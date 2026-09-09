@@ -1543,16 +1543,33 @@ class SchedulerWeightUpdaterManager:
                 # the co-located waking rank's ``resume`` is fenced on (C14),
                 # and the destination hook runs after that resume -- so while
                 # either hook holds this scheduler thread, the other end of the
-                # bounce cannot be running.  With a real plan (S5c's whole
-                # addition) an armed source leg would fill a bounce, block in
-                # ``drain-final`` to the budget, vote its PROD row FAILED and
-                # take the destination down with it: seconds on the critical
-                # path of that credit for zero compared bytes.  The gate still
-                # runs and the two digests are still compared; only the lane is
-                # refused, by name, on the log.  It is FALSE HERE and nowhere
-                # else -- S6's RPC handler drives both ends inside one call and
+                # bounce cannot be running.  It is FALSE HERE and nowhere else
+                # -- S6's RPC handler drives both ends inside one call and
                 # passes the default.
+                #
+                # S6 CHANGED WHAT THIS FLAG BUYS, not where it is set.  It used
+                # to mean "refuse the lane"; it now means "this lane must be
+                # STORE-AND-FORWARD", which is the shape that needs no
+                # concurrent peer: the source fills one slot per batch, seals
+                # the rows and returns inside its own leg, and the destination
+                # hook -- after the C14-fenced resume, in its own later leg --
+                # opens the same ``/dev/shm`` file and reads them.  The drain
+                # that could not be drained is gone by arithmetic (every
+                # ``seq - slots`` is negative) rather than by a branch, so
+                # ``blocked_ms`` stays 0.000 and the destination now has bytes
+                # to COMPARE.  A shape that does not fit is still refused by
+                # name, and the refusal is now W65 (the deposit) instead of the
+                # blameless placement line.
                 oncard_drainable=False,
+                # WHAT THE #1269 LEDGER CHARGED FOR ONE CARD'S DEPOSIT.  The
+                # adapter is the producer because the budget is a property of
+                # the BOOT's arm and a rank hook cannot read the launcher's
+                # ladder; the value comes from the ledger's own function, so
+                # the charge and the bound are one number and cannot drift.
+                # An unreadable ledger yields 0, which REFUSES -- pinned host
+                # bytes nothing charged for are exactly what
+                # host-schwelle-nie-uebertreten forbids.
+                host_bounce_budget_bytes=self._weg2_shadow_host_budget(),
             )
             try:
                 sh.run_leg_hook(inputs, log=logger.info, plan=plan)
@@ -1573,6 +1590,23 @@ class SchedulerWeightUpdaterManager:
                 "weight bytes",
                 hook, type(exc).__name__, exc,
             )
+
+    def _weg2_shadow_host_budget(self) -> int:
+        """One card's charged deposit budget, in bytes, or 0 (#1273 S6).
+
+        ONE READER OF ONE NUMBER.  ``host_ledger.xchg_bounce_bytes_per_card``
+        is the same function the launcher's ARM line charges with, so the
+        budget a rank enforces and the term the ledger carries are the same
+        arithmetic rather than two copies of it.  Zero on any failure, and zero
+        REFUSES the deposit downstream: an observer that could not read its own
+        budget must not pin host memory on a guess.
+        """
+        try:
+            from sglang.srt.weg2 import host_ledger as hl
+
+            return int(hl.xchg_bounce_bytes_per_card())
+        except Exception:  # noqa: BLE001 -- an observer never raises
+            return 0
 
     def _weg2_restore_device(self, device: int) -> None:
         """Put the calling thread's CUDA device back where the hook found it."""

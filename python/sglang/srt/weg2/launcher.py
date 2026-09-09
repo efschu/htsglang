@@ -4142,6 +4142,7 @@ def choose_host_ledger(
     meminfo_path: str = "/proc/meminfo",
     cgroup_root: str = "/sys/fs/cgroup",
     record_path: Optional[str] = None,
+    weight_source: str = WEIGHT_SOURCE_DEFAULT,
 ) -> Tuple[host_ledger.Arm, Optional[float], List[str], Dict[str, Optional[int]]]:
     """THE LAUNCHER'S ONE LEDGER CALL SITE: read the host, price the ladder.
 
@@ -4198,6 +4199,16 @@ def choose_host_ledger(
         cg_ceiling_source=cg_ceiling_source,
         cg_oom_kill=cg["oom_kill"],
         measured_record=record,
+        # #1273 S6: the exchange's own pinned host carrier.  The ARM STRING
+        # decides it here, at the one ledger call site, and not inside the
+        # ledger -- `WEIGHT_SOURCE_CHOICES` is this module's, and a ledger that
+        # knew about arm names would be a second reader of a decision that
+        # already has one.  `ring` charges 0 and every existing boot number is
+        # unchanged.
+        xchg_bounce_host_bytes=(
+            0 if str(weight_source) == WEIGHT_SOURCE_DEFAULT
+            else host_ledger.xchg_bounce_bytes()
+        ),
     )
     return arm, reap_headroom_gib, lines, cg
 
@@ -8656,7 +8667,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # 2. host ledger
     arm, reap_headroom_gib, lines, cg = choose_host_ledger(
         ring_plan.host_weights_bytes,
-        ring_plan.host_weights_span1_bytes, ring_plan.provenance)
+        ring_plan.host_weights_span1_bytes, ring_plan.provenance,
+        weight_source=ns.weg2_weight_source)
     state.cgroup = dict(cg)
     for ln in lines:
         log(ln)

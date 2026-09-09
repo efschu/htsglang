@@ -399,6 +399,46 @@ def oncard_not_drainable_message(*, rank: int, row: int, peer_row: int,
     )
 
 
+def deposit_refusal_message(*, reason: str, rank: int, row: int, peer_row: int,
+                            leg: int, epoch: str, is_source: bool,
+                            batches: int, slots: int, slot_bytes: int,
+                            budget_bytes: int,
+                            slots_max: int = tp.ONCARD_SLOTS_MAX) -> str:
+    """W65: this lane's store-and-forward deposit does not fit (#1273 S6).
+
+    THE SIBLING OF :func:`oncard_not_drainable_message`, at the same placement
+    and under the same contract: the gate rendezvous has already run, the two
+    digests HAVE been compared, and no byte moves.  What differs is the claim.
+    The other line says the lane's two ends are sequential on this placement --
+    true of the hooks, nobody's fault, no W-code.  This one says a deposit was
+    asked for whose slots cannot hold its batches, or whose host bytes the
+    #1269 ledger did not charge for, and both of those are configurations that
+    would move bytes into storage nothing guarantees.
+
+    IT REPLACES THE OTHER REFUSAL ONLY WHERE THE BOUNCE REMOVES THE WAIT.  On
+    the ``ipc`` arm the deposit cannot exist at all (an exported bounce dies
+    with its leg), so that lane keeps the old, blameless line.
+    """
+    return (
+        f"W65 Weg2XchgDepositUnfundable rank={rank} row={row} "
+        f"peer_row={peer_row} leg={leg} epoch={epoch} "
+        f"hook={'source' if is_source else 'destination'} reason={reason} "
+        f"oncard_batches={batches} oncard_slots={slots} "
+        f"oncard_slot_mib={slot_bytes / MIB:.0f} "
+        f"deposit_mib={slots * slot_bytes / MIB:.0f} "
+        f"host_budget_mib={budget_bytes / MIB:.0f} slots_max={slots_max} "
+        "-- the store-and-forward deposit is what lets this hook's lane run "
+        "with no concurrent peer (the source fills one slot per batch and "
+        "returns; the destination reads the same shm file in its own later "
+        "leg), and this shape does not fit: with fewer slots than batches a "
+        "slot is overwritten before anything read it, and above the charged "
+        "host budget the deposit is pinned host bytes no ledger term carries "
+        "against a reap mark that is a hard bound.  The gate rendezvous ran "
+        "and plan_digest/card_digest WERE compared, NO bytes moved, and the "
+        "ring is and stays the only authority for weight bytes"
+    )
+
+
 def shadow_gate(region: xr.XchgRegion, row: int, *, leg: int, vote: bool,
                 classes_hash: int, need_mib: int,
                 log: Callable[[str], None],
@@ -755,16 +795,38 @@ def price_shadow(card: str, need_bytes: int, free_mib: int, *,
                        up(reserve_bytes), str(scope), bool(graded))
 
 
-def oncard_lane_bytes(descs: Sequence[object], rank: int) -> int:
+def oncard_lane_descs(descs: Sequence[object], rank: int) -> List[object]:
     """THIS CARD's diagonal inside ``descs`` -- ``run_leg``'s own filter.
 
-    ONE DEFINITION, because the number is used twice (the bounce is priced from
-    it, and the hop is priced from it) and two copies of a filter is how the
-    sum-across-cards denominator got in.
+    ONE DEFINITION, because the set is used four times now (the bounce is
+    priced from it, the hop is priced from it, S6's slot count is derived from
+    it and S6's deposit verdict is graded on it) and two copies of a filter is
+    how the sum-across-cards denominator got in.
     """
-    return sum(int(d.nbytes) for d in descs
-               if d.kind != tp.ZEROFILL and _is_on_card(d)
-               and int(d.src_rank) == int(rank))
+    return [d for d in descs
+            if d.kind != tp.ZEROFILL and _is_on_card(d)
+            and int(d.src_rank) == int(rank)]
+
+
+def oncard_lane_bytes(descs: Sequence[object], rank: int) -> int:
+    """THIS CARD's diagonal in BYTES."""
+    return sum(int(d.nbytes) for d in oncard_lane_descs(descs, rank))
+
+
+def oncard_lane_batches(descs: Sequence[object], rank: int,
+                        slot_bytes: int) -> int:
+    """HOW MANY BATCHES the producer will actually cut -- the batcher's count.
+
+    NOT ``ceil(bytes / slot_bytes)``, and the difference is the whole reason
+    this function exists (#1273 S6).  ``ceil`` is the HOP model's denominator
+    and it is a lower bound on the truth: :func:`tp.batch_descs` starts a new
+    batch whenever the next piece does not fit, so a diagonal whose descriptors
+    do not pack flush cuts MORE batches than the byte count implies.  A slot
+    count derived from the ceil model would then be smaller than the number of
+    batches -- exactly the ``slots < batches`` overwrite the deposit forbids,
+    arrived at by using a number that names something else.
+    """
+    return len(tp.batch_descs(oncard_lane_descs(descs, rank), int(slot_bytes)))
 
 
 def price_leg(card_uuid: str, descs: Sequence[object], *, rank: int,
@@ -1236,6 +1298,15 @@ class ShadowResult:
     oncard_slot_mib: float = 0.0
     oncard_batches: int = 0
     oncard_hop_ms_priced: Optional[float] = None
+    #: S6.  THE DEPOSIT'S SHAPE AND WHERE THE COUNT CAME FROM.  ``slots`` was
+    #: never on this line because it was never a choice -- it was
+    #: ``tp.ONCARD_SLOTS`` on every product path.  It is one now, so it is
+    #: printed with its provenance and with the host bytes it implies, and a
+    #: reader can check ``oncard_slots >= oncard_batches`` (the property that
+    #: removes the drain wait) without opening the source.
+    oncard_slots: int = 0
+    oncard_slots_source: str = "caller"
+    oncard_deposit_mib: float = 0.0
     direction: str = "?"
     ran: bool = False
     reason: str = ""
@@ -1344,6 +1415,9 @@ class ShadowResult:
             f"{counters.checksum_not_representable} "
             f"oncard_slot_mib={self.oncard_slot_mib:g} "
             f"oncard_batches={self.oncard_batches} "
+            f"oncard_slots={self.oncard_slots} "
+            f"oncard_slots_source={self.oncard_slots_source} "
+            f"oncard_deposit_mib={self.oncard_deposit_mib:g} "
             f"oncard_hop_ms_priced={ms(self.oncard_hop_ms_priced)} "
             f"oncard_ms={self.oncard_ms:.3f} cross_ms={self.cross_ms:.3f} "
             f"ring_ms={ms(self.ring_ms)} compare_ms={self.compare_ms:.3f} "
@@ -1524,6 +1598,12 @@ def shadow_transport(
     #: bounce is allocated or a handle awaited.  See
     #: :attr:`ShadowLegInputs.oncard_drainable`.
     oncard_drainable: bool = True,
+    #: S6.  What one card's store-and-forward deposit may cost on the host,
+    #: from the #1269 ledger's own charge, and whether this caller asked for
+    #: the deposit at all.  ``0``/``False`` keeps every S3/S4/S5 caller
+    #: byte-unchanged: with ``oncard_drainable=True`` neither is read.
+    host_bounce_budget_bytes: int = 0,
+    oncard_store_forward: bool = False,
     #: S5c.  The two digests this rank votes with, and the peer whose card
     #: geometry it is checked against.  Zero/``None`` keeps S3's and S4's
     #: callers byte-unchanged: a table of zeros is uniform, so the checks are
@@ -1599,6 +1679,11 @@ def shadow_transport(
         result.oncard_batches = -(-diag_bytes // diag_slot) if diag_bytes else 0
         result.oncard_hop_ms_priced = (result.oncard_batches
                                        * tp.ONCARD_PER_BATCH_MS)
+        # S6, on the same line and before the same gate: the deposit's shape.
+        result.oncard_slots = int(oncard_slots)
+        result.oncard_slots_source = ("store-forward-batches"
+                                      if oncard_store_forward else "caller")
+        result.oncard_deposit_mib = int(oncard_slots) * diag_slot / MIB
         if not price.affordable:
             log(price.message())
             if explicit:
@@ -1616,6 +1701,7 @@ def shadow_transport(
         if not verdict.run:
             result.reason = verdict.reason.split(":")[0].replace(" ", "-")
             return run
+        store_forward = False
         if not oncard_drainable and any(_is_on_card(d) for d in subset.descs):
             # THE LANE HAS NO CONCURRENT PEER ON THIS PLACEMENT, and the gate
             # has just done the only work that does not need one: the six rows
@@ -1624,12 +1710,42 @@ def shadow_transport(
             # value -- an earlier return would skip the rendezvous and the
             # digests would never be compared at all, which is refuter finding
             # 9 with the sign flipped.
-            log(oncard_not_drainable_message(
-                rank=rank, row=row, peer_row=peer_row, leg=leg, epoch=epoch,
-                is_source=is_source,
-                descs=sum(1 for d in subset.descs if _is_on_card(d))))
-            result.reason = "oncard-not-drainable"
-            return run
+            #
+            # S6 PUTS A LANE BACK IN FRONT OF THAT REFUSAL, and only where it
+            # genuinely removes the wait.  A store-and-forward deposit needs no
+            # concurrent peer at all: with one slot per batch the source fills,
+            # publishes and RETURNS, and the destination reads the same shm
+            # file in its own later leg.  So the refusal below now has two
+            # arms -- W65 when the deposit itself does not fit or is not funded
+            # (a claim that something is misconfigured), and the older
+            # blameless line when no deposit is possible on this arm at all.
+            # THE BATCHER'S OWN COUNT, not the hop model's ceil -- see
+            # :func:`oncard_lane_batches`.  The verdict is about whether every
+            # batch gets its own slot, so it must be graded on the number of
+            # batches that will actually be cut.
+            deposit_batches = oncard_lane_batches(subset.descs, rank, diag_slot)
+            deposit_reason = tp.deposit_refusal_reason(
+                batches=deposit_batches, slots=int(oncard_slots),
+                slot_bytes=int(diag_slot),
+                budget_bytes=int(host_bounce_budget_bytes),
+                mode=str(oncard_mode))
+            if not oncard_store_forward or deposit_reason == tp.DEPOSIT_REASON_IPC:
+                log(oncard_not_drainable_message(
+                    rank=rank, row=row, peer_row=peer_row, leg=leg, epoch=epoch,
+                    is_source=is_source,
+                    descs=sum(1 for d in subset.descs if _is_on_card(d))))
+                result.reason = "oncard-not-drainable"
+                return run
+            if deposit_reason:
+                log(deposit_refusal_message(
+                    reason=deposit_reason, rank=rank, row=row,
+                    peer_row=peer_row, leg=leg, epoch=epoch,
+                    is_source=is_source, batches=deposit_batches,
+                    slots=int(oncard_slots), slot_bytes=int(diag_slot),
+                    budget_bytes=int(host_bounce_budget_bytes)))
+                result.reason = "deposit-unfundable"
+                return run
+            store_forward = True
         mine_dst = [d for d in subset.descs if int(d.dst_rank) == int(rank)]
         layout, total = shadow_layout(mine_dst)
         buffers = None
@@ -1682,7 +1798,12 @@ def shadow_transport(
             # leg's, and the lane runs once per CARD, so it is a different
             # number from the subset's sum across the three cards too.
             oncard_slot_bytes=diag_slot,
-            oncard_slots=oncard_slots)
+            oncard_slots=oncard_slots,
+            # S6.  ``True`` ONLY after the deposit verdict above said this
+            # shape fits and is funded -- so a source leg that reaches here
+            # fills its slots and returns without a terminal drain, and the
+            # destination's own later leg reads them.
+            oncard_store_forward=store_forward)
         elapsed_ms = (time.perf_counter() - started) * 1e3
         result.cross_ms = sum(p.elapsed_s for p in out.pairs) * 1e3
         result.oncard_ms = (out.oncard.elapsed_s * 1e3) if out.oncard else 0.0
@@ -2458,7 +2579,22 @@ class ShadowLegInputs:
     #: under a plan its consumer has not seen.  ``True`` is the default because
     #: it is the truth for every concurrent caller (S6's RPC handler, and every
     #: hermetic test that drives both ends of the lane at once).
+    #:
+    #: S6: ``False`` no longer means the lane is refused.  It means the lane
+    #: needs the STORE-AND-FORWARD shape, which needs no concurrent peer -- and
+    #: the refusal now fires only when that shape does not fit either (W65,
+    #: :func:`deposit_refusal_message`) or when the arm cannot carry it (the
+    #: ``ipc`` arm, which keeps the old blameless line).
     oncard_drainable: bool = True
+    #: WHAT THE #1269 HOST LEDGER CHARGED FOR ONE CARD'S DEPOSIT, in bytes
+    #: (:func:`sglang.srt.weg2.host_ledger.xchg_bounce_bytes_per_card`).  Its
+    #: producer is the ADAPTER, for the same reason ``gate_rows`` has one: the
+    #: budget is a property of the BOOT's arm, and a rank hook cannot read the
+    #: launcher's ladder.  ``0`` is "no ledger answer reached this rank" and
+    #: refuses the deposit by name -- an absent measurement never becomes a
+    #: quiet zero, and pinned host bytes above what a term carries are exactly
+    #: the shape ``host-schwelle-nie-uebertreten`` forbids.
+    host_bounce_budget_bytes: int = 0
 
 
 class ShadowLeg:
@@ -2921,13 +3057,40 @@ def run_leg_hook(
         # A PINNED slot is pinned through the SAME producer (floor == ceiling),
         # so the batch count and the hop stay its arithmetic and not ours.
         lane_bytes = oncard_lane_bytes(subset.descs, inputs.rank)
-        lane = (tp.plan_oncard_slot_bytes(lane_bytes)
+        # S6: THE SLOT COUNT COMES OUT OF THE SAME PRODUCER AS THE SLOT SIZE.
+        # ``run_leg_hook`` had no ``oncard_slots`` parameter, so every product
+        # path ran the lane at the module constant ``tp.ONCARD_SLOTS = 2`` --
+        # a hand number one seam below a planner that already knew the batch
+        # count.  A deposit needs one slot per batch, so the count is derived
+        # here, printed with its provenance (``oncard_slots_source=``), and
+        # handed to ``shadow_transport`` as ONE reading, exactly as
+        # ``diag_slot`` already is: the W52 cross-check between the two
+        # co-located processes then still compares two readings of one
+        # derivation rather than two derivations.
+        store_forward = not bool(inputs.oncard_drainable)
+        budget_bytes = int(inputs.host_bounce_budget_bytes)
+        lane = (tp.plan_oncard_slot_bytes(
+                    lane_bytes, store_forward=store_forward,
+                    host_budget_bytes=budget_bytes)
                 if oncard_slot_bytes is None
                 else tp.plan_oncard_slot_bytes(
                     lane_bytes, floor_bytes=int(oncard_slot_bytes),
-                    ceiling_bytes=int(oncard_slot_bytes)))
+                    ceiling_bytes=int(oncard_slot_bytes),
+                    store_forward=store_forward,
+                    host_budget_bytes=budget_bytes))
         diag_slot = int(lane.slot_bytes)
         batches = int(lane.batches)
+        # ONE SLOT PER BATCH THE BATCHER WILL ACTUALLY CUT.  ``lane.slots`` is
+        # derived from the hop model's ``ceil(bytes / slot)``, which is a LOWER
+        # bound on that count (:func:`oncard_lane_batches`), so the deposit
+        # takes the larger of the two.  ``or tp.ONCARD_SLOTS`` covers the empty
+        # diagonal, where the plan derives 0 and ``require_oncard_slots``
+        # refuses a depth of zero one layer down.
+        diag_slots = int(tp.ONCARD_SLOTS)
+        if store_forward:
+            diag_slots = max(int(lane.slots),
+                             oncard_lane_batches(subset.descs, inputs.rank,
+                                                 diag_slot)) or int(tp.ONCARD_SLOTS)
         priced_ms = float(lane.hop_ms)
         if priced_ms > bound:
             message = hop_refusal_message(
@@ -2937,6 +3100,9 @@ def run_leg_hook(
             result.subset = subset
             result.oncard_slot_mib = diag_slot / MIB
             result.oncard_batches = batches
+            result.oncard_slots = diag_slots
+            result.oncard_slots_source = lane.slots_source
+            result.oncard_deposit_mib = diag_slots * diag_slot / MIB
             result.oncard_hop_ms_priced = priced_ms
             result.reason = "hop-over-bound"
             # THE ASYMMETRIC REFUSAL, PUBLISHED.  ``hop_ms`` is priced from
@@ -2968,6 +3134,12 @@ def run_leg_hook(
             budget_left=left,
             gate_budget_s=min(float(gate_budget_s), left()),
             oncard_drainable=bool(inputs.oncard_drainable),
+            # S6: the deposit's two inputs, from the two producers that own
+            # them -- the slot count from the lane plan above, the host budget
+            # from the adapter's reading of the #1269 ledger's charge.
+            oncard_slots=diag_slots,
+            host_bounce_budget_bytes=budget_bytes,
+            oncard_store_forward=store_forward,
             gate_rows=inputs.gate_rows,
             plan_digest=plan_digest, card_digest=card_digest,
             # THE CO-LOCATED PAIR IS ONLY VISIBLE TO THE DESTINATION.  The
