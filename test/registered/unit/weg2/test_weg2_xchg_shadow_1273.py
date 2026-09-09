@@ -2501,6 +2501,21 @@ def _wu_source(name: str) -> str:
         getattr(_wu().SchedulerWeightUpdaterManager, name))
 
 
+def _wu_ast(name: str):
+    """The same method as an ``ast.FunctionDef``.
+
+    ``textwrap.dedent`` and NOT ``inspect.cleandoc``: cleandoc leaves the FIRST
+    line unindented and strips the rest, so a method whose signature wraps
+    parses as an empty ``def`` followed by a docstring at column 4 -- an
+    ``IndentationError`` that reads exactly like a broken product.  Found by
+    this round's own run (2 failures, both this line).
+    """
+    import ast as _ast
+    import textwrap
+
+    return _ast.parse(textwrap.dedent(_wu_source(name))).body[0]
+
+
 # --- must_fix 1: the rendezvous the placements can satisfy -----------------
 
 def test_the_source_hook_does_not_wait_for_rows_the_flip_has_not_reached(region):
@@ -2631,8 +2646,7 @@ def test_the_leg_threads_device_is_put_back_after_the_hook():
     decides which device the authoritative leg continues on."""
     import ast as _ast
 
-    src = _wu_source("_weg2_shadow_hook")
-    fn = _ast.parse(inspect.cleandoc(src)).body[0]
+    fn = _wu_ast("_weg2_shadow_hook")
     finallies = [n for n in _ast.walk(fn) if isinstance(n, _ast.Try) and n.finalbody]
     assert finallies, "the hook has no finally at all"
     restored = any(
@@ -2864,7 +2878,7 @@ def test_the_adapter_still_never_raises_and_that_is_why_signals_are_caught():
     """
     import ast as _ast
 
-    fn = _ast.parse(inspect.cleandoc(_wu_source("_weg2_shadow_hook"))).body[0]
+    fn = _wu_ast("_weg2_shadow_hook")
     assert not any(isinstance(n, _ast.Raise) for n in _ast.walk(fn))
     assert any(isinstance(h.type, _ast.Name) and h.type.id == "BaseException"
                for n in _ast.walk(fn) if isinstance(n, _ast.Try)
