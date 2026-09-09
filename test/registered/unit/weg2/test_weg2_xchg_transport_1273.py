@@ -1232,6 +1232,43 @@ def test_the_fake_never_mistakes_a_host_address_for_a_device_one(region, ops):
             assert ptr | FAKE_IMPORT_BIAS != ptr
 
 
+def test_no_byte_moves_before_the_flip_is_bound(tmp_path, boot, sems):
+    """THE GATE COMES BEFORE THE FIRST BYTE, on both lanes.
+
+    Gate 0 runs in the RPC preamble, before any ``resume`` and before any
+    ``pause``, and ``begin_flip`` is what stamps this flip's identity onto the
+    slots and the rows.  A transport that ran without it would fill slots
+    carrying the PREVIOUS flip's epoch hash -- which
+    ``XchgRegion.claim_produced`` then zeroes as foreign, so the bytes would be
+    silently dropped rather than loudly refused.
+
+    Both lanes are asserted, because the diagonal has no semaphore and could
+    easily have been given a weaker precondition.
+    """
+    unbound = xr.XchgRegion.create(boot, shm_root=str(tmp_path))
+    ops_ = FakeDeviceOps(str(tmp_path / "d"), rank=0)
+    try:
+        assert unbound.epoch == "" and unbound.epoch_hash == 0
+        src, dst = dev_ptr(0, 0), dev_ptr(1, 0)
+        descs = [flat_desc(0, 1, 512, src_ptr=src, dst_ptr=dst)]
+        before = ops_.issued
+        with pytest.raises(xr.Weg2XchgPlanDisagree) as excinfo:
+            tp.run_producer_pair(unbound, sems, ops_, ops_.create_stream(0),
+                                 pair=xr.pair_id(0, 1), descs=descs,
+                                 stats=tp.PairStats(0, 1, "a", "b"),
+                                 budget_s=2.0, slot_bytes=SLOT)
+        assert "W52 Weg2XchgPlanDisagree" in str(excinfo.value)
+        assert "no flip is bound" in str(excinfo.value)
+        assert ops_.issued == before, "the refusal must precede the first copy"
+
+        with pytest.raises(xr.Weg2XchgPlanDisagree):
+            tp.write_oncard_row(unbound, tp.DIR_ONCARD_PROD_OFF, 0, slot=0,
+                                seq=0, nbytes=1, state=tp.ONCARD_STATE_READY)
+    finally:
+        ops_.close()
+        unbound.close()
+
+
 def test_kind_constants_match_the_plan_builder():
     """The transport declares its own kind strings so it stays importable
     without torch; this is what keeps the two sets from drifting into a
