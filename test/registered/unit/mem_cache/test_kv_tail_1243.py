@@ -1626,6 +1626,339 @@ class TestTheNonHybridPathIsUnchanged(_HybridSeamBase):
 
 
 # ---------------------------------------------------------------------------
+# T12 -- THE DEMOTION POLICY, AND THE RESIDENCY THAT PROVES IT.
+#
+# Boot weg2kvtail5: `rows_held=0` on all 168 lines, `materialised == demoted`,
+# `wiped=0`, and the arm bit-identical to tail-off over 53,047 positions. Read
+# as "everything claimed is demoted in the same pass -- the tail is a
+# turnstile". The log could not distinguish that from "nothing was ever held",
+# because BOTH print `rows_held=0`.
+#
+# THE ACTUAL POPULATION, from the boot log: 463 `Prefill batch` lines and
+# **1** `Decode batch` line. The ring is armed only on a DECODE step
+# (`begin_decode_step` -- the F8 fix that keeps it off the extend path), so a
+# prefill-only scoring corpus cannot fill it. `claimed_total` reached 30 while
+# `untrimmed_owned` reached 27,200: claiming, not demoting, is what did not
+# happen.
+#
+# The four hypotheses in the tasking are refuted structurally, not by opinion:
+#   pressure shrink        -- `pressure=True` is passed NOWHERE in the tree;
+#                             `pressure_demotions=0` on all 168 lines
+#   virtual-fp8 at write   -- `--kv-tail-virtual-fp8` is refused at parse
+#                             (slice 3); it cannot be on
+#   guaranteed-N floor     -- no floor logic exists in slice 1 (slice 2)
+#   age threshold in the
+#   wrong unit             -- possible in principle; pinned below, and it is
+#                             not what fired here
+#
+# There are exactly TWO callers of the cast primitive: `_on_body_free` and
+# `plan`'s age-out. Both are now named in the line.
+# ---------------------------------------------------------------------------
+
+
+class _PolicyBase(CustomTestCase):
+    """A ring holding N rows for one request, with the window covering them."""
+
+    N = 5
+
+    def _held(self, rows=32, body_rows=64, min_tokens=16384):
+        ring = _ring(rows=rows, body_rows=body_rows,
+                     knobs=KvTailKnobs(min_tokens=min_tokens, max_tokens=KV_TAIL_OPEN))
+        loc = torch.arange(10, 10 + self.N, dtype=torch.int64)
+        ring.claim(loc, torch.ones(self.N, dtype=torch.bool))
+        self.assertEqual(ring.rows_held, self.N)
+        return ring, loc
+
+    def _plan(self, ring, loc, tail_len=None):
+        """One decode plan whose owned vector is exactly ``loc``."""
+        kv_indptr = torch.tensor([0, loc.numel()], dtype=torch.int32)
+        kv_indices = loc.to(torch.int32)
+        # Below the minimum -> the window is the WHOLE sequence (basis 7.1:
+        # `min(seq_len, min_tokens)`), so every owned slot is inside it.
+        owned_tail = torch.tensor(
+            [loc.numel() if tail_len is None else tail_len], dtype=torch.int64
+        )
+        return ring.plan(kv_indptr, kv_indices, owned_tail)
+
+
+class TestRowsBelowTheMinimumAreNeverDemoted(_PolicyBase):
+    """Basis 7.1: below `min_tokens` a row is GUARANTEED, and only VRAM
+    pressure may take it. With no pressure, a plan must demote nothing."""
+
+    def test_the_rows_stay_held_across_a_plan(self):
+        ring, loc = self._held()
+        self._plan(ring, loc)
+        self.assertEqual(ring.rows_held, self.N)
+        self.assertEqual(ring.counters.demoted_total, 0)
+        self.assertEqual(ring.counters.demoted_this_pass, 0)
+        self.assertEqual(ring.counters.pressure_demotions, 0)
+
+    def test_the_held_rows_are_exactly_what_the_plan_attends(self):
+        """Residency is only worth something if the second attention call
+        reads it: `attended_rows` must be the held set, not zero beside it --
+        the weg2kvtail1 shape."""
+        ring, loc = self._held()
+        _bi, body, _ti, tail = self._plan(ring, loc)
+        self.assertEqual(ring.counters.attended_rows, self.N)
+        self.assertEqual(tail.numel(), self.N)
+        self.assertEqual(body.numel(), 0)
+
+    def test_a_plan_that_repeats_does_not_bleed_rows(self):
+        ring, loc = self._held()
+        for _ in range(5):
+            self._plan(ring, loc)
+        self.assertEqual(ring.rows_held, self.N)
+        self.assertEqual(ring.counters.demoted_total, 0)
+
+
+class TestTheTriggerNamesThePath(_PolicyBase):
+    """Three producers, three totals. A sum can never hide which one moved."""
+
+    def test_the_free_path_names_itself(self):
+        ring, loc = self._held()
+        ring._on_body_free(loc)
+        self.assertEqual(ring.counters.last_trigger, "free")
+        self.assertEqual(ring.counters.demoted_by_free, self.N)
+        self.assertEqual(ring.counters.demoted_by_age, 0)
+        self.assertEqual(ring.rows_held, 0)
+
+    def test_the_age_path_names_itself(self):
+        """Shrink the window so the held rows fall OUT of it: that is the
+        age-out, and it must be attributed to age, not to free."""
+        ring, loc = self._held()
+        self._plan(ring, loc, tail_len=0)
+        self.assertEqual(ring.counters.last_trigger, "age")
+        self.assertEqual(ring.counters.demoted_by_age, self.N)
+        self.assertEqual(ring.counters.demoted_by_free, 0)
+        self.assertEqual(ring.rows_held, 0)
+
+    def test_pressure_is_attributed_apart_from_both(self):
+        ring, loc = self._held()
+        ring.materialise_body_rows(loc, pressure=True)
+        self.assertEqual(ring.counters.last_trigger, "pressure")
+        self.assertEqual(ring.counters.demoted_by_pressure, self.N)
+        self.assertEqual(ring.counters.demoted_by_age, 0)
+        self.assertEqual(ring.counters.demoted_by_free, 0)
+
+    def test_the_three_totals_sum_to_the_demoted_total(self):
+        ring, loc = self._held()
+        ring._on_body_free(loc[:2])
+        self._plan(ring, loc, tail_len=0)
+        c = ring.counters
+        self.assertEqual(
+            c.demoted_by_age + c.demoted_by_free + c.demoted_by_pressure,
+            c.demoted_total,
+        )
+
+
+class TestTheLineSeparatesTheTwoWorlds(_PolicyBase):
+    """THE INSTRUMENT'S REASON TO EXIST. weg2kvtail5's line printed
+    `rows_held=0` for a world it could not name. These two worlds must now
+    print differently."""
+
+    def test_held_then_demoted_versus_never_held(self):
+        held, loc = self._held()
+        held._on_body_free(loc)
+        line_demoted = held.counter_line("decode")
+
+        never = _ring(rows=32, knobs=KvTailKnobs(min_tokens=16384, max_tokens=KV_TAIL_OPEN))
+        never.plan(
+            torch.tensor([0, 0], dtype=torch.int32),
+            torch.zeros(0, dtype=torch.int32),
+            torch.tensor([0], dtype=torch.int64),
+        )
+        line_never = never.counter_line("decode")
+
+        # Both still say rows_held=0 -- that was never the discriminator.
+        self.assertIn("rows_held=0/", line_demoted)
+        self.assertIn("rows_held=0/", line_never)
+        # The residency term is what separates them.
+        self.assertIn("demoted_by_free=5", line_demoted)
+        self.assertIn("trigger=free", line_demoted)
+        self.assertIn("demoted_by_free=0", line_never)
+        self.assertIn("trigger=none", line_never)
+
+    def test_decode_steps_is_the_denominator_for_claims(self):
+        """The weg2kvtail5 signature, made legible: a run that never armed the
+        ring reports `decode_steps=0`, and `claimed_total=0` is then the
+        ABSENCE OF A POPULATION rather than an over-eager demoter."""
+        ring = _ring(rows=32, armed=False)
+        self.assertEqual(ring.counters.decode_steps, 0)
+        # An unarmed ring claims nothing: this is the prefill-only workload.
+        self.assertEqual(
+            ring.claim(torch.tensor([1, 2], dtype=torch.int64)), (None, None)
+        )
+        line = ring.counter_line("decode")
+        self.assertIn("decode_steps=0", line)
+        self.assertIn("claimed_total=0", line)
+        self.assertIn("demoted_total=0", line)
+        # And one decode step moves the denominator.
+        ring.begin_decode_step()
+        self.assertIn("decode_steps=1", ring.counter_line("decode"))
+
+    def test_rows_held_pre_is_a_pass_quantity_not_a_total(self):
+        ring, loc = self._held()
+        self._plan(ring, loc)
+        self.assertEqual(ring.counters.rows_held_pre, self.N)
+        self.assertEqual(ring.counters.demoted_this_pass, 0)
+        self._plan(ring, loc, tail_len=0)
+        self.assertEqual(ring.counters.rows_held_pre, self.N)
+        self.assertEqual(ring.counters.demoted_this_pass, self.N)
+        # A third pass with nothing left demotes nothing: per-pass, not cumulative.
+        self._plan(ring, loc, tail_len=0)
+        self.assertEqual(ring.counters.rows_held_pre, 0)
+        self.assertEqual(ring.counters.demoted_this_pass, 0)
+
+
+# ---------------------------------------------------------------------------
+# T13 -- THE MERGE SEAM, EXECUTED AT DESK.
+#
+# `_kv_tail_merge_decode` was named UNPROVEN in 1aw-6 and again in 1aw-7 -- the
+# category that has now cost two boots. It is executable here after all: the
+# ONLY part that needs a GPU is `_safe_merge_state`, which dispatches to a
+# flashinfer/Triton kernel. That one call is substituted with a pure-torch
+# reference LSE merge; everything else -- the plan-missing refusal, both
+# empty-attention sanitisings, the wrapper call and the fold ORDER -- is the
+# shipped code.
+# ---------------------------------------------------------------------------
+
+
+def _reference_merge(v_a, s_a, v_b, s_b):
+    """Textbook log-sum-exp merge of two attention partials, in float64.
+
+    Only stands in for the kernel's ARITHMETIC; the contract under test is the
+    seam around it.
+    """
+    m = torch.maximum(s_a, s_b)
+    finite = torch.isfinite(m)
+    m_safe = torch.where(finite, m, torch.zeros_like(m))
+    wa = torch.exp(s_a - m_safe).unsqueeze(-1)
+    wb = torch.exp(s_b - m_safe).unsqueeze(-1)
+    wa = torch.where(torch.isfinite(wa), wa, torch.zeros_like(wa))
+    wb = torch.where(torch.isfinite(wb), wb, torch.zeros_like(wb))
+    denom = wa + wb
+    out = torch.where(denom > 0, (v_a * wa + v_b * wb) / denom.clamp(min=1e-30), v_a)
+    lse = m_safe + torch.log((wa + wb).squeeze(-1).clamp(min=1e-30))
+    lse = torch.where(finite, lse, torch.full_like(lse, float("-inf")))
+    return out, lse
+
+
+class _TailWrapperDouble:
+    def __init__(self, o, lse):
+        self._o, self._lse = o, lse
+        self.calls = 0
+
+    def forward_return_lse(self, q, kv, sm_scale=None, logits_soft_cap=None):
+        self.calls += 1
+        self.kv_seen = kv
+        return self._o, self._lse
+
+
+class TestTheMergeSeamRuns(CustomTestCase):
+    HEADS_Q = 2
+
+    def _backend(self, ring, planned, body_empty, tail_empty, o_t, lse_t):
+        from sglang.srt.layers.attention.flashinfer_backend import (
+            FlashInferAttnBackend,
+        )
+
+        self._fn = FlashInferAttnBackend._kv_tail_merge_decode
+        pool = types.SimpleNamespace(kv_tail=ring)
+        return types.SimpleNamespace(
+            token_to_kv_pool=pool,
+            _kv_tail_planned_rows=planned,
+            _kv_tail_body_empty=body_empty,
+            _kv_tail_tail_empty=tail_empty,
+            _kv_tail_wrapper=_TailWrapperDouble(o_t, lse_t),
+        )
+
+    def _run(self, be, o, lse):
+        """Execute the shipped seam with only the GPU merge substituted."""
+        from sglang.srt.layers.attention import flashinfer_backend as fb
+
+        layer = types.SimpleNamespace(layer_id=0, scaling=1.0, logit_cap=0.0)
+        real = fb._safe_merge_state
+        fb._safe_merge_state = _reference_merge
+        try:
+            return self._fn(be, torch.zeros(o.shape[0], self.HEADS_Q, HEAD_DIM), layer, o, lse)
+        finally:
+            fb._safe_merge_state = real
+
+    def _ring1(self):
+        r = _ring(rows=16)
+        r.claim(torch.tensor([5, 6], dtype=torch.int64), torch.ones(2, dtype=torch.bool))
+        return r
+
+    def test_a_step_with_no_plan_is_a_named_refusal_not_a_skip(self):
+        """Skipping would make the tail a silent no-op on exactly the steps
+        that differ -- the weg2kvtail1 shape."""
+        be = self._backend(self._ring1(), None, None, None, None, None)
+        o = torch.zeros(1, self.HEADS_Q, HEAD_DIM)
+        lse = torch.zeros(1, self.HEADS_Q)
+        with self.assertRaises(Weg2KvTailFormRefused):
+            self._run(be, o, lse)
+
+    def test_the_tail_partial_actually_reaches_the_merge(self):
+        o = torch.zeros(1, self.HEADS_Q, HEAD_DIM)
+        lse = torch.zeros(1, self.HEADS_Q)
+        o_t = torch.ones(1, self.HEADS_Q, HEAD_DIM)
+        lse_t = torch.zeros(1, self.HEADS_Q)
+        be = self._backend(
+            self._ring1(), 2,
+            torch.zeros(1, dtype=torch.bool), torch.zeros(1, dtype=torch.bool),
+            o_t, lse_t,
+        )
+        out, _out_lse = self._run(be, o, lse)
+        self.assertEqual(be._kv_tail_wrapper.calls, 1)
+        # Equal LSEs -> the merge is the mean of the two partials.
+        self.assertTrue(torch.allclose(out, torch.full_like(out, 0.5), atol=1e-5))
+
+    def test_an_empty_tail_leaves_the_body_answer_untouched(self):
+        """`planned == 0` must return the body partial unchanged -- and must
+        not call the wrapper at all."""
+        o = torch.randn(2, self.HEADS_Q, HEAD_DIM)
+        lse = torch.zeros(2, self.HEADS_Q)
+        be = self._backend(self._ring1(), 0, None, None, None, None)
+        out, out_lse = self._run(be, o.clone(), lse.clone())
+        self.assertEqual(be._kv_tail_wrapper.calls, 0)
+        self.assertTrue(torch.equal(out, o))
+        self.assertTrue(torch.equal(out_lse, lse))
+
+    def test_an_empty_body_request_is_sanitised_before_the_merge(self):
+        """The shipped arm's NORMAL case: at min_tokens over shorter sequences
+        every owned slot is in the window, so the body plan is empty for the
+        whole batch. An unsanitised empty body partial would feed whatever the
+        kernel returns for a zero-length row straight into the merge."""
+        o = torch.full((1, self.HEADS_Q, HEAD_DIM), 7.0)  # garbage from an empty row
+        lse = torch.full((1, self.HEADS_Q), 3.0)
+        o_t = torch.ones(1, self.HEADS_Q, HEAD_DIM)
+        lse_t = torch.zeros(1, self.HEADS_Q)
+        be = self._backend(
+            self._ring1(), 2,
+            torch.ones(1, dtype=torch.bool),   # body EMPTY for this request
+            torch.zeros(1, dtype=torch.bool),
+            o_t, lse_t,
+        )
+        out, _ = self._run(be, o, lse)
+        # The body garbage must not survive: the answer is the tail partial.
+        self.assertTrue(torch.allclose(out, o_t, atol=1e-5))
+
+    def test_a_request_empty_on_both_sides_comes_back_zeroed(self):
+        o = torch.full((1, self.HEADS_Q, HEAD_DIM), 7.0)
+        lse = torch.full((1, self.HEADS_Q), 3.0)
+        be = self._backend(
+            self._ring1(), 2,
+            torch.ones(1, dtype=torch.bool),
+            torch.ones(1, dtype=torch.bool),
+            torch.full((1, self.HEADS_Q, HEAD_DIM), 9.0),
+            torch.full((1, self.HEADS_Q), 4.0),
+        )
+        out, out_lse = self._run(be, o, lse)
+        self.assertTrue(torch.equal(out, torch.zeros_like(out)))
+        self.assertTrue(bool(torch.isinf(out_lse).all()))
+
+
+# ---------------------------------------------------------------------------
 # MUTANTS.  Each must turn a NAMED assertion above red.
 # ---------------------------------------------------------------------------
 
@@ -1676,6 +2009,21 @@ _MUTANTS = {
         "            return layer_id\n"
         "        return self._layer_id_transfer(layer_id)",
         "        return layer_id",
+    ),
+    # M14 -- DEMOTE ON WRITE: cast the row in the same breath as claiming it.
+    # This is precisely the "turnstile" weg2kvtail5 was read as, so the reading
+    # must have a test that can tell it apart from an empty population.
+    "M14_demote_on_write": (
+        "                self.counters.claimed_total += n_fresh",
+        "                self.counters.claimed_total += n_fresh\n"
+        "                self.materialise_body_rows(owned[fresh], trigger=\"age\")",
+    ),
+    # M15 -- IGNORE THE WINDOW: age out every mapped slot, in-window or not.
+    # Basis 7.1's guaranteed minimum is then unenforced and a row below
+    # min_tokens is demoted with no pressure -- the "floor ignored" shape.
+    "M15_window_ignored": (
+        "    age_out = mapped & ~in_window",
+        "    age_out = mapped",
     ),
     # M12 -- report a cutover WIPE as a materialised cast.
     "M12_wipe_as_cast": (
@@ -1788,6 +2136,42 @@ class TestMutantsKillNamedAssertions(CustomTestCase):
         v = torch.zeros((2, HEADS, HEAD_DIM), dtype=torch.bfloat16)
         with self.assertRaises(IndexError):
             ring.write(_Layer(27), ring_loc, ring_mask, k, v)
+
+    def test_M14_demote_on_write_makes_the_ring_a_turnstile(self):
+        """Rows claimed and cast in the same pass: occupancy can never rise."""
+        m = _load_mutant("M14_demote_on_write")
+        ring = m.KvTailRing(
+            _body_pool(64),
+            m.KvTailKnobs(min_tokens=16384, max_tokens=m.KV_TAIL_OPEN),
+            ring_rows=32,
+        )
+        ring.begin_decode_step()
+        loc = torch.arange(10, 15, dtype=torch.int64)
+        ring.claim(loc, torch.ones(5, dtype=torch.bool))
+        # The shipped ring holds 5 here; the mutant holds none.
+        self.assertEqual(ring.rows_held, 0)
+        self.assertEqual(ring.counters.demoted_total, 5)
+
+    def test_M15_ignoring_the_window_demotes_a_guaranteed_row(self):
+        """Below min_tokens, with no pressure, nothing may be demoted."""
+        m = _load_mutant("M15_window_ignored")
+        ring = m.KvTailRing(
+            _body_pool(64),
+            m.KvTailKnobs(min_tokens=16384, max_tokens=m.KV_TAIL_OPEN),
+            ring_rows=32,
+        )
+        ring.begin_decode_step()
+        loc = torch.arange(10, 15, dtype=torch.int64)
+        ring.claim(loc, torch.ones(5, dtype=torch.bool))
+        self.assertEqual(ring.rows_held, 5)
+        # Window covers the WHOLE sequence, so the shipped rule demotes none.
+        ring.plan(
+            torch.tensor([0, 5], dtype=torch.int32),
+            loc.to(torch.int32),
+            torch.tensor([5], dtype=torch.int64),
+        )
+        self.assertEqual(ring.rows_held, 0)
+        self.assertEqual(ring.counters.demoted_by_age, 5)
 
     def test_M3_position_key_breaks_the_compacted_slot_lookup(self):
         m = _load_mutant("M3_position_key")
