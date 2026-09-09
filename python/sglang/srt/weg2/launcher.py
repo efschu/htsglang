@@ -729,8 +729,58 @@ D_DECODE_STEPS_PROVENANCE = (
 #: ``--rank-tp-ratio auto-performance --rank-perf-tune <target>`` (resolved by
 #: uneven_perf.apply_auto_performance). What the launcher adds is the CHOICE,
 #: priced, on one line -- ``d_tp_ratio_decision``.
-D_TP_OBJECTIVE_CHOICES = ("maxkv", "speed")
+#: #1241 slice (2). THE OPERATING-POINT AXIS OF THE SAME #1017 SOLVE.
+#:
+#: ``maxkv`` and ``speed`` answer "what does this boot optimise for". They do
+#: NOT answer "at which decode operating point", and the two answers are not
+#: the same vector: a bs=1 decode round is BANDWIDTH-bound (every rank streams
+#: its weight shard once per token, so the barrier is
+#: ``max_r bytes_r / bandwidth_r``) while a bs=6 round is COMPUTE-bound (the
+#: same shard is read once for six tokens, so the barrier is
+#: ``max_r flops_r / gemm_r``). The 5090's measured advantage over a 3080 is
+#: 2.32x on bandwidth and 3.99x on GEMM (this rig's own card-rate library), so
+#: the two operating points do not want the same split, and until now no boot
+#: could state which of them the shipped vector serves.
+#:
+#: NO SECOND SOLVER, exactly as the two older arms. Both new positions are
+#: priced with the runtime's OWN cost model -- ``PerfCostModel.
+#: decode_round_time`` / ``per_rank_decode_times`` for the bandwidth arm,
+#: ``prefill_lockstep_compute_time`` over the #324 per-(rank, family) GEMM
+#: scores for the compute arm, ``predict_capacity`` for the pool -- and what
+#: the launcher adds is the CHOICE plus a line that prints all three vectors
+#: beside each other so the trade is readable per boot instead of per
+#: archaeology.
+D_TP_OBJECTIVE_CHOICES = ("maxkv", "speed", "decode-bs1", "decode-bs6")
 D_TP_OBJECTIVE_DEFAULT = "maxkv"
+
+#: The two positions that emit an EXPLICIT weight vector rather than one of
+#: the runtime's two symbolic resolvers.
+D_OPERATING_POINTS = ("decode-bs1", "decode-bs6")
+
+#: #705, MEASURED, quoted with the commits that measured it. The desk half of
+#: #705 (``05baa99213897ed9a5ae987e67938a92c648baf0``) priced a family-split
+#: TP decode to a single threshold: the net is positive if and only if a
+#: BLOCKING TP all-reduce costs more than 14.3 us on this rig. The verdict
+#: commit (``d937d5f76b03a0f3c5ecb916649a97245acf0148``) then measured that
+#: all-reduce at 31.0-33.7 us for the 10 KB bs=1 payload (INTEGRATION_R3
+#: __group__ rows) -- i.e. above the threshold -- and REFUSED the family split
+#: anyway, because the gate is a desk net and the split would need a
+#: per-family vector that has no flag.
+#:
+#: Carried here as the collective term of the bs=1 row: at bs=1 the round is
+#: bandwidth-bound and this all-reduce is charged ONCE per layer per token, so
+#: it is the part of the round that a weight vector cannot move. Printing it
+#: beside the barrier is what keeps a reader from reading the whole barrier
+#: delta as available.
+D705_AR_BS1_US = (31.0, 33.7)
+D705_FAMILY_SPLIT_BREAKEVEN_US = 14.3
+D705_PROVENANCE = (
+    "#705 desk price 05baa99213 (family split net positive iff a blocking TP "
+    "all-reduce > %.1f us) against the measured %.1f-%.1f us at the 10 KB bs=1 "
+    "payload, d937d5f76b (INTEGRATION_R3 __group__ rows) -- which is why the "
+    "family split is REFUSED and only the head vector moves here."
+    % (D705_FAMILY_SPLIT_BREAKEVEN_US, D705_AR_BS1_US[0], D705_AR_BS1_US[1])
+)
 
 
 @dataclass(frozen=True)
@@ -3433,6 +3483,336 @@ def d_overlap_cost_line(model: str, disable_overlap: bool, d_bs: int = 8) -> str
 
 
 @dataclass(frozen=True)
+class DOperatingPointRow:
+    """One operating point's vector and what the runtime's own model prices it at."""
+
+    position: str
+    #: What the vector is proportional to, named so a reader never has to guess
+    #: which of the two measured rates produced it.
+    score_name: str
+    scores: Tuple[float, ...]
+    weights: Tuple[int, ...]
+    attn_heads: Tuple[int, ...]
+    gdn_heads: Tuple[int, ...]
+    #: Lockstep round cost from PerfCostModel, in the unit that method returns.
+    #: ``None`` = the model could not price it, and the row then says so rather
+    #: than carrying a number that looks measured.
+    round_ms: Optional[float]
+    round_unit: str
+    world_pool_tokens: Optional[int]
+    note: str = ""
+
+
+def _gcd_reduce(values: Sequence[int]) -> Tuple[int, ...]:
+    vals = [max(1, int(v)) for v in values]
+    g = math.gcd(*vals) if len(vals) > 1 else vals[0]
+    return tuple(v // max(1, g) for v in vals)
+
+
+def _weights_from_scores(scores: Sequence[float]) -> Tuple[int, ...]:
+    """A ratio vector proportional to a measured per-rank rate.
+
+    ``--rank-tp-ratio`` takes a comma-separated integer ratio
+    (server_args.py:467 ``_parse_rank_tp_ratio``), so the rates are scaled to
+    integers and gcd-reduced. x1000 because this rig's slowest and fastest
+    measured rates differ by ~4x and rounding at x1 would quantise a 3.99x
+    ratio to 4:1 -- the vector must carry the measurement, not a rounding of it.
+    """
+    lo = min(float(s) for s in scores)
+    return _gcd_reduce([int(round(float(s) / max(lo, 1e-9) * 1000.0)) for s in scores])
+
+
+def d_operating_point_rows(
+    cards: Sequence[Card],
+    budgets: Sequence[int],
+    model: str,
+    d_bs: int,
+    facts: Sequence[EarlyReadFact] = EARLY_READ_FACTS,
+) -> Tuple[List[DOperatingPointRow], List[str]]:
+    """Price the three D weight vectors side by side. Returns (rows, refusals).
+
+    Row 0 is always the SHIPPED maxkv vector (the gcd-reduced budget vector
+    ``ServerArgs._resolve_auto_rank_tp_ratio`` derives), so the two operating
+    points are always read against what this boot actually ships rather than
+    against each other.
+
+    REFUSALS ARE RETURNED, NOT RAISED. This function runs on every boot to
+    build the provenance line, including the boots that ship ``maxkv`` and
+    must not be killed by a card-rate library that cannot price an arm nobody
+    selected. ``d_tp_ratio_decision`` raises the matching refusal only when
+    the refused position is the one being SHIPPED.
+    """
+    refusals: List[str] = []
+    budgets = [int(b) for b in budgets]
+    maxkv_weights = _gcd_reduce(budgets)
+
+    # -- the geometry and the cost model, both the runtime's own -------------
+    pcm = None
+    try:
+        from sglang.srt.uneven_perf import PerfCostModel, PlanInputs
+
+        pcm = PerfCostModel(
+            PlanInputs(
+                tp_size=len(budgets),
+                model_path=model,
+                kv_cache_dtype="fp8_e4m3",
+                speculative_algorithm="NEXTN",
+                speculative_num_draft_tokens=3,
+                max_running_requests=int(d_bs),
+            ),
+            list(maxkv_weights),
+            list(budgets),
+        )
+    except Exception as exc:  # pragma: no cover - geometry is diagnostic
+        refusals.append(
+            "W52 Weg2TpOperatingPointUnpriced: the cost model could not be "
+            "built for %r (%s), so neither operating point can be derived. The "
+            "shipped maxkv vector is unaffected -- it is the budget vector and "
+            "needs no model." % (model, exc)
+        )
+        return ([], refusals)
+
+    # -- the two measured rate vectors, by card NAME -------------------------
+    gemm: List[float] = []
+    membw: List[float] = []
+    try:
+        from sglang.srt.planner.card_rate_pass import load_measured_library
+
+        library = load_measured_library()
+        if library is not None:
+            for c in cards:
+                variant = next(
+                    (
+                        v
+                        for v in (library.variants(c.name) or ())
+                        if getattr(v, "gemm_tflops", None)
+                        and getattr(v, "membw_gbs", None)
+                    ),
+                    None,
+                )
+                if variant is None:
+                    gemm, membw = [], []
+                    break
+                gemm.append(float(variant.gemm_tflops))
+                membw.append(float(variant.membw_gbs))
+    except Exception:
+        gemm, membw = [], []
+
+    if len(gemm) != len(budgets) or len(membw) != len(budgets):
+        refusals.append(
+            "W52 Weg2TpOperatingPointUnpriced: this rig's card-rate library "
+            "carries no measured (gemm_tflops, membw_gbs) pair for every card "
+            "of group D (%s). An operating-point vector IS the measured rate "
+            "ratio, so without the measurement there is no vector to ship -- "
+            "it is refused, never approximated from a nameplate peak. Write "
+            "one with `python -m sglang.srt.planner.card_rate_pass --run`."
+            % ", ".join(c.name for c in cards)
+        )
+        return ([], refusals)
+
+    # -- W54: an explicit vector needs the uneven-TP early-read env fact ------
+    # `_handle_uneven_tp` (server_args.py:12025) reads SGLANG_UNEVEN_DCP* off
+    # os.environ BEFORE the flag half publishes itself (:7186). An explicit
+    # ratio shipped on a boot whose EARLY_READ_FACTS no longer carries that row
+    # for group D would be silently evened out -- a wrong vector that boots.
+    have = {
+        f.env_key for f in facts if f.groups in ("both", "D") and f.env_key
+    }
+    missing = [
+        k
+        for k in ("SGLANG_UNEVEN_DCP", "SGLANG_UNEVEN_DCP_WEIGHTED")
+        if k not in have
+    ]
+    if missing:
+        refusals.append(
+            "W54 Weg2TpOperatingPointNeedsEnvPin: an explicit --rank-tp-ratio "
+            "vector is resolved by _handle_uneven_tp (server_args.py:12025), "
+            "which reads %s off os.environ BEFORE the flag half publishes "
+            "itself (:7186). EARLY_READ_FACTS no longer states %s for group D, "
+            "so shipping the vector would need an env pin in the launcher's own "
+            "shell -- the R19 shape #1235 removed. Refused instead."
+            % (" and ".join(missing), " and ".join(missing))
+        )
+        return ([], refusals)
+
+    # -- the three rows ------------------------------------------------------
+    from sglang.srt.distributed.utils import partition_units
+
+    def _row(position: str, score_name: str, scores, weights) -> DOperatingPointRow:
+        attn_units = partition_units(int(pcm.attn_units), list(weights))
+        scale = int(pcm.q_heads) // max(1, int(pcm.attn_units))
+        attn = tuple(u * scale for u in attn_units)
+        gdn = (
+            tuple(partition_units(int(pcm.gdn_units), list(weights)))
+            if int(pcm.gdn_units) > 1
+            else tuple()
+        )
+        mlp = list(partition_units(int(pcm.mlp_units), list(weights)))
+        round_ms: Optional[float] = None
+        unit = "unpriced"
+        note = ""
+        try:
+            if position == "decode-bs1":
+                # THE RUNTIME'S OWN bs=1 ROOFLINE. Relative units by its own
+                # docstring ("only ratios between candidates are consumed"),
+                # so it is reported as a ratio and never as milliseconds.
+                round_ms = float(
+                    pcm.decode_round_time(mlp, membw, None, list(attn_units))
+                )
+                unit = "relative bs1 round (PerfCostModel.decode_round_time)"
+                note = D705_PROVENANCE
+            else:
+                # COMPUTE-BOUND: the lockstep sum-of-per-family-maxima over the
+                # #324 per-(rank, family) GEMM rates. Seconds, converted to ms.
+                round_ms = (
+                    float(
+                        pcm.prefill_lockstep_compute_time(
+                            mlp, gemm, None, list(attn_units)
+                        )
+                    )
+                    * 1000.0
+                )
+                unit = "ms lockstep GEMM (PerfCostModel.prefill_lockstep_compute_time)"
+        except Exception as exc:
+            round_ms = None
+            unit = "unpriced (%s)" % exc
+        pool: Optional[int] = None
+        try:
+            cap = pcm.predict_capacity(mlp, list(attn_units))
+            pool = int(sum(cap["p"]))
+        except Exception:
+            pool = None
+        return DOperatingPointRow(
+            position=position,
+            score_name=score_name,
+            scores=tuple(float(x) for x in scores),
+            weights=tuple(int(w) for w in weights),
+            attn_heads=attn,
+            gdn_heads=gdn,
+            round_ms=round_ms,
+            round_unit=unit,
+            world_pool_tokens=pool,
+            note=note,
+        )
+
+    rows = [
+        _row("maxkv", "budget MiB (capacity-first)", tuple(budgets), maxkv_weights),
+        _row("decode-bs1", "measured membw_gbs", membw, _weights_from_scores(membw)),
+        _row("decode-bs6", "measured gemm_tflops", gemm, _weights_from_scores(gemm)),
+    ]
+
+    # -- W53: a position that would turn an uneven axis OFF -------------------
+    #
+    # THE OBVIOUS CHECK IS UNREACHABLE AND IS NOT THE ONE MADE HERE. A rank
+    # owning zero heads cannot happen: `partition_units` guarantees every rank
+    # >= 1 unit by construction (distributed/utils.py, "largest-remainder
+    # rounding, every rank gets >= 1 unit"). Asserting against zero heads would
+    # be a guard that can never fire -- written, never executed.
+    #
+    # The reachable failure is SATURATION. When a rank's proportional share of
+    # a family's units falls below one unit, the partitioner floors it to 1 and
+    # the shipped partition stops representing the measured ratio: the axis is
+    # still nominally uneven, but it is pinned at its floor and every further
+    # difference in the measurement is invisible to it. That is an axis
+    # disabled in the only sense that matters to a boot -- it no longer carries
+    # the quantity it exists to carry -- and it is what an extreme rate ratio
+    # actually produces.
+    def _saturated(weights: Sequence[int], units: int) -> Optional[int]:
+        total = sum(int(w) for w in weights)
+        for r, w in enumerate(weights):
+            if total > 0 and float(w) / total * float(units) < 1.0:
+                return r
+        return None
+
+    for row in rows[1:]:
+        sat_family = None
+        sat_rank = None
+        for fam_name, fam_units in (
+            ("attention", int(pcm.attn_units)),
+            ("GDN", int(pcm.gdn_units)),
+        ):
+            if fam_units <= 1:
+                continue
+            r = _saturated(row.weights, fam_units)
+            if r is not None:
+                sat_family, sat_rank = fam_name, r
+                break
+        if sat_family is not None:
+            refusals.append(
+                "W53 Weg2TpOperatingPointDisablesUnevenAxis: position %s "
+                "derives weights %s; rank %d's share of the %d %s units is "
+                "below ONE unit, so partition_units floors it to 1 (it "
+                "guarantees >= 1 per rank) and the shipped partition %s no "
+                "longer represents the measured ratio -- the axis is pinned at "
+                "its floor, which is the axis disabled in the sense a boot can "
+                "observe. Refused rather than shipped."
+                % (
+                    row.position,
+                    list(row.weights),
+                    int(sat_rank),
+                    int(pcm.attn_units) if sat_family == "attention"
+                    else int(pcm.gdn_units),
+                    sat_family,
+                    list(row.attn_heads) if sat_family == "attention"
+                    else list(row.gdn_heads),
+                )
+            )
+        elif len(set(row.weights)) == 1 and len(row.weights) > 1:
+            refusals.append(
+                "W53 Weg2TpOperatingPointDisablesUnevenAxis: position %s "
+                "derives the FLAT vector %s, which is even TP wearing an "
+                "uneven flag. Refused: an axis that resolves to equality is "
+                "the axis disabled." % (row.position, list(row.weights))
+            )
+    return (rows, refusals)
+
+
+def d_operating_point_line(
+    rows: Sequence[DOperatingPointRow], refusals: Sequence[str], shipped: str
+) -> str:
+    """All three vectors, their price and their pool, on ONE line.
+
+    The trade is only readable if the alternatives are printed next to what
+    shipped, in the same units, from the same model, on the same boot.
+    """
+    if not rows:
+        return (
+            "WEG2 D-OPERATING-POINTS UNPRICED (shipped=%s): %s"
+            % (shipped, " | ".join(refusals) or "no reason given")
+        )
+    parts = []
+    for row in rows:
+        priced = (
+            "%.4f %s" % (row.round_ms, row.round_unit)
+            if row.round_ms is not None
+            else row.round_unit
+        )
+        parts.append(
+            "%s%s: weights %s from %s %s -> attn %s GDN %s, round %s, world pool %s"
+            % (
+                row.position,
+                " [SHIPPED]" if row.position == shipped else "",
+                list(row.weights),
+                row.score_name,
+                [round(x, 1) for x in row.scores],
+                list(row.attn_heads),
+                list(row.gdn_heads),
+                priced,
+                row.world_pool_tokens
+                if row.world_pool_tokens is not None
+                else "UNPRICED",
+            )
+        )
+    tail = (" REFUSED: " + " | ".join(refusals)) if refusals else ""
+    note = next((r.note for r in rows if r.note), "")
+    return (
+        "WEG2 D-OPERATING-POINTS (#1241 slice 2, the operating-point axis of "
+        "the #1017 solve; shipped=%s, default %s stays byte-identical). %s. %s%s"
+        % (shipped, D_TP_OBJECTIVE_DEFAULT, " || ".join(parts), note, tail)
+    )
+
+
+@dataclass(frozen=True)
 class DTpRatioDecision:
     """Group D's weight-vector objective, the argv it produces, and its price."""
 
@@ -3440,6 +3820,10 @@ class DTpRatioDecision:
     tune: str
     flags: Tuple[str, ...]
     line: str
+    #: #1241 slice (2). The three-vector provenance line. Empty only when the
+    #: rows could not be built at all, which the line itself then says.
+    op_line: str = ""
+    rows: Tuple[DOperatingPointRow, ...] = ()
 
 
 def d_tp_ratio_decision(
@@ -3506,8 +3890,35 @@ def d_tp_ratio_decision(
             "W47 Weg2TpObjectiveRefused: --d-tp-objective %r is not one of %s."
             % (objective, "|".join(D_TP_OBJECTIVE_CHOICES))
         )
+
+    # #1241 slice (2). Built on EVERY boot, including the maxkv ones, because
+    # the point of the line is that the trade is visible per boot. Refusals
+    # only KILL the launch when the refused position is the one being shipped.
+    op_rows, op_refusals = d_operating_point_rows(cards, budgets, model, d_bs)
+    op_line = d_operating_point_line(op_rows, op_refusals, objective)
+    if objective in D_OPERATING_POINTS:
+        mine = [
+            r
+            for r in op_refusals
+            if objective in r or r.startswith(("W52", "W54"))
+        ]
+        if mine:
+            raise Weg2LaunchRefused(mine[0] + " (position %s was SHIPPED, so "
+                                    "the refusal is fatal here; on a maxkv boot "
+                                    "the same finding is printed and the launch "
+                                    "continues)." % objective)
+
     if objective == "speed":
         flags = ("--rank-tp-ratio", "auto-performance", "--rank-perf-tune", str(tune))
+    elif objective in D_OPERATING_POINTS:
+        row = next(r for r in op_rows if r.position == objective)
+        # THE ONE PLACE THE LAUNCHER WRITES A VECTOR INSTEAD OF NAMING A
+        # RESOLVER. Deliberate and narrow: neither `auto` nor
+        # `auto-performance` moves the attention/GDN split (uneven_perf.py:6571
+        # says so in its own docstring), and the attention barrier IS the
+        # operating-point question. The vector is the measured rate ratio and
+        # nothing else -- no hand numbers, no tuning constant.
+        flags = ("--rank-tp-ratio", ",".join(str(w) for w in row.weights))
     else:
         flags = ("--rank-tp-ratio", "auto")
 
@@ -3637,7 +4048,12 @@ def d_tp_ratio_decision(
         )
     )
     return DTpRatioDecision(
-        objective=objective, tune=str(tune), flags=tuple(flags), line=line
+        objective=objective,
+        tune=str(tune),
+        flags=tuple(flags),
+        line=line,
+        op_line=op_line,
+        rows=tuple(op_rows),
     )
 
 
@@ -5440,10 +5856,25 @@ def build_parser() -> argparse.ArgumentParser:
              f"because speed was never considered. 'speed' emits "
              f"--rank-tp-ratio auto-performance --rank-perf-tune "
              f"<--d-rank-perf-tune>, the runtime's own per-task optimizer. "
-             f"Either way the launcher prints the WEG2 D-WEIGHTS line naming "
-             f"the objective, the weight vector, the per-rank head partition "
-             f"and the estimated cost at the attention barrier. No arm is "
-             f"silent and no arm is solved here.",
+             f"'decode-bs1' and 'decode-bs6' (#1241) add the OPERATING-POINT "
+             f"axis to the same solve and are the only two arms that emit an "
+             f"EXPLICIT --rank-tp-ratio vector: a bs=1 decode round is "
+             f"bandwidth-bound and its vector is the measured membw_gbs ratio, "
+             f"a bs=6 round is compute-bound and its vector is the measured "
+             f"gemm_tflops ratio -- both from this rig's card-rate library, by "
+             f"card NAME, with no hand number anywhere in the derivation. They "
+             f"are needed because neither 'auto' nor 'auto-performance' moves "
+             f"the attention/GDN split (uneven_perf.py:6571) and that split IS "
+             f"the operating-point question. A position whose vector would give "
+             f"any rank ZERO heads of a family, or would need an env pin to be "
+             f"honoured, is REFUSED (W52/W53/W54) rather than shipped. "
+             f"Whatever is chosen, the launcher prints the WEG2 D-WEIGHTS line "
+             f"naming the objective, the weight vector, the per-rank head "
+             f"partition and the estimated cost at the attention barrier, PLUS "
+             f"the WEG2 D-OPERATING-POINTS line carrying ALL THREE vectors "
+             f"with their priced round cost and world pool -- on every boot, "
+             f"including the default one, so the trade is readable per boot. "
+             f"No arm is silent and no arm is solved here.",
     )
     ap.add_argument(
         "--d-rank-perf-tune", default="both",
@@ -6168,6 +6599,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             ns.d_tp_objective, ns.d_rank_perf_tune, cards, budgets_d, ns.model, d_bs
         )
         log(d_ratio.line)
+        log(d_ratio.op_line)
         log(d_tokvec.line)
         env_d = build_env(tree, ns.venv, cvd, store_dir, False, ns.tag, chunk_layers, chunk_count, tms_so, ns.transport, ring_plan, group="D", **_env_knobs(ns))
         spec_d = GroupSpec("D", PORT_D, transport_argv(argv_d(py, ns.model, budgets_d, arm.s_gb, arm.m_mib, store_gib, shlex.split(ns.extra_d), d_bs, max_kv_per_request, x_tokens, ns.num_continuous_decode_steps, ns.d_disable_overlap_schedule, d_ratio.flags, d_tokvec.flags, ns.random_seed, ns.barlink_bar1_cap_cycles, ns.collective_census_interval, admin_api_key=admin_api_key), ns.transport), state.logs["D"], env_d)
@@ -6235,6 +6667,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         ns.d_tp_objective, ns.d_rank_perf_tune, cards, budgets_d, ns.model, d_bs
     )
     log(d_ratio.line)
+    log(d_ratio.op_line)
     log(d_tokvec.line)
     env_d = build_env(tree, ns.venv, cvd, store_dir, ns.debug_hold in ("D", "both"), ns.tag, chunk_layers, chunk_count, tms_so, ns.transport, ring_plan, group="D", **_env_knobs(ns))
     spec_d = GroupSpec("D", PORT_D, transport_argv(argv_d(py, ns.model, budgets_d, arm.s_gb, arm.m_mib, store_gib, shlex.split(ns.extra_d), d_bs, max_kv_per_request, x_tokens, ns.num_continuous_decode_steps, ns.d_disable_overlap_schedule, d_ratio.flags, d_tokvec.flags, ns.random_seed, ns.barlink_bar1_cap_cycles, ns.collective_census_interval, admin_api_key=admin_api_key), ns.transport), state.logs["D"], env_d)

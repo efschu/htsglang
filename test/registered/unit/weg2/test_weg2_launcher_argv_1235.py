@@ -64,7 +64,16 @@ class TestDWeightObjective1017(unittest.TestCase):
 
     def test_default_objective_is_maxkv(self):
         self.assertEqual(D_TP_OBJECTIVE_DEFAULT, "maxkv")
-        self.assertEqual(tuple(D_TP_OBJECTIVE_CHOICES), ("maxkv", "speed"))
+        # #1241 slice (2) ADDED the operating-point positions to this same
+        # solve. The pin is widened deliberately rather than deleted: what it
+        # exists to protect is that the DEFAULT does not move and that the two
+        # original arms keep their exact spelling, both still asserted below
+        # and in test_maxkv_emits_auto_and_speed_emits_auto_performance.
+        self.assertEqual(
+            tuple(D_TP_OBJECTIVE_CHOICES),
+            ("maxkv", "speed", "decode-bs1", "decode-bs6"),
+        )
+        self.assertEqual(D_TP_OBJECTIVE_CHOICES[:2], ("maxkv", "speed"))
         ns = build_parser().parse_args(["--tree", "/t", "--tag", "x"])
         self.assertEqual(ns.d_tp_objective, "maxkv")
 
