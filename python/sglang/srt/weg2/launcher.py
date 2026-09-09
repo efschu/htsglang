@@ -3448,6 +3448,12 @@ def budgets_from_dc(
     # ``user_reserve_by_card`` is the operator's external headroom (default 0);
     # it RAISES the floor and therefore lowers the budget by exactly as much,
     # which is what the knob is for.
+    # #1257c REFUTER FIX 2: the LABEL names the pass ("D(dry, expectation)"),
+    # the GROUP names the floor it keys. They were the same string, so a
+    # decorated dry pass and the real pass would have read different floors the
+    # day D is measured. Both are printed from here on, because an operator
+    # who greps ``group=D`` must find the dry pass too.
+    group = corridor_guard.normalise_group(label)
     floors = corridor_budget.floors_for_cards(cards, label, user_reserve_by_card)
     for i, c in enumerate(cards):
         over = int(overshoot_mib[i]) if overshoot_mib is not None else 0
@@ -3457,7 +3463,8 @@ def budgets_from_dc(
         b = (b // 8) * 8
         out.append(b)
         log(
-            f"budget {label} ordinal={i} nvml_idx={c.nvml_index} {c.name}: "
+            f"budget {label} group={group} ordinal={i} "
+            f"nvml_idx={c.nvml_index} {c.name}: "
             f"{b} MiB = total {c.total_mib} - corridor {corridor} "
             f"(floor {cf.mib} source={cf.source} reserve={cf.reserve_mib} "
             f"+ awake_overshoot {D_AWAKE_OVERSHOOT_MIB}) "
@@ -3475,7 +3482,7 @@ def budgets_from_dc(
     # (User decision 2026-09-09, consequences 3 and 4.)
     if not any(f.actuates for f in floors.values()):
         log(
-            f"WEG2-BUDGET corridor-constrained group={label} "
+            f"WEG2-BUDGET corridor-constrained group={group} pass={label} "
             f"{corridor_budget.UNMEASURED_FLOOR_NAME}: no card's corridor floor "
             f"is priced (every source is UNMEASURED-FALLBACK and every user "
             f"reserve is 0), so the corridor pass is VERDICT-ONLY on this boot "
@@ -3498,7 +3505,7 @@ def budgets_from_dc(
     # margin is the one the world pool is bound by.
     sample, why = corridor_budget.load_sample(corridor_sample_path)
     solve = corridor_budget.solve_corridor_budgets(
-        cards, out, dc_mib, sample, why, floors=floors, group=label
+        cards, out, dc_mib, sample, why, floors=floors, group=f"{group} pass={label}"
     )
     for line in solve.lines:
         log(line)

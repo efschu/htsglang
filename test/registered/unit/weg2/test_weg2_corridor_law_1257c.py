@@ -856,6 +856,17 @@ class RefuterFixTwoTheGroupTagIsAKeyNotALabel(unittest.TestCase):
         self.assertEqual(dry.source, "MEASURED-D")
         self.assertEqual(dry.group, "D")
 
+    def test_the_launcher_prints_the_group_beside_the_pass_label(self):
+        """An operator grepping ``group=D`` must find the dry pass too."""
+        import inspect
+
+        from sglang.srt.weg2 import launcher
+
+        src = inspect.getsource(launcher.budgets_from_dc)
+        self.assertIn("normalise_group(label)", src)
+        self.assertIn("group={group} pass={label}", src)
+        self.assertIn("group={group} ordinal=", src)
+
     def test_normalise_group_is_the_narrow_rule_it_claims(self):
         self.assertEqual(cg.normalise_group("D(dry, expectation)"), "D")
         self.assertEqual(cg.normalise_group("P-warm"), "P")
