@@ -1666,6 +1666,17 @@ _MUTANTS = {
         '        if not getattr(self, "_armed", False):\n            return None, None\n',
         "",
     ),
+    # M13 -- the weg2kvtail4 defect as a mutant: cross into the ring's pool
+    # with the RAW GLOBAL layer id. On a hybrid model the ring pool is sized
+    # for the DENSE full-attention frame, so a global id runs off the buffer
+    # list -- and for a global id that happens to be in range it would return
+    # ANOTHER layer's KV, which is the silent half of the same defect.
+    "M13_global_layer_id": (
+        "        if self._layer_id_transfer is None:\n"
+        "            return layer_id\n"
+        "        return self._layer_id_transfer(layer_id)",
+        "        return layer_id",
+    ),
     # M12 -- report a cutover WIPE as a materialised cast.
     "M12_wipe_as_cast": (
         "        self.counters.wiped_rows += self.rows_held",
@@ -1752,6 +1763,31 @@ class TestMutantsKillNamedAssertions(CustomTestCase):
         ring.reset()
         self.assertEqual(ring.counters.wiped_rows, 0)
         self.assertEqual(ring.counters.materialised_total, 2)
+
+    def test_M13_the_raw_global_layer_id_runs_off_the_ring_pool(self):
+        """The boot weg2kvtail4 killer, pinned as a mutant."""
+        m = _load_mutant("M13_global_layer_id")
+        full_pool = m.KvTailRing.__init__  # touch the module so a typo here fails
+        self.assertTrue(callable(full_pool))
+        pool = _body_pool(64)
+        wrapper = _HybridPoolDouble(pool)
+        ring = m.install_kv_tail_ring(
+            wrapper,
+            m.KvTailKnobs(min_tokens=8, max_tokens=8, ring_rows=16),
+            max_running_requests=1,
+            owned_share_num=1,
+            owned_share_den=1,
+        )
+        # The mutant hands the pool the global id unchanged.
+        self.assertEqual(ring.local_layer_id(27), 27)
+        ring.begin_decode_step()
+        ring_loc, ring_mask = ring.claim(
+            torch.tensor([3, 4], dtype=torch.int64), torch.ones(2, dtype=torch.bool)
+        )
+        k = torch.zeros((2, HEADS, HEAD_DIM), dtype=torch.bfloat16)
+        v = torch.zeros((2, HEADS, HEAD_DIM), dtype=torch.bfloat16)
+        with self.assertRaises(IndexError):
+            ring.write(_Layer(27), ring_loc, ring_mask, k, v)
 
     def test_M3_position_key_breaks_the_compacted_slot_lookup(self):
         m = _load_mutant("M3_position_key")
