@@ -465,6 +465,29 @@ class KvTailCounters:
     #: time (basis 7.2's write-side fallback). There is no second producer.
     clamped_alloc: int = 0
     resets: int = 0
+    #: RESIDENCY, added after boot weg2kvtail5 (#1243). That boot showed
+    #: `rows_held=0` on all 168 lines with `materialised == demoted`, and the
+    #: line could not say WHICH of two very different worlds it was in:
+    #: "rows were held and then demoted" or "rows were never held at all".
+    #: Both print the same. These terms separate them, and every demotion now
+    #: names the path that caused it -- there are exactly THREE producers and
+    #: each has its own total, so a sum can never hide which one moved.
+    demoted_by_age: int = 0
+    demoted_by_free: int = 0
+    demoted_by_pressure: int = 0
+    #: Sampled at the TOP of `plan`, before the age-out that plan may perform.
+    #: `rows_held` alone is sampled after, which is why it read 0 forever.
+    rows_held_pre: int = 0
+    demoted_this_pass: int = 0
+    last_trigger: str = "none"
+    #: THE DENOMINATOR for claimed_total. The ring is armed only on a DECODE
+    #: step (`begin_decode_step`, the F8 fix that keeps it off the extend
+    #: path), so on a prefill-only workload it CANNOT fill -- and that is not
+    #: a policy defect, it is the absence of the population. weg2kvtail5 ran
+    #: 463 prefill batches and 1 decode batch; without this term the log
+    #: cannot distinguish "the demoter is too eager" from "the ring was never
+    #: armed", and the first reading costs a boot.
+    decode_steps: int = 0
     attended_rows: int = 0
     body_rows: int = 0
     untrimmed_owned: int = 0
@@ -716,7 +739,7 @@ class KvTailRing:
         slots = self.to_compact_slots(free_index)
         if slots.numel() == 0:
             return
-        self.materialise_body_rows(slots)
+        self.materialise_body_rows(slots, trigger="free")
 
     def available_size(self) -> int:
         """Free RING rows -- the admission bound of basis 7.10.
@@ -747,6 +770,7 @@ class KvTailRing:
         """
         self._armed = True
         self._claim_cache = None
+        self.counters.decode_steps += 1
 
     def disarm(self) -> None:
         """Every non-decode step: extend, draft, spec, idle.  An unarmed ring
@@ -858,7 +882,9 @@ class KvTailRing:
             dcp_kv_mask=ring_mask,
         )
 
-    def materialise_body_rows(self, slots: torch.Tensor, pressure: bool = False) -> int:
+    def materialise_body_rows(
+        self, slots: torch.Tensor, pressure: bool = False, trigger: str = "free"
+    ) -> int:
         """THE ONE PRIMITIVE for all four cast sites (basis 7.1).
 
         In slice 1 it degenerates to "free the ring rows and clear the mapping",
@@ -882,8 +908,20 @@ class KvTailRing:
         self.rows_held -= n
         self.counters.materialised_total += n
         self.counters.demoted_total += n
+        # ATTRIBUTED, not summed. `pressure` stays the flag the cast primitive
+        # already took; `trigger` names the CALLER, and the two are reconciled
+        # here so a caller cannot claim one and be counted as the other.
         if pressure:
             self.counters.pressure_demotions += n
+            self.counters.demoted_by_pressure += n
+            self.counters.last_trigger = "pressure"
+        elif trigger == "age":
+            self.counters.demoted_by_age += n
+            self.counters.last_trigger = "age"
+        else:
+            self.counters.demoted_by_free += n
+            self.counters.last_trigger = "free"
+        self.counters.demoted_this_pass += n
         return n
 
     def reset(self) -> None:
@@ -917,10 +955,16 @@ class KvTailRing:
         The age-out runs BEFORE the split is accounted, so the counters describe
         the plan that is actually issued.
         """
+        # RESIDENCY BEFORE THE DEMOTION STEP. `rows_held` is read again at
+        # emission time, i.e. AFTER any age-out below; reporting only that is
+        # what made weg2kvtail5's line unable to say whether a row was ever
+        # resident. Reset per pass so the term is a PASS quantity, not a total.
+        self.counters.rows_held_pre = self.rows_held
+        self.counters.demoted_this_pass = 0
         pre = split_owned_indices(kv_indptr, kv_indices, owned_tail_len, self.mapping)
         age_out = pre[4]
         if age_out.numel():
-            self.materialise_body_rows(age_out)
+            self.materialise_body_rows(age_out, trigger="age")
             body_indptr, body_indices, tail_indptr, tail_ring, _ = split_owned_indices(
                 kv_indptr, kv_indices, owned_tail_len, self.mapping
             )
@@ -1000,6 +1044,13 @@ class KvTailRing:
             f"ring_free={self.available_size()} "
             f"clamped_alloc={c.clamped_alloc} "
             f"resets={c.resets} "
+            f"rows_held_pre={c.rows_held_pre} "
+            f"demoted_this_pass={c.demoted_this_pass} "
+            f"trigger={c.last_trigger} "
+            f"demoted_by_age={c.demoted_by_age} "
+            f"demoted_by_free={c.demoted_by_free} "
+            f"demoted_by_pressure={c.demoted_by_pressure} "
+            f"decode_steps={c.decode_steps} "
             f"instrument=plan-counts"
         )
 
