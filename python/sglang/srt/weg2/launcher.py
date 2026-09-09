@@ -6812,9 +6812,7 @@ def solve_p_cut(
     # say which floor it was measured against, and whether that floor was the
     # shipped default or something the operator typed, sends the reader to the
     # wrong flag.
-    pool_floor, pool_floor_from_cut, pool_floor_rule = resolve_pool_floor(
-        ns.pp_solve_pool_floor
-    )
+    pool_floor, pool_floor_from_cut, pool_floor_rule = resolve_pool_floor(ns.pp_solve_pool_floor)
     log("PP-CUT POOL FLOOR RULE: " + pool_floor_rule)
     decision = _cut.solve_launch_cut(
         layer_families=families,
