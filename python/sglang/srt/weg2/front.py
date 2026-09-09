@@ -2652,111 +2652,87 @@ class Front:
         if pending is not None:
             pending.x_requeues = n
         self.counters["W50_Weg2TpPrefillExceeded"] += 1
-        # #1290: TERMINAL ON THE FIRST REFUSAL WHEN THE REASON CANNOT CHANGE.
-        # The requeue is a bet that a full P prefill puts the prefix in the
-        # store, so D's `match_prefix` shrinks the extent below X on the second
-        # offer. That bet is only payable if the KV can come BACK to D, i.e.
-        # if the prompt fits the carrier. Over the carrier it cannot, D sees
-        # the same whole prompt again and refuses again -- which is exactly
-        # what sb5f measured: 159 in-band re-offers, 78 W35s, 93 of 93 ending
-        # in 503 after a median 22.0 s, every one of them a P prefill spent on
-        # a verdict that could not move. So: ask once, up front, whether the
-        # retry can change the answer; when it cannot, refuse by name now.
-        # #1291: A COMPLETED P LEG 1 MAKES THE RE-OFFER TERMINAL.
+        # #1290/#1291/#1296: WHERE THE TERMINAL BELONGS -- AND WHERE IT DOES NOT.
         #
-        # The requeue exists to bet that a full P prefill puts the prefix in
-        # the store so D's `match_prefix` shrinks the extent below X on the
-        # second offer. If leg 1 ALREADY RAN ON P and D still refused, that
-        # bet has been placed and lost ONCE, on this exact request -- and the
-        # requeue's answer is to place it again. Boot weg2sb5g measured the
-        # result: 53 LONG routes, 104 `W50_Weg2TpPrefillExceeded`, 54
-        # `W50_requeue`, 50 `W35_Weg2XReQueueLoop`, and 3 served out of 53
-        # (natural 1/27, salad 2/26), every failure a 503 after 32-64 s.
+        # Two refusals live in this function and they are NOT the same kind
+        # of claim:
         #
-        # THE EVIDENCE THAT IT CANNOT PAY, from D's own log, per request:
-        #   W50 Weg2TpPrefillExceeded rid=a977bd8d... uncached=24657 X=8742
-        #   PHASE-PURITY STORE WITNESS OBSERVATION rid=a977bd8d... state=unprobed
-        # `uncached` is the WHOLE prompt -- D priced it as if P had never run
-        # -- and the witness says the store was never probed for that rid.
-        # `WEG2 X-DEFER` (the completion predicate that exists precisely to
-        # hold a request whose store read is still in flight) fired ZERO
-        # times all boot, so no read was ever pending to wait for. A second P
-        # prefill cannot change any of that.
+        #   W52 (below, FIRST refusal): STRUCTURAL. `carrier_est >
+        #   carrier_max` means P's KV can never be read back into D at all,
+        #   whatever happens next. No second pass can move it, so it is
+        #   terminal on n=1 and stays that way.
         #
-        # So this is a NAMED TERMINAL verdict with the numbers, not a lap.
-        # THE CONDITION IS NARROWER THAN "leg 1 ran", and the slice-A suite
-        # is why. `test_f2a/f2b/t9c` encode a real case this must NOT take:
-        # a leg-2 W31 whose store read simply had not LANDED yet, where a
-        # re-offer through P genuinely serves the client. So the terminal
-        # verdict additionally requires D'S OWN NUMBER to show that NOTHING
-        # came back -- the extent D priced is still the whole request.
+        #   W53 (SECOND refusal only): OBSERVATIONAL. "D priced the whole
+        #   prompt again, so nothing came back" is a statement about what had
+        #   landed AT THAT INSTANT. It is not a proof that nothing ever will.
         #
-        # Same law as #1290 round 2: only a MEASURED quantity may terminate.
-        # D's refusal message carries it verbatim
-        # (`scheduler.py::_weg2_answer_x_refusals`: "...extent after prefix
-        # matching is {uncached}"); when it cannot be parsed the answer is
-        # UNKNOWN and the old re-offer stands, never a refusal on a guess.
-        # #1296: THE COMPARAND IS P'S MEASURED COUNT, NOT THE FRONT'S ESTIMATE.
-        # `est_uncached` is `len(text) / CHARS_PER_TOKEN` (3.0) and its ERROR
-        # CHANGES SIGN WITH THE PROSE. Boot weg2sb5h ran one 62k-char body in
-        # two styles: token salad measured 2.747-2.798 chars/token (13 rids,
-        # estimate too LOW -> `d_extent >= est_uncached` -> W53/413, as
-        # designed) and natural prose 3.355-3.883 (11 rids, estimate too HIGH
-        # -> the same empty handback read as a PARTIAL one -> a second P
-        # prefill and W35/503). Clean 13/11 split with 3.0 sitting in the gap;
-        # the store had handed back NOTHING for all 24 (d_extent == P's leg-1
-        # `prompt_tokens` exactly, `cached_tokens=0`, every one). Cost of the
-        # estimate: 14 second leg-1 prefills, 156.1 s of P wall, 237,983
-        # tokens re-prefilled for 0 cached hits.
-        # P's realised count for THIS request is already on this object
+        # #1291 made W53 terminal on the FIRST refusal. Boot weg2sb5h refutes
+        # that premise on the metal. All 13 W53s fired at `requeue_n=1`; the
+        # 13 rids that were re-offered instead (the prose class, where the
+        # char estimate happened to fall the other side of the comparand) are
+        # the counterfactual #1291 never had:
+        #
+        #   weg2-28-259  leg 1 pt=18559 ct=0 | offer 1 uncached=18559 REFUSED
+        #                -> re-offer -> offer 2 cached_tokens=18557 uncached=2
+        #                   status=200 verdict=serve
+        #   weg2-12-235  leg 1 pt=16522 ct=0 | offer 1 uncached=16522 REFUSED
+        #                -> re-offer -> offer 2 cached_tokens=8190 (PARTIAL)
+        #
+        # 2 of those 13 re-offers paid, and one of them is the ONLY 200 that
+        # population produced. `d_extent == the measured whole prompt` at
+        # offer 1 is therefore indistinguishable, BY EXTENT ALONE, from the
+        # f2a/f2b/t9c case the slice-A suite already protects: a store read
+        # that simply had not LANDED yet. The read lands BETWEEN the two
+        # offers, so no quantity available at the first refusal separates
+        # them -- D's witness census for this boot is `state=unprobed` 186 /
+        # `state=cold` 9 with `X-DEFER` 0, i.e. there is no read-state signal
+        # to gate on either. (Design item: this terminal wants a READ-STATE
+        # witness, not an extent. SECTION 1ax-b.)
+        #
+        # #1291's own justification carries the same refutation: the weg2sb5g
+        # figures it quotes are "3 served out of 53 (natural 1/27, salad
+        # 2/26)" -- three requests that exist only BECAUSE the re-offer ran,
+        # and that a first-refusal terminal deletes. Salad pays at 2/26
+        # there, so this is not a prose-only effect.
+        #
+        # So the terminal MOVES TO THE SECOND REFUSAL, where W35 already
+        # stands, and W35's bare 503 becomes this named, measured 413 --
+        # which is what #1291 actually wanted (name it, 4xx not 503) minus
+        # the lap it should never have skipped. Cost, stated honestly: the
+        # salad class spends its second P prefill again (13 on sb5h).
+        # Benefit: the re-offer that sometimes pays is no longer deleted
+        # before it is placed.
+        #
+        # THE COMPARAND IS P'S MEASURED COUNT, NOT THE FRONT'S ESTIMATE
+        # (#1296 round 1, which stands). `est_uncached` is
+        # `len(text) / CHARS_PER_TOKEN` (3.0) and its ERROR CHANGES SIGN WITH
+        # THE PROSE: on sb5h one 62k-char body measured 2.747-2.798
+        # chars/token as token salad (13 rids, estimate too LOW) and
+        # 3.355-3.883 as natural prose (13 rids, estimate too HIGH), 3.0
+        # sitting in the gap -- so the IDENTICAL empty handback read as
+        # "empty" for one class and "partial" for the other. P's realised
+        # count for THIS request is already on this object
         # (`Pending.leg1_prompt_tokens`, written in `leg1`), so measuring
         # against a measurement costs no new bookkeeping and no second store.
+        # Same law as #1290 round 2: only a MEASURED quantity may terminate.
+        # D's refusal carries its half verbatim
+        # (`scheduler.py::_weg2_answer_x_refusals`: "...extent after prefix
+        # matching is {uncached}"); when it cannot be parsed the answer is
+        # UNKNOWN and the plain W35 503 stands, never a refusal on a guess.
         d_extent = _d_refusal_extent(body)
         measured_whole = int(getattr(pending, "leg1_prompt_tokens", 0) or 0)
         handback_empty = (
             d_extent is not None
             and pending is not None
+            and getattr(pending, "leg1_done", False)
             # 0 is UNKNOWN, never "the store returned nothing": route
             # CARRIER-EXCEEDS sets `leg1_done` WITHOUT running a leg 1
             # (`p.skip_leg1` in the drain), so this is the only field that
             # separates "P ran and nothing came back" from "P never ran".
-            # UNKNOWN re-offers -- the same law as an unparsable body.
+            # That class keeps the plain W35 503 -- named in SECTION 1ax-b.
             and measured_whole > 0
             and d_extent >= measured_whole
         )
-        if pending is not None and getattr(pending, "leg1_done", False) \
-                and handback_empty:
-            self.counters["W53_Weg2StoreHandbackFailed"] += 1
-            detail = (
-                f"{HANDBACK_NAME} rid={rid}: group P completed leg 1 for this "
-                f"request and group D still refused it with {X_REFUSAL_NAME} "
-                f"-- so the prefill P performed did not reach D. Re-offering "
-                f"it would run the same P prefill a second time and reach the "
-                f"same verdict, which is the W35 loop this replaces. D's "
-                f"refusal: {body.decode(errors='replace')[:300]}. Front terms: "
-                f"est_uncached={pending.est_uncached} X="
-                f"{self.tp_prefill_max_tokens} carrier_max="
-                f"{self.carrier_max_tokens} leg1_done=True requeue_n={n} "
-                f"d_extent={d_extent} leg1_prompt_tokens={measured_whole} "
-                f"(d_extent >= leg1_prompt_tokens, the MEASURED whole prompt, "
-                f"so the store handed back NOTHING; est_uncached is the "
-                f"front's char estimate at CHARS_PER_TOKEN={CHARS_PER_TOKEN} "
-                f"and is printed for the error, not compared -- #1296). "
-                f"If D's `uncached` above is the WHOLE prompt, the store did "
-                f"not hand P's pages back: check D's PHASE-PURITY STORE "
-                f"WITNESS state for this rid (`unprobed` = no read was ever "
-                f"issued) and the store size against the P pool."
-            )
-            logger.error("%s", detail)
-            if seat is not None:
-                seat.release(HANDBACK_NAME)
-            return web.json_response(
-                {"error": detail, "x_tokens": self.tp_prefill_max_tokens,
-                 "est_uncached": pending.est_uncached,
-                 "leg1_prompt_tokens": measured_whole,
-                 "carrier_max": self.carrier_max_tokens,
-                 "leg1_done": True},
-                status=413)
 
         # SAME RULE AS THE ROUTER: only a MEASURED count may terminate. D has
         # just answered, so `_note_exact` has this text's real prompt_tokens
@@ -2786,10 +2762,54 @@ class Front:
                  "carrier_est": carrier_est,
                  "carrier_max": self.carrier_max_tokens},
                 status=413)
-        logger.warning("WEG2 X-REQUEUE rid=%s n=%d verdict=%s", rid, n,
-                       "requeue" if n <= 1 else "W35")
+        logger.warning(
+            "WEG2 X-REQUEUE rid=%s n=%d verdict=%s", rid, n,
+            "requeue" if n <= 1 else ("W53" if handback_empty else "W35"))
         if n > 1:
+            # W35 counts the POPULATION -- every rid D refused a second time
+            # after a full P prefill. W53 is the SUBSET of those for which
+            # D's own number shows the store handed nothing back. So
+            # W53 <= W35 always, both denominators are readable straight off
+            # the census, and each still has exactly ONE increment site.
             self.counters["W35_Weg2XReQueueLoop"] += 1
+            if handback_empty:
+                self.counters["W53_Weg2StoreHandbackFailed"] += 1
+                detail = (
+                    f"{HANDBACK_NAME} rid={rid}: group P completed leg 1 for "
+                    f"this request TWICE and group D refused it with "
+                    f"{X_REFUSAL_NAME} both times -- so the prefill P "
+                    f"performed did not reach D, and the one re-offer that "
+                    f"could have changed that is now spent. Refusing by name "
+                    f"rather than a third pass. D's refusal: "
+                    f"{body.decode(errors='replace')[:300]}. Front terms: "
+                    f"front_X={self.tp_prefill_max_tokens} carrier_max="
+                    f"{self.carrier_max_tokens} leg1_done=True requeue_n={n} "
+                    f"d_extent={d_extent} leg1_prompt_tokens={measured_whole} "
+                    f"(d_extent >= leg1_prompt_tokens, the MEASURED whole "
+                    f"prompt, so the store handed back NOTHING). "
+                    f"est_uncached={pending.est_uncached} is the front's char "
+                    f"estimate at CHARS_PER_TOKEN={CHARS_PER_TOKEN}, PRINTED "
+                    f"NOT COMPARED (#1296). front_X is THIS process's "
+                    f"--tp-prefill-max-tokens; D enforces its own and the two "
+                    f"disagreed for all of sb5h, so read the `X=` inside D's "
+                    f"refusal above for the value that actually gated. W53 is "
+                    f"a SUBSET of W35_Weg2XReQueueLoop, its population. If "
+                    f"D's `uncached` above is the WHOLE prompt, the store did "
+                    f"not hand P's pages back: check D's PHASE-PURITY STORE "
+                    f"WITNESS state for this rid (`unprobed` = no read was "
+                    f"ever issued) and the store size against the P pool."
+                )
+                logger.error("%s", detail)
+                if seat is not None:
+                    seat.release(HANDBACK_NAME)
+                return web.json_response(
+                    {"error": detail, "x_tokens": self.tp_prefill_max_tokens,
+                     "est_uncached": pending.est_uncached,
+                     "leg1_prompt_tokens": measured_whole,
+                     "d_extent": d_extent,
+                     "carrier_max": self.carrier_max_tokens,
+                     "leg1_done": True},
+                    status=413)
             logger.error("W35 Weg2XReQueueLoop rid=%s: D refused this rid with W31 a second time after a full "
                          "P prefill; refusing by name rather than a third pass. D said: %s",
                          rid, body.decode(errors="replace")[:400])

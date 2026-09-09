@@ -183,18 +183,42 @@ class ACompletedLegOneMakesTheRefusalTerminal(CustomTestCase):
         self.assertIn("leg1_done", src)
         self.assertIn("status=413", src[i:i + 3000])
 
-    def test_the_terminal_check_precedes_every_requeue_bookkeeping(self):
-        """It must refuse BEFORE the X-REQUEUE line and before the W35 branch,
-        or the counters record a lap that never happened."""
+    def test_the_terminal_check_follows_the_one_re_offer(self):
+        """CORRECTED BY #1296 ROUND 2 -- this assertion pinned the defect.
+
+        It used to require W53 to fire BEFORE the X-REQUEUE line, i.e. on the
+        FIRST refusal.  Boot weg2sb5h refuted the premise on the metal: of the
+        13 rids that were re-offered instead of refused there, two paid --
+        `weg2-28-259` came back `cached_tokens=18557/18559 status=200` on the
+        second offer (the ONLY 200 that population produced) and
+        `weg2-12-235` came back with a partial 8190/16522.  The store read
+        lands BETWEEN the two offers, so at the first refusal an empty
+        handback is indistinguishable by extent from a read that has merely
+        not landed yet.  #1291's own sb5g figures say the same thing: the "3
+        served out of 53" it quotes exist only because the re-offer ran.
+
+        So the terminal now sits on the SECOND refusal, where W35 already
+        stands, and the counters are ordered W35 (population) then W53
+        (subset) -- the opposite of what this test used to demand.
+        """
         src = inspect.getsource(Front._requeue_after_x_refusal)
         # Anchor on the BRANCH, not on the first mention of a name: the
         # docstring and comments name these too, and comparing raw offsets
         # measures the prose. (Assert-on-a-literal, caught for the fourth
         # time on this branch.)
-        i = src.find("W53_Weg2StoreHandbackFailed")
-        self.assertGreater(i, -1)
-        self.assertLess(i, src.find('logger.warning("WEG2 X-REQUEUE'))
-        self.assertLess(i, src.find('self.counters["W35_Weg2XReQueueLoop"]'))
+        i = src.find('self.counters["W53_Weg2StoreHandbackFailed"] += 1')
+        # find() answers -1 for "absent", and -1 satisfies every assertGreater
+        # below -- so each anchor is proved PRESENT before it is ordered.
+        # (Assert-on-a-literal, the trap this class has now hit five times.)
+        requeue_log = src.find('"WEG2 X-REQUEUE rid=%s n=%d verdict=%s"')
+        w35 = src.find('self.counters["W35_Weg2XReQueueLoop"] += 1')
+        for name, off in (("W53 increment", i), ("X-REQUEUE line", requeue_log),
+                          ("W35 increment", w35)):
+            self.assertGreater(off, -1, f"anchor vanished: {name}")
+        self.assertGreater(i, requeue_log,
+                           "W53 must not fire before the one re-offer is spent")
+        self.assertGreater(i, w35,
+                           "W53 is a SUBSET of W35's population, counted after it")
 
     def test_the_refusal_carries_the_numbers_a_reader_needs(self):
         src = inspect.getsource(Front._requeue_after_x_refusal)
@@ -231,11 +255,18 @@ class ACompletedLegOneMakesTheRefusalTerminal(CustomTestCase):
         `leg1_done` False, and P never ran for it. Gating on the presence of
         a Pending would refuse it wrongly."""
         src = inspect.getsource(Front._requeue_after_x_refusal)
-        i = src.find("W53_Weg2StoreHandbackFailed")
-        head = src[max(0, i - 900):i]
-        self.assertIn("leg1_done", head,
+        # #1296 round 2 moved the emitter away from the predicate, so anchor
+        # on the PREDICATE itself rather than on a character window before the
+        # counter -- a window measures the layout, not the condition.
+        i = src.find("handback_empty = (")
+        self.assertGreater(i, -1, "the predicate lost its name")
+        pred = src[i:src.find(")", src.find("d_extent >= measured_whole", i))]
+        self.assertIn("leg1_done", pred,
                       "the branch tests the presence of a Pending rather than "
                       "the completion of a leg 1")
+        self.assertIn("measured_whole > 0", pred,
+                      "a leg 1 that never ran has no measurement, so it is "
+                      "UNKNOWN and must keep its re-offer")
 
     def test_mutant_the_w52_estimate_rule_is_not_weakened(self):
         """MUTANT: W53 must not swallow W52's path. The carrier check that
