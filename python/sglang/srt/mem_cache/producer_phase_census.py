@@ -595,13 +595,22 @@ def reset_for_test() -> None:
     global _ledger_dropped, _ledger_writes, _emitted, _suppressed
     global _late_arrivals, _arrivals, _consults, _consult_misses
     global _dpc, _dpc_emitted, _dpc_suppressed, _dpc_over_bound_seen
-    global _dpc_fence_pending, _dpc_fence_seed
+    global _dpc_fence_pending, _dpc_fence_seed, _dpc_wave_emitted
     _dpc = None
     _dpc_emitted = 0
     _dpc_suppressed = 0
     _dpc_over_bound_seen = 0
     _dpc_fence_pending = 0
     _dpc_fence_seed = 0
+    # "ALL module state" has to mean all of it. This one was missed when
+    # #1154 added it, and the omission was not theoretical: with the wave
+    # flag surviving ``reset_for_test``, whether
+    # ``test_breach_is_never_sampled_away`` passed depended on whether some
+    # EARLIER test in the same xdist worker had emitted -- so a test count
+    # change in an unrelated directory (the serve-next4 train, 2026-09-09)
+    # flipped it red at 88c40263d0 and green at 991181cbd1 on identical
+    # product code.
+    _dpc_wave_emitted = False
     with _gen_lock:
         _gen_phases.clear()
     with _ledger_lock:

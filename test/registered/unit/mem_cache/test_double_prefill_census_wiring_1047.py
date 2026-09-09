@@ -116,6 +116,13 @@ def test_breach_is_never_sampled_away(monkeypatch):
     monkeypatch.setattr(pc, "resolve_chunk_size", lambda s=None: (4096, "test"))
     log = _Log()
     pc.note_double_prefill("clean", 100, 100)
+    # SPEND THE FIRST-OF-WAVE ALLOWANCE FIRST (#1154): the first line of a
+    # wave always goes out, so "the first emit is sampled away" is only ever
+    # true when something before this test already emitted in this process.
+    # It did, by accident, until a test count change elsewhere reshuffled the
+    # xdist distribution. The allowance is now spent explicitly and the
+    # sampling is asserted on the emit that is actually subject to it.
+    assert pc.emit_double_prefill(log) is True        # first of the wave
     assert pc.emit_double_prefill(log) is False       # sampled away
     pc.note_double_prefill("breach", 9000, 0)
     assert pc.emit_double_prefill(log) is True        # forced
