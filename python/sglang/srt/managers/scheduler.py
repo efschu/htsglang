@@ -310,6 +310,7 @@ from sglang.srt.mem_cache.hicache_collective import bounded_wait
 from sglang.srt.mem_cache import kv_cache_builder
 from sglang.srt.planner import transient_census as _transient_census
 from sglang.srt.mem_cache.common import (
+    release_admission_acquired_mamba_slot,
     evict_from_tree_cache,
     maybe_cache_unfinished_req,
     release_kv_cache,
@@ -10070,6 +10071,23 @@ class Scheduler(
                 f"through the prefill group -- never prefilled here silently."
             )
             logger.warning("W50 Weg2TpPrefillExceeded rid=%s uncached=%d X=%d", req.rid, uncached, x)
+            # #Q0/#991 THE THIRD EXIT. A request refused here was matched
+            # first, and the match may have drawn a COW resume slot
+            # (`MambaComponent.finalize_match_result`). It never reaches
+            # `alloc` or `cache_finished_req`, so THIS is the only place that
+            # can give the slot back -- and it did not, which is the on-idle
+            # `leaked_mamba_pages` wall (boot weg2sn5s: one station line for
+            # the whole request, zero #991 lines in the log). Same helper and
+            # same guards as the two sibling exits; no second ledger.
+            if release_admission_acquired_mamba_slot(
+                req, self.tree_cache, site="weg2_x_refusal"
+            ):
+                self.counters_991_x_refusal = getattr(self, "counters_991_x_refusal", 0) + 1
+                logger.info(
+                    "#991 GIVE-BACK rid=%s site=weg2_x_refusal n=%d -- the COW slot this "
+                    "admission's match acquired, returned on the W50 exit",
+                    req.rid, self.counters_991_x_refusal,
+                )
             if self.enable_hicache_storage:
                 self.tree_cache.release_aborted_request(req.rid)
             elif self.enable_hierarchical_cache:
@@ -12674,11 +12692,10 @@ class Scheduler(
                         req, "session", None
                     ):
                         if acquired_here:
-                            self.tree_cache.req_to_token_pool.mamba_allocator.free(
-                                req.mamba_pool_idx.unsqueeze(-1)
+                            # #Q0: one implementation for all three exits.
+                            release_admission_acquired_mamba_slot(
+                                req, self.tree_cache, site="admission_revert"
                             )
-                            req.mamba_pool_idx = None
-                            req.mamba_slot_acquired_this_admission = False
                         else:
                             # AFFIRMATIVE REPORTING, and it is what makes the
                             # next boot the metal proof of this root rather

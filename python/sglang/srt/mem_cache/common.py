@@ -1746,6 +1746,64 @@ def alloc_for_decode(batch: ScheduleBatch, token_per_req: int) -> torch.Tensor:
     return out_cache_loc
 
 
+def release_admission_acquired_mamba_slot(req, tree_cache, *, site: str) -> bool:
+    """#991 give-back, ONE implementation for every admission-refusal exit.
+
+    A prefix match can acquire a Mamba slot SPECULATIVELY, before the request
+    is admitted: ``MambaComponent.finalize_match_result`` draws a COW slot for
+    a resume anchor and stamps ``mamba_slot_acquired_this_admission``. If the
+    request is then refused, whoever refuses owes that slot back -- the request
+    never reaches ``alloc`` or ``cache_finished_req``, so no later station can
+    release it.
+
+    THIS EXISTED TWICE, OPEN-CODED, AND THE THIRD EXIT DID NOT HAVE IT.
+    Measured on boot weg2sn5s @ fd9244056d, all three D ranks:
+
+        22:27:51 #924D station=alloc_cow rid=664901103e55 mamba_slot=[7] site=finalize_match_result
+        22:27:51 WEG2 X-GATE rid=664901103e55 uncached=17236 X=8742 verdict=W31
+        22:27:51 W50 Weg2TpPrefillExceeded rid=664901103e55 uncached=17236 X=8742
+        on_idle: leaked_mamba_pages={7}
+                 mamba_leak_owners=[slot=7 slot_used=True last_event=ALLOC@seq6158
+                                    releaser=none-recorded]
+
+    One station line for the whole request, and ZERO ``#991`` give-back lines
+    in the entire log. Only long prompts trip it (W50 needs uncached > X) and
+    only after a prefix match (no match, no COW acquire) -- which is exactly
+    why a synthetic load with a unique leading nonce never reproduced it and
+    the fleet's shared-prefix shape reproduced it in minutes.
+
+    Returns True when a slot was actually returned, so callers can log it.
+    """
+    if getattr(req, "mamba_pool_idx", None) is None:
+        return False
+    if not getattr(req, "mamba_slot_acquired_this_admission", False):
+        # Not this admission's slot: a batch-owned or session-held slot has a
+        # different releaser and freeing it here is the #1051 double-owned
+        # defect. Narrower than the leak, never wider.
+        return False
+    if getattr(req, "session", None):
+        return False
+    from sglang.srt.mem_cache.allocator.mamba import note_924d
+
+    tree_cache.req_to_token_pool.mamba_allocator.free(req.mamba_pool_idx.unsqueeze(-1))
+    note_924d(
+        "give_back",
+        rid=getattr(req, "rid", None),
+        slot=req.mamba_pool_idx.unsqueeze(-1),
+        dedup=False,
+        extra=f"site={site}",
+    )
+    req.mamba_pool_idx = None
+    # #991: the stamp describes the slot, so it dies with it.
+    req.mamba_slot_acquired_this_admission = False
+    # The match's other per-admission carry-overs die with it too; a refused
+    # request must not carry a resume anchor into its next admission.
+    req.mamba_cow_src_index = None
+    req.mamba_needs_clear = False
+    req.mamba_loadback_anchor_adopted = False
+    return True
+
+
 def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = True):
     # #969K RELEASE-EXIT PROBE (temporary). §O/§Q left one question: the
     # retention path's prefixes never reach the mamba backup writer, the writer

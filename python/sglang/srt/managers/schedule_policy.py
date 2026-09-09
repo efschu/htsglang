@@ -2407,18 +2407,14 @@ class PrefillAdder:
                         # admission. Guarded exactly as the revert site is:
                         # only a slot THIS admission acquired, never a
                         # session-held one.
-                        if (
-                            req.mamba_pool_idx is not None
-                            and getattr(
-                                req, "mamba_slot_acquired_this_admission", False
-                            )
-                            and not getattr(req, "session", None)
-                        ):
-                            self.tree_cache.req_to_token_pool.mamba_allocator.free(
-                                req.mamba_pool_idx.unsqueeze(-1)
-                            )
-                            req.mamba_pool_idx = None
-                            req.mamba_slot_acquired_this_admission = False
+                        # #Q0: one implementation for all three exits.
+                        from sglang.srt.mem_cache.common import (
+                            release_admission_acquired_mamba_slot,
+                        )
+
+                        release_admission_acquired_mamba_slot(
+                            req, self.tree_cache, site="pp_schedule_refused"
+                        )
                         req.mamba_loadback_anchor_adopted = False
 
                         from sglang.srt.managers.pp_admission_congruence import (
