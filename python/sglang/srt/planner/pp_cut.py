@@ -89,7 +89,7 @@ import json
 import math
 import os
 import re
-from typing import Callable, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Callable, ClassVar, Dict, List, Mapping, Optional, Sequence, Tuple
 
 __all__ = [
     "LAYER_FAMILY_ATTENTION",
@@ -2697,17 +2697,184 @@ class PhasePoolModel:
     mamba_mib_per_linear_layer_per_slot: float = 0.0
     mamba_slots: int = 0
 
+    #: The sizer's SECOND floor, and it is not the cell (#1286 F7). The runtime
+    #: does ``available_bytes // cell_size`` and then
+    #: ``// page_size * page_size`` (model_executor/pool_configurator.py:527-531
+    #: ``calculate_pool_sizes``), so a pool is a whole number of PAGES. Both
+    #: reference boots ran ``--page-size 1``, where the second floor is the
+    #: identity and no error was observable; at ``--page-size > 1`` a model that
+    #: floors only by the cell OVER-prices by up to ``page_size - 1`` tokens per
+    #: rank. Mirrored rather than left out because "unobservable on the two
+    #: boots we have" is not "absent from the runtime".
+    page_size: int = 1
+
+    # -- #1286: THE POSTS THE BOOT CHARGES AND THIS MODEL DID NOT ----------
+    #
+    # Measured on boot weg2sb5f (2026-09-09), where the shipped cut was priced
+    # at 499,967 tokens and group P then sized itself at 304,655 -- +64.1 % on
+    # the binding stage. The three halves that were RIGHT are the per-rank
+    # attention count, the 2048-byte cell and the min-over-ranks reduction; the
+    # half that was missing is everything below. Each field's absence is the
+    # OVER-pricing direction, which is the dangerous one: it lets a cut through
+    # the `pool >= --max-kv-per-request` floor that the boot cannot hold.
+
+    #: Per-stage NON-LAYER weight and runtime state, MiB. `weight_mib_per_layer
+    #: * n_layers` prices the transformer layers only; the boot's own
+    #: `weights + runtime state` post additionally carries the embedding on
+    #: stage 0, lm_head plus the MTP/draft head on the last stage, the
+    #: replicated payload EVERY stage carries (vision tower + MTP head, see
+    #: :class:`CheckpointWeightTerms`), and the per-rank runtime state.
+    #: Recovered independently from two boots that ran DIFFERENT cuts
+    #: (44,10,10 and 32,18,14): 2348.2/1100.0/3515.6 against
+    #: 2335.5/1111.2/3520.1 MiB -- agreeing to <= 12.7 MiB, which is what makes
+    #: it a per-STAGE constant rather than something that tracks layer count.
+    #: Empty = UNFUNDED, and it is then named by :attr:`unfunded_posts` rather
+    #: than silently read as zero.
+    stage_fixed_mib: Tuple[float, ...] = ()
+
+    #: The boot's `prefill activation reserve` post, MiB per rank. Measured
+    #: 1.000 GiB on every rank of both boots. Zero = UNFUNDED.
+    activation_reserve_mib: float = 0.0
+
+    #: The boot's `gapped corridor holdback` post, MiB per rank. ``None`` falls
+    #: back to :attr:`arming_floor_mib`, which is what this model charged
+    #: before #1286 -- and the two are NOT the same term: the runtime's post
+    #: list charges a 1024 MiB holdback and no arming floor (the #676 floor is
+    #: held back after the profiler, so it already sits inside the recovered
+    #: reserve, cf. ``boot_instruments.recover_reserve_mib``). The fallback is
+    #: therefore a 205 MiB per-rank OVER-charge -- the one term that errs the
+    #: safe way, named here so it is not read as agreement.
+    corridor_holdback_mib: Optional[float] = None
+
+    #: The runtime's `mamba pre-capture reserve` post, MiB per rank (#1286 F3a).
+    #: Charged by ``model_runner_kv_cache_mixin.py:864-871`` whenever
+    #: ``mambaish_config is not None and post_capture_kv_active`` -- a SECOND
+    #: ``ServerArgs.activation_reserve_mb`` on top of the prefill one. It is
+    #: absent from both reference boots' emitted post lists, i.e.
+    #: ``post_capture_kv_active`` was False on both, which is why this model
+    #: reproduced them at zero. That is a property of those two boots and not of
+    #: the runtime: a post-capture-sizing boot charges it and a model that has
+    #: no field for it cannot even say so. Zero is legal ONLY when the caller
+    #: names it in :attr:`zero_posts_acknowledged`.
+    mamba_precapture_reserve_mib: float = 0.0
+
+    #: The runtime's `speculative intermediate state` post, MiB per rank
+    #: (#1286 F3b). The ``admitted * D * per_req`` half of
+    #: ``_mamba_pool_budget_cost_gb`` (model_runner_kv_cache_mixin.py:2107),
+    #: booked at :2259/:2333/:2399/:2440. Zero on both reference boots -- which
+    #: is exactly why ``mamba_mib_per_linear_layer_per_slot`` recovers cleanly
+    #: from ``size * per_req`` alone (33 linear x 20 slots x 1.5588 = 1028.8 MiB
+    #: against the emitted 1.005 GiB). So that constant silently ASSUMES D = 0,
+    #: and this field is where a boot with D > 0 says otherwise. Zero is legal
+    #: ONLY when the caller names it in :attr:`zero_posts_acknowledged`.
+    speculative_intermediate_mib: float = 0.0
+
+    #: Runtime post names the CALLER has shown are zero for the form it is
+    #: about to price, each acknowledged deliberately (#1286 F3).
+    #:
+    #: WHY AN ACKNOWLEDGEMENT AND NOT A DEFAULT. #1009's lesson is that an
+    #: unpriced term reads as "free", and the repair #1286 shipped was to give
+    #: every runtime post a field. That repair is only half done if a field can
+    #: sit at zero and :attr:`unfunded_posts` returns ``()`` anyway -- the guard
+    #: would then catch a post nobody funded and miss a post nobody could have
+    #: funded, which is the same silence by a different road. Naming the post
+    #: here costs one string and puts the claim, and whoever made it, in the
+    #: launch line.
+    zero_posts_acknowledged: Tuple[str, ...] = ()
+
+    #: The runtime's post NAMES, in the runtime's own order, mapped to the field
+    #: that funds each (#1286 F2/F3). This is the model's statement of WHICH
+    #: list it mirrors, and ``test_pp_cut_boot_sizing_1286`` scans
+    #: ``model_runner_kv_cache_mixin.py`` for ``budget_posts.append`` sites and
+    #: fails when the runtime grows a post that is not in here -- so the mirror
+    #: cannot silently fall behind the thing it mirrors. A guard that only tests
+    #: its own fields for zero can never notice a post it does not know about.
+    RUNTIME_BUDGET_POSTS: ClassVar[Tuple[Tuple[str, str], ...]] = (
+        ("weights + runtime state", "weight_mib_per_layer + stage_fixed_mib"),
+        ("gapped corridor holdback", "corridor_holdback_mib"),
+        ("mamba state pool", "mamba_mib_per_linear_layer_per_slot"),
+        ("speculative intermediate state", "speculative_intermediate_mib"),
+        ("prefill activation reserve", "activation_reserve_mib"),
+        ("mamba pre-capture reserve", "mamba_precapture_reserve_mib"),
+        # Emitted only by the GGUF path, which this launcher never takes: group
+        # P boots a safetensors checkpoint. Funded at zero and acknowledged by
+        # the seam like the other two, rather than omitted from the census.
+        ("GGUF dequant scratch", "gguf_scratch_mib (not modelled -- acknowledge)"),
+    )
+
+    @property
+    def unfunded_posts(self) -> Tuple[str, ...]:
+        """Which of the boot's budget posts this model is not charging.
+
+        #1009's lesson stated as data: an unpriced term does not read as
+        "unknown", it reads as "free". A caller that is about to price a cut
+        the BOOT will then size must refuse on a non-empty answer rather than
+        publish an upper bound as if it were the boot's number.
+
+        ``mamba_mib_per_linear_layer_per_slot`` counts as unfunded at zero even
+        though zero is a legal value for a non-hybrid checkpoint: the caller
+        knows which it has, and a hybrid model priced at zero mamba is exactly
+        the weg2sb5f defect (1.005 GiB unbooked on the binding stage).
+
+        THE TWO POSTS THAT WERE ZERO WITHOUT BEING ASKED (#1286 F3). Before
+        this, ``mamba pre-capture reserve`` and ``speculative intermediate
+        state`` had no field at all, so this property returned ``()`` for a
+        model that could not have charged them -- a guard blind to exactly the
+        posts nobody had thought about, which is the population the guard
+        exists for. They are fields now, and their zero has to be SAID
+        (:attr:`zero_posts_acknowledged`) rather than assumed. Every other post
+        keeps its old rule; nothing that funded a model before funds it less
+        now.
+        """
+        missing: List[str] = []
+        if not self.stage_fixed_mib:
+            missing.append("stage_fixed_mib")
+        if float(self.activation_reserve_mib) <= 0.0:
+            missing.append("activation_reserve_mib")
+        if self.corridor_holdback_mib is None:
+            missing.append("corridor_holdback_mib")
+        if (
+            float(self.mamba_mib_per_linear_layer_per_slot) <= 0.0
+            or int(self.mamba_slots) <= 0
+        ):
+            missing.append("mamba_mib_per_linear_layer_per_slot")
+        acknowledged = {str(x) for x in self.zero_posts_acknowledged}
+        for post, field in (
+            ("mamba pre-capture reserve", "mamba_precapture_reserve_mib"),
+            ("speculative intermediate state", "speculative_intermediate_mib"),
+            ("GGUF dequant scratch", "gguf_scratch_mib"),
+        ):
+            if post in acknowledged:
+                continue
+            if field == "gguf_scratch_mib" or float(getattr(self, field)) <= 0.0:
+                missing.append(f"{field} (runtime post {post!r})")
+        return tuple(missing)
+
 
 def stage_pp_capacities(
     counts: Sequence[int],
     attn_counts: Sequence[int],
     model: PhasePoolModel,
 ) -> Tuple[float, ...]:
-    """Per-rank PP-phase token capacity.
+    """Per-rank PP-phase token capacity -- THE BOOT'S OWN SIZING ARITHMETIC.
 
-    ``free_i / (attention_layers_i * kv_per_token_per_attn_layer)``, with the
-    weights of ALL the rank's layers and its per-sequence mamba states removed
-    from free first.
+    ``floor(available_bytes_r / (attention_layers_r * kv_cell))``, where
+    ``available_bytes`` is what is left after every post the boot charges (see
+    :func:`_stage_free_after_residency`). This is the same expression the
+    runtime prints as ``"KV pool sizing: available_bytes=%d, cell_size=%d ->
+    max_total_num_tokens=%d"``, and BOTH of its floors are part of it -- the
+    cell division and the page rounding underneath it. See
+    :func:`stage_capacity_tokens`: the sizer does integer division and then
+    rounds down to a whole number of pages, so a model that returned the real
+    quotient would differ from the boot by up to one token per rank, and one
+    that skipped the page floor by up to ``page_size - 1`` (#1286 F7/F8).
+
+    #1255: a rank with no full-attention layer is REFUSED, never priced. Its
+    cell is zero, and the runtime's own artifact at ``cell_size=0`` is
+    ``max_total_num_tokens=1048576`` -- a number that would win every maximin
+    while contributing no KV at all. (A gapped map's KV-less stage is a
+    designed shape, not a degenerate boundary; :func:`gapped_phase_pool`
+    EXCLUDES it from the reduction rather than pricing it.)
     """
     caps: List[float] = []
     frees = _stage_free_after_residency(counts, attn_counts, model)
@@ -2717,9 +2884,9 @@ def stage_pp_capacities(
         if free < 0.0:
             raise ValueError(
                 f"cut {tuple(counts)} is infeasible on rank{r}: {n} layers of "
-                f"weights, its mamba states and a "
-                f"{float(model.arming_floor_mib[r]):,.1f} MiB arming floor "
-                f"exceed the {float(model.free_mib[r]):,.1f} MiB free by "
+                f"weights, its per-stage fixed posts, its mamba states, the "
+                f"prefill activation reserve and the corridor holdback exceed "
+                f"the {float(model.free_mib[r]):,.1f} MiB budget by "
                 f"{-free:,.1f} MiB."
             )
         if a <= 0:
@@ -2729,7 +2896,7 @@ def stage_pp_capacities(
                 "modelling artifact, not a real configuration: refusing to price "
                 f"cut {tuple(counts)} with attention counts {tuple(attn_counts)}."
             )
-        caps.append(free / (a * float(model.kv_mib_per_token_per_attn_layer)))
+        caps.append(float(stage_capacity_tokens(free, a, model)))
     return tuple(caps)
 
 
@@ -2739,12 +2906,32 @@ def pp_phase_pool(
     model: PhasePoolModel,
     **forbidden,
 ) -> float:
-    """PP-phase pool bound: the MIN over ranks.
+    """PP-phase pool bound: the MIN over ranks. THE BOOT-SIZING FORMULA.
 
     Takes NO KV-vector argument. Under PP the pool is layer-sharded, so a rank's
     footprint is ``max_total_tokens * attention_layers_r`` and the token vector
     cannot relieve it -- proven on metal in #702, where cutting rank0's vector
     share 4.3x moved its memory by zero.
+
+    THIS IS THE ONE PRICING FUNCTION, AND #1019 IS WHY (#1286).
+    ----------------------------------------------------------
+    ``world_kv_floor`` above carries the counter-example in its own docstring:
+    a pool metric that is not the boot's arithmetic ranked three cuts in the
+    exact REVERSE of the serving world, and it closes with "Use the boot sizing
+    formula for anything the boot will then size." This is that formula --
+    ``min_r floor(available_bytes_r / (n_attn_r * kv_cell))`` -- and every
+    candidate of every objective is priced through it. Not "the kv-floor
+    objective uses one function and the time objectives another": one function,
+    because two functions is two sets of books and the second one is always the
+    one that drifts.
+
+    WHAT IT COST TO LEARN THAT TWICE (boot weg2sb5f, 2026-09-09). The makespan
+    objective shipped 44,10,10 / attn 11,2,3 priced at 499,967 tokens; group P
+    sized 304,655. The shape of the formula was already right here -- the min,
+    the cell, the per-rank attention count all reproduce the boot exactly --
+    and the whole 64.1 % lived in ``available_bytes``, i.e. in the posts
+    :func:`_stage_free_after_residency` was not charging. A ranking is only as
+    good as the quantity it reduces.
     """
     if forbidden:
         raise TypeError(
@@ -3354,26 +3541,95 @@ def _stage_free_after_residency(
     attn_counts: Sequence[int],
     model: PhasePoolModel,
 ) -> Tuple[float, ...]:
-    """Free MiB per stage once weights, mamba state and the arming floor are out.
+    """Free MiB per stage once the BOOT'S OWN BUDGET POSTS are out.
 
     The one arithmetic ``stage_pp_capacities``, ``decoupled_phase_pool`` and
     ``gapped_phase_pool`` all need. Extracted rather than written a third time:
     the three differ in what they DIVIDE by, never in what they subtract, and
     three copies of a subtraction are three places for the mamba term to be
     forgotten in.
+
+    THE POST LIST IS THE RUNTIME'S, IN THE RUNTIME'S ORDER (#1286). The boot
+    emits it verbatim on the success path -- ``model_runner_kv_cache_mixin.py``
+    line 1174, ``"[world_rank %d] KV budget posts (GiB): %s | rest=%.3f"`` --
+    and this function is that list transcribed, so the two can be joined
+    per boot instead of merely compared::
+
+        budget
+          - weights + runtime state      (weight_mib_per_layer * n  +  stage_fixed_mib[r])
+          - gapped corridor holdback     (corridor_holdback_mib, else the arming floor)
+          - mamba state pool             (rate * linear_layers * slots)
+          - speculative intermediate st. (speculative_intermediate_mib)
+          - prefill activation reserve   (activation_reserve_mib)
+          - mamba pre-capture reserve    (mamba_precapture_reserve_mib)
+          = rest, which the sizer then divides by the cell.
+
+    The last three are ZERO on both reference boots and are subtracted anyway,
+    because a term with no field cannot be reported as zero -- it is simply
+    absent, and absent reads as free (#1286 F3). ``unfunded_posts`` makes the
+    caller SAY that it means zero.
+
+    Before #1286 the first line charged only the per-LAYER half and the second
+    charged the arming floor, while the third and fourth were absent entirely.
+    Measured cost on weg2sb5f's binding stage: 10,741 MiB claimed against 6,545
+    MiB the boot actually had.
     """
     out: List[float] = []
+    fixed = tuple(float(x) for x in model.stage_fixed_mib)
+    if fixed and len(fixed) != len(list(counts)):
+        raise ValueError(
+            f"stage_fixed_mib has {len(fixed)} entries for "
+            f"{len(list(counts))} stages; it is a PER-STAGE post (the "
+            "embedding sits on stage 0, lm_head and the draft head on the "
+            "last) and cannot be broadcast."
+        )
     for r, (n, a) in enumerate(zip(counts, attn_counts)):
         linear = int(n) - int(a)
+        holdback = (
+            float(model.arming_floor_mib[r])
+            if model.corridor_holdback_mib is None
+            else float(model.corridor_holdback_mib)
+        )
         out.append(
             float(model.free_mib[r])
             - float(model.weight_mib_per_layer) * int(n)
+            - (fixed[r] if fixed else 0.0)
+            - holdback
             - float(model.mamba_mib_per_linear_layer_per_slot)
             * linear
             * int(model.mamba_slots)
-            - float(model.arming_floor_mib[r])
+            - float(model.speculative_intermediate_mib)
+            - float(model.activation_reserve_mib)
+            - float(model.mamba_precapture_reserve_mib)
         )
     return tuple(out)
+
+
+def stage_capacity_tokens(free_mib: float, attn_layers: int, model: PhasePoolModel) -> int:
+    """``floor(available_bytes / cell) // page_size * page_size`` -- INTEGER.
+
+    The runtime's own two floors, in the runtime's own arithmetic
+    (``pool_configurator.calculate_pool_sizes``: ``available_bytes //
+    self._cell_size``, then ``// page_size * page_size``), both on INTEGER
+    bytes.
+
+    WHY INTEGER AND NOT ``math.floor`` ON A FLOAT QUOTIENT (#1286 F8). The
+    model's free memory is carried in MiB as a float and the boot's is an
+    integer byte count, so a float division puts a 1-ULP knife edge under an
+    assertion that is deliberately an EQUALITY -- the equality is what kills
+    the ``floor -> ceil`` mutant, which moves the answer by exactly one token
+    per rank and is invisible to any percentage tolerance. Here the cell is
+    ``2048 = 2**11`` and every quotient is exactly representable, so the two
+    forms agree; that is a property of this checkpoint's KV geometry and not of
+    the code, and the code should not depend on it.
+    """
+    cell_bytes_per_attn_layer = int(round(float(model.kv_mib_per_token_per_attn_layer) * MIB))
+    cell = int(attn_layers) * cell_bytes_per_attn_layer
+    if cell <= 0:
+        raise ValueError("a KV cell of zero bytes cannot bound a token count.")
+    available_bytes = int(float(free_mib) * MIB)
+    page = max(1, int(model.page_size))
+    return (available_bytes // cell) // page * page
 
 
 def gapped_phase_pool(
@@ -3406,13 +3662,18 @@ def gapped_phase_pool(
         if f < 0.0:
             raise ValueError(
                 f"gapped map {tuple(counts)} is infeasible on rank{r}: its "
-                f"{int(counts[r])} layers of weights, mamba state and arming "
-                f"floor exceed the {float(model.free_mib[r]):,.1f} MiB free by "
+                f"{int(counts[r])} layers of weights, its per-stage fixed "
+                f"posts, mamba state, activation reserve and corridor holdback "
+                f"exceed the {float(model.free_mib[r]):,.1f} MiB budget by "
                 f"{-f:,.1f} MiB."
             )
         if int(a) <= 0:
+            # #1255: EXCLUDED from the reduction, never priced. The number a
+            # KV-less stage would otherwise carry is the runtime's own
+            # cell_size=0 artifact, 1048576 -- large enough to be invisible in
+            # a MIN and to look like a capacity win in any other reduction.
             continue
-        caps.append(f / (int(a) * float(model.kv_mib_per_token_per_attn_layer)))
+        caps.append(float(stage_capacity_tokens(f, int(a), model)))
     if not caps:
         raise ValueError(
             f"gapped map {tuple(counts)} with attention counts "

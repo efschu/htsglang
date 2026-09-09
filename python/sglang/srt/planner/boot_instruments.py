@@ -131,7 +131,11 @@ def world_pool_tokens(
 
 
 def predict_tokens_for_cut(
-    attn_layers: int, rest_mib: float, reserve_mib: Optional[float]
+    attn_layers: int,
+    rest_mib: float,
+    reserve_mib: Optional[float],
+    *,
+    cell_bytes_per_attn_layer: int,
 ) -> int:
     """Tokens a stage will hold, from its rest and its reserve.
 
@@ -143,6 +147,15 @@ def predict_tokens_for_cut(
     Do not pass the arming floor separately -- it is already inside the
     reserve (see :func:`recover_reserve_mib`), and subtracting it again charges
     it twice.
+
+    ``cell_bytes_per_attn_layer`` is mandatory and has no default (#1286 F1,
+    sibling sweep). It used to be a literal ``2048`` -- correct for this
+    checkpoint's fp8_e4m3 KV at 2 x 4 kv-heads x 256 head_dim, and silently
+    wrong for any other dtype or head geometry. The value belongs to the
+    CHECKPOINT, so it comes from the caller that knows which one it has
+    (``pp_cut.kv_mib_per_token_per_attn_layer_from_config`` consumes it from
+    config.json); a default here would let the wrong cell reach an answer that
+    still looks like a token count.
     """
     if reserve_mib is None:
         raise ValueError(
@@ -158,7 +171,12 @@ def predict_tokens_for_cut(
             "token-scaling KV and its capacity is unbounded -- not a real "
             "configuration."
         )
-    cell = int(attn_layers) * 2048  # K+V bytes/token/attn-layer, fp8_e4m3
+    if int(cell_bytes_per_attn_layer) <= 0:
+        raise ValueError(
+            "cell_bytes_per_attn_layer must be positive; a zero cell is the "
+            "runtime's KV-less artifact and prices an unbounded pool (#1255)."
+        )
+    cell = int(attn_layers) * int(cell_bytes_per_attn_layer)
     available = (float(rest_mib) - float(reserve_mib)) * _MIB
     if available <= 0:
         return 0
