@@ -3630,11 +3630,39 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 self._log_prefetch_refused("host_alloc_failed", req_id, need)
                 self.dec_host_lock_ref(last_host_node, anchor_lock_params)
                 return
-            # NOTE: under `symmetric` we deliberately SKIP the truncation-retry so
-            # prefetch_key length (hence prefetch_tokens_occupied and the
-            # min_completed_tokens reduce) stays identical across ranks; a failed
-            # full alloc leaves host_indices None and becomes a negative consensus
-            # vote below rather than a per-rank early-return.
+            # NOTE: under `symmetric` the per-rank truncation-retry above is
+            # still SKIPPED -- a rank deciding its own shorter span is the
+            # per-rank early-return the #580 vote exists to prevent. #1290 (D leg 2)
+            # replaces it with a GROUP trim: the rank allocates what it CAN
+            # here, BEFORE the vote (all-or-none is preserved because nothing
+            # allocates after consensus), votes the allocated LENGTH into the
+            # reduce below, and every rank then trims to the group MIN --
+            # release-only after the vote, never alloc.
+            #
+            # WHY (boot weg2sb5g, 2026-09-09, rid a977bd8d): a leg-2 arrival
+            # whose P leg had completed needed 24,655 tokens against 20,103
+            # available on every rank. The all-or-none vote refused the WHOLE
+            # read (`#915 PREFETCH REFUSED reason=vote_negative`), nothing was
+            # registered, so the X gate's completion predicate had nothing
+            # pending to defer on (`WEG2 X-DEFER` = 0 all boot), the witness
+            # read `unprobed`, and D priced the request at its full extent
+            # (`W50 Weg2TpPrefillExceeded uncached=24657 X=8742`) as if P had
+            # never run. A partial read of 20,103 tokens (page_size=1 on
+            # this form) admits the same request with a remainder of 4,554
+            # <= X.
+            if host_indices is None and symmetric:
+                available_size = self.cache_controller.mem_pool_host.available_size()
+                _partial = min(
+                    prefetch_length,
+                    available_size - (available_size % self.page_size),
+                )
+                if _partial >= self.prefetch_threshold:
+                    host_indices = self.cache_controller.mem_pool_host.alloc(
+                        _partial
+                    )
+                # A failed partial alloc (the room raced away between the
+                # read and the alloc) leaves host_indices None and becomes a
+                # negative consensus vote below, exactly as before.
 
             alloc_failed = host_indices is None
             if host_indices is not None:
@@ -3732,9 +3760,22 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             # slot0 != -slot1 proves the ranks were not all in this collective.
             # Same-width traffic from another site is then a named error on
             # every rank instead of a short read some ranks silently accept.
-            local_ok = 1 if (eligible and not alloc_failed) else 0
+            # #1290 (D leg 2): the third slot votes the allocated LENGTH, not a boolean.
+            # 0 is the old negative vote (ineligible, or nothing allocated);
+            # MIN over the lengths is the group's common readable span. This
+            # STRENGTHENS the old contract: before, every rank registered its
+            # own full-length key iff all could; now every rank registers the
+            # SAME group-minimum length, so the downstream completion reduces
+            # run over identical spans. A rank that allocated more than the
+            # MIN releases its tail AFTER the vote -- release-only, so no rank
+            # can fail after consensus and all-or-none is preserved.
+            local_len = (
+                len(host_indices)
+                if (eligible and not alloc_failed and host_indices is not None)
+                else 0
+            )
             vote = torch.tensor(
-                [_PREFETCH_VOTE_TAG, -_PREFETCH_VOTE_TAG, local_ok], dtype=torch.int
+                [_PREFETCH_VOTE_TAG, -_PREFETCH_VOTE_TAG, local_len], dtype=torch.int
             )
             self._all_reduce_attn_groups(
                 vote,
@@ -3751,11 +3792,24 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                     "different collective on the same group -- the #580 "
                     "failure -- and continuing would corrupt the vote."
                 )
-            if int(vote[2].item()) == 0:
-                # #1068 L1: the group declined. Named on every rank, including
-                # the one whose own gate term or anchor exhaustion lowered
-                # the vote (that rank counted its local term above as well;
-                # the attribution order names the local term first).
+            group_len = int(vote[2].item())
+            if group_len > local_len:
+                # MIN can never exceed a voter's own vote -- same detector
+                # shape as the tag check above: the ranks were not all in
+                # THIS collective, and pricing a span on the foreign number
+                # would corrupt the registration set.
+                raise HiCacheCollectiveDesyncError(
+                    "prefetch_participation_vote returned a group span above "
+                    f"this rank's own vote (group={group_len}, "
+                    f"local={local_len}): a MIN reduce can never do that, so "
+                    "the ranks were not all inside this collective."
+                )
+            if group_len < self.prefetch_threshold:
+                # #1068 L1: the group declined (0, or a common span below the
+                # prefetch threshold). Named on every rank, including the one
+                # whose own gate term or anchor exhaustion lowered the vote
+                # (that rank counted its local term above as well; the
+                # attribution order names the local term first).
                 _note_prefetch_gate("vote_negative", prefetch_length)
                 self._log_prefetch_refused("vote_negative", req_id, need)
                 if host_indices is not None:
@@ -3766,7 +3820,37 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 if anchor_lock_params is not None:
                     self.dec_host_lock_ref(last_host_node, anchor_lock_params)
                 return
-            # Positive consensus: every rank allocated -> all fall through to register.
+            if group_len < len(prefetch_key):
+                # #1290 (D leg 2) GROUP TRIM. Counted and spoken under the SAME key and
+                # line as the non-symmetric truncation (`host_pool_truncated`
+                # stands beside `issued`, never a decline): the span is cut
+                # to the group's common room and the shortened prefetch
+                # registers below with an identical length on every rank.
+                # Release-only: the KV tail rows go back to the pool; the
+                # component transfers are length-independent (the mamba
+                # PREFETCH transfer is one anchor slot with a TRAILING_PAGES
+                # hit policy, resolved from the pages actually fetched).
+                _note_prefetch_gate(
+                    "host_pool_truncated", len(prefetch_key) - group_len
+                )
+                self._log_prefetch_truncated(req_id, need, group_len)
+                if len(host_indices) > group_len:
+                    self.cache_controller.append_host_mem_release(
+                        host_indices=host_indices[group_len:]
+                    )
+                host_indices = host_indices[:group_len]
+                prefetch_key = prefetch_key[:group_len]
+                # The sidecar transfers built above wrap the PRE-trim KV
+                # host_indices; a KV-sourced sidecar would otherwise carry
+                # rows this trim just released. Rebuild from the trimmed
+                # tensor -- the builder wraps and allocates nothing, so this
+                # cannot fail after the consensus.
+                sidecar_xfers = self._build_sidecar_transfers(
+                    CacheTransferPhase.PREFETCH,
+                    PoolTransfer(name=PoolName.KV, host_indices=host_indices),
+                    comp_xfers,
+                )
+            # Positive consensus: every rank registers the group span.
         elif alloc_failed:
             # #1068 L1: a component could not take its host resource -- the
             # #1035 site above, which counted the cause (anchor_pool_exhausted).
