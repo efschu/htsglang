@@ -1969,6 +1969,280 @@ class TestTheMergeSeamRuns(CustomTestCase):
 
 
 # ---------------------------------------------------------------------------
+# T14 -- THE LSE CONVENTION AT THE TAIL MERGE.  Boot weg2kvtail6's correctness
+# defect, rooted and pinned.
+#
+# THE EVIDENCE THAT MAKES THIS A DEFECT AND NOT A PRECISION EFFECT: kvtail6 ran
+# `--kv-cache-dtype bfloat16` for EVERY arm (kt6_boot.sh:27), so the body was
+# bf16 and the ring is bf16.  On that form the tail is MATHEMATICALLY INERT --
+# body attention over N-k rows plus tail attention over k bf16 rows, merged by
+# LSE, must reproduce plain attention to float tolerance.  Measured instead:
+# 20/20 passages divergent, 79.54 % of tokens, first divergence at step 2 on
+# every passage -- step 1 is prefill (identical), step 2 is the FIRST decode
+# with the ring armed, holding ~1 row.  A flip on 20/20 at the first armed
+# decode with ONE ring row is not a near-tie cascade.
+#
+# THE ROOT, at file:line, from the tree's OWN authority:
+#
+#   flashinfer_backend.py:5804   o, lse = self._kv_tail_merge_decode(...)
+#                                 -> merges tail into body with
+#                                    `_safe_merge_state`, i.e. flashinfer's
+#                                    `merge_state`
+#   flashinfer_backend.py:5807   o = cp_lse_ag_out_ar_mha_uneven(o, lse, ...)
+#                                 -> the CROSS-RANK combine
+#   dcp/comm.py:250-253          that combine is PURE NATURAL LOG:
+#                                    global_lse = torch.logsumexp(lses, 0)
+#                                    scale     = torch.exp(lse - global_lse)
+#   flashinfer_backend.py:6490   `_dcp_extend_final_merge`, the in-tree
+#                                 authority, states it verbatim:
+#                                 "flashinfer's ragged forward_return_lse also
+#                                 returns natural-log LSE ... flashinfer's
+#                                 merge_state uses a different internal
+#                                 convention and must NOT be used across these
+#                                 two sources."
+#
+# The comment at :5796-5801 reasons only about the two INPUTS being same-family
+# (body wrapper and tail wrapper both flashinfer), and concludes `merge_state`
+# is safe.  The error is in the OUTPUT: `merge_state` returns an lse in ITS
+# convention, and that value is handed straight to a natural-log consumer.  So
+# on every rank and every step where the tail engages -- and only then -- the
+# cross-rank weighting is computed from an lse in the wrong base.  That is
+# exactly "starts at the first armed decode, affects most tokens, independent
+# of dtype".
+#
+# Corroboration that the tree knows this distinction is real: `cp_lse_ag_out_rs_mla`
+# carries an explicit `is_lse_base_on_e` flag.
+#
+# THE FIX is upstream-minimal: merge tail<->body with the SAME natural-log
+# arithmetic `_dcp_extend_final_merge` already uses, so `lse` stays natural-log
+# all the way into the cross-rank combine.
+# ---------------------------------------------------------------------------
+
+
+def _plain_attention(q, k, v, scale):
+    """Reference: ordinary softmax attention, float64, no LSE anywhere."""
+    q64, k64, v64 = q.double(), k.double(), v.double()
+    # q: [H, D]; k, v: [N, H, D]
+    logits = torch.einsum("hd,nhd->hn", q64, k64) * scale
+    w = torch.softmax(logits, dim=-1)
+    return torch.einsum("hn,nhd->hd", w, v64)
+
+
+def _partial_attention_natural_log(q, k, v, scale):
+    """One partial, returning ``(o, lse)`` with lse in NATURAL LOG -- the
+    documented convention of flashinfer's ``forward_return_lse``."""
+    q64, k64, v64 = q.double(), k.double(), v.double()
+    logits = torch.einsum("hd,nhd->hn", q64, k64) * scale
+    lse = torch.logsumexp(logits, dim=-1)
+    w = torch.softmax(logits, dim=-1)
+    o = torch.einsum("hn,nhd->hd", w, v64)
+    return o, lse
+
+
+def _cross_rank_combine(partials):
+    """The arithmetic of ``cp_lse_ag_out_ar_mha_uneven`` (dcp/comm.py:250-253),
+    reproduced exactly: natural-log logsumexp, then exp(lse - global)."""
+    lses = torch.stack([p[1] for p in partials], dim=0)
+    global_lse = torch.logsumexp(lses, dim=0)
+    out = torch.zeros_like(partials[0][0])
+    for o_i, lse_i in partials:
+        scale = torch.exp(lse_i - global_lse).unsqueeze(-1)
+        scale = torch.nan_to_num(scale, nan=0.0, posinf=0.0, neginf=0.0)
+        out = out + torch.nan_to_num(o_i, nan=0.0) * scale
+    return out, global_lse
+
+
+class TestTheTailMergeKeepsTheNaturalLogConvention(CustomTestCase):
+    """THE ORACLE.  A bf16 body + a bf16 tail over the SAME context must
+    reproduce plain attention -- and must still do so after the cross-rank
+    combine, which is where the convention actually bites.
+
+    TOLERANCE, derived rather than guessed: every merge here runs in float64
+    and the only lossy step is storing K/V as bfloat16 (8 explicit mantissa
+    bits, relative step 2^-8 ~= 3.9e-3). The reference attends the SAME bf16
+    tensors, so the rounding is common-mode and what remains is float64
+    re-association across the split: ~1e-12. `atol=1e-9` is therefore loose by
+    three orders of magnitude and still catches a base-2/base-e confusion,
+    which is a factor of ln(2) ~= 0.69 -- an error of order 1e-1, eleven
+    decades above the floor.
+    """
+
+    H, D, N = 4, 8, 256
+    SCALE = 0.125
+    ATOL = 1e-9
+
+    def _ctx(self, seed=0):
+        g = torch.Generator().manual_seed(seed)
+        q = torch.randn(self.H, self.D, generator=g)
+        k = torch.randn(self.N, self.H, self.D, generator=g).to(torch.bfloat16)
+        v = torch.randn(self.N, self.H, self.D, generator=g).to(torch.bfloat16)
+        return q, k, v
+
+    def _merge(self):
+        from sglang.srt.layers.attention.flashinfer_backend import _kv_tail_lse_merge
+
+        return _kv_tail_lse_merge
+
+    def test_body_plus_tail_reproduces_plain_attention(self):
+        """k = 1, 2, 60 tail rows over a body of a few hundred: the split must
+        be invisible. k=1 is the kvtail6 step-2 shape exactly."""
+        merge = self._merge()
+        q, k, v = self._ctx()
+        ref = _plain_attention(q, k, v, self.SCALE)
+        for kk in (1, 2, 60):
+            with self.subTest(tail_rows=kk):
+                o_b, lse_b = _partial_attention_natural_log(
+                    q, k[: self.N - kk], v[: self.N - kk], self.SCALE
+                )
+                o_t, lse_t = _partial_attention_natural_log(
+                    q, k[self.N - kk :], v[self.N - kk :], self.SCALE
+                )
+                o, _lse = merge(o_b, lse_b, o_t, lse_t)
+                self.assertTrue(
+                    torch.allclose(o, ref, atol=self.ATOL),
+                    f"tail split changed the answer at k={kk}: "
+                    f"max |d| = {float((o - ref).abs().max())}",
+                )
+
+    def test_the_merged_lse_is_still_a_NATURAL_LOG_lse(self):
+        """THE DEFECT, stated as the property that fails.
+
+        The merged lse is consumed by `cp_lse_ag_out_ar_mha_uneven`, which is
+        `torch.logsumexp` / `torch.exp` -- natural log. So the tail merge must
+        return `logaddexp(lse_body, lse_tail)`. flashinfer's `merge_state`
+        returns its own convention, and the difference is a factor of ln(2):
+        invisible on this rank, wrong on the cross-rank weighting.
+        """
+        merge = self._merge()
+        q, k, v = self._ctx(seed=3)
+        o_b, lse_b = _partial_attention_natural_log(q, k[:200], v[:200], self.SCALE)
+        o_t, lse_t = _partial_attention_natural_log(q, k[200:], v[200:], self.SCALE)
+        _o, lse = merge(o_b, lse_b, o_t, lse_t)
+        self.assertTrue(
+            torch.allclose(lse, torch.logaddexp(lse_b, lse_t), atol=self.ATOL),
+            "the merged lse is not a natural-log lse",
+        )
+        # And it is the lse of the WHOLE context, which is the only reading
+        # under which the cross-rank combine is correct.
+        _o_all, lse_all = _partial_attention_natural_log(q, k, v, self.SCALE)
+        self.assertTrue(torch.allclose(lse, lse_all, atol=self.ATOL))
+
+    def test_it_still_composes_with_the_cross_rank_combine(self):
+        """THE ONE THAT THE BOOT ACTUALLY FAILED.
+
+        Three ranks with the uneven-DCP token split 30/17/17. Rank 0 holds a
+        tail; ranks 1 and 2 do not. After each rank merges its own halves, the
+        cross-rank combine must still reproduce plain attention over the whole
+        context. An lse in the wrong base survives the rank-local merge (the
+        output `o` there is fine) and corrupts exactly this step -- which is
+        why the defect needed three ranks and a tail to appear at all.
+        """
+        merge = self._merge()
+        q, k, v = self._ctx(seed=7)
+        ratios = (30, 17, 17)
+        total = sum(ratios)
+        # Token-axis split, the weighted owner rule's shape.
+        idx = torch.arange(self.N)
+        owned = [idx[(idx % total >= sum(ratios[:r])) & (idx % total < sum(ratios[: r + 1]))]
+                 for r in range(3)]
+        self.assertEqual(sum(o.numel() for o in owned), self.N)
+        partials = []
+        for r, own in enumerate(owned):
+            k_r, v_r = k[own], v[own]
+            if r == 0:
+                # This rank's newest 5 owned rows are tail-resident.
+                o_b, lse_b = _partial_attention_natural_log(
+                    q, k_r[:-5], v_r[:-5], self.SCALE
+                )
+                o_t, lse_t = _partial_attention_natural_log(
+                    q, k_r[-5:], v_r[-5:], self.SCALE
+                )
+                partials.append(merge(o_b, lse_b, o_t, lse_t))
+            else:
+                partials.append(
+                    _partial_attention_natural_log(q, k_r, v_r, self.SCALE)
+                )
+        out, _ = _cross_rank_combine(partials)
+        ref = _plain_attention(q, k, v, self.SCALE)
+        self.assertTrue(
+            torch.allclose(out, ref, atol=self.ATOL),
+            f"the tail changed the answer THROUGH the cross-rank combine: "
+            f"max |d| = {float((out - ref).abs().max())}",
+        )
+
+    def test_a_rank_with_no_tail_rows_contributes_nothing(self):
+        """`(o=0, lse=-inf)` is the empty-attention contract. A rank that owns
+        no tail row must contribute NOTHING -- not a zero vector at lse 0,
+        which would be a real partial of weight exp(0) and would dilute the
+        answer."""
+        merge = self._merge()
+        q, k, v = self._ctx(seed=11)
+        o_b, lse_b = _partial_attention_natural_log(q, k, v, self.SCALE)
+        empty_o = torch.zeros_like(o_b)
+        empty_lse = torch.full_like(lse_b, float("-inf"))
+        o, lse = merge(o_b, lse_b, empty_o, empty_lse)
+        self.assertTrue(torch.allclose(o, o_b, atol=self.ATOL))
+        self.assertTrue(torch.allclose(lse, lse_b, atol=self.ATOL))
+
+    def test_both_sides_empty_stays_empty(self):
+        merge = self._merge()
+        o = torch.zeros(self.H, self.D, dtype=torch.float64)
+        lse = torch.full((self.H,), float("-inf"), dtype=torch.float64)
+        out, out_lse = merge(o, lse, o.clone(), lse.clone())
+        self.assertTrue(torch.equal(out, torch.zeros_like(out)))
+        self.assertTrue(bool(torch.isinf(out_lse).all()))
+
+    def test_it_is_the_same_arithmetic_as_the_extend_paths_merge(self):
+        """ONE AUTHORITY. `_dcp_extend_final_merge` already does the
+        natural-log merge for the extend path; the tail must not become a
+        second, drifting opinion of it."""
+        merge = self._merge()
+        g = torch.Generator().manual_seed(5)
+        o_a = torch.randn(3, 4, generator=g).double()
+        o_b = torch.randn(3, 4, generator=g).double()
+        lse_a = torch.randn(3, generator=g).double()
+        lse_b = torch.randn(3, generator=g).double()
+        o, lse = merge(o_a, lse_a, o_b, lse_b)
+        # The extend path's arithmetic, inlined from :6497-6507.
+        final = torch.logaddexp(lse_a.float(), lse_b.float())
+        sc_a = torch.nan_to_num(torch.exp(lse_a.float() - final), nan=0.0,
+                                posinf=0.0, neginf=0.0).unsqueeze(-1)
+        sc_b = torch.nan_to_num(torch.exp(lse_b.float() - final), nan=0.0,
+                                posinf=0.0, neginf=0.0).unsqueeze(-1)
+        expect = o_a.float() * sc_a + o_b.float() * sc_b
+        self.assertTrue(torch.allclose(o.float(), expect, atol=1e-6))
+        self.assertTrue(torch.allclose(lse.float(), final, atol=1e-6))
+
+
+class TestTheTailMergeIsWiredToTheNaturalLogHelper(CustomTestCase):
+    """Source pin: the seam must not route back to `merge_state`.
+
+    The numerical oracle above cannot catch this on a CPU desk -- flashinfer's
+    `merge_state` is a GPU kernel, so any hermetic test necessarily substitutes
+    it and would then measure the substitute's convention, not the shipped
+    one. Stated rather than hidden: this pin is what stands in for that, and it
+    is the reason the defect survived a green desk suite through two boots.
+    """
+
+    def test_the_tail_merge_does_not_use_merge_state(self):
+        import inspect
+
+        from sglang.srt.layers.attention.flashinfer_backend import (
+            FlashInferAttnBackend,
+        )
+
+        src = inspect.getsource(FlashInferAttnBackend._kv_tail_merge_decode)
+        self.assertNotIn(
+            "_safe_merge_state(",
+            src,
+            "the tail merge is back on flashinfer's merge_state, whose lse "
+            "convention the cross-rank combine at flashinfer_backend.py:5807 "
+            "cannot consume (dcp/comm.py:250 is torch.logsumexp)",
+        )
+        self.assertIn("_kv_tail_lse_merge(", src)
+
+
+# ---------------------------------------------------------------------------
 # MUTANTS.  Each must turn a NAMED assertion above red.
 # ---------------------------------------------------------------------------
 
