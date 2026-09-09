@@ -79,6 +79,52 @@ SHADOW_BUDGET_LINE_PREFIX = "WEG2-XCHG-SHADOW-BUDGET"
 MISMATCH_MARKER = "W59 Weg2XchgShadowMismatch"
 UNAFFORDABLE_MARKER = "W61 Weg2XchgShadowUnaffordable"
 
+#: S5c.  THE ACCEPTANCE LINE OF THE DERIVED PLAN, one per leg per rank.
+#:
+#: It shares its prefix with S1's ``emit_plan_line`` on purpose -- one event
+#: name for "this is the plan that will move" -- and the two are told apart by
+#: their FIRST field: S1's is ``dir=``, this one is ``card=``.  A grep for
+#: ``WEG2-XCHG-PLAN `` gets both, which is what a reader asking "what did this
+#: boot plan" wants; ``grep 'WEG2-XCHG-PLAN card='`` is the shadow's own.
+PLAN_LINE_PREFIX = "WEG2-XCHG-PLAN"
+
+#: S5c.  THE PER-CLASS COMPARE LINE.  ``mismatch_message`` (W59) names a class
+#: only when something went WRONG, so a boot whose shadow agreed carried no
+#: per-class evidence at all -- the reader could see ``match=7`` and not which
+#: seven.  This line is emitted for MATCH and MISMATCH alike, one per class,
+#: and it is what item 4 of the S5c brief asks for.
+COMPARE_LINE_PREFIX = "WEG2-XCHG-SHADOW-COMPARE"
+
+#: W64 -- the six ranks did not derive the SAME plan.
+#:
+#: The gate already refused six ranks that chose different CLASS SUBSETS
+#: (``classes_hash``).  S5c gives the plan a product producer, and a producer
+#: has failure modes a subset hash cannot see: a rank whose chunk geometry came
+#: from a stale environment, a rank whose wave partition names a tag this
+#: boot's family does not carry, a rank that enumerated a different class
+#: rotation because its card carries different tags.  All four are "the ranks
+#: are about to shadow different things", all four are silent today, and the
+#: subset hash agrees in every one of them because the subset is CHOSEN from
+#: the rotation and two different rotations can offer the same name.
+#:
+#: TWO SCOPES, ONE CODE, the same shape as W61's ``scope=vram|hop``:
+#:
+#: * ``scope=group`` -- the rows this hook expects do not carry one
+#:   ``plan_digest``.  The digest is over the GROUP-UNIFORM derivation facts
+#:   (chunk geometry, the family tag tuple, the wave partition, the card
+#:   vector, the class rotation and the producer that answered), so a
+#:   disagreement is a boot-configuration divergence and never a property of
+#:   which card a rank sits on.
+#: * ``scope=oncard-peer`` -- this rank and the CO-LOCATED rank of the other
+#:   group derived different CARD geometry for the same classes.  That one is
+#:   not a configuration fault: it is the honest reading of "the two groups do
+#:   not hold the same bytes on this card", which on the P=PP / D=TP form of
+#:   this rig is the expected answer.  It is refused BY NAME here rather than
+#:   left to become a W54 byte-count disagreement three seams later inside the
+#:   on-card consumer, or -- worse -- a red compare that reads as a defect in
+#:   the exchange when it is a statement about the two layouts.
+PLAN_DIVERGED_MARKER = "W64 Weg2XchgShadowPlanDiverged"
+
 #: The comparison granularity, spec section 6/S5: "per-64-MiB-stripe checksum
 #: on device, no host round trip".  It is ALSO the size of the scratch the spec
 #: budgets ("VRAM delta = 64 MiB per consumer rank"), and deliberately the same
@@ -147,6 +193,25 @@ class Weg2XchgShadowMismatch(RuntimeError):
     """
 
 
+class Weg2XchgShadowPlanDiverged(RuntimeError):
+    """W64 -- the ranks of one leg did not derive the same plan.
+
+    NOT a flip refusal, exactly like every other refusal in this module: it
+    switches the SHADOW off for this leg and the ring proceeds untouched.  It
+    is raised only on the ``explicit=True`` arm (an operator who asked for the
+    shadow by name), and on the automatic path it is a verdict reason, a log
+    line under :data:`PLAN_DIVERGED_MARKER` and a ``vote=no`` row.
+
+    WHY IT IS A SEPARATE CODE FROM THE CLASS-SUBSET DISAGREEMENT the gate
+    already reports: that one says "six ranks picked different classes OUT OF
+    THE SAME LIST", which is a rotation bug; this one says "six ranks are not
+    reading the same list at all", which is a boot-configuration or a layout
+    fact.  Folding the two would make a census of "legs the ranks disagreed on"
+    unable to say which question they disagreed about, and the two have
+    different fixes.
+    """
+
+
 class Weg2XchgShadowUnaffordable(RuntimeError):
     """W61 -- the shadow's buffers do not fit this card's free column.
 
@@ -169,9 +234,21 @@ class Weg2XchgShadowUnaffordable(RuntimeError):
 # ---------------------------------------------------------------------------
 
 SHADOW_AREA_OFF = tp.DIR_USED_BYTES
-SHADOW_ROW_BYTES = 64
-#: ``epoch_hash, leg, vote, classes_hash, need_mib, pid, ts_ns`` + a seal.
-SHADOW_ROW_STRUCT = struct.Struct("<7Q")
+#: S5c WIDENED IT FROM 64 TO 128, and the two new words are why.
+#:
+#: The row carried seven words plus its seal, which filled 64 bytes exactly, so
+#: the plan digest and the card fingerprint had nowhere to go.  Folding either
+#: into ``classes_hash`` was the alternative and is refused: the gate reports
+#: that field's disagreement as "the ranks chose different class subsets", and
+#: a plan divergence reported under that sentence sends the reader to the
+#: rotation, which is not where it is.  The dir area has 832,768 bytes of slack
+#: behind this table (``DATA_OFF - DIR_OFF - SHADOW_AREA_END``, asserted by
+#: ``test_the_shadow_rows_are_disjoint_from_s4s``), so the space is free and
+#: 128 keeps the row a power of two the way every other table here is.
+SHADOW_ROW_BYTES = 128
+#: ``epoch_hash, leg, vote, classes_hash, need_mib, pid, ts_ns, plan_digest,
+#: card_digest`` + a seal.
+SHADOW_ROW_STRUCT = struct.Struct("<9Q")
 SHADOW_SEAL_OFF = SHADOW_ROW_STRUCT.size
 SHADOW_AREA_BYTES = xr.N_RANKS * SHADOW_ROW_BYTES
 SHADOW_AREA_END = SHADOW_AREA_OFF + SHADOW_AREA_BYTES
@@ -187,19 +264,27 @@ def _row_off(row: int) -> int:
 
 
 def write_shadow_vote(region: xr.XchgRegion, row: int, *, leg: int, vote: bool,
-                      classes_hash: int, need_mib: int) -> None:
+                      classes_hash: int, need_mib: int,
+                      plan_digest: int = 0, card_digest: int = 0) -> None:
     """Publish this rank's shadow vote.  ONE WRITER PER ADDRESS, sealed.
 
     Same discipline as every other row in this region (S3's gate rows, S4's
     on-card rows): a rank writes only its own row, the row is sealed, and a
     half-written row is not a signal.
+
+    ``plan_digest`` and ``card_digest`` default to 0 so a caller that has no
+    derived plan (a refusal publishing its NO, S3's and S4's own callers) is
+    byte-unchanged; the gate only COMPARES them, and a table of zeros is
+    uniform, so a leg where nobody derived a plan is not turned into a
+    divergence by the fields existing.
     """
     view = region.dir_view()
     off = _row_off(row)
     payload = SHADOW_ROW_STRUCT.pack(
         region.epoch_hash, int(leg), VOTE_YES if vote else VOTE_NO,
         int(classes_hash) & ((1 << 64) - 1), int(need_mib), os.getpid(),
-        time.time_ns())
+        time.time_ns(), int(plan_digest) & ((1 << 64) - 1),
+        int(card_digest) & ((1 << 64) - 1))
     addr = ctypes.addressof(view)
     ctypes.memmove(addr + off, payload, len(payload))
     ctypes.memmove(addr + off + SHADOW_SEAL_OFF,
@@ -212,11 +297,13 @@ def read_shadow_vote(region: xr.XchgRegion, row: int) -> Dict[str, int]:
     addr = ctypes.addressof(view)
     payload = ctypes.string_at(addr + off, SHADOW_ROW_STRUCT.size)
     seal = struct.unpack("<Q", ctypes.string_at(addr + off + SHADOW_SEAL_OFF, 8))[0]
-    eh, leg, vote, classes_hash, need_mib, pid, ts_ns = \
-        SHADOW_ROW_STRUCT.unpack(payload)
+    eh, leg, vote, classes_hash, need_mib, pid, ts_ns, plan_digest, \
+        card_digest = SHADOW_ROW_STRUCT.unpack(payload)
     return {"epoch_hash": eh, "leg": leg, "vote": vote,
             "classes_hash": classes_hash, "need_mib": need_mib, "pid": pid,
-            "ts_ns": ts_ns, "sealed": int(seal == xr._seal(payload))}
+            "ts_ns": ts_ns, "plan_digest": plan_digest,
+            "card_digest": card_digest,
+            "sealed": int(seal == xr._seal(payload))}
 
 
 @dataclass(frozen=True)
@@ -255,13 +342,34 @@ class ShadowVerdict:
         )
 
 
+def plan_divergence_message(*, scope: str, leg: int, epoch: str,
+                            rows: Dict[int, int], field: str) -> str:
+    """W64, naming the scope, the field and every row's own value.
+
+    Every row is printed, not just the odd one out: with six rows and two
+    values there is no "the odd one out", and a message that picks one has
+    decided which side is wrong without knowing.
+    """
+    return (
+        f"{PLAN_DIVERGED_MARKER} scope={scope} leg={leg} epoch={epoch} "
+        f"field={field} "
+        + " ".join(f"[row={r} {field}={v:#x}]" for r, v in sorted(rows.items()))
+        + " -- the ranks of this leg did not derive the same plan, so the "
+        "shadow switches itself off for this leg rather than compare two "
+        "different experiments; the flip proceeds on the ring, which is and "
+        "stays the only authority for weight bytes"
+    )
+
+
 def shadow_gate(region: xr.XchgRegion, row: int, *, leg: int, vote: bool,
                 classes_hash: int, need_mib: int,
                 log: Callable[[str], None],
                 budget_s: float = SHADOW_GATE_BUDGET_S,
                 poll_s: float = xr.GATE_POLL_S,
                 monotonic: Callable[[], float] = time.monotonic,
-                expect_rows: Optional[Sequence[int]] = None) -> ShadowVerdict:
+                expect_rows: Optional[Sequence[int]] = None,
+                plan_digest: int = 0, card_digest: int = 0,
+                peer_row: Optional[int] = None) -> ShadowVerdict:
     """UNIFORM ACROSS THE ROWS IT MAY EXPECT: any of them refusing is a NO.
 
     ``expect_rows`` IS THE ROWS THIS RANK MAY EXPECT AT THIS INSTANT, and it
@@ -307,7 +415,8 @@ def shadow_gate(region: xr.XchgRegion, row: int, *, leg: int, vote: bool,
     wanted = (tuple(range(xr.N_RANKS)) if expect_rows is None
               else tuple(sorted({int(r) for r in expect_rows} | {int(row)})))
     write_shadow_vote(region, row, leg=leg, vote=vote,
-                      classes_hash=classes_hash, need_mib=need_mib)
+                      classes_hash=classes_hash, need_mib=need_mib,
+                      plan_digest=plan_digest, card_digest=card_digest)
     started = monotonic()
     while True:
         rows = {i: read_shadow_vote(region, i) for i in wanted}
@@ -331,6 +440,42 @@ def shadow_gate(region: xr.XchgRegion, row: int, *, leg: int, vote: bool,
                         f"[row={i} classes_hash={rows[i]['classes_hash']:#x}]"
                         for i in wanted),
                     monotonic() - started, expected=len(wanted))
+            # W64, scope=group.  THE DERIVATION'S OWN AGREEMENT, checked in the
+            # rendezvous that already exists rather than in a second one: the
+            # digest is over facts that are GROUP-UNIFORM BY CONSTRUCTION
+            # (S5c), so any disagreement here is a rank reading a different
+            # boot configuration -- a stale chunk geometry, a wave partition
+            # from another family, a rotation its card cannot offer.
+            digests = {i: int(rows[i]["plan_digest"]) for i in wanted}
+            if len(set(digests.values())) != 1:
+                message = plan_divergence_message(
+                    scope="group", leg=int(leg), epoch=str(region.epoch),
+                    rows=digests, field="plan_digest")
+                log(message)
+                return ShadowVerdict(False, len(fresh), wanted,
+                                     "plan-diverged-group",
+                                     monotonic() - started,
+                                     expected=len(wanted))
+            # W64, scope=oncard-peer.  THE CO-LOCATED PAIR's own geometry, and
+            # it is a DIFFERENT question from the one above: the two ranks that
+            # share a card are the two ends of the on-card lane, and if they
+            # framed the same classes differently the transport would discover
+            # it as a W54 byte-count disagreement inside the consumer, after
+            # the source has already filled a bounce and while it waits out its
+            # drain.  Asked here it costs one comparison and names the layouts.
+            if peer_row is not None and int(peer_row) in digests:
+                pair = {int(row): int(card_digest),
+                        int(peer_row): int(rows[int(peer_row)]["card_digest"])}
+                if len(set(pair.values())) != 1:
+                    message = plan_divergence_message(
+                        scope="oncard-peer", leg=int(leg),
+                        epoch=str(region.epoch), rows=pair, field="card_digest")
+                    log(message)
+                    return ShadowVerdict(False, len(fresh),
+                                         tuple(sorted(pair)),
+                                         "plan-diverged-oncard-peer",
+                                         monotonic() - started,
+                                         expected=len(wanted))
             stamps = [int(rows[i]["ts_ns"]) for i in wanted]
             return ShadowVerdict(True, len(fresh), (),
                                  f"all {len(wanted)} expected rows joined",
@@ -729,6 +874,25 @@ def mismatch_message(stripe: Stripe, *, verdict: str, leg: int,
     )
 
 
+def compare_class_line(*, tensor_class: str, stripes: int, nbytes: int,
+                       match: int, mismatch: int, leg: int, epoch: str) -> str:
+    """One line per shadowed CLASS, on the destination, MATCH or not.
+
+    ``bytes=`` is the PAYLOAD the two sides actually summed for this class --
+    not the plan's claim and not the descriptor span -- because that is the
+    denominator of ``stripes=`` and the number a reader needs to know how much
+    of the class the shadow really looked at.  A class whose stripes are all
+    ``MATCH`` gets a line too: the S5b boot ticket could grade only
+    ``mismatch=0``, which is satisfied just as well by a compare that looked at
+    nothing.
+    """
+    return (
+        f"{COMPARE_LINE_PREFIX} leg={leg} epoch={epoch} class={tensor_class} "
+        f"stripes={stripes} bytes={nbytes} match={match} mismatch={mismatch} "
+        f"verdict={MATCH if match and not mismatch else (MISMATCH if mismatch else NO_STRIPES)}"
+    )
+
+
 def slot_checksum_verdict(report: "tp.ChecksumReport") -> str:
     """MATCH / MISMATCH / NOT-REPRESENTABLE for one STAGED batch.
 
@@ -1066,6 +1230,21 @@ class ShadowResult:
     #: tell a priced leg from an unwired one -- ``0`` on the source hook, where
     #: there is no resume to reserve for, and the ``hook=`` token says which.
     resume_reserve_mib: int = 0
+    #: S5c, item 5.  THE WALL THIS LEG SPENT BLOCKED ON ITS CO-LOCATED PEER,
+    #: from ``OnCardStats.drain_wait_s``.  The two hooks sit at opposite ends
+    #: of one flip, so the producer's terminal slot drain and the consumer's
+    #: fill wait can legitimately span it; the block is BOUNDED (it is carved
+    #: out of :data:`SHADOW_HOOK_BUDGET_S` through ``run_leg``'s ``budget_s``)
+    #: and this is what lets a boot PRICE it rather than infer it from
+    #: ``shadow_ms`` minus everything else.  ``0.0`` here is a real
+    #: measurement of "never waited", not an absence: the field is filled on
+    #: every leg that reached the transport, and a leg that did not reached
+    #: no lane to wait in and says so with ``ran=no``.
+    blocked_ms: float = 0.0
+    #: S5c.  The GROUP-UNIFORM digest of the derivation facts this rank voted
+    #: with (:attr:`LegPlanFacts.digest`), on the line so a boot log can be
+    #: censused for the divergence W64 refuses without re-deriving anything.
+    plan_digest: int = 0
 
     def line(self) -> str:
         """THE acceptance line.  One line, both token sets, and here is why.
@@ -1119,6 +1298,8 @@ class ShadowResult:
             f"hop_bound_ms={self.hop_bound_ms:.3f} "
             f"sems_armed={'n/a' if self.sems_armed is None else self.sems_armed} "
             f"resume_reserve_mib={self.resume_reserve_mib} "
+            f"blocked_ms={self.blocked_ms:.3f} "
+            f"plan_digest={self.plan_digest:#x} "
             f"verdict={counters.verdict if self.ran else 'NOT-RUN'} "
             f"reason={self.reason or 'ok'}"
         )
@@ -1205,17 +1386,34 @@ class ShadowRun:
             result.compare_ms = (time.perf_counter() - started) * 1e3
             counters = result.counters
             counters.stripes = len(stripes)
+            per_class: Dict[str, List[int]] = {}
             for stripe in stripes:
                 verdict = classify(stripe)
+                # PER CLASS, FOR EVERY VERDICT (S5c item 4): W59 names a class
+                # only when something went wrong, so a boot whose shadow AGREED
+                # carried no per-class evidence at all -- ``match=7`` and no way
+                # to say which seven, over which bytes.  The class is the unit
+                # this slice rotates over, so it is the unit the reader needs.
+                row = per_class.setdefault(
+                    stripe.tensor_class, [0, 0, 0, 0])
+                row[0] += 1
+                row[1] += int(stripe.nbytes)
                 if verdict == MATCH:
                     counters.match += 1
+                    row[2] += 1
                     continue
+                row[3] += 1
                 if verdict == NOT_REPRESENTABLE:
                     counters.not_representable += 1
                 else:
                     counters.mismatch += 1
                 log(mismatch_message(stripe, verdict=verdict, leg=result.leg,
                                      epoch=result.epoch))
+            for cls in sorted(per_class):
+                n, nbytes, ok, bad = per_class[cls]
+                log(compare_class_line(
+                    tensor_class=cls, stripes=n, nbytes=nbytes, match=ok,
+                    mismatch=bad, leg=result.leg, epoch=result.epoch))
         except BaseException as exc:  # noqa: BLE001 -- an observer never raises
             result.counters.errors.append(f"{type(exc).__name__}: {exc}")
             result.reason = f"compare-failed:{type(exc).__name__}"
@@ -1255,6 +1453,13 @@ def shadow_transport(
     budget_s: float = SHADOW_TRANSPORT_BUDGET_S,
     gate_budget_s: float = SHADOW_GATE_BUDGET_S,
     gate_rows: Optional[Sequence[int]] = None,
+    #: S5c.  The two digests this rank votes with, and the peer whose card
+    #: geometry it is checked against.  Zero/``None`` keeps S3's and S4's
+    #: callers byte-unchanged: a table of zeros is uniform, so the checks are
+    #: inert until a derivation fills them.
+    plan_digest: int = 0,
+    card_digest: int = 0,
+    check_peer_card: bool = False,
     floor_mib: float = SHADOW_FLOOR_MIB,
     resume_reserve_bytes: int = 0,
     explicit: bool = False,
@@ -1330,7 +1535,9 @@ def shadow_transport(
         verdict = shadow_gate(region, row, leg=leg, vote=price.affordable,
                               classes_hash=subset.hash, need_mib=price.need_mib,
                               log=log, budget_s=gate_budget_s,
-                              expect_rows=gate_rows)
+                              expect_rows=gate_rows,
+                              plan_digest=plan_digest, card_digest=card_digest,
+                              peer_row=peer_row if check_peer_card else None)
         log(verdict.line(leg=leg, epoch=epoch))
         # THE SIX RANKS' SPREAD, not this rank's wait -- see
         # :attr:`ShadowVerdict.skew_ms`.
@@ -1394,7 +1601,16 @@ def shadow_transport(
         result.cross_ms = sum(p.elapsed_s for p in out.pairs) * 1e3
         result.oncard_ms = (out.oncard.elapsed_s * 1e3) if out.oncard else 0.0
         result.slot_wait_ms = sum(p.slot_wait_s for p in out.pairs) * 1e3
-        result.issue_ms = max(0.0, elapsed_ms - result.cross_ms - result.oncard_ms)
+        result.blocked_ms = (out.oncard.drain_wait_s * 1e3) if out.oncard else 0.0
+        # THE REMAINDER NAMES WHAT IT SUBTRACTED.  ``issue_ms`` is
+        # ``elapsed - cross - oncard``, and the producer's TERMINAL drain sits
+        # outside ``oncard.elapsed_s`` by design -- so without this term a wait
+        # that can span a whole flip would be reported as issue overhead and
+        # graded against spec 6/S5's "issue_ms <= 5 % of xchg_ms".
+        outside_ms = ((out.oncard.drain_wait_outside_s * 1e3)
+                      if out.oncard else 0.0)
+        result.issue_ms = max(0.0, elapsed_ms - result.cross_ms
+                              - result.oncard_ms - outside_ms)
         result.pieces = sum(p.pieces for p in out.pairs) + len(
             [d for d in leg_descs if _is_on_card(d)])
         result.ran = True
@@ -1480,17 +1696,21 @@ class Weg2XchgShadowRankLocalSkip(RuntimeError):
       another boot);
     * ``no-sems`` -- the 24 names are not openable without ``O_CREAT``;
     * ``no-ops`` -- ``libcudart`` did not load;
-    * ``no-plan`` -- nothing handed this leg descriptors.  **This is the
-      standing state**: :func:`plan_for_leg` has NO PRODUCER in this slice and
-      says so, so a shadow boot today prints ``verdict=NOT-RUN reason=no-plan``
-      on every leg of every rank.  That is the honest reading of "the exchange
-      has no plan on the boot path yet" (``weight_exchange.build_plan`` has
-      zero product callers, verified by ``test_the_plan_seam_has_no_producer``)
-      and it is deliberately a NAMED ABSENCE rather than a fabricated identity
-      plan: a plan a rank derives on its own would compare the ring's restored
-      bytes against a copy of those same bytes and match by construction --
-      the "instrument that cannot go red" this campaign has now paid for three
-      times (``20c5fb9048``, refuter 1, refuter 2).
+    * ``no-plan`` -- nothing handed this leg descriptors.  **S5c ENDED THE
+      STANDING STATE**: :func:`derive_leg_plan` is ``build_plan``'s product
+      caller and the two ``weight_updater`` adapters call it, so a shadow boot
+      no longer prints this on every leg of every rank by construction.  It is
+      now a REFUSAL WITH A CAUSE, and the cause is on the line
+      (``ShadowLegInputs.plan_reason``): ``no-ring-layout`` for a form with no
+      chunked weights family (a P-only boot, a stock boot),
+      ``stale-wave-map``, ``tag-not-in-family``, ``no-chunk-classes``,
+      ``plan-refused:<W-code>``.  What has NOT changed is the prohibition the
+      old wording existed for: the plan is derived from the RING's own layout
+      producers, never from a rank's private guess, because a plan a rank
+      invents on its own compares the ring's restored bytes against a copy of
+      those same bytes and matches by construction -- the "instrument that
+      cannot go red" this campaign has now paid for three times
+      (``20c5fb9048``, refuter 1, refuter 2).
     * ``stale-run`` -- a previous leg's shadow was never closed (see
       :class:`ShadowLeg`).
     """
@@ -1546,19 +1766,376 @@ def rank_local_skip_message(*, reason: str, rank: int, leg: int, epoch: str,
 
 
 # ---------------------------------------------------------------------------
+# S5c -- THE DERIVATION.  build_plan gets its product caller, and every fact
+# it is built from has a named producer in the ring's own code.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class LegPlanFacts:
+    """The GROUP-UNIFORM inputs one leg's plan is derived from.
+
+    "Group-uniform" is the load-bearing word and it is a property of WHERE
+    each field comes from, not a hope about the six ranks agreeing:
+
+    * ``chunk_layers`` / ``chunk_count`` -- ``weg2_memory_saver.
+      weight_chunk_geometry()``, read from the two environment variables the
+      LAUNCHER writes into both groups' environments in one call
+      (``launcher.build_env``), so the six ranks read one value;
+    * ``family_tags`` -- ``weg2_memory_saver.weights_family_tags(count)``, a
+      pure function of ``chunk_count``, in the order the front pauses them;
+    * ``waves`` -- ``weight_exchange.derive_waves`` over those tags;
+    * ``cards`` -- ``weight_exchange_region.N_CARDS``, the module that states
+      "rank *n* of either group runs on ``cards[n]``";
+    * ``classes`` -- the tensor classes of the CHUNK tags, which is a property
+      of the model architecture and not of a card (see :func:`derive_leg_plan`
+      for why the BASE tag's classes are deliberately not in here).
+
+    Nothing on this list is read from a card, a rank, a pointer or a live
+    tensor, which is what makes :attr:`digest` comparable across all six rows
+    of the shadow gate.
+    """
+
+    chunk_layers: int
+    chunk_count: int
+    family_tags: Tuple[str, ...]
+    waves: Tuple[Tuple[str, ...], ...]
+    cards: Tuple[int, ...]
+    classes: Tuple[str, ...]
+    source: str
+
+    @property
+    def digest(self) -> int:
+        """A stable 64-bit digest, through the SAME hash the gate rows use.
+
+        ``xr.epoch_hash`` and never ``hash()``: the built-in is salted per
+        process (PYTHONHASHSEED), so six ranks would publish six numbers for
+        one plan and the gate would refuse every leg -- the identical defect
+        :func:`classes_hash` names one section up.
+        """
+        return xr.epoch_hash("|".join((
+            f"L={self.chunk_layers}", f"N={self.chunk_count}",
+            "family=" + ",".join(self.family_tags),
+            "waves=" + ";".join("+".join(w) for w in self.waves),
+            "cards=" + ",".join(str(c) for c in self.cards),
+            "classes=" + ",".join(self.classes),
+            "source=" + self.source,
+        )))
+
+
+@dataclass(frozen=True)
+class LegPlan:
+    """One leg's derived plan, its provenance, and the two digests.
+
+    ``descs`` is what :func:`run_leg_hook` hands the transport; ``classes`` is
+    the rotation the subset is chosen FROM (never the subset itself -- the
+    subset is a function of the leg index and is chosen by
+    :func:`select_subset`, which stays the one owner of that arithmetic).
+    """
+
+    facts: LegPlanFacts
+    descs: Tuple[object, ...]
+    card: int
+    tags: Tuple[str, ...]
+    card_digest: int
+    undescribed: int = 0
+
+    @property
+    def classes(self) -> Tuple[str, ...]:
+        return self.facts.classes
+
+    @property
+    def slots(self) -> int:
+        """The DESCRIPTOR count -- what the on-card lane batches into slots.
+
+        Named ``slots`` on the line because that is the word the brief's
+        acceptance grep uses; it is not the bounce's ``ONCARD_SLOTS`` depth,
+        which is a constant of the transport and is printed by the budget line
+        as ``oncard_slot_mib``/``oncard_batches``.
+        """
+        return len(self.descs)
+
+    @property
+    def nbytes(self) -> int:
+        return sum(int(d.nbytes) for d in self.descs)
+
+    def line(self) -> str:
+        """THE PROVENANCE LINE, once per leg per rank.
+
+        ``source=`` names the PRODUCERS, not this module: the whole point of
+        S5c is that no number here is a hand list, so the line has to say
+        which functions were asked.  A reader who doubts a field greps the
+        name and lands on the code that answered.
+        """
+        return (
+            f"{PLAN_LINE_PREFIX} card={self.card} "
+            f"tags={','.join(self.tags) or 'none'} "
+            f"classes={','.join(self.classes) or 'none'} "
+            f"slots={self.slots} bytes={self.nbytes} "
+            f"waves={len(self.facts.waves)} "
+            f"undescribed={self.undescribed} "
+            f"plan_digest={self.facts.digest:#x} "
+            f"card_digest={self.card_digest:#x} "
+            f"source={self.facts.source}"
+        )
+
+
+#: The producers, named once, in the order :func:`derive_leg_plan` asks them.
+#: This string goes on the acceptance line as ``source=`` and into the group
+#: digest, so a rank that derived its plan from a DIFFERENT set of producers
+#: (a future second derivation, a monkeypatched test double left armed in a
+#: product process) diverges at the gate instead of silently shadowing
+#: something else.
+PLAN_SOURCE = (
+    "weg2_memory_saver.weight_chunk_geometry+weights_family_tags"
+    "+tag_of_parameter_name,weight_exchange.derive_waves+build_plan,"
+    "weight_exchange_region.N_CARDS"
+)
+
+
+def _plan_refusal(reason: str, detail: str = "") -> Tuple[None, str]:
+    return None, (f"{reason}:{detail}" if detail else reason)
+
+
+def derive_leg_plan(
+    *,
+    hook: str,
+    group: str,
+    peer: str,
+    rank: int,
+    model,
+    region_tag: str = "",
+    chunk_geometry: Optional[Callable[[], Tuple[int, int]]] = None,
+    family_tags: Optional[Callable[[int], Sequence[str]]] = None,
+    tag_of: Optional[Callable[..., str]] = None,
+    waves_of: Optional[Callable[..., Sequence[Sequence[str]]]] = None,
+    n_cards: Optional[int] = None,
+) -> Tuple[Optional[LegPlan], str]:
+    """ONE derivation, from the ring's own layout facts.  ``(plan, reason)``.
+
+    THE PRODUCT CALLER OF ``build_plan`` (SECTION 1ai-S5b-fix's UNPROVEN 2, in
+    its own words: *"``build_plan`` has no product caller ... still the largest
+    gap"*).  Every input is READ FROM A PRODUCER and none is a literal:
+
+    ==================  =======================================================
+    what                who answers
+    ==================  =======================================================
+    layer chunking      ``weg2_memory_saver.weight_chunk_geometry()``
+    the family tags     ``weg2_memory_saver.weights_family_tags(count)``
+    a parameter's tag   ``weight_exchange.tag_of_parameter_name(name, ...)``
+    the flip order      ``weight_exchange.derive_waves(tags, {}, cards)``
+    the card vector     ``weight_exchange_region.N_CARDS``
+    the geometry        ``ParamGeom.of(<the live tensor>)`` -- stride/itemsize
+    the pointers        ``tensor.data_ptr()``, THIS rank's side only
+    ==================  =======================================================
+
+    **THE PLAN IS THIS CARD'S DIAGONAL**, and that is a derivation and not a
+    narrowing: ``weight_exchange_region`` states that rank *n* of either group
+    runs on ``cards[n]``, so the pair ``src_rank == dst_rank == rank`` is the
+    ON-CARD lane S0 probed on silicon and S4 built -- the one lane that exists
+    between two processes that share a card.  Both groups are given the PP form
+    (``tp_size=1``, whole tensors, ``stage`` naming the holder) with DISJOINT
+    ``base`` numbers, which is what makes ``_check_bases``' 6x6 matrix real and
+    ``_check_cards``' on-card theorem true.
+
+    **WHY THE BASE TAG'S CLASSES ARE NOT IN THE ROTATION.**
+    ``chunk_tag_cards``' own docstring says it: the base tag "is NOT in the map
+    -- its bytes (embeddings on the first stage, head on the last, buffers
+    everywhere) are not a layer band".  A rotation built over those classes is
+    a rotation whose CONTENT depends on which card asks, so the six ranks would
+    enumerate different lists, pick different classes for the same leg index
+    and refuse every leg at the ``classes_hash`` check -- a gate that can never
+    open.  The chunk tags ARE layer bands and every card's bands carry the same
+    module classes, so the rotation over them is card-uniform by construction.
+    The base tag's parameters stay in the inventory (they are still planned and
+    still counted) -- they are simply never the rotation's unit.
+
+    **WHAT THIS IS NOT.**  It is not the full cross-group exchange plan.  That
+    one needs BOTH groups' shard vectors and the unsharded extent of every
+    parameter, which is cross-group knowledge no single rank holds, and it is
+    S6/S8's.  What the shadow can honestly claim from this card alone is: *the
+    bytes rank n of one group holds for class C, pushed through the exchange's
+    own on-card lane, are the bytes rank n of the other group holds for class C
+    after the ring restored them.*  On a form where the two groups do NOT hold
+    the same bytes on a card -- this rig's P=PP / D=TP shipping form -- that
+    claim is false, and it is refused BY NAME as W64 ``scope=oncard-peer`` at
+    the gate, on the ``card_digest``, BEFORE a byte moves.  A named refusal is
+    the honest answer there; a red compare would read as a defect in the
+    exchange when it is a statement about two layouts, and a fabricated match
+    would be the instrument-that-cannot-go-red this campaign has paid for three
+    times.
+
+    ``(None, reason)`` on every refusal, and each reason is its own word so a
+    boot log can be censused by cause:
+
+    ``no-model``, ``no-ring-layout`` (this boot has no chunked weights family,
+    which is every form without a ring layout -- a P-only boot, a stock boot),
+    ``stale-wave-map`` (the wave partition is not a permutation of THIS boot's
+    family: the flip order map a rank derived does not belong to the tags it
+    carries), ``tag-not-in-family`` (a live tensor carries a weights-family tag
+    this boot's family does not contain), ``no-carried-tags``,
+    ``no-chunk-classes``, ``plan-refused:<W-code exception>`` (``build_plan``'s
+    own refusals, forwarded verbatim: an empty plan, a barren wave tag, a
+    geometry the shard arithmetic cannot name).
+    """
+    from sglang.srt.managers import weg2_memory_saver as ms
+    from sglang.srt.weg2 import weight_exchange as wx
+
+    chunk_geometry = chunk_geometry or ms.weight_chunk_geometry
+    family_tags = family_tags or ms.weights_family_tags
+    tag_of = tag_of or wx.tag_of_parameter_name
+    waves_of = waves_of or wx.derive_waves
+    cards = tuple(range(int(xr.N_CARDS if n_cards is None else n_cards)))
+    region_tag = region_tag or wx.GPU_MEMORY_TYPE_WEIGHTS
+
+    if model is None:
+        return _plan_refusal("no-model")
+    if not 0 <= int(rank) < len(cards):
+        return _plan_refusal("wrong-card", f"rank={rank} cards={list(cards)}")
+
+    chunk_layers, chunk_count = chunk_geometry()
+    if int(chunk_layers) <= 0 or int(chunk_count) <= 0:
+        return _plan_refusal(
+            "no-ring-layout",
+            f"weight_chunk_geometry()=({chunk_layers}, {chunk_count})")
+    family = tuple(str(t) for t in family_tags(int(chunk_count)))
+
+    # THE FLIP ORDER MAP.  ``{}`` for the tag->card map is READ, not assumed:
+    # ``chunk_tag_cards``' own docstring says an empty map means UNIFORM, and a
+    # rank cannot produce a non-empty one -- the map needs the layer count of
+    # EVERY PP stage and a rank holds only its own.  Uniform yields the single
+    # wave that is this boot's shipping shape (``derive_waves`` refuses the
+    # nine-wave arm on measured transport grounds in its own docstring), and,
+    # unlike a per-card map, it is the same on all six ranks, which is what the
+    # group digest requires.  STATED DEVIATION, carried into UNPROVEN.
+    waves = tuple(tuple(str(t) for t in w) for w in waves_of(family, {}, cards))
+    flat = [t for w in waves for t in w]
+    if sorted(flat) != sorted(family):
+        return _plan_refusal(
+            "stale-wave-map",
+            f"waves={waves} family={family}")
+
+    inventory = []
+    tensor_of: Dict[str, object] = {}
+    carried: set = set()
+    undescribed = 0
+    for name, param in model.named_parameters():
+        tag = str(tag_of(str(name), region_tag=region_tag))
+        if not ms.is_weights_family_tag(tag):
+            continue
+        if tag not in family:
+            return _plan_refusal("tag-not-in-family",
+                                 f"{name} tag={tag} family={family}")
+        try:
+            geom = wx.ParamGeom.of(param, name=str(name), tag=tag,
+                                   shard_axis=wx.REPLICATED, shard_total=0,
+                                   stage=int(rank))
+        except BaseException:  # noqa: BLE001 -- a shape this plan cannot name
+            # COUNTED AND PRINTED, never silently dropped: ``undescribed=`` is
+            # on the acceptance line, so a boot whose plan quietly narrowed is
+            # visible without opening the source.  The classes such a parameter
+            # would have contributed are simply not in the rotation, so the
+            # shadow never claims to have checked them.
+            undescribed += 1
+            continue
+        inventory.append(geom)
+        tensor_of[str(name)] = param
+        carried.add(tag)
+
+    if not inventory:
+        return _plan_refusal("no-carried-tags", f"family={family}")
+
+    # THE ROTATION, over the CHUNK tags only -- see the docstring.
+    classes = tuple(sorted({
+        tensor_class(g.name) for g in inventory
+        if ms.is_weights_chunk_tag(g.tag)}))
+    if not classes:
+        return _plan_refusal("no-chunk-classes",
+                             f"carried={sorted(carried)}")
+
+    waves_here = [[t for t in w if t in carried] for w in waves]
+    waves_here = [w for w in waves_here if w]
+    skip_tags = tuple(t for t in family if t not in carried)
+
+    is_source = str(hook) == HOOK_SOURCE
+    src_name, dst_name = ((str(group), str(peer)) if is_source
+                          else (str(peer), str(group)))
+    src = wx.GroupLayout(name=src_name, cards=cards, tp_size=1, base=0)
+    dst = wx.GroupLayout(name=dst_name, cards=cards, tp_size=1,
+                         base=len(cards))
+
+    def ptr_of(g: str, r: int, name: str) -> Optional[int]:
+        # ``None`` ON THE SIDE THIS RANK DOES NOT OWN, which is XchgDesc's own
+        # documented contract.  The source hook fills src_ptr and the
+        # destination hook fills dst_ptr, and the destination's dst_ptr is what
+        # the compare reads as "the ring-restored bytes".
+        if g != str(group) or int(r) != int(rank):
+            return None
+        tensor = tensor_of.get(str(name))
+        return None if tensor is None else int(tensor.data_ptr())
+
+    def geom_of(g: str, r: int, name: str):
+        if g != str(group) or int(r) != int(rank):
+            return None
+        return tensor_of.get(str(name))
+
+    try:
+        plan = wx.build_plan(inventory, src, dst, waves=waves_here,
+                             ptr_of=ptr_of, geom_of=geom_of,
+                             skip_tags=skip_tags)
+    except BaseException as exc:  # noqa: BLE001 -- a derivation never raises
+        return _plan_refusal("plan-refused", f"{type(exc).__name__}: {exc}")
+
+    facts = LegPlanFacts(
+        chunk_layers=int(chunk_layers), chunk_count=int(chunk_count),
+        family_tags=family, waves=waves, cards=cards, classes=classes,
+        source=PLAN_SOURCE)
+    return LegPlan(facts=facts, descs=tuple(plan.descs), card=int(rank),
+                   tags=tuple(sorted(carried)),
+                   card_digest=card_geometry_digest(inventory, classes),
+                   undescribed=undescribed), ""
+
+
+def card_geometry_digest(inventory: Sequence[object],
+                         classes: Sequence[str]) -> int:
+    """THIS CARD's storage geometry for the rotation's classes, as one number.
+
+    Computed from the INVENTORY and never from the descriptors, and the
+    difference is a measured trap rather than taste: ``_emit`` reads the live
+    pitch through ``geom_of`` for the side the rank owns and DERIVES it for the
+    other, so the source hook and the destination hook of one card build
+    descriptors that differ in ``spitch``/``dpitch`` even when the two
+    processes hold byte-identical storage.  A digest over descriptors would
+    call that a divergence and refuse every leg -- a gate that cannot open,
+    which is exactly the failure mode the base-tag rotation was cut to avoid.
+
+    What the two co-located processes must agree on is the STORAGE: same
+    parameter names, same extents, same itemsize, same tag.  That is what this
+    hashes, and a disagreement in it is the honest reading of "these two groups
+    do not hold the same bytes on this card".
+    """
+    wanted = set(str(c) for c in classes)
+    terms = sorted(
+        f"{g.name}:{g.tag}:{g.rows_full}x{g.cols_full}x{g.itemsize}"
+        for g in inventory if tensor_class(g.name) in wanted)
+    return xr.epoch_hash("|".join(terms))
+
+
+# ---------------------------------------------------------------------------
 # The plan seam.  ONE named absence, not a silent one.
 # ---------------------------------------------------------------------------
 
 #: The descriptor producer for a shadow leg.  ``None`` is the shipping value.
 #:
-#: WHY IT IS EMPTY AND WHY THAT IS NOT A STUB.  ``weight_exchange.build_plan``
-#: needs the inventory and the ``GroupLayout`` of BOTH groups -- cross-group
-#: knowledge no single rank holds -- and it has no product caller anywhere
-#: (``test_the_plan_seam_has_no_producer`` asserts that, so the day S6 wires
-#: one this test goes red and this comment gets updated rather than rotting).
-#: The alternative was an identity plan built from this rank's own
-#: ``named_parameters()``; it is refused above, in W63's ``no-plan`` bullet,
-#: with the reason.
+#: STILL EMPTY IN THE PRODUCT, AND STILL NOT A STUB -- but for a different
+#: reason than before S5c.  The product's producer is
+#: :func:`derive_leg_plan`, called by the two ``weight_updater`` adapters,
+#: which pass a whole :class:`LegPlan` (descriptors AND the digests the gate
+#: needs) through ``run_leg_hook(plan=...)``.  This module-level slot remains
+#: the seam a TEST installs, and a future caller that has descriptors but no
+#: facts can still use it; what it may never carry is a plan a rank invented
+#: from its own ``named_parameters()`` with no cross-check, which is refused
+#: in W63's ``no-plan`` bullet with the reason.
 _PLAN_PROVIDER: Optional[Callable[[str, int, int], Sequence[object]]] = None
 
 
@@ -1650,6 +2227,14 @@ class ShadowLegInputs:
     #: the destination hook are at opposite ends of the flip, so the answer is
     #: different for each.  See :func:`shadow_gate`'s ``expect_rows``.
     gate_rows: Optional[Tuple[int, ...]] = None
+    #: S5c.  WHY THIS LEG HAS NO PLAN, when it has none.  The ``no-plan``
+    #: refusal used to print one fixed sentence -- "build_plan has no product
+    #: caller" -- which was true while there was no derivation and is a LIE the
+    #: moment there is one: a boot that refuses because its chunk geometry is
+    #: unset, or because a rank carries a tag outside the family, would still
+    #: have printed the sentence naming an absence that no longer exists.  The
+    #: adapter derives, and hands the derivation's own reason word down here.
+    plan_reason: str = ""
 
 
 class ShadowLeg:
@@ -1956,6 +2541,12 @@ def run_leg_hook(
     *,
     log: Callable[[str], None],
     descs: Optional[Sequence[object]] = None,
+    #: S5c.  THE DERIVED PLAN, from :func:`derive_leg_plan`.  When it is given,
+    #: it supplies the descriptors, the class rotation the subset is chosen
+    #: from, and the two digests the gate compares -- and its provenance line
+    #: is logged ONCE, here, before anything is opened.  ``descs`` stays for
+    #: the hermetic callers that hand descriptors directly.
+    plan: Optional[LegPlan] = None,
     region=None,
     sems=None,
     ops=None,
@@ -2041,13 +2632,25 @@ def run_leg_hook(
         # so an attach-first order would report ``no-region`` on every rank of
         # every boot that has no region either, and the two reasons would be
         # indistinguishable in exactly the case the reader cares about.
-        plan = tuple(descs) if descs is not None else plan_for_leg(
+        plan_digest = card_digest = 0
+        if plan is not None:
+            # ONCE PER LEG, BEFORE ANYTHING IS OPENED.  A plan that is refused
+            # further down (unaffordable, gate expiry) still leaves its own
+            # provenance on the log, which is the line a reader needs most on a
+            # leg that did not run.
+            log(plan.line())
+            descs = plan.descs
+            classes = classes or plan.classes
+            plan_digest = plan.facts.digest
+            card_digest = plan.card_digest
+        plan_descs = tuple(descs) if descs is not None else plan_for_leg(
             inputs.direction, inputs.leg, inputs.rank)
-        if not plan:
+        if not plan_descs:
             log(rank_local_skip_message(
                 reason="no-plan", rank=inputs.rank, leg=inputs.leg,
                 epoch=inputs.epoch,
-                detail="weight_exchange.build_plan has no product caller"))
+                detail=(inputs.plan_reason
+                        or "no derivation was handed to this leg")))
             if explicit:
                 raise Weg2XchgShadowRankLocalSkip("no-plan")
             result.reason = "no-plan"
@@ -2068,7 +2671,7 @@ def run_leg_hook(
             return result
         is_source = inputs.hook == HOOK_SOURCE
         mode = resolve_shadow_oncard_mode()
-        subset = select_subset(plan, leg=inputs.leg, classes=classes,
+        subset = select_subset(plan_descs, leg=inputs.leg, classes=classes,
                                per_leg=per_leg)
         # NO HAND ARITHMETIC: the slot, the batch count and the hop all come
         # from ``plan_oncard_slot_bytes``'s own :class:`tp.OnCardSlotPlan`,
@@ -2110,7 +2713,7 @@ def run_leg_hook(
             region=leg.region, sems=leg.sems, ops=leg.ops, row=inputs.row,
             rank=inputs.rank, device=inputs.device,
             card_uuid=inputs.card_uuid,
-            uuid_of_card=tuple(inputs.uuid_of_card), descs=plan,
+            uuid_of_card=tuple(inputs.uuid_of_card), descs=plan_descs,
             is_source=is_source, oncard_mode=mode, peer_row=inputs.peer_row,
             wave=inputs.wave, leg=inputs.leg, direction=inputs.direction,
             epoch=inputs.epoch, free_mib=inputs.free_mib, log=log,
@@ -2122,6 +2725,13 @@ def run_leg_hook(
             budget_s=min(float(budget_s), left()),
             gate_budget_s=min(float(gate_budget_s), left()),
             gate_rows=inputs.gate_rows,
+            plan_digest=plan_digest, card_digest=card_digest,
+            # THE CO-LOCATED PAIR IS ONLY VISIBLE TO THE DESTINATION.  The
+            # source expects its own group's three rows (S5b must_fix 1), and
+            # its peer's row is one of the three it does NOT wait for -- asking
+            # it to compare a row it never reads would reintroduce exactly the
+            # circular wait that fix removed.
+            check_peer_card=(not is_source) and card_digest != 0,
             # ONE NUMBER FOR THE DIAGONAL SLOT.  The hook already priced the hop
             # from it; letting ``shadow_transport`` derive it a second time is
             # two computations of one quantity, and the W52 cross-check between
@@ -2170,4 +2780,5 @@ def run_leg_hook(
         result.hook = str(inputs.hook)
         result.resume_reserve_mib = int(
             -(-int(inputs.resume_reserve_bytes) // MIB))
+        result.plan_digest = plan.facts.digest if plan is not None else 0
         log(result.line())
