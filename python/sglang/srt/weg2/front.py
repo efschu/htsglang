@@ -47,6 +47,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import collections
+import contextvars
 import hashlib
 import json
 import logging
@@ -167,6 +168,16 @@ RPC_LEG_BY_PATH = {
 #: `ServerDisconnectedError` is a subclass of `ClientConnectionError`; both are
 #: named so the tuple reads as the intent rather than as a class hierarchy.
 RPC_CONN_ERRORS = (ServerDisconnectedError, ClientConnectionError)
+#: Whether the LAST attempt in THIS task failed in the never-reached-a-handler
+#: shape.  A ContextVar and not an attribute on the front: the two flip legs run
+#: as concurrent tasks under one `asyncio.gather`, so an instance attribute
+#: would be read by whichever leg finished last.  Each task gets its own copy of
+#: the context, and `leg_rpc` awaits `rpc` in its OWN task, so it reads its own
+#: leg's flag and no other's.  It exists so that `rpc` stays the single seam
+#: every caller and every test already stubs, instead of `leg_rpc` reaching past
+#: it into `_rpc_attempt`.
+RPC_LAST_RETRYABLE: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "weg2_rpc_last_retryable", default=False)
 
 
 def rpc_leg_name(path: str) -> str:
@@ -2574,9 +2585,12 @@ class Front:
         that pool.  ``force_close=True`` also guarantees it leaves nothing
         pooled behind, which is what the mutant test reads.
         """
-        code, text, retryable = await self._rpc_attempt(
-            self.session, g, path, body, timeout)
-        if not retryable:
+        # Through `self.rpc`, not past it: that is the seam every caller and
+        # every existing test stubs, and a stub that does not set the flag is
+        # simply never retried -- the old behaviour, unchanged.
+        RPC_LAST_RETRYABLE.set(False)
+        code, text = await self.rpc(g, path, body, timeout)
+        if not RPC_LAST_RETRYABLE.get():
             return code, text
         if (body or {}).get("epoch") is None:
             logger.info(
@@ -2642,6 +2656,7 @@ class Front:
                 leg, g.name, path, epoch, info["conn"], sport, idle, total,
                 status, (time.perf_counter() - t0) * 1000,
             )
+            RPC_LAST_RETRYABLE.set(False)
             return status, text, False
         except Exception as e:  # noqa: BLE001
             idle, total = rpc_pool_counts(session)
@@ -2649,6 +2664,7 @@ class Front:
             # connection object to read a sockname off (instrument limits at
             # RPC_CONN_ERRORS above).  Absent, never 0.
             retryable = isinstance(e, RPC_CONN_ERRORS) and not got_response
+            RPC_LAST_RETRYABLE.set(retryable)
             logger.info(
                 "WEG2-RPC RAISED leg=%s group=%s path=%s epoch=%s conn=%s sport=n/a "
                 "pool_idle=%d pool_total=%d after_ms=%.0f got_response=%s retryable=%s "

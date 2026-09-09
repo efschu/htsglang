@@ -21,6 +21,8 @@ import functools
 import logging
 import re
 
+from aiohttp import ServerDisconnectedError
+
 from sglang.srt.weg2.front import (
     Group,
     rpc_leg_name,
@@ -414,3 +416,48 @@ def test_both_handlers_guard_first_and_commit_every_return():
         for r in rets:
             d = ast.dump(r)
             assert ("_weg2_leg_commit" in d) or ("replay" in d), (name, d[:200])
+
+
+# ------------------------------------------------- the discriminator, direct
+#
+# WHY A FAKE HERE AND REAL SOCKETS EVERYWHERE ELSE.  Measured against aiohttp
+# 3.14.1 on this tree: a peer that drops mid-body -- FIN or RST, both tried --
+# raises `ClientPayloadError`, which is NOT a `ClientConnectionError`.  So on
+# real sockets the exception CLASS alone already stops a retry, and the
+# `not got_response` guard cannot be shown to carry any weight.  It carries
+# weight against the shape aiohttp is not obliged to keep raising that way, and
+# the only way to exercise that branch is to hand `_rpc_attempt` the shape
+# directly.  A test that cannot fail on a broken guard is not a test.
+class _RaisingResponse:
+    status = 200
+    _protocol = None
+
+    async def read(self):
+        raise ServerDisconnectedError("dropped while reading the body")
+
+
+class _Ctx:
+    async def __aenter__(self):
+        return _RaisingResponse()
+
+    async def __aexit__(self, *a):
+        return False
+
+
+class _SessionStub:
+    connector = None
+
+    def post(self, *a, **k):
+        return _Ctx()
+
+
+@sync
+async def test_a_connection_error_after_the_response_line_is_not_retryable():
+    front = FrontStub(_SessionStub())
+    g = Group(name="P", url="http://127.0.0.1:1")
+    code, text, retryable = await front._rpc_attempt(
+        _SessionStub(), g, SLEEP, {"tags": ["kv_cache"], "epoch": "e9"}, 5)
+    assert code == 0 and "Disconnected" in text
+    # MUTANT M1 (drop the `not got_response` guard): this flips to True and the
+    # front would re-apply a leg whose handler has already run.
+    assert retryable is False

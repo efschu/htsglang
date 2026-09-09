@@ -94,11 +94,26 @@ class TheBootKiller(CustomTestCase):
             )
 
     def test_the_front_sends_the_bearer_token_on_every_rpc(self):
-        """THE fix. Pre-#1275 `Front.rpc` posts with no headers at all."""
+        """THE fix. Pre-#1275 `Front.rpc` posts with no headers at all.
+
+        #1285 moved the post itself out of `Front.rpc` and into
+        `Front._rpc_attempt` (one instrumented attempt, so `leg_rpc` can retry
+        one).  The GUARD is unchanged and so is its intent -- every path that
+        actually posts carries the token -- so it now reads the posting method,
+        and asserts there is exactly ONE of those: a second `session.post` that
+        skipped the headers is precisely the regression this test exists for.
+        """
         from sglang.srt.weg2 import front as front_mod
 
-        src = inspect.getsource(front_mod.Front.rpc)
-        self.assertIn("headers=", src, "Front.rpc sends no headers -> 401 on the quiesce")
+        posting = [name for name in ("rpc", "_rpc_attempt", "leg_rpc")
+                   if "session.post(" in inspect.getsource(
+                       getattr(front_mod.Front, name))]
+        self.assertEqual(
+            posting, ["_rpc_attempt"],
+            "exactly one Front method may post an RPC, and it is the one this "
+            f"test then checks for headers; found {posting}")
+        src = inspect.getsource(front_mod.Front._rpc_attempt)
+        self.assertIn("headers=", src, "the RPC post sends no headers -> 401 on the quiesce")
         self.assertIn("auth_headers", src)
 
     def test_an_unkeyed_boot_sends_nothing_and_is_byte_identical(self):

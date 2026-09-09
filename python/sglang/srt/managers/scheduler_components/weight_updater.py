@@ -1652,9 +1652,9 @@ class SchedulerWeightUpdaterManager:
 
     @_weg2_group_stop_on_leg_failure
     def resume_memory_occupation(self, recv_req: ResumeMemoryOccupationReqInput):
-        # #1285: see the release leg.  This one is the sharper case -- the very
-        # first mutation below is `self.offload_tags.remove(tag)`, which raises
-        # KeyError on a repeat, so without this the retry would kill the group.
+        # #1285: see the release leg.  This one is the sharper case -- the wake's
+        # very first mutation below drops each tag from the offload set, which
+        # raises KeyError on a repeat, so without this the retry kills the group.
         replay = self._weg2_leg_replay("resume", recv_req)
         if replay is not None:
             return replay
