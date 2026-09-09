@@ -628,23 +628,55 @@ def p_form_key(argv: Sequence[str]) -> Tuple[str, str]:
     return hashlib.sha1(normalised.encode()).hexdigest()[:12], normalised
 
 
+#: #1305 item 4 (boot weg2sn5pre, 2026-09-09): THE XCHG ARM IS A FORM TERM THAT
+#: LIVES OUTSIDE GROUP P'S ARGV.  Boots weg2she1 (an xchg shadow boot) and
+#: weg2sb5d (a serving boot) hashed to the SAME P form key 25f9ba4cf4f1 -- the
+#: weight-exchange region is a launcher-level shm region plus hooks, not a P
+#: flag -- yet their measured dormant P images differed by 5171 MiB (43029 vs
+#: 37858), and the residual carried across a form change is exactly the term
+#: the ring prices from.  A defaults boot at the serve tip therefore read its
+#: ring from whichever of the two was newer by mtime and refused W20 at the
+#: launch moment (-1.31 GiB) from she1, or funded (+3.57 GiB) from sb5d.  The
+#: marker the xchg launcher prints on every such boot is folded into the
+#: source's form as a synthetic flag, so the key sees what the argv cannot;
+#: THIS tree's launcher never arms xchg, so THIS boot never carries the token
+#: and an xchg source is never same-form for it.  When the xchg slice lands
+#: on the line its launcher must add the same token to the argv it hands
+#: ``solve`` (one line, ``p_argv + [XCHG_FORM_TOKEN]``), or its own boots will
+#: rank a serving source as their form's twin -- the mirror of this defect.
+XCHG_FORM_MARKER = "WEG2-XCHG-REGION"
+XCHG_FORM_TOKEN = "--weg2-xchg-region=armed"
+
+
 def parse_p_form(front_log: str) -> Tuple[Optional[List[str]], str]:
-    """``(group P's argv, "")`` from a boot's front log, or ``(None, reason)``."""
+    """``(group P's argv, "")`` from a boot's front log, or ``(None, reason)``.
+
+    The argv is the ``group P argv:`` line, shell-split, PLUS the synthetic
+    :data:`XCHG_FORM_TOKEN` when the same front log carries the xchg arm's own
+    marker (:data:`XCHG_FORM_MARKER`) -- see the note at those names.
+    """
     import shlex
 
+    argv: Optional[List[str]] = None
+    xchg = False
     try:
         with open(front_log, errors="replace") as fh:
             for line in fh:
-                if "group P argv:" not in line:
-                    continue
-                found = _P_ARGV_RE.search(line)
-                if found:
-                    try:
-                        return shlex.split(found.group(1)), ""
-                    except ValueError as exc:
-                        return None, f"its 'group P argv:' line does not shell-split: {exc}"
+                if argv is None and "group P argv:" in line:
+                    found = _P_ARGV_RE.search(line)
+                    if found:
+                        try:
+                            argv = shlex.split(found.group(1))
+                        except ValueError as exc:
+                            return None, f"its 'group P argv:' line does not shell-split: {exc}"
+                elif not xchg and XCHG_FORM_MARKER in line:
+                    xchg = True
+                if argv is not None and xchg:
+                    break
     except OSError as exc:
         return None, f"front log unreadable: {exc}"
+    if argv is not None:
+        return (argv + [XCHG_FORM_TOKEN] if xchg else argv), ""
     return None, (
         "its front log carries no 'group P argv:' line, so what group P LOADED "
         "in that boot cannot be established and its per-card census cannot be "
@@ -2179,18 +2211,54 @@ def solve(
     # term that had drifted.  A same-form boot needs no such carry: both halves
     # of its image statement are a measurement of this form.
     form_order = ""
+    xchg_excluded: List[str] = []
     if p_argv is not None and len(stems) > 1:
-        same_form, other_form = [], []
+        # #1305 item 4: OTHER-FORM CANDIDATES RANK BY FORM DISTANCE, then by
+        # age -- newest-by-mtime alone let an xchg shadow boot (she1) outrank a
+        # serving boot (sb5d) whose form was one term closer, and the 5 GiB
+        # residual difference between them decided the launch verdict. The
+        # distance is the size of the symmetric difference of the two
+        # normalised forms: the fewer form-changing terms differ, the more the
+        # source's residual is a measurement of this boot.  Same-form (distance
+        # 0) stays a class of its own, ahead of everything.  An xchg source is
+        # EXCLUDED outright for a boot that does not itself carry the xchg
+        # token (operator ruling, boot weg2sn5pre): its residual includes the
+        # exchange region's host pages, which this boot never allocates.
+        mine_toks = set(my_form.split(" ")) if my_form else set()
+        i_am_xchg = XCHG_FORM_TOKEN in mine_toks
+        same_form, scored = [], []
         for s in stems:
             src_argv, _why = parse_p_form(os.path.join(evidence_dir, f"{s}.front.log"))
-            same = src_argv is not None and p_form_key(src_argv)[0] == my_key
-            (same_form if same else other_form).append(s)
+            if src_argv is None:
+                scored.append((10**9, s))
+                continue
+            src_key, src_form = p_form_key(src_argv)
+            if src_key == my_key:
+                same_form.append(s)
+                continue
+            theirs = set(src_form.split(" "))
+            if XCHG_FORM_TOKEN in theirs and not i_am_xchg:
+                xchg_excluded.append(s)
+                continue
+            scored.append((len(mine_toks ^ theirs), s))
+        # stable sort: distance ascending, mtime order (newest first) preserved
+        scored.sort(key=lambda d_s: d_s[0])
+        other_form = [s for _d, s in scored]
         stems = same_form + other_form
         form_order = (
             f"{len(same_form)} same-form candidate(s) ranked ahead of "
-            f"{len(other_form)} of another form (form key {my_key})"
+            f"{len(other_form)} of another form (form key {my_key}; other-form "
+            f"ranking by form DISTANCE then age: "
+            + ", ".join(f"{s.replace('boot_weg2_', '')}(d={d})" for d, s in scored[:6])
+            + (" ..." if len(scored) > 6 else "")
+            + f"; {len(xchg_excluded)} xchg-shadow source(s) EXCLUDED for this non-xchg boot)"
         )
-    reasons = []
+    reasons = [
+        f"{s}: EXCLUDED -- an xchg shadow boot ({XCHG_FORM_MARKER} in its front "
+        f"log); its dormant residual carries the exchange region's host pages, "
+        f"which this serving boot never allocates (#1305 item 4)"
+        for s in xchg_excluded
+    ]
     for stem in stems:
         p_log = os.path.join(evidence_dir, f"{stem}.P.log")
         d_log = os.path.join(evidence_dir, f"{stem}.D.log")
