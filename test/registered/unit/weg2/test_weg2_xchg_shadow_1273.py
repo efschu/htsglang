@@ -4552,3 +4552,166 @@ def test_the_shadow_line_prices_the_copy_on_the_host_arm_and_not_on_ipc(
     # Finding 8: neither lane deposits, so neither prints a deposit.
     assert ipc.oncard_deposit_mib == 0.0 and host.oncard_deposit_mib == 0.0
     assert "oncard_deposit_mib=0" in host.line(), host.line()
+
+
+# ---------------------------------------------------------------------------
+# S6 fix C (#1273) -- THE RANK IDENTITY THE TWO HOOKS ARE GATED ON.
+#
+# BOOT weg2shadowC IS THE MEASUREMENT.  Two arms (C1 ipc, C2 host), two flips
+# each, `--weg2-weight-source shadow` armed and its ARM line printed -- and
+# across all four flips ZERO `WEG2-XCHG-PLAN`, zero SEMS, zero ONCARD-REFUSED,
+# zero COMPARE, zero W61/W65.  The ledger half of both arms was exact, so the
+# arm itself was real.
+#
+# The root is one gate and it is not the arm: `_weg2_rank` read
+# `getattr(scheduler, "tp_rank")` / `"pp_rank"`, and the Scheduler HAS NEITHER
+# -- it keeps its parallel identity on the `ParallelState` wrapper.  The tree
+# says so in three places already (`scheduler.py:1766`, `:8157-8161`,
+# `:14502-14504`), each of them written after the same mistake raised
+# AttributeError somewhere else.  Here it could not raise, because the read is
+# `getattr(..., None)` behind an `isinstance(..., int)` test, so it degraded to
+# a silent -1 -- and `-1 < 0` is the adapter's second pre-flight gate, which
+# returns without a word.  Every downstream line is behind that return, which
+# is why one root produced five empty gates.
+#
+# THE CORROBORATION IS IN EVERY BOOT LOG WE HAVE: `rank=-1` on 210 of 210
+# `WEG2-FLIP-TAG` lines across the four shadowC rank logs, and the same -1 far
+# enough back that `ring_table` WIDENED ITS PARSER to `rank=(-?\d+)` and grew a
+# synthetic per-card index for it (`ring_table.py:159-166`, W37's docstring at
+# `:866`) instead of the emitter being fixed. The instrument was believed
+# before it was checked -- INDIKATOR-GESETZ, in its plainest form.
+# ---------------------------------------------------------------------------
+
+def _scheduler_rank_surface(*, world_rank, ps_tp_rank, ps_pp_rank, ps_tp_size):
+    """A double with the REAL Scheduler's rank surface, and no other.
+
+    The load-bearing property is an ABSENCE: no `tp_rank` and no `pp_rank` on
+    the object itself.  A double that carries them cannot fail on this defect
+    -- which is exactly how it survived: `test_census_attribute_surface_583`
+    exists because "a desk test that stubbed the attribute never noticed".
+    """
+    import types
+
+    sched = types.SimpleNamespace()
+    sched.ps = types.SimpleNamespace(
+        tp_rank=ps_tp_rank, pp_rank=ps_pp_rank, tp_size=ps_tp_size)
+    sched.world_group = types.SimpleNamespace(rank_in_group=world_rank)
+    assert not hasattr(sched, "tp_rank") and not hasattr(sched, "pp_rank")
+    return sched
+
+
+def _rank_probe(sched):
+    from sglang.srt.managers.scheduler_components.weight_updater import (
+        SchedulerWeightUpdaterManager,
+    )
+
+    probe = SchedulerWeightUpdaterManager.__new__(SchedulerWeightUpdaterManager)
+    probe.scheduler = sched
+    return SchedulerWeightUpdaterManager, probe
+
+
+@pytest.mark.parametrize(
+    "group,world_rank,ps_tp_rank,ps_pp_rank,ps_tp_size",
+    [
+        # Group D: pp_size=1, tp_size=3 (launcher.py:6525) -- tp_rank IS the
+        # identity, and the flat form reduces to it.
+        ("D", 0, 0, 0, 3), ("D", 1, 1, 0, 3), ("D", 2, 2, 0, 3),
+        # Group P: pp_size=3, tp_size=1 -- `ps.tp_rank` is 0 on ALL THREE
+        # ranks.  This is why "read ps.tp_rank instead" is not the fix: it
+        # would give three ranks row 0 of the six-row gate matrix, which is
+        # silently WRONG where -1 was merely silently absent.
+        ("P", 0, 0, 0, 1), ("P", 1, 0, 1, 1), ("P", 2, 0, 2, 1),
+    ],
+)
+def test_the_rank_gate_reads_an_identity_the_scheduler_actually_has(
+        group, world_rank, ps_tp_rank, ps_pp_rank, ps_tp_size):
+    """RED ON `d891223f54`: -1 on all six, for both groups.
+
+    `rank_row` accepts 0..2 and raises outside it, so -1 is not a degraded
+    answer the shadow could still work from -- it is the gate.
+    """
+    M, probe = _rank_probe(_scheduler_rank_surface(
+        world_rank=world_rank, ps_tp_rank=ps_tp_rank,
+        ps_pp_rank=ps_pp_rank, ps_tp_size=ps_tp_size))
+
+    got = M._weg2_rank(probe)
+    assert got == world_rank, (
+        f"group {group} rank {world_rank} resolved to {got}; the adapter's "
+        f"`rank < 0` gate then returns before run_leg_hook and the whole "
+        f"shadow is silent (boot weg2shadowC)"
+    )
+    # The identity is worth having only if it is the one the region indexes by.
+    assert xr.rank_row(group, got) == (0 if group == "P" else 3) + world_rank
+
+
+def test_the_rank_is_unreadable_rather_than_wrong_when_there_is_no_scheduler():
+    """-1 stays the answer where there is genuinely no identity to read.
+
+    The fix may not invent a 0: rank 0 is a REAL row that another rank owns,
+    and a rank that guesses it would have two publishers on one row.
+    """
+    import types
+
+    M, probe = _rank_probe(None)
+    assert M._weg2_rank(probe) == -1
+    _, probe2 = _rank_probe(types.SimpleNamespace())
+    assert M._weg2_rank(probe2) == -1
+
+
+def test_the_identity_gate_of_an_armed_shadow_is_never_silent():
+    """THE DISCRIMINATOR shadowC did not have.
+
+    Both pre-flight gates of `_weg2_shadow_hook` returned without a line, so
+    "the arm never reached the rank" and "the rank has no identity" produced
+    byte-identical evidence: nothing.  The ARM gate must stay silent (it fires
+    on every ring boot, i.e. every boot that has ever run); the IDENTITY gate
+    fires only under an armed shadow, where silence is the defect.
+    """
+    import ast as _ast
+
+    root = os.path.abspath(
+        os.path.join(os.path.dirname(__file__), "..", "..", "..", ".."))
+    path = os.path.join(root, "python", "sglang", "srt", "managers",
+                        "scheduler_components", "weight_updater.py")
+    with open(path, encoding="utf-8") as fh:
+        src = fh.read()
+    fn = next(n for n in _ast.walk(_ast.parse(src))
+              if isinstance(n, _ast.FunctionDef) and n.name == "_weg2_shadow_hook")
+
+    # The gate: `if group not in ("P", "D") or rank < 0:` -- find it and prove
+    # its body says something before it returns.
+    gates = [n for n in _ast.walk(fn)
+             if isinstance(n, _ast.If)
+             and "rank < 0" in _ast.unparse(n.test).replace(" ", " ")]
+    assert len(gates) == 1, f"expected exactly one identity gate, got {len(gates)}"
+    body = _ast.unparse(gates[0])
+    assert "rank_local_skip_message" in body, (
+        "the identity gate returns silently -- a shadow boot that produces no "
+        "PLAN line then cannot say whether the arm or the identity stopped it, "
+        "which is exactly the unresolved half of boot weg2shadowC"
+    )
+
+
+def test_the_rank_reader_does_not_go_back_to_the_attributes_that_do_not_exist():
+    """MUTATION PIN.  `scheduler.tp_rank` / `scheduler.pp_rank` do not exist.
+
+    Three sites in `scheduler.py` already carry a comment saying so, each
+    written after the same read raised somewhere else.  This one could not
+    raise, so nothing taught it; the pin is the teaching.
+    """
+    import ast as _ast
+
+    root = os.path.abspath(
+        os.path.join(os.path.dirname(__file__), "..", "..", "..", ".."))
+    path = os.path.join(root, "python", "sglang", "srt", "managers",
+                        "scheduler_components", "weight_updater.py")
+    with open(path, encoding="utf-8") as fh:
+        src = fh.read()
+    fn = next(n for n in _ast.walk(_ast.parse(src))
+              if isinstance(n, _ast.FunctionDef) and n.name == "_weg2_rank")
+    body = _ast.unparse(fn)
+    for dead in ("'tp_rank', 'pp_rank'", '"tp_rank", "pp_rank"'):
+        assert dead not in body, (
+            f"_weg2_rank still walks {dead} on the Scheduler, which has "
+            f"neither -- that is the shadowC root"
+        )
