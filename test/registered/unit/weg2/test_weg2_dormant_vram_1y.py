@@ -1358,9 +1358,22 @@ def test_the_float_workspace_is_writable_and_readable_after_a_resume():
     Pause the graph tag with a registered FLOAT workspace inside it, resume,
     restore the zero contract, then write through the SAME tensor and read the
     bytes back.  Address and size must be unchanged (a graph replay reads its
-    buffers by address) and the checksum after the write must be non-zero --
-    otherwise the resume handed back a mapping that silently swallows stores,
-    which is the shape that becomes an illegal access one decode later.
+    buffers by address) and every byte written must read back with the VALUE
+    written -- not merely a non-zero checksum, because a partially backed
+    mapping that returns garbage passes a ``sum != 0`` and fails this.
+
+    WHAT THIS TEST DOES NOT PROVE, stated because the round-2 refuter is right
+    that its name suggests otherwise: it cannot see a MISSING STREAM
+    DEPENDENCY.  The production wake is
+    ``weight_updater.py`` ``resume(GPU_MEMORY_TYPE_CUDA_GRAPH)`` ->
+    ``_weg2_zero_graph_scratch()`` -> ``flashinfer_backend.py`` ``buf.zero_()``,
+    which is stream-async with no event and no sync, so a graph replay launched
+    on another stream carries no dependency on that memset.  This test calls
+    ``torch.cuda.synchronize()`` before each assertion and therefore
+    synchronises exactly that hazard away.  It is pre-existing #1249 behaviour,
+    not introduced by this slice, and it stays in the UNPROVEN list rather than
+    being papered over with a racy assertion that would be flaky in both
+    directions.
     """
     import torch
 
@@ -1391,6 +1404,11 @@ def test_the_float_workspace_is_writable_and_readable_after_a_resume():
         assert int(buf.sum().item()) != 0, (
             "the resumed mapping swallowed a store: the pages are not backed"
         )
+        # ... and READ THE VALUE BACK, not just its checksum: a mapping that is
+        # only partially backed can return garbage whose sum is non-zero.
+        assert bool(
+            torch.equal(buf, torch.full_like(buf, 9))
+        ), "the resumed mapping returned bytes other than the ones written"
     finally:
         fb._WORKSPACE_BUFFERS.clear()
         fb._WORKSPACE_BUFFERS.update(saved)

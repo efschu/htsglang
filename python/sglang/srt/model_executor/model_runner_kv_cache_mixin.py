@@ -2258,6 +2258,30 @@ class ModelRunnerKVCacheMixin:
                 _spec_gb = intermediate_size / (1 << 30)
                 _note_mamba_component(self, "speculative intermediate state", _spec_gb)
                 total_rest_memory = total_rest_memory - _spec_gb
+            # #1023 S1 round-2 (refuter MUST_FIX 1 + review finding 2): THIS
+            # BRANCH PRINTED NOTHING.  The demand branch below announces itself
+            # with [auto-mamba] -- pool size, per_req, fit_cap, the activation
+            # reserve, and the ENGINE'S OWN ratio -- so a boot that pins
+            # --max-mamba-cache-size lost every one of those witnesses at the
+            # moment it needed them most, because pinning the pool also drops
+            # the #307 budget fitter and the activation-reserve subtraction
+            # (both below, demand branch only).  A launcher that prices this
+            # position (weg2/launcher.py, --d-kv-form bs1-slots) therefore had
+            # no boot line to be checked against.  Instrument only: nothing
+            # above or below this call changes.
+            _explicit_ratio = max(self._calculate_mamba_ratio(), 1)
+            logger.info(
+                "[explicit-mamba] PINNED mamba pool: max_mamba_cache_size=%d slots "
+                "ratio=%d -> _hybrid_kv_token_cap concurrency term %d "
+                "(max_running_requests=%s); this branch subtracts NO prefill "
+                "activation reserve (%.2f GB, demand-branch only) and runs NO #307 "
+                "budget fit, so the KV pool keeps memory the demand path holds back.",
+                server_args.max_mamba_cache_size,
+                _explicit_ratio,
+                server_args.max_mamba_cache_size // _explicit_ratio,
+                server_args.max_running_requests,
+                MAMBA_AUTO_ACTIVATION_RESERVE_MIB / 1024.0,
+            )
         elif self._auto_mamba_demand_active():
             # === Demand-driven mamba pool (uneven-DCP auto-sizing) ===========
             # Size the pool to the real serving concurrency, NOT to a fixed

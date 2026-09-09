@@ -35,8 +35,16 @@ WHAT IS ASSERTED HERE, in order:
     rather than silently winning against an operator value.
 
 Hermetic: ``CUDA_VISIBLE_DEVICES=""``, no pool allocation, no server, no boot.
-The double is a ``SimpleNamespace``; the METHODS under test are the real
-unbound functions off ``ModelRunnerKVCacheMixin``.
+The ServerArgs half of the double is a ``SimpleNamespace``; the RUNNER is a
+real ``ModelRunnerKVCacheMixin`` subclass, because ``_apply_token_constraints``
+dispatches and a data-only double would have tested nothing.
+
+ROUND 2 (the must_fix round) added, below the original four: an argv golden
+captured on the PARENT commit (the only comparison here that is not the new
+code against itself), the wiring into ``main`` (which was the one untested part
+and held two surviving mutants), ``--extra-d`` as the back door to every
+quantity the form owns, the reserve that ``bs1-slots`` deletes rather than
+pays, and the pinned-ratio provenance.
 """
 
 from __future__ import annotations
@@ -427,6 +435,289 @@ class TheProvenanceLineSaysWhatItBought(CustomTestCase):
         ).line
         self.assertIn("the default, unchanged", line)
         self.assertIn("did not take one", line)
+
+
+# ---------------------------------------------------------------------------
+# ROUND 2 -- the must_fix round.  Everything below was written against a
+# finding, and every finding names the mutant that lived where no test looked.
+# ---------------------------------------------------------------------------
+
+#: Group D's and group P's DEFAULT argv, CAPTURED ON THE PARENT 4f762260ba and
+#: pinned here.  Provenance: run on the remote desk at the parent commit,
+#: /spinning/gpu-arb/devtools/remote_results/2f36737928_20260909T054211Z.
+#:
+#: Round-2 review finding 4: ``test_default_position_emits_todays_flags``
+#: compares ``argv_d()`` against ``argv_d(**default_form_kwargs)`` -- the new
+#: code against itself -- and therefore cannot see a change to ``argv_d``.  A
+#: literal captured BEFORE the slice is the only comparison in this file that
+#: can actually fail for the reason the slice claims ("the default path is
+#: byte-identical"), so it is the oracle and the self-comparison is the
+#: consistency check beside it.
+GOLDEN_D_AT_PARENT = ['py', '-m', 'sglang.launch_server', '--model-path', '/m', '--trust-remote-code', '--served-model-name', 'Qwen3.8-27B', '--rank-gpu-id', '0,1,2', '--skip-server-warmup', '--kv-cache-dtype', 'fp8_e4m3', '--context-length', '262144', '--max-kv-per-request', '262144', '--reasoning-parser', 'qwen3', '--tool-call-parser', 'qwen3_coder', '--chat-template-default-kwargs', '{"preserve_thinking": true}', '--enable-cache-report', '--enable-metrics', '--enable-hierarchical-cache', '--hicache-host-role', 'staging', '--hicache-size', '1', '--hicache-mamba-host-mib', '1', '--hicache-write-policy', 'write_through', '--hicache-storage-backend', 'file', '--hicache-mem-layout', 'layer_first', '--hicache-io-backend', 'direct', '--hicache-storage-backend-extra-config', '{"max_size":"1G","min_free_space":"1G","max_size_scope":"shared"}', '--hicache-canonical-kv-page', '--host', '127.0.0.1', '--chunked-prefill-size', '4096', '--scheduler-distributed-teardown', '--page-size', '1', '--random-seed', '785500001', '--mamba-slot-reorder', '--kv-backing-relief', '--barlink', '--barlink-transport', 'bar1', '--barlink-bar1-cap-cycles', '300000000000', '--collective-census-interval', '50', '--uneven-dcp', '--uneven-dcp-weighted', '--mamba-ssm-dtype', 'bfloat16', '--enable-memory-saver', '--enable-weights-cpu-backup', '--max-running-requests', '8', '--tp-prefill-max-tokens', '0', '--mamba-radix-cache-strategy', 'extra_buffer', '--tp-size', '3', '--pp-size', '1', '--num-continuous-decode-steps', '1', '--rank-gpu-memory-mib', '1,2,3', '--rank-tp-ratio', 'auto', '--speculative-algorithm', 'NEXTN', '--speculative-num-steps', '2', '--speculative-eagle-topk', '1', '--speculative-num-draft-tokens', '3', '--barlink-bar1-window-mib', '16,TP_0=32,DCP_0=40', '--barlink-uncovered-class', 'refuse', '--port', '30032']
+
+GOLDEN_P_AT_PARENT = ['py', '-m', 'sglang.launch_server', '--model-path', '/m', '--trust-remote-code', '--served-model-name', 'Qwen3.8-27B', '--rank-gpu-id', '0,1,2', '--skip-server-warmup', '--kv-cache-dtype', 'fp8_e4m3', '--context-length', '262144', '--max-kv-per-request', '262144', '--reasoning-parser', 'qwen3', '--tool-call-parser', 'qwen3_coder', '--chat-template-default-kwargs', '{"preserve_thinking": true}', '--enable-cache-report', '--enable-metrics', '--enable-hierarchical-cache', '--hicache-host-role', 'staging', '--hicache-size', '1', '--hicache-mamba-host-mib', '1', '--hicache-write-policy', 'write_through', '--hicache-storage-backend', 'file', '--hicache-mem-layout', 'layer_first', '--hicache-io-backend', 'direct', '--hicache-storage-backend-extra-config', '{"max_size":"1G","min_free_space":"1G","max_size_scope":"shared"}', '--hicache-canonical-kv-page', '--host', '127.0.0.1', '--chunked-prefill-size', '4096', '--scheduler-distributed-teardown', '--page-size', '1', '--random-seed', '785500001', '--mamba-slot-reorder', '--kv-backing-relief', '--barlink', '--barlink-transport', 'bar1', '--barlink-bar1-cap-cycles', '300000000000', '--collective-census-interval', '50', '--mamba-ssm-dtype', 'bfloat16', '--enable-memory-saver', '--enable-weights-cpu-backup', '--max-running-requests', '8', '--tp-size', '1', '--pp-size', '3', '--pp-async-batch-depth', '0', '--disable-overlap-schedule', '--pp-stage-ratio', '32,18,14', '--pp-attn-stage-ratio', '8,4,4', '--rank-gpu-memory-mib', '1,2,3', '--barlink-bar1-window-mib', '24,PP_0=96', '--speculative-algorithm', 'NEXTN', '--speculative-num-steps', '2', '--speculative-eagle-topk', '1', '--speculative-num-draft-tokens', '3', '--speculative-draft-kv-only', '--max-total-tokens', '428000', '--port', '30031']
+
+
+def _ns(**kw):
+    """An argparse namespace double carrying only what the wiring reads."""
+    fields = dict(
+        model="/m",
+        d_bs=None,
+        max_kv_per_request=None,
+        extra_d="",
+        d_kv_form="bs8",
+    )
+    fields.update(kw)
+    return SimpleNamespace(**fields)
+
+
+class TheArgvGoldenIsFromBeforeTheSlice(CustomTestCase):
+    """The one comparison here that is not the new code against itself."""
+
+    def test_group_d_default_argv_is_byte_identical_to_the_parent(self):
+        self.maxDiff = None
+        self.assertEqual(
+            launcher.argv_d("py", "/m", [1, 2, 3], 1, 1, 1.0, [], d_bs=8),
+            GOLDEN_D_AT_PARENT,
+        )
+
+    def test_group_p_argv_is_byte_identical_to_the_parent(self):
+        self.maxDiff = None
+        self.assertEqual(
+            launcher.argv_p("py", "/m", [1, 2, 3], 1, 1, 1.0, []),
+            GOLDEN_P_AT_PARENT,
+        )
+
+
+class TheWiringIntoABootIsTheTestedPart(CustomTestCase):
+    """Round-2 review finding 1: two mutants lived in ``main`` and survived.
+
+    Both are asserted here against ``d_kv_form_for_boot``, which is the whole
+    wiring now: MR1 was ``max_kv_per_request_was_passed=False`` (the W52
+    ceiling refusal disarmed at the CLI) and MR2 was dropping ``d_bs =
+    form.d_bs`` (a bs1 position launched at ``--max-running-requests 8`` while
+    the log printed 1).
+    """
+
+    def test_a_bs1_position_returns_the_forms_concurrency_not_the_default(self):
+        d_bs, _, form = launcher.d_kv_form_for_boot(_ns(d_kv_form="bs1-slots"))
+        self.assertEqual(d_bs, 1)
+        self.assertEqual(form.d_bs, 1)
+
+    def test_the_default_position_returns_the_shipped_eight(self):
+        d_bs, max_kv, form = launcher.d_kv_form_for_boot(_ns())
+        self.assertEqual(d_bs, 8)
+        self.assertEqual(max_kv, launcher.CONTEXT_LENGTH_TOKENS)
+        self.assertTrue(form.is_default)
+
+    def test_an_operator_ceiling_beside_a_bs1_position_is_refused_at_the_cli(self):
+        with self.assertRaises(launcher.Weg2LaunchRefused) as cm:
+            launcher.d_kv_form_for_boot(
+                _ns(d_kv_form="bs1-ctx1m", max_kv_per_request=262144)
+            )
+        self.assertIn("W52", str(cm.exception))
+
+    def test_an_operator_concurrency_beside_a_bs1_position_is_refused_at_the_cli(self):
+        with self.assertRaises(launcher.Weg2LaunchRefused) as cm:
+            launcher.d_kv_form_for_boot(_ns(d_kv_form="bs1-slots", d_bs=8))
+        self.assertIn("W52", str(cm.exception))
+
+    def test_an_extra_d_draft_width_moves_the_printed_extra_term(self):
+        """The printed ceiling must track the argv that will actually run."""
+        _, _, base = launcher.d_kv_form_for_boot(_ns(d_kv_form="bs1-slots"))
+        _, _, wider = launcher.d_kv_form_for_boot(
+            _ns(
+                d_kv_form="bs1-slots",
+                extra_d="--speculative-num-draft-tokens 5",
+            )
+        )
+        self.assertEqual(base.cap_tokens, 4 * (262144 + 7))
+        self.assertEqual(wider.cap_tokens, 4 * (262144 + 9))
+
+
+class TheFormOwnsTheBackDoorToo(CustomTestCase):
+    """Round-2 refuter MUST_FIX 2: ``--extra-d`` is appended LAST and wins."""
+
+    def test_an_extra_d_concurrency_beside_a_bs1_position_is_refused(self):
+        with self.assertRaises(launcher.Weg2LaunchRefused) as cm:
+            launcher.d_kv_form_for_boot(
+                _ns(d_kv_form="bs1-slots", extra_d="--max-running-requests 8")
+            )
+        msg = str(cm.exception)
+        self.assertIn("W52", msg)
+        self.assertIn("--max-running-requests", msg)
+
+    def test_every_owned_flag_is_refused_from_extra_d(self):
+        for flag, value in (
+            ("--max-running-requests", "8"),
+            ("--context-length", "262144"),
+            ("--max-kv-per-request", "262144"),
+            ("--max-mamba-cache-size", "40"),
+            ("--speculative-algorithm", "NONE"),
+        ):
+            with self.subTest(flag=flag):
+                with self.assertRaises(launcher.Weg2LaunchRefused) as cm:
+                    launcher.d_kv_form_for_boot(
+                        _ns(d_kv_form="bs1-ctx1m", extra_d=f"{flag} {value}")
+                    )
+                self.assertIn(flag, str(cm.exception))
+
+    def test_the_equals_form_of_the_flag_is_seen_too(self):
+        with self.assertRaises(launcher.Weg2LaunchRefused):
+            launcher.d_kv_form_for_boot(
+                _ns(d_kv_form="bs1-slots", extra_d="--context-length=1048576")
+            )
+
+    def test_an_unrelated_extra_d_flag_still_launches(self):
+        _, _, form = launcher.d_kv_form_for_boot(
+            _ns(d_kv_form="bs1-slots", extra_d="--log-level debug")
+        )
+        self.assertEqual(form.name, "bs1-slots")
+
+    def test_the_default_position_leaves_extra_d_alone(self):
+        """bs8 owns nothing, so it refuses nothing -- today's boot unchanged."""
+        _, _, form = launcher.d_kv_form_for_boot(
+            _ns(extra_d="--max-running-requests 4")
+        )
+        self.assertTrue(form.is_default)
+
+
+class AnAgreeingOperatorValueIsNotADisagreement(CustomTestCase):
+    """Round-2 review finding 7: W52 refused a non-conflict."""
+
+    def test_a_ceiling_equal_to_the_forms_own_is_accepted(self):
+        _, _, form = launcher.d_kv_form_for_boot(
+            _ns(d_kv_form="bs1-slots", max_kv_per_request=262144)
+        )
+        self.assertEqual(form.max_kv_per_request, 262144)
+
+    def test_a_ceiling_different_from_the_forms_own_is_refused(self):
+        with self.assertRaises(launcher.Weg2LaunchRefused):
+            launcher.d_kv_form_for_boot(
+                _ns(d_kv_form="bs1-slots", max_kv_per_request=131072)
+            )
+
+    def test_d_bs_one_beside_a_bs1_position_is_accepted(self):
+        d_bs, _, form = launcher.d_kv_form_for_boot(
+            _ns(d_kv_form="bs1-ctx1m", d_bs=1)
+        )
+        self.assertEqual(d_bs, 1)
+        self.assertEqual(form.name, "bs1-ctx1m")
+
+
+class TheSlotsPositionPricesWhatItDeletes(CustomTestCase):
+    """Round-2 refuter MUST_FIX 1: the position deletes a 1 GiB/card post.
+
+    Pinning ``--max-mamba-cache-size`` moves group D from the demand-driven
+    mamba branch to the explicit one, and the prefill activation reserve is
+    subtracted ONLY on the demand branch.  Before this round the launcher
+    priced "+11 mamba slots" and said nothing about the reserve.
+    """
+
+    def _form(self, name):
+        return launcher.resolve_d_kv_form(
+            name,
+            d_bs_default=8,
+            max_kv_per_request=launcher.CONTEXT_LENGTH_TOKENS,
+            extra_tokens=EXTRA,
+        )
+
+    def test_the_reserve_is_read_from_the_engine_not_typed_here(self):
+        import re as _re
+
+        src = open(
+            launcher._ENGINE_KV_MIXIN_PATH, encoding="utf-8"
+        ).read()
+        m = _re.search(
+            r"^MAMBA_AUTO_ACTIVATION_RESERVE_MIB\s*=\s*(\d+)\s*$", src, _re.M
+        )
+        self.assertIsNotNone(m, "the engine constant this position prices is gone")
+        self.assertEqual(
+            launcher.engine_int_constant("MAMBA_AUTO_ACTIVATION_RESERVE_MIB"),
+            int(m.group(1)),
+        )
+
+    def test_the_slots_position_carries_the_deleted_reserve_as_a_field(self):
+        form = self._form("bs1-slots")
+        self.assertEqual(
+            form.unpriced_reserve_mib,
+            launcher.engine_int_constant("MAMBA_AUTO_ACTIVATION_RESERVE_MIB"),
+        )
+
+    def test_the_positions_that_stay_on_the_demand_branch_delete_nothing(self):
+        self.assertEqual(self._form("bs8").unpriced_reserve_mib, 0)
+        self.assertEqual(self._form("bs1-ctx1m").unpriced_reserve_mib, 0)
+
+    def test_the_price_names_the_reserve_the_fitter_and_the_class_two_gate(self):
+        line = self._form("bs1-slots").line
+        self.assertIn("prefill activation reserve", line)
+        self.assertIn(
+            str(launcher.engine_int_constant("MAMBA_AUTO_ACTIVATION_RESERVE_MIB")),
+            line,
+        )
+        self.assertIn("#307", line)
+        self.assertIn("CLASS-II", line)
+
+    def test_the_engine_branches_are_still_asymmetric(self):
+        """The premise of the price, pinned against the engine's source.
+
+        Characterization, not red-first: the asymmetry exists today.  It is
+        pinned so that FIXING it -- subtracting the reserve on the explicit
+        branch too -- goes red here and forces the price string to be
+        corrected, instead of leaving the launcher charging for a post the
+        engine has started paying.
+        """
+        src = open(
+            launcher._ENGINE_KV_MIXIN_PATH, encoding="utf-8"
+        ).read()
+        head, _, rest = src.partition(
+            "        if server_args.max_mamba_cache_size is not None:"
+        )
+        self.assertTrue(rest, "the explicit mamba branch moved")
+        explicit, sep, demand = rest.partition(
+            "        elif self._auto_mamba_demand_active():"
+        )
+        self.assertTrue(sep, "the demand-driven mamba branch moved")
+        demand_body = demand.split("\n        elif ")[0]
+        self.assertNotIn(
+            '_note_mamba_component(self, "prefill activation reserve"', explicit
+        )
+        self.assertIn(
+            '_note_mamba_component(self, "prefill activation reserve"', demand_body
+        )
+        # ... and the witness this slice added, so the ratio stays readable on
+        # the branch that lost [auto-mamba].
+        self.assertIn("[explicit-mamba]", explicit)
+
+
+class TheDefaultLineSaysFloorNotPrediction(CustomTestCase):
+    """Round-2 review finding 5: ``cap_tokens`` is not the boot's own cap."""
+
+    def test_the_default_cap_is_the_flag_floor_and_says_so(self):
+        form = launcher.resolve_d_kv_form(
+            "bs8",
+            d_bs_default=8,
+            max_kv_per_request=launcher.CONTEXT_LENGTH_TOKENS,
+            extra_tokens=EXTRA,
+        )
+        self.assertEqual(form.cap_tokens, 8 * (262144 + EXTRA))
+        self.assertIn("FLOOR", form.line)
+        # the number every boot of record actually printed, and the sizing that
+        # produces it (weg2sb5e D:351-353 -> 40 slots at ratio 4)
+        self.assertIn("2,621,510", form.line)
+        self.assertIn("40 slots", form.line)
+
+    def test_every_position_names_the_pinned_ratio_as_pinned(self):
+        for name in launcher.D_KV_FORM_CHOICES:
+            form = launcher.resolve_d_kv_form(
+                name,
+                d_bs_default=8,
+                max_kv_per_request=launcher.CONTEXT_LENGTH_TOKENS,
+                extra_tokens=EXTRA,
+            )
+            with self.subTest(name=name):
+                self.assertIn("PINNED", form.line)
+                self.assertIn("mamba_ratio=%d" % launcher.D_MAMBA_RATIO, form.line)
 
 
 if __name__ == "__main__":

@@ -425,10 +425,34 @@ CONTEXT_LENGTH_TOKENS_1M = 1048576
 #: bs1 causes; and it clears ``_validate_max_mamba_cache_size``'s hard demand
 #: floor for one running request (server_args.py:15074-15111).
 D_KV_FORM_SLOTS_MAMBA_CACHE = 16
-#: D's mamba ratio on this model, and it is READ, not assumed: the engine's
-#: ``_calculate_mamba_ratio`` resolves 4 for Qwen3_5 (48 GDN layers over 16
-#: full-attention layers).  Named here only so the cap arithmetic this module
-#: PRINTS can be checked against the engine's own; the engine never reads it.
+#: D's mamba ratio on this model.  PINNED, AND CHECKED AT BOOT -- not read.
+#: The round-1 wording ("it is READ, not assumed") was false and is the reason
+#: this comment is now three paragraphs: nothing here calls anything.  The
+#: engine computes the number at runtime,
+#: ``ratio = max(self._calculate_mamba_ratio(), 1)``
+#: (model_runner_kv_cache_mixin.py:4898), out of the model's layer counts AND
+#: four flags (--disable-overlap-schedule, the mamba-radix strategy,
+#: --mamba-slot-reorder, --disable-radix-cache), one of which -- ``--d-disable-
+#: overlap-schedule`` -- is a flag of THIS launcher.  A launcher-side constant
+#: therefore cannot be a reading of it, only a claim about it.
+#:
+#: PROVENANCE of the 4, and it is a log line rather than an assumption: boot
+#: weg2sb5e (3ea18deb95) group D printed
+#: ``[auto-mamba] demand-driven mamba pool: target_concurrency=8 ratio=4 ...``
+#: on all three ranks
+#: (/spinning/evidence-665-f1/boot_weg2_weg2sb5e_3ea18deb95_0908_205950.D.log
+#: lines 351-353), and boot weg2sb5f (4f762260ba) reproduces it.
+#:
+#: WHY IT IS CHECKED RATHER THAN TRUSTED: at ratio 8 the ``bs1-slots``
+#: concurrency term is ``16 // 8 = 2`` and its cap 524,302 -- BELOW the
+#: 767,776-token R1 projection, i.e. the silent clamp is back while this
+#: module prints 1,048,604.  So every position writes ``mamba_ratio=%d
+#: (PINNED)`` into its own provenance line and names the boot line that must
+#: be read beside it.  ``bs1-slots`` moves group D onto the EXPLICIT mamba
+#: branch, which printed no ratio at all -- the boot that most needs the
+#: witness was the one that lost it -- so this slice adds ``[explicit-mamba]``
+#: there.  If either line ever reads a ratio other than 4, every bs1 cap this
+#: module prints is wrong by exactly that factor and must not be quoted.
 D_MAMBA_RATIO = 4
 #: The form positions.  ``bs8`` is TODAY, byte-for-byte: no flag of this knob
 #: reaches either group's argv in that position.
@@ -459,9 +483,23 @@ class DKvForm:
     max_mamba_cache_size: Optional[int]
     #: The concurrency term ``_hybrid_kv_token_cap`` will compute for this form.
     cap_concurrency: int
-    #: ``cap_concurrency * (context_length + extra)`` -- the per-request KV cap
-    #: that must clear the projected pool, or the pool is silently clamped.
+    #: ``cap_concurrency * (context_length + extra)`` -- a FLOOR ON, not a
+    #: prediction of, the cap the boot computes.  ``cap_concurrency`` is what
+    #: the FLAGS alone force; the engine takes
+    #: ``max(max_running_requests, max_mamba_cache_size // ratio)`` and in the
+    #: DEFAULT position the demand-driven sizer picks the pool AFTER this line
+    #: is printed -- weg2sb5e D:351-353 sized 40 slots, so the engine's
+    #: concurrency was 10 and its cap 2,621,510 against the 2,097,208 these
+    #: flags alone give.  A bs1 position PINS the pool, so there the two are
+    #: equal by construction.  The only question the number answers is "does
+    #: the cap clear the pool", and a floor is the safe side of it.
     cap_tokens: int
+    #: MiB PER CARD this position hands the KV pool that no ledger prices: the
+    #: prefill activation reserve, subtracted only on the demand-driven mamba
+    #: branch (model_runner_kv_cache_mixin.py:2339), which a pinned pool leaves.
+    #: 0 for every position that stays on the demand branch.  READ from the
+    #: engine's own source, never typed here.
+    unpriced_reserve_mib: int
     line: str
 
     @property
@@ -479,6 +517,16 @@ def d_kv_form_cap_tokens(concurrency: int, context_len: int, extra: int) -> int:
     This is a MIRROR and is pinned as one: the S1 test drives the engine's real
     method on a double and asserts it returns exactly this number, so the two
     cannot drift apart without a red test.
+
+    THE CAP HAS A SECOND CONSUMER, found by the round-2 review and NOT in the
+    spec's list: besides ``_apply_token_constraints``, ``_hybrid_kv_token_cap``
+    feeds ``_maybe_suggest_dcp_token_vector`` as ``hard_cap=`` into
+    ``cp_token_speed_vector``.  It is inert on today's shipped D argv
+    (``--rank-kv-ratio`` resolves to ``coupled`` and no speed weights are
+    passed), but a bs1 position LOWERS that hard_cap from 2,621,510 to ~1.05M,
+    which tightens the loose-context bound the moment ``--rank-kv-ratio speed``
+    is ever selected on group D.  Named here so the next reader does not have
+    to rediscover it; not chased, because no boot of record reaches it.
     """
     return int(concurrency) * (int(context_len) + int(extra))
 
@@ -504,6 +552,71 @@ def d_kv_form_extra_tokens(argv_of_d: Sequence[str]) -> int:
     return 4 + draft_tokens
 
 
+def _extra_d_restates(extra_d, owned):
+    """Which owned quantities an ``--extra-d`` passthrough restates.
+
+    ``--extra-d`` is shell-split and appended LAST to group D's argv, and
+    argparse takes the LAST occurrence of a flag, so a quantity named there
+    wins over the one the form emitted -- silently, while the D-KV-FORM line
+    still prints the form's number.  That is the exact class W52 exists for,
+    reached through a door the first cut of W52 did not look at.
+    """
+    hits = []
+    for tok in extra_d:
+        base = str(tok).split("=", 1)[0]
+        if base in owned and base not in hits:
+            hits.append(base)
+    return hits
+
+
+#: The quantities a bs1 position OWNS, and therefore the ones an ``--extra-d``
+#: may not restate beside it.  The first four are the form's own arithmetic
+#: (concurrency, context, per-request ceiling, state pool); the fifth is the
+#: USER LAW of 2026-09-09 ("mtp bleibt dabei") -- every bs1 line this module
+#: prints asserts that the drafter stays on, and a passthrough that can turn
+#: it off would make the printed assertion unfalsifiable.
+D_KV_FORM_OWNED_FLAGS = (
+    "--max-running-requests",
+    "--context-length",
+    "--max-kv-per-request",
+    "--max-mamba-cache-size",
+    "--speculative-algorithm",
+)
+
+#: The engine's KV-sizing module, addressed from this file rather than by an
+#: absolute path so a worktree, the remote desk container and a bind mount all
+#: read the same tree.
+_ENGINE_KV_MIXIN_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "model_executor",
+    "model_runner_kv_cache_mixin.py",
+)
+_ENGINE_INT_CONSTANTS: Dict[str, int] = {}
+
+
+def engine_int_constant(name: str) -> int:
+    """READ a module-level ``NAME = <int>`` out of the engine's own source.
+
+    Not an import: importing the KV mixin drags torch into a launcher that is
+    a plain script, and into every hermetic desk test of this module.  Reading
+    the assignment out of the file is what turns a provenance COMMENT into a
+    provenance CHECK -- the difference between "the engine reserves 1024 MiB"
+    written here once and never re-read, and a number that moves when the
+    engine's does.  Raises ``KeyError`` when the constant is gone, which is a
+    louder answer than a stale copy.
+    """
+    if name not in _ENGINE_INT_CONSTANTS:
+        with open(_ENGINE_KV_MIXIN_PATH, "r", encoding="utf-8") as fh:
+            src = fh.read()
+        m = re.search(r"^%s\s*=\s*(\d+)\s*$" % re.escape(name), src, re.M)
+        if m is None:
+            raise KeyError(
+                "%s carries no module-level `%s = <int>`" % (_ENGINE_KV_MIXIN_PATH, name)
+            )
+        _ENGINE_INT_CONSTANTS[name] = int(m.group(1))
+    return _ENGINE_INT_CONSTANTS[name]
+
+
 def resolve_d_kv_form(
     form: str,
     d_bs_default: int,
@@ -511,14 +624,19 @@ def resolve_d_kv_form(
     extra_tokens: int,
     d_bs_was_passed: bool = False,
     max_kv_per_request_was_passed: bool = False,
+    extra_d: Sequence[str] = (),
 ) -> DKvForm:
     """Turn the objective position into group D's argv, and price it.
 
     Refuses (W52) rather than resolving when the operator states the same
-    quantity twice: a bs1 form OWNS ``--max-running-requests`` and the per-
-    request KV ceiling, so an explicit ``--d-bs``/``--max-kv-per-request``
-    beside it is two statements of one number and the launcher would have to
-    pick one silently -- the class this rig has paid for repeatedly.
+    quantity twice AND DIFFERENTLY: a bs1 form OWNS ``--max-running-requests``
+    and the per-request KV ceiling, so a DISAGREEING ``--d-bs`` /
+    ``--max-kv-per-request`` beside it is two numbers where one is needed and
+    the launcher would have to pick one silently -- the class this rig has
+    paid for repeatedly.  An operator value that AGREES with the form is not a
+    disagreement and is accepted (round-2 review finding 7: refusing it was a
+    refusal for a non-conflict).  The same ownership is enforced against
+    ``--extra-d``, which reaches the same flags through the back door.
     """
     if form not in D_KV_FORM_CHOICES:
         raise Weg2LaunchRefused(
@@ -536,14 +654,21 @@ def resolve_d_kv_form(
             cap_tokens=d_kv_form_cap_tokens(
                 int(d_bs_default), CONTEXT_LENGTH_TOKENS, extra_tokens
             ),
+            unpriced_reserve_mib=0,
             line=(
                 "WEG2 D-KV-FORM objective=%s (the default, unchanged): group D runs "
-                "--max-running-requests %d at --context-length %d, so "
-                "_hybrid_kv_token_cap = max(%d, mamba_slots // %d) x (%d + %d) = %d "
-                "tokens and does not bind the profiled pool (boot weg2sb5e:380 "
-                "printed 2,621,510 against a 671,680-token pool). The bs1 "
-                "positions of WEG2_KV1M_SPEC_0908 sec 2.1 (%s) are SELECTABLE and "
-                "never silent; this boot did not take one."
+                "--max-running-requests %d at --context-length %d, so the FLAGS ALONE "
+                "floor _hybrid_kv_token_cap at max(%d, mamba_slots // %d) x (%d + %d) "
+                "= %d tokens. THE BOOT'S OWN CAP IS HIGHER AND IS NOT THIS NUMBER: "
+                "the demand-driven sizer picks the pool after this line is printed "
+                "(weg2sb5e D:351-353 -> 40 slots at ratio 4), so the engine's "
+                "concurrency was 40 // 4 = 10 and its cap 2,621,510 against a "
+                "671,680-token pool (weg2sb5e:380) -- printed here as a FLOOR, which "
+                "is the safe side of the only question it answers (does the cap clear "
+                "the pool). mamba_ratio=%d is PINNED here, and the boot's own is the "
+                "[auto-mamba] line on this branch. The bs1 positions of "
+                "WEG2_KV1M_SPEC_0908 sec 2.1 (%s) are SELECTABLE and never silent; "
+                "this boot did not take one."
                 % (
                     form,
                     int(d_bs_default),
@@ -555,31 +680,16 @@ def resolve_d_kv_form(
                     d_kv_form_cap_tokens(
                         int(d_bs_default), CONTEXT_LENGTH_TOKENS, extra_tokens
                     ),
+                    D_MAMBA_RATIO,
                     ", ".join(c for c in D_KV_FORM_CHOICES if c != D_KV_FORM_DEFAULT),
                 )
             ),
-        )
-    if d_bs_was_passed:
-        raise Weg2LaunchRefused(
-            "W52 Weg2KvFormRefused: --d-kv-form %s OWNS group D's concurrency "
-            "(--max-running-requests 1 is what collapses the mamba sizer to 5 "
-            "slots and frees 7/8 of both mamba posts), so --d-bs must not be "
-            "passed beside it. Drop --d-bs, or take --d-kv-form %s."
-            % (form, D_KV_FORM_DEFAULT)
-        )
-    if max_kv_per_request_was_passed:
-        raise Weg2LaunchRefused(
-            "W52 Weg2KvFormRefused: --d-kv-form %s OWNS group D's per-request KV "
-            "ceiling -- the whole point of the position is that the ceiling is "
-            "raised in step with the concurrency collapse. An operator value "
-            "beside it is the second statement that would silently win or lose. "
-            "Drop --max-kv-per-request, or take --d-kv-form %s."
-            % (form, D_KV_FORM_DEFAULT)
         )
     if form == "bs1-ctx1m":
         ctx = CONTEXT_LENGTH_TOKENS_1M
         slots = None
         concurrency = 1
+        reserve_mib = 0
         price = (
             "concurrency 8 -> 1; retention_pin_budget 8 -> 1 slot, so D's prefix "
             "cache collapses and D prefills more (spec R-5); every prompt above "
@@ -592,13 +702,75 @@ def resolve_d_kv_form(
         ctx = CONTEXT_LENGTH_TOKENS
         slots = D_KV_FORM_SLOTS_MAMBA_CACHE
         concurrency = D_KV_FORM_SLOTS_MAMBA_CACHE // D_MAMBA_RATIO
+        # ROUND-2 MUST_FIX (refuter): pinning the pool does not merely change a
+        # number, IT CHANGES BRANCH.  model_runner_kv_cache_mixin.py:2236
+        # (`max_mamba_cache_size is not None`) is the explicit branch;
+        # :2261 (`_auto_mamba_demand_active()`, whose gate at :2053-2059 reads
+        # `max_mamba_cache_size is None`) is the demand branch, and the ONLY
+        # subtraction of the prefill activation reserve in that file is at
+        # :2339, inside the demand branch.  So this position hands the KV pool
+        # the reserve the demand path holds back -- rows nothing prices -- and
+        # also loses the #307 budget fitter (:2288-2291) and the [auto-mamba]
+        # line (:2305), the boot's only witness of the engine's own ratio.  The
+        # MiB is READ from the engine (engine_int_constant), never typed here.
+        reserve_mib = engine_int_constant("MAMBA_AUTO_ACTIVATION_RESERVE_MIB")
         price = (
             "concurrency 8 -> 1 for admission while the CAP is bought from the "
             "state pool instead of the context: +%d mamba slots over the bs1 "
             "sizer's 5, which also restores retention_pin_budget to 12 slots "
-            "(no prefix-cache collapse) and carries NO RoPE growth. No single "
-            "request may exceed %d tokens in this position"
-            % (D_KV_FORM_SLOTS_MAMBA_CACHE - 5, CONTEXT_LENGTH_TOKENS)
+            "(no prefix-cache collapse) and carries NO RoPE growth. AND ONE POST "
+            "THIS POSITION DELETES RATHER THAN PAYS: pinning the pool moves group "
+            "D off the demand-driven mamba branch onto the explicit one "
+            "(model_runner_kv_cache_mixin.py:2236 vs :2261), and the prefill "
+            "activation reserve is subtracted ONLY on the demand branch (:2339), "
+            "so the KV pool grows by %d MiB PER CARD that no ledger prices -- the "
+            "reserve exists to keep the transient DCP-extend prefix-gather scratch "
+            "alive, the direction is OOM, and r0's measured free-column minimum is "
+            "322 MiB against the 1024 MiB corridor law. The same branch switch "
+            "drops the #307 budget fitter and the [auto-mamba] line; this slice "
+            "adds [explicit-mamba] so the ratio stays witnessed. THIS IS A CLASS-II "
+            "RUNG (spec sec 4): it must not be booted before S2 has printed a "
+            "per-CARD free-column minimum under load. No single request may exceed "
+            "%d tokens in this position"
+            % (
+                D_KV_FORM_SLOTS_MAMBA_CACHE - 5,
+                reserve_mib,
+                CONTEXT_LENGTH_TOKENS,
+            )
+        )
+    if d_bs_was_passed and int(d_bs_default) != 1:
+        raise Weg2LaunchRefused(
+            "W52 Weg2KvFormRefused: --d-kv-form %s OWNS group D's concurrency "
+            "(--max-running-requests 1 is what collapses the mamba sizer to 5 "
+            "slots and frees 7/8 of both mamba posts), so --d-bs %d beside it is "
+            "a SECOND and DIFFERENT statement of one number. Drop --d-bs, pass "
+            "--d-bs 1, or take --d-kv-form %s."
+            % (form, int(d_bs_default), D_KV_FORM_DEFAULT)
+        )
+    if max_kv_per_request_was_passed and int(max_kv_per_request) != ctx:
+        raise Weg2LaunchRefused(
+            "W52 Weg2KvFormRefused: --d-kv-form %s OWNS group D's per-request KV "
+            "ceiling and sets it to %d -- the whole point of the position is that "
+            "the ceiling is raised in step with the concurrency collapse. "
+            "--max-kv-per-request %d beside it is the second statement that would "
+            "silently win or lose. Drop it, pass %d, or take --d-kv-form %s."
+            % (form, ctx, int(max_kv_per_request), ctx, D_KV_FORM_DEFAULT)
+        )
+    restated = _extra_d_restates(extra_d, D_KV_FORM_OWNED_FLAGS)
+    if restated:
+        raise Weg2LaunchRefused(
+            "W52 Weg2KvFormRefused: --d-kv-form %s OWNS %s, and --extra-d restates "
+            "%s. --extra-d is appended LAST to group D's argv and argparse takes "
+            "the last occurrence, so the passthrough would WIN while this line "
+            "still printed the form's numbers -- the boot would run one form and "
+            "the log would name another. Drop it from --extra-d, or take "
+            "--d-kv-form %s."
+            % (
+                form,
+                " ".join(D_KV_FORM_OWNED_FLAGS),
+                " ".join(restated),
+                D_KV_FORM_DEFAULT,
+            )
         )
     cap = d_kv_form_cap_tokens(concurrency, ctx, extra_tokens)
     return DKvForm(
@@ -609,11 +781,14 @@ def resolve_d_kv_form(
         max_mamba_cache_size=slots,
         cap_concurrency=concurrency,
         cap_tokens=cap,
+        unpriced_reserve_mib=reserve_mib,
         line=(
             "WEG2 D-KV-FORM objective=%s (SELECTED, not the default %r): group D "
             "runs --max-running-requests 1 --context-length %d "
             "--max-kv-per-request %d%s, so _hybrid_kv_token_cap = max(1, %s // %d) "
-            "= %d x (%d + %d) = %d tokens. THE CEILING THIS BUYS: the cap no "
+            "= %d x (%d + %d) = %d tokens (mamba_ratio=%d is PINNED here; the "
+            "boot's own is the [auto-mamba] / [explicit-mamba] line and must be "
+            "read beside this one). THE CEILING THIS BUYS: the cap no "
             "longer binds a pool up to %d tokens, against the %d the bare bs1 "
             "form would have clamped it to (WEG2_KV1M_SPEC_0908 sec 2.1, the "
             "-61%% trap). WHAT IT COSTS: %s. Nothing here is lossy and the MTP "
@@ -630,12 +805,56 @@ def resolve_d_kv_form(
                 ctx,
                 extra_tokens,
                 cap,
+                D_MAMBA_RATIO,
                 cap,
                 d_kv_form_cap_tokens(1, CONTEXT_LENGTH_TOKENS, extra_tokens),
                 price,
             )
         ),
     )
+
+
+def d_kv_form_for_boot(ns, py: str = "py") -> Tuple[int, int, DKvForm]:
+    """THE ONE WIRING of the knob into a boot -- a function so it can be TESTED.
+
+    Round-2 review finding 1: this was twelve lines inside ``main`` and was the
+    only part of the slice no test drove.  Two review mutants lived there and
+    both survived the whole S1 suite -- ``max_kv_per_request_was_passed=False``
+    (which disarms the W52 ceiling refusal at the CLI, exactly the class W52
+    exists to prevent) and dropping ``d_bs = d_kv_form.d_bs`` (which launches a
+    bs1 position at ``--max-running-requests 8`` while the D-KV-FORM line
+    prints 1).  A slice whose licence is "an objective position, never silent"
+    cannot leave its own wiring untested, so the wiring is here and ``main``
+    calls it in one line.
+
+    Returns ``(d_bs, max_kv_per_request, form)`` -- the three values ``main``
+    then USES, so a mutant that fails to apply the form's concurrency has to
+    delete a name from a tuple unpack rather than quietly not write a line.
+    """
+    d_bs = max(1, D_BS_DEFAULT if ns.d_bs is None else int(ns.d_bs))
+    max_kv_per_request = int(
+        getattr(ns, "max_kv_per_request", None) or CONTEXT_LENGTH_TOKENS
+    )
+    extra_d = shlex.split(getattr(ns, "extra_d", "") or "")
+    form = resolve_d_kv_form(
+        ns.d_kv_form,
+        d_bs_default=d_bs,
+        max_kv_per_request=max_kv_per_request,
+        # The extra term is read off an argv built WITH --extra-d, so a
+        # passthrough that moves --speculative-num-draft-tokens moves the
+        # printed ceiling with it instead of leaving it a claim about a boot
+        # that did not happen (round-2 refuter, secondary instance).
+        extra_tokens=d_kv_form_extra_tokens(
+            argv_d(py, ns.model, [1, 1, 1], 1, 1, 1.0, extra_d, d_bs=d_bs)
+        ),
+        d_bs_was_passed=ns.d_bs is not None,
+        max_kv_per_request_was_passed=getattr(ns, "max_kv_per_request", None)
+        is not None,
+        extra_d=extra_d,
+    )
+    return form.d_bs, max_kv_per_request, form
+
+
 #: WEG2_SCHEDULING_SPEC_0907 C10/K5 -- the RECORDED break-even inputs, used
 #: only when this rig's own logs carry none.  Measured pair from record
 #: 1l/1o (boot weg2zr2, tip 7e3a9150b4): D's realised single-prefill rate at
@@ -840,8 +1059,11 @@ def resolve_x(override: Optional[int], evidence_dir: str, floor_tokens: int) -> 
         f"back, so this is a fallback, never a table (O4)"
     )
 
-#: The operating point both groups are launched at (`--context-length`), and
-#: therefore the longest prompt group P can be asked to prefill. It is the
+#: Group P's operating point (`--context-length`), and therefore the longest
+#: prompt group P can be asked to prefill.  It was "both groups" until #1023
+#: S1: the ``bs1-ctx1m`` position raises group D's context alone, so the two
+#: groups no longer necessarily share this number and a reader who assumed they
+#: did would size P's pool from D's form. It is the
 #: default floor for P's KV pool: P frees a request's rows once its prefill
 #: completes, but DURING that prefill the whole prefix must be device-resident
 #: for the stage's attention layers, so a pool below this cannot serve the
@@ -5385,8 +5607,16 @@ def build_parser() -> argparse.ArgumentParser:
                          f"{D_KV_FORM_SLOTS_MAMBA_CACHE}, concurrency term "
                          f"{D_KV_FORM_SLOTS_MAMBA_CACHE // D_MAMBA_RATIO}), keeps the "
                          f"{CONTEXT_LENGTH_TOKENS} context and the retention pin, and has no RoPE "
-                         f"growth. A bs1 position OWNS --d-bs and --max-kv-per-request: passing "
-                         f"either beside it is W52 Weg2KvFormRefused.")
+                         f"growth -- but it PINS the state pool, which moves group D off the "
+                         f"demand-driven mamba branch onto the explicit one, and the prefill "
+                         f"activation reserve is subtracted only on the demand branch: the KV "
+                         f"pool then grows by that reserve PER CARD with nothing pricing it, so "
+                         f"'bs1-slots' is a CLASS-II rung and must not be booted before S2 has "
+                         f"printed a per-card free-column minimum under load. A bs1 position OWNS "
+                         f"--d-bs, --max-kv-per-request, --context-length, --max-mamba-cache-size "
+                         f"and --speculative-algorithm: a DIFFERING value beside it -- as a flag "
+                         f"or inside --extra-d, which argparse lets win silently -- is W52 "
+                         f"Weg2KvFormRefused. An operator value that AGREES is accepted.")
     ap.add_argument("--tp-prefill-max-tokens", type=int, default=None,
                     help="K5 (X): uncached tokens D may prefill itself. Unset = DERIVED as "
                          "2*flip_s/(1/r_D - 1/r_P) from this rig's own front-log rate and flip "
@@ -5410,7 +5640,9 @@ def build_parser() -> argparse.ArgumentParser:
                     help="K10: seconds before a flip is refused by name (W1 -> W2). Shipped value.")
     ap.add_argument("--max-kv-per-request", type=int, default=None,
                     help="K9: per-request KV ceiling for BOTH groups. Unset = the model context "
-                         f"({CONTEXT_LENGTH_TOKENS}), i.e. the as-built cap.")
+                         f"({CONTEXT_LENGTH_TOKENS}), i.e. the as-built cap. A bs1 --d-kv-form "
+                         f"position OWNS group D's half of this number; a DIFFERING value beside "
+                         f"such a position is W52 Weg2KvFormRefused (an agreeing one is fine).")
     ap.add_argument("--carrier-max-tokens", type=int, default=None,
                     help="#1246: ship a LOWER carrier bound than the one the census reads from group D's "
                          "own '#915 PREFETCH LIMIT' line. IT CAN ONLY LOWER IT: N is accepted exactly on "
@@ -5922,24 +6154,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # reason -- one number, printed with its inputs, then TOLD to both the
     # front and group D (C2/R-6: no HTTP round trip to a sleeping group).
     p_bs = max(1, int(ns.p_bs))
-    d_bs = max(1, D_BS_DEFAULT if ns.d_bs is None else int(ns.d_bs))
-    max_kv_per_request = int(ns.max_kv_per_request or CONTEXT_LENGTH_TOKENS)
     # #1023 S1 -- THE CAP SEAM, RESOLVED HERE AND DERIVED, never pinned. The
     # form owns group D's concurrency and per-request ceiling in every position
     # but the default; ``extra`` is read off D's own argv (the drafter's
     # --speculative-num-draft-tokens, which the user law of 2026-09-09 keeps
-    # on), so the printed ceiling cannot drift from the boot that runs.
-    d_kv_form = resolve_d_kv_form(
-        ns.d_kv_form,
-        d_bs_default=d_bs,
-        max_kv_per_request=max_kv_per_request,
-        extra_tokens=d_kv_form_extra_tokens(
-            argv_d("py", ns.model, [1, 1, 1], 1, 1, 1.0, [], d_bs=d_bs)
-        ),
-        d_bs_was_passed=ns.d_bs is not None,
-        max_kv_per_request_was_passed=ns.max_kv_per_request is not None,
-    )
-    d_bs = d_kv_form.d_bs
+    # on), so the printed ceiling cannot drift from the boot that runs. The
+    # wiring itself lives in d_kv_form_for_boot BECAUSE it is testable there
+    # and was not testable here (round-2 review finding 1: two mutants in these
+    # lines survived the entire S1 suite).
+    d_bs, max_kv_per_request, d_kv_form = d_kv_form_for_boot(ns, py)
     log(d_kv_form.line)
     x_tokens, x_provenance = resolve_x(ns.tp_prefill_max_tokens, EVIDENCE_DIR, CHUNKED_PREFILL_TOKENS)
     flip_min_work_tokens = int(ns.flip_min_work_tokens) if ns.flip_min_work_tokens is not None else x_tokens
