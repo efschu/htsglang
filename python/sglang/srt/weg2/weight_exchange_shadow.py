@@ -970,6 +970,32 @@ class ShadowResult:
     direction: str = "?"
     ran: bool = False
     reason: str = ""
+    #: S5b.  Which of the two ``weight_updater`` hooks emitted this line --
+    #: ``source`` (the sleep leg) or ``destination`` (the wake leg).  A boot
+    #: whose lines are all one word has ONE hook wired, which is a wiring
+    #: finding a reader cannot make out of ``dir=`` alone (both hooks of one
+    #: flip carry different directions on different ranks).
+    hook: str = "?"
+    #: S5b, item 5.  THE ADDED WALL THIS HOOK COST ITS LEG, measured from the
+    #: first statement of :func:`run_leg_hook` to its ``finally``, so it
+    #: includes the attach, the semaphore census, the gate wait and the
+    #: compare -- everything the flip paid for having an observer.  It is a
+    #: MEASUREMENT and never a refusal: ``hop_bound_ms`` is what refuses, and
+    #: it refuses a PREDICTION, before the wall is spent.
+    shadow_ms: float = 0.0
+    #: The launcher-given bound the priced hop was graded against.
+    hop_bound_ms: float = 0.0
+    #: ``verify_sem_arm``'s census (24) when every count was armed, ``None``
+    #: when it refused or could not run.  ``None`` prints ``n/a``: an absent
+    #: check and a passed one are different findings (denominator law).
+    sems_armed: Optional[int] = None
+    #: S5b, item 2.  The ring's OWN not-yet-mapped image demand for this leg,
+    #: in MiB, as the destination hook read it from ``_weg2_tag_bytes`` before
+    #: the ``resume`` loop.  It is on the acceptance line as well as on the
+    #: budget line so a reader who greps only ``WEG2-XCHG-SHADOW `` can still
+    #: tell a priced leg from an unwired one -- ``0`` on the source hook, where
+    #: there is no resume to reserve for, and the ``hook=`` token says which.
+    resume_reserve_mib: int = 0
 
     def line(self) -> str:
         """THE acceptance line.  One line, both token sets, and here is why.
@@ -1017,6 +1043,10 @@ class ShadowResult:
             f"issue_ms={self.issue_ms:.3f} slot_wait_ms={self.slot_wait_ms:.3f} "
             f"gate_skew_ms={self.gate_skew_ms:.3f} "
             f"lock_wait_ms={ms(self.lock_wait_ms)} "
+            f"hook={self.hook} shadow_ms={self.shadow_ms:.3f} "
+            f"hop_bound_ms={self.hop_bound_ms:.3f} "
+            f"sems_armed={'n/a' if self.sems_armed is None else self.sems_armed} "
+            f"resume_reserve_mib={self.resume_reserve_mib} "
             f"verdict={counters.verdict if self.ran else 'NOT-RUN'} "
             f"reason={self.reason or 'ok'}"
         )
@@ -1305,3 +1335,563 @@ def shadow_transport(
 
 def _is_on_card(desc: object) -> bool:
     return int(desc.src_rank) == int(desc.dst_rank)
+
+
+# ===========================================================================
+# S5b -- THE TWO LEG HOOKS.  The shadow's only callers in the product.
+#
+# SECTION 1ai-S5-fix's UNPROVEN 2 named the gap in these words: "the two hooks
+# inside ``weight_updater``'s legs are NOT written ... until then the shadow
+# has no caller in the product at all."  This section is that caller, and it
+# is deliberately a pair of FREE FUNCTIONS over plain arguments rather than
+# methods on the scheduler mixin: the mixin cannot be constructed without a
+# model runner, a torch process group and a device, so a hook written into it
+# is a hook no hermetic test can drive.  ``weight_updater`` keeps two thin
+# adapters that gather the arguments and call these; the adapters are pinned
+# by SOURCE (the WiringTest precedent, test_weg2_xchg_cover_1273.py:862) and
+# the behaviour is proven here.
+# ===========================================================================
+
+#: Which side of the flip a hook is on.  The SOURCE hook runs on the SLEEP leg
+#: (the group giving its weights up) and the DESTINATION hook on the WAKE leg.
+HOOK_SOURCE = "source"
+HOOK_DESTINATION = "destination"
+
+#: THE FACTOR, NAMED.  :data:`tp.ONCARD_HOP_BUDGET_MS` (20 ms) is the spec's
+#: diagonal target for the AUTHORITATIVE lane, and the shadow is not that lane:
+#: it moves a class subset on a card that is simultaneously carrying a real
+#: flip leg, so a bound equal to the authoritative target would refuse the
+#: observer for being an observer.  Three is chosen as the smallest integer
+#: multiple that still refuses the shape this bound exists to refuse -- a
+#: subset whose priced hop has grown to the FULL diagonal's order (the 10.28
+#: GiB / 109-batch figure prices at 19.8 ms, so a full-diagonal subset lands at
+#: ~1x the budget and passes; the 32 MiB shipping slot prices the same bytes at
+#: 329 batches ~ 118 ms and is refused at 60 ms).  It is a factor and not a
+#: second measured constant precisely so the reader can see it is a POLICY
+#: number sitting on top of a measured one, not an arm of its own.
+SHADOW_HOP_BOUND_FACTOR = 3.0
+SHADOW_HOP_BOUND_MS_DEFAULT = tp.ONCARD_HOP_BUDGET_MS * SHADOW_HOP_BOUND_FACTOR
+
+#: The launcher-given bound.  ``--weg2-shadow-hop-bound-ms`` publishes it; the
+#: env read is the same shape as :data:`tp.ENV_ONCARD_MODE`, so a rank needs no
+#: new plumbing to see a flag the launcher set.
+ENV_HOP_BOUND_MS = "SGLANG_WEG2_SHADOW_HOP_BOUND_MS"
+
+#: W63 -- this RANK could not join the shadow while the mode is armed.
+#:
+#: It exists because item 6 of the S5b brief is a real hazard and not a style
+#: rule: the shadow gate is rank-uniform, so a rank that quietly returns
+#: without voting is not "one rank less" -- it is five ranks waiting out the
+#: gate budget inside their own flip legs and then reading an EXPIRY, which
+#: looks identical to a card that refused on arithmetic.  A skip that cannot be
+#: told from a refusal is a silent divergence, and this names it.
+RANK_LOCAL_SKIP_MARKER = "W63 Weg2XchgShadowRankLocalSkip"
+
+
+class Weg2XchgShadowRankLocalSkip(RuntimeError):
+    """W63 -- the shadow is armed for this boot but this rank cannot join it.
+
+    Raised ONLY with ``explicit=True`` (an operator who asked for the shadow by
+    name on this rank), the same two-arm shape as :class:`
+    Weg2XchgShadowUnaffordable` and W56 before it.  On the automatic path it is
+    a log line and a ``reason=`` token on the leg's own
+    ``WEG2-XCHG-SHADOW`` line, because a zero-authority observer that raises
+    into a flip leg has taken the authority this slice exists not to have.
+
+    The reasons it names, all of which are "this rank, locally":
+
+    * ``no-region`` -- ``SGLANG_WEG2_XCHG_REGION`` is unset or the file will not
+      open (the launcher's ``prepare_shadow_env`` did not run, or ran for
+      another boot);
+    * ``no-sems`` -- the 24 names are not openable without ``O_CREAT``;
+    * ``no-ops`` -- ``libcudart`` did not load;
+    * ``no-plan`` -- nothing handed this leg descriptors.  **This is the
+      standing state**: :func:`plan_for_leg` has NO PRODUCER in this slice and
+      says so, so a shadow boot today prints ``verdict=NOT-RUN reason=no-plan``
+      on every leg of every rank.  That is the honest reading of "the exchange
+      has no plan on the boot path yet" (``weight_exchange.build_plan`` has
+      zero product callers, verified by ``test_the_plan_seam_has_no_producer``)
+      and it is deliberately a NAMED ABSENCE rather than a fabricated identity
+      plan: a plan a rank derives on its own would compare the ring's restored
+      bytes against a copy of those same bytes and match by construction --
+      the "instrument that cannot go red" this campaign has now paid for three
+      times (``20c5fb9048``, refuter 1, refuter 2).
+    * ``stale-run`` -- a previous leg's shadow was never closed (see
+      :class:`ShadowLeg`).
+    """
+
+
+def hop_bound_ms(value: Optional[float] = None) -> float:
+    """The bound this boot grades the priced hop against, with its provenance.
+
+    ``value`` (the launcher flag, passed down) wins; then the environment;
+    then :data:`SHADOW_HOP_BOUND_MS_DEFAULT`.  A malformed environment value is
+    NOT silently replaced by the default -- it raises, here, at the top of the
+    leg, where a ``ValueError`` is caught by the hook and printed as a reason.
+    A bound nobody can read is a bound nobody is graded against.
+    """
+    if value is not None:
+        return float(value)
+    raw = (os.environ.get(ENV_HOP_BOUND_MS, "") or "").strip()
+    if not raw:
+        return float(SHADOW_HOP_BOUND_MS_DEFAULT)
+    return float(raw)
+
+
+def hop_refusal_message(*, card: str, priced_ms: float, bound_ms: float,
+                        batches: int, slot_mib: float, leg: int) -> str:
+    """W61 for the TIME term, the same marker the VRAM term already uses.
+
+    ONE code for one class of event -- "the shadow cannot afford to run on this
+    leg" -- and the line says which resource by naming both numbers.  A second
+    W-code for the same decision would make a census of "legs the shadow
+    refused itself" read low by exactly the time-refused ones.
+    """
+    return (
+        f"{UNAFFORDABLE_MARKER} card={card} scope=hop leg={leg} "
+        f"priced_hop_ms={priced_ms:.3f} bound_ms={bound_ms:.3f} "
+        f"batches={batches} slot_mib={slot_mib:g} "
+        f"factor={SHADOW_HOP_BOUND_FACTOR:g}x{tp.ONCARD_HOP_BUDGET_MS:g}ms "
+        f"-- the shadow does not run on this leg; the flip is untouched and "
+        f"the ring remains the only authority for weight bytes"
+    )
+
+
+def rank_local_skip_message(*, reason: str, rank: int, leg: int, epoch: str,
+                            detail: str = "") -> str:
+    """W63, naming the rank, the leg and what was missing."""
+    return (
+        f"{RANK_LOCAL_SKIP_MARKER} rank={rank} leg={leg} epoch={epoch} "
+        f"reason={reason}{(' detail=' + detail) if detail else ''} "
+        f"-- this rank does not join the shadow for this leg.  The rank-uniform "
+        f"gate turns that into a NO for all {xr.N_RANKS} rows (a non-publisher "
+        f"is a gate expiry, which is a NO), so no rank runs a half experiment; "
+        f"the flip proceeds on the ring either way"
+    )
+
+
+# ---------------------------------------------------------------------------
+# The plan seam.  ONE named absence, not a silent one.
+# ---------------------------------------------------------------------------
+
+#: The descriptor producer for a shadow leg.  ``None`` is the shipping value.
+#:
+#: WHY IT IS EMPTY AND WHY THAT IS NOT A STUB.  ``weight_exchange.build_plan``
+#: needs the inventory and the ``GroupLayout`` of BOTH groups -- cross-group
+#: knowledge no single rank holds -- and it has no product caller anywhere
+#: (``test_the_plan_seam_has_no_producer`` asserts that, so the day S6 wires
+#: one this test goes red and this comment gets updated rather than rotting).
+#: The alternative was an identity plan built from this rank's own
+#: ``named_parameters()``; it is refused above, in W63's ``no-plan`` bullet,
+#: with the reason.
+_PLAN_PROVIDER: Optional[Callable[[str, int, int], Sequence[object]]] = None
+
+
+def set_plan_provider(
+    provider: Optional[Callable[[str, int, int], Sequence[object]]],
+) -> Optional[Callable[[str, int, int], Sequence[object]]]:
+    """Install the descriptor producer (S6's, or a test's).  Returns the old one."""
+    global _PLAN_PROVIDER
+    previous = _PLAN_PROVIDER
+    _PLAN_PROVIDER = provider
+    return previous
+
+
+def plan_for_leg(direction: str, leg: int, rank: int) -> Sequence[object]:
+    """The descriptors for this leg, or ``()`` when nothing produces them."""
+    provider = _PLAN_PROVIDER
+    if provider is None:
+        return ()
+    return tuple(provider(str(direction), int(leg), int(rank)))
+
+
+# ---------------------------------------------------------------------------
+# The leg's own shadow: created at leg start, closed at leg end.
+# ---------------------------------------------------------------------------
+
+#: The ONE shadow run this process owns, or ``None``.  A module-level slot and
+#: not a scheduler attribute, because the thing it guards against is a run that
+#: OUTLIVES the object that made it: a leg that raised between the allocation
+#: and the close leaves a raw ``cudaMalloc`` alive for the life of the boot on
+#: the tight card, which is refuter must_fix 3 one scope up.
+_ACTIVE_LEG: Optional["ShadowLeg"] = None
+
+
+@dataclass(frozen=True)
+class ShadowLegInputs:
+    """What the leg knows and the shadow needs.  Every field has a producer.
+
+    ``resume_reserve_bytes`` and ``ring_ms`` are the two S5b brief calls
+    "producers", and both are READ from the ring rather than estimated:
+
+    * ``resume_reserve_bytes`` is the sum of ``_weg2_tag_bytes(tag)`` over the
+      weights family, read in the wake leg BEFORE the ``resume`` loop -- i.e.
+      the ring's own not-yet-mapped image demand, the exact number
+      :func:`price_shadow`'s fourth term was added for (refuter must_fix 4).
+    * ``ring_ms`` is the sum of the per-tag walls the leg already measures and
+      already prints on its ``WEG2-FLIP-TAG`` lines (``weg2_per_tag[tag][1]``),
+      so the shadow's line and the ring's lines carry the SAME instrument and a
+      reader can subtract them.  It is ``None`` on the source hook, which runs
+      before the leg's own wall exists -- and ``None`` prints ``n/a``, which is
+      the point of that field.
+    """
+
+    leg: int
+    epoch: str
+    direction: str
+    hook: str
+    rank: int
+    row: int
+    peer_row: int
+    device: int
+    card_uuid: str
+    uuid_of_card: Tuple[str, ...] = ()
+    wave: int = 0
+    free_mib: int = 0
+    resume_reserve_bytes: int = 0
+    ring_ms: Optional[float] = None
+
+
+class ShadowLeg:
+    """ONE flip leg's shadow.  The leg owns it; nothing else may close it.
+
+    LIFETIME, which is item 4 of the S5b brief and a real defect class rather
+    than hygiene:
+
+    * :meth:`start` refuses to begin while another leg's run is still open
+      (``reason=stale-run``) and closes the stale one, so a boot cannot
+      accumulate one raw ``cudaMalloc`` per flip on the card that is short of
+      VRAM by 550 MiB before the shadow asks for a byte;
+    * :meth:`close` is IDEMPOTENT and OWNERSHIP-CHECKED: a caller that did not
+      create this run cannot close it (``owner=`` must match the token
+      :meth:`start` handed back).  The handler that wraps the hook therefore
+      cannot free a buffer a LATER leg is using, which is the same shape as
+      the stale-``ShadowRun`` leak refuter must_fix 3 found one layer down;
+    * the buffer is freed BEFORE the hook returns, on every path, including the
+      ones where the transport raised: the ``finally`` is in :func:`run_leg_hook`
+      and the ownership token makes the double-close a no-op rather than a
+      free of somebody else's pointer.
+    """
+
+    def __init__(self, inputs: ShadowLegInputs, log: Callable[[str], None]):
+        self.inputs = inputs
+        self.log = log
+        self.token = f"{os.getpid()}:{inputs.epoch}:{inputs.leg}:{inputs.hook}"
+        self.region: Optional[xr.XchgRegion] = None
+        self.sems: Optional[tp.SemSet] = None
+        self.ops: Optional[tp.DeviceOps] = None
+        self.run: Optional[ShadowRun] = None
+        self.sems_armed: Optional[int] = None
+        self.sems_reason: str = ""
+        self.closed = False
+
+    # -- lifetime ---------------------------------------------------------
+
+    def adopt(self) -> "ShadowLeg":
+        """Become the process's active run, closing a stale one BY NAME."""
+        global _ACTIVE_LEG
+        stale = _ACTIVE_LEG
+        if stale is not None and stale is not self:
+            self.log(rank_local_skip_message(
+                reason="stale-run", rank=self.inputs.rank,
+                leg=self.inputs.leg, epoch=self.inputs.epoch,
+                detail=f"previous={stale.token}"))
+            stale.close(owner=stale.token)
+        _ACTIVE_LEG = self
+        return self
+
+    def close(self, *, owner: str) -> bool:
+        """Free everything this run owns.  ``False`` when the caller is not it."""
+        global _ACTIVE_LEG
+        if owner != self.token:
+            return False
+        if self.closed:
+            return True
+        self.closed = True
+        for name in ("run", "ops", "sems", "region"):
+            obj = getattr(self, name, None)
+            if obj is None:
+                continue
+            try:
+                obj.close()
+            except BaseException:  # noqa: BLE001 -- an observer's unwind
+                pass
+            setattr(self, name, None)
+        if _ACTIVE_LEG is self:
+            _ACTIVE_LEG = None
+        return True
+
+    # -- attach -----------------------------------------------------------
+
+    def attach(self, *, region=None, sems=None, ops=None) -> str:
+        """Open region, semaphores and device ops.  ``""`` on success, else a reason.
+
+        Every one of the three is INJECTABLE, which is what makes the hook
+        testable at all: the hermetic double hands in S4's fake device layer and
+        a region on ``tmp_path``, and the product hands in nothing and gets the
+        env-driven real ones.
+        """
+        i = self.inputs
+        if region is not None:
+            self.region = region
+        else:
+            path = (os.environ.get(xr.ENV_REGION_PATH, "") or "").strip()
+            boot = (os.environ.get(xr.ENV_REGION_BOOT, "") or "").strip()
+            if not path or not boot:
+                return "no-region"
+            try:
+                self.region = xr.XchgRegion.open(path, expect_boot=boot)
+            except BaseException as exc:  # noqa: BLE001
+                self.sems_reason = f"{type(exc).__name__}: {exc}"
+                return "no-region"
+            try:
+                # THE FLIP TOKEN IS COMPOSED FROM THIS REGION'S OWN BOOT NONCE,
+                # not from the RPC's epoch, and the two are not the same string:
+                # the RPC carries ``weg2_memory_saver.credit_epoch`` =
+                # ``<TMS_HOST_RING_EPOCH>.<flip>`` while the region was created
+                # under the launcher's xchg boot nonce, and ``begin_flip``
+                # REFUSES a token whose boot half is not its own (W52).  The
+                # FLIP half is the shared quantity and it is what
+                # ``ShadowLegInputs.leg`` carries -- derived, in the adapter,
+                # from that same epoch token rather than from a counter this
+                # class does not have.
+                self.region.begin_flip(f"{self.region.boot_nonce}.{int(i.leg)}")
+            except BaseException as exc:  # noqa: BLE001
+                self.sems_reason = f"{type(exc).__name__}: {exc}"
+                return "no-region"
+        if sems is not None:
+            self.sems = sems
+        else:
+            try:
+                self.sems = tp.SemSet(self.region.boot_nonce)
+            except BaseException as exc:  # noqa: BLE001
+                self.sems_reason = f"{type(exc).__name__}: {exc}"
+                return "no-sems"
+        if ops is not None:
+            self.ops = ops
+        else:
+            try:
+                self.ops = tp.CudartDeviceOps()
+            except BaseException as exc:  # noqa: BLE001
+                self.sems_reason = f"{type(exc).__name__}: {exc}"
+                return "no-ops"
+        return ""
+
+    def verify_sems(self) -> str:
+        """W62 AT LEG START -- **counted here, never raised into the leg**.
+
+        SECTION 1ai-S5's UNPROVEN 9 said ``verify_sem_arm`` has no caller.  This
+        is the caller, and the placement is a deliberate narrowing of that
+        function's own ``TODO(S6)``: it names the RPC preamble, which is where a
+        refusal that STOPS A FLIP belongs, and the shadow may not stop a flip.
+        So the same check runs at the start of the shadow's leg and its refusal
+        decides only whether the SHADOW runs -- ``reason=w62-stale`` on the
+        line, ``sems=stale`` in the census field, and the flip proceeds on the
+        ring.  When S6 puts it in the preamble as an authoritative refusal this
+        call becomes redundant and should be deleted, not kept as a second one.
+        """
+        if self.sems is None:
+            return "no-sems"
+        try:
+            census = tp.verify_sem_arm(self.sems, leg=self.inputs.leg,
+                                       epoch=self.inputs.epoch, log=self.log)
+        except tp.Weg2XchgSemaphoreNotRearmed as exc:
+            self.sems_armed = None
+            self.sems_reason = str(exc)
+            self.log(str(exc))
+            return "w62-stale"
+        except BaseException as exc:  # noqa: BLE001
+            self.sems_reason = f"{type(exc).__name__}: {exc}"
+            return "sem-check-failed"
+        self.sems_armed = int(census.get("checked", 0))
+        return ""
+
+
+def oncard_mode_word(mode: str) -> int:
+    """The Gate-0 word for an on-card mode.  THE MODE WORD'S PRODUCER.
+
+    SECTION 1ai-S5's UNPROVEN 10: "the Gate-0 mode word has no producer -- every
+    rank publishes UNSTATED".  ``gate0_publish`` takes the word; this is the one
+    place that turns the launcher's arm (``--weg2-xchg-oncard`` ->
+    ``SGLANG_WEG2_XCHG_ONCARD`` -> the mode the transport resolved) into it, so
+    a Gate-0 publisher no longer has to invent one.  An unknown mode maps to
+    ``UNSTATED`` rather than to a guess: ``gate0_check`` treats UNSTATED as
+    "not a disagreement" and a wrong word would be one.
+    """
+    return int(xr.ONCARD_MODE_WORD.get(str(mode), xr.ONCARD_MODE_UNSTATED))
+
+
+def resolve_shadow_oncard_mode() -> str:
+    """The mode the shadow's lane uses, from the launcher flag, never probed.
+
+    ``ipc`` is the default and ``host`` the operator's degrade; the shadow does
+    NOT run ``tp.resolve_oncard_mode``'s probe, because that probe allocates and
+    an observer that probes has changed the card it is observing before it has
+    been allowed to run at all.  An unreadable value is ``host``, the degrade,
+    not a raise: this decision may not stop a leg.
+    """
+    requested = (os.environ.get(tp.ENV_ONCARD_MODE, "") or "").strip()
+    if requested == tp.ONCARD_MODE_HOST:
+        return tp.ONCARD_MODE_HOST
+    if requested in ("", tp.ONCARD_MODE_IPC):
+        return tp.ONCARD_MODE_IPC
+    return tp.ONCARD_MODE_HOST
+
+
+def shadow_armed() -> bool:
+    """Is ``--weg2-weight-source shadow`` the arm of this boot?
+
+    THE ONE GATE ON BOTH HOOKS.  On ``ring`` -- the default and every boot that
+    has ever run -- this is False, both adapters return before they touch a
+    single symbol of this module's machinery, and the leg is byte-identical to
+    today's.  ``test_the_hooks_are_never_reached_on_the_ring_arm`` is the proof.
+    """
+    from sglang.srt.weg2 import weight_exchange as wxm
+
+    return wxm.weight_source() == WEIGHT_SOURCE_SHADOW
+
+
+def run_leg_hook(
+    inputs: ShadowLegInputs,
+    *,
+    log: Callable[[str], None],
+    descs: Optional[Sequence[object]] = None,
+    region=None,
+    sems=None,
+    ops=None,
+    sum_bytes: Optional[Callable[[int, int], int]] = None,
+    classes: Sequence[str] = (),
+    per_leg: int = 1,
+    bound_ms: Optional[float] = None,
+    explicit: bool = False,
+    armed: Optional[bool] = None,
+    # The staging geometry, FORWARDED and never re-derived.  These are already
+    # parameters of :func:`shadow_transport` with exactly these defaults; the
+    # hook passes them through so a caller whose region has a different
+    # geometry (the hermetic double's 4 KiB slot) drives the same code path the
+    # product does instead of a second one written for it.
+    slot_bytes: int = xr.SLOT_BYTES,
+    stripe_bytes: int = STRIPE_BYTES,
+    budget_s: float = SHADOW_TRANSPORT_BUDGET_S,
+) -> Optional[ShadowResult]:
+    """ONE leg's shadow, start to close.  Returns ``None`` when not armed.
+
+    THE ORDER, and every step is a refusal point that decides only the shadow:
+
+    1. the arm (``--weg2-weight-source shadow``) -- ``None`` on every other one;
+    2. adopt the process's active-run slot, closing a stale one (W63);
+    3. attach region + semaphores + device ops (W63 on each, by name);
+    4. ``verify_sem_arm`` (W62, counted);
+    5. the plan (W63 ``no-plan`` -- the standing state, see :func:`plan_for_leg`);
+    6. the priced hop against the launcher's bound (W61 ``scope=hop``);
+    7. the transport, and on the destination hook the compare;
+    8. ``close()``, in a ``finally``, with the ownership token.
+
+    Step 6 runs BEFORE step 7 on purpose: the bound is a PREDICTION the leg is
+    allowed to act on, and ``shadow_ms`` is the MEASUREMENT it is graded
+    against afterwards.  A measured overshoot is a finding on the line, never a
+    retro-active refusal -- there is nothing to refuse once the wall has been
+    spent, and pretending otherwise is the compensating-reader shape.
+    """
+    if armed is None:
+        armed = shadow_armed()
+    if not armed:
+        return None
+    started = time.perf_counter()
+    leg = ShadowLeg(inputs, log).adopt()
+    result = ShadowResult(leg=int(inputs.leg), epoch=str(inputs.epoch),
+                          subset=select_subset((), leg=int(inputs.leg)),
+                          counters=ShadowCounters(),
+                          direction=str(inputs.direction))
+    result.ring_ms = inputs.ring_ms
+    bound = float(SHADOW_HOP_BOUND_MS_DEFAULT)
+    try:
+        try:
+            bound = hop_bound_ms(bound_ms)
+        except (TypeError, ValueError) as exc:
+            result.reason = f"bad-bound:{type(exc).__name__}"
+            return result
+        reason = leg.attach(region=region, sems=sems, ops=ops)
+        if reason:
+            log(rank_local_skip_message(
+                reason=reason, rank=inputs.rank, leg=inputs.leg,
+                epoch=inputs.epoch, detail=leg.sems_reason))
+            if explicit:
+                raise Weg2XchgShadowRankLocalSkip(reason)
+            result.reason = reason
+            return result
+        sem_reason = leg.verify_sems()
+        if sem_reason:
+            result.reason = sem_reason
+            return result
+        plan = tuple(descs) if descs is not None else plan_for_leg(
+            inputs.direction, inputs.leg, inputs.rank)
+        if not plan:
+            log(rank_local_skip_message(
+                reason="no-plan", rank=inputs.rank, leg=inputs.leg,
+                epoch=inputs.epoch,
+                detail="weight_exchange.build_plan has no product caller"))
+            if explicit:
+                raise Weg2XchgShadowRankLocalSkip("no-plan")
+            result.reason = "no-plan"
+            return result
+        is_source = inputs.hook == HOOK_SOURCE
+        mode = resolve_shadow_oncard_mode()
+        subset = select_subset(plan, leg=inputs.leg, classes=classes,
+                               per_leg=per_leg)
+        diag_slot = tp.plan_oncard_slot_bytes(
+            oncard_lane_bytes(subset.descs, inputs.rank))
+        diag_bytes = oncard_lane_bytes(subset.descs, inputs.rank)
+        batches = -(-diag_bytes // diag_slot) if diag_bytes else 0
+        priced_ms = batches * tp.ONCARD_PER_BATCH_MS
+        if priced_ms > bound:
+            message = hop_refusal_message(
+                card=inputs.card_uuid, priced_ms=priced_ms, bound_ms=bound,
+                batches=batches, slot_mib=diag_slot / MIB, leg=inputs.leg)
+            log(message)
+            result.subset = subset
+            result.oncard_slot_mib = diag_slot / MIB
+            result.oncard_batches = batches
+            result.oncard_hop_ms_priced = priced_ms
+            result.reason = "hop-over-bound"
+            if explicit:
+                raise Weg2XchgShadowUnaffordable(message)
+            return result
+        run = shadow_transport(
+            region=leg.region, sems=leg.sems, ops=leg.ops, row=inputs.row,
+            rank=inputs.rank, device=inputs.device,
+            card_uuid=inputs.card_uuid,
+            uuid_of_card=tuple(inputs.uuid_of_card), descs=plan,
+            is_source=is_source, oncard_mode=mode, peer_row=inputs.peer_row,
+            wave=inputs.wave, leg=inputs.leg, direction=inputs.direction,
+            epoch=inputs.epoch, free_mib=inputs.free_mib, log=log,
+            sum_bytes=sum_bytes, classes=classes, per_leg=per_leg,
+            resume_reserve_bytes=inputs.resume_reserve_bytes,
+            explicit=explicit, slot_bytes=slot_bytes,
+            stripe_bytes=stripe_bytes, budget_s=budget_s)
+        leg.run = run
+        result = run.result
+        result.ring_ms = inputs.ring_ms
+        if not is_source:
+            # THE COMPARE IS THE DESTINATION HOOK'S WHOLE POINT and it runs
+            # here, after the ring's own restore, against the ring's own bytes.
+            run.compare(sum_bytes, log)
+        return result
+    except Weg2XchgShadowUnaffordable:
+        raise
+    except Weg2XchgShadowRankLocalSkip:
+        raise
+    except BaseException as exc:  # noqa: BLE001 -- a hook never raises into a leg
+        result.counters.errors.append(f"{type(exc).__name__}: {exc}")
+        result.reason = f"hook-failed:{type(exc).__name__}"
+        result.ran = False
+        return result
+    finally:
+        leg.close(owner=leg.token)
+        result.shadow_ms = (time.perf_counter() - started) * 1e3
+        result.hop_bound_ms = bound
+        result.sems_armed = leg.sems_armed
+        result.hook = str(inputs.hook)
+        result.resume_reserve_mib = int(
+            -(-int(inputs.resume_reserve_bytes) // MIB))
+        log(result.line())

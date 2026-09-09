@@ -74,6 +74,7 @@ from sglang.srt.weg2 import (
     host_ledger,
     ring_table,
     weight_exchange_region,
+    weight_exchange_shadow,
     xchg_residency,
 )
 from sglang.srt.weg2 import DEFAULT_D_BS, DEFAULT_P_BS, DEFAULT_PP_ORDERED_CUT
@@ -3336,7 +3337,8 @@ def prepare_xchg_region(log: Log, boot_nonce: str, hook_mode: int,
 
 
 def prepare_shadow_env(log: Log, boot_nonce: str, weight_source: str,
-                       hook_mode: int = 0, dry: bool = False) -> Dict[str, str]:
+                       hook_mode: int = 0, dry: bool = False,
+                       hop_bound_ms: Optional[float] = None) -> Dict[str, str]:
     """#1273 S5: arm the region for the SHADOW arm, and publish it to both groups.
 
     ``{}`` on every other arm, and that empty dict is what keeps the default
@@ -3363,6 +3365,12 @@ def prepare_shadow_env(log: Log, boot_nonce: str, weight_source: str,
     got = prepare_xchg_region(log, boot_nonce, hook_mode, dry=dry)
     env = dict(got.get("env") or {})
     env["SGLANG_WEG2_WEIGHT_SOURCE"] = "shadow"
+    # S5b: the launcher-given hop bound, published by the same mechanism and
+    # for the same reason as the region names -- a rank reads a flag it never
+    # sees on its own argv, and a bound nobody published is a bound the rank
+    # would have to invent.
+    env[weight_exchange_shadow.ENV_HOP_BOUND_MS] = repr(
+        float(weight_exchange_shadow.hop_bound_ms(hop_bound_ms)))
     log(f"WEG2-XCHG-SHADOW ARMED epoch={boot_nonce} path={got.get('path', '')} "
         f"sems={got.get('sems', 0)} ring=AUTHORITATIVE exchange=OBSERVER "
         f"-- the ring refills every weight byte as it does today; the exchange "
@@ -3877,7 +3885,11 @@ def build_env(tree: str, venv: str, cvd: str, store_dir: str, debug_hold: bool, 
     # nobody asked for, and a stale region path is a rank mapping another
     # boot's shm.
     for key in ("SGLANG_WEG2_XCHG_REGION", "SGLANG_WEG2_XCHG_BOOT",
-                "SGLANG_WEG2_WEIGHT_SOURCE"):
+                "SGLANG_WEG2_WEIGHT_SOURCE",
+                # S5b: the shadow's hop bound is launcher OUTPUT too, so an
+                # operator's inherited shell value may not silently regrade a
+                # boot that arms no shadow at all.
+                weight_exchange_shadow.ENV_HOP_BOUND_MS):
         env.pop(key, None)
     for key, value in (xchg_env or {}).items():
         env[str(key)] = str(value)
@@ -7927,6 +7939,23 @@ def build_parser() -> argparse.ArgumentParser:
              "can refuse NOTHING ELSE.",
     )
     ap.add_argument(
+        "--weg2-shadow-hop-bound-ms", type=float,
+        default=weight_exchange_shadow.SHADOW_HOP_BOUND_MS_DEFAULT,
+        help="#1273 S5b: the wall the SHADOW is allowed to price its on-card "
+             "hop at before it refuses ITSELF for this leg (W61, scope=hop). "
+             "The default is the spec's 20 ms diagonal target for the "
+             "AUTHORITATIVE lane times a named factor of "
+             f"{weight_exchange_shadow.SHADOW_HOP_BOUND_FACTOR:g} -- the "
+             "observer runs on a card that is simultaneously carrying a real "
+             "flip leg, so a bound equal to the authoritative target would "
+             "refuse it for being an observer. It grades the PRICED hop, "
+             "before any wall is spent; the MEASURED one is on the shadow "
+             "line as shadow_ms= and is a finding, never a retro-active "
+             "refusal. It can refuse only the shadow: the flip proceeds on "
+             "the ring either way. Ignored on every arm but "
+             "--weg2-weight-source shadow",
+    )
+    ap.add_argument(
         "--weg2-xchg-census", default="",
         help="#1273 S7: the per-card, per-tag, per-group census W55 prices the "
              "exchange's VRAM peak from -- a JSON FILE with its own provenance "
@@ -8905,7 +8934,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # #1273 S5: the SHADOW arm's region, armed here and published to both
     # groups by build_env below.  Empty on every other arm.
     xchg_env = prepare_shadow_env(log, str(ring_plan.epoch),
-                                  ns.weg2_weight_source, dry=dry)
+                                  ns.weg2_weight_source, dry=dry,
+                                  hop_bound_ms=ns.weg2_shadow_hop_bound_ms)
 
     # 2. host ledger
     arm, reap_headroom_gib, lines, cg = choose_host_ledger(

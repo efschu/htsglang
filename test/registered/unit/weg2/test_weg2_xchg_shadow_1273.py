@@ -1727,3 +1727,620 @@ def test_the_shadow_prices_its_own_hop_and_not_the_full_diagonals(region, ops):
     empty = sh.ShadowResult(leg=0, epoch="b.1", subset=sh.select_subset([], leg=0),
                             counters=sh.ShadowCounters())
     assert "oncard_hop_ms_priced=n/a" in empty.line()
+
+
+# ===========================================================================
+# S5b -- THE TWO LEG HOOKS.
+#
+# DANGER DIRECTION, four shapes, and every one of them is a hook that is
+# WORSE THAN NO HOOK because it looks like an instrument while it damages the
+# thing it observes:
+#
+#   1. a hook that writes into the LIVE ARENA -- the shadow's whole licence is
+#      that the ring's bytes are untouched; a hook whose destination is the
+#      ring's own pointer serves the exchange's bytes with the ring's
+#      authority and none of its proof;
+#   2. a hook that SWALLOWS A MISMATCH -- the acceptance is `mismatch=0`, so a
+#      hook that drops the compare's counters on the floor turns the one
+#      finding this slice exists for into a green line;
+#   3. a hook whose FAILURE ABORTS THE LEG -- zero authority, enumerated in
+#      the module docstring, is exactly the property a caller can undo;
+#   4. a hook that runs ON ONE RANK ONLY -- the gate is rank-uniform, so a
+#      rank that returns without voting is not "one less" but five ranks
+#      waiting out a gate budget inside their own flip legs.
+# ===========================================================================
+
+
+def _inputs(hook, *, leg=0, rank=0, row=0, peer_row=3, epoch="e.0",
+            direction="P->D", **kw):
+    return sh.ShadowLegInputs(leg=leg, epoch=epoch, direction=direction,
+                              hook=hook, rank=rank, row=row, peer_row=peer_row,
+                              device=0, card_uuid="u0",
+                              uuid_of_card=("u0", "u1", "u2"),
+                              free_mib=kw.pop("free_mib", 8192), **kw)
+
+
+@pytest.fixture()
+def no_active_leg():
+    """No shadow run may leak OUT of a test either."""
+    sh.set_plan_provider(None)
+    yield
+    active = sh._ACTIVE_LEG
+    if active is not None:
+        active.close(owner=active.token)
+    sh.set_plan_provider(None)
+    assert sh._ACTIVE_LEG is None
+
+
+# --- the arm: the ring path may not reach a single line of this ------------
+
+def test_the_hooks_are_never_reached_on_the_ring_arm(monkeypatch, no_active_leg):
+    """DEFAULT = RING = BYTE-IDENTICAL, and it is proven by a TRIPWIRE.
+
+    Asserting "it returned None" would pass for a hook that did all its work
+    and then discarded it, so every door out of the arm check is mined: a
+    plan provider, a region opener and a semaphore set that all raise if the
+    ring path so much as looks at them.
+    """
+    monkeypatch.delenv(wx.WEIGHT_SOURCE_ENV, raising=False)
+    assert wx.weight_source() == wx.WEIGHT_SOURCE_RING
+    assert sh.shadow_armed() is False
+
+    def tripwire(*_a, **_k):
+        raise AssertionError("the ring arm reached the shadow's machinery")
+
+    monkeypatch.setattr(sh, "plan_for_leg", tripwire)
+    monkeypatch.setattr(sh.xr.XchgRegion, "open", staticmethod(tripwire))
+    monkeypatch.setattr(sh.tp, "SemSet", tripwire)
+    monkeypatch.setattr(sh.tp, "verify_sem_arm", tripwire)
+    lines: list = []
+    assert sh.run_leg_hook(_inputs(sh.HOOK_DESTINATION), log=lines.append) is None
+    assert lines == [], lines
+    assert sh._ACTIVE_LEG is None
+
+
+def test_the_shadow_arm_reaches_the_hook(monkeypatch, no_active_leg):
+    """The can-fail control for the test above: on ``shadow`` it DOES run.
+
+    Without this the previous test passes for a hook that is dead on every
+    arm, which is the unarmed-instrument-reading-as-a-passed-one shape this
+    file already caught twice.
+    """
+    monkeypatch.setenv(wx.WEIGHT_SOURCE_ENV, sh.WEIGHT_SOURCE_SHADOW)
+    assert sh.shadow_armed() is True
+    lines: list = []
+    result = sh.run_leg_hook(_inputs(sh.HOOK_DESTINATION), log=lines.append)
+    assert result is not None
+    assert result.reason == "no-region"
+    assert any(ln.startswith("WEG2-XCHG-SHADOW ") for ln in lines)
+
+
+# --- the plan seam ---------------------------------------------------------
+
+def test_the_plan_seam_has_no_producer(no_active_leg):
+    """``build_plan`` has ZERO product callers, and that is why W63 says so.
+
+    This is a DENOMINATOR test, not a style one: the shadow's ``no-plan``
+    reason claims an absence, and an absence nobody re-checks is the one that
+    rots.  The day S6 wires a producer this goes red and the W63 docstring
+    gets corrected instead of lying.
+    """
+    root = os.path.abspath(
+        os.path.join(os.path.dirname(__file__), "..", "..", "..", ".."))
+    hits = []
+    for dirpath, _dirs, names in os.walk(os.path.join(root, "python", "sglang")):
+        for n in names:
+            if not n.endswith(".py") or n == "weight_exchange.py":
+                continue
+            p = os.path.join(dirpath, n)
+            with open(p, encoding="utf-8") as fh:
+                for i, line in enumerate(fh, 1):
+                    if "build_plan(" in line:
+                        hits.append(f"{os.path.relpath(p, root)}:{i}")
+    assert hits == [], hits
+    assert sh.plan_for_leg("P->D", 0, 0) == ()
+
+
+def test_a_leg_without_descriptors_says_no_plan_and_never_says_match(no_active_leg):
+    """MUTANT: the hook treats an empty plan as a run.  It must not.
+
+    An empty plan produces no stripes, and ``verdict`` would then be
+    ``NO-STRIPES`` -- already not ``MATCH`` -- but the LINE must also carry a
+    reason a reader can act on, because ``NO-STRIPES`` alone does not say
+    whether the subset was empty or the wiring is missing.
+    """
+    lines: list = []
+    result = sh.run_leg_hook(_inputs(sh.HOOK_DESTINATION), log=lines.append,
+                             descs=(), armed=True)
+    assert result.reason == "no-plan"
+    assert "verdict=NOT-RUN" in result.line()
+    assert any(sh.RANK_LOCAL_SKIP_MARKER in ln for ln in lines)
+    assert any("build_plan has no product caller" in ln for ln in lines)
+
+
+def test_the_plan_provider_is_the_seam_and_it_is_consulted(no_active_leg):
+    """The can-fail control for the seam: a provider IS read."""
+    seen: list = []
+
+    def provider(direction, leg, rank):
+        seen.append((direction, leg, rank))
+        return ()
+
+    previous = sh.set_plan_provider(provider)
+    try:
+        sh.run_leg_hook(_inputs(sh.HOOK_SOURCE, leg=7, rank=2),
+                        log=lambda _s: None, armed=True)
+    finally:
+        sh.set_plan_provider(previous)
+    assert seen == [("P->D", 7, 2)]
+
+
+# --- rank-uniformity (danger 4) -------------------------------------------
+
+def test_a_rank_that_cannot_join_says_so_by_name_and_does_not_go_quiet(
+        no_active_leg):
+    """DANGER 4.  Every local skip is W63 with its reason, never a bare return.
+
+    Enumerated rather than sampled: each door out of the hook before the gate
+    must print the marker, because the gate is rank-uniform and a silent skip
+    is indistinguishable at the other five rows from a card that refused on
+    arithmetic.
+    """
+    for reason, kwargs in (
+        ("no-region", {}),
+        ("no-plan", {"descs": ()}),
+    ):
+        lines: list = []
+        result = sh.run_leg_hook(_inputs(sh.HOOK_DESTINATION),
+                                 log=lines.append, armed=True, **kwargs)
+        assert result.reason == reason
+        assert any(sh.RANK_LOCAL_SKIP_MARKER in ln for ln in lines), reason
+        assert any(f"reason={reason}" in ln for ln in lines), reason
+        assert any(f"NO for all {xr.N_RANKS} rows" in ln for ln in lines), reason
+
+
+def test_an_explicit_caller_gets_the_skip_raised_and_the_leg_never_does(
+        no_active_leg):
+    """The W56/W61 two-arm shape, third instance: automatic degrades, explicit raises."""
+    with pytest.raises(sh.Weg2XchgShadowRankLocalSkip):
+        sh.run_leg_hook(_inputs(sh.HOOK_DESTINATION), log=lambda _s: None,
+                        descs=(), armed=True, explicit=True)
+    # ... and the automatic path with the same inputs does NOT raise.
+    assert sh.run_leg_hook(_inputs(sh.HOOK_DESTINATION), log=lambda _s: None,
+                           descs=(), armed=True).reason == "no-plan"
+
+
+# --- the bound (item 5) ----------------------------------------------------
+
+def test_the_hop_bound_is_the_spec_target_times_a_named_factor():
+    assert sh.SHADOW_HOP_BOUND_MS_DEFAULT == (
+        tp.ONCARD_HOP_BUDGET_MS * sh.SHADOW_HOP_BOUND_FACTOR)
+    assert sh.hop_bound_ms() == sh.SHADOW_HOP_BOUND_MS_DEFAULT
+    assert sh.hop_bound_ms(12.5) == 12.5
+
+
+def test_a_malformed_bound_is_not_silently_replaced_by_the_default(monkeypatch,
+                                                                   no_active_leg):
+    """MUTANT: ``except ValueError: return DEFAULT``.  A bound nobody can read
+    is a bound nothing is graded against, and it would read as a passed one."""
+    monkeypatch.setenv(sh.ENV_HOP_BOUND_MS, "twenty")
+    with pytest.raises(ValueError):
+        sh.hop_bound_ms()
+    result = sh.run_leg_hook(_inputs(sh.HOOK_DESTINATION), log=lambda _s: None,
+                             descs=(), armed=True)
+    assert result.reason.startswith("bad-bound:")
+
+
+def test_a_priced_hop_over_the_bound_refuses_the_shadow_by_name_and_not_the_flip(
+        region, tmp_path, boot, no_active_leg):
+    """W61 ``scope=hop``: the leg is refused BEFORE a wall is spent.
+
+    The descriptors are a diagonal big enough that the priced hop clears the
+    bound; the assertion is that the leg prints the refusal, prints what it
+    would have cost, and returns a result whose ``ran`` is False -- i.e. the
+    ring carried the flip and the observer stood down.
+    """
+    big = 400 * sh.MIB
+    descs = [_diag(0, big, cls="qkv_proj")]
+    lines: list = []
+    result = sh.run_leg_hook(_inputs(sh.HOOK_SOURCE), log=lines.append,
+                             descs=descs, region=region, sems=object(),
+                             ops=object(), armed=True, bound_ms=1.0)
+    assert result.reason == "hop-over-bound"
+    assert result.ran is False
+    refusals = [ln for ln in lines if sh.UNAFFORDABLE_MARKER in ln]
+    assert refusals, lines
+    assert "scope=hop" in refusals[0]
+    assert "bound_ms=1.000" in refusals[0]
+    assert result.oncard_hop_ms_priced and result.oncard_hop_ms_priced > 1.0
+    assert "hop_bound_ms=1.000" in result.line()
+
+
+def test_a_priced_hop_under_the_bound_is_not_refused(region, boot, no_active_leg):
+    """The can-fail control for the bound: it must be able to say YES.
+
+    Without it the refusal test passes for a bound that refuses everything,
+    which is mutant K of the previous round one field over.
+    """
+    descs = [_diag(0, 1 * sh.MIB, cls="qkv_proj")]
+    lines: list = []
+    result = sh.run_leg_hook(_inputs(sh.HOOK_SOURCE), log=lines.append,
+                             descs=descs, region=region, sems=object(),
+                             ops=object(), armed=True, bound_ms=1e6)
+    assert result.reason != "hop-over-bound"
+    assert not [ln for ln in lines if "scope=hop" in ln]
+
+
+# --- W62 at leg start (item 3) --------------------------------------------
+
+def test_a_stale_semaphore_stops_the_shadow_and_never_the_flip(region, boot,
+                                                               no_active_leg):
+    """W62 gets its caller, and the caller COUNTS it.
+
+    ``verify_sem_arm`` refuses; on the authoritative path (S6's RPC preamble)
+    that refusal stops a flip.  Here the same event may only stop the SHADOW,
+    so the hook catches it, prints it, and reports ``reason=w62-stale`` with
+    ``sems_armed=n/a`` -- an absent census, not a passed one.
+    """
+    xr.create_semaphores(boot)
+    sems = tp.SemSet(boot)
+    try:
+        sems.post(0, 0, "full")  # the leftover a rolled-forward flip leaves
+        lines: list = []
+        result = sh.run_leg_hook(_inputs(sh.HOOK_DESTINATION), log=lines.append,
+                                 descs=[_diag(0, 4096)], region=region,
+                                 sems=sems, ops=object(), armed=True)
+        assert result.reason == "w62-stale"
+        assert result.sems_armed is None
+        assert "sems_armed=n/a" in result.line()
+        assert any(tp.SEM_NOT_REARMED_MARKER in ln for ln in lines)
+    finally:
+        sems.close()
+        xr.unlink_semaphores(boot)
+
+
+def test_an_armed_semaphore_set_is_reported_as_a_number_not_as_silence(
+        region, boot, no_active_leg):
+    """A check whose PASS is invisible cannot be told from an absent one."""
+    xr.create_semaphores(boot)
+    sems = tp.SemSet(boot)
+    try:
+        result = sh.run_leg_hook(_inputs(sh.HOOK_DESTINATION),
+                                 log=lambda _s: None, descs=(), region=region,
+                                 sems=sems, ops=object(), armed=True)
+        assert result.sems_armed == xr.N_PAIRS * xr.SLOTS_PER_PAIR * 2
+        assert f"sems_armed={result.sems_armed}" in result.line()
+    finally:
+        sems.close()
+        xr.unlink_semaphores(boot)
+
+
+# --- the Gate-0 mode word gets a producer ---------------------------------
+
+def test_the_on_card_mode_word_has_a_producer_now(monkeypatch):
+    """SECTION 1ai-S5 UNPROVEN 10 closed on the desk half."""
+    assert sh.oncard_mode_word(tp.ONCARD_MODE_IPC) == xr.ONCARD_MODE_WORD["ipc"]
+    assert sh.oncard_mode_word(tp.ONCARD_MODE_HOST) == xr.ONCARD_MODE_WORD["host"]
+    # An unknown mode is UNSTATED and never a guess: gate0_check reads UNSTATED
+    # as "not a disagreement" and a wrong word would BE one.
+    assert sh.oncard_mode_word("banana") == xr.ONCARD_MODE_UNSTATED
+    monkeypatch.setenv(tp.ENV_ONCARD_MODE, "host")
+    assert sh.resolve_shadow_oncard_mode() == tp.ONCARD_MODE_HOST
+    monkeypatch.delenv(tp.ENV_ONCARD_MODE)
+    assert sh.resolve_shadow_oncard_mode() == tp.ONCARD_MODE_IPC
+
+
+def test_the_shadow_never_probes_for_the_on_card_mode():
+    """An observer that PROBES has allocated on the card it is observing."""
+    src = inspect.getsource(sh.resolve_shadow_oncard_mode)
+    assert "resolve_oncard_mode" not in src
+    assert "probe" not in src.split('"""')[2]
+
+
+# --- lifetime (item 4) -----------------------------------------------------
+
+def test_a_stale_run_is_closed_by_name_and_never_carried_across_flips(
+        no_active_leg):
+    """MUTANT: the active slot is overwritten silently.
+
+    One leaked raw ``cudaMalloc`` per flip on the card that is already 550 MiB
+    below the corridor floor is the one failure a zero-authority instrument
+    may not cause.
+    """
+    stale = sh.ShadowLeg(_inputs(sh.HOOK_SOURCE, leg=0), lambda _s: None).adopt()
+    assert sh._ACTIVE_LEG is stale
+    lines: list = []
+    sh.run_leg_hook(_inputs(sh.HOOK_DESTINATION, leg=1), log=lines.append,
+                    descs=(), armed=True)
+    assert stale.closed is True
+    assert sh._ACTIVE_LEG is None
+    assert any("reason=stale-run" in ln for ln in lines), lines
+
+
+def test_a_handler_cannot_close_a_run_it_does_not_own(no_active_leg):
+    """The token is the whole guard: a wrong owner is a NO-OP, not a free."""
+    leg = sh.ShadowLeg(_inputs(sh.HOOK_SOURCE), lambda _s: None)
+    assert leg.close(owner="somebody-elses-token") is False
+    assert leg.closed is False
+    assert leg.close(owner=leg.token) is True
+    assert leg.close(owner=leg.token) is True  # idempotent
+
+
+def test_the_hook_closes_its_run_on_every_path_including_the_raising_one(
+        no_active_leg):
+    """The ``finally`` is the property, so it is tested through a RAISE."""
+    boom = _inputs(sh.HOOK_DESTINATION)
+
+    def exploding_provider(direction, leg, rank):
+        raise RuntimeError("no plan for you")
+
+    previous = sh.set_plan_provider(exploding_provider)
+    try:
+        result = sh.run_leg_hook(boom, log=lambda _s: None, armed=True)
+    finally:
+        sh.set_plan_provider(previous)
+    assert result.reason.startswith("hook-failed:RuntimeError")
+    assert sh._ACTIVE_LEG is None
+
+
+# --- danger 3: a hook whose failure aborts the leg ------------------------
+
+def test_no_hook_failure_can_reach_the_leg(no_active_leg):
+    """DANGER 3, enumerated over the failure classes the hook can meet."""
+    for provider in (
+        lambda _d, _lg, _r: (_ for _ in ()).throw(RuntimeError("plan")),
+        lambda _d, _lg, _r: (_ for _ in ()).throw(MemoryError("oom")),
+        lambda _d, _lg, _r: (_ for _ in ()).throw(KeyboardInterrupt()),
+    ):
+        previous = sh.set_plan_provider(provider)
+        try:
+            result = sh.run_leg_hook(_inputs(sh.HOOK_SOURCE),
+                                     log=lambda _s: None, armed=True)
+        finally:
+            sh.set_plan_provider(previous)
+        assert result is not None and result.ran is False
+        assert result.reason.startswith("hook-failed:")
+
+
+def test_the_weight_updater_adapters_catch_everything_and_return(no_active_leg):
+    """The PRODUCT adapter, by source: a bare ``except Exception`` would let a
+    ``MemoryError`` out of an observer and into a flip leg."""
+    import ast as _ast
+
+    root = os.path.abspath(
+        os.path.join(os.path.dirname(__file__), "..", "..", "..", ".."))
+    path = os.path.join(root, "python", "sglang", "srt", "managers",
+                        "scheduler_components", "weight_updater.py")
+    with open(path, encoding="utf-8") as fh:
+        tree = _ast.parse(fh.read())
+    fn = next(n for n in _ast.walk(tree)
+              if isinstance(n, _ast.FunctionDef) and n.name == "_weg2_shadow_hook")
+    handlers = [h for n in _ast.walk(fn) if isinstance(n, _ast.Try)
+                for h in n.handlers]
+    assert handlers, "the adapter has no handler at all"
+    assert any(isinstance(h.type, _ast.Name) and h.type.id == "BaseException"
+               for h in handlers)
+    assert not any(isinstance(n, _ast.Raise) for n in _ast.walk(fn))
+
+
+def test_the_two_call_sites_are_where_the_bytes_are(no_active_leg):
+    """WIRING, pinned by SOURCE -- the precedent is
+    ``test_weg2_xchg_cover_1273.WiringTest``.
+
+    The SOURCE hook must sit BEFORE the pause loop: the exporter reads tensors
+    allocated inside ``region(GPU_MEMORY_TYPE_WEIGHTS)``, and after
+    ``pause(tag)`` those are unmapped pages -- the campaign (a) fault, pinned
+    on the other side by ``test_weights_block_pause_is_the_last_statement``.
+    The DESTINATION hook must sit after ``family_complete``'s reload: that is
+    the only instant in the boot where the ring's restored bytes exist to be
+    compared against.
+    """
+    root = os.path.abspath(
+        os.path.join(os.path.dirname(__file__), "..", "..", "..", ".."))
+    path = os.path.join(root, "python", "sglang", "srt", "managers",
+                        "scheduler_components", "weight_updater.py")
+    with open(path, encoding="utf-8") as fh:
+        src = fh.read()
+    assert "self._weg2_shadow_source_leg(recv_req, weights_tags, tag_bytes)" in src
+    assert "self._weg2_shadow_destination_leg(" in src
+    i_src = src.index("self._weg2_shadow_source_leg(recv_req")
+    i_pause = src.index("self.memory_saver_adapter.pause(tag)")
+    assert i_src < i_pause, "the source hook reads pages the pause has unmapped"
+    i_dst = src.index("self._weg2_shadow_destination_leg(\n")
+    i_reload = src.index("self._weg2_wake_reload_weights()")
+    assert i_reload < i_dst, "the destination hook has no ring bytes to compare"
+
+
+# --- danger 1 + 2, end to end on the double -------------------------------
+
+def test_the_destination_hook_matches_the_ring_and_writes_nothing_into_it(
+        region, tmp_path, boot, no_active_leg):
+    """DANGER 1 + the acceptance line, end to end through the HOOKS.
+
+    The ring's destination is poisoned before the pair runs and asserted
+    byte-identical afterwards: the shadow may read the source's still-mapped
+    VRAM and may write only its own raw buffer.  A hook that wrote into the
+    live arena would be the exchange with the ring's authority and none of its
+    proof -- and, because the compare's two sides would then both be the
+    shadow's bytes, it would MATCH while doing it.
+    """
+    xr.create_semaphores(boot)
+    sems_s, sems_d = tp.SemSet(boot), tp.SemSet(boot)
+    src_ops = FakeDeviceOps(str(tmp_path / "d"), rank=0)
+    dst_ops = FakeDeviceOps(str(tmp_path / "d"), rank=0)
+    try:
+        dst_ops.raw_malloc(0, 2 << 20)
+        payload = pattern(41, 1800)
+        src, ring_dst = dev_ptr(0, 0x10000), dev_ptr(0, 0x60000)
+        write(src_ops, src, payload)
+        # THE RING HAS ALREADY RESTORED, which is the product's order: this
+        # hook runs after family_complete.  Identical bytes -> MATCH.
+        write(dst_ops, ring_dst, payload)
+        descs = [flat_desc(0, 0, len(payload), src_ptr=src, dst_ptr=ring_dst,
+                           name="model.layers.0.self_attn.qkv_proj.weight")]
+        _vote_rows(region, [1, 2, 4, 5], leg=0, vote=True,
+                   classes_hash=sh.classes_hash(["qkv_proj"]), need_mib=0)
+        lines: list = []
+        thread = threading.Thread(target=lambda: sh.run_leg_hook(
+            _inputs(sh.HOOK_SOURCE, row=0, peer_row=3), log=lines.append,
+            descs=descs, region=region, sems=sems_s, ops=src_ops, armed=True,
+            slot_bytes=SLOT, stripe_bytes=1 << 20, budget_s=10.0))
+        thread.start()
+        try:
+            result = sh.run_leg_hook(
+                _inputs(sh.HOOK_DESTINATION, row=3, peer_row=0),
+                log=lines.append, descs=descs, region=region, sems=sems_d,
+                ops=dst_ops, armed=True, sum_bytes=byte_sum(dst_ops),
+                slot_bytes=SLOT, stripe_bytes=1 << 20, budget_s=10.0)
+        finally:
+            thread.join(60)
+        assert result.ran, result.counters.errors
+        assert read(dst_ops, ring_dst, len(payload)) == payload, \
+            "the hook wrote into the RING's live destination"
+        assert result.counters.stripes == 1
+        assert result.counters.match == 1 and result.counters.mismatch == 0
+        line = result.line()
+        for token in ("WEG2-XCHG-SHADOW ", "hook=destination", "shadow_ms=",
+                      "hop_bound_ms=", "sems_armed=24", "verdict=MATCH",
+                      "resume_reserve_mib="):
+            assert token in line, (token, line)
+        assert any("hook=source" in ln for ln in lines)
+        assert sh._ACTIVE_LEG is None
+    finally:
+        src_ops.close()
+        dst_ops.close()
+        sems_s.close()
+        sems_d.close()
+        xr.unlink_semaphores(boot)
+
+
+def test_the_destination_hook_cannot_swallow_a_mismatch(region, tmp_path, boot,
+                                                        no_active_leg):
+    """DANGER 2, and it is the can-fail control for the test above.
+
+    The 'ring' restores DIFFERENT bytes.  The hook's own line must go red
+    (``verdict=MISMATCH``), the W59 marker must be on the log, and nothing may
+    be raised -- the ring's bytes were served, and this is a finding about the
+    EXCHANGE.
+    """
+    xr.create_semaphores(boot)
+    sems_s, sems_d = tp.SemSet(boot), tp.SemSet(boot)
+    src_ops = FakeDeviceOps(str(tmp_path / "d"), rank=0)
+    dst_ops = FakeDeviceOps(str(tmp_path / "d"), rank=0)
+    try:
+        dst_ops.raw_malloc(0, 2 << 20)
+        payload = pattern(43, 1700)
+        src, ring_dst = dev_ptr(0, 0x10000), dev_ptr(0, 0x60000)
+        write(src_ops, src, payload)
+        write(dst_ops, ring_dst, pattern(44, 1700))  # a DIFFERENT restore
+        descs = [flat_desc(0, 0, len(payload), src_ptr=src, dst_ptr=ring_dst,
+                           name="model.layers.0.mlp.down_proj.weight")]
+        _vote_rows(region, [1, 2, 4, 5], leg=0, vote=True,
+                   classes_hash=sh.classes_hash(["down_proj"]), need_mib=0)
+        lines: list = []
+        thread = threading.Thread(target=lambda: sh.run_leg_hook(
+            _inputs(sh.HOOK_SOURCE, row=0, peer_row=3), log=lines.append,
+            descs=descs, region=region, sems=sems_s, ops=src_ops, armed=True,
+            slot_bytes=SLOT, stripe_bytes=1 << 20, budget_s=10.0))
+        thread.start()
+        try:
+            result = sh.run_leg_hook(
+                _inputs(sh.HOOK_DESTINATION, row=3, peer_row=0),
+                log=lines.append, descs=descs, region=region, sems=sems_d,
+                ops=dst_ops, armed=True, sum_bytes=byte_sum(dst_ops),
+                slot_bytes=SLOT, stripe_bytes=1 << 20, budget_s=10.0)
+        finally:
+            thread.join(60)
+        assert result.counters.mismatch == 1
+        assert "verdict=MISMATCH" in result.line()
+        assert any(sh.MISMATCH_MARKER in ln for ln in lines)
+        assert any("class=down_proj" in ln for ln in lines)
+    finally:
+        src_ops.close()
+        dst_ops.close()
+        sems_s.close()
+        sems_d.close()
+        xr.unlink_semaphores(boot)
+
+
+# --- the two producers (item 2) -------------------------------------------
+
+def test_the_resume_reserve_and_the_ring_wall_have_producers_now(no_active_leg):
+    """``resume_reserve_mib=`` and ``ring_ms=`` stop printing as absences.
+
+    MUTANT: the hook passes 0 and None through.  Both fields exist precisely so
+    an unwired boot is VISIBLY unwired, so a wired one has to be visibly wired
+    -- and ``n/a`` on ``ring_ms`` must survive on the SOURCE hook, where the
+    leg's wall does not exist yet.
+    """
+    dst = sh.run_leg_hook(
+        _inputs(sh.HOOK_DESTINATION, resume_reserve_bytes=27 * sh.MIB,
+                ring_ms=2311.5),
+        log=lambda _s: None, descs=(), armed=True)
+    assert "resume_reserve_mib=27" in dst.line()
+    assert "ring_ms=2311.500" in dst.line()
+    src = sh.run_leg_hook(_inputs(sh.HOOK_SOURCE), log=lambda _s: None,
+                          descs=(), armed=True)
+    assert "ring_ms=n/a" in src.line()
+    assert "resume_reserve_mib=0" in src.line()
+
+
+def test_the_adapter_reads_the_rings_own_numbers_and_estimates_neither():
+    """SOURCE-pinned: both producers are READS of the leg's own instruments.
+
+    ``resume_reserve_bytes`` is the sum of the per-tag byte counts the wake leg
+    already read from the SAVER before its resume loop; ``ring_ms`` is the sum
+    of the per-tag walls the leg already prints on WEG2-FLIP-TAG.  A hook that
+    estimated either would be a second instrument beside the ring's own, which
+    is the class UPSTREAM-MINIMAL refuses.
+    """
+    root = os.path.abspath(
+        os.path.join(os.path.dirname(__file__), "..", "..", "..", ".."))
+    path = os.path.join(root, "python", "sglang", "srt", "managers",
+                        "scheduler_components", "weight_updater.py")
+    with open(path, encoding="utf-8") as fh:
+        src = fh.read()
+    assert "ring_ms=sum(float(v[1]) for v in weg2_per_tag.values())" in src
+    assert "int(sum(int(v) for v in (tag_bytes or {}).values()))" in src
+
+
+def test_the_flip_index_is_read_back_from_the_fronts_own_epoch():
+    """No second flip counter beside ``credit_epoch``'s."""
+    from sglang.srt.managers.scheduler_components import weight_updater as wu
+
+    assert wu._weg2_flip_index_of("weg2sb5g.7") == 7
+    assert wu._weg2_flip_index_of(None) == -1
+    assert wu._weg2_flip_index_of("no-dot") == -1
+    assert wu._weg2_flip_index_of("boot.nope") == -1
+
+
+# --- the launcher flag -----------------------------------------------------
+
+def test_the_hop_bound_is_a_launcher_flag_and_is_published_to_the_ranks():
+    """The bound is the LAUNCHER's, and the ring arm still publishes nothing.
+
+    Read from the launcher SOURCE rather than by building a parser, for the
+    same reason ``test_weg2_wcode_uniqueness_1263`` reads source: half of what
+    is asserted here is inside an f-string help text and inside a ``pop`` loop,
+    neither of which is an object at runtime.
+    """
+    from sglang.srt.weg2 import launcher as ln
+
+    src = inspect.getsource(ln)
+    assert "--weg2-shadow-hop-bound-ms" in src
+    assert "ns.weg2_shadow_hop_bound_ms" in src
+    assert "weight_exchange_shadow.ENV_HOP_BOUND_MS" in src
+    assert ln.prepare_shadow_env(lambda _s: None, "b", "ring") == {}, \
+        "the ring arm must publish nothing at all"
+
+
+# --- W63 is a new, free code ----------------------------------------------
+
+def test_w63_is_the_next_free_code_and_names_one_exception():
+    assert sh.RANK_LOCAL_SKIP_MARKER == "W63 Weg2XchgShadowRankLocalSkip"
+    assert sh.Weg2XchgShadowRankLocalSkip.__name__ in sh.RANK_LOCAL_SKIP_MARKER
+    # The TIME term reuses W61 rather than taking a code of its own: one code
+    # for one class of event ("the shadow cannot afford this leg"), so a census
+    # of self-refusals cannot read low by exactly the time-refused ones.
+    assert sh.UNAFFORDABLE_MARKER in sh.hop_refusal_message(
+        card="u", priced_ms=1.0, bound_ms=0.5, batches=2, slot_mib=32.0, leg=0)
