@@ -582,8 +582,16 @@ def decide_bound(
     *,
     log_path: str = "<group D log>",
     floor_why: str = "",
+    x_measured: bool = True,
 ) -> BoundDecision:
     """The bound the front gets, or the W45 that stops the launch.  Pure.
+
+    ``x_measured`` says whether the X the floor was derived from is a
+    MEASUREMENT of this rig or the recorded fallback pair (#1299).  It gates
+    exactly one arm -- ``below_floor`` with no operator override -- because
+    that is the only verdict whose truth depends on X.  Every other verdict is
+    about the CENSUS (missing, disagree, or an override that cannot be
+    checked), holds whatever X is, and still refuses.
 
     THE OVERRIDE MAY ONLY LOWER A MEASURED BOUND.  ``--carrier-max-tokens N``
     is accepted exactly on ``floor < N <= measured``:
@@ -640,6 +648,43 @@ def decide_bound(
     if override is None:
         if cen.ok:
             return BoundDecision(bound=cen.bound, source="census", reason="", detail=cen.detail)
+        if cen.verdict == "below_floor" and not x_measured and measured is not None:
+            # #1299: AN UNMEASURED X MAY NOT REFUSE A BOOT.
+            #
+            # `below_floor` is a comparison against `route_floor(X)` = 1.25x X,
+            # so when X came from the recorded fallback rather than from this
+            # rig, refusing here lets a table stop a boot -- the standing law
+            # "unmeasured = a NAMED fallback, never an actuator" in its exact
+            # shape.  Measured: dec2b (f929987a9c) and shadow boot B
+            # (edbf7007c8), two independent lines, both refused pre-READY on
+            # floor 28,195 = 1.25 x a fallback X of 22,556, while the carrier's
+            # own measurement (27,466) was real and unchanged.
+            #
+            # The bound the census MEASURED is still shipped: it is a
+            # measurement and it is not in doubt.  What is withheld is the
+            # VERDICT on reachability, because one of its two terms is not a
+            # measurement.  The front then re-solves X from its own drains
+            # (#1271 (b), N=8) -- the measurement that was missing -- which it
+            # can only do if the boot is allowed to start.
+            return BoundDecision(
+                bound=cen.bound,
+                source="census (reachability UNGRADED)",
+                reason="",
+                detail=cen.detail,
+                note=(
+                    f"UNGRADED, not refused: the carrier bound {cen.bound} is at or below the "
+                    f"route floor {cen.floor} [{floor_why}], but that floor is 1.25x an X this "
+                    f"rig did NOT measure -- X came from the recorded fallback pair, so the "
+                    f"comparison has one measured term and one table term and grades nothing. "
+                    f"The MEASURED bound ships; the reachability verdict is withheld rather than "
+                    f"invented, and the round trip may in fact be unreachable for every prompt "
+                    f"length on this boot (the weg2rg5 outcome: zero round trips, zero prefill "
+                    f"passes on group P). The front re-solves X from its own drains once serving "
+                    f"(#1271 (b)); to grade this before the boot instead, give the scan a front "
+                    f"log that carries all three instruments, or pass "
+                    f"--tp-prefill-max-tokens. {provenance}"
+                ),
+            )
         if measured is None:
             why_not_lowerable = (
                 "this census measured no bound at all, so there is nothing to lower")
