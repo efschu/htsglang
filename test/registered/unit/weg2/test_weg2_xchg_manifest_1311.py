@@ -19,10 +19,14 @@ The models below are that census in miniature: one card, a P end holding a
 CONTIGUOUS TAIL of the layers whole, a D end holding EVERY layer sliced.
 
 **FINDING 2.**  ``WEG2-XCHG-SHADOW-ONCARD-REFUSED`` 24 times, every one
-``hook=source``, independent of W80.  Its root is one missing argument: the S6
-store-and-forward deposit -- the lane shape that needs no concurrent peer -- had
-its only non-default producers in two TEST files, so no boot could ever reach
-it.  Reproduced here as a hermetic double of the hook order.
+``hook=source``, independent of W80.  Its root is the ARM, and the obvious
+reading -- "the store-and-forward deposit was never wired" -- is WRONG: the leg
+path derives ``store_forward = not inputs.oncard_drainable``, so the product has
+always asked for it.  Every one of those refusals came through the other half of
+the condition, ``DEPOSIT_REASON_IPC``: an exported VRAM bounce is freed with the
+leg that exported it, so the deposit is a ``host``-arm shape by construction and
+weg2xsn5 ran ``--weg2-xchg-oncard ipc``.  What was defective was the LINE, which
+blamed the hook placement the deposit exists to defeat and named no arm.
 """
 
 from __future__ import annotations
@@ -435,9 +439,15 @@ def test_the_identity_is_stable_across_processes_never_the_builtin_hash(
     processes: a builtin-hashed manifest would intersect to nothing."""
     import inspect
 
-    src = inspect.getsource(sh.manifest_entry)
-    assert "xr.epoch_hash" in src
-    assert "hash(" not in src.replace("epoch_hash(", "")
+    # THE BODY, NOT THE DOCSTRING -- which names ``hash()`` in order to forbid
+    # it, and a source-level grep that could not tell the two apart would fail
+    # on the comment that documents the rule.
+    import ast as _ast
+
+    body = _ast.unparse(_ast.parse(inspect.getsource(sh.manifest_entry).strip()))
+    body = body.split('"""', 2)[-1] if '"""' in body else body
+    assert "xr.epoch_hash" in body
+    assert "hash(" not in body.replace("epoch_hash(", "")
     a = sh.manifest_entry("model.layers.3.mlp.down_proj.weight", "down_proj",
                           32, 32, 2)
     b = sh.manifest_entry("model.layers.3.mlp.down_proj.weight", "down_proj",
@@ -482,15 +492,17 @@ def test_the_voted_class_set_now_comes_from_the_agreed_inventory(
 # FINDING 2 -- the source hook's refusal, and the lane that was never wired.
 # ---------------------------------------------------------------------------
 
-def test_the_product_adapter_asks_for_the_store_and_forward_deposit():
-    """THE ROOT OF THE 24 REFUSALS, and it is one argument.
+def test_the_product_already_asks_for_the_deposit_so_the_arm_is_the_root():
+    """THE ROOT OF THE 24 REFUSALS IS THE ARM, not a missing argument.
 
-    ``run_leg_hook`` refuses with ``if not oncard_store_forward or reason ==
-    DEPOSIT_REASON_IPC``, and ``ShadowLegInputs.oncard_store_forward`` defaults
-    to False.  Before this fix the field's only non-default producers were two
-    TEST files, so the deposit -- priced, slot-guarded and reason-enumerated --
-    could not be reached from any boot.  This pins the wiring at the seam,
-    because the behaviour it enables needs a scheduler the desk cannot build.
+    It is worth pinning because the obvious reading is wrong and cost one round
+    here.  ``shadow_transport`` refuses with ``if not oncard_store_forward or
+    reason == DEPOSIT_REASON_IPC``, and ``ShadowLegInputs`` carries no
+    ``oncard_store_forward`` field at all -- the leg path DERIVES it from the
+    placement flag the adapter does set: ``store_forward = not
+    inputs.oncard_drainable``.  So the deposit was always asked for on the
+    product path, and every one of boot weg2xsn5's refusals came through the
+    second half of that condition: the ``ipc`` arm.
     """
     import inspect
 
@@ -500,8 +512,12 @@ def test_the_product_adapter_asks_for_the_store_and_forward_deposit():
     head = src.split("ShadowLegInputs(", 1)
     assert len(head) == 2, "the adapter must construct ShadowLegInputs"
     body = head[1].split("\n            )", 1)[0]
-    assert "oncard_store_forward=True" in body, body[-400:]
     assert "oncard_drainable=False" in body
+    # ``ShadowLegInputs`` must NOT grow a store-forward field behind the leg
+    # path's derivation -- two producers for one decision is how they drift.
+    assert not hasattr(sh.ShadowLegInputs, "oncard_store_forward")
+    leg = inspect.getsource(sh.run_leg_hook)
+    assert "store_forward = not bool(inputs.oncard_drainable)" in leg
 
 
 def test_the_ipc_arm_refusal_names_the_arm_and_not_only_the_placement():

@@ -1994,9 +1994,13 @@ def shadow_transport(
                     is_source=is_source,
                     descs=sum(1 for d in subset.descs if _is_on_card(d)),
                     mode=str(oncard_mode), asked=bool(oncard_store_forward)))
-                result.reason = ("oncard-arm-cannot-deposit"
-                                 if oncard_store_forward
-                                 else "oncard-not-drainable")
+                # THE CENSUS WORD DOES NOT MOVE (#1311 S6b).  Every boot record
+                # of this campaign counts ``reason=oncard-not-drainable``, and
+                # renaming it to say "the arm, not the placement" would make the
+                # correction invisible to exactly the greps that would look for
+                # it.  The distinction lives on the LINE, in ``oncard_mode=`` and
+                # ``deposit_asked=``, which is where a reader can act on it.
+                result.reason = "oncard-not-drainable"
                 return run
             if deposit_reason:
                 log(deposit_refusal_message(
