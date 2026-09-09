@@ -811,7 +811,21 @@ D_DECODE_STEPS_PROVENANCE = (
 #: beside each other so the trade is readable per boot instead of per
 #: archaeology.
 D_TP_OBJECTIVE_CHOICES = ("maxkv", "speed", "decode-bs1", "decode-bs6")
-D_TP_OBJECTIVE_DEFAULT = "maxkv"
+
+#: USER ORDER 2026-09-09, verbatim: "der decode bs6 soll mit bs6 (nicht mehr
+#: bs4) der standard werden". Group D's default objective moves from the
+#: capacity-first `maxkv` split to the bs=6 OPERATING POINT.
+#:
+#: WHAT THE ORDER TRADES, from dec2c's own A/B rather than from an argument:
+#: the bs=6 vector [42,11,11] measured **+10.3 % at bs4 for -1.4 % pool**. So
+#: the maxkv law is not repealed -- it is outranked at this one position,
+#: because the ranking a boot should follow is the ranking AT THE OPERATING
+#: POINT IT RUNS, and D runs decode.
+#:
+#: `maxkv` stays fully selectable via --d-tp-objective and its argv is
+#: byte-identical to the pre-#1241 form; only which arm you get by saying
+#: nothing has changed. --d-bs is NOT touched here (separate branch).
+D_TP_OBJECTIVE_DEFAULT = "decode-bs6"
 
 #: The two positions that emit an EXPLICIT weight vector rather than one of
 #: the runtime's two symbolic resolvers.
@@ -4294,7 +4308,9 @@ def d_operating_point_line(
     note = next((r.note for r in rows if r.note), "")
     return (
         "WEG2 D-OPERATING-POINTS (#1241 slice 2, the operating-point axis of "
-        "the #1017 solve; shipped=%s, default %s stays byte-identical). %s. %s%s"
+        "the #1017 solve; shipped=%s, default %s since the user order of "
+        "2026-09-09 -- 'maxkv' is still selectable and its argv is still "
+        "byte-identical to the pre-#1241 form). %s. %s%s"
         % (shipped, D_TP_OBJECTIVE_DEFAULT, " || ".join(parts), note, tail)
     )
 
@@ -4520,7 +4536,11 @@ def d_tp_ratio_decision(
         )
 
     line = (
-        "WEG2 D-WEIGHTS objective=%s (default %s, the maxkv law; 'speed' is "
+        "WEG2 D-WEIGHTS objective=%s (default %s since the user order of "
+        "2026-09-09, \"der decode bs6 soll mit bs6 (nicht mehr bs4) der "
+        "standard werden\": dec2c measured the bs=6 vector [42,11,11] at "
+        "+10.3 %% at bs4 for -1.4 %% pool, so the maxkv law is outranked AT "
+        "THIS OPERATING POINT, not repealed -- 'maxkv' and 'speed' stay "
         "selectable and never silent) -> argv %s. Weights the runtime will "
         "derive from the SAME --rank-gpu-memory-mib %s: %s (gcd-reduced, "
         "server_args.py:11239 -- printed here, written there). %s. %s"
@@ -6334,13 +6354,20 @@ def build_parser() -> argparse.ArgumentParser:
         "--d-tp-objective", choices=list(D_TP_OBJECTIVE_CHOICES),
         default=D_TP_OBJECTIVE_DEFAULT,
         help=f"Group D only (#1017). WHICH OBJECTIVE group D's weight vector "
-             f"is solved for. Default {D_TP_OBJECTIVE_DEFAULT!r} = the "
-             f"capacity-first split, emitted as --rank-tp-ratio auto: weights "
+             f"is solved for. Default {D_TP_OBJECTIVE_DEFAULT!r} SINCE THE "
+             f"USER ORDER OF 2026-09-09, verbatim \"der decode bs6 soll mit "
+             f"bs6 (nicht mehr bs4) der standard werden\": the bs=6 operating "
+             f"point, whose vector is the measured gemm_tflops ratio. Boot "
+             f"dec2c priced that vector ([42,11,11]) at +10.3%% at bs4 for "
+             f"-1.4%% pool, which is the trade the order makes -- the ranking "
+             f"a boot follows is the ranking AT THE OPERATING POINT IT RUNS, "
+             f"and group D runs decode. The maxkv law is therefore outranked "
+             f"here, not repealed: 'maxkv' remains fully selectable and emits "
+             f"the same --rank-tp-ratio auto it always did (byte-identical to "
+             f"the pre-#1241 form) -- the capacity-first split, weights "
              f"proportional to the per-rank VRAM budgets, which maximizes the "
              f"KV pool and is deliberately independent of how fast the cards "
-             f"are (server_args.py:838). That is the DEFAULT because the "
-             f"standing law makes maximum KV the default objective -- not "
-             f"because speed was never considered. 'speed' emits "
+             f"are (server_args.py:838). 'speed' emits "
              f"--rank-tp-ratio auto-performance --rank-perf-tune "
              f"<--d-rank-perf-tune>, the runtime's own per-task optimizer. "
              f"'decode-bs1' and 'decode-bs6' (#1241) add the OPERATING-POINT "
@@ -6349,10 +6376,17 @@ def build_parser() -> argparse.ArgumentParser:
              f"measured membw_gbs ratio, the bs=6 arm's is the measured "
              f"gemm_tflops ratio -- both from this rig's card-rate library, by "
              f"card NAME, with no hand number anywhere in the derivation. "
-             f"BOTH REGIME PREMISES ARE UNPROVEN ON THIS RIG: that a bs=1 "
-             f"round is bandwidth-bound and a bs=6 round compute-bound is "
+             f"BOTH REGIME PREMISES ARE STILL UNPROVEN ON THIS RIG, AND ONE "
+             f"OF THEM IS NOW THE DEFAULT: that a bs=1 round is "
+             f"bandwidth-bound and a bs=6 round compute-bound is "
              f"exactly the quantity the #1241 decode compute/wait clock "
-             f"measures, and no boot has run it yet -- so these two arms are "
+             f"measures. Boot dec2c (21c46b1876) DID run that clock and "
+             f"withheld the split on 13,893 of 13,950 rounds "
+             f"(graph-replay-nodes-overwritten), so it measured the rounds "
+             f"and not the regime; #1302 is the fix for that read and the "
+             f"next dec boot is where the premise is first testable. What "
+             f"the order rests on is the A/B (throughput and pool), not the "
+             f"regime claim -- so these two arms are "
              f"hypotheses with a derivation, not measurements, and the "
              f"D-OPERATING-POINTS line says so per row. They are needed "
              f"because neither 'auto' nor 'auto-performance' moves the "

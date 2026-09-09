@@ -62,20 +62,30 @@ def _flag_value(argv, flag):
 class TestDWeightObjective1017(unittest.TestCase):
     """#1017: the capacity-first split is a CHOICE with a name and a price."""
 
-    def test_default_objective_is_maxkv(self):
-        self.assertEqual(D_TP_OBJECTIVE_DEFAULT, "maxkv")
+    def test_default_objective_is_decode_bs6(self):
+        # USER ORDER 2026-09-09: "der decode bs6 soll mit bs6 (nicht mehr bs4)
+        # der standard werden". The default moved from 'maxkv' to the bs=6
+        # OPERATING POINT; dec2c priced that vector ([42,11,11]) at +10.3 % at
+        # bs4 for -1.4 % pool. The maxkv law is outranked at this position,
+        # not repealed -- which is why the arm's own spelling is still pinned
+        # below and in test_maxkv_emits_auto_and_speed_emits_auto_performance.
+        self.assertEqual(D_TP_OBJECTIVE_DEFAULT, "decode-bs6")
         # #1241 slice (2) ADDED the operating-point positions to this same
         # solve. The pin is widened deliberately rather than deleted: what it
-        # exists to protect is that the DEFAULT does not move and that the two
-        # original arms keep their exact spelling, both still asserted below
-        # and in test_maxkv_emits_auto_and_speed_emits_auto_performance.
+        # exists to protect is that the two original arms keep their exact
+        # spelling and stay selectable.
         self.assertEqual(
             tuple(D_TP_OBJECTIVE_CHOICES),
             ("maxkv", "speed", "decode-bs1", "decode-bs6"),
         )
         self.assertEqual(D_TP_OBJECTIVE_CHOICES[:2], ("maxkv", "speed"))
         ns = build_parser().parse_args(["--tree", "/t", "--tag", "x"])
-        self.assertEqual(ns.d_tp_objective, "maxkv")
+        self.assertEqual(ns.d_tp_objective, "decode-bs6")
+        # And saying 'maxkv' out loud still reaches the parser unchanged.
+        ns_maxkv = build_parser().parse_args(
+            ["--tree", "/t", "--tag", "x", "--d-tp-objective", "maxkv"]
+        )
+        self.assertEqual(ns_maxkv.d_tp_objective, "maxkv")
 
     def test_maxkv_emits_auto_and_speed_emits_auto_performance(self):
         maxkv = d_tp_ratio_decision("maxkv", "both", CARDS, BUDGETS, MODEL, 8)

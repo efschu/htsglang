@@ -221,14 +221,20 @@ class OperatingPointVectorTest(unittest.TestCase):
 
     # -- the default must not move --------------------------------------
 
-    def test_MUTANT_7_the_DEFAULT_maxkv_argv_is_BYTE_IDENTICAL(self):
+    def test_MUTANT_7_the_maxkv_argv_is_BYTE_IDENTICAL_when_asked_for(self):
+        # The user order of 2026-09-09 moved the DEFAULT to 'decode-bs6'. What
+        # this pin protects is unchanged and is now stated where it belongs:
+        # asking for 'maxkv' still produces the pre-#1241 argv, byte for byte.
+        # It is asserted against the LITERAL and not against the default
+        # constant, so that a future move of the default cannot silently take
+        # the byte-identity proof with it.
         p1, p2 = _patched()
         with p1, p2:
             dec = d_tp_ratio_decision(
-                D_TP_OBJECTIVE_DEFAULT, "both", CARDS, SB5E_BUDGETS, "/model", 6
+                "maxkv", "both", CARDS, SB5E_BUDGETS, "/model", 6
             )
         self.assertEqual(dec.flags, ("--rank-tp-ratio", "auto"))
-        self.assertEqual(D_TP_OBJECTIVE_DEFAULT, "maxkv")
+        self.assertEqual(D_TP_OBJECTIVE_DEFAULT, "decode-bs6")
         # And the SPEED arm is untouched too.
         p1, p2 = _patched()
         with p1, p2:
@@ -238,14 +244,21 @@ class OperatingPointVectorTest(unittest.TestCase):
             ("--rank-tp-ratio", "auto-performance", "--rank-perf-tune", "dec"),
         )
 
-    def test_the_default_D_argv_renders_identically_with_and_without_the_axis(self):
-        """The argv-builder half: what reaches the process must be unchanged."""
+    def test_the_maxkv_D_argv_renders_identically_with_and_without_the_axis(self):
+        """The argv-builder half: what reaches the process must be unchanged.
+
+        Pinned against the LITERAL 'maxkv' since the user order of 2026-09-09
+        moved the default to 'decode-bs6'. The guarantee this test exists for
+        is about the maxkv ARM, not about whichever arm happens to be the
+        default, and binding it to the default constant would have quietly
+        re-pointed the proof at the new arm the day the default moved.
+        """
         from sglang.srt.weg2.launcher import argv_d
 
         p1, p2 = _patched()
         with p1, p2:
             dec = d_tp_ratio_decision(
-                D_TP_OBJECTIVE_DEFAULT, "both", CARDS, SB5E_BUDGETS, "/model", 6
+                "maxkv", "both", CARDS, SB5E_BUDGETS, "/model", 6
             )
         common = dict(
             py="python3",
@@ -406,11 +419,13 @@ class OperatingPointVectorTest(unittest.TestCase):
             self.assertNotIn("geometry:", row.round_unit)
             self.assertIsNotNone(row.round_ms, row.position)
             self.assertIsNotNone(row.world_pool_tokens, row.position)
-        # And the whole decision, which is what a boot actually calls.
+        # And the whole decision, which is what a boot actually calls. Pinned
+        # on 'maxkv' by literal: this assertion is about the auto-emitting
+        # arm, and the default is 'decode-bs6' since the 2026-09-09 order.
         p1, p2 = _patched(pcm=SmallGdnPCM)
         with p1, p2:
             dec = d_tp_ratio_decision(
-                D_TP_OBJECTIVE_DEFAULT, "both", CARDS, SB5E_BUDGETS, "/model", 6
+                "maxkv", "both", CARDS, SB5E_BUDGETS, "/model", 6
             )
         self.assertEqual(dec.flags, ("--rank-tp-ratio", "auto"))
         self.assertIn("WEG2 D-OPERATING-POINTS", dec.op_line)
@@ -874,13 +889,18 @@ class AttentionTokenAxis1293Test(unittest.TestCase):
             "head",
         )
 
-    def test_1293_the_default_maxkv_argv_is_STILL_byte_identical(self):
+    def test_1293_the_maxkv_argv_is_STILL_byte_identical(self):
         """The #1241 golden, re-run under the dec1 geometry: the axis work
-        must not move a single argv byte of the default."""
+        must not move a single argv byte of the maxkv arm.
+
+        Bound to the LITERAL since the 2026-09-09 order made 'decode-bs6' the
+        default -- the golden is about that arm, not about whichever arm is
+        currently default.
+        """
         p1, p2 = _patched(pcm=Dec1PCM)
         with p1, p2:
             dec = d_tp_ratio_decision(
-                D_TP_OBJECTIVE_DEFAULT, "both", CARDS, DEC1_BUDGETS, "/model", 6
+                "maxkv", "both", CARDS, DEC1_BUDGETS, "/model", 6
             )
         self.assertEqual(dec.flags, ("--rank-tp-ratio", "auto"))
         self.assertIn("WEG2 D-OPERATING-POINTS", dec.op_line)
