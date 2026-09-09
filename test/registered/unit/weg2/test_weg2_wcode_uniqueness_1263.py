@@ -268,8 +268,8 @@ class TestOneWCodePerException(CustomTestCase):
         string."""
         c = census()
         front = "python/sglang/srt/weg2/front.py"
-        text = open(os.path.join(_repo_root(), front), encoding="utf-8").read()
-        lines = text.split("\n")
+        with open(os.path.join(_repo_root(), front), encoding="utf-8") as fh:
+            lines = fh.read().split("\n")
 
         def sites(literal):
             """The 1-based lines of ``front.py`` that carry this exact text.
