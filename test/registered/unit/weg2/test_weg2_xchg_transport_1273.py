@@ -1063,7 +1063,23 @@ def test_run_leg_applies_its_slot_size_to_both_lanes():
     assert sig.parameters["oncard_slot_bytes"].default is None
     source = inspect.getsource(tp.run_leg)
     assert "diag_bytes = int(slot_bytes if oncard_slot_bytes is None" in source
-    assert source.count("slot_bytes=diag_bytes") == 3
+    # EVERY diagonal site, found by an AST walk rather than counted by
+    # hand: a literal count is a test that has to be edited whenever a
+    # site is added, which is precisely when it should fail instead.
+    tree = ast.parse(source.lstrip())
+    sized = {"OnCardBounce", "HostBounce", "run_oncard_consumer"}
+    seen = 0
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        name = getattr(node.func, "id", None) or getattr(node.func, "attr", None)
+        if name not in sized:
+            continue
+        seen += 1
+        kw = {k.arg: k.value for k in node.keywords}
+        assert "slot_bytes" in kw, f"{name} takes the module default"
+        assert getattr(kw["slot_bytes"], "id", None) == "diag_bytes", name
+    assert seen >= 3, f"only {seen} sized call sites found in run_leg"
 
 
 def test_a_torn_oncard_row_is_not_a_signal(region):
@@ -1294,10 +1310,18 @@ def test_the_acceptance_lines_carry_every_token_the_spec_names():
     assert "gbs=0.000" in zero.line() and "bytes_mib=0.00" in zero.line()
 
     oncard = tp.OnCardStats(1, "GPU-card", tp.ONCARD_MODE_IPC,
-                            bytes_moved=2 * xr.MIB, elapsed_s=0.013)
+                            bytes_moved=2 * xr.MIB, hops=4, elapsed_s=0.013)
     for token in ("WEG2-XCHG-ONCARD", "card=GPU-card", "mode=ipc",
-                  "bytes_mib=2.00", "hop_ms=13.000"):
+                  "bytes_mib=2.00", "hops=4", "hop_ms=13.000"):
         assert token in oncard.line(), token
+
+    # A kilobyte lane prints bytes_mib=0.00 and MUST still be distinguishable
+    # from one that moved nothing -- the measured reason `hops` is on the line.
+    small = tp.OnCardStats(1, "GPU-card", tp.ONCARD_MODE_IPC,
+                           bytes_moved=5000, hops=2, elapsed_s=0.001)
+    assert "bytes_mib=0.00" in small.line() and "hops=2" in small.line()
+    nothing = tp.OnCardStats(1, "GPU-card", tp.ONCARD_MODE_IPC)
+    assert "bytes_mib=0.00" in nothing.line() and "hops=0" in nothing.line()
 
 
 def test_every_w_code_this_slice_raises_is_free_and_named_once():
@@ -1560,6 +1584,12 @@ def test_six_ranks_move_a_wave_and_every_byte_lands(tmp_path):
     for src, dst in xr.CROSS_PAIRS:
         named = [ln for ln in pairs if f"src=GPU-{src} dst=GPU-{dst} " in ln]
         assert len(named) == 2, (src, dst, named)
-        assert all("bytes_mib=0.00" not in ln for ln in named), named
+        # NOT "bytes_mib != 0.00": these payloads are kilobytes and two
+        # decimals of MiB cannot tell SMALL from NOTHING -- the double
+        # printed exactly that for a lane that had just moved every byte
+        # correctly.  The piece and hop counts can tell them apart, and they
+        # are the fields that WOULD be zero on a lane that moved nothing.
+        assert all(" pieces=0 " not in ln for ln in named), named
     for line in oncard:
-        assert "mode=ipc" in line and "bytes_mib=0.00" not in line
+        assert "mode=ipc" in line, line
+        assert " hops=0 " not in line, line
