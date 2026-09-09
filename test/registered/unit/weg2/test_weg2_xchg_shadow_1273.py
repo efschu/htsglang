@@ -2049,7 +2049,9 @@ def test_the_shadow_never_probes_for_the_on_card_mode():
     """An observer that PROBES has allocated on the card it is observing."""
     src = inspect.getsource(sh.resolve_shadow_oncard_mode)
     body = src.split('"""')[2]  # everything after the docstring: the CODE
-    assert "resolve_oncard_mode" not in src
+    # The DOCSTRING names both words -- it is what says the probe is refused --
+    # so the assertion has to be over the body, which is the thing that runs.
+    assert "resolve_oncard_mode" not in body, body
     assert "probe" not in body, body
 
 
@@ -2071,6 +2073,36 @@ def test_a_stale_run_is_closed_by_name_and_never_carried_across_flips(
     assert stale.closed is True
     assert sh._ACTIVE_LEG is None
     assert any("reason=stale-run" in ln for ln in lines), lines
+
+
+def test_a_leg_never_closes_a_region_or_a_device_it_was_handed(region, boot,
+                                                               no_active_leg):
+    """MEASURED DEFECT of this round, and it presented as a SIGSEGV.
+
+    ``close()`` used to close region, semaphores and device ops
+    unconditionally, so a leg HANDED those by its caller unmapped them out from
+    under it -- the end-to-end test's source leg finished first and pulled the
+    shared mmap away while the destination leg was still reading it: the whole
+    process died and ``junit.xml`` was never written, which is the run shape
+    #1281 exists to make loud.  In the product it is the same event with two
+    co-located ranks and one region.
+
+    "A run cannot be closed by a caller that does not own it" now also reads:
+    a run does not own what it was handed.
+    """
+    xr.create_semaphores(boot)
+    sems = tp.SemSet(boot)
+    try:
+        leg = sh.ShadowLeg(_inputs(sh.HOOK_SOURCE), lambda _s: None)
+        assert leg.attach(region=region, sems=sems, ops=object()) == ""
+        assert leg._opened == set()
+        assert leg.close(owner=leg.token) is True
+        # Still usable: nothing of the caller's was closed.
+        assert sems.getvalue(0, 0, "empty") == 1
+        region.dir_view()
+    finally:
+        sems.close()
+        xr.unlink_semaphores(boot)
 
 
 def test_a_handler_cannot_close_a_run_it_does_not_own(no_active_leg):
