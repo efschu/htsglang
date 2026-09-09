@@ -564,7 +564,7 @@ def deposit_refusal_message(*, reason: str, rank: int, row: int, peer_row: int,
                             batches: int, slots: int, slot_bytes: int,
                             budget_bytes: int,
                             slots_max: int = tp.ONCARD_SLOTS_MAX) -> str:
-    """W85: this lane's store-and-forward deposit does not fit (#1273 S6).
+    """W83: this lane's store-and-forward deposit does not fit (#1273 S6).
 
     THE SIBLING OF :func:`oncard_not_drainable_message`, at the same placement
     and under the same contract: the gate rendezvous has already run, the two
@@ -580,7 +580,7 @@ def deposit_refusal_message(*, reason: str, rank: int, row: int, peer_row: int,
     with its leg), so that lane keeps the old, blameless line.
     """
     return (
-        f"W85 Weg2XchgDepositUnfundable rank={rank} row={row} "
+        f"W83 Weg2XchgDepositUnfundable rank={rank} row={row} "
         f"peer_row={peer_row} leg={leg} epoch={epoch} "
         f"hook={'source' if is_source else 'destination'} reason={reason} "
         f"oncard_batches={batches} oncard_slots={slots} "
@@ -1975,7 +1975,7 @@ def shadow_transport(
             # concurrent peer at all: with one slot per batch the source fills,
             # publishes and RETURNS, and the destination reads the same shm
             # file in its own later leg.  So the refusal below now has two
-            # arms -- W85 when the deposit itself does not fit or is not funded
+            # arms -- W83 when the deposit itself does not fit or is not funded
             # (a claim that something is misconfigured), and the older
             # blameless line when no deposit is possible on this arm at all.
             # THE BATCHER'S OWN COUNT, not the hop model's ceil -- see
@@ -1994,9 +1994,13 @@ def shadow_transport(
                     is_source=is_source,
                     descs=sum(1 for d in subset.descs if _is_on_card(d)),
                     mode=str(oncard_mode), asked=bool(oncard_store_forward)))
-                result.reason = ("oncard-arm-cannot-deposit"
-                                 if oncard_store_forward
-                                 else "oncard-not-drainable")
+                # THE CENSUS WORD DOES NOT MOVE (#1311 S6b).  Every boot record
+                # of this campaign counts ``reason=oncard-not-drainable``, and
+                # renaming it to say "the arm, not the placement" would make the
+                # correction invisible to exactly the greps that would look for
+                # it.  The distinction lives on the LINE, in ``oncard_mode=`` and
+                # ``deposit_asked=``, which is where a reader can act on it.
+                result.reason = "oncard-not-drainable"
                 return run
             if deposit_reason:
                 log(deposit_refusal_message(
@@ -3326,7 +3330,7 @@ class ShadowLegInputs:
     #:
     #: S6: ``False`` no longer means the lane is refused.  It means the lane
     #: needs the STORE-AND-FORWARD shape, which needs no concurrent peer -- and
-    #: the refusal now fires only when that shape does not fit either (W85,
+    #: the refusal now fires only when that shape does not fit either (W83,
     #: :func:`deposit_refusal_message`) or when the arm cannot carry it (the
     #: ``ipc`` arm, which keeps the old blameless line).
     oncard_drainable: bool = True

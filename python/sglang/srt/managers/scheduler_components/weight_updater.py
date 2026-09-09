@@ -1799,6 +1799,11 @@ class SchedulerWeightUpdaterManager:
             plan, plan_reason = self._weg2_shadow_plan(str(hook), group,
                                                        int(rank),
                                                        agreed=agreed)
+            # THE MANIFEST STATE RIDES THE PLAN REASON, so the one line a
+            # refused leg prints (W81 ``no-plan``) says WHY the pair could not
+            # agree and not merely that it did not.
+            if plan_reason:
+                plan_reason = f"{plan_reason} manifest={manifest_state}"
             inputs = sh.ShadowLegInputs(
                 leg=leg,
                 epoch=epoch_token,
@@ -1813,11 +1818,7 @@ class SchedulerWeightUpdaterManager:
                 resume_reserve_bytes=int(reserve_bytes),
                 ring_ms=ring_ms,
                 gate_rows=self._weg2_shadow_gate_rows(str(hook), group),
-                # THE MANIFEST STATE RIDES THE PLAN REASON, so the one line a
-                # refused leg prints (W81 ``no-plan``) says WHY the pair could
-                # not agree and not merely that it did not.
-                plan_reason=(f"{plan_reason} manifest={manifest_state}"
-                             if plan_reason else str(plan_reason)),
+                plan_reason=str(plan_reason),
                 # THE ON-CARD LANE HAS NO CONCURRENT PEER ON THIS PLACEMENT.
                 # Same structural fact as ``_weg2_shadow_gate_rows`` above, one
                 # consequence further on (S5c refuter, must_fix 3): the source
@@ -1840,49 +1841,28 @@ class SchedulerWeightUpdaterManager:
                 # ``seq - slots`` is negative) rather than by a branch, so
                 # ``blocked_ms`` stays 0.000 and the destination now has bytes
                 # to COMPARE.  A shape that does not fit is still refused by
-                # name, and the refusal is now W85 (the deposit) instead of the
+                # name, and the refusal is now W83 (the deposit) instead of the
                 # blameless placement line.
                 oncard_drainable=False,
-                # #1311 S6b -- THE LANE S6 BUILT AND NOBODY ASKED FOR.
-                #
-                # BOOT weg2xsn5 MEASURED IT: ``WEG2-XCHG-SHADOW-ONCARD-REFUSED``
-                # 24 times, every one ``hook=source``, on every leg, INDEPENDENT
-                # of the W82 plan divergence.  The root is one missing argument.
-                # ``run_leg_hook``'s refusal reads
-                #     if not oncard_store_forward or reason == DEPOSIT_REASON_IPC
-                # and ``ShadowLegInputs.oncard_store_forward`` defaults to
-                # ``False``.  This construction never passed it, and a grep of
-                # the tree found the field's only non-default producers in TWO
-                # TEST FILES -- so the store-and-forward deposit was priced, its
-                # slot arithmetic guarded (``require_store_forward_slots``), its
-                # refusal reasons enumerated, and it could not be reached from a
-                # boot.  Same class as "``build_plan`` has no product caller"
-                # (S5b UNPROVEN 2): a lane written, tested and never wired.
-                #
-                # IT IS THE UPSTREAM-MINIMAL SHAPE OF THE THREE THE TICKET
-                # OFFERS.  Running the lane from the DESTINATION hook does not
-                # help -- the source rank is then inside its pause loop and its
-                # end still cannot drain.  Splitting the source hook so the C14
-                # credit publishes first would move the flip's own ordering to
-                # suit an observer, which is deviation 6 of this module's
-                # docstring inverted.  A side thread with a bounded join is
-                # measured-bad: the leg is owned by the thread that runs it
-                # (``weight_exchange_shadow._ACTIVE``), and a second leg sharing
-                # the interpreter adopted the slot and closed the first out from
-                # under itself, presenting as a gate expiry five seconds inside
-                # a flip.  The deposit needs NO concurrent peer at all, which is
-                # the property the placement actually lacks.
-                #
-                # ASKING IS NOT GETTING, and that is deliberate: with a shape
-                # that does not fit, ``deposit_refusal_reason`` still refuses BY
-                # NAME -- W85 on the ``host`` arm when the slots or the #1269
-                # charge do not carry it, and the blameless placement line on
-                # the ``ipc`` arm, where an exported bounce cannot outlive its
-                # leg by construction.  A boot on ``--weg2-xchg-oncard ipc``
-                # (which is what weg2xsn5 ran) therefore still refuses; the
-                # difference is that the refusal now names the ARM, and the
-                # ``host`` arm now has a path.
-                oncard_store_forward=True,
+                # #1311 S6b -- WHY THE ON-CARD LANE STILL DOES NOT RUN, and
+                # it is NOT this flag.  ``run_leg_hook``'s ShadowLegInputs path
+                # already derives ``store_forward = not oncard_drainable``
+                # (``weight_exchange_shadow.py:3855``), so setting
+                # ``oncard_drainable=False`` here IS asking for the deposit.
+                # Boot weg2xsn5's 24 ``WEG2-XCHG-SHADOW-ONCARD-REFUSED`` lines
+                # came through the OTHER half of that refusal's condition:
+                # ``deposit_refusal_reason`` returns ``DEPOSIT_REASON_IPC`` for
+                # every mode that is not ``host``
+                # (``weight_exchange_transport.py:1607``) and the boot ran
+                # ``--weg2-xchg-oncard ipc``.  An exported VRAM bounce is freed
+                # with the leg that exported it, so store-and-forward is a
+                # ``host``-arm shape by construction and no code change here can
+                # give the ipc arm one.  What #1311 changed is that the refusal
+                # LINE now names the arm and the action instead of blaming the
+                # placement the deposit already defeats -- and the ledger term
+                # below is only read on the host arm
+                # (``_weg2_shadow_host_budget``), which is the other half a
+                # host-arm boot needs.
                 # WHAT THE #1269 LEDGER CHARGED FOR ONE CARD'S DEPOSIT.  The
                 # adapter is the producer because the budget is a property of
                 # the BOOT's arm and a rank hook cannot read the launcher's
