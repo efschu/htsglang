@@ -53,7 +53,7 @@ import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
-from typing import Callable, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, Mapping, NamedTuple, Optional, Sequence, Tuple
 
 from sglang.srt.weg2 import admin_key as admin_key_mod
 from sglang.srt.registry import nvml as nvml_registry
@@ -580,18 +580,56 @@ def measure_x_inputs(log_path: str, floor_tokens: int) -> Optional[Tuple[float, 
     return (_median(flips), _median(r_d), _median(r_p), len(flips), len(r_d), len(r_p))
 
 
-def resolve_x(override: Optional[int], evidence_dir: str, floor_tokens: int) -> Tuple[int, str]:
+class XSeed(NamedTuple):
+    """X, its provenance line, and whether a MEASUREMENT produced it.
+
+    ``measured`` is load-bearing, not decoration.  The carrier floor is 1.25x X
+    (:func:`carrier_census.route_floor`), so an X this rig never measured
+    decides through W45 whether a boot may start at all -- a fallback acting as
+    an actuator, which the standing law forbids.  Carried as a field rather
+    than sniffed back out of ``provenance`` so the two cannot drift (#1299).
+    """
+
+    tokens: int
+    provenance: str
+    measured: bool
+
+
+def resolve_x(override: Optional[int], evidence_dir: str, floor_tokens: int) -> XSeed:
     """X and its PROVENANCE LINE, naming the three inputs and their source.
 
     Order: an explicit ``--tp-prefill-max-tokens`` wins (A1-4: derived with
     the flag as override), else the newest front log on this rig that
     carries all three instruments, else the recorded PRE-BARLINK pair.
+
+    #1299: THE SCAN READS EVERY LOG UNTIL ONE QUALIFIES -- it used to stop
+    after the newest EIGHT, and a log that parsed to ``None`` consumed a slot
+    exactly like one that measured.  Measured consequence, four boots of one
+    day: dec1 (07:32Z) and both sb5h (10:25Z, 10:31Z) found
+    ``weg2sb5f...front.log`` at scan positions 1 and 5 and seeded X=8,742 from
+    it; by dec2b (12:50Z) and shadow boot B (12:56Z) the same file had drifted
+    to positions 8 and 9 behind eight barren logs -- refused or decode-only
+    boots that print a front log but never drain P -- and both fell through to
+    the recorded pair at X=22,556.  The seed tripled on two INDEPENDENT lines
+    at the same wall-clock while the file it should have read sat unchanged on
+    disk, because the cap counts files examined, not files that qualified.
+
+    The two ``.P.log`` scans in this same launcher
+    (:func:`newest_p_log_with_bubble` and the mean-prefix scan beside it)
+    already walk their whole sorted list and skip what does not carry the line;
+    this is that shape, and it deletes a hand number rather than adding one.
+
+    Both provenance lines now carry the scan's own denominator: how many logs
+    were skipped before the seed, or how many were examined before the
+    fallback.  Without it "no front log on this rig carried all three
+    instruments" reads as a fact about the rig when it was only a fact about
+    the eight the scan looked at.
     """
     if override is not None:
-        return max(floor_tokens, int(override)), (
+        return XSeed(max(floor_tokens, int(override)), (
             f"X={max(floor_tokens, int(override))} source=flag "
             f"(--tp-prefill-max-tokens, operator override; floor {floor_tokens})"
-        )
+        ), True)
     logs: List[str] = []
     try:
         logs = sorted(
@@ -601,30 +639,34 @@ def resolve_x(override: Optional[int], evidence_dir: str, floor_tokens: int) -> 
         )
     except OSError:
         logs = []
-    for path in logs[:8]:
+    skipped = 0
+    for path in logs:
         got = measure_x_inputs(path, floor_tokens)
         if got is None:
+            skipped += 1
             continue
         flip_s, r_d, r_p, n_f, n_d, n_p = got
         try:
             x = derive_x_star(flip_s, r_d, r_p, floor_tokens)
         except ValueError:
+            skipped += 1
             continue
-        return x, (
+        return XSeed(x, (
             f"X={x} source=boot:{os.path.basename(path)} "
             f"X*=2*flip_s/(1/r_D-1/r_P) flip_s={flip_s:.2f} (median of {n_f}) "
             f"r_D={r_d:.0f} tok/s (median of {n_d} D single prefills) "
-            f"r_P={r_p:.0f} tok/s (median of {n_p} P leg 1s) floor={floor_tokens}"
-        )
+            f"r_P={r_p:.0f} tok/s (median of {n_p} P leg 1s) floor={floor_tokens}; "
+            f"skipped {skipped} newer front log(s) carrying no complete instrument set"
+        ), True)
     x = derive_x_star(X_RECORDED_FLIP_S, X_RECORDED_R_D_TOKS, X_RECORDED_R_P_TOKS, floor_tokens)
-    return x, (
-        f"X={x} source=recorded PRE-BARLINK (no front log on this rig carried all three "
-        f"instruments) X*=2*flip_s/(1/r_D-1/r_P) flip_s={X_RECORDED_FLIP_S} "
+    return XSeed(x, (
+        f"X={x} source=recorded PRE-BARLINK (examined {len(logs)} front log(s) on this rig, "
+        f"none carried all three instruments) X*=2*flip_s/(1/r_D-1/r_P) flip_s={X_RECORDED_FLIP_S} "
         f"r_D={X_RECORDED_R_D_TOKS:.0f} tok/s r_P={X_RECORDED_R_P_TOKS:.0f} tok/s "
         f"floor={floor_tokens} -- record 1l/1o weg2zr2, conservative corner of the measured "
         f"range; post-barlink r_D 1354 tok/s pushes X far higher and post-flipcost pulls it "
         f"back, so this is a fallback, never a table (O4)"
-    )
+    ), False)
 
 #: The operating point both groups are launched at (`--context-length`), and
 #: therefore the longest prompt group P can be asked to prefill. It is the
@@ -5957,7 +5999,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     p_bs = max(1, int(ns.p_bs))
     d_bs = max(1, int(ns.d_bs))
     max_kv_per_request = int(ns.max_kv_per_request or CONTEXT_LENGTH_TOKENS)
-    x_tokens, x_provenance = resolve_x(ns.tp_prefill_max_tokens, EVIDENCE_DIR, CHUNKED_PREFILL_TOKENS)
+    x_seed = resolve_x(ns.tp_prefill_max_tokens, EVIDENCE_DIR, CHUNKED_PREFILL_TOKENS)
+    x_tokens, x_provenance = x_seed.tokens, x_seed.provenance
     flip_min_work_tokens = int(ns.flip_min_work_tokens) if ns.flip_min_work_tokens is not None else x_tokens
     idle_layout_front = "P" if ns.idle_layout == "pp" else "D"
     log(f"SCHEDULING KNOBS (spec slice A, resolved before the budget solve): --p-bs {p_bs} "
@@ -6639,7 +6682,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     for _sl in _cen.lines:
         log(f"CARRIER BOUND source line: {_sl}")
 
-    _dec = _cc.decide_bound(_cen, ns.carrier_max_tokens, log_path=spec_d.log, floor_why=_floor_why)
+    # #1299: the floor is 1.25x X, so a FALLBACK X must not be allowed to refuse
+    # the boot through W45 -- an unmeasured term is a named fallback, never an
+    # actuator. The census bound itself is a measurement and is graded as before.
+    _dec = _cc.decide_bound(_cen, ns.carrier_max_tokens, log_path=spec_d.log,
+                            floor_why=_floor_why, x_measured=x_seed.measured)
     if _dec.refused:
         raise Weg2LaunchRefused(_dec.detail)
     carrier_max_tokens = _dec.bound
