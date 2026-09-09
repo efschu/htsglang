@@ -2649,3 +2649,158 @@ class TestTheReassociationBound(CustomTestCase):
         self.assertGreater(worst16, worst32 * 100)
         # ...and still a PRECISION term, not a 0.69-relative convention error.
         self.assertLess(worst16, 1e-1)
+
+
+# ---------------------------------------------------------------------------
+# T17 -- THE FUNCTIONAL PROOF ("es funktioniert").
+#
+# User order: quality is NOT measured -- 16 bit is definitively better, it just
+# has to WORK, i.e. real 16-bit tokens actually used over the configured
+# length. So a boot log must be able to prove FOUR facts, each with a named
+# emitter:
+#
+#   (1) the tail region is REAL bf16 KV, and the BODY's dtype is stated beside
+#       it. kvtail6 is the reason this is not optional: the boot script
+#       hard-wired --kv-cache-dtype bfloat16 for every arm, so there was no fp8
+#       body anywhere, and NOTHING in the log said so. `kv_tail_cell_bytes`
+#       alone is a proxy that nobody read correctly.
+#   (2) the tail length in use equals the configured flag.
+#   (3) the READ path actually consumes the 16-bit tail -- the merge is counted
+#       per decode step. Without this, `attended_rows > 0` proves only that a
+#       PLAN named some rows, not that any kernel ever read them. That gap is
+#       the kvtail1 "probe did not bite" class exactly.
+#   (4) a refusal fires when the tail cannot be real 16-bit on this form.
+# ---------------------------------------------------------------------------
+
+
+class TestFactOneTheDtypesAreStated(CustomTestCase):
+    """(1) tail_dtype and body_dtype on the L1 sizing line."""
+
+    def _cfg(self, kv_cache_dtype="fp8_e4m3"):
+        from sglang.srt.model_executor.pool_configurator import DefaultPoolConfigurator
+
+        cfg = DefaultPoolConfigurator.__new__(DefaultPoolConfigurator)
+        sa = types.SimpleNamespace(
+            kv_tail_min_tokens=16384, kv_tail_max_tokens=KV_TAIL_OPEN,
+            kv_tail_ring_rows=64, kv_tail_host_max_tokens=None,
+            max_running_requests=1, kv_cache_dtype=kv_cache_dtype,
+        )
+        cfg._kv_tail_mr = types.SimpleNamespace(server_args=sa)
+        cfg._cell_size = 32768
+        cfg._kv_tail_body_itemsize = 1
+        cfg._kv_tail_target_cell_size = 32768
+        return cfg
+
+    def test_the_terms_name_both_dtypes(self):
+        import contextlib
+        import importlib
+
+        rc = importlib.import_module("sglang.srt.runtime_context")
+        with unittest.mock.patch.object(
+            rc, "get_parallel", lambda: types.SimpleNamespace(
+                attn_dcp_size=1, attn_dcp_rank=0)
+        ):
+            with contextlib.ExitStack() as st:
+                pc = importlib.import_module(
+                    "sglang.srt.model_executor.pool_configurator")
+                st.enter_context(unittest.mock.patch.object(
+                    pc, "get_parallel", lambda: types.SimpleNamespace(
+                        attn_dcp_size=1, attn_dcp_rank=0)))
+                _post, terms = self._cfg()._kv_tail_ring_post(page_size=1)
+        self.assertEqual(terms["tail_dtype"], "bf16")
+        self.assertEqual(terms["body_dtype"], "fp8_e4m3")
+
+    def test_a_bf16_body_is_named_as_such(self):
+        """The kvtail6 configuration. It must be readable OFF THE LINE that
+        the body was bf16 -- that boot's whole conclusion turned on it and the
+        log could not say."""
+        import contextlib
+        import importlib
+
+        with contextlib.ExitStack() as st:
+            pc = importlib.import_module(
+                "sglang.srt.model_executor.pool_configurator")
+            st.enter_context(unittest.mock.patch.object(
+                pc, "get_parallel", lambda: types.SimpleNamespace(
+                    attn_dcp_size=1, attn_dcp_rank=0)))
+            _p, terms = self._cfg(kv_cache_dtype="bfloat16")._kv_tail_ring_post(1)
+        self.assertEqual(terms["body_dtype"], "bfloat16")
+        self.assertEqual(terms["tail_dtype"], "bf16")
+
+
+class TestFactThreeTheMergeIsCounted(CustomTestCase):
+    """(3) the read path is counted, per decode step."""
+
+    def test_the_counter_line_carries_the_merge_count(self):
+        ring = _ring(rows=16)
+        self.assertIn("tail_merges=", ring.counter_line("decode"))
+
+    def test_note_merge_moves_the_step_and_total_counts(self):
+        ring = _ring(rows=16)
+        self.assertEqual(ring.counters.tail_merges, 0)
+        ring.note_merge()
+        ring.note_merge()
+        self.assertEqual(ring.counters.tail_merges, 2)
+        self.assertEqual(ring.counters.tail_merges_this_step, 2)
+
+    def test_the_merge_seam_counts_itself(self):
+        """The seam must call it -- a counter nobody increments is the same
+        blind spot with a number beside it."""
+        import inspect
+
+        from sglang.srt.layers.attention.flashinfer_backend import (
+            FlashInferAttnBackend,
+        )
+
+        src = inspect.getsource(FlashInferAttnBackend._kv_tail_merge_decode)
+        self.assertIn("note_merge()", src)
+
+
+class TestFactFourTheProbeMustBite(CustomTestCase):
+    """(4) a refusal when the tail cannot be real 16-bit on this form.
+
+    THE kvtail1 CLASS: a plan that names rows, a counter that moves, and no
+    kernel that ever reads them. `attended_rows > 0` is a PLAN fact; only the
+    merge count is a READ fact. If a step plans a tail and merges nothing, the
+    tail is a banner and must say so."""
+
+    def _armed_with_rows(self):
+        ring = _ring(rows=16)
+        loc = torch.arange(4, 8, dtype=torch.int64)
+        ring.claim(loc, torch.ones(4, dtype=torch.bool))
+        return ring, loc
+
+    def _plan(self, ring, loc):
+        return ring.plan(
+            torch.tensor([0, loc.numel()], dtype=torch.int32),
+            loc.to(torch.int32),
+            torch.tensor([loc.numel()], dtype=torch.int64),
+        )
+
+    def test_a_planned_tail_that_never_merged_is_refused_by_name(self):
+        ring, loc = self._armed_with_rows()
+        self._plan(ring, loc)                 # step 1 plans 4 tail rows
+        self.assertEqual(ring.counters.attended_rows, 4)
+        ring.begin_decode_step()              # ...and NO note_merge() follows
+        with self.assertRaises(Weg2KvTailNoOp) as cm:
+            self._plan(ring, loc)             # step 2's plan must catch it
+        self.assertIn("attended", str(cm.exception).lower())
+
+    def test_a_planned_tail_that_did_merge_is_accepted(self):
+        ring, loc = self._armed_with_rows()
+        self._plan(ring, loc)
+        ring.begin_decode_step()
+        for _ in range(4):                    # the per-layer merges
+            ring.note_merge()
+        self._plan(ring, loc)                 # no refusal
+        self.assertGreater(ring.counters.tail_merges, 0)
+
+    def test_a_step_that_planned_no_tail_needs_no_merge(self):
+        """The gate must not fire on a step with an empty tail plan."""
+        ring = _ring(rows=16)
+        empty = torch.zeros(0, dtype=torch.int32)
+        for _ in range(3):
+            ring.plan(torch.tensor([0, 0], dtype=torch.int32), empty,
+                      torch.tensor([0], dtype=torch.int64))
+            ring.begin_decode_step()
+        self.assertEqual(ring.counters.tail_merges, 0)
