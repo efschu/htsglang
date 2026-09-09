@@ -3745,6 +3745,7 @@ def test_the_product_adapter_declares_its_lane_undrainable():
 
 def test_an_undrainable_lane_compares_digests_and_moves_no_bytes(region, boot,
                                                                  tmp_path,
+                                                                 monkeypatch,
                                                                  no_active_leg,
                                                                  chunked):
     """must_fix 3, and refuter finding 9 answered in the same run.
@@ -3755,7 +3756,17 @@ def test_an_undrainable_lane_compares_digests_and_moves_no_bytes(region, boot,
     exporting under a plan its consumer never saw -- finding 9 with the sign
     flipped.  So the gate must have run, the refusal must be on the log by
     name, and ``run_leg`` must never have been entered.
+
+    S6 NARROWED WHERE THIS LINE IS THE RIGHT ANSWER, so this test now pins the
+    ARM as well.  A store-and-forward deposit needs no concurrent peer and is
+    what an undrainable ``host`` lane now gets instead; on the ``ipc`` arm no
+    deposit is possible at all -- an exported bounce is freed with its leg --
+    so THAT is where the blameless placement line survives.  The refusal's
+    contract (gate ran, digests compared, no bytes moved, ``blocked_ms=0``) is
+    unchanged, which is what the assertions below are for.
     """
+    monkeypatch.setattr(sh, "resolve_shadow_oncard_mode",
+                        lambda: tp.ONCARD_MODE_IPC)
     plan, why = _derive("source", rank=0, group="P")
     assert plan is not None, why
     xr.create_semaphores(boot)
@@ -3950,3 +3961,435 @@ def test_the_wave_map_is_printed_as_the_assumption_it_is(chunked):
     assert f"waves={len(plan.facts.waves)}" in plan.line()
     src = inspect.getsource(sh.derive_leg_plan)
     assert "waves_of(family, {}, cards)" in src, "the literal is still the literal"
+
+
+# --- S6: the store-and-forward deposit, and what it puts back on the log ----
+#
+# THE FINDING THIS SLICE ANSWERS (SECTION 1ai-S5c-fix): the source hook sits
+# inside the pause loop, upstream of the peer's C14-fenced resume, so the
+# on-card lane cannot drain across the flip -- `oncard_drainable=False`, six
+# `WEG2-XCHG-SHADOW-ONCARD-REFUSED` per flip, and no compare at all.  A deposit
+# sized `slots >= batches` needs no drain: the source fills every slot inside
+# its own leg and returns, and the destination reads them in its own.
+
+
+#: A DIAGONAL SLOT THE ROW AREA CAN ADDRESS AT ONE SLOT PER BATCH.  ``SLOT``
+#: is 4 KiB -- deliberately tiny, so the cross lane's batching is exercised by
+#: kilobytes -- and this fixture's diagonal cuts 48 batches at that size, which
+#: is six times ``ONCARD_SLOTS_MAX``.  A deposit of 48 slots is a REAL refusal
+#: (``batches-exceed-slots-max``) and it is tested as one below; a test that
+#: wants to reach the funded path must therefore name a slot at which the
+#: deposit fits, exactly as ``plan_oncard_slot_bytes`` raises the size itself
+#: when it is allowed to choose.
+DEPOSIT_SLOT = 64 * 1024
+
+
+def _ledger_budget() -> int:
+    from sglang.srt.weg2 import host_ledger as hl
+
+    return int(hl.xchg_bounce_bytes_per_card())
+
+
+def _host_arm(monkeypatch) -> None:
+    """The deposit is a ``host``-arm shape; ``resolve_shadow_oncard_mode``
+    defaults to ``ipc``, where an exported bounce cannot outlive its leg."""
+    monkeypatch.setattr(sh, "resolve_shadow_oncard_mode",
+                        lambda: tp.ONCARD_MODE_HOST)
+
+
+def test_an_unfunded_deposit_is_refused_by_name_and_moves_no_bytes(
+        region, boot, tmp_path, no_active_leg, chunked, monkeypatch):
+    """S6 W65: pinned host bytes nobody charged for are not a risk to accept.
+
+    ``host_bounce_budget_bytes=0`` is "no ledger answer reached this rank", and
+    it refuses exactly like a budget that is too small: an absent measurement
+    never becomes a quiet zero, and the reap mark is a HARD bound
+    (``host-schwelle-nie-uebertreten``), never a margin to spend.
+
+    THE CONTRACT IS THE OTHER REFUSAL'S: the gate rendezvous has run, the two
+    digests HAVE been compared, ``run_leg`` was never entered and nothing
+    blocked.  What differs is the claim -- a W-code, because a deposit that was
+    asked for and not funded is a configuration that is wrong, where the
+    placement line is nobody's fault.
+    """
+    _host_arm(monkeypatch)
+    plan, why = _derive("source", rank=0, group="P")
+    assert plan is not None, why
+    xr.create_semaphores(boot)
+    sems = tp.SemSet(boot)
+    ops = FakeDeviceOps(str(tmp_path / "nf"), rank=0)
+    subset = sh.select_subset(plan.descs, leg=0, classes=plan.classes)
+    _vote_rows(region, [1, 2], leg=0, vote=True, classes_hash=subset.hash,
+               need_mib=0, plan_digest=plan.facts.digest)
+    entered = []
+    try:
+        lines = []
+        real = tp.run_leg
+        tp.run_leg = lambda *a, **k: entered.append(1)  # noqa: E731
+        try:
+            result = sh.run_leg_hook(
+                _inputs(sh.HOOK_SOURCE, row=0, peer_row=3, gate_rows=(0, 1, 2),
+                        oncard_drainable=False, host_bounce_budget_bytes=0),
+                log=lines.append, plan=plan, region=region, sems=sems, ops=ops,
+                armed=True, gate_budget_s=2.0, hook_budget_s=5.0,
+                slot_bytes=SLOT, oncard_slot_bytes=DEPOSIT_SLOT)
+        finally:
+            tp.run_leg = real
+    finally:
+        ops.close()
+        sems.close()
+        xr.unlink_semaphores(boot)
+    assert entered == [], "an unfunded deposit must not reach the transport"
+    assert result.reason == "deposit-unfundable", result.line()
+    assert result.ran is False
+    refusal = [ln for ln in lines if ln.startswith("W65 Weg2XchgDepositUnfundable")]
+    assert len(refusal) == 1, lines
+    for token in ("hook=source", "row=0", "peer_row=3",
+                  f"reason={tp.DEPOSIT_REASON_UNFUNDED}",
+                  "host_budget_mib=0", "oncard_batches=", "oncard_slots="):
+        assert token in refusal[0], (token, refusal[0])
+    # The placement line is NOT what fired: the deposit is possible here, it is
+    # only unfunded, and the two refusals must never be read as one event.
+    assert not [ln for ln in lines
+                if ln.startswith(sh.ONCARD_NOT_DRAINABLE_PREFIX)], lines
+    gate = [ln for ln in lines if ln.startswith(sh.SHADOW_GATE_LINE_PREFIX)]
+    assert len(gate) == 1 and "run=yes" in gate[0], lines
+    assert result.blocked_ms == 0.0, result.line()
+
+
+def test_a_funded_deposit_runs_the_lane_with_no_concurrent_peer(
+        region, boot, tmp_path, no_active_leg, chunked, monkeypatch):
+    """S6: THE MIRROR of the refusal, and the whole product effect of S6.
+
+    Same placement, same ``oncard_drainable=False``, same hook -- and now the
+    transport IS entered, with ``oncard_store_forward=True`` and one slot per
+    batch, which is the property that makes the source's every drain wait a
+    negative-``seq`` early return.  The recorder stands in for the transport so
+    this stays a wiring proof: the bytes themselves are proven in
+    ``test_a_deposit_outlives_its_leg_and_is_read_after_the_source_is_gone``,
+    against the real batcher.
+    """
+    _host_arm(monkeypatch)
+    plan, why = _derive("source", rank=0, group="P")
+    assert plan is not None, why
+    xr.create_semaphores(boot)
+    sems = tp.SemSet(boot)
+    ops = FakeDeviceOps(str(tmp_path / "fd"), rank=0)
+    subset = sh.select_subset(plan.descs, leg=0, classes=plan.classes)
+    _vote_rows(region, [1, 2], leg=0, vote=True, classes_hash=subset.hash,
+               need_mib=0, plan_digest=plan.facts.digest)
+    seen = {}
+    try:
+        lines = []
+        real = tp.run_leg
+
+        def recorder(*a, **k):
+            seen.update(k)
+            return tp.LegResult()
+
+        tp.run_leg = recorder
+        try:
+            result = sh.run_leg_hook(
+                _inputs(sh.HOOK_SOURCE, row=0, peer_row=3, gate_rows=(0, 1, 2),
+                        oncard_drainable=False,
+                        host_bounce_budget_bytes=_ledger_budget()),
+                log=lines.append, plan=plan, region=region, sems=sems, ops=ops,
+                armed=True, gate_budget_s=2.0, hook_budget_s=5.0,
+                slot_bytes=SLOT, oncard_slot_bytes=DEPOSIT_SLOT)
+        finally:
+            tp.run_leg = real
+    finally:
+        ops.close()
+        sems.close()
+        xr.unlink_semaphores(boot)
+    assert seen, "a funded deposit MUST reach the transport"
+    assert seen["oncard_store_forward"] is True, seen.get("oncard_store_forward")
+    batches = sh.oncard_lane_batches(subset.descs, 0, seen["oncard_slot_bytes"])
+    assert batches > 0, "this test proves nothing on an empty diagonal"
+    assert seen["oncard_slots"] >= batches, (seen["oncard_slots"], batches)
+    assert seen["oncard_slots"] != tp.ONCARD_SLOTS or batches == tp.ONCARD_SLOTS
+    assert not [ln for ln in lines
+                if ln.startswith(sh.ONCARD_NOT_DRAINABLE_PREFIX)
+                or ln.startswith("W65 ")], lines
+    assert result.blocked_ms == 0.0, result.line()
+    # The deposit's shape is on the shadow's own line, with its provenance.
+    line = result.line()
+    for token in (f"oncard_slots={seen['oncard_slots']}",
+                  "oncard_slots_source=store-forward-batches",
+                  "oncard_deposit_mib="):
+        assert token in line, (token, line)
+
+
+def test_the_batch_count_the_deposit_is_sized_from_is_the_batchers_own(chunked):
+    """S6: ``ceil(bytes / slot)`` is a LOWER bound on the batches, not the count.
+
+    The hop model's denominator and the batcher's output are two different
+    numbers whenever the descriptors do not pack flush -- ``batch_descs`` starts
+    a new batch when the next piece does not fit.  Sizing the deposit from the
+    ceil model would produce ``slots < batches`` from arithmetic alone, which is
+    the silent overwrite the whole shape forbids.
+    """
+    plan, why = _derive("source", rank=0, group="P")
+    assert plan is not None, why
+    subset = sh.select_subset(plan.descs, leg=0, classes=plan.classes)
+    lane = sh.oncard_lane_descs(subset.descs, 0)
+    total = sh.oncard_lane_bytes(subset.descs, 0)
+    assert lane and total > 0, "the fixture must have a diagonal"
+    # ONE FILTER, three readers -- the bytes, the descriptors and the batches.
+    assert sum(int(d.nbytes) for d in lane) == total
+    for slot in (SLOT, 4 * SLOT):
+        counted = sh.oncard_lane_batches(subset.descs, 0, slot)
+        assert counted == len(tp.batch_descs(lane, slot))
+        assert counted >= -(-total // slot), (counted, total, slot)
+
+
+def test_the_adapter_reads_its_deposit_budget_from_the_ledger():
+    """S6: the charge and the bound are ONE number, not two copies of it.
+
+    The adapter is the producer for the same reason it produces ``gate_rows``:
+    the budget is a property of the BOOT's arm and a rank hook cannot read the
+    launcher's ladder.  What it must NOT do is spell the arithmetic again --
+    a second copy of ``slots x slot_bytes`` here and in the ledger is how a
+    charge and a bound drift apart by one edit.
+    """
+    hook = _wu_source("_weg2_shadow_hook")
+    assert "host_bounce_budget_bytes=self._weg2_shadow_host_budget()" in hook, hook
+    reader = _wu_source("_weg2_shadow_host_budget")
+    assert "hl.xchg_bounce_bytes_per_card()" in reader, reader
+    # AN UNREADABLE LEDGER YIELDS 0, AND 0 REFUSES -- never a guessed budget.
+    assert "return 0" in reader, reader
+    assert sh.ShadowLegInputs(
+        leg=0, epoch="e", direction="d2h", hook=sh.HOOK_SOURCE, rank=0, row=0,
+        peer_row=3, device=0, card_uuid="u").host_bounce_budget_bytes == 0
+
+
+def test_the_deposit_is_a_term_of_the_1269_host_ledger_and_the_arm_line_says_so():
+    """S6: the exchange's pinned host carrier, priced where host bytes are priced.
+
+    THE OMISSION WAS SELF-DECLARED: ``oncard_host_path``'s docstring has said
+    since S4 that the degrade's bounce is host memory "that spec 0.2's ledger
+    term does NOT carry ... the number belongs in the record".  It is a term
+    now, in ``charge_terms`` -- the one authority the three consumers read --
+    so ``size_store_gib``'s leftover shrinks by exactly the deposit and the
+    predicted run peak carries it against the reap mark.
+
+    THE RING ARM IS UNCHANGED, and that is asserted rather than assumed: the
+    term is 0.00 there, so every existing boot number is the same number.
+    """
+    from sglang.srt.weg2 import host_ledger as hl
+
+    per_card = hl.xchg_bounce_bytes_per_card()
+    assert per_card == tp.ONCARD_SLOTS_MAX * tp.ONCARD_SLOT_BYTES
+    assert hl.xchg_bounce_bytes(3) == 3 * per_card
+    ring = hl.price(120 << 30, 60 << 30, 1, 1200,
+                    ring_bytes=30 << 30, ring_span1_bytes=10 << 30)
+    armed = hl.price(120 << 30, 60 << 30, 1, 1200,
+                     ring_bytes=30 << 30, ring_span1_bytes=10 << 30,
+                     xchg_bounce_host_bytes=hl.xchg_bounce_bytes(3))
+    assert ring.terms["xchg_bounce_gib"] == 0.0
+    assert armed.terms["xchg_bounce_gib"] == hl.xchg_bounce_bytes(3) / hl.GIB
+    # THE TERM IS SPENT AT BOTH MOMENTS, so the leftover -- and therefore the
+    # store -- shrinks by exactly it and by nothing else.
+    assert round(ring.run_leftover_gib - armed.run_leftover_gib, 6) == \
+        round(armed.terms["xchg_bounce_gib"], 6)
+    assert round(ring.launch_leftover_gib - armed.launch_leftover_gib, 6) == \
+        round(armed.terms["xchg_bounce_gib"], 6)
+    # ... and it is in the ONE authority, not added at the three call sites.
+    assert "xchg_bounce_gib" in hl.charge_terms(
+        1, 1200, 3, hl.resolve_image_terms(None))
+    assert "xchg_bounce_gib" in inspect.getsource(hl._boot_charges_gib)
+
+
+def test_the_arm_line_names_the_deposit_even_when_it_is_zero(tmp_path):
+    """S6: an unarmed boot SAYS the term was priced at zero.
+
+    A term that only appears when it is non-zero leaves a reader unable to tell
+    "priced at zero" from "not priced", which is the reading this whole slice
+    exists to remove from ``oncard_host_path``'s docstring.
+    """
+    from sglang.srt.weg2 import host_ledger as hl
+
+    _arm, _store, lines = hl.choose(
+        200 << 30, 150 << 30, store_min_gib=1.0, ring_bytes=20 << 30,
+        ring_span1_bytes=8 << 30)
+    arms = [ln for ln in lines if ln.startswith("WEG2-HOST-LEDGER ARM ")]
+    assert arms, lines
+    assert all("xchg_bounce=0.00" in ln for ln in arms), arms
+
+    _a2, _s2, armed_lines = hl.choose(
+        200 << 30, 150 << 30, store_min_gib=1.0, ring_bytes=20 << 30,
+        ring_span1_bytes=8 << 30,
+        xchg_bounce_host_bytes=hl.xchg_bounce_bytes(3))
+    armed_arms = [ln for ln in armed_lines if ln.startswith("WEG2-HOST-LEDGER ARM ")]
+    expect = f"xchg_bounce={hl.xchg_bounce_bytes(3) / hl.GIB:.2f}"
+    assert all(expect in ln for ln in armed_arms), (expect, armed_arms)
+
+
+def test_the_launcher_charges_the_deposit_only_on_an_armed_boot():
+    """S6: the ARM STRING decides the charge, at the one ledger call site.
+
+    Not inside the ledger: ``WEIGHT_SOURCE_CHOICES`` is the launcher's, and a
+    ledger that knew about arm names would be a second reader of a decision
+    that already has one.  ``ring`` -- the default and every boot that has run
+    -- charges nothing, which is what keeps this slice off the default path.
+    """
+    from sglang.srt.weg2 import launcher as lc
+
+    src = inspect.getsource(lc.choose_host_ledger)
+    assert "xchg_bounce_host_bytes=(" in src, src
+    assert "host_ledger.xchg_bounce_bytes()" in src, src
+    assert "WEIGHT_SOURCE_DEFAULT" in src, src
+    main_src = inspect.getsource(lc.main)
+    assert "weight_source=ns.weg2_weight_source" in main_src, \
+        "the arm must reach the ledger call site"
+
+
+def test_shadow_ms_still_covers_everything_the_hook_spends(region, boot,
+                                                           tmp_path,
+                                                           no_active_leg,
+                                                           chunked, monkeypatch):
+    """S6: the deposit's slot writes are INSIDE the graded wall, not beside it.
+
+    ``shadow_ms`` is measured from the first statement of ``run_leg_hook`` to
+    its ``finally``, so a leg that now COPIES where it used to WAIT reports the
+    same field with different physics rather than a shorter wall and a hidden
+    cost.  ``budget=ok|OVER`` keeps grading ``shadow_ms + derive_ms`` against
+    the hook budget, which is the one place the user law is readable.
+    """
+    _host_arm(monkeypatch)
+    plan, why = _derive("source", rank=0, group="P")
+    assert plan is not None, why
+    xr.create_semaphores(boot)
+    sems = tp.SemSet(boot)
+    ops = FakeDeviceOps(str(tmp_path / "sm"), rank=0)
+    subset = sh.select_subset(plan.descs, leg=0, classes=plan.classes)
+    _vote_rows(region, [1, 2], leg=0, vote=True, classes_hash=subset.hash,
+               need_mib=0, plan_digest=plan.facts.digest)
+    try:
+        lines = []
+        real = tp.run_leg
+
+        def slow(*a, **k):
+            time.sleep(0.05)
+            return tp.LegResult()
+
+        tp.run_leg = slow
+        try:
+            result = sh.run_leg_hook(
+                _inputs(sh.HOOK_SOURCE, row=0, peer_row=3, gate_rows=(0, 1, 2),
+                        oncard_drainable=False,
+                        host_bounce_budget_bytes=_ledger_budget()),
+                log=lines.append, plan=plan, region=region, sems=sems, ops=ops,
+                armed=True, gate_budget_s=2.0, hook_budget_s=5.0,
+                slot_bytes=SLOT, oncard_slot_bytes=DEPOSIT_SLOT)
+        finally:
+            tp.run_leg = real
+    finally:
+        ops.close()
+        sems.close()
+        xr.unlink_semaphores(boot)
+    assert result.shadow_ms >= 50.0, result.line()
+    assert "budget=ok" in result.line(), result.line()
+    assert "hook_budget_ms=5000.000" in result.line(), result.line()
+
+
+def test_the_two_budget_lines_keep_their_shape_under_the_deposit(region, boot,
+                                                                 tmp_path,
+                                                                 no_active_leg,
+                                                                 chunked):
+    """S6: the host term does NOT get a second bookkeeping beside the VRAM one.
+
+    ``ShadowPrice`` is a VRAM affordability object with a VRAM verdict, and the
+    host bound lives in ``host_ledger``.  Giving this line a host column and a
+    second verdict would be the Zweitbuchhaltung UPSTREAM-MINIMAL refuses --
+    two places that can disagree about one number.  So both budget lines keep
+    exactly the fields they had, and the deposit is priced where host bytes are
+    priced.
+    """
+    plan, why = _derive("source", rank=0, group="P")
+    assert plan is not None, why
+    xr.create_semaphores(boot)
+    sems = tp.SemSet(boot)
+    ops = FakeDeviceOps(str(tmp_path / "bl"), rank=0)
+    subset = sh.select_subset(plan.descs, leg=0, classes=plan.classes)
+    _vote_rows(region, [1, 2], leg=0, vote=True, classes_hash=subset.hash,
+               need_mib=0, plan_digest=plan.facts.digest)
+    try:
+        lines = []
+        real = tp.run_leg
+        tp.run_leg = lambda *a, **k: tp.LegResult()  # noqa: E731
+        try:
+            sh.run_leg_hook(
+                _inputs(sh.HOOK_SOURCE, row=0, peer_row=3, gate_rows=(0, 1, 2),
+                        oncard_drainable=False,
+                        host_bounce_budget_bytes=_ledger_budget()),
+                log=lines.append, plan=plan, region=region, sems=sems, ops=ops,
+                armed=True, gate_budget_s=2.0, hook_budget_s=5.0,
+                slot_bytes=SLOT, oncard_slot_bytes=DEPOSIT_SLOT)
+        finally:
+            tp.run_leg = real
+    finally:
+        ops.close()
+        sems.close()
+        xr.unlink_semaphores(boot)
+    budget = [ln for ln in lines if ln.startswith(sh.SHADOW_BUDGET_LINE_PREFIX)]
+    assert len(budget) == 2, budget
+    assert "scope=full" in budget[0] and "graded=no" in budget[0], budget
+    assert "scope=subset" in budget[1] and "graded=yes" in budget[1], budget
+    fields = lambda ln: sorted(t.split("=")[0] for t in ln.split() if "=" in t)  # noqa: E731
+    assert fields(budget[0]) == fields(budget[1]), budget
+    assert not any("host" in f for f in fields(budget[0])), fields(budget[0])
+
+
+def test_a_deposit_with_more_batches_than_slots_is_refused_by_name(
+        region, boot, tmp_path, monkeypatch, no_active_leg, chunked):
+    """S6 W65: the second refusal arm, at a slot the row area cannot cover.
+
+    Pinning ``oncard_slot_bytes`` to this file's 4 KiB cross slot makes this
+    fixture's diagonal 48 batches -- six times ``ONCARD_SLOTS_MAX``, which
+    sizes the handshake row area ONCE for both processes.  One slot per batch
+    is impossible there, and a clamp to 8 would be the silent overwrite the
+    deposit exists to forbid, so the leg refuses by name with the two numbers
+    on the line.
+    """
+    _host_arm(monkeypatch)
+    plan, why = _derive("source", rank=0, group="P")
+    assert plan is not None, why
+    xr.create_semaphores(boot)
+    sems = tp.SemSet(boot)
+    ops = FakeDeviceOps(str(tmp_path / "ov"), rank=0)
+    subset = sh.select_subset(plan.descs, leg=0, classes=plan.classes)
+    _vote_rows(region, [1, 2], leg=0, vote=True, classes_hash=subset.hash,
+               need_mib=0, plan_digest=plan.facts.digest)
+    entered = []
+    try:
+        lines = []
+        real = tp.run_leg
+        tp.run_leg = lambda *a, **k: entered.append(1)  # noqa: E731
+        try:
+            result = sh.run_leg_hook(
+                _inputs(sh.HOOK_SOURCE, row=0, peer_row=3, gate_rows=(0, 1, 2),
+                        oncard_drainable=False,
+                        host_bounce_budget_bytes=_ledger_budget()),
+                log=lines.append, plan=plan, region=region, sems=sems, ops=ops,
+                armed=True, gate_budget_s=2.0, hook_budget_s=5.0,
+                slot_bytes=SLOT, oncard_slot_bytes=SLOT)
+        finally:
+            tp.run_leg = real
+    finally:
+        ops.close()
+        sems.close()
+        xr.unlink_semaphores(boot)
+    assert entered == [], "a deposit that cannot fit must not reach the transport"
+    assert result.reason == "deposit-unfundable", result.line()
+    refusal = [ln for ln in lines if ln.startswith("W65 Weg2XchgDepositUnfundable")]
+    assert len(refusal) == 1, lines
+    assert f"reason={tp.DEPOSIT_REASON_BATCHES}" in refusal[0], refusal[0]
+    assert f"slots_max={tp.ONCARD_SLOTS_MAX}" in refusal[0], refusal[0]
+    batches = sh.oncard_lane_batches(subset.descs, 0, SLOT)
+    assert batches > tp.ONCARD_SLOTS_MAX, batches
+    assert f"oncard_batches={batches}" in refusal[0], (batches, refusal[0])
+    # ... and the same diagonal at a slot the row area CAN cover does fit,
+    # which is what makes this a refusal about the shape and not about the lane.
+    assert sh.oncard_lane_batches(subset.descs, 0, DEPOSIT_SLOT) \
+        <= tp.ONCARD_SLOTS_MAX

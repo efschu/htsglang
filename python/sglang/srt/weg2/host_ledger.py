@@ -932,8 +932,47 @@ def resolve_image_terms(record: Optional[Dict[str, dict]] = None) -> ImageTerms:
     )
 
 
+def xchg_bounce_bytes_per_card(slots: Optional[int] = None,
+                               slot_bytes: Optional[int] = None) -> int:
+    """ONE card's store-and-forward deposit on the host, in bytes (#1273 S6).
+
+    THE EXCHANGE'S OWN CARRIER, PRICED.  The on-card lane's ``host`` arm keeps
+    its bounce in ``/dev/shm`` (``oncard_host_path``), ``cudaHostRegister``ed,
+    and S6 sizes it ``slots >= batches`` so the source can deposit and return
+    without a live consumer.  Those are pinned, non-reclaimable bytes that land
+    directly on ``memory.current`` for the span of a flip, and until this
+    function existed they appeared in NO ledger term -- the omission is named
+    verbatim in ``oncard_host_path``'s own docstring ("192 MiB of host that
+    spec 0.2's ledger term does NOT carry ... the number belongs in the
+    record").
+
+    ``kv-1m-kein-lossy-kein-hostram`` is about KV and does not reach here: this
+    is the exchange's own carrier for the span of one flip, not hot KV parked
+    in host RAM.  What DOES reach here is ``host-schwelle-nie-uebertreten`` --
+    which is exactly why the bytes become a TERM (so the reap bound sees them
+    and the store shrinks by them) instead of a note.
+
+    THE GEOMETRY IS READ FROM ITS OWNER, never re-spelled: a second copy of
+    ``ONCARD_SLOTS_MAX x ONCARD_SLOT_BYTES`` here is the Zweitbuchhaltung that
+    lets the charge and the deposit drift apart by one edit.  The worst case is
+    charged, not the case a particular flip happens to derive, because the arm
+    is chosen once at launch and the derivation runs per leg -- a charge that
+    tracked the derivation would fund the smallest flip and refuse none.
+    """
+    from sglang.srt.weg2 import weight_exchange_transport as tp
+
+    return (int(tp.ONCARD_SLOTS_MAX if slots is None else slots)
+            * int(tp.ONCARD_SLOT_BYTES if slot_bytes is None else slot_bytes))
+
+
+def xchg_bounce_bytes(cards: int = 3) -> int:
+    """Every card's deposit -- the term :func:`charge_terms` carries."""
+    return max(0, int(cards)) * xchg_bounce_bytes_per_card()
+
+
 def charge_terms(
-    s_gb: int, m_mib: int, ranks_per_group: int, images: ImageTerms
+    s_gb: int, m_mib: int, ranks_per_group: int, images: ImageTerms,
+    xchg_bounce_host_bytes: int = 0,
 ) -> Dict[str, float]:
     """Everything the BOOT ITSELF adds to ``memory.current``, per term.
 
@@ -945,6 +984,16 @@ def charge_terms(
     The image terms are NOT in here: which image is resident is a property of
     the MOMENT (launch charges P's, the run moment charges the dormant one),
     not of the arm.
+
+    ``xchg_bounce_host_bytes`` IS AN ARM PROPERTY and therefore is (#1273 S6):
+    it is 0 on ``--weg2-weight-source ring`` -- the default and every boot that
+    has run -- and :func:`xchg_bounce_bytes` on the arms that create the file.
+    The KEY IS ALWAYS PRESENT, value 0.0 when unarmed, because the three
+    consumers of this dict must not be able to disagree about whether a term
+    exists; an unarmed boot prints ``xchg_bounce=0.00`` and says so rather than
+    leaving a reader to wonder whether it was priced.  The parameter is
+    deliberately NOT named after the module function that produces the value:
+    :func:`price`'s own fix-8 note records what a shadowed name costs.
     """
     anchors_gib = (ANCHORS_AT_2400_BYTES * (m_mib / ANCHORS_REFERENCE_M_MIB)) / GIB
     rings_gib = (RING_P_MULT_GB_PER_S + RING_D_MULT_GB_PER_S) * s_gb * GB / GIB
@@ -961,6 +1010,7 @@ def charge_terms(
         "weight_tags_d_gib": WEIGHT_TAGS_D_BYTES / GIB,
         "image_extra_p_gib": images.extra_p_gib,
         "image_extra_d_gib": images.extra_d_gib,
+        "xchg_bounce_gib": max(0, int(xchg_bounce_host_bytes)) / GIB,
     }
 
 
@@ -969,6 +1019,11 @@ def _boot_charges_gib(terms: Dict[str, float]) -> float:
     return (
         terms["heaps_gib"] + terms["anchors_gib"] + terms["rings_gib"]
         + terms["overhead_gib"] + terms["draft_host_p_gib"] + terms["draft_host_d_gib"]
+        # #1273 S6: 0.00 on every ring-arm boot, so every existing number is
+        # unchanged; on an armed boot it is charged at BOTH moments, which is
+        # what makes `size_store_gib`'s leftover -- and therefore the store --
+        # shrink by exactly the deposit rather than by a note in a docstring.
+        + terms["xchg_bounce_gib"]
     )
 
 
@@ -1345,6 +1400,7 @@ def price(
     reclaimable_bytes: Optional[int] = None,
     cg_ceiling_bytes: Optional[int] = None,
     measured_record: Optional[Dict[str, dict]] = None,
+    xchg_bounce_host_bytes: int = 0,
 ) -> Arm:
     """Price one arm at both moments.  Pure.
 
@@ -1385,6 +1441,12 @@ def price(
     images and run-moment residuals (:func:`read_measured_record`).  ``None``
     prices the named dk7 reading for P and a BOUND for D, and says which is
     which -- see :func:`resolve_image_terms`.
+
+    ``xchg_bounce_host_bytes`` is #1273 S6: the weight exchange's own pinned
+    host carrier (:func:`xchg_bounce_bytes`), 0 on the ring arm and therefore
+    on every boot that has run to date.  It is charged like any other term --
+    the flip transient's absence above is about the RING and says nothing about
+    a carrier the ring never had.
     """
     if s_gb < 1 or m_mib < 1:
         raise ValueError(f"arm terms must be >= 1: S={s_gb} M={m_mib}")
@@ -1453,7 +1515,8 @@ def price(
     # across the flip).  It is NOT part of the flip image -- the ring carries
     # the weights, this carries the draft pages, never the same bytes.
     images = resolve_image_terms(measured_record)
-    charges = charge_terms(s_gb, m_mib, ranks_per_group, images)
+    charges = charge_terms(s_gb, m_mib, ranks_per_group, images,
+                           xchg_bounce_host_bytes=xchg_bounce_host_bytes)
     heaps_gib = charges["heaps_gib"]
     anchors_gib = charges["anchors_gib"]
     rings_gib = charges["rings_gib"]
@@ -1534,6 +1597,11 @@ def price(
         "overhead_gib": overhead_gib,
         "draft_host_p_gib": draft_host_p_gib,
         "draft_host_d_gib": draft_host_d_gib,
+        # #1273 S6.  THE KEY IS ALWAYS HERE, 0.0 on the ring arm, because
+        # ``_boot_charges_gib`` indexes it and ``predicted_run_peak_gib`` sums
+        # that -- a key that can be absent is how the three consumers this
+        # dict exists to reconcile would start disagreeing again.
+        "xchg_bounce_gib": charges["xchg_bounce_gib"],
         "store_draft_fraction": STORE_DRAFT_FRACTION,
     }
     arm.launch_leftover_gib = launch
@@ -1987,6 +2055,7 @@ def choose(
     cg_oom_kill: Optional[int] = None,
     measured_record: Optional[Dict[str, dict]] = None,
     margin: Optional[Margin] = None,
+    xchg_bounce_host_bytes: int = 0,
 ) -> Tuple[Arm, float, List[str]]:
     """Walk the ladder; return (arm, store_gib, printed lines) or raise W20/W21.
 
@@ -2031,6 +2100,7 @@ def choose(
             reclaimable_bytes=reclaimable_bytes,
             cg_ceiling_bytes=cg_ceiling_bytes,
             measured_record=measured_record,
+            xchg_bounce_host_bytes=xchg_bounce_host_bytes,
         )
         for s, m in arms
     ]
@@ -2151,7 +2221,13 @@ def choose(
         lines.append(
             f"WEG2-HOST-LEDGER ARM S={arm.s_gb} M={arm.m_mib}: "
             f"anchors={arm.terms['anchors_gib']:.2f} rings={arm.terms['rings_gib']:.2f} "
-            f"overhead={arm.terms['overhead_gib']:.2f} -> "
+            f"overhead={arm.terms['overhead_gib']:.2f} "
+            # #1273 S6: THE EXCHANGE'S PINNED HOST CARRIER, NAMED ON THE ARM
+            # LINE.  0.00 on the ring arm -- an unarmed boot says the term was
+            # priced at zero instead of leaving a reader to ask whether it was
+            # priced at all -- and `slots x slot_bytes x cards` of /dev/shm on
+            # the arms that create the file, charged at both moments.
+            f"xchg_bounce={arm.terms['xchg_bounce_gib']:.2f} -> "
             f"leftover launch={arm.launch_leftover_gib:.2f} GiB "
             f"run={arm.run_leftover_gib:.2f} GiB store={run_store:.0f} GiB "
             f"(leftover {sizing.leftover_gib:.2f}, reap-bound "
