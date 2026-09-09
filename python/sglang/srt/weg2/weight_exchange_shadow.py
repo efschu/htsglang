@@ -1808,6 +1808,7 @@ def run_leg_hook(
     slot_bytes: int = xr.SLOT_BYTES,
     stripe_bytes: int = STRIPE_BYTES,
     budget_s: float = SHADOW_TRANSPORT_BUDGET_S,
+    oncard_slot_bytes: Optional[int] = None,
 ) -> Optional[ShadowResult]:
     """ONE leg's shadow, start to close.  Returns ``None`` when not armed.
 
@@ -1887,8 +1888,14 @@ def run_leg_hook(
         # Recomputing ``batches x per_batch_ms`` here would be a second copy of
         # a formula that already has one producer -- and the previous cut of
         # this line did exactly that and divided by the PLAN OBJECT.
-        lane = tp.plan_oncard_slot_bytes(
-            oncard_lane_bytes(subset.descs, inputs.rank))
+        # A PINNED slot is pinned through the SAME producer (floor == ceiling),
+        # so the batch count and the hop stay its arithmetic and not ours.
+        lane_bytes = oncard_lane_bytes(subset.descs, inputs.rank)
+        lane = (tp.plan_oncard_slot_bytes(lane_bytes)
+                if oncard_slot_bytes is None
+                else tp.plan_oncard_slot_bytes(
+                    lane_bytes, floor_bytes=int(oncard_slot_bytes),
+                    ceiling_bytes=int(oncard_slot_bytes)))
         diag_slot = int(lane.slot_bytes)
         batches = int(lane.batches)
         priced_ms = float(lane.hop_ms)
@@ -1916,7 +1923,13 @@ def run_leg_hook(
             sum_bytes=sum_bytes, classes=classes, per_leg=per_leg,
             resume_reserve_bytes=inputs.resume_reserve_bytes,
             explicit=explicit, slot_bytes=slot_bytes,
-            stripe_bytes=stripe_bytes, budget_s=budget_s)
+            stripe_bytes=stripe_bytes, budget_s=budget_s,
+            # ONE NUMBER FOR THE DIAGONAL SLOT.  The hook already priced the hop
+            # from it; letting ``shadow_transport`` derive it a second time is
+            # two computations of one quantity, and the W52 cross-check between
+            # the two co-located processes would then be comparing two
+            # derivations rather than two readings of the same one.
+            oncard_slot_bytes=diag_slot)
         leg.run = run
         result = run.result
         result.ring_ms = inputs.ring_ms
