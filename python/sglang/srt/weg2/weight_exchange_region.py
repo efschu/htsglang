@@ -70,11 +70,16 @@ failure of a predecessor mechanism rather than a precaution:
   ``bytes_filled`` is written by the producer *after* its own
   ``cudaStreamSynchronize`` and is the only quantity a consumer may copy.
   This module owns the field and its state machine; S4 owns the copy that
-  reads it (W54).
+  reads it (W70).
 
-THE TWO W-CODES ALLOCATED HERE are W52 and W53 (spec section 7).  Both were
+THE TWO W-CODES ALLOCATED HERE are W68 and W69 (spec section 7).  Both were
 free at the tree of record: the census ``test_weg2_wcode_uniqueness_1263.py``
 performs over its own ROOTS returns W50 as the highest assigned code.
+
+RENUMBERED BY THE serve-next5 REPLAY (2026-09-09): W53/W54 here became W68/W69
+with the other fourteen, because the serve line had claimed W51-W66 while this
+branch was cut.  The W50 maximum quoted above is this branch's OWN base; the
+merged maximum is W66 and W67-W82 are what the enumeration returns on it.
 
 LAYOUT (spec S3, with the deviations stated where they occur)::
 
@@ -253,7 +258,7 @@ HOOK_MODE_NAMES = {
 
 
 class Weg2XchgPlanDisagree(RuntimeError):
-    """W52: two things that must agree about this exchange do not.
+    """W68: two things that must agree about this exchange do not.
 
     Raised on EVERY reader, never only on the rank that happens to notice --
     #802's rule is that the disagreement is a property of the pair, so both
@@ -262,7 +267,7 @@ class Weg2XchgPlanDisagree(RuntimeError):
     nobody can start from.
 
     **DEVIATION, stated: this code is used more widely than spec section 7's
-    row for it.**  Section 7 assigns W52 to Gate 0 (asymmetric matrix, a
+    row for it.**  Section 7 assigns W68 to Gate 0 (asymmetric matrix, a
     per-tag total != ``tms_tag_bytes``, a plan hash != the front's).  It is
     also raised here for every OTHER disagreement about the shared object
     itself: a file that is not an exchange region, a region built by a
@@ -272,14 +277,14 @@ class Weg2XchgPlanDisagree(RuntimeError):
     ``bytes_filled`` beyond the slot's capacity.  The alternative would be
     four more codes for one sentence each; the reason they are one code is
     that every one of them means *the two sides do not agree about what this
-    region is*, which is the same refusal one layer down.  W54
+    region is*, which is the same refusal one layer down.  W70
     ``Weg2XchgShortPiece`` is NOT taken here: it is the CONSUMER's per-piece
     check and belongs to S4.
     """
 
 
 class Weg2XchgGateTimeout(RuntimeError):
-    """W53: a rank did not join a gate, or joined it and then died.
+    """W69: a rank did not join a gate, or joined it and then died.
 
     Names every non-joiner by group, rank, row, pid, the wave it was last
     seen at, the wave it was needed at, and whether its pid is still in
@@ -578,7 +583,7 @@ class XchgRegion:
             fd = os.open(target, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
         except FileExistsError:
             raise Weg2XchgPlanDisagree(
-                f"W52 Weg2XchgPlanDisagree create path={target}: a region for boot "
+                f"W68 Weg2XchgPlanDisagree create path={target}: a region for boot "
                 f"{boot_nonce!r} already exists.  Creating it again would re-zero a "
                 f"live boot's gate rows, matrix rows and slots and report success -- "
                 f"the launcher's shm residue sweep owns removing a dead boot's region, "
@@ -633,7 +638,7 @@ class XchgRegion:
             mm.close()
             os.close(fd)
             return Weg2XchgPlanDisagree(
-                f"W52 Weg2XchgPlanDisagree path={path}: {why}"
+                f"W68 Weg2XchgPlanDisagree path={path}: {why}"
             )
 
         f = HEADER_STRUCT.unpack_from(mm, HEADER_OFF)
@@ -719,13 +724,13 @@ class XchgRegion:
         boot, index = split_flip_epoch(flip_epoch)
         if boot != self.boot_nonce:
             raise Weg2XchgPlanDisagree(
-                f"W52 Weg2XchgPlanDisagree begin_flip epoch={flip_epoch!r}: its boot "
+                f"W68 Weg2XchgPlanDisagree begin_flip epoch={flip_epoch!r}: its boot "
                 f"nonce {boot!r} is not this region's {self.boot_nonce!r} -- a flip of "
                 f"another boot can never be run on this region"
             )
         if index <= self.flip_index:
             raise Weg2XchgPlanDisagree(
-                f"W52 Weg2XchgPlanDisagree begin_flip epoch={flip_epoch!r}: flip index "
+                f"W68 Weg2XchgPlanDisagree begin_flip epoch={flip_epoch!r}: flip index "
                 f"{index} does not advance past {self.flip_index}, which this view has "
                 f"already run -- a flip is entered once, and re-entering an old one "
                 f"would re-adopt its rows as this flip's joins"
@@ -785,7 +790,7 @@ class XchgRegion:
     def _require_flip(self, what: str) -> None:
         if not self.epoch_hash:
             raise Weg2XchgPlanDisagree(
-                f"W52 Weg2XchgPlanDisagree {what}: no flip is bound to this view. "
+                f"W68 Weg2XchgPlanDisagree {what}: no flip is bound to this view. "
                 f"XchgRegion.begin_flip('<boot>.<flip>') stamps the gate rows, matrix "
                 f"rows and slots; writing them with the boot's own identity would let "
                 f"the previous flip's rows count as this flip's joins"
@@ -994,14 +999,14 @@ class XchgRegion:
         if rec.state != SLOT_FILLING or rec.epoch_hash != self.epoch_hash:
             raise self._refuse(
                 Weg2XchgPlanDisagree,
-                f"W52 Weg2XchgPlanDisagree publish pair={pair} slot={slot}: the slot is "
+                f"W68 Weg2XchgPlanDisagree publish pair={pair} slot={slot}: the slot is "
                 f"{rec.state_name} at epoch_hash={rec.epoch_hash:#x}, expected FILLING at "
                 f"{self.epoch_hash:#x} -- a publish onto a slot this flip never claimed",
             )
         if int(bytes_filled) > SLOT_BYTES:
             raise self._refuse(
                 Weg2XchgPlanDisagree,
-                f"W52 Weg2XchgPlanDisagree publish pair={pair} slot={slot}: "
+                f"W68 Weg2XchgPlanDisagree publish pair={pair} slot={slot}: "
                 f"bytes_filled={bytes_filled} exceeds slot_bytes={SLOT_BYTES}",
             )
         rec.bytes_filled = int(bytes_filled)
@@ -1032,7 +1037,7 @@ class XchgRegion:
           is returned.  This is ``host_ring.cpp:285-291``'s rule ported to
           slots: a previous boot's or a previous flip's leftovers are never
           read as this flip's funding.
-        * **FILLING at this epoch whose producer is gone from /proc** -> W53.
+        * **FILLING at this epoch whose producer is gone from /proc** -> W69.
           Nobody will ever post this slot, and a bounded wait that ends in a
           timeout would name the wait rather than the death.
         """
@@ -1047,7 +1052,7 @@ class XchgRegion:
             if not _pid_alive(rec.producer_pid, proc_root):
                 raise self._refuse(
                     Weg2XchgGateTimeout,
-                    f"W53 Weg2XchgGateTimeout slot pair={pair} slot={slot} state=FILLING "
+                    f"W69 Weg2XchgGateTimeout slot pair={pair} slot={slot} state=FILLING "
                     f"epoch={self.epoch} producer_pid={rec.producer_pid} "
                     f"alive_in_proc=no seq={rec.seq} bytes_filled={rec.bytes_filled} -- the "
                     f"producer died mid-fill; these bytes will never be posted",
@@ -1238,7 +1243,7 @@ def _matrix_wait(region: XchgRegion, budget: float, poll_s: float,
             ]
             raise region._refuse(
                 Weg2XchgGateTimeout,
-                f"W53 Weg2XchgGateTimeout gate=0 epoch={region.epoch} "
+                f"W69 Weg2XchgGateTimeout gate=0 epoch={region.epoch} "
                 f"published={len(published)}/{N_RANKS} budget_s={budget} "
                 f"waited_s={monotonic() - started:.3f} non-publishers: {' '.join(missing)} "
                 f"(denominator: the six SEALED matrix rows carrying epoch_hash="
@@ -1260,7 +1265,7 @@ def gate0_check(
     poll_s: float = GATE_POLL_S,
     monotonic: Callable[[], float] = time.monotonic,
 ) -> Dict[str, object]:
-    """Check all 36 cells, every plan hash and every rank's verdict.  W52 on any gap.
+    """Check all 36 cells, every plan hash and every rank's verdict.  W68 on any gap.
 
     Runs in the RPC preamble, **before any `resume` and before any `pause`**
     (spec section 3.3), so a refusal here costs nothing: neither side has
@@ -1306,7 +1311,7 @@ def gate0_check(
     if not have_census and not census_unavailable_reason:
         raise region._refuse(
             Weg2XchgPlanDisagree,
-            f"W52 Weg2XchgPlanDisagree gate=0 epoch={region.epoch} reader_row={row}: "
+            f"W68 Weg2XchgPlanDisagree gate=0 epoch={region.epoch} reader_row={row}: "
             f"tag_totals/tms_tag_bytes were not supplied and no "
             f"census_unavailable_reason was declared.  The 36-cell and plan-hash "
             f"checks compare the ranks against each other, so the C++ census is Gate "
@@ -1333,7 +1338,7 @@ def gate0_check(
     if not (own.sealed and own.epoch_hash == region.epoch_hash):
         raise region._refuse(
             Weg2XchgPlanDisagree,
-            f"W52 Weg2XchgPlanDisagree gate=0 epoch={region.epoch} reader_row={row}: "
+            f"W68 Weg2XchgPlanDisagree gate=0 epoch={region.epoch} reader_row={row}: "
             f"this rank has not published its own matrix row for this flip "
             f"(sealed={own.sealed} epoch_hash={own.epoch_hash:#x}) -- gate0_publish "
             f"comes first, and a rank that checks a gate it never joined is the "
@@ -1399,7 +1404,7 @@ def gate0_check(
     if mismatches:
         raise region._refuse(
             Weg2XchgPlanDisagree,
-            f"W52 Weg2XchgPlanDisagree gate=0 epoch={region.epoch} "
+            f"W68 Weg2XchgPlanDisagree gate=0 epoch={region.epoch} "
             f"reader_row={row} cells=36 verdicts={sum(1 for r in rows if r.local_ok)}/"
             f"{N_RANKS} tags={tags_checked if have_census else 'skipped'} "
             f"mismatches={len(mismatches)}: {' '.join(mismatches)} -- no byte has moved",
@@ -1451,7 +1456,7 @@ def wave_gate(
     poll_s: float = GATE_POLL_S,
     monotonic: Callable[[], float] = time.monotonic,
 ) -> Dict[str, object]:
-    """Close wave ``wave`` across all six ranks, or raise W53 naming who did not.
+    """Close wave ``wave`` across all six ranks, or raise W69 naming who did not.
 
     Spec section 1.3 step 17: each rank writes its own row **after its last
     ``cudaStreamSynchronize``** -- that sync is a syscall, so the payload is
@@ -1469,7 +1474,7 @@ def wave_gate(
     Without that, a rank that wrote its row and then died (OOM, a raise after
     the store) leaves a permanent phantom join: every later gate closes 6/6
     without it, and after gate 1 the source has already unmapped, so the flip
-    is committed to the W57 roll-forward by a gate that reported PASS.
+    is committed to the W73 roll-forward by a gate that reported PASS.
 
     ``log`` is REQUIRED, not defaulted: this line is S3's second acceptance
     criterion, and a default of ``None`` would let a caller silently keep it
@@ -1489,7 +1494,7 @@ def wave_gate(
         # instead of at the fence budget.
         note = region.vote_failure_note()
         return Weg2XchgGateTimeout(
-            f"W53 Weg2XchgGateTimeout epoch={region.epoch} wave={wave} "
+            f"W69 Weg2XchgGateTimeout epoch={region.epoch} wave={wave} "
             f"joined={len(joined)}/{N_RANKS} ok={len(voted_ok)}/{N_RANKS} "
             f"budget_s={budget} waited_s={monotonic() - started:.3f} "
             f"{headline}: {_describe(rows, which, want_seq, proc_root)} "

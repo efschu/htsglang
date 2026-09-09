@@ -436,14 +436,14 @@ def _round_trip(region, sems, ops, descs, *, pair, slot_bytes=SLOT,
 
 
 def test_short_piece_is_refused_by_the_consumer(region, sems, ops):
-    """The producer posts ``bytes_filled = plan - 1``; the consumer raises W54
+    """The producer posts ``bytes_filled = plan - 1``; the consumer raises W70
     and issues NO copy.
 
     This is #802's physical root, which #802 itself explicitly did not close.
     The two halves of the assertion carry equal weight: the NAME must be in the
     message so a grep over a boot log finds it, and ``ops.issued`` must not
     move, so the refusal is PROVEN to precede the copy rather than to follow
-    it.  A W54 raised after the copy is a log line, not a guard.
+    it.  A W70 raised after the copy is a log line, not a guard.
     """
     pair = xr.pair_id(0, 1)
     payload = pattern(3, 600)
@@ -475,7 +475,7 @@ def test_short_piece_is_refused_by_the_consumer(region, sems, ops):
     assert f"bytes_filled={batch.total_bytes - 1}" in message
     assert "short_by=1" in message
     assert "lane=cross" in message
-    assert ops.issued == before, "W54 must precede the first copy, not follow it"
+    assert ops.issued == before, "W70 must precede the first copy, not follow it"
     assert read(ops, dst, len(payload)) != payload
 
 
@@ -562,7 +562,7 @@ def test_consumer_never_reads_an_unposted_slot(region, sems, ops):
         tp.run_consumer_pair(region, sems, ops, ops.create_stream(0),
                              pair=pair, descs=descs, stats=stats,
                              budget_s=0.25, slot_bytes=SLOT)
-    assert "W53 Weg2XchgGateTimeout" in str(excinfo.value)
+    assert "W69 Weg2XchgGateTimeout" in str(excinfo.value)
     assert "kind=full" in str(excinfo.value)
     assert time.monotonic() - started >= 0.2, "it must actually have waited"
     assert ops.issued == before
@@ -637,7 +637,7 @@ def test_stream_is_not_nonblocking():
 
 
 def test_oncard_lane_falls_back_by_name(tmp_path):
-    """A failing ``cudaIpcOpenMemHandle`` arms **W56** at LAUNCH and the lane
+    """A failing ``cudaIpcOpenMemHandle`` arms **W72** at LAUNCH and the lane
     degrades with a named line that says WHERE TO.
 
     MEASURED-BY-REVIEW DEFECT (S4 review, 2026-09-09, must_fix): the line said
@@ -722,7 +722,7 @@ def test_oncard_lane_falls_back_by_name(tmp_path):
     assert "OSError" in raised[0]
 
     # AN EXPLICIT `ipc` WHOSE PROBE FAILS IS A REFUSAL, and it is the only
-    # runtime use the W56 CLASS has.  Degrading here would run a boot whose
+    # runtime use the W72 CLASS has.  Degrading here would run a boot whose
     # operator believes the lane is on, and every wall claim that followed
     # would be about a lane that is not there.  A refusal that is only ever a
     # string is a refusal nobody can catch.
@@ -740,11 +740,11 @@ def test_oncard_lane_falls_back_by_name(tmp_path):
 
 
 def test_the_degraded_lane_really_moves_the_bytes(tmp_path, region):
-    """W56 names a degrade; the degrade has to work.
+    """W72 names a degrade; the degrade has to work.
 
     A named fallback that was never executed is the
     desk-written-never-executed class.  The ``host`` arm runs the same batcher,
-    the same rows and the same W54 comparison over a per-card shm bounce
+    the same rows and the same W70 comparison over a per-card shm bounce
     instead of an IPC one.
     """
     prod = FakeDeviceOps(str(tmp_path / "d"), rank=0)
@@ -767,7 +767,7 @@ def test_the_degraded_lane_really_moves_the_bytes(tmp_path, region):
                                      os.path.dirname(region.path)))
         assert c_bounce.ptr != p_bounce.ptr, "two mappings, two addresses"
         # The degrade's host cost is a REAL file of a size this test can read,
-        # and it scales exactly as the W56 line's `host_add_mib` claims.
+        # and it scales exactly as the W72 line's `host_add_mib` claims.
         assert os.path.getsize(p_bounce.path) == tp.ONCARD_SLOTS * SLOT
         assert p_bounce.path.endswith("oncard-0.bin"), p_bounce.path
         assert tp.ONCARD_HOST_DEGRADE_MIB * xr.MIB == \
@@ -963,7 +963,7 @@ def test_batches_are_the_same_whether_the_side_coalesced_or_not():
     stream, so both must yield identical sequence numbers, identical
     ``total_bytes``, and the same bytes at the same slot offsets.
 
-    If this were false, EVERY boot would fire W54 and the refusal would be
+    If this were false, EVERY boot would fire W70 and the refusal would be
     about the plan builder rather than about a defect -- which is the worst
     kind of guard, one that cries wolf on the healthy path.
     """
@@ -1008,7 +1008,7 @@ def test_a_run_that_cannot_fit_a_slot_is_refused_before_any_copy():
                         dst_ptr=dev_ptr(1, 0))
     with pytest.raises(xr.Weg2XchgPlanDisagree) as excinfo:
         tp.batch_descs([desc], SLOT)
-    assert "W52 Weg2XchgPlanDisagree" in str(excinfo.value)
+    assert "W68 Weg2XchgPlanDisagree" in str(excinfo.value)
     assert "run_bytes" in str(excinfo.value)
 
 
@@ -1023,7 +1023,7 @@ def test_a_batch_never_exceeds_the_slot_it_will_be_written_into():
     """The one arithmetic invariant the whole handshake rests on.
 
     ``publish`` refuses a ``bytes_filled`` over ``SLOT_BYTES``, so a batcher
-    that over-packed would turn every flip into a W52 -- but only after the
+    that over-packed would turn every flip into a W68 -- but only after the
     producer had already issued the copies past the end of the slot, into the
     NEXT pair's slot.  The check belongs before the bytes move.
     """
@@ -1108,7 +1108,7 @@ def test_oncard_two_hops_land_the_bytes_and_the_handle_survives(region, tmp_path
 
 
 def test_oncard_consumer_refuses_a_short_hop(region, tmp_path):
-    """W54 on the diagonal too -- one refusal, both lanes.
+    """W70 on the diagonal too -- one refusal, both lanes.
 
     The on-card lane has no semaphore (the diagonal is absent from
     ``CROSS_PAIRS``), so it would have been easy to give it its own weaker
@@ -1170,7 +1170,7 @@ def test_a_second_batch_does_not_overwrite_the_first_batchs_row(region):
 
     With ONE row per rank, the producer's batch 1 overwrote batch 0's ``bytes``
     before the consumer read it, and the consumer -- which waits for a
-    sequence and then compares byte counts -- raised W54 against a producer
+    sequence and then compares byte counts -- raised W70 against a producer
     that had done nothing wrong (``expected_bytes=4096 bytes_filled=1904``:
     batch 1's number answering batch 0's question).  Two halves, and the second
     is the one that makes the first safe:
@@ -1260,7 +1260,7 @@ def test_an_armed_row_is_the_handle_signal_and_not_a_batch(region):
     Folding the two would make batch 0's wait also the handle's wait, and the
     consumer would then open a buffer it had never been told was there --
     or, worse, treat the arming row as a filled batch of zero bytes and raise
-    W54 against a producer that had done nothing wrong.
+    W70 against a producer that had done nothing wrong.
     """
     tp.write_oncard_row(region, tp.DIR_ONCARD_PROD_OFF, 0, seq=-1, nbytes=0,
                         slot_bytes=SLOT, wave=WAVE,
@@ -1468,7 +1468,7 @@ def test_a_previous_waves_oncard_row_is_not_this_waves_signal(region):
       so wave 2's ``>=`` returns instantly and the producer refills a slot
       nobody has drained -- a silent overwrite on every multi-wave flip.
     * FILL, reachable whenever a wave's on-card share is two batches or fewer:
-      the stale row matches EXACTLY and either raises W54 against a healthy
+      the stale row matches EXACTLY and either raises W70 against a healthy
       producer or copies out of an unfilled bounce.
     * HANDLE: waves 2 and 3 never wait for the new handle at all and read
       wave 1's 64 bytes -- of a buffer the previous wave has already freed.
@@ -1578,7 +1578,7 @@ def test_a_slot_size_the_region_cannot_hold_is_refused_before_any_copy(
                    pair=xr.pair_id(0, 1), descs=descs,
                    stats=tp.PairStats(0, 1, "a", "b"), budget_s=1.0,
                    slot_bytes=over)
-        assert "W52 Weg2XchgPlanDisagree" in str(excinfo.value)
+        assert "W68 Weg2XchgPlanDisagree" in str(excinfo.value)
         assert f"slot_bytes={over}" in str(excinfo.value), runner.__name__
         assert "next pair's live payload" in str(excinfo.value)
     assert ops.issued == before, "the refusal must precede the first copy"
@@ -1624,7 +1624,7 @@ def test_a_slot_size_the_region_cannot_hold_is_refused_before_any_copy(
 
 def test_the_sequence_half_of_the_short_piece_check_fires_on_its_own(
         region, sems, ops):
-    """W54's ``rec.seq != batch.seq`` half, alone.
+    """W70's ``rec.seq != batch.seq`` half, alone.
 
     MEASURED-BY-REVIEW GAP (S4 review, 2026-09-09, a SURVIVING MUTANT):
     reducing the check to its byte-count half left 36/36 green.  On the real
@@ -1664,7 +1664,7 @@ def test_the_sequence_half_of_the_short_piece_check_fires_on_its_own(
     assert f"seq_filled={batch.seq + 4}" in message
     assert f"seq={batch.seq} " in message
     assert "seq_ok=no" in message, (
-        "a W54 that printed only byte counts would read as a contradiction of "
+        "a W70 that printed only byte counts would read as a contradiction of "
         "itself here")
     assert ops.issued == before
     assert read(ops, dst, len(payload)) != payload
@@ -1707,7 +1707,7 @@ def test_a_signal_during_a_slot_wait_is_not_a_timeout(boot):
     read, although the CDLL was opened with ``use_errno=True``.  POSIX permits
     ``EINTR``, and these waits run inside a live ``launch_server`` beside
     torch's watchdogs and child reaping -- so a signal produced
-    ``W53 ... no producer posted this slot within the fence budget`` naming a
+    ``W69 ... no producer posted this slot within the fence budget`` naming a
     rank that was perfectly healthy, and ``run_leg`` then voted the group down
     (W29 -> front W4 -> do_stop).  A guard that cries wolf on the healthy path
     is the failure mode this file names in
@@ -1774,7 +1774,7 @@ def test_every_thread_that_failed_is_reported_not_only_the_first(
     extra = [ln for ln in lines if "also failed" in ln]
     assert len(extra) == 1, lines
     assert "thread 2 of 2" in extra[0], extra[0]
-    assert "W53 Weg2XchgGateTimeout" in extra[0]
+    assert "W69 Weg2XchgGateTimeout" in extra[0]
     notes = getattr(excinfo.value, "__notes__", [])
     assert any("also failed" in n for n in notes), notes
 
@@ -1931,7 +1931,7 @@ def test_no_byte_moves_before_the_flip_is_bound(tmp_path, boot, sems):
                                  pair=xr.pair_id(0, 1), descs=descs,
                                  stats=tp.PairStats(0, 1, "a", "b"),
                                  budget_s=2.0, slot_bytes=SLOT)
-        assert "W52 Weg2XchgPlanDisagree" in str(excinfo.value)
+        assert "W68 Weg2XchgPlanDisagree" in str(excinfo.value)
         assert "no flip is bound" in str(excinfo.value)
         assert ops_.issued == before, "the refusal must precede the first copy"
 
@@ -2048,41 +2048,41 @@ def test_the_acceptance_lines_carry_every_token_the_spec_names():
 
 
 def test_every_w_code_this_slice_raises_is_free_and_named_once():
-    """W54 and W56 are what spec section 7 assigns to S4, and the branch census
-    at 2ee844f7b8 leaves exactly those two free below W60 (W51/52/53/55/58/60
-    are held by S1/S2/S3/S7; W57 is S6's and W59 is S5's).
+    """W70 and W72 are what spec section 7 assigns to S4, and the branch census
+    at 2ee844f7b8 leaves exactly those two free below W76 (W67/52/53/55/58/60
+    are held by S1/S2/S3/S7; W73 is S6's and W75 is S5's).
 
     ``test_weg2_wcode_uniqueness_1263`` is the authority and walks the whole
     tree; this asserts the local half, so a collision introduced here is named
     here rather than three files away.
     """
-    assert tp.SHORT_PIECE_MARKER == "W54 Weg2XchgShortPiece"
-    assert tp.ONCARD_UNAVAILABLE_MARKER == "W56 Weg2XchgOnCardUnavailable"
+    assert tp.SHORT_PIECE_MARKER == "W70 Weg2XchgShortPiece"
+    assert tp.ONCARD_UNAVAILABLE_MARKER == "W72 Weg2XchgOnCardUnavailable"
     found = set(re.findall(r"\b(W\d{1,2}[a-z]?)\s+(Weg2[A-Za-z0-9_]+)",
                            inspect.getsource(tp)))
     assert found == {
-        ("W52", "Weg2XchgPlanDisagree"),
-        ("W53", "Weg2XchgGateTimeout"),
-        ("W54", "Weg2XchgShortPiece"),
-        ("W56", "Weg2XchgOnCardUnavailable"),
+        ("W68", "Weg2XchgPlanDisagree"),
+        ("W69", "Weg2XchgGateTimeout"),
+        ("W70", "Weg2XchgShortPiece"),
+        ("W72", "Weg2XchgOnCardUnavailable"),
         # S5 (S4-fix refusal C, an S6 must_fix carried forward): the per-leg
         # semaphore re-arm check lives in this module because SemSet does.
-        # W62 is free in the branch census -- W60 was the highest assigned and
-        # W61 is the shadow's.
-        ("W62", "Weg2XchgSemaphoreNotRearmed"),
+        # W78 is free in the branch census -- W76 was the highest assigned and
+        # W77 is the shadow's.
+        ("W78", "Weg2XchgSemaphoreNotRearmed"),
         # S6 (#1273): the store-and-forward deposit's refusal.  ENUMERATED,
         # not picked -- the census over the four roots of
         # ``test_weg2_wcode_uniqueness_1263`` at ``edbf7007c8`` returns 54
-        # assigned codes with a maximum of W64, so the next free code is W65.
+        # assigned codes with a maximum of W80, so the next free code is W81.
         # The gaps below that maximum (W5, W6, W13-15, W18, W19, W23, W24,
-        # W27, W39, W57) are deliberately NOT reused: a retired number still
+        # W27, W39, W73) are deliberately NOT reused: a retired number still
         # matches every grep of every old boot log, and this file's own
         # history is two collisions bought by picking a number.
-        ("W65", "Weg2XchgDepositUnfundable"),
-        # S6 fix E (#1273): the on-card slot CEILING flag's refusal.  W65 was
-        # the census maximum when the comment above was written, so W66 is the
+        ("W81", "Weg2XchgDepositUnfundable"),
+        # S6 fix E (#1273): the on-card slot CEILING flag's refusal.  W81 was
+        # the census maximum when the comment above was written, so W82 is the
         # next free code -- enumerated, not picked, and no retired gap reused.
-        ("W66", "Weg2XchgOncardSlotRefused"),
+        ("W82", "Weg2XchgOncardSlotRefused"),
     }, found
 
 
@@ -2453,7 +2453,7 @@ def test_a_deposit_outlives_its_leg_and_is_read_after_the_source_is_gone(
 
 def test_a_deposit_with_fewer_slots_than_batches_is_refused_before_a_copy(
         tmp_path, region):
-    """S6 W65: the danger direction, refused where it cannot be compensated.
+    """S6 W81: the danger direction, refused where it cannot be compensated.
 
     ``slots < batches`` under store-and-forward is SILENT: batch ``k`` and
     batch ``k + slots`` share a slot, the producer overwrites without waiting
@@ -2475,7 +2475,7 @@ def test_a_deposit_with_fewer_slots_than_batches_is_refused_before_a_copy(
                                    stats=tp.OnCardStats(0, "u0", "host"),
                                    budget_s=2.0, store_forward=True)
         bounce.close()
-        assert "W65 Weg2XchgDepositUnfundable" in str(caught.value)
+        assert "W81 Weg2XchgDepositUnfundable" in str(caught.value)
         assert "slots=2" in str(caught.value) and "batches=4" in str(caught.value)
         assert prod.issued == issued, "NO copy may be issued before the refusal"
     finally:
@@ -2525,7 +2525,7 @@ def test_the_slot_count_is_derived_from_the_batches_and_prints_its_provenance():
     Every product path ran the lane at ``tp.ONCARD_SLOTS = 2`` because
     ``run_leg_hook`` had no way to pass anything else -- a hand number one seam
     below a planner that already knew the batch count.  Under the deposit the
-    count IS the batch count, and the plan is its one producer, so the W52
+    count IS the batch count, and the plan is its one producer, so the W68
     cross-check between the two co-located processes still compares two
     readings of one derivation.
     """
@@ -2593,7 +2593,7 @@ def test_run_leg_refuses_a_deposit_on_the_exported_arm(tmp_path, region, boot):
                        slot_bytes=SLOT, oncard_slot_bytes=SLOT,
                        oncard_store_forward=True)
         assert tp.DEPOSIT_REASON_IPC in str(caught.value)
-        assert "W65 Weg2XchgDepositUnfundable" in str(caught.value)
+        assert "W81 Weg2XchgDepositUnfundable" in str(caught.value)
     finally:
         ops.close()
         sems.close()
@@ -2772,7 +2772,7 @@ def test_the_two_sides_ring_depths_are_compared_and_not_assumed(
     Only ``slot_bytes`` was compared.  With equal slot sizes and unequal
     depths the consumer polls ``seq % slots_dst`` while the producer wrote
     ``seq % slots_src``: every wait misses, and the destination burns its whole
-    budget in a W53 whose denominator names an ABSENT peer -- never a ring
+    budget in a W69 whose denominator names an ABSENT peer -- never a ring
     sized differently on the two sides.  The ARMED row's ``nbytes`` word is
     written on a row where no batch exists, so it was free.
     """
@@ -2801,11 +2801,11 @@ def test_the_two_sides_ring_depths_are_compared_and_not_assumed(
                        budget_s=1.0, slot_bytes=SLOT, oncard_slot_bytes=SLOT,
                        oncard_slots=2)
         message = str(caught.value)
-        assert "W52 Weg2XchgPlanDisagree" in message
+        assert "W68 Weg2XchgPlanDisagree" in message
         assert "slots=4" in message and "derived 2" in message
         assert "different depths" in message
 
-        # THE CAN-FAIL CONTROL: agreeing depths do NOT raise W52.  This rank
+        # THE CAN-FAIL CONTROL: agreeing depths do NOT raise W68.  This rank
         # then dies on the missing bounce file, which is a different failure
         # and proves the check above discriminated rather than always fired.
         with pytest.raises(BaseException) as other:

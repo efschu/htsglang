@@ -176,7 +176,7 @@ def test_the_row_area_is_sized_for_the_deepest_pipeline_not_the_default():
 
 def test_a_pipeline_depth_the_rows_cannot_address_is_refused_before_any_copy(
         region, tmp_path):
-    """W52 by name, and the refusal lands before a thread exists."""
+    """W68 by name, and the refusal lands before a thread exists."""
     dev = FakeDeviceOps(str(tmp_path / "d"), rank=0)
     try:
         descs = [flat_desc(0, 0, 64, src_ptr=dev_ptr(0, 0x1000),
@@ -275,7 +275,7 @@ def test_a_diagonal_too_large_for_the_ceiling_is_priced_red_not_rounded_green():
     ``ONCARD_SLOT_BYTES_MAX x slots`` is raw VRAM on the producer's card and a
     residency term of spec section 5.  A pricer that grew the slot until the
     timing budget went green would be paying for a wall claim with a number
-    W55 has to refuse later -- so it clamps and says ``fits=no``.
+    W71 has to refuse later -- so it clamps and says ``fits=no``.
     """
     huge = 200 * (1 << 30)
     plan = tp.plan_oncard_slot_bytes(huge)
@@ -708,7 +708,7 @@ def test_the_gate_expiry_switches_the_shadow_off_and_never_raises(region):
     """DEVIATION 6, made falsifiable.
 
     Five of six ranks vote.  The authoritative wave gate would wait
-    ``WEG2_GROUP_FENCE_BUDGET_S`` and then raise W53 -- correct there, fatal
+    ``WEG2_GROUP_FENCE_BUDGET_S`` and then raise W69 -- correct there, fatal
     here: it would put 120 s of an observer's wait inside a flip leg.  The
     shadow waits its own small budget and switches itself off.
     """
@@ -825,7 +825,7 @@ def test_shadow_mismatch_names_the_parameter():
                        first_run_dst=0xDEAD000)
     assert sh.classify(stripe) == sh.MISMATCH
     msg = sh.mismatch_message(stripe, verdict=sh.MISMATCH, leg=2, epoch="b.2")
-    for token in ("W59 Weg2XchgShadowMismatch", "class=in_proj_qkvz",
+    for token in ("W75 Weg2XchgShadowMismatch", "class=in_proj_qkvz",
                   "param=model.layers.7.linear_attn.in_proj_qkvz.weight",
                   "stripe=3", "dst_off=0xdead000", "nbytes=1024",
                   "shadow_checksum=500", "ring_checksum=501"):
@@ -1028,7 +1028,7 @@ def test_a_mismatch_is_counted_and_the_flip_is_never_told(region, tmp_path, boot
 def test_a_transport_failure_is_logged_and_never_raised(region, tmp_path, boot):
     """Zero authority under FAILURE, which is the case that matters.
 
-    W52/W53/W54 stop a flip on the authoritative path.  Here the same events
+    W68/W69/W70 stop a flip on the authoritative path.  Here the same events
     mean only "the shadow got no measurement": they are recorded, the line says
     ``ran=no`` with the reason, and the leg continues.
     """
@@ -1273,7 +1273,7 @@ def test_the_verdict_republish_keeps_the_mode(region):
 def test_a_stale_full_count_refuses_the_leg_by_name(boot):
     """S4-fix refusal C, carried forward: the 24 counts at the leg's start.
 
-    A flip abandoned after gate 1 rolls forward by design (W57) and leaves any
+    A flip abandoned after gate 1 rolls forward by design (W73) and leaves any
     posted-but-untaken ``full`` at 1 for the rest of the boot.  The next
     producer then blocks on ``empty`` for the whole fence budget and names a
     healthy consumer.
@@ -1348,7 +1348,7 @@ def test_the_slot_checksum_asks_representability_before_it_says_mismatch():
     """MUST_FIX (S5 review 1): rule 3 was asked for STRIPES only.
 
     The slot path -- the transport's producer-vs-consumer comparison, which
-    reaches the same W59 marker -- logged on a bare inequality.  A batch whose
+    reaches the same W75 marker -- logged on a bare inequality.  A batch whose
     two ends framed the field differently was therefore reported as a data
     corruption, which is #656 register C22 exactly: an instance killed for a
     corruption that had not happened.
@@ -1479,7 +1479,7 @@ def test_the_diagonal_slot_is_this_cards_lane_and_not_the_sum():
     summed = tp.plan_oncard_slot_bytes(8 << 30).slot_bytes
     assert mine < summed, "the two denominators must be distinguishable here"
     # Both co-located processes derive it from the same filter over the same
-    # descriptors, which is what keeps the W52 slot_bytes check a cross-check.
+    # descriptors, which is what keeps the W68 slot_bytes check a cross-check.
     _, peer = sh.price_leg("GPU-5090", descs, rank=0, is_source=False,
                            oncard_mode=tp.ONCARD_MODE_IPC, free_mib=8192)
     assert peer == mine
@@ -1824,7 +1824,7 @@ def test_the_plan_seam_has_exactly_one_producer_and_it_is_the_derivation():
     """S5c: ``build_plan`` HAS a product caller now, and there is exactly one.
 
     This was ``test_the_plan_seam_has_no_producer`` and asserted the opposite,
-    which is precisely why it was written as a DENOMINATOR test: the W63
+    which is precisely why it was written as a DENOMINATOR test: the W79
     docstring claimed an absence and an absence nobody re-checks is the one
     that rots.  The absence is gone; the test does not.  What it now pins is
     the thing that would rot next -- a SECOND derivation growing somewhere
@@ -1905,7 +1905,7 @@ def test_the_plan_provider_is_the_seam_and_it_is_consulted(no_active_leg):
 
 def test_a_rank_that_cannot_join_says_so_by_name_and_does_not_go_quiet(
         no_active_leg):
-    """DANGER 4.  Every local skip is W63 with its reason, never a bare return.
+    """DANGER 4.  Every local skip is W79 with its reason, never a bare return.
 
     Enumerated rather than sampled: each door out of the hook before the gate
     must print the marker, because the gate is rank-uniform and a silent skip
@@ -1927,7 +1927,7 @@ def test_a_rank_that_cannot_join_says_so_by_name_and_does_not_go_quiet(
 
 def test_an_explicit_caller_gets_the_skip_raised_and_the_leg_never_does(
         no_active_leg):
-    """The W56/W61 two-arm shape, third instance: automatic degrades, explicit raises."""
+    """The W72/W77 two-arm shape, third instance: automatic degrades, explicit raises."""
     with pytest.raises(sh.Weg2XchgShadowRankLocalSkip):
         sh.run_leg_hook(_inputs(sh.HOOK_DESTINATION), log=lambda _s: None,
                         descs=(), armed=True, explicit=True)
@@ -1959,7 +1959,7 @@ def test_a_malformed_bound_is_not_silently_replaced_by_the_default(monkeypatch,
 
 def test_a_priced_hop_over_the_bound_refuses_the_shadow_by_name_and_not_the_flip(
         region, tmp_path, boot, no_active_leg):
-    """W61 ``scope=hop``: the leg is refused BEFORE a wall is spent.
+    """W77 ``scope=hop``: the leg is refused BEFORE a wall is spent.
 
     The descriptors are a diagonal big enough that the priced hop clears the
     bound; the assertion is that the leg prints the refusal, prints what it
@@ -2009,15 +2009,15 @@ def test_a_priced_hop_under_the_bound_is_not_refused(region, boot, no_active_leg
     assert not [ln for ln in lines if "scope=hop" in ln]
 
 
-# --- W62 at leg start (item 3) --------------------------------------------
+# --- W78 at leg start (item 3) --------------------------------------------
 
 def test_a_stale_semaphore_stops_the_shadow_and_never_the_flip(region, boot,
                                                                no_active_leg):
-    """W62 gets its caller, and the caller COUNTS it.
+    """W78 gets its caller, and the caller COUNTS it.
 
     ``verify_sem_arm`` refuses; on the authoritative path (S6's RPC preamble)
     that refusal stops a flip.  Here the same event may only stop the SHADOW,
-    so the hook catches it, prints it, and reports ``reason=w62-stale`` with
+    so the hook catches it, prints it, and reports ``reason=w78-stale`` with
     ``sems_armed=n/a`` -- an absent census, not a passed one.
     """
     xr.create_semaphores(boot)
@@ -2028,7 +2028,7 @@ def test_a_stale_semaphore_stops_the_shadow_and_never_the_flip(region, boot,
         result = sh.run_leg_hook(_inputs(sh.HOOK_DESTINATION), log=lines.append,
                                  descs=[_diag(0, 4096)], region=region,
                                  sems=sems, ops=object(), armed=True)
-        assert result.reason == "w62-stale"
+        assert result.reason == "w78-stale"
         assert result.sems_armed is None
         assert "sems_armed=n/a" in result.line()
         assert any(tp.SEM_NOT_REARMED_MARKER in ln for ln in lines)
@@ -2341,7 +2341,7 @@ def test_the_destination_hook_cannot_swallow_a_mismatch(region, tmp_path, boot,
     """DANGER 2, and it is the can-fail control for the test above.
 
     The 'ring' restores DIFFERENT bytes.  The hook's own line must go red
-    (``verdict=MISMATCH``), the W59 marker must be on the log, and nothing may
+    (``verdict=MISMATCH``), the W75 marker must be on the log, and nothing may
     be raised -- the ring's bytes were served, and this is a finding about the
     EXCHANGE.
     """
@@ -2464,12 +2464,12 @@ def test_the_hop_bound_is_a_launcher_flag_and_is_published_to_the_ranks():
         "the ring arm must publish nothing at all"
 
 
-# --- W63 is a new, free code ----------------------------------------------
+# --- W79 is a new, free code ----------------------------------------------
 
-def test_w63_is_the_next_free_code_and_names_one_exception():
-    assert sh.RANK_LOCAL_SKIP_MARKER == "W63 Weg2XchgShadowRankLocalSkip"
+def test_w79_is_the_next_free_code_and_names_one_exception():
+    assert sh.RANK_LOCAL_SKIP_MARKER == "W79 Weg2XchgShadowRankLocalSkip"
     assert sh.Weg2XchgShadowRankLocalSkip.__name__ in sh.RANK_LOCAL_SKIP_MARKER
-    # The TIME term reuses W61 rather than taking a code of its own: one code
+    # The TIME term reuses W77 rather than taking a code of its own: one code
     # for one class of event ("the shadow cannot afford this leg"), so a census
     # of self-refusals cannot read low by exactly the time-refused ones.
     assert sh.UNAFFORDABLE_MARKER in sh.hop_refusal_message(
@@ -2730,7 +2730,7 @@ def test_a_refusal_after_the_attach_publishes_its_no_so_no_peer_waits(
     """MUST_FIX 5.  ``hop_ms`` is priced from THIS card's diagonal, so one card
     can refuse while the other two do not -- exactly the asymmetric case where
     a silent return costs five peers a full gate budget each, inside their own
-    flip legs.  W63's own docstring names the hazard; the code only logged it.
+    flip legs.  W79's own docstring names the hazard; the code only logged it.
     """
     xr.create_semaphores(boot)
     sems = tp.SemSet(boot)
@@ -2755,7 +2755,7 @@ def test_a_refusal_after_the_attach_publishes_its_no_so_no_peer_waits(
 def test_a_refusal_before_the_attach_has_nowhere_to_publish_and_admits_it(
         no_active_leg):
     """The honest half: ``no-region``/``no-sems``/``no-ops``/``no-plan`` happen
-    with no row to write into, and W63 names them instead of the code
+    with no row to write into, and W79 names them instead of the code
     pretending a vote was cast."""
     leg = sh.ShadowLeg(_inputs(sh.HOOK_SOURCE), lambda _s: None)
     assert leg.region is None
@@ -3125,7 +3125,7 @@ def test_a_plan_for_a_card_this_rank_does_not_run_on_is_refused(chunked):
     """DANGER 2.  ``rank`` IS the card (weight_exchange_region's own theorem).
 
     A rank outside ``range(N_CARDS)`` would silently become a ``stage`` no
-    group layout has, ``_blocks_of`` would raise W52 deep inside ``build_plan``
+    group layout has, ``_blocks_of`` would raise W68 deep inside ``build_plan``
     and the reason would name the plan rather than the card.
     """
     plan, reason = _derive(rank=xr.N_CARDS)
@@ -3143,7 +3143,7 @@ def test_a_stale_flip_order_map_is_refused_by_name(chunked):
 
     The flip order map is derived per leg; a rank that kept one across a boot
     whose ``chunk_count`` changed would plan waves over tags this family does
-    not have, and ``build_plan``'s own W58 would then refuse for a reason
+    not have, and ``build_plan``'s own W74 would then refuse for a reason
     ("barren wave tag") that sends the reader to the inventory instead of to
     the map.  Named here, at the map.
     """
@@ -3251,7 +3251,7 @@ def test_the_class_rotation_moves_the_card_digest_and_not_the_group_one(chunked)
     rank's inventory is its own stage's layer band, so on a hybrid layer stack
     a band that lacks one layer type yields a different class set -- and the
     old digest hashed that assertion instead of checking it, which would have
-    surfaced as W64 ``scope=group`` under a cause sentence naming a stale chunk
+    surfaced as W80 ``scope=group`` under a cause sentence naming a stale chunk
     geometry.  Wrong place, wrong cause, and the reader sent to the wrong file.
 
     So the class set must move ``card_digest`` (a per-card reading by
@@ -3288,7 +3288,7 @@ def test_two_readers_of_the_chunk_geometry_that_disagree_are_refused(chunked):
 
 
 def test_a_divergent_plan_is_a_named_refusal_and_never_a_vote(region):
-    """DANGER 4 at the rendezvous: W64, ``scope=group``, no vote taken.
+    """DANGER 4 at the rendezvous: W80, ``scope=group``, no vote taken.
 
     The gate is where a divergence between ranks is VISIBLE, and it is the only
     place: a rank cannot see another rank's derivation any other way.  It must
@@ -3329,13 +3329,13 @@ def test_agreeing_plans_do_not_trip_the_new_check(region):
 
 
 def test_the_co_located_pair_is_checked_on_its_card_geometry(region):
-    """W64 ``scope=oncard-peer``: the two ends of ONE card's lane.
+    """W80 ``scope=oncard-peer``: the two ends of ONE card's lane.
 
     A DIFFERENT question from the group one, and the honest answer on this
     rig's P=PP / D=TP form: the two groups do not hold the same bytes on a
     card, and that is a statement about two layouts, not a defect in the
     exchange.  Refused here, before a byte moves -- otherwise it surfaces as a
-    W54 byte-count disagreement inside the on-card consumer, after the source
+    W70 byte-count disagreement inside the on-card consumer, after the source
     has filled a bounce and while it waits out its drain.
     """
     for row in range(1, xr.N_RANKS):
@@ -3451,7 +3451,7 @@ def test_the_compare_names_the_class_the_stripes_and_the_bytes(
         region, tmp_path, boot, no_active_leg):
     """ITEM 4, for MATCH as well as for MISMATCH.
 
-    W59 names a class only when something went WRONG, so a boot whose shadow
+    W75 names a class only when something went WRONG, so a boot whose shadow
     agreed carried no per-class evidence: ``match=7`` with no way to say which
     seven, over how many bytes.  A compare that looked at nothing satisfies
     ``mismatch=0`` just as well as one that looked at everything, and the S5b
@@ -3581,7 +3581,7 @@ def test_the_blocked_wall_reaches_the_shadow_line_from_a_failed_leg(tmp_path,
     stats.drain_wait_s = 0.402
     result = tp.LegResult()
     result.oncard = stats
-    exc = tp.Weg2XchgGateTimeout("W53 Weg2XchgGateTimeout oncard -- synthetic")
+    exc = tp.Weg2XchgGateTimeout("W69 Weg2XchgGateTimeout oncard -- synthetic")
     setattr(exc, "weg2_leg_result", result)
     got = getattr(exc, "weg2_leg_result", None)
     assert got is not None and got.oncard is stats
@@ -3633,13 +3633,13 @@ def test_the_adapter_derives_and_hands_the_plan_down(no_active_leg):
     assert any(isinstance(n, _ast.ExceptHandler) for n in _ast.walk(tree))
 
 
-def test_w64_is_the_next_free_code_and_names_one_exception():
-    """W64, and it is not folded into the class-subset disagreement.
+def test_w80_is_the_next_free_code_and_names_one_exception():
+    """W80, and it is not folded into the class-subset disagreement.
 
-    W63 was the highest assigned code on this branch; W64 is the first free
+    W79 was the highest assigned code on this branch; W80 is the first free
     one above it, per ``test_weg2_wcode_uniqueness_1263``'s census rule.
     """
-    assert sh.PLAN_DIVERGED_MARKER == "W64 Weg2XchgShadowPlanDiverged"
+    assert sh.PLAN_DIVERGED_MARKER == "W80 Weg2XchgShadowPlanDiverged"
     assert sh.Weg2XchgShadowPlanDiverged.__name__ in sh.PLAN_DIVERGED_MARKER
     message = sh.plan_divergence_message(
         scope="group", leg=1, epoch="e.1", rows={0: 1, 1: 2},
@@ -4007,7 +4007,7 @@ def _host_arm(monkeypatch) -> None:
 
 def test_an_unfunded_deposit_is_refused_by_name_and_moves_no_bytes(
         region, boot, tmp_path, no_active_leg, chunked, monkeypatch):
-    """S6 W65: pinned host bytes nobody charged for are not a risk to accept.
+    """S6 W81: pinned host bytes nobody charged for are not a risk to accept.
 
     ``host_bounce_budget_bytes=0`` is "no ledger answer reached this rank", and
     it refuses exactly like a budget that is too small: an absent measurement
@@ -4054,7 +4054,7 @@ def test_an_unfunded_deposit_is_refused_by_name_and_moves_no_bytes(
     assert entered == [], "an unfunded deposit must not reach the transport"
     assert result.reason == "deposit-unfundable", result.line()
     assert result.ran is False
-    refusal = [ln for ln in lines if ln.startswith("W65 Weg2XchgDepositUnfundable")]
+    refusal = [ln for ln in lines if ln.startswith("W81 Weg2XchgDepositUnfundable")]
     assert len(refusal) == 1, lines
     for token in ("hook=source", "row=0", "peer_row=3",
                   f"reason={tp.DEPOSIT_REASON_UNFUNDED}",
@@ -4126,7 +4126,7 @@ def test_a_funded_deposit_runs_the_lane_with_no_concurrent_peer(
     assert seen["oncard_slots"] != tp.ONCARD_SLOTS or batches == tp.ONCARD_SLOTS
     assert not [ln for ln in lines
                 if ln.startswith(sh.ONCARD_NOT_DRAINABLE_PREFIX)
-                or ln.startswith("W65 ")], lines
+                or ln.startswith("W81 ")], lines
     assert result.blocked_ms == 0.0, result.line()
     # The deposit's shape is on the shadow's own line, with its provenance.
     line = result.line()
@@ -4380,7 +4380,7 @@ def test_the_two_budget_lines_keep_their_shape_under_the_deposit(region, boot,
 
 def test_a_deposit_with_more_batches_than_slots_is_refused_by_name(
         region, boot, tmp_path, monkeypatch, no_active_leg, chunked):
-    """S6 W65: the second refusal arm, at a slot the row area cannot cover.
+    """S6 W81: the second refusal arm, at a slot the row area cannot cover.
 
     Pinning ``oncard_slot_bytes`` to this file's 4 KiB cross slot makes this
     fixture's diagonal 48 batches -- six times ``ONCARD_SLOTS_MAX``, which
@@ -4423,7 +4423,7 @@ def test_a_deposit_with_more_batches_than_slots_is_refused_by_name(
         xr.unlink_semaphores(boot)
     assert entered == [], "a deposit that cannot fit must not reach the transport"
     assert result.reason == "deposit-unfundable", result.line()
-    refusal = [ln for ln in lines if ln.startswith("W65 Weg2XchgDepositUnfundable")]
+    refusal = [ln for ln in lines if ln.startswith("W81 Weg2XchgDepositUnfundable")]
     assert len(refusal) == 1, lines
     assert f"reason={tp.DEPOSIT_REASON_BATCHES}" in refusal[0], refusal[0]
     assert f"slots_max={tp.ONCARD_SLOTS_MAX}" in refusal[0], refusal[0]
@@ -4592,7 +4592,7 @@ def test_the_shadow_line_prices_the_copy_on_the_host_arm_and_not_on_ipc(
 # BOOT weg2shadowC IS THE MEASUREMENT.  Two arms (C1 ipc, C2 host), two flips
 # each, `--weg2-weight-source shadow` armed and its ARM line printed -- and
 # across all four flips ZERO `WEG2-XCHG-PLAN`, zero SEMS, zero ONCARD-REFUSED,
-# zero COMPARE, zero W61/W65.  The ledger half of both arms was exact, so the
+# zero COMPARE, zero W77/W81.  The ledger half of both arms was exact, so the
 # arm itself was real.
 #
 # The root is one gate and it is not the arm: `_weg2_rank` read
@@ -4756,12 +4756,12 @@ def test_the_rank_reader_does_not_go_back_to_the_attributes_that_do_not_exist():
 # FLIP-TAG lines, rank=-1 = 0; GATE 1: 15 PLAN lines, 0 no-identity) and then
 # produced the SAME SHAPE one level up, verbatim:
 #
-#   W52 Weg2XchgPlanDisagree begin_flip epoch='1788964408.-1': flip index -1
+#   W68 Weg2XchgPlanDisagree begin_flip epoch='1788964408.-1': flip index -1
 #   does not advance past -1, which this view has already run
 #
 # The boot half of that stamp is right and the FLIP half is -1.  The three legs
 # that produced it are group P's BOOT-TIME INITIAL SLEEP at its own READY
-# (14:33:55Z), 73 s BEFORE the first flip began (14:35:08Z) -- and the W63 that
+# (14:33:55Z), 73 s BEFORE the first flip began (14:35:08Z) -- and the W79 that
 # carried it printed `epoch=` EMPTY, so the request had no epoch at all rather
 # than a malformed one.  The front's plumbing is CORRECT: every real flip leg
 # of that boot carried `epoch=1788964408.0` / `.1`.
@@ -4774,7 +4774,7 @@ def test_the_rank_reader_does_not_go_back_to_the_attributes_that_do_not_exist():
 # ---------------------------------------------------------------------------
 
 SHADOWD_W52_VERBATIM = (
-    "W52 Weg2XchgPlanDisagree begin_flip epoch='1788964408.-1': flip index -1 "
+    "W68 Weg2XchgPlanDisagree begin_flip epoch='1788964408.-1': flip index -1 "
     "does not advance past -1, which this view has already run"
 )
 
@@ -4816,7 +4816,7 @@ def _armed_probe(monkeypatch, *, leg_epoch, card="GPU-abc", free_bytes=8 << 30):
 ])
 def test_a_leg_with_no_flip_epoch_refuses_by_name_before_the_sentinel_travels(
         monkeypatch, caplog, epoch_value, expect_reason):
-    """RED ON `57ef547466`: the -1 travels and comes back as W52.
+    """RED ON `57ef547466`: the -1 travels and comes back as W68.
 
     The assertion that matters is the NEGATIVE one: the shadowD string must not
     be reachable from a leg that simply has no flip.  `-1` is a fine internal
@@ -4833,7 +4833,7 @@ def test_a_leg_with_no_flip_epoch_refuses_by_name_before_the_sentinel_travels(
     assert f"reason={expect_reason}" in caplog.text, caplog.text[-2000:]
     assert "Weg2XchgPlanDisagree" not in caplog.text, (
         "the flip-index sentinel still reaches begin_flip -- this is the "
-        "shadowD W52, which names a plan disagreement on a leg that is simply "
+        "shadowD W68, which names a plan disagreement on a leg that is simply "
         "not a flip"
     )
     assert "does not advance past -1" not in caplog.text
@@ -4872,7 +4872,7 @@ def test_every_identity_the_hook_reads_has_a_named_refusal(
 
     Two of these five used to travel as sentinels into `ShadowLegInputs`:
     `card_uuid="unknown"` (an unnamed card priced, charged and printed on the
-    W61 line as though it were a real one) and `free_mib=0` (an UNREADABLE NVML
+    W77 line as though it were a real one) and `free_mib=0` (an UNREADABLE NVML
     free column priced as a FULL card, so `price_shadow` refuses UNAFFORDABLE
     while naming the wrong cause -- worse than not pricing at all).
     """
@@ -5175,7 +5175,7 @@ def test_slot_64_charges_1_50_gib_which_is_what_reopens_a_rung_at_bs6():
 
 @pytest.mark.parametrize("bad", [0, -64, 16, 48, 100, "x", None, 31])
 def test_a_slot_ceiling_that_does_not_divide_the_geometry_refuses_by_name(bad):
-    """W66, not a clamp.
+    """W82, not a clamp.
 
     A clamp is what makes a ledger charge one geometry while the ranks
     allocate another -- the drift `ONCARD_DEPOSIT_BYTES_MAX`'s own comment was
@@ -5184,7 +5184,7 @@ def test_a_slot_ceiling_that_does_not_divide_the_geometry_refuses_by_name(bad):
     """
     with pytest.raises(tp.Weg2XchgOncardSlotRefused) as exc:
         tp.validate_oncard_slot_mib(bad)
-    assert "W66" in str(exc.value)
+    assert "W82" in str(exc.value)
     assert "does not divide" in str(exc.value) or "not an integer" in str(exc.value)
 
 
@@ -5252,7 +5252,7 @@ def test_the_launcher_charge_follows_the_flag_not_its_own_import():
 # REACHED THE PIECE BUILDER.
 #
 # Boot weg2shadowE: the rotation fix landed (classes=1 on 12/12 lines, the
-# subset rotates A_log/down_proj, W52 0, W61 0, 19 AFFORDABLE / 5 REFUSED,
+# subset rotates A_log/down_proj, W68 0, W77 0, 19 AFFORDABLE / 5 REFUSED,
 # need_mib=32, deposit runs, hop priced 0.182) and every leg still read
 # `ran=no ... pieces=0 stripes=0`.  The reason was already on the same line,
 # 400 characters further along:
@@ -5266,10 +5266,10 @@ def test_the_launcher_charge_follows_the_flag_not_its_own_import():
 # builder does not read the pin, imposes no stripe minimum, filters no dtype,
 # and its population handle is full -- it is simply never called.
 #
-# WHAT THE GATE FOUND IS REAL, AND THE GATE IS RIGHT.  W64 scope=oncard-peer
+# WHAT THE GATE FOUND IS REAL, AND THE GATE IS RIGHT.  W80 scope=oncard-peer
 # compares the CO-LOCATED pair's `card_digest`:
 #
-#     W64 Weg2XchgShadowPlanDiverged scope=oncard-peer leg=0 field=card_digest
+#     W80 Weg2XchgShadowPlanDiverged scope=oncard-peer leg=0 field=card_digest
 #       [row=0 card_digest=0xb580709a80b8e768] [row=3 card_digest=0x64a79d7d9e67e603]
 #
 # row 0 is P rank 0 and row 3 is D rank 0 -- the two ranks sharing card 0.
@@ -5447,7 +5447,7 @@ def test_the_pair_agrees_on_pieces_while_their_whole_storage_digests_differ():
 
 
 def test_a_mismatched_piece_set_still_diverges_and_names_a_piece():
-    """The W54 hazard the gate exists for survives the rebuild.
+    """The W70 hazard the gate exists for survives the rebuild.
 
     Two ranks that framed the SAME overlap differently have different piece
     keys -- a different slice offset is a different piece -- so the gate still

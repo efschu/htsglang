@@ -392,6 +392,65 @@ class TestOneWCodePerException(CustomTestCase):
         self.assertEqual(set(c["W53"]), {"Weg2StoreHandbackFailed"})
         self.assertEqual(set(c["W56"]), {"Weg2CorridorFloorUnmeasured"})
 
+    def test_the_xchg_replay_renumbered_its_sixteen_codes_by_census(self):
+        """#1273 xchg on serve-next5 (2026-09-09). The weight-exchange chain
+        was cut on ``3ea18deb95``, whose census maximum is W50, and enumerated
+        W51-W66 there -- every one of them free at the time. While it was being
+        built the serve line claimed that whole band (W51 host-ring, W52
+        no-route, W53 handback, W54-W56 corridor, W57/W58 store, W59
+        chunk-card, W60 carrier floor, W61-W66 operating point / prefetch /
+        eager decode), so on the replayed tree all sixteen collided at once.
+
+        Renumbered to W67-W82, the first free numbers above the MERGED census
+        maximum W66 -- the same rule the serve-next4 and serve-next5 trains
+        applied to their own incoming codes -- with the exception NAMES
+        unchanged, so a boot log is still grepped by name.
+
+        W73 has no holder on purpose: it is the chain's old W57, a number its
+        prose reserved for the S6 roll-forward that never got an exception.
+        It moved with the rest so that no xchg comment points at a serve-line
+        code (W57 is ``Weg2StoreDiskRefused``) that means something else.
+        """
+        c = census()
+        for code, name in (
+            ("W67", "Weg2XchgCoverageRefused"),
+            ("W68", "Weg2XchgPlanDisagree"),
+            ("W69", "Weg2XchgGateTimeout"),
+            ("W70", "Weg2XchgShortPiece"),
+            ("W71", "Weg2XchgResidencyUnarmable"),
+            ("W72", "Weg2XchgOnCardUnavailable"),
+            ("W74", "Weg2XchgSourceMissing"),
+            ("W75", "Weg2XchgShadowMismatch"),
+            ("W76", "Weg2XchgRunnerShapeUnknown"),
+            ("W77", "Weg2XchgShadowUnaffordable"),
+            ("W78", "Weg2XchgSemaphoreNotRearmed"),
+            ("W79", "Weg2XchgShadowRankLocalSkip"),
+            ("W80", "Weg2XchgShadowPlanDiverged"),
+            ("W81", "Weg2XchgDepositUnfundable"),
+            ("W82", "Weg2XchgOncardSlotRefused"),
+        ):
+            self.assertEqual(set(c[code]), {name}, code)
+        # and every serve-line holder the incoming codes collided with KEPT
+        # its number -- the half a renumber gets wrong by moving the wrong side.
+        for code, name in (
+            ("W51", "Weg2HostRingUnfunded"),
+            ("W52", "Weg2NoServiceableRoute"),
+            ("W53", "Weg2StoreHandbackFailed"),
+            ("W54", "Weg2CorridorBudgetUnpriced"),
+            ("W55", "Weg2CorridorBudgetWouldBind"),
+            ("W56", "Weg2CorridorFloorUnmeasured"),
+            ("W57", "Weg2StoreDiskRefused"),
+            ("W58", "Weg2StoreArcRefused"),
+            ("W59", "Weg2ChunkCardMismatch"),
+            ("W60", "Weg2CarrierFloorUnreachable"),
+            ("W61", "Weg2TpOperatingPointUnpriced"),
+            ("W66", "Weg2EagerDecodeArm"),
+        ):
+            self.assertEqual(set(c[code]), {name}, code)
+        # the xchg band is contiguous apart from the holder-less W73: nothing
+        # was left behind on an old number by a partial rewrite.
+        self.assertEqual(set(c["W73"]), set())
+
     def test_the_chosen_number_was_free_and_the_free_ones_are_named(self):
         """W50 is not 'the next one': it is the first free number above the
         highest assigned code, and the census can say which others are free."""
