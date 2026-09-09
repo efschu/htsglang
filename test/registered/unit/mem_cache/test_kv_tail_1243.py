@@ -2596,3 +2596,56 @@ class TestTheReassociationBound(CustomTestCase):
             f"{self.BOUND:.1e} re-association bound -- that is a DEFECT, not "
             f"rounding",
         )
+
+    def test_the_bf16_output_roundtrip_is_the_dominant_term(self):
+        """THE GAP between this desk oracle and the metal, named.
+
+        The oracle above runs its partials in fp32, so `_kv_tail_lse_merge`'s
+        closing `o.to(o_a.dtype)` is a no-op and the measured distance is
+        fp32-class (~3e-7). ON METAL `o` comes back from
+        `forward_return_lse` in the model dtype, so that cast ROUNDS THE
+        MERGED OUTPUT TO BF16 -- a 2^-8 = 3.9e-3 relative perturbation, on
+        every layer where the tail engages, that the no-tail path does not
+        have: without a tail there is no intermediate merge and no extra
+        round-trip before the cross-rank combine.
+
+        This is arithmetic, not corruption: it is a PRECISION cost of the
+        extra merge step, and it is the right order to explain the metal's
+        end-to-end |dlogprob| (mean 0.044, max 0.46 nats over ~48 layers).
+        """
+        from sglang.srt.layers.attention.flashinfer_backend import _kv_tail_lse_merge
+
+        rows = []
+        worst32 = worst16 = 0.0
+        for n_tail in (1, 2, 60):
+            q, k, v = self._parts(0, n_tail)
+
+            def part(kk, vv):
+                lg = torch.einsum("hd,nhd->hn", q.float(), kk.float()) * self.SCALE
+                return (
+                    torch.einsum("hn,nhd->hd", torch.softmax(lg, -1), vv.float()),
+                    torch.logsumexp(lg, -1),
+                )
+
+            o_b, lse_b = part(k[: self.N - n_tail], v[: self.N - n_tail])
+            o_t, lse_t = part(k[self.N - n_tail :], v[self.N - n_tail :])
+            ref, _ = part(k, v)
+            o32, _ = _kv_tail_lse_merge(o_b, lse_b, o_t, lse_t)
+            o16, _ = _kv_tail_lse_merge(
+                o_b.to(torch.bfloat16), lse_b, o_t.to(torch.bfloat16), lse_t
+            )
+            d32 = float((o32 - ref).abs().max())
+            d16 = float((o16.float() - ref).abs().max())
+            worst32, worst16 = max(worst32, d32), max(worst16, d16)
+            rows.append((n_tail, d32, d16))
+        print("\nT15b OUTPUT DTYPE IS THE DOMINANT TERM (max|d| vs plain):")
+        print("  k      fp32 merge      bf16 merge     ratio")
+        for n_tail, d32, d16 in rows:
+            print(f"  {n_tail:<4} {d32:13.3e} {d16:15.3e} {d16/max(d32,1e-30):9.0f}x")
+        print(f"  WORST fp32 {worst32:.3e}   WORST bf16 {worst16:.3e}")
+        print("  metal, end-to-end |dlogprob| over ~48 layers: mean 0.044, max 0.46 nats")
+        # The bf16 round-trip must be decades above the fp32 floor -- that is
+        # the whole point of naming it.
+        self.assertGreater(worst16, worst32 * 100)
+        # ...and still a PRECISION term, not a 0.69-relative convention error.
+        self.assertLess(worst16, 1e-1)
