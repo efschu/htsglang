@@ -50,6 +50,7 @@ _S1 = _load("test_weg2_xchg_plan_1273")
 _S2 = _load("test_weg2_xchg_cover_1273")
 _S3 = _load("test_weg2_xchg_region_1273")
 _S7 = _load("test_weg2_xchg_instruments_1273")
+_S4 = _load("test_weg2_xchg_transport_1273")
 
 EMITTED: list[str] = []
 
@@ -253,6 +254,77 @@ def test_s7_flip_tag_and_armed_lines() -> None:
         assert token in armed[0], f"{token!r} missing from {armed[0]!r}"
 
 
+def test_s4_pair_and_oncard_lines(tmp_path) -> None:
+    """``WEG2-XCHG-PAIR`` and ``WEG2-XCHG-ONCARD`` from a real six-rank run.
+
+    Not from a hand-built stats object: the numbers come from S4's own
+    hermetic double, so a format string that drifted from what the transport
+    actually produces cannot pass here.
+    """
+    from sglang.srt.weg2 import weight_exchange_region as xr
+    from sglang.srt.weg2 import weight_exchange_transport as tp
+
+    boot = _S4._fresh_boot()
+    root = os.path.join(str(tmp_path), "dev")
+    os.makedirs(root, exist_ok=True)
+    region = xr.XchgRegion.create(boot, shm_root=str(tmp_path))
+    path = region.path
+    region.close()
+    xr.create_semaphores(boot)
+    ctx = mp.get_context("fork")
+    ready = ctx.Barrier(xr.N_RANKS)
+    procs, outs = [], []
+    try:
+        for group in ("P", "D"):
+            for rank in range(xr.N_CARDS):
+                out = os.path.join(str(tmp_path), f"a-{group}{rank}.txt")
+                outs.append(out)
+                proc = ctx.Process(
+                    target=_S4._rank_child,
+                    args=(root, path, boot, group, rank, out, ready))
+                proc.start()
+                procs.append(proc)
+        for proc in procs:
+            proc.join(150)
+        assert all(p.exitcode == 0 for p in procs), [p.exitcode for p in procs]
+    finally:
+        for proc in procs:
+            if proc.is_alive():
+                proc.terminate()
+        xr.unlink_semaphores(boot)
+
+    lines = []
+    for out in outs:
+        with open(out) as fh:
+            verdict = eval(fh.read())  # noqa: S307 -- our own repr
+        assert verdict["error"] == "", verdict["error"]
+        assert verdict["mismatch"] == [], verdict["mismatch"]
+        lines.extend(verdict["lines"])
+
+    pairs = [l for l in lines if l.startswith(tp.PAIR_LINE_PREFIX)]
+    oncard = [l for l in lines if l.startswith(tp.ONCARD_LINE_PREFIX)]
+    assert len(pairs) == 2 * xr.N_PAIRS and len(oncard) == 2 * xr.N_CARDS
+    _say("S4", pairs[0])
+    _say("S4", oncard[0])
+    for token in ("src=", "dst=", "bytes_mib=", "pieces=", "strided_mib=",
+                  "ms=", "gbs=", "slot_waits=", "slot_wait_ms="):
+        assert token in pairs[0], f"{token!r} missing from {pairs[0]!r}"
+    for token in ("card=", "mode=", "bytes_mib=", "hops=", "hop_ms="):
+        assert token in oncard[0], f"{token!r} missing from {oncard[0]!r}"
+
+    degraded = []
+    tp.arm_oncard_lane(card_uuid="GPU-probe", probe=lambda: (False, "smoke"),
+                       log=degraded.append)
+    _say("S4", degraded[0])
+    assert tp.ONCARD_UNAVAILABLE_MARKER in degraded[0]
+
+
+def tp_marker() -> str:
+    from sglang.srt.weg2 import weight_exchange_transport as tp
+
+    return tp.ONCARD_UNAVAILABLE_MARKER
+
+
 def test_all_six_prefixes_were_emitted() -> None:
     """The integrator's actual question: all of them, from one merged tree."""
     want = (
@@ -263,6 +335,9 @@ def test_all_six_prefixes_were_emitted() -> None:
         "WEG2-XCHG-GATE",
         "WEG2-FLIP-TAG",
         "WEG2-XCHG-ARMED",
+        "WEG2-XCHG-PAIR",
+        "WEG2-XCHG-ONCARD",
+        tp_marker(),
     )
     missing = [p for p in want if not any(p in line for line in EMITTED)]
     assert not missing, (
