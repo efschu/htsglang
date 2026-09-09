@@ -5245,3 +5245,127 @@ def test_the_launcher_charge_follows_the_flag_not_its_own_import():
     assert "validate_oncard_slot_mib" in body, (
         "the charge accepts a slot size it never validated"
     )
+
+
+# ---------------------------------------------------------------------------
+# S6 fix F (#1273) -- `pieces=0` IS NOT A PIECE-BUILDER DEFECT.  THE LEG NEVER
+# REACHED THE PIECE BUILDER.
+#
+# Boot weg2shadowE: the rotation fix landed (classes=1 on 12/12 lines, the
+# subset rotates A_log/down_proj, W52 0, W61 0, 19 AFFORDABLE / 5 REFUSED,
+# need_mib=32, deposit runs, hop priced 0.182) and every leg still read
+# `ran=no ... pieces=0 stripes=0`.  The reason was already on the same line,
+# 400 characters further along:
+#
+#     verdict=NOT-RUN reason=plan-diverged-oncard-peer
+#
+# and it is 6 of 6 shadow lines in BOTH groups -- 12 of 12 legs, one cause, no
+# second.  `result.ran = True` and `result.pieces = ...` are set only AFTER
+# `tp.run_leg` returns, so a leg refused at the gate reports the initialised
+# zeros.  NONE of the four candidates put to this round applies: the piece
+# builder does not read the pin, imposes no stripe minimum, filters no dtype,
+# and its population handle is full -- it is simply never called.
+#
+# WHAT THE GATE FOUND IS REAL, AND THE GATE IS RIGHT.  W64 scope=oncard-peer
+# compares the CO-LOCATED pair's `card_digest`:
+#
+#     W64 Weg2XchgShadowPlanDiverged scope=oncard-peer leg=0 field=card_digest
+#       [row=0 card_digest=0xb580709a80b8e768] [row=3 card_digest=0x64a79d7d9e67e603]
+#
+# row 0 is P rank 0 and row 3 is D rank 0 -- the two ranks sharing card 0.
+# `card_geometry_digest` hashes this rank's STORAGE (`name:tag:rows x cols x
+# itemsize`, plus the unplanned population), and its own docstring says a
+# disagreement "is the honest reading of 'these two groups do not hold the same
+# bytes on this card'".  Measured across the run: SIX distinct card_digests,
+# each appearing 3x in one group's log and 1x in the other's -- three are P's
+# cards and three are D's, and no co-located pair agrees.
+#
+# THE PREMISE, NOT THE CODE, IS WHAT FAILS.  Group P runs pp_size=3 / tp_size=1
+# and group D pp_size=1 / tp_size=3 (`launcher.py`), so P rank n holds a
+# PIPELINE STAGE (whole layers, some layer indices) while D rank n holds a
+# TENSOR SHARD (slices of every layer).  Co-located ranks genuinely do not hold
+# the same parameter names or extents, so the on-card diagonal has no shared
+# storage to exchange and the gate can never open on this placement.  That is a
+# DESIGN question for the operator, not a defect to patch here -- and these
+# tests exist so nobody "fixes" it by weakening the gate, which would compare
+# two different experiments and call the result a MATCH.
+# ---------------------------------------------------------------------------
+
+def test_the_oncard_peer_gate_refuses_when_the_pair_hold_different_storage():
+    """RED if the gate is ever weakened.  This refusal is CORRECT.
+
+    Two co-located ranks whose storage differs must produce a NAMED refusal and
+    no comparison.  Weakening this to "compare anyway" is the shape S5's own
+    can-fail control already caught once (both sides of the compare became the
+    shadow buffer, so every stripe matched itself).
+    """
+    from sglang.srt.weg2 import weight_exchange_shadow as m
+
+    a = m.card_geometry_digest(
+        [_Geom("model.layers.0.A_log", "weights_0", 4096, 1, 2)],
+        ("A_log",), unplanned=())
+    b = m.card_geometry_digest(
+        [_Geom("model.layers.9.A_log", "weights_2", 4096, 1, 2)],
+        ("A_log",), unplanned=())
+    assert a != b, (
+        "a pipeline stage and a tensor shard hashed to the same card geometry "
+        "-- the gate that stops the shadow comparing two different experiments "
+        "has stopped discriminating"
+    )
+    same = m.card_geometry_digest(
+        [_Geom("model.layers.0.A_log", "weights_0", 4096, 1, 2)],
+        ("A_log",), unplanned=())
+    assert same == a, "the digest is not stable over identical storage"
+
+
+class _Geom:
+    def __init__(self, name, tag, rows_full, cols_full, itemsize):
+        self.name = name
+        self.tag = tag
+        self.rows_full = rows_full
+        self.cols_full = cols_full
+        self.itemsize = itemsize
+
+
+def test_a_one_class_subset_has_pieces_to_exchange():
+    """THE FOUR CANDIDATES, refuted in one test.
+
+    A single rotated class over a synthetic population yields a NON-EMPTY desc
+    list and a NON-ZERO layout total.  So the piece builder does not read the
+    (now empty) pin, imposes no minimum piece size that a 32 MiB class misses,
+    filters nothing by tensor property, and its population handle is full.
+    `pieces=0` on metal was the gate, not this.
+    """
+    descs = _population(FOURTEEN, per_class=4, nbytes=8 << 20)
+    sub = sh.select_subset(descs, leg=0, rotation=FOURTEEN)
+    assert len(sub.classes) == 1
+    assert len(sub.descs) == 4, sub.classes
+    assert sub.nbytes == 4 * (8 << 20)
+    mine = [d for d in sub.descs if int(d.dst_rank) == 0]
+    layout, total = sh.shadow_layout(mine)
+    assert total > 0 and len(layout) == len(mine), (total, len(layout))
+
+
+def test_a_refused_leg_says_why_beside_ran_not_four_hundred_chars_later():
+    """The readability defect that cost boot weg2shadowE a cycle.
+
+    `reason=` was already on the line and was missed by every reader, because
+    the head of the line reads `ran=no ... pieces=0 stripes=0` and the cause sat
+    at the far end.  The trailing `reason=` is kept so existing parsers do not
+    move.
+    """
+    r = sh.ShadowResult(leg=0, epoch="b.0",
+                        subset=sh.select_subset([], leg=0),
+                        counters=sh.ShadowCounters())
+    r.reason = "plan-diverged-oncard-peer"
+    line = r.line()
+    assert "why=plan-diverged-oncard-peer" in line
+    assert line.index("ran=") < line.index("why=") < line.index("pieces="), line
+    # and the trailing field is untouched
+    assert "reason=plan-diverged-oncard-peer" in line
+
+    ok = sh.ShadowResult(leg=0, epoch="b.0",
+                         subset=sh.select_subset([], leg=0),
+                         counters=sh.ShadowCounters())
+    ok.ran = True
+    assert "why=ok" in ok.line()
