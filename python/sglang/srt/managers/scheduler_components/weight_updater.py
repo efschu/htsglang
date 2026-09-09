@@ -58,6 +58,7 @@ from sglang.srt.managers.weg2_memory_saver import (
     vram_credit,
     weg2_graph_tag_armed,
 )
+from sglang.srt.mem_cache.weg2_store_gates import Weg2StoreIndexBlind
 
 #: C21 / spec R13.  The group fence's budget, named so the ONE place that owns
 #: it can be re-justified and so C14's credit wait can be bounded by the SAME
@@ -1004,6 +1005,69 @@ class SchedulerWeightUpdaterManager:
         )
         return {"per_tag": merged, "critical_path": critical}
 
+    def _weg2_rescan_store_index(self) -> None:
+        """Re-read the L3 store directory into the LRU index at this wake.
+
+        #1295: ``HiCacheStorage.rescan_eviction_index`` was written as THE
+        mitigation for two eviction owners over one directory -- its own
+        docstring says "an index built once at boot is wrong after hours of the
+        sibling's writes ... Each owner therefore re-scans when it wakes" -- and
+        at 57fef0ce6e it had ZERO callers anywhere in ``python/sglang``.
+        Measured on boot weg2sb5h: ``re-scanned at wake`` = 0 in both the P and
+        the D log, while the store reached 1.34x its cap. The index the cap is
+        enforced against, and the measurement of the bytes a sibling owner holds
+        in the same directory, both go stale exactly across a sleep; this is the
+        moment they are corrected, which is why it runs here rather than on the
+        write path (re-walking 655k files per page would buy nothing -- a
+        sleeping group performs no writes).
+
+        ``Weg2StoreIndexBlind`` is NOT caught. ``rescan_eviction_index``
+        records the obligation in its own docstring: the wake caller escalates
+        it group-fatally, because a cap enforced over a fraction of the sole
+        carrier is not a cap and continuing spends the whole awake phase
+        evicting against numbers that do not describe the disk. Everything
+        else -- no store, no evictor, an OSError from the walk -- leaves the
+        wake alone; a stale index degrades the hit rate, and refusing the wake
+        over it would be worse than the staleness.
+        """
+        sch = self.scheduler
+        tc = getattr(sch, "tree_cache", None)
+        if tc is None or not getattr(sch, "enable_hierarchical_cache", False):
+            return
+        controller = getattr(tc, "cache_controller", None)
+        backend = getattr(controller, "storage_backend", None)
+        if backend is None or not hasattr(backend, "rescan_eviction_index"):
+            return
+        t0 = time.perf_counter()
+        try:
+            census = backend.rescan_eviction_index()
+        except Weg2StoreIndexBlind:
+            raise
+        except Exception as e:
+            logger.warning(
+                "WEG2-STORE-RESCAN skipped at wake: %s (%s) -- the eviction "
+                "index keeps the numbers it had at the last census, so the cap "
+                "is enforced against a stale reading of the directory",
+                e,
+                type(e).__name__,
+            )
+            return
+        logger.info(
+            "WEG2-STORE-RESCAN at wake: %d of %d files, %d of %d B (%.1f%%) "
+            "indexed here; %d B in this directory belong to the sibling owner "
+            "and are counted against the same cap but reclaimable only by it "
+            "(instrument: os.stat over every .bin under the store, charged at "
+            "max(st_blocks*512, st_size) -- the #410 unit, not apparent size) "
+            "in %.0f ms",
+            census.get("indexed_entries", 0),
+            census.get("seen_entries", 0),
+            census.get("indexed_bytes", 0),
+            census.get("seen_bytes", 0),
+            100.0 * float(census.get("fraction", 1.0)),
+            census.get("foreign_bytes", 0),
+            (time.perf_counter() - t0) * 1000,
+        )
+
     def _weg2_drain_hicache_before_sleep(self, bound_s: float = 30.0) -> None:
         """Drain HiCache in-flight terms (write-through / storage backup /
         load-back / prefetch) before a sleep is judged -- see the caller."""
@@ -1829,6 +1893,7 @@ class SchedulerWeightUpdaterManager:
                 logger.info(
                     "WEG2-DORMANT cleared: kv_cache resumed, admission seams admit"
                 )
+                self._weg2_rescan_store_index()
                 if scheduler.disaggregation_mode == DisaggregationMode.DECODE:
                     for queue_name in (
                         "disagg_decode_transfer_queue",
