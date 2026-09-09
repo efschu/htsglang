@@ -238,7 +238,7 @@ def test_gate_names_the_non_joiner(tmp_path):
             xr.wave_gate(region, 0, 1, True, budget_s=1.0, log=lines.append)
         msg = str(excinfo.value)
 
-        assert "W53 Weg2XchgGateTimeout" in msg
+        assert "W71 Weg2XchgGateTimeout" in msg
         assert f"joined={xr.N_RANKS - 1}/{xr.N_RANKS}" in msg, msg
         assert "group=D" in msg and "rank=1" in msg and f"row={straggler_row}" in msg, msg
         assert f"pid={procs[straggler_row].pid}" in msg, msg
@@ -389,7 +389,7 @@ def test_a_joined_row_whose_writer_is_dead_is_not_a_join(tmp_path):
 
     A rank that writes wave k's row and then dies would otherwise close every
     later gate 6/6 without it -- and after gate 1 the source has unmapped, so
-    the flip would be committed to the W57 roll-forward by a gate that
+    the flip would be committed to the W75 roll-forward by a gate that
     reported PASS.
     """
     region = _make(tmp_path)
@@ -476,7 +476,7 @@ def test_a_torn_row_is_not_a_join(tmp_path):
 
 
 def test_wave_gate_refuses_an_ok_false_vote(tmp_path):
-    """Spec section 1.3 step 17: "Any ok=False or expiry -> W53"."""
+    """Spec section 1.3 step 17: "Any ok=False or expiry -> W71"."""
     region = _make(tmp_path)
     lines = []
     proc_root = _fake_proc(tmp_path, [os.getpid()] + [9000 + r for r in range(1, 6)])
@@ -496,7 +496,7 @@ def test_wave_gate_refuses_an_ok_false_vote(tmp_path):
 def test_a_refusal_votes_false_so_the_peers_do_not_wait_the_budget(tmp_path):
     """Spec section 3.6: a rank that cannot go on VOTES, it does not go quiet.
 
-    Every W52/W53 in this module leaves by exception.  If the refusing rank
+    Every W70/W71 in this module leaves by exception.  If the refusing rank
     does not also publish ``ok=False``, its five peers learn nothing until
     their own gate reaches ``WEG2_GROUP_FENCE_BUDGET_S`` = 120 s -- which is
     the fast named propagation section 3.2 sells against ``monitored_barrier``.
@@ -584,7 +584,7 @@ def test_the_gate_acceptance_line_cannot_be_silently_omitted():
 
 
 def test_matrix_refuses_asymmetric_plan(tmp_path):
-    """``send[0][1] != recv[1][0]`` -> W52 on EVERY reader, before any transfer."""
+    """``send[0][1] != recv[1][0]`` -> W70 on EVERY reader, before any transfer."""
     region = _make(tmp_path)
     try:
         matrix = _byte_matrix()
@@ -605,7 +605,7 @@ def test_matrix_refuses_asymmetric_plan(tmp_path):
                 xr.gate0_check(region, reader, front_plan_hash=0xABCDEF, budget_s=5.0,
                                census_unavailable_reason=NO_CENSUS)
             msg = str(excinfo.value)
-            assert "W52 Weg2XchgPlanDisagree" in msg, msg
+            assert "W70 Weg2XchgPlanDisagree" in msg, msg
             assert "send[0][1]=" in msg and "recv[1][0]=" in msg, msg
             assert "delta=4096" in msg, msg
             assert "no byte has moved" in msg, msg
@@ -627,7 +627,7 @@ def test_a_rank_local_gate0_refusal_stops_every_reader(tmp_path):
     A rank whose per-tag total disagrees with ``tms_tag_bytes`` raising alone
     would leave the other five to proceed and discover it only when wave 1's
     gate expired at the full 120 s budget -- after they had moved wave-1 bytes.
-    Spec section 3.3: *"Any mismatch -> W52 on every reader."*
+    Spec section 3.3: *"Any mismatch -> W70 on every reader."*
     """
     region = _make(tmp_path)
     try:
@@ -748,7 +748,7 @@ def test_gate0_refuses_a_reader_that_never_published_its_own_row(tmp_path):
 
 
 def test_producer_death_after_publish_does_not_lose_the_slot(tmp_path):
-    """Published bytes survive their producer; a death mid-FILL is W53."""
+    """Published bytes survive their producer; a death mid-FILL is W71."""
     region = _make(tmp_path)
     ctx = mp.get_context("fork")
     nbytes = 8192
@@ -789,7 +789,7 @@ def test_producer_death_after_publish_does_not_lose_the_slot(tmp_path):
         with pytest.raises(xr.Weg2XchgGateTimeout) as excinfo:
             region.claim_produced(1, 0)
         msg = str(excinfo.value)
-        assert "W53 Weg2XchgGateTimeout" in msg and "state=FILLING" in msg, msg
+        assert "W71 Weg2XchgGateTimeout" in msg and "state=FILLING" in msg, msg
         assert f"producer_pid={filler.pid}" in msg and "alive_in_proc=no" in msg, msg
     finally:
         region.close()
@@ -1308,12 +1308,12 @@ def test_prepare_leaves_no_region_behind_when_the_handshake_fails(tmp_path, monk
 
 
 def test_the_two_wcodes_are_the_ones_the_spec_allocated():
-    """W52/W53, one code one name -- the census test pins the rest."""
+    """W70/W71, one code one name -- the census test pins the rest."""
     src = inspect.getsource(xr)
-    assert "W52 Weg2XchgPlanDisagree" in src and "W53 Weg2XchgGateTimeout" in src
+    assert "W70 Weg2XchgPlanDisagree" in src and "W71 Weg2XchgGateTimeout" in src
     for taken in ("W50 ", "W49 ", "W35 "):
         assert f"{taken}Weg2Xchg" not in src
-    assert "W54" in src, (
-        "W54 Weg2XchgShortPiece is S4's, and the widening of W52 past spec "
+    assert "W72" in src, (
+        "W72 Weg2XchgShortPiece is S4's, and the widening of W70 past spec "
         "section 7's row for it is stated where it happens"
     )

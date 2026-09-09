@@ -209,7 +209,7 @@ class Weg2PcieLockTimeout(RuntimeError):
 
 
 class Weg2XchgCoverageRefused(RuntimeError):
-    """W51 -- a live tensor under an exchanged tag has no source.
+    """W69 -- a live tensor under an exchanged tag has no source.
 
     #1273 spec section 6/S2.  The weight-byte exchange fills the destination's
     weight pages from the SOURCE's VRAM, descriptor by descriptor, and restores
@@ -1922,7 +1922,7 @@ def chunk_tag_cards(
 #: ``weights_draft`` (constants.py), whose entire purpose is to be OUTSIDE the
 #: family.  Under the prefix test it was inside it, which would have put the
 #: drafter back into every leg, census and wave and left the exchange with a
-#: destination range that has no VRAM source (W58).  Same defect one layer down
+#: destination range that has no VRAM source (W76).  Same defect one layer down
 #: for the planned ``weights_vision`` (spec section 6/S8).
 #:
 #: The index is what ``weight_chunk_tag`` writes, so the index is what the
@@ -2023,7 +2023,7 @@ def weights_region(adapter: Any, tag: str, *, enable_cpu_backup: bool) -> Iterat
 
     #1273 S2 (refuter F6).  Publishing the region tag and opening the region
     were two statements at two call sites (model_runner's boot load and
-    weight_updater's W57 roll-forward), and one of them adopted the publisher
+    weight_updater's W75 roll-forward), and one of them adopted the publisher
     while the other kept a hardcoded ``GPU_MEMORY_TYPE_WEIGHTS``.  That is
     split brain, not a TODO: the roll-forward's post-load repack runs
     ``weight_chunk_scope`` (model_loader/loader.py:941), which reads THIS

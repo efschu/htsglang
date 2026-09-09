@@ -2448,7 +2448,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # CLASSIFIED (classify_runner) rather than read off the is_draft_worker
         # CONSTRUCTION gate: the lane (#274) and the phase-flip TP stack (#631)
         # ride that gate too and hold TARGET weights (see :514-521), and a
-        # shape the classifier does not know is refused by name (W60), never
+        # shape the classifier does not know is refused by name (W78), never
         # guessed.  weights_region publishes the tag weight_chunk_scope must
         # restore -- the C hook cannot be asked for it -- and opens the region
         # in the same statement, so the two cannot disagree.

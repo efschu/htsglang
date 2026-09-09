@@ -979,7 +979,7 @@ P_MAMBA_AUTO_SAFETY_MARGIN = 1.25
 P_MAMBA_SLOTS_PER_RUNNING_REQUEST = 2
 #: #1273: where a waking group's weight bytes come from. ``ring`` is today's
 #: path, byte for byte, and stays the default until S6 has booted the other
-#: one; ``exchange`` moves them card-to-card and is what W55 prices.
+#: one; ``exchange`` moves them card-to-card and is what W73 prices.
 #: ``shadow`` (#1273 S5) is the third value and it is RING-AUTHORITATIVE: the
 #: weights still come from the host ring, byte for byte, and the exchange runs
 #: beside them into buffers nothing reads so its bytes can be compared against
@@ -1027,7 +1027,7 @@ def xchg_region_pairs(n_cards: int) -> int:
 
 
 #: #1273 S7 round-2 review F2: does the ``exchange`` arm change any RANK
-#: behaviour yet?  No -- S7 arms the W55 gate and nothing else, so a boot
+#: behaviour yet?  No -- S7 arms the W73 gate and nothing else, so a boot
 #: launched with ``--weg2-weight-source exchange`` still runs the ring path
 #: byte for byte.  The arming line SAYS so rather than leaving a later reader
 #: of the log to infer it from a non-zero ``ring_H_mib``.
@@ -1397,7 +1397,7 @@ class BootState:
     dc_expect_d: Dict[str, int] = field(default_factory=dict)
     ledger_lines: List[str] = field(default_factory=list)
     ring_lines: List[str] = field(default_factory=list)
-    #: #1273 S7: the W55 residency rows, empty on the default `ring` arm --
+    #: #1273 S7: the W73 residency rows, empty on the default `ring` arm --
     #: an empty list there means "the exchange did not run", never "it was
     #: checked and found nothing".
     xchg_lines: List[str] = field(default_factory=list)
@@ -3306,7 +3306,7 @@ def prepare_shadow_env(log: Log, boot_nonce: str, weight_source: str,
     ``model_runner`` still opens the weights region with ``enable_cpu_backup``
     and the ring still refills every byte.
 
-    W55 IS NOT ARMED HERE, on purpose.  W55 prices the co-residency peak of a
+    W73 IS NOT ARMED HERE, on purpose.  W73 prices the co-residency peak of a
     real exchange, and under ``shadow`` no tag is ever exchanged: both images
     stay where they are and the only new VRAM is the shadow's own bounded
     subset, which is priced per card, per leg, against the LIVE NVML free
@@ -3335,7 +3335,7 @@ def prepare_shadow_env(log: Log, boot_nonce: str, weight_source: str,
     # same reason as the arm -- it decides the deposit's size in the ranks AND
     # the worst case the #1269 ledger charged at launch, so the two may not be
     # two readings.  Validated here, so an illegal value dies at the launcher
-    # with W66 rather than at six rank imports.
+    # with W84 rather than at six rank imports.
     slot_mib = weight_exchange_transport.validate_oncard_slot_mib(
         oncard_slot_mib)
     env[weight_exchange_transport.ENV_ONCARD_SLOT_MIB] = str(slot_mib)
@@ -3365,7 +3365,7 @@ def prepare_weight_exchange(
     ring_h_mib: int,
     floor_mib: float = ARMING_FLOOR_MIB,
 ) -> Optional["xchg_residency.XchgResidency"]:
-    """W55 (#1273 S7): price the exchange's VRAM peak BEFORE either group starts.
+    """W73 (#1273 S7): price the exchange's VRAM peak BEFORE either group starts.
 
     Returns None on the ``ring`` arm, where nothing about this boot changes --
     the check is not merely skipped there, it has no subject: no wave schedule
@@ -3380,7 +3380,7 @@ def prepare_weight_exchange(
     same reason: a refusal that arrives mid-flip arrives after VRAM has already
     been mutated.
 
-    W55 REPLACES W49's ROLE HERE rather than joining it (spec section 0.4,
+    W73 REPLACES W49's ROLE HERE rather than joining it (spec section 0.4,
     finding R1-1): under ``exchange`` the launcher publishes no
     ``TMS_HOST_RING_*``, Sigma H is 0 and every ring inequality reads ``0 > 0``
     -- false, i.e. a gate that passes because it has nothing to grade.  An
@@ -3396,7 +3396,7 @@ def prepare_weight_exchange(
     """
     if weight_source != "exchange":
         return None
-    census = xchg_residency.load_census(census_path)   # raises W55 by name
+    census = xchg_residency.load_census(census_path)   # raises W73 by name
     res = xchg_residency.solve(cards, census, floor_mib)
     for ln in res.lines:
         log(ln)
@@ -7749,7 +7749,7 @@ def build_parser() -> argparse.ArgumentParser:
              "the sleeping group's still-mapped pages, which removes the ring's "
              "whole Sigma H from host RAM and pays for it with a VRAM peak while "
              "both groups' bytes are resident on one card. In THIS slice (S7) "
-             "the flag arms one thing only -- the W55 residency check on that "
+             "the flag arms one thing only -- the W73 residency check on that "
              "peak, before either group starts. "
              "TODO(S7->S6): S6 owns propagating it into the two groups' argv, "
              "the request structs and the memory saver's region flag; until "
@@ -7759,7 +7759,7 @@ def build_parser() -> argparse.ArgumentParser:
              "it into raw cudaMalloc buffers nothing reads, comparing what it "
              "pulled against what the ring restored (WEG2-XCHG-SHADOW).  It "
              "arms the region and the six-rank shadow gate; it can refuse "
-             "ITSELF (W61, per card, against that card's free column) and it "
+             "ITSELF (W79, per card, against that card's free column) and it "
              "can refuse NOTHING ELSE.",
     )
     ap.add_argument(
@@ -7778,7 +7778,7 @@ def build_parser() -> argparse.ArgumentParser:
              "is deliberately NOT relaxed (operator decision 2026-09-09): a "
              "per-flip charge would fund the smallest flip and refuse none. "
              "Must be a whole multiple of the 32 MiB slot floor, else the "
-             "launcher refuses by name (W66).",
+             "launcher refuses by name (W84).",
     )
     ap.add_argument(
         "--weg2-xchg-oncard", choices=ONCARD_MODE_CHOICES,
@@ -7802,7 +7802,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--weg2-shadow-hop-bound-ms", type=float,
         default=weight_exchange_shadow.SHADOW_HOP_BOUND_MS_DEFAULT,
         help="#1273 S5b: the wall the SHADOW is allowed to price its on-card "
-             "hop at before it refuses ITSELF for this leg (W61, scope=hop). "
+             "hop at before it refuses ITSELF for this leg (W79, scope=hop). "
              "The default is the spec's 20 ms diagonal target for the "
              "AUTHORITATIVE lane times a named factor of "
              f"{weight_exchange_shadow.SHADOW_HOP_BOUND_FACTOR:g} -- the "
@@ -7817,12 +7817,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     ap.add_argument(
         "--weg2-xchg-census", default="",
-        help="#1273 S7: the per-card, per-tag, per-group census W55 prices the "
+        help="#1273 S7: the per-card, per-tag, per-group census W73 prices the "
              "exchange's VRAM peak from -- a JSON FILE with its own provenance "
              "string, the same kind of measured input --duplex-probe already is, "
              "never a number on this command line. Required by "
              "--weg2-weight-source exchange; absent, the launcher REFUSES by "
-             "name (W55) rather than invent a table",
+             "name (W73) rather than invent a table",
     )
     ap.add_argument("--ring-table-boot", default="",
                     help="pin the ring table to ONE boot instead of the newest usable "
@@ -8757,7 +8757,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                             "this host budget; this boot refuses by name)")
     state.ring_dir = ring_plan.dir if (ring_plan.armed and ring_plan.form == "MAP_SHARED") else ""
 
-    # 1c. #1273 S7: W55, the exchange's VRAM residency, per card per direction
+    # 1c. #1273 S7: W73, the exchange's VRAM residency, per card per direction
     # per wave -- HERE, beside the ring's own inequalities, because it grades
     # the same kind of claim (a peak nobody can observe once the flip is
     # running) and must refuse in the same place (before either group starts).
@@ -9736,7 +9736,7 @@ class Weg2CarrierFloorUnreachable(Weg2LaunchRefused):
 #: as W20 -- an arm whose predicted RUN PEAK is not below the observed reap
 #: point does not boot -- so it joins this tuple instead of growing a second
 #: `except` clause beside the one handler.
-#: #1273 S7 round-2 review F1: ``xchg_residency.Weg2XchgRefused`` (W55) joins
+#: #1273 S7 round-2 review F1: ``xchg_residency.Weg2XchgRefused`` (W73) joins
 #: it for the SAME reason W34 once did not -- it shipped outside this tuple and
 #: therefore exited 1 with a traceback and dropped no admin key. It is the
 #: module's BASE class, not the leaf, so the FIX 2 lesson holds one module on:

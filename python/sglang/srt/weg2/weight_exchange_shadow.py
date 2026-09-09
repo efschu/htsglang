@@ -29,7 +29,7 @@ shadow that finds something is exactly the thing it may not do:**
    ``BaseException`` and turns it into a logged line -- with ONE stated arm,
    ``explicit=True``, where an operator asked for a named class subset by hand
    and gets :class:`Weg2XchgShadowUnaffordable` instead of a silent degrade
-   (the W56 two-arm shape; it has no producer on the boot path, TODO(S6));
+   (the W74 two-arm shape; it has no producer on the boot path, TODO(S6));
 6. it may not hold the flip: every wait here is bounded by ITS OWN small
    budget, never by ``WEG2_GROUP_FENCE_BUDGET_S``, because a shadow that can
    block a leg for 120 s has authority over the flip's wall.
@@ -39,7 +39,7 @@ and it is the one deviation this module takes: that rule exists so the
 authoritative path cannot grow a second, differently-tuned deadline.  A budget
 that bounds an observer is not that; using the fence budget here would be.
 
-**THE MISMATCH IS COUNTED, NEVER ACTED ON.**  W59 names the class, the stripe,
+**THE MISMATCH IS COUNTED, NEVER ACTED ON.**  W77 names the class, the stripe,
 the byte counts and both checksums, and the flip continues.  Spec section 3.3
 rule 3 is obeyed at the one place it matters: ``checksum_is_representable``
 (``model_executor/weights_arena.py:133``) is asked BEFORE anything is called a
@@ -76,8 +76,8 @@ SHADOW_LINE_PREFIX = "WEG2-XCHG-SHADOW"
 SHADOW_GATE_LINE_PREFIX = "WEG2-XCHG-SHADOW-GATE"
 SHADOW_BUDGET_LINE_PREFIX = "WEG2-XCHG-SHADOW-BUDGET"
 
-MISMATCH_MARKER = "W59 Weg2XchgShadowMismatch"
-UNAFFORDABLE_MARKER = "W61 Weg2XchgShadowUnaffordable"
+MISMATCH_MARKER = "W77 Weg2XchgShadowMismatch"
+UNAFFORDABLE_MARKER = "W79 Weg2XchgShadowUnaffordable"
 
 #: S5c.  THE ACCEPTANCE LINE OF THE DERIVED PLAN, one per leg per rank.
 #:
@@ -88,14 +88,14 @@ UNAFFORDABLE_MARKER = "W61 Weg2XchgShadowUnaffordable"
 #: boot plan" wants; ``grep 'WEG2-XCHG-PLAN card='`` is the shadow's own.
 PLAN_LINE_PREFIX = "WEG2-XCHG-PLAN"
 
-#: S5c.  THE PER-CLASS COMPARE LINE.  ``mismatch_message`` (W59) names a class
+#: S5c.  THE PER-CLASS COMPARE LINE.  ``mismatch_message`` (W77) names a class
 #: only when something went WRONG, so a boot whose shadow agreed carried no
 #: per-class evidence at all -- the reader could see ``match=7`` and not which
 #: seven.  This line is emitted for MATCH and MISMATCH alike, one per class,
 #: and it is what item 4 of the S5c brief asks for.
 COMPARE_LINE_PREFIX = "WEG2-XCHG-SHADOW-COMPARE"
 
-#: W64 -- the six ranks did not derive the SAME plan.
+#: W82 -- the six ranks did not derive the SAME plan.
 #:
 #: The gate already refused six ranks that chose different CLASS SUBSETS
 #: (``classes_hash``).  S5c gives the plan a product producer, and a producer
@@ -107,7 +107,7 @@ COMPARE_LINE_PREFIX = "WEG2-XCHG-SHADOW-COMPARE"
 #: subset hash agrees in every one of them because the subset is CHOSEN from
 #: the rotation and two different rotations can offer the same name.
 #:
-#: TWO SCOPES, ONE CODE, the same shape as W61's ``scope=vram|hop``:
+#: TWO SCOPES, ONE CODE, the same shape as W79's ``scope=vram|hop``:
 #:
 #: * ``scope=group`` -- the rows this hook expects do not carry one
 #:   ``plan_digest``.  The digest is over the GROUP-UNIFORM derivation facts
@@ -120,10 +120,10 @@ COMPARE_LINE_PREFIX = "WEG2-XCHG-SHADOW-COMPARE"
 #:   not a configuration fault: it is the honest reading of "the two groups do
 #:   not hold the same bytes on this card", which on the P=PP / D=TP form of
 #:   this rig is the expected answer.  It is refused BY NAME here rather than
-#:   left to become a W54 byte-count disagreement three seams later inside the
+#:   left to become a W72 byte-count disagreement three seams later inside the
 #:   on-card consumer, or -- worse -- a red compare that reads as a defect in
 #:   the exchange when it is a statement about the two layouts.
-PLAN_DIVERGED_MARKER = "W64 Weg2XchgShadowPlanDiverged"
+PLAN_DIVERGED_MARKER = "W82 Weg2XchgShadowPlanDiverged"
 
 #: The comparison granularity, spec section 6/S5: "per-64-MiB-stripe checksum
 #: on device, no host round trip".  It is ALSO the size of the scratch the spec
@@ -173,7 +173,7 @@ SHADOW_HOOK_BUDGET_S = SHADOW_GATE_BUDGET_S
 #: MiB per card is the user's free space, not an internal allowance, and the
 #: VRAM corridor band (819-1229 MiB NVML-free per card under load) is measured
 #: in the same regime the shadow runs in -- a live boot with load -- which is
-#: what makes it the right floor here and a conservative one in W55's unloaded
+#: what makes it the right floor here and a conservative one in W73's unloaded
 #: window.
 SHADOW_FLOOR_MIB = 1024.0
 
@@ -192,7 +192,7 @@ SB5F_FREE_MIB_NOTE = (
 
 
 class Weg2XchgShadowMismatch(RuntimeError):
-    """W59 -- a pulled stripe differs from the destination's own restored bytes.
+    """W77 -- a pulled stripe differs from the destination's own restored bytes.
 
     **RAISED ONLY WHERE IT CANNOT REACH A FLIP** (a test, or a deliberate
     ``strict=True`` caller).  On the flip path it is a COUNTER and a log line:
@@ -206,7 +206,7 @@ class Weg2XchgShadowMismatch(RuntimeError):
 
 
 class Weg2XchgShadowPlanDiverged(RuntimeError):
-    """W64 -- the ranks of one leg did not derive the same plan.
+    """W82 -- the ranks of one leg did not derive the same plan.
 
     NOT a flip refusal, exactly like every other refusal in this module: it
     switches the SHADOW off for this leg and the ring proceeds untouched.  It
@@ -225,7 +225,7 @@ class Weg2XchgShadowPlanDiverged(RuntimeError):
 
 
 class Weg2XchgShadowUnaffordable(RuntimeError):
-    """W61 -- the shadow's buffers do not fit this card's free column.
+    """W79 -- the shadow's buffers do not fit this card's free column.
 
     NOT a flip refusal.  Raised only when a caller EXPLICITLY demanded a class
     subset (``classes=``, which has no launcher flag yet: TODO(S6)); the
@@ -235,7 +235,7 @@ class Weg2XchgShadowUnaffordable(RuntimeError):
     this sentence used to say and is not what the gate does (S5 refuter,
     wording).  A shadow that refuses a FLIP would have taken the authority this
     slice exists not to have; refusing ITSELF is the whole mechanism.  Same
-    shape as W56's two arms in S4: logged when the degrade is automatic, raised
+    shape as W74's two arms in S4: logged when the degrade is automatic, raised
     when the operator asked for the thing that is unavailable.
     """
 
@@ -360,7 +360,7 @@ class ShadowVerdict:
 
 def plan_divergence_message(*, scope: str, leg: int, epoch: str,
                             rows: Dict[int, int], field: str) -> str:
-    """W64, naming the scope, the field and every row's own value.
+    """W82, naming the scope, the field and every row's own value.
 
     Every row is printed, not just the odd one out: with six rows and two
     values there is no "the odd one out", and a message that picks one has
@@ -408,7 +408,7 @@ def deposit_refusal_message(*, reason: str, rank: int, row: int, peer_row: int,
                             batches: int, slots: int, slot_bytes: int,
                             budget_bytes: int,
                             slots_max: int = tp.ONCARD_SLOTS_MAX) -> str:
-    """W65: this lane's store-and-forward deposit does not fit (#1273 S6).
+    """W83: this lane's store-and-forward deposit does not fit (#1273 S6).
 
     THE SIBLING OF :func:`oncard_not_drainable_message`, at the same placement
     and under the same contract: the gate rendezvous has already run, the two
@@ -424,7 +424,7 @@ def deposit_refusal_message(*, reason: str, rank: int, row: int, peer_row: int,
     with its leg), so that lane keeps the old, blameless line.
     """
     return (
-        f"W65 Weg2XchgDepositUnfundable rank={rank} row={row} "
+        f"W83 Weg2XchgDepositUnfundable rank={rank} row={row} "
         f"peer_row={peer_row} leg={leg} epoch={epoch} "
         f"hook={'source' if is_source else 'destination'} reason={reason} "
         f"oncard_batches={batches} oncard_slots={slots} "
@@ -493,7 +493,7 @@ def shadow_gate(region: xr.XchgRegion, row: int, *, leg: int, vote: bool,
 
     It is also why ``classes_hash`` is in the row: six ranks shadowing
     DIFFERENT class subsets is six half-experiments, and the disagreement is
-    detectable here for free rather than as a W54 three seams later.
+    detectable here for free rather than as a W72 three seams later.
     """
     wanted = (tuple(range(xr.N_RANKS)) if expect_rows is None
               else tuple(sorted({int(r) for r in expect_rows} | {int(row)})))
@@ -523,7 +523,7 @@ def shadow_gate(region: xr.XchgRegion, row: int, *, leg: int, vote: bool,
                         f"[row={i} classes_hash={rows[i]['classes_hash']:#x}]"
                         for i in wanted),
                     monotonic() - started, expected=len(wanted))
-            # W64, scope=group.  THE DERIVATION'S OWN AGREEMENT, checked in the
+            # W82, scope=group.  THE DERIVATION'S OWN AGREEMENT, checked in the
             # rendezvous that already exists rather than in a second one: every
             # field of this digest is read from the LAUNCHER's environment or
             # from a pure function of it (S5c refuter, must_fix 4 took the one
@@ -543,7 +543,7 @@ def shadow_gate(region: xr.XchgRegion, row: int, *, leg: int, vote: bool,
                                      "plan-diverged-group",
                                      monotonic() - started,
                                      expected=len(wanted))
-            # W64, scope=oncard-peer.  THE CO-LOCATED PAIR's ON-CARD PIECES.
+            # W82, scope=oncard-peer.  THE CO-LOCATED PAIR's ON-CARD PIECES.
             #
             # S6 fix F2 CHANGED THE PREDICATE, not the check.  This compared
             # ``card_digest`` -- a hash of WHOLE STORAGE -- and under
@@ -556,7 +556,7 @@ def shadow_gate(region: xr.XchgRegion, row: int, *, leg: int, vote: bool,
             # byte-exact), so what the pair must agree on is the PIECE SET the
             # plan assigns to their card -- name, offsets, bytes, ordered.
             # That is a question both sides can answer yes to, and it still
-            # catches the W54 byte-count disagreement this check exists for:
+            # catches the W72 byte-count disagreement this check exists for:
             # two ranks that framed the same overlap differently have different
             # piece keys.  The geometry digest survives as INFORMATION on the
             # plan line and is never a gate again.
@@ -885,7 +885,7 @@ def price_leg(card_uuid: str, descs: Sequence[object], *, rank: int,
 
     Both co-located processes compute this from the same ``src_rank == rank``
     filter over the same descriptors, so they agree by construction and the
-    W52 slot_bytes cross-check in the diagonal stays a cross-check.
+    W70 slot_bytes cross-check in the diagonal stays a cross-check.
     """
     # THE SAME SET :func:`shadow_transport` ACTUALLY ALLOCATES FOR.
     # MEASURED-BY-REVIEW DEFECT (S5b refuter, non-blocking finding, carried
@@ -962,7 +962,7 @@ def checksum_representable(value: int, nbytes: int) -> bool:
 
     MEASURED-BY-REVIEW DEFECT (S5 review, must_fix 1): the question was asked
     for STRIPES only.  The SLOT-checksum path -- the transport's own
-    producer-vs-consumer comparison, which reaches the same W59 marker --
+    producer-vs-consumer comparison, which reaches the same W77 marker --
     logged a mismatch on a bare inequality, so a batch whose two ends framed
     the field differently was reported as a data corruption.  That is #656
     register C22 exactly, and it is why rule 3 says "before ANY mismatch is
@@ -998,7 +998,7 @@ def classify(stripe: Stripe) -> str:
 
 def mismatch_message(stripe: Stripe, *, verdict: str, leg: int,
                      epoch: str) -> str:
-    """W59, naming the class, the parameter, the offset and both sums."""
+    """W77, naming the class, the parameter, the offset and both sums."""
     return (
         f"{MISMATCH_MARKER} leg={leg} epoch={epoch} verdict={verdict} "
         f"class={stripe.tensor_class} param={stripe.param_name} "
@@ -1055,7 +1055,7 @@ def slot_checksum_verdict(report: "tp.ChecksumReport") -> str:
 
 def slot_checksum_message(report: "tp.ChecksumReport", *, verdict: str,
                           leg: int, epoch: str) -> str:
-    """W59 for a staged batch, naming the lane, the slot and both sums."""
+    """W77 for a staged batch, naming the lane, the slot and both sums."""
     return (
         f"{MISMATCH_MARKER} leg={leg} epoch={epoch} verdict={verdict} "
         f"lane={report.lane} pair={report.pair} slot={report.slot} "
@@ -1420,7 +1420,7 @@ class ShadowResult:
     blocked_ms: float = 0.0
     #: S5c.  The GROUP-UNIFORM digest of the derivation facts this rank voted
     #: with (:attr:`LegPlanFacts.digest`), on the line so a boot log can be
-    #: censused for the divergence W64 refuses without re-deriving anything.
+    #: censused for the divergence W82 refuses without re-deriving anything.
     plan_digest: int = 0
 
     @property
@@ -1570,7 +1570,7 @@ class ShadowRun:
         """Compare the pulled bytes against the ring-restored ones.  COUNT ONLY.
 
         Called after ``family_complete`` on the destination.  Every mismatch is
-        a W59 log line and a counter; nothing here refuses, retries, or touches
+        a W77 log line and a counter; nothing here refuses, retries, or touches
         a tag.  If the caller passed no summer there is nothing to compare and
         the line says ``verdict=NOT-RUN`` rather than ``MATCH`` -- an unarmed
         instrument may not read as a passed one (spec section 4.2).
@@ -1592,7 +1592,7 @@ class ShadowRun:
             per_class: Dict[str, List[int]] = {}
             for stripe in stripes:
                 verdict = classify(stripe)
-                # PER CLASS, FOR EVERY VERDICT (S5c item 4): W59 names a class
+                # PER CLASS, FOR EVERY VERDICT (S5c item 4): W77 names a class
                 # only when something went wrong, so a boot whose shadow AGREED
                 # carried no per-class evidence at all -- ``match=7`` and no way
                 # to say which seven, over which bytes.  The class is the unit
@@ -1703,12 +1703,12 @@ def shadow_transport(
 
     EVERY FAILURE PATH ENDS IN A LOG LINE AND A RETURNED RESULT, WITH ONE
     STATED EXCEPTION.  No exception leaves this function on the automatic path,
-    including the ones the transport raises by design (W52, W53, W54): on the
+    including the ones the transport raises by design (W70, W71, W72): on the
     authoritative path those are refusals that stop a flip, and here the same
     event means "the shadow did not get its measurement".  The exception is
     ``explicit=True`` -- an operator who asked for a named class subset gets
     :class:`Weg2XchgShadowUnaffordable` raised instead of a degrade, the same
-    two-arm shape as W56 in S4, and that arm has no producer on the boot path
+    two-arm shape as W74 in S4, and that arm has no producer on the boot path
     (there is no launcher flag for it: TODO(S6)).  ``vote_failure`` is a
     RECORDER, not the transport's group vote -- passing the real one would let
     an observer's thread take six ranks down.
@@ -1819,7 +1819,7 @@ def shadow_transport(
             # concurrent peer at all: with one slot per batch the source fills,
             # publishes and RETURNS, and the destination reads the same shm
             # file in its own later leg.  So the refusal below now has two
-            # arms -- W65 when the deposit itself does not fit or is not funded
+            # arms -- W83 when the deposit itself does not fit or is not funded
             # (a claim that something is misconfigured), and the older
             # blameless line when no deposit is possible on this arm at all.
             # THE BATCHER'S OWN COUNT, not the hop model's ceil -- see
@@ -2058,7 +2058,7 @@ SHADOW_HOP_BOUND_MS_DEFAULT = tp.ONCARD_HOP_BUDGET_MS * SHADOW_HOP_BOUND_FACTOR
 #: new plumbing to see a flag the launcher set.
 ENV_HOP_BOUND_MS = "SGLANG_WEG2_SHADOW_HOP_BOUND_MS"
 
-#: W63 -- this RANK could not join the shadow while the mode is armed.
+#: W81 -- this RANK could not join the shadow while the mode is armed.
 #:
 #: It exists because item 6 of the S5b brief is a real hazard and not a style
 #: rule: the shadow gate is rank-uniform, so a rank that quietly returns
@@ -2066,15 +2066,15 @@ ENV_HOP_BOUND_MS = "SGLANG_WEG2_SHADOW_HOP_BOUND_MS"
 #: gate budget inside their own flip legs and then reading an EXPIRY, which
 #: looks identical to a card that refused on arithmetic.  A skip that cannot be
 #: told from a refusal is a silent divergence, and this names it.
-RANK_LOCAL_SKIP_MARKER = "W63 Weg2XchgShadowRankLocalSkip"
+RANK_LOCAL_SKIP_MARKER = "W81 Weg2XchgShadowRankLocalSkip"
 
 
 class Weg2XchgShadowRankLocalSkip(RuntimeError):
-    """W63 -- the shadow is armed for this boot but this rank cannot join it.
+    """W81 -- the shadow is armed for this boot but this rank cannot join it.
 
     Raised ONLY with ``explicit=True`` (an operator who asked for the shadow by
     name on this rank), the same two-arm shape as :class:`
-    Weg2XchgShadowUnaffordable` and W56 before it.  On the automatic path it is
+    Weg2XchgShadowUnaffordable` and W74 before it.  On the automatic path it is
     a log line and a ``reason=`` token on the leg's own
     ``WEG2-XCHG-SHADOW`` line, because a zero-authority observer that raises
     into a flip leg has taken the authority this slice exists not to have.
@@ -2126,7 +2126,7 @@ def hop_bound_ms(value: Optional[float] = None) -> float:
 def hop_refusal_message(*, card: str, priced_ms: float, bound_ms: float,
                         batches: int, slot_mib: float, leg: int,
                         model: str = "") -> str:
-    """W61 for the TIME term, the same marker the VRAM term already uses.
+    """W79 for the TIME term, the same marker the VRAM term already uses.
 
     ONE code for one class of event -- "the shadow cannot afford to run on this
     leg" -- and the line says which resource by naming both numbers.  A second
@@ -2152,7 +2152,7 @@ def hop_refusal_message(*, card: str, priced_ms: float, bound_ms: float,
 
 def rank_local_skip_message(*, reason: str, rank: int, leg: int, epoch: str,
                             detail: str = "") -> str:
-    """W63, naming the rank, the leg and what was missing."""
+    """W81, naming the rank, the leg and what was missing."""
     return (
         f"{RANK_LOCAL_SKIP_MARKER} rank={rank} leg={leg} epoch={epoch} "
         f"reason={reason}{(' detail=' + detail) if detail else ''} "
@@ -2198,7 +2198,7 @@ class LegPlanFacts:
     rank's inventory is its stage's band alone, and on a hybrid layer stack
     (GDN + full attention) a band that lacks one layer type yields a different
     class set.  The code did not check that assertion, it HASHED it, so the
-    divergence would have surfaced as W64 ``scope=group`` under a cause
+    divergence would have surfaced as W82 ``scope=group`` under a cause
     sentence naming a stale chunk geometry -- sending the reader to the wrong
     place (Instrument-Text-luegt, class A).
 
@@ -2432,7 +2432,7 @@ def derive_leg_plan(
     own on-card lane, are the bytes rank n of the other group holds for class C
     after the ring restored them.*  On a form where the two groups do NOT hold
     the same bytes on a card -- this rig's P=PP / D=TP shipping form -- that
-    claim is false, and it is refused BY NAME as W64 ``scope=oncard-peer`` at
+    claim is false, and it is refused BY NAME as W82 ``scope=oncard-peer`` at
     the gate, on the ``piece_digest`` (S6 fix F2), BEFORE a byte moves.  A named refusal is
     the honest answer there; a red compare would read as a defect in the
     exchange when it is a statement about two layouts, and a fabricated match
@@ -2654,7 +2654,7 @@ def card_geometry_digest(inventory: Sequence[object],
 #: the seam a TEST installs, and a future caller that has descriptors but no
 #: facts can still use it; what it may never carry is a plan a rank invented
 #: from its own ``named_parameters()`` with no cross-check, which is refused
-#: in W63's ``no-plan`` bullet with the reason.
+#: in W81's ``no-plan`` bullet with the reason.
 _PLAN_PROVIDER: Optional[Callable[[str, int, int], Sequence[object]]] = None
 
 
@@ -2766,7 +2766,7 @@ class ShadowLegInputs:
     #: consumer of this bounce cannot exist while the producer blocks on it.
     #: With a non-empty plan -- which is what S5c added -- every armed source
     #: leg would therefore fill a bounce, block in ``drain-final``, time out at
-    #: the budget, mark its PROD row FAILED and raise W53; the destination hook
+    #: the budget, mark its PROD row FAILED and raise W71; the destination hook
     #: would then find a FAILED row and raise at once.  Net product effect:
     #: seconds added to every sleep leg, on the critical path of the C14 credit,
     #: and ZERO bytes ever compared.
@@ -2782,7 +2782,7 @@ class ShadowLegInputs:
     #:
     #: S6: ``False`` no longer means the lane is refused.  It means the lane
     #: needs the STORE-AND-FORWARD shape, which needs no concurrent peer -- and
-    #: the refusal now fires only when that shape does not fit either (W65,
+    #: the refusal now fires only when that shape does not fit either (W83,
     #: :func:`deposit_refusal_message`) or when the arm cannot carry it (the
     #: ``ipc`` arm, which keeps the old blameless line).
     oncard_drainable: bool = True
@@ -2908,7 +2908,7 @@ class ShadowLeg:
                 # the RPC carries ``weg2_memory_saver.credit_epoch`` =
                 # ``<TMS_HOST_RING_EPOCH>.<flip>`` while the region was created
                 # under the launcher's xchg boot nonce, and ``begin_flip``
-                # REFUSES a token whose boot half is not its own (W52).  The
+                # REFUSES a token whose boot half is not its own (W70).  The
                 # FLIP half is the shared quantity and it is what
                 # ``ShadowLegInputs.leg`` carries -- derived, in the adapter,
                 # from that same epoch token rather than from a counter this
@@ -2938,14 +2938,14 @@ class ShadowLeg:
         return ""
 
     def verify_sems(self) -> str:
-        """W62 AT LEG START -- **counted here, never raised into the leg**.
+        """W80 AT LEG START -- **counted here, never raised into the leg**.
 
         SECTION 1ai-S5's UNPROVEN 9 said ``verify_sem_arm`` has no caller.  This
         is the caller, and the placement is a deliberate narrowing of that
         function's own ``TODO(S6)``: it names the RPC preamble, which is where a
         refusal that STOPS A FLIP belongs, and the shadow may not stop a flip.
         So the same check runs at the start of the shadow's leg and its refusal
-        decides only whether the SHADOW runs -- ``reason=w62-stale`` on the
+        decides only whether the SHADOW runs -- ``reason=w80-stale`` on the
         line, ``sems=stale`` in the census field, and the flip proceeds on the
         ring.  When S6 puts it in the preamble as an authoritative refusal this
         call becomes redundant and should be deleted, not kept as a second one.
@@ -2959,7 +2959,7 @@ class ShadowLeg:
             self.sems_armed = None
             self.sems_reason = str(exc)
             self.log(str(exc))
-            return "w62-stale"
+            return "w80-stale"
         except BaseException as exc:  # noqa: BLE001
             self.sems_reason = f"{type(exc).__name__}: {exc}"
             return "sem-check-failed"
@@ -3025,7 +3025,7 @@ def publish_no_vote(leg: ShadowLeg, *, reason: str,
     so a rank that refused on its own arithmetic was indistinguishable, to its
     five peers, from a rank that crashed, and they paid a whole gate budget
     inside their own flip legs discovering it.  The hazard is named verbatim in
-    W63's own docstring, and the code then only logged it.
+    W81's own docstring, and the code then only logged it.
 
     A row IS available on those paths (``leg.attach`` succeeded and
     ``begin_flip`` stamped the region), so the NO costs one 64-byte sealed
@@ -3035,7 +3035,7 @@ def publish_no_vote(leg: ShadowLeg, *, reason: str,
     checks refusers BEFORE it compares class hashes, so a NO row's hash is
     never read.  ``False`` when there was no region to write into -- the
     pre-attach reasons (``no-region``, ``no-sems``, ``no-ops``, ``no-plan``)
-    have nowhere to publish, by construction, and W63 names them instead.
+    have nowhere to publish, by construction, and W81 names them instead.
     """
     region = getattr(leg, "region", None)
     if region is None:
@@ -3137,11 +3137,11 @@ def run_leg_hook(
     THE ORDER, and every step is a refusal point that decides only the shadow:
 
     1. the arm (``--weg2-weight-source shadow``) -- ``None`` on every other one;
-    2. adopt the process's active-run slot, closing a stale one (W63);
-    3. attach region + semaphores + device ops (W63 on each, by name);
-    4. ``verify_sem_arm`` (W62, counted);
-    5. the plan (W63 ``no-plan`` -- the standing state, see :func:`plan_for_leg`);
-    6. the priced hop against the launcher's bound (W61 ``scope=hop``);
+    2. adopt the process's active-run slot, closing a stale one (W81);
+    3. attach region + semaphores + device ops (W81 on each, by name);
+    4. ``verify_sem_arm`` (W80, counted);
+    5. the plan (W81 ``no-plan`` -- the standing state, see :func:`plan_for_leg`);
+    6. the priced hop against the launcher's bound (W79 ``scope=hop``);
     7. the transport, and on the destination hook the compare;
     8. ``close()``, in a ``finally``, with the ownership token.
 
@@ -3305,7 +3305,7 @@ def run_leg_hook(
         # count.  A deposit needs one slot per batch, so the count is derived
         # here, printed with its provenance (``oncard_slots_source=``), and
         # handed to ``shadow_transport`` as ONE reading, exactly as
-        # ``diag_slot`` already is: the W52 cross-check between the two
+        # ``diag_slot`` already is: the W70 cross-check between the two
         # co-located processes then still compares two readings of one
         # derivation rather than two derivations.
         store_forward = not bool(inputs.oncard_drainable)
@@ -3408,7 +3408,7 @@ def run_leg_hook(
             check_peer_card=(not is_source) and piece_digest != 0,
             # ONE NUMBER FOR THE DIAGONAL SLOT.  The hook already priced the hop
             # from it; letting ``shadow_transport`` derive it a second time is
-            # two computations of one quantity, and the W52 cross-check between
+            # two computations of one quantity, and the W70 cross-check between
             # the two co-located processes would then be comparing two
             # derivations rather than two readings of the same one.
             oncard_slot_bytes=diag_slot)

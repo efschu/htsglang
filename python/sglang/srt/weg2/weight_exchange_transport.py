@@ -170,7 +170,7 @@ ONCARD_SLOT_MIB_DEFAULT = 128
 
 
 class Weg2XchgOncardSlotRefused(ValueError):
-    """W66: the on-card slot ceiling does not divide the diagonal geometry."""
+    """W84: the on-card slot ceiling does not divide the diagonal geometry."""
 
 
 def validate_oncard_slot_mib(value) -> int:
@@ -196,13 +196,13 @@ def validate_oncard_slot_mib(value) -> int:
         mib = int(value)
     except (TypeError, ValueError):
         raise Weg2XchgOncardSlotRefused(
-            f"W66 Weg2XchgOncardSlotRefused: --weg2-xchg-oncard-slot-mib "
+            f"W84 Weg2XchgOncardSlotRefused: --weg2-xchg-oncard-slot-mib "
             f"{value!r} is not an integer number of MiB"
         ) from None
     floor_mib = ONCARD_SLOT_BYTES // xr.MIB
     if mib < floor_mib or mib % floor_mib:
         raise Weg2XchgOncardSlotRefused(
-            f"W66 Weg2XchgOncardSlotRefused: --weg2-xchg-oncard-slot-mib "
+            f"W84 Weg2XchgOncardSlotRefused: --weg2-xchg-oncard-slot-mib "
             f"{mib} does not divide the diagonal geometry -- the slot FLOOR is "
             f"{floor_mib} MiB (ONCARD_SLOT_BYTES = xr.SLOT_BYTES), so the "
             f"ceiling must be a whole multiple of it and at least equal to it. "
@@ -330,8 +330,8 @@ PAIR_LINE_PREFIX = "WEG2-XCHG-PAIR"
 ONCARD_LINE_PREFIX = "WEG2-XCHG-ONCARD"
 HOSTREG_LINE_PREFIX = "WEG2-XCHG-HOSTREG"
 
-SHORT_PIECE_MARKER = "W54 Weg2XchgShortPiece"
-ONCARD_UNAVAILABLE_MARKER = "W56 Weg2XchgOnCardUnavailable"
+SHORT_PIECE_MARKER = "W72 Weg2XchgShortPiece"
+ONCARD_UNAVAILABLE_MARKER = "W74 Weg2XchgOnCardUnavailable"
 
 
 # ---------------------------------------------------------------------------
@@ -360,7 +360,7 @@ DIR_HANDLE_BYTES = xr.N_RANKS * CUDA_IPC_HANDLE_SIZE
 #: green remote run of S4's suite: with one row per rank the producer's batch 1
 #: overwrote batch 0's ``bytes`` before the consumer had read it, and the
 #: consumer -- which waits for a sequence and then compares byte counts --
-#: raised W54 against a producer that had done nothing wrong
+#: raised W72 against a producer that had done nothing wrong
 #: (``expected_bytes=4096 bytes_filled=1904``, i.e. batch 1's number answering
 #: batch 0's question).  A per-slot row cannot be overwritten while the batch
 #: it describes is undrained, because the producer may not reuse a slot until
@@ -431,14 +431,29 @@ ONCARD_STATE_FAILED = 4
 
 
 # ---------------------------------------------------------------------------
-# Refusals.  W54 and W56 -- the two codes section 7 assigns to this slice, and
-# the two still free in the branch census at 2ee844f7b8 (W51, W52, W53, W55,
-# W58 and W60 are held by S1/S2/S3/S7; W57 and W59 are S6's and S5's).
+# ---------------------------------------------------------------------------
+# RENUMBERED W51-W66 -> W69-W84 BY THE serve-next5 REPLAY (2026-09-09, #1273
+# on `weg2/xchg-S6-sn5-0909`).  Every number this branch enumerated was free on
+# its own base `3ea18deb95`, whose census maximum is W50 -- and every one of
+# them had been claimed on the serve line in the meantime (W51 host-ring, W52
+# no-route, W53 handback, W54-W56 corridor, W57/W58 store, W59 chunk-card, W60
+# carrier floor, W61-W66 operating point / prefetch / eager decode; past this
+# chain's fork point the serve line had claimed W67-W68 as well, #1305
+# ordered-cut frontier refusal and #1317 forced-direct prefill).  All 16 moved
+# to the first free numbers above the MERGED census maximum W68, which is the
+# same rule the serve-next4/next5 trains applied to their own incoming codes.  EXCEPTION NAMES ARE UNCHANGED, so a boot log is still grepped by name.
+# The enumeration argument recorded below is the ORIGINAL one against the
+# branch's own base; it is kept because it is why the number was enumerated
+# rather than picked, not because its arithmetic names today's number.
+# ---------------------------------------------------------------------------
+# Refusals.  W72 and W74 -- the two codes section 7 assigns to this slice, and
+# the two still free in the branch census at 2ee844f7b8 (W69, W70, W71, W73,
+# W76 and W78 are held by S1/S2/S3/S7; W75 and W77 are S6's and S5's).
 # ---------------------------------------------------------------------------
 
 
 class Weg2XchgShortPiece(RuntimeError):
-    """W54 -- ``bytes_filled`` is not the number this consumer's plan claims.
+    """W72 -- ``bytes_filled`` is not the number this consumer's plan claims.
 
     THE #802 RULE AT ITS PHYSICAL ROOT.  ``c26d28172106`` killed an instance
     over a corruption that had not happened, because two ranks derived their
@@ -457,13 +472,22 @@ class Weg2XchgShortPiece(RuntimeError):
 
 
 class Weg2XchgDepositUnfundable(RuntimeError):
-    """W65 -- a store-and-forward deposit of this shape cannot be run.
+    """W83 -- a store-and-forward deposit of this shape cannot be run.
 
     THE CODE WAS ENUMERATED, NOT PICKED (``test_weg2_wcode_uniqueness_1263``'s
     own history: W31 -> W47 was a second collision because the number was
     chosen from memory).  The census over the four roots at ``edbf7007c8``
-    returns 54 assigned codes with a maximum of W64, so the next free code is
-    W65; the enumeration, not the number, is the guard.
+    returns 54 assigned codes with a maximum of W82, so the next free code is
+    W83; the enumeration, not the number, is the guard.
+
+    RENUMBERED BY THE serve-next5 REPLAY (2026-09-09): this branch enumerated
+    its codes against base ``3ea18deb95`` (census maximum W50); the serve line
+    had since claimed W51-W66, and past this chain's fork point W67-W68 as
+    well (#1305 ordered-cut frontier refusal, #1317 forced-direct prefill), so
+    all 16 moved to W69-W84 -- the first free numbers above the MERGED maximum
+    W68 -- with the exception NAMES unchanged.
+    The argument below is the ORIGINAL enumeration and is kept as the reason
+    the number was enumerated, not as the derivation of today's number.
 
     WHY A W-CODE HERE AND A BARE PREFIX FOR ``oncard-not-drainable``.  The two
     refusals are siblings in PLACEMENT and opposites in KIND.  The
@@ -478,7 +502,7 @@ class Weg2XchgDepositUnfundable(RuntimeError):
 
 
 class Weg2XchgOnCardUnavailable(RuntimeError):
-    """W56 -- ``cudaIpc`` is unusable on this build, so the on-card lane degrades.
+    """W74 -- ``cudaIpc`` is unusable on this build, so the on-card lane degrades.
 
     NOT A FAILURE OF THE FLIP when the mode was left to the arm.  Section 3.7
     degrade 3: the on-card share routes through a per-card HOST bounce instead,
@@ -494,7 +518,7 @@ class Weg2XchgOnCardUnavailable(RuntimeError):
     for ``ipc`` EXPLICITLY and the probe said no.  Silently handing back the
     degrade there is the "armed gate reading as a passed one" defect -- the
     boot would run a lane the operator believes is on.  Left to the default,
-    the arm logs W56 and degrades, which is what section 3.7 asks for.
+    the arm logs W74 and degrades, which is what section 3.7 asks for.
 
     S0 measured ``ipc=ok`` on this rig, so this is the armed-and-not-taken
     path.  It exists because a build, a driver or a container change can take
@@ -508,7 +532,7 @@ def short_piece_message(
     src: int, dst: int, epoch: str, producer_pid: int, lane: str,
     seq_filled: int,
 ) -> str:
-    """W54's message, naming BOTH halves of the comparison it failed.
+    """W72's message, naming BOTH halves of the comparison it failed.
 
     ``seq_filled`` is not decoration.  The check is
     ``rec.seq != batch.seq or rec.bytes_filled != batch.total_bytes``, and on
@@ -538,7 +562,7 @@ def short_piece_message(
 #: ``ONCARD_SLOTS_MAX x ONCARD_SLOT_BYTES`` -- the slot FLOOR beside the slot
 #: COUNT's ceiling, i.e. a quarter of what :func:`plan_oncard_slot_bytes` may
 #: actually derive, while its own docstring claimed to read the geometry from
-#: its owner.  It now reads THIS name, and so does the W56 degrade line, so the
+#: its owner.  It now reads THIS name, and so does the W74 degrade line, so the
 #: charge and the allocation cannot drift apart by one edit.
 ONCARD_DEPOSIT_BYTES_MAX = ONCARD_SLOTS_MAX * ONCARD_SLOT_BYTES_MAX
 
@@ -556,7 +580,7 @@ ONCARD_HOST_DEGRADE_MIB = (
 
 
 def oncard_unavailable_message(*, card: str, reason: str, mode: str) -> str:
-    """The W56 degrade line.
+    """The W74 degrade line.
 
     IT MUST NAME THE TARGET IT ACTUALLY USES.  The first version of this line
     said "routes through the staging region", which is what spec 3.7 degrade 3
@@ -585,7 +609,7 @@ def oncard_unavailable_message(*, card: str, reason: str, mode: str) -> str:
 
 
 def oncard_refused_message(*, card: str, reason: str) -> str:
-    """W56 as a REFUSAL: ``ipc`` was asked for by name and is not available."""
+    """W74 as a REFUSAL: ``ipc`` was asked for by name and is not available."""
     return (
         f"{ONCARD_UNAVAILABLE_MARKER} card={card} reason={reason} "
         f"degrade_to=none requested={ONCARD_MODE_IPC} -- the on-card lane was "
@@ -989,7 +1013,7 @@ class SemSet:
         producer or consumer thread during a slot wait -- and these run inside
         a live ``launch_server`` beside torch's watchdogs and child reaping --
         came back as ``False``, which :func:`_take_slot` turns into
-        ``W53 Weg2XchgGateTimeout ... no producer posted this slot within the
+        ``W71 Weg2XchgGateTimeout ... no producer posted this slot within the
         fence budget``, naming a peer that is perfectly healthy.
         :func:`run_leg` then votes ``ok=False``, which is group-fatal: W29 ->
         front W4 -> ``do_stop``.  A guard that cries wolf on the healthy path
@@ -1051,12 +1075,12 @@ class SemSet:
 
 
 class Weg2XchgSemaphoreNotRearmed(RuntimeError):
-    """W62 -- a slot semaphore did not start this leg at its armed count.
+    """W80 -- a slot semaphore did not start this leg at its armed count.
 
     **S4-fix REFUSAL C, an S6 ``must_fix`` carried forward.**  The launcher
     creates all 24 with ``empty=1, full=0`` (``O_EXCL`` after an unlink) and no
     rank may create one.  Nothing re-arms them per FLIP, and a flip abandoned
-    after gate 1 rolls forward by design (W57) leaving any slot whose ``full``
+    after gate 1 rolls forward by design (W75) leaving any slot whose ``full``
     was posted and never taken at ``full=1, empty=0`` for the rest of the boot.
     The consequences are exactly the two this campaign keeps paying for:
 
@@ -1064,7 +1088,7 @@ class Weg2XchgSemaphoreNotRearmed(RuntimeError):
       budget and then reports a timeout naming a consumer that never had a
       reason to drain anything;
     * the next flip's CONSUMER takes a ``full`` whose slot record carries a
-      FOREIGN epoch -- W52, correctly raised, about a state nobody caused this
+      FOREIGN epoch -- W70, correctly raised, about a state nobody caused this
       flip.
 
     So the leg checks, by name, at its start.  It CANNOT repair: repairing
@@ -1079,7 +1103,7 @@ class Weg2XchgSemaphoreNotRearmed(RuntimeError):
 #: the check cannot drift from the creation.
 SEM_ARMED_COUNTS = {"empty": 1, "full": 0}
 
-SEM_NOT_REARMED_MARKER = "W62 Weg2XchgSemaphoreNotRearmed"
+SEM_NOT_REARMED_MARKER = "W80 Weg2XchgSemaphoreNotRearmed"
 
 
 def verify_sem_arm(sems: SemSet, *, leg: int, epoch: str,
@@ -1087,7 +1111,7 @@ def verify_sem_arm(sems: SemSet, *, leg: int, epoch: str,
     """Check all 24 counts at the start of a leg.  REFUSE, never repair.
 
     TODO(S6): call this from ``begin_flip``'s caller -- the RPC preamble, where
-    every other derivable refusal already lands (spec 3.6: W51/W52/W55/W58 are
+    every other derivable refusal already lands (spec 3.6: W69/W70/W73/W76 are
     raised BEFORE the first ``resume``, so a refusal costs nothing).  S5 owns
     the check and its proof; S6 owns the call site, because S6 is what creates
     the situation this detects (a flip that rolls forward past gate 1).
@@ -1111,7 +1135,7 @@ def verify_sem_arm(sems: SemSet, *, leg: int, epoch: str,
         raise Weg2XchgSemaphoreNotRearmed(
             f"{SEM_NOT_REARMED_MARKER} leg={leg} epoch={epoch} "
             f"stale={len(stale)}/{checked}: {' '.join(stale)} -- a previous "
-            f"leg left counts behind (the W57 roll-forward is the path that "
+            f"leg left counts behind (the W75 roll-forward is the path that "
             f"does it).  A producer would block on `empty` for the whole fence "
             f"budget and name a healthy consumer; a consumer would take a "
             f"`full` whose record carries a foreign epoch.  This leg refuses "
@@ -1249,7 +1273,7 @@ def batch_descs(
     Producer and consumer never exchange a batch description: each calls this
     on its own copy of the same descriptor list -- the list whose ``plan_id``
     Gate 0 already agreed across all six ranks -- and gets the same batches, in
-    the same order, with the same ``total_bytes``.  W54 is what happens when
+    the same order, with the same ``total_bytes``.  W72 is what happens when
     that stops being true, which is exactly why the comparison is against the
     consumer's OWN derivation and not against a number the producer also chose.
 
@@ -1311,7 +1335,7 @@ def batch_descs(
             continue
         if kind != STRIDED2D:
             raise Weg2XchgPlanDisagree(
-                f"W52 Weg2XchgPlanDisagree batch: descriptor {index} "
+                f"W70 Weg2XchgPlanDisagree batch: descriptor {index} "
                 f"({getattr(desc, 'param_name', '?')}) has kind {kind!r}, which "
                 f"is none of {FLAT}/{STRIDED2D}/{ZEROFILL} -- the transport "
                 f"refuses a shape it cannot price rather than falling through "
@@ -1320,7 +1344,7 @@ def batch_descs(
         run = int(desc.run_bytes)
         if run <= 0 or run > slot_bytes:
             raise Weg2XchgPlanDisagree(
-                f"W52 Weg2XchgPlanDisagree batch: descriptor {index} "
+                f"W70 Weg2XchgPlanDisagree batch: descriptor {index} "
                 f"({getattr(desc, 'param_name', '?')}) has run_bytes={run}, "
                 f"which does not fit a {slot_bytes}-byte slot; a run is the "
                 f"smallest indivisible unit of a 2-D copy, so this plan cannot "
@@ -1515,7 +1539,7 @@ def require_slot_bytes(ceiling: int, slot_bytes: int, *, what: str) -> int:
     value = int(slot_bytes)
     if value <= 0 or value > int(ceiling):
         raise Weg2XchgPlanDisagree(
-            f"W52 Weg2XchgPlanDisagree {what}: slot_bytes={value} is not in "
+            f"W70 Weg2XchgPlanDisagree {what}: slot_bytes={value} is not in "
             f"1..{int(ceiling)}.  A batch larger than the slot it is written "
             f"into is issued past the end of that slot, into the next pair's "
             f"live payload, and `publish` only notices afterwards -- the "
@@ -1538,7 +1562,7 @@ def require_oncard_slots(slots: int, *, what: str) -> int:
     value = int(slots)
     if value < 1 or value > ONCARD_SLOTS_MAX:
         raise Weg2XchgPlanDisagree(
-            f"W52 Weg2XchgPlanDisagree {what}: oncard_slots={value} is not in "
+            f"W70 Weg2XchgPlanDisagree {what}: oncard_slots={value} is not in "
             f"1..{ONCARD_SLOTS_MAX}.  The on-card handshake row area is sized "
             f"once, from ONCARD_SLOTS_MAX, so a deeper pipeline addresses "
             f"another rank's rows -- identically on both sides, which is why "
@@ -1605,7 +1629,7 @@ def require_store_forward_slots(batches: int, slots: int, *, what: str) -> int:
     """
     if int(slots) < int(batches):
         raise Weg2XchgDepositUnfundable(
-            f"W65 Weg2XchgDepositUnfundable {what}: a store-and-forward "
+            f"W83 Weg2XchgDepositUnfundable {what}: a store-and-forward "
             f"deposit needs one slot per batch and got slots={int(slots)} for "
             f"batches={int(batches)}.  The source returns without waiting for "
             f"a consumer, so a reused slot is overwritten before anything has "
@@ -1675,7 +1699,7 @@ def run_producer_pair(
 
         def expired(slot=slot, batch=batch) -> BaseException:
             return Weg2XchgGateTimeout(
-                f"W53 Weg2XchgGateTimeout slot pair={pair} slot={slot} "
+                f"W71 Weg2XchgGateTimeout slot pair={pair} slot={slot} "
                 f"kind=empty epoch={region.epoch} src_card={src} dst_card={dst} "
                 f"seq={batch.seq} budget_s={budget} -- the consumer has not "
                 f"drained this slot; the producer is blocked holding bytes it "
@@ -1733,7 +1757,7 @@ def run_consumer_pair(
     THE SHORT-PIECE CHECK IS BEFORE THE FIRST COPY -- not after it, and not
     beside it.  ``rec.bytes_filled`` is the producer's post-sync claim;
     ``batch.total_bytes`` is this rank's own derivation from the plan Gate 0
-    agreed.  If they differ the transport raises W54 and issues NOTHING.
+    agreed.  If they differ the transport raises W72 and issues NOTHING.
     """
     budget = xr.fence_budget_s() if budget_s is None else float(budget_s)
     slot_bytes = require_slot_bytes(region.header()["slot_bytes"], slot_bytes,
@@ -1746,7 +1770,7 @@ def run_consumer_pair(
 
         def expired(slot=slot, batch=batch) -> BaseException:
             return Weg2XchgGateTimeout(
-                f"W53 Weg2XchgGateTimeout slot pair={pair} slot={slot} "
+                f"W71 Weg2XchgGateTimeout slot pair={pair} slot={slot} "
                 f"kind=full epoch={region.epoch} src_card={src} dst_card={dst} "
                 f"seq={batch.seq} budget_s={budget} -- no producer posted this "
                 f"slot within the fence budget"
@@ -1757,7 +1781,7 @@ def run_consumer_pair(
         rec = region.claim_produced(pair, slot)
         if rec is None:
             raise Weg2XchgPlanDisagree(
-                f"W52 Weg2XchgPlanDisagree consume pair={pair} slot={slot} "
+                f"W70 Weg2XchgPlanDisagree consume pair={pair} slot={slot} "
                 f"seq={batch.seq} epoch={region.epoch}: the slot's `full` "
                 f"semaphore was posted but the record is not PRODUCED at this "
                 f"flip's epoch -- a post and a publish that do not agree"
@@ -1826,7 +1850,7 @@ def apply_zerofill(ops: DeviceOps, stream: int, descs: Sequence[object],
     at tp=1 pads to 64 and 248320 is already a multiple of 64, so D rank 2 owns
     all 128 pad rows and they have NO VRAM source and NO checkpoint source.
     They are not a transport case, they are an initialisation case, and giving
-    them a descriptor rather than leaving them undefined is what makes W58's
+    them a descriptor rather than leaving them undefined is what makes W76's
     "every destination byte has a source or a ZEROFILL" checkable at all.
 
     ``dst_rank`` is the GROUP-LOCAL rank, matching ``XchgDesc.dst_rank`` -- not
@@ -2308,16 +2332,16 @@ def arm_oncard_lane(
     requested: str = "",
     log: Callable[[str], None],
 ) -> str:
-    """Decide the on-card lane's mode ONCE, at the launcher (spec 3.7, W56).
+    """Decide the on-card lane's mode ONCE, at the launcher (spec 3.7, W74).
 
     ``probe`` is the S0 probe as a subprocess: it returns ``(ok, reason)``.  A
-    ``False`` is **W56** -- logged by name, with the degrade named and the cost
+    ``False`` is **W74** -- logged by name, with the degrade named and the cost
     named -- and the boot then runs the on-card share through the staging region
     for its whole life.  There is no per-flip and no per-lane retry (R2-1).
 
     An explicit ``--weg2-xchg-oncard host`` skips the probe entirely: the user
     asked for the degrade, and probing anyway would let a green probe silently
-    override the request.  It still logs the W56 line, because a boot running
+    override the request.  It still logs the W74 line, because a boot running
     the degrade must say so whichever way it got there.
 
     An explicit ``--weg2-xchg-oncard ipc`` whose probe FAILS is the one case
@@ -2329,7 +2353,7 @@ def arm_oncard_lane(
     a refusal that is only ever a string is a refusal nobody can catch.
 
     TODO(S6): the launcher's ``prepare_weight_exchange`` is where this belongs
-    on the boot path, beside W55.  It is unwired here on purpose --
+    on the boot path, beside W73.  It is unwired here on purpose --
     ``XCHG_RANK_BEHAVIOUR_WIRED`` on the ``WEG2-XCHG-ARMED`` line is still
     ``no``, and arming a lane whose consumer does not exist would be the
     unarmed-gate-reading-as-a-passed-one defect this design keeps naming.
@@ -2417,7 +2441,7 @@ def oncard_host_path(boot_nonce: str, card: int, shm_root: str = xr.SHM_ROOT) ->
 class HostBounce:
     """The ``host`` degrade's bounce: a small shm file instead of device VRAM.
 
-    Same geometry, same handshake rows, same batcher, same W54 comparison as
+    Same geometry, same handshake rows, same batcher, same W72 comparison as
     :class:`OnCardBounce` -- only the storage differs, which is the whole point
     of routing the degrade through this class rather than through a second copy
     of the loop.  Registered with ``cudaHostRegister`` for the same measured
@@ -2680,7 +2704,7 @@ def run_oncard_consumer(
 ) -> OnCardStats:
     """Hop 2: the imported peer bounce -> this rank's VRAM.
 
-    The same W54 comparison as the staging lane, for the same reason: the
+    The same W72 comparison as the staging lane, for the same reason: the
     producer's published ``bytes`` is a claim and ``batch.total_bytes`` is this
     rank's own derivation.  A hop that copies at the producer's claim takes the
     previous batch's residue with it and raises nothing.
@@ -2693,7 +2717,7 @@ def run_oncard_consumer(
         # EXACT, not >=: this row describes slot ``slot``'s current batch, and
         # the producer cannot have moved past it (it would have to reuse the
         # slot, which needs this consumer's release).  A >= here is what let
-        # batch 1's byte count answer batch 0's question and raise W54 against
+        # batch 1's byte count answer batch 0's question and raise W72 against
         # a healthy producer.
         # MEASURED (#1273 S5c): the consumer's fill wait spans the flip on the
         # shadow's placement exactly as the producer's drain does, and the same
@@ -2714,7 +2738,7 @@ def run_oncard_consumer(
         # above it; on this lane the row can carry the number, so it does.
         if got["slot_bytes"] != int(slot_bytes):
             raise Weg2XchgPlanDisagree(
-                f"W52 Weg2XchgPlanDisagree oncard row={row} peer_row={peer_row} "
+                f"W70 Weg2XchgPlanDisagree oncard row={row} peer_row={peer_row} "
                 f"slot={slot} seq={batch.seq} epoch={region.epoch} wave={wave}: "
                 f"the producer batched at slot_bytes={got['slot_bytes']} and "
                 f"this consumer at {int(slot_bytes)} -- the two sides would "
@@ -2777,14 +2801,14 @@ def _await_oncard(region: xr.XchgRegion, area_off: int, peer_row: int, seq: int,
     consumer row, at the same epoch and at a much larger sequence, satisfied
     its ``>=`` drain wait instantly, and refilled a slot nobody had drained.
     The FILL direction had the mirror image: an on-card share of two batches or
-    fewer matches wave 1's exact row and either raises W54 against a healthy
+    fewer matches wave 1's exact row and either raises W72 against a healthy
     producer or copies out of an unfilled bounce.  Epoch alone is not identity
     when the unit of work is smaller than a flip.
 
     ``exact`` distinguishes the two questions this poll answers.  The FILL
     direction asks "is slot s carrying batch k", and must be exact: a ``>=``
     accepts a later batch's byte count as an answer about this one, which is
-    how a healthy producer earned a W54 on the first green run of this suite.
+    how a healthy producer earned a W72 on the first green run of this suite.
     The DRAIN direction asks "has the consumer got at least as far as k", and
     ``>=`` is the honest reading there -- WITHIN a wave, which is what the wave
     stamp now guarantees.
@@ -2805,7 +2829,7 @@ def _await_oncard(region: xr.XchgRegion, area_off: int, peer_row: int, seq: int,
                  and got["state"] not in (ONCARD_STATE_IDLE, ONCARD_STATE_ARMED))
         if fresh and got["state"] == ONCARD_STATE_FAILED:
             raise Weg2XchgGateTimeout(
-                f"W53 Weg2XchgGateTimeout oncard row={row} peer_row={peer_row} "
+                f"W71 Weg2XchgGateTimeout oncard row={row} peer_row={peer_row} "
                 f"slot={slot} epoch={region.epoch} wave={wave} seq={seq} "
                 f"what={what} -- the peer voted FAILED on this lane"
             )
@@ -2813,7 +2837,7 @@ def _await_oncard(region: xr.XchgRegion, area_off: int, peer_row: int, seq: int,
             return got
         if time.monotonic() - started >= budget_s:
             raise Weg2XchgGateTimeout(
-                f"W53 Weg2XchgGateTimeout oncard row={row} peer_row={peer_row} "
+                f"W71 Weg2XchgGateTimeout oncard row={row} peer_row={peer_row} "
                 f"slot={slot} epoch={region.epoch} wave={wave} seq={seq} "
                 f"what={what} exact={'yes' if exact else 'no'} "
                 f"budget_s={budget_s} waited_s={time.monotonic() - started:.3f} "
@@ -2863,7 +2887,7 @@ def _await_handle(region: xr.XchgRegion, peer_row: int, budget_s: float,
             return got
         if time.monotonic() - started >= budget_s:
             raise Weg2XchgGateTimeout(
-                f"W53 Weg2XchgGateTimeout oncard row={row} peer_row={peer_row} "
+                f"W71 Weg2XchgGateTimeout oncard row={row} peer_row={peer_row} "
                 f"epoch={region.epoch} wave={wave} what=handle "
                 f"budget_s={budget_s} "
                 f"waited_s={time.monotonic() - started:.3f} "
@@ -2989,7 +3013,7 @@ def run_leg(
     with ``create=False`` and reading rows that are still sealed at this
     epoch/wave.  It is a ``host``-arm shape ONLY: an exported VRAM bounce is
     freed with the leg that exported it, so it cannot outlive one, and asking
-    for the combination is refused here (W65) rather than half-honoured.
+    for the combination is refused here (W83) rather than half-honoured.
 
     TODO(S6): the RPC handler that binds the flip, runs Gate 0, resumes the
     destination's tags, calls this per wave and then closes ``wave_gate`` is
@@ -3021,7 +3045,7 @@ def run_leg(
     # use-after-free the S4 review already found once.
     if oncard_store_forward and oncard_mode != ONCARD_MODE_HOST:
         raise Weg2XchgDepositUnfundable(
-            f"W65 Weg2XchgDepositUnfundable run_leg row={row} lane=oncard: a "
+            f"W83 Weg2XchgDepositUnfundable run_leg row={row} lane=oncard: a "
             f"store-and-forward deposit was asked for on mode="
             f"{oncard_mode!r}, and {DEPOSIT_REASON_IPC} -- the exporter's "
             f"cudaFree runs in this leg's own unwind, so the destination's "
@@ -3118,7 +3142,7 @@ def run_leg(
                 # crossing the two processes with nothing comparing it: the
                 # consumer polls ``seq % slots_dst`` while the producer wrote
                 # ``seq % slots_src``, so with equal ``slot_bytes`` and unequal
-                # depth every wait misses, and W53 would name an absent peer
+                # depth every wait misses, and W71 would name an absent peer
                 # instead of a ring sized differently on the two sides.
                 write_oncard_row(region, DIR_ONCARD_PROD_OFF, row, slot=0,
                                  seq=-1, nbytes=diag_slots,
@@ -3163,7 +3187,7 @@ def run_leg(
                     oncard_stats.drain_wait_outside_s += _waited
                 if armed["slot_bytes"] != diag_bytes:
                     raise Weg2XchgPlanDisagree(
-                        f"W52 Weg2XchgPlanDisagree oncard row={row} "
+                        f"W70 Weg2XchgPlanDisagree oncard row={row} "
                         f"peer_row={peer_row} epoch={region.epoch} wave={wave}: "
                         f"the co-located source armed a bounce of "
                         f"slot_bytes={armed['slot_bytes']} and this rank "
@@ -3187,14 +3211,14 @@ def run_leg(
                 # whose ``bytes`` word is that batch's byte count, and
                 # comparing it against a ring depth refuses every fast
                 # producer.  Where the row has advanced the depth is no longer
-                # readable from it; ``_await_oncard``'s W53 then carries this
+                # readable from it; ``_await_oncard``'s W71 then carries this
                 # rank's own depth (``consumer_slots=``) so a mismatch is still
                 # diagnosable from the line instead of reading as an absent
                 # peer, which is the half of must_fix 5 that matters most.
                 if (int(armed["state"]) == ONCARD_STATE_ARMED
                         and int(armed["bytes"]) != int(diag_slots)):
                     raise Weg2XchgPlanDisagree(
-                        f"W52 Weg2XchgPlanDisagree oncard row={row} "
+                        f"W70 Weg2XchgPlanDisagree oncard row={row} "
                         f"peer_row={peer_row} epoch={region.epoch} wave={wave}: "
                         f"the co-located source armed a bounce of "
                         f"slots={int(armed['bytes'])} and this rank derived "
