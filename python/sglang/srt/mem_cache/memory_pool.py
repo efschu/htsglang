@@ -2312,6 +2312,16 @@ class HybridReqToTokenPool(ReqToTokenPool):
         buf[:n] = slots
         req.mamba_ping_pong_track_buffer = buf
         req.mamba_next_track_idx = 0
+        # #Q0-trail: the ping-pong pair is 2 of a request's 3 extra_buffer
+        # slots and NOTHING logged them, so the buffer could not be
+        # reconstructed at any station (boot weg2sn5o: 6 station lines for a
+        # whole boot, slot 13 with no fate line).
+        note_924d(
+            "alloc_pingpong",
+            rid=getattr(req, "rid", None),
+            slot=slots,
+            extra=f"n={n} buf={buf.tolist()}",
+        )
         # Claimed slots must be zeroed before any kernel can observe them
         # (deferred to the forward stream, alongside the active-slot clear):
         # recycled slots otherwise expose the previous occupant's state to
@@ -2350,6 +2360,18 @@ class HybridReqToTokenPool(ReqToTokenPool):
             f"buf={req.mamba_ping_pong_track_buffer.tolist()}, "
             f"next_track_idx={req.mamba_next_track_idx}, "
             f"rid={req.rid}"
+        )
+        # #Q0-trail: THE hand-off this family turns on -- which slot went to
+        # the node and which fresh slot took its place at which index.
+        note_924d(
+            "donate",
+            rid=getattr(req, "rid", None),
+            slot=mamba_value_donated,
+            node_id=getattr(getattr(req, "last_node", None), "id", None),
+            extra=(
+                f"donate_idx={donate_idx} old={int(mamba_value_donated.item())} "
+                f"new={int(new_slot[0])} buf_before={req.mamba_ping_pong_track_buffer.tolist()}"
+            ),
         )
         self.set_mamba_ping_pong_slot(req, donate_idx, new_slot[0])
         # The replacement slot is a fresh claim: queue it for the deferred
@@ -2418,6 +2440,17 @@ class HybridReqToTokenPool(ReqToTokenPool):
                         mamba_ping_pong_track_buffer_to_free != -1
                     ]
                 )
+            # #Q0-trail: which ping-pong entries were released, and which was
+            # KEPT -- the keep is the half that has never been in any log.
+            note_924d(
+                "free_pingpong",
+                rid=getattr(req, "rid", None),
+                slot=mamba_ping_pong_track_buffer_to_free,
+                extra=(
+                    f"keep_idx={mamba_ping_pong_track_buffer_to_keep} "
+                    f"buf={self.req_index_to_mamba_ping_pong_track_buffer_mapping.get(req.req_pool_idx).tolist() if self.req_index_to_mamba_ping_pong_track_buffer_mapping.get(req.req_pool_idx) is not None else None}"
+                ),
+            )
             self.mamba_allocator.free(mamba_ping_pong_track_buffer_to_free)
             # Match the req.mamba_pool_idx=None clear above so the next
             # alloc() doesn't see a stale ping-pong reference on the req
