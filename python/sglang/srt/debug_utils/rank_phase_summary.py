@@ -21,10 +21,26 @@ from typing import Dict, Iterable, List, Optional, Tuple
 # ---------------------------------------------------------------------------
 
 _LINE_RE = re.compile(
-    r"\[(?P<ts_and_rank>[^\]]+)\]\s+\w+\s+rank batch"
+    r"\[(?P<ts_and_rank>[^\]]+)\]\s+(?P<phase>\w+)\s+rank batch"
+    # #1241: the decode half of the line names its rank as a FIELD. Optional,
+    # so the prefill line (which has always taken its rank from the log
+    # prefix) parses byte-identically.
+    r"(?:,\s*rank:\s*(?P<rank_field>\d+))?"
+    r"(?:.*?#round:\s*(?P<round>\d+))?"
+    r"(?:.*?bs:\s*(?P<bs>\d+))?"
     r".*?gpu-ms:\s*(?P<gpu_ms>[\d.]+)"
     r"\s*\(compute\s+(?P<compute_ms>[\d.]+),\s*wait\s+(?P<wait_ms>[\d.]+)\)"
     r"(?:\s*\(wait by family:\s*(?P<families>.*?)\))?"
+)
+
+#: #1241. A round whose split was WITHHELD. Parsed on purpose rather than
+#: dropped: a summary that silently skips graph-replayed rounds reports a
+#: compute/wait mean over the eager minority and calls it the boot's.
+_NO_SPLIT_RE = re.compile(
+    r"\[(?P<ts_and_rank>[^\]]+)\]\s+(?P<phase>\w+)\s+rank batch"
+    r"(?:,\s*rank:\s*(?P<rank_field>\d+))?"
+    r".*?gpu-ms:\s*(?P<gpu_ms>[\d.]+)"
+    r"\s*\(split unavailable:\s*(?P<reason>[^,]+),"
 )
 
 # Extract the trailing TP\d+ from the bracket content (e.g. "2026-08-06 19:15:53 TP0")
@@ -49,10 +65,20 @@ def parse_rank_batch_line(line: str) -> Optional[dict]:
 
         ts_and_rank = m.group("ts_and_rank")
         rm = _RANK_RE.search(ts_and_rank)
-        if rm is None:
+        rank_field = m.groupdict().get("rank_field")
+        if rm is None and rank_field is None:
             return None
-        rank = rm.group("rank")
-        ts = ts_and_rank[: rm.start("rank")].rstrip()
+        if rm is not None:
+            rank = rm.group("rank")
+            ts = ts_and_rank[: rm.start("rank")].rstrip()
+        else:
+            # The explicit field WINS when both are present: the two groups of
+            # a Weg-2 boot write different prefixes, and a cross-rank join must
+            # not depend on the formatter.
+            rank = "TP%s" % rank_field
+            ts = ts_and_rank.rstrip()
+        if rank_field is not None:
+            rank = "TP%s" % rank_field
 
         families_raw = m.group("families")
         family_dict: Dict[str, Tuple[float, int]] = {}
@@ -63,13 +89,51 @@ def parse_rank_batch_line(line: str) -> Optional[dict]:
                     int(fm.group("count")),
                 )
 
-        return {
+        out = {
             "ts": ts,
             "rank": rank,
+            "phase": m.group("phase"),
             "gpu_ms": float(m.group("gpu_ms")),
             "compute_ms": float(m.group("compute_ms")),
             "wait_ms": float(m.group("wait_ms")),
             "wait_by_family": family_dict,
+            "split_known": True,
+        }
+        if m.groupdict().get("round") is not None:
+            out["round"] = int(m.group("round"))
+        if m.groupdict().get("bs") is not None:
+            out["bs"] = int(m.group("bs"))
+        return out
+    except Exception:
+        return None
+
+
+def parse_unsplit_line(line: str) -> Optional[dict]:
+    """#1241. A ``Decode rank batch ... (split unavailable: R, ...)`` line.
+
+    Returns the rank, the honest ``gpu_ms`` and the REASON. Never invents a
+    compute/wait pair for it: the absent split is reported as absent, which is
+    the only reading that keeps a mean over the readable rounds from being
+    quoted as a mean over the boot.
+    """
+    try:
+        m = _NO_SPLIT_RE.search(line)
+        if m is None:
+            return None
+        rank_field = m.group("rank_field")
+        if rank_field is not None:
+            rank = "TP%s" % rank_field
+        else:
+            rm = _RANK_RE.search(m.group("ts_and_rank"))
+            if rm is None:
+                return None
+            rank = rm.group("rank")
+        return {
+            "rank": rank,
+            "phase": m.group("phase"),
+            "gpu_ms": float(m.group("gpu_ms")),
+            "split_known": False,
+            "reason": m.group("reason").strip(),
         }
     except Exception:
         return None

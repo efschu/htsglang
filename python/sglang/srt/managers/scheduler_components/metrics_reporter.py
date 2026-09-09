@@ -24,6 +24,7 @@ from sglang.srt.observability.metrics_collector import (
     SchedulerStats,
     compute_routing_key_stats,
 )
+from sglang.srt.managers.scheduler_components.decode_round_log import DecodeRoundLog
 from sglang.srt.utils.collective_clock import CollectiveClock, collective_clock
 from sglang.srt.utils.device_timer import DeviceTimer, SplitDeviceTimer
 from sglang.srt.utils.scheduler_status_logger import SchedulerStatusLogger
@@ -651,6 +652,10 @@ class SchedulerMetricsReporter:
         self.fwd_occupancy = float("nan")
 
         self.rank_prefill_log = RankPrefillLog()
+        # #1241. Installed by _install_rank_prefill_timer on a CUDA device;
+        # stays None on every other device, where the line is not emitted at
+        # all rather than emitted without numbers.
+        self.decode_round_log: DecodeRoundLog | None = None
         # The bubble line names its own rank; pp_rank is the stage identity
         # the reader needs (a boot of three stages emits three PP-BUBBLE
         # lines per window and they must be tellable apart).
@@ -714,6 +719,26 @@ class SchedulerMetricsReporter:
         self.scheduler.tp_worker.model_runner.prefill_rank_timer = (
             self.rank_prefill_log.timer
         )
+        # #1241 THE DECODE HALF OF THE SAME INSTRUMENT. Same clock object,
+        # deliberately: a collective is counted once, by one arming, whichever
+        # phase issued it. Prefill and decode brackets never nest -- a batch is
+        # prefill XOR decode -- so the single armed slot is never contended.
+        #
+        # ONE log object per rank, shared with the DRAFT runners as well as the
+        # target runner: a speculative round is a draft forward plus a verify
+        # forward and they must fold into ONE round line, not two.
+        self.decode_round_log = DecodeRoundLog(
+            clock=self.rank_prefill_log.clock,
+            rank=int(self.tp_rank or 0),
+        )
+        self.scheduler.tp_worker.model_runner.decode_round_log = self.decode_round_log
+        if self.scheduler.draft_worker is not None:
+            dw = getattr(self.scheduler.draft_worker, "draft_worker", None)
+            if dw is not None:
+                if hasattr(dw, "draft_runner"):
+                    dw.draft_runner.decode_round_log = self.decode_round_log
+                for r in getattr(dw, "draft_runner_list", []):
+                    r.decode_round_log = self.decode_round_log
 
     def _install_device_timer_on_runners(self):
         if self.forward_pass_device_timer is None:

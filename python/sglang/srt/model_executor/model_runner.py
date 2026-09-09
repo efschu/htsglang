@@ -633,6 +633,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # device_timer is shared with the draft runners and covers every
         # forward category.
         self.prefill_rank_timer: Optional[DeviceTimer] = None
+        # #1241. The per-rank decode round clock, installed by
+        # SchedulerMetricsReporter on the target runner AND on every draft
+        # runner, all sharing ONE object so a speculative round folds into one
+        # line. None => every bracket below is a nullcontext.
+        self.decode_round_log = None
         self.is_multimodal = model_config.is_multimodal
         self.is_multimodal_chunked_prefill_supported = (
             model_config.is_multimodal_chunked_prefill_supported
@@ -4879,10 +4884,22 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
             # Replay cuda graph if applicable
             if can_run_graph:
-                ret = self.decode_cuda_graph_runner.execute(
-                    forward_batch,
-                    pp_proxy_tensors=pp_proxy_tensors,
-                )
+                # #1241. The bracket sits AROUND the replay, on the same
+                # stream, so the round's device time is measured even though
+                # the collectives inside the replay are unobservable. That
+                # opacity is declared here (graphed=True) and printed as
+                # `split unavailable: graph-replay` rather than turning into
+                # a wait of 0.0.
+                with self._decode_round_segment(
+                    "target_verify"
+                    if forward_batch.forward_mode.is_target_verify()
+                    else "decode",
+                    graphed=True,
+                ):
+                    ret = self.decode_cuda_graph_runner.execute(
+                        forward_batch,
+                        pp_proxy_tensors=pp_proxy_tensors,
+                    )
                 return ModelRunnerOutput(logits_output=ret, can_run_graph=can_run_graph)
 
             # DP / MLP-sync padding + attn-tp normalization. Only the decode
@@ -4932,7 +4949,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     and forward_batch.forward_mode.is_plain_prefill()
                     else contextlib.nullcontext()
                 )
-                with ctx, rank_ctx:
+                # #1241: a piecewise-graph target-verify reached from a decode
+                # round. Self-gating -- outside a decode round the scheduler
+                # has opened no round and this is a nullcontext.
+                round_ctx = self._decode_round_segment(category, graphed=True)
+                with ctx, rank_ctx, round_ctx:
                     ret = self.prefill_cuda_graph_runner.execute(
                         forward_batch, **kwargs
                     )
@@ -4950,6 +4971,19 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 forward_batch.post_forward_mlp_sync_batch(ret)
 
             return ModelRunnerOutput(logits_output=ret, can_run_graph=can_run_graph)
+
+    def _decode_round_segment(self, category: str, graphed: bool):
+        """#1241. Bracket this forward into the open decode round, or nothing.
+
+        Two ways this is a no-op, and both are the default on a non-Weg-2
+        boot: no log installed (non-CUDA device), or no round open (the
+        scheduler opens one only for a decode batch, so every prefill forward
+        passes through untouched and its line stays byte-identical).
+        """
+        log = self.decode_round_log
+        if log is None:
+            return contextlib.nullcontext()
+        return log.segment(category, graphed)
 
     def _preprocess_logits(
         self, logits_output: LogitsProcessorOutput, sampling_info: SamplingBatchInfo

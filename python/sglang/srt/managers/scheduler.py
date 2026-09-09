@@ -13588,6 +13588,49 @@ class Scheduler(
             self._decode_steps_this_phase = (
                 int(getattr(self, "_decode_steps_this_phase", 0) or 0) + 1
             )
+            # #1241 THE DECODE ROUND BOUNDARY. Here and nowhere else, for the
+            # same reason the counter above is here: this is the ONE funnel
+            # every batch passes on its way to a forward, so a round opened
+            # here cannot miss a forward and cannot double-count one. The
+            # boundary also RETIRES the previous round and reads whatever is
+            # ready (query-only, never a sync) -- so round N's line is emitted
+            # at the start of round N+1, one round late by construction.
+            #
+            # `batch.forward_iter` is `self.forward_ct`, the boot-monotone
+            # forward counter set three lines above; it is the join key the
+            # decode ladder's per-round aggregate is matched on, so it is
+            # taken from the scheduler's own counter rather than counted a
+            # second time inside the log.
+            _drl = getattr(
+                getattr(self, "metrics_reporter", None), "decode_round_log", None
+            )
+            if _drl is not None:
+                _bs = batch.batch_size()
+                # Rows this round submits. PRIMARY WRITER is scheduler.py:1078
+                # (`_lane_pairing_rows_per_seq`, a target-verify runs
+                # num_draft_tokens rows per sequence, a plain decode 1) -- it is
+                # set only on a boot that runs the lane-pairing publisher, so
+                # the same derivation is repeated here for the boots that do
+                # not. If that line moves, this one moves with it.
+                _rows = getattr(self, "_lane_pairing_rows_per_seq", None)
+                if _rows is None:
+                    _rows = (
+                        int(
+                            getattr(
+                                self.server_args,
+                                "speculative_num_draft_tokens",
+                                None,
+                            )
+                            or 1
+                        )
+                        if not self.spec_algorithm.is_none()
+                        else 1
+                    )
+                _drl.begin_round(
+                    round_id=int(batch.forward_iter),
+                    bs=int(_bs),
+                    tokens=int(_bs) * int(_rows or 1),
+                )
 
         # #1233 (WEG 2, S0): the draft worker used to start COLD after a
         # layout change, because it was built on the other stack. Weg 2's

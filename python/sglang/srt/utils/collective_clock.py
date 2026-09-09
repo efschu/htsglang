@@ -53,10 +53,14 @@ from typing import Dict, List, Optional, Tuple
 import torch
 
 __all__ = [
+    "ClockBackend",
     "CollectiveClock",
     "FamilyStat",
     "HarvestResult",
+    "RoundSpan",
+    "RoundResult",
     "Slot",
+    "TorchCudaBackend",
     "collective_clock",
     "OTHER",
 ]
@@ -64,6 +68,48 @@ __all__ = [
 #: Family of a span whose caller said nothing. Never an error: an unlabeled
 #: collective is still counted in the grand total, it just lands here.
 OTHER = "other"
+
+
+#: #1241. Separator between a forward's PHASE prefix and the collective family
+#: the dispatch site named. ``spec_verify:tp.all_reduce`` is the tp all-reduce
+#: of a speculative VERIFY forward; ``tp.all_reduce`` without a prefix is the
+#: plain decode/prefill one. Kept as a prefix rather than as a second axis so
+#: the existing one-dimensional ``wait by family`` reader (and its regex,
+#: debug_utils/rank_phase_summary.py:34, ``[A-Za-z0-9_.]+``) parses both --
+#: hence a character that regex already accepts is NOT usable, and ':' is
+#: deliberately outside it so an old reader drops the prefixed families rather
+#: than silently merging them into the unprefixed ones.
+FAMILY_PHASE_SEP = ":"
+
+
+class ClockBackend:
+    """The whole of this module's contact with CUDA, in one place.
+
+    Two calls, both on the hot path, both replaceable in a test: create a
+    timing event, and ask whether the current stream is capturing a graph.
+    Everything else here is arithmetic over what those two return.
+
+    The point is not abstraction for its own sake -- it is that the decode
+    round clock (#1241) has to be exercised WITHOUT a GPU, and the only
+    honest way to do that is to move the device behind one seam instead of
+    letting each test monkeypatch ``torch.cuda`` differently.
+    """
+
+    def event(self):  # pragma: no cover - trivial, overridden in tests
+        raise NotImplementedError
+
+    def is_capturing(self) -> bool:  # pragma: no cover
+        raise NotImplementedError
+
+
+class TorchCudaBackend(ClockBackend):
+    """The real device. The default, and the only one serving ever uses."""
+
+    def event(self):
+        return torch.cuda.Event(enable_timing=True)
+
+    def is_capturing(self) -> bool:
+        return torch.cuda.is_current_stream_capturing()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -99,11 +145,50 @@ class Slot:
         self.graph_capture_skipped = False
 
 
+@dataclasses.dataclass
+class RoundSpan:
+    """One decode round's bracket: the events around it and its collectives.
+
+    The bracket is recorded on the SAME stream as the collectives inside it,
+    so ``end.query()`` being true implies every pair in ``slot`` is complete
+    -- the same argument ``SplitDeviceTimer`` makes for its interval, and the
+    reason a round can be harvested without ever synchronizing.
+    """
+
+    start: object
+    end: object = None
+    slot: Optional[Slot] = None
+    #: True when at least one forward of this round ran from a REPLAYED CUDA
+    #: graph. The Python body of a collective inside a replay does not run,
+    #: so its span is never recorded and ``slot`` would report a wait of 0.0
+    #: -- a wrong zero, not a measurement. Set by the caller, honoured by
+    #: :meth:`harvest_round`, which then withholds the split.
+    graph_replayed: bool = False
+
+
+@dataclasses.dataclass(frozen=True)
+class RoundResult:
+    """One round's reading. ``compute_ms`` is ``round_ms - wait_ms``."""
+
+    round_ms: float
+    wait_ms: Optional[float]
+    compute_ms: Optional[float]
+    families: Optional[Dict[str, FamilyStat]]
+    #: Why the split is absent, or ``None`` when it is present. Never an
+    #: empty string: a reader must be able to print the reason verbatim.
+    split_refused: Optional[str] = None
+
+
 class CollectiveClock:
-    def __init__(self) -> None:
+    def __init__(self, backend: Optional[ClockBackend] = None) -> None:
         self._slot: Optional[Slot] = None
         self._pool: List[torch.cuda.Event] = []
         self._label_hint: Optional[str] = None
+        #: #1241. Phase prefix applied to every family recorded while it is
+        #: set. Distinct from ``_label_hint``: the hint REPLACES what the
+        #: dispatch site said, the prefix KEEPS it and adds who was running.
+        self._phase_prefix: Optional[str] = None
+        self._backend: ClockBackend = backend or TorchCudaBackend()
 
     # -- arming ---------------------------------------------------------
 
@@ -141,6 +226,31 @@ class CollectiveClock:
             self._label_hint = prev
 
     @contextmanager
+    def phase_scope(self, phase: Optional[str]):
+        """Name WHO is running, without overwriting WHAT was issued (#1241).
+
+        ``label_scope`` answers "what is this transfer for" and therefore
+        REPLACES the dispatch site's family. A decode round needs the other
+        question answered at the same time -- a speculative verify forward
+        issues the very same ``tp.all_reduce`` the plain decode forward
+        issues, and the round line has to be able to say which of the two
+        the wait sat in. So this PREFIXES instead of replacing:
+        ``spec_verify:tp.all_reduce``.
+
+        ``None`` is the no-op form, so a call site can pass the phase it has
+        (or has not) without branching.
+        """
+        if phase is None:
+            yield
+            return
+        prev = self._phase_prefix
+        self._phase_prefix = str(phase)
+        try:
+            yield
+        finally:
+            self._phase_prefix = prev
+
+    @contextmanager
     def span(self, label: Optional[str] = None):
         """Time one collective. Caller must have checked ``armed`` first.
 
@@ -152,11 +262,13 @@ class CollectiveClock:
         if slot is None:
             yield
             return
-        if torch.cuda.is_current_stream_capturing():
+        if self._backend.is_capturing():
             slot.graph_capture_skipped = True
             yield
             return
         family = self._label_hint or label or OTHER
+        if self._phase_prefix:
+            family = self._phase_prefix + FAMILY_PHASE_SEP + family
         # Disarm for the duration of the body so that a collective built out
         # of other collectives is counted once, not once per level.
         self._slot = None
@@ -173,7 +285,7 @@ class CollectiveClock:
     def _acquire(self) -> torch.cuda.Event:
         if self._pool:
             return self._pool.pop()
-        return torch.cuda.Event(enable_timing=True)
+        return self._backend.event()
 
     # -- harvesting -----------------------------------------------------
 
@@ -216,6 +328,99 @@ class CollectiveClock:
                 name: FamilyStat(total_ms=v[0], count=int(v[1]), max_ms=v[2])
                 for name, v in acc.items()
             },
+        )
+
+    # -- decode rounds (#1241) -------------------------------------------
+
+    def open_round(self) -> RoundSpan:
+        """Bracket a decode round and arm the clock for its collectives.
+
+        The prefill half of this instrument (#252) brackets ONE forward
+        through ``SplitDeviceTimer``. A decode round is not one forward --
+        under speculation it is a draft extend plus a target verify, and the
+        question the ladder asks ("ms per round per rank") is about the sum.
+        So the bracket is opened here, at the round, and the forwards inside
+        it record into one slot.
+
+        No synchronization: two event records on the current stream.
+        """
+        slot = Slot()
+        self._slot = slot
+        start = self._acquire()
+        start.record()
+        return RoundSpan(start=start, slot=slot)
+
+    def close_round(self, span: Optional[RoundSpan]) -> Optional[RoundSpan]:
+        """Close the bracket. Still no synchronization, still no reading."""
+        if span is None:
+            return None
+        end = self._acquire()
+        end.record()
+        span.end = end
+        self._slot = None
+        return span
+
+    def harvest_round(self, span: Optional[RoundSpan]) -> Optional[RoundResult]:
+        """Read a CLOSED round, or ``None`` while its events are still in
+        flight. Query-only: the caller reads round N while round N+1 runs.
+
+        Three outcomes, and the third is the one this instrument exists to
+        get right:
+
+        * ready and observable -> ``round_ms`` with a compute/wait split;
+        * ready and GRAPH-REPLAYED -> ``round_ms`` only, ``split_refused``
+          naming the replay. The collectives ran; their Python bodies did
+          not, so nothing recorded them. Reporting ``wait 0.0`` here would
+          be a fabrication with the same shape as a measurement;
+        * not ready -> ``None``, and the caller keeps the span.
+        """
+        if span is None or span.end is None:
+            return None
+        if not span.end.query():
+            return None
+        round_ms = span.start.elapsed_time(span.end)
+        self._pool.append(span.start)
+        self._pool.append(span.end)
+        span.start = None
+        span.end = None
+        if span.graph_replayed:
+            slot = span.slot
+            span.slot = None
+            # Drain the slot's events back to the pool without pricing them:
+            # a partial wait over a round whose graph part is invisible is
+            # not a smaller wait, it is an unknown one.
+            if slot is not None:
+                for st, en, _ in slot.pairs:
+                    self._pool.append(st)
+                    self._pool.append(en)
+                slot.pairs.clear()
+            return RoundResult(
+                round_ms=round_ms,
+                wait_ms=None,
+                compute_ms=None,
+                families=None,
+                split_refused="graph-replay",
+            )
+        detail = self.harvest_detail(span.slot)
+        span.slot = None
+        if detail is None:
+            return RoundResult(
+                round_ms=round_ms,
+                wait_ms=None,
+                compute_ms=None,
+                families=None,
+                split_refused="collective-events-unread",
+            )
+        wait_ms = detail.total_s * 1000.0
+        return RoundResult(
+            round_ms=round_ms,
+            wait_ms=wait_ms,
+            # Clamped for the same reason the prefill line clamps: the
+            # collective spans sit INSIDE the bracket, so their sum cannot
+            # legitimately exceed it, but event granularity can push the
+            # difference a hair below zero.
+            compute_ms=max(round_ms - wait_ms, 0.0),
+            families=dict(detail.families),
         )
 
     def harvest(self, slot: Optional[Slot]) -> Optional[float]:
