@@ -792,9 +792,24 @@ def _resolve_transient_mib(
         fp2, digest = _published_digest(group)
         fp = fp or fp2
         if digest is None:
+            # THE FIRST BOOT IS ALWAYS UNMEASURED, and an operator reading this
+            # should not have to work that out. Only a GROUP PROCESS can write
+            # this pointer (``ServerArgs.activation_reserve_mb`` ->
+            # :func:`publish_floor_profile`, with ``SGLANG_WEG2_GROUP`` set),
+            # and the LAUNCHER needs the floor BEFORE it starts that process --
+            # so on a rig where this recipe has never booted, on a cleared
+            # cache, or after any change to the activation profile, the floor
+            # is honestly unmeasured and the pass is verdict-only. It measures
+            # from the NEXT boot of the same recipe. Verified on this rig
+            # 2026-09-09: the phase footprints exist
+            # (phase_footprint-a191a0712717-055c2e4b0867.json, 1055/1097/858
+            # MiB) while the pointer does not, so every card reads the
+            # fallback until a boot publishes which digest it used.
             return None, (
                 f"no activation profile published for group {group!r} at "
-                f"{_floor_digest_path()!r}"
+                f"{_floor_digest_path()!r} (only a boot of that group writes "
+                f"it, and the launcher reads the floor before that process "
+                f"exists -- expected on the first boot of a recipe)"
             )
     if digest is None and profile is not None:
         try:

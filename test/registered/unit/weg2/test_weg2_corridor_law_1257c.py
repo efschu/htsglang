@@ -867,6 +867,22 @@ class RefuterFixThreeOneDigestOneGroup(unittest.TestCase):
         )
         self.assertEqual(got.source, cg.FLOOR_SOURCE_FALLBACK)
 
+    def test_the_first_boot_fallback_says_why_and_who_fixes_it(self):
+        """The launcher reads the floor before the process that publishes it.
+
+        VERIFIED ON THIS RIG 2026-09-09: the phase footprints exist
+        (1055/1097/858 MiB) and the pointer file does NOT, so every card reads
+        the fallback until a boot of that group publishes which digest it
+        used. An operator reading the line should not have to derive that.
+        """
+        got = cg.corridor_floor_mib(
+            C5090, group="P", hw_fingerprint=HW, cache_dir=self.cache
+        )
+        self.assertEqual(got.source, cg.FLOOR_SOURCE_FALLBACK)
+        self.assertIn(cg._floor_digest_path(), got.provenance)
+        self.assertIn("only a boot of that group writes it", got.provenance)
+        self.assertIn("first boot of a recipe", got.provenance)
+
     def test_digest_group_collision_names_the_sharers(self):
         _publish(self.cache, {"P": "same", "D": "same"})
         self.assertEqual(cg.digest_group_collision("same", "D"), "P")
