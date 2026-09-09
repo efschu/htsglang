@@ -1692,3 +1692,38 @@ def test_the_unmeasured_wall_fields_do_not_print_as_measurements():
     result.ring_ms, result.lock_wait_ms = 12.5, 0.25
     assert "ring_ms=12.500" in result.line()
     assert "lock_wait_ms=0.250" in result.line()
+
+
+def test_the_shadow_prices_its_own_hop_and_not_the_full_diagonals(region, ops):
+    """The boot ticket needs a PREDICTION beside its measurement.
+
+    The PLAN line's ``oncard_hop_ms_priced`` prices the FULL diagonal; a shadow
+    leg moves a class SUBSET over the lane of ONE card, so grading its
+    ``oncard_ms`` against the plan's number compares two different lanes.  The
+    line therefore carries the subset lane's own slot, batch count and priced
+    hop, all three from ``ONCARD_PER_BATCH_MS`` and its measured arm.
+    """
+    desc = _diag(0, 3 << 20, cls="qkv_proj")
+    # The gate refuses, so no thread starts: the priced hop is a property of
+    # the PLAN and is printed by a leg that never ran.
+    _vote_rows(region, [1, 2, 3, 4, 5], leg=0, vote=False,
+               classes_hash=sh.classes_hash(["qkv_proj"]), need_mib=0)
+    run = sh.shadow_transport(
+        region=region, sems=None, ops=ops, row=0, rank=0, device=0,
+        card_uuid="u0", uuid_of_card=["u0", "u1", "u2"], descs=[desc],
+        is_source=True, oncard_mode=tp.ONCARD_MODE_IPC, peer_row=3, wave=WAVE,
+        leg=0, direction="P->D", epoch="b.1", free_mib=8192,
+        log=lambda _s: None, oncard_slot_bytes=1 << 20)
+    result = run.result
+    assert not result.ran
+    assert result.oncard_slot_mib == 1
+    assert result.oncard_batches == 3
+    assert result.oncard_hop_ms_priced == 3 * tp.ONCARD_PER_BATCH_MS
+    line = result.line()
+    assert "oncard_slot_mib=1" in line and "oncard_batches=3" in line
+    assert f"oncard_hop_ms_priced={3 * tp.ONCARD_PER_BATCH_MS:.3f}" in line
+    # A leg with no diagonal at all prices no hop, rather than a zero that
+    # reads as a measured one.
+    empty = sh.ShadowResult(leg=0, epoch="b.1", subset=sh.select_subset([], leg=0),
+                            counters=sh.ShadowCounters())
+    assert "oncard_hop_ms_priced=n/a" in empty.line()
