@@ -18,12 +18,22 @@ and the groups are two stock ``sglang.launch_server`` launches.
 
 #: THE TWO SCHEDULING BATCH SIZES, EACH WRITTEN EXACTLY ONCE.
 #:
-#: User order 2026-09-09, verbatim: "nimm jetzt vorerst bs4 fuer decode und bs2
-#: fuer prefill. wenn alles fertig ist kann man das immernoch nachmessen wo da
-#: das optimum fuer meinen anwendungsfall liegt."  So these two numbers are a
-#: PROVISIONAL operating point, explicitly re-measurable once the strand is
-#: finished -- not a derived or proven optimum, and nothing may treat them as
-#: one.
+#: THE ORDER IN FORCE, user 2026-09-09, verbatim: "der decode bs6 soll mit bs6
+#: (nicht mehr bs4) der standard werden."  D's default is therefore 6.
+#:
+#: SUPERSEDED, same day, and kept because it is the source of P's number and of
+#: the re-measurability clause that still governs both -- user 2026-09-09,
+#: verbatim: "nimm jetzt vorerst bs4 fuer decode und bs2 fuer prefill. wenn
+#: alles fertig ist kann man das immernoch nachmessen wo da das optimum fuer
+#: meinen anwendungsfall liegt."  P stays 2 from that order; D's 4 was replaced
+#: by the order above before it ever reached metal.
+#:
+#: So these two numbers remain a PROVISIONAL operating point, explicitly
+#: re-measurable once the strand is finished -- not a derived or proven
+#: optimum, and nothing may treat them as one.  The supersession inside a
+#: single day is the cheapest possible evidence that the pair moves: it moved
+#: once already, and the only reason that cost one edit instead of twenty is
+#: the single-site rule below.
 #:
 #: They live here, in the package root, because BOTH ends need them and neither
 #: may own the other's copy: ``launcher`` owns ``--p-bs`` / ``--d-bs`` and every
@@ -43,4 +53,5 @@ and the groups are two stock ``sglang.launch_server`` launches.
 DEFAULT_P_BS = 2
 
 #: K2: group D's ``--max-running-requests`` AND the number of front D seats.
-DEFAULT_D_BS = 4
+#: 6 by the order of 2026-09-09 quoted above ("nicht mehr bs4").
+DEFAULT_D_BS = 6

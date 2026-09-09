@@ -138,9 +138,13 @@ class TestTheOverlapChoiceIsPricedAndStated(unittest.TestCase):
         the PRODUCT is the shipped ``--d-bs`` and is asserted against
         ``DEFAULT_D_BS``.
 
-        UPDATED 2026-09-09 (user order: "bs4 fuer decode"), not deleted: the
-        shipped default moved 8 -> 4, so ``mrr`` moved with it and ``extra``
-        halved, 16 -> 8. Re-pinning the product to the CONSTANT rather than to
+        UPDATED 2026-09-09, not deleted: the shipped default moved 8 -> 4
+        ("bs4 fuer decode") and then, the same day and before any metal, 4 -> 6
+        ("der decode bs6 soll mit bs6 (nicht mehr bs4) der standard werden"), so
+        ``mrr`` moved with it and ``extra`` followed, 16 -> 8 -> 12. The second
+        move cost this file NOTHING, which is the whole argument: it was already
+        re-pinned to the constant after the first. Binding the product to the
+        CONSTANT rather than to
         the new literal is the actual repair -- this test asserted "derived
         from the runtime, not typed" while itself typing the product of a
         default it did not name, so the next re-measurement (which the order

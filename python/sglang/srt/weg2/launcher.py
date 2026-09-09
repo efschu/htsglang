@@ -5906,8 +5906,10 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--d-bs", type=int, default=DEFAULT_D_BS,
                     help=f"K2: group D's --max-running-requests AND the number of front seats, so "
                          f"the front never hands D more concurrent requests than D can run. Default "
-                         f"{DEFAULT_D_BS} by the same 2026-09-09 order ('bs4 fuer decode'), equally "
-                         f"provisional and equally re-measurable.")
+                         f"{DEFAULT_D_BS} by the user order of 2026-09-09 ('der decode bs6 soll mit "
+                         f"bs6 (nicht mehr bs4) der standard werden'), which superseded that same day's "
+                         f"'bs4 fuer decode' before it reached metal. Equally provisional and equally "
+                         f"re-measurable.")
     ap.add_argument("--tp-prefill-max-tokens", type=int, default=None,
                     help="K5 (X): uncached tokens D may prefill itself. Unset = DERIVED as "
                          "2*flip_s/(1/r_D - 1/r_P) from this rig's own front-log rate and flip "

@@ -1,8 +1,15 @@
 """The two shipped scheduling batch sizes, and the pin that keeps them single.
 
-USER ORDER 2026-09-09, verbatim: "nimm jetzt vorerst bs4 fuer decode und bs2
-fuer prefill. wenn alles fertig ist kann man das immernoch nachmessen wo da das
-optimum fuer meinen anwendungsfall liegt."
+USER ORDER IN FORCE, 2026-09-09, verbatim: "der decode bs6 soll mit bs6 (nicht
+mehr bs4) der standard werden."
+
+SUPERSEDED the same day, and quoted because P's number and the re-measurability
+clause both come from it -- 2026-09-09, verbatim: "nimm jetzt vorerst bs4 fuer
+decode und bs2 fuer prefill. wenn alles fertig ist kann man das immernoch
+nachmessen wo da das optimum fuer meinen anwendungsfall liegt."
+
+That the pair moved once inside a single day, at the cost of one edit, is the
+concrete case for the singleness pin below rather than a hypothetical one.
 
 Two things are asserted here, and the second is the one that will still be
 earning its keep in a month:
@@ -70,11 +77,14 @@ def test_the_parsed_defaults_are_the_ordered_pair():
     from sglang.srt.weg2.launcher import build_parser
 
     ns = build_parser().parse_args(["--tree", "/t", "--tag", "x"])
-    assert ns.p_bs == 2, "user order 2026-09-09: bs2 fuer prefill"
-    assert ns.d_bs == 4, "user order 2026-09-09: bs4 fuer decode"
+    assert ns.p_bs == 2, "user order 2026-09-09: 'bs2 fuer prefill'"
+    assert ns.d_bs == 6, ("user order 2026-09-09: 'der decode bs6 soll mit bs6 "
+                          "(nicht mehr bs4) der standard werden'")
     # ...and the constants are those same two numbers, so no site can be
     # "correct" against a constant that has itself drifted from the order.
-    assert (DEFAULT_P_BS, DEFAULT_D_BS) == (2, 4)
+    # These two literals and the two in __init__.py are the ONLY places the
+    # values are written down: the test states the order, the constant obeys it.
+    assert (DEFAULT_P_BS, DEFAULT_D_BS) == (2, 6)
 
 
 def test_the_defaults_are_independent_knobs_not_one_number():
@@ -307,11 +317,29 @@ def test_each_number_is_written_exactly_once_in_the_package():
 
 def test_the_order_is_recorded_where_the_numbers_live():
     """A provisional number without its order is an unexplained magic constant
-    the next reader will 'clean up'."""
-    src = (WEG2_DIR / "__init__.py").read_text()
-    assert "2026-09-09" in src
-    assert "bs4" in src and "bs2" in src
-    assert "nachmessen" in src, "the re-measurability clause must survive"
+    the next reader will 'clean up'.
+
+    Matched against the comment block with its ``#:`` prefixes stripped and its
+    whitespace collapsed, because an order is PROSE and prose wraps: the quote
+    below spans two comment lines, so a raw-source substring test would assert
+    on where the author happened to break the line rather than on whether the
+    order is recorded. (It did, and failed on a file that records the order
+    perfectly -- the same trap the provenance test hit with an implicitly
+    concatenated f-string.)
+    """
+    raw = (WEG2_DIR / "__init__.py").read_text()
+    prose = " ".join(
+        ln.lstrip().removeprefix("#:").removeprefix("#").strip()
+        for ln in raw.splitlines()
+    )
+    prose = " ".join(prose.split())
+
+    assert "2026-09-09" in prose
+    # the order IN FORCE, verbatim
+    assert "der decode bs6 soll mit bs6 (nicht mehr bs4) der standard werden" in prose
+    # P's number still comes from the superseded order, so that one is kept too
+    assert "bs2 fuer prefill" in prose
+    assert "nachmessen" in prose, "the re-measurability clause must survive"
 
 
 register_cpu_ci(__file__)
