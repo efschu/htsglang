@@ -757,7 +757,13 @@ class TestGeometryErrorsGetTheirOwnSentence(CustomTestCase):
         message = str(cm.exception)
         self.assertIn("--pp-cut-stage-fixed-mib", message)
         self.assertIn("2 entries", message)
+        # THE POINT of the finding: the operator must not be handed the
+        # solver's geometry sentence for an input error.  Asserted against the
+        # solver's own wording, and against the FIRST sentence naming the flag
+        # rather than a layout.
         self.assertNotIn("is priceable", message)
+        self.assertNotIn("not one cut", message)
+        self.assertIn("--pp-cut-stage-fixed-mib", message.split(".")[0])
 
 
 class TestThePageFloorIsMirrored(CustomTestCase):

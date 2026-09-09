@@ -172,9 +172,10 @@ def refuse_pool_model_geometry(pool_model: PhasePoolModel, stages: int) -> None:
                 "launch. These are PER-STAGE posts -- the embedding sits on "
                 "stage 0, lm_head and the draft head on the last -- so they "
                 "cannot be broadcast, and a length mismatch is a launch INPUT "
-                "error, not an unpriceable layout. Left to the solver it "
-                "surfaces as 'not one cut ... is priceable', which names the "
-                "wrong thing entirely (#1286). Values: %s"
+                "error, not an unpriceable layout. Fix the flag: no cut of any "
+                "shape would have helped, which is why the solver's own "
+                "geometry refusal must not be the sentence you get here "
+                "(#1286 F5). Values: %s"
                 % (
                     name,
                     len(tuple(vec)),
