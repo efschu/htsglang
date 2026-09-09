@@ -1243,3 +1243,73 @@ class TestTheGroupShortfallDeferral(_Clean):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TheShortfallMarkSurvivesTheInFlightCutRead(CustomTestCase):
+    """#1305 item 6 (boot weg2sn5pre, rid 7df20326): the retry's
+    `declined:already_in_flight` on a `host_pool_shortfall` mark is a RE-DEFER,
+    not a landing.
+
+    On the metal the mark was set at intake (the group trim cut the read to
+    9171 of 24790 tokens), the retry on the very next pass found that CUT read
+    still in flight, the generic branch read that as "the deferred prefetch
+    registered" and cleared the mark as LANDED after one pass, and the X gate
+    then priced the request at its whole extent (uncached=24792 > X=8742 ->
+    W50). For the RATE arm "already in flight" does mean the read registered;
+    for THIS arm it is exactly the state the mark describes, so it re-defers
+    through the same bounded arm and the same DEFER EXPIRED exit.
+    """
+
+    def _marked(self):
+        s = _Intake(lambda r: _VERDICT_TRUNCATED_GROUP, symmetric=True, tp_size=3)
+        r = _Req("cut", seq=1)
+        s._add_request_to_queue(r)
+        self.assertEqual(getattr(r, "prefetch_deferred", None), "host_pool_shortfall")
+        return s, r
+
+    def test_the_retry_meeting_the_in_flight_cut_read_keeps_the_mark(self):
+        s, r = self._marked()
+        s._verdict = lambda req: "declined:already_in_flight"
+        self.assertEqual(s._retry_deferred_prefetches(), 1)
+        self.assertEqual(
+            getattr(r, "prefetch_deferred", None),
+            "host_pool_shortfall",
+            "still in flight is what the shortfall mark MEANS; clearing it as "
+            "LANDED priced the request whole on weg2sn5pre (W50)",
+        )
+        self.assertEqual(int(r.prefetch_defer_passes), 1)
+        self.assertEqual(int(r.prefetch_defer_attempts), 2)
+
+    def test_the_same_verdict_on_the_rate_mark_still_lands(self):
+        """The rate arm's reading is unchanged: for it, in-flight IS registered."""
+        s = _Intake(lambda r: "declined:rate_limited", symmetric=False)
+        r = _Req("rate", seq=1)
+        s._add_request_to_queue(r)
+        self.assertEqual(getattr(r, "prefetch_deferred", None), "rate_limited")
+        s._verdict = lambda req: "declined:already_in_flight"
+        s._retry_deferred_prefetches()
+        self.assertIsNone(getattr(r, "prefetch_deferred", None))
+        self.assertTrue(getattr(r, "_prefetch_landed_hold_once", False))
+
+    def test_the_bound_still_ends_it(self):
+        """A read that never lands cannot hold the queue: the SAME bound."""
+        s, r = self._marked()
+        r.prefetch_defer_since = time.monotonic() - 10 * 3600.0
+        s._verdict = lambda req: "declined:already_in_flight"
+        s._retry_deferred_prefetches()
+        self.assertIsNone(getattr(r, "prefetch_deferred", None))
+
+    def test_the_x_defer_verdict_precedes_the_rank_local_hold_in_the_loop(self):
+        """#1305 finding 1: in `_get_new_batch_prefill_raw` the group-agreed
+        `_weg2_x_defers` check sits ABOVE `_admission_held_for_deferred_prefetch`,
+        so a marked request the group has an opinion on is skipped under
+        `weg2_x_defer` with the S3 X-DEFER line, not silently under
+        `prefetch_deferred`. The refusal arm stays below both."""
+        import inspect
+
+        src = inspect.getsource(Scheduler._get_new_batch_prefill_raw)
+        i_defer = src.index("self._weg2_x_defers(req, _head_inputs)")
+        i_hold = src.index("self._admission_held_for_deferred_prefetch(req)")
+        i_refuse = src.index("self._weg2_x_refuses(req, _head_inputs)")
+        self.assertLess(i_defer, i_hold)
+        self.assertLess(i_hold, i_refuse)

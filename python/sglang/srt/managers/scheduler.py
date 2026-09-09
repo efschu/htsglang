@@ -6042,6 +6042,25 @@ class Scheduler(
         span = getattr(req, "_prefetch_span_tokens", None)
         if verdict == _VERDICT_TRUNCATED_GROUP:
             return self._apply_group_shortfall_deferral(req, rid, span, marked, site)
+        if (
+            marked
+            and verdict == "declined:already_in_flight"
+            and getattr(req, "prefetch_deferred", None) == _DEFER_REASON_SHORTFALL
+        ):
+            # #1305 item 6 (boot weg2sn5pre, rid 7df20326): the shortfall mark
+            # means "the read REGISTERED and was CUT by the group; a re-issue
+            # is owed once the cut read leaves ongoing_prefetch". The retry on
+            # the very next pass found that cut read STILL in flight -- which
+            # is exactly the state the mark describes -- and the generic
+            # branch below read `declined:already_in_flight` as "the deferred
+            # prefetch registered" (true for the RATE arm, whose mark means
+            # "not issued yet") and cleared the mark as LANDED after one pass.
+            # The X gate then priced the request at its whole extent
+            # (uncached=24792 > X=8742 -> W50) on a read that was going to
+            # land 15,619 tokens short. For THIS mark, still-in-flight is a
+            # RE-DEFER, through the same bounded arm and the same DEFER
+            # EXPIRED exit, never a landing.
+            return self._apply_group_shortfall_deferral(req, rid, span, marked, site)
         if verdict == "declined:rate_limited":
             if self._prefetch_deferral_refusal_reason() is not None:
                 # The pre-#1068 decline stands on this rank/phase (the TP
@@ -11871,6 +11890,22 @@ class Scheduler(
                 # prefill -- that is what sends it to PP instead of wedging it.
                 _note_skip("seam_transport_only", req.rid)
                 continue
+            # #1305 finding 1 (serve-next5 refuter): THE GROUP'S VERDICT
+            # FIRST, THE RANK-LOCAL HOLD SECOND. `_weg2_x_defers` is the
+            # MIN-reduced, group-agreed completion predicate of the X gate
+            # (it prints `WEG2 X-DEFER ... reason=host_pool_shortfall`, the
+            # S3 line of #1298 gate 1); the A12.2 hold below is rank-local at
+            # both ends in the TP phase (its own docstring, #1203 A3) and used
+            # to run FIRST, so a marked request was skipped under the census
+            # key `prefetch_deferred` on every pass and the X-DEFER line was
+            # unreachable for it. Where the group has an opinion it decides
+            # and speaks; where it abstains (no vote, rid outside the
+            # canonical head) the hold still applies, as before. The refusal
+            # arm (`_weg2_x_refuses`, W50) keeps its place further down: it
+            # DELETES, and every "held" verdict must precede a deletion.
+            if self._weg2_x_defers(req, _head_inputs):
+                _note_skip("weg2_x_defer", req.rid)
+                continue
             # #1068 (A12.2): a request whose prefetch is DEFERRED (rate-limited
             # budget) is not admitted to prefill while the mark stands --
             # admitting it would recompute the whole prefix, the very thing
@@ -12220,9 +12255,8 @@ class Scheduler(
             # (no deletion, no answer, no seat given up), bounded by the span's
             # own length-priced store-read timeout so a read that never lands
             # is priced rather than waited on for ever.
-            if self._weg2_x_defers(req, _head_inputs):
-                _note_skip("weg2_x_defer", req.rid)
-                continue
+            # (#1305 finding 1: `_weg2_x_defers` moved ABOVE the A12.2 hold at
+            # the top of this loop; see the note there.)
             if self._weg2_x_refuses(req, _head_inputs):
                 _note_skip("weg2_x_refused", req.rid)
                 _x_refused.append(req)
