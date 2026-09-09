@@ -369,6 +369,29 @@ class TestOneWCodePerException(CustomTestCase):
             cb.UNMEASURED_FLOOR_NAME, "W56 Weg2CorridorFloorUnmeasured"
         )
 
+    def test_the_serve_next5_train_renumbered_the_incoming_codes_by_census(self):
+        """serve-next5 train (2026-09-09). Two input branches were cut on trees
+        where W52-W56 were free: ``weg2/tp3-decode-dec2-0909`` (base
+        4f762260ba, before #1236) claimed W52-W56 for the #1241/#1293
+        operating-point refusals and the eager-decode arm, and
+        ``weg2/fix-1298-0909`` claimed W55 for the #580 span STOP. On the
+        merged tree every one of those collided with a serve-line holder
+        (W52 no-route, W53 handback, W54-W56 corridor). Renumbered to the
+        first free numbers above this census's maximum (W60 -> W61..W66),
+        exception NAMES unchanged, so a boot log is still grepped by name."""
+        c = census()
+        self.assertEqual(set(c["W61"]), {"Weg2TpOperatingPointUnpriced"})
+        self.assertEqual(set(c["W62"]), {"Weg2TpOperatingPointDisablesUnevenAxis"})
+        self.assertEqual(set(c["W63"]), {"Weg2TpOperatingPointNeedsEnvPin"})
+        self.assertEqual(set(c["W64"]), {"Weg2TpOperatingPointInfeasible"})
+        self.assertEqual(set(c["W65"]), {"Weg2PrefetchSpanSplit"})
+        self.assertEqual(set(c["W66"]), {"Weg2EagerDecodeArm"})
+        # and the serve-line holders the incoming codes collided with kept
+        # their numbers (the pushed serve-next4 tip's boot ticket names them).
+        self.assertEqual(set(c["W52"]), {"Weg2NoServiceableRoute"})
+        self.assertEqual(set(c["W53"]), {"Weg2StoreHandbackFailed"})
+        self.assertEqual(set(c["W56"]), {"Weg2CorridorFloorUnmeasured"})
+
     def test_the_chosen_number_was_free_and_the_free_ones_are_named(self):
         """W50 is not 'the next one': it is the first free number above the
         highest assigned code, and the census can say which others are free."""

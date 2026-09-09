@@ -3865,7 +3865,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             span_lo = int(vote[3].item())
             span_hi = -int(vote[4].item())
             if span_lo != span_hi:
-                # W55 Weg2PrefetchSpanSplit -- NAMED STOP, NEVER COMPENSATION.
+                # W65 Weg2PrefetchSpanSplit -- NAMED STOP, NEVER COMPENSATION.
                 # Same detector shape and same class as the two raises above.
                 # The ranks agreed on a LENGTH to register and disagreed about
                 # WHICH TOKENS it covers: each would trim its own key to
@@ -3875,7 +3875,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 # -- ranks acting on different facts -- and the law is to stop,
                 # not to reconcile a span nobody voted for.
                 raise HiCacheCollectiveDesyncError(
-                    "W55 Weg2PrefetchSpanSplit: the ranks entered "
+                    "W65 Weg2PrefetchSpanSplit: the ranks entered "
                     "prefetch_participation_vote with DIFFERENT pre-vote spans "
                     f"(min={span_lo} max={span_hi}) for rid={str(req_id)[:8]} "
                     f"while agreeing a group length of {group_len}. Every rank "

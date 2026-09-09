@@ -928,7 +928,7 @@ def test_s1_a_span_split_between_ranks_is_a_named_stop():
     with pytest.raises(HiCacheCollectiveDesyncError) as exc:
         _issue(tree, "rid-split", 8000)
     msg = str(exc.value)
-    assert "W55 Weg2PrefetchSpanSplit" in msg, msg
+    assert "W65 Weg2PrefetchSpanSplit" in msg, msg
     assert "min=7000" in msg and "max=8000" in msg, msg
     assert "rid-split" not in tree.registered, (
         "a request must never register on a split span"

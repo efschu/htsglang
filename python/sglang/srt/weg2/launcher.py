@@ -4426,7 +4426,7 @@ class DOperatingPointRow:
     note: str = ""
     #: #1293. WHICH AXIS THE ATTENTION FAMILY'S COMPUTE RIDES on this boot's
     #: geometry -- ``"token"`` under replicated-KV uneven DCP, ``"head"``
-    #: otherwise. It is not decoration: it names the grid the W53 saturation
+    #: otherwise. It is not decoration: it names the grid the W62 saturation
     #: verdict below was taken against, and the two grids differ by 16x on this
     #: rig (4 kv-head units vs 64 token units), which is the difference between
     #: a position being representable and being refused.
@@ -4606,7 +4606,7 @@ def d_operating_point_rows(
         )
     except Exception as exc:  # pragma: no cover - geometry is diagnostic
         refusals.append(
-            "W52 Weg2TpOperatingPointUnpriced: the cost model could not be "
+            "W61 Weg2TpOperatingPointUnpriced: the cost model could not be "
             "built for %r (%s), so neither operating point can be derived. The "
             "shipped maxkv vector is unaffected -- it is the budget vector and "
             "needs no model." % (model, exc)
@@ -4641,7 +4641,7 @@ def d_operating_point_rows(
 
     if len(gemm) != len(budgets) or len(membw) != len(budgets):
         refusals.append(
-            "W52 Weg2TpOperatingPointUnpriced: this rig's card-rate library "
+            "W61 Weg2TpOperatingPointUnpriced: this rig's card-rate library "
             "carries no measured (gemm_tflops, membw_gbs) pair for every card "
             "of group D (%s). An operating-point vector IS the measured rate "
             "ratio, so without the measurement there is no vector to ship -- "
@@ -4651,7 +4651,7 @@ def d_operating_point_rows(
         )
         return ([], refusals)
 
-    # -- W54: an explicit vector needs the uneven-TP early-read env fact ------
+    # -- W63: an explicit vector needs the uneven-TP early-read env fact ------
     # `_handle_uneven_tp` (server_args.py:12025) reads SGLANG_UNEVEN_DCP* off
     # os.environ BEFORE the flag half publishes itself (:7186). An explicit
     # ratio shipped on a boot whose EARLY_READ_FACTS no longer carries that row
@@ -4666,7 +4666,7 @@ def d_operating_point_rows(
     ]
     if missing:
         refusals.append(
-            "W54 Weg2TpOperatingPointNeedsEnvPin: an explicit --rank-tp-ratio "
+            "W63 Weg2TpOperatingPointNeedsEnvPin: an explicit --rank-tp-ratio "
             "vector is resolved by _handle_uneven_tp (server_args.py:12025), "
             "which reads %s off os.environ BEFORE the flag half publishes "
             "itself (:7186). EARLY_READ_FACTS no longer states %s for group D, "
@@ -4683,11 +4683,11 @@ def d_operating_point_rows(
 
     # #1293 -- the plan-time flags the attention-axis predicate reads. This
     # launcher's group D always ships ``--uneven-dcp`` + ``--uneven-dcp-
-    # weighted`` (``early_read_flags("D")``), and the W54 gate immediately
+    # weighted`` (``early_read_flags("D")``), and the W63 gate immediately
     # above has just PROVEN both facts present -- under a non-uniform
     # ``--rank-tp-ratio`` the runtime then auto-sets ``dcp_size = tp_size``
     # (server_args.py:12112-12128, "Uneven DCP: auto-set dcp_size"). Mirroring
-    # that auto-set here is gated on the SAME fact the W54 check read, so a
+    # that auto-set here is gated on the SAME fact the W63 check read, so a
     # future form that stops shipping the env fact falls back to the head
     # axis instead of silently keeping the token one. The non-uniformity half
     # of the predicate stays inside ``plan_uneven_dcp_kv_replicated`` itself.
@@ -4937,7 +4937,7 @@ def d_operating_point_rows(
         refusal = None
         if feasible is False:
             refusal = (
-                "W55 Weg2TpOperatingPointInfeasible: position %s derives "
+                "W64 Weg2TpOperatingPointInfeasible: position %s derives "
                 "weights %s, which PerfCostModel.predict_capacity marks "
                 "feasible=False against this boot's budgets %s -- the weight "
                 "shards plus the mamba pool plus the reserves do not leave a "
@@ -4982,7 +4982,7 @@ def d_operating_point_rows(
         if _refusal is not None and _pos != "maxkv":
             refusals.append(_refusal)
 
-    # -- W53: a position that would turn an uneven axis OFF -------------------
+    # -- W62: a position that would turn an uneven axis OFF -------------------
     #
     # THE OBVIOUS CHECK IS UNREACHABLE AND IS NOT THE ONE MADE HERE. A rank
     # owning zero heads cannot happen: `partition_units` guarantees every rank
@@ -5032,7 +5032,7 @@ def d_operating_point_rows(
         ):
             # SAME PREDICATE AS THE PARTITION (review R2). A family the
             # runtime does not shard by the vector has no axis to disable, so
-            # a saturation refusal against it would be a FALSE W53 -- the
+            # a saturation refusal against it would be a FALSE W62 -- the
             # `<= 1` form fired for a GDN family of 2 units on 3 ranks, which
             # `gdn_unit_partition` answers with [0, 0, 0].
             if fam_units < n_ranks:
@@ -5049,7 +5049,7 @@ def d_operating_point_rows(
             else:
                 sat_part = list(row.gdn_heads)
             refusals.append(
-                "W53 Weg2TpOperatingPointDisablesUnevenAxis: position %s "
+                "W62 Weg2TpOperatingPointDisablesUnevenAxis: position %s "
                 "derives weights %s; rank %d's share of the %d %s units "
                 "(axis=%s) is below ONE unit, so partition_units floors "
                 "it to 1 (it guarantees >= 1 per rank) and the shipped "
@@ -5069,7 +5069,7 @@ def d_operating_point_rows(
             )
         elif len(set(row.weights)) == 1 and len(row.weights) > 1:
             refusals.append(
-                "W53 Weg2TpOperatingPointDisablesUnevenAxis: position %s "
+                "W62 Weg2TpOperatingPointDisablesUnevenAxis: position %s "
                 "derives the FLAT vector %s, which is even TP wearing an "
                 "uneven flag. Refused: an axis that resolves to equality is "
                 "the axis disabled." % (row.position, list(row.weights))
@@ -5234,7 +5234,7 @@ def d_tp_ratio_decision(
         mine = [
             r
             for r in op_refusals
-            if objective in r or r.startswith(("W52", "W54"))
+            if objective in r or r.startswith(("W61", "W63"))
         ]
         if mine:
             raise Weg2LaunchRefused(mine[0] + " (position %s was SHIPPED, so "
@@ -7668,13 +7668,13 @@ def build_parser() -> argparse.ArgumentParser:
              f"because neither 'auto' nor 'auto-performance' moves the "
              f"attention/GDN split (uneven_perf.py:6571) and that split IS the "
              f"operating-point question. A position is REFUSED rather than "
-             f"shipped when the card-rate library cannot price it (W52), when "
+             f"shipped when the card-rate library cannot price it (W61), when "
              f"its vector SATURATES a family -- a rank's proportional share "
              f"below one unit, so partition_units floors it and the axis is "
              f"pinned at its floor -- or resolves FLAT, which is even TP "
-             f"wearing an uneven flag (W53), when it would need an env pin to "
-             f"be honoured (W54), or when PerfCostModel.predict_capacity marks "
-             f"it feasible=False (W55). A rank with ZERO heads is NOT among "
+             f"wearing an uneven flag (W62), when it would need an env pin to "
+             f"be honoured (W63), or when PerfCostModel.predict_capacity marks "
+             f"it feasible=False (W64). A rank with ZERO heads is NOT among "
              f"them and never was: partition_units guarantees every rank at "
              f"least one unit, so that check could not fire. "
              f"Whatever is chosen, the launcher prints the WEG2 D-WEIGHTS line "
@@ -8419,7 +8419,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     state.p_depth = depth_decision.depth
     if ns.d_disable_cuda_graph:
         log(
-            "W56 Weg2EagerDecodeArm: --d-disable-cuda-graph was passed, so "
+            "W66 Weg2EagerDecodeArm: --d-disable-cuda-graph was passed, so "
             "group D runs --disable-cuda-graph. THIS IS A CONTROL ARM: the "
             "decode form under measurement is now eager, not the graphed "
             "full-perf form, and boot weg2dec1_0909 measured the eager mean "
@@ -9158,9 +9158,11 @@ def cli(argv: Optional[Sequence[str]] = None) -> int:
     out of step with the exceptions raised, and nothing could see it.
 
     #1248: a refusal raised AFTER a group has already spawned (W7/W9/W10/W45,
-    W53, ...) used to stop here -- print, drop the key, exit 2 -- leaving
+    W62, ...) used to stop here -- print, drop the key, exit 2 -- leaving
     whatever OS process(es) main() had already started running (weg2dec1
-    arms 2/3: W53 left group P serving on :30031, ~1.4 GiB held on the 5090,
+    arms 2/3: W62, which was W53 on that tree and is renumbered here because
+    W53 is Weg2StoreHandbackFailed on this one, left group P serving on
+    :30031, ~1.4 GiB held on the 5090,
     cleared only by a MANUAL teardown against the state json --
     BOOT_weg2dec1_0909.md). This is the SAME funnel, not a second one: a
     refusal before any spawn still takes the fast exit below unchanged,

@@ -337,7 +337,7 @@ class OperatingPointVectorTest(unittest.TestCase):
         )
         self.assertTrue(refusals, "a 1000:1 vector shipped without a refusal")
         self.assertTrue(
-            all(r.startswith("W53") for r in refusals), refusals
+            all(r.startswith("W62") for r in refusals), refusals
         )
         self.assertIn("below ONE unit", " ".join(refusals))
         self.assertIn("pinned at its floor", " ".join(refusals))
@@ -356,7 +356,7 @@ class OperatingPointVectorTest(unittest.TestCase):
     def test_no_measured_library_REFUSES_W52_and_never_uses_a_nameplate_peak(self):
         rows, refusals = self.rows(library=None)
         self.assertEqual(rows, [])
-        self.assertTrue(refusals[0].startswith("W52"), refusals)
+        self.assertTrue(refusals[0].startswith("W61"), refusals)
         self.assertIn("never approximated from a nameplate peak", refusals[0])
 
     def test_a_missing_early_read_fact_REFUSES_W54_rather_than_pinning_the_env(self):
@@ -371,7 +371,7 @@ class OperatingPointVectorTest(unittest.TestCase):
         )
         rows, refusals = self.rows(facts=trimmed)
         self.assertEqual(rows, [])
-        self.assertTrue(refusals[0].startswith("W54"), refusals)
+        self.assertTrue(refusals[0].startswith("W63"), refusals)
         self.assertIn("SGLANG_UNEVEN_DCP", refusals[0])
 
     def test_MUTANT_8_a_refusal_is_FATAL_only_when_that_position_is_shipped(self):
@@ -387,7 +387,7 @@ class OperatingPointVectorTest(unittest.TestCase):
                 d_tp_ratio_decision(
                     "decode-bs1", "both", CARDS, SB5E_BUDGETS, "/model", 6
                 )
-        self.assertIn("W52", str(ctx.exception))
+        self.assertIn("W61", str(ctx.exception))
         self.assertIn("was SHIPPED", str(ctx.exception))
 
     # -- R2: a diagnostic on the default path must not RAISE ---------------
@@ -438,7 +438,7 @@ class OperatingPointVectorTest(unittest.TestCase):
         boot blocker."""
         _rows, refusals = self.rows(pcm=SmallGdnPCM)
         self.assertEqual(
-            [r for r in refusals if "GDN" in r and r.startswith("W53")],
+            [r for r in refusals if "GDN" in r and r.startswith("W62")],
             [],
             refusals,
         )
@@ -450,9 +450,9 @@ class OperatingPointVectorTest(unittest.TestCase):
         `p`. An infeasible vector was printed with a world-pool number and
         shipped."""
         _rows, refusals = self.rows(pcm=InfeasiblePCM)
-        w55 = [r for r in refusals if r.startswith("W55")]
-        self.assertEqual(len(w55), 2, refusals)
-        for r in w55:
+        w64 = [r for r in refusals if r.startswith("W64")]
+        self.assertEqual(len(w64), 2, refusals)
+        for r in w64:
             self.assertIn("feasible=False", r)
         # ...and it is FATAL for the position that is shipped, and only then.
         p1, p2 = _patched(pcm=InfeasiblePCM)
@@ -461,7 +461,7 @@ class OperatingPointVectorTest(unittest.TestCase):
                 d_tp_ratio_decision(
                     "decode-bs6", "both", CARDS, SB5E_BUDGETS, "/model", 6
                 )
-        self.assertIn("W55", str(ctx.exception))
+        self.assertIn("W64", str(ctx.exception))
         p1, p2 = _patched(pcm=InfeasiblePCM)
         with p1, p2:
             dec = d_tp_ratio_decision(
@@ -541,7 +541,7 @@ class OperatingPointVectorTest(unittest.TestCase):
         del argparse
 
     def test_the_help_no_longer_promises_the_ZERO_HEADS_refusal(self):
-        """W53 is a SATURATION check. The zero-head check it replaced could
+        """W62 is a SATURATION check. The zero-head check it replaced could
         never fire -- `partition_units` guarantees >= 1 unit per rank -- so a
         help text promising it documents a guard that does not exist."""
         import inspect
@@ -553,7 +553,7 @@ class OperatingPointVectorTest(unittest.TestCase):
         help_text = src[i : i + 4000]
         self.assertNotIn("would give any rank ZERO heads of a family", help_text)
         self.assertIn("SATURATES", help_text)
-        self.assertIn("W55", help_text)
+        self.assertIn("W64", help_text)
 
     # -- MF-6: one writer for the boot's own spec/KV facts ------------------
 
@@ -627,7 +627,7 @@ class OperatingPointVectorTest(unittest.TestCase):
 #
 # THE FIXTURE IS BOOT weg2dec1 (BOOT_weg2dec1_0909.md, arms 2/3, 2026-09-09),
 # EVERY NUMBER QUOTED. Both operating-point positions were REFUSED at launch
-# with W53 on this rig:
+# with W62 on this rig:
 #
 #   arm 2 (decode-bs1): weights [58, 25, 25] from measured membw_gbs
 #     [1661.6, 716.2, 716.2]; "rank 1's share of the 4 attention units is
@@ -727,7 +727,7 @@ class AttentionTokenAxis1293Test(unittest.TestCase):
 
     def test_1293_both_weg2dec1_positions_are_FEASIBLE_priced_vectors(self):
         """weg2dec1 arms 2/3 in fixture form: today's tree refuses both with
-        W53 ("pool-feasible, axis-infeasible"); after #1293 both must yield
+        W62 ("pool-feasible, axis-infeasible"); after #1293 both must yield
         a feasible priced vector, because on this rig's serving form
         (replicated-KV uneven DCP) the attention compute rides the token
         axis, where [58, 25, 25] and [3991, 1000, 1000] are representable."""
@@ -791,7 +791,7 @@ class AttentionTokenAxis1293Test(unittest.TestCase):
     # -- MUTANT A: attention back on the head grid -------------------------
 
     def test_1293_MUTANT_A_the_head_grid_arm_reproduces_the_metal_refusal(self):
-        """Forcing the axis back to "head" must reproduce weg2dec1's W53 for
+        """Forcing the axis back to "head" must reproduce weg2dec1's W62 for
         both positions -- this is the red half of the slice, executable, and
         the detector for the mutant that reverts the axis."""
         p1, p2 = _patched(pcm=Dec1PCM)
@@ -802,7 +802,7 @@ class AttentionTokenAxis1293Test(unittest.TestCase):
             _rows, refusals = d_operating_point_rows(
                 CARDS, DEC1_BUDGETS, "/model", 6
             )
-        w53 = [r for r in refusals if r.startswith("W53")]
+        w53 = [r for r in refusals if r.startswith("W62")]
         self.assertEqual(len(w53), 2, refusals)
         for r in w53:
             self.assertIn("attention", r)
@@ -864,7 +864,7 @@ class AttentionTokenAxis1293Test(unittest.TestCase):
         )
         self.assertTrue(refusals)
         for r in refusals:
-            self.assertTrue(r.startswith("W53"), r)
+            self.assertTrue(r.startswith("W62"), r)
             self.assertIn("axis=token", r)
             self.assertIn("64", r)
             self.assertIn("below ONE unit", r)
