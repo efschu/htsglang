@@ -1854,7 +1854,7 @@ def _gib_or_none(value: Optional[float]) -> str:
     return "unreadable" if value is None else f"{value:.2f} GiB"
 
 
-def _advisory_line(arm: "Arm", chosen: bool) -> str:
+def _advisory_line(arm: Arm, chosen: bool) -> str:
     """The RUN-PEAK line, printed for the CHOSEN arm or -- on a total refusal --
     for the most frugal arm on the ladder.
 
