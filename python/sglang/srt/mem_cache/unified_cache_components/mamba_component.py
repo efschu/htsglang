@@ -1225,50 +1225,26 @@ class MambaComponent(TreeComponent):
                 return
 
             if self.enable_mamba_extra_buffer:
-                # #Q0 THE DONATION REPLACES THE BUFFER ENTRY, SO NOTHING IN THE
-                # BUFFER BELONGS TO THE TREE. `donate_mamba_ping_pong_slot`
-                # (memory_pool.py) returns the OLD slot -- that is what the tree
-                # takes -- and writes a FRESHLY ALLOCATED `new_slot` back into
-                # `buf[donate_idx]`, which the REQUEST owns and must return.
-                #
-                # This branch used to recompute that same index as `keep_idx`
-                # and hand it to `free_mamba_cache`, which then skipped freeing
-                # it. The tree owned the old slot, the request's fresh
-                # replacement was kept for nobody: not on the free list, not in
-                # any node. Exactly ONE orphaned slot per finished request whose
-                # donation the tree accepted -- measured on boot weg2sn5n
-                # (`leaked_mamba_pages={26}`, all three D ranks, on_idle) and on
-                # ARM 3 before it (`={16}` after a single 24k direct prefill).
-                # Only NEW long prefixes trip it: a request landing on an
-                # existing prefix takes `mamba_exist=True`, and that path never
-                # donated.
-                #
-                # THE KEEP SEMANTICS ARE INHERITED AND WERE INVALIDATED BY THE
-                # PORT, not merely lost. The sibling this component replaced
-                # (`mamba_radix_cache.py:746-761`) takes the tree's value from
-                # the buffer IN PLACE and allocates nothing:
-                #     src_active  = req.mamba_ping_pong_track_buffer[keep_idx]
-                #     mamba_value = src_active.clone()
-                # There "keep buf[keep_idx]" is exactly right, because the tree
-                # really does own that entry. The unified port added the fresh
-                # allocation and the in-place replacement while carrying the
-                # sibling's keep_idx across -- and the replacement is precisely
-                # what makes it false.
-                #
-                # The int8 branch above already frees both entries (it passes no
-                # keep index) and releases its own unused donation; this brings
-                # the plain extra-buffer branch to the same rule rather than
-                # inventing a second ledger for it.
-                donated = (
-                    insert_params.mamba_value if insert_params is not None else None
+                # #Q0 REVERTED ON METAL, 2026-09-09 boot weg2sn5o. The
+                # keep_idx=None variant (plus a give-back for the refused
+                # donation) turned the ORPHAN into an ALIASED slot: D died with
+                # `[mamba] available=19, evictable=12` on a 30-slot pool,
+                # i.e. one slot counted free AND tree-held -- which the pool's
+                # own message says makes alloc() hand a live anchor's GDN state
+                # to the next request. That is SILENT corruption where the
+                # original defect was loud and fail-stop, so the behaviour is
+                # restored here until the ownership transaction is proven, not
+                # inferred. The instrumentation added with it STAYS: it is what
+                # produced the first station trail of the fresh replacement slot
+                # (`station=alloc_component ... site=_alloc_mamba_slot`).
+                keep_idx = (
+                    pool.get_mamba_ping_pong_keep_idx(req)
+                    if mamba_value_inserted
+                    else None
                 )
-                if not mamba_value_inserted and donated is not None:
-                    # The tree refused the donation. The old slot already left
-                    # the buffer, so `free_mamba_cache` cannot reach it and
-                    # nothing else owes it back -- the same omission the plain
-                    # path carried until #929.
-                    self._free_mamba_value(donated)
-                pool.free_mamba_cache(req, mamba_ping_pong_track_buffer_to_keep=None)
+                pool.free_mamba_cache(
+                    req, mamba_ping_pong_track_buffer_to_keep=keep_idx
+                )
                 return
 
             if not mamba_value_inserted:

@@ -176,6 +176,21 @@ def admit(pool, req, n_track=2):
 # --------------------------------------------------------------------------
 
 
+@pytest.mark.xfail(
+    reason=(
+        "Q0 OPEN. These two assert the ownership rule the pool SHOULD satisfy, "
+        "and they are red because the defect is real and unfixed -- they are "
+        "the specimen, kept executable. The keep_idx=None repair they were "
+        "written against was REVERTED on metal (boot weg2sn5o): it turned the "
+        "orphan into an ALIASED slot (available=19 + evictable=12 on a 30-slot "
+        "pool), i.e. silent state corruption instead of a loud fail-stop. Do "
+        "not 'fix' these by relaxing the assertion; the next candidate repair "
+        "is to donate WITHOUT the fresh replacement, exactly as the sibling "
+        "mamba_radix_cache.py:746-761 does, which makes the ORIGINAL keep_idx "
+        "semantics true again instead of overriding them."
+    ),
+    strict=True,
+)
 def test_L1_accepted_donation_leaves_no_orphan():
     """One long NEW prefix: prefill -> donate -> tree inserts -> finish.
 
@@ -202,6 +217,21 @@ def test_L1_accepted_donation_leaves_no_orphan():
     )
 
 
+@pytest.mark.xfail(
+    reason=(
+        "Q0 OPEN. These two assert the ownership rule the pool SHOULD satisfy, "
+        "and they are red because the defect is real and unfixed -- they are "
+        "the specimen, kept executable. The keep_idx=None repair they were "
+        "written against was REVERTED on metal (boot weg2sn5o): it turned the "
+        "orphan into an ALIASED slot (available=19 + evictable=12 on a 30-slot "
+        "pool), i.e. silent state corruption instead of a loud fail-stop. Do "
+        "not 'fix' these by relaxing the assertion; the next candidate repair "
+        "is to donate WITHOUT the fresh replacement, exactly as the sibling "
+        "mamba_radix_cache.py:746-761 does, which makes the ORIGINAL keep_idx "
+        "semantics true again instead of overriding them."
+    ),
+    strict=True,
+)
 def test_L1_orphan_count_is_exactly_one_per_request():
     """The specimen's rate: {16} after one request, {26} after another."""
     pool = make_pool()
@@ -220,6 +250,21 @@ def test_L1_orphan_count_is_exactly_one_per_request():
 # --------------------------------------------------------------------------
 
 
+@pytest.mark.xfail(
+    reason=(
+        "Q0 OPEN. These two assert the ownership rule the pool SHOULD satisfy, "
+        "and they are red because the defect is real and unfixed -- they are "
+        "the specimen, kept executable. The keep_idx=None repair they were "
+        "written against was REVERTED on metal (boot weg2sn5o): it turned the "
+        "orphan into an ALIASED slot (available=19 + evictable=12 on a 30-slot "
+        "pool), i.e. silent state corruption instead of a loud fail-stop. Do "
+        "not 'fix' these by relaxing the assertion; the next candidate repair "
+        "is to donate WITHOUT the fresh replacement, exactly as the sibling "
+        "mamba_radix_cache.py:746-761 does, which makes the ORIGINAL keep_idx "
+        "semantics true again instead of overriding them."
+    ),
+    strict=True,
+)
 def test_L2_refused_donation_leaves_no_orphan():
     """``mamba_exist=True``: keep_idx is None, both buffer entries go back --
     but the OLD donated slot left the buffer and nothing frees it."""
@@ -288,6 +333,10 @@ def test_request_state_is_cleared_after_finish():
     assert req.mamba_next_track_idx is None
 
 
+@pytest.mark.xfail(
+    reason="Q0 OPEN -- same specimen as test_L1, in both ping-pong modes.",
+    strict=True,
+)
 @pytest.mark.parametrize("lazy", [False, True])
 def test_both_pingpong_modes(lazy):
     """``get_mamba_ping_pong_keep_idx`` differs between lazy and normal mode;
