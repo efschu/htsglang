@@ -1012,6 +1012,60 @@ def test_a_previous_flips_oncard_row_is_not_this_flips_signal(region, boot):
     assert "alive_in_proc" in str(excinfo.value)
 
 
+def test_a_second_batch_does_not_overwrite_the_first_batchs_row(region):
+    """THE MEASURED DEFECT of the first green remote run, pinned.
+
+    With ONE row per rank, the producer's batch 1 overwrote batch 0's ``bytes``
+    before the consumer read it, and the consumer -- which waits for a
+    sequence and then compares byte counts -- raised W54 against a producer
+    that had done nothing wrong (``expected_bytes=4096 bytes_filled=1904``:
+    batch 1's number answering batch 0's question).  Two halves, and the second
+    is the one that makes the first safe:
+
+    * a row is per rank PER SLOT, so batch 0's description survives while
+      batch 1 is being filled into the other slot;
+    * the FILL wait is EXACT, so a later batch's row can never answer for an
+      earlier one even if the layout changed again.
+    """
+    tp.write_oncard_row(region, tp.DIR_ONCARD_PROD_OFF, 0, slot=0, seq=0,
+                        nbytes=4096, state=tp.ONCARD_STATE_READY)
+    tp.write_oncard_row(region, tp.DIR_ONCARD_PROD_OFF, 0, slot=1, seq=1,
+                        nbytes=1904, state=tp.ONCARD_STATE_READY)
+    assert tp.read_oncard_row(region, tp.DIR_ONCARD_PROD_OFF, 0, 0)["bytes"] == 4096
+    assert tp.read_oncard_row(region, tp.DIR_ONCARD_PROD_OFF, 0, 1)["bytes"] == 1904
+
+    got = tp._await_oncard(region, tp.DIR_ONCARD_PROD_OFF, 0, 0, 1.0,
+                           what="fill", row=3, slot=0, exact=True)
+    assert got["bytes"] == 4096, "batch 0's row must still describe batch 0"
+
+    # And exactness: slot 1 carries batch 1, so asking it about batch 0 is a
+    # timeout, never batch 1's byte count.
+    with pytest.raises(xr.Weg2XchgGateTimeout) as excinfo:
+        tp._await_oncard(region, tp.DIR_ONCARD_PROD_OFF, 0, 0, 0.2,
+                         what="fill", row=3, slot=1, exact=True)
+    assert "exact=yes" in str(excinfo.value)
+    assert "peer_seq=1" in str(excinfo.value)
+    # The DRAIN direction is monotone and must stay >=.
+    assert tp._await_oncard(region, tp.DIR_ONCARD_PROD_OFF, 0, 0, 1.0,
+                            what="drain", row=3, slot=1)["seq"] == 1
+
+
+def test_run_leg_applies_its_slot_size_to_both_lanes():
+    """A knob that covers half of what its name says is worse than no knob.
+
+    The first version threaded ``slot_bytes`` into the cross lane only and left
+    the on-card bounce on the module default, which the six-process double
+    caught the hard way: a 4 KiB leg allocated a 64 MiB bounce and ran the fake
+    device out of memory.  ``oncard_slot_bytes`` defaults to ``slot_bytes``, and
+    the double asserts the allocation size that follows from it.
+    """
+    sig = inspect.signature(tp.run_leg)
+    assert sig.parameters["oncard_slot_bytes"].default is None
+    source = inspect.getsource(tp.run_leg)
+    assert "diag_bytes = int(slot_bytes if oncard_slot_bytes is None" in source
+    assert source.count("slot_bytes=diag_bytes") == 3
+
+
 def test_a_torn_oncard_row_is_not_a_signal(region):
     """Half a row must not read as a whole one -- the same seal law as S3's
     gate rows, in the area S4 owns."""
@@ -1109,6 +1163,11 @@ def test_the_dir_sub_layout_is_disjoint_and_inside_the_region():
     assert cursor == tp.DIR_USED_BYTES <= tp.DIR_CAPACITY
     assert tp.DIR_CAPACITY == xr.DATA_OFF - xr.DIR_OFF
     assert tp.ONCARD_ROW_STRUCT.size + 8 <= tp.DIR_ONCARD_ROW_BYTES
+    # ONE ROW PER RANK PER SLOT -- see the measured overwrite defect.
+    assert tp.DIR_ONCARD_ROWS == xr.N_RANKS * tp.ONCARD_SLOTS
+    assert tp.DIR_ONCARD_PROD_BYTES == tp.DIR_ONCARD_ROWS * tp.DIR_ONCARD_ROW_BYTES
+    with pytest.raises(ValueError):
+        tp._oncard_row_off(tp.DIR_ONCARD_PROD_OFF, 0, tp.ONCARD_SLOTS)
     # ~1608 x 48 B is what spec 2.2 says the S6 pointer table needs.
     assert tp.DIR_PTRTABLE_BYTES >= 1608 * 48
 
@@ -1352,7 +1411,7 @@ def _rank_child(root: str, region_path: str, boot: str, group: str, rank: int,
     peer_row = xr.rank_row("D" if is_source else "P", rank)
     ops = FakeDeviceOps(root, rank=rank)
     verdict = {"row": row, "ok": False, "error": "", "lines": [],
-               "mismatch": [], "zerofill": 0}
+               "mismatch": [], "zerofill": 0, "bump": 0}
     sems = None
     try:
         with xr.XchgRegion.open(region_path, expect_boot=boot) as region:
@@ -1387,6 +1446,7 @@ def _rank_child(root: str, region_path: str, boot: str, group: str, rank: int,
             verdict["zerofill"] = result.zerofill_bytes
             if not is_source:
                 verdict["mismatch"] = _verify(ops, root, descs, rank)
+            verdict["bump"] = ops._bump
             verdict["ok"] = not verdict["mismatch"]
     except BaseException as exc:  # noqa: BLE001 -- reported through the file
         verdict["error"] = f"{type(exc).__name__}: {exc}"
@@ -1484,6 +1544,13 @@ def test_six_ranks_move_a_wave_and_every_byte_lands(tmp_path):
     for verdict in consumers:
         assert verdict["mismatch"] == [], verdict["mismatch"]
     assert sum(v["zerofill"] for v in consumers) == 256
+    # The bounce is sized from run_leg's OWN slot size, not the module
+    # default: a 4 KiB leg that allocated a 64 MiB bounce is exactly how
+    # the half-applied knob was caught.
+    sources = [v for v in verdicts if v["row"] < xr.N_CARDS]
+    assert all(v["bump"] == tp.ONCARD_SLOTS * SLOT for v in sources), \
+        [v["bump"] for v in sources]
+    assert all(v["bump"] == 0 for v in consumers), [v["bump"] for v in consumers]
 
     lines = [ln for v in verdicts for ln in v["lines"]]
     pairs = [ln for ln in lines if ln.startswith(tp.PAIR_LINE_PREFIX)]
