@@ -351,9 +351,13 @@ def arm_report(
                         f"free) is BELOW its corridor floor of {floor} MiB "
                         f"(source={source})"
                     )
-                elif got is not None and corridor_guard.unmobilised_free_mib(
-                    mib, floor
-                ):
+                # NOT gated on the log carrying a floor= token. The finding is
+                # graded against whatever floor is IN FORCE, and on a
+                # pre-#1257c log that is the rig-wide band floor -- a real
+                # floor, named as PRE-1257C-BAND. Gating it would have made an
+                # over-filled card invisible on exactly the logs that have
+                # been taken so far.
+                elif corridor_guard.unmobilised_free_mib(mib, floor):
                     # DECISION 5, 2026-09-09: the upper edge is a FINDING and
                     # never a FAIL on its own. It says MiB are sitting
                     # unmobilised, which is a capacity question for the

@@ -160,9 +160,31 @@ def sb5f_boot():
 
 
 def line_for(solve, uuid):
-    hits = [l for l in solve.lines if f"card={uuid} " in l]
-    assert len(hits) == 1, f"expected exactly one line for {uuid}, got {len(hits)}"
+    """THE VERDICT LINE for one card.
+
+    #1257c: a card may now emit a SECOND line -- the ``INSTALLED`` provenance
+    line that names what the cut cost -- so "exactly one line per card" became
+    "exactly one VERDICT line per card". The count is still asserted, because
+    two verdict lines for one card is still the mispairing this assertion was
+    written to catch.
+    """
+    hits = [
+        l for l in solve.lines
+        if f"card={uuid} " in l and " verdict=" in l
+    ]
+    assert len(hits) == 1, (
+        f"expected exactly one verdict line for {uuid}, got {len(hits)}"
+    )
     return hits[0]
+
+
+def installed_line_for(solve, uuid):
+    """The ``INSTALLED`` provenance line for one card, or ``None`` (#1257c)."""
+    hits = [
+        l for l in solve.lines
+        if f"card={uuid} INSTALLED " in l
+    ]
+    return hits[0] if hits else None
 
 
 def field(line, key):
