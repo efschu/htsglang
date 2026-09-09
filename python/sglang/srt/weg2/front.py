@@ -78,6 +78,7 @@ from sglang.srt.managers.weg2_memory_saver import (
     weights_family_tags,
 )
 from sglang.srt.registry import nvml as nvml_registry
+from sglang.srt.weg2 import DEFAULT_D_BS, DEFAULT_P_BS
 from sglang.srt.weg2 import admin_key as admin_key_mod
 from sglang.srt.weg2 import host_ledger
 
@@ -1131,7 +1132,7 @@ class Front:
     def __init__(self, prefill: str, decode: str, awake: str, tag: str, store_dir: str,
                  prefill_sid: int, decode_sid: int, dc_reserve: Dict[str, int], w_s: float,
                  weight_chunks: int = 0, carrier_max_tokens: int = 0,
-                 p_concurrency: int = 8, d_bs: int = 8,
+                 p_concurrency: int = DEFAULT_P_BS, d_bs: int = DEFAULT_D_BS,
                  tp_prefill_max_tokens: int = X_FALLBACK_TOKENS,
                  flip_min_work_tokens: Optional[int] = None,
                  min_dwell_ms: Optional[float] = None,
@@ -4163,14 +4164,19 @@ def main():
                          "Seconds the oldest waiter may wait before the front stops admitting new "
                          "work to D and flips. 0 DISABLES it. Every fire names this switch, the "
                          "oldest wait and the queue it pre-empted.")
-    ap.add_argument("--p-concurrency", type=int, default=8,
-                    help="law 1 (K3): how many leg-1 POSTs group P runs at once. CONCURRENCY ONLY -- "
-                         "the P phase ends when the backlog is empty, never on this number. Written "
-                         "by the launcher from --p-bs; the front never derives it over HTTP.")
-    ap.add_argument("--d-bs", type=int, default=8,
-                    help="law 2 (K4): group D's own batch size, independent of P's. It is both D's "
-                         "--max-running-requests and the number of front seats, so the front cannot "
-                         "hand D more concurrent requests than D can run. Written by the launcher.")
+    ap.add_argument("--p-concurrency", type=int, default=DEFAULT_P_BS,
+                    help=f"law 1 (K3): how many leg-1 POSTs group P runs at once. CONCURRENCY ONLY -- "
+                         f"the P phase ends when the backlog is empty, never on this number. Written "
+                         f"by the launcher from --p-bs; the front never derives it over HTTP. This "
+                         f"default ({DEFAULT_P_BS}) therefore binds ONLY when the front is run by "
+                         f"hand, and it is the same provisional number the launcher ships (user "
+                         f"order 2026-09-09), read from one place so the two cannot disagree.")
+    ap.add_argument("--d-bs", type=int, default=DEFAULT_D_BS,
+                    help=f"law 2 (K4): group D's own batch size, independent of P's. It is both D's "
+                         f"--max-running-requests and the number of front seats, so the front cannot "
+                         f"hand D more concurrent requests than D can run. Written by the launcher; "
+                         f"this default ({DEFAULT_D_BS}) binds only for a hand-run front and is the "
+                         f"same provisional number the launcher ships (user order 2026-09-09).")
     ap.add_argument("--tp-prefill-max-tokens", type=int, default=X_FALLBACK_TOKENS,
                     help="law 4 (K5, X): uncached tokens D may prefill itself before the round trip "
                          "through P is cheaper. DERIVED by the launcher as 2*flip_s/(1/r_D - 1/r_P) "

@@ -49,6 +49,7 @@ import shlex
 import shutil
 import signal
 import subprocess
+import sys
 import time
 import urllib.error
 import urllib.request
@@ -58,6 +59,7 @@ from typing import Dict, List, Mapping, Optional, Sequence, Tuple
 from sglang.srt.weg2 import admin_key as admin_key_mod
 from sglang.srt.registry import nvml as nvml_registry
 from sglang.srt.weg2 import host_ledger, ring_table
+from sglang.srt.weg2 import DEFAULT_D_BS, DEFAULT_P_BS
 
 MIB = 1024 * 1024
 PORT_FRONT = 30030
@@ -737,7 +739,16 @@ P_MAMBA_AUTO_SAFETY_MARGIN = 1.25
 #: upper bound on SLOTS is an over-charge of mamba MiB, i.e. an UNDER-price of
 #: the pool -- the conservative direction, and the opposite of the one that
 #: cost weg2sb5f its floor. At p=2, t=8 it is ceil(20.0) = 20, the boot's own
-#: number, so the bound is TIGHT on the shipping form and not merely safe.
+#: number, so the bound is TIGHT on the form weg2sb5f ran and not merely safe.
+#:
+#: THAT ANCHOR IS A RECORD, NOT TODAY'S FORM: weg2sb5f booted at t=8, and the
+#: shipped default moved to ``DEFAULT_P_BS`` by the user order of 2026-09-09.
+#: The bound is proven for every t (the derivation above uses no value of t),
+#: so nothing here needed changing -- but the tightness claim is about that
+#: boot's t, not about the default, and re-reading it as "tight at the shipped
+#: bs" would be the instrument-text trap. The number the launcher actually
+#: charges is ``ceil(--p-bs x this x safety)`` and is printed with its inputs
+#: in the PP-CUT budget posts line, where --p-bs appears as a resolved value.
 P_MAMBA_SLOTS_PER_RUNNING_REQUEST = 2
 
 #: #1240 -- the DEPTH axis of the cost model, and the two records that pin it.
@@ -2048,7 +2059,7 @@ def argv_p(
     m_mib: int,
     store_cfg: str,
     extra: List[str],
-    p_bs: int = 8,
+    p_bs: int = DEFAULT_P_BS,
     max_kv_per_request: int = CONTEXT_LENGTH_TOKENS,
     stage_ratio: Optional[str] = None,
     attn_stage_ratio: Optional[str] = None,
@@ -2197,7 +2208,7 @@ def argv_d(
     m_mib: int,
     store_cfg: str,
     extra: List[str],
-    d_bs: int = 8,
+    d_bs: int = DEFAULT_D_BS,
     max_kv_per_request: int = CONTEXT_LENGTH_TOKENS,
     x_tokens: int = 0,
     num_continuous_decode_steps: int = 1,
@@ -2230,9 +2241,16 @@ def argv_d(
         # (arg_groups/overrides.py:1225-1239), so switching the overlap
         # schedule on also switched no_buffer -> extra_buffer, and
         # mamba_pool_floor.mamba_ping_pong_slots then charges 2 state slots
-        # per running request instead of 0 -- DOUBLING D's device mamba floor
-        # (16 -> 32 slots at --max-running-requests 8) out of the FIXED
-        # --rank-gpu-memory-mib budgets. Stated here so the argv is an honest
+        # per running request instead of 0 -- DOUBLING D's device mamba floor,
+        # by `2 x --max-running-requests` extra slots per rank, out of the FIXED
+        # --rank-gpu-memory-mib budgets. Stated PER RUNNING REQUEST and not as
+        # the product, because the product moves with `d_bs` and a comment
+        # cannot: the old wording read "16 -> 32 slots at
+        # --max-running-requests 8" and was stale the moment the shipped
+        # default moved to DEFAULT_D_BS (user order 2026-09-09). The live
+        # product is computed, printed and asserted by d_overlap_cost_line /
+        # d_mamba_ping_pong_cost, which read the RESOLVED bs -- never this
+        # comment. Stated here so the argv is an honest
         # statement of what D runs, and priced in the SCHEDULER: log line
         # (d_overlap_cost_line) so the launcher cannot move D's device
         # residency without the number appearing. The value follows the
@@ -3787,7 +3805,7 @@ def budgets_from_dc(
     return out
 
 
-def _max_running_requests(model: str, group: str = "D", bs: int = 8) -> int:
+def _max_running_requests(model: str, group: str = "D", bs: int = DEFAULT_D_BS) -> int:
     """``--max-running-requests`` as this launcher actually passes it, per GROUP.
 
     PRE-EXISTING BOOT KILLER, found by this slice's own --dry-run and fixed
@@ -3818,7 +3836,7 @@ def _max_running_requests(model: str, group: str = "D", bs: int = 8) -> int:
     return int(flags[flags.index("--max-running-requests") + 1])
 
 
-def _p_page_size(model: str, p_bs: int = 8) -> int:
+def _p_page_size(model: str, p_bs: int = DEFAULT_P_BS) -> int:
     """``--page-size`` as this launcher actually passes it to group P.
 
     #1286 F7. The pool model floors twice, as the sizer does
@@ -3836,7 +3854,7 @@ def _p_page_size(model: str, p_bs: int = 8) -> int:
         return 1
 
 
-def p_activation_reserve_provenance(model: str, p_bs: int = 8) -> Tuple[float, str]:
+def p_activation_reserve_provenance(model: str, p_bs: int = DEFAULT_P_BS) -> Tuple[float, str]:
     """What group P's boot would charge for the prefill activation reserve if
     NOTHING on this rig were calibrated -- and the line that tells you which
     branch it actually took.
@@ -3886,7 +3904,7 @@ def p_activation_reserve_provenance(model: str, p_bs: int = 8) -> Tuple[float, s
         reads, filled from the argv this launcher builds for group P."""
 
         disaggregation_mode = "null"
-        max_running_requests = _flag("--max-running-requests", 8)
+        max_running_requests = _flag("--max-running-requests", DEFAULT_P_BS)
         chunked_prefill_size = _flag("--chunked-prefill-size", 0)
         max_prefill_tokens = _flag("--max-prefill-tokens", 0)
         speculative_num_draft_tokens = _flag("--speculative-num-draft-tokens", 0)
@@ -3905,7 +3923,7 @@ def p_activation_reserve_provenance(model: str, p_bs: int = 8) -> Tuple[float, s
     ) % heuristic
 
 
-def d_mamba_ping_pong_cost(model: str, disable_overlap: bool, d_bs: int = 8) -> Tuple[str, int, int, int]:
+def d_mamba_ping_pong_cost(model: str, disable_overlap: bool, d_bs: int = DEFAULT_D_BS) -> Tuple[str, int, int, int]:
     """What D's overlap choice costs in DEVICE mamba state slots (FIX 1r/1).
 
     Returns ``(strategy, ping_pong_slots_per_running_request, extra_slots_per
@@ -3965,7 +3983,7 @@ def d_mamba_ping_pong_cost(model: str, disable_overlap: bool, d_bs: int = 8) -> 
     return strategy, per_req, (per_req - baseline) * mrr, mrr
 
 
-def d_overlap_cost_line(model: str, disable_overlap: bool, d_bs: int = 8) -> str:
+def d_overlap_cost_line(model: str, disable_overlap: bool, d_bs: int = DEFAULT_D_BS) -> str:
     """The one line that must appear wherever D's overlap choice is announced.
 
     The launcher must not be able to change D's device residency without the
@@ -5378,14 +5396,14 @@ def solve_p_cut(
         # literally on the argv this launcher builds, so P's value is always
         # the user-set branch.
         mamba_slots=math.ceil(
-            _max_running_requests(model, "P", int(getattr(ns, "p_bs", 8) or 8))
+            _max_running_requests(model, "P", int(getattr(ns, "p_bs", DEFAULT_P_BS) or DEFAULT_P_BS))
             * int(ns.pp_cut_mamba_slots_per_running_request)
             * P_MAMBA_AUTO_SAFETY_MARGIN
         ),
         # #1286 F7: the sizer's second floor. Read off P's argv for the same
         # reason as the target above -- a second copy would drift the day
         # --page-size moves.
-        page_size=_p_page_size(model, int(getattr(ns, "p_bs", 8) or 8)),
+        page_size=_p_page_size(model, int(getattr(ns, "p_bs", DEFAULT_P_BS) or DEFAULT_P_BS)),
         # #1286 F3: the two runtime posts that had no field, funded at zero
         # WITH the claim stated. Both are absent from the emitted post list of
         # weg2sb5f AND weg2rg6:
@@ -5564,7 +5582,7 @@ def solve_p_cut(
     # the runtime's own names, so this line and the boot's `KV budget posts`
     # line can be read side by side without a translation step.
     _act_heuristic_mib, _act_provenance = p_activation_reserve_provenance(
-        model, int(getattr(ns, "p_bs", 8) or 8)
+        model, int(getattr(ns, "p_bs", DEFAULT_P_BS) or DEFAULT_P_BS)
     )
     log(
         "PP-CUT budget posts (the boot's own list, MiB/rank): "
@@ -5584,7 +5602,7 @@ def solve_p_cut(
             float(model_pool.corridor_holdback_mib or 0.0),
             float(model_pool.mamba_mib_per_linear_layer_per_slot),
             int(model_pool.mamba_slots),
-            int(getattr(ns, "p_bs", 8) or 8),
+            int(getattr(ns, "p_bs", DEFAULT_P_BS) or DEFAULT_P_BS),
             int(ns.pp_cut_mamba_slots_per_running_request),
             P_MAMBA_AUTO_SAFETY_MARGIN,
             float(model_pool.speculative_intermediate_mib),
@@ -5878,13 +5896,18 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--extra-d", default="", help="extra flags for group D (shell-split)")
     ap.add_argument("--fairness-w-s", type=float, default=45.0,
                     help="A1-1: the only sanctioned pre-emption; 0 disables it. Passed to the front.")
-    ap.add_argument("--p-bs", type=int, default=8,
-                    help="K1: group P's --max-running-requests AND the front's leg-1 concurrency. "
-                         "Independent of --d-bs (law 2). Default 8 = today's shipped value. Also "
-                         "sizes P's req_to_token_pool, so it is resolved before the budget solve.")
-    ap.add_argument("--d-bs", type=int, default=8,
-                    help="K2: group D's --max-running-requests AND the number of front seats, so "
-                         "the front never hands D more concurrent requests than D can run.")
+    ap.add_argument("--p-bs", type=int, default=DEFAULT_P_BS,
+                    help=f"K1: group P's --max-running-requests AND the front's leg-1 concurrency. "
+                         f"Independent of --d-bs (law 2). Default {DEFAULT_P_BS} by the user order of "
+                         f"2026-09-09 ('bs2 fuer prefill'), which calls itself PROVISIONAL -- the "
+                         f"optimum for this workload is to be re-measured once the strand is finished, "
+                         f"and this flag is how you do it. Also sizes P's req_to_token_pool, so it is "
+                         f"resolved before the budget solve.")
+    ap.add_argument("--d-bs", type=int, default=DEFAULT_D_BS,
+                    help=f"K2: group D's --max-running-requests AND the number of front seats, so "
+                         f"the front never hands D more concurrent requests than D can run. Default "
+                         f"{DEFAULT_D_BS} by the same 2026-09-09 order ('bs4 fuer decode'), equally "
+                         f"provisional and equally re-measurable.")
     ap.add_argument("--tp-prefill-max-tokens", type=int, default=None,
                     help="K5 (X): uncached tokens D may prefill itself. Unset = DERIVED as "
                          "2*flip_s/(1/r_D - 1/r_P) from this rig's own front-log rate and flip "
@@ -6423,6 +6446,25 @@ def build_parser() -> argparse.ArgumentParser:
     return ap
 
 
+def bs_source(flag: str, argv: Optional[Sequence[str]] = None) -> str:
+    """``"flag"`` if this boot was TOLD its bs, ``"default"`` if it inherited it.
+
+    Every boot record must be able to answer "was this operating point chosen
+    for this boot, or is it the shipped provisional default?" without a second
+    document -- the user order of 2026-09-09 calls the pair explicitly
+    re-measurable, so a record that shows only the VALUE cannot later be sorted
+    into "measured arm" and "inherited arm".
+
+    Read off the argv that was PARSED, not off a comparison with the default:
+    an operator who passes ``--d-bs 4`` explicitly while the default is also 4
+    has still chosen it, and a value-comparison would silently call that boot a
+    default boot. Both spellings argparse accepts are matched (``--d-bs 4`` and
+    ``--d-bs=4``).
+    """
+    words = list(sys.argv[1:] if argv is None else argv)
+    return "flag" if any(w == flag or w.startswith(flag + "=") for w in words) else "default"
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     ns = build_parser().parse_args(argv)
     if ns.teardown:
@@ -6483,6 +6525,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     x_tokens, x_provenance = resolve_x(ns.tp_prefill_max_tokens, EVIDENCE_DIR, CHUNKED_PREFILL_TOKENS)
     flip_min_work_tokens = int(ns.flip_min_work_tokens) if ns.flip_min_work_tokens is not None else x_tokens
     idle_layout_front = "P" if ns.idle_layout == "pp" else "D"
+    # THE OPERATING POINT, WITH ITS PROVENANCE, ON EVERY BOOT RECORD. The pair
+    # is provisional by the order that set it (2026-09-09, "vorerst"), so a
+    # later re-measurement has to be able to sort past boots into "told" and
+    # "inherited" -- the value alone cannot do that, and neither can a
+    # comparison against the default (an explicit `--d-bs 4` is still a choice).
+    log(f"SCHEDULING BS PROVENANCE: p_bs={p_bs} d_bs={d_bs} "
+        f"source={bs_source('--p-bs', argv)}|{bs_source('--d-bs', argv)} "
+        f"(shipped defaults --p-bs {DEFAULT_P_BS} / --d-bs {DEFAULT_D_BS}, user order 2026-09-09, "
+        f"PROVISIONAL: 'wenn alles fertig ist kann man das immernoch nachmessen')")
     log(f"SCHEDULING KNOBS (spec slice A, resolved before the budget solve): --p-bs {p_bs} "
         f"(group P --max-running-requests + front leg-1 concurrency) --d-bs {d_bs} (group D "
         f"--max-running-requests + front D seats), independent by construction; "

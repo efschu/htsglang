@@ -16,6 +16,7 @@ import unittest
 import pytest
 
 try:
+    from sglang.srt.weg2 import DEFAULT_D_BS
     from sglang.srt.weg2.launcher import (
         argv_d,
         argv_p,
@@ -133,11 +134,22 @@ class TestTheOverlapChoiceIsPricedAndStated(unittest.TestCase):
         )
 
     def test_the_slot_delta_is_derived_from_the_runtime_not_typed(self):
+        """The PER-REQUEST term is the runtime's and is asserted as a number;
+        the PRODUCT is the shipped ``--d-bs`` and is asserted against
+        ``DEFAULT_D_BS``.
+
+        UPDATED 2026-09-09 (user order: "bs4 fuer decode"), not deleted: the
+        shipped default moved 8 -> 4, so ``mrr`` moved with it and ``extra``
+        halved, 16 -> 8. Re-pinning the product to the CONSTANT rather than to
+        the new literal is the actual repair -- this test asserted "derived
+        from the runtime, not typed" while itself typing the product of a
+        default it did not name, so the next re-measurement (which the order
+        says is coming) would have broken it again."""
         strategy, per_req, extra, mrr = d_mamba_ping_pong_cost(MODEL, False)
         self.assertEqual(strategy, "extra_buffer")
         self.assertEqual(per_req, 2)
-        self.assertEqual(mrr, 8)
-        self.assertEqual(extra, 16)
+        self.assertEqual(mrr, DEFAULT_D_BS)
+        self.assertEqual(extra, 2 * DEFAULT_D_BS)
         strategy, per_req, extra, mrr = d_mamba_ping_pong_cost(MODEL, True)
         self.assertEqual(strategy, "no_buffer")
         self.assertEqual(per_req, 0)
@@ -145,7 +157,9 @@ class TestTheOverlapChoiceIsPricedAndStated(unittest.TestCase):
 
     def test_the_number_appears_in_the_line_that_announces_the_change(self):
         line = d_overlap_cost_line(MODEL, False)
-        self.assertIn("16 extra device mamba state slots", line)
+        # 2 extra slots per running request x DEFAULT_D_BS running requests.
+        # Built from the constant for the same reason as above (2026-09-09).
+        self.assertIn(f"{2 * DEFAULT_D_BS} extra device mamba state slots", line)
         self.assertIn("2 extra ping-pong state slots per running request", line)
         self.assertIn("extra_buffer", line)
         # The MiB conversion is REFUSED here, and the refusal is named rather
