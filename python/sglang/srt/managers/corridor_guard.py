@@ -967,7 +967,10 @@ def corridor_floors_for_cards(
     return out
 
 
-def corridor_floor_for_current_device(group: Optional[str] = None) -> CorridorFloor:
+def corridor_floor_for_current_device(
+    group: Optional[str] = None,
+    fallback_reserve_mib: int = 0,
+) -> CorridorFloor:
     """The derived floor for the card THIS process is on. ONE rank-local door.
 
     REFUTER FINDINGS 6 AND 9 (2026-09-09). Three rank-local consumers
@@ -995,11 +998,17 @@ def corridor_floor_for_current_device(group: Optional[str] = None) -> CorridorFl
         uuid = registry_nvml.current_device_uuid() or ""
     except Exception as exc:  # pragma: no cover - NVML availability
         logger.debug("current device uuid unavailable for the floor: %s", exc)
-    return corridor_floor_mib(
-        uuid,
-        group=group,
-        user_reserve_mib=user_reserve_by_card().get(uuid, 0),
-    )
+    # THE PUBLISHED PER-CARD MAPPING FIRST, the caller's scalar only where
+    # there is none. A rank booted WITHOUT the Weg-2 launcher has no
+    # USER_RESERVE_ENV at all, and reading 0 there would silently drop an
+    # operator's ``--rank-user-reserve-mib`` -- the one knob the user
+    # explicitly kept ("das feature muss aber erhalten bleiben"). The fallback
+    # is still rank-uniform: it is one CLI value shared by every rank.
+    by_card = user_reserve_by_card()
+    reserve = by_card.get(uuid)
+    if reserve is None:
+        reserve = max(0, int(fallback_reserve_mib or 0))
+    return corridor_floor_mib(uuid, group=group, user_reserve_mib=reserve)
 
 
 #: #826: OPT-IN ADOPTION OF THE SOLVED ARMING FLOOR.

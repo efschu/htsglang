@@ -1172,6 +1172,32 @@ class RefuterFindingNineNoRankTerm(unittest.TestCase):
             ]
         self.assertEqual(floors[0].line, floors[1].line)
 
+    def test_the_cli_reserve_survives_a_boot_without_the_launcher(self):
+        """The knob the user explicitly kept must not vanish off the Weg-2 path.
+
+        A rank booted WITHOUT the Weg-2 launcher has no USER_RESERVE_ENV at
+        all. Reading 0 there would silently drop an operator's
+        ``--rank-user-reserve-mib`` -- "das feature muss aber erhalten
+        bleiben". The published per-card mapping still WINS where it exists,
+        so co-located ranks cannot diverge.
+        """
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(cg.USER_RESERVE_ENV, None)
+            os.environ.pop(cg.LAW_ENV, None)
+            got = cg.corridor_floor_for_current_device(
+                group="P", fallback_reserve_mib=512
+            )
+            self.assertEqual(got.reserve_mib, 512)
+            self.assertTrue(got.actuates)
+        with mock.patch.dict(
+            os.environ, {cg.USER_RESERVE_ENV: json.dumps({"": 128})}
+        ):
+            os.environ.pop(cg.LAW_ENV, None)
+            got = cg.corridor_floor_for_current_device(
+                group="P", fallback_reserve_mib=512
+            )
+            self.assertEqual(got.reserve_mib, 128)
+
     def test_the_rank_local_door_reads_the_card_level_reserve(self):
         """Not a per-RANK scalar: the reserve is a per-CARD quantity."""
         import inspect
@@ -1179,6 +1205,8 @@ class RefuterFindingNineNoRankTerm(unittest.TestCase):
         src = inspect.getsource(cg.corridor_floor_for_current_device)
         self.assertIn("user_reserve_by_card", src)
         self.assertNotIn("user_reserve_mib_scalar", src)
+        # the CLI fallback is a NAMED parameter, not a second reader
+        self.assertIn("fallback_reserve_mib", src)
 
 
 class RefuterFindingEightTheBootRecipes(unittest.TestCase):

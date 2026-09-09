@@ -596,7 +596,14 @@ def _seam_staging_reserve_bytes(server_args) -> int:
             corridor_floor_for_current_device,
         )
 
-        floor = corridor_floor_for_current_device()
+        # ``server_args`` is still read -- but only as the fallback reserve
+        # for a rank booted WITHOUT the Weg-2 launcher, which publishes no
+        # per-card mapping. Where the mapping exists it wins, so co-located
+        # ranks cannot diverge.
+        scalar = getattr(server_args, "user_reserve_mib_scalar", None)
+        floor = corridor_floor_for_current_device(
+            fallback_reserve_mib=int(scalar()) if callable(scalar) else 0
+        )
         floor_mib = int(floor.verdict_floor_mib)
     except Exception:  # pragma: no cover - the floor must never break a boot
         from sglang.srt.managers.corridor_guard import (
