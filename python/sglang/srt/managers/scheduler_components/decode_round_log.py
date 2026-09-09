@@ -93,11 +93,15 @@ each now NAMES THE MISSING THING rather than naming the mechanism:
 ``graph-replay-no-event-nodes``
     the graph was captured with no scope armed (or the replay declared no
     key), so there is nothing to read;
-``graph-replay-nodes-overwritten``
+``graph-replay-nodes-overwritten-by-N``
     a later replay of the same key re-executed the nodes before this round
-    was read, or WHILE it was being read. The nodes belong to the graph, not
-    to the round, and the read is not atomic against the forward thread, so
-    the generation that proves this is checked before AND after the read;
+    was read, or WHILE it was being read, and no reading of them survives in
+    the ring. ``N`` is the LAG, in replays: a bare ``overwritten`` reads as a
+    property of the mechanism, which since #1302 it is not. The witness is
+    the launch FENCE and not the generation -- a replay that has been issued
+    but not executed has destroyed nothing, and refusing on it cost 13,893 of
+    13,950 rounds on boot weg2dec2c. The read is not atomic against the
+    forward thread, so the fence is checked before AND after the read;
 ``graph-replay-nodes-unread``
     a node had not completed, or a node a concurrent replay re-recorded
     mid-read returned ``cudaErrorNotReady``. Never blocked on, never
@@ -348,10 +352,35 @@ class DecodeRoundLog:
             for span, category, graphed in acc.spans:
                 r = self.clock.harvest_round(span)
                 if r is None:
+                    self._snapshot_pending()
                     return
                 results.append((r, category, graphed))
             self._pending.pop(round_id)
             self._emit(acc, results)
+
+    def _snapshot_pending(self) -> None:
+        """#1302. Take the reading of every round that cannot be READ yet.
+
+        This is the whole mechanism, and it lives here rather than in the
+        clock because only the log knows which rounds are still waiting. A
+        round whose bracket has not completed is not emittable -- but the
+        graph it replayed IS readable at this instant, and will not be once
+        the next replay of that key executes, which under the overlap
+        scheduler is one round away. Taking the reading now and keeping it
+        in the clock's ring is what lets the round be emitted with a split
+        one or more replays later, instead of with
+        ``graph-replay-nodes-overwritten`` on 99.6 % of rounds.
+
+        Every pending round, not just the blocking one: any of them can be
+        the next to age out. Query-only, and a snapshot that finds nothing
+        readable refuses nothing and counts nothing.
+        """
+        snapshot = getattr(self.clock, "snapshot_round", None)
+        if snapshot is None:
+            return
+        for acc in self._pending.values():
+            for span, _category, _graphed in acc.spans:
+                snapshot(span)
 
     def _emit(self, acc: RoundAcc, results) -> None:
         round_ms = 0.0
@@ -454,9 +483,27 @@ class DecodeRoundLog:
         # schedule`, before reading anything into the round times), unready is
         # the device not having finished. Neither is ever waited on.
         graphs = nodes = late = stale = unready = reused = 0
+        ring_depth = ring_hits = 0
         gcounts = getattr(self.clock, "graph_node_counts", None)
         if gcounts is not None:
-            graphs, nodes, late, stale, unready, reused = gcounts
+            (
+                graphs,
+                nodes,
+                late,
+                stale,
+                unready,
+                reused,
+                ring_depth,
+                ring_hits,
+            ) = gcounts
+        # #1302 THREE DENOMINATORS, LABELLED APART ON THE LINE ITSELF. The
+        # dec2c boot record read "196 overwritten" off this line as NODES and
+        # set it against the 1552 node total -- two orders of magnitude out,
+        # because the counter is FORWARDS refused, and because this line is
+        # emitted ONCE after the first OVERHEAD_ROUNDS rounds and is
+        # therefore a running total as of that round, never a boot total.
+        # The per-round withheld-reason tally at the end of a boot is the
+        # only boot-wide population. Both facts now ride on the line.
         logger.info(
             "Decode rank clock overhead, rank: %d, %.1f us/round host-side over "
             "%d rounds = %.3f %% of the mean round gpu-ms %.2f, emitting about "
@@ -466,8 +513,12 @@ class DecodeRoundLog:
             "the prefill half (#252), both MUST be 0: prefill armings refused "
             "%d, decode rounds opened contended %d. Graph event nodes (#1241b): "
             "%d graphs carry %d nodes (%d created inside a capture); reads "
-            "skipped without blocking: %d overwritten by a later replay, %d "
-            "not yet complete, %d rounds that replayed one graph twice.",
+            "skipped without blocking, counted in FORWARDS and not in nodes, "
+            "and as of this line only (it is emitted once, after %d rounds): "
+            "%d overwritten by a later replay, %d "
+            "not yet complete, %d rounds that replayed one graph twice. "
+            "Reading ring (#1302): depth %d replays, %d rounds served from a "
+            "reading taken before the overwrite.",
             self.rank,
             us_per_round,
             self._overhead_rounds,
@@ -480,7 +531,10 @@ class DecodeRoundLog:
             graphs,
             nodes,
             late,
+            self._overhead_rounds,
             stale,
             unready,
             reused,
+            ring_depth,
+            ring_hits,
         )

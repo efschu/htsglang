@@ -79,25 +79,77 @@ is a host-side device call in the middle of the span being measured.
 
 THE ONE THING THIS CANNOT DO, NAMED RATHER THAN DISCOVERED. The nodes belong
 to the graph, not to the round: replay N+1 OVERWRITES the timestamps replay N
-left. So a reading is valid only while no newer replay of that key has been
-launched. :meth:`note_graph_replay` bumps a per-key generation at the launch
-site and :meth:`harvest_round` refuses a round whose generation has moved on
-(``graph-replay-nodes-overwritten``) instead of pricing somebody else's
-replay. Whether that window is open in practice is a property of the
-SCHEDULER, not of this module: with the overlap scheduler the host runs a
-batch ahead of the device, so a round may not have completed by the time the
-next replay is launched. The refusal counts are printed, so a boot answers
-the question instead of a comment claiming it.
+left. So a reading is valid only while no newer replay of that key has RUN.
+Whether that window is open in practice is a property of the SCHEDULER, not
+of this module: with the overlap scheduler the host runs a batch ahead of the
+device. The refusal counts are printed, so a boot answers the question
+instead of a comment claiming it.
 
-THE GENERATION CHECK IS TWO CHECKS, NOT ONE. ``harvest_round`` runs on the
-SCHEDULER thread; ``note_graph_replay`` and the graph launch run on the
-FORWARD thread. A single check before the read would be a TOCTOU: the read
-loop is ~two host calls per pair, and a replay launched inside that window
-re-stamps the early nodes while the loop is still walking the later ones,
-producing a mixture of two replays that no exception announces. So the
-generation is read again AFTER the read and the split is refused if it
-moved. The bump happens before the launch, which is what makes the second
-check conclusive rather than merely likelier to be right.
+#1302 -- THE READ IS ONE ROUND LATE, AND THAT USED TO COST EVERYTHING
+--------------------------------------------------------------------
+
+Boot ``weg2dec2c`` (21c46b1876) read all seven of this instrument's gates,
+found every identity holding, and reported ``split unavailable`` on **13,893
+of 13,950 rounds** with reason ``graph-replay-nodes-overwritten`` (plus 57
+``graph-replay-nodes-unread``). The instrument was right and the read lost
+the race, for one reason:
+
+    THE GENERATION IS A HOST FACT AND THE OVERWRITE IS A DEVICE EVENT.
+
+``note_graph_replay`` bumps the generation at the LAUNCH site, before
+``backend.replay``; the timestamps die when that replay EXECUTES. Under the
+overlap scheduler those are a round apart, so the flush that reaches round N
+always finds the next replay *issued* -- and a refusal keyed on "issued"
+throws away a reading that is still intact. Two changes close it, and both
+are query-only:
+
+1. **The predicate becomes the device's.** ``note_graph_replay`` records an
+   eager FENCE event on the launch stream immediately before the replay is
+   issued. Stream order is ``... replay G | fence G+1 | replay G+1 ...``, so
+   a COMPLETED fence G+1 is the proof -- and the only available proof -- that
+   generation G's nodes are being or have been re-executed. Recording the
+   fence AFTER the launch would answer "has G+1 finished", which is the wrong
+   question: a replay that has merely STARTED has already re-recorded the
+   early pairs. See :meth:`_executed_past`.
+2. **A reading outlives the round it was taken in.** When the flush finds a
+   round not yet readable, the graph it declared IS readable at that instant
+   and will not be once the next replay runs, so the reading is taken then
+   and kept in a per-key ring (:meth:`snapshot_round`, :meth:`_graph_reading`).
+   The round is emitted from the ring one or more replays later, and the
+   reader tolerates a lag of up to ``DEFAULT_GRAPH_RING - 1``.
+
+THE RING IS OF READINGS, NOT OF NODES, and that is forced rather than
+chosen. A static CUDA graph re-executes every one of its event-record nodes
+on every replay, so one capture holds exactly one replay's timestamps; K
+node-sets inside one graph would all be overwritten together and K captures
+per shape would multiply graph memory and capture time. A ring of readings
+costs one dict per replay per key.
+
+A SYNCHRONOUS READ WAS THE OTHER CANDIDATE AND IS REFUSED. Reading round N
+under ``cudaEventSynchronize`` on the scheduler path would guarantee the
+window, at the price of holding batch N+1 back until the device finished
+round N -- i.e. it would delete the run-ahead and measure the
+``--d-disable-overlap-schedule`` form instead of the shipped one. That is the
+same objection this module already makes to ``--disable-cuda-graph``: an
+instrument may not change the form it measures. It is also longest exactly
+where it would be needed most (a saturated device), so it is not kept as a
+fallback either.
+
+A REFUSAL NAMES THE LAG. ``graph-replay-nodes-overwritten-by-4`` says the
+reader was four replays behind; a bare ``overwritten`` reads as a property of
+the mechanism, and a wait of ``0.0`` would read as a measurement. The lag is
+computed from the generations the fences carry, never from their position, so
+a trimmed ring reports a lag of forty as forty.
+
+THE FENCE IS CHECKED TWICE, NOT ONCE. ``harvest_round`` and the snapshot run
+on the SCHEDULER thread; ``note_graph_replay`` and the graph launch run on
+the FORWARD thread. A single check before the read would be a TOCTOU: the
+read loop is ~two host calls per pair, and a replay that lands inside that
+window re-stamps the early nodes while the loop is still walking the later
+ones, producing a mixture of two replays that no exception announces. So the
+fences are read again AFTER the read and the reading is discarded if one
+moved -- which matters more now than it did before, because a mixture stored
+in the ring would later be SERVED to a round as a measurement.
 
 THE KEY IS THE RUNNER'S, NOT THE SHAPE'S. ``_graphs`` is a process-global
 dict on a process-global clock, while a capture size (``bs=8``) is a shape
@@ -259,8 +311,29 @@ class GraphNodes:
         default_factory=list
     )
     #: Bumped at every DECLARED replay of this key. A round holding an older
-    #: generation is reading timestamps a later replay has overwritten.
+    #: generation is reading timestamps a later replay has overwritten --
+    #: but only once that replay has EXECUTED, which is what ``fences``
+    #: below is for. The generation alone is a HOST-side fact.
     generation: int = 0
+    #: #1302. ``(generation, fence)`` in declaration order, newest last. The
+    #: fence is an EAGER event recorded on the launch stream immediately
+    #: BEFORE the replay of that generation is issued, so a COMPLETED fence
+    #: of generation G+1 proves the device has reached that launch point --
+    #: and only then are generation G's timestamps gone. Trimmed to the
+    #: clock's ring depth; the LAG is computed from the generations the
+    #: entries carry, never from their position, so trimming cannot make a
+    #: large lag read as a small one.
+    fences: List[Tuple[int, object]] = dataclasses.field(default_factory=list)
+    #: #1302. ``(generation, families)`` readings, oldest first. A reading is
+    #: taken at the last instant it is valid -- the flush that finds a round
+    #: not yet readable -- and kept here so the round can be emitted from it
+    #: one or more replays later. THE RING IS OF READINGS, NOT OF NODES: a
+    #: static CUDA graph re-executes every one of its event-record nodes on
+    #: every replay, so one capture can hold exactly one replay's timestamps
+    #: and K node-sets inside one graph is not a thing that can exist.
+    readings: List[Tuple[int, Dict[str, FamilyStat]]] = dataclasses.field(
+        default_factory=list
+    )
     #: Pairs whose events were not pre-created before the capture because the
     #: pre-allocation hint was too small. Not an error -- the pair is still
     #: correct -- but it is an allocation inside a capture, so it is counted
@@ -328,8 +401,21 @@ class RoundResult:
     split_refused: Optional[str] = None
 
 
+#: #1302. How many readings (and launch fences) each captured graph keeps.
+#: The reader tolerates a lag of up to ``DEFAULT_GRAPH_RING - 1`` replays
+#: between the flush that took a reading and the flush that emits the round
+#: it belongs to. Eight because the measured lag under the overlap scheduler
+#: is one to two rounds and the entry is a small dict -- depth is cheap here,
+#: and a ring too shallow degrades to the shipped behaviour silently.
+DEFAULT_GRAPH_RING = 8
+
+
 class CollectiveClock:
-    def __init__(self, backend: Optional[ClockBackend] = None) -> None:
+    def __init__(
+        self,
+        backend: Optional[ClockBackend] = None,
+        graph_ring: int = DEFAULT_GRAPH_RING,
+    ) -> None:
         self._slot: Optional[Slot] = None
         self._pool: List[torch.cuda.Event] = []
         self._label_hint: Optional[str] = None
@@ -384,6 +470,16 @@ class CollectiveClock:
         #: WHICH graph it is about to replay without threading the span
         #: through four dispatch layers.
         self._open_span: Optional[RoundSpan] = None
+        # -- #1302: the reading ring ---------------------------------------
+        self._graph_ring: int = max(1, int(graph_ring))
+        #: Launch fences returned by the ring's trim, reused rather than
+        #: re-created: an allocation on the replay path is the mutant this
+        #: module already refuses, and a fence is recorded on that path.
+        self._fence_pool: List[object] = []
+        #: Rounds emitted from a reading taken in an EARLIER flush. The one
+        #: number that says whether the ring is load bearing on this boot, as
+        #: opposed to every round having won its read outright.
+        self._graph_ring_hits: int = 0
 
     # -- arming ---------------------------------------------------------
 
@@ -649,6 +745,20 @@ class CollectiveClock:
         if nodes is None:
             return
         nodes.generation += 1
+        # #1302. THE FENCE, and it is recorded HERE rather than after the
+        # launch on purpose. The stream order is
+        # ``... replay G | fence G+1 | replay G+1 ...``, so a COMPLETE fence
+        # G+1 proves the device finished replay G and has arrived at the
+        # launch point of G+1: from that instant generation G's nodes are
+        # being, or have been, re-executed. Recording the fence AFTER the
+        # launch would answer a different question ("has G+1 finished"), and
+        # a replay that has only STARTED has already destroyed the early
+        # pairs -- which is the mixture no exception announces.
+        fence = self._fence_pool.pop() if self._fence_pool else self._backend.event()
+        fence.record()
+        nodes.fences.append((nodes.generation, fence))
+        while len(nodes.fences) > self._graph_ring:
+            self._fence_pool.append(nodes.fences.pop(0)[1])
         span = self._open_span
         if span is None:
             return
@@ -671,12 +781,18 @@ class CollectiveClock:
         span.graph_reads.append((nodes, nodes.generation))
 
     @property
-    def graph_node_counts(self) -> Tuple[int, int, int, int, int, int]:
-        """``(graphs, event nodes, late-created, stale, unready, key reused)``.
+    def graph_node_counts(self) -> Tuple[int, int, int, int, int, int, int, int]:
+        """``(graphs, event nodes, late-created, stale, unready, key reused,
+        ring depth, ring hits)``.
 
-        The denominator of every graph-replayed split line. ``graphs`` and
-        ``event nodes`` say how much of the boot CAN be split at all; the
-        three read counts say how much of what could be, was not -- and why.
+        THREE DIFFERENT DENOMINATORS, and the dec2c boot record got two of
+        them wrong in one sentence, so they are spelled out here rather than
+        left to the reader. ``graphs`` and ``event nodes`` count NODES and
+        say how much of the boot CAN be split at all. ``stale``, ``unready``
+        and ``key reused`` count FORWARDS refused, never nodes -- reading
+        them against the node total is out by whatever the replay count is.
+        ``ring hits`` counts ROUNDS served from a reading taken in an earlier
+        flush; ``ring depth`` is the configured lag tolerance, in replays.
         """
         pairs = sum(len(g.pairs) for g in self._graphs.values())
         late = sum(g.late_created for g in self._graphs.values())
@@ -687,10 +803,96 @@ class CollectiveClock:
             self._graph_stale_reads,
             self._graph_unready_reads,
             self._graph_key_reuses,
+            self._graph_ring,
+            self._graph_ring_hits,
         )
 
+    def _executed_past(self, nodes: GraphNodes, generation: int) -> int:
+        """How many replays of this key have EXECUTED past ``generation``.
+
+        ``0`` means the nodes still hold ``generation``'s timestamps. The
+        witness is the launch fence: fences are recorded in stream order, so
+        completion is monotone along the list and the NEWEST complete fence
+        is the answer. Query-only, and bounded by the ring depth rather than
+        by the boot's replay count.
+
+        THE LAG IS COMPUTED FROM THE GENERATIONS THE ENTRIES CARRY, not from
+        their position, so a trimmed ring reports a lag of 40 as 40 and
+        never as the ring depth.
+        """
+        for gen, fence in reversed(nodes.fences):
+            if gen <= generation:
+                break
+            if fence.query():
+                return gen - generation
+        return 0
+
+    def _graph_reading(
+        self, nodes: GraphNodes, generation: int, count: bool
+    ) -> Tuple[Optional[Dict[str, FamilyStat]], Optional[str]]:
+        """The per-family stats of ONE declared replay, or a refusal reason.
+
+        Three sources, in order, and the first is what #1302 added: a reading
+        this key already took while ``generation`` was still resident; then a
+        fresh read, if the fences prove it is still resident; then a refusal
+        that NAMES THE LAG.
+
+        ``count`` is False for the opportunistic snapshot pass, whose misses
+        are not refusals of any round and must not inflate the counters a
+        boot reads as the instrument's failure rate.
+
+        THE FENCE IS CHECKED TWICE, and the second check is not redundant --
+        the same argument the generation check made, with a predicate that is
+        now the device's rather than the host's: the forward thread can
+        launch AND the device can execute the next replay of this key between
+        the two, and the nodes then hand back a mixture of two replays with
+        no error. The bump and the fence both precede the launch, so a fence
+        that has not completed by the second check means no newer replay had
+        executed while the loop above ran.
+        """
+        for gen, fams in nodes.readings:
+            if gen == generation:
+                if count:
+                    self._graph_ring_hits += 1
+                return fams, None
+        lag = self._executed_past(nodes, generation)
+        if lag:
+            if count:
+                self._graph_stale_reads += 1
+            return None, f"graph-replay-nodes-overwritten-by-{lag}"
+        fams = self._read_graph_nodes(nodes, count_unready=count)
+        if fams is None:
+            return None, "graph-replay-nodes-unread"
+        lag = self._executed_past(nodes, generation)
+        if lag:
+            if count:
+                self._graph_stale_reads += 1
+            return None, f"graph-replay-nodes-overwritten-by-{lag}"
+        nodes.readings.append((generation, fams))
+        while len(nodes.readings) > self._graph_ring:
+            nodes.readings.pop(0)
+        return fams, None
+
+    def snapshot_round(self, span: Optional[RoundSpan]) -> None:
+        """Take, and keep, the reading of a round that cannot be READ yet.
+
+        Called by the flush when a pending round's bracket has not completed.
+        The round is not readable, but the graph it declared IS -- and it
+        will not be after the next replay of that key executes, which under
+        the overlap scheduler is imminent. This is the one call that turns
+        the ring from a data structure into a mechanism.
+
+        Query-only and silent: a snapshot that finds the nodes not yet
+        executed, or already superseded, simply takes nothing. It refuses no
+        round, so it counts nothing.
+        """
+        if span is None or not span.graph_replayed or span.graph_key_reused:
+            return
+        for nodes, generation in span.graph_reads:
+            self._graph_reading(nodes, generation, count=False)
+
     def _read_graph_nodes(
-        self, nodes: GraphNodes
+        self, nodes: GraphNodes, count_unready: bool = True
     ) -> Optional[Dict[str, FamilyStat]]:
         """Per-family stats of the LAST completed replay, or None.
 
@@ -719,13 +921,15 @@ class CollectiveClock:
         for pre, post, family in nodes.pairs:
             try:
                 if not post.query():
-                    self._graph_unready_reads += 1
+                    if count_unready:
+                        self._graph_unready_reads += 1
                     return None
                 ms = pre.elapsed_time(post)
             except RuntimeError:
                 # cudaErrorNotReady on a node a concurrent replay re-recorded
                 # mid-read. Same outcome as an incomplete node, same counter.
-                self._graph_unready_reads += 1
+                if count_unready:
+                    self._graph_unready_reads += 1
                 return None
             cell = acc.get(family)
             if cell is None:
@@ -895,29 +1099,16 @@ class CollectiveClock:
                 # which read as "graphs cannot be split" and is now false.
                 refused = "graph-replay-no-event-nodes"
             for nodes, generation in reads if refused is None else ():
-                if nodes.generation != generation:
-                    # A later replay of the same key has already re-executed
-                    # the nodes and overwritten their timestamps. The numbers
-                    # sitting in them are somebody else's round.
-                    self._graph_stale_reads += 1
-                    refused = "graph-replay-nodes-overwritten"
-                    break
-                fams = self._read_graph_nodes(nodes)
+                # #1302. Was this reading kept from an earlier flush, is it
+                # still resident, or is it genuinely gone -- and by how many
+                # replays? The predicate is the DEVICE's (launch fences),
+                # not the host's (``nodes.generation``): a replay that has
+                # been issued but not executed has destroyed nothing, and
+                # refusing on it discarded 13,893 of 13,950 valid readings
+                # on boot weg2dec2c.
+                fams, why = self._graph_reading(nodes, generation, count=True)
                 if fams is None:
-                    refused = "graph-replay-nodes-unread"
-                    break
-                if nodes.generation != generation:
-                    # THE SAME CHECK AGAIN, AND IT IS NOT REDUNDANT. The one
-                    # above proves nothing about the read that follows it:
-                    # the forward thread can launch the next replay of this
-                    # key between the two, and the nodes then hand back a
-                    # mixture of two replays' timestamps with no error. The
-                    # generation is bumped BEFORE the launch, so a generation
-                    # that has not moved by here means no newer replay was
-                    # launched while the loop above ran -- which is the whole
-                    # claim the split rests on.
-                    self._graph_stale_reads += 1
-                    refused = "graph-replay-nodes-overwritten"
+                    refused = why
                     break
                 for name, stat in fams.items():
                     have = graph_families.get(name)

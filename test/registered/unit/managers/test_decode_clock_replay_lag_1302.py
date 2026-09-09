@@ -47,11 +47,11 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from sglang.srt.debug_utils.rank_phase_summary import (  # noqa: E402
+from sglang.srt.debug_utils.rank_phase_summary import (
     parse_rank_batch_line,
     parse_unsplit_line,
 )
-from test_decode_graph_event_nodes_1241b import Harness, _Capture  # noqa: E402
+from test_decode_graph_event_nodes_1241b import Harness, _Capture
 
 #: The refusal token every overwritten round still starts with. The LAG is
 #: appended (``...-by-4``) so a log line can never say "overwritten" without
@@ -121,7 +121,7 @@ class ReplayLagTest(unittest.TestCase):
         self.assertIsNotNone(
             split,
             "round 1 was refused although the replay that would overwrite it "
-            "has not executed: %r" % (un,),
+            f"has not executed: {un!r}",
         )
         self.assertAlmostEqual(split["wait_ms"], 1.0, places=1)
         self.assertAlmostEqual(split["gpu_ms"], 7.0, places=1)
@@ -158,7 +158,7 @@ class ReplayLagTest(unittest.TestCase):
         got = self.lines()
         self.assertEqual(len(got), 2, got)
         first, un = self.parse(got[0])
-        self.assertIsNotNone(first, "the ring did not keep round 1's reading: %r" % (un,))
+        self.assertIsNotNone(first, f"the ring did not keep round 1's reading: {un!r}")
         self.assertAlmostEqual(first["wait_ms"], 1.0, places=1)
         self.assertAlmostEqual(first["gpu_ms"], 7.0, places=1)
         second, _ = self.parse(got[1])
@@ -188,7 +188,7 @@ class ReplayLagTest(unittest.TestCase):
             split, un = self.parse(line)
             self.assertIsNone(split, line)
             self.assertIsNotNone(un, line)
-            self.assertEqual(un["reason"], "%s-by-%d" % (OVERWRITTEN, lag), line)
+            self.assertEqual(un["reason"], f"{OVERWRITTEN}-by-{lag}", line)
             self.assertFalse(un["split_known"])
             self.assertNotIn("wait 0.0", line)
         last, _ = self.parse(got[4])
@@ -236,7 +236,7 @@ class ReplayLagTest(unittest.TestCase):
         self.assertIsNone(
             split,
             "a mixture of two replays was stored in the ring and served as "
-            "round 1's split: %r" % (split,),
+            f"round 1's split: {split!r}",
         )
         self.assertIsNotNone(un, got[0])
         self.assertTrue(un["reason"].startswith(OVERWRITTEN), got[0])
@@ -277,7 +277,7 @@ class ReplayLagTest(unittest.TestCase):
         self.assertEqual(
             len(split_lines),
             rounds - (no_nodes + overwritten + unread + twice),
-            "the withheld reasons do not partition the graphed rounds: %r" % (reasons,),
+            f"the withheld reasons do not partition the graphed rounds: {reasons!r}",
         )
         self.assertEqual(no_nodes, 1, reasons)
         self.assertGreaterEqual(len(split_lines), 1, got)

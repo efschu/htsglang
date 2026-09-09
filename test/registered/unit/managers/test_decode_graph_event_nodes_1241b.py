@@ -320,7 +320,10 @@ class GraphEventNodeTest(unittest.TestCase):
         self.assertEqual(len(got), 2, got)
         un = parse_unsplit_line("[2026-09-09 00:00:00 TP1] " + got[0])
         self.assertIsNotNone(un, got[0])
-        self.assertEqual(un["reason"], "graph-replay-nodes-overwritten")
+        # #1302 appended the LAG to this token. The round is one replay
+        # behind, and a reason that cannot say how far behind reads as a
+        # property of the mechanism rather than of this round.
+        self.assertEqual(un["reason"], "graph-replay-nodes-overwritten-by-1")
         self.assertFalse(un["split_known"])
         self.assertNotIn("wait 0.0", got[0])
         # and the round that DID own the nodes is still split.
@@ -470,7 +473,8 @@ class ConcurrentReplayTest(unittest.TestCase):
 
         un = parse_unsplit_line("[2026-09-09 00:00:00 TP1] " + self.lines()[0])
         self.assertIsNotNone(un, self.lines()[0])
-        self.assertEqual(un["reason"], "graph-replay-nodes-overwritten")
+        # #1302: the same refusal, now carrying the lag it refused at.
+        self.assertEqual(un["reason"], "graph-replay-nodes-overwritten-by-1")
         self.assertEqual(
             self.h.clock.graph_node_counts[3], 1, "the mid-read replay was not counted"
         )
