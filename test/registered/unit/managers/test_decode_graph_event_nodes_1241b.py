@@ -716,5 +716,217 @@ class EagerPathUnchangedTest(unittest.TestCase):
         self.assertFalse(self.h.clock.armed)
 
 
+# ---------------------------------------------------------------------------
+# #1297: the disarm must be as wide as ``armed``.
+# ---------------------------------------------------------------------------
+
+
+class ReentrantDispatch:
+    """``parallel_state.py:1438-1444``, modelled exactly.
+
+    Every test above calls ``clock.span(...)`` DIRECTLY. No dispatch site
+    does. The real ones read ``armed`` and, when it is true, re-enter
+    THEMSELVES inside the span -- relying on the span to have made ``armed``
+    false, so the second entry falls through the guard and runs the body
+    once::
+
+        if _COLLECTIVE_CLOCK.armed:
+            with _COLLECTIVE_CLOCK.span(self._clock_family_all_reduce):
+                return self.all_reduce(input_)
+        ...body...
+
+    That difference is not cosmetic: it is the entire reason the file above
+    was green on 9b40973baf while the boot died. A span that disarms less
+    than ``armed`` reads is invisible to a direct call and is an infinite
+    recursion here.
+
+    No depth cap on purpose -- a capped dispatch would report a tidy
+    assertion where the defect's real signature is ``RecursionError``, the
+    one boot weg2dec2 raised 2966 levels deep.
+    """
+
+    def __init__(self, clock, family="tp.all_reduce"):
+        self.clock = clock
+        self.family = family
+        #: times the guard was passed and the body reached
+        self.bodies = 0
+        #: times the function was entered at all (guarded + body entry)
+        self.entries = 0
+
+    def all_reduce(self):
+        self.entries += 1
+        if self.clock.armed:
+            with self.clock.span(self.family):
+                return self.all_reduce()
+        self.bodies += 1
+        return "done"
+
+
+class ArmedDisarmContractTest(unittest.TestCase):
+    """#1297: ``span`` must clear EVERY scope ``armed`` reads.
+
+    #1241b widened ``armed`` from ``_slot is not None`` to
+    ``_slot is not None or _capture is not None`` (994f0b5293) while each
+    branch of ``span`` kept clearing only its own field, and the branch that
+    skips a capturing slot cleared none at all. With both scopes live the
+    guard never went false, and boot weg2dec2 recursed into decode
+    CUDA-graph capture until the stack ended (BOOT_weg2dec2_0909.md).
+
+    Four reachable (scope x capturing x slot) states recurse on the broken
+    clock; one test each, named for the wrong behaviour. Every one drives
+    the clock through :class:`ReentrantDispatch`.
+
+    ``arm()`` is used to make the slot live because it is the smaller of the
+    two halves that own that one field; ``open_round()`` sets the SAME
+    ``_slot`` (see its docstring on contention), so the shapes below hold
+    for a decode round as well as a prefill forward.
+    """
+
+    def setUp(self) -> None:
+        self.h = Harness()
+
+    def dispatch(self):
+        return ReentrantDispatch(self.h.clock)
+
+    # -- the four recursion shapes ---------------------------------------
+
+    def test_a_capture_with_a_round_open_does_not_recurse_forever(self):
+        """THE BOOT KILLER. Capture branch clears `_capture`; `_slot` keeps
+        `armed` true, so the re-entry re-enters, forever."""
+        d = self.dispatch()
+        self.h.clock.arm()
+        with self.h.clock.capture_scope("k1"):
+            self.h.state.capturing = True
+            try:
+                self.assertEqual(d.all_reduce(), "done")
+            finally:
+                self.h.state.capturing = False
+        self.assertEqual(d.bodies, 1)
+        self.assertEqual(d.entries, 2)
+
+    def test_the_capture_skip_early_return_does_not_recurse_forever(self):
+        """A capturing stream with a slot open and NO capture scope takes the
+        `graph_capture_skipped` early return, which disarmed nothing at
+        all -- harmless while `armed` read one field, fatal after."""
+        d = self.dispatch()
+        self.h.clock.arm()
+        self.h.state.capturing = True
+        try:
+            self.assertEqual(d.all_reduce(), "done")
+        finally:
+            self.h.state.capturing = False
+        self.assertEqual(d.bodies, 1)
+        self.assertEqual(d.entries, 2)
+        slot = self.h.clock.disarm()
+        self.assertTrue(slot.graph_capture_skipped)
+
+    def test_a_capture_scope_before_the_stream_captures_does_not_recurse(self):
+        """`capture_scope` arms BEFORE the runner starts the stream capture
+        (see Harness.capture), so `_capture` set with `is_capturing()` false
+        is a real window. `span` fell to `slot is None` and yielded without
+        disarming anything."""
+        d = self.dispatch()
+        with self.h.clock.capture_scope("k2"):
+            self.assertFalse(self.h.state.capturing)
+            self.assertEqual(d.all_reduce(), "done")
+        self.assertEqual(d.bodies, 1)
+        self.assertEqual(d.entries, 2)
+
+    def test_a_slot_path_span_under_an_unstarted_capture_does_not_recurse(self):
+        """Same window as above, with a round also open: `span` took the slot
+        path and cleared `_slot`, but `_capture` kept `armed` true."""
+        d = self.dispatch()
+        self.h.clock.arm()
+        with self.h.clock.capture_scope("k3"):
+            self.assertFalse(self.h.state.capturing)
+            self.assertEqual(d.all_reduce(), "done")
+        self.assertEqual(d.bodies, 1)
+        self.assertEqual(d.entries, 2)
+
+    # -- the disarm must not be wider than it is deep either ---------------
+
+    def test_the_dispatch_site_still_lays_one_node_when_only_capture_is_armed(self):
+        """The disarm must not cost the measurement it guards: one pair laid,
+        for the one occurrence, under the family the site named."""
+        d = self.dispatch()
+        with self.h.clock.capture_scope("k4"):
+            self.h.state.capturing = True
+            try:
+                d.all_reduce()
+            finally:
+                self.h.state.capturing = False
+        nodes = self.h.clock.captured_graph("k4")
+        self.assertEqual(len(nodes.pairs), 1)
+        self.assertEqual(nodes.pairs[0][2], "tp.all_reduce")
+        self.assertEqual(d.bodies, 1)
+
+    def test_the_dispatch_site_still_records_one_pair_when_only_a_round_is_armed(self):
+        """The pre-#1241b path, byte-for-byte: one pair, one family, one
+        body, nothing else touched."""
+        d = self.dispatch()
+        self.h.clock.arm()
+        self.h.state.advance(3.0)
+        d.all_reduce()
+        slot = self.h.clock.disarm()
+        self.assertEqual(len(slot.pairs), 1)
+        self.assertEqual(slot.pairs[0][2], "tp.all_reduce")
+        self.assertFalse(slot.graph_capture_skipped)
+        self.assertEqual(d.bodies, 1)
+        self.assertEqual(d.entries, 2)
+
+    def test_a_nested_collective_is_still_counted_once_not_once_per_level(self):
+        """The re-entry discipline the disarm exists for, on both scopes: an
+        inner span inside an outer one adds no second region."""
+        self.h.clock.arm()
+        with self.h.clock.span("tp.all_reduce"):
+            self.h.state.advance(1.0)
+            with self.h.clock.span("tp.inner"):
+                self.h.state.advance(1.0)
+        slot = self.h.clock.disarm()
+        self.assertEqual([p[2] for p in slot.pairs], ["tp.all_reduce"])
+
+        with self.h.clock.capture_scope("k5"):
+            self.h.state.capturing = True
+            try:
+                with self.h.clock.span("tp.all_reduce"):
+                    with self.h.clock.span("tp.inner"):
+                        pass
+            finally:
+                self.h.state.capturing = False
+        nodes = self.h.clock.captured_graph("k5")
+        self.assertEqual([p[2] for p in nodes.pairs], ["tp.all_reduce"])
+
+    # -- restoration -------------------------------------------------------
+
+    def test_both_scopes_are_live_again_after_the_span_exits(self):
+        self.h.clock.arm()
+        with self.h.clock.capture_scope("k6"):
+            self.h.state.capturing = True
+            try:
+                with self.h.clock.span("tp.all_reduce"):
+                    self.assertFalse(self.h.clock.armed)
+                self.assertTrue(self.h.clock.armed)
+            finally:
+                self.h.state.capturing = False
+            self.assertTrue(self.h.clock.armed)
+        self.assertTrue(self.h.clock.armed)
+        self.assertIsNotNone(self.h.clock.disarm())
+        self.assertFalse(self.h.clock.armed)
+
+    def test_an_exception_in_the_body_restores_both_scopes(self):
+        self.h.clock.arm()
+        with self.h.clock.capture_scope("k7"):
+            self.h.state.capturing = True
+            try:
+                with self.assertRaises(ValueError):
+                    with self.h.clock.span("tp.all_reduce"):
+                        raise ValueError("body blew up")
+            finally:
+                self.h.state.capturing = False
+            self.assertTrue(self.h.clock.armed)
+        self.assertTrue(self.h.clock.armed)
+        self.assertIsNotNone(self.h.clock.disarm())
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -397,6 +397,17 @@ class CollectiveClock:
         their ``span`` on this one read, so a capture that does not flip it
         would lay no nodes at all -- the guard, not the ``span``, is what
         decides whether the capture is instrumented.
+
+        #1297, THE CONTRACT THAT COMES WITH THAT WIDTH: ``span`` must clear
+        EVERY field read here for the duration of the body it wraps. The
+        dispatch sites do not merely gate on this read, they RE-ENTER
+        THEMSELVES inside the span and rely on it being false the second
+        time (parallel_state.py:1443-1444). A scope added here without a
+        matching disarm in ``span`` is therefore not a missing measurement,
+        it is an infinite recursion -- which is exactly how #1241b's own
+        instrument killed boot weg2dec2 in decode graph capture. ``span``
+        clears both fields in one place, above every branch, so that the
+        disarm cannot drift narrower than this expression again.
         """
         return self._slot is not None or self._capture is not None
 
@@ -486,48 +497,62 @@ class CollectiveClock:
         active :meth:`label_scope` overrides it; if neither says anything the
         span is counted under ``other`` rather than dropped.
         """
-        capture = self._capture
-        if capture is not None and self._backend.is_capturing():
-            # #1241b. Lay a dedicated pre/post pair into the graph. The pair
-            # is this occurrence's own -- see GraphNodes for why sharing one
-            # per family would measure the compute between the occurrences.
+        # #1297. DISARM EVERY SCOPE ``armed`` READS, ABOVE EVERY BRANCH, ON
+        # EVERY PATH -- so that a collective built out of other collectives
+        # gets ONE region, not one per level, whichever scope is live.
+        #
+        # This used to be four separate disarms and one branch that had
+        # none: the capture branch cleared ``_capture``, the slot path
+        # cleared ``_slot``, and the early return that skips a capturing
+        # slot cleared nothing. That was correct only while ``armed`` read
+        # ONE field. #1241b made it the OR of two, and the dispatch sites
+        # re-enter themselves on that read (parallel_state.py:1443-1444)
+        # expecting it to be false -- so with a graph capturing AND a round
+        # open, each entry cleared one field, the other kept ``armed`` true,
+        # and boot weg2dec2 recursed 2966 levels inside decode graph capture
+        # (BOOT_weg2dec2_0909.md). Hoisted, the disarm is EQUAL to ``armed``
+        # by construction rather than by four correct recollections; a third
+        # scope has to be added here, not remembered in every branch.
+        capture, slot = self._capture, self._slot
+        self._capture = None
+        self._slot = None
+        try:
+            if capture is not None and self._backend.is_capturing():
+                # #1241b. Lay a dedicated pre/post pair into the graph. The
+                # pair is this occurrence's own -- see GraphNodes for why
+                # sharing one per family would measure the compute between
+                # the occurrences.
+                family = self._label_hint or label or OTHER
+                if capture.phase:
+                    family = capture.phase + FAMILY_PHASE_SEP + family
+                pre, post = self._acquire_capture_pair(capture)
+                capture.pairs.append((pre, post, family))
+                pre.record()
+                try:
+                    yield
+                finally:
+                    post.record()
+                return
+            if slot is None:
+                yield
+                return
+            if self._backend.is_capturing():
+                slot.graph_capture_skipped = True
+                yield
+                return
             family = self._label_hint or label or OTHER
-            if capture.phase:
-                family = capture.phase + FAMILY_PHASE_SEP + family
-            pre, post = self._acquire_capture_pair(capture)
-            capture.pairs.append((pre, post, family))
-            # Same re-entry discipline as the slot path: a collective built
-            # out of other collectives gets ONE region, not one per level.
-            self._capture = None
-            pre.record()
+            if self._phase_prefix:
+                family = self._phase_prefix + FAMILY_PHASE_SEP + family
+            start = self._acquire()
+            start.record()
             try:
                 yield
             finally:
-                post.record()
-                self._capture = capture
-            return
-        slot = self._slot
-        if slot is None:
-            yield
-            return
-        if self._backend.is_capturing():
-            slot.graph_capture_skipped = True
-            yield
-            return
-        family = self._label_hint or label or OTHER
-        if self._phase_prefix:
-            family = self._phase_prefix + FAMILY_PHASE_SEP + family
-        # Disarm for the duration of the body so that a collective built out
-        # of other collectives is counted once, not once per level.
-        self._slot = None
-        start = self._acquire()
-        start.record()
-        try:
-            yield
+                end = self._acquire()
+                end.record()
+                slot.pairs.append((start, end, family))
         finally:
-            end = self._acquire()
-            end.record()
-            slot.pairs.append((start, end, family))
+            self._capture = capture
             self._slot = slot
 
     def _acquire(self) -> torch.cuda.Event:
