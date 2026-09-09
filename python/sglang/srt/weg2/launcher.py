@@ -1196,6 +1196,18 @@ _ADMIN_KEY: Optional[str] = None
 #: The path, so teardown (and the refusal handler) can unlink it.
 _ADMIN_KEY_FILE: str = ""
 
+#: #1248: the LIVE BootState of whatever this process has spawned so far,
+#: read back by cli()'s refusal handler AFTER main() has already unwound.
+#: Same reason _ADMIN_KEY is a module global rather than a return value: the
+#: handler runs outside main()'s frame, in the except clause of its caller,
+#: so this is the only channel that survives the raise. Reset to None at the
+#: top of every main() call and pointed at the real BootState the moment one
+#: exists (before any group is spawned) -- from then on its .pids dict is the
+#: SAME dict main() mutates, so the handler sees pids even if the refusal hit
+#: before the next _write_state() flushed them to disk (front's pid has that
+#: gap: set at one line, written a dozen lines later).
+_ACTIVE_BOOT_STATE: BootState | None = None
+
 
 def set_admin_key(key: Optional[str], path: str = "") -> None:
     """Arm every launcher RPC with this boot's key. Idempotent, one source."""
@@ -6597,6 +6609,11 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
+    global _ACTIVE_BOOT_STATE
+    # #1248: unclaimed until a BootState exists below -- a stale pointer from
+    # a PREVIOUS boot in the same process (there is none today; guards the
+    # shape anyway) must never make a fast pre-spawn refusal look post-spawn.
+    _ACTIVE_BOOT_STATE = None
     ns = build_parser().parse_args(argv)
     if ns.teardown:
         return teardown(ns.teardown)
@@ -6627,6 +6644,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         raise Weg2LaunchRefused("tree is not clean -- boot from a COMMITTED tip only")
     py = f"{ns.venv}/bin/python"
     state = BootState(tag=ns.tag, tip=tip, tree=tree, stamp=stamp)
+    # #1248: from here on, cli()'s refusal handler can see this boot's pids
+    # the instant main() mutates state.pids -- no group has spawned yet
+    # (launch_group(spec_p, ...) is still ~500 lines below), so a refusal
+    # between here and there still takes today's unchanged fast exit.
+    _ACTIVE_BOOT_STATE = state
     state.logs = {"front": front_log or "<dry>", "P": f"{base}.P.log", "D": f"{base}.D.log"}
 
     # 1. preflight
@@ -7612,7 +7634,53 @@ def _write_state(state: BootState) -> None:
         json.dump(state.__dict__, f, indent=1, default=str)
 
 
-def teardown(path: str) -> int:
+#: #1248: first W-code substring in a refusal message, for the one-line
+#: summary. Not every Weg2LaunchRefused carries one (build_env's
+#: PYTORCH_CUDA_ALLOC_CONF refusal does not) -- covers the "Wnn" and "Wnnb"
+#: forms actually used in this file (e.g. W11b Weg2DraftBuildUnaccounted).
+_W_CODE_RE = re.compile(r"\bW\d+[a-z]?\b")
+
+
+def _w_code_of(e: BaseException) -> str:
+    """Best-effort W-code out of a refusal's message; "W?" when absent
+    rather than inventing one."""
+    m = _W_CODE_RE.search(str(e))
+    return m.group(0) if m else "W?"
+
+
+def _cards_empty(cards: list[dict]) -> bool:
+    """True iff NVML reports zero tenant-held MiB on every card this boot
+    claimed (``BootState.cards``, i.e. ``Card.__dict__`` entries).
+
+    Reuses the SAME reader :func:`teardown` already prints from
+    (``nvml_registry.memory_snapshot`` / ``tenant_used_mib``, the
+    carve-out-honest figure, #539) so this check and that print can never
+    disagree about what "empty" means. Conservative on any read failure or
+    on a card missing from the snapshot: an unread/unmatched card proves
+    nothing, so this returns False rather than claiming an unverified
+    guarantee -- the opposite mistake (claiming empty when it is not) is the
+    one #1248 exists to stop repeating.
+    """
+    try:
+        snap = nvml_registry.memory_snapshot()
+    except Exception:  # noqa: BLE001 - unread NVML must read as "not proven empty", never crash the refusal path
+        return False
+    used_by_index = {d.index: m.tenant_used_mib for d, m in snap}
+    for c in cards:
+        idx = c.get("nvml_index") if isinstance(c, dict) else getattr(c, "nvml_index", None)
+        if idx not in used_by_index or used_by_index[idx] != 0:
+            return False
+    return True
+
+
+def teardown(path: str, report: dict | None = None) -> int:
+    """Tear down a boot from its state json. Unchanged signature for the
+    ``--teardown PATH`` CLI mode (main()'s ``if ns.teardown: return
+    teardown(ns.teardown)`` passes only ``path``, so ``report`` must stay
+    optional). #1248: the refusal handler is the second caller -- it passes
+    a dict and reads back the pid/group tallies for its one-line summary,
+    rather than this function returning a different type to two callers.
+    """
     st = json.load(open(path))
     print(f"[{_now()}] WEG2-TEARDOWN {path}")
     # #1275 fix 2 (3): THE KEY DIES WITH THE BOOT. Read from the state json --
@@ -7714,6 +7782,13 @@ def teardown(path: str) -> int:
         )
     except Exception as e:  # noqa: BLE001 - a teardown print never fails a teardown
         print(f"cards after teardown: NVML unreadable ({e})")
+    if report is not None:
+        # The SAME pid set this function just TERMed/KILLed, and the SAME
+        # group names the state json recorded -- not a re-derivation, so the
+        # refusal handler's printed tallies cannot drift from what actually
+        # happened above.
+        report["pids"] = sorted(pids)
+        report["groups"] = sorted(name for name, pid in st.get("pids", {}).items() if pid)
     return 0
 
 
@@ -7723,6 +7798,46 @@ class Weg2RingFormUnproven(ring_table.Weg2RingRefused):
     A subclass of the ring's own refusal base, so it inherits ``cli()``'s
     handler -- the one named line and exit 2 -- without being enumerated
     anywhere (FIX 2's lesson, applied to the new member rather than repeated).
+    """
+
+
+class Weg2ChunkCardMismatch(Weg2LaunchRefused, ValueError):
+    """W52: ``chunk_tag_cards()``'s ``card_of_stage`` length does not match
+    the PP stage count (#1294).
+
+    Before this class existed the site raised a bare ``ValueError``, which is
+    reachable from ``main()`` after the dry-return (``launcher.py`` calls
+    ``chunk_tag_cards`` while building the flip's chunk-tag-to-card map) and
+    left the sglang groups alive on the cards as an uncaught traceback --
+    both funnels (this one and the pre-#1248 one) missed it because it was
+    neither in ``REFUSALS`` nor named ``Weg2*``.  Subclasses BOTH
+    ``Weg2LaunchRefused`` (so ``cli()``'s ``except REFUSALS`` catches it, the
+    same as every other launch refusal) AND ``ValueError`` (so the
+    pre-existing ``test_weg2_flip_order_1233.py::test_card_list_that_does_not_match_the_stages_is_refused``
+    -- which asserts ``ValueError`` and is not itself in scope here -- keeps
+    passing unmodified: the exception TYPE this call raises is intentionally
+    made richer, not swapped for an unrelated one, so no consumer of the old
+    type loses its match).
+    """
+
+
+class Weg2CarrierFloorUnreachable(Weg2LaunchRefused):
+    """W54: ``carrier_census.route_floor()``'s bisection could not bracket a
+    prompt length that exceeds the SHORT bound (#1294).
+
+    Before this class existed the site raised a bare ``RuntimeError`` for
+    what its own comment calls unreachable "for any sane divisor" --
+    reachable from ``main()`` after the dry-return via
+    ``_cc.route_floor(x_tokens)`` -- and left the sglang groups alive on the
+    cards as an uncaught traceback, missed by both funnels for the same
+    reason as ``Weg2ChunkCardMismatch`` above.  No pre-existing test asserts
+    on the specific ``RuntimeError`` this branch used to raise (checked:
+    every ``route_floor`` call site in
+    ``test_weg2_1246_carrier_census.py`` exercises the normal
+    ``(floor, why)`` return, none the unreachable branch), so no
+    multiple-inheritance is needed here -- ``Weg2LaunchRefused`` already
+    subclasses ``RuntimeError``, so any hypothetical ``except RuntimeError``
+    elsewhere still matches.
     """
 
 
@@ -7747,6 +7862,15 @@ def cli(argv: Optional[Sequence[str]] = None) -> int:
     A function rather than a bare ``__main__`` block so the handler is
     REACHABLE FROM A TEST: the defect it fixes was an except list that had gone
     out of step with the exceptions raised, and nothing could see it.
+
+    #1248: a refusal raised AFTER a group has already spawned (W7/W9/W10/W45,
+    W53, ...) used to stop here -- print, drop the key, exit 2 -- leaving
+    whatever OS process(es) main() had already started running (weg2dec1
+    arms 2/3: W53 left group P serving on :30031, ~1.4 GiB held on the 5090,
+    cleared only by a MANUAL teardown against the state json --
+    BOOT_weg2dec1_0909.md). This is the SAME funnel, not a second one: a
+    refusal before any spawn still takes the fast exit below unchanged,
+    because ``_ACTIVE_BOOT_STATE.pids`` is still empty at that point.
     """
     try:
         return main(argv)
@@ -7756,6 +7880,29 @@ def cli(argv: Optional[Sequence[str]] = None) -> int:
         # here and left its key file behind -- a boot that never served, whose
         # secret outlived it. Both exits, or the guarantee is only half true.
         print(f"[{_now()}] WEG2-LAUNCH admin key file: {drop_admin_key_file()}", flush=True)
+        st = _ACTIVE_BOOT_STATE
+        spawned = {name: pid for name, pid in (st.pids if st else {}).items() if pid}
+        if not spawned:
+            # Refused before the first launch_group() call -- nothing to tear
+            # down. Today's behavior, unchanged.
+            return 2
+        # #1248: at least one group is already running. Go through the SAME
+        # teardown() the operator's `--teardown PATH` mode and the killer use
+        # -- TERM the pid set (+ the pgrep fallback), wait, KILL leftovers,
+        # unmount, drop the ring dir and vram credit counters -- not a
+        # second, parallel cleanup path. Flush first: state.pids["front"] is
+        # set one statement before its next _write_state() (a real gap in
+        # main()), and teardown() reads the FILE, not this live object.
+        _write_state(st)
+        td_report: dict = {}
+        teardown(state_path(st), report=td_report)
+        cards_empty = _cards_empty(st.cards)
+        print(
+            f"WEG2-LAUNCH REFUSED {_w_code_of(e)} teardown=done "
+            f"groups={len(spawned)} pids={len(td_report.get('pids', []))} "
+            f"cards_empty={cards_empty}",
+            flush=True,
+        )
         return 2
 
 

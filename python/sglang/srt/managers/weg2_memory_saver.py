@@ -1859,8 +1859,21 @@ def chunk_tag_cards(
         return {}
     cards = list(card_of_stage) if card_of_stage is not None else list(range(len(stage_layers)))
     if len(cards) != len(stage_layers):
-        raise ValueError(
-            f"card_of_stage {cards} does not match the {len(stage_layers)} PP stages {list(stage_layers)}"
+        # #1294: was a bare ValueError, reachable from launcher.py's main()
+        # after the dry-return and caught by neither funnel (not in
+        # REFUSALS, not named Weg2*) -- left the sglang groups alive on the
+        # cards as an uncaught traceback.  Weg2ChunkCardMismatch subclasses
+        # BOTH Weg2LaunchRefused (cli()'s funnel) and ValueError (the
+        # pre-existing test_weg2_flip_order_1233.py assertion), so no
+        # existing catcher of either type loses its match.  Deferred import:
+        # this module is used by the live serving managers, not only by the
+        # launcher, so the launcher's own (control-plane) import graph is
+        # brought in only on this failure path, never at module load.
+        from sglang.srt.weg2.launcher import Weg2ChunkCardMismatch
+
+        raise Weg2ChunkCardMismatch(
+            f"W52 Weg2ChunkCardMismatch: card_of_stage {cards} does not match "
+            f"the {len(stage_layers)} PP stages {list(stage_layers)}"
         )
     acc: Dict[str, set] = {}
     layer = 0

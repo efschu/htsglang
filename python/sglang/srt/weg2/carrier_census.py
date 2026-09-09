@@ -342,9 +342,19 @@ def route_floor(short_bound: Optional[int] = None) -> Tuple[int, str]:
     while not _not_short(hi):
         hi *= 2
         if hi > (chunk + 4) * 64:  # unreachable for any sane divisor; fail loud
-            raise RuntimeError(
-                "#1246 route_floor: no prompt length up to %d chars exceeds "
-                "the SHORT bound %d under front.price_remainder" % (hi, chunk)
+            # #1294: was a bare RuntimeError, reachable from launcher.py's
+            # main() after the dry-return (via _cc.route_floor(x_tokens))
+            # and caught by neither funnel -- left the sglang groups alive
+            # on the cards as an uncaught traceback.  Deferred import for
+            # the same reason as weg2_memory_saver.chunk_tag_cards: this
+            # module has callers other than the launcher, so the launcher's
+            # import graph is paid for only on this failure path.
+            from sglang.srt.weg2.launcher import Weg2CarrierFloorUnreachable
+
+            raise Weg2CarrierFloorUnreachable(
+                "W54 Weg2CarrierFloorUnreachable: #1246 route_floor: no "
+                f"prompt length up to {hi} chars exceeds the SHORT bound "
+                f"{chunk} under front.price_remainder"
             )
     lo = 0
     while lo < hi:
