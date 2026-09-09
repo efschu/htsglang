@@ -304,7 +304,7 @@ class RoundSpan:
     #: round replayed a graph that carries no event nodes, or declared
     #: nothing at all. The generation is read back at harvest -- a mismatch
     #: means a later replay has overwritten the timestamps.
-    graph_reads: List[Tuple["GraphNodes", int]] = dataclasses.field(
+    graph_reads: List[Tuple[GraphNodes, int]] = dataclasses.field(
         default_factory=list
     )
     #: One key declared TWICE inside one bracket. Not the same as two
@@ -537,7 +537,7 @@ class CollectiveClock:
 
     # -- graph capture / replay (#1241b) ---------------------------------
 
-    def _acquire_capture_pair(self, capture: "GraphNodes"):
+    def _acquire_capture_pair(self, capture: GraphNodes):
         """Two timing events for one wrapped region of the graph.
 
         Drawn from the pool created BEFORE the capture. A draw that finds it
@@ -594,7 +594,7 @@ class CollectiveClock:
         if len(capture.pairs) > self._capture_pair_hint:
             self._capture_pair_hint = len(capture.pairs)
 
-    def captured_graph(self, key) -> Optional["GraphNodes"]:
+    def captured_graph(self, key) -> Optional[GraphNodes]:
         """The nodes recorded for ``key``, or None if that graph carries none.
 
         Read-only accessor, so a test can assert the ONE-PAIR-PER-REGION rule
@@ -665,7 +665,7 @@ class CollectiveClock:
         )
 
     def _read_graph_nodes(
-        self, nodes: "GraphNodes"
+        self, nodes: GraphNodes
     ) -> Optional[Dict[str, FamilyStat]]:
         """Per-family stats of the LAST completed replay, or None.
 
