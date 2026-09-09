@@ -18,9 +18,22 @@ requiring a GPU or a launch:
 
 import os
 import tempfile
+import json
 import unittest
 
 import pytest
+
+#: #1236: argv_p / argv_d take the RENDERED backend extra-config, not a
+#: store size in GiB -- the store is a directory on disk sized from the P
+#: KV pool, so a GiB number no longer means anything at this seam.
+#: Spelled out here rather than imported from the launcher: this module
+#: is read before its guarded launcher import, and the SHAPE is what the
+#: argv seam is being tested on.
+STORE_CFG = json.dumps(
+    {"max_size": str(30 * 1024 ** 3), "min_free_space": str(32 * 1024 ** 3),
+     "max_size_scope": "shared"},
+    separators=(",", ":"),
+)
 
 try:
     from sglang.srt.weg2.launcher import (
@@ -278,7 +291,7 @@ class GroupDDefaultsAreMeasured(unittest.TestCase):
             budgets=[1, 2, 3],
             s_gb=1,
             m_mib=1,
-            store_gib=1.0,
+            store_cfg=STORE_CFG,
             extra=[],
         )
         kwargs.update(over)

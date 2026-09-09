@@ -146,21 +146,23 @@ class TestTheLedgerWireIsLoadBearing(CustomTestCase):
             #   14.99 launch reading) + charges 27.62 (heaps 17.23 + anchors
             #   2.37 + rings 7.45 + overhead 0.39 + draft 0.18) + Sigma H 32.19
             #   = 81.19 GiB. #1236: the "+ store 17" this sum used to carry is
-            #   GONE -- the page store is a directory on the ZFS dataset, so it
-            #   is not in the run peak at all, and 81.19 sits UNDER the hard
-            #   bound. This box therefore no longer reaches W21 through the run
-            #   peak on the full ladder; the pin below restricts the ladder to
-            #   its top arm, which still predicts above the bound.
-            import unittest.mock as _mock
-            with _mock.patch.object(host_ledger, "DEFAULT_ARMS", ((1, 2400),)):
-                with self.assertRaises(host_ledger.Weg2HostRunPeakRefused) as cm:
-                    launcher.choose_host_ledger(
-                        DK5_RING_BYTES, DK5_RING_SPAN1_BYTES, meminfo_path=meminfo,
-                        cgroup_root=cg,
-                        record_path=os.path.join(tmp, "no-such-record.json"),
-                    )
-        terms = [ln for ln in str(cm.exception).splitlines()
-                 if "WEG2-HOST-LEDGER TERMS" in ln][0]
+            #   GONE -- the page store is a directory on the ZFS dataset -- and
+            #   81.19 sits UNDER the hard bound, so this box FUNDS M=600 with
+            #   6.11 GiB of headroom instead of refusing.
+            #
+            # WHAT THIS TEST IS FOR IS UNCHANGED BY THAT, and it is why the
+            # assertion moved to the lines rather than to the exception: the
+            # seam exists to carry fix 6's DENOMINATOR into a boot, and the
+            # TERMS line below is that denominator. It was read off a refusal
+            # only because a refusal was the outcome on this box at the time;
+            # the fix-6 review's own mutant (`cg["reclaimable"]` -> `None`)
+            # still moves `base=93.05` to `base=86.89` here and still goes red.
+            _arm, _headroom, lines, _r = launcher.choose_host_ledger(
+                DK5_RING_BYTES, DK5_RING_SPAN1_BYTES, meminfo_path=meminfo,
+                cgroup_root=cg,
+                record_path=os.path.join(tmp, "no-such-record.json"),
+            )
+        terms = [ln for ln in lines if "WEG2-HOST-LEDGER TERMS" in ln][0]
         # base = 118.05 (ceiling) - 14.99 (non-reclaimable) - 10 (CLI) = 93.05.
         self.assertIn("of which reclaimable=6.17 GiB", terms)
         self.assertIn("non-reclaimable=14.99 GiB charged", terms)

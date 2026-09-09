@@ -480,9 +480,11 @@ class LedgerRingTermsTest(unittest.TestCase):
         self.assertEqual((arm.s_gb, arm.m_mib), (1, 1200))
         # #1236: the middle of the tuple is the REAP HEADROOM (hard bound minus
         # predicted run peak), not a store size -- the store is on disk and this
-        # ledger no longer sizes one.
-        self.assertIsNotNone(headroom)
-        self.assertGreater(headroom, 0.0)
+        # ledger no longer sizes one. This box passes NO cgroup sample, so there
+        # is no origin to predict a peak from and the headroom is ABSENT: None,
+        # stated, never 0.0 (which would read as "no room" rather than "not
+        # measured").
+        self.assertIsNone(headroom)
 
     def test_an_unfundable_ladder_refuses_with_the_ring_arithmetic(self):
         with self.assertRaises(host_ledger.Weg2HostLedgerRefused) as ctx:

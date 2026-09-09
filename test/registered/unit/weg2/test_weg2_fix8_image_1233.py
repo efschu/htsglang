@@ -291,11 +291,15 @@ class TestTheDormantImageSampler(CustomTestCase):
 
 class TestTheRunPeakRefusesInsteadOfAdvising(CustomTestCase):
     def test_an_arm_that_funds_both_moments_is_refused_by_its_run_peak(self):
-        # A box with room to spare at both moments and at the store floor: the
-        # ONLY term that can refuse here is the run peak, so this test cannot
-        # pass by accident of another gate.
+        # A box with room to spare at BOTH moments: the ONLY term that can
+        # refuse here is the run peak, so this test cannot pass by accident of
+        # another gate. #1236: the ladder is restricted to its top arm, because
+        # with the store off the RAM books the lower arms of this box now fit
+        # (see REFUSING_ARMS) -- the gate under test is the run peak, not which
+        # arm happens to trip it.
         with self.assertRaises(host_ledger.Weg2HostRunPeakRefused) as cm:
-            _ladder(int(200 * GIB), int(190 * GIB), int(20 * GIB), 0)
+            _ladder(int(200 * GIB), int(190 * GIB), int(20 * GIB), 0,
+                    arms=REFUSING_ARMS)
         msg = str(cm.exception)
         self.assertIn("W21 Weg2HostRunPeakRefused", msg)
         self.assertIn("RUN PEAK", msg)

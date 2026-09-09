@@ -262,15 +262,22 @@ class TestTheLedgerDoesNotChargeRam(CustomTestCase):
             cg_ceiling_source="test",
             cg_oom_kill=0,
         )
-        text = "\n".join(lines)
         chosen = [ln for ln in lines if "WEG2-HOST-LEDGER CHOSEN" in ln][0]
         self.assertIn("store=ON DISK, NOT A RAM POST", chosen)
         self.assertIn("page_cache=reclaimable", chosen)
         self.assertIn("reap_headroom=", chosen)
         self.assertIsNotNone(headroom)
-        # THE DANGER DIRECTION, pinned as text: no line may print a store as a
-        # GiB RAM quantity again.
-        self.assertNotIn("GiB tmpfs", text)
+        # THE DANGER DIRECTION, pinned as text: no ARM or CHOSEN line may
+        # print a store as a GiB RAM quantity again. Scoped to those lines on
+        # purpose -- the surrounding prose legitimately REFERS to the tmpfs
+        # form as history ("6 GiB on boot weg2sb5g, whose store was a 6 GiB
+        # tmpfs"), and a blanket ban on the word would forbid the explanation
+        # instead of the charge.
+        priced = [ln for ln in lines
+                  if "WEG2-HOST-LEDGER ARM" in ln or "WEG2-HOST-LEDGER CHOSEN" in ln]
+        self.assertEqual(len(priced), 4)      # three arms plus the choice
+        for ln in priced:
+            self.assertNotIn("GiB tmpfs", ln)
         for ln in lines:
             if "WEG2-HOST-LEDGER ARM" in ln:
                 self.assertIn("store=NOT CHARGED HERE", ln)
@@ -431,8 +438,12 @@ class TestTheDirectory(CustomTestCase):
                 f.write(b"x" * 8192)
             log = _Log()
             freed = launcher.sweep_store_residue(log, keep, dry=False, root=root)
-        self.assertGreater(freed, 0)
-        self.assertFalse(os.path.isdir(stale))
+            # INSIDE the TemporaryDirectory: outside it the tree is gone and
+            # `isdir(stale)` is False for a reason that has nothing to do with
+            # the sweep -- the assertion would pass whatever the sweep did.
+            self.assertGreater(freed, 0)
+            self.assertFalse(os.path.isdir(stale))
+            self.assertTrue(os.path.isdir(keep))
         self.assertIn("oldboot", log.text)
         self.assertIn("DISK, not host RAM", log.text)
 
@@ -459,8 +470,9 @@ class TestTheDirectory(CustomTestCase):
             freed = launcher.sweep_store_residue(
                 log, os.path.join(root, "thisboot"), dry=True, root=root
             )
-        self.assertEqual(freed, 0)
-        self.assertTrue(os.path.isdir(stale))
+            # INSIDE the TemporaryDirectory, for the same reason as above.
+            self.assertEqual(freed, 0)
+            self.assertTrue(os.path.isdir(stale))
         self.assertIn("DRY-RUN", log.text)
 
     def test_prepare_store_makes_a_plain_directory(self):

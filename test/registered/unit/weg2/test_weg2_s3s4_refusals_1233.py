@@ -122,22 +122,37 @@ def test_w20_refuses_a_boot_with_no_measured_ring_table_rather_than_guessing():
 DR1_BYTES = (29912 + 32964) * 1024 * 1024
 
 
-def test_w20_still_refuses_the_live_box_shape_under_the_DR1_two_image_shape():
+def test_the_DR1_two_image_shape_is_priced_far_above_the_ring_form():
     """boot weg2ls1b2 (2026-09-07): with the #721 floor alone the ledger funded
     S=1/M=1200/store 5 GiB and the box OOM-killed at group D's first sleep.
-    With the #1232 headroom charged the same box REFUSES by name.
 
     C19 keeps this regression intact by pricing the same shape from the
     measured table rather than from the deleted constants: two resident images
-    = 61.4 GiB, which this box does not fund at any arm."""
+    = 61.4 GiB against the ring's 32.19.
+
+    #1236 CHANGED THE VERDICT AND THE TEST FOLLOWS THE EVIDENCE RATHER THAN
+    THE OLD OUTCOME. This box used to REFUSE outright, and a large part of what
+    put it over was the store: every arm's predicted peak carried its own
+    tmpfs. With the store on the ZFS dataset the same readings fund an arm, so
+    what is pinned here is the QUANTITY that made the DR-1 shape wrong -- it
+    prices ~29 GiB above the ring form at the same arm, and no reader can miss
+    that in the terms -- rather than a refusal that the RAM ledger no longer
+    owes. The refusal for the two-image shape lives where it belongs now: the
+    ring slice, which never builds two resident images at all."""
     memtotal = 118 * GIB
     memavail = 107 * GIB
-    with pytest.raises(host_ledger.Weg2HostLedgerRefused) as ei:
-        host_ledger.choose(memtotal, memavail,
-                           ring_bytes=DR1_BYTES,
-                           ring_span1_bytes=RING_SPAN1_BYTES,
-                           ring_provenance="boot weg2zr2, DR-1 two-image shape")
-    text = str(ei.value)
+    dr1 = host_ledger.price(memtotal, memavail, 1, 1200,
+                            ring_bytes=DR1_BYTES, ring_span1_bytes=RING_SPAN1_BYTES)
+    ring = host_ledger.price(memtotal, memavail, 1, 1200,
+                             ring_bytes=RING_BYTES, ring_span1_bytes=RING_SPAN1_BYTES)
+    assert dr1.terms["host_ring_gib"] - ring.terms["host_ring_gib"] > 25.0
+    assert dr1.run_leftover_gib < ring.run_leftover_gib
+    _arm, _headroom, lines = host_ledger.choose(
+        memtotal, memavail,
+        ring_bytes=DR1_BYTES,
+        ring_span1_bytes=RING_SPAN1_BYTES,
+        ring_provenance="boot weg2zr2, DR-1 two-image shape")
+    text = "\n".join(lines)
     # fix 8: the MEASURED dormant image (`image_P=`/`image_D=`) prints beside the
     # #809 census sums (`weight_tags_P=`) it used to be confused with -- and on
     # the ring both are PROVENANCE, not charges: the charge is Sigma H.

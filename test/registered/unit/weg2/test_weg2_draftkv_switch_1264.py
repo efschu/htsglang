@@ -32,9 +32,22 @@ The checkpoint cases skip where this rig's model tree is absent; the argv,
 form-key and predicate cases are synthetic and run anywhere.
 """
 
+import json
 import unittest
 
 import pytest
+
+#: #1236: argv_p / argv_d take the RENDERED backend extra-config, not a
+#: store size in GiB -- the store is a directory on disk sized from the P
+#: KV pool, so a GiB number no longer means anything at this seam.
+#: Spelled out here rather than imported from the launcher: this module
+#: is read before its guarded launcher import, and the SHAPE is what the
+#: argv seam is being tested on.
+STORE_CFG = json.dumps(
+    {"max_size": str(30 * 1024 ** 3), "min_free_space": str(32 * 1024 ** 3),
+     "max_size_scope": "shared"},
+    separators=(",", ":"),
+)
 
 try:
     from sglang.srt.weg2 import ring_table
@@ -73,7 +86,7 @@ RG6_PP2_RESIDUAL_MIB = 1344.2
 
 def p(**kw):
     args = dict(
-        py=PY, model=MODEL, budgets=BUDGETS, s_gb=48, m_mib=2400, store_gib=10.0,
+        py=PY, model=MODEL, budgets=BUDGETS, s_gb=48, m_mib=2400, store_cfg=STORE_CFG,
         extra=[],
     )
     args.update(kw)
@@ -133,7 +146,7 @@ class TestArgvCarriesTheSwitch(unittest.TestCase):
     def test_group_d_is_untouched_by_the_switch(self):
         """D keeps its own NEXTN head in BOTH forms."""
         d = argv_d(py=PY, model=MODEL, budgets=BUDGETS, s_gb=48, m_mib=2400,
-                   store_gib=10.0, extra=[])
+                   store_cfg=STORE_CFG, extra=[])
         for flag in ("--speculative-algorithm", "--speculative-num-steps",
                      "--speculative-eagle-topk", "--speculative-num-draft-tokens"):
             self.assertIn(flag, d)
@@ -211,7 +224,7 @@ class TestOnePredicate(unittest.TestCase):
         drafter -- which is why the predicate tests the family, not the
         silencer."""
         d = argv_d(py=PY, model=MODEL, budgets=BUDGETS, s_gb=48, m_mib=2400,
-                   store_gib=10.0, extra=[])
+                   store_cfg=STORE_CFG, extra=[])
         self.assertTrue(ring_table.p_carries_drafter(d))
 
     def test_ring_module_has_no_second_inline_copy(self):

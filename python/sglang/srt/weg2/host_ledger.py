@@ -2150,7 +2150,7 @@ def choose(
         "above; expectation from the operator (record 1g) was ~20 GiB without the "
         f"heap term ({chosen.terms['heaps_gib']:.2f} GiB measured). THE #1236 DELTA: this "
         "headroom is larger than the pre-#1236 form's by exactly the store term that "
-        "form charged -- 6 GiB on boot weg2sb5g, whose store was a 6 GiB tmpfs -- and "
+        "form charged -- 6 GiB on boot weg2sb5g, whose store was RAM-backed -- and "
         "the launcher prints the delta against THIS boot's own store budget on the "
         "WEG2-STORE line rather than repeating a recalled number here."
     )
