@@ -1045,9 +1045,16 @@ class _Resp:
     def __init__(self, body, status=200):
         self.status = status
         self._body = body
+        self.content_type = "application/json"
 
     async def json(self):
         return self._body
+
+    async def read(self):
+        # #1288: the front's internal GETs now go through `Front.group_get`,
+        # which reads the body with `.read()` and reports `.content_type`.
+        # A fake that offers only `.json()` no longer models its caller.
+        return json.dumps(self._body).encode()
 
     async def __aenter__(self):
         return self
