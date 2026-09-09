@@ -61,6 +61,7 @@ from aiohttp import (
     ClientSession,
     ClientTimeout,
     ServerDisconnectedError,
+    TCPConnector,
     TraceConfig,
     web,
 )
@@ -183,16 +184,50 @@ def rpc_pool_counts(session: Optional[ClientSession]) -> Tuple[int, int]:
         return -1, -1
 
 
+class SportTCPConnector(TCPConnector):
+    """aiohttp's default connector, plus the local port of each connection.
+
+    THE PORT IS THE JOIN KEY.  It is the only field that lets a front log line
+    be matched against the peer's uvicorn access log -- which is exactly the
+    read weg2sb5e needed and could not make (P logged no access line for the
+    resume; without a port there was no way to say whether the request had left
+    on a socket P had ever seen).
+
+    It has to be captured HERE and not off the response: measured on aiohttp
+    3.14.1, by the time an `async with session.post(...)` body is available
+    `resp.connection` is already None and `resp._protocol.transport` is None
+    too -- a small Content-Length body completes during the header read, and
+    `_response_eof` releases the connection immediately.  The protocol object,
+    however, survives and is reused with the pooled connection, so the port
+    stamped at creation is still correct on a REUSED connection (verified: two
+    requests, one connection, the same port on both).
+
+    No behaviour is changed: every constructor argument is aiohttp's own.
+    """
+
+    async def _create_connection(self, req, traces, timeout):
+        proto = await super()._create_connection(req, traces, timeout)
+        try:
+            proto._weg2_sport = str(  # noqa: SLF001
+                proto.transport.get_extra_info("sockname")[1])
+        except Exception:  # noqa: BLE001 - an instrument never breaks serving
+            proto._weg2_sport = "n/a"  # noqa: SLF001
+        return proto
+
+
 def rpc_response_sport(resp: Any) -> str:
     """The LOCAL port this response came back on, or `n/a`.
 
-    Read while the response context is still open, which is the only window in
-    which `resp.connection` is still held.
+    `n/a` means unreadable -- an aiohttp whose internals moved, or a session
+    not built on :class:`SportTCPConnector`.  Never a port number of 0.
     """
     try:
-        name = resp.connection.transport.get_extra_info("sockname")
-        return str(name[1])
+        return str(resp._protocol._weg2_sport)  # noqa: SLF001
     except Exception:  # noqa: BLE001 - an instrument never breaks serving
+        pass
+    try:
+        return str(resp.connection.transport.get_extra_info("sockname")[1])
+    except Exception:  # noqa: BLE001
         return "n/a"
 
 
@@ -1537,6 +1572,7 @@ class Front:
         # the same step would leave the boot unable to say which of the two
         # moved the symptom.
         self.session = ClientSession(timeout=ClientTimeout(total=3600),
+                                     connector=SportTCPConnector(),
                                      trace_configs=[make_rpc_trace_config()])
         app["controller"] = asyncio.create_task(self.controller())
         app["admitter"] = asyncio.create_task(self.d_admitter())
@@ -2512,6 +2548,59 @@ class Front:
         code, text, _ = await self._rpc_attempt(self.session, g, path, body, timeout)
         return code, text
 
+    async def leg_rpc(self, g: Group, path: str, body: Optional[dict],
+                      timeout: float) -> Tuple[int, str]:
+        """:meth:`rpc` plus ONE retry on a FRESH connection (#1285).
+
+        ONLY for the two gathered flip legs, and only for the one failure shape
+        that provably never reached a handler: a connection-level error raised
+        BEFORE the response line (``_rpc_attempt``'s ``retryable``).  A partial
+        response is never retried -- its handler ran.
+
+        THE RETRY IS SAFE BECAUSE THE HANDLER MAKES IT SAFE, not because the
+        legs are idempotent.  They are not: ``resume_memory_occupation`` opens
+        with ``offload_tags.remove(tag)`` (KeyError on a repeat) and
+        ``release_memory_occupation`` pauses unconditionally while deriving
+        ``sleep_begins``/``family_paused_before`` from the offload set.  The
+        epoch-scoped ledger added in the same commit
+        (``weight_updater.Weg2LegLedger``) is what makes a repeat a replay: a
+        leg identified by (op, epoch, tag set) is applied at most once per rank
+        and a second arrival returns the recorded answer.  The front therefore
+        retries ONLY requests that carry an epoch -- without one there is no
+        dedup key on the far side and the retry would be a second application.
+
+        A SEPARATE SESSION, not the shared one: the hypothesis under test is a
+        stale POOLED connection, so the retry must not be able to draw from
+        that pool.  ``force_close=True`` also guarantees it leaves nothing
+        pooled behind, which is what the mutant test reads.
+        """
+        code, text, retryable = await self._rpc_attempt(
+            self.session, g, path, body, timeout)
+        if not retryable:
+            return code, text
+        if (body or {}).get("epoch") is None:
+            logger.info(
+                "WEG2-RPC NO-RETRY leg=%s group=%s path=%s reason=no epoch on the "
+                "request, so the far side has no dedup key and a retry could "
+                "apply the leg twice (#1285)",
+                rpc_leg_name(path), g.name, path,
+            )
+            return code, text
+        logger.info(
+            "WEG2-RPC RETRY leg=%s group=%s path=%s epoch=%s reason=%s "
+            "(one retry, fresh force_close connection, no pool)",
+            rpc_leg_name(path), g.name, path, (body or {}).get("epoch"), text,
+        )
+        connector = SportTCPConnector(force_close=True, limit=1)
+        session = ClientSession(timeout=ClientTimeout(total=timeout),
+                                connector=connector,
+                                trace_configs=[make_rpc_trace_config()])
+        try:
+            code, text, _ = await self._rpc_attempt(session, g, path, body, timeout)
+        finally:
+            await session.close()
+        return code, text
+
     async def _rpc_attempt(self, session: ClientSession, g: Group, path: str,
                            body: Optional[dict], timeout: float,
                            ) -> Tuple[int, str, bool]:
@@ -2579,8 +2668,15 @@ class Front:
         it.  Each leg times itself; the sum and the wall are then two different
         measured quantities and L5 prints both plus their difference (spec C11).
         """
+        # #1285: the two gathered legs -- and ONLY they -- go through the
+        # retry-once path.  The discriminator is the leg name, i.e. the path
+        # itself, so a future third caller of ``timed_rpc`` on some other
+        # endpoint does not silently inherit a retry it has no dedup for.
         t0 = time.perf_counter()
-        code, text = await self.rpc(g, path, body, timeout)
+        if rpc_leg_name(path) == "other":
+            code, text = await self.rpc(g, path, body, timeout)
+        else:
+            code, text = await self.leg_rpc(g, path, body, timeout)
         return code, text, (time.perf_counter() - t0) * 1000
 
     async def drain(self, g: Group) -> bool:

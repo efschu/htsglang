@@ -5,6 +5,7 @@ import functools
 import logging
 import time
 import traceback
+from collections import OrderedDict
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import timedelta
@@ -160,6 +161,80 @@ def _merge_checksum_payloads(target: Dict, draft: Dict) -> Dict:
     return target
 
 
+# ---------------------------------------------------------------------------
+# #1285: EPOCH-SCOPED LEG DEDUP -- what makes a retried flip leg safe
+#
+# NEITHER LEG IS IDEMPOTENT.  Measured on this tree, not assumed:
+#   * `resume_memory_occupation` does `self.offload_tags.remove(tag)` for every
+#     tag (below).  `set.remove` raises KeyError on a tag that is not present,
+#     so a second wake for the same tags dies at its first statement -- and
+#     `memory_saver_adapter.resume(tag)` on an already-mapped tag is a second
+#     recommit of pages that are already there.
+#   * `release_memory_occupation` calls `memory_saver_adapter.pause(tag)`
+#     unconditionally, and `sleep_begins`/`family_paused_before` -- which gate
+#     the census, the static-state export and the credit -- are derived from
+#     `len(self.offload_tags)`, i.e. they read FALSE on a repeat and silently
+#     turn the second sleep into a different operation.
+# So the front may not simply re-send a leg whose fate it does not know, which
+# is exactly the weg2sb5e situation: `ServerDisconnectedError` with no access
+# line on the peer means applied / partly applied / not applied at all are all
+# consistent with what the client saw.
+#
+# The handlers ALREADY receive the flip's epoch (io_struct.py, `epoch` on both
+# ReqInputs; the front sends it at front.py's gathered legs).  They did NOT key
+# on it: the only reader was the VRAM-credit counter
+# (`_weg2_open_credit_for_leg` / `_weg2_credit_reader`).  This ledger makes the
+# epoch mean what its presence implies -- a leg identified by (op, epoch, tag
+# set) is applied AT MOST ONCE per rank, and a repeat returns the recorded
+# answer without touching VRAM.
+#
+# WHY A COMPLETED-OUTCOME LEDGER IS ENOUGH (no in-flight state).  The handler
+# runs inside the scheduler loop, which processes one control request at a time
+# per rank.  A retry therefore cannot interleave with a first attempt still
+# executing on the same rank: by the time the repeat is dispatched, the first
+# has RETURNED on that rank, or the rank is already dead --
+# `_weg2_group_stop_on_leg_failure` stops the group on a leg that raised.
+#
+# WHY IT CANNOT SPLIT THE RANKS (memory `raenge-nie-uneins`).  The decision is
+# a pure function of the REQUEST (op, epoch, tags) and of a per-rank record
+# every rank writes at the same leg, and the RPC fans out to every rank through
+# the same communicator.  All ranks therefore hit or miss together, and the
+# group fence further down is entered by all or by none.
+#
+# WHY IT CANNOT TOUCH THE STOCK PATH.  It engages ONLY when `epoch` is not
+# None.  Upstream never sets it, and neither do the front's two un-epoched
+# single-tag RPCs, so those requests are byte-identical to what they were.
+#: How many completed legs a rank remembers.  A flip has two; the window only
+#: has to outlive one RPC retry, and the record is three small tuples.
+WEG2_LEG_LEDGER_MAX = 8
+
+
+class Weg2LegLedger:
+    """Per-rank record of COMPLETED epoch-scoped flip legs (#1285)."""
+
+    __slots__ = ("_cap", "_done")
+
+    def __init__(self, cap: int = WEG2_LEG_LEDGER_MAX):
+        self._cap = cap
+        self._done: OrderedDict[Tuple, Any] = OrderedDict()
+
+    @staticmethod
+    def key(op: str, epoch: Any, tags: Optional[Sequence[str]]) -> Tuple:
+        # The TAG SET, sorted: the front sends a permutation-checked order and
+        # the leg's effect does not depend on it, so two orders of the same
+        # family are the same leg and must dedup against each other.
+        return (op, str(epoch), tuple(sorted(tags or ())))
+
+    def recorded(self, key: Tuple) -> Any:
+        return self._done.get(key)
+
+    def record(self, key: Tuple, out: Any) -> None:
+        self._done[key] = out
+        self._done.move_to_end(key)
+        while len(self._done) > self._cap:
+            self._done.popitem(last=False)
+
+
 @dataclass(kw_only=True, slots=True)
 class SchedulerWeightUpdaterManager:
     tp_worker: Any
@@ -186,6 +261,13 @@ class SchedulerWeightUpdaterManager:
     #: ``None``, which is the resolved answer "no card key" -- so an
     #: unresolvable card is not re-resolved (and re-logged) on every tag.
     weg2_card_uuid_cache: Any = "unset"
+    #: #1285: this rank's record of COMPLETED epoch-scoped flip legs, so a
+    #: front retry after a ServerDisconnectedError replays instead of
+    #: re-applying.  A FIELD for the third time in this class: ``slots=True``
+    #: turns a lazily-assigned ``self._weg2_leg_ledger`` into an
+    #: ``AttributeError`` raised ONLY on the retry path, i.e. only after a
+    #: failure has already happened -- the worst possible place to learn it.
+    weg2_leg_ledger: Any = None
 
     @contextmanager
     def _observe_weight_load(self, source: str) -> Iterator[None]:
@@ -1160,8 +1242,57 @@ class SchedulerWeightUpdaterManager:
                 rec.get("reason", ""),
             )
 
+    # ---- #1285 epoch-scoped leg dedup (module docstring above) -------------
+    def _weg2_leg_key(self, op: str, recv_req) -> Optional[Tuple]:
+        """The dedup key of THIS leg, or None when the request carries no epoch.
+
+        None is the stock path: no epoch, no dedup, byte-identical behaviour.
+        """
+        epoch = getattr(recv_req, "epoch", None)
+        if epoch is None:
+            return None
+        return Weg2LegLedger.key(op, epoch, getattr(recv_req, "tags", None))
+
+    def _weg2_leg_ledger_obj(self) -> Weg2LegLedger:
+        led = self.weg2_leg_ledger
+        if led is None:
+            led = Weg2LegLedger()
+            self.weg2_leg_ledger = led
+        return led
+
+    def _weg2_leg_replay(self, op: str, recv_req):
+        """The recorded answer of an already-applied leg, or None."""
+        key = self._weg2_leg_key(op, recv_req)
+        if key is None:
+            return None
+        out = self._weg2_leg_ledger_obj().recorded(key)
+        if out is None:
+            return None
+        logger.info(
+            "WEG2-LEG REPLAY op=%s epoch=%s tags=%s -- this leg is already "
+            "applied on this rank; returning the recorded answer and touching "
+            "no VRAM (#1285: neither leg is idempotent, so a front retry after "
+            "a ServerDisconnectedError must not re-apply it)",
+            op, getattr(recv_req, "epoch", None), sorted(getattr(recv_req, "tags", None) or []),
+        )
+        return out
+
+    def _weg2_leg_commit(self, op: str, recv_req, out):
+        key = self._weg2_leg_key(op, recv_req)
+        if key is not None:
+            self._weg2_leg_ledger_obj().record(key, out)
+        return out
+
     @_weg2_group_stop_on_leg_failure
     def release_memory_occupation(self, recv_req: ReleaseMemoryOccupationReqInput):
+        # #1285 FIRST STATEMENT, before the idle assert and before any mutation:
+        # a leg that is already applied returns its recorded answer.  It has to
+        # precede the assert too -- a repeat arrives with the group in whatever
+        # state the first attempt left it, and refusing there would turn a safe
+        # no-op into a group death.
+        replay = self._weg2_leg_replay("release", recv_req)
+        if replay is not None:
+            return replay
         # C16/C17: this rank's own per-tag report of THIS leg, filled by the
         # weights block below and reduced over the group at the fence.
         weg2_per_tag: Dict[str, List[float]] = {}
@@ -1510,17 +1641,23 @@ class SchedulerWeightUpdaterManager:
         # falls back to THIS rank's own numbers when there was no group to
         # gather over (a single-rank engine), and is None on the stock path so
         # that answer is byte-identical to what it always was.
-        return ReleaseMemoryOccupationReqOutput(
+        return self._weg2_leg_commit("release", recv_req, ReleaseMemoryOccupationReqOutput(
             per_tag=(report.get("per_tag") or weg2_per_tag or None)
             if weg2_memory_saver_on
             else None,
             critical_path=(report.get("critical_path") or None)
             if weg2_memory_saver_on
             else None,
-        )
+        ))
 
     @_weg2_group_stop_on_leg_failure
     def resume_memory_occupation(self, recv_req: ResumeMemoryOccupationReqInput):
+        # #1285: see the release leg.  This one is the sharper case -- the very
+        # first mutation below is `self.offload_tags.remove(tag)`, which raises
+        # KeyError on a repeat, so without this the retry would kill the group.
+        replay = self._weg2_leg_replay("resume", recv_req)
+        if replay is not None:
+            return replay
         # C16/C17: this rank's own per-tag report of THIS leg, filled by the
         # weights block below and reduced over the group at the fence.
         weg2_per_tag: Dict[str, List[float]] = {}
@@ -1713,14 +1850,14 @@ class SchedulerWeightUpdaterManager:
                 leg_ms=weg2_leg_ms,
             )
 
-        return ResumeMemoryOccupationReqOutput(
+        return self._weg2_leg_commit("resume", recv_req, ResumeMemoryOccupationReqOutput(
             per_tag=(report.get("per_tag") or weg2_per_tag or None)
             if weg2_memory_saver_on
             else None,
             critical_path=(report.get("critical_path") or None)
             if weg2_memory_saver_on
             else None,
-        )
+        ))
 
     def check_weights(self, recv_req: CheckWeightsReqInput):
         try:
