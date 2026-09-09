@@ -1620,6 +1620,16 @@ def shadow_transport(
         result.counters.errors.append(f"{type(exc).__name__}: {exc}")
         result.reason = f"transport-failed:{type(exc).__name__}"
         result.ran = False
+        # THE BLOCK IS PRICED ON THE PATH WHERE IT MATTERS MOST.  A leg that
+        # died in its drain is a leg that waited out its whole budget, and
+        # reporting ``blocked_ms=0.000`` there would say the opposite of what
+        # happened -- the unwired-instrument-reads-as-a-passed-one shape, in
+        # the one field this round exists to add.  ``run_leg`` carries its
+        # partial stats on the exception for exactly this.
+        partial = getattr(exc, "weg2_leg_result", None)
+        oncard = getattr(partial, "oncard", None) if partial is not None else None
+        if oncard is not None:
+            result.blocked_ms = oncard.drain_wait_s * 1e3
         run.close()
     return run
 
