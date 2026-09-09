@@ -175,6 +175,25 @@ MX_PLAN_HASH = 2 * N_RANKS
 MX_EPOCH_HASH = MX_PLAN_HASH + 1
 MX_PID = MX_EPOCH_HASH + 1
 MX_LOCAL_OK = MX_PID + 1
+#: THE ON-CARD MODE, carried in Gate 0 (#1273 S4-fix refusal A, an S6
+#: ``must_fix`` carried forward by S5).  S4 closed the SILENT half of that
+#: finding -- the slot GEOMETRY, published in the on-card row, refused by name
+#: -- and left the LOUD half open: two co-located ranks that disagree about
+#: ``ipc`` vs ``host`` fail late and confusingly (a zero handle, or a
+#: ``HostBounce(create=False)`` ENOENT) inside the transport, after the flip
+#: has begun.  The mode is a per-BOOT arm, so Gate 0 -- which runs before a
+#: byte moves and before any ``resume`` -- is where a disagreement costs
+#: nothing to refuse.
+#: ``0`` means UNSTATED, which is what every rank publishes until S6 passes the
+#: launcher's arm down; unstated is not a disagreement, and a gate that refused
+#: it would refuse every flip of every boot before S6.
+MX_ONCARD_MODE = MX_LOCAL_OK + 1
+
+#: The mode values, as one word.  Not a string in a row: the row is fixed-width
+#: u64s and a hash of "ipc" would be a second identity for a two-valued field.
+ONCARD_MODE_UNSTATED = 0
+ONCARD_MODE_WORD = {"ipc": 1, "host": 2}
+ONCARD_MODE_NAMES = {0: "unstated", 1: "ipc", 2: "host"}
 
 DIR_OFF = 64 * KIB
 DATA_OFF = 1 * MIB
@@ -466,9 +485,10 @@ class MatrixRow:
     """One rank's published send and recv vectors, verdict and plan hash."""
 
     __slots__ = ("row", "send", "recv", "plan_hash", "epoch_hash", "pid",
-                 "local_ok", "sealed")
+                 "local_ok", "sealed", "oncard_mode")
 
-    def __init__(self, row, send, recv, plan_hash, eh, pid, local_ok=True, sealed=True):
+    def __init__(self, row, send, recv, plan_hash, eh, pid, local_ok=True,
+                 sealed=True, oncard_mode=ONCARD_MODE_UNSTATED):
         self.row = int(row)
         self.send = tuple(int(x) for x in send)
         self.recv = tuple(int(x) for x in recv)
@@ -477,6 +497,11 @@ class MatrixRow:
         self.pid = int(pid)
         self.local_ok = bool(local_ok)
         self.sealed = bool(sealed)
+        self.oncard_mode = int(oncard_mode)
+
+    @property
+    def oncard_mode_name(self) -> str:
+        return ONCARD_MODE_NAMES.get(self.oncard_mode, f"unknown({self.oncard_mode})")
 
 
 # --------------------------------------------------------------------------
@@ -1102,12 +1127,13 @@ class XchgRegion:
         return MatrixRow(
             row, f[0:N_RANKS], f[N_RANKS:2 * N_RANKS], f[MX_PLAN_HASH],
             f[MX_EPOCH_HASH], f[MX_PID], bool(f[MX_LOCAL_OK]),
-            sealed=(seal == _seal(payload)),
+            sealed=(seal == _seal(payload)), oncard_mode=f[MX_ONCARD_MODE],
         )
 
     def write_matrix_row(self, row: int, send: Sequence[int], recv: Sequence[int],
                          plan_hash: int, *, pid: int = 0,
-                         local_ok: bool = True) -> MatrixRow:
+                         local_ok: bool = True,
+                         oncard_mode: int = ONCARD_MODE_UNSTATED) -> MatrixRow:
         self._require_flip(f"write_matrix_row row={row}")
         if len(send) != N_RANKS or len(recv) != N_RANKS:
             raise ValueError(
@@ -1118,14 +1144,16 @@ class XchgRegion:
         this_pid = int(pid or os.getpid())
         words = (
             [int(x) for x in send] + [int(x) for x in recv]
-            + [int(plan_hash), self.epoch_hash, this_pid, 1 if local_ok else 0]
-            + [0] * (MATRIX_PAYLOAD_STRUCT.size // 8 - MX_LOCAL_OK - 1)
+            + [int(plan_hash), self.epoch_hash, this_pid, 1 if local_ok else 0,
+               int(oncard_mode)]
+            + [0] * (MATRIX_PAYLOAD_STRUCT.size // 8 - MX_ONCARD_MODE - 1)
         )
         payload = MATRIX_PAYLOAD_STRUCT.pack(*words)
         struct.pack_into("<Q", self._mm, off + MATRIX_SEAL_OFF, 0)
         self._mm[off: off + MATRIX_SEAL_OFF] = payload
         struct.pack_into("<Q", self._mm, off + MATRIX_SEAL_OFF, _seal(payload))
-        return MatrixRow(row, send, recv, plan_hash, self.epoch_hash, this_pid, local_ok)
+        return MatrixRow(row, send, recv, plan_hash, self.epoch_hash, this_pid,
+                         local_ok, oncard_mode=int(oncard_mode))
 
     def write_matrix_verdict(self, row: int, local_ok: bool) -> MatrixRow:
         """Re-publish THIS rank's own row with its rank-local Gate-0 verdict.
@@ -1136,7 +1164,8 @@ class XchgRegion:
         """
         rec = self.read_matrix_row(row)
         return self.write_matrix_row(row, rec.send, rec.recv, rec.plan_hash,
-                                     pid=rec.pid, local_ok=bool(local_ok))
+                                     pid=rec.pid, local_ok=bool(local_ok),
+                                     oncard_mode=rec.oncard_mode)
 
 
 # --------------------------------------------------------------------------
@@ -1177,9 +1206,18 @@ def region_line(region: XchgRegion, *, sems: Optional[int] = None) -> str:
 
 def gate0_publish(region: XchgRegion, row: int, send: Sequence[int],
                   recv: Sequence[int], plan_hash: int,
-                  *, local_ok: bool = True) -> MatrixRow:
-    """Publish this rank's row of the 6x6 byte matrix.  Moves no byte."""
-    return region.write_matrix_row(row, send, recv, plan_hash, local_ok=local_ok)
+                  *, local_ok: bool = True,
+                  oncard_mode: int = ONCARD_MODE_UNSTATED) -> MatrixRow:
+    """Publish this rank's row of the 6x6 byte matrix.  Moves no byte.
+
+    TODO(S6): pass the launcher's ``--weg2-xchg-oncard`` arm as
+    ``oncard_mode`` (``ONCARD_MODE_WORD[mode]``).  Until S6 owns that arm every
+    rank publishes ``ONCARD_MODE_UNSTATED`` and :func:`gate0_check` says so on
+    its own line rather than grading a field nobody fills -- an unarmed gate
+    must never read as a passed one.
+    """
+    return region.write_matrix_row(row, send, recv, plan_hash,
+                                   local_ok=local_ok, oncard_mode=oncard_mode)
 
 
 def _matrix_wait(region: XchgRegion, budget: float, poll_s: float,
@@ -1325,6 +1363,24 @@ def gate0_check(
                     f"delta={sent - expected} src=group={ga},rank={ra} "
                     f"dst=group={gb},rank={rb}]"
                 )
+    # THE LOUD HALF OF S4-fix REFUSAL A.  Two co-located ranks that disagree
+    # about `ipc` vs `host` fail LATE and confusingly -- a zero IPC handle on
+    # one side, a `HostBounce(create=False)` ENOENT on the other, both inside
+    # the transport, after the flip has started.  The mode is a per-boot arm,
+    # so the disagreement is derivable here, before a byte moves and before any
+    # resume, where a refusal costs nothing.  UNSTATED is not a disagreement:
+    # until S6 passes the arm down every rank publishes 0, and a gate that
+    # refused that would refuse every flip before S6 exists.
+    modes = {r.oncard_mode for r in rows}
+    stated = modes - {ONCARD_MODE_UNSTATED}
+    if len(stated) > 1 or (stated and ONCARD_MODE_UNSTATED in modes):
+        mismatches.append(
+            "[on-card MODE disagreement: " + " ".join(
+                f"row={r.row}:{r.oncard_mode_name}" for r in rows)
+            + " -- one arm would export an IPC handle the other never imports "
+              "(or open a host bounce file that was never created); it is a "
+              "per-boot arm, so this is a launch disagreement, not a race]"
+        )
     hashes = {r.plan_hash for r in rows}
     if len(hashes) != 1:
         mismatches.append(
@@ -1356,6 +1412,7 @@ def gate0_check(
             tags_checked if have_census else f"skipped({census_unavailable_reason})"
         ),
         "verdicts_ok": sum(1 for r in rows if r.local_ok),
+        "oncard_mode": ONCARD_MODE_NAMES.get(rows[row].oncard_mode, "unknown"),
         "plan_hash": rows[row].plan_hash,
         "total_bytes": total,
         "waited_s": monotonic() - started,
