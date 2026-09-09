@@ -668,7 +668,12 @@ class TestTheLauncherSeam(CustomTestCase):
         self.assertEqual(set(objective.choices), {"maxkv", "makespan", "incumbent"})
 
     def test_the_help_states_the_no_fallback_rule_and_the_other_floor(self):
-        help_text = self._parser().format_help()
+        # Flattened: argparse re-wraps the paragraph at the terminal width, so
+        # a two-word phrase can land across a line break whenever the text
+        # BEFORE it changes length (measured 2026-09-09: the #1305 rewrite of
+        # the sentence head split 'NO SILENT' as 'NO\nSILENT'). Asserting on
+        # the raw text tests the line width, not the presence of the rule.
+        help_text = " ".join(self._parser().format_help().split())
         self.assertIn("--pp-solve-pool-floor", help_text)
         self.assertIn("NO SILENT", help_text)
         self.assertIn("--max-kv-per-request", help_text)

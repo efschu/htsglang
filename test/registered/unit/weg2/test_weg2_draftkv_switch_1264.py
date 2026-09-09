@@ -144,9 +144,13 @@ class TestArgvCarriesTheSwitch(unittest.TestCase):
         on, off = p(draft_kv_on_p=True), p(draft_kv_on_p=False)
         # Not a set difference: the block is CONTIGUOUS and in one place, so a
         # future edit that scatters it across argv_p fails here.
+        # #1305 item 2: the cap rides directly behind the head's flags, with a
+        # value the CALLER hands in (the shipped cut's priced pool), so the
+        # contiguous block is the five flags plus that pair.
+        block = list(P_DRAFT_KV_FLAGS) + ["--max-total-tokens", str(P_CAP)]
         i = on.index("--speculative-algorithm")
-        self.assertEqual(on[i:i + len(P_DRAFT_KV_FLAGS)], list(P_DRAFT_KV_FLAGS))
-        self.assertEqual(on[:i] + on[i + len(P_DRAFT_KV_FLAGS):], off)
+        self.assertEqual(on[i:i + len(block)], block)
+        self.assertEqual(on[:i] + on[i + len(block):], off)
 
     def test_group_d_is_untouched_by_the_switch(self):
         """D keeps its own NEXTN head in BOTH forms."""
