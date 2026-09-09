@@ -87,7 +87,23 @@ from sglang.srt.weg2 import host_ledger
 
 logger = logging.getLogger("weg2.front")
 
-FORWARD_PATHS = ("/generate", "/v1/completions", "/v1/chat/completions")
+#: Q0-B: ``/v1/messages`` IS FORWARDED LIKE ``/v1/chat/completions``.  Both
+#: groups serve the Anthropic Messages API natively (measured 2026-09-09 on
+#: boot weg2sn5: ``POST :30032/v1/messages`` -> 200 while the front answered
+#: 404), and the split router at :30099 passes the path through unchanged, so
+#: a front without this entry makes every Messages-API client -- i.e. the
+#: whole Claude-Code-shaped agent fleet -- unreachable while the groups behind
+#: it are healthy.  The three places that had to learn the second wire shape
+#: are named at their own sites: ``request_text`` (pricing), ``usage_of`` /
+#: ``AnthropicStreamUsage`` (the leg-2 price), and the ``stream_options``
+#: injection in ``leg2``.  The ROUTING LOGIC is untouched by this addition.
+FORWARD_PATHS = ("/generate", "/v1/completions", "/v1/chat/completions", "/v1/messages")
+#: ``count_tokens`` is a PRICING call, not a generation: it decodes no token,
+#: needs no seat, must not open a Pending and must never provoke a flip.  It
+#: is forwarded verbatim to whichever group is awake, exactly like the GET
+#: passthroughs beside it -- routing it through ``handle_generate`` would
+#: allocate a seat for a request that never generates.
+PASSTHROUGH_POST = ("/v1/messages/count_tokens",)
 PASSTHROUGH_GET = ("/v1/models", "/get_model_info", "/get_server_info", "/model_info", "/metrics")
 CHARS_PER_TOKEN = 3.0  # conservative: over-estimates tokens, never under-prices
 # #1233 zero-remainder: the CARRIER-EXCEEDS route must not UNDER-estimate --
@@ -361,15 +377,78 @@ class Weg2Stop(Exception):
 # --------------------------------------------------------------------------
 
 
+def _block_text(x: Any) -> str:
+    """One content BLOCK as text, on both wire shapes.
+
+    Q0-B: reading only ``text`` -- what this did while ``/v1/messages`` was
+    404 and only OpenAI bodies arrived -- prices a Claude-Code turn at the
+    prose half of its own conversation and silently drops the tool half.  An
+    Anthropic ``tool_use`` block carries its arguments in ``input`` (a JSON
+    object) and a ``tool_result`` carries the whole tool output in
+    ``content``; both are PROMPT BYTES the model pays for on the next turn.
+    Under-pricing here is not cosmetic: ``price_remainder`` feeds the SHORT
+    bound, so an under-priced long prompt routes SHORT to D, exceeds D's own
+    prefill cap and comes back as W50 -- the wall this front already counts
+    by name.  Over-pricing is the safe direction and the module says so at
+    CHARS_PER_TOKEN.
+    """
+    if not isinstance(x, dict):
+        return str(x)
+    t = x.get("type")
+    if t == "tool_use":
+        # name + the arguments object; `input` is a dict, not a string.
+        return f"{x.get('name', '')} {json.dumps(x.get('input') or {}, ensure_ascii=False, sort_keys=True)}"
+    if t == "tool_result":
+        c = x.get("content")
+        if isinstance(c, list):
+            return " ".join(_block_text(b) for b in c)
+        return str(c if c is not None else "")
+    if t == "thinking":
+        return str(x.get("thinking", "") or "")
+    if "text" in x:
+        return str(x.get("text", "") or "")
+    # An unknown block (image, document, ...) has no priceable char count.
+    # Return its type rather than its base64 payload: a data URI would price
+    # as tens of thousands of phantom prompt chars.
+    return str(t or "")
+
+
+def _content_text(c: Any) -> str:
+    """A message's ``content`` (str, or a list of blocks) as one string."""
+    if isinstance(c, list):
+        return " ".join(_block_text(x) for x in c)
+    return str(c if c is not None else "")
+
+
 def request_text(payload: dict) -> str:
-    """The prompt as ONE string, for the span estimate and the ledger."""
+    """The prompt as ONE string, for the span estimate and the ledger.
+
+    Q0-B: covers BOTH forwarded chat shapes. OpenAI carries the system turn
+    as ``messages[0]`` with ``role="system"``; Anthropic carries it in a
+    top-level ``system`` field. Emitting it as a leading ``system:<text>``
+    line makes the two shapes price IDENTICALLY for the same conversation,
+    which is what the equivalence test in
+    ``test/registered/unit/weg2/test_front_messages_pricing.py`` pins.
+    ``tools`` is priced for both shapes -- it was priced for NEITHER before,
+    and a Claude-Code agent carries 10-20k tokens of tool schemas.
+    """
     if "messages" in payload and isinstance(payload["messages"], list):
         parts = []
+        sys_field = payload.get("system")
+        if sys_field:
+            parts.append(f"system:{_content_text(sys_field)}\n")
         for m in payload["messages"]:
-            c = m.get("content", "")
-            if isinstance(c, list):
-                c = " ".join(str(x.get("text", "")) if isinstance(x, dict) else str(x) for x in c)
-            parts.append(f"{m.get('role', '')}:{c}\n")
+            if not isinstance(m, dict):
+                parts.append(f"{m}\n")
+                continue
+            parts.append(f"{m.get('role', '')}:{_content_text(m.get('content', ''))}\n")
+        tools = payload.get("tools")
+        if isinstance(tools, list) and tools:
+            # The whole schema list, serialized once. Deterministic key order
+            # so the span LRU's prefix match is stable across identical turns.
+            parts.append(
+                "tools:" + json.dumps(tools, ensure_ascii=False, sort_keys=True) + "\n"
+            )
         return "".join(parts)
     p = payload.get("prompt", payload.get("text", ""))
     if isinstance(p, list):
@@ -442,6 +521,16 @@ def usage_of(body: Any) -> Tuple[int, int, int, bool]:
             return 0, 0, 0, False
         return (int(mi.get("prompt_tokens", 0) or 0), int(mi.get("cached_tokens", 0) or 0),
                 int(mi.get("completion_tokens", 0) or 0), True)
+    if isinstance(u, dict) and "prompt_tokens" not in u and "input_tokens" in u:
+        # Q0-B: the ANTHROPIC shape. `/v1/messages` prices a non-streamed
+        # answer with `usage.input_tokens` / `output_tokens`, and reports the
+        # cached half as `cache_read_input_tokens`. Without this branch the
+        # body reads as UNPRICED and `leg2` refuses a healthy 200 by W28 --
+        # i.e. forwarding the path without teaching the pricer would turn the
+        # front's 404 into a 503, which is not an improvement.
+        pt = int(u.get("input_tokens", 0) or 0)
+        ct = int(u.get("cache_read_input_tokens", 0) or 0)
+        return pt, ct, int(u.get("output_tokens", 0) or 0), True
     if not isinstance(u, dict) or "prompt_tokens" not in u:
         return 0, 0, 0, False
     pt = int(u.get("prompt_tokens", 0) or 0)
@@ -477,6 +566,92 @@ def usage_of_stream_tail(tail: bytes) -> Tuple[int, int, int, bool]:
             if priced and pt:
                 return pt, ct, comp, True
     return 0, 0, 0, False
+
+
+class AnthropicStreamUsage:
+    """Roll up an Anthropic SSE stream's usage ACROSS THE WHOLE STREAM.
+
+    Q0-B, and the reason this is a fed accumulator rather than one more tail
+    scan: on the Anthropic wire the PROMPT count is announced exactly once,
+    in ``message_start``, at the very FRONT of the stream, while
+    ``message_delta`` carries only the running ``output_tokens`` and
+    ``message_stop`` carries none. ``leg2`` retains a bounded tail (256 KiB,
+    trimmed to the last 128 KiB), so on any answer longer than that window
+    ``message_start`` has already been discarded by the time
+    ``usage_of_stream_tail`` runs -- the price would silently read 0 and the
+    request would land in W28 as 'unpriced'. Feeding every chunk past this
+    object as it is written to the client costs one line-split per chunk and
+    cannot be trimmed away.
+
+    Chunk boundaries do not respect SSE line boundaries, so the trailing
+    partial line is buffered rather than parsed and discarded.
+    """
+
+    def __init__(self) -> None:
+        self.input_tokens = 0
+        self.cached_tokens = 0
+        self.output_tokens = 0
+        self.saw_start = False
+        self.saw_stop = False
+        self._buf = b""
+
+    def feed(self, chunk: bytes) -> None:
+        self._buf += chunk
+        # Keep the last (possibly partial) line in the buffer.
+        lines = self._buf.split(b"\n")
+        self._buf = lines.pop()
+        for raw in lines:
+            self._line(raw)
+
+    def _line(self, raw: bytes) -> None:
+        line = raw.strip()
+        if not line.startswith(b"data:"):
+            return
+        data = line[5:].strip()
+        if not data or data == b"[DONE]":
+            return
+        try:
+            js = json.loads(data)
+        except Exception:  # noqa: BLE001
+            return
+        if not isinstance(js, dict):
+            return
+        kind = js.get("type")
+        if kind == "message_start":
+            self.saw_start = True
+            u = ((js.get("message") or {}).get("usage")) or {}
+            if isinstance(u, dict):
+                self.input_tokens = int(u.get("input_tokens", 0) or 0)
+                self.cached_tokens = int(u.get("cache_read_input_tokens", 0) or 0)
+                # message_start already carries the first output token.
+                self.output_tokens = max(
+                    self.output_tokens, int(u.get("output_tokens", 0) or 0)
+                )
+        elif kind == "message_delta":
+            u = js.get("usage") or {}
+            if isinstance(u, dict):
+                # Cumulative on the Anthropic wire; max() keeps it monotone
+                # even if a producer ever sends it per-delta.
+                self.output_tokens = max(
+                    self.output_tokens, int(u.get("output_tokens", 0) or 0)
+                )
+                if not self.input_tokens:
+                    self.input_tokens = int(u.get("input_tokens", 0) or 0)
+        elif kind == "message_stop":
+            self.saw_stop = True
+
+    def result(self) -> Tuple[int, int, int, bool]:
+        """(prompt_tokens, cached_tokens, completion_tokens, priced).
+
+        ``priced`` is the same contract as ``usage_of``: a prompt count was
+        actually seen on the wire. ``saw_stop`` is NOT required -- a stream cut
+        short still carries a real input count from ``message_start``, and
+        refusing to price it would re-introduce the W28 fail-closed this class
+        exists to prevent.
+        """
+        if self.saw_start and self.input_tokens > 0:
+            return self.input_tokens, self.cached_tokens, self.output_tokens, True
+        return 0, 0, 0, False
 
 
 def double_prefill_verdict(
@@ -1979,6 +2154,25 @@ class Front:
             body = await r.read()
             return web.Response(body=body, status=r.status, content_type=r.content_type)
 
+    async def handle_passthrough_post(self, request: web.Request) -> web.Response:
+        """Forward a NON-GENERATING POST to the awake group, verbatim.
+
+        Q0-B: ``/v1/messages/count_tokens`` is the only member. It decodes
+        nothing, so it takes no seat, opens no Pending, records no span and
+        must not be able to provoke a flip -- routing it through
+        ``handle_generate`` would do all four for a request that never
+        generates a token. The group server answers it natively (measured:
+        ``POST :30032/v1/messages/count_tokens`` -> 200).
+        """
+        g = self.groups[self.awake]
+        payload = await request.read()
+        async with self.session.post(
+            f"{g.url}{request.path_qs}", data=payload,
+            headers={"Content-Type": request.content_type or "application/json"},
+        ) as r:
+            body = await r.read()
+            return web.Response(body=body, status=r.status, content_type=r.content_type)
+
     async def handle_session_refused(self, request: web.Request) -> web.Response:
         self.counters["session_refused_501"] += 1
         return web.json_response(
@@ -2489,10 +2683,17 @@ class Front:
         t0 = time.time()
         if pending is not None and pending.skip_leg1:
             single_prefill = True
-        if stream and pending is not None and request.path.startswith("/v1/"):
+        if (stream and pending is not None and request.path.startswith("/v1/")
+                and request.path != "/v1/messages"):
             # 1j finding 2: a STREAMED leg 2 is priced like a non-streamed one.
             # OpenAI's stream_options.include_usage makes D append one usage
             # chunk (empty choices) -- standard, and the only post-hoc price.
+            #
+            # Q0-B: EXCLUDING /v1/messages is not an omission. `stream_options`
+            # is an OpenAI field; the Anthropic wire always carries usage
+            # (message_start / message_delta), so nothing has to be asked for,
+            # and injecting an unknown top-level key into a Messages body risks
+            # a 400 from the very endpoint this ticket exists to reach.
             payload = dict(payload)
             so = dict(payload.get("stream_options") or {})
             so["include_usage"] = True
@@ -2541,9 +2742,15 @@ class Front:
                     resp.content_type = r.content_type
                     await resp.prepare(request)
                     tail = bytearray()
+                    # Q0-B: the Anthropic prompt count arrives ONCE, at the
+                    # head of the stream, and the bounded tail below trims the
+                    # head away on any long answer. Accumulate as we forward.
+                    anth = AnthropicStreamUsage() if request.path == "/v1/messages" else None
 
                     async def _push(chunk: bytes) -> None:
                         await resp.write(chunk)
+                        if anth is not None:
+                            anth.feed(chunk)
                         tail.extend(chunk)
                         if len(tail) > 262144:
                             del tail[:-131072]
@@ -2559,7 +2766,10 @@ class Front:
                             await _push(chunk)
                     await resp.write_eof()
                     g.served += 1
-                    pt, ct, comp, priced = usage_of_stream_tail(bytes(tail))
+                    if anth is not None:
+                        pt, ct, comp, priced = anth.result()
+                    else:
+                        pt, ct, comp, priced = usage_of_stream_tail(bytes(tail))
                     x_inband = x_refusal_marker_in(bytes(tail).decode(errors="replace"))
                     if x_inband:
                         # The W16 precedent's counterpart (finding 2): the
@@ -4422,6 +4632,8 @@ def main():
     app.router.add_post("/close_session", front.handle_session_refused)
     for path in PASSTHROUGH_GET:
         app.router.add_get(path, front.handle_passthrough_get)
+    for path in PASSTHROUGH_POST:
+        app.router.add_post(path, front.handle_passthrough_post)
     for path in FORWARD_PATHS:
         app.router.add_post(path, front.handle_generate)
     logger.info("WEG2-FRONT %s:%s -> P=%s D=%s awake=%s weights_tags=%s src_chunk_cards=%s", args.host, args.port,
