@@ -361,7 +361,12 @@ class RenumberedCode(unittest.TestCase):
         breaks silently at exactly the renumber that fixes the collision."""
         self.assertEqual(front.X_REFUSAL_MARKER, "Weg2TpPrefillExceeded")
         self.assertTrue(front.x_refusal_marker_in("... W50 Weg2TpPrefillExceeded ..."))
-        self.assertTrue(front.x_refusal_marker_in("... W31 Weg2TpPrefillExceeded ..."))
+        self.assertTrue(
+            front.x_refusal_marker_in(
+                # quotes the PRE-RENUMBER label on purpose:
+                "... W31 Weg2TpPrefillExceeded ..."  # wcode-census: ignore
+            )
+        )
         self.assertFalse(front.x_refusal_marker_in("W31 Weg2HostRingExhausted"))
 
     def test_the_host_ring_exhaustion_is_not_matched_by_the_front(self):
