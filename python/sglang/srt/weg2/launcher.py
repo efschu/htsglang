@@ -3289,7 +3289,10 @@ def prepare_xchg_region(log: Log, boot_nonce: str, hook_mode: int,
 def prepare_shadow_env(log: Log, boot_nonce: str, weight_source: str,
                        hook_mode: int = 0, dry: bool = False,
                        hop_bound_ms: Optional[float] = None,
-                       oncard_mode: str = ONCARD_MODE_DEFAULT) -> Dict[str, str]:
+                       oncard_mode: str = ONCARD_MODE_DEFAULT,
+                       oncard_slot_mib: int =
+                       weight_exchange_transport.ONCARD_SLOT_MIB_DEFAULT,
+                       ) -> Dict[str, str]:
     """#1273 S5: arm the region for the SHADOW arm, and publish it to both groups.
 
     ``{}`` on every other arm, and that empty dict is what keeps the default
@@ -3328,6 +3331,14 @@ def prepare_shadow_env(log: Log, boot_nonce: str, weight_source: str,
     # bytes on -- so the arm a rank enforces and the arm the ledger paid for
     # cannot be two different readings.
     env[weight_exchange_transport.ENV_ONCARD_MODE] = str(oncard_mode)
+    # S6 fix E: the slot CEILING, published by the same mechanism and for the
+    # same reason as the arm -- it decides the deposit's size in the ranks AND
+    # the worst case the #1269 ledger charged at launch, so the two may not be
+    # two readings.  Validated here, so an illegal value dies at the launcher
+    # with W66 rather than at six rank imports.
+    slot_mib = weight_exchange_transport.validate_oncard_slot_mib(
+        oncard_slot_mib)
+    env[weight_exchange_transport.ENV_ONCARD_SLOT_MIB] = str(slot_mib)
     log(f"WEG2-XCHG-SHADOW ARMED epoch={boot_nonce} path={got.get('path', '')} "
         f"sems={got.get('sems', 0)} ring=AUTHORITATIVE exchange=OBSERVER "
         f"-- the ring refills every weight byte as it does today; the exchange "
@@ -3850,7 +3861,11 @@ def build_env(tree: str, venv: str, cvd: str, store_dir: str, debug_hold: bool, 
                 # S6: the on-card arm is launcher OUTPUT for the same reason --
                 # an inherited ``SGLANG_WEG2_XCHG_ONCARD=host`` would put ranks
                 # on an arm this boot's ledger charged nothing for.
-                weight_exchange_transport.ENV_ONCARD_MODE):
+                weight_exchange_transport.ENV_ONCARD_MODE,
+                # S6 fix E: the slot ceiling is launcher OUTPUT too -- an
+                # inherited value would size a deposit this boot's ledger
+                # charged a different worst case for.
+                weight_exchange_transport.ENV_ONCARD_SLOT_MIB):
         env.pop(key, None)
     for key, value in (xchg_env or {}).items():
         env[str(key)] = str(value)
@@ -4159,7 +4174,8 @@ def measured_record_path() -> str:
     return f"{EVIDENCE_DIR}/{host_ledger.MEASURED_RECORD_NAME}"
 
 
-def xchg_bounce_charge_bytes(weight_source: str, oncard_mode: str) -> int:
+def xchg_bounce_charge_bytes(weight_source: str, oncard_mode: str,
+                             oncard_slot_mib: Optional[int] = None) -> int:
     """The #1269 host term for the exchange's own pinned carrier, in bytes.
 
     ONE PRODUCER OF THE PREDICATE (S6 refuter, must_fix 4), and it is a
@@ -4179,7 +4195,17 @@ def xchg_bounce_charge_bytes(weight_source: str, oncard_mode: str) -> int:
         return 0
     if str(oncard_mode) != weight_exchange_transport.ONCARD_MODE_HOST:
         return 0
-    return int(host_ledger.xchg_bounce_bytes())
+    # S6 fix E: the LAUNCHER's own process was started without the flag in its
+    # environment, so ``tp.ONCARD_SLOT_BYTES_MAX`` bound the DEFAULT at import
+    # and a charge read from it would price 128 MiB slots while the ranks
+    # allocated 64.  The flag's value is therefore threaded explicitly here --
+    # the ranks read the published env, the launcher passes what it parsed, and
+    # both end in the SAME arithmetic (``xchg_bounce_bytes_per_card``).
+    if oncard_slot_mib is None:
+        return int(host_ledger.xchg_bounce_bytes())
+    slot_bytes = weight_exchange_transport.validate_oncard_slot_mib(
+        oncard_slot_mib) * weight_exchange_region.MIB
+    return int(host_ledger.xchg_bounce_bytes(slot_bytes=slot_bytes))
 
 
 def choose_host_ledger(
@@ -4191,6 +4217,7 @@ def choose_host_ledger(
     record_path: Optional[str] = None,
     weight_source: str = WEIGHT_SOURCE_DEFAULT,
     oncard_mode: str = ONCARD_MODE_DEFAULT,
+    oncard_slot_mib: Optional[int] = None,
 ) -> Tuple[host_ledger.Arm, Optional[float], List[str], Dict[str, Optional[int]]]:
     """THE LAUNCHER'S ONE LEDGER CALL SITE: read the host, price the ladder.
 
@@ -4266,7 +4293,8 @@ def choose_host_ledger(
         # deposit allocates under, and it is the launcher's own published
         # value rather than a second reading of the environment.
         xchg_bounce_host_bytes=xchg_bounce_charge_bytes(weight_source,
-                                                        oncard_mode),
+                                                        oncard_mode,
+                                                        oncard_slot_mib),
     )
     return arm, reap_headroom_gib, lines, cg
 
@@ -7735,6 +7763,24 @@ def build_parser() -> argparse.ArgumentParser:
              "can refuse NOTHING ELSE.",
     )
     ap.add_argument(
+        "--weg2-xchg-oncard-slot-mib", type=int,
+        default=weight_exchange_transport.ONCARD_SLOT_MIB_DEFAULT,
+        help="#1273 S6 fix E: the CEILING one diagonal slot may reach, in MiB "
+             "(default 128 = byte-identical to every boot so far). The #1269 "
+             "host ledger charges the WORST CASE, ONCARD_SLOTS_MAX x this "
+             "value per card x 3 cards, at both the launch and the run moment "
+             "-- 8 x 128 MiB x 3 = 3.00 GiB by default. That charge is what "
+             "closed the last fundable rung for the 'host' arm at --d-bs 6 on "
+             "this box (boot weg2shadowD D2: W20, every rung under the 6 GiB "
+             "store floor). Lowering it to 64 charges 1.50 GiB and re-opens a "
+             "rung; the price is more batches per lane and a higher priced "
+             "hop, which the boot then MEASURES. The worst-case charge itself "
+             "is deliberately NOT relaxed (operator decision 2026-09-09): a "
+             "per-flip charge would fund the smallest flip and refuse none. "
+             "Must be a whole multiple of the 32 MiB slot floor, else the "
+             "launcher refuses by name (W66).",
+    )
+    ap.add_argument(
         "--weg2-xchg-oncard", choices=ONCARD_MODE_CHOICES,
         default=ONCARD_MODE_DEFAULT,
         help="#1273 S6 (spec 3.7 degrade 3): how the CO-LOCATED pair of ranks "
@@ -8739,14 +8785,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     xchg_env = prepare_shadow_env(log, str(ring_plan.epoch),
                                   ns.weg2_weight_source, dry=dry,
                                   hop_bound_ms=ns.weg2_shadow_hop_bound_ms,
-                                  oncard_mode=ns.weg2_xchg_oncard)
+                                  oncard_mode=ns.weg2_xchg_oncard,
+                                  oncard_slot_mib=ns.weg2_xchg_oncard_slot_mib)
 
     # 2. host ledger
     arm, reap_headroom_gib, lines, cg = choose_host_ledger(
         ring_plan.host_weights_bytes,
         ring_plan.host_weights_span1_bytes, ring_plan.provenance,
         weight_source=ns.weg2_weight_source,
-        oncard_mode=ns.weg2_xchg_oncard)
+        oncard_mode=ns.weg2_xchg_oncard,
+        oncard_slot_mib=ns.weg2_xchg_oncard_slot_mib)
     state.cgroup = dict(cg)
     for ln in lines:
         log(ln)
