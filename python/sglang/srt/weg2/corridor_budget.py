@@ -1,0 +1,462 @@
+# SPDX-License-Identifier: Apache-2.0
+"""#1257 -- the corridor law as a HARD constraint on group D's budget solve.
+
+WHAT THIS IS NOT: a second budget bookkeeping.  ``launcher.budgets_from_dc``
+stays the one and only producer of ``--rank-gpu-memory-mib``; this module is a
+pure post-pass it calls with its own numbers, and it can only ever LOWER a
+budget or leave it byte-identical.  Nothing here reads NVML, spawns a process
+or writes a file.
+
+THE LAW (memory ``vram-korridor-regel.md``): 819-1229 MiB NVML-free per card
+under the awake group's load, verdict constant 1024.  ``free`` is NVML free v2
+-- never ``total - used``, which returns free PLUS the driver carve-out
+(+424/+518 MiB on this rig, measured boot weg2rg6, #1250) and would score a
+breaching card as satisfied.  ``Card.reserved_mib`` is that carve-out and is
+subtracted here for exactly that reason.
+
+THE ARITHMETIC, and why every term is a MEASUREMENT rather than a constant.
+The brief's formula is
+
+    predicted_free = total - (budget + dormant_other + carve + load_transient)
+
+and on this rig it overpredicts the 5090 by 825 MiB: at boot weg2sb5f the
+launcher's own budget line gives ``32607 - 29352 - 1334 - 518 = 1403`` while
+the front's corridor sampler measured **578 MiB idle / 474 under load**.  The
+gap is D's unbudgeted awake consumption (NEXTN draft + verify-tree transients
+and the decode graphs sit outside the ``--rank-gpu-memory-mib`` fraction --
+the same effect ``launcher.D_OVERSHOOT_MIB`` already charges 489 MiB of).
+Shipping the bare formula would print SATISFIED on a card the metal measures
+550 MiB BELOW the law, which is the indicator law's exact failure mode.  So a
+fifth term is carried, derived from the SAME paired sample:
+
+    awake_residue = (total_s - budget_s - dormant_s - carve_s) - free_idle_s
+    predicted_free(b) = total - b - dormant - carve - awake_residue - transient
+
+By construction this reproduces the measured load free at the sample's own
+budget (578 - 104 = 474 on the 5090; 1101 - 6 = 1095 and 1111 - 8 = 1103 on
+the 3080s), so the instrument is calibrated against the only three metal
+points that exist rather than asserted.
+
+THE ONE ASSUMPTION, stated because it is not measured on this form: that a MiB
+removed from a rank's budget returns a MiB to that card's free column.
+htsglang ``aeac561711`` (#631) measured **0.318** on the Weg-1 form (-1200 MiB
+of budget -> +382 MiB of free), so 1.0 is an OPTIMISTIC bound and a cut
+computed from it is a LOWER BOUND on the cut actually needed.  The sample may
+carry a measured ``budget_return_ratio`` with its own provenance; where it does
+not, the line says ``return_ratio=1.0:ASSUMED`` and names #631's scope.
+
+THE DANGER DIRECTION, and the refusal that guards it (``kein-bindender-rang``:
+per-rank capacity is a free variable and the WORLD POOL is the thing worth
+protecting).  Under the weighted owner rule the served context is
+
+    C = min_r(P_r // v_r) * sum(v)      (model_runner_kv_cache_mixin.py:5033)
+
+so lowering the budget of the rank that achieves that minimum shrinks C for
+every rank at once.  This module therefore never lowers a budget without first
+recomputing C, and where C would shrink it REFUSES BY NAME with both numbers
+and keeps the budget byte-identical.  Trading world pool for corridor margin is
+the operator's decision, not a solver's.
+
+MISSING INPUTS ARE A REFUSAL, NOT A DEFAULT.  With no paired sample -- or one
+that does not cover every card of this boot -- the pass prints
+``W52 Weg2CorridorBudgetUnpriced`` and returns the launcher's budgets
+unchanged, byte for byte.  A boot must never silently get a budget that was
+priced off numbers nobody measured.
+"""
+
+from __future__ import annotations
+
+import json
+import math
+import os
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Sequence, Tuple
+
+#: The corridor law's verdict constant, MiB of NVML free-v2 per card under the
+#: awake group's load.  The band is 819-1229; 1024 is the number a verdict is
+#: taken against (memory ``vram-korridor-regel.md``).  NOT a knob.
+CORRIDOR_LAW_MIB = 1024
+
+#: ``budgets_from_dc`` floors every budget to a multiple of 8 MiB; a cut that
+#: is also a multiple of 8 keeps that invariant without re-flooring.
+BUDGET_ALIGN_MIB = 8
+
+BYTES_PER_MIB = 1 << 20
+
+#: Where the paired corridor/budget sample lives by default.  Evidence tree,
+#: not the repo: it is a measurement of THIS rig, produced by the front's
+#: corridor sampler plus that boot's own launcher and D-group log lines.
+DEFAULT_SAMPLE_PATH = "/spinning/gpu-arb/weg2/corridor_budget_sample.json"
+
+
+@dataclass(frozen=True)
+class SampleCard:
+    """One card's paired measurement, all six figures from one boot."""
+
+    card_uuid: str
+    name: str
+    world_rank: int
+    nvml_total_mib: int
+    budget_mib: int
+    dormant_other_mib: int
+    driver_reserved_mib: int
+    free_idle_mib: int
+    free_load_mib: int
+    profiled_tokens: int
+
+    @property
+    def load_transient_mib(self) -> int:
+        """MiB the awake group takes on top of idle, MEASURED (idle - load)."""
+        return int(self.free_idle_mib) - int(self.free_load_mib)
+
+    @property
+    def awake_residue_mib(self) -> int:
+        """Unbudgeted awake consumption: what the budget line does not book."""
+        booked = (
+            int(self.nvml_total_mib)
+            - int(self.budget_mib)
+            - int(self.dormant_other_mib)
+            - int(self.driver_reserved_mib)
+        )
+        return booked - int(self.free_idle_mib)
+
+
+@dataclass(frozen=True)
+class CorridorSample:
+    provenance: str
+    cell_size: int
+    token_vector: Tuple[int, ...]
+    cards: Tuple[SampleCard, ...]
+    budget_return_ratio: Optional[float]
+    budget_return_provenance: str
+
+    @property
+    def by_uuid(self) -> Dict[str, SampleCard]:
+        return {c.card_uuid: c for c in self.cards}
+
+    @property
+    def tokens_per_mib(self) -> int:
+        """Tokens of a rank's own capacity that one MiB of its budget buys."""
+        return BYTES_PER_MIB // int(self.cell_size)
+
+
+@dataclass(frozen=True)
+class CorridorSolve:
+    """Result of the pass: the budgets that ship, and one line per card."""
+
+    budgets: Tuple[int, ...]
+    lines: Tuple[str, ...]
+    unpriced_reason: Optional[str]
+    world_pool_before: Optional[int]
+    world_pool_after: Optional[int]
+
+    @property
+    def changed(self) -> bool:
+        return self.unpriced_reason is None and any(
+            l.count("->") and " verdict=APPLIED" in l for l in self.lines
+        )
+
+
+def load_sample(path: Optional[str]) -> Tuple[Optional[CorridorSample], Optional[str]]:
+    """Read the paired sample.  Returns ``(sample, None)`` or ``(None, why)``.
+
+    Every failure is a NAMED reason, because "no corridor line in the log" must
+    never be readable as "the constraint was satisfied"."""
+    p = path or DEFAULT_SAMPLE_PATH
+    if not p or not os.path.exists(p):
+        return None, f"no corridor/budget sample at {p!r}"
+    try:
+        with open(p, "r", encoding="utf-8") as fh:
+            raw = json.load(fh)
+    except Exception as exc:  # malformed evidence is a refusal, not a default
+        return None, f"corridor/budget sample {p!r} is unreadable: {exc}"
+
+    try:
+        cell = int(raw["cell_size"])
+        vec = tuple(int(v) for v in raw["token_vector"])
+        cards = tuple(
+            SampleCard(
+                card_uuid=str(c["card_uuid"]),
+                name=str(c.get("name", "")),
+                world_rank=int(c["world_rank"]),
+                nvml_total_mib=int(c["nvml_total_mib"]),
+                budget_mib=int(c["budget_mib"]),
+                dormant_other_mib=int(c["dormant_other_mib"]),
+                driver_reserved_mib=int(c["driver_reserved_mib"]),
+                free_idle_mib=int(c["free_idle_mib"]),
+                free_load_mib=int(c["free_load_mib"]),
+                profiled_tokens=int(c["profiled_tokens"]),
+            )
+            for c in raw["cards"]
+        )
+    except Exception as exc:
+        return None, f"corridor/budget sample {p!r} is incomplete: {exc}"
+
+    if cell <= 0:
+        return None, f"corridor/budget sample {p!r} has cell_size={cell}"
+    if not cards:
+        return None, f"corridor/budget sample {p!r} has no cards"
+    if len(vec) != len(cards) or any(v <= 0 for v in vec):
+        return None, (
+            f"corridor/budget sample {p!r} token_vector {list(vec)} does not "
+            f"match its {len(cards)} cards"
+        )
+    for c in cards:
+        if c.profiled_tokens <= 0:
+            return None, (
+                f"corridor/budget sample {p!r}: card {c.card_uuid} has no "
+                f"profiled token capacity"
+            )
+        if c.load_transient_mib < 0:
+            return None, (
+                f"corridor/budget sample {p!r}: card {c.card_uuid} measured MORE "
+                f"free under load ({c.free_load_mib}) than idle ({c.free_idle_mib}) "
+                f"-- the pair is not one boot"
+            )
+    ratio = raw.get("budget_return_ratio", None)
+    ratio = float(ratio) if ratio is not None else None
+    if ratio is not None and not (0.0 < ratio <= 1.0):
+        return None, (
+            f"corridor/budget sample {p!r} budget_return_ratio={ratio} is not in (0, 1]"
+        )
+    return (
+        CorridorSample(
+            provenance=str(raw.get("provenance", "(undeclared)")),
+            cell_size=cell,
+            token_vector=vec,
+            cards=cards,
+            budget_return_ratio=ratio,
+            budget_return_provenance=str(raw.get("budget_return_provenance", "")),
+        ),
+        None,
+    )
+
+
+def _predicted_free_mib(
+    total_mib: int,
+    budget_mib: int,
+    dormant_mib: int,
+    carve_mib: int,
+    sc: SampleCard,
+) -> int:
+    """NVML free-v2 this card is predicted to show under D-awake load."""
+    return (
+        int(total_mib)
+        - int(budget_mib)
+        - int(dormant_mib)
+        - int(carve_mib)
+        - sc.awake_residue_mib
+        - sc.load_transient_mib
+    )
+
+
+def _capacities(
+    budgets: Sequence[int], order: Sequence[SampleCard], tokens_per_mib: int
+) -> List[int]:
+    """P_r at these budgets: the sample's measured P_r moved by the delta.
+
+    Exact, not modelled: the KV cell is the same on every rank of a D group
+    (``cell_size=32768`` on all three ranks of weg2sb5f), so one MiB of a
+    rank's budget is exactly ``tokens_per_mib`` tokens of that rank's own
+    physical capacity."""
+    return [
+        max(0, sc.profiled_tokens + (int(b) - sc.budget_mib) * tokens_per_mib)
+        for b, sc in zip(budgets, order)
+    ]
+
+
+def _world_pool(caps: Sequence[int], vec: Sequence[int]) -> Tuple[int, int]:
+    """``C = min_r(P_r // v_r) * sum(v)`` and the binding rank index.
+
+    The runtime's own rule, quoted from where it is implemented:
+    ``model_runner_kv_cache_mixin.py:5020-5037``."""
+    units = [int(p) // int(v) for p, v in zip(caps, vec)]
+    binder = min(range(len(units)), key=lambda i: units[i])
+    return units[binder] * int(sum(vec)), binder
+
+
+def _resolved_world_pool(caps: Sequence[int]) -> Optional[int]:
+    """C after the runtime re-solves the vector from these capacities.
+
+    Group D ships NO token vector (``d_token_vector_decision`` default), so the
+    runtime installs ``partition_units(64, [P_r...])`` gcd-reduced after
+    profiling -- boot weg2sb5f installed ``[17, 7, 8]`` that way.  Under a
+    re-solved vector EVERY rank is near-binding by construction, so this is the
+    stricter of the two pool predictions and it is why the pass may refuse a
+    cut on a rank the fixed vector calls non-binding.  Returns ``None`` (and
+    the caller says UNPRICED) when the runtime's own helper is not importable
+    -- never a locally reinvented partition."""
+    try:
+        from sglang.srt.distributed.utils import partition_units
+    except Exception:
+        return None
+    if any(c <= 0 for c in caps):
+        return None
+    units = list(partition_units(64, list(caps)))
+    if not units or any(u <= 0 for u in units):
+        return None
+    g = math.gcd(*units) if len(units) > 1 else units[0]
+    vec = [u // max(1, g) for u in units]
+    pool, _ = _world_pool(caps, vec)
+    return pool
+
+
+def solve_corridor_budgets(
+    cards: Sequence,
+    budgets: Sequence[int],
+    dormant_mib: Dict[str, int],
+    sample: Optional[CorridorSample],
+    unpriced_reason: Optional[str] = None,
+    law_mib: int = CORRIDOR_LAW_MIB,
+    group: str = "D",
+) -> CorridorSolve:
+    """Apply the corridor law to ``budgets``; lower only where it is free to.
+
+    ``cards`` are the launcher's ``Card`` objects in ordinal order (they carry
+    ``uuid``, ``name``, ``total_mib`` and ``reserved_mib``); ``budgets`` is what
+    ``budgets_from_dc`` just produced; ``dormant_mib`` is THIS boot's measured
+    dormant image of the other group, keyed by uuid -- the same dict the budget
+    line was computed from.  Only the residue and the load transient come from
+    the sample; everything else is live."""
+    budgets = [int(b) for b in budgets]
+    if sample is None:
+        why = unpriced_reason or "no corridor/budget sample was supplied"
+        return CorridorSolve(
+            budgets=tuple(budgets),
+            lines=(
+                f"WEG2-BUDGET corridor-constrained group={group} "
+                f"W52 Weg2CorridorBudgetUnpriced: {why}. law={law_mib} MiB. "
+                f"REFUSED TO PRICE -- every budget stands byte-identical "
+                f"({','.join(str(b) for b in budgets)} MiB). The corridor is "
+                f"still the law; this boot simply cannot say whether it holds, "
+                f"and a boot must never get a budget priced off numbers nobody "
+                f"measured.",
+            ),
+            unpriced_reason=why,
+            world_pool_before=None,
+            world_pool_after=None,
+        )
+
+    by_uuid = sample.by_uuid
+    missing = [c.uuid for c in cards if c.uuid not in by_uuid]
+    if missing or len(cards) != len(sample.cards):
+        why = (
+            f"the sample covers {len(sample.cards)} card(s) and this boot has "
+            f"{len(cards)}"
+            if not missing
+            else f"the sample has no row for card(s) {missing}"
+        )
+        return solve_corridor_budgets(
+            cards, budgets, dormant_mib, None, why, law_mib, group
+        )
+
+    order = [by_uuid[c.uuid] for c in cards]
+    vec = list(sample.token_vector)
+    tpm = sample.tokens_per_mib
+    ratio = sample.budget_return_ratio
+    ratio_note = (
+        f"return_ratio={ratio}:MEASURED({sample.budget_return_provenance or 'undeclared'})"
+        if ratio is not None
+        else (
+            "return_ratio=1.0:ASSUMED (no measured budget->free pair on the Weg-2 "
+            "form; htsglang aeac561711 #631 measured 0.318 on the Weg-1 form, a "
+            "different form and NOT carried, so a cut below is a LOWER BOUND)"
+        )
+    )
+    eff_ratio = ratio if ratio is not None else 1.0
+
+    caps0 = _capacities(budgets, order, tpm)
+    pool0, binder0 = _world_pool(caps0, vec)
+    res0 = _resolved_world_pool(caps0)
+
+    working = list(budgets)
+    verdicts: List[Tuple[int, str, str]] = []  # (ordinal, verdict, extra)
+
+    for i, card in enumerate(cards):
+        sc = order[i]
+        free = _predicted_free_mib(
+            card.total_mib, working[i], int(dormant_mib.get(card.uuid, 0)),
+            int(getattr(card, "reserved_mib", 0)), sc,
+        )
+        if free >= law_mib:
+            verdicts.append((i, "SATISFIED", f"margin_mib={free - law_mib}"))
+            continue
+        need = law_mib - free
+        cut = int(math.ceil(need / eff_ratio))
+        cut = int(math.ceil(cut / BUDGET_ALIGN_MIB)) * BUDGET_ALIGN_MIB
+        trial = list(working)
+        trial[i] = working[i] - cut
+        if trial[i] <= 0:
+            verdicts.append(
+                (i, "REFUSED-IMPOSSIBLE",
+                 f"shortfall_mib={need} cut_mib={cut} would take the budget to "
+                 f"{trial[i]} MiB")
+            )
+            continue
+        caps_t = _capacities(trial, order, tpm)
+        pool_t, binder_t = _world_pool(caps_t, vec)
+        res_t = _resolved_world_pool(caps_t)
+        shrinks_fixed = pool_t < pool0
+        shrinks_resolved = res0 is not None and res_t is not None and res_t < res0
+        if shrinks_fixed or shrinks_resolved:
+            which = []
+            if shrinks_fixed:
+                which.append(f"fixed-vector {pool0}->{pool_t}")
+            if shrinks_resolved:
+                which.append(f"re-solved-vector {res0}->{res_t}")
+            verdicts.append(
+                (i, "REFUSED-WOULD-BIND",
+                 f"W53 Weg2CorridorBudgetWouldBind shortfall_mib={need} "
+                 f"cut_mib={cut} would_be_free_mib={free + int(cut * eff_ratio)} "
+                 f"would_shrink_world_pool[{'; '.join(which)}] "
+                 f"binder_after={binder_t}. The corridor margin on this card is "
+                 f"only buyable with world context; kein-bindender-rang leaves "
+                 f"that trade to the operator, so the budget stands unchanged")
+            )
+            continue
+        working[i] = trial[i]
+        verdicts.append(
+            (i, "APPLIED",
+             f"shortfall_mib={need} cut_mib={cut} world pool unchanged "
+             f"(this rank does not bind)")
+        )
+
+    caps1 = _capacities(working, order, tpm)
+    pool1, binder1 = _world_pool(caps1, vec)
+    res1 = _resolved_world_pool(caps1)
+
+    lines: List[str] = []
+    for i, card in enumerate(cards):
+        sc = order[i]
+        free_after = _predicted_free_mib(
+            card.total_mib, working[i], int(dormant_mib.get(card.uuid, 0)),
+            int(getattr(card, "reserved_mib", 0)), sc,
+        )
+        verdict, extra = next((v, e) for j, v, e in verdicts if j == i)
+        lines.append(
+            f"WEG2-BUDGET corridor-constrained card={card.uuid} "
+            f"budget_mib={budgets[i]}->{working[i]} "
+            f"predicted_free_mib={free_after} law={law_mib} "
+            f"world_pool={pool0}->{pool1} binder={binder1} "
+            f"verdict={verdict} ordinal={i} nvml_idx={card.nvml_index} "
+            f"{card.name} terms[total={card.total_mib} "
+            f"dormant_other={int(dormant_mib.get(card.uuid, 0))} "
+            f"carve={int(getattr(card, 'reserved_mib', 0))} "
+            f"awake_residue={sc.awake_residue_mib} "
+            f"load_transient={sc.load_transient_mib}] {extra}"
+        )
+    lines.append(
+        f"WEG2-BUDGET corridor-constrained group={group} SOURCE={sample.provenance} "
+        f"cell_size={sample.cell_size} token_vector={vec} "
+        f"world_pool fixed-vector {pool0}->{pool1} "
+        f"re-solved-vector {res0 if res0 is not None else 'UNPRICED'}"
+        f"->{res1 if res1 is not None else 'UNPRICED'} "
+        f"binder {binder0}->{binder1} {ratio_note}"
+    )
+    return CorridorSolve(
+        budgets=tuple(working),
+        lines=tuple(lines),
+        unpriced_reason=None,
+        world_pool_before=pool0,
+        world_pool_after=pool1,
+    )
