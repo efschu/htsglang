@@ -4235,14 +4235,14 @@ def test_the_arm_line_names_the_deposit_even_when_it_is_zero(tmp_path):
     from sglang.srt.weg2 import host_ledger as hl
 
     _arm, _store, lines = hl.choose(
-        200 << 30, 150 << 30, store_min_gib=1.0, ring_bytes=20 << 30,
+        200 << 30, 150 << 30, ring_bytes=20 << 30,
         ring_span1_bytes=8 << 30)
     arms = [ln for ln in lines if ln.startswith("WEG2-HOST-LEDGER ARM ")]
     assert arms, lines
     assert all("xchg_bounce=0.00" in ln for ln in arms), arms
 
     _a2, _s2, armed_lines = hl.choose(
-        200 << 30, 150 << 30, store_min_gib=1.0, ring_bytes=20 << 30,
+        200 << 30, 150 << 30, ring_bytes=20 << 30,
         ring_span1_bytes=8 << 30,
         xchg_bounce_host_bytes=hl.xchg_bounce_bytes(3))
     armed_arms = [ln for ln in armed_lines if ln.startswith("WEG2-HOST-LEDGER ARM ")]
@@ -4476,8 +4476,7 @@ def test_the_deposit_is_charged_only_on_the_arm_that_can_allocate_it():
 
     # ... and the term reaches the ARM LINE with exactly that value.
     def _arms(term):
-        _a, _s, lines = hl.choose(200 << 30, 150 << 30, store_min_gib=1.0,
-                                  ring_bytes=20 << 30, ring_span1_bytes=8 << 30,
+        _a, _s, lines = hl.choose(200 << 30, 150 << 30,                                   ring_bytes=20 << 30, ring_span1_bytes=8 << 30,
                                   xchg_bounce_host_bytes=term)
         return [ln for ln in lines if ln.startswith("WEG2-HOST-LEDGER ARM ")]
 

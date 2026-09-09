@@ -429,7 +429,12 @@ class TestWiredIntoTheSleepingLeg(CustomTestCase):
         src = Path(weight_updater.__file__).read_text()
         self.assertIn("RingNeedGuard(", src)
         self.assertIn("weg2_ring_guard.guard_tag(", src)
-        block = src.split('direction="d2h"')[1]
+        # #1273 seam: the ordinal "the SECOND d2h" stopped naming this lock
+        # when the exchange's shadow hook added an EARLIER `direction="d2h"`
+        # to this module. Anchor on the lock the guard has to precede the
+        # pause INSIDE, not on a count of look-alikes -- the hazard is the
+        # sleep-D2H acquire, and the acquire has a name.
+        block = src.split('self._weg2_pcie_lock("sleep-D2H ')[1]
         guard_at = block.index("weg2_ring_guard.guard_tag(")
         pause_at = block.index("self.memory_saver_adapter.pause(tag)")
         self.assertLess(guard_at, pause_at,
