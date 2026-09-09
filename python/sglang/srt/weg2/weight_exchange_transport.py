@@ -299,7 +299,12 @@ DIR_CAPACITY = xr.DATA_OFF - xr.DIR_OFF
 #:   entering with different values agree on every payload below the smaller
 #:   one and diverge silently above it.  Publishing it in the row makes the
 #:   consumer refuse the disagreement by name (#802 rule 4).
-ONCARD_ROW_STRUCT = struct.Struct("<q6Q")
+#: S5 appends ``checksum``: the diagonal has no slot RECORD to carry it (the
+#: region's ``XchgSlot`` serves the cross pairs only -- ``xr.CROSS_PAIRS`` has
+#: no diagonal), so the row is the only place a co-located producer can publish
+#: the sum its consumer verifies.  ``0`` means NOT COMPUTED, which is the
+#: authoritative path's value and keeps that path byte-identical.
+ONCARD_ROW_STRUCT = struct.Struct("<q7Q")
 ONCARD_SEAL_OFF = ONCARD_ROW_STRUCT.size
 
 ONCARD_STATE_IDLE = 0
@@ -920,20 +925,70 @@ class SlotBatch:
         """
         return self.seq % xr.SLOTS_PER_PAIR
 
-    def checksum(self) -> int:
-        """TODO(S5): the shadow slice records a ``uint8_checksum`` per piece
-        here and compares it against the destination's own restored tensor
-        after ``family_complete``.
+    def checksum(self, read_bytes: Optional[Callable[[int, int], int]] = None,
+                 base: int = 0) -> int:
+        """The ``uint8_checksum`` of this batch's STAGED bytes, or 0.
 
-        Deliberately NOT computed on the authoritative path: it would cost a
-        full read of every byte inside the flip budget, and section 3.3 rule 3
-        requires ``checksum_is_representable``
-        (``model_executor/weights_arena.py:133``) to be asked before any
-        mismatch is REPORTED -- a question only the shadow has the context to
-        ask.  ``0`` here means "not computed", and the slot record's own
-        ``checksum`` field is what S5 fills.
+        WIRED IN S5 (this was ``TODO(S5)`` and returned 0 unconditionally).
+        ``read_bytes(addr, nbytes) -> int`` is the caller's summer -- on the
+        metal a device-side sum over a scratch tensor, in the double a byte
+        sum over the fake's storage.  ``None`` keeps the authoritative path
+        BYTE-IDENTICAL to today: no read, no sync, no cost, and ``0`` keeps its
+        meaning of "not computed".
+
+        THE RANGE IS ``[base, base + total_bytes)`` AND THAT IS A PROPERTY OF
+        THE BATCHER, not an assumption: :func:`batch_descs` packs pieces at
+        ``slot_off = cur_bytes``, a running sum, so a batch occupies the front
+        of its slot contiguously and a 2-D piece is COMPACTED into it
+        (``dpitch = run_bytes``).  Summing the range is therefore summing
+        exactly the payload -- never slot padding, which is stale bytes from an
+        older batch and would make an honest transport report a mismatch.
+        ``test_the_checksum_covers_the_payload_and_not_the_slot_padding`` is
+        what holds that.
+
+        IT DOES NOT CLASSIFY AND IT DOES NOT RAISE.  Section 3.3 rule 3 says
+        ``checksum_is_representable`` (``model_executor/weights_arena.py:133``)
+        must be asked before any mismatch is REPORTED, and that question needs
+        a context this module does not have (it must stay importable without
+        torch).  The transport hands the two numbers to its
+        ``on_checksum`` callback; the shadow decides what they mean.
         """
-        return 0
+        if read_bytes is None:
+            return 0
+        return int(read_bytes(int(base), int(self.total_bytes)))
+
+
+#: What ``SlotBatch.checksum`` returns when no summer was supplied.  A named
+#: constant because ``0`` is also a legal checksum (an all-zero payload), and
+#: the two are told apart by whether a summer was passed -- never by the value.
+CHECKSUM_NOT_COMPUTED = 0
+
+
+@dataclass(frozen=True)
+class ChecksumReport:
+    """One staged batch's producer checksum beside the consumer's own.
+
+    HANDED TO A CALLBACK, NEVER RAISED, and that is the shadow's zero-authority
+    rule expressed in the transport's own signature: this module cannot tell a
+    corruption from a framing error (that is what ``checksum_is_representable``
+    is for) and a module that cannot classify a fault must not act on one.
+
+    ``expected`` is the PRODUCER's published number and ``got`` is this
+    consumer's own sum over the same staged range.  ``match`` is the plain
+    comparison; everything else about what it MEANS belongs to the caller.
+    """
+
+    lane: str
+    pair: int
+    slot: int
+    seq: int
+    nbytes: int
+    expected: int
+    got: int
+
+    @property
+    def match(self) -> bool:
+        return int(self.expected) == int(self.got)
 
 
 def batch_descs(
@@ -1277,6 +1332,7 @@ def run_producer_pair(
     stats: PairStats,
     budget_s: Optional[float] = None,
     slot_bytes: int = xr.SLOT_BYTES,
+    checksum_bytes: Optional[Callable[[int, int], int]] = None,
 ) -> PairStats:
     """D2H one directed pair's descriptors into the staging slots.
 
@@ -1328,7 +1384,11 @@ def run_producer_pair(
                 stats.strided_bytes += piece.nbytes
             stats.pieces += 1
         ops.synchronize(stream)
-        region.publish(pair, slot, batch.total_bytes, checksum=batch.checksum())
+        # AFTER the sync, like `bytes_filled` and for the identical reason: a
+        # checksum taken over issued-but-not-landed bytes is a checksum of the
+        # PREVIOUS batch, and it would be published as this one's.
+        region.publish(pair, slot, batch.total_bytes,
+                       checksum=batch.checksum(checksum_bytes, base))
         sems.post(pair, slot, "full")
         stats.bytes_moved += batch.total_bytes
         stats.batches += 1
@@ -1347,6 +1407,8 @@ def run_consumer_pair(
     stats: PairStats,
     budget_s: Optional[float] = None,
     slot_bytes: int = xr.SLOT_BYTES,
+    checksum_bytes: Optional[Callable[[int, int], int]] = None,
+    on_checksum: Optional[Callable[[ChecksumReport], None]] = None,
 ) -> PairStats:
     """H2D one directed pair's descriptors out of the staging slots.
 
@@ -1390,6 +1452,9 @@ def run_consumer_pair(
                 producer_pid=rec.producer_pid,
             ))
         base = region.slot_address(pair, slot)
+        _report_checksum(on_checksum, checksum_bytes, batch, base,
+                         lane="cross", pair=pair, slot=slot,
+                         published=rec.checksum)
         for piece in batch.pieces:
             desc = descs[piece.desc_index]
             dst_ptr = int(desc.dst_ptr) + piece.dst_off
@@ -1411,6 +1476,27 @@ def run_consumer_pair(
         stats.batches += 1
     stats.elapsed_s = time.perf_counter() - started
     return stats
+
+
+def _report_checksum(on_checksum, checksum_bytes, batch, base: int, *,
+                     lane: str, pair: int, slot: int, published: int) -> None:
+    """Compare the staged bytes against the producer's published sum, and TELL.
+
+    Silent when either half is absent -- no summer, or a producer that
+    published ``CHECKSUM_NOT_COMPUTED`` -- because a comparison against a
+    number nobody computed is the "unarmed gate reading as a passed one" shape
+    the spec forbids in section 4.2.  It never raises: on the authoritative
+    path there is no summer at all, and in the shadow a mismatch is COUNTED,
+    which is what zero authority means when the finding is real.
+    """
+    if on_checksum is None or checksum_bytes is None:
+        return
+    if int(published) == CHECKSUM_NOT_COMPUTED:
+        return
+    got = batch.checksum(checksum_bytes, base)
+    on_checksum(ChecksumReport(lane=lane, pair=int(pair), slot=int(slot),
+                               seq=int(batch.seq), nbytes=int(batch.total_bytes),
+                               expected=int(published), got=int(got)))
 
 
 def apply_zerofill(ops: DeviceOps, stream: int, descs: Sequence[object],
@@ -1660,7 +1746,7 @@ def _oncard_row_off(area_off: int, row: int, slot: int = 0) -> int:
 
 def write_oncard_row(region: xr.XchgRegion, area_off: int, row: int, *,
                      seq: int, nbytes: int, slot_bytes: int, wave: int,
-                     state: int, slot: int = 0) -> None:
+                     state: int, slot: int = 0, checksum: int = 0) -> None:
     """Publish one side's on-card handshake row.  ONE WRITER PER ADDRESS.
 
     Producer rows and consumer rows are separate arrays, so no word here has two
@@ -1684,7 +1770,7 @@ def write_oncard_row(region: xr.XchgRegion, area_off: int, row: int, *,
     off = _oncard_row_off(area_off, row, slot)
     payload = ONCARD_ROW_STRUCT.pack(int(seq), int(nbytes), int(slot_bytes),
                                      int(wave), region.epoch_hash,
-                                     os.getpid(), int(state))
+                                     os.getpid(), int(state), int(checksum))
     addr = ctypes.addressof(view)
     ctypes.memmove(addr + off, payload, len(payload))
     ctypes.memmove(addr + off + ONCARD_SEAL_OFF, struct.pack("<Q", _seal(payload)), 8)
@@ -1697,11 +1783,11 @@ def read_oncard_row(region: xr.XchgRegion, area_off: int, row: int,
     addr = ctypes.addressof(view)
     payload = ctypes.string_at(addr + off, ONCARD_ROW_STRUCT.size)
     seal = struct.unpack("<Q", ctypes.string_at(addr + off + ONCARD_SEAL_OFF, 8))[0]
-    seq, nbytes, slot_bytes, wave, eh, pid, state = \
+    seq, nbytes, slot_bytes, wave, eh, pid, state, checksum = \
         ONCARD_ROW_STRUCT.unpack(payload)
     return {
         "seq": seq, "bytes": nbytes, "slot_bytes": slot_bytes, "wave": wave,
-        "epoch_hash": eh, "pid": pid,
+        "epoch_hash": eh, "pid": pid, "checksum": checksum,
         "state": state, "sealed": int(seal == _seal(payload)),
     }
 
@@ -1928,6 +2014,7 @@ def run_oncard_producer(
     descs: Sequence[object],
     stats: OnCardStats,
     budget_s: Optional[float] = None,
+    checksum_bytes: Optional[Callable[[int, int], int]] = None,
 ) -> OnCardStats:
     """Hop 1: this rank's VRAM -> its own bounce slot, batch by batch.
 
@@ -1968,7 +2055,8 @@ def run_oncard_producer(
         write_oncard_row(region, DIR_ONCARD_PROD_OFF, row, slot=slot,
                          seq=batch.seq, nbytes=batch.total_bytes,
                          slot_bytes=bounce.slot_bytes, wave=wave,
-                         state=ONCARD_STATE_READY)
+                         state=ONCARD_STATE_READY,
+                         checksum=batch.checksum(checksum_bytes, base))
         stats.bytes_moved += batch.total_bytes
         stats.batches += 1
     # This rank's OWN half of the two hops, measured before the terminal wait:
@@ -1998,6 +2086,8 @@ def run_oncard_consumer(
     slots: int = ONCARD_SLOTS,
     slot_bytes: int = ONCARD_SLOT_BYTES,
     budget_s: Optional[float] = None,
+    checksum_bytes: Optional[Callable[[int, int], int]] = None,
+    on_checksum: Optional[Callable[[ChecksumReport], None]] = None,
 ) -> OnCardStats:
     """Hop 2: the imported peer bounce -> this rank's VRAM.
 
@@ -2041,6 +2131,9 @@ def run_oncard_consumer(
                 producer_pid=got["pid"],
             ))
         base = peer_ptr + slot * int(slot_bytes)
+        _report_checksum(on_checksum, checksum_bytes, batch, base,
+                         lane="oncard", pair=-1, slot=slot,
+                         published=got["checksum"])
         for piece in batch.pieces:
             desc = descs[piece.desc_index]
             dst_ptr = int(desc.dst_ptr) + piece.dst_off
@@ -2101,7 +2194,7 @@ def _await_oncard(region: xr.XchgRegion, area_off: int, peer_row: int, seq: int,
     """
     if seq < 0:
         return {"seq": seq, "bytes": 0, "slot_bytes": 0, "wave": int(wave),
-                "state": ONCARD_STATE_DONE, "pid": 0,
+                "state": ONCARD_STATE_DONE, "pid": 0, "checksum": 0,
                 "epoch_hash": region.epoch_hash, "sealed": 1}
     started = time.monotonic()
     waiter = _OnCardWait() if wait is None else wait
@@ -2225,6 +2318,8 @@ def run_leg(
     slot_bytes: int = xr.SLOT_BYTES,
     oncard_slot_bytes: Optional[int] = None,
     oncard_slots: int = ONCARD_SLOTS,
+    checksum_bytes: Optional[Callable[[int, int], int]] = None,
+    on_checksum: Optional[Callable[[ChecksumReport], None]] = None,
 ) -> LegResult:
     """Move this rank's whole share of one wave.
 
@@ -2320,9 +2415,17 @@ def run_leg(
         def one(pair=pair, stats=stats, sub=sub) -> None:
             stream = ops.create_stream(device)
             try:
-                runner = run_producer_pair if is_source else run_consumer_pair
-                runner(region, sems, ops, stream, pair=pair, descs=sub,
-                       stats=stats, budget_s=budget, slot_bytes=slot_bytes)
+                if is_source:
+                    run_producer_pair(region, sems, ops, stream, pair=pair,
+                                      descs=sub, stats=stats, budget_s=budget,
+                                      slot_bytes=slot_bytes,
+                                      checksum_bytes=checksum_bytes)
+                else:
+                    run_consumer_pair(region, sems, ops, stream, pair=pair,
+                                      descs=sub, stats=stats, budget_s=budget,
+                                      slot_bytes=slot_bytes,
+                                      checksum_bytes=checksum_bytes,
+                                      on_checksum=on_checksum)
             finally:
                 ops.destroy_stream(stream)
 
@@ -2363,7 +2466,8 @@ def run_leg(
                 run_oncard_producer(region, ops, stream, bounce, row=row,
                                     peer_row=peer_row, wave=wave,
                                     descs=on_card, stats=oncard_stats,
-                                    budget_s=budget)
+                                    budget_s=budget,
+                                    checksum_bytes=checksum_bytes)
                 if ipc:
                     _await_release(region, peer_row, budget, row=row, wave=wave)
                     may_free = True
@@ -2390,7 +2494,9 @@ def run_leg(
                                     peer_row=peer_row, wave=wave,
                                     descs=on_card, stats=oncard_stats,
                                     budget_s=budget, slots=diag_slots,
-                                    slot_bytes=diag_bytes)
+                                    slot_bytes=diag_bytes,
+                                    checksum_bytes=checksum_bytes,
+                                    on_checksum=on_checksum)
         except BaseException:
             # Vote this lane down where the peer is looking, so its wait ends
             # NOW and names the death instead of the fence budget.
