@@ -259,7 +259,11 @@ SHADOW_AREA_OFF = tp.DIR_USED_BYTES
 #: 128 keeps the row a power of two the way every other table here is.
 SHADOW_ROW_BYTES = 128
 #: ``epoch_hash, leg, vote, classes_hash, need_mib, pid, ts_ns, plan_digest,
-#: card_digest`` + a seal.
+#: piece_digest`` + a seal.  S6 fix F2: the ninth slot's LAYOUT is unchanged
+#: (still ``<9Q``); what it CARRIES changed from the whole-storage geometry
+#: digest to the on-card PIECE-SET digest, because only the second is a
+#: question two asymmetrically-placed ranks can both answer yes to.  The
+#: geometry digest stays on the PLAN line as information and is never gated.
 SHADOW_ROW_STRUCT = struct.Struct("<9Q")
 SHADOW_SEAL_OFF = SHADOW_ROW_STRUCT.size
 SHADOW_AREA_BYTES = xr.N_RANKS * SHADOW_ROW_BYTES
@@ -277,14 +281,14 @@ def _row_off(row: int) -> int:
 
 def write_shadow_vote(region: xr.XchgRegion, row: int, *, leg: int, vote: bool,
                       classes_hash: int, need_mib: int,
-                      plan_digest: int = 0, card_digest: int = 0) -> None:
+                      plan_digest: int = 0, piece_digest: int = 0) -> None:
     """Publish this rank's shadow vote.  ONE WRITER PER ADDRESS, sealed.
 
     Same discipline as every other row in this region (S3's gate rows, S4's
     on-card rows): a rank writes only its own row, the row is sealed, and a
     half-written row is not a signal.
 
-    ``plan_digest`` and ``card_digest`` default to 0 so a caller that has no
+    ``plan_digest`` and ``piece_digest`` default to 0 so a caller that has no
     derived plan (a refusal publishing its NO, S3's and S4's own callers) is
     byte-unchanged; the gate only COMPARES them, and a table of zeros is
     uniform, so a leg where nobody derived a plan is not turned into a
@@ -296,7 +300,7 @@ def write_shadow_vote(region: xr.XchgRegion, row: int, *, leg: int, vote: bool,
         region.epoch_hash, int(leg), VOTE_YES if vote else VOTE_NO,
         int(classes_hash) & ((1 << 64) - 1), int(need_mib), os.getpid(),
         time.time_ns(), int(plan_digest) & ((1 << 64) - 1),
-        int(card_digest) & ((1 << 64) - 1))
+        int(piece_digest) & ((1 << 64) - 1))
     addr = ctypes.addressof(view)
     ctypes.memmove(addr + off, payload, len(payload))
     ctypes.memmove(addr + off + SHADOW_SEAL_OFF,
@@ -310,11 +314,11 @@ def read_shadow_vote(region: xr.XchgRegion, row: int) -> Dict[str, int]:
     payload = ctypes.string_at(addr + off, SHADOW_ROW_STRUCT.size)
     seal = struct.unpack("<Q", ctypes.string_at(addr + off + SHADOW_SEAL_OFF, 8))[0]
     eh, leg, vote, classes_hash, need_mib, pid, ts_ns, plan_digest, \
-        card_digest = SHADOW_ROW_STRUCT.unpack(payload)
+        piece_digest = SHADOW_ROW_STRUCT.unpack(payload)
     return {"epoch_hash": eh, "leg": leg, "vote": vote,
             "classes_hash": classes_hash, "need_mib": need_mib, "pid": pid,
             "ts_ns": ts_ns, "plan_digest": plan_digest,
-            "card_digest": card_digest,
+            "piece_digest": piece_digest,
             "sealed": int(seal == xr._seal(payload))}
 
 
@@ -394,7 +398,7 @@ def oncard_not_drainable_message(*, rank: int, row: int, peer_row: int,
         "that publishes the C14 credit the co-located destination hook's "
         "resume is fenced on), so a producer here would fill a bounce, block "
         "in drain-final and time out at the budget for zero compared bytes; "
-        "the gate rendezvous ran and plan_digest/card_digest WERE compared, "
+        "the gate rendezvous ran and plan_digest/piece_digest WERE compared, "
         "the ring is and stays the only authority for weight bytes"
     )
 
@@ -434,7 +438,7 @@ def deposit_refusal_message(*, reason: str, rank: int, row: int, peer_row: int,
         "slot is overwritten before anything read it, and above the charged "
         "host budget the deposit is pinned host bytes no ledger term carries "
         "against a reap mark that is a hard bound.  The gate rendezvous ran "
-        "and plan_digest/card_digest WERE compared, NO bytes moved, and the "
+        "and plan_digest/piece_digest WERE compared, NO bytes moved, and the "
         "ring is and stays the only authority for weight bytes"
     )
 
@@ -446,8 +450,9 @@ def shadow_gate(region: xr.XchgRegion, row: int, *, leg: int, vote: bool,
                 poll_s: float = xr.GATE_POLL_S,
                 monotonic: Callable[[], float] = time.monotonic,
                 expect_rows: Optional[Sequence[int]] = None,
-                plan_digest: int = 0, card_digest: int = 0,
-                peer_row: Optional[int] = None) -> ShadowVerdict:
+                plan_digest: int = 0, piece_digest: int = 0,
+                peer_row: Optional[int] = None,
+                piece_hint: str = "") -> ShadowVerdict:
     """UNIFORM ACROSS THE ROWS IT MAY EXPECT: any of them refusing is a NO.
 
     ``expect_rows`` IS THE ROWS THIS RANK MAY EXPECT AT THIS INSTANT, and it
@@ -494,7 +499,7 @@ def shadow_gate(region: xr.XchgRegion, row: int, *, leg: int, vote: bool,
               else tuple(sorted({int(r) for r in expect_rows} | {int(row)})))
     write_shadow_vote(region, row, leg=leg, vote=vote,
                       classes_hash=classes_hash, need_mib=need_mib,
-                      plan_digest=plan_digest, card_digest=card_digest)
+                      plan_digest=plan_digest, piece_digest=piece_digest)
     started = monotonic()
     while True:
         rows = {i: read_shadow_vote(region, i) for i in wanted}
@@ -538,21 +543,32 @@ def shadow_gate(region: xr.XchgRegion, row: int, *, leg: int, vote: bool,
                                      "plan-diverged-group",
                                      monotonic() - started,
                                      expected=len(wanted))
-            # W64, scope=oncard-peer.  THE CO-LOCATED PAIR's own geometry, and
-            # it is a DIFFERENT question from the one above: the two ranks that
-            # share a card are the two ends of the on-card lane, and if they
-            # framed the same classes differently the transport would discover
-            # it as a W54 byte-count disagreement inside the consumer, after
-            # the source has already filled a bounce and while it waits out its
-            # drain.  Asked here it costs one comparison and names the layouts.
+            # W64, scope=oncard-peer.  THE CO-LOCATED PAIR's ON-CARD PIECES.
+            #
+            # S6 fix F2 CHANGED THE PREDICATE, not the check.  This compared
+            # ``card_digest`` -- a hash of WHOLE STORAGE -- and under
+            # P=PP3 / D=TP3 a stage-holder and a shard-holder can never agree
+            # on that: boot weg2shadowE measured six distinct values with no
+            # co-located pair matching, and refused all 12 legs of a lane that
+            # has real bytes.  The exchange's unit is the SUB-TENSOR OVERLAP
+            # (SECTION 1af / #1277: the layer resident whole on card n in P
+            # CONTAINS D-rank-n's shard of it; 10.285 GiB on-card measured
+            # byte-exact), so what the pair must agree on is the PIECE SET the
+            # plan assigns to their card -- name, offsets, bytes, ordered.
+            # That is a question both sides can answer yes to, and it still
+            # catches the W54 byte-count disagreement this check exists for:
+            # two ranks that framed the same overlap differently have different
+            # piece keys.  The geometry digest survives as INFORMATION on the
+            # plan line and is never a gate again.
             if peer_row is not None and int(peer_row) in digests:
-                pair = {int(row): int(card_digest),
-                        int(peer_row): int(rows[int(peer_row)]["card_digest"])}
+                pair = {int(row): int(piece_digest),
+                        int(peer_row): int(rows[int(peer_row)]["piece_digest"])}
                 if len(set(pair.values())) != 1:
                     message = plan_divergence_message(
                         scope="oncard-peer", leg=int(leg),
-                        epoch=str(region.epoch), rows=pair, field="card_digest")
-                    log(message)
+                        epoch=str(region.epoch), rows=pair,
+                        field="piece_digest")
+                    log(message + " -- " + str(piece_hint or ""))
                     return ShadowVerdict(False, len(fresh),
                                          tuple(sorted(pair)),
                                          "plan-diverged-oncard-peer",
@@ -1666,7 +1682,9 @@ def shadow_transport(
     #: callers byte-unchanged: a table of zeros is uniform, so the checks are
     #: inert until a derivation fills them.
     plan_digest: int = 0,
-    card_digest: int = 0,
+    #: S6 fix F2: the ON-CARD PIECE SET this card's pair exchanges, which is
+    #: what the oncard-peer gate compares now.  See :func:`oncard_piece_digest`.
+    piece_digest: int = 0,
     check_peer_card: bool = False,
     floor_mib: float = SHADOW_FLOOR_MIB,
     resume_reserve_bytes: int = 0,
@@ -1774,8 +1792,11 @@ def shadow_transport(
                               classes_hash=subset.hash, need_mib=price.need_mib,
                               log=log, budget_s=gate_budget_s,
                               expect_rows=gate_rows,
-                              plan_digest=plan_digest, card_digest=card_digest,
-                              peer_row=peer_row if check_peer_card else None)
+                              plan_digest=plan_digest,
+                              piece_digest=piece_digest,
+                              peer_row=peer_row if check_peer_card else None,
+                              piece_hint=first_piece_difference(
+                                  descs, piece_digest, int(rank)))
         log(verdict.line(leg=leg, epoch=epoch))
         # THE SIX RANKS' SPREAD, not this rank's wait -- see
         # :attr:`ShadowVerdict.skew_ms`.
@@ -1921,6 +1942,76 @@ def shadow_transport(
             result.blocked_ms = oncard.drain_wait_s * 1e3
         run.close()
     return run
+
+
+def oncard_piece_digest(descs: Sequence[object], card: int) -> int:
+    """The ON-CARD PIECE SET of one card's co-located pair, as one number.
+
+    #1273 S6 fix F2, and it REPLACES ``card_geometry_digest`` as the gate.
+    Operator ruling 2026-09-09, on SECTION 1af / #1277: the exchange's unit
+    under P=PP3 / D=TP3 was never "the same tensors on the same card" -- it is
+    the SUB-TENSOR OVERLAP.  A layer resident whole on card *n* in P CONTAINS
+    D-rank-*n*'s TP shard of that layer, and #1277 measured exactly that as the
+    diagonal: **10.285 GiB on-card (35.7 %) against 18.560 GiB cross-card**, on
+    byte-exact checksums.  So a digest over WHOLE STORAGE
+    (``name:tag:rows x cols x itemsize``) is the wrong predicate for asymmetric
+    placement -- it must always differ between a stage-holder and a
+    shard-holder, and boot weg2shadowE measured it doing so on 12 of 12 legs
+    (six distinct ``card_digest`` values, no co-located pair agreeing) while
+    refusing a lane that has real bytes to compare.
+
+    WHAT THE PAIR MUST AGREE ON IS THE PIECES, and the identity is the one the
+    plan already has: :meth:`XchgDesc.key`, the POINTER-FREE tuple (tag, param
+    name, src/dst rank, kind, bytes, rows, run, pitches, **offsets**, pieces)
+    that the plan id itself is built from.  Reusing it is the upstream-minimal
+    choice: one identity for a piece, not a second one written here that could
+    drift from it.
+
+    DERIVED FROM THE PLAN, NEVER FROM RANK-LOCAL STORAGE.  ``descs`` is
+    ``LegPlan.descs``; the stage-holder and the shard-holder reach the same set
+    because they are reading the same group-uniform derivation, not because
+    they enumerate the same tensors -- which they demonstrably do not.  That is
+    the whole reason this digest can be a gate and the geometry one cannot.
+
+    ORDERED, so two processes that build the list in different orders still
+    agree: sorted on the key itself, never on iteration order.
+    """
+    pieces = sorted(
+        repr(d.key()) if hasattr(d, "key") else repr((
+            getattr(d, "tag", ""), getattr(d, "param_name", ""),
+            int(getattr(d, "src_rank", -1)), int(getattr(d, "dst_rank", -1)),
+            int(getattr(d, "nbytes", 0)), int(getattr(d, "src_off", 0)),
+            int(getattr(d, "dst_off", 0))))
+        for d in descs
+        if int(getattr(d, "src_rank", -1)) == int(card)
+        and int(getattr(d, "dst_rank", -2)) == int(card)
+    )
+    return xr.epoch_hash("|".join(pieces))
+
+
+def oncard_piece_count(descs: Sequence[object], card: int) -> int:
+    """How many on-card pieces this card's pair exchanges.  0 is a REFUSAL."""
+    return sum(1 for d in descs
+               if int(getattr(d, "src_rank", -1)) == int(card)
+               and int(getattr(d, "dst_rank", -2)) == int(card))
+
+
+def first_piece_difference(mine: Sequence[object], theirs_digest: int,
+                           card: int) -> str:
+    """A reader-facing hint for a piece-set divergence.
+
+    Only this side's pieces are available in-process (the peer publishes a
+    digest, not a list), so this names WHAT THIS SIDE PLANNED -- the first
+    piece by sorted key and the count -- rather than pretending to diff two
+    sets.  Naming half honestly beats naming a difference that was not read.
+    """
+    keys = sorted(repr(d.key()) for d in mine
+                  if int(getattr(d, "src_rank", -1)) == int(card)
+                  and int(getattr(d, "dst_rank", -2)) == int(card))
+    if not keys:
+        return f"this side planned NO on-card pieces for card={card}"
+    return (f"this side planned {len(keys)} on-card piece(s) for card={card}, "
+            f"first={keys[0]}")
 
 
 def _is_on_card(desc: object) -> bool:
@@ -2198,6 +2289,23 @@ class LegPlan:
         return self.facts.classes
 
     @property
+    def piece_digest(self) -> int:
+        """THE GATE'S FIELD (S6 fix F2): this card's on-card piece set.
+
+        Derived from ``self.descs`` -- the group-uniform derivation -- and this
+        card's index, never from a rank-local tensor walk.  That is what lets a
+        stage-holder and a shard-holder produce the same number for the same
+        card while their whole-storage digests differ, which is the fact the
+        old gate could not represent.
+        """
+        return oncard_piece_digest(self.descs, int(self.card))
+
+    @property
+    def oncard_pieces(self) -> int:
+        """How many pieces this card's pair exchanges.  0 is a named refusal."""
+        return oncard_piece_count(self.descs, int(self.card))
+
+    @property
     def slots(self) -> int:
         """The DESCRIPTOR count -- what the on-card lane batches into slots.
 
@@ -2240,6 +2348,8 @@ class LegPlan:
             f"derive_ms={self.derive_ms:.3f} "
             f"plan_digest={self.facts.digest:#x} "
             f"card_digest={self.card_digest:#x} "
+            f"piece_digest={self.piece_digest:#x} "
+            f"oncard_pieces={self.oncard_pieces} "
             f"source={self.facts.source}"
         )
 
@@ -2323,7 +2433,7 @@ def derive_leg_plan(
     after the ring restored them.*  On a form where the two groups do NOT hold
     the same bytes on a card -- this rig's P=PP / D=TP shipping form -- that
     claim is false, and it is refused BY NAME as W64 ``scope=oncard-peer`` at
-    the gate, on the ``card_digest``, BEFORE a byte moves.  A named refusal is
+    the gate, on the ``piece_digest`` (S6 fix F2), BEFORE a byte moves.  A named refusal is
     the honest answer there; a red compare would read as a defect in the
     exchange when it is a statement about two layouts, and a fabricated match
     would be the instrument-that-cannot-go-red this campaign has paid for three
@@ -3097,7 +3207,8 @@ def run_leg_hook(
         # so an attach-first order would report ``no-region`` on every rank of
         # every boot that has no region either, and the two reasons would be
         # indistinguishable in exactly the case the reader cares about.
-        plan_digest = card_digest = 0
+        plan_digest = piece_digest = 0
+        oncard_pieces = -1
         # Empty = no group-uniform list was handed in, so select_subset
         # falls back to this card's own rotation (the hermetic shape).
         plan_rotation: Tuple[str, ...] = ()
@@ -3128,7 +3239,11 @@ def run_leg_hook(
             # different quantity for a missing one.
             plan_rotation = tuple(plan.classes)
             plan_digest = plan.facts.digest
-            card_digest = plan.card_digest
+            # S6 fix F2: the gate's field is the PIECE SET, not the whole
+            # storage geometry.  ``plan.card_digest`` stays on the plan line
+            # as information and is never voted.
+            piece_digest = plan.piece_digest
+            oncard_pieces = plan.oncard_pieces
         plan_descs = tuple(descs) if descs is not None else plan_for_leg(
             inputs.direction, inputs.leg, inputs.rank)
         if not plan_descs:
@@ -3154,6 +3269,21 @@ def run_leg_hook(
         if sem_reason:
             publish_no_vote(leg, reason=sem_reason)
             result.reason = sem_reason
+            return result
+        # S6 fix F2: NO OVERLAP IS A NAMED REFUSAL.  A card whose pair shares
+        # no bytes has nothing for this lane, and saying so by name is the
+        # whole lesson of boot weg2shadowE, where the honest cause sat behind
+        # an initialised ``pieces=0``.  ``-1`` means no plan reached here, which
+        # ``no-plan`` above has already named.
+        if oncard_pieces == 0:
+            log(rank_local_skip_message(
+                reason="no-oncard-pieces", rank=inputs.rank, leg=inputs.leg,
+                epoch=inputs.epoch,
+                detail=(f"hook={inputs.hook} card={inputs.rank} -- the plan "
+                        f"assigns this co-located pair no on-card pieces, so "
+                        f"there is nothing on this card for the diagonal to "
+                        f"exchange or compare")))
+            result.reason = "no-oncard-pieces"
             return result
         is_source = inputs.hook == HOOK_SOURCE
         mode = resolve_shadow_oncard_mode()
@@ -3269,13 +3399,13 @@ def run_leg_hook(
             host_bounce_budget_bytes=budget_bytes,
             oncard_store_forward=store_forward,
             gate_rows=inputs.gate_rows,
-            plan_digest=plan_digest, card_digest=card_digest,
+            plan_digest=plan_digest, piece_digest=piece_digest,
             # THE CO-LOCATED PAIR IS ONLY VISIBLE TO THE DESTINATION.  The
             # source expects its own group's three rows (S5b must_fix 1), and
             # its peer's row is one of the three it does NOT wait for -- asking
             # it to compare a row it never reads would reintroduce exactly the
             # circular wait that fix removed.
-            check_peer_card=(not is_source) and card_digest != 0,
+            check_peer_card=(not is_source) and piece_digest != 0,
             # ONE NUMBER FOR THE DIAGONAL SLOT.  The hook already priced the hop
             # from it; letting ``shadow_transport`` derive it a second time is
             # two computations of one quantity, and the W52 cross-check between
