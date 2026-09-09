@@ -1753,9 +1753,19 @@ def measure_and_record(scheduler, runtime) -> None:
 
 
 def _corridor_law_bytes() -> int:
+    # #1257c / REFUTER FINDING 6 (2026-09-09): per card, through the one
+    # derivation, not the flat stated law. The seam's spendable margin is
+    # "what sits above the floor on THIS card", and that floor is now the
+    # awake group's measured transient plus the operator's reserve.
+    from sglang.srt.managers.corridor_guard import (
+        corridor_floor_for_current_device,
+    )
     from sglang.srt.managers.vram_dial import corridor_law_floor_bytes
 
-    return int(corridor_law_floor_bytes())
+    try:
+        return int(corridor_floor_for_current_device().mib) * (1 << 20)
+    except Exception:  # pragma: no cover - diagnosis path, never fatal
+        return int(corridor_law_floor_bytes())
 
 
 def describe(reserve: SeamReserve, path: str) -> str:

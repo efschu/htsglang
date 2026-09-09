@@ -59,7 +59,7 @@ LOG_PREFIX = "VRAM-DIAL"
 MIB = 1024 * 1024
 
 
-def corridor_law_floor_bytes() -> int:
+def corridor_law_floor_bytes(card_uuid: str = "", group: Optional[str] = None) -> int:
     """The user's corridor law in bytes, read from ``CorridorGuard``.
 
     #658, register C18: THE DIAL AND THE GUARD MUST NOT CARRY TWO FLOORS.
@@ -74,10 +74,52 @@ def corridor_law_floor_bytes() -> int:
     in this module would be a second source of truth, and the one thing this
     chain has repeatedly proved is that two constants that must agree
     eventually do not.
+
+    #1257c / REFUTER FINDING 6 (2026-09-09): THE FLOOR IS NO LONGER A RIG-WIDE
+    CONSTANT, so importing the constant became exactly the second-floor defect
+    this function's own docstring forbids. On this rig the guard says 858 on
+    one card and 1097 on another while the flat import kept saying 1024 --
+    short on one card and over-reserving on the other, both silently. Given a
+    ``card_uuid`` this now takes the SAME derivation every other consumer takes
+    (``corridor_floor_mib``): the awake group's measured transient plus the
+    operator's reserve for that card.
+
+    ``card_uuid=""`` keeps the flat fallback, because a caller with no card
+    identity cannot honestly ask for a per-card number -- and that fallback IS
+    ``DEFAULT_FLOOR_MIB``, the same value ``UNMEASURED-FALLBACK`` returns, so
+    the two paths can never disagree.
+
+    THE FLOOR, NOT THE VERDICT FLOOR. This term reserves bytes that must stay
+    free; the -20 % band under an unmeasured law is a grading tolerance for a
+    verdict, not a licence to plan a KV ceiling 205 MiB deeper into the card.
     """
     from sglang.srt.managers.corridor_guard import DEFAULT_FLOOR_MIB
 
-    return int(DEFAULT_FLOOR_MIB) * MIB
+    if not card_uuid:
+        return int(DEFAULT_FLOOR_MIB) * MIB
+    try:
+        from sglang.srt.managers.corridor_guard import (
+            corridor_floor_mib,
+            user_reserve_by_card,
+        )
+
+        floor = corridor_floor_mib(
+            card_uuid,
+            group=group,
+            user_reserve_mib=user_reserve_by_card().get(card_uuid, 0),
+        )
+        logger.info("%s %s", LOG_PREFIX, floor.line)
+        return int(floor.mib) * MIB
+    except Exception as e:  # pragma: no cover - the floor must not break a dial
+        logger.warning(
+            "%s corridor floor for card %s underivable (%s); falling back to "
+            "the stated law %d MiB",
+            LOG_PREFIX,
+            card_uuid,
+            e,
+            int(DEFAULT_FLOOR_MIB),
+        )
+        return int(DEFAULT_FLOOR_MIB) * MIB
 
 
 class KvCapacityError(RuntimeError):
@@ -1022,7 +1064,11 @@ def _measure_local_floor_bytes(participants: List[DialParticipant]) -> tuple:
     # names an ABSOLUTE budget, which is precisely the moment an external
     # tenant is taking bytes off this card and the law is what protects
     # serving.
-    law = corridor_law_floor_bytes()
+    # #1257c: PER CARD. ``uuid`` is resolved four lines above, so this call
+    # site has the card identity the derivation needs -- there is no reason
+    # for the dial to spend against a rig-wide number when the guard grades
+    # this very card against a different one.
+    law = corridor_law_floor_bytes(uuid)
     floor = used - backed + law
     if floor <= 0:
         raise KvCapacityError(

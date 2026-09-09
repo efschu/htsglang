@@ -197,7 +197,7 @@ class ArmReport:
     band_mib: Tuple[int, int] = (0, 0)
     #: #1257c: ``{nvml index: (floor MiB, source)}`` read back off the front's
     #: own CORRIDOR line. Empty on a pre-#1257c log.
-    floors: Dict[int, Tuple[int, str]] = field(default_factory=dict)
+    floors: Dict[int, "ring_table.FrontFloor"] = field(default_factory=dict)
     problems: List[str] = field(default_factory=list)
     #: #1257c: things worth saying that are NOT failures. The upper band edge
     #: lives here by user decision (2026-09-09, consequence 5).
@@ -209,11 +209,19 @@ class ArmReport:
 
     def report(self) -> str:
         floor, ceil = self.band_mib
+        # floor/verdict_floor per card: the two numbers are DIFFERENT under an
+        # unmeasured fallback (1024 and 819) and the arm grades on the second,
+        # so printing only the first made the summary unreadable against the
+        # problems below it (refuter finding 1).
+        floors_txt = ", ".join(
+            f"nvml{i}={f.floor_mib}/{f.verdict_floor_mib}({f.source})"
+            for i, f in sorted(self.floors.items())
+        )
         head = (
             f"WEG2-CORRIDOR-ARM log={self.path} instrument={self.instrument} "
             f"samples={self.samples} prose_mentions={self.prose_mentions} "
             f"band={floor}-{ceil}MiB(allocatable free) "
-            f"floors={{{', '.join(f'nvml{i}={m}({s})' for i, (m, s) in sorted(self.floors.items()))}}} "
+            f"floors={{{floors_txt}}} "
             f"findings={len(self.findings)} "
             f"verdict={'PASS' if self.ok else 'FAIL'}"
         )
@@ -343,13 +351,22 @@ def arm_report(
                 continue
             for idx, mib in sorted(unit.allocatable.items()):
                 got = rep.floors.get(idx)
-                floor = got[0] if got else band_floor
-                source = got[1] if got else "PRE-1257C-BAND"
-                if mib < floor:
+                floor = got.floor_mib if got else band_floor
+                source = got.source if got else "PRE-1257C-BAND"
+                # REFUTER FIX 1: BELOW is graded against the VERDICT floor,
+                # which is what the front's own ``verdict=`` on that same line
+                # is graded against. Grading it against ``floor=`` made this
+                # arm and the front contradict each other on every unmeasured
+                # card between 819 and 1023 MiB -- a window that PASSED
+                # pre-#1257c under the rig-wide 819-1229 band and that an
+                # UNMEASURED fallback floor must never fail (consequence 3:
+                # an unpriced floor is a verdict, never an actuation).
+                verdict_floor = got.verdict_floor_mib if got else band_floor
+                if mib < verdict_floor:
                     rep.problems.append(
                         f"phase={phase} nvml{idx} minimum {mib} MiB (allocatable "
-                        f"free) is BELOW its corridor floor of {floor} MiB "
-                        f"(source={source})"
+                        f"free) is BELOW its corridor verdict floor of "
+                        f"{verdict_floor} MiB (floor={floor} source={source})"
                     )
                 # NOT gated on the log carrying a floor= token. The finding is
                 # graded against whatever floor is IN FORCE, and on a

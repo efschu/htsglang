@@ -585,20 +585,18 @@ def _seam_staging_reserve_bytes(server_args) -> int:
     supposed to respect.
     """
     try:
-        from sglang.srt.managers.corridor_guard import corridor_floor_mib
+        # #1257c / REFUTER FINDINGS 6 AND 9 (2026-09-09): the ONE rank-local
+        # door. This resolved its own uuid inline and read the reserve off a
+        # ServerArgs scalar, which is a third way of asking the same question
+        # -- and the scalar is per-RANK where the reserve is per-CARD, so two
+        # co-located ranks could reach different floors from the same law.
+        # ``corridor_floor_for_current_device`` takes the card-level reserve
+        # from the one published mapping, so there is no rank term left.
+        from sglang.srt.managers.corridor_guard import (
+            corridor_floor_for_current_device,
+        )
 
-        reserve_mib = 0
-        scalar = getattr(server_args, "user_reserve_mib_scalar", None)
-        if callable(scalar):
-            reserve_mib = int(scalar())
-        uuid = ""
-        try:
-            from sglang.srt.registry import nvml as registry_nvml
-
-            uuid = registry_nvml.current_device_uuid() or ""
-        except Exception:  # pragma: no cover - NVML availability
-            uuid = ""
-        floor = corridor_floor_mib(uuid, user_reserve_mib=reserve_mib)
+        floor = corridor_floor_for_current_device()
         floor_mib = int(floor.verdict_floor_mib)
     except Exception:  # pragma: no cover - the floor must never break a boot
         from sglang.srt.managers.corridor_guard import (

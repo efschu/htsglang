@@ -352,11 +352,49 @@ def corridor_band_mib():
 # consumer may turn "above the ceiling" into a failed verdict on its own.
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# REFUTER FIX 5 (2026-09-09): THE FLOOR'S MEASURED TERM AND ITS VERDICT ARE IN
+# DIFFERENT UNITS, AND THE LINE NOW SAYS SO.
+#
+# The measured transient is ``activation_delta_bytes`` -- a TORCH CACHING
+# ALLOCATOR high-water delta across the probe bracket (``activation_probe``).
+# The verdict (``free_mib < verdict_floor``) and the budget cut are both
+# graded in NVML FREE bytes. A true allocator peak catches every spike inside
+# its bracket, so this is NOT sampler-cadence blindness -- but it is blind to
+# everything the allocator never sees: the CUDA context, BAR1/mapping windows,
+# NCCL and cuBLAS workspaces, and any non-torch allocation on the card.
+#
+# CONSEQUENCE, AND IT IS THE DANGEROUS DIRECTION: a floor built from allocator
+# bytes and enforced on NVML bytes is a LOWER BOUND on the real requirement,
+# systematically low by an unmeasured amount. Too low a floor buys too small a
+# cut, which leaves LESS free VRAM than the transient actually needs. The tree
+# already knows the gap exists and has never priced it: ``D_AWAKE_OVERSHOOT_MIB
+# = 404`` in the Weg-2 launcher is a cross-boot constant that exists precisely
+# because that consumption "sits outside the fraction".
+#
+# NOT COMPENSATED HERE. Adding a margin would be a hand number, which this
+# slice exists to remove. It is DECLARED instead: every floor line carries
+# ``basis=``, and the gap between the two units is an open UNPROVEN item, not
+# a silent assumption.
+#: The transient came from a torch allocator high-water delta and is enforced
+#: on NVML free. A LOWER BOUND -- see the block above.
+BASIS_ALLOC_DELTA = "torch-alloc-delta(NVML-lower-bound)"
+#: The transient is a number an operator typed. No unit question, no measurement.
+BASIS_HAND_SET = "hand-set"
+#: The transient is the stated law nobody measured. Verdict-only by construction.
+BASIS_STATED_LAW = "stated-law"
+
 #: The transient term came from the env override (:data:`LAW_ENV`). Actuating:
 #: an operator who moves the law by hand has priced it by hand.
 FLOOR_SOURCE_ENV = "ENV-OVERRIDE"
 #: The transient term is 1024 and nobody measured it. VERDICT-ONLY.
 FLOOR_SOURCE_FALLBACK = "UNMEASURED-FALLBACK"
+
+#: The dump layer's name for the other half of the same ambiguity: one
+#: filename, two digests. Quoted (never re-declared) by
+#: :func:`digest_group_collision`, which refuses the mirror -- one digest, two
+#: groups -- so an operator grepping either half finds both.
+PHASE_FOOTPRINT_COLLISION_NAME = "W18 Weg2PhaseFootprintCollision"
 
 
 def corridor_ceiling_for_floor_mib(floor_mib: int) -> int:
@@ -379,6 +417,69 @@ def unmobilised_free_mib(free_mib: int, floor_mib: int) -> int:
     return max(0, int(free_mib) - corridor_ceiling_for_floor_mib(floor_mib))
 
 
+#: Every measured source token starts with this. Declared so the two readers
+#: of "is this measured" (:attr:`CorridorFloor.measured` and
+#: :func:`verdict_floor_for_mib`, which grades a floor recovered from a LOG
+#: LINE and has no object) test the same prefix instead of two literals.
+MEASURED_SOURCE_PREFIX = "MEASURED-"
+
+#: The only group tags a floor may be keyed by. Weg-2 has exactly two phases
+#: and the store has exactly two digests; anything else cannot resolve.
+CANONICAL_GROUPS = ("P", "D")
+
+#: What :func:`normalise_group` returns for a tag it will not accept. No
+#: digest is ever published under it, so it can only ever reach the fallback.
+GROUP_UNKNOWN = "?"
+
+
+def normalise_group(group) -> str:
+    """The CANONICAL group tag. ``"D(dry, expectation)"`` -> ``"D"``.
+
+    REFUTER FIX 2 (2026-09-09). The group was a KEY in one place
+    (:func:`_published_digest` looks the digest up by it) and a free-form
+    LABEL in another: ``launcher.budgets_from_dc`` passes its ``label``
+    straight through, and one call site passes ``"D(dry, expectation)"`` while
+    the other passes ``"D"``. Both resolved to the fallback today, so the two
+    budgets agreed BY ACCIDENT; the day D is measured the dry pass would read
+    ``UNMEASURED-FALLBACK`` and the real pass ``MEASURED-D``, and the launcher
+    would hold two different budgets for one group with nothing saying so.
+
+    The rule is deliberately narrow: the LEADING RUN OF LETTERS, upper-cased,
+    and only if that run is a canonical group. A decorated label
+    (``"D(dry, expectation)"``, ``"P-warm"``) keys the same floor as its bare
+    group; anything that is not a group (``"decode"``, ``""``, ``None``)
+    becomes :data:`GROUP_UNKNOWN` rather than being upper-cased and passed on
+    to a lookup that would silently miss.
+    """
+    raw = str(group or "").strip().upper()
+    head = ""
+    for ch in raw:
+        if not ch.isalpha():
+            break
+        head += ch
+    return head if head in CANONICAL_GROUPS else GROUP_UNKNOWN
+
+
+_WARNED_UNKNOWN_GROUPS: set = set()
+
+
+def _warn_unknown_group(asked) -> None:
+    """Say ONCE that a tag will never resolve a measured floor."""
+    key = str(asked)
+    if key in _WARNED_UNKNOWN_GROUPS:
+        return
+    _WARNED_UNKNOWN_GROUPS.add(key)
+    logger.warning(
+        "CORRIDOR-FLOOR group tag %r is not one of %s, so no measured "
+        "transient can be attributed to it and this card falls back to the "
+        "stated law. A decorated label (%r) keys its bare group; a tag that "
+        "is not a group does not.",
+        asked,
+        list(CANONICAL_GROUPS),
+        "D(dry, expectation)",
+    )
+
+
 def measured_floor_source(group: str) -> str:
     """``MEASURED-P`` / ``MEASURED-D`` -- the source token for a measured peak.
 
@@ -388,8 +489,24 @@ def measured_floor_source(group: str) -> str:
     tell a P-derived floor graded against D-awake free -- a scope error -- from
     a correct pairing.
     """
-    tag = str(group or "").strip().upper() or "?"
-    return f"MEASURED-{tag}"
+    return f"{MEASURED_SOURCE_PREFIX}{normalise_group(group)}"
+
+
+def verdict_floor_for_mib(floor_mib: int, source: str) -> int:
+    """The BELOW threshold for a floor known only as ``(number, source)``.
+
+    REFUTER FIX 1 (2026-09-09). :attr:`CorridorFloor.verdict_floor_mib` is the
+    same rule with an object in hand; this is the rule for a consumer that
+    recovered a floor from a LOG LINE (``corridor_arm`` reading a front log).
+    ONE rule, two entry points -- the pre-fix tree had the arm grade against
+    the FLOOR while the front printed its verdict against the VERDICT FLOOR,
+    so a card at 852 MiB under an unmeasured 1024 read ``verdict=IN`` on one
+    line and "BELOW its corridor floor" on the next.
+    """
+    f = max(0, int(floor_mib))
+    if str(source or "").startswith(MEASURED_SOURCE_PREFIX):
+        return f
+    return int(f - f * CORRIDOR_BAND_FRACTION)
 
 
 #: Pointer file: ``{"hw_fingerprint": str, "groups": {"P": digest, ...}}``.
@@ -419,6 +536,31 @@ GROUP_ENV = "SGLANG_WEG2_GROUP"
 USER_RESERVE_ENV = "SGLANG_WEG2_USER_RESERVE_MIB_BY_CARD"
 
 
+def user_reserve_by_card() -> Dict[str, int]:
+    """``{card_uuid: MiB}`` of operator-reserved headroom. THE reader.
+
+    REFUTER FINDING 6 (2026-09-09). ``weg2.front`` had the only reader of
+    :data:`USER_RESERVE_ENV`, so a second consumer of the derived floor
+    (``vram_dial``) had no way to see the reserve without restating the
+    parse. Declared beside the variable it reads: a malformed value is NO
+    reserve and says so, never a guessed number.
+    """
+    raw = os.environ.get(USER_RESERVE_ENV)
+    if not raw:
+        return {}
+    try:
+        import json
+
+        return {str(k): max(0, int(v)) for k, v in json.loads(raw).items()}
+    except Exception:  # noqa: BLE001 - a malformed hint is no reserve, loudly
+        logger.warning(
+            "WEG2-CORRIDOR %s=%r is unreadable; reserve read as 0",
+            USER_RESERVE_ENV,
+            raw,
+        )
+        return {}
+
+
 def _floor_digest_path() -> str:
     override = os.environ.get(FLOOR_DIGEST_FILE_ENV)
     if override:
@@ -440,8 +582,8 @@ def publish_floor_profile(group: str, profile, hw_fingerprint: Optional[str]) ->
     because a rig that cannot write it simply reads UNMEASURED-FALLBACK, which
     is verdict-only and therefore safe.
     """
-    tag = str(group or "").strip().upper()
-    if not tag or not hw_fingerprint:
+    tag = normalise_group(group)
+    if tag == GROUP_UNKNOWN or not hw_fingerprint:
         return None
     try:
         import json
@@ -474,25 +616,65 @@ def publish_floor_profile(group: str, profile, hw_fingerprint: Optional[str]) ->
         return None
 
 
-def _published_digest(group: str) -> Tuple[Optional[str], Optional[str]]:
-    """``(hw_fingerprint, profile_digest)`` for ``group``, or ``(None, None)``."""
+def _published_groups() -> Tuple[Optional[str], Dict[str, str]]:
+    """``(hw_fingerprint, {group: digest})`` from the pointer file."""
     try:
         import json
 
         path = _floor_digest_path()
         if not os.path.exists(path):
-            return None, None
+            return None, {}
         with open(path, "r", encoding="utf-8") as fh:
             raw = json.load(fh) or {}
-        tag = str(group or "").strip().upper()
-        digest = (raw.get("groups") or {}).get(tag)
         fp = raw.get("hw_fingerprint")
-        if not digest or not fp:
-            return None, None
-        return str(fp), str(digest)
+        groups = {
+            str(k): str(v) for k, v in (raw.get("groups") or {}).items() if v
+        }
+        return (str(fp) if fp else None), groups
     except Exception as exc:  # pragma: no cover
         logger.debug("corridor floor digest unreadable: %s", exc)
+        return None, {}
+
+
+def digest_group_collision(digest: str, tag: str) -> Optional[str]:
+    """The OTHER canonical groups that published this same digest, or ``None``.
+
+    REFUTER FIX 3 (2026-09-09). THE STORE IS KEYED BY DIGEST AND THE GROUP
+    PICKS THE DIGEST -- after that the group plays no part.
+    ``profile_from_server_args`` carries no phase field, so if P and D ever
+    agree on (arch, chunked_prefill_size, tp, pp, kv_dtype, spec_draft_tokens,
+    decode_max_bs) they compute the SAME digest, both write the SAME cache
+    file, and whoever ingested last owns the bytes. D's floor would then be
+    P's prefill peak stamped ``MEASURED-D``, ``actuates=yes``, and it would
+    CUT a budget -- the exact scope error ``measured_floor_source`` says a
+    reader must be able to see.
+
+    The dump layer already refuses the mirror of this by name
+    (``activation_probe`` / ``W18 Weg2PhaseFootprintCollision``); this is the
+    same refusal at the cache/floor layer. An ambiguous digest resolves to
+    UNMEASURED-FALLBACK for EVERY group sharing it -- not just the second one
+    -- because the file cannot say whose bytes it holds, and verdict-only is
+    the safe direction.
+    """
+    if not digest:
+        return None
+    _fp, groups = _published_groups()
+    others = sorted(
+        g
+        for g, d in groups.items()
+        if d == digest and normalise_group(g) != normalise_group(tag)
+    )
+    return ",".join(others) if others else None
+
+
+def _published_digest(group: str) -> Tuple[Optional[str], Optional[str]]:
+    """``(hw_fingerprint, profile_digest)`` for ``group``, or ``(None, None)``."""
+    fp, groups = _published_groups()
+    tag = normalise_group(group)
+    digest = groups.get(tag)
+    if not digest or not fp:
         return None, None
+    return str(fp), str(digest)
 
 
 @dataclass(frozen=True)
@@ -511,6 +693,7 @@ class CorridorFloor:
     reserve_mib: int
     source: str
     provenance: str = ""
+    basis: str = BASIS_STATED_LAW
 
     @property
     def mib(self) -> int:
@@ -558,11 +741,12 @@ class CorridorFloor:
 
     @property
     def verdict_floor_mib(self) -> int:
-        """Below this is a breach. No tolerance under a MEASURED peak."""
-        if self.measured:
-            return self.mib
-        law = self.mib
-        return int(law - law * CORRIDOR_BAND_FRACTION)
+        """Below this is a breach. No tolerance under a MEASURED peak.
+
+        Delegates so that this object and a floor recovered from a log line
+        (:func:`verdict_floor_for_mib`) can never grade differently.
+        """
+        return verdict_floor_for_mib(self.mib, self.source)
 
     @property
     def ceiling_mib(self) -> int:
@@ -576,7 +760,8 @@ class CorridorFloor:
             f"CORRIDOR-FLOOR card={self.card_uuid} group={self.group} "
             f"floor={self.mib} verdict_floor={self.verdict_floor_mib} "
             f"ceiling={self.ceiling_mib} transient={self.transient_mib} "
-            f"source={self.source} reserve={self.reserve_mib} "
+            f"source={self.source} basis={self.basis} "
+            f"reserve={self.reserve_mib} "
             f"actuates={'yes' if self.actuates else 'no'} "
             f"reason={self.reason} provenance={self.provenance or '(none)'}"
         )
@@ -611,6 +796,24 @@ def _resolve_transient_mib(
                 f"no activation profile published for group {group!r} at "
                 f"{_floor_digest_path()!r}"
             )
+    if digest is None and profile is not None:
+        try:
+            digest = _act.profile_key(profile)
+        except Exception:  # pragma: no cover - profile shape
+            digest = None
+    # REFUTER FIX 3: the digest must belong to exactly ONE group, on BOTH
+    # paths -- the boot owns a real profile and still reads a cache file the
+    # other group may have written under the same key. An ambiguous digest is
+    # refused rather than attributed, and the refusal names the sharers.
+    shared = digest_group_collision(digest, group) if digest else None
+    if shared:
+        return None, (
+            f"profile digest {digest} is published by groups {shared} as well "
+            f"as {normalise_group(group)}, so the one activation store cannot "
+            f"attribute its bytes to a group (the same ambiguity "
+            f"{PHASE_FOOTPRINT_COLLISION_NAME} refuses at the dump layer); "
+            f"refusing to stamp another group's transient as this one's"
+        )
     if not fp:
         try:
             from sglang.srt.mem_ledger.calibration import live_fingerprint
@@ -668,7 +871,17 @@ def corridor_floor_mib(
     how the front and the launcher read the same measurement without restating
     the profile.
     """
-    tag = str(group or os.environ.get(GROUP_ENV) or "").strip().upper() or "?"
+    # REFUTER FIX 2: canonical, so a decorated label ("D(dry, expectation)")
+    # and its bare group ("D") key ONE floor. A tag that is not a group
+    # becomes GROUP_UNKNOWN, under which no digest is ever published, so it
+    # reaches the fallback instead of silently missing a lookup.
+    asked = group if group is not None else os.environ.get(GROUP_ENV)
+    tag = normalise_group(asked)
+    if tag == GROUP_UNKNOWN and str(asked or "").strip():
+        # LOUD, ONCE PER TAG. A tag that is not a group cannot resolve a
+        # measured floor and would otherwise fail as a silent fallback --
+        # indistinguishable from "nobody has measured this rig yet".
+        _warn_unknown_group(asked)
     reserve = max(0, int(user_reserve_mib or 0))
 
     raw = os.environ.get(LAW_ENV)
@@ -681,6 +894,7 @@ def corridor_floor_mib(
                 reserve_mib=reserve,
                 source=FLOOR_SOURCE_ENV,
                 provenance=f"{LAW_ENV}={raw}",
+                basis=BASIS_HAND_SET,
             )
         except (TypeError, ValueError):
             pass  # a malformed override is the fallback, exactly as before
@@ -696,6 +910,7 @@ def corridor_floor_mib(
             reserve_mib=reserve,
             source=measured_floor_source(tag),
             provenance=why,
+            basis=BASIS_ALLOC_DELTA,
         )
     return CorridorFloor(
         card_uuid=card_uuid,
@@ -704,6 +919,7 @@ def corridor_floor_mib(
         reserve_mib=reserve,
         source=FLOOR_SOURCE_FALLBACK,
         provenance=f"{why}; falling back to the stated law {CORRIDOR_LAW_MIB} MiB",
+        basis=BASIS_STATED_LAW,
     )
 
 
@@ -734,6 +950,41 @@ def corridor_floors_for_cards(
             uuid, group=group, user_reserve_mib=reserve, **kw
         )
     return out
+
+
+def corridor_floor_for_current_device(group: Optional[str] = None) -> CorridorFloor:
+    """The derived floor for the card THIS process is on. ONE rank-local door.
+
+    REFUTER FINDINGS 6 AND 9 (2026-09-09). Three rank-local consumers
+    (``kv_vmm_backing``'s allocator preempt, ``phase_flip_seam_reserve``,
+    ``phase_flip_runtime``) each needed "the floor for my card" and each did
+    something different about it: two imported the flat ``DEFAULT_FLOOR_MIB``
+    and the third resolved its own uuid inline. That is three readers of one
+    law, which is the defect ``vram_dial``'s own docstring names.
+
+    RANK-UNIFORM BY CONSTRUCTION, and this is the part worth stating. The
+    floor is a pure function of (card uuid, group, reserve, store, env), and
+    every one of those is a CARD- or GROUP-level quantity: two ranks
+    co-located on one card resolve the same uuid, read the same
+    :data:`GROUP_ENV`, read the same :data:`USER_RESERVE_ENV`, and open the
+    same store file. There is no rank term anywhere in the derivation and no
+    entry point that takes one. What this does NOT do is DETECT a disagreement
+    that arose anyway (a store file half-written under one rank, say) -- that
+    needs a group collective and a boot, and it is named in UNPROVEN rather
+    than faked here.
+    """
+    uuid = ""
+    try:
+        from sglang.srt.registry import nvml as registry_nvml
+
+        uuid = registry_nvml.current_device_uuid() or ""
+    except Exception as exc:  # pragma: no cover - NVML availability
+        logger.debug("current device uuid unavailable for the floor: %s", exc)
+    return corridor_floor_mib(
+        uuid,
+        group=group,
+        user_reserve_mib=user_reserve_by_card().get(uuid, 0),
+    )
 
 
 #: #826: OPT-IN ADOPTION OF THE SOLVED ARMING FLOOR.

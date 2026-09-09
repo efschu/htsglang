@@ -367,6 +367,45 @@ def _resolved_world_pool(
     return pool, None
 
 
+def installed_cut_line(
+    cf: CorridorFloor,
+    *,
+    cut_mib: int,
+    pool_before,
+    pool_after,
+    vector,
+    binder,
+) -> str:
+    """THE CUT LINE, emitted only where a cut was INSTALLED (#1257c).
+
+    It names the actuating term, both pool figures and the binder, so the
+    operator can read what the margin cost without reconstructing it from
+    three other lines.  ``kein-bindender-rang``: a cut that made a rank the
+    binder never reaches here -- it is refused above by name -- and the price
+    of the one that did happen is printed rather than hidden.
+
+    REFUTER FIX 4 (2026-09-09): ``measured_peak=`` may only ever carry a
+    number somebody MEASURED.  It printed ``cf.transient_mib``
+    unconditionally, so a cut installed for ``reason=user-reserve`` on an
+    UNMEASURED-FALLBACK floor read ``measured_peak=1024`` for a number nobody
+    measured -- flatly contradicting the ``provenance=`` field printed beside
+    it.  ``n/a`` where the transient is a fallback or a hand-set law, and
+    ``basis=`` says what the number IS wherever there is one.
+
+    A FUNCTION, not an f-string inside the solve, so the acceptance can
+    exercise the REAL producer instead of a restatement of it.
+    """
+    return (
+        f"WEG2-BUDGET corridor-constrained card={cf.card_uuid} INSTALLED "
+        f"cut_mib={int(cut_mib)} reason={cf.reason} "
+        f"floor={cf.mib} source={cf.source} reserve={cf.reserve_mib} "
+        f"pool_before={pool_before} pool_after={pool_after} vector={vector} "
+        f"binder={binder} "
+        f"measured_peak={cf.transient_mib if cf.measured else 'n/a'} "
+        f"basis={cf.basis} provenance={cf.provenance}"
+    )
+
+
 def floors_for_cards(
     cards: Sequence,
     group: str,
@@ -620,14 +659,15 @@ def solve_corridor_budgets(
         # and the price of the one that did happen is printed rather than
         # hidden.
         if verdict == "APPLIED":
-            cut_mib = budgets[i] - working[i]
             lines.append(
-                f"WEG2-BUDGET corridor-constrained card={card.uuid} INSTALLED "
-                f"cut_mib={cut_mib} reason={cf.reason} "
-                f"floor={cf.mib} source={cf.source} reserve={cf.reserve_mib} "
-                f"pool_before={pool0} pool_after={pool1} vector={vec} "
-                f"binder={binder1} measured_peak={cf.transient_mib} "
-                f"provenance={cf.provenance}"
+                installed_cut_line(
+                    cf,
+                    cut_mib=budgets[i] - working[i],
+                    pool_before=pool0,
+                    pool_after=pool1,
+                    vector=vec,
+                    binder=binder1,
+                )
             )
     lines.append(
         f"WEG2-BUDGET corridor-constrained group={group} SOURCE={sample.provenance} "

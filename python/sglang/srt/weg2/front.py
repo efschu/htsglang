@@ -68,6 +68,7 @@ from aiohttp import (
     web,
 )
 
+from sglang.srt.managers import corridor_guard
 from sglang.srt.managers.corridor_guard import (
     corridor_band_ceiling_mib,
     corridor_band_floor_mib,
@@ -1057,14 +1058,14 @@ RESERVE_ENV = USER_RESERVE_ENV
 
 
 def _reserve_by_card() -> Dict[str, int]:
-    raw = os.environ.get(RESERVE_ENV)
-    if not raw:
-        return {}
-    try:
-        return {str(k): max(0, int(v)) for k, v in json.loads(raw).items()}
-    except Exception:  # noqa: BLE001 - a malformed hint is no reserve, loudly
-        logger.warning("WEG2-CORRIDOR %s=%r is unreadable; reserve read as 0", RESERVE_ENV, raw)
-        return {}
+    """Delegates to ``corridor_guard.user_reserve_by_card`` -- ONE reader.
+
+    REFUTER FINDING 6: this parse used to live here alone, which is why a
+    second consumer of the derived floor (``vram_dial``) could not see the
+    reserve at all.  The variable is declared in ``corridor_guard`` beside the
+    floor it raises, so its reader belongs there too.
+    """
+    return corridor_guard.user_reserve_by_card()
 
 
 def corridor_floor_for_card(card_uuid: str, group: str):
@@ -4094,7 +4095,17 @@ class Front:
         floors = {c.uuid: corridor_floor_for_card(c.uuid, phase) for c in cards}
         per_card = " ".join(
             f"nvml{c.nvml_index}:free={c.free_mib}MiB reserved={c.reserved_mib}MiB "
-            f"floor={floors[c.uuid].mib}MiB source={floors[c.uuid].source} "
+            f"floor={floors[c.uuid].mib}MiB "
+            # REFUTER FIX 1: the number the VERDICT on this same line is
+            # graded against, printed BESIDE the floor it is derived from.
+            # Pre-fix the segment carried only ``floor=`` while ``verdict=``
+            # was graded against ``verdict_floor_mib``, and ``corridor_arm``
+            # -- reading this very line back -- graded against the ``floor=``
+            # it could see. Under an unmeasured 1024 (verdict floor 819) a
+            # card at 852 MiB therefore printed ``verdict=IN`` here and was
+            # failed as BELOW by the arm off the same token.
+            f"verdict_floor={floors[c.uuid].verdict_floor_mib}MiB "
+            f"source={floors[c.uuid].source} "
             f"reserve={floors[c.uuid].reserve_mib}MiB "
             f"verdict={corridor_verdict(c.free_mib, floors[c.uuid])}"
             + (

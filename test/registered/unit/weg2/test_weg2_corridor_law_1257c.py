@@ -338,7 +338,8 @@ class TheActuationGate(unittest.TestCase):
                 "pool_after=",
                 "vector=",
                 "binder=",
-                "measured_peak=",
+                "measured_peak=900",
+                "basis=",
                 "provenance=",
                 "source=MEASURED-D",
             ):
@@ -485,9 +486,11 @@ class TheSharedSurfaces(unittest.TestCase):
         line = (
             "WEG2-CORRIDOR phase=D(awake) epoch=3 "
             "instrument=nvml_v2_free,allocatable band=819-1266MiB "
-            "nvml0:free=1095MiB reserved=425MiB floor=1097MiB source=MEASURED-P "
+            "nvml0:free=1095MiB reserved=425MiB floor=1097MiB "
+            "verdict_floor=1097MiB source=MEASURED-P "
             "reserve=0MiB verdict=BELOW "
-            "nvml1:free=474MiB reserved=518MiB floor=1055MiB source=MEASURED-P "
+            "nvml1:free=474MiB reserved=518MiB floor=1055MiB "
+            "verdict_floor=1055MiB source=MEASURED-P "
             "reserve=0MiB verdict=BELOW\n"
         )
         with tempfile.NamedTemporaryFile("w", suffix=".log", delete=False) as fh:
@@ -495,7 +498,13 @@ class TheSharedSurfaces(unittest.TestCase):
             path = fh.name
         self.addCleanup(os.unlink, path)
         got = ring_table.parse_front_corridor_floors(path)
-        self.assertEqual(got, {0: (1097, "MEASURED-P"), 1: (1055, "MEASURED-P")})
+        self.assertEqual(
+            got,
+            {
+                0: ring_table.FrontFloor(1097, "MEASURED-P", 1097),
+                1: ring_table.FrontFloor(1055, "MEASURED-P", 1055),
+            },
+        )
 
     def test_a_pre_1257c_log_yields_no_floor_and_says_nothing_false(self):
         from sglang.srt.weg2 import ring_table
@@ -593,14 +602,512 @@ class TheDocumentedNumbersAreGrepable(unittest.TestCase):
         self.assertRegex(
             f.line,
             r"^CORRIDOR-FLOOR card=\S+ group=\S+ floor=\d+ verdict_floor=\d+ "
-            r"ceiling=\d+ transient=\d+ source=\S+ reserve=\d+ actuates=(yes|no) "
-            r"reason=\S+ provenance=",
+            r"ceiling=\d+ transient=\d+ source=\S+ basis=\S+ reserve=\d+ "
+            r"actuates=(yes|no) reason=\S+ provenance=",
         )
 
     def test_every_new_line_is_english_and_has_no_emoji(self):
         f = cg.CorridorFloor(C5090, "P", 1055, 0, "MEASURED-P")
         self.assertTrue(all(ord(ch) < 128 for ch in f.line), f.line)
         self.assertIsNone(re.search(r"[^\x00-\x7f]", f.line))
+
+
+
+
+def _cut_line(floor, cut_mib):
+    """THE SHIPPED producer of the INSTALLED line, not a restatement of it."""
+    return cb.installed_cut_line(
+        floor,
+        cut_mib=cut_mib,
+        pool_before=700000,
+        pool_after=699000,
+        vector=(32, 18, 14),
+        binder=1,
+    )
+
+
+class RefuterFixOneAuthorityOnTheVerdictFloor(unittest.TestCase):
+    """MUST FIX 1: the front line and the arm grade against the SAME number.
+
+    THE DEFECT, in the refuter's own case. The front printed ``floor=`` (the
+    FLOOR) and graded ``verdict=`` against ``verdict_floor_mib``; the arm read
+    the ``floor=`` token back and graded ``mib < floor``. Under an unmeasured
+    1024 (verdict floor 819) a card at 852 MiB free therefore printed
+    ``verdict=IN`` on the front line and was appended to ``problems`` as BELOW
+    off that same line -- a self-contradictory log, a FAILED acceptance from
+    an UNMEASURED fallback (which consequence 3 forbids), and a regression in
+    the 819-1023 window that passed pre-#1257c under the rig-wide band.
+    """
+
+    BASE = (
+        "[2026-09-09T09:00:00Z] INFO weg2.front: WEG2-CORRIDOR phase=D(awake) "
+        "epoch=0 instrument=nvml_v2_free,allocatable band=819-1229MiB "
+    )
+
+    def _card(self, i, free, floor, vfloor, source, verdict, reserved=425):
+        return (
+            f"nvml{i}:free={free}MiB reserved={reserved}MiB floor={floor}MiB "
+            f"verdict_floor={vfloor}MiB source={source} reserve=0MiB "
+            f"verdict={verdict} "
+        )
+
+    def _log(self, *cards, minima=""):
+        with tempfile.NamedTemporaryFile("w", suffix=".log", delete=False) as fh:
+            fh.write(self.BASE + "".join(cards) + minima + "\n")
+            path = fh.name
+        self.addCleanup(os.unlink, path)
+        return path
+
+    def test_the_front_segment_prints_the_number_its_verdict_uses(self):
+        """Both numbers on the line, so the reader need not re-derive one."""
+        import inspect
+
+        from sglang.srt.weg2 import front
+
+        src = inspect.getsource(front.Front.corridor_sample)
+        self.assertIn("verdict_floor=", src)
+        self.assertIn("floor=", src)
+        # and the two are DIFFERENT attributes, not the same one twice
+        self.assertIn("verdict_floor_mib", src)
+
+    def test_an_unmeasured_fallback_does_not_fail_an_852_mib_card(self):
+        """Consequence 3 at the ARM: verdict-only means it cannot fail a boot.
+
+        852 MiB is the exact figure in the arm suite's own ``POST_FIX_LINE``
+        and it passed the pre-#1257c 819-1229 band.
+        """
+        from sglang.srt.weg2 import corridor_arm
+
+        path = self._log(
+            self._card(2, 852, 1024, 819, cg.FLOOR_SOURCE_FALLBACK, "IN"),
+            minima="min_so_far={2: 852} (nvml_v2_free,allocatable, MiB)",
+        )
+        rep = corridor_arm.arm_report(path, require_in_band=True)
+        self.assertTrue(rep.ok, rep.problems)
+
+    def test_a_measured_peak_still_fails_below_it(self):
+        """No tolerance under a MEASURED peak -- the fix must not soften that."""
+        from sglang.srt.weg2 import corridor_arm
+
+        path = self._log(
+            self._card(2, 852, 1055, 1055, "MEASURED-P", "BELOW"),
+            minima="min_so_far={2: 852} (nvml_v2_free,allocatable, MiB)",
+        )
+        rep = corridor_arm.arm_report(path, require_in_band=True)
+        self.assertFalse(rep.ok)
+        self.assertIn("verdict floor of 1055", rep.problems[0])
+        self.assertIn("floor=1055", rep.problems[0])
+
+    def test_a_log_without_the_token_derives_it_by_the_one_rule(self):
+        """A first-form #1257c log has floor= and source= but no verdict floor.
+
+        It must be DERIVED through ``verdict_floor_for_mib`` -- not equated
+        with the floor, which is the conflation being removed.
+        """
+        from sglang.srt.weg2 import ring_table
+
+        with tempfile.NamedTemporaryFile("w", suffix=".log", delete=False) as fh:
+            fh.write(
+                self.BASE
+                + "nvml0:free=852MiB reserved=425MiB floor=1024MiB "
+                + f"source={cg.FLOOR_SOURCE_FALLBACK} reserve=0MiB verdict=IN\n"
+            )
+            path = fh.name
+        self.addCleanup(os.unlink, path)
+        got = ring_table.parse_front_corridor_floors(path)
+        self.assertEqual(got[0].floor_mib, 1024)
+        self.assertEqual(got[0].verdict_floor_mib, 819)
+
+    def test_the_object_and_the_log_line_grade_identically(self):
+        """ONE rule, two entry points: the object's and the parser's."""
+        for mib, source in (
+            (1024, cg.FLOOR_SOURCE_FALLBACK),
+            (1055, "MEASURED-P"),
+            (1183, "MEASURED-D"),
+            (1024, cg.FLOOR_SOURCE_ENV),
+        ):
+            f = cg.CorridorFloor("GPU-x", "D", mib, 0, source)
+            self.assertEqual(
+                f.verdict_floor_mib, cg.verdict_floor_for_mib(mib, source), source
+            )
+
+    def test_the_arm_summary_shows_both_numbers(self):
+        from sglang.srt.weg2 import corridor_arm
+
+        path = self._log(
+            self._card(0, 1030, 1024, 819, cg.FLOOR_SOURCE_FALLBACK, "IN"),
+            minima="min_so_far={0: 1030} (nvml_v2_free,allocatable, MiB)",
+        )
+        rep = corridor_arm.arm_report(path, require_in_band=True)
+        self.assertIn(f"nvml0=1024/819({cg.FLOOR_SOURCE_FALLBACK})", rep.report())
+
+
+class RefuterFixTwoTheGroupTagIsAKeyNotALabel(unittest.TestCase):
+    """MUST FIX 2: a decorated label keys the same floor as its bare group.
+
+    ``launcher.budgets_from_dc`` passes its ``label`` straight through, and one
+    call site passes ``"D"`` while the dry pass -- which feeds
+    ``d_tp_ratio_decision`` -- passes ``"D(dry, expectation)"``. Both resolved
+    to the fallback today, so the two agreed BY ACCIDENT; the day D is measured
+    the dry pass would read UNMEASURED-FALLBACK and the real pass MEASURED-D.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.cache = self._tmp.name
+        self.addCleanup(self._tmp.cleanup)
+        self._env = mock.patch.dict(
+            os.environ, {cg.FLOOR_DIGEST_FILE_ENV: os.path.join(self.cache, "d.json")}
+        )
+        self._env.start()
+        self.addCleanup(self._env.stop)
+        os.environ.pop(cg.LAW_ENV, None)
+        os.environ.pop(cg.GROUP_ENV, None)
+
+    def test_the_dry_label_and_the_real_group_key_one_floor(self):
+        _write_footprints(self.cache, "ddigest", {C5090: 1183})
+        _publish(self.cache, {"D": "ddigest"})
+        dry = cg.corridor_floor_mib(
+            C5090, group="D(dry, expectation)", hw_fingerprint=HW, cache_dir=self.cache
+        )
+        real = cg.corridor_floor_mib(
+            C5090, group="D", hw_fingerprint=HW, cache_dir=self.cache
+        )
+        self.assertEqual(dry.mib, real.mib)
+        self.assertEqual(dry.source, real.source)
+        self.assertEqual(dry.source, "MEASURED-D")
+        self.assertEqual(dry.group, "D")
+
+    def test_normalise_group_is_the_narrow_rule_it_claims(self):
+        self.assertEqual(cg.normalise_group("D(dry, expectation)"), "D")
+        self.assertEqual(cg.normalise_group("P-warm"), "P")
+        self.assertEqual(cg.normalise_group("d"), "D")
+        self.assertEqual(cg.normalise_group(" P "), "P")
+        for bad in ("decode", "", None, "X", "PD", "0"):
+            self.assertEqual(cg.normalise_group(bad), cg.GROUP_UNKNOWN, bad)
+
+    def test_a_tag_that_is_not_a_group_cannot_reach_a_measured_floor(self):
+        """It falls back rather than silently missing a lookup -- and says so."""
+        _write_footprints(self.cache, "ddigest", {C5090: 1183})
+        _publish(self.cache, {"D": "ddigest"})
+        cg._WARNED_UNKNOWN_GROUPS.discard("decode")
+        with self.assertLogs("sglang.srt.managers.corridor_guard", "WARNING") as cm:
+            got = cg.corridor_floor_mib(
+                C5090, group="decode", hw_fingerprint=HW, cache_dir=self.cache
+            )
+        self.assertEqual(got.source, cg.FLOOR_SOURCE_FALLBACK)
+        self.assertFalse(got.actuates)
+        self.assertIn("is not one of", "\n".join(cm.output))
+
+    def test_the_source_token_carries_the_canonical_group(self):
+        self.assertEqual(cg.measured_floor_source("D(dry, expectation)"), "MEASURED-D")
+        self.assertEqual(cg.measured_floor_source("decode"), "MEASURED-?")
+
+
+class RefuterFixThreeOneDigestOneGroup(unittest.TestCase):
+    """MUST FIX 3: nothing separated P from D when their digests coincided.
+
+    The store is keyed by ``(hw_fingerprint, profile_digest, card_uuid)`` and
+    the group only PICKS the digest. ``profile_from_server_args`` has no phase
+    field, so if P and D agree on every field they compute one digest, write
+    one cache file, and the last ingest owns the bytes -- D's floor would be
+    P's prefill peak stamped ``MEASURED-D``, ``actuates=yes``, and it would
+    CUT. The dump layer refuses the mirror by name (W18); this is the same
+    refusal at the cache layer.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.cache = self._tmp.name
+        self.addCleanup(self._tmp.cleanup)
+        self._env = mock.patch.dict(
+            os.environ, {cg.FLOOR_DIGEST_FILE_ENV: os.path.join(self.cache, "d.json")}
+        )
+        self._env.start()
+        self.addCleanup(self._env.stop)
+        os.environ.pop(cg.LAW_ENV, None)
+        os.environ.pop(cg.GROUP_ENV, None)
+
+    def test_a_shared_digest_is_refused_for_both_groups(self):
+        _write_footprints(self.cache, "shared", {C5090: 1055})
+        _publish(self.cache, {"P": "shared", "D": "shared"})
+        for group in ("P", "D"):
+            got = cg.corridor_floor_mib(
+                C5090, group=group, hw_fingerprint=HW, cache_dir=self.cache
+            )
+            self.assertEqual(got.source, cg.FLOOR_SOURCE_FALLBACK, group)
+            self.assertFalse(got.actuates, group)
+            self.assertIn("digest", got.provenance)
+            self.assertIn(cg.PHASE_FOOTPRINT_COLLISION_NAME, got.provenance)
+
+    def test_distinct_digests_still_resolve(self):
+        """The refusal must be the collision, not a blanket refusal."""
+        _write_footprints(self.cache, "pdig", {C5090: 1055})
+        _write_footprints(self.cache, "ddig", {C5090: 1183})
+        _publish(self.cache, {"P": "pdig", "D": "ddig"})
+        p = cg.corridor_floor_mib(
+            C5090, group="P", hw_fingerprint=HW, cache_dir=self.cache
+        )
+        d = cg.corridor_floor_mib(
+            C5090, group="D", hw_fingerprint=HW, cache_dir=self.cache
+        )
+        self.assertEqual((p.mib, p.source), (1055, "MEASURED-P"))
+        self.assertEqual((d.mib, d.source), (1183, "MEASURED-D"))
+
+    def test_the_collision_check_also_covers_the_profile_path(self):
+        """The boot owns a profile and still reads a file the other group wrote."""
+        _write_footprints(self.cache, "shared", {C5090: 1055})
+        _publish(self.cache, {"P": "shared", "D": "shared"})
+        got = cg.corridor_floor_mib(
+            C5090,
+            group="D",
+            hw_fingerprint=HW,
+            profile_digest="shared",
+            cache_dir=self.cache,
+        )
+        self.assertEqual(got.source, cg.FLOOR_SOURCE_FALLBACK)
+
+    def test_digest_group_collision_names_the_sharers(self):
+        _publish(self.cache, {"P": "same", "D": "same"})
+        self.assertEqual(cg.digest_group_collision("same", "D"), "P")
+        self.assertEqual(cg.digest_group_collision("same", "P"), "D")
+        self.assertIsNone(cg.digest_group_collision("other", "P"))
+        self.assertIsNone(cg.digest_group_collision("", "P"))
+
+
+class RefuterFixFourMeasuredPeakIsOnlyEverMeasured(unittest.TestCase):
+    """MUST FIX 4: ``measured_peak=`` printed an unmeasured number.
+
+    With ``reason=user-reserve`` on an UNMEASURED-FALLBACK floor the INSTALLED
+    line read ``measured_peak=1024`` for a number nobody measured -- flatly
+    contradicting the ``provenance=`` field printed beside it.
+    """
+
+    def test_an_unmeasured_floor_prints_no_measured_peak(self):
+        f = cg.CorridorFloor(
+            C5090, "D", 1024, 512, cg.FLOOR_SOURCE_FALLBACK, "nothing measured it"
+        )
+        self.assertTrue(f.actuates)  # the reserve actuates it
+        self.assertEqual(f.reason, "user-reserve")
+        line = _cut_line(f, 64)
+        self.assertIn("measured_peak=n/a", line)
+        self.assertNotIn("measured_peak=1024", line)
+
+    def test_a_measured_floor_prints_the_number(self):
+        f = cg.CorridorFloor(
+            C5090, "D", 1183, 0, "MEASURED-D", "path#x", cg.BASIS_ALLOC_DELTA
+        )
+        line = _cut_line(f, 64)
+        self.assertIn("measured_peak=1183", line)
+        self.assertIn(f"basis={cg.BASIS_ALLOC_DELTA}", line)
+
+    def test_a_hand_set_law_is_not_a_measurement_either(self):
+        f = cg.CorridorFloor(
+            C5090, "D", 2048, 0, cg.FLOOR_SOURCE_ENV, "SGLANG_...=2048",
+            cg.BASIS_HAND_SET,
+        )
+        self.assertTrue(f.actuates)
+        self.assertEqual(f.reason, "hand-set-law")
+        self.assertIn("measured_peak=n/a", _cut_line(f, 64))
+
+
+class RefuterFixFiveTheUnitsAreDeclared(unittest.TestCase):
+    """MUST FIX 5: the measured term and the verdict are in different units.
+
+    The transient is ``activation_delta_bytes`` -- a torch allocator high-water
+    delta; the verdict and the cut are graded in NVML free. That is not
+    sampler blindness (a true allocator peak catches spikes inside its
+    bracket) but it IS blind to the CUDA context, BAR1 windows and
+    NCCL/cuBLAS workspaces, so the floor is a LOWER BOUND on the NVML
+    requirement -- the dangerous direction. Not compensated (that would be a
+    hand number); DECLARED, on every line.
+    """
+
+    def test_every_floor_line_names_its_basis(self):
+        for source, basis in (
+            ("MEASURED-P", cg.BASIS_ALLOC_DELTA),
+            (cg.FLOOR_SOURCE_ENV, cg.BASIS_HAND_SET),
+            (cg.FLOOR_SOURCE_FALLBACK, cg.BASIS_STATED_LAW),
+        ):
+            f = cg.CorridorFloor(C5090, "P", 1055, 0, source, "x", basis)
+            self.assertIn(f"basis={basis}", f.line)
+
+    def test_the_measured_basis_says_it_is_a_lower_bound(self):
+        self.assertIn("lower-bound", cg.BASIS_ALLOC_DELTA.lower())
+        self.assertIn("NVML", cg.BASIS_ALLOC_DELTA)
+
+    def test_a_measured_floor_is_stamped_with_the_allocator_basis(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        with mock.patch.dict(
+            os.environ, {cg.FLOOR_DIGEST_FILE_ENV: os.path.join(tmp.name, "d.json")}
+        ):
+            os.environ.pop(cg.LAW_ENV, None)
+            _write_footprints(tmp.name, "pdig", {C5090: 1055})
+            _publish(tmp.name, {"P": "pdig"})
+            got = cg.corridor_floor_mib(
+                C5090, group="P", hw_fingerprint=HW, cache_dir=tmp.name
+            )
+        self.assertEqual(got.basis, cg.BASIS_ALLOC_DELTA)
+
+    def test_the_declaration_is_in_the_module_not_only_in_a_record(self):
+        import inspect
+
+        src = inspect.getsource(cg)
+        self.assertIn("activation_delta_bytes", src)
+        self.assertIn("D_AWAKE_OVERSHOOT_MIB", src)
+
+
+class RefuterFindingSixOneAuthority(unittest.TestCase):
+    """FINDING 6: the actuating readers of the flat 1024 are migrated.
+
+    ``vram_dial.corridor_law_floor_bytes`` is the one that mattered: it is the
+    KV capacity floor, in the module whose own docstring says "the dial and the
+    guard must not carry two floors". On this rig the guard said 858 on one
+    card while the dial said 1024 on all three.
+    """
+
+    def test_the_dial_takes_the_derivation_when_it_knows_the_card(self):
+        from sglang.srt.managers import vram_dial
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        with mock.patch.dict(
+            os.environ, {cg.FLOOR_DIGEST_FILE_ENV: os.path.join(tmp.name, "d.json")}
+        ):
+            os.environ.pop(cg.LAW_ENV, None)
+            os.environ.pop(cg.USER_RESERVE_ENV, None)
+            with mock.patch.object(
+                cg,
+                "corridor_floor_mib",
+                return_value=cg.CorridorFloor(
+                    C3080B, "P", 858, 0, "MEASURED-P", "path#x", cg.BASIS_ALLOC_DELTA
+                ),
+            ):
+                got = vram_dial.corridor_law_floor_bytes(C3080B)
+        self.assertEqual(got, 858 * 1024 * 1024)
+
+    def test_no_card_identity_keeps_the_flat_fallback(self):
+        from sglang.srt.managers import vram_dial
+
+        self.assertEqual(
+            vram_dial.corridor_law_floor_bytes(),
+            int(cg.DEFAULT_FLOOR_MIB) * 1024 * 1024,
+        )
+
+    def test_the_dial_call_site_passes_its_card(self):
+        import inspect
+
+        from sglang.srt.managers import vram_dial
+
+        src = inspect.getsource(vram_dial._measure_local_floor_bytes)
+        self.assertIn("corridor_law_floor_bytes(uuid)", src)
+
+    def test_the_rank_local_consumers_share_one_door(self):
+        """kv_vmm_backing, the seam reserve and the flip runtime, one call."""
+        import inspect
+
+        from sglang.srt.managers import phase_flip_runtime, phase_flip_seam_reserve
+        from sglang.srt.mem_cache import kv_vmm_backing
+
+        for mod, fn in (
+            (kv_vmm_backing, "_corridor_law_floor_bytes"),
+            (phase_flip_seam_reserve, "_corridor_law_bytes"),
+        ):
+            src = inspect.getsource(getattr(mod, fn))
+            self.assertIn("corridor_floor_for_current_device", src, fn)
+        self.assertIn(
+            "corridor_floor_for_current_device",
+            inspect.getsource(phase_flip_runtime),
+        )
+
+    def test_the_reserve_has_one_reader(self):
+        """``weg2.front`` delegates rather than parsing the variable twice."""
+        import inspect
+
+        from sglang.srt.weg2 import front
+
+        src = inspect.getsource(front._reserve_by_card)
+        self.assertIn("corridor_guard.user_reserve_by_card", src)
+        with mock.patch.dict(
+            os.environ, {cg.USER_RESERVE_ENV: json.dumps({C5090: 256})}
+        ):
+            self.assertEqual(cg.user_reserve_by_card(), {C5090: 256})
+        with mock.patch.dict(os.environ, {cg.USER_RESERVE_ENV: "not json"}):
+            self.assertEqual(cg.user_reserve_by_card(), {})
+
+
+class RefuterFindingNineNoRankTerm(unittest.TestCase):
+    """FINDING 9: the briefed mutant 'floor read from one rank' had no test.
+
+    There is no rank ARGUMENT anywhere in the derivation and no per-rank entry
+    point, so two ranks co-located on a card cannot reach different floors
+    from the same inputs. What this does NOT prove is that a disagreement
+    which arose anyway would be DETECTED -- that needs a group collective and
+    a boot, and it stands in UNPROVEN.
+    """
+
+    def test_no_entry_point_takes_a_rank(self):
+        import inspect
+
+        for fn in (
+            cg.corridor_floor_mib,
+            cg.corridor_floors_for_cards,
+            cg.corridor_floor_for_current_device,
+        ):
+            params = set(inspect.signature(fn).parameters)
+            self.assertFalse(
+                {"rank", "tp_rank", "local_rank", "pp_rank"} & params, fn.__name__
+            )
+
+    def test_two_ranks_on_one_card_derive_one_floor(self):
+        """Same card, same group, same reserve -> byte-identical floors."""
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        with mock.patch.dict(
+            os.environ, {cg.FLOOR_DIGEST_FILE_ENV: os.path.join(tmp.name, "d.json")}
+        ):
+            os.environ.pop(cg.LAW_ENV, None)
+            _write_footprints(tmp.name, "pdig", {C5090: 1055})
+            _publish(tmp.name, {"P": "pdig"})
+            floors = [
+                cg.corridor_floor_mib(
+                    C5090, group="P", hw_fingerprint=HW, cache_dir=tmp.name
+                )
+                for _ in range(2)  # two ranks, same card
+            ]
+        self.assertEqual(floors[0].line, floors[1].line)
+
+    def test_the_rank_local_door_reads_the_card_level_reserve(self):
+        """Not a per-RANK scalar: the reserve is a per-CARD quantity."""
+        import inspect
+
+        src = inspect.getsource(cg.corridor_floor_for_current_device)
+        self.assertIn("user_reserve_by_card", src)
+        self.assertNotIn("user_reserve_mib_scalar", src)
+
+
+class RefuterFindingEightTheBootRecipes(unittest.TestCase):
+    """FINDING 8: two shipped recipes seeded the OLD meaning of 1024.
+
+    Written when 1024 was the default reserve, so the literal restated the
+    default. Under the corridor law an explicit reserve ACTUATES and stacks on
+    the measured transient (5090: 1055 + 1024 = 2079 MiB).
+    """
+
+    def test_neither_602_recipe_passes_an_explicit_reserve(self):
+        root = os.path.dirname(os.path.dirname(os.path.dirname(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        )))
+        for name in ("boot_baseline.sh", "boot_corridor.sh"):
+            path = os.path.join(root, "scripts", "dev", "602_corridor", name)
+            if not os.path.exists(path):
+                self.skipTest(f"{path} not in this checkout")
+            text = open(path).read()
+            body = "\n".join(
+                l for l in text.splitlines() if not l.lstrip().startswith("#")
+            )
+            self.assertNotIn("--rank-user-reserve-mib", body, name)
 
 
 if __name__ == "__main__":
