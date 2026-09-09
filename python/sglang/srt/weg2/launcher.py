@@ -978,7 +978,12 @@ P_MAMBA_SLOTS_PER_RUNNING_REQUEST = 2
 #: #1273: where a waking group's weight bytes come from. ``ring`` is today's
 #: path, byte for byte, and stays the default until S6 has booted the other
 #: one; ``exchange`` moves them card-to-card and is what W55 prices.
-WEIGHT_SOURCE_CHOICES = ("ring", "exchange")
+#: ``shadow`` (#1273 S5) is the third value and it is RING-AUTHORITATIVE: the
+#: weights still come from the host ring, byte for byte, and the exchange runs
+#: beside them into buffers nothing reads so its bytes can be compared against
+#: the ring's.  It is the only arm that can prove the exchange on silicon
+#: without the exchange being able to break a flip.
+WEIGHT_SOURCE_CHOICES = ("ring", "exchange", "shadow")
 WEIGHT_SOURCE_DEFAULT = "ring"
 
 #: The /dev/shm staging region's layout terms, spec section 6/S3: 2 slots per
@@ -3267,6 +3272,41 @@ def prepare_xchg_region(log: Log, boot_nonce: str, hook_mode: int,
     return weight_exchange_region.prepare_region(boot_nonce, hook_mode=hook_mode, log=log)
 
 
+def prepare_shadow_env(log: Log, boot_nonce: str, weight_source: str,
+                       hook_mode: int = 0, dry: bool = False) -> Dict[str, str]:
+    """#1273 S5: arm the region for the SHADOW arm, and publish it to both groups.
+
+    ``{}`` on every other arm, and that empty dict is what keeps the default
+    boot byte-identical: no region file, no semaphores, no environment, and
+    :func:`build_env` pops the three names so nothing can be inherited.
+
+    THE SHADOW NEEDS EXACTLY WHAT THE EXCHANGE NEEDS, MINUS THE AUTHORITY: the
+    same 385 MiB staging region, the same 24 semaphores, the same two env
+    names.  What it does not get is the mode switch inside the ranks --
+    ``SGLANG_WEG2_WEIGHT_SOURCE=shadow`` leaves ``exchange_armed()`` False, so
+    ``model_runner`` still opens the weights region with ``enable_cpu_backup``
+    and the ring still refills every byte.
+
+    W55 IS NOT ARMED HERE, on purpose.  W55 prices the co-residency peak of a
+    real exchange, and under ``shadow`` no tag is ever exchanged: both images
+    stay where they are and the only new VRAM is the shadow's own bounded
+    subset, which is priced per card, per leg, against the LIVE NVML free
+    column by ``weight_exchange_shadow.price_shadow`` -- inside the rank that
+    will allocate it, at the moment it would.  Pricing it at launch instead
+    would grade a peak this arm does not have.
+    """
+    if weight_source != "shadow":
+        return {}
+    got = prepare_xchg_region(log, boot_nonce, hook_mode, dry=dry)
+    env = dict(got.get("env") or {})
+    env["SGLANG_WEG2_WEIGHT_SOURCE"] = "shadow"
+    log(f"WEG2-XCHG-SHADOW ARMED epoch={boot_nonce} path={got.get('path', '')} "
+        f"sems={got.get('sems', 0)} ring=AUTHORITATIVE exchange=OBSERVER "
+        f"-- the ring refills every weight byte as it does today; the exchange "
+        f"runs beside it into raw cudaMalloc buffers nothing reads")
+    return env
+
+
 def teardown_xchg_region(log: Log, boot_nonce: str) -> Dict[str, int]:
     """#1273 S3 / spec section 3.8: unlink the 24 names and remove the region.
 
@@ -3709,7 +3749,8 @@ def build_env(tree: str, venv: str, cvd: str, store_dir: str, debug_hold: bool, 
               arming_floor_solved: bool = True,
               hicache_bigram_keys: bool = True,
               hicache_flush_publish_sweep: bool = True,
-              group: str = "") -> Dict[str, str]:
+              group: str = "",
+              xchg_env: Optional[Dict[str, str]] = None) -> Dict[str, str]:
     env = dict(os.environ)
     # FIX 2, finding 1: WHICH WEG-2 GROUP THIS RANK BELONGS TO, and the only
     # thing in either tree that says so.  Read by
@@ -3764,6 +3805,19 @@ def build_env(tree: str, venv: str, cvd: str, store_dir: str, debug_hold: bool, 
         env["SGLANG_WEG2_WEIGHT_CHUNKS"] = str(chunk_count)
     if tms_so:
         env["SGLANG_WEG2_TMS_PRELOAD_SO"] = tms_so
+    # #1273 S3/S5: the staging region and the weight-source mode, published to
+    # BOTH groups by the same two names the region's own module reads
+    # (SGLANG_WEG2_XCHG_REGION / _BOOT / SGLANG_WEG2_WEIGHT_SOURCE).  SAME
+    # DISCIPLINE AS THE RING FAMILY ABOVE and for the same measured reason: it
+    # is launcher OUTPUT, so it is POPPED when this boot arms no region -- a
+    # value inherited from the operator's shell must never arm a coupling
+    # nobody asked for, and a stale region path is a rank mapping another
+    # boot's shm.
+    for key in ("SGLANG_WEG2_XCHG_REGION", "SGLANG_WEG2_XCHG_BOOT",
+                "SGLANG_WEG2_WEIGHT_SOURCE"):
+        env.pop(key, None)
+    for key, value in (xchg_env or {}).items():
+        env[str(key)] = str(value)
     cu13 = f"{venv}/lib/python3.12/site-packages/nvidia/cu13/lib"
     # boot_855_train0901.sh:152-153 (NVRTC) and S1 killer K1: the memory
     # saver's cu13 preload hook links libcudart.so.13, which must be on the
@@ -7590,7 +7644,14 @@ def build_parser() -> argparse.ArgumentParser:
              "peak, before either group starts. "
              "TODO(S7->S6): S6 owns propagating it into the two groups' argv, "
              "the request structs and the memory saver's region flag; until "
-             "then 'exchange' arms the gate and changes no rank behaviour.",
+             "then 'exchange' arms the gate and changes no rank behaviour. "
+             "'shadow' (S5) is RING-AUTHORITATIVE: the ring refills the "
+             "weights exactly as it does today and the exchange runs beside "
+             "it into raw cudaMalloc buffers nothing reads, comparing what it "
+             "pulled against what the ring restored (WEG2-XCHG-SHADOW).  It "
+             "arms the region and the six-rank shadow gate; it can refuse "
+             "ITSELF (W61, per card, against that card's free column) and it "
+             "can refuse NOTHING ELSE.",
     )
     ap.add_argument(
         "--weg2-xchg-census", default="",
@@ -8557,6 +8618,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         (ring_plan.table.total_h_bytes // ring_table.MIB) if ring_plan.table else 0,
     )
     state.xchg_lines = list(xchg_res.lines) if xchg_res is not None else []
+    # #1273 S5: the SHADOW arm's region, armed here and published to both
+    # groups by build_env below.  Empty on every other arm.
+    xchg_env = prepare_shadow_env(log, str(ring_plan.epoch),
+                                  ns.weg2_weight_source, dry=dry)
 
     # 2. host ledger
     arm, reap_headroom_gib, lines, cg = choose_host_ledger(
@@ -8658,7 +8723,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # TRAIN FIX 5 moved the dc-reserve / budgets_p / cut solve ahead of the
     # ring (block 1b- above); only ``env_p`` stays here, because it is the
     # one thing in this step that genuinely needs the armed ring.
-    env_p = build_env(tree, ns.venv, cvd, store_dir, ns.debug_hold in ("P", "both"), ns.tag, chunk_layers, chunk_count, tms_so, ns.transport, ring_plan, group="P", **_env_knobs(ns))
+    env_p = build_env(tree, ns.venv, cvd, store_dir, ns.debug_hold in ("P", "both"), ns.tag, chunk_layers, chunk_count, tms_so, ns.transport, ring_plan, group="P", xchg_env=xchg_env, **_env_knobs(ns))
     # #1269 PUBLICATION: build_env's own comment says the decision is
     # "published explicitly so the boot log names the decision" -- but it only
     # SET the variables and logged nothing, so no boot log ever carried them.
@@ -8898,7 +8963,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         log(d_ratio.line)
         log(d_ratio.op_line)
         log(d_tokvec.line)
-        env_d = build_env(tree, ns.venv, cvd, store_dir, False, ns.tag, chunk_layers, chunk_count, tms_so, ns.transport, ring_plan, group="D", **_env_knobs(ns))
+        env_d = build_env(tree, ns.venv, cvd, store_dir, False, ns.tag, chunk_layers, chunk_count, tms_so, ns.transport, ring_plan, group="D", xchg_env=xchg_env, **_env_knobs(ns))
         spec_d = GroupSpec("D", PORT_D, transport_argv(argv_d(py, ns.model, budgets_d, arm.s_gb, arm.m_mib, store_cfg, shlex.split(ns.extra_d), d_bs, max_kv_per_request, x_tokens, ns.num_continuous_decode_steps, ns.d_disable_overlap_schedule, d_ratio.flags, d_tokvec.flags, ns.random_seed, ns.barlink_bar1_cap_cycles, ns.collective_census_interval, ns.d_disable_cuda_graph, admin_api_key=admin_api_key), ns.transport), state.logs["D"], env_d)
         launch_group(spec_d, tree, log, dry)
         log("front argv (dry): " + " ".join(shlex.quote(a) for a in front_argv_for(
@@ -8969,7 +9034,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     log(d_ratio.line)
     log(d_ratio.op_line)
     log(d_tokvec.line)
-    env_d = build_env(tree, ns.venv, cvd, store_dir, ns.debug_hold in ("D", "both"), ns.tag, chunk_layers, chunk_count, tms_so, ns.transport, ring_plan, group="D", **_env_knobs(ns))
+    env_d = build_env(tree, ns.venv, cvd, store_dir, ns.debug_hold in ("D", "both"), ns.tag, chunk_layers, chunk_count, tms_so, ns.transport, ring_plan, group="D", xchg_env=xchg_env, **_env_knobs(ns))
     spec_d = GroupSpec("D", PORT_D, transport_argv(argv_d(py, ns.model, budgets_d, arm.s_gb, arm.m_mib, store_cfg, shlex.split(ns.extra_d), d_bs, max_kv_per_request, x_tokens, ns.num_continuous_decode_steps, ns.d_disable_overlap_schedule, d_ratio.flags, d_tokvec.flags, ns.random_seed, ns.barlink_bar1_cap_cycles, ns.collective_census_interval, ns.d_disable_cuda_graph, admin_api_key=admin_api_key), ns.transport), state.logs["D"], env_d)
     state.argv["D"] = " ".join(shlex.quote(a) for a in spec_d.argv)
     launch_group(spec_d, tree, log, dry)
