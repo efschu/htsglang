@@ -5972,7 +5972,13 @@ class FlashInferAttnBackend(AttentionBackend):
             return o, lse
         o_t, lse_t = self._kv_tail_wrapper.forward_return_lse(
             q_full,
-            ring.pool.get_kv_buffer(layer.layer_id),
+            # SAME LAYER-ID AUTHORITY as the ring write (`KvTailRing.write`).
+            # The ring's pool is addressed in the body pool's frame -- the
+            # DENSE full-attention one on a hybrid model -- so a raw
+            # `layer.layer_id` here reads off the end of the buffer list, or,
+            # worse than the IndexError that killed boot weg2kvtail4, returns
+            # another layer's KV for a global id that happens to be in range.
+            ring.pool.get_kv_buffer(ring.local_layer_id(layer.layer_id)),
             sm_scale=layer.scaling,
             logits_soft_cap=layer.logit_cap,
         )

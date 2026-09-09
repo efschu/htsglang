@@ -498,12 +498,35 @@ class KvTailRing:
         device: Optional[str] = None,
         enable_memory_saver: bool = False,
         owner_bounds: Optional[Tuple[int, int, int, int]] = None,
+        layer_id_transfer=None,
         _pool_factory=None,
         _allocator_factory=None,
     ):
         self.knobs = knobs
         self.counters = KvTailCounters()
         self._refuse_unsupported_form(body_pool, knobs)
+        # THE THIRD INDEX SPACE (boot weg2kvtail4's killer).  The two named
+        # below are TOKEN spaces; this one is the LAYER space, and slice 1
+        # crossed it without translating.
+        #
+        #   GLOBAL           `layer.layer_id`, what the attention backend
+        #                    carries.
+        #   DENSE FULL-ATTN  what `HybridLinearKVPool.full_kv_pool` -- our
+        #                    `body_pool` -- is addressed in.  The wrapper
+        #                    converts with `_transfer_full_attention_id` and
+        #                    hands the sub-pool the result as
+        #                    `layer_id_override`; the sub-pool is explicitly
+        #                    `mark_as_sub_pool`ed so its `local_slot`
+        #                    degenerates to the subtraction inside that dense
+        #                    frame.
+        #
+        # The ring's pool is a SECOND ALLOCATION OF THE BODY POOL'S FRAME, so
+        # it must be addressed exactly as the body pool is.  `layer_id_transfer`
+        # is the wrapper's OWN translation, passed in by `install_kv_tail_ring`
+        # -- never a table rebuilt here.  A second layer table beside the
+        # wrapper's is the same defect class as a second owner rule beside
+        # `dcp_weighted_write_slots`, and this file exists to not have one.
+        self._layer_id_transfer = layer_id_transfer
         # TWO INDEX SPACES, NAMED (the F1 defect of the first cut).  The
         # mapping is keyed by the COMPACTED PHYSICAL SLOT
         # (``dcp_weighted_write_slots``), because that is what the write side
@@ -563,6 +586,15 @@ class KvTailRing:
             ),
             enable_alt_stream=False,
         )
+        # The ring's pool is a second allocation of the BODY POOL'S frame, so
+        # its slot map is the body pool's, inherited -- not one re-derived from
+        # the process-global layer-set parser that `KVCache.__init__` consults.
+        # Under a PP layer set that parser would attach a GLOBAL-keyed map to a
+        # pool addressed with DENSE ids, and every lookup would miss (the exact
+        # reason `mark_as_sub_pool` exists for `full_kv_pool`). Inheriting makes
+        # `ring.pool.local_slot` agree with `body_pool.local_slot` by
+        # construction rather than by coincidence.
+        self.pool._local_slot_of = getattr(body_pool, "_local_slot_of", None)
         self.allocator = _allocator_factory(
             size=self.ring_rows,
             dtype=torch.bfloat16,
@@ -781,6 +813,27 @@ class KvTailRing:
         self._claim_cache = (key, ring_loc, ring_mask)
         return ring_loc, ring_mask
 
+    def local_layer_id(self, layer_id: int) -> int:
+        """GLOBAL layer id -> the frame the ring's pool is addressed in.
+
+        THE ONE LAYER-ID AUTHORITY for every ring <-> pool crossing, read and
+        write alike. It delegates to the wrapper's own
+        ``_transfer_full_attention_id``; it does not reimplement it and holds
+        no table of its own.
+
+        A layer the tail does not hold (a linear/GDN layer, which has no
+        full-attention slot at all) is REFUSED by that same rule rather than
+        translated -- for the reason ``KVCache.local_slot`` states about the
+        subtraction it replaced: the failure mode is to return a plausible
+        index into ANOTHER layer's KV.
+
+        Identity when there is no wrapper: then the global id already IS the
+        pool's frame, which is the pre-#1243 behaviour byte for byte.
+        """
+        if self._layer_id_transfer is None:
+            return layer_id
+        return self._layer_id_transfer(layer_id)
+
     def write(self, layer, ring_loc, ring_mask, cache_k, cache_v) -> None:
         """The SECOND ``set_kv_buffer``, against the ring, at the SAME masked
         write the body took.
@@ -788,6 +841,11 @@ class KvTailRing:
         The ring's dtype is bf16 and ``cache_k`` arrives bf16, so the cast at
         ``MHATokenToKVPool.set_kv_buffer`` is a structural no-op on this call
         and the masked-write kernel is reused unchanged.
+
+        ``layer_id_override`` is the SAME mechanism and the SAME value
+        ``HybridLinearKVPool.set_kv_buffer`` uses to reach this pool's twin --
+        boot weg2kvtail4 died here because the raw GLOBAL id was passed to a
+        pool sized for the DENSE full-attention frame.
         """
         self.pool.set_kv_buffer(
             layer,
@@ -796,6 +854,7 @@ class KvTailRing:
             cache_v,
             None,
             None,
+            layer_id_override=self.local_layer_id(layer.layer_id),
             dcp_kv_mask=ring_mask,
         )
 
@@ -999,6 +1058,17 @@ def install_kv_tail_ring(
             "honest mapping from a freed slot to a ring row."
         )
     body_pool = getattr(token_to_kv_pool, "full_kv_pool", token_to_kv_pool)
+    # The unwrap above changes the LAYER FRAME as well as the object: a
+    # `full_kv_pool` is addressed with the DENSE full-attention id its wrapper
+    # produces, never with the global id the attention backend carries. Take
+    # the wrapper's OWN translation with us, so the ring resolves layers
+    # through the same authority the body write does. `None` where there is no
+    # wrapper -- then the global id already is the pool's frame.
+    layer_id_transfer = (
+        getattr(token_to_kv_pool, "_transfer_full_attention_id", None)
+        if body_pool is not token_to_kv_pool
+        else None
+    )
     rows = knobs.ring_rows
     if rows is None:
         rows = auto_ring_rows(
@@ -1010,6 +1080,7 @@ def install_kv_tail_ring(
         ring_rows=rows,
         enable_memory_saver=enable_memory_saver,
         owner_bounds=owner_bounds if allocator_index_space == "global" else None,
+        layer_id_transfer=layer_id_transfer,
     )
     body_pool.kv_tail = ring
     token_to_kv_pool.kv_tail = ring
