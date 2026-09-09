@@ -3774,7 +3774,11 @@ def test_an_undrainable_lane_compares_digests_and_moves_no_bytes(region, boot,
     ops = FakeDeviceOps(str(tmp_path / "nd"), rank=0)
     # The three rows this source hook expects, all voting yes, with the digests
     # it derived: the gate opens, and only then is the lane refused.
-    subset = sh.select_subset(plan.descs, leg=0, classes=plan.classes)
+    # S6 fix E: the plan's classes are the ROTATION, not the pin -- the hook
+    # narrows to ONE class per leg, so a fixture that votes classes_hash from
+    # a pinned all-class subset votes a hash the hook no longer computes and
+    # the gate refuses (correctly). Same call the product now makes.
+    subset = sh.select_subset(plan.descs, leg=0, rotation=plan.classes)
     _vote_rows(region, [1, 2], leg=0, vote=True, classes_hash=subset.hash,
                need_mib=0, plan_digest=plan.facts.digest)
     entered = []
@@ -3819,7 +3823,11 @@ def test_a_drainable_lane_is_unchanged_by_the_refusal(region, boot, tmp_path,
     xr.create_semaphores(boot)
     sems = tp.SemSet(boot)
     ops = FakeDeviceOps(str(tmp_path / "dr"), rank=0)
-    subset = sh.select_subset(plan.descs, leg=0, classes=plan.classes)
+    # S6 fix E: the plan's classes are the ROTATION, not the pin -- the hook
+    # narrows to ONE class per leg, so a fixture that votes classes_hash from
+    # a pinned all-class subset votes a hash the hook no longer computes and
+    # the gate refuses (correctly). Same call the product now makes.
+    subset = sh.select_subset(plan.descs, leg=0, rotation=plan.classes)
     _vote_rows(region, [1, 2], leg=0, vote=True, classes_hash=subset.hash,
                need_mib=0, plan_digest=plan.facts.digest)
     entered = []
@@ -4018,7 +4026,11 @@ def test_an_unfunded_deposit_is_refused_by_name_and_moves_no_bytes(
     xr.create_semaphores(boot)
     sems = tp.SemSet(boot)
     ops = FakeDeviceOps(str(tmp_path / "nf"), rank=0)
-    subset = sh.select_subset(plan.descs, leg=0, classes=plan.classes)
+    # S6 fix E: the plan's classes are the ROTATION, not the pin -- the hook
+    # narrows to ONE class per leg, so a fixture that votes classes_hash from
+    # a pinned all-class subset votes a hash the hook no longer computes and
+    # the gate refuses (correctly). Same call the product now makes.
+    subset = sh.select_subset(plan.descs, leg=0, rotation=plan.classes)
     _vote_rows(region, [1, 2], leg=0, vote=True, classes_hash=subset.hash,
                need_mib=0, plan_digest=plan.facts.digest)
     entered = []
@@ -4075,7 +4087,11 @@ def test_a_funded_deposit_runs_the_lane_with_no_concurrent_peer(
     xr.create_semaphores(boot)
     sems = tp.SemSet(boot)
     ops = FakeDeviceOps(str(tmp_path / "fd"), rank=0)
-    subset = sh.select_subset(plan.descs, leg=0, classes=plan.classes)
+    # S6 fix E: the plan's classes are the ROTATION, not the pin -- the hook
+    # narrows to ONE class per leg, so a fixture that votes classes_hash from
+    # a pinned all-class subset votes a hash the hook no longer computes and
+    # the gate refuses (correctly). Same call the product now makes.
+    subset = sh.select_subset(plan.descs, leg=0, rotation=plan.classes)
     _vote_rows(region, [1, 2], leg=0, vote=True, classes_hash=subset.hash,
                need_mib=0, plan_digest=plan.facts.digest)
     seen = {}
@@ -4131,7 +4147,11 @@ def test_the_batch_count_the_deposit_is_sized_from_is_the_batchers_own(chunked):
     """
     plan, why = _derive("source", rank=0, group="P")
     assert plan is not None, why
-    subset = sh.select_subset(plan.descs, leg=0, classes=plan.classes)
+    # S6 fix E: the plan's classes are the ROTATION, not the pin -- the hook
+    # narrows to ONE class per leg, so a fixture that votes classes_hash from
+    # a pinned all-class subset votes a hash the hook no longer computes and
+    # the gate refuses (correctly). Same call the product now makes.
+    subset = sh.select_subset(plan.descs, leg=0, rotation=plan.classes)
     lane = sh.oncard_lane_descs(subset.descs, 0)
     total = sh.oncard_lane_bytes(subset.descs, 0)
     assert lane and total > 0, "the fixture must have a diagonal"
@@ -4271,7 +4291,11 @@ def test_shadow_ms_still_covers_everything_the_hook_spends(region, boot,
     xr.create_semaphores(boot)
     sems = tp.SemSet(boot)
     ops = FakeDeviceOps(str(tmp_path / "sm"), rank=0)
-    subset = sh.select_subset(plan.descs, leg=0, classes=plan.classes)
+    # S6 fix E: the plan's classes are the ROTATION, not the pin -- the hook
+    # narrows to ONE class per leg, so a fixture that votes classes_hash from
+    # a pinned all-class subset votes a hash the hook no longer computes and
+    # the gate refuses (correctly). Same call the product now makes.
+    subset = sh.select_subset(plan.descs, leg=0, rotation=plan.classes)
     _vote_rows(region, [1, 2], leg=0, vote=True, classes_hash=subset.hash,
                need_mib=0, plan_digest=plan.facts.digest)
     try:
@@ -4320,7 +4344,11 @@ def test_the_two_budget_lines_keep_their_shape_under_the_deposit(region, boot,
     xr.create_semaphores(boot)
     sems = tp.SemSet(boot)
     ops = FakeDeviceOps(str(tmp_path / "bl"), rank=0)
-    subset = sh.select_subset(plan.descs, leg=0, classes=plan.classes)
+    # S6 fix E: the plan's classes are the ROTATION, not the pin -- the hook
+    # narrows to ONE class per leg, so a fixture that votes classes_hash from
+    # a pinned all-class subset votes a hash the hook no longer computes and
+    # the gate refuses (correctly). Same call the product now makes.
+    subset = sh.select_subset(plan.descs, leg=0, rotation=plan.classes)
     _vote_rows(region, [1, 2], leg=0, vote=True, classes_hash=subset.hash,
                need_mib=0, plan_digest=plan.facts.digest)
     try:
@@ -4367,7 +4395,11 @@ def test_a_deposit_with_more_batches_than_slots_is_refused_by_name(
     xr.create_semaphores(boot)
     sems = tp.SemSet(boot)
     ops = FakeDeviceOps(str(tmp_path / "ov"), rank=0)
-    subset = sh.select_subset(plan.descs, leg=0, classes=plan.classes)
+    # S6 fix E: the plan's classes are the ROTATION, not the pin -- the hook
+    # narrows to ONE class per leg, so a fixture that votes classes_hash from
+    # a pinned all-class subset votes a hash the hook no longer computes and
+    # the gate refuses (correctly). Same call the product now makes.
+    subset = sh.select_subset(plan.descs, leg=0, rotation=plan.classes)
     _vote_rows(region, [1, 2], leg=0, vote=True, classes_hash=subset.hash,
                need_mib=0, plan_digest=plan.facts.digest)
     entered = []
@@ -4926,3 +4958,290 @@ def test_the_oncard_copy_arm_is_on_the_line_on_both_arms():
     assert tp.oncard_copy_gbps(tp.ONCARD_MODE_HOST) == tp.ONCARD_HOST_COPY_GBPS
     r.oncard_copy_gbps = tp.oncard_copy_gbps(tp.ONCARD_MODE_IPC)
     assert "oncard_copy_gbps=0 " in r.line(), r.line()
+
+
+# ---------------------------------------------------------------------------
+# S6 fix E (#1273) -- THE SUBSET IS ONE CLASS PER LEG, AND IT WAS THE WHOLE
+# POPULATION.
+#
+# S6-fix ticket C2's design of record: "the subset is ONE tensor class per leg.
+# Crossover ~218 MiB of per-card subset diagonal".  Boot weg2shadowD measured
+# `classes=14` on EVERY shadow line, with `rotation=` advancing (19/20/21) but
+# the count never narrowing, `planned=575 of population=650`, dst_buffers 11836
+# MiB against free 8126 MiB -> UNAFFORDABLE on every card of every leg ->
+# `ran=no` on all 15 legs and not one byte ever compared.
+#
+# ROOT, one line: `run_leg_hook` did `classes = classes or plan.classes` and
+# handed that to `select_subset(classes=...)`, whose `classes` parameter PINS
+# the subset ("an operator arm").  `LegPlan`'s own docstring states the contract
+# this violated, verbatim: "`classes` is the rotation the subset is chosen FROM
+# (never the subset itself)".  The population went into the pin, the
+# `if classes:` branch took all of it, and the rotation was computed and thrown
+# away.  Same falsy-default shape as fix D's identity sentinels, one field over.
+#
+# THE FIX IS NOT "DELETE THE PIN".  `rotation_of(descs)` reads THIS CARD's
+# descriptors, and shadowD measured rotation lengths 19 / 20 / 21 on P's three
+# ranks in one leg -- `leg % len(rotation)` over three different lengths picks
+# three DIFFERENT classes, which is exactly what the gate's `classes_hash`
+# exists to catch.  The group-uniform list is `LegPlan.classes`, whose
+# `LegPlanFacts` digest measured IDENTICAL on all six rows (plan_digest
+# 0x81c24054c5b571bf, 18/18 lines).  So it is handed in as the ROTATION.
+# ---------------------------------------------------------------------------
+
+class _Desc:
+    """The two fields `select_subset` reads, plus what the by-rank sum needs."""
+
+    def __init__(self, param_name, nbytes=1 << 20, dst_rank=0, tag="weights",
+                 kind="copy"):
+        self.param_name = param_name
+        self.nbytes = nbytes
+        self.dst_rank = dst_rank
+        self.tag = tag
+        self.kind = kind
+
+
+def _population(classes, per_class=3, nbytes=1 << 20):
+    return [_Desc(f"model.layers.{i}.{c}.weight", nbytes=nbytes)
+            for c in classes for i in range(per_class)]
+
+
+FOURTEEN = ("A_log", "down_proj", "dt_bias", "gate_up_proj", "in_proj_ba",
+            "in_proj_qkvz", "input_layernorm", "k_norm", "norm", "o_proj",
+            "out_proj", "post_attention_layernorm", "q_norm", "qkv_proj")
+
+
+def test_one_class_per_leg_and_the_next_leg_takes_the_next_class():
+    """The design of record, as arithmetic: |subset| == 1, and it rotates.
+
+    RED on `b1d68dfad0` only through the hook (below); `select_subset` itself
+    was always right -- which is the point: the builder was correct and the
+    CALLER pinned it.
+    """
+    descs = _population(FOURTEEN)
+    seen = []
+    for leg in range(len(FOURTEEN) + 2):
+        sub = sh.select_subset(descs, leg=leg)
+        assert len(sub.classes) == 1, (leg, sub.classes)
+        seen.append(sub.classes[0])
+    rot = sorted(FOURTEEN)
+    assert seen[:len(rot)] == rot, seen
+    # and it wraps rather than running off the end
+    assert seen[len(rot)] == rot[0] and seen[len(rot) + 1] == rot[1]
+
+
+def test_the_group_uniform_rotation_beats_this_cards_own_class_list():
+    """shadowD's 19/20/21, as a test.
+
+    Three ranks whose OWN descriptor sets carry different class counts must
+    still choose the SAME class for the same leg once the group-uniform
+    rotation is handed in -- otherwise the six gate rows disagree by
+    construction and `classes_hash` fires on a difference nobody introduced.
+    """
+    rank_a = _population(FOURTEEN)                      # 14 classes
+    rank_b = _population(FOURTEEN + ("extra_1",))       # 15
+    rank_c = _population(FOURTEEN + ("extra_1", "extra_2"))  # 16
+
+    for leg in range(6):
+        picked = {
+            tuple(sh.select_subset(d, leg=leg, rotation=FOURTEEN).classes)
+            for d in (rank_a, rank_b, rank_c)
+        }
+        assert len(picked) == 1, (leg, picked)
+        assert len(next(iter(picked))) == 1
+
+    # WITHOUT the group-uniform rotation this is exactly what went wrong:
+    # somewhere in the leg range the three per-card rotations disagree.
+    drift_seen = False
+    for leg in range(20):
+        drifted = {
+            tuple(sh.select_subset(d, leg=leg).classes)
+            for d in (rank_a, rank_b, rank_c)
+        }
+        if len(drifted) > 1:
+            drift_seen = True
+    assert drift_seen, (
+        "the per-card rotation never disagreed in 20 legs -- this fixture no "
+        "longer reproduces the hazard the rotation parameter exists for"
+    )
+
+
+def test_a_population_handed_in_as_the_pin_takes_every_class():
+    """THE DEFECT, isolated, so the fix's necessity is visible.
+
+    This is what `classes = classes or plan.classes` did.  `select_subset` is
+    behaving correctly here -- pinning is a real operator arm -- which is why
+    the fix belongs at the caller and not in this function.
+    """
+    descs = _population(FOURTEEN)
+    pinned = sh.select_subset(descs, leg=0, classes=FOURTEEN)
+    assert len(pinned.classes) == 14
+    rotated = sh.select_subset(descs, leg=0, rotation=FOURTEEN)
+    assert len(rotated.classes) == 1
+
+
+def test_the_subset_bytes_land_in_the_crossover_band_not_the_whole_image():
+    """~218 MiB per-card diagonal (ticket C2), not 11836 MiB.
+
+    The assertion is a RATIO, not an absolute: one class of fourteen must cost
+    about a fourteenth of the population, so a subset that silently widens
+    again fails here even if the fixture's byte size changes.
+    """
+    descs = _population(FOURTEEN, per_class=5, nbytes=16 << 20)  # 14*5*16 MiB
+    whole = sum(d.nbytes for d in descs)
+    sub = sh.select_subset(descs, leg=3, rotation=FOURTEEN)
+    got = sum(v for v in sub.bytes_by_rank.values())
+    assert len(sub.classes) == 1
+    assert got * 14 == whole, (got, whole)
+    assert got < whole // 10
+
+
+def test_run_leg_hook_hands_the_plans_classes_in_as_the_rotation_not_the_pin():
+    """RED on `b1d68dfad0`: the line reads `classes = classes or plan.classes`.
+
+    Source-level, because the alternative is constructing a real LegPlan with
+    a live model runner.  The two assertions are the contract `LegPlan`'s
+    docstring already states and the code did not keep.
+    """
+    import ast as _ast
+
+    root = os.path.abspath(
+        os.path.join(os.path.dirname(__file__), "..", "..", "..", ".."))
+    path = os.path.join(root, "python", "sglang", "srt", "weg2",
+                        "weight_exchange_shadow.py")
+    with open(path, encoding="utf-8") as fh:
+        src = fh.read()
+    fn = next(n for n in _ast.walk(_ast.parse(src))
+              if isinstance(n, _ast.FunctionDef) and n.name == "run_leg_hook")
+    body = _ast.unparse(fn)
+
+    assert "classes = classes or plan.classes" not in body, (
+        "the plan's class POPULATION is still fed into select_subset's PIN -- "
+        "this is the shadowD classes=14 defect"
+    )
+    calls = [n for n in _ast.walk(fn) if isinstance(n, _ast.Call)
+             and _ast.unparse(n.func).endswith("select_subset")
+             # the no-plan early result selects over NO descs; there is no
+             # rotation to be uniform about and none is required.
+             and _ast.unparse(n.args[0] if n.args else _ast.Constant(0)) != "()"]
+    assert len(calls) >= 1
+    for c in calls:
+        kw = {k.arg for k in c.keywords}
+        assert "rotation" in kw, (
+            "select_subset is called without the group-uniform rotation; with "
+            "only this card's descs the three ranks of a group pick different "
+            "classes for the same leg (shadowD: rotation 19/20/21)"
+        )
+
+
+# ---------------------------------------------------------------------------
+# S6 fix E, second half -- THE OPERATOR DECISION ON D2/bs6, as a flag.
+#
+# Boot weg2shadowD D2 refused: W20, every rung of the ladder under the 6 GiB
+# store floor (store 0 / 2 / 4 GiB) where shadow C2 on the same `host` arm at
+# --d-bs 4 still had store 7.  Measured delta: bs 4 -> 6 costs 2.12 GiB of
+# leftover (12.40 -> 10.28) and 2.14 GiB of reap-bound (7.02 -> 4.88), ~1.07
+# GiB per additional D seat, against a 3.00 GiB xchg_bounce term and only 1.00
+# GiB of margin on the last fundable rung.  Without the bounce term D2's M=600
+# store would be 4 + 3 = 7 >= floor 6.
+#
+# OPERATOR DECISION 2026-09-09: keep the worst-case charge honest -- no
+# per-flip charge (it would fund the smallest flip and refuse none, which
+# `xchg_bounce_bytes_per_card`'s own docstring says in those words), no
+# non-uniform x4-only arm -- and make the CEILING settable instead.
+# ---------------------------------------------------------------------------
+
+def test_the_slot_ceiling_flag_defaults_to_a_byte_identical_boot():
+    """128 MiB and a 3.00 GiB charge is every boot so far."""
+    from sglang.srt.weg2 import host_ledger as hl
+
+    assert tp.ONCARD_SLOT_MIB_DEFAULT == 128
+    assert tp.validate_oncard_slot_mib(128) == 128
+    per_card = hl.xchg_bounce_bytes_per_card(slot_bytes=128 * xr.MIB)
+    assert per_card == tp.ONCARD_SLOTS_MAX * 128 * xr.MIB
+    assert hl.xchg_bounce_bytes(slot_bytes=128 * xr.MIB) / (1 << 30) == 3.0
+
+
+def test_slot_64_charges_1_50_gib_which_is_what_reopens_a_rung_at_bs6():
+    """The number ticket E2 depends on, computed rather than asserted by hand."""
+    from sglang.srt.weg2 import host_ledger as hl
+
+    assert tp.validate_oncard_slot_mib(64) == 64
+    assert hl.xchg_bounce_bytes(slot_bytes=64 * xr.MIB) / (1 << 30) == 1.5
+    # D2's M=600 rung had store 4 against floor 6 with 3.00 charged; giving
+    # 1.50 back clears the floor.  This is the arithmetic, not a prediction
+    # about the boot -- the anchors term is unchanged by the slot size.
+    assert 4 + (3.0 - 1.5) >= 6 - 0.5
+
+
+@pytest.mark.parametrize("bad", [0, -64, 16, 48, 100, "x", None, 31])
+def test_a_slot_ceiling_that_does_not_divide_the_geometry_refuses_by_name(bad):
+    """W66, not a clamp.
+
+    A clamp is what makes a ledger charge one geometry while the ranks
+    allocate another -- the drift `ONCARD_DEPOSIT_BYTES_MAX`'s own comment was
+    written after (it had charged the slot FLOOR beside the COUNT's ceiling and
+    understated the maximum 4x).
+    """
+    with pytest.raises(tp.Weg2XchgOncardSlotRefused) as exc:
+        tp.validate_oncard_slot_mib(bad)
+    assert "W66" in str(exc.value)
+    assert "does not divide" in str(exc.value) or "not an integer" in str(exc.value)
+
+
+@pytest.mark.parametrize("good", [32, 64, 96, 128, 256])
+def test_whole_multiples_of_the_32_mib_floor_are_accepted(good):
+    assert tp.validate_oncard_slot_mib(good) == good
+    assert good % (tp.ONCARD_SLOT_BYTES // xr.MIB) == 0
+
+
+def test_the_launcher_publishes_the_ceiling_to_both_groups_and_pops_it():
+    """Same discipline as the arm: launcher OUTPUT, published and popped.
+
+    An inherited `SGLANG_WEG2_XCHG_ONCARD_SLOT_MIB` would size a deposit this
+    boot's ledger charged a different worst case for -- the exact two-readings
+    failure the arm's own publication comment names.
+    """
+    root = os.path.abspath(
+        os.path.join(os.path.dirname(__file__), "..", "..", "..", ".."))
+    path = os.path.join(root, "python", "sglang", "srt", "weg2", "launcher.py")
+    with open(path, encoding="utf-8") as fh:
+        src = fh.read()
+    assert "--weg2-xchg-oncard-slot-mib" in src
+    assert "ENV_ONCARD_SLOT_MIB] = str(slot_mib)" in src
+    # Popped in build_env's launcher-OUTPUT loop and published by
+    # prepare_shadow_env, whose dict build_env applies AFTER that loop -- the
+    # ordering that matters is the runtime one (pop, then override), which the
+    # arm's three names already rely on and share this loop with.
+    assert "weight_exchange_transport.ENV_ONCARD_SLOT_MIB):" in src
+    i_loop = src.index("for key in (\"SGLANG_WEG2_XCHG_REGION\"")
+    i_apply = src.index("for key, value in (xchg_env or {}).items():")
+    assert i_loop < i_apply, "the pop loop must run before the xchg_env overrides"
+
+
+def test_the_launcher_charge_follows_the_flag_not_its_own_import():
+    """The trap this threading exists for.
+
+    The launcher process starts WITHOUT the flag in its environment, so
+    `tp.ONCARD_SLOT_BYTES_MAX` binds the 128 MiB default at import.  A charge
+    read from that constant would price 128 MiB slots while the ranks, which DO
+    have the published env, allocate 64 -- a ledger that funded one geometry
+    and a boot that ran another.
+    """
+    import ast as _ast
+
+    root = os.path.abspath(
+        os.path.join(os.path.dirname(__file__), "..", "..", "..", ".."))
+    path = os.path.join(root, "python", "sglang", "srt", "weg2", "launcher.py")
+    with open(path, encoding="utf-8") as fh:
+        src = fh.read()
+    fn = next(n for n in _ast.walk(_ast.parse(src))
+              if isinstance(n, _ast.FunctionDef)
+              and n.name == "xchg_bounce_charge_bytes")
+    assert "oncard_slot_mib" in {a.arg for a in fn.args.args}, (
+        "the charge cannot see the flag, so it prices the launcher's import-"
+        "time default"
+    )
+    body = _ast.unparse(fn)
+    assert "validate_oncard_slot_mib" in body, (
+        "the charge accepts a slot size it never validated"
+    )
