@@ -1158,6 +1158,9 @@ class Front:
         }
         self._x_since_resolve = 0
         self._x_seed_note = f"launcher solve X={self.tp_prefill_max_tokens}"
+        #: #1289: which inputs were missing at the last NO-SOLVE, so the line
+        #: is emitted on every CHANGE of that set rather than once per flip.
+        self._x_last_missing: List[str] = []
         # C8/K7: None = derive from the last completed flip in that direction.
         self.min_dwell_ms = None if min_dwell_ms is None else float(min_dwell_ms)
         # law 5 / C6: which group is awake when nothing is pending.
@@ -1792,6 +1795,14 @@ class Front:
             "dc_measured_d_mib": self.dc_measured_d,
             "uptime_s": round(time.time() - self.t0, 1),
             "fairness_w_s": self.w_s,
+            # #1289: X AND ITS PROVENANCE TRAVEL TOGETHER. An acceptance that
+            # reads only the number cannot tell the launcher's carried-in
+            # constant from a value this boot measured -- which is exactly how
+            # sb5f shipped `flip_s=3.79 (median of 30)` from a different
+            # layout's flips and nobody noticed for a whole run.
+            "x_tokens": self.tp_prefill_max_tokens,
+            "flip_min_work_tokens": self.flip_min_work_tokens,
+            "x_flip_s": self.x_flip_s_provenance(),
         }
 
     async def handle_passthrough_get(self, request: web.Request) -> web.Response:
@@ -3149,7 +3160,15 @@ class Front:
         self.flip_log.append(rec)
         self.counters["flips"] += 1
         # #1271 (b): this boot's own flip cost feeds the live X.
-        self.note_x_sample("flip_s", float(rec.get("flip_total_ms", 0)) / 1000.0)
+        # #1289: THE KEY IS `flip_ms`. `rec` has never had a `flip_total_ms`
+        # -- the name only ever existed in the LOG LINE below ("flip_total=%d
+        # ms", fed from `rec["flip_ms"]`), and `dict.get` with a default of 0
+        # turned that mismatch into a silent 0.0 that `note_x_sample` then
+        # dropped on its own `value <= 0` guard. Result on weg2sb5f: 14
+        # completed flips, ZERO flip_s samples, and `resolve_x_live` returning
+        # None at its first line for the whole boot. Read from the SAME key
+        # the log line reads, so the two can never disagree again.
+        self.note_x_sample("flip_s", float(rec["flip_ms"]) / 1000.0)
         logger.info("WEG2-FLIP done epoch=%d slept=%s woke=%s drain+quiesce=%d ms sleep=%d ms (kv RPC + the %s leg of the gathered pair) "
                     "wake=%d ms (the %s leg + kv RPC) "
                     "interleave=%d ms (NOT sleep+wake: the legs overlap -- gather wall %d ms against %d + %d ms of legs) "
@@ -3225,24 +3244,59 @@ class Front:
     X_SAMPLE_WINDOW = 32
 
     def note_x_sample(self, kind: str, value: float) -> None:
-        """Record one live X input. ``kind`` in {r_d, r_p, flip_s}."""
+        """Record one live X input. ``kind`` in {r_d, r_p, flip_s}.
+
+        #1289: A COMPLETED LEG PAIR IS ITSELF A TRIGGER. Before this the ONLY
+        trigger was the eighth ``r_p`` sample, i.e. the eighth P-DRAIN window
+        -- so on a boot whose load never routes long (weg2sb5f: 14 flips but
+        only SEVEN drains, because every prompt priced below X) the re-solve
+        could not fire even once, whatever the flip cost did. The legs are the
+        measurement this ticket is about, so a leg pair re-solves on its own.
+        The r_p trigger is kept unchanged beside it: two ways in, one
+        arithmetic, and the smoothing window below still decides how much
+        history each median sees.
+        """
         if value is None or value <= 0:
             return
         buf = self._x_samples.get(kind)
         if buf is None:
             return
         buf.append(float(value))
-        if kind == "r_p":
+        if kind == "flip_s":
+            # Every completed leg pair. The median over the window is what
+            # smooths -- not a count of legs withheld from the solver.
+            self.resolve_x_live()
+        elif kind == "r_p":
             self._x_since_resolve += 1
             if self._x_since_resolve >= self.X_RESOLVE_EVERY:
                 self._x_since_resolve = 0
                 self.resolve_x_live()
+
+    def x_flip_s_provenance(self) -> str:
+        """``flip_s source=live|seed n=`` -- on EVERY X decision (#1289).
+
+        ``seed`` means no leg of THIS boot has been measured yet and X is
+        still the launcher's carried-in constant; ``live`` means the median
+        below is this boot's own legs and names how many. sb5f shipped
+        ``flip_s=3.79 (median of 30)`` -- thirty flips of the PREVIOUS boot,
+        on a different layout, while its own eight legs measured 3.906 s
+        (D->P) and 4.175 s (P->D). Without this line the reader cannot tell a
+        carried-in number from a measured one, and that is the whole defect.
+        """
+        n = len(self._x_samples["flip_s"])
+        return f"flip_s source={'live' if n else 'seed'} n={n}"
 
     def resolve_x_live(self) -> Optional[int]:
         """Re-solve X from the boot's own medians; return the new X or None.
 
         Prints the re-solve WITH ITS PROVENANCE -- an X that changed silently
         is a routing threshold nobody can account for after the fact.
+
+        #1289: AND IT PRINTS WHEN IT DOES NOT. The early return below used to
+        be silent, so a boot with an empty ``flip_s`` deque (the whole of
+        weg2sb5f) looked exactly like a boot where nothing needed re-solving.
+        A missing input is now a named, rate-limited line that says WHICH
+        input is missing.
         """
         import statistics as _st
 
@@ -3254,7 +3308,20 @@ class Front:
 
         s = self._x_samples
         if not (s["r_d"] and s["r_p"] and s["flip_s"]):
+            missing = [k for k in ("r_d", "r_p", "flip_s") if not s[k]]
+            if missing != self._x_last_missing:
+                self._x_last_missing = missing
+                logger.warning(
+                    "WEG2 X NO-SOLVE: no %s sample yet, so X stays at the "
+                    "carried-in %d (%s; have r_d=%d r_p=%d flip_s=%d). This "
+                    "line exists because the same state was SILENT on "
+                    "weg2sb5f for 14 flips (#1289)",
+                    " and ".join(missing), self.tp_prefill_max_tokens,
+                    self.x_flip_s_provenance(),
+                    len(s["r_d"]), len(s["r_p"]), len(s["flip_s"]),
+                )
             return None
+        self._x_last_missing = []
         r_d = _st.median(s["r_d"])
         r_p = _st.median(s["r_p"])
         flip_s = _st.median(s["flip_s"])
@@ -3276,8 +3343,9 @@ class Front:
             # No break-even (r_D >= r_P) is a real state, not an error: the
             # round trip does not pay and X stays where it was.
             logger.warning(
-                "WEG2 X RE-SOLVE held: %s -- X stays %d (n=%d/%d/%d)",
-                e, prev, len(s["r_d"]), len(s["r_p"]), len(s["flip_s"]),
+                "WEG2 X RE-SOLVE held: %s -- X stays %d (%s; n=%d/%d/%d)",
+                e, prev, self.x_flip_s_provenance(),
+                len(s["r_d"]), len(s["r_p"]), len(s["flip_s"]),
             )
             return None
         self.tp_prefill_max_tokens = x
@@ -3286,7 +3354,8 @@ class Front:
         self.counters["x_resolves"] += 1
         logger.info(
             "WEG2 X RE-SOLVE n=%d X=%d <- X_prev=%d r_D=%.0f r_P=%.0f flip_s=%.2f "
-            "source=live (medians over this boot's own samples: %d r_D, %d r_P "
+            + self.x_flip_s_provenance() +
+            " source=live (medians over this boot's own samples: %d r_D, %d r_P "
             "drains, %d flips, window %d; seeded from %s. Both rates are "
             "group_throughput -- tokens the group moved over the wall it was "
             "busy -- so 1/r_D-1/r_P is a time-per-token difference; #1271)",

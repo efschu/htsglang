@@ -127,9 +127,14 @@ class RollingResolve(CustomTestCase):
         }
         f._x_since_resolve = 0
         f._x_seed_note = f"launcher solve X={x}"
+        # #1289: mirrors the constructor. A hand-built Front that omits a
+        # field the real one has is a test that passes on a shape production
+        # never runs -- which is how this ticket's defect stayed green here.
+        f._x_last_missing = []
         f.counters = collections.Counter()
         f.note_x_sample = Front.note_x_sample.__get__(f)
         f.resolve_x_live = Front.resolve_x_live.__get__(f)
+        f.x_flip_s_provenance = Front.x_flip_s_provenance.__get__(f)
         return f
 
     def test_red_first_x_does_not_move_before_n_samples(self):
