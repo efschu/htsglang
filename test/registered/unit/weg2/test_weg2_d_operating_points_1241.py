@@ -20,6 +20,7 @@ from unittest import mock
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 
 from sglang.srt.weg2.launcher import (  # noqa: E402
+    RING_FORM_SENTINEL_STORE_CFG,
     D_OPERATING_POINTS,
     D_TP_OBJECTIVE_CHOICES,
     D_TP_OBJECTIVE_DEFAULT,
@@ -277,7 +278,7 @@ class OperatingPointVectorTest(unittest.TestCase):
             budgets=common["budgets"],
             s_gb=8,
             m_mib=4096,
-            store_gib=64,
+            store_cfg=RING_FORM_SENTINEL_STORE_CFG,
             extra=[],
             d_bs=6,
             max_kv_per_request=262144,
@@ -572,7 +573,7 @@ class OperatingPointVectorTest(unittest.TestCase):
 
         argv = argv_d(
             py="python3", model="/model", budgets=SB5E_BUDGETS, s_gb=8, m_mib=4096,
-            store_gib=64, extra=[], d_bs=6,
+            store_cfg=RING_FORM_SENTINEL_STORE_CFG, extra=[], d_bs=6,
         )
         i = argv.index("--speculative-num-draft-tokens")
         self.assertEqual(argv[i + 1], str(SPEC_NUM_DRAFT_TOKENS))
