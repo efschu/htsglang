@@ -1765,11 +1765,11 @@ def no_active_leg():
     """No shadow run may leak OUT of a test either."""
     sh.set_plan_provider(None)
     yield
-    active = sh._ACTIVE_LEG
+    active = sh._active_leg()
     if active is not None:
         active.close(owner=active.token)
     sh.set_plan_provider(None)
-    assert sh._ACTIVE_LEG is None
+    assert sh._active_leg() is None
 
 
 # --- the arm: the ring path may not reach a single line of this ------------
@@ -1796,7 +1796,7 @@ def test_the_hooks_are_never_reached_on_the_ring_arm(monkeypatch, no_active_leg)
     lines: list = []
     assert sh.run_leg_hook(_inputs(sh.HOOK_DESTINATION), log=lines.append) is None
     assert lines == [], lines
-    assert sh._ACTIVE_LEG is None
+    assert sh._active_leg() is None
 
 
 def test_the_shadow_arm_reaches_the_hook(monkeypatch, no_active_leg):
@@ -2066,12 +2066,12 @@ def test_a_stale_run_is_closed_by_name_and_never_carried_across_flips(
     may not cause.
     """
     stale = sh.ShadowLeg(_inputs(sh.HOOK_SOURCE, leg=0), lambda _s: None).adopt()
-    assert sh._ACTIVE_LEG is stale
+    assert sh._active_leg() is stale
     lines: list = []
     sh.run_leg_hook(_inputs(sh.HOOK_DESTINATION, leg=1), log=lines.append,
                     descs=(), armed=True)
     assert stale.closed is True
-    assert sh._ACTIVE_LEG is None
+    assert sh._active_leg() is None
     assert any("reason=stale-run" in ln for ln in lines), lines
 
 
@@ -2105,6 +2105,35 @@ def test_a_leg_never_closes_a_region_or_a_device_it_was_handed(region, boot,
         xr.unlink_semaphores(boot)
 
 
+def test_two_legs_in_one_interpreter_do_not_close_each_other(no_active_leg):
+    """MEASURED DEFECT of this round: the active slot was PROCESS-wide.
+
+    In the product the two hooks of one flip are two rank PROCESSES, so the two
+    forms are the same thing there -- but wherever a second leg shares the
+    interpreter (this file's own two-sided test) the second adopt() closed the
+    first leg out from under itself, and it presented as a gate expiry
+    ``only n/6 ranks published`` five seconds inside a flip.  The leg is owned
+    by the THREAD that runs it; a stale run carried across FLIPS is the same
+    thread and is still caught.
+    """
+    a = sh.ShadowLeg(_inputs(sh.HOOK_SOURCE, leg=0), lambda _s: None).adopt()
+    seen: list = []
+
+    def other():
+        b = sh.ShadowLeg(_inputs(sh.HOOK_DESTINATION, leg=0),
+                         lambda _s: None).adopt()
+        seen.append(sh._active_leg() is b)
+        b.close(owner=b.token)
+
+    t = threading.Thread(target=other)
+    t.start()
+    t.join(30)
+    assert seen == [True]
+    assert a.closed is False, "the other thread's leg closed this one"
+    assert sh._active_leg() is a
+    a.close(owner=a.token)
+
+
 def test_a_handler_cannot_close_a_run_it_does_not_own(no_active_leg):
     """The token is the whole guard: a wrong owner is a NO-OP, not a free."""
     leg = sh.ShadowLeg(_inputs(sh.HOOK_SOURCE), lambda _s: None)
@@ -2128,7 +2157,7 @@ def test_the_hook_closes_its_run_on_every_path_including_the_raising_one(
     finally:
         sh.set_plan_provider(previous)
     assert result.reason.startswith("hook-failed:RuntimeError")
-    assert sh._ACTIVE_LEG is None
+    assert sh._active_leg() is None
 
 
 # --- danger 3: a hook whose failure aborts the leg ------------------------
@@ -2253,7 +2282,7 @@ def test_the_destination_hook_matches_the_ring_and_writes_nothing_into_it(
                       "resume_reserve_mib="):
             assert token in line, (token, line)
         assert any("hook=source" in ln for ln in lines)
-        assert sh._ACTIVE_LEG is None
+        assert sh._active_leg() is None
     finally:
         src_ops.close()
         dst_ops.close()
