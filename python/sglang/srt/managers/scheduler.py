@@ -13588,23 +13588,33 @@ class Scheduler(
             self._decode_steps_this_phase = (
                 int(getattr(self, "_decode_steps_this_phase", 0) or 0) + 1
             )
-            # #1241 THE DECODE ROUND BOUNDARY. Here and nowhere else, for the
-            # same reason the counter above is here: this is the ONE funnel
-            # every batch passes on its way to a forward, so a round opened
-            # here cannot miss a forward and cannot double-count one. The
-            # boundary also RETIRES the previous round and reads whatever is
-            # ready (query-only, never a sync) -- so round N's line is emitted
-            # at the start of round N+1, one round late by construction.
-            #
-            # `batch.forward_iter` is `self.forward_ct`, the boot-monotone
-            # forward counter set three lines above; it is the join key the
-            # decode ladder's per-round aggregate is matched on, so it is
-            # taken from the scheduler's own counter rather than counted a
-            # second time inside the log.
-            _drl = getattr(
-                getattr(self, "metrics_reporter", None), "decode_round_log", None
-            )
-            if _drl is not None:
+
+        # #1241 THE DECODE ROUND BOUNDARY. Here and nowhere else, for the same
+        # reason the decode-step counter above is here: this is the ONE funnel
+        # every batch passes on its way to a forward, so a round opened here
+        # cannot miss a forward and cannot double-count one.
+        #
+        # OUTSIDE the `is_decode` branch on purpose. A round's lifetime is ONE
+        # batch: every batch closes whatever round was open, and only a decode
+        # batch then opens a new one. Closing only at the next `begin_round`
+        # (the first version) leaves the round open across the batch boundary,
+        # and on any boot that interleaves prefill with decode -- upstream
+        # chunked prefill, and group D's own `--tp-prefill-max-tokens`
+        # phase-prefill -- the following PREFILL forward then folds into the
+        # previous decode round and its bracket steals the slot
+        # `SplitDeviceTimer` armed for the shipped #252 prefill line.
+        #
+        # `batch.forward_iter` is `self.forward_ct`, the boot-monotone forward
+        # counter set at the top of this method. It orders rounds within a
+        # rank; it is NOT the ladder join key (see decode_round_log's
+        # docstring -- the ladder joins on the line's wall stamp).
+        _drl = getattr(
+            getattr(self, "metrics_reporter", None), "decode_round_log", None
+        )
+        if _drl is not None:
+            if not batch.forward_mode.is_decode():
+                _drl.end_round()
+            else:
                 _bs = batch.batch_size()
                 # Rows this round submits. PRIMARY WRITER is scheduler.py:1078
                 # (`_lane_pairing_rows_per_seq`, a target-verify runs
@@ -13629,7 +13639,7 @@ class Scheduler(
                 _drl.begin_round(
                     round_id=int(batch.forward_iter),
                     bs=int(_bs),
-                    tokens=int(_bs) * int(_rows or 1),
+                    rows=int(_bs) * int(_rows or 1),
                 )
 
         # #1233 (WEG 2, S0): the draft worker used to start COLD after a

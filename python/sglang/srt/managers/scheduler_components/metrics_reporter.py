@@ -721,8 +721,17 @@ class SchedulerMetricsReporter:
         )
         # #1241 THE DECODE HALF OF THE SAME INSTRUMENT. Same clock object,
         # deliberately: a collective is counted once, by one arming, whichever
-        # phase issued it. Prefill and decode brackets never nest -- a batch is
-        # prefill XOR decode -- so the single armed slot is never contended.
+        # phase issued it.
+        #
+        # ONE SLOT, TWO ARMERS, AND THE EXCLUSION IS ENFORCED RATHER THAN
+        # ASSUMED. A batch is prefill XOR decode, so the two brackets should
+        # never nest -- but that is a premise about the scheduler, and the
+        # first version of this instrument broke it by leaving the decode
+        # round open across the batch boundary. `CollectiveClock.arm` and
+        # `open_round` now each refuse a slot the other holds and COUNT the
+        # refusal, and the decode overhead line prints both counts (they must
+        # be 0). A boot where they are not 0 has a round boundary defect, not
+        # a tuning question.
         #
         # ONE log object per rank, shared with the DRAFT runners as well as the
         # target runner: a speculative round is a draft forward plus a verify
@@ -1122,6 +1131,21 @@ class SchedulerMetricsReporter:
             graphed=can_run_cuda_graph,
         )
         self.rank_prefill_log.flush()
+        # #1241: the decode half is drained at the same three sites the
+        # prefill half is drained at. Query-only, so a drain that finds
+        # nothing ready costs two branches. It does NOT retire the open round
+        # -- the funnel owns the round boundary (scheduler._run_batch_forward)
+        # and a second retire authority is exactly the second bookkeeping this
+        # instrument must not grow.
+        #
+        # getattr, NOT self.decode_round_log: this pre-gate region is driven
+        # in tests by reporter STAND-INS (SimpleNamespace) that carry only the
+        # fields it reads -- the same reason the #861k block below uses
+        # getattr. A new unconditional attribute here is an AttributeError on
+        # every silent-rank test.
+        _drl = getattr(self, "decode_round_log", None)
+        if _drl is not None and _drl.has_pending:
+            _drl.flush()
         # Before the logging-rank gate: the online estimator runs on the rank
         # that carries the lanes, which is not necessarily the logging rank.
         self.prefill_tokens_total += int(prefill_stats.log_input_tokens or 0)
@@ -1297,6 +1321,9 @@ class SchedulerMetricsReporter:
         # last prefill report (e.g. the tail chunk of a prefill burst).
         if self.rank_prefill_log.has_pending:
             self.rank_prefill_log.flush()
+        _drl = getattr(self, "decode_round_log", None)
+        if _drl is not None and _drl.has_pending:
+            _drl.flush()
 
         batch = running_batch or self.scheduler.running_batch
 
@@ -1744,6 +1771,15 @@ class SchedulerMetricsReporter:
         # no decode iteration left to flush its last per-rank line.
         if self.rank_prefill_log.has_pending:
             self.rank_prefill_log.flush()
+        # #1241 THE IDLE FLUSH, and the only site outside the funnel that
+        # RETIRES a round. A decode burst that ends leaves its last round open
+        # with no further batch to close it; at idle there is provably no
+        # forward left to fold into it, so retiring here emits that round
+        # instead of losing it -- which is every measurement window's last
+        # round and every pre-flip drain's.
+        _drl = getattr(self, "decode_round_log", None)
+        if _drl is not None and _drl.has_pending:
+            _drl.end_round()
 
         if (
             not self.current_scheduler_metrics_enabled

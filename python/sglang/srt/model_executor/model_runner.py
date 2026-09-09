@@ -4856,12 +4856,24 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     and self.decode_cuda_graph_runner.can_run_graph(forward_batch)
                 )
                 if worker_can_run_graph:
-                    self.decode_cuda_graph_runner.execute(
-                        forward_batch,
-                        pp_proxy_tensors=pp_proxy_tensors,
-                    )
+                    # #1241 (review R6). Bracketed like the head's replay
+                    # below. An UNBRACKETED rank retires an EMPTY round and
+                    # emits no line at all, and a three-rank comparison
+                    # silently missing one rank is worse than no comparison:
+                    # nothing in the log would say which rank is absent.
+                    with self._decode_round_segment(
+                        "target_verify"
+                        if forward_batch.forward_mode.is_target_verify()
+                        else "decode",
+                        graphed=True,
+                    ):
+                        self.decode_cuda_graph_runner.execute(
+                            forward_batch,
+                            pp_proxy_tensors=pp_proxy_tensors,
+                        )
                     return ModelRunnerOutput(logits_output=None, can_run_graph=True)
-                return self._forward_weightless_worker(forward_batch)
+                with self._decode_round_segment("decode", graphed=False):
+                    return self._forward_weightless_worker(forward_batch)
 
             mode_check = (
                 forward_batch.forward_mode.is_cpu_graph

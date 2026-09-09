@@ -24,8 +24,8 @@ the same reader parses.
 
 THE LINE, deliberately named so ONE grep finds both families::
 
-    Decode rank batch, rank: 1, #round: 4120, bs: 6, #tokens: 24, #fwd: 2,
-    gpu-ms: 31.4 (compute 19.8, wait 11.6)
+    Decode rank batch, rank: 1, #round: 4120, t: 1757397412.318, bs: 6,
+    #rows: 24, #fwd: 2, gpu-ms: 31.4 (compute 19.8, wait 11.6)
     (wait by family: tp.all_reduce 9.2/129x, spec_verify:tp.all_reduce 2.4/3x)
 
 ``grep -E ' rank batch, '`` returns the prefill and the decode family
@@ -33,7 +33,7 @@ together, and ``debug_utils/rank_phase_summary.py`` -- whose docstring has
 promised a ``Decode rank batch`` pattern since #252 and whose regex is
 ``\\w+\\s+rank batch`` -- parses it with no change to its arithmetic.
 
-WHAT A ROUND IS. One scheduler decode step: the funnel
+WHAT A ROUND IS, AND WHERE IT ENDS. One scheduler decode step: the funnel
 ``Scheduler._run_batch_forward`` already counts as ``_decode_steps_this_phase``.
 Under speculation that step is SEVERAL forwards (a draft extend, then a target
 verify), so a round is a FOLD of brackets exactly as the prefill line's
@@ -42,6 +42,29 @@ K, and ``gpu-ms`` is the sum of the folded brackets' device time -- device
 time, so the host-side gap BETWEEN two forwards of one round is not in it.
 That gap is the PP bubble's separate term (``pp_bubble.PPBubbleMeter``) and is
 never derived from this one, the same rule the prefill line already states.
+
+THE ROUND IS CLOSED BY THE SAME FUNNEL THAT OPENS IT, and this is the whole
+of its lifetime -- it is not a state that persists between batches. EVERY
+batch entering ``_run_batch_forward`` retires whatever round was open; only a
+DECODE batch then opens a new one. The first version of this module opened at
+the funnel and retired only at the next ``begin_round``, which is a different
+and wrong lifetime: on any boot that interleaves prefill with decode (chunked
+prefill upstream; group D's own ``--tp-prefill-max-tokens`` phase-prefill
+here) the round stayed open across the batch boundary, so the next PREFILL
+forward's device time and collectives folded into the previous decode round,
+were labelled ``spec_draft:`` by ``PHASE_OF_CATEGORY['extend']``, and -- worst
+-- the round's bracket took the slot that ``SplitDeviceTimer`` had just armed
+for that prefill forward, dropping the SHIPPED #252 line's compute/wait
+column. ``CollectiveClock.open_round`` now refuses a contended slot instead of
+taking it (belt), and the funnel closes the round on every non-decode batch
+(braces). Both, because the failure was silent in both directions.
+
+FLUSHED WHERE THE PREFILL HALF IS FLUSHED. ``metrics_reporter`` already
+drains ``rank_prefill_log`` at the decode report, the prefill report and the
+idle tick; the decode log is drained at the same three, and the idle tick
+additionally RETIRES the open round -- that is the "idle flush" this
+docstring used to name without anyone having written it, and it is why the
+last round of a decode burst is emitted at all.
 
 GRAPH-REPLAY HONEST, WHICH HERE MEANS MOSTLY REFUSING. Decode is the phase
 that actually runs from captured CUDA graphs, and a collective inside a
@@ -67,12 +90,39 @@ round instead of forcing the device. A round is therefore emitted one round
 after it ran, and the last round of a boot is emitted by the idle flush or
 not at all -- never by a sync.
 
-JOINABLE TO THE LADDER. ``devtools/probe_decode_ladder.py`` reports per-round
-aggregates over the front. The join key is printed on this line and nowhere
-derived: ``#round`` (the scheduler's own monotone decode-step counter),
-``bs`` and ``#tokens``. ``rank`` is on the line as a FIELD rather than left to
-the log prefix, because the two groups of a Weg-2 boot write their prefixes
-differently and a cross-rank join must not depend on the formatter.
+JOINABLE TO THE LADDER -- ON WALL TIME, WHICH IS THE ONLY AXIS BOTH SIDES
+ACTUALLY HAVE. ``devtools/probe_decode_ladder.py`` drives the front and
+reports per-arm aggregates. Three candidate join keys, two of which are
+category errors and are named here so nobody re-derives them:
+
+* ``#round`` is the scheduler's ``forward_ct``, incremented on EVERY forward
+  including prefill and idle, thousands deep into a boot. The probe's own
+  ``rec["round"]`` is the REPEAT INDEX of an arm (0, 1, 2). Same word, two
+  quantities; joining them is meaningless. ``#round`` is printed because it
+  orders and de-duplicates rounds WITHIN one rank -- not to join across
+  processes. Whether the three D ranks hold the same ``forward_ct`` for the
+  same round is UNPROVEN: nothing checks it, and a single divergent forward
+  on one rank would offset every later round. Do not assume it.
+* ``#rows`` is rows SUBMITTED (``bs x rows_per_seq``; under MTP a verify
+  submits ``num_draft_tokens`` rows per sequence). The probe counts
+  ``completion_tokens``, i.e. tokens ACCEPTED. They differ by the acceptance
+  rate, so they are not two readings of one quantity and must never be
+  equated. The field was called ``#tokens`` in the first version of this
+  module, which invited exactly that. Renamed.
+* ``t`` is the join key: UNIX epoch seconds with milliseconds, taken at
+  emission. Epoch and not ``monotonic`` deliberately -- the probe is a
+  different process (and may be a different tool entirely), and epoch is the
+  one clock both can read. It is on the line as a FIELD because the emission
+  is one round LATE by construction, so the log prefix's timestamp is the
+  time the line was WRITTEN, not the time the round RAN; ``t`` is stamped
+  when the round is OPENED, which is the quantity a ladder window needs.
+  The two differ by about one round, below the ladder's arm granularity,
+  so a window join is sound and a per-round cross-process join is not
+  offered.
+
+``rank`` is on the line as a FIELD rather than left to the log prefix,
+because the two groups of a Weg-2 boot write their prefixes differently and a
+cross-rank join must not depend on the formatter.
 """
 
 from __future__ import annotations
@@ -91,12 +141,17 @@ __all__ = ["DecodeRoundLog", "RoundAcc"]
 class RoundAcc:
     """One round's folded brackets, before it is readable."""
 
-    __slots__ = ("round_id", "bs", "tokens", "spans", "categories")
+    __slots__ = ("round_id", "bs", "rows", "spans", "categories", "wall")
 
-    def __init__(self, round_id: int, bs: int, tokens: int) -> None:
+    def __init__(self, round_id: int, bs: int, rows: int) -> None:
         self.round_id = int(round_id)
         self.bs = int(bs)
-        self.tokens = int(tokens)
+        #: Rows SUBMITTED this round, never rows accepted. See the module
+        #: docstring's join-key section for why the distinction is load
+        #: bearing against the ladder's completion count.
+        self.rows = int(rows)
+        #: UNIX epoch at the moment the round was opened. The join axis.
+        self.wall = time.time()
         # (span, category, graphed)
         self.spans: List[Tuple[object, str, bool]] = []
         self.categories: List[str] = []
@@ -142,7 +197,7 @@ class DecodeRoundLog:
 
     # -- round boundary --------------------------------------------------
 
-    def begin_round(self, round_id: int, bs: int, tokens: int) -> None:
+    def begin_round(self, round_id: int, bs: int, rows: int) -> None:
         """Open round ``round_id`` and read whatever earlier rounds are ready.
 
         The flush happens BEFORE the new round is opened, so the reading of
@@ -152,9 +207,38 @@ class DecodeRoundLog:
         t0 = time.perf_counter_ns()
         self._retire_open()
         self.flush()
-        self._open = RoundAcc(round_id, bs, tokens)
+        self._open = RoundAcc(round_id, bs, rows)
         self.round_id = int(round_id)
         self._overhead_ns += time.perf_counter_ns() - t0
+
+    def end_round(self) -> None:
+        """Close the open round without opening another, and drain.
+
+        THE OTHER HALF OF ``begin_round``, and the reason a round's lifetime
+        is one batch rather than "until the next decode batch". Called from
+        the funnel for every NON-decode batch and from the idle tick, so that
+
+        * a prefill/extend/idle forward is never folded into a decode round
+          it did not run in, and
+        * the last round of a decode burst is emitted rather than sitting
+          open until the next burst -- or, at the end of a phase, forever.
+
+        Idempotent: outside a round it is two branches and a flush.
+        """
+        t0 = time.perf_counter_ns()
+        self._retire_open()
+        self.flush()
+        self._overhead_ns += time.perf_counter_ns() - t0
+
+    @property
+    def has_pending(self) -> bool:
+        """True while a round is open or a retired round is unread.
+
+        Same name and same role as ``RankPrefillLog.has_pending``, so the
+        three flush sites in ``metrics_reporter`` guard both halves of the
+        instrument with the same shape of condition.
+        """
+        return self._open is not None or bool(self._pending)
 
     def _retire_open(self) -> None:
         if self._open is None:
@@ -263,14 +347,15 @@ class DecodeRoundLog:
                     slot[1] += stat.count
 
         line = (
-            "Decode rank batch, rank: %d, #round: %d, bs: %d, #tokens: %d, "
-            "#fwd: %d, gpu-ms: %.1f"
+            "Decode rank batch, rank: %d, #round: %d, t: %.3f, bs: %d, "
+            "#rows: %d, #fwd: %d, gpu-ms: %.1f"
         )
         args: list = [
             self.rank,
             acc.round_id,
+            acc.wall,
             acc.bs,
-            acc.tokens,
+            acc.rows,
             len(results),
             round_ms,
         ]
@@ -318,15 +403,31 @@ class DecodeRoundLog:
         share = (
             100.0 * (us_per_round / 1000.0) / mean_gpu_ms if mean_gpu_ms > 0 else 0.0
         )
+        # THE EMISSION RATE, STATED. One line per round per rank is a lot of
+        # log at 30 ms rounds, and the operator reading a ladder window out of
+        # this log is entitled to know how much of that log is the instrument
+        # before deciding to run the window with the emitter on. Derived from
+        # the same denominator as the overhead, so it cannot drift from it.
+        lines_per_s = 1000.0 / mean_gpu_ms if mean_gpu_ms > 0 else float("nan")
+        arm_refusals, round_contentions = (0, 0)
+        counts = getattr(self.clock, "contention_counts", None)
+        if counts is not None:
+            arm_refusals, round_contentions = counts
         logger.info(
             "Decode rank clock overhead, rank: %d, %.1f us/round host-side over "
-            "%d rounds = %.3f %% of the mean round gpu-ms %.2f. Host-side only: "
-            "the device cost is two event records per forward and is inside the "
-            "bracket it measures. Dropped rounds (events never readable): %d.",
+            "%d rounds = %.3f %% of the mean round gpu-ms %.2f, emitting about "
+            "%.0f lines/s on this rank. Host-side only: the device cost is two "
+            "event records per forward and is inside the bracket it measures. "
+            "Dropped rounds (events never readable): %d. Slot contention with "
+            "the prefill half (#252), both MUST be 0: prefill armings refused "
+            "%d, decode rounds opened contended %d.",
             self.rank,
             us_per_round,
             self._overhead_rounds,
             share,
             mean_gpu_ms,
+            lines_per_s,
             self._dropped_rounds,
+            arm_refusals,
+            round_contentions,
         )

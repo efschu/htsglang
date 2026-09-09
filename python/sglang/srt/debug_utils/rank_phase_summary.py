@@ -27,7 +27,14 @@ _LINE_RE = re.compile(
     # prefix) parses byte-identically.
     r"(?:,\s*rank:\s*(?P<rank_field>\d+))?"
     r"(?:.*?#round:\s*(?P<round>\d+))?"
+    # #1241 the LADDER JOIN AXIS: UNIX epoch at which the round was opened.
+    # Optional, so the prefill line (which has none) parses unchanged.
+    r"(?:.*?\bt:\s*(?P<wall>\d+\.\d+))?"
     r"(?:.*?bs:\s*(?P<bs>\d+))?"
+    # Rows SUBMITTED this round. Named `#rows` and not `#tokens` on purpose:
+    # the ladder counts tokens ACCEPTED, and under MTP the two differ by the
+    # acceptance rate. A reader who equates them mis-scales the join.
+    r"(?:.*?#rows:\s*(?P<rows>\d+))?"
     r".*?gpu-ms:\s*(?P<gpu_ms>[\d.]+)"
     r"\s*\(compute\s+(?P<compute_ms>[\d.]+),\s*wait\s+(?P<wait_ms>[\d.]+)\)"
     r"(?:\s*\(wait by family:\s*(?P<families>.*?)\))?"
@@ -39,6 +46,9 @@ _LINE_RE = re.compile(
 _NO_SPLIT_RE = re.compile(
     r"\[(?P<ts_and_rank>[^\]]+)\]\s+(?P<phase>\w+)\s+rank batch"
     r"(?:,\s*rank:\s*(?P<rank_field>\d+))?"
+    r"(?:.*?#round:\s*(?P<round>\d+))?"
+    r"(?:.*?\bt:\s*(?P<wall>\d+\.\d+))?"
+    r"(?:.*?bs:\s*(?P<bs>\d+))?"
     r".*?gpu-ms:\s*(?P<gpu_ms>[\d.]+)"
     r"\s*\(split unavailable:\s*(?P<reason>[^,]+),"
 )
@@ -99,10 +109,14 @@ def parse_rank_batch_line(line: str) -> Optional[dict]:
             "wait_by_family": family_dict,
             "split_known": True,
         }
-        if m.groupdict().get("round") is not None:
+        if m.group("round") is not None:
             out["round"] = int(m.group("round"))
-        if m.groupdict().get("bs") is not None:
+        if m.group("bs") is not None:
             out["bs"] = int(m.group("bs"))
+        if m.group("rows") is not None:
+            out["rows"] = int(m.group("rows"))
+        if m.group("wall") is not None:
+            out["wall"] = float(m.group("wall"))
         return out
     except Exception:
         return None
@@ -128,13 +142,20 @@ def parse_unsplit_line(line: str) -> Optional[dict]:
             if rm is None:
                 return None
             rank = rm.group("rank")
-        return {
+        out = {
             "rank": rank,
             "phase": m.group("phase"),
             "gpu_ms": float(m.group("gpu_ms")),
             "split_known": False,
             "reason": m.group("reason").strip(),
         }
+        if m.group("round") is not None:
+            out["round"] = int(m.group("round"))
+        if m.group("bs") is not None:
+            out["bs"] = int(m.group("bs"))
+        if m.group("wall") is not None:
+            out["wall"] = float(m.group("wall"))
+        return out
     except Exception:
         return None
 
@@ -144,16 +165,21 @@ def summarize(lines: Iterable[str]) -> dict:
 
     Returns a dict keyed by rank string, each value containing:
         count, mean_gpu_ms, max_gpu_ms, mean_compute_ms, mean_wait_ms,
-        total_wait_by_family  (family -> (total_ms, total_count))
+        total_wait_by_family  (family -> (total_ms, total_count)),
+        withheld, withheld_gpu_ms_values, withheld_reasons
+
+    THE DENOMINATOR IS PART OF THE ANSWER (#1241). A ``Decode rank batch``
+    line whose split was WITHHELD (graph replay, or a slot contended with the
+    prefill half) carries an honest ``gpu-ms`` and no compute/wait pair. The
+    first version of this function dropped those lines silently, so the mean
+    it printed was a mean over the readable MINORITY of a graph-covered boot
+    while being labelled the boot's. They are counted here instead, by rank
+    and by reason, and ``report`` prints the count next to the mean it does
+    not contain.
     """
     accum: Dict[str, dict] = {}
 
-    for line in lines:
-        parsed = parse_rank_batch_line(line)
-        if parsed is None:
-            continue
-
-        rank = parsed["rank"]
+    def _slot(rank: str) -> dict:
         if rank not in accum:
             accum[rank] = {
                 "count": 0,
@@ -161,9 +187,26 @@ def summarize(lines: Iterable[str]) -> dict:
                 "compute_ms_sum": 0.0,
                 "wait_ms_sum": 0.0,
                 "total_wait_by_family": {},
+                "withheld": 0,
+                "withheld_gpu_ms_values": [],
+                "withheld_reasons": {},
             }
+        return accum[rank]
 
-        a = accum[rank]
+    for line in lines:
+        parsed = parse_rank_batch_line(line)
+        if parsed is None:
+            unsplit = parse_unsplit_line(line)
+            if unsplit is None:
+                continue
+            a = _slot(unsplit["rank"])
+            a["withheld"] += 1
+            a["withheld_gpu_ms_values"].append(unsplit["gpu_ms"])
+            reason = unsplit["reason"]
+            a["withheld_reasons"][reason] = a["withheld_reasons"].get(reason, 0) + 1
+            continue
+
+        a = _slot(parsed["rank"])
         a["count"] += 1
         a["gpu_ms_values"].append(parsed["gpu_ms"])
         a["compute_ms_sum"] += parsed["compute_ms"]
@@ -177,14 +220,22 @@ def summarize(lines: Iterable[str]) -> dict:
     for rank, a in accum.items():
         n = a["count"]
         gpu_vals = a["gpu_ms_values"]
-        result[rank] = {
+        row = {
             "count": n,
-            "mean_gpu_ms": sum(gpu_vals) / n,
-            "max_gpu_ms": max(gpu_vals),
-            "mean_compute_ms": a["compute_ms_sum"] / n,
-            "mean_wait_ms": a["wait_ms_sum"] / n,
+            # A rank with ONLY withheld rounds has no split to average. None,
+            # never 0.0: the whole point of counting the withheld rounds is
+            # that an absent split must not be readable as a small one.
+            "mean_gpu_ms": (sum(gpu_vals) / n) if n else None,
+            "max_gpu_ms": max(gpu_vals) if n else None,
+            "mean_compute_ms": (a["compute_ms_sum"] / n) if n else None,
+            "mean_wait_ms": (a["wait_ms_sum"] / n) if n else None,
             "total_wait_by_family": a["total_wait_by_family"],
+            "withheld": a["withheld"],
+            "withheld_reasons": dict(a["withheld_reasons"]),
         }
+        wv = a["withheld_gpu_ms_values"]
+        row["withheld_mean_gpu_ms"] = (sum(wv) / len(wv)) if wv else None
+        result[rank] = row
     return result
 
 
@@ -203,15 +254,40 @@ def report(summary: dict) -> str:
 
     for rank in ranks:
         s = summary[rank]
-        lines.append(f"\n{rank}:  {s['count']} samples")
+        withheld = int(s.get("withheld", 0) or 0)
+        total = s["count"] + withheld
         lines.append(
-            f"  mean gpu-ms:   {s['mean_gpu_ms']:>10.1f}   "
-            f"max gpu-ms:  {s['max_gpu_ms']:.1f}"
+            f"\n{rank}:  {s['count']} split samples of {total} rounds"
+            f"  ({withheld} withheld)"
         )
-        lines.append(
-            f"  mean compute-ms: {s['mean_compute_ms']:>10.1f}   "
-            f"mean wait-ms: {s['mean_wait_ms']:>10.1f}"
-        )
+        if s["count"]:
+            lines.append(
+                f"  mean gpu-ms:   {s['mean_gpu_ms']:>10.1f}   "
+                f"max gpu-ms:  {s['max_gpu_ms']:.1f}"
+            )
+            lines.append(
+                f"  mean compute-ms: {s['mean_compute_ms']:>10.1f}   "
+                f"mean wait-ms: {s['mean_wait_ms']:>10.1f}"
+            )
+        else:
+            lines.append(
+                "  NO SPLIT ON THIS RANK: every round withheld its "
+                "compute/wait pair. There is no mean to print."
+            )
+        if withheld:
+            reasons = ", ".join(
+                f"{r} x{c}"
+                for r, c in sorted(
+                    s.get("withheld_reasons", {}).items(), key=lambda kv: -kv[1]
+                )
+            )
+            wm = s.get("withheld_mean_gpu_ms")
+            wm_txt = f"{wm:.1f}" if wm is not None else "n/a"
+            lines.append(
+                f"  WITHHELD {withheld}/{total} rounds (mean gpu-ms {wm_txt}); "
+                f"the means above are over the other {s['count']}. "
+                f"Reasons: {reasons}"
+            )
         families = s["total_wait_by_family"]
         if families:
             lines.append("  Total wait by family (across all samples):")
@@ -222,12 +298,29 @@ def report(summary: dict) -> str:
     lines.append("CONCLUSION")
     lines.append("-" * width)
 
-    slowest_rank = max(summary, key=lambda r: summary[r]["mean_wait_ms"])
-    slowest_wait = summary[slowest_rank]["mean_wait_ms"]
-    lines.append(
-        f"Rank with highest mean wait: {slowest_rank}  "
-        f"({slowest_wait:.1f} ms per sample)"
-    )
+    split_ranks = [r for r in summary if summary[r]["count"]]
+    if split_ranks:
+        slowest_rank = max(split_ranks, key=lambda r: summary[r]["mean_wait_ms"])
+        slowest_wait = summary[slowest_rank]["mean_wait_ms"]
+        lines.append(
+            f"Rank with highest mean wait: {slowest_rank}  "
+            f"({slowest_wait:.1f} ms per sample)"
+        )
+    else:
+        lines.append(
+            "No rank reported a compute/wait split -- every round withheld "
+            "it. Re-run the window with the decode graph off "
+            "(--disable-cuda-graph) before reading a pacemaker out of this."
+        )
+    total_withheld = sum(int(s.get("withheld", 0) or 0) for s in summary.values())
+    total_split = sum(s["count"] for s in summary.values())
+    if total_withheld > total_split:
+        lines.append(
+            f"WINDOW NOT EVIDENCE: {total_withheld} withheld rounds against "
+            f"{total_split} split ones. The majority of this window carries no "
+            f"split, so any compute/wait conclusion drawn from it describes "
+            f"the minority that fell out of the graph, not the boot."
+        )
 
     global_families: Dict[str, float] = {}
     for s in summary.values():

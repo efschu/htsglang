@@ -164,6 +164,15 @@ class RoundSpan:
     #: -- a wrong zero, not a measurement. Set by the caller, honoured by
     #: :meth:`harvest_round`, which then withholds the split.
     graph_replayed: bool = False
+    #: True when this round was opened while the slot was ALREADY armed by
+    #: the prefill half (#252). The round then owns no slot: it brackets the
+    #: device time and withholds the split, and -- decisively -- it does not
+    #: touch ``_slot``, so the prefill arming it found still reaches its own
+    #: ``disarm``. Overwriting instead would have stolen the shipped line's
+    #: compute/wait column, which is a regression of the other half of this
+    #: same instrument and is the reason the guard exists rather than an
+    #: assertion in a comment.
+    contended: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -189,6 +198,22 @@ class CollectiveClock:
         #: dispatch site said, the prefix KEEPS it and adds who was running.
         self._phase_prefix: Optional[str] = None
         self._backend: ClockBackend = backend or TorchCudaBackend()
+        #: #1241 CONTENTION, COUNTED NOT ASSUMED. Both halves of this
+        #: instrument arm the one slot: ``arm``/``disarm`` for a prefill
+        #: forward (#252) and ``open_round``/``close_round`` for a decode
+        #: round. They are supposed to be mutually exclusive -- a batch is
+        #: prefill XOR decode -- but "supposed to" is a premise about the
+        #: scheduler, not a property of this object, and the failure mode of
+        #: a broken premise here is SILENT: the second arming overwrites the
+        #: first, the first reads an empty slot and reports ``wait 0.0``,
+        #: which has the exact shape of a measurement. So neither arming
+        #: overwrites the other, both count how often they had to refuse,
+        #: and the refusing side withholds its split by name.
+        self._arm_refusals: int = 0
+        self._round_contentions: int = 0
+        #: LIFO depth of armings that found the slot taken. ``disarm`` pops
+        #: it instead of stealing a slot it never created.
+        self._refused_arm_depth: int = 0
 
     # -- arming ---------------------------------------------------------
 
@@ -196,10 +221,34 @@ class CollectiveClock:
     def armed(self) -> bool:
         return self._slot is not None
 
+    @property
+    def contention_counts(self) -> Tuple[int, int]:
+        """``(prefill armings refused, decode rounds opened contended)``.
+
+        Both are ZERO on a correct boot. A non-zero pair is not a tuning
+        number, it is the statement that the two halves overlapped and that
+        one of the two lines is therefore carrying a withheld split -- read
+        it before reading any compute/wait mean from that boot.
+        """
+        return (self._arm_refusals, self._round_contentions)
+
     def arm(self) -> None:
+        if self._slot is not None:
+            # A decode round already owns the slot. Refuse rather than
+            # overwrite: overwriting would silently empty the round's slot.
+            self._arm_refusals += 1
+            self._refused_arm_depth += 1
+            return
         self._slot = Slot()
 
     def disarm(self) -> Optional[Slot]:
+        if self._refused_arm_depth > 0:
+            # This disarm belongs to an arming that never took the slot.
+            # Returning None makes the caller report an UNTIMED line, which
+            # the prefill reporter already renders; returning the slot would
+            # hand it somebody else's collectives.
+            self._refused_arm_depth -= 1
+            return None
         slot, self._slot = self._slot, None
         return slot
 
@@ -343,7 +392,20 @@ class CollectiveClock:
         it record into one slot.
 
         No synchronization: two event records on the current stream.
+
+        CONTENTION IS REFUSED, NEVER RESOLVED BY OVERWRITING. If the slot is
+        already armed the prefill half (#252) is mid-forward; taking the slot
+        from it would make ``SplitDeviceTimer.disarm`` return an empty slot
+        and drop the SHIPPED prefill line's compute/wait column. The round is
+        opened anyway -- its device time is honest either way -- with no slot
+        and ``contended`` set, and :meth:`harvest_round` then withholds the
+        decode split by name.
         """
+        if self._slot is not None:
+            self._round_contentions += 1
+            start = self._acquire()
+            start.record()
+            return RoundSpan(start=start, slot=None, contended=True)
         slot = Slot()
         self._slot = slot
         start = self._acquire()
@@ -351,13 +413,20 @@ class CollectiveClock:
         return RoundSpan(start=start, slot=slot)
 
     def close_round(self, span: Optional[RoundSpan]) -> Optional[RoundSpan]:
-        """Close the bracket. Still no synchronization, still no reading."""
+        """Close the bracket. Still no synchronization, still no reading.
+
+        Disarms only the slot this span actually armed. A contended span
+        armed nothing, so clearing ``_slot`` here would disarm the PREFILL
+        forward that owns it -- the same theft the open guards against, one
+        scope later.
+        """
         if span is None:
             return None
         end = self._acquire()
         end.record()
         span.end = end
-        self._slot = None
+        if not span.contended and self._slot is span.slot:
+            self._slot = None
         return span
 
     def harvest_round(self, span: Optional[RoundSpan]) -> Optional[RoundResult]:
@@ -383,6 +452,18 @@ class CollectiveClock:
         self._pool.append(span.end)
         span.start = None
         span.end = None
+        if span.contended:
+            # No slot was ever armed for this round. Not a zero wait: an
+            # unknown one, named so the reader can count how many rounds the
+            # overlap cost and never average over them silently.
+            span.slot = None
+            return RoundResult(
+                round_ms=round_ms,
+                wait_ms=None,
+                compute_ms=None,
+                families=None,
+                split_refused="slot-contended-with-prefill",
+            )
         if span.graph_replayed:
             slot = span.slot
             span.slot = None
