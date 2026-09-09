@@ -352,7 +352,7 @@ def route_floor(short_bound: Optional[int] = None) -> Tuple[int, str]:
             from sglang.srt.weg2.launcher import Weg2CarrierFloorUnreachable
 
             raise Weg2CarrierFloorUnreachable(
-                "W54 Weg2CarrierFloorUnreachable: #1246 route_floor: no "
+                "W60 Weg2CarrierFloorUnreachable: #1246 route_floor: no "
                 f"prompt length up to {hi} chars exceeds the SHORT bound "
                 f"{chunk} under front.price_remainder"
             )

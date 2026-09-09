@@ -1872,7 +1872,7 @@ def chunk_tag_cards(
         from sglang.srt.weg2.launcher import Weg2ChunkCardMismatch
 
         raise Weg2ChunkCardMismatch(
-            f"W52 Weg2ChunkCardMismatch: card_of_stage {cards} does not match "
+            f"W59 Weg2ChunkCardMismatch: card_of_stage {cards} does not match "
             f"the {len(stage_layers)} PP stages {list(stage_layers)}"
         )
     acc: Dict[str, set] = {}

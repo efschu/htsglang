@@ -12,8 +12,8 @@ either raise, so a boot that hits one leaves the sglang groups alive on the
 cards exactly like the pre-#1248 defect, just from two different sites.
 
 THE FIX (``launcher.py``): ``Weg2ChunkCardMismatch(Weg2LaunchRefused,
-ValueError)`` (W52) and ``Weg2CarrierFloorUnreachable(Weg2LaunchRefused)``
-(W54), raised at the two sites via a deferred import (the leaf module
+ValueError)`` (W59) and ``Weg2CarrierFloorUnreachable(Weg2LaunchRefused)``
+(W60), raised at the two sites via a deferred import (the leaf module
 imports the control-plane class only inside the failing branch, so the
 launcher's import graph is paid for only on that path). Multiple
 inheritance on the first class only, because it is the only one of the two
@@ -324,7 +324,7 @@ class TestTheTwoSitesRaiseForReal(CustomTestCase):
         with self.assertRaises(L.Weg2LaunchRefused) as ctx:
             weg2_memory_saver.chunk_tag_cards([4, 4], 2, 4, card_of_stage=[0])
         self.assertIsInstance(ctx.exception, ValueError)
-        self.assertIn("W52 Weg2ChunkCardMismatch", str(ctx.exception))
+        self.assertIn("W59 Weg2ChunkCardMismatch", str(ctx.exception))
 
     def test_route_floor_raises_weg2_launch_refused(self):
         # front.price_remainder mocked to always return remainder=0: with
@@ -338,7 +338,7 @@ class TestTheTwoSitesRaiseForReal(CustomTestCase):
             self.assertRaises(L.Weg2LaunchRefused) as ctx,
         ):
             carrier_census.route_floor(short_bound=100)
-        self.assertIn("W54 Weg2CarrierFloorUnreachable", str(ctx.exception))
+        self.assertIn("W60 Weg2CarrierFloorUnreachable", str(ctx.exception))
 
 
 if __name__ == "__main__":
