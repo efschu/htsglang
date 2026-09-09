@@ -258,7 +258,13 @@ P_WINDOWS_MIB = 24 + 96
 #: flag would be loud rather than plausible.
 RING_FORM_SENTINEL_S_GB = -1
 RING_FORM_SENTINEL_M_MIB = -1
-RING_FORM_SENTINEL_STORE_GIB = -1.0
+#: #1236 store on disk: the store parameter of ``argv_p``/``argv_d``/``common_flags``
+#: is the RENDERED extra-config JSON (a str), so the form-key sentinel is an
+#: impossible JSON string, never a float -- boot weg2sb5h died at
+#: ring_table.p_form_key on a float that reached ``_flag_pairs`` (stale call
+#: sites after the signature change).  The flag is in FORM_KEY_EXCLUDED_FLAGS,
+#: so the value never enters the key; it only has to be a str.
+RING_FORM_SENTINEL_STORE_CFG = '{"form-key-sentinel":"not-a-store"}'
 RING_FORM_SENTINEL_DEPTH = -1
 
 MODEL_DEFAULT = "/spinning/llm_stuff/club-3090/models-cache/Qwen3.8-27B-INT8-gdncov-vocabembed"
@@ -3806,9 +3812,9 @@ def _max_running_requests(model: str, group: str = "D", bs: int = 8) -> int:
     ``--d-bs``. Sharing one value was the very coupling C1/R-12 removed.
     """
     if str(group) == "P":
-        flags = argv_p("py", model, [1, 1, 1], 1, 1, 1.0, [], p_bs=int(bs))
+        flags = argv_p("py", model, [1, 1, 1], 1, 1, RING_FORM_SENTINEL_STORE_CFG, [], p_bs=int(bs))
     else:
-        flags = argv_d("py", model, [1, 1, 1], 1, 1, 1.0, [], d_bs=int(bs))
+        flags = argv_d("py", model, [1, 1, 1], 1, 1, RING_FORM_SENTINEL_STORE_CFG, [], d_bs=int(bs))
     return int(flags[flags.index("--max-running-requests") + 1])
 
 
@@ -3821,7 +3827,7 @@ def _p_page_size(model: str, p_bs: int = 8) -> int:
     the flag lives in ``common_flags`` today and the model must follow it if it
     moves, rather than carrying a second copy of the value.
     """
-    flags = argv_p("py", model, [1, 1, 1], 1, 1, 1.0, [], p_bs=int(p_bs))
+    flags = argv_p("py", model, [1, 1, 1], 1, 1, RING_FORM_SENTINEL_STORE_CFG, [], p_bs=int(p_bs))
     try:
         return int(flags[flags.index("--page-size") + 1])
     except ValueError:
@@ -3867,7 +3873,7 @@ def p_activation_reserve_provenance(model: str, p_bs: int = 8) -> Tuple[float, s
     """
     from sglang.srt.server_args import ServerArgs
 
-    flags = argv_p("py", model, [1, 1, 1], 1, 1, 1.0, [], p_bs=int(p_bs))
+    flags = argv_p("py", model, [1, 1, 1], 1, 1, RING_FORM_SENTINEL_STORE_CFG, [], p_bs=int(p_bs))
 
     def _flag(name: str, default):
         try:
@@ -3934,7 +3940,7 @@ def d_mamba_ping_pong_cost(model: str, disable_overlap: bool, d_bs: int = 8) -> 
     # Group D's own argv, for the same reason and with the same defect history
     # as _max_running_requests above: this list is read for the presence of a
     # flag, so it must be the list the group actually gets.
-    flags = argv_d("py", model, [1, 1, 1], 1, 1, 1.0, [], d_bs=int(d_bs))
+    flags = argv_d("py", model, [1, 1, 1], 1, 1, RING_FORM_SENTINEL_STORE_CFG, [], d_bs=int(d_bs))
 
     class _StrategyView:
         """Exactly the ServerArgs surface ``mamba_ping_pong_slots`` reads."""
@@ -6562,7 +6568,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # divergence there.
     chunk_tokens = chunked_prefill_size_of(
         common_flags(ns.model, RING_FORM_SENTINEL_S_GB, RING_FORM_SENTINEL_M_MIB,
-                     RING_FORM_SENTINEL_STORE_GIB, max_kv_per_request,
+                     RING_FORM_SENTINEL_STORE_CFG, max_kv_per_request,
                      ns.p_hicache_write_policy, "P", ns.random_seed,
                      ns.barlink_bar1_cap_cycles, ns.collective_census_interval)
     )
@@ -6675,7 +6681,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         log(draft_kv_off_line())
     form_argv_p = argv_p(
         py, ns.model, budgets_p, RING_FORM_SENTINEL_S_GB, RING_FORM_SENTINEL_M_MIB,
-        RING_FORM_SENTINEL_STORE_GIB, shlex.split(ns.extra_p), p_bs, max_kv_per_request,
+        RING_FORM_SENTINEL_STORE_CFG, shlex.split(ns.extra_p), p_bs, max_kv_per_request,
         stage_ratio, attn_stage_ratio, ns.p_hicache_write_policy,
         RING_FORM_SENTINEL_DEPTH, ns.p_barlink_bar1_window_mib, ns.random_seed,
         ns.barlink_bar1_cap_cycles, ns.collective_census_interval,
