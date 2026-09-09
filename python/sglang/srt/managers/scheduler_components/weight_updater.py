@@ -1164,38 +1164,103 @@ class SchedulerWeightUpdaterManager:
     # ``BaseException`` and return, so no shadow failure can reach a flip.
     # ------------------------------------------------------------------
 
-    def _weg2_shadow_hook(self, hook: str, *, recv_req, weights_tags,
-                          tag_bytes, ring_ms=None) -> None:
+    def _weg2_device_index(self) -> int:
+        """THIS RANK's CUDA ordinal, read from torch.  ``-1`` when unreadable.
+
+        MEASURED-BY-REVIEW DEFECT (S5b refuter, must_fix 3): this was the
+        literal ``0``.  The launcher hands EVERY rank the same
+        ``CUDA_VISIBLE_DEVICES`` -- all three card uuids, one string, both
+        groups (``launcher.py`` builds ``cvd`` from every card) -- exactly so
+        that ``weight_exchange_region``'s "rank *n* of either group runs on
+        ``cards[n]``" holds.  So a rank's own device is its ordinal, not 0, and
+        a hardcoded 0 makes the observer (i) ``cudaMalloc`` on ANOTHER rank's
+        card, (ii) price that allocation against its own card's free column and
+        uuid, and (iii) leave the SCHEDULER THREAD -- the flip leg's own thread
+        -- on device 0, because ``CudartDeviceOps.set_device`` is a bare
+        ``cudaSetDevice`` with no restore.  A zero-authority observer that moves
+        the authoritative thread's current device is danger (a) in its plainest
+        form.
+
+        Read from torch and never assumed: torch is what the leg thread's
+        device actually is, and ``_weg2_card_uuid`` already resolves this card
+        through it, so the two cannot name different cards.
+        """
+        try:
+            import torch
+
+            if torch.cuda.is_available():
+                return int(torch.cuda.current_device())
+        except Exception:  # noqa: BLE001 -- an observer never raises
+            pass
+        return -1
+
+    def _weg2_shadow_gate_rows(self, hook: str, group: str):
+        """The rows this hook may expect to see voted AT THIS INSTANT.
+
+        MEASURED-BY-REVIEW DEFECT (S5b refuter, must_fix 1).  The two hooks sit
+        at OPPOSITE ENDS OF THE FLIP: the source runs on the SLEEPING group
+        before its ``pause``, the destination on the WAKING group after its
+        ``resume`` and its disk reload -- and on a co-located card the waking
+        rank is fenced (C14) on the credit the sleeping rank publishes INSIDE
+        its pause loop, i.e. after its own hook.  A source rank that waits for
+        all six rows therefore waits for three rows that cannot be written
+        until it stops waiting: a circular wait, resolved only by the gate
+        expiry, paid by every sleeping rank on every flip, on the critical path
+        of that credit.
+
+        So the source expects its OWN group's three rows -- the ranks that are
+        at the same instant of the same flip -- and the destination expects all
+        six, because the source rows were sealed earlier in this same flip with
+        this region's ``epoch_hash`` and this ``leg`` and are therefore free.
+        ``None`` means all six.
+        """
+        from sglang.srt.weg2 import weight_exchange_region as xr
+
+        if hook != "source" or group not in ("P", "D"):
+            return None
+        return tuple(xr.rank_row(group, r) for r in range(xr.N_CARDS))
+
+    def _weg2_shadow_hook(self, hook: str, *, recv_req, reserve_bytes: int = 0,
+                          ring_ms=None) -> None:
         """Run one leg's shadow, or return having touched nothing.
 
         THE ARM IS CHECKED FIRST AND CHEAPLY.  ``shadow_armed()`` reads
         ``--weg2-weight-source``; on ``ring`` -- the default and every boot that
-        has run to date -- it is False and this method returns before importing
-        or touching any exchange machinery, which is what keeps the default leg
-        byte-identical.  Pinned by
-        ``test_the_hooks_are_never_reached_on_the_ring_arm``.
+        has run to date -- it is False and this method returns after ONE module
+        import, before a device call, an allocation, an env write or a single
+        line of the exchange's machinery.  That is what keeps the default leg
+        byte-identical, and it is what
+        ``test_the_hooks_are_never_reached_on_the_ring_arm`` proves with a
+        tripwire on every door out of the arm check.
+
+        (The docstring used to claim it returned "before importing" anything;
+        it did not, and does not -- ``shadow_armed`` lives in the shadow module
+        and reading it is an import.  S5b refuter, non-blocking finding: a
+        claim a reader can refute by looking two lines up is worse than no
+        claim.  What is byte-identical is the DEVICE and the ALLOCATOR, not the
+        import table.)
         """
         try:
-            from sglang.srt.weg2 import weight_exchange_region as xr
             from sglang.srt.weg2 import weight_exchange_shadow as sh
 
             if not sh.shadow_armed():
                 return
+            from sglang.srt.weg2 import weight_exchange_region as xr
+
             group = self._weg2_group_name()
             rank = self._weg2_rank()
             if group not in ("P", "D") or rank < 0:
                 return
+            device = self._weg2_device_index()
+            if device < 0:
+                logger.info(sh.rank_local_skip_message(
+                    reason="no-device", rank=rank,
+                    leg=_weg2_flip_index_of(getattr(recv_req, "epoch", None)),
+                    epoch=str(getattr(recv_req, "epoch", "") or ""),
+                    detail="torch reports no CUDA device on this rank"))
+                return
             peer = "D" if group == "P" else "P"
             free_bytes = self._weg2_free_bytes()
-            # THE RING'S OWN NUMBER, READ AND NOT ESTIMATED (S5b item 2): the
-            # per-tag byte counts this leg already read from the SAVER, summed.
-            # On the wake leg they are read BEFORE the resume loop, so they are
-            # exactly the not-yet-mapped image demand ``price_shadow``'s fourth
-            # term was added for; on the sleep leg the pages are still mapped
-            # and there is no resume to reserve against, so it is 0 and the
-            # ``hook=source`` token on the line says why.
-            reserve = (int(sum(int(v) for v in (tag_bytes or {}).values()))
-                       if hook == sh.HOOK_DESTINATION else 0)
             inputs = sh.ShadowLegInputs(
                 leg=_weg2_flip_index_of(getattr(recv_req, "epoch", None)),
                 epoch=str(getattr(recv_req, "epoch", "") or ""),
@@ -1204,13 +1269,25 @@ class SchedulerWeightUpdaterManager:
                 rank=int(rank),
                 row=xr.rank_row(group, int(rank)),
                 peer_row=xr.rank_row(peer, int(rank)),
-                device=0,
+                device=int(device),
                 card_uuid=self._weg2_card_uuid() or "unknown",
                 free_mib=0 if free_bytes is None else int(free_bytes // MIB_),
-                resume_reserve_bytes=reserve,
+                resume_reserve_bytes=int(reserve_bytes),
                 ring_ms=ring_ms,
+                gate_rows=self._weg2_shadow_gate_rows(str(hook), group),
             )
-            sh.run_leg_hook(inputs, log=logger.info)
+            try:
+                sh.run_leg_hook(inputs, log=logger.info)
+            finally:
+                # THE LEG THREAD'S DEVICE IS PUT BACK, ALWAYS.  The shadow's
+                # raw ``cudaMalloc`` and its stream both go through
+                # ``CudartDeviceOps.set_device``, which is a bare
+                # ``cudaSetDevice`` with no save/restore, so without this the
+                # observer decides what device the AUTHORITATIVE leg continues
+                # on.  Restoring through torch (not through the ops layer) is
+                # deliberate: torch's current device is the one the rest of
+                # this leg reads.
+                self._weg2_restore_device(device)
         except BaseException as exc:  # noqa: BLE001 -- an observer never raises
             logger.warning(
                 "[weg2 shadow] the %s hook failed and the flip is unaffected "
@@ -1219,7 +1296,17 @@ class SchedulerWeightUpdaterManager:
                 hook, type(exc).__name__, exc,
             )
 
-    def _weg2_shadow_source_leg(self, recv_req, weights_tags, tag_bytes) -> None:
+    def _weg2_restore_device(self, device: int) -> None:
+        """Put the calling thread's CUDA device back where the hook found it."""
+        try:
+            import torch
+
+            if torch.cuda.is_available() and int(device) >= 0:
+                torch.cuda.set_device(int(device))
+        except Exception:  # noqa: BLE001 -- an observer's unwind
+            pass
+
+    def _weg2_shadow_source_leg(self, recv_req) -> None:
         """SOURCE hook, sleep leg.  Placed BEFORE the pause loop, not after it.
 
         **STATED DEVIATION from the S5b brief's parenthetical** ("after the ring
@@ -1233,12 +1320,25 @@ class SchedulerWeightUpdaterManager:
         the last instant the bytes exist on the device: after the census and the
         C14 credit -- i.e. after the ring has everything it needs from this
         rank -- and before the pause that takes the pages away.
-        """
-        self._weg2_shadow_hook(
-            "source", recv_req=recv_req, weights_tags=weights_tags,
-            tag_bytes=tag_bytes)
 
-    def _weg2_shadow_destination_leg(self, recv_req, weights_tags, tag_bytes,
+        IT PASSES NO ``resume_reserve_bytes``, and 0 is the CORRECT value here
+        rather than an unwired one: nothing on this leg is waiting to be
+        mapped -- the leg's whole job is to give pages BACK -- so there is no
+        future demand to hold free VRAM for.  ``hook=source`` on the line says
+        which of the two a ``resume_reserve_mib=0`` came from.
+
+        THE LEG'S OWN WALL INCLUDES IT.  ``weg2_leg_t0`` is taken BEFORE this
+        call (S5b refuter, must_fix 4): with the clock started after the hook,
+        ``weg2_leg_ms`` and every WEG2-FLIP-TAG wall excluded the entire
+        shadow, so the sleep leg's own instrument reported a wall that was
+        short by exactly the cost the observer added -- and that wall gates the
+        C14 credit a co-located waking rank is fenced on.  ``shadow_ms`` on the
+        shadow's own line is the subtrahend, so the two numbers on one log
+        separate the ring's wall from the observer's.
+        """
+        self._weg2_shadow_hook("source", recv_req=recv_req)
+
+    def _weg2_shadow_destination_leg(self, recv_req, *, reserve_bytes: int = 0,
                                      ring_ms=None) -> None:
         """DESTINATION hook, wake leg, after ``family_complete`` and the reload.
 
@@ -1247,10 +1347,22 @@ class SchedulerWeightUpdaterManager:
         the shadow's pulled stripes have something to be compared AGAINST.  It
         runs before the leg reports done, so a mismatch appears in the log
         beside the flip that produced it rather than one flip later.
+
+        ``reserve_bytes`` IS THE STILL-UNMAPPED DEMAND AT *THIS* INSTANT, and
+        the number it used to carry was wrong in the one way that matters.
+        MEASURED-BY-REVIEW DEFECT (S5b refuter, must_fix 2): it carried the
+        WEIGHTS image (the sum of ``tag_bytes``, read before the resume loop) --
+        but this hook runs AFTER that resume completed, and ``free_mib`` is read
+        here too, so the image is already OUT of the free column.  Subtracting
+        it a second time removed 9-13 GiB from a free column the VRAM corridor
+        law holds at 819-1229 MiB: ``price_shadow.affordable`` was False by
+        construction and every rank voted NO on every leg.  The demand that is
+        genuinely still unmapped when this runs is the REST OF THIS RPC's tags
+        -- kv_cache and anything else the resume has not reached -- read from
+        the same saver instrument, at the instant the term is consumed.
         """
-        self._weg2_shadow_hook(
-            "destination", recv_req=recv_req, weights_tags=weights_tags,
-            tag_bytes=tag_bytes, ring_ms=ring_ms)
+        self._weg2_shadow_hook("destination", recv_req=recv_req,
+                               reserve_bytes=reserve_bytes, ring_ms=ring_ms)
 
     def _weg2_await_vram_credit(self, credit, tag: str, need_bytes: int,
                                 epoch=None) -> None:
@@ -1480,8 +1592,16 @@ class SchedulerWeightUpdaterManager:
             # weight pages are mapped.  See _weg2_shadow_source_leg for why it
             # is here and not after the pause.  Never raises; on every arm but
             # --weg2-weight-source shadow it returns having touched nothing.
-            self._weg2_shadow_source_leg(recv_req, weights_tags, tag_bytes)
+            #
+            # THE LEG'S CLOCK STARTS BEFORE IT (S5b refuter, must_fix 4).  With
+            # t0 after the hook, weg2_leg_ms -- the number this leg publishes
+            # as its own wall, and the one the sb5f flip band is read from --
+            # excluded the whole shadow, so an observer could add seconds to
+            # the leg that gates a co-located rank's C14 credit while the
+            # leg's own instrument reported no change at all.  On the ring arm
+            # the hook returns after one import, so the band is unaffected.
             weg2_leg_t0 = time.perf_counter()
+            self._weg2_shadow_source_leg(recv_req)
             with self._weg2_pcie_lock("sleep-D2H " + ",".join(weights_tags), direction="d2h"):
                 for tag in weights_tags:
                     t_tag = time.perf_counter()
@@ -1798,8 +1918,25 @@ class SchedulerWeightUpdaterManager:
                 # ``ring_ms`` is the leg's OWN per-tag wall, the same instrument
                 # the WEG2-FLIP-TAG lines above print, so the two numbers on one
                 # log can be subtracted.
+                # THE STILL-UNMAPPED DEMAND, READ HERE, WHERE IT IS
+                # CONSUMED (S5b refuter, must_fix 2): every tag of THIS rpc
+                # that the resume has not reached yet.  The graph tag was
+                # resumed above this block and the weights family inside it,
+                # so what is left is kv_cache and anything else in `tags` --
+                # the bytes that will be mapped after this hook returns and
+                # that the shadow's own buffers must not have taken.  Read
+                # from the SAVER (`_weg2_tag_bytes`), the same instrument the
+                # ring sizes itself from; a 0 there means "the saver could not
+                # answer" and prints as resume_reserve_mib=0.
+                pending_tags = [
+                    t for t in tags
+                    if t != GPU_MEMORY_TYPE_CUDA_GRAPH
+                    and not is_weights_family_tag(t)
+                ]
                 self._weg2_shadow_destination_leg(
-                    recv_req, weights_tags, tag_bytes,
+                    recv_req,
+                    reserve_bytes=sum(self._weg2_tag_bytes(t)
+                                      for t in pending_tags),
                     ring_ms=sum(float(v[1]) for v in weg2_per_tag.values()),
                 )
 

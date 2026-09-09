@@ -91,6 +91,26 @@ STRIPE_BYTES = 64 * MIB
 SHADOW_GATE_BUDGET_S = 5.0
 SHADOW_TRANSPORT_BUDGET_S = 30.0
 
+#: THE ONE WALL A FLIP LEG PAYS FOR HAVING AN OBSERVER, and the only bound the
+#: user law ("never delays the leg's own completion beyond a named bound")
+#: can be read off in one place.
+#:
+#: MEASURED-BY-REVIEW DEFECT (S5b refuter, must_fix 4): the only ENFORCED bound
+#: was :data:`SHADOW_HOP_BOUND_MS_DEFAULT` (60 ms), which grades the priced
+#: on-card hop and nothing else -- while the attach, the gate wait (5 s), the
+#: transport (30 s) and the compare all sat on the leg's critical path outside
+#: it.  The honest bound on the added wall was therefore the SUM of three
+#: constants a reader had to find in three places, and the code enforced one of
+#: them.  Here the two WAITS are carved out of ONE deadline: whatever the gate
+#: spends, the transport cannot spend again, so the two together can never
+#: exceed this number no matter how the sub-budgets are tuned.
+#:
+#: ITS VALUE IS THE GATE BUDGET, DELIBERATELY, and that is the whole rule: the
+#: shadow may cost the flip ONE rendezvous, never a rendezvous plus a transport
+#: plus a compare.  It is a policy number sitting on top of S5's, not a fourth
+#: measured constant -- the same shape as :data:`SHADOW_HOP_BOUND_FACTOR`.
+SHADOW_HOOK_BUDGET_S = SHADOW_GATE_BUDGET_S
+
 #: The floor the shadow's VRAM is priced against.  ``Reserve-Semantik``: 1024
 #: MiB per card is the user's free space, not an internal allowance, and the
 #: VRAM corridor band (819-1229 MiB NVML-free per card under load) is measured
@@ -216,11 +236,18 @@ class ShadowVerdict:
     #: would have reported a skew of zero on the leg with the largest one.
     #: The rows already carry ``ts_ns``, so the real number is free.
     skew_ms: float = 0.0
+    #: HOW MANY ROWS THIS RANK WAS ENTITLED TO EXPECT -- the denominator of
+    #: ``joined=``, and never a constant again.  See :func:`shadow_gate`'s
+    #: ``expect_rows``: the two hooks of one flip sit at OPPOSITE ends of it,
+    #: so a source rank that waits for all six waits for rows that physically
+    #: cannot exist yet, and printing ``joined=3/6`` for a complete rendezvous
+    #: reads as a half-failed one.
+    expected: int = xr.N_RANKS
 
     def line(self, *, leg: int, epoch: str) -> str:
         return (
             f"{SHADOW_GATE_LINE_PREFIX} leg={leg} epoch={epoch} "
-            f"joined={self.joined}/{xr.N_RANKS} "
+            f"joined={self.joined}/{self.expected} "
             f"run={'yes' if self.run else 'no'} "
             f"refusers={','.join(str(r) for r in self.refusers) or 'none'} "
             f"waited_s={self.waited_s:.3f} skew_ms={self.skew_ms:.3f} "
@@ -233,8 +260,33 @@ def shadow_gate(region: xr.XchgRegion, row: int, *, leg: int, vote: bool,
                 log: Callable[[str], None],
                 budget_s: float = SHADOW_GATE_BUDGET_S,
                 poll_s: float = xr.GATE_POLL_S,
-                monotonic: Callable[[], float] = time.monotonic) -> ShadowVerdict:
-    """RANK-UNIFORM: any rank refusing means NO rank runs the shadow.
+                monotonic: Callable[[], float] = time.monotonic,
+                expect_rows: Optional[Sequence[int]] = None) -> ShadowVerdict:
+    """UNIFORM ACROSS THE ROWS IT MAY EXPECT: any of them refusing is a NO.
+
+    ``expect_rows`` IS THE ROWS THIS RANK MAY EXPECT AT THIS INSTANT, and it
+    defaults to all six -- S3's and S4's callers are unchanged.
+
+    MEASURED-BY-REVIEW DEFECT (S5b refuter, must_fix 1), and it is a
+    STRUCTURAL one rather than a tuning one: the two ``weight_updater`` hooks
+    sit at OPPOSITE ENDS OF THE FLIP.  The source hook runs on the SLEEPING
+    group before its ``pause``; the destination hook runs on the WAKING group
+    after its ``resume`` and after the disk reload -- and on a co-located card
+    the waking rank is BLOCKED on the C14 credit the sleeping rank publishes
+    inside its pause loop, i.e. AFTER its own hook.  A source rank that waits
+    for all six rows is therefore waiting for three rows that cannot exist
+    until it stops waiting: a circular wait, broken only by the expiry, paid
+    once per sleeping rank per flip, on the critical path of the credit a
+    co-located waking rank is fenced on.  The shadow never ran, and the flip
+    paid the full budget for it.
+
+    So the ROWS ARE THE HOOK'S: the source expects its OWN group's three
+    (the ranks that are at the same instant of the same flip), the destination
+    expects all six (the source rows were sealed earlier in this same flip,
+    with this region's ``epoch_hash`` and this ``leg``, so they are free).
+    Spec section 6/S5 is written this way too -- step 1 pushes into the
+    staging region before ``pause``, step 2 pulls "after ``family_complete``"
+    -- so the asymmetry is the design's, not an accident of the placement.
 
     The #802 rule (``kv_reshard.py:1010``'s discipline, spec section 3.3)
     applied to an observer: the six ranks derive their own affordability from
@@ -252,46 +304,47 @@ def shadow_gate(region: xr.XchgRegion, row: int, *, leg: int, vote: bool,
     DIFFERENT class subsets is six half-experiments, and the disagreement is
     detectable here for free rather than as a W54 three seams later.
     """
+    wanted = (tuple(range(xr.N_RANKS)) if expect_rows is None
+              else tuple(sorted({int(r) for r in expect_rows} | {int(row)})))
     write_shadow_vote(region, row, leg=leg, vote=vote,
                       classes_hash=classes_hash, need_mib=need_mib)
     started = monotonic()
     while True:
-        rows = [read_shadow_vote(region, r) for r in range(xr.N_RANKS)]
-        fresh = [r for r in rows
+        rows = {i: read_shadow_vote(region, i) for i in wanted}
+        fresh = [i for i, r in rows.items()
                  if r["sealed"] and r["epoch_hash"] == region.epoch_hash
                  and r["leg"] == int(leg)]
-        if len(fresh) == xr.N_RANKS:
-            refusers = tuple(i for i, r in enumerate(rows) if not r["vote"])
-            hashes = {r["classes_hash"] for r in rows}
+        if len(fresh) == len(wanted):
+            refusers = tuple(i for i in wanted if not rows[i]["vote"])
+            hashes = {rows[i]["classes_hash"] for i in wanted}
             if refusers:
                 return ShadowVerdict(
                     False, len(fresh), refusers,
                     "a rank refused: " + " ".join(
                         f"[row={i} pid={rows[i]['pid']} "
                         f"need_mib={rows[i]['need_mib']}]" for i in refusers),
-                    monotonic() - started)
+                    monotonic() - started, expected=len(wanted))
             if len(hashes) != 1:
                 return ShadowVerdict(
-                    False, len(fresh), tuple(range(xr.N_RANKS)),
+                    False, len(fresh), wanted,
                     "the ranks chose different class subsets: " + " ".join(
-                        f"[row={i} classes_hash={r['classes_hash']:#x}]"
-                        for i, r in enumerate(rows)),
-                    monotonic() - started)
-            stamps = [int(r["ts_ns"]) for r in rows]
-            return ShadowVerdict(True, len(fresh), (), "all six joined",
+                        f"[row={i} classes_hash={rows[i]['classes_hash']:#x}]"
+                        for i in wanted),
+                    monotonic() - started, expected=len(wanted))
+            stamps = [int(rows[i]["ts_ns"]) for i in wanted]
+            return ShadowVerdict(True, len(fresh), (),
+                                 f"all {len(wanted)} expected rows joined",
                                  monotonic() - started,
-                                 (max(stamps) - min(stamps)) / 1e6)
+                                 (max(stamps) - min(stamps)) / 1e6,
+                                 expected=len(wanted))
         if monotonic() - started >= budget_s:
-            missing = tuple(i for i, r in enumerate(rows)
-                            if not (r["sealed"]
-                                    and r["epoch_hash"] == region.epoch_hash
-                                    and r["leg"] == int(leg)))
+            missing = tuple(i for i in wanted if i not in fresh)
             return ShadowVerdict(
                 False, len(fresh), missing,
-                f"only {len(fresh)}/{xr.N_RANKS} ranks published a vote for "
-                f"leg={leg} within {budget_s}s -- the shadow switches itself "
-                f"off for this leg rather than wait inside the flip",
-                monotonic() - started)
+                f"only {len(fresh)}/{len(wanted)} expected ranks published a "
+                f"vote for leg={leg} within {budget_s}s -- the shadow switches "
+                f"itself off for this leg rather than wait inside the flip",
+                monotonic() - started, expected=len(wanted))
         time.sleep(poll_s)
 
 
@@ -556,8 +609,17 @@ def price_leg(card_uuid: str, descs: Sequence[object], *, rank: int,
     filter over the same descriptors, so they agree by construction and the
     W52 slot_bytes cross-check in the diagonal stays a cross-check.
     """
-    moved = [d for d in descs if d.kind != tp.ZEROFILL]
-    mine_dst = [d for d in moved if int(d.dst_rank) == int(rank)]
+    # THE SAME SET :func:`shadow_transport` ACTUALLY ALLOCATES FOR.
+    # MEASURED-BY-REVIEW DEFECT (S5b refuter, non-blocking finding, carried
+    # from S5): this filtered ``kind != ZEROFILL`` first, while the transport's
+    # own ``mine_dst`` does not -- a ZEROFILL descriptor addressed to this rank
+    # IS shadowed there (it must be: leaving its original ``dst_ptr`` in the
+    # leg would have ``run_leg`` memset the RING's live destination, which is
+    # danger (a)), so the buffer was larger than the number that was priced.
+    # An instrument whose one forbidden failure is "OOM the flip it observes"
+    # may under-price nothing; the price follows the allocation, not the other
+    # way round.
+    mine_dst = [d for d in descs if int(d.dst_rank) == int(rank)]
     oncard_bytes = oncard_lane_bytes(descs, rank)
     diag_slot = (int(tp.plan_oncard_slot_bytes(oncard_bytes).slot_bytes)
                  if oncard_slot_bytes is None else int(oncard_slot_bytes))
@@ -986,6 +1048,13 @@ class ShadowResult:
     shadow_ms: float = 0.0
     #: The launcher-given bound the priced hop was graded against.
     hop_bound_ms: float = 0.0
+    #: S5b fix, refuter must_fix 4.  THE ONE DEADLINE THE HOOK'S TWO WAITS
+    #: WERE CARVED OUT OF (:data:`SHADOW_HOOK_BUDGET_S`, in ms).  On the line
+    #: beside ``shadow_ms`` so the reader compares the wall that was SPENT
+    #: against the wall that was ALLOWED without opening the source; a
+    #: ``shadow_ms`` above it is the compare's own work overrunning (work is
+    #: measured, waits are bounded) and reads as ``budget=OVER``.
+    hook_budget_ms: float = 0.0
     #: ``verify_sem_arm``'s census (24) when every count was armed, ``None``
     #: when it refused or could not run.  ``None`` prints ``n/a``: an absent
     #: check and a passed one are different findings (denominator law).
@@ -1045,6 +1114,8 @@ class ShadowResult:
             f"gate_skew_ms={self.gate_skew_ms:.3f} "
             f"lock_wait_ms={ms(self.lock_wait_ms)} "
             f"hook={self.hook} shadow_ms={self.shadow_ms:.3f} "
+            f"hook_budget_ms={self.hook_budget_ms:.3f} "
+            f"budget={'OVER' if self.hook_budget_ms and self.shadow_ms > self.hook_budget_ms else 'ok'} "
             f"hop_bound_ms={self.hop_bound_ms:.3f} "
             f"sems_armed={'n/a' if self.sems_armed is None else self.sems_armed} "
             f"resume_reserve_mib={self.resume_reserve_mib} "
@@ -1182,6 +1253,8 @@ def shadow_transport(
     classes: Sequence[str] = (),
     per_leg: int = 1,
     budget_s: float = SHADOW_TRANSPORT_BUDGET_S,
+    gate_budget_s: float = SHADOW_GATE_BUDGET_S,
+    gate_rows: Optional[Sequence[int]] = None,
     floor_mib: float = SHADOW_FLOOR_MIB,
     resume_reserve_bytes: int = 0,
     explicit: bool = False,
@@ -1256,7 +1329,8 @@ def shadow_transport(
                 raise Weg2XchgShadowUnaffordable(price.message())
         verdict = shadow_gate(region, row, leg=leg, vote=price.affordable,
                               classes_hash=subset.hash, need_mib=price.need_mib,
-                              log=log)
+                              log=log, budget_s=gate_budget_s,
+                              expect_rows=gate_rows)
         log(verdict.line(leg=leg, epoch=epoch))
         # THE SIX RANKS' SPREAD, not this rank's wait -- see
         # :attr:`ShadowVerdict.skew_ms`.
@@ -1570,6 +1644,12 @@ class ShadowLegInputs:
     free_mib: int = 0
     resume_reserve_bytes: int = 0
     ring_ms: Optional[float] = None
+    #: THE ROWS THIS HOOK MAY EXPECT TO SEE VOTED AT THIS INSTANT, or ``None``
+    #: for all six.  Its producer is the adapter, because the adapter is the
+    #: only thing that knows which GROUP this rank is in -- and the source and
+    #: the destination hook are at opposite ends of the flip, so the answer is
+    #: different for each.  See :func:`shadow_gate`'s ``expect_rows``.
+    gate_rows: Optional[Tuple[int, ...]] = None
 
 
 class ShadowLeg:
@@ -1783,7 +1863,92 @@ def shadow_armed() -> bool:
     """
     from sglang.srt.weg2 import weight_exchange as wxm
 
-    return wxm.weight_source() == WEIGHT_SOURCE_SHADOW
+    # ONE DEFINITION OF ONE DECISION (S5b refuter, non-blocking finding):
+    # ``weight_exchange.shadow_armed`` is the owner and this delegates to it.
+    # It used to re-spell the comparison (``weight_source() == SHADOW``), which
+    # is a second copy of a predicate -- the Zweitbuchhaltung shape
+    # UPSTREAM-MINIMAL refuses, and the shape that lets two arms drift.
+    return bool(wxm.shadow_armed())
+
+
+def publish_no_vote(leg: ShadowLeg, *, reason: str,
+                    classes_hash: int = 0, need_mib: int = 0) -> bool:
+    """Publish this rank's NO before returning, when the region is already open.
+
+    MEASURED-BY-REVIEW DEFECT (S5b refuter, must_fix 5): every refusal that
+    happens BETWEEN the attach and the gate returned without writing a row --
+    so a rank that refused on its own arithmetic was indistinguishable, to its
+    five peers, from a rank that crashed, and they paid a whole gate budget
+    inside their own flip legs discovering it.  The hazard is named verbatim in
+    W63's own docstring, and the code then only logged it.
+
+    A row IS available on those paths (``leg.attach`` succeeded and
+    ``begin_flip`` stamped the region), so the NO costs one 64-byte sealed
+    write and turns every peer's wait into an immediate, named refusal.
+
+    ``classes_hash`` may be 0 here and that is not a disagreement: the gate
+    checks refusers BEFORE it compares class hashes, so a NO row's hash is
+    never read.  ``False`` when there was no region to write into -- the
+    pre-attach reasons (``no-region``, ``no-sems``, ``no-ops``, ``no-plan``)
+    have nowhere to publish, by construction, and W63 names them instead.
+    """
+    region = getattr(leg, "region", None)
+    if region is None:
+        return False
+    i = leg.inputs
+    try:
+        write_shadow_vote(region, int(i.row), leg=int(i.leg), vote=False,
+                          classes_hash=int(classes_hash), need_mib=int(need_mib))
+    except BaseException:  # noqa: BLE001 -- an observer never raises
+        return False
+    leg.log(
+        f"{SHADOW_GATE_LINE_PREFIX} leg={i.leg} epoch={i.epoch} row={i.row} "
+        f"vote=no reason={reason} -- published BEFORE the gate, so no peer "
+        f"pays a gate budget inside its own flip leg discovering this row is "
+        f"not coming"
+    )
+    return True
+
+
+def _make_summer(ops: tp.DeviceOps, device: int, stripe_bytes: int,
+                 result: ShadowResult):
+    """``(sum_bytes, stream, scratch)`` -- THE PRODUCT PRODUCER of the summer.
+
+    MEASURED-BY-REVIEW DEFECT (S5b refuter, must_fix 6): the ``weight_updater``
+    adapter passed no ``sum_bytes``, so :meth:`ShadowRun.compare` took its
+    ``no-summer`` exit and ``tp.run_leg`` ran with its slot checksums disabled
+    -- the shipping shape reported ``verdict=NOT-RUN`` for TWO independent
+    reasons while the record named one.  :func:`make_device_scratch` and
+    :func:`device_summer` had no product caller anywhere; this is it.
+
+    IT IS BUILT AFTER THE GATE AND AFTER THE TRANSPORT, never before: the
+    scratch is a 64 MiB device allocation, and "allocate only once the gate
+    said yes" is the rule :func:`shadow_transport` states for the destination
+    buffers.  It is the term :func:`price_leg` already prices as
+    ``scratch_bytes`` on the destination side, so it is priced before it is
+    taken, not after.
+
+    Every failure is a counted error and ``(None, None, None)`` -- an
+    unavailable summer reads as ``verdict=NOT-RUN reason=no-summer``, which is
+    the honest reading, and never as a match.
+    """
+    try:
+        stream = ops.create_stream(int(device))
+    except BaseException as exc:  # noqa: BLE001 -- an observer never raises
+        result.counters.errors.append(f"no-summer-stream {type(exc).__name__}: {exc}")
+        return None, None, None
+    try:
+        scratch = make_device_scratch(int(stripe_bytes), int(device))
+        return device_summer(ops, stream, scratch), stream, scratch
+    except BaseException as exc:  # noqa: BLE001
+        result.counters.errors.append(f"no-summer-scratch {type(exc).__name__}: {exc}")
+        destroy = getattr(ops, "destroy_stream", None)
+        if destroy is not None:
+            try:
+                destroy(stream)
+            except BaseException:  # noqa: BLE001
+                pass
+        return None, None, None
 
 
 def run_leg_hook(
@@ -1800,6 +1965,12 @@ def run_leg_hook(
     bound_ms: Optional[float] = None,
     explicit: bool = False,
     armed: Optional[bool] = None,
+    # THE ONE DEADLINE THE TWO WAITS ARE CARVED OUT OF.  See
+    # :data:`SHADOW_HOOK_BUDGET_S`; ``gate_budget_s`` and ``budget_s`` are
+    # CEILINGS on their step, and what is left of this deadline is the other
+    # ceiling, so their sum can never be paid.
+    hook_budget_s: float = SHADOW_HOOK_BUDGET_S,
+    gate_budget_s: float = SHADOW_GATE_BUDGET_S,
     # The staging geometry, FORWARDED and never re-derived.  These are already
     # parameters of :func:`shadow_transport` with exactly these defaults; the
     # hook passes them through so a caller whose region has a different
@@ -1828,12 +1999,28 @@ def run_leg_hook(
     against afterwards.  A measured overshoot is a finding on the line, never a
     retro-active refusal -- there is nothing to refuse once the wall has been
     spent, and pretending otherwise is the compensating-reader shape.
+
+    **EVERY WAIT IS INSIDE ONE DEADLINE** (:data:`SHADOW_HOOK_BUDGET_S`;
+    S5b refuter must_fix 4).  ``bound_ms`` grades the priced on-card HOP and
+    nothing else -- it never covered the attach, the gate, the transport or the
+    compare, all of which sat on the leg's critical path.  The two things that
+    can WAIT (the gate rendezvous and the transport's slot protocol) now draw
+    from one deadline: each is given ``min(its own ceiling, what is left)``, so
+    whatever the gate spends the transport cannot spend again.  Work is not a
+    wait and is not clamped -- the compare's device sums are bounded by the
+    class subset instead -- but the total IS measured (``shadow_ms``) and
+    printed beside the deadline (``hook_budget_ms``, ``budget=ok|OVER``), so an
+    overrun is a reading rather than a hidden cost.
     """
     if armed is None:
         armed = shadow_armed()
     if not armed:
         return None
     started = time.perf_counter()
+    hook_budget_s = max(0.0, float(hook_budget_s))
+    deadline = started + hook_budget_s
+    left = lambda: max(0.0, deadline - time.perf_counter())  # noqa: E731
+    summer_stream = None
     leg = ShadowLeg(inputs, log).adopt()
     result = ShadowResult(leg=int(inputs.leg), epoch=str(inputs.epoch),
                           subset=select_subset((), leg=int(inputs.leg)),
@@ -1876,6 +2063,7 @@ def run_leg_hook(
             return result
         sem_reason = leg.verify_sems()
         if sem_reason:
+            publish_no_vote(leg, reason=sem_reason)
             result.reason = sem_reason
             return result
         is_source = inputs.hook == HOOK_SOURCE
@@ -1909,6 +2097,12 @@ def run_leg_hook(
             result.oncard_batches = batches
             result.oncard_hop_ms_priced = priced_ms
             result.reason = "hop-over-bound"
+            # THE ASYMMETRIC REFUSAL, PUBLISHED.  ``hop_ms`` is priced from
+            # THIS CARD's diagonal, so one card can refuse while the other two
+            # do not -- exactly the case where a silent return costs five
+            # peers a gate budget each.
+            publish_no_vote(leg, reason="hop-over-bound",
+                            classes_hash=subset.hash, need_mib=0)
             if explicit:
                 raise Weg2XchgShadowUnaffordable(message)
             return result
@@ -1923,7 +2117,11 @@ def run_leg_hook(
             sum_bytes=sum_bytes, classes=classes, per_leg=per_leg,
             resume_reserve_bytes=inputs.resume_reserve_bytes,
             explicit=explicit, slot_bytes=slot_bytes,
-            stripe_bytes=stripe_bytes, budget_s=budget_s,
+            stripe_bytes=stripe_bytes,
+            # BOTH WAITS OUT OF ONE DEADLINE -- see the docstring.
+            budget_s=min(float(budget_s), left()),
+            gate_budget_s=min(float(gate_budget_s), left()),
+            gate_rows=inputs.gate_rows,
             # ONE NUMBER FOR THE DIAGONAL SLOT.  The hook already priced the hop
             # from it; letting ``shadow_transport`` derive it a second time is
             # two computations of one quantity, and the W52 cross-check between
@@ -1936,6 +2134,13 @@ def run_leg_hook(
         if not is_source:
             # THE COMPARE IS THE DESTINATION HOOK'S WHOLE POINT and it runs
             # here, after the ring's own restore, against the ring's own bytes.
+            if sum_bytes is None and result.ran:
+                # The scratch itself is held by the closure the summer IS
+                # (``device_summer`` closes over the tensor), so there is no
+                # second reference here to forget to drop.
+                sum_bytes, summer_stream, _scratch = _make_summer(
+                    leg.ops, int(inputs.device), stripe_bytes, result)
+                del _scratch
             run.compare(sum_bytes, log)
         return result
     except Weg2XchgShadowUnaffordable:
@@ -1948,8 +2153,18 @@ def run_leg_hook(
         result.ran = False
         return result
     finally:
+        # THE SUMMER'S STREAM BEFORE THE LEG'S OPS, because ``leg.close`` nulls
+        # them: a stream destroyed through a ``None`` is a leaked stream on the
+        # card the shadow is not allowed to disturb.
+        destroy = getattr(leg.ops, "destroy_stream", None)
+        if summer_stream is not None and destroy is not None:
+            try:
+                destroy(summer_stream)
+            except BaseException:  # noqa: BLE001 -- an observer's unwind
+                pass
         leg.close(owner=leg.token)
         result.shadow_ms = (time.perf_counter() - started) * 1e3
+        result.hook_budget_ms = hook_budget_s * 1e3
         result.hop_bound_ms = bound
         result.sems_armed = leg.sems_armed
         result.hook = str(inputs.hook)
