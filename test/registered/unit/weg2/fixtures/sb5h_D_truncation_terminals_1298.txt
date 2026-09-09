@@ -1,0 +1,129 @@
+[2026-09-09 10:42:27 TP0] #915 PREFETCH TRUNCATED rid=553f4b08 need=18493 got=8016 lost=10477 chunk=4096 over_bound=true available=0 pool_id=140034380321984 epoch=10 phase=pp generation=0
+[2026-09-09 10:42:27 TP2] #915 PREFETCH TRUNCATED rid=553f4b08 need=18493 got=8016 lost=10477 chunk=4096 over_bound=true available=0 pool_id=135372351741616 epoch=10 phase=pp generation=0
+[2026-09-09 10:42:27 TP1] #915 PREFETCH TRUNCATED rid=553f4b08 need=18493 got=8016 lost=10477 chunk=4096 over_bound=true available=0 pool_id=131697287118480 epoch=10 phase=pp generation=0
+[2026-09-09 10:42:28 TP0] #915 PREFETCH TRUNCATED rid=9fceb1a8 need=16233 got=8016 lost=8217 chunk=4096 over_bound=true available=0 pool_id=140034380321984 epoch=10 phase=pp generation=0
+[2026-09-09 10:42:28 TP1] #915 PREFETCH TRUNCATED rid=9fceb1a8 need=16233 got=8016 lost=8217 chunk=4096 over_bound=true available=0 pool_id=131697287118480 epoch=10 phase=pp generation=0
+[2026-09-09 10:42:28 TP2] #915 PREFETCH TRUNCATED rid=9fceb1a8 need=16233 got=8016 lost=8217 chunk=4096 over_bound=true available=0 pool_id=135372351741616 epoch=10 phase=pp generation=0
+[2026-09-09 10:42:29 TP0] #915 PREFETCH TRUNCATED rid=3cde9539 need=22331 got=8016 lost=14315 chunk=4096 over_bound=true available=0 pool_id=140034380321984 epoch=10 phase=pp generation=0
+[2026-09-09 10:42:29 TP1] #915 PREFETCH TRUNCATED rid=3cde9539 need=22331 got=8016 lost=14315 chunk=4096 over_bound=true available=0 pool_id=131697287118480 epoch=10 phase=pp generation=0
+[2026-09-09 10:42:29 TP2] #915 PREFETCH TRUNCATED rid=3cde9539 need=22331 got=8016 lost=14315 chunk=4096 over_bound=true available=0 pool_id=135372351741616 epoch=10 phase=pp generation=0
+[2026-09-09 10:43:08 TP2] #915 PREFETCH TRUNCATED rid=4c7f0c75 need=18493 got=7991 lost=10502 chunk=4096 over_bound=true available=0 pool_id=135372351741616 epoch=13 phase=pp generation=0
+[2026-09-09 10:43:08 TP0] #915 PREFETCH TRUNCATED rid=4c7f0c75 need=18493 got=7991 lost=10502 chunk=4096 over_bound=true available=0 pool_id=140034380321984 epoch=13 phase=pp generation=0
+[2026-09-09 10:43:08 TP1] #915 PREFETCH TRUNCATED rid=4c7f0c75 need=18493 got=7991 lost=10502 chunk=4096 over_bound=true available=0 pool_id=131697287118480 epoch=13 phase=pp generation=0
+[2026-09-09 10:43:09 TP0] #915 PREFETCH TRUNCATED rid=dc7e113c need=16233 got=7991 lost=8242 chunk=4096 over_bound=true available=0 pool_id=140034380321984 epoch=13 phase=pp generation=0
+[2026-09-09 10:43:09 TP2] #915 PREFETCH TRUNCATED rid=dc7e113c need=16233 got=7991 lost=8242 chunk=4096 over_bound=true available=0 pool_id=135372351741616 epoch=13 phase=pp generation=0
+[2026-09-09 10:43:09 TP1] #915 PREFETCH TRUNCATED rid=dc7e113c need=16233 got=7991 lost=8242 chunk=4096 over_bound=true available=0 pool_id=131697287118480 epoch=13 phase=pp generation=0
+[2026-09-09 10:43:09 TP2] #915 PREFETCH TRUNCATED rid=577ea4b0 need=22432 got=7991 lost=14441 chunk=4096 over_bound=true available=0 pool_id=135372351741616 epoch=13 phase=pp generation=0
+[2026-09-09 10:43:09 TP0] #915 PREFETCH TRUNCATED rid=577ea4b0 need=22432 got=7991 lost=14441 chunk=4096 over_bound=true available=0 pool_id=140034380321984 epoch=13 phase=pp generation=0
+[2026-09-09 10:43:09 TP1] #915 PREFETCH TRUNCATED rid=577ea4b0 need=22432 got=7991 lost=14441 chunk=4096 over_bound=true available=0 pool_id=131697287118480 epoch=13 phase=pp generation=0
+[2026-09-09 10:43:52 TP1] #915 PREFETCH TRUNCATED rid=9fd94699 need=18360 got=8128 lost=10232 chunk=4096 over_bound=true available=0 pool_id=131697287118480 epoch=16 phase=pp generation=0
+[2026-09-09 10:43:52 TP2] #915 PREFETCH TRUNCATED rid=9fd94699 need=18360 got=8128 lost=10232 chunk=4096 over_bound=true available=0 pool_id=135372351741616 epoch=16 phase=pp generation=0
+[2026-09-09 10:43:52 TP0] #915 PREFETCH TRUNCATED rid=9fd94699 need=18360 got=8128 lost=10232 chunk=4096 over_bound=true available=0 pool_id=140034380321984 epoch=16 phase=pp generation=0
+[2026-09-09 10:43:53 TP0] #915 PREFETCH TRUNCATED rid=1b4a4361 need=16388 got=8128 lost=8260 chunk=4096 over_bound=true available=0 pool_id=140034380321984 epoch=16 phase=pp generation=0
+[2026-09-09 10:43:53 TP1] #915 PREFETCH TRUNCATED rid=1b4a4361 need=16388 got=8128 lost=8260 chunk=4096 over_bound=true available=0 pool_id=131697287118480 epoch=16 phase=pp generation=0
+[2026-09-09 10:43:53 TP2] #915 PREFETCH TRUNCATED rid=1b4a4361 need=16388 got=8128 lost=8260 chunk=4096 over_bound=true available=0 pool_id=135372351741616 epoch=16 phase=pp generation=0
+[2026-09-09 10:43:53 TP1] #915 PREFETCH TRUNCATED rid=1910112d need=22362 got=8128 lost=14234 chunk=4096 over_bound=true available=0 pool_id=131697287118480 epoch=16 phase=pp generation=0
+[2026-09-09 10:43:53 TP2] #915 PREFETCH TRUNCATED rid=1910112d need=22362 got=8128 lost=14234 chunk=4096 over_bound=true available=0 pool_id=135372351741616 epoch=16 phase=pp generation=0
+[2026-09-09 10:43:53 TP0] #915 PREFETCH TRUNCATED rid=1910112d need=22362 got=8128 lost=14234 chunk=4096 over_bound=true available=0 pool_id=140034380321984 epoch=16 phase=pp generation=0
+[2026-09-09 10:44:28 TP1] #915 PREFETCH TRUNCATED rid=54b0d547 need=18360 got=8150 lost=10210 chunk=4096 over_bound=true available=0 pool_id=131697287118480 epoch=19 phase=pp generation=0
+[2026-09-09 10:44:28 TP0] #915 PREFETCH TRUNCATED rid=54b0d547 need=18360 got=8150 lost=10210 chunk=4096 over_bound=true available=0 pool_id=140034380321984 epoch=19 phase=pp generation=0
+[2026-09-09 10:44:28 TP2] #915 PREFETCH TRUNCATED rid=54b0d547 need=18360 got=8150 lost=10210 chunk=4096 over_bound=true available=0 pool_id=135372351741616 epoch=19 phase=pp generation=0
+[2026-09-09 10:44:29 TP1] #915 PREFETCH TRUNCATED rid=b5d23523 need=16388 got=8150 lost=8238 chunk=4096 over_bound=true available=0 pool_id=131697287118480 epoch=19 phase=pp generation=0
+[2026-09-09 10:44:29 TP2] #915 PREFETCH TRUNCATED rid=b5d23523 need=16388 got=8150 lost=8238 chunk=4096 over_bound=true available=0 pool_id=135372351741616 epoch=19 phase=pp generation=0
+[2026-09-09 10:44:29 TP0] #915 PREFETCH TRUNCATED rid=b5d23523 need=16388 got=8150 lost=8238 chunk=4096 over_bound=true available=0 pool_id=140034380321984 epoch=19 phase=pp generation=0
+[2026-09-09 10:44:29 TP1] #915 PREFETCH TRUNCATED rid=d0396673 need=22364 got=8150 lost=14214 chunk=4096 over_bound=true available=0 pool_id=131697287118480 epoch=19 phase=pp generation=0
+[2026-09-09 10:44:29 TP2] #915 PREFETCH TRUNCATED rid=d0396673 need=22364 got=8150 lost=14214 chunk=4096 over_bound=true available=0 pool_id=135372351741616 epoch=19 phase=pp generation=0
+[2026-09-09 10:44:29 TP0] #915 PREFETCH TRUNCATED rid=d0396673 need=22364 got=8150 lost=14214 chunk=4096 over_bound=true available=0 pool_id=140034380321984 epoch=19 phase=pp generation=0
+[2026-09-09 10:45:18 TP2] #915 PREFETCH TRUNCATED rid=17a0203f need=16520 got=7891 lost=8629 chunk=4096 over_bound=true available=0 pool_id=135372351741616 epoch=22 phase=pp generation=0
+[2026-09-09 10:45:18 TP0] #915 PREFETCH TRUNCATED rid=17a0203f need=16520 got=7891 lost=8629 chunk=4096 over_bound=true available=0 pool_id=140034380321984 epoch=22 phase=pp generation=0
+[2026-09-09 10:45:18 TP1] #915 PREFETCH TRUNCATED rid=17a0203f need=16520 got=7891 lost=8629 chunk=4096 over_bound=true available=0 pool_id=131697287118480 epoch=22 phase=pp generation=0
+[2026-09-09 10:45:19 TP1] #915 PREFETCH TRUNCATED rid=ef8cbcd6 need=16165 got=7891 lost=8274 chunk=4096 over_bound=true available=0 pool_id=131697287118480 epoch=22 phase=pp generation=0
+[2026-09-09 10:45:19 TP2] #915 PREFETCH TRUNCATED rid=ef8cbcd6 need=16165 got=7891 lost=8274 chunk=4096 over_bound=true available=0 pool_id=135372351741616 epoch=22 phase=pp generation=0
+[2026-09-09 10:45:19 TP0] #915 PREFETCH TRUNCATED rid=ef8cbcd6 need=16165 got=7891 lost=8274 chunk=4096 over_bound=true available=0 pool_id=140034380321984 epoch=22 phase=pp generation=0
+[2026-09-09 10:45:20 TP0] #915 PREFETCH TRUNCATED rid=1a5327ec need=22352 got=7891 lost=14461 chunk=4096 over_bound=true available=0 pool_id=140034380321984 epoch=22 phase=pp generation=0
+[2026-09-09 10:45:20 TP1] #915 PREFETCH TRUNCATED rid=1a5327ec need=22352 got=7891 lost=14461 chunk=4096 over_bound=true available=0 pool_id=131697287118480 epoch=22 phase=pp generation=0
+[2026-09-09 10:45:20 TP2] #915 PREFETCH TRUNCATED rid=1a5327ec need=22352 got=7891 lost=14461 chunk=4096 over_bound=true available=0 pool_id=135372351741616 epoch=22 phase=pp generation=0
+[2026-09-09 10:45:54 TP2] #915 PREFETCH TRUNCATED rid=d975c73c need=16520 got=8247 lost=8273 chunk=4096 over_bound=true available=0 pool_id=135372351741616 epoch=25 phase=pp generation=0
+[2026-09-09 10:45:54 TP0] #915 PREFETCH TRUNCATED rid=d975c73c need=16520 got=8247 lost=8273 chunk=4096 over_bound=true available=0 pool_id=140034380321984 epoch=25 phase=pp generation=0
+[2026-09-09 10:45:54 TP1] #915 PREFETCH TRUNCATED rid=d975c73c need=16520 got=8247 lost=8273 chunk=4096 over_bound=true available=0 pool_id=131697287118480 epoch=25 phase=pp generation=0
+[2026-09-09 10:45:57 TP0] #905 PREFETCH-COMPLETE free-site: req=d975c73caeba4dc698abd1e7e8ea9117 unclaimed_to=44 completed=8190 min_synced=8190 | pool id now=140034380321984 epoch now=25 | at registration id=140034380321984 epoch=25 | MOVED=False
+[2026-09-09 10:45:57 TP0] HiCache prefetch success req=d975c73caeba4dc698abd1e7e8ea9117 completed_local=8190 completed_synced=8190 synced=yes attn_reduce_world=3 matched=44 loaded=8146 refused=0 tail_release=0 occupied=0
+[2026-09-09 10:45:57 TP1] #905 PREFETCH-COMPLETE free-site: req=d975c73caeba4dc698abd1e7e8ea9117 unclaimed_to=44 completed=8190 min_synced=8190 | pool id now=131697287118480 epoch now=25 | at registration id=131697287118480 epoch=25 | MOVED=False
+[2026-09-09 10:45:57 TP1] HiCache prefetch success req=d975c73caeba4dc698abd1e7e8ea9117 completed_local=8190 completed_synced=8190 synced=yes attn_reduce_world=3 matched=44 loaded=8146 refused=0 tail_release=0 occupied=0
+[2026-09-09 10:45:57 TP2] #905 PREFETCH-COMPLETE free-site: req=d975c73caeba4dc698abd1e7e8ea9117 unclaimed_to=44 completed=8190 min_synced=8190 | pool id now=135372351741616 epoch now=25 | at registration id=135372351741616 epoch=25 | MOVED=False
+[2026-09-09 10:45:57 TP2] HiCache prefetch success req=d975c73caeba4dc698abd1e7e8ea9117 completed_local=8190 completed_synced=8190 synced=yes attn_reduce_world=3 matched=44 loaded=8146 refused=0 tail_release=0 occupied=0
+[2026-09-09 10:46:54 TP1] #915 PREFETCH TRUNCATED rid=8d2d5da6 need=18187 got=8247 lost=9940 chunk=4096 over_bound=true available=0 pool_id=131697287118480 epoch=28 phase=pp generation=0
+[2026-09-09 10:46:54 TP2] #915 PREFETCH TRUNCATED rid=8d2d5da6 need=18187 got=8247 lost=9940 chunk=4096 over_bound=true available=0 pool_id=135372351741616 epoch=28 phase=pp generation=0
+[2026-09-09 10:46:54 TP0] #915 PREFETCH TRUNCATED rid=8d2d5da6 need=18187 got=8247 lost=9940 chunk=4096 over_bound=true available=0 pool_id=140034380321984 epoch=28 phase=pp generation=0
+[2026-09-09 10:46:56 TP2] #905 PREFETCH-COMPLETE free-site: req=8d2d5da624c146e799b54361a1c7d7e3 unclaimed_to=44 completed=8190 min_synced=8190 | pool id now=135372351741616 epoch now=28 | at registration id=135372351741616 epoch=28 | MOVED=False
+[2026-09-09 10:46:56 TP2] HiCache prefetch success req=8d2d5da624c146e799b54361a1c7d7e3 completed_local=8190 completed_synced=8190 synced=yes attn_reduce_world=3 matched=44 loaded=8146 refused=0 tail_release=0 occupied=0
+[2026-09-09 10:46:56 TP0] #905 PREFETCH-COMPLETE free-site: req=8d2d5da624c146e799b54361a1c7d7e3 unclaimed_to=44 completed=8190 min_synced=8190 | pool id now=140034380321984 epoch now=28 | at registration id=140034380321984 epoch=28 | MOVED=False
+[2026-09-09 10:46:56 TP1] #905 PREFETCH-COMPLETE free-site: req=8d2d5da624c146e799b54361a1c7d7e3 unclaimed_to=44 completed=8190 min_synced=8190 | pool id now=131697287118480 epoch now=28 | at registration id=131697287118480 epoch=28 | MOVED=False
+[2026-09-09 10:46:56 TP0] HiCache prefetch success req=8d2d5da624c146e799b54361a1c7d7e3 completed_local=8190 completed_synced=8190 synced=yes attn_reduce_world=3 matched=44 loaded=8146 refused=0 tail_release=0 occupied=0
+[2026-09-09 10:46:56 TP1] HiCache prefetch success req=8d2d5da624c146e799b54361a1c7d7e3 completed_local=8190 completed_synced=8190 synced=yes attn_reduce_world=3 matched=44 loaded=8146 refused=0 tail_release=0 occupied=0
+[2026-09-09 10:46:56 TP0] #915 PREFETCH TRUNCATED rid=1fdf04cc need=22300 got=8247 lost=14053 chunk=4096 over_bound=true available=0 pool_id=140034380321984 epoch=28 phase=pp generation=0
+[2026-09-09 10:46:56 TP2] #915 PREFETCH TRUNCATED rid=1fdf04cc need=22300 got=8247 lost=14053 chunk=4096 over_bound=true available=0 pool_id=135372351741616 epoch=28 phase=pp generation=0
+[2026-09-09 10:46:56 TP1] #915 PREFETCH TRUNCATED rid=1fdf04cc need=22300 got=8247 lost=14053 chunk=4096 over_bound=true available=0 pool_id=131697287118480 epoch=28 phase=pp generation=0
+[2026-09-09 10:46:57 TP1] #915 PREFETCH TRUNCATED rid=5247c870 need=16520 got=8247 lost=8273 chunk=4096 over_bound=true available=0 pool_id=131697287118480 epoch=28 phase=pp generation=0
+[2026-09-09 10:46:57 TP0] #915 PREFETCH TRUNCATED rid=5247c870 need=16520 got=8247 lost=8273 chunk=4096 over_bound=true available=0 pool_id=140034380321984 epoch=28 phase=pp generation=0
+[2026-09-09 10:46:57 TP2] #915 PREFETCH TRUNCATED rid=5247c870 need=16520 got=8247 lost=8273 chunk=4096 over_bound=true available=0 pool_id=135372351741616 epoch=28 phase=pp generation=0
+[2026-09-09 10:47:01 TP0] #905 PREFETCH-COMPLETE free-site: req=5247c870b69c44e4974c0597015aa11b unclaimed_to=44 completed=8190 min_synced=8190 | pool id now=140034380321984 epoch now=28 | at registration id=140034380321984 epoch=28 | MOVED=False
+[2026-09-09 10:47:01 TP1] #905 PREFETCH-COMPLETE free-site: req=5247c870b69c44e4974c0597015aa11b unclaimed_to=44 completed=8190 min_synced=8190 | pool id now=131697287118480 epoch now=28 | at registration id=131697287118480 epoch=28 | MOVED=False
+[2026-09-09 10:47:01 TP0] HiCache prefetch success req=5247c870b69c44e4974c0597015aa11b completed_local=8190 completed_synced=8190 synced=yes attn_reduce_world=3 matched=44 loaded=8146 refused=0 tail_release=0 occupied=0
+[2026-09-09 10:47:01 TP2] #905 PREFETCH-COMPLETE free-site: req=5247c870b69c44e4974c0597015aa11b unclaimed_to=44 completed=8190 min_synced=8190 | pool id now=135372351741616 epoch now=28 | at registration id=135372351741616 epoch=28 | MOVED=False
+[2026-09-09 10:47:01 TP1] HiCache prefetch success req=5247c870b69c44e4974c0597015aa11b completed_local=8190 completed_synced=8190 synced=yes attn_reduce_world=3 matched=44 loaded=8146 refused=0 tail_release=0 occupied=0
+[2026-09-09 10:47:01 TP2] HiCache prefetch success req=5247c870b69c44e4974c0597015aa11b completed_local=8190 completed_synced=8190 synced=yes attn_reduce_world=3 matched=44 loaded=8146 refused=0 tail_release=0 occupied=0
+[2026-09-09 10:47:50 TP0] #915 PREFETCH TRUNCATED rid=eadb433c need=18187 got=7991 lost=10196 chunk=4096 over_bound=true available=0 pool_id=140034380321984 epoch=31 phase=pp generation=0
+[2026-09-09 10:47:50 TP2] #915 PREFETCH TRUNCATED rid=eadb433c need=18187 got=7991 lost=10196 chunk=4096 over_bound=true available=0 pool_id=135372351741616 epoch=31 phase=pp generation=0
+[2026-09-09 10:47:50 TP1] #915 PREFETCH TRUNCATED rid=eadb433c need=18187 got=7991 lost=10196 chunk=4096 over_bound=true available=0 pool_id=131697287118480 epoch=31 phase=pp generation=0
+[2026-09-09 10:47:51 TP0] #915 PREFETCH TRUNCATED rid=87fc34e1 need=22162 got=7991 lost=14171 chunk=4096 over_bound=true available=0 pool_id=140034380321984 epoch=31 phase=pp generation=0
+[2026-09-09 10:47:51 TP2] #915 PREFETCH TRUNCATED rid=87fc34e1 need=22162 got=7991 lost=14171 chunk=4096 over_bound=true available=0 pool_id=135372351741616 epoch=31 phase=pp generation=0
+[2026-09-09 10:47:51 TP1] #915 PREFETCH TRUNCATED rid=87fc34e1 need=22162 got=7991 lost=14171 chunk=4096 over_bound=true available=0 pool_id=131697287118480 epoch=31 phase=pp generation=0
+[2026-09-09 10:47:52 TP0] #915 PREFETCH TRUNCATED rid=aac1730f need=16215 got=7991 lost=8224 chunk=4096 over_bound=true available=0 pool_id=140034380321984 epoch=31 phase=pp generation=0
+[2026-09-09 10:47:52 TP2] #915 PREFETCH TRUNCATED rid=aac1730f need=16215 got=7991 lost=8224 chunk=4096 over_bound=true available=0 pool_id=135372351741616 epoch=31 phase=pp generation=0
+[2026-09-09 10:47:52 TP1] #915 PREFETCH TRUNCATED rid=aac1730f need=16215 got=7991 lost=8224 chunk=4096 over_bound=true available=0 pool_id=131697287118480 epoch=31 phase=pp generation=0
+[2026-09-09 10:48:39 TP2] #915 PREFETCH TRUNCATED rid=3d036774 need=16198 got=8043 lost=8155 chunk=4096 over_bound=true available=0 pool_id=135372351741616 epoch=34 phase=pp generation=0
+[2026-09-09 10:48:39 TP0] #915 PREFETCH TRUNCATED rid=3d036774 need=16198 got=8043 lost=8155 chunk=4096 over_bound=true available=0 pool_id=140034380321984 epoch=34 phase=pp generation=0
+[2026-09-09 10:48:39 TP1] #915 PREFETCH TRUNCATED rid=3d036774 need=16198 got=8043 lost=8155 chunk=4096 over_bound=true available=0 pool_id=131697287118480 epoch=34 phase=pp generation=0
+[2026-09-09 10:48:40 TP0] #915 PREFETCH TRUNCATED rid=f496440c need=22190 got=8043 lost=14147 chunk=4096 over_bound=true available=0 pool_id=140034380321984 epoch=34 phase=pp generation=0
+[2026-09-09 10:48:40 TP2] #915 PREFETCH TRUNCATED rid=f496440c need=22190 got=8043 lost=14147 chunk=4096 over_bound=true available=0 pool_id=135372351741616 epoch=34 phase=pp generation=0
+[2026-09-09 10:48:40 TP1] #915 PREFETCH TRUNCATED rid=f496440c need=22190 got=8043 lost=14147 chunk=4096 over_bound=true available=0 pool_id=131697287118480 epoch=34 phase=pp generation=0
+[2026-09-09 10:48:41 TP0] #915 PREFETCH TRUNCATED rid=37f3ab63 need=16215 got=8043 lost=8172 chunk=4096 over_bound=true available=0 pool_id=140034380321984 epoch=34 phase=pp generation=0
+[2026-09-09 10:48:41 TP2] #915 PREFETCH TRUNCATED rid=37f3ab63 need=16215 got=8043 lost=8172 chunk=4096 over_bound=true available=0 pool_id=135372351741616 epoch=34 phase=pp generation=0
+[2026-09-09 10:48:41 TP1] #915 PREFETCH TRUNCATED rid=37f3ab63 need=16215 got=8043 lost=8172 chunk=4096 over_bound=true available=0 pool_id=131697287118480 epoch=34 phase=pp generation=0
+[2026-09-09 10:49:15 TP0] #915 PREFETCH TRUNCATED rid=7a690e40 need=16198 got=8100 lost=8098 chunk=4096 over_bound=true available=0 pool_id=140034380321984 epoch=37 phase=pp generation=0
+[2026-09-09 10:49:15 TP1] #915 PREFETCH TRUNCATED rid=7a690e40 need=16198 got=8100 lost=8098 chunk=4096 over_bound=true available=0 pool_id=131697287118480 epoch=37 phase=pp generation=0
+[2026-09-09 10:49:15 TP2] #915 PREFETCH TRUNCATED rid=7a690e40 need=16198 got=8100 lost=8098 chunk=4096 over_bound=true available=0 pool_id=135372351741616 epoch=37 phase=pp generation=0
+[2026-09-09 10:49:16 TP0] #915 PREFETCH TRUNCATED rid=29cc3856 need=22493 got=8100 lost=14393 chunk=4096 over_bound=true available=0 pool_id=140034380321984 epoch=37 phase=pp generation=0
+[2026-09-09 10:49:16 TP1] #915 PREFETCH TRUNCATED rid=29cc3856 need=22493 got=8100 lost=14393 chunk=4096 over_bound=true available=0 pool_id=131697287118480 epoch=37 phase=pp generation=0
+[2026-09-09 10:49:16 TP2] #915 PREFETCH TRUNCATED rid=29cc3856 need=22493 got=8100 lost=14393 chunk=4096 over_bound=true available=0 pool_id=135372351741616 epoch=37 phase=pp generation=0
+[2026-09-09 10:49:17 TP1] #915 PREFETCH TRUNCATED rid=db0dc1a6 need=17311 got=8100 lost=9211 chunk=4096 over_bound=true available=0 pool_id=131697287118480 epoch=37 phase=pp generation=0
+[2026-09-09 10:49:17 TP2] #915 PREFETCH TRUNCATED rid=db0dc1a6 need=17311 got=8100 lost=9211 chunk=4096 over_bound=true available=0 pool_id=135372351741616 epoch=37 phase=pp generation=0
+[2026-09-09 10:49:17 TP0] #915 PREFETCH TRUNCATED rid=db0dc1a6 need=17311 got=8100 lost=9211 chunk=4096 over_bound=true available=0 pool_id=140034380321984 epoch=37 phase=pp generation=0
+[2026-09-09 10:50:04 TP1] #915 PREFETCH TRUNCATED rid=75725d50 need=15982 got=8074 lost=7908 chunk=4096 over_bound=true available=0 pool_id=131697287118480 epoch=40 phase=pp generation=0
+[2026-09-09 10:50:04 TP2] #915 PREFETCH TRUNCATED rid=75725d50 need=15982 got=8074 lost=7908 chunk=4096 over_bound=true available=0 pool_id=135372351741616 epoch=40 phase=pp generation=0
+[2026-09-09 10:50:04 TP0] #915 PREFETCH TRUNCATED rid=75725d50 need=15982 got=8074 lost=7908 chunk=4096 over_bound=true available=0 pool_id=140034380321984 epoch=40 phase=pp generation=0
+[2026-09-09 10:50:05 TP2] #915 PREFETCH TRUNCATED rid=b7c94c07 need=22331 got=8074 lost=14257 chunk=4096 over_bound=true available=0 pool_id=135372351741616 epoch=40 phase=pp generation=0
+[2026-09-09 10:50:05 TP1] #915 PREFETCH TRUNCATED rid=b7c94c07 need=22331 got=8074 lost=14257 chunk=4096 over_bound=true available=0 pool_id=131697287118480 epoch=40 phase=pp generation=0
+[2026-09-09 10:50:05 TP0] #915 PREFETCH TRUNCATED rid=b7c94c07 need=22331 got=8074 lost=14257 chunk=4096 over_bound=true available=0 pool_id=140034380321984 epoch=40 phase=pp generation=0
+[2026-09-09 10:50:06 TP0] #915 PREFETCH TRUNCATED rid=c830ac83 need=17311 got=8074 lost=9237 chunk=4096 over_bound=true available=0 pool_id=140034380321984 epoch=40 phase=pp generation=0
+[2026-09-09 10:50:06 TP2] #915 PREFETCH TRUNCATED rid=c830ac83 need=17311 got=8074 lost=9237 chunk=4096 over_bound=true available=0 pool_id=135372351741616 epoch=40 phase=pp generation=0
+[2026-09-09 10:50:06 TP1] #915 PREFETCH TRUNCATED rid=c830ac83 need=17311 got=8074 lost=9237 chunk=4096 over_bound=true available=0 pool_id=131697287118480 epoch=40 phase=pp generation=0
+[2026-09-09 10:51:05 TP0] #915 PREFETCH TRUNCATED rid=dd5fff7f need=15982 got=7991 lost=7991 chunk=4096 over_bound=true available=0 pool_id=140034380321984 epoch=43 phase=pp generation=0
+[2026-09-09 10:51:05 TP2] #915 PREFETCH TRUNCATED rid=dd5fff7f need=15982 got=7991 lost=7991 chunk=4096 over_bound=true available=0 pool_id=135372351741616 epoch=43 phase=pp generation=0
+[2026-09-09 10:51:05 TP1] #915 PREFETCH TRUNCATED rid=dd5fff7f need=15982 got=7991 lost=7991 chunk=4096 over_bound=true available=0 pool_id=131697287118480 epoch=43 phase=pp generation=0
+[2026-09-09 10:51:06 TP0] #915 PREFETCH TRUNCATED rid=bdabffbd need=22461 got=7991 lost=14470 chunk=4096 over_bound=true available=0 pool_id=140034380321984 epoch=43 phase=pp generation=0
+[2026-09-09 10:51:06 TP1] #915 PREFETCH TRUNCATED rid=bdabffbd need=22461 got=7991 lost=14470 chunk=4096 over_bound=true available=0 pool_id=131697287118480 epoch=43 phase=pp generation=0
+[2026-09-09 10:51:06 TP2] #915 PREFETCH TRUNCATED rid=bdabffbd need=22461 got=7991 lost=14470 chunk=4096 over_bound=true available=0 pool_id=135372351741616 epoch=43 phase=pp generation=0
+[2026-09-09 10:51:07 TP0] #915 PREFETCH TRUNCATED rid=af46bb2c need=16826 got=7991 lost=8835 chunk=4096 over_bound=true available=0 pool_id=140034380321984 epoch=43 phase=pp generation=0
+[2026-09-09 10:51:07 TP1] #915 PREFETCH TRUNCATED rid=af46bb2c need=16826 got=7991 lost=8835 chunk=4096 over_bound=true available=0 pool_id=131697287118480 epoch=43 phase=pp generation=0
+[2026-09-09 10:51:07 TP2] #915 PREFETCH TRUNCATED rid=af46bb2c need=16826 got=7991 lost=8835 chunk=4096 over_bound=true available=0 pool_id=135372351741616 epoch=43 phase=pp generation=0
+[2026-09-09 10:51:54 TP0] #915 PREFETCH TRUNCATED rid=4b1ec0e1 need=18557 got=7877 lost=10680 chunk=4096 over_bound=true available=0 pool_id=140034380321984 epoch=46 phase=pp generation=0
+[2026-09-09 10:51:54 TP2] #915 PREFETCH TRUNCATED rid=4b1ec0e1 need=18557 got=7877 lost=10680 chunk=4096 over_bound=true available=0 pool_id=135372351741616 epoch=46 phase=pp generation=0
+[2026-09-09 10:51:54 TP1] #915 PREFETCH TRUNCATED rid=4b1ec0e1 need=18557 got=7877 lost=10680 chunk=4096 over_bound=true available=0 pool_id=131697287118480 epoch=46 phase=pp generation=0
+[2026-09-09 10:51:55 TP1] #915 PREFETCH TRUNCATED rid=3dfafe1b need=22488 got=7877 lost=14611 chunk=4096 over_bound=true available=0 pool_id=131697287118480 epoch=46 phase=pp generation=0
+[2026-09-09 10:51:55 TP2] #915 PREFETCH TRUNCATED rid=3dfafe1b need=22488 got=7877 lost=14611 chunk=4096 over_bound=true available=0 pool_id=135372351741616 epoch=46 phase=pp generation=0
+[2026-09-09 10:51:55 TP0] #915 PREFETCH TRUNCATED rid=3dfafe1b need=22488 got=7877 lost=14611 chunk=4096 over_bound=true available=0 pool_id=140034380321984 epoch=46 phase=pp generation=0
+[2026-09-09 10:51:56 TP0] #915 PREFETCH TRUNCATED rid=09e0cc8f need=16826 got=7877 lost=8949 chunk=4096 over_bound=true available=0 pool_id=140034380321984 epoch=46 phase=pp generation=0
+[2026-09-09 10:51:56 TP1] #915 PREFETCH TRUNCATED rid=09e0cc8f need=16826 got=7877 lost=8949 chunk=4096 over_bound=true available=0 pool_id=131697287118480 epoch=46 phase=pp generation=0
+[2026-09-09 10:51:56 TP2] #915 PREFETCH TRUNCATED rid=09e0cc8f need=16826 got=7877 lost=8949 chunk=4096 over_bound=true available=0 pool_id=135372351741616 epoch=46 phase=pp generation=0

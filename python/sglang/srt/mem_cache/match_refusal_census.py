@@ -280,12 +280,22 @@ PREFETCH_DECLINE_ORDER = (
 #: (or `vote_negative` under the vote), so
 #: anchor_pool_exhausted <= alloc_failed_post_vote + vote_negative.
 #: `host_pool_truncated` is not a decline and stands beside `issued`.
+#: `host_pool_truncated_group` (#1298 S2) likewise, and it is a STRICT SUBSET
+#: of `host_pool_truncated`: both are bumped at the post-consensus group trim,
+#: only the former is, so `host_pool_truncated - host_pool_truncated_group` is
+#: the count of RANK-LOCAL cuts (the non-symmetric site). The two are kept
+#: apart because only the group one is a fact every rank agrees on, and only a
+#: fact every rank agrees on may carry a deferral mark into the #580 vote.
 #: `already_in_flight` is decided after the tree ran, so the tree's own term
 #: for that call (`attempted`, or a gate decline) is counted beside it. Under
 #: the #580 vote (tp_world_size > 1) a rank whose own gate term declined ALSO
 #: counts `vote_negative` (the group's exit), so there the sum over-counts by
 #: exactly those calls. The A12.2 deferral keys (deferred, landed, ...) are a
-#: separate partition of the rate_limited verdicts.
+#: separate partition -- of the rate_limited verdicts UNTIL #1298, and since
+#: S5 of the `issued:truncated_group` verdicts as well. `deferred` is the
+#: total of both arms; `deferred_shortfall` counts the #1298 arm alone, so
+#: `deferred - deferred_shortfall` is the rate arm and neither number has to
+#: be reconstructed from a different log (denominator law).
 PREFETCH_INTAKE_PARTITION = (
     "issued",
     "storage_disabled",

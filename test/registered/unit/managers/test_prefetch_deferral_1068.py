@@ -66,7 +66,12 @@ from unittest import mock
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers import scheduler as sched_mod
 from sglang.srt.managers.phase_purity import SEAM_READMIT_ATTR
-from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.scheduler import (
+    _DEFER_REASON_RATE,
+    _DEFER_REASON_SHORTFALL,
+    _VERDICT_TRUNCATED_GROUP,
+    Scheduler,
+)
 from sglang.srt.mem_cache.match_refusal_census import PREFETCH_GATE_COUNTS
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -187,6 +192,7 @@ class _Intake:
     _add_request_to_queue = Scheduler._add_request_to_queue
     readmit_seam_residents = Scheduler.readmit_seam_residents
     _apply_prefetch_deferral = _method("_apply_prefetch_deferral")
+    _apply_group_shortfall_deferral = _method("_apply_group_shortfall_deferral")
     _retry_deferred_prefetches = _method("_retry_deferred_prefetches")
     _deferred_prefetch_bound_s = _method("_deferred_prefetch_bound_s")
     _prefetch_capacity_limit_or_none = _method("_prefetch_capacity_limit_or_none")
@@ -981,6 +987,257 @@ class TestARefusedRateVerdictIsCounted(_Clean):
         self.assertTrue(
             any("DEFER DROPPED" in ln and "reason=storage_disabled" in ln for ln in caught.output),
             caught.output,
+        )
+
+
+class TestATruncatedReadNeverReachesTheDeferral(_Clean):
+    """#1298 part (C): WHY THE DEFER MACHINERY FIRED 0 TIMES ON BOOT weg2sb5h.
+
+    CHARACTERISATION, NOT A REGRESSION GUARD -- these pass on the parent and
+    are labelled so rather than dressed up as red-first.  They exist because
+    part (C) was specified as "reuse the A12.2 deferral mark", and the two
+    reasons that cannot work today are invisible in the source unless someone
+    joins three files.  A future builder who plans that fix reads them here.
+
+    THE FIRST REASON, pinned below.  A store read the host pool CUT still
+    REGISTERS -- that is the whole point of the truncation branches
+    (``unified_radix_cache.py:3614`` non-symmetric, ``:3833`` the #1290 group
+    trim) -- so ``_prefetch_kvcache``'s effect-based verdict is ``issued``,
+    byte-identical to a read that landed whole.  The deferral state machine
+    is entered only by ``declined:rate_limited``, so a truncated read never
+    reaches it at all, and boot weg2sb5h's D-group census shows exactly that
+    shape: ``host_pool_truncated=37`` per rank with NO ``rate_limited``, NO
+    ``deferred`` and NO ``defer_refused`` key present at all.
+
+    THE SECOND REASON is already pinned by
+    ``TestTheMarkDoesNotSurviveTheCutover`` above (``_prefetch_deferral_
+    refusal_reason() == "symmetric_vote"``, marks dropped, "no rank walks into
+    the #580 vote alone"): even a verdict that DID reach the machine could not
+    leave a mark on group D, because registration there is the #580 group vote
+    and a rank-divergent deferred set enters it unevenly.  Not duplicated
+    here; cross-referenced, because one pin per fact is the rule.
+    """
+
+    def test_the_issued_verdict_a_truncated_read_returns_is_not_the_deferrals_business(self):
+        s = _Intake(lambda r: "issued", symmetric=True, tp_size=3)
+        r = _Req("t", seq=1)
+        s._add_request_to_queue(r)
+        # No mark, and the state machine says the verdict is not its business.
+        _assert_unmarked(self, r)
+        self.assertIsNone(s._apply_prefetch_deferral(r, "issued", site="intake"))
+        _assert_unmarked(self, r)
+        # So the X gate's deferral arm (`_weg2_store_read_is_pending` reads
+        # `prefetch_deferred`) is False the instant the read leaves
+        # `ongoing_prefetch` -- which is why a cut read is priced at its whole
+        # extent (W50) instead of deferred. THAT is the #1298 part (C) gap.
+        self.assertIsNone(getattr(r, "prefetch_deferred", None))
+
+    def test_the_only_door_into_the_deferral_is_the_rate_verdict(self):
+        # Enumerated, not remembered: every verdict `_prefetch_kvcache` can
+        # return other than the rate one leaves an unmarked request unmarked.
+        # A future part (C) that routes truncation into the deferral must add
+        # its door HERE, and this test is what will notice.
+        s = _Intake(lambda r: "issued", symmetric=False)
+        for verdict in (
+            "issued",
+            "declined:already_in_flight",
+            "declined:attempted_but_unregistered",
+            "declined:storage_disabled",
+            "declined:anchor",
+            "declined:too_short",
+        ):
+            r = _Req(f"v-{verdict}", seq=1)
+            self.assertIsNone(
+                s._apply_prefetch_deferral(r, verdict, site="intake"), verdict
+            )
+            _assert_unmarked(self, r)
+        # ... and the rate verdict, on a tree that permits the deferral, does
+        # mark -- so the enumeration above is a property of the OTHER verdicts
+        # and not of a stand-in that can never mark anything.
+        r = _Req("rate", seq=1)
+        self.assertEqual(
+            s._apply_prefetch_deferral(r, "declined:rate_limited", site="intake"),
+            "deferred",
+        )
+        self.assertEqual(getattr(r, "prefetch_deferred", None), "rate_limited")
+
+
+class TestTheGroupShortfallDeferral(_Clean):
+    """#1298 (S3/S4/S5): a read the GROUP cut is deferred, not priced whole.
+
+    RED ON `fe867c601a`: `issued:truncated_group` is not a verdict there, the
+    refusal predicate takes no argument, and `_apply_group_shortfall_deferral`
+    does not exist.
+
+    The verdict arrives from `_prefetch_kvcache` only when the POST-CONSENSUS
+    group trim fired (`unified_radix_cache.py`, S2 census key), so by the time
+    it reaches this state machine it is already a fact every rank of the group
+    agreed on. These tests drive the state machine; the group-agreement half is
+    pinned in `test_weg2_store_grid_claim_1298.py::test_s1_*`.
+    """
+
+    def test_the_symmetric_vote_refusal_no_longer_blocks_this_mark(self):
+        # S4, the scoping: `symmetric_vote` is a statement about a RANK-LOCAL
+        # mark. The rate arm still meets it; the group arm does not.
+        s = _Intake(lambda r: _VERDICT_TRUNCATED_GROUP, symmetric=True, tp_size=3)
+        self.assertEqual(
+            s._prefetch_deferral_refusal_reason(), "symmetric_vote"
+        )
+        self.assertEqual(
+            s._prefetch_deferral_refusal_reason(_DEFER_REASON_RATE),
+            "symmetric_vote",
+        )
+        self.assertIsNone(
+            s._prefetch_deferral_refusal_reason(_DEFER_REASON_SHORTFALL)
+        )
+
+    def test_a_group_cut_read_is_marked_on_a_symmetric_tree(self):
+        # The whole point: on group D (symmetric), where the A12.2 machinery
+        # was previously inert, a cut read now leaves a mark, so the X gate's
+        # completion predicate stays True after the short read lands.
+        s = _Intake(lambda r: _VERDICT_TRUNCATED_GROUP, symmetric=True, tp_size=3)
+        r = _Req("g", seq=1)
+        s._add_request_to_queue(r)
+        self.assertEqual(getattr(r, "prefetch_deferred", None),
+                         _DEFER_REASON_SHORTFALL)
+        self.assertEqual(PREFETCH_GATE_COUNTS.get("deferred_shortfall", 0), 1)
+        self.assertEqual(PREFETCH_GATE_COUNTS.get("defer_refused", 0), 0)
+
+    def test_the_unpriced_tree_still_refuses_it(self):
+        # S4 scoped the RANK-DIVERGENCE reason only. A tree that cannot price
+        # the bound still refuses, because an unbounded defer is the wedge.
+        s = _Intake(lambda r: _VERDICT_TRUNCATED_GROUP, symmetric=True,
+                    tp_size=3, priced=False)
+        self.assertEqual(
+            s._prefetch_deferral_refusal_reason(_DEFER_REASON_SHORTFALL),
+            "unpriced_timeout",
+        )
+        r = _Req("u", seq=1)
+        s._add_request_to_queue(r)
+        _assert_unmarked(self, r)
+        self.assertEqual(PREFETCH_GATE_COUNTS.get("defer_refused", 0), 1)
+
+    def test_a_span_over_the_carrier_bound_is_refused_not_deferred(self):
+        # S5: does not fit even with the pool empty -> the EXISTING
+        # undeferrable exit, on the first mark, so it can never loop.
+        s = _Intake(lambda r: _VERDICT_TRUNCATED_GROUP, symmetric=True, tp_size=3)
+        r = _Req("big", seq=1, span=LIMIT + 1)
+        with self.assertLogs(LOG, level="WARNING") as caught:
+            s._add_request_to_queue(r)
+        _assert_unmarked(self, r)
+        self.assertEqual(PREFETCH_GATE_COUNTS.get("undeferrable", 0), 1)
+        self.assertEqual(PREFETCH_GATE_COUNTS.get("deferred", 0), 0)
+        line = [x for x in caught.output if "UNDEFERRABLE" in x]
+        self.assertEqual(len(line), 1, caught.output)
+        self.assertIn("reason=host_pool_shortfall", line[0])
+
+    def test_a_repeat_cut_re_defers_until_the_bound_then_expires(self):
+        # S5: the pool was still busy -> re-defer, attempts rise. Past the
+        # length-priced bound -> the EXISTING DEFER EXPIRED, and the request is
+        # priced as it stands. No second bound, no unbounded wait.
+        s = _Intake(lambda r: _VERDICT_TRUNCATED_GROUP, symmetric=True, tp_size=3)
+        r = _Req("rep", seq=1)
+        s._add_request_to_queue(r)
+        self.assertEqual(r.prefetch_defer_attempts, 1)
+        s.waiting_queue = [r]
+        self.assertEqual(s._retry_deferred_prefetches(), 1)
+        self.assertEqual(getattr(r, "prefetch_deferred", None),
+                         _DEFER_REASON_SHORTFALL)
+        self.assertEqual(r.prefetch_defer_attempts, 2)
+        # age it past its own bound
+        r.prefetch_defer_since = time.monotonic() - (
+            s._deferred_prefetch_bound_s(SPAN) + 1.0
+        )
+        with self.assertLogs(LOG, level="WARNING") as caught:
+            s._retry_deferred_prefetches()
+        self.assertIsNone(getattr(r, "prefetch_deferred", None))
+        self.assertEqual(PREFETCH_GATE_COUNTS.get("defer_expired", 0), 1)
+        self.assertTrue(
+            [x for x in caught.output if "DEFER EXPIRED" in x], caught.output
+        )
+
+    def test_a_retry_that_lands_whole_clears_the_mark(self):
+        # The intended path end to end: deferred while the pool was busy,
+        # re-issued when it freed, landed -> mark gone, admission proceeds.
+        s = _Intake(lambda r: _VERDICT_TRUNCATED_GROUP, symmetric=True, tp_size=3)
+        r = _Req("ok", seq=1)
+        s._add_request_to_queue(r)
+        self.assertEqual(getattr(r, "prefetch_deferred", None),
+                         _DEFER_REASON_SHORTFALL)
+        s.waiting_queue = [r]
+        s._verdict = lambda req: "issued"
+        s._retry_deferred_prefetches()
+        # The LANDED contract, and it is #1068's, not this arm's: the MARK is
+        # cleared and the landed-hold is armed for one more pass. The timing
+        # fields are deliberately left standing as history -- only the full
+        # clearer (`_clear_prefetch_deferral_fields`, i.e. the cutover
+        # re-issue) zeroes those, which is why `_assert_unmarked` is the wrong
+        # assertion here and the right one for the readmit tests above.
+        self.assertIsNone(getattr(r, "prefetch_deferred", None))
+        self.assertTrue(getattr(r, "_prefetch_landed_hold_once", False))
+        self.assertEqual(PREFETCH_GATE_COUNTS.get("landed", 0), 1)
+
+    def test_the_retry_set_is_identical_on_every_rank(self):
+        """S4/red-first (2): the property `symmetric_vote` exists to protect.
+
+        Three ranks, same queue, same group-agreed verdict -> the same rids are
+        retried in the same order on every rank, so every rank walks into the
+        #580 participation vote with the same set. A rate mark beside them is
+        still dropped on all three, and dropped IDENTICALLY.
+        """
+        ranks = [
+            _Intake(lambda r: _VERDICT_TRUNCATED_GROUP, symmetric=True, tp_size=3)
+            for _ in range(3)
+        ]
+        sets = []
+        for s in ranks:
+            reqs = [_Req("a", seq=1), _Req("b", seq=2), _Req("c", seq=3)]
+            for q in reqs:
+                s._add_request_to_queue(q)
+            # a rate mark planted by hand must NOT survive on any rank
+            reqs[1].prefetch_deferred = _DEFER_REASON_RATE
+            s.waiting_queue = list(reqs)
+            s.prefetch_calls.clear()
+            s._retry_deferred_prefetches()
+            sets.append(list(s.prefetch_calls))
+        self.assertEqual(sets[0], ["a", "c"], sets)
+        self.assertEqual(sets[0], sets[1])
+        self.assertEqual(sets[1], sets[2])
+
+    def test_the_tp_admission_hold_is_uniform_for_this_mark(self):
+        """#1203 family A3, newly REACHABLE and therefore newly checked.
+
+        `_admission_held_for_deferred_prefetch` withholds admission on a mark,
+        and its own docstring records that in the TP phase the PP0 exemption is
+        inert -- every rank reaches `return True` and holds on ITS OWN mark. It
+        names that an open hazard because #1068's mark is rank-local at both
+        ends (this rank's budget, this rank's clock).
+
+        Before #1298 that path was UNREACHABLE on group D: no mark could exist
+        there at all (`symmetric_vote`). This arm makes it reachable, so the
+        hazard's precondition has to be checked rather than inherited -- and it
+        is not met: the shortfall mark is written from MIN-reduced values, so
+        all three ranks hold or release the same request on the same pass. The
+        hold is the DESIRED behaviour here (do not admit while a re-issue is
+        owed); what would be wrong is an asymmetric one.
+        """
+        ranks = []
+        for _ in range(3):
+            s = _Intake(lambda r: _VERDICT_TRUNCATED_GROUP, symmetric=True, tp_size=3)
+            r = _Req("h", seq=1)
+            s._add_request_to_queue(r)
+            ranks.append((s, r))
+        holds = [s._admission_held_for_deferred_prefetch(r) for s, r in ranks]
+        self.assertEqual(
+            holds, [True, True, True],
+            "the ranks must hold this request together or not at all -- an "
+            "asymmetric hold builds different batches per rank (#1203 A3)",
+        )
+        for s, r in ranks:
+            s._clear_prefetch_deferral_fields(r)
+        self.assertEqual(
+            [s._admission_held_for_deferred_prefetch(r) for s, r in ranks],
+            [False, False, False],
         )
 
 

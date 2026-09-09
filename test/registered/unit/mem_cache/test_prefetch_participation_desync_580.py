@@ -229,8 +229,14 @@ class TestForeignPayloadIsLoud(unittest.TestCase):
 
     def test_foreign_same_width_payload_raises_named_error(self):
         def _foreign(tensor, op, label="hicache"):
-            # A same-width vector from somewhere else on this group.
-            tensor.copy_(torch.tensor([7, -7, 1], dtype=tensor.dtype))
+            # A same-width vector from somewhere else on this group. The width
+            # tracks the payload: #1298 (S1) widened it to five slots (tag,
+            # -tag, group length, span, -span), and the whole point of this
+            # test is traffic that gloo CANNOT reject on size, so the foreign
+            # vector must be exactly as wide as the real one.
+            tensor.copy_(
+                torch.tensor([7, -7, 1, 1, -1][: tensor.numel()], dtype=tensor.dtype)
+            )
 
         cache = make_cache(rate_limited=False, symmetric=True, all_reduce=_foreign)
         # Asserted on the base class, so this file also COLLECTS against the
