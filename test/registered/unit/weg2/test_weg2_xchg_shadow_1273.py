@@ -4715,3 +4715,214 @@ def test_the_rank_reader_does_not_go_back_to_the_attributes_that_do_not_exist():
             f"_weg2_rank still walks {dead} on the Scheduler, which has "
             f"neither -- that is the shadowC root"
         )
+
+
+# ---------------------------------------------------------------------------
+# S6 fix D (#1273) -- THE IDENTITY CLASS, swept instead of instanced.
+#
+# Boot weg2shadowD proved the rank fix (GATE 0: rank=0/1/2 on 37/35/33
+# FLIP-TAG lines, rank=-1 = 0; GATE 1: 15 PLAN lines, 0 no-identity) and then
+# produced the SAME SHAPE one level up, verbatim:
+#
+#   W52 Weg2XchgPlanDisagree begin_flip epoch='1788964408.-1': flip index -1
+#   does not advance past -1, which this view has already run
+#
+# The boot half of that stamp is right and the FLIP half is -1.  The three legs
+# that produced it are group P's BOOT-TIME INITIAL SLEEP at its own READY
+# (14:33:55Z), 73 s BEFORE the first flip began (14:35:08Z) -- and the W63 that
+# carried it printed `epoch=` EMPTY, so the request had no epoch at all rather
+# than a malformed one.  The front's plumbing is CORRECT: every real flip leg
+# of that boot carried `epoch=1788964408.0` / `.1`.
+#
+# So the defect is not a missing counter, it is a SENTINEL THAT TRAVELS: an
+# absent identity became -1, the -1 was composed into a region stamp
+# (`weight_exchange_shadow.py` `f"{boot_nonce}.{int(i.leg)}"`), and the
+# refusal that came back named the wrong thing -- "the plan disagrees" about a
+# leg whose real condition is "this is not a flip".
+# ---------------------------------------------------------------------------
+
+SHADOWD_W52_VERBATIM = (
+    "W52 Weg2XchgPlanDisagree begin_flip epoch='1788964408.-1': flip index -1 "
+    "does not advance past -1, which this view has already run"
+)
+
+
+def _armed_probe(monkeypatch, *, leg_epoch, card="GPU-abc", free_bytes=8 << 30):
+    """An adapter probe whose five identity reads are all satisfiable.
+
+    Everything the hook needs is stubbed at CLASS level (the manager is a
+    ``slots=True`` dataclass, so per-instance attributes are not an option),
+    which is also what lets each identity be knocked out ONE AT A TIME.
+    """
+    from sglang.srt.managers.scheduler_components import weight_updater as wu
+
+    M = wu.SchedulerWeightUpdaterManager
+    monkeypatch.setattr(M, "_weg2_group_name", lambda self: "P")
+    monkeypatch.setattr(M, "_weg2_rank", lambda self: 1)
+    monkeypatch.setattr(M, "_weg2_device_index", lambda self: 0)
+    monkeypatch.setattr(M, "_weg2_card_uuid", lambda self: card)
+    monkeypatch.setattr(M, "_weg2_free_bytes", lambda self: free_bytes)
+    monkeypatch.setattr(M, "_weg2_shadow_gate_rows", lambda self, h, g: ())
+    monkeypatch.setattr(M, "_weg2_shadow_host_budget", lambda self: 0)
+    monkeypatch.setattr(M, "_weg2_shadow_plan",
+                        lambda self, h, g, r: (None, "stub"))
+    import types
+    probe = M.__new__(M)
+    probe.scheduler = None
+    return M, probe, types.SimpleNamespace(epoch=leg_epoch)
+
+
+@pytest.mark.parametrize("epoch_value,expect_reason", [
+    # The shadowD leg, exactly: the boot-time initial sleep carries no epoch.
+    (None, "no-flip-epoch"),
+    ("", "no-flip-epoch"),
+    # A boot nonce with no flip half -- the other way _weg2_flip_index_of
+    # reaches -1, and it must land on the same named refusal.
+    ("1788964408", "no-flip-epoch"),
+    # A malformed tail is not an index either.
+    ("1788964408.x", "no-flip-epoch"),
+])
+def test_a_leg_with_no_flip_epoch_refuses_by_name_before_the_sentinel_travels(
+        monkeypatch, caplog, epoch_value, expect_reason):
+    """RED ON `57ef547466`: the -1 travels and comes back as W52.
+
+    The assertion that matters is the NEGATIVE one: the shadowD string must not
+    be reachable from a leg that simply has no flip.  `-1` is a fine internal
+    answer; composing it into a region stamp is what made a non-flip look like
+    a plan disagreement.
+    """
+    from sglang.srt.weg2 import weight_exchange as wxm
+
+    with wxm.weight_source_for_test(wxm.WEIGHT_SOURCE_SHADOW):
+        M, probe, req = _armed_probe(monkeypatch, leg_epoch=epoch_value)
+        with caplog.at_level("INFO"):
+            M._weg2_shadow_hook(probe, "source", recv_req=req)
+
+    assert f"reason={expect_reason}" in caplog.text, caplog.text[-2000:]
+    assert "Weg2XchgPlanDisagree" not in caplog.text, (
+        "the flip-index sentinel still reaches begin_flip -- this is the "
+        "shadowD W52, which names a plan disagreement on a leg that is simply "
+        "not a flip"
+    )
+    assert "does not advance past -1" not in caplog.text
+
+
+def test_the_real_flip_epoch_is_not_refused(monkeypatch, caplog):
+    """MUTANT GUARD.  A gate that refuses everything would pass the test above.
+
+    `1788964408.0` is shadowD's own first flip leg, verbatim -- flip index 0,
+    which is a legitimate index and must survive the gate.  If this goes red
+    the fix has turned the boot-time refusal into a refusal of every flip.
+    """
+    from sglang.srt.weg2 import weight_exchange as wxm
+
+    with wxm.weight_source_for_test(wxm.WEIGHT_SOURCE_SHADOW):
+        M, probe, req = _armed_probe(monkeypatch, leg_epoch="1788964408.0")
+        with caplog.at_level("INFO"):
+            M._weg2_shadow_hook(probe, "source", recv_req=req)
+
+    assert "reason=no-flip-epoch" not in caplog.text, (
+        "flip index 0 was refused as 'no flip epoch' -- 0 is a real index and "
+        "the boot's FIRST flip carries it"
+    )
+
+
+@pytest.mark.parametrize("knock_out,expect_reason", [
+    ("_weg2_rank", "no-identity"),
+    ("_weg2_group_name", "no-identity"),
+    ("_weg2_device_index", "no-device"),
+    ("_weg2_card_uuid", "no-card"),
+    ("_weg2_free_bytes", "no-free-column"),
+])
+def test_every_identity_the_hook_reads_has_a_named_refusal(
+        monkeypatch, caplog, knock_out, expect_reason):
+    """THE SWEEP, as a table.  One identity missing at a time, each NAMED.
+
+    Two of these five used to travel as sentinels into `ShadowLegInputs`:
+    `card_uuid="unknown"` (an unnamed card priced, charged and printed on the
+    W61 line as though it were a real one) and `free_mib=0` (an UNREADABLE NVML
+    free column priced as a FULL card, so `price_shadow` refuses UNAFFORDABLE
+    while naming the wrong cause -- worse than not pricing at all).
+    """
+    from sglang.srt.weg2 import weight_exchange as wxm
+
+    missing = {"_weg2_rank": -1, "_weg2_group_name": "?",
+               "_weg2_device_index": -1, "_weg2_card_uuid": None,
+               "_weg2_free_bytes": None}[knock_out]
+
+    with wxm.weight_source_for_test(wxm.WEIGHT_SOURCE_SHADOW):
+        M, probe, req = _armed_probe(monkeypatch, leg_epoch="1788964408.0")
+        monkeypatch.setattr(M, knock_out, lambda self, *a, **k: missing)
+        with caplog.at_level("INFO"):
+            M._weg2_shadow_hook(probe, "source", recv_req=req)
+
+    assert f"reason={expect_reason}" in caplog.text, (
+        f"knocking out {knock_out} produced no named refusal; "
+        f"log tail: {caplog.text[-1500:]}"
+    )
+
+
+def test_no_identity_read_on_the_hook_path_keeps_a_travelling_sentinel():
+    """RATCHET.  The FORM, not the five instances.
+
+    Scans `_weg2_shadow_hook` for the shape this whole fix round is about: a
+    value read with a sentinel default (`or "..."`, `0 if x is None else ...`)
+    that is then handed straight into `ShadowLegInputs`.  Two of those were the
+    S6-fix-D findings; a third added later must fail here rather than on metal.
+    """
+    import ast as _ast
+
+    root = os.path.abspath(
+        os.path.join(os.path.dirname(__file__), "..", "..", "..", ".."))
+    path = os.path.join(root, "python", "sglang", "srt", "managers",
+                        "scheduler_components", "weight_updater.py")
+    with open(path, encoding="utf-8") as fh:
+        src = fh.read()
+    fn = next(n for n in _ast.walk(_ast.parse(src))
+              if isinstance(n, _ast.FunctionDef) and n.name == "_weg2_shadow_hook")
+    call = next(n for n in _ast.walk(fn)
+                if isinstance(n, _ast.Call)
+                and _ast.unparse(n.func).endswith("ShadowLegInputs"))
+
+    offenders = []
+    for kw in call.keywords:
+        text = _ast.unparse(kw.value)
+        # `or <literal>` and `<lit> if <x> is None else ...` are the two shapes
+        # that turned an absence into a value the region then had to recognise.
+        if isinstance(kw.value, _ast.BoolOp) and isinstance(kw.value.op, _ast.Or):
+            offenders.append(f"{kw.arg}={text}")
+        if isinstance(kw.value, _ast.IfExp) and "is None" in _ast.unparse(kw.value.test):
+            offenders.append(f"{kw.arg}={text}")
+    assert not offenders, (
+        "identity sentinels still travel into ShadowLegInputs: "
+        + "; ".join(offenders)
+        + " -- resolve the identity BEFORE the inputs and refuse it by name "
+          "(rank_local_skip_message), so no downstream reader has to recognise "
+          "a sentinel"
+    )
+
+
+def test_the_oncard_copy_arm_is_on_the_line_on_both_arms():
+    """S6 fix D, finding 2.  `oncard_copy_gbps` / `oncard_copy_ms` were 0 hits
+    in both of shadowD's rank logs while the other three oncard fields printed
+    15 times each.
+
+    The emitter was never missing -- `tp.OncardLane.tokens` prints both -- but
+    `ShadowResult` hand-copies a SUBSET of the lane's fields and these two were
+    not in it, so `tp.oncard_copy_gbps(mode)` was computed, handed to the
+    planner and dropped.  `0.0` on the ipc arm is a VALUE (the copy is D2D and
+    already inside ONCARD_PER_BATCH_MS), so it must PRINT, never be omitted:
+    otherwise "ipc prices no separate copy" and "nobody priced it" read alike.
+    """
+    r = sh.ShadowResult(leg=0, epoch="b.0",
+                        subset=sh.select_subset([], leg=0),
+                        counters=sh.ShadowCounters())
+    assert hasattr(r, "oncard_copy_gbps") and hasattr(r, "oncard_copy_ms")
+    line = r.line()
+    assert "oncard_copy_gbps=" in line and "oncard_copy_ms=" in line, line
+
+    # The ipc arm's 0.0 is a design value, not an absence.
+    assert tp.oncard_copy_gbps(tp.ONCARD_MODE_IPC) == 0.0
+    assert tp.oncard_copy_gbps(tp.ONCARD_MODE_HOST) == tp.ONCARD_HOST_COPY_GBPS
+    r.oncard_copy_gbps = tp.oncard_copy_gbps(tp.ONCARD_MODE_IPC)
+    assert "oncard_copy_gbps=0 " in r.line(), r.line()
