@@ -52,20 +52,31 @@ class TestClaimPolicy(CustomTestCase):
         self.assertEqual(Stub(draft_page_get_func=boom)._draft_page_get(["a"], None), 0)
 
     def test_t14_claim_full_trim_cold(self):
+        # #1298 CONTRACT CHANGE: the ``trim`` mode is GONE. Every case this
+        # test previously pinned to ``trim`` claimed at most ``d`` pages while
+        # ``cold`` claims all ``k`` for the same input -- including the last
+        # one below, which encoded the literal zero (``(0, 0, "trim", None)``
+        # for k=10) as the EXPECTED answer. Boot weg2sb5h measured that zero
+        # 69 times out of 69 trims. The rows are updated, not deleted, so the
+        # danger direction stays covered by the same assertions.
         no_reprobe = lambda d: d  # noqa: E731 - the anchor sits at d
         self.assertEqual(resolve_draft_claim(10, 10, CHUNK, no_reprobe), (10, 10, "full", None))
         self.assertEqual(resolve_draft_claim(10, 12, CHUNK, no_reprobe), (10, 10, "full", None))
-        self.assertEqual(resolve_draft_claim(5000, 4000, CHUNK, no_reprobe), (4000, 4000, "trim", None))
+        self.assertEqual(
+            resolve_draft_claim(5000, 4000, CHUNK, no_reprobe), (5000, 4000, "cold", (4000, 5000))
+        )
         self.assertEqual(
             resolve_draft_claim(9000, 4000, CHUNK, no_reprobe), (9000, 4000, "cold", (4000, 9000))
         )
-        # the trim lands on the nearest anchor at or below d; if that pushes the
-        # re-prefill past one chunk the request goes cold by name instead
-        self.assertEqual(resolve_draft_claim(5000, 4000, CHUNK, lambda d: 3500), (3500, 3500, "trim", None))
+        # the reprobe can no longer lower the claim: a short anchor answer
+        # names the cold span instead of shrinking what is claimed
+        self.assertEqual(
+            resolve_draft_claim(5000, 4000, CHUNK, lambda d: 3500), (5000, 4000, "cold", (4000, 5000))
+        )
         self.assertEqual(
             resolve_draft_claim(5000, 4000, CHUNK, lambda d: 800), (5000, 4000, "cold", (4000, 5000))
         )
-        self.assertEqual(resolve_draft_claim(10, 0, CHUNK, no_reprobe), (0, 0, "trim", None))
+        self.assertEqual(resolve_draft_claim(10, 0, CHUNK, no_reprobe), (10, 0, "cold", (0, 10)))
         self.assertEqual(resolve_draft_claim(0, 0, CHUNK, no_reprobe), (0, 0, "full", None))
 
     def test_t14_cold_reason_third_trigger(self):

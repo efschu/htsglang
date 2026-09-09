@@ -406,20 +406,30 @@ class TestEveryExitBehindTheGateIsNamed(_CleanCounts):
         """T17: room for 5000 of 39364 -> the span is CUT, counted as
         host_pool_truncated with the lost tokens, spoken with lost= and
         over_bound=, and REGISTERED (it is not a refusal). RED: no line, no
-        key."""
+        key.
+
+        #1298 NUMBERS UPDATED, PROPERTY UNCHANGED. The granted span is now
+        floored to the store's block grid (`chunk`, 4096) before it is
+        registered, because the store credits a partial read on whole blocks
+        and the rows above the boundary are dead weight held against the
+        siblings (boot weg2sb5h, 75/75 joined lines). So 5,000 rows of room
+        grant 4,096, not 5,000, and `lost` grows by the same 904. What this
+        test pins -- cut, counted, spoken, registered, not refused -- is
+        untouched.
+        """
         tree = _serving_tree(available=5000)
         with self.assertLogs(TREE_LOGGER, level="WARNING") as cm:
             tree.prefetch_from_storage("rid-truncated", _node(), list(range(39364)))
         self.assertEqual(PREFETCH_GATE_COUNTS.get("host_pool_truncated"), 1)
-        self.assertEqual(PREFETCH_GATE_COUNTS.get("host_pool_truncated_tokens"), 34364)
+        self.assertEqual(PREFETCH_GATE_COUNTS.get("host_pool_truncated_tokens"), 35268)
         self.assertEqual(PREFETCH_GATE_COUNTS.get("attempted"), 1)
         lines = _lines(cm, "#915 PREFETCH TRUNCATED")
         self.assertEqual(len(lines), 1, lines)
         for term in (
             "rid=rid-trun",
             "need=39364",
-            "got=5000",
-            "lost=34364",
+            "got=4096",
+            "lost=35268",
             "chunk=4096",
             "over_bound=true",
             "available=5000",
@@ -430,18 +440,23 @@ class TestEveryExitBehindTheGateIsNamed(_CleanCounts):
             self.assertIn(term, lines[0])
         self.assertEqual(_lines(cm, "#915 PREFETCH REFUSED"), [])
         self.assertIn("rid-truncated", tree.ongoing_prefetch)
-        self.assertEqual(len(tree.ongoing_prefetch["rid-truncated"].prefetch_key), 5000)
-        self.assertEqual(tree.cache_controller.prefetch_tokens_occupied, 5000)
+        self.assertEqual(len(tree.ongoing_prefetch["rid-truncated"].prefetch_key), 4096)
+        self.assertEqual(tree.cache_controller.prefetch_tokens_occupied, 4096)
 
     def test_a_truncation_inside_the_chunk_bound_says_so(self):
+        """#1298: same update. 39,000 rows of room grant 36,864 (the largest
+        whole block that fits), so the realised loss is 2,500 -- still inside
+        the one-chunk bound, which is what this test is about, and
+        `over_bound=false` still says so."""
         tree = _serving_tree(available=39000)
         with self.assertLogs(TREE_LOGGER, level="WARNING") as cm:
             tree.prefetch_from_storage("rid-inbound", _node(), list(range(39364)))
         lines = _lines(cm, "#915 PREFETCH TRUNCATED")
         self.assertEqual(len(lines), 1, lines)
-        self.assertIn("lost=364", lines[0])
+        self.assertIn("got=36864", lines[0])
+        self.assertIn("lost=2500", lines[0])
         self.assertIn("over_bound=false", lines[0])
-        self.assertEqual(PREFETCH_GATE_COUNTS.get("host_pool_truncated_tokens"), 364)
+        self.assertEqual(PREFETCH_GATE_COUNTS.get("host_pool_truncated_tokens"), 2500)
 
     def test_host_alloc_failed_is_named(self):
         """Room reported, alloc refused anyway (a fragmented pool): the second

@@ -374,21 +374,40 @@ def resolve_draft_claim(kv_pages: int, draft_pages: int, chunk_pages: int, repro
     Returns ``(claim, draft_claim, mode, cold_span)``:
 
     * ``full``  -- the draft prefix covers the claim.
-    * ``trim``  -- ``kv - draft`` fits one chunk: claim the draft-covered
-      prefix (re-prefill at most one chunk, #939), never re-prefill more.
-    * ``cold``  -- the gap exceeds one chunk (or the nearest anchor pushes
-      the trim past it): claim the KV prefix and name the span ``[d, k)``
-      whose draft rows the #993 zero fill will hold. Never silent, never a
-      D-side draft recompute (Q-G5: K/V do not invert to hidden states).
+    * ``cold``  -- the draft prefix is short: claim the KV prefix and name
+      the span ``[d, k)`` whose draft rows the #993 zero fill will hold.
+      Never silent, never a D-side draft recompute (Q-G5: K/V do not invert
+      to hidden states).
+
+    #1298: THE ``trim`` BRANCH IS DELETED, NOT REPAIRED.  It was selected on
+    ``k - d <= chunk_pages`` and then capped its own claim at
+    ``max(0, min(reprobe(d), d))`` -- so whatever the store answered, it could
+    never return more than ``d`` pages, while the ``cold`` return below claims
+    the whole ``k`` for the same ``(k, d)``.  A branch that can only ever lose
+    to the branch beside it is a deletion candidate, not a repair order
+    (upstream-minimal law).
+
+    MEASURED, boot weg2sb5h (instrument: the ``WEG2 DRAFT-PRESENCE`` line at
+    mem_cache/hybrid_cache/hybrid_cache_controller.py:1018; denominator: all
+    123 DRAFT-PRESENCE lines of that boot, 3 ranks per request, rank-
+    unanimous): 69 lines took ``trim`` and **every one of the 69 returned
+    claim=0** -- 66 at ``kv_pages=4094 draft_pages=47`` and 3 at
+    ``kv_pages=2727``.  The 54 lines that took ``cold`` each claimed their
+    full ``k``.  The trim branch's realised claim distribution over that boot
+    is the single value zero, discarding 4,047 valid KV pages per event.
+
+    ``cold`` already carries strictly LARGER gaps than the ones this deletion
+    routes to it (same boot: ``k=8190 d=48``, a gap of 8,142 pages, went cold
+    and is zero-filled), so no new zero-fill hazard is introduced -- the spans
+    that move are smaller than spans that path already holds.
+
+    ``chunk_pages`` and ``reprobe`` stay in the signature: they are the #939
+    bound and the anchor-aware re-probe, part of the caller's contract, and
+    dropping them would rewrite every call site for no behavioural gain.
     """
     k, d = int(kv_pages), int(draft_pages)
     if d >= k:
         return k, k, "full", None
-    if k - d <= chunk_pages:
-        c = int(reprobe(d))
-        c = max(0, min(c, d))
-        if k - c <= chunk_pages:
-            return c, c, "trim", None
     return k, d, "cold", (d, k)
 
 #: #1068 (WEG 1 slice 2 fix 3 + fix 4, spec A12.4 and its amendment): the

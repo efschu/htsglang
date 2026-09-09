@@ -195,6 +195,57 @@ _REAP_SLOT_HIT_TOKENS = 2 + _POOL_SLOT_COUNT
 _REAP_PACKED_LEN = 3 + _POOL_SLOT_COUNT
 
 
+def _store_grid_floor(granted: int, full_span: int, grid: int) -> int:
+    """#1298: floor a PARTIAL host grant to the store's block grid.
+
+    Both truncation sites in ``UnifiedRadixCache.prefetch_from_storage`` floor
+    the pool's room to ``page_size``, which is 1 on the Weg-2 form -- a no-op.
+    The rank therefore takes whatever odd number of rows the pool happens to
+    hold, and the store does not credit odd numbers: its presence probe answers
+    on whole ``chunked_prefill_size`` blocks.
+
+    MEASURED, boot weg2sb5h, 2026-09-09 (instruments: ``#915 PREFETCH
+    TRUNCATED`` for the granted span ``got``, ``WEG2 DRAFT-PRESENCE`` for the
+    credit ``kv_pages``; denominator 37 truncation events x 3 ranks = 111
+    lines, all ``over_bound=true``, all ``chunk=4096``, rank-unanimous; joined
+    per rid over the 75 lines carrying both): **every ``got >= 8192`` credited
+    8190 and every ``got < 8192`` credited 4094, 75/75, zero mismatches.** So a
+    residual of 8,150 rows buys exactly what 4,096 rows buy, and the 4,054 rows
+    above the block boundary are dead weight that read holds against its own
+    siblings for the rest of the epoch -- on a 27,466-token staging pool that
+    carries ONE ~22k read.
+
+    ONLY ON A RESIDUAL. When the pool can carry the whole span the read is not
+    truncated at all and the store credits the whole key chain, not a
+    block-floored prefix: same boot, 15 round trips returned
+    ``cached_tokens == prompt_tokens - 2`` (e.g. 22,406 of 22,408), which is
+    NOT ``floor_chunk(22408)``. Flooring a full grant would turn those into
+    partial reads -- a regression on the path that works -- so
+    ``granted >= full_span`` returns unchanged.
+
+    NOT A NEW BOUND: ``grid`` is the caller's ``_prefetch_chunk_tokens``, the
+    same term ``_log_prefetch_truncated`` already prints as ``chunk``. A tree
+    built without it (``<= 0``, the stand-in that line reports as
+    ``over_bound=unknown``) is left alone rather than floored against a guessed
+    grid.
+
+    MODULE-LEVEL ON PURPOSE, not a method: the two truncation sites are covered
+    by harnesses that bind a CURATED list of real methods onto a stub
+    (test_prefetch_gate_census_915, test_weg2_leg2_store_probe_1290,
+    test_zero_answer_partition_1035c). A new method silently leaves those stubs
+    incomplete -- measured, it took 6 of them red on the first remote run --
+    while a free function is reachable from the module no matter what the stub
+    carries. The grid is passed in for the same reason.
+    """
+    granted = int(granted)
+    if granted >= int(full_span):
+        return granted
+    grid = int(grid)
+    if grid > 0:
+        granted -= granted % grid
+    return granted
+
+
 class UnifiedTreeNode:
     counter = 0
 
@@ -3604,7 +3655,15 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 )
             if host_indices is None and not symmetric:
                 available_size = self.cache_controller.mem_pool_host.available_size()
-                prefetch_length = available_size - (available_size % self.page_size)
+                # #1298 sibling of the symmetric residual below: the same
+                # un-quantized grant, on the per-rank path. Same helper, same
+                # exits -- `host_pool_exhausted` still catches a floored grant
+                # that no longer clears the threshold.
+                prefetch_length = _store_grid_floor(
+                    available_size - (available_size % self.page_size),
+                    need,
+                    getattr(self, "_prefetch_chunk_tokens", -1),
+                )
                 if prefetch_length >= self.prefetch_threshold:
                     # #1068 L2: the span is CUT to the room the pool has.
                     # Counted and spoken, NOT a refusal -- the shortened
@@ -3652,9 +3711,18 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             # <= X.
             if host_indices is None and symmetric:
                 available_size = self.cache_controller.mem_pool_host.available_size()
-                _partial = min(
+                # #1298: quantize the residual to the store's block grid.
+                # A grant that now falls below `prefetch_threshold` takes the
+                # EXISTING exit unchanged -- `host_indices` stays None, this
+                # rank votes 0, and the group refuses under the name it
+                # already uses. No new refusal reason is invented here.
+                _partial = _store_grid_floor(
+                    min(
+                        prefetch_length,
+                        available_size - (available_size % self.page_size),
+                    ),
                     prefetch_length,
-                    available_size - (available_size % self.page_size),
+                    getattr(self, "_prefetch_chunk_tokens", -1),
                 )
                 if _partial >= self.prefetch_threshold:
                     host_indices = self.cache_controller.mem_pool_host.alloc(
