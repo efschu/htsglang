@@ -18,37 +18,57 @@ whole, under D's own key, 7.1-43.4 s before D first admitted it -- proven by
 round-trip and not by a counter: 15 rids came back at
 ``cached_tokens == prompt_tokens - 2`` (e.g. 22,406 of 22,408).  D then
 refused 24 of those requests at the X gate with ``uncached`` equal to the
-WHOLE prompt.  Two terms in series, both on D's read path, cut the handback to
-zero:
+WHOLE prompt.
 
-* **T1** the D-phase host staging pool is 30,518 rows / limit 27,466 tokens and
-  fits exactly ONE ~22k read.  The first leg-2 offer of an epoch takes it; the
-  siblings get the residual, granted UN-QUANTIZED because the existing floor is
-  ``available % page_size`` and ``page_size`` is 1 on this form.
-* **T2** the residual misses the store's 4,096-token block boundary by 42-315
-  tokens, the probe credits ``4094`` instead of ``8190``, and
-  ``resolve_draft_claim``'s ``trim`` branch collapses that to **0**.
+WHAT ACTUALLY CUT THE HANDBACK -- and it is NOT what fix 1 of this branch
+claimed.  Fix 1 asserted the store "does not credit odd numbers: its presence
+probe answers on whole ``chunked_prefill_size`` blocks", and floored the pool
+grant to 4,096.  The boot's own instrument refutes that, on every line it
+emitted (instrument ``#1028B FETCH CAP``, D log, denominator: all 36
+component-capped lines of the boot = 12 rids x 3 ranks, rank-unanimous)::
 
-MEASURED POPULATION, this file's whole fixture (instruments: ``#915 PREFETCH
-TRUNCATED`` and ``WEG2 DRAFT-PRESENCE`` in the sb5h D log; denominators stated
-per constant below, joined per rid):
+    kv=8150 claimed=4094 lost=4056 caps={MAMBA: 4094, draft-...: 48} keys=8150
+    kv=8247 claimed=8190 lost=57   caps={MAMBA: 8190, draft-...: 48} keys=8247
 
-* 111 truncation lines = 37 rids x 3 ranks, rank-unanimous, all
-  ``over_bound=true``, all ``chunk=4096``.
-* 123 DRAFT-PRESENCE lines.  **69 took ``trim`` and every one of the 69
-  returned claim=0.**  The 54 that took ``cold`` each claimed their full ``k``.
-* Joined per rid, 25 of the 37 truncated rids also carry a presence line: 22
-  distinct ``(need, got, k, d)`` rows ended in claim 0, 2 in claim 8190.  The
-  only thing separating them is the 8,192 boundary
-  (``got >= 8192 -> k=8190``, ``got < 8192 -> k=4094``, 75/75 joined lines,
-  0 mismatches).
+``kv == keys`` on **36/36**: for every truncated read the store credited every
+key it was asked about.  The store quantized nothing.  There is no block grid
+on that path at all -- the KV prefix is a per-page contiguous scan
+(``hicache_storage.py`` ``batch_exists_v2``) -- and the cut came from
+``final_pages = min(final_pages, boundary)``, the MAMBA component boundary.
+The same lines carry the discriminator (``#1035b``)::
 
-RED AT THE PARENT ``57fef0ce6e``: ``test_b1`` returns claim 0 for the boot's
-own arguments, ``test_a1`` grants 8,150 un-quantized rows, and ``test_c1`` --
-the real chain, a real ``HiCacheFile`` on disk written through the WRITER's key
-funnel and probed through the READER's -- ends at claim 0.  ``test_f3`` is RED
-on the sb5h log itself and stays red until part (C) lands; it is the next
-boot's acceptance, not a claim about this commit.
+    kv=8247 claimed=8190  mamba anchors_in_range(count, deepest_idx)=(2, 8189)
+    kv<8192 claimed=4094  mamba anchors_in_range(count, deepest_idx)=(1, 4093)
+
+so the binding term is the MAMBA ANCHOR STRIDE, and the anchors sit at 0-based
+index ``4096k - 3`` -> boundary ``4096k - 2`` (4094, 8190) -- the same ``-2``
+as the byte-exact round trips (22,406 of 22,408).  That the stride is also
+4,096 is an unstated coupling to P's write-back cadence which
+``hicache_storage.py`` explicitly plans to break ("a GRANULARITY problem, fixed
+by publishing anchors more often").
+
+So this file pins the mechanism (M) rather than a constant, and GUARDS (G) the
+pool grant against being quantized against a guessed one -- fix 1's floor
+dropped a whole block for any residual in ``[4096k-2, 4096k)`` and could push
+the realised ``lost`` outside the one-chunk bound (#939) that the same line
+reports.  See the record block, SECTION 1az.
+
+WHAT REMAINS FIXED HERE (T2, unrefuted): ``resolve_draft_claim``'s ``trim``
+branch capped its own claim at ``max(0, min(reprobe(d), d))``, so it could
+never return more than ``d`` pages while the ``cold`` branch beside it claims
+the whole ``k`` for the same input -- unconditionally, for every input, not
+only on this boot's distribution.  MEASURED (instrument ``WEG2
+DRAFT-PRESENCE``; denominator: all 123 presence lines of the boot, 3 ranks per
+request, rank-unanimous): 69 lines took ``trim`` and **every one of the 69
+returned claim=0** -- 66 at ``k=4094 d=47`` and 3 at ``k=2727 d=2671``, the
+latter OFF the 4,096 grid, which is how we know the zero is the branch and not
+the value.  The 54 ``cold`` lines each claimed their full ``k``.
+
+RED AT THE PARENT ``57fef0ce6e``: the whole (B) family, and ``test_c1``.
+``test_g1``/``test_g2`` are green at the parent BY CONSTRUCTION -- they are
+regression guards for the reverted floor, not claims about this commit, and
+they go red against it.  ``test_f3`` is RED on the sb5h log itself and stays
+red until part (C) lands; it is the next boot's acceptance.
 
 Hermetic: ``CUDA_VISIBLE_DEVICES=""``, no model, no GPU, no collective.  The
 MIN all-reduce is simulated by MIN-ing the ranks' captured votes, which is the
@@ -67,7 +87,6 @@ import pytest
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 
 import torch
-
 from sglang.srt.managers.cache_controller import resolve_draft_claim
 from sglang.srt.mem_cache import match_refusal_census as census_mod
 from sglang.srt.mem_cache.hicache_storage import (
@@ -80,10 +99,7 @@ from sglang.srt.mem_cache.hicache_storage import (
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
 )
-from sglang.srt.mem_cache.unified_radix_cache import (
-    UnifiedRadixCache,
-    _store_grid_floor,
-)
+from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
 # ---------------------------------------------------------------- constants
 # EVERY number below is read off boot weg2sb5h's own lines, never picked.
@@ -95,6 +111,22 @@ PAGE = 1
 POOL_ROWS = 30518
 POOL_LIMIT = 27466
 THRESHOLD = 256
+#: The MEASURED mamba anchor boundaries and the 0-based deepest index that
+#: produced each, off the 36 `#1028B FETCH CAP` lines that carry a MAMBA cap:
+#: `(kv_pages_present, anchor_count_in_range, deepest_idx, claimed)`.
+#: 9 lines at the first row, 27 across the rest -- every capped line of the
+#: boot, not a sample.
+ANCHOR_ROWS = (
+    (8247, 2, 8189, 8190),
+    (8150, 1, 4093, 4094),
+    (8128, 1, 4093, 4094),
+    (8100, 1, 4093, 4094),
+    (8074, 1, 4093, 4094),
+    (8043, 1, 4093, 4094),
+    (8016, 1, 4093, 4094),
+    (7991, 1, 4093, 4094),
+    (7891, 1, 4093, 4094),
+)
 #: The 22 distinct `(need, got, kv_pages, draft_pages)` rows that ended in
 #: claim=0, joined per rid across the two instruments.  Not a sample: this is
 #: every truncated rid of the boot that also carries a presence line and went
@@ -109,7 +141,8 @@ TRIM_ROWS = (
     (22362, 8128, 4094, 45), (22364, 8150, 4094, 45), (22461, 7991, 4094, 47),
     (22493, 8100, 4094, 46),
 )
-#: The two rows that survived, and the only difference: got >= 8192.
+#: The two rows that survived, and the only difference: a SECOND anchor was in
+#: range (`anchors_in_range=(2, 8189)`), not that `got` cleared a block edge.
 COLD_ROWS = ((16520, 8247, 8190, 48), (18187, 8247, 8190, 48))
 #: The one trim row off the 4,096 grid -- proof the zero is not a property of
 #: 4094 but of the branch (`WEG2 DRAFT-PRESENCE ... kv_pages=2727
@@ -121,32 +154,140 @@ SB5H_D_LOG = (
     "/spinning/evidence-665-f1/"
     "boot_weg2_weg2sb5h_57fef0ce6e_0909_103119.D.log"
 )
+IDENTITY = "0123456789abcdef"
+TREE_LOGGER = "sglang.srt.mem_cache.unified_radix_cache"
 
 
-# ------------------------------------------------------- (A) the pool grant
+def _store(root):
+    return HiCacheFile(
+        HiCacheStorageConfig(
+            tp_rank=0, tp_size=1, pp_rank=0, pp_size=1,
+            attn_cp_rank=0, attn_cp_size=1, is_mla_model=False,
+            enable_storage_metrics=False, is_page_first_layout=True,
+            model_name="Qwen3.8-27B", model_identity_hash=IDENTITY,
+        ),
+        file_path=root,
+    )
+
+
+def _skip_if_store_dir_overridden(store, root):
+    if os.path.realpath(store.file_path) != os.path.realpath(root):
+        pytest.skip(
+            "SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR overrides the store dir"
+        )
+
+
+# ------------------------------------------ (M) the mechanism, on the store
+def test_m1_the_store_credits_every_key_it_holds_and_the_anchor_does_the_cutting():
+    """THE COUNTER-MEASUREMENT, PINNED SO IT CANNOT BE RE-INVENTED.
+
+    Fix 1 of this branch shipped the claim that the store "does not credit odd
+    numbers: its presence probe answers on whole ``chunked_prefill_size``
+    blocks", and floored the pool grant to that assumed grid.  The boot said
+    otherwise on all 36 of its capped lines (``kv == keys``, 36/36), and so
+    does the real store here.
+
+    DRIVEN ROWS, and why these three of the nine: the rows differ in exactly
+    two ways, the anchor COUNT in range (1 or 2) and the span.  ``kv=8247``
+    is the whole count=2 arm (9 of the 36 lines); ``kv=7891`` and ``kv=8150``
+    are the extremes of the count=1 arm (the other 27 lines all sit between
+    them with the identical ``deepest_idx=4093``).  The remaining six rows add
+    no arm, only file-writes -- their arithmetic is asserted over ALL nine in
+    ``test_m2``.  Each driven row: publish ALL ``kv`` KV pages, publish the
+    MAMBA anchor at exactly the measured ``deepest_idx``, probe the whole span
+    with the real ``TRAILING_PAGES`` transfer the mamba component builds
+    (``keys=[node.hash_value[-1]]`` -> trailing 1), and read the two numbers
+    the ``#1028B`` line prints:
+
+    * ``kv_uncapped`` -- the KV prefix BEFORE any component cap -- equals the
+      number of keys asked, for an odd, non-block span.  No grid, anywhere.
+    * ``kv_hit_pages`` -- the cross-pool MIN -- equals the measured ``claimed``,
+      and the pool that produced it is MAMBA.
+
+    Anything that floors a read against a store-side block grid is fixing a
+    mechanism this test says does not exist.
+    """
+    driven = [row for row in ANCHOR_ROWS if row[0] in (8247, 8150, 7891)]
+    assert len(driven) == 3 and {r[1] for r in driven} == {1, 2}, driven
+    for kv, count, deepest, claimed in driven:
+        with tempfile.TemporaryDirectory() as root:
+            store = _store(root)
+            _skip_if_store_dir_overridden(store, root)
+            keys = [f"w2-1298-m1-{kv}-{i:07d}" for i in range(kv)]
+            blob = torch.arange(8, dtype=torch.uint8)
+            for key in keys:
+                assert store.set(store._log_key(PoolName.KV, key), blob)
+            # the anchors the boot's `#1035b` probe found in range
+            anchors = [deepest - j * CHUNK for j in range(count)]
+            assert anchors[-1] >= 0 and max(anchors) == deepest
+            for idx in anchors:
+                assert store.set(store._log_key(PoolName.MAMBA, keys[idx]), blob)
+            mamba = PoolTransfer(
+                name=PoolName.MAMBA,
+                keys=[keys[-1]],  # trailing 1, as hi_mamba_radix_cache builds it
+                hit_policy=PoolHitPolicy.TRAILING_PAGES,
+            )
+            hit = store.batch_exists_v2(keys, [mamba], None)
+            assert hit.keys_asked == kv
+            assert hit.kv_uncapped == kv, (
+                f"kv={kv}: the store credited {hit.kv_uncapped} of {kv} keys "
+                "it holds. THE STORE HAS NO BLOCK GRID -- if this ever fails, "
+                "the probe changed, not the assumption"
+            )
+            assert kv % CHUNK != 0, "the boot's spans are all off the grid"
+            assert hit.kv_hit_pages == claimed, (
+                f"kv={kv}: cross-pool MIN {hit.kv_hit_pages}, measured {claimed}"
+            )
+            assert (
+                int(hit.extra_pool_hit_pages.get(str(PoolName.MAMBA), 0)) == claimed
+            ), "and MAMBA is the pool that produced it"
+
+
+def test_m2_the_anchor_boundary_is_not_the_block_boundary():
+    """WHY A ``% 4096`` FLOOR IS THE WRONG QUANTITY, in one arithmetic.
+
+    The measured boundaries are ``4096k - 2`` (4094, 8190), from anchors at
+    0-based ``4096k - 3``.  So for a granted span in ``[4096k-2, 4096k)`` the
+    store credits block ``k`` while a ``granted - granted % 4096`` floor drops
+    the grant to block ``k-1`` -- at ``k=1`` to ZERO, under
+    ``prefetch_threshold``, refusing a read the parent performed and credited
+    4,094 pages for.  Stated on the numbers rather than argued, and asserted
+    in the direction that keeps the boundary honest if either side moves.
+    """
+    for kv, _count, deepest, claimed in ANCHOR_ROWS:
+        assert claimed == deepest + 1, "boundary is the prefix length"
+        assert claimed % CHUNK == CHUNK - 2, (
+            f"claimed={claimed}: the anchor grid is 4096k-2, not 4096k"
+        )
+        assert claimed - (claimed % CHUNK) != claimed, (
+            "so flooring the credited boundary itself to a block loses it"
+        )
+    # the interval a block floor destroys, on the boot's own stride
+    for k in (1, 2, 3):
+        edge = k * CHUNK - 2  # the credited boundary
+        for granted in (edge, edge + 1):
+            assert granted - (granted % CHUNK) == (k - 1) * CHUNK, (
+                f"granted={granted}: a block floor drops to block {k - 1} "
+                f"while the store credits {edge}"
+            )
+    assert (1 * CHUNK - 2) - ((1 * CHUNK - 2) % CHUNK) == 0, (
+        "and at the first block it floors to zero, i.e. a refusal"
+    )
+
+
+# ---------------------------------- (G) the grant is NOT quantized: guards
 class _FakeHostPool:
     """The two calls ``prefetch_from_storage`` makes, over a free counter."""
 
-    def __init__(self, free, refuse_first=0):
+    def __init__(self, free):
         self.free = int(free)
         self.allocs = []
         self.released = 0
-        #: A pool that REPORTS room and refuses the alloc anyway -- the
-        #: fragmentation case the tree already names (`host_alloc_failed`,
-        #: "the room raced away between the read and the alloc").  It is the
-        #: only way the symmetric branch is reached with the WHOLE span still
-        #: affordable, so it is the only way the full-grant guard is
-        #: reachable at all.  Measured: without it, `test_a2` passed against a
-        #: mutant that had the guard removed.
-        self.refuse_first = int(refuse_first)
 
     def available_size(self):
         return self.free
 
     def alloc(self, need_size):
-        if self.refuse_first > 0:
-            self.refuse_first -= 1
-            return None
         if need_size > self.free:
             return None
         self.free -= need_size
@@ -155,11 +296,11 @@ class _FakeHostPool:
 
 
 def _cache_stub(available, peer_votes, page=PAGE, threshold=THRESHOLD, chunk=CHUNK,
-                refuse_first=0):
+                symmetric=True):
     """A ``UnifiedRadixCache`` stand-in driving the REAL
-    ``prefetch_from_storage`` (and through it the REAL ``_store_grid_floor``),
-    with a reduce stub that MINs this rank's vote against ``peer_votes``."""
-    pool = _FakeHostPool(available, refuse_first=refuse_first)
+    ``prefetch_from_storage``, with a reduce stub that MINs this rank's vote
+    against ``peer_votes``."""
+    pool = _FakeHostPool(available)
     registered = {}
 
     def _reduce(t, op, label):
@@ -198,7 +339,7 @@ def _cache_stub(available, peer_votes, page=PAGE, threshold=THRESHOLD, chunk=CHU
         votes=[],
         registered=registered,
         pool=pool,
-        _hicache_prefetch_symmetric=lambda: True,
+        _hicache_prefetch_symmetric=lambda: symmetric,
         _all_reduce_attn_groups=_reduce,
         evict_host=lambda *a, **k: None,
         inc_host_lock_ref=lambda node: SimpleNamespace(to_dec_params=lambda: "l"),
@@ -226,96 +367,100 @@ def _issue(stub, rid, tokens):
     return {k: v for k, v in delta.items() if v}
 
 
-def test_a1_the_residual_grant_is_quantized_to_the_store_grid():
-    """RED AT THE PARENT: the residual is floored to ``page_size`` (=1), so
-    the rank takes 8,150 rows and the probe credits what 4,096 rows would
-    have bought.  Every one of the boot's ten distinct ``got`` values is
-    driven, not one specimen."""
-    got_values = sorted({row[1] for row in TRIM_ROWS} | {row[1] for row in COLD_ROWS})
-    assert len(got_values) == 10, "the boot's ten distinct granted spans"
-    for got in got_values:
-        need = 22331  # a `need` from the boot, larger than every residual
-        stub = _cache_stub(got, peer_votes=[got, got])
-        _issue(stub, "grid", need)
-        registered = stub.registered.get("grid")
-        assert registered is not None, f"got={got}: the read must still register"
-        assert registered.key_len % CHUNK == 0, (
-            f"got={got}: granted {registered.key_len} rows, which is "
-            f"{registered.key_len % CHUNK} rows past a {CHUNK}-token block "
-            "boundary -- rows the store credits nothing for and the siblings "
-            "cannot use"
-        )
-        assert registered.key_len == got - (got % CHUNK)
-        assert stub.pool.free == got - registered.key_len, (
-            "the rows above the boundary stay in the pool for the siblings"
-        )
+def test_g1_a_residual_is_granted_whole_never_floored_to_a_block():
+    """REGRESSION GUARD for the reverted fix-1 floor (F2/F3).
 
-
-def test_a2_a_full_span_grant_is_never_floored():
-    """THE DANGER DIRECTION of (A), through the ONLY path that reaches it.
-
-    15 round trips of this boot came back at ``prompt_tokens - 2`` (22,406 of
-    22,408) -- NOT ``floor_4096(22408)``.  A grant that covers the whole span
-    is not a residual and must pass through untouched, or the fix breaks the
-    path that works.
-
-    REACHABILITY, and it is the point of this test rather than a detail: the
-    symmetric branch runs ONLY after ``alloc(prefetch_length)`` has already
-    failed twice, so a pool with plain room never enters the helper and an
-    assertion written that way passes no matter what the helper does.  It has
-    to be a pool that REPORTS the room and refuses the alloc -- the
-    fragmentation case the tree names itself.  Measured: the naive version of
-    this test passed against a mutant with the full-grant guard deleted.
+    The residual the pool can carry is granted at exactly ``available``
+    (page-floored, and ``page_size`` is 1 here).  The dangerous inputs are the
+    ones sitting just below a block edge -- ``4096k - 1`` and ``4096k - 2``,
+    the second being the boundary the store actually credits (``test_m2``).  A
+    block floor turns those into block ``k-1``, and at ``k=1`` into a refusal
+    of a read the parent performs.  Driven over the boot's ten granted spans
+    plus the three edges, on the symmetric (#1290) site.
     """
-    for need in (22408, 22331, 18187, 8192, CHUNK + 1, THRESHOLD):
-        stub = _cache_stub(
-            POOL_LIMIT + need, peer_votes=[need, need], refuse_first=2
+    # why a residual exists at all on this form: the D-phase staging pool is
+    # 30,518 rows / limit 27,466 tokens and fits exactly ONE ~22k read, so
+    # every sibling of an epoch is served from what the first one left.
+    assert POOL_LIMIT < 2 * 22331 <= POOL_ROWS + 22331
+    edges = [k * CHUNK - off for k in (1, 2) for off in (1, 2)]
+    spans = sorted({row[1] for row in TRIM_ROWS} | {row[1] for row in COLD_ROWS})
+    assert len(spans) == 10, "the boot's ten distinct granted spans"
+    # EDGES FIRST, deliberately: they are the inputs F2 is about, so a guard
+    # that goes red names one of them rather than an ordinary span.
+    for got in edges + spans:
+        stub = _cache_stub(got, peer_votes=[got, got])
+        _issue(stub, "resid", 22331)
+        registered = stub.registered.get("resid")
+        assert registered is not None, (
+            f"got={got}: the read must still register -- a block floor at "
+            f"{got - (got % CHUNK)} would drop it under the threshold"
         )
-        _issue(stub, "full", need)
-        registered = stub.registered.get("full")
-        assert registered is not None and registered.key_len == need, (
-            f"need={need}: a full grant was floored to "
-            f"{None if registered is None else registered.key_len}"
+        assert registered.key_len == got, (
+            f"got={got}: granted {registered.key_len}. The residual is granted "
+            "WHOLE: the store credits every key it holds (test_m1), so rows "
+            "above a block edge are not dead weight, and the term that does "
+            "cut the claim is the mamba anchor, which this site cannot see."
         )
-        assert stub.pool.allocs == [need], (
-            f"need={need}: the third alloc must ask for the WHOLE span"
+        assert stub.pool.allocs == [got]
+
+
+def test_g2_the_realised_loss_is_the_room_that_was_missing_and_nothing_more():
+    """REGRESSION GUARD (F4): the #939 one-chunk bound is reported on the
+    REALISED loss, so a quantizer that discards rows the pool did hold would
+    push a truncation that honoured the bound outside it -- under a counter
+    (``host_pool_truncated_tokens``) whose name says the pool had no room.
+
+    On the non-symmetric site, which is the one that speaks the line: for a
+    need one row past a whole number of blocks against room one row short of
+    it, ``lost`` must be exactly 2 and ``over_bound`` must read false.
+    """
+    for m in (2, 3):
+        need, available = m * CHUNK + 1, m * CHUNK - 1
+        stub = _cache_stub(available, peer_votes=[need, need], symmetric=False)
+        with _CaptureLines(logging.getLogger(TREE_LOGGER)) as cap:
+            delta = _issue(stub, "bound", need)
+        assert delta.get("host_pool_truncated") == 1
+        assert delta.get("host_pool_truncated_tokens") == need - available == 2, (
+            f"need={need} available={available}: the counter must carry the "
+            "room that was missing, not rows a quantizer threw away"
         )
+        line = [ln for ln in cap.lines if "#915 PREFETCH TRUNCATED" in ln]
+        assert len(line) == 1, cap.lines
+        assert f"got={available}" in line[0] and "lost=2" in line[0], line[0]
+        assert "over_bound=false" in line[0], line[0]
 
 
-def test_a2b_the_grid_floor_itself_leaves_a_full_grant_alone():
-    """The same guard, stated on the helper directly, so a future call site
-    inherits the property rather than re-deriving it."""
-    for span in (22408, 22331, 18187, 8192, CHUNK, CHUNK + 1, 1):
-        assert _store_grid_floor(span, span, CHUNK) == span
-        assert _store_grid_floor(span + 1, span, CHUNK) == span + 1, (
-            "a grant ABOVE the span is not a residual either"
-        )
-    # and a genuine residual is floored, on the same helper
-    assert _store_grid_floor(8150, 22331, CHUNK) == CHUNK
-    assert _store_grid_floor(8247, 22331, CHUNK) == 2 * CHUNK
-    assert _store_grid_floor(8150, 22331, 0) == 8150, "no grid, no floor"
-    assert _store_grid_floor(8150, 22331, -1) == 8150
+class _CaptureLines(logging.Handler):
+    """A handler, not ``caplog``: the census harnesses in this tree bind their
+    own root config and ``caplog`` propagation is not reliable under them."""
+
+    def __init__(self, logger):
+        super().__init__(level=logging.WARNING)
+        self._logger = logger
+        self.lines = []
+
+    def emit(self, record):
+        self.lines.append(record.getMessage())
+
+    def __enter__(self):
+        self._prev = self._logger.level
+        self._logger.setLevel(logging.WARNING)
+        self._logger.addHandler(self)
+        return self
+
+    def __exit__(self, *a):
+        self._logger.removeHandler(self)
+        self._logger.setLevel(self._prev)
+        return False
 
 
-def test_a3_a_residual_below_one_block_takes_the_existing_exit(caplog):
-    """No new refusal reason is invented.  A residual that the grid floor
-    drops under ``prefetch_threshold`` leaves ``host_indices`` None, votes 0,
-    and the group refuses under the name it already uses."""
-    stub = _cache_stub(CHUNK - 1, peer_votes=[CHUNK - 1, CHUNK - 1])
-    with caplog.at_level(logging.WARNING):
-        delta = _issue(stub, "short", 22331)
-    assert stub.registered == {}, "nothing registers on a sub-block residual"
-    assert delta.get("vote_negative") == 1
-    assert "reason=vote_negative" in caplog.text
-    assert stub.pool.allocs == [], "and no rows were taken to be thrown away"
-
-
-def test_a4_the_grid_floor_is_rank_uniform():
-    """Ranks never disagree.  Three ranks with DIVERGENT pool room register
-    ONE identical length -- the group MIN of three floored votes -- and each
-    releases only its own surplus."""
+def test_g3_ranks_still_agree_on_the_unquantized_grant():
+    """Ranks never disagree.  Three ranks with DIVERGENT pool room register ONE
+    identical length -- the group MIN of three votes -- and each releases only
+    its own surplus.  Unchanged by the revert, and stated here because it is
+    the property any future quantizer must not break."""
     rooms = [8150, 8247, 12290]
-    votes = [min(22331, r) - (min(22331, r) % CHUNK) for r in rooms]
+    votes = [min(22331, r) for r in rooms]
     group = min(votes)
     stubs = []
     for me, room in enumerate(rooms):
@@ -325,17 +470,8 @@ def test_a4_the_grid_floor_is_rank_uniform():
         stubs.append(stub)
     assert {s.registered["uniform"].key_len for s in stubs} == {group}
     for s, vote in zip(stubs, votes):
-        assert s.votes == [vote], "each rank voted its own floored length"
+        assert s.votes == [vote], "each rank voted its own allocated length"
         assert s.pool.released == vote - group
-
-
-def test_a5_a_tree_without_the_chunk_term_is_left_alone():
-    """``over_bound=unknown`` is a stand-in, never a verdict against an
-    unmeasured bound -- so a tree built without ``chunked_prefill_size`` must
-    not be floored against a guessed grid."""
-    stub = _cache_stub(8150, peer_votes=[8150, 8150], chunk=-1)
-    _issue(stub, "nogrid", 22331)
-    assert stub.registered["nogrid"].key_len == 8150
 
 
 # ------------------------------------------------------------ (B) the claim
@@ -346,7 +482,7 @@ def _cold_claim(k, d):
 
 
 def test_b1_the_trim_zero_is_gone_on_the_boots_own_arguments():
-    """RED AT THE PARENT -- F1.  Arguments read verbatim off ``D L77876`` /
+    """RED AT THE PARENT.  Arguments read verbatim off ``D L77876`` /
     ``D L105408``: ``resolve_draft_claim(4094, 47, 4096, reprobe->0)`` returned
     ``(0, 0, 'trim', None)``, discarding 4,047 valid KV pages.  Driven over all
     22 measured rows, not one specimen."""
@@ -360,8 +496,8 @@ def test_b1_the_trim_zero_is_gone_on_the_boots_own_arguments():
 
 
 def test_b2_the_cold_guard_arm_is_unchanged():
-    """The arm that already worked stays byte-identical: ``got=8247`` credited
-    8,190 and served."""
+    """The arm that already worked stays byte-identical: ``got=8247`` reached a
+    second anchor, credited 8,190 and served."""
     for need, got, k, d in COLD_ROWS:
         assert resolve_draft_claim(k, d, CHUNK, lambda _d: 0) == (
             k, d, "cold", (d, k)
@@ -372,10 +508,11 @@ def test_b2_the_cold_guard_arm_is_unchanged():
 
 def test_b3_no_reprobe_answer_can_lower_the_claim():
     """The cap ``max(0, min(reprobe(d), d))`` was the mechanism: whatever the
-    store answered, the branch could not return more than ``d``.  Sweep the
-    whole answer space -- generous, exact, short, zero, negative, absurd -- on
-    the boot's own ``(k, d)`` and on the one row that is NOT on the 4,096
-    grid."""
+    store answered, the branch could not return more than ``d``, and ``d < k``
+    is the branch's own precondition -- so it lost to ``cold`` for EVERY input,
+    not only this boot's.  Sweep the whole answer space -- generous, exact,
+    short, zero, negative, absurd -- on the boot's own ``(k, d)`` and on the
+    one row that is NOT on the 4,096 grid."""
     pairs = [(k, d) for _n, _g, k, d in TRIM_ROWS] + [OFF_GRID_TRIM]
     for k, d in pairs:
         for answer in (0, -5, 1, d - 1, d, d + 1, k, k * 4):
@@ -408,8 +545,8 @@ def test_f3_every_truncated_read_reaches_a_terminal_line():
     reap, a refusal, or a defer.  On sb5h, 34 of 37 truncated rids have NONE
     of the four -- issued, cut, and gone without a word ~1 s later, which is
     why ``WEG2 X-DEFER`` is 0 in 109,471 lines while 24 requests were priced
-    at their whole prompt.  Parts (A) and (B) of #1298 do not close this;
-    part (C) does, and this test is how the next boot says so.
+    at their whole prompt.  The trim deletion in this commit does not close
+    this; part (C) does, and this test is how the next boot says so.
     """
     trunc = {}
     terminal = {}
@@ -441,22 +578,7 @@ def test_f3_every_truncated_read_reaches_a_terminal_line():
     )
 
 
-# ------------------------------------- the REAL chain, on a real disk store
-IDENTITY = "0123456789abcdef"
-
-
-def _store(root):
-    return HiCacheFile(
-        HiCacheStorageConfig(
-            tp_rank=0, tp_size=1, pp_rank=0, pp_size=1,
-            attn_cp_rank=0, attn_cp_size=1, is_mla_model=False,
-            enable_storage_metrics=False, is_page_first_layout=True,
-            model_name="Qwen3.8-27B", model_identity_hash=IDENTITY,
-        ),
-        file_path=root,
-    )
-
-
+# --------------------------- the real D-side chain, on a real disk store
 def _draft_controller(store, page_size=PAGE, chunk=CHUNK):
     """The REAL ``_apply_draft_claim`` and ``_draft_chunk_pages`` bound over a
     bare controller -- the D-side consumer of the store's probe."""
@@ -477,28 +599,31 @@ def _draft_controller(store, page_size=PAGE, chunk=CHUNK):
     return stub
 
 
-def test_c1_the_real_chain_p_writes_d_reads_and_the_claim_is_not_zero():
-    """RED AT THE PARENT, and it is the whole ticket in one function.
+def test_c1_the_real_d_side_chain_from_a_published_prefix_is_not_zero():
+    """RED AT THE PARENT: the D-side resolver chain, on a real store.
 
-    A REAL ``HiCacheFile`` on disk.  P writes the published prefix through the
+    A REAL ``HiCacheFile`` on disk.  The KV prefix is published through the
     WRITER's key funnel (``set(_log_key(pool, key))``, what ``_write_page``
-    calls); D probes through the READER's funnel
-    (``batch_exists_v2`` -> ``_get_component_key``) -- the two funnels #1295
-    proved share the canonical suffix -- and D's real ``_apply_draft_claim``
-    resolves the claim.  The sequence is the log-proven one: ``need=22331``,
-    the pool grants ``got=8016``, the store holds 4,094 published KV pages and
-    47 draft pages, and the handback must not be zero.
+    calls) and probed through the READER's (``batch_exists_v2`` ->
+    ``_get_component_key``) -- the two funnels #1295 proved share the canonical
+    suffix -- and D's real ``_apply_draft_claim`` resolves the claim.
+
+    SCOPE, STATED HONESTLY: this drives the chain from a KV prefix of ``k``
+    pages to the claim.  It reproduces ``k=4094`` by publishing 4,094 pages,
+    i.e. by WRITE PROGRESS, and passes NO mamba transfer -- so the anchor cap,
+    the term that actually produced 4,094 on the boot (``test_m1``), does not
+    fire here.  It does not need to: the resolver is a function of ``(k, d)``
+    and does not care where ``k`` came from, and the claim it returned for
+    this ``(k, d)`` was zero.  ``test_m1`` covers the cap; this covers what D
+    then does with it.
     """
     need, got, k, d = 22331, 8016, 4094, 47
     with tempfile.TemporaryDirectory() as root:
         store = _store(root)
-        if os.path.realpath(store.file_path) != os.path.realpath(root):
-            pytest.skip(
-                "SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR overrides the store dir"
-            )
+        _skip_if_store_dir_overridden(store, root)
         keys = [f"weg2-1298-page{i:07d}" for i in range(got)]
         blob = torch.arange(8, dtype=torch.uint8)
-        # --- P's leg: publish the KV prefix, then the shorter draft prefix.
+        # --- publish the KV prefix, then the shorter draft prefix.
         for key in keys[:k]:
             assert store.set(store._log_key(PoolName.KV, key), blob)
         for key in keys[:d]:
@@ -513,7 +638,7 @@ def test_c1_the_real_chain_p_writes_d_reads_and_the_claim_is_not_zero():
         hit = store.batch_exists_v2(keys, [draft_probe], None)
         assert hit.kv_hit_pages == k, (
             f"the store credited {hit.kv_hit_pages} of {k} published pages -- "
-            "this test's premise (P's write landed) is broken, not its claim"
+            "this test's premise (the write landed) is broken, not its claim"
         )
         assert int(hit.extra_pool_hit_pages.get(str(PoolName.DRAFT), 0)) == d
         # --- D's claim, through the real resolver.
