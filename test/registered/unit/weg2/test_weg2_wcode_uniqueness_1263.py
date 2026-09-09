@@ -22,13 +22,13 @@ which #1290 already held at the base commit -- and this census reported 7/0/0
 anyway. Its pattern was ``W<nn>`` + WHITESPACE + ``Weg2<Name>``, and #1290
 writes the code in the two forms that have no whitespace after it:
 
-* CONCATENATED, ``front.py:560``: the name is built from the bare code plus a
+* CONCATENATED, ``front.py:561``: the name is built from the bare code plus a
   separate marker constant, so a QUOTE follows the code, not a space.
-* COUNTER KEY, ``front.py:1980``/``:2602``: ``W52_Weg2NoServiceableRoute``, an
+* COUNTER KEY, ``front.py:1981``/``:2603``: ``W52_Weg2NoServiceableRoute``, an
   UNDERSCORE after the code.
 
 Both are read by a human grepping a boot log for ``W52`` and by neither of the
-regexes that were supposed to prevent the clash -- and ``front.py:556``'s own
+regexes that were supposed to prevent the clash -- and ``front.py:557``'s own
 "W52 is free" comment was written from this same blind instrument, which is
 how the wrong number looked enumerated. So the census now reads all three
 forms and RESOLVES the concatenated one through the marker constant; an
@@ -110,9 +110,9 @@ UNRESOLVED = "UNRESOLVED-CONCAT-OPERAND"
 #: W22 joined this list on 2026-09-09 WITHOUT anything changing in the source:
 #: it is pre-existing at the base commit ``80de2d31d1`` and was simply
 #: invisible to the un-hardened scan, which could not read a counter key.
-#: ``W22 Weg2HostWatermarkBreached`` at ``front.py:1804`` and
+#: ``W22 Weg2HostWatermarkBreached`` at ``front.py:1805`` and
 #: ``host_ledger.py:688`` vs. the counter ``W22_Weg2SpanUnknownPricedFull`` at
-#: ``front.py:1937``. Recorded here rather than renumbered, for the reason the
+#: ``front.py:1938``. Recorded here rather than renumbered, for the reason the
 #: docstring gives for the other four: this is the serving-boot base.
 KNOWN_COLLISIONS = {
     "W10": {"Weg2CanonicalPageMissing", "Weg2DrafterIdentityMismatch"},
@@ -272,14 +272,14 @@ class TestOneWCodePerException(CustomTestCase):
         front = "python/sglang/srt/weg2/front.py"
         self.assertIn(f"{front}:558", c["W50"]["Weg2TpPrefillExceeded"],
                       "the concatenated form must be read AND resolved")
-        self.assertIn(f"{front}:563", c["W52"]["Weg2NoServiceableRoute"],
+        self.assertIn(f"{front}:564", c["W52"]["Weg2NoServiceableRoute"],
                       "#1290's concatenated claim is the one #1257 walked into")
         # form 2, counter key: an underscore where the plain pattern wants a
         # space. Both of #1290's counter sites, and the pre-existing W22 one.
-        for line in (2070, 2803):
+        for line in (2071, 2804):
             self.assertIn(f"{front}:{line}",
                           c["W52"]["Weg2NoServiceableRoute"])
-        self.assertIn(f"{front}:2027",
+        self.assertIn(f"{front}:2028",
                       c["W22"]["Weg2SpanUnknownPricedFull"])
         # ...and the sub-key suffix is NOT read as a second holder.
         self.assertEqual(set(c["W28"]), {"Weg2Leg2Unpriced"},
