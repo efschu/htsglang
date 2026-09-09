@@ -557,6 +557,16 @@ def _arriving_prefill_tokens(inflight, _already_queued=None, exclude=None) -> in
     return total
 
 
+#: #1298 (S3/S4/S5): the deferral reasons, as names rather than literals
+#: scattered over four methods. ``rate_limited`` is #1068's original and its
+#: behaviour is unchanged; ``host_pool_shortfall`` is the group-agreed one the
+#: #1290 vote publishes (see `_prefetch_deferral_refusal_reason`).
+_DEFER_REASON_RATE = "rate_limited"
+_DEFER_REASON_SHORTFALL = "host_pool_shortfall"
+#: The verdict `Scheduler._prefetch_kvcache` returns for a read that REGISTERED
+#: and was cut by the post-consensus group trim. Not a decline: the read exists.
+_VERDICT_TRUNCATED_GROUP = "issued:truncated_group"
+
 # #1068 A12.2: why the prefetch deferral is REFUSED on a rank/phase, by name.
 # MODULE-LEVEL on purpose: `_prefetch_deferral_refusal_reason` is bound to
 # test stand-ins by method, and a class attribute would not travel with it
@@ -5302,6 +5312,22 @@ class Scheduler(
             return "declined:unobservable"
         if req.rid in _ongoing and not _was_registered:
             _note_prefetch_gate("issued")
+            # #1298 (S3): ISSUED, BUT CUT BY THE GROUP. The read registered --
+            # so this is not a decline and must never be counted as one -- and
+            # the group agreed to register LESS than the span it asked for.
+            # Read off the census delta this call already brackets, on the key
+            # only the post-consensus group trim bumps
+            # (`unified_radix_cache.py`, S2), so the answer is identical on
+            # every rank of the group by construction. The non-symmetric
+            # truncation deliberately does NOT reach here: its cut is a
+            # rank-local decision and there is no group fact to defer on.
+            from sglang.srt.mem_cache.match_refusal_census import (
+                PREFETCH_GATE_COUNTS as _PGC,
+            )
+
+            _key = "host_pool_truncated_group"
+            if _PGC.get(_key, 0) > _gate_before.get(_key, 0):
+                return "issued:truncated_group"
             return "issued"
         if _was_registered:
             # It was already in flight before we asked; the escape did not
@@ -5894,8 +5920,31 @@ class Scheduler(
         except Exception:  # noqa: BLE001 - no pool -> no judgement, never 0
             return None
 
-    def _prefetch_deferral_refusal_reason(self) -> Optional[str]:
+    def _prefetch_deferral_refusal_reason(
+        self, for_reason: str = "rate_limited"
+    ) -> Optional[str]:
         """Why the A12.2 deferral is REFUSED on this rank/phase, or None.
+
+        #1298 (S4): ``for_reason`` NAMES WHICH DEFERRAL IS BEING ASKED ABOUT,
+        because ``symmetric_vote`` is not a statement about deferrals in
+        general -- it is a statement about a RANK-LOCAL one.  Its own text
+        says so: *"the rate verdict is rank-local while registration is the
+        #580 group vote; a rank-divergent deferred set would enter that vote
+        unevenly."*  That is exactly right for ``rate_limited``, whose mark is
+        set from this rank's own prefetch budget.  It does not describe
+        ``host_pool_shortfall``, whose mark is set from two MIN-REDUCED values
+        and is therefore identical on every rank of the group before any rank
+        acts on it (``unified_radix_cache.py``, S1: the span rides the vote and
+        a span split is a named STOP, so ``group_len < span`` is a group fact).
+        A refusal that quotes rank-divergence as its reason must not fire on a
+        mark that cannot be rank-divergent.
+
+        SCOPED, NOT DELETED.  ``rate_limited`` keeps every refusal it had --
+        this method is byte-identical for the default argument -- and the two
+        reasons that are about CAPABILITY rather than rank-divergence
+        (``storage_disabled``, ``unpriced_timeout``) still refuse both, as does
+        ``symmetric_probe_failed``: an unknown vote mode is refused rather than
+        guessed, which is the whole point of naming it separately.
 
         ONE predicate for every reader -- the writer at intake/retry
         (`_apply_prefetch_deferral`), the retry gate
@@ -5933,6 +5982,10 @@ class Scheduler(
                 reason = "symmetric_vote"
         except Exception:  # noqa: BLE001 - a probe may never break intake
             reason = "symmetric_probe_failed"
+        if reason == "symmetric_vote" and for_reason == _DEFER_REASON_SHORTFALL:
+            # S4: the group vote is the very mechanism that makes THIS mark
+            # uniform, so it cannot also be the reason to refuse it.
+            reason = None
         if reason is None and (
             getattr(tc, "prefetch_timeout_base", None) is None
             or getattr(tc, "prefetch_timeout_per_page", None) is None
@@ -5987,6 +6040,8 @@ class Scheduler(
         rid = str(getattr(req, "rid", "?"))[:8]
         marked = getattr(req, "prefetch_deferred", None) is not None
         span = getattr(req, "_prefetch_span_tokens", None)
+        if verdict == _VERDICT_TRUNCATED_GROUP:
+            return self._apply_group_shortfall_deferral(req, rid, span, marked, site)
         if verdict == "declined:rate_limited":
             if self._prefetch_deferral_refusal_reason() is not None:
                 # The pre-#1068 decline stands on this rank/phase (the TP
@@ -6095,6 +6150,116 @@ class Scheduler(
         )
         return "released"
 
+    def _apply_group_shortfall_deferral(
+        self, req, rid: str, span, marked: bool, site: str
+    ) -> Optional[str]:
+        """#1298 (S5): the ``host_pool_shortfall`` arm of the A12.2 machine.
+
+        THE READ REGISTERED AND WAS CUT BY THE GROUP.  It will land holding
+        less than the request needs, and the moment it leaves
+        ``ongoing_prefetch`` the X gate's completion predicate goes False and
+        prices the request at its WHOLE extent -- boot weg2sb5h's 37 W50s on
+        prompts P had already written.  The mark keeps
+        ``_weg2_store_read_is_pending`` True across that gap, so the gate
+        defers instead of pricing, and ``_retry_deferred_prefetches`` re-issues
+        the read on a later pass, when the admit ahead of it has released the
+        staging pool.
+
+        EVERY EXIT IS ONE THAT ALREADY EXISTED.  No new refusal, no new
+        counter beyond the census keys, no second bound:
+
+        * **does not fit even alone** -> the EXISTING ``undeferrable`` exit.
+          Its predicate is ``span > _prefetch_capacity_limit_or_none()``, and
+          that limit IS the carrier bound the front prices against (boot
+          weg2sb5h: ``limit=27466`` on the #915 line, the same 27,466 the
+          front's ``carrier_est`` is compared to).  A request that exceeds it
+          cannot be made to fit by waiting for anyone, so it takes the
+          carrier-exceeds path on the FIRST mark and never defers at all --
+          which is also why the repeat case cannot loop on it.
+        * **waited too long** -> the EXISTING ``DEFER EXPIRED`` bound,
+          ``_deferred_prefetch_bound_s``, the same length-priced timeout the
+          rate arm uses and the same one the X gate reads.
+        * **landed whole on the retry** -> falls out of this method into the
+          normal LANDED path below, because the retry's verdict is then plain
+          ``issued``.
+
+        A REPEAT TRUNCATION IS A RE-DEFER, NOT A SECOND MECHANISM: the pool
+        was still busy, the read is still coming, and the bound is what stops
+        it.  The attempt counter rises so the boot can see a rid that is
+        losing the race rather than one that is waiting once.
+        """
+        from sglang.srt.mem_cache.match_refusal_census import (
+            note_prefetch_gate as _note_prefetch_gate,
+        )
+
+        refusal = self._prefetch_deferral_refusal_reason(_DEFER_REASON_SHORTFALL)
+        if refusal is not None:
+            # Counted, never silent -- the suppressed count of the once-per-
+            # process DEFERRAL REFUSED line, exactly as the rate arm does.
+            _note_prefetch_gate("defer_refused")
+            return "refused"
+        limit = self._prefetch_capacity_limit_or_none()
+        if span is not None and limit is not None and int(span) > int(limit):
+            # Carrier-exceeds. Identical predicate and identical exit to the
+            # rate arm's: a span the budget can never hold does not become
+            # holdable by deferring, so it proceeds on the recompute path.
+            if marked:
+                self._clear_prefetch_deferral_fields(req)
+            _note_prefetch_gate("undeferrable")
+            logger.warning(
+                "#1068 PREFETCH UNDEFERRABLE rid=%s span=%d limit=%d site=%s "
+                "reason=%s -- the request's own span exceeds the carrier bound "
+                "and cannot fit even with the staging pool empty, so it is "
+                "refused here rather than deferred a second time",
+                rid,
+                int(span),
+                int(limit),
+                site,
+                _DEFER_REASON_SHORTFALL,
+            )
+            return "undeferrable"
+        if not marked:
+            req.prefetch_deferred = _DEFER_REASON_SHORTFALL
+            req.prefetch_defer_attempts = 1
+            req.prefetch_defer_passes = 0
+            req.prefetch_defer_since = time.monotonic()
+            _note_prefetch_gate("deferred")
+            _note_prefetch_gate("deferred_shortfall")
+            # L14, edge-triggered: the FIRST deferral only, never per pass.
+            logger.warning(
+                "#1068 PREFETCH DEFERRED rid=%s reason=%s attempt=%d span=%d "
+                "site=%s -- the group trim cut this read (#1298 S1, a MIN-"
+                "reduced fact on every rank); the X gate holds it pending "
+                "instead of pricing the whole prompt",
+                rid,
+                _DEFER_REASON_SHORTFALL,
+                1,
+                -1 if span is None else int(span),
+                site,
+            )
+            return "deferred"
+        req.prefetch_defer_attempts = int(getattr(req, "prefetch_defer_attempts", 0)) + 1
+        req.prefetch_defer_passes = int(getattr(req, "prefetch_defer_passes", 0)) + 1
+        waited = time.monotonic() - float(getattr(req, "prefetch_defer_since", 0.0))
+        bound = self._deferred_prefetch_bound_s(span or 0)
+        if waited > bound:
+            req.prefetch_deferred = None
+            _note_prefetch_gate("defer_expired")
+            logger.warning(
+                "#1068 PREFETCH DEFER EXPIRED rid=%s waited_s=%.1f bound_s=%.1f "
+                "attempts=%d span=%d reason=%s -- the read was cut again after "
+                "the bound; admitted and priced as it stands, so a staging pool "
+                "that never frees cannot hold the queue forever",
+                rid,
+                waited,
+                bound,
+                int(req.prefetch_defer_attempts),
+                -1 if span is None else int(span),
+                _DEFER_REASON_SHORTFALL,
+            )
+            return "expired"
+        return "deferred"
+
     def _clear_prefetch_deferral_fields(self, req) -> bool:
         """Reset every A12.2 field on ``req``. Returns True when a mark or a
         landed-hold was standing, so the caller can count and name the exit
@@ -6199,16 +6364,35 @@ class Scheduler(
                 else 0
             )
         )
-        reason = self._prefetch_deferral_refusal_reason()
-        if reason is not None:
-            for req in marked:
-                self._drop_prefetch_deferral(req, reason, site="retry")
-            return 0
+        # #1298 (S4): THE REFUSAL IS PER MARK REASON, because it is now per
+        # reason at its source. A `rate_limited` mark still meets
+        # `symmetric_vote` and is still dropped by name; a `host_pool_shortfall`
+        # mark does not, because the #580 vote is the very thing that made it
+        # uniform. Read LIVE per pass, never cached, exactly as before.
+        #
+        # THE RETRY SET IS RANK-IDENTICAL BY CONSTRUCTION, which is the whole
+        # reason this may run at all: every mark below was written from
+        # MIN-reduced values (S1), the queue holds the same rids on every rank
+        # of group D, the refusal predicate reads only phase/tree terms that
+        # are uniform across a phase, and the order is `kv_arrival_seq`, which
+        # is assigned once at intake and is rank-uniform by its own comment.
+        # So every rank walks into `prefetch_from_storage` -- and therefore
+        # into the #580 participation vote -- with the same set, in the same
+        # order. That is the property `symmetric_vote` exists to protect, met
+        # rather than bypassed.
+        retried = 0
         for req in marked:
+            reason = self._prefetch_deferral_refusal_reason(
+                str(getattr(req, "prefetch_deferred", None) or _DEFER_REASON_RATE)
+            )
+            if reason is not None:
+                self._drop_prefetch_deferral(req, reason, site="retry")
+                continue
             verdict = self._prefetch_kvcache(req)
             req._969c_verdict = verdict
             self._apply_prefetch_deferral(req, verdict, site="retry")
-        return len(marked)
+            retried += 1
+        return retried
 
     def _admission_held_for_deferred_prefetch(self, req) -> bool:
         """True when the admission loop must skip ``req`` this pass.
@@ -9720,26 +9904,35 @@ class Scheduler(
         verdict = tp_head_congruence.x_completion_verdict(pending_ms, bound_s)
         n = getattr(self, "_weg2_x_defer_passes", 0) + 1
         self._weg2_x_defer_passes = n
+        # #1298 (S3): NAME WHICH PENDING THIS IS. `prefetch_pending` (the read
+        # is in flight) and `host_pool_shortfall` (the read landed CUT and a
+        # re-issue is owed) are answered by the same predicate and fixed by
+        # different things, so a boot census that cannot tell them apart cannot
+        # read gate 1 of the #1298 ticket. The mark is the discriminator and it
+        # is group-agreed; absent a mark the read is simply still in flight.
+        _defer_reason = getattr(req, "prefetch_deferred", None) or "prefetch_pending"
         if verdict == tp_head_congruence.X_DEFER:
             if n <= 5 or n % 200 == 0:
                 logger.info(
-                    "WEG2 X-DEFER rid=%s reason=prefetch_pending age_s=%.2f "
+                    "WEG2 X-DEFER rid=%s reason=%s age_s=%.2f "
                     "bound_s=%.2f replicated_term=group verdict=defer "
                     "held_passes=%d (the store read for this request is still in "
-                    "flight on at least one rank; pricing it now is the "
-                    "uncached=whole-prompt W31 of boot weg2sc3. Denominator: "
-                    "every pass in which any request was found pending)",
-                    str(getattr(req, "rid", "?"))[:16], pending_ms / 1000.0,
-                    bound_s, n,
+                    "flight on at least one rank, or landed cut and is owed a "
+                    "re-issue; pricing it now is the uncached=whole-prompt W31 "
+                    "of boot weg2sc3. Denominator: every pass in which any "
+                    "request was found pending)",
+                    str(getattr(req, "rid", "?"))[:16], _defer_reason,
+                    pending_ms / 1000.0, bound_s, n,
                 )
             return True
         logger.info(
-            "WEG2 X-DEFER rid=%s reason=prefetch_pending age_s=%.2f bound_s=%.2f "
+            "WEG2 X-DEFER rid=%s reason=%s age_s=%.2f bound_s=%.2f "
             "replicated_term=group verdict=bound_expired held_passes=%d (the "
             "group's youngest store-read timer outlived the span's own "
             "length-priced bound, so the request is priced as it stands and W31 "
             "may fire honestly)",
-            str(getattr(req, "rid", "?"))[:16], pending_ms / 1000.0, bound_s, n,
+            str(getattr(req, "rid", "?"))[:16], _defer_reason,
+            pending_ms / 1000.0, bound_s, n,
         )
         return False
 

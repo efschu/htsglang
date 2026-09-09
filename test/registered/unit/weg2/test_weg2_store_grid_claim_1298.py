@@ -90,6 +90,7 @@ os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 import torch
 from sglang.srt.managers.cache_controller import resolve_draft_claim
 from sglang.srt.mem_cache import match_refusal_census as census_mod
+from sglang.srt.mem_cache.hicache_collective import HiCacheCollectiveDesyncError
 from sglang.srt.mem_cache.hicache_storage import (
     HiCacheFile,
     HiCacheStorageConfig,
@@ -372,10 +373,19 @@ class _FakeHostPool:
 
 
 def _cache_stub(available, peer_votes, page=PAGE, threshold=THRESHOLD, chunk=CHUNK,
-                symmetric=True):
+                symmetric=True, peer_spans=None):
     """A ``UnifiedRadixCache`` stand-in driving the REAL
     ``prefetch_from_storage``, with a reduce stub that MINs this rank's vote
-    against ``peer_votes``."""
+    against ``peer_votes``.
+
+    #1298 (S1): the stub now reduces EVERY slot the real payload carries, not
+    just the length at index 2.  ``peer_spans`` is what the OTHER ranks entered
+    the vote with; ``None`` means they entered with the same span as this rank,
+    which is the uniform case and the behaviour every pre-#1298 caller relied
+    on.  Reducing only index 2 would have left the span slots holding this
+    rank's own numbers, i.e. silently modelled a one-rank group on exactly the
+    arm whose whole subject is disagreement between ranks.
+    """
     pool = _FakeHostPool(available)
     registered = {}
 
@@ -383,6 +393,13 @@ def _cache_stub(available, peer_votes, page=PAGE, threshold=THRESHOLD, chunk=CHU
         assert label == "prefetch_participation_vote"
         stub.votes.append(int(t[2].item()))
         t[2] = min([int(t[2].item())] + [int(v) for v in peer_votes])
+        if t.numel() > 4:
+            mine = int(t[3].item())
+            spans = [mine] + [
+                int(s) for s in (peer_spans if peer_spans is not None else [])
+            ]
+            t[3] = min(spans)
+            t[4] = min(-s for s in spans)
         return t
 
     def _prefetch(req_id, host_indices, prefetch_key, last_hash, prefix_keys,
@@ -791,3 +808,105 @@ def test_c1_the_real_d_side_chain_from_a_published_prefix_is_not_zero():
             "and the uncovered draft rows are NAMED for the #993 zero fill, "
             "never silently claimed"
         )
+
+
+# ================================================================= #1298 (S1)
+# The group-agreed truncation fact: the pre-vote SPAN rides the participation
+# vote, so `group_len < span` is computed from two REDUCED values on every
+# rank instead of from one reduced and one rank-local one.
+#
+# RED ON `fe867c601a`: the payload is three slots wide there, so slots 3/4 do
+# not exist and the trim condition still reads this rank's own
+# `len(prefetch_key)`.
+def test_s1_the_payload_carries_the_span_both_ways_beside_the_length():
+    """The contract as a shape: MIN yields the low end directly and the high
+    end through the negation, exactly as the tag already does in slots 0/1."""
+    seen = {}
+
+    def _capture(t, op, label):
+        assert label == "prefetch_participation_vote"
+        seen["numel"] = int(t.numel())
+        seen["span"] = int(t[3].item())
+        seen["neg_span"] = int(t[4].item())
+        return t
+
+    tree = _cache_stub(available=100000, peer_votes=[])
+    tree._all_reduce_attn_groups = _capture
+    _issue(tree, "rid-shape", 5000)
+    assert seen["numel"] == 5, f"payload is {seen['numel']} slots, expected 5"
+    assert seen["span"] == 5000
+    assert seen["neg_span"] == -5000, (
+        "slot 4 must be the NEGATED span so one MIN yields both ends"
+    )
+
+
+def test_s1_one_short_rank_cuts_the_group_and_the_rank_with_room_agrees():
+    """THE PHYSICS, and why a shortfall BIT would have been wrong arithmetic.
+
+    ``group_len`` is a MIN, so ONE short rank drags every rank's registered
+    span down: the read IS cut, for the group.  The group fact is therefore
+    the OR over ranks ("someone was short"), which is exactly what
+    ``group_len < span`` computes -- not the AND that a MIN over a raw
+    shortfall bit would have produced.
+
+    THIS rank has room for all 8,000 and is not short; a peer voted 4,096.
+    The rank with room must still register the cut span and must count the
+    GROUP truncation, or the fact would be rank-local and the mark could
+    diverge -- which is the hazard the whole arm exists to avoid.
+    """
+    tree = _cache_stub(available=100000, peer_votes=[4096])
+    delta = _issue(tree, "rid-one-short", 8000)
+    assert tree.registered["rid-one-short"].key_len == 4096
+    assert delta.get("host_pool_truncated_group") == 1, delta
+    assert delta.get("host_pool_truncated") == 1, (
+        "the group key must stand BESIDE the existing one, not replace it"
+    )
+
+
+def test_s1_no_shortfall_anywhere_is_not_a_truncation():
+    """The negative arm, so the counter above is not simply always bumped."""
+    tree = _cache_stub(available=100000, peer_votes=[8000])
+    delta = _issue(tree, "rid-whole", 8000)
+    assert tree.registered["rid-whole"].key_len == 8000
+    assert "host_pool_truncated_group" not in delta, delta
+    assert "host_pool_truncated" not in delta, delta
+
+
+def test_s1_a_span_split_between_ranks_is_a_named_stop():
+    """THE CAN-FAIL AGAINST THE HAZARD, and why the mark is safe to hang.
+
+    Two ranks agree a LENGTH and entered with different SPANS: each would trim
+    its own key to ``group_len`` and register a different token range under one
+    rid.  Lengths agree, contents do not, and every length-based reduce
+    downstream would report agreement.  The group stops by name rather than
+    reconciling a span nobody voted for.
+    """
+    tree = _cache_stub(available=100000, peer_votes=[4096], peer_spans=[7000])
+    with pytest.raises(HiCacheCollectiveDesyncError) as exc:
+        _issue(tree, "rid-split", 8000)
+    msg = str(exc.value)
+    assert "W55 Weg2PrefetchSpanSplit" in msg, msg
+    assert "min=7000" in msg and "max=8000" in msg, msg
+    assert "rid-split" not in tree.registered, (
+        "a request must never register on a split span"
+    )
+
+
+def test_s1_a_declining_peer_still_takes_the_existing_vote_negative_exit():
+    """WHY THE STOP SITS BELOW THE THRESHOLD RETURN.
+
+    An INELIGIBLE rank enters this vote carrying nothing (``scheduler.py``:
+    "enter the vote carrying nothing"), so its span is 0.  A span check placed
+    ABOVE the threshold return would fire on that -- the most ordinary
+    condition in the system -- instead of on a real split.  Below the return,
+    ``group_len >= threshold > 0`` proves every rank was eligible AND
+    allocated, so only real spans are ever compared.
+
+    Here the peer declines (votes 0, span 0).  The exit must be the EXISTING
+    ``vote_negative``, never the new STOP.
+    """
+    tree = _cache_stub(available=100000, peer_votes=[0], peer_spans=[0])
+    delta = _issue(tree, "rid-inelig", 8000)
+    assert "rid-inelig" not in tree.registered
+    assert delta.get("vote_negative") == 1, delta
+    assert "host_pool_truncated_group" not in delta, delta

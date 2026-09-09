@@ -3774,8 +3774,39 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 if (eligible and not alloc_failed and host_indices is not None)
                 else 0
             )
+            # #1298 (S1) SLOTS 3 AND 4: THIS RANK'S PRE-VOTE SPAN, AND ITS
+            # NEGATION, SO THE GROUP CAN READ BOTH ENDS OUT OF ONE MIN.
+            #
+            # WHY A SPAN AND NOT A "WAS I SHORT" BIT. The truncation the X gate
+            # must wait for is `group_len < len(prefetch_key)` (below), and
+            # `group_len` is already group-agreed. The half that was NOT was
+            # `len(prefetch_key)`: it comes from the caller's rank-local match
+            # (`scheduler.py:5137`, `_matched_len = len(req.prefix_indices) +
+            # req.host_hit_length`, rank-local under uneven DCP by the comment
+            # twelve lines above it). So the fix is not to add a redundant bit
+            # beside the condition -- it is to make the condition's own second
+            # term group-agreed. Voting the span does that and adds no new
+            # quantity to reason about.
+            #
+            # AND A BIT WOULD HAVE BEEN WRONG ARITHMETIC. MIN over a raw
+            # shortfall bit is an AND ("every rank was short"), and the group
+            # read is cut when ANY rank is short, because `group_len` is a MIN:
+            # one short rank drags every rank's registered span down. The OR is
+            # what `group_len < span` already computes, so the bit would have
+            # been both redundant and, in its natural MIN form, inverted.
+            #
+            # MIN gives the low end directly and the high end through the
+            # negation, exactly as slots 0/1 already carry the tag both ways.
+            local_span = len(prefetch_key)
             vote = torch.tensor(
-                [_PREFETCH_VOTE_TAG, -_PREFETCH_VOTE_TAG, local_len], dtype=torch.int
+                [
+                    _PREFETCH_VOTE_TAG,
+                    -_PREFETCH_VOTE_TAG,
+                    local_len,
+                    local_span,
+                    -local_span,
+                ],
+                dtype=torch.int,
             )
             self._all_reduce_attn_groups(
                 vote,
@@ -3820,7 +3851,49 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 if anchor_lock_params is not None:
                     self.dec_host_lock_ref(last_host_node, anchor_lock_params)
                 return
-            if group_len < len(prefetch_key):
+            # #1298 (S1) THE SPAN AGREEMENT, AND WHY IT IS SAFE TO TAKE HERE.
+            #
+            # PLACED AFTER THE THRESHOLD RETURN ON PURPOSE. An INELIGIBLE rank
+            # enters this vote carrying an empty token list
+            # (`scheduler.py:5268`: "enter the vote carrying nothing"), so its
+            # span is 0 and a span check above the threshold return would fire
+            # on the most ordinary condition in the system. Past that return
+            # the population is provably clean: `group_len >= prefetch_threshold
+            # > 0` and `local_len` is 0 on any rank that was ineligible or did
+            # not allocate, so a MIN at or above the threshold proves EVERY
+            # rank was eligible AND allocated. Only real spans are compared.
+            span_lo = int(vote[3].item())
+            span_hi = -int(vote[4].item())
+            if span_lo != span_hi:
+                # W55 Weg2PrefetchSpanSplit -- NAMED STOP, NEVER COMPENSATION.
+                # Same detector shape and same class as the two raises above.
+                # The ranks agreed on a LENGTH to register and disagreed about
+                # WHICH TOKENS it covers: each would trim its own key to
+                # `group_len` and register a different token range under one
+                # rid, so the store keys diverge while every length-based
+                # reduce downstream reports agreement. That is the #580 family
+                # -- ranks acting on different facts -- and the law is to stop,
+                # not to reconcile a span nobody voted for.
+                raise HiCacheCollectiveDesyncError(
+                    "W55 Weg2PrefetchSpanSplit: the ranks entered "
+                    "prefetch_participation_vote with DIFFERENT pre-vote spans "
+                    f"(min={span_lo} max={span_hi}) for rid={str(req_id)[:8]} "
+                    f"while agreeing a group length of {group_len}. Every rank "
+                    "is past the eligibility threshold here, so these are real "
+                    "spans, and they differ only if the ranks disagree about "
+                    "how much prefix they already hold (`_matched_len` in "
+                    "Scheduler._prefetch_kvcache). Trimming each rank's own key "
+                    "to the group length would register a different token range "
+                    "per rank under one rid. Fix the match divergence; do not "
+                    "reconcile the span here."
+                )
+            # #1298 (S1) THE GROUP-AGREED TRUNCATION FACT. Both terms are now
+            # reduced values, identical on every rank by construction, so every
+            # rank takes or does not take the branch below TOGETHER -- which is
+            # what lets the scheduler hang a deferral mark on it without a
+            # rank-divergent marked set entering this very vote on the retry.
+            truncated_group = group_len < span_lo
+            if truncated_group:
                 # #1290 (D leg 2) GROUP TRIM. Counted and spoken under the SAME key and
                 # line as the non-symmetric truncation (`host_pool_truncated`
                 # stands beside `issued`, never a decline): the span is cut
@@ -3832,6 +3905,18 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 # hit policy, resolved from the pages actually fetched).
                 _note_prefetch_gate(
                     "host_pool_truncated", len(prefetch_key) - group_len
+                )
+                # #1298 (S2) THE PUBLICATION CHANNEL, and it is the census the
+                # scheduler ALREADY samples as a per-call delta -- not a second
+                # bookkeeping. A SEPARATE key from `host_pool_truncated` on
+                # purpose: that one is also bumped by the NON-symmetric site
+                # (:3614), where the cut is a rank-local decision and no group
+                # fact exists to defer on. Only this site, past the consensus
+                # and past the span agreement, can promise the scheduler a
+                # verdict that is identical on every rank. `host_pool_truncated`
+                # keeps its meaning and its denominator untouched.
+                _note_prefetch_gate(
+                    "host_pool_truncated_group", len(prefetch_key) - group_len
                 )
                 self._log_prefetch_truncated(req_id, need, group_len)
                 if len(host_indices) > group_len:
