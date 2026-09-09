@@ -1360,10 +1360,15 @@ class TheFingerprintOfThePointerIsChecked(unittest.TestCase):
         import inspect
 
         src = inspect.getsource(cg.rig_hardware_fingerprint)
-        self.assertIn("rig_fingerprint", src)
-        self.assertNotIn("import live_fingerprint", src)
+        self.assertIn("import rig_fingerprint", src)
+        self.assertNotIn("live_fingerprint(", src)
+        # THE CALL, not the word: the site keeps a comment naming
+        # ``live_fingerprint`` as what it used to call, and an assertion that
+        # cannot tell a call from the sentence explaining the call is a guard
+        # that fails on its own documentation (it did, first run).
         resolve = inspect.getsource(cg._resolve_transient_mib)
-        self.assertNotIn("live_fingerprint", resolve)
+        self.assertNotIn("live_fingerprint(", resolve)
+        self.assertIn("rig_hardware_fingerprint()", resolve)
 
 
 if __name__ == "__main__":
