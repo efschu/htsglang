@@ -565,20 +565,48 @@ def seam_backoff_skips(consecutive_abandons: int, backoff_max: int) -> int:
 
 
 def _seam_staging_reserve_bytes(server_args) -> int:
-    """The user reserve, minus the band tolerance the seam may transiently use.
+    """The corridor floor this card must keep free while the seam runs, BYTES.
 
-    Returns BYTES. Falls back to the reserve itself if the band cannot be
-    read, which is the previous behaviour and the safe direction: a seam that
-    reserves too much refuses a flip, while one that reserves too little
-    breaches the law it is supposed to respect.
+    #1257c. This used to read ``rank_user_reserve_mib or 1024`` and apply the
+    band tolerance to it -- a FOURTH private copy of the law, and one that
+    conflated two quantities the user has now separated: the engine's own
+    transient (measured, per card) and the operator's external headroom (the
+    knob, default 0). Reading the reserve alone would have silently become
+    ``0`` here the moment the default moved, and a seam that reserves nothing
+    is precisely the ``cuMemCreate failed: CUDA_ERROR_OUT_OF_MEMORY`` this
+    module exists to avoid.
+
+    So it asks the ONE derivation instead, and takes ``verdict_floor_mib`` --
+    the same number the corridor verdict is graded against, tolerance included
+    where it applies and excluded where the transient is measured. Any failure
+    falls back to that function's own fallback (1024 + reserve), which is the
+    previous behaviour and the safe direction: a seam that reserves too much
+    refuses a flip, while one that reserves too little breaches the law it is
+    supposed to respect.
     """
-    reserve_mib = int(getattr(server_args, "rank_user_reserve_mib", None) or 1024)
     try:
-        from sglang.srt.managers.corridor_guard import CORRIDOR_BAND_FRACTION
+        from sglang.srt.managers.corridor_guard import corridor_floor_mib
 
-        floor_mib = int(round(reserve_mib * (1.0 - CORRIDOR_BAND_FRACTION)))
-    except Exception:  # pragma: no cover - the band must never break a boot
-        floor_mib = reserve_mib
+        reserve_mib = 0
+        scalar = getattr(server_args, "user_reserve_mib_scalar", None)
+        if callable(scalar):
+            reserve_mib = int(scalar())
+        uuid = ""
+        try:
+            from sglang.srt.registry import nvml as registry_nvml
+
+            uuid = registry_nvml.current_device_uuid() or ""
+        except Exception:  # pragma: no cover - NVML availability
+            uuid = ""
+        floor = corridor_floor_mib(uuid, user_reserve_mib=reserve_mib)
+        floor_mib = int(floor.verdict_floor_mib)
+    except Exception:  # pragma: no cover - the floor must never break a boot
+        from sglang.srt.managers.corridor_guard import (
+            CORRIDOR_BAND_FRACTION,
+            CORRIDOR_LAW_MIB,
+        )
+
+        floor_mib = int(round(CORRIDOR_LAW_MIB * (1.0 - CORRIDOR_BAND_FRACTION)))
     return max(0, floor_mib) * 1024 * 1024
 
 

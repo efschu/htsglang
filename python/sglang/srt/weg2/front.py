@@ -71,7 +71,9 @@ from aiohttp import (
 from sglang.srt.managers.corridor_guard import (
     corridor_band_ceiling_mib,
     corridor_band_floor_mib,
+    corridor_floor_mib,
 )
+from sglang.srt.managers.corridor_guard import USER_RESERVE_ENV
 from sglang.srt.managers.weg2_memory_saver import (
     WEIGHT_CHUNK_PREFIX,
     credit_epoch,
@@ -1048,18 +1050,63 @@ def corridor_instrument(cards: List[CardFree]) -> str:
     return CORRIDOR_INSTRUMENT
 
 
-def corridor_verdict(free_mib: int) -> str:
-    """``IN`` / ``BELOW`` / ``ABOVE`` against the corridor band IN FORCE.
+#: The user reserve this front was launched with, ``{card_uuid: MiB}``.
+#: Injected by the launcher; empty means 0 on every card, which is the default
+#: since #1257c. The NAME is the guard's, imported and not repeated.
+RESERVE_ENV = USER_RESERVE_ENV
 
-    Graded on ALLOCATABLE free only.  Inclusive at both edges: the default
-    band is 819-1229 MiB, so 819 and 1229 are IN and 818 / 1230 are not --
-    and if the law is moved (``SGLANG_CORRIDOR_LAW_FLOOR_MIB``) this verdict
-    moves with it, because the edges come from the guard on every call.
+
+def _reserve_by_card() -> Dict[str, int]:
+    raw = os.environ.get(RESERVE_ENV)
+    if not raw:
+        return {}
+    try:
+        return {str(k): max(0, int(v)) for k, v in json.loads(raw).items()}
+    except Exception:  # noqa: BLE001 - a malformed hint is no reserve, loudly
+        logger.warning("WEG2-CORRIDOR %s=%r is unreadable; reserve read as 0", RESERVE_ENV, raw)
+        return {}
+
+
+def corridor_floor_for_card(card_uuid: str, group: str):
+    """This card's derived corridor floor, for the group AWAKE on it.
+
+    #1257c.  THE FLOOR IS NO LONGER RIG-UNIFORM and it is no longer a hand
+    number: it is ``measured transient peak(awake group) + user reserve``, and
+    where the transient is not measured it is the named
+    ``UNMEASURED-FALLBACK`` 1024 -- which grades and prints but may never
+    actuate a budget cut.  Read from ``managers.corridor_guard``, the ONE
+    declaration, on every call, for the same reason the band always was: a
+    value frozen here cannot follow an override.
     """
-    floor, ceil = corridor_band_mib()
-    if free_mib < floor:
+    return corridor_floor_mib(
+        card_uuid,
+        group=group,
+        user_reserve_mib=_reserve_by_card().get(card_uuid, 0),
+    )
+
+
+def corridor_verdict(free_mib: int, floor=None) -> str:
+    """``IN`` / ``BELOW`` / ``ABOVE`` against the corridor floor IN FORCE.
+
+    Graded on ALLOCATABLE free only.  Inclusive at both edges.
+
+    #1257c.  ``floor`` is a :class:`~sglang.srt.managers.corridor_guard.CorridorFloor`
+    for THIS card; passing none keeps the pre-#1257c rig-wide band (819-1229
+    at the stated law), which is what a caller without a card identity can
+    honestly grade against.
+
+    ``ABOVE`` IS A FINDING, NOT A FAIL (user decision, 2026-09-09, consequence
+    5).  It says MiB are sitting unmobilised; it never fails an acceptance on
+    its own.  Consumers print it as ``unmobilised_free_mib=`` and must not
+    turn it into a problem -- see :func:`corridor_arm.arm_report`.
+    """
+    if floor is None:
+        lo, hi = corridor_band_mib()
+    else:
+        lo, hi = floor.verdict_floor_mib, floor.ceiling_mib
+    if free_mib < lo:
         return "BELOW"
-    if free_mib > ceil:
+    if free_mib > hi:
         return "ABOVE"
     return "IN"
 
@@ -1199,6 +1246,10 @@ class Front:
         #: before the first sample is not blank; every sample overwrites it with
         #: what that read actually was.
         self.corridor_instrument: str = CORRIDOR_INSTRUMENT
+        #: #1257c: ``{card_uuid: CORRIDOR-FLOOR provenance line}`` from the
+        #: last sample. Empty until the first one -- never a nominal
+        #: constant, for the same reason ``corridor_instrument`` is not.
+        self.corridor_floors: Dict[str, str] = {}
         self.flip_log: List[dict] = []
         # ---- #1262 TIER 3: the flip's own stall detector ------------------
         # Deadman tier 1 (a process exists) and tier 2 (/health_generate) both
@@ -1899,6 +1950,13 @@ class Front:
             # the corridor guard, read now.
             "corridor_instrument": self.corridor_instrument,
             "corridor_band_mib": list(corridor_band_mib()),
+            # #1257c: the DERIVED per-card floor and both of its terms, so a
+            # machine reader gets the same provenance the log line carries and
+            # never has to assume the rig-wide band above still describes the
+            # verdict.  ``corridor_band_mib`` stays for compatibility and is
+            # the pre-#1257c rig-wide band, which is NOT what a verdict is
+            # taken against when a card's transient is measured.
+            "corridor_floor": dict(self.corridor_floors),
             "flips": self.flip_log[-20:],
             "dc_measured_d_mib": self.dc_measured_d,
             "uptime_s": round(time.time() - self.t0, 1),
@@ -4026,20 +4084,39 @@ class Front:
             self.corridor_min[phase][c.nvml_index] = (
                 c.free_mib if cur is None else min(cur, c.free_mib)
             )
+        # #1257c: ONE floor per card, derived, with its provenance in the
+        # line.  The band is no longer rig-uniform, so a single ``band=``
+        # token can no longer describe the sample and each card carries its
+        # own ``floor=``/``source=``/``reserve=``.  ``band=`` stays for the
+        # log parsers that key on it (``ring_table``, ``corridor_arm``) and
+        # now reports the SPAN of the per-card floors, which is what it
+        # honestly is when they differ.
+        floors = {c.uuid: corridor_floor_for_card(c.uuid, phase) for c in cards}
         per_card = " ".join(
             f"nvml{c.nvml_index}:free={c.free_mib}MiB reserved={c.reserved_mib}MiB "
-            f"verdict={corridor_verdict(c.free_mib)}"
+            f"floor={floors[c.uuid].mib}MiB source={floors[c.uuid].source} "
+            f"reserve={floors[c.uuid].reserve_mib}MiB "
+            f"verdict={corridor_verdict(c.free_mib, floors[c.uuid])}"
+            + (
+                f" unmobilised_free_mib={c.free_mib - floors[c.uuid].ceiling_mib}"
+                if c.free_mib > floors[c.uuid].ceiling_mib
+                else ""
+            )
             for c in cards
         )
         instrument = corridor_instrument(cards)
         self.corridor_instrument = instrument
-        floor, ceil = corridor_band_mib()
+        self.corridor_floors = {u: f.line for u, f in floors.items()}
+        lo = min(f.verdict_floor_mib for f in floors.values())
+        hi = max(f.ceiling_mib for f in floors.values())
         line = (
             f"WEG2-CORRIDOR phase={phase}(awake) epoch={self.epoch} "
-            f"instrument={instrument} band={floor}-{ceil}MiB "
+            f"instrument={instrument} band={lo}-{hi}MiB "
             f"{per_card} min_so_far={dict(self.corridor_min[phase])} ({instrument}, MiB)"
         )
         logger.info("%s", line)
+        for f in floors.values():
+            logger.info("%s", f.line)
         return line
 
     async def corridor_sampler(self) -> None:

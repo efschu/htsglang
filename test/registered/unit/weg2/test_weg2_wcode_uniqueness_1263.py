@@ -309,16 +309,27 @@ class TestOneWCodePerException(CustomTestCase):
         c = census()
         self.assertEqual(set(c["W52"]), {"Weg2NoServiceableRoute"})
 
-    def test_the_corridor_codes_are_w53_and_w54_alone(self):
+    def test_the_corridor_codes_are_w54_w55_w56_alone(self):
+        """#1257c. W53 was claimed on the base by #1291's
+        ``W53 Weg2StoreHandbackFailed`` between #1257's enumeration and its
+        merge, so on the merged tree the two contradicted each other: this
+        census sees both forms since the CONCAT hardening. The corridor pass
+        renumbered to W55 (enumerated free against this same census) and the
+        older claim keeps W53. W56 is the new verdict-only floor refusal."""
         c = census()
-        self.assertEqual(set(c["W53"]), {"Weg2CorridorBudgetWouldBind"})
+        self.assertEqual(set(c["W53"]), {"Weg2StoreHandbackFailed"})
         self.assertEqual(set(c["W54"]), {"Weg2CorridorBudgetUnpriced"})
+        self.assertEqual(set(c["W55"]), {"Weg2CorridorBudgetWouldBind"})
+        self.assertEqual(set(c["W56"]), {"Weg2CorridorFloorUnmeasured"})
         # and the label is not built by concatenation, because that is what
         # hid the previous claim from this very census.
         from sglang.srt.weg2 import corridor_budget as cb
 
         self.assertEqual(cb.UNPRICED_NAME, "W54 Weg2CorridorBudgetUnpriced")
-        self.assertEqual(cb.WOULD_BIND_NAME, "W53 Weg2CorridorBudgetWouldBind")
+        self.assertEqual(cb.WOULD_BIND_NAME, "W55 Weg2CorridorBudgetWouldBind")
+        self.assertEqual(
+            cb.UNMEASURED_FLOOR_NAME, "W56 Weg2CorridorFloorUnmeasured"
+        )
 
     def test_the_chosen_number_was_free_and_the_free_ones_are_named(self):
         """W50 is not 'the next one': it is the first free number above the
@@ -330,7 +341,9 @@ class TestOneWCodePerException(CustomTestCase):
         # #1257 renumbered to W54 by enumerating this same census. The numbers
         # below stayed free through both renumbers and are the next candidates.
         self.assertIn(54, used, "W54 is the corridor pass's number now")
-        for n in (15, 18, 23, 39):
+        self.assertIn(55, used, "W55 is the would-bind refusal's number now")
+        self.assertIn(56, used, "W56 is the unmeasured-floor refusal's number")
+        for n in (14, 15, 23, 39):
             self.assertNotIn(n, used, f"W{n} was named free and is not")
 
 

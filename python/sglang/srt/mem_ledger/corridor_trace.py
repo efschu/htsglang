@@ -76,7 +76,34 @@ DEFAULT_CAPACITY = 18000
 #: from there; this value exists so that an instrument can still report a
 #: verdict if that import is ever unavailable, and it is deliberately the
 #: same number so a fallback cannot change a verdict silently.
+#:
+#: #1257c: it is now also deliberately the same number the GUARD falls back to
+#: under ``UNMEASURED-FALLBACK``, and it is only ever reached when the guard
+#: itself cannot be imported -- so this copy can no longer disagree with a
+#: DERIVED floor either. Where the card is known, :func:`corridor_floor` reads
+#: the derivation instead and this constant is not consulted at all.
 _LAW_MIB_FALLBACK = 1024
+#: Printed instead of a bare number wherever the fallback is what answered, so
+#: a reader can tell a measured floor from a stated one at a glance.
+_LAW_SOURCE_FALLBACK = "UNMEASURED-FALLBACK"
+
+
+def corridor_floor(card_uuid: Optional[str], group: Optional[str] = None):
+    """This card's DERIVED corridor floor, or ``None`` when it cannot be had.
+
+    #1257c. The instrument grades against the same floor the guard hands the
+    gate: ``measured transient peak of the awake group + user reserve``, and
+    the named 1024 fallback where nothing measured it. Lazily imported for the
+    reason :func:`corridor_law_mib` is.
+    """
+    if not card_uuid:
+        return None
+    try:
+        from sglang.srt.managers.corridor_guard import corridor_floor_mib
+
+        return corridor_floor_mib(card_uuid, group=group)
+    except Exception:  # pragma: no cover - see _LAW_MIB_FALLBACK
+        return None
 
 
 def corridor_law_mib() -> int:
@@ -215,7 +242,24 @@ class CorridorTrace:
         instrument ends up reporting a different verdict from the gate it
         is meant to audit (#656).
         """
-        corridor_mib = corridor_law_mib() if corridor_mib is None else int(corridor_mib)
+        # #1257c: the DERIVED per-card floor first -- the same number the gate
+        # uses -- and the rig-wide stated law only where this trace does not
+        # know its card. A private copy of a threshold is how an instrument
+        # ends up reporting a different verdict from the gate it audits (#656),
+        # and a rig-wide copy of a now-per-card threshold is the same defect
+        # one level up.
+        corridor_source = "stated-law"
+        if corridor_mib is None:
+            derived = corridor_floor(self.card_uuid)
+            if derived is not None:
+                corridor_mib = int(derived.verdict_floor_mib)
+                corridor_source = derived.source
+            else:
+                corridor_mib = corridor_law_mib()
+                corridor_source = _LAW_SOURCE_FALLBACK
+        else:
+            corridor_mib = int(corridor_mib)
+            corridor_source = "caller-supplied"
         samples = list(self.samples)
         if not samples:
             return {"n": 0, "card_uuid": self.card_uuid}
@@ -224,6 +268,7 @@ class CorridorTrace:
         floor = min(free)
         return {
             "card_uuid": self.card_uuid,
+            "corridor_source": corridor_source,
             "n": len(samples),
             "span_s": round(span, 3),
             "period_ms": int(self.period_s * 1000),
@@ -243,8 +288,27 @@ class CorridorTrace:
             # the target" with "did the law hold": on this rig the cutover
             # transient sat at 895-935 MiB, which is 89-129 MiB from the
             # centre and comfortably inside the band.
-            "corridor_band_floor_mib": _band_floor_mib(corridor_mib),
-            "breach": bool(floor // MIB < _band_floor_mib(corridor_mib)),
+            # #1257c: a MEASURED floor has NO -20 % tolerance. The band exists
+            # because a hand-stated target needs slack; a measured transient
+            # peak is a physical requirement and slack below it is a breach
+            # with extra steps. ``corridor_mib`` already IS the guard's
+            # ``verdict_floor_mib`` when the floor was derived, so the band is
+            # applied only where the source says nothing measured it.
+            "corridor_band_floor_mib": (
+                int(corridor_mib)
+                if corridor_source.startswith("MEASURED")
+                or corridor_source == "ENV-OVERRIDE"
+                else _band_floor_mib(corridor_mib)
+            ),
+            "breach": bool(
+                floor // MIB
+                < (
+                    int(corridor_mib)
+                    if corridor_source.startswith("MEASURED")
+                    or corridor_source == "ENV-OVERRIDE"
+                    else _band_floor_mib(corridor_mib)
+                )
+            ),
             "margin_mib": floor // MIB - corridor_mib,
             "arena_backed_min_mib": min(s.kv_arena_backed_bytes for s in samples)
             // MIB,

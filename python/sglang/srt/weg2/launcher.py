@@ -55,6 +55,7 @@ import urllib.request
 from dataclasses import dataclass, field
 from typing import Dict, List, Mapping, Optional, Sequence, Tuple
 
+from sglang.srt.managers import corridor_guard
 from sglang.srt.weg2 import admin_key as admin_key_mod
 from sglang.srt.registry import nvml as nvml_registry
 from sglang.srt.weg2 import corridor_budget, host_ledger, ring_table
@@ -106,7 +107,20 @@ SHM_OWN_PREFIXES = (
 #: ~400 MiB below the budget line (CUDA context + BAR1 windows sit outside
 #: the --rank-gpu-memory-mib fraction).  The measured overshoot is charged
 #: here so the minimum lands mid-band; R5 grades the result.
-CORRIDOR_MIB = 1024 + 404
+#:
+#: SPLIT 2026-09-09 (#1257c). The 404 stays -- it is a measurement of THIS
+#: form (D's awake overshoot outside the --rank-gpu-memory-mib fraction) and
+#: nothing about the user decision touches it. The 1024 does not: it is now
+#: the DERIVED per-card floor from
+#: ``managers.corridor_guard.corridor_floor_mib`` = measured transient peak of
+#: the group awake on that card + that card's user reserve. Where nothing
+#: measured the transient the derivation returns the same 1024, stamped
+#: ``UNMEASURED-FALLBACK``, so an unmeasured rig at reserve 0 subtracts
+#: exactly 1428 here as before -- byte-identical, deliberately.
+D_AWAKE_OVERSHOOT_MIB = 404
+#: Kept as the name the pre-#1257c budget line printed, and as the value the
+#: fallback still produces. NEVER read as a floor: the floor is per card now.
+CORRIDOR_MIB = 1024 + D_AWAKE_OVERSHOOT_MIB
 #: Spec section 1.6 V1 (arm B, graphs resident) derived upper bounds for the
 #: dormant residue of a rank: 5090 1,848 MiB, 3080 1,442 MiB -- EXPECTATIONS
 #: (record 1d/1f B6), printed beside the measurement, used only for group P's
@@ -673,6 +687,24 @@ P_PREFILL_ACTIVATION_RESERVE_MIB = 1024.0
 #: arming floor, so the 1229 MiB stand-in over-charged by 205 MiB per rank.
 #: That was the only one of the four errors pointing the SAFE way.
 P_CORRIDOR_HOLDBACK_MIB = 1024.0
+
+#: FOLLOWS THE RESERVE SINCE #1257c. The runtime post this stands for
+#: (``model_runner_kv_cache_mixin._gapped_corridor_holdback``) IS the user
+#: reserve, and the reserve now defaults to 0 -- so on a default boot the
+#: runtime charges ``gapped corridor holdback=0.000`` and a pool model still
+#: carrying 1024.0 over-charges group P by a gibibyte PER RANK. The measured
+#: 1024.0 above is what BOTH reference boots emitted, and it is exactly what
+#: this expression still returns whenever the reserve is 1024. Derived, never
+#: re-typed: ``--pp-cut-corridor-holdback-mib`` takes it as its default and
+#: the operator can still pin it.
+def p_corridor_holdback_default_mib(user_reserve_mib=None) -> float:
+    """The 'gapped corridor holdback' post the boot will actually charge."""
+    from sglang.srt.mem_ledger.terms import DEFAULT_USER_RESERVE_MIB
+
+    if user_reserve_mib is None:
+        user_reserve_mib = DEFAULT_USER_RESERVE_MIB
+    return float(max(0, int(user_reserve_mib)))
+
 
 #: Device GDN state per linear layer per sequence SLOT, MiB. Recovered from
 #: `mamba state pool / (linear_layers * 20 slots)` on six rank readings:
@@ -3369,6 +3401,37 @@ def build_tms_preload(tree: str, venv: str, log: Log) -> str:
 #: refused the 84k prompt on boot weg2ls4b2 at limit=27466 of pool 30518).
 CARRIER_PREFETCH_FRACTION = 0.9
 
+def parse_user_reserve(raw, cards) -> Dict[str, int]:
+    """``--user-reserve-mib`` -> ``{card_uuid: MiB}``. Refuses, never guesses.
+
+    #1257c. A scalar applies to every card; a list is in NVML-ordinal order
+    and must have exactly one entry per card. KEYED BY UUID on the way out for
+    the reason every other per-card table in this file is: NVML enumeration is
+    not stable across boots, and an index-keyed reserve would silently move to
+    a different card the day the order shifts.
+    """
+    text = str(raw if raw is not None else 0).strip()
+    if not text:
+        return {c.uuid: 0 for c in cards}
+    try:
+        values = [int(part) for part in text.split(",")]
+    except ValueError:
+        raise SystemExit(
+            f"--user-reserve-mib must be an integer or a comma-separated list "
+            f"of integers, got {text!r}."
+        ) from None
+    if any(v < 0 for v in values):
+        raise SystemExit(f"--user-reserve-mib values must be >= 0, got {values}.")
+    if len(values) == 1:
+        values = values * len(cards)
+    if len(values) != len(cards):
+        raise SystemExit(
+            f"--user-reserve-mib has {len(values)} entries but this boot has "
+            f"{len(cards)} card(s); pass one value or exactly one per card."
+        )
+    return {c.uuid: v for c, v in zip(cards, values)}
+
+
 def budgets_from_dc(
     cards: List[Card],
     dc_mib: Dict[str, int],
@@ -3378,20 +3441,51 @@ def budgets_from_dc(
     overshoot_provenance: str = "",
     corridor_sample_path: Optional[str] = None,
     corridor_constrain: bool = False,
+    user_reserve_by_card: Optional[Dict[str, int]] = None,
 ) -> List[int]:
     out = []
+    # #1257c: ONE derivation, per card, for the group this budget is for.
+    # ``user_reserve_by_card`` is the operator's external headroom (default 0);
+    # it RAISES the floor and therefore lowers the budget by exactly as much,
+    # which is what the knob is for.
+    floors = corridor_budget.floors_for_cards(cards, label, user_reserve_by_card)
     for i, c in enumerate(cards):
         over = int(overshoot_mib[i]) if overshoot_mib is not None else 0
-        b = c.total_mib - CORRIDOR_MIB - dc_mib[c.uuid] - over
+        cf = floors[c.uuid]
+        corridor = int(cf.mib) + D_AWAKE_OVERSHOOT_MIB
+        b = c.total_mib - corridor - dc_mib[c.uuid] - over
         b = (b // 8) * 8
         out.append(b)
         log(
             f"budget {label} ordinal={i} nvml_idx={c.nvml_index} {c.name}: "
-            f"{b} MiB = total {c.total_mib} - corridor {CORRIDOR_MIB} - dormant_other {dc_mib[c.uuid]}"
+            f"{b} MiB = total {c.total_mib} - corridor {corridor} "
+            f"(floor {cf.mib} source={cf.source} reserve={cf.reserve_mib} "
+            f"+ awake_overshoot {D_AWAKE_OVERSHOOT_MIB}) "
+            f"- dormant_other {dc_mib[c.uuid]}"
             + (f" - measured_awake_overshoot {over} ({overshoot_provenance})" if over else "")
             + " MiB"
         )
+        log(cf.line)
     if not corridor_constrain:
+        return out
+    # #1257c THE INSTALL GATE. The corridor pass may lower a budget only where
+    # SOMEBODY PRICED THE FLOOR -- a measured transient, an explicit reserve,
+    # or a hand-set law. Where no card's floor actuates the pass is
+    # VERDICT-ONLY: it says so by name and returns the budgets byte-identical.
+    # (User decision 2026-09-09, consequences 3 and 4.)
+    if not any(f.actuates for f in floors.values()):
+        log(
+            f"WEG2-BUDGET corridor-constrained group={label} "
+            f"{corridor_budget.UNMEASURED_FLOOR_NAME}: no card's corridor floor "
+            f"is priced (every source is UNMEASURED-FALLBACK and every user "
+            f"reserve is 0), so the corridor pass is VERDICT-ONLY on this boot "
+            f"and every budget stands byte-identical "
+            f"({','.join(str(b) for b in out)} MiB). Measure the awake group's "
+            f"transient (scripts/vram_ledger/probe_activation.py ingest) or "
+            f"pass --rank-user-reserve-mib to make it actuate."
+        )
+        for cf in floors.values():
+            log(cf.line)
         return out
     # #1257 -- THE CORRIDOR LAW AS A HARD CONSTRAINT, applied here and nowhere
     # else so this function stays the one producer of a budget number.  The
@@ -3404,7 +3498,7 @@ def budgets_from_dc(
     # margin is the one the world pool is bound by.
     sample, why = corridor_budget.load_sample(corridor_sample_path)
     solve = corridor_budget.solve_corridor_budgets(
-        cards, out, dc_mib, sample, why, group=label
+        cards, out, dc_mib, sample, why, floors=floors, group=label
     )
     for line in solve.lines:
         log(line)
@@ -4913,6 +5007,7 @@ def solve_p_cut(
     model: str,
     log,
     chunk_tokens: int = 4096,
+    user_reserve_by_card: Optional[Dict[str, int]] = None,
 ) -> PCutFacts:
     """Group P's layer + attention cut, and the ONE provenance line for it.
 
@@ -4970,7 +5065,15 @@ def solve_p_cut(
         # tokens for the cut group P then sized at 304,655 (+64.1 %).
         stage_fixed_mib=tuple(_csv_floats(ns.pp_cut_stage_fixed_mib)),
         activation_reserve_mib=float(ns.pp_cut_activation_reserve_mib),
-        corridor_holdback_mib=float(ns.pp_cut_corridor_holdback_mib),
+        # #1257c: None = follow the reserve (the runtime charges exactly it);
+        # a number = the operator pinned it.
+        corridor_holdback_mib=(
+            p_corridor_holdback_default_mib(
+                max((user_reserve_by_card or {}).values() or [0])
+            )
+            if ns.pp_cut_corridor_holdback_mib is None
+            else float(ns.pp_cut_corridor_holdback_mib)
+        ),
         mamba_mib_per_linear_layer_per_slot=float(
             ns.pp_cut_mamba_mib_per_linear_layer_per_slot
         ),
@@ -5825,11 +5928,17 @@ def build_parser() -> argparse.ArgumentParser:
              f"It had no field at all before #1286.",
     )
     ap.add_argument(
-        "--pp-cut-corridor-holdback-mib", type=float,
-        default=P_CORRIDOR_HOLDBACK_MIB,
+        "--pp-cut-corridor-holdback-mib", type=float, default=None,
         help=f"The boot's 'gapped corridor holdback' post, MiB per rank "
-             f"(#1286). Default {P_CORRIDOR_HOLDBACK_MIB} = the 1.000 GiB it "
-             f"measured on every rank of both reference boots. This REPLACES "
+             f"(#1286). Default: FOLLOWS --user-reserve-mib, because that post "
+             f"IS the user reserve at the runtime end "
+             f"(model_runner_kv_cache_mixin._gapped_corridor_holdback) and the "
+             f"reserve defaults to 0 since #1257c. Both reference boots "
+             f"measured {P_CORRIDOR_HOLDBACK_MIB} = 1.000 GiB per rank, which "
+             f"is exactly what this returns at --user-reserve-mib 1024; a "
+             f"pinned {P_CORRIDOR_HOLDBACK_MIB} on a reserve-0 boot would "
+             f"over-charge group P by a gibibyte PER RANK against a runtime "
+             f"that charges 0.000. Pass a number to pin it. This REPLACES "
              f"--pp-cut-arming-floor-mib in the pool model's subtraction: the "
              f"runtime's post list charges this holdback and no arming floor "
              f"(the #676 floor is held back after the profiler and already "
@@ -5850,6 +5959,23 @@ def build_parser() -> argparse.ArgumentParser:
              # which the log line prints verbatim.
              + D_DECODE_STEPS_PROVENANCE.replace("%", "%%")
              + " Pass 1 to restore the shipped value.",
+    )
+    ap.add_argument(
+        "--user-reserve-mib", type=str, default="0",
+        help="#1257c. EXTERNAL headroom, MiB PER CARD: VRAM left free for YOUR "
+             "OTHER PROCESSES while this boot serves. A scalar applied to "
+             "every card, or a comma-separated list in NVML-ordinal order. "
+             "Default 0 (user decision 2026-09-09): the 1024 this used to "
+             "default to existed only because the engine could not price its "
+             "own transient, and it now can -- the corridor floor is "
+             "`measured transient peak of the awake group + THIS value`, per "
+             "card, printed with its provenance on every CORRIDOR-FLOOR line. "
+             "THE KNOB IS KEPT, deliberately, because the operator sometimes "
+             "runs other VRAM consumers beside the rig. A nonzero value here "
+             "raises that card's corridor floor by exactly as much, lowers its "
+             "--rank-gpu-memory-mib by exactly as much, and MAKES THE CORRIDOR "
+             "PASS ACTUATE on that card even when nothing measured the "
+             "transient -- an explicit reserve is a priced floor.",
     )
     ap.add_argument(
         "--corridor-budget-sample", default=corridor_budget.DEFAULT_SAMPLE_PATH,
@@ -6177,8 +6303,24 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         f"NVML per-process, windows included) + {slack_mib} MiB slack; spec 1.6 expectation was "
         f"{DC_EXPECT_5090_MIB}/{DC_EXPECT_3080_MIB} (exceeded); graded by W19 at D's first sleep: "
         + ", ".join(f"nvml{c.nvml_index}={dc_expect_d[c.uuid]}" for c in cards))
+    # #1257c: the operator's external headroom, resolved ONCE per boot and
+    # keyed by CARD UUID -- never by NVML index, which is not stable across
+    # boots on this rig. Everything downstream (both budget solves, the
+    # corridor floor, the front's sampler) reads THIS dict.
+    user_reserve_by_card = parse_user_reserve(ns.user_reserve_mib, cards)
+    log(
+        "user reserve (external, #1257c) = "
+        + ", ".join(
+            f"nvml{c.nvml_index}={user_reserve_by_card.get(c.uuid, 0)}MiB"
+            for c in cards
+        )
+        + " -- VRAM left free for processes OUTSIDE this engine; it raises "
+        "that card's corridor floor and lowers its budget by exactly as much"
+    )
     budgets_p = budgets_from_dc(
-        cards, dc_expect_d, log, "P", overshoot_mib=P_OVERSHOOT_MIB, overshoot_provenance="boot weg2ls2b2"
+        cards, dc_expect_d, log, "P", overshoot_mib=P_OVERSHOOT_MIB,
+        overshoot_provenance="boot weg2ls2b2",
+        user_reserve_by_card=user_reserve_by_card,
     )
     state.budgets["P"] = budgets_p
     # Same TRAIN 2 MERGE FIX as at ``form_argv_p`` below: everything past the
@@ -6194,7 +6336,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                      ns.p_hicache_write_policy, "P", ns.random_seed,
                      ns.barlink_bar1_cap_cycles, ns.collective_census_interval)
     )
-    cut = solve_p_cut(ns, cards, budgets_p, ns.model, log, chunk_tokens=chunk_tokens)
+    cut = solve_p_cut(
+        ns, cards, budgets_p, ns.model, log, chunk_tokens=chunk_tokens,
+        user_reserve_by_card=user_reserve_by_card,
+    )
     stage_ratio, attn_stage_ratio = cut.stage_ratio, cut.attn_stage_ratio
     # 1b' (moved here by the argv slice's FIX 2) -- P's PP LAYER SPLIT, of the
     # cut group P is ACTUALLY LAUNCHED WITH.  Read off PCutFacts, where
@@ -6608,7 +6753,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         log(f"DEVIATION (declared): {d}")
     launch_group(spec_p, tree, log, dry)
     if dry:
-        budgets_d = budgets_from_dc(cards, {c.uuid: dc_expect_d[c.uuid] + P_WINDOWS_MIB - D_WINDOWS_MIB for c in cards}, log, "D(dry, expectation)", corridor_sample_path=ns.corridor_budget_sample, corridor_constrain=True)
+        budgets_d = budgets_from_dc(cards, {c.uuid: dc_expect_d[c.uuid] + P_WINDOWS_MIB - D_WINDOWS_MIB for c in cards}, log, "D(dry, expectation)", corridor_sample_path=ns.corridor_budget_sample, corridor_constrain=True, user_reserve_by_card=user_reserve_by_card)
         d_ratio = d_tp_ratio_decision(
             ns.d_tp_objective, ns.d_rank_perf_tune, cards, budgets_d, ns.model, d_bs
         )
@@ -6675,6 +6820,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     budgets_d = budgets_from_dc(
         cards, dc_p, log, "D", overshoot_mib=D_OVERSHOOT_MIB, overshoot_provenance="boot weg2ls4b1",
         corridor_sample_path=ns.corridor_budget_sample, corridor_constrain=True,
+        user_reserve_by_card=user_reserve_by_card,
     )
     state.budgets["D"] = budgets_d
     d_ratio = d_tp_ratio_decision(
@@ -6863,6 +7009,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # to its own start time, which is boot-unique for the same reason.
     if ring_plan is not None and ring_plan.armed:
         fenv["TMS_HOST_RING_EPOCH"] = str(ring_plan.epoch)
+    # #1257c: DELIVERABLE 6 -- the front's corridor sampler and this launcher
+    # read THE SAME derived floor. The measured half already comes from one
+    # store (the activation footprint cache, keyed by the digest the boot
+    # publishes); the operator half is a launcher argument, so the front is
+    # TOLD it here rather than re-deriving it. The front then prints
+    # `floor=/source=/reserve=` per card on every WEG2-CORRIDOR line, and the
+    # boot's corridor VERDICT (`corridor_arm.arm_report`) grades against THAT
+    # LINE -- which is the shared surface, in one direction only, so the two
+    # cannot disagree.
+    if user_reserve_by_card:
+        fenv[corridor_guard.USER_RESERVE_ENV] = json.dumps(
+            {u: int(v) for u, v in user_reserve_by_card.items()}
+        )
     log("front argv: " + " ".join(shlex.quote(a) for a in front_argv))
     ffh = open(front_log, "ab")
     fp = subprocess.Popen(front_argv, env=fenv, stdout=ffh, stderr=subprocess.STDOUT, cwd=tree, start_new_session=True)

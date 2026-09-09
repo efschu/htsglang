@@ -53,6 +53,10 @@ from sglang.srt.arg_groups.argparse_actions import (
     LoRAPathAction,
 )
 from sglang.srt.configs.linear_attn_model_registry import get_linear_attn_spec_by_arch
+# #1257c: the sentinel that makes "--rank-user-reserve-mib was passed"
+# a real signal instead of a comparison against the default value. Safe at
+# module level: mem_ledger.terms is stdlib-only and imports nothing of ours.
+from sglang.srt.mem_ledger.terms import USER_RESERVE_UNSET
 from sglang.srt.connector import ConnectorType
 from sglang.srt.disaggregation.topology import TOPOLOGY_CHOICES as PD_TOPOLOGY_CHOICES
 from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
@@ -2616,24 +2620,34 @@ class ServerArgs:
         Union[int, str],
         Arg(
             help="EXTERNAL headroom (MiB) per physical card: memory left free "
-            "for things OUTSIDE this engine (a desktop compositor, an "
-            "nvidia-smi, a short-lived CUDA tool). Default 1024. This flag "
-            "has exactly one meaning and it never funds anything internal -- "
-            "no activation peak, no graph capture, no workspace, no CUDA "
-            "context is charged against it. Those are computed per card by "
-            "the VRAM ledger (--enable-vram-ledger) and printed itemized at "
-            "boot. Either a single value applied to every card, or a "
-            "comma-separated list with one value per rank (aligned with "
-            "--rank-gpu-id); when co-located ranks disagree the largest wins, "
-            "because the headroom belongs to the card and not to a rank. "
-            "Raising this buys free memory on the card and costs exactly that "
-            "many MiB of KV pool -- it cannot fix an internal term that was "
-            "modelled too small, and it never could: a budget line does not "
-            "cap a runtime allocation (#493). Requires --enable-vram-ledger; "
-            "passing it without one is refused rather than silently ignored.",
+            "for things OUTSIDE this engine -- a desktop compositor, an "
+            "nvidia-smi, another process of yours that wants VRAM while this "
+            "one serves. THAT IS ITS WHOLE JOB. Default 0 (#1257c, "
+            "2026-09-09): it used to default to 1024 because the engine could "
+            "not price its own transient and the number was standing in for "
+            "both; the transient is now measured per card and carried by the "
+            "corridor floor (managers.corridor_guard.corridor_floor_mib), so "
+            "what is left here is only your headroom and you get it by asking "
+            "for it. This flag never funds anything internal -- no activation "
+            "peak, no graph capture, no workspace, no CUDA context is charged "
+            "against it. Those are computed per card by the VRAM ledger "
+            "(--enable-vram-ledger) and printed itemized at boot. Either a "
+            "single value applied to every card, or a comma-separated list "
+            "with one value per rank (aligned with --rank-gpu-id); when "
+            "co-located ranks disagree the largest wins, because the headroom "
+            "belongs to the card and not to a rank. Raising this buys free "
+            "memory on the card, RAISES that card's corridor floor by exactly "
+            "as much, and costs exactly that many MiB of KV pool -- it cannot "
+            "fix an internal term that was modelled too small, and it never "
+            "could: a budget line does not cap a runtime allocation (#493). "
+            "Requires --enable-vram-ledger; passing it without one is refused "
+            "rather than silently ignored -- including an explicit 0, which is "
+            "a real answer and is distinguished from an unset flag by a "
+            "sentinel default rather than by comparing it with the default "
+            "value.",
             type_parser=str,
         ),
-    ] = 1024
+    ] = USER_RESERVE_UNSET
     enable_vram_ledger: A[
         bool,
         Arg(
@@ -12944,7 +12958,7 @@ class ServerArgs:
     # guess was invisible in the flag that recorded it.
     #
     # Split:
-    #   --rank-user-reserve-mib  external headroom ONLY, default 1024
+    #   --rank-user-reserve-mib  external headroom ONLY, default 0 (#1257c)
     #   the VRAM ledger          every internal term, computed and itemized
     #
     # The old flag keeps working exactly as it did so that existing recipes
@@ -12956,10 +12970,46 @@ class ServerArgs:
         return bool(getattr(self, "enable_vram_ledger", False))
 
     def _user_reserve_was_passed(self) -> bool:
-        from sglang.srt.mem_ledger.terms import DEFAULT_USER_RESERVE_MIB
+        """Was ``--rank-user-reserve-mib`` actually passed?
+
+        #1257c. This used to be ``str(raw) != str(DEFAULT_USER_RESERVE_MIB)``,
+        a VALUE comparison that only worked while the default was a number no
+        operator would type. With the default at 0 an explicit
+        ``--rank-user-reserve-mib 0`` would have read as "not passed" and would
+        have silently disarmed the refusal below it -- the flag would do
+        nothing, without a word, which is the exact failure that refusal
+        exists to prevent. So passedness is now a SENTINEL and not an
+        arithmetic coincidence.
+        """
+        from sglang.srt.mem_ledger.terms import USER_RESERVE_UNSET
+
+        return str(self.rank_user_reserve_mib) != str(USER_RESERVE_UNSET)
+
+    def user_reserve_mib_scalar(self) -> int:
+        """The user reserve as ONE number, sentinel resolved.
+
+        For the callers that hold no rank->gpu placement (the gapped-cut
+        holdback in the model runner). A per-rank list collapses to its
+        largest entry for the same reason
+        :meth:`user_reserve_mib_per_gpu` collapses per card: the headroom is a
+        property of the card, so the larger ask is the one satisfied by
+        leaving it free.
+        """
+        from sglang.srt.mem_ledger.terms import (
+            DEFAULT_USER_RESERVE_MIB,
+            USER_RESERVE_UNSET,
+        )
 
         raw = self.rank_user_reserve_mib
-        return str(raw) != str(DEFAULT_USER_RESERVE_MIB)
+        if raw is None or str(raw) == str(USER_RESERVE_UNSET):
+            return int(DEFAULT_USER_RESERVE_MIB)
+        try:
+            return max(int(p) for p in str(raw).split(","))
+        except ValueError:
+            raise ValueError(
+                "--rank-user-reserve-mib must be an integer or a "
+                f"comma-separated list of integers, got {raw!r}."
+            ) from None
 
     def user_reserve_mib_per_gpu(self, rank_gpu_id: Sequence[int]) -> Dict[int, int]:
         """``{physical gpu id: external headroom MiB}``.
@@ -12970,7 +13020,14 @@ class ServerArgs:
         memory are asking for the same free memory twice, and the larger ask is
         the one that is satisfied by leaving it free.
         """
+        from sglang.srt.mem_ledger.terms import (
+            DEFAULT_USER_RESERVE_MIB,
+            USER_RESERVE_UNSET,
+        )
+
         raw = str(self.rank_user_reserve_mib)
+        if raw == str(USER_RESERVE_UNSET):
+            raw = str(int(DEFAULT_USER_RESERVE_MIB))
         try:
             values = [int(part) for part in raw.split(",")]
         except ValueError:
@@ -13029,8 +13086,10 @@ class ServerArgs:
                 "workspaces, CUDA context).\n"
                 "  --enable-vram-ledger splits those: "
                 "--rank-user-reserve-mib is external headroom only (default "
-                "1024 MiB), and every internal term is computed and itemized "
-                "per card.\n"
+                "0 MiB since #1257c -- the engine's own transient is priced by "
+                "the corridor floor now, so this flag funds nothing but your "
+                "other processes), and every internal term is computed and "
+                "itemized per card.\n"
                 "Pass one or the other. To port a pinned recipe, drop "
                 "--rank-auto-reserve-mib and set --rank-user-reserve-mib to the "
                 "headroom you actually want left free; the ledger will print "
@@ -13047,7 +13106,7 @@ class ServerArgs:
                 "workspaces and its CUDA context. That is why this path can "
                 "warn that its own demand model derives more than you pinned "
                 "and then boot anyway. Migrate to --enable-vram-ledger with "
-                "--rank-user-reserve-mib <external headroom, default 1024>: "
+                "--rank-user-reserve-mib <external headroom, default 0>: "
                 "the internal terms are then computed and itemized per card, "
                 "and a card that does not fit is refused at parse time with "
                 "the itemization instead of warned about. This boot proceeds "
@@ -14212,6 +14271,23 @@ class ServerArgs:
                 profile=profile_from_server_args(self, _model_architectures(self)),
             )
             if footprint is not None:
+                # #1257c: PUBLISH WHICH PROFILE THIS BOOT MEASURED AGAINST.
+                # The corridor floor needs the same footprint in two processes
+                # that own no ServerArgs (the Weg-2 front and its launcher),
+                # and ``launcher.p_activation_reserve_provenance`` refuses BY
+                # NAME to restate ``profile_from_server_args`` there. This is
+                # the alternative: the process that HAS the profile writes its
+                # digest once, and they key the one store with it. A DIGEST,
+                # never a MiB -- there is no second set of books.
+                from sglang.srt.managers.corridor_guard import (
+                    publish_floor_profile,
+                )
+
+                publish_floor_profile(
+                    os.environ.get("SGLANG_WEG2_GROUP", ""),
+                    profile_from_server_args(self, _model_architectures(self)),
+                    live[0] if live else None,
+                )
                 return float(footprint.activation_mib)
         except Exception as e:  # pragma: no cover - probe/NVML availability
             logger.debug("activation footprint unavailable (%s)", e)

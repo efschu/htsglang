@@ -194,7 +194,13 @@ class ArmReport:
     #: ONLY THING THIS REPORT GRADES.
     units: Dict[str, ring_table.CorridorUnit] = field(default_factory=dict)
     band_mib: Tuple[int, int] = (0, 0)
+    #: #1257c: ``{nvml index: (floor MiB, source)}`` read back off the front's
+    #: own CORRIDOR line. Empty on a pre-#1257c log.
+    floors: Dict[int, Tuple[int, str]] = field(default_factory=dict)
     problems: List[str] = field(default_factory=list)
+    #: #1257c: things worth saying that are NOT failures. The upper band edge
+    #: lives here by user decision (2026-09-09, consequence 5).
+    findings: List[str] = field(default_factory=list)
 
     @property
     def ok(self) -> bool:
@@ -206,6 +212,8 @@ class ArmReport:
             f"WEG2-CORRIDOR-ARM log={self.path} instrument={self.instrument} "
             f"samples={self.samples} prose_mentions={self.prose_mentions} "
             f"band={floor}-{ceil}MiB(allocatable free) "
+            f"floors={{{', '.join(f'nvml{i}={m}({s})' for i, (m, s) in sorted(self.floors.items()))}}} "
+            f"findings={len(self.findings)} "
             f"verdict={'PASS' if self.ok else 'FAIL'}"
         )
         body = []
@@ -237,6 +245,7 @@ class ArmReport:
                         f"({self.instrument}) verdict=UNGRADED"
                     )
         body += [f"  PROBLEM: {p}" for p in self.problems]
+        body += [f"  FINDING: {f}" for f in self.findings]
         return "\n".join([head] + body)
 
 
@@ -311,21 +320,48 @@ def arm_report(
             f"{front.CORRIDOR_INSTRUMENT_NO_V2!r} instead -- carve-out-blind, "
             f"and the reserved= field on every line is 0)"
         )
+    # #1257c: THE FLOOR COMES FROM THE FRONT'S OWN LINE, per card, and this
+    # module grades against THAT. The front derives it once
+    # (``corridor_guard.corridor_floor_mib``) and prints ``floor=``/``source=``
+    # beside every ``nvmlN:free=``; reading it back is a one-directional
+    # shared surface, so the boot's verdict and the sampler that produced it
+    # cannot disagree about the number. A log with no ``floor=`` token is a
+    # pre-#1257c boot and falls back to the rig-wide band -- named, never
+    # silently equated.
+    rep.floors = ring_table.parse_front_corridor_floors(path)
     if require_in_band:
-        floor, ceil = rep.band_mib
+        band_floor, band_ceil = rep.band_mib
         for phase in sorted(rep.minima):
             unit = rep.units.get(phase)
             if unit is None or not unit.ok:
                 rep.problems.append(
-                    f"phase={phase} cannot be graded against the {floor}-{ceil} MiB "
-                    f"band: {unit.reason if unit else 'no unit conversion was attempted'}"
+                    f"phase={phase} cannot be graded against the "
+                    f"{band_floor}-{band_ceil} MiB band: "
+                    f"{unit.reason if unit else 'no unit conversion was attempted'}"
                 )
                 continue
             for idx, mib in sorted(unit.allocatable.items()):
-                if not floor <= mib <= ceil:
+                got = rep.floors.get(idx)
+                floor = got[0] if got else band_floor
+                source = got[1] if got else "PRE-1257C-BAND"
+                if mib < floor:
                     rep.problems.append(
-                        f"phase={phase} nvml{idx} minimum {mib} MiB (allocatable free) "
-                        f"is {front.corridor_verdict(mib)} the {floor}-{ceil} MiB band"
+                        f"phase={phase} nvml{idx} minimum {mib} MiB (allocatable "
+                        f"free) is BELOW its corridor floor of {floor} MiB "
+                        f"(source={source})"
+                    )
+                elif got is not None and mib > int(round(floor * 1.2)):
+                    # DECISION 5, 2026-09-09: the upper edge is a FINDING and
+                    # never a FAIL on its own. It says MiB are sitting
+                    # unmobilised, which is a capacity question for the
+                    # planner, not a breach of the corridor law. The
+                    # predecessor of this branch appended it to
+                    # ``problems`` and failed acceptances on it.
+                    rep.findings.append(
+                        f"phase={phase} nvml{idx} unmobilised_free_mib="
+                        f"{mib - int(round(floor * 1.2))} (minimum {mib} MiB "
+                        f"against a {floor} MiB floor, source={source}); a "
+                        f"FINDING, not a failure"
                     )
     return rep
 

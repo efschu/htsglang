@@ -16,7 +16,9 @@
     card_total = user_reserve + internal_demand + kv_pool
 
 ``user_reserve`` is the operator's headroom for things OUTSIDE this engine and
-defaults to 1024 MiB per card. ``internal_demand`` is the itemized sum of this
+defaults to 0 MiB per card (#1257c: the engine now prices its own transient
+per card via ``managers.corridor_guard.corridor_floor_mib``, so this flag no
+longer has to stand in for it; raise it for processes outside the engine). ``internal_demand`` is the itemized sum of this
 package's terms, each MODELED from configuration or CALIBRATED once per
 hardware fingerprint. ``kv_pool`` is the residual, so surplus is never idle.
 

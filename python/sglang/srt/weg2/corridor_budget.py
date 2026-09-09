@@ -101,12 +101,31 @@ from typing import Dict, List, Optional, Sequence, Tuple
 #: because that concatenated form is precisely what hid #1290's claim from the
 #: census for a whole slice.
 UNPRICED_NAME = "W54 Weg2CorridorBudgetUnpriced"
-WOULD_BIND_NAME = "W53 Weg2CorridorBudgetWouldBind"
+#: RENUMBERED 2026-09-09 (#1257c): W53 was claimed on the base commit
+#: ``1f837b8e17`` by #1291's ``W53 Weg2StoreHandbackFailed``
+#: (``front.py:569``, counter ``W53_Weg2StoreHandbackFailed``), which landed
+#: between this module's enumeration and its merge.  Both claims were real and
+#: the census in ``test_weg2_wcode_uniqueness_1263.py`` sees both, so on the
+#: merged tree they contradicted each other.  W55 was enumerated free against
+#: the same census -- as was W56 below -- and the older claim keeps its number.
+WOULD_BIND_NAME = "W55 Weg2CorridorBudgetWouldBind"
+#: #1257c.  The floor for this card is the named ``UNMEASURED-FALLBACK`` and no
+#: user reserve was asked for, so NOTHING PRICED IT and the cut does not
+#: happen.  A verdict, not an actuation -- see the module docstring.
+UNMEASURED_FLOOR_NAME = "W56 Weg2CorridorFloorUnmeasured"
 
-#: The corridor law's verdict constant, MiB of NVML free-v2 per card under the
-#: awake group's load.  The band is 819-1229; 1024 is the number a verdict is
-#: taken against (memory ``vram-korridor-regel.md``).  NOT a knob.
-CORRIDOR_LAW_MIB = 1024
+#: The stated law, MiB.  KEPT ONLY AS THE FALLBACK'S VALUE (#1257c): the
+#: verdict constant is now DERIVED per card by
+#: ``managers.corridor_guard.corridor_floor_mib`` as ``measured transient peak
+#: of the awake group + user reserve``, and this literal is what that
+#: derivation returns when nothing measured the transient.  Imported from the
+#: guard rather than repeated, because the guard is THE ONE DECLARATION and a
+#: private copy here is the fourth one its own comment forbids.
+from sglang.srt.managers.corridor_guard import (  # noqa: E402
+    CORRIDOR_LAW_MIB,
+    CorridorFloor,
+    corridor_floor_mib,
+)
 
 #: ``budgets_from_dc`` floors every budget to a multiple of 8 MiB; a cut that
 #: is also a multiple of 8 keeps that invariant without re-flooring.
@@ -348,13 +367,41 @@ def _resolved_world_pool(
     return pool, None
 
 
+def floors_for_cards(
+    cards: Sequence,
+    group: str,
+    user_reserve_mib=None,
+) -> Dict[str, CorridorFloor]:
+    """The derived corridor floor per card, keyed by uuid. ONE reader.
+
+    #1257c.  ``law_mib`` used to be a DEFAULT PARAMETER of the solve -- a
+    scalar 1024 that every card was graded against and that no caller ever
+    passed.  It is now a required per-card input with provenance, because the
+    two halves of the old number are per-card quantities: the awake group's
+    measured transient peak differs by card (1055/1097/858 MiB on this rig at
+    the S3 P ingest) and so does the user reserve.
+    """
+    return {
+        c.uuid: corridor_floor_mib(
+            c.uuid,
+            group=group,
+            user_reserve_mib=(
+                int((user_reserve_mib or {}).get(c.uuid, 0))
+                if isinstance(user_reserve_mib, dict)
+                else int(user_reserve_mib or 0)
+            ),
+        )
+        for c in cards
+    }
+
+
 def solve_corridor_budgets(
     cards: Sequence,
     budgets: Sequence[int],
     dormant_mib: Dict[str, int],
     sample: Optional[CorridorSample],
     unpriced_reason: Optional[str] = None,
-    law_mib: int = CORRIDOR_LAW_MIB,
+    floors: Optional[Dict[str, CorridorFloor]] = None,
     group: str = "D",
 ) -> CorridorSolve:
     """Apply the corridor law to ``budgets``; lower only where it is free to.
@@ -366,6 +413,16 @@ def solve_corridor_budgets(
     line was computed from.  Only the residue and the load transient come from
     the sample; everything else is live."""
     budgets = [int(b) for b in budgets]
+    if floors is None:
+        floors = floors_for_cards(cards, group)
+    # The span, for the header lines only. A verdict is NEVER taken against
+    # it: every card is graded against its own floor below.
+    law_span = (
+        f"{min(f.mib for f in floors.values())}-{max(f.mib for f in floors.values())}"
+        if floors
+        else str(CORRIDOR_LAW_MIB)
+    )
+    law_mib = law_span
     if sample is None:
         why = unpriced_reason or "no corridor/budget sample was supplied"
         return CorridorSolve(
@@ -394,7 +451,7 @@ def solve_corridor_budgets(
             else f"the sample has no row for card(s) {missing}"
         )
         return solve_corridor_budgets(
-            cards, budgets, dormant_mib, None, why, law_mib, group
+            cards, budgets, dormant_mib, None, why, floors, group
         )
 
     order = [by_uuid[c.uuid] for c in cards]
@@ -418,7 +475,7 @@ def solve_corridor_budgets(
             "the sample's world_rank column does not pair with this boot's "
             "card ordinals, so its positional token_vector cannot be trusted "
             "against these cards: " + "; ".join(mispaired),
-            law_mib, group,
+            floors, group,
         )
     vec = list(sample.token_vector)
     tpm = sample.tokens_per_mib
@@ -443,14 +500,36 @@ def solve_corridor_budgets(
 
     for i, card in enumerate(cards):
         sc = order[i]
+        cf = floors[card.uuid]
+        card_law = int(cf.verdict_floor_mib)
         free = _predicted_free_mib(
             card.total_mib, working[i], int(dormant_mib.get(card.uuid, 0)),
             int(getattr(card, "reserved_mib", 0)), sc,
         )
-        if free >= law_mib:
-            verdicts.append((i, "SATISFIED", f"margin_mib={free - law_mib}"))
+        if free >= card_law:
+            verdicts.append((i, "SATISFIED", f"margin_mib={free - card_law}"))
             continue
-        need = law_mib - free
+        # #1257c THE ACTUATION GATE, and it is the whole user decision in one
+        # branch.  A floor whose transient nobody measured, on a card whose
+        # operator asked for no reserve, is a VERDICT ONLY: it prints, it says
+        # the card is below it, and it does not spend a single MiB of KV pool
+        # to fix that.  Cutting a budget against 1024 MiB that nobody priced is
+        # the same defect this module already refuses four other ways -- "a
+        # boot must never silently get a budget that was priced off numbers
+        # nobody measured" -- applied to the floor itself.
+        if not cf.actuates:
+            verdicts.append(
+                (i, "REFUSED-UNMEASURED-FLOOR",
+                 f"{UNMEASURED_FLOOR_NAME} shortfall_mib={card_law - free} "
+                 f"floor={cf.mib} source={cf.source} reserve={cf.reserve_mib} "
+                 f"({cf.provenance}); nothing priced this floor, so it is a "
+                 f"verdict and not a cut -- the budget stands byte-identical. "
+                 f"Measure the awake group's transient "
+                 f"(scripts/vram_ledger/probe_activation.py ingest) or pass "
+                 f"--rank-user-reserve-mib to make it actuate")
+            )
+            continue
+        need = card_law - free
         cut = int(math.ceil(need / eff_ratio))
         cut = int(math.ceil(cut / BUDGET_ALIGN_MIB)) * BUDGET_ALIGN_MIB
         trial = list(working)
@@ -519,10 +598,12 @@ def solve_corridor_budgets(
             int(getattr(card, "reserved_mib", 0)), sc,
         )
         verdict, extra = next((v, e) for j, v, e in verdicts if j == i)
+        cf = floors[card.uuid]
         lines.append(
             f"WEG2-BUDGET corridor-constrained card={card.uuid} "
             f"budget_mib={budgets[i]}->{working[i]} "
-            f"predicted_free_mib={free_after} law={law_mib} "
+            f"predicted_free_mib={free_after} law={cf.verdict_floor_mib} "
+            f"floor={cf.mib} source={cf.source} reserve={cf.reserve_mib} "
             f"world_pool={pool0}->{pool1} binder={binder1} "
             f"verdict={verdict} ordinal={i} nvml_idx={card.nvml_index} "
             f"{card.name} terms[total={card.total_mib} "
@@ -531,6 +612,23 @@ def solve_corridor_budgets(
             f"awake_residue={sc.awake_residue_mib} "
             f"load_transient={sc.load_transient_mib}] {extra}"
         )
+        # THE CUT LINE, emitted only where a cut was INSTALLED (#1257c).  It
+        # names the actuating term, both pool figures and the binder, so the
+        # operator can read what the margin cost without reconstructing it
+        # from three other lines.  ``kein-bindender-rang``: a cut that made a
+        # rank the binder never gets here -- it is refused above by name --
+        # and the price of the one that did happen is printed rather than
+        # hidden.
+        if verdict == "APPLIED":
+            cut_mib = budgets[i] - working[i]
+            lines.append(
+                f"WEG2-BUDGET corridor-constrained card={card.uuid} INSTALLED "
+                f"cut_mib={cut_mib} reason={cf.reason} "
+                f"floor={cf.mib} source={cf.source} reserve={cf.reserve_mib} "
+                f"pool_before={pool0} pool_after={pool1} vector={vec} "
+                f"binder={binder1} measured_peak={cf.transient_mib} "
+                f"provenance={cf.provenance}"
+            )
     lines.append(
         f"WEG2-BUDGET corridor-constrained group={group} SOURCE={sample.provenance} "
         f"cell_size={sample.cell_size} token_vector={vec} "

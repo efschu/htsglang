@@ -188,6 +188,37 @@ _CORRIDOR_FREE_RE = re.compile(r"nvml(\d+):free=(\d+)MiB")
 _CORRIDOR_INSTRUMENT_RE = re.compile(r"WEG2-CORRIDOR\s+phase=[A-Z]\(awake\)[^\n]*?instrument=(\S+)")
 
 
+#: #1257c: the front prints its DERIVED per-card floor beside every free
+#: reading -- ``nvml1:free=474MiB reserved=518MiB floor=1055MiB
+#: source=MEASURED-P reserve=0MiB verdict=BELOW``.  Parsed back so the boot's
+#: corridor verdict grades against the SAME number the sampler used, rather
+#: than against a band it re-derives.  A pre-#1257c line carries no ``floor=``
+#: and yields nothing, which the caller must treat as "fall back and say so".
+_CORRIDOR_FLOOR_RE = re.compile(
+    r"nvml(\d+):free=\d+MiB\s+reserved=\d+MiB\s+floor=(\d+)MiB\s+source=(\S+)"
+)
+
+
+def parse_front_corridor_floors(path: str) -> Dict[int, Tuple[int, str]]:
+    """``{nvml index: (floor MiB, source)}`` from a front log's LAST sample.
+
+    The last sample, not the first: the floor can change within one boot (a
+    group flip changes which transient is awake), and the verdict belongs to
+    the state the boot ended in.  A log with no such token returns ``{}``.
+    """
+    out: Dict[int, Tuple[int, str]] = {}
+    try:
+        with open(path, errors="replace") as f:
+            for line in f:
+                if "WEG2-CORRIDOR" not in line:
+                    continue
+                for m in _CORRIDOR_FLOOR_RE.finditer(line):
+                    out[int(m.group(1))] = (int(m.group(2)), m.group(3))
+    except OSError:
+        return {}
+    return out
+
+
 def _corridor_sample_phase(line: str) -> Optional[str]:
     """The phase letter if this line IS a corridor SAMPLE, else ``None``.
 
