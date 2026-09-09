@@ -344,20 +344,26 @@ P_BYTES_PER_TOKEN = 8192 + 2048
 #:
 #: Under "fastest above F" the order is selected for any F in the half-open
 #: interval (414654, 481400].  The floor is the MIDPOINT of that interval,
-#: (414654 + 481400) // 2 = 448027, because the midpoint is the value furthest
-#: from BOTH boundaries it must not cross: 8.05 %% of headroom down to
-#: 40,12,12's pool and 6.93 %% up to 39,13,12's own.  The frontier may be
-#: re-priced (a card library refresh, a checkpoint, a token vector) and a
-#: uniform re-pricing moves the selection only past a -6.9 %% / +7.9 %% shift.
+#: (414654 + 481400) // 2 = 448027: it sits 33,373 tokens from each boundary,
+#: which is the largest equal headroom the interval allows.
+#:
+#: A floor survives a uniform re-pricing of the frontier by factor s only while
+#: it stays inside (414654*s, 481400*s], so every floor has TWO tolerances --
+#: how far pools may GROW before 40,12,12 clears it too and wins on speed, and
+#: how far they may SHRINK before 39,13,12 stops clearing it -- and the SMALLER
+#: of the two is the one that fails first.  The midpoint tolerates +8.05 %%
+#: growth and -6.93 %% shrink, so 6.93 %% binds.
 #:
 #: THE REJECTED RULE, named because it is the obvious one: "39,13,12's priced
-#: pool minus the priced-vs-realised tolerance" gives 481400 * 0.999 = 480918.
-#: That tolerance is 0.10 %% MEASURED (weg2sb5f priced 304,946 against 304,655
-#: realised), so such a floor would carry a downward margin exactly the size of
-#: its own measurement error -- i.e. no engineering margin at all, and the
-#: first re-price that shaved a tenth of a percent off the pool would silently
-#: ship 38,13,13 (453.4 ms) or refuse.  The midpoint costs nothing and cannot
-#: fail that way.
+#: pool minus the priced-vs-realised tolerance" gives 481400 * 0.999 = 481118.
+#: It tolerates +16.03 %% growth -- better than the midpoint -- but only
+#: -0.06 %% shrink.  That tolerance is 0.10 %% MEASURED (weg2sb5f priced
+#: 304,946 against 304,655 realised), so its binding margin is SMALLER than the
+#: measurement error it was derived from: the first re-price that shaved a
+#: tenth of a percent off the pool would silently ship 38,13,13 (453.4 ms) or
+#: refuse.  Ranked on distance from the LOWER boundary alone the rejected rule
+#: looks like the better one, which is exactly why that is not the comparison
+#: -- the test asserts it on the binding margin instead.
 #:
 #: THE TRADE THE ORDER BOUGHT, so nobody re-derives it as a regression: against
 #: the unfloored makespan winner 44,10,10 (359.0 ms / 304,946 tokens) this is

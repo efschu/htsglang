@@ -20,11 +20,15 @@ THE FLOOR'S RULE, so a re-measure can redo it instead of copying it.  From the
 the order are 40,12,12 at pool 414654 (417.6 ms, the next FASTER cut) and
 39,13,12 at pool 481400 (420.1 ms).  Under "fastest above F" the order is
 selected for any F in (414654, 481400], and the shipped floor is that
-interval's MIDPOINT -- the value furthest from both boundaries it must not
-cross (8.05 % of headroom down, 6.93 % up).  The obvious alternative, "the
-chosen pool minus the priced-vs-realised tolerance", is REJECTED and the
-rejection is asserted below: that tolerance is 0.10 % measured, so such a floor
-would carry a downward margin exactly the size of its own measurement error.
+interval's MIDPOINT -- 33,373 tokens from each boundary, the largest equal
+headroom the interval allows.  A uniform re-pricing by factor s moves the
+selection only once the floor leaves (414654*s, 481400*s], so each floor has a
+GROWTH and a SHRINK tolerance and the smaller one binds: +8.05 % / -6.93 % here.
+The obvious alternative, "the chosen pool minus the priced-vs-realised
+tolerance", is REJECTED and the rejection is asserted below on the BINDING
+margin -- it tolerates +16.03 % but only -0.06 %, under the 0.10 % measurement
+error it was derived from.  On distance from the lower boundary alone it looks
+better, which is why that is not the comparison.
 
 WHY THE FIFTEEN-POINT FRONTIER IS A SOUND STAND-IN for the 932-candidate field,
 which is the one step in this file that is an argument and not a lookup: under
@@ -124,6 +128,22 @@ def _pool_of(cut):
     return next(pool for layers, _a, _m, pool in FRONTIER if layers == cut)
 
 
+def _flat(text):
+    """Collapse wrapping so a quoted ORDER can be searched for as one string.
+
+    Both places the order has to appear re-flow it: argparse rewraps help to
+    the terminal width, and the constant's comment block wraps at 79 columns
+    with a ``#:`` marker starting each line.  Asserting on the raw text
+    therefore tests the line width, not the presence of the order -- measured,
+    2026-09-09: both assertions failed against sources that DID carry it.
+    """
+    return " ".join(text.replace("#:", " ").split())
+
+
+#: The order, in the one spelling every assertion below searches for.
+ORDER = "39,13,12 mit bs2 im pp layout soll standard werden vorerst"
+
+
 def _choose(floor, objective="makespan"):
     field = _field()
     return choose_under_floor(
@@ -201,19 +221,56 @@ class TheDefaultSelectsTheOrderedCut(CustomTestCase):
         self.assertEqual(_choose(_pool_of(ORDERED_CUT)).layers, ORDERED_CUT)
         self.assertEqual(_choose(_pool_of(ORDERED_CUT) + 1).layers, (38, 13, 13))
 
-    def test_the_rejected_rule_is_named_and_is_worse(self):
+    def test_the_midpoint_is_equidistant_from_both_boundaries(self):
+        """THE RULE'S OWN PROPERTY, exactly: same number of tokens either side.
+
+        The midpoint maximises the minimum ABSOLUTE distance to the two
+        boundaries, and does it by construction rather than by luck -- 33,373
+        tokens of headroom in each direction.  (It is deliberately NOT claimed
+        to maximise the RELATIVE margin: that point is the harmonic mean, a
+        few hundred tokens away, and buying that distinction is not worth a
+        rule an operator cannot redo in their head.)
+        """
+        low, high = _pool_of(NEXT_FASTER_CUT), _pool_of(ORDERED_CUT)
+        self.assertEqual(
+            DEFAULT_PP_SOLVE_POOL_FLOOR - low, high - DEFAULT_PP_SOLVE_POOL_FLOOR
+        )
+        self.assertEqual(DEFAULT_PP_SOLVE_POOL_FLOOR - low, 33373)
+
+    def test_the_rejected_rule_is_named_and_is_worse_where_it_binds(self):
         """"chosen pool minus the 0.10 % tolerance" -- it selects, but barely.
 
-        It is not wrong today; it is BRITTLE, and the assertion is exactly
-        that: its downward margin is the same size as the measurement error it
-        was derived from, while the shipped rule's is two orders larger.
+        It is not wrong today; it is BRITTLE, and the assertion has to be made
+        on the margin that BINDS or it says the opposite of the truth.  A floor
+        survives a uniform re-pricing of the frontier by factor s only while it
+        stays inside (low*s, high*s], so each floor has TWO tolerances -- how
+        far pools may GROW before the next-faster cut clears it too, and how
+        far they may SHRINK before the chosen cut stops clearing it -- and the
+        smaller of the two is the one that fails first.
+
+        Measured on the shipped numbers: the midpoint tolerates +8.05 % growth
+        and -6.93 % shrink, so 6.93 % binds.  The rejected rule tolerates
+        +16.03 % but only -0.06 % -- a downward margin SMALLER than the 0.10 %
+        priced-vs-realised error it was derived from, i.e. no margin at all.
+        Ranked on distance from the lower boundary alone the rejected rule
+        looks better, which is exactly why that is not the comparison.
         """
+        def margins(floor):
+            low, high = _pool_of(NEXT_FASTER_CUT), _pool_of(ORDERED_CUT)
+            return floor / low - 1.0, 1.0 - floor / high
+
         tolerance_rule = int(_pool_of(ORDERED_CUT) * 0.999)
         self.assertEqual(_choose(tolerance_rule).layers, ORDERED_CUT)
-        low = _pool_of(NEXT_FASTER_CUT)
-        margin_tolerance = (tolerance_rule - low) / low
-        margin_shipped = (DEFAULT_PP_SOLVE_POOL_FLOOR - low) / low
-        self.assertGreater(margin_shipped, 20 * margin_tolerance)
+
+        grow_s, shrink_s = margins(DEFAULT_PP_SOLVE_POOL_FLOOR)
+        grow_t, shrink_t = margins(tolerance_rule)
+        # the rejected rule wins on the axis that does NOT bind ...
+        self.assertGreater(grow_t, grow_s)
+        # ... and loses by two orders on the one that does
+        self.assertGreater(min(grow_s, shrink_s), 50 * min(grow_t, shrink_t))
+        # its binding margin is under the 0.10 % measurement error itself
+        self.assertLess(min(grow_t, shrink_t), 0.001)
+        self.assertGreater(min(grow_s, shrink_s), 0.06)
 
     def test_a_lower_default_would_ship_a_different_cut(self):
         """THE MUTANT, pinned as a test rather than only run by hand.
@@ -296,7 +353,7 @@ class TheDefaultReachesTheBootThroughTheParser(CustomTestCase):
         self.assertEqual(floor, DEFAULT_PP_SOLVE_POOL_FLOOR)
         self.assertEqual(floor, 448027)
         self.assertIn("source=default", prov)
-        self.assertIn("39,13,12 mit bs2 im pp layout soll standard werden vorerst", prov)
+        self.assertIn(ORDER, _flat(prov))
 
     def test_an_operator_value_outranks_the_default_and_says_flag(self):
         floor, prov = resolve_pool_floor(500000)
@@ -305,8 +362,8 @@ class TheDefaultReachesTheBootThroughTheParser(CustomTestCase):
         self.assertIn("is NOT in force", prov)
 
     def test_the_order_is_quoted_in_the_flag_help(self):
-        h = launcher.build_parser().format_help()
-        self.assertIn("39,13,12 mit bs2 im pp layout soll standard werden vorerst", h)
+        h = _flat(launcher.build_parser().format_help())
+        self.assertIn(ORDER, h)
         self.assertIn(str(DEFAULT_PP_SOLVE_POOL_FLOOR), h)
 
     def test_the_help_no_longer_claims_unset_means_no_floor(self):
@@ -473,10 +530,8 @@ class TheNumberIsWrittenExactlyOnce(CustomTestCase):
     def test_the_order_is_recorded_where_the_number_lives(self):
         src = (WEG2_DIR / "launcher.py").read_text()
         head = src[: src.index("DEFAULT_PP_SOLVE_POOL_FLOOR = ")]
-        block = head[head.rindex("#: THE SHIPPED FLOOR") :]
-        self.assertIn(
-            "39,13,12 mit bs2 im pp layout soll standard werden vorerst", block
-        )
+        block = _flat(head[head.rindex("#: THE SHIPPED FLOOR") :])
+        self.assertIn(ORDER, block)
         self.assertIn("414654", block)
         self.assertIn("481400", block)
 
