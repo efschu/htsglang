@@ -796,12 +796,25 @@ def SB5F_LOCAL_TOKENS_PRICED():
 
 
 class TestCapacityIsIntegerArithmetic(CustomTestCase):
-    """F8: the equality that kills the floor->ceil mutant sat on a float ULP.
+    """F8: the capacity is the runtime's INTEGER expression.
 
-    2048 B is a power of two, so the float quotient happened to agree with the
-    boot's integer division.  A cell that is NOT a power of two is where a
-    float floor and an integer floor can part company, and the model must
-    still be the boot's arithmetic there.
+    THE MUTANT FOR THIS ONE SURVIVES, AND THAT IS THE RESULT, not a gap in the
+    tests (measured 2026-09-09, mutant M13: restore ``math.floor(free_mib *
+    MIB / cell)`` in place of ``int(free_mib * MIB) // cell`` -> 44/44 still
+    pass).  The two forms are EQUAL for every non-negative finite input, and
+    the proof is short: ``floor(x/c) > floor(floor(x)/c)`` would need an
+    integer multiple of ``c`` in the half-open interval ``(floor(x), x]``, and
+    for a non-integral ``x`` that interval contains no integer at all.  The
+    remaining difference is the float division's own rounding, which needs
+    ``free_mib * MIB`` above 2**53 to bite -- about 8 PiB per rank.
+
+    So F8 named a real CLASS hazard (an equality assertion resting on a float
+    quotient) whose instance is unreachable at these magnitudes.  The integer
+    form ships anyway, because "provably equal today at this scale" is a worse
+    thing to leave under a load-bearing ``assertEqual`` than an expression that
+    is simply the runtime's.  What is asserted below is the property that IS
+    real and IS falsifiable: the model equals the boot's expression, and the
+    helper returns an int.
     """
 
     def test_a_non_power_of_two_cell_still_matches_the_hand_expression(self):
