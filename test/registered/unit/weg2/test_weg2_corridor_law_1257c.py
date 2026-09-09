@@ -58,6 +58,26 @@ from sglang.srt.mem_ledger import activation as act
 from sglang.srt.weg2 import corridor_budget as cb
 
 HW = "a191a0712717"
+
+
+def setUpModule():
+    """PIN THE RIG FINGERPRINT, because the check added for refuter A MF-2
+    reads NVML and NVML IGNORES ``CUDA_VISIBLE_DEVICES``.
+
+    Every test here publishes a pointer stamped :data:`HW` and most of them
+    then ask for a floor WITHOUT passing a fingerprint, which is the launcher's
+    own call shape. The guard now compares the pointer's fingerprint against
+    the rig's -- so on a box with cards the answer would depend on which box
+    ran the suite, and ``CUDA_VISIBLE_DEVICES=""`` cannot make that hermetic.
+    Pinning the cache states the assumption instead: THIS is the rig the
+    pointer names. ``TheFingerprintOfThePointerIsChecked`` below unpins it on
+    purpose, which is the only place the mismatch is exercised.
+    """
+    cg._RIG_FP_CACHE[:] = [HW, None]
+
+
+def tearDownModule():
+    cg._RIG_FP_CACHE.clear()
 #: The three cards of this rig, and the P peaks the S3 ingest measured for
 #: them. NOT typed by hand into an expectation: they are written into a tmp
 #: store below and read back, so the test exercises the reader, not a literal.
@@ -1253,6 +1273,97 @@ class RefuterFindingEightTheBootRecipes(unittest.TestCase):
                 if not line.lstrip().startswith("#")
             )
             self.assertNotIn("--rank-user-reserve-mib", body, name)
+
+
+class TheFingerprintOfThePointerIsChecked(unittest.TestCase):
+    """REFUTER A MF-2 (serve-next4, 2026-09-09): the pointer supplied BOTH
+    terms and nothing checked the first one.
+
+    On the launcher/front call shape (no profile, no digest) the guard read
+    ``corridor_floor_digest.json`` for the digest AND took its
+    ``hw_fingerprint`` as its own. A pointer written on OTHER HARDWARE then
+    opened its own footprint file, the floor came back ``MEASURED-*`` with
+    ``actuates=yes``, and it CUT a budget derived on a rig this boot is not
+    running on. The digest half of the same hazard is refused by name
+    (``digest_group_collision``); this is the fingerprint half.
+
+    RED-FIRST: without the check every assertion below reads ``MEASURED-P``.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.cache = self._tmp.name
+        self.addCleanup(self._tmp.cleanup)
+        self._env = mock.patch.dict(
+            os.environ, {cg.FLOOR_DIGEST_FILE_ENV: os.path.join(self.cache, "d.json")}
+        )
+        self._env.start()
+        self.addCleanup(self._env.stop)
+        os.environ.pop(cg.LAW_ENV, None)
+        os.environ.pop(cg.GROUP_ENV, None)
+        _write_footprints(self.cache, "pdigest", P_PEAKS)
+        _publish(self.cache, {"P": "pdigest"})
+        # Every test in this class owns the cache for the duration, because
+        # the module-level pin is exactly what is under test here.
+        self._saved = list(cg._RIG_FP_CACHE)
+        self.addCleanup(lambda: cg._RIG_FP_CACHE.__setitem__(
+            slice(None), self._saved))
+
+    def _pin(self, fp, why=None):
+        cg._RIG_FP_CACHE[:] = [fp, why]
+
+    def test_a_pointer_from_another_rig_is_refused_and_names_both(self):
+        self._pin("deadbeef0000")
+        got = cg.corridor_floor_mib(C5090, group="P", cache_dir=self.cache)
+        self.assertEqual(got.source, cg.FLOOR_SOURCE_FALLBACK)
+        self.assertFalse(got.actuates)
+        self.assertIn(HW, got.provenance)
+        self.assertIn("deadbeef0000", got.provenance)
+        self.assertIn("another rig", got.provenance)
+
+    def test_the_callers_own_fingerprint_is_the_reference_when_it_has_one(self):
+        """No NVML needed: a caller that passed a fingerprint has already
+        answered the question, and a pointer disagreeing with IT is the same
+        refusal for free."""
+        self._pin(None, "no NVML rig inventory")
+        got = cg.corridor_floor_mib(
+            C5090, group="P", hw_fingerprint="cafebabe1111", cache_dir=self.cache
+        )
+        self.assertEqual(got.source, cg.FLOOR_SOURCE_FALLBACK)
+        self.assertIn("cafebabe1111", got.provenance)
+
+    def test_a_check_that_cannot_run_does_not_refuse_but_says_so(self):
+        """UNVERIFIABLE IS NOT MISMATCHED. A box with no NVML still measures --
+        dropping to the fallback there would turn every hermetic reader into a
+        verdict-only one -- but the provenance has to carry the gap."""
+        self._pin(None, "no NVML rig inventory")
+        got = cg.corridor_floor_mib(C5090, group="P", cache_dir=self.cache)
+        self.assertEqual(got.source, "MEASURED-P")
+        self.assertEqual(got.mib, 1055)
+        self.assertIn("UNVERIFIED", got.provenance)
+        self.assertIn("no NVML rig inventory", got.provenance)
+
+    def test_the_matching_rig_measures_and_says_nothing_extra(self):
+        """CAN-FAIL DIRECTION: the check must not refuse the happy path."""
+        self._pin(HW)
+        got = cg.corridor_floor_mib(C5090, group="P", cache_dir=self.cache)
+        self.assertEqual(got.source, "MEASURED-P")
+        self.assertEqual(got.mib, 1055)
+        self.assertNotIn("UNVERIFIED", got.provenance)
+        self.assertTrue(got.actuates)
+
+    def test_the_rig_reader_is_the_unmasked_one(self):
+        """#589: ``live_fingerprint`` is built from torch.cuda and therefore
+        describes the CVD-masked slice -- each window-5 rank fingerprinted its
+        own card and ingest refused all three. The floor's reader must be the
+        NVML one, by name, in the source."""
+        import inspect
+
+        src = inspect.getsource(cg.rig_hardware_fingerprint)
+        self.assertIn("rig_fingerprint", src)
+        self.assertNotIn("import live_fingerprint", src)
+        resolve = inspect.getsource(cg._resolve_transient_mib)
+        self.assertNotIn("live_fingerprint", resolve)
 
 
 if __name__ == "__main__":
