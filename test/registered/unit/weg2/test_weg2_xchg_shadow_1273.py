@@ -1585,7 +1585,8 @@ def test_the_device_summer_cannot_be_a_dead_instrument(ops):
     src = dev_ptr(0, 0x90000)
     write(ops, src, payload)
     scratch = _FakeScratch(ops, 512)
-    summer = sh.device_summer(ops, 0, scratch, checksum=lambda b: sum(b))
+    stream = ops.create_stream(0)
+    summer = sh.device_summer(ops, stream, scratch, checksum=lambda b: sum(b))
     assert summer(src, len(payload)) == sum(payload)
     assert summer(src, 0) == 0
     # THE BOUND COMES FROM THE SCRATCH, not from the module constant: a range
@@ -1596,7 +1597,8 @@ def test_the_device_summer_cannot_be_a_dead_instrument(ops):
     # And a scratch that was never allocated is refused where it is handed
     # over, not paid for with a run of zeros.
     with pytest.raises(ValueError) as empty:
-        sh.device_summer(ops, 0, _FakeScratch(ops, 0), checksum=lambda b: sum(b))
+        sh.device_summer(ops, stream, _FakeScratch(ops, 0),
+                         checksum=lambda b: sum(b))
     assert "EMPTY scratch" in str(empty.value)
 
 
