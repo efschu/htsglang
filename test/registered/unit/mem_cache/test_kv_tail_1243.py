@@ -1236,7 +1236,7 @@ class TestEveryGatedLazyImportResolves(CustomTestCase):
         import sglang
 
         root = os.path.dirname(os.path.dirname(os.path.abspath(sglang.__file__)))
-        broken, checked = [], 0
+        broken, offplatform, checked = [], [], 0
         for rel in self.FILES:
             path = os.path.join(root, rel)
             self.assertTrue(os.path.exists(path), path)
@@ -1244,6 +1244,17 @@ class TestEveryGatedLazyImportResolves(CustomTestCase):
                 checked += 1
                 try:
                     mod = importlib.import_module(module)
+                except ModuleNotFoundError as exc:
+                    # A VENDOR SDK that this platform does not have (torch_npu
+                    # on a CUDA box) is not the defect this ratchet hunts: the
+                    # class is a wrong path INSIDE sglang. Counted and named
+                    # rather than silently skipped -- an unreported skip is how
+                    # a ratchet quietly stops covering what it claims to.
+                    if not (exc.name or "").startswith("sglang"):
+                        offplatform.append(f"{rel}:{lineno} {module} <- {exc.name}")
+                        continue
+                    broken.append(f"{rel}:{lineno} import {module}: {exc!r}")
+                    continue
                 except Exception as exc:  # noqa: BLE001
                     broken.append(f"{rel}:{lineno} import {module}: {exc!r}")
                     continue
@@ -1262,9 +1273,22 @@ class TestEveryGatedLazyImportResolves(CustomTestCase):
                             f"and no submodule of that name"
                         )
         # The population is named, per the denominator law: a green here is
-        # only worth the number of imports it actually resolved.
+        # only worth the number of imports it actually resolved, and the
+        # off-platform ones it could not are named rather than absorbed.
         self.assertGreater(checked, 40, "the AST walk collected almost nothing")
-        self.assertEqual(broken, [], "\n".join(broken))
+        self.assertLess(
+            len(offplatform),
+            10,
+            "too much of this slice is unresolvable on this platform for the "
+            "green to mean anything:\n" + "\n".join(offplatform),
+        )
+        self.assertEqual(
+            broken,
+            [],
+            f"{len(broken)} of {checked} function-scoped sglang imports do not "
+            f"resolve ({len(offplatform)} skipped as off-platform):\n"
+            + "\n".join(broken),
+        )
 
     def test_get_parallel_is_not_importable_from_parallel_state(self):
         """The exact wrong module, pinned so a future edit cannot re-adopt it.
