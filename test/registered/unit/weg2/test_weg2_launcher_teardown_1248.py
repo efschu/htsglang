@@ -98,10 +98,18 @@ NAMED_POST_SPAWN_HELPERS = (
 #: Pinned 2026-09-09 against this branch (base 80de2d31d1). A raise site
 #: added or removed changes one of these numbers -- the point is that it
 #: cannot change silently.
+#:
+#: serve-next5 train (2026-09-09): ``d_tp_ratio_decision`` 1 -> 2. The second
+#: raise is #1241's operating-point refusal for a SHIPPED position (the
+#: W61-W64 ``Weg2TpOperatingPoint*`` family re-raised as ``Weg2LaunchRefused``
+#: with "position ... was SHIPPED, so the refusal is fatal here"), merged from
+#: ``weg2/tp3-decode-dec2-0909``, whose tree predates this file and so never
+#: ran this pin. Not swallowed: ``test_no_named_helper_locally_swallows_its_
+#: own_refusal`` holds on the merged tree.
 RAISE_COUNTS_BY_HELPER = {
     "wait_ready": 3,
     "sleep_group": 1,
-    "d_tp_ratio_decision": 1,
+    "d_tp_ratio_decision": 2,
     "build_env": 1,
     "gate_w11": 2,
     "check_drafter_identity": 0,
