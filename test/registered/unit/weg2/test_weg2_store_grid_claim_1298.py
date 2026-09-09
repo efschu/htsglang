@@ -79,6 +79,7 @@ arithmetic ``_all_reduce_attn_groups`` performs (same harness shape as
 import logging
 import os
 import re
+import subprocess
 import tempfile
 from types import MethodType, SimpleNamespace
 
@@ -149,11 +150,86 @@ COLD_ROWS = ((16520, 8247, 8190, 48), (18187, 8247, 8190, 48))
 #: draft_pages=2671 claim=0 mode=trim`, 3 lines / 1 rid).
 OFF_GRID_TRIM = (2727, 2671)
 #: The sb5h D log, the F3 subject.  Absent on the remote desk by design (the
-#: evidence tree is not shipped over the link), so F3 skips there.
+#: evidence tree is not shipped over the link).
 SB5H_D_LOG = (
     "/spinning/evidence-665-f1/"
     "boot_weg2_weg2sb5h_57fef0ce6e_0909_103119.D.log"
 )
+#: THE SAME SUBJECT, SHIPPED.  Part C round 1 -- F3 was written by fix 2 and
+#: NEVER EXECUTED as a pytest node: it skipped on the remote (no evidence tree)
+#: and no local pytest is allowed while a boot window runs, so its assertion
+#: had only ever been computed by hand off the log.  An acceptance test that
+#: has never run is the `desk-written-never-executed` class, one level in --
+#: so the lines F3 reads are cut into the tree and the test runs EVERYWHERE.
+#:
+#: THE CUT IS PROVABLY FAITHFUL, not merely small: F3's own walk looks at
+#: exactly two kinds of line (the truncation instrument, and the five terminal
+#: markers), so the fixture keeps every truncation line plus every terminal
+#: line whose rid is one of the truncated ones, and drops nothing the walk
+#: could have read.  `test_f3_fixture_is_faithful` re-runs the walk over the
+#: FULL log wherever the evidence tree exists and asserts both populations are
+#: identical, so the fixture cannot drift into a friendlier subject.
+#:
+#: THE EXTENSION IS LOAD-BEARING -- ``.txt``, never ``.log``. Measured on the
+#: first remote run of this commit: ``.gitignore:62`` is a blanket ``*.log``,
+#: so ``git add -A`` skipped the fixture WITHOUT A WORD, the commit shipped a
+#: test whose subject was not in the tree, and F3 came back red on the remote
+#: with ``FileNotFoundError`` -- one red in the tally, indistinguishable from
+#: the red this test is SUPPOSED to produce. It would have been reported as
+#: "F3 executes and is red as designed" and it was nothing of the kind.
+#: `desk-written-never-executed`, one level in: the test ran and reached the
+#: wrong thing. `test_f3_the_fixture_is_actually_in_the_tree` below is the
+#: guard, because a comment cannot fail.
+SB5H_D_FIXTURE = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "fixtures",
+    "sb5h_D_truncation_terminals_1298.txt",
+)
+#: The five ways a store read can END where a reader can see it.  `X-DEFER`
+#: counts as terminal on purpose: a deferred read is one the X gate has
+#: accounted for, which is the whole of part (C).
+F3_TERMINAL_MARKERS = (
+    ("HiCache prefetch success req=", "success"),
+    ("#905 PREFETCH-COMPLETE", "complete"),
+    ("#1157 PREFETCH REAPED", "reaped"),
+    ("#915 PREFETCH REFUSED", "refused"),
+    ("WEG2 X-DEFER", "defer"),
+)
+#: The population floor.  Asserted so a green can never come from an empty
+#: walk (the ratchet rule): sb5h carries 37 truncated rids, all `over_bound`.
+F3_MIN_TRUNCATED_RIDS = 30
+
+
+def _f3_walk(path):
+    """(truncated rid -> (need, got), rid -> set(terminal names)) over one log.
+
+    ONE walk, used by F3 and by its fidelity check, so the fixture and the
+    full log can never be compared through two different readings.
+
+    ``over_bound=true`` ONLY: the invariant part (C) must close is about reads
+    the pool cut by more than one chunk (#939), which is the population the X
+    gate then prices at the whole prompt.  A cut inside the one-chunk law is
+    not a #1298 event and is not counted here -- on sb5h the filter removes
+    nothing (111/111 lines are `true`), and saying so is the point: the
+    denominator is stated rather than assumed.
+    """
+    trunc, terminal = {}, {}
+    rt = re.compile(
+        r"#915 PREFETCH TRUNCATED rid=(\S+) need=(\d+) got=(\d+) "
+        r"lost=\d+ chunk=\d+ over_bound=(\S+)"
+    )
+    rr = re.compile(r"(?:req|rid)=([0-9a-f]{6,})")
+    with open(path, errors="replace") as fh:
+        for line in fh:
+            hit = rt.search(line)
+            if hit and hit.group(4) == "true":
+                trunc.setdefault(hit.group(1)[:8], (hit.group(2), hit.group(3)))
+            for literal, name in F3_TERMINAL_MARKERS:
+                if literal in line:
+                    rid = rr.search(line)
+                    if rid:
+                        terminal.setdefault(rid.group(1)[:8], set()).add(name)
+    return trunc, terminal
 IDENTITY = "0123456789abcdef"
 TREE_LOGGER = "sglang.srt.mem_cache.unified_radix_cache"
 
@@ -534,47 +610,99 @@ def test_b4_the_reprobe_is_no_longer_called_at_all():
 
 
 # --------------------------------------------- (C) the log-invariant, F3
-@pytest.mark.skipif(
-    not os.path.exists(SB5H_D_LOG),
-    reason="the sb5h evidence tree is not shipped to the remote desk",
-)
+def test_f3_the_fixture_is_actually_in_the_tree():
+    """F3's subject must be SHIPPED, not merely present on the author's box.
+
+    RED-FIRST AND OBSERVED RED, on the real trap rather than a constructed
+    one: with the fixture named ``.log`` it was swallowed by the blanket
+    ``*.log`` in ``.gitignore:62``, so the remote had no subject and F3
+    returned ``FileNotFoundError`` -- a red that counts the same in a tally as
+    the red F3 is designed to produce, and would have been reported as it.
+    This test tells the two apart by name.
+
+    Tracked-ness is asserted where git can answer and existence everywhere:
+    on the remote desk the worktree is materialised from the PUSHED sha, so
+    existence there IS tracked-ness, which is exactly where the trap fired.
+    """
+    assert os.path.exists(SB5H_D_FIXTURE), (
+        f"{SB5H_D_FIXTURE} is missing. If it exists on your box but not here, "
+        "it was never committed -- check .gitignore (a blanket *.log ate this "
+        "fixture once already) and confirm with `git ls-files`."
+    )
+    try:
+        tracked = subprocess.run(
+            ["git", "ls-files", "--error-unmatch", SB5H_D_FIXTURE],
+            cwd=os.path.dirname(SB5H_D_FIXTURE),
+            capture_output=True,
+        ).returncode
+    except (OSError, ValueError):  # no git here: existence above is the check
+        tracked = 0
+    assert tracked == 0, (
+        f"{SB5H_D_FIXTURE} exists but git does not track it -- it will not "
+        "reach any other checkout, and F3 will fail there on a missing file "
+        "rather than on its invariant (.gitignore:62 is a blanket *.log)"
+    )
+
+
 def test_f3_every_truncated_read_reaches_a_terminal_line():
     """F3 -- THE ACCEPTANCE FOR PART (C), AND IT IS EXPECTED RED HERE.
 
     A read the pool cut must end somewhere a reader can see: a completion, a
-    reap, a refusal, or a defer.  On sb5h, 34 of 37 truncated rids have NONE
-    of the four -- issued, cut, and gone without a word ~1 s later, which is
-    why ``WEG2 X-DEFER`` is 0 in 109,471 lines while 24 requests were priced
-    at their whole prompt.  The trim deletion in this commit does not close
-    this; part (C) does, and this test is how the next boot says so.
+    reap, a refusal, or a defer.  On sb5h, 34 of 37 ``over_bound=true``
+    truncated rids have NONE of the five -- issued, cut, and gone without a
+    word ~1 s later, which is why ``WEG2 X-DEFER`` is 0 in 109,471 lines while
+    24 requests were priced at their whole prompt.  Neither the trim deletion
+    nor anything else on this branch closes this; part (C) does, and this test
+    is how the next boot says so.
+
+    RUNS EVERYWHERE (part C round 1).  Fix 2 wrote this test against the
+    evidence tree alone, so it skipped on the remote and was never executed as
+    a pytest node at all.  It now reads the shipped fixture -- the same lines,
+    proven identical by :func:`test_f3_fixture_is_faithful` wherever the full
+    log exists -- so the acceptance is a test that RAN and is red, not a
+    computation somebody did by hand and wrote down.
     """
-    trunc = {}
-    terminal = {}
-    rt = re.compile(r"#915 PREFETCH TRUNCATED rid=(\S+) need=(\d+) got=(\d+)")
-    markers = (
-        ("HiCache prefetch success req=", "success"),
-        ("#905 PREFETCH-COMPLETE", "complete"),
-        ("#1157 PREFETCH REAPED", "reaped"),
-        ("#915 PREFETCH REFUSED", "refused"),
-        ("WEG2 X-DEFER", "defer"),
+    trunc, terminal = _f3_walk(SB5H_D_FIXTURE)
+    assert len(trunc) >= F3_MIN_TRUNCATED_RIDS, (
+        f"only {len(trunc)} truncated rids in the subject -- below the "
+        f"{F3_MIN_TRUNCATED_RIDS} floor. A green from an empty walk is not a "
+        "green; the fixture or the instrument's line format moved."
     )
-    with open(SB5H_D_LOG, errors="replace") as fh:
-        for line in fh:
-            hit = rt.search(line)
-            if hit:
-                trunc.setdefault(hit.group(1)[:8], (hit.group(2), hit.group(3)))
-            for literal, name in markers:
-                if literal in line:
-                    rid = re.search(r"(?:req|rid)=([0-9a-f]{6,})", line)
-                    if rid:
-                        terminal.setdefault(rid.group(1)[:8], set()).add(name)
-    assert trunc, "the truncation instrument itself is missing from this log"
     orphans = sorted(r for r in trunc if not terminal.get(r))
     assert not orphans, (
         f"{len(orphans)} of {len(trunc)} truncated reads have no completion, "
         f"no reap, no refusal and no defer line: {orphans[:6]}... -- the X "
         "gate sees neither a pending read nor a refused one, so it prices the "
         "whole prompt (#1298 part C)"
+    )
+
+
+@pytest.mark.skipif(
+    not os.path.exists(SB5H_D_LOG),
+    reason="the sb5h evidence tree is not shipped to the remote desk",
+)
+def test_f3_fixture_is_faithful():
+    """The shipped cut answers F3 exactly as the 23 MB original does.
+
+    Without this, shrinking the subject to make it shippable is also a way to
+    make it friendlier, and nobody would see it.  Both populations are
+    compared -- the truncated set AND the orphan set -- because a fixture that
+    dropped a terminal line would make F3 MORE red and one that dropped a
+    truncation line would make it LESS, and only checking both catches both.
+    """
+    full_t, full_term = _f3_walk(SB5H_D_LOG)
+    fix_t, fix_term = _f3_walk(SB5H_D_FIXTURE)
+    assert set(fix_t) == set(full_t), (
+        "the fixture's truncated rid set differs from the full log's: "
+        f"missing={sorted(set(full_t) - set(fix_t))[:5]} "
+        f"extra={sorted(set(fix_t) - set(full_t))[:5]}"
+    )
+    full_orphans = sorted(r for r in full_t if not full_term.get(r))
+    fix_orphans = sorted(r for r in fix_t if not fix_term.get(r))
+    assert fix_orphans == full_orphans, (
+        f"the fixture answers F3 with {len(fix_orphans)} orphans where the "
+        f"full log answers {len(full_orphans)}: a terminal line was dropped "
+        "or invented by the cut"
     )
 
 

@@ -984,5 +984,77 @@ class TestARefusedRateVerdictIsCounted(_Clean):
         )
 
 
+class TestATruncatedReadNeverReachesTheDeferral(_Clean):
+    """#1298 part (C): WHY THE DEFER MACHINERY FIRED 0 TIMES ON BOOT weg2sb5h.
+
+    CHARACTERISATION, NOT A REGRESSION GUARD -- these pass on the parent and
+    are labelled so rather than dressed up as red-first.  They exist because
+    part (C) was specified as "reuse the A12.2 deferral mark", and the two
+    reasons that cannot work today are invisible in the source unless someone
+    joins three files.  A future builder who plans that fix reads them here.
+
+    THE FIRST REASON, pinned below.  A store read the host pool CUT still
+    REGISTERS -- that is the whole point of the truncation branches
+    (``unified_radix_cache.py:3614`` non-symmetric, ``:3833`` the #1290 group
+    trim) -- so ``_prefetch_kvcache``'s effect-based verdict is ``issued``,
+    byte-identical to a read that landed whole.  The deferral state machine
+    is entered only by ``declined:rate_limited``, so a truncated read never
+    reaches it at all, and boot weg2sb5h's D-group census shows exactly that
+    shape: ``host_pool_truncated=37`` per rank with NO ``rate_limited``, NO
+    ``deferred`` and NO ``defer_refused`` key present at all.
+
+    THE SECOND REASON is already pinned by
+    ``TestTheMarkDoesNotSurviveTheCutover`` above (``_prefetch_deferral_
+    refusal_reason() == "symmetric_vote"``, marks dropped, "no rank walks into
+    the #580 vote alone"): even a verdict that DID reach the machine could not
+    leave a mark on group D, because registration there is the #580 group vote
+    and a rank-divergent deferred set enters it unevenly.  Not duplicated
+    here; cross-referenced, because one pin per fact is the rule.
+    """
+
+    def test_the_issued_verdict_a_truncated_read_returns_is_not_the_deferrals_business(self):
+        s = _Intake(lambda r: "issued", symmetric=True, tp_size=3)
+        r = _Req("t", seq=1)
+        s._add_request_to_queue(r)
+        # No mark, and the state machine says the verdict is not its business.
+        _assert_unmarked(self, r)
+        self.assertIsNone(s._apply_prefetch_deferral(r, "issued", site="intake"))
+        _assert_unmarked(self, r)
+        # So the X gate's deferral arm (`_weg2_store_read_is_pending` reads
+        # `prefetch_deferred`) is False the instant the read leaves
+        # `ongoing_prefetch` -- which is why a cut read is priced at its whole
+        # extent (W50) instead of deferred. THAT is the #1298 part (C) gap.
+        self.assertIsNone(getattr(r, "prefetch_deferred", None))
+
+    def test_the_only_door_into_the_deferral_is_the_rate_verdict(self):
+        # Enumerated, not remembered: every verdict `_prefetch_kvcache` can
+        # return other than the rate one leaves an unmarked request unmarked.
+        # A future part (C) that routes truncation into the deferral must add
+        # its door HERE, and this test is what will notice.
+        s = _Intake(lambda r: "issued", symmetric=False)
+        for verdict in (
+            "issued",
+            "declined:already_in_flight",
+            "declined:attempted_but_unregistered",
+            "declined:storage_disabled",
+            "declined:anchor",
+            "declined:too_short",
+        ):
+            r = _Req(f"v-{verdict}", seq=1)
+            self.assertIsNone(
+                s._apply_prefetch_deferral(r, verdict, site="intake"), verdict
+            )
+            _assert_unmarked(self, r)
+        # ... and the rate verdict, on a tree that permits the deferral, does
+        # mark -- so the enumeration above is a property of the OTHER verdicts
+        # and not of a stand-in that can never mark anything.
+        r = _Req("rate", seq=1)
+        self.assertEqual(
+            s._apply_prefetch_deferral(r, "declined:rate_limited", site="intake"),
+            "deferred",
+        )
+        self.assertEqual(getattr(r, "prefetch_deferred", None), "rate_limited")
+
+
 if __name__ == "__main__":
     unittest.main()
