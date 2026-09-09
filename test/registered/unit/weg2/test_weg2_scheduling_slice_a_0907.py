@@ -614,12 +614,13 @@ def test_c10_x_is_derived_with_a_provenance_line_naming_its_three_inputs():
     assert launcher_mod.derive_x_star(13.247, 690.0, 3640.0, 30000) == 30000  # floor
     with pytest.raises(ValueError):
         launcher_mod.derive_x_star(13.247, 4000.0, 3640.0, 4096)  # no break-even
-    x, prov = launcher_mod.resolve_x(None, "/nonexistent-evidence-dir", 4096)
+    x, prov, x_measured = launcher_mod.resolve_x(None, "/nonexistent-evidence-dir", 4096)
     assert x == 22556
     assert "source=recorded PRE-BARLINK" in prov
+    assert x_measured is False, "#1299: the fallback must declare itself unmeasured"
     for term in ("flip_s=", "r_D=", "r_P=", "floor="):
         assert term in prov
-    x2, prov2 = launcher_mod.resolve_x(9999, "/nonexistent-evidence-dir", 4096)
+    x2, prov2, _m2 = launcher_mod.resolve_x(9999, "/nonexistent-evidence-dir", 4096)
     assert x2 == 9999 and "source=flag" in prov2
 
 
@@ -652,8 +653,9 @@ def test_c10_x_prefers_this_rigs_own_measured_lines(tmp_path):
         "WEG2-SERVED group=D leg=2 rid=b status=200 prompt_tokens=30100 cached_tokens=0 "
         "completion_tokens=5 uncached=30100 verdict=single_prefill wall=43.62s epoch=2\n"
     )
-    x, prov = launcher_mod.resolve_x(None, str(tmp_path), 4096)
+    x, prov, x_measured = launcher_mod.resolve_x(None, str(tmp_path), 4096)
     assert "source=boot:" in prov and log.name in prov
+    assert x_measured is True, "#1299: a seed read off a boot IS a measurement"
     # r_P is the DRAIN aggregate: (30100 + 30000) uncached over drain_s=12.0,
     # NOT the median of 30100/8.27 and 30000/9.00.
     r_p_drain = (30100 + 30000) / 12.000
