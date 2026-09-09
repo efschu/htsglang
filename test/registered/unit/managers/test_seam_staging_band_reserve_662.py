@@ -147,10 +147,17 @@ def test_sizing_reserves_the_band_floor_not_the_centre():
 
 def test_sizing_and_the_runtime_seam_reserve_are_the_same_number():
     """The disagreement WAS the defect: sizing kept 1024 while the gate spent
-    to 819, so a pool gain could eat the seam's margin unnoticed."""
-    law_mib = 1024
+    to 819, so a pool gain could eat the seam's margin unnoticed.
+
+    #1257c vocabulary: both sides are asked about the LAW, so the runtime side
+    is given a user reserve of 0. ``_args(1024)`` would now mean law PLUS a
+    1024 MiB reserve and the two would be answering different questions --
+    which is the very confusion this case exists to catch, so it must not be
+    written into the case itself.
+    """
+    law_mib = cg.CORRIDOR_LAW_MIB
     sizing = sr._band_floor_bytes(law_mib * MIB)
-    runtime = pfr._seam_staging_reserve_bytes(_args(law_mib))
+    runtime = pfr._seam_staging_reserve_bytes(_args(0))
     assert sizing == runtime == 819 * MIB
 
 
