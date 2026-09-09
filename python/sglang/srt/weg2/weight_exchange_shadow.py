@@ -25,8 +25,11 @@ shadow that finds something is exactly the thing it may not do:**
    SHADOW runs;
 3. it may not change a slot state on the authoritative path;
 4. it may not call ``vote_failure``;
-5. it may not raise into the leg: :func:`shadow_leg` catches ``BaseException``
-   and turns it into a logged line;
+5. it may not raise into the leg: :func:`shadow_transport` catches
+   ``BaseException`` and turns it into a logged line -- with ONE stated arm,
+   ``explicit=True``, where an operator asked for a named class subset by hand
+   and gets :class:`Weg2XchgShadowUnaffordable` instead of a silent degrade
+   (the W56 two-arm shape; it has no producer on the boot path, TODO(S6));
 6. it may not hold the flip: every wait here is bounded by ITS OWN small
    budget, never by ``WEG2_GROUP_FENCE_BUDGET_S``, because a shadow that can
    block a leg for 120 s has authority over the flip's wall.
@@ -127,11 +130,15 @@ class Weg2XchgShadowUnaffordable(RuntimeError):
     """W61 -- the shadow's buffers do not fit this card's free column.
 
     NOT a flip refusal.  Raised only when a caller EXPLICITLY demanded a class
-    subset (``--weg2-shadow-classes``); the automatic path logs the same
-    message and shadows nothing on that card, because a shadow that refuses a
-    flip has taken the authority this slice exists not to have.  Same shape as
-    W56's two arms in S4: logged when the degrade is automatic, raised when the
-    operator asked for the thing that is unavailable.
+    subset (``classes=``, which has no launcher flag yet: TODO(S6)); the
+    automatic path logs the same message and votes NO in the shadow gate.  That
+    gate is RANK-UNIFORM, so one card's refusal switches the shadow off on ALL
+    SIX RANKS for that leg -- not "shadows nothing on that card", which is what
+    this sentence used to say and is not what the gate does (S5 refuter,
+    wording).  A shadow that refuses a FLIP would have taken the authority this
+    slice exists not to have; refusing ITSELF is the whole mechanism.  Same
+    shape as W56's two arms in S4: logged when the degrade is automatic, raised
+    when the operator asked for the thing that is unavailable.
     """
 
 
@@ -200,6 +207,14 @@ class ShadowVerdict:
     refusers: Tuple[int, ...]
     reason: str
     waited_s: float
+    #: THE SPREAD OF THE SIX RANKS' OWN PUBLICATION STAMPS, in ms -- which is
+    #: what "skew" means.  MEASURED-BY-REVIEW finding (S5 refuter): the result
+    #: line's ``gate_skew_ms`` carried ``waited_s``, i.e. THIS rank's wait,
+    #: and grading spec 6/S5's ``gate_skew_ms <= 100`` against a wait
+    #: conflates two different numbers -- a rank that arrives last waits ~0 and
+    #: would have reported a skew of zero on the leg with the largest one.
+    #: The rows already carry ``ts_ns``, so the real number is free.
+    skew_ms: float = 0.0
 
     def line(self, *, leg: int, epoch: str) -> str:
         return (
@@ -207,7 +222,8 @@ class ShadowVerdict:
             f"joined={self.joined}/{xr.N_RANKS} "
             f"run={'yes' if self.run else 'no'} "
             f"refusers={','.join(str(r) for r in self.refusers) or 'none'} "
-            f"waited_s={self.waited_s:.3f} reason={self.reason}"
+            f"waited_s={self.waited_s:.3f} skew_ms={self.skew_ms:.3f} "
+            f"reason={self.reason}"
         )
 
 
@@ -260,8 +276,10 @@ def shadow_gate(region: xr.XchgRegion, row: int, *, leg: int, vote: bool,
                         f"[row={i} classes_hash={r['classes_hash']:#x}]"
                         for i, r in enumerate(rows)),
                     monotonic() - started)
+            stamps = [int(r["ts_ns"]) for r in rows]
             return ShadowVerdict(True, len(fresh), (), "all six joined",
-                                 monotonic() - started)
+                                 monotonic() - started,
+                                 (max(stamps) - min(stamps)) / 1e6)
         if monotonic() - started >= budget_s:
             missing = tuple(i for i, r in enumerate(rows)
                             if not (r["sealed"]
@@ -331,6 +349,23 @@ class ShadowSubset:
     def hash(self) -> int:
         return classes_hash(self.classes)
 
+    @property
+    def tags(self) -> Tuple[str, ...]:
+        """The TAGS the chosen classes fall in, for the acceptance line.
+
+        Spec section 6/S5's line names ``tag=``, and its sentence is "per flip,
+        ONE tag is shadowed, rotating".  THIS SLICE ROTATES OVER THE TENSOR
+        CLASS INSTEAD, and the deviation is stated rather than papered over
+        (S5 review, must_fix 5): the offsets that can be wrong are wrong for a
+        whole CLASS at once (R5 -- a wrong device offset writes ``k`` over
+        ``q`` for every layer of every tag), so a class is the unit that either
+        proves or fails, and a tag is a save-order bucket the class cuts
+        across.  The line therefore carries the tags the chosen classes
+        actually touch, which is one tag in the common case and says so when it
+        is not.
+        """
+        return tuple(sorted({str(d.tag) for d in self.descs}))
+
 
 def rotation_of(descs: Sequence[object]) -> Tuple[str, ...]:
     """Every class in the plan, in a DETERMINISTIC order all six ranks share.
@@ -383,41 +418,66 @@ def select_subset(descs: Sequence[object], *, leg: int,
 # ---------------------------------------------------------------------------
 
 
+#: The two things a budget line can be about.  ``subset`` is what this leg
+#: will actually run and is the only one that grades anything; ``full`` is the
+#: whole leg, priced and printed for the reader and nothing else.
+SCOPE_SUBSET = "subset"
+SCOPE_FULL = "full"
+
+
 @dataclass(frozen=True)
 class ShadowPrice:
     card: str
-    need_mib: int
+    dst_mib: int
+    scratch_mib: int
+    bounce_mib: int
     free_mib: int
     floor_mib: float
-    scratch_mib: int
+    reserve_mib: int = 0
+    scope: str = SCOPE_SUBSET
+    graded: bool = True
+
+    @property
+    def need_mib(self) -> int:
+        return self.dst_mib + self.scratch_mib + self.bounce_mib
 
     @property
     def affordable(self) -> bool:
-        return self.free_mib - self.need_mib >= self.floor_mib
+        return (self.free_mib - self.need_mib - self.reserve_mib
+                >= self.floor_mib)
 
     def message(self) -> str:
         return (
-            f"{UNAFFORDABLE_MARKER} card={self.card} need_mib={self.need_mib} "
-            f"(dst_buffers={self.need_mib - self.scratch_mib} + "
-            f"scratch={self.scratch_mib}) free_mib={self.free_mib} "
-            f"floor_mib={self.floor_mib:g} "
-            f"left_mib={self.free_mib - self.need_mib} -- the shadow does not "
-            f"run on this card for this leg; the flip is untouched.  "
-            f"{SB5F_FREE_MIB_NOTE}"
+            f"{UNAFFORDABLE_MARKER} card={self.card} scope={self.scope} "
+            f"need_mib={self.need_mib} "
+            f"(dst_buffers={self.dst_mib} + scratch={self.scratch_mib} + "
+            f"oncard_bounce={self.bounce_mib}) "
+            f"resume_reserve_mib={self.reserve_mib} "
+            f"free_mib={self.free_mib} floor_mib={self.floor_mib:g} "
+            f"left_mib={self.free_mib - self.need_mib - self.reserve_mib} "
+            f"-- the shadow does not run on this card for this leg; the flip "
+            f"is untouched.  {SB5F_FREE_MIB_NOTE}"
         )
 
     def line(self) -> str:
         return (
-            f"{SHADOW_BUDGET_LINE_PREFIX} card={self.card} "
-            f"need_mib={self.need_mib} free_mib={self.free_mib} "
-            f"floor_mib={self.floor_mib:g} "
+            f"{SHADOW_BUDGET_LINE_PREFIX} card={self.card} scope={self.scope} "
+            f"need_mib={self.need_mib} dst_mib={self.dst_mib} "
+            f"scratch_mib={self.scratch_mib} bounce_mib={self.bounce_mib} "
+            f"resume_reserve_mib={self.reserve_mib} "
+            f"free_mib={self.free_mib} floor_mib={self.floor_mib:g} "
+            f"graded={'yes' if self.graded else 'no'} "
             f"verdict={'AFFORDABLE' if self.affordable else 'REFUSED'}"
         )
 
 
 def price_shadow(card: str, need_bytes: int, free_mib: int, *,
                  floor_mib: float = SHADOW_FLOOR_MIB,
-                 scratch_bytes: int = STRIPE_BYTES) -> ShadowPrice:
+                 scratch_bytes: int = STRIPE_BYTES,
+                 bounce_bytes: int = 0,
+                 reserve_bytes: int = 0,
+                 scope: str = SCOPE_SUBSET,
+                 graded: bool = True) -> ShadowPrice:
     """Can this card carry the shadow's buffers on top of what it is doing?
 
     ``need`` is the destination buffers (raw ``cudaMalloc``, OUTSIDE every TMS
@@ -425,14 +485,85 @@ def price_shadow(card: str, need_bytes: int, free_mib: int, *,
     plus ONE stripe-sized scratch for the device checksum -- the spec's own
     "VRAM delta = 64 MiB per consumer rank".
 
+    ``bounce_bytes`` IS THE THIRD TERM AND IT WAS MISSING.  MEASURED-BY-REVIEW
+    DEFECT (S5 review must_fix 3, refuter must_fix 2): a SOURCE rank priced
+    ``need=0`` and then allocated ``slots x slot_bytes`` of raw ``cudaMalloc``
+    on its own card inside ``run_leg``'s diagonal (:class:`tp.OnCardBounce`) --
+    up to 2 x 128 MiB on exactly the card the boot ticket expects to refuse.
+    An instrument whose only forbidden failure is "OOM the flip it observes"
+    had an unpriced VRAM term on the source leg.
+
+    ``reserve_bytes`` IS THE FOURTH, and it is the timing hole the refuter
+    named (must_fix 4): ``free_mib`` is read at HOOK time, but the
+    destination's ring ``resume`` maps its image AFTER that instant while the
+    shadow's buffers are still alive.  A subset that fits the free column now
+    can OOM the authoritative ``cu_mem_create`` a moment later.  The caller
+    that knows the not-yet-resumed demand passes it here; it defaults to 0 and
+    the line PRINTS the number, so a boot where nobody passed it says so
+    (``resume_reserve_mib=0``) instead of looking priced.  TODO(S6): the
+    destination-side hook in ``weight_updater`` is where that number exists.
+
     ``free_mib`` is the card's LIVE NVML free column, read by the caller.  Not
     a census, not a projection: R6 (the allocator cache) is unbounded in
     principle and this is an instrument that must not OOM the boot it observes,
     so the number it prices against is the one the driver reports right now.
     """
-    need = int(-(-int(need_bytes) // MIB)) + int(-(-int(scratch_bytes) // MIB))
-    return ShadowPrice(str(card), need, int(free_mib), float(floor_mib),
-                       int(-(-int(scratch_bytes) // MIB)))
+    up = lambda n: int(-(-int(n) // MIB))  # noqa: E731 -- one line, three uses
+    return ShadowPrice(str(card), up(need_bytes), up(scratch_bytes),
+                       up(bounce_bytes), int(free_mib), float(floor_mib),
+                       up(reserve_bytes), str(scope), bool(graded))
+
+
+def price_leg(card_uuid: str, descs: Sequence[object], *, rank: int,
+              is_source: bool, oncard_mode: str, free_mib: int,
+              oncard_slots: int = tp.ONCARD_SLOTS,
+              oncard_slot_bytes: Optional[int] = None,
+              floor_mib: float = SHADOW_FLOOR_MIB,
+              stripe_bytes: int = STRIPE_BYTES,
+              reserve_bytes: int = 0,
+              scope: str = SCOPE_SUBSET,
+              graded: bool = True) -> Tuple[ShadowPrice, int]:
+    """Every VRAM term ONE RANK's shadow costs ON ITS OWN CARD, and the slot.
+
+    Returns the price and the diagonal slot size, together, because they are
+    the same decision: the slot sizes the bounce, and the bounce is a term of
+    the price.  Computing them apart is how the source's bounce came to be
+    allocated without ever being priced.
+
+    THE DIAGONAL IS THIS CARD'S, NOT THE SUM.  ``run_leg`` selects its on-card
+    descriptors with ``src_rank == rank``
+    (``weight_exchange_transport.py:2500``): the lane runs ONCE PER CARD
+    between the two co-located processes.  MEASURED-BY-REVIEW DEFECT (S5
+    refuter, must_fix 5): the caller priced the slot from the subset's on-card
+    bytes summed across ALL THREE cards -- the exact denominator error
+    ``XchgPlan.oncard_bytes_by_rank`` exists to stop, re-committed one seam
+    over, and it inflated the unpriced bounce of the defect above by ~3x.
+
+    Both co-located processes compute this from the same ``src_rank == rank``
+    filter over the same descriptors, so they agree by construction and the
+    W52 slot_bytes cross-check in the diagonal stays a cross-check.
+    """
+    moved = [d for d in descs if d.kind != tp.ZEROFILL]
+    mine_dst = [d for d in moved if int(d.dst_rank) == int(rank)]
+    oncard_bytes = sum(int(d.nbytes) for d in moved
+                       if _is_on_card(d) and int(d.src_rank) == int(rank))
+    diag_slot = (int(tp.plan_oncard_slot_bytes(oncard_bytes).slot_bytes)
+                 if oncard_slot_bytes is None else int(oncard_slot_bytes))
+    # The IMPORTING side maps the exporter's allocation and allocates none of
+    # its own; the ``host`` degrade's bounce is a shm file, not VRAM.  So the
+    # term is the EXPORTER's, and only on the IPC arm.
+    exports = (bool(is_source) and oncard_bytes > 0
+               and str(oncard_mode) == tp.ONCARD_MODE_IPC)
+    price = price_shadow(
+        card_uuid,
+        0 if is_source else shadow_layout(mine_dst)[1],
+        free_mib,
+        floor_mib=floor_mib,
+        scratch_bytes=0 if is_source else int(stripe_bytes),
+        bounce_bytes=int(oncard_slots) * diag_slot if exports else 0,
+        reserve_bytes=int(reserve_bytes),
+        scope=str(scope), graded=bool(graded))
+    return price, diag_slot
 
 
 # ---------------------------------------------------------------------------
@@ -460,6 +591,29 @@ class Stripe:
 MATCH = "MATCH"
 MISMATCH = "MISMATCH"
 NOT_REPRESENTABLE = "NOT-REPRESENTABLE"
+#: A compare that RAN and had nothing to compare.  Not MATCH -- see
+#: :meth:`ShadowCounters.verdict`.
+NO_STRIPES = "NO-STRIPES"
+
+
+def checksum_representable(value: int, nbytes: int) -> bool:
+    """Spec section 3.3 rule 3, asked from ONE place in this module.
+
+    MEASURED-BY-REVIEW DEFECT (S5 review, must_fix 1): the question was asked
+    for STRIPES only.  The SLOT-checksum path -- the transport's own
+    producer-vs-consumer comparison, which reaches the same W59 marker --
+    logged a mismatch on a bare inequality, so a batch whose two ends framed
+    the field differently was reported as a data corruption.  That is #656
+    register C22 exactly, and it is why rule 3 says "before ANY mismatch is
+    reported" rather than "before a stripe is".
+
+    The import is LAZY because ``weights_arena`` imports torch and this module
+    is exercised at the desk without it; the function is IMPORTED, never
+    re-derived (rule 3 says so in as many words).
+    """
+    from sglang.srt.model_executor.weights_arena import checksum_is_representable
+
+    return bool(checksum_is_representable(int(value), int(nbytes)))
 
 
 def classify(stripe: Stripe) -> str:
@@ -472,14 +626,11 @@ def classify(stripe: Stripe) -> str:
     register C22 reported exactly that as a data corruption and an instance was
     killed for a corruption that had not happened.
 
-    The import is LAZY because ``weights_arena`` imports torch and this module
-    is exercised at the desk without it; the function is IMPORTED, never
-    re-derived (rule 3 says so in as many words).
+    Asked through :func:`checksum_representable`, which is also what the SLOT
+    path asks -- one question, one caller, so the two cannot drift again.
     """
-    from sglang.srt.model_executor.weights_arena import checksum_is_representable
-
     for value in (stripe.shadow_sum, stripe.ring_sum):
-        if not checksum_is_representable(value, stripe.nbytes):
+        if not checksum_representable(value, stripe.nbytes):
             return NOT_REPRESENTABLE
     return MATCH if stripe.match else MISMATCH
 
@@ -502,6 +653,60 @@ def mismatch_message(stripe: Stripe, *, verdict: str, leg: int,
            "the same destination offsets; the RING's bytes are authoritative "
            "and were served, this is a finding about the EXCHANGE")
     )
+
+
+def slot_checksum_verdict(report: "tp.ChecksumReport") -> str:
+    """MATCH / MISMATCH / NOT-REPRESENTABLE for one STAGED batch.
+
+    The same three answers in the same order as :func:`classify`, for the other
+    checksum in this slice: the transport's producer-published sum against the
+    consumer's own sum over the staged bytes.  ``ChecksumReport`` states in its
+    own docstring that it "cannot tell a corruption from a framing error (that
+    is what ``checksum_is_representable`` is for)"; this is the caller that
+    obeys it.
+    """
+    if report.match:
+        return MATCH
+    for value in (report.expected, report.got):
+        if not checksum_representable(value, report.nbytes):
+            return NOT_REPRESENTABLE
+    return MISMATCH
+
+
+def slot_checksum_message(report: "tp.ChecksumReport", *, verdict: str,
+                          leg: int, epoch: str) -> str:
+    """W59 for a staged batch, naming the lane, the slot and both sums."""
+    return (
+        f"{MISMATCH_MARKER} leg={leg} epoch={epoch} verdict={verdict} "
+        f"lane={report.lane} pair={report.pair} slot={report.slot} "
+        f"seq={report.seq} nbytes={report.nbytes} "
+        f"producer_checksum={report.expected} consumer_checksum={report.got} "
+        + ("-- one of the two values is outside [0, 255*nbytes], so it was "
+           "never a checksum of this batch: the two ends framed the field "
+           "differently and the STAGED BYTES are not what is wrong (#656 C22)"
+           if verdict == NOT_REPRESENTABLE else
+           "-- the STAGED bytes changed between publish and read; counted, "
+           "never acted on")
+    )
+
+
+def report_slot_checksum(report: "tp.ChecksumReport", counters: "ShadowCounters",
+                         *, leg: int, epoch: str,
+                         log: Callable[[str], None]) -> str:
+    """Count one staged batch's checksum.  COUNT AND LOG, never act.
+
+    Returns the verdict so a caller can assert on it; the flip is never told.
+    """
+    counters.checksum_reports += 1
+    verdict = slot_checksum_verdict(report)
+    if verdict == MATCH:
+        return verdict
+    if verdict == NOT_REPRESENTABLE:
+        counters.checksum_not_representable += 1
+    else:
+        counters.checksum_mismatch += 1
+    log(slot_checksum_message(report, verdict=verdict, leg=leg, epoch=epoch))
+    return verdict
 
 
 def payload_runs(desc: object, shadow_ptr: int, shadow_off: int):
@@ -611,51 +816,76 @@ def to_shadow(descs: Sequence[object], layout: Dict[int, int],
 # ---------------------------------------------------------------------------
 
 
-def torch_device_summer(ops: tp.DeviceOps, device: int, stream: int,
-                        scratch_ptr: int, scratch_bytes: int = STRIPE_BYTES):
+def make_device_scratch(nbytes: int = STRIPE_BYTES, device: Optional[int] = None):
+    """THE ONE PRODUCER of the summer's scratch: a uint8 device tensor.
+
+    Torch-owned because :func:`~sglang.srt.model_executor.weights_arena.uint8_checksum`
+    takes a tensor, and that is what makes the sum a DEVICE sum.  The shadow's
+    destination BUFFERS are raw ``cudaMalloc`` instead (see
+    :class:`ShadowBuffers`), deliberately: two allocators, two reasons, both
+    stated.  ITS SIZE IS THE STRIPE SIZE and the summer re-reads it from the
+    tensor, so the two numbers cannot be given independently and drift.
+    """
+    import torch
+
+    return torch.empty(int(nbytes), dtype=torch.uint8,
+                       device="cuda" if device is None else f"cuda:{int(device)}")
+
+
+def device_summer(ops: tp.DeviceOps, stream: int, scratch,
+                  checksum: Optional[Callable[[object], int]] = None):
     """``sum_bytes(addr, nbytes)`` over DEVICE memory, on the device.
 
-    The range is copied D2D into a torch-owned uint8 scratch and summed by
+    The range is copied D2D into ``scratch`` and summed by
     :func:`~sglang.srt.model_executor.weights_arena.uint8_checksum`, which is
     imported and never re-derived (spec 3.3 rule 3).  No host round trip of the
     payload: the only thing that crosses is the scalar, at the one sync
     ``uint8_checksum`` already does.
 
-    The scratch is a torch tensor because that is what makes the sum a DEVICE
-    sum; the shadow's destination BUFFERS are raw ``cudaMalloc`` instead,
-    deliberately, so they sit outside every TMS region and can never be paused,
-    unmapped or counted into the saver's census.  Two allocators, two reasons,
-    both stated.
+    **THE SCRATCH IS THE ARGUMENT, AND ITS SIZE IS READ FROM IT.**
+    MEASURED-BY-REVIEW DEFECT (S5 refuter, must_fix 1): the first version took
+    a raw ``scratch_ptr`` plus a byte count and bound the TENSOR afterwards
+    through a ``bind_scratch`` attribute that had no caller anywhere.  Unbound,
+    the tensor was ``torch.empty(0)``, ``scratch[:n]`` was empty, and
+    ``uint8_checksum`` returned 0 for BOTH sides of every stripe -- a summer
+    that cannot go red, on an instrument whose acceptance is ``mismatch=0``.
+    Nothing coupled the memcpy target to the tensor's storage either.  Here the
+    tensor IS the target (``data_ptr()``) and IS the bound
+    (``numel() * element_size()``), so the dead-instrument state is not
+    reachable, and a range larger than the scratch is REFUSED rather than
+    silently truncated to whatever the slice returns.
 
     OPEN ITEM, named rather than hidden: a 2-D class contributes ~6 KiB runs,
     so this issues one small D2D per run.  It is an observer, bounded by the
     class subset, and the cost lands in ``compare_ms`` on the line -- but it is
     not free and it is not the shape S6 would use for an authoritative check.
     """
-    import torch
-
-    scratch = torch.empty(0)  # placeholder; bound below
+    scratch_ptr = int(scratch.data_ptr())
+    scratch_bytes = int(scratch.numel()) * int(scratch.element_size())
+    if scratch_bytes <= 0:
+        raise ValueError(
+            "the device summer was handed an EMPTY scratch -- every sum would "
+            "be 0 and every stripe would match itself; the scratch is the "
+            "stripe (spec 6/S5's 64 MiB per consumer rank) and it must be "
+            "allocated before the summer exists")
 
     def sum_bytes(addr: int, nbytes: int) -> int:
-        from sglang.srt.model_executor.weights_arena import uint8_checksum
-
         n = int(nbytes)
         if n <= 0:
             return 0
-        if n > int(scratch_bytes):
+        if n > scratch_bytes:
             raise ValueError(
-                f"a stripe of {n} bytes does not fit the {int(scratch_bytes)}-byte "
+                f"a stripe of {n} bytes does not fit the {scratch_bytes}-byte "
                 f"shadow scratch -- the scratch IS the stripe size (spec 6/S5's "
                 f"64 MiB per consumer rank), so these two numbers may not drift")
         ops.memcpy_async(scratch_ptr, int(addr), n, stream)
         ops.synchronize(stream)
+        if checksum is not None:
+            return int(checksum(scratch[:n]))
+        from sglang.srt.model_executor.weights_arena import uint8_checksum
+
         return int(uint8_checksum(scratch[:n]))
 
-    def bind(tensor) -> None:
-        nonlocal scratch
-        scratch = tensor
-
-    sum_bytes.bind_scratch = bind  # type: ignore[attr-defined]
     return sum_bytes
 
 
@@ -674,12 +904,25 @@ class ShadowCounters:
     not_representable: int = 0
     checksum_reports: int = 0
     checksum_mismatch: int = 0
+    checksum_not_representable: int = 0
     errors: List[str] = field(default_factory=list)
 
     @property
     def verdict(self) -> str:
+        """MISMATCH / MATCH / NO-STRIPES -- and the third one is the point.
+
+        MEASURED-BY-REVIEW finding (S5 refuter): a comparison that produced NO
+        stripes returned ``MATCH``, so a destination whose subset selected
+        nothing on this rank printed the same word as one that compared a whole
+        class and agreed.  Only the boot ticket's "``mismatch=0`` WITH
+        ``stripes>0``" grep stood between that and an unarmed instrument
+        reading as a passed one -- a compensating reader, which is the thing
+        this campaign refuses to rely on.  The code says it now.
+        """
         if self.mismatch or self.not_representable:
             return MISMATCH
+        if not self.stripes:
+            return NO_STRIPES
         return MATCH
 
 
@@ -691,12 +934,18 @@ class ShadowResult:
     counters: ShadowCounters
     oncard_ms: float = 0.0
     cross_ms: float = 0.0
-    ring_ms: float = 0.0
+    #: NO PRODUCER IN THIS SLICE, and the line says ``n/a`` rather than
+    #: ``0.000``.  MEASURED-BY-REVIEW finding (S5 refuter): a zero prints as a
+    #: measurement, and ``ring_ms`` (the authoritative restore's own wall) and
+    #: ``lock_wait_ms`` (``_split_decisions`` contention) are both filled by
+    #: the ``weight_updater`` hooks S6 owns.  ``None`` is the honest value of a
+    #: field nothing has measured yet.
+    ring_ms: Optional[float] = None
     compare_ms: float = 0.0
     issue_ms: float = 0.0
     slot_wait_ms: float = 0.0
     gate_skew_ms: float = 0.0
-    lock_wait_ms: float = 0.0
+    lock_wait_ms: Optional[float] = None
     pieces: int = 0
     direction: str = "?"
     ran: bool = False
@@ -716,26 +965,35 @@ class ShadowResult:
         ``lock_wait_ms`` is an OBSERVATION, never a budget (R2-10): with one
         producer and one consumer per card and a direction-split key there is
         no second contender by construction, so a non-zero value is a finding
-        about ``_split_decisions``, not about the exchange.
+        about ``_split_decisions``, not about the exchange.  It and ``ring_ms``
+        print ``n/a`` until a hook fills them -- see the field comments.
+
+        ``tag=`` carries the tags the shadowed CLASSES fall in; the rotation
+        unit of this slice is the class, not the tag, and
+        :attr:`ShadowSubset.tags` states why.
         """
         counters = self.counters
+        ms = lambda v: "n/a" if v is None else f"{v:.3f}"  # noqa: E731
         return (
             f"{SHADOW_LINE_PREFIX} leg={self.leg} epoch={self.epoch} "
             f"dir={self.direction} ran={'yes' if self.ran else 'no'} "
             f"classes={len(self.subset.classes)} "
             f"subset={','.join(self.subset.classes) or 'none'} "
             f"rotation={len(self.subset.rotation)} "
+            f"tag={','.join(self.subset.tags) or 'none'} "
             f"pieces={self.pieces} stripes={counters.stripes} "
             f"match={counters.match} mismatch={counters.mismatch} "
             f"not_representable={counters.not_representable} "
             f"slot_checksums={counters.checksum_reports} "
             f"slot_checksum_mismatch={counters.checksum_mismatch} "
+            f"slot_checksum_not_representable="
+            f"{counters.checksum_not_representable} "
             f"oncard_ms={self.oncard_ms:.3f} cross_ms={self.cross_ms:.3f} "
-            f"ring_ms={self.ring_ms:.3f} compare_ms={self.compare_ms:.3f} "
+            f"ring_ms={ms(self.ring_ms)} compare_ms={self.compare_ms:.3f} "
             f"xchg_ms={self.oncard_ms + self.cross_ms:.3f} "
             f"issue_ms={self.issue_ms:.3f} slot_wait_ms={self.slot_wait_ms:.3f} "
             f"gate_skew_ms={self.gate_skew_ms:.3f} "
-            f"lock_wait_ms={self.lock_wait_ms:.3f} "
+            f"lock_wait_ms={ms(self.lock_wait_ms)} "
             f"verdict={counters.verdict if self.ran else 'NOT-RUN'} "
             f"reason={self.reason or 'ok'}"
         )
@@ -749,25 +1007,28 @@ class ShadowBuffers:
     the saver, which would put the shadow's buffers inside the weights region
     -- paused with it, unmapped with it, and counted into the census the ring
     is sized from.  An observer that changes the thing it observes is not one.
+
+    ONE ALLOCATION, and the scratch is NOT here.  MEASURED-BY-REVIEW DEFECT
+    (S5 refuter, must_fix 3): this used to issue two raw ``cudaMalloc``s in one
+    ``__init__``, and a failure of the second one -- which is what happens on
+    the tight card, the only card where this matters -- propagated with the
+    first already leaked for the life of the boot.  The summer's scratch is a
+    torch tensor owned by :func:`make_device_scratch` (one object, one
+    pointer, one size), so there is nothing left to pair with here.
     """
 
-    def __init__(self, ops: tp.DeviceOps, device: int, nbytes: int,
-                 scratch_bytes: int = STRIPE_BYTES):
+    def __init__(self, ops: tp.DeviceOps, device: int, nbytes: int):
         self.ops = ops
         self.nbytes = int(nbytes)
-        self.scratch_bytes = int(scratch_bytes)
         self.ptr = ops.raw_malloc(int(device), self.nbytes) if self.nbytes else 0
-        self.scratch = (ops.raw_malloc(int(device), self.scratch_bytes)
-                        if self.scratch_bytes else 0)
 
     def close(self) -> None:
-        for ptr in (self.ptr, self.scratch):
-            if ptr:
-                try:
-                    self.ops.raw_free(ptr)
-                except Exception:  # noqa: BLE001 -- an observer's unwind
-                    pass
-        self.ptr = self.scratch = 0
+        if self.ptr:
+            try:
+                self.ops.raw_free(self.ptr)
+            except Exception:  # noqa: BLE001 -- an observer's unwind
+                pass
+        self.ptr = 0
 
 
 class ShadowRun:
@@ -868,6 +1129,7 @@ def shadow_transport(
     per_leg: int = 1,
     budget_s: float = SHADOW_TRANSPORT_BUDGET_S,
     floor_mib: float = SHADOW_FLOOR_MIB,
+    resume_reserve_bytes: int = 0,
     explicit: bool = False,
     slot_bytes: int = xr.SLOT_BYTES,
     oncard_slot_bytes: Optional[int] = None,
@@ -881,26 +1143,48 @@ def shadow_transport(
     allocating after the gate is what stops a rank that will not run from
     taking VRAM anyway.
 
-    EVERY FAILURE PATH ENDS IN A LOG LINE AND A RETURNED RESULT.  There is no
-    exception that leaves this function, including the ones the transport
-    raises by design (W52, W53, W54): on the authoritative path those are
-    refusals that stop a flip, and here the same event means "the shadow did
-    not get its measurement".  ``vote_failure`` is a RECORDER, not the
-    transport's group vote -- passing the real one would let an observer's
-    thread take six ranks down.
+    EVERY FAILURE PATH ENDS IN A LOG LINE AND A RETURNED RESULT, WITH ONE
+    STATED EXCEPTION.  No exception leaves this function on the automatic path,
+    including the ones the transport raises by design (W52, W53, W54): on the
+    authoritative path those are refusals that stop a flip, and here the same
+    event means "the shadow did not get its measurement".  The exception is
+    ``explicit=True`` -- an operator who asked for a named class subset gets
+    :class:`Weg2XchgShadowUnaffordable` raised instead of a degrade, the same
+    two-arm shape as W56 in S4, and that arm has no producer on the boot path
+    (there is no launcher flag for it: TODO(S6)).  ``vote_failure`` is a
+    RECORDER, not the transport's group vote -- passing the real one would let
+    an observer's thread take six ranks down.
+
+    ``resume_reserve_bytes`` is the destination's not-yet-resumed image demand;
+    see :func:`price_shadow`.  It defaults to 0 and the budget line prints it,
+    so an unwired boot is visibly unwired rather than quietly optimistic.
     """
     subset = select_subset(descs, leg=leg, classes=classes, per_leg=per_leg)
     result = ShadowResult(leg=int(leg), epoch=str(epoch), subset=subset,
                           counters=ShadowCounters(), direction=str(direction))
     run = ShadowRun(result, None, (), {}, stripe_bytes=stripe_bytes)
     try:
-        mine = [d for d in subset.descs
-                if int(d.dst_rank if not is_source else d.src_rank) == int(rank)]
-        need_bytes = 0 if is_source else shadow_layout(
-            [d for d in subset.descs if int(d.dst_rank) == int(rank)])[1]
-        price = price_shadow(card_uuid, need_bytes, free_mib,
-                             floor_mib=floor_mib,
-                             scratch_bytes=0 if is_source else stripe_bytes)
+        # THE FULL LEG, PRICED AND PRINTED, GRADING NOTHING.  MEASURED-BY-
+        # REVIEW DEFECT (S5 review, must_fix 4): the automatic path prices only
+        # the SUBSET, so no full-size budget line could ever appear on a
+        # default shadow boot -- and the boot ticket's prediction ("the 5090
+        # refuses at full size; no refusal there is itself a finding") was
+        # graded against an absence the code guaranteed.  An absence that
+        # cannot occur is not evidence.  This line is scope=full graded=no: it
+        # is the ticket's number, and it decides nothing.
+        full_price, _ = price_leg(
+            card_uuid, descs, rank=rank, is_source=is_source,
+            oncard_mode=oncard_mode, free_mib=free_mib,
+            oncard_slots=oncard_slots, oncard_slot_bytes=oncard_slot_bytes,
+            floor_mib=floor_mib, stripe_bytes=stripe_bytes,
+            reserve_bytes=resume_reserve_bytes, scope=SCOPE_FULL, graded=False)
+        log(full_price.line())
+        price, diag_slot = price_leg(
+            card_uuid, subset.descs, rank=rank, is_source=is_source,
+            oncard_mode=oncard_mode, free_mib=free_mib,
+            oncard_slots=oncard_slots, oncard_slot_bytes=oncard_slot_bytes,
+            floor_mib=floor_mib, stripe_bytes=stripe_bytes,
+            reserve_bytes=resume_reserve_bytes, scope=SCOPE_SUBSET)
         log(price.line())
         if not price.affordable:
             log(price.message())
@@ -910,18 +1194,27 @@ def shadow_transport(
                               classes_hash=subset.hash, need_mib=price.need_mib,
                               log=log)
         log(verdict.line(leg=leg, epoch=epoch))
-        result.gate_skew_ms = verdict.waited_s * 1e3
+        # THE SIX RANKS' SPREAD, not this rank's wait -- see
+        # :attr:`ShadowVerdict.skew_ms`.
+        result.gate_skew_ms = verdict.skew_ms
         if not verdict.run:
             result.reason = verdict.reason.split(":")[0].replace(" ", "-")
             return run
-        layout, total = shadow_layout([d for d in subset.descs
-                                       if int(d.dst_rank) == int(rank)])
+        mine_dst = [d for d in subset.descs if int(d.dst_rank) == int(rank)]
+        layout, total = shadow_layout(mine_dst)
         buffers = None
         leg_descs: Sequence[object] = subset.descs
         if not is_source:
-            buffers = ShadowBuffers(ops, device, total,
-                                    scratch_bytes=stripe_bytes)
-            mine_dst = [d for d in subset.descs if int(d.dst_rank) == int(rank)]
+            buffers = ShadowBuffers(ops, device, total)
+            # THE RUN OWNS THE BUFFER FROM THE INSTANT IT EXISTS.  MEASURED-BY-
+            # REVIEW DEFECT (S5 refuter, must_fix 3): the run was built AFTER
+            # the descriptor rewrite below, so an exception in between reached
+            # the handler, which called ``close()`` on the STALE run
+            # (``buffers=None``) and leaked the whole destination buffer for
+            # the life of the boot -- on the card where allocations raise,
+            # which is the only card where any of this matters.
+            run = ShadowRun(result, buffers, (), layout,
+                            stripe_bytes=stripe_bytes)
             shadowed = to_shadow(mine_dst, layout, buffers.ptr)
             keep = {id(d) for d in mine_dst}
             leg_descs = [d for d in subset.descs if id(d) not in keep] + shadowed
@@ -933,20 +1226,12 @@ def shadow_transport(
             # could not go red.  A comparison whose two sides are the same
             # pointer is the "gate that cannot fail" this campaign keeps
             # naming, and it was one line.
-            run = ShadowRun(result, buffers, mine_dst, layout,
-                            stripe_bytes=stripe_bytes)
+            run.descs = list(mine_dst)
         counters = result.counters
 
         def on_checksum(report: tp.ChecksumReport) -> None:
-            counters.checksum_reports += 1
-            if not report.match:
-                counters.checksum_mismatch += 1
-                log(f"{MISMATCH_MARKER} lane={report.lane} pair={report.pair} "
-                    f"slot={report.slot} seq={report.seq} "
-                    f"nbytes={report.nbytes} producer_checksum={report.expected} "
-                    f"consumer_checksum={report.got} leg={leg} epoch={epoch} "
-                    f"-- the STAGED bytes changed between publish and read; "
-                    f"counted, never acted on")
+            # REPRESENTABILITY FIRST, on this path too (S5 review, must_fix 1).
+            report_slot_checksum(report, counters, leg=leg, epoch=epoch, log=log)
 
         started = time.perf_counter()
         out = tp.run_leg(
@@ -959,15 +1244,13 @@ def shadow_transport(
                 f"leg-vote {type(exc).__name__}: {exc}"),
             budget_s=budget_s, checksum_bytes=sum_bytes,
             on_checksum=on_checksum, slot_bytes=slot_bytes,
-            # PRICED FROM THE SUBSET'S OWN DIAGONAL, not inherited: the shadow
-            # moves a class subset, so its batch count -- and therefore the
-            # hop this leg pays -- is a different number from the full leg's.
-            # Passing the flip's slot size here would price a lane that is not
-            # the one running.
-            oncard_slot_bytes=(
-                tp.plan_oncard_slot_bytes(
-                    sum(int(d.nbytes) for d in leg_descs if _is_on_card(d))
-                ).slot_bytes if oncard_slot_bytes is None else oncard_slot_bytes),
+            # PRICED FROM THIS CARD'S OWN DIAGONAL WITHIN THE SUBSET, by the
+            # same :func:`price_leg` call that sized the bounce from it: the
+            # shadow moves a class subset, so its batch count -- and therefore
+            # the hop this leg pays -- is a different number from the full
+            # leg's, and the lane runs once per CARD, so it is a different
+            # number from the subset's sum across the three cards too.
+            oncard_slot_bytes=diag_slot,
             oncard_slots=oncard_slots)
         elapsed_ms = (time.perf_counter() - started) * 1e3
         result.cross_ms = sum(p.elapsed_s for p in out.pairs) * 1e3
@@ -977,7 +1260,6 @@ def shadow_transport(
         result.pieces = sum(p.pieces for p in out.pairs) + len(
             [d for d in leg_descs if _is_on_card(d)])
         result.ran = True
-        _ = mine
     except Weg2XchgShadowUnaffordable:
         raise
     except BaseException as exc:  # noqa: BLE001 -- an observer never raises
