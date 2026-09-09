@@ -65,6 +65,20 @@ EXTRA = 7
 R1_PROJECTED_ROWS = 767_776
 
 
+class _RunnerDouble(ModelRunnerKVCacheMixin):
+    """The mixin itself, over a dict of the fields its two methods read.
+
+    Subclassed rather than duck-typed on a ``SimpleNamespace`` because
+    ``_apply_token_constraints`` DISPATCHES: it calls ``self._hybrid_kv_token_
+    cap()``, the SWA sibling and ``self._apply_hybrid_kv_token_cap()``.  A
+    double that only carried data would prove the clamp against methods nobody
+    resolved -- which is a test of the test.
+    """
+
+    def __init__(self, **fields):
+        self.__dict__.update(fields)
+
+
 def _double(
     *,
     max_running_requests,
@@ -92,7 +106,7 @@ def _double(
         page_size=1,
         uneven_memory_budgets_active=lambda: False,
     )
-    return SimpleNamespace(
+    return _RunnerDouble(
         server_args=sa,
         model_config=SimpleNamespace(context_len=context_len),
         mambaish_config=object(),
@@ -105,11 +119,11 @@ def _double(
 
 
 def _cap(runner):
-    return ModelRunnerKVCacheMixin._hybrid_kv_token_cap(runner)
+    return runner._hybrid_kv_token_cap()
 
 
 def _clamp(runner, projected):
-    return ModelRunnerKVCacheMixin._apply_token_constraints(runner, projected)
+    return runner._apply_token_constraints(projected)
 
 
 class TheTrapBeforeTheKnob(CustomTestCase):

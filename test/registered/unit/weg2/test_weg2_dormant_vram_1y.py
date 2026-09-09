@@ -1216,3 +1216,181 @@ def test_launcher_publishes_the_group_beside_that_family_on_both_groups(weg2_env
     finally:
         if saved is not None:
             os.environ[ms.WEG2_GROUP_ENV] = saved
+
+
+# ---------------------------------------------------------------------------
+# #1023 S5 -- THE RESTORE HALF, which is the risky one
+#
+# Everything above proves the RELEASE: the tag is coupled to the kv carrier,
+# the workspace is allocated inside the region, and the wake calls the
+# re-zeroing.  What none of it proves is that the buffer the wake zeroes is
+# still THE SAME BUFFER, at the same size, and usable after one forward.  That
+# is where an unrestored workspace turns into an illegal access in the first
+# decode after a wake -- a boot killer, not a regression -- and it is the half
+# the harvest ladder's R5b rung leans on.
+#
+# THE RUNG ITSELF IS ALREADY DELIVERED, which is why this section adds no
+# mechanism (UPSTREAM-MINIMAL).  Boot weg2sb5e at the tree of record already
+# prints, per rank and 16 times each,
+#
+#   WEG2-SLEEP released tags=['cuda_graph'] mib=388.0 / 388.0 / 408.0   (group P)
+#   WEG2-SLEEP released tags=['cuda_graph'] mib=482.0                   (group D)
+#
+# and that line's own denominator is "the capture pool plus the flashinfer
+# FLOAT workspace", i.e. both R3a and R4 of record section [1y].  The
+# pre-#1249 boot weg2rg6 carried neither the tag nor the TAGGED line and its
+# dormant image was 1780 / 1342 / 1376 MiB against sb5e's 1372 / 954 / 968.
+# So the only thing left to add here is the assertion, not the code.
+# ---------------------------------------------------------------------------
+
+
+def _fresh_workspace_registry():
+    """A clean per-lane workspace registry, restored on exit by the caller."""
+    from sglang.srt.layers.attention import flashinfer_backend as fb
+
+    saved = dict(fb._WORKSPACE_BUFFERS)
+    fb._WORKSPACE_BUFFERS.clear()
+    return fb, saved
+
+
+def test_the_wake_zeroes_the_same_buffer_it_released_not_a_new_one():
+    """Identity, size and content contract across a release/restore cycle.
+
+    A pause unmaps PHYSICAL pages and leaves the virtual address alone; the
+    Python object never moves.  So the property that has to hold -- and the one
+    a registry bug would break silently -- is that the buffer the wake zeroes
+    is identical in ``data_ptr`` and ``nbytes`` to the one that was registered,
+    and that its content contract is restored REPEATEDLY, not once: the wake
+    happens on every flip, not only the first.
+
+    Hermetic on CPU tensors.  What that cannot show is the mapping itself; the
+    device-gated test below is the one that can.
+    """
+    import torch
+
+    fb, saved = _fresh_workspace_registry()
+    try:
+        buf = torch.empty(4096, dtype=torch.uint8)
+        fb.register_flashinfer_workspace_buffer(buf)
+        ptr, nbytes = buf.data_ptr(), buf.numel() * buf.element_size()
+
+        # First wake.
+        buf.fill_(7)
+        zeroed = fb.zero_flashinfer_workspaces()
+        assert zeroed >= 1, (
+            "the wake zeroed nothing: a registry that lost the buffer reports "
+            "success while the next forward reads the other group's residue "
+            "where NOTE(#50) promises zeros"
+        )
+        assert int(buf.max()) == 0
+        assert (buf.data_ptr(), buf.numel() * buf.element_size()) == (ptr, nbytes)
+
+        # "one forward" writes into it, and the SECOND wake must restore it too.
+        buf.fill_(3)
+        assert fb.zero_flashinfer_workspaces() >= 1
+        assert int(buf.max()) == 0
+        assert (buf.data_ptr(), buf.numel() * buf.element_size()) == (ptr, nbytes)
+    finally:
+        fb._WORKSPACE_BUFFERS.clear()
+        fb._WORKSPACE_BUFFERS.update(saved)
+
+
+def test_the_wakes_restore_count_is_n_a_and_never_zero_when_it_cannot_run():
+    """``_weg2_zero_graph_scratch`` returns None, not 0, when unreachable.
+
+    "no workspace was zeroed" and "the zeroing never ran" are the difference
+    between a restored contract and a silent one, and the caller prints this
+    number.  A 0 here would read as a successful restore of an empty set.
+    """
+    import sys
+
+    updater = _updater()
+    saved = sys.modules.pop("sglang.srt.layers.attention.flashinfer_backend", None)
+    sys.modules["sglang.srt.layers.attention.flashinfer_backend"] = None
+    try:
+        assert updater._weg2_zero_graph_scratch() is None
+    finally:
+        if saved is not None:
+            sys.modules["sglang.srt.layers.attention.flashinfer_backend"] = saved
+        else:
+            sys.modules.pop("sglang.srt.layers.attention.flashinfer_backend", None)
+
+
+def test_the_restored_workspace_has_the_size_the_region_reserved():
+    """One number, read twice, must be the same number.
+
+    The region is entered with ``nbytes`` and the tensor is allocated with its
+    own size.  If those two ever come from different expressions, the tag holds
+    a reservation of one size while the buffer that must be re-materialised
+    inside it is another -- and the failure surfaces at the wake, on metal.
+    """
+    from sglang.srt.layers.attention import flashinfer_backend as fb
+
+    src = inspect.getsource(fb)
+    m = re.search(
+        r"def _weg2_new_workspace\(\).{0,400}?with weg2_graph_scratch_region\(\s*([^,]+),",
+        src,
+        re.S,
+    )
+    assert m, "the factory and the region no longer sit together"
+    region_nbytes = m.group(1).strip()
+    factory = re.search(
+        r"def _weg2_new_workspace\(\).{0,400}?torch\.empty\(\s*([^,]+),", src, re.S
+    )
+    assert factory, "the workspace factory no longer allocates with torch.empty"
+    assert region_nbytes == factory.group(1).strip(), (
+        "the region reserves %r while the buffer is allocated with %r"
+        % (region_nbytes, factory.group(1).strip())
+    )
+    assert "SGLANG_FLASHINFER_WORKSPACE_SIZE" in region_nbytes
+
+
+@pytest.mark.skipif(
+    os.environ.get("WEG2_DORMANT_GPU_GATE") != "1",
+    reason=(
+        "needs a real CUDA device, a preload-mode torch_memory_saver hook and a "
+        "gpuq window; run it from arm_dormant_boot.sh with WEG2_DORMANT_GPU_GATE=1"
+    ),
+)
+def test_the_float_workspace_is_writable_and_readable_after_a_resume():
+    """The claim the desk cannot make: the pages come back.
+
+    Pause the graph tag with a registered FLOAT workspace inside it, resume,
+    restore the zero contract, then write through the SAME tensor and read the
+    bytes back.  Address and size must be unchanged (a graph replay reads its
+    buffers by address) and the checksum after the write must be non-zero --
+    otherwise the resume handed back a mapping that silently swallows stores,
+    which is the shape that becomes an illegal access one decode later.
+    """
+    import torch
+
+    from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH
+    from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
+
+    fb, saved = _fresh_workspace_registry()
+    try:
+        adapter = TorchMemorySaverAdapter.create(enable=True)
+        with adapter.region(tag=GPU_MEMORY_TYPE_CUDA_GRAPH):
+            buf = torch.empty(64 * 1024 * 1024, dtype=torch.uint8, device="cuda")
+        fb.register_flashinfer_workspace_buffer(buf)
+        ptr, nbytes = buf.data_ptr(), buf.numel() * buf.element_size()
+
+        adapter.pause(GPU_MEMORY_TYPE_CUDA_GRAPH)
+        adapter.resume(GPU_MEMORY_TYPE_CUDA_GRAPH)
+
+        assert fb.zero_flashinfer_workspaces() >= 1
+        torch.cuda.synchronize()
+        assert (buf.data_ptr(), buf.numel() * buf.element_size()) == (ptr, nbytes), (
+            "the workspace moved across pause/resume -- a captured graph reads "
+            "its buffers by ADDRESS, so this configuration must not ride the tag"
+        )
+        assert int(buf.sum().item()) == 0
+
+        buf.fill_(9)
+        torch.cuda.synchronize()
+        assert int(buf.sum().item()) != 0, (
+            "the resumed mapping swallowed a store: the pages are not backed"
+        )
+    finally:
+        fb._WORKSPACE_BUFFERS.clear()
+        fb._WORKSPACE_BUFFERS.update(saved)
