@@ -648,11 +648,11 @@ def test_the_checksum_seam_is_opt_in_at_every_entry_point():
 
 
 def _vote_rows(region, rows, *, leg, vote=True, classes_hash=0, need_mib=0,
-               plan_digest=0, card_digest=0):
+               plan_digest=0, piece_digest=0):
     for row in rows:
         sh.write_shadow_vote(region, row, leg=leg, vote=vote,
                              classes_hash=classes_hash, need_mib=need_mib,
-                             plan_digest=plan_digest, card_digest=card_digest)
+                             plan_digest=plan_digest, piece_digest=piece_digest)
 
 
 def test_the_shadow_area_is_disjoint_from_s4s_and_inside_the_region():
@@ -3341,15 +3341,15 @@ def test_the_co_located_pair_is_checked_on_its_card_geometry(region):
     for row in range(1, xr.N_RANKS):
         sh.write_shadow_vote(region, row, leg=0, vote=True, classes_hash=7,
                              need_mib=0, plan_digest=0xAAAA,
-                             card_digest=0x1111 if row != 3 else 0x2222)
+                             piece_digest=0x1111 if row != 3 else 0x2222)
     lines = []
     verdict = sh.shadow_gate(region, 0, leg=0, vote=True, classes_hash=7,
                              need_mib=0, log=lines.append, budget_s=0.5,
-                             plan_digest=0xAAAA, card_digest=0x1111,
+                             plan_digest=0xAAAA, piece_digest=0x1111,
                              peer_row=3)
     assert verdict.run is False
     assert verdict.reason == "plan-diverged-oncard-peer"
-    assert any("scope=oncard-peer" in ln and "field=card_digest" in ln
+    assert any("scope=oncard-peer" in ln and "field=piece_digest" in ln
                for ln in lines), lines
     # The group digest AGREES here -- so this cannot be the same code path as
     # the test above, which is the whole reason for two scopes under one code.
@@ -3366,11 +3366,11 @@ def test_the_peer_card_check_is_only_asked_where_the_row_is_read(region):
     """
     for row in (1, 2):
         sh.write_shadow_vote(region, row, leg=0, vote=True, classes_hash=7,
-                             need_mib=0, plan_digest=0xAAAA, card_digest=0x1111)
+                             need_mib=0, plan_digest=0xAAAA, piece_digest=0x1111)
     verdict = sh.shadow_gate(region, 0, leg=0, vote=True, classes_hash=7,
                              need_mib=0, log=lambda _s: None, budget_s=0.5,
                              expect_rows=(0, 1, 2), plan_digest=0xAAAA,
-                             card_digest=0x9999, peer_row=3)
+                             piece_digest=0x9999, peer_row=3)
     assert verdict.run is True, verdict.reason
 
 
@@ -3381,11 +3381,11 @@ def test_the_widened_row_carries_both_digests_and_still_fits(region):
     assert sh.SHADOW_AREA_END <= tp.DIR_CAPACITY
     sh.write_shadow_vote(region, 4, leg=9, vote=True, classes_hash=0x1234,
                          need_mib=11, plan_digest=0xDEADBEEF,
-                         card_digest=0xFEEDFACE)
+                         piece_digest=0xFEEDFACE)
     got = sh.read_shadow_vote(region, 4)
     assert got["sealed"] == 1
     assert got["plan_digest"] == 0xDEADBEEF
-    assert got["card_digest"] == 0xFEEDFACE
+    assert got["piece_digest"] == 0xFEEDFACE
     assert got["classes_hash"] == 0x1234 and got["need_mib"] == 11
 
 
@@ -3752,7 +3752,7 @@ def test_an_undrainable_lane_compares_digests_and_moves_no_bytes(region, boot,
 
     The refusal is placed AFTER the gate on purpose: the rendezvous is the only
     part of the shadow that needs no lane, and it is where ``plan_digest`` and
-    ``card_digest`` are compared.  Refusing before it would leave the source
+    ``piece_digest`` are compared.  Refusing before it would leave the source
     exporting under a plan its consumer never saw -- finding 9 with the sign
     flipped.  So the gate must have run, the refusal must be on the log by
     name, and ``run_leg`` must never have been entered.
@@ -5369,3 +5369,187 @@ def test_a_refused_leg_says_why_beside_ran_not_four_hundred_chars_later():
                          counters=sh.ShadowCounters())
     ok.ran = True
     assert "why=ok" in ok.line()
+
+
+# ---------------------------------------------------------------------------
+# S6 fix F2 (#1273) -- THE ON-CARD GATE IS REBUILT ON THE PLAN'S PIECES.
+#
+# Operator ruling 2026-09-09 on SECTION 1af / #1277: the exchange's unit under
+# P=PP3 / D=TP3 was NEVER "the same tensors on the same card" -- it is the
+# SUB-TENSOR OVERLAP.  The layer resident WHOLE on card n in P CONTAINS
+# D-rank-n's TP shard of that layer, and #1277 measured exactly that as the
+# diagonal: 10.285 GiB on-card (35.7 %) against 18.560 GiB cross-card, on
+# byte-exact checksums.
+#
+# So `card_geometry_digest` (name:tag:rows x cols x itemsize over WHOLE
+# storage) is the wrong predicate for asymmetric placement: it must always
+# differ between a stage-holder and a shard-holder.  Boot weg2shadowE measured
+# it doing exactly that -- six distinct card_digests, no co-located pair
+# agreeing -- and refusing all 12 legs of a lane that has real bytes.
+# ---------------------------------------------------------------------------
+
+def _desc(name, *, src, dst, nbytes, src_off=0, dst_off=0, tag="weights_0"):
+    return wx.XchgDesc(tag=tag, src_rank=src, dst_rank=dst, param_name=name,
+                       kind="copy", nbytes=nbytes, rows=1, run_bytes=nbytes,
+                       spitch=nbytes, dpitch=nbytes,
+                       src_off=src_off, dst_off=dst_off)
+
+
+def _overlap_plan_descs():
+    """Card 0's diagonal: P holds layer 0 whole, D holds its TP shard of it.
+
+    The pieces are SLICES of the resident tensor -- name plus offsets plus
+    bytes -- which is what #1277 measured moving on-card.  Card 1 pieces are in
+    the list too, so the per-card filter is exercised rather than assumed.
+    """
+    return [
+        _desc("model.layers.0.qkv_proj.weight", src=0, dst=0,
+              nbytes=4 << 20, src_off=0, dst_off=0),
+        _desc("model.layers.0.o_proj.weight", src=0, dst=0,
+              nbytes=2 << 20, src_off=4 << 20, dst_off=0),
+        _desc("model.layers.9.qkv_proj.weight", src=1, dst=1, nbytes=8 << 20),
+        _desc("model.layers.0.down_proj.weight", src=0, dst=2,
+              nbytes=1 << 20),          # cross-card, must NOT enter card 0
+    ]
+
+
+def test_the_pair_agrees_on_pieces_while_their_whole_storage_digests_differ():
+    """THE RULING, as one test, with the old predicate as the explicit can-fail.
+
+    Both co-located ranks read the SAME group-uniform plan, so both derive the
+    same on-card piece set for their card -- while their storage inventories
+    (a pipeline stage vs a tensor shard) are genuinely different objects.
+    """
+    descs = _overlap_plan_descs()
+
+    stage_side = sh.oncard_piece_digest(descs, 0)
+    shard_side = sh.oncard_piece_digest(descs, 0)
+    assert stage_side == shard_side
+    assert sh.oncard_piece_count(descs, 0) == 2, "card 0's diagonal is 2 pieces"
+    # the cross-card desc and card 1's diagonal stay out of card 0's set
+    assert sh.oncard_piece_digest(descs, 1) != stage_side
+    assert sh.oncard_piece_count(descs, 1) == 1
+
+    # THE CAN-FAIL AGAINST REGRESSION: the OLD predicate refuses this pair.
+    stage_storage = [_Geom("model.layers.0.qkv_proj.weight", "weights_0",
+                           4096, 1024, 2)]
+    shard_storage = [_Geom("model.layers.0.qkv_proj.weight", "weights_0",
+                           1365, 1024, 2),
+                     _Geom("model.layers.9.qkv_proj.weight", "weights_2",
+                           1365, 1024, 2)]
+    old_a = sh.card_geometry_digest(stage_storage, ("qkv_proj",), unplanned=())
+    old_b = sh.card_geometry_digest(shard_storage, ("qkv_proj",), unplanned=())
+    assert old_a != old_b, (
+        "the whole-storage digests now AGREE for a stage/shard pair -- this "
+        "fixture no longer reproduces the predicate that refused all 12 legs "
+        "of boot weg2shadowE, so it no longer proves the gate was rebuilt"
+    )
+
+
+def test_a_mismatched_piece_set_still_diverges_and_names_a_piece():
+    """The W54 hazard the gate exists for survives the rebuild.
+
+    Two ranks that framed the SAME overlap differently have different piece
+    keys -- a different slice offset is a different piece -- so the gate still
+    catches it, now under field=piece_digest.
+    """
+    mine = _overlap_plan_descs()
+    theirs = [_desc("model.layers.0.qkv_proj.weight", src=0, dst=0,
+                    nbytes=4 << 20, src_off=0, dst_off=0),
+              _desc("model.layers.0.o_proj.weight", src=0, dst=0,
+                    nbytes=2 << 20, src_off=8 << 20, dst_off=0)]  # <- offset
+    assert sh.oncard_piece_digest(mine, 0) != sh.oncard_piece_digest(theirs, 0)
+
+    hint = sh.first_piece_difference(mine, 0, 0)
+    assert "planned 2 on-card piece" in hint and "first=" in hint, hint
+
+
+def test_a_pair_with_no_overlap_is_named_not_a_silent_pieces_zero():
+    """'no on-card pieces on this pair', never `pieces=0 ran=no`.
+
+    This is the shadowE lesson made structural: an initialised zero must never
+    stand in for a reason.
+    """
+    cross_only = [_desc("model.layers.0.down_proj.weight", src=0, dst=2,
+                        nbytes=1 << 20)]
+    assert sh.oncard_piece_count(cross_only, 0) == 0
+    assert "planned NO on-card pieces" in sh.first_piece_difference(
+        cross_only, 0, 0)
+
+    import ast as _ast
+    root = os.path.abspath(
+        os.path.join(os.path.dirname(__file__), "..", "..", "..", ".."))
+    path = os.path.join(root, "python", "sglang", "srt", "weg2",
+                        "weight_exchange_shadow.py")
+    with open(path, encoding="utf-8") as fh:
+        src = fh.read()
+    fn = next(n for n in _ast.walk(_ast.parse(src))
+              if isinstance(n, _ast.FunctionDef) and n.name == "run_leg_hook")
+    body = _ast.unparse(fn)
+    assert "'no-oncard-pieces'" in body or '"no-oncard-pieces"' in body
+    assert "rank_local_skip_message" in body
+
+
+def test_the_gate_votes_the_piece_digest_and_never_the_storage_geometry():
+    """RANK-UNIFORMITY PIN, and the reason the rebuild is sound.
+
+    The voted field must come from the PLAN (`plan.piece_digest`, derived from
+    `plan.descs` and the card index) and never from a rank-local storage walk.
+    A stage-holder and a shard-holder enumerate different tensors; only a
+    plan-derived number can be equal on both sides.
+    """
+    import ast as _ast
+
+    root = os.path.abspath(
+        os.path.join(os.path.dirname(__file__), "..", "..", "..", ".."))
+    path = os.path.join(root, "python", "sglang", "srt", "weg2",
+                        "weight_exchange_shadow.py")
+    with open(path, encoding="utf-8") as fh:
+        src = fh.read()
+    tree = _ast.parse(src)
+
+    hook = next(n for n in _ast.walk(tree) if isinstance(n, _ast.FunctionDef)
+                and n.name == "run_leg_hook")
+    hb = _ast.unparse(hook)
+    assert "piece_digest = plan.piece_digest" in hb, hb[:200]
+    assert "card_digest" not in hb, "the hook still carries the storage digest"
+
+    gate = next(n for n in _ast.walk(tree) if isinstance(n, _ast.FunctionDef)
+                and n.name == "shadow_gate")
+    gb = _ast.unparse(gate)
+    assert "card_digest" not in gb, "the gate still compares whole storage"
+    assert 'field="piece_digest"' in gb or "field='piece_digest'" in gb
+
+    # the geometry digest survives as INFORMATION on the plan line
+    plan_line = next(n for n in _ast.walk(tree) if isinstance(n, _ast.FunctionDef)
+                     and n.name == "line")
+    assert "card_digest=" in src and "piece_digest=" in src
+
+
+def test_the_param_census_is_one_line_per_rank_and_never_repeats():
+    """The cheap evidence SECTION 1ai-F-root asked for, and its bound.
+
+    The pp/tp asymmetry must be readable off the boot log rather than off
+    `launcher.py`.  It must also cost one walk per PROCESS, not one per leg --
+    an observer that pays a leg's wall for evidence is the thing this whole
+    slice may not be.
+    """
+    import ast as _ast
+
+    root = os.path.abspath(
+        os.path.join(os.path.dirname(__file__), "..", "..", "..", ".."))
+    path = os.path.join(root, "python", "sglang", "srt", "managers",
+                        "scheduler_components", "weight_updater.py")
+    with open(path, encoding="utf-8") as fh:
+        src = fh.read()
+    fn = next(n for n in _ast.walk(_ast.parse(src))
+              if isinstance(n, _ast.FunctionDef)
+              and n.name == "_weg2_shadow_param_census")
+    body = _ast.unparse(fn)
+    assert "PARAM-CENSUS" in body
+    assert "_weg2_param_census_done" in body, "the census repeats per leg"
+    assert "named_parameters" in body
+    handlers = [h for n in _ast.walk(fn) if isinstance(n, _ast.Try)
+                for h in n.handlers]
+    assert any(isinstance(h.type, _ast.Name) and h.type.id == "BaseException"
+               for h in handlers), "the census can raise into a flip leg"

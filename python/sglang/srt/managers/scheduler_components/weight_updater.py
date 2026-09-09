@@ -1482,6 +1482,44 @@ class SchedulerWeightUpdaterManager:
             return None
         return tuple(xr.rank_row(group, r) for r in range(xr.N_CARDS))
 
+    def _weg2_shadow_param_census(self, group: str, rank: int) -> None:
+        """ONE LINE PER RANK, ONCE: the pp/tp asymmetry, read off the LOG.
+
+        #1273 S6 fix F2, and it is the "cheap evidence" SECTION 1ai-F-root's
+        UNPROVEN 2 named: the claim that group P holds PIPELINE STAGES and
+        group D TENSOR SHARDS of the same card was read out of ``launcher.py``
+        and corroborated only indirectly, by six disagreeing storage digests.
+        A count plus the first and last parameter name per rank settles it from
+        the boot's own log instead, and costs one sorted walk of
+        ``named_parameters`` at the first hook of the boot.
+
+        Never raises and never repeats: an observer that cost a leg its wall on
+        every flip would be paying for evidence with the thing it observes.
+        """
+        if getattr(type(self), "_weg2_param_census_done", False):
+            return
+        try:
+            type(self)._weg2_param_census_done = True
+            runner = getattr(self.tp_worker, "model_runner", None)
+            model = getattr(runner, "model", None)
+            if model is None:
+                return
+            names = sorted(n for n, _ in model.named_parameters())
+            if not names:
+                return
+            logger.info(
+                "WEG2-XCHG-SHADOW PARAM-CENSUS group=%s rank=%s params=%d "
+                "first=%s last=%s -- the pp/tp asymmetry, from this rank's own "
+                "named_parameters(): a PP stage carries whole layers over a "
+                "SUBSET of layer indices, a TP shard carries slices of EVERY "
+                "layer, and the two are why the co-located pair's whole-storage "
+                "digests differ while their on-card PIECE sets agree (#1273 S6 "
+                "fix F2, SECTION 1ai-F-fix)",
+                group, rank, len(names), names[0], names[-1],
+            )
+        except BaseException:  # noqa: BLE001 -- an observer never raises
+            pass
+
     def _weg2_shadow_plan(self, hook: str, group: str, rank: int):
         """THE PRODUCT CALL SITE OF ``weight_exchange.build_plan``.
 
@@ -1649,6 +1687,7 @@ class SchedulerWeightUpdaterManager:
                            f"could not be read; pricing against 0 would refuse "
                            f"UNAFFORDABLE naming a full card that is not full"))
                 return
+            self._weg2_shadow_param_census(group, rank)
             plan, plan_reason = self._weg2_shadow_plan(str(hook), group,
                                                        int(rank))
             inputs = sh.ShadowLegInputs(
