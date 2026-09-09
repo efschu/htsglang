@@ -5549,6 +5549,10 @@ def solve_p_cut(
         # 499,967-token pool -- +33.5 % prefill for -47.7 % pool on metal --
         # which is a trade nobody selected, taken by a flag nobody passed.
         objective=P_SOLVER_OBJECTIVE_OF[str(ns.pp_solve_objective)],
+        # #1286b: the operator's floor under the SHIPPED pool. None = no floor
+        # = unchanged. It constrains the set the objective ranks over; it does
+        # not rank, and it never degrades to the fastest cut below itself.
+        pool_floor=ns.pp_solve_pool_floor,
     )
     log(
         f"PP-CUT inputs: layers={n_layers} attn={n_attn} "
@@ -5620,6 +5624,12 @@ def solve_p_cut(
     )
     log(decision.provenance_line())
     log(decision.trade_line())
+    # #1286b -- THE CURVE. provenance_line prices TWO points of it (the two
+    # objectives' cuts); this line prices every point that is not beaten on
+    # both axes at once, so "what would a floor of N cost me in ms" is read off
+    # one boot log instead of re-solved. It is also how a value for
+    # --pp-solve-pool-floor is chosen.
+    log(decision.frontier_line())
     for row in decision.table_lines():
         log(row)
     # WHICH of those priced rows this boot actually SHIPS (#1254 -- see
@@ -5646,8 +5656,18 @@ def solve_p_cut(
         decision, P_PP_STAGE_RATIO_SCORES, P_PP_ATTN_STAGE_RATIO_SCORES
     )
     makespan_row = decision.makespan or decision.chosen
+    # #1286b: THE FLOOR APPLIES TO WHAT SHIPS, not only to what the objective
+    # ranked. `incumbent` names a candidate and looks it up in the ranked field,
+    # so it never passes through the set --pp-solve-pool-floor narrowed; without
+    # this call an operator could set a floor, take that arm, and boot below it
+    # with every line saying the floor was honoured. Same writer as the solver's
+    # own refusals (CutDecision.refuse_shipped_below_floors -> refuse_below_floors).
+    decision.refuse_shipped_below_floors(
+        chosen, "the SHIPPED cut (%s)" % (ship_why.split(" (")[0],)
+    )
     log(
-        "PP-CUT SHIPPED: layers=%s attn=%s pool_tokens=%d makespan_ms=%.1f -- %s. "
+        "PP-CUT SHIPPED: layers=%s attn=%s chosen_pool=%d pool_floor=%s "
+        "makespan_ms=%.1f -- %s. "
         "The two objectives this boot did NOT take stay priced beside it and are "
         "therefore not paid by accident: incumbent %s pool %s makespan %s, "
         "pool-maximal (kv-floor) %s pool %d makespan %.1f, makespan-optimal %s "
@@ -5657,6 +5677,7 @@ def solve_p_cut(
             ",".join(str(n) for n in chosen.layers),
             ",".join(str(a) for a in chosen.attn),
             int(chosen.pool_tokens),
+            "none" if decision.pool_floor is None else str(int(decision.pool_floor)),
             chosen.makespan_ms,
             ship_why,
             incumbent_row.fmt() if incumbent_row is not None else "%s / %s" % (
@@ -6075,6 +6096,35 @@ def build_parser() -> argparse.ArgumentParser:
              "shipped cut (flip_order_split) and W46 checks that by "
              "construction. GAPPED MAPS ARE NOT AN ARM OF THIS FLAG: see "
              "--pp-layer-set and the #753 gate.",
+    )
+    ap.add_argument(
+        "--pp-solve-pool-floor", type=int, default=None,
+        help="#1286b. A HARD LOWER BOUND, in WORLD KV TOKENS, on the priced "
+             "pool of whatever --pp-solve-objective ships. UNSET (the default) "
+             "= no floor and today's behaviour exactly: the objective ranks "
+             "over the same feasible set it always did and nothing moves. SET "
+             "= the objective still ranks, but only over the cuts whose PRICED "
+             "world pool clears this number -- so 'makespan' becomes 'the "
+             "FASTEST cut that still holds N tokens'. It is a CONSTRAINT ON "
+             "the one objective knob, not a second objective: the standing law "
+             "is that trades live behind one knob, and 'fastest above N' is "
+             "the same ranking over a smaller set. WHY IT EXISTS: #1286 "
+             "repriced every candidate against the boot's own sizing formula "
+             "and the makespan winner came out at 304,946 tokens against the "
+             "incumbent's 715,089 -- 43 %% of the capacity for the speed cut -- "
+             "and before this flag the only way to put a bound under that was "
+             "to pin a cut by hand, which is the thing the solver replaces. "
+             "The pool it is compared against is the SAME number "
+             "PP-POOL-JOIN publishes and group P then sizes (within 0.1 %% on "
+             "both reference boots), NOT a second estimate. NO SILENT "
+             "FALLBACK: if no servable cut clears it the launch is a W40 "
+             "REFUSAL that prints the frontier -- the fastest cuts that DO "
+             "clear it and the best pool anywhere in the field -- so the next "
+             "move is a number, not a re-solve by hand. Distinct from "
+             "--max-kv-per-request, which is the PHYSICAL floor (one "
+             "full-context prompt must fit); both are checked and each refusal "
+             "names its own flag. Read the curve on the PP-CUT FRONTIER: line "
+             "of any boot to choose a value.",
     )
     ap.add_argument(
         "--pp-cut-measured-ms-per-layer", default=MEASURED_MS_PER_LAYER,
