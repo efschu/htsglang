@@ -674,8 +674,18 @@ class TestTheLauncherSeam(CustomTestCase):
         self.assertIn("--max-kv-per-request", help_text)
 
     def test_the_launcher_hands_the_floor_to_the_solver(self):
+        """The flag reaches the solver -- since 2026-09-09 via the resolver.
+
+        It used to read ``pool_floor=ns.pp_solve_pool_floor`` at the call. The
+        shipped default (the 39,13,12 order) put ``resolve_pool_floor`` in
+        between, so the assertion follows the seam rather than the old spelling:
+        the flag goes INTO the resolver and the resolver's value goes into the
+        solve. Both halves are asserted, because either one alone would still
+        pass with the floor dropped on the floor between them.
+        """
         src = self._launcher_source()
-        self.assertIn("pool_floor=ns.pp_solve_pool_floor", src)
+        self.assertIn("resolve_pool_floor(ns.pp_solve_pool_floor)", src)
+        self.assertIn("pool_floor=pool_floor", src)
 
     def test_the_shipped_line_renders_and_publishes_the_floor(self):
         """RENDERED, not grepped: twelve substitutions is the failure class.
@@ -705,6 +715,11 @@ class TestTheLauncherSeam(CustomTestCase):
                 # incumbent IS ranked in this field and the fallback must not
                 # fire.
                 incumbent_fallback="FALLBACK-MUST-NOT-APPEAR",
+                # REQUIRED since 2026-09-09: once the floor has a shipped
+                # default, the number alone no longer says whether the boot
+                # obeyed a standing order or an operator. This file drives the
+                # solver directly, so its floors are all "flag" by definition.
+                floor_source="flag (test drives solve_launch_cut directly)",
             )
             self.assertNotIn("FALLBACK-MUST-NOT-APPEAR", line)
             print("\nRECORD %s" % line)

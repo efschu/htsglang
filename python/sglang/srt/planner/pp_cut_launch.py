@@ -779,6 +779,59 @@ def ms_per_layer_from_card_library(
     )
 
 
+def choose_under_floor(
+    feasible: Sequence[CutCandidate],
+    *,
+    objective: str,
+    pool_floor: Optional[int],
+    choosable: Sequence[CutCandidate],
+    cost_provenance: str,
+) -> CutCandidate:
+    """THE FLOOR NARROWS, THE OBJECTIVE RANKS -- and neither step is inline.
+
+    Split out for the same reason :func:`CutDecision.frontier_line` and the
+    launcher's ``shipped_line`` were: this is the whole of "which cut ships",
+    it is three lines of set arithmetic that a boot pays for, and until it was
+    a function the only way to prove the rule was to spend a window.  A desk
+    test can now hand it the fifteen priced points of a REAL rig frontier and
+    read back the cut, which is exactly the proof a shipped default needs.
+
+    Nothing about the rule moved in the extraction:
+
+    * ``pool_floor=None`` is no floor, and then this is ``min(total_ms)`` over
+      the untouched feasible set -- byte-identical to the pre-#1286b makespan.
+    * A floor NARROWS the set the objective ranks over.  It never re-ranks and
+      it never degrades: an empty set is the W40 refusal below, carrying the
+      frontier, not a quiet fall back to the fastest cut underneath the floor.
+      That direction is the load-bearing half and the mutants aim at it.
+    * Ties break on the OTHER axis in both arms, so an objective never spends
+      capacity or time it did not have to.
+
+    The named candidate in the refusal is the POOL-MAXIMAL one of the feasible
+    field -- the closest anything came -- because "short by N" against the best
+    possible is the number that tells the operator whether the floor is off by
+    a rounding or by a layout generation.
+    """
+    if pool_floor is not None:
+        floored = [c for c in feasible if c.pool_tokens >= float(pool_floor)]
+        if not floored:
+            _refuse_below_pool_floor(
+                max(feasible, key=lambda c: c.pool_tokens),
+                "no cut of the solved field clears --pp-solve-pool-floor; "
+                "the pool-maximal servable cut",
+                int(pool_floor),
+                cost_provenance,
+                floor_flag="--pp-solve-pool-floor",
+                field=choosable,
+            )
+        feasible = floored
+    return (
+        max(feasible, key=lambda c: (c.pool_tokens, -c.total_ms))
+        if objective == "maxkv"
+        else min(feasible, key=lambda c: (c.total_ms, -c.pool_tokens))
+    )
+
+
 def solve_launch_cut(
     *,
     layer_families: Sequence[str],
@@ -1234,32 +1287,16 @@ def solve_launch_cut(
             )
         # THE OPERATOR'S FLOOR NARROWS THE SET THE OBJECTIVE RANKS OVER, and
         # an empty set is a REFUSAL rather than a quiet fallback to the fastest
-        # cut below it (#1286b). The named candidate is the POOL-MAXIMAL one of
-        # the feasible field -- the closest anything came -- because "short by
-        # N" against the best possible is the number that tells the operator
-        # whether the floor is off by a rounding or by a layout generation.
-        if pool_floor is not None:
-            floored = [c for c in feasible if c.pool_tokens >= float(pool_floor)]
-            if not floored:
-                _refuse_below_pool_floor(
-                    max(feasible, key=lambda c: c.pool_tokens),
-                    "no cut of the solved field clears --pp-solve-pool-floor; "
-                    "the pool-maximal servable cut",
-                    int(pool_floor),
-                    cost_provenance,
-                    floor_flag="--pp-solve-pool-floor",
-                    field=choosable,
-                )
-            feasible = floored
-        # THE OBJECTIVE PICKS, AND BOTH ROWS ARE KEPT (#1254). maxkv is the
-        # default because the standing law puts the default at maximum KV;
-        # makespan is one flag away and is priced on the same line either way.
-        # Ties break on the OTHER axis in both arms, so an objective never
-        # spends capacity or time it did not have to.
-        chosen = (
-            max(feasible, key=lambda c: (c.pool_tokens, -c.total_ms))
-            if objective == "maxkv"
-            else min(feasible, key=lambda c: (c.total_ms, -c.pool_tokens))
+        # cut below it (#1286b); then the objective picks and BOTH rows are
+        # kept (#1254). Both steps live in :func:`choose_under_floor` so the
+        # rule that decides which cut a boot pays for can be RENDERED by a desk
+        # test against a real frontier instead of only by spending a window.
+        chosen = choose_under_floor(
+            feasible,
+            objective=objective,
+            pool_floor=pool_floor,
+            choosable=choosable,
+            cost_provenance=cost_provenance,
         )
 
     return CutDecision(
