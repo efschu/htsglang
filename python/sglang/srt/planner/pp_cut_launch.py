@@ -213,8 +213,8 @@ FRONTIER_MAX_POINTS = 24
 
 
 def pareto_frontier(
-    candidates: Sequence["CutCandidate"],
-) -> Tuple["CutCandidate", ...]:
+    candidates: Sequence[CutCandidate],
+) -> Tuple[CutCandidate, ...]:
     """The non-dominated (total_ms, pool_tokens) pairs, fastest first.
 
     THE CURVE THE TWO OBJECTIVES ARE THE TWO ENDS OF. ``maxkv`` reports the
@@ -235,7 +235,7 @@ def pareto_frontier(
     ordered = sorted(
         candidates, key=lambda c: (float(c.total_ms), -float(c.pool_tokens))
     )
-    out: List["CutCandidate"] = []
+    out: List[CutCandidate] = []
     best_pool = float("-inf")
     for cand in ordered:
         # Ascending time: a candidate survives only by carrying MORE pool than
@@ -248,7 +248,7 @@ def pareto_frontier(
 
 
 def _floor_frontier_note(
-    field: Sequence["CutCandidate"], floor_tokens: int, top: int = 3
+    field: Sequence[CutCandidate], floor_tokens: int, top: int = 3
 ) -> str:
     """What the operator needs beside a floor refusal: the alternatives.
 
@@ -270,7 +270,7 @@ def _floor_frontier_note(
         key=lambda c: (float(c.total_ms), -float(c.pool_tokens)),
     )
     best_pool = max(field, key=lambda c: float(c.pool_tokens))
-    def _row(c: "CutCandidate") -> str:
+    def _row(c: CutCandidate) -> str:
         return "%s pool %d total %.1f ms" % (c.fmt(), int(c.pool_tokens), c.total_ms)
 
     if above:
@@ -301,13 +301,13 @@ def _floor_frontier_note(
 
 
 def _refuse_below_pool_floor(
-    candidate: "CutCandidate",
+    candidate: CutCandidate,
     what: str,
     cap_tokens: int,
     cost_provenance: str,
     *,
     floor_flag: str = "--max-kv-per-request",
-    field: Sequence["CutCandidate"] = (),
+    field: Sequence[CutCandidate] = (),
 ) -> None:
     """W40 when a chosen layout does not clear a pool floor.
 
@@ -354,13 +354,13 @@ def _refuse_below_pool_floor(
 
 
 def refuse_below_floors(
-    candidate: "CutCandidate",
+    candidate: CutCandidate,
     what: str,
     *,
     cap_tokens: int,
     pool_floor: Optional[int],
     cost_provenance: str,
-    field: Sequence["CutCandidate"] = (),
+    field: Sequence[CutCandidate] = (),
 ) -> None:
     """BOTH pool floors, in the order the operator can act on them.
 
