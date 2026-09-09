@@ -1809,7 +1809,8 @@ def test_the_shadow_arm_reaches_the_hook(monkeypatch, no_active_leg):
     monkeypatch.setenv(wx.WEIGHT_SOURCE_ENV, sh.WEIGHT_SOURCE_SHADOW)
     assert sh.shadow_armed() is True
     lines: list = []
-    result = sh.run_leg_hook(_inputs(sh.HOOK_DESTINATION), log=lines.append)
+    result = sh.run_leg_hook(_inputs(sh.HOOK_DESTINATION), log=lines.append,
+                             descs=[_diag(0, 4096)])
     assert result is not None
     assert result.reason == "no-region"
     assert any(ln.startswith("WEG2-XCHG-SHADOW ") for ln in lines)
@@ -1887,7 +1888,7 @@ def test_a_rank_that_cannot_join_says_so_by_name_and_does_not_go_quiet(
     arithmetic.
     """
     for reason, kwargs in (
-        ("no-region", {}),
+        ("no-region", {"descs": [_diag(0, 4096)]}),
         ("no-plan", {"descs": ()}),
     ):
         lines: list = []
@@ -1940,12 +1941,18 @@ def test_a_priced_hop_over_the_bound_refuses_the_shadow_by_name_and_not_the_flip
     would have cost, and returns a result whose ``ran`` is False -- i.e. the
     ring carried the flip and the observer stood down.
     """
-    big = 400 * sh.MIB
-    descs = [_diag(0, big, cls="qkv_proj")]
-    lines: list = []
-    result = sh.run_leg_hook(_inputs(sh.HOOK_SOURCE), log=lines.append,
-                             descs=descs, region=region, sems=object(),
-                             ops=object(), armed=True, bound_ms=1.0)
+    xr.create_semaphores(boot)
+    sems = tp.SemSet(boot)
+    try:
+        big = 400 * sh.MIB
+        descs = [_diag(0, big, cls="qkv_proj")]
+        lines: list = []
+        result = sh.run_leg_hook(_inputs(sh.HOOK_SOURCE), log=lines.append,
+                                 descs=descs, region=region, sems=sems,
+                                 ops=object(), armed=True, bound_ms=1.0)
+    finally:
+        sems.close()
+        xr.unlink_semaphores(boot)
     assert result.reason == "hop-over-bound"
     assert result.ran is False
     refusals = [ln for ln in lines if sh.UNAFFORDABLE_MARKER in ln]
@@ -1962,11 +1969,17 @@ def test_a_priced_hop_under_the_bound_is_not_refused(region, boot, no_active_leg
     Without it the refusal test passes for a bound that refuses everything,
     which is mutant K of the previous round one field over.
     """
-    descs = [_diag(0, 1 * sh.MIB, cls="qkv_proj")]
-    lines: list = []
-    result = sh.run_leg_hook(_inputs(sh.HOOK_SOURCE), log=lines.append,
-                             descs=descs, region=region, sems=object(),
-                             ops=object(), armed=True, bound_ms=1e6)
+    xr.create_semaphores(boot)
+    sems = tp.SemSet(boot)
+    try:
+        descs = [_diag(0, 1 * sh.MIB, cls="qkv_proj")]
+        lines: list = []
+        result = sh.run_leg_hook(_inputs(sh.HOOK_SOURCE), log=lines.append,
+                                 descs=descs, region=region, sems=sems,
+                                 ops=object(), armed=True, bound_ms=1e6)
+    finally:
+        sems.close()
+        xr.unlink_semaphores(boot)
     assert result.reason != "hop-over-bound"
     assert not [ln for ln in lines if "scope=hop" in ln]
 
@@ -2006,8 +2019,10 @@ def test_an_armed_semaphore_set_is_reported_as_a_number_not_as_silence(
     sems = tp.SemSet(boot)
     try:
         result = sh.run_leg_hook(_inputs(sh.HOOK_DESTINATION),
-                                 log=lambda _s: None, descs=(), region=region,
-                                 sems=sems, ops=object(), armed=True)
+                                 log=lambda _s: None, descs=[_diag(0, 4096)],
+                                 region=region, sems=sems, ops=object(),
+                                 armed=True, bound_ms=0.0)
+        assert result.reason == "hop-over-bound"
         assert result.sems_armed == xr.N_PAIRS * xr.SLOTS_PER_PAIR * 2
         assert f"sems_armed={result.sems_armed}" in result.line()
     finally:
@@ -2033,8 +2048,9 @@ def test_the_on_card_mode_word_has_a_producer_now(monkeypatch):
 def test_the_shadow_never_probes_for_the_on_card_mode():
     """An observer that PROBES has allocated on the card it is observing."""
     src = inspect.getsource(sh.resolve_shadow_oncard_mode)
+    body = src.split('"""')[2]  # everything after the docstring: the CODE
     assert "resolve_oncard_mode" not in src
-    assert "probe" not in src.split('"""')[2]
+    assert "probe" not in body, body
 
 
 # --- lifetime (item 4) -----------------------------------------------------

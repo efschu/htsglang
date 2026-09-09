@@ -1811,6 +1811,24 @@ def run_leg_hook(
         except (TypeError, ValueError) as exc:
             result.reason = f"bad-bound:{type(exc).__name__}"
             return result
+        # THE PLAN IS ASKED FOR FIRST, BEFORE A FILE IS OPENED.  Not a
+        # preference: a leg with nothing to move must not map a 385 MiB region,
+        # open 24 semaphores and load libcudart to find that out -- and the
+        # standing state of this boot IS "no plan" (see :func:`plan_for_leg`),
+        # so an attach-first order would report ``no-region`` on every rank of
+        # every boot that has no region either, and the two reasons would be
+        # indistinguishable in exactly the case the reader cares about.
+        plan = tuple(descs) if descs is not None else plan_for_leg(
+            inputs.direction, inputs.leg, inputs.rank)
+        if not plan:
+            log(rank_local_skip_message(
+                reason="no-plan", rank=inputs.rank, leg=inputs.leg,
+                epoch=inputs.epoch,
+                detail="weight_exchange.build_plan has no product caller"))
+            if explicit:
+                raise Weg2XchgShadowRankLocalSkip("no-plan")
+            result.reason = "no-plan"
+            return result
         reason = leg.attach(region=region, sems=sems, ops=ops)
         if reason:
             log(rank_local_skip_message(
@@ -1824,26 +1842,21 @@ def run_leg_hook(
         if sem_reason:
             result.reason = sem_reason
             return result
-        plan = tuple(descs) if descs is not None else plan_for_leg(
-            inputs.direction, inputs.leg, inputs.rank)
-        if not plan:
-            log(rank_local_skip_message(
-                reason="no-plan", rank=inputs.rank, leg=inputs.leg,
-                epoch=inputs.epoch,
-                detail="weight_exchange.build_plan has no product caller"))
-            if explicit:
-                raise Weg2XchgShadowRankLocalSkip("no-plan")
-            result.reason = "no-plan"
-            return result
         is_source = inputs.hook == HOOK_SOURCE
         mode = resolve_shadow_oncard_mode()
         subset = select_subset(plan, leg=inputs.leg, classes=classes,
                                per_leg=per_leg)
-        diag_slot = tp.plan_oncard_slot_bytes(
+        # NO HAND ARITHMETIC: the slot, the batch count and the hop all come
+        # from ``plan_oncard_slot_bytes``'s own :class:`tp.OnCardSlotPlan`,
+        # which carries the measured coefficient and prints its own cost model.
+        # Recomputing ``batches x per_batch_ms`` here would be a second copy of
+        # a formula that already has one producer -- and the previous cut of
+        # this line did exactly that and divided by the PLAN OBJECT.
+        lane = tp.plan_oncard_slot_bytes(
             oncard_lane_bytes(subset.descs, inputs.rank))
-        diag_bytes = oncard_lane_bytes(subset.descs, inputs.rank)
-        batches = -(-diag_bytes // diag_slot) if diag_bytes else 0
-        priced_ms = batches * tp.ONCARD_PER_BATCH_MS
+        diag_slot = int(lane.slot_bytes)
+        batches = int(lane.batches)
+        priced_ms = float(lane.hop_ms)
         if priced_ms > bound:
             message = hop_refusal_message(
                 card=inputs.card_uuid, priced_ms=priced_ms, bound_ms=bound,
