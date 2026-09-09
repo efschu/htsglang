@@ -802,14 +802,14 @@ class AttentionTokenAxis1293Test(unittest.TestCase):
             _rows, refusals = d_operating_point_rows(
                 CARDS, DEC1_BUDGETS, "/model", 6
             )
-        w53 = [r for r in refusals if r.startswith("W62")]
-        self.assertEqual(len(w53), 2, refusals)
-        for r in w53:
+        w62 = [r for r in refusals if r.startswith("W62")]
+        self.assertEqual(len(w62), 2, refusals)
+        for r in w62:
             self.assertIn("attention", r)
             self.assertIn("axis=head", r)
             self.assertIn("below ONE unit", r)
-        self.assertIn("[58, 25, 25]", w53[0])
-        self.assertIn("[3991, 1000, 1000]", w53[1])
+        self.assertIn("[58, 25, 25]", w62[0])
+        self.assertIn("[3991, 1000, 1000]", w62[1])
 
     # -- MUTANT C: a non-DCP form must never take the token axis -----------
 
