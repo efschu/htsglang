@@ -1111,3 +1111,154 @@ def _class_descs(classes):
                 dst_ptr=0x2000))
     return out
 
+
+
+# ===========================================================================
+# ITEM 4 -- the two S6 must_fix, carried as far as they are S5-shaped.
+# DANGER DIRECTION: a per-boot arm that only fails inside the transport, and a
+# handshake that starts a leg carrying the previous leg's counts.
+# ===========================================================================
+
+
+def _publish_matrix(region, *, modes):
+    zeros = [0] * xr.N_RANKS
+    for row, mode in enumerate(modes):
+        region.write_matrix_row(row, zeros, zeros, 0xABC, pid=1000 + row,
+                                oncard_mode=mode)
+
+
+def _check(region, row=0):
+    return xr.gate0_check(region, row, census_unavailable_reason="s5-test",
+                          budget_s=1.0)
+
+
+def test_the_gate_0_row_carries_the_on_card_mode(region):
+    """The field exists, survives the seal, and reads back by NAME.
+
+    S4-fix closed the SILENT half of refusal A (the slot geometry, in the
+    on-card row).  This is the LOUD half's channel: the mode is a per-BOOT arm,
+    so Gate 0 -- which runs before a byte moves -- is where it belongs.
+    """
+    _publish_matrix(region, modes=[xr.ONCARD_MODE_WORD["ipc"]] * xr.N_RANKS)
+    got = region.read_matrix_row(2)
+    assert got.sealed and got.oncard_mode_name == "ipc"
+    assert _check(region)["oncard_mode"] == "ipc"
+
+
+def test_ranks_that_disagree_about_the_on_card_mode_are_refused_before_a_byte_moves(
+        region):
+    """The LOUD half of S4-fix refusal A.
+
+    Without it the disagreement surfaces INSIDE the transport, after the flip
+    has started: a zero IPC handle on one side, a ``HostBounce(create=False)``
+    ENOENT on the other.  Both are loud, and both are late.
+    """
+    modes = [xr.ONCARD_MODE_WORD["ipc"]] * xr.N_RANKS
+    modes[4] = xr.ONCARD_MODE_WORD["host"]
+    _publish_matrix(region, modes=modes)
+    with pytest.raises(xr.Weg2XchgPlanDisagree) as excinfo:
+        _check(region)
+    message = str(excinfo.value)
+    assert "on-card MODE disagreement" in message
+    assert "row=4:host" in message and "row=0:ipc" in message
+    assert "no byte has moved" in message
+
+
+def test_an_unstated_on_card_mode_is_not_a_disagreement(region):
+    """Until S6 passes the arm down, every rank publishes 0.
+
+    A gate that refused that would refuse every flip of every boot before S6
+    exists -- a check that cannot pass is as useless as one that cannot fail,
+    and it would be discovered at the worst possible moment.
+    """
+    _publish_matrix(region, modes=[xr.ONCARD_MODE_UNSTATED] * xr.N_RANKS)
+    assert _check(region)["oncard_mode"] == "unstated"
+
+
+def test_a_mode_stated_by_only_some_ranks_is_a_disagreement(region):
+    """Half a boot's ranks knowing the arm is worse than none of them knowing.
+
+    ``unstated`` is a coherent whole-boot state (pre-S6); ``unstated`` BESIDE a
+    stated mode is a rank that did not get the arm, which is the launch defect
+    this refusal exists to name.
+    """
+    modes = [xr.ONCARD_MODE_WORD["ipc"]] * xr.N_RANKS
+    modes[5] = xr.ONCARD_MODE_UNSTATED
+    _publish_matrix(region, modes=modes)
+    with pytest.raises(xr.Weg2XchgPlanDisagree) as excinfo:
+        _check(region)
+    assert "on-card MODE disagreement" in str(excinfo.value)
+
+
+def test_the_verdict_republish_keeps_the_mode(region):
+    """``write_matrix_verdict`` is a read-modify-write of the rank's own row.
+
+    It re-published four fields and would have zeroed the fifth, turning every
+    rank that failed its local check into a mode disagreement as well -- one
+    refusal manufacturing another, which is how a log stops naming the cause.
+    """
+    _publish_matrix(region, modes=[xr.ONCARD_MODE_WORD["host"]] * xr.N_RANKS)
+    region.write_matrix_verdict(3, False)
+    assert region.read_matrix_row(3).oncard_mode_name == "host"
+
+
+def test_a_stale_full_count_refuses_the_leg_by_name(boot):
+    """S4-fix refusal C, carried forward: the 24 counts at the leg's start.
+
+    A flip abandoned after gate 1 rolls forward by design (W57) and leaves any
+    posted-but-untaken ``full`` at 1 for the rest of the boot.  The next
+    producer then blocks on ``empty`` for the whole fence budget and names a
+    healthy consumer.
+    """
+    xr.create_semaphores(boot)
+    sems = tp.SemSet(boot)
+    try:
+        assert tp.verify_sem_arm(sems, leg=1, epoch=f"{boot}.1")["stale"] == 0
+        sems.post(2, 1, "full")  # the leftover a rolled-forward flip leaves
+        with pytest.raises(tp.Weg2XchgSemaphoreNotRearmed) as excinfo:
+            tp.verify_sem_arm(sems, leg=2, epoch=f"{boot}.2")
+        message = str(excinfo.value)
+        assert tp.SEM_NOT_REARMED_MARKER in message
+        assert "count=1 armed=0" in message
+        assert xr.sem_name(boot, 2, 1, "full") in message
+        assert "does NOT drain them" in message
+        # AND IT DID NOT DRAIN IT: a check that repairs is a rank deciding
+        # another flip's leftovers were harmless.
+        assert sems.getvalue(2, 1, "full") == 1
+    finally:
+        sems.close()
+        xr.unlink_semaphores(boot)
+
+
+def test_the_armed_census_is_logged_so_a_pass_is_visible(boot):
+    """A check whose pass is invisible cannot be told from an absent one."""
+    xr.create_semaphores(boot)
+    sems = tp.SemSet(boot)
+    lines: list = []
+    try:
+        out = tp.verify_sem_arm(sems, leg=1, epoch=f"{boot}.1", log=lines.append)
+        assert out["checked"] == xr.N_PAIRS * xr.SLOTS_PER_PAIR * 2 == 24
+        assert lines and lines[0].startswith("WEG2-XCHG-SEMS ")
+        assert f"armed={out['checked']}/{out['checked']}" in lines[0]
+    finally:
+        sems.close()
+        xr.unlink_semaphores(boot)
+
+
+def test_the_armed_counts_are_read_from_one_place(boot):
+    """The check may not carry its own copy of the creation's two numbers.
+
+    ``create_semaphores`` arms ``empty`` at 1 and ``full`` at 0; a second
+    statement of that would drift, and the drift would read as a stale count on
+    a healthy boot.
+    """
+    xr.create_semaphores(boot)
+    sems = tp.SemSet(boot)
+    try:
+        for pair in range(xr.N_PAIRS):
+            for slot in range(xr.SLOTS_PER_PAIR):
+                for kind, want in tp.SEM_ARMED_COUNTS.items():
+                    assert sems.getvalue(pair, slot, kind) == want
+    finally:
+        sems.close()
+        xr.unlink_semaphores(boot)
