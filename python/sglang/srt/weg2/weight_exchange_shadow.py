@@ -56,7 +56,16 @@ import struct
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Callable, Dict, List, Optional, Sequence, Tuple
+from typing import (
+    Callable,
+    Dict,
+    FrozenSet,
+    Iterable,
+    List,
+    Optional,
+    Sequence,
+    Tuple,
+)
 
 from sglang.srt.weg2 import weight_exchange_region as xr
 from sglang.srt.weg2 import weight_exchange_transport as tp
@@ -124,6 +133,14 @@ COMPARE_LINE_PREFIX = "WEG2-XCHG-SHADOW-COMPARE"
 #:   on-card consumer, or -- worse -- a red compare that reads as a defect in
 #:   the exchange when it is a statement about the two layouts.
 PLAN_DIVERGED_MARKER = "W80 Weg2XchgShadowPlanDiverged"
+
+#: W83, and the one grep-able line for the card manifest's own refusals
+#: (#1311 S6b).  An overflow is the only shape here that is somebody's mistake;
+#: the two "not yet" states are ordinary boot startup and are reported under
+#: :data:`MANIFEST_LINE_PREFIX` without a W-code, for the same reason
+#: :data:`ONCARD_NOT_DRAINABLE_PREFIX` carries none.
+MANIFEST_OVERFLOW_MARKER = "W83 Weg2XchgManifestOverflow"
+MANIFEST_LINE_PREFIX = "WEG2-XCHG-MANIFEST"
 
 #: The comparison granularity, spec section 6/S5: "per-64-MiB-stripe checksum
 #: on device, no host round trip".  It is ALSO the size of the scratch the spec
@@ -224,6 +241,22 @@ class Weg2XchgShadowPlanDiverged(RuntimeError):
     """
 
 
+class Weg2XchgManifestOverflow(RuntimeError):
+    """W83 -- this rank holds more exchangeable parameters than a manifest row.
+
+    #1311 S6b.  The card manifest is the authority the co-located pair agrees
+    over, and the ONE way it can lie is by silently holding fewer entries than
+    the rank has: two ends that both truncated at the same cap would intersect
+    two truncated sets, agree, and shadow a subset neither of them chose --
+    with every instrument reading green.  So the overflow is a refusal by name,
+    never a narrowing, and the message carries the count and the cap so raising
+    :data:`MANIFEST_MAX_ENTRIES` is an arithmetic decision rather than a guess.
+
+    NOT a flip refusal, like everything else in this module: the shadow
+    switches itself off for this boot's on-card lane and the ring proceeds.
+    """
+
+
 class Weg2XchgShadowUnaffordable(RuntimeError):
     """W77 -- the shadow's buffers do not fit this card's free column.
 
@@ -271,6 +304,95 @@ SHADOW_AREA_END = SHADOW_AREA_OFF + SHADOW_AREA_BYTES
 
 VOTE_NO = 0
 VOTE_YES = 1
+
+
+# ---------------------------------------------------------------------------
+# THE CARD MANIFEST (#1311 S6b).  The shared authority the on-card gate lacked.
+# ---------------------------------------------------------------------------
+#
+# BOOT weg2xsn5 MEASURED THE GAP THIS TABLE CLOSES.  ``W80 ... scope=oncard-peer
+# field=piece_digest`` fired on 7 of 8 legs, three co-located pairs, with the
+# two values STABLE per pair across every leg -- and the same boot's
+# ``PARAM-CENSUS`` says why: group D carries 1249 parameters on every rank (TP,
+# every layer sliced) while group P carries 935/488/490 (PP stage subsets, rank
+# 1 starting at ``model.layers.42``).  The plan line agreed: ``oncard_pieces``
+# was 1200 on the D ranks and 902/481/479 on the P ranks.  Two sets of DIFFERENT
+# CARDINALITY cannot hash equal, so the gate could not open on any leg of any
+# boot of this serving form.
+#
+# THE DEFECT CLASS IS "AN AGREEMENT GATE WHOSE TWO ENDS COMPUTE FROM RANK-LOCAL
+# INPUTS", and S6 fix F2 changed the HASH FUNCTION without changing the INPUT'S
+# PROVENANCE: :func:`oncard_piece_digest`'s own docstring claims ``descs`` is a
+# "group-uniform derivation", but :func:`derive_leg_plan` builds its inventory
+# from ``model.named_parameters()`` -- this rank's own live model -- and fills
+# the PEER's half of every descriptor by DERIVING it from this rank's geometry
+# (``ptr_of``/``geom_of`` return ``None`` off-rank, so ``_emit`` falls back to
+# the local ``ParamGeom``).  Each end therefore plans "my tensors exchanged with
+# a peer shaped exactly like me", which two differently-shaped ends can never
+# agree on.  ``plan_digest`` (scope=group) agreed on all six rows in that same
+# boot precisely because ``LegPlanFacts`` IS rank-uniform: it is read from the
+# launcher's environment and from pure functions of it.
+#
+# SO THE FIX IS AN AUTHORITY, NOT A RELAXATION.  Each rank publishes the
+# POINTER-FREE IDENTITY of every family-tagged parameter it holds into its own
+# sealed row here, once per boot; the co-located pair then plans over the
+# INTERSECTION of the two rows.  Both ends compute that intersection from the
+# same two published arrays, so their digests are equal BY CONSTRUCTION rather
+# than by luck -- and what they exchange is exactly the set of pieces both ends
+# hold identically, which is the only claim the on-card lane can honestly make
+# (#1277 measured that diagonal at 10.285 GiB, 35.7 %, byte-exact).
+#
+# THE ENTRY CARRIES THE EXTENTS, and that is deliberate.  Intersecting on the
+# NAME alone would agree on a parameter that P holds whole and D holds as a TP
+# shard, and the lane would then move a stage-holder's bytes into a
+# shard-holder's storage.  Requiring ``rows_full``, ``cols_full`` and
+# ``itemsize`` to match too means a piece enters the agreed set only when the
+# two ends really do hold the same bytes; everything else is EXCLUDED and
+# COUNTED on the plan line, never silently narrowed.
+#
+# KEYED ON ``boot_hash``, NOT ``epoch_hash``: a rank's parameter inventory is a
+# BOOT constant, so the row is written once and survives every flip.  A row
+# stamped with another boot's nonce is a stale mapping and reads as absent.
+MANIFEST_AREA_OFF = SHADOW_AREA_END
+#: ``(name_hash, class_hash, rows_full, cols_full, itemsize)`` -- 40 bytes.
+#: The two hashes are :func:`weight_exchange_region.epoch_hash`, i.e. blake2b-64
+#: and stable across processes (``hash()`` is randomised per process and would
+#: make six ranks publish six different numbers for one name).
+MANIFEST_ENTRY_STRUCT = struct.Struct("<5Q")
+#: ``(boot_hash, count, peer_seen)``.  ``peer_seen`` is the MUTUAL-READINESS
+#: flag and it is what makes the two ends switch on together -- see
+#: :func:`reconcile_card_manifest`.
+MANIFEST_HEADER_STRUCT = struct.Struct("<3Q")
+#: The cap.  Above it the manifest REFUSES BY NAME (W83) instead of truncating:
+#: two ends that both truncated would agree on a lie, which is the
+#: instrument-that-cannot-go-red shape this campaign has paid for three times.
+#: 2048 is 1.6x the largest census this rig has measured (D, 1249).
+MANIFEST_MAX_ENTRIES = 2048
+MANIFEST_SEAL_BYTES = 8
+#: 96 KiB per row holds the cap with room to grow the entry.  Six rows are
+#: 589,824 bytes of the 832,768 the dir area has free behind the shadow rows
+#: (``DATA_OFF - DIR_OFF - SHADOW_AREA_END``), asserted below rather than
+#: asserted in prose.
+MANIFEST_ROW_BYTES = 96 * 1024
+MANIFEST_AREA_BYTES = xr.N_RANKS * MANIFEST_ROW_BYTES
+MANIFEST_AREA_END = MANIFEST_AREA_OFF + MANIFEST_AREA_BYTES
+
+#: IT FITS, CHECKED AT IMPORT.  ``dir_view`` is exactly ``DATA_OFF - DIR_OFF``
+#: long, so an arithmetic error here would raise ``IndexError`` deep inside a
+#: flip leg instead of at import; both bounds are asserted so neither the row
+#: size nor the entry cap can be raised past the area by an edit that only
+#: looks local.
+assert (MANIFEST_HEADER_STRUCT.size
+        + MANIFEST_MAX_ENTRIES * MANIFEST_ENTRY_STRUCT.size
+        + MANIFEST_SEAL_BYTES) <= MANIFEST_ROW_BYTES
+assert MANIFEST_AREA_END <= (xr.DATA_OFF - xr.DIR_OFF)
+
+#: The manifest states, on the plan line as ``manifest=``.
+MANIFEST_AGREED = "agreed"
+MANIFEST_PEER_ABSENT = "peer-absent"
+MANIFEST_PEER_UNREADY = "peer-unready"
+MANIFEST_NOT_ASKED = "not-asked"
+MANIFEST_OVERFLOW = "overflow"
 
 
 def _row_off(row: int) -> int:
@@ -387,18 +509,52 @@ ONCARD_NOT_DRAINABLE_PREFIX = "WEG2-XCHG-SHADOW-ONCARD-REFUSED"
 
 def oncard_not_drainable_message(*, rank: int, row: int, peer_row: int,
                                  leg: int, epoch: str, is_source: bool,
-                                 descs: int) -> str:
-    """Why this leg compared digests and moved no bytes (S5c refuter, must_fix 3)."""
+                                 descs: int, mode: str = "",
+                                 asked: bool = False) -> str:
+    """Why this leg compared digests and moved no bytes (S5c refuter, must_fix 3).
+
+    #1311 S6b CORRECTED WHAT IT BLAMES, because the old sentence became wrong
+    the moment the deposit was wired.  It named the PLACEMENT -- "the co-located
+    end cannot run while this hook holds its scheduler thread" -- and boot
+    weg2xsn5 printed that 24 times on an ``ipc`` boot.  The placement is a true
+    fact, but it is no longer the OPERATIVE one: the store-and-forward deposit
+    exists precisely to run with no concurrent peer, and it is unavailable here
+    only because an exported VRAM bounce dies with the leg that exported it.
+    A reader who acts on the old sentence goes looking at the hooks; the action
+    that changes this line is ``--weg2-xchg-oncard host``.  ``asked=False``
+    keeps the original sentence for a caller that never asked for the deposit.
+    """
+    if asked:
+        why = (
+            f"-- this lane asked for the store-and-forward deposit (which needs "
+            f"no concurrent peer) and the arm cannot carry it: oncard_mode="
+            f"{mode or 'unset'!s}, and an exported VRAM bounce is freed with "
+            f"the leg that exported it, so it cannot outlive the leg the "
+            f"destination reads it in.  THE ARM IS THE ACTION: this lane runs "
+            f"on --weg2-xchg-oncard host, where the deposit is a shm file the "
+            f"destination opens in its own later leg.  The placement fact "
+            f"below still holds and is why the deposit is needed at all: the "
+            f"source hook is upstream of the pause loop that publishes the C14 "
+            f"credit the co-located destination hook's resume is fenced on, so "
+            f"a drained producer here would block in drain-final and time out "
+            f"at the budget for zero compared bytes"
+        )
+    else:
+        why = (
+            "-- the co-located end of this lane cannot run while this hook "
+            "holds its scheduler thread (the source hook is upstream of the "
+            "pause loop that publishes the C14 credit the co-located "
+            "destination hook's resume is fenced on), so a producer here would "
+            "fill a bounce, block in drain-final and time out at the budget "
+            "for zero compared bytes"
+        )
     return (
         f"{ONCARD_NOT_DRAINABLE_PREFIX} rank={rank} row={row} "
         f"peer_row={peer_row} leg={leg} epoch={epoch} "
         f"hook={'source' if is_source else 'destination'} oncard_descs={descs} "
-        "-- the co-located end of this lane cannot run while this hook holds "
-        "its scheduler thread (the source hook is upstream of the pause loop "
-        "that publishes the C14 credit the co-located destination hook's "
-        "resume is fenced on), so a producer here would fill a bounce, block "
-        "in drain-final and time out at the budget for zero compared bytes; "
-        "the gate rendezvous ran and plan_digest/piece_digest WERE compared, "
+        f"oncard_mode={mode or 'unset'} deposit_asked={'yes' if asked else 'no'} "
+        + why +
+        "; the gate rendezvous ran and plan_digest/piece_digest WERE compared, "
         "the ring is and stays the only authority for weight bytes"
     )
 
@@ -1836,8 +1992,11 @@ def shadow_transport(
                 log(oncard_not_drainable_message(
                     rank=rank, row=row, peer_row=peer_row, leg=leg, epoch=epoch,
                     is_source=is_source,
-                    descs=sum(1 for d in subset.descs if _is_on_card(d))))
-                result.reason = "oncard-not-drainable"
+                    descs=sum(1 for d in subset.descs if _is_on_card(d)),
+                    mode=str(oncard_mode), asked=bool(oncard_store_forward)))
+                result.reason = ("oncard-arm-cannot-deposit"
+                                 if oncard_store_forward
+                                 else "oncard-not-drainable")
                 return run
             if deposit_reason:
                 log(deposit_refusal_message(
@@ -1942,6 +2101,207 @@ def shadow_transport(
             result.blocked_ms = oncard.drain_wait_s * 1e3
         run.close()
     return run
+
+
+def _manifest_row_off(row: int) -> int:
+    if not 0 <= int(row) < xr.N_RANKS:
+        raise ValueError(f"row must be 0..{xr.N_RANKS - 1}, not {row!r}")
+    return MANIFEST_AREA_OFF + int(row) * MANIFEST_ROW_BYTES
+
+
+def manifest_entry(name: str, cls: str, rows_full: int, cols_full: int,
+                   itemsize: int) -> Tuple[int, int, int, int, int]:
+    """One parameter's POINTER-FREE, PROCESS-STABLE identity.
+
+    The two hashes are ``blake2b`` (:func:`weight_exchange_region.epoch_hash`)
+    and never ``hash()``: PYTHONHASHSEED randomises the builtin per process, so
+    six ranks would publish six different numbers for one parameter name and
+    every intersection would be empty.  The extents ride along because a name
+    alone would let a stage-holder and a shard-holder agree on a parameter
+    whose bytes they do not share -- see the table header.
+    """
+    return (xr.epoch_hash(str(name)), xr.epoch_hash(str(cls)),
+            int(rows_full), int(cols_full), int(itemsize))
+
+
+def write_card_manifest(region: xr.XchgRegion, row: int,
+                        entries: Sequence[Tuple[int, int, int, int, int]],
+                        *, peer_seen: bool) -> None:
+    """Publish this rank's manifest row.  ONE WRITER PER ADDRESS, sealed.
+
+    Same discipline as every other row in this region: a rank writes only its
+    own row, the row is sealed, and a half-written row is not a signal.  The
+    row is keyed on ``region.boot_hash`` rather than ``epoch_hash`` because the
+    inventory it describes is a BOOT constant -- writing it once and reading it
+    on every later flip is the point.
+
+    Raises :class:`Weg2XchgManifestOverflow` above the cap.  It does NOT
+    truncate: see that class.
+    """
+    entries = tuple(entries)
+    if len(entries) > MANIFEST_MAX_ENTRIES:
+        raise Weg2XchgManifestOverflow(
+            f"{MANIFEST_OVERFLOW_MARKER} row={row} entries={len(entries)} "
+            f"cap={MANIFEST_MAX_ENTRIES} -- this rank holds more exchangeable "
+            f"parameters than one manifest row addresses.  Truncating would "
+            f"let both ends of a co-located pair intersect two truncated sets, "
+            f"agree, and shadow a subset neither of them chose, with every "
+            f"instrument green; raise MANIFEST_MAX_ENTRIES (and with it "
+            f"MANIFEST_ROW_BYTES, which the module asserts against the dir "
+            f"area) instead")
+    view = region.dir_view()
+    addr = ctypes.addressof(view)
+    off = _manifest_row_off(row)
+    payload = bytearray(MANIFEST_HEADER_STRUCT.pack(
+        int(region.boot_hash), len(entries), 1 if peer_seen else 0))
+    for e in entries:
+        payload += MANIFEST_ENTRY_STRUCT.pack(*(int(v) & ((1 << 64) - 1)
+                                                for v in e))
+    payload = bytes(payload)
+    ctypes.memmove(addr + off, payload, len(payload))
+    ctypes.memmove(addr + off + MANIFEST_ROW_BYTES - MANIFEST_SEAL_BYTES,
+                   struct.pack("<Q", xr._seal(payload)), MANIFEST_SEAL_BYTES)
+
+
+def read_card_manifest(region: xr.XchgRegion, row: int):
+    """``(entries, peer_seen, state)`` for one row.
+
+    ``state`` is :data:`MANIFEST_PEER_ABSENT` for a row that was never written,
+    was written by ANOTHER BOOT, is unsealed (a half-written row), or claims a
+    count the row cannot hold -- four ways of "there is nothing here to agree
+    with", all of which must read as absent rather than as an empty agreement.
+    An empty agreement is the dangerous one: it hashes to a fixed number both
+    ends would match.
+    """
+    view = region.dir_view()
+    addr = ctypes.addressof(view)
+    off = _manifest_row_off(row)
+    head = ctypes.string_at(addr + off, MANIFEST_HEADER_STRUCT.size)
+    boot_hash, count, peer_seen = MANIFEST_HEADER_STRUCT.unpack(head)
+    if boot_hash != int(region.boot_hash) or count > MANIFEST_MAX_ENTRIES:
+        return (), False, MANIFEST_PEER_ABSENT
+    span = MANIFEST_HEADER_STRUCT.size + count * MANIFEST_ENTRY_STRUCT.size
+    payload = ctypes.string_at(addr + off, span)
+    seal = struct.unpack("<Q", ctypes.string_at(
+        addr + off + MANIFEST_ROW_BYTES - MANIFEST_SEAL_BYTES,
+        MANIFEST_SEAL_BYTES))[0]
+    if seal != xr._seal(payload):
+        return (), False, MANIFEST_PEER_ABSENT
+    body = payload[MANIFEST_HEADER_STRUCT.size:]
+    entries = tuple(MANIFEST_ENTRY_STRUCT.unpack_from(body, i * 40)
+                    for i in range(count))
+    return entries, bool(peer_seen), ""
+
+
+@dataclass(frozen=True)
+class AgreedPieces:
+    """THE INTERSECTION of a co-located pair's two manifests.
+
+    Both ends build this from the SAME two published rows, so ``digest`` is
+    equal on both by construction -- which is the whole difference between this
+    and the rank-local ``piece_digest`` boot weg2xsn5 refused 7 legs on.
+    ``mine``/``theirs`` are the two cardinalities, printed on the plan line, so
+    a reader sees how much of each side was excluded rather than only what
+    survived.
+    """
+
+    keys: FrozenSet[Tuple[int, int, int, int, int]]
+    digest: int
+    mine: int
+    theirs: int
+
+    @property
+    def count(self) -> int:
+        return len(self.keys)
+
+
+def agreed_piece_digest(keys: Iterable[Tuple[int, int, int, int, int]]) -> int:
+    """The intersection, ORDERED, as one number.
+
+    Sorted on the key itself and never on iteration order, for the same reason
+    :func:`oncard_piece_digest` is: two processes build their sets in different
+    orders and must still produce the same number.
+    """
+    return xr.epoch_hash("|".join(repr(tuple(int(v) for v in k))
+                                  for k in sorted(keys)))
+
+
+def agree_card_pieces(mine: Sequence[Tuple[int, int, int, int, int]],
+                      theirs: Sequence[Tuple[int, int, int, int, int]],
+                      ) -> AgreedPieces:
+    """What this card's co-located pair BOTH hold, identically."""
+    a = {tuple(int(v) for v in e) for e in mine}
+    b = {tuple(int(v) for v in e) for e in theirs}
+    keys = frozenset(a & b)
+    return AgreedPieces(keys=keys, digest=agreed_piece_digest(keys),
+                        mine=len(a), theirs=len(b))
+
+
+def reconcile_card_manifest(region: xr.XchgRegion, *, row: int, peer_row: int,
+                            entries: Sequence[Tuple[int, int, int, int, int]]):
+    """Publish this rank's manifest, read the peer's, and agree.  ``(agreed, state)``.
+
+    THE MUTUAL-READINESS FLAG, and it is what stops this fix from replacing one
+    divergence with another.  The two hooks of a leg are at OPPOSITE ENDS of the
+    flip -- the source runs before its group's pause, the destination after its
+    resume -- so at the very first hook of a boot the source has published its
+    row and the destination has not.  If the destination then used the
+    intersection while the source published a zero, the gate would report W80
+    for a reason that is pure startup order.
+
+    So each row carries ``peer_seen``, monotone 0 -> 1, and the intersection is
+    used only when BOTH rows carry 1.  Both ends evaluate that predicate over
+    the same two rows, and the source hook of a leg always seals its row before
+    the destination hook of the same leg reads it -- the SAME ordering
+    :func:`shadow_gate`'s asymmetric ``expect_rows`` already relies on and
+    states.  The cost is bounded and named: the first flip of a boot refuses
+    both directions by name, and every later flip agrees.
+
+    ``state`` is one of :data:`MANIFEST_AGREED`, :data:`MANIFEST_PEER_ABSENT`,
+    :data:`MANIFEST_PEER_UNREADY` or :data:`MANIFEST_OVERFLOW`; only the first
+    returns an :class:`AgreedPieces`.
+    """
+    theirs, their_seen, their_state = read_card_manifest(region, int(peer_row))
+    seen = not their_state
+    try:
+        write_card_manifest(region, int(row), entries, peer_seen=seen)
+    except Weg2XchgManifestOverflow:
+        return None, MANIFEST_OVERFLOW
+    if not seen:
+        return None, MANIFEST_PEER_ABSENT
+    if not their_seen:
+        # THE PEER HAS NOT SEEN US YET, so it is about to publish a zero digest
+        # for this leg; agreeing here would be this end alone.  Named, not
+        # silent, and it clears on the next flip.
+        return None, MANIFEST_PEER_UNREADY
+    return agree_card_pieces(entries, theirs), MANIFEST_AGREED
+
+
+def manifest_state_message(*, state: str, rank: int, row: int, peer_row: int,
+                           leg: int, epoch: str, mine: int, theirs: int = -1,
+                           ) -> str:
+    """The card manifest's own line -- one grep, four states (#1311 S6b)."""
+    marker = (MANIFEST_OVERFLOW_MARKER if state == MANIFEST_OVERFLOW
+              else MANIFEST_LINE_PREFIX)
+    tail = {
+        MANIFEST_OVERFLOW: (
+            "-- this rank holds more exchangeable parameters than one manifest "
+            "row addresses; the on-card lane is refused rather than agreed "
+            "over a truncated set"),
+        MANIFEST_PEER_ABSENT: (
+            "-- the co-located peer has not published its card manifest yet, "
+            "which is the ordinary state of the FIRST hook of a boot (the "
+            "source runs before its pause, the destination after its resume); "
+            "the on-card lane is refused by name for this leg and agrees from "
+            "the next flip on"),
+        MANIFEST_PEER_UNREADY: (
+            "-- the peer's manifest is published but has not yet seen ours, so "
+            "it will vote a zero piece digest for this leg; agreeing here "
+            "would be one end alone and would report itself as W80"),
+    }.get(state, "-- the co-located pair agreed its on-card piece set")
+    return (f"{marker} state={state} rank={rank} row={row} "
+            f"peer_row={peer_row} leg={leg} epoch={epoch} "
+            f"mine={mine} theirs={theirs} cap={MANIFEST_MAX_ENTRIES} {tail}")
 
 
 def oncard_piece_digest(descs: Sequence[object], card: int) -> int:
@@ -2259,6 +2619,20 @@ class LegPlan:
     card: int
     tags: Tuple[str, ...]
     card_digest: int
+    #: #1311 S6b.  THIS RANK'S OWN CARD MANIFEST -- what it publishes into the
+    #: region for its co-located peer to intersect with.  Carried on the plan so
+    #: the "one producer for the identity" claim is checkable rather than prose:
+    #: a test compares it against :func:`derive_card_manifest` on the same model
+    #: and the two must be equal.
+    manifest: Tuple[Tuple[int, int, int, int, int], ...] = ()
+    #: :data:`MANIFEST_AGREED` when this plan was narrowed to a peer-agreed
+    #: piece set, :data:`MANIFEST_NOT_ASKED` when no manifest was handed in
+    #: (every hermetic caller, byte-unchanged).
+    agreed_state: str = MANIFEST_NOT_ASKED
+    agreed_digest: int = 0
+    agreed_count: int = 0
+    agreed_mine: int = 0
+    agreed_theirs: int = 0
     undescribed: int = 0
     #: THE POPULATION THIS PLAN WAS DERIVED OVER, from
     #: ``weight_exchange.walk_live_tensors`` -- the ring's own named producer
@@ -2290,19 +2664,44 @@ class LegPlan:
 
     @property
     def piece_digest(self) -> int:
-        """THE GATE'S FIELD (S6 fix F2): this card's on-card piece set.
+        """THE GATE'S FIELD: this card's PEER-AGREED on-card piece set.
 
-        Derived from ``self.descs`` -- the group-uniform derivation -- and this
-        card's index, never from a rank-local tensor walk.  That is what lets a
-        stage-holder and a shard-holder produce the same number for the same
-        card while their whole-storage digests differ, which is the fact the
-        old gate could not represent.
+        #1311 S6b CHANGED THE PROVENANCE, which is what S6 fix F2 did not.
+        F2's version hashed ``self.descs`` and its docstring called that "the
+        group-uniform derivation" -- but :func:`derive_leg_plan` builds those
+        descriptors from ``model.named_parameters()``, this rank's OWN live
+        model, and fills the peer's half of each descriptor from this rank's own
+        geometry.  Boot weg2xsn5 measured the consequence: 1200 on-card pieces
+        on the D ranks against 902/481/479 on the P ranks, ``W80
+        field=piece_digest`` on 7 of 8 legs, ``ran=no`` 48 of 48, and not one
+        MATCH or MISMATCH verdict in the whole boot.
+
+        The number returned here is now the digest of the INTERSECTION of the
+        pair's two published card manifests (:func:`reconcile_card_manifest`),
+        computed by both ends over the same two arrays.
+
+        ``0`` when a product leg could not agree -- both ends return 0 in that
+        case, so the gate sees a uniform table and reports the honest reason
+        rather than a fabricated divergence.  With no manifest asked at all
+        (every hermetic caller) it falls back to the old descriptor digest, so
+        those callers are byte-unchanged.
         """
-        return oncard_piece_digest(self.descs, int(self.card))
+        if self.agreed_state == MANIFEST_AGREED:
+            return int(self.agreed_digest)
+        if self.agreed_state == MANIFEST_NOT_ASKED:
+            return oncard_piece_digest(self.descs, int(self.card))
+        return 0
 
     @property
     def oncard_pieces(self) -> int:
-        """How many pieces this card's pair exchanges.  0 is a named refusal."""
+        """How many DESCRIPTORS this card's pair exchanges.  0 is a named refusal.
+
+        Deliberately still the descriptor count and not ``agreed_count``: the
+        two answer different questions and both belong on the line.
+        ``agreed_count`` is how many PARAMETERS the pair agreed on;
+        this is how many pieces the transport will actually issue after
+        ``coalesce``, which is what a lane with nothing to do is measured by.
+        """
         return oncard_piece_count(self.descs, int(self.card))
 
     @property
@@ -2350,6 +2749,14 @@ class LegPlan:
             f"card_digest={self.card_digest:#x} "
             f"piece_digest={self.piece_digest:#x} "
             f"oncard_pieces={self.oncard_pieces} "
+            # #1311 S6b: BOTH CARDINALITIES, NEVER ONLY THE SURVIVOR.  On the
+            # 42,11,11 form the two ends carry 1249 and 935/488/490 parameters,
+            # so a line printing only ``agreed=`` would hide how much of each
+            # side the intersection excluded -- and how much it excluded is the
+            # measurement the next boot is graded on.
+            f"manifest={self.agreed_state} agreed={self.agreed_count} "
+            f"manifest_mine={self.agreed_mine} "
+            f"manifest_theirs={self.agreed_theirs} "
             f"source={self.facts.source}"
         )
 
@@ -2371,6 +2778,80 @@ def _plan_refusal(reason: str, detail: str = "") -> Tuple[None, str]:
     return None, (f"{reason}:{detail}" if detail else reason)
 
 
+def card_manifest_entries(inventory: Sequence[object],
+                          ) -> Tuple[Tuple[int, int, int, int, int], ...]:
+    """THE PUBLISHED IDENTITY of every parameter in one card's inventory.
+
+    ONE PRODUCER for the identity the pair agrees over and the identity the plan
+    is narrowed by -- both come from this function over the same
+    :class:`ParamGeom` list, so they cannot drift.  Sorted, because two
+    processes build their lists in different orders and the digest is over the
+    set.
+    """
+    return tuple(sorted(
+        manifest_entry(g.name, tensor_class(g.name), g.rows_full, g.cols_full,
+                       g.itemsize)
+        for g in inventory))
+
+
+def derive_card_manifest(
+    *,
+    rank: int,
+    model,
+    region_tag: str = "",
+    chunk_geometry: Optional[Callable[[], Tuple[int, int]]] = None,
+    family_tags: Optional[Callable[[int], Sequence[str]]] = None,
+    tag_of: Optional[Callable[..., str]] = None,
+):
+    """This rank's card manifest, without building a plan.  ``(entries, reason)``.
+
+    THE ADAPTER'S ENTRY POINT, and it is separate from :func:`derive_leg_plan`
+    for a timing reason rather than a taste one: the manifest is a BOOT constant
+    (a rank's parameter inventory does not change across flips) and must be
+    published BEFORE the first plan is derived, because the plan is narrowed by
+    the agreement the publication makes possible.  Deriving a whole plan just to
+    read its inventory would double ``derive_ms`` on the flip's critical path,
+    which the hook budget subtracts from its own deadline.
+
+    Every refusal word is :func:`derive_leg_plan`'s, verbatim, so a boot log can
+    be censused by cause across both entry points.
+    """
+    from sglang.srt.managers import weg2_memory_saver as ms
+    from sglang.srt.weg2 import weight_exchange as wx
+
+    chunk_geometry = chunk_geometry or ms.weight_chunk_geometry
+    family_tags = family_tags or ms.weights_family_tags
+    tag_of = tag_of or wx.tag_of_parameter_name
+    region_tag = region_tag or wx.GPU_MEMORY_TYPE_WEIGHTS
+    if model is None:
+        return None, "no-model"
+    chunk_layers, chunk_count = chunk_geometry()
+    if int(chunk_layers) <= 0 or int(chunk_count) <= 0:
+        return None, (f"no-ring-layout:weight_chunk_geometry()="
+                      f"({chunk_layers}, {chunk_count})")
+    family = tuple(str(t) for t in family_tags(int(chunk_count)))
+    inventory = []
+    for name, param in model.named_parameters():
+        tag = str(tag_of(str(name), region_tag=region_tag))
+        if not ms.is_weights_family_tag(tag):
+            continue
+        if tag not in family:
+            return None, f"tag-not-in-family:{name} tag={tag}"
+        try:
+            geom = wx.ParamGeom.of(param, name=str(name), tag=tag,
+                                   shard_axis=wx.REPLICATED, shard_total=0,
+                                   stage=int(rank))
+        except BaseException:  # noqa: BLE001 -- a shape this plan cannot name
+            # THE SAME SKIP RULE AS THE PLAN'S, deliberately: a parameter the
+            # plan cannot describe must not be in the manifest either, or the
+            # pair would agree on a piece one end can never move.
+            continue
+        inventory.append(geom)
+    if not inventory:
+        return None, f"no-carried-tags:family={family}"
+    return card_manifest_entries(inventory), ""
+
+
 def derive_leg_plan(
     *,
     hook: str,
@@ -2384,6 +2865,19 @@ def derive_leg_plan(
     tag_of: Optional[Callable[..., str]] = None,
     waves_of: Optional[Callable[..., Sequence[Sequence[str]]]] = None,
     n_cards: Optional[int] = None,
+    #: #1311 S6b.  THE CO-LOCATED PAIR'S AGREED ON-CARD PIECE SET, from
+    #: :func:`reconcile_card_manifest`.  When given, the inventory is narrowed
+    #: to it BEFORE ``build_plan`` -- never afterwards, because ``coalesce``
+    #: merges adjacent descriptors ACROSS parameter names (it compares tag and
+    #: ranks, not ``param_name``, and the merged descriptor keeps the first
+    #: name), so a descriptor-level filter would drop bytes it still names or
+    #: keep bytes it no longer names.
+    agreed: Optional[AgreedPieces] = None,
+    #: PRODUCT PATH ONLY.  ``True`` says this caller has a co-located peer and
+    #: must not plan a lane over a set the peer never agreed to; the derivation
+    #: then refuses by name instead of falling back to this rank's own view.
+    #: ``False`` keeps every S3/S4/S5 caller and every hermetic test unchanged.
+    require_agreement: bool = False,
 ) -> Tuple[Optional[LegPlan], str]:
     """ONE derivation, from the ring's own layout facts.  ``(plan, reason)``.
 
@@ -2550,7 +3044,50 @@ def derive_leg_plan(
     if not inventory:
         return _plan_refusal("no-carried-tags", f"family={family}")
 
+    # THE CARD MANIFEST THIS RANK PUBLISHES, from the inventory that was just
+    # built -- ONE producer for the identity, so the set the pair agrees over
+    # and the set the plan is built from cannot drift apart.
+    manifest = card_manifest_entries(inventory)
+
+    # #1311 S6b: THE NARROWING IS THE FIX, AND IT HAPPENS HERE.  Boot weg2xsn5
+    # refused 7 of 8 legs on ``field=piece_digest`` because each end hashed its
+    # OWN inventory: 1200 on-card pieces on the D ranks against 902/481/479 on
+    # the P ranks, three co-located pairs, stable across every leg.  Restricting
+    # the inventory to the pair's INTERSECTION makes the two ends plan the same
+    # pieces, so the digests are equal by construction and what the lane moves
+    # is exactly the bytes both ends hold identically.
+    if agreed is not None:
+        keys = agreed.keys
+        kept = [g for g in inventory
+                if manifest_entry(g.name, tensor_class(g.name), g.rows_full,
+                                  g.cols_full, g.itemsize) in keys]
+        if not kept:
+            return _plan_refusal(
+                "no-agreed-pieces",
+                f"mine={agreed.mine} theirs={agreed.theirs} agreed=0")
+        inventory = kept
+        tensor_of = {str(g.name): tensor_of[str(g.name)] for g in inventory}
+        carried = {str(g.tag) for g in inventory}
+    elif require_agreement:
+        # NEVER A FALLBACK TO THIS RANK'S OWN VIEW.  A product leg whose peer
+        # has not published cannot plan an on-card lane at all: planning one
+        # anyway is exactly the rank-local derivation that produced W80, and a
+        # relaxed comparison would be worse than the refusal it replaced.
+        return _plan_refusal("manifest-unagreed",
+                             f"hook={hook} group={group} rank={rank} -- the "
+                             f"co-located pair has not agreed a card manifest "
+                             f"for this leg")
+
     # THE ROTATION, over the CHUNK tags only -- see the docstring.
+    #
+    # #1311 S6b, AND IT IS THE SIBLING OF THE W80 ROOT.  ``classes`` is voted at
+    # the gate as ``classes_hash``, and it is derived from THIS RANK'S
+    # inventory: on boot weg2xsn5 the six ranks agreed only because a PP stage
+    # subset and a TP slice of every layer happen to yield the same class NAMES
+    # (``qkv_proj``, ``o_proj``, ...).  That is an accident of naming, not a
+    # property of the derivation -- one class present on only one side of the
+    # cut would have refused every leg under a different sentence.  Deriving it
+    # from the AGREED inventory makes the agreement structural here too.
     classes = tuple(sorted({
         tensor_class(g.name) for g in inventory
         if ms.is_weights_chunk_tag(g.tag)}))
@@ -2599,6 +3136,13 @@ def derive_leg_plan(
                    tags=tuple(sorted(carried)),
                    card_digest=card_geometry_digest(inventory, classes,
                                                     unplanned=unplanned),
+                   manifest=manifest,
+                   agreed_state=(MANIFEST_AGREED if agreed is not None
+                                 else MANIFEST_NOT_ASKED),
+                   agreed_digest=(agreed.digest if agreed is not None else 0),
+                   agreed_count=(agreed.count if agreed is not None else 0),
+                   agreed_mine=(agreed.mine if agreed is not None else 0),
+                   agreed_theirs=(agreed.theirs if agreed is not None else 0),
                    undescribed=undescribed,
                    population=len(live),
                    planned=len(inventory),
