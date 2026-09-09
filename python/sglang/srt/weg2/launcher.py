@@ -4887,6 +4887,55 @@ def incumbent_candidate(decision, incumbent_layers, incumbent_attn):
     return None
 
 
+def shipped_line(decision, chosen, ship_why, incumbent_row, makespan_row) -> str:
+    """THE ``PP-CUT SHIPPED`` line. Pure, so it can be RENDERED by a test.
+
+    Split out for the same reason :func:`incumbent_candidate` was: this line is
+    the boot's whole statement of which priced row it pays for, and until
+    #1286b the only proof it still rendered was a boot. It carries twelve
+    substitutions across a %-format, which is exactly the failure class an edit
+    to it produces -- a wrong arity raises TypeError at emit time, i.e. after
+    the weights are loaded, i.e. a spent window. Now a desk test builds a
+    decision and renders it.
+
+    #1286b renamed ``pool_tokens=`` to ``chosen_pool=`` and added
+    ``pool_floor=``: a pool figure whose constraint is not printed beside it is
+    the shape that let weg2sb5f's +64.1 %% sit in plain sight across two logs.
+    ``pool_tokens=`` survives on the ``PP-CUT solver:`` table rows and on
+    ``PP-POOL-JOIN``, and no parser on this rig reads it off THIS line.
+    """
+    return (
+        "PP-CUT SHIPPED: layers=%s attn=%s chosen_pool=%d pool_floor=%s "
+        "makespan_ms=%.1f -- %s. "
+        "The two objectives this boot did NOT take stay priced beside it and are "
+        "therefore not paid by accident: incumbent %s pool %s makespan %s, "
+        "pool-maximal (kv-floor) %s pool %d makespan %.1f, makespan-optimal %s "
+        "pool %d makespan %.1f (--pp-solve-objective incumbent|maxkv|makespan "
+        "ships them)."
+        % (
+            ",".join(str(n) for n in chosen.layers),
+            ",".join(str(a) for a in chosen.attn),
+            int(chosen.pool_tokens),
+            "none" if decision.pool_floor is None else str(int(decision.pool_floor)),
+            chosen.makespan_ms,
+            ship_why,
+            incumbent_row.fmt() if incumbent_row is not None else "%s / %s" % (
+                _csv(P_PP_STAGE_RATIO_SCORES), _csv(P_PP_ATTN_STAGE_RATIO_SCORES)
+            ),
+            "%d" % int(incumbent_row.pool_tokens) if incumbent_row is not None
+            else "n/a (NOT RANKED by this solve)",
+            "%.1f" % incumbent_row.makespan_ms if incumbent_row is not None
+            else "n/a",
+            decision.kv_floor.fmt(),
+            int(decision.kv_floor.pool_tokens),
+            decision.kv_floor.makespan_ms,
+            makespan_row.fmt(),
+            int(makespan_row.pool_tokens),
+            makespan_row.makespan_ms,
+        )
+    )
+
+
 def solve_p_cut(
     ns,
     cards: List[Card],
@@ -5270,36 +5319,7 @@ def solve_p_cut(
     decision.refuse_shipped_below_floors(
         chosen, "the SHIPPED cut (%s)" % (ship_why.split(" (")[0],)
     )
-    log(
-        "PP-CUT SHIPPED: layers=%s attn=%s chosen_pool=%d pool_floor=%s "
-        "makespan_ms=%.1f -- %s. "
-        "The two objectives this boot did NOT take stay priced beside it and are "
-        "therefore not paid by accident: incumbent %s pool %s makespan %s, "
-        "pool-maximal (kv-floor) %s pool %d makespan %.1f, makespan-optimal %s "
-        "pool %d makespan %.1f (--pp-solve-objective incumbent|maxkv|makespan "
-        "ships them)."
-        % (
-            ",".join(str(n) for n in chosen.layers),
-            ",".join(str(a) for a in chosen.attn),
-            int(chosen.pool_tokens),
-            "none" if decision.pool_floor is None else str(int(decision.pool_floor)),
-            chosen.makespan_ms,
-            ship_why,
-            incumbent_row.fmt() if incumbent_row is not None else "%s / %s" % (
-                _csv(P_PP_STAGE_RATIO_SCORES), _csv(P_PP_ATTN_STAGE_RATIO_SCORES)
-            ),
-            "%d" % int(incumbent_row.pool_tokens) if incumbent_row is not None
-            else "n/a (NOT RANKED by this solve)",
-            "%.1f" % incumbent_row.makespan_ms if incumbent_row is not None
-            else "n/a",
-            decision.kv_floor.fmt(),
-            int(decision.kv_floor.pool_tokens),
-            decision.kv_floor.makespan_ms,
-            makespan_row.fmt(),
-            int(makespan_row.pool_tokens),
-            makespan_row.makespan_ms,
-        )
-    )
+    log(shipped_line(decision, chosen, ship_why, incumbent_row, makespan_row))
     # #1286 -- THE JOIN LINE. `PP-CUT SHIPPED` prices the three objectives, but
     # nothing on it could be JOINED against what group P then sized: the two
     # halves are emitted by different processes, in different units, with no

@@ -677,13 +677,61 @@ class TestTheLauncherSeam(CustomTestCase):
         src = self._launcher_source()
         self.assertIn("pool_floor=ns.pp_solve_pool_floor", src)
 
-    def test_the_shipped_line_publishes_the_floor_and_the_chosen_pool(self):
-        src = self._launcher_source()
-        start = src.index('"PP-CUT SHIPPED: ')
-        head = src[start : start + 200]
-        self.assertIn("chosen_pool=%d", head)
-        self.assertIn("pool_floor=%s", head)
-        self.assertIn("makespan_ms=%.1f", head)
+    def test_the_shipped_line_renders_and_publishes_the_floor(self):
+        """RENDERED, not grepped: twelve substitutions is the failure class.
+
+        A wrong arity in this format raises TypeError at EMIT time -- after the
+        weights are loaded, which is a spent window -- and a source scan cannot
+        see it. ``shipped_line`` is pure for exactly this reason.
+        """
+        from sglang.srt.weg2.launcher import (
+            incumbent_candidate,
+            pick_shipped_cut,
+            shipped_line,
+        )
+
+        for floor, shown in ((None, "pool_floor=none"), (350_000, "pool_floor=350000")):
+            d = solve(pool_floor=floor)
+            chosen, why = pick_shipped_cut(d, INCUMBENT, PRICED_ATTN[RG6], "makespan")
+            line = shipped_line(
+                d,
+                chosen,
+                why,
+                incumbent_candidate(d, INCUMBENT, PRICED_ATTN[RG6]),
+                d.makespan or d.chosen,
+            )
+            print("\nRECORD %s" % line)
+            self.assertTrue(line.startswith("PP-CUT SHIPPED: "))
+            self.assertIn(shown, line)
+            self.assertIn("chosen_pool=%d" % int(chosen.pool_tokens), line)
+            self.assertIn("makespan_ms=", line)
+            # the two arms it did NOT take stay priced beside it (#1254)
+            self.assertIn("pool-maximal (kv-floor)", line)
+            self.assertIn("makespan-optimal", line)
+            # and the floor it reports is the one the shipped row actually met
+            if floor is not None:
+                self.assertGreaterEqual(int(chosen.pool_tokens), floor)
+
+    def test_the_frontier_line_of_this_fixture_is_recorded(self):
+        """Prints the curve, so the record carries the line a boot will emit."""
+        for floor in (None, 500_000):
+            print("\nRECORD %s" % solve(pool_floor=floor).frontier_line())
+        d = solve()
+        for point in d.frontier:
+            print(
+                "RECORD FRONTIER-POINT %s attn %s total_ms=%.2f pool=%d"
+                % (
+                    ",".join(str(n) for n in point.layers),
+                    ",".join(str(a) for a in point.attn),
+                    point.total_ms,
+                    int(point.pool_tokens),
+                )
+            )
+        print(
+            "RECORD FIELD priced=%d servable=%d frontier=%d"
+            % (len(d.ranked), len(d.servable), len(d.frontier))
+        )
+        self.assertTrue(d.frontier)
 
     def test_the_frontier_line_is_emitted_on_every_boot(self):
         src = self._launcher_source()
