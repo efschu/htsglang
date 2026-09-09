@@ -263,6 +263,7 @@ SESSION = web.AppKey("session", aiohttp.ClientSession)
 # registry -- not just a counter -- is what lets /__router/stats report the
 # longest current wait, not only the lifetime totals.
 LOCAL_WAIT_S = web.AppKey("local_wait_s", float)
+UPSTREAM_WAIT_S = web.AppKey("upstream_wait_s", float)
 MAX_BUFFERED = web.AppKey("max_buffered", int)
 LOCAL_POLL_INTERVAL_S = web.AppKey("local_poll_interval_s", float)
 HELD_STARTS = web.AppKey("held_starts", dict)
@@ -695,13 +696,17 @@ async def _probe_local_health(
         return False
 
 
-async def _wait_for_local_backend(
+async def _wait_for_backend(
     session: aiohttp.ClientSession,
-    health_url: str,
+    health_url: Optional[str],
     deadline: float,
     poll_interval_s: float,
 ) -> None:
     """Sleep, waking early once ``/health`` answers 200; otherwise at the deadline.
+
+    ``health_url=None`` means the caller has no health path to consult, so the
+    sleep alone paces the retry and the next connect attempt doubles as the
+    probe.
 
     Pacing: sleep first (up to one jittered interval, never past the
     deadline), THEN probe. So a down backend sees roughly one tiny GET per
@@ -723,24 +728,34 @@ async def _wait_for_local_backend(
         await asyncio.sleep(sleep_for)
         if loop.time() >= deadline:
             return
+        if health_url is None:
+            # No health path to consult (upstream arm): the sleep above is the
+            # whole pacing, and the next connect attempt IS the probe.
+            return
         if await _probe_local_health(session, health_url):
             return
 
 
-async def _open_local_backend(
+async def _open_backend(
     session: aiohttp.ClientSession,
     method: str,
     url: str,
     headers: dict[str, str],
     data: Optional[bytes],
     wait_s: float,
-    health_url: str,
+    health_url: Optional[str],
     stats: dict,
     held: dict,
     max_buffered: int,
     poll_interval_s: float,
+    label: str = "local backend",
 ) -> aiohttp.ClientResponse:
-    """Connect to the local backend, HOLDING the client while it is down.
+    """Connect to a backend, HOLDING the client while it is down.
+
+    Used for BOTH arms. The local arm polls the backend's ``/health`` between
+    attempts; the upstream arm passes ``health_url=None`` and simply retries the
+    connect, because an upstream proxy exposes no health path this router may
+    assume. ``label`` only names the arm in the log lines.
 
     ``wait_s <= 0`` is the pre-buffer behaviour: a single attempt, and the
     transport error propagates untouched so the caller answers the exact 502
@@ -782,9 +797,9 @@ async def _open_local_backend(
                     if len(held) >= max_buffered:
                         stats["buffer_gave_up"] += 1
                         logger.warning(
-                            "local backend %s refused and the hold queue is "
+                            "%s refused and the hold queue is "
                             "full (%d/%d); refusing immediately: %s",
-                            health_url.rsplit("/", 1)[0],
+                            label,
                             len(held),
                             max_buffered,
                             e,
@@ -793,9 +808,9 @@ async def _open_local_backend(
                     token = object()
                     held[token] = start
                     logger.info(
-                        "local backend %s refused; holding the request up to "
+                        "%s refused; holding the request up to "
                         "%.0fs while it reboots: %s",
-                        health_url.rsplit("/", 1)[0],
+                        label,
                         wait_s,
                         e,
                     )
@@ -804,7 +819,7 @@ async def _open_local_backend(
                 raise _LocalBackendDownTimeout(
                     loop.time() - start, wait_s, last_error
                 ) from last_error
-            await _wait_for_local_backend(session, health_url, deadline, poll_interval_s)
+            await _wait_for_backend(session, health_url, deadline, poll_interval_s)
     finally:
         if token is not None:
             held.pop(token, None)
@@ -819,6 +834,7 @@ def create_app(
     effort: str = EFFORT_XHIGH,
     policy_file: Optional[str] = None,
     local_wait_s: Optional[float] = None,
+    upstream_wait_s: float = 0.0,
     max_buffered: int = MAX_BUFFERED_REQUESTS,
     local_poll_interval_s: float = LOCAL_WAIT_POLL_INTERVAL_S,
 ) -> web.Application:
@@ -838,6 +854,12 @@ def create_app(
     and ``local_poll_interval_s`` are the queue-size cap and the health-probe
     pacing described in the module docstring.
     """
+    if upstream_wait_s < 0:
+        logger.warning(
+            "upstream wait cap %s is negative; using 0 (immediate 502)",
+            upstream_wait_s,
+        )
+        upstream_wait_s = 0.0
     if local_wait_s is None:
         local_wait_s = _default_local_wait_s()
     if local_wait_s < 0:
@@ -866,6 +888,7 @@ def create_app(
         "buffer_gave_up": 0,
     }
     app[LOCAL_WAIT_S] = local_wait_s
+    app[UPSTREAM_WAIT_S] = upstream_wait_s
     app[MAX_BUFFERED] = max_buffered
     app[LOCAL_POLL_INTERVAL_S] = local_poll_interval_s
     app[HELD_STARTS] = {}
@@ -973,16 +996,26 @@ def create_app(
                 )
 
         # Opening the connection is the one step that differs between the two
-        # routes. Upstream (Anthropic) is never buffered -- this codebase runs
-        # ON Anthropic infrastructure, so that side is not the outage this
-        # buffer exists for -- and a single _connect_once there is exactly the
-        # `async with session.request(...)` this replaced: zero added latency,
-        # zero behaviour change. Local gets the hold buffer, gated on
-        # LOCAL_WAIT_S: 0 (the default absent a boot in progress reproduces
-        # the old immediate-attempt behaviour too, since wait_s<=0 short-
-        # circuits straight to a single _connect_once inside the helper.
+        # routes, and BOTH can now be held.
+        #
+        # Upstream was originally never buffered, on the reasoning that it is
+        # Anthropic itself and therefore not the outage this buffer exists for.
+        # That premise no longer holds wherever --upstream-base points at a
+        # local proxy: such a process restarts, and every restart turned into
+        # immediate 502s for whatever was in flight. Measured on this rig:
+        # one restart of the pooling proxy produced 91 refused requests, and a
+        # refused request makes Claude Code fall back to another model -- an
+        # Opus agent that lands on Fable and stays there.
+        #
+        # Still OFF by default (UPSTREAM_WAIT_S = 0), because against
+        # api.anthropic.com a connect failure is a real failure and holding it
+        # would only delay the error. Turn it on when the upstream is a process
+        # you restart.
+        #
+        # The upstream arm passes no health path: a proxy exposes none this
+        # router may assume, so the retry itself is the probe.
         if to_local:
-            opener = _open_local_backend(
+            opener = _open_backend(
                 request.app[SESSION],
                 request.method,
                 url,
@@ -994,10 +1027,22 @@ def create_app(
                 request.app[HELD_STARTS],
                 request.app[MAX_BUFFERED],
                 request.app[LOCAL_POLL_INTERVAL_S],
+                "local backend",
             )
         else:
-            opener = _connect_once(
-                request.app[SESSION], request.method, url, headers, body if body else None
+            opener = _open_backend(
+                request.app[SESSION],
+                request.method,
+                url,
+                headers,
+                body if body else None,
+                request.app[UPSTREAM_WAIT_S],
+                None,
+                request.app[STATS],
+                request.app[HELD_STARTS],
+                request.app[MAX_BUFFERED],
+                request.app[LOCAL_POLL_INTERVAL_S],
+                "upstream",
             )
 
         upstream_response: Optional[aiohttp.ClientResponse] = None
@@ -1192,6 +1237,20 @@ def main(argv: list[str] | None = None) -> None:
         "from a live backend still passes straight through.",
     )
     parser.add_argument(
+        "--upstream-wait-s",
+        type=float,
+        default=0.0,
+        help="how long (seconds) to HOLD a request whose connection to "
+        "--upstream-base was refused or reset, retrying until it accepts, "
+        "instead of answering 502 immediately. 0 (default) keeps the old "
+        "behaviour, which is right for api.anthropic.com: there a connect "
+        "failure is a real failure and holding it only delays the error. Set "
+        "it when --upstream-base points at a process you restart, such as a "
+        "local pooling proxy -- a refused request makes Claude Code fall back "
+        "to another model, so a one-second restart can leave an Opus agent "
+        "running on Fable. Shares the --local-max-buffered cap.",
+    )
+    parser.add_argument(
         "--local-max-buffered",
         type=int,
         default=MAX_BUFFERED_REQUESTS,
@@ -1223,13 +1282,15 @@ def main(argv: list[str] | None = None) -> None:
         effort=args.local_effort,
         policy_file=args.policy_file,
         local_wait_s=args.local_wait_s,
+        upstream_wait_s=args.upstream_wait_s,
         max_buffered=args.local_max_buffered,
         local_poll_interval_s=args.local_poll_interval_s,
     )
     logger.info(
         "listening on %s:%d, local models %s (aliases %s) -> %s, "
         "everything else -> %s; default arm thinking=%s effort=%s%s; "
-        "local-backend hold buffer: wait_s=%.0f max_buffered=%d poll_interval_s=%.1f",
+        "local-backend hold buffer: wait_s=%.0f max_buffered=%d poll_interval_s=%.1f"
+        "; upstream hold buffer: wait_s=%.0f",
         args.host,
         args.port,
         sorted(args.local_model),
@@ -1242,6 +1303,7 @@ def main(argv: list[str] | None = None) -> None:
         app[LOCAL_WAIT_S],
         app[MAX_BUFFERED],
         app[LOCAL_POLL_INTERVAL_S],
+        app[UPSTREAM_WAIT_S],
     )
     web.run_app(app, host=args.host, port=args.port, print=None)
 
