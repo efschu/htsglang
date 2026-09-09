@@ -1427,6 +1427,7 @@ def run_producer_pair(
     descs: Sequence[object],
     stats: PairStats,
     budget_s: Optional[float] = None,
+    budget_left: BudgetLeft = None,
     slot_bytes: int = xr.SLOT_BYTES,
     checksum_bytes: Optional[Callable[[int, int], int]] = None,
 ) -> PairStats:
@@ -1462,7 +1463,8 @@ def run_producer_pair(
                 f"cannot place"
             )
 
-        _take_slot(sems, pair, slot, "empty", budget, stats, expired)
+        _take_slot(sems, pair, slot, "empty",
+                   _wait_budget(budget, budget_left), stats, expired)
         region.begin_fill(pair, slot, batch.seq)
         base = region.slot_address(pair, slot)
         for piece in batch.pieces:
@@ -1502,6 +1504,7 @@ def run_consumer_pair(
     descs: Sequence[object],
     stats: PairStats,
     budget_s: Optional[float] = None,
+    budget_left: BudgetLeft = None,
     slot_bytes: int = xr.SLOT_BYTES,
     checksum_bytes: Optional[Callable[[int, int], int]] = None,
     on_checksum: Optional[Callable[[ChecksumReport], None]] = None,
@@ -1530,7 +1533,8 @@ def run_consumer_pair(
                 f"slot within the fence budget"
             )
 
-        _take_slot(sems, pair, slot, "full", budget, stats, expired)
+        _take_slot(sems, pair, slot, "full",
+                   _wait_budget(budget, budget_left), stats, expired)
         rec = region.claim_produced(pair, slot)
         if rec is None:
             raise Weg2XchgPlanDisagree(
@@ -1645,11 +1649,18 @@ class OnCardStats:
     #:
     #: It matters here and not only as hygiene: under the shadow the two ends
     #: of this lane sit at OPPOSITE ENDS OF ONE FLIP (the source hook before
-    #: the pause, the destination hook after the resume), so the producer's
-    #: terminal drain can legitimately span the flip.  The block is bounded --
-    #: that is ``SHADOW_HOOK_BUDGET_S``, carved down through ``run_leg``'s
-    #: ``budget_s`` -- and this is the number that lets a boot PRICE it
-    #: (``blocked_ms=`` on the shadow's own line) instead of guessing.
+    #: the pause, the destination hook after the resume).
+    #:
+    #: CORRECTED (S5c refuter, must_fix 3): this docstring used to say the
+    #: terminal drain could "legitimately span the flip".  It cannot span it.
+    #: The hook holds its scheduler thread while it waits, and the co-located
+    #: consumer of that bounce is DOWNSTREAM of the credit the source's own
+    #: pause loop publishes -- so the consumer cannot exist while the producer
+    #: blocks on it, and every such wait runs to the budget by construction.
+    #: The shadow's product adapter therefore refuses that lane by name
+    #: (``oncard_drainable=False``) instead of paying for it.  What survives
+    #: here is the MEASUREMENT: the field prices whatever block a caller does
+    #: incur (``blocked_ms=`` on the shadow's own line) instead of guessing.
     drain_wait_s: float = 0.0
     #: THE PART OF :attr:`drain_wait_s` THAT IS **NOT** INSIDE
     #: :attr:`elapsed_s`, seconds.  The producer stops its own clock before the
@@ -2126,6 +2137,37 @@ class HostBounce:
         os.close(self._fd)
 
 
+#: A LEG'S REMAINING DEADLINE, as a callable, or ``None`` for "no deadline".
+#: See :func:`_wait_budget` for why one number cannot do this job.
+BudgetLeft = Optional[Callable[[], float]]
+
+
+def _wait_budget(budget_s: float, left: BudgetLeft) -> float:
+    """This ONE wait's ceiling: its own budget, clamped by what is LEFT.
+
+    MEASURED-BY-REVIEW DEFECT (S5c refuter, must_fix 2).  ``budget_s`` is a
+    PER-WAIT ceiling and was being read as a total.  A leg's blocking waits are
+    ``batches - slots`` per-batch drains, ``slots`` terminal drains and one
+    release wait, and each one restarted its own clock with the full number --
+    so a caller that carved 5 s out of a deadline and handed it down could pay
+    ``(batches + slots + 1) x 5 s``.  ``weight_exchange_shadow``'s
+    :data:`~sglang.srt.weg2.weight_exchange_shadow.SHADOW_HOOK_BUDGET_S`
+    documents the opposite in as many words ("the two together can never exceed
+    this number"), and it is the single place the user law "never delays the
+    leg's own completion beyond a named bound" is meant to be readable.
+
+    So the deadline is RE-EVALUATED per wait rather than sampled once.  ``left``
+    is a callable and not a number for exactly that reason: a number sampled at
+    ``run_leg`` entry is the same defect one level up.  ``None`` keeps every
+    pre-S5c caller (S3/S4, the whole cross lane's own tests) on the old
+    per-wait semantics, which is the honest default for a caller that never
+    claimed a total.
+    """
+    if left is None:
+        return float(budget_s)
+    return min(float(budget_s), max(0.0, float(left())))
+
+
 def run_oncard_producer(
     region: xr.XchgRegion,
     ops: DeviceOps,
@@ -2138,6 +2180,7 @@ def run_oncard_producer(
     descs: Sequence[object],
     stats: OnCardStats,
     budget_s: Optional[float] = None,
+    budget_left: BudgetLeft = None,
     checksum_bytes: Optional[Callable[[int, int], int]] = None,
 ) -> OnCardStats:
     """Hop 1: this rank's VRAM -> its own bounce slot, batch by batch.
@@ -2162,11 +2205,22 @@ def run_oncard_producer(
         # consumer has released the batch that used it last, which is
         # `seq - slots`.  Everything else about this lane's safety follows.
         # MEASURED, not just bounded (#1273 S5c): see OnCardStats.drain_wait_s.
+        # THE ACCUMULATION IS IN A ``finally`` (S5c refuter, must_fix 1): this
+        # call RAISES on budget expiry, so an addition placed after it prices
+        # every wait except the only one that ever costs the leg anything.
+        # Measured on the remote desk before the fix: a leg that spent 402.0 of
+        # its 402.9 ms blocked in ``drain-final`` reported ``blocked_ms=0.004``
+        # -- the microseconds of the ``seq<0`` early return, which never
+        # blocked at all.  The field this round exists to add read as its own
+        # opposite on the one path it was added for.
         _blocked = time.perf_counter()
-        _await_oncard(region, DIR_ONCARD_CONS_OFF, peer_row,
-                      batch.seq - bounce.slots, budget, what="drain", row=row,
-                      slot=slot, wave=wave)
-        stats.drain_wait_s += time.perf_counter() - _blocked
+        try:
+            _await_oncard(region, DIR_ONCARD_CONS_OFF, peer_row,
+                          batch.seq - bounce.slots,
+                          _wait_budget(budget, budget_left), what="drain",
+                          row=row, slot=slot, wave=wave)
+        finally:
+            stats.drain_wait_s += time.perf_counter() - _blocked
         base = bounce.slot_address(batch.seq)
         for piece in batch.pieces:
             desc = descs[piece.desc_index]
@@ -2198,13 +2252,18 @@ def run_oncard_producer(
             # inside ``elapsed_s`` (that clock stopped above, so this rank's
             # own hop wall does not absorb how long its peer took), so the two
             # numbers are additive and a reader can see both.
+            # Same ``finally`` and the same reason as the per-batch drain: THIS
+            # is the wait the measured defect landed on.
             _blocked = time.perf_counter()
-            _await_oncard(region, DIR_ONCARD_CONS_OFF, peer_row, seq, budget,
-                          what="drain-final", row=row,
-                          slot=seq % bounce.slots, wave=wave)
-            _waited = time.perf_counter() - _blocked
-            stats.drain_wait_s += _waited
-            stats.drain_wait_outside_s += _waited
+            try:
+                _await_oncard(region, DIR_ONCARD_CONS_OFF, peer_row, seq,
+                              _wait_budget(budget, budget_left),
+                              what="drain-final", row=row,
+                              slot=seq % bounce.slots, wave=wave)
+            finally:
+                _waited = time.perf_counter() - _blocked
+                stats.drain_wait_s += _waited
+                stats.drain_wait_outside_s += _waited
     return stats
 
 
@@ -2222,6 +2281,7 @@ def run_oncard_consumer(
     slots: int = ONCARD_SLOTS,
     slot_bytes: int = ONCARD_SLOT_BYTES,
     budget_s: Optional[float] = None,
+    budget_left: BudgetLeft = None,
     checksum_bytes: Optional[Callable[[int, int], int]] = None,
     on_checksum: Optional[Callable[[ChecksumReport], None]] = None,
 ) -> OnCardStats:
@@ -2246,11 +2306,15 @@ def run_oncard_consumer(
         # shadow's placement exactly as the producer's drain does, and the same
         # field carries both -- which of the two a number came from is the
         # ``hook=`` token on the shadow's own line.
+        # ``finally``, same defect, same fix (S5c refuter, must_fix 1).
         _blocked = time.perf_counter()
-        got = _await_oncard(region, DIR_ONCARD_PROD_OFF, peer_row, batch.seq,
-                            budget, what="fill", row=row, slot=slot,
-                            wave=wave, exact=True)
-        stats.drain_wait_s += time.perf_counter() - _blocked
+        try:
+            got = _await_oncard(region, DIR_ONCARD_PROD_OFF, peer_row,
+                                batch.seq, _wait_budget(budget, budget_left),
+                                what="fill", row=row, slot=slot,
+                                wave=wave, exact=True)
+        finally:
+            stats.drain_wait_s += time.perf_counter() - _blocked
         # The producer's batcher geometry, published rather than assumed.  Two
         # co-located ranks reading the same plan with different slot sizes
         # agree on every payload below the smaller one and diverge silently
@@ -2457,6 +2521,7 @@ def run_leg(
     log: Callable[[str], None],
     vote_failure: Callable[[BaseException], None],
     budget_s: Optional[float] = None,
+    budget_left: BudgetLeft = None,
     slot_bytes: int = xr.SLOT_BYTES,
     oncard_slot_bytes: Optional[int] = None,
     oncard_slots: int = ONCARD_SLOTS,
@@ -2496,6 +2561,17 @@ def run_leg(
     gate row; ``device`` is the CUDA ordinal this process sees.  Three names
     because they are three numbers, and the boot forms in this tree have made
     every pair of them differ at least once.
+
+    ``budget_left`` IS THE LEG'S DEADLINE, and it is a CALLABLE because a
+    number cannot answer the question.  ``budget_s`` bounds ONE wait; this leg
+    performs many (``batches - slots`` per-batch drains, ``slots`` terminal
+    drains, one release wait, and one slot wait per cross batch), and each one
+    restarts its own clock.  A caller that must not exceed a TOTAL -- which is
+    every caller that carved this budget out of a flip leg -- passes a callable
+    returning what is left of its own deadline, and every wait below is granted
+    ``min(its own ceiling, that)``.  ``None`` keeps the pre-S5c per-wait
+    semantics for callers that never claimed a total.  See :func:`_wait_budget`
+    for the measured defect.
 
     ``oncard_slot_bytes`` DEFAULTS TO ``slot_bytes``, and that default is a
     measured correction rather than a convenience: the first version took
@@ -2560,11 +2636,13 @@ def run_leg(
                 if is_source:
                     run_producer_pair(region, sems, ops, stream, pair=pair,
                                       descs=sub, stats=stats, budget_s=budget,
+                                      budget_left=budget_left,
                                       slot_bytes=slot_bytes,
                                       checksum_bytes=checksum_bytes)
                 else:
                     run_consumer_pair(region, sems, ops, stream, pair=pair,
                                       descs=sub, stats=stats, budget_s=budget,
+                                      budget_left=budget_left,
                                       slot_bytes=slot_bytes,
                                       checksum_bytes=checksum_bytes,
                                       on_checksum=on_checksum)
@@ -2608,14 +2686,39 @@ def run_leg(
                 run_oncard_producer(region, ops, stream, bounce, row=row,
                                     peer_row=peer_row, wave=wave,
                                     descs=on_card, stats=oncard_stats,
-                                    budget_s=budget,
+                                    budget_s=budget, budget_left=budget_left,
                                     checksum_bytes=checksum_bytes)
                 if ipc:
-                    _await_release(region, peer_row, budget, row=row, wave=wave)
+                    # PRICED AND IN A ``finally`` like every other wait of this
+                    # lane (S5c refuter, must_fix 1): the release wait was the
+                    # one block on the diagonal that reached NO field at all,
+                    # so a leg that died holding an exported bounce reported
+                    # the drains it had paid and not the wait it died in.
+                    _blocked = time.perf_counter()
+                    try:
+                        _await_release(region, peer_row,
+                                       _wait_budget(budget, budget_left),
+                                       row=row, wave=wave)
+                    finally:
+                        _waited = time.perf_counter() - _blocked
+                        oncard_stats.drain_wait_s += _waited
+                        oncard_stats.drain_wait_outside_s += _waited
                     may_free = True
             else:
-                armed = _await_handle(region, peer_row, budget, row=row,
-                                      wave=wave)
+                _blocked = time.perf_counter()
+                try:
+                    armed = _await_handle(region, peer_row,
+                                          _wait_budget(budget, budget_left),
+                                          row=row, wave=wave)
+                finally:
+                    # The consumer's FIRST block, and the one a destination
+                    # hook whose co-located producer never arrives spends its
+                    # whole budget in.  Inside its own clock's span but before
+                    # ``run_oncard_consumer`` starts one, so it goes to the
+                    # outside field too.
+                    _waited = time.perf_counter() - _blocked
+                    oncard_stats.drain_wait_s += _waited
+                    oncard_stats.drain_wait_outside_s += _waited
                 if armed["slot_bytes"] != diag_bytes:
                     raise Weg2XchgPlanDisagree(
                         f"W52 Weg2XchgPlanDisagree oncard row={row} "
@@ -2635,7 +2738,8 @@ def run_leg(
                 run_oncard_consumer(region, ops, stream, peer_ptr, row=row,
                                     peer_row=peer_row, wave=wave,
                                     descs=on_card, stats=oncard_stats,
-                                    budget_s=budget, slots=diag_slots,
+                                    budget_s=budget, budget_left=budget_left,
+                                    slots=diag_slots,
                                     slot_bytes=diag_bytes,
                                     checksum_bytes=checksum_bytes,
                                     on_checksum=on_checksum)
