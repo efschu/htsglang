@@ -4315,6 +4315,7 @@ def choose_host_ledger(
     pin_m_mib: int = 0,
     s_gb_d: Optional[int] = None,
     d_cap_terms: Optional[Dict[str, float]] = None,
+    weight_source: str = WEIGHT_SOURCE_DEFAULT,
 ) -> Tuple[host_ledger.Arm, Optional[float], List[str], Dict[str, Optional[int]]]:
     """THE LAUNCHER'S ONE LEDGER CALL SITE: read the host, price the ladder.
 
@@ -4387,6 +4388,16 @@ def choose_host_ledger(
         cg_ceiling_source=cg_ceiling_source,
         cg_oom_kill=cg["oom_kill"],
         measured_record=record,
+        # #1273 S6: the exchange's own pinned host carrier.  The ARM STRING
+        # decides it here, at the one ledger call site, and not inside the
+        # ledger -- `WEIGHT_SOURCE_CHOICES` is this module's, and a ledger that
+        # knew about arm names would be a second reader of a decision that
+        # already has one.  `ring` charges 0 and every existing boot number is
+        # unchanged.
+        xchg_bounce_host_bytes=(
+            0 if str(weight_source) == WEIGHT_SOURCE_DEFAULT
+            else host_ledger.xchg_bounce_bytes()
+        ),
     )
     if pin_m_mib and int(pin_m_mib) > 0:
         # #1317/#1318 THE PINNED ARM IS PRICED, NOT ASSUMED. The ladder is run
@@ -8945,7 +8956,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         # #1317n NO BOOT WITH S_D=S_P IN THE LEDGER. D carries 4 GB where P
         # carries 1, which is +8.38 GiB of rings; an arm priced without it is
         # optimistic by that much against a reap mark nobody may touch.
-        s_gb_d=s_gb_d, d_cap_terms=_l2_terms)
+        s_gb_d=s_gb_d, d_cap_terms=_l2_terms,
+        weight_source=ns.weg2_weight_source)
     state.cgroup = dict(cg)
     for ln in lines:
         log(ln)

@@ -340,6 +340,27 @@ class Weg2XchgShortPiece(RuntimeError):
     """
 
 
+class Weg2XchgDepositUnfundable(RuntimeError):
+    """W65 -- a store-and-forward deposit of this shape cannot be run.
+
+    THE CODE WAS ENUMERATED, NOT PICKED (``test_weg2_wcode_uniqueness_1263``'s
+    own history: W31 -> W47 was a second collision because the number was
+    chosen from memory).  The census over the four roots at ``edbf7007c8``
+    returns 54 assigned codes with a maximum of W64, so the next free code is
+    W65; the enumeration, not the number, is the guard.
+
+    WHY A W-CODE HERE AND A BARE PREFIX FOR ``oncard-not-drainable``.  The two
+    refusals are siblings in PLACEMENT and opposites in KIND.  The
+    :data:`~sglang.srt.weg2.weight_exchange_shadow.ONCARD_NOT_DRAINABLE_PREFIX`
+    line says "this lane's two ends are sequential here", which is a property
+    of where a hook sits and is nobody's fault.  THIS one says a deposit was
+    ASKED FOR that the geometry or the host ledger does not fund -- a
+    configuration that would move bytes into slots that do not exist, or host
+    bytes nothing charged for.  That is a claim that something is wrong, which
+    is what a W-code in a boot log means.
+    """
+
+
 class Weg2XchgOnCardUnavailable(RuntimeError):
     """W56 -- ``cudaIpc`` is unusable on this build, so the on-card lane degrades.
 
@@ -1397,6 +1418,75 @@ def require_oncard_slots(slots: int, *, what: str) -> int:
     return value
 
 
+#: WHY A STORE-AND-FORWARD DEPOSIT WAS REFUSED.  One word per cause, because
+#: the three causes have three different levers and a single "refused" would
+#: send a reader to the wrong one.
+DEPOSIT_REASON_IPC = "exported-bounce-cannot-outlive-its-leg"
+DEPOSIT_REASON_BATCHES = "batches-exceed-slots-max"
+DEPOSIT_REASON_UNFUNDED = "ledger-cannot-fund-deposit"
+
+
+def deposit_refusal_reason(*, batches: int, slots: int, slot_bytes: int,
+                           budget_bytes: int, mode: str,
+                           slots_max: int = ONCARD_SLOTS_MAX) -> str:
+    """``""`` when this deposit can run; otherwise the word saying why not.
+
+    THE WHOLE POINT OF THE DEPOSIT is that the source needs no concurrent
+    consumer: with ``slots >= batches`` every per-batch drain asks for
+    ``seq - slots < 0`` and :func:`_await_oncard` returns without reading a
+    row, and :func:`run_oncard_producer` skips its terminal drain because the
+    bytes now live in a file that outlives the leg.  Each of the three refusals
+    below is a way that property fails to hold:
+
+    * ``ipc``: an exported VRAM bounce is freed with the exporting leg, so it
+      CANNOT outlive it.  Store-and-forward is a ``host``-arm shape by
+      construction, not a tuning choice.
+    * ``batches``: with more batches than the row area can address, two batches
+      share a slot and the second overwrites the first before its reader
+      exists.  The bound is :data:`ONCARD_SLOTS_MAX`, which sizes
+      :data:`DIR_ONCARD_ROWS` once for both processes.
+    * ``unfunded``: the deposit is pinned host memory for the span of a flip.
+      ``budget_bytes`` is what the #1269 host ledger CHARGED for this arm
+      (:func:`sglang.srt.weg2.host_ledger.xchg_bounce_bytes_per_card`); bytes
+      above it are host bytes no term carries, and the reap mark is a hard
+      bound (``host-schwelle-nie-uebertreten``), never a risk to accept.  A
+      ``budget_bytes`` of 0 is "no ledger answer reached this rank" and refuses
+      for the same reason -- an absent measurement never becomes a quiet zero.
+    """
+    if str(mode) != ONCARD_MODE_HOST:
+        return DEPOSIT_REASON_IPC
+    if int(batches) > int(slots_max) or int(slots) < int(batches):
+        return DEPOSIT_REASON_BATCHES
+    if int(budget_bytes) <= 0 or int(slots) * int(slot_bytes) > int(budget_bytes):
+        return DEPOSIT_REASON_UNFUNDED
+    return ""
+
+
+def require_store_forward_slots(batches: int, slots: int, *, what: str) -> int:
+    """Refuse a deposit whose slots cannot hold every batch at once.
+
+    THE DANGER DIRECTION, and it is silent without this check: with
+    ``slots < batches`` batch ``k`` and batch ``k + slots`` share a slot, the
+    producer overwrites the first with the second WITHOUT waiting (that is what
+    store-and-forward removed), and the destination -- reading in its own leg,
+    after the producer is gone -- finds the later batch's bytes under the
+    earlier batch's row.  Both sides agree on the address and neither raises.
+    So the guard is here, in the producer, before the first copy is issued, and
+    not only in the planner that is supposed to have got it right.
+    """
+    if int(slots) < int(batches):
+        raise Weg2XchgDepositUnfundable(
+            f"W65 Weg2XchgDepositUnfundable {what}: a store-and-forward "
+            f"deposit needs one slot per batch and got slots={int(slots)} for "
+            f"batches={int(batches)}.  The source returns without waiting for "
+            f"a consumer, so a reused slot is overwritten before anything has "
+            f"read it -- and the reader would take the LATER batch's bytes "
+            f"under the earlier batch's row with nothing disagreeing; NO copy "
+            f"was issued"
+        )
+    return int(slots)
+
+
 def _take_slot(sems: SemSet, pair: int, slot: int, kind: str, budget_s: float,
                stats: PairStats, on_timeout: Callable[[], BaseException]) -> None:
     """Take one semaphore, counting whether it actually blocked.
@@ -1735,6 +1825,20 @@ class OnCardSlotPlan:
     batches: int
     per_batch_ms: float
     budget_ms: float
+    #: WHERE ``slots`` CAME FROM.  ``caller`` is every pre-S6 reading (the
+    #: constant the caller passed in, echoed); ``store-forward-batches`` is
+    #: S6's derivation, one slot per batch so the source never waits.  A number
+    #: whose provenance is not on the line is a hand number one edit later.
+    slots_source: str = "caller"
+    #: What the #1269 host ledger charged for ONE card's deposit, or 0 when no
+    #: ledger answer reached this planner.  Not subtracted from anything here:
+    #: it is the bound :func:`deposit_refusal_reason` grades against.
+    host_budget_bytes: int = 0
+
+    @property
+    def deposit_bytes(self) -> int:
+        """The pinned host bytes one card's deposit holds for the flip's span."""
+        return int(self.slots) * int(self.slot_bytes)
 
     @property
     def hop_ms(self) -> float:
@@ -1761,7 +1865,11 @@ class OnCardSlotPlan:
     def tokens(self) -> str:
         return (
             f"oncard_slot_mib={self.slot_bytes / xr.MIB:.0f} "
-            f"oncard_slots={self.slots} oncard_batches={self.batches} "
+            f"oncard_slots={self.slots} "
+            f"oncard_slots_source={self.slots_source} "
+            f"oncard_deposit_mib={self.deposit_bytes / xr.MIB:.0f} "
+            f"oncard_host_budget_mib={self.host_budget_bytes / xr.MIB:.0f} "
+            f"oncard_batches={self.batches} "
             f"oncard_hop_ms_priced={self.hop_ms:.1f} "
             f"oncard_hop_ms_budget={self.budget_ms:g} "
             f"oncard_priced_fits={'yes' if self.fits else 'no'}"
@@ -1777,6 +1885,9 @@ def plan_oncard_slot_bytes(
     floor_bytes: int = ONCARD_SLOT_BYTES,
     ceiling_bytes: int = ONCARD_SLOT_BYTES_MAX,
     align_bytes: int = xr.MIB,
+    store_forward: bool = False,
+    slots_max: int = ONCARD_SLOTS_MAX,
+    host_budget_bytes: int = 0,
 ) -> OnCardSlotPlan:
     """Choose the diagonal's slot size from the plan's own byte count.
 
@@ -1793,12 +1904,30 @@ def plan_oncard_slot_bytes(
     this per-batch cost.  Returning ``fits=False`` with every term printed is
     a statement the boot can act on; silently exceeding the VRAM ceiling to
     make a timing budget green is the compensation-layer reflex.
+
+    ``store_forward`` MAKES THIS THE ONE PRODUCER OF THE SLOT COUNT TOO (S6).
+    A deposit needs one slot per batch -- that is the property that removes the
+    drain wait -- so ``slots`` stops being an echoed constant and becomes
+    ``batches``.  It is derived in TWO steps and both are arithmetic on numbers
+    that already exist: the hop model picks a slot size as before, then the
+    size is raised until the batch count fits ``slots_max``
+    (``ceil(total / slots_max)``), because a smaller slot buys a hop budget
+    this shape cannot spend anyway -- the consumer runs in another leg.  The
+    result may still exceed ``slots_max`` (a diagonal above
+    ``slots_max x ceiling_bytes``), and it is returned RATHER THAN CLAMPED so
+    :func:`deposit_refusal_reason` can name it.  Clamping here would produce
+    exactly the ``slots < batches`` overwrite
+    :func:`require_store_forward_slots` exists to refuse.
     """
     total = int(bytes_total)
     slots = int(slots)
+    source = "caller"
     if total <= 0:
-        return OnCardSlotPlan(0, int(floor_bytes), slots, 0, float(per_batch_ms),
-                              float(budget_ms))
+        return OnCardSlotPlan(0, int(floor_bytes),
+                              0 if store_forward else slots, 0,
+                              float(per_batch_ms), float(budget_ms),
+                              "store-forward-batches" if store_forward
+                              else source, int(host_budget_bytes))
     if per_batch_ms <= 0:
         raise ValueError(f"per_batch_ms must be positive, not {per_batch_ms!r}")
     allowed = int(float(budget_ms) // float(per_batch_ms))
@@ -1806,11 +1935,21 @@ def plan_oncard_slot_bytes(
         want = int(ceiling_bytes)
     else:
         want = -(-total // allowed)  # ceil
+    if store_forward and int(slots_max) >= 1:
+        # ONE SLOT PER BATCH IS THE PROPERTY, so the slot must be at least the
+        # share of the diagonal that leaves `slots_max` batches.  Raising the
+        # size is the only lever -- the batch count is `total / slot` and
+        # nothing else -- and it is bounded by `ceiling_bytes` below, which is
+        # what makes the refusal reachable instead of a silent over-allocation.
+        want = max(want, -(-total // int(slots_max)))
     want = -(-want // int(align_bytes)) * int(align_bytes)
     slot = max(int(floor_bytes), min(int(ceiling_bytes), want))
     batches = -(-total // slot)
+    if store_forward:
+        slots = batches
+        source = "store-forward-batches"
     return OnCardSlotPlan(total, slot, slots, batches, float(per_batch_ms),
-                          float(budget_ms))
+                          float(budget_ms), source, int(host_budget_bytes))
 
 
 class _OnCardWait:
@@ -2093,6 +2232,13 @@ class HostBounce:
     of routing the degrade through this class rather than through a second copy
     of the loop.  Registered with ``cudaHostRegister`` for the same measured
     7.5 % / 3.3 % reason the staging region is.
+
+    :meth:`close` DOES NOT UNLINK, and that is a contract rather than an
+    omission (S6).  It is what lets a store-and-forward source deposit every
+    batch, close its own mapping and return, while the destination opens the
+    same path with ``create=False`` in a LATER leg and finds the bytes.  The
+    file joins the boot directory's residue sweep like the region does; nothing
+    else removes it, and nothing else may.
     """
 
     def __init__(self, ops: DeviceOps, boot_nonce: str, card: int, *,
@@ -2182,6 +2328,7 @@ def run_oncard_producer(
     budget_s: Optional[float] = None,
     budget_left: BudgetLeft = None,
     checksum_bytes: Optional[Callable[[int, int], int]] = None,
+    store_forward: bool = False,
 ) -> OnCardStats:
     """Hop 1: this rank's VRAM -> its own bounce slot, batch by batch.
 
@@ -2195,9 +2342,30 @@ def run_oncard_producer(
     returns while its consumer is still issuing D2D out of the last
     ``ONCARD_SLOTS`` batches, and the caller's ``finally`` frees the buffer
     underneath them.
+
+    ``store_forward`` REMOVES THAT PREMISE RATHER THAN THAT WAIT (S6).  The
+    deposit's storage is a :class:`HostBounce` -- an shm file whose
+    :meth:`HostBounce.close` munmaps and does NOT unlink -- so the bytes
+    survive this leg, this process's mapping and this rank's whole hook, and
+    the destination opens the same file in ITS own leg with ``create=False``.
+    There is therefore nothing for a terminal drain to protect: raising the
+    slot count alone would make the loop WORSE (with ``slots > last`` its range
+    collapses to every batch), so the loop is skipped by construction and the
+    one-slot-per-batch precondition it depends on is REFUSED here, before the
+    first copy, by :func:`require_store_forward_slots`.
+
+    The per-batch drain needs no such handling and that is not luck: with
+    ``slots >= batches`` every ``seq - slots`` is negative and
+    :func:`_await_oncard` returns on its documented base case without reading a
+    row.  The wait disappears because the arithmetic says so, not because a
+    branch skips it.
     """
     budget = xr.fence_budget_s() if budget_s is None else float(budget_s)
     batches = batch_descs(descs, bounce.slot_bytes)
+    if store_forward:
+        require_store_forward_slots(
+            len(batches), bounce.slots,
+            what=f"run_oncard_producer row={row} wave={wave} lane=oncard")
     started = time.perf_counter()
     for batch in batches:
         slot = batch.seq % bounce.slots
@@ -2244,7 +2412,7 @@ def run_oncard_producer(
     # `hop_ms` must not silently absorb how long the peer took, or a slow
     # consumer would read as a slow producer on the acceptance line.
     stats.elapsed_s = time.perf_counter() - started
-    if batches:
+    if batches and not store_forward:
         last = batches[-1].seq
         for seq in range(max(0, last - bounce.slots + 1), last + 1):
             # THE TERMINAL DRAIN IS THE ONE THAT CAN SPAN A FLIP.  Measured for
@@ -2525,6 +2693,7 @@ def run_leg(
     slot_bytes: int = xr.SLOT_BYTES,
     oncard_slot_bytes: Optional[int] = None,
     oncard_slots: int = ONCARD_SLOTS,
+    oncard_store_forward: bool = False,
     checksum_bytes: Optional[Callable[[int, int], int]] = None,
     on_checksum: Optional[Callable[[ChecksumReport], None]] = None,
 ) -> LegResult:
@@ -2580,10 +2749,20 @@ def run_leg(
     line said so.  A knob that applies to half of what its name covers is worse
     than no knob.
 
-    TODO(S6): nothing calls this yet.  S6 owns the RPC handler that binds the
-    flip, runs Gate 0, resumes the destination's tags, calls this per wave and
-    then closes ``wave_gate``.  ``test_run_leg_interface_is_what_s6_must_call``
-    pins the signature so the seam cannot drift while it is unwired.
+    ``oncard_store_forward`` SPLITS THE DIAGONAL ACROSS TWO LEGS (S6).  With it
+    the source fills one slot per batch, publishes the rows and RETURNS -- no
+    terminal drain, no release wait, no live consumer required -- and the
+    destination runs its half in its own later leg, opening the same shm file
+    with ``create=False`` and reading rows that are still sealed at this
+    epoch/wave.  It is a ``host``-arm shape ONLY: an exported VRAM bounce is
+    freed with the leg that exported it, so it cannot outlive one, and asking
+    for the combination is refused here (W65) rather than half-honoured.
+
+    TODO(S6): the RPC handler that binds the flip, runs Gate 0, resumes the
+    destination's tags, calls this per wave and then closes ``wave_gate`` is
+    still unwritten -- ``weight_updater``'s two hooks are the callers today.
+    ``test_run_leg_interface_is_what_s6_must_call`` pins the signature so the
+    seam cannot drift while the RPC half is unwired.
     """
     budget = xr.fence_budget_s() if budget_s is None else float(budget_s)
     # Both knobs bounded BEFORE a thread starts, and each against the storage
@@ -2603,6 +2782,19 @@ def run_leg(
     # both sides would compute the same wrong offset without disagreeing.
     diag_slots = require_oncard_slots(oncard_slots,
                                       what=f"run_leg row={row} lane=oncard")
+    # THE ARM IS CHECKED BEFORE A THREAD EXISTS, same reason as the two knobs
+    # above: a deposit on an exported VRAM bounce is a lifetime the arm cannot
+    # provide, and half-honouring it (deposit, then free with the leg) is the
+    # use-after-free the S4 review already found once.
+    if oncard_store_forward and oncard_mode != ONCARD_MODE_HOST:
+        raise Weg2XchgDepositUnfundable(
+            f"W65 Weg2XchgDepositUnfundable run_leg row={row} lane=oncard: a "
+            f"store-and-forward deposit was asked for on mode="
+            f"{oncard_mode!r}, and {DEPOSIT_REASON_IPC} -- the exporter's "
+            f"cudaFree runs in this leg's own unwind, so the destination's "
+            f"later leg would map freed VRAM; the deposit is a "
+            f"{ONCARD_MODE_HOST!r}-arm shape by construction"
+        )
     result = LegResult()
     errors: List[BaseException] = []
     lock = threading.Lock()
@@ -2665,6 +2857,12 @@ def run_leg(
         # -- CUDA's own rule and the use-after-free the S4 review found.  Every
         # other case may free at once: a HostBounce is this process's own
         # mapping and the consumer holds an independent one of the same file.
+        # THE DEPOSIT DEPENDS ON THAT SECOND SENTENCE (S6).  A store-and-
+        # forward source closes here, in its own leg's ``finally``, and that is
+        # correct precisely because ``HostBounce.close`` munmaps and unregisters
+        # WITHOUT unlinking: the file, and every deposited byte in it, outlives
+        # this leg for the destination's later one.  A close that unlinked would
+        # turn every deposit into an empty read with nothing disagreeing.
         may_free = not (is_source and ipc)
         try:
             if is_source:
@@ -2687,7 +2885,8 @@ def run_leg(
                                     peer_row=peer_row, wave=wave,
                                     descs=on_card, stats=oncard_stats,
                                     budget_s=budget, budget_left=budget_left,
-                                    checksum_bytes=checksum_bytes)
+                                    checksum_bytes=checksum_bytes,
+                                    store_forward=oncard_store_forward)
                 if ipc:
                     # PRICED AND IN A ``finally`` like every other wait of this
                     # lane (S5c refuter, must_fix 1): the release wait was the
