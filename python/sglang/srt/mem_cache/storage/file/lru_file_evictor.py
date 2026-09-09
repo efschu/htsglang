@@ -57,6 +57,17 @@ _EMPTY_CENSUS = {
     # the directory, always reported; whether the cap is ENFORCED against it
     # is a separate question (``_enforced_foreign_bytes``).
     "foreign_bytes": 0,
+    # #1295 round 2: bytes that ARE in this index (they carry a suffix this
+    # group scans) but were written by the sibling GROUP, so this owner counts
+    # them against the cap and must never unlink them. Under the #706
+    # canonical page the two groups' suffix sets INTERSECT, so this is the
+    # large term on a Weg-2 store, not a residue.
+    "foreign_indexed_bytes": 0,
+    # #1295 round 2: ``.tmp.<uuid>`` staging files and orphaned partials. They
+    # occupy the same filesystem under the same cap and are reaped by age at
+    # attach only, so over a boot that attaches once they are a component the
+    # cap could not see at all.
+    "staging_bytes": 0,
 }
 
 # How often an eviction run may print its proof line, in seconds. Suppressed
@@ -64,6 +75,10 @@ _EMPTY_CENSUS = {
 # rate-limited emitter that prints no suppressed count turns a throttle into
 # an apparent zero).
 _EVICT_LOG_INTERVAL_S = 10.0
+# Above this, a wake re-scan says so. A PRICE TAG, NOT A BOUND: crossing it
+# changes nothing about the scan (see ``rescan`` on why a deadline here would
+# make a rank-uniform verdict depend on wall clock).
+_RESCAN_SLOW_S = 2.0
 
 
 def _parse_size_to_bytes(value: Any) -> int:
@@ -111,6 +126,7 @@ class LRUFileEvictor:
         iter_existing: Optional[
             Callable[[], Iterable[Tuple[str, os.stat_result]]]
         ] = None,
+        iter_staging: Optional[Callable[[], Iterable[os.stat_result]]] = None,
         pins: Optional[Any] = None,
         require_watermark: bool = False,
     ) -> None:
@@ -169,6 +185,16 @@ class LRUFileEvictor:
             lambda stem: os.path.join(self.file_path, f"{stem}.bin")
         )
         self._iter_existing = iter_existing or self._iter_existing_flat
+        # #1295 round 2, SHOULD_FIX 8: the ``.bin`` walk above is not the whole
+        # directory. ``HiCacheFile`` writes every page through a
+        # ``<final>.tmp.<uuid>`` staging file and reaps orphaned partials BY AGE
+        # AT ATTACH ONLY (hicache_storage.py, ``_partial_ttl_s``). Under Weg 2
+        # the process attaches once and runs for hours, so between attaches that
+        # component sits on the same filesystem under the same operator cap and
+        # was outside ``seen_bytes`` entirely. Injected rather than assumed: the
+        # evictor does not know the backend's staging naming, and a store that
+        # injects nothing keeps the pre-#1295 population exactly.
+        self._iter_staging = iter_staging
         # Free-space watchdog state: a latch, so a full disk produces one loud
         # error and cheap refusals instead of a per-page warning flood.
         self._write_stopped = False
@@ -220,33 +246,78 @@ class LRUFileEvictor:
         # takes the operator's whole ``max_size`` (``writer_count`` divides the
         # cap over the ranks INSIDE a group -- an axis that is 1 for both Weg-2
         # groups -- and never over the groups sharing the directory), and each
-        # filters its census by its OWN group's suffix product, which are
-        # disjoint. Neither ``_total_bytes`` can therefore see the other's
-        # bytes, and the combined enforceable ceiling is 2x the cap. Measured
-        # on boot weg2sb5h: 40,429,487,490 B apparent / 36,622,785,536 B
-        # allocated against max_size=30,150,131,852 B -- 1.34x the cap in the
-        # very unit the cap is enforced in, across 655,982 files, with ZERO
-        # refusals of any kind on either group, which is the PREDICTED outcome
-        # of two full caps rather than an anomaly.
+        # counted only what IT had written since ITS attach. Measured on boot
+        # weg2sb5h: 40,429,487,490 B apparent / 36,622,785,536 B allocated
+        # against max_size=30,150,131,852 B -- 1.34x the cap in the very unit
+        # the cap is enforced in, across 655,982 files, with ZERO refusals of
+        # any kind on either group, which is the PREDICTED outcome of two full
+        # caps rather than an anomaly.
+        #
+        # CORRECTION, ROUND 2 -- THE FIRST CUT OF THIS COMMENT CLAIMED THE TWO
+        # GROUPS' SCAN SUFFIXES ARE "DISJOINT". THEY ARE NOT, and the claim was
+        # load-bearing for which half of this fix does the work. Under the #706
+        # canonical KV page ``_build_key_suffixes`` (hicache_storage.py) DROPS
+        # ``_{tp_rank}_{tp_size}`` and ``_{pp_size}_{pp_rank}`` from
+        # ``kv_config_suffix`` exactly when ``canonical_kv_page is not None``,
+        # and ``_suffix_for_key`` routes canonical KV keys AND shared mamba keys
+        # there; #1233 does the same for the draft suffix. Both group logs of
+        # boot weg2sb5h print it ("#706 canonical KV page active: ... KV keys
+        # carry content only (no tp/pp suffix)", P 10:32:14 PP0-2, D 10:33:08
+        # TP0-2). So P's and D's suffix sets INTERSECT on the suffix carrying
+        # the store's bulk (~94 % of it by the fork's own 940:60 page:draft
+        # ratio), and only the per-rank ``config_suffix`` files are group-
+        # private. Two consequences, both against the first cut's framing:
+        #
+        #   (a) After a census the shared bulk lands in ``_lru`` -- the cap
+        #       bounds it through ``_total_bytes``, not through the term below.
+        #       The term below carries only the group-private residue.
+        #   (b) Those indexed entries are the SIBLING's live pages, and this
+        #       store is Weg 2's handback carrier. ``_census_existing_files``
+        #       sorts oldest-``st_mtime``-first, so they sort FIRST and a naive
+        #       ``_evict_locked`` would unlink the pages P wrote for D to load,
+        #       while the sibling's own ``_total_bytes`` still counted them.
+        #       That is a phantom cap AND a destroyed carrier -- strictly worse
+        #       than the 1.34x it replaces. Hence ``_foreign_indexed``: an
+        #       indexed entry this owner did not write is COUNTED and never
+        #       UNLINKED, and when what it cannot reclaim already fills the cap
+        #       the write is refused BY NAME. Bounded and loud beats reclaimed
+        #       and wrong.
         #
         # The unit was never wrong: ``_allocated_size`` has charged
         # ``max(st_blocks * 512, st_size)`` since #410. The POPULATION was. So
         # the cap is enforced against the bytes MEASURED in the directory --
-        # every ``.bin`` under it whatever its suffix, which is exactly the
-        # ``seen_bytes`` denominator the census already computes -- and this
-        # term carries the part of that measurement the index does not cover.
-        # It is a MEASUREMENT, not a protocol: no lease, no cross-process
-        # bookkeeping, no declared owner count that could be misconfigured.
+        # every ``.bin`` under it whatever its suffix, plus the staging files
+        # the ``.bin`` walk cannot see -- and these terms carry the parts of
+        # that measurement the index does not cover or may not reclaim. It is a
+        # MEASUREMENT, not a protocol: no lease, no cross-process bookkeeping,
+        # no declared owner count that could be misconfigured (a declared owner
+        # count is a configuration that can be wrong in exactly the way that
+        # produced #1295, and a refusal on "second owner detected" would refuse
+        # every Weg-2 boot, since two owners over one directory IS the design).
         #
         # REFRESHED AT THE CENSUS, WHICH IS WHY THE WAKE RE-SCAN IS WIRED.
         # A sleeping group performs no writes (``rescan``), so within one awake
-        # period this number is a constant and re-walking 655k files per page
-        # would buy nothing. It goes stale exactly across a sleep, and the wake
-        # is where ``rescan`` corrects it.
+        # period these numbers are constants and re-walking 655k files per page
+        # would buy nothing. They go stale exactly across a sleep, and the wake
+        # is where ``rescan`` corrects them.
         self._enforced_foreign_bytes: int = 0
+        # Indexed here, written by the sibling GROUP: counted, never unlinked.
+        # Stems, so ``_evict_one_lru_locked`` can answer per victim; the strings
+        # are the same objects ``_lru`` holds, so this costs a set table and not
+        # a second copy of 655k names.
+        self._foreign_indexed: Set[str] = set()
+        self._foreign_indexed_bytes: int = 0
+        # Staging/partial bytes measured at the last census (see _iter_staging).
+        self._staging_bytes: int = 0
         # Named-refusal counter, so "0 refusals" in a boot log is a fact about
         # what happened rather than about what the log level emitted.
         self._cap_refusals: int = 0
+        # SHOULD_FIX 7: min_free refusals are a DIFFERENT POPULATION from cap
+        # refusals and were reported through ``_refused_since_stop``, which the
+        # watchdog ZEROES on recovery -- so a boot could refuse thousands of
+        # pages on the watermark and still read 0. Cumulative, never reset,
+        # reported beside the cap counter under its own name.
+        self._min_free_refusals: int = 0
         self._last_evict_log = 0.0
         self._evict_runs_suppressed = 0
 
@@ -367,7 +438,12 @@ class LRUFileEvictor:
             f"allocated bytes), foreign={self._enforced_foreign_bytes} B "
             f"(directory bytes this index does not cover; enforced against the "
             f"cap, reclaimable only by their own owner), "
-            f"directory={self._total_bytes + self._enforced_foreign_bytes} B"
+            f"foreign_indexed={self._foreign_indexed_bytes} B "
+            f"({len(self._foreign_indexed)} entries the sibling group wrote "
+            f"under the shared #706 suffix -- counted, never unlinked here; 0 "
+            f"at attach by construction and non-zero only after a wake "
+            f"re-scan), staging={self._staging_bytes} B, "
+            f"directory={self._directory_bytes_locked()} B"
         )
 
     def _load_config(self, extra: dict) -> None:
@@ -467,12 +543,31 @@ class LRUFileEvictor:
         not see and where the store reached 1.34x its cap with no refusal.
 
         Not the same question as what this owner can RECLAIM: that is
-        ``_total_bytes`` alone, because a file outside this index belongs to
-        the sibling's LRU and unlinking it here would be the twin bookkeeping
-        F7 removed. The gap between the two is why an over-cap write is
-        refused BY NAME rather than compensated.
+        ``_total_bytes`` MINUS ``_foreign_indexed_bytes``, because a file
+        outside this index belongs to the sibling's LRU and unlinking it here
+        would be the twin bookkeeping F7 removed -- and, since round 2, so does
+        an indexed file the sibling wrote. The gap between the two is why an
+        over-cap write is refused BY NAME rather than compensated.
         """
-        return self._total_bytes + self._enforced_foreign_bytes
+        return (
+            self._total_bytes + self._enforced_foreign_bytes + self._staging_bytes
+        )
+
+    def _unreclaimable_bytes_locked(self) -> int:
+        """Directory bytes this owner counts and cannot free. Caller holds lock.
+
+        The pre-check before an eviction run: when this number alone plus the
+        pending write already exceeds the cap, evicting every page this owner
+        DOES own would cost the whole cache and still not fund the write. Three
+        terms, three provenances -- the sibling group's unscanned suffixes, the
+        sibling group's pages under the shared #706 suffix, and the backend's
+        staging files -- and none of them is this owner's to unlink.
+        """
+        return (
+            self._enforced_foreign_bytes
+            + self._foreign_indexed_bytes
+            + self._staging_bytes
+        )
 
     def _stats_locked(self) -> dict:
         """``stats()`` for callers already holding ``_lock``."""
@@ -497,17 +592,33 @@ class LRUFileEvictor:
             # cannot reclaim, ``directory_bytes`` their sum -- the number the
             # cap is enforced against.
             "foreign_bytes": self._enforced_foreign_bytes,
+            "foreign_indexed_bytes": self._foreign_indexed_bytes,
+            "foreign_indexed_entries": len(self._foreign_indexed),
+            "staging_bytes": self._staging_bytes,
+            "unreclaimable_bytes": self._unreclaimable_bytes_locked(),
             "directory_bytes": self._directory_bytes_locked(),
             "cap_refusals": self._cap_refusals,
+            # SHOULD_FIX 7: a SECOND population. ``cap_refusals`` is "the cap
+            # could not fund this page"; this is "the filesystem watermark
+            # would be breached". The record's "min_free refusals 0" and the
+            # cap's "0 refusals" read as one number and are two.
+            "min_free_refusals": self._min_free_refusals,
             # #410 + the #715 lesson: never report as deliverable what the
             # actuator cannot deliver. Pinned bytes are held by conversation
             # checkpoints and eviction skips them, so a capacity decision must
             # read reclaimable_bytes rather than used_bytes.
             "pinned_entries": self._pins.pinned_entries() if self._pins else 0,
             "pinned_bytes": self._pins.pinned_bytes() if self._pins else 0,
+            # ROUND 2: the sibling's indexed pages come OUT of this. They are
+            # in ``_lru`` so the cap sees them, and they are in
+            # ``_foreign_indexed`` so eviction will not take them, which makes
+            # them exactly as undeliverable as a pinned page (#715: never
+            # report as deliverable what the actuator cannot deliver).
             "reclaimable_bytes": max(
                 0,
-                self._total_bytes - (self._pins.pinned_bytes() if self._pins else 0),
+                self._total_bytes
+                - self._foreign_indexed_bytes
+                - (self._pins.pinned_bytes() if self._pins else 0),
             ),
             # #411 reconciliation: the overshoot the two accountings could
             # produce, reported rather than clamped away. It is 0 on this tree
@@ -684,6 +795,8 @@ class LRUFileEvictor:
             if self.min_free_bytes > 0:
                 fs = self._fs_stats()
                 if fs is not None and (fs[1] - value_bytes) < self.min_free_bytes:
+                    with self._lock:
+                        self._min_free_refusals += 1
                     logger.warning(
                         f"HiCacheFile: filesystem hosting {self.file_path!r} "
                         f"would fall below min_free={self.min_free_bytes} B "
@@ -704,6 +817,7 @@ class LRUFileEvictor:
         if not self.check_free_space():
             with self._lock:
                 self._refused_since_stop += 1
+                self._min_free_refusals += 1
             return False
 
         with self._lock:
@@ -715,7 +829,7 @@ class LRUFileEvictor:
                 > self.max_size_bytes
             ):
                 if (
-                    self._enforced_foreign_bytes + value_bytes
+                    self._unreclaimable_bytes_locked() + value_bytes
                 ) > self.max_size_bytes:
                     # NOTHING THIS OWNER CAN EVICT WOULD FUND THIS WRITE: the
                     # bytes it cannot reclaim already exceed the cap on their
@@ -729,6 +843,7 @@ class LRUFileEvictor:
             if self.min_free_bytes > 0 and not self._enforce_free_space_locked(
                 value_bytes
             ):
+                self._min_free_refusals += 1
                 logger.warning(
                     f"HiCacheFile: filesystem hosting {self.file_path!r} "
                     f"would fall below min_free={self.min_free_bytes} B "
@@ -766,11 +881,16 @@ class LRUFileEvictor:
             f"HiCacheFile CAP-UNHOLDABLE: refusing {key} ({value_bytes} B) -- "
             f"{self.file_path!r} holds {self._directory_bytes_locked()} B "
             f"against cap {self.max_size_bytes} B, of which "
-            f"{self._total_bytes} B ({len(self._lru)} entries) are this "
-            f"owner's and reclaimable and {self._enforced_foreign_bytes} B "
-            f"belong to a sibling owner of the same directory and are not. "
-            f"This is a cache miss, not an error; refusal #{self._cap_refusals} "
-            f"on this evictor."
+            f"{self._total_bytes - self._foreign_indexed_bytes} B "
+            f"({len(self._lru) - len(self._foreign_indexed)} entries) are this "
+            f"owner's own writes and reclaimable, "
+            f"{self._foreign_indexed_bytes} B ({len(self._foreign_indexed)} "
+            f"entries) are the sibling group's pages under the shared #706 "
+            f"suffix (indexed here, counted, NEVER unlinked here -- this store "
+            f"is the handback carrier), {self._enforced_foreign_bytes} B carry "
+            f"a suffix this group does not scan, and {self._staging_bytes} B "
+            f"are staging/partial files. This is a cache miss, not an error; "
+            f"refusal #{self._cap_refusals} on this evictor."
         )
         return False
 
@@ -860,8 +980,11 @@ class LRUFileEvictor:
             self._pending_writes.clear()
             self._total_bytes = 0
             # The backend removed every file under the directory, a sibling
-            # owner's included, so the measured foreign term is stale too.
+            # owner's included, so every measured term is stale too.
             self._enforced_foreign_bytes = 0
+            self._foreign_indexed.clear()
+            self._foreign_indexed_bytes = 0
+            self._staging_bytes = 0
             self._scan_census = dict(_EMPTY_CENSUS)
 
     def _fs_stats(self) -> Optional[tuple]:
@@ -1029,6 +1152,7 @@ class LRUFileEvictor:
         entries.sort(key=lambda e: e[0])  # oldest first
         indexed_bytes = sum(size for _, _, size in entries)
         foreign_bytes = max(0, seen_bytes - indexed_bytes)
+        staging_bytes = self._census_staging_bytes()
         self._scan_census = {
             "indexed_bytes": indexed_bytes,
             "seen_bytes": seen_bytes,
@@ -1036,7 +1160,12 @@ class LRUFileEvictor:
             "seen_entries": seen_entries,
             "fraction": (indexed_bytes / seen_bytes) if seen_bytes > 0 else 1.0,
             "foreign_bytes": foreign_bytes,
+            # Filled by ``_install_census``: only the installer knows which of
+            # these entries this owner already knew about.
+            "foreign_indexed_bytes": 0,
+            "staging_bytes": staging_bytes,
         }
+        self._staging_bytes = staging_bytes
         # #1295: MEASURED ALWAYS, ENFORCED ONLY WHERE ONE OWNER ANSWERS FOR THE
         # WHOLE DIRECTORY. Under shared keys F7 elects exactly one evictor per
         # group and ``writer_count`` is 1, so an unindexed file is a sibling
@@ -1050,11 +1179,57 @@ class LRUFileEvictor:
         )
         return entries
 
-    def _install_census(self, entries: List[Tuple[float, str, int]]) -> None:
-        """Seed the LRU index from a census, oldest first."""
+    def _census_staging_bytes(self) -> int:
+        """Allocated bytes of the backend's staging/partial files, or 0.
+
+        SHOULD_FIX 8. Same unit as everything else here (``_allocated_size``),
+        and 0 on any store that injects no ``iter_staging`` -- which is every
+        store that did not have this component in the first place.
+        """
+        if self._iter_staging is None:
+            return 0
+        total = 0
+        try:
+            for st in self._iter_staging():
+                total += self._allocated_size(st)
+        except OSError as e:
+            logger.warning(
+                f"HiCacheFile: staging census over {self.file_path!r} failed "
+                f"({e}); the cap is enforced without that component this round."
+            )
+            return 0
+        return total
+
+    def _install_census(
+        self,
+        entries: List[Tuple[float, str, int]],
+        own_known: Optional[Set[str]] = None,
+    ) -> None:
+        """Seed the LRU index from a census, oldest first.
+
+        ``own_known`` is the provenance answer, and it is the whole of
+        MUST_FIX 4. ``None`` means ADOPT EVERYTHING -- the attach case, where
+        there is no live sibling to have written anything and adopting is
+        exactly the pre-#1295 behaviour of every single-owner store ("adopt
+        whatever this rank already wrote while it was running unbounded"). A
+        SET means this owner already had an index: every stem in it was either
+        adopted at attach or written by this process, so a stem the walk found
+        that is NOT in it appeared in the directory since, without this owner
+        writing it -- i.e. it is the sibling group's, under the shared #706
+        suffix. Those are counted against the cap and marked unevictable.
+
+        The rule is a MEASUREMENT of what this process did, not a protocol: no
+        lease, no ownership record on disk, nothing a sibling could contradict.
+        """
+        adopt_all = own_known is None
         for _, stem, size in entries:
             self._lru[stem] = size
             self._total_bytes += size
+            if not adopt_all and stem not in own_known:
+                self._foreign_indexed.add(stem)
+                self._foreign_indexed_bytes += size
+        if isinstance(getattr(self, "_scan_census", None), dict):
+            self._scan_census["foreign_indexed_bytes"] = self._foreign_indexed_bytes
 
     def _check_index_coverage(self) -> None:
         """Grade W8b against the census this evictor just took.
@@ -1120,19 +1295,64 @@ class LRUFileEvictor:
 
         In-flight writes are preserved: a reservation belongs to this process
         and is not on disk yet, so re-reading the directory must not drop it.
+
+        MUST_FIX 5 -- THE WALK DOES NOT HOLD ``_lock``. It walks the whole
+        store (``os.scandir`` + ``os.stat`` per file; 655,982 files at the
+        teardown of boot weg2sb5h, and ~6.4 s INFERRED at that size from the
+        #558 flat-directory rate of 11.7 M entries in 114 s -- an inference,
+        not a measurement of this sharded walk), 16 times per group by that
+        boot's ``WEG2-DORMANT cleared`` count. ``_lock`` gates ``reserve``,
+        ``commit``, ``abort``, ``touch`` and ``stats``, so holding it across
+        the walk stalls every store write for the duration, on a tree that
+        already has a ``front_pyspy_FLIP-STALL`` artifact. The lock is now
+        taken twice, briefly: once to snapshot what this owner knows, once to
+        install. Nothing else in this class touches the directory listing, and
+        the sibling group is asleep, so the walk needs no exclusion.
+
+        A key that appears in ``_lru`` DURING the walk is one this process
+        reserved while the walk ran; the walk could not have seen its file, so
+        it is carried over explicitly rather than dropped. A key that was there
+        BEFORE the walk and is not in the census is genuinely gone.
+
+        NO DEADLINE, DELIBERATELY. A timeout would make the verdict this census
+        feeds (W8b) depend on wall clock, so one rank could refuse the wake on
+        a slow walk while its sibling completed and woke on -- the disagreement
+        the escalation exists to prevent. The cost is PRICED (elapsed ms in the
+        caller's line, and a warning above ``_RESCAN_SLOW_S``), not bounded.
         """
         if not self._eviction_enabled:
             return self.index_coverage()
+        t0 = time.monotonic()
         with self._lock:
-            pending = {k: self._lru.get(k, 0) for k in self._pending_writes}
+            # Adopted at attach, or written by this process: this owner's.
+            own_known = set(self._lru) - self._foreign_indexed
+            before_walk = set(self._lru)
+            lru_sizes = dict(self._lru)
+        entries = self._census_existing_files()
+        walk_s = time.monotonic() - t0
+        with self._lock:
+            carried = {
+                k: self._lru.get(k, lru_sizes.get(k, 0))
+                for k in (set(self._lru) - before_walk) | set(self._pending_writes)
+            }
             self._lru.clear()
             self._total_bytes = 0
-            self._scan_existing_files()
-            for key, size in pending.items():
+            self._foreign_indexed.clear()
+            self._foreign_indexed_bytes = 0
+            self._install_census(entries, own_known=own_known)
+            for key, size in carried.items():
                 if key not in self._lru:
                     self._lru[key] = size
                     self._total_bytes += size
             census = self.index_coverage()
+        if walk_s > _RESCAN_SLOW_S:
+            logger.warning(
+                f"HiCacheFile RESCAN-SLOW: walking {self.file_path!r} took "
+                f"{walk_s * 1000:.0f} ms for {census.get('seen_entries', 0)} "
+                f"files (instrument: os.scandir + os.stat per file, no lock "
+                f"held). This is wake latency, not a store-write stall; it "
+                f"grows with the store and is not bounded here."
+            )
         # W8b, graded where the number exists. In ``__init__`` this store may
         # be COLD -- Weg 2's first boot sees an empty directory, and coverage
         # over zero bytes is 1.0 by definition, a gate with no denominator.
@@ -1180,6 +1400,20 @@ class LRUFileEvictor:
         evict_stem, evict_size = self._lru.popitem(last=False)  # oldest
         if evict_stem in self._pending_writes:
             # Keep in-flight reservations; their file isn't committed yet.
+            self._lru[evict_stem] = evict_size
+            return "skipped", 0
+        if evict_stem in self._foreign_indexed:
+            # #1295 MUST_FIX 4: THE SIBLING GROUP'S PAGE. It is in this index
+            # because the #706 canonical suffix is shared, and the census sorts
+            # oldest-mtime-first, so on a Weg-2 store these sort FIRST and an
+            # unguarded loop would unlink the handback carrier's payload --
+            # pages P wrote for D to load, while P's own ``_total_bytes`` still
+            # counted them (a phantom cap on one side, a lost handback on the
+            # other; the boot of record already carries 13
+            # ``W53_Weg2StoreHandbackFailed``). Counted against the cap, never
+            # freed here. Same skip-and-repin a pin gets, so a directory that
+            # is ALL the sibling's exhausts the caller's attempt budget and the
+            # caller learns the space is not there instead of looping.
             self._lru[evict_stem] = evict_size
             return "skipped", 0
         if self._pins is not None and self._pins.is_pinned(evict_stem):
@@ -1242,10 +1476,13 @@ class LRUFileEvictor:
         Caller holds _lock. #1295: the low-water mark is measured over the
         directory, so an owner sharing the store with a sibling stops where
         the physical fact says to stop rather than where its own subset does.
-        The victims are still this owner's alone -- unlinking a file outside
-        this index would be the twin bookkeeping F7 removed -- so the loop can
-        end above the target with nothing left to evict, and that is precisely
-        the state ``_refuse_cap_unholdable_locked`` names.
+        THE VICTIMS ARE WHAT THIS OWNER WROTE, which is narrower than "what is
+        in this index": under the #706 canonical suffix the index also holds
+        the SIBLING group's pages, and unlinking those would destroy the
+        handback carrier (``_foreign_indexed``), just as unlinking a file
+        outside the index would be the twin bookkeeping F7 removed. So the loop
+        can end above the target with nothing left to evict, and that is
+        precisely the state ``_refuse_cap_unholdable_locked`` names.
         """
         if self.max_size_bytes <= 0:
             return
@@ -1270,7 +1507,10 @@ class LRUFileEvictor:
             f"{reclaimed} B toward target {target} B (cap {self.max_size_bytes} B "
             f"x ratio {self.eviction_ratio:.2f}, need {needed_bytes} B); "
             f"directory {before} -> {self._directory_bytes_locked()} B "
-            f"= {self._total_bytes} B indexed here ({len(self._lru)} entries) "
-            f"+ {self._enforced_foreign_bytes} B a sibling owner holds; "
-            f"{suppressed} further run(s) suppressed since the last line"
+            f"= {self._total_bytes} B indexed here ({len(self._lru)} entries, "
+            f"of which {self._foreign_indexed_bytes} B in "
+            f"{len(self._foreign_indexed)} entries are the sibling group's and "
+            f"were skipped, not freed) + {self._enforced_foreign_bytes} B under "
+            f"a suffix this group does not scan + {self._staging_bytes} B "
+            f"staging; {suppressed} further run(s) suppressed since the last line"
         )

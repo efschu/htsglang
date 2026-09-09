@@ -258,6 +258,13 @@ class SchedulerWeightUpdaterManager:
     #: attribute -- this is a ``slots=True`` dataclass, and the comment above
     #: already learnt that lesson once.
     weg2_fence_raised: bool = False
+    #: #1295: this rank's W8b verdict on the L3 store index it rebuilt at the
+    #: wake, empty when there is none.  Written by
+    #: :meth:`_weg2_rescan_store_index`, read and cleared by the resume fence,
+    #: which votes it through C15's ok-bit so ONE owner's finding stops EVERY
+    #: rank instead of killing the owner alone.  A FIELD for the fourth time in
+    #: this class, for the reason the three comments above give.
+    weg2_store_rescan_failure: str = ""
     #: C16: this rank's card, resolved once.  ``"unset"`` is distinct from
     #: ``None``, which is the resolved answer "no card key" -- so an
     #: unresolvable card is not re-resolved (and re-logged) on every tag.
@@ -1021,14 +1028,26 @@ class SchedulerWeightUpdaterManager:
         write path (re-walking 655k files per page would buy nothing -- a
         sleeping group performs no writes).
 
-        ``Weg2StoreIndexBlind`` is NOT caught. ``rescan_eviction_index``
-        records the obligation in its own docstring: the wake caller escalates
-        it group-fatally, because a cap enforced over a fraction of the sole
-        carrier is not a cap and continuing spends the whole awake phase
-        evicting against numbers that do not describe the disk. Everything
-        else -- no store, no evictor, an OSError from the walk -- leaves the
-        wake alone; a stale index degrades the hit rate, and refusing the wake
-        over it would be worse than the staleness.
+        ``Weg2StoreIndexBlind`` IS ESCALATED, AND NOT BY RAISING HERE.
+        ``rescan_eviction_index`` records the obligation in its own docstring
+        -- "a rank that dies HERE alone while its siblings wake on is still the
+        disagreement §0 forbids" -- and a bare ``raise`` on this line does
+        exactly that: ``LRUFileEvictor.rescan`` returns early for a non-owner
+        (``_eviction_enabled`` = configured AND elected owner), so only PP0 / TP0
+        can ever reach the raise, and PP1-2 / TP1-2 would clear dormancy and
+        wake on. Fix 2 shipped that raise with a docstring CLAIMING a group-
+        fatal escalation nothing in the code performed.
+
+        The escalation is the OK-BIT of the fence that already closes this leg
+        (``_weg2_group_fence`` at the end of ``resume_memory_occupation``, C15):
+        every rank of the group joins it, the verdict is all-gathered, and ANY
+        False makes EVERY rank raise ``Weg2FlipRankDisagree``. So this method
+        RECORDS the refusal in ``weg2_store_rescan_failure`` and the fence
+        turns one owner's finding into one group-wide STOP, with no new
+        collective, no cross-rank protocol, and no rank left running.
+        Everything else -- no store, no evictor, an OSError from the walk --
+        leaves the wake alone; a stale index degrades the hit rate, and
+        refusing the wake over it would be worse than the staleness.
         """
         sch = self.scheduler
         tc = getattr(sch, "tree_cache", None)
@@ -1041,8 +1060,19 @@ class SchedulerWeightUpdaterManager:
         t0 = time.perf_counter()
         try:
             census = backend.rescan_eviction_index()
-        except Weg2StoreIndexBlind:
-            raise
+        except Weg2StoreIndexBlind as e:
+            self.weg2_store_rescan_failure = (
+                f"W4 Weg2WakeRefused (#1295, via the C15 ok-bit): the L3 store "
+                f"index rebuilt at this wake is blind -- {e}. A cap enforced "
+                f"over a fraction of the sole handback carrier is not a cap, "
+                f"and this group's whole awake phase would evict against "
+                f"numbers that do not describe the disk. Recorded here and "
+                f"voted at the resume fence so every rank of the group stops "
+                f"together; a raise on this line would kill the eviction owner "
+                f"alone while its siblings woke on."
+            )
+            logger.error("%s", self.weg2_store_rescan_failure)
+            return
         except Exception as e:
             logger.warning(
                 "WEG2-STORE-RESCAN skipped at wake: %s (%s) -- the eviction "
@@ -1054,9 +1084,12 @@ class SchedulerWeightUpdaterManager:
             return
         logger.info(
             "WEG2-STORE-RESCAN at wake: %d of %d files, %d of %d B (%.1f%%) "
-            "indexed here; %d B in this directory belong to the sibling owner "
-            "and are counted against the same cap but reclaimable only by it "
-            "(instrument: os.stat over every .bin under the store, charged at "
+            "indexed here; of the indexed bytes %d B are the SIBLING GROUP's "
+            "pages under the shared #706 canonical suffix -- counted against "
+            "this cap, never unlinked by this owner, because this store is the "
+            "handback carrier -- and a further %d B carry a suffix this group "
+            "does not scan; %d B are staging/partial files "
+            "(instrument: os.scandir + os.stat over the store, charged at "
             "max(st_blocks*512, st_size) -- the #410 unit, not apparent size) "
             "in %.0f ms",
             census.get("indexed_entries", 0),
@@ -1064,7 +1097,9 @@ class SchedulerWeightUpdaterManager:
             census.get("indexed_bytes", 0),
             census.get("seen_bytes", 0),
             100.0 * float(census.get("fraction", 1.0)),
+            census.get("foreign_indexed_bytes", 0),
             census.get("foreign_bytes", 0),
+            census.get("staging_bytes", 0),
             (time.perf_counter() - t0) * 1000,
         )
 
@@ -1908,12 +1943,30 @@ class SchedulerWeightUpdaterManager:
                         queue.resume_memory_occupation()
 
         report: Dict[str, Any] = {}
+        # #1295 MUST_FIX 2: THE STORE VERDICT RIDES THE FENCE THAT IS ALREADY
+        # HERE. ``_weg2_rescan_store_index`` above can find this group's L3
+        # index blind (W8b), and only ONE rank of the group holds an index to
+        # rebuild -- so raising there kills the eviction owner while its
+        # siblings clear dormancy and walk into the next collective, which is
+        # the disagreement §0 forbids. C15's ok-bit is all-gathered over the
+        # group's world cpu group and ANY False makes EVERY rank raise, so the
+        # verdict is voted, not raised. Read-and-clear, so a later leg cannot
+        # inherit it.
+        store_failure = self.weg2_store_rescan_failure
+        self.weg2_store_rescan_failure = ""
         if weg2_memory_saver_on:
             report = self._weg2_group_fence(
                 "resume tags=%s" % (list(tags),),
+                ok=not store_failure,
+                failure=store_failure,
                 per_tag=weg2_per_tag,
                 leg_ms=weg2_leg_ms,
             )
+        if store_failure and not report:
+            # The fence did not gather: no memory saver, no cpu group, or
+            # world <= 1. A single-rank engine cannot disagree with itself, so
+            # here -- and only here -- the local raise IS the group-wide stop.
+            raise Weg2WakeRefused(store_failure)
 
         return self._weg2_leg_commit("resume", recv_req, ResumeMemoryOccupationReqOutput(
             per_tag=(report.get("per_tag") or weg2_per_tag or None)
