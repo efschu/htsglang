@@ -483,7 +483,7 @@ class DecodeRoundLog:
         # schedule`, before reading anything into the round times), unready is
         # the device not having finished. Neither is ever waited on.
         graphs = nodes = late = stale = unready = reused = 0
-        ring_depth = ring_hits = 0
+        ring_depth = ring_hits = fence_late = 0
         gcounts = getattr(self.clock, "graph_node_counts", None)
         if gcounts is not None:
             (
@@ -495,6 +495,7 @@ class DecodeRoundLog:
                 reused,
                 ring_depth,
                 ring_hits,
+                fence_late,
             ) = gcounts
         # #1302 THREE DENOMINATORS, LABELLED APART ON THE LINE ITSELF. The
         # dec2c boot record read "196 overwritten" off this line as NODES and
@@ -518,7 +519,8 @@ class DecodeRoundLog:
             "%d overwritten by a later replay, %d "
             "not yet complete, %d rounds that replayed one graph twice. "
             "Reading ring (#1302): depth %d replays, %d rounds served from a "
-            "reading taken before the overwrite.",
+            "reading taken before the overwrite, %d launch fences created on "
+            "the replay path (MUST be 0).",
             self.rank,
             us_per_round,
             self._overhead_rounds,
@@ -537,4 +539,5 @@ class DecodeRoundLog:
             reused,
             ring_depth,
             ring_hits,
+            fence_late,
         )

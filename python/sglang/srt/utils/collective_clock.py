@@ -480,6 +480,11 @@ class CollectiveClock:
         #: number that says whether the ring is load bearing on this boot, as
         #: opposed to every round having won its read outright.
         self._graph_ring_hits: int = 0
+        #: Fences that had to be created ON THE REPLAY PATH because the pool
+        #: pre-created at capture time ran dry. MUST be 0 on a boot; a
+        #: non-zero value means the instrument allocated inside the span it
+        #: was measuring.
+        self._fence_late_created: int = 0
 
     # -- arming ---------------------------------------------------------
 
@@ -705,6 +710,18 @@ class CollectiveClock:
             ev = self._backend.event()
             self._backend.materialize(ev)
             self._capture_prealloc.append(ev)
+        # #1302. The launch FENCES this graph's ring will need, created here
+        # -- outside the capture, on the cold path -- for exactly the reason
+        # the pairs above are: a fence is RECORDED on the replay path, and
+        # creating an event there is a host-side device call in the middle of
+        # the span being measured. One ring's worth per captured graph, which
+        # is what the ring holds once it is full. Caught by
+        # ``test_the_replay_path_allocates_no_event``, which is why that
+        # mutant test exists rather than a comment promising it.
+        for _ in range(self._graph_ring):
+            ev = self._backend.event()
+            self._backend.materialize(ev)
+            self._fence_pool.append(ev)
         capture = GraphNodes(key=key, phase=phase)
         self._capture = capture
         try:
@@ -754,7 +771,17 @@ class CollectiveClock:
         # launch would answer a different question ("has G+1 finished"), and
         # a replay that has only STARTED has already destroyed the early
         # pairs -- which is the mixture no exception announces.
-        fence = self._fence_pool.pop() if self._fence_pool else self._backend.event()
+        if self._fence_pool:
+            fence = self._fence_pool.pop()
+        else:
+            # Not an error -- a fence that is not recorded would leave the
+            # ring with no way to tell a valid reading from a stale one, and
+            # a lower bound on the wait is what this module exists to refuse.
+            # But it IS an allocation on the replay path, so it is counted
+            # and printed rather than left to be discovered, the same way
+            # ``late_created`` handles the pair pool running dry.
+            self._fence_late_created += 1
+            fence = self._backend.event()
         fence.record()
         nodes.fences.append((nodes.generation, fence))
         while len(nodes.fences) > self._graph_ring:
@@ -781,9 +808,11 @@ class CollectiveClock:
         span.graph_reads.append((nodes, nodes.generation))
 
     @property
-    def graph_node_counts(self) -> Tuple[int, int, int, int, int, int, int, int]:
+    def graph_node_counts(
+        self,
+    ) -> Tuple[int, int, int, int, int, int, int, int, int]:
         """``(graphs, event nodes, late-created, stale, unready, key reused,
-        ring depth, ring hits)``.
+        ring depth, ring hits, fences created on the replay path)``.
 
         THREE DIFFERENT DENOMINATORS, and the dec2c boot record got two of
         them wrong in one sentence, so they are spelled out here rather than
@@ -805,6 +834,7 @@ class CollectiveClock:
             self._graph_key_reuses,
             self._graph_ring,
             self._graph_ring_hits,
+            self._fence_late_created,
         )
 
     def _executed_past(self, nodes: GraphNodes, generation: int) -> int:

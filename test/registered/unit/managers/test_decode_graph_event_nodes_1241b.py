@@ -709,7 +709,14 @@ class EagerPathUnchangedTest(unittest.TestCase):
             with self.h.clock.span("tp.all_reduce"):
                 self.h.state.advance(1.0)
         self.h.log.end_round()
-        self.assertEqual(self.h.clock.graph_node_counts, (0, 0, 0, 0, 0, 0))
+        # #1302 widened this from six to nine: the ring's DEPTH is a config
+        # value and shows even on a boot that never captured a graph, while
+        # the ring hits and the replay-path fence allocations stay 0. The
+        # exact tuple is kept (rather than sliced) because a counter that
+        # quietly becomes non-zero on the EAGER path is the finding.
+        self.assertEqual(
+            self.h.clock.graph_node_counts, (0, 0, 0, 0, 0, 0, 8, 0, 0)
+        )
 
     def test_the_clock_is_armed_by_a_capture_scope_or_no_node_is_ever_laid(self):
         """The dispatch sites gate on `armed`, not on `span`. A capture scope
