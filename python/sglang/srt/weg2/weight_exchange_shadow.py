@@ -783,11 +783,17 @@ class ShadowRun:
     """
 
     def __init__(self, result: ShadowResult, buffers: Optional[ShadowBuffers],
-                 descs: Sequence[object], layout: Dict[int, int]):
+                 descs: Sequence[object], layout: Dict[int, int],
+                 stripe_bytes: int = STRIPE_BYTES):
         self.result = result
         self.buffers = buffers
         self.descs = list(descs)
         self.layout = layout
+        # ONE number for the stripe and the scratch, carried from the caller:
+        # the scratch IS the stripe (spec 6/S5's 64 MiB per consumer rank), and
+        # two independent copies of that size is a stripe that does not fit its
+        # own scratch.
+        self.stripe_bytes = int(stripe_bytes)
 
     def compare(self, sum_bytes: Optional[Callable[[int, int], int]],
                 log: Callable[[str], None]) -> ShadowResult:
@@ -808,7 +814,8 @@ class ShadowRun:
                 return result
             started = time.perf_counter()
             stripes = compare_stripes(self.descs, self.layout,
-                                      self.buffers.ptr, sum_bytes)
+                                      self.buffers.ptr, sum_bytes,
+                                      stripe_bytes=self.stripe_bytes)
             result.compare_ms = (time.perf_counter() - started) * 1e3
             counters = result.counters
             counters.stripes = len(stripes)
@@ -862,6 +869,10 @@ def shadow_transport(
     budget_s: float = SHADOW_TRANSPORT_BUDGET_S,
     floor_mib: float = SHADOW_FLOOR_MIB,
     explicit: bool = False,
+    slot_bytes: int = xr.SLOT_BYTES,
+    oncard_slot_bytes: Optional[int] = None,
+    oncard_slots: int = tp.ONCARD_SLOTS,
+    stripe_bytes: int = STRIPE_BYTES,
 ) -> ShadowRun:
     """Run the exchange for one leg, into buffers nothing reads.
 
@@ -881,7 +892,7 @@ def shadow_transport(
     subset = select_subset(descs, leg=leg, classes=classes, per_leg=per_leg)
     result = ShadowResult(leg=int(leg), epoch=str(epoch), subset=subset,
                           counters=ShadowCounters(), direction=str(direction))
-    run = ShadowRun(result, None, (), {})
+    run = ShadowRun(result, None, (), {}, stripe_bytes=stripe_bytes)
     try:
         mine = [d for d in subset.descs
                 if int(d.dst_rank if not is_source else d.src_rank) == int(rank)]
@@ -889,7 +900,7 @@ def shadow_transport(
             [d for d in subset.descs if int(d.dst_rank) == int(rank)])[1]
         price = price_shadow(card_uuid, need_bytes, free_mib,
                              floor_mib=floor_mib,
-                             scratch_bytes=0 if is_source else STRIPE_BYTES)
+                             scratch_bytes=0 if is_source else stripe_bytes)
         log(price.line())
         if not price.affordable:
             log(price.message())
@@ -908,14 +919,16 @@ def shadow_transport(
         buffers = None
         leg_descs: Sequence[object] = subset.descs
         if not is_source:
-            buffers = ShadowBuffers(ops, device, total)
+            buffers = ShadowBuffers(ops, device, total,
+                                    scratch_bytes=stripe_bytes)
             mine_dst = [d for d in subset.descs if int(d.dst_rank) == int(rank)]
             shadowed = to_shadow(mine_dst, layout, buffers.ptr)
             layout = {id(new): layout[id(old)]
                       for old, new in zip(mine_dst, shadowed)}
             keep = {id(d) for d in mine_dst}
             leg_descs = [d for d in subset.descs if id(d) not in keep] + shadowed
-            run = ShadowRun(result, buffers, shadowed, layout)
+            run = ShadowRun(result, buffers, shadowed, layout,
+                            stripe_bytes=stripe_bytes)
         counters = result.counters
 
         def on_checksum(report: tp.ChecksumReport) -> None:
@@ -939,7 +952,17 @@ def shadow_transport(
             vote_failure=lambda exc: counters.errors.append(
                 f"leg-vote {type(exc).__name__}: {exc}"),
             budget_s=budget_s, checksum_bytes=sum_bytes,
-            on_checksum=on_checksum)
+            on_checksum=on_checksum, slot_bytes=slot_bytes,
+            # PRICED FROM THE SUBSET'S OWN DIAGONAL, not inherited: the shadow
+            # moves a class subset, so its batch count -- and therefore the
+            # hop this leg pays -- is a different number from the full leg's.
+            # Passing the flip's slot size here would price a lane that is not
+            # the one running.
+            oncard_slot_bytes=(
+                tp.plan_oncard_slot_bytes(
+                    sum(int(d.nbytes) for d in leg_descs if _is_on_card(d))
+                ).slot_bytes if oncard_slot_bytes is None else oncard_slot_bytes),
+            oncard_slots=oncard_slots)
         elapsed_ms = (time.perf_counter() - started) * 1e3
         result.cross_ms = sum(p.elapsed_s for p in out.pairs) * 1e3
         result.oncard_ms = (out.oncard.elapsed_s * 1e3) if out.oncard else 0.0
