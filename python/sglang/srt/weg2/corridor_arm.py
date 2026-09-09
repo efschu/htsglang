@@ -59,7 +59,11 @@ import re
 from dataclasses import dataclass, field
 from typing import Dict, List, Mapping, Optional, Tuple
 
-from sglang.srt.managers import corridor_guard
+# NO ``corridor_guard`` IMPORT HERE ANY MORE. Every rule this module used to
+# call it for -- the verdict threshold and the unmobilised-free edge -- now
+# arrives ON the floor it is grading (``ring_table.FrontFloor``), which
+# derives both through the guard itself. One reader, and no way for the arm
+# to grade a floor by a rule the floor does not agree with.
 from sglang.srt.weg2 import front, ring_table
 
 #: The DELTAS a pre-fix pairing shows, MiB.  Used ONLY to recognise the pre-fix

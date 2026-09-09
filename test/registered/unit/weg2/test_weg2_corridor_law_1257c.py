@@ -328,7 +328,7 @@ class TheActuationGate(unittest.TestCase):
             self.cards, self.budgets, self.dormant, self._sample(), floors=floors
         )
         text = "\n".join(solve.lines)
-        installed = [l for l in solve.lines if " INSTALLED " in l]
+        installed = [ln for ln in solve.lines if " INSTALLED " in ln]
         if installed:
             line = installed[0]
             for token in (
@@ -355,7 +355,7 @@ class TheActuationGate(unittest.TestCase):
         solve = cb.solve_corridor_budgets(
             self.cards, self.budgets, self.dormant, self._sample(), floors=floors
         )
-        card_lines = [l for l in solve.lines if f"card={C5090} " in l]
+        card_lines = [ln for ln in solve.lines if f"card={C5090} " in ln]
         self.assertTrue(card_lines)
         self.assertIn("floor=1152", card_lines[0])
         self.assertIn(f"source={cg.FLOOR_SOURCE_FALLBACK}", card_lines[0])
@@ -1227,7 +1227,9 @@ class RefuterFindingEightTheBootRecipes(unittest.TestCase):
                 self.skipTest(f"{path} not in this checkout")
             text = open(path).read()
             body = "\n".join(
-                l for l in text.splitlines() if not l.lstrip().startswith("#")
+                line
+                for line in text.splitlines()
+                if not line.lstrip().startswith("#")
             )
             self.assertNotIn("--rank-user-reserve-mib", body, name)
 
