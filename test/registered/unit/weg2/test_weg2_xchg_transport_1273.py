@@ -693,8 +693,10 @@ def test_oncard_lane_falls_back_by_name(tmp_path):
     # ...and the term is the real geometry: one bounce per card of the three,
     # ONCARD_SLOTS slots each.  Computed here from the same two constants the
     # HostBounce is built from, never from the message.
+    # S6 must_fix 3: the CEILING of the shape, not one plan's choice.  The
+    # line is printed at ARM time, before any plan has derived a slot size.
     assert tp.ONCARD_HOST_DEGRADE_MIB == \
-        3 * tp.ONCARD_SLOTS * tp.ONCARD_SLOT_BYTES // xr.MIB
+        3 * tp.ONCARD_DEPOSIT_BYTES_MAX // xr.MIB
 
     ok_lines: list = []
     assert tp.arm_oncard_lane(card_uuid="GPU-abc", probe=lambda: (True, ""),
@@ -769,7 +771,7 @@ def test_the_degraded_lane_really_moves_the_bytes(tmp_path, region):
         assert os.path.getsize(p_bounce.path) == tp.ONCARD_SLOTS * SLOT
         assert p_bounce.path.endswith("oncard-0.bin"), p_bounce.path
         assert tp.ONCARD_HOST_DEGRADE_MIB * xr.MIB == \
-            3 * tp.ONCARD_SLOTS * tp.ONCARD_SLOT_BYTES
+            3 * tp.ONCARD_DEPOSIT_BYTES_MAX
         errors: list = []
 
         def produce():
@@ -2588,6 +2590,288 @@ def test_run_leg_refuses_a_deposit_on_the_exported_arm(tmp_path, region, boot):
                        oncard_store_forward=True)
         assert tp.DEPOSIT_REASON_IPC in str(caught.value)
         assert "W65 Weg2XchgDepositUnfundable" in str(caught.value)
+    finally:
+        ops.close()
+        sems.close()
+        xr.unlink_semaphores(boot)
+
+
+# ===========================================================================
+# S6 FIX -- the five must_fix of the S6 refuter.  Each test names the defect
+# it closes and carries the control that would have passed before the fix.
+# ===========================================================================
+
+
+def test_the_host_arm_prices_the_copy_and_the_ipc_arm_must_not():
+    """S6 must_fix 1: the deposit's cost gate priced no copy at all.
+
+    ``ONCARD_PER_BATCH_MS`` was measured on the ``ipc`` arm, where the copy is
+    device-to-device and disappears inside the handshake.  Pricing a ``host``
+    deposit with it asserts 512 MiB in 2.91 ms = 171.8 GiB/s over a link this
+    rig does not have, and S6 made that load-bearing: a deposit is host-only by
+    construction, so every batch it prices is a real unoverlapped PCIe copy.
+
+    THE FALSE GREEN, EXACTLY: one card's deposit at the geometry's ceiling
+    clears the shadow's 60 ms hop bound at the old model and does not at the
+    new one.  A mutant that drops the copy term fails on the second assert.
+    """
+    assert tp.oncard_copy_gbps(tp.ONCARD_MODE_HOST) == tp.ONCARD_HOST_COPY_GBPS
+    assert tp.oncard_copy_gbps(tp.ONCARD_MODE_IPC) == 0.0
+
+    ceiling = tp.ONCARD_DEPOSIT_BYTES_MAX
+    bound = 3.0 * tp.ONCARD_HOP_BUDGET_MS          # the shadow's own bound
+    old = tp.plan_oncard_slot_bytes(ceiling, store_forward=True)
+    new = tp.plan_oncard_slot_bytes(ceiling, store_forward=True,
+                                    copy_gbps=tp.ONCARD_HOST_COPY_GBPS)
+    assert old.copy_ms == 0.0 and old.hop_ms < bound, old.model()
+    assert new.hop_ms > bound, new.model()
+    # ... and the term that made the difference is the BYTES, by two orders.
+    assert new.copy_ms > 100 * (new.batches * new.per_batch_ms), new.model()
+    assert new.copy_ms == pytest.approx(
+        (ceiling / (tp.ONCARD_HOST_COPY_GBPS * 1e9)) * 1e3)
+    # The model PRINTS both terms, because they have different levers: too
+    # many batches is a slot-size question, too many bytes is not.
+    assert f"{tp.ONCARD_HOST_COPY_GBPS:g} GB/s" in new.model(), new.model()
+    assert "not priced" in old.model(), old.model()
+    for token in (f"oncard_copy_gbps={tp.ONCARD_HOST_COPY_GBPS:g}",
+                  f"oncard_copy_ms={new.copy_ms:.1f}"):
+        assert token in new.tokens(), (token, new.tokens())
+
+
+def test_the_copy_is_paid_out_of_the_hop_budget_before_the_batches_are():
+    """S6 must_fix 1, the arithmetic half: bytes first, batches from the rest.
+
+    A slot size chosen from the WHOLE budget spends the copy's share twice.
+    When the copy alone exceeds the budget the plan takes the largest slot the
+    ceiling allows -- the fewest batches the geometry can cut -- and says
+    ``fits=False`` rather than clamping something to make a green.
+    """
+    total = 8 * tp.ONCARD_SLOT_BYTES_MAX
+    free = tp.plan_oncard_slot_bytes(total, budget_ms=20.0)
+    paid = tp.plan_oncard_slot_bytes(total, budget_ms=20.0,
+                                     copy_gbps=tp.ONCARD_HOST_COPY_GBPS)
+    assert paid.copy_ms > 20.0, paid.model()
+    assert paid.slot_bytes == tp.ONCARD_SLOT_BYTES_MAX
+    assert paid.fits is False and paid.hop_ms > paid.budget_ms
+    # THE CAN-FAIL: the same call with no copy term fits, and its slot is the
+    # smaller one the un-spent budget bought.
+    assert free.slot_bytes <= paid.slot_bytes
+    # A zero rate is the ipc arm and reproduces the pre-S6 arithmetic exactly.
+    assert tp.plan_oncard_slot_bytes(total, budget_ms=20.0, copy_gbps=0.0) == free
+
+
+def test_the_deposit_is_declared_to_the_pinned_host_owner_before_it_is_pinned(
+        tmp_path, region):
+    """S6 must_fix 2: the deposit pinned host RAM outside its declared owner.
+
+    ``pinned_host_budget`` is the #550 single owner of "may this PINNED host
+    buffer be allocated?", and the joint check HiCache and kv-session-offload
+    pass through sums ``registered_posts()``.  The bounce called
+    ``cudaHostRegister`` with no post at all, so that sum was short by up to
+    the whole deposit -- two ledgers for one payload.  The #1269 ledger term
+    S6 added answers a different question (the launch-time reap bound); this
+    one answers at the moment of allocation.
+    """
+    from sglang.srt.mem_cache import pinned_host_budget as php
+
+    root = os.path.dirname(os.path.dirname(region.path))
+    ops = FakeDeviceOps(str(tmp_path / "d"), rank=0)
+    php.clear_registered_posts()
+    try:
+        bounce = tp.HostBounce(ops, region.boot_nonce, 0, create=True,
+                               slots=4, slot_bytes=SLOT, shm_root=root)
+        posts = [p for p in php.registered_posts() if bounce.path in p.name]
+        assert len(posts) == 1, php.registered_posts()
+        assert posts[0].nbytes == 4 * SLOT
+        assert posts[0].flag == tp.HostBounce.POST_FLAG
+        bounce.close()
+        # ... and RELEASED, or the next admission is charged for bytes nobody
+        # holds -- the mirror of the under-charge this closes.
+        assert not [p for p in php.registered_posts() if bounce.path in p.name]
+
+        # DECLARED BEFORE ALLOCATED (#729's ordering), proven by refusing at
+        # the declaration: no file may exist afterwards.
+        path = tp.oncard_host_path(region.boot_nonce, 7, root)
+        assert not os.path.exists(path)
+
+        def _refuse(name, flag, nbytes, **kw):
+            raise RuntimeError("over-committed")
+
+        real = tp.check_and_register_pinned_post
+        tp.check_and_register_pinned_post = _refuse
+        try:
+            with pytest.raises(RuntimeError):
+                tp.HostBounce(ops, region.boot_nonce, 7, create=True,
+                              slots=2, slot_bytes=SLOT, shm_root=root)
+        finally:
+            tp.check_and_register_pinned_post = real
+        assert not os.path.exists(path), "the post is declared BEFORE the map"
+
+        # ... and a post whose allocation then fails is undone (#729).
+        real_makedirs = os.makedirs
+        os.makedirs = lambda *a, **k: (_ for _ in ()).throw(OSError("no dir"))
+        try:
+            with pytest.raises(OSError):
+                tp.HostBounce(ops, region.boot_nonce, 8, create=True,
+                              slots=2, slot_bytes=SLOT, shm_root=root)
+        finally:
+            os.makedirs = real_makedirs
+        leftover = [p for p in php.registered_posts() if "oncard-8.bin" in p.name]
+        assert leftover == [], leftover
+    finally:
+        php.clear_registered_posts()
+        ops.close()
+
+
+def test_the_charged_deposit_is_the_geometry_the_planner_can_actually_derive():
+    """S6 must_fix 3: the charge read the slot FLOOR beside the count CEILING.
+
+    ``ONCARD_SLOTS_MAX x ONCARD_SLOT_BYTES`` is 256 MiB; the shape's maximum is
+    ``ONCARD_SLOTS_MAX x ONCARD_SLOT_BYTES_MAX`` = 1024 MiB, and
+    ``plan_oncard_slot_bytes`` clamps to the latter.  The consequence was not
+    an overspend but a systematic FALSE REFUSAL, because
+    ``deposit_refusal_reason`` grades against the same number: every per-card
+    diagonal in the 256 MiB..1 GiB band -- the band the geometry exists for --
+    refused ``ledger-cannot-fund-deposit``.
+    """
+    from sglang.srt.weg2 import host_ledger as hl
+
+    assert tp.ONCARD_DEPOSIT_BYTES_MAX == \
+        tp.ONCARD_SLOTS_MAX * tp.ONCARD_SLOT_BYTES_MAX
+    assert hl.xchg_bounce_bytes_per_card() == tp.ONCARD_DEPOSIT_BYTES_MAX
+    assert tp.ONCARD_DEPOSIT_BYTES_MAX == \
+        4 * tp.ONCARD_SLOTS_MAX * tp.ONCARD_SLOT_BYTES, "the 4x understatement"
+
+    # A plan in the band the fix restores: funded at the real ceiling, refused
+    # at the old floor-derived one.
+    plan = tp.plan_oncard_slot_bytes(4 * tp.ONCARD_SLOT_BYTES_MAX,
+                                     store_forward=True)
+    graded = dict(batches=plan.batches, slots=plan.slots,
+                  slot_bytes=plan.slot_bytes, mode=tp.ONCARD_MODE_HOST)
+    assert plan.deposit_bytes > tp.ONCARD_SLOTS_MAX * tp.ONCARD_SLOT_BYTES
+    assert tp.deposit_refusal_reason(
+        budget_bytes=hl.xchg_bounce_bytes_per_card(), **graded) == ""
+    assert tp.deposit_refusal_reason(
+        budget_bytes=tp.ONCARD_SLOTS_MAX * tp.ONCARD_SLOT_BYTES,
+        **graded) == tp.DEPOSIT_REASON_UNFUNDED
+
+    # The card count is DERIVED from the region's own rank layout, not typed.
+    assert hl.xchg_bounce_bytes() == (xr.N_RANKS // 2) * \
+        hl.xchg_bounce_bytes_per_card()
+    assert hl.xchg_bounce_bytes(1) == hl.xchg_bounce_bytes_per_card()
+
+
+def test_the_two_sides_ring_depths_are_compared_and_not_assumed(
+        tmp_path, region, boot):
+    """S6 must_fix 5: ``slots`` crossed the two processes with no cross-check.
+
+    Only ``slot_bytes`` was compared.  With equal slot sizes and unequal
+    depths the consumer polls ``seq % slots_dst`` while the producer wrote
+    ``seq % slots_src``: every wait misses, and the destination burns its whole
+    budget in a W53 whose denominator names an ABSENT peer -- never a ring
+    sized differently on the two sides.  The ARMED row's ``nbytes`` word is
+    written on a row where no batch exists, so it was free.
+    """
+    xr.create_semaphores(boot)
+    sems = tp.SemSet(boot)
+    ops = FakeDeviceOps(str(tmp_path / "d"), rank=0)
+    payload = pattern(0x11, SLOT)
+    src, dst = dev_ptr(0, 0x10000), dev_ptr(0, 0x80000)
+    write(ops, src, payload)
+    descs = [flat_desc(0, 0, len(payload), src_ptr=src, dst_ptr=dst,
+                       name="oncard")]
+    try:
+        # The producer's own row now CARRIES the depth it armed.
+        tp.write_oncard_row(region, tp.DIR_ONCARD_PROD_OFF, 0, seq=-1,
+                            nbytes=4, slot_bytes=SLOT, wave=WAVE,
+                            state=tp.ONCARD_STATE_ARMED)
+        got = tp.read_oncard_row(region, tp.DIR_ONCARD_PROD_OFF, 0, 0)
+        assert got["bytes"] == 4 and got["slot_bytes"] == SLOT
+
+        with pytest.raises(xr.Weg2XchgPlanDisagree) as caught:
+            tp.run_leg(region, sems, ops, row=3, rank=0, device=0,
+                       card_uuid="u0", uuid_of_card=("u0", "u1", "u2"),
+                       descs=descs, is_source=False,
+                       oncard_mode=tp.ONCARD_MODE_HOST, peer_row=0, wave=WAVE,
+                       log=lambda _s: None, vote_failure=lambda _e: None,
+                       budget_s=1.0, slot_bytes=SLOT, oncard_slot_bytes=SLOT,
+                       oncard_slots=2)
+        message = str(caught.value)
+        assert "W52 Weg2XchgPlanDisagree" in message
+        assert "slots=4" in message and "derived 2" in message
+        assert "different depths" in message
+
+        # THE CAN-FAIL CONTROL: agreeing depths do NOT raise W52.  This rank
+        # then dies on the missing bounce file, which is a different failure
+        # and proves the check above discriminated rather than always fired.
+        with pytest.raises(BaseException) as other:
+            tp.run_leg(region, sems, ops, row=3, rank=0, device=0,
+                       card_uuid="u0", uuid_of_card=("u0", "u1", "u2"),
+                       descs=descs, is_source=False,
+                       oncard_mode=tp.ONCARD_MODE_HOST, peer_row=0, wave=WAVE,
+                       log=lambda _s: None, vote_failure=lambda _e: None,
+                       budget_s=1.0, slot_bytes=SLOT, oncard_slot_bytes=SLOT,
+                       oncard_slots=4)
+        assert not isinstance(other.value, xr.Weg2XchgPlanDisagree), other.value
+        assert isinstance(other.value, OSError), other.value
+    finally:
+        ops.close()
+        sems.close()
+        xr.unlink_semaphores(boot)
+
+
+def test_a_lane_that_deposits_nothing_prints_no_deposit(tmp_path):
+    """S6 refuter finding 8: ``oncard_deposit_mib`` on a non-depositing lane.
+
+    The field's name means "pinned host bytes held ACROSS the flip".  On the
+    drainable lane the slots are a pipelined double buffer allocated and freed
+    inside the leg, so printing them made a sum over acceptance lines count
+    host bytes that were never held.
+    """
+    drain = tp.plan_oncard_slot_bytes(200 * xr.MIB)
+    keep = tp.plan_oncard_slot_bytes(200 * xr.MIB, store_forward=True)
+    assert drain.slots > 0 and drain.deposit_bytes == 0, drain.tokens()
+    assert keep.deposit_bytes == keep.slots * keep.slot_bytes
+    assert "oncard_deposit_mib=0 " in drain.tokens() + " "
+
+
+def test_the_source_publishes_its_ring_depth_in_the_arming_row(
+        tmp_path, region, boot):
+    """S6 must_fix 5, the PRODUCER half, deterministic.
+
+    The consumer's cross-check is only as good as what the producer writes, and
+    the co-located pair's concurrent tests catch a producer that writes 0 only
+    when the consumer happens to read the row before batch 0 overwrites it.
+    This drives ``run_leg`` as the SOURCE and reads the row back, so the
+    publication is proven by arithmetic rather than by a race.
+    """
+    xr.create_semaphores(boot)
+    sems = tp.SemSet(boot)
+    ops = FakeDeviceOps(str(tmp_path / "d"), rank=0)
+    payload = pattern(0x21, SLOT)
+    src, dst = dev_ptr(0, 0x10000), dev_ptr(0, 0x80000)
+    write(ops, src, payload)
+    descs = [flat_desc(0, 0, len(payload), src_ptr=src, dst_ptr=dst,
+                       name="oncard")]
+    try:
+        tp.run_leg(region, sems, ops, row=0, rank=0, device=0,
+                   card_uuid="u0", uuid_of_card=("u0", "u1", "u2"),
+                   descs=descs, is_source=True,
+                   oncard_mode=tp.ONCARD_MODE_HOST, peer_row=3, wave=WAVE,
+                   log=lambda _s: None, vote_failure=lambda _e: None,
+                   budget_s=2.0, slot_bytes=SLOT, oncard_slot_bytes=SLOT,
+                   oncard_slots=5, oncard_store_forward=True)
+        armed = tp.read_oncard_row(region, tp.DIR_ONCARD_PROD_OFF, 0, 0)
+        # The row may have advanced to the batch it then wrote; the ARMING
+        # row's own word is what this pins, so read it while it is still one.
+        if armed["state"] == tp.ONCARD_STATE_ARMED:
+            assert armed["seq"] == -1
+            assert armed["bytes"] == 5, armed
+        assert armed["slot_bytes"] == SLOT, armed
+        # ... and the write itself, at the one place it happens.
+        source = inspect.getsource(tp.run_leg)
+        assert "seq=-1, nbytes=diag_slots," in source, \
+            "the arming row must carry the ring depth, not a zero"
     finally:
         ops.close()
         sems.close()

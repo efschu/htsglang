@@ -870,7 +870,16 @@ def price_leg(card_uuid: str, descs: Sequence[object], *, rank: int,
     # way round.
     mine_dst = [d for d in descs if int(d.dst_rank) == int(rank)]
     oncard_bytes = oncard_lane_bytes(descs, rank)
-    diag_slot = (int(tp.plan_oncard_slot_bytes(oncard_bytes).slot_bytes)
+    # THE FALLBACK DERIVATION CARRIES THE ARM'S COPY TERM TOO (S6-fix).  On
+    # the product path the slot is handed in -- ``run_leg_hook`` derives it
+    # once and passes it here and to ``shadow_transport``, so there is exactly
+    # one derivation.  This branch runs only when nobody handed one in, and a
+    # slot chosen from a budget that does not pay for the host arm's copy is a
+    # SECOND model of one quantity, which is the defect must_fix 1 removed one
+    # seam over.
+    diag_slot = (int(tp.plan_oncard_slot_bytes(
+                     oncard_bytes,
+                     copy_gbps=tp.oncard_copy_gbps(oncard_mode)).slot_bytes)
                  if oncard_slot_bytes is None else int(oncard_slot_bytes))
     # The IMPORTING side maps the exporter's allocation and allocates none of
     # its own; the ``host`` degrade's bounce is a shm file, not VRAM.  So the
@@ -1675,15 +1684,35 @@ def shadow_transport(
         # run: a leg the gate switches off still prints what it would have
         # cost, which is the number a refused boot needs most.
         diag_bytes = oncard_lane_bytes(subset.descs, rank)
+        # ONE PRODUCER OF THE COST MODEL, AND THE COPY IS IN IT (S6 refuter,
+        # must_fix 1).  This line used to multiply the batch count by
+        # ``tp.ONCARD_PER_BATCH_MS`` by hand -- a second copy of a formula that
+        # already has an owner, and one that carried no bytes term at all, so
+        # on the ``host`` arm it priced a PCIe copy at the cost of a
+        # device-to-device handshake.  The slot is PINNED here (floor ==
+        # ceiling == ``diag_slot``) and ``store_forward`` is left False on
+        # purpose: this call RE-PRICES the hook's decision, it does not
+        # re-decide it, so the slot count stays the one derivation both
+        # co-located processes compare.
+        lane_priced = tp.plan_oncard_slot_bytes(
+            diag_bytes, slots=int(oncard_slots),
+            floor_bytes=diag_slot, ceiling_bytes=diag_slot,
+            host_budget_bytes=int(host_bounce_budget_bytes),
+            copy_gbps=tp.oncard_copy_gbps(oncard_mode))
         result.oncard_slot_mib = diag_slot / MIB
-        result.oncard_batches = -(-diag_bytes // diag_slot) if diag_bytes else 0
-        result.oncard_hop_ms_priced = (result.oncard_batches
-                                       * tp.ONCARD_PER_BATCH_MS)
+        result.oncard_batches = int(lane_priced.batches)
+        result.oncard_hop_ms_priced = float(lane_priced.hop_ms)
         # S6, on the same line and before the same gate: the deposit's shape.
         result.oncard_slots = int(oncard_slots)
         result.oncard_slots_source = ("store-forward-batches"
                                       if oncard_store_forward else "caller")
-        result.oncard_deposit_mib = int(oncard_slots) * diag_slot / MIB
+        # ZERO WHEN THIS LANE DEPOSITS NOTHING (S6 refuter, finding 8).  The
+        # field's name means "pinned host bytes held across the flip"; on the
+        # drainable lane the slots are a pipelined double buffer allocated and
+        # freed inside this leg, so printing them here made a sum over
+        # acceptance lines count host bytes that were never held.
+        result.oncard_deposit_mib = (int(oncard_slots) * diag_slot / MIB
+                                     if oncard_store_forward else 0.0)
         if not price.affordable:
             log(price.message())
             if explicit:
@@ -1951,20 +1980,28 @@ def hop_bound_ms(value: Optional[float] = None) -> float:
 
 
 def hop_refusal_message(*, card: str, priced_ms: float, bound_ms: float,
-                        batches: int, slot_mib: float, leg: int) -> str:
+                        batches: int, slot_mib: float, leg: int,
+                        model: str = "") -> str:
     """W61 for the TIME term, the same marker the VRAM term already uses.
 
     ONE code for one class of event -- "the shadow cannot afford to run on this
     leg" -- and the line says which resource by naming both numbers.  A second
     W-code for the same decision would make a census of "legs the shadow
     refused itself" read low by exactly the time-refused ones.
+
+    ``model`` IS THE PLAN'S OWN COST MODEL, printed with the refusal (S6): the
+    priced hop is now a SUM of two terms with different units behind them -- a
+    handshake per batch and a copy per byte -- and a reader who sees only the
+    total cannot tell a lane refused for cutting too many batches from one
+    refused for having too many bytes to move.  Those have different levers.
     """
     return (
         f"{UNAFFORDABLE_MARKER} card={card} scope=hop leg={leg} "
         f"priced_hop_ms={priced_ms:.3f} bound_ms={bound_ms:.3f} "
         f"batches={batches} slot_mib={slot_mib:g} "
         f"factor={SHADOW_HOP_BOUND_FACTOR:g}x{tp.ONCARD_HOP_BUDGET_MS:g}ms "
-        f"-- the shadow does not run on this leg; the flip is untouched and "
+        + (f"model=[{model}] " if model else "")
+        + f"-- the shadow does not run on this leg; the flip is untouched and "
         f"the ring remains the only authority for weight bytes"
     )
 
@@ -3069,15 +3106,22 @@ def run_leg_hook(
         # derivation rather than two derivations.
         store_forward = not bool(inputs.oncard_drainable)
         budget_bytes = int(inputs.host_bounce_budget_bytes)
+        # THE BYTES TERM IS AN ARM PROPERTY, and the arm is known here (S6
+        # refuter, must_fix 1): ``host`` prices the copy at spec 0.3's measured
+        # slowest-card rate, ``ipc`` prices 0 because its copy is D2D and is
+        # already inside ``ONCARD_PER_BATCH_MS``.  One producer of that
+        # decision, in the transport, so the hop this hook grades and the hop
+        # ``shadow_transport`` prints cannot be two different models.
+        copy_gbps = tp.oncard_copy_gbps(mode)
         lane = (tp.plan_oncard_slot_bytes(
                     lane_bytes, store_forward=store_forward,
-                    host_budget_bytes=budget_bytes)
+                    host_budget_bytes=budget_bytes, copy_gbps=copy_gbps)
                 if oncard_slot_bytes is None
                 else tp.plan_oncard_slot_bytes(
                     lane_bytes, floor_bytes=int(oncard_slot_bytes),
                     ceiling_bytes=int(oncard_slot_bytes),
                     store_forward=store_forward,
-                    host_budget_bytes=budget_bytes))
+                    host_budget_bytes=budget_bytes, copy_gbps=copy_gbps))
         diag_slot = int(lane.slot_bytes)
         batches = int(lane.batches)
         # ONE SLOT PER BATCH THE BATCHER WILL ACTUALLY CUT.  ``lane.slots`` is
@@ -3095,14 +3139,19 @@ def run_leg_hook(
         if priced_ms > bound:
             message = hop_refusal_message(
                 card=inputs.card_uuid, priced_ms=priced_ms, bound_ms=bound,
-                batches=batches, slot_mib=diag_slot / MIB, leg=inputs.leg)
+                batches=batches, slot_mib=diag_slot / MIB, leg=inputs.leg,
+                model=lane.model())
             log(message)
             result.subset = subset
             result.oncard_slot_mib = diag_slot / MIB
             result.oncard_batches = batches
             result.oncard_slots = diag_slots
             result.oncard_slots_source = lane.slots_source
-            result.oncard_deposit_mib = diag_slots * diag_slot / MIB
+            # Finding 8 again, on the refusal path: a lane refused before it
+            # ran deposited nothing, and a lane that is not store-and-forward
+            # never would have.
+            result.oncard_deposit_mib = (diag_slots * diag_slot / MIB
+                                         if store_forward else 0.0)
             result.oncard_hop_ms_priced = priced_ms
             result.reason = "hop-over-bound"
             # THE ASYMMETRIC REFUSAL, PUBLISHED.  ``hop_ms`` is priced from
