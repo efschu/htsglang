@@ -373,9 +373,27 @@ assert P_MAX_TOTAL_TOKENS == 428000, P_MAX_TOTAL_TOKENS
 #: would hand back 1618 MiB of pool the boot could have used), and the rg6
 #: baseline carried no such flag at all.  A term whose premise is the head
 #: belongs to the head.
+#: #1241 (refuter MF-6). THE BOOT'S SPEC AND KV FACTS, ONE WRITER.
+#:
+#: These five values were literals in FIVE places: the P draft-KV flag tuple,
+#: ``common_flags``, ``argv_d``, and BOTH ``PlanInputs`` blocks that price a
+#: weight vector. The argv half and the pricing half agreed by coincidence of
+#: typing, not by construction -- so a change to the shipped draft-token count
+#: (which #1242 is already moving) would have gone on pricing the OLD
+#: configuration, silently, on every boot including the default one. That is a
+#: second bookkeeping of the boot's own argv, which is the shape
+#: UPSTREAM-MINIMAL forbids. One name each, read by everybody.
+SPEC_ALGORITHM = "NEXTN"
+SPEC_NUM_STEPS = 2
+SPEC_EAGLE_TOPK = 1
+SPEC_NUM_DRAFT_TOKENS = 3
+KV_CACHE_DTYPE = "fp8_e4m3"
+
 P_DRAFT_KV_FLAGS: Tuple[str, ...] = (
-    "--speculative-algorithm", "NEXTN", "--speculative-num-steps", "2",
-    "--speculative-eagle-topk", "1", "--speculative-num-draft-tokens", "3",
+    "--speculative-algorithm", SPEC_ALGORITHM,
+    "--speculative-num-steps", str(SPEC_NUM_STEPS),
+    "--speculative-eagle-topk", str(SPEC_EAGLE_TOPK),
+    "--speculative-num-draft-tokens", str(SPEC_NUM_DRAFT_TOKENS),
     "--speculative-draft-kv-only",
     "--max-total-tokens", str(P_MAX_TOTAL_TOKENS),
 )
@@ -1553,7 +1571,7 @@ def common_flags(
         "--served-model-name", "Qwen3.8-27B",
         "--rank-gpu-id", "0,1,2",
         "--skip-server-warmup",
-        "--kv-cache-dtype", "fp8_e4m3",
+        "--kv-cache-dtype", KV_CACHE_DTYPE,
         "--context-length", str(CONTEXT_LENGTH_TOKENS),
         # C14/K9: the per-request KV ceiling, decoupled from the model
         # context. A CEILING, not the pressure relief: on D the device pool
@@ -1836,8 +1854,10 @@ def argv_d(
         # from d_tp_ratio_decision as --d-tp-objective, priced on the launch
         # line; the default is still 'auto' because the maxkv law makes
         # capacity the default objective, not because nothing was decided.
-        "--speculative-algorithm", "NEXTN", "--speculative-num-steps", "2",
-        "--speculative-eagle-topk", "1", "--speculative-num-draft-tokens", "3",
+        "--speculative-algorithm", SPEC_ALGORITHM,
+        "--speculative-num-steps", str(SPEC_NUM_STEPS),
+        "--speculative-eagle-topk", str(SPEC_EAGLE_TOPK),
+        "--speculative-num-draft-tokens", str(SPEC_NUM_DRAFT_TOKENS),
     ] + list(token_vector_flags) + [
         # NO TOKEN VECTOR BY DEFAULT (#1032). What stood here was
         # `--uneven-token-vector 29,19,16 --uneven-token-vector-role seed`, the
@@ -3500,6 +3520,14 @@ class DOperatingPointRow:
     round_ms: Optional[float]
     round_unit: str
     world_pool_tokens: Optional[int]
+    #: ``PerfCostModel.predict_capacity``'s own verdict that this vector fits
+    #: at all. ``None`` = the capacity call did not run (unpriced geometry).
+    feasible: Optional[bool] = None
+    #: The FUNDED context ``min(sum_r P_r, 64 * min_r P_r)`` -- bounded by the
+    #: SMALLEST rank, which is the whole reason it is carried next to the
+    #: world pool: a vector that collapses one rank barely moves ``sum(p)``
+    #: and can halve this.
+    funded_ctx_tokens: Optional[int] = None
     note: str = ""
 
 
@@ -3520,6 +3548,26 @@ def _weights_from_scores(scores: Sequence[float]) -> Tuple[int, ...]:
     """
     lo = min(float(s) for s in scores)
     return _gcd_reduce([int(round(float(s) / max(lo, 1e-9) * 1000.0)) for s in scores])
+
+
+def d_plan_inputs(model: str, tp_size: int, d_bs: int):
+    """The runtime ``PlanInputs`` describing THIS boot's group D.
+
+    ONE FACTORY (refuter MF-6). Every field is read from the module constant
+    the argv builder emits, so the vector this launcher PRICES and the argv it
+    SHIPS cannot describe two different configurations. Both callers -- the
+    #1017 weight line and the #1241 operating-point rows -- go through here.
+    """
+    from sglang.srt.uneven_perf import PlanInputs
+
+    return PlanInputs(
+        tp_size=int(tp_size),
+        model_path=model,
+        kv_cache_dtype=KV_CACHE_DTYPE,
+        speculative_algorithm=SPEC_ALGORITHM,
+        speculative_num_draft_tokens=SPEC_NUM_DRAFT_TOKENS,
+        max_running_requests=int(d_bs),
+    )
 
 
 def d_operating_point_rows(
@@ -3549,17 +3597,10 @@ def d_operating_point_rows(
     # -- the geometry and the cost model, both the runtime's own -------------
     pcm = None
     try:
-        from sglang.srt.uneven_perf import PerfCostModel, PlanInputs
+        from sglang.srt.uneven_perf import PerfCostModel
 
         pcm = PerfCostModel(
-            PlanInputs(
-                tp_size=len(budgets),
-                model_path=model,
-                kv_cache_dtype="fp8_e4m3",
-                speculative_algorithm="NEXTN",
-                speculative_num_draft_tokens=3,
-                max_running_requests=int(d_bs),
-            ),
+            d_plan_inputs(model, len(budgets), d_bs),
             list(maxkv_weights),
             list(budgets),
         )
@@ -3638,16 +3679,89 @@ def d_operating_point_rows(
     # -- the three rows ------------------------------------------------------
     from sglang.srt.distributed.utils import partition_units
 
-    def _row(position: str, score_name: str, scores, weights) -> DOperatingPointRow:
-        attn_units = partition_units(int(pcm.attn_units), list(weights))
-        scale = int(pcm.q_heads) // max(1, int(pcm.attn_units))
-        attn = tuple(u * scale for u in attn_units)
-        gdn = (
-            tuple(partition_units(int(pcm.gdn_units), list(weights)))
-            if int(pcm.gdn_units) > 1
-            else tuple()
-        )
-        mlp = list(partition_units(int(pcm.mlp_units), list(weights)))
+    n_ranks = len(budgets)
+
+    def _fam_partition(units: int, weights: Sequence[int]) -> Tuple[int, ...]:
+        """Partition ``units`` over ``weights``, or ``()`` if the runtime
+        would not shard that family by a vector at all.
+
+        THE PREDICATE IS THE RUNTIME'S, NOT A WEAKER ONE OF OUR OWN (review
+        R2). ``_partition_units_raw`` RAISES when ``units < len(weights)``
+        (distributed/utils.py), and ``PerfCostModel`` answers exactly this
+        question with ``gdn_units >= tp_size`` (uneven_perf.py:4553, :4596)
+        before it shards. The first version of this row guarded GDN with
+        ``> 1``, which is true and still below the world size on any model
+        with 2 GDN units and 3 ranks -- and the call sat OUTSIDE every
+        try/except in a function reached from the DEFAULT maxkv boot. A
+        diagnostic line that runs on every boot must not be able to kill one.
+        """
+        if int(units) < int(n_ranks):
+            return tuple()
+        return tuple(partition_units(int(units), list(weights)))
+
+    def _row(
+        position: str, score_name: str, scores, weights
+    ) -> Tuple[DOperatingPointRow, Optional[str]]:
+        """One priced row, and the refusal it earned (or ``None``).
+
+        NOTHING IN HERE RAISES. Every arm is priced on every boot so the
+        trade is readable per boot, which means this runs on maxkv boots that
+        selected none of the arms it prices.
+        """
+        try:
+            # Attention. The runtime widens the grid to the q-heads when the
+            # o-group count is below the world size rather than crashing in
+            # partition_units (uneven_perf.py:4520-4528); mirrored here so the
+            # row quotes the geometry the model would actually shard on.
+            a_units = int(pcm.attn_units)
+            grid = a_units if a_units >= n_ranks else max(int(pcm.q_heads), n_ranks)
+            attn_units = list(partition_units(grid, list(weights)))
+            scale = int(pcm.q_heads) // max(1, grid)
+            attn = tuple(u * scale for u in attn_units)
+            # GDN through the cost model's OWN partitioner, so its predicate
+            # (and its `[0] * tp_size` answer for a model it will not shard)
+            # is inherited rather than re-implemented.
+            gdn_raw = pcm.gdn_unit_partition(list(weights))
+            gdn = tuple(int(x) for x in gdn_raw) if any(gdn_raw) else tuple()
+            mlp_part = _fam_partition(int(pcm.mlp_units), weights)
+            if not mlp_part:
+                return (
+                    DOperatingPointRow(
+                        position=position,
+                        score_name=score_name,
+                        scores=tuple(float(x) for x in scores),
+                        weights=tuple(int(w) for w in weights),
+                        attn_heads=attn,
+                        gdn_heads=gdn,
+                        round_ms=None,
+                        round_unit="unpriced (%d MLP units < %d ranks: the "
+                        "runtime does not shard this family by a vector)"
+                        % (int(pcm.mlp_units), n_ranks),
+                        world_pool_tokens=None,
+                        feasible=None,
+                        funded_ctx_tokens=None,
+                    ),
+                    None,
+                )
+            mlp = list(mlp_part)
+        except Exception as exc:  # pragma: no cover - geometry is diagnostic
+            return (
+                DOperatingPointRow(
+                    position=position,
+                    score_name=score_name,
+                    scores=tuple(float(x) for x in scores),
+                    weights=tuple(int(w) for w in weights),
+                    attn_heads=tuple(),
+                    gdn_heads=tuple(),
+                    round_ms=None,
+                    round_unit="unpriced (geometry: %s)" % exc,
+                    world_pool_tokens=None,
+                    feasible=None,
+                    funded_ctx_tokens=None,
+                ),
+                None,
+            )
+
         round_ms: Optional[float] = None
         unit = "unpriced"
         note = ""
@@ -3662,8 +3776,21 @@ def d_operating_point_rows(
                 unit = "relative bs1 round (PerfCostModel.decode_round_time)"
                 note = D705_PROVENANCE
             else:
-                # COMPUTE-BOUND: the lockstep sum-of-per-family-maxima over the
-                # #324 per-(rank, family) GEMM rates. Seconds, converted to ms.
+                # The lockstep sum-of-per-family-maxima (#475).
+                #
+                # PER-CARD SCALAR RATES, NOT PER-(RANK, FAMILY) SCORES, AND
+                # THE LINE SAYS SO (refuter MF-3). ``family_tflops`` is passed
+                # as None because this launcher has no per-family score
+                # source: ``family_prefill_tflops`` needs a ``GemmScores``
+                # from the planner's gemm pass and returns None for a
+                # single-scheme checkpoint anyway. With None, one rank is
+                # slowest in EVERY family, so #475's ``sum_fam max_rank``
+                # degenerates to ``max_rank sum_fam`` -- the pre-#475 lower
+                # bound. Building a second per-family score here to dress the
+                # number up would be exactly the parallel bookkeeping
+                # UPSTREAM-MINIMAL forbids, so the claim is dropped instead of
+                # the input invented, and the unit carries the limitation to
+                # the log line.
                 round_ms = (
                     float(
                         pcm.prefill_lockstep_compute_time(
@@ -3672,34 +3799,82 @@ def d_operating_point_rows(
                     )
                     * 1000.0
                 )
-                unit = "ms lockstep GEMM (PerfCostModel.prefill_lockstep_compute_time)"
+                unit = (
+                    "ms lockstep GEMM over PER-CARD scalar rates "
+                    "(PerfCostModel.prefill_lockstep_compute_time, "
+                    "family_tflops=None, so sum_fam max_rank collapses to "
+                    "max_rank sum_fam); the COMPUTE-BOUND premise of this arm "
+                    "is BOOT-UNPROVEN -- it is the very quantity #1241 slice "
+                    "(1) measures and no boot has run it yet"
+                )
         except Exception as exc:
             round_ms = None
             unit = "unpriced (%s)" % exc
+
+        # THE POOL, AND THE TWO FIELDS THE FIRST VERSION THREW AWAY
+        # (refuter MF-4). ``predict_capacity`` returns `feasible` -- the
+        # model's own verdict that the vector fits at all -- and `ctx`, the
+        # FUNDED context ``min(sum_r P_r, 64 * min_r P_r)``. Reading only
+        # ``sum(p)`` prints a barely-moved world pool for a vector that
+        # collapses one rank, because the funded context is bounded by the
+        # SMALLEST rank and the sum is not. Both are carried on the row now,
+        # and an infeasible vector is refused rather than shipped.
         pool: Optional[int] = None
+        feasible: Optional[bool] = None
+        funded_ctx: Optional[int] = None
         try:
             cap = pcm.predict_capacity(mlp, list(attn_units))
             pool = int(sum(cap["p"]))
+            if "feasible" in cap:
+                feasible = bool(cap["feasible"])
+            if cap.get("ctx") is not None:
+                funded_ctx = int(cap["ctx"])
         except Exception:
             pool = None
-        return DOperatingPointRow(
-            position=position,
-            score_name=score_name,
-            scores=tuple(float(x) for x in scores),
-            weights=tuple(int(w) for w in weights),
-            attn_heads=attn,
-            gdn_heads=gdn,
-            round_ms=round_ms,
-            round_unit=unit,
-            world_pool_tokens=pool,
-            note=note,
+        refusal = None
+        if feasible is False:
+            refusal = (
+                "W55 Weg2TpOperatingPointInfeasible: position %s derives "
+                "weights %s, which PerfCostModel.predict_capacity marks "
+                "feasible=False against this boot's budgets %s -- the weight "
+                "shards plus the mamba pool plus the reserves do not leave a "
+                "positive KV pool on at least one rank. Refused. This is the "
+                "model's own verdict, not a margin chosen here: no safety "
+                "factor is applied on top of it."
+                % (position, list(int(w) for w in weights), list(budgets))
+            )
+        return (
+            DOperatingPointRow(
+                position=position,
+                score_name=score_name,
+                scores=tuple(float(x) for x in scores),
+                weights=tuple(int(w) for w in weights),
+                attn_heads=attn,
+                gdn_heads=gdn,
+                round_ms=round_ms,
+                round_unit=unit,
+                world_pool_tokens=pool,
+                feasible=feasible,
+                funded_ctx_tokens=funded_ctx,
+                note=note,
+            ),
+            refusal,
         )
 
-    rows = [
-        _row("maxkv", "budget MiB (capacity-first)", tuple(budgets), maxkv_weights),
-        _row("decode-bs1", "measured membw_gbs", membw, _weights_from_scores(membw)),
-        _row("decode-bs6", "measured gemm_tflops", gemm, _weights_from_scores(gemm)),
-    ]
+    rows = []
+    for _pos, _score_name, _scores, _weights in (
+        ("maxkv", "budget MiB (capacity-first)", tuple(budgets), maxkv_weights),
+        ("decode-bs1", "measured membw_gbs", membw, _weights_from_scores(membw)),
+        ("decode-bs6", "measured gemm_tflops", gemm, _weights_from_scores(gemm)),
+    ):
+        _row_obj, _refusal = _row(_pos, _score_name, _scores, _weights)
+        rows.append(_row_obj)
+        # A refusal on the SHIPPED maxkv vector is not this axis's to make:
+        # that vector is what `--rank-tp-ratio auto` resolves to with or
+        # without #1241, so refusing it here would turn a diagnostic into a
+        # boot blocker for the default path.
+        if _refusal is not None and _pos != "maxkv":
+            refusals.append(_refusal)
 
     # -- W53: a position that would turn an uneven axis OFF -------------------
     #
@@ -3731,7 +3906,12 @@ def d_operating_point_rows(
             ("attention", int(pcm.attn_units)),
             ("GDN", int(pcm.gdn_units)),
         ):
-            if fam_units <= 1:
+            # SAME PREDICATE AS THE PARTITION (review R2). A family the
+            # runtime does not shard by the vector has no axis to disable, so
+            # a saturation refusal against it would be a FALSE W53 -- the
+            # `<= 1` form fired for a GDN family of 2 units on 3 ranks, which
+            # `gdn_unit_partition` answers with [0, 0, 0].
+            if fam_units < n_ranks:
                 continue
             r = _saturated(row.weights, fam_units)
             if r is not None:
@@ -3788,7 +3968,8 @@ def d_operating_point_line(
             else row.round_unit
         )
         parts.append(
-            "%s%s: weights %s from %s %s -> attn %s GDN %s, round %s, world pool %s"
+            "%s%s: weights %s from %s %s -> attn %s GDN %s, round %s, world pool "
+            "%s, funded ctx %s, feasible %s"
             % (
                 row.position,
                 " [SHIPPED]" if row.position == shipped else "",
@@ -3801,6 +3982,15 @@ def d_operating_point_line(
                 row.world_pool_tokens
                 if row.world_pool_tokens is not None
                 else "UNPRICED",
+                # BOTH, because they answer different questions: the world
+                # pool is the sum over ranks, the funded context is bounded by
+                # the SMALLEST rank (min(sum P, 64 min P)) and is the quantity
+                # a carrier bound is about. A vector that collapses one rank
+                # moves the second far more than the first.
+                row.funded_ctx_tokens
+                if row.funded_ctx_tokens is not None
+                else "UNPRICED",
+                "UNPRICED" if row.feasible is None else row.feasible,
             )
         )
     tail = (" REFUSED: " + " | ".join(refusals)) if refusals else ""
@@ -3933,22 +4123,22 @@ def d_tp_ratio_decision(
     n_q = 0
     try:
         from sglang.srt.distributed.utils import partition_units
-        from sglang.srt.uneven_perf import PerfCostModel, PlanInputs
+        from sglang.srt.uneven_perf import PerfCostModel
 
-        inputs = PlanInputs(
-            tp_size=len(budgets),
-            model_path=model,
-            kv_cache_dtype="fp8_e4m3",
-            speculative_algorithm="NEXTN",
-            speculative_num_draft_tokens=3,
-            max_running_requests=int(d_bs),
+        pcm = PerfCostModel(
+            d_plan_inputs(model, len(budgets), d_bs), weights, list(budgets)
         )
-        pcm = PerfCostModel(inputs, weights, list(budgets))
         n_q = int(pcm.q_heads)
         scale = n_q // max(1, int(pcm.attn_units))
         q_heads = [u * scale for u in partition_units(int(pcm.attn_units), weights)]
-        if int(pcm.gdn_units) > 1:
-            gdn_heads = list(partition_units(int(pcm.gdn_units), weights))
+        # Same predicate as the operating-point rows (review R2): `> 1` is
+        # true and still below the world size for a 2-unit GDN family on 3
+        # ranks, and partition_units RAISES there. `gdn_unit_partition`
+        # carries the runtime's own `gdn_units >= tp_size` and answers
+        # [0]*tp_size instead of raising.
+        _gdn_raw = pcm.gdn_unit_partition(list(weights))
+        if any(_gdn_raw):
+            gdn_heads = [int(x) for x in _gdn_raw]
         heads_note = "attention %s of %d q-heads%s" % (
             q_heads,
             n_q,
@@ -5858,21 +6048,35 @@ def build_parser() -> argparse.ArgumentParser:
              f"<--d-rank-perf-tune>, the runtime's own per-task optimizer. "
              f"'decode-bs1' and 'decode-bs6' (#1241) add the OPERATING-POINT "
              f"axis to the same solve and are the only two arms that emit an "
-             f"EXPLICIT --rank-tp-ratio vector: a bs=1 decode round is "
-             f"bandwidth-bound and its vector is the measured membw_gbs ratio, "
-             f"a bs=6 round is compute-bound and its vector is the measured "
+             f"EXPLICIT --rank-tp-ratio vector: the bs=1 arm's vector is the "
+             f"measured membw_gbs ratio, the bs=6 arm's is the measured "
              f"gemm_tflops ratio -- both from this rig's card-rate library, by "
-             f"card NAME, with no hand number anywhere in the derivation. They "
-             f"are needed because neither 'auto' nor 'auto-performance' moves "
-             f"the attention/GDN split (uneven_perf.py:6571) and that split IS "
-             f"the operating-point question. A position whose vector would give "
-             f"any rank ZERO heads of a family, or would need an env pin to be "
-             f"honoured, is REFUSED (W52/W53/W54) rather than shipped. "
+             f"card NAME, with no hand number anywhere in the derivation. "
+             f"BOTH REGIME PREMISES ARE UNPROVEN ON THIS RIG: that a bs=1 "
+             f"round is bandwidth-bound and a bs=6 round compute-bound is "
+             f"exactly the quantity the #1241 decode compute/wait clock "
+             f"measures, and no boot has run it yet -- so these two arms are "
+             f"hypotheses with a derivation, not measurements, and the "
+             f"D-OPERATING-POINTS line says so per row. They are needed "
+             f"because neither 'auto' nor 'auto-performance' moves the "
+             f"attention/GDN split (uneven_perf.py:6571) and that split IS the "
+             f"operating-point question. A position is REFUSED rather than "
+             f"shipped when the card-rate library cannot price it (W52), when "
+             f"its vector SATURATES a family -- a rank's proportional share "
+             f"below one unit, so partition_units floors it and the axis is "
+             f"pinned at its floor -- or resolves FLAT, which is even TP "
+             f"wearing an uneven flag (W53), when it would need an env pin to "
+             f"be honoured (W54), or when PerfCostModel.predict_capacity marks "
+             f"it feasible=False (W55). A rank with ZERO heads is NOT among "
+             f"them and never was: partition_units guarantees every rank at "
+             f"least one unit, so that check could not fire. "
              f"Whatever is chosen, the launcher prints the WEG2 D-WEIGHTS line "
              f"naming the objective, the weight vector, the per-rank head "
              f"partition and the estimated cost at the attention barrier, PLUS "
              f"the WEG2 D-OPERATING-POINTS line carrying ALL THREE vectors "
-             f"with their priced round cost and world pool -- on every boot, "
+             f"with their priced round cost, world pool, FUNDED CONTEXT "
+             f"(min(sum P, 64 min P), the bound the smallest rank sets) and "
+             f"the model's feasible verdict -- on every boot, "
              f"including the default one, so the trade is readable per boot. "
              f"No arm is silent and no arm is solved here.",
     )

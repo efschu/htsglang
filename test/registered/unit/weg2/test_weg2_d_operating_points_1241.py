@@ -75,16 +75,37 @@ class FakeLibrary:
 
 
 class FakePCM:
-    """The runtime's cost model, reduced to what this solve calls on it."""
+    """The runtime's cost model, reduced to what this solve calls on it.
+
+    ``gdn_unit_partition`` and the full ``predict_capacity`` dict are here
+    because the SOLVE calls them, not because a test wants them: the review's
+    R2 (a diagnostic that raises on the default boot) and the refuter's MF-4
+    (``feasible`` and ``ctx`` read and discarded) are both defects of calling
+    the runtime's objects through a narrower fake than the runtime's own
+    surface. A fake narrower than the real object hides exactly this class.
+    """
 
     q_heads = SB5E_Q_HEADS
     #: 12 o_groups x scale 2 = the 24 q-heads the boot line reports.
     attn_units = 12
     gdn_units = SB5E_GDN_UNITS
     mlp_units = 32
+    tp_size = 3
+    #: What `predict_capacity` reports. Overridden by the infeasible fake.
+    feasible = True
 
-    def __init__(self, *_args, **_kwargs):
-        pass
+    def __init__(self, inputs=None, *_args, **_kwargs):
+        #: Kept so a test can assert WHICH configuration was priced.
+        self.inputs = inputs
+
+    def gdn_unit_partition(self, attn_vector=None):
+        """The runtime's own: `[0] * tp_size` when it will not shard."""
+        from sglang.srt.distributed.utils import partition_units
+
+        n = len(attn_vector) if attn_vector else self.tp_size
+        if int(self.gdn_units) >= n:
+            return partition_units(int(self.gdn_units), list(attn_vector))
+        return [0] * n
 
     def decode_round_time(self, mlp, membw, gemv=None, attn=None):
         # The roofline shape: slowest rank's shard bytes over its bandwidth.
@@ -94,7 +115,56 @@ class FakePCM:
         return max(m / g for m, g in zip(mlp, gemm)) / 1000.0
 
     def predict_capacity(self, mlp, attn=None, token_vector=None):
-        return {"p": [10000.0 * m for m in mlp], "ctx": 1.0}
+        p = [10000.0 * m for m in mlp]
+        # The runtime's own funded-context formula (uneven_perf.py:4881):
+        # bounded by the SMALLEST rank, which is why a vector that collapses
+        # one rank barely moves sum(p) and can halve this.
+        ctx = min(sum(p), 64 * min(p)) if self.feasible else 0.0
+        return {
+            "p": p,
+            "ctx": ctx,
+            "token_vector": None,
+            "feasible": self.feasible,
+            "weights_gib": [0.0 for _ in mlp],
+        }
+
+
+class SmallGdnPCM(FakePCM):
+    """A checkpoint whose GDN family is BELOW the world size.
+
+    ``partition_units`` RAISES for it (`units < len(weights)`), which is the
+    review's R2: the first version guarded with `gdn_units > 1`, true here,
+    and the call sat outside every try/except on a path the DEFAULT boot
+    walks.
+    """
+
+    gdn_units = 2
+
+
+class InfeasiblePCM(FakePCM):
+    feasible = False
+
+
+class SmallestRankBoundPCM(FakePCM):
+    """A rig where the funded context is bound by the SMALLEST rank.
+
+    ``ctx = min(sum_r P_r, 64 * min_r P_r)``. Whenever the second term wins,
+    ``sum(p)`` and the funded context are numerically different quantities --
+    which is the whole reason the row carries both. A fake in which they can
+    never diverge could not tell a correct row from one that prints
+    ``sum(p)`` under both labels.
+    """
+
+    def predict_capacity(self, mlp, attn=None, token_vector=None):
+        # One rank collapsed: 64 x its P is far below the world sum.
+        p = [100000.0, 100000.0, 10.0]
+        return {
+            "p": p,
+            "ctx": min(sum(p), 64 * min(p)),
+            "token_vector": None,
+            "feasible": True,
+            "weights_gib": [0.0 for _ in mlp],
+        }
 
 
 def _patched(library=FakeLibrary, pcm=FakePCM):
@@ -108,8 +178,8 @@ def _patched(library=FakeLibrary, pcm=FakePCM):
 
 
 class OperatingPointVectorTest(unittest.TestCase):
-    def rows(self, budgets=None, facts=None, library=FakeLibrary):
-        p1, p2 = _patched(library=library)
+    def rows(self, budgets=None, facts=None, library=FakeLibrary, pcm=FakePCM):
+        p1, p2 = _patched(library=library, pcm=pcm)
         kw = {} if facts is None else {"facts": facts}
         with p1, p2:
             return d_operating_point_rows(
@@ -181,18 +251,32 @@ class OperatingPointVectorTest(unittest.TestCase):
             model="/model",
             budgets=SB5E_BUDGETS,
         )
-        try:
-            with_axis = argv_d(
-                common["py"], common["model"], common["budgets"], 8, 4096, 64, [], 6,
-                262144, 32768, 2, False, dec.flags, (), 785500001, 4, 512,
-            )
-            pre_1241 = argv_d(
-                common["py"], common["model"], common["budgets"], 8, 4096, 64, [], 6,
-                262144, 32768, 2, False, ("--rank-tp-ratio", "auto"), (), 785500001,
-                4, 512,
-            )
-        except TypeError as exc:  # signature drifted; the flags claim still holds
-            self.skipTest("argv_d signature changed: %s" % exc)
+        # NO skipTest HERE (review R7). A `except TypeError: skipTest` made
+        # the byte-identity proof disappear silently on the next signature
+        # change instead of going red -- and this is the whole argv-level
+        # guarantee that the default path did not move. Call by KEYWORD so a
+        # reordering cannot break it, and let a genuine signature change fail
+        # loudly, which is the only way anyone learns the proof needs redoing.
+        kw = dict(
+            py=common["py"],
+            model=common["model"],
+            budgets=common["budgets"],
+            s_gb=8,
+            m_mib=4096,
+            store_gib=64,
+            extra=[],
+            d_bs=6,
+            max_kv_per_request=262144,
+            x_tokens=32768,
+            num_continuous_decode_steps=2,
+            disable_overlap=False,
+            token_vector_flags=(),
+            random_seed=785500001,
+            barlink_cap_cycles=4,
+            census_interval=512,
+        )
+        with_axis = argv_d(tp_ratio_flags=dec.flags, **kw)
+        pre_1241 = argv_d(tp_ratio_flags=("--rank-tp-ratio", "auto"), **kw)
         self.assertEqual(with_axis, pre_1241)
         self.assertIn("auto", with_axis)
 
@@ -290,6 +374,202 @@ class OperatingPointVectorTest(unittest.TestCase):
                 )
         self.assertIn("W52", str(ctx.exception))
         self.assertIn("was SHIPPED", str(ctx.exception))
+
+    # -- R2: a diagnostic on the default path must not RAISE ---------------
+
+    def test_MUTANT_9_a_GDN_family_below_the_world_size_does_not_KILL_the_boot(self):
+        """`partition_units` raises when `units < len(weights)`. The first
+        version guarded GDN with `> 1` -- true for a 2-unit family on 3 ranks
+        -- and the call sat outside every try/except in a function the
+        DEFAULT maxkv boot calls unconditionally. A line that prints a trade
+        must not be able to stop a launch that took neither side of it."""
+        rows, refusals = self.rows(pcm=SmallGdnPCM)
+        self.assertEqual(
+            [r.position for r in rows], ["maxkv", "decode-bs1", "decode-bs6"]
+        )
+        for row in rows:
+            self.assertEqual(
+                row.gdn_heads,
+                tuple(),
+                "a family the runtime answers [0,0,0] for was reported as sharded",
+            )
+            # AND THE ROW IS STILL PRICED. Not raising is only half the fix:
+            # a bare try/except around the raising call would also survive
+            # this, by swallowing the geometry and reporting every arm
+            # UNPRICED -- the diagnostic silently gone on exactly the models
+            # that need it. The predicate has to keep the OTHER families
+            # working, which is why it is the runtime's predicate and not a
+            # catch. (This assertion is what mutant M15 -- restore
+            # `gdn_units > 1` + a raw partition_units -- fails on.)
+            self.assertTrue(row.attn_heads, "%s lost its attention geometry" % row.position)
+            self.assertNotIn("geometry:", row.round_unit)
+            self.assertIsNotNone(row.round_ms, row.position)
+            self.assertIsNotNone(row.world_pool_tokens, row.position)
+        # And the whole decision, which is what a boot actually calls.
+        p1, p2 = _patched(pcm=SmallGdnPCM)
+        with p1, p2:
+            dec = d_tp_ratio_decision(
+                D_TP_OBJECTIVE_DEFAULT, "both", CARDS, SB5E_BUDGETS, "/model", 6
+            )
+        self.assertEqual(dec.flags, ("--rank-tp-ratio", "auto"))
+        self.assertIn("WEG2 D-OPERATING-POINTS", dec.op_line)
+
+    def test_a_GDN_family_the_runtime_will_not_shard_earns_NO_W53(self):
+        """The saturation check used the weaker `<= 1` predicate, so it could
+        refuse a position over an axis that does not exist on this
+        checkpoint -- a false refusal, which for a SHIPPED position is a
+        boot blocker."""
+        _rows, refusals = self.rows(pcm=SmallGdnPCM)
+        self.assertEqual(
+            [r for r in refusals if "GDN" in r and r.startswith("W53")],
+            [],
+            refusals,
+        )
+
+    # -- MF-4: feasibility and the FUNDED context ---------------------------
+
+    def test_MUTANT_10_an_INFEASIBLE_vector_is_REFUSED_not_shipped(self):
+        """`predict_capacity` returns `feasible`; the first version read only
+        `p`. An infeasible vector was printed with a world-pool number and
+        shipped."""
+        _rows, refusals = self.rows(pcm=InfeasiblePCM)
+        w55 = [r for r in refusals if r.startswith("W55")]
+        self.assertEqual(len(w55), 2, refusals)
+        for r in w55:
+            self.assertIn("feasible=False", r)
+        # ...and it is FATAL for the position that is shipped, and only then.
+        p1, p2 = _patched(pcm=InfeasiblePCM)
+        with p1, p2:
+            with self.assertRaises(Weg2LaunchRefused) as ctx:
+                d_tp_ratio_decision(
+                    "decode-bs6", "both", CARDS, SB5E_BUDGETS, "/model", 6
+                )
+        self.assertIn("W55", str(ctx.exception))
+        p1, p2 = _patched(pcm=InfeasiblePCM)
+        with p1, p2:
+            dec = d_tp_ratio_decision(
+                "maxkv", "both", CARDS, SB5E_BUDGETS, "/model", 6
+            )
+        self.assertEqual(dec.flags, ("--rank-tp-ratio", "auto"))
+
+    def test_MUTANT_11_the_line_carries_the_FUNDED_context_not_only_sum_p(self):
+        """`sum(p)` is the wrong invariant on its own: the funded context is
+        `min(sum P, 64 min P)`, bounded by the SMALLEST rank, so a vector
+        that collapses one rank barely moves the sum and can halve the
+        quantity a carrier bound is actually about."""
+        rows, refusals = self.rows()
+        line = d_operating_point_line(rows, refusals, "maxkv")
+        self.assertIn("funded ctx", line)
+        self.assertIn("feasible", line)
+        for r in rows:
+            self.assertIsNotNone(r.funded_ctx_tokens, r.position)
+            self.assertIs(r.feasible, True, r.position)
+        # The two must be able to DISAGREE, or carrying both is decoration:
+        # on a rig where one rank collapses, the world pool barely moves and
+        # the funded context is 64 x the smallest rank.
+        rows2, _ = self.rows(pcm=SmallestRankBoundPCM)
+        for r in rows2:
+            self.assertEqual(r.world_pool_tokens, 200010)
+            self.assertEqual(r.funded_ctx_tokens, 640)
+        line2 = d_operating_point_line(rows2, [], "maxkv")
+        self.assertIn("world pool 200010, funded ctx 640", line2)
+
+    # -- MF-3 / MF-5: the claims the numbers cannot carry -------------------
+
+    def test_the_bs6_price_does_NOT_claim_per_rank_family_GEMM_scores(self):
+        """`family_tflops` is passed as None, so #475's `sum_fam max_rank`
+        degenerates to `max_rank sum_fam`. Claiming the per-(rank, family)
+        scores while passing None is a claim the arithmetic does not carry."""
+        import inspect
+
+        from sglang.srt.weg2 import launcher as lz
+
+        rows, _ = self.rows()
+        unit = next(r for r in rows if r.position == "decode-bs6").round_unit
+        self.assertIn("PER-CARD scalar", unit)
+        self.assertIn("family_tflops=None", unit)
+        src = inspect.getsource(lz.d_operating_point_rows)
+        self.assertNotIn("#324 per-(rank, family)", src)
+
+    def test_the_bs6_regime_premise_is_marked_UNPROVEN_on_the_row_and_in_help(self):
+        """"a bs=6 round is compute-bound" is the very quantity slice (1)
+        measures, and slice (1) has produced no measurement. An argv-affecting
+        arm may not present a hypothesis as a finding."""
+        import argparse
+        import inspect
+
+        from sglang.srt.weg2 import launcher as lz
+
+        rows, _ = self.rows()
+        unit = next(r for r in rows if r.position == "decode-bs6").round_unit
+        self.assertIn("BOOT-UNPROVEN", unit)
+        src = inspect.getsource(lz)
+        i = src.index('"--d-tp-objective"')
+        help_text = src[i : i + 4000]
+        self.assertIn("BOTH REGIME PREMISES ARE UNPROVEN", help_text)
+        del argparse
+
+    def test_the_help_no_longer_promises_the_ZERO_HEADS_refusal(self):
+        """W53 is a SATURATION check. The zero-head check it replaced could
+        never fire -- `partition_units` guarantees >= 1 unit per rank -- so a
+        help text promising it documents a guard that does not exist."""
+        import inspect
+
+        from sglang.srt.weg2 import launcher as lz
+
+        src = inspect.getsource(lz)
+        i = src.index('"--d-tp-objective"')
+        help_text = src[i : i + 4000]
+        self.assertNotIn("would give any rank ZERO heads of a family", help_text)
+        self.assertIn("SATURATES", help_text)
+        self.assertIn("W55", help_text)
+
+    # -- MF-6: one writer for the boot's own spec/KV facts ------------------
+
+    def test_MUTANT_12_the_priced_config_is_the_SHIPPED_config_not_a_copy(self):
+        """Four literals (`fp8_e4m3`, `NEXTN`, 3 draft tokens) stood in the
+        argv builder AND in both PlanInputs blocks. They agreed by typing,
+        not by construction, so moving the shipped draft-token count -- which
+        #1242 is already doing -- would have gone on pricing the OLD
+        configuration on every boot, silently."""
+        from sglang.srt.weg2.launcher import (
+            KV_CACHE_DTYPE,
+            SPEC_ALGORITHM,
+            SPEC_NUM_DRAFT_TOKENS,
+            argv_d,
+            d_plan_inputs,
+        )
+
+        argv = argv_d(
+            py="python3", model="/model", budgets=SB5E_BUDGETS, s_gb=8, m_mib=4096,
+            store_gib=64, extra=[], d_bs=6,
+        )
+        i = argv.index("--speculative-num-draft-tokens")
+        self.assertEqual(argv[i + 1], str(SPEC_NUM_DRAFT_TOKENS))
+        self.assertEqual(argv[argv.index("--speculative-algorithm") + 1],
+                         SPEC_ALGORITHM)
+        self.assertEqual(argv[argv.index("--kv-cache-dtype") + 1], KV_CACHE_DTYPE)
+        inputs = d_plan_inputs("/model", 3, 6)
+        self.assertEqual(inputs.speculative_num_draft_tokens, SPEC_NUM_DRAFT_TOKENS)
+        self.assertEqual(inputs.speculative_algorithm, SPEC_ALGORITHM)
+        self.assertEqual(inputs.kv_cache_dtype, KV_CACHE_DTYPE)
+        # And the rows really price THAT object, not a second literal block.
+        p1, p2 = _patched()
+        with p1, p2:
+            rows, _ = d_operating_point_rows(CARDS, SB5E_BUDGETS, "/model", 6)
+        self.assertTrue(rows)
+
+    def test_the_spec_and_KV_literals_have_exactly_ONE_writer_each(self):
+        import inspect
+
+        from sglang.srt.weg2 import launcher as lz
+
+        src = inspect.getsource(lz)
+        self.assertEqual(src.count('"NEXTN"'), 1, "NEXTN typed more than once")
+        self.assertEqual(
+            src.count('speculative_num_draft_tokens=3'), 0,
+            "a PlanInputs block still types the draft-token count",
+        )
 
     def test_an_unknown_objective_still_refuses_W47(self):
         with self.assertRaises(Weg2LaunchRefused) as ctx:
