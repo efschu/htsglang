@@ -2696,6 +2696,16 @@ def run_leg(
             log(note)
             if hasattr(first, "add_note"):
                 first.add_note(note)
+        # WHAT THIS LEG MEASURED SURVIVES ITS DEATH (#1273 S5c).  The lane that
+        # raised is usually the lane that WAITED -- a drain that never drained,
+        # a fill that never filled -- so the wall the caller most needs to
+        # price is precisely the one a bare ``raise`` throws away.  The partial
+        # result rides on the exception rather than being returned, because a
+        # failed leg must not read as a completed one at any call site that
+        # ignores the attribute.
+        result.pairs = pair_stats
+        result.oncard = oncard_stats if on_card else None
+        setattr(first, "weg2_leg_result", result)
         vote_failure(first)
         raise first
 
