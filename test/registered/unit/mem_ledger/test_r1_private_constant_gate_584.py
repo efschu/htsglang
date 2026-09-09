@@ -209,6 +209,23 @@ KNOWN = {
         "via SGLANG_PHASE_FLIP_ARMING_MARGIN_MIB, so it is at least not a "
         "silent constant."
     ),
+    "weg2/launcher.py::P_CORRIDOR_HOLDBACK_MIB": (
+        "NOT A DEMAND DECISION, a TRANSCRIPTION of one the runtime already "
+        "made (#1286). It is the boot's own 'gapped corridor holdback' post, "
+        "read off the success-path line model_runner_kv_cache_mixin.py:1174 "
+        "and measured at 1.000 GiB on every rank of boots weg2sb5f and "
+        "weg2rg6. The launcher does not decide it; it charges it, so that the "
+        "cut ranking prices what the boot will then size. Overridable with "
+        "--pp-cut-corridor-holdback-mib."
+    ),
+    "weg2/launcher.py::P_PREFILL_ACTIVATION_RESERVE_MIB": (
+        "NOT A DEMAND DECISION, a TRANSCRIPTION of one the runtime already "
+        "made (#1286). It is the boot's own 'prefill activation reserve' "
+        "post, from the same emitted line, measured at 1.000 GiB on every "
+        "rank of both reference boots. Leaving it unbooked is what made the "
+        "pool model publish 499,967 tokens for a cut group P sized at "
+        "304,655. Overridable with --pp-cut-activation-reserve-mib."
+    ),
 }
 
 
