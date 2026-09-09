@@ -509,6 +509,13 @@ class MambaComponent(TreeComponent):
                     # so the whole match is zeroed.
                     self._log_mamba_slot_starvation("mamba (prefix-resume COW)")
                     return zero_match_result(self.cache, result)
+                # #Q0 (b): the COW acquire was the other uninstrumented draw.
+                note_924d(
+                    "alloc_cow",
+                    rid=getattr(req, "rid", None),
+                    slot=dst_index,
+                    extra="site=finalize_match_result",
+                )
                 req.mamba_pool_idx = dst_index[0]
                 # #991: acquired speculatively by THIS admission round's match.
                 # If `add_one_req` then rejects the request, scheduler.py's
@@ -824,6 +831,13 @@ class MambaComponent(TreeComponent):
             slot = self.cache.req_to_token_pool.mamba_allocator.alloc(1)
             if slot is None:
                 self._log_mamba_slot_starvation("mamba")
+        # #Q0 (b): CLOSE THE STATION COVERAGE HOLE. `station=alloc` was emitted
+        # ONLY from scheduler.py, so every draw inside this component was
+        # invisible -- which is why the weg2sn5n specimen's orphaned slot 26
+        # appeared in NO station line and could only be reached by elimination.
+        # A draw that never shows up cannot be traced to the owner that lost it.
+        if slot is not None:
+            note_924d("alloc_component", slot=slot, extra="site=_alloc_mamba_slot")
         elif peer_needs_mamba_evict(self.cache):
             # #639b: this rank had a slot, a peer did not. The peer is
             # tombstoning a mamba node right now; skipping the eviction here
@@ -1211,14 +1225,50 @@ class MambaComponent(TreeComponent):
                 return
 
             if self.enable_mamba_extra_buffer:
-                keep_idx = (
-                    pool.get_mamba_ping_pong_keep_idx(req)
-                    if mamba_value_inserted
-                    else None
+                # #Q0 THE DONATION REPLACES THE BUFFER ENTRY, SO NOTHING IN THE
+                # BUFFER BELONGS TO THE TREE. `donate_mamba_ping_pong_slot`
+                # (memory_pool.py) returns the OLD slot -- that is what the tree
+                # takes -- and writes a FRESHLY ALLOCATED `new_slot` back into
+                # `buf[donate_idx]`, which the REQUEST owns and must return.
+                #
+                # This branch used to recompute that same index as `keep_idx`
+                # and hand it to `free_mamba_cache`, which then skipped freeing
+                # it. The tree owned the old slot, the request's fresh
+                # replacement was kept for nobody: not on the free list, not in
+                # any node. Exactly ONE orphaned slot per finished request whose
+                # donation the tree accepted -- measured on boot weg2sn5n
+                # (`leaked_mamba_pages={26}`, all three D ranks, on_idle) and on
+                # ARM 3 before it (`={16}` after a single 24k direct prefill).
+                # Only NEW long prefixes trip it: a request landing on an
+                # existing prefix takes `mamba_exist=True`, and that path never
+                # donated.
+                #
+                # THE KEEP SEMANTICS ARE INHERITED AND WERE INVALIDATED BY THE
+                # PORT, not merely lost. The sibling this component replaced
+                # (`mamba_radix_cache.py:746-761`) takes the tree's value from
+                # the buffer IN PLACE and allocates nothing:
+                #     src_active  = req.mamba_ping_pong_track_buffer[keep_idx]
+                #     mamba_value = src_active.clone()
+                # There "keep buf[keep_idx]" is exactly right, because the tree
+                # really does own that entry. The unified port added the fresh
+                # allocation and the in-place replacement while carrying the
+                # sibling's keep_idx across -- and the replacement is precisely
+                # what makes it false.
+                #
+                # The int8 branch above already frees both entries (it passes no
+                # keep index) and releases its own unused donation; this brings
+                # the plain extra-buffer branch to the same rule rather than
+                # inventing a second ledger for it.
+                donated = (
+                    insert_params.mamba_value if insert_params is not None else None
                 )
-                pool.free_mamba_cache(
-                    req, mamba_ping_pong_track_buffer_to_keep=keep_idx
-                )
+                if not mamba_value_inserted and donated is not None:
+                    # The tree refused the donation. The old slot already left
+                    # the buffer, so `free_mamba_cache` cannot reach it and
+                    # nothing else owes it back -- the same omission the plain
+                    # path carried until #929.
+                    self._free_mamba_value(donated)
+                pool.free_mamba_cache(req, mamba_ping_pong_track_buffer_to_keep=None)
                 return
 
             if not mamba_value_inserted:

@@ -621,6 +621,37 @@ class SchedulerInvariantChecker:
                 f", leaked_full_pages={leaked_full_pages or None}"
                 f", leaked_mamba_pages={leaked_mamba_pages or None}"
             )
+            # #Q0 (b): NAME THE OWNER, NOT JUST THE SLOT. The weg2sn5n specimen
+            # reported `leaked_mamba_pages={26}` and nothing else, and the slot
+            # appeared in no station line, so the orphaning site could only be
+            # reached by elimination across a dozen candidate paths. The
+            # allocator already carries both answers -- `slot_used` (its own
+            # ownership ledger) and the #1033b provenance book (last event per
+            # slot, with the releaser's stack) -- and this report consulted
+            # neither. It is the same complaint #1033b makes about
+            # `_refuse_double_free`: the instrument names the visible party,
+            # not the responsible one.
+            if leaked_mamba_pages:
+                details = []
+                book = getattr(mamba_allocator, "_slot_provenance", None) or {}
+                used = getattr(mamba_allocator, "slot_used", None)
+                open_group = getattr(mamba_allocator, "_alloc_iter", None) is not None
+                for slot in sorted(leaked_mamba_pages):
+                    try:
+                        is_used = bool(used[slot]) if used is not None else None
+                    except Exception:  # noqa: BLE001
+                        is_used = None
+                    ev = book.get(slot) or {}
+                    where = (ev.get("where") or "").strip().replace("\n", " | ")
+                    details.append(
+                        f"slot={slot} slot_used={is_used} "
+                        f"last_event={ev.get('kind')}@seq{ev.get('seq')} "
+                        f"releaser={where[-400:] if where else 'none-recorded'}"
+                    )
+                msg += (
+                    f", mamba_leak_owners=[{'; '.join(details)}]"
+                    f", alloc_group_open={open_group}"
+                )
         return leak, msg
 
     def _check_mamba_pool_with_int8(self, ps: PoolStats, ckpt_pool) -> Tuple[bool, str]:
