@@ -1316,6 +1316,26 @@ class ShadowResult:
     oncard_slots: int = 0
     oncard_slots_source: str = "caller"
     oncard_deposit_mib: float = 0.0
+    #: S6 fix D.  THE COPY ARM, WHICH WAS COMPUTED AND THEN DROPPED.  Boot
+    #: weg2shadowD: ``oncard_copy_gbps`` / ``oncard_copy_ms`` were 0 hits in
+    #: both rank logs while ``oncard_slots_source`` / ``_hop_ms_priced`` /
+    #: ``_deposit_mib`` printed 15 times each.  The emitter was not missing --
+    #: :meth:`tp.OncardLane.tokens` prints ELEVEN oncard tokens including both
+    #: -- but this class hand-copies a SUBSET of the lane's fields
+    #: (:1702-1716, :3146-3156) and these two were never added to the subset,
+    #: so ``tp.oncard_copy_gbps(mode)`` was called, handed to the planner and
+    #: discarded.  Second bookkeeping beside the lane's own tokens, and the
+    #: half that fell out is the half the boot ticket asked for.
+    #:
+    #: ``0.0`` IS A VALUE, NOT AN ABSENCE, and that is why it must print: on
+    #: the ``ipc`` arm the copy is D2D and already inside
+    #: ``ONCARD_PER_BATCH_MS``, so ``oncard_copy_gbps(mode)`` returns 0.0 BY
+    #: DESIGN (``weight_exchange_transport.py:259``).  A reader must be able to
+    #: tell "the ipc arm prices no separate copy" from "nobody priced it";
+    #: omitting the field made those two identical, which is the whole defect
+    #: class this fix round is about.
+    oncard_copy_gbps: float = 0.0
+    oncard_copy_ms: float = 0.0
     direction: str = "?"
     ran: bool = False
     reason: str = ""
@@ -1427,6 +1447,8 @@ class ShadowResult:
             f"oncard_slots={self.oncard_slots} "
             f"oncard_slots_source={self.oncard_slots_source} "
             f"oncard_deposit_mib={self.oncard_deposit_mib:g} "
+            f"oncard_copy_gbps={self.oncard_copy_gbps:g} "
+            f"oncard_copy_ms={self.oncard_copy_ms:.1f} "
             f"oncard_hop_ms_priced={ms(self.oncard_hop_ms_priced)} "
             f"oncard_ms={self.oncard_ms:.3f} cross_ms={self.cross_ms:.3f} "
             f"ring_ms={ms(self.ring_ms)} compare_ms={self.compare_ms:.3f} "
@@ -1702,6 +1724,10 @@ def shadow_transport(
         result.oncard_slot_mib = diag_slot / MIB
         result.oncard_batches = int(lane_priced.batches)
         result.oncard_hop_ms_priced = float(lane_priced.hop_ms)
+        # S6 fix D: the copy arm, from the SAME lane the hop came from, so the
+        # line cannot name one model's hop beside another model's copy.
+        result.oncard_copy_gbps = float(lane_priced.copy_gbps)
+        result.oncard_copy_ms = float(lane_priced.copy_ms)
         # S6, on the same line and before the same gate: the deposit's shape.
         result.oncard_slots = int(oncard_slots)
         result.oncard_slots_source = ("store-forward-batches"
@@ -3153,6 +3179,10 @@ def run_leg_hook(
             result.oncard_deposit_mib = (diag_slots * diag_slot / MIB
                                          if store_forward else 0.0)
             result.oncard_hop_ms_priced = priced_ms
+            # S6 fix D: a refusal states its copy arm too -- a line that omits
+            # it cannot be told from a lane nobody priced.
+            result.oncard_copy_gbps = float(lane.copy_gbps)
+            result.oncard_copy_ms = float(lane.copy_ms)
             result.reason = "hop-over-bound"
             # THE ASYMMETRIC REFUSAL, PUBLISHED.  ``hop_ms`` is priced from
             # THIS CARD's diagonal, so one card can refuse while the other two
