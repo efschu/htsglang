@@ -12,6 +12,7 @@ the first test proves the quote: group D's budgets from boot weg2sb5e must
 reproduce that boot's own printed weight vector.
 """
 
+import dataclasses
 import os
 import unittest
 from unittest import mock
@@ -590,6 +591,309 @@ class OperatingPointVectorTest(unittest.TestCase):
         # The measured all-reduce is ABOVE the break-even, which is why the
         # family split is refused rather than taken.
         self.assertGreater(D705_AR_BS1_US[0], D705_FAMILY_SPLIT_BREAKEVEN_US)
+
+
+# --- #1293: THE ATTENTION AXIS OF THE OPERATING-POINT SOLVE ----------------
+#
+# THE FIXTURE IS BOOT weg2dec1 (BOOT_weg2dec1_0909.md, arms 2/3, 2026-09-09),
+# EVERY NUMBER QUOTED. Both operating-point positions were REFUSED at launch
+# with W53 on this rig:
+#
+#   arm 2 (decode-bs1): weights [58, 25, 25] from measured membw_gbs
+#     [1661.6, 716.2, 716.2]; "rank 1's share of the 4 attention units is
+#     below ONE unit ... the shipped partition [12, 6, 6] no longer
+#     represents the measured ratio" -> REFUSED
+#   arm 3 (decode-bs6): weights [3991, 1000, 1000] from measured gemm_tflops
+#     [203.4, 51.0, 51.0] -> same floor, same refusal.
+#
+# ROOT CLASS (#492 correction, #503's enumerator fix at placement.py:813):
+# under replicated-KV uneven DCP the attention COMPUTE follows the TOKEN
+# vector (continuous, 64 largest-remainder units), not the 4-kv-head-unit
+# grid -- the grid only carries the projections. Judging a measured rate
+# ratio against a grid its compute does not ride is the defect these tests
+# pin: today -> refused (proven on metal by that boot, and reproduced here by
+# MUTANT A's head-grid arm); after -> feasible priced vectors whose token
+# shares are proportional to the measurement.
+
+#: weg2dec1's own maxkv line: "maxkv weights [3669, 2267, 2265]". Budgets
+#: are 8x (gcd-reduced by the solve; gcd(3669, 2267, 2265) == 1).
+DEC1_BUDGETS = [29352, 18136, 18120]
+DEC1_MAXKV_WEIGHTS = (3669, 2267, 2265)
+#: The refusal's own derived weights, reproduced from LIB_* by
+#: test_the_two_positions... above: membw -> [58, 25, 25], gemm ->
+#: [3991, 1000, 1000] (the library carries 203.42/50.97; the boot line
+#: prints them rounded to 203.4/51.0).
+DEC1_BS1_WEIGHTS = (58, 25, 25)
+DEC1_BS6_WEIGHTS = (3991, 1000, 1000)
+#: partition_units(64, weights) -- largest-remainder over the SAME 64 token
+#: units the runtime's "Uneven DCP ... installed" vector uses
+#: (_CP_TOKEN_UNITS, distributed/utils.py).
+DEC1_BS1_TOKEN_UNITS = (34, 15, 15)
+DEC1_BS6_TOKEN_UNITS = (42, 11, 11)
+
+
+class Dec1PCM(FakePCM):
+    """The weg2dec1 checkpoint geometry: 4 attention units over 3 ranks.
+
+    ``predict_capacity`` honours ``token_vector`` with the runtime's OWN
+    pinned-vector formula (``cp_token_context_budget``), because the #1293
+    seam must be provably feeding the pin to the gate -- a fake that ignores
+    the kwarg could not tell "token vector computed" from "token vector
+    priced", which is exactly the #492 lesson (the price must reach the
+    gate, not be rounded away).
+    """
+
+    attn_units = 4
+    q_heads = 24
+    gdn_units = 16
+
+    def predict_capacity(self, mlp, attn=None, token_vector=None):
+        from sglang.srt.distributed.utils import cp_token_context_budget
+
+        p = [10000.0 * m for m in mlp]
+        if token_vector is not None:
+            ctx = float(
+                cp_token_context_budget(
+                    [max(int(v), 1) for v in token_vector],
+                    [max(int(x), 1) for x in p],
+                )
+            )
+        else:
+            ctx = min(sum(p), 64 * min(p)) if self.feasible else 0.0
+        return {
+            "p": p,
+            "ctx": ctx,
+            "token_vector": None,
+            "feasible": self.feasible,
+            "weights_gib": [0.0 for _ in mlp],
+        }
+
+
+class AttentionTokenAxis1293Test(unittest.TestCase):
+    def rows(self, budgets=None, library=FakeLibrary, pcm=Dec1PCM):
+        p1, p2 = _patched(library=library, pcm=pcm)
+        with p1, p2:
+            return d_operating_point_rows(
+                CARDS, budgets or DEC1_BUDGETS, "/model", 6
+            )
+
+    # -- the red half, statically: the head grid FLOORS this rig ----------
+
+    def test_the_head_grid_floors_ranks_1_and_2_exactly_as_weg2dec1_said(self):
+        """The defect's mechanism, held as a fact: on 4 attention units both
+        measured vectors give ranks 1 and 2 a sub-unit share. This is the
+        arithmetic behind both metal refusals, and it must STAY true -- the
+        fix moves the verdict to the axis the compute rides, it does not
+        bend the head grid."""
+        from sglang.srt.weg2.launcher import _axis_floor_ranks
+
+        self.assertEqual(_axis_floor_ranks(4, DEC1_BS1_WEIGHTS), (1, 2))
+        self.assertEqual(_axis_floor_ranks(4, DEC1_BS6_WEIGHTS), (1, 2))
+        # And the token grid does NOT floor them.
+        self.assertEqual(_axis_floor_ranks(64, DEC1_BS1_WEIGHTS), ())
+        self.assertEqual(_axis_floor_ranks(64, DEC1_BS6_WEIGHTS), ())
+
+    # -- the fix: both positions feasible on the token axis ----------------
+
+    def test_1293_both_weg2dec1_positions_are_FEASIBLE_priced_vectors(self):
+        """weg2dec1 arms 2/3 in fixture form: today's tree refuses both with
+        W53 ("pool-feasible, axis-infeasible"); after #1293 both must yield
+        a feasible priced vector, because on this rig's serving form
+        (replicated-KV uneven DCP) the attention compute rides the token
+        axis, where [58, 25, 25] and [3991, 1000, 1000] are representable."""
+        rows, refusals = self.rows()
+        self.assertEqual(refusals, [], refusals)
+        maxkv = next(r for r in rows if r.position == "maxkv")
+        bs1 = next(r for r in rows if r.position == "decode-bs1")
+        bs6 = next(r for r in rows if r.position == "decode-bs6")
+        self.assertEqual(maxkv.weights, DEC1_MAXKV_WEIGHTS)
+        self.assertEqual(bs1.weights, DEC1_BS1_WEIGHTS)
+        self.assertEqual(bs6.weights, DEC1_BS6_WEIGHTS)
+        for row in (bs1, bs6):
+            self.assertEqual(row.attn_axis, "token", row.position)
+            self.assertIs(row.feasible, True, row.position)
+            self.assertIsNotNone(row.round_ms, row.position)
+            self.assertIsNotNone(row.world_pool_tokens, row.position)
+            self.assertIsNotNone(row.funded_ctx_tokens, row.position)
+        # The projection split is still the head grid's [12, 6, 6] -- that
+        # split is REAL (the q/o projections do shard that way); what moved
+        # is which axis the family's COMPUTE is judged and priced on.
+        self.assertEqual(bs1.attn_heads, (12, 6, 6))
+
+    def test_1293_token_shares_are_proportional_to_the_measurement(self):
+        """Largest-remainder over the 64 token units, exactly the runtime's
+        own integerisation -- and the shares must SUM TO THE WORLD (the
+        owner rule hands out every one of the 64 units exactly once)."""
+        rows, _ = self.rows()
+        bs1 = next(r for r in rows if r.position == "decode-bs1")
+        bs6 = next(r for r in rows if r.position == "decode-bs6")
+        self.assertEqual(bs1.attn_token_units, DEC1_BS1_TOKEN_UNITS)
+        self.assertEqual(bs6.attn_token_units, DEC1_BS6_TOKEN_UNITS)
+        for row in (bs1, bs6):
+            units = row.attn_token_units
+            self.assertEqual(sum(units), 64, row.position)
+            total_w = sum(row.weights)
+            for r, (u, w) in enumerate(zip(units, row.weights)):
+                self.assertLess(
+                    abs(u - 64.0 * w / total_w),
+                    1.0,
+                    "rank %d of %s drifted a full unit off the measured "
+                    "ratio" % (r, row.position),
+                )
+
+    def test_1293_the_pinned_token_vector_REACHES_the_capacity_gate(self):
+        """#492's discipline: the pinned vector's funded context is
+        cp_token_context_budget(pin, P) -- strictly the weaker of the two --
+        and it must reach the gate, not be rounded away. mlp for
+        [58, 25, 25] on 32 units is [17, 8, 7] -> P = [170000, 80000, 70000];
+        matched ctx would be 320000, the pin funds
+        min(170000//34, 80000//15, 70000//15) * 64 = 4666 * 64 = 298624."""
+        rows, _ = self.rows()
+        bs1 = next(r for r in rows if r.position == "decode-bs1")
+        self.assertEqual(bs1.funded_ctx_tokens, 298624)
+        self.assertNotEqual(bs1.funded_ctx_tokens, 320000)
+        # maxkv keeps the derived-matched call (byte-identical default):
+        # mlp = partition_units(32, [3669, 2267, 2265]) = [14, 9, 9] ->
+        # P = [140000, 90000, 90000] -> min(320000, 64 * 90000) = 320000.
+        maxkv = next(r for r in rows if r.position == "maxkv")
+        self.assertEqual(maxkv.funded_ctx_tokens, 320000)
+
+    # -- MUTANT A: attention back on the head grid -------------------------
+
+    def test_1293_MUTANT_A_the_head_grid_arm_reproduces_the_metal_refusal(self):
+        """Forcing the axis back to "head" must reproduce weg2dec1's W53 for
+        both positions -- this is the red half of the slice, executable, and
+        the detector for the mutant that reverts the axis."""
+        p1, p2 = _patched(pcm=Dec1PCM)
+        with p1, p2, mock.patch(
+            "sglang.srt.weg2.launcher._attn_axis_for",
+            lambda weights, plan_flags: "head",
+        ):
+            _rows, refusals = d_operating_point_rows(
+                CARDS, DEC1_BUDGETS, "/model", 6
+            )
+        w53 = [r for r in refusals if r.startswith("W53")]
+        self.assertEqual(len(w53), 2, refusals)
+        for r in w53:
+            self.assertIn("attention", r)
+            self.assertIn("axis=head", r)
+            self.assertIn("below ONE unit", r)
+        self.assertIn("[58, 25, 25]", w53[0])
+        self.assertIn("[3991, 1000, 1000]", w53[1])
+
+    # -- MUTANT C: a non-DCP form must never take the token axis -----------
+
+    def test_1293_MUTANT_C_no_DCP_evidence_means_the_head_axis(self):
+        """The axis decision is #503's shared plan-time predicate
+        (plan_uneven_dcp_kv_replicated), never a third spelling: with no DCP
+        evidence on the flags (dcp_size unset, no KV token vector) even the
+        steepest weights ride the head grid, because there the token vector
+        does not exist."""
+        from sglang.srt.uneven_perf import PlanInputs
+        from sglang.srt.weg2.launcher import _attn_axis_for
+
+        bare = PlanInputs(tp_size=3, model_path="/m")
+        self.assertEqual(_attn_axis_for(DEC1_BS1_WEIGHTS, bare), "head")
+        armed = dataclasses.replace(bare, dcp_size=3)
+        self.assertEqual(_attn_axis_for(DEC1_BS1_WEIGHTS, armed), "token")
+        # A uniform plan is even DCP's fast path -- head axis even when armed.
+        self.assertEqual(_attn_axis_for((25, 25, 25), armed), "head")
+        # And a KV token vector alone is also DCP evidence (the predicate's
+        # own second arm), so the spelling here really is the shared one.
+        vec = dataclasses.replace(bare, kv_token_vector=[2, 1, 1])
+        self.assertEqual(_attn_axis_for(DEC1_BS1_WEIGHTS, vec), "token")
+
+    def test_1293_a_FLAT_vector_is_still_refused_whatever_the_axis(self):
+        flat = {
+            "NVIDIA GeForce RTX 5090": 100.0,
+            "NVIDIA GeForce RTX 3080": 100.0,
+        }
+        _rows, refusals = self.rows(
+            library=lambda: FakeLibrary(gemm=flat, membw=flat)
+        )
+        self.assertTrue(refusals)
+        self.assertIn("even TP wearing an uneven flag", " ".join(refusals))
+
+    # -- the refusal STAYS for a genuinely unrepresentable vector ----------
+
+    def test_1293_a_vector_the_TOKEN_grid_cannot_represent_is_still_W53(self):
+        """64 units floor a rank whose share is below 1/64 -- a ~1000:1 rate
+        ratio. The fix moves the verdict to the riding axis; it does not
+        delete the verdict."""
+        _rows, refusals = self.rows(
+            library=lambda: FakeLibrary(
+                gemm={
+                    "NVIDIA GeForce RTX 5090": 1000.0,
+                    "NVIDIA GeForce RTX 3080": 1.0,
+                },
+                membw={
+                    "NVIDIA GeForce RTX 5090": 1000.0,
+                    "NVIDIA GeForce RTX 3080": 1.0,
+                },
+            )
+        )
+        self.assertTrue(refusals)
+        for r in refusals:
+            self.assertTrue(r.startswith("W53"), r)
+            self.assertIn("axis=token", r)
+            self.assertIn("64", r)
+            self.assertIn("below ONE unit", r)
+
+    # -- MLP/GDN keep their own grids --------------------------------------
+
+    def test_1293_GDN_stays_on_its_own_unit_grid(self):
+        """partition_units(16, [58,25,25]) == [8,4,4] and
+        partition_units(16, [3991,1000,1000]) == [10,3,3]: the token axis
+        carries ONLY the attention compute; GDN (and MLP, asserted through
+        the funded-ctx number above, which prices mlp [17,8,7] of 32) keep
+        the grids the runtime shards them on."""
+        rows, _ = self.rows()
+        bs1 = next(r for r in rows if r.position == "decode-bs1")
+        bs6 = next(r for r in rows if r.position == "decode-bs6")
+        self.assertEqual(bs1.gdn_heads, (8, 4, 4))
+        self.assertEqual(bs6.gdn_heads, (10, 3, 3))
+
+    # -- the line names the axis, per row ----------------------------------
+
+    def test_1293_the_line_prints_attn_axis_and_token_units_per_row(self):
+        rows, refusals = self.rows()
+        line = d_operating_point_line(rows, refusals, "maxkv")
+        self.assertIn("attn_axis=token", line)
+        self.assertIn("token_units [34, 15, 15]", line)
+        self.assertIn("token_units [42, 11, 11]", line)
+        # The head grid still BINDS for the projections on this rig (4 units,
+        # ranks 1/2 floored) -- stated on the row instead of either silent or
+        # fatal.
+        self.assertIn("attention-projections/head grid BINDS", line)
+        # A head-axis form still says so.
+        from sglang.srt.uneven_perf import PlanInputs
+        from sglang.srt.weg2.launcher import _attn_axis_for
+
+        self.assertEqual(
+            _attn_axis_for((2, 1, 1), PlanInputs(tp_size=3, model_path="/m")),
+            "head",
+        )
+
+    def test_1293_the_default_maxkv_argv_is_STILL_byte_identical(self):
+        """The #1241 golden, re-run under the dec1 geometry: the axis work
+        must not move a single argv byte of the default."""
+        p1, p2 = _patched(pcm=Dec1PCM)
+        with p1, p2:
+            dec = d_tp_ratio_decision(
+                D_TP_OBJECTIVE_DEFAULT, "both", CARDS, DEC1_BUDGETS, "/model", 6
+            )
+        self.assertEqual(dec.flags, ("--rank-tp-ratio", "auto"))
+        self.assertIn("WEG2 D-OPERATING-POINTS", dec.op_line)
+        # And the previously-refused positions now DECIDE (the launch-level
+        # consequence: an operating-point boot on this rig gets a vector).
+        for pos, want in (
+            ("decode-bs1", "58,25,25"),
+            ("decode-bs6", "3991,1000,1000"),
+        ):
+            p1, p2 = _patched(pcm=Dec1PCM)
+            with p1, p2:
+                d = d_tp_ratio_decision(pos, "both", CARDS, DEC1_BUDGETS, "/model", 6)
+            self.assertEqual(d.flags, ("--rank-tp-ratio", want))
 
 
 if __name__ == "__main__":
