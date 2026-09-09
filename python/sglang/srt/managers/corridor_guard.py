@@ -814,11 +814,24 @@ def _resolve_transient_mib(
             # so on a rig where this recipe has never booted, on a cleared
             # cache, or after any change to the activation profile, the floor
             # is honestly unmeasured and the pass is verdict-only. It measures
-            # from the NEXT boot of the same recipe. Verified on this rig
-            # 2026-09-09: the phase footprints exist
-            # (phase_footprint-a191a0712717-055c2e4b0867.json, 1055/1097/858
-            # MiB) while the pointer does not, so every card reads the
-            # fallback until a boot publishes which digest it used.
+            # from the NEXT boot of the same recipe.
+            #
+            # STATE ON THIS RIG, 2026-09-09 (serve-next4 train), read from the
+            # files rather than from the earlier note that stood here: the
+            # pointer NOW EXISTS. It was seeded from boot weg2sb5h's own two
+            # dumps through :func:`publish_floor_profile`, so the FIRST boot of
+            # this recipe reads MEASURED floors:
+            #   P -> 055c2e4b0867 (chunk 4096, tp 1, pp 3, fp8_e4m3, spec 0,
+            #        decode_max_bs 24): 1055 / 1095 / 858 MiB
+            #   D -> cc0ac5caf91e (chunk 4096, tp 3, pp 1, fp8_e4m3, spec 3,
+            #        decode_max_bs 24):  767 /  700 / 701 MiB
+            # The earlier note in this comment read "1055/1097/858"; the file
+            # it named says 1095 on GPU-5c648f96, and the FILE is the
+            # instrument. THE SEED IS ONLY AS GOOD AS THE RECIPE MATCHING:
+            # this pointer is keyed by GROUP, not by profile, so a boot whose
+            # P or D profile differs from the tuple above would read another
+            # recipe's transient stamped MEASURED-*. Every boot republishes its
+            # own digest, so the pointer self-corrects from the second boot.
             return None, (
                 f"no activation profile published for group {group!r} at "
                 f"{_floor_digest_path()!r} (only a boot of that group writes "
