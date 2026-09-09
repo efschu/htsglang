@@ -5793,12 +5793,18 @@ class FlashInferAttnBackend(AttentionBackend):
             )
             # #1243 PRECISION TAIL: one extra PAGED call from the SAME
             # flashinfer wrapper family as the body, over the bf16 ring, merged
-            # by `_safe_merge_state` BEFORE the untouched cross-rank combine.
-            # The merge primitive is NOT interchangeable with the uneven-DCP
-            # LSE path: `_dcp_extend_final_merge` states in-tree that
-            # flashinfer's `merge_state` "uses a different internal convention
-            # and must NOT be used across these two sources". So tail<->body is
-            # intra-family `_safe_merge_state`; cross-rank stays `cp_lse_*`.
+            # NATURAL-LOG by `_kv_tail_lse_merge` BEFORE the untouched
+            # cross-rank combine.
+            #
+            # THIS USED TO CALL `_safe_merge_state`, and that cost boot
+            # weg2kvtail6. The old comment argued that both partials come from
+            # flashinfer wrappers, so `merge_state` is "intra-family" -- an
+            # argument about the INPUTS. The defect is in the OUTPUT: the `lse`
+            # returned here is consumed on the NEXT LINE by
+            # `cp_lse_ag_out_ar_mha_uneven`, which is pure natural log
+            # (dcp/comm.py:250-253). `merge_state` returns another convention,
+            # so the cross-rank weighting was computed in the wrong base on
+            # exactly the steps where the tail engages.
             # The per-layer collective count is UNCHANGED -- the extra call
             # takes no collective at all.
             o, lse = self._kv_tail_merge_decode(q_full, layer, o, lse)
@@ -5988,7 +5994,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 tail_empty.unsqueeze(1), torch.full_like(lse_t, neg_inf), lse_t
             )
             o_t = torch.where(tail_empty.view(-1, 1, 1), torch.zeros_like(o_t), o_t)
-        o, lse = _safe_merge_state(o, lse, o_t, lse_t)
+        o, lse = _kv_tail_lse_merge(o, lse, o_t, lse_t)
         if body_empty is not None and tail_empty is not None:
             both = body_empty & tail_empty
             lse = torch.where(both.unsqueeze(1), torch.full_like(lse, neg_inf), lse)
@@ -6588,6 +6594,45 @@ def _build_dcp_ragged_tree_mask(
 # (and thus ROCm/gfx900 and sm75). Imported at module scope above and aliased
 # here so every call site in this file stays byte-identical.
 _build_dcp_weighted_kv_indices = build_dcp_weighted_kv_indices
+
+
+def _kv_tail_lse_merge(o_a, lse_a, o_b, lse_b):
+    """#1243: merge two attention partials in NATURAL-LOG LSE.
+
+    NOT `_safe_merge_state`. Both partials come from flashinfer wrappers, so
+    using flashinfer's `merge_state` here looks same-family and is what boot
+    weg2kvtail6 shipped -- but the argument is about the INPUTS and the defect
+    is in the OUTPUT. `merge_state` returns an lse in its own internal
+    convention, and this function's result is consumed by
+    `cp_lse_ag_out_ar_mha_uneven` (dcp/comm.py:250-253), which is pure natural
+    log: `torch.logsumexp` and `torch.exp(lse - global_lse)`. Feeding it an lse
+    in another base makes the CROSS-RANK weighting wrong on exactly the steps
+    where the tail engages -- measured: bf16 body + bf16 tail, a form on which
+    the tail is mathematically inert, diverged on 20/20 passages and 79.54 % of
+    tokens starting at the first armed decode.
+
+    `_dcp_extend_final_merge` states the rule in-tree ("flashinfer's ragged
+    forward_return_lse also returns natural-log LSE ... flashinfer's
+    merge_state uses a different internal convention and must NOT be used
+    across these two sources"), and this is that same arithmetic, kept in ONE
+    place so the tail cannot drift into a second opinion of it. A test pins the
+    two equal.
+
+    `(o=0, lse=-inf)` is the empty-attention contract and is preserved: a side
+    with lse -inf contributes weight exp(-inf)=0, and two empty sides return
+    an empty partial rather than NaN.
+    """
+    lse_a32 = lse_a.float()
+    lse_b32 = lse_b.float()
+    final_lse = torch.logaddexp(lse_a32, lse_b32)
+    sc_a = torch.nan_to_num(
+        torch.exp(lse_a32 - final_lse), nan=0.0, posinf=0.0, neginf=0.0
+    ).unsqueeze(-1)
+    sc_b = torch.nan_to_num(
+        torch.exp(lse_b32 - final_lse), nan=0.0, posinf=0.0, neginf=0.0
+    ).unsqueeze(-1)
+    o = o_a.float() * sc_a + o_b.float() * sc_b
+    return o.to(o_a.dtype), final_lse.to(lse_a.dtype)
 
 
 def _kv_tail_position_lengths(paged_kernel_lens, min_tokens):

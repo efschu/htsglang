@@ -2525,3 +2525,74 @@ class TestMutantsKillNamedAssertions(CustomTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ---------------------------------------------------------------------------
+# T15 -- THE DISCRIMINATOR (user's objection, 2026-09-09).
+#
+# "20/20 passages, 79.54 % tokens" is NOT by itself evidence of a defect. The
+# body/tail split merged by LSE is not bitwise associative in float, so at
+# temperature 0 a near-tie can flip and the whole sequence cascades. So the
+# question is quantitative: is the tail path's deviation from plain attention
+# INSIDE the re-association bound, or decades above it?
+#
+# This measures it, in the shipped dtype regime (bf16 K/V storage, fp32
+# accumulation), and prints the table. It asserts only the DERIVED bound, so a
+# result either way is a result and no red is manufactured.
+# ---------------------------------------------------------------------------
+
+
+class TestTheReassociationBound(CustomTestCase):
+    H, D, N = 4, 128, 384
+    SCALE = 1.0 / (128 ** 0.5)
+    #: bf16 has 8 explicit mantissa bits -> relative step 2^-8 = 3.9e-3. The
+    #: split changes only the ORDER of an fp32 accumulation over identical bf16
+    #: inputs, so the expected |delta| is fp32-class (~1e-6) amplified by the
+    #: conditioning of the softmax weights, not bf16-class. 1e-2 is the
+    #: coordinator's stated 1e-3..1e-2 class ceiling.
+    BOUND = 1e-2
+
+    def _parts(self, seed, n_tail):
+        g = torch.Generator().manual_seed(seed)
+        q = torch.randn(self.H, self.D, generator=g)
+        k = torch.randn(self.N, self.H, self.D, generator=g).to(torch.bfloat16)
+        v = torch.randn(self.N, self.H, self.D, generator=g).to(torch.bfloat16)
+        return q, k, v
+
+    def test_the_split_stays_inside_the_reassociation_bound(self):
+        from sglang.srt.layers.attention.flashinfer_backend import _kv_tail_lse_merge
+
+        rows = []
+        worst = 0.0
+        for n_tail in (1, 2, 60):
+            for rank, seed in enumerate((0, 1, 2)):
+                q, k, v = self._parts(seed, n_tail)
+                # fp32 accumulation over bf16 storage, both sides.
+                def part(kk, vv):
+                    lg = torch.einsum("hd,nhd->hn", q.float(), kk.float()) * self.SCALE
+                    return (
+                        torch.einsum("hn,nhd->hd", torch.softmax(lg, -1), vv.float()),
+                        torch.logsumexp(lg, -1),
+                    )
+                o_b, lse_b = part(k[: self.N - n_tail], v[: self.N - n_tail])
+                o_t, lse_t = part(k[self.N - n_tail :], v[self.N - n_tail :])
+                o, _ = _kv_tail_lse_merge(o_b, lse_b, o_t, lse_t)
+                ref, _ = part(k, v)
+                d = (o - ref).abs()
+                mx, mean = float(d.max()), float(d.mean())
+                worst = max(worst, mx)
+                rows.append((n_tail, rank, mx, mean))
+        print("\nT15 RE-ASSOCIATION BOUND (bf16 K/V, fp32 accum), tail vs plain:")
+        print("  k    rank        max|d|       mean|d|")
+        for n_tail, rank, mx, mean in rows:
+            print(f"  {n_tail:<4} {rank:<4} {mx:14.3e} {mean:13.3e}")
+        print(f"  WORST max|d| = {worst:.3e}   derived bound = {self.BOUND:.1e}")
+        print(f"  a base-2/base-e lse confusion would be ~{1-0.6931:.2f} "
+              f"relative in the exponent, i.e. 0.1-nat class -- "
+              f"{0.1/max(worst,1e-12):.0f}x above this.")
+        self.assertLess(
+            worst, self.BOUND,
+            f"the tail path deviates by {worst:.3e}, above the "
+            f"{self.BOUND:.1e} re-association bound -- that is a DEFECT, not "
+            f"rounding",
+        )
