@@ -364,6 +364,9 @@ def sems(boot):
     xr.unlink_semaphores(boot)
 
 
+_UNSET = object()
+
+
 def byte_sum(ops: FakeDeviceOps):
     """A ``uint8_checksum``-shaped summer over the double's storage.
 
@@ -383,17 +386,28 @@ def byte_sum(ops: FakeDeviceOps):
 
 def _cross_round_trip(region, sems, ops, descs, *, pair, slot_bytes=SLOT,
                       budget_s=10.0, checksum_bytes=None, on_checksum=None,
-                      corrupt=None):
+                      corrupt=None, producer_checksum=_UNSET):
+    """``producer_checksum`` is separate on purpose.
+
+    SURVIVING MUTANT (this slice's own mutant E): deleting the
+    "a producer that published nothing is not compared against" guard left the
+    suite green, because the one test that named that case handed NEITHER side
+    a summer -- so ``_report_checksum`` returned at its FIRST guard and the one
+    under test was never reached.  The asymmetric arm is the whole case.
+    """
     pstats = tp.PairStats(*xr.CROSS_PAIRS[pair], "us", "ud")
     cstats = tp.PairStats(*xr.CROSS_PAIRS[pair], "us", "ud")
     errors: list = []
+
+    prod_sum = (checksum_bytes if producer_checksum is _UNSET
+                else producer_checksum)
 
     def produce():
         try:
             tp.run_producer_pair(region, sems, ops, ops.create_stream(0),
                                  pair=pair, descs=descs, stats=pstats,
                                  budget_s=budget_s, slot_bytes=slot_bytes,
-                                 checksum_bytes=checksum_bytes)
+                                 checksum_bytes=prod_sum)
         except BaseException as exc:  # noqa: BLE001
             errors.append(exc)
 
@@ -532,9 +546,16 @@ def test_a_producer_that_computed_nothing_is_not_compared_against(
     write(ops, src, payload)
     descs = [flat_desc(0, 1, len(payload), src_ptr=src, dst_ptr=dst, name="p")]
     reports: list = []
+    # THE ASYMMETRIC ARM: this consumer has a summer, the producer does not.
+    # Handing neither side one would return at _report_checksum's FIRST guard
+    # and never reach the one under test -- which is exactly how mutant E
+    # survived the first round.
     _cross_round_trip(region, sems, ops, descs, pair=0,
-                      checksum_bytes=None, on_checksum=reports.append)
-    assert reports == []
+                      checksum_bytes=byte_sum(ops), producer_checksum=None,
+                      on_checksum=reports.append)
+    assert reports == [], (
+        "this consumer compared its own real sum against a 0 the producer "
+        "never computed -- an unarmed instrument reading as a failed one")
     # And with BOTH halves armed the same payload does produce a report.
     region.release_slot(0, 0)
     reports2: list = []
