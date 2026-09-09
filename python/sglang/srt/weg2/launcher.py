@@ -57,7 +57,7 @@ from typing import Dict, List, Mapping, Optional, Sequence, Tuple
 
 from sglang.srt.weg2 import admin_key as admin_key_mod
 from sglang.srt.registry import nvml as nvml_registry
-from sglang.srt.weg2 import host_ledger, ring_table
+from sglang.srt.weg2 import corridor_budget, host_ledger, ring_table
 
 MIB = 1024 * 1024
 PORT_FRONT = 30030
@@ -3376,6 +3376,8 @@ def budgets_from_dc(
     label: str,
     overshoot_mib: Optional[List[int]] = None,
     overshoot_provenance: str = "",
+    corridor_sample_path: Optional[str] = None,
+    corridor_constrain: bool = False,
 ) -> List[int]:
     out = []
     for i, c in enumerate(cards):
@@ -3389,7 +3391,24 @@ def budgets_from_dc(
             + (f" - measured_awake_overshoot {over} ({overshoot_provenance})" if over else "")
             + " MiB"
         )
-    return out
+    if not corridor_constrain:
+        return out
+    # #1257 -- THE CORRIDOR LAW AS A HARD CONSTRAINT, applied here and nowhere
+    # else so this function stays the one producer of a budget number.  The
+    # subtraction above is a per-card EXPECTATION (CORRIDOR_MIB = 1024 + 404, a
+    # constant plus one cross-boot overshoot); the pass below is the same law
+    # checked against what the front's corridor sampler actually MEASURED under
+    # D-awake load, and it may only lower a budget or leave it untouched.  It
+    # refuses -- loudly, keeping today's budget byte-identical -- both when the
+    # inputs to price it are missing and when the only card that needs the
+    # margin is the one the world pool is bound by.
+    sample, why = corridor_budget.load_sample(corridor_sample_path)
+    solve = corridor_budget.solve_corridor_budgets(
+        cards, out, dc_mib, sample, why, group=label
+    )
+    for line in solve.lines:
+        log(line)
+    return list(solve.budgets)
 
 
 def _max_running_requests(model: str, group: str = "D", bs: int = 8) -> int:
@@ -5833,6 +5852,27 @@ def build_parser() -> argparse.ArgumentParser:
              + " Pass 1 to restore the shipped value.",
     )
     ap.add_argument(
+        "--corridor-budget-sample", default=corridor_budget.DEFAULT_SAMPLE_PATH,
+        help="#1257. PATH to the paired corridor/budget measurement group D's "
+             "budgets are corridor-constrained against -- not an on/off switch: "
+             "the 819-1229 MiB free-per-card corridor is the law for the Weg-2 "
+             "form, so the constraint is always on and only its INPUT is "
+             "selectable. The file pairs, for one boot, each card's NVML total, "
+             "the --rank-gpu-memory-mib it ran with, the dormant image of the "
+             "sleeping group, the driver carve-out, the front sampler's free "
+             "column idle AND under load, and that rank's profiled token "
+             "capacity; from those the pass derives the two terms the budget "
+             "line does not book (unbudgeted awake residue, load transient) and "
+             "the world pool C = min_r(P_r // v_r) * sum(v). A missing or "
+             "incomplete file -- or one whose rows do not pair with this "
+             "boot's card ordinals -- is a REFUSAL TO PRICE "
+             f"({corridor_budget.UNPRICED_NAME}), not a default: the budgets "
+             "then ship byte-identical and the log says so. The code is "
+             "interpolated from the module constant on purpose; a hand-typed "
+             "one here is exactly how front.py:556's 'W52 is free' comment "
+             "outlived the number it described.",
+    )
+    ap.add_argument(
         "--d-tp-objective", choices=list(D_TP_OBJECTIVE_CHOICES),
         default=D_TP_OBJECTIVE_DEFAULT,
         help=f"Group D only (#1017). WHICH OBJECTIVE group D's weight vector "
@@ -6568,7 +6608,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         log(f"DEVIATION (declared): {d}")
     launch_group(spec_p, tree, log, dry)
     if dry:
-        budgets_d = budgets_from_dc(cards, {c.uuid: dc_expect_d[c.uuid] + P_WINDOWS_MIB - D_WINDOWS_MIB for c in cards}, log, "D(dry, expectation)")
+        budgets_d = budgets_from_dc(cards, {c.uuid: dc_expect_d[c.uuid] + P_WINDOWS_MIB - D_WINDOWS_MIB for c in cards}, log, "D(dry, expectation)", corridor_sample_path=ns.corridor_budget_sample, corridor_constrain=True)
         d_ratio = d_tp_ratio_decision(
             ns.d_tp_objective, ns.d_rank_perf_tune, cards, budgets_d, ns.model, d_bs
         )
@@ -6633,7 +6673,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     # 5. group D
     budgets_d = budgets_from_dc(
-        cards, dc_p, log, "D", overshoot_mib=D_OVERSHOOT_MIB, overshoot_provenance="boot weg2ls4b1"
+        cards, dc_p, log, "D", overshoot_mib=D_OVERSHOOT_MIB, overshoot_provenance="boot weg2ls4b1",
+        corridor_sample_path=ns.corridor_budget_sample, corridor_constrain=True,
     )
     state.budgets["D"] = budgets_d
     d_ratio = d_tp_ratio_decision(

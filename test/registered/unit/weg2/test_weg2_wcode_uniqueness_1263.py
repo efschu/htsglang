@@ -16,6 +16,29 @@ THE CLASS, three instances in one day and every one found by a READER:
 A third hand-picked number would repeat it, so the enumeration is the guard
 rather than the fix: this file recomputes the census on every run.
 
+FOURTH INSTANCE, 2026-09-09 (#1257), and the reason the SCAN is hardened here
+rather than only the label fixed: the #1257 corridor pass claimed ``W52``,
+which #1290 already held at the base commit -- and this census reported 7/0/0
+anyway. Its pattern was ``W<nn>`` + WHITESPACE + ``Weg2<Name>``, and #1290
+writes the code in the two forms that have no whitespace after it:
+
+* CONCATENATED, ``front.py:560``: the name is built from the bare code plus a
+  separate marker constant, so a QUOTE follows the code, not a space.
+* COUNTER KEY, ``front.py:1980``/``:2602``: ``W52_Weg2NoServiceableRoute``, an
+  UNDERSCORE after the code.
+
+Both are read by a human grepping a boot log for ``W52`` and by neither of the
+regexes that were supposed to prevent the clash -- and ``front.py:556``'s own
+"W52 is free" comment was written from this same blind instrument, which is
+how the wrong number looked enumerated. So the census now reads all three
+forms and RESOLVES the concatenated one through the marker constant; an
+operand it cannot resolve is a loud failure, never a silent miss.
+
+Hardening the scan also surfaced one PRE-EXISTING collision that was invisible
+before (``W22``: the host-watermark breach vs. the span-unknown counter key,
+both at the base commit) -- recorded in ``KNOWN_COLLISIONS`` below with its
+locations, not fixed here.
+
 WHY A CENSUS AND NOT A REGISTRY. There is no table of W-codes to keep in sync
 -- the code IS the message text -- so a registry would be second bookkeeping
 beside the refusals themselves, and would drift exactly the way the front's
@@ -55,13 +78,45 @@ ROOTS = (
 )
 FILES = ("python/sglang/srt/server_args.py",)
 
-#: ``W12``, ``W11b``, ``W40b`` -- the letter suffix is part of the code.
+#: THE THREE FORMS A W-CODE IS WRITTEN IN. Reading only the first is what let
+#: #1257 claim a taken number while this file reported no collision.
+#:
+#: 1. PLAIN, in a message or a docstring: ``W12 Weg2Something``. The letter
+#:    suffix (``W11b``, ``W40b``) is part of the code.
 ASSIGNMENT = re.compile(r"\b(W\d{1,2}[a-z]?)\s+(Weg2[A-Za-z0-9_]+)")
+#: 2. COUNTER KEY: ``self.counters["W28_Weg2Leg2Unpriced"]``. The exception
+#:    name is CamelCase, so a trailing ``_lowercase`` part is a sub-key
+#:    ("..._stream_served") and not part of the name -- hence no underscore in
+#:    the captured group, which truncates the suffix instead of inventing a
+#:    second holder for the code.
+COUNTER_KEY = re.compile(r"\b(W\d{1,2}[a-z]?)_(Weg2[A-Za-z0-9]+)")
+#: 3. CONCATENATED: ``NAME = "W50 " + X_REFUSAL_MARKER``. The code's holder is
+#:    then the VALUE of that operand, so the scan has to resolve it; capturing
+#:    the identifier itself would report the variable name as the holder and
+#:    turn every such site into a phantom collision.
+CONCAT = re.compile(r"[\"'](W\d{1,2}[a-z]?) [\"']\s*\+\s*([A-Za-z_][A-Za-z0-9_]*)")
+#: ``X_REFUSAL_MARKER = "Weg2TpPrefillExceeded"`` -- resolves form 3's operand.
+MARKER_DEF = re.compile(
+    r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*[\"'](Weg2[A-Za-z0-9]+)[\"']\s*$"
+)
+#: Written into the census when form 3's operand resolves to nothing in its own
+#: file. Asserted to be empty: an unresolvable operand is the blind spot coming
+#: back, and it has to fail rather than quietly drop the code.
+UNRESOLVED = "UNRESOLVED-CONCAT-OPERAND"
 
-#: THE KNOWN COLLISIONS, 2026-09-08, with both holders. Deferred, not
-#: accepted: this branch renumbers W47 only (see the module docstring).
+#: THE KNOWN COLLISIONS, with both holders. Deferred, not accepted: this
+#: branch renumbers W47 (2026-09-08) and W52 (2026-09-09, #1257) only.
+#:
+#: W22 joined this list on 2026-09-09 WITHOUT anything changing in the source:
+#: it is pre-existing at the base commit ``80de2d31d1`` and was simply
+#: invisible to the un-hardened scan, which could not read a counter key.
+#: ``W22 Weg2HostWatermarkBreached`` at ``front.py:1804`` and
+#: ``host_ledger.py:688`` vs. the counter ``W22_Weg2SpanUnknownPricedFull`` at
+#: ``front.py:1937``. Recorded here rather than renumbered, for the reason the
+#: docstring gives for the other four: this is the serving-boot base.
 KNOWN_COLLISIONS = {
     "W10": {"Weg2CanonicalPageMissing", "Weg2DrafterIdentityMismatch"},
+    "W22": {"Weg2HostWatermarkBreached", "Weg2SpanUnknownPricedFull"},
     "W35": {"Weg2VramCreditRefused", "Weg2XReQueueLoop"},
     "W36": {"Weg2AdmitterBarrierExpired", "Weg2DuplexDecisionRefused"},
     "W46": {"Weg2PPSplitMapMismatch", "Weg2TokenVectorRefused"},
@@ -83,6 +138,9 @@ def census():
     Reads the SOURCE, never the imported module: a refusal inside an ``f``
     string is only text at runtime, and half of these are logged rather than
     raised, so there is no object to enumerate.
+
+    Reads all THREE forms (see the patterns above). Marker constants are
+    resolved per file, which is where they are defined and used.
     """
     root = _repo_root()
     paths = [os.path.join(root, f) for f in FILES]
@@ -99,9 +157,22 @@ def census():
                 lines = fh.read().split("\n")
         except OSError:
             continue
+        rel_p = os.path.relpath(p, root)
+        markers = {}
+        for line in lines:
+            m = MARKER_DEF.match(line)
+            if m:
+                markers[m.group(1)] = m.group(2)
         for i, line in enumerate(lines, 1):
-            for code, name in ASSIGNMENT.findall(line):
-                out[code][name].append(f"{os.path.relpath(p, root)}:{i}")
+            hits = ASSIGNMENT.findall(line) + COUNTER_KEY.findall(line)
+            hits += [
+                (code, markers.get(ident, f"{UNRESOLVED}:{ident}"))
+                for code, ident in CONCAT.findall(line)
+            ]
+            for code, name in hits:
+                locs = out[code][name]
+                if f"{rel_p}:{i}" not in locs:
+                    locs.append(f"{rel_p}:{i}")
     return out
 
 
@@ -189,6 +260,66 @@ class TestOneWCodePerException(CustomTestCase):
         files = {loc.split(":")[0] for loc in c["W4"]["Weg2WakeRefused"]}
         self.assertGreaterEqual(len(files), 2, sorted(files))
 
+    def test_the_scan_reads_all_three_forms_and_not_just_the_plain_one(self):
+        """DENOMINATOR FOR THE HARDENING ITSELF. The un-hardened scan passed
+        every other assertion in this file while being blind to two of the
+        three forms, so the hardening needs its own proof that it can see
+        them -- on the real tree, at the real lines, not on a synthetic
+        string."""
+        c = census()
+        # form 3, concatenated: front.py builds both of these from a bare code
+        # plus a marker constant, and the scan must credit the RESOLVED name.
+        front = "python/sglang/srt/weg2/front.py"
+        self.assertIn(f"{front}:554", c["W50"]["Weg2TpPrefillExceeded"],
+                      "the concatenated form must be read AND resolved")
+        self.assertIn(f"{front}:560", c["W52"]["Weg2NoServiceableRoute"],
+                      "#1290's concatenated claim is the one #1257 walked into")
+        # form 2, counter key: an underscore where the plain pattern wants a
+        # space. Both of #1290's counter sites, and the pre-existing W22 one.
+        for line in (1980, 2602):
+            self.assertIn(f"{front}:{line}",
+                          c["W52"]["Weg2NoServiceableRoute"])
+        self.assertIn(f"{front}:1937",
+                      c["W22"]["Weg2SpanUnknownPricedFull"])
+        # ...and the sub-key suffix is NOT read as a second holder.
+        self.assertEqual(set(c["W28"]), {"Weg2Leg2Unpriced"},
+                         "W28_Weg2Leg2Unpriced_stream_served is a sub-key of "
+                         "the same refusal, not a second exception")
+
+    def test_no_concat_operand_is_left_unresolved(self):
+        """The one way this hardening could go quietly blind again: a marker
+        constant defined somewhere the per-file resolution cannot see it. That
+        must FAIL here, not drop the code from the census."""
+        c = census()
+        unresolved = {
+            code: names for code, names in c.items()
+            for n in names if n.startswith(UNRESOLVED)
+        }
+        self.assertEqual(
+            unresolved, {},
+            "a W-code is concatenated with a marker this scan cannot resolve "
+            "in its own file; resolve it (or define the marker beside its "
+            "use) rather than letting the code drop out of the census",
+        )
+
+    def test_w52_belongs_to_the_no_route_refusal_alone(self):
+        """#1257's regression, pinned. W52 is #1290's, claimed at the base
+        commit 80de2d31d1 in two whitespace-free forms; the corridor pass was
+        renumbered to W54 rather than sharing it."""
+        c = census()
+        self.assertEqual(set(c["W52"]), {"Weg2NoServiceableRoute"})
+
+    def test_the_corridor_codes_are_w53_and_w54_alone(self):
+        c = census()
+        self.assertEqual(set(c["W53"]), {"Weg2CorridorBudgetWouldBind"})
+        self.assertEqual(set(c["W54"]), {"Weg2CorridorBudgetUnpriced"})
+        # and the label is not built by concatenation, because that is what
+        # hid the previous claim from this very census.
+        from sglang.srt.weg2 import corridor_budget as cb
+
+        self.assertEqual(cb.UNPRICED_NAME, "W54 Weg2CorridorBudgetUnpriced")
+        self.assertEqual(cb.WOULD_BIND_NAME, "W53 Weg2CorridorBudgetWouldBind")
+
     def test_the_chosen_number_was_free_and_the_free_ones_are_named(self):
         """W50 is not 'the next one': it is the first free number above the
         highest assigned code, and the census can say which others are free."""
@@ -196,6 +327,9 @@ class TestOneWCodePerException(CustomTestCase):
         used = {int(m.group(1)) for code in c
                 for m in [re.match(r"W(\d{1,2})", code)] if m}
         self.assertNotIn(50, used - {50}, "W50 must have been free before this")
+        # #1257 renumbered to W54 by enumerating this same census. The numbers
+        # below stayed free through both renumbers and are the next candidates.
+        self.assertIn(54, used, "W54 is the corridor pass's number now")
         for n in (15, 18, 23, 39):
             self.assertNotIn(n, used, f"W{n} was named free and is not")
 
