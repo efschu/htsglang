@@ -8,6 +8,14 @@
 # activation profile digest, and that is the recipe the cached digest was
 # measured for. A different recipe leaves the terms UNBOUNDED and the boot is
 # refused -- which is correct, but is not an acceptance run.
+# #1257c (2026-09-09): --rank-user-reserve-mib 1024 REMOVED from this recipe.
+# It was written when 1024 was the DEFAULT reserve, so passing it explicitly
+# restated the default and cost nothing. Under the corridor law the default is
+# 0 and an explicit reserve is an ACTUATING term: it raises the floor and
+# stacks on the measured transient (this rig's 5090 would go 1055 + 1024 =
+# 2079 MiB), so the same literal now means something the arm-B/arm-A
+# comparison was never controlling for. Dropped from BOTH arms, which keeps
+# them identical to each other and to the shipped default.
 set -euo pipefail
 WT=/spinning/wt-602-fill
 NVRTC=/spinning/htsglang-gpu/.venv/lib/python3.12/site-packages/nvidia/cu13/lib
@@ -18,7 +26,7 @@ export SGLANG_VRAM_FLIGHT_DIR=$WT/flight602
 exec /spinning/htsglang-gpu/.venv/bin/python -m sglang.launch_server \
   --model-path /spinning/llm_stuff/club-3090/models-cache/Qwen3.6-27B-FP8 \
   --tp 3 --rank-gpu-id 0,1,2 --rank-tp-ratio auto-performance \
-  --enable-vram-ledger --rank-user-reserve-mib 1024 \
+  --enable-vram-ledger \
   --kv-cache-dtype fp8_e4m3 --context-length 32768 --trust-remote-code \
   --max-running-requests 16 \
   --speculative-algorithm NEXTN --speculative-num-steps 3 \

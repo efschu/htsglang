@@ -279,23 +279,41 @@ class CorridorLineTest(unittest.TestCase):
         _f, line = self._line({0: 1030, 1: 341, 2: 852})
         self.assertIn("band=819-1229MiB", line)
 
+    #: #1257c: the per-card field gained ``floor=``/``source=``/``reserve=``
+    #: between the free reading and the verdict, because the floor is DERIVED
+    #: per card now and a reader must be able to see which one graded this
+    #: card.  On a rig with no measured footprint and no user reserve the
+    #: values are the named fallback, so the VERDICTS below are byte-identical
+    #: to the pre-#1257c ones -- which is the point of pinning them here.
+    # #1257c refuter fix 1: the segment carries BOTH numbers -- the floor
+    # and the number the ``verdict=`` beside it is actually graded
+    # against. Pinning only ``floor=`` is how the front and the arm came
+    # to contradict each other on the same line.
+    FALLBACK_FIELDS = (
+        "floor=1024MiB verdict_floor=819MiB "
+        "source=UNMEASURED-FALLBACK reserve=0MiB"
+    )
+
     def test_verdict_per_card(self):
         _f, line = self._line({0: 1030, 1: 341, 2: 852})
-        self.assertIn("nvml0:free=1030MiB reserved=425MiB verdict=IN", line)
-        self.assertIn("nvml1:free=341MiB reserved=518MiB verdict=BELOW", line)
-        self.assertIn("nvml2:free=852MiB reserved=425MiB verdict=IN", line)
+        f = self.FALLBACK_FIELDS
+        self.assertIn(f"nvml0:free=1030MiB reserved=425MiB {f} verdict=IN", line)
+        self.assertIn(f"nvml1:free=341MiB reserved=518MiB {f} verdict=BELOW", line)
+        self.assertIn(f"nvml2:free=852MiB reserved=425MiB {f} verdict=IN", line)
 
     def test_verdict_flips_at_the_floor(self):
+        f = self.FALLBACK_FIELDS
         _f, low = self._line({0: 818, 1: 818, 2: 818})
-        self.assertIn("nvml0:free=818MiB reserved=425MiB verdict=BELOW", low)
+        self.assertIn(f"nvml0:free=818MiB reserved=425MiB {f} verdict=BELOW", low)
         _f, edge = self._line({0: 819, 1: 819, 2: 819})
-        self.assertIn("nvml0:free=819MiB reserved=425MiB verdict=IN", edge)
+        self.assertIn(f"nvml0:free=819MiB reserved=425MiB {f} verdict=IN", edge)
 
     def test_verdict_flips_at_the_ceiling(self):
+        f = self.FALLBACK_FIELDS
         _f, edge = self._line({0: 1229, 1: 1229, 2: 1229})
-        self.assertIn("nvml0:free=1229MiB reserved=425MiB verdict=IN", edge)
+        self.assertIn(f"nvml0:free=1229MiB reserved=425MiB {f} verdict=IN", edge)
         _f, high = self._line({0: 1230, 1: 1230, 2: 1230})
-        self.assertIn("nvml0:free=1230MiB reserved=425MiB verdict=ABOVE", high)
+        self.assertIn(f"nvml0:free=1230MiB reserved=425MiB {f} verdict=ABOVE", high)
 
     def test_the_rg6_5090_would_have_been_graded_BELOW(self):
         """The whole point: 859 grades IN, 341 grades BELOW, same instant."""
@@ -717,7 +735,16 @@ class BandHasOneDeclarationTest(unittest.TestCase):
         with _PatchNvml(_fake(_rig({0: 1030, 1: 341, 2: 852}))):
             line = f.corridor_sample()
         self.assertIn("band=1228-1843MiB", line)
-        self.assertIn("nvml0:free=1030MiB reserved=425MiB verdict=BELOW", line)
+        # #1257c: an ENV-set law is still a STATED law, so it keeps the +-20 %
+        # band (only a MEASURED transient peak loses the tolerance) -- and it
+        # is stamped ENV-OVERRIDE so a reader can tell it from the shipped
+        # fallback.
+        self.assertIn(
+            "nvml0:free=1030MiB reserved=425MiB floor=1536MiB "
+            "verdict_floor=1228MiB source=ENV-OVERRIDE reserve=0MiB "
+            "verdict=BELOW",
+            line,
+        )
 
     def test_the_exported_state_follows_the_law(self):
         self._move_the_law()
@@ -967,19 +994,51 @@ class BootArmTest(unittest.TestCase):
         )
 
     def test_the_band_check_grades_BOTH_edges(self):
-        """ABOVE the ceiling is "the boot did not pass", not a free pass.
+        """Both edges are still GRADED. Only one of them still FAILS.
 
-        The corridor rule has two failing sides -- below the floor is a
-        breach, above the ceiling is VRAM buying no tokens -- and a check
-        that only looked down would bless an over-filled card.  (Mutant 4g:
-        dropping ``<= ceil`` survived the first battery.)
+        REVERSED 2026-09-09 by user decision (#1257c, consequence 5): "the
+        upper band edge stays a FINDING ('unmobilised free') never a FAIL by
+        itself". Below the floor is a breach and still fails the arm; above
+        the ceiling is VRAM buying no tokens, which is a capacity question for
+        the planner and not a breach of the corridor law, so it is reported in
+        ``findings`` and the arm still passes on it alone.
+
+        The original intent of this case -- that a check must not look only
+        downward -- is preserved: the ABOVE card must still be NAMED, with its
+        number, in the report. What changed is which list it lands in.
+        (Mutant 4g, dropping the upper comparison entirely, still dies here.)
         """
         above = POST_FIX_LINE.replace("nvml0:free=1030MiB", "nvml0:free=5000MiB")
         rep = corridor_arm.arm_report(_write_log(self, above), require_in_band=True)
-        self.assertFalse(rep.ok)
+        self.assertFalse(rep.ok, "the BELOW card still fails the arm")
         joined = " ".join(rep.problems)
-        self.assertIn("nvml0 minimum 5000 MiB (allocatable free) is ABOVE", joined)
         self.assertIn("nvml1 minimum 341 MiB (allocatable free) is BELOW", joined)
+        self.assertNotIn("is ABOVE", joined)
+        found = " ".join(rep.findings)
+        self.assertIn("nvml0", found)
+        self.assertIn("unmobilised_free_mib=", found)
+        self.assertIn("a FINDING, not a failure", found)
+
+    def test_an_over_filled_card_alone_does_not_fail_the_arm(self):
+        """#1257c consequence 5, isolated: idle VRAM is not a breach.
+
+        The predecessor failed an acceptance outright on a card resting above
+        the ceiling. Under the user decision that boot passes its corridor arm
+        and carries a finding.
+        """
+        only_above = POST_FIX_LINE
+        for a, b in (
+            ("nvml0:free=1030MiB", "nvml0:free=5000MiB"),
+            ("nvml1:free=341MiB", "nvml1:free=5000MiB"),
+            ("nvml2:free=852MiB", "nvml2:free=5000MiB"),
+        ):
+            only_above = only_above.replace(a, b)
+        rep = corridor_arm.arm_report(
+            _write_log(self, only_above), require_in_band=True
+        )
+        self.assertEqual(rep.problems, [], rep.problems)
+        self.assertTrue(rep.ok)
+        self.assertEqual(len(rep.findings), 3, rep.findings)
 
     def test_an_in_band_log_passes_the_strict_check(self):
         """Can-fail the other way: the strict check must be satisfiable."""

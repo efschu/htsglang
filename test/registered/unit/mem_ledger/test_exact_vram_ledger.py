@@ -405,7 +405,13 @@ def test_coresident_tenant_sums_exactly_into_the_card_ledger():
         production_inputs(),
         cards=[CARD_5090, CARD_3080_A, CARD_3080_B],
         rank_gpu_id=[0, 1, 2],
-        user_reserve_mib={0: 1024, 1: 1024, 2: 1024},
+        # THE SAME RESERVE ON BOTH SIDES, and taken from the declaration rather
+        # than typed: the subject here is the TENANT DELTA, so a reserve that
+        # differs between the two ledgers puts its own number into that delta.
+        # This read 1024 while ``production_ledgers()`` took the declared
+        # default, which was invisible only while the two happened to be equal
+        # (#1257c moved the default to 0 and the difference surfaced).
+        user_reserve_mib={g: DEFAULT_USER_RESERVE_MIB for g in (0, 1, 2)},
         calibration=calibration_for(CARD_5090, CARD_3080_A, CARD_3080_B),
         tenant_terms=extra,
     )

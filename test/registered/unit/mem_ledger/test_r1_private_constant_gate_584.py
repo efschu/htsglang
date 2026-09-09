@@ -209,6 +209,18 @@ KNOWN = {
         "via SGLANG_PHASE_FLIP_ARMING_MARGIN_MIB, so it is at least not a "
         "silent constant."
     ),
+    "weg2/launcher.py::D_AWAKE_OVERSHOOT_MIB": (
+        "NOT A DEMAND DECISION, a MEASUREMENT of this form (#1257c). Group D's "
+        "awake consumption that sits OUTSIDE the --rank-gpu-memory-mib "
+        "fraction -- CUDA context and BAR1 windows -- measured at 404 MiB on "
+        "boot weg2onebackup2 (2026-09-07), where the 5090's continuous minimum "
+        "under D was 620-684 MiB against a 1024 MiB line. It was the second "
+        "half of `CORRIDOR_MIB = 1024 + 404`; #1257c split the pair because "
+        "the FIRST half became a derived per-card floor "
+        "(managers.corridor_guard.corridor_floor_mib) and this one did not "
+        "change at all. Named here so the split is visible rather than "
+        "arriving as a new unpinned constant."
+    ),
     "weg2/launcher.py::P_CORRIDOR_HOLDBACK_MIB": (
         "NOT A DEMAND DECISION, a TRANSCRIPTION of one the runtime already "
         "made (#1286). It is the boot's own 'gapped corridor holdback' post, "
@@ -216,7 +228,13 @@ KNOWN = {
         "and measured at 1.000 GiB on every rank of boots weg2sb5f and "
         "weg2rg6. The launcher does not decide it; it charges it, so that the "
         "cut ranking prices what the boot will then size. Overridable with "
-        "--pp-cut-corridor-holdback-mib."
+        "--pp-cut-corridor-holdback-mib, whose DEFAULT now follows "
+        "--user-reserve-mib (#1257c): that post IS the user reserve at the "
+        "runtime end (_gapped_corridor_holdback), the reserve defaults to 0 "
+        "since 2026-09-09, and a pinned 1024.0 against a runtime charging "
+        "0.000 would over-charge group P by a gibibyte per rank. This "
+        "constant is what the expression returns at reserve 1024, which is "
+        "the value both reference boots measured."
     ),
     "weg2/launcher.py::P_PREFILL_ACTIVATION_RESERVE_MIB": (
         "NOT A DEMAND DECISION, a TRANSCRIPTION of one the runtime already "

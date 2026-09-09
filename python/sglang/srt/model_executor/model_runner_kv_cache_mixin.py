@@ -2742,6 +2742,16 @@ class ModelRunnerKVCacheMixin:
             # for no holdback". The ``or`` idiom conflates the two and would
             # make the reserve impossible to switch off.
             configured = getattr(self.server_args, "rank_user_reserve_mib", None)
+            # #1257c. The field default is now the SENTINEL ``"default"``, not
+            # a number, so "unset" arrives as that string and not as None. It
+            # must collapse to None HERE, before the gate below reads it:
+            # otherwise every shipped configuration -- none of which pass this
+            # flag -- would suddenly take the explicit-flag branch and get a
+            # holdback its solve never had.
+            from sglang.srt.mem_ledger.terms import USER_RESERVE_UNSET
+
+            if configured is not None and str(configured) == str(USER_RESERVE_UNSET):
+                configured = None
             # AN EXPLICIT FLAG IS NEVER SILENTLY DROPPED (#774).
             #
             # The gapped gate below exists to keep SHIPPED configurations
@@ -2761,7 +2771,24 @@ class ModelRunnerKVCacheMixin:
             # tried that".
             if configured is None and not pp_gapped_ownership_active(pp_size):
                 return rest_memory, None
-            reserve_mib = 1024 if configured is None else int(configured)
+            # #1257c. THE LITERAL 1024 IS GONE. It was a SECOND hard default
+            # for a number ``mem_ledger.terms.DEFAULT_USER_RESERVE_MIB``
+            # already declares, so a card whose ServerArgs simply lacked the
+            # attribute got a 1 GiB holdback nobody asked for -- and when the
+            # operator moved the default to 0 this copy would have kept
+            # charging the gibibyte, invisibly, on exactly the gapped path
+            # that has the demonstrated OOM. Resolved through the one
+            # authority: the sentinel-aware scalar reader where the ServerArgs
+            # has one, the declared default otherwise.
+            from sglang.srt.mem_ledger.terms import DEFAULT_USER_RESERVE_MIB
+
+            if configured is None:
+                reserve_mib = int(DEFAULT_USER_RESERVE_MIB)
+            else:
+                scalar = getattr(self.server_args, "user_reserve_mib_scalar", None)
+                reserve_mib = (
+                    int(scalar()) if callable(scalar) else int(configured)
+                )
             if reserve_mib <= 0:
                 return rest_memory, None
             reserve_gb = reserve_mib / 1024.0

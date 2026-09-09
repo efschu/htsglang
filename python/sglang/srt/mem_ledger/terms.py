@@ -57,6 +57,7 @@ from typing import Dict, Iterable, Mapping, Optional, Sequence, Tuple
 
 __all__ = [
     "DEFAULT_USER_RESERVE_MIB",
+    "USER_RESERVE_UNSET",
     "Provenance",
     "LedgerTerm",
     "CardVramLedger",
@@ -69,11 +70,35 @@ __all__ = [
 #: Default operator headroom per card, in MiB. This is the ONE number in the
 #: ledger that is a policy choice rather than a derivation, and it is a choice
 #: about the world OUTSIDE the engine: a desktop compositor, an nvidia-smi, a
-#: short-lived CUDA tool. It is deliberately not zero -- a card driven to its
-#: last megabyte leaves the operator no room to look at it -- and it is
-#: deliberately not larger, because every MiB here is a MiB the KV pool does
-#: not get. Internal demand is never charged against it.
-DEFAULT_USER_RESERVE_MIB = 1024
+#: short-lived CUDA tool. Internal demand is never charged against it.
+#:
+#: ZERO SINCE 2026-09-09 (#1257c), by user decision, verbatim: "die 1024er
+#: grenze von mir existiert ja nur weil du den wahren vram verbrauch nicht
+#: bepreisen konntest UND weil ich manchmal noch vram fuer andere prozesse
+#: brauche. wenn du jetzt korrekt bepreisen kannst, dann kann die default
+#: 1024er grenze auch weg (das feature muss aber erhalten bleiben, eben weil
+#: ich noch andere prozesse manchmal nebenher habe die vram brauchen)".
+#:
+#: The predecessor of this comment argued the number was "deliberately not
+#: zero -- a card driven to its last megabyte leaves the operator no room to
+#: look at it". That argument was about the ENGINE's own unpriced transient,
+#: not about the operator's other processes, and the engine's transient is now
+#: priced per card by ``managers.corridor_guard.corridor_floor_mib``. What is
+#: left here is only the operator's external headroom, and the operator asks
+#: for that when they want it. THE KNOB STAYS -- the default moves.
+DEFAULT_USER_RESERVE_MIB = 0
+
+#: The field default of ``--rank-user-reserve-mib``. A SENTINEL, not a value.
+#:
+#: DANGER SITE, closed here (#1257c). ``_user_reserve_was_passed`` used to be
+#: ``str(raw) != str(DEFAULT_USER_RESERVE_MIB)`` -- a VALUE comparison, which
+#: works only while the default is a value no operator would type. At default
+#: 0 an explicit ``--rank-user-reserve-mib 0`` becomes indistinguishable from
+#: an unset flag, which silently disarms the "reserve without
+#: --enable-vram-ledger" refusal. A sentinel is a real passedness signal, and
+#: it is the same shape the neighbouring ``rank_gpu_memory_mib = "auto"``
+#: field already uses.
+USER_RESERVE_UNSET = "default"
 
 #: The ledger line that carries the user reserve. Named so that a renderer, a
 #: test and a refusal all point at the same row.

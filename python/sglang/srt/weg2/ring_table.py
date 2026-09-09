@@ -110,7 +110,16 @@ import math
 import os
 import re
 from dataclasses import dataclass, field
-from typing import Collection, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import (
+    Collection,
+    Dict,
+    List,
+    Mapping,
+    NamedTuple,
+    Optional,
+    Sequence,
+    Tuple,
+)
 
 from sglang.srt.weg2 import host_ledger
 
@@ -186,6 +195,82 @@ _CORRIDOR_FREE_RE = re.compile(r"nvml(\d+):free=(\d+)MiB")
 #: ``instrument=nvml_v2_free,allocatable`` -- present only on boots taken after
 #: the corridor instrument fix (front.CORRIDOR_INSTRUMENT).
 _CORRIDOR_INSTRUMENT_RE = re.compile(r"WEG2-CORRIDOR\s+phase=[A-Z]\(awake\)[^\n]*?instrument=(\S+)")
+
+
+#: #1257c: the front prints its DERIVED per-card floor beside every free
+#: reading -- ``nvml1:free=474MiB reserved=518MiB floor=1055MiB
+#: source=MEASURED-P reserve=0MiB verdict=BELOW``.  Parsed back so the boot's
+#: corridor verdict grades against the SAME number the sampler used, rather
+#: than against a band it re-derives.  A pre-#1257c line carries no ``floor=``
+#: and yields nothing, which the caller must treat as "fall back and say so".
+_CORRIDOR_FLOOR_RE = re.compile(
+    r"nvml(\d+):free=\d+MiB\s+reserved=\d+MiB\s+floor=(\d+)MiB\s+"
+    r"(?:verdict_floor=(\d+)MiB\s+)?source=(\S+)"
+)
+
+
+class FrontFloor(NamedTuple):
+    """One card's floor as recovered from a front log line.
+
+    Three fields, because grading and the unmobilised-free finding use two
+    DIFFERENT numbers: ``verdict_floor_mib`` is what BELOW is graded against
+    and ``floor_mib`` is what the finding edge is derived from.  Collapsing
+    them was refuter finding 1.
+    """
+
+    floor_mib: int
+    source: str
+    verdict_floor_mib: int
+
+    @property
+    def ceiling_mib(self) -> int:
+        """The unmobilised-free edge above this floor.  A FINDING threshold.
+
+        Derived through ``corridor_guard.corridor_ceiling_for_floor_mib`` --
+        the same rule ``CorridorFloor.ceiling_mib`` uses -- so a floor read
+        back off a log and the object that printed it cannot place the edge
+        differently.
+        """
+        from sglang.srt.managers.corridor_guard import (
+            corridor_ceiling_for_floor_mib,
+        )
+
+        return corridor_ceiling_for_floor_mib(self.floor_mib)
+
+
+def parse_front_corridor_floors(path: str) -> Dict[int, FrontFloor]:
+    """``{nvml index: FrontFloor}`` from a front log's LAST sample.
+
+    The last sample, not the first: the floor can change within one boot (a
+    group flip changes which transient is awake), and the verdict belongs to
+    the state the boot ended in.  A log with no such token returns ``{}``.
+
+    ``verdict_floor=`` is OPTIONAL in the pattern so a log written by the
+    first #1257c form (floor and source, no verdict floor) still parses.  It
+    is then DERIVED by the one rule -- ``corridor_guard.verdict_floor_for_mib``
+    -- rather than by equating it with the floor, which is exactly the
+    conflation this fix removes.
+    """
+    from sglang.srt.managers.corridor_guard import verdict_floor_for_mib
+
+    out: Dict[int, FrontFloor] = {}
+    try:
+        with open(path, errors="replace") as f:
+            for line in f:
+                if "WEG2-CORRIDOR" not in line:
+                    continue
+                for m in _CORRIDOR_FLOOR_RE.finditer(line):
+                    floor, source = int(m.group(2)), m.group(4)
+                    out[int(m.group(1))] = FrontFloor(
+                        floor,
+                        source,
+                        int(m.group(3))
+                        if m.group(3) is not None
+                        else verdict_floor_for_mib(floor, source),
+                    )
+    except OSError:
+        return {}
+    return out
 
 
 def _corridor_sample_phase(line: str) -> Optional[str]:

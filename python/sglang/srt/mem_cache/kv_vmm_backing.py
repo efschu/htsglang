@@ -62,9 +62,25 @@ def _corridor_law_floor_bytes() -> int:
     # own copy, so the law could be moved for one and not the others -- a
     # divergence with no symptom until a breach is judged twice and answered
     # differently. Still read per call, for the reason above.
-    from sglang.srt.managers.corridor_guard import corridor_law_bytes
+    # #1257c / REFUTER FINDING 6 (2026-09-09): the law is no longer rig-wide.
+    # ``corridor_law_bytes`` is the flat stated law; the floor THIS card is
+    # actually graded against is the awake group's measured transient plus the
+    # operator's reserve, and on this rig those differ by 239 MiB between two
+    # cards. Preempting against a number 239 MiB away from the one the guard
+    # enforces is the same two-floors defect at a third site. THE FLOOR, not
+    # the verdict floor: this decides whether to spend the allocator cache
+    # before crossing, and the -20 % grading tolerance is not a licence to
+    # cross. Falls back to the flat law if the derivation cannot run -- the
+    # preempt must never break a restore walk.
+    from sglang.srt.managers.corridor_guard import (
+        corridor_floor_for_current_device,
+        corridor_law_bytes,
+    )
 
-    return corridor_law_bytes()
+    try:
+        return int(corridor_floor_for_current_device().mib) * (1 << 20)
+    except Exception:  # noqa: BLE001 -- a probe must never break the walk
+        return corridor_law_bytes()
 
 
 def _corridor_preempt(step: int, label: str, reclaim: Optional[callable]) -> None:

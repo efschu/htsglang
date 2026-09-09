@@ -59,6 +59,12 @@ import re
 from dataclasses import dataclass, field
 from typing import Dict, List, Mapping, Optional, Tuple
 
+# The guard is imported for its ARITHMETIC, never for a rule restated here:
+# the verdict threshold and the finding edge arrive ON the floor being
+# graded (``ring_table.FrontFloor``), and the one subtraction this module
+# needs is delegated because #656's one-converter gate forbids a ``-`` in
+# ``arm_report`` by name.
+from sglang.srt.managers import corridor_guard
 from sglang.srt.weg2 import front, ring_table
 
 #: The DELTAS a pre-fix pairing shows, MiB.  Used ONLY to recognise the pre-fix
@@ -194,7 +200,13 @@ class ArmReport:
     #: ONLY THING THIS REPORT GRADES.
     units: Dict[str, ring_table.CorridorUnit] = field(default_factory=dict)
     band_mib: Tuple[int, int] = (0, 0)
+    #: #1257c: ``{nvml index: (floor MiB, source)}`` read back off the front's
+    #: own CORRIDOR line. Empty on a pre-#1257c log.
+    floors: Dict[int, "ring_table.FrontFloor"] = field(default_factory=dict)
     problems: List[str] = field(default_factory=list)
+    #: #1257c: things worth saying that are NOT failures. The upper band edge
+    #: lives here by user decision (2026-09-09, consequence 5).
+    findings: List[str] = field(default_factory=list)
 
     @property
     def ok(self) -> bool:
@@ -202,10 +214,20 @@ class ArmReport:
 
     def report(self) -> str:
         floor, ceil = self.band_mib
+        # floor/verdict_floor per card: the two numbers are DIFFERENT under an
+        # unmeasured fallback (1024 and 819) and the arm grades on the second,
+        # so printing only the first made the summary unreadable against the
+        # problems below it (refuter finding 1).
+        floors_txt = ", ".join(
+            f"nvml{i}={f.floor_mib}/{f.verdict_floor_mib}({f.source})"
+            for i, f in sorted(self.floors.items())
+        )
         head = (
             f"WEG2-CORRIDOR-ARM log={self.path} instrument={self.instrument} "
             f"samples={self.samples} prose_mentions={self.prose_mentions} "
             f"band={floor}-{ceil}MiB(allocatable free) "
+            f"floors={{{floors_txt}}} "
+            f"findings={len(self.findings)} "
             f"verdict={'PASS' if self.ok else 'FAIL'}"
         )
         body = []
@@ -237,6 +259,7 @@ class ArmReport:
                         f"({self.instrument}) verdict=UNGRADED"
                     )
         body += [f"  PROBLEM: {p}" for p in self.problems]
+        body += [f"  FINDING: {f}" for f in self.findings]
         return "\n".join([head] + body)
 
 
@@ -311,21 +334,74 @@ def arm_report(
             f"{front.CORRIDOR_INSTRUMENT_NO_V2!r} instead -- carve-out-blind, "
             f"and the reserved= field on every line is 0)"
         )
+    # #1257c: THE FLOOR COMES FROM THE FRONT'S OWN LINE, per card, and this
+    # module grades against THAT. The front derives it once
+    # (``corridor_guard.corridor_floor_mib``) and prints ``floor=``/``source=``
+    # beside every ``nvmlN:free=``; reading it back is a one-directional
+    # shared surface, so the boot's verdict and the sampler that produced it
+    # cannot disagree about the number. A log with no ``floor=`` token is a
+    # pre-#1257c boot and falls back to the rig-wide band -- named, never
+    # silently equated.
+    rep.floors = ring_table.parse_front_corridor_floors(path)
     if require_in_band:
-        floor, ceil = rep.band_mib
+        band_floor, band_ceil = rep.band_mib
         for phase in sorted(rep.minima):
             unit = rep.units.get(phase)
             if unit is None or not unit.ok:
                 rep.problems.append(
-                    f"phase={phase} cannot be graded against the {floor}-{ceil} MiB "
-                    f"band: {unit.reason if unit else 'no unit conversion was attempted'}"
+                    f"phase={phase} cannot be graded against the "
+                    f"{band_floor}-{band_ceil} MiB band: "
+                    f"{unit.reason if unit else 'no unit conversion was attempted'}"
                 )
                 continue
             for idx, mib in sorted(unit.allocatable.items()):
-                if not floor <= mib <= ceil:
+                got = rep.floors.get(idx)
+                floor = got.floor_mib if got else band_floor
+                source = got.source if got else "PRE-1257C-BAND"
+                # THE FINDING EDGE, and on a pre-#1257c log it is the band's
+                # OWN ceiling rather than one re-derived from its floor.
+                # ``band_mib`` is (819, 1229) at the stated law; deriving
+                # 819 * 1.2 = 983 instead would have reported "unmobilised
+                # free" for every card between 983 and 1229 MiB -- the middle
+                # of the very band those logs passed. Findings never fail an
+                # acceptance, so this was noise and not a wrong verdict, but
+                # noise in the instrument that grades the boot is how a real
+                # finding stops being read.
+                ceiling = got.ceiling_mib if got else band_ceil
+                # REFUTER FIX 1: BELOW is graded against the VERDICT floor,
+                # which is what the front's own ``verdict=`` on that same line
+                # is graded against. Grading it against ``floor=`` made this
+                # arm and the front contradict each other on every unmeasured
+                # card between 819 and 1023 MiB -- a window that PASSED
+                # pre-#1257c under the rig-wide 819-1229 band and that an
+                # UNMEASURED fallback floor must never fail (consequence 3:
+                # an unpriced floor is a verdict, never an actuation).
+                verdict_floor = got.verdict_floor_mib if got else band_floor
+                if mib < verdict_floor:
                     rep.problems.append(
-                        f"phase={phase} nvml{idx} minimum {mib} MiB (allocatable free) "
-                        f"is {front.corridor_verdict(mib)} the {floor}-{ceil} MiB band"
+                        f"phase={phase} nvml{idx} minimum {mib} MiB (allocatable "
+                        f"free) is BELOW its corridor verdict floor of "
+                        f"{verdict_floor} MiB (floor={floor} source={source})"
+                    )
+                # NOT gated on the log carrying a floor= token. The finding is
+                # graded against whatever floor is IN FORCE, and on a
+                # pre-#1257c log that is the rig-wide band floor -- a real
+                # floor, named as PRE-1257C-BAND. Gating it would have made an
+                # over-filled card invisible on exactly the logs that have
+                # been taken so far.
+                elif corridor_guard.unmobilised_above_ceiling_mib(mib, ceiling):
+                    # DECISION 5, 2026-09-09: the upper edge is a FINDING and
+                    # never a FAIL on its own. It says MiB are sitting
+                    # unmobilised, which is a capacity question for the
+                    # planner, not a breach of the corridor law. The
+                    # predecessor of this branch appended it to
+                    # ``problems`` and failed acceptances on it.
+                    rep.findings.append(
+                        f"phase={phase} nvml{idx} unmobilised_free_mib="
+                        f"{corridor_guard.unmobilised_above_ceiling_mib(mib, ceiling)} "
+                        f"(minimum {mib} MiB against a {floor} MiB floor, "
+                        f"ceiling {ceiling} MiB, source={source}); a FINDING, "
+                        f"not a failure"
                     )
     return rep
 

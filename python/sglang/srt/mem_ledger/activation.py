@@ -321,7 +321,32 @@ def load_footprints(
     cache_dir: Optional[str] = None,
 ) -> Dict[str, PhaseFootprint]:
     """Cached footprints for this (hardware, profile), or ``{}``."""
-    digest = profile_key(profile)
+    return load_footprints_by_digest(
+        hw_fingerprint=hw_fingerprint,
+        profile_digest=profile_key(profile),
+        cache_dir=cache_dir,
+    )
+
+
+def load_footprints_by_digest(
+    *,
+    hw_fingerprint: str,
+    profile_digest: str,
+    cache_dir: Optional[str] = None,
+) -> Dict[str, PhaseFootprint]:
+    """The same read, keyed by the DIGEST instead of by the profile object.
+
+    #1257c. The corridor floor is needed in two processes that do not own an
+    ``ActivationProfile`` -- the Weg-2 front and its launcher -- and building
+    one there means restating ``profile_from_server_args`` against a ServerArgs
+    they never construct, which ``launcher.p_activation_reserve_provenance``
+    refuses by name. They are handed the digest the boot published instead.
+
+    NOT A SECOND STORE: this is the SAME file, the same version gate and the
+    same fingerprint gate; only the key arrives ready-made. ``load_footprints``
+    delegates here so there is exactly one JSON reader.
+    """
+    digest = profile_digest
     path = footprint_cache_path(hw_fingerprint, digest, cache_dir)
     if not os.path.exists(path):
         return {}
