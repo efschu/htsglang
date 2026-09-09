@@ -59,6 +59,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Dict, List, Mapping, Optional, Tuple
 
+from sglang.srt.managers import corridor_guard
 from sglang.srt.weg2 import front, ring_table
 
 #: The DELTAS a pre-fix pairing shows, MiB.  Used ONLY to recognise the pre-fix
@@ -350,7 +351,9 @@ def arm_report(
                         f"free) is BELOW its corridor floor of {floor} MiB "
                         f"(source={source})"
                     )
-                elif got is not None and mib > int(round(floor * 1.2)):
+                elif got is not None and corridor_guard.unmobilised_free_mib(
+                    mib, floor
+                ):
                     # DECISION 5, 2026-09-09: the upper edge is a FINDING and
                     # never a FAIL on its own. It says MiB are sitting
                     # unmobilised, which is a capacity question for the
@@ -359,9 +362,9 @@ def arm_report(
                     # ``problems`` and failed acceptances on it.
                     rep.findings.append(
                         f"phase={phase} nvml{idx} unmobilised_free_mib="
-                        f"{mib - int(round(floor * 1.2))} (minimum {mib} MiB "
-                        f"against a {floor} MiB floor, source={source}); a "
-                        f"FINDING, not a failure"
+                        f"{corridor_guard.unmobilised_free_mib(mib, floor)} "
+                        f"(minimum {mib} MiB against a {floor} MiB floor, "
+                        f"source={source}); a FINDING, not a failure"
                     )
     return rep
 

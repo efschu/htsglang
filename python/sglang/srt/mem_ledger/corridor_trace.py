@@ -296,16 +296,14 @@ class CorridorTrace:
             # applied only where the source says nothing measured it.
             "corridor_band_floor_mib": (
                 int(corridor_mib)
-                if corridor_source.startswith("MEASURED")
-                or corridor_source == "ENV-OVERRIDE"
+                if corridor_source.startswith("MEASURED-")
                 else _band_floor_mib(corridor_mib)
             ),
             "breach": bool(
                 floor // MIB
                 < (
                     int(corridor_mib)
-                    if corridor_source.startswith("MEASURED")
-                    or corridor_source == "ENV-OVERRIDE"
+                    if corridor_source.startswith("MEASURED-")
                     else _band_floor_mib(corridor_mib)
                 )
             ),

@@ -18,7 +18,10 @@ from sglang.srt.mem_ledger.calibration import (
     load_calibration,
     save_calibration,
 )
-from sglang.srt.mem_ledger.terms import DEFAULT_USER_RESERVE_MIB
+from sglang.srt.mem_ledger.terms import (
+    DEFAULT_USER_RESERVE_MIB,
+    USER_RESERVE_UNSET,
+)
 from sglang.srt.server_args import ServerArgs
 
 MODEL = "/nonexistent/model"
@@ -35,7 +38,11 @@ def make_args(**kwargs):
     defaults = dict(
         model_path=MODEL,
         rank_auto_reserve_mib="auto",
-        rank_user_reserve_mib=DEFAULT_USER_RESERVE_MIB,
+        # THE SENTINEL, not the default VALUE (#1257c). "unset" and "the
+        # operator typed the default" are different states and the flag's
+        # refusal turns on which one it is; a fixture that types the value
+        # cannot express "unset" once the default is 0.
+        rank_user_reserve_mib=USER_RESERVE_UNSET,
         enable_vram_ledger=False,
     )
     defaults.update(kwargs)
@@ -47,10 +54,38 @@ def make_args(**kwargs):
 # --- the decreed default ----------------------------------------------------
 
 
-def test_user_reserve_defaults_to_1024_mib_per_card():
-    assert DEFAULT_USER_RESERVE_MIB == 1024
+def test_user_reserve_defaults_to_zero_mib_per_card():
+    """CHANGED 2026-09-09 by user decision (#1257c), verbatim:
+
+        "die 1024er grenze von mir existiert ja nur weil du den wahren vram
+         verbrauch nicht bepreisen konntest UND weil ich manchmal noch vram
+         fuer andere prozesse brauche. wenn du jetzt korrekt bepreisen kannst,
+         dann kann die default 1024er grenze auch weg (das feature muss aber
+         erhalten bleiben, eben weil ich noch andere prozesse manchmal
+         nebenher habe die vram brauchen)"
+
+    The knob is KEPT and only its default moves. The engine's own transient is
+    now priced per card by ``managers.corridor_guard.corridor_floor_mib``, so
+    what is left in this flag is only the operator's external headroom.
+    """
+    assert DEFAULT_USER_RESERVE_MIB == 0
     field = ServerArgs.__dataclass_fields__["rank_user_reserve_mib"]
-    assert field.default == DEFAULT_USER_RESERVE_MIB
+    # A SENTINEL, not the value: at default 0 a value comparison cannot tell
+    # an explicit ``--rank-user-reserve-mib 0`` from an unset flag, and that
+    # ambiguity silently disarms the refusal below.
+    assert field.default == USER_RESERVE_UNSET
+    assert str(field.default) != str(DEFAULT_USER_RESERVE_MIB)
+
+
+def test_an_explicit_zero_reads_as_passed_and_is_still_refused_without_the_ledger():
+    """#1257c danger site, pinned. A flag asked for and silently ignored is
+    worse than one that does not exist."""
+    import pytest as _pytest
+
+    args = make_args(rank_user_reserve_mib=0)
+    assert args._user_reserve_was_passed()
+    with _pytest.raises(ValueError, match="does nothing without"):
+        args._check_vram_ledger_flags()
 
 
 def test_ledger_is_on_by_default_because_it_is_the_authority():
@@ -331,9 +366,12 @@ def test_the_boot_path_forms_budgets_from_the_ledger(monkeypatch, caplog):
     with caplog.at_level("INFO"):
         non_kv = args._vram_ledger_non_kv_per_gpu(Counter([0, 1]))
 
-    # 1024 user reserve + 1766 activation + 640 capture + 384 flashinfer
-    # workspace + 408 hardware residual + 425 NVML carve-out + 70 load
-    # transient = 4717.
+    # 0 user reserve (#1257c: was 1024 until the user decision of 2026-09-09
+    # moved the default; the engine's own transient is now priced per card by
+    # the corridor floor and this flag funds only processes OUTSIDE the
+    # engine) + 1766 activation + 640 capture + 384 flashinfer workspace +
+    # 408 hardware residual + 425 NVML carve-out + 70 load transient = 3693.
+    # Every one of those 1024 MiB goes straight to the KV pool.
     #
     # Was 5976 before the phase footprints landed: activation 3968 (the
     # falsified heuristic) and capture 192 (the token estimate the same window
@@ -351,7 +389,7 @@ def test_the_boot_path_forms_budgets_from_the_ledger(monkeypatch, caplog):
     # 2026-08-06 corridor window saw the free-memory floor dip into and that no
     # term charged. Same direction as the carve-out and for the same reason --
     # the budget was being formed against memory the boot does not keep.
-    assert non_kv == {0: 4717, 1: 4717}
+    assert non_kv == {0: 3693, 1: 3693}
     text = caplog.text
     assert "attention workspaces (capped)" in text
     assert "SGLANG_FLASHINFER_WORKSPACE_SIZE" in text

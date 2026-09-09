@@ -359,6 +359,26 @@ FLOOR_SOURCE_ENV = "ENV-OVERRIDE"
 FLOOR_SOURCE_FALLBACK = "UNMEASURED-FALLBACK"
 
 
+def corridor_ceiling_for_floor_mib(floor_mib: int) -> int:
+    """The unmobilised-free edge above a given floor. A FINDING threshold.
+
+    #1257c. Split out so a consumer that has only a NUMBER (a floor read back
+    off a log line, say) derives the edge the same way
+    :attr:`CorridorFloor.ceiling_mib` does, instead of re-typing ``* 1.2``.
+    """
+    f = max(0, int(floor_mib))
+    return int(round(f + f * CORRIDOR_BAND_FRACTION))
+
+
+def unmobilised_free_mib(free_mib: int, floor_mib: int) -> int:
+    """MiB resting ABOVE the finding edge, or 0. Never a failure by itself.
+
+    User decision 2026-09-09, consequence 5: "the upper band edge stays a
+    FINDING ('unmobilised free') never a FAIL by itself".
+    """
+    return max(0, int(free_mib) - corridor_ceiling_for_floor_mib(floor_mib))
+
+
 def measured_floor_source(group: str) -> str:
     """``MEASURED-P`` / ``MEASURED-D`` -- the source token for a measured peak.
 
@@ -498,7 +518,15 @@ class CorridorFloor:
 
     @property
     def measured(self) -> bool:
-        return self.source not in (FLOOR_SOURCE_FALLBACK,)
+        """Did somebody MEASURE this card's transient?
+
+        The env override does NOT count, and the distinction is not pedantry:
+        an operator who sets ``SGLANG_CORRIDOR_LAW_FLOOR_MIB`` is moving the
+        STATED law, which is a target and carries the +-20 % band exactly as
+        the shipped 1024 does. Only a footprint the probe measured is a
+        physical requirement with no slack under it.
+        """
+        return self.source.startswith("MEASURED-")
 
     @property
     def actuates(self) -> bool:
@@ -509,7 +537,11 @@ class CorridorFloor:
         An unmeasured 1024 with no reserve prints, grades and refuses -- it
         never spends KV pool.
         """
-        return self.measured or int(self.reserve_mib) > 0
+        return (
+            self.measured
+            or self.source == FLOOR_SOURCE_ENV
+            or int(self.reserve_mib) > 0
+        )
 
     @property
     def reason(self) -> str:
@@ -518,6 +550,8 @@ class CorridorFloor:
             return "measured-peak+user-reserve"
         if self.measured:
             return "measured-peak"
+        if self.source == FLOOR_SOURCE_ENV:
+            return "hand-set-law"
         if int(self.reserve_mib) > 0:
             return "user-reserve"
         return "unmeasured-fallback"
@@ -533,8 +567,7 @@ class CorridorFloor:
     @property
     def ceiling_mib(self) -> int:
         """Above this at rest is unmobilised free. A FINDING, never a FAIL."""
-        law = self.mib
-        return int(round(law + law * CORRIDOR_BAND_FRACTION))
+        return corridor_ceiling_for_floor_mib(self.mib)
 
     @property
     def line(self) -> str:

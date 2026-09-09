@@ -52,7 +52,7 @@ direction reached by two SILENT routes rather than a wrong number:
       plausible and belong to the wrong cards.  M7 shifts it and requires an
       UNPRICED refusal.
 
-W-CODE: this pass owns W53 and W54.  It shipped as W52 for one revision, which
+W-CODE: this pass owns W54, W55 and W56 (#1257c renumbered W53 -> W55: #1291 claimed W53 on the base between this pass's enumeration and its merge).  It shipped as W52 for one revision, which
 #1290 already held at the base commit; the collision census could not see that
 claim because #1290 writes the code in two whitespace-free forms.  Both the
 label and the census are fixed in the same commit -- see
@@ -240,6 +240,39 @@ class TheInstrumentReproducesTheMetal(CustomTestCase):
         self.assertIsNone(why, "a priceable pool carries no refusal reason")
 
 
+def _law_floors(cards, mib=1024, group="D"):
+    """An ACTUATING floor at the stated law, for every card.
+
+    #1257c. The subject of this file is the CUT ARITHMETIC, and that is
+    unchanged: it still grades a predicted free against a floor and still
+    refuses where the world pool would shrink. What #1257c changed is WHERE
+    the floor comes from and whether an UNPRICED one may actuate at all -- so
+    these cases hand the pass a floor somebody priced, exactly as a boot with
+    a measured transient would, and the new gate gets its own class below.
+    """
+    from sglang.srt.managers.corridor_guard import CorridorFloor
+
+    return {
+        c.uuid: CorridorFloor(
+            card_uuid=c.uuid,
+            group=group,
+            transient_mib=int(mib),
+            reserve_mib=0,
+            source="MEASURED-" + group,
+            provenance="test fixture: the stated law, priced",
+        )
+        for c in cards
+    }
+
+
+def _solve(cards, budgets, dormant, sample, why=None, group="D", floors=None):
+    return cb.solve_corridor_budgets(
+        cards, budgets, dormant, sample, why,
+        floors=_law_floors(cards, group=group) if floors is None else floors,
+        group=group,
+    )
+
+
 class TheCorridorIsCheckedAtAll(CustomTestCase):
     """RED-FIRST: at 80de2d31d1 nothing compares the budget line against the
     sampler, so none of these lines exists and none of these verdicts is
@@ -247,7 +280,7 @@ class TheCorridorIsCheckedAtAll(CustomTestCase):
 
     def test_sb5f_breaches_on_the_5090_and_holds_on_both_3080s(self):
         cards, budgets, dormant = sb5f_boot()
-        solve = cb.solve_corridor_budgets(cards, budgets, dormant, sb5f_sample())
+        solve = _solve(cards, budgets, dormant, sb5f_sample())
         self.assertIsNone(solve.unpriced_reason)
         self.assertEqual(field(line_for(solve, SB5F_UUID_5090), "verdict"),
                          "REFUSED-WOULD-BIND")
@@ -258,7 +291,7 @@ class TheCorridorIsCheckedAtAll(CustomTestCase):
 
     def test_the_line_is_grepable_and_carries_every_required_field(self):
         cards, budgets, dormant = sb5f_boot()
-        solve = cb.solve_corridor_budgets(cards, budgets, dormant, sb5f_sample())
+        solve = _solve(cards, budgets, dormant, sb5f_sample())
         line = line_for(solve, SB5F_UUID_5090)
         self.assertTrue(line.startswith("WEG2-BUDGET corridor-constrained card="))
         self.assertEqual(field(line, "budget_mib"), "29352->29352")
@@ -272,7 +305,7 @@ class TheCorridorIsCheckedAtAll(CustomTestCase):
 
     def test_the_refusal_names_the_numbers_it_refuses(self):
         cards, budgets, dormant = sb5f_boot()
-        solve = cb.solve_corridor_budgets(cards, budgets, dormant, sb5f_sample())
+        solve = _solve(cards, budgets, dormant, sb5f_sample())
         line = line_for(solve, SB5F_UUID_5090)
         self.assertIn(cb.WOULD_BIND_NAME, line)
         self.assertEqual(field(line, "shortfall_mib"), "550")
@@ -293,7 +326,7 @@ class TheCorridorIsCheckedAtAll(CustomTestCase):
             tuned = replace(sc, free_load_mib=1024 - delta,
                             free_idle_mib=1024 - delta + sc.load_transient_mib)
             s2 = replace(s, cards=(tuned,) + s.cards[1:])
-            solve = cb.solve_corridor_budgets(cards, budgets, dormant, s2)
+            solve = _solve(cards, budgets, dormant, s2)
             self.assertEqual(field(line_for(solve, SB5F_UUID_5090), "verdict"), want,
                              f"predicted_free {1024 - delta} vs law 1024")
 
@@ -313,7 +346,7 @@ class MutantsOnTheDangerDirection(CustomTestCase):
         self.assertLess(p1, p0)
         # ...and the shipped solver did NOT take it.
         cards, budgets, dormant = sb5f_boot()
-        solve = cb.solve_corridor_budgets(cards, budgets, dormant, s)
+        solve = _solve(cards, budgets, dormant, s)
         self.assertEqual(list(solve.budgets), budgets, "budgets must be byte-identical")
         self.assertEqual(solve.world_pool_before, solve.world_pool_after)
 
@@ -326,7 +359,7 @@ class MutantsOnTheDangerDirection(CustomTestCase):
         s = sb5f_sample()
         big = replace(s.by_uuid[SB5F_UUID_5090], profiled_tokens=600000)
         s2 = replace(s, cards=(big,) + s.cards[1:])
-        solve = cb.solve_corridor_budgets(cards, budgets, dormant, s2)
+        solve = _solve(cards, budgets, dormant, s2)
         line = line_for(solve, SB5F_UUID_5090)
         self.assertEqual(field(line, "verdict"), "APPLIED")
         self.assertEqual(field(line, "budget_mib"), "29352->28800")
@@ -364,7 +397,7 @@ class MutantsOnTheDangerDirection(CustomTestCase):
         self.assertEqual(blind.awake_residue_mib, sc.awake_residue_mib + 518)
         self.assertEqual(cb._predicted_free_mib(32607, 29352, 1334, 0, blind), 474)
         # The shipped solve carries the measured carve and stays at 474.
-        solve = cb.solve_corridor_budgets(cards, budgets, dormant, s)
+        solve = _solve(cards, budgets, dormant, s)
         self.assertEqual(field(line_for(solve, SB5F_UUID_5090), "predicted_free_mib"),
                          "474")
         self.assertIn("carve=518", line_for(solve, SB5F_UUID_5090))
@@ -385,11 +418,11 @@ class MutantsOnTheDangerDirection(CustomTestCase):
         )
         s_mut = replace(s, cards=(replace(bare, free_load_mib=bare.free_idle_mib - 104),)
                         + s.cards[1:])
-        mut = cb.solve_corridor_budgets(cards, budgets, dormant, s_mut)
+        mut = _solve(cards, budgets, dormant, s_mut)
         self.assertEqual(field(line_for(mut, SB5F_UUID_5090), "verdict"), "SATISFIED",
                          "premise: without the residue term the card reads clean")
         self.assertEqual(field(line_for(mut, SB5F_UUID_5090), "predicted_free_mib"), "1299")
-        honest = cb.solve_corridor_budgets(cards, budgets, dormant, s)
+        honest = _solve(cards, budgets, dormant, s)
         self.assertEqual(field(line_for(honest, SB5F_UUID_5090), "verdict"),
                          "REFUSED-WOULD-BIND")
         self.assertIn("awake_residue=825", line_for(honest, SB5F_UUID_5090))
@@ -406,10 +439,10 @@ class MutantsOnTheDangerDirection(CustomTestCase):
                                            for c in s.cards))
         for c in idle_only.cards:
             self.assertEqual(c.load_transient_mib, 0, "premise: transient mutated out")
-        mut = cb.solve_corridor_budgets(cards, budgets, dormant, idle_only)
+        mut = _solve(cards, budgets, dormant, idle_only)
         self.assertEqual(field(line_for(mut, SB5F_UUID_5090), "predicted_free_mib"), "578")
         self.assertEqual(field(line_for(mut, SB5F_UUID_3080_A), "predicted_free_mib"), "1101")
-        honest = cb.solve_corridor_budgets(cards, budgets, dormant, s)
+        honest = _solve(cards, budgets, dormant, s)
         for uuid in (SB5F_UUID_5090, SB5F_UUID_3080_A, SB5F_UUID_3080_B):
             self.assertEqual(
                 int(field(line_for(honest, uuid), "predicted_free_mib")),
@@ -436,7 +469,7 @@ class MutantsOnTheDangerDirection(CustomTestCase):
         big = replace(s.by_uuid[SB5F_UUID_5090], profiled_tokens=600000)
         s2 = replace(s, cards=(big,) + s.cards[1:])
 
-        green = cb.solve_corridor_budgets(cards, budgets, dormant, s2)
+        green = _solve(cards, budgets, dormant, s2)
         self.assertEqual(field(line_for(green, SB5F_UUID_5090), "verdict"),
                          "APPLIED", "premise: this cut IS taken when priceable")
         self.assertEqual(list(green.budgets), [28800, 18136, 18120])
@@ -446,7 +479,7 @@ class MutantsOnTheDangerDirection(CustomTestCase):
             None, "simulated: the runtime's vector solver is not importable"
         )
         try:
-            red = cb.solve_corridor_budgets(cards, budgets, dormant, s2)
+            red = _solve(cards, budgets, dormant, s2)
         finally:
             cb._resolved_world_pool = real
         line = line_for(red, SB5F_UUID_5090)
@@ -480,7 +513,7 @@ class MutantsOnTheDangerDirection(CustomTestCase):
                 replace(s.cards[2], world_rank=0),
             ),
         )
-        solve = cb.solve_corridor_budgets(cards, budgets, dormant, shifted)
+        solve = _solve(cards, budgets, dormant, shifted)
         self.assertEqual(list(solve.budgets), budgets,
                          "the budget must stand byte-identical")
         self.assertEqual(len(solve.lines), 1)
@@ -490,7 +523,7 @@ class MutantsOnTheDangerDirection(CustomTestCase):
         self.assertIsNotNone(solve.unpriced_reason)
         # ...and the honest ordering still prices, so this is the SHIFT being
         # detected and not the check refusing everything.
-        ok = cb.solve_corridor_budgets(cards, budgets, dormant, s)
+        ok = _solve(cards, budgets, dormant, s)
         self.assertIsNone(ok.unpriced_reason)
 
     def test_mutant_5_missing_inputs_must_not_produce_a_default_budget(self):
@@ -521,7 +554,7 @@ class MutantsOnTheDangerDirection(CustomTestCase):
 
         for why in cases:
             sample = None
-            solve = cb.solve_corridor_budgets(cards, budgets, dormant, sample, why)
+            solve = _solve(cards, budgets, dormant, sample, why)
             self.assertEqual(list(solve.budgets), budgets,
                              "the budget must stand byte-identical")
             self.assertEqual(len(solve.lines), 1)
@@ -533,7 +566,7 @@ class MutantsOnTheDangerDirection(CustomTestCase):
         cards, budgets, dormant = sb5f_boot()
         s = sb5f_sample()
         partial = replace(s, cards=s.cards[:2], token_vector=(17, 7))
-        solve = cb.solve_corridor_budgets(cards, budgets, dormant, partial)
+        solve = _solve(cards, budgets, dormant, partial)
         self.assertEqual(list(solve.budgets), budgets)
         self.assertIn(cb.UNPRICED_NAME, solve.lines[0])
         self.assertIn("no row for card", solve.lines[0])
@@ -546,7 +579,7 @@ class TheReturnRatioIsNamedNotAssumedSilently(CustomTestCase):
 
     def test_the_assumption_is_printed_with_its_counter_evidence(self):
         cards, budgets, dormant = sb5f_boot()
-        solve = cb.solve_corridor_budgets(cards, budgets, dormant, sb5f_sample())
+        solve = _solve(cards, budgets, dormant, sb5f_sample())
         self.assertIn("return_ratio=1.0:ASSUMED", solve.lines[-1])
         self.assertIn("0.318", solve.lines[-1])
 
@@ -554,7 +587,7 @@ class TheReturnRatioIsNamedNotAssumedSilently(CustomTestCase):
         cards, budgets, dormant = sb5f_boot()
         s = replace(sb5f_sample(), budget_return_ratio=0.5,
                     budget_return_provenance="boot weg2xx two-point pair")
-        solve = cb.solve_corridor_budgets(cards, budgets, dormant, s)
+        solve = _solve(cards, budgets, dormant, s)
         self.assertIn("return_ratio=0.5:MEASURED", solve.lines[-1])
         # 550 MiB of free needed at a 0.5 return = 1100 MiB of budget.
         self.assertEqual(field(line_for(solve, SB5F_UUID_5090), "cut_mib"), "1104")
@@ -647,7 +680,7 @@ class TheBudgetProducerStaysSingular(CustomTestCase):
         cards, budgets, dormant = sb5f_boot()
         for scale in (0.8, 1.0, 1.2):
             b = [int(x * scale) // 8 * 8 for x in budgets]
-            solve = cb.solve_corridor_budgets(cards, b, dormant, sb5f_sample())
+            solve = _solve(cards, b, dormant, sb5f_sample())
             for before, after in zip(b, solve.budgets):
                 self.assertLessEqual(after, before)
 
@@ -655,19 +688,50 @@ class TheBudgetProducerStaysSingular(CustomTestCase):
         cards, budgets, dormant = sb5f_boot()
         s = sb5f_sample()
         big = replace(s.by_uuid[SB5F_UUID_5090], profiled_tokens=600000)
-        solve = cb.solve_corridor_budgets(cards, budgets, dormant,
+        solve = _solve(cards, budgets, dormant,
                                           replace(s, cards=(big,) + s.cards[1:]))
         for b in solve.budgets:
             self.assertEqual(b % 8, 0)
 
-    def test_the_pass_is_the_only_caller_of_the_law_constant(self):
+    def test_the_pass_holds_no_private_copy_of_the_law(self):
+        """STRENGTHENED by #1257c: not one assignment -- ZERO.
+
+        This used to allow exactly one ``CORRIDOR_LAW_MIB = 1024`` here and
+        pinned its value. That was already a private copy of a number
+        ``managers.corridor_guard`` declares and whose own comment forbids
+        repeating; #1257c removed it in favour of an import, so the assignment
+        count is now 0 and the identity is asserted instead.
+        """
+        from sglang.srt.managers import corridor_guard as cg
+
         src = inspect.getsource(cb)
         tree = ast.parse(textwrap.dedent(src))
         assigns = [n for n in ast.walk(tree)
                    if isinstance(n, ast.Assign)
                    and any(getattr(t, "id", "") == "CORRIDOR_LAW_MIB" for t in n.targets)]
-        self.assertEqual(len(assigns), 1)
-        self.assertEqual(assigns[0].value.value, 1024)
+        self.assertEqual(assigns, [], "no private copy of the law may return")
+        self.assertIs(cb.CORRIDOR_LAW_MIB, cg.CORRIDOR_LAW_MIB)
+        self.assertEqual(cb.CORRIDOR_LAW_MIB, 1024)
+
+    def test_an_unpriced_floor_is_a_verdict_and_never_a_cut(self):
+        """#1257c, the user decision, on THIS file's own sb5f fixture.
+
+        The 5090 predicts 474 MiB free -- 345 below the band floor the
+        fallback grades against. With no measured transient and no user
+        reserve, nothing priced that floor, so the pass says so by name and
+        every budget stands byte-identical. This is the case the whole rest of
+        the file's fixtures previously took for granted.
+        """
+        cards, budgets, dormant = sb5f_boot()
+        solve = cb.solve_corridor_budgets(
+            cards, budgets, dormant, sb5f_sample(), group="D"
+        )
+        self.assertEqual(list(solve.budgets), list(budgets))
+        self.assertFalse(solve.changed)
+        text = "\n".join(solve.lines)
+        self.assertIn(cb.UNMEASURED_FLOOR_NAME, text)
+        self.assertIn("REFUSED-UNMEASURED-FLOOR", text)
+        self.assertNotIn(" INSTALLED ", text)
 
 
 if __name__ == "__main__":
