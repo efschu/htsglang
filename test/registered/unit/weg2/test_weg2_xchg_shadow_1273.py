@@ -876,7 +876,8 @@ def test_the_shadow_moves_the_bytes_into_its_own_buffer_and_not_the_ring_s(
                 card_uuid="u0", uuid_of_card=["u0", "u1", "u2"], descs=descs,
                 is_source=True, oncard_mode=tp.ONCARD_MODE_IPC, peer_row=3,
                 wave=WAVE, leg=0, direction="P->D", epoch=f"{boot}.1",
-                free_mib=8192, log=lambda _s: None, budget_s=10.0))
+                free_mib=8192, log=lambda _s: None, budget_s=10.0,
+                slot_bytes=SLOT, oncard_slot_bytes=SLOT))
 
         thread = threading.Thread(target=source)
         thread.start()
@@ -886,6 +887,7 @@ def test_the_shadow_moves_the_bytes_into_its_own_buffer_and_not_the_ring_s(
             is_source=False, oncard_mode=tp.ONCARD_MODE_IPC, peer_row=0,
             wave=WAVE, leg=0, direction="P->D", epoch=f"{boot}.1",
             free_mib=8192, log=lambda _s: None, budget_s=10.0,
+            slot_bytes=SLOT, oncard_slot_bytes=SLOT, stripe_bytes=1 << 20,
             sum_bytes=byte_sum(dst_ops))
         thread.join(60)
         assert run.result.ran, run.result.counters.errors
@@ -936,7 +938,8 @@ def test_a_mismatch_is_counted_and_the_flip_is_never_told(region, tmp_path, boot
             card_uuid="u0", uuid_of_card=["u0", "u1", "u2"], descs=descs,
             is_source=True, oncard_mode=tp.ONCARD_MODE_IPC, peer_row=3,
             wave=WAVE, leg=0, direction="P->D", epoch=f"{boot}.1",
-            free_mib=8192, log=lambda _s: None, budget_s=10.0))
+            free_mib=8192, log=lambda _s: None, budget_s=10.0,
+            slot_bytes=SLOT, oncard_slot_bytes=SLOT))
         thread.start()
         run = sh.shadow_transport(
             region=region, sems=sems, ops=dst_ops, row=3, rank=0, device=0,
@@ -944,6 +947,7 @@ def test_a_mismatch_is_counted_and_the_flip_is_never_told(region, tmp_path, boot
             is_source=False, oncard_mode=tp.ONCARD_MODE_IPC, peer_row=0,
             wave=WAVE, leg=0, direction="P->D", epoch=f"{boot}.1",
             free_mib=8192, log=lambda _s: None, budget_s=10.0,
+            slot_bytes=SLOT, oncard_slot_bytes=SLOT, stripe_bytes=1 << 20,
             sum_bytes=byte_sum(dst_ops))
         thread.join(60)
         assert run.result.ran
@@ -975,7 +979,10 @@ def test_a_transport_failure_is_logged_and_never_raised(region, tmp_path, boot):
         descs = [flat_desc(0, 0, 512, src_ptr=dev_ptr(0, 0x10000),
                            dst_ptr=dev_ptr(0, 0x60000),
                            name="model.layers.0.self_attn.o_proj.weight")]
-        _vote_rows(region, [1, 2, 4, 5], leg=0, vote=True,
+        # Row 0 is the co-located SOURCE, which does not run in this test:
+        # without its vote the GATE is what stops the shadow, and the failure
+        # under test (the transport's) would never be reached.
+        _vote_rows(region, [0, 1, 2, 4, 5], leg=0, vote=True,
                    classes_hash=sh.classes_hash(["o_proj"]), need_mib=0)
         lines: list = []
         run = sh.shadow_transport(
@@ -984,6 +991,7 @@ def test_a_transport_failure_is_logged_and_never_raised(region, tmp_path, boot):
             is_source=False, oncard_mode=tp.ONCARD_MODE_IPC, peer_row=0,
             wave=WAVE, leg=0, direction="P->D", epoch=f"{boot}.1",
             free_mib=8192, log=lines.append, budget_s=0.4,
+            slot_bytes=SLOT, oncard_slot_bytes=SLOT, stripe_bytes=1 << 20,
             sum_bytes=byte_sum(dst_ops))
         assert not run.result.ran
         assert run.result.counters.errors, "the failure was not even recorded"
