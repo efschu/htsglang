@@ -516,6 +516,8 @@ class XchgRegion:
         #: :meth:`bind`.
         self.row: Optional[int] = None
         self.wave: int = 0
+        #: Cached mapping base address; see :meth:`base_address`.
+        self._base: int = 0
 
     # ---- lifecycle ------------------------------------------------------
 
@@ -784,6 +786,69 @@ class XchgRegion:
     def set_sem_count(self, n: int) -> None:
         """Record how many named semaphores were created for this region."""
         struct.pack_into("<Q", self._mm, HEADER_OFF + 15 * 8, int(n))
+
+    # ---- addresses and the dir area: the S4 seam ------------------------
+    #
+    # These three exist ONLY so the transport (S4) does not open a SECOND
+    # mapping of this file.  Two mappings of one region is second bookkeeping
+    # beside a truth this object already owns (upstream-minimal law): the two
+    # would have different base addresses, and ``cudaHostRegister`` on one of
+    # them would leave the other's pages unpinned while every count here said
+    # "registered".  So the transport asks this object for the address it
+    # already has, and writes into the dir area through a BOUNDED view rather
+    # than through ``_mm``.
+
+    def base_address(self) -> int:
+        """The mapping's base address -- what ``cudaHostRegister`` pins.
+
+        The whole region is registered once per rank, not slot by slot: the
+        header, gate, matrix and dir areas are read and written by the CPU on
+        the flip path, and a partially pinned mapping would make which half is
+        pinned an accident of the slot arithmetic.
+
+        Computed ONCE and cached, and the temporary that computes it is dropped
+        inside this method.  ``from_buffer`` EXPORTS the mmap's buffer for as
+        long as the ctypes object lives, and an exported buffer makes
+        ``mmap.close()`` raise ``BufferError``; a cached integer keeps that
+        window to the width of one statement instead of leaving it open for
+        every caller that ever asked for an address.
+        """
+        if self._base:
+            return self._base
+        holder = ctypes.c_char.from_buffer(self._mm)
+        self._base = ctypes.addressof(holder)
+        del holder
+        return self._base
+
+    def slot_address(self, pair: int, slot: int) -> int:
+        """Absolute address of one staging slot's payload."""
+        return self.base_address() + self.data_offset(pair, slot)
+
+    def dir_view(self):
+        """The ``[64 KiB, 1 MiB)`` dir area, as a writable ``c_ubyte`` array.
+
+        BOUNDED BY CONSTRUCTION: the array is exactly ``DATA_OFF - DIR_OFF``
+        long, so an arithmetic error inside the transport's own sub-layout
+        raises ``IndexError`` instead of reaching the header, the gate rows,
+        the matrix rows or a payload slot.  The sub-layout of this area (the S6
+        pointer table, the six IPC handles and the on-card handshake rows) is
+        owned by the transport, which is why this hands back storage and not a
+        set of typed accessors.
+
+        A ``ctypes`` array over the address rather than a ``memoryview``, and
+        that is not a style choice: a memoryview EXPORTS the mmap's buffer, and
+        an exported buffer makes ``mmap.close()`` raise -- so every caller
+        would have to release its view on every path, including the raising
+        ones, and one missed release turns :meth:`close` into a
+        ``BufferError`` at teardown.  ``from_address`` exports nothing.
+        """
+        return (ctypes.c_ubyte * (DATA_OFF - DIR_OFF)).from_address(
+            self.base_address() + DIR_OFF)
+
+    def dir_address(self) -> int:
+        """Absolute address of the dir area -- for a CUDA call that needs a
+        pointer rather than a Python buffer."""
+        return self.base_address() + DIR_OFF
 
     def mark_registered(self, row: int, *, log: Optional[Callable[[str], None]] = None) -> int:
         """Record that one rank has ``cudaHostRegister``ed this region (S4).
