@@ -14,7 +14,7 @@ concrete case for the singleness pin below rather than a hypothetical one.
 Two things are asserted here, and the second is the one that will still be
 earning its keep in a month:
 
-1.  THE VALUES. ``--p-bs`` parses to 2 and ``--d-bs`` to 4, and the argv the
+1.  THE VALUES. ``--p-bs`` parses to 2 and ``--d-bs`` to 6, and the argv the
     launcher builds for each group carries those as ``--max-running-requests``.
     A default that parses correctly but does not reach the group's argv is the
     failure this catches.
@@ -73,7 +73,7 @@ def _weg2_sources():
 
 
 def test_the_parsed_defaults_are_the_ordered_pair():
-    """--p-bs 2 and --d-bs 4, off a parse with neither flag given."""
+    """--p-bs 2 and --d-bs 6, off a parse with neither flag given."""
     from sglang.srt.weg2.launcher import build_parser
 
     ns = build_parser().parse_args(["--tree", "/t", "--tag", "x"])
@@ -201,7 +201,7 @@ def test_the_boot_record_prints_the_pair_with_its_source():
     assert "d_bs={d_bs}" in line, line
     # the source of EACH knob, read off the argv by the helper -- not a
     # comparison against the default, which would misfile an explicit
-    # `--d-bs 4` as inherited
+    # `--d-bs 6` as inherited
     assert "source={bs_source('--p-bs', argv)}|{bs_source('--d-bs', argv)}" in line, line
     # and the shipped pair travels with it, so a record is readable without
     # knowing which commit it came from
