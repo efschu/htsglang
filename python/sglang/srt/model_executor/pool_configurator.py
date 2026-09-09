@@ -553,7 +553,6 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             return 0
         rows = int(max_total_num_tokens)
         try:
-            from sglang.srt.distributed.parallel_state import get_parallel
             from sglang.srt.distributed.utils import uneven_dcp_active
             from sglang.srt.layers.dcp.owner import (
                 dcp_compact_pool_rows,
@@ -566,6 +565,17 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     dcp_size, int(get_parallel().attn_dcp_rank or 0)
                 )
                 rows = dcp_compact_pool_rows(int(max_total_num_tokens), cp_S, cp_ratio)
+        except (ImportError, AttributeError, NameError):
+            # A wrong module, a renamed accessor or a missing attribute is a
+            # DEFECT, not a topology answer. This except used to be bare, and
+            # that is precisely why the sibling of this line -- the identical
+            # wrong import in `_kv_tail_ring_post` -- reached the rig: the desk
+            # test that DOES drive this function caught the ImportError here,
+            # took the fallback, and stayed green while the same one-line
+            # mistake killed all three ranks of boot weg2kvtail3 one function
+            # further down. A programming error is raised; a topology answer is
+            # still allowed to be absent below.
+            raise
         except Exception:
             # Sizing must not fail on a topology probe; the un-sharded row
             # count is the CONSERVATIVE (larger) charge.
@@ -602,7 +612,14 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         )
         if not knobs.enabled:
             return 0, {}
-        from sglang.srt.distributed.parallel_state import get_parallel
+        # `get_parallel` is the MODULE-LEVEL import at the top of this file
+        # (`sglang.srt.runtime_context`). It is deliberately NOT re-imported
+        # here: the line that used to sit at this spot imported it from
+        # `sglang.srt.distributed.parallel_state`, which has never defined it,
+        # and shadowed the correct name that was already in scope. Because the
+        # statement sat BELOW the `knobs.enabled` gate, py_compile, the import
+        # smoke and every tail-off boot were blind to it, and it killed all
+        # three ranks of boot weg2kvtail3 at the first arm with the tail on.
         from sglang.srt.layers.dcp.owner import dcp_weighted_owner_bounds
 
         dcp_size = int(get_parallel().attn_dcp_size or 1)

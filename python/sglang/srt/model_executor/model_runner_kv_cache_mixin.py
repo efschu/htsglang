@@ -3442,7 +3442,12 @@ class ModelRunnerKVCacheMixin:
             self, "is_draft_pool_worker", False
         ):
             return None
-        from sglang.srt.distributed.parallel_state import get_parallel
+        # `get_parallel` is the MODULE-LEVEL import at the top of this file
+        # (`sglang.srt.runtime_context`); see the note in
+        # `pool_configurator._kv_tail_ring_post`. This site carried the same
+        # wrong-module shadow and is the wall the boot would have hit NEXT,
+        # one link past the sizing one -- so repairing only the site named in
+        # the weg2kvtail3 traceback would have bought exactly one more boot.
         from sglang.srt.distributed.utils import uneven_dcp_active
         from sglang.srt.layers.dcp.owner import dcp_weighted_owner_bounds
 
