@@ -91,7 +91,7 @@ class FakeEvent:
             hook(self._state.queries)
         return self.t is not None and self.t <= self._state.readable_from
 
-    def elapsed_time(self, other: "FakeEvent") -> float:
+    def elapsed_time(self, other: FakeEvent) -> float:
         assert self.t is not None and other.t is not None, (
             "elapsed_time on an unstamped event: the clock read a node the "
             "device had not executed"
