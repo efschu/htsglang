@@ -2448,7 +2448,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
                 slot=mamba_ping_pong_track_buffer_to_free,
                 extra=(
                     f"keep_idx={mamba_ping_pong_track_buffer_to_keep} "
-                    f"buf={self.req_index_to_mamba_ping_pong_track_buffer_mapping.get(req.req_pool_idx).tolist() if self.req_index_to_mamba_ping_pong_track_buffer_mapping.get(req.req_pool_idx) is not None else None}"
+                    f"buf={req.mamba_ping_pong_track_buffer.tolist() if req.mamba_ping_pong_track_buffer is not None else None}"
                 ),
             )
             self.mamba_allocator.free(mamba_ping_pong_track_buffer_to_free)
