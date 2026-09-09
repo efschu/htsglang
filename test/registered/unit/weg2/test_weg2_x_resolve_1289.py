@@ -89,6 +89,8 @@ def _front(x=SB5F_SHIPPED_X):
     f._x_since_resolve = 0
     f._x_seed_note = f"launcher solve X={x}"
     f._x_last_missing = []
+    # #1291: r_D now carries provenance too, so the stub carries its source.
+    f._x_r_d_src = "none yet"
     f.counters = collections.Counter()
     # TOLERANT ON PURPOSE, and only here: this helper must also construct
     # against the PARENT commit `4f762260ba`, where `x_flip_s_provenance` does
@@ -270,19 +272,19 @@ class TheProvenanceIsOnEveryDecision(CustomTestCase):
 
     def test_seed_before_any_leg(self):
         f = _front()
-        self.assertEqual(f.x_flip_s_provenance(), "flip_s source=seed n=0")
+        self.assertIn("flip_s source=seed n=0", f.x_flip_s_provenance())
 
     def test_live_after_the_first_leg(self):
         f = _front()
         run_producer(f, _flip_rec(3906))
-        self.assertEqual(f.x_flip_s_provenance(), "flip_s source=live n=1")
+        self.assertIn("flip_s source=live n=1", f.x_flip_s_provenance())
 
     def test_it_counts_the_legs_it_actually_holds(self):
         f = _front()
         for i, ms in enumerate(SB5F_LEGS_MS):
             run_producer(f, _flip_rec(ms, epoch=i + 1))
-        self.assertEqual(f.x_flip_s_provenance(),
-                         f"flip_s source=live n={len(SB5F_LEGS_MS)}")
+        self.assertIn(f"flip_s source=live n={len(SB5F_LEGS_MS)}",
+                      f.x_flip_s_provenance())
 
     def test_all_three_x_decision_lines_carry_it(self):
         """The re-solve, the held-no-break-even, and the no-solve."""

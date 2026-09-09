@@ -52,6 +52,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import subprocess
 import time
 from dataclasses import dataclass, field
@@ -558,6 +559,33 @@ X_REFUSAL_NAME = "W50 " + X_REFUSAL_MARKER
 #: guessed -- the renumbering note above W50 is about exactly that mistake.
 NO_ROUTE_MARKER = "Weg2NoServiceableRoute"
 NO_ROUTE_NAME = "W52 " + NO_ROUTE_MARKER
+
+#: #1291. W53 is free: the used set is W50/W51/W52, enumerated before
+#: choosing. This names a DIFFERENT fault from W52 on purpose -- W52 is "no
+#: route can serve this", W53 is "the route ran and its result did not reach
+#: the group that needed it", which is a store/carrier fault and points at a
+#: different repair.
+HANDBACK_MARKER = "Weg2StoreHandbackFailed"
+HANDBACK_NAME = "W53 " + HANDBACK_MARKER
+
+#: D states its priced extent in the W50 body it sends back
+#: (`scheduler.py::_weg2_answer_x_refusals`). Parsed rather than re-derived:
+#: it is the only number that says whether the store handed anything back.
+_D_EXTENT_RE = re.compile(r"extent after prefix matching is (\d+)")
+
+
+def _d_refusal_extent(body: bytes) -> Optional[int]:
+    """The uncached extent D priced, or None when its message does not say.
+
+    None means UNKNOWN and never 0: a caller must not read an unparsed body
+    as "the store returned nothing" -- that is the estimate-terminates trap
+    #1290 round 2 closed one layer up.
+    """
+    try:
+        m = _D_EXTENT_RE.search(body.decode(errors="replace"))
+    except Exception:  # noqa: BLE001 - a parser may never break admission
+        return None
+    return int(m.group(1)) if m else None
 
 
 def serviceable_route(uncached: int, carrier_est: int, x_tokens: int,
@@ -1234,6 +1262,10 @@ class Front:
         #: #1289: which inputs were missing at the last NO-SOLVE, so the line
         #: is emitted on every CHANGE of that set rather than once per flip.
         self._x_last_missing: List[str] = []
+        #: #1289 round 2: arrivals at D, the denominator of the solo witness.
+        self._d_admissions = 0
+        #: Where the last r_D sample came from, printed with every X decision.
+        self._x_r_d_src = "none yet"
         # C8/K7: None = derive from the last completed flip in that direction.
         self.min_dwell_ms = None if min_dwell_ms is None else float(min_dwell_ms)
         # law 5 / C6: which group is awake when nothing is pending.
@@ -2385,6 +2417,15 @@ class Front:
                    seat: Optional[Seat] = None) -> web.StreamResponse:
         g = self.groups["D"]
         g.outstanding[rid] = time.time()
+        # #1289 round 2: THE SOLO WITNESS for the r_D sample below. `r_D` is
+        # D's PREFILL rate -- tokens over the wall of a prefill D ran ALONE --
+        # so what qualifies a sample is CONCURRENCY, not a pricing verdict.
+        # `_d_admissions` counts every arrival at D; if it has not moved and
+        # D's outstanding set held only this rid at both ends, nothing else
+        # was in flight and the wall is this group's own throughput.
+        self._d_admissions += 1
+        _solo_adm0 = self._d_admissions
+        _solo_entry = len(g.outstanding) == 1
         t0 = time.time()
         if pending is not None and pending.skip_leg1:
             single_prefill = True
@@ -2510,14 +2551,45 @@ class Front:
                             rid, r.status, pt, ct, comp, max(0, pt - ct), verdict, time.time() - t0, self.epoch,
                             dterms["draft_pages"], dterms["draft_miss"], dterms["accept_len"], dterms["accept_src"])
                 # #1271 (b): r_D SAMPLE, and ONLY from a prefill D ran ALONE.
-                # `single_prefill` is concurrency one, so tokens/wall IS the
-                # group's throughput for that window -- the same unit as the
-                # per-drain r_P above. A concurrent leg-2 wall would be a
-                # latency and must never enter this deque (#1271 (a)).
+                # A concurrent leg-2 wall would be a latency and must never
+                # enter this deque (#1271 (a)).
+                #
+                # #1289 ROUND 2 -- THE GATE TESTED THE WRONG PROPERTY, and
+                # boot weg2sb5g measured the consequence: `r_d` stayed 0
+                # across 64 flips and 84 admitted D prefills, so
+                # `resolve_x_live` starved at its first line and X never
+                # re-solved (`WEG2 X NO-SOLVE: no r_d sample yet ... have
+                # r_d=0 r_p=1 flip_s=2`) even though the flip_s sampler this
+                # ticket fixed was working.
+                #
+                # The old gate admitted the verdicts `single_prefill` and
+                # `short_mispriced` and nothing else. Both are EXCEPTIONAL:
+                # the first is route CARRIER-EXCEEDS, the second a SHORT the
+                # front under-priced. The ORDINARY well-priced SHORT -- which
+                # is a D prefill and is routinely the only thing on D --
+                # returns `serve` (`_leg2_verdict`), and `serve` was excluded.
+                # sb5g's census: `verdict=serve` 24, `verdict=short` 20, and
+                # ZERO of either admitted verdict. The gate was also
+                # incoherent: `short_mispriced` is a seated SHORT running at
+                # exactly the same concurrency as `serve`, so the old rule
+                # admitted and excluded the same physical situation depending
+                # on how the front had priced it.
+                #
+                # CONCURRENCY IS THE PROPERTY, so measure concurrency. The
+                # witness is exact rather than a snapshot: `_d_admissions`
+                # not moving rules out an arrival that came and went inside
+                # this window, which `len(outstanding)` at two instants
+                # cannot.
                 _unc = max(0, pt - ct)
                 _w = time.time() - t0
-                if verdict in ("single_prefill", "short_mispriced") and _unc > 0 and _w > 0:
+                _solo = (_solo_entry
+                         and self._d_admissions == _solo_adm0
+                         and len(g.outstanding) == 1)
+                if _solo and _unc > 0 and _w > 0:
+                    self._x_r_d_src = f"solo leg2 verdict={verdict}"
                     self.note_x_sample("r_d", _unc / _w)
+                elif _unc > 0 and _w > 0:
+                    self.counters["r_d_skipped_concurrent"] += 1
                 if pt:
                     self.spans.record(text, pt)
                     self._note_exact(text, pt)
@@ -2590,6 +2662,77 @@ class Front:
         # in 503 after a median 22.0 s, every one of them a P prefill spent on
         # a verdict that could not move. So: ask once, up front, whether the
         # retry can change the answer; when it cannot, refuse by name now.
+        # #1291: A COMPLETED P LEG 1 MAKES THE RE-OFFER TERMINAL.
+        #
+        # The requeue exists to bet that a full P prefill puts the prefix in
+        # the store so D's `match_prefix` shrinks the extent below X on the
+        # second offer. If leg 1 ALREADY RAN ON P and D still refused, that
+        # bet has been placed and lost ONCE, on this exact request -- and the
+        # requeue's answer is to place it again. Boot weg2sb5g measured the
+        # result: 53 LONG routes, 104 `W50_Weg2TpPrefillExceeded`, 54
+        # `W50_requeue`, 50 `W35_Weg2XReQueueLoop`, and 3 served out of 53
+        # (natural 1/27, salad 2/26), every failure a 503 after 32-64 s.
+        #
+        # THE EVIDENCE THAT IT CANNOT PAY, from D's own log, per request:
+        #   W50 Weg2TpPrefillExceeded rid=a977bd8d... uncached=24657 X=8742
+        #   PHASE-PURITY STORE WITNESS OBSERVATION rid=a977bd8d... state=unprobed
+        # `uncached` is the WHOLE prompt -- D priced it as if P had never run
+        # -- and the witness says the store was never probed for that rid.
+        # `WEG2 X-DEFER` (the completion predicate that exists precisely to
+        # hold a request whose store read is still in flight) fired ZERO
+        # times all boot, so no read was ever pending to wait for. A second P
+        # prefill cannot change any of that.
+        #
+        # So this is a NAMED TERMINAL verdict with the numbers, not a lap.
+        # THE CONDITION IS NARROWER THAN "leg 1 ran", and the slice-A suite
+        # is why. `test_f2a/f2b/t9c` encode a real case this must NOT take:
+        # a leg-2 W31 whose store read simply had not LANDED yet, where a
+        # re-offer through P genuinely serves the client. So the terminal
+        # verdict additionally requires D'S OWN NUMBER to show that NOTHING
+        # came back -- the extent D priced is still the whole request.
+        #
+        # Same law as #1290 round 2: only a MEASURED quantity may terminate.
+        # D's refusal message carries it verbatim
+        # (`scheduler.py::_weg2_answer_x_refusals`: "...extent after prefix
+        # matching is {uncached}"); when it cannot be parsed the answer is
+        # UNKNOWN and the old re-offer stands, never a refusal on a guess.
+        d_extent = _d_refusal_extent(body)
+        handback_empty = (
+            d_extent is not None
+            and pending is not None
+            and pending.est_uncached > 0
+            and d_extent >= pending.est_uncached
+        )
+        if pending is not None and getattr(pending, "leg1_done", False) \
+                and handback_empty:
+            self.counters["W53_Weg2StoreHandbackFailed"] += 1
+            detail = (
+                f"{HANDBACK_NAME} rid={rid}: group P completed leg 1 for this "
+                f"request and group D still refused it with {X_REFUSAL_NAME} "
+                f"-- so the prefill P performed did not reach D. Re-offering "
+                f"it would run the same P prefill a second time and reach the "
+                f"same verdict, which is the W35 loop this replaces. D's "
+                f"refusal: {body.decode(errors='replace')[:300]}. Front terms: "
+                f"est_uncached={pending.est_uncached} X="
+                f"{self.tp_prefill_max_tokens} carrier_max="
+                f"{self.carrier_max_tokens} leg1_done=True requeue_n={n} "
+                f"d_extent={d_extent} (>= est_uncached, so the store handed "
+                f"back NOTHING). "
+                f"If D's `uncached` above is the WHOLE prompt, the store did "
+                f"not hand P's pages back: check D's PHASE-PURITY STORE "
+                f"WITNESS state for this rid (`unprobed` = no read was ever "
+                f"issued) and the store size against the P pool."
+            )
+            logger.error("%s", detail)
+            if seat is not None:
+                seat.release(HANDBACK_NAME)
+            return web.json_response(
+                {"error": detail, "x_tokens": self.tp_prefill_max_tokens,
+                 "est_uncached": pending.est_uncached,
+                 "carrier_max": self.carrier_max_tokens,
+                 "leg1_done": True},
+                status=413)
+
         # SAME RULE AS THE ROUTER: only a MEASURED count may terminate. D has
         # just answered, so `_note_exact` has this text's real prompt_tokens
         # -- which is exactly the case the router could not have. An estimate
@@ -3395,7 +3538,22 @@ class Front:
         buf = self._x_samples.get(kind)
         if buf is None:
             return
+        was_empty = not buf
         buf.append(float(value))
+        # #1291: THE SAMPLE THAT COMPLETES THE TRIPLE RESOLVES IMMEDIATELY.
+        # Without this, an `r_d` arriving last (the sb5g order: flip_s and r_p
+        # first, r_d starved) waits for the NEXT flip or the eighth drain
+        # before the solve it just unblocked can run -- so the term that was
+        # missing all boot buys nothing on the pass that finally supplies it.
+        # NOT for `r_p`: that kind carries #1271's deliberate every-8
+        # contract (a median over eight drain windows, not over one), and
+        # `test_red_first_x_does_not_move_before_n_samples` is that contract.
+        # The starved term on sb5g was `r_d`, and `flip_s` has its own
+        # per-leg trigger below, so completing on those two is enough.
+        if (kind != "r_p" and was_empty
+                and all(self._x_samples[k] for k in ("r_d", "r_p", "flip_s"))):
+            self.resolve_x_live()
+            return
         if kind == "flip_s":
             # Every completed leg pair. The median over the window is what
             # smooths -- not a count of legs withheld from the solver.
@@ -3418,7 +3576,13 @@ class Front:
         carried-in number from a measured one, and that is the whole defect.
         """
         n = len(self._x_samples["flip_s"])
-        return f"flip_s source={'live' if n else 'seed'} n={n}"
+        nd = len(self._x_samples["r_d"])
+        # #1289 round 2: r_D gets the same treatment as flip_s. sb5g proved
+        # the value of naming the STARVED term: the NO-SOLVE line said
+        # "no r_d sample yet" and that one word located the defect.
+        return (f"flip_s source={'live' if n else 'seed'} n={n} "
+                f"r_d source={'live' if nd else 'none'} n={nd} "
+                f"src={self._x_r_d_src}")
 
     def resolve_x_live(self) -> Optional[int]:
         """Re-solve X from the boot's own medians; return the new X or None.

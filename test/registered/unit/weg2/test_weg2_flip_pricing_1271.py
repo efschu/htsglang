@@ -131,6 +131,8 @@ class RollingResolve(CustomTestCase):
         # field the real one has is a test that passes on a shape production
         # never runs -- which is how this ticket's defect stayed green here.
         f._x_last_missing = []
+        # #1291: r_D now carries provenance too, so the stub carries its source.
+        f._x_r_d_src = "none yet"
         f.counters = collections.Counter()
         f.note_x_sample = Front.note_x_sample.__get__(f)
         f.resolve_x_live = Front.resolve_x_live.__get__(f)
