@@ -53,7 +53,6 @@ try:
     from sglang.srt.weg2 import ring_table
     from sglang.srt.weg2.launcher import (
         P_DRAFT_KV_FLAGS,
-        P_MAX_TOTAL_TOKENS,
         argv_d,
         argv_p,
         draft_kv_off_line,
@@ -84,10 +83,16 @@ RG6_PP2_MEASURED_IMAGE_MIB = 9730.0
 RG6_PP2_RESIDUAL_MIB = 1344.2
 
 
+#: #1305 item 2: the cap is the SHIPPED cut's priced pool, handed to argv_p by
+#: the caller that holds PCutFacts (weg2sn5pre priced 42,11,11 at 463,763); it
+#: is no longer a launcher constant, so this fixture supplies one.
+P_CAP = 463763
+
+
 def p(**kw):
     args = dict(
         py=PY, model=MODEL, budgets=BUDGETS, s_gb=48, m_mib=2400, store_cfg=STORE_CFG,
-        extra=[],
+        extra=[], p_max_total_tokens=P_CAP,
     )
     args.update(kw)
     return argv_p(**args)
@@ -122,7 +127,7 @@ class TestArgvCarriesTheSwitch(unittest.TestCase):
             self.assertIn(flag, argv, f"{flag} missing from the on form")
         self.assertEqual(len([t for t in argv if t.startswith("--speculative")]), 5)
         self.assertEqual(
-            argv[argv.index("--max-total-tokens") + 1], str(P_MAX_TOTAL_TOKENS)
+            argv[argv.index("--max-total-tokens") + 1], str(P_CAP)
         )
         # The values are D's, byte-for-byte (they hash into the drafter
         # identity, W5) -- a value drift here is a W10 refusal on metal.
@@ -206,7 +211,7 @@ class TestFormKeyDiscriminates(unittest.TestCase):
                 "--speculative-eagle-topk=1",
                 "--speculative-num-draft-tokens=3",
                 "--speculative-draft-kv-only",
-                f"--max-total-tokens={P_MAX_TOTAL_TOKENS}",
+                f"--max-total-tokens={P_CAP}",
             },
         )
         self.assertEqual(set(off_norm.split(" ")) - set(on_norm.split(" ")), set())

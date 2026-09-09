@@ -467,6 +467,15 @@ class CutDecision:
     #: priced against -- a pool figure whose constraint is not beside it is the
     #: shape that let weg2sb5f's +64.1 % sit in plain sight.
     pool_floor: Optional[int] = None
+    #: WHERE ``pool_floor`` came from (#1305): ``"none"`` (no floor),
+    #: ``"flag"`` (``--pp-solve-pool-floor N``, the operator's number) or
+    #: ``"default-from-ordered-cut"`` (read off THIS decision's frontier as the
+    #: priced pool of :attr:`pool_floor_cut`).  Carried on the decision for
+    #: the reason ``pool_floor`` is: the same ``pool_floor=578199`` wants
+    #: opposite responses from a reader depending on which of the three it is.
+    pool_floor_source: str = "none"
+    #: The ordered cut the default floor was derived from, or ``None``.
+    pool_floor_cut: Optional[Tuple[int, ...]] = None
     #: The non-dominated (time, pool) curve over the SERVABLE field, fastest
     #: first (:func:`pareto_frontier`).
     frontier: Tuple[CutCandidate, ...] = ()
@@ -779,6 +788,108 @@ def ms_per_layer_from_card_library(
     )
 
 
+def derive_pool_floor_from_cut(
+    frontier: Sequence[CutCandidate],
+    servable: Sequence[CutCandidate],
+    ordered_cut: Sequence[int],
+    cost_provenance: str,
+) -> Tuple[int, str, Tuple[int, ...]]:
+    """#1305: the DEFAULT pool floor, read off THIS solve's frontier.
+
+    ``(floor_tokens, "default-from-ordered-cut", ordered_cut)``, where the
+    floor is the priced pool of the ordered cut ON THE FRONTIER.  Under
+    "fastest cut that clears F" (:func:`choose_under_floor`, objective
+    makespan) that floor selects the ordered cut EXACTLY: every faster point
+    of a Pareto frontier holds strictly less pool, so none of them clears it,
+    and the ordered cut is the fastest of those that do.  The rule needs no
+    interval, no midpoint and no tolerance, because the floor and the frontier
+    it constrains come out of the SAME solve on the SAME inputs -- the drift a
+    hand constant suffered on boot weg2sn5pre (448,027 against an interval
+    that had moved to (482768, 578199]) cannot occur between two numbers that
+    are computed together.
+
+    THE CUT IS MATCHED ON LAYER COUNTS AND KIND (contiguous).  The attention
+    vector is the one those counts land on (``attention_counts``), so it is
+    not a second key; a cut named by counts has exactly one realizable
+    attention split.
+
+    OFF THE FRONTIER IS A REFUSAL, BY NAME, and the refusal says WHICH of the
+    two ways it is off: DOMINATED (priced and servable, but some other cut is
+    no slower and no smaller -- named, with both axes) or UNPRICED (not in the
+    servable field at all: a stage does not fit, or the map is not
+    realizable).  Both print the frontier through the same note the W40
+    refusals carry.  Neither ships a neighbour: the operator ordered a cut, and
+    a boot that quietly runs a different one under the order's name is the
+    defect this whole knob exists to make impossible.
+    ``--pp-solve-pool-floor N`` (an explicit floor) or ``0`` (off) are the two
+    ways past this refusal, and the message names them.
+    """
+    want = tuple(int(n) for n in ordered_cut)
+    for c in frontier:
+        if c.kind == "contiguous" and tuple(c.layers) == want:
+            return int(c.pool_tokens), "default-from-ordered-cut", want
+    cut_s = ",".join(str(n) for n in want)
+    priced = next(
+        (c for c in servable if c.kind == "contiguous" and tuple(c.layers) == want),
+        None,
+    )
+    if priced is not None:
+        dominators = [
+            c
+            for c in frontier
+            if float(c.total_ms) <= float(priced.total_ms)
+            and float(c.pool_tokens) >= float(priced.pool_tokens)
+            and c is not priced
+        ]
+        best = (
+            max(dominators, key=lambda c: (float(c.pool_tokens), -float(c.total_ms)))
+            if dominators
+            else None
+        )
+        how = (
+            "DOMINATED: it is priced at pool %d / %.1f ms, and %s"
+            % (
+                int(priced.pool_tokens),
+                priced.total_ms,
+                (
+                    "%s attn %s holds %d tokens in %.1f ms -- no slower and no smaller"
+                    % (
+                        ",".join(str(n) for n in best.layers),
+                        ",".join(str(a) for a in best.attn),
+                        int(best.pool_tokens),
+                        best.total_ms,
+                    )
+                    if best is not None
+                    else "another servable cut is no slower and no smaller"
+                ),
+            )
+        )
+    else:
+        how = (
+            "UNPRICED: no servable candidate carries these layer counts (a "
+            "stage does not fit its weights, mamba state and arming floor on "
+            "this boot's budgets, or the cut is not realizable)"
+        )
+    raise PPCutRefused(
+        "W67 Weg2PPCutOrderedCutOffFrontier: the ordered cut %s (user order "
+        "2026-09-09: '39,13,12 mit bs2 im pp layout soll standard werden "
+        "vorerst') is NOT on this boot's frontier, so no default pool floor "
+        "can be derived from it -- %s. Refusing rather than shipping a "
+        "neighbour under the order's name. Pass --pp-solve-pool-floor N to "
+        "floor the pool explicitly, or --pp-solve-pool-floor 0 to boot the "
+        "unfloored --pp-solve-objective winner. Cost model: %s%s"
+        % (
+            cut_s,
+            how,
+            cost_provenance,
+            _floor_frontier_note(
+                servable,
+                int(priced.pool_tokens) if priced is not None else 0,
+            ),
+        )
+    )
+
+
 def choose_under_floor(
     feasible: Sequence[CutCandidate],
     *,
@@ -851,6 +962,7 @@ def solve_launch_cut(
     pinned_layer_set: Optional[str] = None,
     objective: str = "maxkv",
     pool_floor: Optional[int] = None,
+    pool_floor_from_cut: Optional[Sequence[int]] = None,
 ) -> CutDecision:
     """Choose the layer + attention cut, for ``objective``, among the feasible.
 
@@ -868,6 +980,16 @@ def solve_launch_cut(
     never the fastest cut below it: a floor that silently degrades is a floor
     the operator cannot rely on, and the whole reason it exists is that the
     #1286 repricing put the makespan winner at 43 % of the incumbent's pool.
+
+    ``pool_floor_from_cut`` (#1305) is the ORDERED CUT, and it is consulted
+    only when ``pool_floor`` is None: the floor is then READ OFF THIS SOLVE'S
+    OWN FRONTIER as the priced pool of that cut
+    (:func:`derive_pool_floor_from_cut`), so it cannot drift away from the
+    frontier it constrains -- which is exactly what a hand constant did on
+    boot weg2sn5pre (448,027 against a frontier whose selecting interval had
+    moved to (482768, 578199]; the order was quoted and 42,11,11 shipped).
+    A cut that is not on the frontier is a ``W67`` refusal, never a
+    neighbour.  An explicit ``pool_floor`` outranks the derivation.
 
     ``pinned_layers``/``pinned_attn``: when the operator passed the existing
     flags explicitly, they WIN -- but they win by being announced with the
@@ -1098,6 +1220,19 @@ def solve_launch_cut(
     # Two floors, one predicate: the binding bound is whichever is higher, and
     # the two are kept separate only in the REFUSALS, where they name different
     # flags for the operator to move.
+    # THE CURVE, over the servable field and independent of both floors: it is
+    # the field's shape, not the choice's, and an operator setting a floor
+    # needs to see the points the floor excludes as much as the ones it keeps.
+    frontier = pareto_frontier(choosable)
+    # #1305: THE DEFAULT FLOOR IS READ OFF THAT CURVE, BEFORE ANY FLOOR IS
+    # APPLIED -- to the pinned paths below as much as to the solved one, so a
+    # pin is judged against the order's floor exactly as a solved cut is.
+    pool_floor_source = "none" if pool_floor is None else "flag"
+    pool_floor_cut: Optional[Tuple[int, ...]] = None
+    if pool_floor is None and pool_floor_from_cut is not None:
+        pool_floor, pool_floor_source, pool_floor_cut = derive_pool_floor_from_cut(
+            frontier, choosable, pool_floor_from_cut, cost_provenance
+        )
     _floors = [float(cap_tokens)] + (
         [float(pool_floor)] if pool_floor is not None else []
     )
@@ -1106,10 +1241,6 @@ def solve_launch_cut(
     makespan_row = min(
         _floor_ok or choosable, key=lambda c: (c.total_ms, -c.pool_tokens)
     )
-    # THE CURVE, over the servable field and independent of both floors: it is
-    # the field's shape, not the choice's, and an operator setting a floor
-    # needs to see the points the floor excludes as much as the ones it keeps.
-    frontier = pareto_frontier(choosable)
 
     def _check_floors(priced: CutCandidate, what: str) -> None:
         refuse_below_floors(
@@ -1186,6 +1317,8 @@ def solve_launch_cut(
             objective=str(objective),
             makespan=makespan_row,
             pool_floor=None if pool_floor is None else int(pool_floor),
+            pool_floor_source=pool_floor_source,
+            pool_floor_cut=pool_floor_cut,
             frontier=frontier,
             servable=tuple(choosable),
         )
@@ -1311,6 +1444,8 @@ def solve_launch_cut(
         objective=str(objective),
         makespan=makespan_row,
         pool_floor=None if pool_floor is None else int(pool_floor),
+        pool_floor_source=pool_floor_source,
+        pool_floor_cut=pool_floor_cut,
         frontier=frontier,
         servable=tuple(choosable),
     )

@@ -56,67 +56,61 @@ DEFAULT_P_BS = 2
 #: 6 by the order of 2026-09-09 quoted above ("nicht mehr bs4").
 DEFAULT_D_BS = 6
 
-#: K3 -- THE P CUT'S POOL FLOOR, moved here from ``launcher.py`` by the serve-next5
-#: train (2026-09-09): the three shipped operating-point constants of the two
-#: user orders of that day live in ONE place, and ``launcher`` imports this one
-#: exactly as it imports the bs pair above (upstream-minimal: one home, not two).
-#: Its only consumer is still ``launcher.resolve_pool_floor``.
-#: THE SHIPPED FLOOR UNDER ``--pp-solve-objective``, in WORLD KV TOKENS, and
-#: WRITTEN EXACTLY ONCE (the pin in
-#: ``test/registered/unit/weg2/test_weg2_p_cut_default_0909.py`` keeps it that
-#: way, the same way ``DEFAULT_P_BS`` is pinned on its own branch).
+#: K3 -- THE ORDERED P CUT, from which the solver's POOL FLOOR is DERIVED AT
+#: BOOT.  Moved here from ``launcher.py`` by the serve-next5 train (2026-09-09)
+#: as a pool-token CONSTANT (448,027) and REPLACED on the same train by the
+#: serve-next5 fixer (#1305) with the CUT the order actually names: the three
+#: shipped operating-point constants of the two user orders of that day live
+#: in ONE place, and ``launcher`` imports this one exactly as it imports the bs
+#: pair above (upstream-minimal: one home, not two).  Its only consumer is
+#: ``launcher.resolve_pool_floor``, which hands it to the solver.
 #:
 #: THE ORDER IN FORCE, user 2026-09-09, verbatim: "39,13,12 mit bs2 im pp
 #: layout soll standard werden vorerst."
 #:
 #: THE CUT IS STILL SOLVED, NOT PINNED, and that distinction is the whole
-#: reason this is a floor and not a ``--pp-stage-ratio``.  A hand pin would
-#: make ``39,13,12`` survive a card change, a checkpoint change or a re-measure
-#: that made it wrong; the solver stays the authority and this number only says
-#: HOW MUCH POOL the boot refuses to go below.  ``--pp-solve-objective``
-#: (makespan, itself a user default since 2026-09-08) then ranks over what is
-#: left, so the shipped rule reads "the FASTEST cut that still holds
-#: 448,027 tokens" -- and on this rig's frontier that is 39,13,12.
+#: reason this is a floor's SOURCE and not a ``--pp-stage-ratio``.  A hand pin
+#: would make ``39,13,12`` survive a card change, a checkpoint change or a
+#: re-measure that made it wrong; the solver stays the authority.  What the
+#: order changes is a CONSTRAINT under ``--pp-solve-objective`` (makespan,
+#: itself a user default since 2026-09-08): the floor under the shipped pool.
 #:
-#: WHY THIS NUMBER -- the rule, so the next re-solve can redo it rather than
-#: copy it.  Read off the ``PP-CUT FRONTIER`` line of #1286b (SECTION 1am-b,
-#: ``/spinning/gpu-arb/weg2/WEG2_BUILD_DECISIONS_0906.md``), the two frontier
-#: points that bracket the order are
+#: THE RULE (#1305, operator ruling of 2026-09-09 after boot weg2sn5pre):
+#: the floor is NOT a number written here.  It is READ OFF THIS BOOT'S OWN
+#: FRONTIER by the solver: ``floor = pool(ordered cut)`` where the pool is
+#: the one the solver just priced for 39,13,12 on this boot's census budgets.
+#: Under "fastest cut that clears F" with F equal to the ordered cut's own
+#: pool, the ordered cut is selected exactly (every faster frontier point
+#: holds strictly less pool, by the definition of the frontier), and the
+#: floor can never drift away from the frontier it is judged against,
+#: because both are computed from the same inputs in the same solve.
 #:
-#:     40,12,12 / 10,3,3   total_ms=417.6   pool=414654   <- next FASTER
-#:     39,13,12 /  9,4,3   total_ms=420.1   pool=481400   <- THE ORDER
+#: WHY NOT A NUMBER, measured: the previous form was the midpoint 448,027 of
+#: the #1286b interval (414654, 481400] read off boot 68308f7fae's frontier
+#: (record SECTION 1bf).  On the merged tree the census budgets changed
+#: (corridor law 7d69c132e2, MEASURED-P floors) and the whole frontier moved
+#: up in pool -- the interval that selects 39,13,12 became (482768, 578199]
+#: -- so boot weg2sn5pre (2026-09-09, tip 319e76d60b) printed the order on
+#: its provenance line and SHIPPED 42,11,11.  A hand-derived constant against
+#: a frontier that moves with every census change is the defect CLASS, not
+#: an instance; a constant "corrected" to 530,483 would have failed the same
+#: way on the next re-price.
 #:
-#: Under "fastest above F" the order is selected for any F in the half-open
-#: interval (414654, 481400].  The floor is the MIDPOINT of that interval,
-#: (414654 + 481400) // 2 = 448027: it sits 33,373 tokens from each boundary,
-#: which is the largest equal headroom the interval allows.
+#: WHEN THE ORDERED CUT IS NOT ON THE FRONTIER (dominated by another cut, or
+#: not priceable on this rig's budgets), the solver REFUSES BY NAME
+#: (``W67 Weg2PPCutOrderedCutOffFrontier``, planner/pp_cut_launch.py) and
+#: prints the frontier and the dominating cut, instead of silently shipping a
+#: neighbour.  ``--pp-solve-pool-floor N`` stays the operator's explicit
+#: override (a number outranks the derivation), and ``--pp-solve-pool-floor
+#: 0`` turns the floor OFF and restores the unfloored makespan byte for byte.
 #:
-#: A floor survives a uniform re-pricing of the frontier by factor s only while
-#: it stays inside (414654*s, 481400*s], so every floor has TWO tolerances --
-#: how far pools may GROW before 40,12,12 clears it too and wins on speed, and
-#: how far they may SHRINK before 39,13,12 stops clearing it -- and the SMALLER
-#: of the two is the one that fails first.  The midpoint tolerates +8.05 %%
-#: growth and -6.93 %% shrink, so 6.93 %% binds.
+#: THE TRADE THE ORDER BOUGHT, on the weg2sn5pre frontier so nobody re-derives
+#: it as a regression: 39,13,12 (578,199 tokens / 421.4 ms per chunk) against
+#: the unfloored makespan winner 44,10,10 (387,411 / 367.2 ms) is +49.3 %%
+#: pool for +14.8 %% ms/chunk; against 42,11,11 (463,763 / 378.2 ms), the cut
+#: the constant shipped, +24.7 %% pool for +11.4 %% ms/chunk.  The user chose
+#: the knee; the value fork is the user's (record SECTION 1bg).
 #:
-#: THE REJECTED RULE, named because it is the obvious one: "39,13,12's priced
-#: pool minus the priced-vs-realised tolerance" gives 481400 * 0.999 = 480918.
-#: It tolerates +15.98 %% growth -- better than the midpoint -- but only
-#: -0.10 %% shrink, and that is not a coincidence: subtracting a 0.10 %%
-#: tolerance BUILDS a 0.10 %% shrink margin, so the rule's binding margin is
-#: always exactly the measurement error it was derived from (0.10 %% MEASURED,
-#: weg2sb5f priced 304,946 against 304,655 realised).  A margin the size of
-#: one's own error is no margin: the first re-price that shaved a tenth of a
-#: percent off the pool would silently ship 38,13,13 (453.4 ms) or refuse.
-#: Ranked on distance from the LOWER boundary alone the rejected rule looks
-#: like the better one, which is exactly why that is not the comparison -- the
-#: test asserts it on the binding margin, 6.93 %% against 0.10 %%, 69x.
-#:
-#: THE TRADE THE ORDER BOUGHT, so nobody re-derives it as a regression: against
-#: the unfloored makespan winner 44,10,10 (359.0 ms / 304,946 tokens) this is
-#: +17.0 %% ms/chunk for +57.9 %% pool.  The user chose the knee.
-#:
-#: OFF IS STILL REACHABLE AND STILL EXACT: ``--pp-solve-pool-floor 0`` restores
-#: the unfloored makespan byte for byte.  The floor is PROVISIONAL in the same
-#: sense the bs pair is -- "vorerst" is in the order -- so re-measuring it must
-#: stay an edit to THIS ONE LINE.
-DEFAULT_PP_SOLVE_POOL_FLOOR = 448_027
+#: PROVISIONAL in the same sense the bs pair is -- "vorerst" is in the order
+#: -- so re-ordering the cut must stay an edit to THIS ONE LINE.
+DEFAULT_PP_ORDERED_CUT = (39, 13, 12)

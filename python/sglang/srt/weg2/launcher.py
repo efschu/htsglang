@@ -60,7 +60,7 @@ from sglang.srt.managers import corridor_guard
 from sglang.srt.weg2 import admin_key as admin_key_mod
 from sglang.srt.registry import nvml as nvml_registry
 from sglang.srt.weg2 import corridor_budget, host_ledger, ring_table
-from sglang.srt.weg2 import DEFAULT_D_BS, DEFAULT_P_BS, DEFAULT_PP_SOLVE_POOL_FLOOR
+from sglang.srt.weg2 import DEFAULT_D_BS, DEFAULT_P_BS, DEFAULT_PP_ORDERED_CUT
 
 MIB = 1024 * 1024
 PORT_FRONT = 30030
@@ -328,10 +328,7 @@ MODEL_DEFAULT = "/spinning/llm_stuff/club-3090/models-cache/Qwen3.8-27B-INT8-gdn
 #: The next boot's L2 `resident_mib` replaces 1618.2 here, with its tag.
 P_DRAFT_RESIDENT_BUDGET_MIB = 405.2 + 1213.0
 P_DRAFT_RESIDENT_TOL_MIB = 256.0
-P_WEG2ZR2_LAST_STAGE_NVML_FREE_MIN_MIB = 1450.0
-P_WEG2ZR2_LAST_STAGE_KV_POOL_MIB = 5584.4
 P_CORRIDOR_TOP_MIB = 1229.0
-P_BYTES_PER_TOKEN = 8192 + 2048
 
 #: Group P's per-stage CAPABILITY SCORES, in stage order (ordinal 0 = the
 #: 5090) -- what ``--pp-stage-ratio`` takes.  NOT a layer split: fix 5, after
@@ -388,14 +385,6 @@ P_PP_INCUMBENT_FMT = "%s / attention %s" % (
 )
 
 
-def derive_p_max_total_tokens() -> int:
-    pool_new = (P_WEG2ZR2_LAST_STAGE_NVML_FREE_MIN_MIB + P_WEG2ZR2_LAST_STAGE_KV_POOL_MIB
-                - P_DRAFT_RESIDENT_BUDGET_MIB - P_CORRIDOR_TOP_MIB)
-    return int(pool_new * 2**20 / P_BYTES_PER_TOKEN) // 1000 * 1000
-
-
-P_MAX_TOTAL_TOKENS = derive_p_max_total_tokens()
-assert P_MAX_TOTAL_TOKENS == 428000, P_MAX_TOTAL_TOKENS
 #: #1264 ``--draft-kv-on-p``.  THE WHOLE PRODUCER FORM OF GROUP P, in one
 #: place, so that ``on`` and ``off`` differ by the presence of ONE list and
 #: not by five ``if``s scattered through ``argv_p``.
@@ -403,14 +392,21 @@ assert P_MAX_TOTAL_TOKENS == 428000, P_MAX_TOTAL_TOKENS
 #: The four speculative flags are group D's, BYTE-FOR-BYTE (they hash into the
 #: drafter identity, W5); ``--speculative-draft-kv-only`` is the silencer that
 #: turns that head into a draft-KV PRODUCER instead of a verifier.
-#: ``--max-total-tokens`` is in the SAME list and not beside it, because its
-#: derivation (:func:`derive_p_max_total_tokens`) subtracts
-#: :data:`P_DRAFT_RESIDENT_BUDGET_MIB` -- the MTP head plus the resident
-#: embedding -- from the last stage's pool.  With no head on that stage the
-#: subtrahend is zero and the number is not merely unnecessary but WRONG (it
-#: would hand back 1618 MiB of pool the boot could have used), and the rg6
-#: baseline carried no such flag at all.  A term whose premise is the head
-#: belongs to the head.
+#: ``--max-total-tokens`` rides WITH this list (``argv_p`` appends it right
+#: behind these flags, only in the ``on`` form) and its VALUE is no longer a
+#: constant: until 2026-09-09 it was ``P_MAX_TOTAL_TOKENS = 428000``, derived
+#: once from boot weg2zr2's last-stage numbers minus the draft residue.  On
+#: boot weg2sn5pre that constant was the BINDING term of group P's pool: P's
+#: own sizing gave 463,289 tokens on the binding rank against the solver's
+#: priced 463,763 (0.1 %%), and the cap cut the realised pool to 428,000
+#: (-7.7 %%) -- BELOW the pool floor the boot claimed to hold.  The cap is
+#: now the SHIPPED CUT'S PRICED POOL (``PCutFacts.pool_tokens``), the number
+#: the #1286 pool model already charges the head against (``stage_fixed``
+#: on the last stage), so realised = min(P's own sizing, priced) and the
+#: floor binds the REALISED pool by construction.  Still head-scoped: in the
+#: ``off`` form there is no head to make room for and the rg6 baseline
+#: carried no such flag at all.  A term whose premise is the head belongs to
+#: the head.
 #: #1241 (refuter MF-6). THE BOOT'S SPEC AND KV FACTS, ONE WRITER.
 #:
 #: These five values were literals in FIVE places: the P draft-KV flag tuple,
@@ -433,7 +429,6 @@ P_DRAFT_KV_FLAGS: Tuple[str, ...] = (
     "--speculative-eagle-topk", str(SPEC_EAGLE_TOPK),
     "--speculative-num-draft-tokens", str(SPEC_NUM_DRAFT_TOKENS),
     "--speculative-draft-kv-only",
-    "--max-total-tokens", str(P_MAX_TOTAL_TOKENS),
 )
 #: The standing user order of 2026-09-07 is draft KV ACROSS THE FLIP, so the
 #: producer is the default.  ``off`` is the serving-base / A-B form and is
@@ -708,50 +703,115 @@ def resolve_x(override: Optional[int], evidence_dir: str, floor_tokens: int) -> 
     ), False)
 
 
-def resolve_pool_floor(override: Optional[int]) -> Tuple[Optional[int], str]:
-    """The P-cut POOL FLOOR and its PROVENANCE LINE -- value, source, order.
+def resolve_pool_floor(
+    override: Optional[int],
+) -> Tuple[Optional[int], Optional[Tuple[int, ...]], str]:
+    """The P-cut POOL FLOOR's SOURCE and its RULE LINE -- before the solve.
 
     Same shape as :func:`resolve_x` for the same reason: a number that can come
     from two places must publish WHICH, or the boot log cannot be read back.
     Three states, and the middle one is the one a reader gets wrong:
 
-    * flag ABSENT -> ``DEFAULT_PP_SOLVE_POOL_FLOOR``, ``source=default``.  The
-      default is not a neutral value: it ENCODES the user order of 2026-09-09
-      and is the reason a boot ships 39,13,12 rather than the unfloored
-      makespan winner, so the order is quoted on the line itself.
-    * flag <= 0 -> ``None``, ``source=flag``.  OFF, exactly: ``None`` is what
-      the solver saw before #1286b existed, so ``--pp-solve-pool-floor 0``
-      restores the unfloored makespan byte for byte rather than approximately.
-      A floor of literally zero would be indistinguishable in effect but would
-      print ``pool_floor=0``, and an instrument that says a floor is armed when
-      none is, is the class this rig calls instrument-text-lies.
-    * flag > 0 -> that value, ``source=flag``.  The operator outranks the
-      default; nothing warns, because choosing the number is the flag's job.
+    * flag ABSENT -> ``(None, DEFAULT_PP_ORDERED_CUT, rule)``: the floor is NOT
+      a number yet.  It is READ OFF THIS BOOT'S OWN FRONTIER by the solver as
+      the priced pool of the ordered cut (#1305,
+      ``pp_cut_launch.derive_pool_floor_from_cut``), and the solver refuses by
+      name (``W67``) when that cut is not on the frontier.  The numeric line
+      is therefore logged AFTER the solve (:func:`pool_floor_line`); this
+      function only states the rule, so a refusal inside the solve still has
+      the source on the record above it.  The previous form -- a constant
+      448,027 typed here as the midpoint of an interval read off ONE boot's
+      frontier -- shipped 42,11,11 under the order's name on boot weg2sn5pre
+      when the census budgets moved the frontier; the operator ruled the
+      constant out (record SECTION 1bg).
+    * flag <= 0 -> ``(None, None, ...)``, ``source=flag``.  OFF, exactly:
+      ``None`` is what the solver saw before #1286b existed, so
+      ``--pp-solve-pool-floor 0`` restores the unfloored makespan byte for
+      byte rather than approximately.  A floor of literally zero would be
+      indistinguishable in effect but would print ``pool_floor=0``, and an
+      instrument that says a floor is armed when none is, is the class this
+      rig calls instrument-text-lies.
+    * flag > 0 -> ``(that value, None, ...)``, ``source=flag``.  The operator
+      outranks the derivation; nothing warns, because choosing the number is
+      the flag's job.
 
     The cut itself stays SOLVED either way -- this only bounds the set
     ``--pp-solve-objective`` ranks over.
     """
+    cut_s = ",".join(str(n) for n in DEFAULT_PP_ORDERED_CUT)
     if override is None:
-        floor = int(DEFAULT_PP_SOLVE_POOL_FLOOR)
-        return floor, (
-            f"pool_floor={floor} source=default -- the SHIPPED default, user order "
-            f"2026-09-09 verbatim: '39,13,12 mit bs2 im pp layout soll standard "
-            f"werden vorerst'. Midpoint of (414654, 481400], the frontier interval "
-            f"on which makespan selects 39,13,12; the cut stays solver-chosen, this "
-            f"only floors the pool. --pp-solve-pool-floor 0 turns it off"
+        return None, tuple(int(n) for n in DEFAULT_PP_ORDERED_CUT), (
+            f"source=default-from-ordered-cut {cut_s} -- the SHIPPED default, user "
+            f"order 2026-09-09 verbatim: '39,13,12 mit bs2 im pp layout soll standard "
+            f"werden vorerst'. The floor is READ OFF THIS BOOT'S FRONTIER by the solve "
+            f"below as the priced pool of {cut_s} (#1305: no constant, no interval, "
+            f"no midpoint -- a number typed here drifted off a moved frontier on boot "
+            f"weg2sn5pre); the cut stays solver-chosen, the floor only bounds the "
+            f"pool. Not on the frontier = W67 refusal, never a neighbour. "
+            f"--pp-solve-pool-floor N overrides, 0 turns it off"
         )
     if int(override) <= 0:
-        return None, (
+        return None, None, (
             f"pool_floor=none source=flag (--pp-solve-pool-floor {int(override)}) -- OFF by "
             f"operator override; the objective ranks over the unfloored feasible set, "
-            f"which is the pre-#1286b behaviour exactly. The shipped default "
-            f"{int(DEFAULT_PP_SOLVE_POOL_FLOOR)} (user order 2026-09-09) is NOT in force"
+            f"which is the pre-#1286b behaviour exactly. The shipped default (the floor "
+            f"of the ordered cut {cut_s}, user order 2026-09-09) is NOT in force"
         )
-    return int(override), (
+    return int(override), None, (
         f"pool_floor={int(override)} source=flag (--pp-solve-pool-floor) -- operator "
-        f"override; the shipped default {int(DEFAULT_PP_SOLVE_POOL_FLOOR)} (user order "
-        f"2026-09-09, '39,13,12 ... soll standard werden vorerst') is NOT in force"
+        f"override; the shipped default (the floor of the ordered cut {cut_s}, user "
+        f"order 2026-09-09, '39,13,12 ... soll standard werden vorerst') is NOT in force"
     )
+
+
+def pool_floor_line(decision) -> str:
+    """THE ``PP-CUT POOL FLOOR:`` line, from the decision, AFTER the solve.
+
+    Pure, so a desk test can render it.  Three sources, one format:
+    ``pool_floor=<n|none> source=<flag|default-from-ordered-cut <cut>|none>``.
+    Printed after the solve because under the default the NUMBER exists only
+    once the frontier does (#1305); the rule was printed before the solve by
+    :func:`resolve_pool_floor` so a refusal inside the solve is attributable.
+    """
+    src = str(getattr(decision, "pool_floor_source", "none") or "none")
+    floor = getattr(decision, "pool_floor", None)
+    cut = getattr(decision, "pool_floor_cut", None)
+    if src == "default-from-ordered-cut" and cut is not None:
+        cut_s = ",".join(str(n) for n in cut)
+        return (
+            f"PP-CUT POOL FLOOR: pool_floor={int(floor)} "
+            f"source=default-from-ordered-cut {cut_s} (frontier of this boot) -- "
+            f"user order 2026-09-09: '39,13,12 mit bs2 im pp layout soll standard "
+            f"werden vorerst'; the floor is the priced pool of {cut_s} on the "
+            f"PP-CUT FRONTIER line of THIS boot, so 'fastest cut that clears it' "
+            f"selects {cut_s} exactly (#1305)"
+        )
+    if src == "flag":
+        return (
+            f"PP-CUT POOL FLOOR: pool_floor={int(floor)} source=flag "
+            f"(--pp-solve-pool-floor, operator override; the ordered-cut default "
+            f"is NOT in force)"
+        )
+    return (
+        "PP-CUT POOL FLOOR: pool_floor=none source=none (--pp-solve-pool-floor 0: "
+        "OFF by operator override; the objective ranks over the unfloored feasible "
+        "set, the pre-#1286b behaviour exactly)"
+    )
+
+
+def floor_source_for_shipped_line(decision) -> str:
+    """The ``pool_floor_source=`` value :func:`shipped_line` prints."""
+    src = str(getattr(decision, "pool_floor_source", "none") or "none")
+    cut = getattr(decision, "pool_floor_cut", None)
+    if src == "default-from-ordered-cut" and cut is not None:
+        return (
+            "default-from-ordered-cut %s (user order 2026-09-09: '39,13,12 mit bs2 "
+            "im pp layout soll standard werden vorerst')"
+            % (",".join(str(n) for n in cut),)
+        )
+    if src == "flag":
+        return "flag (--pp-solve-pool-floor, operator override)"
+    return "none (--pp-solve-pool-floor 0, operator override: OFF)"
 
 #: The operating point both groups are launched at (`--context-length`), and
 #: therefore the longest prompt group P can be asked to prefill. It is the
@@ -2296,6 +2356,7 @@ def argv_p(
     census_interval: int = COLLECTIVE_CENSUS_INTERVAL,
     draft_kv_on_p: bool = True,
     admin_api_key: Optional[str] = None,
+    p_max_total_tokens: Optional[int] = None,
 ) -> List[str]:
     # THE COUNT FLAGS ARE THE CONTIGUOUS FORM, AND ONLY THAT (#1240 FOLLOW FIX
     # 1). --pp-stage-ratio/--pp-attn-stage-ratio are per-stage COUNTS that
@@ -2381,7 +2442,15 @@ def argv_p(
     # Group D is NOT touched by this switch: D keeps its own NEXTN head in
     # both forms (argv_d, below), because `off` removes the PRODUCER, not
     # speculative decode.
-    ] + (list(P_DRAFT_KV_FLAGS) if draft_kv_on_p else []) + [
+    ] + (list(P_DRAFT_KV_FLAGS) if draft_kv_on_p else []) + (
+        # #1305 item 2: the cap is the SHIPPED cut's priced pool, handed in by
+        # the caller that holds PCutFacts; never a constant here.  Head-scoped
+        # (see P_DRAFT_KV_FLAGS); absent when no cut was solved (the sentinel
+        # helpers that only read flags off this argv).
+        ["--max-total-tokens", str(int(p_max_total_tokens))]
+        if draft_kv_on_p and p_max_total_tokens is not None
+        else []
+    ) + [
         "--port", str(PORT_P),
     ] + admin_key_flag(admin_api_key) + extra
 
@@ -3715,11 +3784,11 @@ def gate_w11(log_p: str, log: Log) -> Dict[str, object]:
         f"| W11b BUILD-ACCOUNTING nvml_delta_mib={w11['nvml_delta_mib']} = resident_mib + "
         f"head_released_mib={w11['head_released_mib']} + unaccounted_mib={w11['unaccounted_mib']} "
         f"(tol {w11['accounting_tol_mib']:.0f}) accounted={w11['accounted']} "
-        f"ok={w11['ok']} (T_P={P_MAX_TOTAL_TOKENS})")
+        f"ok={w11['ok']}")
     if not w11["resident_ok"]:
         raise Weg2LaunchRefused(f"W11 Weg2DraftResidentOverBudget: measured resident_mib={w11['resident_mib']} vs budget "
-                                f"{w11['budget_mib']:.1f}+{w11['tol_mib']:.0f} MiB -- T_P={P_MAX_TOTAL_TOKENS} was derived for the "
-                                f"budget and the last stage's corridor target (idle NVML free at {P_CORRIDOR_TOP_MIB:.0f}) cannot hold")
+                                f"{w11['budget_mib']:.1f}+{w11['tol_mib']:.0f} MiB -- the last stage's pool was priced against "
+                                f"this budget (#1286 stage_fixed) and its corridor target (idle NVML free at {P_CORRIDOR_TOP_MIB:.0f}) cannot hold")
     if not w11["accounted"]:
         # #1233 fix 6: the SECOND instrument. resident_mib is a model-graph
         # quantity, so a table released only from the graph passes it while
@@ -6449,7 +6518,7 @@ def shipped_line(
     reason ``pool_floor=`` was added beside ``chosen_pool=``: once a floor has
     a SHIPPED DEFAULT, the number alone no longer says whether the boot was
     obeying a standing user order or an operator's one-off ``--pp-solve-pool-
-    floor``.  Those two produce the same ``pool_floor=448027`` and want
+    floor``.  Those two produce the same ``pool_floor=578199`` and want
     opposite responses from a reader, so the line prints which.  No default
     value here on purpose: a caller that forgets it must fail loudly at the
     call site rather than quietly publish an unattributed floor.
@@ -6743,8 +6812,10 @@ def solve_p_cut(
     # say which floor it was measured against, and whether that floor was the
     # shipped default or something the operator typed, sends the reader to the
     # wrong flag.
-    pool_floor, pool_floor_provenance = resolve_pool_floor(ns.pp_solve_pool_floor)
-    log("PP-CUT POOL FLOOR: " + pool_floor_provenance)
+    pool_floor, pool_floor_from_cut, pool_floor_rule = resolve_pool_floor(
+        ns.pp_solve_pool_floor
+    )
+    log("PP-CUT POOL FLOOR RULE: " + pool_floor_rule)
     decision = _cut.solve_launch_cut(
         layer_families=families,
         incumbent_layers=incumbent,
@@ -6770,11 +6841,16 @@ def solve_p_cut(
         objective=P_SOLVER_OBJECTIVE_OF[str(ns.pp_solve_objective)],
         # #1286b: the floor under the SHIPPED pool. It constrains the set the
         # objective ranks over; it does not rank, and it never degrades to the
-        # fastest cut below itself. SHIPPED DEFAULT since the user order of
-        # 2026-09-09 (DEFAULT_PP_SOLVE_POOL_FLOOR) -- None here now means the
-        # operator passed 0 to turn it off, not that the flag is unimplemented.
+        # fastest cut below itself. #1305: under the SHIPPED DEFAULT (user
+        # order 2026-09-09, DEFAULT_PP_ORDERED_CUT) pool_floor is None here
+        # and pool_floor_from_cut names the ordered cut, and the solver reads
+        # the floor off its own frontier; both None = the operator passed 0.
         pool_floor=pool_floor,
+        pool_floor_from_cut=pool_floor_from_cut,
     )
+    # #1305: THE NUMBER, now that the frontier exists.  A W67/W40 raised by
+    # the solve above carries the cut and the floor in its own text.
+    log(pool_floor_line(decision))
     log(
         f"PP-CUT inputs: layers={n_layers} attn={n_attn} "
         f"kv={kv_mib * 1024 * 1024:.0f} B/token/attn-layer (from config, fp8_e4m3) "
@@ -6895,10 +6971,7 @@ def solve_p_cut(
             makespan_row,
             incumbent_fallback="%s / %s"
             % (_csv(P_PP_STAGE_RATIO_SCORES), _csv(P_PP_ATTN_STAGE_RATIO_SCORES)),
-            floor_source="default (user order 2026-09-09: '39,13,12 mit bs2 im pp "
-            "layout soll standard werden vorerst')"
-            if ns.pp_solve_pool_floor is None
-            else "flag (--pp-solve-pool-floor, operator override)",
+            floor_source=floor_source_for_shipped_line(decision),
         )
     )
     # #1286 -- THE JOIN LINE. `PP-CUT SHIPPED` prices the three objectives, but
@@ -6951,6 +7024,27 @@ def solve_p_cut(
             int(model_pool.page_size),
             int(model_pool.mamba_slots),
             int(model_pool.mamba_slots),
+        )
+    )
+    # #1305 item 2 (boot weg2sn5pre): THE CAP AND THE FLOOR, SIDE BY SIDE.
+    # Group P's `--max-total-tokens` was a constant 428,000 from boot weg2zr2
+    # and cut the realised pool 7.7 % below the priced one -- and below the
+    # floor the boot claimed to hold. It is now the shipped cut's priced pool
+    # (argv_p, p_max_total_tokens), so realised = min(P's own sizing, priced)
+    # and the floor binds the REALISED pool: a cap below the floor is
+    # impossible by construction (the shipped pool clears the floor or the
+    # solve refused above), which is why this line prints both numbers rather
+    # than carrying a second refusal.
+    log(
+        "PP-CUT P-CAP: --max-total-tokens=%d (= the SHIPPED cut's priced pool; "
+        "was the boot-weg2zr2 constant 428000 until 2026-09-09, which undercut "
+        "the priced pool by 7.7 %% on weg2sn5pre) pool_floor=%s -- the floor "
+        "binds the REALISED pool by construction: realised = min(group P's own "
+        "'KV token sizing' min-reduce, this cap), and PRICED minus REALISED "
+        "reads off PP-POOL-JOIN"
+        % (
+            int(chosen.pool_tokens),
+            "none" if decision.pool_floor is None else str(int(decision.pool_floor)),
         )
     )
     if chosen.kind == "gapped":
@@ -7314,14 +7408,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--pp-solve-pool-floor", type=int, default=None,
         help="#1286b. A HARD LOWER BOUND, in WORLD KV TOKENS, on the priced "
              "pool of whatever --pp-solve-objective ships. UNSET = the SHIPPED "
-             f"DEFAULT {DEFAULT_PP_SOLVE_POOL_FLOOR} "
-             "(DEFAULT_PP_SOLVE_POOL_FLOOR), which since the user order of "
+             "DEFAULT, which since the user order of "
              "2026-09-09 -- verbatim: '39,13,12 mit bs2 im pp layout soll "
-             "standard werden vorerst' -- makes the makespan solve select "
-             "39,13,12 on this rig's frontier. It is the MIDPOINT of "
-             "(414654, 481400], the interval of floors on which 'fastest above "
-             "F' picks that cut, so it sits 8.05 %% above the next-faster "
-             "cut's pool and 6.93 %% below its own -- the cut stays SOLVED, "
+             "standard werden vorerst' -- is the ORDERED CUT "
+             f"{','.join(str(n) for n in DEFAULT_PP_ORDERED_CUT)} "
+             "(DEFAULT_PP_ORDERED_CUT): the solver READS THE FLOOR OFF THIS "
+             "BOOT'S OWN FRONTIER as that cut's priced pool (#1305), so "
+             "'fastest above F' selects it exactly and the floor cannot drift "
+             "off a moved frontier the way a typed constant did on boot "
+             "weg2sn5pre; a cut that is not on the frontier is a W67 refusal, "
+             "never a neighbour -- the cut stays SOLVED, "
              "this only bounds the pool. PASS 0 to turn the floor OFF and get "
              "the pre-#1286b behaviour exactly: the objective then ranks over "
              "the same feasible set it always did and nothing moves. SET to a "
@@ -8116,7 +8212,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         stage_ratio, attn_stage_ratio, ns.p_hicache_write_policy,
         RING_FORM_SENTINEL_DEPTH, ns.p_barlink_bar1_window_mib, ns.random_seed,
         ns.barlink_bar1_cap_cycles, ns.collective_census_interval,
-        draft_kv_on_p,
+        draft_kv_on_p, p_max_total_tokens=int(cut.pool_tokens),
     )
     form_key, form_norm = ring_table.p_form_key(form_argv_p)
     log(
@@ -8430,7 +8526,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         f"Direct call: curl -s -X POST http://127.0.0.1:{PORT_D}/hicache/storage-backend/resize "
         f"-H \"Authorization: Bearer $(cat {admin_key_file})\" "
         f"-H 'Content-Type: application/json' -d '{{\"max_size_gb\": 8, \"min_free_gb\": 20}}'")
-    shipped_argv_p = argv_p(py, ns.model, budgets_p, arm.s_gb, arm.m_mib, store_cfg, shlex.split(ns.extra_p), p_bs, max_kv_per_request, stage_ratio, attn_stage_ratio, ns.p_hicache_write_policy, depth_decision.depth, ns.p_barlink_bar1_window_mib, ns.random_seed, ns.barlink_bar1_cap_cycles, ns.collective_census_interval, draft_kv_on_p, admin_api_key=admin_api_key)
+    shipped_argv_p = argv_p(py, ns.model, budgets_p, arm.s_gb, arm.m_mib, store_cfg, shlex.split(ns.extra_p), p_bs, max_kv_per_request, stage_ratio, attn_stage_ratio, ns.p_hicache_write_policy, depth_decision.depth, ns.p_barlink_bar1_window_mib, ns.random_seed, ns.barlink_bar1_cap_cycles, ns.collective_census_interval, draft_kv_on_p, admin_api_key=admin_api_key, p_max_total_tokens=int(cut.pool_tokens))
     # TRAIN FIX 5: THE SENTINEL PREMISE, PROVEN ON EVERY BOOT.  The form key that
     # gated the ring table was hashed over an argv built with sentinel ledger
     # terms, which is sound only while every flag those sentinels reach is
@@ -8692,9 +8788,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             raise Weg2LaunchRefused(f"W10 Weg2DrafterIdentityMismatch: P={w10['P']} D={w10['D']} layout_P={w10['layout_P']} "
                                     f"layout_D={w10['layout_D']} -- the decode group would ask the carrier for draft pages under "
                                     f"an identity the prefill group never writes")
-        # #1233 fix 2: W11 DRAFT-RESIDENT gate. T_P (P_MAX_TOTAL_TOKENS) is derived
-        # from a budgeted residue on P's last stage; the L2 line carries the
-        # MEASURED one. Over budget = the corridor derivation is refuted by this
+        # #1233 fix 2: W11 DRAFT-RESIDENT gate. The last stage's pool is priced
+        # against a budgeted draft residue (P_DRAFT_RESIDENT_BUDGET_MIB); the L2
+        # line carries the MEASURED one. Over budget = the corridor derivation is refuted by this
         # boot -> refuse before the front opens (boot weg2dk2's 3994 MiB build).
         gate_w11(spec_p.log, log)
     clips = count_marker(spec_d.log, "window clip") + count_marker(spec_d.log, "Bar1WindowRefused")
