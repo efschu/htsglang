@@ -984,7 +984,8 @@ def xchg_bounce_bytes_per_card(slots: Optional[int] = None,
             * int(tp.ONCARD_SLOT_BYTES_MAX if slot_bytes is None else slot_bytes))
 
 
-def xchg_bounce_bytes(cards: Optional[int] = None) -> int:
+def xchg_bounce_bytes(cards: Optional[int] = None,
+                      slot_bytes: Optional[int] = None) -> int:
     """Every card's deposit -- the term :func:`charge_terms` carries.
 
     ``cards`` DEFAULTED TO A TYPED ``3`` (S6 refuter, finding 6): a hand number
@@ -998,7 +999,13 @@ def xchg_bounce_bytes(cards: Optional[int] = None) -> int:
 
     if cards is None:
         cards = int(xr_.N_RANKS) // 2
-    return max(0, int(cards)) * xchg_bounce_bytes_per_card()
+    # S6 fix E: ``slot_bytes`` is the launcher passing the value of
+    # ``--weg2-xchg-oncard-slot-mib`` it parsed, because ITS process imported
+    # the transport before that flag existed in any environment.  ``None`` is
+    # the rank path, where the module constant already resolved from the
+    # published env.  One arithmetic function, two ways in.
+    return max(0, int(cards)) * xchg_bounce_bytes_per_card(
+        slot_bytes=slot_bytes)
 
 
 def charge_terms(

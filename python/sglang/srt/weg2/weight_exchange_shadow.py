@@ -661,7 +661,8 @@ def rotation_of(descs: Sequence[object]) -> Tuple[str, ...]:
 
 def select_subset(descs: Sequence[object], *, leg: int,
                   classes: Sequence[str] = (),
-                  per_leg: int = 1) -> ShadowSubset:
+                  per_leg: int = 1,
+                  rotation: Sequence[str] = ()) -> ShadowSubset:
     """The bounded class subset this leg shadows.
 
     ROTATING, and derived from the LEG INDEX rather than from anything a rank
@@ -672,8 +673,20 @@ def select_subset(descs: Sequence[object], *, leg: int,
     ``classes`` pins the subset explicitly (an operator arm); ``per_leg``
     widens it.  Both stay bounded by the budget check, which runs afterwards --
     a wider subset does not become affordable by being asked for.
+
+    ``rotation`` IS THE GROUP-UNIFORM CLASS LIST AND IT IS NOW A PARAMETER
+    (#1273 S6 fix E).  ``rotation_of(descs)`` reads THIS CARD's descriptors,
+    and on metal the three ranks of one group hold different directed subsets:
+    boot weg2shadowD measured ``rotation=19``, ``20`` and ``21`` on P's three
+    ranks in the same leg.  ``leg % len(rotation)`` over three different
+    lengths picks three DIFFERENT classes, which is the one thing the gate's
+    ``classes_hash`` exists to catch -- so the caller that HAS a group-uniform
+    list (``LegPlan.classes``, whose ``LegPlanFacts`` digest measured identical
+    on all six rows, 18/18 lines) must hand it in.  The per-card
+    ``rotation_of`` stays the fallback for hermetic callers that have no plan,
+    where one card is the whole world.
     """
-    rotation = rotation_of(descs)
+    rotation = tuple(rotation) if rotation else rotation_of(descs)
     if classes:
         chosen = tuple(c for c in rotation if c in set(classes))
         if not chosen:
@@ -1615,6 +1628,10 @@ def shadow_transport(
     sum_bytes: Optional[Callable[[int, int], int]] = None,
     classes: Sequence[str] = (),
     per_leg: int = 1,
+    #: S6 fix E.  The GROUP-UNIFORM rotation, forwarded so the transport's
+    #: subset is the SAME one the hook priced.  Empty keeps every hermetic
+    #: caller on the per-card ``rotation_of``; see :func:`select_subset`.
+    rotation: Sequence[str] = (),
     budget_s: float = SHADOW_TRANSPORT_BUDGET_S,
     #: THE LEG'S REMAINING DEADLINE, as a callable, forwarded verbatim to
     #: ``tp.run_leg`` (S5c refuter, must_fix 2).  ``budget_s`` bounds ONE wait
@@ -1673,7 +1690,8 @@ def shadow_transport(
     see :func:`price_shadow`.  It defaults to 0 and the budget line prints it,
     so an unwired boot is visibly unwired rather than quietly optimistic.
     """
-    subset = select_subset(descs, leg=leg, classes=classes, per_leg=per_leg)
+    subset = select_subset(descs, leg=leg, classes=classes, per_leg=per_leg,
+                           rotation=rotation)
     result = ShadowResult(leg=int(leg), epoch=str(epoch), subset=subset,
                           counters=ShadowCounters(), direction=str(direction))
     run = ShadowRun(result, None, (), {}, stripe_bytes=stripe_bytes)
@@ -3071,6 +3089,9 @@ def run_leg_hook(
         # every boot that has no region either, and the two reasons would be
         # indistinguishable in exactly the case the reader cares about.
         plan_digest = card_digest = 0
+        # Empty = no group-uniform list was handed in, so select_subset
+        # falls back to this card's own rotation (the hermetic shape).
+        plan_rotation: Tuple[str, ...] = ()
         if plan is not None:
             # ONCE PER LEG, BEFORE ANYTHING IS OPENED.  A plan that is refused
             # further down (unaffordable, gate expiry) still leaves its own
@@ -3078,7 +3099,25 @@ def run_leg_hook(
             # leg that did not run.
             log(plan.line())
             descs = plan.descs
-            classes = classes or plan.classes
+            # #1273 S6 fix E -- THE DEFECT THIS LINE USED TO BE:
+            #     classes = classes or plan.classes
+            # ``LegPlan``'s own docstring states the contract this violated,
+            # verbatim: "``classes`` is the rotation the subset is chosen FROM
+            # (never the subset itself -- the subset is a function of the leg
+            # index and is chosen by :func:`select_subset`)".  Feeding the
+            # POPULATION into ``select_subset``'s explicit PIN made its
+            # ``if classes:`` branch take every class, so the rotation was
+            # computed and discarded and every leg planned the whole image.
+            # Measured on boot weg2shadowD: ``classes=14`` on every shadow
+            # line with ``rotation`` advancing but never narrowing,
+            # ``planned=575 of population=650``, need 11836 MiB of destination
+            # buffers against 8126 MiB free -> UNAFFORDABLE on every card of
+            # every leg -> ``ran=no`` on all 15 legs and not one byte compared.
+            #
+            # It is the same falsy-default shape fix D swept out of the
+            # identity reads, one field over: ``a or b`` substituting a
+            # different quantity for a missing one.
+            plan_rotation = tuple(plan.classes)
             plan_digest = plan.facts.digest
             card_digest = plan.card_digest
         plan_descs = tuple(descs) if descs is not None else plan_for_leg(
@@ -3110,7 +3149,7 @@ def run_leg_hook(
         is_source = inputs.hook == HOOK_SOURCE
         mode = resolve_shadow_oncard_mode()
         subset = select_subset(plan_descs, leg=inputs.leg, classes=classes,
-                               per_leg=per_leg)
+                               per_leg=per_leg, rotation=plan_rotation)
         # NO HAND ARITHMETIC: the slot, the batch count and the hop all come
         # from ``plan_oncard_slot_bytes``'s own :class:`tp.OnCardSlotPlan`,
         # which carries the measured coefficient and prints its own cost model.
@@ -3202,6 +3241,7 @@ def run_leg_hook(
             wave=inputs.wave, leg=inputs.leg, direction=inputs.direction,
             epoch=inputs.epoch, free_mib=inputs.free_mib, log=log,
             sum_bytes=sum_bytes, classes=classes, per_leg=per_leg,
+            rotation=plan_rotation,
             resume_reserve_bytes=inputs.resume_reserve_bytes,
             explicit=explicit, slot_bytes=slot_bytes,
             stripe_bytes=stripe_bytes,

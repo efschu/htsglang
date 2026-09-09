@@ -156,7 +156,72 @@ ONCARD_SLOTS_MAX = 8
 #: importer maps the same allocation, so the ceiling is a residency term of
 #: spec section 5, not a tuning preference: at the shipping ``ONCARD_SLOTS=2``
 #: this caps the bounce at 256 MiB per card.
-ONCARD_SLOT_BYTES_MAX = 128 * xr.MIB
+#: S6 fix E: OPERATOR-SETTABLE, default byte-identical.  The D2 arm of boot
+#: weg2shadowD could not boot at ``--d-bs 6``: the worst-case deposit charge is
+#: ``ONCARD_SLOTS_MAX x ONCARD_SLOT_BYTES_MAX`` = 8 x 128 MiB = 1024 MiB per
+#: card x 3 = 3.00 GiB, and with the bs6 per-seat host cost (~1.07 GiB/seat,
+#: C2-vs-D2) no rung of the ladder cleared the 6 GiB store floor.  The operator
+#: decision (2026-09-09) was to KEEP the worst-case charge honest -- no per-flip
+#: charge, no non-uniform x4-only arm -- and make the ceiling itself settable,
+#: so ``--weg2-xchg-oncard-slot-mib 64`` charges 1.50 GiB and the extra batches
+#: and higher priced hop are what the boot then MEASURES rather than assumes.
+ENV_ONCARD_SLOT_MIB = "SGLANG_WEG2_XCHG_ONCARD_SLOT_MIB"
+ONCARD_SLOT_MIB_DEFAULT = 128
+
+
+class Weg2XchgOncardSlotRefused(ValueError):
+    """W66: the on-card slot ceiling does not divide the diagonal geometry."""
+
+
+def validate_oncard_slot_mib(value) -> int:
+    """The flag's ONE validator, shared by the launcher and the rank import.
+
+    Two conditions, both structural rather than preference:
+
+    * ``>= ONCARD_SLOT_BYTES`` (32 MiB, ``xr.SLOT_BYTES``) -- the value is the
+      CEILING ``plan_oncard_slot_bytes`` clamps to, and a ceiling under the
+      floor is not a geometry, it is a contradiction the planner would resolve
+      silently in whichever direction its ``max``/``min`` happened to run.
+    * a whole multiple of ``ONCARD_SLOT_BYTES`` -- the deposit file is cut into
+      floor-sized slots and the region's row area is sized once from
+      :data:`ONCARD_SLOTS_MAX`; a ceiling that is not a whole number of them
+      leaves a partial slot that one process would address and the other would
+      not.
+
+    Refuses BY NAME rather than clamping: a boot whose ledger charged one
+    geometry while its ranks allocated another is the exact drift
+    ``ONCARD_DEPOSIT_BYTES_MAX``'s own comment was written after.
+    """
+    try:
+        mib = int(value)
+    except (TypeError, ValueError):
+        raise Weg2XchgOncardSlotRefused(
+            f"W66 Weg2XchgOncardSlotRefused: --weg2-xchg-oncard-slot-mib "
+            f"{value!r} is not an integer number of MiB"
+        ) from None
+    floor_mib = ONCARD_SLOT_BYTES // xr.MIB
+    if mib < floor_mib or mib % floor_mib:
+        raise Weg2XchgOncardSlotRefused(
+            f"W66 Weg2XchgOncardSlotRefused: --weg2-xchg-oncard-slot-mib "
+            f"{mib} does not divide the diagonal geometry -- the slot FLOOR is "
+            f"{floor_mib} MiB (ONCARD_SLOT_BYTES = xr.SLOT_BYTES), so the "
+            f"ceiling must be a whole multiple of it and at least equal to it. "
+            f"Legal values on this tree: {floor_mib}, {2 * floor_mib}, "
+            f"{4 * floor_mib} (the default) ... ; the per-card worst-case "
+            f"deposit the #1269 ledger then charges is "
+            f"ONCARD_SLOTS_MAX x {mib} MiB = {ONCARD_SLOTS_MAX * mib} MiB"
+        )
+    return mib
+
+
+def _resolve_oncard_slot_bytes_max() -> int:
+    raw = (os.environ.get(ENV_ONCARD_SLOT_MIB, "") or "").strip()
+    if not raw:
+        return ONCARD_SLOT_MIB_DEFAULT * xr.MIB
+    return validate_oncard_slot_mib(raw) * xr.MIB
+
+
+ONCARD_SLOT_BYTES_MAX = _resolve_oncard_slot_bytes_max()
 
 #: The on-card lane's poll granularity.  It has no semaphore -- the diagonal is
 #: absent from :data:`xr.CROSS_PAIRS` by construction -- so its handshake is a
