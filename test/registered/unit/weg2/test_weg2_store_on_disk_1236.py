@@ -201,7 +201,7 @@ class TestTheDiskCheck(CustomTestCase):
         with self.assertRaises(launcher.Weg2StoreDiskRefused) as cm:
             _plan("/tmp", free=SMALL_DISK_FREE)
         msg = str(cm.exception)
-        self.assertIn("W52 Weg2StoreDiskRefused", msg)
+        self.assertIn("W57 Weg2StoreDiskRefused", msg)
         for needle in ("NEEDED", "AVAILABLE", "max_size", "min_free",
                        "P pool", "sidecar factor",
                        "--store-sidecar-factor", "--store-disk-min-free-gib"):
@@ -323,7 +323,7 @@ class TestTheArcPreflight(CustomTestCase):
         arc = {"arc_max": 0, "c_max": None, "size": int(40 * GIB)}
         with self.assertRaises(launcher.Weg2StoreArcRefused) as cm:
             launcher.arc_preflight_line(arc, self._plan(), margin_gib=0.5)
-        self.assertIn("W53 Weg2StoreArcRefused", str(cm.exception))
+        self.assertIn("W58 Weg2StoreArcRefused", str(cm.exception))
         self.assertIn("NO explicit cap", str(cm.exception))
 
     def test_an_uncapped_arc_with_room_is_stated_not_refused(self):
@@ -515,25 +515,52 @@ class TestTheArgvSeam(CustomTestCase):
 # =====================================================================
 
 
-class TestTheWCodes(CustomTestCase):
-    def test_w52_and_w53_are_not_already_taken(self):
-        import re
-        import subprocess
+def _canonical_census():
+    """The ONE census, loaded from its own file by path.
 
-        root = os.path.dirname(os.path.dirname(os.path.dirname(
-            os.path.dirname(os.path.dirname(os.path.abspath(__file__))))))
-        out = subprocess.run(
-            ["grep", "-rhoE", r"\bW5[23] Weg2[A-Za-z0-9_]+",
-             os.path.join(root, "python", "sglang", "srt", "weg2")],
-            capture_output=True, text=True,
-        ).stdout
-        names = {}
-        for line in out.split("\n"):
-            m = re.match(r"(W5[23]) (Weg2\w+)", line.strip())
-            if m:
-                names.setdefault(m.group(1), set()).add(m.group(2))
-        self.assertEqual(names.get("W52"), {"Weg2StoreDiskRefused"})
-        self.assertEqual(names.get("W53"), {"Weg2StoreArcRefused"})
+    By path rather than by import name so this pin cannot silently bind to a
+    stale copy on ``sys.path`` -- the failure mode that made the old private
+    grep look authoritative.
+    """
+    import importlib.util
+
+    here = os.path.dirname(os.path.abspath(__file__))
+    src = os.path.join(here, "test_weg2_wcode_uniqueness_1263.py")
+    assert os.path.exists(src), src
+    spec = importlib.util.spec_from_file_location("_wcode_census_1263", src)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod.census()
+
+
+class TestTheWCodes(CustomTestCase):
+    """DELEGATED, not re-implemented (#1236 renumber, serve-next4 train).
+
+    This class used to run its OWN ``grep -rhoE "\\bW5[23] Weg2..."`` over
+    ``srt/weg2``. That scanner read the WHITESPACE form only, and both prior
+    holders of these numbers are written without whitespace -- ``front.py``
+    builds ``W52`` by CONCATENATION and counts ``W53_Weg2StoreHandbackFailed``
+    with an UNDERSCORE. So the grep answered "free" about two taken numbers and
+    #1236 shipped the collision. A second scanner beside the canonical census
+    is exactly the second bookkeeping that produced the defect, so it is gone:
+    the one census in ``test_weg2_wcode_uniqueness_1263`` is the authority, and
+    this file only pins WHICH codes the store refusals hold.
+
+    The codes moved W52 -> W57 and W53 -> W58 on the merge, because the older
+    claims (#1290 ``Weg2NoServiceableRoute``, #1291 ``Weg2StoreHandbackFailed``)
+    keep their numbers.
+    """
+
+    def test_the_store_codes_are_w57_and_w58_and_hold_them_alone(self):
+        c = _canonical_census()
+        self.assertEqual(set(c["W57"]), {"Weg2StoreDiskRefused"})
+        self.assertEqual(set(c["W58"]), {"Weg2StoreArcRefused"})
+
+    def test_the_store_codes_no_longer_sit_on_the_front_s_numbers(self):
+        """The regression this renumber closes: W52/W53 belong to the front."""
+        c = _canonical_census()
+        self.assertNotIn("Weg2StoreDiskRefused", c["W52"])
+        self.assertNotIn("Weg2StoreArcRefused", c["W53"])
 
 
 if __name__ == "__main__":

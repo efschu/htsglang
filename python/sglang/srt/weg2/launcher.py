@@ -1728,7 +1728,7 @@ def plan_store(
     )
     if plan.needed_bytes > free:
         raise Weg2StoreDiskRefused(
-            f"W52 Weg2StoreDiskRefused: the filesystem hosting {root} cannot fund this "
+            f"W57 Weg2StoreDiskRefused: the filesystem hosting {root} cannot fund this "
             f"boot's store. NEEDED {plan.needed_bytes / host_ledger.GIB:.2f} GiB = "
             f"max_size {max_size / host_ledger.GIB:.2f} GiB (P pool "
             f"{plan.p_pool_tokens} tokens x {cell_bytes} B/token = "
@@ -1909,7 +1909,7 @@ def arc_preflight_line(
     )
     if unbounded and margin_gib is not None and margin_gib < store_budget_gib:
         raise Weg2StoreArcRefused(
-            f"W53 Weg2StoreArcRefused: the ZFS ARC has NO explicit cap "
+            f"W58 Weg2StoreArcRefused: the ZFS ARC has NO explicit cap "
             f"(zfs_arc_max={_g(arc_max)}) and the reap margin {margin_gib:.2f} GiB is "
             f"thinner than this store's own byte budget {store_budget_gib:.2f} GiB. An "
             f"uncapped ARC can grow to hold what this store writes, and this boot has "
