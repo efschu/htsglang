@@ -391,7 +391,7 @@ FLOOR_SOURCE_ENV = "ENV-OVERRIDE"
 FLOOR_SOURCE_FALLBACK = "UNMEASURED-FALLBACK"
 
 #: The dump layer's name for the other half of the same ambiguity: one
-#: filename, two digests. Quoted (never re-declared) by
+#: filename, two digests. Quoted (never redeclared) by
 #: :func:`digest_group_collision`, which refuses the mirror -- one digest, two
 #: groups -- so an operator grepping either half finds both.
 PHASE_FOOTPRINT_COLLISION_NAME = "W18 Weg2PhaseFootprintCollision"
@@ -691,6 +691,45 @@ def _published_digest(group: str) -> Tuple[Optional[str], Optional[str]]:
     return str(fp), str(digest)
 
 
+#: Cached ``(fingerprint, why_not)`` of the WHOLE rig. One NVML inventory per
+#: process: :func:`corridor_floors_for_cards` asks per card, and the rig does
+#: not change under a boot.
+_RIG_FP_CACHE: List[Optional[str]] = []
+
+
+def rig_hardware_fingerprint() -> Tuple[Optional[str], Optional[str]]:
+    """``(fingerprint, why_not)`` for the rig this process runs on.
+
+    ``calibration.rig_fingerprint``, NOT ``live_fingerprint``: the latter is
+    built from ``torch.cuda`` and therefore describes the CVD-masked slice the
+    calling process can see. Each window-5 rank fingerprinted only its own
+    card (``fad5762191c9`` / ``9ce0ed6a79fc`` / ``b0c936f23170``) against the
+    rig's ``a191a0712717`` (#589) -- so inside a pinned Weg-2 rank the masked
+    form can never match a stored footprint, and outside one it would happily
+    match the wrong rig. NVML ignores CVD, so its device list IS the rig.
+
+    Returns ``(None, why)`` when no inventory can be read at all (no NVML, a
+    hermetic test box). That is NOT a mismatch and must never be read as one:
+    a check that cannot run fails OPEN and says so in the provenance.
+    """
+    if _RIG_FP_CACHE:
+        return _RIG_FP_CACHE[0], _RIG_FP_CACHE[1]
+    fp: Optional[str] = None
+    why: Optional[str] = None
+    try:
+        from sglang.srt.mem_ledger.calibration import rig_fingerprint
+
+        rig = rig_fingerprint()
+        if rig and rig[0]:
+            fp = str(rig[0])
+        else:
+            why = "no NVML rig inventory"
+    except Exception as exc:  # pragma: no cover - import/NVML shape
+        why = f"rig fingerprint unavailable ({exc})"
+    _RIG_FP_CACHE.extend([fp, why])
+    return fp, why
+
+
 @dataclass(frozen=True)
 class CorridorFloor:
     """One card's corridor floor, with the provenance of both of its terms.
@@ -802,8 +841,41 @@ def _resolve_transient_mib(
         return None, f"mem_ledger.activation not importable ({exc})"
     fp = hw_fingerprint
     digest = profile_digest
+    unverified_fp = ""
     if profile is None and digest is None:
         fp2, digest = _published_digest(group)
+        # REFUTER FIX 4 (serve-next4, 2026-09-09). THE POINTER SUPPLIED BOTH
+        # TERMS AND NOTHING CHECKED THE FIRST ONE. On this path the caller
+        # passes no profile and no digest, so a pointer file written on OTHER
+        # HARDWARE -- or before a card was swapped -- handed us its own
+        # fingerprint, which then opened its own footprint file, which was
+        # stamped MEASURED-* with actuates=yes and CUT a budget derived on a
+        # rig this boot is not running on. The digest half of exactly this
+        # hazard is refused by name below (``digest_group_collision``); this
+        # is its fingerprint half.
+        #
+        # The reference is the CALLER's fingerprint when it passed one (free),
+        # else the rig's (one NVML inventory). A check that cannot run --
+        # no NVML on this box -- does not refuse; it says so in the
+        # provenance, because "unverifiable" and "mismatched" are different
+        # facts and only the second one is a reason to drop to fallback.
+        if fp2:
+            ref = fp
+            if not ref:
+                ref, why = rig_hardware_fingerprint()
+                if not ref:
+                    unverified_fp = (
+                        f"; hardware fingerprint {fp2} taken from the pointer "
+                        f"UNVERIFIED ({why})"
+                    )
+            if ref and str(ref) != str(fp2):
+                return None, (
+                    f"the published floor pointer at {_floor_digest_path()!r} "
+                    f"was written on hardware fingerprint {fp2} and this rig "
+                    f"is {ref} -- refusing to price a corridor floor off "
+                    f"another rig's measurement (a mismatched pointer is a "
+                    f"fallback, not a measurement)"
+                )
         fp = fp or fp2
         if digest is None:
             # THE FIRST BOOT IS ALWAYS UNMEASURED, and an operator reading this
@@ -857,15 +929,14 @@ def _resolve_transient_mib(
             f"refusing to stamp another group's transient as this one's"
         )
     if not fp:
-        try:
-            from sglang.srt.mem_ledger.calibration import live_fingerprint
-
-            live = live_fingerprint()
-            fp = live[0] if live else None
-        except Exception as exc:
-            return None, f"live hardware fingerprint unavailable ({exc})"
-    if not fp:
-        return None, "live hardware fingerprint unavailable"
+        # REFUTER FIX 4, same site: this used to call ``live_fingerprint``,
+        # which is CVD-masked -- inside a pinned rank it fingerprints one card
+        # and matches nothing (#589). It failed safe (a miss becomes the
+        # fallback) but it could never measure. ``rig_hardware_fingerprint``
+        # is the unmasked form.
+        fp, why = rig_hardware_fingerprint()
+        if not fp:
+            return None, f"rig hardware fingerprint unavailable ({why})"
     try:
         if profile is not None:
             hit = _act.resolve_phase_footprint(
@@ -887,7 +958,7 @@ def _resolve_transient_mib(
     )
     return int(hit.activation_mib), (
         f"{path}#cards.{card_uuid}.activation_mib={int(hit.activation_mib)}MiB "
-        f"({getattr(hit.provenance, 'value', hit.provenance)})"
+        f"({getattr(hit.provenance, 'value', hit.provenance)}){unverified_fp}"
     )
 
 
@@ -971,7 +1042,7 @@ def corridor_floors_for_cards(
     group: Optional[str] = None,
     user_reserve_mib=None,
     **kw,
-) -> "Dict[str, CorridorFloor]":
+) -> Dict[str, CorridorFloor]:
     """The floor for several cards in one call, keyed by uuid.
 
     ``user_reserve_mib`` is a scalar or a ``{uuid: MiB}`` mapping.
