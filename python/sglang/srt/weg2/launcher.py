@@ -332,6 +332,66 @@ P_WEG2ZR2_LAST_STAGE_NVML_FREE_MIN_MIB = 1450.0
 P_WEG2ZR2_LAST_STAGE_KV_POOL_MIB = 5584.4
 P_CORRIDOR_TOP_MIB = 1229.0
 P_BYTES_PER_TOKEN = 8192 + 2048
+
+#: THE SHIPPED FLOOR UNDER ``--pp-solve-objective``, in WORLD KV TOKENS, and
+#: WRITTEN EXACTLY ONCE (the pin in
+#: ``test/registered/unit/weg2/test_weg2_p_cut_default_0909.py`` keeps it that
+#: way, the same way ``DEFAULT_P_BS`` is pinned on its own branch).
+#:
+#: THE ORDER IN FORCE, user 2026-09-09, verbatim: "39,13,12 mit bs2 im pp
+#: layout soll standard werden vorerst."
+#:
+#: THE CUT IS STILL SOLVED, NOT PINNED, and that distinction is the whole
+#: reason this is a floor and not a ``--pp-stage-ratio``.  A hand pin would
+#: make ``39,13,12`` survive a card change, a checkpoint change or a re-measure
+#: that made it wrong; the solver stays the authority and this number only says
+#: HOW MUCH POOL the boot refuses to go below.  ``--pp-solve-objective``
+#: (makespan, itself a user default since 2026-09-08) then ranks over what is
+#: left, so the shipped rule reads "the FASTEST cut that still holds
+#: 448,027 tokens" -- and on this rig's frontier that is 39,13,12.
+#:
+#: WHY THIS NUMBER -- the rule, so the next re-solve can redo it rather than
+#: copy it.  Read off the ``PP-CUT FRONTIER`` line of #1286b (SECTION 1am-b,
+#: ``/spinning/gpu-arb/weg2/WEG2_BUILD_DECISIONS_0906.md``), the two frontier
+#: points that bracket the order are
+#:
+#:     40,12,12 / 10,3,3   total_ms=417.6   pool=414654   <- next FASTER
+#:     39,13,12 /  9,4,3   total_ms=420.1   pool=481400   <- THE ORDER
+#:
+#: Under "fastest above F" the order is selected for any F in the half-open
+#: interval (414654, 481400].  The floor is the MIDPOINT of that interval,
+#: (414654 + 481400) // 2 = 448027: it sits 33,373 tokens from each boundary,
+#: which is the largest equal headroom the interval allows.
+#:
+#: A floor survives a uniform re-pricing of the frontier by factor s only while
+#: it stays inside (414654*s, 481400*s], so every floor has TWO tolerances --
+#: how far pools may GROW before 40,12,12 clears it too and wins on speed, and
+#: how far they may SHRINK before 39,13,12 stops clearing it -- and the SMALLER
+#: of the two is the one that fails first.  The midpoint tolerates +8.05 %%
+#: growth and -6.93 %% shrink, so 6.93 %% binds.
+#:
+#: THE REJECTED RULE, named because it is the obvious one: "39,13,12's priced
+#: pool minus the priced-vs-realised tolerance" gives 481400 * 0.999 = 480918.
+#: It tolerates +15.98 %% growth -- better than the midpoint -- but only
+#: -0.10 %% shrink, and that is not a coincidence: subtracting a 0.10 %%
+#: tolerance BUILDS a 0.10 %% shrink margin, so the rule's binding margin is
+#: always exactly the measurement error it was derived from (0.10 %% MEASURED,
+#: weg2sb5f priced 304,946 against 304,655 realised).  A margin the size of
+#: one's own error is no margin: the first re-price that shaved a tenth of a
+#: percent off the pool would silently ship 38,13,13 (453.4 ms) or refuse.
+#: Ranked on distance from the LOWER boundary alone the rejected rule looks
+#: like the better one, which is exactly why that is not the comparison -- the
+#: test asserts it on the binding margin, 6.93 %% against 0.10 %%, 69x.
+#:
+#: THE TRADE THE ORDER BOUGHT, so nobody re-derives it as a regression: against
+#: the unfloored makespan winner 44,10,10 (359.0 ms / 304,946 tokens) this is
+#: +17.0 %% ms/chunk for +57.9 %% pool.  The user chose the knee.
+#:
+#: OFF IS STILL REACHABLE AND STILL EXACT: ``--pp-solve-pool-floor 0`` restores
+#: the unfloored makespan byte for byte.  The floor is PROVISIONAL in the same
+#: sense the bs pair is -- "vorerst" is in the order -- so re-measuring it must
+#: stay an edit to THIS ONE LINE.
+DEFAULT_PP_SOLVE_POOL_FLOOR = 448_027
 #: Group P's per-stage CAPABILITY SCORES, in stage order (ordinal 0 = the
 #: 5090) -- what ``--pp-stage-ratio`` takes.  NOT a layer split: fix 5, after
 #: the map below was found to restate this vector as one.  ``server_args``
@@ -705,6 +765,52 @@ def resolve_x(override: Optional[int], evidence_dir: str, floor_tokens: int) -> 
         f"range; post-barlink r_D 1354 tok/s pushes X far higher and post-flipcost pulls it "
         f"back, so this is a fallback, never a table (O4)"
     ), False)
+
+
+def resolve_pool_floor(override: Optional[int]) -> Tuple[Optional[int], str]:
+    """The P-cut POOL FLOOR and its PROVENANCE LINE -- value, source, order.
+
+    Same shape as :func:`resolve_x` for the same reason: a number that can come
+    from two places must publish WHICH, or the boot log cannot be read back.
+    Three states, and the middle one is the one a reader gets wrong:
+
+    * flag ABSENT -> ``DEFAULT_PP_SOLVE_POOL_FLOOR``, ``source=default``.  The
+      default is not a neutral value: it ENCODES the user order of 2026-09-09
+      and is the reason a boot ships 39,13,12 rather than the unfloored
+      makespan winner, so the order is quoted on the line itself.
+    * flag <= 0 -> ``None``, ``source=flag``.  OFF, exactly: ``None`` is what
+      the solver saw before #1286b existed, so ``--pp-solve-pool-floor 0``
+      restores the unfloored makespan byte for byte rather than approximately.
+      A floor of literally zero would be indistinguishable in effect but would
+      print ``pool_floor=0``, and an instrument that says a floor is armed when
+      none is, is the class this rig calls instrument-text-lies.
+    * flag > 0 -> that value, ``source=flag``.  The operator outranks the
+      default; nothing warns, because choosing the number is the flag's job.
+
+    The cut itself stays SOLVED either way -- this only bounds the set
+    ``--pp-solve-objective`` ranks over.
+    """
+    if override is None:
+        floor = int(DEFAULT_PP_SOLVE_POOL_FLOOR)
+        return floor, (
+            f"pool_floor={floor} source=default -- the SHIPPED default, user order "
+            f"2026-09-09 verbatim: '39,13,12 mit bs2 im pp layout soll standard "
+            f"werden vorerst'. Midpoint of (414654, 481400], the frontier interval "
+            f"on which makespan selects 39,13,12; the cut stays solver-chosen, this "
+            f"only floors the pool. --pp-solve-pool-floor 0 turns it off"
+        )
+    if int(override) <= 0:
+        return None, (
+            f"pool_floor=none source=flag (--pp-solve-pool-floor {int(override)}) -- OFF by "
+            f"operator override; the objective ranks over the unfloored feasible set, "
+            f"which is the pre-#1286b behaviour exactly. The shipped default "
+            f"{int(DEFAULT_PP_SOLVE_POOL_FLOOR)} (user order 2026-09-09) is NOT in force"
+        )
+    return int(override), (
+        f"pool_floor={int(override)} source=flag (--pp-solve-pool-floor) -- operator "
+        f"override; the shipped default {int(DEFAULT_PP_SOLVE_POOL_FLOOR)} (user order "
+        f"2026-09-09, '39,13,12 ... soll standard werden vorerst') is NOT in force"
+    )
 
 #: The operating point both groups are launched at (`--context-length`), and
 #: therefore the longest prompt group P can be asked to prefill. It is the
@@ -6365,6 +6471,79 @@ def incumbent_candidate(decision, incumbent_layers, incumbent_attn):
     return None
 
 
+def shipped_line(
+    decision,
+    chosen,
+    ship_why,
+    incumbent_row,
+    makespan_row,
+    *,
+    incumbent_fallback: str,
+    floor_source: str,
+) -> str:
+    """THE ``PP-CUT SHIPPED`` line. Pure, so it can be RENDERED by a test.
+
+    Split out for the same reason :func:`incumbent_candidate` was: this line is
+    the boot's whole statement of which priced row it pays for, and until
+    #1286b the only proof it still rendered was a boot. It carries twelve
+    substitutions across a %-format, which is exactly the failure class an edit
+    to it produces -- a wrong arity raises TypeError at emit time, i.e. after
+    the weights are loaded, i.e. a spent window. Now a desk test builds a
+    decision and renders it.
+
+    ``incumbent_fallback`` is passed IN rather than built from
+    ``P_PP_STAGE_RATIO_SCORES`` here, and that is not style. #1233 pins the
+    census of functions that read the incumbent score vector, precisely because
+    an extra reader is how a constant drifts back into the argv path; this
+    formatter has no business joining that list, so the one string it would
+    need is handed to it by the caller that legitimately holds the vector.
+
+    #1286b renamed ``pool_tokens=`` to ``chosen_pool=`` and added
+    ``pool_floor=``: a pool figure whose constraint is not printed beside it is
+    the shape that let weg2sb5f's +64.1 %% sit in plain sight across two logs.
+    ``pool_tokens=`` survives on the ``PP-CUT solver:`` table rows and on
+    ``PP-POOL-JOIN``, and no parser on this rig reads it off THIS line.
+
+    ``floor_source`` is REQUIRED and keyword-only (2026-09-09) for the same
+    reason ``pool_floor=`` was added beside ``chosen_pool=``: once a floor has
+    a SHIPPED DEFAULT, the number alone no longer says whether the boot was
+    obeying a standing user order or an operator's one-off ``--pp-solve-pool-
+    floor``.  Those two produce the same ``pool_floor=448027`` and want
+    opposite responses from a reader, so the line prints which.  No default
+    value here on purpose: a caller that forgets it must fail loudly at the
+    call site rather than quietly publish an unattributed floor.
+    """
+    return (
+        "PP-CUT SHIPPED: layers=%s attn=%s chosen_pool=%d pool_floor=%s "
+        "pool_floor_source=%s makespan_ms=%.1f -- %s. "
+        "The two objectives this boot did NOT take stay priced beside it and are "
+        "therefore not paid by accident: incumbent %s pool %s makespan %s, "
+        "pool-maximal (kv-floor) %s pool %d makespan %.1f, makespan-optimal %s "
+        "pool %d makespan %.1f (--pp-solve-objective incumbent|maxkv|makespan "
+        "ships them)."
+        % (
+            ",".join(str(n) for n in chosen.layers),
+            ",".join(str(a) for a in chosen.attn),
+            int(chosen.pool_tokens),
+            "none" if decision.pool_floor is None else str(int(decision.pool_floor)),
+            floor_source,
+            chosen.makespan_ms,
+            ship_why,
+            incumbent_row.fmt() if incumbent_row is not None else incumbent_fallback,
+            "%d" % int(incumbent_row.pool_tokens) if incumbent_row is not None
+            else "n/a (NOT RANKED by this solve)",
+            "%.1f" % incumbent_row.makespan_ms if incumbent_row is not None
+            else "n/a",
+            decision.kv_floor.fmt(),
+            int(decision.kv_floor.pool_tokens),
+            decision.kv_floor.makespan_ms,
+            makespan_row.fmt(),
+            int(makespan_row.pool_tokens),
+            makespan_row.makespan_ms,
+        )
+    )
+
+
 def solve_p_cut(
     ns,
     cards: List[Card],
@@ -6618,6 +6797,13 @@ def solve_p_cut(
             or "NONE",
         )
     )
+    # THE FLOOR AND ITS SOURCE ARE RESOLVED BEFORE THE SOLVE, and the line is
+    # logged whether the solve then succeeds or REFUSES -- a W40 that does not
+    # say which floor it was measured against, and whether that floor was the
+    # shipped default or something the operator typed, sends the reader to the
+    # wrong flag.
+    pool_floor, pool_floor_provenance = resolve_pool_floor(ns.pp_solve_pool_floor)
+    log("PP-CUT POOL FLOOR: " + pool_floor_provenance)
     decision = _cut.solve_launch_cut(
         layer_families=families,
         incumbent_layers=incumbent,
@@ -6641,6 +6827,12 @@ def solve_p_cut(
         # 499,967-token pool -- +33.5 % prefill for -47.7 % pool on metal --
         # which is a trade nobody selected, taken by a flag nobody passed.
         objective=P_SOLVER_OBJECTIVE_OF[str(ns.pp_solve_objective)],
+        # #1286b: the floor under the SHIPPED pool. It constrains the set the
+        # objective ranks over; it does not rank, and it never degrades to the
+        # fastest cut below itself. SHIPPED DEFAULT since the user order of
+        # 2026-09-09 (DEFAULT_PP_SOLVE_POOL_FLOOR) -- None here now means the
+        # operator passed 0 to turn it off, not that the flag is unimplemented.
+        pool_floor=pool_floor,
     )
     log(
         f"PP-CUT inputs: layers={n_layers} attn={n_attn} "
@@ -6712,6 +6904,12 @@ def solve_p_cut(
     )
     log(decision.provenance_line())
     log(decision.trade_line())
+    # #1286b -- THE CURVE. provenance_line prices TWO points of it (the two
+    # objectives' cuts); this line prices every point that is not beaten on
+    # both axes at once, so "what would a floor of N cost me in ms" is read off
+    # one boot log instead of re-solved. It is also how a value for
+    # --pp-solve-pool-floor is chosen.
+    log(decision.frontier_line())
     for row in decision.table_lines():
         log(row)
     # WHICH of those priced rows this boot actually SHIPS (#1254 -- see
@@ -6738,32 +6936,28 @@ def solve_p_cut(
         decision, P_PP_STAGE_RATIO_SCORES, P_PP_ATTN_STAGE_RATIO_SCORES
     )
     makespan_row = decision.makespan or decision.chosen
+    # #1286b: THE FLOOR APPLIES TO WHAT SHIPS, not only to what the objective
+    # ranked. `incumbent` names a candidate and looks it up in the ranked field,
+    # so it never passes through the set --pp-solve-pool-floor narrowed; without
+    # this call an operator could set a floor, take that arm, and boot below it
+    # with every line saying the floor was honoured. Same writer as the solver's
+    # own refusals (CutDecision.refuse_shipped_below_floors -> refuse_below_floors).
+    decision.refuse_shipped_below_floors(
+        chosen, "the SHIPPED cut (%s)" % (ship_why.split(" (")[0],)
+    )
     log(
-        "PP-CUT SHIPPED: layers=%s attn=%s pool_tokens=%d makespan_ms=%.1f -- %s. "
-        "The two objectives this boot did NOT take stay priced beside it and are "
-        "therefore not paid by accident: incumbent %s pool %s makespan %s, "
-        "pool-maximal (kv-floor) %s pool %d makespan %.1f, makespan-optimal %s "
-        "pool %d makespan %.1f (--pp-solve-objective incumbent|maxkv|makespan "
-        "ships them)."
-        % (
-            ",".join(str(n) for n in chosen.layers),
-            ",".join(str(a) for a in chosen.attn),
-            int(chosen.pool_tokens),
-            chosen.makespan_ms,
+        shipped_line(
+            decision,
+            chosen,
             ship_why,
-            incumbent_row.fmt() if incumbent_row is not None else "%s / %s" % (
-                _csv(P_PP_STAGE_RATIO_SCORES), _csv(P_PP_ATTN_STAGE_RATIO_SCORES)
-            ),
-            "%d" % int(incumbent_row.pool_tokens) if incumbent_row is not None
-            else "n/a (NOT RANKED by this solve)",
-            "%.1f" % incumbent_row.makespan_ms if incumbent_row is not None
-            else "n/a",
-            decision.kv_floor.fmt(),
-            int(decision.kv_floor.pool_tokens),
-            decision.kv_floor.makespan_ms,
-            makespan_row.fmt(),
-            int(makespan_row.pool_tokens),
-            makespan_row.makespan_ms,
+            incumbent_row,
+            makespan_row,
+            incumbent_fallback="%s / %s"
+            % (_csv(P_PP_STAGE_RATIO_SCORES), _csv(P_PP_ATTN_STAGE_RATIO_SCORES)),
+            floor_source="default (user order 2026-09-09: '39,13,12 mit bs2 im pp "
+            "layout soll standard werden vorerst')"
+            if ns.pp_solve_pool_floor is None
+            else "flag (--pp-solve-pool-floor, operator override)",
         )
     )
     # #1286 -- THE JOIN LINE. `PP-CUT SHIPPED` prices the three objectives, but
@@ -7174,6 +7368,45 @@ def build_parser() -> argparse.ArgumentParser:
              "shipped cut (flip_order_split) and W46 checks that by "
              "construction. GAPPED MAPS ARE NOT AN ARM OF THIS FLAG: see "
              "--pp-layer-set and the #753 gate.",
+    )
+    ap.add_argument(
+        "--pp-solve-pool-floor", type=int, default=None,
+        help="#1286b. A HARD LOWER BOUND, in WORLD KV TOKENS, on the priced "
+             "pool of whatever --pp-solve-objective ships. UNSET = the SHIPPED "
+             f"DEFAULT {DEFAULT_PP_SOLVE_POOL_FLOOR} "
+             "(DEFAULT_PP_SOLVE_POOL_FLOOR), which since the user order of "
+             "2026-09-09 -- verbatim: '39,13,12 mit bs2 im pp layout soll "
+             "standard werden vorerst' -- makes the makespan solve select "
+             "39,13,12 on this rig's frontier. It is the MIDPOINT of "
+             "(414654, 481400], the interval of floors on which 'fastest above "
+             "F' picks that cut, so it sits 8.05 %% above the next-faster "
+             "cut's pool and 6.93 %% below its own -- the cut stays SOLVED, "
+             "this only bounds the pool. PASS 0 to turn the floor OFF and get "
+             "the pre-#1286b behaviour exactly: the objective then ranks over "
+             "the same feasible set it always did and nothing moves. SET to a "
+             "positive number = the objective still ranks, but only over the "
+             "cuts whose PRICED "
+             "world pool clears this number -- so 'makespan' becomes 'the "
+             "FASTEST cut that still holds N tokens'. It is a CONSTRAINT ON "
+             "the one objective knob, not a second objective: the standing law "
+             "is that trades live behind one knob, and 'fastest above N' is "
+             "the same ranking over a smaller set. WHY IT EXISTS: #1286 "
+             "repriced every candidate against the boot's own sizing formula "
+             "and the makespan winner came out at 304,946 tokens against the "
+             "incumbent's 715,089 -- 43 %% of the capacity for the speed cut -- "
+             "and before this flag the only way to put a bound under that was "
+             "to pin a cut by hand, which is the thing the solver replaces. "
+             "The pool it is compared against is the SAME number "
+             "PP-POOL-JOIN publishes and group P then sizes (within 0.1 %% on "
+             "both reference boots), NOT a second estimate. NO SILENT "
+             "FALLBACK: if no servable cut clears it the launch is a W40 "
+             "REFUSAL that prints the frontier -- the fastest cuts that DO "
+             "clear it and the best pool anywhere in the field -- so the next "
+             "move is a number, not a re-solve by hand. Distinct from "
+             "--max-kv-per-request, which is the PHYSICAL floor (one "
+             "full-context prompt must fit); both are checked and each refusal "
+             "names its own flag. Read the curve on the PP-CUT FRONTIER: line "
+             "of any boot to choose a value.",
     )
     ap.add_argument(
         "--pp-cut-measured-ms-per-layer", default=MEASURED_MS_PER_LAYER,

@@ -35,6 +35,22 @@ attention layers, so P's pool must hold at least ONE full-context prompt. That
 is a FLOOR on capacity, and makespan is minimised subject to it -- not traded
 against it.
 
+THE POOL FLOOR IS A CONSTRAINT ON THE OBJECTIVE, NOT A SECOND OBJECTIVE
+(#1286b). ``pool_floor`` -- ``--pp-solve-pool-floor`` at the launcher -- is a
+hard lower bound on the PRICED WORLD POOL of the cut that ships. The objective
+still decides; it decides among the cuts that clear the floor. That shape is
+the standing law's own (trades live behind ONE objective knob): a second
+ranking would be a second knob, and "fastest above F" is the same ranking on a
+smaller set. It exists because the #1286 repricing made the makespan winner's
+pool a number worth bounding -- 44,10,10 prices at 304,946 against the
+incumbent's 715,089, i.e. the speed arm now ships 43 % of the capacity, and the
+operator who wants a floor under that has no way to say so except by pinning a
+cut by hand, which is the thing the solver exists to replace.
+
+Default ``None`` = no floor = the behaviour before #1286b, exactly: the
+constrained set is then the feasible set, unchanged, and nothing on any line
+moves except a ``pool_floor=none`` field that says the floor is off.
+
 THE TWO OBJECTIVES ARE BOTH PRINTED (#1018), AND THE DEFAULT IS ``maxkv``
 (#1254). Both cuts are priced on the same axes and both appear on the
 provenance line with their pool AND their ms, so a boot cannot pay the trade by
@@ -185,10 +201,115 @@ def refuse_pool_model_geometry(pool_model: PhasePoolModel, stages: int) -> None:
             )
 
 
+#: How many frontier points the ``PP-CUT FRONTIER`` line prints before it says
+#: how many it did not. The frontier is a MONOTONE STAIRCASE, so a bound on it
+#: is a bound on resolution and never on range: the fastest point and the
+#: largest-pool point are always printed, whatever the bound. Measured on this
+#: rig's own field (932 priceable contiguous cuts of the 64-layer checkpoint
+#: over three stages, #1286b): 15 non-dominated points, so the bound does not
+#: bite today and exists only so a wider checkpoint cannot turn one log line
+#: into a page.
+FRONTIER_MAX_POINTS = 24
+
+
+def pareto_frontier(
+    candidates: Sequence[CutCandidate],
+) -> Tuple[CutCandidate, ...]:
+    """The non-dominated (total_ms, pool_tokens) pairs, fastest first.
+
+    THE CURVE THE TWO OBJECTIVES ARE THE TWO ENDS OF. ``maxkv`` reports the
+    right-hand end and ``makespan`` the left-hand one, and the pair of them has
+    been printed on every boot since #1254 -- but two points do not tell an
+    operator what a floor COSTS, which is the question ``--pp-solve-pool-floor``
+    makes askable. The frontier answers it from one boot log: every cut that is
+    not beaten on both axes at once, in order, so "what is the fastest layout
+    that still holds N tokens" is read off rather than re-solved.
+
+    Domination is STRICT in the usual sense -- ``b`` dominates ``a`` when it is
+    no slower AND no smaller and better on at least one axis -- so a candidate
+    is dropped only when another is genuinely at least as good everywhere.
+    Two candidates equal on BOTH axes dominate neither each other nor anything
+    else; they are one point of the curve and are collapsed to one row, which
+    is a de-duplication of the plot and not a domination claim about either.
+    """
+    ordered = sorted(
+        candidates, key=lambda c: (float(c.total_ms), -float(c.pool_tokens))
+    )
+    out: List[CutCandidate] = []
+    best_pool = float("-inf")
+    for cand in ordered:
+        # Ascending time: a candidate survives only by carrying MORE pool than
+        # every faster one. Equal pool at a later time is dominated by the
+        # earlier row; equal time and equal pool is the same point twice.
+        if float(cand.pool_tokens) > best_pool:
+            out.append(cand)
+            best_pool = float(cand.pool_tokens)
+    return tuple(out)
+
+
+def _floor_frontier_note(
+    field: Sequence[CutCandidate], floor_tokens: int, top: int = 3
+) -> str:
+    """What the operator needs beside a floor refusal: the alternatives.
+
+    A refusal that only says "no" makes the next move a re-solve by hand. Two
+    facts end that: the THREE fastest cuts that DO clear the floor (the actual
+    alternatives, when the refusal is about one pinned layout the field could
+    have replaced), and the LARGEST POOL anywhere in the field (the ceiling,
+    which is the answer when nothing clears the floor -- it says the floor is
+    unreachable and by how much, rather than leaving "raise the budgets" as the
+    only advice).
+
+    Both halves name their population, because "3 clear it" is meaningless
+    without "of how many".
+    """
+    if not field:
+        return ""
+    above = sorted(
+        (c for c in field if float(c.pool_tokens) >= float(floor_tokens)),
+        key=lambda c: (float(c.total_ms), -float(c.pool_tokens)),
+    )
+    best_pool = max(field, key=lambda c: float(c.pool_tokens))
+    def _row(c: CutCandidate) -> str:
+        return "%s pool %d total %.1f ms" % (c.fmt(), int(c.pool_tokens), c.total_ms)
+
+    if above:
+        head = (
+            " FRONTIER: %d of %d servable candidates clear the floor; the "
+            "fastest are %s."
+            % (
+                len(above),
+                len(field),
+                " | ".join(_row(c) for c in above[: int(top)]),
+            )
+        )
+    else:
+        head = (
+            " FRONTIER: NONE of %d servable candidates clears the floor -- this "
+            "is not a ranking accident, the floor is above the whole field."
+            % (len(field),)
+        )
+    return head + (
+        " Best pool anywhere in the field: %s (short of the floor by %d)."
+        % (
+            _row(best_pool),
+            max(0, int(floor_tokens) - int(best_pool.pool_tokens)),
+        )
+        if float(best_pool.pool_tokens) < float(floor_tokens)
+        else " Best pool anywhere in the field: %s." % (_row(best_pool),)
+    )
+
+
 def _refuse_below_pool_floor(
-    candidate: "CutCandidate", what: str, cap_tokens: int, cost_provenance: str
+    candidate: CutCandidate,
+    what: str,
+    cap_tokens: int,
+    cost_provenance: str,
+    *,
+    floor_flag: str = "--max-kv-per-request",
+    field: Sequence[CutCandidate] = (),
 ) -> None:
-    """W40 when a chosen layout cannot hold one full-context prompt.
+    """W40 when a chosen layout does not clear a pool floor.
 
     The SOLVED path has refused this since #1236 (``feasible`` is the set that
     clears the floor). The PINNED paths returned without ever asking, so boot
@@ -196,27 +317,76 @@ def _refuse_below_pool_floor(
     262144)`` beside a pinned map and went on to build the argv -- a boot that
     cannot admit one full-context prompt is a spent window, and the sentence
     that names it already existed. One writer of that sentence, three callers.
+
+    #1286b EXTENDS this one writer to a SECOND floor rather than adding a
+    second writer. There are now two lower bounds on the same quantity --
+    ``--max-kv-per-request`` (one full-context prompt must fit) and
+    ``--pp-solve-pool-floor`` (the operator's floor under the shipped pool) --
+    and they differ only in WHICH FLAG the operator has to move. A second
+    function would have been a second sentence to keep true; ``floor_flag``
+    carries the difference and ``field`` carries the alternatives, so the
+    refusal that used to end at "or pin a layout that holds it" can now name
+    the layouts that hold it.
     """
     if float(candidate.pool_tokens) >= float(cap_tokens):
         return
     raise PPCutRefused(
-        "W40 Weg2PPCutRefused: %s does not hold one full-context prompt. The "
-        "pool floor is %d tokens (--max-kv-per-request); this layout is "
+        "W40 Weg2PPCutRefused: %s does not clear the pool floor. The "
+        "pool floor is %d tokens (%s); this layout is "
         "layers=%s attn=%s at %d tokens (makespan %.1f ms, crossings %.1f ms), "
-        "short by %d. Lower --max-kv-per-request, raise the per-rank budgets, "
-        "or pin a layout that holds it. Cost model: %s"
+        "short by %d. Lower %s, raise the per-rank budgets, "
+        "or pin a layout that holds it. Cost model: %s%s"
         % (
             what,
             int(cap_tokens),
+            floor_flag,
             ",".join(str(n) for n in candidate.layers),
             ",".join(str(a) for a in candidate.attn),
             int(candidate.pool_tokens),
             candidate.makespan_ms,
             candidate.crossing_ms,
             int(cap_tokens) - int(candidate.pool_tokens),
+            floor_flag,
             cost_provenance,
+            _floor_frontier_note(field, int(cap_tokens)),
         )
     )
+
+
+def refuse_below_floors(
+    candidate: CutCandidate,
+    what: str,
+    *,
+    cap_tokens: int,
+    pool_floor: Optional[int],
+    cost_provenance: str,
+    field: Sequence[CutCandidate] = (),
+) -> None:
+    """BOTH pool floors, in the order the operator can act on them.
+
+    ``--max-kv-per-request`` first because it is the PHYSICAL one -- a boot
+    that cannot admit one full-context prompt is not a slower boot, it is a
+    broken one -- and ``--pp-solve-pool-floor`` second because it is the
+    operator's own bound, whose refusal must say "your floor" rather than "the
+    context". THREE callers, ONE writer of the sentence: the solver's pinned
+    paths, the solver's solved path, and the launcher's check on the candidate
+    the objective actually SHIPS (#1286b). That third one is not redundant:
+    ``--pp-solve-objective incumbent`` names a CANDIDATE rather than a ranking,
+    so it reaches the boot without ever passing through the set the floor
+    narrowed, and a floor a named arm can walk past is not a floor.
+    """
+    _refuse_below_pool_floor(
+        candidate, what, int(cap_tokens), cost_provenance, field=field
+    )
+    if pool_floor is not None:
+        _refuse_below_pool_floor(
+            candidate,
+            what,
+            int(pool_floor),
+            cost_provenance,
+            floor_flag="--pp-solve-pool-floor",
+            field=field,
+        )
 
 
 @dataclasses.dataclass(frozen=True)
@@ -291,6 +461,104 @@ class CutDecision:
     #: was chosen, so the trade is visible in BOTH directions -- the kv-floor
     #: row alone only exposed the trade a makespan default was making.
     makespan: Optional[CutCandidate] = None
+    #: ``--pp-solve-pool-floor``, or ``None`` when no floor was asked for
+    #: (#1286b). Carried on the decision rather than only in the launcher's
+    #: namespace so every line that prices a pool can say which bound it was
+    #: priced against -- a pool figure whose constraint is not beside it is the
+    #: shape that let weg2sb5f's +64.1 % sit in plain sight.
+    pool_floor: Optional[int] = None
+    #: The non-dominated (time, pool) curve over the SERVABLE field, fastest
+    #: first (:func:`pareto_frontier`).
+    frontier: Tuple[CutCandidate, ...] = ()
+    #: The candidates the frontier was taken over -- the SERVABLE field, i.e.
+    #: the priced field minus the gapped maps the #753 gate excludes. Carried
+    #: whole rather than as a count so a floor refusal can name the actual
+    #: alternatives, and so the frontier line can print its own DENOMINATOR: a
+    #: frontier of 15 says nothing without "of 932".
+    servable: Tuple[CutCandidate, ...] = ()
+
+    def refuse_shipped_below_floors(self, shipped: CutCandidate, what: str) -> None:
+        """The floors, applied to the candidate that actually SHIPS.
+
+        The solver narrows the set its OBJECTIVE ranks over, which covers
+        ``maxkv`` and ``makespan`` -- but ``incumbent`` names a candidate by
+        layer counts and looks it up in the ranked field, so it never passes
+        through that set at all. One call at the launch seam closes that,
+        through the same writer rather than a second sentence.
+        """
+        refuse_below_floors(
+            shipped,
+            what,
+            cap_tokens=int(self.cap_tokens),
+            pool_floor=self.pool_floor,
+            cost_provenance=self.cost_provenance,
+            field=self.servable,
+        )
+
+    def frontier_line(self, top: int = FRONTIER_MAX_POINTS) -> str:
+        """THE curve, one line. Format is load-bearing: a reader greps it.
+
+        Every point carries its cut, its attention vector, its total ms and its
+        priced pool, so the makespan-vs-pool trade is READ rather than
+        re-solved -- and, when a floor is set, each point says whether it
+        clears it, which makes "what does this floor cost me in ms" a
+        subtraction between two rows of one line.
+
+        TRUNCATION CANNOT HIDE AN END. The curve is monotone, so a bound on the
+        printed points is a bound on RESOLUTION: the fastest point and the
+        largest-pool point are always printed and the count of the omitted
+        middle is stated. A frontier line that silently dropped its right-hand
+        end would read as "no layout holds more than this", which is the
+        denominator trap in its most expensive form.
+        """
+        if not self.frontier:
+            return (
+                "PP-CUT FRONTIER: pool_floor=%s -- EMPTY: no servable candidate "
+                "was priced, so there is no curve to read (the refusal above is "
+                "the whole answer)."
+                % ("none" if self.pool_floor is None else str(int(self.pool_floor)))
+            )
+        points = list(self.frontier)
+        omitted = 0
+        if len(points) > int(top) and int(top) >= 2:
+            omitted = len(points) - int(top)
+            points = points[: int(top) - 1] + [points[-1]]
+
+        def _pt(c: CutCandidate) -> str:
+            mark = ""
+            if self.pool_floor is not None:
+                mark = (
+                    " CLEARS"
+                    if float(c.pool_tokens) >= float(self.pool_floor)
+                    else " BELOW"
+                )
+            return "%s/%s total_ms=%.1f pool=%d%s" % (
+                ",".join(str(n) for n in c.layers),
+                ",".join(str(a) for a in c.attn),
+                c.total_ms,
+                int(c.pool_tokens),
+                mark,
+            )
+
+        return (
+            "PP-CUT FRONTIER: pool_floor=%s objective=%s %d non-dominated of %d "
+            "servable (of %d priced), fastest first: %s%s"
+            % (
+                "none" if self.pool_floor is None else str(int(self.pool_floor)),
+                self.objective,
+                len(self.frontier),
+                len(self.servable),
+                len(self.ranked),
+                " | ".join(_pt(c) for c in points),
+                (
+                    " | (+%d further non-dominated point(s) between the two "
+                    "printed ends not shown; the curve is monotone, so both "
+                    "ends are above)" % omitted
+                )
+                if omitted
+                else "",
+            )
+        )
 
     def table_lines(self, top: int = 8) -> List[str]:
         """The chosen candidate and its alternatives, best first.
@@ -511,6 +779,59 @@ def ms_per_layer_from_card_library(
     )
 
 
+def choose_under_floor(
+    feasible: Sequence[CutCandidate],
+    *,
+    objective: str,
+    pool_floor: Optional[int],
+    choosable: Sequence[CutCandidate],
+    cost_provenance: str,
+) -> CutCandidate:
+    """THE FLOOR NARROWS, THE OBJECTIVE RANKS -- and neither step is inline.
+
+    Split out for the same reason :func:`CutDecision.frontier_line` and the
+    launcher's ``shipped_line`` were: this is the whole of "which cut ships",
+    it is three lines of set arithmetic that a boot pays for, and until it was
+    a function the only way to prove the rule was to spend a window.  A desk
+    test can now hand it the fifteen priced points of a REAL rig frontier and
+    read back the cut, which is exactly the proof a shipped default needs.
+
+    Nothing about the rule moved in the extraction:
+
+    * ``pool_floor=None`` is no floor, and then this is ``min(total_ms)`` over
+      the untouched feasible set -- byte-identical to the pre-#1286b makespan.
+    * A floor NARROWS the set the objective ranks over.  It never re-ranks and
+      it never degrades: an empty set is the W40 refusal below, carrying the
+      frontier, not a quiet fall back to the fastest cut underneath the floor.
+      That direction is the load-bearing half and the mutants aim at it.
+    * Ties break on the OTHER axis in both arms, so an objective never spends
+      capacity or time it did not have to.
+
+    The named candidate in the refusal is the POOL-MAXIMAL one of the feasible
+    field -- the closest anything came -- because "short by N" against the best
+    possible is the number that tells the operator whether the floor is off by
+    a rounding or by a layout generation.
+    """
+    if pool_floor is not None:
+        floored = [c for c in feasible if c.pool_tokens >= float(pool_floor)]
+        if not floored:
+            _refuse_below_pool_floor(
+                max(feasible, key=lambda c: c.pool_tokens),
+                "no cut of the solved field clears --pp-solve-pool-floor; "
+                "the pool-maximal servable cut",
+                int(pool_floor),
+                cost_provenance,
+                floor_flag="--pp-solve-pool-floor",
+                field=choosable,
+            )
+        feasible = floored
+    return (
+        max(feasible, key=lambda c: (c.pool_tokens, -c.total_ms))
+        if objective == "maxkv"
+        else min(feasible, key=lambda c: (c.total_ms, -c.pool_tokens))
+    )
+
+
 def solve_launch_cut(
     *,
     layer_families: Sequence[str],
@@ -529,6 +850,7 @@ def solve_launch_cut(
     enumerate_gapped: bool = True,
     pinned_layer_set: Optional[str] = None,
     objective: str = "maxkv",
+    pool_floor: Optional[int] = None,
 ) -> CutDecision:
     """Choose the layer + attention cut, for ``objective``, among the feasible.
 
@@ -536,6 +858,16 @@ def solve_launch_cut(
     pool-maximal feasible cut; makespan takes the one with the smallest
     compute+crossing total. BOTH are priced and BOTH appear on the provenance
     line either way, so the trade is a decision and not a side effect.
+
+    ``pool_floor`` (#1286b) is a HARD LOWER BOUND on the priced world pool of
+    whatever ships, and it CONSTRAINS the objective rather than replacing it:
+    the objective still ranks, over the cuts that clear the floor. ``None`` --
+    the default -- is no floor and leaves the constrained set identical to the
+    feasible set, which is why this argument cannot move any existing boot.
+    When nothing clears it the answer is a W40 REFUSAL carrying the frontier,
+    never the fastest cut below it: a floor that silently degrades is a floor
+    the operator cannot rely on, and the whole reason it exists is that the
+    #1286 repricing put the makespan winner at 43 % of the incumbent's pool.
 
     ``pinned_layers``/``pinned_attn``: when the operator passed the existing
     flags explicitly, they WIN -- but they win by being announced with the
@@ -758,10 +1090,36 @@ def solve_launch_cut(
     # protection -- it ranks BY the number that moved, and there the correction
     # inverted the order (#1286: 31,17,16 fell from pool-maximal to below the
     # incumbent). Two objectives, two different exposures to the same repair.
-    _floor_ok = [c for c in choosable if c.pool_tokens >= float(cap_tokens)]
+    #
+    # #1286b: the POOL FLOOR binds this row too. The makespan row is not a
+    # curiosity, it is what ``--pp-solve-objective makespan`` SHIPS
+    # (launcher.pick_shipped_cut returns ``decision.makespan``), so a row that
+    # ignored the floor would be a floor the shipping arm walks straight past.
+    # Two floors, one predicate: the binding bound is whichever is higher, and
+    # the two are kept separate only in the REFUSALS, where they name different
+    # flags for the operator to move.
+    _floors = [float(cap_tokens)] + (
+        [float(pool_floor)] if pool_floor is not None else []
+    )
+    _binding_floor = max(_floors)
+    _floor_ok = [c for c in choosable if c.pool_tokens >= _binding_floor]
     makespan_row = min(
         _floor_ok or choosable, key=lambda c: (c.total_ms, -c.pool_tokens)
     )
+    # THE CURVE, over the servable field and independent of both floors: it is
+    # the field's shape, not the choice's, and an operator setting a floor
+    # needs to see the points the floor excludes as much as the ones it keeps.
+    frontier = pareto_frontier(choosable)
+
+    def _check_floors(priced: CutCandidate, what: str) -> None:
+        refuse_below_floors(
+            priced,
+            what,
+            cap_tokens=int(cap_tokens),
+            pool_floor=pool_floor,
+            cost_provenance=cost_provenance,
+            field=choosable,
+        )
     # THE OBJECTIVE IS THE SUM of the two time columns. Ranking on makespan
     # alone would hand a gapped map the crossings for free -- 31 per chunk at
     # a 40 MiB frame is not a rounding term -- and ranking on crossings alone
@@ -813,11 +1171,8 @@ def solve_launch_cut(
                 "Refused here instead. %s=1 reaches it anyway while debugging "
                 "the forward." % (str(pinned_layer_set), gate_env)
             )
-        _refuse_below_pool_floor(
-            priced,
-            "the pinned --pp-layer-set %r" % (str(pinned_layer_set),),
-            int(cap_tokens),
-            cost_provenance,
+        _check_floors(
+            priced, "the pinned --pp-layer-set %r" % (str(pinned_layer_set),)
         )
         return CutDecision(
             chosen=priced,
@@ -830,6 +1185,9 @@ def solve_launch_cut(
             unpriced=tuple(unpriced),
             objective=str(objective),
             makespan=makespan_row,
+            pool_floor=None if pool_floor is None else int(pool_floor),
+            frontier=frontier,
+            servable=tuple(choosable),
         )
 
     pinned = pinned_layers is not None
@@ -871,11 +1229,8 @@ def solve_launch_cut(
                 "priced on every axis (pool, family compute, crossings)."
                 % (",".join(str(n) for n in layers),)
             )
-        _refuse_below_pool_floor(
-            priced,
-            "the pinned layer cut %s" % (",".join(str(n) for n in layers),),
-            int(cap_tokens),
-            cost_provenance,
+        _check_floors(
+            priced, "the pinned layer cut %s" % (",".join(str(n) for n in layers),)
         )
         chosen = priced
     else:
@@ -930,15 +1285,18 @@ def solve_launch_cut(
                     (" -- " + "; ".join(unpriced)) if unpriced else "",
                 )
             )
-        # THE OBJECTIVE PICKS, AND BOTH ROWS ARE KEPT (#1254). maxkv is the
-        # default because the standing law puts the default at maximum KV;
-        # makespan is one flag away and is priced on the same line either way.
-        # Ties break on the OTHER axis in both arms, so an objective never
-        # spends capacity or time it did not have to.
-        chosen = (
-            max(feasible, key=lambda c: (c.pool_tokens, -c.total_ms))
-            if objective == "maxkv"
-            else min(feasible, key=lambda c: (c.total_ms, -c.pool_tokens))
+        # THE OPERATOR'S FLOOR NARROWS THE SET THE OBJECTIVE RANKS OVER, and
+        # an empty set is a REFUSAL rather than a quiet fallback to the fastest
+        # cut below it (#1286b); then the objective picks and BOTH rows are
+        # kept (#1254). Both steps live in :func:`choose_under_floor` so the
+        # rule that decides which cut a boot pays for can be RENDERED by a desk
+        # test against a real frontier instead of only by spending a window.
+        chosen = choose_under_floor(
+            feasible,
+            objective=objective,
+            pool_floor=pool_floor,
+            choosable=choosable,
+            cost_provenance=cost_provenance,
         )
 
     return CutDecision(
@@ -952,4 +1310,7 @@ def solve_launch_cut(
         unpriced=tuple(unpriced),
         objective=str(objective),
         makespan=makespan_row,
+        pool_floor=None if pool_floor is None else int(pool_floor),
+        frontier=frontier,
+        servable=tuple(choosable),
     )
