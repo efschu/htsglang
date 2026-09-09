@@ -236,6 +236,15 @@ KNOWN = {
         "constant is what the expression returns at reserve 1024, which is "
         "the value both reference boots measured."
     ),
+    "weg2/corridor_budget.py::BUDGET_ALIGN_MIB": (
+        "NOT A DEMAND DECISION and not a VRAM SCALE at all (#1257c). It is "
+        "the 8 MiB GRANULARITY that `budgets_from_dc` already floors every "
+        "budget to; the corridor cut rounds UP to the same multiple so the "
+        "post-cut vector keeps that invariant without a second flooring. It "
+        "decides no demand -- it only names the grid an existing decision is "
+        "already expressed on. Pinned here because the name ends in _MIB and "
+        "the gate reads names, not roles."
+    ),
     "weg2/launcher.py::P_PREFILL_ACTIVATION_RESERVE_MIB": (
         "NOT A DEMAND DECISION, a TRANSCRIPTION of one the runtime already "
         "made (#1286). It is the boot's own 'prefill activation reserve' "
