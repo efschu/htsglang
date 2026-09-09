@@ -750,6 +750,34 @@ def test_the_5090_free_column_refuses_the_full_leg_by_name():
     assert "REFUSED" in price.line()
 
 
+def test_the_corridor_floor_is_applied_and_not_merely_printed():
+    """SURVIVING MUTANT (this slice's own mutant K): dropping the floor from
+    ``affordable`` left every test green.
+
+    Both existing cases were decided by the SIGN -- 8 GiB against 474 MiB free
+    is negative with or without a floor, 512 MiB against 4 GiB is comfortable
+    either way -- so nothing exercised the floor itself.  The floor is the
+    user's reserve (``Reserve-Semantik``: 1024 MiB per card is THEIR free
+    space, not an internal allowance), and a shadow that spends it has taken
+    something that was never the mechanism's to take.
+
+    This is the case in between: a need that FITS the free column and leaves
+    less than the reserve behind.
+    """
+    free = 1200
+    need_mib = 500  # 1200 - (500 + 64) = 636 MiB left, under the 1024 floor
+    price = sh.price_shadow("GPU-3080", (need_mib - 64) * sh.MIB, free)
+    assert price.need_mib == need_mib
+    assert price.free_mib - price.need_mib > 0, "the sign must not decide this"
+    assert not price.affordable, (
+        "the shadow fitted itself into the user's 1024 MiB reserve")
+    assert "floor_mib=1024" in price.message()
+    # And one MiB of headroom the other way is affordable, so the boundary is
+    # the floor and not an accident.
+    assert sh.price_shadow("GPU-3080", (need_mib - 64) * sh.MIB, free,
+                           floor_mib=636).affordable
+
+
 def test_a_bounded_subset_fits_where_the_full_leg_does_not():
     """Which is the whole reason the subset is bounded and rotating."""
     free = 4096
