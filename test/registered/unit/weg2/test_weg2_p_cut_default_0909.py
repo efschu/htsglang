@@ -26,9 +26,10 @@ selection only once the floor leaves (414654*s, 481400*s], so each floor has a
 GROWTH and a SHRINK tolerance and the smaller one binds: +8.05 % / -6.93 % here.
 The obvious alternative, "the chosen pool minus the priced-vs-realised
 tolerance", is REJECTED and the rejection is asserted below on the BINDING
-margin -- it tolerates +16.03 % but only -0.06 %, under the 0.10 % measurement
-error it was derived from.  On distance from the lower boundary alone it looks
-better, which is why that is not the comparison.
+margin -- it tolerates +15.98 % but only -0.10 %, which is exactly the
+measurement error it was derived from (subtracting a 0.10 % tolerance BUILDS a
+0.10 % margin).  On distance from the lower boundary alone it looks better,
+which is why that is not the comparison.
 
 WHY THE FIFTEEN-POINT FRONTIER IS A SOUND STAND-IN for the 932-candidate field,
 which is the one step in this file that is an argument and not a lookup: under
@@ -250,10 +251,12 @@ class TheDefaultSelectsTheOrderedCut(CustomTestCase):
 
         Measured on the shipped numbers: the midpoint tolerates +8.05 % growth
         and -6.93 % shrink, so 6.93 % binds.  The rejected rule tolerates
-        +16.03 % but only -0.06 % -- a downward margin SMALLER than the 0.10 %
-        priced-vs-realised error it was derived from, i.e. no margin at all.
-        Ranked on distance from the lower boundary alone the rejected rule
-        looks better, which is exactly why that is not the comparison.
+        +15.98 % but only -0.10 % -- and that 0.10 % is not a coincidence,
+        it is the priced-vs-realised error the rule subtracted, handed back as
+        its entire downward margin.  A margin the size of one's own measurement
+        error is no margin.  69x apart on the axis that binds; ranked on
+        distance from the lower boundary alone the rejected rule looks better,
+        which is exactly why that is not the comparison.
         """
         def margins(floor):
             low, high = _pool_of(NEXT_FASTER_CUT), _pool_of(ORDERED_CUT)
@@ -268,8 +271,8 @@ class TheDefaultSelectsTheOrderedCut(CustomTestCase):
         self.assertGreater(grow_t, grow_s)
         # ... and loses by two orders on the one that does
         self.assertGreater(min(grow_s, shrink_s), 50 * min(grow_t, shrink_t))
-        # its binding margin is under the 0.10 % measurement error itself
-        self.assertLess(min(grow_t, shrink_t), 0.001)
+        # its binding margin IS the 0.10 % measurement error, by construction
+        self.assertAlmostEqual(min(grow_t, shrink_t), 0.001, places=4)
         self.assertGreater(min(grow_s, shrink_s), 0.06)
 
     def test_a_lower_default_would_ship_a_different_cut(self):

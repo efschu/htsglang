@@ -355,15 +355,17 @@ P_BYTES_PER_TOKEN = 8192 + 2048
 #: growth and -6.93 %% shrink, so 6.93 %% binds.
 #:
 #: THE REJECTED RULE, named because it is the obvious one: "39,13,12's priced
-#: pool minus the priced-vs-realised tolerance" gives 481400 * 0.999 = 481118.
-#: It tolerates +16.03 %% growth -- better than the midpoint -- but only
-#: -0.06 %% shrink.  That tolerance is 0.10 %% MEASURED (weg2sb5f priced
-#: 304,946 against 304,655 realised), so its binding margin is SMALLER than the
-#: measurement error it was derived from: the first re-price that shaved a
-#: tenth of a percent off the pool would silently ship 38,13,13 (453.4 ms) or
-#: refuse.  Ranked on distance from the LOWER boundary alone the rejected rule
-#: looks like the better one, which is exactly why that is not the comparison
-#: -- the test asserts it on the binding margin instead.
+#: pool minus the priced-vs-realised tolerance" gives 481400 * 0.999 = 480918.
+#: It tolerates +15.98 %% growth -- better than the midpoint -- but only
+#: -0.10 %% shrink, and that is not a coincidence: subtracting a 0.10 %%
+#: tolerance BUILDS a 0.10 %% shrink margin, so the rule's binding margin is
+#: always exactly the measurement error it was derived from (0.10 %% MEASURED,
+#: weg2sb5f priced 304,946 against 304,655 realised).  A margin the size of
+#: one's own error is no margin: the first re-price that shaved a tenth of a
+#: percent off the pool would silently ship 38,13,13 (453.4 ms) or refuse.
+#: Ranked on distance from the LOWER boundary alone the rejected rule looks
+#: like the better one, which is exactly why that is not the comparison -- the
+#: test asserts it on the binding margin, 6.93 %% against 0.10 %%, 69x.
 #:
 #: THE TRADE THE ORDER BOUGHT, so nobody re-derives it as a regression: against
 #: the unfloored makespan winner 44,10,10 (359.0 ms / 304,946 tokens) this is
