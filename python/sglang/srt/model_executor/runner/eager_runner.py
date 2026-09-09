@@ -249,8 +249,12 @@ class EagerRunner(BaseRunner):
             if model_runner.device_timer
             else contextlib.nullcontext()
         )
+        # #1241. The EAGER decode round -- the one shape where the collectives
+        # inside the round DO execute their Python bodies, so this is the path
+        # that can carry a compute/wait split at all.
+        round_ctx = model_runner._decode_round_segment("decode", graphed=False)
 
-        with ctx, pdmux_ctx:
+        with ctx, round_ctx, pdmux_ctx:
             return model_runner.model.forward(
                 forward_batch.input_ids,
                 forward_batch.positions,
@@ -327,7 +331,11 @@ class EagerRunner(BaseRunner):
             and forward_batch.forward_mode.is_plain_prefill()
             else contextlib.nullcontext()
         )
-        with ctx, rank_ctx:
+        # #1241: an extend-shaped forward reached from an OPEN decode round is
+        # a speculation forward (draft extend or target verify). Outside a
+        # round this is a nullcontext, so plain prefill is untouched.
+        round_ctx = model_runner._decode_round_segment(category, graphed=False)
+        with ctx, rank_ctx, round_ctx:
             pcg_runner = model_runner.prefill_cuda_graph_runner
             if (
                 _is_hip
@@ -414,7 +422,12 @@ class EagerRunner(BaseRunner):
             if model_runner.device_timer
             else contextlib.nullcontext()
         )
-        with ctx:
+        # #1241: an idle forward INSIDE a decode round is this rank's share of
+        # a round the group is running -- it is the rank that waits, and
+        # dropping it would make the round look shorter on exactly the rank
+        # whose wait the instrument exists to show.
+        round_ctx = model_runner._decode_round_segment("idle", graphed=False)
+        with ctx, round_ctx:
             return model_runner.model.forward(
                 forward_batch.input_ids,
                 forward_batch.positions,

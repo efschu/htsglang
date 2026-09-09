@@ -53,7 +53,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Dict, List, Mapping, NamedTuple, Optional, Sequence, Tuple
 
 from sglang.srt.managers import corridor_guard
@@ -410,9 +410,27 @@ assert P_MAX_TOTAL_TOKENS == 428000, P_MAX_TOTAL_TOKENS
 #: would hand back 1618 MiB of pool the boot could have used), and the rg6
 #: baseline carried no such flag at all.  A term whose premise is the head
 #: belongs to the head.
+#: #1241 (refuter MF-6). THE BOOT'S SPEC AND KV FACTS, ONE WRITER.
+#:
+#: These five values were literals in FIVE places: the P draft-KV flag tuple,
+#: ``common_flags``, ``argv_d``, and BOTH ``PlanInputs`` blocks that price a
+#: weight vector. The argv half and the pricing half agreed by coincidence of
+#: typing, not by construction -- so a change to the shipped draft-token count
+#: (which #1242 is already moving) would have gone on pricing the OLD
+#: configuration, silently, on every boot including the default one. That is a
+#: second bookkeeping of the boot's own argv, which is the shape
+#: UPSTREAM-MINIMAL forbids. One name each, read by everybody.
+SPEC_ALGORITHM = "NEXTN"
+SPEC_NUM_STEPS = 2
+SPEC_EAGLE_TOPK = 1
+SPEC_NUM_DRAFT_TOKENS = 3
+KV_CACHE_DTYPE = "fp8_e4m3"
+
 P_DRAFT_KV_FLAGS: Tuple[str, ...] = (
-    "--speculative-algorithm", "NEXTN", "--speculative-num-steps", "2",
-    "--speculative-eagle-topk", "1", "--speculative-num-draft-tokens", "3",
+    "--speculative-algorithm", SPEC_ALGORITHM,
+    "--speculative-num-steps", str(SPEC_NUM_STEPS),
+    "--speculative-eagle-topk", str(SPEC_EAGLE_TOPK),
+    "--speculative-num-draft-tokens", str(SPEC_NUM_DRAFT_TOKENS),
     "--speculative-draft-kv-only",
     "--max-total-tokens", str(P_MAX_TOTAL_TOKENS),
 )
@@ -918,8 +936,72 @@ D_DECODE_STEPS_PROVENANCE = (
 #: ``--rank-tp-ratio auto-performance --rank-perf-tune <target>`` (resolved by
 #: uneven_perf.apply_auto_performance). What the launcher adds is the CHOICE,
 #: priced, on one line -- ``d_tp_ratio_decision``.
-D_TP_OBJECTIVE_CHOICES = ("maxkv", "speed")
-D_TP_OBJECTIVE_DEFAULT = "maxkv"
+#: #1241 slice (2). THE OPERATING-POINT AXIS OF THE SAME #1017 SOLVE.
+#:
+#: ``maxkv`` and ``speed`` answer "what does this boot optimise for". They do
+#: NOT answer "at which decode operating point", and the two answers are not
+#: the same vector: a bs=1 decode round is BANDWIDTH-bound (every rank streams
+#: its weight shard once per token, so the barrier is
+#: ``max_r bytes_r / bandwidth_r``) while a bs=6 round is COMPUTE-bound (the
+#: same shard is read once for six tokens, so the barrier is
+#: ``max_r flops_r / gemm_r``). The 5090's measured advantage over a 3080 is
+#: 2.32x on bandwidth and 3.99x on GEMM (this rig's own card-rate library), so
+#: the two operating points do not want the same split, and until now no boot
+#: could state which of them the shipped vector serves.
+#:
+#: NO SECOND SOLVER, exactly as the two older arms. Both new positions are
+#: priced with the runtime's OWN cost model -- ``PerfCostModel.
+#: decode_round_time`` / ``per_rank_decode_times`` for the bandwidth arm,
+#: ``prefill_lockstep_compute_time`` over the #324 per-(rank, family) GEMM
+#: scores for the compute arm, ``predict_capacity`` for the pool -- and what
+#: the launcher adds is the CHOICE plus a line that prints all three vectors
+#: beside each other so the trade is readable per boot instead of per
+#: archaeology.
+D_TP_OBJECTIVE_CHOICES = ("maxkv", "speed", "decode-bs1", "decode-bs6")
+
+#: USER ORDER 2026-09-09, verbatim: "der decode bs6 soll mit bs6 (nicht mehr
+#: bs4) der standard werden". Group D's default objective moves from the
+#: capacity-first `maxkv` split to the bs=6 OPERATING POINT.
+#:
+#: WHAT THE ORDER TRADES, from dec2c's own A/B rather than from an argument:
+#: the bs=6 vector [42,11,11] measured **+10.3 % at bs4 for -1.4 % pool**. So
+#: the maxkv law is not repealed -- it is outranked at this one position,
+#: because the ranking a boot should follow is the ranking AT THE OPERATING
+#: POINT IT RUNS, and D runs decode.
+#:
+#: `maxkv` stays fully selectable via --d-tp-objective and its argv is
+#: byte-identical to the pre-#1241 form; only which arm you get by saying
+#: nothing has changed. --d-bs is NOT touched here (separate branch).
+D_TP_OBJECTIVE_DEFAULT = "decode-bs6"
+
+#: The two positions that emit an EXPLICIT weight vector rather than one of
+#: the runtime's two symbolic resolvers.
+D_OPERATING_POINTS = ("decode-bs1", "decode-bs6")
+
+#: #705, MEASURED, quoted with the commits that measured it. The desk half of
+#: #705 (``05baa99213897ed9a5ae987e67938a92c648baf0``) priced a family-split
+#: TP decode to a single threshold: the net is positive if and only if a
+#: BLOCKING TP all-reduce costs more than 14.3 us on this rig. The verdict
+#: commit (``d937d5f76b03a0f3c5ecb916649a97245acf0148``) then measured that
+#: all-reduce at 31.0-33.7 us for the 10 KB bs=1 payload (INTEGRATION_R3
+#: __group__ rows) -- i.e. above the threshold -- and REFUSED the family split
+#: anyway, because the gate is a desk net and the split would need a
+#: per-family vector that has no flag.
+#:
+#: Carried here as the collective term of the bs=1 row: at bs=1 the round is
+#: bandwidth-bound and this all-reduce is charged ONCE per layer per token, so
+#: it is the part of the round that a weight vector cannot move. Printing it
+#: beside the barrier is what keeps a reader from reading the whole barrier
+#: delta as available.
+D705_AR_BS1_US = (31.0, 33.7)
+D705_FAMILY_SPLIT_BREAKEVEN_US = 14.3
+D705_PROVENANCE = (
+    "#705 desk price 05baa99213 (family split net positive iff a blocking TP "
+    "all-reduce > %.1f us) against the measured %.1f-%.1f us at the 10 KB bs=1 "
+    "payload, d937d5f76b (INTEGRATION_R3 __group__ rows) -- which is why the "
+    "family split is REFUSED and only the head vector moves here."
+    % (D705_FAMILY_SPLIT_BREAKEVEN_US, D705_AR_BS1_US[0], D705_AR_BS1_US[1])
+)
 
 
 @dataclass(frozen=True)
@@ -2089,7 +2171,7 @@ def common_flags(
         "--served-model-name", "Qwen3.8-27B",
         "--rank-gpu-id", "0,1,2",
         "--skip-server-warmup",
-        "--kv-cache-dtype", "fp8_e4m3",
+        "--kv-cache-dtype", KV_CACHE_DTYPE,
         "--context-length", str(CONTEXT_LENGTH_TOKENS),
         # C14/K9: the per-request KV ceiling, decoupled from the model
         # context. A CEILING, not the pressure relief: on D the device pool
@@ -2314,6 +2396,7 @@ def argv_d(
     random_seed: int = RANDOM_SEED,
     barlink_cap_cycles: int = BARLINK_BAR1_CAP_CYCLES,
     census_interval: int = COLLECTIVE_CENSUS_INTERVAL,
+    disable_cuda_graph: bool = False,
     admin_api_key: Optional[str] = None,
 ) -> List[str]:
     return [py, "-m", "sglang.launch_server"] + common_flags(
@@ -2321,6 +2404,13 @@ def argv_d(
         random_seed, barlink_cap_cycles, census_interval,
     ) + (
         ["--disable-overlap-schedule"] if disable_overlap else []
+    ) + (
+        # #1241b CONTROL ARM, NOT A TUNING KNOB. Default off, and off means
+        # this list is empty -- the shipped argv is byte-identical to the one
+        # before this flag existed. Passing it CHANGES THE MEASURED FORM
+        # (full-perf validation runs with graphs and spec), so a number taken
+        # under it describes the eager form and nothing else.
+        ["--disable-cuda-graph"] if disable_cuda_graph else []
     ) + [
         # C1/K2: D's own bs, independent of P's by construction.
         "--max-running-requests", str(d_bs),
@@ -2379,8 +2469,10 @@ def argv_d(
         # from d_tp_ratio_decision as --d-tp-objective, priced on the launch
         # line; the default is still 'auto' because the maxkv law makes
         # capacity the default objective, not because nothing was decided.
-        "--speculative-algorithm", "NEXTN", "--speculative-num-steps", "2",
-        "--speculative-eagle-topk", "1", "--speculative-num-draft-tokens", "3",
+        "--speculative-algorithm", SPEC_ALGORITHM,
+        "--speculative-num-steps", str(SPEC_NUM_STEPS),
+        "--speculative-eagle-topk", str(SPEC_EAGLE_TOPK),
+        "--speculative-num-draft-tokens", str(SPEC_NUM_DRAFT_TOKENS),
     ] + list(token_vector_flags) + [
         # NO TOKEN VECTOR BY DEFAULT (#1032). What stood here was
         # `--uneven-token-vector 29,19,16 --uneven-token-vector-role seed`, the
@@ -4200,6 +4292,755 @@ def d_overlap_cost_line(model: str, disable_overlap: bool, d_bs: int = DEFAULT_D
 
 
 @dataclass(frozen=True)
+class DOperatingPointRow:
+    """One operating point's vector and what the runtime's own model prices it at."""
+
+    position: str
+    #: What the vector is proportional to, named so a reader never has to guess
+    #: which of the two measured rates produced it.
+    score_name: str
+    scores: Tuple[float, ...]
+    weights: Tuple[int, ...]
+    attn_heads: Tuple[int, ...]
+    gdn_heads: Tuple[int, ...]
+    #: Lockstep round cost from PerfCostModel, in the unit that method returns.
+    #: ``None`` = the model could not price it, and the row then says so rather
+    #: than carrying a number that looks measured.
+    round_ms: Optional[float]
+    round_unit: str
+    world_pool_tokens: Optional[int]
+    #: ``PerfCostModel.predict_capacity``'s own verdict that this vector fits
+    #: at all. ``None`` = the capacity call did not run (unpriced geometry).
+    feasible: Optional[bool] = None
+    #: The FUNDED context ``min(sum_r P_r, 64 * min_r P_r)`` -- bounded by the
+    #: SMALLEST rank, which is the whole reason it is carried next to the
+    #: world pool: a vector that collapses one rank barely moves ``sum(p)``
+    #: and can halve this.
+    funded_ctx_tokens: Optional[int] = None
+    note: str = ""
+    #: #1293. WHICH AXIS THE ATTENTION FAMILY'S COMPUTE RIDES on this boot's
+    #: geometry -- ``"token"`` under replicated-KV uneven DCP, ``"head"``
+    #: otherwise. It is not decoration: it names the grid the W53 saturation
+    #: verdict below was taken against, and the two grids differ by 16x on this
+    #: rig (4 kv-head units vs 64 token units), which is the difference between
+    #: a position being representable and being refused.
+    attn_axis: str = "head"
+    #: The DCP token partition of ``_CP_TOKEN_UNITS`` units (largest-remainder,
+    #: the same partitioner and the same units the runtime's own "Uneven DCP:
+    #: auto-set dcp_size" install uses). Empty tuple on the head axis, where
+    #: there is no token vector to report.
+    attn_token_units: Tuple[int, ...] = ()
+    #: Floor-aware re-normalisation statement: which family/axis had a rank
+    #: pinned at the partitioner's one-unit floor, and how far the REALISED
+    #: shares then sit from the requested ratio. Empty when no grid binds.
+    axis_note: str = ""
+
+
+def _gcd_reduce(values: Sequence[int]) -> Tuple[int, ...]:
+    vals = [max(1, int(v)) for v in values]
+    g = math.gcd(*vals) if len(vals) > 1 else vals[0]
+    return tuple(v // max(1, g) for v in vals)
+
+
+def _weights_from_scores(scores: Sequence[float]) -> Tuple[int, ...]:
+    """A ratio vector proportional to a measured per-rank rate.
+
+    ``--rank-tp-ratio`` takes a comma-separated integer ratio
+    (server_args.py:467 ``_parse_rank_tp_ratio``), so the rates are scaled to
+    integers and gcd-reduced. x1000 because this rig's slowest and fastest
+    measured rates differ by ~4x and rounding at x1 would quantise a 3.99x
+    ratio to 4:1 -- the vector must carry the measurement, not a rounding of it.
+    """
+    lo = min(float(s) for s in scores)
+    return _gcd_reduce([int(round(float(s) / max(lo, 1e-9) * 1000.0)) for s in scores])
+
+
+def d_plan_inputs(model: str, tp_size: int, d_bs: int):
+    """The runtime ``PlanInputs`` describing THIS boot's group D.
+
+    ONE FACTORY (refuter MF-6). Every field is read from the module constant
+    the argv builder emits, so the vector this launcher PRICES and the argv it
+    SHIPS cannot describe two different configurations. Both callers -- the
+    #1017 weight line and the #1241 operating-point rows -- go through here.
+    """
+    from sglang.srt.uneven_perf import PlanInputs
+
+    return PlanInputs(
+        tp_size=int(tp_size),
+        model_path=model,
+        kv_cache_dtype=KV_CACHE_DTYPE,
+        speculative_algorithm=SPEC_ALGORITHM,
+        speculative_num_draft_tokens=SPEC_NUM_DRAFT_TOKENS,
+        max_running_requests=int(d_bs),
+    )
+
+
+def _attn_axis_for(weights: Sequence[int], plan_flags) -> str:
+    """Which axis the attention family's COMPUTE rides for one D vector (#1293).
+
+    ``"token"`` exactly when the boot form is replicated-KV uneven DCP -- the
+    serving form: every rank keeps the FULL replicated kv-head set and runs the
+    attention core over its own TOKEN shard, so the compute follows the token
+    vector, which is continuous (#492: "attention grid-PINNED was FALSE").
+    ``"head"`` otherwise (even DCP, no DCP, or a uniform plan), where the
+    kv-head unit grid genuinely carries the family.
+
+    THE PREDICATE IS #503's SHARED ONE, NOT A THIRD SPELLING.
+    ``plan_uneven_dcp_kv_replicated`` (distributed/utils.py, placed next to the
+    runtime's ``uneven_dcp_kv_replicated`` by #503 so the two cannot drift)
+    answers this exact question at plan time from the flags about to be
+    emitted. A ``plan_flags`` with no DCP evidence (``dcp_size`` unset and no
+    KV token vector) answers "head" for ANY weights -- a non-DCP form must
+    never silently take the token axis, because there the token vector does
+    not exist and the head grid is the real carrier.
+    """
+    from sglang.srt.distributed.utils import plan_uneven_dcp_kv_replicated
+
+    return (
+        "token"
+        if plan_uneven_dcp_kv_replicated(plan_flags, list(weights))
+        else "head"
+    )
+
+
+def _axis_floor_ranks(units: int, weights: Sequence[int]) -> Tuple[int, ...]:
+    """Ranks whose proportional share of ``units`` is BELOW one whole unit.
+
+    ``partition_units`` guarantees every rank >= 1 unit, so each of these is
+    pinned at the partitioner's floor and the realised split stops carrying the
+    weight ratio on that axis. This is the one REACHABLE failure of a unit grid
+    -- a rank owning ZERO units cannot happen -- and naming the ranks rather
+    than answering yes/no is what lets the caller re-normalise against the grid
+    that binds and say WHICH rank moved.
+    """
+    total = sum(int(w) for w in weights)
+    if total <= 0 or int(units) <= 0:
+        return tuple()
+    return tuple(
+        r
+        for r, w in enumerate(weights)
+        if float(int(w)) / float(total) * float(int(units)) < 1.0
+    )
+
+
+def _axis_renormalisation(
+    family: str,
+    axis: str,
+    units: int,
+    weights: Sequence[int],
+    realised: Sequence[int],
+) -> str:
+    """Floor-aware re-normalisation, as a printable statement (#1293).
+
+    When a grid binds, ``partition_units`` floors the starved ranks to one unit
+    and takes the shortfall back off the largest shares, so the realised
+    fractions are NOT the requested ratio. Printing the requested ratio there
+    would be the instrument-text-lies shape -- the number reported would not be
+    the number shipped. This prints BOTH plus the drift between them, with the
+    family and the axis named, so a floored grid is READABLE instead of either
+    silently wrong or automatically fatal.
+    """
+    floored = _axis_floor_ranks(units, weights)
+    if not floored or not realised:
+        return ""
+    w_total = float(sum(int(w) for w in weights)) or 1.0
+    r_total = float(sum(int(u) for u in realised)) or 1.0
+    want = [float(int(w)) / w_total for w in weights]
+    got = [float(int(u)) / r_total for u in realised]
+    return (
+        "%s/%s grid BINDS: rank(s) %s below one of %d units, pinned at the "
+        "floor; realised shares %s vs requested %s (max drift %.3f)"
+        % (
+            family,
+            axis,
+            list(floored),
+            int(units),
+            [round(g, 3) for g in got],
+            [round(w, 3) for w in want],
+            max(abs(g - w) for g, w in zip(got, want)),
+        )
+    )
+
+
+def d_operating_point_rows(
+    cards: Sequence[Card],
+    budgets: Sequence[int],
+    model: str,
+    d_bs: int,
+    facts: Sequence[EarlyReadFact] = EARLY_READ_FACTS,
+) -> Tuple[List[DOperatingPointRow], List[str]]:
+    """Price the three D weight vectors side by side. Returns (rows, refusals).
+
+    Row 0 is always the SHIPPED maxkv vector (the gcd-reduced budget vector
+    ``ServerArgs._resolve_auto_rank_tp_ratio`` derives), so the two operating
+    points are always read against what this boot actually ships rather than
+    against each other.
+
+    REFUSALS ARE RETURNED, NOT RAISED. This function runs on every boot to
+    build the provenance line, including the boots that ship ``maxkv`` and
+    must not be killed by a card-rate library that cannot price an arm nobody
+    selected. ``d_tp_ratio_decision`` raises the matching refusal only when
+    the refused position is the one being SHIPPED.
+    """
+    refusals: List[str] = []
+    budgets = [int(b) for b in budgets]
+    maxkv_weights = _gcd_reduce(budgets)
+
+    # -- the geometry and the cost model, both the runtime's own -------------
+    pcm = None
+    plan = None
+    try:
+        from sglang.srt.uneven_perf import PerfCostModel
+
+        plan = d_plan_inputs(model, len(budgets), d_bs)
+        pcm = PerfCostModel(
+            plan,
+            list(maxkv_weights),
+            list(budgets),
+        )
+    except Exception as exc:  # pragma: no cover - geometry is diagnostic
+        refusals.append(
+            "W52 Weg2TpOperatingPointUnpriced: the cost model could not be "
+            "built for %r (%s), so neither operating point can be derived. The "
+            "shipped maxkv vector is unaffected -- it is the budget vector and "
+            "needs no model." % (model, exc)
+        )
+        return ([], refusals)
+
+    # -- the two measured rate vectors, by card NAME -------------------------
+    gemm: List[float] = []
+    membw: List[float] = []
+    try:
+        from sglang.srt.planner.card_rate_pass import load_measured_library
+
+        library = load_measured_library()
+        if library is not None:
+            for c in cards:
+                variant = next(
+                    (
+                        v
+                        for v in (library.variants(c.name) or ())
+                        if getattr(v, "gemm_tflops", None)
+                        and getattr(v, "membw_gbs", None)
+                    ),
+                    None,
+                )
+                if variant is None:
+                    gemm, membw = [], []
+                    break
+                gemm.append(float(variant.gemm_tflops))
+                membw.append(float(variant.membw_gbs))
+    except Exception:
+        gemm, membw = [], []
+
+    if len(gemm) != len(budgets) or len(membw) != len(budgets):
+        refusals.append(
+            "W52 Weg2TpOperatingPointUnpriced: this rig's card-rate library "
+            "carries no measured (gemm_tflops, membw_gbs) pair for every card "
+            "of group D (%s). An operating-point vector IS the measured rate "
+            "ratio, so without the measurement there is no vector to ship -- "
+            "it is refused, never approximated from a nameplate peak. Write "
+            "one with `python -m sglang.srt.planner.card_rate_pass --run`."
+            % ", ".join(c.name for c in cards)
+        )
+        return ([], refusals)
+
+    # -- W54: an explicit vector needs the uneven-TP early-read env fact ------
+    # `_handle_uneven_tp` (server_args.py:12025) reads SGLANG_UNEVEN_DCP* off
+    # os.environ BEFORE the flag half publishes itself (:7186). An explicit
+    # ratio shipped on a boot whose EARLY_READ_FACTS no longer carries that row
+    # for group D would be silently evened out -- a wrong vector that boots.
+    have = {
+        f.env_key for f in facts if f.groups in ("both", "D") and f.env_key
+    }
+    missing = [
+        k
+        for k in ("SGLANG_UNEVEN_DCP", "SGLANG_UNEVEN_DCP_WEIGHTED")
+        if k not in have
+    ]
+    if missing:
+        refusals.append(
+            "W54 Weg2TpOperatingPointNeedsEnvPin: an explicit --rank-tp-ratio "
+            "vector is resolved by _handle_uneven_tp (server_args.py:12025), "
+            "which reads %s off os.environ BEFORE the flag half publishes "
+            "itself (:7186). EARLY_READ_FACTS no longer states %s for group D, "
+            "so shipping the vector would need an env pin in the launcher's own "
+            "shell -- the R19 shape #1235 removed. Refused instead."
+            % (" and ".join(missing), " and ".join(missing))
+        )
+        return ([], refusals)
+
+    # -- the three rows ------------------------------------------------------
+    from sglang.srt.distributed.utils import _CP_TOKEN_UNITS, partition_units
+
+    n_ranks = len(budgets)
+
+    # #1293 -- the plan-time flags the attention-axis predicate reads. This
+    # launcher's group D always ships ``--uneven-dcp`` + ``--uneven-dcp-
+    # weighted`` (``early_read_flags("D")``), and the W54 gate immediately
+    # above has just PROVEN both facts present -- under a non-uniform
+    # ``--rank-tp-ratio`` the runtime then auto-sets ``dcp_size = tp_size``
+    # (server_args.py:12112-12128, "Uneven DCP: auto-set dcp_size"). Mirroring
+    # that auto-set here is gated on the SAME fact the W54 check read, so a
+    # future form that stops shipping the env fact falls back to the head
+    # axis instead of silently keeping the token one. The non-uniformity half
+    # of the predicate stays inside ``plan_uneven_dcp_kv_replicated`` itself.
+    uneven_dcp_armed = "SGLANG_UNEVEN_DCP" in have
+    dcp_flags = replace(
+        plan, dcp_size=(n_ranks if uneven_dcp_armed else plan.dcp_size)
+    )
+
+    def _fam_partition(units: int, weights: Sequence[int]) -> Tuple[int, ...]:
+        """Partition ``units`` over ``weights``, or ``()`` if the runtime
+        would not shard that family by a vector at all.
+
+        THE PREDICATE IS THE RUNTIME'S, NOT A WEAKER ONE OF OUR OWN (review
+        R2). ``_partition_units_raw`` RAISES when ``units < len(weights)``
+        (distributed/utils.py), and ``PerfCostModel`` answers exactly this
+        question with ``gdn_units >= tp_size`` (uneven_perf.py:4553, :4596)
+        before it shards. The first version of this row guarded GDN with
+        ``> 1``, which is true and still below the world size on any model
+        with 2 GDN units and 3 ranks -- and the call sat OUTSIDE every
+        try/except in a function reached from the DEFAULT maxkv boot. A
+        diagnostic line that runs on every boot must not be able to kill one.
+        """
+        if int(units) < int(n_ranks):
+            return tuple()
+        return tuple(partition_units(int(units), list(weights)))
+
+    def _row(
+        position: str, score_name: str, scores, weights
+    ) -> Tuple[DOperatingPointRow, Optional[str]]:
+        """One priced row, and the refusal it earned (or ``None``).
+
+        NOTHING IN HERE RAISES. Every arm is priced on every boot so the
+        trade is readable per boot, which means this runs on maxkv boots that
+        selected none of the arms it prices.
+        """
+        try:
+            # Attention. The runtime widens the grid to the q-heads when the
+            # o-group count is below the world size rather than crashing in
+            # partition_units (uneven_perf.py:4520-4528); mirrored here so the
+            # row quotes the geometry the model would actually shard on.
+            a_units = int(pcm.attn_units)
+            grid = a_units if a_units >= n_ranks else max(int(pcm.q_heads), n_ranks)
+            attn_units = list(partition_units(grid, list(weights)))
+            scale = int(pcm.q_heads) // max(1, grid)
+            attn = tuple(u * scale for u in attn_units)
+            # #1293 THE AXIS THE ATTENTION COMPUTE RIDES. Under replicated-KV
+            # uneven DCP (the serving form: dcp_size=3, replicated kv heads,
+            # token-sharded, weighted owner rule #173) the attention COMPUTE
+            # follows the TOKEN vector, not the kv-head unit grid -- #492's
+            # correction verbatim: "attention grid-PINNED was FALSE -- kv
+            # heads are replicated, attention compute follows the token
+            # vector (continuous)". The head partition above stays what the
+            # PROJECTIONS really do (that split is real and prices the weight
+            # terms below); the token partition is what the family's per-rank
+            # work follows, on the SAME 64-unit largest-remainder grid the
+            # runtime's own "Uneven DCP ... installed" vector uses
+            # (_CP_TOKEN_UNITS, distributed/utils.py). This is #503's escape
+            # extended to this solve: #503 fixed the phase-prefill enumerator
+            # gridding attention on kv-heads (placement.py:813 models it
+            # right); the same class sat here.
+            axis = _attn_axis_for(weights, dcp_flags)
+            token_units: Tuple[int, ...] = ()
+            if axis == "token" and position != "maxkv":
+                # The position's own intent made concrete: token ownership
+                # proportional to the measured rates, integerised exactly the
+                # way the runtime integerises its token vector. For maxkv
+                # (auto) the runtime DERIVES its capacity-matched vector
+                # instead; that derived vector is read off predict_capacity
+                # below rather than re-spelled here.
+                token_units = tuple(
+                    partition_units(_CP_TOKEN_UNITS, list(weights))
+                )
+            # GDN through the cost model's OWN partitioner, so its predicate
+            # (and its `[0] * tp_size` answer for a model it will not shard)
+            # is inherited rather than re-implemented.
+            gdn_raw = pcm.gdn_unit_partition(list(weights))
+            gdn = tuple(int(x) for x in gdn_raw) if any(gdn_raw) else tuple()
+            mlp_part = _fam_partition(int(pcm.mlp_units), weights)
+            if not mlp_part:
+                return (
+                    DOperatingPointRow(
+                        position=position,
+                        score_name=score_name,
+                        scores=tuple(float(x) for x in scores),
+                        weights=tuple(int(w) for w in weights),
+                        attn_heads=attn,
+                        gdn_heads=gdn,
+                        round_ms=None,
+                        round_unit="unpriced (%d MLP units < %d ranks: the "
+                        "runtime does not shard this family by a vector)"
+                        % (int(pcm.mlp_units), n_ranks),
+                        world_pool_tokens=None,
+                        feasible=None,
+                        funded_ctx_tokens=None,
+                        attn_axis=axis,
+                        attn_token_units=token_units,
+                    ),
+                    None,
+                )
+            mlp = list(mlp_part)
+            # #1293 floor-aware re-normalisation, per family, per axis. When a
+            # unit grid floors a rank, the realised shares drift off the
+            # requested ratio; the drift is PRINTED with the family and the
+            # axis instead of either passing silently (instrument-text-lies
+            # shape) or being fatal for a grid that no longer carries the
+            # compute. Families checked on the grid they actually ride: the
+            # attention COMPUTE on its axis (token grid when uneven DCP, the
+            # head grid otherwise), the attention PROJECTIONS always on the
+            # head grid (their split is real either way), GDN and MLP on
+            # their own unit grids.
+            _notes = []
+            if axis == "token":
+                if token_units:
+                    _notes.append(
+                        _axis_renormalisation(
+                            "attention", "token", _CP_TOKEN_UNITS, weights,
+                            token_units,
+                        )
+                    )
+                _notes.append(
+                    _axis_renormalisation(
+                        "attention-projections", "head", grid, weights,
+                        attn_units,
+                    )
+                )
+            else:
+                _notes.append(
+                    _axis_renormalisation(
+                        "attention", "head", grid, weights, attn_units
+                    )
+                )
+            if gdn:
+                _notes.append(
+                    _axis_renormalisation(
+                        "GDN", "head", int(pcm.gdn_units), weights, list(gdn)
+                    )
+                )
+            _notes.append(
+                _axis_renormalisation(
+                    "MLP", "unit", int(pcm.mlp_units), weights, mlp
+                )
+            )
+            axis_note = "; ".join(n for n in _notes if n)
+        except Exception as exc:  # pragma: no cover - geometry is diagnostic
+            return (
+                DOperatingPointRow(
+                    position=position,
+                    score_name=score_name,
+                    scores=tuple(float(x) for x in scores),
+                    weights=tuple(int(w) for w in weights),
+                    attn_heads=tuple(),
+                    gdn_heads=tuple(),
+                    round_ms=None,
+                    round_unit="unpriced (geometry: %s)" % exc,
+                    world_pool_tokens=None,
+                    feasible=None,
+                    funded_ctx_tokens=None,
+                ),
+                None,
+            )
+
+        round_ms: Optional[float] = None
+        unit = "unpriced"
+        note = ""
+        try:
+            if position == "decode-bs1":
+                # THE RUNTIME'S OWN bs=1 ROOFLINE. Relative units by its own
+                # docstring ("only ratios between candidates are consumed"),
+                # so it is reported as a ratio and never as milliseconds.
+                round_ms = float(
+                    pcm.decode_round_time(mlp, membw, None, list(attn_units))
+                )
+                unit = "relative bs1 round (PerfCostModel.decode_round_time)"
+                note = D705_PROVENANCE
+            else:
+                # The lockstep sum-of-per-family-maxima (#475).
+                #
+                # PER-CARD SCALAR RATES, NOT PER-(RANK, FAMILY) SCORES, AND
+                # THE LINE SAYS SO (refuter MF-3). ``family_tflops`` is passed
+                # as None because this launcher has no per-family score
+                # source: ``family_prefill_tflops`` needs a ``GemmScores``
+                # from the planner's gemm pass and returns None for a
+                # single-scheme checkpoint anyway. With None, one rank is
+                # slowest in EVERY family, so #475's ``sum_fam max_rank``
+                # degenerates to ``max_rank sum_fam`` -- the pre-#475 lower
+                # bound. Building a second per-family score here to dress the
+                # number up would be exactly the parallel bookkeeping
+                # UPSTREAM-MINIMAL forbids, so the claim is dropped instead of
+                # the input invented, and the unit carries the limitation to
+                # the log line.
+                round_ms = (
+                    float(
+                        pcm.prefill_lockstep_compute_time(
+                            mlp, gemm, None, list(attn_units)
+                        )
+                    )
+                    * 1000.0
+                )
+                unit = (
+                    "ms lockstep GEMM over PER-CARD scalar rates "
+                    "(PerfCostModel.prefill_lockstep_compute_time, "
+                    "family_tflops=None, so sum_fam max_rank collapses to "
+                    "max_rank sum_fam); the COMPUTE-BOUND premise of this arm "
+                    "is BOOT-UNPROVEN -- it is the very quantity #1241 slice "
+                    "(1) measures and no boot has run it yet"
+                )
+        except Exception as exc:
+            round_ms = None
+            unit = "unpriced (%s)" % exc
+
+        # THE POOL, AND THE TWO FIELDS THE FIRST VERSION THREW AWAY
+        # (refuter MF-4). ``predict_capacity`` returns `feasible` -- the
+        # model's own verdict that the vector fits at all -- and `ctx`, the
+        # FUNDED context ``min(sum_r P_r, 64 * min_r P_r)``. Reading only
+        # ``sum(p)`` prints a barely-moved world pool for a vector that
+        # collapses one rank, because the funded context is bounded by the
+        # SMALLEST rank and the sum is not. Both are carried on the row now,
+        # and an infeasible vector is refused rather than shipped.
+        pool: Optional[int] = None
+        feasible: Optional[bool] = None
+        funded_ctx: Optional[int] = None
+        try:
+            # #1293: a token-axis POSITION pins its own token vector, so the
+            # funded context priced is the pinned vector's own budget
+            # (predict_capacity's #492 arm: cp_token_context_budget of the pin,
+            # strictly the weaker of the two) -- the price of taking token
+            # ownership proportional to a rate instead of to capacity reaches
+            # the gate rather than being rounded away. maxkv (auto) keeps the
+            # byte-identical derived-matched call, and its token vector is
+            # read BACK off the model's own answer below.
+            cap = (
+                pcm.predict_capacity(
+                    mlp, list(attn_units), token_vector=list(token_units)
+                )
+                if token_units
+                else pcm.predict_capacity(mlp, list(attn_units))
+            )
+            pool = int(sum(cap["p"]))
+            if "feasible" in cap:
+                feasible = bool(cap["feasible"])
+            if cap.get("ctx") is not None:
+                funded_ctx = int(cap["ctx"])
+            if position == "maxkv" and axis == "token" and cap.get("token_vector"):
+                token_units = tuple(int(v) for v in cap["token_vector"])
+        except Exception:
+            pool = None
+        refusal = None
+        if feasible is False:
+            refusal = (
+                "W55 Weg2TpOperatingPointInfeasible: position %s derives "
+                "weights %s, which PerfCostModel.predict_capacity marks "
+                "feasible=False against this boot's budgets %s -- the weight "
+                "shards plus the mamba pool plus the reserves do not leave a "
+                "positive KV pool on at least one rank. Refused. This is the "
+                "model's own verdict, not a margin chosen here: no safety "
+                "factor is applied on top of it."
+                % (position, list(int(w) for w in weights), list(budgets))
+            )
+        return (
+            DOperatingPointRow(
+                position=position,
+                score_name=score_name,
+                scores=tuple(float(x) for x in scores),
+                weights=tuple(int(w) for w in weights),
+                attn_heads=attn,
+                gdn_heads=gdn,
+                round_ms=round_ms,
+                round_unit=unit,
+                world_pool_tokens=pool,
+                feasible=feasible,
+                funded_ctx_tokens=funded_ctx,
+                note=note,
+                attn_axis=axis,
+                attn_token_units=token_units,
+                axis_note=axis_note,
+            ),
+            refusal,
+        )
+
+    rows = []
+    for _pos, _score_name, _scores, _weights in (
+        ("maxkv", "budget MiB (capacity-first)", tuple(budgets), maxkv_weights),
+        ("decode-bs1", "measured membw_gbs", membw, _weights_from_scores(membw)),
+        ("decode-bs6", "measured gemm_tflops", gemm, _weights_from_scores(gemm)),
+    ):
+        _row_obj, _refusal = _row(_pos, _score_name, _scores, _weights)
+        rows.append(_row_obj)
+        # A refusal on the SHIPPED maxkv vector is not this axis's to make:
+        # that vector is what `--rank-tp-ratio auto` resolves to with or
+        # without #1241, so refusing it here would turn a diagnostic into a
+        # boot blocker for the default path.
+        if _refusal is not None and _pos != "maxkv":
+            refusals.append(_refusal)
+
+    # -- W53: a position that would turn an uneven axis OFF -------------------
+    #
+    # THE OBVIOUS CHECK IS UNREACHABLE AND IS NOT THE ONE MADE HERE. A rank
+    # owning zero heads cannot happen: `partition_units` guarantees every rank
+    # >= 1 unit by construction (distributed/utils.py, "largest-remainder
+    # rounding, every rank gets >= 1 unit"). Asserting against zero heads would
+    # be a guard that can never fire -- written, never executed.
+    #
+    # The reachable failure is SATURATION. When a rank's proportional share of
+    # a family's units falls below one unit, the partitioner floors it to 1 and
+    # the shipped partition stops representing the measured ratio: the axis is
+    # still nominally uneven, but it is pinned at its floor and every further
+    # difference in the measurement is invisible to it. That is an axis
+    # disabled in the only sense that matters to a boot -- it no longer carries
+    # the quantity it exists to carry -- and it is what an extreme rate ratio
+    # actually produces.
+    def _saturated(weights: Sequence[int], units: int) -> Optional[int]:
+        total = sum(int(w) for w in weights)
+        for r, w in enumerate(weights):
+            if total > 0 and float(w) / total * float(units) < 1.0:
+                return r
+        return None
+
+    for row in rows[1:]:
+        sat_family = None
+        sat_rank = None
+        sat_units = None
+        sat_axis = None
+        # #1293: THE GRID THE VERDICT IS TAKEN AGAINST IS THE GRID THE COMPUTE
+        # RIDES. Under replicated-KV uneven DCP the attention compute follows
+        # the TOKEN vector (row.attn_axis == "token"), so saturation for that
+        # family is judged on the 64-unit token grid -- the 4-kv-head-unit
+        # grid stopped carrying the family's compute the moment the KV heads
+        # were replicated (#492), and refusing a measured ratio against a grid
+        # it does not ride was this seam's defect (boot weg2dec1 arms 2/3,
+        # BOOT_weg2dec1_0909.md). The refusal itself STAYS for a vector that
+        # genuinely cannot be represented on its riding axis (a rank's token
+        # share below 1/64), and for every head-axis form.
+        for fam_name, fam_units, fam_axis in (
+            (
+                "attention",
+                _CP_TOKEN_UNITS
+                if row.attn_axis == "token"
+                else int(pcm.attn_units),
+                row.attn_axis,
+            ),
+            ("GDN", int(pcm.gdn_units), "head"),
+        ):
+            # SAME PREDICATE AS THE PARTITION (review R2). A family the
+            # runtime does not shard by the vector has no axis to disable, so
+            # a saturation refusal against it would be a FALSE W53 -- the
+            # `<= 1` form fired for a GDN family of 2 units on 3 ranks, which
+            # `gdn_unit_partition` answers with [0, 0, 0].
+            if fam_units < n_ranks:
+                continue
+            r = _saturated(row.weights, fam_units)
+            if r is not None:
+                sat_family, sat_rank, sat_units, sat_axis = (
+                    fam_name, r, fam_units, fam_axis,
+                )
+                break
+        if sat_family is not None:
+            if sat_family == "attention":
+                sat_part = list(row.attn_token_units or row.attn_heads)
+            else:
+                sat_part = list(row.gdn_heads)
+            refusals.append(
+                "W53 Weg2TpOperatingPointDisablesUnevenAxis: position %s "
+                "derives weights %s; rank %d's share of the %d %s units "
+                "(axis=%s) is below ONE unit, so partition_units floors "
+                "it to 1 (it guarantees >= 1 per rank) and the shipped "
+                "partition %s no "
+                "longer represents the measured ratio -- the axis is pinned at "
+                "its floor, which is the axis disabled in the sense a boot can "
+                "observe. Refused rather than shipped."
+                % (
+                    row.position,
+                    list(row.weights),
+                    int(sat_rank),
+                    int(sat_units),
+                    sat_family,
+                    sat_axis,
+                    sat_part,
+                )
+            )
+        elif len(set(row.weights)) == 1 and len(row.weights) > 1:
+            refusals.append(
+                "W53 Weg2TpOperatingPointDisablesUnevenAxis: position %s "
+                "derives the FLAT vector %s, which is even TP wearing an "
+                "uneven flag. Refused: an axis that resolves to equality is "
+                "the axis disabled." % (row.position, list(row.weights))
+            )
+    return (rows, refusals)
+
+
+def d_operating_point_line(
+    rows: Sequence[DOperatingPointRow], refusals: Sequence[str], shipped: str
+) -> str:
+    """All three vectors, their price and their pool, on ONE line.
+
+    The trade is only readable if the alternatives are printed next to what
+    shipped, in the same units, from the same model, on the same boot.
+    """
+    if not rows:
+        return (
+            "WEG2 D-OPERATING-POINTS UNPRICED (shipped=%s): %s"
+            % (shipped, " | ".join(refusals) or "no reason given")
+        )
+    parts = []
+    for row in rows:
+        priced = (
+            "%.4f %s" % (row.round_ms, row.round_unit)
+            if row.round_ms is not None
+            else row.round_unit
+        )
+        # #1293: which axis the attention compute rides, named per row, plus
+        # the token partition when that axis carries it and the floor-binding
+        # statement when any grid binds. `attn_axis=head` is the pre-DCP
+        # reading of the attn heads printed before it; `attn_axis=token`
+        # says the heads are the PROJECTION split and the compute follows
+        # `token_units`.
+        axis_bit = " attn_axis=%s" % row.attn_axis
+        if row.attn_token_units:
+            axis_bit += " token_units %s" % (list(row.attn_token_units),)
+        if row.axis_note:
+            axis_bit += " [%s]" % row.axis_note
+        parts.append(
+            "%s%s: weights %s from %s %s -> attn %s%s GDN %s, round %s, world pool "
+            "%s, funded ctx %s, feasible %s"
+            % (
+                row.position,
+                " [SHIPPED]" if row.position == shipped else "",
+                list(row.weights),
+                row.score_name,
+                [round(x, 1) for x in row.scores],
+                list(row.attn_heads),
+                axis_bit,
+                list(row.gdn_heads),
+                priced,
+                row.world_pool_tokens
+                if row.world_pool_tokens is not None
+                else "UNPRICED",
+                # BOTH, because they answer different questions: the world
+                # pool is the sum over ranks, the funded context is bounded by
+                # the SMALLEST rank (min(sum P, 64 min P)) and is the quantity
+                # a carrier bound is about. A vector that collapses one rank
+                # moves the second far more than the first.
+                row.funded_ctx_tokens
+                if row.funded_ctx_tokens is not None
+                else "UNPRICED",
+                "UNPRICED" if row.feasible is None else row.feasible,
+            )
+        )
+    tail = (" REFUSED: " + " | ".join(refusals)) if refusals else ""
+    note = next((r.note for r in rows if r.note), "")
+    return (
+        "WEG2 D-OPERATING-POINTS (#1241 slice 2, the operating-point axis of "
+        "the #1017 solve; shipped=%s, default %s since the user order of "
+        "2026-09-09 -- 'maxkv' is still selectable and its argv is still "
+        "byte-identical to the pre-#1241 form). %s. %s%s"
+        % (shipped, D_TP_OBJECTIVE_DEFAULT, " || ".join(parts), note, tail)
+    )
+
+
+@dataclass(frozen=True)
 class DTpRatioDecision:
     """Group D's weight-vector objective, the argv it produces, and its price."""
 
@@ -4207,6 +5048,10 @@ class DTpRatioDecision:
     tune: str
     flags: Tuple[str, ...]
     line: str
+    #: #1241 slice (2). The three-vector provenance line. Empty only when the
+    #: rows could not be built at all, which the line itself then says.
+    op_line: str = ""
+    rows: Tuple[DOperatingPointRow, ...] = ()
 
 
 def d_tp_ratio_decision(
@@ -4273,8 +5118,35 @@ def d_tp_ratio_decision(
             "W47 Weg2TpObjectiveRefused: --d-tp-objective %r is not one of %s."
             % (objective, "|".join(D_TP_OBJECTIVE_CHOICES))
         )
+
+    # #1241 slice (2). Built on EVERY boot, including the maxkv ones, because
+    # the point of the line is that the trade is visible per boot. Refusals
+    # only KILL the launch when the refused position is the one being shipped.
+    op_rows, op_refusals = d_operating_point_rows(cards, budgets, model, d_bs)
+    op_line = d_operating_point_line(op_rows, op_refusals, objective)
+    if objective in D_OPERATING_POINTS:
+        mine = [
+            r
+            for r in op_refusals
+            if objective in r or r.startswith(("W52", "W54"))
+        ]
+        if mine:
+            raise Weg2LaunchRefused(mine[0] + " (position %s was SHIPPED, so "
+                                    "the refusal is fatal here; on a maxkv boot "
+                                    "the same finding is printed and the launch "
+                                    "continues)." % objective)
+
     if objective == "speed":
         flags = ("--rank-tp-ratio", "auto-performance", "--rank-perf-tune", str(tune))
+    elif objective in D_OPERATING_POINTS:
+        row = next(r for r in op_rows if r.position == objective)
+        # THE ONE PLACE THE LAUNCHER WRITES A VECTOR INSTEAD OF NAMING A
+        # RESOLVER. Deliberate and narrow: neither `auto` nor
+        # `auto-performance` moves the attention/GDN split (uneven_perf.py:6571
+        # says so in its own docstring), and the attention barrier IS the
+        # operating-point question. The vector is the measured rate ratio and
+        # nothing else -- no hand numbers, no tuning constant.
+        flags = ("--rank-tp-ratio", ",".join(str(w) for w in row.weights))
     else:
         flags = ("--rank-tp-ratio", "auto")
 
@@ -4289,22 +5161,22 @@ def d_tp_ratio_decision(
     n_q = 0
     try:
         from sglang.srt.distributed.utils import partition_units
-        from sglang.srt.uneven_perf import PerfCostModel, PlanInputs
+        from sglang.srt.uneven_perf import PerfCostModel
 
-        inputs = PlanInputs(
-            tp_size=len(budgets),
-            model_path=model,
-            kv_cache_dtype="fp8_e4m3",
-            speculative_algorithm="NEXTN",
-            speculative_num_draft_tokens=3,
-            max_running_requests=int(d_bs),
+        pcm = PerfCostModel(
+            d_plan_inputs(model, len(budgets), d_bs), weights, list(budgets)
         )
-        pcm = PerfCostModel(inputs, weights, list(budgets))
         n_q = int(pcm.q_heads)
         scale = n_q // max(1, int(pcm.attn_units))
         q_heads = [u * scale for u in partition_units(int(pcm.attn_units), weights)]
-        if int(pcm.gdn_units) > 1:
-            gdn_heads = list(partition_units(int(pcm.gdn_units), weights))
+        # Same predicate as the operating-point rows (review R2): `> 1` is
+        # true and still below the world size for a 2-unit GDN family on 3
+        # ranks, and partition_units RAISES there. `gdn_unit_partition`
+        # carries the runtime's own `gdn_units >= tp_size` and answers
+        # [0]*tp_size instead of raising.
+        _gdn_raw = pcm.gdn_unit_partition(list(weights))
+        if any(_gdn_raw):
+            gdn_heads = [int(x) for x in _gdn_raw]
         heads_note = "attention %s of %d q-heads%s" % (
             q_heads,
             n_q,
@@ -4389,7 +5261,11 @@ def d_tp_ratio_decision(
         )
 
     line = (
-        "WEG2 D-WEIGHTS objective=%s (default %s, the maxkv law; 'speed' is "
+        "WEG2 D-WEIGHTS objective=%s (default %s since the user order of "
+        "2026-09-09, \"der decode bs6 soll mit bs6 (nicht mehr bs4) der "
+        "standard werden\": dec2c measured the bs=6 vector [42,11,11] at "
+        "+10.3 %% at bs4 for -1.4 %% pool, so the maxkv law is outranked AT "
+        "THIS OPERATING POINT, not repealed -- 'maxkv' and 'speed' stay "
         "selectable and never silent) -> argv %s. Weights the runtime will "
         "derive from the SAME --rank-gpu-memory-mib %s: %s (gcd-reduced, "
         "server_args.py:11239 -- printed here, written there). %s. %s"
@@ -4404,7 +5280,12 @@ def d_tp_ratio_decision(
         )
     )
     return DTpRatioDecision(
-        objective=objective, tune=str(tune), flags=tuple(flags), line=line
+        objective=objective,
+        tune=str(tune),
+        flags=tuple(flags),
+        line=line,
+        op_line=op_line,
+        rows=tuple(op_rows),
     )
 
 
@@ -6516,19 +7397,62 @@ def build_parser() -> argparse.ArgumentParser:
         "--d-tp-objective", choices=list(D_TP_OBJECTIVE_CHOICES),
         default=D_TP_OBJECTIVE_DEFAULT,
         help=f"Group D only (#1017). WHICH OBJECTIVE group D's weight vector "
-             f"is solved for. Default {D_TP_OBJECTIVE_DEFAULT!r} = the "
-             f"capacity-first split, emitted as --rank-tp-ratio auto: weights "
+             f"is solved for. Default {D_TP_OBJECTIVE_DEFAULT!r} SINCE THE "
+             f"USER ORDER OF 2026-09-09, verbatim \"der decode bs6 soll mit "
+             f"bs6 (nicht mehr bs4) der standard werden\": the bs=6 operating "
+             f"point, whose vector is the measured gemm_tflops ratio. Boot "
+             f"dec2c priced that vector ([42,11,11]) at +10.3%% at bs4 for "
+             f"-1.4%% pool, which is the trade the order makes -- the ranking "
+             f"a boot follows is the ranking AT THE OPERATING POINT IT RUNS, "
+             f"and group D runs decode. The maxkv law is therefore outranked "
+             f"here, not repealed: 'maxkv' remains fully selectable and emits "
+             f"the same --rank-tp-ratio auto it always did (byte-identical to "
+             f"the pre-#1241 form) -- the capacity-first split, weights "
              f"proportional to the per-rank VRAM budgets, which maximizes the "
              f"KV pool and is deliberately independent of how fast the cards "
-             f"are (server_args.py:838). That is the DEFAULT because the "
-             f"standing law makes maximum KV the default objective -- not "
-             f"because speed was never considered. 'speed' emits "
+             f"are (server_args.py:838). 'speed' emits "
              f"--rank-tp-ratio auto-performance --rank-perf-tune "
              f"<--d-rank-perf-tune>, the runtime's own per-task optimizer. "
-             f"Either way the launcher prints the WEG2 D-WEIGHTS line naming "
-             f"the objective, the weight vector, the per-rank head partition "
-             f"and the estimated cost at the attention barrier. No arm is "
-             f"silent and no arm is solved here.",
+             f"'decode-bs1' and 'decode-bs6' (#1241) add the OPERATING-POINT "
+             f"axis to the same solve and are the only two arms that emit an "
+             f"EXPLICIT --rank-tp-ratio vector: the bs=1 arm's vector is the "
+             f"measured membw_gbs ratio, the bs=6 arm's is the measured "
+             f"gemm_tflops ratio -- both from this rig's card-rate library, by "
+             f"card NAME, with no hand number anywhere in the derivation. "
+             f"BOTH REGIME PREMISES ARE STILL UNPROVEN ON THIS RIG, AND ONE "
+             f"OF THEM IS NOW THE DEFAULT: that a bs=1 round is "
+             f"bandwidth-bound and a bs=6 round compute-bound is "
+             f"exactly the quantity the #1241 decode compute/wait clock "
+             f"measures. Boot dec2c (21c46b1876) DID run that clock and "
+             f"withheld the split on 13,893 of 13,950 rounds "
+             f"(graph-replay-nodes-overwritten), so it measured the rounds "
+             f"and not the regime; #1302 is the fix for that read and the "
+             f"next dec boot is where the premise is first testable. What "
+             f"the order rests on is the A/B (throughput and pool), not the "
+             f"regime claim -- so these two arms are "
+             f"hypotheses with a derivation, not measurements, and the "
+             f"D-OPERATING-POINTS line says so per row. They are needed "
+             f"because neither 'auto' nor 'auto-performance' moves the "
+             f"attention/GDN split (uneven_perf.py:6571) and that split IS the "
+             f"operating-point question. A position is REFUSED rather than "
+             f"shipped when the card-rate library cannot price it (W52), when "
+             f"its vector SATURATES a family -- a rank's proportional share "
+             f"below one unit, so partition_units floors it and the axis is "
+             f"pinned at its floor -- or resolves FLAT, which is even TP "
+             f"wearing an uneven flag (W53), when it would need an env pin to "
+             f"be honoured (W54), or when PerfCostModel.predict_capacity marks "
+             f"it feasible=False (W55). A rank with ZERO heads is NOT among "
+             f"them and never was: partition_units guarantees every rank at "
+             f"least one unit, so that check could not fire. "
+             f"Whatever is chosen, the launcher prints the WEG2 D-WEIGHTS line "
+             f"naming the objective, the weight vector, the per-rank head "
+             f"partition and the estimated cost at the attention barrier, PLUS "
+             f"the WEG2 D-OPERATING-POINTS line carrying ALL THREE vectors "
+             f"with their priced round cost, world pool, FUNDED CONTEXT "
+             f"(min(sum P, 64 min P), the bound the smallest rank sets) and "
+             f"the model's feasible verdict -- on every boot, "
+             f"including the default one, so the trade is readable per boot. "
+             f"No arm is silent and no arm is solved here.",
     )
     ap.add_argument(
         "--d-rank-perf-tune", default="both",
@@ -6574,6 +7498,19 @@ def build_parser() -> argparse.ArgumentParser:
              "retracted does NOT switch off the value match here -- #900's "
              "lesson, and the value match is what caught the shipped 29,19,16 "
              "in the first place.",
+    )
+    ap.add_argument(
+        "--d-disable-cuda-graph", action="store_true",
+        help="CONTROL ARM ONLY (#1241b). Put --disable-cuda-graph on group "
+             "D, so every decode round runs eager and the compute/wait split "
+             "is measured the slice-1 way. THIS CHANGES THE MEASURED FORM: "
+             "boot weg2dec1_0909 recorded eager rounds averaging 16.6x the "
+             "graphed ones, so a ms/round or a compute/wait number taken "
+             "under this flag describes the eager form and must never be "
+             "quoted as the form's. The graphed form is split by the event "
+             "nodes #1241b lays at capture -- use this arm to CHECK those "
+             "numbers, or when the overhead line reports the nodes as "
+             "overwritten. Default off, and off is byte-identical argv.",
     )
     ap.add_argument(
         "--d-disable-overlap-schedule", action="store_true",
@@ -7247,6 +8184,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
     log(depth_decision.line())
     state.p_depth = depth_decision.depth
+    if ns.d_disable_cuda_graph:
+        log(
+            "W56 Weg2EagerDecodeArm: --d-disable-cuda-graph was passed, so "
+            "group D runs --disable-cuda-graph. THIS IS A CONTROL ARM: the "
+            "decode form under measurement is now eager, not the graphed "
+            "full-perf form, and boot weg2dec1_0909 measured the eager mean "
+            "round at 16.6x the graphed one. Every ms/round, compute/wait and "
+            "throughput figure from this boot carries that scope; none of "
+            "them is a statement about the shipped form."
+        )
     if ns.d_disable_overlap_schedule:
         log(
             "W41 Weg2OverlapRefused: --d-disable-overlap-schedule was passed, "
@@ -7366,9 +8313,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             ns.d_tp_objective, ns.d_rank_perf_tune, cards, budgets_d, ns.model, d_bs
         )
         log(d_ratio.line)
+        log(d_ratio.op_line)
         log(d_tokvec.line)
         env_d = build_env(tree, ns.venv, cvd, store_dir, False, ns.tag, chunk_layers, chunk_count, tms_so, ns.transport, ring_plan, group="D", **_env_knobs(ns))
-        spec_d = GroupSpec("D", PORT_D, transport_argv(argv_d(py, ns.model, budgets_d, arm.s_gb, arm.m_mib, store_cfg, shlex.split(ns.extra_d), d_bs, max_kv_per_request, x_tokens, ns.num_continuous_decode_steps, ns.d_disable_overlap_schedule, d_ratio.flags, d_tokvec.flags, ns.random_seed, ns.barlink_bar1_cap_cycles, ns.collective_census_interval, admin_api_key=admin_api_key), ns.transport), state.logs["D"], env_d)
+        spec_d = GroupSpec("D", PORT_D, transport_argv(argv_d(py, ns.model, budgets_d, arm.s_gb, arm.m_mib, store_cfg, shlex.split(ns.extra_d), d_bs, max_kv_per_request, x_tokens, ns.num_continuous_decode_steps, ns.d_disable_overlap_schedule, d_ratio.flags, d_tokvec.flags, ns.random_seed, ns.barlink_bar1_cap_cycles, ns.collective_census_interval, ns.d_disable_cuda_graph, admin_api_key=admin_api_key), ns.transport), state.logs["D"], env_d)
         launch_group(spec_d, tree, log, dry)
         log("front argv (dry): " + " ".join(shlex.quote(a) for a in front_argv_for(
             py, store_dir, 0, 0, dc_expect_d, cards, ns, chunk_count, 0, p_bs, d_bs, x_tokens,
@@ -7435,9 +8383,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         ns.d_tp_objective, ns.d_rank_perf_tune, cards, budgets_d, ns.model, d_bs
     )
     log(d_ratio.line)
+    log(d_ratio.op_line)
     log(d_tokvec.line)
     env_d = build_env(tree, ns.venv, cvd, store_dir, ns.debug_hold in ("D", "both"), ns.tag, chunk_layers, chunk_count, tms_so, ns.transport, ring_plan, group="D", **_env_knobs(ns))
-    spec_d = GroupSpec("D", PORT_D, transport_argv(argv_d(py, ns.model, budgets_d, arm.s_gb, arm.m_mib, store_cfg, shlex.split(ns.extra_d), d_bs, max_kv_per_request, x_tokens, ns.num_continuous_decode_steps, ns.d_disable_overlap_schedule, d_ratio.flags, d_tokvec.flags, ns.random_seed, ns.barlink_bar1_cap_cycles, ns.collective_census_interval, admin_api_key=admin_api_key), ns.transport), state.logs["D"], env_d)
+    spec_d = GroupSpec("D", PORT_D, transport_argv(argv_d(py, ns.model, budgets_d, arm.s_gb, arm.m_mib, store_cfg, shlex.split(ns.extra_d), d_bs, max_kv_per_request, x_tokens, ns.num_continuous_decode_steps, ns.d_disable_overlap_schedule, d_ratio.flags, d_tokvec.flags, ns.random_seed, ns.barlink_bar1_cap_cycles, ns.collective_census_interval, ns.d_disable_cuda_graph, admin_api_key=admin_api_key), ns.transport), state.logs["D"], env_d)
     state.argv["D"] = " ".join(shlex.quote(a) for a in spec_d.argv)
     launch_group(spec_d, tree, log, dry)
     state.pids["D"] = spec_d.pid
