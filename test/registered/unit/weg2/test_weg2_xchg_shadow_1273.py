@@ -1818,13 +1818,20 @@ def test_the_shadow_arm_reaches_the_hook(monkeypatch, no_active_leg):
 
 # --- the plan seam ---------------------------------------------------------
 
-def test_the_plan_seam_has_no_producer(no_active_leg):
-    """``build_plan`` has ZERO product callers, and that is why W63 says so.
+def test_the_plan_seam_has_exactly_one_producer_and_it_is_the_derivation():
+    """S5c: ``build_plan`` HAS a product caller now, and there is exactly one.
 
-    This is a DENOMINATOR test, not a style one: the shadow's ``no-plan``
-    reason claims an absence, and an absence nobody re-checks is the one that
-    rots.  The day S6 wires a producer this goes red and the W63 docstring
-    gets corrected instead of lying.
+    This was ``test_the_plan_seam_has_no_producer`` and asserted the opposite,
+    which is precisely why it was written as a DENOMINATOR test: the W63
+    docstring claimed an absence and an absence nobody re-checks is the one
+    that rots.  The absence is gone; the test does not.  What it now pins is
+    the thing that would rot next -- a SECOND derivation growing somewhere
+    else, which is the Zweitbuchhaltung UPSTREAM-MINIMAL refuses and the exact
+    shape that made ``shadow_armed`` re-spell its own predicate one round ago.
+
+    ONE caller, in ``weight_exchange_shadow.derive_leg_plan``.  A new call site
+    anywhere else turns this red, and the reader then has to justify the second
+    derivation rather than discover it later as two ranks disagreeing.
     """
     root = os.path.abspath(
         os.path.join(os.path.dirname(__file__), "..", "..", "..", ".."))
@@ -1838,8 +1845,21 @@ def test_the_plan_seam_has_no_producer(no_active_leg):
                 for i, line in enumerate(fh, 1):
                     if "build_plan(" in line:
                         hits.append(f"{os.path.relpath(p, root)}:{i}")
-    assert hits == [], hits
+    assert len(hits) == 1, hits
+    assert hits[0].endswith("weight_exchange_shadow.py:"
+                            + str(_line_of("wx.build_plan(inventory, src, dst"))), hits
+    # The module-level seam is still EMPTY in the product: the derivation is
+    # passed as an object through ``run_leg_hook(plan=...)``, not installed as
+    # a global by a rank.
     assert sh.plan_for_leg("P->D", 0, 0) == ()
+
+
+def _line_of(needle: str) -> int:
+    src = inspect.getsource(sh).splitlines()
+    for i, line in enumerate(src, 1):
+        if needle in line:
+            return i
+    raise AssertionError(needle)
 
 
 def test_a_leg_without_descriptors_says_no_plan_and_never_says_match(no_active_leg):
@@ -1856,7 +1876,10 @@ def test_a_leg_without_descriptors_says_no_plan_and_never_says_match(no_active_l
     assert result.reason == "no-plan"
     assert "verdict=NOT-RUN" in result.line()
     assert any(sh.RANK_LOCAL_SKIP_MARKER in ln for ln in lines)
-    assert any("build_plan has no product caller" in ln for ln in lines)
+    # THE REASON IS THE DERIVATION'S OWN WORD NOW, not one fixed sentence
+    # about an absence that no longer exists (S5c).  With no reason handed
+    # down the line says so rather than naming a cause it does not have.
+    assert any("no derivation was handed to this leg" in ln for ln in lines)
 
 
 def test_the_plan_provider_is_the_seam_and_it_is_consulted(no_active_leg):
@@ -2883,3 +2906,629 @@ def test_the_adapter_still_never_raises_and_that_is_why_signals_are_caught():
     assert any(isinstance(h.type, _ast.Name) and h.type.id == "BaseException"
                for n in _ast.walk(fn) if isinstance(n, _ast.Try)
                for h in n.handlers)
+
+
+# ===========================================================================
+# S5c -- THE DERIVATION.  build_plan gets its product caller.
+#
+# DANGER DIRECTION, and it is not the one the rounds before had.  Those asked
+# "can the observer hurt the flip".  This one asks "can the observer LIE": a
+# plan is the instrument's own definition of what it is measuring, so a plan
+# that is wrong does not fail -- it reports about something else and calls the
+# answer a match.  The four shapes, each with a test and a mutant:
+#
+#   1. a plan naming a class the ring does not carry on this card;
+#   2. a plan whose card is not the one this rank runs on;
+#   3. a plan built from a STALE flip-order map (a wave partition belonging to
+#      another chunk_count, i.e. to another boot's family);
+#   4. a rank building a different plan than its peers -- the one shape that
+#      is invisible from inside a single rank and must therefore be caught in
+#      the rendezvous, by name, and never by a vote.
+# ===========================================================================
+
+
+class _FakeParam:
+    """A tensor-shaped double with the three things the derivation reads.
+
+    Not a torch tensor: ``ParamGeom.of`` goes through ``StorageGeom.of``, which
+    reads ``dim``/``stride``/``element_size``/``shape``, and the derivation
+    additionally reads ``data_ptr``.  A double makes the GEOMETRY a parameter
+    of the test instead of a property of whatever torch does on this box, which
+    is what lets the two-sides-disagree case be built at all.
+    """
+
+    def __init__(self, rows, cols, *, itemsize=2, ptr=0x100000):
+        self.shape = (rows, cols)
+        self._stride = (cols, 1)
+        self._itemsize = int(itemsize)
+        self._ptr = int(ptr)
+
+    def dim(self):
+        return 2
+
+    def stride(self, i=None):
+        return self._stride if i is None else self._stride[i]
+
+    def element_size(self):
+        return self._itemsize
+
+    def data_ptr(self):
+        return self._ptr
+
+    def is_contiguous(self):
+        return True
+
+
+class _FakeModel:
+    """A model that is only its ``named_parameters()``, which is all that is read."""
+
+    def __init__(self, params):
+        self._params = list(params)
+
+    def named_parameters(self, *_a, **_k):
+        return iter(self._params)
+
+
+def _sb4_model(*, layers=32, base_ptr=0x10000000, cols=32):
+    """Two classes per layer plus the base tag's embedding, the sb4 shape."""
+    out = []
+    for layer in range(layers):
+        out.append((f"model.layers.{layer}.self_attn.qkv_proj.weight",
+                    _FakeParam(64, cols, ptr=base_ptr + layer * 0x10000)))
+        out.append((f"model.layers.{layer}.mlp.down_proj.weight",
+                    _FakeParam(32, cols, ptr=base_ptr + layer * 0x10000 + 0x8000)))
+    out.append(("model.embed_tokens.weight",
+                _FakeParam(128, cols, ptr=base_ptr + 0x900000)))
+    return _FakeModel(out)
+
+
+@pytest.fixture()
+def chunked(monkeypatch):
+    """The ring's own chunk geometry, armed the way the launcher arms it."""
+    from sglang.srt.managers import weg2_memory_saver as ms
+
+    monkeypatch.setenv(ms.WEIGHT_CHUNK_ENV_LAYERS, "8")
+    monkeypatch.setenv(ms.WEIGHT_CHUNK_ENV_COUNT, "4")
+    return ms
+
+
+def _derive(hook="source", *, rank=0, group="P", model=None, **kw):
+    return sh.derive_leg_plan(hook=hook, group=group,
+                              peer=("D" if group == "P" else "P"), rank=rank,
+                              model=model if model is not None else _sb4_model(),
+                              **kw)
+
+
+# --- the derivation reads producers, never a hand list ---------------------
+
+def test_the_plan_is_derived_from_the_rings_own_producers(chunked):
+    """Every fact on the line came from a NAMED producer, and each was asked.
+
+    The can-fail control is the spy: a derivation that hardcoded the tag list
+    or the wave partition would still produce a plausible line, and this test
+    would pass on it -- unless the producers are observed being called and
+    their answers are observed reaching the line.  So both are asserted.
+    """
+    asked = []
+
+    def geometry():
+        asked.append("weight_chunk_geometry")
+        return 8, 4
+
+    def family(count):
+        asked.append(f"weights_family_tags({count})")
+        return chunked.weights_family_tags(count)
+
+    def waves(tags, tag_cards, cards):
+        asked.append(f"derive_waves(tags={len(tags)}, map={tag_cards}, "
+                     f"cards={tuple(cards)})")
+        from sglang.srt.weg2 import weight_exchange as wx
+        return wx.derive_waves(tags, tag_cards, cards)
+
+    plan, reason = _derive(chunk_geometry=geometry, family_tags=family,
+                           waves_of=waves)
+    assert reason == "" and plan is not None, reason
+    assert asked[0] == "weight_chunk_geometry"
+    assert "weights_family_tags(4)" in asked
+    # THE TAG->CARD MAP IS THE EMPTY ONE, and it is a stated deviation rather
+    # than an oversight: a rank holds only its OWN stage's layer count, and
+    # ``chunk_tag_cards``' own docstring reads an empty map as UNIFORM.
+    assert any("map={}" in a for a in asked), asked
+    line = plan.line()
+    for token in ("WEG2-XCHG-PLAN card=0", "tags=", "classes=", "slots=",
+                  "bytes=", "source="):
+        assert token in line, (token, line)
+    # The producers are NAMED on the line -- a reader who doubts a field greps
+    # the name and lands on the function that answered.
+    for producer in ("weight_chunk_geometry", "weights_family_tags",
+                     "tag_of_parameter_name", "derive_waves", "build_plan",
+                     "N_CARDS"):
+        assert producer in line, (producer, line)
+    assert plan.slots == len(plan.descs) and plan.nbytes > 0
+
+
+def test_the_plan_carries_the_tags_and_classes_the_ring_gave_this_card(chunked):
+    """MUTANT 1's target: the class list is the RING's, not a literal.
+
+    The classes are the tensor classes of the CHUNK tags -- and the base tag's
+    classes are deliberately absent, because ``chunk_tag_cards`` states that
+    the base tag's bytes are not a layer band and therefore not card-uniform.
+    """
+    plan, reason = _derive()
+    assert reason == ""
+    assert plan.classes == ("down_proj", "qkv_proj"), plan.classes
+    assert "embed_tokens" not in plan.classes, (
+        "the base tag's classes are stage-dependent; a rotation over them "
+        "makes the six ranks enumerate different lists and the classes_hash "
+        "gate can then never open")
+    # The tag set IS the ring's family, and the base tag is planned (its bytes
+    # are still moved) even though its classes are not the rotation's unit.
+    assert set(plan.tags) == {"weights", "weights_0", "weights_1", "weights_2",
+                              "weights_3"}, plan.tags
+    assert set(plan.facts.family_tags) == set(plan.tags)
+
+
+def test_a_class_the_ring_does_not_carry_cannot_enter_the_plan(chunked):
+    """DANGER 1.  A live tensor under a family tag this boot does not carry.
+
+    ``weights_9`` is a weights-family tag by the predicate and is NOT in a
+    4-chunk family.  Planning it would put a tag in a wave that the ring never
+    pauses -- bytes the destination waits for that no leg produces.
+    """
+    model = _sb4_model()
+    model._params.append(("model.layers.99.mlp.down_proj.weight",
+                          _FakeParam(8, 8, ptr=0x999000)))
+
+    def tag_of(name, region_tag=""):
+        return "weights_9" if "layers.99" in name else \
+            ("weights" if "layers." not in name else
+             f"weights_{min(int(name.split('layers.')[1].split('.')[0]) // 8, 3)}")
+
+    plan, reason = _derive(model=model, tag_of=tag_of)
+    assert plan is None
+    assert reason.startswith("tag-not-in-family:"), reason
+    assert "weights_9" in reason
+
+
+def test_a_plan_for_a_card_this_rank_does_not_run_on_is_refused(chunked):
+    """DANGER 2.  ``rank`` IS the card (weight_exchange_region's own theorem).
+
+    A rank outside ``range(N_CARDS)`` would silently become a ``stage`` no
+    group layout has, ``_blocks_of`` would raise W52 deep inside ``build_plan``
+    and the reason would name the plan rather than the card.
+    """
+    plan, reason = _derive(rank=xr.N_CARDS)
+    assert plan is None and reason.startswith("wrong-card:"), reason
+    assert f"rank={xr.N_CARDS}" in reason
+    # The can-fail control: every legal card derives.
+    for card in range(xr.N_CARDS):
+        got, why = _derive(rank=card)
+        assert got is not None and why == "", (card, why)
+        assert got.card == card
+
+
+def test_a_stale_flip_order_map_is_refused_by_name(chunked):
+    """DANGER 3.  A wave partition that belongs to ANOTHER boot's family.
+
+    The flip order map is derived per leg; a rank that kept one across a boot
+    whose ``chunk_count`` changed would plan waves over tags this family does
+    not have, and ``build_plan``'s own W58 would then refuse for a reason
+    ("barren wave tag") that sends the reader to the inventory instead of to
+    the map.  Named here, at the map.
+    """
+    def stale(tags, tag_cards, cards):
+        return [["weights_0", "weights_1", "weights_2", "weights_3",
+                 "weights_4", "weights_5", "weights_6", "weights_7",
+                 "weights"]]
+
+    plan, reason = _derive(waves_of=stale)
+    assert plan is None and reason.startswith("stale-wave-map:"), reason
+    # A DROPPED tag is the same class of fault and is caught by the same check:
+    # a partition is a PERMUTATION of the family or it is not one.
+    def short(tags, tag_cards, cards):
+        return [[t for t in tags if t != "weights_3"]]
+
+    plan, reason = _derive(waves_of=short)
+    assert plan is None and reason.startswith("stale-wave-map:"), reason
+
+
+def test_a_form_with_no_ring_layout_refuses_by_name_and_not_by_no_plan(
+        monkeypatch):
+    """The forms this slice does NOT serve, and they say which they are.
+
+    A boot with no chunked weights family -- a P-only boot, a stock boot -- has
+    no ring layout to derive from.  Before S5c every boot printed the same
+    ``no-plan``; now the reason names the missing FACT, so the census of
+    "legs the shadow could not plan" can be read by cause.
+    """
+    from sglang.srt.managers import weg2_memory_saver as ms
+
+    monkeypatch.delenv(ms.WEIGHT_CHUNK_ENV_LAYERS, raising=False)
+    monkeypatch.delenv(ms.WEIGHT_CHUNK_ENV_COUNT, raising=False)
+    plan, reason = _derive()
+    assert plan is None
+    assert reason.startswith("no-ring-layout:"), reason
+    assert "weight_chunk_geometry()=(0, 0)" in reason
+    # A model that is not there is its own reason, not this one.
+    assert _derive(model=None)[1] == "no-model"
+
+
+def test_the_two_hooks_derive_the_same_bytes_from_opposite_directions(chunked):
+    """The source fills ``src_ptr``, the destination fills ``dst_ptr``.
+
+    ``XchgDesc`` states the contract in its own docstring -- pointers are
+    ``None`` on the side a rank does not own -- and this is what makes the
+    compare read the RING's restored bytes on the destination rather than a
+    copy of the shadow's own buffer.
+    """
+    src, _ = _derive("source", group="P")
+    dst, _ = _derive("destination", group="D")
+    assert [d.key() for d in src.descs] == [d.key() for d in dst.descs], (
+        "the two ends of one card's lane must plan the same GEOMETRY")
+    assert all(d.src_ptr is not None and d.dst_ptr is None for d in src.descs)
+    assert all(d.dst_ptr is not None and d.src_ptr is None for d in dst.descs)
+    assert all(d.src_rank == d.dst_rank == 0 for d in src.descs)
+
+
+# --- rank-uniformity by construction (danger 4) ---------------------------
+
+def test_the_plan_digest_is_over_group_uniform_facts_only(chunked):
+    """DANGER 4.  Two cards, two models, ONE digest -- by construction.
+
+    The two ranks hold DIFFERENT bytes at DIFFERENT addresses (that is what a
+    card is), so a digest over descriptors would differ between them and the
+    gate could never open.  What must agree is the DERIVATION: the chunk
+    geometry, the family, the wave partition, the card vector, the rotation and
+    the producer that answered.
+    """
+    a, _ = _derive(rank=0, model=_sb4_model(base_ptr=0x10000000))
+    b, _ = _derive(rank=1, model=_sb4_model(base_ptr=0x77000000))
+    assert a.facts.digest == b.facts.digest
+    assert a.card_digest == b.card_digest, (
+        "same architecture on both cards -> same storage fingerprint")
+    assert [d.src_ptr for d in a.descs] != [d.src_ptr for d in b.descs]
+
+
+def test_a_rank_reading_a_different_boot_configuration_diverges(chunked):
+    """The can-fail control for the digest: it MOVES when a fact moves.
+
+    Enumerated over every field, because a digest that ignores one of them is
+    a digest that cannot see the divergence that field produces -- and the
+    field it would ignore is the one nobody thought to test.
+    """
+    base, _ = _derive()
+    from sglang.srt.weg2 import weight_exchange as wx
+
+    variants = {
+        "chunk geometry": dict(chunk_geometry=lambda: (16, 4)),
+        "chunk count": dict(chunk_geometry=lambda: (8, 3)),
+        "class rotation": dict(model=_FakeModel([
+            ("model.layers.0.mlp.down_proj.weight", _FakeParam(32, 32))])),
+        "wave partition": dict(waves_of=lambda t, m, c: [
+            list(t)[:2], list(t)[2:]]),
+    }
+    for what, kw in variants.items():
+        other, why = _derive(**kw)
+        assert other is not None, (what, why)
+        assert other.facts.digest != base.facts.digest, what
+
+
+def test_a_divergent_plan_is_a_named_refusal_and_never_a_vote(region):
+    """DANGER 4 at the rendezvous: W64, ``scope=group``, no vote taken.
+
+    The gate is where a divergence between ranks is VISIBLE, and it is the only
+    place: a rank cannot see another rank's derivation any other way.  It must
+    not be folded into the class-subset disagreement -- that sentence sends the
+    reader to the rotation, and the rotation is not where this is.
+    """
+    for row in (1, 2):
+        sh.write_shadow_vote(region, row, leg=0, vote=True, classes_hash=7,
+                             need_mib=0, plan_digest=0xAAAA)
+    lines = []
+    verdict = sh.shadow_gate(region, 0, leg=0, vote=True, classes_hash=7,
+                             need_mib=0, log=lines.append, budget_s=0.5,
+                             expect_rows=(0, 1, 2), plan_digest=0xBBBB)
+    assert verdict.run is False
+    assert verdict.reason == "plan-diverged-group"
+    assert any(sh.PLAN_DIVERGED_MARKER in ln for ln in lines), lines
+    assert any("scope=group" in ln and "field=plan_digest" in ln
+               for ln in lines), lines
+    # EVERY row is named, not just the odd one out: with two values and three
+    # rows there is no odd one out, and picking one decides which side is wrong.
+    assert all(f"row={r}" in "".join(lines) for r in (0, 1, 2))
+
+
+def test_agreeing_plans_do_not_trip_the_new_check(region):
+    """The can-fail control: the check is inert when the ranks agree.
+
+    Including the shipping case where NOBODY derived a plan -- a table of
+    zeros is uniform, so S3's and S4's callers are byte-unchanged.
+    """
+    for digest in (0, 0xAAAA):
+        for row in (1, 2):
+            sh.write_shadow_vote(region, row, leg=3, vote=True, classes_hash=7,
+                                 need_mib=0, plan_digest=digest)
+        verdict = sh.shadow_gate(region, 0, leg=3, vote=True, classes_hash=7,
+                                 need_mib=0, log=lambda _s: None, budget_s=0.5,
+                                 expect_rows=(0, 1, 2), plan_digest=digest)
+        assert verdict.run is True, (digest, verdict.reason)
+
+
+def test_the_co_located_pair_is_checked_on_its_card_geometry(region):
+    """W64 ``scope=oncard-peer``: the two ends of ONE card's lane.
+
+    A DIFFERENT question from the group one, and the honest answer on this
+    rig's P=PP / D=TP form: the two groups do not hold the same bytes on a
+    card, and that is a statement about two layouts, not a defect in the
+    exchange.  Refused here, before a byte moves -- otherwise it surfaces as a
+    W54 byte-count disagreement inside the on-card consumer, after the source
+    has filled a bounce and while it waits out its drain.
+    """
+    for row in range(1, xr.N_RANKS):
+        sh.write_shadow_vote(region, row, leg=0, vote=True, classes_hash=7,
+                             need_mib=0, plan_digest=0xAAAA,
+                             card_digest=0x1111 if row != 3 else 0x2222)
+    lines = []
+    verdict = sh.shadow_gate(region, 0, leg=0, vote=True, classes_hash=7,
+                             need_mib=0, log=lines.append, budget_s=0.5,
+                             plan_digest=0xAAAA, card_digest=0x1111,
+                             peer_row=3)
+    assert verdict.run is False
+    assert verdict.reason == "plan-diverged-oncard-peer"
+    assert any("scope=oncard-peer" in ln and "field=card_digest" in ln
+               for ln in lines), lines
+    # The group digest AGREES here -- so this cannot be the same code path as
+    # the test above, which is the whole reason for two scopes under one code.
+    assert not any("scope=group" in ln for ln in lines)
+
+
+def test_the_peer_card_check_is_only_asked_where_the_row_is_read(region):
+    """It may never be asked on the SOURCE hook.
+
+    The source expects its own group's three rows (S5b must_fix 1) and its
+    co-located peer's row is one of the three it does NOT wait for.  Comparing
+    a row it never reads would reintroduce exactly the circular wait that fix
+    removed.
+    """
+    for row in (1, 2):
+        sh.write_shadow_vote(region, row, leg=0, vote=True, classes_hash=7,
+                             need_mib=0, plan_digest=0xAAAA, card_digest=0x1111)
+    verdict = sh.shadow_gate(region, 0, leg=0, vote=True, classes_hash=7,
+                             need_mib=0, log=lambda _s: None, budget_s=0.5,
+                             expect_rows=(0, 1, 2), plan_digest=0xAAAA,
+                             card_digest=0x9999, peer_row=3)
+    assert verdict.run is True, verdict.reason
+
+
+def test_the_widened_row_carries_both_digests_and_still_fits(region):
+    """The row grew from 64 to 128 bytes; the two new words survive a round trip."""
+    assert sh.SHADOW_ROW_BYTES == 128
+    assert sh.SHADOW_SEAL_OFF + 8 <= sh.SHADOW_ROW_BYTES
+    assert sh.SHADOW_AREA_END <= tp.DIR_CAPACITY
+    sh.write_shadow_vote(region, 4, leg=9, vote=True, classes_hash=0x1234,
+                         need_mib=11, plan_digest=0xDEADBEEF,
+                         card_digest=0xFEEDFACE)
+    got = sh.read_shadow_vote(region, 4)
+    assert got["sealed"] == 1
+    assert got["plan_digest"] == 0xDEADBEEF
+    assert got["card_digest"] == 0xFEEDFACE
+    assert got["classes_hash"] == 0x1234 and got["need_mib"] == 11
+
+
+# --- the hooks reach the gate WITH a plan ---------------------------------
+
+def test_both_hooks_reach_the_gate_with_a_plan(region, boot, tmp_path,
+                                               no_active_leg, chunked):
+    """ITEM 3: a plan present -> gate -> pricing -> transport, not ``no-plan``.
+
+    The gate is deliberately made to EXPIRE here (the peers never publish), so
+    this asserts the leg got PAST the plan step and INTO the rendezvous --
+    which is what "the hooks proceed to the gate" means and is falsifiable
+    without a second process.
+    """
+    plan, why = _derive("source", rank=0, group="P")
+    assert plan is not None, why
+    xr.create_semaphores(boot)
+    sems = tp.SemSet(boot)
+    ops = FakeDeviceOps(str(tmp_path / "dd"), rank=0)
+    try:
+        lines = []
+        result = sh.run_leg_hook(
+            _inputs(sh.HOOK_SOURCE, row=0, peer_row=3), log=lines.append,
+            plan=plan, region=region, sems=sems, ops=ops, armed=True,
+            gate_budget_s=0.05, hook_budget_s=0.5, slot_bytes=SLOT,
+            oncard_slot_bytes=SLOT)
+    finally:
+        ops.close()
+        sems.close()
+        xr.unlink_semaphores(boot)
+    assert result.reason != "no-plan", result.line()
+    assert any(ln.startswith(sh.PLAN_LINE_PREFIX + " card=") for ln in lines)
+    assert any(ln.startswith(sh.SHADOW_GATE_LINE_PREFIX) for ln in lines), lines
+    assert any(ln.startswith(sh.SHADOW_BUDGET_LINE_PREFIX) for ln in lines)
+    # ONE provenance line per leg, not one per descriptor and not one per class.
+    assert sum(1 for ln in lines
+               if ln.startswith(sh.PLAN_LINE_PREFIX + " card=")) == 1
+    assert f"plan_digest={plan.facts.digest:#x}" in result.line()
+
+
+def test_a_leg_with_no_plan_still_refuses_and_names_the_derivations_reason(
+        no_active_leg):
+    """The no-plan path SURVIVES, and it now carries a cause.
+
+    The refusal is what serves every form without a ring layout, and it must
+    keep returning BEFORE the region is opened -- otherwise a P-only boot pays
+    an attach and reports ``no-region`` for a leg that had no plan.
+    """
+    lines = []
+    result = sh.run_leg_hook(
+        _inputs(sh.HOOK_DESTINATION,
+                plan_reason="no-ring-layout:weight_chunk_geometry()=(0, 0)"),
+        log=lines.append, descs=(), armed=True)
+    assert result.reason == "no-plan"
+    assert any("reason=no-plan" in ln and "no-ring-layout" in ln
+               for ln in lines), lines
+    assert not any(ln.startswith(sh.SHADOW_GATE_LINE_PREFIX) for ln in lines)
+
+
+# --- item 4: the compare names class, stripes and bytes -------------------
+
+def test_the_compare_names_the_class_the_stripes_and_the_bytes(
+        region, tmp_path, boot, no_active_leg):
+    """ITEM 4, for MATCH as well as for MISMATCH.
+
+    W59 names a class only when something went WRONG, so a boot whose shadow
+    agreed carried no per-class evidence: ``match=7`` with no way to say which
+    seven, over how many bytes.  A compare that looked at nothing satisfies
+    ``mismatch=0`` just as well as one that looked at everything, and the S5b
+    ticket could grade only the latter.
+    """
+    xr.create_semaphores(boot)
+    sems_s, sems_d = tp.SemSet(boot), tp.SemSet(boot)
+    src_ops = FakeDeviceOps(str(tmp_path / "d"), rank=0)
+    dst_ops = FakeDeviceOps(str(tmp_path / "d"), rank=0)
+    try:
+        dst_ops.raw_malloc(0, 2 << 20)
+        payload = pattern(61, 1600)
+        src, ring_dst = dev_ptr(0, 0x10000), dev_ptr(0, 0x60000)
+        write(src_ops, src, payload)
+        write(dst_ops, ring_dst, payload)
+        descs = [flat_desc(0, 0, len(payload), src_ptr=src, dst_ptr=ring_dst,
+                           name="model.layers.0.self_attn.qkv_proj.weight")]
+        _vote_rows(region, [1, 2, 4, 5], leg=0, vote=True,
+                   classes_hash=sh.classes_hash(["qkv_proj"]), need_mib=0)
+        lines = []
+        thread = threading.Thread(target=lambda: sh.run_leg_hook(
+            _inputs(sh.HOOK_SOURCE, row=0, peer_row=3), log=lines.append,
+            descs=descs, region=region, sems=sems_s, ops=src_ops, armed=True,
+            slot_bytes=SLOT, stripe_bytes=1 << 20, budget_s=10.0,
+            oncard_slot_bytes=SLOT))
+        thread.start()
+        try:
+            result = sh.run_leg_hook(
+                _inputs(sh.HOOK_DESTINATION, row=3, peer_row=0),
+                log=lines.append, descs=descs, region=region, sems=sems_d,
+                ops=dst_ops, armed=True, sum_bytes=byte_sum(dst_ops),
+                slot_bytes=SLOT, stripe_bytes=1 << 20, budget_s=10.0,
+                oncard_slot_bytes=SLOT)
+        finally:
+            thread.join(60)
+        assert result.ran, result.counters.errors
+        compare = [ln for ln in lines if ln.startswith(sh.COMPARE_LINE_PREFIX)]
+        assert len(compare) == 1, lines
+        for token in ("class=qkv_proj", "stripes=1", f"bytes={len(payload)}",
+                      "match=1", "mismatch=0", "verdict=MATCH"):
+            assert token in compare[0], (token, compare[0])
+        # And the bytes on the line are the PAYLOAD, not the descriptor span or
+        # the plan's claim -- the denominator of ``stripes=``.
+        assert f"bytes={len(payload)}" in compare[0]
+    finally:
+        src_ops.close()
+        dst_ops.close()
+        sems_s.close()
+        sems_d.close()
+        xr.unlink_semaphores(boot)
+
+
+# --- item 5: the block across the flip span is bounded AND priced ---------
+
+def test_the_block_on_slot_drain_is_measured_and_printed(region, tmp_path,
+                                                         boot, no_active_leg):
+    """ITEM 5 / S5b UNPROVEN 3: the transport is unchanged, the wait is PRICED.
+
+    The two ends of the on-card lane sit at opposite ends of one flip, so the
+    producer's terminal drain can span it.  This round does not redesign the
+    transport; it makes the block measurable, so a boot can decide whether it
+    needs redesigning instead of the next round guessing.
+
+    The peer never arrives, so the source spends its whole (tiny) budget in the
+    drain and ``blocked_ms`` must be the number that says so.
+    """
+    xr.create_semaphores(boot)
+    sems = tp.SemSet(boot)
+    ops = FakeDeviceOps(str(tmp_path / "d"), rank=0)
+    try:
+        payload = pattern(29, 1200)
+        src = dev_ptr(0, 0x10000)
+        write(ops, src, payload)
+        descs = [flat_desc(0, 0, len(payload), src_ptr=src, dst_ptr=0,
+                           name="model.layers.0.mlp.down_proj.weight")]
+        _vote_rows(region, [1, 2], leg=0, vote=True,
+                   classes_hash=sh.classes_hash(["down_proj"]), need_mib=0)
+        lines = []
+        result = sh.run_leg_hook(
+            _inputs(sh.HOOK_SOURCE, row=0, peer_row=3), log=lines.append,
+            descs=descs, region=region, sems=sems, ops=ops, armed=True,
+            gate_rows=(0, 1, 2), slot_bytes=SLOT, stripe_bytes=1 << 20,
+            budget_s=0.4, hook_budget_s=3.0, oncard_slot_bytes=SLOT)
+    finally:
+        ops.close()
+        sems.close()
+        xr.unlink_semaphores(boot)
+    line = result.line()
+    assert "blocked_ms=" in line, line
+    assert result.blocked_ms > 0.0, line
+    # BOUNDED BY THE BUDGET THAT ALREADY EXISTS, never by a new constant: the
+    # block cannot outlive the transport budget the hook carved from its own
+    # deadline.
+    assert result.blocked_ms <= result.hook_budget_ms, line
+
+
+def test_the_issue_remainder_does_not_absorb_the_terminal_drain():
+    """The DENOMINATOR of ``issue_ms``, named.
+
+    ``issue_ms`` is a REMAINDER (``elapsed - cross - oncard``) and the
+    producer's terminal drain sits OUTSIDE ``oncard.elapsed_s`` by design -- so
+    without subtracting it, a wait that can span a whole flip is reported as
+    issue overhead and graded against spec 6/S5's ``issue_ms <= 5 % of
+    xchg_ms``.  Two fields, because only one of the two blocks is outside.
+    """
+    stats = tp.OnCardStats(0, "u0", tp.ONCARD_MODE_IPC)
+    assert hasattr(stats, "drain_wait_s")
+    assert hasattr(stats, "drain_wait_outside_s")
+    src = inspect.getsource(sh.shadow_transport)
+    assert "drain_wait_outside_s" in src
+    i_outside = src.index("outside_ms")
+    i_issue = src.index("result.issue_ms =")
+    assert i_outside < i_issue, "the remainder must subtract it, not follow it"
+
+
+# --- the adapter is the product caller, pinned by source ------------------
+
+def test_the_adapter_derives_and_hands_the_plan_down(no_active_leg):
+    """The WIRING, pinned by SOURCE the way every other adapter here is.
+
+    An adapter that derived a plan and then dropped it would leave every boot
+    on ``no-plan`` while this file's behaviour tests all passed -- the seam is
+    exactly where a wiring defect is invisible from both sides.
+    """
+    src = _wu_source("_weg2_shadow_plan")
+    assert "sh.derive_leg_plan(" in src
+    assert "weights_region_tag_for" in src, (
+        "the region tag must be the one this runner's weights were opened "
+        "with, or a drafter plans bytes nobody exchanges")
+    hook = _wu_source("_weg2_shadow_hook")
+    assert "self._weg2_shadow_plan(" in hook
+    assert "plan=plan" in hook, "the derivation must REACH the hook"
+    assert "plan_reason=str(plan_reason)" in hook
+    # And it still cannot raise into the leg.
+    import ast as _ast
+
+    tree = _wu_ast("_weg2_shadow_plan")
+    assert not any(isinstance(n, _ast.Raise) for n in _ast.walk(tree))
+    assert any(isinstance(n, _ast.ExceptHandler) for n in _ast.walk(tree))
+
+
+def test_w64_is_the_next_free_code_and_names_one_exception():
+    """W64, and it is not folded into the class-subset disagreement.
+
+    W63 was the highest assigned code on this branch; W64 is the first free
+    one above it, per ``test_weg2_wcode_uniqueness_1263``'s census rule.
+    """
+    assert sh.PLAN_DIVERGED_MARKER == "W64 Weg2XchgShadowPlanDiverged"
+    assert sh.Weg2XchgShadowPlanDiverged.__name__ in sh.PLAN_DIVERGED_MARKER
+    message = sh.plan_divergence_message(
+        scope="group", leg=1, epoch="e.1", rows={0: 1, 1: 2},
+        field="plan_digest")
+    assert message.startswith(sh.PLAN_DIVERGED_MARKER)
+    assert "the flip proceeds on the ring" in message

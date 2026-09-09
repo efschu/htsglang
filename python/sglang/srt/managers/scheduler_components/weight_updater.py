@@ -1436,6 +1436,48 @@ class SchedulerWeightUpdaterManager:
             return None
         return tuple(xr.rank_row(group, r) for r in range(xr.N_CARDS))
 
+    def _weg2_shadow_plan(self, hook: str, group: str, rank: int):
+        """THE PRODUCT CALL SITE OF ``weight_exchange.build_plan``.
+
+        SECTION 1ai-S5b-fix's UNPROVEN 2 in its own words -- *"``build_plan``
+        has no product caller ... unchanged, and still the largest gap"* -- is
+        closed here.  The derivation itself lives in
+        ``weight_exchange_shadow.derive_leg_plan``, deliberately, and this
+        method is four lines of argument gathering: the mixin cannot be
+        constructed without a model runner, a process group and a device, so
+        anything written INTO it is code no hermetic test can drive (the same
+        reason the two hooks are free functions over plain arguments).
+
+        THE MODEL IS THIS RANK'S OWN LIVE ONE and the region tag is the one its
+        weights were actually opened with (``weights_region_tag_for``), so a
+        runner whose weights are OUT of the exchanged family (the drafter under
+        an armed exchange) derives no family tags and refuses by name rather
+        than planning bytes nobody exchanges.
+
+        ``(None, reason)`` on every failure, including an exception: a
+        derivation that raised into a flip leg would be the observer taking the
+        authority this slice exists not to have.
+        """
+        try:
+            from sglang.srt.weg2 import weight_exchange as wx
+            from sglang.srt.weg2 import weight_exchange_shadow as sh
+
+            runner = getattr(self.tp_worker, "model_runner", None)
+            model = getattr(runner, "model", None)
+            region_tag = ""
+            if runner is not None:
+                try:
+                    region_tag = wx.weights_region_tag_for(
+                        wx.RunnerShape.of(runner))
+                except BaseException:  # noqa: BLE001 -- an unclassified shape
+                    region_tag = ""
+            return sh.derive_leg_plan(
+                hook=str(hook), group=str(group),
+                peer=("D" if group == "P" else "P"), rank=int(rank),
+                model=model, region_tag=region_tag)
+        except BaseException as exc:  # noqa: BLE001 -- an observer never raises
+            return None, f"derivation-failed:{type(exc).__name__}"
+
     def _weg2_shadow_hook(self, hook: str, *, recv_req, reserve_bytes: int = 0,
                           ring_ms=None) -> None:
         """Run one leg's shadow, or return having touched nothing.
@@ -1477,6 +1519,8 @@ class SchedulerWeightUpdaterManager:
                 return
             peer = "D" if group == "P" else "P"
             free_bytes = self._weg2_free_bytes()
+            plan, plan_reason = self._weg2_shadow_plan(str(hook), group,
+                                                       int(rank))
             inputs = sh.ShadowLegInputs(
                 leg=_weg2_flip_index_of(getattr(recv_req, "epoch", None)),
                 epoch=str(getattr(recv_req, "epoch", "") or ""),
@@ -1491,9 +1535,10 @@ class SchedulerWeightUpdaterManager:
                 resume_reserve_bytes=int(reserve_bytes),
                 ring_ms=ring_ms,
                 gate_rows=self._weg2_shadow_gate_rows(str(hook), group),
+                plan_reason=str(plan_reason),
             )
             try:
-                sh.run_leg_hook(inputs, log=logger.info)
+                sh.run_leg_hook(inputs, log=logger.info, plan=plan)
             finally:
                 # THE LEG THREAD'S DEVICE IS PUT BACK, ALWAYS.  The shadow's
                 # raw ``cudaMalloc`` and its stream both go through
