@@ -947,26 +947,57 @@ def xchg_bounce_bytes_per_card(slots: Optional[int] = None,
     record").
 
     ``kv-1m-kein-lossy-kein-hostram`` is about KV and does not reach here: this
-    is the exchange's own carrier for the span of one flip, not hot KV parked
-    in host RAM.  What DOES reach here is ``host-schwelle-nie-uebertreten`` --
-    which is exactly why the bytes become a TERM (so the reap bound sees them
-    and the store shrinks by them) instead of a note.
+    is the exchange's own carrier, not hot KV parked in host RAM.  What DOES
+    reach here is ``host-schwelle-nie-uebertreten`` -- which is exactly why the
+    bytes become a TERM (so the reap bound sees them and the store shrinks by
+    them) instead of a note.
 
-    THE GEOMETRY IS READ FROM ITS OWNER, never re-spelled: a second copy of
-    ``ONCARD_SLOTS_MAX x ONCARD_SLOT_BYTES`` here is the Zweitbuchhaltung that
-    lets the charge and the deposit drift apart by one edit.  The worst case is
-    charged, not the case a particular flip happens to derive, because the arm
-    is chosen once at launch and the derivation runs per leg -- a charge that
-    tracked the derivation would fund the smallest flip and refuse none.
+    IT IS NOT "FOR THE SPAN OF A FLIP", AND THE EARLIER WORDING WAS WRONG (S6
+    refuter, finding 9).  ``HostBounce.close`` deliberately does not unlink, so
+    a deposited file lives until the boot's ``/dev/shm`` residue sweep -- which
+    is what makes the destination's later leg able to read it, and what makes
+    charging the bytes at BOTH the launch and the run moment correct rather
+    than conservative.
+
+    THE GEOMETRY IS READ FROM ITS OWNER, and now actually is (S6 refuter,
+    must_fix 3).  This read ``ONCARD_SLOTS_MAX x ONCARD_SLOT_BYTES`` -- the
+    slot count's CEILING beside the slot size's FLOOR -- while claiming to read
+    the owner's bound, and understated the shape's maximum by 4x: 8 x 32 MiB =
+    256 MiB against the 8 x 128 MiB the planner may actually derive
+    (``plan_oncard_slot_bytes`` clamps to ``ONCARD_SLOT_BYTES_MAX``).  The
+    consequence was not an overspend but a systematic FALSE REFUSAL, because
+    ``deposit_refusal_reason`` grades the deposit against this same number: a
+    per-card diagonal above ~256 MiB refused ``ledger-cannot-fund-deposit`` --
+    exactly the band the geometry exists for.  The owner's own name for the
+    bound is :data:`tp.ONCARD_DEPOSIT_BYTES_MAX`, and this reads THAT.
+
+    The worst case is charged, not the case a particular flip happens to
+    derive, because the arm is chosen once at launch and the derivation runs
+    per leg -- a charge that tracked the derivation would fund the smallest
+    flip and refuse none.
     """
     from sglang.srt.weg2 import weight_exchange_transport as tp
 
+    if slots is None and slot_bytes is None:
+        return int(tp.ONCARD_DEPOSIT_BYTES_MAX)
     return (int(tp.ONCARD_SLOTS_MAX if slots is None else slots)
-            * int(tp.ONCARD_SLOT_BYTES if slot_bytes is None else slot_bytes))
+            * int(tp.ONCARD_SLOT_BYTES_MAX if slot_bytes is None else slot_bytes))
 
 
-def xchg_bounce_bytes(cards: int = 3) -> int:
-    """Every card's deposit -- the term :func:`charge_terms` carries."""
+def xchg_bounce_bytes(cards: Optional[int] = None) -> int:
+    """Every card's deposit -- the term :func:`charge_terms` carries.
+
+    ``cards`` DEFAULTED TO A TYPED ``3`` (S6 refuter, finding 6): a hand number
+    at the one call site, derived from nothing, in a module whose whole subject
+    is numbers with provenance.  It now comes from the region's own rank
+    layout -- one bounce file per CARD, and a card is a co-located pair of the
+    six rows -- which is the same arithmetic
+    :data:`tp.ONCARD_HOST_DEGRADE_MIB` announces the degrade with.
+    """
+    from sglang.srt.weg2 import weight_exchange_region as xr_
+
+    if cards is None:
+        cards = int(xr_.N_RANKS) // 2
     return max(0, int(cards)) * xchg_bounce_bytes_per_card()
 
 

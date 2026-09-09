@@ -98,6 +98,16 @@ import time
 from dataclasses import dataclass, field
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
+# THE DECLARED OWNER OF "may this PINNED host buffer be allocated?" (#550/
+# #729).  Imported at module level and not lazily: the answer is needed inside
+# a constructor on the flip's critical path, and a lazy import there would put
+# a first-import of the memtier profile inside the leg's measured wall.  The
+# module itself imports only the standard library at import time.
+from sglang.srt.mem_cache.pinned_host_budget import (
+    check_and_register_pinned_post,
+    revert_pinned_posts_on_failure,
+    unregister_pinned_post,
+)
 from sglang.srt.weg2 import weight_exchange_region as xr
 from sglang.srt.weg2.weight_exchange_region import (
     Weg2XchgGateTimeout,
@@ -201,12 +211,53 @@ ONCARD_SPIN_ITERS = 512
 #: named regime, never a target.
 ONCARD_PER_BATCH_MS = 0.182
 
+#: THE BYTES TERM :data:`ONCARD_PER_BATCH_MS` DOES NOT CONTAIN, in GB/s.
+#: MEASURED-BY-REVIEW DEFECT (S6 refuter, must_fix 1).  The coefficient above
+#: was measured on the ``ipc`` arm, where the copy is device-to-device on ONE
+#: card -- S5-pre timed that copy at 0.044 ms for a 32 MiB slot, i.e. ~727
+#: GB/s, so it vanishes inside the handshake and the residual 0.182 ms IS the
+#: handshake.  Pricing the ``host`` arm with the same coefficient asserts 512
+#: MiB in 2.91 ms = 171.8 GiB/s over a link this rig does not have (no P2P,
+#: all PHB, GPU0 at x4; memory ``rig-interconnect-p2p``), and S6 is what made
+#: that mispricing LOAD-BEARING: a store-and-forward deposit is ``host``-only
+#: by construction (:func:`deposit_refusal_reason`), so every batch it prices
+#: is a real, unoverlapped PCIe copy that no deadline cuts -- ``_wait_budget``
+#: clamps WAITS, and a memcpy loop is work.
+#:
+#: THE NUMBER IS READ OFF THE SPEC'S OWN MEASURED TABLE, never typed: spec
+#: section 0.3 of ``/spinning/gpu-arb/weg2/WEG2_REUSE_SPEC_0908.md`` (medians
+#: over 48 legs per card of boot weg2sb4) gives a copy-only rate per card --
+#: 5090 11.39, 3080-x8 7.00, 3080-x4 **3.84** GB/s.  The SLOWEST of the three
+#: is the one used, and deliberately: this coefficient feeds a REFUSAL, and a
+#: bound that holds on the x4 card holds on all three.  Pricing each card at
+#: its own rate would need a uuid->rate table with no measured key on this rig
+#: and would make the refusal card-dependent -- i.e. rank-divergent.
+#:
+#: NOT the spec 3.7 "+0.49 s on the x4 card" figure: that prices a degrade
+#: routed through the STAGING REGION, which is a route this code does not take
+#: (:func:`oncard_unavailable_message` names the same discrepancy).
+ONCARD_HOST_COPY_GBPS = 3.84
+
 #: Spec section 6/S4's acceptance for the whole diagonal.
 ONCARD_HOP_BUDGET_MS = 20.0
 
 #: Modes for the on-card lane; ``host`` is the named degrade of section 3.7.
 ONCARD_MODE_IPC = "ipc"
 ONCARD_MODE_HOST = "host"
+
+
+def oncard_copy_gbps(mode: str) -> float:
+    """The rate THIS MODE's copy is priced at, GB/s, or 0.0 for "not priced".
+
+    ONE PRODUCER of the mode-to-rate decision, because it is read in two places
+    (the hook's lane plan and :func:`shadow_transport`'s printed hop) and two
+    copies of it is how a lane came to be priced by one arm's coefficient while
+    running on another arm's link.  ``ipc`` returns 0.0 -- not because the copy
+    is free, but because it is DEVICE-TO-DEVICE and already inside
+    :data:`ONCARD_PER_BATCH_MS`; adding a term there would double-count it.
+    """
+    return ONCARD_HOST_COPY_GBPS if str(mode) == ONCARD_MODE_HOST else 0.0
+
 
 ENV_ONCARD_MODE = "SGLANG_WEG2_XCHG_ONCARD"
 
@@ -416,13 +467,26 @@ def short_piece_message(
     )
 
 
-#: What the ``host`` degrade costs in HOST bytes, derived and not typed: one
-#: bounce file per card of the three, ``ONCARD_SLOTS`` slots each.  Spec 0.2's
-#: ledger term (0.38 GiB staging) does not carry it and spec 3.7 prices the
-#: degrade in WALL only, so the number belongs on the line that announces the
-#: degrade rather than in a comment.
+#: ONE CARD'S LARGEST POSSIBLE BOUNCE, in bytes -- the SHAPE's maximum and not
+#: one plan's choice.  THE SINGLE PRODUCER of that bound (S6 refuter, must_fix
+#: 3): ``host_ledger.xchg_bounce_bytes_per_card`` charged
+#: ``ONCARD_SLOTS_MAX x ONCARD_SLOT_BYTES`` -- the slot FLOOR beside the slot
+#: COUNT's ceiling, i.e. a quarter of what :func:`plan_oncard_slot_bytes` may
+#: actually derive, while its own docstring claimed to read the geometry from
+#: its owner.  It now reads THIS name, and so does the W56 degrade line, so the
+#: charge and the allocation cannot drift apart by one edit.
+ONCARD_DEPOSIT_BYTES_MAX = ONCARD_SLOTS_MAX * ONCARD_SLOT_BYTES_MAX
+
+#: What the ``host`` degrade costs in HOST bytes at its ceiling, derived and
+#: not typed: one bounce file per card of the three,
+#: :data:`ONCARD_DEPOSIT_BYTES_MAX` each.  Spec 0.2's ledger term (0.38 GiB
+#: staging) does not carry it and spec 3.7 prices the degrade in WALL only, so
+#: the number belongs on the line that announces the degrade rather than in a
+#: comment.  IT IS THE CEILING and not ``ONCARD_SLOTS x ONCARD_SLOT_BYTES``:
+#: the line is printed at ARM time, before any plan has derived a slot size, so
+#: the only honest number there is the largest the shape can reach.
 ONCARD_HOST_DEGRADE_MIB = (
-    (xr.N_RANKS // 2) * ONCARD_SLOTS * ONCARD_SLOT_BYTES // xr.MIB
+    (xr.N_RANKS // 2) * ONCARD_DEPOSIT_BYTES_MAX // xr.MIB
 )
 
 
@@ -1834,15 +1898,42 @@ class OnCardSlotPlan:
     #: ledger answer reached this planner.  Not subtracted from anything here:
     #: it is the bound :func:`deposit_refusal_reason` grades against.
     host_budget_bytes: int = 0
+    #: The MEASURED copy rate the bytes term is priced at (GB/s), or 0.0 for
+    #: "this arm's copy is already inside ``per_batch_ms``".  Defaulting to 0.0
+    #: is what leaves every pre-S6 caller's number identical to the digit.
+    copy_gbps: float = 0.0
+    #: DOES THIS PLAN DESCRIBE A DEPOSIT?  ``deposit_bytes`` is 0 when it does
+    #: not (S6 refuter, finding 8): on the drainable lane the slots are a
+    #: pipelined double buffer allocated and freed INSIDE the leg, and printing
+    #: them under a field whose name means "pinned host bytes held across the
+    #: flip" makes a sum over acceptance lines count host bytes never held.
+    store_forward: bool = False
 
     @property
     def deposit_bytes(self) -> int:
-        """The pinned host bytes one card's deposit holds for the flip's span."""
-        return int(self.slots) * int(self.slot_bytes)
+        """The pinned host bytes one card's DEPOSIT holds beyond its own leg.
+
+        Zero unless this plan is a deposit -- see :attr:`store_forward`.
+        """
+        return int(self.slots) * int(self.slot_bytes) if self.store_forward else 0
+
+    @property
+    def copy_ms(self) -> float:
+        """The BYTES term: this diagonal at the measured rate, or 0.0.
+
+        S6 refuter must_fix 1.  It is the whole diagonal's bytes and not one
+        batch's, because the deposit copies every byte exactly once with
+        nothing to overlap: the consumer runs in a LATER leg, in another
+        process, so there is no pipeline for a per-batch model to amortise
+        against.
+        """
+        if float(self.copy_gbps) <= 0.0:
+            return 0.0
+        return (int(self.bytes_total) / (float(self.copy_gbps) * 1e9)) * 1e3
 
     @property
     def hop_ms(self) -> float:
-        return self.batches * self.per_batch_ms
+        return self.batches * self.per_batch_ms + self.copy_ms
 
     @property
     def fits(self) -> bool:
@@ -1855,11 +1946,18 @@ class OnCardSlotPlan:
 
     def model(self) -> str:
         return (
-            f"hop_ms = batches x per_batch_ms = {self.batches} x "
-            f"{self.per_batch_ms:g} = {self.hop_ms:.1f} ms "
+            f"hop_ms = batches x per_batch_ms + bytes / copy_gbps = "
+            f"{self.batches} x {self.per_batch_ms:g} + "
+            f"{self.bytes_total / xr.MIB:.0f} MiB / "
+            + (f"{self.copy_gbps:g} GB/s" if self.copy_gbps > 0 else "(not priced)")
+            + f" = {self.batches * self.per_batch_ms:.1f} + {self.copy_ms:.1f} "
+            f"= {self.hop_ms:.1f} ms "
             f"(per_batch_ms MEASURED consumer-side on the 5090, S5-pre poll-rebind "
-            f"arm at ONCARD_POLL_S={ONCARD_POLL_S * 1e6:g}us; batch count is the "
-            f"only term that moved the cost across an 8x slot sweep)"
+            f"arm at ONCARD_POLL_S={ONCARD_POLL_S * 1e6:g}us, and it is the "
+            f"HANDSHAKE only -- the copy it was measured over is device-to-device; "
+            f"copy_gbps is spec 0.3's measured copy-only rate of the SLOWEST card "
+            f"and is 0 on the ipc arm, where the copy is already inside "
+            f"per_batch_ms)"
         )
 
     def tokens(self) -> str:
@@ -1870,6 +1968,8 @@ class OnCardSlotPlan:
             f"oncard_deposit_mib={self.deposit_bytes / xr.MIB:.0f} "
             f"oncard_host_budget_mib={self.host_budget_bytes / xr.MIB:.0f} "
             f"oncard_batches={self.batches} "
+            f"oncard_copy_gbps={self.copy_gbps:g} "
+            f"oncard_copy_ms={self.copy_ms:.1f} "
             f"oncard_hop_ms_priced={self.hop_ms:.1f} "
             f"oncard_hop_ms_budget={self.budget_ms:g} "
             f"oncard_priced_fits={'yes' if self.fits else 'no'}"
@@ -1888,6 +1988,7 @@ def plan_oncard_slot_bytes(
     store_forward: bool = False,
     slots_max: int = ONCARD_SLOTS_MAX,
     host_budget_bytes: int = 0,
+    copy_gbps: float = 0.0,
 ) -> OnCardSlotPlan:
     """Choose the diagonal's slot size from the plan's own byte count.
 
@@ -1918,6 +2019,19 @@ def plan_oncard_slot_bytes(
     :func:`deposit_refusal_reason` can name it.  Clamping here would produce
     exactly the ``slots < batches`` overwrite
     :func:`require_store_forward_slots` exists to refuse.
+
+    ``copy_gbps`` IS THE BYTES TERM, AND IT COMES OUT OF THE BUDGET FIRST (S6
+    refuter, must_fix 1).  On the ``host`` arm the hop is dominated by a real
+    PCIe copy that :data:`ONCARD_PER_BATCH_MS` does not contain
+    (:data:`ONCARD_HOST_COPY_GBPS` says why), so the batch allowance is what is
+    LEFT of the budget after the copy is paid:
+    ``allowed = (budget_ms - copy_ms) // per_batch_ms``.  When the copy alone
+    exceeds the budget, ``allowed`` falls below 1, the existing branch takes the
+    largest slot -- the fewest batches this geometry can cut -- and the plan
+    returns ``fits=False``.  THAT IS THE ANSWER, not a clamp: a diagonal whose
+    bytes cannot cross the link inside the bound does not become affordable by
+    being cut differently.  ``copy_gbps=0.0`` (the default, and the ``ipc``
+    arm) reproduces the pre-S6 arithmetic to the digit.
     """
     total = int(bytes_total)
     slots = int(slots)
@@ -1927,10 +2041,13 @@ def plan_oncard_slot_bytes(
                               0 if store_forward else slots, 0,
                               float(per_batch_ms), float(budget_ms),
                               "store-forward-batches" if store_forward
-                              else source, int(host_budget_bytes))
+                              else source, int(host_budget_bytes),
+                              float(copy_gbps), bool(store_forward))
     if per_batch_ms <= 0:
         raise ValueError(f"per_batch_ms must be positive, not {per_batch_ms!r}")
-    allowed = int(float(budget_ms) // float(per_batch_ms))
+    copy_ms = (0.0 if float(copy_gbps) <= 0.0
+               else (total / (float(copy_gbps) * 1e9)) * 1e3)
+    allowed = int((float(budget_ms) - copy_ms) // float(per_batch_ms))
     if allowed < 1:
         want = int(ceiling_bytes)
     else:
@@ -1949,7 +2066,8 @@ def plan_oncard_slot_bytes(
         slots = batches
         source = "store-forward-batches"
     return OnCardSlotPlan(total, slot, slots, batches, float(per_batch_ms),
-                          float(budget_ms), source, int(host_budget_bytes))
+                          float(budget_ms), source, int(host_budget_bytes),
+                          float(copy_gbps), bool(store_forward))
 
 
 class _OnCardWait:
@@ -2214,12 +2332,19 @@ def oncard_host_path(boot_nonce: str, card: int, shm_root: str = xr.SHM_ROOT) ->
     created only when the degrade is armed, and it joins the same residue sweep
     as the region because it lives under the same boot directory.
 
-    OPEN ITEM, named rather than hidden: on the degrade arm this adds
-    ``3 x 2 x 32 MiB = 192 MiB`` of host that spec 0.2's ledger term (0.38 GiB
-    staging) does NOT carry.  Section 3.7 prices the degrade in WALL (+0.49 s
-    on the x4 card) and not in host.  The saving is still ~34.5 GiB, so the arm
-    remains far inside the bound -- but the number belongs in the record, not
-    in a comment nobody reads, and it is repeated in the S4 record block.
+    CLOSED, and by a ledger term rather than by a comment (S6): the degrade's
+    host bytes are :data:`ONCARD_HOST_DEGRADE_MIB` at the shape's CEILING --
+    one file per card, :data:`ONCARD_DEPOSIT_BYTES_MAX` each -- and
+    ``host_ledger.xchg_bounce_bytes`` charges exactly that at both the launch
+    and the run moment, on the ``host`` arm and only there.  Spec 0.2's 0.38
+    GiB staging term still does not carry it and spec 3.7 still prices the
+    degrade in WALL (+0.49 s on the x4 card) and not in host; the term above is
+    what makes the reap bound see it.
+
+    THE FILE OUTLIVES THE LEG THAT WROTE IT.  :meth:`HostBounce.close` does not
+    unlink -- that is what a store-and-forward deposit is -- so the bytes are
+    held until the boot directory's residue sweep, not "for the span of a
+    flip", and the charge is sized for the longer life.
     """
     return os.path.join(xr.region_dir(boot_nonce, shm_root), f"oncard-{int(card)}.bin")
 
@@ -2239,8 +2364,30 @@ class HostBounce:
     same path with ``create=False`` in a LATER leg and finds the bytes.  The
     file joins the boot directory's residue sweep like the region does; nothing
     else removes it, and nothing else may.
+
+    THE BYTES ARE DECLARED TO THEIR OWNER BEFORE THEY ARE PINNED (S6 refuter,
+    must_fix 2).  ``cudaHostRegister`` on this mapping makes it non-swappable
+    host memory on a box with no swap, and ``pinned_host_budget`` is the #550
+    single owner of the question "may this pinned host buffer be allocated?" --
+    the same registry HiCache and kv-session-offload's joint check sum over.
+    Charging only the #1269 LAUNCH-TIME ledger (which S6 also does, for the
+    reap bound) left ``registered_posts()`` short by up to the whole deposit,
+    which is two ledgers for one payload; this is the one that answers at the
+    moment of allocation.  Declaring BEFORE mapping is #729's own ordering, and
+    :func:`revert_pinned_posts_on_failure` undoes the declaration when the map
+    or the register then raises.
+
+    THE POST IS KEYED BY PATH, not by card: two objects over the same file in
+    one process (a source that re-opens its own deposit) are the same physical
+    pages and must be charged once, and the registry is a dict keyed by name.
     """
 
+    #: The flag an operator lowers to remove this post.  It is the ARM, not a
+    #: size: there is no per-card size knob, so naming one would be a refusal
+    #: pointing at a flag that does not exist.
+    POST_FLAG = "--weg2-xchg-oncard ipc"
+
+    @revert_pinned_posts_on_failure
     def __init__(self, ops: DeviceOps, boot_nonce: str, card: int, *,
                  create: bool, slots: int = ONCARD_SLOTS,
                  slot_bytes: int = ONCARD_SLOT_BYTES,
@@ -2252,6 +2399,8 @@ class HostBounce:
         self.slot_bytes = int(slot_bytes)
         self.nbytes = self.slots * self.slot_bytes
         self.path = oncard_host_path(boot_nonce, card, shm_root)
+        self._post = f"weg2-xchg-oncard-bounce {self.path}"
+        check_and_register_pinned_post(self._post, self.POST_FLAG, self.nbytes)
         os.makedirs(os.path.dirname(self.path), exist_ok=True)
         flags = os.O_RDWR | (os.O_CREAT if create else 0)
         self._fd = os.open(self.path, flags, 0o600)
@@ -2274,13 +2423,24 @@ class HostBounce:
         return self.ptr + (int(slot) % self.slots) * self.slot_bytes
 
     def close(self) -> None:
-        if self._registered:
-            try:
-                self.ops.host_unregister(self.ptr)
-            finally:
-                self._registered = False
-        self._mm.close()
-        os.close(self._fd)
+        """Unpin, unmap, close the fd, and RELEASE THE POST.  Never unlink.
+
+        The post goes last and unconditionally: a post that outlived its buffer
+        charges the next admission for bytes nobody holds, which is the mirror
+        of the under-charge :meth:`__init__` closes and refuses a pool that in
+        fact fits.  The FILE is the one thing this does not touch -- see the
+        class docstring; the residue sweep owns it.
+        """
+        try:
+            if self._registered:
+                try:
+                    self.ops.host_unregister(self.ptr)
+                finally:
+                    self._registered = False
+            self._mm.close()
+            os.close(self._fd)
+        finally:
+            unregister_pinned_post(self._post)
 
 
 #: A LEG'S REMAINING DEADLINE, as a callable, or ``None`` for "no deadline".
@@ -2480,7 +2640,7 @@ def run_oncard_consumer(
             got = _await_oncard(region, DIR_ONCARD_PROD_OFF, peer_row,
                                 batch.seq, _wait_budget(budget, budget_left),
                                 what="fill", row=row, slot=slot,
-                                wave=wave, exact=True)
+                                wave=wave, exact=True, slots=int(slots))
         finally:
             stats.drain_wait_s += time.perf_counter() - _blocked
         # The producer's batcher geometry, published rather than assumed.  Two
@@ -2532,6 +2692,7 @@ def run_oncard_consumer(
 def _await_oncard(region: xr.XchgRegion, area_off: int, peer_row: int, seq: int,
                   budget_s: float, *, what: str, row: int, wave: int,
                   slot: int = 0, exact: bool = False,
+                  slots: Optional[int] = None,
                   wait: Optional["_OnCardWait"] = None) -> Dict[str, int]:
     """Bounded poll for a peer's on-card row to reach ``seq``.
 
@@ -2595,7 +2756,14 @@ def _await_oncard(region: xr.XchgRegion, area_off: int, peer_row: int, seq: int,
                 f"peer_state={got['state']} "
                 f"peer_sealed={got['sealed']} peer_pid={got['pid']} "
                 f"alive_in_proc={'yes' if _pid_alive(got['pid'], '/proc') else 'no'} "
-                f"(denominator: the peer's on-card row for THIS slot carrying "
+                # S6 refuter, must_fix 5: the depth THIS rank wrapped its ring
+                # at.  A peer that sized the ring differently wrote every batch
+                # at another address, so this wait would never match and the
+                # line would name an absent peer -- a live producer read as a
+                # dead one.  The number is on the line so the two readings can
+                # be compared by whoever reads the boot log.
+                + (f"consumer_slots={int(slots)} " if slots is not None else "")
+                + f"(denominator: the peer's on-card row for THIS slot carrying "
                 f"epoch_hash={region.epoch_hash:#x} and wave={wave})"
             )
         waiter.wait()
@@ -2878,8 +3046,18 @@ def run_leg(
                 # buffer it had never been told existed.  Written AFTER the
                 # handle, sealed, and carrying this wave: it is the handle's
                 # publication barrier as well as its announcement.
+                #
+                # ``nbytes`` CARRIES THE RING DEPTH (S6 refuter, must_fix 5).
+                # On an ARMED row no batch exists, so the field was written 0
+                # and was free -- and ``slots`` was the one geometry number
+                # crossing the two processes with nothing comparing it: the
+                # consumer polls ``seq % slots_dst`` while the producer wrote
+                # ``seq % slots_src``, so with equal ``slot_bytes`` and unequal
+                # depth every wait misses, and W53 would name an absent peer
+                # instead of a ring sized differently on the two sides.
                 write_oncard_row(region, DIR_ONCARD_PROD_OFF, row, slot=0,
-                                 seq=-1, nbytes=0, slot_bytes=diag_bytes,
+                                 seq=-1, nbytes=diag_slots,
+                                 slot_bytes=diag_bytes,
                                  wave=wave, state=ONCARD_STATE_ARMED)
                 run_oncard_producer(region, ops, stream, bounce, row=row,
                                     peer_row=peer_row, wave=wave,
@@ -2926,6 +3104,40 @@ def run_leg(
                         f"slot_bytes={armed['slot_bytes']} and this rank "
                         f"expects {diag_bytes} -- the two sides would read the "
                         f"same bounce at different slot addresses"
+                    )
+                # THE SECOND HALF OF THE SAME COMPARISON (S6 refuter, must_fix
+                # 5).  Slot SIZE and ring DEPTH both address the bounce, and
+                # only the size was checked.  Both sides derive the depth
+                # independently -- the source from its own plan, this rank from
+                # its own -- so agreeing about it is a fact to be verified, not
+                # assumed, and a mismatch is silent otherwise: every poll
+                # simply never matches and the budget expires.
+                #
+                # ONLY THE ARMING ROW CARRIES THE DEPTH, and this reads it only
+                # when that is the row it got.  MEASURED (S6-fix, three
+                # concurrent tests): ``_await_handle`` accepts ANY non-IDLE row
+                # at this epoch and wave, and the arming row's address is slot
+                # 0 -- which batch 0 then overwrites.  A producer that has
+                # already published batch 0 therefore hands back a READY row
+                # whose ``bytes`` word is that batch's byte count, and
+                # comparing it against a ring depth refuses every fast
+                # producer.  Where the row has advanced the depth is no longer
+                # readable from it; ``_await_oncard``'s W53 then carries this
+                # rank's own depth (``consumer_slots=``) so a mismatch is still
+                # diagnosable from the line instead of reading as an absent
+                # peer, which is the half of must_fix 5 that matters most.
+                if (int(armed["state"]) == ONCARD_STATE_ARMED
+                        and int(armed["bytes"]) != int(diag_slots)):
+                    raise Weg2XchgPlanDisagree(
+                        f"W52 Weg2XchgPlanDisagree oncard row={row} "
+                        f"peer_row={peer_row} epoch={region.epoch} wave={wave}: "
+                        f"the co-located source armed a bounce of "
+                        f"slots={int(armed['bytes'])} and this rank derived "
+                        f"{int(diag_slots)} at the same slot_bytes={diag_bytes} "
+                        f"-- the two sides would wrap the same ring at "
+                        f"different depths, so the consumer's seq % slots would "
+                        f"address a slot the producer never wrote and the wait "
+                        f"would expire naming an absent peer"
                     )
                 if ipc:
                     peer_ptr = ops.ipc_open_handle(read_ipc_handle(region, peer_row))
