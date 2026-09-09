@@ -1299,17 +1299,34 @@ class TheShortfallMarkSurvivesTheInFlightCutRead(CustomTestCase):
         s._retry_deferred_prefetches()
         self.assertIsNone(getattr(r, "prefetch_deferred", None))
 
-    def test_the_x_defer_verdict_precedes_the_rank_local_hold_in_the_loop(self):
-        """#1305 finding 1: in `_get_new_batch_prefill_raw` the group-agreed
-        `_weg2_x_defers` check sits ABOVE `_admission_held_for_deferred_prefetch`,
-        so a marked request the group has an opinion on is skipped under
-        `weg2_x_defer` with the S3 X-DEFER line, not silently under
-        `prefetch_deferred`. The refusal arm stays below both."""
+    def test_the_rank_local_hold_stands_down_where_the_group_speaks(self):
+        """#1305 finding 1: in `_get_new_batch_prefill_raw` the A12.2 hold is
+        conditioned on the group NOT having an opinion on the rid's store read
+        (`_weg2_x_group_speaks`), so a marked request the group has an opinion
+        on falls through to the group-agreed `_weg2_x_defers` -- which stays
+        DIRECTLY above the pricing gate, FIX 7's own pin (test_weg2_sched_fix7
+        c1d) -- and is skipped under `weg2_x_defer` with the S3 X-DEFER line,
+        not silently under `prefetch_deferred`."""
         import inspect
 
         src = inspect.getsource(Scheduler._get_new_batch_prefill_raw)
-        i_defer = src.index("self._weg2_x_defers(req, _head_inputs)")
+        self.assertIn(
+            "self._admission_held_for_deferred_prefetch(req) and not (\n"
+            "                self._weg2_x_group_speaks(req, _head_inputs)\n"
+            "            )",
+            src,
+        )
         i_hold = src.index("self._admission_held_for_deferred_prefetch(req)")
+        i_defer = src.index("self._weg2_x_defers(req, _head_inputs)")
         i_refuse = src.index("self._weg2_x_refuses(req, _head_inputs)")
-        self.assertLess(i_defer, i_hold)
-        self.assertLess(i_hold, i_refuse)
+        self.assertLess(i_hold, i_defer)
+        self.assertLess(i_defer, i_refuse)
+
+    def test_the_group_speaks_predicate_is_the_x_gates_own_term(self):
+        """Same term the X gate reads, asked without acting; fail-closed."""
+        import inspect
+
+        src = inspect.getsource(Scheduler._weg2_x_group_speaks)
+        self.assertIn("tp_head_congruence.group_store_read_pending_ms(", src)
+        self.assertIn("is not None", src)
+        self.assertIn("return False", src)

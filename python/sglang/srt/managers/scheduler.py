@@ -9858,6 +9858,26 @@ class Scheduler(
         except Exception:  # noqa: BLE001 - an unpriceable bound is not a wait
             return 0.0
 
+    def _weg2_x_group_speaks(self, req, head_inputs=None) -> bool:
+        """#1305 finding 1: does the X gate hold a GROUP opinion on this rid?
+
+        True iff the MIN-reduced pending arm of the packed reduce carries a
+        value for this request's store read -- the same term
+        :meth:`_weg2_x_defers` reads, asked without acting on it. Used by the
+        admission loop to stand the rank-local A12.2 hold down where the
+        group-agreed verdict exists; never a verdict itself. Fail-closed to
+        False (= the hold applies) on any error, which is the pre-#1305 form.
+        """
+        try:
+            return (
+                tp_head_congruence.group_store_read_pending_ms(
+                    head_inputs, str(getattr(req, "rid", "") or "")
+                )
+                is not None
+            )
+        except Exception:  # noqa: BLE001
+            return False
+
     def _weg2_x_defers(self, req: Req, head_inputs=None) -> bool:
         """LAW 4's COMPLETION PREDICATE: must the X gate WAIT to price this?
 
@@ -11890,29 +11910,31 @@ class Scheduler(
                 # prefill -- that is what sends it to PP instead of wedging it.
                 _note_skip("seam_transport_only", req.rid)
                 continue
-            # #1305 finding 1 (serve-next5 refuter): THE GROUP'S VERDICT
-            # FIRST, THE RANK-LOCAL HOLD SECOND. `_weg2_x_defers` is the
-            # MIN-reduced, group-agreed completion predicate of the X gate
-            # (it prints `WEG2 X-DEFER ... reason=host_pool_shortfall`, the
-            # S3 line of #1298 gate 1); the A12.2 hold below is rank-local at
-            # both ends in the TP phase (its own docstring, #1203 A3) and used
-            # to run FIRST, so a marked request was skipped under the census
-            # key `prefetch_deferred` on every pass and the X-DEFER line was
-            # unreachable for it. Where the group has an opinion it decides
-            # and speaks; where it abstains (no vote, rid outside the
-            # canonical head) the hold still applies, as before. The refusal
-            # arm (`_weg2_x_refuses`, W50) keeps its place further down: it
-            # DELETES, and every "held" verdict must precede a deletion.
-            if self._weg2_x_defers(req, _head_inputs):
-                _note_skip("weg2_x_defer", req.rid)
-                continue
             # #1068 (A12.2): a request whose prefetch is DEFERRED (rate-limited
             # budget) is not admitted to prefill while the mark stands --
             # admitting it would recompute the whole prefix, the very thing
             # the deferral exists to avoid. The retry at the top of this pass
             # clears the mark when the prefetch registers; the two bounded
             # exits (UNDEFERRABLE / DEFER EXPIRED) clear it by name.
-            if self._admission_held_for_deferred_prefetch(req):
+            #
+            # #1305 finding 1 (serve-next5 refuter): THE HOLD ABSTAINS WHERE
+            # THE GROUP SPEAKS. This hold is rank-local at both ends in the TP
+            # phase (its own docstring, #1203 A3). The X gate's completion
+            # predicate (`_weg2_x_defers`, further down and DIRECTLY above the
+            # pricing gate by FIX 7's own pin) is the MIN-reduced, group-agreed
+            # verdict on the same fact and prints the S3 line `WEG2 X-DEFER
+            # ... reason=host_pool_shortfall` (#1298 gate 1). With the hold
+            # unconditional, a marked request was skipped here under the
+            # census key `prefetch_deferred` on every pass and that line was
+            # unreachable for it (boot weg2sn5pre: 3 DEFERRED, 0 X-DEFER). So
+            # where the group has an opinion on this rid's store read, the
+            # rank-local hold stands down and the group's gate decides and
+            # speaks; where the group abstains (no vote taken, rid outside the
+            # canonical head) the hold applies exactly as before. One fact,
+            # one verdict where a group verdict exists.
+            if self._admission_held_for_deferred_prefetch(req) and not (
+                self._weg2_x_group_speaks(req, _head_inputs)
+            ):
                 _note_skip("prefetch_deferred", req.rid)
                 continue
             if self.enable_lora and not self._can_schedule_lora_req(req, running_loras):
@@ -12255,8 +12277,9 @@ class Scheduler(
             # (no deletion, no answer, no seat given up), bounded by the span's
             # own length-priced store-read timeout so a read that never lands
             # is priced rather than waited on for ever.
-            # (#1305 finding 1: `_weg2_x_defers` moved ABOVE the A12.2 hold at
-            # the top of this loop; see the note there.)
+            if self._weg2_x_defers(req, _head_inputs):
+                _note_skip("weg2_x_defer", req.rid)
+                continue
             if self._weg2_x_refuses(req, _head_inputs):
                 _note_skip("weg2_x_refused", req.rid)
                 _x_refused.append(req)
