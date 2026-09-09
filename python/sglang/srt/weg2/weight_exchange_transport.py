@@ -769,6 +769,7 @@ class SemSet:
         lib.sem_timedwait.argtypes = [ctypes.c_void_p, ctypes.POINTER(_Timespec)]
         lib.sem_post.argtypes = [ctypes.c_void_p]
         lib.sem_close.argtypes = [ctypes.c_void_p]
+        lib.sem_getvalue.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_int)]
         self._lib = lib
         self._handles: Dict[Tuple[int, int, str], int] = {}
         self._lock = threading.Lock()
@@ -872,11 +873,106 @@ class SemSet:
             err = ctypes.get_errno()
             raise OSError(err, f"sem_post failed: {os.strerror(err)}")
 
+    def getvalue(self, pair: int, slot: int, kind: str) -> int:
+        """The semaphore's CURRENT count.  A read; it takes nothing.
+
+        The only way to tell a re-armed handshake from a handshake still
+        carrying the last flip's leftovers, and the reason
+        :func:`verify_sem_arm` can be a check rather than a re-creation: a rank
+        may not create a semaphore (see this class's docstring), so a rank that
+        found a stale count could only refuse -- which is the correct answer
+        anyway, because the leftovers mean a previous flip did not finish the
+        way it says it did.
+        """
+        value = ctypes.c_int(0)
+        ctypes.set_errno(0)
+        if self._lib.sem_getvalue(ctypes.c_void_p(self.handle(pair, slot, kind)),
+                                  ctypes.byref(value)) != 0:
+            err = ctypes.get_errno()
+            raise OSError(err, f"sem_getvalue(pair={pair} slot={slot} "
+                               f"kind={kind}) failed: {os.strerror(err)}")
+        return int(value.value)
+
     def close(self) -> None:
         with self._lock:
             for raw in self._handles.values():
                 self._lib.sem_close(ctypes.c_void_p(raw))
             self._handles.clear()
+
+
+class Weg2XchgSemaphoreNotRearmed(RuntimeError):
+    """W62 -- a slot semaphore did not start this leg at its armed count.
+
+    **S4-fix REFUSAL C, an S6 ``must_fix`` carried forward.**  The launcher
+    creates all 24 with ``empty=1, full=0`` (``O_EXCL`` after an unlink) and no
+    rank may create one.  Nothing re-arms them per FLIP, and a flip abandoned
+    after gate 1 rolls forward by design (W57) leaving any slot whose ``full``
+    was posted and never taken at ``full=1, empty=0`` for the rest of the boot.
+    The consequences are exactly the two this campaign keeps paying for:
+
+    * the next flip's PRODUCER blocks on ``empty`` for the whole 120 s fence
+      budget and then reports a timeout naming a consumer that never had a
+      reason to drain anything;
+    * the next flip's CONSUMER takes a ``full`` whose slot record carries a
+      FOREIGN epoch -- W52, correctly raised, about a state nobody caused this
+      flip.
+
+    So the leg checks, by name, at its start.  It CANNOT repair: repairing
+    means draining counts, i.e. a rank quietly deciding another flip's
+    leftovers were harmless.
+    """
+
+
+#: What each of the 24 counts must be at the start of a leg: ``empty`` armed to
+#: one free slot, ``full`` empty.  The same two numbers
+#: ``weight_exchange_region.create_semaphores`` writes, read from ONE place so
+#: the check cannot drift from the creation.
+SEM_ARMED_COUNTS = {"empty": 1, "full": 0}
+
+SEM_NOT_REARMED_MARKER = "W62 Weg2XchgSemaphoreNotRearmed"
+
+
+def verify_sem_arm(sems: SemSet, *, leg: int, epoch: str,
+                   log: Optional[Callable[[str], None]] = None) -> Dict[str, int]:
+    """Check all 24 counts at the start of a leg.  REFUSE, never repair.
+
+    TODO(S6): call this from ``begin_flip``'s caller -- the RPC preamble, where
+    every other derivable refusal already lands (spec 3.6: W51/W52/W55/W58 are
+    raised BEFORE the first ``resume``, so a refusal costs nothing).  S5 owns
+    the check and its proof; S6 owns the call site, because S6 is what creates
+    the situation this detects (a flip that rolls forward past gate 1).
+
+    Returns the census when every count is armed, so the caller can log
+    ``sems_armed=24/24`` -- a check whose pass is invisible is a check nobody
+    can tell from an absent one.
+    """
+    stale: List[str] = []
+    checked = 0
+    for pair in range(xr.N_PAIRS):
+        for slot in range(xr.SLOTS_PER_PAIR):
+            for kind, want in SEM_ARMED_COUNTS.items():
+                got = sems.getvalue(pair, slot, kind)
+                checked += 1
+                if got != want:
+                    stale.append(
+                        f"[{xr.sem_name(sems.boot_nonce, pair, slot, kind)} "
+                        f"count={got} armed={want}]")
+    if stale:
+        raise Weg2XchgSemaphoreNotRearmed(
+            f"{SEM_NOT_REARMED_MARKER} leg={leg} epoch={epoch} "
+            f"stale={len(stale)}/{checked}: {' '.join(stale)} -- a previous "
+            f"leg left counts behind (the W57 roll-forward is the path that "
+            f"does it).  A producer would block on `empty` for the whole fence "
+            f"budget and name a healthy consumer; a consumer would take a "
+            f"`full` whose record carries a foreign epoch.  This leg refuses "
+            f"instead, and it does NOT drain them: draining is a rank deciding "
+            f"another flip's leftovers were harmless"
+        )
+    if log is not None:
+        log(f"WEG2-XCHG-SEMS leg={leg} epoch={epoch} armed={checked}/{checked} "
+            f"counts=empty:{SEM_ARMED_COUNTS['empty']},full:"
+            f"{SEM_ARMED_COUNTS['full']}")
+    return {"checked": checked, "stale": 0}
 
 
 # ---------------------------------------------------------------------------

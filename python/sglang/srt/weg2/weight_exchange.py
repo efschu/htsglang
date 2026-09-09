@@ -1742,6 +1742,12 @@ MIB = 1024 * 1024
 
 WEIGHT_SOURCE_RING = "ring"
 WEIGHT_SOURCE_EXCHANGE = "exchange"
+#: #1273 S5.  RING-AUTHORITATIVE: the ring refills every weight byte exactly as
+#: it does today and the exchange runs beside it into buffers nothing reads.
+#: ``exchange_armed()`` is FALSE here, deliberately -- that predicate gates the
+#: region's ``enable_cpu_backup`` and the pause/resume shape, and the shadow
+#: changes neither.
+WEIGHT_SOURCE_SHADOW = "shadow"
 
 #: MINIMAL INTERFACE, TODO(S6, spec section 6/S6): the user-facing flag is
 #: ``--weg2-weight-source {ring|exchange}`` on ``server_args``, and the
@@ -1757,17 +1763,31 @@ WEIGHT_SOURCE_ENV = "SGLANG_WEG2_WEIGHT_SOURCE"
 
 
 def weight_source() -> str:
-    """``ring`` (today, byte for byte) or ``exchange``.  Default ``ring``."""
+    """``ring`` (today, byte for byte), ``exchange`` or ``shadow``.
+
+    Anything unrecognised is ``ring``: this reads an ENVIRONMENT variable, and
+    the one direction a typo may not take is "arm something".
+    """
     value = (os.environ.get(WEIGHT_SOURCE_ENV, "") or "").strip().lower()
-    return (
-        WEIGHT_SOURCE_EXCHANGE
-        if value == WEIGHT_SOURCE_EXCHANGE
-        else WEIGHT_SOURCE_RING
-    )
+    if value in (WEIGHT_SOURCE_EXCHANGE, WEIGHT_SOURCE_SHADOW):
+        return value
+    return WEIGHT_SOURCE_RING
 
 
 def exchange_armed() -> bool:
+    """Does the EXCHANGE own the weight bytes?  False under ``shadow``.
+
+    The one predicate that decides ``enable_cpu_backup`` and therefore whether
+    ``pause`` is a pure unmap.  Under ``shadow`` the answer is no -- the ring
+    is authoritative -- and reading it as yes there would delete the very
+    ground truth the shadow compares against.
+    """
     return weight_source() == WEIGHT_SOURCE_EXCHANGE
+
+
+def shadow_armed() -> bool:
+    """Does the shadow run beside the ring?  Never implies :func:`exchange_armed`."""
+    return weight_source() == WEIGHT_SOURCE_SHADOW
 
 
 @contextmanager
