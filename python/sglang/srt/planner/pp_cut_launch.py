@@ -100,6 +100,39 @@ def _gapped_forward_gate() -> Tuple[bool, str]:
     return pp_gapped_forward_known_wrong_allowed(), PP_GAPPED_KNOWN_WRONG_ENV
 
 
+def refuse_unfunded_posts(pool_model: PhasePoolModel) -> None:
+    """W40 when a BOOT is about to be priced with posts nobody funded (#1286).
+
+    The library keeps pricing an under-funded model, because a desk explorer
+    asking "how does the pool move with the cut" gets a useful upper bound from
+    it. A LAUNCH does not: the number it publishes is compared against
+    ``--max-kv-per-request`` and printed as the boot's pool, and every missing
+    post pushes it the same way -- UP. Measured on weg2sb5f: 499,967 published
+    against 304,655 sized, +64.1 %, with the three posts below all at zero.
+
+    So the refusal lives at the launch seam rather than in the model: one
+    caller, one sentence, and the desk paths are untouched.
+    """
+    missing = pool_model.unfunded_posts
+    if not missing:
+        return
+    raise PPCutRefused(
+        "W40 Weg2PPCutRefused: the pool model would price this boot's cuts "
+        "with %d of the boot's own budget posts UNFUNDED (%s). An unpriced "
+        "term does not read as 'unknown', it reads as 'free' (#1009), and "
+        "every one of these is the OVER-pricing direction: on boot weg2sb5f "
+        "the same omissions published 499,967 tokens for the cut group P then "
+        "sized at 304,655 (+64.1 %%), which is a pool floor cleared on paper "
+        "by a layout that could not hold the prompt. Fund them from the boot's "
+        "'KV budget posts (GiB):' line -- weights + runtime state minus the "
+        "per-layer half is --pp-cut-stage-fixed-mib, 'prefill activation "
+        "reserve' is --pp-cut-activation-reserve-mib, 'gapped corridor "
+        "holdback' is --pp-cut-corridor-holdback-mib, 'mamba state pool' "
+        "divided by (linear layers x slots) is "
+        "--pp-cut-mamba-mib-per-linear-layer-per-slot." % (len(missing), ", ".join(missing))
+    )
+
+
 def _refuse_below_pool_floor(
     candidate: "CutCandidate", what: str, cap_tokens: int, cost_provenance: str
 ) -> None:

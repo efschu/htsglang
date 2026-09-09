@@ -636,6 +636,58 @@ MEASURED_MS_PER_LAYER = "8.10,35.16,33.59"
 #: solved floor exists only for a layout that has booted.
 ARMING_FLOOR_MIB = 1229.0
 
+# ---------------------------------------------------------------------------
+# #1286 -- THE POSTS THE BOOT CHARGES, so the ranking prices what the boot
+# sizes. Every constant below is READ OFF THE RUNTIME'S OWN SUCCESS-PATH LINE
+# (model_runner_kv_cache_mixin.py:1174):
+#
+#   [world_rank 0] KV budget posts (GiB): weights + runtime state=17.908,
+#     gapped corridor holdback=1.000, mamba state pool=1.005,
+#     prefill activation reserve=1.000, GGUF dequant scratch=0.000 | rest=6.392
+#
+# TWO BOOTS, TWO DIFFERENT CUTS, so these are measurements and not a fit:
+#   weg2sb5f  44,10,10 / attn 11,2,3  (2026-09-09, tip 11df059318)
+#   weg2rg6   32,18,14 / attn 8,4,4   (2026-09-08, tip 7f88b1c75d; weg2sb4
+#                                      reproduced it byte-identically)
+# Recovering the same per-stage constant from both is the falsifiable part: a
+# term that tracked layer count would move by thousands of MiB between them.
+# ---------------------------------------------------------------------------
+
+#: Per-stage NON-LAYER weight + runtime state, MiB: the embedding on stage 0,
+#: lm_head plus the MTP/draft head on the last stage, the replicated payload
+#: every stage carries, and the per-rank runtime state. Recovered as
+#: `weights_and_runtime_state_GiB * 1024 - MEAN_LAYER_MIB * n_layers`:
+#:   weg2sb5f  2348.2 / 1100.0 / 3515.6 MiB
+#:   weg2rg6   2335.5 / 1111.2 / 3520.1 MiB
+#: The two agree to <= 12.7 MiB (<= 0.55 % of the term, <= 600 tokens on the
+#: binding stage), which is the residual this constant carries.
+P_PP_STAGE_FIXED_MIB = "2342.0,1105.5,3518.0"
+
+#: The `prefill activation reserve` post, MiB per rank. 1.000 GiB on every
+#: rank of both boots. It had NO FIELD in the pool model before #1286.
+P_PREFILL_ACTIVATION_RESERVE_MIB = 1024.0
+
+#: The `gapped corridor holdback` post, MiB per rank. 1.000 GiB on every rank
+#: of both boots. This is the term ARMING_FLOOR_MIB was standing in for, and
+#: they are NOT the same thing: the runtime charges this holdback and no
+#: arming floor, so the 1229 MiB stand-in over-charged by 205 MiB per rank.
+#: That was the only one of the four errors pointing the SAFE way.
+P_CORRIDOR_HOLDBACK_MIB = 1024.0
+
+#: Device GDN state per linear layer per sequence SLOT, MiB. Recovered from
+#: `mamba state pool / (linear_layers * 20 slots)` on six rank readings:
+#: 31.185/31.23/31.16 (weg2sb5f) and 31.19/31.16/31.13 (weg2rg6) MiB per
+#: linear layer, i.e. 1.5588 MiB per linear layer per slot. Cross-checked
+#: against the boot's own `per_req=51.43 MiB` at 33 linear layers.
+P_MAMBA_MIB_PER_LINEAR_LAYER_PER_SLOT = 1.5588
+
+#: Slots the demand-driven pool allocates per unit of --p-bs: mamba_ratio 2 x
+#: safety 1.25 (model_runner_kv_cache_mixin.py:2088). The boot prints the
+#: product: `target_concurrency=8 ratio=2 safety=1.25 ->
+#: max_mamba_cache_size=20 slots`. The pool model charged --p-bs itself
+#: before #1286, i.e. 8 slots where the allocator took 20.
+P_MAMBA_SLOT_FACTOR = 2.5
+
 #: #1240 -- the DEPTH axis of the cost model, and the two records that pin it.
 #:
 #: A full-attention layer's cost for one chunk grows with the prefix it
@@ -4772,6 +4824,16 @@ def solve_p_cut(
         weight_mib_per_layer=mean_layer_mib,
         kv_mib_per_token_per_attn_layer=kv_mib,
         arming_floor_mib=tuple(float(ns.pp_cut_arming_floor_mib) for _ in budgets_p),
+        # -- #1286: THE POSTS THE BOOT CHARGES AND THIS MODEL DID NOT ------
+        # Every one of these is read off the runtime's OWN success-path line,
+        # `[world_rank r] KV budget posts (GiB): ...`, so the model's
+        # subtraction is that line transcribed rather than re-derived. Before
+        # this the model charged the per-LAYER weight half plus a 1229 MiB
+        # arming floor and nothing else, and boot weg2sb5f published 499,967
+        # tokens for the cut group P then sized at 304,655 (+64.1 %).
+        stage_fixed_mib=tuple(_csv_floats(ns.pp_cut_stage_fixed_mib)),
+        activation_reserve_mib=float(ns.pp_cut_activation_reserve_mib),
+        corridor_holdback_mib=float(ns.pp_cut_corridor_holdback_mib),
         mamba_mib_per_linear_layer_per_slot=float(
             ns.pp_cut_mamba_mib_per_linear_layer_per_slot
         ),
@@ -4779,8 +4841,23 @@ def solve_p_cut(
         # second copy of --max-running-requests would drift the day the flag
         # moves, and the mamba residency scales linearly with it.
         # P's OWN bs (C1/R-12): this is P's pool model.
-        mamba_slots=_max_running_requests(model, "P", int(getattr(ns, "p_bs", 8) or 8)),
+        #
+        # #1286: --max-running-requests is the CONCURRENCY TARGET, not the slot
+        # count. The demand-driven pool allocates
+        # `ceil(target * mamba_ratio * safety)` slots
+        # (model_runner_kv_cache_mixin.py:2088, and the boot prints the result:
+        # `[auto-mamba] ... target_concurrency=8 ratio=2 safety=1.25 ->
+        # max_mamba_cache_size=20 slots`). Charging 8 where the allocator takes
+        # 20 under-charged the mamba post by 2.5x on every rank.
+        mamba_slots=math.ceil(
+            _max_running_requests(model, "P", int(getattr(ns, "p_bs", 8) or 8))
+            * float(ns.pp_cut_mamba_slot_factor)
+        ),
     )
+    # #1286: a LAUNCH may not price with an unfunded post. The desk paths keep
+    # their upper bound; this seam publishes a number that is compared against
+    # --max-kv-per-request and read as the boot's pool, so it refuses instead.
+    _cut.refuse_unfunded_posts(model_pool)
     families = tuple(
         _pp_cut.LAYER_FAMILY_ATTENTION
         if str(k) == "full_attention"
@@ -4924,9 +5001,31 @@ def solve_p_cut(
         f"weights attn {terms.attn_layer_weight_bytes / _pp_cut.MIB:.1f} / linear "
         f"{terms.linear_layer_weight_bytes / _pp_cut.MIB:.1f} MiB per layer -> mean "
         f"{mean_layer_mib:.1f} used; free={budgets_p} MiB (this launcher's own "
-        f"per-rank budgets); arming floor {ns.pp_cut_arming_floor_mib} MiB/rank; "
-        f"mamba/linear-layer/slot {ns.pp_cut_mamba_mib_per_linear_layer_per_slot} MiB "
-        f"(0.0 = UNFUNDED, pool is an UPPER bound)"
+        f"per-rank budgets); arming floor {ns.pp_cut_arming_floor_mib} MiB/rank "
+        f"(rank0 layer cap only -- the pool model charges the corridor holdback "
+        f"instead, #1286)"
+    )
+    # #1286: the posts, on their own line, in the runtime's own order and with
+    # the runtime's own names, so this line and the boot's `KV budget posts`
+    # line can be read side by side without a translation step.
+    log(
+        "PP-CUT budget posts (the boot's own list, MiB/rank): "
+        "weights+runtime = %.1f/layer x n + stage_fixed %s; corridor holdback "
+        "%.1f; mamba %.4f/linear-layer/slot x %d slots (--p-bs %d x factor "
+        "%.2f, the runtime's ratio 2 x safety 1.25); prefill activation "
+        "reserve %.1f. Every one of these was UNFUNDED or wrong before #1286 "
+        "and each omission over-prices; measured on weg2sb5f, the same cut "
+        "published 499967 tokens and group P sized 304655 (+64.1%%)."
+        % (
+            mean_layer_mib,
+            ",".join("%.1f" % v for v in model_pool.stage_fixed_mib),
+            float(model_pool.corridor_holdback_mib or 0.0),
+            float(model_pool.mamba_mib_per_linear_layer_per_slot),
+            int(model_pool.mamba_slots),
+            int(getattr(ns, "p_bs", 8) or 8),
+            float(ns.pp_cut_mamba_slot_factor),
+            float(model_pool.activation_reserve_mib),
+        )
     )
     log(decision.provenance_line())
     log(decision.trade_line())
@@ -4982,6 +5081,38 @@ def solve_p_cut(
             makespan_row.fmt(),
             int(makespan_row.pool_tokens),
             makespan_row.makespan_ms,
+        )
+    )
+    # #1286 -- THE JOIN LINE. `PP-CUT SHIPPED` prices the three objectives, but
+    # nothing on it could be JOINED against what group P then sized: the two
+    # halves are emitted by different processes, in different units, with no
+    # shared key, so the +64.1 % of weg2sb5f sat in plain sight across two logs
+    # for a whole boot. `cell_bytes` is that key -- it is the per-rank
+    # `cell_size=` of P's own `KV pool sizing:` line, byte for byte -- and the
+    # per-rank priced capacities line up against P's per-rank
+    # `KV token sizing: rank r local capacity N tokens`.
+    #
+    # ONE GREP FINDS BOTH HALVES, and that is the whole point of the marker:
+    #   grep -h 'PP-POOL-JOIN\|KV pool sizing\|KV token sizing' front.log P.log
+    per_rank_priced = _pp_cut.stage_pp_capacities(
+        chosen.layers, chosen.attn, model_pool
+    ) if chosen.kind == "contiguous" else ()
+    log(
+        "PP-POOL-JOIN: objective=%s layers=%s attn=%s PRICED pool_tokens=%d "
+        "priced_per_rank=%s cell_bytes=%s -- REALISED is group P's own sizing: "
+        "join on cell_bytes against 'KV pool sizing: available_bytes=... "
+        "cell_size=...' per rank, and compare the world against 'KV token "
+        "sizing: ... min-reduced across ranks to N'. PRICED minus REALISED is "
+        "this pool model's error FOR THIS CUT and belongs in the boot record; "
+        "it was +64.1%% before #1286 and the residual the posts carry now is "
+        "the two-boot spread of --pp-cut-stage-fixed-mib (<=12.7 MiB/rank)."
+        % (
+            str(ns.pp_solve_objective),
+            ",".join(str(n) for n in chosen.layers),
+            ",".join(str(a) for a in chosen.attn),
+            int(chosen.pool_tokens),
+            ",".join("%d" % int(c) for c in per_rank_priced) or "n/a (gapped)",
+            ",".join(str(int(a) * 2048) for a in chosen.attn),
         )
     )
     if chosen.kind == "gapped":
@@ -5405,13 +5536,63 @@ def build_parser() -> argparse.ArgumentParser:
              f"{ATTN_ANCHOR_PREFIX_TOKENS} = --context-length.",
     )
     ap.add_argument(
-        "--pp-cut-mamba-mib-per-linear-layer-per-slot", type=float, default=0.0,
-        help="Device GDN state per linear layer per sequence slot, MiB. "
-             "Default 0.0 = UNFUNDED, and the direction is named rather than "
-             "hidden: omitting it inflates every stage's capacity, more for "
-             "stages holding more linear layers, so the printed pool is an "
-             "UPPER bound and the pool floor is looser than reality. Pass a "
-             "measured value to tighten it.",
+        "--pp-cut-mamba-mib-per-linear-layer-per-slot", type=float,
+        default=P_MAMBA_MIB_PER_LINEAR_LAYER_PER_SLOT,
+        help=f"Device GDN state per linear layer per sequence slot, MiB. "
+             f"Default {P_MAMBA_MIB_PER_LINEAR_LAYER_PER_SLOT} = MEASURED "
+             f"(#1286): the boot's own 'mamba state pool' post divided by "
+             f"(linear layers x slots) on SIX rank readings across two boots "
+             f"that ran different cuts -- 31.185/31.23/31.16 and "
+             f"31.19/31.16/31.13 MiB per linear layer at 20 slots. It was 0.0 "
+             f"= UNFUNDED until #1286, which inflated every stage's capacity, "
+             f"more for stages holding more linear layers. 0.0 restores that "
+             f"upper bound and is REFUSED at the launch seam.",
+    )
+    ap.add_argument(
+        "--pp-cut-mamba-slot-factor", type=float,
+        default=P_MAMBA_SLOT_FACTOR,
+        help=f"Slots the demand-driven mamba pool allocates per unit of "
+             f"--p-bs. Default {P_MAMBA_SLOT_FACTOR} = mamba_ratio 2 x safety "
+             f"1.25, the runtime's own derivation "
+             f"(model_runner_kv_cache_mixin.py:2088; the boot prints the "
+             f"result as '[auto-mamba] ... target_concurrency=8 ratio=2 "
+             f"safety=1.25 -> max_mamba_cache_size=20 slots'). Before #1286 "
+             f"the pool model charged --p-bs itself, i.e. 2.5x too few slots.",
+    )
+    ap.add_argument(
+        "--pp-cut-stage-fixed-mib", default=P_PP_STAGE_FIXED_MIB,
+        help=f"PER-STAGE non-layer weight and runtime state, MiB, comma list "
+             f"(#1286). Default {P_PP_STAGE_FIXED_MIB} = MEASURED: the boot's "
+             f"'weights + runtime state' post minus the per-layer half, "
+             f"recovered INDEPENDENTLY from two boots that ran different cuts "
+             f"(weg2sb5f 44,10,10 and weg2rg6 32,18,14) -- 2348.2/1100.0/"
+             f"3515.6 against 2335.5/1111.2/3520.1 MiB, agreeing to <=12.7 "
+             f"MiB, which is what makes it a per-STAGE constant and not "
+             f"something that tracks layer count. It covers the embedding on "
+             f"stage 0, lm_head plus the MTP/draft head on the last stage, the "
+             f"replicated payload every stage carries, and the per-rank "
+             f"runtime state. Empty = UNFUNDED and REFUSED at the launch seam.",
+    )
+    ap.add_argument(
+        "--pp-cut-activation-reserve-mib", type=float,
+        default=P_PREFILL_ACTIVATION_RESERVE_MIB,
+        help=f"The boot's 'prefill activation reserve' post, MiB per rank "
+             f"(#1286). Default {P_PREFILL_ACTIVATION_RESERVE_MIB} = the "
+             f"1.000 GiB it measured on every rank of both reference boots. "
+             f"It had no field at all before #1286.",
+    )
+    ap.add_argument(
+        "--pp-cut-corridor-holdback-mib", type=float,
+        default=P_CORRIDOR_HOLDBACK_MIB,
+        help=f"The boot's 'gapped corridor holdback' post, MiB per rank "
+             f"(#1286). Default {P_CORRIDOR_HOLDBACK_MIB} = the 1.000 GiB it "
+             f"measured on every rank of both reference boots. This REPLACES "
+             f"--pp-cut-arming-floor-mib in the pool model's subtraction: the "
+             f"runtime's post list charges this holdback and no arming floor "
+             f"(the #676 floor is held back after the profiler and already "
+             f"sits inside the recovered reserve), so the old 1229 MiB "
+             f"stand-in was over-charging by 205 MiB per rank -- the one term "
+             f"of the four that erred the SAFE way.",
     )
     # -- group D: the decode knobs ---------------------------------------
     ap.add_argument(
