@@ -614,6 +614,11 @@ class CollectiveClock:
         outside a decode round (warmup, a prefill piecewise graph) therefore
         invalidates a pending decode round's reading, and the round says so
         by name instead of pricing this replay as its own.
+
+        An open round COLLECTS declarations rather than keeping only the
+        last: a bracketed forward that replays two DIFFERENT graphs has both
+        of their waits, and summing them is the right answer. The same key
+        twice is the case that cannot be summed and is refused by name.
         """
         nodes = self._graphs.get(key)
         if nodes is None:
@@ -630,8 +635,13 @@ class CollectiveClock:
                 # launched. Two different graphs would sum; this cannot, and
                 # overwriting the entry (the shipped form) priced the last
                 # replay and dropped the first without saying so.
+                if not span.graph_key_reused:
+                    # ONE per ROUND, not one per declaration: the counter is
+                    # printed as "rounds that replayed one graph twice", and
+                    # a counter whose unit is not its label is the same
+                    # defect class as a wait of 0.0.
+                    self._graph_key_reuses += 1
                 span.graph_key_reused = True
-                self._graph_key_reuses += 1
                 return
         span.graph_reads.append((nodes, nodes.generation))
 

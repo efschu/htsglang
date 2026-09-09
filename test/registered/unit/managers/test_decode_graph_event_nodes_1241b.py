@@ -572,6 +572,25 @@ class MultiGraphRoundTest(unittest.TestCase):
         self.assertFalse(un["split_known"])
         self.assertEqual(self.h.clock.graph_node_counts[5], 1)
 
+    def test_a_third_declaration_of_one_key_still_counts_ONE_round(self):
+        """The counter is printed as "rounds that replayed one graph
+        twice". Counting declarations instead would make it exceed the round
+        count -- a denominator that cannot be read, which is the defect the
+        whole overhead line exists to prevent."""
+        self.h.capture("k8", ["tp.all_reduce"])
+        self.h.log.begin_round(round_id=1, bs=6, rows=24)
+        with self.h.log.segment("decode", graphed=True):
+            for ms in (1.0, 9.0, 4.0):
+                self.h.clock.note_graph_replay("k8")
+                self.h.replay("k8", [ms])
+            self.h.state.advance(5.0)
+        self.h.ready_now()
+        self.h.log.end_round()
+
+        un = parse_unsplit_line("[2026-09-09 00:00:00 TP1] " + self.lines()[0])
+        self.assertEqual(un["reason"], "graph-replay-key-replayed-twice")
+        self.assertEqual(self.h.clock.graph_node_counts[5], 1)
+
 
 class RunnerGraphKeyTest(unittest.TestCase):
     """The clock's registry is process-global; a ShapeKey is not (finding 1).
