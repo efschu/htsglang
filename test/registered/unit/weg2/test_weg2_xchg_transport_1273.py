@@ -187,6 +187,16 @@ class FakeDeviceOps(tp.DeviceOps):
     def destroy_stream(self, stream: int) -> None:
         self._streams.pop(stream, None)
 
+    def pending_total(self) -> int:
+        """How many issued copies have not executed yet.
+
+        The fake defers every copy to ``synchronize``, so this is the
+        honest reading of 'bytes issued but not landed' -- the quantity
+        the whole ``bytes_filled`` handshake exists to keep out of a
+        consumer's hands.
+        """
+        return sum(len(q) for q in self._streams.values())
+
     def synchronize(self, stream: int) -> None:
         queued = self._streams.get(stream, [])
         if self.drop_last_copy and queued:
@@ -436,6 +446,61 @@ def test_short_piece_is_refused_by_the_consumer(region, sems, ops):
     assert "lane=cross" in message
     assert ops.issued == before, "W54 must precede the first copy, not follow it"
     assert read(ops, dst, len(payload)) != payload
+
+
+def test_bytes_filled_is_published_only_after_the_sync(region, sems, ops):
+    """``bytes_filled`` must mean "these bytes have LANDED", not "were issued".
+
+    ADDED AFTER A SURVIVING MUTANT.  Swapping ``synchronize`` and ``publish``
+    in :func:`tp.run_producer_pair` killed NOTHING in the first mutant round:
+    every test reached the slot through ``sem_post(full)``, which still came
+    after the sync, so the suite was proving ``sync -> post`` and had never
+    looked at ``sync -> publish``.  That is #802 rule 2 exactly -- the number
+    the consumer copies must be a post-sync fact -- and S5's shadow will read
+    the slot record's ``checksum`` field without the semaphore at all, at which
+    point the untested half becomes the load-bearing one.
+
+    The assertion is behavioural, not structural: at the instant ``publish`` is
+    called, the fake must hold ZERO issued-but-unexecuted copies.
+    """
+    pair = xr.pair_id(0, 1)
+    payload = pattern(41, 6000)          # 2 batches at SLOT, so no consumer
+    src, dst = dev_ptr(0, 0), dev_ptr(1, 0)
+    write(ops, src, payload)
+    descs = [flat_desc(0, 1, len(payload), src_ptr=src, dst_ptr=dst)]
+    assert len(tp.batch_descs(descs, SLOT)) == 2
+
+    pending_at_publish: list = []
+    real_publish = region.publish
+
+    def spy(pair_, slot_, nbytes, **kw):
+        pending_at_publish.append(ops.pending_total())
+        return real_publish(pair_, slot_, nbytes, **kw)
+
+    region.publish = spy
+    try:
+        tp.run_producer_pair(region, sems, ops, ops.create_stream(0), pair=pair,
+                             descs=descs, stats=tp.PairStats(0, 1, "a", "b"),
+                             budget_s=2.0, slot_bytes=SLOT)
+    finally:
+        del region.publish
+    assert len(pending_at_publish) == 2
+    assert pending_at_publish == [0, 0], (
+        "publish ran with copies still unexecuted -- bytes_filled would then "
+        f"mean 'issued', not 'landed': {pending_at_publish}")
+
+    # Independent second guard, in case a future edit moves the sync into a
+    # helper the fake cannot see: the three statements in that order, by AST.
+    body = ast.parse(inspect.getsource(tp.run_producer_pair).lstrip()).body[0]
+    order = []
+    for node in ast.walk(body):
+        if not isinstance(node, ast.Call):
+            continue
+        name = getattr(node.func, "attr", None)
+        if name in ("synchronize", "publish", "post"):
+            order.append((node.lineno, name))
+    order = [n for _l, n in sorted(order)]
+    assert order[-3:] == ["synchronize", "publish", "post"], order
 
 
 def test_consumer_never_reads_an_unposted_slot(region, sems, ops):
