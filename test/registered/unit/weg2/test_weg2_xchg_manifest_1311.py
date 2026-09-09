@@ -492,6 +492,41 @@ def test_the_voted_class_set_now_comes_from_the_agreed_inventory(
 # FINDING 2 -- the source hook's refusal, and the lane that was never wired.
 # ---------------------------------------------------------------------------
 
+def test_the_adapter_reconciles_the_manifest_before_it_derives_the_plan():
+    """THE WIRING, pinned by SOURCE -- and it was a MEASURED gap.
+
+    A mutant that dropped ``agreed=agreed, require_agreement=True`` from the
+    adapter survived the whole of this file: every behaviour test above drives
+    :func:`derive_leg_plan` directly, so an adapter that stopped asking would
+    put every boot back on the rank-local digest with all 21 green.  That is
+    the seam a wiring defect is invisible from both sides of, and it is pinned
+    here by name.
+
+    THE ORDER IS PART OF THE PIN.  The plan is narrowed by the agreement, so
+    the reconciliation has to happen BEFORE the derivation -- not inside
+    ``run_leg_hook`` where the region is opened for the transport, which is one
+    call too late.
+    """
+    import inspect
+
+    from sglang.srt.managers.scheduler_components import weight_updater as wu
+
+    plan_src = inspect.getsource(wu.SchedulerWeightUpdaterManager._weg2_shadow_plan)
+    assert "agreed=agreed" in plan_src
+    assert "require_agreement=True" in plan_src, (
+        "without it a leg whose peer has not published falls back to this "
+        "rank's own inventory -- the rank-local derivation W80 came from")
+    hook = inspect.getsource(wu.SchedulerWeightUpdaterManager._weg2_shadow_hook)
+    assert "_weg2_shadow_manifest(" in hook
+    assert hook.index("_weg2_shadow_manifest(") < hook.index(
+        "_weg2_shadow_plan("), "the agreement must precede the derivation"
+    rec = inspect.getsource(wu.SchedulerWeightUpdaterManager._weg2_shadow_manifest)
+    assert "reconcile_card_manifest" in rec
+    assert "derive_card_manifest" in rec
+    assert "_weg2_shadow_manifest_cache" in rec, (
+        "the manifest is a boot constant and must not be re-derived per leg")
+
+
 def test_the_product_already_asks_for_the_deposit_so_the_arm_is_the_root():
     """THE ROOT OF THE 24 REFUSALS IS THE ARM, not a missing argument.
 
