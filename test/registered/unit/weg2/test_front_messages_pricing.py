@@ -386,3 +386,139 @@ def test_stream_options_are_not_injected_into_a_messages_body():
 
     src = inspect.getsource(F.Front.leg2)
     assert 'request.path != "/v1/messages"' in src
+
+
+# --------------------------------------------------------------------------
+# 4. the re-route lookahead (Q0-B round 2, boot weg2sn5m)
+# --------------------------------------------------------------------------
+#
+# MEASURED KILLER: the long Claude-Code body routed CARRIER-EXCEEDS to a D
+# single prefill, D refused it by name (W50 Weg2TpPrefillExceeded, extent
+# 17387 > X=8742), and the front could not re-route because:
+#   - non-stream: entrypoints/anthropic/serving.py collapsed the
+#     HTTPException(503, "W50 ...") into 500 "Internal server error",
+#     destroying BOTH halves of is_x_refusal's test;
+#   - stream: `message_start` is ALWAYS the first Anthropic event, so the
+#     one-chunk lookahead never saw the `error` event that followed it.
+# Front log of that boot: "W50 Weg2TpPrefillExceeded rid=weg2-0-5 (STREAM,
+# served): D refused this request by name after the first byte -- re-route
+# impossible", client got 200 with 0 chars of text.
+
+
+class _FakeContent:
+    def __init__(self, chunks):
+        self._chunks = list(chunks)
+
+    def iter_any(self):
+        chunks = self._chunks
+
+        class _It:
+            def __aiter__(self_inner):
+                return self_inner
+
+            async def __anext__(self_inner):
+                if not chunks:
+                    raise StopAsyncIteration
+                return chunks.pop(0)
+
+        return _It()
+
+
+class _FakeResp:
+    def __init__(self, chunks):
+        self.content = _FakeContent(chunks)
+
+
+def _run(coro):
+    import asyncio
+
+    return asyncio.new_event_loop().run_until_complete(coro)
+
+
+def test_lookahead_finds_a_refusal_that_follows_message_start():
+    """THE measured case: the refusal is the SECOND event, never the first."""
+    chunks = [
+        _sse("message_start", {"type": "message_start",
+                               "message": {"usage": {"input_tokens": 17387, "output_tokens": 0}}}),
+        _sse("error", {"type": "error", "error": {
+            "type": "overloaded_error",
+            "message": "W50 Weg2TpPrefillExceeded: this group may prefill at most 8742 "
+                       "uncached tokens itself; this request's extent after prefix "
+                       "matching is 17387. Refused by name"}}),
+        _sse("message_stop", {"type": "message_stop"}),
+    ]
+    head, refused = _run(F._anthropic_refusal_lookahead(_FakeResp(chunks)))
+    assert refused is True
+    assert F.X_REFUSAL_MARKER.encode() in head
+    # the one-chunk instrument it replaces genuinely misses it: the first
+    # chunk alone carries no marker (mutation-proof in situ)
+    assert F.x_refusal_marker_in(chunks[0].decode()) is False
+
+
+def test_lookahead_stops_at_the_first_content_event():
+    """A healthy stream must not be buffered past the start of generation."""
+    chunks = [
+        _sse("message_start", {"type": "message_start",
+                               "message": {"usage": {"input_tokens": 10, "output_tokens": 0}}}),
+        _sse("content_block_start", {"type": "content_block_start", "index": 0,
+                                     "content_block": {"type": "text", "text": ""}}),
+        _sse("content_block_delta", {"type": "content_block_delta", "index": 0,
+                                     "delta": {"type": "text_delta", "text": "hello"}}),
+    ]
+    head, refused = _run(F._anthropic_refusal_lookahead(_FakeResp(list(chunks))))
+    assert refused is False
+    # it stopped at content_block_start: the third chunk was never consumed
+    assert b"hello" not in head
+
+
+def test_lookahead_is_bounded_and_forwards_what_it_read():
+    """Nothing is dropped: the head is returned for verbatim forwarding."""
+    chunks = [_sse("ping", {"type": "ping"}) for _ in range(50)]
+    head, refused = _run(F._anthropic_refusal_lookahead(_FakeResp(chunks)))
+    assert refused is False
+    assert len(head) > 0
+    # Bounded by chunk count, not by the producer. Two things are asserted
+    # against LITERALS, deliberately: comparing to
+    # F.ANTHROPIC_LOOKAHEAD_MAX_CHUNKS would be self-referential -- a mutant
+    # that removes the bound also moves the yardstick, and the test passes
+    # while the front buffers an unbounded stream (measured: that mutant
+    # survived until this line was rewritten).
+    # Count EVENTS, not the substring "ping": each _sse() frame carries the
+    # name twice (the `event:` line and the `type` field).
+    n = head.count(b"event: ping")
+    assert n < 50, "the lookahead consumed the whole stream instead of bounding it"
+    assert n <= 8, "the shipped bound is 8 chunks"
+    assert F.ANTHROPIC_LOOKAHEAD_MAX_CHUNKS == 8
+
+
+def test_lookahead_handles_an_empty_stream():
+    head, refused = _run(F._anthropic_refusal_lookahead(_FakeResp([])))
+    assert head is None and refused is False
+
+
+def test_openai_wire_still_uses_the_one_chunk_test():
+    import inspect
+
+    src = inspect.getsource(F.Front.leg2)
+    assert 'if request.path == "/v1/messages":' in src
+    assert "_anthropic_refusal_lookahead(r)" in src
+    assert "_first_stream_chunk(r)" in src  # the OpenAI branch survives
+
+
+def test_anthropic_serving_preserves_an_httpexception_status_and_detail():
+    """The non-stream half: a 503 refusal must not become a 500.
+
+    ``is_x_refusal`` needs BOTH the 503 status and the exception NAME; the
+    generic ``except Exception`` branch destroyed both and the front served
+    the client a 500 for a request the rig can serve.
+    """
+    import inspect
+
+    from sglang.srt.entrypoints.anthropic import serving as S
+
+    src = inspect.getsource(S.AnthropicServing._handle_non_streaming)
+    assert "except HTTPException as e:" in src
+    assert "status_code=e.status_code" in src
+    assert "message=detail" in src
+    # and it must sit ABOVE the generic branch or it never runs
+    assert src.index("except HTTPException as e:") < src.index("except Exception as e:")

@@ -875,6 +875,57 @@ async def _first_stream_chunk(r) -> Optional[bytes]:
     return None
 
 
+#: Q0-B: how far past the envelope the re-route lookahead may read on the
+#: Anthropic wire, before it gives up and commits the stream to the client.
+#: Bounded in BOTH dimensions so a well-behaved stream can never be delayed
+#: by more than one small envelope: the refusal, when it comes, is the event
+#: immediately after ``message_start``.
+ANTHROPIC_LOOKAHEAD_MAX_CHUNKS = 8
+ANTHROPIC_LOOKAHEAD_MAX_BYTES = 65536
+#: The events that mean "generation has actually begun". Reaching one of
+#: these ends the lookahead: from here on there is content to lose, so the
+#: stream is committed and a later refusal is counted by name (W50), exactly
+#: as it is on the OpenAI wire.
+ANTHROPIC_CONTENT_MARKERS = (b"content_block_delta", b"content_block_start")
+
+
+async def _anthropic_refusal_lookahead(r) -> Tuple[Optional[bytes], bool]:
+    """(buffered head, refused) for a streamed Anthropic leg 2.
+
+    Q0-B, measured 2026-09-09 on boot weg2sn5m: ``_first_stream_chunk`` above
+    is calibrated for the OPENAI wire, where a request refused at admission
+    is aborted before it decodes anything, so the refusal IS the first chunk.
+    On the ANTHROPIC wire it structurally CANNOT be: ``message_start`` is
+    always emitted first, carrying the id, model and input usage, and the
+    ``error`` event follows it. The one-chunk test therefore saw
+    ``message_start``, found no marker, committed the response, and the
+    refusal arrived after the first byte -- where re-routing is impossible.
+    Measured shape of that boot: ``events={'message_start': 1, 'error': 1,
+    'message_stop': 1}``, 0 chars of text, front logged
+    ``W50 ... (STREAM, served) ... re-route impossible``.
+
+    So the decision this lookahead has to make is not "is the FIRST CHUNK a
+    refusal" but "does the refusal arrive before the first CONTENT" -- and on
+    a wire whose envelope precedes its content, those differ by exactly one
+    event. Everything read here is returned and forwarded verbatim, so the
+    client sees a byte-identical stream either way; the only cost on the
+    happy path is buffering one envelope.
+    """
+    head = bytearray()
+    for _ in range(ANTHROPIC_LOOKAHEAD_MAX_CHUNKS):
+        chunk = await _first_stream_chunk(r)
+        if chunk is None:
+            break
+        head.extend(chunk)
+        if x_refusal_marker_in(bytes(head).decode(errors="replace")):
+            return bytes(head), True
+        if any(m in head for m in ANTHROPIC_CONTENT_MARKERS):
+            break
+        if len(head) >= ANTHROPIC_LOOKAHEAD_MAX_BYTES:
+            break
+    return (bytes(head) if head else None), False
+
+
 def witness_verdict(front_outstanding: int, rank_idle: bool) -> Optional[str]:
     """W3 in either direction; None when the two witnesses agree."""
     if front_outstanding == 0 and rank_idle:
@@ -2728,10 +2779,21 @@ class Front:
                     # the refusal IS the first chunk -- reading it costs one
                     # chunk of head-of-line latency (the client sees nothing
                     # before the first token anyway) and buys the re-route.
-                    first_chunk = await _first_stream_chunk(r)
-                    if first_chunk is not None and x_refusal_marker_in(
-                        first_chunk.decode(errors="replace")
-                    ):
+                    #
+                    # Q0-B: ...on the OPENAI wire. The Anthropic wire always
+                    # sends `message_start` first, so the refusal is never the
+                    # first chunk there and this test saw only the envelope
+                    # (measured, boot weg2sn5m). Read to the first CONTENT
+                    # event instead, bounded; everything read is forwarded
+                    # verbatim below.
+                    if request.path == "/v1/messages":
+                        first_chunk, _refused = await _anthropic_refusal_lookahead(r)
+                    else:
+                        first_chunk = await _first_stream_chunk(r)
+                        _refused = first_chunk is not None and x_refusal_marker_in(
+                            first_chunk.decode(errors="replace")
+                        )
+                    if _refused:
                         self.counters["W50_stream_inband_requeued"] += 1
                         g.outstanding.pop(rid, None)
                         return await self._requeue_after_x_refusal(

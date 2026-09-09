@@ -12,7 +12,7 @@ import logging
 import uuid
 from typing import TYPE_CHECKING, Any, AsyncGenerator, Optional, Union
 
-from fastapi import Request
+from fastapi import HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ValidationError
 
@@ -992,6 +992,34 @@ class AnthropicServing:
             )
         except asyncio.CancelledError:
             raise
+        except HTTPException as e:
+            # Q0-B, measured 2026-09-09 on boot weg2sn5m: a scheduler refusal
+            # travels this way -- `tokenizer_manager` raises
+            # ``HTTPException(503, detail="W50 Weg2TpPrefillExceeded: ...")``
+            # for a NON-streamed request -- and the generic branch below
+            # turned it into ``500 "Internal server error"``. That is wrong
+            # twice over. (1) 503 (overloaded, retryable) and 500 (a server
+            # bug) mean different things to every client, including the
+            # Anthropic SDKs, which map them to different typed errors.
+            # (2) The weg2 front recognises D's refusal by STATUS 503 *and*
+            # the exception NAME in the body (``weg2/front.py`` is_x_refusal
+            # / X_REFUSAL_MARKER); the generic branch destroyed BOTH, so the
+            # front could not re-route the request through P and the caller
+            # got a 500 for a request the rig can serve perfectly well.
+            #
+            # Passing ``detail`` through does NOT weaken the 5xx scrub
+            # policy: that policy exists for raw ``str(e)`` payloads (stack
+            # frames, paths, PII), whereas an HTTPException detail is text
+            # the raising code AUTHORED for the client. The scrub still
+            # governs every other exception type, which is the whole
+            # population it was written for.
+            detail = e.detail if isinstance(e.detail, str) else str(e.detail)
+            return self._error_response(
+                status_code=e.status_code,
+                error_type=ERROR_TYPE_MAP.get(e.status_code, "api_error"),
+                message=detail,
+                exception_name=type(e).__name__,
+            )
         except Exception as e:
             logger.exception("Error processing Anthropic request: %s", e)
             return self._error_response(
