@@ -53,6 +53,7 @@ from __future__ import annotations
 import ctypes
 import os
 import struct
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
@@ -1509,12 +1510,31 @@ def plan_for_leg(direction: str, leg: int, rank: int) -> Sequence[object]:
 # The leg's own shadow: created at leg start, closed at leg end.
 # ---------------------------------------------------------------------------
 
-#: The ONE shadow run this process owns, or ``None``.  A module-level slot and
-#: not a scheduler attribute, because the thing it guards against is a run that
-#: OUTLIVES the object that made it: a leg that raised between the allocation
-#: and the close leaves a raw ``cudaMalloc`` alive for the life of the boot on
-#: the tight card, which is refuter must_fix 3 one scope up.
-_ACTIVE_LEG: Optional["ShadowLeg"] = None
+#: The ONE shadow run the CALLING THREAD owns, or ``None``.  A module-level
+#: slot and not a scheduler attribute, because the thing it guards against is a
+#: run that OUTLIVES the object that made it: a leg that raised between the
+#: allocation and the close leaves a raw ``cudaMalloc`` alive for the life of
+#: the boot on the tight card, which is refuter must_fix 3 one scope up.
+#:
+#: THREAD-LOCAL, and the reason is the ownership rule and not convenience: the
+#: leg is owned by the thread that runs it.  In the product that is the
+#: scheduler's own thread, one per RANK PROCESS, so the two hooks of one flip
+#: are two processes and a process-wide slot would be the same thing.  A
+#: process-wide slot is strictly WRONG, though, wherever a second leg shares
+#: the interpreter -- this round's own two-sided test, and any future caller
+#: that runs a leg off the scheduler thread: the second leg adopted the slot
+#: and CLOSED the first one out from under itself, which presented as a gate
+#: expiry ("only n/6 ranks published") five seconds inside a flip.  A stale run
+#: carried across FLIPS is the same thread and is still caught.
+_ACTIVE = threading.local()
+
+
+def _active_leg() -> Optional["ShadowLeg"]:
+    return getattr(_ACTIVE, "leg", None)
+
+
+def _set_active_leg(leg: Optional["ShadowLeg"]) -> None:
+    _ACTIVE.leg = leg
 
 
 @dataclass(frozen=True)
@@ -1598,21 +1618,19 @@ class ShadowLeg:
     # -- lifetime ---------------------------------------------------------
 
     def adopt(self) -> "ShadowLeg":
-        """Become the process's active run, closing a stale one BY NAME."""
-        global _ACTIVE_LEG
-        stale = _ACTIVE_LEG
+        """Become this thread's active run, closing a stale one BY NAME."""
+        stale = _active_leg()
         if stale is not None and stale is not self:
             self.log(rank_local_skip_message(
                 reason="stale-run", rank=self.inputs.rank,
                 leg=self.inputs.leg, epoch=self.inputs.epoch,
                 detail=f"previous={stale.token}"))
             stale.close(owner=stale.token)
-        _ACTIVE_LEG = self
+        _set_active_leg(self)
         return self
 
     def close(self, *, owner: str) -> bool:
         """Free everything this run owns.  ``False`` when the caller is not it."""
-        global _ACTIVE_LEG
         if owner != self.token:
             return False
         if self.closed:
@@ -1631,8 +1649,8 @@ class ShadowLeg:
                 obj.close()
             except BaseException:  # noqa: BLE001 -- an observer's unwind
                 pass
-        if _ACTIVE_LEG is self:
-            _ACTIVE_LEG = None
+        if _active_leg() is self:
+            _set_active_leg(None)
         return True
 
     # -- attach -----------------------------------------------------------
