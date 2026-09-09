@@ -2992,11 +2992,13 @@ def chunked(monkeypatch):
     return ms
 
 
-def _derive(hook="source", *, rank=0, group="P", model=None, **kw):
-    return sh.derive_leg_plan(hook=hook, group=group,
-                              peer=("D" if group == "P" else "P"), rank=rank,
-                              model=model if model is not None else _sb4_model(),
-                              **kw)
+_DEFAULT_MODEL = object()
+
+
+def _derive(hook="source", *, rank=0, group="P", model=_DEFAULT_MODEL, **kw):
+    return sh.derive_leg_plan(
+        hook=hook, group=group, peer=("D" if group == "P" else "P"), rank=rank,
+        model=_sb4_model() if model is _DEFAULT_MODEL else model, **kw)
 
 
 # --- the derivation reads producers, never a hand list ---------------------
@@ -3200,8 +3202,8 @@ def test_a_rank_reading_a_different_boot_configuration_diverges(chunked):
     from sglang.srt.weg2 import weight_exchange as wx
 
     variants = {
-        "chunk geometry": dict(chunk_geometry=lambda: (16, 4)),
-        "chunk count": dict(chunk_geometry=lambda: (8, 3)),
+        "layers per chunk": dict(chunk_geometry=lambda: (16, 4)),
+        "the card vector": dict(n_cards=2),
         "class rotation": dict(model=_FakeModel([
             ("model.layers.0.mlp.down_proj.weight", _FakeParam(32, 32))])),
         "wave partition": dict(waves_of=lambda t, m, c: [
@@ -3211,6 +3213,24 @@ def test_a_rank_reading_a_different_boot_configuration_diverges(chunked):
         other, why = _derive(**kw)
         assert other is not None, (what, why)
         assert other.facts.digest != base.facts.digest, what
+    assert wx.derive_waves is not None  # the producer this reads is the real one
+
+
+def test_two_readers_of_the_chunk_geometry_that_disagree_are_refused(chunked):
+    """The derivation has TWO readers of the same fact, and they can drift.
+
+    ``weight_chunk_geometry()`` answers "how many chunks does this boot have",
+    and ``tag_of_parameter_name`` answers "which chunk is THIS parameter in" --
+    and the second reads the environment for itself.  A rank whose two readers
+    disagree (a mid-boot environment change, a stale injection) would plan a
+    tag the family does not contain, which is the same silent shape as the
+    stale wave map.  It is refused by name, and this is where that is proven,
+    because it is not obvious from either producer alone.
+    """
+    plan, reason = _derive(chunk_geometry=lambda: (8, 3))
+    assert plan is None
+    assert reason.startswith("tag-not-in-family:"), reason
+    assert "weights_3" in reason
 
 
 def test_a_divergent_plan_is_a_named_refusal_and_never_a_vote(region):
@@ -3457,9 +3477,10 @@ def test_the_block_on_slot_drain_is_measured_and_printed(region, tmp_path,
                    classes_hash=sh.classes_hash(["down_proj"]), need_mib=0)
         lines = []
         result = sh.run_leg_hook(
-            _inputs(sh.HOOK_SOURCE, row=0, peer_row=3), log=lines.append,
+            _inputs(sh.HOOK_SOURCE, row=0, peer_row=3, gate_rows=(0, 1, 2)),
+            log=lines.append,
             descs=descs, region=region, sems=sems, ops=ops, armed=True,
-            gate_rows=(0, 1, 2), slot_bytes=SLOT, stripe_bytes=1 << 20,
+            slot_bytes=SLOT, stripe_bytes=1 << 20,
             budget_s=0.4, hook_budget_s=3.0, oncard_slot_bytes=SLOT)
     finally:
         ops.close()
