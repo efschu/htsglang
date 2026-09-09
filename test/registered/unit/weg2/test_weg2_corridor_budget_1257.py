@@ -36,6 +36,27 @@ could quietly do harm:
       load transient (M4).  M5 pins the missing-input path to byte-identical
       budgets, because a silent default there is the same lie with no line at
       all.
+
+M6 AND M7 were added by the refuter pass (2026-09-09) and are the same danger
+direction reached by two SILENT routes rather than a wrong number:
+
+  M6. The re-solved world pool cannot be priced (the runtime's own
+      ``partition_units`` unimportable in this process).  The first draft then
+      fell back to the FIXED-vector check alone and APPLIED the cut -- a
+      constraint satisfied on paper, on the one input that is derived rather
+      than read.  It must refuse instead, and M6 pins both halves: APPLIED
+      while the pool is priceable, REFUSED-UNPRICED-POOL when it is not.
+  M7. The sample's rows are paired with this boot's cards BY UUID, but the
+      token vector is positional.  If NVML enumeration order shifted between
+      the sample's boot and this one, the pool and the binder come out
+      plausible and belong to the wrong cards.  M7 shifts it and requires an
+      UNPRICED refusal.
+
+W-CODE: this pass owns W53 and W54.  It shipped as W52 for one revision, which
+#1290 already held at the base commit; the collision census could not see that
+claim because #1290 writes the code in two whitespace-free forms.  Both the
+label and the census are fixed in the same commit -- see
+``test_weg2_wcode_uniqueness_1263.py``, which now reads all three forms.
 """
 
 import ast
@@ -211,7 +232,12 @@ class TheInstrumentReproducesTheMetal(CustomTestCase):
         units = list(partition_units(64, caps))
         g = _m.gcd(*units)
         self.assertEqual([u // g for u in units], SB5F_VECTOR)
-        self.assertEqual(cb._resolved_world_pool(caps), SB5F_WORLD_POOL)
+        # (pool, why): the reason half is load-bearing -- an unpriceable pool
+        # must REFUSE a cut rather than fall back to the fixed-vector check
+        # (M6), so the helper has to say why it could not price it.
+        pool, why = cb._resolved_world_pool(caps)
+        self.assertEqual(pool, SB5F_WORLD_POOL)
+        self.assertIsNone(why, "a priceable pool carries no refusal reason")
 
 
 class TheCorridorIsCheckedAtAll(CustomTestCase):
@@ -248,7 +274,7 @@ class TheCorridorIsCheckedAtAll(CustomTestCase):
         cards, budgets, dormant = sb5f_boot()
         solve = cb.solve_corridor_budgets(cards, budgets, dormant, sb5f_sample())
         line = line_for(solve, SB5F_UUID_5090)
-        self.assertIn("W53 Weg2CorridorBudgetWouldBind", line)
+        self.assertIn(cb.WOULD_BIND_NAME, line)
         self.assertEqual(field(line, "shortfall_mib"), "550")
         self.assertEqual(field(line, "cut_mib"), "552")
         self.assertEqual(field(line, "would_be_free_mib"), "1026")
@@ -391,10 +417,86 @@ class MutantsOnTheDangerDirection(CustomTestCase):
                 "only the honest instrument reproduces the sampler",
             )
 
+    def test_mutant_6_an_unpriceable_resolved_pool_refuses_the_cut(self):
+        """M6: the silent-degradation route to the danger direction.
+
+        ``_resolved_world_pool`` returns None when the runtime's own
+        ``partition_units`` is not importable in this process. The first draft
+        then evaluated ``shrinks_resolved`` as False and applied the cut under
+        the FIXED-vector check alone -- but the runtime RE-SOLVES the vector at
+        boot, and under a re-solved vector every rank is near-binding, so a cut
+        the fixed check calls free can still shrink the pool actually served.
+
+        GREEN-THEN-RED in one test, on the same fixture: with the pool
+        priceable the non-binding breacher is APPLIED (that is M1b), and with
+        the pool unpriceable the SAME input must refuse and leave the budget
+        byte-identical."""
+        cards, budgets, dormant = sb5f_boot()
+        s = sb5f_sample()
+        big = replace(s.by_uuid[SB5F_UUID_5090], profiled_tokens=600000)
+        s2 = replace(s, cards=(big,) + s.cards[1:])
+
+        green = cb.solve_corridor_budgets(cards, budgets, dormant, s2)
+        self.assertEqual(field(line_for(green, SB5F_UUID_5090), "verdict"),
+                         "APPLIED", "premise: this cut IS taken when priceable")
+        self.assertEqual(list(green.budgets), [28800, 18136, 18120])
+
+        real = cb._resolved_world_pool
+        cb._resolved_world_pool = lambda caps: (
+            None, "simulated: the runtime's vector solver is not importable"
+        )
+        try:
+            red = cb.solve_corridor_budgets(cards, budgets, dormant, s2)
+        finally:
+            cb._resolved_world_pool = real
+        line = line_for(red, SB5F_UUID_5090)
+        self.assertEqual(field(line, "verdict"), "REFUSED-UNPRICED-POOL")
+        self.assertEqual(field(line, "budget_mib"), "29352->29352")
+        self.assertIn(cb.UNPRICED_NAME, line)
+        self.assertIn("not importable", line, "the refusal names WHY")
+        self.assertEqual(list(red.budgets), budgets,
+                         "an unpriceable danger direction leaves every budget "
+                         "byte-identical -- it does not fall back to the "
+                         "fixed-vector check")
+
+    def test_mutant_7_a_shifted_card_order_is_unpriced_not_mispaired(self):
+        """M7: the sample's rows pair with this boot's cards by uuid, but the
+        token vector is POSITIONAL. NVML enumeration order can shift between
+        boots on this rig, and a shifted pairing does not fail loudly -- it
+        prices a perfectly plausible pool and binder for the wrong cards.
+
+        The mutation is the shift itself: the same three measured rows, with
+        the world_rank column of two of them swapped, as a boot that
+        re-enumerated would produce. The pass must refuse, not re-sort: if the
+        two boots disagree about which card is rank 0, the residue and
+        transient measured on the other boot are not this boot's either."""
+        cards, budgets, dormant = sb5f_boot()
+        s = sb5f_sample()
+        shifted = replace(
+            s,
+            cards=(
+                replace(s.cards[0], world_rank=2),
+                s.cards[1],
+                replace(s.cards[2], world_rank=0),
+            ),
+        )
+        solve = cb.solve_corridor_budgets(cards, budgets, dormant, shifted)
+        self.assertEqual(list(solve.budgets), budgets,
+                         "the budget must stand byte-identical")
+        self.assertEqual(len(solve.lines), 1)
+        self.assertIn(cb.UNPRICED_NAME, solve.lines[0])
+        self.assertIn("world_rank", solve.lines[0])
+        self.assertIn("ordinal 0", solve.lines[0], "the line names the ordinal")
+        self.assertIsNotNone(solve.unpriced_reason)
+        # ...and the honest ordering still prices, so this is the SHIFT being
+        # detected and not the check refusing everything.
+        ok = cb.solve_corridor_budgets(cards, budgets, dormant, s)
+        self.assertIsNone(ok.unpriced_reason)
+
     def test_mutant_5_missing_inputs_must_not_produce_a_default_budget(self):
         """M5: the silent-default shape. No sample, an unreadable one, an
         incomplete one and one that does not cover this boot's cards must ALL
-        leave the budgets byte-identical and say W52 -- never quietly ship a
+        leave the budgets byte-identical and say W54 -- never quietly ship a
         number nobody measured, and never let the absence of a corridor line
         read as a satisfied corridor."""
         cards, budgets, dormant = sb5f_boot()
@@ -423,7 +525,7 @@ class MutantsOnTheDangerDirection(CustomTestCase):
             self.assertEqual(list(solve.budgets), budgets,
                              "the budget must stand byte-identical")
             self.assertEqual(len(solve.lines), 1)
-            self.assertIn("W52 Weg2CorridorBudgetUnpriced", solve.lines[0])
+            self.assertIn(cb.UNPRICED_NAME, solve.lines[0])
             self.assertIn("REFUSED TO PRICE", solve.lines[0])
             self.assertIsNotNone(solve.unpriced_reason)
 
@@ -433,7 +535,7 @@ class MutantsOnTheDangerDirection(CustomTestCase):
         partial = replace(s, cards=s.cards[:2], token_vector=(17, 7))
         solve = cb.solve_corridor_budgets(cards, budgets, dormant, partial)
         self.assertEqual(list(solve.budgets), budgets)
-        self.assertIn("W52 Weg2CorridorBudgetUnpriced", solve.lines[0])
+        self.assertIn(cb.UNPRICED_NAME, solve.lines[0])
         self.assertIn("no row for card", solve.lines[0])
 
 

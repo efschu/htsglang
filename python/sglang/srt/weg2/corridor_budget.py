@@ -57,11 +57,34 @@ recomputing C, and where C would shrink it REFUSES BY NAME with both numbers
 and keeps the budget byte-identical.  Trading world pool for corridor margin is
 the operator's decision, not a solver's.
 
-MISSING INPUTS ARE A REFUSAL, NOT A DEFAULT.  With no paired sample -- or one
-that does not cover every card of this boot -- the pass prints
-``W52 Weg2CorridorBudgetUnpriced`` and returns the launcher's budgets
-unchanged, byte for byte.  A boot must never silently get a budget that was
-priced off numbers nobody measured.
+MISSING INPUTS ARE A REFUSAL, NOT A DEFAULT.  Four separate ways this pass can
+fail to know something all land on the same answer -- the launcher's budgets,
+byte for byte, and a line saying which one it was: no paired sample; a sample
+that does not cover every card of this boot; a sample whose rows do not pair
+with this boot's card ordinals (below); and a world pool this boot cannot
+price (below).  A boot must never silently get a budget that was priced off
+numbers nobody measured.
+
+THE ROWS ARE PAIRED BY ORDINAL, SO THE PAIRING IS CHECKED.  Capacities are
+ordered by THIS boot's card ordinals (by uuid), but the token vector is a
+POSITIONAL list, so ``vec[i]`` only belongs to ``order[i]`` while the sample's
+own ``world_rank`` column agrees with the ordinal.  NVML enumeration order can
+shift between boots on this rig -- the project's own standing warning -- and a
+shifted pairing would not fail loudly, it would compute a plausible pool and a
+plausible binder for the wrong cards.  Hence an explicit check, and a refusal
+when it does not hold.
+
+THE W-CODE IS W54 AND WAS ENUMERATED, NOT PICKED.  The first draft of this
+module used W52, which #1290 already holds at the base commit: ``front.py:560``
+builds ``NO_ROUTE_NAME`` by concatenating that code with ``NO_ROUTE_MARKER``,
+and the counter keys ``W52_Weg2NoServiceableRoute`` sit at ``front.py:1980``
+and ``:2602``.  The collision census that exists to stop exactly this
+(``test_weg2_wcode_uniqueness_1263.py``) did not see it: its pattern was
+``W<nn>`` + whitespace + ``Weg2<Name>``, and BOTH of #1290's forms hide that
+whitespace -- a quote follows the code in the concatenation, an underscore in
+the counter key.  The census is hardened in the same commit that renumbers
+this, because the blind instrument is the durable half of the defect and the
+label is only this slice's instance of it.
 """
 
 from __future__ import annotations
@@ -71,6 +94,14 @@ import math
 import os
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence, Tuple
+
+#: The two W-codes this pass owns, enumerated against the (hardened) census:
+#: W53 and W54 were free, W52 was NOT -- see the module docstring.  Written as
+#: plain literals rather than a bare code concatenated with a marker constant,
+#: because that concatenated form is precisely what hid #1290's claim from the
+#: census for a whole slice.
+UNPRICED_NAME = "W54 Weg2CorridorBudgetUnpriced"
+WOULD_BIND_NAME = "W53 Weg2CorridorBudgetWouldBind"
 
 #: The corridor law's verdict constant, MiB of NVML free-v2 per card under the
 #: awake group's load.  The band is 819-1229; 1024 is the number a verdict is
@@ -275,7 +306,9 @@ def _world_pool(caps: Sequence[int], vec: Sequence[int]) -> Tuple[int, int]:
     return units[binder] * int(sum(vec)), binder
 
 
-def _resolved_world_pool(caps: Sequence[int]) -> Optional[int]:
+def _resolved_world_pool(
+    caps: Sequence[int],
+) -> Tuple[Optional[int], Optional[str]]:
     """C after the runtime re-solves the vector from these capacities.
 
     Group D ships NO token vector (``d_token_vector_decision`` default), so the
@@ -283,22 +316,36 @@ def _resolved_world_pool(caps: Sequence[int]) -> Optional[int]:
     profiling -- boot weg2sb5f installed ``[17, 7, 8]`` that way.  Under a
     re-solved vector EVERY rank is near-binding by construction, so this is the
     stricter of the two pool predictions and it is why the pass may refuse a
-    cut on a rank the fixed vector calls non-binding.  Returns ``None`` (and
-    the caller says UNPRICED) when the runtime's own helper is not importable
-    -- never a locally reinvented partition."""
+    cut on a rank the fixed vector calls non-binding.
+
+    Returns ``(pool, None)`` or ``(None, why)``.  The reason is not decoration:
+    when this cannot be priced the CALLER MUST REFUSE THE CUT, because the
+    fixed-vector check alone is not the check.  The runtime re-solves the
+    vector at boot from the profiled capacities, and under a re-solved vector
+    every rank is near-binding by construction -- so a cut that the fixed
+    vector calls free can still shrink the pool the boot actually serves.
+    Falling back to the fixed check here would be the exact shape this module
+    exists to refuse: a constraint satisfied on paper.  Never a locally
+    reinvented partition either -- the runtime's own helper or nothing."""
     try:
         from sglang.srt.distributed.utils import partition_units
-    except Exception:
-        return None
+    except Exception as exc:
+        return None, (
+            f"the runtime's own vector solver (sglang.srt.distributed.utils."
+            f"partition_units) is not importable here: {exc}"
+        )
     if any(c <= 0 for c in caps):
-        return None
-    units = list(partition_units(64, list(caps)))
+        return None, f"a rank has no capacity to partition: {list(caps)}"
+    try:
+        units = list(partition_units(64, list(caps)))
+    except Exception as exc:
+        return None, f"partition_units refused these capacities: {exc}"
     if not units or any(u <= 0 for u in units):
-        return None
+        return None, f"partition_units returned {units} for {list(caps)}"
     g = math.gcd(*units) if len(units) > 1 else units[0]
     vec = [u // max(1, g) for u in units]
     pool, _ = _world_pool(caps, vec)
-    return pool
+    return pool, None
 
 
 def solve_corridor_budgets(
@@ -325,7 +372,7 @@ def solve_corridor_budgets(
             budgets=tuple(budgets),
             lines=(
                 f"WEG2-BUDGET corridor-constrained group={group} "
-                f"W52 Weg2CorridorBudgetUnpriced: {why}. law={law_mib} MiB. "
+                f"{UNPRICED_NAME}: {why}. law={law_mib} MiB. "
                 f"REFUSED TO PRICE -- every budget stands byte-identical "
                 f"({','.join(str(b) for b in budgets)} MiB). The corridor is "
                 f"still the law; this boot simply cannot say whether it holds, "
@@ -351,6 +398,28 @@ def solve_corridor_budgets(
         )
 
     order = [by_uuid[c.uuid] for c in cards]
+    # F3. `order` is keyed by uuid, but `vec` is POSITIONAL: vec[i] belongs to
+    # order[i] only while the sample's own world_rank column agrees with this
+    # boot's ordinal. NVML enumeration order can shift between boots on this
+    # rig, and a shifted pairing fails SILENTLY -- it computes a perfectly
+    # plausible pool and binder for the wrong cards. So it is checked, and a
+    # mismatch is unpriced rather than papered over by re-sorting: if the two
+    # boots disagree about which card is rank 0, the residues and transients
+    # measured on the other boot are not this boot's either.
+    mispaired = [
+        f"ordinal {i} ({cards[i].uuid}) carries world_rank "
+        f"{int(order[i].world_rank)} in the sample"
+        for i in range(len(cards))
+        if int(order[i].world_rank) != i
+    ]
+    if mispaired:
+        return solve_corridor_budgets(
+            cards, budgets, dormant_mib, None,
+            "the sample's world_rank column does not pair with this boot's "
+            "card ordinals, so its positional token_vector cannot be trusted "
+            "against these cards: " + "; ".join(mispaired),
+            law_mib, group,
+        )
     vec = list(sample.token_vector)
     tpm = sample.tokens_per_mib
     ratio = sample.budget_return_ratio
@@ -367,7 +436,7 @@ def solve_corridor_budgets(
 
     caps0 = _capacities(budgets, order, tpm)
     pool0, binder0 = _world_pool(caps0, vec)
-    res0 = _resolved_world_pool(caps0)
+    res0, res0_why = _resolved_world_pool(caps0)
 
     working = list(budgets)
     verdicts: List[Tuple[int, str, str]] = []  # (ordinal, verdict, extra)
@@ -395,9 +464,26 @@ def solve_corridor_budgets(
             continue
         caps_t = _capacities(trial, order, tpm)
         pool_t, binder_t = _world_pool(caps_t, vec)
-        res_t = _resolved_world_pool(caps_t)
+        res_t, res_t_why = _resolved_world_pool(caps_t)
+        if res0 is None or res_t is None:
+            # F2. The danger direction is UNPRICEABLE, so the cut does not
+            # happen. Degrading to the fixed-vector check here would apply a
+            # cut whose effect on the pool the boot actually serves nobody
+            # computed -- the module's own law (missing inputs are a refusal)
+            # applied to the one input that is derived rather than read.
+            verdicts.append(
+                (i, "REFUSED-UNPRICED-POOL",
+                 f"{UNPRICED_NAME} shortfall_mib={need} cut_mib={cut} "
+                 f"re-solved world pool unpriceable "
+                 f"({res0_why or res_t_why}); the fixed-vector pool alone is "
+                 f"NOT the check -- the runtime re-solves the vector at boot "
+                 f"and under a re-solved vector every rank is near-binding, so "
+                 f"the budget stands byte-identical rather than take a cut "
+                 f"whose world-pool cost nobody priced")
+            )
+            continue
         shrinks_fixed = pool_t < pool0
-        shrinks_resolved = res0 is not None and res_t is not None and res_t < res0
+        shrinks_resolved = res_t < res0
         if shrinks_fixed or shrinks_resolved:
             which = []
             if shrinks_fixed:
@@ -406,7 +492,7 @@ def solve_corridor_budgets(
                 which.append(f"re-solved-vector {res0}->{res_t}")
             verdicts.append(
                 (i, "REFUSED-WOULD-BIND",
-                 f"W53 Weg2CorridorBudgetWouldBind shortfall_mib={need} "
+                 f"{WOULD_BIND_NAME} shortfall_mib={need} "
                  f"cut_mib={cut} would_be_free_mib={free + int(cut * eff_ratio)} "
                  f"would_shrink_world_pool[{'; '.join(which)}] "
                  f"binder_after={binder_t}. The corridor margin on this card is "
@@ -423,7 +509,7 @@ def solve_corridor_budgets(
 
     caps1 = _capacities(working, order, tpm)
     pool1, binder1 = _world_pool(caps1, vec)
-    res1 = _resolved_world_pool(caps1)
+    res1, _res1_why = _resolved_world_pool(caps1)
 
     lines: List[str] = []
     for i, card in enumerate(cards):

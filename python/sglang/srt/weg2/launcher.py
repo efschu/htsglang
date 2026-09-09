@@ -5864,8 +5864,13 @@ def build_parser() -> argparse.ArgumentParser:
              "capacity; from those the pass derives the two terms the budget "
              "line does not book (unbudgeted awake residue, load transient) and "
              "the world pool C = min_r(P_r // v_r) * sum(v). A missing or "
-             "incomplete file is a REFUSAL TO PRICE (W52), not a default: the "
-             "budgets then ship byte-identical and the log says so.",
+             "incomplete file -- or one whose rows do not pair with this "
+             "boot's card ordinals -- is a REFUSAL TO PRICE "
+             f"({corridor_budget.UNPRICED_NAME}), not a default: the budgets "
+             "then ship byte-identical and the log says so. The code is "
+             "interpolated from the module constant on purpose; a hand-typed "
+             "one here is exactly how front.py:556's 'W52 is free' comment "
+             "outlived the number it described.",
     )
     ap.add_argument(
         "--d-tp-objective", choices=list(D_TP_OBJECTIVE_CHOICES),
