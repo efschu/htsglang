@@ -222,6 +222,21 @@ class FrontFloor(NamedTuple):
     source: str
     verdict_floor_mib: int
 
+    @property
+    def ceiling_mib(self) -> int:
+        """The unmobilised-free edge above this floor.  A FINDING threshold.
+
+        Derived through ``corridor_guard.corridor_ceiling_for_floor_mib`` --
+        the same rule ``CorridorFloor.ceiling_mib`` uses -- so a floor read
+        back off a log and the object that printed it cannot place the edge
+        differently.
+        """
+        from sglang.srt.managers.corridor_guard import (
+            corridor_ceiling_for_floor_mib,
+        )
+
+        return corridor_ceiling_for_floor_mib(self.floor_mib)
+
 
 def parse_front_corridor_floors(path: str) -> Dict[int, FrontFloor]:
     """``{nvml index: FrontFloor}`` from a front log's LAST sample.

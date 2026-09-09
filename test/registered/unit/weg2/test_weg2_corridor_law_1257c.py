@@ -742,6 +742,84 @@ class RefuterFixOneAuthorityOnTheVerdictFloor(unittest.TestCase):
         self.assertIn(f"nvml0=1024/819({cg.FLOOR_SOURCE_FALLBACK})", rep.report())
 
 
+class TheFindingEdgeIsTheBandsOwnCeiling(unittest.TestCase):
+    """The upper edge on a PRE-#1257c log is the band ceiling, not 0.8*0.8.
+
+    ``rep.band_mib`` is (819, 1229) at the stated law.  Re-deriving the edge
+    from the band FLOOR gave 819 * 1.2 = 983, so every card between 983 and
+    1229 MiB -- the middle of the very band those logs passed -- was reported
+    as unmobilised free.  Findings never fail an acceptance, so this was noise
+    and not a wrong verdict; noise in the instrument that grades the boot is
+    how a real finding stops being read.
+    """
+
+    BASE = (
+        "WEG2-CORRIDOR phase=D(awake) epoch=0 "
+        "instrument=nvml_v2_free,allocatable band=819-1229MiB "
+    )
+
+    def _log(self, body):
+        with tempfile.NamedTemporaryFile("w", suffix=".log", delete=False) as fh:
+            fh.write(self.BASE + body + "\n")
+            path = fh.name
+        self.addCleanup(os.unlink, path)
+        return path
+
+    def test_mid_band_on_a_pre_1257c_log_is_not_a_finding(self):
+        from sglang.srt.weg2 import corridor_arm
+
+        rep = corridor_arm.arm_report(
+            self._log(
+                "nvml0:free=1100MiB reserved=425MiB verdict=IN "
+                "min_so_far={0: 1100} (nvml_v2_free,allocatable, MiB)"
+            ),
+            require_in_band=True,
+        )
+        self.assertTrue(rep.ok, rep.problems)
+        self.assertEqual(rep.findings, [])
+
+    def test_above_the_band_ceiling_still_is_one(self):
+        from sglang.srt.weg2 import corridor_arm
+
+        rep = corridor_arm.arm_report(
+            self._log(
+                "nvml0:free=1400MiB reserved=425MiB verdict=ABOVE "
+                "min_so_far={0: 1400} (nvml_v2_free,allocatable, MiB)"
+            ),
+            require_in_band=True,
+        )
+        self.assertTrue(rep.ok)
+        self.assertEqual(len(rep.findings), 1)
+        self.assertIn("unmobilised_free_mib=171", rep.findings[0])
+        self.assertIn("ceiling 1229 MiB", rep.findings[0])
+
+    def test_a_measured_floor_moves_the_edge_with_it(self):
+        from sglang.srt.weg2 import corridor_arm
+
+        rep = corridor_arm.arm_report(
+            self._log(
+                "nvml0:free=1100MiB reserved=425MiB floor=858MiB "
+                "verdict_floor=858MiB source=MEASURED-P reserve=0MiB "
+                "verdict=ABOVE "
+                "min_so_far={0: 1100} (nvml_v2_free,allocatable, MiB)"
+            ),
+            require_in_band=True,
+        )
+        self.assertTrue(rep.ok)
+        self.assertIn("unmobilised_free_mib=70", rep.findings[0])
+        self.assertIn("ceiling 1030 MiB", rep.findings[0])
+
+    def test_the_parser_and_the_object_place_the_edge_identically(self):
+        from sglang.srt.weg2 import ring_table
+
+        for mib, source in ((858, "MEASURED-P"), (1024, cg.FLOOR_SOURCE_FALLBACK)):
+            obj = cg.CorridorFloor("GPU-x", "P", mib, 0, source)
+            parsed = ring_table.FrontFloor(
+                mib, source, cg.verdict_floor_for_mib(mib, source)
+            )
+            self.assertEqual(obj.ceiling_mib, parsed.ceiling_mib, source)
+
+
 class RefuterFixTwoTheGroupTagIsAKeyNotALabel(unittest.TestCase):
     """MUST FIX 2: a decorated label keys the same floor as its bare group.
 

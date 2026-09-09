@@ -353,6 +353,16 @@ def arm_report(
                 got = rep.floors.get(idx)
                 floor = got.floor_mib if got else band_floor
                 source = got.source if got else "PRE-1257C-BAND"
+                # THE FINDING EDGE, and on a pre-#1257c log it is the band's
+                # OWN ceiling rather than one re-derived from its floor.
+                # ``band_mib`` is (819, 1229) at the stated law; deriving
+                # 819 * 1.2 = 983 instead would have reported "unmobilised
+                # free" for every card between 983 and 1229 MiB -- the middle
+                # of the very band those logs passed. Findings never fail an
+                # acceptance, so this was noise and not a wrong verdict, but
+                # noise in the instrument that grades the boot is how a real
+                # finding stops being read.
+                ceiling = got.ceiling_mib if got else band_ceil
                 # REFUTER FIX 1: BELOW is graded against the VERDICT floor,
                 # which is what the front's own ``verdict=`` on that same line
                 # is graded against. Grading it against ``floor=`` made this
@@ -374,7 +384,7 @@ def arm_report(
                 # floor, named as PRE-1257C-BAND. Gating it would have made an
                 # over-filled card invisible on exactly the logs that have
                 # been taken so far.
-                elif corridor_guard.unmobilised_free_mib(mib, floor):
+                elif mib > ceiling:
                     # DECISION 5, 2026-09-09: the upper edge is a FINDING and
                     # never a FAIL on its own. It says MiB are sitting
                     # unmobilised, which is a capacity question for the
@@ -383,9 +393,10 @@ def arm_report(
                     # ``problems`` and failed acceptances on it.
                     rep.findings.append(
                         f"phase={phase} nvml{idx} unmobilised_free_mib="
-                        f"{corridor_guard.unmobilised_free_mib(mib, floor)} "
+                        f"{mib - ceiling} "
                         f"(minimum {mib} MiB against a {floor} MiB floor, "
-                        f"source={source}); a FINDING, not a failure"
+                        f"ceiling {ceiling} MiB, source={source}); a FINDING, "
+                        f"not a failure"
                     )
     return rep
 
