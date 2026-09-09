@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""#1273 slice S7: the remap instrument and the W55 residency line.
+"""#1273 slice S7: the remap instrument and the W71 residency line.
 
 TWO THINGS, and both exist because a number that nobody can observe is a
 number that gets asserted instead of measured.
@@ -13,7 +13,7 @@ number that gets asserted instead of measured.
   weight exchange does not change that cost in either arm -- which is exactly
   why both arms must be able to measure it (spec risk R2).
 
-* **W55.** The exchange's VRAM peak is spec section 5's arithmetic over a
+* **W71.** The exchange's VRAM peak is spec section 5's arithmetic over a
   measured census, and spec section 9 point 7 says the honest thing about it:
   *"no cell is separately observable."*  So it is checked at LAUNCH, against
   live NVML, and it refuses -- where W32/W34/W49 already refuse, before either
@@ -413,7 +413,7 @@ class XchgInstrumentTest(CustomTestCase):
     # ---------------------------------------------------------------- S7 (2)
 
     def test_launch_refuses_when_a_wave_peak_exceeds_the_card(self):
-        """W55 by name, naming card, direction, wave, peak, total and floor.
+        """W71 by name, naming card, direction, wave, peak, total and floor.
 
         The census below overflows card 1 in the direction where **P wakes**
         (``d2p``) and in no other case, so the test also proves the gate is
@@ -434,7 +434,7 @@ class XchgInstrumentTest(CustomTestCase):
                     _cards(), lines.append, "exchange", path, "b.0", 0,
                 )
         msg = str(ctx.exception)
-        self.assertIn("W55 Weg2XchgResidencyUnarmable", msg)
+        self.assertIn("W71 Weg2XchgResidencyUnarmable", msg)
         self.assertIn(_UUID[1], msg)
         self.assertIn("nvml1", msg)
         self.assertIn("dir=d2p", msg)
@@ -454,10 +454,10 @@ class XchgInstrumentTest(CustomTestCase):
             "a refusing launch must not also print the arming line",
         )
 
-    def test_w55_leaves_cli_as_the_named_line_and_exit_2(self):
+    def test_w71_leaves_cli_as_the_named_line_and_exit_2(self):
         """The refusal must be ENROLLED in the handler, not merely promise it.
 
-        ROUND-2 REVIEW F1.  W55 shipped as a bare ``RuntimeError``, a subclass
+        ROUND-2 REVIEW F1.  W71 shipped as a bare ``RuntimeError``, a subclass
         of none of ``launcher.REFUSALS``' members, so ``cli()`` did not catch
         it: exit **1** with a raw traceback -- which any wrapper keying on the
         exit code reads as a crash rather than as the refusal it is -- and
@@ -479,7 +479,7 @@ class XchgInstrumentTest(CustomTestCase):
 
         self.assertTrue(
             issubclass(xchg_residency.Weg2XchgResidencyUnarmable, launcher.REFUSALS),
-            "W55 is not enrolled in launcher.REFUSALS: it will exit 1",
+            "W71 is not enrolled in launcher.REFUSALS: it will exit 1",
         )
         self.assertTrue(
             issubclass(
@@ -491,7 +491,7 @@ class XchgInstrumentTest(CustomTestCase):
 
         def boom(argv=None):
             raise xchg_residency.Weg2XchgResidencyUnarmable(
-                "W55 Weg2XchgResidencyUnarmable: synthetic, for the handler only"
+                "W71 Weg2XchgResidencyUnarmable: synthetic, for the handler only"
             )
 
         real_main = launcher.main
@@ -505,7 +505,7 @@ class XchgInstrumentTest(CustomTestCase):
         out = buf.getvalue()
         self.assertEqual(rc, 2, out)
         self.assertIn("WEG2-LAUNCH REFUSED", out)
-        self.assertIn("W55 Weg2XchgResidencyUnarmable", out)
+        self.assertIn("W71 Weg2XchgResidencyUnarmable", out)
         self.assertIn("admin key file", out)
 
     def test_sb4_census_reproduces_the_spec_residency_table(self):
@@ -513,7 +513,7 @@ class XchgInstrumentTest(CustomTestCase):
 
         This is the indicator check for the whole slice: if the solver does not
         reproduce the six peaks and six free-at-peak figures the spec derived by
-        hand from boot weg2sb4's own census, then the number W55 refuses on is
+        hand from boot weg2sb4's own census, then the number W71 refuses on is
         not the number the design was argued from.
         """
         from sglang.srt.weg2 import xchg_residency
@@ -770,14 +770,14 @@ class XchgInstrumentTest(CustomTestCase):
         self.assertFalse(res.armed)
         self.assertTrue(any(_UUID[2] in r and "not in the census" in r for r in res.refusals))
 
-    def test_w55_is_the_only_code_this_slice_allocates(self):
+    def test_w71_is_the_only_code_this_slice_allocates(self):
         """One code, one exception name -- the #1263 discipline, checked here too."""
         src = open(
             os.path.join(ROOT, "python", "sglang", "srt", "weg2", "xchg_residency.py"),
             encoding="utf-8",
         ).read()
         codes = set(re.findall(r"\b(W\d{1,2}[a-z]?)\s+(Weg2[A-Za-z0-9_]+)", src))
-        self.assertEqual(codes, {("W55", "Weg2XchgResidencyUnarmable")})
+        self.assertEqual(codes, {("W71", "Weg2XchgResidencyUnarmable")})
 
 
 # ---------------------------------------------------------------------------

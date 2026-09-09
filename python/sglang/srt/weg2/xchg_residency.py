@@ -1,12 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
-"""W55: can this boot's exchange schedule live on these cards, per wave?
+"""W71: can this boot's exchange schedule live on these cards, per wave?
 
 #1273 slice S7.  The weight exchange (``--weg2-weight-source exchange``) frees
 the host ring by moving the weights card-to-card instead of through host RAM,
 and it pays for that with a VRAM PEAK: for the length of one wave both groups'
 bytes are resident on the same card at once.  Spec section 5 states that peak
 as exact arithmetic over a measured census, and its own section 9 point 7 says
-the honest thing about it -- *"no cell is separately observable"*.  W55 exists
+the honest thing about it -- *"no cell is separately observable"*.  W71 exists
 because of that sentence: an un-observable prediction is checked BEFORE either
 group starts, against this boot's own NVML totals, and REFUSES rather than
 accepts risk.
@@ -136,7 +136,7 @@ class Weg2XchgRefused(RuntimeError):
 
 
 class Weg2XchgResidencyUnarmable(Weg2XchgRefused):
-    """W55: a card / direction / wave peak, or the wave-1 inequality, does not fit.
+    """W71: a card / direction / wave peak, or the wave-1 inequality, does not fit.
 
     Raised by the LAUNCHER, before either group starts, where
     :class:`ring_table.Weg2RingWeightsUnderSized` (W49) already refuses -- and
@@ -179,7 +179,7 @@ class XchgCensus:
     #: The wave partition, in the shape the request struct carries it
     #: (spec section 3.1 ``xchg_waves: Optional[List[List[str]]]``).
     #: TODO(S7->S1): ``weight_exchange`` derives this from ``chunk_tag_cards``;
-    #: until it lands the launcher has no producer and W55 refuses rather than
+    #: until it lands the launcher has no producer and W71 refuses rather than
     #: inventing a partition.
     #: AND THE HAZARD THAT COMES WITH IT (round-2 refuter F11): the partition
     #: priced here is read by ONE process and transmitted to nobody.  Today
@@ -293,11 +293,11 @@ def _as_int_mib(value: object, what: str) -> int:
         out = int(value)  # type: ignore[arg-type]
     except (TypeError, ValueError):
         raise Weg2XchgResidencyUnarmable(
-            f"W55 Weg2XchgResidencyUnarmable: {what} is not an integer MiB value: {value!r}"
+            f"W71 Weg2XchgResidencyUnarmable: {what} is not an integer MiB value: {value!r}"
         )
     if out < 0:
         raise Weg2XchgResidencyUnarmable(
-            f"W55 Weg2XchgResidencyUnarmable: {what} is negative: {out}"
+            f"W71 Weg2XchgResidencyUnarmable: {what} is negative: {out}"
         )
     return out
 
@@ -309,11 +309,11 @@ def load_census(path: str) -> XchgCensus:
     measurement a PREVIOUS run produced, handed to the launcher by path so the
     number that arms the boot has a readable source.  There is no default and
     no fallback -- an absent or malformed census under ``--weg2-weight-source
-    exchange`` is W55, never a guessed table.
+    exchange`` is W71, never a guessed table.
     """
     if not path:
         raise Weg2XchgResidencyUnarmable(
-            "W55 Weg2XchgResidencyUnarmable: --weg2-weight-source exchange needs a "
+            "W71 Weg2XchgResidencyUnarmable: --weg2-weight-source exchange needs a "
             "per-card census (--weg2-xchg-census <path>) and none was given.  The "
             "exchange's VRAM peak is spec section 5's arithmetic over a MEASURED "
             "census; with no census there is no peak to check, and an unchecked "
@@ -321,23 +321,23 @@ def load_census(path: str) -> XchgCensus:
         )
     if not os.path.isfile(path):
         raise Weg2XchgResidencyUnarmable(
-            f"W55 Weg2XchgResidencyUnarmable: census file {path!r} does not exist"
+            f"W71 Weg2XchgResidencyUnarmable: census file {path!r} does not exist"
         )
     try:
         with open(path, encoding="utf-8") as fh:
             blob = json.load(fh)
     except (OSError, ValueError) as exc:
         raise Weg2XchgResidencyUnarmable(
-            f"W55 Weg2XchgResidencyUnarmable: census file {path!r} is unreadable: {exc}"
+            f"W71 Weg2XchgResidencyUnarmable: census file {path!r} is unreadable: {exc}"
         )
     if not isinstance(blob, dict):
         raise Weg2XchgResidencyUnarmable(
-            f"W55 Weg2XchgResidencyUnarmable: census file {path!r} is not a JSON object"
+            f"W71 Weg2XchgResidencyUnarmable: census file {path!r} is not a JSON object"
         )
     raw_waves = blob.get("waves")
     if not isinstance(raw_waves, list) or not raw_waves:
         raise Weg2XchgResidencyUnarmable(
-            f"W55 Weg2XchgResidencyUnarmable: census file {path!r} carries no "
+            f"W71 Weg2XchgResidencyUnarmable: census file {path!r} carries no "
             "'waves' partition.  TODO(S7->S1): weight_exchange.derive_waves is "
             "its producer; a launcher that invented one would be checking a "
             "schedule the ranks do not run."
@@ -346,25 +346,25 @@ def load_census(path: str) -> XchgCensus:
     for k, wave in enumerate(raw_waves, start=1):
         if not isinstance(wave, list) or not all(isinstance(t, str) for t in wave):
             raise Weg2XchgResidencyUnarmable(
-                f"W55 Weg2XchgResidencyUnarmable: wave {k} of {path!r} is not a "
+                f"W71 Weg2XchgResidencyUnarmable: wave {k} of {path!r} is not a "
                 "list of tag names"
             )
         waves.append(tuple(wave))
     raw_cards = blob.get("cards")
     if not isinstance(raw_cards, dict) or not raw_cards:
         raise Weg2XchgResidencyUnarmable(
-            f"W55 Weg2XchgResidencyUnarmable: census file {path!r} carries no 'cards'"
+            f"W71 Weg2XchgResidencyUnarmable: census file {path!r} carries no 'cards'"
         )
     cards: Dict[str, CardCensus] = {}
     for uuid, entry in raw_cards.items():
         if not isinstance(entry, dict):
             raise Weg2XchgResidencyUnarmable(
-                f"W55 Weg2XchgResidencyUnarmable: card {uuid} of {path!r} is not an object"
+                f"W71 Weg2XchgResidencyUnarmable: card {uuid} of {path!r} is not an object"
             )
         tags_raw = entry.get("tags")
         if not isinstance(tags_raw, dict) or set(tags_raw) != set(GROUPS):
             raise Weg2XchgResidencyUnarmable(
-                f"W55 Weg2XchgResidencyUnarmable: card {uuid} of {path!r} must carry "
+                f"W71 Weg2XchgResidencyUnarmable: card {uuid} of {path!r} must carry "
                 f"'tags' for both groups {list(GROUPS)}, got "
                 f"{sorted(tags_raw) if isinstance(tags_raw, dict) else type(tags_raw).__name__}. "
                 "A one-group census cannot state a co-residency peak."
@@ -374,7 +374,7 @@ def load_census(path: str) -> XchgCensus:
             per_tag = tags_raw[group]
             if not isinstance(per_tag, dict):
                 raise Weg2XchgResidencyUnarmable(
-                    f"W55 Weg2XchgResidencyUnarmable: card {uuid} group {group} of "
+                    f"W71 Weg2XchgResidencyUnarmable: card {uuid} group {group} of "
                     f"{path!r} is not a tag->MiB object"
                 )
             tags[group] = {
@@ -464,7 +464,7 @@ def solve(
     RPC preamble, because R6 -- the allocator's unbounded cache -- is the one
     term this arithmetic cannot bound, and refusing there is cheaper than
     taking a ``cu_mem_create`` OOM at a wave whose source pages are already
-    unmapped.  S6 owns the preamble; until it exists W55 is launch-only and
+    unmapped.  S6 owns the preamble; until it exists W71 is launch-only and
     that is a WEAKER gate than section 5.3 specifies, not an equal one.
     """
     res = XchgResidency(provenance=census.provenance, floor_mib=float(floor_mib))
@@ -667,9 +667,9 @@ def armed_line(
 
 
 def refusal_head(res: XchgResidency) -> str:
-    """The W55 message body: what failed, and why there is nothing to fall back to."""
+    """The W71 message body: what failed, and why there is nothing to fall back to."""
     return (
-        f"W55 Weg2XchgResidencyUnarmable: the exchange's predicted VRAM residency "
+        f"W71 Weg2XchgResidencyUnarmable: the exchange's predicted VRAM residency "
         f"does not fit on {len(res.refusals)} (card x direction) case(s).  This is "
         "spec section 5's arithmetic over a MEASURED census, checked at launch "
         "because no cell of it is separately observable at runtime (spec section "

@@ -18,7 +18,7 @@ two branches meet without arguing about line order:
   storage become which bytes of which other rank's storage.  Pure arithmetic
   over replicated geometry, which is what lets every rank derive the same plan
   independently and then HANDSHAKE it (Gate 0, spec 3.3) rather than trust it.
-* **SECTION S2 -- COVERAGE ARMING (W51) AND THE DRAFT TAG** (spec 6/S2, 4.1,
+* **SECTION S2 -- COVERAGE ARMING (W67) AND THE DRAFT TAG** (spec 6/S2, 4.1,
   below).  S2 consumes exactly one thing from S1 and nothing else:
   ``{tag: {parameter name: planned bytes}}`` (see :data:`PlanBytes`), where
   the bytes are the sum of that parameter's ``XchgDesc.nbytes``.
@@ -199,7 +199,7 @@ SHARD_FAMILIES = (VOCAB_FAMILY, "mlp", "moe")
 
 
 class Weg2XchgPlanDisagree(RuntimeError):
-    """W52 Weg2XchgPlanDisagree -- the plan does not describe the hardware.
+    """W68 Weg2XchgPlanDisagree -- the plan does not describe the hardware.
 
     Raised here when a destination tensor is not tiled exactly by its sources
     (two sources for one byte, or a piece that runs past the destination's own
@@ -213,7 +213,7 @@ class Weg2XchgPlanDisagree(RuntimeError):
 
 
 class Weg2XchgSourceMissing(RuntimeError):
-    """W58 Weg2XchgSourceMissing -- a destination byte range has no VRAM source
+    """W74 Weg2XchgSourceMissing -- a destination byte range has no VRAM source
     and no ZEROFILL descriptor.
 
     The concrete shape this guards is the draft/MTP class leaking back into the
@@ -265,7 +265,7 @@ class StorageGeom:
         if len(shape) == 1:
             if stride[0] != 1:
                 raise Weg2XchgPlanDisagree(
-                    f"W52 Weg2XchgPlanDisagree: 1-D tensor with stride {stride} "
+                    f"W68 Weg2XchgPlanDisagree: 1-D tensor with stride {stride} "
                     f"is not a contiguous run; a descriptor cannot name it."
                 )
             return cls(rows=1, cols=shape[0], pitch=shape[0], itemsize=itemsize)
@@ -277,7 +277,7 @@ class StorageGeom:
             )
             if not flat:
                 raise Weg2XchgPlanDisagree(
-                    f"W52 Weg2XchgPlanDisagree: {len(shape)}-D tensor shape "
+                    f"W68 Weg2XchgPlanDisagree: {len(shape)}-D tensor shape "
                     f"{shape} stride {stride} is not a contiguous block, so it "
                     f"has no storage rows a copy primitive can name."
                 )
@@ -293,13 +293,13 @@ class StorageGeom:
             rows, cols, pitch = shape[1], shape[0], stride[1]
         else:
             raise Weg2XchgPlanDisagree(
-                f"W52 Weg2XchgPlanDisagree: tensor shape {shape} stride {stride} "
+                f"W68 Weg2XchgPlanDisagree: tensor shape {shape} stride {stride} "
                 f"has no unit-stride axis, so it has no storage rows a copy "
                 f"primitive can name."
             )
         if pitch < cols:
             raise Weg2XchgPlanDisagree(
-                f"W52 Weg2XchgPlanDisagree: tensor shape {shape} stride {stride} "
+                f"W68 Weg2XchgPlanDisagree: tensor shape {shape} stride {stride} "
                 f"yields pitch {pitch} < row width {cols}; the rows overlap, "
                 f"which no memcpy2d can express."
             )
@@ -338,11 +338,11 @@ def shard_offsets(
     """
     if tp_size <= 0:
         raise Weg2XchgPlanDisagree(
-            f"W52 Weg2XchgPlanDisagree: tp_size {tp_size} is not a group size."
+            f"W68 Weg2XchgPlanDisagree: tp_size {tp_size} is not a group size."
         )
     if ratios is not None and len(ratios) and len(ratios) != tp_size:
         raise Weg2XchgPlanDisagree(
-            f"W52 Weg2XchgPlanDisagree: ratio vector {list(ratios)} has "
+            f"W68 Weg2XchgPlanDisagree: ratio vector {list(ratios)} has "
             f"{len(ratios)} entries for a group of {tp_size} ranks. Selecting "
             f"a vector for a group is GroupLayout.ratios_for's job; one that "
             f"reaches the shard arithmetic must already apply to this group."
@@ -350,7 +350,7 @@ def shard_offsets(
     if not ratios:
         if total % tp_size != 0:
             raise Weg2XchgPlanDisagree(
-                f"W52 Weg2XchgPlanDisagree: dimension {total} is not divisible "
+                f"W68 Weg2XchgPlanDisagree: dimension {total} is not divisible "
                 f"by tp_size {tp_size} and no ratio vector applies."
             )
         sizes = [total // tp_size] * tp_size
@@ -362,7 +362,7 @@ def shard_offsets(
         acc += int(size)
     if acc != total:
         raise Weg2XchgPlanDisagree(
-            f"W52 Weg2XchgPlanDisagree: per-rank sizes {sizes} sum to {acc}, "
+            f"W68 Weg2XchgPlanDisagree: per-rank sizes {sizes} sum to {acc}, "
             f"not to the dimension {total}."
         )
     return out
@@ -510,24 +510,24 @@ class GroupLayout:
         """Refuse a layout whose shard arithmetic could only be guessed at."""
         if self.n_ranks <= 0:
             raise Weg2XchgPlanDisagree(
-                f"W52 Weg2XchgPlanDisagree: group {self.name!r} has no cards."
+                f"W68 Weg2XchgPlanDisagree: group {self.name!r} has no cards."
             )
         if self.tp_size not in (1, self.n_ranks):
             raise Weg2XchgPlanDisagree(
-                f"W52 Weg2XchgPlanDisagree: group {self.name!r} has tp_size "
+                f"W68 Weg2XchgPlanDisagree: group {self.name!r} has tp_size "
                 f"{self.tp_size} over {self.n_ranks} ranks. The V1 scope is "
                 f"pure TP (tp_size == ranks) or the PP form (tp_size == 1)."
             )
         if int(self.base) < 0:
             raise Weg2XchgPlanDisagree(
-                f"W52 Weg2XchgPlanDisagree: group {self.name!r} base "
+                f"W68 Weg2XchgPlanDisagree: group {self.name!r} base "
                 f"{self.base} is not a global rank number."
             )
         vectors = [("base", self.ratios)] + sorted((self.family_ratios or {}).items())
         for label, vec in vectors:
             if vec and len(vec) != self.tp_size:
                 raise Weg2XchgPlanDisagree(
-                    f"W52 Weg2XchgPlanDisagree: group {self.name!r} carries a "
+                    f"W68 Weg2XchgPlanDisagree: group {self.name!r} carries a "
                     f"{label} shard vector {list(vec)} of {len(vec)} entries "
                     f"for {self.tp_size} ranks. The fork treats a length "
                     f"mismatch as 'does not apply' and falls back to the even "
@@ -593,7 +593,7 @@ class ParamGeom:
     64 and 248320 is already a multiple of 64, so 128 rows exist on no card and
     in no checkpoint and are ZEROFILL by design (spec §2.2).  ``src_extent``
     additionally clips how much of the rest actually has a source; anything
-    between it and the pad is a GAP and is refused by name (W58), never zeroed.
+    between it and the pad is a GAP and is refused by name (W74), never zeroed.
 
     ``family`` selects the shard vector (``GroupLayout.ratios_for``): the
     vocabulary keeps the even split under an uneven base plan while the MLP of
@@ -640,19 +640,19 @@ class ParamGeom:
         """
         if self.rows_full <= 0 or self.cols_full <= 0 or self.itemsize <= 0:
             raise Weg2XchgPlanDisagree(
-                f"W52 Weg2XchgPlanDisagree: {self.name}: extents "
+                f"W68 Weg2XchgPlanDisagree: {self.name}: extents "
                 f"({self.rows_full}, {self.cols_full}) itemsize "
                 f"{self.itemsize} do not describe a tensor."
             )
         if self.shard_axis not in (ROWS, COLS, REPLICATED):
             raise Weg2XchgPlanDisagree(
-                f"W52 Weg2XchgPlanDisagree: {self.name}: shard axis "
+                f"W68 Weg2XchgPlanDisagree: {self.name}: shard axis "
                 f"{self.shard_axis} is neither ROWS, COLS nor REPLICATED."
             )
         if self.blocks:
             if self.shard_axis != ROWS:
                 raise Weg2XchgPlanDisagree(
-                    f"W52 Weg2XchgPlanDisagree: {self.name}: packed outputs "
+                    f"W68 Weg2XchgPlanDisagree: {self.name}: packed outputs "
                     f"{list(self.blocks)} on a non-ROWS shard axis. Spec §2.2 "
                     f"has no such class, and device_block_offsets' dev_row is "
                     f"a ROW prefix sum -- it would name the wrong coordinate "
@@ -660,19 +660,19 @@ class ParamGeom:
                 )
             if any(int(b) <= 0 for b in self.blocks):
                 raise Weg2XchgPlanDisagree(
-                    f"W52 Weg2XchgPlanDisagree: {self.name}: packed output "
+                    f"W68 Weg2XchgPlanDisagree: {self.name}: packed output "
                     f"sizes {list(self.blocks)} are not all positive."
                 )
             if sum(int(b) for b in self.blocks) != self.shard_total:
                 raise Weg2XchgPlanDisagree(
-                    f"W52 Weg2XchgPlanDisagree: {self.name}: packed outputs "
+                    f"W68 Weg2XchgPlanDisagree: {self.name}: packed outputs "
                     f"{list(self.blocks)} sum to "
                     f"{sum(int(b) for b in self.blocks)}, not to the sharded "
                     f"axis' {self.shard_total}."
                 )
         if not 0 <= int(self.pad_units) <= self.shard_total:
             raise Weg2XchgPlanDisagree(
-                f"W52 Weg2XchgPlanDisagree: {self.name}: pad_units "
+                f"W68 Weg2XchgPlanDisagree: {self.name}: pad_units "
                 f"{self.pad_units} against an axis of {self.shard_total}. A "
                 f"pad past the axis turns the whole parameter into ZEROFILL."
             )
@@ -680,7 +680,7 @@ class ParamGeom:
             0 <= int(self.src_extent) <= self.content_units
         ):
             raise Weg2XchgPlanDisagree(
-                f"W52 Weg2XchgPlanDisagree: {self.name}: src_extent "
+                f"W68 Weg2XchgPlanDisagree: {self.name}: src_extent "
                 f"{self.src_extent} against {self.content_units} non-pad "
                 f"units."
             )
@@ -689,7 +689,7 @@ class ParamGeom:
             and sum(int(w) for w in self.dst_widths) != self.shard_total
         ):
             raise Weg2XchgPlanDisagree(
-                f"W52 Weg2XchgPlanDisagree: {self.name}: seeded widths "
+                f"W68 Weg2XchgPlanDisagree: {self.name}: seeded widths "
                 f"{list(self.dst_widths)} sum to "
                 f"{sum(int(w) for w in self.dst_widths)}, not to the sharded "
                 f"axis' {self.shard_total}."
@@ -721,7 +721,7 @@ class ParamGeom:
         ndim = int(tensor.dim()) if hasattr(tensor, "dim") else len(tensor.shape)
         if ndim > 2 and (shard_dim is None or int(shard_dim) not in (0, ndim - 1)):
             raise Weg2XchgPlanDisagree(
-                f"W52 Weg2XchgPlanDisagree: {name} is {ndim}-D and its shard "
+                f"W68 Weg2XchgPlanDisagree: {name} is {ndim}-D and its shard "
                 f"axis is not one a (rows, cols, pitch) triple can name. A "
                 f"contiguous block flattens to storage rows only for a LEADING "
                 f"axis shard (conv1d's [C, 1, K]: pass shard_dim=0) or a "
@@ -939,7 +939,7 @@ def plan_id(descs: Sequence[XchgDesc], waves: Sequence[Sequence[str]] = ()) -> s
 
     Two processes hold the same tensors at different addresses, so an id that
     moved with the address could never be compared -- and comparing it is the
-    whole job (W52: "the plan hash != the front's").
+    whole job (W68: "the plan hash != the front's").
 
     TAKE THE **RAW** LIST.  ``XchgDesc.key()`` excludes the pointers, but
     ``coalesce`` CONSUMES them: which pieces merge is a function of the pointer
@@ -950,7 +950,7 @@ def plan_id(descs: Sequence[XchgDesc], waves: Sequence[Sequence[str]] = ()) -> s
 
     The WAVE PARTITION is folded in because two partitions can leave the
     descriptor order untouched, and a schedule disagreement is one of the three
-    things W52 names (spec §3.3).
+    things W68 names (spec §3.3).
     """
     h = hashlib.blake2b(digest_size=6)
     for wave in waves:
@@ -1207,7 +1207,7 @@ def _blocks_of(geom: ParamGeom, layout: GroupLayout, is_dst: bool) -> List[List[
         # PP form (or a single-rank group): whole tensors, one holder each.
         if geom.stage is not None and not 0 <= int(geom.stage) < layout.n_ranks:
             raise Weg2XchgPlanDisagree(
-                f"W52 Weg2XchgPlanDisagree: {geom.name} names stage "
+                f"W68 Weg2XchgPlanDisagree: {geom.name} names stage "
                 f"{geom.stage} in group {layout.name!r}, which has "
                 f"{layout.n_ranks} ranks. No rank would match, every block "
                 f"list would come back empty and the parameter would vanish "
@@ -1225,7 +1225,7 @@ def _blocks_of(geom: ParamGeom, layout: GroupLayout, is_dst: bool) -> List[List[
         return [list(full) if r in holders else [] for r in range(layout.n_ranks)]
     if layout.tp_size != layout.n_ranks:
         raise Weg2XchgPlanDisagree(
-            f"W52 Weg2XchgPlanDisagree: group {layout.name!r} has tp_size "
+            f"W68 Weg2XchgPlanDisagree: group {layout.name!r} has tp_size "
             f"{layout.tp_size} over {layout.n_ranks} ranks. The V1 scope is "
             f"pure TP (tp_size == ranks) or the PP form (tp_size == 1); a mixed "
             f"form is refused rather than guessed."
@@ -1239,7 +1239,7 @@ def _blocks_of(geom: ParamGeom, layout: GroupLayout, is_dst: bool) -> List[List[
     if is_dst and geom.dst_widths is not None:
         if len(geom.dst_widths) != layout.n_ranks:
             raise Weg2XchgPlanDisagree(
-                f"W52 Weg2XchgPlanDisagree: {geom.name}: {len(geom.dst_widths)} "
+                f"W68 Weg2XchgPlanDisagree: {geom.name}: {len(geom.dst_widths)} "
                 f"seeded widths for {layout.n_ranks} ranks."
             )
         out, acc = [], 0
@@ -1302,7 +1302,7 @@ def _live_storage(
         live = StorageGeom.of(live)
     if live.itemsize != int(geom.itemsize):
         raise Weg2XchgPlanDisagree(
-            f"W52 Weg2XchgPlanDisagree: {geom.name} on {layout.name!r} rank "
+            f"W68 Weg2XchgPlanDisagree: {geom.name} on {layout.name!r} rank "
             f"{rank}: the plan says itemsize {geom.itemsize}, the live tensor "
             f"says {live.itemsize}. Weight scales are FP32 on device and BF16 "
             f"in the checkpoint (spec §2.4 rule 3), so this is the exact shape "
@@ -1312,7 +1312,7 @@ def _live_storage(
     fixed_plan = int(geom.rows_full) if strided else int(geom.cols_full)
     if fixed_live != fixed_plan:
         raise Weg2XchgPlanDisagree(
-            f"W52 Weg2XchgPlanDisagree: {geom.name} on {layout.name!r} rank "
+            f"W68 Weg2XchgPlanDisagree: {geom.name} on {layout.name!r} rank "
             f"{rank}: the UNSHARDED axis is {fixed_plan} in the plan and "
             f"{fixed_live} in the live tensor's storage."
         )
@@ -1411,7 +1411,7 @@ def _emit(
             actual = live.cols if strided else live.rows
             if actual != derived:
                 raise Weg2XchgPlanDisagree(
-                    f"W52 Weg2XchgPlanDisagree: {geom.name} src_rank={r}: the "
+                    f"W68 Weg2XchgPlanDisagree: {geom.name} src_rank={r}: the "
                     f"plan reads {derived} units from a source whose own "
                     f"storage holds {actual}. The shard vector and the "
                     f"hardware disagree."
@@ -1534,26 +1534,26 @@ def _check_tiles(
     for lo, hi in sorted(covered):
         if lo > cursor:
             raise Weg2XchgSourceMissing(
-                f"W58 Weg2XchgSourceMissing: {geom.name} dst_rank={d_rank}: "
+                f"W74 Weg2XchgSourceMissing: {geom.name} dst_rank={d_rank}: "
                 f"units [{cursor}, {lo}) of this rank's {extent} have no VRAM "
                 f"source and no ZEROFILL descriptor."
             )
         if lo < cursor:
             raise Weg2XchgPlanDisagree(
-                f"W52 Weg2XchgPlanDisagree: {geom.name} dst_rank={d_rank}: unit "
+                f"W68 Weg2XchgPlanDisagree: {geom.name} dst_rank={d_rank}: unit "
                 f"range [{lo}, {hi}) overlaps a range already claimed up to "
                 f"{cursor}; two sources for one destination byte."
             )
         cursor = hi
     if cursor > extent:
         raise Weg2XchgPlanDisagree(
-            f"W52 Weg2XchgPlanDisagree: {geom.name} dst_rank={d_rank}: the plan "
+            f"W68 Weg2XchgPlanDisagree: {geom.name} dst_rank={d_rank}: the plan "
             f"writes {cursor} units into a destination whose own storage holds "
             f"{extent}. The shard vector and the hardware disagree."
         )
     if cursor < extent:
         raise Weg2XchgSourceMissing(
-            f"W58 Weg2XchgSourceMissing: {geom.name} dst_rank={d_rank}: units "
+            f"W74 Weg2XchgSourceMissing: {geom.name} dst_rank={d_rank}: units "
             f"[{cursor}, {extent}) have no VRAM source and no ZEROFILL "
             f"descriptor."
         )
@@ -1573,7 +1573,7 @@ def _check_cards(src: GroupLayout, dst: GroupLayout) -> None:
         src.card_of(r) != dst.card_of(r) for r in range(src.n_ranks)
     ):
         raise Weg2XchgPlanDisagree(
-            f"W52 Weg2XchgPlanDisagree: group {src.name!r} runs on cards "
+            f"W68 Weg2XchgPlanDisagree: group {src.name!r} runs on cards "
             f"{list(src.cards)} and group {dst.name!r} on {list(dst.cards)}. "
             f"on_card is rank equality, which is a statement about ONE card "
             f"only while the two vectors agree rank by rank."
@@ -1592,7 +1592,7 @@ def _check_bases(src: GroupLayout, dst: GroupLayout) -> None:
     lo_b, hi_b = int(dst.base), int(dst.base) + dst.n_ranks
     if lo_a < hi_b and lo_b < hi_a:
         raise Weg2XchgPlanDisagree(
-            f"W52 Weg2XchgPlanDisagree: group {src.name!r} occupies global "
+            f"W68 Weg2XchgPlanDisagree: group {src.name!r} occupies global "
             f"ranks [{lo_a}, {hi_a}) and {dst.name!r} [{lo_b}, {hi_b}). The "
             f"base numbers overlap, so the 6x6 byte matrix folds and its "
             f"symmetry check passes on cells that hold two groups' bytes."
@@ -1642,7 +1642,7 @@ def build_plan(
         for tag in wave:
             if tag in wave_of:
                 raise Weg2XchgPlanDisagree(
-                    f"W52 Weg2XchgPlanDisagree: tag {tag!r} appears in wave "
+                    f"W68 Weg2XchgPlanDisagree: tag {tag!r} appears in wave "
                     f"{wave_of[tag]} and wave {w}. The wave list must be a "
                     f"PERMUTATION of the weights family; last-write-wins would "
                     f"accept a schedule the front's own guard "
@@ -1659,7 +1659,7 @@ def build_plan(
         if geom.tag not in wave_of:
             if geom.tag not in skip:
                 raise Weg2XchgSourceMissing(
-                    f"W58 Weg2XchgSourceMissing: {geom.name} carries tag "
+                    f"W74 Weg2XchgSourceMissing: {geom.name} carries tag "
                     f"{geom.tag!r}, which no wave carries and which was not "
                     f"declared skippable. Dropping it would remove it from the "
                     f"descriptors AND from the byte matrix, so Gate 0's "
@@ -1670,7 +1670,7 @@ def build_plan(
         descs = _emit(geom, src, dst, ptr_of, geom_of)
         if not descs:
             raise Weg2XchgSourceMissing(
-                f"W58 Weg2XchgSourceMissing: {geom.name} (tag {geom.tag!r}) "
+                f"W74 Weg2XchgSourceMissing: {geom.name} (tag {geom.tag!r}) "
                 f"produced no descriptor: no rank of group {dst.name!r} holds "
                 f"any of it. A parameter that is in the inventory and in a "
                 f"wave has to move."
@@ -1681,13 +1681,13 @@ def build_plan(
     barren = sorted(tag for tag, n in emitted.items() if n == 0)
     if barren:
         raise Weg2XchgSourceMissing(
-            f"W58 Weg2XchgSourceMissing: wave tags {barren} produced no "
+            f"W74 Weg2XchgSourceMissing: wave tags {barren} produced no "
             f"descriptor at all. A wave that moves nothing is an agreement "
             f"between six ranks that no byte has to arrive."
         )
     if not raw:
         raise Weg2XchgSourceMissing(
-            "W58 Weg2XchgSourceMissing: the plan is empty. Its plan_id is a "
+            "W74 Weg2XchgSourceMissing: the plan is empty. Its plan_id is a "
             "fixed digest and its byte matrix is all zeros, so every Gate 0 "
             "comparison would succeed while the destination keeps whatever its "
             "remapped pages held."
@@ -1729,7 +1729,7 @@ def build_plan(
 
 
 # ===========================================================================
-# SECTION S2 -- COVERAGE ARMING (W51) AND THE DRAFT TAG (spec 6/S2, 4.1).
+# SECTION S2 -- COVERAGE ARMING (W67) AND THE DRAFT TAG (spec 6/S2, 4.1).
 # ===========================================================================
 
 MIB = 1024 * 1024
@@ -1808,11 +1808,11 @@ def weight_source_for_test(source: str) -> Iterator[str]:
 # S2 -- THE DRAFT TAG (spec section 4.1)
 # ===========================================================================
 
-RUNNER_SHAPE_REFUSAL_MARKER = "W60 Weg2XchgRunnerShapeUnknown"
+RUNNER_SHAPE_REFUSAL_MARKER = "W76 Weg2XchgRunnerShapeUnknown"
 
 
 class Weg2XchgRunnerShapeUnknown(RuntimeError):
-    """W60 -- a secondary ModelRunner this predicate cannot classify.
+    """W76 -- a secondary ModelRunner this predicate cannot classify.
 
     ``is_draft_worker`` is a CONSTRUCTION gate with several producers and only
     one of them holds draft weights (model_runner.py:514-521).  The tag switch
@@ -1821,10 +1821,17 @@ class Weg2XchgRunnerShapeUnknown(RuntimeError):
     both guesses are wrong in a way that shows up only at the next flip:
     guessing DRAFT takes a full target model out of the weights family (never
     paused, never exchanged, permanently resident, no refusal names it), and
-    guessing PRIMARY puts unsourced bytes into it (W58).
+    guessing PRIMARY puts unsourced bytes into it (W74).
 
-    W60 is free per the spec section 7 census (highest assigned W51, this
+    W76 is free per the spec section 7 census (highest assigned W67, this
     branch) and per ``test_weg2_wcode_uniqueness_1263``.
+
+    RENUMBERED BY THE serve-next5 REPLAY (2026-09-09): this branch enumerated
+    its codes against base ``3ea18deb95`` (census maximum W50); the serve line
+    had since claimed W51-W66, so all 16 moved to W67-W82 -- the first free
+    numbers above the MERGED maximum -- with the exception NAMES unchanged.
+    The argument below is the ORIGINAL enumeration and is kept as the reason
+    the number was enumerated, not as the derivation of today's number.
     """
 
 
@@ -1916,7 +1923,7 @@ def runner_shape_refusal_message(shape: RunnerShape) -> str:
         f"these bytes are exchanged at all, and neither answer is safe for a "
         f"shape nobody classified -- the draft tag would take a full target "
         f"model out of the weights family, the base tag would put bytes with no "
-        f"VRAM source into it (W58). Classify the new producer in "
+        f"VRAM source into it (W74). Classify the new producer in "
         f"classify_runner() or run this boot with --weg2-weight-source ring."
     )
 
@@ -1991,7 +1998,7 @@ def resident_line(*, tag: str, mib: float, rank: int, mode: str) -> str:
 
 
 def roll_forward_weights_tag(*, has_draft_shard: bool) -> Optional[str]:
-    """The tag W57's roll-forward reload may open its ONE region with.
+    """The tag W73's roll-forward reload may open its ONE region with.
 
     ``None`` means REFUSE.  ``_weg2_wake_reload_weights``
     (weight_updater.py:531-706) refills BOTH shards of a process through ONE
@@ -2001,12 +2008,12 @@ def roll_forward_weights_tag(*, has_draft_shard: bool) -> Optional[str]:
     is out of the family by construction), and one region carries one tag, so
     there is no tag that is right for both: the base tag re-tags the drafter's
     repacked parameters back into the weights family and the next flip then has
-    a destination range with no VRAM source (W58), while the draft tag does the
+    a destination range with no VRAM source (W74), while the draft tag does the
     same thing to the main shard in the other direction.
 
     Refusing is the only answer this slice can give.  Making the roll-forward
     work under ``exchange`` means one region per runner, which is a change to
-    the reload's shape and belongs to S6 with W57 (spec section 3.6).
+    the reload's shape and belongs to S6 with W73 (spec section 3.6).
     """
     if not exchange_armed():
         return GPU_MEMORY_TYPE_WEIGHTS
@@ -2024,17 +2031,17 @@ def roll_forward_refusal_message() -> str:
         "(weight_updater.py:576-597). One region carries one tag, so this "
         "roll-forward would re-tag the drafter's repacked parameters into the "
         "weights family and the next flip would have a destination range with "
-        "no VRAM source (W58). Refusing rather than re-tagging. OWNER: S6 -- "
-        "W57's roll-forward needs one region per runner (spec section 3.6)."
+        "no VRAM source (W74). Refusing rather than re-tagging. OWNER: S6 -- "
+        "W73's roll-forward needs one region per runner (spec section 3.6)."
     )
 
 
 # ===========================================================================
-# S2 -- COVERAGE ARMING (W51, spec section 2.4 rule 4 and section 6/S2)
+# S2 -- COVERAGE ARMING (W67, spec section 2.4 rule 4 and section 6/S2)
 # ===========================================================================
 
 COVER_LINE_PREFIX = "WEG2-XCHG-COVER"
-COVERAGE_REFUSAL_MARKER = "W51 Weg2XchgCoverageRefused"
+COVERAGE_REFUSAL_MARKER = "W67 Weg2XchgCoverageRefused"
 
 #: MINIMAL INTERFACE, TODO(S1, branch weg2/xchg-s1-0908): the plan half of this
 #: module must expose its parameter population in exactly this shape --
@@ -2360,7 +2367,7 @@ def build_coverage(
 
 
 def coverage_refusal_message(rows: Mapping[str, TagCoverage]) -> str:
-    """The W51 text: every refused tensor named, with its module path."""
+    """The W67 text: every refused tensor named, with its module path."""
     parts: List[str] = []
     for tag in sorted(rows):
         row = rows[tag]
@@ -2417,7 +2424,7 @@ class CoverageVote:
 
 
 def refuse_if_not_ok(vote: CoverageVote) -> CoverageVote:
-    """Raise W51 for a failing vote.  ONLY where a group fence covers it."""
+    """Raise W67 for a failing vote.  ONLY where a group fence covers it."""
     if not vote.ok:
         raise Weg2XchgCoverageRefused(vote.reason)
     return vote

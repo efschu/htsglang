@@ -1600,7 +1600,7 @@ class SchedulerWeightUpdaterManager:
                 # gate above stays silent on purpose: it fires on every ring
                 # boot, i.e. every boot that has ever run.  THIS one fires only
                 # under an armed shadow, where a silent return is the defect;
-                # it is the same W63 line every other rank-local refusal on
+                # it is the same W79 line every other rank-local refusal on
                 # this path already uses, so no reader learns a new shape.
                 logger.info(sh.rank_local_skip_message(
                     reason="no-identity", rank=rank,
@@ -1625,14 +1625,14 @@ class SchedulerWeightUpdaterManager:
             # index degraded to -1, was COMPOSED INTO A STAMP
             # (``weight_exchange_shadow.py:2753``,
             # ``f"{boot_nonce}.{int(i.leg)}"``) and handed to
-            # ``XchgRegion.begin_flip``, which refused it as **W52
+            # ``XchgRegion.begin_flip``, which refused it as **W68
             # Weg2XchgPlanDisagree** -- a name that says "the plan disagrees"
             # about a leg whose actual condition is "this is not a flip".
             #
             # The three legs that produced it were group P's BOOT-TIME initial
             # sleep at its own READY (14:33:55Z), 73 s BEFORE the first flip
             # began (14:35:08Z).  That leg carries no epoch because no flip
-            # exists yet -- the W63 printed ``epoch=`` EMPTY, not malformed --
+            # exists yet -- the W79 printed ``epoch=`` EMPTY, not malformed --
             # so the -1 was honest and only its downstream use was not.
             #
             # UPSTREAM-MINIMAL, and it is why no counter is added here: the
@@ -1648,9 +1648,9 @@ class SchedulerWeightUpdaterManager:
             #
             # THE CLASS, swept here in one place: every identity this hook
             # reads is resolved BEFORE the inputs are built, and any one that
-            # is missing becomes a NAMED W63 refusal instead of a sentinel that
+            # is missing becomes a NAMED W79 refusal instead of a sentinel that
             # downstream code has to recognise.  The sentinels that used to
-            # travel were: leg=-1 / epoch="" (W52, above), card_uuid="unknown"
+            # travel were: leg=-1 / epoch="" (W68, above), card_uuid="unknown"
             # (an unnamed card priced and charged as if it were a real one),
             # and free_mib=0 (an UNREADABLE NVML free column priced as a FULL
             # card -- ``price_shadow`` would then refuse UNAFFORDABLE giving
@@ -1674,7 +1674,7 @@ class SchedulerWeightUpdaterManager:
                     reason="no-card", rank=rank, leg=leg, epoch=epoch_token,
                     detail=f"hook={hook} -- NVML could not name this rank's "
                            f"card, and every shadow term (the price, the "
-                           f"deposit charge, the W61 line) is keyed by it"))
+                           f"deposit charge, the W77 line) is keyed by it"))
                 return
             peer = "D" if group == "P" else "P"
             free_bytes = self._weg2_free_bytes()
@@ -1727,7 +1727,7 @@ class SchedulerWeightUpdaterManager:
                 # ``seq - slots`` is negative) rather than by a branch, so
                 # ``blocked_ms`` stays 0.000 and the destination now has bytes
                 # to COMPARE.  A shape that does not fit is still refused by
-                # name, and the refusal is now W65 (the deposit) instead of the
+                # name, and the refusal is now W81 (the deposit) instead of the
                 # blameless placement line.
                 oncard_drainable=False,
                 # WHAT THE #1269 LEDGER CHARGED FOR ONE CARD'S DEPOSIT.  The

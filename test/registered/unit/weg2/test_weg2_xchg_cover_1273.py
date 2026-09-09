@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""#1273 slice S2 -- coverage arming (W51) and the draft tag.
+"""#1273 slice S2 -- coverage arming (W67) and the draft tag.
 
 WEG2_REUSE_SPEC_0908.md section 6/S2 and section 4.1.  Two properties, and both
 of them are about a SILENT wrongness, which is why they are tests and not a
@@ -11,7 +11,7 @@ boot observation:
    destination never receives -- plausible garbage, no error, no crash.  The
    arming check walks ``named_parameters()`` + ``named_buffers()`` + a sweep of
    every module's ``__dict__`` for stray ``torch.Tensor`` attributes and
-   refuses by name (**W51 Weg2XchgCoverageRefused**) rather than ship a tag it
+   refuses by name (**W67 Weg2XchgCoverageRefused**) rather than ship a tag it
    cannot account for.  The SLACK (allocator overhang, measured +0.08 to
    +0.58 GiB/rank) is PRINTED, never compared for equality: an equality assert
    would refuse every boot.
@@ -285,7 +285,7 @@ class RunnerShapeTest(unittest.TestCase):
             with self.assertRaises(wx.Weg2XchgRunnerShapeUnknown) as ctx:
                 wx.weights_region_tag_for(self.UNKNOWN)
             msg = str(ctx.exception)
-            self.assertIn("W60", msg)
+            self.assertIn("W76", msg)
             self.assertIn("Weg2XchgRunnerShapeUnknown", msg)
             self.assertIn("is_draft_worker=True", msg)
 
@@ -454,7 +454,7 @@ class RegionAwareTagTest(_ChunkedCase):
         """THE DANGER DIRECTION.  With a region-blind tag the drafter's
         parameters build family rows, get compared against
         ``tms_tag_bytes('weights_0')`` on a process that has no such tag, and
-        W51 can fire over a population that is out of family by construction --
+        W67 can fire over a population that is out of family by construction --
         the exact opposite of section 4.1's purpose."""
         model = _Model()
         rows = wx.build_coverage(
@@ -470,7 +470,7 @@ class RegionAwareTagTest(_ChunkedCase):
 class CoverageTest(_ChunkedCase):
     def test_uncovered_tensor_refuses(self):
         """A stray ``torch.Tensor`` attribute inside a layer's module is a page
-        with no source: W51, by name, with the module path in the message."""
+        with no source: W67, by name, with the module path in the message."""
         model = _Model()
         model.layers[1].scratch = torch.zeros(3 * MIB, dtype=torch.uint8)
         vote = wx.arm_coverage(
@@ -484,7 +484,7 @@ class CoverageTest(_ChunkedCase):
         with self.assertRaises(wms.Weg2XchgCoverageRefused) as ctx:
             wx.refuse_if_not_ok(vote)
         msg = str(ctx.exception)
-        self.assertIn("W51", msg)
+        self.assertIn("W67", msg)
         self.assertIn("Weg2XchgCoverageRefused", msg)
         self.assertIn("layers.1.scratch", msg)
 
@@ -700,7 +700,7 @@ class VoteTest(_ChunkedCase):
         self.assertIsInstance(vote, wx.CoverageVote)
         self.assertFalse(vote.ok)
         self.assertEqual(vote.rank, 4)
-        self.assertIn("W51", vote.reason)
+        self.assertIn("W67", vote.reason)
 
     def test_refuse_if_not_ok_raises_only_for_a_failing_vote(self):
         model = _Model()
@@ -806,7 +806,7 @@ class ArmAtLoadTest(_ChunkedCase):
                 log=log,
             )
         self.assertFalse(vote.ok)
-        self.assertIn("W51", vote.reason)
+        self.assertIn("W67", vote.reason)
         self.assertIn("no plan provider is registered", vote.reason)
 
     def test_arm_at_load_does_not_raise_where_there_is_no_fence(self):
@@ -825,7 +825,7 @@ class ArmAtLoadTest(_ChunkedCase):
 
 
 class RollForwardTagTest(unittest.TestCase):
-    """Refuter F6: W57's roll-forward opens ONE region for BOTH shards."""
+    """Refuter F6: W73's roll-forward opens ONE region for BOTH shards."""
 
     def test_roll_forward_is_unchanged_under_ring(self):
         with wx.weight_source_for_test(wx.WEIGHT_SOURCE_RING):
@@ -844,7 +844,7 @@ class RollForwardTagTest(unittest.TestCase):
             )
         msg = wx.roll_forward_refusal_message()
         self.assertIn("weights_draft", msg)
-        self.assertIn("W58", msg)
+        self.assertIn("W74", msg)
         self.assertIn("OWNER: S6", msg)
 
 
@@ -918,14 +918,14 @@ class PlanInterfaceTest(_ChunkedCase):
 
 
 class WCodeTest(unittest.TestCase):
-    def test_w51_is_the_coverage_refusal_and_says_so_once(self):
-        self.assertIn("W51", wms.Weg2XchgCoverageRefused.__doc__ or "")
-        self.assertEqual(wx.COVERAGE_REFUSAL_MARKER, "W51 Weg2XchgCoverageRefused")
+    def test_w67_is_the_coverage_refusal_and_says_so_once(self):
+        self.assertIn("W67", wms.Weg2XchgCoverageRefused.__doc__ or "")
+        self.assertEqual(wx.COVERAGE_REFUSAL_MARKER, "W67 Weg2XchgCoverageRefused")
 
-    def test_w60_is_the_runner_shape_refusal_and_says_so_once(self):
-        self.assertIn("W60", wx.Weg2XchgRunnerShapeUnknown.__doc__ or "")
+    def test_w76_is_the_runner_shape_refusal_and_says_so_once(self):
+        self.assertIn("W76", wx.Weg2XchgRunnerShapeUnknown.__doc__ or "")
         self.assertEqual(
-            wx.RUNNER_SHAPE_REFUSAL_MARKER, "W60 Weg2XchgRunnerShapeUnknown"
+            wx.RUNNER_SHAPE_REFUSAL_MARKER, "W76 Weg2XchgRunnerShapeUnknown"
         )
 
 

@@ -287,7 +287,7 @@ class TestStorageSpace(CustomTestCase):
         base = torch.empty((64, 64), dtype=torch.int8, device="meta")
         with self.assertRaises(Weg2XchgPlanDisagree) as cm:
             StorageGeom.of(base[:, ::2])
-        self.assertIn("W52 Weg2XchgPlanDisagree", str(cm.exception))
+        self.assertIn("W68 Weg2XchgPlanDisagree", str(cm.exception))
 
 
 class TestTiling(CustomTestCase):
@@ -328,7 +328,7 @@ class TestTiling(CustomTestCase):
                 waves=[["weights_0"]],
             )
         message = str(cm.exception)
-        self.assertIn("W58 Weg2XchgSourceMissing", message)
+        self.assertIn("W74 Weg2XchgSourceMissing", message)
         self.assertIn("down_proj", message)
         self.assertIn("dst_rank=0", message)
         self.assertIn("[7792, 7808)", message)
@@ -343,18 +343,18 @@ class TestTiling(CustomTestCase):
                 waves=[["weights_0"]],
             )
         message = str(cm.exception)
-        self.assertIn("W52 Weg2XchgPlanDisagree", message)
+        self.assertIn("W68 Weg2XchgPlanDisagree", message)
         self.assertIn("writes 7808 units", message)
         self.assertIn("holds 7792", message)
 
     def test_a_gap_in_the_destination_is_w58_not_a_silent_short_write(self):
         """A destination range with no source and no DECLARED pad is the
-        draft/MTP class leaking back into the weights family (spec §7 W58)."""
+        draft/MTP class leaking back into the weights family (spec §7 W74)."""
         src, dst = _p_layout(), _d_layout(MLP_RATIO)
         holed = _mlp_down_geom(src_extent=MLP_IN_FULL - 128)
         with self.assertRaises(Weg2XchgSourceMissing) as cm:
             build_plan([holed], src, dst, waves=[["weights_0"]])
-        self.assertIn("W58 Weg2XchgSourceMissing", str(cm.exception))
+        self.assertIn("W74 Weg2XchgSourceMissing", str(cm.exception))
         self.assertIn("down_proj", str(cm.exception))
 
     def test_a_source_picked_twice_would_be_an_overlap_and_is_prevented(self):
@@ -543,7 +543,7 @@ class TestDeterminism(CustomTestCase):
 
         # And the id is POINTER-FREE: two processes hold the same tensors at
         # different addresses, so an id that moved with the address could never
-        # be compared across ranks (spec §7 W52, "plan hash != the front's").
+        # be compared across ranks (spec §7 W68, "plan hash != the front's").
         with_ptrs = build_plan(
             self._inventory(),
             src,
@@ -909,7 +909,7 @@ class TestPlanCoverage(CustomTestCase):
         with self.assertRaises(Weg2XchgSourceMissing) as cm:
             build_plan([], src, dst, waves=[["weights_0"]])
         message = str(cm.exception)
-        self.assertIn("W58 Weg2XchgSourceMissing", message)
+        self.assertIn("W74 Weg2XchgSourceMissing", message)
         self.assertIn("weights_0", message)
 
     def test_a_tag_outside_every_wave_is_refused_not_silently_dropped(self):
@@ -1100,7 +1100,7 @@ class TestShardFamilies(CustomTestCase):
         with self.assertRaises(Weg2XchgPlanDisagree) as cm:
             shard_offsets(total, [61, 38], 3)
         message = str(cm.exception)
-        self.assertIn("W52 Weg2XchgPlanDisagree", message)
+        self.assertIn("W68 Weg2XchgPlanDisagree", message)
         self.assertIn("2 entries", message)
         bad = GroupLayout(name="D", cards=CARDS, tp_size=3, ratios=[61, 38], base=3)
         with self.assertRaises(Weg2XchgPlanDisagree) as cm:
@@ -1118,7 +1118,7 @@ class TestGroupIdentity(CustomTestCase):
         with self.assertRaises(Weg2XchgPlanDisagree) as cm:
             build_plan([_mlp_down_geom()], _p_layout(), dst, waves=[["weights_0"]])
         message = str(cm.exception)
-        self.assertIn("W52 Weg2XchgPlanDisagree", message)
+        self.assertIn("W68 Weg2XchgPlanDisagree", message)
         self.assertIn("base", message)
 
     def test_the_two_groups_card_vectors_must_agree(self):
@@ -1130,12 +1130,12 @@ class TestGroupIdentity(CustomTestCase):
         )
         with self.assertRaises(Weg2XchgPlanDisagree) as cm:
             build_plan([_mlp_down_geom()], _p_layout(), dst, waves=[["weights_0"]])
-        self.assertIn("W52 Weg2XchgPlanDisagree", str(cm.exception))
+        self.assertIn("W68 Weg2XchgPlanDisagree", str(cm.exception))
 
     def test_a_stage_outside_the_group_is_refused(self):
         """``holders = [int(geom.stage)]`` is unvalidated: a stage outside the
         group matches no rank, every block list comes back empty, and the
-        parameter vanishes from the plan with no W58 at all -- fail-open, in
+        parameter vanishes from the plan with no W74 at all -- fail-open, in
         the direction where P is the DESTINATION (spec §1.4)."""
         with self.assertRaises(Weg2XchgPlanDisagree) as cm:
             build_plan(
@@ -1145,7 +1145,7 @@ class TestGroupIdentity(CustomTestCase):
                 waves=[["weights_0"]],
             )
         message = str(cm.exception)
-        self.assertIn("W52 Weg2XchgPlanDisagree", message)
+        self.assertIn("W68 Weg2XchgPlanDisagree", message)
         self.assertIn("stage", message)
 
 
@@ -1312,7 +1312,7 @@ class TestLiveStorage(CustomTestCase):
                 shard_axis=ROWS,
                 shard_total=512,
             )
-        self.assertIn("W52 Weg2XchgPlanDisagree", str(cm.exception))
+        self.assertIn("W68 Weg2XchgPlanDisagree", str(cm.exception))
         conv = torch.empty((768, 1, 4), dtype=torch.int8, device="meta")
         geom = ParamGeom.of(
             conv,
@@ -1346,7 +1346,7 @@ class TestTilingCanFail(CustomTestCase):
 
 class TestPlanIdIsComparable(CustomTestCase):
     """``plan_id`` exists to be compared between two processes and the front
-    (spec §3.3, W52).  Coalescing consumes ``src_ptr``/``dst_ptr``, so a digest
+    (spec §3.3, W68).  Coalescing consumes ``src_ptr``/``dst_ptr``, so a digest
     over the COALESCED list is a function of the pointer table -- and a rank is
     producer or consumer, never both, so the two sides hold different tables
     and the front holds none.
@@ -1396,7 +1396,7 @@ class TestPlanIdIsComparable(CustomTestCase):
         tags in; two ranks that disagree about it emit the identical descriptor
         list, because ``wave_of`` maps both tags to the same wave index and the
         sort key never sees the order.  A digest over the descriptors alone is
-        therefore blind to one of the three things W52 names (spec §3.3)."""
+        therefore blind to one of the three things W68 names (spec §3.3)."""
         src, dst = _p_layout(), _d_layout(None)
         inv = self._inventory()
         inv[1] = inv[1].replace(tag="weights_1")
