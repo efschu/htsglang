@@ -134,10 +134,75 @@ CUDA_STREAM_DEFAULT = 0
 ONCARD_SLOT_BYTES = xr.SLOT_BYTES
 ONCARD_SLOTS = 2
 
+#: The deepest pipeline the handshake rows are sized for.  The row area is
+#: allocated from THIS number (see :data:`DIR_ONCARD_ROWS`), so a caller may
+#: raise ``oncard_slots`` from the plan without moving a single offset in the
+#: dir sub-layout -- the two processes would otherwise have to agree on a
+#: geometry that only one of them was told.
+ONCARD_SLOTS_MAX = 8
+
+#: The largest diagonal slot :func:`plan_oncard_slot_bytes` may choose.  The
+#: bounce is ``slots x slot_bytes`` of raw VRAM on the producer's card and the
+#: importer maps the same allocation, so the ceiling is a residency term of
+#: spec section 5, not a tuning preference: at the shipping ``ONCARD_SLOTS=2``
+#: this caps the bounce at 256 MiB per card.
+ONCARD_SLOT_BYTES_MAX = 128 * xr.MIB
+
 #: The on-card lane's poll granularity.  It has no semaphore -- the diagonal is
 #: absent from :data:`xr.CROSS_PAIRS` by construction -- so its handshake is a
 #: bounded poll over single-writer rows, the same shape as the wave gate.
-ONCARD_POLL_S = xr.GATE_POLL_S
+#:
+#: **IT IS NO LONGER ``xr.GATE_POLL_S``, AND THAT WAS A MEASURED DEFECT.**
+#: S5-pre (2026-09-09, RTX 5090, gpuq ``2xhz55``, raw in
+#: ``/spinning/evidence-665-f1/xchg_s5_0909/ARMS_SUMMARY.txt``) ran 512 MiB
+#: through this lane on silicon and found it **per-batch-bound, not
+#: bandwidth-bound**: across an 8x change in bytes per batch (32 -> 4 MiB) the
+#: consumer-side cost stayed ~0.33-0.50 ms per BATCH while the copy itself fell
+#: from 0.044 ms to 0.0055 ms.  A gate fires once per WAVE; this row poll fires
+#: once per BATCH, and the real diagonal is 10.28 GiB = 329 batches at a 32 MiB
+#: slot -- ~118 ms against spec 6/S4's ``hop_ms <= 20``.
+#:
+#: THE THREE ARMS THAT SIZE THE TWO CONSTANTS BELOW, all consumer-side (the
+#: producer-side instrument is 1.75x A/A noise and carries no claim):
+#:
+#: ===============  ====================  ==============================
+#: ``ONCARD_POLL_S``  ms per batch         reading
+#: ===============  ====================  ==============================
+#: 500 us (the gate)  0.328-0.398          the sleep dominates
+#: **50 us**          **0.182**            2.0x, far outside the 1.21x floor
+#: 5 us               0.165                +0.017 for 10x the wakeups
+#: ===============  ====================  ==============================
+#:
+#: So the sleep is 50 us -- the arm that took the 2.0x -- and the residual
+#: 0.165 ms is NOT the sleep: it is the lock-step round trip itself (sync,
+#: sealed-row write, the peer observing it).  That is what
+#: :data:`ONCARD_SPIN_BUDGET_S` covers, and why spinning longer than it would
+#: burn a core for a peer that is not coming.
+ONCARD_POLL_S = 50e-6
+
+#: The spin half of the spin-then-sleep wait, in SECONDS, from the same arms:
+#: 5 us and 50 us polling measured 0.165 vs 0.182 ms per batch, i.e. the floor
+#: a poll cannot go below is ~0.165 ms.  A peer that is going to answer answers
+#: inside that window, so the wait spins for it and sleeps for everything
+#: longer.  Spinning PAST it buys nothing measurable and costs a core.
+ONCARD_SPIN_BUDGET_S = 165e-6
+
+#: The iteration cap on that spin.  The TIME bound above is the load-bearing
+#: one; this is the belt-and-braces half, because the cost of one row read is
+#: not measured and a time-only bound would spin an unbounded number of times
+#: on a machine where it is cheap.  Whichever bound is reached first ends the
+#: spin.
+ONCARD_SPIN_ITERS = 512
+
+#: The measured per-batch cost of the lane at :data:`ONCARD_POLL_S`, in ms,
+#: consumer-side -- the "poll rebind" arm of S5-pre (32 MiB slot, 16 batches,
+#: 2.91 ms / 16 = 0.182).  It is the coefficient of the cost model
+#: :func:`plan_oncard_slot_bytes` prices with, and it is a MEASUREMENT with a
+#: named regime, never a target.
+ONCARD_PER_BATCH_MS = 0.182
+
+#: Spec section 6/S4's acceptance for the whole diagonal.
+ONCARD_HOP_BUDGET_MS = 20.0
 
 #: Modes for the on-card lane; ``host`` is the named degrade of section 3.7.
 ONCARD_MODE_IPC = "ipc"
@@ -187,7 +252,13 @@ DIR_HANDLE_BYTES = xr.N_RANKS * CUDA_IPC_HANDLE_SIZE
 #: what makes the SIGNAL safe, and it only works if the signal is per slot too.
 DIR_ONCARD_PROD_OFF = DIR_HANDLE_OFF + DIR_HANDLE_BYTES
 DIR_ONCARD_ROW_BYTES = 128
-DIR_ONCARD_ROWS = xr.N_RANKS * ONCARD_SLOTS
+#: Sized from :data:`ONCARD_SLOTS_MAX`, not from the shipping default: the
+#: pipeline depth is a per-plan knob from S5 on (the diagonal's batch count is
+#: known at plan time), and a row area sized from the DEFAULT would put rank
+#: r's slot 2 on top of rank r+1's slot 0 the moment a caller raised it.  The
+#: dir layout is agreed by nothing at runtime -- it is two processes computing
+#: the same offsets -- so its size may not depend on an argument.
+DIR_ONCARD_ROWS = xr.N_RANKS * ONCARD_SLOTS_MAX
 DIR_ONCARD_PROD_BYTES = DIR_ONCARD_ROWS * DIR_ONCARD_ROW_BYTES
 DIR_ONCARD_CONS_OFF = DIR_ONCARD_PROD_OFF + DIR_ONCARD_PROD_BYTES
 DIR_ONCARD_CONS_BYTES = DIR_ONCARD_ROWS * DIR_ONCARD_ROW_BYTES
@@ -1152,6 +1223,29 @@ def require_slot_bytes(ceiling: int, slot_bytes: int, *, what: str) -> int:
     return value
 
 
+def require_oncard_slots(slots: int, *, what: str) -> int:
+    """Refuse a diagonal pipeline depth the handshake rows cannot address.
+
+    The sibling of :func:`require_slot_bytes`, and the same defect one field
+    over: ``ONCARD_SLOTS`` became a per-plan knob in S5 (the diagonal's batch
+    count is known at plan time, so a deeper pipeline is a real choice), and
+    the row area is sized ONCE from :data:`ONCARD_SLOTS_MAX` because two
+    processes compute its offsets independently.  A depth above the max is not
+    a slow lane -- it is rank ``r``'s slot ``k`` landing on rank ``r+1``'s slot
+    0, with both sides agreeing on the wrong address.
+    """
+    value = int(slots)
+    if value < 1 or value > ONCARD_SLOTS_MAX:
+        raise Weg2XchgPlanDisagree(
+            f"W52 Weg2XchgPlanDisagree {what}: oncard_slots={value} is not in "
+            f"1..{ONCARD_SLOTS_MAX}.  The on-card handshake row area is sized "
+            f"once, from ONCARD_SLOTS_MAX, so a deeper pipeline addresses "
+            f"another rank's rows -- identically on both sides, which is why "
+            f"nothing would disagree about it"
+        )
+    return value
+
+
 def _take_slot(sems: SemSet, pair: int, slot: int, kind: str, budget_s: float,
                stats: PairStats, on_timeout: Callable[[], BaseException]) -> None:
     """Take one semaphore, counting whether it actually blocked.
@@ -1396,12 +1490,171 @@ class OnCardStats:
         )
 
 
+@dataclass(frozen=True)
+class OnCardSlotPlan:
+    """What one card's diagonal costs at a chosen slot size, and the model.
+
+    THE MODEL IS ONE LINE AND IT IS PRINTED WHEREVER THE NUMBER IS:
+    ``hop_ms = batches x per_batch_ms``, ``batches = ceil(bytes / slot_bytes)``.
+    Its coefficient is :data:`ONCARD_PER_BATCH_MS`, MEASURED consumer-side on
+    the 5090 (S5-pre), and the measurement's own finding is what makes the
+    model this shape: the per-batch cost did not move with the bytes per batch
+    across an 8x sweep, so the batch COUNT is the only term worth choosing.
+
+    ``fits`` grades the priced hop against spec 6/S4's ``hop_ms <= 20``.  It is
+    a PREDICTION, and the boot compares it against the measured ``hop_ms=`` on
+    the ``WEG2-XCHG-ONCARD`` line -- which is why both numbers are printed
+    rather than one being trusted.  The extrapolation is honest about its
+    range: 329 batches is 2.6x beyond the largest batch count S5-pre measured.
+    """
+
+    bytes_total: int
+    slot_bytes: int
+    slots: int
+    batches: int
+    per_batch_ms: float
+    budget_ms: float
+
+    @property
+    def hop_ms(self) -> float:
+        return self.batches * self.per_batch_ms
+
+    @property
+    def fits(self) -> bool:
+        return self.hop_ms <= self.budget_ms
+
+    @property
+    def bounce_bytes(self) -> int:
+        """The VRAM this choice costs on the producer's card."""
+        return self.slots * self.slot_bytes
+
+    def model(self) -> str:
+        return (
+            f"hop_ms = batches x per_batch_ms = {self.batches} x "
+            f"{self.per_batch_ms:g} = {self.hop_ms:.1f} ms "
+            f"(per_batch_ms MEASURED consumer-side on the 5090, S5-pre poll-rebind "
+            f"arm at ONCARD_POLL_S={ONCARD_POLL_S * 1e6:g}us; batch count is the "
+            f"only term that moved the cost across an 8x slot sweep)"
+        )
+
+    def tokens(self) -> str:
+        return (
+            f"oncard_slot_mib={self.slot_bytes / xr.MIB:.0f} "
+            f"oncard_slots={self.slots} oncard_batches={self.batches} "
+            f"oncard_hop_ms_priced={self.hop_ms:.1f} "
+            f"oncard_hop_ms_budget={self.budget_ms:g} "
+            f"oncard_priced_fits={'yes' if self.fits else 'no'}"
+        )
+
+
+def plan_oncard_slot_bytes(
+    bytes_total: int,
+    *,
+    slots: int = ONCARD_SLOTS,
+    budget_ms: float = ONCARD_HOP_BUDGET_MS,
+    per_batch_ms: float = ONCARD_PER_BATCH_MS,
+    floor_bytes: int = ONCARD_SLOT_BYTES,
+    ceiling_bytes: int = ONCARD_SLOT_BYTES_MAX,
+    align_bytes: int = xr.MIB,
+) -> OnCardSlotPlan:
+    """Choose the diagonal's slot size from the plan's own byte count.
+
+    The diagonal's batch count is known at PLAN time -- it is
+    ``ceil(oncard_bytes / slot_bytes)`` and nothing else -- so the slot size is
+    a decision the plan can make instead of a constant the flip inherits.  With
+    :data:`ONCARD_PER_BATCH_MS` measured, the smallest slot that clears the
+    budget is ``bytes / floor(budget / per_batch)``, rounded UP to
+    ``align_bytes`` and clamped into ``[floor_bytes, ceiling_bytes]``.
+
+    IT MAY RETURN A PLAN THAT DOES NOT FIT, and that is deliberate: the
+    ceiling is a VRAM residency term (:data:`ONCARD_SLOT_BYTES_MAX`), so on a
+    diagonal large enough it is arithmetically impossible to clear 20 ms at
+    this per-batch cost.  Returning ``fits=False`` with every term printed is
+    a statement the boot can act on; silently exceeding the VRAM ceiling to
+    make a timing budget green is the compensation-layer reflex.
+    """
+    total = int(bytes_total)
+    slots = int(slots)
+    if total <= 0:
+        return OnCardSlotPlan(0, int(floor_bytes), slots, 0, float(per_batch_ms),
+                              float(budget_ms))
+    if per_batch_ms <= 0:
+        raise ValueError(f"per_batch_ms must be positive, not {per_batch_ms!r}")
+    allowed = int(float(budget_ms) // float(per_batch_ms))
+    if allowed < 1:
+        want = int(ceiling_bytes)
+    else:
+        want = -(-total // allowed)  # ceil
+    want = -(-want // int(align_bytes)) * int(align_bytes)
+    slot = max(int(floor_bytes), min(int(ceiling_bytes), want))
+    batches = -(-total // slot)
+    return OnCardSlotPlan(total, slot, slots, batches, float(per_batch_ms),
+                          float(budget_ms))
+
+
+class _OnCardWait:
+    """Spin-then-sleep for the on-card row polls.  One per wait call.
+
+    S5-pre measured the lane per-batch-bound and measured HALF of that cost to
+    be this wait's sleep (see :data:`ONCARD_POLL_S`).  A bare
+    ``time.sleep(poll)`` per iteration pays a full sleep granularity even when
+    the peer's row lands microseconds later, which is the common case on a
+    lock-step lane: the two ranks are co-located, the peer is inside a
+    ``cudaStreamSynchronize`` of a copy this rank just watched it start.
+
+    So: spin (a bare re-read, no syscall) for :data:`ONCARD_SPIN_BUDGET_S` --
+    the measured floor of the round trip -- and only then sleep
+    :data:`ONCARD_POLL_S` per iteration.  BOTH BOUNDS ARE REQUIRED.  A spin
+    with no time bound burns a core for a peer that died; a spin with no
+    iteration bound spins an unmeasured number of times on a machine where a
+    read is cheap.  The overall wait is still bounded by the fence budget at
+    the call site -- this class chooses only HOW to wait, never HOW LONG.
+
+    ``sleep``/``monotonic`` are injectable because the property under test is
+    "did it sleep yet", which is unobservable through a real clock without
+    making a timing assertion out of it.
+    """
+
+    __slots__ = ("_iters", "_budget", "_poll", "_sleep", "_monotonic",
+                 "_started", "_spun", "_slept")
+
+    def __init__(self, *, spin_iters: int = ONCARD_SPIN_ITERS,
+                 spin_budget_s: float = ONCARD_SPIN_BUDGET_S,
+                 poll_s: float = ONCARD_POLL_S,
+                 sleep: Callable[[float], None] = time.sleep,
+                 monotonic: Callable[[], float] = time.monotonic):
+        self._iters = int(spin_iters)
+        self._budget = float(spin_budget_s)
+        self._poll = float(poll_s)
+        self._sleep = sleep
+        self._monotonic = monotonic
+        self._started = monotonic()
+        self._spun = 0
+        self._slept = 0
+
+    @property
+    def spins(self) -> int:
+        return self._spun
+
+    @property
+    def sleeps(self) -> int:
+        return self._slept
+
+    def wait(self) -> None:
+        if (self._spun < self._iters
+                and self._monotonic() - self._started < self._budget):
+            self._spun += 1
+            return
+        self._slept += 1
+        self._sleep(self._poll)
+
+
 def _oncard_row_off(area_off: int, row: int, slot: int = 0) -> int:
     if not 0 <= int(row) < xr.N_RANKS:
         raise ValueError(f"row must be 0..{xr.N_RANKS - 1}, not {row!r}")
-    if not 0 <= int(slot) < ONCARD_SLOTS:
-        raise ValueError(f"slot must be 0..{ONCARD_SLOTS - 1}, not {slot!r}")
-    index = int(row) * ONCARD_SLOTS + int(slot)
+    if not 0 <= int(slot) < ONCARD_SLOTS_MAX:
+        raise ValueError(f"slot must be 0..{ONCARD_SLOTS_MAX - 1}, not {slot!r}")
+    index = int(row) * ONCARD_SLOTS_MAX + int(slot)
     return area_off + index * DIR_ONCARD_ROW_BYTES
 
 
@@ -1811,7 +2064,8 @@ def run_oncard_consumer(
 
 def _await_oncard(region: xr.XchgRegion, area_off: int, peer_row: int, seq: int,
                   budget_s: float, *, what: str, row: int, wave: int,
-                  slot: int = 0, exact: bool = False) -> Dict[str, int]:
+                  slot: int = 0, exact: bool = False,
+                  wait: Optional["_OnCardWait"] = None) -> Dict[str, int]:
     """Bounded poll for a peer's on-card row to reach ``seq``.
 
     Bounded by ``WEG2_GROUP_FENCE_BUDGET_S`` like every other wait in this
@@ -1850,6 +2104,7 @@ def _await_oncard(region: xr.XchgRegion, area_off: int, peer_row: int, seq: int,
                 "state": ONCARD_STATE_DONE, "pid": 0,
                 "epoch_hash": region.epoch_hash, "sealed": 1}
     started = time.monotonic()
+    waiter = _OnCardWait() if wait is None else wait
     while True:
         got = read_oncard_row(region, area_off, peer_row, slot)
         fresh = (got["sealed"] and got["epoch_hash"] == region.epoch_hash
@@ -1876,7 +2131,7 @@ def _await_oncard(region: xr.XchgRegion, area_off: int, peer_row: int, seq: int,
                 f"(denominator: the peer's on-card row for THIS slot carrying "
                 f"epoch_hash={region.epoch_hash:#x} and wave={wave})"
             )
-        time.sleep(ONCARD_POLL_S)
+        waiter.wait()
 
 
 def _await_handle(region: xr.XchgRegion, peer_row: int, budget_s: float,
@@ -1899,6 +2154,7 @@ def _await_handle(region: xr.XchgRegion, peer_row: int, budget_s: float,
     it is sealed, it is written after the handle, and it now carries the wave.
     """
     started = time.monotonic()
+    waiter = _OnCardWait()
     while True:
         got = read_oncard_row(region, DIR_ONCARD_PROD_OFF, peer_row, 0)
         if (got["sealed"] and got["epoch_hash"] == region.epoch_hash
@@ -1916,7 +2172,7 @@ def _await_handle(region: xr.XchgRegion, peer_row: int, budget_s: float,
                 f"alive_in_proc={'yes' if _pid_alive(got['pid'], '/proc') else 'no'} "
                 f"-- the co-located source never published a bounce handle"
             )
-        time.sleep(ONCARD_POLL_S)
+        waiter.wait()
 
 
 def _await_release(region: xr.XchgRegion, peer_row: int, budget_s: float,
@@ -1968,6 +2224,7 @@ def run_leg(
     budget_s: Optional[float] = None,
     slot_bytes: int = xr.SLOT_BYTES,
     oncard_slot_bytes: Optional[int] = None,
+    oncard_slots: int = ONCARD_SLOTS,
 ) -> LegResult:
     """Move this rank's whole share of one wave.
 
@@ -2023,9 +2280,16 @@ def run_leg(
     slot_bytes = require_slot_bytes(region.header()["slot_bytes"], slot_bytes,
                                     what=f"run_leg row={row} lane=cross")
     diag_bytes = require_slot_bytes(
-        ONCARD_SLOT_BYTES,
+        ONCARD_SLOT_BYTES_MAX,
         slot_bytes if oncard_slot_bytes is None else oncard_slot_bytes,
         what=f"run_leg row={row} lane=oncard")
+    # The pipeline DEPTH is bounded by the row area, which is sized once from
+    # ONCARD_SLOTS_MAX and can therefore not follow an argument.  Refused here,
+    # before a thread exists, for the same reason as the slot size: a depth the
+    # rows cannot address writes rank r's slot k over rank r+1's slot 0, and
+    # both sides would compute the same wrong offset without disagreeing.
+    diag_slots = require_oncard_slots(oncard_slots,
+                                      what=f"run_leg row={row} lane=oncard")
     result = LegResult()
     errors: List[BaseException] = []
     lock = threading.Lock()
@@ -2081,9 +2345,11 @@ def run_leg(
         may_free = not (is_source and ipc)
         try:
             if is_source:
-                bounce = (OnCardBounce(ops, device, slot_bytes=diag_bytes) if ipc
+                bounce = (OnCardBounce(ops, device, slots=diag_slots,
+                                       slot_bytes=diag_bytes) if ipc
                           else HostBounce(ops, region.boot_nonce, rank,
-                                          create=True, slot_bytes=diag_bytes))
+                                          create=True, slots=diag_slots,
+                                          slot_bytes=diag_bytes))
                 if ipc:
                     publish_ipc_handle(region, row, bounce.handle)
                 # ARMED, seq -1, slot 0: "the bounce is there, no batch yet".
@@ -2117,12 +2383,14 @@ def run_leg(
                     peer_ptr = ops.ipc_open_handle(read_ipc_handle(region, peer_row))
                 else:
                     bounce = HostBounce(ops, region.boot_nonce, rank,
-                                        create=False, slot_bytes=diag_bytes)
+                                        create=False, slots=diag_slots,
+                                        slot_bytes=diag_bytes)
                     peer_ptr = bounce.ptr
                 run_oncard_consumer(region, ops, stream, peer_ptr, row=row,
                                     peer_row=peer_row, wave=wave,
                                     descs=on_card, stats=oncard_stats,
-                                    budget_s=budget, slot_bytes=diag_bytes)
+                                    budget_s=budget, slots=diag_slots,
+                                    slot_bytes=diag_bytes)
         except BaseException:
             # Vote this lane down where the peer is looking, so its wait ends
             # NOW and names the death instead of the fence budget.

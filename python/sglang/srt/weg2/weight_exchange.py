@@ -1114,6 +1114,23 @@ class XchgPlan:
     def cross_bytes(self) -> int:
         return sum(d.nbytes for d in self.descs if d.kind != ZEROFILL and not d.on_card)
 
+    def oncard_bytes_by_rank(self) -> Dict[int, int]:
+        """The diagonal, PER CARD -- which is the denominator ``hop_ms`` has.
+
+        ``oncard_bytes`` is the sum over all three cards and is what spec
+        section 6/S6's ``oncard_gib=10.28`` names; the on-card LANE, however,
+        runs once per card between two co-located processes, so a hop budget
+        priced against the sum is priced against a lane that does not exist.
+        S5-pre's own extrapolation ("10.28 GiB = 329 batches") took the sum for
+        one lane; keeping both numbers, each with its denominator, is what
+        stops that reading from being repeated.
+        """
+        out: Dict[int, int] = {}
+        for d in self.descs:
+            if d.kind != ZEROFILL and d.on_card:
+                out[int(d.src_rank)] = out.get(int(d.src_rank), 0) + int(d.nbytes)
+        return out
+
     @property
     def zerofill_bytes(self) -> int:
         return sum(d.nbytes for d in self.descs if d.kind == ZEROFILL)
@@ -1138,6 +1155,18 @@ class XchgPlan:
             direction = f"{self.src_group}2{self.dst_group}"
         hist = "/".join(f"{k}:{v}" for k, v in piece_histogram(self.descs).items())
         gib = float(1 << 30)
+        # S5: the diagonal's batch count is known HERE, at plan time, so the
+        # slot size is a decision this plan makes and the priced hop is a
+        # number the boot can hold against the measured ``hop_ms=`` on the
+        # WEG2-XCHG-ONCARD line.  Priced for the BUSIEST card, named, because
+        # the lane is per card (see oncard_bytes_by_rank).
+        from sglang.srt.weg2 import weight_exchange_transport as _tp
+
+        by_rank = self.oncard_bytes_by_rank()
+        hot_rank, hot_bytes = (
+            max(by_rank.items(), key=lambda kv: kv[1]) if by_rank else (-1, 0)
+        )
+        oncard = _tp.plan_oncard_slot_bytes(hot_bytes)
         return (
             "WEG2-XCHG-PLAN "
             f"dir={direction} waves={len(self.waves)} descs={len(self.raw_descs)} "
@@ -1148,7 +1177,11 @@ class XchgPlan:
             f"oncard_gib={self.oncard_bytes / gib:.2f} "
             f"cross_gib={self.cross_bytes / gib:.2f} "
             f"zerofill_mib={self.zerofill_bytes / (1 << 20):.2f} "
-            f"hist={hist} plan_id={self.plan_id}"
+            f"hist={hist} "
+            f"oncard_priced_rank={hot_rank} "
+            f"oncard_priced_gib={hot_bytes / gib:.2f} "
+            f"{oncard.tokens()} "
+            f"plan_id={self.plan_id}"
         )
 
 
