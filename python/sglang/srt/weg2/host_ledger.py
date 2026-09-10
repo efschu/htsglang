@@ -1288,6 +1288,83 @@ def dk7_run_residual_gib() -> float:
     )
 
 
+def record_run_residual_gib(
+    entry: Dict[str, object], ranks_per_group: int = 3
+) -> Tuple[Optional[float], float]:
+    """One record's run residual RE-PRICED in the arm's own currency.
+
+    Returns ``(residual, correction)``; ``correction`` is what was removed, so
+    a caller can print it and 0.0 means "this record needed nothing".
+
+    #1325 -- WHY THE READER AND NOT ONLY THE SAMPLER. The sampler's own
+    subtraction was in the wrong currency (it omitted ``s_gb_d``, so D's rings
+    stayed inside the residual and the ledger then added them again at
+    prediction time). Fixing the sampler corrects records written from now on
+    -- and the record that BLOCKS the next boot is already on disk. The sidecar
+    is APPEND-ONLY because history is evidence, so it may not be rewritten;
+    the derivation therefore moves to the reader, where it corrects old and new
+    records alike from one place. ONE reader, ONE derivation, and the stored
+    ``run_residual_gib`` stays exactly as the boot wrote it.
+
+    THE CORRECTION IS COMPUTABLE FROM THE RECORD ALONE, which is what makes
+    this a re-derivation and not a guess. The stored residual is
+    ``nonreclaim - charges(arm without s_gb_d) - image``, so
+    ``nonreclaim = stored + charges_old + image`` and the corrected value is
+    ``stored - (charges_new - charges_old)``. Both charge figures come from
+    ``charge_terms`` with the record's OWN stored ``arm`` and ``rss_shmem_gib``
+    -- no new measurement, no constant.
+
+    MEASURED against the live sidecar
+    (``/spinning/evidence-665-f1/...``, 2026-09-10): every boot up to weg2sn6p
+    stored an arm of ``{s_gb: 1, m_mib: 600|1200}`` with NO ``s_gb_d`` and their
+    P residuals sit at 7.42-9.01 GiB. **weg2sn6s is the first and only record
+    carrying ``s_gb_d: 4``** -- it is the first boot on this line to give D its
+    own budget -- and its P residual jumps to **16.34**. Corrected: 16.34 -
+    8.7172 = **7.62**, i.e. back inside the band every other boot occupies, and
+    below sn6p's 9.01. That is the record whose 16.34 predicts ``run_peak
+    92.53`` against the 87.30 boot bound and fires ``W21
+    Weg2HostRunPeakRefused`` on every dry run of this form.
+
+    ``None`` when the record has no residual, which stays an absence.
+    """
+    stored = entry.get("run_residual_gib")
+    if stored is None:
+        return None, 0.0
+    arm = entry.get("arm")
+    if not isinstance(arm, dict):
+        return float(stored), 0.0
+    # EVERY read of the arm is inside the guard, including this comparison.
+    # An arm carrying a non-numeric `s_gb` raised ValueError here while the
+    # try-block below was already written to swallow exactly that -- the guard
+    # was one line short of the thing it guarded (found by its own test).
+    try:
+        s_d = arm.get("s_gb_d")
+        if s_d is None or int(s_d) == int(arm.get("s_gb", s_d)):
+            # Single-budget record: the omitted argument defaulted to `s_gb`,
+            # so the stored value was already in its own currency.
+            # Byte-identical, which is every record written before D got its
+            # own budget.
+            return float(stored), 0.0
+        img_gib = float(entry.get("rss_shmem_gib") or 0.0)
+        images = ImageTerms(
+            p_gib=img_gib, d_gib=img_gib, p_source="record", d_source="record",
+            p_measured=True, d_measured=True, extra_p_gib=0.0, extra_d_gib=0.0,
+        )
+        old = _boot_charges_gib(
+            charge_terms(int(arm["s_gb"]), int(arm["m_mib"]), ranks_per_group, images)
+        )
+        new = _boot_charges_gib(
+            charge_terms(int(arm["s_gb"]), int(arm["m_mib"]), ranks_per_group, images,
+                         s_gb_d=int(s_d))
+        )
+    except (KeyError, TypeError, ValueError):
+        # A record whose arm cannot be re-priced keeps its stored value. It is
+        # the CONSERVATIVE direction (the stored figure is the larger one) and
+        # never a silent 0.
+        return float(stored), 0.0
+    return float(stored) - (new - old), new - old
+
+
 def run_origin_gib(
     cg_nonreclaim_gib: Optional[float], record: Optional[Dict[str, dict]] = None
 ) -> Tuple[Optional[float], str]:
@@ -1308,16 +1385,39 @@ def run_origin_gib(
     """
     if cg_nonreclaim_gib is None:
         return None, "no cgroup sample passed -- no origin to add this arm's charges to"
-    residuals = [
-        (float(e["run_residual_gib"]), g, e)
+    # #1325: RE-PRICED ON READ, never taken as stored. `record_run_residual_gib`
+    # removes the double charge a two-budget record carries (D's rings sat
+    # inside the residual because the sampler's subtraction omitted `s_gb_d`),
+    # and is byte-identical for every single-budget record. The sidecar is
+    # append-only, so the reader is the only place this can be corrected for a
+    # record already on disk -- and the record blocking the next boot is one.
+    _repriced = [
+        (record_run_residual_gib(e), g, e)
         for g, e in (record or {}).items()
         if isinstance(e, dict) and e.get("run_residual_gib") is not None
     ]
+    residuals = [
+        (v, g, e, corr) for (v, corr), g, e in _repriced if v is not None
+    ]
     if residuals:
-        floor, group, entry = max(residuals, key=lambda r: r[0])
+        floor, group, entry, _corr = max(residuals, key=lambda r: r[0])
+        # #1325: the chosen floor NAMES ITS LOAD CLASS and its form. Not a
+        # selector -- the max() is unchanged -- but a boot whose origin came
+        # from a sample taken under load must SAY so on its own ARM line, or
+        # the next reader cannot tell an idle floor from a load peak and will
+        # re-derive the sn6s confusion from scratch. `?` for a pre-#1325
+        # record, which is a fact about the record and not a claim about the
+        # box.
         floor_src = (
             f"MEASURED run-moment residual of boot {entry.get('boot_tag', '?')} @ "
-            f"{entry.get('commit', '?')} ({entry.get('at', '?')}, group {group})"
+            f"{entry.get('commit', '?')} ({entry.get('at', '?')}, group {group}, "
+            f"load_class={entry.get('load_class', '?')}, "
+            f"form={entry.get('form_key', '?')}, stored="
+            f"{float(entry['run_residual_gib']):.2f}"
+            + (
+                f", RE-PRICED -{_corr:.2f} for S_D (#1325)" if _corr else ""
+            )
+            + ")"
         )
     else:
         floor = dk7_run_residual_gib()
@@ -1994,6 +2094,7 @@ def dormant_image_sample(
     reclaimable_bytes: Optional[int] = None,
     arm: Optional[Dict[str, float]] = None,
     ranks_per_group: int = 3,
+    load_witness: Optional[Dict[str, int]] = None,
 ) -> Dict[str, object]:
     """One group's dormant image, measured at its FIRST sleep.  Pure but for /proc.
 
@@ -2048,13 +2149,46 @@ def dormant_image_sample(
             p_gib=rss_gib, d_gib=rss_gib, p_source="this sample", d_source="this sample",
             p_measured=True, d_measured=True, extra_p_gib=0.0, extra_d_gib=0.0,
         )
+        # #1325: THE SUBTRACTION MUST BE IN THE CURRENCY THE BOOT ACTUALLY RAN.
+        # This call omitted `s_gb_d`, so on a two-budget boot it subtracted the
+        # rings of an S_D == S arm while the boot held S_D=4 of them -- and the
+        # unsubtracted difference landed in `run_residual_gib`, i.e. in the one
+        # quantity whose entire definition is "what the box holds that this
+        # ledger's term list does NOT name". The ledger then adds those same
+        # rings back at prediction time, so they are charged twice.
+        #
+        # MEASURED with charge_terms itself, sn6s's arm (S=1 M=600 S_D=4,
+        # ranks=3): boot charges 24.5047 GiB without `s_gb_d` against 33.2219
+        # with it -- 8.7172 GiB under-subtracted. sn6s's recorded run residual
+        # of 16.34 GiB corrects to 7.62, BELOW sn6p's idle 9.01, so
+        # `run_origin_gib`'s max() keeps 9.01 and the arm prices exactly as it
+        # did when (g) passed. The uncorrected 16.34 is what predicts
+        # run_peak 92.53 against the 87.30 boot bound and fires W21
+        # Weg2HostRunPeakRefused on EVERY dry run of this form.
+        #
+        # `arm` carries the key already (`price()` writes `s_gb_d` into its
+        # terms, host_ledger.py:1778), so nothing new is measured or plumbed --
+        # a value that was present at the call site was simply not passed.
+        # `.get` and not `[...]`: a pre-#1325 arm dict has no such key and must
+        # keep its single-budget subtraction, which is byte-identical because
+        # `charge_terms` defaults `_s_d` to `s_gb`.
+        _arm_s_d = arm.get("s_gb_d")
         charges = charge_terms(
-            int(arm["s_gb"]), int(arm["m_mib"]), ranks_per_group, images
+            int(arm["s_gb"]), int(arm["m_mib"]), ranks_per_group, images,
+            s_gb_d=None if _arm_s_d is None else int(_arm_s_d),
         )
         residual = (
             nonreclaim_gib
             - _boot_charges_gib(charges)
             - rss_gib
+        )
+        residual_note = (
+            f"nonreclaimable {nonreclaim_gib:.2f} minus this boot's own charges "
+            f"{_boot_charges_gib(charges):.2f} (at S={int(arm['s_gb'])} "
+            f"S_D={int(_arm_s_d) if _arm_s_d is not None else int(arm['s_gb'])} "
+            f"M={int(arm['m_mib'])}, rings={charges['rings_gib']:.2f}) minus the "
+            f"measured image {rss_gib:.2f} (#1325: the subtraction now carries "
+            f"S_D; omitting it left D's rings inside the residual)"
         )
     return {
         "group": group,
@@ -2074,6 +2208,40 @@ def dormant_image_sample(
         "arm": arm,
         "run_residual_gib": residual,
         "run_residual_note": residual_note,
+        # #1325: WHAT THE BOX WAS DOING WHEN THIS WAS SAMPLED, and WHICH
+        # SERVING FORM it speaks for. Both RECORDED, neither yet a selector of
+        # a different number -- and that ordering is deliberate. The reading
+        # itself was wrong (the S_D subtraction above), and a load-class or
+        # form-key rule layered on top of a wrong reading would have priced a
+        # corrected sample by a rule built for the uncorrected one.
+        #
+        # `load_class` is MEASURED, never inferred from the clock: the front
+        # passes the queue depth and the in-flight count it already holds at
+        # the sampling moment, and anything above zero is `loaded`. A sample
+        # taken at a flip under load is `loaded` by construction, which is
+        # exactly the sn6s case (its record was taken at 15:21:55Z, mid-load).
+        # `unknown` when no witness was passed -- never `idle`, because an
+        # absent witness is not a quiet box.
+        #
+        # `form_key` names the terms that fix the HOST posten and are
+        # independent of the arm being priced: the ranks per group and the
+        # measured weight-tag sum. It deliberately does NOT include the arm --
+        # the residual is already arm-normalised by the subtraction above, so
+        # keying selection on the arm would be circular (you would need the arm
+        # to find the record that prices the arm). Shadow/exchange forms do not
+        # change either term, so they share a key, which is what the operator's
+        # reading of the form requires.
+        "load_class": (
+            "unknown"
+            if not load_witness
+            else (
+                "loaded"
+                if sum(int(v or 0) for v in load_witness.values()) > 0
+                else "idle"
+            )
+        ),
+        "load_witness": dict(load_witness or {}),
+        "form_key": f"ranks={int(ranks_per_group)};wtags={weight_tags_gib:.2f}",
     }
 
 

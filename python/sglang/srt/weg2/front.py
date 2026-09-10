@@ -3780,6 +3780,20 @@ class Front:
             cg_current_bytes=cg.get("current"),
             reclaimable_bytes=cg.get("reclaimable"),
             arm=self.ledger_arm or None,
+            # #1325: the MEASURED load witness at the sampling moment. Both
+            # terms are already held here, so nothing new is instrumented: the
+            # front's own queue depth and the number of requests in flight
+            # across both groups. A first sleep during a flip under load reads
+            # non-zero and the record is stamped `loaded` -- which is what
+            # sn6s's 16.34 GiB sample was, taken at 15:21:55Z with the 120k
+            # load running, while sn6p's 9.01 GiB was taken idle.
+            load_witness={
+                "queued": len(self.queue),
+                "outstanding": sum(
+                    len(getattr(gr, "outstanding", ()) or ())
+                    for gr in self.groups.values()
+                ),
+            },
         )
         self.dormant_image[group] = rec
         logger.info("%s", host_ledger.format_dormant_image(rec))
