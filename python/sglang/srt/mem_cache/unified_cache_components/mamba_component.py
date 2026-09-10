@@ -1531,6 +1531,61 @@ class MambaComponent(TreeComponent):
                 self.cache.evict_host(1, ComponentType.MAMBA)
                 host_indices = self._mamba_pool_host.alloc(1)
             if host_indices is None:
+                # #1317m WHO HOLDS THE ANCHORS? Boot weg2sn6o died here 84
+                # times with `host_anchor_avail=0 host_anchor_size=13` and NO
+                # instrument could say why an eviction between two allocs of
+                # ONE slot freed nothing. Three candidate holders, and a
+                # reading that cannot separate them is a fourth hypothesis
+                # rather than a root -- exactly the shape the C1 refusal census
+                # was built for one tier up, and that census is what let the
+                # next root be named in one boot instead of five.
+                #
+                # TWO THEORIES ALREADY DIED HERE, which is why this counts
+                # instead of concluding: (a) "the component asks for the whole
+                # prompt" -- refuted, this arm allocates exactly ONE slot and
+                # reads neither `prefetch_tokens` nor `token_ids`; (b) "the
+                # host-eviction H-leaf predicate cannot reach interior nodes"
+                # -- refuted, `drive_host_eviction` above walks the mamba host
+                # LRU and TOMBSTONES internal nodes. So the holder is one of:
+                # every anchor-holding node is HOST-PINNED (the LRU walk skips
+                # `host_lock_ref > 0`, and a registered prefetch pins its
+                # anchor node), the LRU is EMPTY of anchor holders (they are
+                # not in this list at all), or the eviction ran and its TRACKER
+                # did not advance past `num_tokens=1`.
+                _lru = self.cache.host_lru_lists.get(ct)
+                _held = _pinned = _leaves = 0
+                try:
+                    for _n in list(getattr(_lru, "cache", {}) or {}):
+                        if _n.component_data[ct].host_value is None:
+                            continue
+                        _held += 1
+                        if any(cd.host_lock_ref > 0 for cd in _n.component_data):
+                            _pinned += 1
+                        if _n in self.cache.evictable_host_leaves:
+                            _leaves += 1
+                except Exception:  # noqa: BLE001 - a census may never break intake
+                    _held = -1
+                _k = getattr(type(self), "_1317m_n", 0) + 1
+                type(self)._1317m_n = _k
+                if _k <= 8 or _k % 64 == 0:
+                    logger.warning(
+                        "#1317m ANCHOR RECLAIM FAILED n=%d asked=1 avail=%s "
+                        "size=%s lru_anchor_holders=%d of_which_host_pinned=%d "
+                        "of_which_h_leaves=%d -- an eviction ran between two "
+                        "allocs of ONE slot and freed nothing. If "
+                        "host_pinned == lru_anchor_holders the holder is the "
+                        "PIN (a registered prefetch pins its anchor node and "
+                        "the LRU walk skips pinned nodes), and the root is a "
+                        "record that never retires, not a pool that is too "
+                        "small. If lru_anchor_holders is 0 while avail is 0 the "
+                        "anchors are held by nodes OUTSIDE this LRU and the "
+                        "reclaim cannot see them at all. Denominator: every "
+                        "PREFETCH anchor alloc that failed twice",
+                        _k,
+                        self._mamba_pool_host.available_size(),
+                        getattr(self._mamba_pool_host, "size", "?"),
+                        _held, _pinned, _leaves,
+                    )
                 return []
             return [
                 PoolTransfer(

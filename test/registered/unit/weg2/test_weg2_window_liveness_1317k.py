@@ -504,3 +504,128 @@ class TestTheExemptionDiesOnItsOwnTerms(unittest.TestCase):
 
         src = inspect.getsource(Scheduler.__dict__["_weg2_x_refuses"])
         self.assertIn("the exemption dies in the same commit as the wall", src)
+
+
+# ---------------------------------------------------------------------------
+# #1317m -- boot weg2sn6o. The W cap and the retry both WORKED; the read was
+# voted down at the ANCHOR pool, and two diagnoses died before the instrument
+# existed to settle it.
+# ---------------------------------------------------------------------------
+
+
+class TestTheInstrumentNamesItsNumbers(unittest.TestCase):
+    """`prefetch_tokens=109131` on the #1035 line was `len(prefetch_key)`, not
+    the ask -- a field that was honest about its number and misleading about
+    its NAME, and it cost a boot's worth of analysis (a reader concluded the
+    mamba component was asking for the whole prompt; it asks for one slot).
+    """
+
+    def _src(self):
+        import inspect
+
+        from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+
+        return inspect.getsource(UnifiedRadixCache.prefetch_from_storage)
+
+    def test_the_1035_line_prints_the_ask_AND_the_remainder_separately(self):
+        src = self._src()
+        self.assertIn("asked_tokens=%d", src)
+        self.assertIn("remaining_tokens=%d", src)
+        self.assertIn("anchors_asked=%d", src)
+        # The misleading name must be gone: `prefetch_tokens=` on THIS line
+        # read as "what this read asked for" and was the prefix length.
+        self.assertNotIn("prefetch_tokens=%d", src)
+
+    def test_the_two_numbers_are_not_the_same_expression(self):
+        """Printing one value under two names would be the same defect."""
+        src = self._src()
+        head = src.index("asked_tokens=%d")
+        args = src[head:]
+        self.assertIn("_comp_tokens,", args)
+        self.assertIn("len(prefetch_key),", args)
+
+
+class TestTheMambaArmAsksForOneSlot(unittest.TestCase):
+    """The refutation that saved a no-op boot, pinned so it cannot be
+    re-proposed: the PREFETCH arm allocates ONE slot and reads neither
+    `prefetch_tokens` nor `token_ids`, so capping either changes nothing."""
+
+    def _arm(self):
+        import inspect
+
+        from sglang.srt.mem_cache.unified_cache_components.mamba_component import (
+            MambaComponent,
+        )
+
+        src = inspect.getsource(MambaComponent.build_hicache_transfers)
+        return src.split("if phase == CacheTransferPhase.PREFETCH:", 1)[1]
+
+    def test_it_allocates_exactly_one_slot(self):
+        arm = self._arm()
+        self.assertIn("_mamba_pool_host.alloc(1)", arm)
+
+    def test_it_reads_neither_span_parameter(self):
+        # EXECUTED LINES ONLY. The first run of this assertion tripped on the
+        # site's own COMMENT, which says "reads neither `prefetch_tokens` nor
+        # `token_ids`" -- the third time today a source-text assertion matched
+        # prose instead of code (a docstring asserting a retired bound, a
+        # comment naming a field). Comments are stripped, so the claim is about
+        # what runs.
+        arm = self._arm().split("return []", 1)[0]
+        code = "\n".join(
+            l for l in arm.split("\n") if not l.lstrip().startswith("#")
+        )
+        self.assertNotIn("prefetch_tokens", code)
+        self.assertNotIn("token_ids", code)
+
+
+class TestTheAnchorHolderIsNamed(unittest.TestCase):
+    """sn6o died 84x at `avail=0 size=13` with an eviction between two allocs
+    of ONE slot that freed nothing, and no instrument could say why. Two
+    theories died first (the whole-prompt ask; the H-leaf blind spot -- refuted
+    because `drive_host_eviction` walks the mamba host LRU and tombstones
+    INTERNAL nodes), so this counts the candidate holders instead of picking
+    one."""
+
+    def _census(self):
+        import inspect
+
+        from sglang.srt.mem_cache.unified_cache_components.mamba_component import (
+            MambaComponent,
+        )
+
+        return inspect.getsource(MambaComponent.build_hicache_transfers)
+
+    def test_all_three_candidate_holders_are_counted(self):
+        src = self._census()
+        self.assertIn("lru_anchor_holders=%d", src)
+        self.assertIn("of_which_host_pinned=%d", src)
+        self.assertIn("of_which_h_leaves=%d", src)
+
+    def test_the_census_cannot_break_the_intake(self):
+        """It runs on the collective path: an exception here would leave one
+        rank out of a vote its peers are already in (#580)."""
+        src = self._census()
+        body = src.split("#1317m WHO HOLDS THE ANCHORS?", 1)[1].split("return []", 1)[0]
+        self.assertIn("except Exception:", body)
+
+    def test_the_refuted_theories_are_recorded_where_they_would_be_retried(self):
+        """Both dead diagnoses are named at the site, so the next reader does
+        not spend a window re-deriving them."""
+        src = self._census()
+        self.assertIn("refuted", src)
+
+
+class TestTheCeilingLineDoesNotPickARefutedCause(unittest.TestCase):
+    def test_it_prints_the_arithmetic_without_naming_a_holder(self):
+        import inspect
+
+        from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+
+        src = inspect.getsource(UnifiedRadixCache._weg2_window_alloc_cap)
+        self.assertIn("ANCHOR CEILING", src)
+        self.assertIn("stays OPEN", src)
+        # Both pool readings side by side -- one without the other is what made
+        # sn6o's two instruments look contradictory.
+        self.assertIn("available=26422", src)
+        self.assertIn("host_anchor_avail=0", src)

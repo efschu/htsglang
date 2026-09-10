@@ -3848,14 +3848,29 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                                 _size = -1
                             logger.warning(
                                 "#1035 PREFETCH DROPPED (host anchor pool "
-                                "exhausted) n=%d comp=%s req=%s prefetch_tokens=%d "
+                                "exhausted) n=%d comp=%s req=%s asked_tokens=%d "
+                                "remaining_tokens=%d anchors_asked=%d "
                                 "host_anchor_avail=%s host_anchor_size=%s -- this "
                                 "rank votes the prefetch DOWN; the prompt is "
-                                "recomputed in full. Not a storage miss.",
+                                "recomputed in full. Not a storage miss. "
+                                "#1317m: `asked_tokens` is the span this read "
+                                "ACTUALLY asked for (the capped window); "
+                                "`remaining_tokens` is the whole prompt tail, "
+                                "which this line used to print UNDER THE NAME "
+                                "`prefetch_tokens` and which made a reader "
+                                "conclude the component was asking for the "
+                                "whole prompt. It never was: the mamba PREFETCH "
+                                "arm allocates exactly ONE slot and reads "
+                                "neither prefetch_tokens nor token_ids "
+                                "(mamba_component.py, `alloc(1)`), so "
+                                "`anchors_asked` is 1 and an exhausted pool is "
+                                "about what is HELD, never about what was asked",
                                 self._1035_n,
                                 comp.component_type,
                                 req_id,
+                                _comp_tokens,
                                 len(prefetch_key),
+                                1,
                                 _avail,
                                 _size,
                             )
@@ -6254,6 +6269,45 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 w,
                 provenance,
             )
+            # #1317m THE ANCHOR CEILING, PRICED AT THE FIRST READ INSTEAD OF
+            # DISCOVERED MID-BOOT. Boot weg2sn6o learned its anchor limit from
+            # 84 `#1035 PREFETCH DROPPED` lines and a 413 to the user; the
+            # terms were all knowable here.
+            #
+            # WHAT IS AND IS NOT CLAIMED. `slots x W` is the ceiling IF each
+            # window holds one anchor for the life of the chain. Whether it
+            # does is OPEN: a first reading of this blamed the host-eviction
+            # H-leaf predicate and that was REFUTED --
+            # `MambaComponent.drive_host_eviction` walks the mamba host LRU and
+            # tombstones INTERNAL nodes too, so non-leaf nodes are reachable by
+            # the reclaim. The remaining candidates are named by the census at
+            # the #1035 site (host pins, an empty LRU, or a tracker that does
+            # not advance) and this line deliberately does NOT pick one. It
+            # prints the arithmetic and the two pool readings side by side,
+            # because on sn6o the KV pool had 26,422 rows free while the anchor
+            # pool was at zero, and one number without the other is what made
+            # the two instruments look contradictory.
+            try:
+                _slots = int(getattr(cc, "host_anchor_slots", 0) or 0)
+            except Exception:  # noqa: BLE001
+                _slots = 0
+            if w and _slots > 0:
+                logger.warning(
+                    "#1317m ANCHOR CEILING: host_anchor_slots=%d W=%d -> at one "
+                    "held anchor per window this group carries a store-read "
+                    "prompt of at most ~%d tokens, and the KV pool's own room "
+                    "is NOT the binding term (sn6o: available=26422 while "
+                    "host_anchor_avail=0). solve_window bounds LIVE anchors at "
+                    "%d, which is the right number ONLY IF an anchor is "
+                    "recycled with its window; whether it is stays OPEN and the "
+                    "#1035 census names the holder. Lift by raising the pinned "
+                    "ledger arm M (--pin-ledger-arm-m / "
+                    "--hicache-mamba-host-mib; sn6o priced one anchor at 46.76 "
+                    "MiB on TP0, 600 MiB -> 13 slots) or by fixing the reclaim "
+                    "the census points at. Denominator: one line per "
+                    "(pool_rows, chunk, chains) binding",
+                    _slots, w, _slots * w, w // max(1, chunk) + 1,
+                )
         self._weg2_window_cap_cache = (key, w)
         return w
 
