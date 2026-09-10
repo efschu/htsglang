@@ -190,15 +190,30 @@ def test_the_latch_still_fires_only_once_per_flip():
 # the deadman follows the front's line (no second timer)
 # --------------------------------------------------------------------------
 
-def test_the_deadman_reads_the_fronts_own_line_and_keeps_no_bound_of_its_own():
-    """Item 3 of the spec needed CITATION, not code: the deadman already
-    triggers on the front's `WEG2-FLIP STALL` line, so moving the bound in the
-    front moves it everywhere and the two can never disagree."""
-    txt = open("/spinning/gpu-arb/devtools/boot_deadman.sh").read()
-    assert "WEG2-FLIP STALL" in txt
-    assert "the Weg-2 front's OWN" in txt
-    # and it must not carry its own flip timer
-    assert "FLIP_STALL_SLACK" not in txt
+def test_the_front_emits_exactly_the_marker_the_deadman_keys_on():
+    """Item 3 of the spec needed CITATION, not code -- and the citation lives
+    in the RECORD, not in this file, because it is about a file outside the
+    repo.
+
+    VERIFIED BY HAND (2026-09-10) in `/spinning/gpu-arb/devtools/boot_deadman.sh`:
+    its header line 17 names tier 3 as *"the Weg-2 front's OWN 'WEG2-FLIP
+    STALL' line, read from the log"*, its trigger sets `FLIP_STALL_SEEN=1` off
+    that string (:311), and `FLIP_STALL_SLACK` appears NOWHERE in the script --
+    so the deadman carries no flip timer of its own and moving the bound in the
+    front moves it everywhere.
+
+    WHAT THIS TEST CAN HONESTLY ASSERT is the repo's own half: that the front
+    still emits that exact marker. An earlier revision read the script by
+    absolute path and went red on the remote desk with FileNotFoundError --
+    a hermetic test may not depend on a path outside the worktree, and a
+    `skipif` there would have proved nothing while looking green."""
+    import inspect
+
+    src = inspect.getsource(F.Front.flip_stall_check)
+    assert "WEG2-FLIP STALL" in src, (
+        "the deadman's tier-3 trigger keys on this exact string; renaming it "
+        "disarms the watcher silently"
+    )
 
 
 # --------------------------------------------------------------------------
