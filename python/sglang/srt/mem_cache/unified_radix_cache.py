@@ -3635,7 +3635,22 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # A WINDOW IS A WINDOW: capping the ask at W leaves the ring floor and
         # the resume anchor room the loop needs to take a SECOND step. Group D:
         # 24,576 instead of 30,518, slack 5,942.
-        _window_cap = self._weg2_window_alloc_cap()
+        #
+        # ASKED THROUGH getattr, AND THAT IS THE CURATED-STAND-IN LESSON THIS
+        # FORK HAS ALREADY PAID FOR ONCE (#1298: making `_store_grid_floor` a
+        # method took 6 tests red across three harnesses that bind a curated
+        # list of real methods onto a SimpleNamespace). Five harnesses bind
+        # `prefetch_from_storage` onto such a stand-in, and 27 of them went red
+        # on the direct call in the first gate run of this branch. In
+        # production `self` is always a `UnifiedRadixCache` and the method is
+        # always there; a stand-in that does not carry it simply gets the
+        # pre-#1317k arithmetic, which is what those harnesses are asserting
+        # anyway. The method's EXISTENCE on the class is pinned by
+        # test_weg2_window_liveness_1317k, so this cannot silently disable the
+        # cap in the tree that matters. Same shape as
+        # `draft_tier_armed_for`'s `getattr(cc, "draft_tier_armed", None)`.
+        _cap_fn = getattr(self, "_weg2_window_alloc_cap", None)
+        _window_cap = _cap_fn() if callable(_cap_fn) else None
         # #1068 (slice 4): the span the verdict was taken on, BEFORE any
         # truncation. It is the `need` term of every L1/L2 line below and the
         # token count of the refusal keys (the `_tokens` companion counts the

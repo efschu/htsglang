@@ -10229,7 +10229,14 @@ class Scheduler(
         contract window 1 already runs under.
 
         THE MARK'S LIFECYCLE TABLE (the rule for every new state field):
-          WRITER   this method, from the returned verdict; and nothing else.
+          WRITER   this method, from the returned verdict; AND #1317k's
+                   terminal exit `_weg2_store_load_terminal`, which disarms
+                   the mark because the request it belonged to has just been
+                   answered W88/W89 and removed from the queue. Named here
+                   rather than left for a reader to find: the AST assertion in
+                   test_weg2_store_priced_x_1317 counts the writers of this
+                   field against this table, which is how the third one was
+                   caught the moment it appeared.
           READER   this method, on a later round.
           DELETER  this method, when the verdict stops being
                    ``issued:truncated_group`` -- i.e. the read landed whole,
@@ -10728,7 +10735,14 @@ class Scheduler(
         # not left open.
         #
         # OFF the windowed path the derivation is byte-identical to before.
-        if self._weg2_windowed_store_read_active():
+        # Asked through getattr for the curated-stand-in reason named at the
+        # window-cap call site (#1298's lesson): four harnesses bind this
+        # method onto a SimpleNamespace, and a stand-in that does not carry the
+        # predicate gets the pre-#1317k derivation -- which is exactly what
+        # those harnesses assert. The predicate's existence on the class is
+        # pinned by test_weg2_window_liveness_1317k.
+        _windowed = getattr(self, "_weg2_windowed_store_read_active", None)
+        if callable(_windowed) and _windowed():
             return float("inf")
         span = len(getattr(req, "full_untruncated_fill_ids", None) or
                    getattr(req, "origin_input_ids", None) or ())

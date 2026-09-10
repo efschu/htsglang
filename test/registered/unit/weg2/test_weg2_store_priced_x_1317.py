@@ -280,8 +280,11 @@ def test_the_mark_has_exactly_the_writers_its_lifecycle_table_claims():
         for t in n.targets
         if isinstance(t, ast.Attribute) and t.attr == "_weg2_window_open"
     ]
-    assert len(writers) == 2, (
-        f"expected 2 writers (re-issue + intake arm), got {writers}"
+    assert len(writers) == 3, (
+        f"expected 3 writers (re-issue + intake arm + #1317k's terminal exit, "
+        f"which disarms the mark when the request is answered W88/W89 and "
+        f"removed from the queue -- all three named in the lifecycle table of "
+        f"`_weg2_issue_next_window`), got {writers}"
     )
 
 

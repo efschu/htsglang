@@ -437,8 +437,14 @@ def test_zero_is_documented_the_same_way_in_the_front_and_in_the_launcher():
     # verdict on both bounds. The sentence it describes is unchanged.
     assert ("fits_carrier = carrier_max <= 0 or carrier_est <= carrier_max"
             in inspect.getsource(front.serviceable_route))
-    assert ("if self.carrier_max_tokens > 0 and pt > self.carrier_max_tokens"
-            in inspect.getsource(front.Front.leg1))
+    # #1317k the guard is now a two-line condition (it gained
+    # `and not self.windowed_carrier`), so the single-line spelling is gone.
+    # Asserted on the TERMS rather than on one line's formatting -- the
+    # sentence in the help text is about the terms, and pinning a line break
+    # made this assertion fail on a change that did not touch its subject.
+    _leg1 = inspect.getsource(front.Front.leg1)
+    assert "self.carrier_max_tokens > 0 and pt > self.carrier_max_tokens" in _leg1
+    assert "not self.windowed_carrier" in _leg1
 
 
 def test_the_mamba_pool_carries_the_label_it_registers_under():
