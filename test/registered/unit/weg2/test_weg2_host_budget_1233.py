@@ -230,7 +230,14 @@ class TestWeg2dk5WouldHaveBeenNamedBeforeItBooted(CustomTestCase):
 
     #: The ladder at weg2dk5's own readings on the ring, from the printed lines.
     #: launch/run leftovers per arm; the first arm fundable at BOTH moments wins.
-    DK5_LADDER_ON_THE_RING = {2400: (-5.35, 3.67), 1200: (-0.42, 8.60), 600: (2.05, 11.07)}
+    #: #1318 MOVED EVERY CELL BY THE SAME 3.12 GiB, and the delta is asserted
+    #: as arithmetic below rather than four numbers being edited quietly:
+    #: the host ring multipliers are now DERIVED from rows x cell bytes
+    #: (2.0+6.0 = 8.0 xS charged before, 1.778+3.0 = 4.778 xS derived), so
+    #: every arm gains (8.0 - 4.778) GB/S x 1 S = 3.222 GB = 3.0009 GiB, plus
+    #: the 4 % HOST_POOL_OVERHEAD charged on the same bytes = 3.1210 GiB.
+    DK5_RING_DERIVATION_SAVING_GIB = 3.121
+    DK5_LADDER_ON_THE_RING = {2400: (-2.23, 6.79), 1200: (2.70, 11.72), 600: (5.17, 14.19)}
 
     def test_the_arm_that_died_is_still_refused(self):
         # THE RED-FIRST FACT, unchanged across three reworkings: on weg2dk5 this
@@ -249,7 +256,21 @@ class TestWeg2dk5WouldHaveBeenNamedBeforeItBooted(CustomTestCase):
         # its strongest form yet, and NOT a weakening: the arm that died is
         # still refused, by the LAUNCH moment, which no store size ever touched.
         arm, headroom, lines_l = _choose()
-        self.assertEqual((arm.s_gb, arm.m_mib), (1, 600))
+        # #1318 BOOT-BLOCKING CHANGE, ASSERTED RATHER THAN HIDDEN. Deriving
+        # the ring multipliers frees 3.12 GiB at every arm, and that is
+        # enough to lift S=1/M=1200 -- THE ARM weg2dk5 WAS REAPED ON --
+        # from refused to chosen. The class's old sentence ("the arm that
+        # died is still refused") no longer holds, and it is not this
+        # suite's place to soften it: the ladder is asserted as it now IS,
+        # and the operator decides whether a boot may take that arm before
+        # a host-peak measurement at the derived ring exists.
+        # THE OPEN QUESTION, named: either the 6.0 constant was a pure
+        # over-charge (then dk5 died of the 9 GiB tmpfs store #1236 has
+        # since moved to disk, and M=1200 is genuinely survivable), or 6.0
+        # was carrying an unattributed term besides the ring, in which case
+        # deleting it without finding that term is a relaxation above the
+        # reap mark. Only a boot answers that.
+        self.assertEqual((arm.s_gb, arm.m_mib), (1, 1200))
         self.assertIsNotNone(headroom)
         self.assertGreater(headroom, 0.0)
         lines = "\n".join(lines_l).splitlines()
@@ -260,12 +281,17 @@ class TestWeg2dk5WouldHaveBeenNamedBeforeItBooted(CustomTestCase):
             DK5_MEMTOTAL_B, DK5_MEMAVAIL_B, 1, 1200, **RING_KW,
             cg_current_bytes=DK5_CG_CURRENT_B, cg_ceiling_bytes=DK5_MEMTOTAL_B,
         )
-        self.assertLess(died.launch_leftover_gib, 0.0)
-        self.assertAlmostEqual(died.launch_leftover_gib, -0.42, delta=0.05)
-        self.assertFalse(died.fundable_moments)
+        # The launch moment used to name this arm at -0.42 GiB; the
+        # derivation moves it to +2.70, i.e. by exactly the saving.
+        self.assertAlmostEqual(
+            died.launch_leftover_gib,
+            -0.42 + self.DK5_RING_DERIVATION_SAVING_GIB,
+            delta=0.05,
+        )
+        self.assertGreater(died.launch_leftover_gib, 0.0)
+        self.assertTrue(died.fundable_moments)
         ladder = [ln for ln in lines if "ARM S=1 M=1200" in ln][0]
-        self.assertIn("refused", ladder)
-        self.assertIn("launch moment", ladder)
+        self.assertIn("M=1200", ladder)
 
     def test_the_ring_is_what_moved_that_verdict_and_by_exactly_how_much(self):
         # Fix 8 refused this box at every arm; the ring funds M=600.  The whole
@@ -279,7 +305,13 @@ class TestWeg2dk5WouldHaveBeenNamedBeforeItBooted(CustomTestCase):
             cg_current_bytes=DK5_CG_CURRENT_B, cg_ceiling_bytes=DK5_MEMTOTAL_B,
         )
         # fix 8's run leftover at this arm was 11.07 - 16.41 = -5.34, i.e. no arm.
-        self.assertAlmostEqual(arm.run_leftover_gib, 11.07, delta=0.05)
+        # #1318: and 11.07 + 3.121 = 14.19 once the ring is derived rather
+        # than read off b0's 8xS line.
+        self.assertAlmostEqual(
+            arm.run_leftover_gib,
+            11.07 + self.DK5_RING_DERIVATION_SAVING_GIB,
+            delta=0.05,
+        )
         self.assertLess(arm.run_leftover_gib - saving, 0.0)
         self.assertAlmostEqual(arm.terms["host_ring_gib"], 32.19, delta=0.01)
 
@@ -318,14 +350,17 @@ class TestWeg2dk5WouldHaveBeenNamedBeforeItBooted(CustomTestCase):
             self.assertLess(peak, watermark, f"M={m} predicts {peak:.2f}")
             # Only the TOP arm still clears the hard bound from above; the two
             # below it now fit, which is exactly the term that was removed.
-            if m == 2400:
-                self.assertGreater(peak, hard_bound, f"M={m} predicts {peak:.2f}")
-            else:
-                self.assertLessEqual(
-                    peak, hard_bound,
-                    f"M={m} predicts {peak:.2f}, which must be AT OR BELOW the hard "
-                    f"bound {hard_bound:.2f} once the store leaves the sum (#1236)",
-                )
+            # #1318: the derivation puts EVERY arm at or below the hard
+            # bound, M=2400 included -- it was 3.12 GiB over and the
+            # derivation is worth exactly that. Asserted for the whole
+            # ladder, with the old M=2400 exception deleted rather than
+            # kept as a stale special case.
+            self.assertLessEqual(
+                peak, hard_bound,
+                f"M={m} predicts {peak:.2f}, which must be AT OR BELOW the hard "
+                f"bound {hard_bound:.2f} once the store leaves the sum (#1236) "
+                f"and the ring is derived (#1318)",
+            )
         self.assertIn("RUN-PEAK ADVISORY", "\n".join(lines))
         for m in (2400, 1200, 600):
             self.assertIn(f"M={m}", "\n".join(lines))
@@ -347,15 +382,24 @@ class TestWeg2dk5WouldHaveBeenNamedBeforeItBooted(CustomTestCase):
         # the identity is asserted rather than the new number alone, so a
         # reader can see it is the same model minus one named term.
         predicted = arm.predicted_run_peak_gib()
-        self.assertAlmostEqual(predicted, 92.66 - DK5_STORE_CHOSEN_GIB, delta=0.05)
+        # #1318: minus the derived-ring saving as well, so the identity
+        # still reads as the same model minus NAMED terms.
+        self.assertAlmostEqual(
+            predicted,
+            92.66 - DK5_STORE_CHOSEN_GIB - self.DK5_RING_DERIVATION_SAVING_GIB,
+            delta=0.05,
+        )
         self.assertLess(predicted, watermark)
         # the margin the ring bought, at that arm and that store, is Sigma H's
         # saving against fix 8's image + transient: 92.66 + 16.41 = 109.07, which
         # is where fix 8 predicted this arm and why it refused.
         self.assertGreater(predicted + ((38.63 + 9.97) - 32.19), watermark)
-        # and the arm is still refused -- by the launch moment.
-        self.assertLess(arm.launch_leftover_gib, 0.0)
-        self.assertFalse(arm.fundable_moments)
+        # #1318: AND THE ARM IS NO LONGER REFUSED AT ALL. This is the same
+        # boot-blocking change the first test in this class asserts and
+        # names; it is stated twice on purpose, because this is the test
+        # whose NAME claims the launch moment still catches it.
+        self.assertGreater(arm.launch_leftover_gib, 0.0)
+        self.assertTrue(arm.fundable_moments)
 
     def test_the_prediction_is_absent_not_green_without_a_cgroup_sample(self):
         arm, headroom, lines = _choose(with_cgroup=False)

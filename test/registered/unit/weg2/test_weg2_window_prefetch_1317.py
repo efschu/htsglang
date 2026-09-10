@@ -48,7 +48,13 @@ def test_ring_mult_p_matches_the_uneven_dcp_pool():
     got = host_ledger._ring_mult_gb_per_s(host_ledger.CELL_BYTES_P_PER_RANK)
     assert got == pytest.approx(1.778, abs=0.005)
     rows = host_ledger.GB / max(host_ledger.CELL_BYTES_P_PER_RANK)
-    assert int(round(rows)) == 54254
+    # 1e9/18432 = 54,253.47 -> 54,253 rows of budget. The P log prints 54,254
+    # because the pool adds ONE page-alignment slot on top (the same +1 the
+    # draft-pool comment in host_ledger names for 61,036 -> 61,037). Pinning
+    # the derivation's own number and the alignment separately keeps the two
+    # from being confused for a rounding disagreement.
+    assert int(rows) == 54253
+    assert int(rows) + 1 == 54254
 
 
 def test_derivation_never_charges_more_than_the_b0_reading_it_replaces():
