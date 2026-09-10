@@ -141,6 +141,7 @@ __all__ = [
     "plan_units",
     "refuse_if_plan_exceeds_slot",
     "refuse_if_slot_short",
+    "refuse_if_staging_disagrees",
     "registered_bounce_bytes",
     "run_agreed_leg",
     "run_bounce_leg",
@@ -332,6 +333,55 @@ def refuse_if_plan_exceeds_slot(slot_bytes: int, descs: Sequence[object],
           f"{widest.key[1]} at {widest.nbytes} B against a depth-slot of "
           f"{int(slot_bytes)} B, so the launch-time census that sized the "
           f"buffer under-read this boot's widest layer."
+    )
+
+
+def refuse_if_staging_disagrees(terms: xb.BounceTerms) -> None:
+    """Refuse when the CHARGED staging total is not the lane's real allocation.
+
+    ONE LAUNCHER VALUE MUST FEED BOTH GEOMETRIES (operator order 2026-09-10;
+    section 10.8 step 3's "one reader, or they drift", recorded in 10.10).
+    ``xr.DATA_BYTES`` is what the staging lane actually IS -- the region file is
+    ``DATA_OFF + DATA_BYTES``, and ``XchgRegion.open`` refuses unless the
+    header's geometry matches this build's constants
+    (``weight_exchange_region.py:659``), so the module constant and the shared
+    file cannot disagree.  ``terms.staging_bytes`` is what the #1269 ledger was
+    CHARGED.  A difference means the boot was priced against a lane that does
+    not exist -- in either direction -- and the reap bound is wrong by exactly
+    that difference.
+
+    IT GRADES THE TOTAL AND NOT THE WIDTH, and that choice is measured rather
+    than lazy (10.10).  Today the region cuts its lane as ``N_PAIRS 6 x
+    SLOTS_PER_PAIR 2 x SLOT_BYTES 32 MiB`` while the launcher charges ``pairs 3
+    x 2 x 64 MiB`` -- both 384 MiB.  The charge is therefore correct while the
+    two decompositions disagree about the slot, so grading the WIDTH here would
+    refuse a boot whose ledger is right, for a labelling defect; and warning
+    and continuing would be the #505a class.  The width is pinned instead by
+    ``test_the_totals_agreeing_does_not_prove_the_widths_agree``, a CANARY that
+    goes red the moment section 10.8 step 3's 32 -> 64 raise lands without the
+    launcher's inputs following it -- at which point the total becomes 768
+    against 384 and THIS refusal fires too.
+
+    W68 and no new code: ``Weg2XchgPlanDisagree``'s own docstring is "two
+    things that must agree about this exchange do not", which is this exactly.
+    It is the REGION's class, because that is the one the transport raises
+    (there are two classes of that name -- see 10.10).
+    """
+    charged = int(terms.staging_bytes)
+    actual = int(xr.DATA_BYTES)
+    if charged == actual:
+        return
+    raise xr.Weg2XchgPlanDisagree(
+        f"W68 Weg2XchgPlanDisagree staging: the ledger was charged "
+        f"{charged} B of path-(a) staging (pairs={terms.pairs} x "
+        f"slots_per_pair={xb.SLOTS_PER_PAIR} x slot_bytes={terms.slot_bytes}) "
+        f"but the lane that exists is {actual} B (xr.N_PAIRS={xr.N_PAIRS} x "
+        f"xr.SLOTS_PER_PAIR={xr.SLOTS_PER_PAIR} x "
+        f"xr.SLOT_BYTES={xr.SLOT_BYTES}). One launcher value must feed the "
+        f"region header and bounce_terms(slot_bytes=) -- see section 10.8 "
+        f"step 3 and 10.10. The boot is otherwise priced against a lane that "
+        f"does not exist and the reap bound is wrong by "
+        f"{abs(charged - actual)} B."
     )
 
 
