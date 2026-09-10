@@ -11,7 +11,7 @@ boot observation:
    destination never receives -- plausible garbage, no error, no crash.  The
    arming check walks ``named_parameters()`` + ``named_buffers()`` + a sweep of
    every module's ``__dict__`` for stray ``torch.Tensor`` attributes and
-   refuses by name (**W67 Weg2XchgCoverageRefused**) rather than ship a tag it
+   refuses by name (**W84 Weg2XchgCoverageRefused**) rather than ship a tag it
    cannot account for.  The SLACK (allocator overhang, measured +0.08 to
    +0.58 GiB/rank) is PRINTED, never compared for equality: an equality assert
    would refuse every boot.
@@ -920,7 +920,7 @@ class PlanInterfaceTest(_ChunkedCase):
 class WCodeTest(unittest.TestCase):
     def test_w67_is_the_coverage_refusal_and_says_so_once(self):
         self.assertIn("W67", wms.Weg2XchgCoverageRefused.__doc__ or "")
-        self.assertEqual(wx.COVERAGE_REFUSAL_MARKER, "W67 Weg2XchgCoverageRefused")
+        self.assertEqual(wx.COVERAGE_REFUSAL_MARKER, "W84 Weg2XchgCoverageRefused")
 
     def test_w76_is_the_runner_shape_refusal_and_says_so_once(self):
         self.assertIn("W76", wx.Weg2XchgRunnerShapeUnknown.__doc__ or "")

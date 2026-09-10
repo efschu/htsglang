@@ -1,3 +1,4 @@
+import pytest
 # SPDX-License-Identifier: Apache-2.0
 """#1317n -- D's L2 is DERIVED from the request cap, and the compensation is gone.
 
@@ -331,3 +332,50 @@ class TestTheLaunchMomentIsPricedInOneCurrencyPerBarrier(unittest.TestCase):
         src = inspect.getsource(hl.choose)
         self.assertIn("launch_sum=", src)
         self.assertIn("launch_cur=", src)
+
+
+def test_the_xchg_bounce_is_non_reclaimable_and_costs_the_launch_moment_its_own_size():
+    """#1273 x #1317n, OPERATOR RULING 2026-09-10, derived from the code and not chosen.
+
+    The on-card lane's bounce is a `/dev/shm` file per card, `cudaHostRegister`ed,
+    created at the arm and NOT unlinked by close(). So it is `shmem`, it is
+    NON-RECLAIMABLE, and it exists from launch to teardown. In the reap-currency
+    class split it therefore belongs with the RINGS, not with `LOAD_TRANSIENT`:
+    it counts against the hard bound at the LAUNCH moment AND at the RUN moment.
+    `LOAD_TRANSIENT` is the only exempt term, because it is page cache the reaper
+    reclaims ~30 s after READY; the bounce is not page cache.
+
+    THE DANGER DIRECTION this pins: if the bounce were ever booked as reclaimable
+    -- i.e. exempted from the launch moment the way the load transient is -- the
+    launch leftover would NOT drop by its size and this test goes red. That is
+    the conservative direction of the host-threshold law, which admits no
+    accept-the-risk branch.
+    """
+    from sglang.srt.weg2 import host_ledger as hl
+
+    MT, MA, CG = 126_751_866_880, 111_196_077_056, 22_719_148_032
+    RING = dict(ring_bytes=32964 * 1024 * 1024, ring_span1_bytes=29912 * 1024 * 1024)
+    bounce = 3 * 512 * 1024 * 1024  # three cards, 512 MiB of deposit each
+
+    without = hl.price(
+        MT, MA, 1, 600, cg_current_bytes=CG, cg_ceiling_bytes=MT, **RING
+    )
+    with_bounce = hl.price(
+        MT, MA, 1, 600, cg_current_bytes=CG, cg_ceiling_bytes=MT,
+        xchg_bounce_host_bytes=bounce, **RING
+    )
+
+    gib = bounce / float(1024 ** 3)
+
+    # The LAUNCH moment loses exactly the bounce -- in the priced (reap) figure,
+    # which is the whole point: an exempt term would leave this unchanged.
+    assert with_bounce.terms["launch_leftover_reap_gib"] == \
+        pytest.approx(without.terms["launch_leftover_reap_gib"] - gib, abs=0.02)
+    # and so does the worst case, so the two forms stay consistent with each other
+    assert with_bounce.terms["launch_leftover_sum_gib"] == \
+        pytest.approx(without.terms["launch_leftover_sum_gib"] - gib, abs=0.02)
+    # The RUN moment loses it too -- the deposit outlives the leg.
+    assert with_bounce.run_leftover_gib == \
+        pytest.approx(without.run_leftover_gib - gib, abs=0.02)
+    # On the ring arm with no exchange the term is absent, not merely small.
+    assert without.terms.get("xchg_bounce_gib", 0.0) == pytest.approx(0.0, abs=1e-9)

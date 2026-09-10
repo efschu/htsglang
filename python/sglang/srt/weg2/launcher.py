@@ -9082,7 +9082,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         # optimistic by that much against a reap mark nobody may touch.
         s_gb_d=s_gb_d, d_cap_terms=_l2_terms,
         weight_source=ns.weg2_weight_source,
-        weight_source=ns.weg2_weight_source,
         oncard_mode=ns.weg2_xchg_oncard,
         oncard_slot_mib=ns.weg2_xchg_oncard_slot_mib)
     state.cgroup = dict(cg)

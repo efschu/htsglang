@@ -2041,7 +2041,7 @@ def roll_forward_refusal_message() -> str:
 # ===========================================================================
 
 COVER_LINE_PREFIX = "WEG2-XCHG-COVER"
-COVERAGE_REFUSAL_MARKER = "W67 Weg2XchgCoverageRefused"
+COVERAGE_REFUSAL_MARKER = "W84 Weg2XchgCoverageRefused"
 
 #: MINIMAL INTERFACE, TODO(S1, branch weg2/xchg-s1-0908): the plan half of this
 #: module must expose its parameter population in exactly this shape --
