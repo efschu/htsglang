@@ -10007,12 +10007,29 @@ class Scheduler(
         failure mode is "no store credit", never "the ranks disagree".
         """
         out: Dict[str, int] = {}
+        _tree_only: Dict[str, int] = {}
         if not canonical:
             return out
         try:
             ctrl = getattr(self.tree_cache, "cache_controller", None)
             probe = getattr(ctrl, "store_presence_pages", None)
             if not callable(probe):
+                # #1317c NAMED, not silent: no probe means no store arm at all,
+                # and the X gate then prices exactly as it did before design A.
+                # A boot that reads zero credits must be able to tell this from
+                # "the store held nothing".
+                self._weg2_store_vote_no_probe = (
+                    getattr(self, "_weg2_store_vote_no_probe", 0) + 1
+                )
+                n = self._weg2_store_vote_no_probe
+                if n <= 3 or n % 256 == 0:
+                    logger.warning(
+                        "#1317 X-STORE-VOTE NO PROBE n=%d: the tree cache has no "
+                        "callable store_presence_pages, so this group takes NO "
+                        "store vote and the X gate prices against the tree only "
+                        "(pre-design-A behaviour). (denominator: passes in which "
+                        "the vote was attempted)", n,
+                    )
                 return out
             page_size = int(getattr(self.tree_cache, "page_size", 1) or 1)
             from sglang.srt.mem_cache.hicache_phase_binding import (
@@ -10062,9 +10079,52 @@ class Scheduler(
                 # backend that over-reports can never credit tokens the
                 # request does not have.
                 store_tokens = min(max(0, pages) * page_size, len(span))
+                _tree_only[rid] = local_match
                 out[rid] = min(local_match + store_tokens, total)
-        except Exception:  # noqa: BLE001 - a vote may never break the reduce
+        except Exception as e:  # noqa: BLE001 - a vote may never break the reduce
+            # #1317c THE SWALLOW WAS SILENT, AND THAT IS WHY BOOT weg2sn6c
+            # COULD NOT BE DIAGNOSED. The vote must not raise (an exception
+            # here leaves one rank out of an all_reduce its peers are already
+            # in), but a bare `return out` made FOUR different outcomes look
+            # identical in every log: the probe raised, the probe was absent,
+            # the rid was not in this rank's queue, and the store genuinely
+            # held nothing. weg2sn6c read `X-STORE-CREDIT` = 0 lines with no
+            # way to say which -- the #505a warn-then-continue swallow, in my
+            # own code, on the one path the build exists for.
+            self._weg2_store_vote_raised = (
+                getattr(self, "_weg2_store_vote_raised", 0) + 1
+            )
+            n = self._weg2_store_vote_raised
+            if n <= 5 or n % 64 == 0:
+                logger.warning(
+                    "#1317 X-STORE-VOTE RAISED n=%d %s: %s -- this rank casts an "
+                    "EMPTY store vote for this pass, so the arm MIN-reduces away "
+                    "and the X gate falls back to the tree match (the pre-design-A "
+                    "behaviour). Never a raise: an exception here would leave this "
+                    "rank out of a collective its peers are already in. "
+                    "(denominator: every pass in which the store vote was attempted)",
+                    n, type(e).__name__, e,
+                )
             return out
+        # #1317c NAME THE OUTCOME EVERY PASS, so an absence of credit is
+        # readable as WHICH absence. A census with no denominator is what made
+        # weg2sn6c's zero unreadable.
+        self._weg2_store_vote_passes = getattr(self, "_weg2_store_vote_passes", 0) + 1
+        n = self._weg2_store_vote_passes
+        if n <= 5 or n % 256 == 0:
+            logger.info(
+                "#1317 X-STORE-VOTE n=%d head=%d voted=%d credited=%d zero=%d "
+                "probe=%s (voted: rids of the canonical head this rank holds and "
+                "priced; credited: those whose store depth exceeded their tree "
+                "match; zero: priced but the store held nothing for them -- which "
+                "is the CORRECT answer for a cold prompt whose write-through has "
+                "not landed yet, and must not be read as the arm failing. "
+                "denominator: passes in which the vote was built)",
+                n, len(canonical), len(out),
+                sum(1 for rid, v in out.items() if v > _tree_only.get(rid, 0)),
+                sum(1 for rid, v in out.items() if v <= _tree_only.get(rid, 0)),
+                "callable",
+            )
         return out
 
     def _weg2_local_store_read_pending_ages(self, canonical) -> Dict[str, int]:
