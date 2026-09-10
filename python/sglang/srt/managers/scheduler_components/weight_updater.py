@@ -342,8 +342,11 @@ class SchedulerWeightUpdaterManager:
     #: comment above called it three commits early. ``slots=True`` turns a
     #: lazily-assigned attribute into an ``AttributeError`` ON THE WRITE, and
     #: the two S6b shadow caches were assigned lazily
-    #: (``self._weg2_shadow_region_cache = region`` at what was line 1590,
-    #: ``self._weg2_shadow_manifest_cache = entries`` at 1632).
+    #: (``self._weg2_shadow_region_cache = region``, weight_updater.py:1613 in
+    #: :meth:`_weg2_shadow_region`; ``self._weg2_shadow_manifest_cache =
+    #: entries``, weight_updater.py:1655 in :meth:`_weg2_shadow_manifest`.
+    #: Both line numbers are THIS tree's; the boot log named 1590 because the
+    #: fields above did not exist yet and shifted everything below them.)
     #:
     #: MEASURED, boot weg2xsn7 @ 376ae2a475 -- 24 of 24 legs, BOTH groups,
     #: both hooks: ``manifest=manifest-failed:AttributeError:
