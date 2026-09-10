@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import functools
 import logging
+import os
 import time
 import traceback
 from collections import OrderedDict
@@ -133,6 +134,32 @@ from sglang.srt.weg2.ring_table import (  # noqa: E402
 from sglang.srt.weg2.ring_guard import RingNeedGuard  # noqa: E402
 
 logger = logging.getLogger(__name__)
+
+
+def _weg2_flip_index_of(epoch) -> int:
+    """The FLIP half of ``weg2_memory_saver.credit_epoch``'s ``<boot>.<flip>``.
+
+    #1273 S5b.  The shadow needs a leg index for its rotation and for the
+    region's per-flip stamp, and this class holds no flip counter of its own --
+    the front owns it and publishes it exactly here, on the request.  Parsing
+    it back out is a READ of the front's number, not a second counter beside
+    it; inventing one would be the cross-boot regression ``credit_epoch``'s own
+    docstring describes, one seam over.
+
+    ``-1`` when there is no epoch or its tail is not an integer, and ``-1`` is
+    load-bearing: ``XchgRegion.begin_flip`` refuses an index that does not
+    advance past ``flip_index`` (initialised to ``-1``), so an undated leg
+    cannot stamp a region and the shadow reports ``reason=no-region`` instead
+    of adopting some other flip's rows.
+    """
+    token = str(epoch or "")
+    if "." not in token:
+        return -1
+    try:
+        return int(token.rsplit(".", 1)[1])
+    except (TypeError, ValueError):
+        return -1
+
 
 
 def _get_draft_model_runner(draft_worker):
@@ -788,10 +815,32 @@ class SchedulerWeightUpdaterManager:
         # model_runner's `enable_weights_cpu_backup or (is_draft_worker and
         # enable_draft_weights_cpu_backup)` is False for BOTH shards here.
         #
+        # #1273 S2 (refuter F6): the region tag is DERIVED, and the same
+        # statement that opens the region publishes it, so this site and
+        # model_runner's boot load cannot silently disagree about the tag the
+        # post-load repack (`weight_chunk_scope`, model_loader/loader.py:941)
+        # restores.  Under --weg2-weight-source exchange with a draft shard in
+        # this process the derivation REFUSES: one region carries one tag and
+        # this call refills two shards that now want two.
+        from sglang.srt.managers.weg2_memory_saver import weights_region
+        from sglang.srt.weg2.weight_exchange import (
+            roll_forward_refusal_message,
+            roll_forward_weights_tag,
+        )
+
+        weights_reload_tag = roll_forward_weights_tag(
+            has_draft_shard=self.draft_worker is not None
+        )
+        if weights_reload_tag is None:
+            raise Weg2WakeRefused(
+                "W4 Weg2WakeRefused: " + roll_forward_refusal_message()
+            )
+
         # Region outside, PCIe lock inside: the region must cover every
         # allocation the loader makes, the lock only the link.
-        with self.memory_saver_adapter.region(
-            GPU_MEMORY_TYPE_WEIGHTS,
+        with weights_region(
+            self.memory_saver_adapter,
+            weights_reload_tag,
             enable_cpu_backup=False,
         ):
             with self._weg2_pcie_lock("wake-H2D weights reload"):
@@ -1191,12 +1240,58 @@ class SchedulerWeightUpdaterManager:
         return weg2_group_name() or "?"
 
     def _weg2_rank(self) -> int:
+        """THIS RANK's 0..2 index inside its Weg-2 group, or ``-1``.
+
+        MEASURED-BY-BOOT DEFECT (weg2shadowC, #1273 S6 fix C).  This read
+        ``getattr(scheduler, "tp_rank")`` then ``"pp_rank"`` -- and **the
+        Scheduler has neither**.  It keeps its parallel identity on the
+        ``ParallelState`` wrapper, which the tree already states in three
+        places, each written after the same read raised somewhere else
+        (``scheduler.py:1766``, ``:8157-8161``, ``:14502-14504``).  Here it
+        could not raise: the read is ``getattr(..., None)`` behind an
+        ``isinstance(..., int)`` test, so it degraded SILENTLY to -1 on every
+        rank of every Weg-2 boot.  Two consequences, one root:
+
+        * every ``WEG2-FLIP-TAG`` line ever emitted printed ``rank=-1`` --
+          210 of 210 in boot weg2shadowC's four rank logs -- and instead of
+          the emitter being fixed, ``ring_table`` WIDENED its parser to
+          ``rank=(-?\\d+)`` and grew a synthetic per-card index for it
+          (``ring_table.py:159-166``, W37's docstring at ``:866``);
+        * ``_weg2_shadow_hook``'s ``rank < 0`` gate returned before
+          ``run_leg_hook`` on all four flips of both shadow arms, so the whole
+          observer -- plan, sems, on-card refusals, the byte compare -- was a
+          single silent ``return``.
+
+        THE IDENTITY IS THE WORLD GROUP'S, NOT ``ps``.  ``scheduler.ps`` is
+        PHASE state: the cutover REPLACES it with ``pp_rank=0`` on every rank
+        (``phase_flip_runtime.py:3366-3374``, stated verbatim at ``:12235``),
+        so it cannot tell ranks apart on a flip boot.  ``world_group`` is bound
+        once (``scheduler.py:1867``) and the cutover rebinds the tp/attn/pp
+        handles beside it but never this one; it is also the identity the
+        cutover itself reads (``:3323``).
+
+        AND ``ps.tp_rank`` ALONE WOULD BE WORSE THAN -1.  Group P runs
+        ``pp_size=3, tp_size=1`` and group D ``pp_size=1, tp_size=3``
+        (``launcher.py:6525``), so on P ``ps.tp_rank`` is 0 on all three ranks:
+        three publishers on row 0 of the six-row gate matrix -- silently WRONG
+        where -1 was merely silently absent.  The ``ps`` fallback below is
+        therefore the FLAT world rank, the same arithmetic
+        ``Scheduler._admin_world_rank`` uses, which reduces correctly on both
+        group shapes and in both ``ps`` states.
+
+        ``-1`` survives as the answer where there is genuinely no identity to
+        read.  It may not become 0: rank 0 is a real row another rank owns.
+        """
         scheduler = self.scheduler
-        for attr in ("tp_rank", "pp_rank"):
-            value = getattr(scheduler, attr, None)
-            if isinstance(value, int):
-                return value
-        return -1
+        world_rank = getattr(
+            getattr(scheduler, "world_group", None), "rank_in_group", None)
+        if isinstance(world_rank, int):
+            return world_rank
+        ps = getattr(scheduler, "ps", None)
+        try:
+            return int(ps.pp_rank) * int(ps.tp_size) + int(ps.tp_rank)
+        except Exception:  # noqa: BLE001 -- an unreadable identity is -1
+            return -1
 
     def _weg2_backup_census(self, weights_tags, tag_bytes):
         """``({tag: bytes}, population)`` -- A1-2's per-card dormant image.
@@ -1312,6 +1407,591 @@ class SchedulerWeightUpdaterManager:
             return int(nvml_registry.memory_info_for_uuid(uuid_key).free_bytes)
         except Exception:  # noqa: BLE001
             return None
+
+    # ------------------------------------------------------------------
+    # #1273 S5b -- THE TWO SHADOW HOOKS.
+    #
+    # Two THIN adapters, and deliberately nothing else: they gather the
+    # arguments this leg already holds and call
+    # ``weight_exchange_shadow.run_leg_hook``, which owns every decision, every
+    # refusal and the run's lifetime.  The bodies live in that module because
+    # this class cannot be constructed without a model runner, a torch process
+    # group and a device, so a hook written HERE is a hook no hermetic test can
+    # drive -- and the S5 round has now paid twice for logic that no arm
+    # reached (refuter finding 1's ``bind_scratch``, review finding 2's
+    # unpinned guard).
+    #
+    # UPSTREAM-MINIMAL: this is two calls appended to the two existing weights
+    # legs, not a second scheduler, not a thread, not an RPC.  The ring remains
+    # the only authority for weight bytes; both adapters catch
+    # ``BaseException`` and return, so no shadow failure can reach a flip.
+    # ------------------------------------------------------------------
+
+    def _weg2_device_index(self) -> int:
+        """THIS RANK's CUDA ordinal, read from torch.  ``-1`` when unreadable.
+
+        MEASURED-BY-REVIEW DEFECT (S5b refuter, must_fix 3): this was the
+        literal ``0``.  The launcher hands EVERY rank the same
+        ``CUDA_VISIBLE_DEVICES`` -- all three card uuids, one string, both
+        groups (``launcher.py`` builds ``cvd`` from every card) -- exactly so
+        that ``weight_exchange_region``'s "rank *n* of either group runs on
+        ``cards[n]``" holds.  So a rank's own device is its ordinal, not 0, and
+        a hardcoded 0 makes the observer (i) ``cudaMalloc`` on ANOTHER rank's
+        card, (ii) price that allocation against its own card's free column and
+        uuid, and (iii) leave the SCHEDULER THREAD -- the flip leg's own thread
+        -- on device 0, because ``CudartDeviceOps.set_device`` is a bare
+        ``cudaSetDevice`` with no restore.  A zero-authority observer that moves
+        the authoritative thread's current device is danger (a) in its plainest
+        form.
+
+        Read from torch and never assumed: torch is what the leg thread's
+        device actually is, and ``_weg2_card_uuid`` already resolves this card
+        through it, so the two cannot name different cards.
+        """
+        try:
+            import torch
+
+            if torch.cuda.is_available():
+                return int(torch.cuda.current_device())
+        except Exception:  # noqa: BLE001 -- an observer never raises
+            pass
+        return -1
+
+    def _weg2_shadow_gate_rows(self, hook: str, group: str):
+        """The rows this hook may expect to see voted AT THIS INSTANT.
+
+        MEASURED-BY-REVIEW DEFECT (S5b refuter, must_fix 1).  The two hooks sit
+        at OPPOSITE ENDS OF THE FLIP: the source runs on the SLEEPING group
+        before its ``pause``, the destination on the WAKING group after its
+        ``resume`` and its disk reload -- and on a co-located card the waking
+        rank is fenced (C14) on the credit the sleeping rank publishes INSIDE
+        its pause loop, i.e. after its own hook.  A source rank that waits for
+        all six rows therefore waits for three rows that cannot be written
+        until it stops waiting: a circular wait, resolved only by the gate
+        expiry, paid by every sleeping rank on every flip, on the critical path
+        of that credit.
+
+        So the source expects its OWN group's three rows -- the ranks that are
+        at the same instant of the same flip -- and the destination expects all
+        six, because the source rows were sealed earlier in this same flip with
+        this region's ``epoch_hash`` and this ``leg`` and are therefore free.
+        ``None`` means all six.
+        """
+        from sglang.srt.weg2 import weight_exchange_region as xr
+
+        if hook != "source" or group not in ("P", "D"):
+            return None
+        return tuple(xr.rank_row(group, r) for r in range(xr.N_CARDS))
+
+    def _weg2_shadow_param_census(self, group: str, rank: int) -> None:
+        """ONE LINE PER RANK, ONCE: the pp/tp asymmetry, read off the LOG.
+
+        #1273 S6 fix F2, and it is the "cheap evidence" SECTION 1ai-F-root's
+        UNPROVEN 2 named: the claim that group P holds PIPELINE STAGES and
+        group D TENSOR SHARDS of the same card was read out of ``launcher.py``
+        and corroborated only indirectly, by six disagreeing storage digests.
+        A count plus the first and last parameter name per rank settles it from
+        the boot's own log instead, and costs one sorted walk of
+        ``named_parameters`` at the first hook of the boot.
+
+        Never raises and never repeats: an observer that cost a leg its wall on
+        every flip would be paying for evidence with the thing it observes.
+        """
+        if getattr(type(self), "_weg2_param_census_done", False):
+            return
+        try:
+            type(self)._weg2_param_census_done = True
+            runner = getattr(self.tp_worker, "model_runner", None)
+            model = getattr(runner, "model", None)
+            if model is None:
+                return
+            names = sorted(n for n, _ in model.named_parameters())
+            if not names:
+                return
+            logger.info(
+                "WEG2-XCHG-SHADOW PARAM-CENSUS group=%s rank=%s params=%d "
+                "first=%s last=%s -- the pp/tp asymmetry, from this rank's own "
+                "named_parameters(): a PP stage carries whole layers over a "
+                "SUBSET of layer indices, a TP shard carries slices of EVERY "
+                "layer, and the two are why the co-located pair's whole-storage "
+                "digests differ while their on-card PIECE sets agree (#1273 S6 "
+                "fix F2, SECTION 1ai-F-fix)",
+                group, rank, len(names), names[0], names[-1],
+            )
+        except BaseException:  # noqa: BLE001 -- an observer never raises
+            pass
+
+    def _weg2_shadow_region(self):
+        """This process's shadow region, opened once and kept.  ``None`` if absent.
+
+        #1311 S6b.  The card manifest has to be published and read BEFORE the
+        plan is derived (the plan is narrowed by the agreement), and the plan is
+        derived before ``run_leg_hook`` opens its own region for the transport.
+        So this adapter opens one itself, from the SAME two env vars
+        ``ShadowLeg.attach`` reads -- no second channel is invented.
+
+        CACHED PER PROCESS, and that is correct rather than convenient: the
+        region file is per BOOT (its ``boot_hash`` names the boot nonce) and is
+        merely re-STAMPED per flip, while what this adapter reads and writes --
+        the manifest rows -- are keyed on ``boot_hash`` and are boot constants.
+        The transport's own region handle stays :class:`ShadowLeg`'s; this one
+        is never handed to a leg and never begins a flip.
+
+        Never raises: an observer that took a flip down over its own bookkeeping
+        would be the thing this whole slice exists not to be.
+        """
+        cached = getattr(self, "_weg2_shadow_region_cache", "unset")
+        if cached != "unset":
+            return cached
+        region = None
+        try:
+            from sglang.srt.weg2 import weight_exchange_region as xr
+
+            path = (os.environ.get(xr.ENV_REGION_PATH, "") or "").strip()
+            boot = (os.environ.get(xr.ENV_REGION_BOOT, "") or "").strip()
+            if path and boot:
+                region = xr.XchgRegion.open(path, expect_boot=boot)
+        except BaseException:  # noqa: BLE001 -- an observer never raises
+            region = None
+        self._weg2_shadow_region_cache = region
+        return region
+
+    def _weg2_shadow_manifest(self, group: str, peer: str, rank: int, *,
+                              leg: int, epoch: str):
+        """Publish this rank's card manifest and agree with the co-located peer.
+
+        ``(AgreedPieces | None, state)``.  THE FIX FOR BOOT weg2xsn5's W80.
+
+        The manifest itself is a BOOT constant and is derived once per process;
+        the reconciliation runs per leg because the PEER's row appears at the
+        peer's own first hook, which is a different instant of a different flip
+        half.  Reconciling is one shared-memory read plus a set intersection --
+        microseconds against a derivation that walks every parameter.
+
+        Never raises.  A ``None`` agreement is a NAMED state on the log, never a
+        quiet fall-back to this rank's own view: the fall-back IS the defect
+        this closes.
+        """
+        try:
+            from sglang.srt.weg2 import weight_exchange as wx
+            from sglang.srt.weg2 import weight_exchange_region as xr
+            from sglang.srt.weg2 import weight_exchange_shadow as sh
+
+            region = self._weg2_shadow_region()
+            if region is None:
+                return None, "no-region"
+            entries = getattr(self, "_weg2_shadow_manifest_cache", None)
+            if entries is None:
+                runner = getattr(self.tp_worker, "model_runner", None)
+                model = getattr(runner, "model", None)
+                region_tag = ""
+                if runner is not None:
+                    try:
+                        region_tag = wx.weights_region_tag_for(
+                            wx.RunnerShape.of(runner))
+                    except BaseException:  # noqa: BLE001
+                        region_tag = ""
+                entries, reason = sh.derive_card_manifest(
+                    rank=int(rank), model=model, region_tag=region_tag)
+                if entries is None:
+                    return None, f"no-manifest:{reason}"
+                self._weg2_shadow_manifest_cache = entries
+            row = xr.rank_row(group, int(rank))
+            peer_row = xr.rank_row(peer, int(rank))
+            agreed, state = sh.reconcile_card_manifest(
+                region, row=row, peer_row=peer_row, entries=entries)
+            # ONE LINE PER LEG, AND IT NAMES BOTH CARDINALITIES.  The states
+            # that are not ``agreed`` are the ones a boot record has to be able
+            # to count, and two of them are ordinary startup rather than a
+            # fault -- which is why only the overflow carries a W-code.
+            logger.info(sh.manifest_state_message(
+                state=state, rank=int(rank), row=row, peer_row=peer_row,
+                leg=int(leg), epoch=str(epoch), mine=len(entries),
+                theirs=(agreed.theirs if agreed is not None else -1)))
+            return agreed, state
+        except BaseException as exc:  # noqa: BLE001 -- an observer never raises
+            return None, f"manifest-failed:{type(exc).__name__}"
+
+    def _weg2_shadow_plan(self, hook: str, group: str, rank: int, *,
+                          agreed=None):
+        """THE PRODUCT CALL SITE OF ``weight_exchange.build_plan``.
+
+        SECTION 1ai-S5b-fix's UNPROVEN 2 in its own words -- *"``build_plan``
+        has no product caller ... unchanged, and still the largest gap"* -- is
+        closed here.  The derivation itself lives in
+        ``weight_exchange_shadow.derive_leg_plan``, deliberately, and this
+        method is four lines of argument gathering: the mixin cannot be
+        constructed without a model runner, a process group and a device, so
+        anything written INTO it is code no hermetic test can drive (the same
+        reason the two hooks are free functions over plain arguments).
+
+        THE MODEL IS THIS RANK'S OWN LIVE ONE and the region tag is the one its
+        weights were actually opened with (``weights_region_tag_for``), so a
+        runner whose weights are OUT of the exchanged family (the drafter under
+        an armed exchange) derives no family tags and refuses by name rather
+        than planning bytes nobody exchanges.
+
+        ``(None, reason)`` on every failure, including an exception: a
+        derivation that raised into a flip leg would be the observer taking the
+        authority this slice exists not to have.
+        """
+        try:
+            from sglang.srt.weg2 import weight_exchange as wx
+            from sglang.srt.weg2 import weight_exchange_shadow as sh
+
+            runner = getattr(self.tp_worker, "model_runner", None)
+            model = getattr(runner, "model", None)
+            region_tag = ""
+            if runner is not None:
+                try:
+                    region_tag = wx.weights_region_tag_for(
+                        wx.RunnerShape.of(runner))
+                except BaseException:  # noqa: BLE001 -- an unclassified shape
+                    region_tag = ""
+            return sh.derive_leg_plan(
+                hook=str(hook), group=str(group),
+                peer=("D" if group == "P" else "P"), rank=int(rank),
+                model=model, region_tag=region_tag,
+                # #1311 S6b.  ``require_agreement`` is the half that must not be
+                # forgotten: without it a leg whose peer has not published would
+                # silently fall back to this rank's own inventory, which is
+                # exactly the rank-local derivation boot weg2xsn5 refused 7 of 8
+                # legs on.  The product refuses by name instead.
+                agreed=agreed, require_agreement=True)
+        except BaseException as exc:  # noqa: BLE001 -- an observer never raises
+            return None, f"derivation-failed:{type(exc).__name__}"
+
+    def _weg2_shadow_hook(self, hook: str, *, recv_req, reserve_bytes: int = 0,
+                          ring_ms=None) -> None:
+        """Run one leg's shadow, or return having touched nothing.
+
+        THE ARM IS CHECKED FIRST AND CHEAPLY.  ``shadow_armed()`` reads
+        ``--weg2-weight-source``; on ``ring`` -- the default and every boot that
+        has run to date -- it is False and this method returns after ONE module
+        import, before a device call, an allocation, an env write or a single
+        line of the exchange's machinery.  That is what keeps the default leg
+        byte-identical, and it is what
+        ``test_the_hooks_are_never_reached_on_the_ring_arm`` proves with a
+        tripwire on every door out of the arm check.
+
+        (The docstring used to claim it returned "before importing" anything;
+        it did not, and does not -- ``shadow_armed`` lives in the shadow module
+        and reading it is an import.  S5b refuter, non-blocking finding: a
+        claim a reader can refute by looking two lines up is worse than no
+        claim.  What is byte-identical is the DEVICE and the ALLOCATOR, not the
+        import table.)
+        """
+        try:
+            from sglang.srt.weg2 import weight_exchange_shadow as sh
+
+            if not sh.shadow_armed():
+                return
+            from sglang.srt.weg2 import weight_exchange_region as xr
+
+            group = self._weg2_group_name()
+            rank = self._weg2_rank()
+            if group not in ("P", "D") or rank < 0:
+                # THE DISCRIMINATOR BOOT weg2shadowC DID NOT HAVE.  Both
+                # pre-flight gates used to return without a word, so "the arm
+                # never reached this rank" and "this rank has no identity"
+                # produced byte-identical evidence -- nothing -- and the boot
+                # could not separate the two readings that mattered.  The ARM
+                # gate above stays silent on purpose: it fires on every ring
+                # boot, i.e. every boot that has ever run.  THIS one fires only
+                # under an armed shadow, where a silent return is the defect;
+                # it is the same W79 line every other rank-local refusal on
+                # this path already uses, so no reader learns a new shape.
+                logger.info(sh.rank_local_skip_message(
+                    reason="no-identity", rank=rank,
+                    leg=_weg2_flip_index_of(getattr(recv_req, "epoch", None)),
+                    epoch=str(getattr(recv_req, "epoch", "") or ""),
+                    detail=f"hook={hook} group={group} rank={rank} -- the "
+                           f"rank's own index inside its Weg-2 group is what "
+                           f"xr.rank_row keys the six gate rows by"))
+                return
+            device = self._weg2_device_index()
+            if device < 0:
+                logger.info(sh.rank_local_skip_message(
+                    reason="no-device", rank=rank,
+                    leg=_weg2_flip_index_of(getattr(recv_req, "epoch", None)),
+                    epoch=str(getattr(recv_req, "epoch", "") or ""),
+                    detail="torch reports no CUDA device on this rank"))
+                return
+            # ------------------------------------------------------------
+            # #1273 S6 fix D -- THE IDENTITY SWEEP, not one more instance.
+            #
+            # Boot weg2shadowD found the SAME SHAPE one level up: the flip
+            # index degraded to -1, was COMPOSED INTO A STAMP
+            # (``weight_exchange_shadow.py:2753``,
+            # ``f"{boot_nonce}.{int(i.leg)}"``) and handed to
+            # ``XchgRegion.begin_flip``, which refused it as **W68
+            # Weg2XchgPlanDisagree** -- a name that says "the plan disagrees"
+            # about a leg whose actual condition is "this is not a flip".
+            #
+            # The three legs that produced it were group P's BOOT-TIME initial
+            # sleep at its own READY (14:33:55Z), 73 s BEFORE the first flip
+            # began (14:35:08Z).  That leg carries no epoch because no flip
+            # exists yet -- the W79 printed ``epoch=`` EMPTY, not malformed --
+            # so the -1 was honest and only its downstream use was not.
+            #
+            # UPSTREAM-MINIMAL, and it is why no counter is added here: the
+            # FRONT owns the flip counter and publishes it on the request
+            # (``front.py:2667`` composes ``credit_epoch(boot, self.epoch)``
+            # and sends it on BOTH gathered legs, ``:2676-2680``); every real
+            # flip leg of shadowD carried ``epoch=1788964408.0`` / ``.1``
+            # correctly.  ``credit_epoch``'s own docstring records what a
+            # rank-local counter costs -- a cross-boot collision that fed C14
+            # a previous boot's credit.  So the authority is the request, and
+            # the right behaviour when it is absent is to REFUSE BY NAME, never
+            # to invent an index and never to let the sentinel travel.
+            #
+            # THE CLASS, swept here in one place: every identity this hook
+            # reads is resolved BEFORE the inputs are built, and any one that
+            # is missing becomes a NAMED W79 refusal instead of a sentinel that
+            # downstream code has to recognise.  The sentinels that used to
+            # travel were: leg=-1 / epoch="" (W68, above), card_uuid="unknown"
+            # (an unnamed card priced and charged as if it were a real one),
+            # and free_mib=0 (an UNREADABLE NVML free column priced as a FULL
+            # card -- ``price_shadow`` would then refuse UNAFFORDABLE giving
+            # the wrong reason, which is worse than not pricing).
+            # ------------------------------------------------------------
+            leg = _weg2_flip_index_of(getattr(recv_req, "epoch", None))
+            epoch_token = str(getattr(recv_req, "epoch", "") or "")
+            if leg < 0:
+                logger.info(sh.rank_local_skip_message(
+                    reason="no-flip-epoch", rank=rank, leg=leg,
+                    epoch=epoch_token,
+                    detail=f"hook={hook} -- this leg carries no flip epoch, so "
+                           f"it is not a flip: the front publishes the index on "
+                           f"the request (front.py:2667) and the boot-time "
+                           f"initial sleep runs before any flip exists.  A leg "
+                           f"with no flip identity may not stamp a region"))
+                return
+            card_uuid = self._weg2_card_uuid()
+            if not card_uuid:
+                logger.info(sh.rank_local_skip_message(
+                    reason="no-card", rank=rank, leg=leg, epoch=epoch_token,
+                    detail=f"hook={hook} -- NVML could not name this rank's "
+                           f"card, and every shadow term (the price, the "
+                           f"deposit charge, the W77 line) is keyed by it"))
+                return
+            peer = "D" if group == "P" else "P"
+            free_bytes = self._weg2_free_bytes()
+            if free_bytes is None:
+                logger.info(sh.rank_local_skip_message(
+                    reason="no-free-column", rank=rank, leg=leg,
+                    epoch=epoch_token,
+                    detail=f"hook={hook} card={card_uuid} -- the LIVE NVML free "
+                           f"column is what price_shadow grades against and it "
+                           f"could not be read; pricing against 0 would refuse "
+                           f"UNAFFORDABLE naming a full card that is not full"))
+                return
+            self._weg2_shadow_param_census(group, rank)
+            # #1311 S6b -- THE CARD MANIFEST, BEFORE THE PLAN AND NOT AFTER.
+            # The plan is narrowed to the pair's agreed piece set, and
+            # ``coalesce`` merges descriptors across parameter names, so the
+            # narrowing has to happen on the INVENTORY inside the derivation.
+            # That is why the agreement is reconciled here, one call earlier,
+            # rather than inside ``run_leg_hook`` where the region is opened
+            # for the transport.
+            agreed, manifest_state = self._weg2_shadow_manifest(
+                group, peer, int(rank), leg=leg, epoch=epoch_token)
+            plan, plan_reason = self._weg2_shadow_plan(str(hook), group,
+                                                       int(rank),
+                                                       agreed=agreed)
+            # THE MANIFEST STATE RIDES THE PLAN REASON, so the one line a
+            # refused leg prints (W79 ``no-plan``) says WHY the pair could not
+            # agree and not merely that it did not.
+            if plan_reason:
+                plan_reason = f"{plan_reason} manifest={manifest_state}"
+            inputs = sh.ShadowLegInputs(
+                leg=leg,
+                epoch=epoch_token,
+                direction="d2h" if hook == sh.HOOK_SOURCE else "h2d",
+                hook=str(hook),
+                rank=int(rank),
+                row=xr.rank_row(group, int(rank)),
+                peer_row=xr.rank_row(peer, int(rank)),
+                device=int(device),
+                card_uuid=card_uuid,
+                free_mib=int(free_bytes // MIB_),
+                resume_reserve_bytes=int(reserve_bytes),
+                ring_ms=ring_ms,
+                gate_rows=self._weg2_shadow_gate_rows(str(hook), group),
+                plan_reason=str(plan_reason),
+                # THE ON-CARD LANE HAS NO CONCURRENT PEER ON THIS PLACEMENT.
+                # Same structural fact as ``_weg2_shadow_gate_rows`` above, one
+                # consequence further on (S5c refuter, must_fix 3): the source
+                # hook is UPSTREAM of the pause loop whose ``credit.publish``
+                # the co-located waking rank's ``resume`` is fenced on (C14),
+                # and the destination hook runs after that resume -- so while
+                # either hook holds this scheduler thread, the other end of the
+                # bounce cannot be running.  It is FALSE HERE and nowhere else
+                # -- S6's RPC handler drives both ends inside one call and
+                # passes the default.
+                #
+                # S6 CHANGED WHAT THIS FLAG BUYS, not where it is set.  It used
+                # to mean "refuse the lane"; it now means "this lane must be
+                # STORE-AND-FORWARD", which is the shape that needs no
+                # concurrent peer: the source fills one slot per batch, seals
+                # the rows and returns inside its own leg, and the destination
+                # hook -- after the C14-fenced resume, in its own later leg --
+                # opens the same ``/dev/shm`` file and reads them.  The drain
+                # that could not be drained is gone by arithmetic (every
+                # ``seq - slots`` is negative) rather than by a branch, so
+                # ``blocked_ms`` stays 0.000 and the destination now has bytes
+                # to COMPARE.  A shape that does not fit is still refused by
+                # name, and the refusal is now W81 (the deposit) instead of the
+                # blameless placement line.
+                oncard_drainable=False,
+                # #1311 S6b -- WHY THE ON-CARD LANE STILL DOES NOT RUN, and
+                # it is NOT this flag.  ``run_leg_hook``'s ShadowLegInputs path
+                # already derives ``store_forward = not oncard_drainable``
+                # (``weight_exchange_shadow.py:3855``), so setting
+                # ``oncard_drainable=False`` here IS asking for the deposit.
+                # Boot weg2xsn5's 24 ``WEG2-XCHG-SHADOW-ONCARD-REFUSED`` lines
+                # came through the OTHER half of that refusal's condition:
+                # ``deposit_refusal_reason`` returns ``DEPOSIT_REASON_IPC`` for
+                # every mode that is not ``host``
+                # (``weight_exchange_transport.py:1607``) and the boot ran
+                # ``--weg2-xchg-oncard ipc``.  An exported VRAM bounce is freed
+                # with the leg that exported it, so store-and-forward is a
+                # ``host``-arm shape by construction and no code change here can
+                # give the ipc arm one.  What #1311 changed is that the refusal
+                # LINE now names the arm and the action instead of blaming the
+                # placement the deposit already defeats -- and the ledger term
+                # below is only read on the host arm
+                # (``_weg2_shadow_host_budget``), which is the other half a
+                # host-arm boot needs.
+                # WHAT THE #1269 LEDGER CHARGED FOR ONE CARD'S DEPOSIT.  The
+                # adapter is the producer because the budget is a property of
+                # the BOOT's arm and a rank hook cannot read the launcher's
+                # ladder; the value comes from the ledger's own function, so
+                # the charge and the bound are one number and cannot drift.
+                # An unreadable ledger yields 0, which REFUSES -- pinned host
+                # bytes nothing charged for are exactly what
+                # host-schwelle-nie-uebertreten forbids.
+                host_bounce_budget_bytes=self._weg2_shadow_host_budget(),
+            )
+            try:
+                sh.run_leg_hook(inputs, log=logger.info, plan=plan)
+            finally:
+                # THE LEG THREAD'S DEVICE IS PUT BACK, ALWAYS.  The shadow's
+                # raw ``cudaMalloc`` and its stream both go through
+                # ``CudartDeviceOps.set_device``, which is a bare
+                # ``cudaSetDevice`` with no save/restore, so without this the
+                # observer decides what device the AUTHORITATIVE leg continues
+                # on.  Restoring through torch (not through the ops layer) is
+                # deliberate: torch's current device is the one the rest of
+                # this leg reads.
+                self._weg2_restore_device(device)
+        except BaseException as exc:  # noqa: BLE001 -- an observer never raises
+            logger.warning(
+                "[weg2 shadow] the %s hook failed and the flip is unaffected "
+                "(%s: %s) -- the ring is and stays the only authority for "
+                "weight bytes",
+                hook, type(exc).__name__, exc,
+            )
+
+    def _weg2_shadow_host_budget(self) -> int:
+        """One card's charged deposit budget, in bytes, or 0 (#1273 S6).
+
+        ONE READER OF ONE NUMBER.  ``host_ledger.xchg_bounce_bytes_per_card``
+        is the same function the launcher's ARM line charges with, so the
+        budget a rank enforces and the term the ledger carries are the same
+        arithmetic rather than two copies of it.  Zero on any failure, and zero
+        REFUSES the deposit downstream: an observer that could not read its own
+        budget must not pin host memory on a guess.
+
+        IT ASKS THE ARM FIRST, AND THAT IS THE HALF THAT WAS MISSING (S6
+        refuter, finding 6 + must_fix 4).  The launcher charges the deposit
+        ONLY on the ``host`` on-card arm; a rank that returned the full budget
+        on every arm would authorise a deposit against a term the ledger did
+        not carry -- host bytes above the reap mark by exactly the amount
+        nobody paid for, which ``host-schwelle-nie-uebertreten`` forbids.  The
+        arm is read from the value the launcher PUBLISHED
+        (``resolve_shadow_oncard_mode``), i.e. the same string that decided the
+        charge, so the two cannot disagree.  With that, the ``except`` arm
+        below is no longer the only path to 0: ``ipc`` reaches it by design.
+        """
+        try:
+            from sglang.srt.weg2 import host_ledger as hl
+            from sglang.srt.weg2 import weight_exchange_shadow as wxs
+            from sglang.srt.weg2 import weight_exchange_transport as tp
+
+            if wxs.resolve_shadow_oncard_mode() != tp.ONCARD_MODE_HOST:
+                return 0
+            return int(hl.xchg_bounce_bytes_per_card())
+        except Exception:  # noqa: BLE001 -- an observer never raises
+            return 0
+
+    def _weg2_restore_device(self, device: int) -> None:
+        """Put the calling thread's CUDA device back where the hook found it."""
+        try:
+            import torch
+
+            if torch.cuda.is_available() and int(device) >= 0:
+                torch.cuda.set_device(int(device))
+        except Exception:  # noqa: BLE001 -- an observer's unwind
+            pass
+
+    def _weg2_shadow_source_leg(self, recv_req) -> None:
+        """SOURCE hook, sleep leg.  Placed BEFORE the pause loop, not after it.
+
+        **STATED DEVIATION from the S5b brief's parenthetical** ("after the ring
+        save has the bytes"), with the reason: the exporter READS this rank's
+        live weight tensors, and they are allocated inside
+        ``region(GPU_MEMORY_TYPE_WEIGHTS)`` (``model_runner.py:2344-2348``), so
+        after ``memory_saver_adapter.pause(tag)`` they are UNMAPPED PAGES.  A
+        read there is the campaign (a) fault on the sibling tag, and the
+        prohibition is pinned by
+        ``test_weights_block_pause_is_the_last_statement``.  So the hook sits at
+        the last instant the bytes exist on the device: after the census and the
+        C14 credit -- i.e. after the ring has everything it needs from this
+        rank -- and before the pause that takes the pages away.
+
+        IT PASSES NO ``resume_reserve_bytes``, and 0 is the CORRECT value here
+        rather than an unwired one: nothing on this leg is waiting to be
+        mapped -- the leg's whole job is to give pages BACK -- so there is no
+        future demand to hold free VRAM for.  ``hook=source`` on the line says
+        which of the two a ``resume_reserve_mib=0`` came from.
+
+        THE LEG'S OWN WALL INCLUDES IT.  ``weg2_leg_t0`` is taken BEFORE this
+        call (S5b refuter, must_fix 4): with the clock started after the hook,
+        ``weg2_leg_ms`` and every WEG2-FLIP-TAG wall excluded the entire
+        shadow, so the sleep leg's own instrument reported a wall that was
+        short by exactly the cost the observer added -- and that wall gates the
+        C14 credit a co-located waking rank is fenced on.  ``shadow_ms`` on the
+        shadow's own line is the subtrahend, so the two numbers on one log
+        separate the ring's wall from the observer's.
+        """
+        self._weg2_shadow_hook("source", recv_req=recv_req)
+
+    def _weg2_shadow_destination_leg(self, recv_req, *, reserve_bytes: int = 0,
+                                     ring_ms=None) -> None:
+        """DESTINATION hook, wake leg, after ``family_complete`` and the reload.
+
+        This is the only place in the boot where the ground truth exists: the
+        ring has restored every weight byte and the static state is imported, so
+        the shadow's pulled stripes have something to be compared AGAINST.  It
+        runs before the leg reports done, so a mismatch appears in the log
+        beside the flip that produced it rather than one flip later.
+
+        ``reserve_bytes`` IS THE STILL-UNMAPPED DEMAND AT *THIS* INSTANT, and
+        the number it used to carry was wrong in the one way that matters.
+        MEASURED-BY-REVIEW DEFECT (S5b refuter, must_fix 2): it carried the
+        WEIGHTS image (the sum of ``tag_bytes``, read before the resume loop) --
+        but this hook runs AFTER that resume completed, and ``free_mib`` is read
+        here too, so the image is already OUT of the free column.  Subtracting
+        it a second time removed 9-13 GiB from a free column the VRAM corridor
+        law holds at 819-1229 MiB: ``price_shadow.affordable`` was False by
+        construction and every rank voted NO on every leg.  The demand that is
+        genuinely still unmapped when this runs is the REST OF THIS RPC's tags
+        -- kv_cache and anything else the resume has not reached -- read from
+        the same saver instrument, at the instant the term is consumed.
+        """
+        self._weg2_shadow_hook("destination", recv_req=recv_req,
+                               reserve_bytes=reserve_bytes, ring_ms=ring_ms)
 
     def _weg2_await_vram_credit(self, credit, tag: str, need_bytes: int,
                                 epoch=None) -> None:
@@ -1586,7 +2266,20 @@ class SchedulerWeightUpdaterManager:
             # anything.  The epoch is THE FLIP'S, carried on the request by the
             # front that owns it -- see :meth:`_weg2_open_credit_for_leg`.
             credit = self._weg2_open_credit_for_leg(getattr(recv_req, "epoch", None))
+            # #1273 S5b: the SOURCE half of the shadow, at the last instant the
+            # weight pages are mapped.  See _weg2_shadow_source_leg for why it
+            # is here and not after the pause.  Never raises; on every arm but
+            # --weg2-weight-source shadow it returns having touched nothing.
+            #
+            # THE LEG'S CLOCK STARTS BEFORE IT (S5b refuter, must_fix 4).  With
+            # t0 after the hook, weg2_leg_ms -- the number this leg publishes
+            # as its own wall, and the one the sb5f flip band is read from --
+            # excluded the whole shadow, so an observer could add seconds to
+            # the leg that gates a co-located rank's C14 credit while the
+            # leg's own instrument reported no change at all.  On the ring arm
+            # the hook returns after one import, so the band is unaffected.
             weg2_leg_t0 = time.perf_counter()
+            self._weg2_shadow_source_leg(recv_req)
             # #1284: the NEED series, and the refusal that reads it.  The pause
             # below is what enters ``host_ring.cpp``'s blocking acquire, and on
             # weg2sb5e that acquire sat out its whole 110 s budget in silence
@@ -1820,6 +2513,9 @@ class SchedulerWeightUpdaterManager:
             t_w0 = time.perf_counter()
             shm0 = self._weg2_rss_shmem_mib()
             tag_bytes = {tag: self._weg2_tag_bytes(tag) for tag in weights_tags}
+            # S7 (#1273): tag -> the saver's own pass-1/pass-2 decomposition of
+            # that tag's resume, or None where the instrument is absent.
+            weg2_map_stats: Dict[str, Optional[Dict[str, float]]] = {}
             credit, credit_epoch = self._weg2_credit_reader(
                 getattr(recv_req, "epoch", None)
             )
@@ -1840,17 +2536,56 @@ class SchedulerWeightUpdaterManager:
                         float(tag_bytes.get(tag, 0)),
                         (time.perf_counter() - t_tag) * 1000,
                     ]
+                    # S7 (#1273): READ THE MAP COST WHILE IT IS STILL THIS TAG'S.
+                    # Resume pass 1 maps every allocation of the tag one at a
+                    # time, so its wall is proportional to an allocation count
+                    # that no log has ever carried -- and with the count absent,
+                    # pass 1's time was charged to the copy rate, which is the
+                    # unexplained remainder of ADDENDUM 3 section 4 and risk R2
+                    # of #1273.  The read is a metadata call on the saver (no
+                    # device call), and it is issued INSIDE the loop because the
+                    # recorder holds ONE record: read after the next tag's resume
+                    # and the number would belong to that tag.  The adapter
+                    # returns None -- never a fabricated 0 -- when the running
+                    # hook has no such symbol or the record names another tag.
+                    weg2_map_stats[tag] = self.memory_saver_adapter.resume_stats(tag)
             weg2_leg_ms = (time.perf_counter() - t_w0) * 1000
             card_uuid = self._weg2_card_uuid() or "unknown"
             for tag, (nbytes, tms) in weg2_per_tag.items():
+                # S7 (#1273): THREE FIELDS APPENDED, and the ring planner's
+                # parser is unaffected because they are appended -- its regex
+                # (ring_table._TAG_RE) anchors on the fields before them and
+                # ends at the optional population token.
+                #
+                # ``allocations`` is the DENOMINATOR of ``map_ms``: pass 1 does
+                # one cu_mem_create + cuMemMap + cu_mem_set_access per
+                # allocation of the tag, and that count appeared in no log.
+                # ``map_ms`` is pass 1 alone, ``copy_ms`` is pass 2's H2D issue
+                # plus pass 3's single synchronise; pass 4's granule release is
+                # in neither, so ``map_ms + copy_ms`` is a LOWER bound on ``ms``
+                # and not a partition of it.  ``n/a`` means the instrument is
+                # ABSENT -- hook without the symbol, a record naming another
+                # tag, or a ROCm build, whose resume path never records at all.
+                # The absence and a measured zero are different findings and
+                # this is the whole denominator law: a 0 printed for an absent
+                # instrument would read as "the remap was free", which is the
+                # claim under test.  A tag whose resume matched no allocation
+                # DOES print ``allocations=0 map_ms=0.0`` -- that is a real
+                # measurement of "nothing was mapped", not an absence, and the
+                # guard above deliberately does not hide it (round-2 refuter
+                # F8: the earlier wording claimed a 0 was never printed).
+                st = weg2_map_stats.get(tag)
                 logger.info(
                     "WEG2-FLIP-TAG group=%s rank=%d card=%s dir=h2d tag=%s bytes=%d MiB "
                     "population=%s (source: tms_tag_bytes, NOT RssShmem) ms=%.0f "
-                    "GB/s=%.2f granules=%d",
+                    "GB/s=%.2f granules=%d allocations=%s map_ms=%s copy_ms=%s",
                     self._weg2_group_name(), self._weg2_rank(), card_uuid, tag,
                     int(nbytes) // MIB_, WEG2_TAG_POPULATION_WEIGHTS, tms,
                     (nbytes / 1e9) / max(1e-6, tms / 1000.0),
                     int(nbytes) // TMS_RING_GRANULE_BYTES,
+                    "n/a" if st is None else int(st["allocations"]),
+                    "n/a" if st is None else "%.1f" % st["map_ms"],
+                    "n/a" if st is None else "%.1f" % st["copy_ms"],
                 )
             logger.info(
                 "WEG2-CHUNK-BYTES wake tags=%s host_image_delta=%.0f MiB (RssShmem %.0f -> %.0f MiB, "
@@ -1881,6 +2616,34 @@ class SchedulerWeightUpdaterManager:
                     self.stashed_model_static_state,
                 )
                 del self.stashed_model_static_state
+                # #1273 S5b: the DESTINATION half.  The ring's bytes are final
+                # here -- that is the whole reason this hook is after
+                # family_complete and after the reload -- so the shadow's
+                # stripes have a ground truth to be compared against.
+                # ``ring_ms`` is the leg's OWN per-tag wall, the same instrument
+                # the WEG2-FLIP-TAG lines above print, so the two numbers on one
+                # log can be subtracted.
+                # THE STILL-UNMAPPED DEMAND, READ HERE, WHERE IT IS
+                # CONSUMED (S5b refuter, must_fix 2): every tag of THIS rpc
+                # that the resume has not reached yet.  The graph tag was
+                # resumed above this block and the weights family inside it,
+                # so what is left is kv_cache and anything else in `tags` --
+                # the bytes that will be mapped after this hook returns and
+                # that the shadow's own buffers must not have taken.  Read
+                # from the SAVER (`_weg2_tag_bytes`), the same instrument the
+                # ring sizes itself from; a 0 there means "the saver could not
+                # answer" and prints as resume_reserve_mib=0.
+                pending_tags = [
+                    t for t in tags
+                    if t != GPU_MEMORY_TYPE_CUDA_GRAPH
+                    and not is_weights_family_tag(t)
+                ]
+                self._weg2_shadow_destination_leg(
+                    recv_req,
+                    reserve_bytes=sum(self._weg2_tag_bytes(t)
+                                      for t in pending_tags),
+                    ring_ms=sum(float(v[1]) for v in weg2_per_tag.values()),
+                )
 
         if GPU_MEMORY_TYPE_KV_CACHE in tags:
             self.memory_saver_adapter.resume(GPU_MEMORY_TYPE_KV_CACHE)

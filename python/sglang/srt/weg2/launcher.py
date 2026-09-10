@@ -55,12 +55,29 @@ import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field, replace
-from typing import Dict, List, Mapping, NamedTuple, Optional, Sequence, Tuple
+from typing import (
+    Callable,
+    Dict,
+    List,
+    Mapping,
+    NamedTuple,
+    Optional,
+    Sequence,
+    Tuple,
+)
 
 from sglang.srt.managers import corridor_guard
 from sglang.srt.weg2 import admin_key as admin_key_mod
 from sglang.srt.registry import nvml as nvml_registry
-from sglang.srt.weg2 import corridor_budget, host_ledger, ring_table
+from sglang.srt.weg2 import (
+    corridor_budget,
+    host_ledger,
+    ring_table,
+    weight_exchange_region,
+    weight_exchange_shadow,
+    weight_exchange_transport,
+    xchg_residency,
+)
 from sglang.srt.weg2 import DEFAULT_D_BS, DEFAULT_P_BS, DEFAULT_PP_ORDERED_CUT
 
 MIB = 1024 * 1024
@@ -123,6 +140,17 @@ SHM_OWN_PREFIXES = (
     "hicache-weg2-",                # the canonical page store when it is put on /dev/shm
     ".weg2-pcie-serialize-",        # model_loader/hibernate.py:504
     "sglang_loads_",                # managers/load_snapshot.py:285
+    # #1273 S3: the weight-exchange staging region (385 MiB) and the 24 named
+    # POSIX semaphores glibc materialises as `/dev/shm/sem.<name>`. Both
+    # families are created by weg2/weight_exchange_region.py. Without these two
+    # entries a crashed exchange boot leaves 385 MiB of tmpfs resident and
+    # INVISIBLE to this sweep -- exactly the weg2dk7 shape (3.23 GiB of a boot
+    # dead for ~16 h, counted by the ledger as occupied) that the sweep exists
+    # for. `sem.` is a SEPARATE entry because the semaphore names do not begin
+    # with the region prefix; a prefix list that assumed they did would sweep
+    # the region and leave the handshake behind.
+    weight_exchange_region.REGION_PREFIX,           # "weg2-xchg-"
+    f"sem.{weight_exchange_region.REGION_PREFIX}",  # "sem.weg2-xchg-"
 )
 #: The corridor law is 819-1229 MiB NVML-free per card under the awake
 #: group's load.  MEASURED 2026-09-07 boot weg2onebackup2 with this constant
@@ -956,6 +984,65 @@ P_MAMBA_AUTO_SAFETY_MARGIN = 1.25
 #: charges is ``ceil(--p-bs x this x safety)`` and is printed with its inputs
 #: in the PP-CUT budget posts line, where --p-bs appears as a resolved value.
 P_MAMBA_SLOTS_PER_RUNNING_REQUEST = 2
+#: #1273: where a waking group's weight bytes come from. ``ring`` is today's
+#: path, byte for byte, and stays the default until S6 has booted the other
+#: one; ``exchange`` moves them card-to-card and is what W71 prices.
+#: ``shadow`` (#1273 S5) is the third value and it is RING-AUTHORITATIVE: the
+#: weights still come from the host ring, byte for byte, and the exchange runs
+#: beside them into buffers nothing reads so its bytes can be compared against
+#: the ring's.  It is the only arm that can prove the exchange on silicon
+#: without the exchange being able to break a flip.
+WEIGHT_SOURCE_CHOICES = ("ring", "exchange", "shadow")
+WEIGHT_SOURCE_DEFAULT = "ring"
+
+#: #1273 S6: THE ON-CARD LANE'S ARM, spec section 3.7 degrade 3's own flag
+#: (``--weg2-xchg-oncard {ipc|host}``).  It had no producer at all: the ranks
+#: read ``SGLANG_WEG2_XCHG_ONCARD`` from their inherited environment and the
+#: launcher never wrote it, so the ``host`` arm -- the only arm on which a
+#: store-and-forward deposit can exist -- was reachable only by an operator
+#: exporting a variable by hand, while the #1269 ledger charged its bytes on
+#: every ``shadow`` boot (S6 refuter, must_fix 4).  One name, one producer, and
+#: the SAME value decides the charge and the allocation.
+ONCARD_MODE_CHOICES = (weight_exchange_transport.ONCARD_MODE_IPC,
+                       weight_exchange_transport.ONCARD_MODE_HOST)
+ONCARD_MODE_DEFAULT = weight_exchange_transport.ONCARD_MODE_IPC
+
+#: The /dev/shm staging region's layout terms, spec section 6/S3: 2 slots per
+#: DIRECTED cross-card pair (double buffering), 32 MiB per slot (evidence E2
+#: measured 32/64/128 MiB indistinguishable below 0.6 %, so the smallest is
+#: taken and the carve-out halves for free), 1 MiB of header + gate rows + the
+#: n x n matrix + the pointer directory. Inputs to
+#: ``xchg_residency.region_mib_from_layout``, never a literal 385.
+#: TODO(S7->S3): S3 owns the region; when weight_exchange creates it, these move
+#: there and the launcher reads the size back off the created file.
+XCHG_REGION_SLOTS_PER_PAIR = 2
+XCHG_REGION_SLOT_MIB = 32
+XCHG_REGION_HEADER_MIB = 1
+
+
+def xchg_region_pairs(n_cards: int) -> int:
+    """DIRECTED cross-card pairs on ``n_cards`` cards: ``n * (n - 1)``.
+
+    Round-2 review F8: this was typed as ``6``, which is that arithmetic
+    evaluated on THIS rig and nowhere stated as arithmetic -- on any other card
+    count the region size would have been silently wrong while every test that
+    grades it still passed, because the tests were handed the same 6.  The
+    count comes from the boot's own card list now.
+    """
+    n = int(n_cards)
+    return n * (n - 1) if n > 1 else 0
+
+
+#: #1273 S7 round-2 review F2: does the ``exchange`` arm change any RANK
+#: behaviour yet?  No -- S7 arms the W71 gate and nothing else, so a boot
+#: launched with ``--weg2-weight-source exchange`` still runs the ring path
+#: byte for byte.  The arming line SAYS so rather than leaving a later reader
+#: of the log to infer it from a non-zero ``ring_H_mib``.
+#: TODO(S7->S6): S6 flips this to True in the same commit that propagates the
+#: flag into the two groups' argv, the request structs and the saver's region
+#: flag.  One name, one place.
+XCHG_RANK_BEHAVIOUR_WIRED = False
+XCHG_UNWIRED_REASON = "S7-gate-only-no-rank-behaviour-until-S6"
 
 #: #1240 -- the DEPTH axis of the cost model, and the two records that pin it.
 #:
@@ -1317,6 +1404,10 @@ class BootState:
     dc_expect_d: Dict[str, int] = field(default_factory=dict)
     ledger_lines: List[str] = field(default_factory=list)
     ring_lines: List[str] = field(default_factory=list)
+    #: #1273 S7: the W71 residency rows, empty on the default `ring` arm --
+    #: an empty list there means "the exchange did not run", never "it was
+    #: checked and found nothing".
+    xchg_lines: List[str] = field(default_factory=list)
     ring_form: str = ""
     ring_dir: str = ""
     #: The boot nonce (``HostRingPlan.epoch``), so teardown can unlink THIS
@@ -1688,6 +1779,7 @@ def shm_residue_sweep(
     shm_dir: str = SHM_DIR,
     proc_root: str = "/proc",
     archive_root: str = SHM_ARCHIVE_ROOT,
+    sem_unlink: Optional[Callable[[str], int]] = None,
 ) -> Dict[str, object]:
     """#1217 + #1233 fix 8: sweep THIS LINE'S dead /dev/shm residue, and only that.
 
@@ -1712,6 +1804,10 @@ def shm_residue_sweep(
       of ~100k small files onto spinning disk at preflight would cost minutes
       and buy nothing -- the evidence of a leaked store is that it existed and
       how big it was, not the pages inside it.
+    * #1273 S3: an orphan POSIX NAMED SEMAPHORE (`sem.weg2-xchg-*`) is
+      `sem_unlink`ed rather than moved -- see the call to
+      :func:`sweep_xchg_semaphores` below for why the order inside this
+      function is the whole point.
     """
     try:
         names = sorted(os.listdir(shm_dir))
@@ -1739,6 +1835,23 @@ def shm_residue_sweep(
             f"{ {n: pids for n, pids in sorted(refused.items())} } -- refusing this boot, not "
             f"sweeping, not killing anything"
         )
+    # #1273 S3, review round 2 F1 -- THIS IS THE ONLY PLACE THE SEMAPHORE SWEEP
+    # CAN RUN.  It has to be AFTER the two refusals above (a live boot is never
+    # swept, and unlinking a live boot's handshake would be strictly worse than
+    # leaving a dead one's behind) and BEFORE the move loop below, which would
+    # otherwise `shutil.move` every `sem.weg2-xchg-*` file into the archive and
+    # leave the kernel object alive for a later `sem_open` to collide with.
+    # Called from outside this function it can only ever find an empty
+    # /dev/shm and log "residue: none" -- which is what it did.
+    sem_gone = sweep_xchg_semaphores(log, shm_dir, dry, unlink=sem_unlink)
+    if sem_gone:
+        # sem_unlink removed the backing files; only survivors get archived.
+        own = [n for n in own if os.path.exists(os.path.join(shm_dir, n))]
+        if not own:
+            log(f"#1217/#1233 shm residue: {len(sem_gone)} exchange semaphore(s) "
+                f"sem_unlink'ed, nothing else of ours left in {shm_dir}")
+            return {"swept": [], "bytes_freed": 0, "bytes_apparent": 0,
+                    "refused": {}, "archive": "", "sems_unlinked": sem_gone}
     archive = f"{archive_root}/{tag}_{stamp}"
     sizes = {n: _tree_bytes(os.path.join(shm_dir, n)) for n in own}
     total = sum(a for a, _b, _n in sizes.values())
@@ -1752,7 +1865,7 @@ def shm_residue_sweep(
             f"{ {n: sizes[n][0] for n in own} }; {foreign} foreign entries untouched"
         )
         return {"swept": own, "bytes_freed": total, "bytes_apparent": apparent,
-                "refused": {}, "archive": archive}
+                "refused": {}, "archive": archive, "sems_unlinked": sem_gone}
     os.makedirs(archive, exist_ok=True)
     manifest: List[dict] = []
     for n in own:
@@ -1781,7 +1894,7 @@ def shm_residue_sweep(
         f"({manifest}; {foreign} foreign entries untouched)"
     )
     return {"swept": own, "bytes_freed": total, "bytes_apparent": apparent,
-            "refused": {}, "archive": archive}
+            "refused": {}, "archive": archive, "sems_unlinked": sem_gone}
 
 
 def refuse_if_front_unbindable(log: Log, host: str, port: int, dry: bool) -> None:
@@ -3148,6 +3261,234 @@ def sweep_dead_credit_counters(log: Log, credit_dir: str = "",
     return removed
 
 
+def sweep_xchg_semaphores(
+    log: Log,
+    shm_dir: str = SHM_DIR,
+    dry: bool = False,
+    unlink: Optional[Callable[[str], int]] = None,
+) -> List[str]:
+    """#1273 S3: ``sem_unlink`` the exchange semaphores a dead boot left behind.
+
+    ORDERING IS LOAD-BEARING AND IS NOW STRUCTURAL: this function is called
+    from INSIDE :func:`shm_residue_sweep`, between its refusal phase and its
+    move phase.  It was previously a second call in ``main()`` after that
+    sweep, and in that position it could never unlink anything -- the residue
+    sweep had already ``shutil.move``d every ``sem.weg2-xchg-*`` file into the
+    archive, so this re-listed ``/dev/shm``, found nothing and logged
+    ``residue: none`` on every boot, residue or not.  Both halves of the
+    position matter: after the refusals (``shm_residue_sweep`` is the one
+    authority that refuses the boot while another ``launch_server`` is alive,
+    and unlinking a LIVE boot's handshake is worse than leaving a dead one's
+    behind), and before the move.
+
+    WHY A SEPARATE SWEEP AT ALL, given that ``sem.weg2-xchg-*`` is in
+    :data:`SHM_OWN_PREFIXES` and the generic sweep would archive the files:
+    a POSIX named semaphore is destroyed by ``sem_unlink``, not by moving its
+    backing file.  Renaming the file leaves the kernel object referenced by
+    any process that still has it open, and a later ``sem_open(O_CREAT)`` on
+    the same name would create a SECOND object while the first still holds
+    waiters.  The prefix entry is the visibility half (a leaked handshake is
+    named and its bytes counted); this is the correctness half.
+
+    ``unlink`` is the one seam a hermetic test needs: ``sem_unlink`` acts on
+    the machine's real ``/dev/shm`` namespace whatever ``shm_dir`` says, so a
+    test that drove the real syscall would have to sweep a live boot's names
+    to prove anything.  The default IS the real syscall.
+    """
+    try:
+        names = sorted(os.listdir(shm_dir))
+    except OSError:
+        log(f"#1273 xchg semaphores: {shm_dir} unreadable -- NOT swept, and not read as empty")
+        return []
+    prefix = f"sem.{weight_exchange_region.REGION_PREFIX}"
+    stale = [n for n in names if n.startswith(prefix)]
+    if not stale:
+        log("WEG2-XCHG-SEM residue: none")
+        return []
+    if dry:
+        log(f"WEG2-XCHG-SEM DRY-RUN: would sem_unlink {len(stale)} name(s): {stale}")
+        return []
+    if unlink is None:
+        lib = weight_exchange_region._libc()
+
+        def unlink(posix_name: str) -> int:
+            return lib.sem_unlink(posix_name.encode("ascii"))
+
+    gone: List[str] = []
+    for entry in stale:
+        posix_name = "/" + entry[len("sem."):]
+        if unlink(posix_name) == 0:
+            gone.append(posix_name)
+    log(f"WEG2-XCHG-SEM residue swept: {len(gone)}/{len(stale)} sem_unlink'ed {gone} "
+        f"-- a crashed boot runs no teardown, so LAUNCH sweeps too")
+    return gone
+
+
+def prepare_xchg_region(log: Log, boot_nonce: str, hook_mode: int,
+                        dry: bool = False) -> Dict[str, object]:
+    """#1273 S3: create the staging region + its 24 semaphores, return the env.
+
+    ONCE PER BOOT, keyed by the BOOT NONCE and not by a flip epoch: the region
+    is ftruncate'd to 385 MiB and (S4) cudaHostRegister'ed once, and neither
+    belongs on a 1.5 s flip's critical path.  The per-flip stamp is
+    ``XchgRegion.begin_flip('<boot>.<flip>')`` inside the ranks; see that
+    method for why the two identities may not be conflated.
+
+    TODO(#1273 S6): the caller that decides ``--weg2-weight-source exchange``
+    lives in S6.  It calls this once, before either group starts, and merges
+    the returned ``env`` into BOTH groups' environment -- one region, six
+    ranks, found by the same two names.  Under ``ring`` this is not called at
+    all and no region file exists, which is what makes the ring form byte-for-
+    byte today's path.
+    """
+    if dry:
+        path = weight_exchange_region.region_path(boot_nonce)
+        log(f"WEG2-XCHG-REGION DRY-RUN: would create {path} "
+            f"({weight_exchange_region.REGION_BYTES} bytes) and 24 semaphores")
+        return {"path": path, "boot": str(boot_nonce), "env": {}, "sems": 0, "line": ""}
+    return weight_exchange_region.prepare_region(boot_nonce, hook_mode=hook_mode, log=log)
+
+
+def prepare_shadow_env(log: Log, boot_nonce: str, weight_source: str,
+                       hook_mode: int = 0, dry: bool = False,
+                       hop_bound_ms: Optional[float] = None,
+                       oncard_mode: str = ONCARD_MODE_DEFAULT,
+                       oncard_slot_mib: int =
+                       weight_exchange_transport.ONCARD_SLOT_MIB_DEFAULT,
+                       ) -> Dict[str, str]:
+    """#1273 S5: arm the region for the SHADOW arm, and publish it to both groups.
+
+    ``{}`` on every other arm, and that empty dict is what keeps the default
+    boot byte-identical: no region file, no semaphores, no environment, and
+    :func:`build_env` pops the three names so nothing can be inherited.
+
+    THE SHADOW NEEDS EXACTLY WHAT THE EXCHANGE NEEDS, MINUS THE AUTHORITY: the
+    same 385 MiB staging region, the same 24 semaphores, the same two env
+    names.  What it does not get is the mode switch inside the ranks --
+    ``SGLANG_WEG2_WEIGHT_SOURCE=shadow`` leaves ``exchange_armed()`` False, so
+    ``model_runner`` still opens the weights region with ``enable_cpu_backup``
+    and the ring still refills every byte.
+
+    W71 IS NOT ARMED HERE, on purpose.  W71 prices the co-residency peak of a
+    real exchange, and under ``shadow`` no tag is ever exchanged: both images
+    stay where they are and the only new VRAM is the shadow's own bounded
+    subset, which is priced per card, per leg, against the LIVE NVML free
+    column by ``weight_exchange_shadow.price_shadow`` -- inside the rank that
+    will allocate it, at the moment it would.  Pricing it at launch instead
+    would grade a peak this arm does not have.
+    """
+    if weight_source != "shadow":
+        return {}
+    got = prepare_xchg_region(log, boot_nonce, hook_mode, dry=dry)
+    env = dict(got.get("env") or {})
+    env["SGLANG_WEG2_WEIGHT_SOURCE"] = "shadow"
+    # S5b: the launcher-given hop bound, published by the same mechanism and
+    # for the same reason as the region names -- a rank reads a flag it never
+    # sees on its own argv, and a bound nobody published is a bound the rank
+    # would have to invent.
+    env[weight_exchange_shadow.ENV_HOP_BOUND_MS] = repr(
+        float(weight_exchange_shadow.hop_bound_ms(hop_bound_ms)))
+    # S6: the on-card arm, published by the same mechanism and for the same
+    # reason.  It is what decides whether a deposit is possible at all, and it
+    # is the same string ``choose_host_ledger`` charges the deposit's host
+    # bytes on -- so the arm a rank enforces and the arm the ledger paid for
+    # cannot be two different readings.
+    env[weight_exchange_transport.ENV_ONCARD_MODE] = str(oncard_mode)
+    # S6 fix E: the slot CEILING, published by the same mechanism and for the
+    # same reason as the arm -- it decides the deposit's size in the ranks AND
+    # the worst case the #1269 ledger charged at launch, so the two may not be
+    # two readings.  Validated here, so an illegal value dies at the launcher
+    # with W82 rather than at six rank imports.
+    slot_mib = weight_exchange_transport.validate_oncard_slot_mib(
+        oncard_slot_mib)
+    env[weight_exchange_transport.ENV_ONCARD_SLOT_MIB] = str(slot_mib)
+    log(f"WEG2-XCHG-SHADOW ARMED epoch={boot_nonce} path={got.get('path', '')} "
+        f"sems={got.get('sems', 0)} ring=AUTHORITATIVE exchange=OBSERVER "
+        f"-- the ring refills every weight byte as it does today; the exchange "
+        f"runs beside it into raw cudaMalloc buffers nothing reads")
+    return env
+
+
+def teardown_xchg_region(log: Log, boot_nonce: str) -> Dict[str, int]:
+    """#1273 S3 / spec section 3.8: unlink the 24 names and remove the region.
+
+    Both halves matter -- teardown alone leaves a crashed boot's region
+    behind, which is the case :func:`sweep_xchg_semaphores` and the
+    :data:`SHM_OWN_PREFIXES` entry close at the NEXT launch.
+    """
+    return weight_exchange_region.teardown_region(boot_nonce, log=log)
+
+
+def prepare_weight_exchange(
+    cards: List[Card],
+    log: Log,
+    weight_source: str,
+    census_path: str,
+    epoch: object,
+    ring_h_mib: int,
+    floor_mib: float = ARMING_FLOOR_MIB,
+) -> Optional["xchg_residency.XchgResidency"]:
+    """W71 (#1273 S7): price the exchange's VRAM peak BEFORE either group starts.
+
+    Returns None on the ``ring`` arm, where nothing about this boot changes --
+    the check is not merely skipped there, it has no subject: no wave schedule
+    runs, so there is no co-residency window to price.
+
+    On the ``exchange`` arm it solves spec section 5's table per card, per
+    direction, per wave from a MEASURED census plus this boot's own live NVML
+    totals, logs one ``WEG2-XCHG-CHECK`` row per (card, direction) and then
+    either the ``WEG2-XCHG-ARMED`` line or raises
+    :class:`xchg_residency.Weg2XchgResidencyUnarmable` -- exit 2, the same
+    contract and the same launch position as W32/W34/W49 above, and for the
+    same reason: a refusal that arrives mid-flip arrives after VRAM has already
+    been mutated.
+
+    W71 REPLACES W49's ROLE HERE rather than joining it (spec section 0.4,
+    finding R1-1): under ``exchange`` the launcher publishes no
+    ``TMS_HOST_RING_*``, Sigma H is 0 and every ring inequality reads ``0 > 0``
+    -- false, i.e. a gate that passes because it has nothing to grade.  An
+    unarmed gate must never be read as a passed one, so the arming line carries
+    ``ring_H_mib`` beside the peaks, and (round-2 review F2) a ``wired=`` token
+    saying in words that no rank behaviour hangs off this arm until S6.
+
+    THE REFUSAL EXITS 2 BECAUSE IT IS ENROLLED, NOT BECAUSE IT SAYS SO
+    (round-2 review F1): :class:`xchg_residency.Weg2XchgRefused` is in
+    ``REFUSALS``, which is what ``cli()`` catches; the first cut of this slice
+    raised a bare ``RuntimeError`` and exited 1 with a traceback while three
+    docstrings, this one included, promised exit 2.
+    """
+    if weight_source != "exchange":
+        return None
+    census = xchg_residency.load_census(census_path)   # raises W71 by name
+    res = xchg_residency.solve(cards, census, floor_mib)
+    for ln in res.lines:
+        log(ln)
+    if not res.armed:
+        head = xchg_residency.refusal_head(res)
+        log(head)
+        for ln in res.refusals:
+            log(ln)
+        raise xchg_residency.Weg2XchgResidencyUnarmable(
+            head + "\n" + "\n".join(res.refusals)
+        )
+    log(
+        xchg_residency.armed_line(
+            res,
+            epoch,
+            xchg_residency.region_mib_from_layout(
+                xchg_region_pairs(len(cards)),
+                XCHG_REGION_SLOTS_PER_PAIR,
+                XCHG_REGION_SLOT_MIB,
+                XCHG_REGION_HEADER_MIB,
+            ),
+            ring_h_mib,
+            XCHG_RANK_BEHAVIOUR_WIRED,
+            XCHG_UNWIRED_REASON,
+        )
+    )
+    return res
+
+
 def prepare_host_ring(cards: List[Card], log: Log, tag: str, form: str,
                       evidence_dir: str, boot_stem: str, dry: bool,
                       leg_form: str = "", pcie_directional: Optional[bool] = None,
@@ -3510,7 +3851,8 @@ def build_env(tree: str, venv: str, cvd: str, store_dir: str, debug_hold: bool, 
               arming_floor_solved: bool = True,
               hicache_bigram_keys: bool = True,
               hicache_flush_publish_sweep: bool = True,
-              group: str = "") -> Dict[str, str]:
+              group: str = "",
+              xchg_env: Optional[Dict[str, str]] = None) -> Dict[str, str]:
     env = dict(os.environ)
     # FIX 2, finding 1: WHICH WEG-2 GROUP THIS RANK BELONGS TO, and the only
     # thing in either tree that says so.  Read by
@@ -3565,6 +3907,31 @@ def build_env(tree: str, venv: str, cvd: str, store_dir: str, debug_hold: bool, 
         env["SGLANG_WEG2_WEIGHT_CHUNKS"] = str(chunk_count)
     if tms_so:
         env["SGLANG_WEG2_TMS_PRELOAD_SO"] = tms_so
+    # #1273 S3/S5: the staging region and the weight-source mode, published to
+    # BOTH groups by the same two names the region's own module reads
+    # (SGLANG_WEG2_XCHG_REGION / _BOOT / SGLANG_WEG2_WEIGHT_SOURCE).  SAME
+    # DISCIPLINE AS THE RING FAMILY ABOVE and for the same measured reason: it
+    # is launcher OUTPUT, so it is POPPED when this boot arms no region -- a
+    # value inherited from the operator's shell must never arm a coupling
+    # nobody asked for, and a stale region path is a rank mapping another
+    # boot's shm.
+    for key in ("SGLANG_WEG2_XCHG_REGION", "SGLANG_WEG2_XCHG_BOOT",
+                "SGLANG_WEG2_WEIGHT_SOURCE",
+                # S5b: the shadow's hop bound is launcher OUTPUT too, so an
+                # operator's inherited shell value may not silently regrade a
+                # boot that arms no shadow at all.
+                weight_exchange_shadow.ENV_HOP_BOUND_MS,
+                # S6: the on-card arm is launcher OUTPUT for the same reason --
+                # an inherited ``SGLANG_WEG2_XCHG_ONCARD=host`` would put ranks
+                # on an arm this boot's ledger charged nothing for.
+                weight_exchange_transport.ENV_ONCARD_MODE,
+                # S6 fix E: the slot ceiling is launcher OUTPUT too -- an
+                # inherited value would size a deposit this boot's ledger
+                # charged a different worst case for.
+                weight_exchange_transport.ENV_ONCARD_SLOT_MIB):
+        env.pop(key, None)
+    for key, value in (xchg_env or {}).items():
+        env[str(key)] = str(value)
     cu13 = f"{venv}/lib/python3.12/site-packages/nvidia/cu13/lib"
     # boot_855_train0901.sh:152-153 (NVRTC) and S1 killer K1: the memory
     # saver's cu13 preload hook links libcudart.so.13, which must be on the
@@ -3977,6 +4344,40 @@ def measured_record_path() -> str:
     return f"{EVIDENCE_DIR}/{host_ledger.MEASURED_RECORD_NAME}"
 
 
+def xchg_bounce_charge_bytes(weight_source: str, oncard_mode: str,
+                             oncard_slot_mib: Optional[int] = None) -> int:
+    """The #1269 host term for the exchange's own pinned carrier, in bytes.
+
+    ONE PRODUCER OF THE PREDICATE (S6 refuter, must_fix 4), and it is a
+    function rather than an expression inside :func:`choose_host_ledger`
+    because the property under test -- "the charge fires on exactly the arm
+    that can allocate" -- must be provable without a host to read.
+
+    BOTH ARMS DECIDE IT.  ``--weg2-weight-source ring`` creates no region at
+    all; ``--weg2-xchg-oncard ipc`` creates one but exports a VRAM bounce that
+    is freed with its own leg, so no bounce FILE exists and no host byte is
+    pinned.  The bytes exist on ``shadow``/``exchange`` + ``host`` and nowhere
+    else, and this is the same value :func:`prepare_shadow_env` publishes to
+    the ranks -- so the arm a rank enforces and the arm that was paid for
+    cannot be two readings.
+    """
+    if str(weight_source) == WEIGHT_SOURCE_DEFAULT:
+        return 0
+    if str(oncard_mode) != weight_exchange_transport.ONCARD_MODE_HOST:
+        return 0
+    # S6 fix E: the LAUNCHER's own process was started without the flag in its
+    # environment, so ``tp.ONCARD_SLOT_BYTES_MAX`` bound the DEFAULT at import
+    # and a charge read from it would price 128 MiB slots while the ranks
+    # allocated 64.  The flag's value is therefore threaded explicitly here --
+    # the ranks read the published env, the launcher passes what it parsed, and
+    # both end in the SAME arithmetic (``xchg_bounce_bytes_per_card``).
+    if oncard_slot_mib is None:
+        return int(host_ledger.xchg_bounce_bytes())
+    slot_bytes = weight_exchange_transport.validate_oncard_slot_mib(
+        oncard_slot_mib) * weight_exchange_region.MIB
+    return int(host_ledger.xchg_bounce_bytes(slot_bytes=slot_bytes))
+
+
 def choose_host_ledger(
     ring_bytes: int,
     ring_span1_bytes: int,
@@ -3987,6 +4388,9 @@ def choose_host_ledger(
     pin_m_mib: int = 0,
     s_gb_d: Optional[int] = None,
     d_cap_terms: Optional[Dict[str, float]] = None,
+    weight_source: str = WEIGHT_SOURCE_DEFAULT,
+    oncard_mode: str = ONCARD_MODE_DEFAULT,
+    oncard_slot_mib: Optional[int] = None,
 ) -> Tuple[host_ledger.Arm, Optional[float], List[str], Dict[str, Optional[int]]]:
     """THE LAUNCHER'S ONE LEDGER CALL SITE: read the host, price the ladder.
 
@@ -4059,6 +4463,27 @@ def choose_host_ledger(
         cg_ceiling_source=cg_ceiling_source,
         cg_oom_kill=cg["oom_kill"],
         measured_record=record,
+        # #1273 S6: the exchange's own pinned host carrier.  The ARM STRINGS
+        # decide it here, at the one ledger call site, and not inside the
+        # ledger -- `WEIGHT_SOURCE_CHOICES` is this module's, and a ledger that
+        # knew about arm names would be a second reader of a decision that
+        # already has one.  `ring` charges 0 and every existing boot number is
+        # unchanged.
+        #
+        # BOTH ARMS, NOT ONE (S6 refuter, must_fix 4).  This charged on every
+        # non-ring boot, but the bounce FILE exists only on the `host` on-card
+        # arm -- on `ipc` the verdict is `DEPOSIT_REASON_IPC`, the lane logs
+        # the blameless not-drainable line and no host byte moves.  So a
+        # `shadow` + `ipc` boot (the default, and the only one the launcher
+        # could produce before the flag above existed) shrank the store and the
+        # run-peak headroom by 0.75 GiB for bytes that arm cannot allocate: a
+        # charge for a thing that does not happen is the mirror of the omission
+        # this term was added to close.  The predicate is now the SAME one the
+        # deposit allocates under, and it is the launcher's own published
+        # value rather than a second reading of the environment.
+        xchg_bounce_host_bytes=xchg_bounce_charge_bytes(weight_source,
+                                                        oncard_mode,
+                                                        oncard_slot_mib),
     )
     if pin_m_mib and int(pin_m_mib) > 0:
         # #1317/#1318 THE PINNED ARM IS PRICED, NOT ASSUMED. The ladder is run
@@ -7588,6 +8013,90 @@ def build_parser() -> argparse.ArgumentParser:
                          "card with the R17 gate beside it, and publishes the table "
                          "to the ranks as SGLANG_WEG2_PCIE_DUPLEX. An unreadable or "
                          "rowless file means NO card splits its lock key")
+    ap.add_argument(
+        "--weg2-weight-source", choices=WEIGHT_SOURCE_CHOICES,
+        default=WEIGHT_SOURCE_DEFAULT,
+        help="#1273: where a waking group's weight BYTES come from. 'ring' (the "
+             "default, and today's path byte for byte) refills them from the "
+             "shared host granule ring. 'exchange' moves them card-to-card from "
+             "the sleeping group's still-mapped pages, which removes the ring's "
+             "whole Sigma H from host RAM and pays for it with a VRAM peak while "
+             "both groups' bytes are resident on one card. In THIS slice (S7) "
+             "the flag arms one thing only -- the W71 residency check on that "
+             "peak, before either group starts. "
+             "TODO(S7->S6): S6 owns propagating it into the two groups' argv, "
+             "the request structs and the memory saver's region flag; until "
+             "then 'exchange' arms the gate and changes no rank behaviour. "
+             "'shadow' (S5) is RING-AUTHORITATIVE: the ring refills the "
+             "weights exactly as it does today and the exchange runs beside "
+             "it into raw cudaMalloc buffers nothing reads, comparing what it "
+             "pulled against what the ring restored (WEG2-XCHG-SHADOW).  It "
+             "arms the region and the six-rank shadow gate; it can refuse "
+             "ITSELF (W77, per card, against that card's free column) and it "
+             "can refuse NOTHING ELSE.",
+    )
+    ap.add_argument(
+        "--weg2-xchg-oncard-slot-mib", type=int,
+        default=weight_exchange_transport.ONCARD_SLOT_MIB_DEFAULT,
+        help="#1273 S6 fix E: the CEILING one diagonal slot may reach, in MiB "
+             "(default 128 = byte-identical to every boot so far). The #1269 "
+             "host ledger charges the WORST CASE, ONCARD_SLOTS_MAX x this "
+             "value per card x 3 cards, at both the launch and the run moment "
+             "-- 8 x 128 MiB x 3 = 3.00 GiB by default. That charge is what "
+             "closed the last fundable rung for the 'host' arm at --d-bs 6 on "
+             "this box (boot weg2shadowD D2: W20, every rung under the 6 GiB "
+             "store floor). Lowering it to 64 charges 1.50 GiB and re-opens a "
+             "rung; the price is more batches per lane and a higher priced "
+             "hop, which the boot then MEASURES. The worst-case charge itself "
+             "is deliberately NOT relaxed (operator decision 2026-09-09): a "
+             "per-flip charge would fund the smallest flip and refuse none. "
+             "Must be a whole multiple of the 32 MiB slot floor, else the "
+             "launcher refuses by name (W82).",
+    )
+    ap.add_argument(
+        "--weg2-xchg-oncard", choices=ONCARD_MODE_CHOICES,
+        default=ONCARD_MODE_DEFAULT,
+        help="#1273 S6 (spec 3.7 degrade 3): how the CO-LOCATED pair of ranks "
+             "on one card moves its diagonal. 'ipc' (the default) exports the "
+             "producer's VRAM bounce to the consumer's process; 'host' routes "
+             "it through a per-card pinned shm file instead, which is the only "
+             "arm on which a STORE-AND-FORWARD deposit exists -- an exported "
+             "VRAM bounce is freed with the exporting leg and cannot outlive "
+             "it, so the source could not deposit and return. The value is "
+             "published to both groups as SGLANG_WEG2_XCHG_ONCARD and it is "
+             "the SAME value the host ledger charges the deposit's pinned "
+             "bytes on, so the arm a rank enforces and the arm that was paid "
+             "for cannot diverge. On 'host' the ledger charges "
+             f"{host_ledger.xchg_bounce_bytes() / (1024 ** 3):.2f} GiB at both "
+             "moments and the store shrinks by it. Ignored on "
+             "--weg2-weight-source ring",
+    )
+    ap.add_argument(
+        "--weg2-shadow-hop-bound-ms", type=float,
+        default=weight_exchange_shadow.SHADOW_HOP_BOUND_MS_DEFAULT,
+        help="#1273 S5b: the wall the SHADOW is allowed to price its on-card "
+             "hop at before it refuses ITSELF for this leg (W77, scope=hop). "
+             "The default is the spec's 20 ms diagonal target for the "
+             "AUTHORITATIVE lane times a named factor of "
+             f"{weight_exchange_shadow.SHADOW_HOP_BOUND_FACTOR:g} -- the "
+             "observer runs on a card that is simultaneously carrying a real "
+             "flip leg, so a bound equal to the authoritative target would "
+             "refuse it for being an observer. It grades the PRICED hop, "
+             "before any wall is spent; the MEASURED one is on the shadow "
+             "line as shadow_ms= and is a finding, never a retro-active "
+             "refusal. It can refuse only the shadow: the flip proceeds on "
+             "the ring either way. Ignored on every arm but "
+             "--weg2-weight-source shadow",
+    )
+    ap.add_argument(
+        "--weg2-xchg-census", default="",
+        help="#1273 S7: the per-card, per-tag, per-group census W71 prices the "
+             "exchange's VRAM peak from -- a JSON FILE with its own provenance "
+             "string, the same kind of measured input --duplex-probe already is, "
+             "never a number on this command line. Required by "
+             "--weg2-weight-source exchange; absent, the launcher REFUSES by "
+             "name (W71) rather than invent a table",
+    )
     ap.add_argument("--ring-table-boot", default="",
                     help="pin the ring table to ONE boot instead of the newest usable "
                          "one. Matched as a SUBSTRING of the log stem, so the boot TAG "
@@ -8226,6 +8735,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     state.logs = {"front": front_log or "<dry>", "P": f"{base}.P.log", "D": f"{base}.D.log"}
 
     # 1. preflight
+    # #1273 S3 (review round 2, F1): the exchange semaphores are swept INSIDE
+    # shm_residue_sweep, between its refusal phase and its move phase. A second
+    # call out here was the defect: the residue sweep had already moved every
+    # `sem.weg2-xchg-*` file into the archive, so the sem_unlink that follows it
+    # sees an empty /dev/shm and logs "residue: none" on every boot regardless.
     state.shm_sweep = shm_residue_sweep(log, ns.tag, stamp, dry)
     sweep_dead_credit_counters(log, dry=dry)
     stale_deadman_sweep(log, [PORT_FRONT, PORT_P, PORT_D], dry)
@@ -8527,6 +9041,37 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                             "this host budget; this boot refuses by name)")
     state.ring_dir = ring_plan.dir if (ring_plan.armed and ring_plan.form == "MAP_SHARED") else ""
 
+    # 1c. #1273 S7: W71, the exchange's VRAM residency, per card per direction
+    # per wave -- HERE, beside the ring's own inequalities, because it grades
+    # the same kind of claim (a peak nobody can observe once the flip is
+    # running) and must refuse in the same place (before either group starts).
+    # On the default `ring` arm this returns None and logs nothing at all.
+    #
+    # ``ring_H_mib`` is reported from THIS boot's ring plan rather than assumed
+    # to be 0: S6 is what stops publishing TMS_HOST_RING_* under `exchange`,
+    # and until it lands a non-zero value on the arming line is the truth about
+    # this boot, not a formatting default.  An unarmed gate must never read as a
+    # passed one, and neither may an un-disarmed ring read as a disarmed one.
+    #
+    # TODO(S7->S6), round-2 refuter F12: ``epoch`` is the RING's epoch because
+    # today the ring is what publishes one.  When S6 stops publishing
+    # TMS_HOST_RING_* under `exchange`, this token goes empty unless the
+    # exchange mints its own epoch -- the arming line must not lose its boot
+    # identity in the same commit that makes the arm real.
+    xchg_res = prepare_weight_exchange(
+        cards, log, ns.weg2_weight_source, ns.weg2_xchg_census,
+        ring_plan.epoch,
+        (ring_plan.table.total_h_bytes // ring_table.MIB) if ring_plan.table else 0,
+    )
+    state.xchg_lines = list(xchg_res.lines) if xchg_res is not None else []
+    # #1273 S5: the SHADOW arm's region, armed here and published to both
+    # groups by build_env below.  Empty on every other arm.
+    xchg_env = prepare_shadow_env(log, str(ring_plan.epoch),
+                                  ns.weg2_weight_source, dry=dry,
+                                  hop_bound_ms=ns.weg2_shadow_hop_bound_ms,
+                                  oncard_mode=ns.weg2_xchg_oncard,
+                                  oncard_slot_mib=ns.weg2_xchg_oncard_slot_mib)
+
     # 2. host ledger
     arm, reap_headroom_gib, lines, cg = choose_host_ledger(
         ring_plan.host_weights_bytes,
@@ -8535,7 +9080,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         # #1317n NO BOOT WITH S_D=S_P IN THE LEDGER. D carries 4 GB where P
         # carries 1, which is +8.38 GiB of rings; an arm priced without it is
         # optimistic by that much against a reap mark nobody may touch.
-        s_gb_d=s_gb_d, d_cap_terms=_l2_terms)
+        s_gb_d=s_gb_d, d_cap_terms=_l2_terms,
+        weight_source=ns.weg2_weight_source,
+        oncard_mode=ns.weg2_xchg_oncard,
+        oncard_slot_mib=ns.weg2_xchg_oncard_slot_mib)
     state.cgroup = dict(cg)
     for ln in lines:
         log(ln)
@@ -8633,7 +9181,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # TRAIN FIX 5 moved the dc-reserve / budgets_p / cut solve ahead of the
     # ring (block 1b- above); only ``env_p`` stays here, because it is the
     # one thing in this step that genuinely needs the armed ring.
-    env_p = build_env(tree, ns.venv, cvd, store_dir, ns.debug_hold in ("P", "both"), ns.tag, chunk_layers, chunk_count, tms_so, ns.transport, ring_plan, group="P", **_env_knobs(ns))
+    env_p = build_env(tree, ns.venv, cvd, store_dir, ns.debug_hold in ("P", "both"), ns.tag, chunk_layers, chunk_count, tms_so, ns.transport, ring_plan, group="P", xchg_env=xchg_env, **_env_knobs(ns))
     # #1269 PUBLICATION: build_env's own comment says the decision is
     # "published explicitly so the boot log names the decision" -- but it only
     # SET the variables and logged nothing, so no boot log ever carried them.
@@ -8873,7 +9421,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         log(d_ratio.line)
         log(d_ratio.op_line)
         log(d_tokvec.line)
-        env_d = build_env(tree, ns.venv, cvd, store_dir, False, ns.tag, chunk_layers, chunk_count, tms_so, ns.transport, ring_plan, group="D", **_env_knobs(ns))
+        env_d = build_env(tree, ns.venv, cvd, store_dir, False, ns.tag, chunk_layers, chunk_count, tms_so, ns.transport, ring_plan, group="D", xchg_env=xchg_env, **_env_knobs(ns))
         spec_d = GroupSpec("D", PORT_D, transport_argv(argv_d(py, ns.model, budgets_d, s_gb_d, arm.m_mib, store_cfg, shlex.split(ns.extra_d), d_bs, max_kv_per_request, x_tokens, ns.num_continuous_decode_steps, ns.d_disable_overlap_schedule, d_ratio.flags, d_tokvec.flags, ns.random_seed, ns.barlink_bar1_cap_cycles, ns.collective_census_interval, ns.d_disable_cuda_graph, admin_api_key=admin_api_key), ns.transport), state.logs["D"], env_d)
         launch_group(spec_d, tree, log, dry)
         log("front argv (dry): " + " ".join(shlex.quote(a) for a in front_argv_for(
@@ -8943,7 +9491,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     log(d_ratio.line)
     log(d_ratio.op_line)
     log(d_tokvec.line)
-    env_d = build_env(tree, ns.venv, cvd, store_dir, ns.debug_hold in ("D", "both"), ns.tag, chunk_layers, chunk_count, tms_so, ns.transport, ring_plan, group="D", **_env_knobs(ns))
+    env_d = build_env(tree, ns.venv, cvd, store_dir, ns.debug_hold in ("D", "both"), ns.tag, chunk_layers, chunk_count, tms_so, ns.transport, ring_plan, group="D", xchg_env=xchg_env, **_env_knobs(ns))
     spec_d = GroupSpec("D", PORT_D, transport_argv(argv_d(py, ns.model, budgets_d, s_gb_d, arm.m_mib, store_cfg, shlex.split(ns.extra_d), d_bs, max_kv_per_request, x_tokens, ns.num_continuous_decode_steps, ns.d_disable_overlap_schedule, d_ratio.flags, d_tokvec.flags, ns.random_seed, ns.barlink_bar1_cap_cycles, ns.collective_census_interval, ns.d_disable_cuda_graph, admin_api_key=admin_api_key), ns.transport), state.logs["D"], env_d)
     state.argv["D"] = " ".join(shlex.quote(a) for a in spec_d.argv)
     launch_group(spec_d, tree, log, dry)
@@ -9114,7 +9662,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         py, store_dir, spec_p.pid, spec_d.pid, dc_expect_d, cards, ns, chunk_count,
         carrier_max_tokens, p_bs, d_bs, x_tokens, flip_min_work_tokens, idle_layout_front,
         src_chunk_cards=src_chunk_cards, measured_record=measured_record_path(),
-        commit=tip, ledger_arm={"s_gb": arm.s_gb, "s_gb_d": s_gb_d, "m_mib": arm.m_mib},
+        commit=tip, ledger_arm={"s_gb": arm.s_gb, "s_gb_d": s_gb_d, "m_mib": arm.m_mib,
+                    # #1326: the xchg deposit is an ARM CHARGE, so the front's
+                    # dormant-image sampler must be able to subtract it from
+                    # the run residual exactly as it subtracts the rings.
+                    # Without it an armed boot books the deposit twice at the
+                    # run moment. 0.0 on every ring-arm boot, so the ring-arm
+                    # record is byte-identical.
+                    "xchg_bounce_gib": float(arm.terms.get("xchg_bounce_gib", 0.0) or 0.0)},
         admin_key_file=admin_key_file,
         anon_preboot_bytes=anon_preboot_bytes,
         front_host=ns.front_host,
@@ -9473,8 +10028,14 @@ class Weg2CarrierFloorUnreachable(Weg2LaunchRefused):
 #: as W20 -- an arm whose predicted RUN PEAK is not below the observed reap
 #: point does not boot -- so it joins this tuple instead of growing a second
 #: `except` clause beside the one handler.
+#: #1273 S7 round-2 review F1: ``xchg_residency.Weg2XchgRefused`` (W71) joins
+#: it for the SAME reason W34 once did not -- it shipped outside this tuple and
+#: therefore exited 1 with a traceback and dropped no admin key. It is the
+#: module's BASE class, not the leaf, so the FIX 2 lesson holds one module on:
+#: a future exchange refusal inherits the handler instead of needing a line.
 REFUSALS = (Weg2LaunchRefused, ring_table.Weg2RingRefused,
-            host_ledger.Weg2HostLedgerRefused, host_ledger.Weg2HostRunPeakRefused)
+            host_ledger.Weg2HostLedgerRefused, host_ledger.Weg2HostRunPeakRefused,
+            xchg_residency.Weg2XchgRefused)
 
 
 def cli(argv: Optional[Sequence[str]] = None) -> int:

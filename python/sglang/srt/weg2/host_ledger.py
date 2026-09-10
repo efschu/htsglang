@@ -1209,10 +1209,86 @@ def _arm_s_d(arm) -> str:
     v = (getattr(arm, "terms", None) or {}).get("s_gb_d")
     return "=S" if v is None else str(int(v))
 
+def xchg_bounce_bytes_per_card(slots: Optional[int] = None,
+                               slot_bytes: Optional[int] = None) -> int:
+    """ONE card's store-and-forward deposit on the host, in bytes (#1273 S6).
+
+    THE EXCHANGE'S OWN CARRIER, PRICED.  The on-card lane's ``host`` arm keeps
+    its bounce in ``/dev/shm`` (``oncard_host_path``), ``cudaHostRegister``ed,
+    and S6 sizes it ``slots >= batches`` so the source can deposit and return
+    without a live consumer.  Those are pinned, non-reclaimable bytes that land
+    directly on ``memory.current`` for the span of a flip, and until this
+    function existed they appeared in NO ledger term -- the omission is named
+    verbatim in ``oncard_host_path``'s own docstring ("192 MiB of host that
+    spec 0.2's ledger term does NOT carry ... the number belongs in the
+    record").
+
+    ``kv-1m-kein-lossy-kein-hostram`` is about KV and does not reach here: this
+    is the exchange's own carrier, not hot KV parked in host RAM.  What DOES
+    reach here is ``host-schwelle-nie-uebertreten`` -- which is exactly why the
+    bytes become a TERM (so the reap bound sees them and the store shrinks by
+    them) instead of a note.
+
+    IT IS NOT "FOR THE SPAN OF A FLIP", AND THE EARLIER WORDING WAS WRONG (S6
+    refuter, finding 9).  ``HostBounce.close`` deliberately does not unlink, so
+    a deposited file lives until the boot's ``/dev/shm`` residue sweep -- which
+    is what makes the destination's later leg able to read it, and what makes
+    charging the bytes at BOTH the launch and the run moment correct rather
+    than conservative.
+
+    THE GEOMETRY IS READ FROM ITS OWNER, and now actually is (S6 refuter,
+    must_fix 3).  This read ``ONCARD_SLOTS_MAX x ONCARD_SLOT_BYTES`` -- the
+    slot count's CEILING beside the slot size's FLOOR -- while claiming to read
+    the owner's bound, and understated the shape's maximum by 4x: 8 x 32 MiB =
+    256 MiB against the 8 x 128 MiB the planner may actually derive
+    (``plan_oncard_slot_bytes`` clamps to ``ONCARD_SLOT_BYTES_MAX``).  The
+    consequence was not an overspend but a systematic FALSE REFUSAL, because
+    ``deposit_refusal_reason`` grades the deposit against this same number: a
+    per-card diagonal above ~256 MiB refused ``ledger-cannot-fund-deposit`` --
+    exactly the band the geometry exists for.  The owner's own name for the
+    bound is :data:`tp.ONCARD_DEPOSIT_BYTES_MAX`, and this reads THAT.
+
+    The worst case is charged, not the case a particular flip happens to
+    derive, because the arm is chosen once at launch and the derivation runs
+    per leg -- a charge that tracked the derivation would fund the smallest
+    flip and refuse none.
+    """
+    from sglang.srt.weg2 import weight_exchange_transport as tp
+
+    if slots is None and slot_bytes is None:
+        return int(tp.ONCARD_DEPOSIT_BYTES_MAX)
+    return (int(tp.ONCARD_SLOTS_MAX if slots is None else slots)
+            * int(tp.ONCARD_SLOT_BYTES_MAX if slot_bytes is None else slot_bytes))
+
+
+def xchg_bounce_bytes(cards: Optional[int] = None,
+                      slot_bytes: Optional[int] = None) -> int:
+    """Every card's deposit -- the term :func:`charge_terms` carries.
+
+    ``cards`` DEFAULTED TO A TYPED ``3`` (S6 refuter, finding 6): a hand number
+    at the one call site, derived from nothing, in a module whose whole subject
+    is numbers with provenance.  It now comes from the region's own rank
+    layout -- one bounce file per CARD, and a card is a co-located pair of the
+    six rows -- which is the same arithmetic
+    :data:`tp.ONCARD_HOST_DEGRADE_MIB` announces the degrade with.
+    """
+    from sglang.srt.weg2 import weight_exchange_region as xr_
+
+    if cards is None:
+        cards = int(xr_.N_RANKS) // 2
+    # S6 fix E: ``slot_bytes`` is the launcher passing the value of
+    # ``--weg2-xchg-oncard-slot-mib`` it parsed, because ITS process imported
+    # the transport before that flag existed in any environment.  ``None`` is
+    # the rank path, where the module constant already resolved from the
+    # published env.  One arithmetic function, two ways in.
+    return max(0, int(cards)) * xchg_bounce_bytes_per_card(
+        slot_bytes=slot_bytes)
+
 
 def charge_terms(
     s_gb: int, m_mib: int, ranks_per_group: int, images: ImageTerms,
     s_gb_d: Optional[int] = None,
+    xchg_bounce_host_bytes: int = 0,
 ) -> Dict[str, float]:
     """Everything the BOOT ITSELF adds to ``memory.current``, per term.
 
@@ -1224,6 +1300,16 @@ def charge_terms(
     The image terms are NOT in here: which image is resident is a property of
     the MOMENT (launch charges P's, the run moment charges the dormant one),
     not of the arm.
+
+    ``xchg_bounce_host_bytes`` IS AN ARM PROPERTY and therefore is (#1273 S6):
+    it is 0 on ``--weg2-weight-source ring`` -- the default and every boot that
+    has run -- and :func:`xchg_bounce_bytes` on the arms that create the file.
+    The KEY IS ALWAYS PRESENT, value 0.0 when unarmed, because the three
+    consumers of this dict must not be able to disagree about whether a term
+    exists; an unarmed boot prints ``xchg_bounce=0.00`` and says so rather than
+    leaving a reader to wonder whether it was priced.  The parameter is
+    deliberately NOT named after the module function that produces the value:
+    :func:`price`'s own fix-8 note records what a shadowed name costs.
     """
     anchors_gib = (ANCHORS_AT_2400_BYTES * (m_mib / ANCHORS_REFERENCE_M_MIB)) / GIB
     # #1317n THE TWO GROUPS ARE PRICED SEPARATELY, because they no longer carry
@@ -1251,6 +1337,7 @@ def charge_terms(
         "weight_tags_d_gib": WEIGHT_TAGS_D_BYTES / GIB,
         "image_extra_p_gib": images.extra_p_gib,
         "image_extra_d_gib": images.extra_d_gib,
+        "xchg_bounce_gib": max(0, int(xchg_bounce_host_bytes)) / GIB,
     }
 
 
@@ -1259,6 +1346,11 @@ def _boot_charges_gib(terms: Dict[str, float]) -> float:
     return (
         terms["heaps_gib"] + terms["anchors_gib"] + terms["rings_gib"]
         + terms["overhead_gib"] + terms["draft_host_p_gib"] + terms["draft_host_d_gib"]
+        # #1273 S6: 0.00 on every ring-arm boot, so every existing number is
+        # unchanged; on an armed boot it is charged at BOTH moments, which is
+        # what makes `size_store_gib`'s leftover -- and therefore the store --
+        # shrink by exactly the deposit rather than by a note in a docstring.
+        + terms["xchg_bounce_gib"]
     )
 
 
@@ -1339,30 +1431,50 @@ def record_run_residual_gib(
     # was one line short of the thing it guarded (found by its own test).
     try:
         s_d = arm.get("s_gb_d")
-        if s_d is None or int(s_d) == int(arm.get("s_gb", s_d)):
-            # Single-budget record: the omitted argument defaulted to `s_gb`,
-            # so the stored value was already in its own currency.
-            # Byte-identical, which is every record written before D got its
-            # own budget.
-            return float(stored), 0.0
+        bounce_gib = float(arm.get("xchg_bounce_gib", 0.0) or 0.0)
         img_gib = float(entry.get("rss_shmem_gib") or 0.0)
         images = ImageTerms(
             p_gib=img_gib, d_gib=img_gib, p_source="record", d_source="record",
             p_measured=True, d_measured=True, extra_p_gib=0.0, extra_d_gib=0.0,
         )
-        old = _boot_charges_gib(
-            charge_terms(int(arm["s_gb"]), int(arm["m_mib"]), ranks_per_group, images)
-        )
+        # THE CORRECT SUM for the arm this record's boot actually ran: both
+        # currency terms, one signature, one call (#1325 rings + #1326 bounce).
         new = _boot_charges_gib(
-            charge_terms(int(arm["s_gb"]), int(arm["m_mib"]), ranks_per_group, images,
-                         s_gb_d=int(s_d))
+            charge_terms(
+                int(arm["s_gb"]), int(arm["m_mib"]), ranks_per_group, images,
+                s_gb_d=None if s_d is None else int(s_d),
+                xchg_bounce_host_bytes=int(round(bounce_gib * GIB)),
+            )
         )
+        # WHAT THE WRITING SAMPLER SUBTRACTED. Read from the record when it
+        # says so (#1326 `residual_charges_gib`), and only RECONSTRUCTED for a
+        # record written before that field existed -- where the sampler
+        # provably passed neither term, so the pre-#1325 sum is exact rather
+        # than inferred. Preferring the stored figure is what keeps this sound
+        # across the NEXT currency change: a record that already subtracted
+        # correctly yields correction 0 without this function knowing anything
+        # about which terms exist.
+        stored_charges = entry.get("residual_charges_gib")
+        if stored_charges is None:
+            old = _boot_charges_gib(
+                charge_terms(int(arm["s_gb"]), int(arm["m_mib"]),
+                             ranks_per_group, images)
+            )
+        else:
+            old = float(stored_charges)
     except (KeyError, TypeError, ValueError):
         # A record whose arm cannot be re-priced keeps its stored value. It is
         # the CONSERVATIVE direction (the stored figure is the larger one) and
         # never a silent 0.
         return float(stored), 0.0
-    return float(stored) - (new - old), new - old
+    correction = new - old
+    if abs(correction) < 1e-9:
+        # Already in its own currency: every single-budget, unarmed record, and
+        # every record written by the corrected sampler. Byte-identical, and
+        # reported as exactly 0.0 so a caller's "was this re-priced" test is a
+        # comparison and not a tolerance.
+        return float(stored), 0.0
+    return float(stored) - correction, correction
 
 
 def run_origin_gib(
@@ -1691,6 +1803,7 @@ def price(
     # arm and every pre-existing caller, so those are byte-identical.
     s_gb_d: Optional[int] = None,
     measured_record: Optional[Dict[str, dict]] = None,
+    xchg_bounce_host_bytes: int = 0,
 ) -> Arm:
     """Price one arm at both moments.  Pure.
 
@@ -1731,6 +1844,12 @@ def price(
     images and run-moment residuals (:func:`read_measured_record`).  ``None``
     prices the named dk7 reading for P and a BOUND for D, and says which is
     which -- see :func:`resolve_image_terms`.
+
+    ``xchg_bounce_host_bytes`` is #1273 S6: the weight exchange's own pinned
+    host carrier (:func:`xchg_bounce_bytes`), 0 on the ring arm and therefore
+    on every boot that has run to date.  It is charged like any other term --
+    the flip transient's absence above is about the RING and says nothing about
+    a carrier the ring never had.
     """
     if s_gb < 1 or m_mib < 1:
         raise ValueError(f"arm terms must be >= 1: S={s_gb} M={m_mib}")
@@ -1799,7 +1918,8 @@ def price(
     # across the flip).  It is NOT part of the flip image -- the ring carries
     # the weights, this carries the draft pages, never the same bytes.
     images = resolve_image_terms(measured_record)
-    charges = charge_terms(s_gb, m_mib, ranks_per_group, images, s_gb_d=s_gb_d)
+    charges = charge_terms(s_gb, m_mib, ranks_per_group, images, s_gb_d=s_gb_d,
+                           xchg_bounce_host_bytes=xchg_bounce_host_bytes)
     heaps_gib = charges["heaps_gib"]
     anchors_gib = charges["anchors_gib"]
     rings_gib = charges["rings_gib"]
@@ -1906,6 +2026,11 @@ def price(
         "overhead_gib": overhead_gib,
         "draft_host_p_gib": draft_host_p_gib,
         "draft_host_d_gib": draft_host_d_gib,
+        # #1273 S6.  THE KEY IS ALWAYS HERE, 0.0 on the ring arm, because
+        # ``_boot_charges_gib`` indexes it and ``predicted_run_peak_gib`` sums
+        # that -- a key that can be absent is how the three consumers this
+        # dict exists to reconcile would start disagreeing again.
+        "xchg_bounce_gib": charges["xchg_bounce_gib"],
         "store_draft_fraction": STORE_DRAFT_FRACTION,
     }
     arm.launch_leftover_gib = launch
@@ -2134,6 +2259,10 @@ def dormant_image_sample(
     rss, seen = rss_shmem_bytes(pids)
     rss_gib = rss / GIB
     residual: Optional[float] = None
+    # Initialised here and not only in the branch below: the record's
+    # `residual_charges_gib` reads it, and a name that exists on exactly one
+    # path is a NameError waiting for the next editor (#1326).
+    _charges_gib: Optional[float] = None
     residual_note = ""
     if cg_current_bytes is None or arm is None:
         residual_note = (
@@ -2172,23 +2301,46 @@ def dormant_image_sample(
         # `.get` and not `[...]`: a pre-#1325 arm dict has no such key and must
         # keep its single-budget subtraction, which is byte-identical because
         # `charge_terms` defaults `_s_d` to `s_gb`.
+        #
+        # #1326 (the S6c merge): THE XCHG BOUNCE IS THE SECOND TERM OF THE SAME
+        # DEFECT, and it had to be added here in the same breath rather than
+        # left for a later ticket. `xchg_bounce_gib` is an ARM charge -- it is
+        # summed by `_boot_charges_gib` and added back by
+        # `predicted_run_peak_gib` -- so an armed boot whose sampler did not
+        # subtract it leaves the deposit inside `run_residual_gib` and the
+        # ledger charges it TWICE at the run moment, exactly as it did with D's
+        # rings. Nothing about the bounce being small makes that safe: the
+        # error is structural, not proportional. ONE currency, both terms, one
+        # signature (`charge_terms(..., s_gb_d=, xchg_bounce_host_bytes=)`) and
+        # one call path -- there is deliberately no second sampler arm for the
+        # armed case.
         _arm_s_d = arm.get("s_gb_d")
+        _arm_bounce_bytes = int(round(float(arm.get("xchg_bounce_gib", 0.0) or 0.0) * GIB))
         charges = charge_terms(
             int(arm["s_gb"]), int(arm["m_mib"]), ranks_per_group, images,
             s_gb_d=None if _arm_s_d is None else int(_arm_s_d),
+            xchg_bounce_host_bytes=_arm_bounce_bytes,
         )
-        residual = (
-            nonreclaim_gib
-            - _boot_charges_gib(charges)
-            - rss_gib
-        )
+        # STORED, so the reader never has to GUESS which currency wrote a
+        # record (#1326). `record_run_residual_gib` re-prices records that are
+        # already on disk, and it can only do that soundly if it knows the sum
+        # the writing sampler actually subtracted. Reconstructing that from the
+        # arm means encoding "which version of this function ran", which is a
+        # guess that goes stale on the next currency change -- and this is the
+        # second currency change in one day. A record that carries the figure
+        # needs no version inference at all: correction = stored_charges -
+        # correct_charges, and it is 0 for a record already in its own currency.
+        _charges_gib = _boot_charges_gib(charges)
+        residual = nonreclaim_gib - _charges_gib - rss_gib
         residual_note = (
             f"nonreclaimable {nonreclaim_gib:.2f} minus this boot's own charges "
-            f"{_boot_charges_gib(charges):.2f} (at S={int(arm['s_gb'])} "
+            f"{_charges_gib:.2f} (at S={int(arm['s_gb'])} "
             f"S_D={int(_arm_s_d) if _arm_s_d is not None else int(arm['s_gb'])} "
-            f"M={int(arm['m_mib'])}, rings={charges['rings_gib']:.2f}) minus the "
-            f"measured image {rss_gib:.2f} (#1325: the subtraction now carries "
-            f"S_D; omitting it left D's rings inside the residual)"
+            f"M={int(arm['m_mib'])}, rings={charges['rings_gib']:.2f}, "
+            f"xchg_bounce={charges['xchg_bounce_gib']:.2f}) minus the "
+            f"measured image {rss_gib:.2f} (#1325/#1326: the subtraction carries "
+            f"S_D AND the xchg bounce; omitting either left an arm charge inside "
+            f"the residual, to be charged again at the run moment)"
         )
     return {
         "group": group,
@@ -2208,6 +2360,10 @@ def dormant_image_sample(
         "arm": arm,
         "run_residual_gib": residual,
         "run_residual_note": residual_note,
+        # #1326: THE SUM THIS SAMPLER SUBTRACTED, so a reader can re-price the
+        # record without inferring which version of this function wrote it.
+        # None when no run moment was available (the residual is None too).
+        "residual_charges_gib": _charges_gib,
         # #1325: WHAT THE BOX WAS DOING WHEN THIS WAS SAMPLED, and WHICH
         # SERVING FORM it speaks for. Both RECORDED, neither yet a selector of
         # a different number -- and that ordering is deliberate. The reading
@@ -2445,6 +2601,7 @@ def choose(
     d_cap_terms: Optional[Dict[str, float]] = None,
     measured_record: Optional[Dict[str, dict]] = None,
     margin: Optional[Margin] = None,
+    xchg_bounce_host_bytes: int = 0,
 ) -> Tuple[Arm, Optional[float], List[str]]:
     """Walk the ladder; return (arm, reap headroom GiB, printed lines) or W20/W21.
 
@@ -2492,6 +2649,7 @@ def choose(
             cg_ceiling_bytes=cg_ceiling_bytes,
             s_gb_d=s_gb_d,
             measured_record=measured_record,
+            xchg_bounce_host_bytes=xchg_bounce_host_bytes,
         )
         for s, m in arms
     ]
@@ -2602,7 +2760,13 @@ def choose(
             # nothing about S or M changed, D simply gained its own budget.
             f"WEG2-HOST-LEDGER ARM S={arm.s_gb} M={arm.m_mib} S_D={_arm_s_d(arm)}: "
             f"anchors={arm.terms['anchors_gib']:.2f} rings={arm.terms['rings_gib']:.2f} "
-            f"overhead={arm.terms['overhead_gib']:.2f} -> "
+            f"overhead={arm.terms['overhead_gib']:.2f} "
+            # #1273 S6: THE EXCHANGE'S PINNED HOST CARRIER, NAMED ON THE ARM
+            # LINE.  0.00 on the ring arm -- an unarmed boot says the term was
+            # priced at zero instead of leaving a reader to ask whether it was
+            # priced at all -- and `slots x slot_bytes x cards` of /dev/shm on
+            # the arms that create the file, charged at both moments.
+            f"xchg_bounce={arm.terms['xchg_bounce_gib']:.2f} -> "
             f"leftover launch={arm.launch_leftover_gib:.2f} GiB "
             # #1317n BOTH FORMS ON THE LINE, because the class assignment is
             # the whole change and a reader must be able to see it rather than

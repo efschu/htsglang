@@ -137,8 +137,13 @@ def test_the_sn6s_record_no_longer_exceeds_the_boot_bound():
     assert abs(corrected - 7.62) < 0.02, corrected
     # A record already in its own currency, so the reader re-prices it by 0
     # and this test asserts the ORDERING and not the correction twice.
-    r = dict(_sample(), arm={"s_gb": 1, "m_mib": 600},
-             run_residual_gib=corrected)
+    # `residual_charges_gib` is dropped along with the arm override: since
+    # #1326 that field IS the record's declared currency, so leaving a
+    # two-budget sum beside a single-budget arm would make the record
+    # self-inconsistent and the reader would correct a value that is already
+    # correct. A constructed record has to be consistent to mean anything.
+    r = {k: v for k, v in _sample().items() if k != "residual_charges_gib"}
+    r.update(arm={"s_gb": 1, "m_mib": 600}, run_residual_gib=corrected)
     assert corrected < SN6P_IDLE_RESIDUAL, (
         "corrected, the loaded sample sits BELOW sn6p's idle floor, so "
         "run_origin_gib's max() keeps the idle floor and the arm prices as it "
@@ -352,3 +357,142 @@ def test_the_record_still_refuses_to_derive_a_residual_without_a_run_moment():
     assert r["run_residual_gib"] is None
     assert "not the run moment" in str(r["run_residual_note"])
     assert "not 0" in str(r["run_residual_note"])
+
+
+# --------------------------------------------------------------------------
+# #1326 -- THE S6c MERGE: the xchg bounce is the SECOND term of the same defect
+# --------------------------------------------------------------------------
+#
+# The band (weg2/xchg-S6c-1317n-0910) adds `xchg_bounce_host_bytes` to
+# `charge_terms` and sums it in `_boot_charges_gib`; the line adds `s_gb_d`.
+# Both are ARM CHARGES that `predicted_run_peak_gib` adds back, so a sampler
+# that subtracts neither leaves BOTH inside `run_residual_gib` to be charged
+# twice at the run moment. Operator ruling: ONE signature, no second call path.
+#
+# DANGER DIRECTION is unchanged (under-charging the box), so the mutants are:
+#   M9  the sampler stops subtracting the bounce
+#       -> test_the_sampler_subtracts_the_bounce_too
+#   M10 the reader guesses the writing currency instead of reading it
+#       -> test_a_record_already_in_its_own_currency_corrects_by_exactly_zero
+#   M11 the ring-arm record changes at all
+#       -> test_the_ring_arm_record_is_byte_identical_to_the_1325_behaviour
+
+ARMED_ARM = {"s_gb": 1, "m_mib": 600, "s_gb_d": 4, "xchg_bounce_gib": 0.75}
+RING_ARM = {"s_gb": 1, "m_mib": 600, "s_gb_d": 4, "xchg_bounce_gib": 0.0}
+
+
+def test_charge_terms_carries_both_currency_terms_in_one_signature():
+    """The operator ruling, as a signature assertion.
+
+    Two slices each added a keyword to this function. A second call path for
+    the armed case would be the compensation layer this tree deletes on sight,
+    so the pin is that BOTH live on the one signature.
+    """
+    import inspect
+
+    params = list(inspect.signature(hl.charge_terms).parameters)
+    assert "s_gb_d" in params and "xchg_bounce_host_bytes" in params, params
+    # And the bounce is actually summed into the boot charges it must be part
+    # of -- a parameter that reached no sum would be decoration.
+    z = _images(0.0)
+    a = hl._boot_charges_gib(hl.charge_terms(1, 600, RANKS, z, s_gb_d=4))
+    b = hl._boot_charges_gib(
+        hl.charge_terms(1, 600, RANKS, z, s_gb_d=4,
+                        xchg_bounce_host_bytes=int(0.75 * hl.GIB))
+    )
+    assert abs((b - a) - 0.75) < 1e-6, (a, b)
+
+
+def test_the_sampler_subtracts_the_bounce_too():
+    """M9: an armed boot's deposit may not sit in the residual.
+
+    Same box, same arm, only the deposit differs: the subtracted sum must move
+    by exactly the deposit and the residual must fall by exactly the deposit.
+    """
+    ring = _sample(arm=RING_ARM)
+    armed = _sample(arm=ARMED_ARM)
+    assert abs((armed["residual_charges_gib"] - ring["residual_charges_gib"]) - 0.75) < 1e-6
+    assert abs((ring["run_residual_gib"] - armed["run_residual_gib"]) - 0.75) < 1e-6
+    assert "xchg_bounce=0.75" in str(armed["run_residual_note"])
+    assert "#1326" in str(armed["run_residual_note"])
+
+
+def test_a_record_already_in_its_own_currency_corrects_by_exactly_zero():
+    """M10: the reader READS the written currency, it does not infer it.
+
+    `residual_charges_gib` is the sum the writing sampler actually subtracted.
+    Preferring it is what keeps the reader sound across the NEXT currency
+    change -- a record that already subtracted correctly must yield exactly
+    0.0, without this function knowing which terms exist.
+    """
+    for arm in (RING_ARM, ARMED_ARM, {"s_gb": 1, "m_mib": 600}):
+        r = _sample(arm=arm)
+        v, corr = hl.record_run_residual_gib(r)
+        assert corr == 0.0, (arm, corr)
+        assert v == r["run_residual_gib"]
+
+
+def test_a_pre_1326_armed_record_is_corrected_by_rings_AND_bounce():
+    """The record already on disk again, now for the armed form.
+
+    A record written before `residual_charges_gib` existed provably passed
+    NEITHER term, so the pre-#1325 sum is exact rather than inferred, and the
+    correction is the two deltas together.
+
+    THE LEGACY RECORD IS BUILT THE WAY THE OLD SAMPLER BUILT IT -- stored =
+    nonreclaimable - the pre-#1325 charge sum - image -- and NOT by stripping
+    the new field off a correctly-subtracted record. Doing the latter (my first
+    attempt) makes the record self-inconsistent: it claims an old currency
+    while carrying a new-currency figure, and the reader then correctly
+    subtracts a correction the value had already had applied. A re-pricing
+    reader is only ever as sound as the record's own consistency, and a test
+    that fakes a record has to honour that.
+    """
+    nonreclaim, img = 50.0, 0.0
+    old_charges = hl._boot_charges_gib(
+        hl.charge_terms(1, 600, RANKS, _images(img))
+    )
+    legacy = dict(_sample(arm=ARMED_ARM),
+                  run_residual_gib=nonreclaim - old_charges - img)
+    del legacy["residual_charges_gib"]
+    v, corr = hl.record_run_residual_gib(legacy)
+    assert abs(corr - (8.7172 + 0.75)) < 0.01, corr
+    # And the re-priced value equals what the CORRECTED sampler would have
+    # written for the same box -- which is the whole claim of the reader.
+    assert abs(v - float(_sample(arm=ARMED_ARM)["run_residual_gib"])) < 0.01, v
+
+
+def test_the_ring_arm_record_is_byte_identical_to_the_1325_behaviour():
+    """M11: every ring-arm boot -- i.e. every boot so far -- is unchanged.
+
+    The bounce is 0.00 on the ring arm, so the merge may not move a single
+    ring-arm number. sn6s is the pin: it must still correct by the rings alone.
+    """
+    v, corr = hl.record_run_residual_gib(SN6S_P_ENTRY)
+    assert round(corr, 4) == 8.7172 and abs(v - 7.63) < 0.02
+    # An unarmed arm dict carrying an explicit 0.0 deposit behaves identically
+    # to one that has no such key at all.
+    a = _sample(arm={"s_gb": 1, "m_mib": 600, "s_gb_d": 4})
+    b = _sample(arm=RING_ARM)
+    assert a["run_residual_gib"] == b["run_residual_gib"]
+    assert a["residual_charges_gib"] == b["residual_charges_gib"]
+
+
+def test_the_ledger_arm_the_launcher_publishes_carries_the_deposit():
+    """The wiring, at the one site that builds `ledger_arm`.
+
+    The sampler can only subtract a term the front was told about, and the
+    front is told through `--ledger-arm`. A source pin because the builder sits
+    inside the launcher's boot path; the arithmetic above covers the behaviour.
+    """
+    import inspect
+
+    from sglang.srt.weg2 import launcher
+
+    src = inspect.getsource(launcher)
+    i = src.index('ledger_arm={"s_gb":')
+    window = src[i:i + 700]
+    assert '"xchg_bounce_gib"' in window, (
+        "the published arm must carry the deposit or the sampler cannot "
+        "subtract it, and an armed boot books it twice at the run moment"
+    )

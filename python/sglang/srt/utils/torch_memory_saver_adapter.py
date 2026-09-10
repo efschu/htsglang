@@ -76,6 +76,9 @@ class TorchMemorySaverAdapter(ABC):
     def backed_up_tag_bytes(self):
         raise NotImplementedError
 
+    def resume_stats(self, tag: str):
+        raise NotImplementedError
+
     def ring_stats(self):
         raise NotImplementedError
 
@@ -185,6 +188,72 @@ class _TorchMemorySaverAdapterReal(TorchMemorySaverAdapter):
                 out[tag] = int(value)
         return out
 
+    def resume_stats(self, tag: str):
+        """S7 (#1273): the LAST ``resume``'s map cost, or None.
+
+        ``{"allocations": n, "map_ms": x, "copy_ms": y}`` for ``tag``, or None
+        in every case where the answer is an ABSENCE rather than a zero: the
+        running hook has no such symbol (stock wheel, or a ``.so`` built before
+        this slice), no resume has been recorded in this process yet, or the
+        recorded tag is not the tag asked about.
+
+        THE TAG CHECK IS THE POINT.  Resume pass 1's cost belongs to ONE tag;
+        the recorder and the reader are two calls, so a reader that skipped the
+        check would print the previous tag's map cost under this tag's name the
+        first time anything resumed between the two.  Never fall back to the
+        last record when the tags differ -- report the absence.
+
+        WHAT THE TAG CHECK DOES NOT COVER (round-2 refuter F7): two records of
+        the SAME tag are indistinguishable, because the returned sequence
+        number is used only as a "never recorded" sentinel and not compared to
+        a value read before the resume.  That is reachable only if a resume of
+        this same tag happened between this call and the one it annotates, and
+        it cannot happen today: every ``CUDA_ERROR_CHECK`` / ``SIMPLE_CHECK`` in
+        ``tms_csrc`` exits the process, so a failed resume kills the rank
+        instead of leaving a stale record behind.  Named, not fixed, because a
+        pre-read costs a second ctypes call per tag on the flip's critical path
+        for a case no code path reaches.
+
+        ROCm RECORDS NOTHING: ``core.cpp`` dispatches ROCm to ``rocm_resume``
+        before the instrumented CUDA branch, so ``last_resume_seq_`` stays 0
+        and this returns None forever there.  Correct by absence -- the caller
+        prints ``n/a``, never a zero -- but stated here so a ROCm reader does
+        not conclude the remap was free.
+        """
+        import ctypes
+
+        fn = _weg2_ring_symbol("tms_resume_stats")
+        if fn is None:
+            return None
+        buf = ctypes.create_string_buffer(256)
+        allocations = ctypes.c_uint64(0)
+        map_ms = ctypes.c_double(0.0)
+        copy_ms = ctypes.c_double(0.0)
+        fn.restype = ctypes.c_uint64
+        fn.argtypes = [
+            ctypes.c_char_p,
+            ctypes.c_size_t,
+            ctypes.POINTER(ctypes.c_uint64),
+            ctypes.POINTER(ctypes.c_double),
+            ctypes.POINTER(ctypes.c_double),
+        ]
+        seq = int(
+            fn(
+                buf,
+                ctypes.c_size_t(len(buf)),
+                ctypes.byref(allocations),
+                ctypes.byref(map_ms),
+                ctypes.byref(copy_ms),
+            )
+        )
+        if seq == 0 or buf.value.decode() != tag:
+            return None
+        return {
+            "allocations": int(allocations.value),
+            "map_ms": float(map_ms.value),
+            "copy_ms": float(copy_ms.value),
+        }
+
     def ring_stats(self):
         """C8/C7: the live per-card host-ring counters, or None when this boot
         published no ring (then the stock ``cudaMallocHost`` path is running and
@@ -247,6 +316,9 @@ class _TorchMemorySaverAdapterNoop(TorchMemorySaverAdapter):
         return None
 
     def backed_up_tag_bytes(self):
+        return None
+
+    def resume_stats(self, tag: str):
         return None
 
     def ring_stats(self):
