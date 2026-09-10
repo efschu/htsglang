@@ -42,10 +42,19 @@ from sglang.srt.weg2 import host_ledger
 # Group D on this rig, from the boot logs of weg2sn6k/sn6l.
 D_POOL = 30518
 D_CHUNK = 4096
-D_CHAINS = 1
 D_FLOOR = D_CHUNK
-D_W = 24576
 D_NEED = 109129
+# TWO chain counts, and keeping both is the point. `solve_window`'s docstring
+# works its example at chains=1 -> W=24,576, and reading that example as "group
+# D's window" is exactly the drift that let W go unwired for a whole ticket:
+# `chains` is `--max-running-requests`, which D's argv sets to **6**
+# (`max_running_requests=6`, weg2sn6l's D log), so the number this rig actually
+# gets is 4,096 -- ONE CHUNK, and 27 windows for the user's prompt rather than
+# 5. Both are pinned below so neither can be mistaken for the other again.
+D_CHAINS_SPEC = 1
+D_W_SPEC = 24576
+D_CHAINS_RIG = 6
+D_W_RIG = 4096
 
 
 def _bind(names):
@@ -88,26 +97,51 @@ class _Tree:
 class TestTheWindowIsAWindow(unittest.TestCase):
     """(1) The cap the read never had."""
 
-    def test_the_solver_reproduces_group_ds_window_and_its_slack(self):
-        w = host_ledger.solve_window(D_POOL, D_CHUNK, D_CHAINS, D_FLOOR, 37)
-        self.assertEqual(w, D_W)
+    def test_the_solver_reproduces_the_specs_own_worked_example(self):
+        w = host_ledger.solve_window(D_POOL, D_CHUNK, D_CHAINS_SPEC, D_FLOOR, 37)
+        self.assertEqual(w, D_W_SPEC)
         # The slack the solver predicts is the room the NEXT window needs, and
         # it is the number metal actually saw on its second attempt (got=1847
         # against this 1846 -- one row is the resume anchor that must survive).
         self.assertEqual(D_POOL - w - D_FLOOR, 1846)
 
+    def test_the_window_this_rig_actually_gets_is_one_chunk_not_the_example(self):
+        """THE NUMBER A READER WILL GET WRONG. chains is --max-running-requests
+        = 6 on group D, so W is 4,096 and the prompt needs 27 windows. Pinned
+        beside the spec example because reading the example as the rig's number
+        is the same drift that left W unwired: a quantity that looks derived,
+        is derived, and describes a different configuration."""
+        w = host_ledger.solve_window(D_POOL, D_CHUNK, D_CHAINS_RIG, D_FLOOR, 37)
+        self.assertEqual(w, D_W_RIG)
+        self.assertEqual(w, D_CHUNK, "one chunk per window at bs6")
+        self.assertEqual(-(-D_NEED // w), 27)
+        # And the pool stays wide open, which is the whole fix: 22,326 rows
+        # free after window 1 instead of the metal reading of available=0.
+        self.assertEqual(D_POOL - w - D_FLOOR, 22326)
+
     def test_the_uncapped_ask_is_the_whole_pool_which_is_the_defect(self):
         # The arithmetic that shipped: min(need, available) on an empty pool.
         available = D_POOL
         self.assertEqual(min(D_NEED, available), D_POOL)
-        # Capped, one window is asked for and the slack survives.
-        self.assertEqual(min(min(D_NEED, available), D_W), D_W)
-        self.assertGreater(D_POOL - D_W, 0)
+        # Capped, one window is asked for and the slack survives -- and the
+        # metal consequence of NOT capping is the reading this pins against:
+        # occupied=30518 available=0, then 26,985 `reason=vote_negative`
+        # refusals of the same rid against a threshold of only 256.
+        self.assertEqual(min(min(D_NEED, available), D_W_RIG), D_W_RIG)
+        self.assertGreater(D_POOL - D_W_RIG, 0)
 
-    def test_five_windows_cover_the_prompt_that_could_not_take_two(self):
-        self.assertEqual(-(-D_NEED // D_W), 5)
-        self.assertIn("W=24576", host_ledger.window_provenance(
-            D_POOL, D_CHUNK, D_CHAINS, D_FLOOR, 37, D_NEED))
+    def test_the_provenance_line_names_every_term_of_whichever_w_it_answers(self):
+        # The line the CAP now prints -- and the reason the acceptance derives
+        # `got=<W>` from it instead of hardcoding a number.
+        rig = host_ledger.window_provenance(
+            D_POOL, D_CHUNK, D_CHAINS_RIG, D_FLOOR, 37, D_NEED)
+        self.assertIn("W=4096", rig)
+        self.assertIn("chains=6", rig)
+        self.assertIn("windows_for_109129=27", rig)
+        spec = host_ledger.window_provenance(
+            D_POOL, D_CHUNK, D_CHAINS_SPEC, D_FLOOR, 37, D_NEED)
+        self.assertIn("W=24576", spec)
+        self.assertIn("chains=1", spec)
 
 
 class TestProgressNotSeconds(unittest.TestCase):
