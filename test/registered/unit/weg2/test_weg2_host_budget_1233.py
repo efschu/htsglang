@@ -565,12 +565,54 @@ class TestTheLauncherCallSites(CustomTestCase):
 
 
     def test_the_ledger_call_site_passes_the_cgroup_denominator(self):
+        # #1317c: THE GUARANTEE IS UNCHANGED, THE READING HAD TO FOLLOW THE
+        # CODE. 6ec75420e7 (the Q6 pin fix) hoisted these kwargs into one
+        # `ledger_kw = dict(...)` block shared by the ladder call and the
+        # pinned-arm call, so no `choose(` site names them literally any more
+        # and a scan of literal keywords found NONE -- a red test over a
+        # guarantee that still holds. Resolving `**ledger_kw` to that dict's
+        # own keys keeps the assertion honest AND keeps it able to fail:
+        # dropping a key from the dict, or calling `choose` without the dict,
+        # both still go red.
+        import ast
+
         tree, _L = self._launcher_ast()
         calls = self._calls(tree, "choose")
         self.assertTrue(calls)
-        kwargs = {k.arg for c in calls for k in c.keywords}
+        # literal keywords at any choose() site
+        kwargs = {k.arg for c in calls for k in c.keywords if k.arg is not None}
+        # plus the keys of every dict splatted into one
+        splatted = {
+            k.value.id
+            for c in calls
+            for k in c.keywords
+            if k.arg is None and isinstance(k.value, ast.Name)
+        }
+        self.assertTrue(
+            kwargs or splatted,
+            "choose() is called with neither literal kwargs nor a splatted dict",
+        )
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Assign):
+                continue
+            for t in node.targets:
+                if not (isinstance(t, ast.Name) and t.id in splatted):
+                    continue
+                v = node.value
+                if isinstance(v, ast.Call) and isinstance(v.func, ast.Name) and v.func.id == "dict":
+                    kwargs |= {k.arg for k in v.keywords if k.arg is not None}
+                elif isinstance(v, ast.Dict):
+                    kwargs |= {
+                        k.value for k in v.keys
+                        if isinstance(k, ast.Constant) and isinstance(k.value, str)
+                    }
         for name in ("cg_current_bytes", "cg_ceiling_bytes", "cg_oom_kill"):
-            self.assertIn(name, kwargs)
+            self.assertIn(
+                name, kwargs,
+                f"{name} reaches host_ledger.choose neither as a literal keyword "
+                f"nor through a splatted dict; the cgroup denominator is the "
+                f"reap bound's own input (#1233 fix 5/6)",
+            )
 
     def test_neither_score_vector_survives_anywhere_as_a_bare_literal(self):
         # m3: ``argv_p`` going back to "8,4,4" while the constant moves is the
