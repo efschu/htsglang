@@ -316,6 +316,27 @@ class TheRouterEndToEnd(CustomTestCase):
         async def json(self):
             return self._payload
 
+        # #1317f: ``web.Request`` IS a MutableMapping, and `handle_generate` now
+        # stashes ``weg2_rid`` / ``weg2_t0`` on it so the client-gone middleware
+        # can abort by rid on the way out. The stub models that half of the real
+        # interface rather than the front being made tolerant of a stub -- a
+        # production guard written for a test's benefit is a guard that stops
+        # describing production.
+        _state: dict
+
+        def __setitem__(self, k, v):
+            if not hasattr(self, "_state"):
+                self._state = {}
+            self._state[k] = v
+
+        def __getitem__(self, k):
+            return getattr(self, "_state", {})[k]
+
+        def get(self, k, default=None):
+            return getattr(self, "_state", {}).get(k, default)
+
+        transport = None
+
     def _front(self):
         f = Front.__new__(Front)
         f.state = "serving"
