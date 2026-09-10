@@ -92,15 +92,47 @@ def test_batch_leg2_within_one_chunk_serves():
 
 
 # ------------------------------------------------ END-OF-PREFILL ANCHOR split
-def _adder_split(armed: bool, rem_chunk_tokens, start: int, length: int, total: int):
-    import importlib
+def _private_schedule_policy():
+    """A PRIVATE copy of ``schedule_policy``, re-evaluated under this env.
+
+    MEASURED CONTAMINATION, 2026-09-10 (gate pair of the #1329 execution
+    smoke): this helper used to ``importlib.reload`` the SHARED module to make
+    it re-read ``SGLANG_WEG2_END_ANCHOR`` at import time, and restore it with a
+    second reload.  A reload rebinds the module's CLASS OBJECTS -- every
+    ``Enum`` in it becomes a new class -- while any test that had already done
+    ``from ... import AddReqResult`` keeps the old one.  The two then compare
+    unequal while printing identically:
+
+        AssertionError: <AddReqResult.OTHER: 3> != <AddReqResult.OTHER: 3>
+        test/registered/unit/managers/test_second_chunked_req_959.py:267
+
+    Under ``-n 8 --dist loadfile`` whether that file shares a worker with this
+    one is a property of the FILE PACKING, so adding any test file anywhere in
+    the three scopes could make a foreign, passing test go red -- which is
+    exactly what happened and cost a gate arm to attribute.  The second reload
+    does not undo it: it produces a THIRD identity.
+
+    So the module is never mutated.  A fresh copy is executed under a private
+    name (not inserted into ``sys.modules``), which gives this file the
+    import-time re-evaluation it needs and gives every other file the identity
+    it started with.
+    """
+    import importlib.util
 
     import sglang.srt.managers.schedule_policy as sp
 
+    spec = importlib.util.spec_from_file_location(
+        "sglang.srt.managers._schedule_policy_probe_1233", sp.__file__)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _adder_split(armed: bool, rem_chunk_tokens, start: int, length: int, total: int):
     old = os.environ.get("SGLANG_WEG2_END_ANCHOR")
     os.environ["SGLANG_WEG2_END_ANCHOR"] = "1" if armed else "0"
     try:
-        importlib.reload(sp)
+        sp = _private_schedule_policy()
         adder = SimpleNamespace(rem_chunk_tokens=rem_chunk_tokens)
         req = SimpleNamespace(full_untruncated_fill_ids=list(range(total)), rid="rid")
         return sp.PrefillAdder._weg2_end_anchor_split(adder, req, start, length)
@@ -109,7 +141,6 @@ def _adder_split(armed: bool, rem_chunk_tokens, start: int, length: int, total: 
             os.environ.pop("SGLANG_WEG2_END_ANCHOR", None)
         else:
             os.environ["SGLANG_WEG2_END_ANCHOR"] = old
-        importlib.reload(sp)
 
 
 def test_split_holds_the_last_token_back_when_the_extend_reaches_the_end():
