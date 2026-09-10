@@ -229,7 +229,22 @@ class NeverRouteToAGroupThatRefusesByConstruction(CustomTestCase):
                         uncached, SB5F_X,
                         f"verdict {v} sends uncached={uncached} to D, whose "
                         f"cap is {SB5F_X} -- D refuses this by construction")
-                if v in ("short", "long"):
+                # #1317d RETIRED THE SECOND HALF OF THIS INVARIANT.
+                # `long` used to imply "the carrier fits", because the carrier
+                # was a CAP on what could move through D's host staging pool
+                # in one piece. Design A prices D's extent against store
+                # presence and the window loop streams the span through that
+                # pool in W-sized windows, so the pool is TRANSIT and `long`
+                # is exactly the route an ABOVE-carrier prompt now takes
+                # (user ruling 2026-09-10). `short` still implies it: that
+                # verdict means D serves the request itself with no store
+                # read at all.
+                #
+                # THE FIRST HALF STANDS UNCHANGED AND IS THE ONE THAT MATTERS
+                # -- no verdict may send an over-X prefill to D -- and #1317d
+                # STRENGTHENS it: the population that used to fall to
+                # `carrier_single` or a 413 now goes to P.
+                if v == "short":
                     self.assertLessEqual(
                         carrier_est, SB5F_CARRIER_MAX,
                         f"verdict {v} needs the carrier, and carrier_est="
