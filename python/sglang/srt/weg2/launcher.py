@@ -8655,6 +8655,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         f"a hand-kept list. weg2sb5 died with sites=2 and auth on NEITHER: the "
         f"front authenticated, the launcher's own startup sleep(P) did not, and "
         f"/release_memory_occupation is ADMIN_OPTIONAL -> 401 at 39 s. #1275 fix 2)")
+    # #1303: sweep the key files of boots that are provably gone. AFTER the
+    # mint, and with THIS boot's tag in the keep set, so the safety belt is
+    # structural: even a wrong liveness verdict cannot delete the key of the
+    # boot doing the sweeping. Measured residue that justified it: two Sep-9
+    # keys with zero live holders, left because those boots were never torn
+    # down, so `drop_admin_key_file` never ran for them.
+    log(admin_key_mod.sweep_stale_keys(GPU_ARB, keep_tags=(ns.tag,), dry=dry))
     log(f"WEG2 ADMIN-KEY {'minted (DRY: not written)' if dry else 'minted'} for this boot -> {admin_key_file} (mode 0600); "
         f"both groups get --admin-api-key, the front authenticates its flip RPCs "
         f"with it, and /hicache/storage-backend/resize is LIVE (#1275). "

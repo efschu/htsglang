@@ -156,3 +156,150 @@ def redact(key: Optional[str]) -> str:
     if not key:
         return "(none)"
     return f"(set, {len(key)} chars, ...{key[-4:]})"
+
+
+# ---------------------------------------------------------------- stale sweep
+#: #1303 (rescoped 2026-09-10): the residue this sweep exists for. Measured on
+#: the box at 10:4xZ: `boot_weg2sn5pre.adminkey` and `boot_weg2xsn5.adminkey`,
+#: both from Sep 9, both with ZERO live processes -- per-boot secrets outliving
+#: their boots in a shared directory, which is precisely what #1275's
+#: `drop_admin_key_file` exists to prevent. They survived because those boots
+#: were never torn down (the same two tags own the orphaned `mem_timeseries.sh`
+#: samplers the 08:17Z shm ticket lists), so the teardown path that would have
+#: removed them never ran. A sweep at LAUNCH is the second half #1275 needs:
+#: the boot that starts is the one process guaranteed to run.
+_PROBE_MARKERS = ("pgrep", "pkill", "ADMINKEY SWEEP")
+
+
+def tag_has_live_holder(
+    tag: str,
+    procs,
+    own_pids=(),
+) -> bool:
+    """Does any LIVE process belong to boot ``tag``?
+
+    PURE, taking ``procs`` as an iterable of ``(pid, cmdline)``, because the
+    reader is the part that cannot be tested and the RULE is the part that
+    must be. ``own_pids`` are excluded outright.
+
+    THE SELF-MATCH TRAP, which this function exists to not fall into and which
+    cost a wrong reading before it existed. The obvious probe is
+    ``pgrep -f <tag>``, and it MATCHES ITS OWN COMMAND LINE: asked whether
+    `weg2sn5pre` was alive, `pgrep -fc weg2sn5pre` answered **2** for a tag
+    with zero real processes, because the shell running the probe and the
+    pgrep itself both carry the tag in their argv. Reading that as "alive"
+    is harmless; reading the inverse as "dead" is how a sweep deletes a live
+    boot's secret. So two exclusions, not one:
+
+    * ``own_pids`` -- this process and anything it was asked to ignore;
+    * any cmdline that is itself a PROBE (``pgrep``/``pkill``, or one carrying
+      this sweep's own log marker). A process whose whole job is to ask about
+      the tag is not a holder of it.
+
+    A cmdline that cannot be read is NOT a holder: an unreadable ``/proc``
+    entry is a race with an exiting process, and the only safe reading of a
+    race is "gone". The DANGEROUS direction is the other one, and it is
+    covered by the caller keeping the live tag explicitly.
+    """
+    if not tag:
+        return False
+    own = {int(p) for p in own_pids}
+    for pid, cmdline in procs:
+        try:
+            pid = int(pid)
+        except (TypeError, ValueError):
+            continue
+        if pid in own:
+            continue
+        if not cmdline:
+            continue
+        if any(m in cmdline for m in _PROBE_MARKERS):
+            continue
+        if tag in cmdline:
+            return True
+    return False
+
+
+def read_procs(proc_root: str = "/proc"):
+    """``(pid, cmdline)`` for every readable process. The untestable half.
+
+    Reads ``/proc`` directly rather than shelling out to ``pgrep``: a
+    subprocess would put the tag into ANOTHER command line and re-create the
+    self-match it is being called to avoid.
+    """
+    out = []
+    try:
+        names = os.listdir(proc_root)
+    except OSError:
+        return out
+    for name in names:
+        if not name.isdigit():
+            continue
+        try:
+            with open(f"{proc_root}/{name}/cmdline", "rb") as fh:
+                raw = fh.read()
+        except OSError:
+            continue
+        out.append((int(name), raw.replace(b"\0", b" ").decode("utf-8", "replace")))
+    return out
+
+
+def stale_key_tags(gpu_arb: str, keep_tags=(), procs=None, own_pids=()):
+    """Split this directory's key files into (removable, kept) by TAG.
+
+    ``keep_tags`` is unconditional and is the caller's safety belt: the
+    current boot's own tag goes in it, so even a wrong liveness verdict cannot
+    delete the key of the boot doing the sweeping.
+    """
+    import glob
+
+    keep = {t for t in keep_tags if t}
+    procs = read_procs() if procs is None else list(procs)
+    removable, kept = [], []
+    prefix = f"{gpu_arb}/weg2/boot_"
+    for path in sorted(glob.glob(f"{gpu_arb}/weg2/boot_*.adminkey")):
+        tag = path[len(prefix):-len(".adminkey")] if path.startswith(prefix) else ""
+        if not tag:
+            continue
+        if tag in keep or tag_has_live_holder(tag, procs, own_pids):
+            kept.append(tag)
+        else:
+            removable.append(tag)
+    return removable, kept
+
+
+def sweep_stale_keys(gpu_arb: str, keep_tags=(), dry: bool = False) -> str:
+    """Remove key files whose boot is provably gone. Returns the log line.
+
+    NEVER RAISES and never removes a kept tag. One line, both lists, so a
+    reader can see what was spared as well as what went -- a sweep that
+    printed only its removals would be unauditable in exactly the direction
+    that matters.
+    """
+    try:
+        removable, kept = stale_key_tags(
+            gpu_arb, keep_tags=keep_tags, own_pids=(os.getpid(),)
+        )
+    except Exception as e:  # noqa: BLE001 - a launch-time sweep never blocks a launch
+        return f"WEG2-LAUNCH ADMINKEY SWEEP failed: {type(e).__name__}: {e}"
+    gone = []
+    for tag in removable:
+        path = key_path(gpu_arb, tag)
+        if dry:
+            gone.append(tag)
+            continue
+        try:
+            os.unlink(path)
+            gone.append(tag)
+        except FileNotFoundError:
+            gone.append(tag)
+        except OSError:
+            kept.append(tag)
+    return (
+        f"WEG2-LAUNCH ADMINKEY SWEEP removed={','.join(gone) or 'none'} "
+        f"kept={','.join(sorted(set(kept))) or 'none'}"
+        + (" (DRY)" if dry else "")
+        + " (a per-boot secret must not outlive its boot, #1275; a tag with any "
+        "live holder is kept, and the current boot's tag is kept "
+        "unconditionally)"
+    )
