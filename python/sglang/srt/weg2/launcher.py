@@ -48,6 +48,7 @@ import re
 import shlex
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import time
@@ -64,6 +65,12 @@ from sglang.srt.weg2 import DEFAULT_D_BS, DEFAULT_P_BS, DEFAULT_PP_ORDERED_CUT
 
 MIB = 1024 * 1024
 PORT_FRONT = 30030
+# User order 2026-09-10: the front serves on the LAN, permanently. 0.0.0.0
+# covers loopback (router, deadmen, agents) AND the LAN address. The groups
+# stay on 127.0.0.1 -- only the front is a client surface. Loopback trust in
+# utils/auth.py keys on the PEER address, so an admin route reached from the
+# LAN still needs the bearer; the API routes need nothing.
+DEFAULT_FRONT_HOST = "0.0.0.0"
 PORT_P = 30031
 PORT_D = 30032
 EVIDENCE_DIR = "/spinning/evidence-665-f1"
@@ -1775,6 +1782,34 @@ def shm_residue_sweep(
     )
     return {"swept": own, "bytes_freed": total, "bytes_apparent": apparent,
             "refused": {}, "archive": archive}
+
+
+def refuse_if_front_unbindable(log: Log, host: str, port: int, dry: bool) -> None:
+    """Pre-spawn probe: can the front bind ``host:port`` at all?
+
+    aiohttp binds with SO_REUSEADDR, so the probe does the same. The case this
+    exists for: the temporary LAN forwarder ``weg2-lan-forward.socket``
+    (2026-09-10) listens on 192.168.0.101:30030; a wildcard bind on the same
+    port then fails with EADDRINUSE. Without this probe the front would die
+    120 s into the boot after P and D are already up. Never on a dry run --
+    a dry run is taken while the serving base still holds the port.
+    """
+    if dry:
+        log(f"front bind probe: skipped on dry run ({host}:{port})")
+        return
+    probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        probe.bind((host, port))
+    except OSError as e:
+        raise Weg2LaunchRefused(
+            f"front cannot bind {host}:{port} ({e}); a listener already holds the port. If it is the "
+            f"temporary LAN forwarder: systemctl disable --now weg2-lan-forward.socket (the front "
+            f"serves the LAN itself on {host}); otherwise: ss -tlnp | grep :{port}"
+        ) from e
+    finally:
+        probe.close()
+    log(f"front bind probe: {host}:{port} bindable")
 
 
 def stale_deadman_sweep(log: Log, ports: Sequence[int], dry: bool) -> None:
@@ -7284,6 +7319,11 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--extra-d", default="", help="extra flags for group D (shell-split)")
     ap.add_argument("--fairness-w-s", type=float, default=45.0,
                     help="A1-1: the only sanctioned pre-emption; 0 disables it. Passed to the front.")
+    ap.add_argument("--front-host", default=DEFAULT_FRONT_HOST,
+                    help=f"bind address of the front on :{PORT_FRONT}. Default {DEFAULT_FRONT_HOST} = LAN-reachable "
+                         f"(user order 2026-09-10); 127.0.0.1 keeps it host-local. Refused before any group "
+                         f"is spawned if the address cannot be bound (e.g. the temporary LAN forwarder "
+                         f"weg2-lan-forward.socket still holds the port).")
     ap.add_argument("--p-bs", type=int, default=DEFAULT_P_BS,
                     help=f"K1: group P's --max-running-requests AND the front's leg-1 concurrency. "
                          f"Independent of --d-bs (law 2). Default {DEFAULT_P_BS} by the user order of "
@@ -8043,6 +8083,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     state.shm_sweep = shm_residue_sweep(log, ns.tag, stamp, dry)
     sweep_dead_credit_counters(log, dry=dry)
     stale_deadman_sweep(log, [PORT_FRONT, PORT_P, PORT_D], dry)
+    refuse_if_front_unbindable(log, ns.front_host, PORT_FRONT, dry)
     host_preflight(log, ns.tag, dry)
     cards = order_cards(resolve_cards())
     state.cards = [c.__dict__ for c in cards]
@@ -8678,7 +8719,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         log("front argv (dry): " + " ".join(shlex.quote(a) for a in front_argv_for(
             py, store_dir, 0, 0, dc_expect_d, cards, ns, chunk_count, 0, p_bs, d_bs, x_tokens,
             flip_min_work_tokens, idle_layout_front, admin_key_file=admin_key_file,
-            anon_preboot_bytes=anon_preboot_bytes)))
+            anon_preboot_bytes=anon_preboot_bytes, front_host=ns.front_host)))
         log("DRY-RUN complete: nothing started, mounted, armed or written")
         return 0
     state.pids["P"] = spec_p.pid
@@ -8916,6 +8957,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         commit=tip, ledger_arm={"s_gb": arm.s_gb, "m_mib": arm.m_mib},
         admin_key_file=admin_key_file,
         anon_preboot_bytes=anon_preboot_bytes,
+        front_host=ns.front_host,
     )
     fenv = dict(os.environ)
     fenv["PYTHONPATH"] = f"{tree}/python"
@@ -8967,7 +9009,8 @@ def front_argv_for(py: str, store_dir: str, p_pid: int, d_pid: int, dc_expect_d:
                    measured_record: str = "", commit: str = "",
                    ledger_arm: Optional[Dict[str, float]] = None,
                    admin_key_file: str = "",
-                   anon_preboot_bytes: int = 0) -> List[str]:
+                   anon_preboot_bytes: int = 0,
+                   front_host: str = DEFAULT_FRONT_HOST) -> List[str]:
     """ONE front argv builder, so --dry-run prints exactly what a real boot runs.
 
     C2/R-6: the front is TOLD the two bs numbers and X. It never asks a
@@ -8978,7 +9021,7 @@ def front_argv_for(py: str, store_dir: str, p_pid: int, d_pid: int, dc_expect_d:
     argv = [
         py, "-m", "sglang.srt.weg2.front",
         "--prefill", f"http://127.0.0.1:{PORT_P}", "--decode", f"http://127.0.0.1:{PORT_D}",
-        "--port", str(PORT_FRONT), "--awake", "D", "--tag", ns.tag,
+        "--port", str(PORT_FRONT), "--host", front_host, "--awake", "D", "--tag", ns.tag,
         "--store-dir", store_dir,
         "--prefill-sid", str(p_pid), "--decode-sid", str(d_pid),
         "--dc-reserve", ",".join(f"{c.uuid}={dc_expect_d.get(c.uuid, 0)}" for c in cards),
