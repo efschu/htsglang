@@ -108,6 +108,35 @@ CONCAT = re.compile(r"[\"'](W\d{1,2}[a-z]?) [\"']\s*\+\s*([A-Za-z_][A-Za-z0-9_]*
 MARKER_DEF = re.compile(
     r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*[\"'](Weg2[A-Za-z0-9]+)[\"']\s*$"
 )
+#: 4. SIGNATURE DEFAULT: ``code: str = "W88",`` with ``name: str =
+#:    "Weg2StoreLoadNotProgressing",`` on the NEXT line -- one terminal exit
+#:    parameterised by the code, so neither half is on the same line as the
+#:    other and no per-line pattern above can see it.
+#:
+#:    THIS FORM COST A RENUMBER (operator catch 2026-09-11). Boot seat 2's
+#:    #1332 B1b enumerated the "free" codes with a pattern that required an
+#:    exception NAME beside the number, read W88 as free, and shipped
+#:    ``W88 Weg2XchgWidestLayerUnreadable`` into a tip where
+#:    ``scheduler.py:6314`` already held W88 for #1324's store-read standstill.
+#:    This census reported no collision, because the holder is a STRING DEFAULT
+#:    and not an assignment -- the same blind-spot CLASS as #1257 (form 1 only)
+#:    and #1263 (counter keys), one form further out. A textual, word-bounded
+#:    grep over ``python/sglang/srt`` found 19 hits for W88; this file found 0.
+SIGNATURE_CODE = re.compile(
+    r'\bcode\s*(?::\s*str\s*)?=\s*[\"\'](W\d{1,2}[a-z]?)[\"\']')
+SIGNATURE_NAME = re.compile(
+    r'\bname\s*(?::\s*str\s*)?=\s*[\"\'](Weg2[A-Za-z0-9]+)[\"\']')
+#: How far a signature's ``name=`` may sit from its ``code=``. Four lines is
+#: the observed distance (adjacent at scheduler.py:6314/6315) plus slack for a
+#: comment between them; a wider window would start pairing a code with the
+#: NEXT refusal's name, which invents a holder instead of finding one.
+SIGNATURE_WINDOW = 4
+#: Written into the census when a signature default's ``name=`` partner is not
+#: found inside the window. Asserted empty, exactly like the concat operand: a
+#: code whose holder cannot be resolved must FAIL rather than be dropped, which
+#: is the whole lesson of the three forms before it.
+UNRESOLVED_SIGNATURE = "UNRESOLVED-SIGNATURE-NAME"
+
 #: Written into the census when form 3's operand resolves to nothing in its own
 #: file. Asserted to be empty: an unresolvable operand is the blind spot coming
 #: back, and it has to fail rather than quietly drop the code.
@@ -178,6 +207,15 @@ def census():
                 (code, markers.get(ident, f"{UNRESOLVED}:{ident}"))
                 for code, ident in CONCAT.findall(line)
             ]
+            # FORM 4: the code is on this line, its holder on a later one.
+            for code in SIGNATURE_CODE.findall(line):
+                holder = None
+                for ahead in lines[i - 1:i - 1 + SIGNATURE_WINDOW + 1]:
+                    found = SIGNATURE_NAME.search(ahead)
+                    if found:
+                        holder = found.group(1)
+                        break
+                hits.append((code, holder or f"{UNRESOLVED_SIGNATURE}:{code}"))
             for code, name in hits:
                 locs = out[code][name]
                 if f"{rel_p}:{i}" not in locs:
@@ -464,8 +502,19 @@ class TestOneWCodePerException(CustomTestCase):
         self.assertIn(54, used, "W54 is the corridor pass's number now")
         self.assertIn(55, used, "W55 is the would-bind refusal's number now")
         self.assertIn(56, used, "W56 is the unmeasured-floor refusal's number")
-        for n in (14, 15, 23, 39):
+        # #1332 B1b (2026-09-11) TOOK W14 for `Weg2XchgWidestLayerUnreadable`,
+        # and this list shrinks in the SAME commit -- a register that names a
+        # free number after it was consumed is the shape the determination law
+        # forbids ("the register entry is part of the work").
+        self.assertIn(14, used, "W14 is the widest-layer refusal's number now")
+        # AND THE LIST IS NOW WORTH MORE THAN IT WAS: `census` reads the
+        # SIGNATURE-DEFAULT form as of this commit (form 4), so a number that
+        # is only held by `code: str = "Wnn"` can no longer be named free here.
+        # That is how W88 was mis-named free by B1b's first enumeration --
+        # 19 textual hits under python/sglang/srt, 0 visible to this file.
+        for n in (15, 23, 39):
             self.assertNotIn(n, used, f"W{n} was named free and is not")
+        self.assertIn(88, used, "form 4 must see scheduler.py's signature code")
 
 
 if __name__ == "__main__":

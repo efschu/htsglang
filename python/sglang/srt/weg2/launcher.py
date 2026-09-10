@@ -4416,12 +4416,12 @@ def xchg_bounce_terms_for_arm(weight_source: str, oncard_mode: str,
                                 oncard_slot_mib) <= 0:
         return 0, []
     if not str(model_dir or "").strip():
-        # THE EXCEPTION MATCHES THE CODE IT PRINTS.  The first draft raised
-        # `Weg2XchgBounceUnderCovered` while naming W88's exception in the
+        # THE EXCEPTION MATCHES THE CODE IT PRINTS.  An earlier draft raised
+        # `Weg2XchgBounceUnderCovered` while naming the other class in the
         # text, which is the "instrument text lies" shape one level down: a
         # reader greps the name and lands on a class that was never raised.
         raise checkpoint_census.Weg2XchgWidestLayerUnreadable(
-            "W88 Weg2XchgWidestLayerUnreadable: the host on-card arm pins a "
+            "W14 Weg2XchgWidestLayerUnreadable: the host on-card arm pins a "
             "host bounce whose size is the WIDEST layer of this boot's "
             "checkpoint, and no checkpoint path reached this call site. "
             "Refused rather than sized against a default"

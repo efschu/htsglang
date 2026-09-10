@@ -73,18 +73,31 @@ WIDEST_LINE_PREFIX = "WEG2-XCHG WIDEST"
 
 
 class Weg2XchgWidestLayerUnreadable(RuntimeError):
-    """W88. The checkpoint could not yield a MEASURED widest layer.
+    """W14. The checkpoint could not yield a MEASURED widest layer.
 
-    THE CODE IS W88 BECAUSE THE CENSUS SAID SO, not because it was next.
-    The first draft of this module wrote W74 and
-    `test_weg2_wcode_uniqueness_1263` caught it in the gate:
-    `{'W74': {'Weg2XchgWidestLayerUnreadable', 'Weg2XchgSourceMissing'}}`.
-    W74 is `Weg2XchgSourceMissing`'s. The free set at the time of writing was
-    {5, 6, 13, 14, 15, 19, 23, 24, 27, 39, 73, 88} over 76 used codes with 87
-    the highest; 73 is EARMARKED for S6 slice 1's `Weg2XchgRollForward` in the
-    spec, so 88 is the honest pick -- enumerated, not incremented, which is
-    what that test's own message demands ("picking the next one by hand is how
-    W31 became W47").
+    THE CODE TOOK THREE TRIES, and both wrong ones were the SAME MISTAKE at
+    different depths: a census whose PATTERN was narrower than the ways a
+    W-code is actually written.
+
+    * Draft 1 wrote **W74**, which is `Weg2XchgSourceMissing`'s.
+      `test_weg2_wcode_uniqueness_1263` caught it in the gate:
+      `{'W74': {'Weg2XchgWidestLayerUnreadable', 'Weg2XchgSourceMissing'}}`.
+    * Draft 2 wrote **W88** after enumerating with `W(\d+)\s+Weg2\w+`, i.e.
+      "a number followed by an exception NAME". That pattern cannot see
+      `scheduler.py:6314`'s `code: str = "W88",` (its holder,
+      `name: str = "Weg2StoreLoadNotProgressing"`, is on the NEXT line), so it
+      read 88 as free while a word-bounded text grep over `python/sglang/srt`
+      found NINETEEN hits for W88. The uniqueness census could not see it
+      either -- form 4 was added in the same commit as this renumber, and it is
+      red on the previous tip.
+    * **W14** is the lowest code with ZERO textual hits anywhere under
+      `python/sglang/srt` (the full zero set: 14, 15, 23, 39 -- every other
+      number below 90 is textually taken in SOME form, including the ones
+      draft 2's narrow pattern reported free: W5 16 hits, W6 5, W13 13, W19 11,
+      W24 17, W27 23, W73 8 and earmarked for `Weg2XchgRollForward`).
+
+    THE RULE THIS LEAVES BEHIND: a free W-code is one with no TEXTUAL hit at
+    all, not one the current census pattern happens not to parse.
 
     A refusal and never a fallback. ``bounce_terms`` grades the assemble
     buffer's coverage against this number, so a guessed one would produce a
@@ -167,7 +180,7 @@ def _read_header(path: str) -> Dict[str, object]:
         raise
     except BaseException as exc:  # noqa: BLE001 -- every shape is named
         raise Weg2XchgWidestLayerUnreadable(
-            f"W88 Weg2XchgWidestLayerUnreadable: the safetensors header of "
+            f"W14 Weg2XchgWidestLayerUnreadable: the safetensors header of "
             f"{path} could not be read ({type(exc).__name__}: {exc}). The "
             f"assemble buffer is sized on the WIDEST layer of this checkpoint "
             f"and a boot that cannot measure it is refused here, at ARM time, "
@@ -203,12 +216,12 @@ def layer_census_from_headers(model_dir: str) -> LayerCensus:
                        if f.endswith(".safetensors"))
     except BaseException as exc:  # noqa: BLE001
         raise Weg2XchgWidestLayerUnreadable(
-            f"W88 Weg2XchgWidestLayerUnreadable: the checkpoint directory "
+            f"W14 Weg2XchgWidestLayerUnreadable: the checkpoint directory "
             f"{root} could not be listed ({type(exc).__name__}: {exc})"
         ) from exc
     if not names:
         raise Weg2XchgWidestLayerUnreadable(
-            f"W88 Weg2XchgWidestLayerUnreadable: no safetensors shard under "
+            f"W14 Weg2XchgWidestLayerUnreadable: no safetensors shard under "
             f"{root}. The widest layer is measured from the checkpoint's own "
             f"headers; with no shard there is nothing to measure and the boot "
             f"is refused instead of sized against a default"
@@ -233,7 +246,7 @@ def layer_census_from_headers(model_dir: str) -> LayerCensus:
             classes.setdefault(idx, set()).add(tensor_class(name))
     if not per:
         raise Weg2XchgWidestLayerUnreadable(
-            f"W88 Weg2XchgWidestLayerUnreadable: no layer-indexed tensor in "
+            f"W14 Weg2XchgWidestLayerUnreadable: no layer-indexed tensor in "
             f"any of the {len(names)} shard(s) under {root} (pattern "
             f"{LAYER_RE.pattern!r}). A checkpoint whose layers cannot be "
             f"identified cannot be assembled a layer at a time, and reporting "
@@ -255,7 +268,7 @@ def widest_layer(census: LayerCensus) -> Tuple[int, int, Tuple[str, ...]]:
     """
     if not census.layer_bytes:
         raise Weg2XchgWidestLayerUnreadable(
-            "W88 Weg2XchgWidestLayerUnreadable: an empty census has no widest "
+            "W14 Weg2XchgWidestLayerUnreadable: an empty census has no widest "
             "layer; layer_census_from_headers refuses before this can happen")
     idx, nbytes = max(census.layer_bytes, key=lambda r: (r[1], -r[0]))
     by_index = dict(census.layer_classes)
