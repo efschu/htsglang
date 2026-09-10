@@ -1945,6 +1945,7 @@ def plan_store(
     sidecar_factor: float = STORE_SIDECAR_FACTOR,
     min_free_gib: float = STORE_DISK_MIN_FREE_GIB,
     root: str = STORE_ROOT,
+    store_max_gb: float = 0.0,
 ) -> StoreDiskPlan:
     """Size the store from THE P POOL, and check the DISK can fund it.
 
@@ -1973,7 +1974,34 @@ def plan_store(
     cell_bytes = int(round(sum(int(a) for a in attn_counts)
                            * float(kv_mib_per_token_per_attn_layer) * MIB))
     pool_bytes = int(round(float(p_pool_tokens) * cell_bytes))
-    max_size = int(math.ceil(pool_bytes * float(sidecar_factor)))
+    # USER-SET ABSOLUTE SIZE takes precedence over the derived one.
+    # User order 2026-09-10, verbatim: "der l3 auf der platte hatte ich mal auf
+    # 150gb groesse festgelegt, nicht 28gb". The derived figure
+    # (`pool_bytes x sidecar_factor`) answers "how big must the store be to hold
+    # one prefill leg plus its sidecars" -- a FLOOR, not a cap, and it cannot
+    # express "the operator gave this store 150 GB of disk". In GB (10^9), the
+    # unit the user used and the unit HiCacheFile's max_size already speaks.
+    #
+    # The #1236 floor still binds: a store below the P pool cannot hold what one
+    # prefill leg produces (boot weg2sb5g logged that refusal 1,324 times), so a
+    # user value under it is REFUSED BY NAME rather than silently clamped -- an
+    # operator asking for less than the law allows should be told, not overridden.
+    if float(store_max_gb) > 0:
+        max_size = int(round(float(store_max_gb) * 1_000_000_000))
+        if max_size < pool_bytes:
+            raise Weg2StoreDiskRefused(
+                f"W57 Weg2StoreDiskRefused: --store-max-gb {store_max_gb} GB = "
+                f"{max_size / host_ledger.GIB:.2f} GiB is BELOW this boot's P pool "
+                f"({int(p_pool_tokens)} tokens x {cell_bytes} B/token = "
+                f"{pool_bytes / host_ledger.GIB:.2f} GiB). #1236's law is store >= P pool: "
+                f"the store is the carrier every prefix travels through from P to D, so one "
+                f"below the pool refuses the writes at the end of a prefill leg. Raise "
+                f"--store-max-gb to at least "
+                f"{int(math.ceil(pool_bytes / 1_000_000_000))} GB, or drop the flag to use "
+                f"the derived size."
+            )
+    else:
+        max_size = int(math.ceil(pool_bytes * float(sidecar_factor)))
     min_free = int(round(float(min_free_gib) * host_ledger.GIB))
     os.makedirs(root, exist_ok=True)
     st = os.statvfs(root)
@@ -7173,6 +7201,14 @@ def build_parser() -> argparse.ArgumentParser:
     # against the disk (max_size >= P pool bytes, W57). The two knobs below are
     # the only ones the disk form has, and both have a stated default.
     ap.add_argument(
+        "--store-max-gb", type=float, default=0.0,
+        help="#1236 / user order 2026-09-10: the store's max_size as an ABSOLUTE size in "
+             "GB (10^9), overriding the derived `P pool bytes x --store-sidecar-factor`. "
+             "0 = derive as before. The #1236 floor stays enforced: a value below the P "
+             "pool is refused by name (W57), never clamped. Use this when the operator has "
+             "given the store a disk budget; use --store-sidecar-factor when you mean "
+             "'more sidecar headroom per pool token'.")
+    ap.add_argument(
         "--store-sidecar-factor", type=float, default=STORE_SIDECAR_FACTOR,
         help="#1236: multiply the P KV pool's bytes by this to size the store, "
              "covering the Mamba blobs and draft pages that ride beside the KV "
@@ -8290,6 +8326,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         cut.attn_counts,
         cut.kv_mib_per_token_per_attn_layer,
         sidecar_factor=ns.store_sidecar_factor,
+        store_max_gb=ns.store_max_gb,
         min_free_gib=ns.store_disk_min_free_gib,
     )
     store_cfg = store_plan.extra_config()
