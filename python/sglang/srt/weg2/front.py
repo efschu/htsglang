@@ -50,6 +50,7 @@ import collections
 import contextvars
 import hashlib
 import json
+import math
 import logging
 import os
 import re
@@ -292,6 +293,15 @@ def make_rpc_trace_config() -> TraceConfig:
 #: specimen it must catch overran by more than 100x (weg2t2a: 7 min against a
 #: 3-5 s flip).
 FLIP_STALL_SLACK = 4.0
+#: #1317h: how often the drain refreshes the live progress reading the
+#: flip-stall detector consults. 10 s against a 120 s drain window is 12 calls
+#: per window for a detector that fires at most once -- cheap enough to be
+#: unconditional, coarse enough not to be a poller.
+FLIP_PROGRESS_SAMPLE_S = 10.0
+#: #1317h: how many drain durations the bound's distribution is taken over.
+#: Bounded, because an unbounded list on a long-lived front is a leak, and 64
+#: is already far more than the p99 of a boot's flips needs.
+DRAIN_LOG_MAX = 64
 #: How often the stall watcher LOOKS.  A poll period, never the bound: the
 #: bound is derived per flip by `Front._flip_stall_bound_s`.  Matches the
 #: corridor sampler's existing cadence so the front gains no new timing
@@ -1631,6 +1641,17 @@ class Front:
         # measured cost of every completed flip -- so the third signal lives
         # here, in the one process that knows a flip began and has not ended.
         self._flip_t0: Optional[float] = None
+        # #1317h: the drain distribution the stall bound is taken over, and
+        # the live progress reading the detector consults. LIFECYCLE:
+        # `_drain_log` is appended by `drain` (both exits) and read only by
+        # `_flip_stall_bound_s`; `_flip_progress_seen` is written by `drain`
+        # and read only by `flip_stall_check`, and it is deliberately NOT
+        # cleared at the end of a flip -- a stale reading is compared against
+        # `_flip_t0` and a reading older than the current flip cannot credit
+        # progress to it.
+        self._drain_log: Deque[float] = collections.deque(maxlen=DRAIN_LOG_MAX)
+        self._flip_progress_seen: Optional[Tuple[float, Optional[dict]]] = None
+        self._flip_progress_start: Optional[dict] = None
         #: #1264 fix 2b (1): the stage's VALUE and the monotonic instant it was
         #: assigned, always written together -- see the `_flip_stage` property.
         self._flip_stage_value: str = "none"
@@ -3693,12 +3714,31 @@ class Front:
         t0 = time.time()
         before = await self._weg2_decode_progress(g)
         self._drain_progress = None
+        # #1317h: the flip-stall detector runs on a 1 s sampler and cannot
+        # await, so the drain leaves it a LIVE reading here. Sampled every
+        # FLIP_PROGRESS_SAMPLE_S, not every 0.25 s poll -- one HTTP call per
+        # poll would put ~480 calls into a single 120 s drain window for a
+        # detector that fires at most once.
+        self._flip_progress_seen = (t0, before)
+        _last_sample = t0
         while g.outstanding:
-            if time.time() - t0 > self.drain_deadline_s:
+            now = time.time()
+            if now - t0 > self.drain_deadline_s:
                 after = await self._weg2_decode_progress(g)
                 self._drain_progress = weg2_drain_progress_delta(before, after)
+                self._drain_log.append(now - t0)
                 return False
+            if now - _last_sample >= FLIP_PROGRESS_SAMPLE_S:
+                _last_sample = now
+                self._flip_progress_seen = (
+                    now, await self._weg2_decode_progress(g)
+                )
             await asyncio.sleep(0.25)
+        # #1317h: a drain that COMPLETED is a sample of the drain
+        # distribution, and it is the only half of that distribution the old
+        # bound never saw -- it only ever read `flip_ms`, which is measured
+        # AFTER the drain succeeded.
+        self._drain_log.append(time.time() - t0)
         return True
 
     async def quiesce(self, g: Group) -> Tuple[bool, str]:
@@ -3787,6 +3827,12 @@ class Front:
         # "serving" or "STOP", and the detector fires only while it is
         # "flipping", so there is no path on which a stale t0 can be read.
         self._flip_t0 = t_flip0
+        # #1317h: the baseline the stall detector's progress check differences
+        # against. Taken from the last live sample if one exists, so the very
+        # first flip of a boot still has a comparand.
+        self._flip_progress_start = (
+            self._flip_progress_seen[1] if self._flip_progress_seen else None
+        )
         self._flip_stage = "drain"
         logger.info("WEG2-FLIP begin epoch=%d sleep=%s wake=%s outstanding=%d queue=%d", self.epoch, src, dst, len(S.outstanding), len(self.queue))
         # 1. drain (W1/W2)
@@ -4759,19 +4805,71 @@ class Front:
         detector can arm would leave the first flip of each direction
         unwatched -- which is the specimen.
         """
+        # #1317h THE OLD BOUND COULD NOT BE SATISFIED BY A HEALTHY FLIP.
+        #
+        # It read `FLIP_STALL_SLACK * last flip_ms` -- 4 x ~3.4 s = ~13.6 s on
+        # boot weg2sn6g -- while `flip_ms` is measured AFTER the drain has
+        # already succeeded, so the drain's own cost was never in it. A flip
+        # whose drain is legitimately WAITING for a decode may take up to
+        # `drain_deadline_s` (120 s) in the drain phase ALONE, and #1011 says
+        # that decode is never cut. So a 13.6 s bound convicts every flip that
+        # queues behind real work: weg2sn6g fired the detector twice
+        # (09:48:14 and 10:03:40) with the boot healthy and serving.
+        #
+        # THE BOUND IS NOW THE DRAIN DISTRIBUTION PLUS THE FLIP. The drain
+        # half comes from `_drain_log`, which records EVERY drain of this boot
+        # (both exits), taken at p99 so one pathological drain does not set the
+        # bound for all later flips; the flip half is the measured `flip_ms`.
+        # Both halves are this boot's own measurements, and the sum is what a
+        # flip actually costs when it waits.
+        drain_s, drain_src = self._drain_p99_s()
+        flip_s, flip_src = 0.0, "no flip measured on this boot yet"
         for rec in reversed(self.flip_log):
             ms = float(rec.get("flip_ms") or 0.0)
             if ms > 0:
-                return (
-                    FLIP_STALL_SLACK * ms / 1000.0,
-                    f"{FLIP_STALL_SLACK:.0f}x this boot's last measured flip "
-                    f"({rec.get('sleep')}->{rec.get('wake')}, {ms:.0f} ms)",
+                flip_s = ms / 1000.0
+                flip_src = (
+                    f"last measured flip {rec.get('sleep')}->{rec.get('wake')} "
+                    f"{ms:.0f} ms"
                 )
+                break
         return (
-            self.drain_deadline_s,
-            "no flip measured on this boot yet -- the front's own published "
-            "drain deadline (--drain-deadline-s) stands in",
+            drain_s + flip_s,
+            f"drain p99 {drain_s:.1f} s ({drain_src}) + flip {flip_s:.1f} s "
+            f"({flip_src}); the drain half is what the old "
+            f"{FLIP_STALL_SLACK:.0f}x-flip_ms bound omitted, and #1011 lets a "
+            f"drain wait for a decode",
         )
+
+    def _drain_p99_s(self) -> Tuple[float, str]:
+        """The p99 of this boot's own drain durations, or its declared bound.
+
+        Fewer than 4 samples is not a distribution, and a bound taken off one
+        or two drains would be as arbitrary as the literal it replaces -- so
+        below that the front's OWN published `drain_deadline_s` stands in,
+        which is the same fallback the previous revision used for epoch 0 and
+        is the ceiling every drain is already refused against.
+
+        p99 AND NOT max, stated with the size at which that starts to matter:
+        `_drain_log` includes drains that ran the full window and were refused,
+        and once the boot has enough flips one of those must not set the bound
+        for all the rest. Below ~100 samples `ceil(0.99*n)-1` IS the last
+        index, so p99 EQUALS the max and this function is a max -- which is the
+        conservative direction and is the right behaviour while the
+        distribution is young. The quantile only begins to trim above ~100
+        drains; it is written as a quantile now so the behaviour does not have
+        to change later.
+        """
+        n = len(self._drain_log)
+        if n < 4:
+            return (
+                self.drain_deadline_s,
+                f"only {n} drain sample(s) -- the front's own published drain "
+                f"deadline (--drain-deadline-s) stands in",
+            )
+        xs = sorted(self._drain_log)
+        idx = min(n - 1, int(math.ceil(0.99 * n)) - 1)
+        return (xs[idx], f"p99 of {n} drains on this boot, max {xs[-1]:.1f} s")
 
     def flip_stall_check(self, now: Optional[float] = None) -> Optional[str]:
         """Emit ``WEG2-FLIP STALL`` once when a flip overruns its derived bound.
@@ -4795,6 +4893,31 @@ class Front:
         bound, provenance = self._flip_stall_bound_s()
         if elapsed < bound:
             return None
+        # #1317h PROGRESS BEFORE THE VERDICT, the same law the drain's own W1
+        # now obeys (#1317c): a flip whose group is still emitting tokens is
+        # WAITING on work #1011 forbids cutting, not stalled. The reading is
+        # the live one the drain refreshes every FLIP_PROGRESS_SAMPLE_S, and
+        # it is only credited when it was taken INSIDE this flip -- a sample
+        # older than `_flip_t0` describes the previous one.
+        seen = self._flip_progress_seen
+        if seen is not None and seen[0] >= self._flip_t0:
+            delta = weg2_drain_progress_delta(
+                (self._flip_progress_start or {}), seen[1]
+            )
+            if delta is not None and delta.get("progressed"):
+                self.counters["flip_stall_waiting"] += 1
+                logger.warning(
+                    "WEG2-FLIP WAITING epoch=%d elapsed=%.1f s bound=%.1f s "
+                    "tokens=%d prefill_tokens=%d running=%d awake=%s "
+                    "(the flip has overrun its bound and its group is STILL "
+                    "EMITTING -- a decode #1011 forbids cutting. NOT latched "
+                    "as a stall; the detector re-arms. Denominator: bound "
+                    "overruns in which live progress was readable)",
+                    self.epoch, elapsed, bound, delta.get("tokens", 0),
+                    delta.get("prefill_tokens", 0), delta.get("running", 0),
+                    self.awake,
+                )
+                return None
         if self._flip_stall_reported_epoch == self.epoch:
             return None
         self._flip_stall_reported_epoch = self.epoch
@@ -4825,10 +4948,21 @@ class Front:
         if self.state != "serving":
             return web.json_response({"error": self.state}, status=503)
         src, dst = self.awake, ("P" if self.awake == "D" else "D")
+        # #1317h: `admit_d` was set False here and NEVER RESTORED, so one
+        # manual flip left D admission off for the rest of the boot -- every
+        # later request queued behind a gate nothing would reopen. Restored in
+        # a `finally`, and to its PREVIOUS value rather than to True, because
+        # the caller may legitimately have had it off already (a drain in
+        # progress, an operator hold).
+        _admit_before = self.admit_d
         self.admit_d = False
-        await self.flip(src, dst)
-        if self.awake == "P" and self.state == "serving":
-            await self.flip("P", "D")
+        try:
+            await self.flip(src, dst)
+            if self.awake == "P" and self.state == "serving":
+                await self.flip("P", "D")
+        finally:
+            self.admit_d = _admit_before
+            self._sync_batch_gate()
         return web.json_response(self.state_dict())
 
 
