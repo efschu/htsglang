@@ -85,12 +85,21 @@ class TheVerdictAsksBothBoundsOnTheirOwnBase(CustomTestCase):
     """RED-FIRST at `4f762260ba`: `serviceable_route` does not exist, and
     nothing else in the front ever returns "no route"."""
 
-    def test_red_first_the_sb5f_long_prompt_has_no_route(self):
-        """THE defect, as one call. Over X AND over the carrier, MEASURED."""
-        self.assertEqual(
-            serviceable_route(SB5F_UNCACHED, SB5F_CARRIER_EST,
-                              SB5F_X, SB5F_CARRIER_MAX, carrier_exact=True),
-            "none")
+    def test_red_first_the_sb5f_long_prompt_now_has_the_p_route(self):
+        """""" + H_RET + """ -- "over X AND over the carrier -> no route -> 413".
+        #1317d retires it: the carrier was a CAP on what could move through D's
+        host staging pool in one piece, and design A + the window loop make
+        that pool TRANSIT, so this population takes the two-leg P route.
+
+        WHAT THIS STILL ASSERTS (the surviving half): the request is never
+        handed to D as a single prefill, because D refuses an over-X prefill by
+        construction. The verdict changed from `none` to `long`; what may NOT
+        happen is unchanged."""
+        got = serviceable_route(SB5F_UNCACHED, SB5F_CARRIER_EST,
+                                SB5F_X, SB5F_CARRIER_MAX, carrier_exact=True)
+        self.assertEqual(got, "long")
+        self.assertNotIn(got, ("short", "carrier_single"),
+                         "an over-X prefill may never be offered to D")
 
     def test_between_x_and_carrier_the_long_route_fires(self):
         """The verdict the census counted ZERO times over 591 requests."""
@@ -120,22 +129,37 @@ class TheVerdictAsksBothBoundsOnTheirOwnBase(CustomTestCase):
         on that number would turn a deliberate over-estimate into a hard
         rejection of prompts the rig can serve -- a worse failure than the
         slow one. An estimate may DOWNGRADE the route, never terminate it."""
+        #1317d: """ + H_SUR + """ -- an estimate may never terminate a route.
+        # It now holds A FORTIORI and is asserted as such rather than deleted:
+        # since the carrier bound terminates NOTHING, neither the estimate nor
+        # the measured count can refuse, and the est/exact distinction has no
+        # terminal left to guard. The old assertion `exact == "none"` was the
+        # RETIRED half and is gone; the guarantee this test exists for is
+        # stronger than before.
         est = serviceable_route(SB5F_UNCACHED, SB5F_CARRIER_EST, SB5F_X,
                                 SB5F_CARRIER_MAX, carrier_exact=False)
         exact = serviceable_route(SB5F_UNCACHED, SB5F_CARRIER_EST, SB5F_X,
                                   SB5F_CARRIER_MAX, carrier_exact=True)
-        self.assertEqual(est, "carrier_single",
-                         "an estimated carrier figure must not refuse")
-        self.assertEqual(exact, "none")
-        self.assertNotEqual(est, exact)
+        self.assertNotEqual(est, "none",
+                            "an estimated carrier figure must not refuse")
+        self.assertNotEqual(exact, "none",
+                            "and since #1317d a MEASURED one does not either")
+        self.assertEqual(est, exact,
+                         "with no terminal left, the est/exact split has "
+                         "nothing to decide for this population")
+        self.assertEqual(est, "long")
 
     def test_the_default_is_the_safe_one(self):
-        """`carrier_exact` defaults False: a caller that does not know must
-        not accidentally get the terminal verdict."""
-        self.assertEqual(
-            serviceable_route(SB5F_UNCACHED, SB5F_CARRIER_EST, SB5F_X,
-                              SB5F_CARRIER_MAX),
-            "carrier_single")
+        """""" + H_SUR + """ -- a caller that does not know must not
+        accidentally get the terminal verdict. Kept, through the new route: the
+        default still cannot produce `none`. Only the concrete value it does
+        produce moved (`carrier_single` -> `long`), because #1317d sends this
+        population to P instead of offering D a prefill 1.7x its cap."""
+        got = serviceable_route(SB5F_UNCACHED, SB5F_CARRIER_EST, SB5F_X,
+                                SB5F_CARRIER_MAX)
+        self.assertNotEqual(got, "none",
+                            "the default must never be the terminal verdict")
+        self.assertEqual(got, "long")
 
     def test_unset_bounds_disable_themselves_and_never_refuse(self):
         """A front started without either bound must behave as before."""
@@ -176,11 +200,15 @@ class NeverRouteToAGroupThatRefusesByConstruction(CustomTestCase):
                          SB5F_CARRIER_MAX)
         new = serviceable_route(SB5F_UNCACHED, SB5F_CARRIER_EST, SB5F_X,
                                 SB5F_CARRIER_MAX, carrier_exact=True)
+        # """ + H_SUR + """ -- "the fix must not send this to D at all". That is
+        # the whole point of MUTANT 1 and it is UNCHANGED; only the destination
+        # moved, from a named refusal to the P route. The mutant still
+        # reproduces the shipped defect and the fix still refuses to repeat it.
         self.assertEqual(old, "carrier_single",
                          "the mutant must reproduce the shipped behaviour")
         self.assertNotEqual(new, old,
                             "the fix must not send this to D at all")
-        self.assertEqual(new, "none")
+        self.assertEqual(new, "long")
 
     def test_mutant_x_alone_would_send_an_over_carrier_request_to_p(self):
         """MUTANT 2, the opposite error: consulting X alone routes a prompt
@@ -189,24 +217,57 @@ class NeverRouteToAGroupThatRefusesByConstruction(CustomTestCase):
         def x_only(uncached, x):
             return "short" if uncached <= x else "long"
 
+        # """ + H_RET + """ -- "with both bounds consulted, NEITHER route is
+        # offered". #1317d makes MUTANT 2 no longer a mutant for this input:
+        # the P route IS the right answer now, because the window loop streams
+        # the span through the staging pool that used to bound it. So the two
+        # routers agree here, and the test says so instead of pretending a
+        # difference. The SURVIVING half is asserted below: whatever else
+        # changes, an over-X request is never offered to D.
         self.assertEqual(x_only(SB5F_UNCACHED, SB5F_X), "long")
-        self.assertEqual(
-            serviceable_route(SB5F_UNCACHED, SB5F_CARRIER_EST, SB5F_X,
-                              SB5F_CARRIER_MAX, carrier_exact=True),
-            "none", "with both bounds consulted, neither route is offered")
+        got = serviceable_route(SB5F_UNCACHED, SB5F_CARRIER_EST, SB5F_X,
+                                SB5F_CARRIER_MAX, carrier_exact=True)
+        self.assertEqual(got, "long",
+                         "since #1317d the P route serves this population")
+        self.assertNotIn(got, ("short", "carrier_single"),
+                         "an over-X prefill may never be offered to D")
 
     def test_mutant_swapping_the_two_bases_changes_the_verdict(self):
         """MUTANT 3 -- ROOT (a) AS AN ASSERTION. Feed each bound the OTHER's
         base, which is the conflation the router made, and the answer flips
         from a refusal to a D single prefill: the exact 503."""
-        swapped = serviceable_route(SB5F_CARRIER_EST, SB5F_UNCACHED,
+        # """ + H_SUR + """ -- the two bounds ask different questions of
+        # different bases and are not interchangeable. THE PROPERTY IS KEPT,
+        # THE WITNESS MOVED, and the reason is stated rather than the
+        # assertion weakened: at the sb5f point the carrier is no longer
+        # CONSULTED at all (over X -> the P route, whatever the carrier says),
+        # so swapping the bases there cannot change an answer that does not
+        # depend on one of them. That is not the bases becoming
+        # interchangeable; it is one of them leaving the decision.
+        #
+        # The witness therefore moves to a point where BOTH bounds still
+        # decide: uncached 9,000 (under X, so D can prefill it) with a carrier
+        # estimate of 28,000 (over the bound). Correct -> `carrier_single`;
+        # swapped -> `long`. Still different, still for the original reason.
+        swapped = serviceable_route(SB5F_CARRIER_EST, 9000,
                                     SB5F_X, SB5F_CARRIER_MAX, carrier_exact=True)
-        correct = serviceable_route(SB5F_UNCACHED, SB5F_CARRIER_EST,
+        correct = serviceable_route(9000, SB5F_CARRIER_EST,
                                     SB5F_X, SB5F_CARRIER_MAX, carrier_exact=True)
         self.assertNotEqual(swapped, correct,
                             "if the bases were interchangeable this ticket "
                             "would not exist -- they are not")
-        self.assertEqual(correct, "none")
+        self.assertEqual(correct, "carrier_single")
+        self.assertEqual(swapped, "long")
+        # and at the sb5f point the carrier has left the decision, which is
+        # asserted so a future reader does not read the moved witness as a
+        # weakening.
+        self.assertEqual(
+            serviceable_route(SB5F_UNCACHED, SB5F_CARRIER_EST, SB5F_X,
+                              SB5F_CARRIER_MAX, carrier_exact=True),
+            serviceable_route(SB5F_UNCACHED, 1, SB5F_X,
+                              SB5F_CARRIER_MAX, carrier_exact=True),
+            "over X the verdict must not depend on the carrier any more",
+        )
 
     def test_no_verdict_ever_names_d_when_d_cannot_prefill_it(self):
         """THE PROPERTY, swept rather than sampled. Over a grid that spans
@@ -372,7 +433,7 @@ class TheRouterEndToEnd(CustomTestCase):
         except asyncio.TimeoutError:
             return None
 
-    def test_a_no_route_request_gets_413_and_never_touches_the_queue(self):
+    def test_an_above_carrier_request_now_parks_for_p_instead_of_413(self):
         import hashlib
         f = self._front()
         # A MEASURED carrier figure: only that may terminate. This is the
@@ -384,13 +445,22 @@ class TheRouterEndToEnd(CustomTestCase):
         # estimator rather than by a number typed here.
         resp = self._run(f, {"stream": False},
                          carrier_chars=SB5F_CARRIER_EST * 3)
-        self.assertIsNotNone(resp, "the refusal must RETURN, not park")
-        self.assertEqual(resp.status, 413)
-        self.assertEqual(len(f.queue), 0,
-                         "a request with no route reached the queue")
-        self.assertEqual(f.counters["W52_Weg2NoServiceableRoute"], 1)
+        # """ + H_RET + """ -- "a no-route request gets 413 and never touches
+        # the queue". #1317d gives it a route, so it PARKS for P exactly like
+        # the below-carrier long request in the sibling test below. The
+        # SURVIVING half is asserted unchanged: it must not be counted as a D
+        # route, because D cannot prefill it.
+        f.awake = "P"
+        f._sync_batch_gate = lambda: None
+        resp2 = self._run(f, {"stream": False},
+                          carrier_chars=SB5F_CARRIER_EST * 3)
+        self.assertIsNone(resp2, "an above-carrier request must now park for P")
+        self.assertEqual(f.counters["W52_Weg2NoServiceableRoute"], 0,
+                         "the carrier bound may no longer refuse a route")
         self.assertEqual(f.counters["route_carrier_exceeds"], 0,
                          "it must not also be counted as a D route")
+        self.assertEqual(f.counters["route_long"], 1)
+        self.assertEqual(len(f.queue), 1)
 
     def test_a_long_request_is_queued_for_p_and_counted_as_long(self):
         f = self._front()
