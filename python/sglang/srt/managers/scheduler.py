@@ -596,6 +596,37 @@ _DEFERRAL_REFUSAL_TEXT_1068 = {
 }
 
 
+def _weg2_windowed_path(sched) -> bool:
+    """Is this group's store read WINDOWED? Asked so a stand-in cannot raise.
+
+    A MODULE FUNCTION, NOT A METHOD, and that is the whole point -- it is the
+    third form this guard took today and the first one that actually works.
+
+    * Direct `self._weg2_windowed_store_read_active()`: five harnesses bind the
+      calling methods onto a `types.SimpleNamespace`, so it raised
+      AttributeError there. Cost one gate run.
+    * A defensive METHOD `_weg2_windowed_path(self)`: same failure, one level
+      out -- the stand-ins bind a CURATED list of real methods, so a NEW method
+      is missing from them exactly as the predicate was. Cost a second gate
+      run. The guard cannot live behind an attribute lookup on the receiver
+      when the receiver is the thing that is incomplete.
+    * A module function: resolved in this module's globals, never on the
+      receiver, so no stand-in can be missing it. Immune by construction rather
+      than by curation, which is what #1298's lesson actually demands.
+
+    A tree that does not carry the predicate answers False, i.e. the pre-#1317
+    behaviour -- which is what those harnesses assert. In production the
+    argument is always a `Scheduler` and the predicate is always there.
+    """
+    fn = getattr(sched, "_weg2_windowed_store_read_active", None)
+    if not callable(fn):
+        return False
+    try:
+        return bool(fn())
+    except Exception:  # noqa: BLE001 - a predicate may never break the gate
+        return False
+
+
 class Scheduler(
     SchedulerDisaggregationDecodeMixin,
     SchedulerDisaggregationPrefillMixin,
@@ -6619,7 +6650,7 @@ class Scheduler(
         # is a cache miss, not a failed handover.
         progress = self._weg2_note_prefetch_progress(req)
         if progress == "terminal":
-            if self._weg2_windowed_store_read_active():
+            if _weg2_windowed_path(self):
                 return self._weg2_store_load_terminal(
                     req, arm=_DEFER_REASON_SHORTFALL, span=span, site=site
                 )
@@ -10257,7 +10288,40 @@ class Scheduler(
         verdict = self._prefetch_kvcache(req, rematch=False)
         self._weg2_window_reissues = getattr(self, "_weg2_window_reissues", 0) + 1
         n = self._weg2_window_reissues
-        still_owed = verdict == "issued:truncated_group"
+        # #1317l A DECLINE IS NOT A FINISHED READ. This was
+        # `still_owed = verdict == "issued:truncated_group"`, and boot
+        # weg2sn6n is what that costs:
+        #
+        #   #1317 WINDOW-REISSUE n=1 verdict=declined:anchor_pool_exhausted
+        #       still_owed=False matched=4096 total=109130 closed_total=1
+        #
+        # The chain declared itself FINISHED after window 1 of ~27 because the
+        # anchor pool was momentarily busy -- so there was never a window 2,
+        # C1 had nothing to release for, and the request was priced at the
+        # 4,096 tokens it happened to hold out of 109,130. The W89 text written
+        # one cycle earlier named this exact conflation before it fired, and
+        # the reading it produced is what this fix is built from.
+        #
+        # THREE OUTCOMES WHERE THERE WERE TWO:
+        #   `issued:truncated_group`  -> a window landed, more are owed;
+        #   any `declined:*`          -> NOTHING landed and nothing was
+        #                                decided: the window is STILL OWED and
+        #                                the chain stays armed, because a
+        #                                transient (a busy anchor pool, a rate
+        #                                limit, a read already in flight) is
+        #                                not a statement about the prompt;
+        #   anything else (`issued`)  -> the read landed WHOLE; the chain is
+        #                                complete and only then may it close.
+        #
+        # AND THIS IS SAFE ONLY BECAUSE THE STANDSTILL EXIT EXISTS. Keeping a
+        # chain armed on every decline would be the pre-#1317k spin if nothing
+        # ended it -- so the progress witness below is not an addition to this
+        # change, it is its precondition: a decline that keeps recurring while
+        # NOTHING moves reaches `_weg2_prefetch_stall_passes()` and is answered
+        # W88 by name. Declines that alternate with progress cost rounds and
+        # deliver the prompt, which is the whole point.
+        _declined = verdict.startswith("declined")
+        still_owed = verdict == "issued:truncated_group" or _declined
         req._weg2_window_open = still_owed
         if still_owed:
             self._weg2_window_owed = getattr(self, "_weg2_window_owed", 0) + 1
@@ -10308,6 +10372,7 @@ class Scheduler(
             logger.info(
                 "#1317 WINDOW-REISSUE n=%d rid=%s verdict=%s still_owed=%s "
                 "matched=%d total=%d owed_total=%d closed_total=%d "
+                "release_refusals=[%s] "
                 "(denominator: every round seam at which a group-agreed window "
                 "remainder stood for the chunked request; the verdict is the "
                 "group's, off the post-consensus trim census)",
@@ -10316,8 +10381,35 @@ class Scheduler(
                 len(getattr(req, "full_untruncated_fill_ids", ()) or ()),
                 getattr(self, "_weg2_window_owed", 0),
                 getattr(self, "_weg2_window_closed", 0),
+                # #1317l THE INSTRUMENT GAP THE sn6n BOOT NAMED. The #1317k
+                # promise was "a bare WINDOW-RELEASE=0 is now impossible", and
+                # it held only for a chain that DIES: the refusal census
+                # printed on `CHAIN DEAD` and on a successful release, and the
+                # sn6n chain did neither -- it CLOSED, took the success path
+                # with `still_owed=False`, and no census was emitted anywhere.
+                # A zero was reachable unnamed after all. The vector now rides
+                # EVERY re-issue line, close included, so the release state is
+                # readable at every seam the loop has rather than only at the
+                # two it happened to instrument.
+                self._weg2_window_release_census(),
             )
         return verdict
+
+    def _weg2_window_release_census(self) -> str:
+        """The tree's C1 refusal vector, or a NAMED absence. Never a bare "".
+
+        `unnamed` is not decoration: a missing census and an all-zero census
+        read the same to a grep, and the whole point of #1317l's addition is
+        that a zero is attributable. A tree that cannot answer says so.
+        """
+        fn = getattr(getattr(self, "tree_cache", None),
+                     "_window_release_refusal_census", None)
+        if not callable(fn):
+            return "unnamed:no_census_on_this_tree"
+        try:
+            return fn() or "unnamed:empty"
+        except Exception:  # noqa: BLE001 - an instrument may never break the loop
+            return "unnamed:census_raised"
 
     def _weg2_window_residual_allowance(self) -> int:
         """The #939 one-chunk allowance, in tokens, for a closing chain.
@@ -10368,6 +10460,17 @@ class Scheduler(
             resident = 0 if _pi is None else len(_pi)
         except TypeError:
             resident = 0
+        # #1317l WHAT THIS CHECK NOW CATCHES, after a DECLINE stopped closing
+        # the chain. Its sn6n trigger is GONE BY CONSTRUCTION: the close path
+        # is no longer reachable from `declined:*`, so the 7 W89s that boot
+        # produced cannot recur in that shape. What remains is narrower and
+        # still worth having -- a close on `issued` (the whole remainder
+        # registered) is skipped as pending below and is covered BY
+        # CONSTRUCTION once it lands (an untruncated read spans the rest of
+        # the prompt), so anything that reaches the shortfall arm is a verdict
+        # class nobody enumerated silently ending a chain. That is exactly the
+        # conflation this reading exists to catch, one class further out.
+        #
         # ONLY A CHAIN WITH NOTHING FURTHER COMING MAY BE JUDGED, and this is
         # the false-positive the first draft of this check would have had:
         # `matched` is read from the TREE, while a read that was just issued
@@ -10741,8 +10844,7 @@ class Scheduler(
         # predicate gets the pre-#1317k derivation -- which is exactly what
         # those harnesses assert. The predicate's existence on the class is
         # pinned by test_weg2_window_liveness_1317k.
-        _windowed = getattr(self, "_weg2_windowed_store_read_active", None)
-        if callable(_windowed) and _windowed():
+        if _weg2_windowed_path(self):
             return float("inf")
         span = len(getattr(req, "full_untruncated_fill_ids", None) or
                    getattr(req, "origin_input_ids", None) or ())
@@ -10926,7 +11028,59 @@ class Scheduler(
         # third value, abstain, is printed above and takes no verdict.
         term = "group" if group_match is not None else "solo"
         carry = self._weg2_host_carry_tokens()
-        if carry > 0 and uncached > carry:
+        # #1317l THE EXEMPTION IS RETIRED ON THE WINDOWED PATH, and it is
+        # retired on ITS OWN TERMS: the comment fifteen lines above says
+        # verbatim "the exemption dies in the same commit as the wall, when the
+        # carrier build gives this group an unbounded windowed store read".
+        # This is that commit -- #1317k wired W and retired the front's
+        # post-leg-1 barrier, #1317l stops a decline from closing the chain --
+        # so the condition the exemption itself named is met.
+        #
+        # WHY IT CANNOT STAY, measured on boot weg2sn6n: the barrier that FED
+        # this exemption is gone (`CARRIER-EXCEEDS after leg 1` = 0, the
+        # RETIRED line present), but the exemption outlived it, so D was
+        # admitted over X **15 times** and prefilled the whole 109k prompt
+        # (`X-GATE uncached=27211/88651/.../109130 against X=11101`,
+        # `D #new-token total 109,131`) **while the client was refused
+        # anyway**. Worst of both: the phase law broken AND no answer. The
+        # standing veto is `kein-d-direct-prefill-ueber-x`, and an exemption
+        # whose bounce-around-the-wall justification no longer applies is
+        # simply a licence to violate it.
+        #
+        # WHAT REPLACES IT IS BOUNDED, not a livelock: over-X now takes the
+        # ordinary named W31/W50 exit, which `is_x_refusal` DOES match, so the
+        # front re-routes it exactly once (W35 bounds the second). And the
+        # failure mode the exemption feared -- a prompt bouncing because no
+        # group can serve it -- is the one the windowed read removes: the store
+        # serves it one window at a time, and a read that will not load is
+        # answered W88/W89, which `is_x_refusal` deliberately does NOT match.
+        #
+        # OFF the windowed path the exemption stands unchanged, because there
+        # the wall it was built for still exists.
+        # Asked through the ONE accessor, for the curated-stand-in reason named
+        # at the window-cap call site. THIRD instance of that trap in this
+        # ticket (the cap, the X-gate bound, and here), which is why the
+        # predicate now has a single defensive reader instead of three
+        # hand-written `getattr` dances: `_weg2_windowed_path()`.
+        if _weg2_windowed_path(self) and carry > 0 and uncached > carry:
+            self._weg2_x_exempt_retired = (
+                getattr(self, "_weg2_x_exempt_retired", 0) + 1
+            )
+            n_r = self._weg2_x_exempt_retired
+            if n_r <= 5 or n_r % 64 == 0:
+                logger.warning(
+                    "#1317l X-GATE EXEMPT-CARRIER-EXCEEDS RETIRED rid=%s "
+                    "uncached=%d X=%d host_carry=%d occurrence=%d -- this "
+                    "request USED to be exempted from law 4 here and prefilled "
+                    "on D over its own bound (15x on boot weg2sn6n, the whole "
+                    "109k prompt, while the client was refused anyway). Under "
+                    "the windowed store read the carry is not the bound on a "
+                    "prompt, so the request takes the ordinary named exit "
+                    "instead. Denominator: X pricings whose uncached extent "
+                    "exceeded the host carry on the windowed path",
+                    str(getattr(req, "rid", "?"))[:16], uncached, x, carry, n_r,
+                )
+        elif carry > 0 and uncached > carry:
             self._weg2_x_exempt = getattr(self, "_weg2_x_exempt", 0) + 1
             if self._weg2_x_exempt <= 5 or self._weg2_x_exempt % 64 == 0:
                 logger.info(

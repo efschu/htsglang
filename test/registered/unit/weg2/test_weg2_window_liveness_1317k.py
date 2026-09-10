@@ -315,3 +315,192 @@ class TestTheRefusalsAreNamed(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ---------------------------------------------------------------------------
+# #1317l -- the four killers boot weg2sn6n produced, after #1317k removed the
+# host-pool wall it was built for. The wall moved; it did not vanish.
+# ---------------------------------------------------------------------------
+
+
+class TestADeclineIsNotAFinishedRead(unittest.TestCase):
+    """sn6n's killer: the chain closed after window 1 of ~27 on a DECLINE.
+
+        #1317 WINDOW-REISSUE n=1 verdict=declined:anchor_pool_exhausted
+            still_owed=False matched=4096 total=109130 closed_total=1
+
+    Both directions are pinned, because getting either one wrong is a
+    different disaster: a decline that CLOSES the chain throws away 105,034
+    tokens of the prompt (measured), and a decline that keeps it armed with
+    nothing ending it is the pre-#1317k spin (26,985 refusals, also measured).
+    """
+
+    def _verdict_owed(self, verdict):
+        """The shipped predicate, read out of the source rather than retyped.
+
+        Retyping it here would let the test agree with a copy of the rule
+        while the executed rule drifted -- which is the second-bookkeeping
+        shape this fork deletes on sight.
+        """
+        import inspect
+        import re
+
+        src = inspect.getsource(Scheduler.__dict__["_weg2_issue_next_window"])
+        m = re.search(r"_declined = (.+)\n\s+still_owed = (.+)", src)
+        assert m, "the still_owed predicate changed shape; update this reader"
+        _declined = eval(m.group(1), {}, {"verdict": verdict})  # noqa: S307
+        return eval(m.group(2), {}, {"verdict": verdict, "_declined": _declined})  # noqa: S307
+
+    def test_a_decline_keeps_the_window_owed(self):
+        for verdict in (
+            "declined:anchor_pool_exhausted",   # sn6n's own verdict
+            "declined:rate_limited",
+            "declined:already_in_flight",
+            "declined:vote_negative",
+        ):
+            self.assertTrue(self._verdict_owed(verdict), verdict)
+
+    def test_a_truncated_group_still_owes_the_next_window(self):
+        self.assertTrue(self._verdict_owed("issued:truncated_group"))
+
+    def test_only_a_whole_read_closes_the_chain(self):
+        self.assertFalse(self._verdict_owed("issued"))
+
+    def test_the_standstill_exit_is_the_precondition_of_keeping_it_armed(self):
+        """Keeping a chain armed on every decline is only safe because a
+        standstill still terminates. If the progress witness ever leaves the
+        still_owed branch, this fix becomes the spin it replaced."""
+        import inspect
+
+        src = inspect.getsource(Scheduler.__dict__["_weg2_issue_next_window"])
+        owed_arm = src.split("if still_owed:", 1)[1].split("else:", 1)[0]
+        self.assertIn("_weg2_note_prefetch_progress", owed_arm)
+        self.assertIn("_weg2_store_load_terminal", owed_arm)
+
+
+class TestTheComponentsCoverWhatWasAllocated(unittest.TestCase):
+    """sn6n's new wall: 13 anchor slots against an ask for ~27.
+
+    `#1035 PREFETCH DROPPED (host anchor pool exhausted) prefetch_tokens=109128
+    host_anchor_avail=0 host_anchor_size=13` fired while the KV pool sat at
+    `available=26422`. Two pools, and only one of them was capped: the KV alloc
+    was bounded but this loop still asked every component for
+    `len(prefetch_key)` -- the whole remaining prompt -- because prefetch_key
+    is trimmed only AFTER the group vote.
+    """
+
+    def _src(self):
+        import inspect
+
+        from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+
+        return inspect.getsource(UnifiedRadixCache.prefetch_from_storage)
+
+    def test_the_component_ask_is_the_allocated_span_not_the_whole_key(self):
+        src = self._src()
+        self.assertIn("_comp_tokens = len(host_indices)", src)
+        self.assertIn("prefetch_tokens=_comp_tokens", src)
+        self.assertIn("token_ids=_comp_ids", src)
+        # The defect spelling must be gone, or the anchor wall comes back.
+        self.assertNotIn("prefetch_tokens=len(prefetch_key)", src)
+
+    def test_the_vote_still_sees_the_full_remainder(self):
+        """The trim may not reach `local_span`: that is what makes
+        `truncated_group` true and arms the next window. Capping it would
+        close every chain after one window -- the same outcome as the killer,
+        reached from the other side."""
+        src = self._src()
+        self.assertIn("local_span = len(prefetch_key)", src)
+
+    def test_one_window_needs_two_anchors_against_thirteen_slots(self):
+        """The arithmetic that makes 13 slots sufficient once the ask is
+        capped: W//chunk + 1, which is `solve_window`'s own W21 term."""
+        anchors_live = D_W_RIG // D_CHUNK + 1
+        self.assertEqual(anchors_live, 2)
+        self.assertLessEqual(anchors_live, 13)
+        # And the ask that actually fired on metal, for contrast.
+        self.assertGreater(-(-109128 // D_CHUNK) + 1, 13)
+
+
+class TestTheCensusRidesEverySeam(unittest.TestCase):
+    """The #1317k promise was "a bare WINDOW-RELEASE=0 is now impossible", and
+    sn6n showed it held only for a chain that DIES: that chain CLOSED, took the
+    success path, and printed no census anywhere."""
+
+    def test_the_reissue_line_carries_the_release_census(self):
+        import inspect
+
+        src = inspect.getsource(Scheduler.__dict__["_weg2_issue_next_window"])
+        self.assertIn("release_refusals=[%s]", src)
+        self.assertIn("_weg2_window_release_census()", src)
+
+    def test_an_unanswerable_census_is_named_never_blank(self):
+        """A missing census and an all-zero census read the same to a grep."""
+        s = _bind(["_weg2_window_release_census"])
+        s.tree_cache = None
+        self.assertEqual(
+            s._weg2_window_release_census(), "unnamed:no_census_on_this_tree"
+        )
+
+        class _Raises:
+            def _window_release_refusal_census(self):
+                raise RuntimeError("boom")
+
+        s.tree_cache = _Raises()
+        self.assertEqual(s._weg2_window_release_census(), "unnamed:census_raised")
+
+    def test_a_real_tree_answers_with_every_key(self):
+        from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+
+        s = _bind(["_weg2_window_release_census"])
+        s.tree_cache = object.__new__(UnifiedRadixCache)
+        got = s._weg2_window_release_census()
+        for n in UnifiedRadixCache._WINDOW_RELEASE_REFUSALS:
+            self.assertIn(f"{n}=0", got)
+
+
+class TestTheExemptionDiesOnItsOwnTerms(unittest.TestCase):
+    """D was admitted over X 15 times on sn6n and prefilled the whole 109k
+    prompt WHILE the client was refused anyway -- the barrier that fed the
+    exemption was gone but the exemption outlived it."""
+
+    def test_the_exemption_is_gated_on_the_windowed_predicate(self):
+        import inspect
+
+        src = inspect.getsource(Scheduler.__dict__["_weg2_x_refuses"])
+        self.assertIn("if _weg2_windowed_path(self) and carry > 0 "
+                      "and uncached > carry:", src)
+        # The retention path keeps the exemption, because there the wall it
+        # was built for still exists.
+        self.assertIn("elif carry > 0 and uncached > carry:", src)
+        self.assertIn("verdict=exempt_carrier_exceeds", src)
+
+    def test_the_guard_is_a_module_function_not_a_method(self):
+        """THE THIRD FORM, and the first that works. A defensive METHOD failed
+        the same way the direct call did -- the stand-ins bind a CURATED list
+        of real methods, so a NEW method is missing from them exactly as the
+        predicate was. Two gate runs, one lesson: the guard cannot live behind
+        an attribute lookup on the receiver when the receiver is the
+        incomplete thing."""
+        import types
+
+        from sglang.srt.managers import scheduler as sched_mod
+
+        self.assertIsInstance(sched_mod._weg2_windowed_path, types.FunctionType)
+        self.assertNotIn("_weg2_windowed_path", Scheduler.__dict__)
+        # The exact shape the harnesses hand it: a namespace with none of this.
+        self.assertFalse(sched_mod._weg2_windowed_path(types.SimpleNamespace()))
+
+        class _Raises:
+            def _weg2_windowed_store_read_active(self):
+                raise RuntimeError("boom")
+
+        self.assertFalse(sched_mod._weg2_windowed_path(_Raises()))
+
+    def test_the_code_itself_named_this_retirement_condition(self):
+        """Not a design deviation: the exemption's own comment set its sunset,
+        and this is the commit that meets it."""
+        import inspect
+
+        src = inspect.getsource(Scheduler.__dict__["_weg2_x_refuses"])
+        self.assertIn("the exemption dies in the same commit as the wall", src)

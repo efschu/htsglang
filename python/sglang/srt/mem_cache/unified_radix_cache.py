@@ -3757,14 +3757,49 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
             alloc_failed = host_indices is None
             if host_indices is not None:
+                # #1317l THE COMPONENTS MUST COVER THE SPAN THAT WAS ACTUALLY
+                # ALLOCATED, not the span that was asked for.
+                #
+                # THE BUG THIS FIXES, measured on boot weg2sn6n: the KV alloc
+                # above is bounded (by the pool before #1317k, by the window W
+                # since), but this loop asked every component for
+                # `len(prefetch_key)` -- the WHOLE remaining prompt, because
+                # `prefetch_key` is only trimmed AFTER the group vote. So for a
+                # 109,128-token remainder the mamba component tried to acquire
+                # one anchor per chunk node of 109,128 tokens (~27) against a
+                # 13-slot host anchor pool, `build_hicache_transfers` returned
+                # [], and the whole read was voted DOWN with
+                # `declined:anchor_pool_exhausted` -- 19 of 29 attempts, with
+                # `host_anchor_avail=0 host_anchor_size=13` on 93 lines, while
+                # the KV pool sat at `available=26422`. Two pools, one of them
+                # asked for 26x what the read could hold.
+                #
+                # PRE-EXISTING, and #1317k only changed WHEN it binds: before
+                # the window cap the KV span was the whole pool (30,518) and
+                # the component ask was still 109,128, so the mismatch was
+                # already there -- `anchor_pool_exhausted` was already a census
+                # key. Capping the KV span correctly made the incoherence
+                # binding earlier instead of hiding it behind a pool that was
+                # over-allocated anyway.
+                #
+                # `len(host_indices)` is the one honest length here: page_size
+                # is 1 on this form, so it is the token count the KV rows
+                # cover, and a component span longer than that describes rows
+                # nobody allocated. The VOTE still sees the full
+                # `len(prefetch_key)` (that is `local_span`, and it is what
+                # makes `truncated_group` true and arms the next window), so
+                # trimming here changes the resource ask and not the group's
+                # view of what remains owed.
+                _comp_tokens = len(host_indices)
+                _comp_ids = prefetch_key.token_ids[:_comp_tokens]
                 for comp in self._components_tuple:
                     if comp.component_type == BASE_COMPONENT_TYPE:
                         continue
                     transfers = comp.build_hicache_transfers(
                         last_host_node,
                         CacheTransferPhase.PREFETCH,
-                        token_ids=prefetch_key.token_ids,
-                        prefetch_tokens=len(prefetch_key),
+                        token_ids=_comp_ids,
+                        prefetch_tokens=_comp_tokens,
                         last_hash=last_hash,
                     )
                     if transfers == []:
