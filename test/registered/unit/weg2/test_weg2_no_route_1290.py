@@ -86,7 +86,7 @@ class TheVerdictAsksBothBoundsOnTheirOwnBase(CustomTestCase):
     nothing else in the front ever returns "no route"."""
 
     def test_red_first_the_sb5f_long_prompt_now_has_the_p_route(self):
-        """""" + H_RET + """ -- "over X AND over the carrier -> no route -> 413".
+        """PINNED #1290's RETIRED HALF -- "over X AND over the carrier -> no route -> 413".
         #1317d retires it: the carrier was a CAP on what could move through D's
         host staging pool in one piece, and design A + the window loop make
         that pool TRANSIT, so this population takes the two-leg P route.
@@ -129,7 +129,7 @@ class TheVerdictAsksBothBoundsOnTheirOwnBase(CustomTestCase):
         on that number would turn a deliberate over-estimate into a hard
         rejection of prompts the rig can serve -- a worse failure than the
         slow one. An estimate may DOWNGRADE the route, never terminate it."""
-        #1317d: """ + H_SUR + """ -- an estimate may never terminate a route.
+        #1317d: PINNED #1290's SURVIVING HALF -- an estimate may never terminate a route.
         # It now holds A FORTIORI and is asserted as such rather than deleted:
         # since the carrier bound terminates NOTHING, neither the estimate nor
         # the measured count can refuse, and the est/exact distinction has no
@@ -150,7 +150,7 @@ class TheVerdictAsksBothBoundsOnTheirOwnBase(CustomTestCase):
         self.assertEqual(est, "long")
 
     def test_the_default_is_the_safe_one(self):
-        """""" + H_SUR + """ -- a caller that does not know must not
+        """PINNED #1290's SURVIVING HALF -- a caller that does not know must not
         accidentally get the terminal verdict. Kept, through the new route: the
         default still cannot produce `none`. Only the concrete value it does
         produce moved (`carrier_single` -> `long`), because #1317d sends this
@@ -200,7 +200,7 @@ class NeverRouteToAGroupThatRefusesByConstruction(CustomTestCase):
                          SB5F_CARRIER_MAX)
         new = serviceable_route(SB5F_UNCACHED, SB5F_CARRIER_EST, SB5F_X,
                                 SB5F_CARRIER_MAX, carrier_exact=True)
-        # """ + H_SUR + """ -- "the fix must not send this to D at all". That is
+        # PINNED #1290's SURVIVING HALF -- "the fix must not send this to D at all". That is
         # the whole point of MUTANT 1 and it is UNCHANGED; only the destination
         # moved, from a named refusal to the P route. The mutant still
         # reproduces the shipped defect and the fix still refuses to repeat it.
@@ -217,7 +217,7 @@ class NeverRouteToAGroupThatRefusesByConstruction(CustomTestCase):
         def x_only(uncached, x):
             return "short" if uncached <= x else "long"
 
-        # """ + H_RET + """ -- "with both bounds consulted, NEITHER route is
+        # PINNED #1290's RETIRED HALF -- "with both bounds consulted, NEITHER route is
         # offered". #1317d makes MUTANT 2 no longer a mutant for this input:
         # the P route IS the right answer now, because the window loop streams
         # the span through the staging pool that used to bound it. So the two
@@ -236,7 +236,7 @@ class NeverRouteToAGroupThatRefusesByConstruction(CustomTestCase):
         """MUTANT 3 -- ROOT (a) AS AN ASSERTION. Feed each bound the OTHER's
         base, which is the conflation the router made, and the answer flips
         from a refusal to a D single prefill: the exact 503."""
-        # """ + H_SUR + """ -- the two bounds ask different questions of
+        # PINNED #1290's SURVIVING HALF -- the two bounds ask different questions of
         # different bases and are not interchangeable. THE PROPERTY IS KEPT,
         # THE WITNESS MOVED, and the reason is stated rather than the
         # assertion weakened: at the sb5f point the carrier is no longer
@@ -443,9 +443,7 @@ class TheRouterEndToEnd(CustomTestCase):
         f.exact_tokens[hashlib.sha1(text.encode()).hexdigest()] = SB5F_CARRIER_EST
         # Long enough to break the carrier too, priced by the front's own
         # estimator rather than by a number typed here.
-        resp = self._run(f, {"stream": False},
-                         carrier_chars=SB5F_CARRIER_EST * 3)
-        # """ + H_RET + """ -- "a no-route request gets 413 and never touches
+        # PINNED #1290's RETIRED HALF -- "a no-route request gets 413 and never touches
         # the queue". #1317d gives it a route, so it PARKS for P exactly like
         # the below-carrier long request in the sibling test below. The
         # SURVIVING half is asserted unchanged: it must not be counted as a D
