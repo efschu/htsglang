@@ -296,10 +296,34 @@ def test_the_sn5w_arm_is_fundable_so_the_pin_is_bootable():
 
 def test_the_pin_refuses_an_unfundable_arm_rather_than_taking_it():
     """A pin selects among arms the ledger would fund; it is not a way past the
-    verdict, and the host-threshold law admits no accept-the-risk branch."""
-    a = _arm(2400)
+    verdict, and the host-threshold law admits no accept-the-risk branch.
+
+    #1317n MOVED THE EXAMPLE, NOT THE PROPERTY. This test used M=2400, which was
+    unfundable while the launch moment charged the 12 GiB page-cache load
+    transient against a reap-currency bound. Priced in reap currency that arm is
+    fundable (launch +9.77 GiB, run +6.79), so it can no longer serve as the
+    example -- and softening the assertion instead would have left a green test
+    guarding nothing.
+
+    The rung is re-pointed rather than the assertion relaxed. Measured on dk5's
+    own box and ring table under the reap currency:
+
+        M=2400  launch +9.77  run  +6.79  fundable
+        M=3600  launch +4.84  run  +1.85  fundable
+        M=4800  launch -0.10  run  -3.08  UNFUNDABLE  <- the boundary now
+        M=7200  launch -9.97  run -12.95  UNFUNDABLE  <- used here, with margin
+
+    M=4800 is the first unfundable rung, and a pin sitting on -0.10 GiB would be
+    a test about a decimal place. M=7200 carries ~10 GiB of margin on the launch
+    moment and ~13 on the run moment, so what it asserts is the property.
+    """
+    a = _arm(7200)
     assert not a.fundable_moments
     assert a.launch_leftover_gib < 0
+    # and the boundary itself, so a future currency change cannot slide the whole
+    # ladder into fundability without this test noticing
+    assert not _arm(4800).fundable_moments
+    assert _arm(3600).fundable_moments
 
 
 def _host_ledger_calls_in(module_source):
