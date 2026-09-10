@@ -350,17 +350,19 @@ class TestWeg2dk5WouldHaveBeenNamedBeforeItBooted(CustomTestCase):
             self.assertLess(peak, watermark, f"M={m} predicts {peak:.2f}")
             # Only the TOP arm still clears the hard bound from above; the two
             # below it now fit, which is exactly the term that was removed.
-            # #1318: the derivation puts EVERY arm at or below the hard
-            # bound, M=2400 included -- it was 3.12 GiB over and the
-            # derivation is worth exactly that. Asserted for the whole
-            # ladder, with the old M=2400 exception deleted rather than
-            # kept as a stale special case.
-            self.assertLessEqual(
-                peak, hard_bound,
-                f"M={m} predicts {peak:.2f}, which must be AT OR BELOW the hard "
-                f"bound {hard_bound:.2f} once the store leaves the sum (#1236) "
-                f"and the ring is derived (#1318)",
-            )
+            # #1318 LEAVES THIS SPLIT WHERE IT WAS. The derivation moves the
+            # LEFTOVERS by 3.121 GiB but not the predicted PEAK (built from
+            # Sigma H and the run origin, not from the ring multipliers), so
+            # M=2400 is still the one arm above the hard bound. Kept as the
+            # measured split rather than generalised away.
+            if m == 2400:
+                self.assertGreater(peak, hard_bound, f"M={m} predicts {peak:.2f}")
+            else:
+                self.assertLessEqual(
+                    peak, hard_bound,
+                    f"M={m} predicts {peak:.2f}, which must be AT OR BELOW the hard "
+                    f"bound {hard_bound:.2f} once the store leaves the sum (#1236)",
+                )
         self.assertIn("RUN-PEAK ADVISORY", "\n".join(lines))
         for m in (2400, 1200, 600):
             self.assertIn(f"M={m}", "\n".join(lines))
@@ -382,13 +384,14 @@ class TestWeg2dk5WouldHaveBeenNamedBeforeItBooted(CustomTestCase):
         # the identity is asserted rather than the new number alone, so a
         # reader can see it is the same model minus one named term.
         predicted = arm.predicted_run_peak_gib()
-        # #1318: minus the derived-ring saving as well, so the identity
-        # still reads as the same model minus NAMED terms.
-        self.assertAlmostEqual(
-            predicted,
-            92.66 - DK5_STORE_CHOSEN_GIB - self.DK5_RING_DERIVATION_SAVING_GIB,
-            delta=0.05,
-        )
+        # #1318 DOES NOT MOVE THIS NUMBER, and that is worth stating because
+        # the LEFTOVERS in this class all moved by 3.121 GiB. The predicted
+        # run peak is built from Sigma H and the run origin, not from the
+        # ring MULTIPLIERS the derivation replaced, so the peak is unchanged
+        # at 92.66 - the store. Measured, not assumed: an earlier revision of
+        # this commit subtracted the saving here and read 83.66 against an
+        # expected 80.54.
+        self.assertAlmostEqual(predicted, 92.66 - DK5_STORE_CHOSEN_GIB, delta=0.05)
         self.assertLess(predicted, watermark)
         # the margin the ring bought, at that arm and that store, is Sigma H's
         # saving against fix 8's image + transient: 92.66 + 16.41 = 109.07, which

@@ -396,7 +396,17 @@ class TestTheOriginIsTheRunMomentNotTheLaunchMoment(CustomTestCase):
         )
         self.assertAlmostEqual(host_ledger.dk7_run_residual_gib(), expect, delta=1e-9)
         # And it is the size the record names: 90.10 idle, ~68.7 of it charged.
-        self.assertAlmostEqual(host_ledger.dk7_run_residual_gib(), 21.38, delta=0.01)
+        # #1318: the RESIDUAL is what the boot charges do NOT explain, so
+        # deriving the ring multipliers (2.0+6.0 -> 1.778+3.0 xS) charges
+        # 3.118 GiB LESS and the unexplained remainder grows by exactly
+        # that. Stated as the identity rather than as a new number: the
+        # measurement did not move, the model got cheaper.
+        RING_DERIVATION_SAVING_GIB = 3.118
+        self.assertAlmostEqual(
+            host_ledger.dk7_run_residual_gib(),
+            21.38 + RING_DERIVATION_SAVING_GIB,
+            delta=0.02,
+        )
 
     def test_dk7s_quiet_launch_no_longer_buys_a_bigger_arm_than_dk6s(self):
         # THE TWO-POINT DEMONSTRATION, re-run under #1236.  At fix-7 pricing

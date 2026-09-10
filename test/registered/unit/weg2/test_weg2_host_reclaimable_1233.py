@@ -131,9 +131,18 @@ class TestTheReclaimableTerm(CustomTestCase):
         # leftover rises by EXACTLY 48.60 - 32.19 = 16.41 GiB, from fix 8's
         # -1.64 (no arm) to 14.77 (funded) -- FLIPCOST A1-3 as arithmetic.
         ring_saving_gib = (38.63 + 9.97) - 32.19
+        # #1318 ADDS A SECOND, INDEPENDENT SAVING to the same moment: the
+        # ring MULTIPLIERS are now derived from rows x cell bytes
+        # (2.0+6.0 = 8.0 xS read off b0 -> 1.778+3.0 = 4.778 xS derived),
+        # so this arm gains a further (8.0-4.778) GB/S x 1 S = 3.0009 GiB
+        # plus the 4 % HOST_POOL_OVERHEAD charged on the same bytes.
+        # Two named terms, added as arithmetic, not one edited number.
+        ring_derivation_saving_gib = 3.118
         self.assertAlmostEqual(
             arm.run_leftover_gib,
-            (8.16 - arm.terms["image_extra_p_gib"]) + ring_saving_gib,
+            (8.16 - arm.terms["image_extra_p_gib"])
+            + ring_saving_gib
+            + ring_derivation_saving_gib,
             delta=0.05,
         )
         lines = _lines()
