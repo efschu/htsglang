@@ -778,3 +778,135 @@ class LocalBackendBufferTestCase(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AllowedModelsPolicyTestCase(AioHTTPTestCase):
+    """``allowed_models`` in the policy file (#1319).
+
+    Claude Code falls back to another model on its own when a request fails
+    at the HTTP level; the router cannot stop the client from trying, but it
+    can refuse to SERVE an unapproved model. These tests pin the refusal
+    (403 before either backend), the pass-through of listed ids, the
+    exemption of model-less bodies, the hot reload in both directions and the
+    non-fatal handling of a malformed list.
+    """
+
+    async def get_application(self):
+        upstream_app, self.upstream = _make_backend("upstream")
+        local_app, self.local = _make_backend("local")
+        self.upstream_server = TestServer(upstream_app)
+        self.local_server = TestServer(local_app)
+        await self.upstream_server.start_server()
+        await self.local_server.start_server()
+        self.policy_path = os.path.join(
+            tempfile.mkdtemp(prefix="router-allowlist-"), "policy.json"
+        )
+        return create_app(
+            local_models=[LOCAL_MODEL],
+            upstream_base=str(self.upstream_server.make_url("")).rstrip("/"),
+            local_base=str(self.local_server.make_url("")).rstrip("/"),
+            local_wait_s=0,  # about the allow-list, not the hold buffer
+            policy_file=self.policy_path,
+        )
+
+    async def tearDownAsync(self):
+        await self.upstream_server.close()
+        await self.local_server.close()
+        await super().tearDownAsync()
+
+    def _body(self, model, **overrides):
+        body = {
+            "model": model,
+            "max_tokens": 64,
+            "messages": [{"role": "user", "content": "hi"}],
+        }
+        body.update(overrides)
+        return body
+
+    def _write_policy(self, obj):
+        # Bump mtime first so a rewrite inside the same clock tick still reloads.
+        if os.path.exists(self.policy_path):
+            os.utime(self.policy_path, None)
+        with open(self.policy_path, "w") as fh:
+            json.dump(obj, fh)
+
+    async def _stats(self):
+        resp = await self.client.get(STATS_PATH)
+        return await resp.json()
+
+    async def test_no_key_means_every_model_passes(self):
+        resp = await self.client.post("/v1/messages", json=self._body(REMOTE_MODEL))
+        self.assertNotEqual(resp.status, 403)
+        self.assertEqual(len(self.upstream["requests"]), 1)
+        self.assertEqual((await self._stats())["refused_model"], 0)
+
+    async def test_an_unlisted_model_is_refused_before_either_backend(self):
+        self._write_policy({"allowed_models": [LOCAL_MODEL, THINKING_ALIAS]})
+        resp = await self.client.post("/v1/messages", json=self._body(REMOTE_MODEL))
+        self.assertEqual(resp.status, 403)
+        err = await resp.json()
+        self.assertEqual(err["type"], "error")
+        self.assertEqual(err["error"]["type"], "permission_error")
+        self.assertIn(REMOTE_MODEL, err["error"]["message"])
+        self.assertIn(LOCAL_MODEL, err["error"]["message"])
+        self.assertEqual(self.upstream["requests"], [])
+        self.assertEqual(self.local["requests"], [])
+        stats = await self._stats()
+        self.assertEqual(stats["refused_model"], 1)
+        self.assertEqual(stats["upstream"], 0)
+        self.assertEqual(stats["local"], 0)
+        self.assertEqual(
+            sorted(stats["policy"]["allowed_models"]),
+            sorted([LOCAL_MODEL, THINKING_ALIAS]),
+        )
+
+    async def test_listed_ids_pass_and_the_alias_is_matched_as_sent(self):
+        self._write_policy({"allowed_models": [LOCAL_MODEL, THINKING_ALIAS]})
+        resp = await self.client.post("/v1/messages", json=self._body(THINKING_ALIAS))
+        self.assertNotEqual(resp.status, 403)
+        resp = await self.client.post("/v1/messages", json=self._body(LOCAL_MODEL))
+        self.assertNotEqual(resp.status, 403)
+        self.assertEqual(len(self.local["requests"]), 2)
+        self.assertEqual(self.upstream["requests"], [])
+        # The nothink alias is a different id: not listed, so refused.
+        resp = await self.client.post("/v1/messages", json=self._body(NOTHINK_ALIAS))
+        self.assertEqual(resp.status, 403)
+        self.assertEqual(len(self.local["requests"]), 2)
+
+    async def test_a_body_without_a_model_is_not_subject_to_the_list(self):
+        self._write_policy({"allowed_models": [LOCAL_MODEL]})
+        resp = await self.client.post(
+            "/v1/messages",
+            json={"max_tokens": 1, "messages": [{"role": "user", "content": "x"}]},
+        )
+        self.assertNotEqual(resp.status, 403)
+        self.assertEqual(len(self.upstream["requests"]), 1)
+
+    async def test_the_list_applies_to_every_proxied_path(self):
+        self._write_policy({"allowed_models": [LOCAL_MODEL]})
+        resp = await self.client.post(
+            "/v1/messages/count_tokens", json={"model": REMOTE_MODEL, "messages": []}
+        )
+        self.assertEqual(resp.status, 403)
+        self.assertEqual(self.upstream["requests"], [])
+
+    async def test_the_list_is_hot_reloaded_in_both_directions(self):
+        self._write_policy({"allowed_models": [LOCAL_MODEL]})
+        resp = await self.client.post("/v1/messages", json=self._body(REMOTE_MODEL))
+        self.assertEqual(resp.status, 403)
+        self._write_policy({})
+        resp = await self.client.post("/v1/messages", json=self._body(REMOTE_MODEL))
+        self.assertNotEqual(resp.status, 403)
+        self.assertEqual(len(self.upstream["requests"]), 1)
+        self._write_policy({"allowed_models": [LOCAL_MODEL]})
+        resp = await self.client.post("/v1/messages", json=self._body(REMOTE_MODEL))
+        self.assertEqual(resp.status, 403)
+        self.assertEqual(len(self.upstream["requests"]), 1)
+
+    async def test_a_malformed_list_is_ignored_and_nothing_is_refused(self):
+        for bad in ("claude-x", [], [1, 2], {"a": 1}):
+            self._write_policy({"allowed_models": bad})
+            resp = await self.client.post("/v1/messages", json=self._body(REMOTE_MODEL))
+            self.assertNotEqual(resp.status, 403, bad)
+        self.assertEqual(len(self.upstream["requests"]), 4)
+        self.assertEqual((await self._stats())["refused_model"], 0)

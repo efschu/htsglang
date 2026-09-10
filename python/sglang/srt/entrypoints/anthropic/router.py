@@ -568,6 +568,29 @@ def _load_policy_file(path: str) -> dict:
         out["effort"] = effort
     elif effort is not None:
         logger.warning("policy file %s: bad effort value %r", path, effort)
+    # ``allowed_models``: a non-empty list of model ids. When present, a
+    # request whose ``model`` is NOT in the list is answered 403 before either
+    # backend sees it (see ``proxy``). Absent = no filtering (the pre-existing
+    # behaviour). An empty list or a non-list is IGNORED with a warning rather
+    # than applied, for the same reason the whole file is non-fatal: an empty
+    # allow-list would refuse every request, and this file is a live-tuning
+    # hook on the process every Claude Code session is pointed at.
+    allowed = obj.get("allowed_models")
+    if allowed is None:
+        pass
+    elif (
+        isinstance(allowed, list)
+        and allowed
+        and all(isinstance(m, str) and m for m in allowed)
+    ):
+        out["allowed_models"] = tuple(allowed)
+    else:
+        logger.warning(
+            "policy file %s: bad allowed_models value %r (need a non-empty "
+            "list of model ids); not applied",
+            path,
+            allowed,
+        )
     return out
 
 
@@ -578,8 +601,9 @@ class _PolicyFile:
     WITHOUT restarting the router. The router holds no other mutable state and
     has no reload signal, so a restart is the only alternative -- and this
     process is the endpoint every Claude Code session is pointed at, so a
-    restart drops live turns. Cost is one ``stat`` per local /v1/messages
-    request, which is noise next to the model call it precedes.
+    restart drops live turns. Cost is one ``stat`` per proxied request (the
+    allow-list check reads the live policy on every path), which is noise next
+    to the model call it precedes.
     """
 
     def __init__(self, path: Optional[str]):
@@ -874,12 +898,22 @@ def create_app(
     app[UPSTREAM_BASE] = upstream_base.rstrip("/")
     app[LOCAL_BASE] = local_base.rstrip("/")
     app[APPLY_SHIM] = apply_shim
-    app[POLICY] = {"thinking_enabled": thinking_enabled, "effort": effort}
+    app[POLICY] = {
+        "thinking_enabled": thinking_enabled,
+        "effort": effort,
+        # Only the policy file can set this; no flag exists on purpose, so the
+        # list can be edited and hot-reloaded without a restart of the
+        # lifeline process.
+        "allowed_models": None,
+    }
     app[POLICY_FILE] = _PolicyFile(policy_file)
     app[STATS] = {
         "local": 0,
         "upstream": 0,
         "errors": 0,
+        # Requests answered 403 because their model id was not in the policy
+        # file's ``allowed_models`` (see ``proxy``). Lifetime total.
+        "refused_model": 0,
         # Lifetime totals for the local-backend hold buffer: a request that
         # was held and then got through, versus one that gave up (wait cap
         # hit, or the queue was already full). See /__router/stats for the
@@ -929,6 +963,45 @@ def create_app(
     async def proxy(request: web.Request) -> web.StreamResponse:
         body = await request.read()
         model = _extract_model(body)
+        # Model allow-list (policy file ``allowed_models``, #1319). Claude Code
+        # falls back to ANOTHER model on its own when a request fails at the
+        # HTTP level -- measured twice on this rig: a Qwen agent whose request
+        # got a 503 from the local front continued 54 turns on claude-opus-4-8,
+        # a model nobody had approved. The router cannot stop the client from
+        # trying; it CAN stop the unapproved model from ever being served,
+        # so the failure is loud (a named 403 in the client's transcript and
+        # in this log) instead of a silent spend on the wrong model. The check
+        # sits before routing so neither backend sees the request. A body
+        # without a model id (count_tokens without one, /v1/models, ...) is
+        # not subject to the list. 403 rather than 5xx on purpose: 5xx and
+        # connection failures are exactly the class the client retries or
+        # falls back on.
+        allowed = _effective_policy(request.app).get("allowed_models")
+        if allowed and model is not None and model not in allowed:
+            request.app[STATS]["refused_model"] += 1
+            logger.warning(
+                "%s %s REFUSED model=%s: not in allowed_models=%s (policy file)",
+                request.method,
+                request.path,
+                model,
+                sorted(allowed),
+            )
+            return web.json_response(
+                {
+                    "type": "error",
+                    "error": {
+                        "type": "permission_error",
+                        "message": (
+                            f"router policy: model {model!r} is not in "
+                            f"allowed_models {sorted(allowed)}; the router refuses "
+                            "unlisted models instead of serving them, because a "
+                            "client that lands here by fallback must fail loudly "
+                            "(user law 2026-09-09: only approved models)"
+                        ),
+                    },
+                },
+                status=403,
+            )
         think_target = (
             request.app[THINKING_ALIASES].get(model) if model is not None else None
         )
