@@ -778,6 +778,23 @@ def vram_credit_path(nvml_uuid: str, *, credit_dir: Optional[str] = None) -> str
     return os.path.join(directory, f".{VRAM_CREDIT_PREFIX}-{_sanitize(nvml_uuid)}.json")
 
 
+
+class Weg2VramCreditAllocatableShort(Weg2VramCreditRefused):
+    """W85 -- the peer funded it, the CARD cannot allocate it (#1331).
+
+    A SUBCLASS of the credit refusal on purpose: every caller that already
+    handles a refused credit handles this one unchanged, and the W-code names
+    which of the two facts failed. `Weg2VramCreditRefused` (W35) means "the
+    peer will never fund this"; W85 means "the peer's counter says it is
+    funded and the device disagrees".
+
+    THE CENSUS WAS RUN, not remembered: the assigned Weg2 codes around it are
+    W80-W84 (the xchg band) and W86-W89 (the serve line); **W85 was the one
+    free number between them**, and the two `W85` hits elsewhere in the tree
+    are `W855-...` specimen DIRECTORY names, i.e. the bare-code-as-grep
+    -pattern trap. `test_weg2_wcode_uniqueness_1263` is the authority.
+    """
+
 class VramCredit:
     """The device-side mirror of the host ring's bitmap, per physical GPU.
 
@@ -904,6 +921,8 @@ class VramCredit:
         budget_s: float,
         tag: str,
         free_bytes_now: Optional[int] = None,
+        free_reader=None,
+        floor_bytes: Optional[int] = None,
         poll_s: float = 0.01,
         epoch: Optional[Any] = None,
     ) -> Dict[str, Any]:
@@ -968,9 +987,65 @@ class VramCredit:
                 state = {}
             credit = int(state.get("credit_bytes", 0))
             if credit >= need:
+                # #1331: THE PEER'S ACCOUNTING IS NOT THE CARD'S ANSWER, and
+                # granting on it alone is what killed boot weg2xsn7.
+                #
+                #   20:05:47 TP0 WEG2-VRAM-CREDIT card=GPU-31d7ef41 tag=weights_7
+                #                credit=2560 MiB requested=1906 MiB
+                #                (the peer's releases funded this tag)
+                #   20:05:48     cu_mem_create -> CUresult 2 (out of memory)
+                #
+                # `free_bytes_now` was only ever an EARLY EXIT at the top of
+                # this method ("the card already holds the bytes"). Once the
+                # loop is entered -- i.e. exactly when the card WAS short --
+                # the grant was decided purely on `credit_bytes`, a number in
+                # a shared file written by the peer's release bookkeeping, with
+                # no second look at the device. So the counter said 2560 MiB
+                # were released and the card could not allocate 1906.
+                #
+                # ONE READER, NEVER A SECOND NVML LOOP: `free_reader` is
+                # injected by the caller and is the #1250 v2 free reader
+                # (`registry.nvml.memory_info_for_uuid` /
+                # `memory_snapshot()`); this module opens no NVML handle of its
+                # own. `None` (unreadable, or no reader passed) keeps the
+                # pre-#1331 behaviour exactly -- a blind reading may not
+                # manufacture a refusal any more than it may license a grant.
+                #
+                # THE PEER TERM SURVIVES as the first condition; it is simply
+                # no longer the only one.
+                free_now = None
+                if free_reader is not None:
+                    try:
+                        got = free_reader()
+                        free_now = None if got is None else int(got)
+                    except Exception:  # noqa: BLE001 -- a probe may not raise
+                        free_now = None
+                floor = max(0, int(floor_bytes or 0))
+                allocatable_est = (
+                    None if free_now is None else max(0, free_now - floor)
+                )
+                if allocatable_est is not None and allocatable_est < need:
+                    raise Weg2VramCreditAllocatableShort(
+                        f"W85 Weg2VramCreditAllocatableShort card={self.uuid} "
+                        f"tag={tag} credit={credit // MIB} MiB "
+                        f"requested={need // MIB} MiB "
+                        f"free_mib={free_now // MIB} "
+                        f"allocatable_est={allocatable_est // MIB} MiB "
+                        f"corridor_floor_mib={floor // MIB} -- the peer's "
+                        f"release counter funds this tag but the CARD does "
+                        f"not: allocatable is below the request, so the "
+                        f"resume would fail in cu_mem_create and leave every "
+                        f"tensor of this tag unmapped (boot weg2xsn7: that "
+                        f"OOM left the barlink control word unmapped and the "
+                        f"process died in the driver). Refused by name rather "
+                        f"than granted silently."
+                    )
                 return {
                     "waited_s": time.perf_counter() - t0,
                     "credit_bytes": credit,
+                    "free_bytes": free_now,
+                    "allocatable_est_bytes": allocatable_est,
+                    "corridor_floor_bytes": floor,
                     "reason": "the peer's releases funded this tag",
                 }
             if bool(state.get("leg_complete")):

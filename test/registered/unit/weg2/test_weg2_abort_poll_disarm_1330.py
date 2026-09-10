@@ -164,6 +164,24 @@ def test_the_disarm_is_latched_and_the_line_appears_exactly_once(caplog):
     # The latch is a real field, not an accident of the log level.
     assert getattr(t, "_abort_poll_disarmed_note", False) is True
 
+    # AND THE LATCH MUST DO SOMETHING ON ITS OWN. Without this the case is
+    # VACUOUS -- measured: removing the early return still left one line,
+    # because `_abort_poll_active = False` makes every later poll return at
+    # the first guard, so the disarm is never re-entered and the latch is
+    # never exercised. A caller that RE-ARMS the poll (a resume that succeeds,
+    # a transport rebound at a cutover) is the case the latch is for, and it
+    # is the only way to tell the two mechanisms apart.
+    t._abort_poll_active = True
+    with caplog.at_level(logging.ERROR, logger=LOGGER):
+        for _ in range(3):
+            assert t.poll_status_word() is False
+            t._abort_poll_active = True
+    assert t._abort_poll_dst.copies == 0
+    assert caplog.text.count("Bar1AbortPollDisarmed") == 1, (
+        "re-arming must not re-log: the latch is what keeps a rebound "
+        "transport from re-printing a refusal it already made"
+    )
+
 
 def test_the_healthy_path_is_untouched_by_the_probe():
     """The probe costs the working case NOTHING but one metadata read.

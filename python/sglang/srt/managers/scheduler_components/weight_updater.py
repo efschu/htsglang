@@ -2064,6 +2064,33 @@ class SchedulerWeightUpdaterManager:
         self._weg2_shadow_hook("destination", recv_req=recv_req,
                                reserve_bytes=reserve_bytes, ring_ms=ring_ms)
 
+    def _weg2_corridor_floor_bytes(self) -> Optional[int]:
+        """This card's corridor lower bound in bytes, or None (#1331).
+
+        THE CORRIDOR AUTHORITY IS THE CORRIDOR AUTHORITY. The floor is read
+        by calling `managers.corridor_guard.corridor_floor_mib` -- the same
+        function `weg2/corridor_budget` calls to build its per-card map -- never
+        re-derived here and never replaced by a constant: the VRAM-korridor law
+        says the per-card lower bound is the MEASURED transient peak plus the
+        user reserve knob, and a second reading of that would be exactly the
+        1024-MiB constant the law deleted.
+
+        `None` when the map is not available, which the caller turns into a
+        floor of 0 -- i.e. the refusal then grades free against the request
+        alone. That is the conservative direction for THIS gate: a missing
+        floor may not manufacture a refusal, only fail to tighten one.
+        """
+        uuid_key = self._weg2_card_uuid()
+        if uuid_key is None:
+            return None
+        try:
+            from sglang.srt.managers.corridor_guard import corridor_floor_mib
+
+            mib = corridor_floor_mib(uuid_key, group=self._weg2_group_name())
+            return None if mib is None else int(mib) * 1024 * 1024
+        except Exception:  # noqa: BLE001 -- an absent authority is an absence
+            return None
+
     def _weg2_await_vram_credit(self, credit, tag: str, need_bytes: int,
                                 epoch=None) -> None:
         if credit is None or need_bytes <= 0:
@@ -2074,6 +2101,14 @@ class SchedulerWeightUpdaterManager:
                 budget_s=WEG2_GROUP_FENCE_BUDGET_S,
                 tag=tag,
                 free_bytes_now=self._weg2_free_bytes(),
+                # #1331: the SAME reader, handed in so the grant can re-read
+                # the card at the moment it grants rather than trusting the
+                # snapshot taken before the wait. `free_bytes_now` above is
+                # still the early-exit term; this is the grant-time one, and
+                # they are one reader (`registry.nvml`, the #1250 v2 free
+                # column) so a second NVML loop cannot drift from the first.
+                free_reader=self._weg2_free_bytes,
+                floor_bytes=self._weg2_corridor_floor_bytes(),
                 epoch=epoch,
             )
         except Weg2VramCreditRefused:
@@ -2084,11 +2119,22 @@ class SchedulerWeightUpdaterManager:
         if rec.get("waited_s", 0.0) > 0.0:
             logger.info(
                 "WEG2-VRAM-CREDIT card=%s tag=%s waited=%.0f ms credit=%d MiB "
-                "requested=%d MiB (%s)",
+                "requested=%d MiB free_mib=%s allocatable_est=%s "
+                "corridor_floor_mib=%s (%s)",
                 self._weg2_card_uuid() or "unknown", tag,
                 float(rec["waited_s"]) * 1000,
                 int(rec.get("credit_bytes", 0)) // MIB_,
                 int(need_bytes) // MIB_,
+                # #1331: PRINTED, so the next boot can ATTRIBUTE instead of
+                # infer. weg2xsn7's line carried neither number, which is why
+                # "allocatable < credited" had to be reconstructed from a
+                # `cu_mem_create` line one row below it. `n/a` and never 0 --
+                # an unreadable free column is an absence.
+                "n/a" if rec.get("free_bytes") is None
+                else int(rec["free_bytes"]) // MIB_,
+                "n/a" if rec.get("allocatable_est_bytes") is None
+                else int(rec["allocatable_est_bytes"]) // MIB_,
+                int(rec.get("corridor_floor_bytes", 0) or 0) // MIB_,
                 rec.get("reason", ""),
             )
 
