@@ -151,7 +151,10 @@ def test_the_unpriced_post_is_not_charged_and_not_in_the_margin():
     assert "UNPRICED_ANON_MAPSHARED_GIB" not in after, (
         "the unpriced post is READ by pricing code -- it is a reading, not a term"
     )
-    assert hl.OBSERVED_REAP_CURRENT_BYTES / GIB == pytest.approx(95.90, abs=0.01)
+    # 95.925 GiB is the constant; 95.90 is what the boot LINE prints, rounded.
+    # Pinned against the constant with the display rounding named, so a future
+    # reader does not "fix" the constant to match the line.
+    assert hl.OBSERVED_REAP_CURRENT_BYTES / GIB == pytest.approx(95.93, abs=0.02)
 
 
 def test_the_provenance_line_prints_the_derived_multipliers_not_the_old_pair():
