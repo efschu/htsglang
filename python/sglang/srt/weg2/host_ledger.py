@@ -773,11 +773,77 @@ ANCHORS_AT_2400_BYTES = 10.19 * GB
 ANCHORS_P_AT_2400_BYTES = (2.55 + 1.49 + 1.06) * GB
 ANCHORS_D_AT_2400_BYTES = (2.55 + 1.27 + 1.27) * GB
 ANCHORS_REFERENCE_M_MIB = 2400
-#: b0: "8xS ring = 16.00 GB at S=2" = PP pool 2.00/1.00/1.00 GB (2xS) plus
-#: TP pool 4.00 GB x3 (6xS).  Per-process pools (record 1e): group P owns the
-#: 2xS half, group D the 6xS half.
-RING_P_MULT_GB_PER_S = 2.0
-RING_D_MULT_GB_PER_S = 6.0
+#: #1318 THE RING MULTIPLIERS ARE DERIVED, NOT MEASURED TWICE.
+#:
+#: WHAT WAS WRONG.  b0 read "8xS ring = 16.00 GB at S=2" off a boot log and
+#: split it by eye into "PP pool 2.00/1.00/1.00 GB (2xS)" for group P and
+#: "TP pool 4.00 GB x3 (6xS)" for group D.  Boot ``weg2sn5w`` measured the
+#: pools themselves and the D half is 2x over-booked: D's log prints
+#: ``HiCache host pool (30518 tokens)`` on all three ranks at 32,768 B per
+#: token, so the group holds 30,518 x 32,768 x 3 = 3.00 GB per S -- against
+#: 6.0 charged.  A 3.0 GB/S over-charge at S=2 is 6.0 GB the store never got,
+#: and it is what held the shipped store at 9 GiB with a 244,140-token bound
+#: still in force below the 262,144 context.
+#:
+#: WHY A FORMULA AND NOT A SECOND PAIR OF CONSTANTS.  A hand-typed pair is a
+#: second bookkeeping beside a quantity the pool already knows, and it drifts
+#: the moment the cell size or the rank layout moves (which is exactly what
+#: uneven DCP does to group P).  The ring cost of one GB of
+#: ``--hicache-size`` is
+#:
+#:      rows_per_rank x sum(cell_bytes over the group's ranks)
+#:
+#: because ``pool_host/base.py sync_fixed_hicache_size`` MIN-syncs the ROW
+#: COUNT across the group, so every rank holds the same number of rows and
+#: the row count is set by the rank with the LARGEST cell:
+#:      rows_per_rank(S=1 GB) = GB / max(cell_bytes)
+#: and each rank then pays its own cell size for those rows.  Linear in S.
+#:
+#: PROVENANCE, both groups, boot ``weg2sn5w`` (front/P/D logs under
+#: /spinning/evidence-665-f1, pattern ``boot_weg2_weg2sn5w_*``):
+#:   * group P, ``--tp-size 1 --pp-size 3``, uneven DCP: cells 18,432 /
+#:     8,192 / 6,144 B; rows MIN-sync to 1e9/18432 = 54,254 (P log:
+#:     ``host KV pool 54254``); ring = 54,254 x 32,768 = 1.78 GB per S.
+#:     The 2.0 charged before over-charges by 0.22 GB/S -- small, and in the
+#:     conservative direction, which is why it was never caught.
+#:   * group D, ``--tp-size 3`` even: cells 32,768 B x 3; rows =
+#:     1e9/32768 = 30,518 (D log: ``HiCache host pool (30518 tokens)``);
+#:     ring = 30,518 x 98,304 = 3.00 GB per S.  This is the 2x.
+#: Derived total 4.78xS against b0's 8xS reading: the derivation may never
+#: come out ABOVE the reading it replaces, and :func:`_ring_mult_gb_per_s`
+#: refuses if it does rather than silently under-charging the host.
+CELL_BYTES_P_PER_RANK = (18432, 8192, 6144)
+CELL_BYTES_D_PER_RANK = (32768, 32768, 32768)
+#: The b0 reading the derivation replaces, kept ONLY as the refusal ceiling
+#: above.  Never charged.
+RING_B0_TOTAL_MULT_GB_PER_S = 8.0
+
+
+def _ring_mult_gb_per_s(cells: tuple) -> float:
+    """GB of host ring per GB of ``--hicache-size``, for one group.
+
+    ``rows_per_rank = GB / max(cells)`` is ``sync_fixed_hicache_size``'s
+    MIN-sync stated as arithmetic; every rank then pays its own cell size for
+    those rows, so the group's bytes are ``rows * sum(cells)``.
+    """
+    if not cells or min(cells) <= 0:
+        raise ValueError(f"cell byte sizes must all be positive, got {cells!r}")
+    rows_per_rank = GB / float(max(cells))
+    return rows_per_rank * float(sum(cells)) / GB
+
+
+RING_P_MULT_GB_PER_S = _ring_mult_gb_per_s(CELL_BYTES_P_PER_RANK)
+RING_D_MULT_GB_PER_S = _ring_mult_gb_per_s(CELL_BYTES_D_PER_RANK)
+if RING_P_MULT_GB_PER_S + RING_D_MULT_GB_PER_S > RING_B0_TOTAL_MULT_GB_PER_S:
+    raise RuntimeError(
+        "#1318 host ring derivation came out ABOVE the b0 reading it replaces "
+        f"({RING_P_MULT_GB_PER_S:.3f}+{RING_D_MULT_GB_PER_S:.3f} = "
+        f"{RING_P_MULT_GB_PER_S + RING_D_MULT_GB_PER_S:.3f} > "
+        f"{RING_B0_TOTAL_MULT_GB_PER_S:.3f} xS): a derivation that charges the "
+        "host LESS than the measurement is a free store, and one that charges "
+        "MORE means the cell sizes or the rank layout above no longer describe "
+        "this boot. Re-measure the pools; do not relax this check."
+    )
 #: b0 U14: the unattributed residual is 1.006 GiB = ~4 % on top of the
 #: host-pool posts (rings + anchors).  Charged as +4 % on those posts.
 HOST_POOL_OVERHEAD = 0.04
@@ -2156,6 +2222,116 @@ def choose(
     )
     lines.append(_advisory_line(chosen, chosen=True))
     return chosen, headroom, lines
+
+
+class WindowUnsolvable(RuntimeError):
+    """W21: no window fits this host pool, and the arithmetic says why.
+
+    A launch refusal, never a runtime fallback: a group that cannot hold one
+    window plus the write-through floor cannot read the store back in windows
+    at all, and discovering that at the first long prompt means the boot is
+    already serving.
+    """
+
+
+def solve_window(
+    pool_rows: int,
+    chunk: int,
+    chains: int,
+    ring_floor: int,
+    anchor_slots: int,
+) -> int:
+    """#1317 C10: the largest window, in tokens, one store read may hold.
+
+    THE QUANTITY.  A windowed store read holds, at any moment, ONE window of
+    host rows per concurrent chain plus whatever the write-through ring has
+    staged.  So
+
+        W = chunk * floor((pool_rows - ring_floor) / (chains * chunk))
+
+    ``chunk`` is the STATIC ``--chunked-prefill-size`` and never
+    ``dynamic_chunked_prefill_size``: a C that varies per rank at runtime is
+    the rank-divergent form the group vote exists to delete, and ``C | W`` is
+    load-bearing for the GDN anchors (one anchor per chunk node).
+
+    ``pool_rows`` is the group's OWN MIN-synced ``mem_pool_host.size``, read
+    in-process.  It is deliberately NOT transported from the launcher: group P
+    holds 54,254 rows and group D 30,518, and one launcher-solved W would
+    truncate every P prefetch to a D-sized window.
+
+    ``chains`` is ``--max-running-requests``: the pool is shared, and sizing W
+    as if one request existed is how a second concurrent read finds no room
+    and votes the first one down.
+
+    Raises :class:`WindowUnsolvable` (W21) with the arithmetic when no window
+    fits, or when the windows would need more resume anchors than the anchor
+    pool holds -- an anchor-starved chain stalls at window 2, which is a
+    launch-time fact and must be a launch-time refusal.
+
+    Worked, group D on boot ``weg2sn5w``: pool_rows=30,518, chunk=4,096,
+    chains=1, ring_floor=4,096, anchor_slots=37 ->
+    W = 4,096 * floor(26,422/4,096) = 4,096 * 6 = 24,576; live W + ring_floor
+    = 28,672 <= 30,518 (slack 1,846); anchors W//C + 1 = 7 of 37.
+    """
+    pool_rows = int(pool_rows)
+    chunk = int(chunk)
+    chains = max(1, int(chains))
+    ring_floor = int(ring_floor)
+    anchor_slots = int(anchor_slots)
+    if chunk <= 0:
+        raise WindowUnsolvable(
+            f"W21 window unsolvable: chunk (--chunked-prefill-size) is {chunk}, "
+            "which is not a length; a window is a whole number of chunks "
+            "because the GDN anchors are published one per chunk node."
+        )
+    room = pool_rows - ring_floor
+    windows = room // (chains * chunk) if room > 0 else 0
+    w = chunk * windows
+    if w < chunk:
+        raise WindowUnsolvable(
+            f"W21 window unsolvable: host pool {pool_rows} rows minus the "
+            f"write-through floor {ring_floor} leaves {room} rows, which is "
+            f"less than one chunk of {chunk} for each of {chains} concurrent "
+            f"chains (needs {chains * chunk}). This group cannot read the "
+            f"store back in windows at all. Raise --hicache-size, lower "
+            f"--max-running-requests, or lower --chunked-prefill-size."
+        )
+    anchors_live = w // chunk + 1
+    if anchors_live > anchor_slots:
+        raise WindowUnsolvable(
+            f"W21 window unsolvable: a window of {w} tokens needs "
+            f"{anchors_live} live resume anchors (W//C + 1: one per chunk node "
+            f"plus the head's own anchor, which must survive its window's "
+            f"recycle) but the anchor pool holds {anchor_slots}. The chain "
+            f"would stall at window 2 with an unmatchable node. Raise the "
+            f"anchor pool (--mamba-host-pool-mib) or lower "
+            f"--chunked-prefill-size."
+        )
+    return w
+
+
+def window_provenance(
+    pool_rows: int,
+    chunk: int,
+    chains: int,
+    ring_floor: int,
+    anchor_slots: int,
+    prompt_tokens: int = 0,
+) -> str:
+    """One line naming every term that produced W, for the launcher to print.
+
+    Prints the terms, not just the number: two groups printing the same W from
+    different pools would be a coincidence, and the reader of a boot log has
+    no other way to tell which pool answered.
+    """
+    w = solve_window(pool_rows, chunk, chains, ring_floor, anchor_slots)
+    n = -(-int(prompt_tokens) // w) if prompt_tokens > 0 else 0
+    return (
+        f"#1317 WINDOW W={w} chunk={chunk} chains={chains} "
+        f"pool_rows={pool_rows} ring_floor={ring_floor} "
+        f"live={w + ring_floor}<={pool_rows} slack={pool_rows - w - ring_floor} "
+        f"anchors={w // chunk + 1}/{anchor_slots} windows_for_{prompt_tokens}={n}"
+    )
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
