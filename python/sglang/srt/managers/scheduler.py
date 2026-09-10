@@ -5041,7 +5041,7 @@ class Scheduler(
         for tokenized_req in recv_req:
             self.handle_generate_request(tokenized_req)
 
-    def _prefetch_kvcache(self, req: Req) -> str:
+    def _prefetch_kvcache(self, req: Req, rematch: bool = True) -> str:
         """Issue a storage prefetch for ``req``. Returns WHAT ACTUALLY HAPPENED.
 
         THE DEFECT THIS RETURN VALUE CLOSES, measured on window-946fix-0828.
@@ -5121,7 +5121,43 @@ class Scheduler(
         # `clear_state_aligned_extent_undistributable` at
         # scheduler.py:12157 (`if not pp_row_carrier_present(self):`), one mover
         # later, where the request and `self.ps` are both in hand.
-        req.init_next_round_input(self.tree_cache, cow_mamba=False)
+        # #1317b THE RE-MATCH IS DESTRUCTIVE FOR A CHUNK-PREFILLING REQUEST,
+        # and that is what killed boot weg2sn6c.
+        #
+        # `init_next_round_input(tree_cache=...)` runs `tree_cache.match_prefix`
+        # and OVERWRITES `req.prefix_indices` with the fresh match
+        # (`schedule_batch.py:1946-1969`). For a request in the WAITING queue
+        # that is exactly right, and it is what this function's three original
+        # callers all are: intake (`_add_request_to_queue`), the disagg-prefill
+        # intake, and the deferral retry. None of them is ever `chunked_req`.
+        #
+        # For the CHUNKED request it is corruption, because `prefix_indices` is
+        # that request's LIVE ROW ACCOUNTING: `extend_range` is indexed against
+        # `len(self.chunked_req.prefix_indices)` (`scheduler.py:8554`), so a
+        # re-match that returns FEWER rows than the standing chunk wrote leaves
+        # those rows attached to no bucket the leak law knows -- neither
+        # `available`, nor `evictable` (the node is not a leaf), nor `protected`
+        # (the lock went with the replaced tensor). MEASURED, boot weg2sn6c
+        # 2026-09-10 08:23:32Z, rid f12d8ce7bc764978: six re-issues, the last
+        # match landing at 24,570 against a 24,576-token window, and
+        # `pool memory leak detected! [full] total=699584, available=651402,
+        # evictable=48176, withheld=0` -- a deficit of exactly 6 rows, the
+        # 24,576 - 24,570 the re-match dropped. Then SIGQUIT on all three ranks.
+        #
+        # This tree already knew the class: the W38/#1245 comment directly above
+        # exists to "stop an asynchronously-completed host hit moving one rank's
+        # prefix_indices alone (the W27 width divergence)". Same field, same
+        # hazard, one caller later.
+        #
+        # `rematch=False` is therefore not an optimisation: it is the correct
+        # contract for a caller whose request is already matched and whose match
+        # belongs to someone else. The round seam has just called
+        # `init_next_round_input()` WITHOUT a tree_cache, which refreshes the
+        # fill ids and deliberately does NOT re-match, so the standing match is
+        # both current and owned by the adder. Nothing is skipped that a caller
+        # needs; a redundant re-match is simply not taken.
+        if rematch:
+            req.init_next_round_input(self.tree_cache, cow_mamba=False)
         last_host_node = req.last_host_node
         # RANK-LOCAL: `backuped` means "full KV present in THIS rank's host
         # pool", and uneven DCP gives the ranks host pools of different sizes,
@@ -9890,7 +9926,7 @@ class Scheduler(
             return "skip:not_chunked_req"
         if not getattr(req, "_weg2_window_open", False):
             return "skip:no_window_owed"
-        verdict = self._prefetch_kvcache(req)
+        verdict = self._prefetch_kvcache(req, rematch=False)
         self._weg2_window_reissues = getattr(self, "_weg2_window_reissues", 0) + 1
         n = self._weg2_window_reissues
         still_owed = verdict == "issued:truncated_group"
