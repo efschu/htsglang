@@ -164,8 +164,12 @@ def test_the_drain_samples_both_ends_of_the_window():
     from sglang.srt.weg2.front import Front
 
     src = inspect.getsource(Front.drain)
-    assert src.count("_weg2_decode_progress") == 2, (
-        "the delta needs a sample at BOTH ends of the window"
+    # #1317h added a THIRD call: a periodic refresh inside the loop, so the
+    # flip-stall detector (which runs on a 1 s sampler and cannot await) has a
+    # live reading. Both ENDS are still sampled; the count is now 3.
+    assert src.count("_weg2_decode_progress") == 3, (
+        "the delta needs a sample at BOTH ends of the window, plus the "
+        "#1317h periodic refresh the stall detector reads"
     )
     assert "weg2_drain_progress_delta" in src
 

@@ -96,13 +96,29 @@ class TestTheBoundIsDerivedNotALiteral1262(CustomTestCase):
         self.assertIn("no flip measured", why)
         self.assertIn("drain-deadline-s", why)
 
-    def test_after_a_flip_the_bound_is_that_flips_own_measured_cost(self):
+    def test_after_a_flip_the_bound_carries_that_flips_own_measured_cost(self):
+        """#1317h CHANGED THE FORMULA, NOT THE PRINCIPLE.
+
+        #1262's principle -- the bound is DERIVED from this boot's own
+        measurements and is never a literal -- survives and is still asserted
+        here. What changed is that `FLIP_STALL_SLACK * flip_ms` was not a
+        bound a healthy flip could satisfy: `flip_ms` is measured AFTER the
+        drain succeeded, so the drain's own cost was never in it, and boot
+        weg2sn6g fired twice IN THE DRAIN STAGE on a healthy boot
+        (elapsed 17.5 / bound 14.1, and 16.1 / 13.5). The bound is now the
+        drain distribution plus the flip -- both halves still this boot's own
+        measurements.
+        """
         f = _front()
         f.flip_log.append({"sleep": "D", "wake": "P", "flip_ms": 3200})
         bound, why = f._flip_stall_bound_s()
-        self.assertAlmostEqual(bound, FLIP_STALL_SLACK * 3.2)
+        # the flip half is still that flip's own cost, named in the provenance
         self.assertIn("3200 ms", why)
         self.assertIn("D->P", why)
+        # and the drain half is ADDED, not replaced: with a young distribution
+        # it is the front's own published deadline.
+        self.assertAlmostEqual(bound, f.drain_deadline_s + 3.2, places=3)
+        self.assertGreater(bound, FLIP_STALL_SLACK * 3.2)
 
     def test_the_bound_tracks_a_slow_form_without_a_second_number(self):
         """weg2rg3 (3.1 s) and weg2dk5 (18.4 s) are the same code path."""
@@ -232,25 +248,44 @@ class TestTheWeg2t2aSpecimen1262(CustomTestCase):
         self.assertIn("queue=1", line)
         self.assertIn("flips=0", line)
 
-    def test_mutant_without_the_derived_bound_a_fast_form_false_positives(self):
-        """Why the bound may not be a constant, shown rather than argued.
+    def test_the_bound_stays_derived_and_firing_early_is_no_longer_a_virtue(self):
+        """THIS TEST'S DIRECTION WAS REFUTED ON METAL, and the correction is
+        the point of #1317h.
 
-        If the detector had shipped a fixed 120 s, a boot whose flips measure
-        3.2 s would let a flip run 37x its own cost before saying anything.
-        The derived bound calls it at 12.8 s -- and on the epoch-0 boot with
-        no measurement it still has the 120 s floor.
+        It used to argue that calling a stall at 12.8 s was BETTER than a
+        fixed 120 s, because "a boot whose flips measure 3.2 s would let a
+        flip run 37x its own cost before saying anything". Boot weg2sn6g
+        showed the cost of that argument: the detector fired TWICE on a
+        healthy serving boot (epoch 4, elapsed 17.5 s against bound 14.1 s;
+        epoch 6, 16.1 against 13.5), BOTH in the drain stage, because a drain
+        may legitimately wait up to `drain_deadline_s` for a decode that
+        #1011 forbids cutting. Firing early is not sensitivity here -- it is a
+        false wedge verdict on work in progress.
+
+        WHAT SURVIVES is #1262's actual invariant: the bound is DERIVED from
+        this boot's own measurements and is never a literal. That is asserted
+        below. What replaces "fire sooner" is the PROGRESS GATE (#1317h): at
+        the bound, a group that is still emitting is WAITING, not stalled --
+        so sensitivity now comes from asking whether work is happening, not
+        from a shorter deadline.
         """
         fast = _front()
         fast.flip_log.append({"sleep": "D", "wake": "P", "flip_ms": 3200})
-        _open_flip(fast, t0=0.0, epoch=1)
-        self.assertIsNone(fast.flip_stall_check(now=12.7))
-        self.assertIsNotNone(fast.flip_stall_check(now=12.8))
-        self.assertLess(
-            12.8,
-            DRAIN_DEADLINE_DEFAULT_S,
-            "a fixed 120 s literal would have stayed silent here -- that is "
-            "the mutant this bound removes",
-        )
+        bound, why = fast._flip_stall_bound_s()
+        # DERIVED, not a literal: it moves with this boot's own flip_ms.
+        slow = _front()
+        slow.flip_log.append({"sleep": "D", "wake": "P", "flip_ms": 18400})
+        assert slow._flip_stall_bound_s()[0] > bound
+        self.assertIn("3200 ms", why)
+        # and the two recorded sn6g fires no longer convict a healthy flip
+        for elapsed in (17.5, 16.1):
+            _open_flip(fast, t0=0.0, epoch=1)
+            fast._flip_stall_reported_epoch = None
+            self.assertIsNone(
+                fast.flip_stall_check(now=elapsed),
+                f"elapsed={elapsed} s fired on a healthy boot -- the weg2sn6g "
+                f"false positive is back",
+            )
 
 
 class TestTheDetectorIsWired1262(CustomTestCase):
