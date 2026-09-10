@@ -263,3 +263,71 @@ class TestTheRefusalNamesTheLargestFundableCap(unittest.TestCase):
         # and it must warn against the wrong fix: shrinking D's L2 alone
         # reintroduces the shortfall the deleted window layer compensated.
         self.assertIn("do NOT lower", src)
+
+
+class TestTheLaunchMomentIsPricedInOneCurrencyPerBarrier(unittest.TestCase):
+    """#1317n Option 3. Boot weg2sn6r refused at the launch moment, -2.78 GiB,
+    while the RUN moment funded (leftover 7.75). The refusal charged D's pinned
+    rings AND the 12 GiB load transient as a SUM.
+
+    THE TRANSIENT IS PAGE CACHE, by this constant's own provenance: weg2ls1b2
+    read MemAvailable 48.0 GB during D's load against 60.0 GB "once the load's
+    page cache had been reclaimed" ~30 s after READY. The residual VANISHED on
+    reclaim, which only page cache does -- an anon staging buffer would have
+    survived it.
+
+    AND THE LEDGER ALREADY HAS TWO CURRENCIES: the reap watermark counts
+    non-reclaimable memory only (`cg_reclaimable_bytes` = `(file - shmem) +
+    slab_reclaimable`, "anon and unevictable are never subtracted"), while
+    MemAvailable under-reports active page cache. Charging page cache against
+    the reap-derived base books a quantity the reaper never kills for.
+    """
+
+    def test_the_split_sums_to_the_measurement_and_carries_provenance(self):
+        self.assertAlmostEqual(
+            hl.LOAD_TRANSIENT_PAGECACHE_GIB + hl.LOAD_TRANSIENT_ANON_GIB,
+            hl.LOAD_TRANSIENT_GIB, places=9)
+        self.assertEqual(hl.LOAD_TRANSIENT_ANON_GIB, 0.0)
+        self.assertIn("PAGE CACHE", hl.LOAD_TRANSIENT_SPLIT_PROVENANCE)
+        self.assertIn("weg2ls1b2", hl.LOAD_TRANSIENT_SPLIT_PROVENANCE)
+
+    def test_the_two_forms_reproduce_the_sn6r_numbers(self):
+        """The class assignment turns the sn6r verdict, and by how much is the
+        number rather than the argument."""
+        launch_sum = -2.78
+        launch_reap = launch_sum + hl.LOAD_TRANSIENT_PAGECACHE_GIB
+        self.assertAlmostEqual(launch_reap, 9.22, places=2)
+
+    def test_the_worst_case_gate_still_refuses_a_real_breach(self):
+        """The split's safety net: if the class assignment were wrong, the SUM
+        form must still sit inside the named margin (8.60 GiB), or the arm is
+        refused anyway. sn6r's -2.78 holds with 5.82 to spare; -9.00 does not."""
+        margin = hl.resolve_margin().boot_total_gib
+        self.assertAlmostEqual(margin, 8.60, places=2)
+
+        def arm(launch, run, sum_form):
+            return type("A", (), {
+                "launch_leftover_gib": launch, "run_leftover_gib": run,
+                "terms": {"launch_leftover_sum_gib": sum_form,
+                          "margin_total_gib": margin},
+                "launch_worst_case_gib": hl.Arm.launch_worst_case_gib,
+            })()
+
+        a = hl.Arm(s_gb=1, m_mib=600, ranks_per_group=3,
+                   memtotal_bytes=0, memavail_bytes=0)
+        a.launch_leftover_gib, a.run_leftover_gib = 9.22, 7.75
+        a.terms = {"launch_leftover_sum_gib": -2.78, "margin_total_gib": margin}
+        self.assertTrue(a.fundable_moments, "sn6r must fund once priced by class")
+        # ...and a configuration whose worst case breaches the margin does NOT
+        a.terms["launch_leftover_sum_gib"] = -9.00
+        self.assertFalse(a.fundable_moments)
+        # ...nor does one whose priced moment is itself negative
+        a.terms["launch_leftover_sum_gib"] = -2.78
+        a.launch_leftover_gib = -0.01
+        self.assertFalse(a.fundable_moments)
+
+    def test_the_arm_line_shows_both_forms_and_names_the_currency(self):
+        import inspect
+        src = inspect.getsource(hl.choose)
+        self.assertIn("launch_sum=", src)
+        self.assertIn("launch_cur=", src)

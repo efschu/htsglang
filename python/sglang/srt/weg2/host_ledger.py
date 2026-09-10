@@ -763,6 +763,60 @@ CGROUP_V2_FILE_INCLUDES_SHMEM_PROOF = (
 #: this loader by at least that much.  12 GiB is the measured residual; the
 #: next boot's memts series replaces it if the in-load peak reads higher.
 LOAD_TRANSIENT_GIB = 12.0
+#: #1317n THE TRANSIENT, SPLIT BY MEMORY CLASS -- because the ledger already
+#: has two currencies and this constant was being spent in the wrong one.
+#:
+#: THE TWO CURRENCIES, both already in this module. The reap watermark counts
+#: NON-RECLAIMABLE memory only: :func:`cg_reclaimable_bytes` is
+#: ``(file - shmem) + slab_reclaimable`` and its docstring states "anon and
+#: unevictable are never subtracted: both are exactly what the reaper kills to
+#: recover". MemAvailable is the other currency, and it genuinely UNDER-REPORTS
+#: active page cache.
+#:
+#: WHICH CLASS THE 12 GiB IS, from this constant's own provenance above: "12 GB
+#: of THE LOAD'S PAGE CACHE was not counted as available", reclaimed ~30 s
+#: after D READY (weg2ls1b2: MemAvailable 48.0 GB during the load against 60.0
+#: GB once it had been reclaimed). Page cache. Not anon, not shmem.
+#:
+#: WHAT THAT MEANS FOR EACH BARRIER, one currency per barrier and no mixing:
+#: against a MemAvailable-derived base the whole transient IS charged -- the
+#: launcher samples BEFORE the groups start, so the depression is a real
+#: forward-looking cost of that reading. Against the REAP-derived base
+#: (``ceiling - non-reclaimable memory.current``) the page-cache half may NOT
+#: be charged, because that base does not contain page cache in the first
+#: place; charging it there books a quantity the reaper never kills for.
+#:
+#: MEASURED ON boot weg2sn6r, both forms, so the difference is a number and not
+#: an argument: launch leftover **-2.78 GiB** charged as a SUM (what refused
+#: the boot) against **+9.2 GiB** charged by class. The run moment funds either
+#: way (leftover 7.75 GiB).
+LOAD_TRANSIENT_PAGECACHE_GIB = 12.0
+#: The anon/shmem half. ZERO, and the zero is asserted with provenance rather
+#: than assumed: the ls1b2 measurement does NOT separate anon from page cache
+#: -- it reads MemAvailable before and after a reclaim -- so what is proven is
+#: that the residual DISAPPEARED on reclaim, and only page cache does that.
+#: An anon staging buffer would have survived it. If a later memts series
+#: separates the two, this is where the anon part goes, and it stays charged
+#: against BOTH barriers.
+LOAD_TRANSIENT_ANON_GIB = 0.0
+LOAD_TRANSIENT_SPLIT_PROVENANCE = (
+    "weg2ls1b2 (#721): MemAvailable 48.0 GB during D's load against 60.0 GB "
+    "once the load's PAGE CACHE had been reclaimed ~30 s after READY. The "
+    "residual vanished on reclaim, which only page cache does -- an anon "
+    "staging buffer would have survived it -- so the split is 12.0 page cache "
+    "/ 0.0 anon. The measurement does not separate the two directly; this line "
+    "IS the provenance the zero rests on."
+)
+if abs(
+    (LOAD_TRANSIENT_PAGECACHE_GIB + LOAD_TRANSIENT_ANON_GIB) - LOAD_TRANSIENT_GIB
+) > 1e-9 or not LOAD_TRANSIENT_SPLIT_PROVENANCE:
+    raise RuntimeError(
+        "#1317n the load transient's class split must sum to the measured "
+        f"total ({LOAD_TRANSIENT_GIB}) and must carry a provenance line: got "
+        f"{LOAD_TRANSIENT_PAGECACHE_GIB} + {LOAD_TRANSIENT_ANON_GIB}. An "
+        "unproven split would let the launch moment be priced in a currency "
+        "nobody measured, which is the defect this split exists to fix."
+    )
 #: b0: 10.19 GB MEASURED for six (rank x phase) anchor pools at m_mib=2400
 #: (2.55/1.49/1.06 + 2.55/1.27/1.27 GB).  Scaled linearly with M.
 ANCHORS_AT_2400_BYTES = 10.19 * GB
@@ -1298,8 +1352,39 @@ class Arm:
     run_leftover_gib: float = 0.0
 
     @property
+    def launch_worst_case_gib(self) -> float:
+        """The launch leftover with the WHOLE load transient charged as
+        non-reclaimable -- i.e. as if the class split (#1317n) were wrong.
+
+        Kept as a first-class term rather than a comment because it is the
+        safety net of that split: the split says 12 GiB of the transient is
+        page cache and may not be booked against the reap bound, and this is
+        the number that answers "and if it isn't?".
+        """
+        t = self.terms or {}
+        v = t.get("launch_leftover_sum_gib")
+        return self.launch_leftover_gib if v is None else float(v)
+
+    @property
     def fundable_moments(self) -> bool:
-        return self.launch_leftover_gib >= 0.0 and self.run_leftover_gib >= 0.0
+        """Both moments fund, AND the worst case stays inside the margin.
+
+        #1317n THE THIRD CONJUNCT IS THE SPLIT'S SAFETY NET. Pricing the launch
+        moment in the reap currency (page cache not charged against a bound the
+        reaper does not enforce on page cache) turns weg2sn6r's -2.78 GiB into
+        +9.2 GiB. If that class assignment is ever wrong, the honest fallback is
+        not "boot anyway": the SUM form must still sit inside the named margin,
+        so a configuration that would breach the reap watermark even once the
+        page cache is reclaimed keeps being REFUSED. On sn6r the sum form is
+        -2.78 against a margin of 8.60, so it holds with 5.82 GiB to spare --
+        the split changes the verdict, and the worst case still has a floor.
+        """
+        if not (self.launch_leftover_gib >= 0.0 and self.run_leftover_gib >= 0.0):
+            return False
+        margin = (self.terms or {}).get("margin_total_gib")
+        if margin is None:
+            return True
+        return self.launch_worst_case_gib >= -float(margin)
 
     def predicted_run_peak_gib(self) -> Optional[float]:
         """What ``memory.current`` this arm reaches at the RUN PEAK, or None.
@@ -1638,7 +1723,15 @@ def price(
     # launcher's sleep(P)); span 2 lands at D's first pause, when D's load
     # transient is gone.  Charging Sigma H at launch is what turns the M=1200
     # arm's leftover from +1.05 into -1.93 GiB.
-    launch = common - host_ring_span1_gib - LOAD_TRANSIENT_GIB
+    # #1317n ONE CURRENCY PER BARRIER. `base_source` names which reading won
+    # the base, and that reading decides which half of the transient is a real
+    # cost against it. `launch_sum` is kept and printed either way as the
+    # WORST CASE (the whole transient non-reclaimable), and it is a hard gate
+    # below -- so this is a class assignment, never a sum->max trick.
+    launch_sum = common - host_ring_span1_gib - LOAD_TRANSIENT_GIB
+    launch_reap = common - host_ring_span1_gib - LOAD_TRANSIENT_ANON_GIB
+    _reap_currency = str(base_source or "").startswith("cgroup")
+    launch = launch_reap if _reap_currency else launch_sum
     # Sigma H IS the run peak; there is no flip transient beside it (A1-1/A1-3).
     run = common - host_ring_gib
     origin_gib, origin_source = run_origin_gib(
@@ -1698,7 +1791,16 @@ def price(
         "image_extra_d_gib": images.extra_d_gib,
         "run_origin_gib": origin_gib,
         "run_origin_source": origin_source,
+        # #1317n the margin the worst-case launch gate measures against. The
+        # DEFAULT resolution, so `price()` alone can enforce the gate; `choose`
+        # may pass a different Margin, and it re-reads the same field.
+        "margin_total_gib": resolve_margin().boot_total_gib,
         "load_transient_gib": LOAD_TRANSIENT_GIB,
+        "load_transient_pagecache_gib": LOAD_TRANSIENT_PAGECACHE_GIB,
+        "load_transient_anon_gib": LOAD_TRANSIENT_ANON_GIB,
+        "launch_leftover_sum_gib": launch_sum,
+        "launch_leftover_reap_gib": launch_reap,
+        "launch_currency": "reap" if _reap_currency else "memavailable",
         "anchors_gib": anchors_gib,
         "rings_gib": rings_gib,
         "overhead_gib": overhead_gib,
@@ -2334,6 +2436,14 @@ def choose(
             f"anchors={arm.terms['anchors_gib']:.2f} rings={arm.terms['rings_gib']:.2f} "
             f"overhead={arm.terms['overhead_gib']:.2f} -> "
             f"leftover launch={arm.launch_leftover_gib:.2f} GiB "
+            # #1317n BOTH FORMS ON THE LINE, because the class assignment is
+            # the whole change and a reader must be able to see it rather than
+            # trust it: `launch` is priced in the currency `launch_cur` names,
+            # `launch_sum` is the worst case with the entire load transient
+            # charged as non-reclaimable, and the gap between them IS the page
+            # cache (boot weg2sn6r: -2.78 sum against +9.22 by class).
+            f"launch_sum={arm.launch_worst_case_gib:.2f} GiB "
+            f"launch_cur={(arm.terms or {}).get('launch_currency', '?')} "
             f"run={arm.run_leftover_gib:.2f} GiB "
             f"store=NOT CHARGED HERE (#1236: on disk under launcher.STORE_ROOT, "
             f"page_cache=reclaimable, sized from the P KV pool -- see WEG2-STORE) "
