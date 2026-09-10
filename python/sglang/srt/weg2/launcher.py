@@ -70,12 +70,14 @@ from sglang.srt.managers import corridor_guard
 from sglang.srt.weg2 import admin_key as admin_key_mod
 from sglang.srt.registry import nvml as nvml_registry
 from sglang.srt.weg2 import (
+    checkpoint_census,
     corridor_budget,
     host_ledger,
     ring_table,
     weight_exchange_region,
     weight_exchange_shadow,
     weight_exchange_transport,
+    xchg_bounce,
     xchg_residency,
 )
 from sglang.srt.weg2 import DEFAULT_D_BS, DEFAULT_P_BS, DEFAULT_PP_ORDERED_CUT
@@ -4378,6 +4380,58 @@ def xchg_bounce_charge_bytes(weight_source: str, oncard_mode: str,
     return int(host_ledger.xchg_bounce_bytes(slot_bytes=slot_bytes))
 
 
+def xchg_bounce_terms_for_arm(weight_source: str, oncard_mode: str,
+                              model_dir: str,
+                              oncard_slot_mib: Optional[int] = None):
+    """``(charged_bytes, lines)`` for the host bounce. #1332 B1b.
+
+    THE SECOND PRODUCER OF THE SAME PREDICATE AS
+    :func:`xchg_bounce_charge_bytes`, and deliberately its neighbour rather
+    than its replacement: that one answers "does this arm pin host bytes at
+    all" for every arm and stays the authority for `ring` and `ipc`, which
+    charge 0.  This one answers "how many, on the arm that does", and it is the
+    call site where seat 3's sizing function finally receives a MEASURED
+    ``widest_layer_bytes`` instead of the missing producer WEG2_REUSE_SPEC
+    §10.8 named as open decide 1.
+
+    Nothing here is arithmetic: the census MEASURES
+    (``checkpoint_census.layer_census_from_headers``, safetensors headers,
+    group-wide, per layer, MAX), ``bounce_terms`` SIZES, ``arm_line`` PRINTS
+    and ``under_coverage_refusal`` REFUSES.  The launcher only decides which
+    arm asks.
+
+    REFUSES rather than defaults, twice: an arm that pins host bytes with no
+    checkpoint to measure, and a buffer whose depth-slot cannot hold the widest
+    layer (W71 form).  Both at ARM time, before either group starts -- a layer
+    that cannot be assembled whole cannot be sliced by its destinations, and
+    finding that out mid-flip means finding it out after VRAM was mutated.
+    """
+    if str(weight_source) == WEIGHT_SOURCE_DEFAULT:
+        return 0, []
+    if str(oncard_mode) != weight_exchange_transport.ONCARD_MODE_HOST:
+        return 0, []
+    if not str(model_dir or "").strip():
+        raise xchg_bounce.Weg2XchgBounceUnderCovered(
+            "W74 Weg2XchgWidestLayerUnreadable: the host on-card arm pins a "
+            "host bounce whose size is the WIDEST layer of this boot's "
+            "checkpoint, and no checkpoint path reached this call site. "
+            "Refused rather than sized against a default"
+        )
+    slot_bytes = 0
+    if oncard_slot_mib is not None:
+        slot_bytes = (weight_exchange_transport.validate_oncard_slot_mib(
+            oncard_slot_mib) * weight_exchange_region.MIB)
+    terms, widest, widest_name = checkpoint_census.widest_layer_terms(
+        str(model_dir), pairs=int(weight_exchange_region.N_CARDS),
+        depth=xchg_bounce.ASSEMBLE_DEPTH_DEFAULT, slot_bytes=slot_bytes)
+    lines = [widest, xchg_bounce.arm_line(terms)]
+    if not terms.covers_widest_layer:
+        raise xchg_bounce.Weg2XchgBounceUnderCovered(
+            xchg_bounce.under_coverage_refusal(terms,
+                                               widest_layer_name=widest_name))
+    return int(terms.total_bytes), lines
+
+
 def choose_host_ledger(
     ring_bytes: int,
     ring_span1_bytes: int,
@@ -4391,6 +4445,7 @@ def choose_host_ledger(
     weight_source: str = WEIGHT_SOURCE_DEFAULT,
     oncard_mode: str = ONCARD_MODE_DEFAULT,
     oncard_slot_mib: Optional[int] = None,
+    model_dir: str = "",
 ) -> Tuple[host_ledger.Arm, Optional[float], List[str], Dict[str, Optional[int]]]:
     """THE LAUNCHER'S ONE LEDGER CALL SITE: read the host, price the ladder.
 
@@ -4438,6 +4493,11 @@ def choose_host_ledger(
     # the identical model (slab term, reap bound, W20/W21 refusals) and cannot
     # drift from the ladder call again. test_weg2_store_priced_x_1317 pins the
     # keyword/signature conformance of every host_ledger call in this module.
+    # #1332 B1b -- MEASURED BEFORE THE LEDGER IS ASKED, so the two refusals
+    # (unreadable checkpoint, under-covered buffer) land before any host number
+    # is priced against them.
+    _bounce_charge_bytes, _bounce_lines = xchg_bounce_terms_for_arm(
+        weight_source, oncard_mode, model_dir, oncard_slot_mib)
     ledger_kw = dict(
         # #1317n D's L2 IS PRICED SEPARATELY FROM P'S. It rides the ONE kwargs
         # block for exactly the reason the block exists (boot weg2sn6a died of
@@ -4481,9 +4541,12 @@ def choose_host_ledger(
         # this term was added to close.  The predicate is now the SAME one the
         # deposit allocates under, and it is the launcher's own published
         # value rather than a second reading of the environment.
-        xchg_bounce_host_bytes=xchg_bounce_charge_bytes(weight_source,
-                                                        oncard_mode,
-                                                        oncard_slot_mib),
+        # #1332 B1b: ON THE HOST ARM THE CHARGE IS THE MEASURED BOUNCE.
+        # `xchg_bounce_charge_bytes` stays the authority for `ring` and `ipc`
+        # (both 0); where bytes are actually pinned, the size is derived from
+        # THIS checkpoint's WIDEST layer by `xchg_bounce_terms_for_arm` ->
+        # `bounce_terms`, and its two lines join the ledger's printed lines.
+        xchg_bounce_host_bytes=_bounce_charge_bytes,
         # #1327 (S6 slice 2): SIGMA H IS 0 BY DESIGN ON THE EXCHANGE ARM, and
         # the ledger is TOLD so rather than left to infer it from a zero.
         # Under `exchange` the launcher publishes no `TMS_HOST_RING_*` and the
@@ -4528,11 +4591,11 @@ def choose_host_ledger(
             f"against the b0 reading {host_ledger.RING_B0_TOTAL_MULT_GB_PER_S:.3f} xS). "
             "The ladder was restricted to the pinned arm by the operator.",
         ]
-        return arm, reap_headroom_gib, lines, cg
+        return arm, reap_headroom_gib, _bounce_lines + lines, cg
     arm, reap_headroom_gib, lines = host_ledger.choose(
         mi["MemTotal"], mi["MemAvailable"], **ledger_kw,
     )
-    return arm, reap_headroom_gib, lines, cg
+    return arm, reap_headroom_gib, _bounce_lines + lines, cg
 
 
 def count_marker(path: str, marker: str) -> int:
@@ -9093,7 +9156,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         s_gb_d=s_gb_d, d_cap_terms=_l2_terms,
         weight_source=ns.weg2_weight_source,
         oncard_mode=ns.weg2_xchg_oncard,
-        oncard_slot_mib=ns.weg2_xchg_oncard_slot_mib)
+        oncard_slot_mib=ns.weg2_xchg_oncard_slot_mib,
+        # #1332 B1b: the checkpoint whose WIDEST layer sizes the host bounce.
+        model_dir=ns.model)
     state.cgroup = dict(cg)
     for ln in lines:
         log(ln)
