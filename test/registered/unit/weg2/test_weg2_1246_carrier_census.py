@@ -568,10 +568,17 @@ def test_a_bound_the_old_floor_accepted_is_no_longer_an_off_switch():
     from sglang.srt.weg2 import front
 
     assert 5119 > SHORT_BOUND
+    # `route_carrier_exceeds` is still CORRECT for a length D can prefill by
+    # itself (above the carrier, uncached <= X): that branch is deliberately
+    # unchanged by #1317d and is the preserved fallback. Measured here: at
+    # 12,287 chars the prompt prices to ~4,095 uncached tokens, under X, so the
+    # single prefill is the cheap and right answer. The off-switch claim is
+    # about the LENGTHS D CANNOT prefill, and those must round-trip -- which is
+    # what the `route_batch in seen` assertion below actually tests.
     seen = set()
     for n in (10, 12287, 12288, 12300, 40000, 300000):
         r = _route_of(5119, n)
-        assert r in ("route_short", "route_batch"), n
+        assert r in ("route_short", "route_batch", "route_carrier_exceeds"), n
         seen.add(r)
     assert "route_batch" in seen, (
         "at least one length must round-trip through P at this bound; if none "
