@@ -4655,6 +4655,10 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             probed=_probed,
             matched=insert_result.prefix_len,
             deliverable=_deliverable,
+            # #1324: the GROUP-AGREED completion, which is what `is_incomplete`
+            # compares -- see its docstring for why a rank-local number would
+            # have had the mark refused on group D's uneven-DCP phase.
+            synced=min_completed_tokens,
         )
         # #843: `refused` separates the TWO reasons this line can say loaded=0,
         # which are not the same finding and were indistinguishable at INFO.

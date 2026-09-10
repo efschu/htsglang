@@ -6106,9 +6106,31 @@ class Scheduler(
                 reason = "symmetric_vote"
         except Exception:  # noqa: BLE001 - a probe may never break intake
             reason = "symmetric_probe_failed"
-        if reason == "symmetric_vote" and for_reason == _DEFER_REASON_SHORTFALL:
+        if reason == "symmetric_vote" and for_reason in (
+            _DEFER_REASON_SHORTFALL,
+            _DEFER_REASON_STORE_SHORT,
+        ):
             # S4: the group vote is the very mechanism that makes THIS mark
             # uniform, so it cannot also be the reason to refuse it.
+            #
+            # #1324 ADDED THE SECOND REASON, and this is the line the fix turns
+            # on. `symmetric_vote` refuses a deferral because a RANK-LOCAL mark
+            # can diverge under uneven DCP -- and group D is exactly such a
+            # phase (TP=3 on the uneven [17,7,8] vector), so without this the
+            # store-short mark would be dropped at EVERY retry
+            # (`_retry_deferred_prefetches` -> `_drop_prefetch_deferral`) and
+            # the whole #1324 repair would sit in the tree unwired while the
+            # X gate went on pricing the shortfall. Present-but-unwired is the
+            # costliest of the three delivery states, so the exemption is
+            # earned rather than assumed:
+            #   `PrefetchOutcome.is_incomplete` compares `synced`
+            #   (`min_completed_tokens`, the packed MIN all_reduce's own
+            #   agreed value whenever tp_world_size > 1) against `deliverable`
+            #   (derived from `prefetch_key`, the participation-voted span that
+            #   #580 makes rank-uniform). Both sides are group facts, so the
+            #   mark cannot be rank-divergent -- which is the identical
+            #   argument S4 makes for `host_pool_shortfall`, and the reason
+            #   `is_incomplete` deliberately does NOT read `materialized`.
             reason = None
         if reason is None and (
             getattr(tc, "prefetch_timeout_base", None) is None

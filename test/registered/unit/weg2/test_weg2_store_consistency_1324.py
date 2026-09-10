@@ -211,7 +211,8 @@ def test_a_short_read_is_incomplete():
     zero. The record itself has to carry the incompleteness or nothing does.
     """
     deliverable = (SN6S_PROMPT_TOKENS // PAGE) * PAGE
-    o = PrefetchOutcome(SN6S_DELIVERED, matched=0, deliverable=deliverable)
+    o = PrefetchOutcome(SN6S_DELIVERED, matched=0, deliverable=deliverable,
+                        synced=SN6S_DELIVERED)
     assert o.materialized == SN6S_DELIVERED
     assert o.is_incomplete, "53,247 of 109,132 is not a success"
     assert deliverable - o.materialized > SN6S_X, (
@@ -230,11 +231,11 @@ def test_a_complete_read_is_not_incomplete_through_page_rounding():
     requested = 109132
     deliverable = (requested // PAGE) * PAGE
     assert deliverable == 106496 and deliverable < requested
-    assert not PrefetchOutcome(deliverable, matched=0,
-                               deliverable=deliverable).is_incomplete
+    assert not PrefetchOutcome(deliverable, matched=0, deliverable=deliverable,
+                               synced=deliverable).is_incomplete
     # ... and the matched/loaded split is irrelevant to the verdict.
-    assert not PrefetchOutcome(6496, matched=100000,
-                               deliverable=deliverable).is_incomplete
+    assert not PrefetchOutcome(6496, matched=100000, deliverable=deliverable,
+                               synced=deliverable).is_incomplete
 
 
 def test_a_record_that_is_not_a_terminated_read_is_never_incomplete():
@@ -254,12 +255,13 @@ def test_the_record_survives_a_round_trip_with_its_new_field():
     import pickle
 
     o = PrefetchOutcome(53247, hit_tokens=7, probed=True, matched=11,
-                        deliverable=106496)
+                        deliverable=106496, synced=53247)
     back = pickle.loads(pickle.dumps(o))
     assert int(back) == 53247 and back.matched == 11
     assert back.deliverable == 106496 and back.hit_tokens == 7 and back.probed
     assert back.is_incomplete
-    assert "deliverable=106496" in repr(back)
+    assert "deliverable=106496" in repr(back) and "synced=53247" in repr(back)
+    assert back.synced == 53247
 
 
 def test_the_emitter_word_is_incomplete_for_a_short_read():
@@ -342,7 +344,8 @@ def test_an_incomplete_read_defers_instead_of_pricing(caplog):
     across that gap.
     """
     deliverable = (SN6S_PROMPT_TOKENS // PAGE) * PAGE
-    s = _sched(PrefetchOutcome(SN6S_DELIVERED, matched=0, deliverable=deliverable))
+    s = _sched(PrefetchOutcome(SN6S_DELIVERED, matched=0, deliverable=deliverable,
+                    synced=SN6S_DELIVERED))
     r = _req()
     assert not s._weg2_store_read_is_pending(r)
     with caplog.at_level(logging.WARNING, logger=sched_mod.logger.name):
@@ -368,7 +371,8 @@ def test_the_defer_names_the_store_as_the_cause(caplog):
     the name must differ or the next reader debugs the wrong half.
     """
     deliverable = (SN6S_PROMPT_TOKENS // PAGE) * PAGE
-    s = _sched(PrefetchOutcome(SN6S_DELIVERED, matched=0, deliverable=deliverable))
+    s = _sched(PrefetchOutcome(SN6S_DELIVERED, matched=0, deliverable=deliverable,
+                    synced=SN6S_DELIVERED))
     r = _req()
     with caplog.at_level(logging.WARNING, logger=sched_mod.logger.name):
         s._weg2_note_store_shortfall(r)
@@ -400,7 +404,8 @@ def test_the_drain_pass_is_a_module_function_a_stand_in_cannot_miss():
     )
     # And on a real receiver it DOES fire, counted.
     deliverable = (SN6S_PROMPT_TOKENS // PAGE) * PAGE
-    s = _sched(PrefetchOutcome(SN6S_DELIVERED, matched=0, deliverable=deliverable))
+    s = _sched(PrefetchOutcome(SN6S_DELIVERED, matched=0, deliverable=deliverable,
+                    synced=SN6S_DELIVERED))
     r = _req()
     s.waiting_queue = [r]
     assert sched_mod._weg2_store_shortfall_pass(s) == 1
@@ -424,7 +429,8 @@ def test_the_drain_pass_is_a_module_function_a_stand_in_cannot_miss():
 def test_a_complete_read_leaves_the_drain_hook_untouched():
     """M4's negative half: no defer, no mark, no line on a healthy read."""
     deliverable = (SN6S_PROMPT_TOKENS // PAGE) * PAGE
-    s = _sched(PrefetchOutcome(deliverable, matched=0, deliverable=deliverable))
+    s = _sched(PrefetchOutcome(deliverable, matched=0, deliverable=deliverable,
+                               synced=deliverable))
     r = _req()
     assert s._weg2_note_store_shortfall(r) is None
     assert r.prefetch_deferred is None
@@ -473,7 +479,7 @@ def test_a_store_that_keeps_delivering_is_waited_for_without_a_bound(caplog):
         for _ in range(rounds):
             delivered += PAGE
             s.tree_cache.prefetch_loaded_tokens_by_reqid["r1"] = PrefetchOutcome(
-                delivered, matched=0, deliverable=deliverable
+                delivered, matched=0, deliverable=deliverable, synced=delivered
             )
             assert s._weg2_note_store_shortfall(r) == "deferred"
     assert delivered < deliverable
@@ -490,7 +496,8 @@ def test_a_store_that_stops_delivering_is_refused_by_name(caplog):
     under a standing veto.
     """
     deliverable = (SN6S_PROMPT_TOKENS // PAGE) * PAGE
-    s = _sched(PrefetchOutcome(SN6S_DELIVERED, matched=0, deliverable=deliverable))
+    s = _sched(PrefetchOutcome(SN6S_DELIVERED, matched=0, deliverable=deliverable,
+                    synced=SN6S_DELIVERED))
     r = _req()
     s.waiting_queue = [r]
     s.ipc_channels = types.SimpleNamespace(
@@ -516,3 +523,58 @@ def test_a_store_that_stops_delivering_is_refused_by_name(caplog):
     assert "store_prefix_short" in caplog.text, (
         "the terminal line must name which arm stood still"
     )
+
+
+# --------------------------------------------------------------------------
+# M8: THE MARK MUST SURVIVE THE RETRY ON GROUP D'S UNEVEN-DCP PHASE
+# --------------------------------------------------------------------------
+
+
+def test_the_verdict_rests_on_the_group_agreed_completion_not_a_rank_local_one():
+    """M8: `is_incomplete` must be a GROUP fact, or the deferral is refused.
+
+    `_prefetch_deferral_refusal_reason` refuses a deferral on a phase running
+    uneven DCP unless the mark is provably rank-uniform, and group D IS such a
+    phase (TP=3 on the uneven [17,7,8] vector). So the compared quantity is
+    `synced` (`min_completed_tokens`, the packed MIN all_reduce's agreed value)
+    and never `materialized`, which collapses to this rank's own device-resident
+    prefix on the `host_span_unclaimed` path (#841).
+    """
+    d = 106496
+    # The #841 shape: the tree declined the fetched tail, so loaded=0 and
+    # `materialized` reads a rank-local prefix -- while the GROUP agreed the
+    # read completed its deliverable prefix. Verdict: complete.
+    o = PrefetchOutcome(0, matched=4096, deliverable=d, synced=d)
+    assert o.materialized == 4096 and o.materialized < d
+    assert not o.is_incomplete, (
+        "a rank-local number must not decide this verdict -- under uneven DCP "
+        "the ranks would disagree and the mark would be refused"
+    )
+    # And the group-agreed shortfall IS incomplete, whatever matched says.
+    assert PrefetchOutcome(0, matched=d, deliverable=d, synced=53247).is_incomplete
+
+
+def test_the_store_short_mark_is_exempt_from_the_symmetric_vote_refusal():
+    """M8: without the exemption the whole repair sits in the tree unwired.
+
+    `_retry_deferred_prefetches` asks `_prefetch_deferral_refusal_reason` for
+    the mark's own reason and DROPS the mark when it answers. On group D the
+    answer is `symmetric_vote`, so a store-short mark without this exemption
+    is dropped at every retry and the X gate goes on pricing the shortfall --
+    present-but-unwired, the costliest of the three delivery states.
+    """
+    s = _sched(None)
+    s._prefetch_deferral_refusal_reason = (
+        sched_mod.Scheduler._prefetch_deferral_refusal_reason.__get__(s)
+    )
+    # Force the uneven-DCP vote the way the tree exposes it.
+    s.tree_cache._hicache_prefetch_symmetric = lambda: True
+    assert s._prefetch_deferral_refusal_reason(
+        sched_mod._DEFER_REASON_RATE
+    ) == "symmetric_vote", "the rate arm keeps every refusal it had"
+    for reason in (sched_mod._DEFER_REASON_SHORTFALL,
+                   sched_mod._DEFER_REASON_STORE_SHORT):
+        assert s._prefetch_deferral_refusal_reason(reason) is None, (
+            f"{reason} is rank-uniform by construction and must not be refused "
+            "by a rank-divergence argument"
+        )

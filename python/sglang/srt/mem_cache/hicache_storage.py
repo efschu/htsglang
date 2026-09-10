@@ -237,12 +237,14 @@ class PrefetchOutcome(int):
         probed: bool = False,
         matched=None,
         deliverable=None,
+        synced=None,
     ):
         self = super().__new__(cls, int(loaded))
         self.hit_tokens = int(hit_tokens if hit_tokens is not None else 0)
         self.probed = bool(probed)
         self.matched = int(matched if matched is not None else 0)
         self.deliverable = int(deliverable if deliverable is not None else 0)
+        self.synced = int(synced if synced is not None else 0)
         return self
 
     @property
@@ -273,8 +275,30 @@ class PrefetchOutcome(int):
         ``0`` means "not a terminated store read" and is never incomplete,
         which keeps every admission-site record (which stores a bare ``int``)
         and every pre-#1324 pickle byte-identical in behaviour.
+
+        THE COMPARED QUANTITY IS ``synced``, THE GROUP-AGREED COMPLETION, and
+        NOT ``materialized``. That is not cosmetic -- it is what makes this
+        verdict a GROUP fact, which the deferral it feeds structurally
+        requires. ``_prefetch_deferral_refusal_reason`` refuses a deferral on a
+        phase running uneven DCP unless the mark is provably rank-uniform (its
+        ``symmetric_vote`` arm), and group D IS such a phase: TP=3 on the
+        uneven ``[17,7,8]`` vector. A mark built from a rank-local number would
+        therefore be REFUSED and dropped at every retry, leaving this whole
+        repair present but unwired -- the most expensive of the three delivery
+        states.
+        ``synced`` is ``min_completed_tokens``, which the packed MIN all_reduce
+        agrees across the attention group whenever ``tp_world_size > 1``, and
+        ``deliverable`` derives from ``prefetch_key``, the participation-voted
+        span (#580 makes registration rank-uniform). Both sides are group
+        facts, so the verdict is one too.
+        ``materialized`` would NOT have been: it is ``matched + loaded``, and on
+        the ``host_span_unclaimed`` path (#841, the tree declining the fetched
+        tail) ``loaded`` is forced to 0 and ``materialized`` collapses to this
+        rank's own device-resident ``prefix_len``. On every other path the two
+        are equal by construction, so this choice costs nothing and closes the
+        one path where the ranks could have disagreed.
         """
-        return int(self.deliverable) > 0 and self.materialized < int(self.deliverable)
+        return int(self.deliverable) > 0 and int(self.synced) < int(self.deliverable)
 
     @property
     def materialized(self) -> int:
@@ -290,14 +314,15 @@ class PrefetchOutcome(int):
     def __reduce__(self):
         return (
             PrefetchOutcome,
-            (int(self), self.hit_tokens, self.probed, self.matched, self.deliverable),
+            (int(self), self.hit_tokens, self.probed, self.matched, self.deliverable,
+             self.synced),
         )
 
     def __repr__(self) -> str:
         return (
             f"PrefetchOutcome(loaded={int(self)}, hit_tokens={self.hit_tokens}, "
             f"probed={self.probed}, matched={self.matched}, "
-            f"deliverable={self.deliverable})"
+            f"deliverable={self.deliverable}, synced={self.synced})"
         )
 
 
