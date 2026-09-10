@@ -189,6 +189,88 @@ def build_x_pending_payload(
     return payload
 
 
+def build_x_store_match_payload(
+    canonical: Sequence[str],
+    local_store_match: Dict[str, int],
+    slots: int = TP_HEAD_SLOTS,
+) -> List[int]:
+    """#1317 DESIGN A: this rank's STORE-PRICED match, one slot per rid.
+
+    THE DEFECT DESIGN A REMOVES.  ``build_head_order_payload`` votes the
+    match against the TREE -- device rows plus host-tier rows.  A token that
+    group P prefilled and wrote through to L3 is in NEITHER of those on group
+    D, so the X gate prices it as UNCACHED WORK and refuses the request
+    (W50), the front re-routes it, P prefills it AGAIN, and the loop is the
+    double prefill the phase law forbids.  But that token is not uncached: it
+    is cached in the store, one tier down, and the only honest reading of
+    "uncached" on a group whose carrier is L3 is "not in the tree AND not in
+    the store".
+
+    ``local_store_match`` maps rid -> ``local tree match + store-present
+    tokens beyond it``, as measured by
+    ``HiCacheController.store_presence_pages``.  That probe is the right
+    instrument for this arm and not merely a convenient one:
+
+    * it answers BY CONTENT KEY, and under #706 a page carries all attention
+      layers for its tokens with the cut taken at READ time, so the key is a
+      function of the CONTENT and not of any rank's layout or residency --
+      which is what makes this vote's inputs replicated rather than
+      rank-local, and it is the same reason ``store_presence_pages`` can be
+      trusted here at all;
+    * it is ANCHOR-CAPPED since #869b (``batch_exists_v2`` with the tree's own
+      component transfers min-clamps the answer to the last page that also
+      carries a mamba anchor), so the depth it returns is the depth a fetch
+      could actually USE.  That cap is what bounds the remainder: by the #939
+      one-chunk law the deepest reachable anchor is
+      ``floor((L-1)/C)*C``, so what survives this arm as genuinely uncached
+      is at most one chunk C -- which is why design A leaves the phase law
+      intact instead of licensing an unbounded D prefill.
+
+    MIN-REDUCED, and MIN is the conservative direction here exactly as it is
+    for the order arm: a rank that cannot see the pages drags the group's
+    store match DOWN, so the group prices MORE uncached work, never less.
+    Since presence is content-keyed the ranks normally agree and the MIN is
+    every rank's own value; a disagreement can only cost work, never
+    correctness.  Absent rids and unused slots ride ``_ABSENT_MATCH``,
+    identically to the order arm.
+
+    NO NEW COLLECTIVE (MUST NOT 6): these slots ride the same packed MIN
+    reduce ``_update_uniform_pool_budget`` already takes once per TP-loop
+    iteration, indexed by the SAME canonical head as the order and completion
+    arms.  This is the third arm, not a third reduce.
+    """
+    payload = [_ABSENT_MATCH] * slots
+    for i, rid in enumerate(canonical[:slots]):
+        payload[i] = int(local_store_match.get(rid, _ABSENT_MATCH))
+    return payload
+
+
+def group_store_match_for(
+    inputs: Optional["UniformHeadInputs"], rid: str
+) -> Optional[int]:
+    """The GROUP's store-priced match for one rid, or ``None`` for no opinion.
+
+    ``None`` on the same four group-uniform counts as
+    :func:`group_store_read_pending_ms`: no verdict this pass, no store arm
+    in the payload (a caller that does not vote), the rid outside the
+    canonical head, or the MIN carried ``_ABSENT_MATCH`` through because some
+    rank did not hold the rid.  A caller that gets ``None`` falls back to the
+    TREE match -- i.e. to the pre-design-A behaviour -- and never to its own
+    probe, which would put a rank-local number into the one verdict that
+    deletes a request from a queue.
+    """
+    if inputs is None or not inputs.canonical or not inputs.store_match:
+        return None
+    try:
+        slot = inputs.canonical.index(rid)
+    except ValueError:
+        return None
+    if slot >= len(inputs.store_match):
+        return None
+    value = int(inputs.store_match[slot])
+    return None if value <= _ABSENT_MATCH else value
+
+
 def group_store_read_pending_ms(
     inputs: Optional["UniformHeadInputs"], rid: str
 ) -> Optional[int]:
@@ -500,6 +582,12 @@ class UniformHeadInputs:
     #: rather than "nothing pending" -- the difference matters, because the
     #: second would license pricing on a read nobody asked about.
     pending_age_ms: Tuple[int, ...] = ()
+    #: #1317 DESIGN A: the store-priced match arm, same canonical indexing.
+    #: Empty when the caller took no store vote, which reads as "no opinion"
+    #: and falls the X gate back to the TREE match -- never as "the store
+    #: holds nothing", which would price a store-resident prompt as uncached
+    #: and is the very defect design A removes.
+    store_match: Tuple[int, ...] = ()
 
 
 def build_uniform_head_inputs(
@@ -508,11 +596,13 @@ def build_uniform_head_inputs(
     admit_limit: Optional[int],
     digest_agreed: bool,
     pending_age_ms: Sequence[int] = (),
+    store_match: Sequence[int] = (),
 ) -> UniformHeadInputs:
     """Freeze this pass's reduce results into the value the pass hands down."""
     return UniformHeadInputs(
         canonical=tuple(canonical or ()),
         group_match_lens=tuple(int(v) for v in (group_match_lens or ())),
+        store_match=tuple(int(v) for v in (store_match or ())),
         admit_limit=None if admit_limit is None else int(admit_limit),
         digest_agreed=bool(digest_agreed),
         pending_age_ms=tuple(int(v) for v in (pending_age_ms or ())),
@@ -690,6 +780,8 @@ def head_order_is_uniform(orders: Sequence[Sequence[str]]) -> bool:
 
 __all__ = [
     "TP_HEAD_SLOTS",
+    "build_x_store_match_payload",
+    "group_store_match_for",
     "NOT_PENDING_MS",
     "X_PRICE",
     "X_DEFER",

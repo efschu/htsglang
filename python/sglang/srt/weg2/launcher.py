@@ -3842,6 +3842,7 @@ def choose_host_ledger(
     meminfo_path: str = "/proc/meminfo",
     cgroup_root: str = "/sys/fs/cgroup",
     record_path: Optional[str] = None,
+    pin_m_mib: int = 0,
 ) -> Tuple[host_ledger.Arm, Optional[float], List[str], Dict[str, Optional[int]]]:
     """THE LAUNCHER'S ONE LEDGER CALL SITE: read the host, price the ladder.
 
@@ -3879,6 +3880,44 @@ def choose_host_ledger(
     record = host_ledger.read_measured_record(
         measured_record_path() if record_path is None else record_path
     )
+    if pin_m_mib and int(pin_m_mib) > 0:
+        # #1317/#1318 THE PINNED ARM IS PRICED, NOT ASSUMED. `price` is the
+        # same function `choose` ladders over, so a pinned arm is scored by the
+        # identical model -- and refused by name when it does not fund, which
+        # is what keeps this a pin rather than a way past the ledger. The
+        # HOST-SCHWELLE law admits no "accept the risk" branch here.
+        pinned = host_ledger.price(
+            mi["MemTotal"], mi["MemAvailable"], 1, int(pin_m_mib),
+            ring_bytes=ring_bytes, ring_span1_bytes=ring_span1_bytes,
+            ring_provenance=ring_provenance,
+            cg_current_bytes=cg["current"], reclaimable_bytes=cg["reclaimable"],
+            slab_reclaimable_bytes=cg["slab_reclaimable"],
+            cg_ceiling_bytes=cg_ceiling, cg_ceiling_source=cg_ceiling_source,
+            cg_oom_kill=cg["oom_kill"], measured_record=record,
+        )
+        if not pinned.fundable_moments:
+            raise host_ledger.Weg2HostLedgerRefused(
+                f"W39 Weg2PinnedArmRefused: --pin-ledger-arm-m {int(pin_m_mib)} "
+                f"prices S=1 M={int(pin_m_mib)} at launch "
+                f"{pinned.launch_leftover_gib:.2f} GiB / run "
+                f"{pinned.run_leftover_gib:.2f} GiB, and it is not fundable at "
+                "both moments. A pin selects among arms the ledger would fund; "
+                "it is not a way past the ledger's verdict, and the "
+                "host-threshold law admits no accept-the-risk branch. Pin a "
+                "smaller M, or drop the pin and let choose() ladder."
+            )
+        return pinned, None, [
+            f"WEG2-LEDGER ARM PINNED by --pin-ledger-arm-m: S=1 M={int(pin_m_mib)} "
+            f"launch={pinned.launch_leftover_gib:.2f} GiB "
+            f"run={pinned.run_leftover_gib:.2f} GiB "
+            f"run_peak={pinned.predicted_run_peak_gib():.2f} GiB "
+            f"host_ring_gib={pinned.terms.get('host_ring_gib', float('nan')):.2f} "
+            f"(#1318 rings derived: P={host_ledger.RING_P_MULT_GB_PER_S:.3f} + "
+            f"D={host_ledger.RING_D_MULT_GB_PER_S:.3f} = "
+            f"{host_ledger.RING_P_MULT_GB_PER_S + host_ledger.RING_D_MULT_GB_PER_S:.3f} xS "
+            f"against the b0 reading {host_ledger.RING_B0_TOTAL_MULT_GB_PER_S:.3f} xS). "
+            "The ladder is NOT run: the operator pinned this arm.",
+        ], cg
     arm, reap_headroom_gib, lines = host_ledger.choose(
         mi["MemTotal"],
         mi["MemAvailable"],
@@ -7201,6 +7240,18 @@ def build_parser() -> argparse.ArgumentParser:
     # against the disk (max_size >= P pool bytes, W57). The two knobs below are
     # the only ones the disk form has, and both have a stated default.
     ap.add_argument(
+        "--pin-ledger-arm-m", type=int, default=0,
+        help="#1317/#1318: PIN the host-ledger arm's mamba-host-pool size M (MiB) "
+             "instead of letting `host_ledger.choose` pick it. 0 = choose as before. "
+             "WHY IT EXISTS: #1318 derived the host ring multipliers from rows x cell "
+             "bytes (D 6.0 -> 3.00 GB/S, P 2.0 -> 1.78), which frees 3.12 GiB at every "
+             "arm and moves `choose` from M=600 to M=1200 -- the arm boot weg2dk5 was "
+             "REAPED on. Until a boot measures the host peak at the derived ring, a "
+             "measurement boot pins M to the value its reference boot actually ran. "
+             "The pinned arm is still PRICED and is REFUSED by name if it is not "
+             "fundable at both moments: this is a pin, never an override of the "
+             "ledger's verdict.")
+    ap.add_argument(
         "--store-max-gb", type=float, default=0.0,
         help="#1236 / user order 2026-09-10: the store's max_size as an ABSOLUTE size in "
              "GB (10^9), overriding the derived `P pool bytes x --store-sidecar-factor`. "
@@ -8282,7 +8333,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # 2. host ledger
     arm, reap_headroom_gib, lines, cg = choose_host_ledger(
         ring_plan.host_weights_bytes,
-        ring_plan.host_weights_span1_bytes, ring_plan.provenance)
+        ring_plan.host_weights_span1_bytes, ring_plan.provenance,
+        pin_m_mib=int(getattr(ns, "pin_ledger_arm_m", 0) or 0))
     state.cgroup = dict(cg)
     for ln in lines:
         log(ln)

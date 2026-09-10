@@ -5496,6 +5496,10 @@ class Scheduler(
             _population = getattr(req, "_969c_population", None)
             _available_before = self._host_pool_available_size()
             _pf_verdict = self._prefetch_kvcache(req)
+            # #1317 C6: WINDOW 1's verdict arms the window mark. This is the
+            # only site that arms it; the round seam re-derives it from each
+            # re-issue's own verdict thereafter.
+            self._weg2_note_window_verdict(req, _pf_verdict)
             # #969C: THE VERDICT WAS COMPUTED AND THROWN AWAY (success-value-
             # without-action, this tree's own catalogued class). #969B measured
             # that 141 of 148 seam re-admissions reach the match with
@@ -7294,6 +7298,18 @@ class Scheduler(
         vals = vals + tp_head_congruence.build_x_pending_payload(
             _head_canonical, self._weg2_local_store_read_pending_ages(_head_canonical)
         )
+        # #1317 DESIGN A: THE STORE-PRICED MATCH ARM, third consumer of this
+        # same reduce (after ORDER and COMPLETION), on the SAME canonical head.
+        # The order arm votes the match against the TREE; a token group P
+        # prefilled and wrote through to L3 is in neither of D's tiers, so the
+        # X gate priced it as uncached work and refused the request -- W50,
+        # re-route, P prefills a store-resident prompt AGAIN. This arm votes
+        # what the STORE holds beyond the tree, so "uncached" can mean "not in
+        # the tree AND not in the store". No new collective (MUST NOT 6).
+        _xstore_at = len(vals)
+        vals = vals + tp_head_congruence.build_x_store_match_payload(
+            _head_canonical, self._weg2_local_store_matches(_head_canonical)
+        )
         _ballot_rids = [
             req.rid
             for req in self.waiting_queue[: prefetch_ballot.PREFETCH_BALLOT_SLOTS]
@@ -7330,6 +7346,22 @@ class Scheduler(
                 f"available={len(vals) - _xpend_at}). Pricing law 4 on a slice "
                 "of the wrong width would read another arm's numbers as store-read "
                 "ages, so the group stops here by name instead."
+            )
+        # #1317 DESIGN A: read back by its own captured head index, before the
+        # ballot, under the same discipline as every other arm of this reduce.
+        _xstore_lens = t[
+            _xstore_at : _xstore_at + tp_head_congruence.TP_HEAD_SLOTS
+        ].tolist()
+        if len(_xstore_lens) != tp_head_congruence.TP_HEAD_SLOTS:
+            raise RuntimeError(
+                "#1317 W38 X-STORE LAYOUT STOP: the reduced payload carries no "
+                f"store-match slice (head={_xstore_at}, "
+                f"expected={tp_head_congruence.TP_HEAD_SLOTS}, "
+                f"available={len(vals) - _xstore_at}). Pricing the uncached "
+                "extent on a slice of the wrong width would read another arm's "
+                "numbers as store depths -- and this arm ADMITS work, so a "
+                "foreign number here would admit a prefill the group cannot "
+                "serve. The group stops here by name instead."
             )
         _admit_limit = int(t[_limit_at])
         # #1203: read back by its captured head index, before the ballot, under
@@ -7398,6 +7430,7 @@ class Scheduler(
             _admit_limit,
             self._uniform_prefetch_ballot is not None,
             _xpend_lens,
+            _xstore_lens,
         )
         self._uniform_min_avail = int(t[0].item())
         # >= 0: the local budget can only exceed the group minimum.
@@ -9697,7 +9730,66 @@ class Scheduler(
                     self._weg2_x_term_priced, n,
                 )
         self._weg2_x_term_priced = getattr(self, "_weg2_x_term_priced", 0) + 1
-        return max(0, total - gm)
+        # #1317 DESIGN A (user ruling 2026-09-10): PRICE AGAINST THE STORE,
+        # NOT ONLY AGAINST THE TREE.
+        #
+        # `gm` is the group's match against the TREE -- device rows plus
+        # host-tier rows. Under the phase law group P prefills the whole
+        # backlog and writes it through to L3, so on group D a long prompt's
+        # prefix is in NEITHER of those tiers and `total - gm` priced the
+        # WHOLE prompt as uncached work. That is what fired W50, sent the
+        # request back to the front, and had P prefill a store-resident prompt
+        # a second time. L3 is the carrier; a token the carrier holds is
+        # CACHED, and the only honest reading of "uncached" here is "not in
+        # the tree AND not in the store".
+        #
+        # `group_store_match_for` is the MIN-reduced store-priced match from
+        # the third arm of the same packed reduce (no new collective). MAX of
+        # the two because both are group-agreed and the store arm can only
+        # ever be >= the tree arm locally; taking the max keeps the OLD value
+        # exactly when the arm is absent (no store vote this pass, rid outside
+        # the canonical head, or some rank missing it), so a missing arm
+        # degrades to the pre-A behaviour rather than to a free admission.
+        #
+        # WHAT BOUNDS THE REMAINDER, and why this does not license a D prefill
+        # above X: the store depth this arm carries is ANCHOR-CAPPED (#869b --
+        # the probe min-clamps to the last page that also carries a mamba
+        # anchor), and by the #939 one-chunk law the deepest reachable anchor
+        # is `floor((L-1)/C)*C`. So what survives as genuinely uncached is at
+        # most one chunk C, plus the one token upstream always leaves to
+        # forward. D therefore prefills at most a chunk.
+        #
+        # AND THAT TAIL IS ALWAYS <= X, PROVEN AT THE SOURCE rather than
+        # assumed: every path that produces X floors it at C.
+        # `derive_x_star` returns `max(int(floor_tokens), ...)` and the
+        # operator-override path applies `max(floor_tokens, int(override))`,
+        # with `floor_tokens=CHUNKED_PREFILL_TOKENS` (4096) at the only call
+        # site (`weg2/launcher.py:8015`). So X >= C on every boot, the
+        # one-chunk remainder cannot exceed X, and design A needs no launch
+        # refusal to stay inside the phase law. If a future change unfloors
+        # X, THIS is the paragraph that stops being true.
+        gsm = tp_head_congruence.group_store_match_for(head_inputs, str(
+            getattr(req, "rid", "") or ""
+        ))
+        priced_match = gm if gsm is None else max(gm, int(gsm))
+        if gsm is not None and int(gsm) > gm:
+            self._weg2_x_store_credited = (
+                getattr(self, "_weg2_x_store_credited", 0) + 1
+            )
+            n = self._weg2_x_store_credited
+            if n <= 5 or n % 64 == 0:
+                logger.info(
+                    "WEG2 X-STORE-CREDIT rid=%s tree_match=%d store_match=%d "
+                    "credited=%d total=%d uncached_tree=%d uncached_store=%d n=%d "
+                    "(the store holds this much prefix beyond the tree, by "
+                    "content key and anchor-capped; the remainder is bounded by "
+                    "one chunk under the #939 law. Denominator: every X pricing "
+                    "in which the store arm credited more than the tree arm)",
+                    str(getattr(req, "rid", "?"))[:16], gm, int(gsm),
+                    int(gsm) - gm, total, max(0, total - gm),
+                    max(0, total - priced_match), n,
+                )
+        return max(0, total - priced_match)
 
     def _weg2_host_carry_tokens(self) -> int:
         """Longest prefix the store can hand back to THIS group, in tokens.
@@ -9751,6 +9843,193 @@ class Scheduler(
             return bool(ongoing) and rid in ongoing
         except TypeError:
             return False
+
+    def _weg2_issue_next_window(self, req) -> str:
+        """#1317 C4/C6: issue the NEXT store window for a chunk-prefilling req.
+
+        Returns the verdict string (or ``"skip:<reason>"``), so a caller and a
+        log can name what happened; nothing here decides admission.
+
+        THE GATE IS GROUP-UNIFORM, and that is the only hard requirement on
+        this function, because ``_prefetch_kvcache`` enters the #580
+        participation vote: a rank that calls it while a peer does not leaves
+        the peer alone in a collective, which is the gloo abort this whole
+        family exists to prevent. The two terms of the gate are therefore:
+
+        * ``self.chunked_req is req`` -- admission is group-uniform in this
+          tree (that is the #791/#968 law), so the identity of the chunked
+          request is replicated;
+        * ``req._weg2_window_open`` -- set from the GROUP-agreed verdict
+          ``issued:truncated_group``, which `_prefetch_kvcache` returns off
+          the post-consensus census key only the group trim bumps
+          (`unified_radix_cache.py`, #1298 S2). Every rank sets it on the same
+          pass for the same request or none does.
+
+        Nothing rank-local enters the gate: not `available_size()`, not a
+        clock, not this rank's own match. The SPAN the re-issued read asks for
+        IS rank-local (it comes from the caller's own tree match), and that is
+        exactly what the existing vote reduces to a group MIN -- the same
+        contract window 1 already runs under.
+
+        THE MARK'S LIFECYCLE TABLE (the rule for every new state field):
+          WRITER   this method, from the returned verdict; and nothing else.
+          READER   this method, on a later round.
+          DELETER  this method, when the verdict stops being
+                   ``issued:truncated_group`` -- i.e. the read landed whole,
+                   or was declined. Also cleared when the request stops being
+                   `chunked_req`, because the field lives on the request and
+                   leaves the scheduler with it.
+        Separating event: the CUTOVER. A flip rebinds the pools and re-issues
+        the affected population through the ordinary intake prefetch
+        (`phase_flip_runtime._post_cutover_readmit`), which re-derives the
+        mark from a fresh verdict -- so a stale mark cannot survive a flip and
+        drive a read against the previous binding. That is the #1060 hazard,
+        and the generation-keyed presence cache is what makes it safe.
+        """
+        if req is None or self.chunked_req is not req:
+            return "skip:not_chunked_req"
+        if not getattr(req, "_weg2_window_open", False):
+            return "skip:no_window_owed"
+        verdict = self._prefetch_kvcache(req)
+        self._weg2_window_reissues = getattr(self, "_weg2_window_reissues", 0) + 1
+        n = self._weg2_window_reissues
+        still_owed = verdict == "issued:truncated_group"
+        req._weg2_window_open = still_owed
+        if still_owed:
+            self._weg2_window_owed = getattr(self, "_weg2_window_owed", 0) + 1
+        else:
+            self._weg2_window_closed = getattr(self, "_weg2_window_closed", 0) + 1
+        if n <= 10 or n % 64 == 0:
+            logger.info(
+                "#1317 WINDOW-REISSUE n=%d rid=%s verdict=%s still_owed=%s "
+                "matched=%d total=%d owed_total=%d closed_total=%d "
+                "(denominator: every round seam at which a group-agreed window "
+                "remainder stood for the chunked request; the verdict is the "
+                "group's, off the post-consensus trim census)",
+                n, str(getattr(req, "rid", "?"))[:16], verdict, still_owed,
+                len(req.prefix_indices) + int(getattr(req, "host_hit_length", 0) or 0),
+                len(getattr(req, "full_untruncated_fill_ids", ()) or ()),
+                getattr(self, "_weg2_window_owed", 0),
+                getattr(self, "_weg2_window_closed", 0),
+            )
+        return verdict
+
+    def _weg2_note_window_verdict(self, req, verdict: str) -> None:
+        """#1317 C6: arm the window mark from a GROUP-agreed prefetch verdict.
+
+        Called at the intake prefetch (window 1). ``issued:truncated_group``
+        is the only verdict that arms it, and it is group-agreed by
+        construction -- it is read off the census key that only the
+        post-consensus group trim bumps, past the span agreement, so every
+        rank returns it together or none does. Any other verdict disarms:
+        a whole read owes no window, and a decline has nothing to continue.
+        """
+        if req is None:
+            return
+        req._weg2_window_open = verdict == "issued:truncated_group"
+        if req._weg2_window_open:
+            self._weg2_window_armed = getattr(self, "_weg2_window_armed", 0) + 1
+
+    def _weg2_local_store_matches(self, canonical) -> Dict[str, int]:
+        """#1317 DESIGN A: this rank's STORE-PRICED match vote, per canonical rid.
+
+        ``tree match + the store depth beyond it``, in tokens, for every rid
+        of the canonical head that this rank holds in its waiting queue. The
+        value goes into the packed MIN reduce and comes back as the group's
+        store match; nothing here is ever a verdict on its own.
+
+        WHY THE PROBE IS LEGAL AS AN INPUT TO A GROUP VERDICT.
+        ``store_presence_pages`` answers BY CONTENT KEY, and under #706 a page
+        carries all attention layers for its tokens with the cut taken at READ
+        time -- so the key is a function of the CONTENT, not of any rank's
+        layout or residency (its own docstring says exactly that). The ranks
+        therefore normally return the same depth, and the MIN only ever costs
+        work when they do not.
+
+        AND IT IS THE DEPTH A FETCH CAN USE, not a KV-only promise: since
+        #869b the probe asks ``batch_exists_v2`` with the tree's own component
+        transfers, which min-clamps the answer to the last page that also
+        carries a mamba anchor. That anchor cap is what bounds the surviving
+        remainder to one chunk (#939) and therefore keeps design A inside the
+        phase law.
+
+        COST: one backend round-trip per rid per BINDING GENERATION, not per
+        pass. The verdict is cached on the request under the same
+        generation-keyed shape ``_prefetch_kvcache`` uses
+        (``_pp_store_presence_cache``), because a presence verdict is a
+        statement about the pool the readers were bound to when it was taken
+        and the cutover rebinds them (#1060).
+
+        A VOTE MAY NEVER BREAK THE REDUCE. Same guard and same reason as
+        ``_weg2_local_store_read_pending_ages`` and
+        ``_local_head_prefix_matches``: this runs on the collective path on
+        every rank, so an exception here would leave one rank out of an
+        ``all_reduce`` its peers are already in -- the #580 split, arriving
+        through the door marked "safety". An empty vote rides
+        ``_ABSENT_MATCH``, which MIN-reduces the arm away and falls the X gate
+        back to the TREE match, i.e. to the pre-design-A behaviour. The
+        failure mode is "no store credit", never "the ranks disagree".
+        """
+        out: Dict[str, int] = {}
+        if not canonical:
+            return out
+        try:
+            ctrl = getattr(self.tree_cache, "cache_controller", None)
+            probe = getattr(ctrl, "store_presence_pages", None)
+            if not callable(probe):
+                return out
+            page_size = int(getattr(self.tree_cache, "page_size", 1) or 1)
+            from sglang.srt.mem_cache.hicache_phase_binding import (
+                current_generation as _current_generation,
+            )
+
+            gen = int(_current_generation())
+            wanted = set(canonical)
+            for req in self.waiting_queue:
+                rid = str(getattr(req, "rid", "") or "")
+                if rid not in wanted or rid in out:
+                    continue
+                fill_ids = getattr(req, "full_untruncated_fill_ids", None)
+                if not fill_ids:
+                    continue
+                total = len(fill_ids)
+                local_match = len(req.prefix_indices) + int(
+                    getattr(req, "host_hit_length", 0) or 0
+                )
+                # The span the store would have to answer for, ending where an
+                # upstream match must end: `_compute_max_prefix_len` is
+                # input_len - 1, because a request must always keep one token
+                # to forward.
+                match_end = req._compute_max_prefix_len(total)
+                if match_end <= local_match:
+                    out[rid] = min(local_match, total)
+                    continue
+                span = fill_ids[local_match:match_end]
+                node = getattr(req, "last_host_node", None)
+                last_hash = (
+                    node.get_last_hash_value() if node is not None else None
+                )
+                prefix_keys = None
+                if node is not None and getattr(
+                    self.tree_cache, "hicache_storage_pass_prefix_keys", False
+                ):
+                    prefix_keys = node.get_prefix_hash_values(node.parent)
+                key = (gen, local_match, len(span))
+                cached = getattr(req, "_weg2_store_match_cache", None)
+                if cached is not None and cached[0] == key:
+                    pages = int(cached[1])
+                else:
+                    pages = int(probe(span, last_hash, prefix_keys) or 0)
+                    req._weg2_store_match_cache = (key, pages)
+                # The probe counts PAGES; the arm votes TOKENS, because the
+                # extent it prices is a token count. Clamped to the span so a
+                # backend that over-reports can never credit tokens the
+                # request does not have.
+                store_tokens = min(max(0, pages) * page_size, len(span))
+                out[rid] = min(local_match + store_tokens, total)
+        except Exception:  # noqa: BLE001 - a vote may never break the reduce
+            return out
+        return out
 
     def _weg2_local_store_read_pending_ages(self, canonical) -> Dict[str, int]:
         """This rank's pending-age vote for the canonical head, in ms.
@@ -11563,6 +11842,31 @@ class Scheduler(
 
         if self.chunked_req is not None:
             self.chunked_req.init_next_round_input()
+            # #1317 C4: THE WINDOW CURSOR IS THIS ROUND, AND THE CURSOR IS THE
+            # TREE.
+            #
+            # Reachable only because of design A. Before A, a store-resident
+            # long prompt was refused by the X gate in the WAITING-QUEUE pass
+            # (`_weg2_x_refuses`, called at :12330, strictly before
+            # `adder.add_one_req`), so it never became `chunked_req` and this
+            # seam never saw it -- that is the ordering refutation of the 0907
+            # spec's C4 recorded in section 1bl. A prices the store-held prefix
+            # as CACHED, the request is admitted, and only then does a round
+            # exist to hang the next window on.
+            #
+            # A store read that does not fit the host pool in one piece is
+            # trimmed to the group's common room (#1290/#1298 vote the
+            # allocated LENGTH; every rank trims to the MIN), leaving a
+            # remainder that nothing re-issued. Windows 2..n are issued HERE.
+            #
+            # NO NEW OFFSET FIELD: `init_next_round_input` above has just
+            # re-matched the tree, so `prefix_indices + host_hit_length` IS the
+            # cursor. A stored "how far did the windows get" could disagree
+            # with the tree and is the writer/reader split this family is made
+            # of. `_prefetch_kvcache` is already re-entrant (three callers, an
+            # effect-based verdict), so this is a fourth caller of an existing
+            # function and not a second mechanism.
+            self._weg2_issue_next_window(self.chunked_req)
             # #679 rung 1-3: SPEND RELIEF BEFORE THE PARK, not instead of it.
             #
             # The ladder runs here and nowhere else: this is the last point at
