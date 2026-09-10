@@ -131,3 +131,29 @@ def test_carrier_limit_comes_from_the_live_property_not_a_retyped_fraction():
     """The two sides must agree BY CONSTRUCTION, not by two copies of 0.9."""
     stub = _stub(carrier_limit=12345)
     assert stub._weg2_carrier_limit_tokens() == 12345
+
+
+def test_the_sb5f_band_is_exempt_so_no_w50_requeue_cycle_can_start():
+    """THE #1290 LOOP, closed at its source.
+
+    #1290's harm was the cycle -- front offers, D refuses by name (W50), front
+    requeues, flip, store read refused, whole prompt uncached, W50 again: 93 of
+    93 ending in 503 after a median 22.0 s with ZERO tokens streamed. The loop
+    can only START if D refuses, so this asserts D does not: on the sb5f
+    numbers the gate answers `exempt_no_carrier_route` and the request is
+    prefilled direct.
+
+    sb5f, measured: uncached 22200, X 12944, carrier_max 27466 (0.9 x 30518),
+    total above the carrier. operator decision 2026-09-10 #1317, law-4 named
+    deviation.
+    """
+    sb5f_x, sb5f_carrier_max, sb5f_uncached, sb5f_total = 12944, 27466, 22200, 28000
+    stub = _stub(x=sb5f_x, host_carry=30518, carrier_limit=sb5f_carrier_max)
+    req = _req(sb5f_total, prefix=sb5f_total - sb5f_uncached)
+    assert sb5f_uncached > sb5f_x, "the offer is above X, so W50 was the old answer"
+    assert sb5f_uncached < 30518, "and BELOW carry, so the original arm does not fire"
+    assert sb5f_total > sb5f_carrier_max, "no carrier route can serve it"
+    assert refuses(stub, req) is False, (
+        "D refused the sb5f band -> the W50/requeue cycle #1290 measured can "
+        "start again"
+    )

@@ -85,12 +85,16 @@ class TheVerdictAsksBothBoundsOnTheirOwnBase(CustomTestCase):
     """RED-FIRST at `4f762260ba`: `serviceable_route` does not exist, and
     nothing else in the front ever returns "no route"."""
 
-    def test_red_first_the_sb5f_long_prompt_has_no_route(self):
-        """THE defect, as one call. Over X AND over the carrier, MEASURED."""
+    def test_the_sb5f_long_prompt_is_exempted_not_refused(self):
+        """THE sb5f prompt, as one call. Over X AND over the carrier, MEASURED.
+
+        operator decision 2026-09-10 #1317, law-4 named deviation. sb5f arithmetic: uncached 22200 > X 12944 AND total 28000 > carrier_max 27466 -> the front routes carrier_single (W68) and D's X gate answers verdict=exempt_no_carrier_route, so it is PREFILLED DIRECT with no W50 and no requeue. The rule MOVED (the terminal is now the per-request cap 262144); it was not eroded -- the 93/93 x 503 loop this file was written against is closed by the exemption instead of by a 413.
+        """
         self.assertEqual(
             serviceable_route(SB5F_UNCACHED, SB5F_CARRIER_EST,
-                              SB5F_X, SB5F_CARRIER_MAX, carrier_exact=True),
-            "none")
+                              SB5F_X, SB5F_CARRIER_MAX, carrier_exact=True,
+                              per_request_cap=262144),
+            "forced_direct")
 
     def test_between_x_and_carrier_the_long_route_fires(self):
         """The verdict the census counted ZERO times over 591 requests."""
@@ -124,10 +128,18 @@ class TheVerdictAsksBothBoundsOnTheirOwnBase(CustomTestCase):
                                 SB5F_CARRIER_MAX, carrier_exact=False)
         exact = serviceable_route(SB5F_UNCACHED, SB5F_CARRIER_EST, SB5F_X,
                                   SB5F_CARRIER_MAX, carrier_exact=True)
+        # #1317 (operator decision 2026-09-10 #1317, law-4 named deviation. sb5f arithmetic: uncached 22200 > X 12944 AND total 28000 > carrier_max 27466 -> the front routes carrier_single (W68) and D's X gate answers verdict=exempt_no_carrier_route, so it is PREFILLED DIRECT with no W50 and no requeue. The rule MOVED (the terminal is now the per-request cap 262144); it was not eroded -- the 93/93 x 503 loop this file was written against is closed by the exemption instead of by a 413.)
+        # The round-2 rule STANDS -- an estimate may not terminate -- and is
+        # now stronger: neither figure terminates below the per-request cap.
+        # The two still differ, which is what the rule is about: the exact
+        # count buys the FORCED route (D admitted above X by its exemption),
+        # the estimate keeps the ordinary carrier_single offer.
         self.assertEqual(est, "carrier_single",
                          "an estimated carrier figure must not refuse")
-        self.assertEqual(exact, "none")
+        self.assertEqual(exact, "forced_direct")
         self.assertNotEqual(est, exact)
+        self.assertNotIn("none", (est, exact),
+                         "below the per-request cap nothing is terminal")
 
     def test_the_default_is_the_safe_one(self):
         """`carrier_exact` defaults False: a caller that does not know must
@@ -178,9 +190,14 @@ class NeverRouteToAGroupThatRefusesByConstruction(CustomTestCase):
                                 SB5F_CARRIER_MAX, carrier_exact=True)
         self.assertEqual(old, "carrier_single",
                          "the mutant must reproduce the shipped behaviour")
+        # #1317 (operator decision 2026-09-10 #1317, law-4 named deviation. sb5f arithmetic: uncached 22200 > X 12944 AND total 28000 > carrier_max 27466 -> the front routes carrier_single (W68) and D's X gate answers verdict=exempt_no_carrier_route, so it is PREFILLED DIRECT with no W50 and no requeue. The rule MOVED (the terminal is now the per-request cap 262144); it was not eroded -- the 93/93 x 503 loop this file was written against is closed by the exemption instead of by a 413.)
+        # The mutant's error is UNCHANGED and still caught: it offers D a
+        # prefill D will REFUSE by name. The fix offers D the same prompt as a
+        # FORCED, exempted prefill -- a different verdict from the mutant's,
+        # which is what this assertion pins.
         self.assertNotEqual(new, old,
-                            "the fix must not send this to D at all")
-        self.assertEqual(new, "none")
+                            "the fix must not repeat the mutant's blind offer")
+        self.assertEqual(new, "forced_direct")
 
     def test_mutant_x_alone_would_send_an_over_carrier_request_to_p(self):
         """MUTANT 2, the opposite error: consulting X alone routes a prompt
@@ -193,7 +210,10 @@ class NeverRouteToAGroupThatRefusesByConstruction(CustomTestCase):
         self.assertEqual(
             serviceable_route(SB5F_UNCACHED, SB5F_CARRIER_EST, SB5F_X,
                               SB5F_CARRIER_MAX, carrier_exact=True),
-            "none", "with both bounds consulted, neither route is offered")
+            "forced_direct",
+            "with both bounds consulted the ORDINARY routes are both refused "
+            "and the forced one is named instead -- #1317 (" + "law-4 named "
+            "deviation, operator 2026-09-10)")
 
     def test_mutant_swapping_the_two_bases_changes_the_verdict(self):
         """MUTANT 3 -- ROOT (a) AS AN ASSERTION. Feed each bound the OTHER's
@@ -206,7 +226,8 @@ class NeverRouteToAGroupThatRefusesByConstruction(CustomTestCase):
         self.assertNotEqual(swapped, correct,
                             "if the bases were interchangeable this ticket "
                             "would not exist -- they are not")
-        self.assertEqual(correct, "none")
+        # #1317 (operator decision 2026-09-10 #1317, law-4 named deviation. sb5f arithmetic: uncached 22200 > X 12944 AND total 28000 > carrier_max 27466 -> the front routes carrier_single (W68) and D's X gate answers verdict=exempt_no_carrier_route, so it is PREFILLED DIRECT with no W50 and no requeue. The rule MOVED (the terminal is now the per-request cap 262144); it was not eroded -- the 93/93 x 503 loop this file was written against is closed by the exemption instead of by a 413.)
+        self.assertEqual(correct, "forced_direct")
 
     def test_no_verdict_ever_names_d_when_d_cannot_prefill_it(self):
         """THE PROPERTY, swept rather than sampled. Over a grid that spans
@@ -329,6 +350,13 @@ class TheRouterEndToEnd(CustomTestCase):
         f.exact_tokens = {}
         f.spans = None
         f.queue = []
+        # #1317 (operator decision 2026-09-10 #1317, law-4 named deviation. sb5f arithmetic: uncached 22200 > X 12944 AND total 28000 > carrier_max 27466 -> the front routes carrier_single (W68) and D's X gate answers verdict=exempt_no_carrier_route, so it is PREFILLED DIRECT with no W50 and no requeue. The rule MOVED (the terminal is now the per-request cap 262144); it was not eroded -- the 93/93 x 503 loop this file was written against is closed by the exemption instead of by a 413.)
+        # 0 = no per-request cap = nothing is terminal on that axis, which is
+        # the front's own default. The cap test below sets it explicitly.
+        # Without this attribute `handle_generate` raised AttributeError inside
+        # the async body and surfaced as "retry() exceed maximum retries" --
+        # how this harness gap was found.
+        f.max_kv_per_request = 0
         return f
 
     @staticmethod
@@ -357,18 +385,29 @@ class TheRouterEndToEnd(CustomTestCase):
         except asyncio.TimeoutError:
             return None
 
-    def test_a_no_route_request_gets_413_and_never_touches_the_queue(self):
+    def test_only_above_the_per_request_cap_does_a_413_survive(self):
+        """#1317 (operator decision 2026-09-10, law-4 named deviation).
+
+        THE TERMINAL MOVED. It used to be "over X and over the carrier"; it is
+        now "over the per-request cap", which is a real capacity wall rather
+        than an economic one. sb5f arithmetic: uncached 22200 > X 12944 and
+        total 28000 > carrier_max 27466 -> FORCED direct prefill (D exempts it,
+        no W50, no requeue), so that shape no longer 413s. A prompt above the
+        cap still does, and this pins that the refusal still RETURNS rather
+        than parking, and is still counted exactly once.
+        """
         import hashlib
         f = self._front()
+        f.max_kv_per_request = 262144
+        over_cap = f.max_kv_per_request + 1000
         # A MEASURED carrier figure: only that may terminate. This is the
         # state after D has served (or refused) this text once and
         # `_note_exact` recorded its real prompt_tokens.
-        text = "w" * (SB5F_CARRIER_EST * 3)
-        f.exact_tokens[hashlib.sha1(text.encode()).hexdigest()] = SB5F_CARRIER_EST
-        # Long enough to break the carrier too, priced by the front's own
-        # estimator rather than by a number typed here.
-        resp = self._run(f, {"stream": False},
-                         carrier_chars=SB5F_CARRIER_EST * 3)
+        text = "w" * (over_cap * 3)
+        f.exact_tokens[hashlib.sha1(text.encode()).hexdigest()] = over_cap
+        # Above the per-request cap, priced by the front's own estimator from
+        # the same text rather than by a number typed here.
+        resp = self._run(f, {"stream": False}, carrier_chars=over_cap * 3)
         self.assertIsNotNone(resp, "the refusal must RETURN, not park")
         self.assertEqual(resp.status, 413)
         self.assertEqual(len(f.queue), 0,
@@ -376,6 +415,39 @@ class TheRouterEndToEnd(CustomTestCase):
         self.assertEqual(f.counters["W52_Weg2NoServiceableRoute"], 1)
         self.assertEqual(f.counters["route_carrier_exceeds"], 0,
                          "it must not also be counted as a D route")
+
+    def test_the_band_is_routed_and_never_counted_as_a_refusal(self):
+        """THE LOOP THIS FILE WAS WRITTEN AGAINST, pinned on the new rule.
+
+        #1290's measured harm was not the 413 -- it was the CYCLE: front
+        offers -> D refuses by name (W50) -> front requeues -> flip -> store
+        read refused -> whole prompt uncached -> W50 again, 93 of 93 ending in
+        HTTP 503 after a median 22.0 s with ZERO tokens streamed. #1317 keeps
+        that loop closed by a different mechanism -- D's own
+        `verdict=exempt_no_carrier_route` -- so the guard is on the OUTCOME.
+
+        Asserted at the verdict rather than through `handle_generate`: the
+        forced path continues into the D-seat machinery (`_batch_gate`), which
+        this harness deliberately does not build, and the W50 half of the loop
+        is D's to answer. The D-side guard lives with the exemption itself, in
+        `test_d_xgate_no_carrier_route_1317.py::
+        test_the_sb5f_band_is_exempt_so_no_w50_requeue_cycle_can_start`.
+
+        operator decision 2026-09-10 #1317, law-4 named deviation.
+        """
+        verdict = serviceable_route(SB5F_UNCACHED, SB5F_CARRIER_EST, SB5F_X,
+                                    SB5F_CARRIER_MAX, carrier_exact=True,
+                                    per_request_cap=262144)
+        self.assertEqual(verdict, "forced_direct",
+                         "the band must be ROUTED, not refused")
+        self.assertNotEqual(verdict, "none",
+                            "a 413 here is the pre-#1317 behaviour")
+        # And the terminal that remains is the capacity wall, not this band.
+        self.assertEqual(
+            serviceable_route(SB5F_UNCACHED, 262144 + 1, SB5F_X,
+                              SB5F_CARRIER_MAX, carrier_exact=True,
+                              per_request_cap=262144),
+            "none", "above the per-request cap a refusal must still stand")
 
     def test_a_long_request_is_queued_for_p_and_counted_as_long(self):
         f = self._front()
