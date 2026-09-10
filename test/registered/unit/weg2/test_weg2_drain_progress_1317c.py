@@ -28,7 +28,20 @@ wedge, but a guard talked out of firing -- so the mutants push that way:
       -> test_three_no_progress_windows_still_reach_w2
 """
 
-from sglang.srt.weg2.front import weg2_drain_progress_delta as delta
+
+def delta(before, after):
+    """Imported INSIDE the call on purpose.
+
+    A module-level import of a symbol the parent does not have turns this
+    whole file into ONE collection error, which proves only that the name is
+    missing. Per-test red is the stronger red-first signal: on the parent each
+    assertion below fails on its own, so the tally says how many distinct
+    claims the fix carries.
+    """
+    from sglang.srt.weg2.front import weg2_drain_progress_delta
+
+    return weg2_drain_progress_delta(before, after)
+
 
 # The specimen's own counters, from the D log.
 SN6E_BEFORE = {"gen_tokens_total": 8814, "prefill_tokens_total": 12000,
