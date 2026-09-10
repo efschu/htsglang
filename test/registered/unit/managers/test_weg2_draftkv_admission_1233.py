@@ -179,7 +179,11 @@ class TestAdmissionLines(CustomTestCase):
             draft_worker=object(),
             tree_cache=types.SimpleNamespace(
                 cache_controller=types.SimpleNamespace(
-                    draft_tier_armed=lambda scope: True, draft_cold_spans=spans
+                    draft_tier_armed=lambda scope: True, draft_cold_spans=spans,
+                    # #1317k the DRAFT-WARM line now reads the controller's own
+                    # draft L3 census instead of printing a literal; distinct
+                    # non-zero values so a test cannot pass on a constant.
+                    _draft_l3_hits=8993, _draft_l3_misses=7,
                 )
             ),
             req_to_token_pool=types.SimpleNamespace(req_to_token=torch.zeros(4, 16, dtype=torch.int64)),
@@ -205,7 +209,18 @@ class TestAdmissionLines(CustomTestCase):
                 "zeros are the fill (#993), rounds_owed=1",
                 text,
             )
-            self.assertIn("WEG2 DRAFT-WARM rid=warm pages=9000 miss=0", text)
+            # #1317k `miss=0` USED TO BE A LITERAL IN THE FORMAT STRING, and
+            # this assertion pinned the literal -- so it passed whatever the
+            # read had done, and boot weg2sn6k's acceptance (vi) then read
+            # `pages=28671 miss=0` off it as evidence that no draft page was
+            # missing. The line now carries the controller's own draft L3
+            # census, and BOTH of these assert a value that came from the
+            # stand-in rather than from the format string: a re-literalised
+            # emitter fails here.
+            self.assertIn("WEG2 DRAFT-WARM rid=warm pages=9000", text)
+            self.assertIn("draft_l3_hits=8993", text)
+            self.assertIn("draft_l3_misses=7", text)
+            self.assertNotIn("miss=0", text)
             self.assertNotIn("rid=fresh", text)
             self.assertIn("ADMISSION draft-cold: 1 request(s) marked", text)  # the denominator stays
             # a chunked prefill's later visit prints neither line again
