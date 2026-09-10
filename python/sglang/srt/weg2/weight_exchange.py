@@ -1823,12 +1823,12 @@ class Weg2XchgRunnerShapeUnknown(RuntimeError):
     paused, never exchanged, permanently resident, no refusal names it), and
     guessing PRIMARY puts unsourced bytes into it (W74).
 
-    W76 is free per the spec section 7 census (highest assigned W84, this
+    W76 is free per the spec section 7 census (highest assigned W67, this
     branch) and per ``test_weg2_wcode_uniqueness_1263``.
 
     RENUMBERED BY THE serve-next5 REPLAY (2026-09-09): this branch enumerated
     its codes against base ``3ea18deb95`` (census maximum W50); the serve line
-    had since claimed W51-W66, so all 16 moved to W84-W82 -- the first free
+    had since claimed W51-W66, so all 16 moved to W67-W82 -- the first free
     numbers above the MERGED maximum -- with the exception NAMES unchanged.
     The argument below is the ORIGINAL enumeration and is kept as the reason
     the number was enumerated, not as the derivation of today's number.

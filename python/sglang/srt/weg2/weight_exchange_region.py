@@ -79,7 +79,7 @@ performs over its own ROOTS returns W50 as the highest assigned code.
 RENUMBERED BY THE serve-next5 REPLAY (2026-09-09): W53/W54 here became W68/W69
 with the other fourteen, because the serve line had claimed W51-W66 while this
 branch was cut.  The W50 maximum quoted above is this branch's OWN base; the
-merged maximum is W66 and W84-W82 are what the enumeration returns on it.
+merged maximum is W66 and W67-W82 are what the enumeration returns on it.
 
 LAYOUT (spec S3, with the deviations stated where they occur)::
 

@@ -432,7 +432,7 @@ ONCARD_STATE_FAILED = 4
 
 # ---------------------------------------------------------------------------
 # ---------------------------------------------------------------------------
-# RENUMBERED W51-W66 -> W84-W82 BY THE serve-next5 REPLAY (2026-09-09, #1273
+# RENUMBERED W51-W66 -> W67-W82 BY THE serve-next5 REPLAY (2026-09-09, #1273
 # on `weg2/xchg-S6-sn5-0909`).  Every number this branch enumerated was free on
 # its own base `3ea18deb95`, whose census maximum is W50 -- and every one of
 # them had been claimed on the serve line in the meantime (W51 host-ring, W52
@@ -446,7 +446,7 @@ ONCARD_STATE_FAILED = 4
 # rather than picked, not because its arithmetic names today's number.
 # ---------------------------------------------------------------------------
 # Refusals.  W70 and W72 -- the two codes section 7 assigns to this slice, and
-# the two still free in the branch census at 2ee844f7b8 (W84, W68, W69, W71,
+# the two still free in the branch census at 2ee844f7b8 (W67, W68, W69, W71,
 # W74 and W76 are held by S1/S2/S3/S7; W73 and W75 are S6's and S5's).
 # ---------------------------------------------------------------------------
 
@@ -481,7 +481,7 @@ class Weg2XchgDepositUnfundable(RuntimeError):
 
     RENUMBERED BY THE serve-next5 REPLAY (2026-09-09): this branch enumerated
     its codes against base ``3ea18deb95`` (census maximum W50); the serve line
-    had since claimed W51-W66, so all 16 moved to W84-W82 -- the first free
+    had since claimed W51-W66, so all 16 moved to W67-W82 -- the first free
     numbers above the MERGED maximum -- with the exception NAMES unchanged.
     The argument below is the ORIGINAL enumeration and is kept as the reason
     the number was enumerated, not as the derivation of today's number.
@@ -1108,7 +1108,7 @@ def verify_sem_arm(sems: SemSet, *, leg: int, epoch: str,
     """Check all 24 counts at the start of a leg.  REFUSE, never repair.
 
     TODO(S6): call this from ``begin_flip``'s caller -- the RPC preamble, where
-    every other derivable refusal already lands (spec 3.6: W84/W68/W71/W74 are
+    every other derivable refusal already lands (spec 3.6: W67/W68/W71/W74 are
     raised BEFORE the first ``resume``, so a refusal costs nothing).  S5 owns
     the check and its proof; S6 owns the call site, because S6 is what creates
     the situation this detects (a flip that rolls forward past gate 1).

@@ -751,7 +751,7 @@ def resolve_pool_floor(
       a number yet.  It is READ OFF THIS BOOT'S OWN FRONTIER by the solver as
       the priced pool of the ordered cut (#1305,
       ``pp_cut_launch.derive_pool_floor_from_cut``), and the solver refuses by
-      name (``W84``) when that cut is not on the frontier.  The numeric line
+      name (``W67``) when that cut is not on the frontier.  The numeric line
       is therefore logged AFTER the solve (:func:`pool_floor_line`); this
       function only states the rule, so a refusal inside the solve still has
       the source on the record above it.  The previous form -- a constant
@@ -782,7 +782,7 @@ def resolve_pool_floor(
             f"below as the priced pool of {cut_s} (#1305: no constant, no interval, "
             f"no midpoint -- a number typed here drifted off a moved frontier on boot "
             f"weg2sn5pre); the cut stays solver-chosen, the floor only bounds the "
-            f"pool. Not on the frontier = W84 refusal, never a neighbour. "
+            f"pool. Not on the frontier = W67 refusal, never a neighbour. "
             f"--pp-solve-pool-floor N overrides, 0 turns it off"
         )
     if int(override) <= 0:
@@ -7507,7 +7507,7 @@ def solve_p_cut(
         pool_floor=pool_floor,
         pool_floor_from_cut=pool_floor_from_cut,
     )
-    # #1305: THE NUMBER, now that the frontier exists.  A W84/W40 raised by
+    # #1305: THE NUMBER, now that the frontier exists.  A W67/W40 raised by
     # the solve above carries the cut and the floor in its own text.
     log(pool_floor_line(decision))
     log(
@@ -8196,7 +8196,7 @@ def build_parser() -> argparse.ArgumentParser:
              "BOOT'S OWN FRONTIER as that cut's priced pool (#1305), so "
              "'fastest above F' selects it exactly and the floor cannot drift "
              "off a moved frontier the way a typed constant did on boot "
-             "weg2sn5pre; a cut that is not on the frontier is a W84 refusal, "
+             "weg2sn5pre; a cut that is not on the frontier is a W67 refusal, "
              "never a neighbour -- the cut stays SOLVED, "
              "this only bounds the pool. PASS 0 to turn the floor OFF and get "
              "the pre-#1286b behaviour exactly: the objective then ranks over "
