@@ -293,13 +293,21 @@ def test_design_a_added_no_collective():
 def test_the_store_arm_slice_width_is_checked_before_it_is_priced():
     """A slice of the wrong width would read another arm's numbers as store
     depths -- and THIS arm admits work, so a foreign number admits a prefill
-    the group cannot serve. That must stop the group by name."""
+    the group cannot serve. That must stop the group by name.
+
+    THE NUMBER IS W86, NOT THE NEXT ONE UP. W38 is already taken (retired
+    `#1234 W38 Weg2CarrierlessPpStoreRead`, still in the census) and
+    `test_weg2_wcode_uniqueness_1263` asserts W39 free. The registry's own
+    rule is "the first free number above the highest assigned code" -- that
+    is W68 here -- but the in-flight xchg candidate recorded in BOOT_QUEUE
+    claims the W69-W85 band, so W86/W87 are the first pair that collide with
+    neither census at merge."""
     import inspect
 
     from sglang.srt.managers.scheduler import Scheduler
 
     src = inspect.getsource(Scheduler._update_uniform_pool_budget)
-    assert "W38 X-STORE LAYOUT STOP" in src
+    assert "W86 Weg2XStoreLayoutStop" in src
     assert "_xstore_at" in src
 
 
@@ -344,6 +352,6 @@ def test_the_pin_flag_prices_and_refuses_by_name():
     from sglang.srt.weg2 import launcher
 
     src = inspect.getsource(launcher.choose_host_ledger)
-    assert "W39 Weg2PinnedArmRefused" in src
+    assert "W87 Weg2PinnedArmRefused" in src
     assert "host_ledger.price(" in src
     assert "fundable_moments" in src

@@ -3897,7 +3897,7 @@ def choose_host_ledger(
         )
         if not pinned.fundable_moments:
             raise host_ledger.Weg2HostLedgerRefused(
-                f"W39 Weg2PinnedArmRefused: --pin-ledger-arm-m {int(pin_m_mib)} "
+                f"W87 Weg2PinnedArmRefused: --pin-ledger-arm-m {int(pin_m_mib)} "
                 f"prices S=1 M={int(pin_m_mib)} at launch "
                 f"{pinned.launch_leftover_gib:.2f} GiB / run "
                 f"{pinned.run_leftover_gib:.2f} GiB, and it is not fundable at "

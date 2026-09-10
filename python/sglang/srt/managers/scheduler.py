@@ -7354,7 +7354,7 @@ class Scheduler(
         ].tolist()
         if len(_xstore_lens) != tp_head_congruence.TP_HEAD_SLOTS:
             raise RuntimeError(
-                "#1317 W38 X-STORE LAYOUT STOP: the reduced payload carries no "
+                "#1317 W86 Weg2XStoreLayoutStop: the reduced payload carries no "
                 f"store-match slice (head={_xstore_at}, "
                 f"expected={tp_head_congruence.TP_HEAD_SLOTS}, "
                 f"available={len(vals) - _xstore_at}). Pricing the uncached "
