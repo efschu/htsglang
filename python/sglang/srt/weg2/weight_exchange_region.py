@@ -364,6 +364,27 @@ def row_group_rank(row: int) -> Tuple[str, int]:
     return ("P" if int(row) < N_CARDS else "D", int(row) % N_CARDS)
 
 
+class Weg2XchgDiagonalHasNoCrossPair(ValueError):
+    """W15. A DIAGONAL request reached a CROSS-ONLY site. #1334.
+
+    BOOT weg2xsn9 (2026-09-11) died 36 times on the bare form of this: the
+    ``host`` arm's on-card lane is store-and-forward, the store-and-forward
+    path asked for a staging slot, and :data:`CROSS_PAIRS` has no diagonal by
+    construction -- so ``CROSS_PAIRS[int(pair)]`` in :func:`sem_name` raised an
+    ``IndexError`` with no message and no site, on every leg of every flip,
+    while an observer that never re-raises left ``Traceback`` at 0 in both
+    groups' logs.
+
+    THE FIX IS NOT A SEVENTH CROSS PAIR (operator ruling, plan AMENDMENT 5).
+    The diagonal keeps its OWN carrier -- the per-card file
+    ``oncard-<card>.bin`` that :func:`weight_exchange_transport.oncard_host_path`
+    already defines -- and its OWN per-card semaphores beside the 24 cross
+    ones. This class is what a cross-only site raises when a diagonal id
+    reaches it anyway: the next reader lands on the mechanism instead of on a
+    subscript.
+    """
+
+
 def pair_id(src_card: int, dst_card: int) -> int:
     """Index of the directed cross-card pair ``src_card -> dst_card``."""
     try:
@@ -1583,8 +1604,67 @@ def sem_name(boot_nonce: str, pair: int, slot: int, kind: str) -> str:
     """
     if kind not in ("empty", "full"):
         raise ValueError(f"kind must be 'empty' or 'full', not {kind!r}")
+    # #1334: BOUNDS-CHECKED, AND THE REFUSAL NAMES THE MECHANISM.  The bare
+    # subscript below is what boot weg2xsn9 reported 36 times as a naked
+    # `IndexError`; a diagonal lane has no cross pair and must be told so.
+    if not 0 <= int(pair) < N_PAIRS:
+        raise Weg2XchgDiagonalHasNoCrossPair(
+            f"W15 Weg2XchgDiagonalHasNoCrossPair: pair={int(pair)} is not one "
+            f"of the {N_PAIRS} directed CROSS pairs {CROSS_PAIRS}. The on-card "
+            f"DIAGONAL lane has no cross pair by construction and never takes "
+            f"a staging slot: its carrier is the per-card file "
+            f"oncard-<card>.bin and its handshake is "
+            f"diagonal_sem_name(boot, card, slot, kind), beside these 24 and "
+            f"never inside them. A caller that reached this site with a "
+            f"diagonal id is asking the cross lane for a slot the diagonal "
+            f"does not have"
+        )
     src, dst = CROSS_PAIRS[int(pair)]
     return f"/{REGION_PREFIX}{boot_nonce}-{src}-{dst}-{int(slot)}-{kind}"
+
+
+def diagonal_sem_name(boot_nonce: str, card: int, slot: int, kind: str) -> str:
+    """The DIAGONAL lane's own semaphore name, keyed by CARD (#1334).
+
+    ``card`` and not a pair index: the diagonal is one card talking to itself
+    (the co-located pair of ranks), so there is no direction to encode and a
+    pair id would be exactly the fiction that produced weg2xsn9's IndexError.
+    The ``card`` infix keeps these names DISJOINT from the 24 cross ones, which
+    matters because :func:`create_semaphores` unlinks before it creates: a
+    colliding name would destroy a live cross handshake while arming a
+    diagonal one.
+    """
+    if kind not in ("empty", "full"):
+        raise ValueError(f"kind must be 'empty' or 'full', not {kind!r}")
+    if not 0 <= int(card) < N_CARDS:
+        raise ValueError(
+            f"card={card!r} is not one of this rig's {N_CARDS} cards")
+    if not 0 <= int(slot) < SLOTS_PER_PAIR:
+        raise ValueError(
+            f"slot={slot!r} exceeds SLOTS_PER_PAIR={SLOTS_PER_PAIR}; the "
+            f"diagonal carrier is sized for exactly that many slots and a "
+            f"third would be a slot nothing charged for")
+    return (f"/{REGION_PREFIX}{boot_nonce}-card{int(card)}-{int(slot)}-{kind}")
+
+
+def all_diagonal_sem_names(boot_nonce: str) -> List[str]:
+    """All diagonal semaphores: N_CARDS x SLOTS_PER_PAIR x {empty, full}."""
+    return [
+        diagonal_sem_name(boot_nonce, card, slot, kind)
+        for card in range(N_CARDS)
+        for slot in range(SLOTS_PER_PAIR)
+        for kind in ("empty", "full")
+    ]
+
+
+def all_region_sem_names(boot_nonce: str) -> List[str]:
+    """THE WHOLE CENSUS the launcher arms: the 24 cross PLUS the diagonals.
+
+    One function, so "all of them" has a single producer.  The two halves stay
+    separately addressable (``all_sem_names`` is still the six pairs' 24) --
+    what must never happen again is a lane whose handshake nobody created.
+    """
+    return all_sem_names(boot_nonce) + all_diagonal_sem_names(boot_nonce)
 
 
 def all_sem_names(boot_nonce: str) -> List[str]:
@@ -1626,7 +1706,12 @@ def create_semaphores(boot_nonce: str) -> List[str]:
     this slice creates and destroys the names and nothing else.
     """
     lib = _libc()
-    names = all_sem_names(boot_nonce)
+    # #1334: THE WHOLE CENSUS, cross AND diagonal.  A lane whose
+    # handshake nobody creates is the defect this commit closes; the
+    # launcher calls this once before either group starts, so the
+    # diagonal's per-card semaphores are armed in the same breath as
+    # the 24 cross ones and by the same single producer.
+    names = all_region_sem_names(boot_nonce)
     for name in names:
         lib.sem_unlink(name.encode("ascii"))
     made: List[str] = []
@@ -1655,7 +1740,7 @@ def unlink_semaphores(boot_nonce: str) -> int:
     """
     lib = _libc()
     gone = 0
-    for name in all_sem_names(boot_nonce):
+    for name in all_region_sem_names(boot_nonce):
         ctypes.set_errno(0)
         if lib.sem_unlink(name.encode("ascii")) == 0:
             gone += 1

@@ -2407,6 +2407,35 @@ class OnCardBounce:
         self.ops.raw_free(self.ptr)
 
 
+def diagonal_carrier_bytes(*, slot_bytes: int) -> int:
+    """The per-card diagonal carrier's size: ``SLOTS_PER_PAIR x slot_bytes``. #1334.
+
+    SIZED FROM THE ONE PUBLISHED SLOT, which is plan AMENDMENT 5's ruling in a
+    function: ``--weg2-xchg-oncard-slot-mib`` (flag default 128) is the value
+    the ARM line charges as staging (``N_CARDS x SLOTS_PER_PAIR x slot``), so
+    the carrier is the per-card share of exactly that term. Boot weg2xsn9
+    printed `slot_mib=128` on the ledger line while its leg planned a 32 MiB
+    slot -- one payload must not have two sizes, and the published one wins
+    because it is the one that was charged.
+
+    NEVER SIZED UP. A plan needing more than :data:`xr.SLOTS_PER_PAIR` batches
+    is refused by name (:data:`DEPOSIT_REASON_BATCHES`) rather than served by a
+    bigger file: the deposit's precondition is one slot per batch, and growing
+    the file to fit would make that precondition depend on a number nobody
+    charged for.
+    """
+    validated = validate_oncard_slot_mib(int(slot_bytes) // xr.MIB)
+    if validated * xr.MIB != int(slot_bytes):
+        raise Weg2XchgOncardSlotRefused(
+            f"slot_bytes={int(slot_bytes)} is not a whole number of MiB; the "
+            f"published slot is a MiB value (--weg2-xchg-oncard-slot-mib) and "
+            f"the carrier is SLOTS_PER_PAIR x it, so a byte count that does "
+            f"not round-trip would size the file from a different number than "
+            f"the ledger charged"
+        )
+    return int(xr.SLOTS_PER_PAIR) * validated * xr.MIB
+
+
 def oncard_host_path(boot_nonce: str, card: int, shm_root: str = xr.SHM_ROOT) -> str:
     """The degrade lane's per-card bounce file.
 
@@ -2418,14 +2447,26 @@ def oncard_host_path(boot_nonce: str, card: int, shm_root: str = xr.SHM_ROOT) ->
     created only when the degrade is armed, and it joins the same residue sweep
     as the region because it lives under the same boot directory.
 
-    CLOSED, and by a ledger term rather than by a comment (S6): the degrade's
-    host bytes are :data:`ONCARD_HOST_DEGRADE_MIB` at the shape's CEILING --
-    one file per card, :data:`ONCARD_DEPOSIT_BYTES_MAX` each -- and
-    ``host_ledger.xchg_bounce_bytes`` charges exactly that at both the launch
-    and the run moment, on the ``host`` arm and only there.  Spec 0.2's 0.38
-    GiB staging term still does not carry it and spec 3.7 still prices the
-    degrade in WALL (+0.49 s on the x4 card) and not in host; the term above is
-    what makes the reap bound see it.
+    CLOSED BY THE BOUNCE TERM, and the CEILING it used to be charged at is
+    RETIRED (plan AMENDMENT 5, 2026-09-11).  The host bytes of this file are
+    ``SLOTS_PER_PAIR x the PUBLISHED slot`` -- see
+    :func:`diagonal_carrier_bytes` -- and the ledger charges the group-wide sum
+    of exactly that as the bounce's staging half
+    (``N_CARDS x SLOTS_PER_PAIR x slot_bytes``, printed on the ARM line as
+    ``path_a_staging_mib`` beside ``xchg_bounce``).  The old yardstick
+    ``ONCARD_SLOTS_MAX x ONCARD_SLOT_BYTES_MAX`` = 8 x 128 MiB per card
+    (``host_ledger.xchg_bounce_bytes``) priced a shape this lane may not take:
+    a plan needing more than ``SLOTS_PER_PAIR`` batches is REFUSED
+    (:data:`DEPOSIT_REASON_BATCHES`), so eight slots could never be filled and
+    charging for them made every host-arm boot pessimistic by 862 MiB at the
+    ceiling.  ONE payload, ONE term, ONE yardstick.
+
+    THE DIAGONAL'S HANDSHAKE IS ITS OWN TOO (#1334): per-card semaphores from
+    ``xr.diagonal_sem_name``, created with the 24 cross ones by
+    ``xr.create_semaphores`` and disjoint from them by name.  Boot weg2xsn9
+    died 36 times because this lane had a carrier and NO handshake, so the
+    store-and-forward path asked the cross lane for a staging slot and
+    ``CROSS_PAIRS[pair]`` indexed out of range.
 
     THE FILE OUTLIVES THE LEG THAT WROTE IT.  :meth:`HostBounce.close` does not
     unlink -- that is what a store-and-forward deposit is -- so the bytes are

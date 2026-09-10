@@ -2091,7 +2091,16 @@ def shadow_transport(
         raise
     except BaseException as exc:  # noqa: BLE001 -- an observer never raises
         result.counters.errors.append(f"{type(exc).__name__}: {exc}")
-        result.reason = f"transport-failed:{type(exc).__name__}"
+        # #1334: THE TYPE ALONE IS A HINT, NOT A FINDING -- #1328's lesson,
+        # which was applied to the manifest and derivation arms and NOT to this
+        # one.  Boot weg2xsn9 (2026-09-11, the first boot whose on-card lane
+        # ever armed) reported `transport-failed:IndexError` on 18 legs of P
+        # and 18 of D, with `Traceback` 0 in both groups because an observer
+        # never raises -- so the whole log said "IndexError" and could not say
+        # WHICH index.  Three windows were spent on exactly that shape on the
+        # other two arms (xsn5/xsn6/xsn7).  The reason field now carries the
+        # message and the raising SITE on the same grep-able line.
+        result.reason = f"transport-failed:{exc_note(exc)}"
         result.ran = False
         # THE BLOCK IS PRICED ON THE PATH WHERE IT MATTERS MOST.  A leg that
         # died in its drain is a leg that waited out its whole budget, and
@@ -2572,6 +2581,40 @@ def hop_refusal_message(*, card: str, priced_ms: float, bound_ms: float,
         + f"-- the shadow does not run on this leg; the flip is untouched and "
         f"the ring remains the only authority for weight bytes"
     )
+
+
+def exc_note(exc: BaseException, *, limit: int = 160) -> str:
+    """``Type: message @ file:line`` for a SWALLOWED exception (#1334, #1328's form).
+
+    The transport arm of this module catches ``BaseException`` -- an observer
+    may not raise into a flip leg -- and returned ``type(exc).__name__`` alone
+    until boot weg2xsn9 proved what that costs: 36 legs reporting
+    ``transport-failed:IndexError`` with no message, no site and no traceback
+    anywhere in either group's log, because nothing re-raises.
+
+    The last frame of the exception's OWN traceback is the site that raised,
+    which is the one fact a type cannot carry. Bounded and newline-free so it
+    stays ONE field on an existing line, and defensive throughout: an
+    instrument that raises while describing a failure replaces the finding with
+    its own. Deliberately a duplicate of ``weight_updater._weg2_exc_note``'s
+    SHAPE and not an import of it -- that module pulls the scheduler, and this
+    one is imported by the transport; the two are pinned equal by a test over
+    the same exception rather than by a dependency.
+    """
+    try:
+        import traceback as _tb
+
+        msg = " ".join(str(exc).split())
+        site = ""
+        frames = _tb.extract_tb(exc.__traceback__)
+        if frames:
+            last = frames[-1]
+            site = f" @ {last.filename.rsplit('/', 1)[-1]}:{last.lineno}"
+        note = f"{type(exc).__name__}: {msg}{site}" if msg else (
+            f"{type(exc).__name__}{site}")
+        return note[:int(limit)]
+    except BaseException:  # noqa: BLE001 -- never replace the finding
+        return type(exc).__name__
 
 
 def rank_local_skip_message(*, reason: str, rank: int, leg: int, epoch: str,

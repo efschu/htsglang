@@ -1010,11 +1010,20 @@ def test_semaphores_are_created_and_unlinked():
     names = []
     try:
         names = xr.create_semaphores(boot)
-        assert len(names) == 24, "6 directed pairs x 2 slots x {empty, full}"
-        assert len(set(names)) == 24
+        # #1334: THE CENSUS IS BOTH HALVES NOW, and it is asserted as a SUM of
+        # two named populations rather than as one number -- boot weg2xsn9 died
+        # 36 times on a lane that had a carrier and no handshake, so "how many
+        # semaphores exist" must fail loudly if either half goes missing.
+        n_cross = 24                                    # 6 directed pairs x 2 slots x 2 kinds
+        n_diag = xr.N_CARDS * xr.SLOTS_PER_PAIR * 2     # 3 cards x 2 slots x 2 kinds
+        assert len(names) == n_cross + n_diag, (len(names), n_cross, n_diag)
+        assert len(set(names)) == n_cross + n_diag
+        assert set(names) == set(xr.all_sem_names(boot)) | set(
+            xr.all_diagonal_sem_names(boot))
+        assert len(xr.all_sem_names(boot)) == n_cross, "the cross half is 24"
         for name in names:
             assert os.path.exists(f"/dev/shm/sem.{name.lstrip('/')}"), name
-        assert xr.unlink_semaphores(boot) == 24
+        assert xr.unlink_semaphores(boot) == n_cross + n_diag
         for name in names:
             assert not os.path.exists(f"/dev/shm/sem.{name.lstrip('/')}"), name
         assert xr.unlink_semaphores(boot) == 0, "unlink is idempotent"
@@ -1278,17 +1287,23 @@ def test_prepare_and_teardown_round_trip_the_region_and_the_sems(tmp_path):
     lines = []
     try:
         out = xr.prepare_region(boot, shm_root=shm_root, log=lines.append)
-        assert out["sems"] == 24
+        assert out["sems"] == xr.N_PAIRS * xr.SLOTS_PER_PAIR * 2 + xr.N_CARDS * xr.SLOTS_PER_PAIR * 2
         assert out["env"][xr.ENV_REGION_PATH] == xr.region_path(boot, shm_root)
         assert out["env"][xr.ENV_REGION_BOOT] == boot
         assert os.path.getsize(out["path"]) == xr.REGION_BYTES
         assert lines and lines[0].startswith("WEG2-XCHG-REGION ")
-        assert "sems=24" in lines[0], "the count is read back from the header"
+        # #1334: the header carries the WHOLE census (cross + diagonal),
+        # because that is what `create_semaphores` armed.  A literal 24 would
+        # pin exactly the half boot weg2xsn9's lane did NOT have.
+        n_all = (xr.N_PAIRS * xr.SLOTS_PER_PAIR * 2
+                 + xr.N_CARDS * xr.SLOTS_PER_PAIR * 2)
+        assert f"sems={n_all}" in lines[0], (
+            "the count is read back from the header", lines[0])
         region = xr.XchgRegion.open(out["path"], expect_boot=boot)
         region.close()
     finally:
         removed = xr.teardown_region(boot, shm_root=shm_root, log=lines.append)
-    assert removed == {"sems": 24, "region": 1}
+    assert removed == {"sems": n_all, "region": 1}
     assert not os.path.exists(xr.region_path(boot, shm_root))
     assert any("WEG2-XCHG-TEARDOWN" in line for line in lines)
 
