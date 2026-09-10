@@ -740,29 +740,49 @@ class SchedulerWeightUpdaterManager:
         else:
             logger.warning("%s", census.format_line())
 
-    def _weg2_wake_reload_weights(self) -> None:
-        """The backup-OFF half of the wake, behind the per-group launcher flag.
+    #: The four possible carriers of the weight bytes on a wake.  Module-level
+    #: strings on the class rather than literals at the branches: the seam's
+    #: test substitutes them, and a typo in a literal would silently take the
+    #: `disk` path -- which is the one that costs 12-17 s and puts the dormant
+    #: image back on the disk route the exchange exists to remove.
+    CARRIER_STOCK = "stock"
+    CARRIER_TMS_BACKUP = "tms-backup"
+    CARRIER_EXCHANGE = "exchange"
+    CARRIER_DISK = "disk"
 
-        With ``--enable-weights-cpu-backup`` the TMS restore already carried
-        the bytes (measured 2.08 s / 27 GiB, campaign (a)) and this is a no-op.
-        Without it, ``resume(GPU_MEMORY_TYPE_WEIGHTS)`` recommitted VMM pages
-        whose CONTENT IS UNDEFINED, so the weights are refilled through the
-        upstream ``update_weights_from_disk`` endpoint from the page-cached
-        checkpoint.  No fork loader: the upstream path is the path.
+    def _weg2_wake_weight_carrier(self) -> str:
+        """WHO carries the weight bytes on this wake.  One of four, or W4.
 
-        GATED on ``--enable-memory-saver``.  Without that flag every
-        ``pause()`` was a no-op, so nothing was ever released and there is
-        nothing to refill: a stock resume must be byte-for-byte the upstream
-        path.  Ungated, the ORDINARY upstream RL configuration
-        (``--enable-memory-saver`` alone, both backup flags default False --
-        ``server_args.py:6636`` / ``:6640``) paid a full checkpoint reload on
-        every wake (12.073/14.143/16.749 s measured on this rig, record
-        (S) 2.6), and that reload is not side-effect-free: ``model_runner.py``
-        ``:2866-2872`` rewrites ``self.load_config`` from a bare
-        ``LoadConfig(load_format=...)`` built at ``:2825``, discarding the
-        boot-time ``download_dir`` / ``model_loader_extra_config`` /
-        ``ignore_patterns``, and records a ``model_runner.update_weights``
-        override event for a weights update nobody requested.
+        #1273 S6 step 5.  This is the decision the refill used to make inline,
+        lifted out for the reason #1329 cost three boots in this same file: a
+        decision inside a long method has no executing test, and every test of
+        that slice drove the module functions while the mixin's own methods --
+        the only callers the product has -- had none.
+
+        THE FOUR, and they are mutually exclusive:
+
+        ``stock``       ``--enable-memory-saver`` absent: ``pause()`` was
+                        ``pass``, nothing was released, there is nothing to
+                        refill.  This wins over every other answer -- a stock
+                        resume must be byte-for-byte the upstream path.
+        ``tms-backup``  ``--enable-weights-cpu-backup``: the TMS restore
+                        already carried the bytes (2.08 s / 27 GiB, campaign
+                        (a)).  Wins over ``exchange``: two writers for one
+                        payload is the ein-job-ein-mover defect, and the
+                        exchange would be overwriting bytes already correct.
+        ``exchange``    ``--weg2-weight-source exchange``: the peer group's
+                        live VRAM is the source, through the bounded host
+                        bounce.  The bytes MUST NOT come from disk here.
+        ``disk``        none of the above: the upstream
+                        ``update_weights_from_disk`` path, unchanged, which is
+                        every ordinary RL boot.
+
+        The three W4 refusals are UNCHANGED and stay AHEAD of every answer: an
+        undecidable wake, shards that disagree about the backup, and a separate
+        draft checkpoint.  VRAM has already been mutated by the time this runs,
+        so a wake that cannot be decided refuses rather than guesses -- and a
+        new branch that answered its own question before these checks would
+        turn an undecidable wake into a silent injection.
         """
         server_args = self._weg2_server_args()
         if server_args is None:
@@ -774,9 +794,7 @@ class SchedulerWeightUpdaterManager:
                 "weights."
             )
         if not getattr(server_args, "enable_memory_saver", False):
-            # Stock boot: pause() was `pass`, the pages were never released,
-            # the content is whatever it always was.  Upstream path, untouched.
-            return
+            return self.CARRIER_STOCK
 
         # The backup verdict is NOT `server_args.enable_weights_cpu_backup`
         # alone.  model_runner.py:2342-2344 builds the WEIGHTS region with
@@ -819,7 +837,136 @@ class SchedulerWeightUpdaterManager:
                     "checkpoint needs its own wake leg, which S1 does not build."
                 )
         if main_carried:
+            return self.CARRIER_TMS_BACKUP
+        try:
+            from sglang.srt.weg2 import weight_exchange as wx
+
+            if wx.exchange_armed():
+                return self.CARRIER_EXCHANGE
+        except Exception:  # noqa: BLE001 -- an unreadable arm is not an arm
+            pass
+        return self.CARRIER_DISK
+
+    def _weg2_xchg_inject_weights(self, **kw) -> None:
+        """Fill the remapped weight pages from the PEER GROUP, not from disk.
+
+        #1273 S6 step 5, the authoritative half.  Under ``exchange`` the
+        weights region was opened ``enable_cpu_backup=False``, so the resume
+        recommitted pages whose CONTENT IS UNDEFINED and the ring had nothing
+        to restore -- which is why the only thing that filled them until now
+        was ``update_weights_from_disk`` (12.073/14.143/16.749 s per wake on
+        this rig, and the disk route #1317/#1323/#1325 exists to remove).
+
+        THE TERM IS THE LAUNCHER'S, READ AND NEVER DERIVED.  A rank may not
+        re-run the checkpoint census: that would be a second sizing authority
+        beside ``bounce_terms``, which is the defect class AMENDMENT 5 retired
+        one instance of.  ``xchg_bounce.read_published_terms`` rebuilds the
+        launcher's own priced inputs through the one sizing function, and an
+        ABSENT publication is a REFUSAL rather than a locally chosen size --
+        injecting against a buffer nobody priced is how the reap mark gets
+        crossed by bytes no ledger carries, which
+        ``host-schwelle-nie-uebertreten`` forbids.
+
+        IT RAISES, unlike every shadow hook in this file.  An observer that
+        took a flip down over its own bookkeeping would be wrong; an AUTHORITY
+        that swallowed would serve UNDEFINED WEIGHTS, which is worse than a
+        refusal by exactly the margin this campaign is about.
+        """
+        from sglang.srt.weg2 import xchg_bounce as xb
+
+        terms = xb.read_published_terms()
+        if terms is None:
+            raise Weg2WakeRefused(
+                "W4 Weg2WakeRefused: --weg2-weight-source exchange owns this "
+                f"wake's weight bytes, but {xb.ENV_BOUNCE_TERMS} was not "
+                "published, so the bounce geometry the injection needs was "
+                "never priced by the launcher. Refusing rather than sizing a "
+                "pinned host buffer locally: the resume has already remapped "
+                "the weight pages and their content is undefined, so serving "
+                "is not an option either. Launch through the weg2 launcher, "
+                "which publishes the term it charged on the ARM line."
+            )
+        self._weg2_xchg_inject_from_peer(terms=terms, **kw)
+
+    def _weg2_xchg_inject_from_peer(self, *, terms, **kw) -> None:
+        """The transfer itself, once the term is known.
+
+        SEPARATE FROM THE DECISION ABOVE so the seam's test can drive the
+        decision without a device, and so the transport work has one entry
+        point.  It delegates to the two legs built in B2/B3
+        (:meth:`_weg2_xchg_agreed_leg` for the byte-identical pieces,
+        :meth:`_weg2_xchg_bounce_leg` for everything else).
+
+        NOT YET REACHABLE ON THE METAL, and it says so rather than pretending:
+        the plan provider has no registrant (``weight_exchange.py``'s
+        ``TODO(S6)``: under ``exchange`` every rank votes ``ok=False`` with
+        ``NO_PLAN_REASON``), and the on-card diagonal lane is being fixed by
+        the boot seat this cycle after XSN9 died on ``pair_id(c, c)``.  Until a
+        plan reaches this method there is nothing to inject, and the honest
+        answer is a REFUSAL naming the missing producer -- not a silent return,
+        which would leave the model serving whatever the remap left behind.
+        """
+        raise Weg2WakeRefused(
+            "W4 Weg2WakeRefused: the exchange owns this wake's weight bytes "
+            f"and the launcher priced its bounce ({terms.total_bytes} B, "
+            f"{terms.expression()}), but no weight-exchange PLAN reached this "
+            "rank, so there is nothing to inject. The plan provider has no "
+            "registrant yet (weight_exchange.register_plan_provider, TODO(S6)) "
+            "and under `exchange` every rank votes ok=False with NO_PLAN_REASON "
+            "by design. Refusing: the resume has already remapped the weight "
+            "pages with UNDEFINED CONTENT, so returning would serve garbage "
+            "and falling back to the disk refill would silently restore the "
+            "very route this arm exists to remove. Boot with "
+            "--weg2-weight-source shadow or ring until the plan is wired."
+        )
+
+    def _weg2_wake_reload_weights(self) -> None:
+        """Fill the weight pages the resume recommitted, by whatever carries them.
+
+        A ROUTER SINCE #1273 S6 step 5, not a decider: it asks
+        :meth:`_weg2_wake_weight_carrier` and obeys the answer.  It used to
+        read the flags itself, and the whole reason it no longer does is that
+        the exchange arm needs a THIRD answer -- inject from the peer group --
+        and a second reading of the flags at a second call site is how two
+        answers to one question start to diverge (`ein-job-ein-mover`).
+        `test_the_refill_asks_the_decision_and_does_not_re_read_the_flags`
+        pins that by substitution: it forces the decision to say `tms-backup`
+        on a configuration whose raw flags say `disk`, and a refill that
+        re-read the flags would reload.
+
+        With ``--enable-weights-cpu-backup`` the TMS restore already carried
+        the bytes (measured 2.08 s / 27 GiB, campaign (a)) and this is a no-op.
+        Without it, ``resume(GPU_MEMORY_TYPE_WEIGHTS)`` recommitted VMM pages
+        whose CONTENT IS UNDEFINED, so the weights are refilled through the
+        upstream ``update_weights_from_disk`` endpoint from the page-cached
+        checkpoint.  No fork loader: the upstream path is the path.  Under
+        ``--weg2-weight-source exchange`` neither applies and the peer group's
+        live VRAM is the source (:meth:`_weg2_xchg_inject_weights`).
+
+        GATED on ``--enable-memory-saver``.  Without that flag every
+        ``pause()`` was a no-op, so nothing was ever released and there is
+        nothing to refill: a stock resume must be byte-for-byte the upstream
+        path.  Ungated, the ORDINARY upstream RL configuration
+        (``--enable-memory-saver`` alone, both backup flags default False --
+        ``server_args.py:6636`` / ``:6640``) paid a full checkpoint reload on
+        every wake (12.073/14.143/16.749 s measured on this rig, record
+        (S) 2.6), and that reload is not side-effect-free: ``model_runner.py``
+        ``:2866-2872`` rewrites ``self.load_config`` from a bare
+        ``LoadConfig(load_format=...)`` built at ``:2825``, discarding the
+        boot-time ``download_dir`` / ``model_loader_extra_config`` /
+        ``ignore_patterns``, and records a ``model_runner.update_weights``
+        override event for a weights update nobody requested.
+        """
+        carrier = self._weg2_wake_weight_carrier()
+        if carrier in (self.CARRIER_STOCK, self.CARRIER_TMS_BACKUP):
+            # Nothing to refill: either pause() never released, or the TMS
+            # restore already wrote every byte.  A second writer here would be
+            # the ein-job-ein-mover defect.
             return
+        if carrier == self.CARRIER_EXCHANGE:
+            self._weg2_xchg_inject_weights()
+            return
+        server_args = self._weg2_server_args()
 
         # W4, BEFORE anything is locked, entered or mutated: on a quantized
         # checkpoint the refill below is not a defined operation, because
@@ -1970,7 +2117,7 @@ class SchedulerWeightUpdaterManager:
     def _weg2_shadow_host_budget(self) -> int:
         """One card's charged deposit budget, in bytes, or 0 (#1273 S6).
 
-        ONE READER OF ONE NUMBER.  ``host_ledger.xchg_bounce_bytes_per_card``
+        ONE READER OF ONE NUMBER.  ``xchg_bounce.staging_bytes_per_card``
         is the same function the launcher's ARM line charges with, so the
         budget a rank enforces and the term the ledger carries are the same
         arithmetic rather than two copies of it.  Zero on any failure, and zero
@@ -1989,13 +2136,29 @@ class SchedulerWeightUpdaterManager:
         below is no longer the only path to 0: ``ipc`` reaches it by design.
         """
         try:
-            from sglang.srt.weg2 import host_ledger as hl
             from sglang.srt.weg2 import weight_exchange_shadow as wxs
             from sglang.srt.weg2 import weight_exchange_transport as tp
+            from sglang.srt.weg2 import xchg_bounce as xb
 
             if wxs.resolve_shadow_oncard_mode() != tp.ONCARD_MODE_HOST:
                 return 0
-            return int(hl.xchg_bounce_bytes_per_card())
+            # AMENDMENT 5: the PUBLISHED SLOT, not the retired ceiling.  This
+            # read `host_ledger.xchg_bounce_bytes_per_card()` -- the S6b
+            # deposit's `ONCARD_SLOTS_MAX 8 x ONCARD_SLOT_BYTES_MAX` -- while
+            # the ledger charged `SLOTS_PER_PAIR 2 x slot_bytes`, so the budget
+            # a rank enforced and the term that was paid for disagreed by 4x on
+            # ONE payload.  Both functions are now deleted and the arithmetic
+            # has a single owner (`xchg_bounce.staging_bytes_per_card`).
+            #
+            # `tp.ONCARD_SLOT_BYTES_MAX` is the LAUNCHER'S PUBLISHED VALUE
+            # despite its name: it resolves `ENV_ONCARD_SLOT_MIB` at import
+            # (`_resolve_oncard_slot_bytes_max`), which is exactly the
+            # `--weg2-xchg-oncard-slot-mib` the launcher parsed and published,
+            # and it is the same number the ARM line printed as `slot_mib=`.
+            # Under S6-BOUNCE it is not a ceiling but THE slot: a plan needing
+            # more than `SLOTS_PER_PAIR` batches per leg is refused by name
+            # (`DEPOSIT_REASON_BATCHES`), never sized up.
+            return int(xb.staging_bytes_per_card(tp.ONCARD_SLOT_BYTES_MAX))
         except Exception:  # noqa: BLE001 -- an observer never raises
             return 0
 

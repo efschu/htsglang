@@ -1209,80 +1209,27 @@ def _arm_s_d(arm) -> str:
     v = (getattr(arm, "terms", None) or {}).get("s_gb_d")
     return "=S" if v is None else str(int(v))
 
-def xchg_bounce_bytes_per_card(slots: Optional[int] = None,
-                               slot_bytes: Optional[int] = None) -> int:
-    """ONE card's store-and-forward deposit on the host, in bytes (#1273 S6).
-
-    THE EXCHANGE'S OWN CARRIER, PRICED.  The on-card lane's ``host`` arm keeps
-    its bounce in ``/dev/shm`` (``oncard_host_path``), ``cudaHostRegister``ed,
-    and S6 sizes it ``slots >= batches`` so the source can deposit and return
-    without a live consumer.  Those are pinned, non-reclaimable bytes that land
-    directly on ``memory.current`` for the span of a flip, and until this
-    function existed they appeared in NO ledger term -- the omission is named
-    verbatim in ``oncard_host_path``'s own docstring ("192 MiB of host that
-    spec 0.2's ledger term does NOT carry ... the number belongs in the
-    record").
-
-    ``kv-1m-kein-lossy-kein-hostram`` is about KV and does not reach here: this
-    is the exchange's own carrier, not hot KV parked in host RAM.  What DOES
-    reach here is ``host-schwelle-nie-uebertreten`` -- which is exactly why the
-    bytes become a TERM (so the reap bound sees them and the store shrinks by
-    them) instead of a note.
-
-    IT IS NOT "FOR THE SPAN OF A FLIP", AND THE EARLIER WORDING WAS WRONG (S6
-    refuter, finding 9).  ``HostBounce.close`` deliberately does not unlink, so
-    a deposited file lives until the boot's ``/dev/shm`` residue sweep -- which
-    is what makes the destination's later leg able to read it, and what makes
-    charging the bytes at BOTH the launch and the run moment correct rather
-    than conservative.
-
-    THE GEOMETRY IS READ FROM ITS OWNER, and now actually is (S6 refuter,
-    must_fix 3).  This read ``ONCARD_SLOTS_MAX x ONCARD_SLOT_BYTES`` -- the
-    slot count's CEILING beside the slot size's FLOOR -- while claiming to read
-    the owner's bound, and understated the shape's maximum by 4x: 8 x 32 MiB =
-    256 MiB against the 8 x 128 MiB the planner may actually derive
-    (``plan_oncard_slot_bytes`` clamps to ``ONCARD_SLOT_BYTES_MAX``).  The
-    consequence was not an overspend but a systematic FALSE REFUSAL, because
-    ``deposit_refusal_reason`` grades the deposit against this same number: a
-    per-card diagonal above ~256 MiB refused ``ledger-cannot-fund-deposit`` --
-    exactly the band the geometry exists for.  The owner's own name for the
-    bound is :data:`tp.ONCARD_DEPOSIT_BYTES_MAX`, and this reads THAT.
-
-    The worst case is charged, not the case a particular flip happens to
-    derive, because the arm is chosen once at launch and the derivation runs
-    per leg -- a charge that tracked the derivation would fund the smallest
-    flip and refuse none.
-    """
-    from sglang.srt.weg2 import weight_exchange_transport as tp
-
-    if slots is None and slot_bytes is None:
-        return int(tp.ONCARD_DEPOSIT_BYTES_MAX)
-    return (int(tp.ONCARD_SLOTS_MAX if slots is None else slots)
-            * int(tp.ONCARD_SLOT_BYTES_MAX if slot_bytes is None else slot_bytes))
-
-
-def xchg_bounce_bytes(cards: Optional[int] = None,
-                      slot_bytes: Optional[int] = None) -> int:
-    """Every card's deposit -- the term :func:`charge_terms` carries.
-
-    ``cards`` DEFAULTED TO A TYPED ``3`` (S6 refuter, finding 6): a hand number
-    at the one call site, derived from nothing, in a module whose whole subject
-    is numbers with provenance.  It now comes from the region's own rank
-    layout -- one bounce file per CARD, and a card is a co-located pair of the
-    six rows -- which is the same arithmetic
-    :data:`tp.ONCARD_HOST_DEGRADE_MIB` announces the degrade with.
-    """
-    from sglang.srt.weg2 import weight_exchange_region as xr_
-
-    if cards is None:
-        cards = int(xr_.N_RANKS) // 2
-    # S6 fix E: ``slot_bytes`` is the launcher passing the value of
-    # ``--weg2-xchg-oncard-slot-mib`` it parsed, because ITS process imported
-    # the transport before that flag existed in any environment.  ``None`` is
-    # the rank path, where the module constant already resolved from the
-    # published env.  One arithmetic function, two ways in.
-    return max(0, int(cards)) * xchg_bounce_bytes_per_card(
-        slot_bytes=slot_bytes)
+# ---------------------------------------------------------------------------
+# RETIRED BY DESIGN (PLAN_S6_BOUNCE_0911 AMENDMENT 5, 2026-09-11).
+#
+# `xchg_bounce_bytes_per_card` and `xchg_bounce_bytes` charged the S6b on-card
+# deposit's CEILING -- `cards x ONCARD_SLOTS_MAX 8 x ONCARD_SLOT_BYTES_MAX` --
+# and were also the yardstick `deposit_refusal_reason` graded a deposit
+# against.  Under S6-BOUNCE the diagonal store-and-forward IS path (a)'s
+# staging for the co-located pairs, and it is priced ONCE, by
+# `xchg_bounce.bounce_terms`, as `N_CARDS x SLOTS_PER_PAIR x slot_bytes` from
+# the launcher's own published `--weg2-xchg-oncard-slot-mib`.  One payload, one
+# term, one yardstick.
+#
+# DELETED RATHER THAN LEFT UNUSED, and that is the point: a function that still
+# returns a plausible number is how a second ledger comes back -- the next
+# reader finds it, it answers, and nothing points at the ruling.  The two
+# readers it had are converted, not redirected: the launcher's arm question is
+# now the boolean `xchg_bounce_arm_pins_host`, and the runtime budget
+# (`weight_updater._weg2_shadow_host_budget`) reads
+# `xchg_bounce.staging_bytes_per_card(published slot)`.
+# `test_the_retired_ceiling_is_gone_from_the_ledger_path` is the ratchet.
+# ---------------------------------------------------------------------------
 
 
 def charge_terms(
@@ -1303,7 +1250,8 @@ def charge_terms(
 
     ``xchg_bounce_host_bytes`` IS AN ARM PROPERTY and therefore is (#1273 S6):
     it is 0 on ``--weg2-weight-source ring`` -- the default and every boot that
-    has run -- and :func:`xchg_bounce_bytes` on the arms that create the file.
+    has run -- and ``xchg_bounce.BounceTerms.total_bytes`` on the arms that
+    create the file (AMENDMENT 5: one term, priced by the launcher).
     The KEY IS ALWAYS PRESENT, value 0.0 when unarmed, because the three
     consumers of this dict must not be able to disagree about whether a term
     exists; an unarmed boot prints ``xchg_bounce=0.00`` and says so rather than
@@ -1847,7 +1795,8 @@ def price(
     which -- see :func:`resolve_image_terms`.
 
     ``xchg_bounce_host_bytes`` is #1273 S6: the weight exchange's own pinned
-    host carrier (:func:`xchg_bounce_bytes`), 0 on the ring arm and therefore
+    host carrier (``xchg_bounce.BounceTerms.total_bytes``, the assemble buffer
+    plus path (a)'s staging), 0 on the ring arm and therefore
     on every boot that has run to date.  It is charged like any other term --
     the flip transient's absence above is about the RING and says nothing about
     a carrier the ring never had.

@@ -41,6 +41,7 @@ from sglang.srt.weg2 import weight_exchange as wx
 from sglang.srt.weg2 import weight_exchange_region as xr
 from sglang.srt.weg2 import weight_exchange_shadow as sh
 from sglang.srt.weg2 import weight_exchange_transport as tp
+from sglang.srt.weg2 import xchg_bounce as xb
 
 from .test_weg2_xchg_transport_1273 import (  # noqa: E402 -- after the env guard
     FakeDeviceOps,
@@ -3993,9 +3994,8 @@ DEPOSIT_SLOT = 64 * 1024
 
 
 def _ledger_budget() -> int:
-    from sglang.srt.weg2 import host_ledger as hl
 
-    return int(hl.xchg_bounce_bytes_per_card())
+    return int(xb.staging_bytes_per_card(tp.ONCARD_SLOT_BYTES_MAX))
 
 
 def _host_arm(monkeypatch) -> None:
@@ -4175,7 +4175,7 @@ def test_the_adapter_reads_its_deposit_budget_from_the_ledger():
     hook = _wu_source("_weg2_shadow_hook")
     assert "host_bounce_budget_bytes=self._weg2_shadow_host_budget()" in hook, hook
     reader = _wu_source("_weg2_shadow_host_budget")
-    assert "hl.xchg_bounce_bytes_per_card()" in reader, reader
+    assert "staging_bytes_per_card" in reader, reader
     # AN UNREADABLE LEDGER YIELDS 0, AND 0 REFUSES -- never a guessed budget.
     assert "return 0" in reader, reader
     assert sh.ShadowLegInputs(
@@ -4198,21 +4198,24 @@ def test_the_deposit_is_a_term_of_the_1269_host_ledger_and_the_arm_line_says_so(
     """
     from sglang.srt.weg2 import host_ledger as hl
 
-    per_card = hl.xchg_bounce_bytes_per_card()
+    per_card = xb.staging_bytes_per_card(tp.ONCARD_SLOT_BYTES_MAX)
     # S6 refuter, must_fix 3: the geometry's CEILING, read from its owner's own
     # name for it.  This asserted the slot FLOOR beside the slot count's
     # ceiling -- a quarter of what the planner may derive -- which made the
     # charge understate and `deposit_refusal_reason` falsely refuse.
-    assert per_card == tp.ONCARD_DEPOSIT_BYTES_MAX
-    assert per_card == tp.ONCARD_SLOTS_MAX * tp.ONCARD_SLOT_BYTES_MAX
-    assert hl.xchg_bounce_bytes(3) == 3 * per_card
+    # AMENDMENT 5: SLOTS_PER_PAIR slots of the PUBLISHED slot, not the 8-slot
+    # ceiling. The ceiling is retired from the ledger path; the shape maximum
+    # is still the transport's and is deliberately 4x this.
+    assert per_card == xb.SLOTS_PER_PAIR * tp.ONCARD_SLOT_BYTES_MAX
+    assert per_card * 4 == tp.ONCARD_DEPOSIT_BYTES_MAX
+    assert xr.N_CARDS * xb.staging_bytes_per_card(tp.ONCARD_SLOT_BYTES_MAX) == xr.N_CARDS * per_card
     ring = hl.price(120 << 30, 60 << 30, 1, 1200,
                     ring_bytes=30 << 30, ring_span1_bytes=10 << 30)
     armed = hl.price(120 << 30, 60 << 30, 1, 1200,
                      ring_bytes=30 << 30, ring_span1_bytes=10 << 30,
-                     xchg_bounce_host_bytes=hl.xchg_bounce_bytes(3))
+                     xchg_bounce_host_bytes=xr.N_CARDS * xb.staging_bytes_per_card(tp.ONCARD_SLOT_BYTES_MAX))
     assert ring.terms["xchg_bounce_gib"] == 0.0
-    assert armed.terms["xchg_bounce_gib"] == hl.xchg_bounce_bytes(3) / hl.GIB
+    assert armed.terms["xchg_bounce_gib"] == xr.N_CARDS * xb.staging_bytes_per_card(tp.ONCARD_SLOT_BYTES_MAX) / hl.GIB
     # THE TERM IS SPENT AT BOTH MOMENTS, so the leftover -- and therefore the
     # store -- shrinks by exactly it and by nothing else.
     assert round(ring.run_leftover_gib - armed.run_leftover_gib, 6) == \
@@ -4241,12 +4244,13 @@ def test_the_arm_line_names_the_deposit_even_when_it_is_zero(tmp_path):
     assert arms, lines
     assert all("xchg_bounce=0.00" in ln for ln in arms), arms
 
+    _term = xr.N_CARDS * xb.staging_bytes_per_card(tp.ONCARD_SLOT_BYTES_MAX)
     _a2, _s2, armed_lines = hl.choose(
         200 << 30, 150 << 30, ring_bytes=20 << 30,
-        ring_span1_bytes=8 << 30,
-        xchg_bounce_host_bytes=hl.xchg_bounce_bytes(3))
-    armed_arms = [ln for ln in armed_lines if ln.startswith("WEG2-HOST-LEDGER ARM ")]
-    expect = f"xchg_bounce={hl.xchg_bounce_bytes(3) / hl.GIB:.2f}"
+        ring_span1_bytes=8 << 30, xchg_bounce_host_bytes=_term)
+    armed_arms = [ln for ln in armed_lines
+                  if ln.startswith("WEG2-HOST-LEDGER ARM ")]
+    expect = f"xchg_bounce={_term / hl.GIB:.2f}"
     assert all(expect in ln for ln in armed_arms), (expect, armed_arms)
 
 
@@ -4265,15 +4269,30 @@ def test_the_launcher_charges_the_deposit_only_on_an_armed_boot():
     # `test_the_deposit_is_charged_only_on_the_arm_that_can_allocate_it`.
     src = inspect.getsource(lc.choose_host_ledger)
     # #1332 B1b: the kwarg is now fed by `xchg_bounce_terms_for_arm`, which
-    # keeps `xchg_bounce_charge_bytes` as its predicate (asserted below and in
+    # keeps `xchg_bounce_arm_pins_host` as its predicate (asserted below and in
     # the test above).  The property this line defends is that the ledger's
     # `xchg_bounce_host_bytes` comes from THE ARM DECISION and never from a
     # constant -- so it names the producer that now feeds it.
     assert "xchg_bounce_host_bytes=_bounce_charge_bytes" in src, src
     assert "xchg_bounce_terms_for_arm(" in src, src
-    predicate = inspect.getsource(lc.xchg_bounce_charge_bytes)
-    assert "host_ledger.xchg_bounce_bytes()" in predicate, predicate
+    predicate = inspect.getsource(lc.xchg_bounce_arm_pins_host)
+    # AMENDMENT 5: the predicate is a BOOLEAN and carries no number at all --
+    # that is the whole point of the reshape, so the guard asserts the absence
+    # of a size rather than the presence of one.
+    assert "ONCARD_MODE_HOST" in predicate, predicate
     assert "WEIGHT_SOURCE_DEFAULT" in predicate, predicate
+    # THE PREDICATE CARRIES NO SIZE (AMENDMENT 5), asserted on the SIGNATURE
+    # and not on the source text: the docstring names the retired
+    # `host_ledger.xchg_bounce_bytes` in order to say it is retired, and a
+    # text-absence guard reads that epitaph as a live member -- which is
+    # e25a88c2a2's own finding, walked into one commit after quoting it.
+    # `launcher.py` carries `from __future__ import annotations`, so the
+    # annotation arrives as the STRING "bool" -- accepted as such rather than
+    # resolved, because resolving it would import the module's namespace just
+    # to learn what its own source already says.
+    assert inspect.signature(
+        lc.xchg_bounce_arm_pins_host).return_annotation in (bool, "bool")
+    assert "host_ledger.xchg_bounce_bytes(" not in predicate, predicate
     main_src = inspect.getsource(lc.main)
     assert "weight_source=ns.weg2_weight_source" in main_src, \
         "the arm must reach the ledger call site"
@@ -4473,33 +4492,41 @@ def test_the_deposit_is_charged_only_on_the_arm_that_can_allocate_it():
     # wired, not that the older name appears in the older place.
     assert "xchg_bounce_terms_for_arm(" in \
         inspect.getsource(lc.choose_host_ledger)
-    assert "xchg_bounce_charge_bytes(weight_source" in \
+    assert "xchg_bounce_arm_pins_host(weight_source" in \
         inspect.getsource(lc.xchg_bounce_terms_for_arm)
     main_src = inspect.getsource(lc.main)
     assert "oncard_mode=ns.weg2_xchg_oncard" in main_src, \
         "the arm must reach BOTH the ledger call site and the shadow env"
     assert main_src.count("oncard_mode=ns.weg2_xchg_oncard") == 2, main_src
 
-    charge = lc.xchg_bounce_charge_bytes
+    charge = lc.xchg_bounce_arm_pins_host
     # THE ONLY ARM THAT PINS A BYTE IS THE ONLY ARM THAT IS CHARGED.
-    assert charge("shadow", tp.ONCARD_MODE_HOST) == hl.xchg_bounce_bytes()
-    assert charge("exchange", tp.ONCARD_MODE_HOST) == hl.xchg_bounce_bytes()
+    assert charge("shadow", tp.ONCARD_MODE_HOST) is True
+    assert charge("exchange", tp.ONCARD_MODE_HOST) is True
     assert charge("shadow", tp.ONCARD_MODE_IPC) == 0
     assert charge("ring", tp.ONCARD_MODE_HOST) == 0
     assert charge("ring", tp.ONCARD_MODE_IPC) == 0
-    assert hl.xchg_bounce_bytes() > 0, "this test proves nothing at a zero term"
+    assert xr.N_CARDS * xb.staging_bytes_per_card(
+        tp.ONCARD_SLOT_BYTES_MAX) > 0, "this proves nothing at a zero term"
 
     # ... and the term reaches the ARM LINE with exactly that value.
     def _arms(term):
-        _a, _s, lines = hl.choose(200 << 30, 150 << 30,                                   ring_bytes=20 << 30, ring_span1_bytes=8 << 30,
+        _a, _s, lines = hl.choose(200 << 30, 150 << 30,
+                                  ring_bytes=20 << 30, ring_span1_bytes=8 << 30,
                                   xchg_bounce_host_bytes=term)
         return [ln for ln in lines if ln.startswith("WEG2-HOST-LEDGER ARM ")]
 
-    ipc = _arms(charge("shadow", tp.ONCARD_MODE_IPC))
-    host = _arms(charge("shadow", tp.ONCARD_MODE_HOST))
+    # THE PREDICATE SELECTS, THE TERM SIZES (AMENDMENT 5). Before the reshape
+    # this test passed `charge(...)` straight in as the byte count, which is
+    # exactly the conflation the ruling removed: one function answered both
+    # "does this arm pin?" and "how much?". Now the arm chooses between 0 and
+    # the term, and the term has one owner.
+    _term = xr.N_CARDS * xb.staging_bytes_per_card(tp.ONCARD_SLOT_BYTES_MAX)
+    ipc = _arms(_term if charge("shadow", tp.ONCARD_MODE_IPC) else 0)
+    host = _arms(_term if charge("shadow", tp.ONCARD_MODE_HOST) else 0)
     assert ipc and host
     assert all("xchg_bounce=0.00" in ln for ln in ipc), ipc
-    expect = f"xchg_bounce={hl.xchg_bounce_bytes() / hl.GIB:.2f}"
+    expect = f"xchg_bounce={_term / hl.GIB:.2f}"
     assert expect != "xchg_bounce=0.00"
     assert all(expect in ln for ln in host), (expect, host)
 
@@ -4545,7 +4572,6 @@ def test_the_rank_budget_is_zero_on_the_arm_the_ledger_charged_nothing_for(
     published, which is the same string that decided the charge.
     """
     from sglang.srt.managers.scheduler_components import weight_updater as wu
-    from sglang.srt.weg2 import host_ledger as hl
 
     budget = wu.SchedulerWeightUpdaterManager._weg2_shadow_host_budget
 
@@ -4554,8 +4580,8 @@ def test_the_rank_budget_is_zero_on_the_arm_the_ledger_charged_nothing_for(
     monkeypatch.delenv(tp.ENV_ONCARD_MODE, raising=False)
     assert budget(object()) == 0, "the default arm is ipc and funds nothing"
     monkeypatch.setenv(tp.ENV_ONCARD_MODE, tp.ONCARD_MODE_HOST)
-    assert budget(object()) == hl.xchg_bounce_bytes_per_card()
-    assert budget(object()) == tp.ONCARD_DEPOSIT_BYTES_MAX
+    assert budget(object()) == xb.staging_bytes_per_card(tp.ONCARD_SLOT_BYTES_MAX)
+    assert budget(object()) * 4 == tp.ONCARD_DEPOSIT_BYTES_MAX
 
 
 def test_the_shadow_line_prices_the_copy_on_the_host_arm_and_not_on_ipc(
@@ -5166,21 +5192,21 @@ def test_run_leg_hook_hands_the_plans_classes_in_as_the_rotation_not_the_pin():
 
 def test_the_slot_ceiling_flag_defaults_to_a_byte_identical_boot():
     """128 MiB and a 3.00 GiB charge is every boot so far."""
-    from sglang.srt.weg2 import host_ledger as hl
 
     assert tp.ONCARD_SLOT_MIB_DEFAULT == 128
     assert tp.validate_oncard_slot_mib(128) == 128
-    per_card = hl.xchg_bounce_bytes_per_card(slot_bytes=128 * xr.MIB)
-    assert per_card == tp.ONCARD_SLOTS_MAX * 128 * xr.MIB
-    assert hl.xchg_bounce_bytes(slot_bytes=128 * xr.MIB) / (1 << 30) == 3.0
+    per_card = xb.staging_bytes_per_card(128 * xr.MIB)
+    assert per_card == xb.SLOTS_PER_PAIR * 128 * xr.MIB
+    assert (xr.N_CARDS * xb.staging_bytes_per_card(128 * xr.MIB)
+            ) / (1 << 30) == 0.75
 
 
 def test_slot_64_charges_1_50_gib_which_is_what_reopens_a_rung_at_bs6():
     """The number ticket E2 depends on, computed rather than asserted by hand."""
-    from sglang.srt.weg2 import host_ledger as hl
 
     assert tp.validate_oncard_slot_mib(64) == 64
-    assert hl.xchg_bounce_bytes(slot_bytes=64 * xr.MIB) / (1 << 30) == 1.5
+    assert (xr.N_CARDS * xb.staging_bytes_per_card(64 * xr.MIB)
+            ) / (1 << 30) == 0.375
     # D2's M=600 rung had store 4 against floor 6 with 3.00 charged; giving
     # 1.50 back clears the floor.  This is the arithmetic, not a prediction
     # about the boot -- the anchors term is unchanged by the slot size.
@@ -5248,11 +5274,17 @@ def test_the_launcher_charge_follows_the_flag_not_its_own_import():
     path = os.path.join(root, "python", "sglang", "srt", "weg2", "launcher.py")
     with open(path, encoding="utf-8") as fh:
         src = fh.read()
+    # AMENDMENT 5 MOVED THIS TRAP, it did not remove it. The arm predicate no
+    # longer carries a size, so the flag cannot reach a charge THROUGH it; the
+    # function that must see the flag is the one that SIZES the term. Graded
+    # there, the trap is the same one: a term read from the launcher's
+    # import-time `tp.ONCARD_SLOT_BYTES_MAX` would price the module default
+    # while the ranks allocate the published value.
     fn = next(n for n in _ast.walk(_ast.parse(src))
               if isinstance(n, _ast.FunctionDef)
-              and n.name == "xchg_bounce_charge_bytes")
+              and n.name == "xchg_bounce_terms_for_arm")
     assert "oncard_slot_mib" in {a.arg for a in fn.args.args}, (
-        "the charge cannot see the flag, so it prices the launcher's import-"
+        "the term cannot see the flag, so it prices the launcher's import-"
         "time default"
     )
     body = _ast.unparse(fn)

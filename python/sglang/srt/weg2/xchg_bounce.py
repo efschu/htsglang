@@ -99,6 +99,16 @@ class BounceTerms:
         return int(self.buffer_bytes) + int(self.staging_bytes)
 
     @property
+    def staging_per_card(self) -> int:
+        """This term's staging, per card -- what ONE rank may deposit.
+
+        ``staging_bytes // pairs`` expressed through the shared arithmetic
+        rather than by dividing, so a term built with ``pairs=0`` (a caller
+        pricing a boot without path (a)) answers 0 instead of raising.
+        """
+        return staging_bytes_per_card(self.slot_bytes) if self.pairs else 0
+
+    @property
     def covers_widest_layer(self) -> bool:
         """Can ONE depth-slot of the buffer hold the widest layer?
 
@@ -179,6 +189,90 @@ def bounce_terms(
         buffer_bytes=int(widest_layer_bytes) * int(depth),
         staging_bytes=int(pairs) * SLOTS_PER_PAIR * int(slot_bytes),
     )
+
+
+#: The channel the launcher's PRICED term reaches a rank on.  A rank may not
+#: re-derive the term: the census is a checkpoint read and a second reader of
+#: it would be a second sizing authority (the defect AMENDMENT 5 just retired
+#: one instance of).  The launcher publishes the scalars it priced WITH, the
+#: rank rebuilds the term through `bounce_terms` -- the same one function -- so
+#: the two objects are identical by construction rather than by agreement.
+ENV_BOUNCE_TERMS = "SGLANG_WEG2_XCHG_BOUNCE_TERMS"
+
+_TERM_FIELDS = ("bytes_per_direction", "n_layers", "widest_layer_bytes",
+                "pairs", "depth", "slot_bytes")
+
+
+def publish_terms(terms: BounceTerms) -> str:
+    """The launcher's side: the term's INPUTS as one compact value.
+
+    The inputs and not the outputs, deliberately.  Publishing
+    `buffer_bytes`/`staging_bytes` would let a rank hold a total whose
+    derivation it cannot check, and a total is exactly the thing that reads
+    right while its factors drift (measured: two 384 MiB staging figures from
+    different factorisations).  Publishing the inputs makes the rank recompute
+    through `bounce_terms`, so a disagreement is impossible instead of merely
+    unlikely.
+    """
+    return ",".join(f"{f}={int(getattr(terms, f))}" for f in _TERM_FIELDS)
+
+
+def read_published_terms(raw: Optional[str] = None) -> Optional[BounceTerms]:
+    """The rank's side: the launcher's term, rebuilt, or ``None``.
+
+    ``None`` means NOT PUBLISHED -- an unarmed boot, or a launcher that did not
+    price a bounce -- and the caller must treat that as "no authority to
+    inject", never as a zero-sized buffer.  A MALFORMED value raises rather
+    than returning None: an env var that exists and cannot be parsed is a
+    launcher defect, and swallowing it would inject against a size nobody
+    priced.
+    """
+    import os
+
+    text = (os.environ.get(ENV_BOUNCE_TERMS, "") if raw is None else raw)
+    text = (text or "").strip()
+    if not text:
+        return None
+    kw = {}
+    for part in text.split(","):
+        key, _, value = part.partition("=")
+        key = key.strip()
+        if key not in _TERM_FIELDS:
+            raise ValueError(
+                f"{ENV_BOUNCE_TERMS} carries an unknown field {key!r}; the "
+                f"published term is the launcher's own and its fields are "
+                f"{_TERM_FIELDS}")
+        kw[key] = int(value)
+    missing = [f for f in _TERM_FIELDS if f not in kw]
+    if missing:
+        raise ValueError(
+            f"{ENV_BOUNCE_TERMS} is missing {missing}; a partially published "
+            f"term would be sized against defaults, which is how a pinned "
+            f"constant re-enters through the back door")
+    return bounce_terms(**kw)
+
+
+def staging_bytes_per_card(slot_bytes: int) -> int:
+    """One card's share of path (a)'s staging: ``SLOTS_PER_PAIR x slot_bytes``.
+
+    THE ONE ARITHMETIC, so the launcher's charge and a rank's runtime budget
+    cannot be two copies of it (AMENDMENT 5 consequence 2).
+    ``bounce_terms`` multiplies this by ``pairs``; a rank enforcing its own
+    deposit multiplies it by nothing.  Before AMENDMENT 5 the runtime read
+    ``host_ledger.xchg_bounce_bytes_per_card`` -- the S6b deposit's CEILING
+    (``ONCARD_SLOTS_MAX 8 x ONCARD_SLOT_BYTES_MAX``) -- while the ledger
+    charged this, so the two disagreed by 4x on the same payload.  That
+    ceiling is retired by design: the diagonal store-and-forward IS path (a)'s
+    staging for the co-located pairs, and a plan needing more than
+    ``SLOTS_PER_PAIR`` batches per leg is refused BY NAME
+    (``DEPOSIT_REASON_BATCHES``), never sized up.
+
+    ``slot_bytes`` is the LAUNCHER'S PUBLISHED VALUE
+    (``--weg2-xchg-oncard-slot-mib``, reaching a rank as
+    ``weight_exchange_transport.ENV_ONCARD_SLOT_MIB``), never a module
+    default: one value, both sides.
+    """
+    return SLOTS_PER_PAIR * int(slot_bytes)
 
 
 def under_coverage_refusal(terms: BounceTerms, *, widest_layer_name: str = "") -> str:

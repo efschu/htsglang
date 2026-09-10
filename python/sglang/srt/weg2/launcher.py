@@ -3357,6 +3357,7 @@ def prepare_shadow_env(log: Log, boot_nonce: str, weight_source: str,
                        oncard_mode: str = ONCARD_MODE_DEFAULT,
                        oncard_slot_mib: int =
                        weight_exchange_transport.ONCARD_SLOT_MIB_DEFAULT,
+                       bounce_terms: Optional[xchg_bounce.BounceTerms] = None,
                        ) -> Dict[str, str]:
     """#1273 S5: arm the region for the SHADOW arm, and publish it to both groups.
 
@@ -3404,6 +3405,25 @@ def prepare_shadow_env(log: Log, boot_nonce: str, weight_source: str,
     slot_mib = weight_exchange_transport.validate_oncard_slot_mib(
         oncard_slot_mib)
     env[weight_exchange_transport.ENV_ONCARD_SLOT_MIB] = str(slot_mib)
+    # #1273 S6 step 5: THE PRICED TERM ITSELF, published to the ranks.
+    #
+    # The seam that injects the weight bytes needs the bounce geometry, and a
+    # rank may not re-derive it: the sizing inputs come from a CHECKPOINT
+    # CENSUS, and a second reader of that census would be a second sizing
+    # authority -- the exact defect AMENDMENT 5 retired one instance of.  So
+    # the launcher publishes the scalars it PRICED WITH and the rank rebuilds
+    # the term through `bounce_terms`, the one sizing function, which makes the
+    # two objects identical by construction instead of by agreement.
+    #
+    # ABSENT means NO AUTHORITY TO INJECT, not "size it yourself": an unarmed
+    # boot publishes nothing and `read_published_terms` answers None, which the
+    # seam turns into a named refusal rather than a default.
+    if bounce_terms is not None:
+        env[xchg_bounce.ENV_BOUNCE_TERMS] = xchg_bounce.publish_terms(
+            bounce_terms)
+        log(f"WEG2-XCHG-BOUNCE PUBLISHED {xchg_bounce.publish_terms(bounce_terms)} "
+            f"-- the ranks rebuild this through bounce_terms(); the ARM line "
+            f"above priced the same inputs")
     log(f"WEG2-XCHG-SHADOW ARMED epoch={boot_nonce} path={got.get('path', '')} "
         f"sems={got.get('sems', 0)} ring=AUTHORITATIVE exchange=OBSERVER "
         f"-- the ring refills every weight byte as it does today; the exchange "
@@ -4346,38 +4366,33 @@ def measured_record_path() -> str:
     return f"{EVIDENCE_DIR}/{host_ledger.MEASURED_RECORD_NAME}"
 
 
-def xchg_bounce_charge_bytes(weight_source: str, oncard_mode: str,
-                             oncard_slot_mib: Optional[int] = None) -> int:
-    """The #1269 host term for the exchange's own pinned carrier, in bytes.
+def xchg_bounce_arm_pins_host(weight_source: str, oncard_mode: str) -> bool:
+    """Does THIS ARM pin host bytes for the exchange's carrier?  A BOOLEAN.
 
-    ONE PRODUCER OF THE PREDICATE (S6 refuter, must_fix 4), and it is a
-    function rather than an expression inside :func:`choose_host_ledger`
+    ONE PRODUCER OF THE PREDICATE, and after AMENDMENT 5 it produces ONLY the
+    predicate.  It used to answer "how many bytes" as well
+    (`xchg_bounce_charge_bytes`, returning the retired
+    `host_ledger.xchg_bounce_bytes` ceiling), which made it a second producer
+    of a SIZE that `xchg_bounce.bounce_terms` already owns -- and the two
+    disagreed by 4x on one payload, because the ceiling counted
+    `ONCARD_SLOTS_MAX 8` slots where the term prices `SLOTS_PER_PAIR 2`.  The
+    size now has exactly one owner and this call answers only the arm question.
+
+    BOTH ARMS DECIDE IT.  `--weg2-weight-source ring` creates no region at all;
+    `--weg2-xchg-oncard ipc` creates one but exports a VRAM bounce that is
+    freed with its own leg, so no bounce FILE exists and no host byte is
+    pinned.  Host bytes exist on `shadow`/`exchange` + `host` and nowhere else,
+    and this is the same arm string `prepare_shadow_env` publishes to the
+    ranks -- so the arm a rank enforces and the arm that was paid for cannot be
+    two readings.
+
+    It is a function rather than an expression inside `choose_host_ledger`
     because the property under test -- "the charge fires on exactly the arm
     that can allocate" -- must be provable without a host to read.
-
-    BOTH ARMS DECIDE IT.  ``--weg2-weight-source ring`` creates no region at
-    all; ``--weg2-xchg-oncard ipc`` creates one but exports a VRAM bounce that
-    is freed with its own leg, so no bounce FILE exists and no host byte is
-    pinned.  The bytes exist on ``shadow``/``exchange`` + ``host`` and nowhere
-    else, and this is the same value :func:`prepare_shadow_env` publishes to
-    the ranks -- so the arm a rank enforces and the arm that was paid for
-    cannot be two readings.
     """
     if str(weight_source) == WEIGHT_SOURCE_DEFAULT:
-        return 0
-    if str(oncard_mode) != weight_exchange_transport.ONCARD_MODE_HOST:
-        return 0
-    # S6 fix E: the LAUNCHER's own process was started without the flag in its
-    # environment, so ``tp.ONCARD_SLOT_BYTES_MAX`` bound the DEFAULT at import
-    # and a charge read from it would price 128 MiB slots while the ranks
-    # allocated 64.  The flag's value is therefore threaded explicitly here --
-    # the ranks read the published env, the launcher passes what it parsed, and
-    # both end in the SAME arithmetic (``xchg_bounce_bytes_per_card``).
-    if oncard_slot_mib is None:
-        return int(host_ledger.xchg_bounce_bytes())
-    slot_bytes = weight_exchange_transport.validate_oncard_slot_mib(
-        oncard_slot_mib) * weight_exchange_region.MIB
-    return int(host_ledger.xchg_bounce_bytes(slot_bytes=slot_bytes))
+        return False
+    return str(oncard_mode) == weight_exchange_transport.ONCARD_MODE_HOST
 
 
 def xchg_bounce_terms_for_arm(weight_source: str, oncard_mode: str,
@@ -4386,7 +4401,7 @@ def xchg_bounce_terms_for_arm(weight_source: str, oncard_mode: str,
     """``(charged_bytes, lines)`` for the host bounce. #1332 B1b.
 
     THE SECOND PRODUCER OF THE SAME PREDICATE AS
-    :func:`xchg_bounce_charge_bytes`, and deliberately its neighbour rather
+    :func:`xchg_bounce_arm_pins_host`, and deliberately its neighbour rather
     than its replacement: that one answers "does this arm pin host bytes at
     all" for every arm and stays the authority for `ring` and `ipc`, which
     charge 0.  This one answers "how many, on the arm that does", and it is the
@@ -4407,13 +4422,12 @@ def xchg_bounce_terms_for_arm(weight_source: str, oncard_mode: str,
     finding that out mid-flip means finding it out after VRAM was mutated.
     """
     # ONE AUTHORITY FOR THE PREDICATE, and it is the OLDER function.
-    # `xchg_bounce_charge_bytes` already answers "does this arm pin host bytes
+    # `xchg_bounce_arm_pins_host` already answers "does this arm pin host bytes
     # at all" and is pinned by two tests in test_weg2_xchg_shadow_1273; asking
     # it here instead of re-deciding the arm strings keeps that single reader
     # (upstream-minimal: a second copy of a predicate is the defect class this
     # fork keeps paying for).  What B1b adds is the SIZE, not the predicate.
-    if xchg_bounce_charge_bytes(weight_source, oncard_mode,
-                                oncard_slot_mib) <= 0:
+    if not xchg_bounce_arm_pins_host(weight_source, oncard_mode):
         return 0, []
     if not str(model_dir or "").strip():
         # THE EXCEPTION MATCHES THE CODE IT PRINTS.  An earlier draft raised
@@ -4551,7 +4565,7 @@ def choose_host_ledger(
         # deposit allocates under, and it is the launcher's own published
         # value rather than a second reading of the environment.
         # #1332 B1b: ON THE HOST ARM THE CHARGE IS THE MEASURED BOUNCE.
-        # `xchg_bounce_charge_bytes` stays the authority for `ring` and `ipc`
+        # `xchg_bounce_arm_pins_host` stays the authority for `ring` and `ipc`
         # (both 0); where bytes are actually pinned, the size is derived from
         # THIS checkpoint's WIDEST layer by `xchg_bounce_terms_for_arm` ->
         # `bounce_terms`, and its two lines join the ledger's printed lines.
@@ -8148,9 +8162,13 @@ def build_parser() -> argparse.ArgumentParser:
              "published to both groups as SGLANG_WEG2_XCHG_ONCARD and it is "
              "the SAME value the host ledger charges the deposit's pinned "
              "bytes on, so the arm a rank enforces and the arm that was paid "
-             "for cannot diverge. On 'host' the ledger charges "
-             f"{host_ledger.xchg_bounce_bytes() / (1024 ** 3):.2f} GiB at both "
-             "moments and the store shrinks by it. Ignored on "
+             "for cannot diverge. On 'host' the ledger charges the S6-BOUNCE "
+             "term -- the assemble buffer (widest layer x depth) PLUS path "
+             "(a)'s staging (N_CARDS x 2 x --weg2-xchg-oncard-slot-mib) -- at "
+             "both moments, printed with its expression on the "
+             "WEG2-XCHG-BOUNCE arm line, and the store shrinks by it. The "
+             "retired per-card ceiling (8 x slot) is no longer charged or "
+             "graded against: one payload, one term. Ignored on "
              "--weg2-weight-source ring",
     )
     ap.add_argument(
@@ -9148,11 +9166,37 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     state.xchg_lines = list(xchg_res.lines) if xchg_res is not None else []
     # #1273 S5: the SHADOW arm's region, armed here and published to both
     # groups by build_env below.  Empty on every other arm.
+    # #1273 S6 step 5: PRICE THE BOUNCE TERM HERE so the ranks can be given it.
+    #
+    # Through the SAME glue `xchg_bounce_terms_for_arm` uses
+    # (`checkpoint_census.widest_layer_terms`, which is itself the one caller of
+    # the one sizing function `xchg_bounce.bounce_terms`) and behind the SAME
+    # arm predicate -- so this is ONE AUTHORITY CALLED TWICE, never a second
+    # formula.  The census is a safetensors HEADER read and `bounce_terms` is
+    # pure, so `choose_host_ledger`'s copy below and this one are identical by
+    # construction.
+    #
+    # Deliberately NOT by widening that function's return: its source is graded
+    # by another seat's guard this cycle
+    # (`test_the_under_coverage_GUARD_is_present_and_currently_unreachable`
+    # greps it for `covers_widest_layer`), and `choose_host_ledger`'s signature
+    # is pinned keyword-for-keyword by `test_weg2_store_priced_x_1317`.  A
+    # publication need is not a reason to edit either.
+    bounce_terms_for_ranks = None
+    if xchg_bounce_arm_pins_host(ns.weg2_weight_source, ns.weg2_xchg_oncard):
+        bounce_terms_for_ranks, _widest_line, _widest_name = (
+            checkpoint_census.widest_layer_terms(
+                str(ns.model),
+                pairs=int(weight_exchange_region.N_CARDS),
+                depth=xchg_bounce.ASSEMBLE_DEPTH_DEFAULT,
+                slot_bytes=weight_exchange_transport.validate_oncard_slot_mib(
+                    ns.weg2_xchg_oncard_slot_mib) * weight_exchange_region.MIB))
     xchg_env = prepare_shadow_env(log, str(ring_plan.epoch),
                                   ns.weg2_weight_source, dry=dry,
                                   hop_bound_ms=ns.weg2_shadow_hop_bound_ms,
                                   oncard_mode=ns.weg2_xchg_oncard,
-                                  oncard_slot_mib=ns.weg2_xchg_oncard_slot_mib)
+                                  oncard_slot_mib=ns.weg2_xchg_oncard_slot_mib,
+                                  bounce_terms=bounce_terms_for_ranks)
 
     # 2. host ledger
     arm, reap_headroom_gib, lines, cg = choose_host_ledger(

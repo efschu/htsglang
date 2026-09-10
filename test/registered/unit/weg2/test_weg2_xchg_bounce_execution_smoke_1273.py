@@ -48,6 +48,7 @@ from __future__ import annotations
 
 import ctypes
 import os
+import re
 
 import pytest
 
@@ -689,62 +690,109 @@ def test_a_destination_with_no_source_is_refused(tmp_path, armed, seeded):
 
 
 # ===========================================================================
-# STEP 4 -- WHAT "STAGING" MEANS, and the three answers the tree gives.
+# STEP 4 -- ONE PAYLOAD, ONE TERM, ONE YARDSTICK (AMENDMENT 5's ruling).
 #
-# NO REFUSAL IS BUILT HERE, deliberately, and an earlier commit of mine that
-# built one was WRONG and is reverted: it graded `terms.staging_bytes` against
-# `xr.DATA_BYTES` -- the CROSS region -- while the launcher feeds
-# `pairs=xr.N_CARDS`, which makes the term model the PER-CARD ON-CARD lane.
-# Two different payloads that both happen to equal 384 MiB today, so the check
-# passed by the very coincidence it was written to catch. The lesson is the
-# one the operator gave and I then broke: read the code, not the prose.
+# The question this file asked in an earlier commit -- "which of three readings
+# is 'staging'?" -- is ANSWERED, and the answer retires one of them. The S6b
+# on-card deposit ceiling (3 x ONCARD_SLOTS_MAX 8 x ONCARD_SLOT_BYTES_MAX) was
+# the OLD carrier's yardstick; under S6-BOUNCE the diagonal store-and-forward
+# IS path (a)'s staging for the co-located pairs, priced as
+# N_CARDS x SLOTS_PER_PAIR x slot_bytes. So these are RATCHETS: they assert the
+# retired reading is GONE from the ledger path, not merely unused.
 #
-# So this is a MEASUREMENT recorded as a test, not a verdict. It pins the three
-# numbers so that whoever resolves the question (operator + boot seat 2, whose
-# accounting this is) has the arithmetic fixed and versioned rather than
-# re-derived, and so that any change to one of the three shows up here.
+# My own earlier magnitude claim is corrected here too, because a wrong number
+# in a test comment outlives the commit that made it: the ledger keyword went
+# 3072 -> 2210 MiB on XSN9 (the launcher threads the FLAG default 128, so
+# staging = 3 x 2 x 128 = 768), so the ceiling optimism was 862 MiB and never
+# the 2688 I reported; and the realised deposit was 32 MiB, which made that
+# boot's ledger CONSERVATIVE by ~2.1 GiB. The reap verdict of a boot is the
+# MEASURED non-reclaimable peak (XSN9: 88.501 < 95.90), never the line.
 # ===========================================================================
 
 
-class WhatStagingMeans:
+class OnePayloadOneTermOneYardstick:
     """Namespace only; the collected tests are the functions below."""
 
 
-def test_the_three_readings_of_the_staging_term_are_pinned():
-    """Three payloads, one label, and 384 MiB reached twice by accident.
+def test_the_retired_ceiling_is_gone_from_the_ledger_path():
+    """THE RATCHET.  Not "unused" -- ABSENT.
 
-    (i)   the CROSS region, which is what section 10.2's "6 directed pairs x
-          2 slots" describes:  xr.N_PAIRS x xr.SLOTS_PER_PAIR x xr.SLOT_BYTES.
-    (ii)  what the launcher actually CHARGES since #1332 B1b
-          (`launcher.py` -> `xchg_bounce_terms_for_arm` ->
-          `checkpoint_census.widest_layer_terms(pairs=xr.N_CARDS)`):
-          3 x xb.SLOTS_PER_PAIR x xb.SLOT_BYTES_DEFAULT.
-    (iii) the ON-CARD host deposit's own worst case, which is what
-          `host_ledger.xchg_bounce_bytes()` charged BEFORE B1b and what
-          `weight_exchange_transport.py` still documents as charged "at both
-          the launch and the run moment":
-          (xr.N_RANKS // 2) x tp.ONCARD_SLOTS_MAX x tp.ONCARD_SLOT_BYTES_MAX.
+    ``host_ledger.xchg_bounce_bytes`` and ``xchg_bounce_bytes_per_card``
+    charged the S6b deposit's ceiling and were the yardstick
+    ``deposit_refusal_reason`` graded against.  AMENDMENT 5 retires that
+    reading by design, and a function left in place "for now" is how a second
+    ledger comes back: the next reader finds it, it still returns a plausible
+    number, and nothing points at the ruling.  So the test is on ABSENCE.
+    """
+    from sglang.srt.weg2 import host_ledger as hl
 
-    (i) and (ii) are both 384 MiB at today's constants and are NOT the same
-    bytes.  (iii) is 3072 MiB, i.e. 2688 MiB more than the ledger now funds
-    for the payload it names.  Which of the three the term is meant to be is an
-    accounting question for the launcher's owner, not for this module -- this
-    test only refuses to let the three drift silently.
+    assert not hasattr(hl, "xchg_bounce_bytes"), (
+        "the retired ceiling is still callable from the ledger module")
+    assert not hasattr(hl, "xchg_bounce_bytes_per_card"), (
+        "the retired per-card ceiling is still callable")
+
+
+def test_the_arm_predicate_carries_no_number():
+    """The launcher's arm question is a BOOLEAN after AMENDMENT 5.
+
+    It used to answer "how many host bytes does this arm pin", which made it a
+    second producer of the size beside ``bounce_terms``.  It now answers only
+    "does this arm pin host bytes at all", and the size has one owner.
+    """
+    from sglang.srt.weg2 import launcher as lz
+    from sglang.srt.weg2 import weight_exchange_transport as tp_
+
+    assert not hasattr(lz, "xchg_bounce_charge_bytes"), (
+        "the numeric charge predicate is still present")
+    assert lz.xchg_bounce_arm_pins_host("ring", tp_.ONCARD_MODE_HOST) is False
+    assert lz.xchg_bounce_arm_pins_host("shadow", "ipc") is False
+    assert lz.xchg_bounce_arm_pins_host("exchange", "ipc") is False
+    assert lz.xchg_bounce_arm_pins_host("shadow", tp_.ONCARD_MODE_HOST) is True
+    assert lz.xchg_bounce_arm_pins_host("exchange", tp_.ONCARD_MODE_HOST) is True
+
+
+def test_the_per_card_staging_is_the_published_slot_not_a_ceiling():
+    """One card's deposit budget = ``SLOTS_PER_PAIR x published slot``.
+
+    Measured on XSN9: the flag default is 128 MiB, so per card is 256 MiB and
+    the three cards are 768 MiB -- which is the ``path_a_staging_mib=768`` the
+    ARM line printed.  The retired ceiling would have said 8 x 128 = 1024 MiB
+    per card, i.e. 4x, for the same payload.
     """
     from sglang.srt.weg2 import weight_exchange_transport as tp_
 
-    cross = xr.N_PAIRS * xr.SLOTS_PER_PAIR * xr.SLOT_BYTES
-    charged = xr.N_CARDS * xb.SLOTS_PER_PAIR * xb.SLOT_BYTES_DEFAULT
-    oncard_worst = ((xr.N_RANKS // 2) * tp_.ONCARD_SLOTS_MAX
-                    * tp_.ONCARD_SLOT_BYTES_MAX)
+    per_card = xb.staging_bytes_per_card(tp_.ONCARD_SLOT_BYTES_MAX)
+    assert per_card == xb.SLOTS_PER_PAIR * tp_.ONCARD_SLOT_BYTES_MAX
+    assert per_card == 256 * xr.MIB          # flag default 128 MiB
+    assert per_card * xr.N_CARDS == 768 * xr.MIB
+    # And the term's own view of it agrees, because it is the same arithmetic.
+    terms = xb.bounce_terms(
+        bytes_per_direction=PLAIN_LAYER_BYTES * N_LAYERS, n_layers=N_LAYERS,
+        widest_layer_bytes=LAYER0_BYTES, pairs=xr.N_CARDS, depth=DEPTH,
+        slot_bytes=tp_.ONCARD_SLOT_BYTES_MAX,
+    )
+    assert terms.staging_per_card == per_card
+    assert terms.staging_bytes == per_card * xr.N_CARDS
 
-    assert cross == 384 * xr.MIB, cross
-    assert charged == 384 * xr.MIB, charged
-    assert oncard_worst == 3072 * xr.MIB, oncard_worst
-    # THE COINCIDENCE, asserted so it cannot pass unnoticed: equal totals from
-    # different factorisations.  If step 3 raises xr.SLOT_BYTES to 64 this
-    # goes red, which is exactly when someone must look.
-    assert cross == charged
-    assert (xr.N_PAIRS, xr.SLOT_BYTES) != (xr.N_CARDS, xb.SLOT_BYTES_DEFAULT)
-    # And the gap the ledger no longer funds for the on-card deposit.
-    assert oncard_worst - charged == 2688 * xr.MIB
+
+def test_the_slot_is_ONE_value_across_publisher_term_and_arm_line():
+    """The identity section 10.8 step 3 demands, as a three-way assertion.
+
+    The value the launcher PUBLISHED to the ranks
+    (``ENV_ONCARD_SLOT_MIB`` -> ``tp.ONCARD_SLOT_BYTES_MAX``), the value the
+    TERM was sized with, and the value the ARM LINE printed must be one
+    number.  Two of the three agreeing is what hid the last drift, so all
+    three are compared here rather than pairwise.
+    """
+    from sglang.srt.weg2 import weight_exchange_transport as tp_
+
+    published = int(tp_.ONCARD_SLOT_BYTES_MAX)
+    terms = xb.bounce_terms(
+        bytes_per_direction=PLAIN_LAYER_BYTES * N_LAYERS, n_layers=N_LAYERS,
+        widest_layer_bytes=LAYER0_BYTES, pairs=xr.N_CARDS, depth=DEPTH,
+        slot_bytes=published,
+    )
+    printed = int(re.search(r"slot_mib=(\d+)", xb.arm_line(terms)).group(1))
+    assert terms.slot_bytes == published
+    assert printed == published // xr.MIB
+    assert printed == 128                    # the flag default, on this boot

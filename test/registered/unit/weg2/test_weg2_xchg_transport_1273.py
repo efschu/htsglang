@@ -61,6 +61,7 @@ os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 from sglang.srt.weg2 import weight_exchange as wx
 from sglang.srt.weg2 import weight_exchange_region as xr
 from sglang.srt.weg2 import weight_exchange_transport as tp
+from sglang.srt.weg2 import xchg_bounce as xb
 
 #: Small enough that batching, slot alternation and the double buffer are all
 #: exercised by a few kilobytes of payload.
@@ -2738,11 +2739,16 @@ def test_the_charged_deposit_is_the_geometry_the_planner_can_actually_derive():
     diagonal in the 256 MiB..1 GiB band -- the band the geometry exists for --
     refused ``ledger-cannot-fund-deposit``.
     """
-    from sglang.srt.weg2 import host_ledger as hl
 
     assert tp.ONCARD_DEPOSIT_BYTES_MAX == \
         tp.ONCARD_SLOTS_MAX * tp.ONCARD_SLOT_BYTES_MAX
-    assert hl.xchg_bounce_bytes_per_card() == tp.ONCARD_DEPOSIT_BYTES_MAX
+    # AMENDMENT 5: the ledger no longer charges this ceiling. The deposit's
+    # own SHAPE maximum still exists (it is the transport's, and the refusal
+    # below still grades a plan against a budget), but the CHARGE is
+    # `xchg_bounce.staging_bytes_per_card(published slot)`, and the two are
+    # deliberately different numbers now: 8 x slot vs SLOTS_PER_PAIR x slot.
+    assert xb.staging_bytes_per_card(tp.ONCARD_SLOT_BYTES_MAX) == xb.SLOTS_PER_PAIR * tp.ONCARD_SLOT_BYTES_MAX
+    assert xb.staging_bytes_per_card(tp.ONCARD_SLOT_BYTES_MAX) < tp.ONCARD_DEPOSIT_BYTES_MAX
     assert tp.ONCARD_DEPOSIT_BYTES_MAX == \
         4 * tp.ONCARD_SLOTS_MAX * tp.ONCARD_SLOT_BYTES, "the 4x understatement"
 
@@ -2754,15 +2760,16 @@ def test_the_charged_deposit_is_the_geometry_the_planner_can_actually_derive():
                   slot_bytes=plan.slot_bytes, mode=tp.ONCARD_MODE_HOST)
     assert plan.deposit_bytes > tp.ONCARD_SLOTS_MAX * tp.ONCARD_SLOT_BYTES
     assert tp.deposit_refusal_reason(
-        budget_bytes=hl.xchg_bounce_bytes_per_card(), **graded) == ""
+        budget_bytes=tp.ONCARD_DEPOSIT_BYTES_MAX, **graded) == ""
     assert tp.deposit_refusal_reason(
         budget_bytes=tp.ONCARD_SLOTS_MAX * tp.ONCARD_SLOT_BYTES,
         **graded) == tp.DEPOSIT_REASON_UNFUNDED
 
     # The card count is DERIVED from the region's own rank layout, not typed.
-    assert hl.xchg_bounce_bytes() == (xr.N_RANKS // 2) * \
-        hl.xchg_bounce_bytes_per_card()
-    assert hl.xchg_bounce_bytes(1) == hl.xchg_bounce_bytes_per_card()
+    # The GROUP-WIDE charge is the term's staging, priced once by the
+    # launcher: N_CARDS x SLOTS_PER_PAIR x published slot.
+    assert xr.N_CARDS * xb.staging_bytes_per_card(tp.ONCARD_SLOT_BYTES_MAX) == xr.N_CARDS * xb.staging_bytes_per_card(tp.ONCARD_SLOT_BYTES_MAX)
+    assert xr.N_CARDS == xr.N_RANKS // 2
 
 
 def test_the_two_sides_ring_depths_are_compared_and_not_assumed(
