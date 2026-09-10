@@ -90,12 +90,32 @@ def test_the_reader_does_not_shell_out():
     """`read_procs` must read /proc directly: a subprocess would put the tag
     into ANOTHER command line and re-create the self-match it exists to
     avoid."""
+    import ast
     import inspect
+    import textwrap
 
     src = inspect.getsource(ak.read_procs)
-    for bad in ("subprocess", "pgrep", "os.system", "popen"):
-        assert bad not in src, f"the reader shells out via {bad}"
-    assert "/cmdline" in src
+    # READ THE EXECUTED CODE, NOT THE TEXT -- sixth instance of this class
+    # today. `read_procs`' own docstring says "rather than shelling out to
+    # `pgrep`" in order to REJECT it, so a source-text grep reports the
+    # rejection as a use and this very assertion failed on its own subject.
+    fn = ast.parse(textwrap.dedent(src)).body[0]
+    body = fn.body[1:] if (
+        fn.body and isinstance(fn.body[0], ast.Expr)
+        and isinstance(fn.body[0].value, ast.Constant)
+    ) else fn.body
+    names = set()
+    for st in body:
+        for n in ast.walk(st):
+            if isinstance(n, ast.Name):
+                names.add(n.id)
+            if isinstance(n, ast.Attribute):
+                names.add(n.attr)
+            if isinstance(n, ast.Constant) and isinstance(n.value, str):
+                names.add(n.value)
+    for bad in ("subprocess", "pgrep", "system", "popen", "Popen", "check_output"):
+        assert bad not in names, f"the reader shells out via {bad}"
+    assert any("/cmdline" in n for n in names if isinstance(n, str))
 
 
 def test_the_reader_sees_this_very_process():
