@@ -16016,6 +16016,40 @@ class Scheduler(
 
         ret["hicache_prefetch"] = prefetch_residency(self.tree_cache)
 
+        # #1317c THE DRAIN'S PROGRESS SIGNAL, published where the front already
+        # polls (it reads `internal_states[0]` of `/get_server_info` for the
+        # draft terms), so the drain needs no new endpoint and no new poll.
+        #
+        # WHY IT EXISTS. Boot weg2sn6e: the front's drain refused three 120 s
+        # windows with `W1 Weg2DrainRefused: D still holds 1 request(s)` and
+        # escalated to `W2 Weg2DrainStuck -> WEG2 STOP`, while that request was
+        # DECODING NORMALLY -- 686 `Decode batch` lines, `#full token` climbing
+        # 8,814 -> 84,384. Every refusal was true as stated and wrong as used:
+        # the predicate reads RESIDENCY and is consumed as a WEDGE verdict, so
+        # a long generation and a livelock are indistinguishable to it. Under
+        # the standing user law (#1011: a decode runs to the end and is never
+        # cut) a decoding request is never a wedge, so the drain must be able
+        # to tell the difference -- and that needs a MONOTONE counter, not a
+        # residency count.
+        #
+        # NOTHING NEW IS COMPUTED HERE. `gen_tokens_total` is the existing
+        # never-reset decode counter (`metrics_reporter`: "Same tokens, never
+        # reset ... needs the serving group's work as a MONOTONE counter"),
+        # chosen over `num_generated_tokens` precisely because that one is
+        # zeroed every logging interval and cannot be differenced over a
+        # window. `forward_ct` rides along as the second witness: a livelock
+        # that spins forward passes without emitting tokens moves one and not
+        # the other, and a reader that sees only tokens could not tell those
+        # apart.
+        _mr = getattr(self, "metrics_reporter", None)
+        _rb = getattr(self, "running_batch", None)
+        ret["weg2_decode_progress"] = {
+            "gen_tokens_total": int(getattr(_mr, "gen_tokens_total", 0) or 0),
+            "prefill_tokens_total": int(getattr(_mr, "prefill_tokens_total", 0) or 0),
+            "forward_ct": int(getattr(self, "forward_ct", 0) or 0),
+            "running": len(getattr(_rb, "reqs", ()) or ()) if _rb is not None else 0,
+        }
+
         if (
             not self.spec_algorithm.is_none()
             and self.metrics_reporter.spec_total_num_forward_ct > 0

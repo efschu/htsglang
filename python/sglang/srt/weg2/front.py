@@ -834,6 +834,54 @@ def serviceable_route(uncached: int, carrier_est: int, x_tokens: int,
     return "long"
 
 
+def weg2_drain_progress_delta(
+    before: Optional[dict], after: Optional[dict]
+) -> Optional[dict]:
+    """#1317c: did D make decode progress across a drain window?
+
+    Pure, so the drain's verdict can be tested without a front, a group or an
+    event loop -- which is the whole reason the predicate lives here and not
+    inline in `flip`.
+
+    Returns None when EITHER sample is missing: an unreadable counter is an
+    absence and the caller must fall back to the old residency behaviour, never
+    read it as "no progress".
+
+    WHAT COUNTS AS PROGRESS, and why ``forward_ct`` deliberately does NOT.
+    Progress is WORK DELIVERED: decode tokens emitted (``gen_tokens_total``) or
+    prefill tokens consumed (``prefill_tokens_total``, so a request still
+    chunk-prefilling a long prompt is not called stalled either). ``forward_ct``
+    is REPORTED as a second witness but never licenses a wait on its own,
+    because a livelock that spins forward passes and emits nothing is exactly
+    the wedge this guard exists to catch -- crediting it as progress would take
+    the guard's teeth out while looking like a safety improvement. So:
+    tokens move -> WAIT; passes move but no tokens -> still a refusal, and the
+    line prints both numbers so a reader can see which shape it was.
+
+    A counter that went BACKWARDS is treated as no progress, not as a negative
+    delta -- that means a restart or a rebind, and the honest answer for the
+    window is "cannot say it worked".
+    """
+    if not isinstance(before, dict) or not isinstance(after, dict):
+        return None
+    tok = int(after.get("gen_tokens_total", 0) or 0) - int(
+        before.get("gen_tokens_total", 0) or 0
+    )
+    pre = int(after.get("prefill_tokens_total", 0) or 0) - int(
+        before.get("prefill_tokens_total", 0) or 0
+    )
+    fwd = int(after.get("forward_ct", 0) or 0) - int(
+        before.get("forward_ct", 0) or 0
+    )
+    return {
+        "tokens": max(0, tok),
+        "prefill_tokens": max(0, pre),
+        "forward": max(0, fwd),
+        "running": int(after.get("running", 0) or 0),
+        "progressed": tok > 0 or pre > 0,
+    }
+
+
 def x_refusal_marker_in(body_text: str) -> bool:
     """True iff this text carries D's named Weg2TpPrefillExceeded refusal.
 
@@ -3443,10 +3491,50 @@ class Front:
             code, text = await self.leg_rpc(g, path, body, timeout)
         return code, text, (time.perf_counter() - t0) * 1000
 
+    async def _weg2_decode_progress(self, g: Group) -> Optional[dict]:
+        """#1317c: D's monotone progress counters, or None if unreadable.
+
+        Read off the SAME endpoint the front already polls for the draft terms
+        (`/get_server_info` -> `internal_states[0]`), so this adds no new poll
+        and no new endpoint. None -- never a zero -- when the read fails or the
+        group does not publish the block: an unreadable counter must reach the
+        caller as an ABSENCE, so it can keep the old residency behaviour
+        instead of reading "no progress" out of a failed HTTP call and
+        manufacturing the very W2 this change exists to prevent.
+        """
+        try:
+            async with self.session.get(f"{g.url}/get_server_info") as r:
+                info = await r.json() if r.status == 200 else None
+            if isinstance(info, list) and info:
+                info = info[0]
+            if not isinstance(info, dict):
+                return None
+            st = info.get("internal_states") or []
+            if isinstance(st, list) and st and isinstance(st[0], dict):
+                info = st[0]
+            blk = info.get("weg2_decode_progress")
+            return blk if isinstance(blk, dict) else None
+        except Exception as e:  # noqa: BLE001 - an instrument never breaks the flip
+            logger.debug("weg2 decode progress unavailable: %s: %s", type(e).__name__, e)
+            return None
+
     async def drain(self, g: Group) -> bool:
+        """Wait for the group to go empty, and RECORD whether it was working.
+
+        #1317c: the return value still answers only "did it go empty", because
+        that is what the flip needs. What changed is that a refusal is no
+        longer self-evidently a wedge: this samples D's monotone counters at
+        both ends of the window and leaves the delta on
+        ``self._drain_progress`` for `flip` to read. A window in which D
+        emitted tokens or ran forward passes is a WAIT, not a refusal.
+        """
         t0 = time.time()
+        before = await self._weg2_decode_progress(g)
+        self._drain_progress = None
         while g.outstanding:
             if time.time() - t0 > self.drain_deadline_s:
+                after = await self._weg2_decode_progress(g)
+                self._drain_progress = weg2_drain_progress_delta(before, after)
                 return False
             await asyncio.sleep(0.25)
         return True
@@ -3541,6 +3629,36 @@ class Front:
         logger.info("WEG2-FLIP begin epoch=%d sleep=%s wake=%s outstanding=%d queue=%d", self.epoch, src, dst, len(S.outstanding), len(self.queue))
         # 1. drain (W1/W2)
         if not await self.drain(S):
+            # #1317c PROGRESS BEFORE VERDICT. A window in which D made decode
+            # progress is a WAIT, not a refusal: under the standing user law
+            # (#1011, "er decoded zuende ... und flippt dann zurueck") a
+            # decoding request runs to the end and is never cut, so it can
+            # never be a wedge. W1 counts only a NO-PROGRESS window, and the
+            # streak resets on a working one -- so W2 still needs three
+            # consecutive windows in which D moved nothing, which is what the
+            # guard was always meant to catch. The 120 s window is unchanged.
+            #
+            # An UNREADABLE counter (None) keeps the OLD behaviour and says so:
+            # it must not be read as "no progress", or a failed HTTP call would
+            # manufacture the W2 this change exists to prevent.
+            _prog = getattr(self, "_drain_progress", None)
+            if _prog is not None and _prog.get("progressed"):
+                self.counters["weg2_drain_waiting"] += 1
+                logger.warning(
+                    "WEG2 DRAIN WAITING decode progress rids=%s tokens=%d "
+                    "prefill_tokens=%d forward=%d running=%d window=%.0fs "
+                    "streak_reset_from=%d "
+                    "(denominator: drain windows that ended non-empty; this one "
+                    "is a WAIT, not a W1 -- D emitted tokens or ran forward "
+                    "passes inside it, and #1011 says a decode is never cut)",
+                    sorted(S.outstanding)[:8], _prog.get("tokens", 0),
+                    _prog.get("prefill_tokens", 0), _prog.get("forward", 0),
+                    _prog.get("running", 0),
+                    self.drain_deadline_s, self.drain_refusals_in_a_row,
+                )
+                self.drain_refusals_in_a_row = 0
+                self.state = "serving" if self.state != "STOP" else "STOP"
+                return
             self.drain_refusals_in_a_row += 1
             self.counters["W1_Weg2DrainRefused"] += 1
             logger.error("W1 Weg2DrainRefused: %s still holds %d request(s) after %.0f s (rids %s) suspended=%d; "
