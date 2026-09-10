@@ -2809,7 +2809,20 @@ def choose(
             # priced at zero instead of leaving a reader to ask whether it was
             # priced at all -- and `slots x slot_bytes x cards` of /dev/shm on
             # the arms that create the file, charged at both moments.
-            f"xchg_bounce={arm.terms['xchg_bounce_gib']:.2f} -> "
+            f"xchg_bounce={arm.terms['xchg_bounce_gib']:.2f} "
+            # #1332 (S6 slice 1): THE TWO HOST-WEIGHT RESIDENCIES, SIDE BY
+            # SIDE ON ONE LINE. `host_weights` is Sigma H -- the region
+            # preallocated at the whole weight image, charged once and never
+            # shrinking for the life of the boot -- and `xchg_bounce` is the
+            # bounded buffer that is meant to replace it (user law 2026-09-11,
+            # spec section 10). The slice's entire acceptance is that the
+            # first goes to 0.00 while the second stands in for it, so they
+            # must be readable in ONE grep and must never be folded into one
+            # figure: a single number carrying both would make exactly that
+            # transition unobservable. Sigma H is also on the TERMS line, but
+            # that is a different line and a reader comparing two lines is a
+            # reader who can mismatch two boots.
+            f"host_weights={arm.terms['host_ring_gib']:.2f} -> "
             f"leftover launch={arm.launch_leftover_gib:.2f} GiB "
             # #1317n BOTH FORMS ON THE LINE, because the class assignment is
             # the whole change and a reader must be able to see it rather than
