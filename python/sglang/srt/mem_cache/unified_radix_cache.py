@@ -221,6 +221,23 @@ class UnifiedTreeNode:
         self.id = UnifiedTreeNode.counter
         UnifiedTreeNode.counter += 1
         self.write_through_pending_id: Optional[int] = None
+        # #1317 C2: THE STORE-PRESENCE FACT, and why it is not second
+        # bookkeeping.
+        #
+        # `backuped` answers "are this node's KV rows in THIS rank's host
+        # pool". Nothing on this node answered "are its pages in L3", and the
+        # windowed store read needs exactly that: it frees a window's host
+        # rows once the span is on the device, and a row may only be freed if
+        # the pages behind it can be read again. Upstream carries this as
+        # `backuped_storage`; this fork dropped it, which is why every reader
+        # here had to fall back to `backuped` and thereby ask about the wrong
+        # tier. Restored at TWO writers and nowhere else:
+        #   * the storage-write ack (`_drain_backup`) -- the write landed;
+        #   * the prefetch-completion host insert -- the pages CAME from L3,
+        #     so they are present by construction.
+        # Never set from a prediction, never cleared to hide a failure: a
+        # False here costs one re-read, a wrong True loses KV.
+        self.l3_present: bool = False
 
     def component(self, component_type: ComponentType) -> ComponentData:
         return self.component_data[component_type]
@@ -3036,7 +3053,19 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             node = queue.pop(0)
             for child in list(node.children.values()):
                 queue.append(child)
-            if node is self.root_node or node.evicted or node.backuped:
+            # #1317 C2/R-5: `l3_present` joins `backuped` as a skip reason.
+            # Without it, every node whose host rows the windowed store read
+            # recycled reads as un-backed here and is re-written through
+            # `write_backup` -- a duplicate D->H copy AND a duplicate L3 write
+            # that refills the host pool at exactly the flush where it must be
+            # empty. The pages are already in the store; there is nothing to
+            # publish.
+            if (
+                node is self.root_node
+                or node.evicted
+                or node.backuped
+                or node.l3_present
+            ):
                 continue
             if node.component_data[BASE_COMPONENT_TYPE].value is None:
                 continue
@@ -4426,6 +4455,19 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 host_indices[:min_completed_tokens],
                 hash_value[: min_completed_tokens // self.page_size],
             )
+            # #1317 C2 WRITER 2 of 2: these pages CAME OUT OF L3 -- the
+            # prefetch is what read them -- so their presence there is a fact
+            # of this code path, not a prediction. Marked on the chain the
+            # insert newly adopted, so a window recycled below can be
+            # re-read. The walk starts at the insert's OWN deepest node
+            # (`inserted_host_node`, the handle the insert already returns)
+            # and stops at `last_host_node`: that is exactly the span this
+            # completion published, and the #841 contiguous-backup law makes
+            # the chain between them unbroken.
+            if not insert_result.host_span_unclaimed:
+                self._mark_l3_present_span(
+                    insert_result.inserted_host_node, last_host_node
+                )
             # #1061: the adopted tail arrived via the PREFETCH arm. Only the
             # keys the tree NEWLY adopted count as arrivals -- the matched
             # head (`prefix_len`) was already resident, and a declined insert
@@ -5078,6 +5120,12 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 entry = self.ongoing_backup.pop(operation.id, None)
                 if entry is not None:
                     node, lock_params = entry
+                    # #1317 C2 WRITER 1 of 2: the L3 write acked, so the pages
+                    # behind this node's rows are re-readable and the windowed
+                    # store read may recycle those rows. Set on the ack and
+                    # never on the issue -- an issued write that never landed
+                    # would license a free that loses the KV.
+                    node.l3_present = True
                     self.dec_host_lock_ref(node, lock_params)
                 # #810: the storage write acked -- this is the drain the
                 # staging ring measures its residency against. Outside the
@@ -5737,6 +5785,136 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 self._finish_write_through_ack(ack_id)
             finish_count -= 1
 
+    def _mark_l3_present_span(
+        self,
+        deepest: Optional[UnifiedTreeNode],
+        stop_at: Optional[UnifiedTreeNode],
+    ) -> int:
+        """#1317 C2 writer 2: mark a span whose pages came out of L3.
+
+        Walks up from *deepest* to (excluding) *stop_at*, or to the root if
+        the chain does not reach it. Returns the number of nodes marked, so
+        the caller can print a denominator instead of asserting an effect.
+        """
+        marked = 0
+        node = deepest
+        while node is not None and node is not stop_at and node is not self.root_node:
+            if not node.l3_present:
+                node.l3_present = True
+                marked += 1
+            node = node.parent
+        return marked
+
+    def release_staged_window(self, node: UnifiedTreeNode) -> int:
+        """#1317 C1: free one window's HOST rows once its span is on the device.
+
+        THE DEFECT THIS DELETES. This fork's host tier RETAINS in both host
+        roles -- `_drain_backup` answers a storage ack with `ring.release` +
+        `dec_host_lock_ref` and never frees the rows, and `evict_host` has no
+        role branch (`cache_controller.prefetch_rate_limited`'s own docstring
+        says both, verbatim). So under `--hicache-host-role staging` the tier
+        calls itself a transient staging buffer and behaves like a retention
+        cache. A store read therefore holds the WHOLE matched prefix in the
+        host pool at once, and the pool -- 30,518 rows on group D -- becomes
+        the ceiling on how long a prompt may be. That ceiling is the carrier
+        bound, and the double prefill is what it causes.
+
+        WHY `evict_host` CANNOT DO THIS. `_is_host_leaf` requires
+        `node.evicted` (no KV on the device) and no children, and
+        `FullComponent.drive_host_eviction` walks only `evictable_host_leaves`.
+        A window that has just been loaded back is device-RESIDENT and has a
+        child (the next window's anchor), so it is a member of neither set: the
+        LRU can never reclaim it, and the release has to be explicit. Verified
+        statically against both predicates.
+
+        THE TWO PRECONDITIONS, and they are checked here rather than trusted:
+          * DEVICE-RESIDENT: `not node.evicted`. The caller is the load-back
+            ack drain, which has already called `finish_event.synchronize()`,
+            so the H->D copy has landed -- not merely been enqueued.
+          * STORE-PRESENT: `node.l3_present` (C2). A row may only be recycled
+            if its pages can be read again. Without this the release would be
+            the load-then-invalidate half of #904 one tier up: KV that exists
+            in neither pool nor store.
+        Plus the pin: `host_lock_ref == 0` on every component. The funnel
+        below does NOT check the host pin (it checks only the device one,
+        #904), so a window still pinned by a concurrent prefetch anchor must
+        be skipped here or its rows are freed under the reader.
+
+        Returns the number of host tokens freed -- 0 whenever any precondition
+        fails, which is a skip and not an error: the rows are simply released
+        later, by the ordinary host eviction, once the node evicts.
+        """
+        if self.cache_controller is None or self.disable:
+            return 0
+        if node is None or node is self.root_node:
+            return 0
+        if node.evicted:
+            # Not device-resident: freeing the host copy here would drop the
+            # only copy this rank holds.
+            return 0
+        if not node.l3_present:
+            return 0
+        if any(cd.host_lock_ref > 0 for cd in node.component_data):
+            return 0
+        if not node.backuped:
+            return 0
+        tracker: dict[ComponentType, int] = {ct: 0 for ct in self.tree_components}
+        for comp in self._components_tuple:
+            if not comp.node_has_component_data(node, target=EvictLayer.HOST):
+                continue
+            self._evict_component_and_detach_lru(
+                node, comp, target=EvictLayer.HOST, tracker=tracker
+            )
+        freed = tracker[BASE_COMPONENT_TYPE]
+        # The node changed tier membership: it is no longer an H-leaf
+        # candidate and may now be a D-leaf. Both sets are recomputed by the
+        # one authority rather than edited here.
+        self._update_evictable_leaf_sets(node)
+        if node.parent is not None:
+            self._update_evictable_leaf_sets(node.parent)
+        if freed:
+            self._weg2_window_rows_recycled = (
+                getattr(self, "_weg2_window_rows_recycled", 0) + freed
+            )
+            self._weg2_window_nodes_recycled = (
+                getattr(self, "_weg2_window_nodes_recycled", 0) + 1
+            )
+        return freed
+
+    def release_staged_window_chain(
+        self, deepest: UnifiedTreeNode, stop_at: Optional[UnifiedTreeNode] = None
+    ) -> tuple[int, int]:
+        """#1317 C1: release a whole loaded window, leaf-first.
+
+        Leaf-first is not a preference: `release_staged_window` refuses a
+        node that still has a host-backed child only through the #841
+        contiguous-backup law (a parent may not lose its host copy while a
+        child holds one), so walking up from the deepest node is what keeps
+        the law. Returns (nodes, tokens).
+
+        *stop_at* is the RESUME ANCHOR of the current head and is never
+        released: the next window's `prefetch_from_storage` uses it as its
+        continuation anchor (`last_hash`, `inc_host_lock_ref`), and a chain
+        whose own anchor was recycled stalls at the next window with an
+        unmatchable node -- the R-4 failure, which is why `anchor_slots`
+        appears in `solve_window` at all.
+        """
+        nodes = 0
+        tokens = 0
+        cur = deepest
+        while cur is not None and cur is not stop_at and cur is not self.root_node:
+            parent = cur.parent
+            freed = self.release_staged_window(cur)
+            if freed <= 0:
+                # A pinned or not-yet-stored node stops the walk: everything
+                # above it is its ancestor and the #841 law forbids freeing an
+                # ancestor while this one keeps its host copy.
+                break
+            nodes += 1
+            tokens += freed
+            cur = parent
+        return nodes, tokens
+
     def loading_check(self) -> None:
         """Poll load-back completions."""
         cc = self.cache_controller
@@ -5754,7 +5932,64 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 node, lock_params, host_lock_params = self.ongoing_load_back.pop(ack_id)
                 self.dec_lock_ref(node, lock_params)
                 self.dec_host_lock_ref(node, host_lock_params)
+                # #1317 C1: THE WINDOW'S ROUND BOUNDARY. The H->D copy is
+                # synchronized above, so this span is device-resident right
+                # now; under the staging role its host rows are transient by
+                # definition and go back to the pool so the NEXT window can
+                # allocate. Under `retention` nothing is freed and this whole
+                # build is inert -- the role is the gate, one conditional, not
+                # interleaved into the default path.
+                if self._staging_host_role():
+                    # THE RESUME ANCHOR IS NOT RECYCLED (C7/R-4). The walk
+                    # starts at the PARENT, so `node` -- the deepest node of
+                    # the span just loaded, and therefore the continuation
+                    # anchor the next store read will hand to
+                    # `prefetch_from_storage` as `last_host_node` -- keeps its
+                    # host copy. Recycling it would work only by accident:
+                    # `inc_host_lock_ref` silently takes no pin on a node with
+                    # no `host_value` (`acquire_component_lock`, lock_host
+                    # arm), so the next read's anchor would be unprotected
+                    # rather than refused. One node of host rows is the price
+                    # of not having that class at all.
+                    _n, _t = self.release_staged_window_chain(node.parent)
+                    if _n:
+                        self._log_window_release(node, _n, _t)
             finish_count -= 1
+
+    def _staging_host_role(self) -> bool:
+        """True when the host tier is the transient staging buffer.
+
+        Read off the CONTROLLER's own field rather than the server args, so a
+        phase rebind cannot leave this reading the role of the other phase.
+        """
+        cc = self.cache_controller
+        return cc is not None and str(getattr(cc, "host_role", "retention")) == "staging"
+
+    def _log_window_release(
+        self, node: UnifiedTreeNode, nodes: int, tokens: int
+    ) -> None:
+        """One line per window, with rank-uniform terms only.
+
+        Every term here is a property of the group's MIN-synced pool or a
+        count of this rank's own act; nothing is compared across ranks, so
+        this line can be read side by side across the three D logs and a
+        difference is a finding rather than an artifact of the instrument.
+        """
+        n = getattr(UnifiedRadixCache, "_weg2_window_n", 0) + 1
+        UnifiedRadixCache._weg2_window_n = n
+        pool = getattr(self.cache_controller, "mem_pool_host", None)
+        size = int(getattr(pool, "size", 0) or 0)
+        avail = int(pool.available_size()) if pool is not None else 0
+        logger.info(
+            "#1317 WINDOW-RELEASE n=%d node=%s tier=L2->free nodes=%d tokens=%d "
+            "pool_rows=%d available_after=%d rows_recycled_total=%d "
+            "nodes_recycled_total=%d "
+            "(denominator: load-back acks drained under the staging host role "
+            "on this rank; tokens are KV host rows, not prompt tokens)",
+            n, getattr(node, "id", "?"), nodes, tokens, size, avail,
+            getattr(self, "_weg2_window_rows_recycled", 0),
+            getattr(self, "_weg2_window_nodes_recycled", 0),
+        )
 
     # ---- HiCache: Scheduler Entry Points ----
 
