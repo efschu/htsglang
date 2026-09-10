@@ -798,12 +798,57 @@ def serviceable_route(uncached: int, carrier_est: int, x_tokens: int,
 
     THE INVARIANT: a request whose uncached extent exceeds D's prefill cap is
     NEVER routed to a D single prefill, because D refuses it BY CONSTRUCTION
-    and no amount of retrying changes a static cap. If the carrier also
+    and no amount of retrying changes a static cap.
+
+    #1317d AMENDED THE SECOND HALF. It used to read: "If the carrier also
     refuses it, no route exists and the honest answer is ONE named refusal at
-    admission, not a requeue loop that spends 22 s to reach a 503.
+    admission." That was true while D's host staging pool was a CAP on prompt
+    length. It is not any more -- design A prices D's extent against store
+    presence and the window loop streams the span through the pool in windows
+    -- so "the carrier refuses it" no longer means "no route exists". The
+    two-leg P route serves that population, and ``none`` is now unreachable
+    from the carrier bound. It survives in this function's vocabulary only for
+    a caller that disables the P route entirely.
     """
     fits_d_prefill = x_tokens <= 0 or uncached <= x_tokens
     fits_carrier = carrier_max <= 0 or carrier_est <= carrier_max
+    # #1317d SCOPE 3 (user ruling 2026-09-10): THE CARRIER IS NO LONGER A CAP
+    # ON PROMPT LENGTH, SO IT NO LONGER TERMINATES A ROUTE.
+    #
+    # `carrier_max` was "what can move through D's host staging pool AS ONE
+    # PIECE", and the whole of #1317 exists to end that: design A prices D's
+    # uncached extent against STORE presence, and the window loop streams the
+    # store-backed span through the staging pool in W-sized windows. The pool
+    # is TRANSIT now, not a ceiling. So a prompt above the carrier gets the
+    # two-leg route it always should have had -- leg 1 on P, write-through to
+    # L3, then offered to D -- instead of a D single prefill or a 413.
+    #
+    # THE POPULATION THIS IS FOR, measured: the user's prompts are 50-100k
+    # tokens. Boot weg2sn6c, rid weg2-2-4: `W52 Weg2NoServiceableRoute
+    # uncached=18453 exceeds X=8742 ... carrier_est=48011 exceeds
+    # carrier_max=27466` -- a 413 at admission for a prompt the rig can serve,
+    # and W52 appeared 1x in the front log and 0x in D's, i.e. D never even
+    # got to price it. That request is exactly what this branch now routes.
+    #
+    # THE FALLBACK IS NOT REMOVED AND NEEDS NO FRONT PLUMBING, which is why
+    # this change is one branch and not a new state machine: if the store
+    # cannot vouch for the prefix when D prices it (a cold first pass whose
+    # write-through has not landed, a failed backup), D's uncached extent
+    # stays large and D's OWN `exempt_carrier_exceeds` arm -- deliberately
+    # untouched by this commit -- admits it as a single prefill. So the chain
+    # is: store vouches -> A credits -> D decodes with a remainder <= one
+    # chunk; store silent -> D's named exemption single-prefills it. Never a
+    # 413 for a servable prompt, and never a hand-priced guess at the front:
+    # the front stops deciding what D can do and lets D's own admission
+    # verdict decide, which is what the ruling asked for.
+    #
+    # PHASE LAW, STATED PLAINLY RATHER THAN GLOSSED: on the credited path D
+    # prefills at most one chunk (anchor-capped store depth + the #939 law,
+    # and X >= C on every path), so the law holds. On the FALLBACK path D
+    # prefills above X -- that is the pre-existing exemption, it is the ONLY
+    # path on which it happens, and it is retained here by explicit user
+    # ruling ("exemption + 413 band stay until A is proven on metal"). It is
+    # not introduced by this commit and it is not hidden by it.
     if not fits_carrier:
         # The store cannot be read into D, so the two-leg route is out: only a
         # single prefill on D could serve it -- and only if D can prefill it.
@@ -824,8 +869,15 @@ def serviceable_route(uncached: int, carrier_est: int, x_tokens: int,
         # may only DOWNGRADE the route, never terminate it: the request goes
         # to D as before, and the exact count taken at the response
         # (`_note_exact`) makes the NEXT decision on this text terminal.
-        # Only a measured `carrier_exact` count refuses.
-        return "none" if carrier_exact else "carrier_single"
+        # #1317d: WAS `return "none" if carrier_exact else "carrier_single"`.
+        # Both answers were wrong once the window loop landed: "none" is a 413
+        # for a prompt P can prefill and the store can hand back, and
+        # "carrier_single" hands D a prefill 1.7x its own cap (the sb5f
+        # measurement in this docstring). The P route serves it, and the
+        # `carrier_exact` distinction stops mattering here -- it existed only
+        # to keep an ESTIMATE from producing a terminal refusal, and this
+        # branch no longer produces one at all.
+        return "long"
     if fits_d_prefill:
         return "short"
     # X < uncached <= carrier: THE P ROUTE. This is the verdict that produced
