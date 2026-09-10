@@ -23,8 +23,6 @@ something unservable, not merely by changing a number:
       -> test_only_the_group_agreed_verdict_arms_the_window
 """
 
-import pytest
-
 from sglang.srt.managers import tp_head_congruence as thc
 from sglang.srt.weg2 import host_ledger
 
