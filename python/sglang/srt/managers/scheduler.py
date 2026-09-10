@@ -6210,6 +6210,28 @@ class Scheduler(
         )
         return "released"
 
+    def _weg2_windowed_store_read_active(self) -> bool:
+        """#1317j: is this group serving store reads in WINDOWS?
+
+        True when the tree can window a store read at all -- storage enabled
+        and the host tier is the transient staging buffer C1 recycles. Under
+        those two the pool is TRANSIT and a span larger than it is servable,
+        so the "cannot fit even with the pool empty" premise no longer holds.
+
+        Read off the controller's own `host_role`, never the server args, for
+        the same reason `_staging_host_role` does: a phase rebind would
+        otherwise leave this reading the role of the other phase.
+
+        FALSE keeps the pre-#1317 behaviour exactly, so a retention-role group
+        (and any tree without a controller) is byte-identical to before.
+        """
+        if not getattr(self, "enable_hicache_storage", False):
+            return False
+        cc = getattr(self.tree_cache, "cache_controller", None)
+        if cc is None:
+            return False
+        return str(getattr(cc, "host_role", "retention")) == "staging"
+
     def _apply_group_shortfall_deferral(
         self, req, rid: str, span, marked: bool, site: str
     ) -> Optional[str]:
@@ -6259,7 +6281,42 @@ class Scheduler(
             _note_prefetch_gate("defer_refused")
             return "refused"
         limit = self._prefetch_capacity_limit_or_none()
-        if span is not None and limit is not None and int(span) > int(limit):
+        # #1317j THE UNDEFERRABLE ARM IS RETIRED ON THE SHORTFALL PATH, and it
+        # is the wall a 159k-token prompt hits on its FIRST window.
+        #
+        # THE PREDICATE WAS `span > limit`, with `span` =
+        # `req._prefetch_span_tokens` (`scheduler.py:5217`,
+        # `len(_new_input_tokens)`) = the WHOLE remaining prompt, and `limit` =
+        # `prefetch_capacity_limit` = 0.9 x 30,518 = 27,466. So for the user's
+        # live 159,000-token prompt the first group trim priced
+        # span 159,000 > 27,466 and took the undeferrable exit ON THE FIRST
+        # MARK -- this method's own docstring says so: "takes the
+        # carrier-exceeds path on the FIRST mark and never defers at all".
+        # The request then goes to the recompute path, the X gate prices its
+        # whole extent, and the C4/C6 window loop NEVER ENGAGES. Seven windows
+        # of 24,576 were unreachable by construction.
+        #
+        # WHY THE PREMISE IS RETIRED, not merely inconvenient. The arm's
+        # reasoning is "a span the budget can never hold does not become
+        # holdable by deferring". That was TRUE before #1317: a read either
+        # fitted the staging pool or it did not. With the windowed store read
+        # a span LARGER than the pool is exactly what the loop serves, one
+        # window at a time -- the same premise the carrier bound lost in
+        # #1317d, one tier down.
+        #
+        # AND ON THIS PATH THE POOL HAS ALREADY PROVEN IT HOLDS THE READ: the
+        # shortfall verdict means the read REGISTERED and was CUT to the
+        # group's common room, so what is resident is `group_len <= limit` BY
+        # CONSTRUCTION. Asking whether the pool could have held the whole ASK
+        # is asking about a quantity nobody is trying to allocate. The RATE arm
+        # keeps this predicate, and correctly: there nothing registered, so the
+        # ask is the only number there is.
+        if (
+            span is not None
+            and limit is not None
+            and int(span) > int(limit)
+            and not self._weg2_windowed_store_read_active()
+        ):
             # Carrier-exceeds. Identical predicate and identical exit to the
             # rate arm's: a span the budget can never hold does not become
             # holdable by deferring, so it proceeds on the recompute path.
@@ -6283,6 +6340,7 @@ class Scheduler(
             req.prefetch_defer_attempts = 1
             req.prefetch_defer_passes = 0
             req.prefetch_defer_since = time.monotonic()
+            req._weg2_defer_windows = 1
             _note_prefetch_gate("deferred")
             _note_prefetch_gate("deferred_shortfall")
             # L14, edge-triggered: the FIRST deferral only, never per pass.
