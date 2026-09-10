@@ -37,37 +37,56 @@ TWO PATHS, because P and D do not agree about a tensor's shape
   deposits the unit into the host bounce buffer and each destination collects
   ITS OWN ROWS.  This carries the other ~99.98 %.
 
-THE STREAMING UNIT IS A ROW BAND, NOT A WHOLE LAYER -- A STATED DEVIATION
--------------------------------------------------------------------------
-Section 10.2 sizes the assemble buffer at ``bytes_per_direction / n_layers``
-(27.12 GiB / 64 = 433.9 MiB) while section 10.5 bounds the refusal at the
+SIZING: AMENDMENT 3 SUPERSEDES SECTION 10.2, WHICH WAS A MEAN
+-------------------------------------------------------------
+Section 10.2 sized the assemble buffer at ``bytes_per_direction / n_layers``
+(27.12 GiB / 64 = 433.9 MiB) while section 10.5 bounded the refusal at the
 WIDEST layer, "not the mean; sizing on the mean is how a boot dies on layer
-47".  Those two sentences cannot both hold for a whole-unit slot, and the
-census settles which one the hardware agrees with
-(``/spinning/gpu-arb/weg2/tools/layer_unit_census.py`` over
-``Qwen3.8-27B-INT8-gdncov-vocabembed``, safetensors headers only, no GPU):
+47".  Those two cannot both hold, and the checkpoint census settled it
+(PLAN_S6_BOUNCE_0911 AMENDMENT 3, from ``weg2/checkpoint_census.py``;
+independently reproduced by ``/spinning/gpu-arb/weg2/tools/layer_unit_census.py``
+-- both read the same 18 safetensors headers, no GPU, and agree on the widest
+layer to the BYTE):
 
-    unit=decoder layer   n=64    mean 368.9 MiB   WIDEST  721.3 MiB  (1.95x)
-    unit=non-layer       n=342                    WIDEST 2425.0 MiB  (lm_head)
-    unit=parameter       n=1608  mean  17.5 MiB   WIDEST 2425.0 MiB  (138x)
-    unit=ROW (indivisible run)                    WIDEST   17408 B
+    WIDEST layer  = layers.0 = 756,323,776 B = 721 MiB   (1.66x the mean)
+    mean layer    = 386.9 MiB                (this module never computes with it)
+    layered total = 24.76 GiB, unlayered = 4.79 GiB (embed / lm_head / MTP)
+    widest UNLAYERED class = lm_head.weight = 2425 MiB
+    widest indivisible ROW = 17408 B
 
-So a whole-unit slot at depth 2 costs ``2 x 2425.0`` = 4.74 GiB and the bounce
-total becomes 5.49 GiB, not section 10.2's 1.60 GiB.  The unit here is
-therefore a ROW BAND cut to the slot, which keeps section 10.2's size exactly
-and moves the hard bound to the widest indivisible RUN -- and that cut is not
-a new mechanism: it is ``transport.batch_descs``, which already "splits a
-STRIDED2D descriptor by ROWS, a row being the smallest unit whose pitch
-arithmetic stays exact", and already refuses (W68) a run above the slot.
+Layer 0 is the widest because it carries the linear-attention family
+(``in_proj_qkv``/``z``/``a``/``b``, ``conv1d``, ``A_log``, ``dt_bias``) ON TOP
+OF the MLP triple -- so the widest layer is a DIFFERENT SHAPE from the mean
+layer, not merely a bigger one, and a double that models only the MLP triple
+would be testing the wrong form.
 
-CONSEQUENCE FOR SECTION 10.5, NAMED RATHER THAN QUIETLY DROPPED: the
-"buffer < one layer" and "buffer < widest layer" refusals would refuse a
-configuration that WORKS under the band cut, so they are not implemented as
-refusals.  What is implemented is the bound no cut can survive
-(:func:`refuse_if_slot_short`, the widest RUN) plus the PRINTING of
-``widest_unit_bytes`` and the per-unit band count on the acceptance line, so
-"this boot would die on layer 47" is answerable from the log instead of being
-traded for a refusal that fires on healthy boots.
+Buffer = ``widest x depth 2`` = 1442 MiB, path (a) staging 384 MiB, bounce
+total 1826 MiB = 1.78 GiB, released 42.96 -> 1.78 GiB (24x).  A section-10.2
+buffer (868 MiB) could not have assembled the widest layer at all.
+
+THE DECIDE THIS MODULE MAKES: A LAYER IS ASSEMBLED WHOLE, AN UNLAYERED CLASS
+IS BANDED (2026-09-11, appended to section 10, reported to the operator).
+``lm_head`` at 2425 MiB does not fit the 721 MiB slot, so the two options are
+a slot sized on ``max(layer, unlayered)`` -- 4850 MiB buffer, 5.11 GiB bounce
+total, 37.85 GiB released (8.4x) -- or the widest LAYER with the unlayered
+classes cut into row bands: 1443 MiB, 1.78 GiB, 41.18 GiB released (24.1x).
+The second IS AMENDMENT 3's own 1826 MiB / 24x, so the plan's figure already
+presupposes it; the first would triple the host residency the law exists to
+shrink, for two tensors.  And the law's word is *"das layer"*: ``lm_head`` is
+not a layer.  ``lm_head`` takes 4 bands at a 721 MiB slot, a band is a
+complete set of ROWS, and each destination's slice of a band is the
+descriptor's own row map -- so banding costs correctness nothing.  What it
+costs is that the class is not resident whole, which the law does not ask for
+outside a layer, and :attr:`BounceResult.banded` prints which classes those
+were so it is answerable from the log rather than argued.
+
+A LAYER above the slot is therefore still a REFUSAL
+(:func:`refuse_if_plan_exceeds_slot`), and the band mechanism is not an escape
+hatch from it.  The cut itself is not a new mechanism either: it is
+``transport.batch_descs``, which already "splits a STRIDED2D descriptor by
+ROWS, a row being the smallest unit whose pitch arithmetic stays exact", and
+already refuses (W68) a run above the slot -- the floor no cut can go below,
+measured at 17408 B and therefore unable to fire at any sane slot.
 
 NO NEW W-CODE (section 10.5's closing sentence).  The refusals reuse
 ``Weg2XchgPlanDisagree`` (W68) for a run the slot cannot hold and
@@ -165,6 +184,18 @@ class Unit:
     @property
     def tag(self) -> str:
         return self.key[0]
+
+    @property
+    def is_layer(self) -> bool:
+        """Is this unit a decoder LAYER, or an unlayered class?
+
+        The distinction decides whether the unit must be assembled COMPLETE in
+        one depth-slot.  The user law says *"das layer ... vollstaendig
+        zusammengesetzt"* -- it speaks of a LAYER, and ``lm_head`` (2425 MiB
+        measured) is not one.  See :func:`refuse_if_plan_exceeds_slot` for the
+        decide this property carries.
+        """
+        return self.key[1].startswith("layers.")
 
     def bands(self, slot_bytes: int) -> int:
         """How many slot-sized bands this unit is cut into."""
@@ -264,8 +295,27 @@ def refuse_if_plan_exceeds_slot(slot_bytes: int, descs: Sequence[object],
     units = plan_units(descs)
     if not units:
         return
-    widest = widest_unit(units)
-    if widest.nbytes <= int(slot_bytes):
+    # THE DECIDE (AMENDMENT 3 follow-up, 2026-09-11): only a LAYER must be
+    # assembled complete in one slot.  An UNLAYERED class is banded instead.
+    #
+    # Forced by the plan's own arithmetic rather than chosen: measured on this
+    # checkpoint's headers the widest layer is 756,323,776 B = 721 MiB while
+    # `lm_head.weight` is 2425 MiB and `embed_tokens` 1212 MiB.  Sizing the
+    # slot on `max(layer, unlayered)` costs a 4850 MiB buffer, a 5.11 GiB
+    # bounce total and releases 37.85 GiB (8.4x); sizing it on the widest LAYER
+    # and banding the unlayered classes costs 1443 MiB, a 1.78 GiB total and
+    # releases 41.18 GiB (24.1x) -- which IS AMENDMENT 3's own 1826 MiB / 24x.
+    # So the amendment's figure already presupposes this decide, and option A
+    # would triple the host residency the law exists to shrink, for two
+    # tensors, while the law's word is "layer".
+    #
+    # `lm_head` takes 4 bands at a 721 MiB slot.  A band is a complete set of
+    # ROWS and each destination's slice of it is the descriptor's own row map,
+    # so banding costs correctness nothing; what it costs is that the class is
+    # not resident whole, which the law does not ask for outside a layer.
+    layered = [u for u in units if u.is_layer]
+    widest = widest_unit(layered) if layered else None
+    if widest is None or widest.nbytes <= int(slot_bytes):
         return
     if terms is None:
         # No ARM term to quote (a caller that sized by hand, i.e. a test or a
@@ -461,6 +511,13 @@ class BounceResult:
     deposit_ms: float = 0.0
     collect_ms: float = 0.0
     short: Tuple[str, ...] = field(default_factory=tuple)
+    #: Units that did NOT fit one depth-slot and were therefore banded.  By
+    #: the AMENDMENT 3 decide these may only ever be UNLAYERED classes
+    #: (``lm_head`` takes 4 bands at a 721 MiB slot); a LAYER among them is a
+    #: refusal, not a log line, so this list existing is not an escape hatch --
+    #: it is how "which classes are not resident whole" stays answerable from
+    #: the log instead of being argued.
+    banded: Tuple[str, ...] = field(default_factory=tuple)
 
     @property
     def verdict(self) -> str:
@@ -497,7 +554,9 @@ class BounceResult:
             f"deposited={self.deposited_bytes} collected={self.collected_bytes} "
             f"planned={self.planned_bytes} "
             f"deposit_ms={self.deposit_ms:.1f} collect_ms={self.collect_ms:.1f} "
-            f"overlap={self.overlap} verdict={self.verdict}"
+            f"banded={len(self.banded)}"
+            + (f" banded_units={','.join(self.banded)}" if self.banded else "")
+            + f" overlap={self.overlap} verdict={self.verdict}"
         )
 
 
@@ -666,6 +725,12 @@ def run_bounce_leg(
         )
     widest = widest_unit(units)
     planned = sum(u.nbytes for u in units)
+    # By the AMENDMENT 3 decide these are UNLAYERED classes only -- a LAYER
+    # above the slot was already refused above, so this list can never carry
+    # one, and the test that pins that is
+    # `test_a_layer_above_the_slot_refuses_but_an_unlayered_class_bands`.
+    banded = tuple(u.key[1] for u in units
+                   if u.nbytes > int(slot_bytes))
 
     bounce = LayerBounce(ops, boot_nonce, slot_bytes=slot_bytes, depth=depth,
                          create=True, shm_root=shm_root)
@@ -726,7 +791,7 @@ def run_bounce_leg(
         widest_run_bytes=widest_run(descs),
         overlap=("ok" if int(depth) >= 2 else "none"),
         deposit_ms=deposit_ms, collect_ms=collect_ms,
-        short=tuple(short),
+        short=tuple(short), banded=banded,
     )
     (log or logger.info)("%s", result.line())
     return result
