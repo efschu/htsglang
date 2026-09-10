@@ -6066,6 +6066,219 @@ class Scheduler(
         pages = (max(0, int(span_tokens)) + page_size - 1) // page_size
         return base + pages * per_page
 
+    # ------------------------------------------------------------------
+    # #1317k PROGRESS-LIVENESS REPLACES THE WALL-CLOCK BOUNDS
+    #
+    # USER RULING 2026-09-10, verbatim: *"warum gibts überhaupt eine
+    # Zeitschranke? entweder es lädt (warten) oder es lädt nicht (Fehler ->
+    # Abbruch)"*. There is no third state, and a clock cannot tell the two
+    # apart: `_deferred_prefetch_bound_s` expires on a HEALTHY slow load
+    # (a 109k-token store read is legitimately slower than a 27k one, and the
+    # bound is priced off the span the read is not allowed to have) and it
+    # does NOT expire on a chain that is provably dead but young. Both errors
+    # were paid for: on boots weg2sn6k/weg2sn6l the chain re-issued ten times
+    # in 61 s without advancing, and the honest verdict -- "this read is not
+    # loading" -- was available on round two.
+    #
+    # WHAT REPLACES IT. A WITNESS OF PROGRESS, not of time: the terms below
+    # are the five quantities the prefetch/window chain moves when it is
+    # working (tokens matched, host rows recycled, windows registered/closed,
+    # bytes landed) plus whether an operation is in flight at all. While ANY
+    # of them changes, the defer stands, unconditionally and without a bound
+    # of any kind -- that is the "es lädt (warten)" half, and no number can
+    # cut it short. While NONE of them changes, the pass count of that
+    # standstill rises, and past `_weg2_prefetch_stall_passes()` the read is
+    # declared NOT LOADING and the request is answered with a NAMED ERROR.
+    #
+    # THE PASS COUNT IS NOT A DISGUISED CLOCK. It counts OBSERVATIONS OF THE
+    # CHAIN in which the chain did not move, so it cannot expire on a load
+    # that is merely slow: any movement at all resets it to zero. A wall-clock
+    # bound has the opposite property, which is precisely the defect.
+    #
+    # THE DANGER DIRECTION IS EXPLICIT: a stuck load with zero progress must
+    # still TERMINATE, never spin. `in_flight` is a term of the witness, so a
+    # read that sits in `ongoing_prefetch` forever without landing a byte
+    # holds the witness CONSTANT and therefore trips the stall exit -- the lost
+    # -ack shape (#989/#1157) cannot wedge the request.
+    #
+    # AND THE TERMINAL EXIT IS AN ERROR TO THE CLIENT, NEVER A FALLBACK.
+    # Falling back to "admit and price it as it stands" is what produced the
+    # phase-law violation on both boots: D prefilled 80,459 tokens against
+    # X=11,101 through the carrier-exceeds exemption, 7.2x over X, with P's
+    # prefill already spent (`kein-d-direct-prefill-ueber-x`). A named 503 is
+    # the honest outcome of a store read that will not load; a silent
+    # recompute over X is not.
+    # ------------------------------------------------------------------
+    def _weg2_prefetch_stall_passes(self) -> int:
+        """How many CONSECUTIVE no-progress observations declare a dead read.
+
+        PASSES, NOT SECONDS, and the unit is the whole point (see the block
+        above). Env-overridable for a boot that wants to see the spin rather
+        than the refusal; the default is deliberately generous, because the
+        cost of one extra pass is one scheduler iteration and the cost of a
+        premature refusal is a served request turned into a 503.
+        """
+        try:
+            return max(
+                2, int(os.environ.get("SGLANG_WEG2_PREFETCH_STALL_PASSES", "64"))
+            )
+        except (TypeError, ValueError):
+            return 64
+
+    def _weg2_prefetch_progress_terms(self, req) -> tuple:
+        """The witness: every quantity the store-read chain moves when it works.
+
+        Rank-local by construction and consumed rank-locally, exactly as the
+        clock it replaces was (`_apply_prefetch_deferral`'s own docstring:
+        "timed off this rank's clock"). This is STRICTLY more rank-uniform
+        than that clock: scheduler passes advance in lockstep across a phase
+        while wall clocks drift freely, so no divergence class is added and
+        one is removed.
+
+        Never raises: every read is getattr-with-default plus int coercion,
+        and the one length-taking read uses len() with an explicit None test
+        (the #1176 round-6 defect -- `bool()` of a torch tensor raises).
+        """
+        tc = getattr(self, "tree_cache", None)
+        _pi = getattr(req, "prefix_indices", None)
+        try:
+            resident = 0 if _pi is None else len(_pi)
+        except TypeError:
+            resident = 0
+        rid = str(getattr(req, "rid", "") or "")
+        ongoing = getattr(tc, "ongoing_prefetch", None)
+        try:
+            in_flight = 1 if (ongoing and rid in ongoing) else 0
+        except TypeError:
+            in_flight = 0
+        return (
+            resident + int(getattr(req, "host_hit_length", 0) or 0),
+            int(getattr(tc, "_weg2_window_rows_recycled", 0) or 0),
+            int(getattr(tc, "_weg2_window_nodes_recycled", 0) or 0),
+            int(getattr(self, "_weg2_window_closed", 0) or 0),
+            int(getattr(self, "_weg2_window_reissues", 0) or 0),
+            int(getattr(req, "_prefetch_registered_prefix_len", 0) or 0),
+            in_flight,
+        )
+
+    def _weg2_note_prefetch_progress(self, req) -> str:
+        """``'progress'`` | ``'stalled'`` | ``'terminal'`` for ONE observation.
+
+        The whole replacement for the two DEFER EXPIRED bounds. Stores the
+        witness on the request, so the comparison is per request and a busy
+        neighbour cannot mask a dead read (or vice versa).
+        """
+        terms = self._weg2_prefetch_progress_terms(req)
+        last = getattr(req, "_weg2_progress_terms", None)
+        if last != terms:
+            req._weg2_progress_terms = terms
+            req._weg2_no_progress_passes = 0
+            return "progress"
+        n = int(getattr(req, "_weg2_no_progress_passes", 0) or 0) + 1
+        req._weg2_no_progress_passes = n
+        return "terminal" if n >= self._weg2_prefetch_stall_passes() else "stalled"
+
+    def _weg2_store_load_terminal(
+        self,
+        req,
+        arm: str,
+        span,
+        site: str,
+        code: str = "W88",
+        name: str = "Weg2StoreLoadNotProgressing",
+        detail: str = "",
+    ) -> str:
+        """The read is NOT loading: answer the client by name. ``'failed'``.
+
+        ONE terminal exit for the whole chain, parameterised by the W-code that
+        describes WHICH honest failure it is (W88 the standstill, W89 a chain
+        that closed with the prompt uncovered), so both refusals give back the
+        same resources through the same helpers and neither can grow its own
+        half-complete copy of this teardown.
+
+        NEVER A FALLBACK. The request is removed from the waiting queue and
+        answered with a 503 naming the arm, the span and the standstill --
+        never admitted "priced as it stands", which is the path that
+        prefilled 80,459 tokens over X on both boots.
+
+        Every give-back the W50 exit makes is made here too, for the same
+        reason and through the same helpers: this request was matched, the
+        match may hold a COW mamba slot, and this is now the only exit it
+        will take.
+        """
+        from sglang.srt.mem_cache.match_refusal_census import (
+            note_prefetch_gate as _note_prefetch_gate,
+        )
+
+        rid = str(getattr(req, "rid", "?"))
+        passes = int(getattr(req, "_weg2_no_progress_passes", 0) or 0)
+        terms = getattr(req, "_weg2_progress_terms", None)
+        self._clear_prefetch_deferral_fields(req)
+        req._weg2_window_open = False
+        # The mark's partition identity is preserved: every DEFERRED mark still
+        # has exactly one exit, and this is the exit that used to be
+        # defer_expired. The census key is kept so the acceptance's
+        # deferred == landed + defer_expired + ... identity still balances;
+        # what changed is that the exit no longer admits over X.
+        _note_prefetch_gate("defer_expired")
+        self._weg2_store_load_failed = getattr(self, "_weg2_store_load_failed", 0) + 1
+        message = (
+            f"{code} {name}: the HiCache store read for this request did not "
+            f"deliver. {detail or f'The chain stood still for {passes} consecutive scheduler passes -- not one of (matched tokens, host rows recycled, windows closed, windows re-issued, registered span, operation in flight) changed.'} "
+            f"arm={arm} span={span} site={site}. There is no time bound here: "
+            f"while the read progresses it is waited for without limit. A read "
+            f"that is not loading is refused BY NAME rather than served by "
+            f"prefilling this group over its own --tp-prefill-max-tokens bound."
+        )
+        logger.error(
+            "%s %s rid=%s arm=%s span=%s site=%s "
+            "no_progress_passes=%d bound_passes=%d witness=%s n=%d -- terminal, "
+            "answered 503; never admitted over X (denominator: every deferred "
+            "store read this exit answered)",
+            code, name, rid[:16], arm, span, site, passes,
+            self._weg2_prefetch_stall_passes(), terms,
+            self._weg2_store_load_failed,
+        )
+        refused_id = id(req)
+        self.waiting_queue = [q for q in self.waiting_queue if id(q) != refused_id]
+        _tc = getattr(self, "tree_cache", None)
+        if _tc is not None and release_admission_acquired_mamba_slot(
+            req, _tc, site="weg2_store_load_terminal"
+        ):
+            logger.info(
+                "#991 GIVE-BACK rid=%s site=weg2_store_load_terminal -- the COW "
+                "slot this admission's match acquired, returned on the W88 exit",
+                rid[:16],
+            )
+        try:
+            if self.enable_hicache_storage:
+                self.tree_cache.release_aborted_request(req.rid)
+            elif self.enable_hierarchical_cache:
+                self.tree_cache.terminate_prefetch(req.rid)
+        except Exception:
+            # The answer must go out regardless -- a release that raises may
+            # not swallow the client's error. Logged with the traceback rather
+            # than passed, so it is a finding and not a silence.
+            logger.warning(
+                "W88 rid=%s: releasing the aborted store read raised; the "
+                "client is answered anyway", rid[:16], exc_info=True,
+            )
+        abort_req = AbortReq(
+            finished_reason={
+                "type": "abort",
+                "status_code": HTTPStatus.SERVICE_UNAVAILABLE,
+                "message": message,
+            },
+            rid=req.rid,
+        )
+        try:
+            req.time_stats.trace_ctx.abort(abort_info=abort_req.finished_reason)
+        except Exception:
+            # Tracing may never eat the answer.
+            logger.debug("W88 rid=%s: trace abort raised", rid[:16], exc_info=True)
+        self.ipc_channels.send_to_tokenizer.send_output(abort_req, req)
+        return "failed"
+
     def _apply_prefetch_deferral(self, req, verdict: str, site: str) -> Optional[str]:
         """Route one prefetch verdict through the A12.2 deferral state machine.
 
@@ -6156,23 +6369,31 @@ class Scheduler(
             # A retry that is still rate-limited.
             req.prefetch_defer_attempts = int(getattr(req, "prefetch_defer_attempts", 0)) + 1
             req.prefetch_defer_passes = int(getattr(req, "prefetch_defer_passes", 0)) + 1
-            waited = time.monotonic() - float(getattr(req, "prefetch_defer_since", 0.0))
-            bound = self._deferred_prefetch_bound_s(span or 0)
-            if waited > bound:
-                # Exit (2): the wedge-freedom bound. Admitted with
-                # reason=rate_expired; counted.
+            # #1317k Exit (2) is now PROGRESS-PRICED, not time-priced. The
+            # RATE arm's mark means "nothing registered, the budget is busy",
+            # so its stall exit keeps the pre-#1068 ACTION -- admitted and
+            # priced as it stands -- because no store read was ever promised
+            # here and there is nothing to fail. What changed is the
+            # CONDITION: a busy budget that is still draining (any witness
+            # term moving) is waited for without a bound, and only a budget
+            # that has not moved for `_weg2_prefetch_stall_passes()`
+            # consecutive observations releases the mark.
+            progress = self._weg2_note_prefetch_progress(req)
+            if progress == "terminal":
                 req.prefetch_deferred = None
                 _note_prefetch_gate("defer_expired")
                 logger.warning(
-                    "#1068 PREFETCH DEFER EXPIRED rid=%s waited_s=%.1f bound_s=%.1f "
-                    "attempts=%d span=%d -- admitted with reason=rate_expired; the "
-                    "bound is the #968/#1065 length-priced prefetch timeout for "
-                    "this span, so a stuck budget cannot hold the queue forever",
+                    "#1317k PREFETCH DEFER STALLED rid=%s arm=rate attempts=%d "
+                    "span=%d no_progress_passes=%d bound_passes=%d -- admitted "
+                    "with reason=rate_stalled. NO WALL CLOCK: the prefetch "
+                    "budget did not move for that many consecutive passes, so "
+                    "it is not draining; while it drains this waits without a "
+                    "bound. Denominator: every rate mark re-observed at a retry",
                     rid,
-                    waited,
-                    bound,
                     int(req.prefetch_defer_attempts),
                     -1 if span is None else int(span),
+                    int(getattr(req, "_weg2_no_progress_passes", 0) or 0),
+                    self._weg2_prefetch_stall_passes(),
                 )
                 return "expired"
             return "deferred"
@@ -6258,15 +6479,21 @@ class Scheduler(
           cannot be made to fit by waiting for anyone, so it takes the
           carrier-exceeds path on the FIRST mark and never defers at all --
           which is also why the repeat case cannot loop on it.
-        * **waited too long** -> the EXISTING ``DEFER EXPIRED`` bound,
-          ``_deferred_prefetch_bound_s``, the same length-priced timeout the
-          rate arm uses and the same one the X gate reads.
+        * **stopped moving** -> #1317k: the standstill exit. This USED to be
+          ``DEFER EXPIRED`` on the length-priced wall clock
+          (``_deferred_prefetch_bound_s``); it is now the progress witness,
+          and on the WINDOWED path it answers the client W88 rather than
+          admitting the request to be recomputed over X. The docstring is
+          corrected here rather than left standing, because a docstring that
+          asserts a bound the code no longer has is the same drift that let
+          three tiers of the carrier barrier be retired at three separate
+          times.
         * **landed whole on the retry** -> falls out of this method into the
           normal LANDED path below, because the retry's verdict is then plain
           ``issued``.
 
         A REPEAT TRUNCATION IS A RE-DEFER, NOT A SECOND MECHANISM: the pool
-        was still busy, the read is still coming, and the bound is what stops
+        was still busy, the read is still coming, and the witness is what stops
         it.  The attempt counter rises so the boot can see a rid that is
         losing the race rather than one that is waiting once.
         """
@@ -6378,22 +6605,38 @@ class Scheduler(
             return "deferred"
         req.prefetch_defer_attempts = int(getattr(req, "prefetch_defer_attempts", 0)) + 1
         req.prefetch_defer_passes = int(getattr(req, "prefetch_defer_passes", 0)) + 1
-        waited = time.monotonic() - float(getattr(req, "prefetch_defer_since", 0.0))
-        bound = self._deferred_prefetch_bound_s(span or 0)
-        if waited > bound:
+        # #1317k THE SHORTFALL ARM'S EXIT IS THE ONE THE USER RULED ON, and it
+        # is the one whose ACTION changes as well as its condition. Here a read
+        # DID register and P's prefill IS in the store, so "admitted and priced
+        # as it stands" means recomputing on D what the store already holds --
+        # measured on weg2sn6k/sn6l as 80,459 tokens against X=11,101 through
+        # the carrier-exceeds exemption, 7.2x over X, which is exactly the
+        # standing veto (`kein-d-direct-prefill-ueber-x`). So:
+        #   progress (any witness term moved) -> wait, with NO bound;
+        #   standstill for the pass bound     -> W88 to the client, terminal.
+        # Off the windowed path the pre-#1317 ACTION is preserved (admit and
+        # price), because there the pool is a retention cache and a short read
+        # is a cache miss, not a failed handover.
+        progress = self._weg2_note_prefetch_progress(req)
+        if progress == "terminal":
+            if self._weg2_windowed_store_read_active():
+                return self._weg2_store_load_terminal(
+                    req, arm=_DEFER_REASON_SHORTFALL, span=span, site=site
+                )
             req.prefetch_deferred = None
             _note_prefetch_gate("defer_expired")
             logger.warning(
-                "#1068 PREFETCH DEFER EXPIRED rid=%s waited_s=%.1f bound_s=%.1f "
-                "attempts=%d span=%d reason=%s -- the read was cut again after "
-                "the bound; admitted and priced as it stands, so a staging pool "
-                "that never frees cannot hold the queue forever",
+                "#1317k PREFETCH DEFER STALLED rid=%s arm=%s attempts=%d span=%d "
+                "no_progress_passes=%d bound_passes=%d -- admitted and priced as "
+                "it stands. NO WALL CLOCK; this is the RETENTION-role path, "
+                "where a short read is a cache miss rather than a failed "
+                "handover, so the pre-#1317 action is preserved",
                 rid,
-                waited,
-                bound,
+                _DEFER_REASON_SHORTFALL,
                 int(req.prefetch_defer_attempts),
                 -1 if span is None else int(span),
-                _DEFER_REASON_SHORTFALL,
+                int(getattr(req, "_weg2_no_progress_passes", 0) or 0),
+                self._weg2_prefetch_stall_passes(),
             )
             return "expired"
         return "deferred"
@@ -10011,8 +10254,49 @@ class Scheduler(
         req._weg2_window_open = still_owed
         if still_owed:
             self._weg2_window_owed = getattr(self, "_weg2_window_owed", 0) + 1
+            # #1317k THE SPIN IS TERMINATED HERE TOO, on the same witness and
+            # by the same rule. `still_owed` re-arms the mark unconditionally,
+            # and on weg2sn6k/sn6l that produced ten identical rounds in 61 s
+            # (`matched` frozen at 98,302 of 109,131, `closed_total` 0,
+            # `WINDOW-RELEASE` 0) with no exit of any kind: the loop had no
+            # notion of NOT ADVANCING. A round that moved nothing is now an
+            # observation of a standstill, and the bound is in observations.
+            if self._weg2_note_prefetch_progress(req) == "terminal":
+                logger.error(
+                    "#1317k WINDOW LOOP NOT PROGRESSING rid=%s n=%d matched=%d "
+                    "total=%d owed_total=%d closed_total=%d -- the re-issue "
+                    "verdict stayed `issued:truncated_group` while not one "
+                    "witness term moved for the bound; terminal by name "
+                    "instead of a further round",
+                    str(getattr(req, "rid", "?"))[:16], n,
+                    len(req.prefix_indices)
+                    + int(getattr(req, "host_hit_length", 0) or 0),
+                    len(getattr(req, "full_untruncated_fill_ids", ()) or ()),
+                    getattr(self, "_weg2_window_owed", 0),
+                    getattr(self, "_weg2_window_closed", 0),
+                )
+                return self._weg2_store_load_terminal(
+                    req, arm="window_loop", span=None, site="reissue"
+                )
         else:
             self._weg2_window_closed = getattr(self, "_weg2_window_closed", 0) + 1
+            # #1317k (item 2) THE MULTI-WINDOW WITNESS, WHICH DID NOT EXIST.
+            # `still_owed` treats "the read landed WHOLE" and "the read was
+            # DECLINED" as one state -- this method's own lifecycle table says
+            # so ("the read landed whole, OR was declined") -- and NOTHING
+            # compared the covered prefix against the prompt at close. So a
+            # decline closed the chain silently and the request was then
+            # priced at whatever it happened to hold, which is the
+            # whole-prompt-uncached shape one tier up.
+            #
+            # A CHAIN MAY ONLY CLOSE COVERED. The residual allowance is the
+            # #939 one-chunk law, for the reason the anchors force: anchors
+            # are per RADIX NODE (there is no interval flag on this tree), so
+            # a #915 page-floored window end that does not land on a node
+            # boundary leaves a shortfall, and one chunk is exactly what that
+            # may cost (#1172). More than that is not a rounding residue --
+            # it is an uncovered span, and it is named rather than priced.
+            self._weg2_check_window_coverage(req, verdict)
         if n <= 10 or n % 64 == 0:
             logger.info(
                 "#1317 WINDOW-REISSUE n=%d rid=%s verdict=%s still_owed=%s "
@@ -10027,6 +10311,124 @@ class Scheduler(
                 getattr(self, "_weg2_window_closed", 0),
             )
         return verdict
+
+    def _weg2_window_residual_allowance(self) -> int:
+        """The #939 one-chunk allowance, in tokens, for a closing chain.
+
+        ONE chunk, read from the static ``chunked_prefill_size`` -- the same
+        number and the same source ``_draft_chunk_pages`` uses, because it is
+        the same law: a window end is page-floored (#915) while a resume
+        anchor exists per radix NODE, so the shortfall a legal close may carry
+        is bounded by the chunk the nodes are cut on, and never by more.
+        """
+        try:
+            chunk = int(getattr(self.server_args, "chunked_prefill_size", 0) or 0)
+        except Exception:  # noqa: BLE001
+            chunk = 0
+        return chunk if chunk > 0 else 4096
+
+    def _weg2_check_window_coverage(self, req, verdict: str) -> Optional[str]:
+        """#1317k (item 2): a closing window chain must have COVERED the prompt.
+
+        The witness the multi-window read did not have. ``observe_store_witness``
+        (#1176) is a per-ADMISSION observer of four candidate presence readings
+        against a re-admission stamp; it says nothing about a chain of windows
+        and it decides nothing by construction. What was missing is the
+        question a windowed read makes possible to ask at all: **when the chain
+        closes, is the prompt covered?**
+
+        THE THREE TERMS, all rank-local and consumed as a rank-local
+        observation exactly like the witness they extend:
+          matched  = ``len(prefix_indices) + host_hit_length`` -- the same
+                     expression the WINDOW-REISSUE line prints, so the two
+                     readings cannot drift;
+          total    = ``len(full_untruncated_fill_ids)`` -- the prompt;
+          residual = total - matched.
+
+        A residual within the allowance is a legal close (the page-floor/node
+        boundary residue, #1172). A residual ABOVE it is an uncovered span,
+        and the honest answer is a NAMED refusal (W89) rather than pricing the
+        request at what it happens to hold -- because pricing it is the path
+        that ends in D prefilling the uncovered remainder over X.
+
+        Returns the outcome name, or None when there is nothing to judge.
+        """
+        total = len(getattr(req, "full_untruncated_fill_ids", ()) or ())
+        if total <= 0:
+            return None
+        _pi = getattr(req, "prefix_indices", None)
+        try:
+            resident = 0 if _pi is None else len(_pi)
+        except TypeError:
+            resident = 0
+        # ONLY A CHAIN WITH NOTHING FURTHER COMING MAY BE JUDGED, and this is
+        # the false-positive the first draft of this check would have had:
+        # `matched` is read from the TREE, while a read that was just issued
+        # lands its span at completion, several passes later. So a close on
+        # `issued` (the read landed whole) or with an operation still in
+        # flight legitimately reads a large residual. Judged only when the
+        # chain is closing on a DECLINE with no pending read -- which is
+        # exactly the state `still_owed=False` conflated with success.
+        if verdict.startswith("issued") or self._weg2_store_read_is_pending(req):
+            self._weg2_window_coverage_pending = (
+                getattr(self, "_weg2_window_coverage_pending", 0) + 1
+            )
+            return "pending"
+        matched = resident + int(getattr(req, "host_hit_length", 0) or 0)
+        residual = total - matched
+        allowance = self._weg2_window_residual_allowance()
+        self._weg2_window_coverage_checks = (
+            getattr(self, "_weg2_window_coverage_checks", 0) + 1
+        )
+        n = self._weg2_window_coverage_checks
+        covered = residual <= allowance
+        if covered:
+            if n <= 8 or n % 64 == 0:
+                logger.info(
+                    "#1317k WINDOW COVERAGE rid=%s verdict=%s matched=%d total=%d "
+                    "residual=%d allowance=%d ok=True n=%d (denominator: every "
+                    "window chain that CLOSED on this rank; the residual is the "
+                    "page-floored window end against the per-node resume anchor, "
+                    "#1172, and one chunk is its whole legal size)",
+                    str(getattr(req, "rid", "?"))[:16], verdict, matched, total,
+                    residual, allowance, n,
+                )
+            return "covered"
+        # NOT covered, and NOT priced. Uncovered means the chain stopped with
+        # a real span of the prompt neither resident nor loaded, so the store
+        # did not carry the handover; saying so is the only honest outcome.
+        self._weg2_window_coverage_short = (
+            getattr(self, "_weg2_window_coverage_short", 0) + 1
+        )
+        logger.error(
+            "W89 Weg2WindowChainClosedShort rid=%s verdict=%s matched=%d total=%d "
+            "residual=%d allowance=%d n=%d -- the window chain closed while %d "
+            "token(s) of the prompt were neither device-resident nor loaded from "
+            "the store, which is more than the one-chunk page-floor residue a "
+            "legal close may carry. The chain closes on ANY verdict that is not "
+            "`issued:truncated_group`, so a DECLINE closed it exactly as a whole "
+            "read would have; that conflation is the defect this reading exists "
+            "to catch (denominator: every closed chain)",
+            str(getattr(req, "rid", "?"))[:16], verdict, matched, total,
+            residual, allowance, self._weg2_window_coverage_short, residual,
+        )
+        return self._weg2_store_load_terminal(
+            req,
+            arm="window_chain_short",
+            span=residual,
+            site="close",
+            code="W89",
+            name="Weg2WindowChainClosedShort",
+            detail=(
+                f"The window chain closed on verdict={verdict} while {residual} "
+                f"token(s) of the {total}-token prompt were neither "
+                f"device-resident nor loaded from the store -- more than the "
+                f"one-chunk ({allowance}) page-floor residue a legal close may "
+                f"carry (#1172: the resume anchors are per radix node, so a "
+                f"page-floored window end must land on a node boundary or the "
+                f"shortfall must stay inside one chunk)."
+            ),
+        )
 
     def _weg2_note_window_verdict(self, req, verdict: str) -> None:
         """#1317 C6: arm the window mark from a GROUP-agreed prefetch verdict.
@@ -10305,6 +10707,29 @@ class Scheduler(
         unbounded wait -- that is the wedge this defer exists to avoid,
         wearing the other costume.
         """
+        # #1317k THE THIRD WALL CLOCK ON THE SAME CHAIN, RETIRED ON THE
+        # WINDOWED PATH. Under the windowed store read this bound prices a
+        # request because a CLOCK ran out, on a read whose whole design is to
+        # take several rounds -- and pricing it means the whole-prompt extent,
+        # W31, and then the carrier-exceeds exemption prefilling it on D over
+        # X. The terminal decision now belongs to exactly ONE place, the
+        # deferral machinery's progress witness, which answers the client by
+        # name (W88) instead of handing the request to the recompute path. So
+        # the gate defers for as long as the read exists; it is the witness,
+        # not the clock, that ends the wait.
+        #
+        # UNBOUNDED IS NOT A WEDGE HERE, and that is the load-bearing claim:
+        # `_weg2_store_read_is_pending` is True only while an
+        # `ongoing_prefetch` record exists or the #1068 mark stands, and BOTH
+        # of those are terminated by the witness -- `in_flight` is one of its
+        # terms, so a read that sits in flight without landing a byte holds
+        # the witness constant and trips the stall exit. The wedge the old
+        # bound guarded against is closed by the mechanism that replaced it,
+        # not left open.
+        #
+        # OFF the windowed path the derivation is byte-identical to before.
+        if self._weg2_windowed_store_read_active():
+            return float("inf")
         span = len(getattr(req, "full_untruncated_fill_ids", None) or
                    getattr(req, "origin_input_ids", None) or ())
         try:

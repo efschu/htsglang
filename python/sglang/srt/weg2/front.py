@@ -1506,6 +1506,7 @@ class Front:
     def __init__(self, prefill: str, decode: str, awake: str, tag: str, store_dir: str,
                  prefill_sid: int, decode_sid: int, dc_reserve: Dict[str, int], w_s: float,
                  weight_chunks: int = 0, carrier_max_tokens: int = 0,
+                 windowed_carrier: bool = False,
                  p_concurrency: int = DEFAULT_P_BS, d_bs: int = DEFAULT_D_BS,
                  tp_prefill_max_tokens: int = X_FALLBACK_TOKENS,
                  flip_min_work_tokens: Optional[int] = None,
@@ -1677,6 +1678,31 @@ class Front:
         # routed to ONE prefill on D instead (no leg 1) -- served, single
         # prefill, and named as the carrier bound it is.
         self.carrier_max_tokens = int(carrier_max_tokens)
+        #: #1317k IS D'S STORE READ WINDOWED? Set by the launcher from the
+        #: argv it itself ships to group D (`--hicache-host-role staging`), so
+        #: it cannot drift from what D actually runs.
+        #:
+        #: WHAT IT TURNS OFF, and only that: the POST-LEG-1 carrier barrier in
+        #: `_leg1_on_p`. `carrier_max_tokens` was "what D's host staging pool
+        #: can carry AS ONE READ", and under the windowed read that is no
+        #: longer the bound on a PROMPT -- it is the bound on ONE WINDOW, and
+        #: the loop serves a prompt larger than the pool one window at a time
+        #: (the premise `serviceable_route` lost in #1317d and the scheduler's
+        #: shortfall arm lost in #1317j; this is the third and last site of
+        #: the same class). Keeping it is what forced leg 2 into a single
+        #: prefill on D and let D prefill 80,459 tokens against X=11,101 on
+        #: boots weg2sn6k and weg2sn6l -- 7.2x over X, with P's prefill
+        #: already spent, which is the standing veto
+        #: `kein-d-direct-prefill-ueber-x`.
+        #:
+        #: AND THE HONEST OUTCOME IS AN ERROR, NOT A FALLBACK. If D cannot
+        #: load the prompt from the store it answers W88/W89 with a 503, and
+        #: `is_x_refusal` deliberately does not match those, so a
+        #: non-loading store read reaches the CLIENT as a named error instead
+        #: of being re-routed into another P prefill or served by a D
+        #: recompute over X. "Either it loads (wait) or it does not load
+        #: (error -> abort)", user ruling 2026-09-10.
+        self.windowed_carrier = bool(windowed_carrier)
         self.exact_tokens: Dict[str, int] = {}
         # #1233 fix 8: the DORMANT-IMAGE measurement, one per group at its FIRST
         # sleep.  The launcher takes P's (un-interleaved, before D exists); the
@@ -2708,7 +2734,8 @@ class Front:
                 self._note_p_prefix_reuse(p, ct)
                 self.spans.record(p.text, pt)
                 self._note_exact(p.text, pt)
-                if self.carrier_max_tokens > 0 and pt > self.carrier_max_tokens and not p.skip_leg1:
+                if (self.carrier_max_tokens > 0 and pt > self.carrier_max_tokens
+                        and not p.skip_leg1 and not self.windowed_carrier):
                     # The realised count says D cannot read this prompt from the
                     # store (host staging pool bound): leg 2 is ONE prefill on D,
                     # not a reroute/W16 loop. P's prefill was spent; counted.
@@ -2716,6 +2743,28 @@ class Front:
                     self.counters["carrier_exceeds_after_leg1"] += 1
                     logger.warning("WEG2-ROUTE rid=%s CARRIER-EXCEEDS after leg 1: prompt_tokens=%d > carrier_max=%d; leg 2 = single prefill on D",
                                    p.rid, pt, self.carrier_max_tokens)
+                elif (self.carrier_max_tokens > 0 and pt > self.carrier_max_tokens
+                        and not p.skip_leg1 and self.windowed_carrier):
+                    # #1317k THE BARRIER IS RETIRED, AUDIBLY. Without this line
+                    # the retirement is invisible on a boot: the request simply
+                    # proceeds, and a reader cannot tell "the barrier was
+                    # retired" from "the barrier never fired". It prints the
+                    # two numbers whose comparison used to end the round trip
+                    # here, and the window count the store must now walk.
+                    self.counters["carrier_exceeds_after_leg1_retired"] += 1
+                    logger.warning(
+                        "#1317k CARRIER-EXCEEDS-AFTER-LEG-1 RETIRED rid=%s "
+                        "prompt_tokens=%d > carrier_max=%d n=%d -- the whole "
+                        "prompt exceeds ONE window of D's staging pool, which "
+                        "USED to send leg 2 to a single prefill on D (and, "
+                        "through D's carrier-exceeds exemption, over X). Under "
+                        "the windowed store read the pool is TRANSIT, so leg 2 "
+                        "takes the ordinary store-credited route and a read "
+                        "that will not load is answered by name (W88/W89) "
+                        "rather than recomputed. Denominator: leg-1 completions "
+                        "whose realised prompt exceeded the carrier bound",
+                        p.rid, pt, self.carrier_max_tokens,
+                        self.counters["carrier_exceeds_after_leg1_retired"])
                 g.served += 1
                 logger.info("WEG2-SERVED group=P leg=1 rid=%s prompt_tokens=%d cached_tokens=%d wall=%.2fs epoch=%d",
                             p.rid, pt, ct, time.time() - t0, self.epoch)
@@ -4776,6 +4825,15 @@ def main():
                     help="C13/K10: seconds a group may still hold requests before a flip is refused "
                          "by name (W1 -> W2). Today's shipped value, promoted from a literal.")
     ap.add_argument("--weight-chunks", type=int, default=0, help="#1233: number of weights_<k> chunk tags both groups were built with (0 = single weights tag)")
+    ap.add_argument("--windowed-carrier", action="store_true",
+                    help="#1317k: group D reads the store in WINDOWS (its host "
+                         "tier runs --hicache-host-role staging). Retires the "
+                         "POST-LEG-1 carrier barrier only: a prompt larger than "
+                         "one window is served by the window loop instead of by "
+                         "one prefill on D, and a store read that will not load "
+                         "is answered by name (W88/W89) instead of being "
+                         "recomputed on D over --tp-prefill-max-tokens. Set by "
+                         "the launcher from the argv it ships to group D.")
     ap.add_argument("--carrier-max-tokens", type=int, default=0,
                     help="#1233 zero-remainder: longest prompt group D can read from the store. "
                          "0 = no CARRIER-EXCEEDS route -- and that is NOT an off switch for the "
@@ -4828,6 +4886,7 @@ def main():
         dc[k] = int(v)
     front = Front(args.prefill, args.decode, args.awake, args.tag, args.store_dir, args.prefill_sid, args.decode_sid, dc, args.fairness_w_s,
                   weight_chunks=args.weight_chunks, carrier_max_tokens=args.carrier_max_tokens,
+                  windowed_carrier=args.windowed_carrier,
                   p_concurrency=args.p_concurrency, d_bs=args.d_bs,
                   tp_prefill_max_tokens=args.tp_prefill_max_tokens,
                   flip_min_work_tokens=args.flip_min_work_tokens,

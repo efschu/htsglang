@@ -3618,6 +3618,24 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         comp_xfers: dict[ComponentType, list[PoolTransfer]] = {}
         sidecar_xfers: list[PoolTransfer] = []
         alloc_failed = True
+        # #1317k THE WINDOW CAP, WIRED. `solve_window` (C10) computed W and
+        # NOBODY EVER APPLIED IT: its only non-test caller was
+        # `window_provenance`, whose only caller was nobody, and the
+        # `#1317 WINDOW W=` line printed 0 times in both group logs of boots
+        # weg2sn6k and weg2sn6l. PRESENT-BUT-UNWIRED, the expensive middle
+        # state. What sized the read instead is the `min(need, available)`
+        # below, i.e. THE WHOLE POOL: metal read
+        # `#915 PREFETCH TRUNCATED need=109129 got=30518 ... available=0`
+        # on a 30,518-row pool, so window 1 took every row, the next window's
+        # alloc could never succeed (`got=1847`, then nothing), C1 had nothing
+        # it was allowed to free, `WINDOW-RELEASE` stayed 0, `closed_total`
+        # stayed 0, and the loop re-issued `issued:truncated_group` ten times
+        # without advancing past matched=98,302 of 109,131.
+        #
+        # A WINDOW IS A WINDOW: capping the ask at W leaves the ring floor and
+        # the resume anchor room the loop needs to take a SECOND step. Group D:
+        # 24,576 instead of 30,518, slack 5,942.
+        _window_cap = self._weg2_window_alloc_cap()
         # #1068 (slice 4): the span the verdict was taken on, BEFORE any
         # truncation. It is the `need` term of every L1/L2 line below and the
         # token count of the refusal keys (the `_tokens` companion counts the
@@ -3625,12 +3643,31 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         need = prefetch_length
         if eligible:
             anchor_lock_params = self.inc_host_lock_ref(last_host_node).to_dec_params()
-            host_indices = self.cache_controller.mem_pool_host.alloc(prefetch_length)
+            # #1317k the ASK is capped at one window; `need` above keeps the
+            # full remaining span, so the #915 TRUNCATED line still prints
+            # `need=<whole prompt> got=<W>` and the group trim still arms the
+            # re-issue mark (`local_span = len(prefetch_key)` stays the FULL
+            # ask, so `truncated_group = group_len < span_lo` is True and the
+            # post-vote trim slices both tensors -- no invariant is touched).
+            #
+            # SYMMETRIC ONLY, and that is a correctness condition, not caution.
+            # On the non-symmetric path the invariant
+            # `len(host_indices) == len(prefetch_key) == prefetch_length` is
+            # maintained by the truncation branch below, which only runs when
+            # the ALLOC FAILED; a capped alloc that SUCCEEDS would skip it and
+            # register a full key against W rows. The windowed store read is
+            # the group-D staging form and is symmetric by construction
+            # (tp_world_size=3 under uneven DCP), so gating here costs the fix
+            # nothing and keeps the single-rank path byte-identical.
+            _ask = (
+                min(prefetch_length, _window_cap)
+                if (_window_cap is not None and symmetric)
+                else prefetch_length
+            )
+            host_indices = self.cache_controller.mem_pool_host.alloc(_ask)
             if host_indices is None:
-                self.evict_host(prefetch_length)
-                host_indices = self.cache_controller.mem_pool_host.alloc(
-                    prefetch_length
-                )
+                self.evict_host(_ask)
+                host_indices = self.cache_controller.mem_pool_host.alloc(_ask)
             if host_indices is None and not symmetric:
                 available_size = self.cache_controller.mem_pool_host.available_size()
                 prefetch_length = available_size - (available_size % self.page_size)
@@ -3685,6 +3722,16 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                     prefetch_length,
                     available_size - (available_size % self.page_size),
                 )
+                # #1317k THE SITE THAT TOOK THE WHOLE POOL. `min(need,
+                # available)` is what read `got=30518` out of a 30,518-row
+                # pool on weg2sn6k/sn6l and left `available=0`, after which no
+                # second window could ever allocate and C1 had nothing it was
+                # permitted to free. A partial read may be SHORTER than one
+                # window -- that is the #1290 leg-2 case and it stays -- but it
+                # may never be LONGER, because the rows above W are exactly the
+                # ring floor and anchor room the next window needs.
+                if _window_cap is not None:
+                    _partial = min(_partial, _window_cap)
                 if _partial >= self.prefetch_threshold:
                     host_indices = self.cache_controller.mem_pool_host.alloc(
                         _partial
@@ -5843,21 +5890,42 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         Returns the number of host tokens freed -- 0 whenever any precondition
         fails, which is a skip and not an error: the rows are simply released
         later, by the ordinary host eviction, once the node evicts.
+
+        #1317k EVERY REFUSAL IS NAMED, because the bare 0 made the metal
+        reading unattributable. Boots weg2sn6k and weg2sn6l both read
+        ``#1317 WINDOW-RELEASE`` = 0 with ``WINDOW-REISSUE`` = 30 and
+        ``closed_total`` = 0 -- the loop re-issued and nothing was ever
+        reclaimed -- and NOTHING IN THE LOG COULD SAY WHICH of the five
+        preconditions below refused. Five candidate roots, one zero, no way to
+        tell them apart: that is the denominator law's own shape (a
+        population-style counter that never names its population), and it cost
+        a whole boot cycle. The counters and the rate-limited line here turn
+        that zero into a named finding on the NEXT boot instead of a sixth
+        hypothesis. NOTHING about the decisions changes -- every predicate and
+        every return value is byte-identical; only the reason becomes readable.
         """
         if self.cache_controller is None or self.disable:
-            return 0
+            return self._note_window_release_refusal(node, "no_controller")
         if node is None or node is self.root_node:
-            return 0
+            return self._note_window_release_refusal(node, "root_or_none")
         if node.evicted:
             # Not device-resident: freeing the host copy here would drop the
             # only copy this rank holds.
-            return 0
+            return self._note_window_release_refusal(node, "not_device_resident")
         if not node.l3_present:
-            return 0
+            # C2 never marked this node: either the L3 write has not acked
+            # (writer 1) or the completion insert was REFUSED and adopted
+            # nothing (writer 2, the stale-stamp arm at :4443). A window whose
+            # pages are not provably re-readable may not be recycled.
+            return self._note_window_release_refusal(node, "not_l3_present")
         if any(cd.host_lock_ref > 0 for cd in node.component_data):
-            return 0
+            # Still pinned on the host side -- by this request's own matched
+            # prefix, or by a concurrent prefetch anchor. The funnel below
+            # checks only the DEVICE pin (#904), so this one has to be checked
+            # here or the rows are freed under a live reader.
+            return self._note_window_release_refusal(node, "host_pin_held")
         if not node.backuped:
-            return 0
+            return self._note_window_release_refusal(node, "no_host_copy")
         tracker: dict[ComponentType, int] = {ct: 0 for ct in self.tree_components}
         for comp in self._components_tuple:
             if not comp.node_has_component_data(node, target=EvictLayer.HOST):
@@ -5880,6 +5948,63 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 getattr(self, "_weg2_window_nodes_recycled", 0) + 1
             )
         return freed
+
+    #: #1317k the five named refusals of `release_staged_window`, counted per
+    #: rank. The KEYS ARE THE PREDICATES, in the order they are checked, so an
+    #: attribution reads as a funnel rather than as a bag.
+    _WINDOW_RELEASE_REFUSALS = (
+        "no_controller",
+        "root_or_none",
+        "not_device_resident",
+        "not_l3_present",
+        "host_pin_held",
+        "no_host_copy",
+    )
+
+    def _note_window_release_refusal(self, node, reason: str) -> int:
+        """Count and (rate-limited) name ONE window-release refusal. Returns 0.
+
+        Returns 0 unconditionally: this is the value every refusing branch of
+        `release_staged_window` returned before, so the caller's `freed <= 0`
+        break is unchanged. The only new thing is that the reason exists.
+
+        Rate-limited like every other census emitter on this path (head 8,
+        then every 256th) AND the per-reason totals are counted without a cap,
+        so the line's own absence after the head can never be read as a zero
+        (denominator law). The totals ride the WINDOW-RELEASE line and the
+        chain-break line, both of which print the whole vector.
+        """
+        counts = self.__dict__.setdefault("_weg2_window_release_refusals", {})
+        n = counts.get(reason, 0) + 1
+        counts[reason] = n
+        total = sum(counts.values())
+        if total <= 8 or total % 256 == 0:
+            logger.info(
+                "#1317k WINDOW-RELEASE REFUSED reason=%s node=%s n=%d total=%d "
+                "census=%s (denominator: every node `release_staged_window` was "
+                "asked about under the staging host role on this rank. A zero "
+                "WINDOW-RELEASE with a non-zero census here is NOT 'C1 never "
+                "ran' -- it is C1 running and being refused, and `reason` is "
+                "the root)",
+                reason,
+                getattr(node, "id", "?"),
+                n,
+                total,
+                self._window_release_refusal_census(),
+            )
+        return 0
+
+    def _window_release_refusal_census(self) -> str:
+        """The refusal vector as `reason=n` pairs, every key always present.
+
+        Every key is printed even at 0: a missing key and a zero key read the
+        same to a grep, and the whole point of this instrument is that an
+        absence is attributable.
+        """
+        counts = getattr(self, "_weg2_window_release_refusals", None) or {}
+        return " ".join(
+            f"{k}={int(counts.get(k, 0))}" for k in self._WINDOW_RELEASE_REFUSALS
+        )
 
     def release_staged_window_chain(
         self, deepest: UnifiedTreeNode, stop_at: Optional[UnifiedTreeNode] = None
@@ -5909,6 +6034,32 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 # A pinned or not-yet-stored node stops the walk: everything
                 # above it is its ancestor and the #841 law forbids freeing an
                 # ancestor while this one keeps its host copy.
+                #
+                # #1317k NAME THE BREAK WHEN IT FREED NOTHING AT ALL. A walk
+                # that frees some nodes and then stops is the ordinary,
+                # expected shape (it hit the previous window's anchor). A walk
+                # that frees NOTHING is the weg2sn6k/sn6l reading, and it is
+                # the one that needs a root: the refusal census printed here
+                # says which precondition ended it. Rate-limited on the same
+                # counter the refusals use, so this cannot outrun that emitter.
+                if nodes == 0:
+                    self._weg2_window_chain_dead = (
+                        getattr(self, "_weg2_window_chain_dead", 0) + 1
+                    )
+                    d = self._weg2_window_chain_dead
+                    if d <= 8 or d % 256 == 0:
+                        logger.warning(
+                            "#1317k WINDOW-RELEASE CHAIN DEAD node=%s n=%d "
+                            "census=%s -- the leaf-first walk freed ZERO nodes, "
+                            "so this window's host rows stay resident and the "
+                            "next window cannot allocate. Release is a "
+                            "PRECONDITION of re-issue (#1317g), so a non-zero "
+                            "count here is the forward-progress stop. "
+                            "Denominator: every chain walk that freed nothing",
+                            getattr(cur, "id", "?"),
+                            d,
+                            self._window_release_refusal_census(),
+                        )
                 break
             nodes += 1
             tokens += freed
@@ -5956,6 +6107,106 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                         self._log_window_release(node, _n, _t)
             finish_count -= 1
 
+    def _weg2_window_alloc_cap(self) -> Optional[int]:
+        """#1317k: W, the largest host span ONE store read may allocate -- or
+        ``None`` when this group does not read the store in windows.
+
+        WHY THIS METHOD EXISTS AT ALL. ``host_ledger.solve_window`` (C10) has
+        computed W since #1317 and NOTHING EVER READ IT: its only non-test
+        caller is ``host_ledger.window_provenance``, whose callers are none,
+        so the ``#1317 WINDOW W=`` line printed **0 times** in both group logs
+        of boots weg2sn6k and weg2sn6l. That is the
+        PRESENT-BUT-UNWIRED state, and it is the root of the two identical
+        FAILs: the quantity that actually sized the read was
+        ``min(need, available)``, i.e. the WHOLE pool
+        (``need=109129 got=30518 ... available=0`` on a 30,518-row pool), so
+        window 1 owned every row, ``WINDOW-RELEASE`` stayed 0, ``closed_total``
+        stayed 0, and the loop re-issued ten times without passing
+        matched=98,302 of 109,131.
+
+        EVERY TERM IS GROUP-UNIFORM, which is what makes the cap safe to apply
+        BEFORE the #580 participation vote: ``mem_pool_host.size`` has already
+        been reduced to the group minimum by ``sync_fixed_hicache_size``, and
+        ``chunked_prefill_size`` / ``max_running_requests`` are static server
+        args identical on every rank. So every rank caps to the same W, the
+        vote's MIN is unchanged by it, and the group cannot split here.
+
+        THE RING FLOOR IS NAMED, NOT GUESSED. ``solve_window``'s ``ring_floor``
+        is the write-through staging room, and its own worked example for group
+        D uses ONE CHUNK (4,096 of 30,518) -- which is also the smallest floor
+        that can hold a single in-flight write-back batch. One chunk is what is
+        used here and it reproduces the spec's W exactly (4,096 x
+        floor(26,422/4,096) = 24,576). ``anchor_slots`` only ever gates
+        ``solve_window``'s W21 refusal, never its value, so it is passed as the
+        live anchor pool when the controller exposes one and otherwise as the
+        anchor count W would need -- an unknown anchor pool must not manufacture
+        a launch-time refusal here, at a call site whose only job is a cap.
+
+        UNSOLVABLE IS ``None``, NEVER 0. A group that cannot window at all
+        keeps the pre-#1317k arithmetic (the caller skips the ``min``); capping
+        to 0 would refuse every read, which is a far worse failure than the one
+        being fixed. Named once per process so it cannot be silent.
+
+        Cached on the three terms it derives from, so the recompute is not paid
+        per pass and a pool that is re-synced after a flip is picked up.
+        """
+        if not self._staging_host_role():
+            return None
+        cc = self.cache_controller
+        pool = getattr(cc, "mem_pool_host", None)
+        if pool is None:
+            return None
+        try:
+            from sglang.srt.runtime_context import get_server_args
+
+            sa = get_server_args()
+            pool_rows = int(getattr(pool, "size", 0) or 0)
+            chunk = int(getattr(sa, "chunked_prefill_size", 0) or 0)
+            chains = int(getattr(sa, "max_running_requests", 0) or 0) or 1
+        except Exception:  # noqa: BLE001 - a cap may never break the read path
+            return None
+        if pool_rows <= 0 or chunk <= 0:
+            return None
+        key = (pool_rows, chunk, chains)
+        cached = getattr(self, "_weg2_window_cap_cache", None)
+        if cached is not None and cached[0] == key:
+            return cached[1]
+        from sglang.srt.weg2.host_ledger import (
+            WindowUnsolvable,
+            solve_window,
+            window_provenance,
+        )
+
+        ring_floor = chunk
+        # `anchor_slots` bounds nothing here: pass what the pool can hold when
+        # it is knowable, else the count W itself would need.
+        anchor_slots = int(
+            getattr(cc, "host_anchor_slots", 0) or 0
+        ) or (max(1, (pool_rows - ring_floor) // max(1, chains * chunk)) + 1)
+        try:
+            w = int(solve_window(pool_rows, chunk, chains, ring_floor, anchor_slots))
+            provenance = window_provenance(
+                pool_rows, chunk, chains, ring_floor, anchor_slots
+            )
+        except WindowUnsolvable as exc:
+            w = None
+            provenance = f"UNSOLVABLE: {exc}"
+        except Exception as exc:  # noqa: BLE001 - never break the read path
+            w = None
+            provenance = f"UNPRICED: {exc!r}"
+        if getattr(self, "_weg2_window_cap_logged", None) != key:
+            self._weg2_window_cap_logged = key
+            logger.warning(
+                "#1317k WINDOW CAP wired: W=%s (the store read's host alloc is "
+                "capped at this; before #1317k it was min(need, available) = "
+                "the whole pool, and solve_window's W was computed by nobody "
+                "and read by nobody). %s",
+                w,
+                provenance,
+            )
+        self._weg2_window_cap_cache = (key, w)
+        return w
+
     def _staging_host_role(self) -> bool:
         """True when the host tier is the transient staging buffer.
 
@@ -5983,12 +6234,16 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         logger.info(
             "#1317 WINDOW-RELEASE n=%d node=%s tier=L2->free nodes=%d tokens=%d "
             "pool_rows=%d available_after=%d rows_recycled_total=%d "
-            "nodes_recycled_total=%d "
+            "nodes_recycled_total=%d refusals=[%s] "
             "(denominator: load-back acks drained under the staging host role "
             "on this rank; tokens are KV host rows, not prompt tokens)",
             n, getattr(node, "id", "?"), nodes, tokens, size, avail,
             getattr(self, "_weg2_window_rows_recycled", 0),
             getattr(self, "_weg2_window_nodes_recycled", 0),
+            # #1317k the refusal vector rides the SUCCESS line too, so one
+            # WINDOW-RELEASE line answers both "did anything come back" and
+            # "what stopped the rest of the walk".
+            self._window_release_refusal_census(),
         )
 
     # ---- HiCache: Scheduler Entry Points ----

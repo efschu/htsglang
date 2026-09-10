@@ -8965,6 +8965,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         admin_key_file=admin_key_file,
         anon_preboot_bytes=anon_preboot_bytes,
         front_host=ns.front_host,
+        # #1317k ONE SOURCE: group D reads the store in windows exactly when
+        # the argv THIS launcher ships to D carries `--hicache-host-role
+        # staging`, which is the same string `_staging_host_role` reads off
+        # the controller in-process. Derived from the shipped argv rather than
+        # from a second copy of the intent, so the front's routing and D's
+        # window cap cannot disagree about which regime is running.
+        windowed_carrier=_windowed_carrier_from_argv(spec_d.argv),
     )
     fenv = dict(os.environ)
     fenv["PYTHONPATH"] = f"{tree}/python"
@@ -9008,6 +9015,26 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     return 0
 
 
+def _windowed_carrier_from_argv(argv_d: Sequence[str]) -> bool:
+    """#1317k: does group D's SHIPPED argv put its host tier in staging role?
+
+    Read off the argv the launcher itself ships, positionally
+    (`--hicache-host-role staging`), so it answers the same question
+    `unified_radix_cache._staging_host_role` answers in-process off the
+    controller. A second copy of the intent -- an ns flag, a derived boolean --
+    is what lets the front's routing and D's allocation cap drift apart, and
+    that drift is the class that produced three tiers of the same carrier
+    barrier retired at three different times.
+    """
+    argv = list(argv_d or ())
+    for i, a in enumerate(argv):
+        if a == "--hicache-host-role" and i + 1 < len(argv):
+            return str(argv[i + 1]).strip() == "staging"
+        if a.startswith("--hicache-host-role="):
+            return a.split("=", 1)[1].strip() == "staging"
+    return False
+
+
 def front_argv_for(py: str, store_dir: str, p_pid: int, d_pid: int, dc_expect_d: Dict[str, int],
                    cards: List[Card], ns, chunk_count: int, carrier_max_tokens: int,
                    p_bs: int, d_bs: int, x_tokens: int, flip_min_work_tokens: int,
@@ -9017,7 +9044,8 @@ def front_argv_for(py: str, store_dir: str, p_pid: int, d_pid: int, dc_expect_d:
                    ledger_arm: Optional[Dict[str, float]] = None,
                    admin_key_file: str = "",
                    anon_preboot_bytes: int = 0,
-                   front_host: str = DEFAULT_FRONT_HOST) -> List[str]:
+                   front_host: str = DEFAULT_FRONT_HOST,
+                   windowed_carrier: bool = False) -> List[str]:
     """ONE front argv builder, so --dry-run prints exactly what a real boot runs.
 
     C2/R-6: the front is TOLD the two bs numbers and X. It never asks a
@@ -9035,6 +9063,13 @@ def front_argv_for(py: str, store_dir: str, p_pid: int, d_pid: int, dc_expect_d:
         "--fairness-w-s", str(ns.fairness_w_s),
         "--weight-chunks", str(chunk_count),
         "--carrier-max-tokens", str(carrier_max_tokens),
+        # #1317k DERIVED FROM THE ARGV THIS LAUNCHER ITSELF SHIPS, never from a
+        # second copy of the intent: group D reads the store in windows exactly
+        # when its own argv carries `--hicache-host-role staging`, which is the
+        # same string `unified_radix_cache._staging_host_role` reads off the
+        # controller in-process. One source, so the front's routing and D's
+        # allocation cap cannot disagree about which regime is running.
+        *(["--windowed-carrier"] if windowed_carrier else []),
         "--p-concurrency", str(p_bs),
         "--d-bs", str(d_bs),
         "--tp-prefill-max-tokens", str(x_tokens),

@@ -916,8 +916,37 @@ def arm_draft_cold_for_admission(scheduler, batch) -> dict:
     cold = []
     slot_rows: List[torch.Tensor] = []
     for req in reqs:
-        if getattr(req, COLD_ARMED_ATTR, False):
+        if getattr(req, COLD_ARMED_ATTR, False) and not getattr(
+            req, "_weg2_window_open", False
+        ):
             continue
+        # #1317k (item 3) A MULTI-WINDOW READ IS ARMED ONCE PER WINDOW, NOT
+        # ONCE PER REQUEST. `COLD_ARMED_ATTR` exists so a chunked prefill's
+        # repeated visits do not re-scrub rows the drafter has since written,
+        # and that is right -- but under the #1317 windowed store read the
+        # LATER WINDOWS bring their own draft claims, and
+        # `cache_controller.draft_cold_spans` is ONE SLOT PER RID
+        # (`hybrid_cache_controller.py:1010` overwrites it per window,
+        # `draft_cold_reason` pops it exactly once, and
+        # `cache_controller.py:3224` pops it away entirely when a window's
+        # store hit falls below the prefetch threshold). So window 1's claim
+        # could be consumed and every later window's claim silently dropped:
+        # the request discharges its finite cold debt and then speculates over
+        # the #993 ZERO rows of a window nobody marked.
+        #
+        # NOT A CORRECTNESS HOLE, and the distinction is worth stating rather
+        # than blurring: those rows are ZEROS, not a previous occupant's bytes
+        # -- `_draft_page_get_generic` writes the zero page on every miss --
+        # and the target verifies every proposed token, so the cost is
+        # acceptance (accept len collapses toward 1.0), never a wrong answer.
+        # The #1047 foreign-bytes shape is closed at that getter and stays
+        # closed. What is fixed here is that a whole window's worth of the
+        # prompt could speculate un-marked.
+        #
+        # RE-ARMING IS SAFE IN BOTH DIRECTIONS: `mark_draft_cold` is monotonic
+        # (it never lowers a standing debt) and the scrub below stays gated on
+        # `not tier_armed`, so a re-evaluation can add rounds but can never
+        # erase draft rows the read did deliver.
         reason = draft_cold_reason(scheduler, req, tier_armed)
         if reason is None:
             # L7: the probe answered the whole prefix (tier armed, no span,
@@ -925,8 +954,30 @@ def arm_draft_cold_for_admission(scheduler, batch) -> dict:
             n_warm = prefix_len(req)
             if n_warm > 0 and tier_armed and not getattr(req, WARM_LOGGED_ATTR, False):
                 setattr(req, WARM_LOGGED_ATTR, True)
+                # #1317k `miss=0` WAS A LITERAL IN THE FORMAT STRING, not a
+                # measurement -- it printed 0 whatever the read had done, and
+                # boot weg2sn6k's acceptance (vi) read `pages=28671 miss=0`
+                # off it as evidence that no draft page was missing. That is
+                # the indicator law's own shape: a number is a finding only
+                # once it has been checked THAT it measures what it claims.
+                # What CAN be measured here is the controller's own L3 draft
+                # hit/miss census (`_draft_page_get_generic` counts both), so
+                # that is what is printed -- labelled CUMULATIVE-PER-PROCESS,
+                # because per-request attribution does not exist at this call
+                # site and inventing it is how the literal happened.
+                _cc = getattr(
+                    getattr(scheduler, "tree_cache", None), "cache_controller", None
+                )
                 logger.info(
-                    "WEG2 DRAFT-WARM rid=%s pages=%d miss=0", getattr(req, "rid", "?"), n_warm
+                    "WEG2 DRAFT-WARM rid=%s pages=%d draft_l3_hits=%s "
+                    "draft_l3_misses=%s (CUMULATIVE PER PROCESS, not per rid: "
+                    "this rank's whole-boot draft page census from "
+                    "_draft_page_get_generic. A miss is ZERO-FILLED, #993, so "
+                    "misses cost acceptance and never correctness)",
+                    getattr(req, "rid", "?"),
+                    n_warm,
+                    getattr(_cc, "_draft_l3_hits", "n/a"),
+                    getattr(_cc, "_draft_l3_misses", "n/a"),
                 )
             continue
         n = prefix_len(req)
