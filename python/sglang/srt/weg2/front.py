@@ -2854,10 +2854,19 @@ class Front:
           PROBE (:func:`price_remainder` over :class:`SpanLRU`), captured at
           arrival in ``Pending.store_span_est``.  It is an ESTIMATE at TEXT
           granularity: the longest common prefix with a prompt this front saw
-          realised, scaled by that prompt's realised token count.  It is a
+          realised, scaled by that prompt's MEASURED cached-on-D share.
+          #1324 CHANGED WHAT THAT SHARE IS, and this term's meaning with it:
+          the LRU used to be fed any realised ``prompt_tokens``, so this
+          counter measured "a prefix somebody PREFILLED" and asserted the
+          write-through; it is now fed D's own leg-2 ``cached_tokens``, so it
+          measures "a prefix D was MEASURED to hold".  The instrument is
+          unchanged; its denominator became honest, and it now reads LOWER on
+          a first pass (no measurement yet) than it used to.  It is a
           LOWER bound in two named ways -- a prefix from before the LRU's
           window is invisible, and a W31 re-queue deliberately contributes 0
-          (D's own refusal is evidence the prefix did NOT come back) -- and it
+          (D's own refusal is evidence the prefix did NOT come back, and since
+          #1324 that refusal also RETRACTS any stale credit for the text) --
+          and it
           is an upper bound in one: it counts the text prefix, not the store's
           page keys, so a prefix shorter than one page cannot actually be read
           back.  It is NOT a store key probe; the front has no tokenizer and
