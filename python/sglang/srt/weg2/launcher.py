@@ -3915,47 +3915,17 @@ def choose_host_ledger(
     record = host_ledger.read_measured_record(
         measured_record_path() if record_path is None else record_path
     )
-    if pin_m_mib and int(pin_m_mib) > 0:
-        # #1317/#1318 THE PINNED ARM IS PRICED, NOT ASSUMED. `price` is the
-        # same function `choose` ladders over, so a pinned arm is scored by the
-        # identical model -- and refused by name when it does not fund, which
-        # is what keeps this a pin rather than a way past the ledger. The
-        # HOST-SCHWELLE law admits no "accept the risk" branch here.
-        pinned = host_ledger.price(
-            mi["MemTotal"], mi["MemAvailable"], 1, int(pin_m_mib),
-            ring_bytes=ring_bytes, ring_span1_bytes=ring_span1_bytes,
-            ring_provenance=ring_provenance,
-            cg_current_bytes=cg["current"], reclaimable_bytes=cg["reclaimable"],
-            slab_reclaimable_bytes=cg["slab_reclaimable"],
-            cg_ceiling_bytes=cg_ceiling, cg_ceiling_source=cg_ceiling_source,
-            cg_oom_kill=cg["oom_kill"], measured_record=record,
-        )
-        if not pinned.fundable_moments:
-            raise host_ledger.Weg2HostLedgerRefused(
-                f"W87 Weg2PinnedArmRefused: --pin-ledger-arm-m {int(pin_m_mib)} "
-                f"prices S=1 M={int(pin_m_mib)} at launch "
-                f"{pinned.launch_leftover_gib:.2f} GiB / run "
-                f"{pinned.run_leftover_gib:.2f} GiB, and it is not fundable at "
-                "both moments. A pin selects among arms the ledger would fund; "
-                "it is not a way past the ledger's verdict, and the "
-                "host-threshold law admits no accept-the-risk branch. Pin a "
-                "smaller M, or drop the pin and let choose() ladder."
-            )
-        return pinned, None, [
-            f"WEG2-LEDGER ARM PINNED by --pin-ledger-arm-m: S=1 M={int(pin_m_mib)} "
-            f"launch={pinned.launch_leftover_gib:.2f} GiB "
-            f"run={pinned.run_leftover_gib:.2f} GiB "
-            f"run_peak={pinned.predicted_run_peak_gib():.2f} GiB "
-            f"host_ring_gib={pinned.terms.get('host_ring_gib', float('nan')):.2f} "
-            f"(#1318 rings derived: P={host_ledger.RING_P_MULT_GB_PER_S:.3f} + "
-            f"D={host_ledger.RING_D_MULT_GB_PER_S:.3f} = "
-            f"{host_ledger.RING_P_MULT_GB_PER_S + host_ledger.RING_D_MULT_GB_PER_S:.3f} xS "
-            f"against the b0 reading {host_ledger.RING_B0_TOTAL_MULT_GB_PER_S:.3f} xS). "
-            "The ladder is NOT run: the operator pinned this arm.",
-        ], cg
-    arm, reap_headroom_gib, lines = host_ledger.choose(
-        mi["MemTotal"],
-        mi["MemAvailable"],
+    # ONE kwargs block for the ladder AND the pin. Boot weg2sn6a (Q6, 07:33Z)
+    # died in this function with `price() got an unexpected keyword argument
+    # 'ring_provenance'`: the pinned arm had been priced by a hand-copied
+    # price() call that carried choose()'s keywords (ring_provenance,
+    # slab_reclaimable_bytes, cg_ceiling_source, cg_oom_kill), none of which
+    # price() takes -- and no test exercised the call. The pin now goes THROUGH
+    # choose() with the ladder restricted to the one arm, so it is scored by
+    # the identical model (slab term, reap bound, W20/W21 refusals) and cannot
+    # drift from the ladder call again. test_weg2_store_priced_x_1317 pins the
+    # keyword/signature conformance of every host_ledger call in this module.
+    ledger_kw = dict(
         ring_bytes=ring_bytes,
         ring_span1_bytes=ring_span1_bytes,
         ring_provenance=ring_provenance,
@@ -3972,6 +3942,43 @@ def choose_host_ledger(
         cg_ceiling_source=cg_ceiling_source,
         cg_oom_kill=cg["oom_kill"],
         measured_record=record,
+    )
+    if pin_m_mib and int(pin_m_mib) > 0:
+        # #1317/#1318 THE PINNED ARM IS PRICED, NOT ASSUMED. The ladder is run
+        # with exactly one rung, so a pinned arm is scored by the identical
+        # model choose() applies to DEFAULT_ARMS -- and refused by name when
+        # it does not fund, which is what keeps this a pin rather than a way
+        # past the ledger. The HOST-SCHWELLE law admits no "accept the risk"
+        # branch here.
+        try:
+            arm, reap_headroom_gib, lines = host_ledger.choose(
+                mi["MemTotal"], mi["MemAvailable"],
+                arms=[(1, int(pin_m_mib))], **ledger_kw,
+            )
+        except host_ledger.Weg2HostLedgerRefused as e:
+            raise host_ledger.Weg2HostLedgerRefused(
+                f"W87 Weg2PinnedArmRefused: --pin-ledger-arm-m {int(pin_m_mib)} "
+                f"was priced by the ladder itself (S=1 M={int(pin_m_mib)}) and "
+                f"is not fundable: {e}. A pin selects among arms the ledger "
+                "would fund; it is not a way past the ledger's verdict, and the "
+                "host-threshold law admits no accept-the-risk branch. Pin a "
+                "smaller M, or drop the pin and let choose() ladder."
+            ) from e
+        lines = list(lines) + [
+            f"WEG2-LEDGER ARM PINNED by --pin-ledger-arm-m: S=1 M={int(pin_m_mib)} "
+            f"launch={arm.launch_leftover_gib:.2f} GiB "
+            f"run={arm.run_leftover_gib:.2f} GiB "
+            f"run_peak={arm.predicted_run_peak_gib():.2f} GiB "
+            f"host_ring_gib={arm.terms.get('host_ring_gib', float('nan')):.2f} "
+            f"(#1318 rings derived: P={host_ledger.RING_P_MULT_GB_PER_S:.3f} + "
+            f"D={host_ledger.RING_D_MULT_GB_PER_S:.3f} = "
+            f"{host_ledger.RING_P_MULT_GB_PER_S + host_ledger.RING_D_MULT_GB_PER_S:.3f} xS "
+            f"against the b0 reading {host_ledger.RING_B0_TOTAL_MULT_GB_PER_S:.3f} xS). "
+            "The ladder was restricted to the pinned arm by the operator.",
+        ]
+        return arm, reap_headroom_gib, lines, cg
+    arm, reap_headroom_gib, lines = host_ledger.choose(
+        mi["MemTotal"], mi["MemAvailable"], **ledger_kw,
     )
     return arm, reap_headroom_gib, lines, cg
 
