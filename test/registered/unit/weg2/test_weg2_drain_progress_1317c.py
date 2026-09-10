@@ -177,13 +177,33 @@ def test_d_publishes_the_counters_on_the_endpoint_the_front_already_polls():
 
     from sglang.srt.managers.scheduler import Scheduler
 
+    import ast
+    import textwrap
+
     src = inspect.getsource(Scheduler.get_internal_state)
     assert '"weg2_decode_progress"' in src
     for key in ("gen_tokens_total", "prefill_tokens_total", "forward_ct", "running"):
         assert key in src, f"the progress block lost {key}"
     # gen_tokens_total and NOT num_generated_tokens: the latter is zeroed every
     # logging interval and cannot be differenced over a window.
-    assert "num_generated_tokens" not in src
+    #
+    # READ THE EXECUTED CODE, NOT THE TEXT -- fourth instance of this class
+    # today (the #1318 pins, the extent docstring, the route provenance): the
+    # comment IN the function names `num_generated_tokens` precisely in order
+    # to reject it, so a source-text grep reports the rejection as a use.
+    fn = ast.parse(textwrap.dedent(src)).body[0]
+    executed = {
+        n.value
+        for n in ast.walk(fn)
+        if isinstance(n, ast.Constant) and isinstance(n.value, str)
+    } | {
+        n.attr for n in ast.walk(fn) if isinstance(n, ast.Attribute)
+    }
+    assert "gen_tokens_total" in executed
+    assert "num_generated_tokens" not in executed, (
+        "the progress block must not read the counter that is zeroed every "
+        "logging interval -- it cannot be differenced over a window"
+    )
 
 
 def test_the_window_length_is_unchanged():
