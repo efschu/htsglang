@@ -834,6 +834,48 @@ def serviceable_route(uncached: int, carrier_est: int, x_tokens: int,
     return "long"
 
 
+def weg2_client_is_gone(
+    raised: Optional[BaseException],
+    transport_closing: Optional[bool],
+    completed: bool,
+) -> bool:
+    """#1317f: did this request's client leave before it finished?
+
+    Pure, so the four endpoints x two shapes are decided by ONE testable rule
+    instead of four hand-written arms.
+
+    THREE INPUTS, and each covers a shape the others miss:
+    * ``raised`` -- the STREAMING shape. A write to a dropped connection raises
+      ``ConnectionResetError`` / ``ClientConnectionResetError``, and aiohttp
+      cancels the handler task on disconnect, which surfaces as
+      ``CancelledError``. Any other exception is a SERVER fault and must not be
+      blamed on the client.
+    * ``transport_closing`` -- the NON-STREAM shape, where nothing is written
+      until the end so nothing raises. ``None`` means unreadable, which is
+      never treated as gone.
+    * ``completed`` -- the guard against the false positive that matters most:
+      a request that finished normally is not "gone" even if the client closed
+      the socket immediately afterwards, which is exactly what a well-behaved
+      non-streaming client does.
+
+    W36 IS NOT THIS. That code owns "the client never reached its POST after
+    the hand-off" and fires from the admitter on a Pending. This decides a
+    request that DID reach the handler, so the two populations are disjoint by
+    construction and neither double-counts the other.
+    """
+    if completed:
+        return False
+    if raised is not None:
+        return isinstance(
+            raised, (asyncio.CancelledError, ConnectionResetError, BrokenPipeError)
+        ) or type(raised).__name__ in (
+            "ClientConnectionResetError",
+            "ClientOSError",
+            "ClientConnectionError",
+        )
+    return transport_closing is True
+
+
 def weg2_drain_progress_delta(
     before: Optional[dict], after: Optional[dict]
 ) -> Optional[dict]:
@@ -2301,12 +2343,80 @@ class Front:
         except Exception as e:  # noqa: BLE001
             return web.json_response({"error": str(e)}, status=503)
 
+    async def weg2_client_gone(self, rid: str, t0: float, why: str) -> str:
+        """#1317f: the client for ``rid`` is gone -- abort it on D AND on P.
+
+        RULING 2026-09-10: a request whose client has disconnected is aborted
+        on both groups. This is NOT a #1011 question: that law protects a
+        decode SOMEONE IS WAITING FOR, and a decode with no receiver is wasted
+        D time that blocks the flip and the P backlog. Upstream sglang aborts
+        on client disconnect as well, so this is the upstream-minimal form.
+
+        MEASURED COST OF NOT DOING IT, boot weg2sn6e: the probe timed out
+        client-side at 240 s and D kept decoding for NINE more minutes -- 686
+        `Decode batch` lines, `#full token` 8,814 -> 84,384 -- work nobody
+        could receive, while the drain refused three windows on it.
+
+        BOTH GROUPS, not just the awake one, and leg 1 counts: a request can be
+        mid-leg-1 on P when its client leaves, and aborting only D would leave
+        P prefilling for a receiver that no longer exists. Returns the
+        ``aborted_on`` term for the log line: ``D``, ``P``, ``both`` or
+        ``none``.
+
+        NEVER RAISES. This runs from a middleware on the way out of a request
+        that is already failing; an exception here would replace a client
+        disconnect with a 500 on a connection nobody is reading.
+        """
+        hit = []
+        for name in ("D", "P"):
+            g = self.groups.get(name)
+            if g is None:
+                continue
+            was_outstanding = rid in g.outstanding
+            g.outstanding.pop(rid, None)
+            try:
+                async with self.session.post(
+                    f"{g.url}/abort_request", json={"rid": rid}
+                ) as r:
+                    ok = r.status == 200
+                    await r.read()
+            except Exception:  # noqa: BLE001 - see NEVER RAISES above
+                ok = False
+            if was_outstanding or ok:
+                hit.append(name)
+        for p in list(self.queue):
+            if p.rid == rid:
+                self.queue.remove(p)
+                if p.seat is not None:
+                    p.seat.release("client_gone")
+                if not p.fut.done():
+                    p.fut.set_exception(
+                        web.HTTPRequestTimeout(text="client gone")
+                    )
+        aborted_on = "both" if len(hit) == 2 else (hit[0] if hit else "none")
+        self.counters["weg2_client_gone"] += 1
+        logger.warning(
+            "WEG2 CLIENT-GONE rid=%s aborted_on=%s elapsed=%.1fs why=%s "
+            "(the client for this rid disconnected; its work is aborted on "
+            "both groups because a decode with no receiver blocks the flip and "
+            "the P backlog. Denominator: requests that reached the handler and "
+            "whose connection dropped before completion -- W36 owns the "
+            "never-POSTed case and is counted separately)",
+            rid, aborted_on, time.time() - t0, why,
+        )
+        return aborted_on
+
     async def handle_generate(self, request: web.Request) -> web.StreamResponse:
         if self.state == "STOP":
             return web.json_response({"error": f"WEG2 STOP {self.stop}"}, status=503)
         payload = await request.json()
         self._rid += 1
         rid = f"weg2-{self.epoch}-{self._rid}"
+        # #1317f: the middleware aborts by rid on the way out, and the rid is
+        # minted here. Stashed on the request rather than passed, because the
+        # middleware wraps a handler whose signature it does not own.
+        request["weg2_rid"] = rid
+        request["weg2_t0"] = time.time()
         text = request_text(payload)
         remainder, est_prompt, known = price_remainder(text, self.spans)
         # MF-3: the routing probe's OTHER half, taken here and nowhere else.
@@ -4799,7 +4909,50 @@ def main():
                 args.admin_key_file or "(none)",
                 admin_key_mod.redact(front.admin_key),
                 "REACHABLE" if front.admin_key else "unreachable (groups started without --admin-api-key)")
-    app = web.Application(client_max_size=1024**3)
+    @web.middleware
+    async def weg2_client_gone_middleware(request, handler):
+        """#1317f: ONE detection point for all four endpoints, both shapes.
+
+        A middleware rather than four hand-written arms: `FORWARD_PATHS` all
+        route to `handle_generate`, so the streaming and non-streaming shapes
+        share one exit and there is exactly one place a dropped connection has
+        to be noticed. Four arms would be four chances to miss one -- the
+        caller-enumeration failure this line has paid for twice already.
+        """
+        raised: Optional[BaseException] = None
+        completed = False
+        try:
+            resp = await handler(request)
+            completed = True
+            return resp
+        except BaseException as e:  # noqa: BLE001 - re-raised below, always
+            raised = e
+            raise
+        finally:
+            rid = request.get("weg2_rid")
+            if rid is not None:
+                tr = request.transport
+                closing = None if tr is None else bool(tr.is_closing())
+                if weg2_client_is_gone(raised, closing, completed):
+                    # Shielded: this runs inside the `finally` of a request
+                    # that is usually being CANCELLED, and an un-shielded await
+                    # there is cancelled immediately -- the abort would be
+                    # issued and never sent. Measured shape, not theory: that
+                    # is why the disconnect case needs the shield and the
+                    # ordinary error case does not care.
+                    try:
+                        await asyncio.shield(
+                            front.weg2_client_gone(
+                                rid,
+                                float(request.get("weg2_t0") or time.time()),
+                                type(raised).__name__ if raised else "transport_closed",
+                            )
+                        )
+                    except Exception:  # noqa: BLE001 - never mask the original
+                        logger.exception("WEG2 CLIENT-GONE abort failed rid=%s", rid)
+
+    app = web.Application(client_max_size=1024**3,
+                          middlewares=[weg2_client_gone_middleware])
     app.on_startup.append(front.startup)
     app.on_cleanup.append(front.cleanup)
     app.router.add_get("/health", front.handle_health)
