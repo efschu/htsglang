@@ -116,7 +116,9 @@ MARKER_DEF = re.compile(
 #:    THIS FORM COST A RENUMBER (operator catch 2026-09-11). Boot seat 2's
 #:    #1332 B1b enumerated the "free" codes with a pattern that required an
 #:    exception NAME beside the number, read W88 as free, and shipped
-#:    ``W88 Weg2XchgWidestLayerUnreadable`` into a tip where
+#:    ``W88`` for the exception ``Weg2XchgWidestLayerUnreadable`` into a tip
+#:    where  -- written with a word between the two so this very comment
+#:    cannot become a phantom holder if ROOTS ever grows to cover tests --
 #:    ``scheduler.py:6314`` already held W88 for #1324's store-read standstill.
 #:    This census reported no collision, because the holder is a STRING DEFAULT
 #:    and not an assignment -- the same blind-spot CLASS as #1257 (form 1 only)
