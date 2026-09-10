@@ -4484,6 +4484,16 @@ def choose_host_ledger(
         xchg_bounce_host_bytes=xchg_bounce_charge_bytes(weight_source,
                                                         oncard_mode,
                                                         oncard_slot_mib),
+        # #1327 (S6 slice 2): SIGMA H IS 0 BY DESIGN ON THE EXCHANGE ARM, and
+        # the ledger is TOLD so rather than left to infer it from a zero.
+        # Under `exchange` the launcher publishes no `TMS_HOST_RING_*` and the
+        # arming line already prints `ring_H_mib=0`; `price()` would otherwise
+        # raise W20, because `ring_bytes == 0` is its signal for "the
+        # predecessor logged no ring table", i.e. a number it refuses to guess.
+        # Two facts, one spelling -- separated here, at the ONE call site that
+        # already knows the arm, exactly as the bounce is. The ledger never
+        # reads the arm string.
+        ring_absent_by_design=(weight_source == "exchange"),
     )
     if pin_m_mib and int(pin_m_mib) > 0:
         # #1317/#1318 THE PINNED ARM IS PRICED, NOT ASSUMED. The ladder is run

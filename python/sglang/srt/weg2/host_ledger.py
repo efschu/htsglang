@@ -1796,6 +1796,7 @@ def price(
     ranks_per_group: int = 3,
     ring_bytes: int = 0,
     ring_span1_bytes: int = 0,
+    ring_absent_by_design: bool = False,
     cg_current_bytes: Optional[int] = None,
     reclaimable_bytes: Optional[int] = None,
     cg_ceiling_bytes: Optional[int] = None,
@@ -1853,7 +1854,39 @@ def price(
     """
     if s_gb < 1 or m_mib < 1:
         raise ValueError(f"arm terms must be >= 1: S={s_gb} M={m_mib}")
-    if ring_bytes <= 0 or ring_span1_bytes <= 0:
+    # #1327 (S6 slice 2): ABSENCE OF A RING AND ABSENCE OF A MEASUREMENT ARE
+    # TWO FACTS, and until now they shared one spelling (`ring_bytes == 0`).
+    #
+    # Under `--weg2-weight-source exchange` there IS no host weights ring: the
+    # launcher publishes no `TMS_HOST_RING_*`, Sigma H is 0 BY DESIGN, and the
+    # arming line says so (`ring_H_mib=0`). The refusal below is about a boot
+    # whose PREDECESSOR logged no ring table, i.e. a number the planner would
+    # have to guess -- and it must keep refusing that, because guessing is what
+    # C19 deleted. Loosening the guard to `< 0` would let the stale-table case
+    # through silently, which is the same defect one layer down.
+    #
+    # So the caller DECLARES the absence instead: `ring_absent_by_design` is
+    # decided at the ONE launcher call site that already knows the arm, exactly
+    # as `xchg_bounce_host_bytes` is ("a ledger that knew about arm names would
+    # be a second reader of a decision that already has one"). The ledger never
+    # reads the arm string.
+    #
+    # WHAT THIS RELEASES, and it is 2.7x what the S6 planning assumed: the
+    # weights ring is the `host_ring_gib` term, MEASURED 32.19 GiB on this rig
+    # at the run moment (`RUN MOMENT = the host weights term 32.19 GiB`), NOT
+    # the 12.83 GiB `rings_gib` term -- that one is the HiCache host pools
+    # (`RING_P_MULT_GB_PER_S * s_gb + RING_D_MULT_GB_PER_S * s_gb_d`) and the
+    # exchange does not touch it. Two different rings, and the S6 headroom
+    # claim was attached to the wrong one.
+    if ring_absent_by_design:
+        if ring_bytes or ring_span1_bytes:
+            raise ValueError(
+                "ring_absent_by_design with a non-zero ring "
+                f"(ring_bytes={ring_bytes}, ring_span1_bytes={ring_span1_bytes}): "
+                "the two inputs contradict each other, and a contradiction "
+                "resolved silently is how a charged term becomes invisible"
+            )
+    elif ring_bytes <= 0 or ring_span1_bytes <= 0:
         raise Weg2HostLedgerRefused(
             "W20 Weg2HostLedgerRefused: the host weights term has no measured source "
             f"(ring_bytes={ring_bytes}, ring_span1_bytes={ring_span1_bytes}).  C19 "
@@ -1999,6 +2032,10 @@ def price(
         "heaps_gib": heaps_gib,
         "host_ring_gib": host_ring_gib,
         "host_ring_span1_gib": host_ring_span1_gib,
+        # #1327: WHY the term is 0, so a reader never has to guess whether
+        # a zero means "no ring" or "no measurement". An unarmed gate must
+        # never be readable as a passed one.
+        "ring_absent_by_design": bool(ring_absent_by_design),
         "image_p_gib": image_p_gib,
         "image_d_gib": image_d_gib,
         "image_p_source": images.p_source,
@@ -2583,6 +2620,7 @@ def choose(
     ranks_per_group: int = 3,
     ring_bytes: int = 0,
     ring_span1_bytes: int = 0,
+    ring_absent_by_design: bool = False,
     ring_provenance: str = "",
     cg_current_bytes: Optional[int] = None,
     reclaimable_bytes: Optional[int] = None,
@@ -2644,6 +2682,7 @@ def choose(
             ranks_per_group=ranks_per_group,
             ring_bytes=ring_bytes,
             ring_span1_bytes=ring_span1_bytes,
+            ring_absent_by_design=ring_absent_by_design,
             cg_current_bytes=cg_current_bytes,
             reclaimable_bytes=reclaimable_bytes,
             cg_ceiling_bytes=cg_ceiling_bytes,
@@ -2695,7 +2734,11 @@ def choose(
         "measured the dormant group at 38.63 GiB against the 28.83 GiB the tag sum priced) "
         f"run_origin={_gib_or_none(t['run_origin_gib'])} bound by {t['run_origin_source']} "
         f"(the image terms above SIZE H(c); they are NOT charged here -- the ring is) "
-        f"RUN MOMENT = the host weights term {t['host_ring_gib']:.2f} GiB "
+        + ("RING ABSENT BY DESIGN (Sigma H=0, reason=exchange): the weights ring "
+           "is not allocated on this arm, so both moments charge 0 for it -- "
+           "this is a DECLARED absence, not a missing measurement (#1327). " 
+           if t.get("ring_absent_by_design") else "")
+        + f"RUN MOMENT = the host weights term {t['host_ring_gib']:.2f} GiB "
         f"(C19; BACKUP_P_BYTES / BACKUP_D_BYTES / chunk_gib are DELETED, not shrunk) "
         f"LAUNCH MOMENT = ring span 1, Sigma image_P = {t['host_ring_span1_gib']:.2f} GiB (R7) + "
         f"load_transient={LOAD_TRANSIENT_GIB:.0f} GiB (MEASURED residual of boot weg2ls1b2, #721 constant was 27; D loading while P is dormant) "
@@ -2841,6 +2884,7 @@ def choose(
                         cg_current_bytes=cg_current_bytes,
                         reclaimable_bytes=reclaimable_bytes,
                         cg_ceiling_bytes=cg_ceiling_bytes, s_gb_d=sd,
+                        ring_absent_by_design=ring_absent_by_design,
                         measured_record=measured_record,
                     )
                 except Exception:  # noqa: BLE001 - advice may never mask the refusal
