@@ -281,3 +281,125 @@ def test_the_exchange_carrier_reaches_the_injector(monkeypatch, exchange):
                         raising=True)
     m._weg2_wake_reload_weights()
     assert called == ["inject"]
+
+
+# ===========================================================================
+# THE PUBLISHED TERM.  Added because two mutants survived without it:
+# "an unpublished term is silently sized to nothing" and "the published term
+# is parsed leniently" both passed all 35 tests, i.e. the two refusals in
+# `_weg2_xchg_inject_weights` / `read_published_terms` had no executing test.
+# A refusal nothing exercises is indistinguishable from a refusal that is not
+# there -- the #1329 shape, one level down.
+# ===========================================================================
+
+
+class ThePublishedTerm:
+    """Namespace only; the collected tests are the functions below."""
+
+
+def test_an_unpublished_term_refuses_instead_of_injecting(monkeypatch, exchange):
+    """W4, and it may not become a zero-sized buffer.
+
+    The resume has already remapped the weight pages and their content is
+    undefined, so this wake has exactly two honest outcomes: inject against
+    the size the launcher PRICED, or refuse.  Sizing a pinned host buffer
+    locally would put bytes above the reap mark that no ledger carries, which
+    `host-schwelle-nie-uebertreten` forbids; returning quietly would serve
+    whatever the remap left behind.
+    """
+    from sglang.srt.weg2 import xchg_bounce as xb
+
+    monkeypatch.delenv(xb.ENV_BOUNCE_TERMS, raising=False)
+    m = _manager(_FakeServerArgs(), monkeypatch)
+    with pytest.raises(wu.Weg2WakeRefused) as e:
+        m._weg2_xchg_inject_weights()
+    msg = str(e.value)
+    assert "W4" in msg
+    assert xb.ENV_BOUNCE_TERMS in msg
+
+
+def test_a_published_term_round_trips_through_the_one_sizing_function(monkeypatch):
+    """The launcher's object and the rank's object must be THE SAME term.
+
+    Not "close": the rank rebuilds from the published INPUTS through
+    `bounce_terms`, the single sizing function, so every derived field
+    (buffer, staging, mean, coverage) is recomputed rather than trusted.  A
+    published TOTAL would have been the thing that reads right while its
+    factors drift -- measured twice in this slice already.
+    """
+    from sglang.srt.weg2 import xchg_bounce as xb
+
+    original = xb.bounce_terms(
+        bytes_per_direction=24_000_000, n_layers=8,
+        widest_layer_bytes=4_000_000, pairs=3, depth=2,
+        slot_bytes=128 * xb.MIB,
+    )
+    monkeypatch.setenv(xb.ENV_BOUNCE_TERMS, xb.publish_terms(original))
+    got = xb.read_published_terms()
+    assert got == original
+    assert got.total_bytes == original.total_bytes
+    assert got.staging_per_card == original.staging_per_card
+
+
+def test_no_publication_reads_as_absent_and_never_as_zero(monkeypatch):
+    """``None`` is a state, not a size."""
+    from sglang.srt.weg2 import xchg_bounce as xb
+
+    monkeypatch.delenv(xb.ENV_BOUNCE_TERMS, raising=False)
+    assert xb.read_published_terms() is None
+    assert xb.read_published_terms("   ") is None
+
+
+def test_a_partially_published_term_raises_rather_than_defaulting(monkeypatch):
+    """A missing field would be sized against `bounce_terms`' defaults.
+
+    That is how a pinned constant re-enters through the back door: the term
+    would look priced, and one of its factors would be this module's default
+    rather than the launcher's measurement.
+    """
+    from sglang.srt.weg2 import xchg_bounce as xb
+
+    with pytest.raises(ValueError) as e:
+        xb.read_published_terms("n_layers=8,pairs=3")
+    assert "missing" in str(e.value)
+
+
+def test_an_unknown_published_field_raises(monkeypatch):
+    """An env var that exists and cannot be parsed is a LAUNCHER defect.
+
+    Swallowing it would inject against a size nobody priced, so it raises
+    rather than degrading to ``None`` -- ``None`` means "not published", and
+    conflating the two would turn a defect into a refusal with the wrong name.
+    """
+    from sglang.srt.weg2 import xchg_bounce as xb
+
+    with pytest.raises(ValueError) as e:
+        xb.read_published_terms("n_layers=8,slot_bytes=1,widest=2")
+    assert "unknown field" in str(e.value)
+
+
+def test_a_published_term_reaches_the_transfer_and_refuses_by_name(monkeypatch,
+                                                                   exchange):
+    """With the term present, the seam gets as far as the TRANSFER.
+
+    And the transfer refuses by name today, because the plan provider has no
+    registrant (`weight_exchange.register_plan_provider`, TODO(S6)) and the
+    on-card diagonal lane is still being fixed.  The refusal must name the
+    missing producer and print the priced size -- an operator reading it needs
+    to know the term was fine and the PLAN was not.
+    """
+    from sglang.srt.weg2 import xchg_bounce as xb
+
+    terms = xb.bounce_terms(
+        bytes_per_direction=24_000_000, n_layers=8,
+        widest_layer_bytes=4_000_000, pairs=3, depth=2,
+        slot_bytes=128 * xb.MIB,
+    )
+    monkeypatch.setenv(xb.ENV_BOUNCE_TERMS, xb.publish_terms(terms))
+    m = _manager(_FakeServerArgs(), monkeypatch)
+    with pytest.raises(wu.Weg2WakeRefused) as e:
+        m._weg2_xchg_inject_weights()
+    msg = str(e.value)
+    assert "W4" in msg
+    assert "NO_PLAN_REASON" in msg or "plan provider" in msg
+    assert str(terms.total_bytes) in msg
