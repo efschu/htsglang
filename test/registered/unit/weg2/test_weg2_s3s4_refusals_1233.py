@@ -230,9 +230,12 @@ def test_span_unknown_is_priced_at_full_prompt():
 
 
 def test_span_known_reduces_the_remainder():
+    # #1324: the seed is a MEASURED cached-on-D reading. `record` is gone
+    # because it accepted any token count and the caller that had
+    # `prompt_tokens` passed it -- the weg2sn6s wall.
     spans = SpanLRU()
     prefix = "system:you are helpful\n" * 200
-    spans.record(prefix, 1000)
+    spans.record_presence(prefix, 1000)
     remainder, est, known = price_remainder(prefix + "user:hi\n", spans)
     assert known and remainder < est and remainder <= ONE_CHUNK
 

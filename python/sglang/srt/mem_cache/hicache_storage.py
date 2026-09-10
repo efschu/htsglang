@@ -236,12 +236,45 @@ class PrefetchOutcome(int):
         hit_tokens=None,
         probed: bool = False,
         matched=None,
+        deliverable=None,
     ):
         self = super().__new__(cls, int(loaded))
         self.hit_tokens = int(hit_tokens if hit_tokens is not None else 0)
         self.probed = bool(probed)
         self.matched = int(matched if matched is not None else 0)
+        self.deliverable = int(deliverable if deliverable is not None else 0)
         return self
+
+    @property
+    def is_incomplete(self) -> bool:
+        """#1324: did this read land SHORT of the prefix it was asked for?
+
+        THE THIRD STATE, and the reason it has to exist. Before this the
+        record answered only "how much came back", and the X gate read every
+        terminated read as landed -- so a read that delivered HALF the
+        requested prefix was indistinguishable from one that delivered all of
+        it, and the shortfall was priced as tokens D must prefill.
+
+        MEASURED, boot weg2sn6s rid 00f5bc40 (2026-09-10): requested 109,132
+        tokens, delivered 53,247, and the emitter said ``HiCache prefetch
+        success completed_local=53247 completed_synced=53247 synced=yes``
+        beside ``#1040 EXTENT STATE-ALIGN loss=0 class=aligned``. Nothing was
+        reaped, rate-limited, truncated or dropped -- the store simply did not
+        HOLD the rest yet, because P's write-through is asynchronous and was
+        46 s behind. With no incompleteness on the record there was nothing
+        for the X gate's defer to wait on (``X-DEFER`` 0 hits on that boot),
+        so the remaining 55,885 priced as uncached: W31 -> W50 after the first
+        stream byte -> 413.
+
+        ``deliverable`` is the largest prefix this read COULD have returned --
+        the requested prefix floored to whole pages, since the store hands
+        back pages and never part of one. Floored rather than raw so page
+        arithmetic can never manufacture a phantom shortfall of a few tokens;
+        ``0`` means "not a terminated store read" and is never incomplete,
+        which keeps every admission-site record (which stores a bare ``int``)
+        and every pre-#1324 pickle byte-identical in behaviour.
+        """
+        return int(self.deliverable) > 0 and self.materialized < int(self.deliverable)
 
     @property
     def materialized(self) -> int:
@@ -257,13 +290,14 @@ class PrefetchOutcome(int):
     def __reduce__(self):
         return (
             PrefetchOutcome,
-            (int(self), self.hit_tokens, self.probed, self.matched),
+            (int(self), self.hit_tokens, self.probed, self.matched, self.deliverable),
         )
 
     def __repr__(self) -> str:
         return (
             f"PrefetchOutcome(loaded={int(self)}, hit_tokens={self.hit_tokens}, "
-            f"probed={self.probed}, matched={self.matched})"
+            f"probed={self.probed}, matched={self.matched}, "
+            f"deliverable={self.deliverable})"
         )
 
 

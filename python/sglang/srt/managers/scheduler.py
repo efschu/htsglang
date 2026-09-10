@@ -564,9 +564,27 @@ def _arriving_prefill_tokens(inflight, _already_queued=None, exclude=None) -> in
 #: #1290 vote publishes (see `_prefetch_deferral_refusal_reason`).
 _DEFER_REASON_RATE = "rate_limited"
 _DEFER_REASON_SHORTFALL = "host_pool_shortfall"
+#: #1324: the THIRD producer of the same deferral, and the reason it is a
+#: separate NAME rather than a reuse of ``host_pool_shortfall``. Both mean "the
+#: read landed holding less than the request needs, and the moment it leaves
+#: ``ongoing_prefetch`` the X gate prices the shortfall as tokens D must
+#: prefill" -- so both take the identical arm, the identical exits and the
+#: identical bound. But the CAUSES differ and point at different repairs:
+#: ``host_pool_shortfall`` is OUR staging pool cutting the read at
+#: registration (#1298 S1, a MIN-reduced group trim), while
+#: ``store_prefix_short`` is the STORE not holding the prefix yet, because P's
+#: write-through is asynchronous (measured 46 s behind on boot weg2sn6s). One
+#: is a capacity fact about this group, the other a timing fact about the
+#: producer, and a boot census that could not tell them apart would send the
+#: next reader to the wrong half of the chain.
+_DEFER_REASON_STORE_SHORT = "store_prefix_short"
 #: The verdict `Scheduler._prefetch_kvcache` returns for a read that REGISTERED
 #: and was cut by the post-consensus group trim. Not a decline: the read exists.
 _VERDICT_TRUNCATED_GROUP = "issued:truncated_group"
+#: #1324: the verdict the DRAIN raises for a read that TERMINATED short of the
+#: prefix it asked for (``PrefetchOutcome.is_incomplete``). ``terminated:`` and
+#: not ``issued:`` because this read is over -- what is owed is a re-issue.
+_VERDICT_STORE_SHORT = "terminated:store_short"
 
 # #1068 A12.2: why the prefetch deferral is REFUSED on a rank/phase, by name.
 # MODULE-LEVEL on purpose: `_prefetch_deferral_refusal_reason` is bound to
@@ -6189,6 +6207,27 @@ class Scheduler(
             int(getattr(self, "_weg2_window_reissues", 0) or 0),
             int(getattr(req, "_prefetch_registered_prefix_len", 0) or 0),
             in_flight,
+            # #1324: THE PREFIX THE STORE HAS ACTUALLY DELIVERED so far, which
+            # is the quantity the store-short defer waits on and the only term
+            # that moves when an asynchronous write-through catches up.
+            # Written by `_weg2_note_store_shortfall` at the drain from the
+            # terminated read's own record (`PrefetchOutcome.materialized`).
+            #
+            # WHY IT HAD TO BE A TERM OF *THIS* WITNESS rather than a second
+            # predicate: the arm's rule is "it loads -> wait; it does not load
+            # -> refuse by name", and without this term the witness cannot see
+            # loading AT ALL on a re-issue cycle. `in_flight` alternates 0/1
+            # across issue and termination, and an alternating tuple compares
+            # unequal on every pass, so a chain that re-reads the same 53,247
+            # tokens for ever would have read as PROGRESS for ever. With the
+            # delivered prefix in the tuple, a re-read that gains nothing
+            # leaves the pair (delivered, in_flight) repeating a value it has
+            # already held, and the standstill count advances honestly.
+            # Four of this tuple's terms (the window counters above) have no
+            # writer anywhere in the tree and are therefore constant 0 -- that
+            # is a separate finding, recorded in the boot order, and it is the
+            # reason this term could not simply be left to them.
+            int(getattr(req, "_weg2_store_delivered", 0) or 0),
         )
 
     def _weg2_note_prefetch_progress(self, req) -> str:
@@ -6325,10 +6364,18 @@ class Scheduler(
         span = getattr(req, "_prefetch_span_tokens", None)
         if verdict == _VERDICT_TRUNCATED_GROUP:
             return self._apply_group_shortfall_deferral(req, rid, span, marked, site)
+        if verdict == _VERDICT_STORE_SHORT:
+            # #1324: the read TERMINATED short of its prefix. Same arm, same
+            # exits, same bound -- only the reason name differs, because only
+            # the repair does (see `_DEFER_REASON_STORE_SHORT`).
+            return self._apply_group_shortfall_deferral(
+                req, rid, span, marked, site, reason=_DEFER_REASON_STORE_SHORT
+            )
         if (
             marked
             and verdict == "declined:already_in_flight"
-            and getattr(req, "prefetch_deferred", None) == _DEFER_REASON_SHORTFALL
+            and getattr(req, "prefetch_deferred", None)
+            in (_DEFER_REASON_SHORTFALL, _DEFER_REASON_STORE_SHORT)
         ):
             # #1305 item 6 (boot weg2sn5pre, rid 7df20326): the shortfall mark
             # means "the read REGISTERED and was CUT by the group; a re-issue
@@ -6343,7 +6390,20 @@ class Scheduler(
             # land 15,619 tokens short. For THIS mark, still-in-flight is a
             # RE-DEFER, through the same bounded arm and the same DEFER
             # EXPIRED exit, never a landing.
-            return self._apply_group_shortfall_deferral(req, rid, span, marked, site)
+            #
+            # #1324: the STORE-SHORT mark is in this branch for the identical
+            # reason. Its mark means "the read terminated short; a re-issue is
+            # owed", and the re-issue this arm just made is what
+            # `declined:already_in_flight` reports -- reading that as LANDED
+            # would clear the mark while the read that is meant to fill the
+            # shortfall has not returned, i.e. exactly the #1305 item-6
+            # defect wearing the new cause's costume. The reason is carried
+            # through so the re-defer stays counted under its own cause.
+            return self._apply_group_shortfall_deferral(
+                req, rid, span, marked, site,
+                reason=str(getattr(req, "prefetch_deferred", None)
+                           or _DEFER_REASON_SHORTFALL),
+            )
         if verdict == "declined:rate_limited":
             if self._prefetch_deferral_refusal_reason() is not None:
                 # The pre-#1068 decline stands on this rank/phase (the TP
@@ -6483,9 +6543,22 @@ class Scheduler(
         return str(getattr(cc, "host_role", "retention")) == "staging"
 
     def _apply_group_shortfall_deferral(
-        self, req, rid: str, span, marked: bool, site: str
+        self, req, rid: str, span, marked: bool, site: str,
+        reason: str = _DEFER_REASON_SHORTFALL,
     ) -> Optional[str]:
         """#1298 (S5): the ``host_pool_shortfall`` arm of the A12.2 machine.
+
+        #1324 ADDED A SECOND CAUSE TO THIS ONE ARM, and deliberately no
+        second arm: ``reason`` is ``store_prefix_short`` when the read
+        TERMINATED short because the store did not hold the prefix yet
+        (P's write-through still in flight), and ``host_pool_shortfall``
+        when our own staging pool cut it at registration. The required
+        ACTION is identical in both cases -- keep
+        ``_weg2_store_read_is_pending`` True across the gap so the X gate
+        defers instead of pricing, and let ``_retry_deferred_prefetches``
+        re-issue -- so a second arm would be a second copy of one exit set,
+        which is the compensation layer this tree deletes on sight. Only the
+        name in the census and the log differs, because only the repair does.
 
         THE READ REGISTERED AND WAS CUT BY THE GROUP.  It will land holding
         less than the request needs, and the moment it leaves
@@ -6530,7 +6603,7 @@ class Scheduler(
             note_prefetch_gate as _note_prefetch_gate,
         )
 
-        refusal = self._prefetch_deferral_refusal_reason(_DEFER_REASON_SHORTFALL)
+        refusal = self._prefetch_deferral_refusal_reason(reason)
         if refusal is not None:
             # Counted, never silent -- the suppressed count of the once-per-
             # process DEFERRAL REFUSED line, exactly as the rate arm does.
@@ -6608,28 +6681,45 @@ class Scheduler(
                 int(span),
                 int(limit),
                 site,
-                _DEFER_REASON_SHORTFALL,
+                reason,
             )
             return "undeferrable"
         if not marked:
-            req.prefetch_deferred = _DEFER_REASON_SHORTFALL
+            req.prefetch_deferred = reason
             req.prefetch_defer_attempts = 1
             req.prefetch_defer_passes = 0
             req.prefetch_defer_since = time.monotonic()
             req._weg2_defer_windows = 1
             _note_prefetch_gate("deferred")
-            _note_prefetch_gate("deferred_shortfall")
+            # #1324: the census key names the CAUSE. `deferred_shortfall`
+            # remains exactly the group-trim population it always counted --
+            # additive, so the acceptance identity
+            # `deferred == landed + defer_expired + ...` still balances and no
+            # existing denominator changes under it.
+            _note_prefetch_gate(
+                "deferred_store_short"
+                if reason == _DEFER_REASON_STORE_SHORT
+                else "deferred_shortfall"
+            )
             # L14, edge-triggered: the FIRST deferral only, never per pass.
             logger.warning(
                 "#1068 PREFETCH DEFERRED rid=%s reason=%s attempt=%d span=%d "
-                "site=%s -- the group trim cut this read (#1298 S1, a MIN-"
-                "reduced fact on every rank); the X gate holds it pending "
-                "instead of pricing the whole prompt",
+                "site=%s -- %s; the X gate holds it pending instead of pricing "
+                "the whole prompt",
                 rid,
-                _DEFER_REASON_SHORTFALL,
+                reason,
                 1,
                 -1 if span is None else int(span),
                 site,
+                (
+                    "the store did not hold the requested prefix yet, so the "
+                    "read TERMINATED short (#1324; P's write-through is "
+                    "asynchronous and measured 46 s behind on weg2sn6s) and a "
+                    "re-issue is owed"
+                    if reason == _DEFER_REASON_STORE_SHORT
+                    else "the group trim cut this read (#1298 S1, a MIN-"
+                    "reduced fact on every rank)"
+                ),
             )
             return "deferred"
         req.prefetch_defer_attempts = int(getattr(req, "prefetch_defer_attempts", 0)) + 1
@@ -6650,7 +6740,7 @@ class Scheduler(
         if progress == "terminal":
             if _weg2_windowed_path(self):
                 return self._weg2_store_load_terminal(
-                    req, arm=_DEFER_REASON_SHORTFALL, span=span, site=site
+                    req, arm=reason, span=span, site=site
                 )
             req.prefetch_deferred = None
             _note_prefetch_gate("defer_expired")
@@ -6661,7 +6751,7 @@ class Scheduler(
                 "where a short read is a cache miss rather than a failed "
                 "handover, so the pre-#1317 action is preserved",
                 rid,
-                _DEFER_REASON_SHORTFALL,
+                reason,
                 int(req.prefetch_defer_attempts),
                 -1 if span is None else int(span),
                 int(getattr(req, "_weg2_no_progress_passes", 0) or 0),
@@ -10206,10 +10296,29 @@ class Scheduler(
           rate-limited out of registration and ``_retry_deferred_prefetches``
           will re-issue it at the top of a coming pass.
 
-        A read that terminated having loaded nothing (``#915 PREFETCH
-        REFUSED``, an undeferrable span) is in NEITHER state, so it prices
-        immediately and W31 fires honestly.  That is the point: the defer is
-        for reads that are still coming, never for reads that are not.
+        A read that terminated having loaded NOTHING (``#915 PREFETCH
+        REFUSED``, a revoke below the prefetch threshold, an undeferrable
+        span) is in NEITHER state, so it prices immediately and W31 fires
+        honestly.  That is the point: the defer is for reads that are still
+        coming, never for reads that are not.
+
+        #1324 -- THE THIRD WAY INTO THE FIRST STATE, and the paragraph above
+        is corrected rather than left standing, because it read as an
+        exhaustive partition and was not one. A read that terminated having
+        loaded PART of its prefix is a read that is still coming: the store
+        did not hold the rest YET, because P's write-through is asynchronous.
+        It was previously indistinguishable from a completed read -- the
+        emitter printed ``HiCache prefetch success completed_local=53247``
+        beside ``loss=0 class=aligned`` for 53,247 of 109,132 tokens
+        (weg2sn6s rid 00f5bc40) -- so this predicate answered False, the X
+        gate priced the missing 55,885 as tokens D must prefill, and the
+        request died W31 -> W50 -> 413. The drain now raises
+        ``_VERDICT_STORE_SHORT`` off ``PrefetchOutcome.is_incomplete`` and the
+        A12.2 mark stands, which is why the FIRST branch below (the mark)
+        already covers this case and nothing here needed widening. It ends
+        the same way every other deferral ends: the progress witness waits
+        while the delivered prefix grows and refuses BY NAME (W88) when it
+        stops.
 
         RANK-LOCAL BY CONSTRUCTION, and never consumed as such -- the caller
         reads the MIN-reduced group value.  Both terms are per-rank: the
@@ -11453,7 +11562,100 @@ class Scheduler(
                             _n,
                             len(_ongoing),
                         )
+        # #1324: A TERMINATED READ THAT LANDED SHORT OF ITS PREFIX IS NOT DONE.
+        # Placed HERE, at the end of the drain, because this is the one point
+        # that (a) runs over the replicated waiting queue -- so the visit set
+        # and its order are rank-uniform, which is the #580 law this method
+        # exists to keep -- and (b) is downstream of every termination this
+        # pass performed, so the record it reads is this pass's own outcome.
+        # It adds NO collective: `_weg2_note_store_shortfall` and the deferral
+        # arm it calls read rank-local fields and the census only.
+        #
+        # OVER A SNAPSHOT, not over the live list: the standstill exit inside
+        # the arm (`_weg2_store_load_terminal`) answers the client and REBINDS
+        # `self.waiting_queue` to a filtered copy, so iterating the attribute
+        # itself would mutate the sequence under the loop. `list(...)` is
+        # taken once and the visit set stays exactly the replicated one the
+        # verdicts above were computed over, which is what keeps the #580
+        # rank-uniformity argument intact.
+        for _req in list(self.waiting_queue):
+            self._weg2_note_store_shortfall(_req)
         return verdicts
+
+    def _weg2_note_store_shortfall(self, req) -> Optional[str]:
+        """#1324: defer a read that TERMINATED short of the prefix it asked for.
+
+        THE WALL THIS CLOSES (boot weg2sn6s, 2026-09-10, rid 00f5bc40 =
+        front rid weg2-2-2). A 109,132-token repeat was prefilled whole by P
+        at 15:21:49. D read the store 46 s later and got 53,247 tokens,
+        because the write-through is asynchronous and had not landed. Nothing
+        was reaped, rate-limited, truncated or dropped -- the read simply
+        terminated holding half its prefix, and reported
+        ``HiCache prefetch success completed_local=53247 completed_synced=53247
+        synced=yes`` beside ``#1040 EXTENT STATE-ALIGN loss=0 class=aligned``.
+        With no incompleteness anywhere on the record, ``X-DEFER`` had nothing
+        to wait on (0 hits on that boot) and the X gate priced the remaining
+        55,885 tokens as work D must do: ``X-GATE uncached=55885 X=11101`` ->
+        W31 -> W50 after the first stream byte -> 413, re-route impossible.
+
+        WHAT THIS DOES, AND WHAT IT DELIBERATELY DOES NOT.  It raises the
+        existing A12.2 shortfall verdict for the rid, so the mark stands, the
+        X gate's completion predicate stays True and
+        ``_retry_deferred_prefetches`` re-issues the read on a coming pass --
+        by which time the write-through has delivered more. It introduces no
+        bound, no clock and no new exit: the progress witness
+        (``_weg2_note_prefetch_progress``, which carries the delivered prefix
+        as a term since #1324) waits without limit while the store keeps
+        delivering and takes the named W88 exit when it stops. That is the
+        user's own ruling on this chain -- *"either it loads (wait) or it does
+        not load (error -> abort)"* -- and it is why widening a wall clock to
+        cover a measured 46 s lag was the wrong repair: the next producer is
+        slower or faster, and the number would have to move again.
+
+        NEVER a prefill over X. The terminal exit answers the client 503 by
+        name; it does not admit the request "priced as it stands", which is
+        the path that recomputed 80,459 tokens against X=11,101 on
+        weg2sn6k/sn6l and stands under the user's standing veto.
+
+        Returns the deferral's named outcome, or None when there is nothing to
+        do -- which is the overwhelmingly common case and costs one dict
+        lookup per queued request per pass.
+        """
+        rid = str(getattr(req, "rid", "") or "")
+        if not rid:
+            return None
+        records = getattr(getattr(self, "tree_cache", None),
+                          "prefetch_loaded_tokens_by_reqid", None)
+        if not records:
+            return None
+        outcome = records.get(rid)
+        # A bare `int` record (the admission sites store one) has no
+        # `is_incomplete`, and a `PrefetchOutcome` with `deliverable == 0` is
+        # not a terminated store read. Both answer "nothing to do" here, so
+        # every pre-#1324 path stays byte-identical.
+        if not getattr(outcome, "is_incomplete", False):
+            return None
+        delivered = int(outcome.materialized)
+        deliverable = int(outcome.deliverable)
+        # The witness term, written BEFORE the arm reads it: a re-read that
+        # gains nothing leaves this value unchanged and the standstill count
+        # advances, which is what ends the wait honestly.
+        req._weg2_store_delivered = delivered
+        self._weg2_store_short_seen = getattr(self, "_weg2_store_short_seen", 0) + 1
+        n = self._weg2_store_short_seen
+        if n <= 8 or n % 64 == 0:
+            logger.warning(
+                "#1324 STORE READ INCOMPLETE rid=%s delivered=%d deliverable=%d "
+                "shortfall=%d site=drain occurrence=%d -- the read TERMINATED "
+                "holding less than the prefix it asked for (the store did not "
+                "hold the rest yet; P's write-through is asynchronous). "
+                "Deferring through the A12.2 shortfall arm instead of letting "
+                "the X gate price the shortfall as tokens D must prefill. "
+                "Denominator: every terminated store read of this rank whose "
+                "record reports a page-floored shortfall",
+                rid[:16], delivered, deliverable, deliverable - delivered, n,
+            )
+        return self._apply_prefetch_deferral(req, _VERDICT_STORE_SHORT, site="drain")
 
     def _prefetch_done_for(self, req: Req, drained: Dict[str, bool]) -> bool:
         """Read the drained verdict for ``req``; refuse to answer locally.

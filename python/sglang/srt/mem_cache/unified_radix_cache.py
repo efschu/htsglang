@@ -4630,6 +4630,15 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # `host_span_unclaimed` branch, where the refused tail zeroes loaded but
         # leaves the resident prefix untouched. Reading loaded alone made boot
         # weg1b6 call a reaped-but-fully-resident re-admission a contradiction.
+        # #1324: THE PREFIX THIS READ WAS ASKED FOR, floored to whole pages.
+        # The store hands back pages, so this is the largest prefix the read
+        # could possibly have returned, and `materialized < _deliverable` is
+        # the incompleteness the X gate needs in order to defer instead of
+        # pricing the shortfall as tokens D must prefill (weg2sn6s wall (k)).
+        # Floored, not raw, so the last partial page cannot manufacture a
+        # phantom one-token shortfall on an otherwise complete read.
+        _page = max(1, int(self.page_size))
+        _deliverable = (len(prefetch_key) // _page) * _page
         self.prefetch_loaded_tokens_by_reqid[req_id] = PrefetchOutcome(
             loaded_from_storage,
             # #1203 (A1): NOT NECESSARILY THE REDUCED VALUE. The N1 comment
@@ -4645,6 +4654,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             hit_tokens=_hit_tokens,
             probed=_probed,
             matched=insert_result.prefix_len,
+            deliverable=_deliverable,
         )
         # #843: `refused` separates the TWO reasons this line can say loaded=0,
         # which are not the same finding and were indistinguishable at INFO.
@@ -4705,8 +4715,21 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # line now says WHETHER it was synced and over which world, so no
         # reader can mistake it for a group fact again.
         _synced_world = self._attn_reduce_world()
-        logger.info(
-            "HiCache prefetch success req=%s completed_local=%d completed_synced=%d synced=%s attn_reduce_world=%d matched=%d loaded=%d refused=%d tail_release=%d occupied=%d",
+        # #1324: A SHORT READ IS NOT A SUCCESS, and until now it printed as
+        # one. `HiCache prefetch success ... completed_local=53247` beside
+        # `loss=0 class=aligned` was the whole visible record of a read that
+        # returned 53,247 of the 109,132 tokens it asked for (weg2sn6s rid
+        # 00f5bc40) -- so every reader, the X gate included, saw a completed
+        # read. The two lines carry the IDENTICAL field set on purpose: only
+        # the verdict word and the two shortfall terms differ, so no existing
+        # log reader loses a number, and a `success` count is now a count of
+        # reads that actually delivered their prefix.
+        _short = self.prefetch_loaded_tokens_by_reqid[req_id].is_incomplete
+        (logger.warning if _short else logger.info)(
+            "HiCache prefetch %s req=%s completed_local=%d completed_synced=%d "
+            "synced=%s attn_reduce_world=%d matched=%d loaded=%d refused=%d "
+            "tail_release=%d occupied=%d deliverable=%d shortfall=%d",
+            "INCOMPLETE" if _short else "success",
             req_id,
             completed_tokens,
             min_completed_tokens,
@@ -4717,6 +4740,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             int(insert_result.host_span_unclaimed),
             completed_tokens - min_completed_tokens,
             self.cache_controller.prefetch_tokens_occupied,
+            _deliverable,
+            max(0, _deliverable - (int(insert_result.prefix_len) + int(loaded_from_storage))),
         )
         if self.enable_storage_metrics and self.storage_metrics_collector is not None:
             self.storage_metrics_collector.log_prefetched_tokens(loaded_from_storage)
@@ -5143,6 +5168,14 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                     # materializes nothing, which is the same verdict this
                     # record carried before `matched` existed.
                     matched=0,
+                    # #1324: `deliverable` stays 0 (its default) ON PURPOSE, so
+                    # a revoke is never INCOMPLETE. A revoke means the store's
+                    # probe answered below the prefetch threshold -- there is
+                    # nothing coming, so this is the "read that loaded nothing"
+                    # case `_weg2_store_read_is_pending` already names as
+                    # undeferrable: it prices immediately and W31 fires
+                    # honestly, and the front re-routes to P. Deferring here
+                    # would be waiting on a read that was never issued.
                 )
             return drained
 

@@ -469,23 +469,89 @@ def common_prefix_len(a: str, b: str) -> int:
 
 
 class SpanLRU:
-    """Realised (text, prompt_tokens) outcomes; the front's only price source."""
+    """Realised (text, CACHED-ON-D) outcomes; the front's only price source.
+
+    #1324: WHAT THIS RECORDS IS A PRESENCE WITNESS, NOT A PREFILL WITNESS,
+    and the two used to share one spelling. That conflation is the whole of
+    boot weg2sn6s's wall (k), so the rule is stated here rather than left to
+    the call sites:
+
+      "P prefilled this text" and "D can serve this text without prefilling
+      it" are DIFFERENT FACTS and must not share a spelling.
+
+    MEASURED, weg2sn6s rid weg2-2-2 (2026-09-10). ``record`` was fed P's
+    leg-1 ``prompt_tokens`` -- 109,132 at 15:21:49, the moment P FINISHED
+    PREFILLING and long before its write-through had landed. The repeat
+    arrived 46 s later, ``span_tokens`` credited 98,261 of it, the front
+    priced ``uncached=10871`` against ``X=11101`` and routed SHORT with
+    ``span_known=True``. D then read what the store actually HELD -- 53,247
+    of 109,132, because the write-through is asynchronous -- priced the
+    remaining 55,885 as uncached and refused by name (W31 -> W50 after the
+    first stream byte, so no re-route). Divergence 45,014 tokens, and
+    ``span_known=True`` was the assurance that carried it.
+
+    So the entries are now fed the MEASURED cached-on-D quantity: a D leg-2
+    response's own ``cached_tokens`` (``matched + loaded`` on the tree's
+    emitter line), which is exactly "what D did not have to prefill". P's
+    leg-1 numbers feed NOTHING here: under W38 P reads no store at all, so
+    its ``cached_tokens`` witnesses P's own device tier, and its
+    ``prompt_tokens`` witnesses a prefill whose write-through may still be in
+    flight. Neither is a statement about what D can read back.
+
+    THE DANGER DIRECTION IS OVER-CREDITING, and this feed can only
+    under-credit: a text D has never served carries no entry, so the whole
+    prompt prices as uncached and the request takes the P route (one prefill
+    on P, the soft no-double-prefill goal paying for a hard correctness
+    bound) instead of a SHORT that D refuses by construction. An
+    under-credited span costs a leg; an over-credited one costs the request.
+
+    NOT A STORE INDEX. The front has no tokenizer and no store key index, and
+    building one here would be the second bookkeeping this tree deletes on
+    sight (``_note_p_prefix_reuse`` says so at length). This is one measured
+    outcome per text, and the ONE witness for "cached on D" -- the same
+    quantity D's own store-priced match (``_weg2_local_store_matches`` over
+    ``store_presence_pages``) votes on, observed from the response instead of
+    re-derived at the front.
+    """
 
     def __init__(self, cap: int = SPAN_LRU):
         self.cap = cap
         self.entries: collections.OrderedDict[str, Tuple[str, int]] = collections.OrderedDict()
 
-    def record(self, text: str, prompt_tokens: int) -> None:
-        if not text or prompt_tokens <= 0:
+    def record_presence(self, text: str, cached_tokens: int) -> None:
+        """One MEASURED cached-on-D outcome for ``text``.
+
+        ``cached_tokens`` is a D leg-2 response's own ``cached_tokens``.
+        NAMED ``record_presence`` and not ``record`` on purpose: the old name
+        took whatever token count a caller had to hand, and the caller that
+        had ``prompt_tokens`` passed it. A name that states the quantity is
+        the only guard that survives the next reader.
+
+        A MEASURED ZERO RETRACTS, it does not abstain. ``cached_tokens == 0``
+        for a text is D saying "I hold none of this", and leaving an older,
+        larger entry standing under that measurement is precisely the stale
+        credit that routes the next repeat SHORT into a W50. The old guard
+        (``prompt_tokens <= 0`` -> return) could not distinguish "no reading"
+        from "a reading of nothing".
+        """
+        if not text:
             return
         key = hashlib.sha1(text.encode()).hexdigest()
         self.entries.pop(key, None)
-        self.entries[key] = (text, prompt_tokens)
+        if int(cached_tokens) <= 0:
+            return
+        self.entries[key] = (text, int(cached_tokens))
         while len(self.entries) > self.cap:
             self.entries.popitem(last=False)
 
     def span_tokens(self, text: str) -> Tuple[int, bool]:
-        """(estimated tokens already in the store for this text's prefix, known)."""
+        """(tokens D is MEASURED to hold for this text's prefix, known).
+
+        ``known`` says a PRESENCE witness exists for a prefix of this text --
+        never that a prefill happened (#1324). The scaling stays what it was:
+        the longest common character prefix against a text D served, times
+        that text's realised cached share.
+        """
         best = 0
         known = False
         for etext, etok in self.entries.values():
@@ -499,7 +565,12 @@ class SpanLRU:
 
 
 def price_remainder(text: str, spans: SpanLRU) -> Tuple[int, int, bool]:
-    """(estimated uncached tokens, estimated prompt tokens, span_known)."""
+    """(estimated uncached tokens, estimated prompt tokens, presence_known).
+
+    #1324: the subtracted span is the MEASURED cached-on-D presence, never a
+    prefill. The third term is therefore "a presence witness exists", which
+    is what the SHORT bound needs to hear; see :class:`SpanLRU`.
+    """
     est_prompt = int(len(text) / CHARS_PER_TOKEN) + 1
     span, known = spans.span_tokens(text)
     return max(0, est_prompt - span), est_prompt, known
@@ -2367,13 +2438,25 @@ class Front:
         remainder, est_prompt, known = price_remainder(text, self.spans)
         # MF-3: the routing probe's OTHER half, taken here and nowhere else.
         # `price_remainder` already asked the span LRU how much of this prompt
-        # is a prefix the front has seen realised before -- i.e. a prefix P
-        # prefilled and WROTE THROUGH to the store -- and subtracted it.  That
-        # difference is the store-resident prefix estimate, so MF-3's
-        # denominator costs no second probe.  It must be captured HERE: leg 1
-        # records this very text into the same LRU, after which the probe
-        # would answer with the request's own prefill.
+        # D is MEASURED to hold, and subtracted it.  That difference is the
+        # presence estimate, so MF-3's denominator costs no second probe.  It
+        # must be captured HERE: leg 2 records this very text into the same
+        # LRU, after which the probe would answer with this request's own
+        # outcome.
+        #
+        # #1324 CORRECTION, and the old wording is replaced rather than left
+        # standing because it named the defect as the design: it read "a
+        # prefix P prefilled and WROTE THROUGH to the store". The LRU
+        # witnessed the PREFILL and asserted the WRITE-THROUGH, which is the
+        # 45,014-token divergence of boot weg2sn6s. The entries are now fed D's
+        # own realised `cached_tokens`, so this term is a measurement.
         store_span = max(0, est_prompt - remainder)
+        # #1324: the ROUTE-VERDICT must name WHAT VOUCHED for the credit it
+        # routes on. `span_known=True` alone read as an assurance about the
+        # store; these two fields say which reading it is and how big, so a
+        # SHORT verdict can never again be traced back to a witness that only
+        # ever saw a prefill.
+        presence_src = "d_leg2_cached" if known else "none"
         if not known:
             self.counters["W22_Weg2SpanUnknownPricedFull"] += 1
         self.counters["requests"] += 1
@@ -2402,12 +2485,15 @@ class Front:
         # showed the number. Instrument-text-lies, class A.
         logger.info(
             "WEG2 ROUTE-VERDICT rid=%s verdict=%s uncached=%d (base for X=%d, "
-            "what D must PREFILL, at CHARS_PER_TOKEN=%.1f minus the span-LRU "
-            "prefix) carrier_est=%d src=%s (THE COMPARED VALUE for "
-            "carrier_max=%d: the WHOLE prompt's KV through the host staging "
-            "pool, at CARRIER_CHARS_PER_TOKEN=%.1f) est_prompt=%d chars=%d "
-            "(#1290)",
+            "what D must PREFILL, at CHARS_PER_TOKEN=%.1f minus the MEASURED "
+            "cached-on-D presence) presence_span=%d presence_src=%s (#1324: the "
+            "credit's witness -- d_leg2_cached is a realised cached_tokens "
+            "reading from group D, never a prefill on P) carrier_est=%d src=%s "
+            "(THE COMPARED VALUE for carrier_max=%d: the WHOLE prompt's KV "
+            "through the host staging pool, at CARRIER_CHARS_PER_TOKEN=%.1f) "
+            "est_prompt=%d chars=%d (#1290)",
             rid, route, remainder, self.tp_prefill_max_tokens, CHARS_PER_TOKEN,
+            store_span, presence_src,
             carrier_est, "exact" if exact is not None else "estimate",
             self.carrier_max_tokens, CARRIER_CHARS_PER_TOKEN, est_prompt,
             len(text),
@@ -2477,7 +2563,11 @@ class Front:
             seat = await self._acquire_short_seat(rid, est_prompt)
             if seat is not None:
                 self.counters["route_short"] += 1
-                logger.info("WEG2-ROUTE rid=%s SHORT -> D est_prompt=%d remainder=%d span_known=%s", rid, est_prompt, remainder, known)
+                # #1324: `span_known=True` used to stand alone here and read as
+                # an assurance about the store. The witness is named instead.
+                logger.info("WEG2-ROUTE rid=%s SHORT -> D est_prompt=%d remainder=%d "
+                            "presence_span=%d presence_src=%s",
+                            rid, est_prompt, remainder, store_span, presence_src)
                 self._log_admit(rid, source="short", t_arrive=time.time())
                 return await self.leg2(request, rid, payload, text, stream, pending=None, seat=seat)
         # #1290: NAME THE P ROUTE. `route == "long"` is X < uncached <=
@@ -2710,7 +2800,25 @@ class Front:
                 pt, ct, _, _ = usage_of(js)
                 p.leg1_prompt_tokens = pt
                 self._note_p_prefix_reuse(p, ct)
-                self.spans.record(p.text, pt)
+                # #1324: NO PRESENCE RECORD HERE. This site used to call
+                # `self.spans.record(p.text, pt)`, i.e. it credited the span
+                # P had just PREFILLED as a span D could read back -- and P's
+                # write-through is asynchronous, so at this instant the store
+                # may hold none of it. Measured on weg2sn6s: recorded 109,132
+                # at 15:21:49, D found 53,247 at 15:22:35, the repeat routed
+                # SHORT on the difference and died W31 -> W50.
+                #
+                # Nothing replaces it, because P HAS no presence witness to
+                # offer: under W38 (`Weg2CarrierlessPpStoreRead`) group P
+                # reads no store at all, so its `cached_tokens` speaks only
+                # for P's own device tier, and its `prompt_tokens` speaks for
+                # a prefill, not for a landing. The witness is D's own
+                # `cached_tokens` on leg 2, recorded there.
+                #
+                # `_note_exact` DOES stay: `prompt_tokens` is a TOKENISATION
+                # fact (this text is 109,132 tokens), it feeds `carrier_est`,
+                # and it was never wrong -- `carrier_est=109132 src=exact` was
+                # the one correct number on the sn6s route line.
                 self._note_exact(p.text, pt)
                 # #1317n THE POST-LEG-1 CARRIER BAND IS GONE. It compared
                 # the realised prompt against what D's host tier could carry AS
@@ -2952,7 +3060,12 @@ class Front:
                     verdict = self._leg2_verdict(pt, ct, priced, pending, single_prefill, True, rid,
                                                  x_inband=x_inband)
                     if pt:
-                        self.spans.record(text, pt)
+                        # #1324: the PRESENCE witness is D's own cached share,
+                        # not the prompt length. `pt` still feeds the
+                        # tokenisation fact (`carrier_est`); `ct` is what D
+                        # did not have to prefill, and it is the only measured
+                        # answer to "can D serve this text back".
+                        self.spans.record_presence(text, ct)
                         self._note_exact(text, pt)
                     dterms = await self._draft_terms(g, None)
                     logger.info("WEG2-SERVED group=D leg=2 rid=%s stream=1 status=%d prompt_tokens=%d cached_tokens=%d completion_tokens=%d "
@@ -3027,7 +3140,13 @@ class Front:
                 elif _unc > 0 and _w > 0:
                     self.counters["r_d_skipped_concurrent"] += 1
                 if pt:
-                    self.spans.record(text, pt)
+                    # #1324, as on the streamed branch above: `ct` is the
+                    # measured presence, `pt` the tokenisation fact. On a W31
+                    # leg 2 this deliberately records D's SMALL reading and
+                    # thereby RETRACTS any larger stale credit for this text
+                    # -- D's own refusal is the strongest evidence the prefix
+                    # did not come back.
+                    self.spans.record_presence(text, ct)
                     self._note_exact(text, pt)
                 if r.status == 200 and pending is not None and verdict == "reroute":
                     self.counters["reroute"] += 1

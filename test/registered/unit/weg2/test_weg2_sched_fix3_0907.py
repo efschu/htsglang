@@ -1280,19 +1280,28 @@ def test_a14_the_forgone_prefix_reuse_is_priced_by_the_routing_probe(caplog):
 
     THE DENOMINATOR IS THE FRONT'S OWN ROUTING PROBE, not a new one.
     ``price_remainder`` already asks the span LRU how much of an arriving
-    prompt is a prefix this front saw realised before -- a prefix P prefilled
-    and wrote through -- and the CARRIER-EXCEEDS / SHORT routing decision is
-    taken on the difference.  ``est_prompt - remainder`` is therefore the
-    store-resident estimate at no extra cost, and it is captured at ARRIVAL
-    because leg 1 records this very text into the same LRU moments later.
+    prompt D is MEASURED to hold, and the CARRIER-EXCEEDS / SHORT routing
+    decision is taken on the difference.  ``est_prompt - remainder`` is
+    therefore the presence estimate at no extra cost, and it is captured at
+    ARRIVAL because leg 2 records this very text into the same LRU moments
+    later.
 
     The reused term is MEASURED (P's own leg-1 ``cached_tokens``), never the
     literal 0 the finding predicts, so the day the carrier arrives and the
     read re-arms this line moves on its own instead of lying.
+
+    #1324 CORRECTED THIS TEST'S SETUP, and the correction is the ticket: it
+    used to seed the probe with ``f.spans.record(text, 120)`` and described
+    the seeded quantity as "a prefix P prefilled AND WROTE THROUGH". Those
+    are two facts and the LRU only ever witnessed the first -- which is the
+    45,014-token divergence of boot weg2sn6s. The seed is now a MEASURED
+    cached-on-D reading, which is what the probe has always claimed to hold.
+    The instrument under test (MF-3's three counters) is unchanged; only its
+    denominator is now honest.
     """
     f = _front_with_reading(None)
     text = "a shared system preamble that two turns of one conversation carry"
-    f.spans.record(text, 120)
+    f.spans.record_presence(text, 120)
 
     follow_up = text + " ... and the second turn's own question"
     remainder, est_prompt, known = front_mod.price_remainder(follow_up, f.spans)
