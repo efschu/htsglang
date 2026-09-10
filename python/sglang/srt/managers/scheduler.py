@@ -620,9 +620,10 @@ def _weg2_store_shortfall_pass(sched) -> int:
     A MODULE FUNCTION for the reason `_weg2_windowed_path` below states at
     length, and this one paid the same price before adopting the form: the
     drain is bound onto a `types.SimpleNamespace` by five harnesses, each with
-    a CURATED list of real methods, so `self._weg2_note_store_shortfall(...)`
+    a CURATED list of real methods, so calling that method through the receiver
     raised AttributeError on every one of them. Resolved in this module's
-    globals instead, no stand-in can be missing it.
+    globals instead, no stand-in can be missing it. (Written without a
+    `self.`-qualified spelling on purpose -- see the note at the call site.)
 
     A receiver that does not carry the predicate does NOTHING -- exactly the
     pre-#1324 drain -- which is what those harnesses assert. In production the
@@ -11632,8 +11633,15 @@ class Scheduler(
         # lesson, and this call site paid for it once: five harnesses bind
         # `_drain_prefetch_progress` onto a `types.SimpleNamespace` with a
         # CURATED list of real methods, so a NEW method is missing from them by
-        # construction and `self._weg2_note_store_shortfall(...)` raised
-        # AttributeError there. Measured on the #1324 gate: 2 NEW failures,
+        # construction, so calling that method through the receiver raised
+        # AttributeError there. (The method name is deliberately NOT written
+        # here as a receiver-qualified expression: the #610 drift guard regexes
+        # receiver-qualified attribute reads out of THIS method's source,
+        # comments included, and an epitaph in a comment reads to it as a live
+        # member of the reduce surface -- measured, it added a third name to
+        # that guard's drift list, and the first rewording of this very comment
+        # added a fourth by quoting the regex's own placeholder.) Measured on
+        # the #1324 gate: 2 NEW failures,
         # `test_prefetch_orphan_collect_1233` both cases, plus an AttributeError
         # surfacing inside `test_ring_commit_bounded_973`'s healthy commit. Same
         # shape as `_weg2_windowed_path` above, same remedy.
