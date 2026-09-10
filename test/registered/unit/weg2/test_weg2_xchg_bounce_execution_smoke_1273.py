@@ -75,6 +75,7 @@ from sglang.srt.weg2 import weight_exchange_region as xr  # noqa: E402
 #: green in every summary, and the whole point of the red run is a number that
 #: is not zero.
 from sglang.srt.weg2 import weight_exchange_bounce as bx  # noqa: E402
+from sglang.srt.weg2 import xchg_bounce as xb  # noqa: E402
 
 from .test_weg2_xchg_transport_1273 import (  # noqa: E402
     FakeDeviceOps,
@@ -107,9 +108,13 @@ STEP = 0x4000
 QKV_OFF = 0x0
 DOWN_OFF = 0x2000
 
-#: The slot is deliberately SMALLER than a unit, so the band cut is exercised
-#: rather than assumed: one layer group-wide is 3072 B and the slot is 1 KiB.
-SLOT_BYTES = 1024
+#: One unit group-wide: three qkv bands plus three down_proj copies.
+UNIT_BYTES = N_DST * QKV_ROWS_SHARD * ROW + N_DST * DOWN_ROWS * ROW   # 3072
+#: THE PRODUCTION SHAPE (AMENDMENT 2): one depth-slot holds a COMPLETE unit,
+#: so the slot is the WIDEST unit and every unit is exactly ONE band.  A
+#: smaller slot is refused, and ``test_a_mean_sized_slot_is_refused`` is that
+#: law's own test -- it is not a knob this file may quietly lower.
+SLOT_BYTES = UNIT_BYTES
 DEPTH = 2
 
 TAG = "weights.chunk.0"
@@ -275,8 +280,7 @@ def test_units_group_by_layer_not_by_parameter():
 
 def test_a_unit_carries_the_bytes_of_every_destination():
     units = bx.plan_units(_all_descs())
-    want = N_DST * QKV_ROWS_SHARD * ROW + N_DST * DOWN_ROWS * ROW
-    assert units[0].nbytes == want
+    assert units[0].nbytes == UNIT_BYTES
 
 
 def test_the_widest_unit_is_named_not_averaged():
@@ -291,18 +295,24 @@ def test_the_widest_unit_is_named_not_averaged():
     assert widest.nbytes > bx.plan_units(_all_descs())[1].nbytes
 
 
-def test_the_slot_refuses_only_what_no_cut_can_fit():
-    """The HARD bound is the widest RUN, not the widest unit.
+def test_a_run_wider_than_the_slot_is_refused():
+    """The batcher's floor: no cut of a 2-D copy may go below one ROW.
 
-    With the band cut a slot smaller than a unit is correct, so a widest-unit
-    refusal would refuse a working configuration.  What no cut can survive is a
-    single indivisible run above the slot -- measured 17408 B on the real
-    checkpoint -- and that is what refuses.
+    Measured 17408 B on the real checkpoint, so at any sane slot this cannot
+    fire -- which is exactly why it must be tested rather than trusted.
+    Delegated to the transport's own W68 so there is one producer of the
+    verdict.
     """
     descs = _all_descs()
-    bx.refuse_if_slot_short(SLOT_BYTES, descs)           # a unit > slot: fine
-    with pytest.raises(wx.Weg2XchgPlanDisagree) as e:
-        bx.refuse_if_slot_short(ROW - 1, descs)          # a RUN > slot: refused
+    bx.refuse_if_slot_short(SLOT_BYTES, descs)
+    # NOTE, measured while writing this test: ``Weg2XchgPlanDisagree`` exists
+    # TWICE -- ``weight_exchange.py:201`` and ``weight_exchange_region.py:260``
+    # -- as two unrelated ``RuntimeError`` subclasses both documented as W68.
+    # The batcher raises the REGION's, so that is the one asserted here.  A
+    # test that caught the other would have gone green on the wrong identity;
+    # unifying them is not this slice's change.
+    with pytest.raises(xr.Weg2XchgPlanDisagree) as e:
+        bx.refuse_if_slot_short(ROW - 1, descs)
     assert "run_bytes" in str(e.value)
 
 
@@ -362,7 +372,7 @@ def test_the_line_prints_the_expression_and_not_only_the_total(tmp_path, armed):
     _seed_source(ops)
     result = _run_bounce(_manager(), ops, armed, str(tmp_path))
     line = result.line()
-    assert "WEG2-XCHG-BOUNCE" in line
+    assert line.startswith("WEG2-XCHG-BOUNCE-LEG ")
     for field in ("units=", "widest_unit_bytes=", "slot_bytes=", "depth=",
                   "bounce_total_bytes=", "widest_run_bytes=", "overlap="):
         assert field in line, field
@@ -457,20 +467,91 @@ def test_depth_one_cannot_overlap_and_says_so(tmp_path, armed):
     assert "overlap=none" in result.line()
 
 
-def test_the_refusal_bound_may_not_be_the_mean():
-    """Section 10.5, in the direction the census made concrete.
+def test_a_mean_sized_slot_is_refused(tmp_path, armed):
+    """Section 10.5 and AMENDMENT 2, in the direction the census made concrete.
 
-    Layer 0 is made three times the others, so mean < layer 0.  A refusal that
-    graded a slot against the MEAN would accept a slot no cut of layer 0 can
-    survive.  The bound under test is the widest RUN, and the mean may not
-    appear in the decision at all.
+    Layer 0 is made wider than the others, so mean < layer 0.  A slot sized on
+    the MEAN covers most units and cannot assemble the widest one COMPLETE --
+    "a boot sized on the mean dies on whichever layer is above it".  The
+    refusal must therefore fire at the mean and it must carry the ARM's own
+    W71 wording, not a second spelling.
+
+    This is the run-moment half of ``xchg_bounce``'s arm-time coverage grade:
+    the arm grades a censused NUMBER, this grades the PLAN.  A census that
+    under-read the widest layer passes the first and must not pass the second.
     """
     descs = _all_descs() + _qkv_descs(0) * 2
     units = bx.plan_units(descs)
-    mean = sum(u.nbytes for u in units) / len(units)
+    mean = int(sum(u.nbytes for u in units) / len(units))
     widest = bx.widest_unit(units).nbytes
-    assert widest > mean
-    # A slot between the mean and the widest unit is ACCEPTED, because the band
-    # cut makes it workable -- this is the assertion that fails if someone
-    # reinstates a widest-unit refusal.
-    bx.refuse_if_slot_short(int(mean), descs)
+    assert widest > mean, (widest, mean)
+
+    with pytest.raises(xb.Weg2XchgBounceUnderCovered) as e:
+        bx.refuse_if_plan_exceeds_slot(mean, descs)
+    msg = str(e.value)
+    assert "W71" in msg
+    assert "never the mean" in msg
+    assert "layers.0" in msg
+
+    # And the leg itself must not start on such a slot: the refusal has to
+    # arrive BEFORE the buffer is mapped and before a byte moves, which is
+    # W71's whole reason for existing.
+    ops = FakeDeviceOps(str(tmp_path), 0)
+    _seed_source(ops)
+    before = bx.registered_bounce_bytes()
+    with pytest.raises(xb.Weg2XchgBounceUnderCovered):
+        _run_bounce(_manager(), ops, armed, str(tmp_path), descs=descs,
+                    slot_bytes=mean)
+    assert bx.registered_bounce_bytes() == before
+
+
+def test_the_slot_covers_the_widest_unit_so_a_unit_is_one_band(tmp_path, armed):
+    """AMENDMENT 2 as an observable: COMPLETE assembly means bands == units.
+
+    The user law says a layer is assembled "vollstaendig".  Under a slot that
+    covers the widest unit that is not an aspiration but an identity, and the
+    line prints both numbers so a config where it stops holding is visible in
+    the log instead of being argued.
+    """
+    ops = FakeDeviceOps(str(tmp_path), 0)
+    _seed_source(ops)
+    result = _run_bounce(_manager(), ops, armed, str(tmp_path))
+    assert result.bands == result.units == N_LAYERS
+
+
+def test_the_leg_geometry_comes_from_the_arm_term_not_from_this_module():
+    """Section 10.8's "one reader, or they drift", as a test.
+
+    ``bounce_terms`` sets ``buffer_bytes = widest_layer_bytes * depth``, so the
+    per-slot width IS the widest layer.  ``leg_geometry`` must return exactly
+    that -- a module that recomputed a size would be the second ledger.
+    """
+    terms = xb.bounce_terms(
+        bytes_per_direction=UNIT_BYTES * N_LAYERS, n_layers=N_LAYERS,
+        widest_layer_bytes=UNIT_BYTES, pairs=6, depth=DEPTH,
+        slot_bytes=xb.SLOT_BYTES_DEFAULT,
+    )
+    assert bx.leg_geometry(terms) == (UNIT_BYTES, DEPTH)
+    assert terms.covers_widest_layer is True
+
+
+def test_the_run_line_is_not_the_arm_line(tmp_path, armed):
+    """Two moments, two prefixes -- or no parser can tell them apart.
+
+    ``xchg_bounce.arm_line`` owns ``WEG2-XCHG-BOUNCE`` and reports the SIZING;
+    the leg reports what it MOVED.  A single prefix carrying both is the
+    instrument confusion #1005 exists to end, so this asserts the prefixes are
+    distinct rather than merely present.
+    """
+    ops = FakeDeviceOps(str(tmp_path), 0)
+    _seed_source(ops)
+    result = _run_bounce(_manager(), ops, armed, str(tmp_path))
+    terms = xb.bounce_terms(
+        bytes_per_direction=UNIT_BYTES * N_LAYERS, n_layers=N_LAYERS,
+        widest_layer_bytes=UNIT_BYTES, pairs=6, depth=DEPTH,
+        slot_bytes=xb.SLOT_BYTES_DEFAULT,
+    )
+    arm = xb.arm_line(terms, sigma_h_bytes=0)
+    assert result.line().startswith("WEG2-XCHG-BOUNCE-LEG ")
+    assert arm.startswith("WEG2-XCHG-BOUNCE ")
+    assert not arm.startswith("WEG2-XCHG-BOUNCE-LEG")

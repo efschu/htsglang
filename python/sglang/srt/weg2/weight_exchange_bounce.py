@@ -105,6 +105,7 @@ from sglang.srt.mem_cache.pinned_host_budget import (
 from sglang.srt.weg2 import weight_exchange as wx
 from sglang.srt.weg2 import weight_exchange_region as xr
 from sglang.srt.weg2 import weight_exchange_transport as tp
+from sglang.srt.weg2 import xchg_bounce as xb
 
 logger = logging.getLogger(__name__)
 
@@ -117,8 +118,9 @@ __all__ = [
     "Unit",
     "agreed_descs",
     "bounce_path",
-    "bounce_total_bytes",
+    "leg_geometry",
     "plan_units",
+    "refuse_if_plan_exceeds_slot",
     "refuse_if_slot_short",
     "registered_bounce_bytes",
     "run_agreed_leg",
@@ -243,18 +245,59 @@ def refuse_if_slot_short(slot_bytes: int, descs: Sequence[object]) -> None:
     tp.batch_descs(list(descs), int(slot_bytes))
 
 
-def bounce_total_bytes(slot_bytes: int, depth: int,
-                       staging_bytes: Optional[int] = None) -> int:
-    """Section 10.2's expression, as a function so the line can print terms.
+def refuse_if_plan_exceeds_slot(slot_bytes: int, descs: Sequence[object],
+                                terms: Optional[xb.BounceTerms] = None) -> None:
+    """Refuse when THIS PLAN's widest unit does not fit one depth-slot.
 
-    ``slot_bytes * depth`` is path (b)'s assemble buffer; ``staging_bytes`` is
-    path (a)'s existing cross lane (``xr.DATA_BYTES``, 6 directed pairs x 2
-    slots x ``xr.SLOT_BYTES``), passed in rather than read here so a caller
-    pricing a boot without path (a) can say so with a 0 instead of having this
-    function guess.
+    THE SAME REFUSAL AS ARM TIME, AT THE OTHER MOMENT, and that is the point
+    rather than a duplicate.  ``xchg_bounce.bounce_terms`` grades a NUMBER --
+    ``widest_layer_bytes``, measured by the launch-time checkpoint census
+    (step B1b) -- while this grades the PLAN the leg actually holds.  If the
+    census under-read the widest layer, arm time says ``covers_widest=yes`` and
+    the assembly would then band a unit the user law requires assembled
+    COMPLETE (AMENDMENT 2).  That gap is invisible to either check alone.
+
+    It raises ``Weg2XchgBounceUnderCovered`` with
+    ``xchg_bounce.under_coverage_refusal``'s own text -- one producer of the
+    message, so the log cannot carry two different spellings of one refusal.
     """
-    staged = xr.DATA_BYTES if staging_bytes is None else int(staging_bytes)
-    return int(slot_bytes) * int(depth) + staged
+    units = plan_units(descs)
+    if not units:
+        return
+    widest = widest_unit(units)
+    if widest.nbytes <= int(slot_bytes):
+        return
+    if terms is None:
+        # No ARM term to quote (a caller that sized by hand, i.e. a test or a
+        # tool).  The refusal still names the same two numbers rather than
+        # inventing a second message shape.
+        terms = xb.bounce_terms(
+            bytes_per_direction=sum(u.nbytes for u in units),
+            n_layers=len(units), widest_layer_bytes=widest.nbytes,
+            pairs=0, depth=1, slot_bytes=xr.SLOT_BYTES,
+        )
+    raise xb.Weg2XchgBounceUnderCovered(
+        xb.under_coverage_refusal(terms, widest_layer_name=widest.key[1])
+        + f" MEASURED AT RUN TIME from the plan itself: the widest unit is "
+          f"{widest.key[1]} at {widest.nbytes} B against a depth-slot of "
+          f"{int(slot_bytes)} B, so the launch-time census that sized the "
+          f"buffer under-read this boot's widest layer."
+    )
+
+
+def leg_geometry(terms: xb.BounceTerms) -> Tuple[int, int]:
+    """``(slot_bytes, depth)`` for :func:`run_bounce_leg`, out of the ARM's own
+    term -- THE ONE READER of that decision.
+
+    Section 10.8's instruction for step 3, applied to step 4 as well: the
+    region layout and ``bounce_terms(slot_bytes=)`` "must be fed the SAME
+    value -- one reader, or they drift".  So this module derives NO size of its
+    own.  ``xchg_bounce.bounce_terms`` sets ``buffer_bytes =
+    widest_layer_bytes * depth``, which makes the per-slot width the WIDEST
+    LAYER and is why a unit is assembled COMPLETE in one slot (AMENDMENT 2,
+    the user law's "vollstaendig zusammengesetzt").
+    """
+    return int(terms.buffer_bytes) // int(terms.depth), int(terms.depth)
 
 
 # ---------------------------------------------------------------------------
@@ -429,15 +472,21 @@ class BounceResult:
         return "MATCH"
 
     def line(self) -> str:
-        """Section 10.6's acceptance line, printing the EXPRESSION's terms.
+        """The RUN-moment line.  Deliberately NOT ``WEG2-XCHG-BOUNCE``.
 
-        Section 10.2 requires it: "the arming line must PRINT the expression's
-        terms, not just the total", because a boot whose cut differs gets a
-        different number from the same formula and a bare total could not be
-        checked against it.
+        ``xchg_bounce.arm_line`` already owns that prefix and prints the ARM
+        moment: the sizing expression, the coverage verdict and Sigma H.  This
+        line reports what the leg then MOVED.  Two moments, two prefixes: a
+        single prefix carrying both would make an arm figure and a run figure
+        indistinguishable to any parser, which is the instrument confusion
+        #1005 was built to end.
+
+        Section 10.2's rule still binds -- the terms are printed, not just the
+        total -- because a boot whose cut differs gets a different number from
+        the same formula and a bare total could not be checked against it.
         """
         return (
-            "WEG2-XCHG-BOUNCE "
+            "WEG2-XCHG-BOUNCE-LEG "
             f"units={self.units} bands={self.bands} "
             f"widest_unit={self.widest_unit_key[1]} "
             f"widest_unit_bytes={self.widest_unit_bytes} "
@@ -544,8 +593,9 @@ def run_bounce_leg(
     ops: tp.DeviceOps,
     boot_nonce: str,
     *,
-    slot_bytes: int,
-    depth: int = 2,
+    slot_bytes: Optional[int] = None,
+    depth: Optional[int] = None,
+    terms: Optional[xb.BounceTerms] = None,
     shm_root: str = xr.SHM_ROOT,
     device: int = 0,
     log=None,
@@ -562,13 +612,37 @@ def run_bounce_leg(
     drained before the next deposit and ``overlap`` reports ``none``: a
     correct transfer and a degraded one, and the line says which.
 
-    ``slot_bytes`` IS NOT DERIVED HERE.  It is the caller's, because the sizing
-    expression and its ledger charge have ONE owner (the launcher's
-    ``xchg_bounce_*`` terms) and a second derivation inside the transport would
-    be the two-ledgers defect this campaign has already paid for.  What this
-    function does own is the REFUSAL that the caller's number is impossible
-    (:func:`refuse_if_slot_short`).
+    ``slot_bytes`` IS NOT DERIVED HERE.  Pass ``terms`` (an
+    ``xchg_bounce.BounceTerms``) and the geometry comes from
+    :func:`leg_geometry`, i.e. from the ARM's own priced decision; the explicit
+    ``slot_bytes``/``depth`` pair exists for tests and tools that size by hand.
+    The sizing expression and its ledger charge have ONE owner
+    (``xchg_bounce`` + the launcher's ``xchg_bounce_host_bytes``), and a second
+    derivation inside the transport would be the two-ledgers defect this
+    campaign has already paid for.  What this function owns is the two
+    REFUSALS that the number cannot work for THIS plan
+    (:func:`refuse_if_plan_exceeds_slot`, :func:`refuse_if_slot_short`).
+
+    THE ROW MAP IS NOT COMPUTED HERE EITHER, and that is the S1 boundary the
+    spec's two prior incidents demand.  Every offset this loop uses is the
+    descriptor's own ``src_off``/``dst_off``/``spitch``/``dpitch`` as
+    ``weight_exchange.build_plan`` emitted them -- which is where
+    ``device_block_offsets`` already knows that ``qkv_proj`` is three device
+    sub-blocks and ``in_proj_qkvz`` FOUR at rows ``0 / g_k / 2*g_k /
+    2*g_k+g_v`` (``qwen3_5.py:543``) and not the checkpoint's byte offsets.
+    A second offset derivation here is precisely the defect that was paid for
+    twice, so there is none.
     """
+    if terms is not None:
+        derived_slot, derived_depth = leg_geometry(terms)
+        slot_bytes = derived_slot if slot_bytes is None else slot_bytes
+        depth = derived_depth if depth is None else depth
+    if slot_bytes is None or depth is None:
+        raise ValueError(
+            "run_bounce_leg needs either `terms` (the ARM's priced decision) "
+            "or an explicit slot_bytes/depth pair; it derives no size of its "
+            "own, because the sizing expression has one owner (xchg_bounce)"
+        )
     descs = list(descs)
     hole = _missing_pointer(descs)
     if hole is not None:
@@ -578,6 +652,10 @@ def run_bounce_leg(
             f"with undefined bytes. Refusing before the buffer is mapped."
         )
     refuse_if_slot_short(slot_bytes, descs)
+    # AMENDMENT 2: a unit is assembled COMPLETE in one depth-slot.  This is the
+    # run-moment half of the ARM's coverage grade -- see the function's
+    # docstring for why one check cannot cover both moments.
+    refuse_if_plan_exceeds_slot(slot_bytes, descs, terms)
 
     units = plan_units(descs)
     if not units:

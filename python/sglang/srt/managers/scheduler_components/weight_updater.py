@@ -2067,6 +2067,81 @@ class SchedulerWeightUpdaterManager:
         self._weg2_shadow_hook("destination", recv_req=recv_req,
                                reserve_bytes=reserve_bytes, ring_ms=ring_ms)
 
+    # -- #1273 S6-BOUNCE: THE AUTHORITATIVE PATHS ------------------------
+    #
+    # These two are the product call sites of the exchange, and they differ
+    # from the shadow's two hooks above in the one way that matters: the
+    # shadow OBSERVES beside a ring that owns the bytes, and these OWN them.
+    # Under ``--weg2-weight-source exchange`` the weights region is opened
+    # ``enable_cpu_backup=False``, so ``resume`` recommits pages whose content
+    # is undefined and the ring has nothing to restore -- the bytes have to
+    # come from the peer group's live VRAM, through a bounded host buffer,
+    # instead of from ``update_weights_from_disk`` (:meth:`_weg2_wake_reload_weights`,
+    # measured 12.073/14.143/16.749 s per wake on this rig).
+    #
+    # THEY RAISE.  An observer that took a flip down over its own bookkeeping
+    # would be wrong, and that is why every shadow method above swallows; an
+    # AUTHORITY that swallowed would serve undefined weights, which is worse
+    # than a refusal by exactly the margin this whole campaign is about.  The
+    # refusals are W68 (a run no slot can hold), W71 (a unit the buffer cannot
+    # assemble whole) and W74 (a slice no source covers) -- all three from
+    # modules that already own them, and no new W-code.
+
+    def _weg2_xchg_bounce_leg(self, *, descs, ops, boot_nonce,
+                              slot_bytes=None, depth=None, terms=None,
+                              shm_root=None, device: int = 0):
+        """PATH (b): assemble each unit in the host bounce, every card slices.
+
+        The whole of the user law's fallback sentence, at the one call site
+        that has both the plan and the device: *"notfalls wird das layer auf
+        einem (vertretbar kleinen) hostpuffer vollstaendig zusammengesetzt und
+        jede karte nimmt sich von dem was er braucht (oder ihn komplett)"*.
+
+        A THIN METHOD ON PURPOSE, and the thinness is the point rather than an
+        omission: #1329 was three boots spent on a shadow whose first write
+        raised on a slots dataclass, and every test of that slice drove the
+        module functions while the mixin's own methods -- the only callers the
+        product has -- had no executing test at all.  So this method exists to
+        BE the call site the smoke drives, and it holds no state (this is a
+        ``slots=True`` dataclass, for the fifth time in this file).
+
+        ``terms`` is the ARM's priced decision (``xchg_bounce.BounceTerms``)
+        and is the normal way in; the explicit ``slot_bytes``/``depth`` pair is
+        for tests and tools. The geometry is never derived here -- section
+        10.8's "one reader, or they drift".
+        """
+        from sglang.srt.weg2 import weight_exchange_bounce as bx
+        from sglang.srt.weg2 import weight_exchange_region as xr
+
+        return bx.run_bounce_leg(
+            descs, ops, boot_nonce,
+            slot_bytes=slot_bytes, depth=depth, terms=terms,
+            shm_root=xr.SHM_ROOT if shm_root is None else shm_root,
+            device=device, log=logger.info,
+        )
+
+    def _weg2_xchg_agreed_leg(self, *, descs, ops, boot_nonce,
+                              slot_bytes=None, shm_root=None,
+                              device: int = 0):
+        """PATH (a): byte-identical pieces, card-to-card, TO LIVE STORAGE.
+
+        The authority question of path (a) is one line long: the shadow calls
+        ``sh.to_shadow`` to re-target every descriptor into its own buffer, and
+        this does NOT -- the descriptors keep their original ``dst_ptr``, so
+        what changes is the destination's live weight storage.  Measured on
+        boot weg2xsn8 the agreed set is 4.90 MiB against a 27.52 GiB image, so
+        this path is real and byte-negligible, and it is deliberately not
+        over-built for that reason.
+        """
+        from sglang.srt.weg2 import weight_exchange_bounce as bx
+        from sglang.srt.weg2 import weight_exchange_region as xr
+
+        return bx.run_agreed_leg(
+            descs, ops, boot_nonce, slot_bytes=slot_bytes,
+            shm_root=xr.SHM_ROOT if shm_root is None else shm_root,
+            device=device, log=logger.info,
+        )
+
     def _weg2_corridor_floor_bytes(self) -> Optional[int]:
         """This card's corridor lower bound in bytes, or None (#1331).
 
