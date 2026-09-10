@@ -1099,6 +1099,50 @@ def d_hicache_provenance(terms: Dict[str, float], share_source: str) -> str:
     )
 
 
+def largest_fundable_d_cap(
+    priced_ok, cap_tokens: int, max_rank_share: float,
+    cell_bytes: int, fraction: float,
+) -> Optional[Dict[str, float]]:
+    """The biggest ``--max-kv-per-request`` some fundable S_D could serve.
+
+    ORDER ITEM 1, THE HALF THAT WAS MISSING: *"ist S_D nicht fundierbar ->
+    benannte Refusal am Launch, die den GROESSTEN FUNDIERBAREN CAP nennt (kein
+    stilles Verkleinern)"*. The first build shipped the refusal without the
+    number, so boot weg2sn6r got a correct W20 that named Sigma H and the rung
+    as its levers and could not say what cap WOULD fit -- leaving the operator
+    to invert the arithmetic by hand.
+
+    ``priced_ok`` is a callable ``s_gb_d -> bool`` (does an arm at that D budget
+    fund BOTH moments), so this function does no pricing of its own and cannot
+    drift from the ladder that refused.
+
+    Returns None when not even S_D=1 funds the moments -- then the D budget is
+    not the binding term and saying otherwise would send the operator after the
+    wrong lever.
+    """
+    share = float(max_rank_share)
+    cell = max(1, int(cell_bytes))
+    frac = float(fraction)
+    if share <= 0.0 or frac <= 0.0:
+        return None
+    best = None
+    for s_d in range(max(1, int(round(cap_tokens * share * cell / frac / GB))), 0, -1):
+        if priced_ok(s_d):
+            best = s_d
+            break
+    if best is None:
+        return None
+    rows = int(best * GB // cell)
+    lendable = int(rows * frac)
+    return {
+        "s_gb_d": float(best),
+        "rows": float(rows),
+        "rows_lendable": float(lendable),
+        "cap_tokens": float(int(lendable / share)),
+        "asked_cap": float(int(cap_tokens)),
+    }
+
+
 def _arm_s_d(arm) -> str:
     """#1317n D's own L2 budget AS PRICED, or "=S" when it equals P's.
 
@@ -1630,6 +1674,15 @@ def price(
             None if cg_ceiling_bytes is None else cg_ceiling_bytes / GIB
         ),
         "floor_gib": FLOOR_GIB,
+        # #1317n THE LABEL DEFECT, and it was in the very line this ticket
+        # repaired. `arm.terms` is built here as a FRESH literal -- it is NOT
+        # `charge_terms()`'s return -- so the `s_gb_d` key added there never
+        # reached the ARM line, which then printed `S_D==S` while the ring
+        # term proved S_D=4 (12.83 GiB is unreachable at S_D=1: (1.7778+3.0)
+        # x0.931323 = 4.45). A correct price with a wrong label, i.e. exactly
+        # the instrument-text class this fork keeps paying for: the boot agent
+        # could verify the VALUE only by inverting the ring arithmetic.
+        "s_gb_d": float(s_gb if s_gb_d is None else s_gb_d),
         "heaps_gib": heaps_gib,
         "host_ring_gib": host_ring_gib,
         "host_ring_span1_gib": host_ring_span1_gib,
@@ -2116,6 +2169,10 @@ def choose(
     # call that had drifted from choose()'s keywords, so a term reaching only
     # one of them is exactly the defect this signature exists to prevent.
     s_gb_d: Optional[int] = None,
+    # #1317n the terms D's L2 was derived from, so a W20 can name the LARGEST
+    # FUNDABLE CAP instead of leaving the operator to invert the arithmetic
+    # (order item 1: "kein stilles Verkleinern" -- but also no silent silence).
+    d_cap_terms: Optional[Dict[str, float]] = None,
     measured_record: Optional[Dict[str, dict]] = None,
     margin: Optional[Margin] = None,
 ) -> Tuple[Arm, Optional[float], List[str]]:
@@ -2331,6 +2388,50 @@ def choose(
                 "census priced) and the origin is the RUN moment, not the launch moment. "
                 f"{levers}\n" + table
             )
+        cap_advice = ""
+        if s_gb_d is not None and d_cap_terms:
+            def _ok(sd: int) -> bool:
+                try:
+                    a = price(
+                        memtotal_bytes, memavail_bytes, arms[0][0], arms[0][1],
+                        ranks_per_group=ranks_per_group, ring_bytes=ring_bytes,
+                        ring_span1_bytes=ring_span1_bytes,
+                        cg_current_bytes=cg_current_bytes,
+                        reclaimable_bytes=reclaimable_bytes,
+                        cg_ceiling_bytes=cg_ceiling_bytes, s_gb_d=sd,
+                        measured_record=measured_record,
+                    )
+                except Exception:  # noqa: BLE001 - advice may never mask the refusal
+                    return False
+                return bool(a.fundable_moments)
+
+            fit = largest_fundable_d_cap(
+                _ok,
+                int(d_cap_terms.get("cap_tokens", 0)),
+                float(d_cap_terms.get("max_rank_share", 0.0)),
+                int(d_cap_terms.get("cell_bytes", 1)),
+                float(d_cap_terms.get("fraction", 1.0)),
+            )
+            if fit is None:
+                cap_advice = (
+                    " LARGEST FUNDABLE CAP: none -- not even S_D=1 funds the "
+                    "moments, so group D's L2 budget is NOT the binding term "
+                    "here and lowering --max-kv-per-request will not help. "
+                    "Cut the term the binding moment names."
+                )
+            else:
+                cap_advice = (
+                    f" LARGEST FUNDABLE CAP: **{int(fit['cap_tokens'])} tokens** "
+                    f"at S_D={int(fit['s_gb_d'])} GB "
+                    f"({int(fit['rows'])} rows, {int(fit['rows_lendable'])} "
+                    f"lendable behind the load fraction), against the "
+                    f"{int(fit['asked_cap'])} asked for. So either lower "
+                    f"--max-kv-per-request to that, or free the term the "
+                    f"binding moment names below -- but do NOT lower "
+                    f"--hicache-size for D on its own: that reintroduces the "
+                    f"shortfall the #1317 window layer existed to compensate, "
+                    f"which is what this ticket deleted."
+                )
         raise Weg2HostLedgerRefused(
             "W20 Weg2HostLedgerRefused: no arm of the ladder funds both moments on this "
             "box (the store is NOT in this test any more -- #1236 put it on disk) "
@@ -2338,7 +2439,8 @@ def choose(
             f"moment, span 1 = {priced[0].terms['host_ring_span1_gib']:.2f} GiB at the launch "
             f"moment; {ring_provenance or 'no provenance passed'}). "
             "The INT8 checkpoint has only the cpu-backup wake path (W4), and the ledger "
-            f"will not shrink another term silently. {outcome}. {levers}\n"
+            f"will not shrink another term silently. {outcome}. {levers}"
+            f"{cap_advice}\n"
             + table
         )
     chosen_peak = chosen.predicted_run_peak_gib()

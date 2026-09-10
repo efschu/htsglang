@@ -183,3 +183,83 @@ class TestTheCompensationIsGone(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestTheArmLineLabelsWhatItPriced(unittest.TestCase):
+    """Boot weg2sn6r printed `S_D==S` while pricing S_D=4.
+
+    A CORRECT PRICE WITH A WRONG LABEL, in the very line this ticket added.
+    The value was only checkable by inverting the ring arithmetic (12.83 GiB is
+    unreachable at S_D=1: (1.7778+3.0) x 0.931323 = 4.45), which is precisely
+    the work an instrument exists to save. Root: `price()` builds `arm.terms`
+    as a FRESH literal dict -- it is not `charge_terms()`'s return -- so the
+    key added there never arrived.
+    """
+
+    def test_price_puts_the_d_budget_into_the_terms_the_arm_line_reads(self):
+        import inspect
+
+        src = inspect.getsource(hl.price)
+        self.assertIn('"s_gb_d": float(s_gb if s_gb_d is None else s_gb_d)', src)
+
+    def test_the_label_follows_the_price_for_both_shapes(self):
+        # priced apart -> the number; priced together -> the honest "=S"
+        self.assertEqual(hl._arm_s_d(type("A", (), {"terms": {"s_gb_d": 4.0}})()), "4")
+        self.assertEqual(hl._arm_s_d(type("A", (), {"terms": {"s_gb_d": 1.0}})()), "1")
+        self.assertEqual(hl._arm_s_d(type("A", (), {"terms": {}})()), "=S")
+
+    def test_the_ring_term_and_the_label_cannot_disagree(self):
+        """The sn6r reading, as an invariant: whatever S_D the label claims
+        must be the S_D the rings were priced from."""
+        import inspect
+        z = hl.ImageTerms(*([0.0] * len(inspect.signature(hl.ImageTerms).parameters)))
+        for sd in (1, 3, 4):
+            t = hl.charge_terms(1, 600, 3, z, s_gb_d=sd)
+            expected = (hl.RING_P_MULT_GB_PER_S * 1
+                        + hl.RING_D_MULT_GB_PER_S * sd) * hl.GB / hl.GIB
+            self.assertAlmostEqual(t["rings_gib"], expected, places=6)
+            self.assertEqual(int(t["s_gb_d"]), sd)
+
+
+class TestTheRefusalNamesTheLargestFundableCap(unittest.TestCase):
+    """Order item 1's missing half: *"ist S_D nicht fundierbar -> benannte
+    Refusal am Launch, die den GROESSTEN FUNDIERBAREN CAP nennt (kein stilles
+    Verkleinern)"*. The first build shipped the refusal without the number, and
+    boot weg2sn6r got a correct W20 that named Sigma H and the rung as levers
+    but could not say which cap WOULD fit -- leaving the operator to invert the
+    arithmetic by hand.
+    """
+
+    def test_it_names_the_cap_the_largest_fundable_budget_serves(self):
+        # sn6r: S_D=4 misses the launch moment by 2.78 GiB; one GB of S_D is
+        # 3.0 GB of rings = 2.79 GiB, so S_D=3 is the first fundable rung.
+        fit = hl.largest_fundable_d_cap(lambda sd: sd <= 3, CAP, SHARE, CELL, FRACTION)
+        self.assertEqual(int(fit["s_gb_d"]), 3)
+        self.assertEqual(int(fit["rows"]), 91552)
+        self.assertEqual(int(fit["rows_lendable"]), 82396)
+        self.assertEqual(int(fit["cap_tokens"]), 219722)
+        self.assertEqual(int(fit["asked_cap"]), CAP)
+
+    def test_a_bigger_share_buys_a_smaller_cap(self):
+        """The share is a divisor, so a margin costs cap -- which is the number
+        the operator needs when choosing the flag."""
+        at_040 = hl.largest_fundable_d_cap(lambda sd: sd <= 3, CAP, 0.40, CELL, FRACTION)
+        self.assertEqual(int(at_040["cap_tokens"]), 205990)
+        self.assertLess(at_040["cap_tokens"],
+                        hl.largest_fundable_d_cap(
+                            lambda sd: sd <= 3, CAP, SHARE, CELL, FRACTION)["cap_tokens"])
+
+    def test_when_d_is_not_the_binding_term_it_says_so_instead_of_advising(self):
+        """Advising a smaller cap when D's budget is not what binds would send
+        the operator after the wrong lever."""
+        self.assertIsNone(
+            hl.largest_fundable_d_cap(lambda sd: False, CAP, SHARE, CELL, FRACTION))
+
+    def test_the_refusal_text_carries_the_advice_and_the_warning(self):
+        import inspect
+
+        src = inspect.getsource(hl.choose)
+        self.assertIn("LARGEST FUNDABLE CAP", src)
+        # and it must warn against the wrong fix: shrinking D's L2 alone
+        # reintroduces the shortfall the deleted window layer compensated.
+        self.assertIn("do NOT lower", src)

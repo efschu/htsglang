@@ -3865,7 +3865,9 @@ def gate_w11(log_p: str, log: Log) -> Dict[str, object]:
     return w11
 
 
-def _derive_d_l2_budget(ns, max_kv_per_request: int) -> Tuple[int, List[str]]:
+def _derive_d_l2_budget(
+    ns, max_kv_per_request: int
+) -> Tuple[int, Dict[str, float], List[str]]:
     """Group D's ``--hicache-size`` in GB, plus the lines that make it auditable.
 
     A HELPER AND NOT INLINE IN ``main()``, for two PINNED reasons rather than
@@ -3884,8 +3886,22 @@ def _derive_d_l2_budget(ns, max_kv_per_request: int) -> Tuple[int, List[str]]:
     from the cap, one cap-sized read fits in ONE prefetch on every rank.
     """
     cap_tokens = int(max_kv_per_request or 0)
-    share = float(ns.d_cap_rank_share)
     rec_share = _installed_max_share_from_record()
+    # #1317n THE RECORD IS THE SHARE SOURCE WHEN IT HAS ONE; the flag is an
+    # OVERRIDE/FLOOR, not the primary. A measured share is a reading and the
+    # flag is a margin, and preferring the margin over a reading is how the
+    # 1 GB constant survived.
+    #
+    # AND IT BUYS NOTHING ON THIS BOX, which is worth stating here so nobody
+    # re-derives it: `hicache_size` is an INT in upstream server_args
+    # (gigabytes), so S_D is ceil()ed either way -- 262,144 x 0.3750 x 32,768
+    # / 0.9 = 3.58 GB and x 0.4000 = 3.82 GB both land on **4**. The share
+    # affects `rows_needed` (98,304 vs 104,858), i.e. how much of the pool the
+    # invariant demands, never the pool's price. A decimal S_D would save
+    # ~1.18 GiB of rings and needs an upstream int->float change on that flag.
+    share = float(ns.d_cap_rank_share)
+    if rec_share is not None:
+        share = rec_share
     if rec_share is not None and rec_share > share + 1e-9:
         raise Weg2LaunchRefused(
             f"W89x Weg2L2ShareBelowInstalled: the sizing record's installed "
@@ -3907,11 +3923,13 @@ def _derive_d_l2_budget(ns, max_kv_per_request: int) -> Tuple[int, List[str]]:
             f"from cap={cap_tokens} share={share}: {exc}"
         ) from exc
     src = (
-        f"flag-default {share} vs installed "
-        + ("unknown at launch (#1032: no vector shipped)"
-           if rec_share is None else f"{rec_share:.4f} (sizing record)")
+        f"record {rec_share:.4f} (sizing record; flag {ns.d_cap_rank_share} "
+        f"is override/floor)"
+        if rec_share is not None else
+        f"flag-default {ns.d_cap_rank_share} vs installed unknown at launch "
+        f"(#1032: no vector shipped)"
     )
-    return int(terms["s_gb"]), [
+    return int(terms["s_gb"]), terms, [
         host_ledger.d_hicache_provenance(terms, src),
         f"WEG2-L2 SHARE PROVENANCE: the launcher ships NO ownership vector "
         f"(#1032), so the INSTALLED vector is not knowable here -- the runtime "
@@ -3968,6 +3986,7 @@ def choose_host_ledger(
     record_path: Optional[str] = None,
     pin_m_mib: int = 0,
     s_gb_d: Optional[int] = None,
+    d_cap_terms: Optional[Dict[str, float]] = None,
 ) -> Tuple[host_ledger.Arm, Optional[float], List[str], Dict[str, Optional[int]]]:
     """THE LAUNCHER'S ONE LEDGER CALL SITE: read the host, price the ladder.
 
@@ -4023,6 +4042,7 @@ def choose_host_ledger(
         # scored against a budget the boot does not run. None = "same as P",
         # which is every recorded arm.
         s_gb_d=s_gb_d,
+        d_cap_terms=d_cap_terms,
         ring_bytes=ring_bytes,
         ring_span1_bytes=ring_span1_bytes,
         ring_provenance=ring_provenance,
@@ -8237,7 +8257,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # refusal funnel is `cli()`), so a site-local try here was a second
     # refusal path, which is the class #1248 exists to stop. It cost this
     # cycle a red gate.
-    s_gb_d, _l2_lines = _derive_d_l2_budget(ns, max_kv_per_request)
+    s_gb_d, _l2_terms, _l2_lines = _derive_d_l2_budget(ns, max_kv_per_request)
     for _ln in _l2_lines:
         log(_ln)
     x_seed = resolve_x(ns.tp_prefill_max_tokens, EVIDENCE_DIR, CHUNKED_PREFILL_TOKENS)
@@ -8515,7 +8535,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         # #1317n NO BOOT WITH S_D=S_P IN THE LEDGER. D carries 4 GB where P
         # carries 1, which is +8.38 GiB of rings; an arm priced without it is
         # optimistic by that much against a reap mark nobody may touch.
-        s_gb_d=s_gb_d)
+        s_gb_d=s_gb_d, d_cap_terms=_l2_terms)
     state.cgroup = dict(cg)
     for ln in lines:
         log(ln)
