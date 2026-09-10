@@ -2124,8 +2124,57 @@ def manifest_entry(name: str, cls: str, rows_full: int, cols_full: int,
     alone would let a stage-holder and a shard-holder agree on a parameter
     whose bytes they do not share -- see the table header.
     """
-    return (xr.epoch_hash(str(name)), xr.epoch_hash(str(cls)),
+    cls = str(cls)
+    cls_hash = xr.epoch_hash(cls)
+    # #1333 B1a -- THE LABEL SIDE OF THE IDENTITY, and it is a LABEL only.
+    # The entry carries `epoch_hash(cls)`, never the name, because the row is a
+    # fixed-width struct read by another process; that is right for the KEY and
+    # useless for a log line a human sizes a buffer from.  So the one producer
+    # of the identity also records the name it hashed, process-locally and
+    # append-only, and `manifest_class_census` labels with it.  Nothing DECIDES
+    # on this map: a hash it does not know (a class only the PEER holds) is
+    # printed as the hex hash, never guessed, and the census stays complete
+    # because the counts and bytes come from the entries themselves.
+    _MANIFEST_CLASS_NAMES.setdefault(cls_hash, cls)
+    return (xr.epoch_hash(str(name)), cls_hash,
             int(rows_full), int(cols_full), int(itemsize))
+
+
+#: ``epoch_hash(class name) -> class name``, for LOG LABELS only (#1333 B1a).
+_MANIFEST_CLASS_NAMES: Dict[int, str] = {}
+
+
+def manifest_class_census(entries: Iterable[Tuple[int, int, int, int, int]],
+                          ) -> Tuple[Tuple[str, int, int], ...]:
+    """``((class, pieces, bytes), ...)`` for a set of manifest entries, bytes-desc.
+
+    #1333 B1a, and the quantity is the USER'S: the S6 decision of 2026-09-11
+    assembles non-identical layers in a small host buffer and slices them per
+    card, so what has to be sized is "pieces this card does NOT hold identically
+    with its peer, by class, in bytes".  Boot weg2xsn8 could only report the
+    three CARDINALITIES (`agreed`, `manifest_mine`, `manifest_theirs`) and the
+    agreed bytes; the remainder had to be approximated from the checkpoint.
+
+    The bytes are the entry's OWN extents (`rows x cols x itemsize`), i.e. what
+    the publishing rank holds -- not an unsharded extent, which is exactly the
+    number a bounce buffer must not be sized from.  Sorted bytes-descending so
+    the first class on the line is the one that sizes the buffer; ties by name,
+    so two processes over the same set print the same string.
+    """
+    per: Dict[str, list] = {}
+    for e in entries:
+        cls_hash, rows, cols, itemsize = int(e[1]), int(e[2]), int(e[3]), int(e[4])
+        label = _MANIFEST_CLASS_NAMES.get(cls_hash) or f"{cls_hash:#x}"
+        row = per.setdefault(label, [0, 0])
+        row[0] += 1
+        row[1] += rows * cols * itemsize
+    return tuple(sorted(((k, v[0], v[1]) for k, v in per.items()),
+                        key=lambda r: (-r[2], r[0])))
+
+
+def format_class_census(census: Sequence[Tuple[str, int, int]]) -> str:
+    """``cls:pieces:bytes|...`` -- NEVER truncated, `none` when empty."""
+    return "|".join(f"{c}:{n}:{b}" for c, n, b in census) or "none"
 
 
 def write_card_manifest(region: xr.XchgRegion, row: int,
@@ -2213,6 +2262,10 @@ class AgreedPieces:
     digest: int
     mine: int
     theirs: int
+    #: #1333 B1a -- the two REMAINDERS, per class, with bytes.  Both ends build
+    #: them from the same two rows, so the two boot logs size the SAME buffer.
+    mine_unagreed: Tuple[Tuple[str, int, int], ...] = ()
+    theirs_unagreed: Tuple[Tuple[str, int, int], ...] = ()
 
     @property
     def count(self) -> int:
@@ -2237,8 +2290,15 @@ def agree_card_pieces(mine: Sequence[Tuple[int, int, int, int, int]],
     a = {tuple(int(v) for v in e) for e in mine}
     b = {tuple(int(v) for v in e) for e in theirs}
     keys = frozenset(a & b)
+    # THE DIFFERENCE, TAKEN ONCE, HERE.  Both censuses are computed against the
+    # intersection that was just built rather than re-derived by a caller: an
+    # agreed piece that appeared in a remainder would size the bounce for bytes
+    # that never travel, and a remainder computed over the whole side is the
+    # obvious way to get that wrong.
     return AgreedPieces(keys=keys, digest=agreed_piece_digest(keys),
-                        mine=len(a), theirs=len(b))
+                        mine=len(a), theirs=len(b),
+                        mine_unagreed=manifest_class_census(a - keys),
+                        theirs_unagreed=manifest_class_census(b - keys))
 
 
 def reconcile_card_manifest(region: xr.XchgRegion, *, row: int, peer_row: int,
@@ -2637,6 +2697,10 @@ class LegPlan:
     agreed_count: int = 0
     agreed_mine: int = 0
     agreed_theirs: int = 0
+    #: #1333 B1a -- the two remainders per class, forwarded from the agreement
+    #: (never recomputed here: one producer, `manifest_class_census`).
+    unagreed_mine: Tuple[Tuple[str, int, int], ...] = ()
+    unagreed_theirs: Tuple[Tuple[str, int, int], ...] = ()
     undescribed: int = 0
     #: THE POPULATION THIS PLAN WAS DERIVED OVER, from
     #: ``weight_exchange.walk_live_tensors`` -- the ring's own named producer
@@ -2761,6 +2825,20 @@ class LegPlan:
             f"manifest={self.agreed_state} agreed={self.agreed_count} "
             f"manifest_mine={self.agreed_mine} "
             f"manifest_theirs={self.agreed_theirs} "
+            # #1333 B1a -- THE REMAINDER, which is what the S6 host bounce is
+            # sized against.  Counts AND bytes AND classes, both sides, because
+            # boot weg2xsn8 proved the counts alone are unusable: its agreed
+            # CLASS list summed to 26.5% of the image while the agreed BYTES
+            # were 4.90 MiB of 27.52 GiB -- agreement is per PIECE, so a class
+            # name on this line never means that class's bytes.
+            f"mine_unagreed={sum(n for _c, n, _b in self.unagreed_mine)} "
+            f"mine_unagreed_bytes={sum(b for _c, _n, b in self.unagreed_mine)} "
+            f"mine_unagreed_by_class={format_class_census(self.unagreed_mine)} "
+            f"theirs_unagreed={sum(n for _c, n, _b in self.unagreed_theirs)} "
+            "theirs_unagreed_bytes="
+            f"{sum(b for _c, _n, b in self.unagreed_theirs)} "
+            "theirs_unagreed_by_class="
+            f"{format_class_census(self.unagreed_theirs)} "
             f"source={self.facts.source}"
         )
 
@@ -3147,6 +3225,10 @@ def derive_leg_plan(
                    agreed_count=(agreed.count if agreed is not None else 0),
                    agreed_mine=(agreed.mine if agreed is not None else 0),
                    agreed_theirs=(agreed.theirs if agreed is not None else 0),
+                   unagreed_mine=(agreed.mine_unagreed if agreed is not None
+                                  else ()),
+                   unagreed_theirs=(agreed.theirs_unagreed if agreed is not None
+                                    else ()),
                    undescribed=undescribed,
                    population=len(live),
                    planned=len(inventory),
