@@ -5545,6 +5545,39 @@ class BarlinkBar1Transport:
             return
         self._abort_poll_active = True
 
+    def _abort_poll_disarm(self, why: str) -> None:
+        """#1330: stop polling the abort word, ONCE, BY NAME.
+
+        DISARM AND NOT SKIP, and that is the whole correction. The gate's
+        caller already caught this failure and continued
+        (`barlink_abort_gate.py:456` `logger.exception(...)`), which is how one
+        unmapped control word became three tracebacks and a segfault on boot
+        weg2xsn7: the poll runs every round, each attempt touches the same dead
+        mapping, and the CUDA context is poisoned before the third one.
+
+        The abort word only ever goes 0 -> non-zero and this mirror follows it
+        once, so a disarmed poll costs the LAST KNOWN verdict and nothing else
+        -- the hot path's view cannot go backwards. Losing the instrument is
+        strictly better than losing the process, and it is loud: the reason is
+        logged once, with the marker, so a boot record can grep it.
+        """
+        if getattr(self, "_abort_poll_disarmed_note", False):
+            return
+        self._abort_poll_disarmed_note = True
+        self._abort_poll_active = False
+        try:
+            logger.error(
+                "Bar1AbortPollDisarmed: %s. The abort-word mirror is now OFF "
+                "for this rank; the last observed verdict (%s) stands. This is "
+                "a NAMED refusal, not a silent skip: the alternative -- copying "
+                "from an unmapped control word and continuing -- cost boot "
+                "weg2xsn7 a segfault after a weights_7 TMS resume failed on a "
+                "device OOM (cu_mem_create CUresult 2).",
+                why, bool(self._abort_code_seen),
+            )
+        except BaseException:  # noqa: BLE001 -- a disarm may never itself raise
+            pass
+
     def poll_status_word(self) -> bool:
         """One watchdog read of the abort word. Returns True once tripped.
 
@@ -5564,6 +5597,38 @@ class BarlinkBar1Transport:
         if self._abort_code_seen:
             return True
         import torch
+
+        # #1330: NEVER READ A CONTROL WORD WHOSE BACKING THE PHASE MAY HAVE
+        # TAKEN. This module's own header names the class at line 317 -- "the
+        # first fault in the whole log is this poll, logged as 'barlink-BAR1
+        # status poll failed' and continued past; the scheduler then died in
+        # `get_cpu_copy` ... three sites, one fault, and two of them innocent"
+        # -- and boot weg2xsn7 paid it in full:
+        #
+        #   WEG2-VRAM-CREDIT tag=weights_7 credit=2560 MiB requested=1906 MiB
+        #   [torch_memory_saver.cpp] CUresult error: 2 (out of memory)
+        #                            func=cu_mem_create line=194
+        #   barlink-BAR1 status poll failed
+        #     self._abort_poll_dst.copy_(self._ctl_dev[0:1], non_blocking=True)
+        #   RuntimeError: unknown parameter type
+        #   Fatal Python error: Segmentation fault
+        #
+        # A TMS resume for `weights_7` failed on a device OOM, so the VA behind
+        # `_ctl_dev` was left unmapped. `copy_` on that storage raised, the
+        # gate logged and CONTINUED -- and the CUDA context was already
+        # poisoned, so the process died in the driver rather than at the raise.
+        # "Log and continue" is the amplifier, not the safety net: a poll that
+        # failed once fails every round and each attempt re-poisons.
+        #
+        # The check is deliberately NOT a CUDA call (a probe that can itself
+        # fault is no probe): a released TMS mapping leaves the storage with a
+        # null data pointer, which is readable from the tensor's own metadata.
+        if self._ctl_dev.untyped_storage().data_ptr() == 0:
+            self._abort_poll_disarm(
+                "the control word's device backing is not mapped "
+                "(data_ptr=0) -- a phase release or a failed TMS resume owns "
+                "it; polling it would fault the context")
+            return bool(self._abort_code_seen)
 
         with torch.cuda.stream(self._abort_poll_stream):
             self._abort_poll_dst.copy_(self._ctl_dev[0:1], non_blocking=True)

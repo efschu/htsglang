@@ -454,6 +454,20 @@ def poll_status_words() -> int:
                     )
                 break
             logger.exception("barlink-BAR1 status poll failed")
+            # #1330: AND DISARM THAT TRANSPORT'S POLL. Logging and continuing
+            # is what this module's own header at line 317 calls the
+            # fault-amplifier -- "three sites, one fault, and two of them
+            # innocent" -- and boot weg2xsn7 is the second specimen: an
+            # unmapped control word raised here, the loop continued, and the
+            # process died in the driver a moment later with a segfault, not
+            # at the raise. A poll that failed once will fail every round and
+            # each attempt re-poisons the context, so the honest exit is to
+            # stop asking. `poll_status_word`'s own pre-check catches the
+            # mapped-but-released case BEFORE the copy; this is the belt for
+            # every failure shape it cannot see in advance.
+            _disarm = getattr(t, "_abort_poll_disarm", None)
+            if callable(_disarm):
+                _disarm("the status poll raised; see the traceback above")
     return tripped
 
 
