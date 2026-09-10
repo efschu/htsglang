@@ -338,6 +338,29 @@ class SchedulerWeightUpdaterManager:
     #: failure has already happened -- the worst possible place to learn it.
     weg2_leg_ledger: Any = None
 
+    #: #1329: FIELDS FOR THE FOURTH AND FIFTH TIME IN THIS CLASS, and the
+    #: comment above called it three commits early. ``slots=True`` turns a
+    #: lazily-assigned attribute into an ``AttributeError`` ON THE WRITE, and
+    #: the two S6b shadow caches were assigned lazily
+    #: (``self._weg2_shadow_region_cache = region`` at what was line 1590,
+    #: ``self._weg2_shadow_manifest_cache = entries`` at 1632).
+    #:
+    #: MEASURED, boot weg2xsn7 @ 376ae2a475 -- 24 of 24 legs, BOTH groups,
+    #: both hooks: ``manifest=manifest-failed:AttributeError:
+    #: 'SchedulerWeightUpdaterManager' object has no attribute
+    #: '_weg2_shadow_region_cache' @ weight_updater.py:1590``. Every shadow leg
+    #: of every boot on this arm died on the first write, which is why
+    #: ``WEG2-XCHG-PLAN`` was 0 on P and D and the shadow has never once run.
+    #:
+    #: The READS were already safe (``getattr(self, ..., "unset")`` /
+    #: ``..., None``), so the sentinel semantics are preserved exactly: the
+    #: region cache defaults to the same ``"unset"`` the getattr default used,
+    #: which is DISTINCT from a cached ``None`` (the region legitimately opens
+    #: to None on a boot with no region, and that answer must be cached rather
+    #: than retried on every leg).
+    _weg2_shadow_region_cache: Any = "unset"
+    _weg2_shadow_manifest_cache: Any = None
+
     @contextmanager
     def _observe_weight_load(self, source: str) -> Iterator[None]:
         # Edge-trigger weight_load_duration_seconds at the end of each
