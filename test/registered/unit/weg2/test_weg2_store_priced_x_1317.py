@@ -170,6 +170,40 @@ def test_the_store_arm_can_only_ever_credit_never_debit():
     assert _price(60000, 24576, 1000) == 60000 - 24576
 
 
+def _executed_names(func):
+    """Every identifier and attribute a function actually EXECUTES.
+
+    Docstring excluded on purpose: several functions on this path name the
+    forbidden rank-local terms IN PROSE precisely in order to forbid them
+    (`weg2_uncached_extent`: "Deliberately NOT here: ``available_size()`` ..."),
+    so a source-text grep for those terms reports the prohibition as a
+    violation. Measured: that false positive failed this very test once.
+    """
+    import ast
+    import inspect
+    import textwrap
+
+    fn = ast.parse(textwrap.dedent(inspect.getsource(func))).body[0]
+    stmts = (
+        fn.body[1:]
+        if (
+            fn.body
+            and isinstance(fn.body[0], ast.Expr)
+            and isinstance(fn.body[0].value, ast.Constant)
+            and isinstance(fn.body[0].value.value, str)
+        )
+        else fn.body
+    )
+    names = set()
+    for st in stmts:
+        for n in ast.walk(st):
+            if isinstance(n, ast.Name):
+                names.add(n.id)
+            if isinstance(n, ast.Attribute):
+                names.add(n.attr)
+    return names
+
+
 def test_the_priced_extent_matches_the_shipped_expression():
     """Drift guard for the transcription above."""
     import inspect
@@ -180,8 +214,9 @@ def test_the_priced_extent_matches_the_shipped_expression():
     assert "group_store_match_for" in src
     assert "max(gm, int(gsm))" in src
     assert "total - priced_match" in src
-    for bad in ("available_size()", "time.monotonic", "free_slots"):
-        assert bad not in src, f"rank-local {bad} entered the extent"
+    names = _executed_names(Scheduler.weg2_uncached_extent)
+    for bad in ("available_size", "monotonic", "free_slots"):
+        assert bad not in names, f"rank-local {bad} EXECUTED in the extent"
 
 
 # --------------------------------------------------------------------------
@@ -216,23 +251,9 @@ def test_the_window_gate_executes_no_rank_local_term():
     decision must carry only replicated terms. Checked on the executable body,
     not the source text: the docstring names those terms in prose in order to
     forbid them."""
-    import ast
-    import inspect
-
     from sglang.srt.managers.scheduler import Scheduler
 
-    fn = ast.parse(inspect.getsource(Scheduler._weg2_issue_next_window).lstrip()).body[0]
-    stmts = fn.body[1:] if (
-        isinstance(fn.body[0], ast.Expr)
-        and isinstance(fn.body[0].value, ast.Constant)
-    ) else fn.body
-    names = set()
-    for st in stmts:
-        for n in ast.walk(st):
-            if isinstance(n, ast.Name):
-                names.add(n.id)
-            if isinstance(n, ast.Attribute):
-                names.add(n.attr)
+    names = _executed_names(Scheduler._weg2_issue_next_window)
     for bad in ("available_size", "monotonic", "free_slots", "uniform_min_avail"):
         assert bad not in names, f"rank-local {bad} executed in the window gate"
 
