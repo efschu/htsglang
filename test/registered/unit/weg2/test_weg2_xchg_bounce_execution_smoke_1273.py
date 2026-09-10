@@ -300,20 +300,6 @@ def seeded(tmp_path):
     return ops
 
 
-def _staging_terms():
-    """A term whose staging matches the region's ACTUAL lane, by construction.
-
-    Fed from the region's own constants rather than from a literal, which is
-    what "one launcher value" means: if the lane's geometry changes, this
-    follows it and the charge cannot drift away from the allocation.
-    """
-    return xb.bounce_terms(
-        bytes_per_direction=PLAIN_LAYER_BYTES * N_LAYERS, n_layers=N_LAYERS,
-        widest_layer_bytes=LAYER0_BYTES, pairs=xr.N_PAIRS,
-        depth=DEPTH, slot_bytes=xr.SLOT_BYTES,
-    )
-
-
 def _run_bounce(mgr, ops, boot_nonce, root, *, descs=None, depth=DEPTH,
                 slot_bytes=SLOT_BYTES, terms=None):
     """One call, through the PRODUCT method."""
@@ -703,72 +689,62 @@ def test_a_destination_with_no_source_is_refused(tmp_path, armed, seeded):
 
 
 # ===========================================================================
-# STEP 4 -- ONE LAUNCHER VALUE FOR THE STAGING GEOMETRY (operator order,
-# 2026-09-10; section 10.8 step 3's "one reader, or they drift" and 10.10).
+# STEP 4 -- WHAT "STAGING" MEANS, and the three answers the tree gives.
+#
+# NO REFUSAL IS BUILT HERE, deliberately, and an earlier commit of mine that
+# built one was WRONG and is reverted: it graded `terms.staging_bytes` against
+# `xr.DATA_BYTES` -- the CROSS region -- while the launcher feeds
+# `pairs=xr.N_CARDS`, which makes the term model the PER-CARD ON-CARD lane.
+# Two different payloads that both happen to equal 384 MiB today, so the check
+# passed by the very coincidence it was written to catch. The lesson is the
+# one the operator gave and I then broke: read the code, not the prose.
+#
+# So this is a MEASUREMENT recorded as a test, not a verdict. It pins the three
+# numbers so that whoever resolves the question (operator + boot seat 2, whose
+# accounting this is) has the arithmetic fixed and versioned rather than
+# re-derived, and so that any change to one of the three shows up here.
 # ===========================================================================
 
 
-class TheStagingGeometryHasOneOwner:
+class WhatStagingMeans:
     """Namespace only; the collected tests are the functions below."""
 
 
-def test_the_charged_staging_total_is_the_regions_actual_allocation():
-    """THE QUANTITY THAT MATTERS: what the ledger charges must be what exists.
+def test_the_three_readings_of_the_staging_term_are_pinned():
+    """Three payloads, one label, and 384 MiB reached twice by accident.
 
-    ``xr.DATA_BYTES`` is the staging lane's REAL allocation -- the region file
-    is ``DATA_OFF + DATA_BYTES`` and the region refuses on open unless its
-    header matches this build's constants (``weight_exchange_region.py:659``).
-    ``terms.staging_bytes`` is what the #1269 ledger was charged. If those two
-    disagree the boot is priced against a lane that does not exist, in
-    whichever direction, and the reap bound is wrong by the difference.
+    (i)   the CROSS region, which is what section 10.2's "6 directed pairs x
+          2 slots" describes:  xr.N_PAIRS x xr.SLOTS_PER_PAIR x xr.SLOT_BYTES.
+    (ii)  what the launcher actually CHARGES since #1332 B1b
+          (`launcher.py` -> `xchg_bounce_terms_for_arm` ->
+          `checkpoint_census.widest_layer_terms(pairs=xr.N_CARDS)`):
+          3 x xb.SLOTS_PER_PAIR x xb.SLOT_BYTES_DEFAULT.
+    (iii) the ON-CARD host deposit's own worst case, which is what
+          `host_ledger.xchg_bounce_bytes()` charged BEFORE B1b and what
+          `weight_exchange_transport.py` still documents as charged "at both
+          the launch and the run moment":
+          (xr.N_RANKS // 2) x tp.ONCARD_SLOTS_MAX x tp.ONCARD_SLOT_BYTES_MAX.
+
+    (i) and (ii) are both 384 MiB at today's constants and are NOT the same
+    bytes.  (iii) is 3072 MiB, i.e. 2688 MiB more than the ledger now funds
+    for the payload it names.  Which of the three the term is meant to be is an
+    accounting question for the launcher's owner, not for this module -- this
+    test only refuses to let the three drift silently.
     """
-    terms = _staging_terms()
-    bx.refuse_if_staging_disagrees(terms)
-    assert terms.staging_bytes == xr.DATA_BYTES
+    from sglang.srt.weg2 import weight_exchange_transport as tp_
 
+    cross = xr.N_PAIRS * xr.SLOTS_PER_PAIR * xr.SLOT_BYTES
+    charged = xr.N_CARDS * xb.SLOTS_PER_PAIR * xb.SLOT_BYTES_DEFAULT
+    oncard_worst = ((xr.N_RANKS // 2) * tp_.ONCARD_SLOTS_MAX
+                    * tp_.ONCARD_SLOT_BYTES_MAX)
 
-def test_a_charge_for_a_lane_that_does_not_exist_is_refused():
-    """The can-fail half: a term priced at another lane's size must refuse."""
-    wrong = xb.bounce_terms(
-        bytes_per_direction=PLAIN_LAYER_BYTES * N_LAYERS, n_layers=N_LAYERS,
-        widest_layer_bytes=LAYER0_BYTES, pairs=xr.N_PAIRS * 2,
-        depth=DEPTH, slot_bytes=xr.SLOT_BYTES,
-    )
-    assert wrong.staging_bytes != xr.DATA_BYTES
-    with pytest.raises(xr.Weg2XchgPlanDisagree) as e:
-        bx.refuse_if_staging_disagrees(wrong)
-    msg = str(e.value)
-    assert "W68" in msg
-    assert str(wrong.staging_bytes) in msg
-    assert str(xr.DATA_BYTES) in msg
-
-
-def test_the_totals_agreeing_does_not_prove_the_widths_agree(tmp_path):
-    """THE CANARY, and it exists because the tree is in exactly this state.
-
-    Measured 2026-09-10 (section 10.10): the region lays its lane out as
-    ``N_PAIRS 6 x SLOTS_PER_PAIR 2 x SLOT_BYTES 32 MiB`` while the launcher
-    charges ``pairs 3 x SLOTS_PER_PAIR 2 x slot_bytes 64 MiB``.  BOTH PRODUCTS
-    ARE 384 MiB.  The charge is therefore right today by ARITHMETIC
-    COINCIDENCE while the two geometries disagree about the slot -- which is
-    strictly worse than a mismatch that shows, because the acceptance
-    expression passes and nothing points at it.
-
-    This test asserts the coincidence EXPLICITLY, so the moment someone
-    performs section 10.8 step 3's ``SLOT_BYTES`` 32 -> 64 raise without also
-    changing what the launcher passes, the total becomes 768 vs 384 and this
-    goes RED naming the fix.  It is a canary rather than a refusal on purpose:
-    the charge is correct now, so refusing would block a boot for a labelling
-    defect, and warning-and-continuing is the #505a class.  A canary fires at
-    the moment of danger instead.
-    """
-    launcher_width = 64 * xr.MIB          # what the measured arm line printed
-    region_width = xr.SLOT_BYTES          # what the lane is actually cut into
-    assert launcher_width != region_width, (
-        "the widths now AGREE -- if step 3's raise landed, delete this canary "
-        "and make refuse_if_staging_disagrees grade the width too")
-    # The coincidence, spelled out in both decompositions.
-    assert 3 * xb.SLOTS_PER_PAIR * launcher_width == xr.DATA_BYTES
-    assert xr.N_PAIRS * xr.SLOTS_PER_PAIR * region_width == xr.DATA_BYTES
-    # And the invariant that DOES hold and must keep holding.
-    bx.refuse_if_staging_disagrees(_staging_terms())
+    assert cross == 384 * xr.MIB, cross
+    assert charged == 384 * xr.MIB, charged
+    assert oncard_worst == 3072 * xr.MIB, oncard_worst
+    # THE COINCIDENCE, asserted so it cannot pass unnoticed: equal totals from
+    # different factorisations.  If step 3 raises xr.SLOT_BYTES to 64 this
+    # goes red, which is exactly when someone must look.
+    assert cross == charged
+    assert (xr.N_PAIRS, xr.SLOT_BYTES) != (xr.N_CARDS, xb.SLOT_BYTES_DEFAULT)
+    # And the gap the ledger no longer funds for the on-card deposit.
+    assert oncard_worst - charged == 2688 * xr.MIB
