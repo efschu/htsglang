@@ -1000,8 +1000,121 @@ def resolve_image_terms(record: Optional[Dict[str, dict]] = None) -> ImageTerms:
     )
 
 
+#: #1317n D's OWN L2 BUDGET, IN GB, DERIVED FROM THE REQUEST CAP.
+#:
+#: WHY THIS EXISTS AT ALL, and it is a deletion story rather than a feature.
+#: Upstream stages EVERY L3 read through the host pool (``batch_get`` into host
+#: pages; there is no disk->device path), and it sizes that pool so residency
+#: can never bind a read: ``pool_host/base.py`` takes ``ratio x device_pool``
+#: when ``--hicache-size`` is unset, with the ratio defaulting to 2.0, so
+#: L2 >= L1 by construction. This fork shipped ``--hicache-size 1`` -- a fixed
+#: 1 GB, 30,518 rows on group D -- which BROKE that invariant, and the whole
+#: #1317 window/chain/anchor layer was the compensation for the break. The user
+#: decided 2026-09-10 to delete the compensation and restore the invariant.
+#:
+#: WHY NOT SIMPLY UNSET THE FLAG, which would be the true upstream form:
+#: priced, and it does not fit. Group D's profiled per-rank device capacity on
+#: boot weg2sn6p was [188788, 262358, 260566] tokens; ``ratio 2.0`` against the
+#: largest is 524,716 host rows at 32,768 B = **17.2 GB on one rank, 51.5 GB
+#: across three**, against a box with 39 GiB MemAvailable and a reap mark at
+#: 95.90 GiB non-reclaimable. The ratio path is unaffordable on this rig, so
+#: the absolute flag stays -- but it is DERIVED from what one cap-sized read
+#: needs instead of pinned at a constant that no quantity justified.
+#:
+#: THE INVARIANT THAT IS ACTUALLY RESTORED, stated as the thing to test: a
+#: single store read of ``--max-kv-per-request`` tokens must fit in one
+#: prefetch, on every rank, without a window. That is
+#:     rows_needed = cap_tokens x max_rank_share
+#: and the pool must hold it BEHIND the load-pool fraction the controller
+#: applies (``HICACHE_LOAD_POOL_USAGE_FRACTION`` = 0.9), hence the division.
+#:
+#: WORKED, boot weg2sn6p: cap 262,144 x share 0.375 x 32,768 B / 0.9 / 1e9 =
+#: 3.58 -> **4 GB per rank** = 122,070 rows, of which the controller will lend
+#: 0.9 x 122,070 = 109,863 >= the 98,304 a cap-sized read needs. The old
+#: pinned 1 GB gave 30,518 rows and a limit of 27,466 -- which is where the
+#: 413 band and every window came from.
+def derive_d_hicache_size_gb(
+    cap_tokens: int,
+    max_rank_share: float,
+    cell_bytes: int,
+    fraction: float,
+) -> Dict[str, float]:
+    """S_D in GB plus every term that produced it. Never a bare number.
+
+    Returns the terms as well as the result so the launcher can print a
+    provenance line: a derived budget whose inputs are not printed is
+    indistinguishable from a pinned one to the next reader, and this fork has
+    paid for that confusion (a launcher census read 19 mamba slots as the KV
+    carrier and shipped a 17-token bound, boot weg2rg5).
+    """
+    cap_tokens = max(0, int(cap_tokens))
+    cell_bytes = max(1, int(cell_bytes))
+    share = float(max_rank_share)
+    fraction = float(fraction)
+    if not (0.0 < share <= 1.0):
+        raise ValueError(
+            f"max_rank_share must be in (0, 1]: {share!r}. It is max(v)/sum(v) "
+            "of group D's KV-token ownership vector, so it is a fraction by "
+            "construction; a value outside the interval means the vector was "
+            "misread, and sizing L2 against a misread share is how the 1 GB "
+            "constant survived unquestioned."
+        )
+    if not (0.0 < fraction <= 1.0):
+        raise ValueError(
+            f"fraction must be in (0, 1]: {fraction!r} "
+            "(HICACHE_LOAD_POOL_USAGE_FRACTION)"
+        )
+    rows_needed = int(-(-cap_tokens * share // 1))  # ceil, share is a fraction
+    gb_exact = rows_needed * cell_bytes / fraction / GB
+    s_gb = int(-(-gb_exact // 1))
+    rows = int(s_gb * GB // cell_bytes)
+    return {
+        "s_gb": float(s_gb),
+        "gb_exact": gb_exact,
+        "cap_tokens": float(cap_tokens),
+        "max_rank_share": share,
+        "cell_bytes": float(cell_bytes),
+        "fraction": fraction,
+        "rows_needed": float(rows_needed),
+        "rows": float(rows),
+        "rows_lendable": float(int(rows * fraction)),
+    }
+
+
+def d_hicache_provenance(terms: Dict[str, float], share_source: str) -> str:
+    """The one line that makes S_D auditable at the boot log."""
+    return (
+        f"WEG2-L2 D hicache_size={int(terms['s_gb'])} GB derived: "
+        f"cap={int(terms['cap_tokens'])} share={terms['max_rank_share']:.4f} "
+        f"({share_source}) fraction={terms['fraction']:.2f} "
+        f"cell={int(terms['cell_bytes'])} "
+        f"rows_needed={int(terms['rows_needed'])} rows={int(terms['rows'])} "
+        f"rows_lendable={int(terms['rows_lendable'])} "
+        f"exact={terms['gb_exact']:.2f} GB -- one cap-sized store read must fit "
+        f"in ONE prefetch on every rank, with no window and no chain (#1317n). "
+        f"Upstream sizes this as ratio x device_pool (pool_host/base.py, ratio "
+        f"2.0 -> L2 >= L1); that path costs 17.2 GB/rank on this rig's profiled "
+        f"D capacity and is unaffordable, so the absolute flag stays and is "
+        f"DERIVED here instead of pinned"
+    )
+
+
+def _arm_s_d(arm) -> str:
+    """#1317n D's own L2 budget AS PRICED, or "=S" when it equals P's.
+
+    On the ARM line because the two budgets stopped being one number: D carries
+    a whole cap-sized read (4 GB) where P carries a staging tier (1 GB), which
+    is +8.38 GiB of rings. An ARM line printing one S while the boot runs two
+    is how an arm gets believed against a budget it was never scored on, and
+    the reap mark is what sits on the other side of that error.
+    """
+    v = (getattr(arm, "terms", None) or {}).get("s_gb_d")
+    return "=S" if v is None else str(int(v))
+
+
 def charge_terms(
-    s_gb: int, m_mib: int, ranks_per_group: int, images: ImageTerms
+    s_gb: int, m_mib: int, ranks_per_group: int, images: ImageTerms,
+    s_gb_d: Optional[int] = None,
 ) -> Dict[str, float]:
     """Everything the BOOT ITSELF adds to ``memory.current``, per term.
 
@@ -1015,11 +1128,22 @@ def charge_terms(
     not of the arm.
     """
     anchors_gib = (ANCHORS_AT_2400_BYTES * (m_mib / ANCHORS_REFERENCE_M_MIB)) / GIB
-    rings_gib = (RING_P_MULT_GB_PER_S + RING_D_MULT_GB_PER_S) * s_gb * GB / GIB
+    # #1317n THE TWO GROUPS ARE PRICED SEPARATELY, because they no longer carry
+    # the same budget: P only WRITES the store (its 1 GB staging tier is all it
+    # needs) while D must hold a whole cap-sized read. `s_gb_d` defaults to
+    # `s_gb`, so every pre-existing caller and every recorded arm is
+    # byte-identical; only a caller that passes a different D budget changes.
+    _s_d = s_gb if s_gb_d is None else int(s_gb_d)
+    rings_gib = (
+        RING_P_MULT_GB_PER_S * s_gb + RING_D_MULT_GB_PER_S * _s_d
+    ) * GB / GIB
     return {
         "heaps_gib": ranks_per_group * (HEAP_AWAKE_GIB + HEAP_DORMANT_GIB),
         "anchors_gib": anchors_gib,
         "rings_gib": rings_gib,
+        # #1317n the D budget the rings were priced from, so the ARM line
+        # prints what it CHARGED rather than what it was asked for.
+        "s_gb_d": float(_s_d),
         "overhead_gib": HOST_POOL_OVERHEAD * (anchors_gib + rings_gib),
         "draft_host_p_gib": DRAFT_HOST_P_MIB / 1024.0,
         "draft_host_d_gib": DRAFT_HOST_D_MIB / 1024.0,
@@ -1334,6 +1458,9 @@ def price(
     cg_current_bytes: Optional[int] = None,
     reclaimable_bytes: Optional[int] = None,
     cg_ceiling_bytes: Optional[int] = None,
+    # #1317n D's own L2 budget. None = "same as P", which is every recorded
+    # arm and every pre-existing caller, so those are byte-identical.
+    s_gb_d: Optional[int] = None,
     measured_record: Optional[Dict[str, dict]] = None,
 ) -> Arm:
     """Price one arm at both moments.  Pure.
@@ -1443,7 +1570,7 @@ def price(
     # across the flip).  It is NOT part of the flip image -- the ring carries
     # the weights, this carries the draft pages, never the same bytes.
     images = resolve_image_terms(measured_record)
-    charges = charge_terms(s_gb, m_mib, ranks_per_group, images)
+    charges = charge_terms(s_gb, m_mib, ranks_per_group, images, s_gb_d=s_gb_d)
     heaps_gib = charges["heaps_gib"]
     anchors_gib = charges["anchors_gib"]
     rings_gib = charges["rings_gib"]
@@ -1984,6 +2111,11 @@ def choose(
     cg_ceiling_bytes: Optional[int] = None,
     cg_ceiling_source: str = "",
     cg_oom_kill: Optional[int] = None,
+    # #1317n D's own L2 budget. It rides the SAME kwargs block the launcher
+    # hands to both `choose` and `price` -- boot weg2sn6a died of a price()
+    # call that had drifted from choose()'s keywords, so a term reaching only
+    # one of them is exactly the defect this signature exists to prevent.
+    s_gb_d: Optional[int] = None,
     measured_record: Optional[Dict[str, dict]] = None,
     margin: Optional[Margin] = None,
 ) -> Tuple[Arm, Optional[float], List[str]]:
@@ -2031,6 +2163,7 @@ def choose(
             cg_current_bytes=cg_current_bytes,
             reclaimable_bytes=reclaimable_bytes,
             cg_ceiling_bytes=cg_ceiling_bytes,
+            s_gb_d=s_gb_d,
             measured_record=measured_record,
         )
         for s, m in arms
@@ -2133,7 +2266,7 @@ def choose(
         if moments_ok and not peak_ok:
             peak_bound_any = True
         lines.append(
-            f"WEG2-HOST-LEDGER ARM S={arm.s_gb} M={arm.m_mib}: "
+            f"WEG2-HOST-LEDGER ARM S={arm.s_gb} S_D={_arm_s_d(arm)} M={arm.m_mib}: "
             f"anchors={arm.terms['anchors_gib']:.2f} rings={arm.terms['rings_gib']:.2f} "
             f"overhead={arm.terms['overhead_gib']:.2f} -> "
             f"leftover launch={arm.launch_leftover_gib:.2f} GiB "

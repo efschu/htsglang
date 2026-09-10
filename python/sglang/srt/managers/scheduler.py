@@ -5566,7 +5566,6 @@ class Scheduler(
             # #1317 C6: WINDOW 1's verdict arms the window mark. This is the
             # only site that arms it; the round seam re-derives it from each
             # re-issue's own verdict thereafter.
-            self._weg2_note_window_verdict(req, _pf_verdict)
             # #969C: THE VERDICT WAS COMPUTED AND THROWN AWAY (success-value-
             # without-action, this tree's own catalogued class). #969B measured
             # that 141 of 148 seam re-admissions reach the match with
@@ -6245,7 +6244,6 @@ class Scheduler(
         passes = int(getattr(req, "_weg2_no_progress_passes", 0) or 0)
         terms = getattr(req, "_weg2_progress_terms", None)
         self._clear_prefetch_deferral_fields(req)
-        req._weg2_window_open = False
         # The mark's partition identity is preserved: every DEFERRED mark still
         # has exactly one exit, and this is the exit that used to be
         # defer_expired. The census key is kept so the acceptance's
@@ -10232,330 +10230,6 @@ class Scheduler(
         except TypeError:
             return False
 
-    def _weg2_issue_next_window(self, req) -> str:
-        """#1317 C4/C6: issue the NEXT store window for a chunk-prefilling req.
-
-        Returns the verdict string (or ``"skip:<reason>"``), so a caller and a
-        log can name what happened; nothing here decides admission.
-
-        THE GATE IS GROUP-UNIFORM, and that is the only hard requirement on
-        this function, because ``_prefetch_kvcache`` enters the #580
-        participation vote: a rank that calls it while a peer does not leaves
-        the peer alone in a collective, which is the gloo abort this whole
-        family exists to prevent. The two terms of the gate are therefore:
-
-        * ``self.chunked_req is req`` -- admission is group-uniform in this
-          tree (that is the #791/#968 law), so the identity of the chunked
-          request is replicated;
-        * ``req._weg2_window_open`` -- set from the GROUP-agreed verdict
-          ``issued:truncated_group``, which `_prefetch_kvcache` returns off
-          the post-consensus census key only the group trim bumps
-          (`unified_radix_cache.py`, #1298 S2). Every rank sets it on the same
-          pass for the same request or none does.
-
-        Nothing rank-local enters the gate: not `available_size()`, not a
-        clock, not this rank's own match. The SPAN the re-issued read asks for
-        IS rank-local (it comes from the caller's own tree match), and that is
-        exactly what the existing vote reduces to a group MIN -- the same
-        contract window 1 already runs under.
-
-        THE MARK'S LIFECYCLE TABLE (the rule for every new state field):
-          WRITER   this method, from the returned verdict; AND #1317k's
-                   terminal exit `_weg2_store_load_terminal`, which disarms
-                   the mark because the request it belonged to has just been
-                   answered W88/W89 and removed from the queue. Named here
-                   rather than left for a reader to find: the AST assertion in
-                   test_weg2_store_priced_x_1317 counts the writers of this
-                   field against this table, which is how the third one was
-                   caught the moment it appeared.
-          READER   this method, on a later round.
-          DELETER  this method, when the verdict stops being
-                   ``issued:truncated_group`` -- i.e. the read landed whole,
-                   or was declined. Also cleared when the request stops being
-                   `chunked_req`, because the field lives on the request and
-                   leaves the scheduler with it.
-        Separating event: the CUTOVER. A flip rebinds the pools and re-issues
-        the affected population through the ordinary intake prefetch
-        (`phase_flip_runtime._post_cutover_readmit`), which re-derives the
-        mark from a fresh verdict -- so a stale mark cannot survive a flip and
-        drive a read against the previous binding. That is the #1060 hazard,
-        and the generation-keyed presence cache is what makes it safe.
-        """
-        if req is None or self.chunked_req is not req:
-            return "skip:not_chunked_req"
-        if not getattr(req, "_weg2_window_open", False):
-            return "skip:no_window_owed"
-        verdict = self._prefetch_kvcache(req, rematch=False)
-        self._weg2_window_reissues = getattr(self, "_weg2_window_reissues", 0) + 1
-        n = self._weg2_window_reissues
-        # #1317l A DECLINE IS NOT A FINISHED READ. This was
-        # `still_owed = verdict == "issued:truncated_group"`, and boot
-        # weg2sn6n is what that costs:
-        #
-        #   #1317 WINDOW-REISSUE n=1 verdict=declined:anchor_pool_exhausted
-        #       still_owed=False matched=4096 total=109130 closed_total=1
-        #
-        # The chain declared itself FINISHED after window 1 of ~27 because the
-        # anchor pool was momentarily busy -- so there was never a window 2,
-        # C1 had nothing to release for, and the request was priced at the
-        # 4,096 tokens it happened to hold out of 109,130. The W89 text written
-        # one cycle earlier named this exact conflation before it fired, and
-        # the reading it produced is what this fix is built from.
-        #
-        # THREE OUTCOMES WHERE THERE WERE TWO:
-        #   `issued:truncated_group`  -> a window landed, more are owed;
-        #   any `declined:*`          -> NOTHING landed and nothing was
-        #                                decided: the window is STILL OWED and
-        #                                the chain stays armed, because a
-        #                                transient (a busy anchor pool, a rate
-        #                                limit, a read already in flight) is
-        #                                not a statement about the prompt;
-        #   anything else (`issued`)  -> the read landed WHOLE; the chain is
-        #                                complete and only then may it close.
-        #
-        # AND THIS IS SAFE ONLY BECAUSE THE STANDSTILL EXIT EXISTS. Keeping a
-        # chain armed on every decline would be the pre-#1317k spin if nothing
-        # ended it -- so the progress witness below is not an addition to this
-        # change, it is its precondition: a decline that keeps recurring while
-        # NOTHING moves reaches `_weg2_prefetch_stall_passes()` and is answered
-        # W88 by name. Declines that alternate with progress cost rounds and
-        # deliver the prompt, which is the whole point.
-        _declined = verdict.startswith("declined")
-        still_owed = verdict == "issued:truncated_group" or _declined
-        req._weg2_window_open = still_owed
-        if still_owed:
-            self._weg2_window_owed = getattr(self, "_weg2_window_owed", 0) + 1
-            # #1317k THE SPIN IS TERMINATED HERE TOO, on the same witness and
-            # by the same rule. `still_owed` re-arms the mark unconditionally,
-            # and on weg2sn6k/sn6l that produced ten identical rounds in 61 s
-            # (`matched` frozen at 98,302 of 109,131, `closed_total` 0,
-            # `WINDOW-RELEASE` 0) with no exit of any kind: the loop had no
-            # notion of NOT ADVANCING. A round that moved nothing is now an
-            # observation of a standstill, and the bound is in observations.
-            if self._weg2_note_prefetch_progress(req) == "terminal":
-                logger.error(
-                    "#1317k WINDOW LOOP NOT PROGRESSING rid=%s n=%d matched=%d "
-                    "total=%d owed_total=%d closed_total=%d -- the re-issue "
-                    "verdict stayed `issued:truncated_group` while not one "
-                    "witness term moved for the bound; terminal by name "
-                    "instead of a further round",
-                    str(getattr(req, "rid", "?"))[:16], n,
-                    len(req.prefix_indices)
-                    + int(getattr(req, "host_hit_length", 0) or 0),
-                    len(getattr(req, "full_untruncated_fill_ids", ()) or ()),
-                    getattr(self, "_weg2_window_owed", 0),
-                    getattr(self, "_weg2_window_closed", 0),
-                )
-                return self._weg2_store_load_terminal(
-                    req, arm="window_loop", span=None, site="reissue"
-                )
-        else:
-            self._weg2_window_closed = getattr(self, "_weg2_window_closed", 0) + 1
-            # #1317k (item 2) THE MULTI-WINDOW WITNESS, WHICH DID NOT EXIST.
-            # `still_owed` treats "the read landed WHOLE" and "the read was
-            # DECLINED" as one state -- this method's own lifecycle table says
-            # so ("the read landed whole, OR was declined") -- and NOTHING
-            # compared the covered prefix against the prompt at close. So a
-            # decline closed the chain silently and the request was then
-            # priced at whatever it happened to hold, which is the
-            # whole-prompt-uncached shape one tier up.
-            #
-            # A CHAIN MAY ONLY CLOSE COVERED. The residual allowance is the
-            # #939 one-chunk law, for the reason the anchors force: anchors
-            # are per RADIX NODE (there is no interval flag on this tree), so
-            # a #915 page-floored window end that does not land on a node
-            # boundary leaves a shortfall, and one chunk is exactly what that
-            # may cost (#1172). More than that is not a rounding residue --
-            # it is an uncovered span, and it is named rather than priced.
-            self._weg2_check_window_coverage(req, verdict)
-        if n <= 10 or n % 64 == 0:
-            logger.info(
-                "#1317 WINDOW-REISSUE n=%d rid=%s verdict=%s still_owed=%s "
-                "matched=%d total=%d owed_total=%d closed_total=%d "
-                "release_refusals=[%s] "
-                "(denominator: every round seam at which a group-agreed window "
-                "remainder stood for the chunked request; the verdict is the "
-                "group's, off the post-consensus trim census)",
-                n, str(getattr(req, "rid", "?"))[:16], verdict, still_owed,
-                len(req.prefix_indices) + int(getattr(req, "host_hit_length", 0) or 0),
-                len(getattr(req, "full_untruncated_fill_ids", ()) or ()),
-                getattr(self, "_weg2_window_owed", 0),
-                getattr(self, "_weg2_window_closed", 0),
-                # #1317l THE INSTRUMENT GAP THE sn6n BOOT NAMED. The #1317k
-                # promise was "a bare WINDOW-RELEASE=0 is now impossible", and
-                # it held only for a chain that DIES: the refusal census
-                # printed on `CHAIN DEAD` and on a successful release, and the
-                # sn6n chain did neither -- it CLOSED, took the success path
-                # with `still_owed=False`, and no census was emitted anywhere.
-                # A zero was reachable unnamed after all. The vector now rides
-                # EVERY re-issue line, close included, so the release state is
-                # readable at every seam the loop has rather than only at the
-                # two it happened to instrument.
-                self._weg2_window_release_census(),
-            )
-        return verdict
-
-    def _weg2_window_release_census(self) -> str:
-        """The tree's C1 refusal vector, or a NAMED absence. Never a bare "".
-
-        `unnamed` is not decoration: a missing census and an all-zero census
-        read the same to a grep, and the whole point of #1317l's addition is
-        that a zero is attributable. A tree that cannot answer says so.
-        """
-        fn = getattr(getattr(self, "tree_cache", None),
-                     "_window_release_refusal_census", None)
-        if not callable(fn):
-            return "unnamed:no_census_on_this_tree"
-        try:
-            return fn() or "unnamed:empty"
-        except Exception:  # noqa: BLE001 - an instrument may never break the loop
-            return "unnamed:census_raised"
-
-    def _weg2_window_residual_allowance(self) -> int:
-        """The #939 one-chunk allowance, in tokens, for a closing chain.
-
-        ONE chunk, read from the static ``chunked_prefill_size`` -- the same
-        number and the same source ``_draft_chunk_pages`` uses, because it is
-        the same law: a window end is page-floored (#915) while a resume
-        anchor exists per radix NODE, so the shortfall a legal close may carry
-        is bounded by the chunk the nodes are cut on, and never by more.
-        """
-        try:
-            chunk = int(getattr(self.server_args, "chunked_prefill_size", 0) or 0)
-        except Exception:  # noqa: BLE001
-            chunk = 0
-        return chunk if chunk > 0 else 4096
-
-    def _weg2_check_window_coverage(self, req, verdict: str) -> Optional[str]:
-        """#1317k (item 2): a closing window chain must have COVERED the prompt.
-
-        The witness the multi-window read did not have. ``observe_store_witness``
-        (#1176) is a per-ADMISSION observer of four candidate presence readings
-        against a re-admission stamp; it says nothing about a chain of windows
-        and it decides nothing by construction. What was missing is the
-        question a windowed read makes possible to ask at all: **when the chain
-        closes, is the prompt covered?**
-
-        THE THREE TERMS, all rank-local and consumed as a rank-local
-        observation exactly like the witness they extend:
-          matched  = ``len(prefix_indices) + host_hit_length`` -- the same
-                     expression the WINDOW-REISSUE line prints, so the two
-                     readings cannot drift;
-          total    = ``len(full_untruncated_fill_ids)`` -- the prompt;
-          residual = total - matched.
-
-        A residual within the allowance is a legal close (the page-floor/node
-        boundary residue, #1172). A residual ABOVE it is an uncovered span,
-        and the honest answer is a NAMED refusal (W89) rather than pricing the
-        request at what it happens to hold -- because pricing it is the path
-        that ends in D prefilling the uncovered remainder over X.
-
-        Returns the outcome name, or None when there is nothing to judge.
-        """
-        total = len(getattr(req, "full_untruncated_fill_ids", ()) or ())
-        if total <= 0:
-            return None
-        _pi = getattr(req, "prefix_indices", None)
-        try:
-            resident = 0 if _pi is None else len(_pi)
-        except TypeError:
-            resident = 0
-        # #1317l WHAT THIS CHECK NOW CATCHES, after a DECLINE stopped closing
-        # the chain. Its sn6n trigger is GONE BY CONSTRUCTION: the close path
-        # is no longer reachable from `declined:*`, so the 7 W89s that boot
-        # produced cannot recur in that shape. What remains is narrower and
-        # still worth having -- a close on `issued` (the whole remainder
-        # registered) is skipped as pending below and is covered BY
-        # CONSTRUCTION once it lands (an untruncated read spans the rest of
-        # the prompt), so anything that reaches the shortfall arm is a verdict
-        # class nobody enumerated silently ending a chain. That is exactly the
-        # conflation this reading exists to catch, one class further out.
-        #
-        # ONLY A CHAIN WITH NOTHING FURTHER COMING MAY BE JUDGED, and this is
-        # the false-positive the first draft of this check would have had:
-        # `matched` is read from the TREE, while a read that was just issued
-        # lands its span at completion, several passes later. So a close on
-        # `issued` (the read landed whole) or with an operation still in
-        # flight legitimately reads a large residual. Judged only when the
-        # chain is closing on a DECLINE with no pending read -- which is
-        # exactly the state `still_owed=False` conflated with success.
-        if verdict.startswith("issued") or self._weg2_store_read_is_pending(req):
-            self._weg2_window_coverage_pending = (
-                getattr(self, "_weg2_window_coverage_pending", 0) + 1
-            )
-            return "pending"
-        matched = resident + int(getattr(req, "host_hit_length", 0) or 0)
-        residual = total - matched
-        allowance = self._weg2_window_residual_allowance()
-        self._weg2_window_coverage_checks = (
-            getattr(self, "_weg2_window_coverage_checks", 0) + 1
-        )
-        n = self._weg2_window_coverage_checks
-        covered = residual <= allowance
-        if covered:
-            if n <= 8 or n % 64 == 0:
-                logger.info(
-                    "#1317k WINDOW COVERAGE rid=%s verdict=%s matched=%d total=%d "
-                    "residual=%d allowance=%d ok=True n=%d (denominator: every "
-                    "window chain that CLOSED on this rank; the residual is the "
-                    "page-floored window end against the per-node resume anchor, "
-                    "#1172, and one chunk is its whole legal size)",
-                    str(getattr(req, "rid", "?"))[:16], verdict, matched, total,
-                    residual, allowance, n,
-                )
-            return "covered"
-        # NOT covered, and NOT priced. Uncovered means the chain stopped with
-        # a real span of the prompt neither resident nor loaded, so the store
-        # did not carry the handover; saying so is the only honest outcome.
-        self._weg2_window_coverage_short = (
-            getattr(self, "_weg2_window_coverage_short", 0) + 1
-        )
-        logger.error(
-            "W89 Weg2WindowChainClosedShort rid=%s verdict=%s matched=%d total=%d "
-            "residual=%d allowance=%d n=%d -- the window chain closed while %d "
-            "token(s) of the prompt were neither device-resident nor loaded from "
-            "the store, which is more than the one-chunk page-floor residue a "
-            "legal close may carry. The chain closes on ANY verdict that is not "
-            "`issued:truncated_group`, so a DECLINE closed it exactly as a whole "
-            "read would have; that conflation is the defect this reading exists "
-            "to catch (denominator: every closed chain)",
-            str(getattr(req, "rid", "?"))[:16], verdict, matched, total,
-            residual, allowance, self._weg2_window_coverage_short, residual,
-        )
-        return self._weg2_store_load_terminal(
-            req,
-            arm="window_chain_short",
-            span=residual,
-            site="close",
-            code="W89",
-            name="Weg2WindowChainClosedShort",
-            detail=(
-                f"The window chain closed on verdict={verdict} while {residual} "
-                f"token(s) of the {total}-token prompt were neither "
-                f"device-resident nor loaded from the store -- more than the "
-                f"one-chunk ({allowance}) page-floor residue a legal close may "
-                f"carry (#1172: the resume anchors are per radix node, so a "
-                f"page-floored window end must land on a node boundary or the "
-                f"shortfall must stay inside one chunk)."
-            ),
-        )
-
-    def _weg2_note_window_verdict(self, req, verdict: str) -> None:
-        """#1317 C6: arm the window mark from a GROUP-agreed prefetch verdict.
-
-        Called at the intake prefetch (window 1). ``issued:truncated_group``
-        is the only verdict that arms it, and it is group-agreed by
-        construction -- it is read off the census key that only the
-        post-consensus group trim bumps, past the span agreement, so every
-        rank returns it together or none does. Any other verdict disarms:
-        a whole read owes no window, and a decline has nothing to continue.
-        """
-        if req is None:
-            return
-        req._weg2_window_open = verdict == "issued:truncated_group"
-        if req._weg2_window_open:
-            self._weg2_window_armed = getattr(self, "_weg2_window_armed", 0) + 1
-
     def _weg2_local_store_matches(self, canonical) -> Dict[str, int]:
         """#1317 DESIGN A: this rank's STORE-PRICED match vote, per canonical rid.
 
@@ -11028,68 +10702,25 @@ class Scheduler(
         # third value, abstain, is printed above and takes no verdict.
         term = "group" if group_match is not None else "solo"
         carry = self._weg2_host_carry_tokens()
-        # #1317l THE EXEMPTION IS RETIRED ON THE WINDOWED PATH, and it is
-        # retired on ITS OWN TERMS: the comment fifteen lines above says
-        # verbatim "the exemption dies in the same commit as the wall, when the
-        # carrier build gives this group an unbounded windowed store read".
-        # This is that commit -- #1317k wired W and retired the front's
-        # post-leg-1 barrier, #1317l stops a decline from closing the chain --
-        # so the condition the exemption itself named is met.
+        # #1317n THE CARRIER-EXCEEDS EXEMPTION IS DELETED, both arms.
         #
-        # WHY IT CANNOT STAY, measured on boot weg2sn6n: the barrier that FED
-        # this exemption is gone (`CARRIER-EXCEEDS after leg 1` = 0, the
-        # RETIRED line present), but the exemption outlived it, so D was
-        # admitted over X **15 times** and prefilled the whole 109k prompt
-        # (`X-GATE uncached=27211/88651/.../109130 against X=11101`,
-        # `D #new-token total 109,131`) **while the client was refused
-        # anyway**. Worst of both: the phase law broken AND no answer. The
-        # standing veto is `kein-d-direct-prefill-ueber-x`, and an exemption
-        # whose bounce-around-the-wall justification no longer applies is
-        # simply a licence to violate it.
+        # It existed because D's host tier could not carry a prompt the front
+        # had already routed to it: refusing such a request here did not move
+        # it to a group that could serve it, it bounced it around the wall
+        # (CARRIER-EXCEEDS -> W31 -> re-route -> flip -> store read refused ->
+        # whole prompt uncached -> W31 again), so law 4 was suspended instead.
+        # Its own comment set the sunset -- "the exemption dies in the same
+        # commit as the wall, when the carrier build gives this group an
+        # unbounded windowed store read" -- and with D's L2 now DERIVED from
+        # `--max-kv-per-request` (WEG2-L2 provenance line) the wall is the cap
+        # itself: below the cap the read fits in ONE prefetch on every rank,
+        # and above it the front refuses at admission where the operator can
+        # see it. There is no band left in which a request is both servable and
+        # exempt, so the exemption is not narrowed, it is gone.
         #
-        # WHAT REPLACES IT IS BOUNDED, not a livelock: over-X now takes the
-        # ordinary named W31/W50 exit, which `is_x_refusal` DOES match, so the
-        # front re-routes it exactly once (W35 bounds the second). And the
-        # failure mode the exemption feared -- a prompt bouncing because no
-        # group can serve it -- is the one the windowed read removes: the store
-        # serves it one window at a time, and a read that will not load is
-        # answered W88/W89, which `is_x_refusal` deliberately does NOT match.
-        #
-        # OFF the windowed path the exemption stands unchanged, because there
-        # the wall it was built for still exists.
-        # Asked through the ONE accessor, for the curated-stand-in reason named
-        # at the window-cap call site. THIRD instance of that trap in this
-        # ticket (the cap, the X-gate bound, and here), which is why the
-        # predicate now has a single defensive reader instead of three
-        # hand-written `getattr` dances: `_weg2_windowed_path()`.
-        if _weg2_windowed_path(self) and carry > 0 and uncached > carry:
-            self._weg2_x_exempt_retired = (
-                getattr(self, "_weg2_x_exempt_retired", 0) + 1
-            )
-            n_r = self._weg2_x_exempt_retired
-            if n_r <= 5 or n_r % 64 == 0:
-                logger.warning(
-                    "#1317l X-GATE EXEMPT-CARRIER-EXCEEDS RETIRED rid=%s "
-                    "uncached=%d X=%d host_carry=%d occurrence=%d -- this "
-                    "request USED to be exempted from law 4 here and prefilled "
-                    "on D over its own bound (15x on boot weg2sn6n, the whole "
-                    "109k prompt, while the client was refused anyway). Under "
-                    "the windowed store read the carry is not the bound on a "
-                    "prompt, so the request takes the ordinary named exit "
-                    "instead. Denominator: X pricings whose uncached extent "
-                    "exceeded the host carry on the windowed path",
-                    str(getattr(req, "rid", "?"))[:16], uncached, x, carry, n_r,
-                )
-        elif carry > 0 and uncached > carry:
-            self._weg2_x_exempt = getattr(self, "_weg2_x_exempt", 0) + 1
-            if self._weg2_x_exempt <= 5 or self._weg2_x_exempt % 64 == 0:
-                logger.info(
-                    "WEG2 X-GATE rid=%s uncached=%d X=%d replicated_term=%s "
-                    "verdict=exempt_carrier_exceeds host_carry=%d occurrence=%d",
-                    str(getattr(req, "rid", "?"))[:16], uncached, x, term, carry,
-                    self._weg2_x_exempt,
-                )
-            return False
+        # `_weg2_host_carry_tokens` stays: the #1246 carrier bound still reads
+        # D's own #915 line, and it is the term the acceptance checks against
+        # cap x share.
         verdict = "W31" if uncached > x else "admit"
         logger.info(
             "WEG2 X-GATE rid=%s uncached=%d X=%d replicated_term=%s verdict=%s",
@@ -12626,14 +12257,12 @@ class Scheduler(
             # allocated LENGTH; every rank trims to the MIN), leaving a
             # remainder that nothing re-issued. Windows 2..n are issued HERE.
             #
-            # NO NEW OFFSET FIELD: `init_next_round_input` above has just
-            # re-matched the tree, so `prefix_indices + host_hit_length` IS the
-            # cursor. A stored "how far did the windows get" could disagree
-            # with the tree and is the writer/reader split this family is made
-            # of. `_prefetch_kvcache` is already re-entrant (three callers, an
-            # effect-based verdict), so this is a fourth caller of an existing
-            # function and not a second mechanism.
-            self._weg2_issue_next_window(self.chunked_req)
+            # #1317n THE PER-ROUND WINDOW RE-ISSUE IS DELETED. It existed
+            # because D's host tier could not hold a whole read, so a store
+            # read had to be walked one window per scheduler round. With D's L2
+            # DERIVED from `--max-kv-per-request` the read fits in ONE prefetch
+            # on every rank, so there is no remainder to re-issue and no cursor
+            # to keep in step with the tree.
             # #679 rung 1-3: SPEND RELIEF BEFORE THE PARK, not instead of it.
             #
             # The ladder runs here and nowhere else: this is the last point at

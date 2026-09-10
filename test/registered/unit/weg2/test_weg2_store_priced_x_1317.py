@@ -228,66 +228,6 @@ def test_the_priced_extent_matches_the_shipped_expression():
 # --------------------------------------------------------------------------
 
 
-def test_only_the_group_agreed_verdict_arms_the_window():
-    """M5 -- THE MARK MUST NOT ARM OFF A RANK-LOCAL VERDICT. Only
-    `issued:truncated_group` arms it: that string is read off the census key
-    only the POST-CONSENSUS group trim bumps, so every rank returns it
-    together. `issued` (a whole read) owes no window, and no decline may arm
-    a re-issue."""
-    import inspect
-
-    from sglang.srt.managers.scheduler import Scheduler
-
-    src = inspect.getsource(Scheduler._weg2_note_window_verdict)
-    assert 'verdict == "issued:truncated_group"' in src
-    # the rank-local truncation key must NOT arm it: at that site the cut is a
-    # rank-local decision and there is no group fact to continue from.
-    assert 'host_pool_truncated"' not in src
-
-    loop = inspect.getsource(Scheduler._weg2_issue_next_window)
-    assert "self.chunked_req is not req" in loop
-    assert "_weg2_window_open" in loop
-    assert "issued:truncated_group" in loop
-
-
-def test_the_window_gate_executes_no_rank_local_term():
-    """A rank that calls `_prefetch_kvcache` while a peer does not leaves the
-    peer alone in the #580 participation vote -- a gloo abort. So the CALL
-    decision must carry only replicated terms. Checked on the executable body,
-    not the source text: the docstring names those terms in prose in order to
-    forbid them."""
-    from sglang.srt.managers.scheduler import Scheduler
-
-    names = _executed_names(Scheduler._weg2_issue_next_window)
-    for bad in ("available_size", "monotonic", "free_slots", "uniform_min_avail"):
-        assert bad not in names, f"rank-local {bad} executed in the window gate"
-
-
-def test_the_mark_has_exactly_the_writers_its_lifecycle_table_claims():
-    """A state field with more writers than its table names is a field nobody
-    owns -- the class that cost this line a boot (#1317 §1bl, the cutover
-    deleting a carry its consumer needed)."""
-    import ast
-    import inspect
-
-    from sglang.srt.managers import scheduler as sched
-
-    tree = ast.parse(inspect.getsource(sched))
-    writers = [
-        n.lineno
-        for n in ast.walk(tree)
-        if isinstance(n, ast.Assign)
-        for t in n.targets
-        if isinstance(t, ast.Attribute) and t.attr == "_weg2_window_open"
-    ]
-    assert len(writers) == 3, (
-        f"expected 3 writers (re-issue + intake arm + #1317k's terminal exit, "
-        f"which disarms the mark when the request is answered W88/W89 and "
-        f"removed from the queue -- all three named in the lifecycle table of "
-        f"`_weg2_issue_next_window`), got {writers}"
-    )
-
-
 def test_design_a_added_no_collective():
     """MUST NOT 6. The store arm rides the reduce that already runs once per
     TP-loop iteration; a new `all_reduce` would be a second collective on the
@@ -471,3 +411,25 @@ def test_the_pin_runs_the_ladder_restricted_to_the_one_arm(monkeypatch):
     assert seen.get("arms") == [(1, 600)]
     assert arm.fundable_moments
     assert any("ARM PINNED" in ln for ln in lines)
+
+
+def test_the_window_mark_and_its_gate_are_DELETED_1317n():
+    """#1317n: the three tests that stood here pinned `_weg2_window_open`, its
+    group-agreed arming and its writer count. The mark is GONE -- D's L2 is
+    derived from `--max-kv-per-request`, so a store read fits in ONE prefetch
+    and there is no per-round window to arm, own or re-issue. Asserting the
+    absence keeps this file guarding the ticket instead of silently passing on
+    a mechanism nobody can reach."""
+    import inspect
+
+    from sglang.srt.managers import scheduler
+    from sglang.srt.managers.scheduler import Scheduler
+
+    assert not hasattr(Scheduler, "_weg2_issue_next_window")
+    assert not hasattr(Scheduler, "_weg2_note_window_verdict")
+    src = inspect.getsource(scheduler)
+    assert "_weg2_window_open" not in src
+    # and what REPLACED it is the derived budget, priced per group
+    from sglang.srt.weg2 import host_ledger as hl
+
+    assert hl.derive_d_hicache_size_gb(262144, 24 / 64, 32768, 0.9)["s_gb"] == 4.0

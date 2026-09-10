@@ -3865,6 +3865,33 @@ def gate_w11(log_p: str, log: Log) -> Dict[str, object]:
     return w11
 
 
+def _installed_max_share_from_record() -> Optional[float]:
+    """max(v)/sum(v) of the INSTALLED D ownership vector, if any record has it.
+
+    None today: no sizing record carries the installed vector yet, and this
+    returns None rather than guessing. It exists so the refusal above is WIRED
+    the day the record does carry it -- the alternative is a TODO, and a TODO
+    is what let the 1 GB constant survive unquestioned for a whole campaign.
+    """
+    try:
+        import json
+
+        with open(measured_record_path(), "r") as fh:
+            rec = json.load(fh)
+    except Exception:  # noqa: BLE001 - no record is not a refusal
+        return None
+    v = None
+    if isinstance(rec, dict):
+        for key in ("d_installed_token_vector", "installed_token_vector"):
+            cand = rec.get(key)
+            if isinstance(cand, (list, tuple)) and cand:
+                v = [int(x) for x in cand]
+                break
+    if not v or sum(v) <= 0:
+        return None
+    return max(v) / float(sum(v))
+
+
 def measured_record_path() -> str:
     """The sidecar this line writes its own dormant-image measurements into."""
     return f"{EVIDENCE_DIR}/{host_ledger.MEASURED_RECORD_NAME}"
@@ -3878,6 +3905,7 @@ def choose_host_ledger(
     cgroup_root: str = "/sys/fs/cgroup",
     record_path: Optional[str] = None,
     pin_m_mib: int = 0,
+    s_gb_d: Optional[int] = None,
 ) -> Tuple[host_ledger.Arm, Optional[float], List[str], Dict[str, Optional[int]]]:
     """THE LAUNCHER'S ONE LEDGER CALL SITE: read the host, price the ladder.
 
@@ -3926,6 +3954,13 @@ def choose_host_ledger(
     # drift from the ladder call again. test_weg2_store_priced_x_1317 pins the
     # keyword/signature conformance of every host_ledger call in this module.
     ledger_kw = dict(
+        # #1317n D's L2 IS PRICED SEPARATELY FROM P'S. It rides the ONE kwargs
+        # block for exactly the reason the block exists (boot weg2sn6a died of
+        # a price() call that had drifted from choose()'s keywords): a term
+        # that reaches only one of the two pricing paths is how an arm gets
+        # scored against a budget the boot does not run. None = "same as P",
+        # which is every recorded arm.
+        s_gb_d=s_gb_d,
         ring_bytes=ring_bytes,
         ring_span1_bytes=ring_span1_bytes,
         ring_provenance=ring_provenance,
@@ -5562,6 +5597,16 @@ class DTokenVectorDecision:
 #: -- distributed/utils.py:306 says so in its own docstring -- so "the gate did
 #: not fire" was never proof of an install either. The sizing lines are.)
 RETRACTED_SEED_VECTOR_1032 = (29, 19, 16)
+
+#: #1317n the controller's own load-pool fraction, mirrored here because the
+#: launcher must size the pool the controller will only lend 90 % of.
+#: Read from the controller rather than typed, so the two cannot drift.
+try:  # pragma: no cover - import shape differs in bare launcher tests
+    from sglang.srt.managers.cache_controller import (
+        HICACHE_LOAD_POOL_USAGE_FRACTION as HICACHE_LOAD_POOL_USAGE_FRACTION_1317N,
+    )
+except Exception:  # noqa: BLE001
+    HICACHE_LOAD_POOL_USAGE_FRACTION_1317N = 0.9
 
 
 def d_token_vector_decision(
@@ -7369,6 +7414,18 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--max-kv-per-request", type=int, default=None,
                     help="K9: per-request KV ceiling for BOTH groups. Unset = the model context "
                          f"({CONTEXT_LENGTH_TOKENS}), i.e. the as-built cap.")
+    ap.add_argument("--d-cap-rank-share", type=float, default=0.40,
+                    help="#1317n: the largest share of --max-kv-per-request one "
+                         "group-D rank may own, i.e. max(v)/sum(v) of D's "
+                         "KV-token ownership vector. Sizes D's --hicache-size so "
+                         "ONE cap-sized store read fits in ONE prefetch per rank "
+                         "(no window, no chain). A NAMED MARGIN, not a reading: "
+                         "the launcher ships no vector (#1032) so the installed "
+                         "one is unknowable here; weg2sn6p measured 0.3750 both "
+                         "as estimate and as installed, and 0.40 covers it. Too "
+                         "small and D's #915 limit lands under cap x share and "
+                         "the #1246 bound names it; too large and the host "
+                         "ledger pays for rows nobody reads.")
     ap.add_argument("--carrier-max-tokens", type=int, default=None,
                     help="#1246: ship a LOWER carrier bound than the one the census reads from group D's "
                          "own '#915 PREFETCH LIMIT' line. IT CAN ONLY LOWER IT: N is accepted exactly on "
@@ -8111,6 +8168,69 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     p_bs = max(1, int(ns.p_bs))
     d_bs = max(1, int(ns.d_bs))
     max_kv_per_request = int(ns.max_kv_per_request or CONTEXT_LENGTH_TOKENS)
+
+    # ------------------------------------------------------------------
+    # #1317n D's L2 IS DERIVED FROM THE REQUEST CAP, not pinned at 1 GB.
+    #
+    # THE INVARIANT BEING RESTORED. Upstream stages every L3 read through the
+    # host pool and sizes that pool so residency can never bind a read
+    # (`pool_host/base.py`: `ratio x device_pool` when `--hicache-size` is
+    # unset, ratio 2.0, so L2 >= L1). This launcher shipped a fixed 1 GB to
+    # BOTH groups -- 30,518 rows on D, a #915 limit of 27,466 -- which broke
+    # that invariant, and the whole #1317 window/chain/anchor layer plus the
+    # 413 band was the compensation. User decision 2026-09-10: delete the
+    # compensation, restore the invariant.
+    #
+    # P KEEPS ITS 1 GB. P only WRITES the store; a staging tier is all it
+    # needs, and its ring multiplier is priced separately below.
+    _cap_tokens = int(max_kv_per_request or 0)
+    # #1317n THE SHARE IS A FLAG DEFAULT, NOT A READING, and the line says so
+    # in those words. The launcher ships no ownership vector (#1032), so the
+    # INSTALLED share is unknowable here; when the sizing record starts
+    # carrying it, this reads it and REFUSES a boot whose installed max_share
+    # exceeds the flag, instead of shipping a pool that is quietly too small.
+    _rec_share = _installed_max_share_from_record()
+    if _rec_share is not None and _rec_share > float(ns.d_cap_rank_share) + 1e-9:
+        raise Weg2LaunchRefused(
+            f"W89x Weg2L2ShareBelowInstalled: the sizing record's installed "
+            f"KV-token ownership vector has max(v)/sum(v) = {_rec_share:.4f}, "
+            f"above --d-cap-rank-share {ns.d_cap_rank_share}. Sizing D's L2 on "
+            f"the smaller share ships a pool that cannot hold one cap-sized "
+            f"read on the largest rank, which is the 27,466-row wall this "
+            f"whole change removes -- refused by name rather than discovered "
+            f"as a 413. Raise --d-cap-rank-share to at least {_rec_share:.4f}."
+        )
+    _share_src = (
+        f"flag-default {ns.d_cap_rank_share} vs installed "
+        + ("unknown at launch (#1032: no vector shipped)"
+           if _rec_share is None else f"{_rec_share:.4f} (sizing record)")
+    )
+    _share = float(ns.d_cap_rank_share)
+    try:
+        _l2 = host_ledger.derive_d_hicache_size_gb(
+            _cap_tokens, _share, host_ledger.CELL_BYTES_D_PER_RANK[0],
+            HICACHE_LOAD_POOL_USAGE_FRACTION_1317N,
+        )
+    except ValueError as exc:
+        raise Weg2LaunchRefused(
+            f"W88x Weg2L2Unsizable: group D's L2 budget could not be derived "
+            f"from cap={_cap_tokens} share={_share}: {exc}"
+        ) from exc
+    s_gb_d = int(_l2["s_gb"])
+    log(host_ledger.d_hicache_provenance(_l2, _share_src))
+    log(
+        f"WEG2-L2 SHARE PROVENANCE: the launcher ships NO ownership vector "
+        f"(#1032, d_token_vector_decision default), so the INSTALLED vector is "
+        f"not knowable here -- the runtime derives an estimate from this boot's "
+        f"budgets and supersedes it after profiling. `--d-cap-rank-share` is "
+        f"therefore a NAMED MARGIN, not a reading: boot weg2sn6p measured "
+        f"installed [17,24,23] -> max/sum = 0.3750 and its own pre-boot "
+        f"estimate [2,3,3] -> 0.3750, i.e. the SHARE was stable across the "
+        f"supersession even though the vector was not. Default {ns.d_cap_rank_share} "
+        f"covers that with margin. IF the installed share exceeds it, D's #915 "
+        f"limit lands BELOW cap x share and the #1246 carrier bound says so by "
+        f"name -- a readable outcome, never a silent one."
+    )
     x_seed = resolve_x(ns.tp_prefill_max_tokens, EVIDENCE_DIR, CHUNKED_PREFILL_TOKENS)
     x_tokens, x_provenance = x_seed.tokens, x_seed.provenance
     flip_min_work_tokens = int(ns.flip_min_work_tokens) if ns.flip_min_work_tokens is not None else x_tokens
@@ -8382,7 +8502,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     arm, reap_headroom_gib, lines, cg = choose_host_ledger(
         ring_plan.host_weights_bytes,
         ring_plan.host_weights_span1_bytes, ring_plan.provenance,
-        pin_m_mib=int(getattr(ns, "pin_ledger_arm_m", 0) or 0))
+        pin_m_mib=int(getattr(ns, "pin_ledger_arm_m", 0) or 0),
+        # #1317n NO BOOT WITH S_D=S_P IN THE LEDGER. D carries 4 GB where P
+        # carries 1, which is +8.38 GiB of rings; an arm priced without it is
+        # optimistic by that much against a reap mark nobody may touch.
+        s_gb_d=s_gb_d)
     state.cgroup = dict(cg)
     for ln in lines:
         log(ln)
@@ -8721,7 +8845,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         log(d_ratio.op_line)
         log(d_tokvec.line)
         env_d = build_env(tree, ns.venv, cvd, store_dir, False, ns.tag, chunk_layers, chunk_count, tms_so, ns.transport, ring_plan, group="D", **_env_knobs(ns))
-        spec_d = GroupSpec("D", PORT_D, transport_argv(argv_d(py, ns.model, budgets_d, arm.s_gb, arm.m_mib, store_cfg, shlex.split(ns.extra_d), d_bs, max_kv_per_request, x_tokens, ns.num_continuous_decode_steps, ns.d_disable_overlap_schedule, d_ratio.flags, d_tokvec.flags, ns.random_seed, ns.barlink_bar1_cap_cycles, ns.collective_census_interval, ns.d_disable_cuda_graph, admin_api_key=admin_api_key), ns.transport), state.logs["D"], env_d)
+        spec_d = GroupSpec("D", PORT_D, transport_argv(argv_d(py, ns.model, budgets_d, s_gb_d, arm.m_mib, store_cfg, shlex.split(ns.extra_d), d_bs, max_kv_per_request, x_tokens, ns.num_continuous_decode_steps, ns.d_disable_overlap_schedule, d_ratio.flags, d_tokvec.flags, ns.random_seed, ns.barlink_bar1_cap_cycles, ns.collective_census_interval, ns.d_disable_cuda_graph, admin_api_key=admin_api_key), ns.transport), state.logs["D"], env_d)
         launch_group(spec_d, tree, log, dry)
         log("front argv (dry): " + " ".join(shlex.quote(a) for a in front_argv_for(
             py, store_dir, 0, 0, dc_expect_d, cards, ns, chunk_count, 0, p_bs, d_bs, x_tokens,
@@ -8791,7 +8915,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     log(d_ratio.op_line)
     log(d_tokvec.line)
     env_d = build_env(tree, ns.venv, cvd, store_dir, ns.debug_hold in ("D", "both"), ns.tag, chunk_layers, chunk_count, tms_so, ns.transport, ring_plan, group="D", **_env_knobs(ns))
-    spec_d = GroupSpec("D", PORT_D, transport_argv(argv_d(py, ns.model, budgets_d, arm.s_gb, arm.m_mib, store_cfg, shlex.split(ns.extra_d), d_bs, max_kv_per_request, x_tokens, ns.num_continuous_decode_steps, ns.d_disable_overlap_schedule, d_ratio.flags, d_tokvec.flags, ns.random_seed, ns.barlink_bar1_cap_cycles, ns.collective_census_interval, ns.d_disable_cuda_graph, admin_api_key=admin_api_key), ns.transport), state.logs["D"], env_d)
+    spec_d = GroupSpec("D", PORT_D, transport_argv(argv_d(py, ns.model, budgets_d, s_gb_d, arm.m_mib, store_cfg, shlex.split(ns.extra_d), d_bs, max_kv_per_request, x_tokens, ns.num_continuous_decode_steps, ns.d_disable_overlap_schedule, d_ratio.flags, d_tokvec.flags, ns.random_seed, ns.barlink_bar1_cap_cycles, ns.collective_census_interval, ns.d_disable_cuda_graph, admin_api_key=admin_api_key), ns.transport), state.logs["D"], env_d)
     state.argv["D"] = " ".join(shlex.quote(a) for a in spec_d.argv)
     launch_group(spec_d, tree, log, dry)
     state.pids["D"] = spec_d.pid
@@ -8961,17 +9085,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         py, store_dir, spec_p.pid, spec_d.pid, dc_expect_d, cards, ns, chunk_count,
         carrier_max_tokens, p_bs, d_bs, x_tokens, flip_min_work_tokens, idle_layout_front,
         src_chunk_cards=src_chunk_cards, measured_record=measured_record_path(),
-        commit=tip, ledger_arm={"s_gb": arm.s_gb, "m_mib": arm.m_mib},
+        commit=tip, ledger_arm={"s_gb": arm.s_gb, "s_gb_d": s_gb_d, "m_mib": arm.m_mib},
         admin_key_file=admin_key_file,
         anon_preboot_bytes=anon_preboot_bytes,
         front_host=ns.front_host,
-        # #1317k ONE SOURCE: group D reads the store in windows exactly when
-        # the argv THIS launcher ships to D carries `--hicache-host-role
-        # staging`, which is the same string `_staging_host_role` reads off
-        # the controller in-process. Derived from the shipped argv rather than
-        # from a second copy of the intent, so the front's routing and D's
-        # window cap cannot disagree about which regime is running.
-        windowed_carrier=_windowed_carrier_from_argv(spec_d.argv),
     )
     fenv = dict(os.environ)
     fenv["PYTHONPATH"] = f"{tree}/python"
@@ -9015,26 +9132,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     return 0
 
 
-def _windowed_carrier_from_argv(argv_d: Sequence[str]) -> bool:
-    """#1317k: does group D's SHIPPED argv put its host tier in staging role?
-
-    Read off the argv the launcher itself ships, positionally
-    (`--hicache-host-role staging`), so it answers the same question
-    `unified_radix_cache._staging_host_role` answers in-process off the
-    controller. A second copy of the intent -- an ns flag, a derived boolean --
-    is what lets the front's routing and D's allocation cap drift apart, and
-    that drift is the class that produced three tiers of the same carrier
-    barrier retired at three different times.
-    """
-    argv = list(argv_d or ())
-    for i, a in enumerate(argv):
-        if a == "--hicache-host-role" and i + 1 < len(argv):
-            return str(argv[i + 1]).strip() == "staging"
-        if a.startswith("--hicache-host-role="):
-            return a.split("=", 1)[1].strip() == "staging"
-    return False
-
-
 def front_argv_for(py: str, store_dir: str, p_pid: int, d_pid: int, dc_expect_d: Dict[str, int],
                    cards: List[Card], ns, chunk_count: int, carrier_max_tokens: int,
                    p_bs: int, d_bs: int, x_tokens: int, flip_min_work_tokens: int,
@@ -9044,8 +9141,7 @@ def front_argv_for(py: str, store_dir: str, p_pid: int, d_pid: int, dc_expect_d:
                    ledger_arm: Optional[Dict[str, float]] = None,
                    admin_key_file: str = "",
                    anon_preboot_bytes: int = 0,
-                   front_host: str = DEFAULT_FRONT_HOST,
-                   windowed_carrier: bool = False) -> List[str]:
+                   front_host: str = DEFAULT_FRONT_HOST) -> List[str]:
     """ONE front argv builder, so --dry-run prints exactly what a real boot runs.
 
     C2/R-6: the front is TOLD the two bs numbers and X. It never asks a
@@ -9063,13 +9159,6 @@ def front_argv_for(py: str, store_dir: str, p_pid: int, d_pid: int, dc_expect_d:
         "--fairness-w-s", str(ns.fairness_w_s),
         "--weight-chunks", str(chunk_count),
         "--carrier-max-tokens", str(carrier_max_tokens),
-        # #1317k DERIVED FROM THE ARGV THIS LAUNCHER ITSELF SHIPS, never from a
-        # second copy of the intent: group D reads the store in windows exactly
-        # when its own argv carries `--hicache-host-role staging`, which is the
-        # same string `unified_radix_cache._staging_host_role` reads off the
-        # controller in-process. One source, so the front's routing and D's
-        # allocation cap cannot disagree about which regime is running.
-        *(["--windowed-carrier"] if windowed_carrier else []),
         "--p-concurrency", str(p_bs),
         "--d-bs", str(d_bs),
         "--tp-prefill-max-tokens", str(x_tokens),

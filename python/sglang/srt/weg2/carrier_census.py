@@ -621,7 +621,14 @@ def decide_bound(
     """
     ref_carrier = _front_ref("front.Front.handle_generate",
                              "fits_carrier = carrier_max <= 0 or carrier_est <= carrier_max", 561)
-    ref_leg1 = _front_ref("front.Front.leg1", "and pt > self.carrier_max_tokens", 624)
+    # #1317n THE SECOND CITATION IS RETIRED WITH THE CODE IT CITED. The
+    # post-leg-1 carrier guard is deleted (D's L2 is derived from
+    # --max-kv-per-request, so below the cap the store carries the whole
+    # prefix in ONE prefetch), so a reference to it would be a printed
+    # citation leading with a symbol that no longer exists -- which is exactly
+    # what `test_printed_citations_lead_with_symbols_that_exist` guards. The
+    # remaining bound is the ADMISSION one, and it is cited above.
+    ref_leg1 = ""
     provenance = (
         f"Source '{SOURCE_MARKER}' in {log_path}; component={COMPONENT}; "
         f"per-rank(TP)={cen.per_rank}; {cen.terms()}; floor={cen.floor} [{floor_why}]"

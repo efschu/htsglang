@@ -442,9 +442,14 @@ def test_zero_is_documented_the_same_way_in_the_front_and_in_the_launcher():
     # Asserted on the TERMS rather than on one line's formatting -- the
     # sentence in the help text is about the terms, and pinning a line break
     # made this assertion fail on a change that did not touch its subject.
+    # #1317n THE POST-LEG-1 GUARD IS DELETED, so its absence is what is
+    # asserted. It compared the realised prompt against what D's host tier
+    # could carry AS ONE READ and sent leg 2 to a single prefill on D; D's L2
+    # is now derived from --max-kv-per-request, so below the cap the store
+    # carries the whole prefix and above it the front refuses at admission.
     _leg1 = inspect.getsource(front.Front.leg1)
-    assert "self.carrier_max_tokens > 0 and pt > self.carrier_max_tokens" in _leg1
-    assert "not self.windowed_carrier" in _leg1
+    assert "pt > self.carrier_max_tokens" not in _leg1
+    assert "windowed_carrier" not in _leg1
 
 
 def test_the_mamba_pool_carries_the_label_it_registers_under():
@@ -867,9 +872,15 @@ def test_printed_citations_lead_with_symbols_that_exist():
         cc.census("/nonexistent", expected_ranks=3, floor=FLOOR), None, floor_why="w").detail
     assert "front.py:279" not in detail  # the citation fix 1 printed for SHORT
     import inspect
-    anchor = "and pt > self.carrier_max_tokens"
-    ref = cc._front_ref("front.Front.leg1", anchor, -1)
-    assert ref.startswith("front.Front.leg1, front.py:")
+    # #1317n THE SECOND CITATION IS RETIRED WITH THE CODE IT CITED. The
+    # post-leg-1 carrier guard is deleted, so `ref_leg1` is now "" -- and this
+    # test's own subject (a printed citation must lead with a symbol that
+    # exists) is satisfied by NOT printing one. What is still checked is the
+    # citation that remains, on the admission bound.
+    assert cc.decide_bound.__doc__ is not None
+    anchor = "fits_carrier = carrier_max <= 0 or carrier_est <= carrier_max"
+    ref = cc._front_ref("front.Front.handle_generate", anchor, -1)
+    assert ref.startswith("front.Front.handle_generate, front.py:")
     cited = int(ref.rsplit(":", 1)[1])
     assert anchor in inspect.getsourcelines(front)[0][cited - 1], (
         f"front.py:{cited} does not hold {anchor!r} -- the citation drifted")
