@@ -614,6 +614,41 @@ _DEFERRAL_REFUSAL_TEXT_1068 = {
 }
 
 
+def _weg2_store_shortfall_pass(sched) -> int:
+    """#1324: defer every queued rid whose store read TERMINATED short.
+
+    A MODULE FUNCTION for the reason `_weg2_windowed_path` below states at
+    length, and this one paid the same price before adopting the form: the
+    drain is bound onto a `types.SimpleNamespace` by five harnesses, each with
+    a CURATED list of real methods, so `self._weg2_note_store_shortfall(...)`
+    raised AttributeError on every one of them. Resolved in this module's
+    globals instead, no stand-in can be missing it.
+
+    A receiver that does not carry the predicate does NOTHING -- exactly the
+    pre-#1324 drain -- which is what those harnesses assert. In production the
+    argument is always a `Scheduler` and the method is always there.
+
+    OVER A SNAPSHOT, not the live list: the standstill exit inside the arm
+    (`_weg2_store_load_terminal`) answers the client and REBINDS
+    `waiting_queue` to a filtered copy, so iterating the attribute itself would
+    mutate the sequence under the loop. The snapshot is taken once, so the
+    visit set stays exactly the replicated one the verdicts were computed over
+    -- which is what keeps the #580 rank-uniformity argument intact.
+
+    Returns how many rids it deferred, so a caller or a test can count rather
+    than infer. Exceptions are NOT swallowed: a real defect in the arm must
+    still surface (a `warn-then-continue` here would be the #505a shape).
+    """
+    fn = getattr(sched, "_weg2_note_store_shortfall", None)
+    if not callable(fn):
+        return 0
+    n = 0
+    for req in list(getattr(sched, "waiting_queue", ()) or ()):
+        if fn(req) is not None:
+            n += 1
+    return n
+
+
 def _weg2_windowed_path(sched) -> bool:
     """Is this group's store read WINDOWED? Asked so a stand-in cannot raise.
 
@@ -11571,15 +11606,16 @@ class Scheduler(
         # It adds NO collective: `_weg2_note_store_shortfall` and the deferral
         # arm it calls read rank-local fields and the census only.
         #
-        # OVER A SNAPSHOT, not over the live list: the standstill exit inside
-        # the arm (`_weg2_store_load_terminal`) answers the client and REBINDS
-        # `self.waiting_queue` to a filtered copy, so iterating the attribute
-        # itself would mutate the sequence under the loop. `list(...)` is
-        # taken once and the visit set stays exactly the replicated one the
-        # verdicts above were computed over, which is what keeps the #580
-        # rank-uniformity argument intact.
-        for _req in list(self.waiting_queue):
-            self._weg2_note_store_shortfall(_req)
+        # THROUGH THE MODULE FUNCTION, never `self.<new method>` -- #1298's
+        # lesson, and this call site paid for it once: five harnesses bind
+        # `_drain_prefetch_progress` onto a `types.SimpleNamespace` with a
+        # CURATED list of real methods, so a NEW method is missing from them by
+        # construction and `self._weg2_note_store_shortfall(...)` raised
+        # AttributeError there. Measured on the #1324 gate: 2 NEW failures,
+        # `test_prefetch_orphan_collect_1233` both cases, plus an AttributeError
+        # surfacing inside `test_ring_commit_bounded_973`'s healthy commit. Same
+        # shape as `_weg2_windowed_path` above, same remedy.
+        _weg2_store_shortfall_pass(self)
         return verdicts
 
     def _weg2_note_store_shortfall(self, req) -> Optional[str]:

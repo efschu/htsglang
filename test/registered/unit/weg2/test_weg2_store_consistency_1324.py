@@ -378,6 +378,49 @@ def test_the_defer_names_the_store_as_the_cause(caplog):
     assert "write-through is asynchronous" in caplog.text
 
 
+def test_the_drain_pass_is_a_module_function_a_stand_in_cannot_miss():
+    """#1298's lesson, pinned where it was actually paid.
+
+    Five harnesses bind `_drain_prefetch_progress` onto a SimpleNamespace with
+    a CURATED list of real methods, so calling a NEW method through `self`
+    raises AttributeError there. Measured on the #1324 gate before this form:
+    2 NEW failures (`test_prefetch_orphan_collect_1233`, both cases) plus an
+    AttributeError surfacing inside `test_ring_commit_bounded_973`'s healthy
+    commit. A receiver without the predicate must do NOTHING, which is the
+    pre-#1324 drain.
+    """
+    import types as _t
+
+    assert callable(sched_mod._weg2_store_shortfall_pass)
+    bare = _t.SimpleNamespace()
+    assert sched_mod._weg2_store_shortfall_pass(bare) == 0
+    bare.waiting_queue = [_req()]
+    assert sched_mod._weg2_store_shortfall_pass(bare) == 0, (
+        "a stand-in lacking the method must be a no-op, never an exception"
+    )
+    # And on a real receiver it DOES fire, counted.
+    deliverable = (SN6S_PROMPT_TOKENS // PAGE) * PAGE
+    s = _sched(PrefetchOutcome(SN6S_DELIVERED, matched=0, deliverable=deliverable))
+    r = _req()
+    s.waiting_queue = [r]
+    assert sched_mod._weg2_store_shortfall_pass(s) == 1
+    assert r.prefetch_deferred == sched_mod._DEFER_REASON_STORE_SHORT
+
+    # The drain calls it through the MODULE, never through `self`.
+    import inspect
+
+    # Comments stripped: the call site carries a comment QUOTING the form it
+    # replaced, and a naive substring scan reads the epitaph as the corpse.
+    # (Second instance in this file -- same trap as the leg1 check above.)
+    src = "\n".join(
+        ln for ln in
+        inspect.getsource(sched_mod.Scheduler._drain_prefetch_progress).splitlines()
+        if not ln.lstrip().startswith("#")
+    )
+    assert "_weg2_store_shortfall_pass(self)" in src
+    assert "self._weg2_note_store_shortfall(" not in src
+
+
 def test_a_complete_read_leaves_the_drain_hook_untouched():
     """M4's negative half: no defer, no mark, no line on a healthy read."""
     deliverable = (SN6S_PROMPT_TOKENS // PAGE) * PAGE
