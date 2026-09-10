@@ -525,13 +525,24 @@ def test_the_leg_geometry_comes_from_the_arm_term_not_from_this_module():
     ``bounce_terms`` sets ``buffer_bytes = widest_layer_bytes * depth``, so the
     per-slot width IS the widest layer.  ``leg_geometry`` must return exactly
     that -- a module that recomputed a size would be the second ledger.
+
+    THE WIDEST AND THE MEAN ARE DELIBERATELY DIFFERENT HERE, and that is a
+    measured lesson rather than a flourish: with ``widest_layer_bytes`` equal
+    to the mean, a mutant returning ``terms.mean_layer_bytes`` from
+    ``leg_geometry`` passed all sixteen tests.  The two numbers must be
+    separated by the fixture or this test cannot see the one defect it is for
+    -- the same mean-instead-of-max direction ``xchg_bounce``'s own mutants
+    cover on the arm side.
     """
+    widest = 2 * UNIT_BYTES                    # mean = UNIT_BYTES, widest = 2x
     terms = xb.bounce_terms(
         bytes_per_direction=UNIT_BYTES * N_LAYERS, n_layers=N_LAYERS,
-        widest_layer_bytes=UNIT_BYTES, pairs=6, depth=DEPTH,
+        widest_layer_bytes=widest, pairs=6, depth=DEPTH,
         slot_bytes=xb.SLOT_BYTES_DEFAULT,
     )
-    assert bx.leg_geometry(terms) == (UNIT_BYTES, DEPTH)
+    assert terms.mean_layer_bytes == UNIT_BYTES
+    assert terms.mean_layer_bytes != terms.widest_layer_bytes
+    assert bx.leg_geometry(terms) == (widest, DEPTH)
     assert terms.covers_widest_layer is True
 
 
