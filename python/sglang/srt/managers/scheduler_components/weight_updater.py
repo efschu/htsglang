@@ -136,6 +136,40 @@ from sglang.srt.weg2.ring_guard import RingNeedGuard  # noqa: E402
 logger = logging.getLogger(__name__)
 
 
+def _weg2_exc_note(exc: BaseException, *, limit: int = 120) -> str:
+    """``Type: message @ file:line`` for a SWALLOWED exception (#1328).
+
+    The observer arms of the shadow may never raise into a flip leg, so they
+    catch ``BaseException`` and return a reason string. Until this existed the
+    string was ``type(exc).__name__`` alone, and boot weg2xsn6 spent 24 of 24
+    legs reporting ``manifest-failed:AttributeError`` -- a hint that named
+    neither the attribute nor the site, and on which three separate
+    hypotheses were built and then refuted (``region.boot_hash``, which
+    ``__init__`` always sets; ``agreed.theirs``, which ``AgreedPieces``
+    carries; ``derive_card_manifest``, whose failures are clean returns).
+
+    The last frame of the exception's OWN traceback is the site that raised,
+    which is the one fact a type cannot carry. Bounded and newline-free so it
+    stays one grep-able field on an existing line, and defensive throughout:
+    an instrument that raises while describing a failure replaces the finding
+    with its own.
+    """
+    try:
+        import traceback as _tb
+
+        msg = " ".join(str(exc).split())
+        site = ""
+        frames = _tb.extract_tb(exc.__traceback__)
+        if frames:
+            last = frames[-1]
+            site = f" @ {last.filename.rsplit(chr(47), 1)[-1]}:{last.lineno}"
+        note = (f"{type(exc).__name__}: {msg}{site}" if msg
+                else f"{type(exc).__name__}{site}")
+        return note[:limit]
+    except BaseException:  # noqa: BLE001 -- describing a failure may not fail
+        return type(exc).__name__
+
+
 def _weg2_flip_index_of(epoch) -> int:
     """The FLIP half of ``weg2_memory_saver.credit_epoch``'s ``<boot>.<flip>``.
 
@@ -1610,7 +1644,19 @@ class SchedulerWeightUpdaterManager:
                 theirs=(agreed.theirs if agreed is not None else -1)))
             return agreed, state
         except BaseException as exc:  # noqa: BLE001 -- an observer never raises
-            return None, f"manifest-failed:{type(exc).__name__}"
+            # #1328: THE TYPE ALONE IS A HINT, NOT A FINDING. Boot weg2xsn6
+            # printed `manifest=manifest-failed:AttributeError` on 24 of 24
+            # legs, in both groups, and that string is all the evidence the
+            # boot left: no message, no attribute name, no site. The whole
+            # campaign then had to guess which attribute -- and three
+            # plausible candidates (`region.boot_hash`, `agreed.theirs`,
+            # `derive_card_manifest`'s clean returns) were each refuted by
+            # reading or by local reproduction, costing a desk pass.
+            #
+            # An observer still never raises. It now REPORTS: the message and
+            # the last frame of its own traceback, so the next boot names the
+            # attribute in one line instead of licensing another guess.
+            return None, f"manifest-failed:{_weg2_exc_note(exc)}"
 
     def _weg2_shadow_plan(self, hook: str, group: str, rank: int, *,
                           agreed=None):
@@ -1659,7 +1705,9 @@ class SchedulerWeightUpdaterManager:
                 # legs on.  The product refuses by name instead.
                 agreed=agreed, require_agreement=True)
         except BaseException as exc:  # noqa: BLE001 -- an observer never raises
-            return None, f"derivation-failed:{type(exc).__name__}"
+            # #1328, same reason as the manifest arm one method up: a swallowed
+            # exception that reports only its type cannot be acted on.
+            return None, f"derivation-failed:{_weg2_exc_note(exc)}"
 
     def _weg2_shadow_hook(self, hook: str, *, recv_req, reserve_bytes: int = 0,
                           ring_ms=None) -> None:
