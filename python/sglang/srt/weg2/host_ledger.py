@@ -848,6 +848,34 @@ if RING_P_MULT_GB_PER_S + RING_D_MULT_GB_PER_S > RING_B0_TOTAL_MULT_GB_PER_S:
 #: host-pool posts (rings + anchors).  Charged as +4 % on those posts.
 HOST_POOL_OVERHEAD = 0.04
 
+#: #1318b THE UNPRICED ANONYMOUS MAP_SHARED POST, named because it is measured
+#: and NOT charged -- never folded into the margin, which this posten was
+#: forbidden to touch.
+#:
+#: MEASURED, boot weg2sn6e under load: cgroup ``shmem`` 51.3 GiB decomposes as
+#: the /dev/shm host ring 43.0 GiB (``/dev/shm/weg2-hostring-weg2sn6e``, the
+#: weight images, charged once as ``host_ring_gib``) plus ~8.3 GiB of
+#: ANONYMOUS MAP_SHARED. Of that 8.3, the ledger charges the L2 host KV pools
+#: as ``rings_gib`` -- 4.45 GiB at S=1 (P 1.66 + D 2.79, and D's half matches
+#: the independently measured ~2.8 GiB) -- which leaves
+#:
+#:      8.3 - 4.45 = ~3.85 GiB CHARGED BY NOBODY
+#:
+#: and that is the gap: the same boot measured non-reclaimable 79.3 GiB against
+#: an arm prediction of 75.86, i.e. **3.4 GiB under-predicted**, which the
+#: unpriced remainder covers on its own with no co-residency needed.
+#: Best current attribution: the TMS backup regions, which are MAP_SHARED and
+#: have no term.
+#:
+#: WHY IT IS A CONSTANT AND NOT AN ACTUATOR. It is stated here so a reader of a
+#: prediction knows the model runs ~3.4 GiB OPTIMISTIC, and so the next boot
+#: can measure the TMS region directly and give it a real term. It is
+#: deliberately NOT added to the margin or the reap mark: this posten was
+#: scoped to leave both alone, and an unmeasured post folded into a safety
+#: margin is exactly the compensation constant the #1232 headroom term was
+#: deleted for.
+UNPRICED_ANON_MAPSHARED_GIB = 3.4
+
 #: #1233 draft KV across the flip (C17). Pinned host DRAFT pools, one row per
 #: target host slot (``kv_cache_builder._build_draft_host_pool``: "same slot
 #: count as the target host pool"), 2048 B/token for the NEXTN head (1 layer
@@ -2083,7 +2111,20 @@ def choose(
         f"load_transient={LOAD_TRANSIENT_GIB:.0f} GiB (MEASURED residual of boot weg2ls1b2, #721 constant was 27; D loading while P is dormant) "
         f"ring provenance: {ring_provenance or 'NOT NAMED -- caller passed none'} "
         f"anchors@2400={ANCHORS_AT_2400_BYTES / GIB:.2f} GiB (b0 measured, scaled by M) "
-        f"rings=({RING_P_MULT_GB_PER_S:.0f}+{RING_D_MULT_GB_PER_S:.0f})xS GB (b0) "
+        # #1318b THE LINE PRINTED THE OLD CONSTANTS WHILE CHARGING THE NEW ONES.
+        # `:.0f` on the DERIVED multipliers renders 1.778 as "2" and 3.000 as
+        # "3", so boot weg2sn6g printed `rings=(2+3)xS GB (b0)` -- which reads
+        # as the pre-#1318 pair (2.0 + 6.0 would print "2+6", but "2+3" reads
+        # as a hand-typed pair either way) and hides that the term is now
+        # DERIVED. The charge was correct all along (`rings=4.45` GiB at S=1 =
+        # 4.778 GB), so this is an instrument-text defect, not an arithmetic
+        # one -- the same class as the #1290 CARRIER-EXCEEDS line that printed
+        # an inequality which was false as printed. Three decimals, the total,
+        # and the word DERIVED, so the reader can check the sum against the
+        # per-S increment without opening this file.
+        f"rings=({RING_P_MULT_GB_PER_S:.3f}+{RING_D_MULT_GB_PER_S:.3f})={RING_P_MULT_GB_PER_S + RING_D_MULT_GB_PER_S:.3f}xS GB "
+        f"DERIVED from rows x cell bytes (#1318; the b0 reading it replaced was "
+        f"{RING_B0_TOTAL_MULT_GB_PER_S:.3f}xS) = {(RING_P_MULT_GB_PER_S + RING_D_MULT_GB_PER_S) * GB / GIB:.2f} GiB per S "
         f"overhead={HOST_POOL_OVERHEAD:.0%} of host-pool posts (b0 U14) "
         f"draft_host_P={DRAFT_HOST_P_MIB:.1f} MiB draft_host_D={DRAFT_HOST_D_MIB:.1f} MiB "
         f"(#1233 pinned draft host pools, both moments) "
