@@ -209,7 +209,7 @@ class Weg2PcieLockTimeout(RuntimeError):
 
 
 class Weg2XchgCoverageRefused(RuntimeError):
-    """W67 -- a live tensor under an exchanged tag has no source.
+    """W84 -- a live tensor under an exchanged tag has no source.
 
     #1273 spec section 6/S2.  The weight-byte exchange fills the destination's
     weight pages from the SOURCE's VRAM, descriptor by descriptor, and restores

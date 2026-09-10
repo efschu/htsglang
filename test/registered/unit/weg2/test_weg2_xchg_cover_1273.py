@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""#1273 slice S2 -- coverage arming (W67) and the draft tag.
+"""#1273 slice S2 -- coverage arming (W84) and the draft tag.
 
 WEG2_REUSE_SPEC_0908.md section 6/S2 and section 4.1.  Two properties, and both
 of them are about a SILENT wrongness, which is why they are tests and not a
@@ -454,7 +454,7 @@ class RegionAwareTagTest(_ChunkedCase):
         """THE DANGER DIRECTION.  With a region-blind tag the drafter's
         parameters build family rows, get compared against
         ``tms_tag_bytes('weights_0')`` on a process that has no such tag, and
-        W67 can fire over a population that is out of family by construction --
+        W84 can fire over a population that is out of family by construction --
         the exact opposite of section 4.1's purpose."""
         model = _Model()
         rows = wx.build_coverage(
@@ -470,7 +470,7 @@ class RegionAwareTagTest(_ChunkedCase):
 class CoverageTest(_ChunkedCase):
     def test_uncovered_tensor_refuses(self):
         """A stray ``torch.Tensor`` attribute inside a layer's module is a page
-        with no source: W67, by name, with the module path in the message."""
+        with no source: W84, by name, with the module path in the message."""
         model = _Model()
         model.layers[1].scratch = torch.zeros(3 * MIB, dtype=torch.uint8)
         vote = wx.arm_coverage(
@@ -484,7 +484,7 @@ class CoverageTest(_ChunkedCase):
         with self.assertRaises(wms.Weg2XchgCoverageRefused) as ctx:
             wx.refuse_if_not_ok(vote)
         msg = str(ctx.exception)
-        self.assertIn("W67", msg)
+        self.assertIn("W84", msg)
         self.assertIn("Weg2XchgCoverageRefused", msg)
         self.assertIn("layers.1.scratch", msg)
 
@@ -700,7 +700,7 @@ class VoteTest(_ChunkedCase):
         self.assertIsInstance(vote, wx.CoverageVote)
         self.assertFalse(vote.ok)
         self.assertEqual(vote.rank, 4)
-        self.assertIn("W67", vote.reason)
+        self.assertIn("W84", vote.reason)
 
     def test_refuse_if_not_ok_raises_only_for_a_failing_vote(self):
         model = _Model()
@@ -806,7 +806,7 @@ class ArmAtLoadTest(_ChunkedCase):
                 log=log,
             )
         self.assertFalse(vote.ok)
-        self.assertIn("W67", vote.reason)
+        self.assertIn("W84", vote.reason)
         self.assertIn("no plan provider is registered", vote.reason)
 
     def test_arm_at_load_does_not_raise_where_there_is_no_fence(self):
@@ -918,8 +918,8 @@ class PlanInterfaceTest(_ChunkedCase):
 
 
 class WCodeTest(unittest.TestCase):
-    def test_w67_is_the_coverage_refusal_and_says_so_once(self):
-        self.assertIn("W67", wms.Weg2XchgCoverageRefused.__doc__ or "")
+    def test_w84_is_the_coverage_refusal_and_says_so_once(self):
+        self.assertIn("W84", wms.Weg2XchgCoverageRefused.__doc__ or "")
         self.assertEqual(wx.COVERAGE_REFUSAL_MARKER, "W84 Weg2XchgCoverageRefused")
 
     def test_w76_is_the_runner_shape_refusal_and_says_so_once(self):

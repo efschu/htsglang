@@ -18,7 +18,7 @@ two branches meet without arguing about line order:
   storage become which bytes of which other rank's storage.  Pure arithmetic
   over replicated geometry, which is what lets every rank derive the same plan
   independently and then HANDSHAKE it (Gate 0, spec 3.3) rather than trust it.
-* **SECTION S2 -- COVERAGE ARMING (W67) AND THE DRAFT TAG** (spec 6/S2, 4.1,
+* **SECTION S2 -- COVERAGE ARMING (W84) AND THE DRAFT TAG** (spec 6/S2, 4.1,
   below).  S2 consumes exactly one thing from S1 and nothing else:
   ``{tag: {parameter name: planned bytes}}`` (see :data:`PlanBytes`), where
   the bytes are the sum of that parameter's ``XchgDesc.nbytes``.
@@ -1729,7 +1729,7 @@ def build_plan(
 
 
 # ===========================================================================
-# SECTION S2 -- COVERAGE ARMING (W67) AND THE DRAFT TAG (spec 6/S2, 4.1).
+# SECTION S2 -- COVERAGE ARMING (W84) AND THE DRAFT TAG (spec 6/S2, 4.1).
 # ===========================================================================
 
 MIB = 1024 * 1024
@@ -1823,12 +1823,12 @@ class Weg2XchgRunnerShapeUnknown(RuntimeError):
     paused, never exchanged, permanently resident, no refusal names it), and
     guessing PRIMARY puts unsourced bytes into it (W74).
 
-    W76 is free per the spec section 7 census (highest assigned W67, this
+    W76 is free per the spec section 7 census (highest assigned W84, this
     branch) and per ``test_weg2_wcode_uniqueness_1263``.
 
     RENUMBERED BY THE serve-next5 REPLAY (2026-09-09): this branch enumerated
     its codes against base ``3ea18deb95`` (census maximum W50); the serve line
-    had since claimed W51-W66, so all 16 moved to W67-W82 -- the first free
+    had since claimed W51-W66, so all 16 moved to W84-W82 -- the first free
     numbers above the MERGED maximum -- with the exception NAMES unchanged.
     The argument below is the ORIGINAL enumeration and is kept as the reason
     the number was enumerated, not as the derivation of today's number.
@@ -2037,7 +2037,7 @@ def roll_forward_refusal_message() -> str:
 
 
 # ===========================================================================
-# S2 -- COVERAGE ARMING (W67, spec section 2.4 rule 4 and section 6/S2)
+# S2 -- COVERAGE ARMING (W84, spec section 2.4 rule 4 and section 6/S2)
 # ===========================================================================
 
 COVER_LINE_PREFIX = "WEG2-XCHG-COVER"
@@ -2367,7 +2367,7 @@ def build_coverage(
 
 
 def coverage_refusal_message(rows: Mapping[str, TagCoverage]) -> str:
-    """The W67 text: every refused tensor named, with its module path."""
+    """The W84 text: every refused tensor named, with its module path."""
     parts: List[str] = []
     for tag in sorted(rows):
         row = rows[tag]
@@ -2424,7 +2424,7 @@ class CoverageVote:
 
 
 def refuse_if_not_ok(vote: CoverageVote) -> CoverageVote:
-    """Raise W67 for a failing vote.  ONLY where a group fence covers it."""
+    """Raise W84 for a failing vote.  ONLY where a group fence covers it."""
     if not vote.ok:
         raise Weg2XchgCoverageRefused(vote.reason)
     return vote

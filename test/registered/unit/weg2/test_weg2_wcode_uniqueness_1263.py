@@ -401,7 +401,8 @@ class TestOneWCodePerException(CustomTestCase):
         chunk-card, W60 carrier floor, W61-W66 operating point / prefetch /
         eager decode), so on the replayed tree all sixteen collided at once.
 
-        Renumbered to W67-W82, the first free numbers above the MERGED census
+        Renumbered to W67-W82 (and W84 for the coverage refusal, which collided with
+        the line's W67 Weg2PPCutOrderedCutOffFrontier), by census
         maximum W66 -- the same rule the serve-next4 and serve-next5 trains
         applied to their own incoming codes -- with the exception NAMES
         unchanged, so a boot log is still grepped by name.
@@ -413,7 +414,7 @@ class TestOneWCodePerException(CustomTestCase):
         """
         c = census()
         for code, name in (
-            ("W67", "Weg2XchgCoverageRefused"),
+            ("W84", "Weg2XchgCoverageRefused"),
             ("W68", "Weg2XchgPlanDisagree"),
             ("W69", "Weg2XchgGateTimeout"),
             ("W70", "Weg2XchgShortPiece"),
