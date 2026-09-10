@@ -745,10 +745,6 @@ NO_ROUTE_NAME = "W52 " + NO_ROUTE_MARKER
 #: mistake, and W59/W65 came back non-zero.
 FORCED_DIRECT_MARKER = "Weg2ForcedDirectPrefill"
 FORCED_DIRECT_NAME = "W68 " + FORCED_DIRECT_MARKER
-#: The payload key that tells group D's X gate this offer is FORCED: the front
-#: has already established there is no carrier route, so D must admit it above
-#: X instead of refusing by name. Absent/false = today's behaviour exactly.
-FORCED_DIRECT_FLAG = "weg2_no_carrier_route"
 #: D's measured single-prefill rate, for the TTFT estimate printed on the W68
 #: line. Provenance: the launcher's X PROVENANCE line, `r_D` median of D single
 #: prefills (1138 tok/s on boot weg2sn5t). An estimate, labelled as one.
@@ -2414,8 +2410,15 @@ class Front:
                 self.tp_prefill_max_tokens, remainder, _ttft,
                 FORCED_DIRECT_R_D_TOK_S, self.max_kv_per_request,
             )
-            payload = dict(payload)
-            payload[FORCED_DIRECT_FLAG] = True
+            # NO MARKER ON THE REQUEST. D derives the same exemption from the
+            # host pool itself (`_weg2_x_refuses`, "derived here rather than
+            # carried on the request ... no marker has to survive an HTTP hop
+            # to get here"), and a payload flag would be DEAD anyway:
+            # `AnthropicMessagesRequest` and `ChatCompletionRequest` set no
+            # `model_config`, so pydantic's `extra="ignore"` silently drops an
+            # undeclared field -- the very hazard that file warns about at
+            # `anthropic/protocol.py:456`. This W-line is a COUNT, not a
+            # channel.
             route = "carrier_single"
         if route == "carrier_single":
             self.counters["route_carrier_exceeds"] += 1
