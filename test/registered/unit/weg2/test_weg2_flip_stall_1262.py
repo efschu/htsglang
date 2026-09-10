@@ -121,13 +121,28 @@ class TestTheBoundIsDerivedNotALiteral1262(CustomTestCase):
         self.assertGreater(bound, FLIP_STALL_SLACK * 3.2)
 
     def test_the_bound_tracks_a_slow_form_without_a_second_number(self):
-        """weg2rg3 (3.1 s) and weg2dk5 (18.4 s) are the same code path."""
+        """weg2rg3 (3.1 s) and weg2dk5 (18.4 s) are the same code path.
+
+        #1317h: THE INTENT IS UNTOUCHED -- one code path, no second number,
+        and the bound still MOVES with this boot's own flip cost. Only the
+        formula changed, from `SLACK x flip_ms` to `drain p99 + flip_ms`,
+        because flip_ms is measured after the drain succeeded and so the
+        drain's own cost was never in the old bound (the weg2sn6g false
+        positive). Asserted as the identity AND as monotonicity, so a future
+        formula that stopped tracking the measurement would still fail here.
+        """
+        bounds = {}
         for ms in (3100, 18400):
             with self.subTest(flip_ms=ms):
                 f = _front()
                 f.flip_log.append({"sleep": "P", "wake": "D", "flip_ms": ms})
                 bound, _ = f._flip_stall_bound_s()
-                self.assertAlmostEqual(bound, FLIP_STALL_SLACK * ms / 1000.0)
+                self.assertAlmostEqual(
+                    bound, f.drain_deadline_s + ms / 1000.0, places=3
+                )
+                bounds[ms] = bound
+        self.assertGreater(bounds[18400], bounds[3100],
+                           "the bound must still track the measured flip cost")
 
     def test_a_front_configured_with_a_different_deadline_derives_from_it(self):
         f = _front(drain_deadline_s=45.0)
