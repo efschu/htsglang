@@ -239,57 +239,101 @@ class TestWeg2dk5WouldHaveBeenNamedBeforeItBooted(CustomTestCase):
     DK5_RING_DERIVATION_SAVING_GIB = 3.121
     DK5_LADDER_ON_THE_RING = {2400: (-2.23, 6.79), 1200: (2.70, 11.72), 600: (5.17, 14.19)}
 
-    def test_the_arm_that_died_is_still_refused(self):
-        # THE RED-FIRST FACT, unchanged across three reworkings: on weg2dk5 this
-        # exact call FUNDED S=1/M=1200 and the box was reaped 9 minutes later.
-        # It still does not hand back that arm.
+    def test_the_arm_that_died_is_fundable_only_because_both_killers_are_gone(self):
+        # ATTRIBUTION PIN (was `test_the_arm_that_died_is_still_refused`).
         #
-        # #1236 MOVED THE OUTCOME AGAIN, and the move is the whole point of the
-        # store going to disk. #1269 had the ladder refusing OUTRIGHT, because
-        # every arm's predicted peak carried its own STORE -- 9 GiB of tmpfs on
-        # dk5's chosen arm -- and that store pushed the best arm to 92.19 GiB
-        # against an 87.30 GiB hard bound. The store is a directory on the ZFS
-        # dataset now and is not in the sum at all, so the same box's peaks drop
-        # by exactly that term: M=600 predicts 81.19 GiB and IS fundable, with
-        # 6.11 GiB of reap headroom. dk5 is therefore named before it boots and
-        # given a smaller, survivable arm -- which is this class's sentence in
-        # its strongest form yet, and NOT a weakening: the arm that died is
-        # still refused, by the LAUNCH moment, which no store size ever touched.
+        # The old name asserted a sentence this suite could no longer prove. Two
+        # separate changes retired it, and pretending otherwise would have kept a
+        # green test guarding nothing:
+        #   * #1318 derived the ring multipliers and freed 3.12 GiB at every arm,
+        #     which already lifted S=1/M=1200 from refused to chosen -- the
+        #     comments below the old assertions said so in as many words;
+        #   * #1317n prices the LAUNCH moment in reap currency, which moves that
+        #     arm's launch leftover from +2.70 to +14.70 GiB.
+        #
+        # MEASURED ATTRIBUTION of weg2dk5's death (2026-09-07 21:15:30Z), which is
+        # what this test now pins instead of a refusal:
+        #   measured non-reclaimable  94.80 GiB (anon 42.16 + shmem 52.65,
+        #                             memts_weg2_weg2dk5.csv 21:15:30Z; cg_current 95.93)
+        #   predicted run peak        83.66 GiB at dk5's own arm
+        #   gap                       11.14 GiB, decomposed WITHOUT residue into:
+        #     - 5.10 GiB tmpfs page store  -> #1236 moved it to a ZFS directory, so it is
+        #                                     page cache/ARC and no longer shmem in this
+        #                                     cgroup (BOOT_weg2dk5_0907.md, slice
+        #                                     attribution: "the store held 5.1 GiB in
+        #                                     tmpfs ... tmpfs is shmem")
+        #     - 7.68 GiB interleave anon   -> C19 charges Sigma H (32.19 GiB) ONCE in place
+        #                                     of image + flip transient (38.63 + 9.97),
+        #                                     and the anon delta that killed dk5 was
+        #                                     exactly that transient (+8,056,452 kB across
+        #                                     memts 21:15:20 -> 21:15:30, shmem FLAT)
+        #   reconstruction            82.02 GiB, i.e. 1.64 GiB BELOW the prediction, so the
+        #                             ledger errs conservative on the box that died.
+        #
+        # THE SAFETY PROPERTY, and the reason this is a pin and not a comment: dk5's
+        # arm is fundable ONLY because both of those terms are gone. If either comes
+        # back -- a tmpfs (shmem) store charged into this cgroup, or a residency model
+        # that charges image + transient instead of one Sigma H -- the assertions below
+        # fail. The PRE-C19 form cannot be priced at all any more (W20: "the host
+        # weights term has no measured source ... and there is no third option"), which
+        # is a missing-source refusal and would pin nothing, so it is deliberately NOT
+        # what is asserted here.
+        DK5_MEASURED_NONRECLAIM_GIB = 94.80
+        DK5_TMPFS_STORE_GIB = 5.10
+        DK5_INTERLEAVE_ANON_GIB = 7.68
+
         arm, headroom, lines_l = _choose()
-        # #1318 BOOT-BLOCKING CHANGE, ASSERTED RATHER THAN HIDDEN. Deriving
-        # the ring multipliers frees 3.12 GiB at every arm, and that is
-        # enough to lift S=1/M=1200 -- THE ARM weg2dk5 WAS REAPED ON --
-        # from refused to chosen. The class's old sentence ("the arm that
-        # died is still refused") no longer holds, and it is not this
-        # suite's place to soften it: the ladder is asserted as it now IS,
-        # and the operator decides whether a boot may take that arm before
-        # a host-peak measurement at the derived ring exists.
-        # THE OPEN QUESTION, named: either the 6.0 constant was a pure
-        # over-charge (then dk5 died of the 9 GiB tmpfs store #1236 has
-        # since moved to disk, and M=1200 is genuinely survivable), or 6.0
-        # was carrying an unattributed term besides the ring, in which case
-        # deleting it without finding that term is a relaxation above the
-        # reap mark. Only a boot answers that.
         self.assertEqual((arm.s_gb, arm.m_mib), (1, 1200))
         self.assertIsNotNone(headroom)
         self.assertGreater(headroom, 0.0)
         lines = "\n".join(lines_l).splitlines()
-        # and M=1200 -- the arm that died -- is refused by name, at the LAUNCH
-        # moment, which is the term the ring does NOT make free (it charges
-        # Sigma span1 = 29.21 GiB there plus the 12 GiB load transient).
+
         died = host_ledger.price(
             DK5_MEMTOTAL_B, DK5_MEMAVAIL_B, 1, 1200, **RING_KW,
             cg_current_bytes=DK5_CG_CURRENT_B, cg_ceiling_bytes=DK5_MEMTOTAL_B,
         )
-        # The launch moment used to name this arm at -0.42 GiB; the
-        # derivation moves it to +2.70, i.e. by exactly the saving.
+        t = died.terms
+
+        # (1) The launch moment is priced in REAP currency and BOTH forms are on the
+        # arm, so the worst case stays visible instead of being replaced.
+        self.assertEqual(t["launch_currency"], "reap")
+        self.assertGreater(t["launch_leftover_reap_gib"], 0.0)
+        self.assertIn("launch_leftover_sum_gib", t)
+        self.assertLess(t["launch_leftover_sum_gib"], t["launch_leftover_reap_gib"])
+
+        # (2) KILLER 1 GONE -- no tmpfs store term is charged into this sum. #1236 put
+        # the store on disk; a store charged here again would be shmem and would break
+        # this.
+        charged_store_keys = [
+            k for k, v in t.items()
+            if "store" in k and k != "store_draft_fraction"
+            and isinstance(v, (int, float)) and v
+        ]
+        self.assertEqual(charged_store_keys, [])
+
+        # (3) KILLER 2 GONE -- the weights term is ONE measured Sigma H, and the load
+        # transient is page cache rather than anon. A residency model would charge the
+        # image plus a flip transient in anon instead, which is what dk5 died of.
+        self.assertGreater(t["host_ring_gib"], 0.0)
+        self.assertAlmostEqual(t["host_ring_gib"], 32.19, delta=0.05)
+        self.assertEqual(t["load_transient_anon_gib"], 0.0)
         self.assertAlmostEqual(
-            died.launch_leftover_gib,
-            -0.42 + self.DK5_RING_DERIVATION_SAVING_GIB,
-            delta=0.05,
+            t["load_transient_pagecache_gib"], t["load_transient_gib"], delta=0.01
         )
-        self.assertGreater(died.launch_leftover_gib, 0.0)
-        self.assertTrue(died.fundable_moments)
+
+        # (4) The arithmetic of the attribution itself, so the numbers cannot drift
+        # apart from the prose above.
+        peak = died.predicted_run_peak_gib()
+        self.assertIsNotNone(peak)
+        self.assertAlmostEqual(peak, 83.66, delta=0.10)
+        reconstructed = (
+            DK5_MEASURED_NONRECLAIM_GIB
+            - DK5_TMPFS_STORE_GIB
+            - DK5_INTERLEAVE_ANON_GIB
+        )
+        self.assertLess(reconstructed, peak)
+        self.assertAlmostEqual(peak - reconstructed, 1.64, delta=0.15)
+
         ladder = [ln for ln in lines if "ARM S=1 M=1200" in ln][0]
         self.assertIn("M=1200", ladder)
 
