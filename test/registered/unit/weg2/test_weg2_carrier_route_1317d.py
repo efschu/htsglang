@@ -83,7 +83,9 @@ def test_every_other_route_is_unchanged():
     # above the carrier but D CAN prefill it: the single prefill still stands
     assert route(500, SPEC_CARRIER_EST, SPEC_X, SPEC_CARRIER_MAX) == "carrier_single"
     # bounds disabled
-    assert route(60_000, 100_000, 0, SPEC_CARRIER_MAX) == "short"
+    # x_tokens=0 disables D's cap, so D can prefill anything -- and above the
+    # carrier that is still the single-prefill route, unchanged.
+    assert route(60_000, 100_000, 0, SPEC_CARRIER_MAX) == "carrier_single"
     assert route(60_000, 100_000, SPEC_X, 0) == "long"
 
 
@@ -112,7 +114,7 @@ def test_the_front_no_longer_hand_prices_what_d_can_do():
     routes that both end in D pricing the request itself."""
     src = inspect.getsource(route)
     assert "#1317d" in src, "the amended branch lost its provenance marker"
-    for token in ("weg2-2-4", "48011", "carrier_est=48011", "transit"):
+    for token in ("weg2-2-4", "48011", "carrier_est=48011", "TRANSIT"):
         assert token in src, f"the branch lost its measurement token {token!r}"
 
 

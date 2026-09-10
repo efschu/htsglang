@@ -544,21 +544,60 @@ def test_at_the_floor_the_real_front_round_trips_nothing_and_one_above_it_does()
     floor, _ = cc.route_floor(SHORT_BOUND)
     shortest_non_short = int(SHORT_BOUND * front.CHARS_PER_TOKEN)  # 12288 chars
 
+    # #1317d RETIRED THE OFF-SWITCH HAZARD THIS TEST WAS WRITTEN FOR, and the
+    # law is restated rather than the assertion flipped.
+    #
+    # WHAT #1246 GUARDED: a carrier bound below the floor silently DISABLED the
+    # round trip -- every non-short prompt fell to `route_carrier_exceeds` and
+    # P was never used, which is why the floor had to be coupled to the real
+    # router instead of to CHUNK_TOKENS.
+    #
+    # WHY IT NO LONGER APPLIES: since #1317d the carrier bound does not gate
+    # round-tripping at all. D's host staging pool is TRANSIT for the window
+    # loop, not a cap on prompt length, so a prompt above the carrier takes the
+    # P route (`long` -> `route_batch`) instead of a single prefill or a 413.
+    # A too-low bound therefore no longer switches the round trip OFF -- it
+    # forces it ON for more of the axis, which is the safe direction and is the
+    # whole point of the change.
+    #
+    # THE BOUND'S NEW FAILURE MODE, named so it is not rediscovered: a
+    # mis-set (too low) carrier bound now routes prompts to P that D could
+    # have single-prefilled cheaply. That costs a leg, never a refusal.
     assert _route_of(floor + 1, shortest_non_short) == "route_batch"
-    assert _route_of(floor, shortest_non_short) == "route_carrier_exceeds"
-    # and nothing at all round-trips at the floor, across the length axis
+    assert _route_of(floor, shortest_non_short) == "route_batch", (
+        "since #1317d a below-floor carrier bound must NOT disable the round "
+        "trip; it routes the same prompt through P instead of refusing it"
+    )
+    # and the round trip is now available across the whole length axis at the
+    # floor -- the axis that used to read `route_carrier_exceeds` everywhere.
     for n in (10, 12287, shortest_non_short, 40000, 300000):
-        assert _route_of(floor, n) in ("route_short", "route_carrier_exceeds"), n
+        assert _route_of(floor, n) in ("route_short", "route_batch"), n
 
 
-def test_a_bound_the_old_floor_accepted_round_trips_nothing():
-    """5119 (a 5688-token host pool x 0.9) cleared the CHUNK_TOKENS floor and is
-    an off switch: measured against the real router, over the whole axis."""
+def test_a_bound_the_old_floor_accepted_is_no_longer_an_off_switch():
+    """5119 (a 5688-token host pool x 0.9) cleared the CHUNK_TOKENS floor and
+    WAS an off switch: over the whole length axis nothing round-tripped.
+
+    #1317d: it is not an off switch any more, and this is the pair to the
+    restated test above. The same bound, the same axis, the same router -- but
+    a prompt above the carrier now takes the P route instead of falling to a
+    single prefill, so `route_carrier_exceeds` is no longer the answer
+    everywhere. The #1246 FLOOR still has a job (it is the bound below which
+    the carrier stops describing anything real, and the census still refuses
+    it), but the HAZARD it was sized against -- a silent loss of the round
+    trip -- cannot occur through this branch any more."""
     from sglang.srt.weg2 import front
 
     assert 5119 > SHORT_BOUND
+    seen = set()
     for n in (10, 12287, 12288, 12300, 40000, 300000):
-        assert _route_of(5119, n) in ("route_short", "route_carrier_exceeds"), n
+        r = _route_of(5119, n)
+        assert r in ("route_short", "route_batch"), n
+        seen.add(r)
+    assert "route_batch" in seen, (
+        "at least one length must round-trip through P at this bound; if none "
+        "does, the off-switch hazard #1246 was written for is back"
+    )
 
 
 # ------------------------------------------ the regex against the LIVE emitter
