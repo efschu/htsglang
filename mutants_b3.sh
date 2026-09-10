@@ -83,4 +83,17 @@ echo "M8 the geometry is re-derived here instead of read from the ARM term"
 mutate 'return int(terms.buffer_bytes) // int(terms.depth), int(terms.depth)' \
        'return int(terms.mean_layer_bytes), int(terms.depth)' && run; restore; echo
 
+echo "M9 an unlayered class treated as a layer (refuses instead of banding)"
+mutate 'return self.key[1].startswith("layers.")' \
+       'return True' && run; restore; echo
+
+echo "M10 a layer treated as unlayered (bands instead of refusing)"
+mutate 'return self.key[1].startswith("layers.")' \
+       'return False' && run; restore; echo
+
+echo "M11 the banded set never reported (the decide becomes invisible)"
+mutate 'banded = tuple(u.key[1] for u in units
+                   if u.nbytes > int(slot_bytes))' \
+       'banded = ()' && run; restore; echo
+
 echo "=== BASELINE AFTER ==="; run; echo

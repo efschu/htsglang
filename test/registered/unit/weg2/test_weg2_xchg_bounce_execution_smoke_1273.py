@@ -118,6 +118,14 @@ LM_HEAD_BYTES = LM_HEAD_ROWS * ROW                    # 44544 = 4 x LAYER0
 SLOT_BYTES = LAYER0_BYTES
 DEPTH = 2
 
+#: The MEAN over the layered units, and a slot strictly between it and the
+#: widest layer.  Both exist only so the mean/max distinction is testable: a
+#: refusal graded on either fires below the mean, so only this window tells
+#: them apart.  Measured equivalent on the real checkpoint: mean 386.9 MiB,
+#: widest 721 MiB.
+MEAN_LAYER_BYTES = (LAYER0_BYTES + (N_LAYERS - 1) * PLAIN_LAYER_BYTES) // N_LAYERS
+SLOT_BETWEEN = (MEAN_LAYER_BYTES + LAYER0_BYTES) // 2
+
 
 def _p_ptr(layer: int, off: int) -> int:
     return dev_ptr(0, P_BASE + layer * STEP + off)
@@ -429,9 +437,18 @@ def test_a_layer_above_the_slot_refuses_but_an_unlayered_class_bands(
     # Half one: the unlayered class alone is fine at this slot.
     bx.refuse_if_plan_exceeds_slot(SLOT_BYTES, _all_descs(lm_head=True))
 
-    # Half two: shrink the slot below the widest LAYER and it must refuse.
+    # Half two: a slot BETWEEN THE MEAN AND THE WIDEST layer must refuse.
+    #
+    # THE SLOT IS BETWEEN THEM ON PURPOSE, and it is a measured lesson: with a
+    # slot below the MEAN (PLAIN_LAYER_BYTES, the first draft) a refusal graded
+    # on the mean and a refusal graded on the max BOTH fire, so a mutant that
+    # replaced the widest with the mean passed all twenty tests.  Only a slot
+    # the mean clears and the widest does not separates the two -- which is
+    # section 10.5's whole sentence ("the bound is the WIDEST layer, not the
+    # mean") and the direction xchg_bounce's own mutants cover on the arm side.
+    assert MEAN_LAYER_BYTES < SLOT_BETWEEN < LAYER0_BYTES
     with pytest.raises(xb.Weg2XchgBounceUnderCovered) as e:
-        bx.refuse_if_plan_exceeds_slot(PLAIN_LAYER_BYTES, _all_descs())
+        bx.refuse_if_plan_exceeds_slot(SLOT_BETWEEN, _all_descs())
     msg = str(e.value)
     assert "W71" in msg
     assert "layers.0" in msg
@@ -442,7 +459,7 @@ def test_a_layer_above_the_slot_refuses_but_an_unlayered_class_bands(
     before = bx.registered_bounce_bytes()
     with pytest.raises(xb.Weg2XchgBounceUnderCovered):
         _run_bounce(_manager(), seeded, armed, str(tmp_path),
-                    slot_bytes=PLAIN_LAYER_BYTES)
+                    slot_bytes=SLOT_BETWEEN)
     assert bx.registered_bounce_bytes() == before
 
 
