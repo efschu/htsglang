@@ -89,21 +89,44 @@ def test_every_other_route_is_unchanged():
     assert route(60_000, 100_000, SPEC_X, 0) == "long"
 
 
-def test_ds_exemption_is_still_there_as_the_cold_store_fallback():
-    """M3. THE FALLBACK NEEDS NO FRONT PLUMBING, and that is why this change
-    is one branch: if the store cannot vouch when D prices the prefix (a cold
-    pass whose write-through has not landed), D's uncached extent stays large
-    and D's OWN `exempt_carrier_exceeds` arm admits it as a single prefill.
-    Removing that arm here would turn every cold above-carrier prompt into a
-    refusal -- the opposite of this change's purpose. It stays until A is
-    proven on metal (user ruling)."""
+def test_ds_exemption_is_GONE_and_the_defer_arm_is_the_cold_route():
+    """#1317n REWRITTEN. This pinned `exempt_carrier_exceeds` as the cold-pass
+    fallback, with the reason: "if the store cannot vouch when D prices the
+    prefix, D's uncached extent stays large and D's OWN exempt arm admits it as
+    a single prefill", and it said the arm "stays until A is proven on metal
+    (user ruling)".
+
+    THE PREMISE IS GONE, so the pin follows. That arm existed because D's host
+    tier was a fixed 1 GB (30,518 rows, #915 limit 27,466), which made an
+    above-carrier prompt genuinely routeless -- refusing it only bounced it
+    around the wall (R-3). D's L2 is now DERIVED from `--max-kv-per-request`,
+    so the carrier is at or above the cap and there are exactly two cases,
+    both with a route:
+
+    * ABOVE the cap -- the front refuses at admission. The cap is the law, and
+      413 is the correct answer, not a hole.
+    * BELOW the cap with a store read that has not LANDED -- the X-DEFER arm
+      (#1238 fix 7) holds it while the read is pending, so it is never priced
+      at its whole extent and never refused for being cold. That route is
+      verified, not asserted:
+      `test_weg2_scheduling_slice_a_0907::test_t9b2_a_pending_store_read_DEFERS_it_never_refuses_it`
+      pins both pending shapes (an `ongoing_prefetch` record AND the #1068
+      mark) plus the negative case.
+
+    So the deletion did not open a hole; it removed a compensation whose own
+    condition ("until A is proven") was replaced by sizing L2 for the cap. What
+    is asserted here is the absence, and that the term the #1246 bound reads is
+    still present.
+    """
     from sglang.srt.managers.scheduler import Scheduler
 
     src = inspect.getsource(Scheduler._weg2_x_refuses)
-    assert "exempt_carrier_exceeds" in src, (
-        "D's cold-store fallback was removed; an above-carrier prompt whose "
-        "store read has not landed would then have no route at all"
+    assert "exempt_carrier_exceeds" not in src, (
+        "the carrier-exceeds exemption is back; it lets D prefill over X, "
+        "which is the standing veto kein-d-direct-prefill-ueber-x"
     )
+    # the carrier term itself STAYS -- the #1246 bound reads it, and the
+    # acceptance checks it against cap x share.
     assert "_weg2_host_carry_tokens" in src
 
 

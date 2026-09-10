@@ -104,6 +104,38 @@ class TestTheCompensationIsGone(unittest.TestCase):
     -- an emitter that survives in one module is the second bookkeeping the
     user ordered removed."""
 
+    GONE = (
+        "WINDOW-REISSUE", "release_staged_window", "_weg2_issue_next_window",
+        "#1317m", "WINDOW-RELEASE", "exempt_carrier_exceeds",
+        "windowed_carrier", "_weg2_window_alloc_cap",
+    )
+
+    @staticmethod
+    def _code_only(src: str) -> str:
+        """Source with comments and string literals removed.
+
+        FIFTH INSTANCE TODAY of a source-text assertion matching PROSE instead
+        of code, and the first one in a test I wrote after naming the class
+        four times: this assertion tripped on the `front.py` COMMENT that
+        DOCUMENTS the deletion ("That arm is DELETED"), and it cost a red gate.
+        The comment is correct and must stay; the assertion is about what
+        EXECUTES. Strings go too -- a deleted emitter's own log text is a
+        string literal, and keeping one would be the same false positive
+        wearing quotes.
+        """
+        import io
+        import tokenize
+
+        out = []
+        try:
+            for tok in tokenize.generate_tokens(io.StringIO(src).readline):
+                if tok.type in (tokenize.COMMENT, tokenize.STRING):
+                    continue
+                out.append(tok.string)
+        except (tokenize.TokenError, IndentationError):  # pragma: no cover
+            return src
+        return "\n".join(out)
+
     def test_no_window_chain_or_anchor_census_survives(self):
         import inspect
 
@@ -113,12 +145,30 @@ class TestTheCompensationIsGone(unittest.TestCase):
         from sglang.srt.weg2 import front
 
         for mod in (scheduler, unified_radix_cache, mamba_component, front):
-            src = inspect.getsource(mod)
-            for gone in ("WINDOW-REISSUE", "release_staged_window",
-                         "_weg2_issue_next_window", "#1317m",
-                         "WINDOW-RELEASE", "exempt_carrier_exceeds",
-                         "windowed_carrier", "_weg2_window_alloc_cap"):
-                self.assertNotIn(gone, src, f"{mod.__name__} still carries {gone}")
+            code = self._code_only(inspect.getsource(mod))
+            for gone in self.GONE:
+                self.assertNotIn(
+                    gone, code, f"{mod.__name__} still EXECUTES {gone}")
+
+    def test_the_absence_check_can_still_fail_plant_proof(self):
+        """A stripper that removes too much turns this suite into a rubber
+        stamp, so the check is proven able to FAIL: every name is planted as
+        real code and must be caught, and the same name in a comment or a
+        string must NOT be."""
+        for gone in self.GONE:
+            planted = f"def f():\n    return {gone.replace('-', '_').replace('#', 'n')}\n"
+            self.assertIn(
+                gone.replace("-", "_").replace("#", "n"),
+                self._code_only(planted),
+                f"the stripper swallowed planted CODE for {gone}",
+            )
+        # ...and prose with the same token is invisible, which is the whole point
+        prose = '# this mentions WINDOW-REISSUE and exempt_carrier_exceeds\ndef f():\n    return 1\n'
+        code = self._code_only(prose)
+        self.assertNotIn("WINDOW-REISSUE", code)
+        self.assertNotIn("exempt_carrier_exceeds", code)
+        docstr = 'def f():\n    """mentions release_staged_window"""\n    return 1\n'
+        self.assertNotIn("release_staged_window", self._code_only(docstr))
 
     def test_design_a_and_the_1246_bound_are_KEPT(self):
         """The delete list is not "everything #1317 touched": the X gate is the

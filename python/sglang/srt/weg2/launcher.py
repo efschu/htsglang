@@ -3865,6 +3865,68 @@ def gate_w11(log_p: str, log: Log) -> Dict[str, object]:
     return w11
 
 
+def _derive_d_l2_budget(ns, max_kv_per_request: int) -> Tuple[int, List[str]]:
+    """Group D's ``--hicache-size`` in GB, plus the lines that make it auditable.
+
+    A HELPER AND NOT INLINE IN ``main()``, for two PINNED reasons rather than
+    taste: ``main()`` must contain zero try/except (the one refusal funnel is
+    ``cli()``, #1248) and its inline-raise sites are counted exactly. Both
+    refusals below therefore live here, where they are ordinary raises that the
+    single funnel catches. The first draft put them in ``main`` and the gate
+    caught it -- `test_main_has_zero_try_blocks` read
+    ``[<ast.Try>] != []`` and `test_mains_own_raise_sites_are_pinned_pre_and_post_spawn`
+    read ``6 != 4``.
+
+    WHY D NEEDS ITS OWN BUDGET AT ALL: upstream stages every L3 read through
+    the host pool and sizes that pool so residency cannot bind a read. A fixed
+    1 GB on D gave 30,518 rows and a #915 limit of 27,466, and the #1317
+    window/chain/anchor layer was the compensation for the shortfall. Derived
+    from the cap, one cap-sized read fits in ONE prefetch on every rank.
+    """
+    cap_tokens = int(max_kv_per_request or 0)
+    share = float(ns.d_cap_rank_share)
+    rec_share = _installed_max_share_from_record()
+    if rec_share is not None and rec_share > share + 1e-9:
+        raise Weg2LaunchRefused(
+            f"W89x Weg2L2ShareBelowInstalled: the sizing record's installed "
+            f"KV-token ownership vector has max(v)/sum(v) = {rec_share:.4f}, "
+            f"above --d-cap-rank-share {share}. Sizing D's L2 on the smaller "
+            f"share ships a pool that cannot hold one cap-sized read on the "
+            f"largest rank -- the 27,466-row wall this change removes -- so it "
+            f"is refused by name rather than discovered as a 413. Raise "
+            f"--d-cap-rank-share to at least {rec_share:.4f}."
+        )
+    try:
+        terms = host_ledger.derive_d_hicache_size_gb(
+            cap_tokens, share, host_ledger.CELL_BYTES_D_PER_RANK[0],
+            HICACHE_LOAD_POOL_USAGE_FRACTION_1317N,
+        )
+    except ValueError as exc:
+        raise Weg2LaunchRefused(
+            f"W88x Weg2L2Unsizable: group D's L2 budget could not be derived "
+            f"from cap={cap_tokens} share={share}: {exc}"
+        ) from exc
+    src = (
+        f"flag-default {share} vs installed "
+        + ("unknown at launch (#1032: no vector shipped)"
+           if rec_share is None else f"{rec_share:.4f} (sizing record)")
+    )
+    return int(terms["s_gb"]), [
+        host_ledger.d_hicache_provenance(terms, src),
+        f"WEG2-L2 SHARE PROVENANCE: the launcher ships NO ownership vector "
+        f"(#1032), so the INSTALLED vector is not knowable here -- the runtime "
+        f"derives an estimate from this boot's budgets and supersedes it after "
+        f"profiling. `--d-cap-rank-share` is a NAMED MARGIN, not a reading: "
+        f"boot weg2sn6p measured installed [17,24,23] -> max/sum = 0.3750 and "
+        f"its own pre-boot estimate [2,3,3] -> 0.3750, i.e. the SHARE was "
+        f"stable across the supersession even though the vector was not. "
+        f"Default {share} covers that with margin. IF the installed share "
+        f"exceeds it, D's #915 limit lands BELOW cap x share and the #1246 "
+        f"carrier bound says so by name -- a readable outcome, never a silent "
+        f"one.",
+    ]
+
+
 def _installed_max_share_from_record() -> Optional[float]:
     """max(v)/sum(v) of the INSTALLED D ownership vector, if any record has it.
 
@@ -8169,68 +8231,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     d_bs = max(1, int(ns.d_bs))
     max_kv_per_request = int(ns.max_kv_per_request or CONTEXT_LENGTH_TOKENS)
 
-    # ------------------------------------------------------------------
-    # #1317n D's L2 IS DERIVED FROM THE REQUEST CAP, not pinned at 1 GB.
-    #
-    # THE INVARIANT BEING RESTORED. Upstream stages every L3 read through the
-    # host pool and sizes that pool so residency can never bind a read
-    # (`pool_host/base.py`: `ratio x device_pool` when `--hicache-size` is
-    # unset, ratio 2.0, so L2 >= L1). This launcher shipped a fixed 1 GB to
-    # BOTH groups -- 30,518 rows on D, a #915 limit of 27,466 -- which broke
-    # that invariant, and the whole #1317 window/chain/anchor layer plus the
-    # 413 band was the compensation. User decision 2026-09-10: delete the
-    # compensation, restore the invariant.
-    #
-    # P KEEPS ITS 1 GB. P only WRITES the store; a staging tier is all it
-    # needs, and its ring multiplier is priced separately below.
-    _cap_tokens = int(max_kv_per_request or 0)
-    # #1317n THE SHARE IS A FLAG DEFAULT, NOT A READING, and the line says so
-    # in those words. The launcher ships no ownership vector (#1032), so the
-    # INSTALLED share is unknowable here; when the sizing record starts
-    # carrying it, this reads it and REFUSES a boot whose installed max_share
-    # exceeds the flag, instead of shipping a pool that is quietly too small.
-    _rec_share = _installed_max_share_from_record()
-    if _rec_share is not None and _rec_share > float(ns.d_cap_rank_share) + 1e-9:
-        raise Weg2LaunchRefused(
-            f"W89x Weg2L2ShareBelowInstalled: the sizing record's installed "
-            f"KV-token ownership vector has max(v)/sum(v) = {_rec_share:.4f}, "
-            f"above --d-cap-rank-share {ns.d_cap_rank_share}. Sizing D's L2 on "
-            f"the smaller share ships a pool that cannot hold one cap-sized "
-            f"read on the largest rank, which is the 27,466-row wall this "
-            f"whole change removes -- refused by name rather than discovered "
-            f"as a 413. Raise --d-cap-rank-share to at least {_rec_share:.4f}."
-        )
-    _share_src = (
-        f"flag-default {ns.d_cap_rank_share} vs installed "
-        + ("unknown at launch (#1032: no vector shipped)"
-           if _rec_share is None else f"{_rec_share:.4f} (sizing record)")
-    )
-    _share = float(ns.d_cap_rank_share)
-    try:
-        _l2 = host_ledger.derive_d_hicache_size_gb(
-            _cap_tokens, _share, host_ledger.CELL_BYTES_D_PER_RANK[0],
-            HICACHE_LOAD_POOL_USAGE_FRACTION_1317N,
-        )
-    except ValueError as exc:
-        raise Weg2LaunchRefused(
-            f"W88x Weg2L2Unsizable: group D's L2 budget could not be derived "
-            f"from cap={_cap_tokens} share={_share}: {exc}"
-        ) from exc
-    s_gb_d = int(_l2["s_gb"])
-    log(host_ledger.d_hicache_provenance(_l2, _share_src))
-    log(
-        f"WEG2-L2 SHARE PROVENANCE: the launcher ships NO ownership vector "
-        f"(#1032, d_token_vector_decision default), so the INSTALLED vector is "
-        f"not knowable here -- the runtime derives an estimate from this boot's "
-        f"budgets and supersedes it after profiling. `--d-cap-rank-share` is "
-        f"therefore a NAMED MARGIN, not a reading: boot weg2sn6p measured "
-        f"installed [17,24,23] -> max/sum = 0.3750 and its own pre-boot "
-        f"estimate [2,3,3] -> 0.3750, i.e. the SHARE was stable across the "
-        f"supersession even though the vector was not. Default {ns.d_cap_rank_share} "
-        f"covers that with margin. IF the installed share exceeds it, D's #915 "
-        f"limit lands BELOW cap x share and the #1246 carrier bound says so by "
-        f"name -- a readable outcome, never a silent one."
-    )
+    # #1317n D's L2 budget, DERIVED. The whole guard lives in the helper:
+    # `main()` carries a pinned law of ZERO try/except blocks and a pinned
+    # inline-raise count (test_weg2_launcher_teardown_1248 -- the single
+    # refusal funnel is `cli()`), so a site-local try here was a second
+    # refusal path, which is the class #1248 exists to stop. It cost this
+    # cycle a red gate.
+    s_gb_d, _l2_lines = _derive_d_l2_budget(ns, max_kv_per_request)
+    for _ln in _l2_lines:
+        log(_ln)
     x_seed = resolve_x(ns.tp_prefill_max_tokens, EVIDENCE_DIR, CHUNKED_PREFILL_TOKENS)
     x_tokens, x_provenance = x_seed.tokens, x_seed.provenance
     flip_min_work_tokens = int(ns.flip_min_work_tokens) if ns.flip_min_work_tokens is not None else x_tokens

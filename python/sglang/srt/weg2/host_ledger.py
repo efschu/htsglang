@@ -2266,7 +2266,14 @@ def choose(
         if moments_ok and not peak_ok:
             peak_bound_any = True
         lines.append(
-            f"WEG2-HOST-LEDGER ARM S={arm.s_gb} S_D={_arm_s_d(arm)} M={arm.m_mib}: "
+            # #1317n S_D IS APPENDED AFTER M, NOT INSERTED BETWEEN S AND M.
+            # Three suites match the literal substring `ARM S=<s> M=<m>` (two
+            # by `in`, one by a list comprehension that then indexes [0] and
+            # raised IndexError), so splitting that pair is a text change
+            # masquerading as a semantic one. The new term is additive and the
+            # old reading is byte-identical -- which is also the honest shape:
+            # nothing about S or M changed, D simply gained its own budget.
+            f"WEG2-HOST-LEDGER ARM S={arm.s_gb} M={arm.m_mib} S_D={_arm_s_d(arm)}: "
             f"anchors={arm.terms['anchors_gib']:.2f} rings={arm.terms['rings_gib']:.2f} "
             f"overhead={arm.terms['overhead_gib']:.2f} -> "
             f"leftover launch={arm.launch_leftover_gib:.2f} GiB "

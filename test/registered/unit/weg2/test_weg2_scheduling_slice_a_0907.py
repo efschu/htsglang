@@ -480,14 +480,64 @@ def test_t9a_the_d_side_x_gate_binds_on_the_real_extent_at_the_boundary():
     assert Scheduler.weg2_uncached_extent(stub, _stub_req(19401, prefix=1000, host_hit=18000)) == 401
 
 
-def test_t9b_x_zero_is_off_and_the_carrier_wall_is_exempt():
-    """The default path is untouched (X=0 = off), and a prompt no store read
-    could ever cover is exempt rather than bounced around the wall (R-3)."""
+def test_t9b_x_zero_is_off_and_above_the_carrier_is_now_REFUSED_not_exempt():
+    """#1317n REWRITTEN, because the premise it pinned is gone.
+
+    It used to assert that a prompt "no store read could ever cover" was
+    EXEMPT from law 4 rather than bounced around the wall (R-3). That
+    exemption existed because D's host tier was a fixed 1 GB -- 30,518 rows --
+    so a 84,027-token prompt genuinely had no route and refusing it only
+    bounced it. D's L2 is now DERIVED from `--max-kv-per-request` (122,070
+    rows at S_D=4), so `host_carry` is at or above the cap and "above the
+    carrier" means ABOVE THE REQUEST CAP -- where refusing by name is the
+    correct answer and the cap is the law. The exemption is deleted, and this
+    pin follows the code rather than outliving it.
+
+    X=0 = off is UNTOUCHED, which is the half that still matters most: the
+    default path never consults any of this.
+    """
     Scheduler, off = _stub_scheduler(0, host_carry=30518)
     assert Scheduler._weg2_x_refuses(off, _stub_req(84027)) is False
-    Scheduler, on = _stub_scheduler(10000, host_carry=30518)
-    assert Scheduler._weg2_x_refuses(on, _stub_req(84027)) is False  # > host carry
-    assert Scheduler._weg2_x_refuses(on, _stub_req(30000)) is True   # under it: refused
+    # Under the DERIVED pool the same prompt is well inside the carrier, and it
+    # is refused for the honest reason: 84,027 uncached against X=10,000 is a
+    # prefill this group may not do itself. The store serves it, or it is
+    # refused by name -- never prefilled over X.
+    Scheduler, on = _stub_scheduler(10000, host_carry=122070)
+    assert Scheduler._weg2_x_refuses(on, _stub_req(84027)) is True
+    assert Scheduler._weg2_x_refuses(on, _stub_req(30000)) is True
+    # And the request that FITS under X is admitted, unchanged.
+    assert Scheduler._weg2_x_refuses(on, _stub_req(9000)) is False
+
+
+def test_t9b2_a_pending_store_read_DEFERS_it_never_refuses_it():
+    """#1317n THE ROUTE THAT REPLACES THE DELETED EXEMPTION, verified rather
+    than asserted in prose.
+
+    The exemption's job was to keep a prompt whose store read had not landed
+    from being priced at its whole extent and refused. That job belongs to the
+    X-DEFER arm (#1238 fix 7): while a store read is PENDING -- an
+    `ongoing_prefetch` record, or the #1068 A12.2 mark -- the gate must WAIT
+    rather than price. This test pins that the pending predicate the admission
+    loop consults answers True on both pending shapes, so a below-cap prompt
+    with an unlanded read is deferred and never reaches the refusal at all.
+    """
+    from sglang.srt.managers.scheduler import Scheduler
+
+    tree = SimpleNamespace(ongoing_prefetch={"inflight": object()})
+    sched = SimpleNamespace(tree_cache=tree)
+
+    # (a) an in-flight prefetch record
+    req_a = _stub_req(84027, rid="inflight")
+    assert Scheduler._weg2_store_read_is_pending(sched, req_a) is True
+    # (b) the #1068 deferral mark, with no record (the read was rate-limited
+    #     out of registration and the retry owes a re-issue)
+    req_b = _stub_req(84027, rid="marked")
+    req_b.prefetch_deferred = "host_pool_shortfall"
+    assert Scheduler._weg2_store_read_is_pending(sched, req_b) is True
+    # (c) and a request with NEITHER prices immediately -- the defer is for
+    #     reads that are still coming, never for reads that are not.
+    req_c = _stub_req(84027, rid="cold")
+    assert Scheduler._weg2_store_read_is_pending(sched, req_c) is False
 
 
 def test_t9c_the_front_requeues_a_w31_once_and_then_raises_w35():
