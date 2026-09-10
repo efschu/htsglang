@@ -6311,12 +6311,32 @@ class Scheduler(
         # is asking about a quantity nobody is trying to allocate. The RATE arm
         # keeps this predicate, and correctly: there nothing registered, so the
         # ask is the only number there is.
-        if (
-            span is not None
-            and limit is not None
-            and int(span) > int(limit)
-            and not self._weg2_windowed_store_read_active()
-        ):
+        _over_limit = (
+            span is not None and limit is not None and int(span) > int(limit)
+        )
+        if _over_limit and self._weg2_windowed_store_read_active():
+            # THE RETIREMENT IS AUDIBLE. Without this line the fix is
+            # invisible on a boot: the request simply proceeds, and a reader
+            # cannot tell "the arm was retired" from "the arm never fired".
+            # Rate-limited like every other census emitter, and it prints the
+            # two numbers whose comparison used to end the request here, so
+            # the boot can check the retirement against the wall it removes.
+            self._weg2_undeferrable_retired = (
+                getattr(self, "_weg2_undeferrable_retired", 0) + 1
+            )
+            n = self._weg2_undeferrable_retired
+            if n <= 5 or n % 64 == 0:
+                logger.warning(
+                    "#1317j UNDEFERRABLE RETIRED rid=%s span=%d limit=%d "
+                    "site=%s occurrence=%d -- the span exceeds the staging "
+                    "budget, which USED to end this request here (the 159k "
+                    "wall); under the windowed store read the pool is TRANSIT "
+                    "and the read already registered its group-trimmed part, "
+                    "so the deferral continues instead. Denominator: shortfall "
+                    "marks whose span exceeded the budget",
+                    rid, int(span), int(limit), site, n,
+                )
+        if _over_limit and not self._weg2_windowed_store_read_active():
             # Carrier-exceeds. Identical predicate and identical exit to the
             # rate arm's: a span the budget can never hold does not become
             # holdable by deferring, so it proceeds on the recompute path.
