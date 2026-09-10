@@ -9711,33 +9711,6 @@ class Scheduler(
         pool = getattr(ctrl, "mem_pool_host", None) if ctrl is not None else None
         return int(getattr(pool, "size", 0) or 0)
 
-    def _weg2_carrier_limit_tokens(self) -> int:
-        """The longest prompt a carrier round trip can serve THIS group.
-
-        #1317. The front's own `--carrier-max-tokens` bound, read from the
-        SAME live property the `#915 PREFETCH LIMIT` line prints and the
-        launcher reads to set that flag:
-        `cache_controller.prefetch_capacity_limit`
-        (= `prefetch_capacity_fraction` x host pool size, 0.9 x 30518 = 27466
-        on this rig). Read rather than recomputed on purpose: retyping the 0.9
-        here would be a second bookkeeping of the fraction, and the two sides
-        must agree BY CONSTRUCTION or the band between them is exactly the
-        #1317 defect again.
-
-        Distinct from `_weg2_host_carry_tokens`, which is the RAW pool size:
-        that one bounds what the store can hand back for the UNCACHED extent,
-        this one bounds the WHOLE prompt (the carrier moves the cached prefix
-        too -- measured on boot weg2sn5t, `completed_local=24872` against a
-        client-side `cache_read_input_tokens=24872`, 1:1).
-
-        0 when there is no host tier, which DISABLES the new exemption rather
-        than widening it -- same convention as the sibling.
-        """
-        ctrl = getattr(self.tree_cache, "cache_controller", None)
-        if ctrl is None:
-            return 0
-        return int(getattr(ctrl, "prefetch_capacity_limit", 0) or 0)
-
     def _weg2_store_read_is_pending(self, req) -> bool:
         """Does THIS rank expect a store read for ``req`` that has not landed?
 
@@ -10069,70 +10042,6 @@ class Scheduler(
                     "verdict=exempt_carrier_exceeds host_carry=%d occurrence=%d",
                     str(getattr(req, "rid", "?"))[:16], uncached, x, term, carry,
                     self._weg2_x_exempt,
-                )
-            return False
-        # #1317 THE SECOND EXEMPTION ARM: NO CARRIER ROUTE CAN EXIST AT ALL.
-        #
-        # The arm above fires on `uncached > carry` (the RAW pool size). But
-        # the front's bound is `carrier_max = 0.9 x pool` (27466 vs 30518), so
-        # there is a band where the front can prove no carrier route exists
-        # while `uncached` is still BELOW `carry` and the arm above stays
-        # silent. Measured on boot weg2sn5t, all of these 413'd:
-        #   uncached=11116 total=32549 | 17493 / 47549 | 19741 / 52549
-        # against carry=30518 and carrier_max=27466. Each side was
-        # individually consistent and the two were jointly wrong.
-        #
-        # Same reasoning as the sibling, applied to the whole prompt: a prompt
-        # the carrier cannot move is not served by refusing it here, because
-        # no other group can take it either -- W50 only bounces it around the
-        # wall. And X is the ECONOMIC break-even (`X* = 2*flip_s/(1/r_D -
-        # 1/r_P)`, r_D=1138 tok/s, r_P=4628 tok/s), not a capacity limit: D
-        # served 50732 tokens direct on boot weg2sn5n. So the offer is
-        # admitted above X.
-        #
-        # DERIVED HERE, NOT CARRIED: the limit comes from this group's own
-        # `prefetch_capacity_limit`, so it is as replicated as the verdict it
-        # exempts from and no marker has to survive an HTTP hop -- the rule
-        # the sibling's comment states. A payload flag was built and DELETED
-        # for exactly that reason, and it would have been dead anyway
-        # (`AnthropicMessagesRequest` sets no `model_config`, so pydantic's
-        # `extra="ignore"` silently drops an undeclared field -- see
-        # `anthropic/protocol.py:456`).
-        #
-        # SOFT-RULE EXCEPTION to law 4, named and counted as W68 -- the SAME
-        # code the front's own line carries, so the deviation is countable
-        # end to end from one census key and the user can veto it. The TTFT
-        # estimate lives on the front's W68 line, which owns `r_D`; a second
-        # copy of that rate here would be the second bookkeeping this comment
-        # is otherwise about.
-        # Resolved defensively: a caller/harness that does not carry the
-        # helper gets 0, which DISABLES this arm and restores the pre-#1317
-        # verdict exactly -- the safe direction. (A real Scheduler always has
-        # it; an existing X-gate test binds only the methods the gate used to
-        # need, and breaking that stub is how this was found.)
-        _lim = getattr(self, "_weg2_carrier_limit_tokens", None)
-        carrier_limit = _lim() if callable(_lim) else 0
-        # The WHOLE prompt, the base `carrier_max` is measured against -- the
-        # same term `weg2_uncached_extent` calls `total` before subtracting the
-        # match (`total = len(fill_ids)` there), read defensively so a request
-        # shape without the field cannot raise inside the gate.
-        total_prompt = len(getattr(req, "full_untruncated_fill_ids", ()) or ())
-        if carrier_limit > 0 and total_prompt > carrier_limit and uncached > x:
-            self._weg2_x_exempt_no_carrier = getattr(
-                self, "_weg2_x_exempt_no_carrier", 0
-            ) + 1
-            if (self._weg2_x_exempt_no_carrier <= 5
-                    or self._weg2_x_exempt_no_carrier % 64 == 0):
-                logger.info(
-                    "WEG2 X-GATE rid=%s uncached=%d X=%d replicated_term=%s "
-                    "verdict=exempt_no_carrier_route total=%d carrier_max=%d "
-                    "host_carry=%d occurrence=%d -- W68 Weg2ForcedDirectPrefill: "
-                    "no carrier route exists for this prompt, so it is admitted "
-                    "above X as a D-direct prefill instead of refused by name "
-                    "(X is the economic break-even, not a capacity limit)",
-                    str(getattr(req, "rid", "?"))[:16], uncached, x, term,
-                    total_prompt, carrier_limit, carry,
-                    self._weg2_x_exempt_no_carrier,
                 )
             return False
         verdict = "W31" if uncached > x else "admit"

@@ -8589,8 +8589,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         log("front argv (dry): " + " ".join(shlex.quote(a) for a in front_argv_for(
             py, store_dir, 0, 0, dc_expect_d, cards, ns, chunk_count, 0, p_bs, d_bs, x_tokens,
             flip_min_work_tokens, idle_layout_front, admin_key_file=admin_key_file,
-            anon_preboot_bytes=anon_preboot_bytes,
-            max_kv_per_request=max_kv_per_request)))
+            anon_preboot_bytes=anon_preboot_bytes)))
         log("DRY-RUN complete: nothing started, mounted, armed or written")
         return 0
     state.pids["P"] = spec_p.pid
@@ -8828,7 +8827,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         commit=tip, ledger_arm={"s_gb": arm.s_gb, "m_mib": arm.m_mib},
         admin_key_file=admin_key_file,
         anon_preboot_bytes=anon_preboot_bytes,
-        max_kv_per_request=max_kv_per_request,
     )
     fenv = dict(os.environ)
     fenv["PYTHONPATH"] = f"{tree}/python"
@@ -8880,8 +8878,7 @@ def front_argv_for(py: str, store_dir: str, p_pid: int, d_pid: int, dc_expect_d:
                    measured_record: str = "", commit: str = "",
                    ledger_arm: Optional[Dict[str, float]] = None,
                    admin_key_file: str = "",
-                   anon_preboot_bytes: int = 0,
-                   max_kv_per_request: int = 0) -> List[str]:
+                   anon_preboot_bytes: int = 0) -> List[str]:
     """ONE front argv builder, so --dry-run prints exactly what a real boot runs.
 
     C2/R-6: the front is TOLD the two bs numbers and X. It never asks a
@@ -8899,10 +8896,6 @@ def front_argv_for(py: str, store_dir: str, p_pid: int, d_pid: int, dc_expect_d:
         "--fairness-w-s", str(ns.fairness_w_s),
         "--weight-chunks", str(chunk_count),
         "--carrier-max-tokens", str(carrier_max_tokens),
-        # #1317: the front needs D's per-request cap as the ONE terminal
-        # bound for a forced direct prefill (W68); everything below it is
-        # routed rather than 413'd.
-        "--max-kv-per-request", str(max_kv_per_request),
         "--p-concurrency", str(p_bs),
         "--d-bs", str(d_bs),
         "--tp-prefill-max-tokens", str(x_tokens),

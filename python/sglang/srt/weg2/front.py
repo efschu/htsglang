@@ -739,17 +739,6 @@ X_REFUSAL_NAME = "W50 " + X_REFUSAL_MARKER
 NO_ROUTE_MARKER = "Weg2NoServiceableRoute"
 NO_ROUTE_NAME = "W52 " + NO_ROUTE_MARKER
 
-#: #1317. W68 is free: the used set at this tip is W47-W58, W60-W64, W66, W67,
-#: enumerated with `grep -ohE '\bW[0-9]{2} Weg2[A-Za-z]+'` before choosing
-#: rather than guessed -- the renumbering note above W50 is about exactly that
-#: mistake, and W59/W65 came back non-zero.
-FORCED_DIRECT_MARKER = "Weg2ForcedDirectPrefill"
-FORCED_DIRECT_NAME = "W68 " + FORCED_DIRECT_MARKER
-#: D's measured single-prefill rate, for the TTFT estimate printed on the W68
-#: line. Provenance: the launcher's X PROVENANCE line, `r_D` median of D single
-#: prefills (1138 tok/s on boot weg2sn5t). An estimate, labelled as one.
-FORCED_DIRECT_R_D_TOK_S = 1138.0
-
 #: #1291. W53 is free: the used set is W50/W51/W52, enumerated before
 #: choosing. This names a DIFFERENT fault from W52 on purpose -- W52 is "no
 #: route can serve this", W53 is "the route ran and its result did not reach
@@ -779,8 +768,7 @@ def _d_refusal_extent(body: bytes) -> Optional[int]:
 
 
 def serviceable_route(uncached: int, carrier_est: int, x_tokens: int,
-                      carrier_max: int, carrier_exact: bool = False,
-                      per_request_cap: int = 0) -> str:
+                      carrier_max: int, carrier_exact: bool = False) -> str:
     """#1290: WHICH ROUTE CAN SERVE THIS REQUEST -- decided ONCE, up front.
 
     Returns one of ``short`` / ``long`` / ``carrier_single`` / ``none``.
@@ -837,41 +825,7 @@ def serviceable_route(uncached: int, carrier_est: int, x_tokens: int,
         # to D as before, and the exact count taken at the response
         # (`_note_exact`) makes the NEXT decision on this text terminal.
         # Only a measured `carrier_exact` count refuses.
-        if not carrier_exact:
-            return "carrier_single"
-        # #1317 FORCED DIRECT PREFILL, and it is a SOFT-RULE EXCEPTION to law
-        # 4, named and counted so it can be vetoed from the census (operator
-        # decision 2026-09-10, `Regeln WEICH, abweichen mit Grund`).
-        #
-        # The branch above used to return "none" here -> HTTP 413. Measured on
-        # boot weg2sn5t under a fleet-shape load with a shared agent prefix:
-        # 15 of 24 requests 413'd, and EVERY ONE carried `src=exact`, never
-        # `src=estimate`. So a FIRST-TIME prompt is routed and only the REPEAT
-        # terminates -- a cache hit makes the request WORSE than a cold one,
-        # which is a routing rule, not physics.
-        #
-        # X IS AN ECONOMIC BREAK-EVEN, NOT A CAPACITY LIMIT, and that was
-        # verified before this edit rather than assumed (two earlier premises
-        # in this ticket failed exactly that way). The launcher's own
-        # provenance: `X* = 2*flip_s/(1/r_D - 1/r_P)`, flip_s=2.90,
-        # r_D=1138 tok/s, r_P=4628 tok/s -- the point where P-prefill plus a
-        # carrier round trip becomes cheaper than D prefilling itself. And D
-        # demonstrably prefills far above it: boot weg2sn5n rid weg2-6-9,
-        # `WEG2-SERVED group=D leg=2 status=200 prompt_tokens=50732
-        # cached_tokens=0` with `freed_by=leg2_finished` (no requeue, no P
-        # leg 1) -- 50732 tokens direct, 5.8x above X=8742.
-        #
-        # #1290's invariant ("never routed to a D single prefill") is about D
-        # REFUSING at its gate and the requeue loop that followed; it is not a
-        # statement that D cannot. With no carrier route the slow D-direct
-        # path beats a 413, so the offer is FORCED and D's gate is told to
-        # admit it (the caller sets the flag; D's X gate honours it).
-        #
-        # THE ONE REMAINING TERMINAL is the per-request cap, which is a real
-        # capacity wall rather than an economic one.
-        if per_request_cap > 0 and carrier_est > per_request_cap:
-            return "none"
-        return "forced_direct"
+        return "none" if carrier_exact else "carrier_single"
     if fits_d_prefill:
         return "short"
     # X < uncached <= carrier: THE P ROUTE. This is the verdict that produced
@@ -1452,7 +1406,6 @@ class Front:
     def __init__(self, prefill: str, decode: str, awake: str, tag: str, store_dir: str,
                  prefill_sid: int, decode_sid: int, dc_reserve: Dict[str, int], w_s: float,
                  weight_chunks: int = 0, carrier_max_tokens: int = 0,
-                 max_kv_per_request: int = 0,
                  p_concurrency: int = DEFAULT_P_BS, d_bs: int = DEFAULT_D_BS,
                  tp_prefill_max_tokens: int = X_FALLBACK_TOKENS,
                  flip_min_work_tokens: Optional[int] = None,
@@ -1624,14 +1577,6 @@ class Front:
         # routed to ONE prefill on D instead (no leg 1) -- served, single
         # prefill, and named as the carrier bound it is.
         self.carrier_max_tokens = int(carrier_max_tokens)
-        # #1317: group D's own per-request KV cap, the ONE remaining terminal
-        # bound for a forced direct prefill. 0 = not supplied = NON-terminal:
-        # the front then never 413s on this axis and D's own cap refuses an
-        # oversized prompt at its gate, which is where that authority lives
-        # (same rule as `is_x_refusal`: D's gate is the authority, the front's
-        # number is an estimate). Defaulting to 0 keeps an un-plumbed front
-        # strictly more permissive, never accidentally terminal.
-        self.max_kv_per_request = int(max_kv_per_request)
         self.exact_tokens: Dict[str, int] = {}
         # #1233 fix 8: the DORMANT-IMAGE measurement, one per group at its FIRST
         # sleep.  The launcher takes P's (un-interleaved, before D exists); the
@@ -2340,8 +2285,7 @@ class Front:
         route = serviceable_route(remainder, carrier_est,
                                   self.tp_prefill_max_tokens,
                                   self.carrier_max_tokens,
-                                  carrier_exact=exact is not None,
-                                  per_request_cap=self.max_kv_per_request)
+                                  carrier_exact=exact is not None)
         # THE COMPARED NUMBER IS PRINTED (#1290 round 2). The CARRIER-EXCEEDS
         # line below printed `est_prompt=... exact=None > carrier_max=...`,
         # and NEITHER of those is the value the branch compares -- `est_prompt`
@@ -2389,37 +2333,6 @@ class Front:
                  "carrier_est": carrier_est,
                  "carrier_max": self.carrier_max_tokens},
                 status=413)
-        if route == "forced_direct":
-            # #1317: no carrier route and above X -- forced D-direct offer
-            # instead of the 413 this used to be. Counted under its own
-            # W-code so the deviation is visible in the census and can be
-            # vetoed; the TTFT estimate makes its COST visible per request
-            # rather than only in aggregate.
-            self.counters[f"W68_{FORCED_DIRECT_MARKER}"] += 1
-            _ttft = remainder / FORCED_DIRECT_R_D_TOK_S if FORCED_DIRECT_R_D_TOK_S > 0 else 0.0
-            logger.warning(
-                "%s rid=%s total=%d carrier_max=%d X=%d uncached=%d "
-                "reason=no_carrier_route est_ttft=%.0fs (uncached/r_D=%.0f tok/s, "
-                "D's measured single-prefill rate from the launcher's X PROVENANCE "
-                "line -- an ESTIMATE) -- SOFT-RULE EXCEPTION to law 4 (operator "
-                "2026-09-10): D admits this above X because X is the economic "
-                "break-even, not a capacity limit, and a 413 on an exact-count "
-                "REPEAT of a prompt that served cold is a routing defect. Only "
-                "the per-request cap %d is terminal.",
-                FORCED_DIRECT_NAME, rid, carrier_est, self.carrier_max_tokens,
-                self.tp_prefill_max_tokens, remainder, _ttft,
-                FORCED_DIRECT_R_D_TOK_S, self.max_kv_per_request,
-            )
-            # NO MARKER ON THE REQUEST. D derives the same exemption from the
-            # host pool itself (`_weg2_x_refuses`, "derived here rather than
-            # carried on the request ... no marker has to survive an HTTP hop
-            # to get here"), and a payload flag would be DEAD anyway:
-            # `AnthropicMessagesRequest` and `ChatCompletionRequest` set no
-            # `model_config`, so pydantic's `extra="ignore"` silently drops an
-            # undeclared field -- the very hazard that file warns about at
-            # `anthropic/protocol.py:456`. This W-line is a COUNT, not a
-            # channel.
-            route = "carrier_single"
         if route == "carrier_single":
             self.counters["route_carrier_exceeds"] += 1
             logger.warning("WEG2-ROUTE rid=%s CARRIER-EXCEEDS -> D single prefill carrier_est=%d (%s) > carrier_max=%d "
@@ -4693,12 +4606,6 @@ def main():
                     help="C13/K10: seconds a group may still hold requests before a flip is refused "
                          "by name (W1 -> W2). Today's shipped value, promoted from a literal.")
     ap.add_argument("--weight-chunks", type=int, default=0, help="#1233: number of weights_<k> chunk tags both groups were built with (0 = single weights tag)")
-    ap.add_argument("--max-kv-per-request", type=int, default=0,
-                    help="#1317: group D's per-request KV cap, used ONLY as the terminal bound "
-                         "for a forced direct prefill (W68). 0 = not supplied = never terminal "
-                         "here; D's own gate then refuses an oversized prompt, which is where "
-                         "that authority belongs. Set it to the same value the groups get so a "
-                         "prompt above the cap is refused at admission instead of by round trip.")
     ap.add_argument("--carrier-max-tokens", type=int, default=0,
                     help="#1233 zero-remainder: longest prompt group D can read from the store. "
                          "0 = no CARRIER-EXCEEDS route -- and that is NOT an off switch for the "
@@ -4750,7 +4657,7 @@ def main():
         k, v = kv.split("=")
         dc[k] = int(v)
     front = Front(args.prefill, args.decode, args.awake, args.tag, args.store_dir, args.prefill_sid, args.decode_sid, dc, args.fairness_w_s,
-                  weight_chunks=args.weight_chunks, carrier_max_tokens=args.carrier_max_tokens, max_kv_per_request=args.max_kv_per_request,
+                  weight_chunks=args.weight_chunks, carrier_max_tokens=args.carrier_max_tokens,
                   p_concurrency=args.p_concurrency, d_bs=args.d_bs,
                   tp_prefill_max_tokens=args.tp_prefill_max_tokens,
                   flip_min_work_tokens=args.flip_min_work_tokens,
