@@ -262,7 +262,7 @@ def test_the_host_arm_with_no_checkpoint_REFUSES_and_never_charges_a_default():
     lz = _launcher()
     with pytest.raises(Exception) as e:
         lz.xchg_bounce_terms_for_arm("shadow", "host", "")
-    assert "W74" in str(e.value), str(e.value)
+    assert "W88" in str(e.value), str(e.value)  # W74 is Weg2XchgSourceMissing's
     with pytest.raises(cc.Weg2XchgWidestLayerUnreadable):
         lz.xchg_bounce_terms_for_arm("shadow", "host", "/nonexistent/ckpt")
 

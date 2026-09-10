@@ -4264,7 +4264,13 @@ def test_the_launcher_charges_the_deposit_only_on_an_armed_boot():
     # is provable without a host to read -- see
     # `test_the_deposit_is_charged_only_on_the_arm_that_can_allocate_it`.
     src = inspect.getsource(lc.choose_host_ledger)
-    assert "xchg_bounce_host_bytes=xchg_bounce_charge_bytes(" in src, src
+    # #1332 B1b: the kwarg is now fed by `xchg_bounce_terms_for_arm`, which
+    # keeps `xchg_bounce_charge_bytes` as its predicate (asserted below and in
+    # the test above).  The property this line defends is that the ledger's
+    # `xchg_bounce_host_bytes` comes from THE ARM DECISION and never from a
+    # constant -- so it names the producer that now feeds it.
+    assert "xchg_bounce_host_bytes=_bounce_charge_bytes" in src, src
+    assert "xchg_bounce_terms_for_arm(" in src, src
     predicate = inspect.getsource(lc.xchg_bounce_charge_bytes)
     assert "host_ledger.xchg_bounce_bytes()" in predicate, predicate
     assert "WEIGHT_SOURCE_DEFAULT" in predicate, predicate
@@ -4458,8 +4464,17 @@ def test_the_deposit_is_charged_only_on_the_arm_that_can_allocate_it():
     from sglang.srt.weg2 import launcher as lc
 
     assert "oncard_mode" in inspect.signature(lc.choose_host_ledger).parameters
-    assert "xchg_bounce_charge_bytes(weight_source" in \
+    # #1332 B1b MOVED THE SEAM, and this pin follows it rather than being
+    # deleted.  The ledger call site now asks `xchg_bounce_terms_for_arm`,
+    # which asks THIS function for the predicate ("does this arm pin host
+    # bytes") and adds only the SIZE (the measured widest layer).  So the arm
+    # still decides the charge at the one call site, and there is still exactly
+    # one reader of the arm strings -- the assertion is that both halves are
+    # wired, not that the older name appears in the older place.
+    assert "xchg_bounce_terms_for_arm(" in \
         inspect.getsource(lc.choose_host_ledger)
+    assert "xchg_bounce_charge_bytes(weight_source" in \
+        inspect.getsource(lc.xchg_bounce_terms_for_arm)
     main_src = inspect.getsource(lc.main)
     assert "oncard_mode=ns.weg2_xchg_oncard" in main_src, \
         "the arm must reach BOTH the ledger call site and the shadow env"

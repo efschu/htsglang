@@ -4406,13 +4406,22 @@ def xchg_bounce_terms_for_arm(weight_source: str, oncard_mode: str,
     that cannot be assembled whole cannot be sliced by its destinations, and
     finding that out mid-flip means finding it out after VRAM was mutated.
     """
-    if str(weight_source) == WEIGHT_SOURCE_DEFAULT:
-        return 0, []
-    if str(oncard_mode) != weight_exchange_transport.ONCARD_MODE_HOST:
+    # ONE AUTHORITY FOR THE PREDICATE, and it is the OLDER function.
+    # `xchg_bounce_charge_bytes` already answers "does this arm pin host bytes
+    # at all" and is pinned by two tests in test_weg2_xchg_shadow_1273; asking
+    # it here instead of re-deciding the arm strings keeps that single reader
+    # (upstream-minimal: a second copy of a predicate is the defect class this
+    # fork keeps paying for).  What B1b adds is the SIZE, not the predicate.
+    if xchg_bounce_charge_bytes(weight_source, oncard_mode,
+                                oncard_slot_mib) <= 0:
         return 0, []
     if not str(model_dir or "").strip():
-        raise xchg_bounce.Weg2XchgBounceUnderCovered(
-            "W74 Weg2XchgWidestLayerUnreadable: the host on-card arm pins a "
+        # THE EXCEPTION MATCHES THE CODE IT PRINTS.  The first draft raised
+        # `Weg2XchgBounceUnderCovered` while naming W88's exception in the
+        # text, which is the "instrument text lies" shape one level down: a
+        # reader greps the name and lands on a class that was never raised.
+        raise checkpoint_census.Weg2XchgWidestLayerUnreadable(
+            "W88 Weg2XchgWidestLayerUnreadable: the host on-card arm pins a "
             "host bounce whose size is the WIDEST layer of this boot's "
             "checkpoint, and no checkpoint path reached this call site. "
             "Refused rather than sized against a default"
