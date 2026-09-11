@@ -3484,6 +3484,97 @@ def teardown_xchg_region(log: Log, boot_nonce: str) -> Dict[str, int]:
     return weight_exchange_region.teardown_region(boot_nonce, log=log)
 
 
+
+def xchg_form_argv(argv: Sequence[str], weight_source: str) -> List[str]:
+    """Group P's form argv, PLUS the xchg token when this boot arms the exchange.
+
+    B4e, and ``ring_table`` wrote the requirement at the name it defined for
+    it: *"when the xchg slice lands on the line its launcher must add the same
+    token to the argv it hands ``solve`` (one line, ``p_argv +
+    [XCHG_FORM_TOKEN]``), or its own boots will rank a serving source as their
+    form's twin -- the mirror of this defect."*  The slice has landed and the
+    token was missing, so #1305 item 4 -- written to keep an xchg source away
+    from a boot that does NOT arm the exchange -- was excluding every boot of
+    this form from the selection of a boot that DOES.
+
+    MEASURED cost of the omission, 2026-09-11: B4c's census took group P's
+    per-card rows from a boot that ran the PP layer split ``[42, 11, 11]``
+    while the armed form runs ``[39, 13, 12]``, because every boot that ran the
+    armed split carries ``WEG2-XCHG-REGION`` and was excluded.  P's rows are a
+    LAYER PLACEMENT, so that is not a rounding difference.
+
+    THE PREDICATE IS ``WEIGHT_SOURCE_ARMED``, not a hand-written comparison,
+    and that is the whole design of it: the same derived tuple decides whether
+    ``prepare_xchg_env`` publishes the region at all, so the MARKER this boot
+    emits and the TOKEN it claims cannot disagree, and a future arm carries
+    both by construction.  A hand comparison here is exactly how ``exchange``
+    was missed at step 7.
+    """
+    out = list(argv)
+    if str(weight_source) in WEIGHT_SOURCE_ARMED:
+        out.append(ring_table.XCHG_FORM_TOKEN)
+    return out
+
+
+#: B4e (ii): the refusal is W48's, and NO new code is minted for it.  W48
+#: ``Weg2RingFormMismatch`` IS "form key X != source Y" -- the launcher already
+#: raises that class for its own un-priceable argv -- and the W-code census
+#: keys on (code, NAME) pairs, so a second name under W48 would be a new
+#: collision while a new number would be a second spelling of one event.
+Weg2XchgFormSourceMissing = ring_table.Weg2RingFormMismatch
+
+
+def refuse_unless_same_form_source(
+    table: Optional["ring_table.RingTable"], weight_source: str
+) -> None:
+    """Under an armed arm, a table solved from ANOTHER form is a refusal.
+
+    The token above stops #1305 item 4 from excluding this form's own boots --
+    and by doing so it also removes the thing that used to make the absence
+    LOUD.  With the token on, ``solve`` simply falls through to the form-DISTANCE
+    ranking and returns the closest twin, silently, which is the foreign-split
+    defect one layer down: the ring's residual, the ledger's charge and (via
+    ``weg2/xchg_census.py``) group P's per-card placement would all be a
+    measurement of a form this boot does not run.
+
+    So the launcher refuses, and PRINTS THE CLOSEST TWIN IT REJECTED -- the
+    selected boot IS the closest twin, because the distance ranking put it
+    first -- together with both form keys and the term-level difference, so the
+    next reader knows which boot to produce rather than which number to lower.
+
+    THREE NON-CASES, each deliberate:
+      * ``table is None``: ``prepare_host_ring`` has already refused (R22/W20)
+        for a reason of its own; a second refusal here would bury it.
+      * the DEFAULT arm: a serving boot has no same-form requirement -- that is
+        #1305 item 4's whole subject, and acceptance (iii) is that its
+        selection does not move.
+      * ``form_same is None``: the form gate never ran, and an unarmed gate is
+        never read as a passed one (``solve``'s own words).  It refuses.
+    """
+    if table is None or str(weight_source) not in WEIGHT_SOURCE_ARMED:
+        return None
+    if getattr(table, "form_same", None) is True:
+        return None
+    unarmed = getattr(table, "form_same", None) is None
+    raise Weg2XchgFormSourceMissing(
+        f"W48 Weg2RingFormMismatch: --weg2-weight-source {weight_source} arms the "
+        f"exchange, so this boot's group-P form carries {ring_table.XCHG_FORM_TOKEN} "
+        f"and its ring table must be solved from a boot of the SAME form.  "
+        + ("The form gate did not run at all, so no source can be called same-form. "
+           if unarmed else
+           f"The closest twin the ranking could offer is boot {table.boot}, whose "
+           f"form key is {table.source_form_key} against this boot's "
+           f"{table.form_key}: {table.form_diff}.  ")
+        + "There is NO fallback: a chunk tag is a LAYER BAND, so a source of "
+        "another PP form states group P's bytes on the wrong cards, and the "
+        "ring's residual, the ledger's charge and the exchange census would "
+        "each be a measurement of a form this boot does not run (MEASURED "
+        "2026-09-11: source split [42, 11, 11] against this form's "
+        "[39, 13, 12]).  Boot the arm once to produce the first same-form "
+        "source, or pin one with --ring-table-boot."
+    )
+
+
 def prepare_weight_exchange(
     cards: List[Card],
     log: Log,
@@ -9215,14 +9306,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     draft_kv_on_p = ns.draft_kv_on_p == "on"
     if not draft_kv_on_p:
         log(draft_kv_off_line())
-    form_argv_p = argv_p(
+    # B4e: ONE form argv, built with the xchg token when the arm is armed, and
+    # used for BOTH the key this line prints and the argv `solve` is handed --
+    # so the printed provenance IS the form that was selected on, token
+    # included, and the two cannot drift.
+    form_argv_p = xchg_form_argv(argv_p(
         py, ns.model, budgets_p, RING_FORM_SENTINEL_S_GB, RING_FORM_SENTINEL_M_MIB,
         RING_FORM_SENTINEL_STORE_CFG, shlex.split(ns.extra_p), p_bs, max_kv_per_request,
         stage_ratio, attn_stage_ratio, ns.p_hicache_write_policy,
         RING_FORM_SENTINEL_DEPTH, ns.p_barlink_bar1_window_mib, ns.random_seed,
         ns.barlink_bar1_cap_cycles, ns.collective_census_interval,
         draft_kv_on_p, p_max_total_tokens=int(cut.pool_tokens),
-    )
+    ), ns.weg2_weight_source)
     form_key, form_norm = ring_table.p_form_key(form_argv_p)
     log(
         f"WEG2-P-FORM key={form_key} -- the identity of what group P LOADS, "
@@ -9242,6 +9337,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ring_plan = prepare_host_ring(cards, log, ns.tag, ns.ring_form, ns.evidence_dir,
                                   ns.ring_table_boot, dry, duplex_probe=ns.duplex_probe,
                                   tree=tree, py=py, p_argv=form_argv_p)
+    # B4e (ii): with the token on, an absent same-form source is no longer an
+    # EXCLUSION but a silent fall-through to the closest twin -- refuse here,
+    # before either group starts, with the twin printed.
+    refuse_unless_same_form_source(ring_plan.table, ns.weg2_weight_source)
     state.ring_lines = ring_plan.lines
     state.ring_epoch = str(ring_plan.epoch)
     # A1-3: an un-armed ring has no fallback form to name.  The predecessor
