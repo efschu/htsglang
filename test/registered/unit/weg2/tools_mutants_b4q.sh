@@ -141,6 +141,14 @@ python3 - "$BX" <<'EOF'
 import sys; p=sys.argv[1]; s=open(p).read()
 s=s.replace("        mode=mode,\n", "", 1); open(p,'w').write(s)
 EOF
+# M10 SURVIVED on its first run (measured 2026-09-11) and the test was fixed,
+# not the mutant: `test_the_mode_travels_from_the_one_validated_source` pinned
+# the wiring with `assertIn("mode=mode,", src)`, and `run_bounce_leg` ALSO
+# contains `InjectVerdict(mode=mode, ...)` (:887) -- so deleting the
+# BounceResult keyword left the substring in place. Seat 5's M5 precedent
+# exactly: a text-scan pin on wiring breaks on the second occurrence. The
+# assertion now walks the AST to the BounceResult call and checks ITS keywords;
+# re-measured after the fix: 34 passed -> 1 failed / 33 passed -> 34 passed.
 run "M10 the mode stops travelling from its one source" RED "$T"
 
 # ---- B4r, the instrument that must not be a constant ------------------

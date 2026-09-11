@@ -591,15 +591,39 @@ class TestTheInjectInstrumentNeverLiesTowardsAuthority(CustomTestCase):
         self.assertIn("self.mode", " ".join(mode_lines))
 
     def test_the_mode_travels_from_the_one_validated_source(self):
-        """``run_bounce_leg`` validates and refuses; the result carries THAT
+        """``run_bounce_leg`` validates and refuses; the RESULT carries THAT
         value. One authority, which is what makes the instrument readable as
-        evidence at all."""
+        evidence at all.
+
+        PINNED BY AST, and the first cut of this test is why. It read
+        ``assertIn("mode=mode,", src)`` -- and ``run_bounce_leg`` ALSO
+        contains ``InjectVerdict(mode=mode, ...)``, so deleting the
+        ``BounceResult`` keyword left the substring in place and the mutant
+        that removes it SURVIVED (harness M10, measured). That is seat 5's M5
+        precedent exactly: a text-scan pin on wiring breaks on the second
+        occurrence. So the assertion now walks to the ``BounceResult(...)``
+        call itself and checks ITS keywords.
+        """
         from sglang.srt.weg2 import weight_exchange_bounce as bx
 
         src = inspect.getsource(bx.run_bounce_leg)
         self.assertIn("comparing = mode == wx.INJECT_SHADOW", src)
-        self.assertIn("mode=mode,", src)
         self.assertIn("Refused rather than defaulted", src)
+
+        tree = ast.parse(inspect.cleandoc(src))
+        fn = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef))
+        ctors = [n for n in ast.walk(fn) if isinstance(n, ast.Call)
+                 and getattr(n.func, "id", "") == "BounceResult"]
+        self.assertEqual(len(ctors), 1,
+                         "expected exactly one BounceResult construction")
+        kwargs = {k.arg: ast.unparse(k.value) for k in ctors[0].keywords}
+        self.assertIn("mode", kwargs,
+                      "BounceResult is built without a mode: the line would "
+                      "fall back to the named unset state for a leg that DID "
+                      "run one of the two real modes")
+        self.assertEqual(kwargs["mode"], "mode",
+                         "the mode must be the validated parameter itself, "
+                         f"not {kwargs['mode']!r}")
 
     def test_an_unset_mode_cannot_be_read_as_authority_by_the_grader(self):
         """The grading plan's own question: does this line prove authority did
