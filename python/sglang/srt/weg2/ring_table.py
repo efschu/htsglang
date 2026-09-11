@@ -1512,6 +1512,28 @@ class GroupLog:
     lines_read: int = 0
     instrument: str = ""
     tag_totals: Dict[str, int] = field(default_factory=dict)
+    #: #1273 B4c: the per-rank peaks ``tag_totals`` is the SUM of, RETAINED.
+    #: ``tag -> {rank: MiB}``, and the caller re-keys rank to card exactly as it
+    #: re-keys ``image``/``max_tag`` (``solve``'s ``rows``).  It exists because
+    #: the S6 exchange census is a statement per CARD per TAG per GROUP
+    #: (``xchg_residency.CardCensus.tags``) and the summation below threw the
+    #: per-rank half away, so ``--weg2-weight-source exchange`` had no census
+    #: producer at all and refused at launch (W71).
+    #:
+    #: IT IS A STRICT SUPERSET OF ``tag_totals``' KEYS, deliberately: it keeps
+    #: the family BASE tag, which ``tag_totals`` drops via
+    #: :func:`_family_roots`.  That drop is correct for what ``tag_totals``
+    #: IS -- a corridor STEP SIZE, where a family root is a bulk record and not
+    #: a step -- and wrong for a census, and the difference is MEASURED, not
+    #: argued: on boot weg2sn5b the sum of every single-tag peak equals that
+    #: rank's image EXACTLY on all six ranks (P 4988/8984/17510, D
+    #: 7136/7136/18608), so under the ring-era instrument ``weights`` carries
+    #: its own remainder (embeddings, head, draft, buffers) and is not a second
+    #: spelling of the family.  A census built without it would be 203-2606 MiB
+    #: per card short and would then be refused by
+    #: ``xchg_residency.check_partition`` for naming a wave tag it has no bytes
+    #: for -- which is the right refusal for the wrong reason.
+    tag_by_rank: Dict[str, Dict[int, int]] = field(default_factory=dict)
     #: True when ``instrument`` names EVERY backed-up tag (C16's WEG2-FLIP-TAG),
     #: False when it names the weights family alone and the census is therefore
     #: a lower bound on the dormant image.
@@ -1642,6 +1664,12 @@ def parse_group_log(path: str) -> GroupLog:
     image: Dict[int, int] = {}
     max_tag: Dict[int, int] = {}
     tag_peak: Dict[str, Dict[int, int]] = {}
+    # #1273 B4c: the SAME peaks, kept one filter EARLIER -- before the family
+    # roots are dropped -- because the census needs the base tag's own bytes
+    # and ``tag_peak`` provably does not carry them (see ``GroupLog``).  Two
+    # dicts rather than one filtered view so that nothing about ``tag_peak``,
+    # ``tag_totals`` or ``max_tag`` changes by a byte.
+    tag_by_rank: Dict[str, Dict[int, int]] = {}
     for rank, records in per_rank.items():
         # PEAK pass, never the mean (a ring sized to a mean blocks on the
         # larger pass); population = the passes actually logged.
@@ -1657,6 +1685,10 @@ def parse_group_log(path: str) -> GroupLog:
             slot = tag_peak.setdefault(tag, {})
             if mib > slot.get(rank, 0):
                 slot[rank] = mib
+        for tag, mib in singles:
+            cell = tag_by_rank.setdefault(tag, {})
+            if mib > cell.get(rank, 0):
+                cell[rank] = mib
     kv_mib = {r: int(round(gb * GB / MIB)) for r, gb in kv_gb.items()}
     # One tag is ONE RPC of the front's interleave and its shards land on every
     # card at once, so the step the host must hold in flight is the sum over
@@ -1670,6 +1702,7 @@ def parse_group_log(path: str) -> GroupLog:
         lines_read=lines_read,
         instrument=instrument,
         tag_totals=tag_totals,
+        tag_by_rank=tag_by_rank,
         covers_all_backed_up_tags=covers_all,
     )
 
