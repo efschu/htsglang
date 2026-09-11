@@ -315,3 +315,33 @@ def test_the_comparison_gate0_check_carries_is_the_one_the_slack_needs():
     assert "ABSENT" in src, "an absent census must not become a quiet zero"
     assert "delta=" in src, "a refusal without the delta is not actionable"
     assert "write_matrix_verdict" in src, "the verdict must reach the other five"
+
+
+def test_the_vote_predicate_REJECTS_an_ok_verdict():
+    """MUTANT R4's lesson: a FLOOR catches a narrowed predicate, never a widened
+    one.  Dropping the ``is False`` literal check made the census match every
+    ``write_matrix_verdict(...)`` call and the floor still passed -- a refusal
+    census that counts an OK verdict as a refusal.
+
+    The tree has no counter-example to pin it against: there is exactly ONE
+    production call site (``weight_exchange_region.py:1550``) and it passes
+    ``False``.  So the predicate is pinned against a SYNTHETIC pair instead,
+    which tests the predicate rather than the tree -- the only way to bound a
+    classifier whose negative case does not exist upstream.
+    """
+    src = (
+        "def refuses(region, row):\n"
+        "    region.write_matrix_verdict(row, False)\n"
+        "def approves(region, row):\n"
+        "    region.write_matrix_verdict(row, True)\n"
+        "def unknown(region, row, ok):\n"
+        "    region.write_matrix_verdict(row, ok)\n"
+    )
+    sites: collections.defaultdict = collections.defaultdict(list)
+    refs: collections.Counter = collections.Counter()
+    _Scan("<synthetic>", sites, refs, {}).visit(ast.parse(src))
+    owners = [o for (_, _, o) in sites[FORM_VOTE]]
+    assert owners == ["refuses"], (
+        f"the vote predicate classified {owners} -- only an explicit False "
+        f"literal is a refusal; True is an approval and a variable is neither"
+    )
