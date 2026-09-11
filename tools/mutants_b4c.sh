@@ -170,5 +170,19 @@ m "M15 tag_totals is fed from singles (the byte-identity breaks)" "$RT" \
   '        for tag, mib in steps:' \
   '        for tag, mib in singles:'
 
+# --- the danger direction: a foreign layer placement read as this form's ----
+m "M16 an unequal split is reported as a match" "$CE" \
+  '    if src == mine:' \
+  '    if True:'
+m "M17 an incomparable form is bounded instead of refused" "$CE" \
+  '    if len(src) != len(mine) or src_chunk != my_chunk or src_layers != my_layers:' \
+  '    if False:'
+m "M18 the bound loses its direction" "$CE" \
+  "        f\" -> {'OVER' if d > 0 else 'UNDER'}-priced by {abs(d)} layer(s)\"" \
+  '        " -> differs"'
+m "M19 the split note never reaches the census" "$CE" \
+  '        + ("; " + form_note if form_note else "")' \
+  "        + \"\""
+
 echo "BASELINE AFTER: $(run)"
 verify_all

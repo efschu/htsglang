@@ -341,9 +341,12 @@ class TheSelectionIsTheLaunchersNotThisModules(CustomTestCase):
 
     def test_the_selection_oracle_accepts_an_agreeing_stem(self):
         d, stem = _rig()
+        # A REAL reference front log always states its realized layer split,
+        # and the census refuses one that does not -- so the fixture carries it.
         oracle = _write(d, "ref.front.log", [
             "[2026-09-11T02:50:08Z] WEG2-LAUNCH WEG2-HOST-RING SOURCE solved from "
             f"{stem} (form DIFFERENT, source key e3fe683c5d40)\n",
+            ORDER_MAP_LINE,
         ])
         build = xchg_census.build_census(
             CARDS, d, family=FAMILY, n_cards=3, tool_sha="s",
@@ -496,3 +499,75 @@ class TheCliTurnsARefusalIntoAnExitCode(CustomTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TheSourcesLayerPlacementIsStatedNotAssumed(CustomTestCase):
+    """Group P's per-card rows are a LAYER PLACEMENT, so the split matters.
+
+    MEASURED and the reason this class exists: the ring table's selected source
+    ran ``[42, 11, 11]`` while the form being armed runs ``[39, 13, 12]``, so
+    P's rows were a different form's placement -- and nothing said so.
+    """
+
+    def _front(self, split, layers=64, per_chunk=8, tags="{'weights_0': [1]}"):
+        d = tempfile.mkdtemp()
+        return _write(d, "f.front.log", [
+            ORDINAL_MAP,
+            "[2026-09-11T02:50:12Z] WEG2-LAUNCH WEG2-FLIP-ORDER MAP group=P (SOLVED "
+            f"cut x -> REALIZED layer split [{split}] over {layers} layers, "
+            f"{per_chunk} layers per chunk, nvml [1, 0, 2] in stage order): {tags}\n",
+        ])
+
+    def test_an_equal_split_says_it_is_a_measurement_of_this_form(self):
+        note = xchg_census.split_note(
+            self._front("39, 13, 12"), self._front("39, 13, 12"))
+        self.assertIn("SPLIT MATCHES", note)
+        self.assertNotIn("BOUND", note)
+
+    def test_a_different_split_is_a_bound_with_its_direction_per_stage(self):
+        note = xchg_census.split_note(
+            self._front("42, 11, 11"), self._front("39, 13, 12"))
+        self.assertIn("SPLIT DIFFERS", note)
+        self.assertIn("BOUND", note)
+        self.assertIn("stage 0 (card ordinal 0): source 42 layers", note)
+        self.assertIn("OVER-priced by 3 layer(s)", note)
+        self.assertIn("stage 1", note)
+        self.assertIn("UNDER-priced by 2 layer(s)", note)
+        self.assertIn("UNDER-priced by 1 layer(s)", note)
+
+    def test_an_incomparable_form_refuses_rather_than_bounding(self):
+        for src, mine in (("42, 22", "39, 13, 12"),):
+            with self.assertRaises(xchg_residency.Weg2XchgResidencyUnarmable) as caught:
+                xchg_census.split_note(self._front(src), self._front(mine))
+            self.assertIn("not comparable", str(caught.exception))
+
+    def test_a_different_chunk_geometry_refuses_too(self):
+        with self.assertRaises(xchg_residency.Weg2XchgResidencyUnarmable):
+            xchg_census.split_note(
+                self._front("39, 13, 12", per_chunk=16),
+                self._front("39, 13, 12", per_chunk=8))
+
+    def test_a_source_with_no_split_line_is_a_bound_of_unstated_direction(self):
+        d = tempfile.mkdtemp()
+        bare = _write(d, "bare.front.log", [ORDINAL_MAP])
+        note = xchg_census.split_note(bare, self._front("39, 13, 12"))
+        self.assertIn("SPLIT UNKNOWN", note)
+        self.assertIn("UNVERIFIED", note)
+
+    def test_no_form_reference_at_all_refuses(self):
+        d = tempfile.mkdtemp()
+        bare = _write(d, "bare.front.log", [ORDINAL_MAP])
+        with self.assertRaises(xchg_residency.Weg2XchgResidencyUnarmable):
+            xchg_census.split_note(self._front("39, 13, 12"), bare)
+
+    def test_the_note_reaches_the_census_provenance(self):
+        d, stem = _rig(front_extra=(ORDER_MAP_LINE,))
+        front = os.path.join(d, f"{stem}.front.log")
+
+        class Table:
+            boot = stem
+
+        build = xchg_census.build_census(
+            CARDS, d, family=FAMILY, n_cards=3, tool_sha="s",
+            solver=lambda *a, **k: (Table(), ""), wave_map_from=front)
+        self.assertIn("SPLIT MATCHES", build.provenance)

@@ -446,6 +446,104 @@ def wave_map_from_front(front_log: str) -> Tuple[Dict[str, Tuple[int, ...]], str
     )
 
 
+def realized_split(front_log: str) -> Tuple[List[int], int, int]:
+    """``(layer split, n_layers, layers per chunk)`` a boot actually ran."""
+    try:
+        with open(front_log, errors="replace") as fh:
+            found = next((m for m in (_ORDER_MAP_RE.search(ln) for ln in fh) if m), None)
+    except OSError as exc:
+        raise _refuse(f"front log {front_log!r} unreadable: {exc}")
+    if found is None:
+        return [], 0, 0
+    return (
+        [int(x) for x in found.group(1).split(",") if x.strip()],
+        int(found.group(2)),
+        int(found.group(3)),
+    )
+
+
+def split_note(source_front: str, form_front: str) -> str:
+    """What the SOURCE boot's PP split says about the census it produced.
+
+    THE ONE PLACE WHERE THE CENSUS IS NOT A MEASUREMENT OF THE ARMED FORM, and
+    it must not be discovered by a reader who compares two log lines.  Group
+    P's per-card, per-tag bytes are a LAYER PLACEMENT: a chunk tag is a layer
+    band, and which card holds that band is the PP split.  Group D is a TP
+    group and holds a shard of every layer, so its half is split-independent.
+
+    MEASURED 2026-09-11, and it is why this function exists: the ring table's
+    selected source ran ``[42, 11, 11]`` while the form being armed runs
+    ``[39, 13, 12]``.  Every boot that ran the armed split carries the xchg
+    marker and is therefore EXCLUDED from the selection by #1305 item 4 -- an
+    exclusion written for a boot that does not itself arm the exchange, applied
+    to one that does, because ``ring_table``'s own note predicted exactly this
+    and the launcher has not yet done what the note prescribes (*"when the xchg
+    slice lands on the line its launcher must add the same token to the argv it
+    hands solve ... or its own boots will rank a serving source as their form's
+    twin -- the mirror of this defect"*).  So the mismatch is the visible end
+    of an open defect, and closing it is a launcher change with consequences
+    for every S6 boot's ledger -- reported, not taken here.
+
+    Carried as a BOUND WITH ITS DIRECTION, which is the ring table's own W48
+    pattern (carry the term across a form change and NAME the difference), and
+    the direction is what makes it safe to carry: the stage whose layer count
+    the source OVERSTATES is priced high (conservative) and the ones it
+    understates are priced low by the number of layers named here, so a reader
+    can bound the error in layers without re-deriving anything.  A form that is
+    not comparable at all -- a different stage count or chunk geometry --
+    REFUSES instead, because then no per-stage delta can be stated.
+    """
+    src, src_layers, src_chunk = realized_split(source_front)
+    mine, my_layers, my_chunk = realized_split(form_front)
+    if not mine:
+        raise _refuse(
+            f"the form reference {form_front!r} states no realized layer split, "
+            "so the census cannot even say whether its source measured this "
+            "form's layer placement"
+        )
+    if not src:
+        return (
+            f"SPLIT UNKNOWN: the source boot logged no realized layer split, so "
+            f"whether its group-P per-card placement is this form's "
+            f"({mine}) is UNVERIFIED -- treat P's per-card rows as a bound of "
+            "unstated direction"
+        )
+    if len(src) != len(mine) or src_chunk != my_chunk or src_layers != my_layers:
+        raise _refuse(
+            f"the source boot's form is not comparable to the one being armed: "
+            f"split {src} over {src_layers} layers at {src_chunk} per chunk "
+            f"against {mine} over {my_layers} at {my_chunk}.  A per-stage layer "
+            "delta is the only thing that bounds the group-P placement error, "
+            "and it cannot be stated across a different stage count or chunk "
+            "geometry"
+        )
+    if src == mine:
+        return (
+            f"SPLIT MATCHES: the source ran this form's layer split {mine}, so "
+            "group P's per-card rows are a measurement of this form's placement"
+        )
+    delta = [s - m for s, m in zip(src, mine)]
+    per_stage = ", ".join(
+        f"stage {i} (card ordinal {i}): source {s} layers vs this form {m}"
+        f" -> {'OVER' if d > 0 else 'UNDER'}-priced by {abs(d)} layer(s)"
+        for i, (s, m, d) in enumerate(zip(src, mine, delta))
+        if d
+    )
+    return (
+        f"SPLIT DIFFERS AND GROUP P IS THEREFORE A BOUND: the source ran {src}, "
+        f"this form runs {mine}.  A chunk tag is a LAYER BAND, so P's per-card "
+        f"rows describe the source's placement, not this one's; group D is TP "
+        f"and its rows are split-independent.  Per stage: {per_stage}.  A layer "
+        "of this checkpoint is 387 MiB at the mean and 721 MiB at the widest "
+        "(weg2/checkpoint_census.py, boot-measured), so the error is bounded by "
+        "that many layers on the stages named.  ROOT, not a property of this "
+        "census: every boot that ran this form's split carries the xchg marker "
+        "and is excluded from the ring table's selection by #1305 item 4, "
+        "because the launcher does not hand solve() the XCHG_FORM_TOKEN that "
+        "ring_table's own note prescribes once the xchg slice is on the line"
+    )
+
+
 def resolve_wave_map(arm: str, front_log: str) -> Tuple[Dict[str, Tuple[int, ...]], str]:
     """The wave map of one named arm, with the arm's own provenance sentence."""
     if arm == "ranks":
@@ -493,6 +591,7 @@ def census_from_logs(
     wave_map: Optional[Dict[str, Tuple[int, ...]]] = None,
     wave_provenance: str = "",
     waves_of: Optional[Callable] = None,
+    form_note: str = "",
 ) -> CensusBuild:
     """The census of ONE named boot, with the selection already made.
 
@@ -585,6 +684,7 @@ def census_from_logs(
         "-> CUDA ordinal map, never by position; waves from "
         f"weight_exchange.derive_waves over {wave_provenance or 'the UNIFORM wave map'}"
         "; dormant residue per card as stated in its own dormant_source"
+        + ("; " + form_note if form_note else "")
         + ("; " + " | ".join(bounds) if bounds else "")
     )
     return CensusBuild(
@@ -682,11 +782,18 @@ def build_census(
     # cut the boot being ARMED will run, so it is read from the reference log of
     # THIS form (``--form-from``) and never from the ring-table stem, which is
     # an older boot chosen for its BYTES.
-    mapping, wave_why = resolve_wave_map(wave_map_arm, wave_map_from or selection_oracle)
+    form_ref = wave_map_from or selection_oracle
+    mapping, wave_why = resolve_wave_map(wave_map_arm, form_ref)
+    # WHETHER THE SOURCE MEASURED THIS FORM'S LAYER PLACEMENT AT ALL, stated in
+    # the file rather than left to a reader comparing two log lines.
+    note = split_note(front, form_ref) if form_ref else (
+        "SPLIT UNCHECKED: no form reference was given, so nothing states whether "
+        "the source boot's group-P placement is this form's"
+    )
     return census_from_logs(
         cards, evidence_dir, stem,
         family=family, n_cards=n_cards, selection=selection, tool_sha=tool_sha,
-        wave_map=mapping, wave_provenance=wave_why,
+        wave_map=mapping, wave_provenance=wave_why, form_note=note,
     )
 
 
