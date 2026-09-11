@@ -123,6 +123,21 @@ N_GROUPS = 2
 N_CARDS = 3
 N_RANKS = N_GROUPS * N_CARDS
 
+#: THE LAUNCHER'S CARD ORDER, published into every rank's environment. #1336.
+#:
+#: Comma-separated GPU UUIDs; **the index IS the card ordinal** that
+#: :data:`CROSS_PAIRS`, :func:`rank_row` and the semaphore names address.  The
+#: launcher publishes it beside the other xchg variables on the shadow and
+#: exchange arms (the ring publishes nothing) and the re-exec'd scheduler
+#: children inherit it.  Named here and read here, once: the launcher publishes
+#: what this module reads, and a retyped literal is how two ends drift.
+#:
+#: NOT ``CUDA_VISIBLE_DEVICES``, and that distinction cost boot weg2xsn11:
+#: measured from ``/proc/<pid>/environ``, every ``sglang::scheduler`` process --
+#: the one that runs the flip leg -- has CVD narrowed to its OWN SINGLE CARD,
+#: while only the parent ``launch_server`` keeps all three.
+ENV_CARD_UUIDS = "SGLANG_WEG2_XCHG_CARD_UUIDS"
+
 #: The six DIRECTED cross-card pairs.  On-card traffic takes the IPC lane and
 #: never a staging slot (spec section 2.2 / S4), so the diagonal is absent.
 CROSS_PAIRS: Tuple[Tuple[int, int], ...] = (
@@ -376,23 +391,40 @@ class Weg2XchgCardUuidMapUnusable(RuntimeError):
     input declared with an unusable default is a defect of its own; the answer
     is a producer plus this refusal, never a padded or truncated map.
 
-    WHY THIS MODULE OWNS THE MAP.  The launcher builds
-    ``CUDA_VISIBLE_DEVICES`` as ``",".join(c.uuid for c in cards)`` and hands
-    the SAME string to every rank of BOTH groups (``launcher.py``'s
-    ``build_env``) for exactly one reason, which this module's own header
-    states: *rank n of either group runs on ``cards[n]``*.  The card ordering
-    is this module's invariant, so "which uuid is card n" is read here, once,
-    and nowhere else -- one job, one mover.
+    WHY THIS MODULE READS IT AND THE LAUNCHER PUBLISHES IT (#1336, operator
+    ruling).  The card ORDER is the launcher's fact -- it is the order in which
+    the launcher enumerated the cards -- and this module's invariant is that
+    *rank n of either group runs on ``cards[n]``*.  So the launcher publishes
+    :data:`ENV_CARD_UUIDS` and this is the one place it is read: one producer,
+    no handshake between ranks, no second producer of card order.
+
+    **AND THERE IS NO FALLBACK, WHICH IS A DESIGN DECISION AND NOT AN
+    OVERSIGHT.**  Boot weg2xsn11 measured both halves of why:
+
+    * ``CUDA_VISIBLE_DEVICES`` is NOT a substitute.  #1335 read it on the
+      strength of a comment that describes the process the launcher SPAWNS;
+      the process that RUNS THE LEG is a re-exec'd ``sglang::scheduler`` whose
+      CVD holds its OWN SINGLE CARD (read from ``/proc/<pid>/environ`` on the
+      live ranks).  Every agreed leg refused, correctly, on a one-entry map.
+    * NVML / CUDA enumeration is WORSE THAN NOTHING.  On that same boot the
+      launcher's order was ``5090, 3080, 3080`` and NVML's was
+      ``3080, 5090, 3080`` -- the orders DIFFER.  A fallback would return the
+      right uuids under the WRONG ORDINALS: a silently wrong ``PairStats``
+      label and, worse, a wrong identity check that refuses correct ranks.
+      A refusal is strictly better than a plausible map.
 
     WHAT IT REFUSES, and each reason is NAMED in the message:
 
     * ``unset`` -- the variable is missing or blank.  A rank with no map cannot
-      label, and must not invent, its pairs.
+      label, and must not invent, its pairs -- and must not go looking for one
+      in another variable or in a device enumeration (see above).
     * ``count`` -- not exactly :data:`N_CARDS` entries.  Padding a short list
       or dropping a surplus entry would shift the index off the card ordinal,
       which is a wrong LABEL on the acceptance line and a wrong IDENTITY in
       the check below -- silently.
     * ``blank`` -- an empty entry between two commas.
+    * ``duplicate`` -- two ordinals naming the same physical card, which would
+      turn a CROSS pair into an on-card one behind the pair tables' back.
     * ``disagrees`` -- the map's entry for this rank is not the uuid NVML gave
       the adapter for this rank's own card.  Two halves disagreeing about
       which card a rank runs on is a STOP, never something to compensate: a
@@ -407,15 +439,19 @@ def uuid_of_card(env: Optional[str] = None) -> Tuple[str, ...]:
     """The card->uuid map, in CARD ORDER, from the launcher's own string.
 
     ``env`` is for tests and for a caller that already holds the string; when
-    it is ``None`` the variable is read here.  The returned index IS the card
+    it is ``None`` :data:`ENV_CARD_UUIDS` is read here -- and ONLY that
+    variable.  There is no fallback to ``CUDA_VISIBLE_DEVICES``, to NVML or to
+    CUDA enumeration, for the measured reason in
+    :class:`Weg2XchgCardUuidMapUnusable`: those name the cards in a DIFFERENT
+    ORDER, so a fallback map would be wrong-ordinal rather than absent.  The returned index IS the card
     ordinal (see :class:`Weg2XchgCardUuidMapUnusable` for why that is a
     contract and not a convenience).
 
     Refuses by name rather than returning a partial map: see that class for
     the four reasons and for the two boots this cost.
     """
-    raw = os.environ.get("CUDA_VISIBLE_DEVICES") if env is None else env
-    source = "the environment" if env is None else "the injected string"
+    raw = os.environ.get(ENV_CARD_UUIDS) if env is None else env
+    source = ENV_CARD_UUIDS if env is None else "the injected string"
     if raw is None or not str(raw).strip():
         # SHORT BY DESIGN (#1335): this message travels as ONE field of a leg
         # line through `exc_note`, whose budget a paragraph would spend --
@@ -435,6 +471,18 @@ def uuid_of_card(env: Optional[str] = None) -> Tuple[str, ...]:
         raise Weg2XchgCardUuidMapUnusable(
             f"W23 Weg2XchgCardUuidMapUnusable reason=blank src={source} "
             f"read={raw!r}"
+        )
+    # TWO ORDINALS MAY NOT NAME ONE CARD.  :data:`CROSS_PAIRS` addresses six
+    # DIRECTED CROSS-card pairs by ordinal; if two ordinals carry the same
+    # uuid, a "cross" pair is really on-card, so the staging lane would be
+    # asked to move bytes from a card to itself while the diagonal carrier
+    # that exists for exactly that sits unused.  Refused, with the repeated
+    # uuid named.
+    repeated = sorted({e for e in entries if entries.count(e) > 1})
+    if repeated:
+        raise Weg2XchgCardUuidMapUnusable(
+            f"W23 Weg2XchgCardUuidMapUnusable reason=duplicate src={source} "
+            f"repeated={','.join(repeated)} read={raw!r}"
         )
     return tuple(entries)
 

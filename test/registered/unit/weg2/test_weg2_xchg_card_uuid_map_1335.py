@@ -132,19 +132,36 @@ def test_the_producer_refuses_by_name_and_never_guesses(bad, why):
 
 
 def test_the_producer_reads_the_environment_when_no_string_is_injected(monkeypatch):
-    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", ",".join(FAKE_MAP))
+    """#1336 MOVED THE SOURCE: the launcher's own variable, never CVD.
+
+    Boot weg2xsn11 refuted #1335's premise on metal -- the scheduler process
+    that runs the leg has `CUDA_VISIBLE_DEVICES` narrowed to its own single
+    card. The operator's ruling gave the card order its own published
+    variable; the full interface is pinned in
+    `test_weg2_xchg_card_order_1336.py` and this is the seam test.
+    """
+    monkeypatch.setenv(xr.ENV_CARD_UUIDS, ",".join(FAKE_MAP))
     assert xr.uuid_of_card() == FAKE_MAP
-    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "")
+    monkeypatch.delenv(xr.ENV_CARD_UUIDS, raising=False)
     with pytest.raises(xr.Weg2XchgCardUuidMapUnusable):
         xr.uuid_of_card()
 
 
 def test_the_env_name_is_the_launchers_and_is_not_retyped():
-    """One spelling of the variable, so the two ends cannot drift."""
+    """One spelling of the variable, so the two ends cannot drift.
+
+    CAUGHT PASSING FOR THE WRONG REASON when #1336 moved the source: this
+    asserted `CUDA_VISIBLE_DEVICES` appeared exactly once in the producer, and
+    after the move the one remaining hit was a DOCSTRING MENTION explaining
+    why that variable is NOT read. A count over prose is not a count over
+    code. It now pins the constant the ruling fixed, and the no-fallback rule
+    lives in `test_weg2_xchg_card_order_1336.py` where it is checked by call
+    shape.
+    """
     src = inspect.getsource(xr.uuid_of_card)
-    assert "CUDA_VISIBLE_DEVICES" in src
-    assert src.count("CUDA_VISIBLE_DEVICES") == 1, \
-        "the variable is named once; a second literal is a second producer"
+    assert "ENV_CARD_UUIDS" in src
+    assert 'os.environ.get(ENV_CARD_UUIDS)' in src, \
+        "the producer reads the published constant, once"
 
 
 # ===========================================================================
@@ -338,10 +355,11 @@ def test_the_store_forward_leg_runs_with_the_map_the_adapter_actually_supplies(
     #1334's own store-and-forward test injects `uuid_of_card=("u0","u1","u2")`
     into `ShadowLegInputs` and was green while both boots died; this one leaves
     the keyword out exactly as `weight_updater.py:1881` does, and supplies the
-    map the only way the product does -- through the launcher's
-    `CUDA_VISIBLE_DEVICES`.
+    map the only way the product does -- through the launcher's published
+    `SGLANG_WEG2_XCHG_CARD_UUIDS` (#1336; it was CVD until boot weg2xsn11
+    measured that the leg's own process cannot see it).
     """
-    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", ",".join(FAKE_MAP))
+    monkeypatch.setenv(xr.ENV_CARD_UUIDS, ",".join(FAKE_MAP))
     result, _p, _d = _store_forward_leg(
         armed, boot, tmp_path, monkeypatch=monkeypatch, inject_map=False)
     assert result is not None
@@ -354,13 +372,13 @@ def test_the_store_forward_leg_runs_with_the_map_the_adapter_actually_supplies(
 
 def test_the_same_leg_refuses_by_name_when_the_launcher_gave_no_map(
         armed, chunked, boot, tmp_path, monkeypatch):
-    """And the hermetic case: no `CUDA_VISIBLE_DEVICES`, a NAMED refusal.
+    """And the hermetic case: the variable unset, a NAMED refusal.
 
-    This is the shape a rank would hit if the launcher ever stopped exporting
-    the string.  It must be a W-coded refusal naming the variable, never 36
+    This is the shape a rank would hit if the launcher ever stopped publishing
+    the card order.  It must be a W-coded refusal naming the variable, never 36
     subscripts.
     """
-    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "")
+    monkeypatch.delenv(xr.ENV_CARD_UUIDS, raising=False)
     result, _p, _d = _store_forward_leg(
         armed, boot, tmp_path, monkeypatch=monkeypatch, inject_map=False)
     assert result is not None
