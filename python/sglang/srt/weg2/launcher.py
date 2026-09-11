@@ -4498,6 +4498,46 @@ def xchg_bounce_terms_for_arm(weight_source: str, oncard_mode: str,
     return int(terms.total_bytes), lines
 
 
+
+def ring_absent_by_design(weight_source: str, inject_mode: str) -> bool:
+    """Is there NO host weights ring in this boot -- by design, not by accident?
+
+    B4f, and boot weg2xsn13's S6I shadow dry-run is why it is a function.  The
+    predecessor read ring absence off the WEIGHT SOURCE alone
+    (``weight_source == "exchange"``) and the dry-run stopped at rc=1 before a
+    card was touched, inside the ledger::
+
+        ValueError: ring_absent_by_design with a non-zero ring
+        (ring_bytes=46133149696, ring_span1_bytes=44559237120)
+
+    THE LEDGER WAS RIGHT.  Its guard exists for exactly that -- *"a
+    contradiction resolved silently is how a charged term becomes invisible"* --
+    and the same run had armed 21715+9758+12529 MiB = 42.97 GiB of ring and
+    handed it those very bytes.
+
+    RING ABSENCE IS A PROPERTY OF THE INJECT ARM, NOT OF THE WEIGHT SOURCE.
+    #1327's comment ("under ``exchange`` the launcher publishes no
+    ``TMS_HOST_RING_*``") is true only where the exchange is the AUTHORITY.
+    Under ``--weg2-xchg-inject shadow`` -- the DEFAULT, and the form the S6I
+    order grades -- the refill is still the authority and the ring is still
+    armed: that order's item (b) requires ``host_weights=`` UNCHANGED and calls
+    a ``host_weights=0.00`` there a FAIL.  So ``exchange`` + ``shadow`` is an
+    ordered, real form in which the ring is PRESENT, and it is precisely the
+    combination the old predicate could not express.
+
+    Hence the conjunction, in ONE named place so the declaration and the arm
+    strings cannot be spelled differently at two call sites, and written as an
+    equality against the recognised constants rather than a negation -- an
+    unrecognised inject mode must not zero a charged ring, and
+    ``weight_exchange.inject_mode`` already answers ``shadow`` for anything it
+    does not recognise.
+    """
+    return (
+        str(weight_source) == WEIGHT_SOURCE_EXCHANGE
+        and str(inject_mode) == weight_exchange.INJECT_AUTHORITATIVE
+    )
+
+
 def choose_host_ledger(
     ring_bytes: int,
     ring_span1_bytes: int,
@@ -4509,6 +4549,11 @@ def choose_host_ledger(
     s_gb_d: Optional[int] = None,
     d_cap_terms: Optional[Dict[str, float]] = None,
     weight_source: str = WEIGHT_SOURCE_DEFAULT,
+    # B4f: the OTHER half of the ring-absence predicate.  Defaulted to the
+    # flag's own default so an existing caller that names only the weight
+    # source gets the arm the launcher actually runs -- which is the arm that
+    # HAS a ring, i.e. the safe side of the contradiction weg2xsn13 hit.
+    inject_mode: str = weight_exchange.INJECT_SHADOW,
     oncard_mode: str = ONCARD_MODE_DEFAULT,
     oncard_slot_mib: Optional[int] = None,
     model_dir: str = "",
@@ -4613,16 +4658,24 @@ def choose_host_ledger(
         # THIS checkpoint's WIDEST layer by `xchg_bounce_terms_for_arm` ->
         # `bounce_terms`, and its two lines join the ledger's printed lines.
         xchg_bounce_host_bytes=_bounce_charge_bytes,
-        # #1327 (S6 slice 2): SIGMA H IS 0 BY DESIGN ON THE EXCHANGE ARM, and
-        # the ledger is TOLD so rather than left to infer it from a zero.
-        # Under `exchange` the launcher publishes no `TMS_HOST_RING_*` and the
-        # arming line already prints `ring_H_mib=0`; `price()` would otherwise
-        # raise W20, because `ring_bytes == 0` is its signal for "the
-        # predecessor logged no ring table", i.e. a number it refuses to guess.
-        # Two facts, one spelling -- separated here, at the ONE call site that
-        # already knows the arm, exactly as the bounce is. The ledger never
-        # reads the arm string.
-        ring_absent_by_design=(weight_source == "exchange"),
+        # #1327 (S6 slice 2): SIGMA H IS 0 BY DESIGN ON THE AUTHORITATIVE
+        # EXCHANGE ARM, and the ledger is TOLD so rather than left to infer it
+        # from a zero. There the launcher publishes no `TMS_HOST_RING_*` and the
+        # arming line prints `ring_H_mib=0`; `price()` would otherwise raise
+        # W20, because `ring_bytes == 0` is its signal for "the predecessor
+        # logged no ring table", i.e. a number it refuses to guess. Two facts,
+        # one spelling -- separated here, at the ONE call site that already
+        # knows the arms, exactly as the bounce is. The ledger never reads an
+        # arm string.
+        #
+        # B4f CORRECTS THE PREDICATE AND THIS COMMENT WITH IT: #1327 wrote
+        # "ON THE EXCHANGE ARM" and read the weight source alone, which is
+        # right only when the exchange is the AUTHORITY. Under
+        # `--weg2-xchg-inject shadow` the ring is still armed and still the
+        # authority, so boot weg2xsn13's dry-run handed the ledger 42.97 GiB of
+        # ring beside a declaration that there was none. See
+        # `ring_absent_by_design`.
+        ring_absent_by_design=ring_absent_by_design(weight_source, inject_mode),
     )
     if pin_m_mib and int(pin_m_mib) > 0:
         # #1317/#1318 THE PINNED ARM IS PRICED, NOT ASSUMED. The ladder is run
@@ -9269,6 +9322,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         # optimistic by that much against a reap mark nobody may touch.
         s_gb_d=s_gb_d, d_cap_terms=_l2_terms,
         weight_source=ns.weg2_weight_source,
+        # B4f: ring absence needs BOTH arms, and the inject mode is already in
+        # hand here -- `prepare_xchg_env` published it three statements above.
+        inject_mode=ns.weg2_xchg_inject,
         oncard_mode=ns.weg2_xchg_oncard,
         oncard_slot_mib=ns.weg2_xchg_oncard_slot_mib,
         # #1332 B1b: the checkpoint whose WIDEST layer sizes the host bounce.
