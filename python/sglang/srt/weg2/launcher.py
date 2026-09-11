@@ -5029,11 +5029,29 @@ CARRIER_PREFETCH_FRACTION = 0.9
 def parse_user_reserve(raw, cards) -> Dict[str, int]:
     """``--user-reserve-mib`` -> ``{card_uuid: MiB}``. Refuses, never guesses.
 
-    #1257c. A scalar applies to every card; a list is in NVML-ordinal order
-    and must have exactly one entry per card. KEYED BY UUID on the way out for
-    the reason every other per-card table in this file is: NVML enumeration is
-    not stable across boots, and an index-keyed reserve would silently move to
-    a different card the day the order shifts.
+    #1257c. A scalar applies to every card; a list is in **RANK / CUDA-ORDINAL
+    ORDER** -- the order :func:`order_cards` returns, i.e. the 5090 FIRST and
+    then the 3080s by NVML index -- and must have exactly one entry per card.
+    KEYED BY UUID on the way out for the reason every other per-card table in
+    this file is: NVML enumeration is not stable across boots, and an
+    index-keyed reserve would silently move to a different card the day the
+    order shifts.
+
+    CORRECTED #1342: this docstring, and the flag's help text, both used to say
+    "NVML-ordinal order". THE CODE WAS ALWAYS RIGHT AND THE PROSE WAS WRONG --
+    the values are zipped against ``cards``, which is
+    ``order_cards(resolve_cards())`` (built at ``launcher.py:9082``, consumed
+    at ``:9237``), so position 0 is the 5090 on this rig while NVML index 0 is
+    a 3080. Boot weg2xsn17 proved it by controlled A/B: passing the DOCUMENTED
+    ``1400,1800,1400`` put 1400 MiB on the 5090 and 1800 on a 3080, while
+    ``1800,1400,1400`` -- the standing form in every order -- reproduced the
+    reference boot byte-identically.
+
+    SO THE DANGEROUS REPAIR IS THE OTHER ONE: "fixing" the code to NVML order
+    would silently hand the 5090 the 1400 meant for a 3080, and the 5090 is the
+    card that OOMed in #1312. The standing form ``1800,1400,1400`` is correct
+    and matches the user setting (5090 1800 / 3080s 1400); it is pinned by
+    ``test_the_standing_reserve_form_puts_1800_on_the_5090``.
     """
     text = str(raw if raw is not None else 0).strip()
     if not text:
@@ -8719,7 +8737,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--user-reserve-mib", type=str, default="0",
         help="#1257c. EXTERNAL headroom, MiB PER CARD: VRAM left free for YOUR "
              "OTHER PROCESSES while this boot serves. A scalar applied to "
-             "every card, or a comma-separated list in NVML-ordinal order. "
+             "every card, or a comma-separated list in RANK/CUDA-ORDINAL "
+             "ORDER -- the 5090 FIRST, then the 3080s by NVML index. That is "
+             "NOT NVML order: nvml0 is a 3080 while ordinal 0 is the 5090, so "
+             "the standing form on this rig is `1800,1400,1400`. Every boot "
+             "prints a WEG2-USER-RESERVE PROVENANCE line giving the argv "
+             "position, card NAME and UUID beside each MiB value, so the "
+             "mapping never has to be inferred from this sentence (#1342). "
              "Default 0 (user decision 2026-09-09): the 1024 this used to "
              "default to existed only because the engine could not price its "
              "own transient, and it now can -- the corridor floor is "
@@ -9236,13 +9260,22 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # corridor floor, the front's sampler) reads THIS dict.
     user_reserve_by_card = parse_user_reserve(ns.user_reserve_mib, cards)
     log(
-        "user reserve (external, #1257c) = "
-        + ", ".join(
-            f"nvml{c.nvml_index}={user_reserve_by_card.get(c.uuid, 0)}MiB"
-            for c in cards
+        "WEG2-USER-RESERVE PROVENANCE (#1257c, line shape #1342): "
+        + "; ".join(
+            f"argv[{i}] -> ordinal={i} nvml{c.nvml_index} "
+            f"name={c.name!r} uuid={c.uuid} reserve_mib="
+            f"{user_reserve_by_card.get(c.uuid, 0)}"
+            for i, c in enumerate(cards)
         )
         + " -- VRAM left free for processes OUTSIDE this engine; it raises "
-        "that card's corridor floor and lowers its budget by exactly as much"
+        "that card's corridor floor and lowers its budget by exactly as much. "
+        "THE ARGV POSITION IS PRINTED BESIDE THE CARD NAME AND UUID ON "
+        "PURPOSE: `--user-reserve-mib` is a list in RANK/CUDA-ORDINAL order "
+        "(`order_cards`: the 5090 first, then the 3080s by NVML index), which "
+        "is NOT NVML order on this rig -- nvml0 is a 3080 and ordinal 0 is the "
+        "5090. Boot weg2xsn17 had to read this mapping back out of a "
+        "CORRIDOR-FLOOR line and infer the ordering from it; after this line "
+        "nobody has to."
     )
     budgets_p = budgets_from_dc(
         cards, dc_expect_d, log, "P", overshoot_mib=P_OVERSHOOT_MIB,

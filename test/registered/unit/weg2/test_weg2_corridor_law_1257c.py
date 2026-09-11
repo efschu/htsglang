@@ -1373,3 +1373,128 @@ class TheFingerprintOfThePointerIsChecked(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ===========================================================================
+# #1342: `--user-reserve-mib` IS A RANK/CUDA-ORDINAL LIST, AND THE PIN SAYS SO.
+#
+# Boot weg2xsn17 reported a "finding" that the flag's documentation and its
+# behaviour disagree.  They do -- and the OPERATOR'S CORRECTION was that the
+# direction of the defect is the DOCUMENTATION, not the code.  The code zips
+# the values against `order_cards(resolve_cards())`, which puts the 5090
+# first, and the standing form `1800,1400,1400` therefore hits the user
+# setting exactly (5090 1800 / 3080s 1400).
+#
+# THE DANGEROUS REPAIR is the other one: pulling the code to NVML order would
+# hand the 5090 the 1400 meant for a 3080, and the 5090 is the card that OOMed
+# in #1312.  These tests exist so that repair cannot be made quietly.
+#
+# HONESTY ABOUT COLOUR: these PASS on 571a3da963 -- the behaviour is already
+# correct.  They are REGRESSION PINS, not red-first tests, and the mutant
+# `tools_mutants_1342.sh` (M9) is what proves they can fail.
+# ===========================================================================
+
+
+def _rig_cards():
+    """This rig's three cards in NVML order, as `resolve_cards` would yield."""
+    from sglang.srt.weg2 import launcher as L
+
+    return [
+        L.Card(nvml_index=0, uuid="GPU-5c648f96", name="NVIDIA GeForce RTX 3080",
+               total_mib=20480, reserved_mib=425),
+        L.Card(nvml_index=1, uuid="GPU-31d7ef41", name="NVIDIA GeForce RTX 5090",
+               total_mib=32607, reserved_mib=518),
+        L.Card(nvml_index=2, uuid="GPU-62dbbae1", name="NVIDIA GeForce RTX 3080",
+               total_mib=20480, reserved_mib=425),
+    ]
+
+
+def test_order_cards_is_cuda_ordinal_with_the_5090_first():
+    """The premise the whole flag rests on, asserted rather than assumed."""
+    from sglang.srt.weg2 import launcher as L
+
+    ordered = L.order_cards(_rig_cards())
+    assert [c.nvml_index for c in ordered] == [1, 0, 2]
+    assert "5090" in ordered[0].name, "ordinal 0 must be the 5090"
+
+
+def test_the_standing_reserve_form_puts_1800_on_the_5090():
+    """THE PIN: `1800,1400,1400` means 5090=1800, both 3080s=1400.
+
+    This is the form every order on this rig ships, and it is correct.  If a
+    future change makes the list NVML-indexed, this test fails and names the
+    card that would have silently lost 400 MiB -- the #1312 OOM card.
+    """
+    from sglang.srt.weg2 import launcher as L
+
+    cards = L.order_cards(_rig_cards())
+    got = L.parse_user_reserve("1800,1400,1400", cards)
+    by_name = {c.name: got[c.uuid] for c in cards}
+    assert by_name["NVIDIA GeForce RTX 5090"] == 1800
+    assert by_name["NVIDIA GeForce RTX 3080"] == 1400
+    assert got["GPU-31d7ef41"] == 1800, "the 5090 by UUID"
+    assert got["GPU-5c648f96"] == 1400
+    assert got["GPU-62dbbae1"] == 1400
+
+
+def test_the_documented_nvml_order_would_have_starved_the_5090():
+    """THE COUNTERFACTUAL, pinned so the old prose cannot be believed again.
+
+    Passing the list the OLD documentation prescribed for NVML order
+    (`1400,1800,1400`) puts 1400 on the 5090 -- which is what boot weg2xsn17
+    measured by controlled A/B.  Asserting the wrong outcome explicitly is
+    what makes the docstring's "the dangerous repair is the other one"
+    checkable rather than a claim.
+    """
+    from sglang.srt.weg2 import launcher as L
+
+    cards = L.order_cards(_rig_cards())
+    got = L.parse_user_reserve("1400,1800,1400", cards)
+    assert got["GPU-31d7ef41"] == 1400, "the 5090 gets the 3080's value"
+    assert got["GPU-5c648f96"] == 1800, "a 3080 gets the 5090's value"
+
+
+def test_a_scalar_still_applies_to_every_card():
+    """The scalar form is untouched by the ordering question."""
+    from sglang.srt.weg2 import launcher as L
+
+    cards = L.order_cards(_rig_cards())
+    got = L.parse_user_reserve("1400", cards)
+    assert set(got.values()) == {1400}
+    assert len(got) == 3
+
+
+def test_a_wrong_length_list_is_refused_not_padded():
+    """A list that does not match the card count must REFUSE.
+
+    The failure mode this forbids is a two-entry list silently leaving the
+    third card at 0, which reads as "no reserve wanted" rather than as a typo.
+    """
+    import pytest
+
+    from sglang.srt.weg2 import launcher as L
+
+    cards = L.order_cards(_rig_cards())
+    with pytest.raises(SystemExit) as e:
+        L.parse_user_reserve("1800,1400", cards)
+    assert "one per card" in str(e.value)
+
+
+def test_the_docstring_no_longer_claims_nvml_order():
+    """#1342: the prose defect itself, pinned.
+
+    The docstring must not tell a reader the list is NVML-ordered, because
+    acting on that sentence is what produces the #1312 direction.  The only
+    permitted occurrence of the phrase is inside the correction that quotes
+    the old wording.
+    """
+    import inspect
+
+    from sglang.srt.weg2 import launcher as L
+
+    doc = inspect.getdoc(L.parse_user_reserve) or ""
+    assert "RANK / CUDA-ORDINAL" in doc or "CUDA-ORDINAL" in doc
+    assert "5090 FIRST" in doc
+    # the phrase may appear ONLY as the quoted old wording in the correction
+    if "NVML-ordinal order" in doc:
+        assert "THE CODE WAS ALWAYS RIGHT" in doc
