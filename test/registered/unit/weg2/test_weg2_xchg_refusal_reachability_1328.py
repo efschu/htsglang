@@ -142,6 +142,7 @@ four debt entries are meaningful -- they survive the over-approximation.
 
 import ast
 import os
+import shutil
 import tempfile
 import textwrap
 import unittest
@@ -825,6 +826,10 @@ class TestTheRatchetCanFail(CustomTestCase):
 
     def _tree(self, lane_src: str, entry_src: str, vote_src: str) -> str:
         root = tempfile.mkdtemp(prefix="b4l-plant-")
+        # Cleaned up per test: five synthetic trees per run, and a suite that
+        # leaves litter in /tmp on a box whose host threshold is a boot
+        # criterion is a suite nobody wants to run twice.
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
         for name, src in (("lane.py", lane_src), ("entry.py", entry_src),
                           ("vote.py", vote_src)):
             with open(os.path.join(root, name), "w", encoding="utf-8") as fh:
