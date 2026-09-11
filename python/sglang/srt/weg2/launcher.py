@@ -3465,6 +3465,7 @@ def prepare_xchg_env(log: Log, boot_nonce: str, weight_source: str,
                        weight_exchange_transport.ONCARD_SLOT_MIB_DEFAULT,
                        bounce_terms: Optional[xchg_bounce.BounceTerms] = None,
                        inject_mode: str = weight_exchange.INJECT_SHADOW,
+                       waves: Optional[Sequence[Sequence[str]]] = None,
                        ) -> Dict[str, str]:
     """#1273 S5/S6: arm the region for EVERY non-default arm and publish it.
 
@@ -3545,6 +3546,21 @@ def prepare_xchg_env(log: Log, boot_nonce: str, weight_source: str,
     # launched with would either serve ungraded bytes or silently keep paying
     # for a refill nobody reads.
     env[weight_exchange.INJECT_ENV] = str(inject_mode)
+    # B4d: THE PRICED WAVE PARTITION, published by the same channel and for a
+    # sharper version of the same reason.  A rank cannot derive this one at
+    # all: a chunk tag is a LAYER BAND, so the map needs the layer count of
+    # EVERY PP stage and a rank holds only its own -- `derive_leg_plan` says so
+    # itself and passes `{}`, which yields ONE wave.  The launcher knows every
+    # stage, so it prices the per-card partition (THREE waves on this rig), and
+    # MEASURED at the desk the difference is not cosmetic: the uniform
+    # partition puts both images on the 5090 at once, 39454 MiB against a
+    # 32607 MiB board, W71 both directions.
+    #
+    # ABSENT means "derive as before", not "no waves": a boot with no census
+    # publishes no key and `published_waves()` answers None, under which
+    # `waves_for_plan` returns the derivation byte for byte.
+    if waves:
+        env[weight_exchange.WAVES_ENV] = weight_exchange.publish_waves(waves)
     # #1273 S6 step 5: THE PRICED TERM ITSELF, published to the ranks.
     #
     # The seam that injects the weight bytes needs the bounce geometry, and a
@@ -9600,7 +9616,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                                   oncard_mode=ns.weg2_xchg_oncard,
                                   oncard_slot_mib=ns.weg2_xchg_oncard_slot_mib,
                                   bounce_terms=bounce_terms_for_ranks,
-                                  inject_mode=ns.weg2_xchg_inject)
+                                  inject_mode=ns.weg2_xchg_inject,
+                                  # B4d: the partition W71 PRICED, not a second
+                                  # derivation of it -- `xchg_res` is the solved
+                                  # table and carries the census's own list.
+                                  waves=(xchg_res.partition if xchg_res is not None
+                                         else None))
 
     # 2. host ledger
     arm, reap_headroom_gib, lines, cg = choose_host_ledger(

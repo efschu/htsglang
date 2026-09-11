@@ -146,6 +146,16 @@ __all__ = [
     "coalesce",
     "coverage_refusal_message",
     "derive_waves",
+    "waves_for_plan",
+    "published_waves",
+    "publish_waves",
+    "waves_digest",
+    "wave_disagreement",
+    "planned_waves",
+    "reset_wave_disagreement",
+    "WAVES_ENV",
+    "WCODE_WAVE_PARTITION",
+    "Weg2XchgWavePartitionDisagree",
     "device_block_offsets",
     "emit_plan_line",
     "exchange_armed",
@@ -876,6 +886,187 @@ class XchgDesc:
 # ---------------------------------------------------------------------------
 # Waves.
 # ---------------------------------------------------------------------------
+
+
+
+# ---------------------------------------------------------------------------
+# B4d: the PRICED wave partition, published to the ranks.
+# ---------------------------------------------------------------------------
+
+#: ``XchgCensus.waves``' own TODO, delivered: *"S1/S6 must publish this list to
+#: the ranks and have them refuse a mismatch, exactly as the front already
+#: refuses a pause order that is not its own weights tags."*
+#:
+#: WHY A RANK CANNOT DERIVE IT.  A chunk tag is a LAYER BAND, so which cards it
+#: touches is the PP split -- and ``derive_leg_plan`` says why it passes ``{}``
+#: instead: *"the map needs the layer count of EVERY PP stage and a rank holds
+#: only its own"*.  So the rank derived ONE wave (``wave_map=uniform-assumed``)
+#: while the launcher, which knows every stage, PRICED three.
+#:
+#: AND THE TWO ARE NOT A PREFERENCE.  MEASURED at the desk on live NVML totals
+#: (B4c): the uniform partition is one wave, so both groups' whole images are
+#: resident at once, and on this rig's 5090 that is 18608 + 17510 + 2x1668 =
+#: 39454 MiB against a 32607 MiB board -- W71 in both directions, free_at_peak
+#: -6847 MiB.  The three-wave partition arms with 0 refusals.  Pricing one and
+#: executing the other is round-2 refuter F11's hazard one layer up.
+WAVES_ENV = "SGLANG_WEG2_XCHG_WAVES"
+
+#: The reason text for a published-vs-derived mismatch.  A DEDICATED code, so a
+#: reader greps one token and lands here -- but NOT a second group-uniform
+#: error: the raise stays :class:`Weg2FlipRankDisagree` (W29) at the wake
+#: fence, whose contract and tests already carry "every rank stops here with
+#: the same peer list" (operator ruling).  Minted from the three numbers that
+#: are genuinely free on this tip (W5, W39, W90) -- and NOT from W19, which the
+#: uniqueness census names free and is not: ``W19 DormantResidueRefused`` lives
+#: in ``front.py`` under a non-``Weg2`` name no scan form can see.
+WCODE_WAVE_PARTITION = "W39 Weg2XchgWavePartitionDisagree"
+
+#: Set by :func:`waves_for_plan` when this rank's derivation disagreed with the
+#: publication, read by the wake fence, cleared per flip.  A MODULE SLOT and
+#: not a raise, deliberately: a raise inside the plan builder is RANK-LOCAL,
+#: and a rank-local stop on a group decision is the shape #1273 keeps paying
+#: for -- the other five ranks would carry on and meet a peer that is gone.
+_WAVE_DISAGREEMENT: Optional[str] = None
+
+#: What :func:`waves_for_plan` last ANSWERED on this rank.  Reported by the
+#: wake fence even when every rank agrees, so the line states what each rank
+#: actually planned -- "all six planned the priced partition" should be a
+#: measurement, not an absence of complaint.
+_PLANNED_WAVES: Optional[Tuple[Tuple[str, ...], ...]] = None
+
+
+class Weg2XchgWavePartitionDisagree(RuntimeError):
+    """The PUBLISHED partition is not a partition of this rank's family.
+
+    Distinct from a mere disagreement about the SHAPE of the partition, which
+    is recorded for the fence rather than raised: this one means the published
+    list names a tag this rank does not have (or omits one it does), so there
+    is no schedule to run at all and no group decision to wait for.  Same
+    reading ``derive_leg_plan``'s own ``stale-wave-map`` refusal has.
+    """
+
+
+def publish_waves(waves: Sequence[Sequence[str]]) -> str:
+    """The wire form: waves separated by ``|``, tags within a wave by ``,``.
+
+    Chosen over JSON because it goes through an ENVIRONMENT variable that a
+    human reads in ``/proc/<pid>/environ`` while triaging a boot, and because
+    it cannot carry a nested structure that the reader would then have to
+    validate -- the only two shapes it can express are the two that exist.
+    """
+    return "|".join(",".join(str(t) for t in wave) for wave in waves)
+
+
+def published_waves() -> Optional[Tuple[Tuple[str, ...], ...]]:
+    """The launcher's priced partition, or ``None`` when none was published.
+
+    ``None`` IS NOT AN EMPTY PARTITION, and the distinction is the whole
+    contract: an empty partition would be a schedule that moves nothing, while
+    absence means "this boot published no list" -- under which
+    :func:`waves_for_plan` returns the derivation BYTE-IDENTICALLY and nothing
+    about a boot that predates B4d changes.  A malformed value reads as absent
+    for the same reason every other reader on this path does: the one direction
+    a typo may not take is arming something.
+    """
+    raw = (os.environ.get(WAVES_ENV, "") or "").strip()
+    if not raw:
+        return None
+    waves = tuple(
+        tuple(t for t in (p.strip() for p in wave.split(",")) if t)
+        for wave in raw.split("|")
+    )
+    waves = tuple(w for w in waves if w)
+    return waves or None
+
+
+def waves_digest(waves: Sequence[Sequence[str]]) -> str:
+    """A short, order-sensitive identity for one partition.
+
+    ORDER-SENSITIVE WITHIN A WAVE AND ACROSS THEM, because both carry meaning:
+    the wave index is the schedule step the residency peak is computed at, and
+    the order inside a wave is the order the interleave walks.  Two partitions
+    with the same tags in a different arrangement price differently, so they
+    must not share a digest.
+    """
+    return hashlib.sha256(publish_waves(waves).encode()).hexdigest()[:12]
+
+
+def planned_waves() -> Optional[Tuple[Tuple[str, ...], ...]]:
+    """The partition this rank last planned, or ``None`` before it planned."""
+    return _PLANNED_WAVES
+
+
+def wave_disagreement() -> Optional[str]:
+    """This rank's recorded published-vs-derived mismatch, or ``None``."""
+    return _WAVE_DISAGREEMENT
+
+
+def reset_wave_disagreement() -> None:
+    """Clear it, once per flip, so one leg's finding cannot poison the next."""
+    global _WAVE_DISAGREEMENT, _PLANNED_WAVES
+    _WAVE_DISAGREEMENT = None
+    _PLANNED_WAVES = None
+
+
+def waves_for_plan(
+    family_tags: Sequence[str],
+    tag_cards: Dict[str, Tuple[int, ...]],
+    cards: Sequence[int],
+) -> List[List[str]]:
+    """:func:`derive_waves`, reconciled against the launcher's publication.
+
+    A DROP-IN: the signature is ``derive_waves``' exactly, so the rank-side
+    change is one line (``waves_of = waves_of or wx.waves_for_plan`` at
+    ``weight_exchange_shadow.py``) and this file owns the whole of the new
+    behaviour.
+
+    THREE ANSWERS, and the middle one is the B4d delivery:
+
+    * nothing published -> the DERIVATION, byte for byte.  A boot that predates
+      this, or any arm that publishes no census, is unaffected.
+    * published and it agrees -> the PUBLICATION (identical either way; taking
+      the published object makes the two provably one).
+    * published and it does NOT agree -> the PUBLICATION, with the mismatch
+      RECORDED for the wake fence.  The publication wins because it is the
+      partition whose VRAM peak was priced and refused-or-armed at launch (W71)
+      -- running the unpriced one is the case that cannot fit -- and the
+      mismatch is recorded rather than raised because a raise here is
+      rank-local.
+
+    The one case that IS raised locally is a publication that is not a
+    partition of this rank's family: then there is no schedule at all, no group
+    decision to wait for, and ``derive_leg_plan``'s own ``stale-wave-map``
+    reading applies.
+    """
+    global _WAVE_DISAGREEMENT, _PLANNED_WAVES
+    derived = derive_waves(list(family_tags), tag_cards, cards)
+    published = published_waves()
+    if published is None:
+        _PLANNED_WAVES = tuple(tuple(w) for w in derived)
+        return derived
+    want = sorted(str(t) for t in family_tags)
+    got = sorted(t for wave in published for t in wave)
+    if got != want:
+        raise Weg2XchgWavePartitionDisagree(
+            f"{WCODE_WAVE_PARTITION}: the published partition is not a partition "
+            f"of this rank's weights family -- published tags {got} against "
+            f"family {want} (digest {waves_digest(published)}).  A publication "
+            "that names a tag this rank does not hold describes a schedule "
+            "nobody can run, so there is no group decision to wait for here."
+        )
+    d_pub, d_der = waves_digest(published), waves_digest(derived)
+    if d_pub != d_der:
+        _WAVE_DISAGREEMENT = (
+            f"{WCODE_WAVE_PARTITION}: published={len(published)} wave(s) "
+            f"digest={d_pub} vs derived={len(derived)} wave(s) digest={d_der} "
+            "-- the launcher PRICED the published partition (its VRAM peak is "
+            "what W71 armed this boot on) and this rank derived a different "
+            "one, so the priced schedule and the executed schedule are two "
+            "objects.  Recorded for the group fence rather than raised here: "
+            "the stop must be group-uniform."
+        )
+    _PLANNED_WAVES = tuple(tuple(w) for w in published)
+    return [list(w) for w in published]
 
 
 def derive_waves(
