@@ -192,3 +192,88 @@ class TheStopIsGroupUniformThroughTheWakeFence(CustomTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TheUncoveredPopulationIsClassifiedNotRelabelled(CustomTestCase):
+    """B4g wall 1, second half: WHY 12 tensors were uncovered, and what a real
+    ``uncovered=0`` requires.
+
+    STRUCTURAL FINDING FIRST, from the census's own arithmetic and xsn14's own
+    line, with no model: a tensor is uncovered only if it is (a) a PARAMETER
+    whose name is not in the plan map, or (b) an ATTRIBUTE aliasing no covered
+    storage.  The line reads ``uncovered=12 ... attrs=6``, so at most 6 can be
+    attributes and therefore **at least 6 are unplanned PARAMETERS**.  That is
+    a plan-coverage gap, not stray attribute aliases.
+
+    AND THE MECHANISM IS NAMED: ``plan_bytes_from_descs`` SKIPS ZEROFILL
+    descriptors -- correctly, because a zerofill piece moves nothing over the
+    link and counting it would claim a transfer that never happens.  But a
+    parameter whose descriptors are ALL zerofill then vanishes from the map
+    entirely, and the census cannot tell "absent BY DESIGN" (the 128 padded
+    vocabulary rows that exist on no card and in no checkpoint, spec section
+    2.2) from "absent because the plan forgot it".  Both read as uncovered.
+
+    So the plan DECLARES the zerofill-by-design parameters with 0 planned
+    bytes instead of omitting them, and the census classifies them as EXEMPT
+    with a printed reason.  Everything else stays uncovered AND IS NAMED on its
+    own line, so the table comes out of one boot instead of a second
+    investigation.
+    """
+
+    def test_a_fully_zerofill_parameter_is_declared_not_omitted(self):
+        class D:
+            def __init__(self, kind, name, nbytes):
+                self.kind, self.param_name, self.nbytes = kind, name, nbytes
+                self.tag = "weights_0"
+
+        descs = [D(wx.ZEROFILL, "embed.pad", 4096),
+                 D("COPY", "mlp.gate", 1024), D(wx.ZEROFILL, "mlp.gate", 16)]
+        out = wx.plan_bytes_from_descs(descs)
+        # the copied parameter keeps its non-zerofill bytes ONLY
+        self.assertEqual(out["weights_0"]["mlp.gate"], 1024)
+        # and the all-zerofill one is PRESENT with zero, not missing
+        self.assertIn("embed.pad", out["weights_0"])
+        self.assertEqual(out["weights_0"]["embed.pad"], 0)
+
+    def test_a_zero_claim_is_exempt_and_never_short(self):
+        """A 0-byte claim against live bytes is the zerofill case, not a
+        partially-tiled parameter -- calling it SHORT would refuse every boot
+        that pads a vocabulary."""
+        self.assertTrue(wx.is_zerofill_by_design(0, 4096))
+        self.assertFalse(wx.is_zerofill_by_design(1024, 4096))
+        self.assertFalse(wx.is_zerofill_by_design(0, 0))
+
+    def test_the_cover_line_prints_exempt_with_its_reason(self):
+        row = _row(uncovered=0)
+        row = wx.TagCoverage(**{**row.__dict__, "exempt": ("embed.pad",)})
+        line = row.cover_line()
+        self.assertIn("exempt=1", line)
+        self.assertIn("reason=", line)
+        self.assertIn("zerofill-by-design", line)
+
+    def test_an_exempt_tensor_does_not_make_the_row_not_ok(self):
+        row = wx.TagCoverage(**{**_row(uncovered=0).__dict__,
+                                "exempt": ("embed.pad",)})
+        self.assertTrue(row.ok)
+
+    def test_but_an_uncovered_one_still_does(self):
+        row = wx.TagCoverage(**{**_row(uncovered=3).__dict__,
+                                "exempt": ("embed.pad",)})
+        self.assertFalse(row.ok)
+
+    def test_the_uncovered_tensors_are_NAMED_on_their_own_line(self):
+        """So the table is a one-boot deliverable.  xsn14 could not produce it:
+        the names live only in ``coverage_refusal_message``, which the refusal
+        that never fired was the only caller of."""
+        row = _row(uncovered=2)
+        lines = row.uncovered_lines()
+        self.assertEqual(len(lines), 2)
+        for i, ln in enumerate(lines):
+            self.assertIn(wx.UNCOVERED_LINE_PREFIX, ln)
+            self.assertIn(f"name=uncov_{i}", ln)
+            self.assertIn("tag=weights_0", ln)
+            self.assertIn("kind=ATTRIBUTE", ln)
+            self.assertIn("mib=", ln)
+
+    def test_a_clean_row_names_nothing(self):
+        self.assertEqual(_row(uncovered=0).uncovered_lines(), [])

@@ -97,6 +97,9 @@ __all__ = [
     "COALESCE_FLOOR_BYTES",
     "COLS",
     "COVERAGE_REFUSAL_MARKER",
+    "UNCOVERED_LINE_PREFIX",
+    "EXEMPT_REASON",
+    "is_zerofill_by_design",
     "COVER_LINE_PREFIX",
     "CoverageVote",
     "FLAT",
@@ -2167,6 +2170,10 @@ class TagCoverage:
     n_parameters: int
     n_buffers: int
     n_attributes: int
+    #: B4g: parameters the plan DECLARED with a zero byte claim, i.e. zerofill
+    #: by design.  Named, counted and printed with their reason, so an
+    #: ``uncovered=0`` is a real zero and not a relabel of the same tensors.
+    exempt: Tuple[str, ...] = ()
 
     @property
     def slack_bytes(self) -> int:
@@ -2183,7 +2190,19 @@ class TagCoverage:
 
     @property
     def ok(self) -> bool:
+        """``exempt`` is deliberately absent from this: a tensor the plan
+        DECLARED as needing no source is accounted for, which is the whole
+        difference between classifying the population and relabelling it."""
         return not (self.uncovered or self.short or self.missing)
+
+    def uncovered_lines(self) -> List[str]:
+        """One line per uncovered tensor, named where it is counted."""
+        return [
+            f"{UNCOVERED_LINE_PREFIX} rank={int(self.rank)} tag={self.tag} "
+            f"kind={t.kind} name={t.name} module={t.module_path or '<root>'} "
+            f"dtype={t.dtype} shape={list(t.shape)} mib={t.nbytes / MIB:.3f}"
+            for t in self.uncovered
+        ]
 
     def cover_line(self) -> str:
         """The acceptance line, spec field order verbatim.
@@ -2205,9 +2224,12 @@ class TagCoverage:
             f"short={len(self.short)} missing={len(self.missing)} "
             f"params={self.n_parameters} buffers={self.n_buffers} "
             f"attrs={self.n_attributes} "
+            f"exempt={len(self.exempt)} "
+            + (f"reason={EXEMPT_REASON} " if self.exempt else "")
+            + (
             f"tms_answered={'yes' if self.tms_bytes else 'no'} "
             f"mode={self.mode}"
-        )
+        ))
 
 
 def tag_of_parameter_name(
@@ -2366,6 +2388,7 @@ def build_coverage(
         buffers_bytes = 0
         uncovered: List[LiveTensor] = []
         short: List[ShortParameter] = []
+        exempt: List[str] = []
         n_par = n_buf = n_attr = 0
 
         # Parameters and buffers first: they define WHICH allocations are
@@ -2377,6 +2400,12 @@ def build_coverage(
                 if t.name in planned_of_tag:
                     seen_names.add(t.name)
                     claim = int(planned_of_tag[t.name])
+                    if is_zerofill_by_design(claim, t.nbytes):
+                        # DECLARED as needing no source: accounted for, and
+                        # named on the line rather than silently dropped.
+                        exempt.append(t.name)
+                        covered_storage.add(t.storage_key)
+                        continue
                     if claim != t.nbytes:
                         short.append(
                             ShortParameter(
@@ -2416,6 +2445,7 @@ def build_coverage(
             uncovered=tuple(uncovered),
             short=tuple(short),
             missing=tuple(sorted(set(planned_of_tag) - seen_names)),
+            exempt=tuple(sorted(exempt)),
             n_parameters=n_par,
             n_buffers=n_buf,
             n_attributes=n_attr,
@@ -2568,6 +2598,14 @@ def arm_coverage(
     )
     for tag in sorted(rows):
         emit(rows[tag].cover_line())
+        # B4g: and NAME the population the count implies.  Boot weg2xsn14
+        # printed uncovered=12 on 39 of 40 lines and the table could not be
+        # built from its log, because the names live only inside
+        # `coverage_refusal_message` and the refusal that never fired was its
+        # only caller.  One line per tensor here makes the classification a
+        # ONE-BOOT deliverable, whatever the verdict downstream turns out to be.
+        for ln in rows[tag].uncovered_lines():
+            emit(ln)
     ok = all(rows[tag].ok for tag in rows)
     return CoverageVote(
         rank=int(rank),
@@ -2617,13 +2655,47 @@ def plan_bytes_from_descs(descs: Any) -> PlanBytes:
     """
     out: Dict[str, Dict[str, int]] = {}
     for d in descs or ():
-        if getattr(d, "kind", None) == ZEROFILL:
-            continue
         tag = str(getattr(d, "tag", ""))
         name = str(getattr(d, "param_name", ""))
         bucket = out.setdefault(tag, {})
-        bucket[name] = bucket.get(name, 0) + int(getattr(d, "nbytes", 0))
+        # B4g: DECLARED WITH ZERO, NEVER OMITTED.  A zerofill piece still
+        # contributes no planned bytes -- counting it would claim a transfer
+        # that never happens, which is the direction that serves undefined
+        # weights -- but a parameter whose descriptors are ALL zerofill used to
+        # vanish from this map entirely, and the coverage arm cannot tell
+        # "absent BY DESIGN" (the 128 padded vocabulary rows that exist on no
+        # card and in no checkpoint, spec section 2.2) from "absent because the
+        # plan forgot it".  Both read as UNCOVERED, which is how boot weg2xsn14
+        # came to report 12 uncovered tensors per tag with short=0 missing=0.
+        # Declaring the name with 0 bytes keeps the byte claim exactly as it
+        # was and lets the census classify the two cases apart.
+        add = 0 if getattr(d, "kind", None) == ZEROFILL else int(getattr(d, "nbytes", 0))
+        bucket[name] = bucket.get(name, 0) + add
     return out
+
+
+def is_zerofill_by_design(planned_bytes: int, live_bytes: int) -> bool:
+    """A DECLARED parameter with a zero byte claim against live storage.
+
+    The zerofill case, and it must not be read as a partially-tiled parameter:
+    ``short`` exists for a plan whose claim does not equal the live storage,
+    and a vocabulary padded to ``64 * tp`` would trip it on every boot that
+    pads.  ``live_bytes == 0`` is NOT this case -- a parameter with no storage
+    at all is a different question and stays with whoever asks it.
+    """
+    return int(planned_bytes) == 0 and int(live_bytes) > 0
+
+
+#: One line per uncovered tensor, so the population is NAMED where it is
+#: counted.  Boot weg2xsn14 could not produce the table its own COVER lines
+#: implied: the names exist only inside ``coverage_refusal_message``, and the
+#: refusal that never fired was its only caller.
+UNCOVERED_LINE_PREFIX = "WEG2-XCHG-UNCOVERED"
+
+#: Printed beside ``exempt=`` so a zero is never a relabel.
+EXEMPT_REASON = ("zerofill-by-design (declared with 0 planned bytes: the piece "
+                 "exists on no card and in no checkpoint, spec section 2.2, and "
+                 "the destination memsets it locally -- it needs no source)")
 
 
 #: The env var the launcher publishes this rank's Weg-2 group on

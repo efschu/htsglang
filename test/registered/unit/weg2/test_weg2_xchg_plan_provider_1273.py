@@ -137,13 +137,25 @@ def test_zerofill_descriptors_are_not_planned_bytes():
     Counting it as planned bytes would make the coverage arm believe a byte
     range is accounted for by a transfer that never happens -- the destination
     memsets it locally (`tp.apply_zerofill`).
+
+    MIGRATED BY B4g, and the BYTE CLAIM IS UNCHANGED -- which is the half this
+    test exists for: `pad` still contributes 0.  What changed is that the NAME
+    is now DECLARED with that zero instead of omitted, because the coverage arm
+    could not tell a parameter that is zerofill BY DESIGN (spec section 2.2's
+    padded vocabulary rows, which exist on no card and in no checkpoint) from
+    one the plan simply forgot -- both vanished from this map and both read as
+    UNCOVERED, which is how boot weg2xsn14 reported 12 uncovered tensors per
+    tag with `short=0 missing=0`.
     """
     z = wx.XchgDesc(
         tag=TAG_A, src_rank=-1, dst_rank=1, param_name="pad", kind=wx.ZEROFILL,
         nbytes=64, rows=1, run_bytes=64, spitch=64, dpitch=64,
     )
     got = wx.plan_bytes_from_descs([_desc(TAG_A, "real", 8), z])
-    assert got == {TAG_A: {"real": 8}}
+    assert got == {TAG_A: {"real": 8, "pad": 0}}
+    # the property the name change must not touch: zerofill adds no bytes
+    assert got[TAG_A]["pad"] == 0
+    assert sum(got[TAG_A].values()) == 8
 
 
 def test_an_empty_plan_is_an_empty_mapping_not_a_zero():
