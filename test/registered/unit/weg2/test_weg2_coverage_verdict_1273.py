@@ -277,3 +277,27 @@ class TheUncoveredPopulationIsClassifiedNotRelabelled(CustomTestCase):
 
     def test_a_clean_row_names_nothing(self):
         self.assertEqual(_row(uncovered=0).uncovered_lines(), [])
+
+    def test_arm_coverage_ACTUALLY_EMITS_them(self):
+        """A MUTANT bought this: the test above drives the helper, and nothing
+        pinned that the emitter calls it -- so replacing the emit loop with
+        `pass` scored GREEN-SURVIVED and the table would silently not exist.
+
+        Third instance of one class in this campaign (B4f's M5, B4d's M9, this):
+        a pin on a helper is not a pin on the site that uses it.  Structural,
+        via AST, so it survives re-wrapping.
+        """
+        import ast
+        import inspect
+        import textwrap
+
+        src = textwrap.dedent(inspect.getsource(wx.arm_coverage))
+        tree = ast.parse(src)
+        calls = [ast.unparse(n) for n in ast.walk(tree) if isinstance(n, ast.Call)]
+        self.assertTrue(
+            any("uncovered_lines()" in c for c in calls),
+            "arm_coverage must CALL uncovered_lines(), not merely be able to")
+        # and the result must reach `emit`, not a local
+        emits = [c for c in calls if c.startswith("emit(")]
+        self.assertTrue(any("ln" == c[len("emit("):-1] for c in emits),
+                        f"the named lines must be emitted; emits={emits}")
