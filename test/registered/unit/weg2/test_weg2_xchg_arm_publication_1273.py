@@ -170,3 +170,73 @@ def test_the_name_no_longer_says_shadow():
     assert hasattr(lz, "prepare_xchg_env")
     assert not hasattr(lz, "prepare_shadow_env"), \
         "two names for one publisher is how two readers begin"
+
+
+# ===========================================================================
+# EXECUTION SMOKE: the seam driven by the PUBLISHED environment.
+#
+# Every other test of the seam sets the env vars by hand, which proves the
+# seam reads them but not that the launcher WRITES the ones it reads. This one
+# closes that loop: the env comes out of `prepare_xchg_env`, is applied
+# verbatim, and the seam is driven through the product method -- so a name the
+# publisher spells differently than the reader fails HERE rather than on the
+# metal, which is the whole class of defect step 7 was.
+# ===========================================================================
+
+
+class TheSeamRunsOnThePublishedEnvironment:
+    """Namespace only; the collected tests are the functions below."""
+
+
+def test_the_seam_reads_the_mode_and_terms_the_launcher_published(tmp_path,
+                                                                  monkeypatch):
+    from .test_weg2_xchg_bounce_execution_smoke_1273 import (
+        DEPTH, SLOT_BYTES, _all_descs, _manager, _seed_source,
+    )
+    from .test_weg2_xchg_transport_1273 import FakeDeviceOps
+
+    published = _env(lz.WEIGHT_SOURCE_EXCHANGE, dry=True,
+                     oncard_mode=tp.ONCARD_MODE_HOST, oncard_slot_mib=128,
+                     bounce_terms=_terms(),
+                     inject_mode=wx.INJECT_SHADOW)
+    # APPLIED VERBATIM, as a rank process would receive it.
+    for key, value in published.items():
+        monkeypatch.setenv(key, str(value))
+
+    # The reader agrees with the publisher, on all three of step 6/7's names.
+    assert wx.exchange_armed() is True
+    assert wx.inject_mode() == wx.INJECT_SHADOW
+    assert xb.read_published_terms() == _terms()
+
+    ops = FakeDeviceOps(str(tmp_path), 0)
+    _seed_source(ops)
+    # NO `mode=` ARGUMENT: the leg must take it from the published env through
+    # `wx.inject_mode()`, which is the path the product uses.
+    result = _manager()._weg2_xchg_bounce_leg(
+        descs=_all_descs(), ops=ops,
+        boot_nonce=published[xr.ENV_REGION_BOOT],
+        slot_bytes=SLOT_BYTES, depth=DEPTH, shm_root=str(tmp_path),
+    )
+    assert result.inject is not None, \
+        "the leg did not take shadow mode from the published environment"
+    assert result.inject.mode == wx.INJECT_SHADOW
+    assert result.inject.pieces > 0
+
+
+def test_the_published_slot_is_the_one_the_rank_sizes_from(tmp_path,
+                                                           monkeypatch):
+    """The one-value identity, end to end through the publication.
+
+    `tp.ONCARD_SLOT_BYTES_MAX` resolves `ENV_ONCARD_SLOT_MIB` AT IMPORT, so a
+    rank's per-card staging budget is fixed by what the launcher published
+    before the rank started -- which is why the publisher and the reader must
+    spell the same name, and why this asserts the arithmetic rather than the
+    string.
+    """
+    published = _env(lz.WEIGHT_SOURCE_EXCHANGE, dry=True,
+                     oncard_mode=tp.ONCARD_MODE_HOST, oncard_slot_mib=128,
+                     bounce_terms=_terms())
+    assert published[tp.ENV_ONCARD_SLOT_MIB] == "128"
+    terms = xb.read_published_terms(published[xb.ENV_BOUNCE_TERMS])
+    assert terms.slot_bytes == 128 * xb.MIB
+    assert terms.staging_per_card == xb.staging_bytes_per_card(128 * xb.MIB)
