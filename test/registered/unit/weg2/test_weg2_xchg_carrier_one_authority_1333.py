@@ -101,6 +101,13 @@ CARRIER_SIZE_ALLOWED = {
 }
 
 
+def _function(path: Path, name: str) -> ast.FunctionDef:
+    """The named function's AST node, so a pin can ask what the code DOES."""
+    for node in ast.walk(ast.parse(path.read_text(), filename=str(path))):
+        if isinstance(node, ast.FunctionDef) and node.name == name:
+            return node
+    raise AssertionError(f"{name} not found in {path}")
+
 # ===========================================================================
 # (1) THE DELETION, asserted as an ABSENCE rather than assumed.
 # ===========================================================================
@@ -154,10 +161,31 @@ def test_the_surviving_authority_is_the_one_the_product_reads():
     assert terms.staging_bytes == xr.N_CARDS * xb.staging_bytes_per_card(slot)
     # The rank-side budget reader calls it by name (source pin, #1273 S6 form).
     wu = (Path(hl.__file__).resolve().parents[1] / "managers"
-          / "scheduler_components" / "weight_updater.py").read_text()
-    body = wu.split("def _weg2_shadow_host_budget")[1].split("\n    def ")[0]
-    assert CARRIER_SIZE_OWNER in body, body[:400]
-    assert "diagonal_carrier_bytes" not in body, body[:400]
+          / "scheduler_components" / "weight_updater.py")
+    fn = _function(wu, "_weg2_shadow_host_budget")
+    # WHAT REACHES THE RETURN, not what the body MENTIONS.  MUTANT M8 -- the
+    # rank enforcing the RETIRED `ONCARD_DEPOSIT_BYTES_MAX` (8 x slot), i.e.
+    # literally the 4x disagreement AMENDMENT 5 retired -- SURVIVED a substring
+    # pin, because the method's own comment still names the owner while
+    # explaining the retirement.  Same lesson as seat 5's M9 and B4f's M5: a pin
+    # must name what reached the site.
+    # EVERY callee inside a return expression, not just the outermost one --
+    # the real return is ``int(xb.staging_bytes_per_card(...))``, so a pin that
+    # read only the top node saw ``int`` and would have passed on anything.
+    called = {
+        (n.func.attr if isinstance(n.func, ast.Attribute)
+         else getattr(n.func, "id", None))
+        for r in ast.walk(fn)
+        if isinstance(r, ast.Return) and r.value is not None
+        for n in ast.walk(r.value) if isinstance(n, ast.Call)
+    }
+    assert CARRIER_SIZE_OWNER in called, called
+    names = {n.attr for n in ast.walk(fn) if isinstance(n, ast.Attribute)}
+    assert "ONCARD_DEPOSIT_BYTES_MAX" not in names, (
+        "the rank is back on the retired 8x ceiling while the ledger charges "
+        "SLOTS_PER_PAIR x slot -- the 4x disagreement on one payload"
+    )
+    assert "diagonal_carrier_bytes" not in {*names, *called}
 
 
 def test_no_SECOND_function_in_weg2_computes_the_carrier_size():
@@ -274,9 +302,26 @@ def test_a_three_batch_deposit_is_refused_as_UNFUNDED_on_the_PRODUCT_default():
         **graded) == tp.DEPOSIT_REASON_BATCHES
     # The production caller does NOT narrow slots_max -- the premise of the
     # whole correction, pinned at the source so it cannot drift silently.
-    shadow = (WEG2_DIR / "weight_exchange_shadow.py").read_text()
-    call = shadow.split("tp.deposit_refusal_reason(")[1].split(")")[0]
-    assert "slots_max" not in call, call
+    # ASKED OF THE AST.  MUTANT M6 -- the production caller narrowing
+    # `slots_max` back to SLOTS_PER_PAIR -- SURVIVED my first version, which
+    # took the call text with `split(")")[0]` and so stopped at the `)` inside
+    # `int(host_bounce_budget_bytes)`, before the argument it was looking for.
+    # A nested-paren call cannot be read by a text split; this is the same
+    # extractor-blindness class as #1342's caller-detection regex.
+    shadow = WEG2_DIR / "weight_exchange_shadow.py"
+    calls = [
+        n for n in ast.walk(ast.parse(shadow.read_text()))
+        if isinstance(n, ast.Call)
+        and getattr(n.func, "attr", getattr(n.func, "id", None))
+        == "deposit_refusal_reason"
+    ]
+    assert calls, "the production caller is gone; the premise needs re-checking"
+    for call in calls:
+        kw = {k.arg for k in call.keywords}
+        assert "slots_max" not in kw, (
+            f"the production caller at line {call.lineno} narrows slots_max "
+            f"again; the charge, not the row area, is what binds here"
+        )
 
 
 @pytest.mark.parametrize("owner_doc", ["staging_bytes_per_card"])
