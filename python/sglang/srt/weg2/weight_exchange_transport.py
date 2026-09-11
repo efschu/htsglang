@@ -3109,6 +3109,29 @@ def run_leg(
     on_card = [d for d in descs
                if d.kind != ZEROFILL and _on_card(d) and int(d.src_rank) == rank]
 
+    # #1335: THE LABEL IS VALIDATED AT THE DOOR, and the whole reason is that
+    # it is ONLY a label.  ``uuid_of_card`` feeds nothing but the
+    # ``src_uuid``/``dst_uuid`` of the PairStats line below (spec R10, the
+    # per-pair acceptance line keyed by source and destination uuid), and yet
+    # boots weg2xsn9 and weg2xsn10 lost every leg of every flip to the bare
+    # subscript of it: the field that carried it had no producer, so the map
+    # was ``()`` and the index was ``IndexError: tuple index out of range``
+    # with no message and no site.  Two things follow, both here: the map is
+    # checked BEFORE a thread exists or a byte is issued, so a descriptive
+    # lookup can never abort a payload in flight; and the check is by NAME
+    # (W23), including the case where the map's entry for THIS rank is not the
+    # card uuid NVML gave the adapter -- two halves disagreeing about which
+    # card a rank runs on is a stop, not something to work around.
+    labelled_cards = sorted({
+        c
+        for src_card, dst_card in xr.CROSS_PAIRS
+        if (src_card if is_source else dst_card) == rank
+        for c in (src_card, dst_card)
+    })
+    uuid_of_card = xr.require_card_uuid_map(
+        uuid_of_card, rank=int(rank), card_uuid=str(card_uuid),
+        cards=labelled_cards)
+
     for pair, (src_card, dst_card) in enumerate(xr.CROSS_PAIRS):
         if (src_card if is_source else dst_card) != rank:
             continue

@@ -3408,7 +3408,21 @@ class ShadowLegInputs:
     peer_row: int
     device: int
     card_uuid: str
-    uuid_of_card: Tuple[str, ...] = ()
+    #: THE CARD->UUID MAP, or ``None`` to let the region produce it. #1335.
+    #:
+    #: This field used to default to ``()``, and NOTHING IN THE TREE EVER WROTE
+    #: IT -- the adapter (``weight_updater``'s ``ShadowLegInputs(`` block)
+    #: passes ``card_uuid`` and not this -- so the transport indexed an empty
+    #: tuple on every leg and boots weg2xsn9 and weg2xsn10 died 36 times each
+    #: on ``IndexError: tuple index out of range``.  A required input with an
+    #: unusable default is the defect; ``None`` is NOT that default in a new
+    #: coat but a CONTRACT with one named authority:
+    #: :func:`weight_exchange_region.uuid_of_card`, which reads the launcher's
+    #: own ``CUDA_VISIBLE_DEVICES`` and REFUSES BY NAME (W23) when it cannot.
+    #: An explicitly-passed ``()`` still refuses -- "I have a map and it is
+    #: empty" is exactly the broken state, and it must not be a synonym for
+    #: "ask the authority".
+    uuid_of_card: Optional[Tuple[str, ...]] = None
     wave: int = 0
     free_mib: int = 0
     resume_reserve_bytes: int = 0
@@ -4048,7 +4062,15 @@ def run_leg_hook(
             region=leg.region, sems=leg.sems, ops=leg.ops, row=inputs.row,
             rank=inputs.rank, device=inputs.device,
             card_uuid=inputs.card_uuid,
-            uuid_of_card=tuple(inputs.uuid_of_card), descs=plan_descs,
+            # #1335: ONE authority for "where does the map come from".  The
+            # hook asks the region when the caller carried none; the transport
+            # never reaches for the environment itself (that would be a second
+            # reader of one fact).  A W23 refusal from here is the launcher's
+            # string being absent or mis-sized, reported by name.
+            uuid_of_card=(xr.uuid_of_card()
+                          if inputs.uuid_of_card is None
+                          else tuple(inputs.uuid_of_card)),
+            descs=plan_descs,
             is_source=is_source, oncard_mode=mode, peer_row=inputs.peer_row,
             wave=inputs.wave, leg=inputs.leg, direction=inputs.direction,
             epoch=inputs.epoch, free_mib=inputs.free_mib, log=log,

@@ -364,6 +364,126 @@ def row_group_rank(row: int) -> Tuple[str, int]:
     return ("P" if int(row) < N_CARDS else "D", int(row) % N_CARDS)
 
 
+class Weg2XchgCardUuidMapUnusable(RuntimeError):
+    """W23. The card->uuid map is absent, mis-sized, or names another card. #1335.
+
+    BOOTS weg2xsn9 and weg2xsn10 both died on EVERY leg of EVERY flip with
+    ``IndexError: tuple index out of range`` at
+    ``weight_exchange_transport.py:3116``, and the root was a required input
+    with NO PRODUCER: ``weight_exchange_shadow.ShadowLegInputs.uuid_of_card``
+    was declared ``Tuple[str, ...] = ()`` and no writer existed anywhere in the
+    tree, so the transport indexed an empty tuple unconditionally.  A required
+    input declared with an unusable default is a defect of its own; the answer
+    is a producer plus this refusal, never a padded or truncated map.
+
+    WHY THIS MODULE OWNS THE MAP.  The launcher builds
+    ``CUDA_VISIBLE_DEVICES`` as ``",".join(c.uuid for c in cards)`` and hands
+    the SAME string to every rank of BOTH groups (``launcher.py``'s
+    ``build_env``) for exactly one reason, which this module's own header
+    states: *rank n of either group runs on ``cards[n]``*.  The card ordering
+    is this module's invariant, so "which uuid is card n" is read here, once,
+    and nowhere else -- one job, one mover.
+
+    WHAT IT REFUSES, and each reason is NAMED in the message:
+
+    * ``unset`` -- the variable is missing or blank.  A rank with no map cannot
+      label, and must not invent, its pairs.
+    * ``count`` -- not exactly :data:`N_CARDS` entries.  Padding a short list
+      or dropping a surplus entry would shift the index off the card ordinal,
+      which is a wrong LABEL on the acceptance line and a wrong IDENTITY in
+      the check below -- silently.
+    * ``blank`` -- an empty entry between two commas.
+    * ``disagrees`` -- the map's entry for this rank is not the uuid NVML gave
+      the adapter for this rank's own card.  Two halves disagreeing about
+      which card a rank runs on is a STOP, never something to compensate: a
+      leg that proceeded would price and label a DIFFERENT rank's card.  This
+      reason also catches an ordinal-valued ``CUDA_VISIBLE_DEVICES``
+      (``"0,1,2"``), because ``"0"`` is not an NVML uuid -- which is why no
+      separate string-shape rule is needed and none is imposed.
+    """
+
+
+def uuid_of_card(env: Optional[str] = None) -> Tuple[str, ...]:
+    """The card->uuid map, in CARD ORDER, from the launcher's own string.
+
+    ``env`` is for tests and for a caller that already holds the string; when
+    it is ``None`` the variable is read here.  The returned index IS the card
+    ordinal (see :class:`Weg2XchgCardUuidMapUnusable` for why that is a
+    contract and not a convenience).
+
+    Refuses by name rather than returning a partial map: see that class for
+    the four reasons and for the two boots this cost.
+    """
+    raw = os.environ.get("CUDA_VISIBLE_DEVICES") if env is None else env
+    source = "the environment" if env is None else "the injected string"
+    if raw is None or not str(raw).strip():
+        raise Weg2XchgCardUuidMapUnusable(
+            f"W23 Weg2XchgCardUuidMapUnusable reason=unset: the card->uuid "
+            f"map is unset or blank in {source} ({raw!r}). The launcher sets "
+            f"it for every rank of both groups as the comma-joined card uuids "
+            f"in card order; a rank that cannot read it cannot label or "
+            f"identify its cards and must refuse rather than index a map it "
+            f"does not have"
+        )
+    entries = [part.strip() for part in str(raw).split(",")]
+    if len(entries) != N_CARDS:
+        raise Weg2XchgCardUuidMapUnusable(
+            f"W23 Weg2XchgCardUuidMapUnusable reason=count: {source} holds "
+            f"{len(entries)} entr{'y' if len(entries) == 1 else 'ies'} "
+            f"({raw!r}) but this rig has N_CARDS={N_CARDS}. The index into "
+            f"this map IS the card ordinal, so a padded or truncated map "
+            f"would point at the wrong card silently"
+        )
+    if any(not e for e in entries):
+        raise Weg2XchgCardUuidMapUnusable(
+            f"W23 Weg2XchgCardUuidMapUnusable reason=blank: {source} has an "
+            f"empty entry ({raw!r}); an empty uuid is not a card"
+        )
+    return tuple(entries)
+
+
+def require_card_uuid_map(
+    uuid_of_card_: Optional[Sequence[str]],
+    *,
+    rank: int,
+    card_uuid: str,
+    cards: Sequence[int] = (),
+) -> Tuple[str, ...]:
+    """Validate a map a leg is about to LABEL ITS PAIRS with. #1335.
+
+    Called at the DOOR of a leg, before any thread or copy exists, because the
+    only consumer of this map is the ``src_uuid``/``dst_uuid`` of
+    ``PairStats`` -- the per-pair acceptance line (spec R10) -- and a
+    descriptive label must never be able to abort a payload, let alone abort it
+    halfway through.  ``cards`` are the card ordinals this leg will actually
+    index, so the refusal can name them.
+    """
+    entries = tuple(str(u) for u in (uuid_of_card_ or ()))
+    needed = max([int(c) for c in cards], default=N_CARDS - 1) + 1
+    if len(entries) < needed or any(not e for e in entries):
+        raise Weg2XchgCardUuidMapUnusable(
+            f"W23 Weg2XchgCardUuidMapUnusable reason=count rank={int(rank)}: "
+            f"this leg labels cards {tuple(int(c) for c in cards) or 'all'} "
+            f"and needs {needed} entr{'y' if needed == 1 else 'ies'}, but the "
+            f"map it was handed is {entries!r}. The map's only consumer is the "
+            f"PairStats src_uuid/dst_uuid label of the per-pair acceptance "
+            f"line; an unusable label is refused here, at the door, so it can "
+            f"never abort a payload that has already started"
+        )
+    mine = entries[int(rank)]
+    if mine != str(card_uuid):
+        raise Weg2XchgCardUuidMapUnusable(
+            f"W23 Weg2XchgCardUuidMapUnusable reason=disagrees "
+            f"rank={int(rank)}: the card->uuid map says this rank's card is "
+            f"{mine!r}, NVML told the adapter it is {str(card_uuid)!r}. The "
+            f"region's card ordering and the adapter's card identity are "
+            f"naming different cards, so a leg that proceeded would price and "
+            f"label another rank's card. Two halves that disagree STOP; "
+            f"nothing here compensates"
+        )
+    return entries
+
+
 class Weg2XchgDiagonalHasNoCrossPair(ValueError):
     """W15. A DIAGONAL request reached a CROSS-ONLY site. #1334.
 

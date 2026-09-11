@@ -241,14 +241,25 @@ from .test_weg2_xchg_transport_1273 import (  # noqa: E402
 )
 
 
-def _store_forward_leg(armed_region, boot_nonce, tmp_path, *, monkeypatch):
-    """One leg with the PRODUCT's own two settings for the host arm.
+def _store_forward_leg(armed_region, boot_nonce, tmp_path, *, monkeypatch,
+                       inject_map=False):
+    """One leg with the PRODUCT's own settings for the host arm.
 
     `oncard_drainable=False` is what the adapter sets
     (`weight_updater._weg2_shadow_hook`), and under S6 it MEANS
     store-and-forward; the execution smoke leaves it True and therefore never
     reaches the deposit at all -- which is why the smoke was green on both arms
     while boot weg2xsn9 died 36 times.
+
+    `inject_map` (#1335) IS THE SECOND HALF OF THAT LESSON, and its default is
+    the one that matters.  This double used to pass
+    `uuid_of_card=("u0","u1","u2")` unconditionally -- the ONE keyword the
+    adapter does not pass -- so it supplied what the product never supplied and
+    could not fail in the product's direction: boots weg2xsn9 AND weg2xsn10
+    both died on that map being empty while this very function was green.  The
+    default now MIRRORS THE ADAPTER (the keyword is omitted, the region
+    produces the map from `CUDA_VISIBLE_DEVICES`), and injecting a map is the
+    explicit opt-in for a test that wants a specific one.
     """
     import threading
 
@@ -269,10 +280,11 @@ def _store_forward_leg(armed_region, boot_nonce, tmp_path, *, monkeypatch):
     p_lines, d_lines = [], []
 
     def inputs(hook, row, peer_row, gate_rows):
+        extra = {"uuid_of_card": ("u0", "u1", "u2")} if inject_map else {}
         return sh.ShadowLegInputs(
             leg=0, epoch=epoch, direction="P->D", hook=hook, rank=0, row=row,
             peer_row=peer_row, device=0, card_uuid="u0",
-            uuid_of_card=("u0", "u1", "u2"), wave=WAVE, free_mib=8192,
+            **extra, wave=WAVE, free_mib=8192,
             gate_rows=tuple(gate_rows),
             # THE PRODUCT'S TWO SETTINGS, verbatim from the adapter.
             oncard_drainable=False,

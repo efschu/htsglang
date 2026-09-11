@@ -513,12 +513,17 @@ class TestOneWCodePerException(CustomTestCase):
         # refusal that replaced boot weg2xsn9's bare IndexError. Same register
         # discipline as W14 one commit earlier: the list shrinks here, now.
         self.assertIn(15, used, "W15 is the diagonal-lane refusal's number now")
+        # #1335 (2026-09-11) TOOK W23 for `Weg2XchgCardUuidMapUnusable`, the
+        # refusal that replaced the card->uuid map's UNPRODUCED default -- the
+        # root of boot weg2xsn9's AND weg2xsn10's 36-leg IndexError. The list
+        # shrinks here, in the same commit, for the third code running.
+        self.assertIn(23, used, "W23 is the card-uuid-map refusal's number now")
         # AND THE LIST IS NOW WORTH MORE THAN IT WAS: `census` reads the
         # SIGNATURE-DEFAULT form as of this commit (form 4), so a number that
         # is only held by `code: str = "Wnn"` can no longer be named free here.
         # That is how W88 was mis-named free by B1b's first enumeration --
         # 19 textual hits under python/sglang/srt, 0 visible to this file.
-        for n in (23, 39):
+        for n in (39,):
             self.assertNotIn(n, used, f"W{n} was named free and is not")
         self.assertIn(88, used, "form 4 must see scheduler.py's signature code")
 
