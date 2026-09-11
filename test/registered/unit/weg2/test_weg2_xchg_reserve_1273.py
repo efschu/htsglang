@@ -1,45 +1,60 @@
 # SPDX-License-Identifier: Apache-2.0
-"""B4g wall 2: W19's reserve is PRICED on the exchange form, not borrowed.
+"""B4i: the `WEG2-XCHG-RESERVE` line -- EMITTED, and on ONE INSTRUMENT.
 
-Boot weg2xsn14 tripped ``W19 DormantResidueRefused`` at EPOCH 0 -- before the
-first flip -- against a reserve built from ``DC_MEASURED_D_*``, constants
-MEASURED ON A SERVING BOOT (weg2ls1b2) which therefore contain none of the
-exchange lane's own device residency.  Those constants are never hand-raised
-(operator ruling, and the VRAM-corridor law), so the exchange form is priced
-instead: the census's per-card ``dormant_proc_used_mib`` plus the lane's own
-terms, each NAMED on its own line.
+**THIS FILE'S B4g/B4h ARITHMETIC IS RETRACTED.  Read this paragraph before any
+older text that quotes 773 / 935 / 773.**  B4g priced the exchange form's
+dormant reserve as *census dormant + named terms* and reported the remainder
+against the measured residue as an UNATTRIBUTED residual of 773 / 935 / 773 MiB
+(162 on the 5090 alone).  That residual does not exist.  It was manufactured by
+subtracting HOST populations from a DEVICE reading: the staging region
+(`xchg.bin`, 385 MiB) and the on-card deposit slots (3x32 = 96 MiB) are both
+`/dev/shm` allocations, while `WEG2-DC` is per-process NVML at sleep.  They were
+never inside `measured`, so removing them invented the gap exactly:
+1254 - 481 = 773 and 1416 - 481 = 935.
 
-THE SUBTRACTION THE OPERATOR ASKED FOR, and it REFUTED THIS SEAT'S OWN FIRST
-READING -- which is why the numbers are asserted here rather than described:
+SAME-INSTRUMENT ARITHMETIC, which is the only kind this line may print
+(boot weg2xsn15's per-card term table):
 
-    measured   2588 / 3084 / 2588      (weg2xsn14, epoch 0)
-    reserved   1986 / 2292 / 1986      (serving constants + slack)
-    excess      602 /  792 /  602
-    census     1334 / 1668 / 1334      (the front's own uuid-keyed WEG2-DC)
-    m - census 1254 / 1416 / 1254
-    - named     481 = region 385 + on-card slots 3x32
-    residual    773 /  935 /  773  UNEXPLAINED
+    XSN15  D @ sleep   3084 / 2590 / 2588      WEG2-DC, exchange form
+    sn5b   D @ sleep   1668 / 1334 / 1334      WEG2-DC, serving form (the census)
+    delta              1416 / 1256 / 1254
+    weights_draft tag  1440 / 1280 / 1280      tms_tag_bytes, resident, in_family=no
+    unexplained          -24 /  -24 /   -26    instrument margin
 
-The asymmetry is **162 MiB on the 5090 alone** and it SURVIVES every uniform
-subtraction.  This seat had predicted the census's foreign-split bound (source
-``[42, 11, 11]`` vs this form's ``[39, 13, 12]``, over-pricing stage 0 = the
-5090) -- but an OVER-priced census term makes that card's residual SMALLER,
-and the observed sign is the opposite.  The bound is not the explanation and
-that reading is withdrawn.
+So the difference between the two readings IS the resident draft tag, and the
+answer is B4k (the draft head joins the weights family and is exchanged like
+every other layer), not a wider reserve and not a residual field.
 
-So this half prices what can be named and REPORTS the rest: W19 stays a
-refusal with a number attached.  A reserve widened to swallow an unexplained
-773-935 MiB would be the defect the host-threshold law forbids.
+**AND THE LINE WAS NEVER EMITTED.**  Boot weg2xsn15 read `WEG2-XCHG-RESERVE`
+**0 times in all four logs** while `W19` was genuine 0 -- so the constant was in
+force and the line that was to report it reached no log at all.  The root is the
+same class as W84's (a guard that computes and never raises) one level down:
+`xchg_form_dormant_reserve` had **zero production call sites**.  It was called
+only from this file and from `test_weg2_w19_form_residue_1273.py`, so every
+suite was green over a function no boot ever ran.  The fix wires it into
+`main()` BEFORE the dry-return, so a dry-run prints it too, and the reachability
+is pinned STRUCTURALLY below -- an execution test on the function alone is
+exactly the proof that was already green while the boot printed nothing.
+
+RED ON `dfceb7004e`: the line carries `dormant_census_mib=`/`region_mib=`/
+`oncard_slots_mib=`/`priced_mib=`/`residual_unattributed_mib=` instead of
+`measured_mib=`/`reserved_mib=`, the function returns a three-tuple whose third
+element is the invented residual, and `main()` does not call it.
 """
 
+import ast
+import inspect
 import json
 import os
 import tempfile
+import textwrap
 import unittest
 
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 
-from sglang.srt.weg2 import launcher, xchg_residency
+from sglang.srt.weg2 import launcher
+from sglang.srt.weg2 import launcher as L
+from sglang.srt.weg2 import xchg_residency
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -49,8 +64,9 @@ BIG = "GPU-31d7ef41-f574-4d0e-21ad-e773fd938f6d"
 SM1 = "GPU-5c648f96-be1d-42d5-0221-34d11ab137f7"
 SM2 = "GPU-62dbbae1-e859-9ccc-f9c2-d9f2443a84f4"
 
-#: weg2xsn14's own epoch-0 readings, and the census's own dormant numbers.
-MEASURED = {SM1: 2588, BIG: 3084, SM2: 2588}
+#: weg2xsn14's own epoch-0 readings (the constant), and the census's own
+#: dormant numbers (the serving form).  BOTH are `WEG2-DC` at sleep.
+MEASURED_XCHG = {SM1: 2588, BIG: 3084, SM2: 2588}
 CENSUS_DORMANT = {SM1: 1334, BIG: 1668, SM2: 1334}
 SERVING_RESERVE = {SM1: 1986, BIG: 2292, SM2: 1986}
 
@@ -79,123 +95,267 @@ def _census(path, dormant=None, drop=()):
     return path
 
 
-class TheReserveIsPricedFromTheCensusAndNamedTerms(CustomTestCase):
+class _Collect:
+    def __init__(self):
+        self.lines = []
+
+    def __call__(self, line):
+        self.lines.append(str(line))
+
+
+# ---------------------------------------------------------------------------
+# AST helpers, the #1294 shape (a pin on a helper is not a pin on its caller).
+# ---------------------------------------------------------------------------
+
+
+def _fn_ast_with_offset(fn):
+    src, start = inspect.getsourcelines(fn)
+    return ast.parse(textwrap.dedent("".join(src))), start - 1
+
+
+def _callee_name(node):
+    f = node.func
+    return f.id if isinstance(f, ast.Name) else getattr(f, "attr", None)
+
+
+def _calls_in(tree, name):
+    return [
+        n
+        for n in ast.walk(tree)
+        if isinstance(n, ast.Call) and _callee_name(n) == name
+    ]
+
+
+def _dry_return_line(tree):
+    fn = tree.body[0]
+    for n in fn.body:
+        if isinstance(n, ast.If) and isinstance(n.test, ast.Name) and n.test.id == "dry":
+            for stmt in reversed(n.body):
+                if isinstance(stmt, ast.Return):
+                    return stmt.lineno
+    raise AssertionError("main() no longer has a top-level `if dry:` branch")
+
+
+# ===========================================================================
+# THE LINE IS ON ONE INSTRUMENT.
+# ===========================================================================
+
+
+class TheReserveLineReportsTwoReadingsOfOneInstrument(CustomTestCase):
     def _run(self, **kw):
         p = _census(os.path.join(tempfile.mkdtemp(), "c.json"), **kw)
-        return launcher.xchg_form_dormant_reserve(CARDS, p, oncard_slot_mib=32)
+        log = _Collect()
+        out, lines = launcher.xchg_form_dormant_reserve(CARDS, p, log=log)
+        self.assertEqual(lines, log.lines, "the lines returned must be the "
+                                           "lines logged, or one of the two "
+                                           "is a second bookkeeping")
+        return out, lines
 
-    def test_the_reserve_is_the_census_plus_the_named_terms(self):
-        out, lines, _res = self._run()
-        named = launcher.xchg_resident_region_mib(len(CARDS)) + 3 * 32
-        self.assertEqual(named, 481)
-        for u in (BIG, SM1, SM2):
-            self.assertEqual(out[u], CENSUS_DORMANT[u] + named)
-        self.assertEqual(out[BIG], 2149)
-        self.assertEqual(out[SM1], 1815)
+    def test_reserved_is_the_forms_own_constant_through_the_one_selector(self):
+        """`reserved_mib` must be what W19 actually grades against, read
+        through `dc_measured_d_mib` -- a second copy of the triple here is the
+        parallel-object defect the selector exists to prevent."""
+        out, _lines = self._run()
+        for u, card in ((BIG, CARDS[0]), (SM1, CARDS[1]), (SM2, CARDS[2])):
+            self.assertEqual(
+                out[u],
+                launcher.dc_measured_d_mib(card, launcher.WEIGHT_SOURCE_EXCHANGE),
+            )
+            self.assertEqual(out[u], MEASURED_XCHG[u])
 
-    def test_it_is_SMALLER_than_the_serving_reserve_on_every_card(self):
-        """AND THAT REFUTES THE SWAP AS A FIX -- the second refutation of this
-        half, measured rather than argued.
+    def test_both_numbers_on_the_line_are_WEG2_DC_AT_SLEEP(self):
+        """THE FIX FOR THE RETRACTED RESIDUAL, as a property of the line.
 
-        One would expect pricing the exchange form to RAISE the reserve, since
-        the serving constants contain none of the lane's residency.  It does
-        the opposite: the census's own dormant readings (1668 / 1334 / 1334,
-        from boot weg2sn5b's front) are BELOW ``DC_MEASURED_D_*`` (2228 / 1922,
-        from weg2ls1b2), so census+named comes to 2149 / 1815 / 1815 against
-        the serving reserve's 2292 / 1986 / 1986.
-
-        CONSEQUENCE: simply re-sourcing W19's reserve from the census makes the
-        refusal STRICTER, not satisfiable -- the excess grows from 602/792/602
-        to 773/935/773.  So the census is the right authority for the census's
-        question (what a sleeping rank held on ITS boot) and the WRONG one for
-        this one (what a sleeping rank holds on THE EXCHANGE FORM).  What W19
-        needs is a measurement ON THIS FORM, which is the operator's second
-        option, and these numbers are why it is the one that can work.
+        The line may carry only readings of ONE instrument, so that the
+        difference a reader takes between them is a difference of like for
+        like.  `measured_mib` is the census's own `WEG2-DC` dormant reading
+        (the serving form), `reserved_mib` is the same instrument on the
+        exchange form (weg2xsn14).  Their delta is the resident draft tag.
         """
-        out, _l, _r = self._run()
-        for u in (BIG, SM1, SM2):
-            self.assertLess(out[u], SERVING_RESERVE[u], u)
-        self.assertEqual(out[BIG], 2149)
-        self.assertEqual(SERVING_RESERVE[BIG], 2292)
-
-    def test_every_term_is_printed_by_name(self):
-        _out, lines, _r = self._run()
+        _out, lines = self._run()
         self.assertEqual(len(lines), 3)
         for ln in lines:
             self.assertIn("WEG2-XCHG-RESERVE", ln)
-            self.assertIn("dormant_census_mib=", ln)
-            self.assertIn(f"region_mib={launcher.xchg_resident_region_mib(len(CARDS))}", ln)
-            self.assertIn("oncard_slots_mib=96", ln)
-            self.assertIn("(3x32)", ln)
-            # RENAMED BY B4h: this function is the PRICER and the MEASURED
-            # value now sits beside it on the same line, so `priced_mib` says
-            # which of the two it is.  The residual between them is printed
-            # rather than left to the reader.
-            self.assertIn("priced_mib=", ln)
-            self.assertIn("measured_mib=", ln)
+            self.assertIn("reserved_mib=", ln)
             self.assertIn("source=measured:weg2xsn14", ln)
-            self.assertIn("residual_unattributed_mib=", ln)
+            self.assertIn("measured_mib=", ln)
+            self.assertIn("instrument=WEG2-DC-at-sleep", ln)
             self.assertIn("census_source=READING", ln)
 
-    def test_the_slot_term_follows_the_published_slot(self):
-        p = _census(os.path.join(tempfile.mkdtemp(), "c.json"))
-        out, lines, _r = launcher.xchg_form_dormant_reserve(
-            CARDS, p, oncard_slot_mib=128)
-        self.assertEqual(out[BIG], 1668 + launcher.xchg_resident_region_mib(len(CARDS)) + 3 * 128)
-        self.assertTrue(any("oncard_slots_mib=384" in ln for ln in lines))
+    def test_the_host_terms_and_the_invented_residual_are_GONE(self):
+        """The retraction, asserted so it cannot come back by copy-paste.
+
+        `region_mib` and `oncard_slots_mib` are `/dev/shm` bytes.  Printing
+        them on a line whose other numbers are per-process NVML is what
+        produced a 773/935/773 MiB finding out of nothing, and a reader who
+        subtracts them again gets the same non-number.
+        """
+        _out, lines = self._run()
+        for ln in lines:
+            for banned in (
+                "region_mib=",
+                "oncard_slots_mib=",
+                "residual_unattributed_mib=",
+                "priced_mib=",
+                "dormant_census_mib=",
+            ):
+                self.assertNotIn(banned, ln, f"{banned} is retracted: {ln}")
+
+    def test_the_census_reading_is_reported_not_subtracted(self):
+        """The census stays on the line as the SERVING form's reading of the
+        same instrument -- it is the comparison's other end, not a term."""
+        _out, lines = self._run()
+        for u in (BIG, SM1, SM2):
+            self.assertTrue(
+                any(f"measured_mib={CENSUS_DORMANT[u]}" in ln for ln in lines),
+                f"{u}: the census's own WEG2-DC reading is not on any line",
+            )
 
     def test_a_card_missing_from_the_census_refuses(self):
         """The serving constants must NOT stand in -- they contain none of the
-        lane's residency, so borrowing them is how weg2xsn14 got its reserve."""
+        exchange lane's residency, so borrowing them is how weg2xsn14 got its
+        reserve."""
         with self.assertRaises(xchg_residency.Weg2XchgResidencyUnarmable) as caught:
             self._run(drop=(BIG,))
         self.assertIn("31d7ef41", str(caught.exception))
         self.assertIn("serving constants must not stand in", str(caught.exception))
 
     def test_the_serving_constants_are_not_hand_raised(self):
-        """Operator ruling + the VRAM-corridor law: launcher.py:216 is untouched."""
+        """Operator ruling + the VRAM-corridor law: launcher.py:216 untouched."""
         self.assertEqual(launcher.DC_MEASURED_D_5090_MIB, 2228)
         self.assertEqual(launcher.DC_MEASURED_D_3080_MIB, 1922)
         self.assertEqual(launcher.DC_RESERVE_SLACK_MIB, 64)
 
-
-class TheUnexplainedResidualIsReportedNotAbsorbed(CustomTestCase):
-    """The arithmetic, asserted, so the next reader inherits the refutation."""
-
-    def test_the_named_terms_are_uniform_and_cannot_explain_the_asymmetry(self):
-        named = launcher.xchg_resident_region_mib(len(CARDS)) + 3 * 32
-        gaps = {u: MEASURED[u] - CENSUS_DORMANT[u] - named for u in MEASURED}
-        self.assertEqual(gaps[SM1], 773)
-        self.assertEqual(gaps[SM2], 773)
-        self.assertEqual(gaps[BIG], 935)
-        # 162 MiB on the 5090 alone, surviving every uniform subtraction
-        self.assertEqual(gaps[BIG] - gaps[SM1], 162)
-
-    def test_the_foreign_split_bound_has_the_WRONG_SIGN_for_this_gap(self):
-        """This seat's first reading, refuted by its own subtraction.
-
-        The census source ran [42,11,11] against this form's [39,13,12], which
-        OVER-prices stage 0 (the 5090).  An over-priced census term makes that
-        card's residual SMALLER; the 5090's residual is the LARGER one.  So the
-        bound cannot be the explanation.
-        """
-        named = launcher.xchg_resident_region_mib(len(CARDS)) + 3 * 32
-        over = 3 * 387   # three layers at the measured mean, the bound's size
-        corrected = MEASURED[BIG] - (CENSUS_DORMANT[BIG] - over) - named
-        self.assertGreater(corrected, MEASURED[BIG] - CENSUS_DORMANT[BIG] - named,
-                           "removing an over-price must GROW the residual")
-
-    def test_the_reserve_does_not_swallow_the_residual(self):
-        """A reserve widened to make W19 pass would be the host-threshold
-        law's forbidden 'accept the risk' branch."""
-        p = _census(os.path.join(tempfile.mkdtemp(), "c.json"))
-        out, _l, _r = launcher.xchg_form_dormant_reserve(
-            CARDS, p, oncard_slot_mib=32)
+    def test_the_exchange_reserve_is_ABOVE_the_serving_reserve_on_every_card(self):
+        """The direction one expects and the direction the constant has: the
+        exchange form holds MORE dormant residency, so its reserve is larger.
+        (B4g's opposite claim came from comparing the CENSUS to the constant,
+        which is two forms of one instrument, not two reserves.)"""
+        out, _lines = self._run()
         for u in (BIG, SM1, SM2):
-            self.assertLess(out[u], MEASURED[u],
-                            "the priced reserve must stay BELOW the measured "
-                            "residue, so W19 still refuses and the gap is "
-                            "reported rather than absorbed")
+            self.assertGreater(out[u], SERVING_RESERVE[u], u)
+
+
+class TheDeltaIsTheResidentDraftTag(CustomTestCase):
+    """The attribution, asserted so the next reader inherits it rather than
+    the retracted residual.  Numbers from boot weg2xsn15's term table."""
+
+    #: `tms_tag_bytes` for `weights_draft` on group D, XSN15, per card.
+    DRAFT_TAG_MIB = {SM1: 1280, BIG: 1440, SM2: 1280}
+
+    def test_the_same_instrument_delta_is_the_draft_tag_within_the_margin(self):
+        for u in (BIG, SM1, SM2):
+            delta = MEASURED_XCHG[u] - CENSUS_DORMANT[u]
+            self.assertLessEqual(
+                abs(delta - self.DRAFT_TAG_MIB[u]), 32,
+                f"{u}: WEG2-DC delta {delta} vs resident weights_draft "
+                f"{self.DRAFT_TAG_MIB[u]} -- if this drifts, the attribution "
+                f"is no longer the draft tag and B4k's premise moved",
+            )
+
+    def test_the_5090_asymmetry_is_the_draft_tags_own_asymmetry(self):
+        """162 MiB was reported as 'surviving every uniform subtraction'.  On
+        one instrument the asymmetry is 1416-1254 = 162 and the draft tag's own
+        asymmetry is 1440-1280 = 160: the same number, not a remainder."""
+        dc = MEASURED_XCHG[BIG] - CENSUS_DORMANT[BIG]
+        dc -= MEASURED_XCHG[SM2] - CENSUS_DORMANT[SM2]
+        tag = self.DRAFT_TAG_MIB[BIG] - self.DRAFT_TAG_MIB[SM2]
+        self.assertLessEqual(abs(dc - tag), 8, f"dc={dc} tag={tag}")
+
+
+# ===========================================================================
+# THE EMISSION DEFECT: a function with no production caller.
+# ===========================================================================
+
+
+class TheLineReachesTheLog(CustomTestCase):
+    """Boot weg2xsn15: 0 `WEG2-XCHG-RESERVE` lines in four logs.  The
+    execution test above was green throughout, which is the whole point of
+    pinning the CALL SITE structurally as well."""
+
+    def test_main_calls_the_emitter(self):
+        tree, offset = _fn_ast_with_offset(L.main)
+        calls = _calls_in(tree, "xchg_form_dormant_reserve")
+        self.assertTrue(
+            calls,
+            "main() does not call xchg_form_dormant_reserve() -- that is the "
+            "weg2xsn15 defect: the pricer had ZERO production call sites and "
+            "every suite was green over it",
+        )
+        self.assertEqual(
+            len(calls), 1, "one call site, or the line prints twice per card"
+        )
+
+    def test_the_call_passes_log_so_the_line_is_PRINTED(self):
+        """A call that computes and discards is the W84 shape: the value is
+        recorded, nothing reaches a log, and no test can tell."""
+        tree, _offset = _fn_ast_with_offset(L.main)
+        call = _calls_in(tree, "xchg_form_dormant_reserve")[0]
+        kwargs = {k.arg for k in call.keywords}
+        self.assertIn("log", kwargs, f"log= not passed: {kwargs}")
+
+    def test_the_call_is_BEFORE_the_dry_return_so_a_dry_run_prints_it(self):
+        """The dry-run is the desk's only pre-boot sight of this arithmetic
+        (operator's proposed change 5).  A call after the dry-return would make
+        every dry-run silent about the reserve it is about to grade against."""
+        tree, _offset = _fn_ast_with_offset(L.main)
+        call = _calls_in(tree, "xchg_form_dormant_reserve")[0]
+        self.assertLess(
+            call.lineno, _dry_return_line(tree),
+            "the emitter must be called before main()'s dry-return",
+        )
+
+    def test_the_guard_does_not_truthy_check_the_census_path(self):
+        """THE #872 SHAPE, and the one that would re-create this very defect.
+
+        ``and ns.weg2_xchg_census`` would make a census-less exchange launch
+        print nothing instead of refusing.  The census is mandatory under this
+        arm and ``xchg_residency.load_census`` is its ONE authority (W71 by
+        name); a second, silent check here is how a line goes missing.
+        """
+        tree, _offset = _fn_ast_with_offset(L.main)
+        call = _calls_in(tree, "xchg_form_dormant_reserve")[0]
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.If):
+                continue
+            if not any(c is call for stmt in node.body for c in ast.walk(stmt)):
+                continue
+            attrs = {
+                n.attr for n in ast.walk(node.test) if isinstance(n, ast.Attribute)
+            }
+            self.assertNotIn(
+                "weg2_xchg_census", attrs,
+                "the guard truthy-checks the census path, so a census-less "
+                "exchange launch would print nothing instead of raising W71",
+            )
+
+    def test_the_emitter_is_armed_on_the_exchange_form_only(self):
+        """The ring form allocates none of this and must pay nothing: the call
+        sits under the form predicate, not beside it."""
+        tree, _offset = _fn_ast_with_offset(L.main)
+        call = _calls_in(tree, "xchg_form_dormant_reserve")[0]
+        guarded = False
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.If):
+                continue
+            if any(c is call for c in ast.walk(node.test)):
+                continue
+            body_calls = [c for stmt in node.body for c in ast.walk(stmt)]
+            if any(c is call for c in body_calls):
+                guarded = True
+                names = {
+                    n.id for n in ast.walk(node.test) if isinstance(n, ast.Name)
+                }
+                attrs = {
+                    n.attr for n in ast.walk(node.test) if isinstance(n, ast.Attribute)
+                }
+                self.assertTrue(
+                    {"_xchg_form"} & names
+                    or {"weg2_weight_source"} & attrs,
+                    f"the guard does not read the weight-source form: "
+                    f"names={names} attrs={attrs}",
+                )
+        self.assertTrue(guarded, "the call is not under any `if` at all")
 
 
 if __name__ == "__main__":

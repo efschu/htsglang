@@ -242,19 +242,27 @@ DC_RESERVE_SLACK_NCCL_MIB = 192
 #: rig (#589).  The two 3080s measured IDENTICALLY at 2588, so the name is
 #: exact here rather than a convenient collapse of two different numbers.
 #:
-#: NOT FINAL, AND NOT AN EXPLANATION.  Of this measurement, 773 / 935 / 773 MiB
-#: is UNATTRIBUTED: subtracting the census's own per-card dormant readings
-#: (1334 / 1668 / 1334) and the exchange lane's named residency terms (region
-#: + on-card slots = 481 MiB, both uniform) leaves that much, and 162 MiB of it
-#: sits on the 5090 alone and survives every uniform subtraction (B4g's
-#: subtraction, which also refuted the foreign-split reading on SIGN).  The
-#: open posten that feeds it is B4b: XSN12 measured the flag slot at 128 MiB
-#: against a realised 32 MiB/card, i.e. 4x, plus the shadow lane's device-side
-#: stripes.  The S6I shadow boot with `--weg2-xchg-oncard host` measures the
-#: bounce and prints the UNCOVERED table, then B4b prices the slot and the
-#: residual is re-derived.  A PER-FORM PREFLIGHT MEASUREMENT REPLACES THIS
-#: CONSTANT once B4e's form token lands (after the shadow verdict) -- nobody
-#: should read this triple as final.
+#: NOT FINAL, AND NOW ATTRIBUTED (B4i, boot weg2xsn15's per-card term table).
+#: B4g reported 773 / 935 / 773 MiB of this measurement as UNATTRIBUTED; THAT
+#: RESIDUAL IS RETRACTED -- it was produced by subtracting /dev/shm byte counts
+#: (the staging region 385 + on-card slots 96 = 481) from a PER-PROCESS NVML
+#: reading that never contained them, which is where 1254-481 and 1416-481 came
+#: from.  On ONE instrument (`WEG2-DC` at sleep) the arithmetic closes:
+#:
+#:     XSN15  D @ sleep   3084 / 2590 / 2588   this form (this constant)
+#:     sn5b   D @ sleep   1668 / 1334 / 1334   the serving form (the census)
+#:     delta              1416 / 1256 / 1254
+#:     weights_draft tag  1440 / 1280 / 1280   tms_tag_bytes, RESIDENT on D
+#:     unexplained          -24 /  -24 /   -26 instrument margin
+#:
+#: So the whole excess is group D's resident NEXTN/MTP draft tag, which the
+#: exchange never moves because `weights_draft` is out of the weights family,
+#: and which no flip pauses (`in_family=no`, absent from pause_order, ms=-1).
+#: B4k puts the draft head IN the family, and when it lands THIS TRIPLE MUST BE
+#: RE-DERIVED from a boot of that form -- never hand-lowered towards the serving
+#: constants, and never replaced by the serving constants themselves without a
+#: measurement.  A PER-FORM PREFLIGHT MEASUREMENT REPLACES THIS CONSTANT once
+#: B4e's form token lands -- nobody should read this triple as final.
 DC_MEASURED_D_XCHG_MIB = (2588, 3084, 2588)
 DC_MEASURED_D_XCHG_3080_MIB = DC_MEASURED_D_XCHG_MIB[0]
 DC_MEASURED_D_XCHG_5090_MIB = DC_MEASURED_D_XCHG_MIB[1]
@@ -9143,14 +9151,41 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     _xchg_form = ns.weg2_weight_source == WEIGHT_SOURCE_EXCHANGE
     log(("dormant residue RESERVE for group D = MEASURED D_c(D) of boot "
          + (f"weg2xsn14 ({'/'.join(str(v) for v in DC_MEASURED_D_XCHG_MIB)} MiB, "
-            "the EXCHANGE form's own residue at epoch 0, of which 773/935/773 "
-            "unattributed -- see DC_MEASURED_D_XCHG_MIB)"
+            "the EXCHANGE form's own residue at epoch 0; its whole excess over "
+            "the serving form is the RESIDENT weights_draft tag -- see "
+            "DC_MEASURED_D_XCHG_MIB)"
             if _xchg_form else
             "weg2ls1b2 (2228 / 1922 / 1922 MiB, NVML per-process, windows included)"))
         + f" + {slack_mib} MiB slack; spec 1.6 expectation was "
         f"{DC_EXPECT_5090_MIB}/{DC_EXPECT_3080_MIB} (exceeded); "
         f"form={ns.weg2_weight_source}; graded by W19 at D's first sleep: "
         + ", ".join(f"nvml{c.nvml_index}={dc_expect_d[c.uuid]}" for c in cards))
+    if _xchg_form:
+        # B4i: THE LINE, ON EVERY LAUNCH OF THIS FORM, DRY-RUN INCLUDED.
+        #
+        # Boot weg2xsn15 read `WEG2-XCHG-RESERVE` ZERO times in all four logs
+        # while W19 was genuine 0 -- the constant was in force and the line that
+        # was to report it existed only as a function with no production caller
+        # (called from two test files and from nowhere else, so every suite was
+        # green over code no boot ever ran).  That is W84's class one level down
+        # and it is closed HERE, at the one place the reserve is built, which is
+        # also why the call sits beside `dc_expect_d` rather than in a helper:
+        # the reserve and its report cannot then drift apart.
+        #
+        # BEFORE the dry-return, so the desk sees the arithmetic without a boot.
+        #
+        # NO `and ns.weg2_xchg_census` HERE, and that is deliberate.  A truthy
+        # check on the path would make a census-less exchange launch print
+        # nothing instead of refusing, which is the #872 shape (a naive truthy
+        # check with no else) and exactly how this line came to be missing in
+        # the first place.  The census is MANDATORY under this arm and there is
+        # ONE authority for that: `xchg_residency.load_census`, which raises
+        # W71 by name with its own full sentence for an absent, non-existent or
+        # malformed file.  Reaching it here rather than at
+        # `prepare_weight_exchange` (200 lines down) is the same named refusal
+        # with the same text, only sooner; the richer W71 of an UNFUNDABLE peak
+        # still comes from that gate, which is the only place that solves one.
+        xchg_form_dormant_reserve(cards, ns.weg2_xchg_census, log=log)
     # #1257c: the operator's external headroom, resolved ONCE per boot and
     # keyed by CARD UUID -- never by NVML index, which is not stable across
     # boots on this rig. Everything downstream (both budget solves, the
@@ -10041,105 +10076,69 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
 
 
-#: B4g wall 2: THE EXCHANGE LANE'S OWN NAMED RESIDENCY TERMS, per card.  Each
-#: is a term the exchange arm allocates and a serving boot does not, so a
-#: reserve derived from serving constants cannot contain them.  The region is
-#: DERIVED by :func:`xchg_resident_region_mib`, not typed.
-#:
-#: The region is ONE /dev/shm file the whole group shares, but every rank MAPS
-#: it, so it is resident per card and enters each card's reserve once.  The
-#: on-card slots are the diagonal's store-and-forward carrier, sized from the
-#: published slot (`SLOTS_PER_PAIR x slot`, and on this rig the deposit realised
-#: 32 MiB per card).  Both are UNIFORM across cards and therefore cannot, on
-#: their own, explain a per-card difference -- which is the arithmetic that
-#: refuted this seat's first reading of weg2xsn14's W19 (see the docstring of
-#: `xchg_form_dormant_reserve`).
-XCHG_RESIDENT_ONCARD_SLOTS = 3
-
-
-def xchg_resident_region_mib(n_cards: int) -> int:
-    """The staging region's own MiB, DERIVED -- never the literal 385.
-
-    `region_mib_from_layout`'s docstring makes the rule and
-    `test_weg2_xchg_instruments_1273` enforces it by AST-scanning this module
-    for the constant: *"It is arithmetic over four stated inputs, never a
-    literal 385."*  The first cut of B4g typed it, the remote gate caught it as
-    ONLY-NEW=1, and deriving it is the better code anyway -- on any card count
-    but this rig's, a typed 385 is silently wrong (the pair count is
-    ``n*(n-1)``, which is 6 here and 12 on four cards).
-    """
-    return xchg_residency.region_mib_from_layout(
-        xchg_region_pairs(int(n_cards)),
-        XCHG_REGION_SLOTS_PER_PAIR,
-        XCHG_REGION_SLOT_MIB,
-        XCHG_REGION_HEADER_MIB,
-    )
+#: B4i DELETED B4g's two "named residency terms" (`XCHG_RESIDENT_ONCARD_SLOTS`
+#: and `xchg_resident_region_mib`) together with the subtraction they served.
+#: Both were /dev/shm byte counts standing next to a per-process NVML reading,
+#: and subtracting them from it is what invented the 773 / 935 / 773 MiB
+#: "unattributed residual" (1254-481, 1416-481).  The region's own size is still
+#: derived where it is actually used, at `prepare_region`
+#: (`xchg_residency.region_mib_from_layout`, launcher.py:3612) -- that call site
+#: is the one `test_weg2_xchg_instruments_1273`' no-literal-385 rule is about.
+#: See `xchg_form_dormant_reserve` for the same-instrument arithmetic that
+#: replaced the subtraction.
 
 
 def xchg_form_dormant_reserve(
     cards: List[Card],
     census_path: str,
     *,
-    oncard_slot_mib: int,
     log: Optional[Log] = None,
-) -> Tuple[Dict[str, int], List[str], Dict[str, int]]:
-    """``({uuid: reserve MiB}, printed lines, {uuid: UNEXPLAINED residual})``.
+) -> Tuple[Dict[str, int], List[str]]:
+    """``({uuid: the reserve W19 grades against}, printed lines)``.
 
     W19 graded boot weg2xsn14 at EPOCH 0 -- before the first flip -- against a
     reserve built from ``DC_MEASURED_D_*``, which are MEASURED ON A SERVING
     BOOT (weg2ls1b2) and therefore contain none of the exchange lane's own
     device residency.  Those constants are never hand-raised (operator ruling,
-    and the VRAM-corridor law): the exchange form is PRICED instead, from the
-    census this fork already produces plus terms named one by one.
+    and the VRAM-corridor law), so the exchange form carries its own measured
+    triple (:data:`DC_MEASURED_D_XCHG_MIB`) and this function REPORTS it beside
+    the other reading of the SAME instrument, per card, on one line.
 
-    THE SUBTRACTION, done at the desk and reported rather than absorbed --
-    and it REFUTED this seat's own first reading, which is why it is written
-    here in full.  weg2xsn14 measured 2588 / 3084 / 2588 MiB against reserves
-    1986 / 2292 / 1986, i.e. excesses 602 / 792 / 602.  The census's own
-    per-card dormant readings (from the front's uuid-keyed ``WEG2-DC``) are
-    1334 / 1668 / 1334, so ``measured - census`` = **1254 / 1416 / 1254** and
-    after the uniform named terms above (385 + 3x32 = 481) come out the
-    residual is **773 / 935 / 773 MiB**.
+    **B4g's PRICED RESERVE AND ITS 773 / 935 / 773 MiB "UNATTRIBUTED RESIDUAL"
+    ARE RETRACTED, AND THE RETRACTION IS THE REASON THIS FUNCTION IS THIS
+    SHORT.**  That residual was manufactured by mixing two populations: the
+    staging region (``xchg.bin``, 385 MiB) and the on-card deposit slots
+    (3x32 = 96 MiB) are ``/dev/shm`` allocations, while ``WEG2-DC`` is
+    PER-PROCESS NVML at sleep.  They were never inside the measured number, so
+    subtracting them produced the gap exactly: ``1254 - 481 = 773`` and
+    ``1416 - 481 = 935``.  A line that carries a host term next to a device
+    reading invites that subtraction again, so it carries neither.
 
-    The asymmetry is therefore **162 MiB on the 5090 alone**, and it SURVIVES
-    every uniform subtraction.  This seat had predicted the foreign-split bound
-    of the census (source ran ``[42, 11, 11]``, this form runs ``[39, 13, 12]``,
-    which OVER-prices stage 0 = the 5090) -- but an over-priced census term
-    makes the residual SMALLER on that card, and the observed sign is the
-    opposite.  **So the bound is not the explanation and that reading is
-    withdrawn.**
+    SAME-INSTRUMENT ARITHMETIC, from boot weg2xsn15's per-card term table --
+    the two numbers on this line are both ``WEG2-DC`` at sleep, one per form::
 
-    AND THE SWAP ITSELF IS REFUTED, which is the second finding of this half.
-    One expects pricing the exchange form to RAISE the reserve, since the
-    serving constants contain none of the lane's residency.  It does the
-    opposite: the census's dormant readings (1668 / 1334 / 1334) are BELOW
-    ``DC_MEASURED_D_*`` (2228 / 1922), so census+named is 2149 / 1815 / 1815
-    against the serving reserve's 2292 / 1986 / 1986.  Re-sourcing W19 from the
-    census therefore makes the refusal STRICTER, not satisfiable -- the excess
-    grows from 602/792/602 to 773/935/773.
+        XSN15  D @ sleep   3084 / 2590 / 2588   the EXCHANGE form (the constant)
+        sn5b   D @ sleep   1668 / 1334 / 1334   the SERVING form (the census)
+        delta              1416 / 1256 / 1254
+        weights_draft tag  1440 / 1280 / 1280   tms_tag_bytes, resident
+        unexplained          -24 /  -24 /   -26 instrument margin
 
-    The census is the right authority for the census's OWN question (what a
-    sleeping rank held on ITS boot) and the wrong one for this one (what a
-    sleeping rank holds on THE EXCHANGE FORM).  So THIS FUNCTION IS NOT WIRED
-    AS THE RESERVE: it is the pricing and REPORTING instrument that makes the
-    refusal auditable, and the answer W19 needs is a measurement taken on this
-    form -- the operator's second option, which these numbers are the argument
-    for.
+    So the whole difference IS the resident ``weights_draft`` tag, which group
+    D holds and the exchange never moves because the tag is out of the weights
+    family.  The answer is therefore B4k (the draft head joins the family and is
+    exchanged like every other layer), not a wider reserve and not a residual
+    field -- and once it lands, this constant must be RE-DERIVED rather than
+    hand-lowered.
 
-    WHAT IT THEREFORE DOES NOT DO: close the gap.  It prices what can be
-    named, prints each term, and returns the residual so W19 STAYS A REFUSAL
-    with a number attached rather than absorbing an unexplained 773-935 MiB.
-    Reporting it is the answer; a reserve widened to swallow it would be the
-    host-threshold law's forbidden accept-the-risk branch.
+    WHAT IT DOES NOT DO: change any budget.  ``main``'s ``dc_expect_d`` is the
+    one consumer of ``dc_measured_d_mib`` and this function reads the same
+    selector, so there is no parallel reserve object; it exists so a boot log
+    says WHAT the reserve is and WHERE both numbers came from.
     """
     from sglang.srt.weg2 import xchg_residency
 
     census = xchg_residency.load_census(census_path)
-    slots_mib = int(XCHG_RESIDENT_ONCARD_SLOTS) * int(oncard_slot_mib)
-    region_mib = xchg_resident_region_mib(len(cards))
-    named = int(region_mib) + slots_mib
     out: Dict[str, int] = {}
-    residual: Dict[str, int] = {}
     lines: List[str] = []
     for c in cards:
         entry = census.cards.get(c.uuid)
@@ -10151,28 +10150,22 @@ def xchg_form_dormant_reserve(
                 "it cannot be priced and the serving constants must not stand "
                 "in -- they contain none of the exchange lane's residency"
             )
-        dormant = int(entry.dormant_proc_used_mib)
-        out[c.uuid] = dormant + named
-        # B4h (2): the MEASURED value beside the PRICED one, on one line, so the
-        # boot record shows both and the unattributed remainder without a
-        # second read.  This function stays the PRICER; the reserve W19
-        # compares against is `dc_measured_d_mib`'s form-keyed measurement.
-        measured = dc_measured_d_mib(c, WEIGHT_SOURCE_EXCHANGE)
-        residual[c.uuid] = int(measured) - int(out[c.uuid])
+        # THE ONE SELECTOR, never a second copy of the triple: this is the
+        # number W19 grades against, read where every other consumer reads it.
+        out[c.uuid] = dc_measured_d_mib(c, WEIGHT_SOURCE_EXCHANGE)
         lines.append(
             f"WEG2-XCHG-RESERVE nvml{c.nvml_index} {c.name} "
-            f"dormant_census_mib={dormant} region_mib={region_mib} "
-            f"oncard_slots_mib={slots_mib} "
-            f"({XCHG_RESIDENT_ONCARD_SLOTS}x{int(oncard_slot_mib)}) "
-            f"priced_mib={out[c.uuid]} "
-            f"measured_mib={measured} source=measured:weg2xsn14 "
-            f"residual_unattributed_mib={residual[c.uuid]} "
+            f"reserved_mib={out[c.uuid]} source=measured:weg2xsn14 "
+            f"measured_mib={int(entry.dormant_proc_used_mib)} "
+            f"instrument=WEG2-DC-at-sleep "
+            f"delta_mib={out[c.uuid] - int(entry.dormant_proc_used_mib)} "
+            f"delta_is=resident-weights_draft-tag-until-B4k "
             f"census_source={entry.dormant_source[:120]}"
         )
     if log is not None:
         for ln in lines:
             log(ln)
-    return out, lines, residual
+    return out, lines
 
 
 def front_argv_for(py: str, store_dir: str, p_pid: int, d_pid: int, dc_expect_d: Dict[str, int],

@@ -175,11 +175,20 @@ if __name__ == "__main__":
     unittest.main()
 
 
-class TheResidualIsPrintedNotAbsorbed(CustomTestCase):
-    """B4h (4): the constant's MEANING is 'measured on this form', and the
-    unattributed part is carried on the line rather than folded into it."""
+class TheExcessIsAttributedOnOneInstrument(CustomTestCase):
+    """B4i REPLACES B4h's ``TheResidualIsPrintedNotAbsorbed``, and the
+    replacement is a RETRACTION, not a rename.
 
-    def test_the_line_carries_measured_priced_and_the_remainder(self):
+    B4h printed ``residual_unattributed_mib=`` 773 / 935 / 773 beside the
+    measurement.  That number does not exist: it came from subtracting
+    ``/dev/shm`` byte counts (the staging region 385 + the on-card slots 96)
+    from a per-process NVML reading that never contained them, so the
+    subtraction produced the gap exactly (1254-481, 1416-481).  On ONE
+    instrument the excess is the RESIDENT ``weights_draft`` tag, to within the
+    instrument margin, and the field is gone rather than re-derived.
+    """
+
+    def test_the_line_carries_the_reserve_and_the_other_reading_of_ONE_instrument(self):
         import json
         import tempfile
 
@@ -193,34 +202,35 @@ class TheResidualIsPrintedNotAbsorbed(CustomTestCase):
         path = os.path.join(tempfile.mkdtemp(), "c.json")
         with open(path, "w") as fh:
             json.dump(blob, fh)
-        out, lines, residual = launcher.xchg_form_dormant_reserve(
-            CARDS, path, oncard_slot_mib=32)
-        # B4g's hand subtraction, now computed live
-        self.assertEqual(residual[SM1], 773)
-        self.assertEqual(residual[SM2], 773)
-        self.assertEqual(residual[BIG], 935)
-        self.assertEqual(residual[BIG] - residual[SM1], 162)
+        out, lines = launcher.xchg_form_dormant_reserve(CARDS, path)
+        self.assertEqual(out[BIG], 3084)
+        self.assertEqual(out[SM1], 2588)
         big = next(ln for ln in lines if "5090" in ln)
-        self.assertIn("measured_mib=3084", big)
-        self.assertIn("priced_mib=2149", big)
-        self.assertIn("residual_unattributed_mib=935", big)
+        self.assertIn("reserved_mib=3084", big)
+        self.assertIn("measured_mib=1668", big)
+        self.assertIn("instrument=WEG2-DC-at-sleep", big)
+        self.assertIn("delta_mib=1416", big)
+        # RETRACTED, and pinned so a copy-paste cannot bring it back.
+        self.assertNotIn("residual_unattributed_mib=", big)
+        self.assertNotIn("priced_mib=", big)
+        self.assertNotIn("region_mib=", big)
 
-    def test_the_pricer_is_still_not_the_reserve(self):
-        """W19 compares against the form-keyed MEASUREMENT; this function
-        prices what can be named and reports the rest."""
-        import inspect
+    def test_the_host_side_terms_are_deleted_from_the_module(self):
+        """The two B4g helpers existed only for the retracted subtraction; the
+        region's size is still derived where it is USED (prepare_region)."""
+        self.assertFalse(hasattr(launcher, "XCHG_RESIDENT_ONCARD_SLOTS"))
+        self.assertFalse(hasattr(launcher, "xchg_resident_region_mib"))
 
-        self.assertIn("stays the PRICER",
-                      inspect.getsource(launcher.xchg_form_dormant_reserve))
-
-    def test_the_constant_says_it_is_not_final(self):
-        """B4h (4): nobody may read the triple as the answer."""
+    def test_the_constant_says_it_is_not_final_and_names_its_attribution(self):
+        """Nobody may read the triple as the answer -- and nobody may read the
+        old residual as an open question either."""
         import inspect
 
         src = inspect.getsource(launcher)
         i = src.index("DC_MEASURED_D_XCHG_MIB = (")
         head = src[max(0, i - 2600):i]
-        self.assertIn("773 / 935 / 773", head)
-        self.assertIn("UNATTRIBUTED", head)
+        self.assertIn("RETRACTED", head)
+        self.assertIn("weights_draft", head)
+        self.assertIn("B4k", head)
         self.assertIn("PREFLIGHT MEASUREMENT REPLACES THIS", head)
-        self.assertIn("B4b", head)
+        self.assertNotIn("UNATTRIBUTED:", head)
