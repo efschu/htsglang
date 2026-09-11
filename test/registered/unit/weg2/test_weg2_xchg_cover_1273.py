@@ -792,22 +792,55 @@ class ArmAtLoadTest(_ChunkedCase):
         self.assertIn("tag=weights_draft mib=1311.0", log.lines[0])
         self.assertIn("in_family=no", log.lines[0])
 
-    def test_arm_at_load_without_a_plan_provider_votes_not_ok(self):
-        """The mode without the plan accounts for NOTHING; that is a refusal,
-        not a pass."""
+    def test_arm_at_load_installs_the_plan_provider(self):
+        """S6 step 6b: the arm SELF-ARMS, so `exchange` is no longer
+        fail-closed BY OMISSION.
+
+        THIS TEST USED TO ASSERT THE OPPOSITE, and the change is the whole
+        point of step 6b rather than a regression: before it,
+        `register_plan_provider` had no registrant anywhere in the tree, so
+        every rank under `exchange` voted not-ok with NO_PLAN_REASON -- a
+        deliberate refusal, but not a working arm, and S1's own TODO said so.
+        `arm_coverage_at_load` now installs `default_plan_provider` (which
+        derives through the shadow's producer) when nothing is registered.
+
+        The not-ok vote has NOT disappeared; it moved to the two places that
+        can still honestly produce it, and both are tested in
+        `test_weg2_xchg_plan_provider_1273`: a derivation that refuses, and a
+        rank with no Weg-2 group identity. What is gone is "nobody ever
+        registered anything".
+        """
         model = _Model()
         log = _CaptureLog()
+        wx.register_plan_provider(None)
         with wx.weight_source_for_test(wx.WEIGHT_SOURCE_EXCHANGE):
-            vote = wx.arm_coverage_at_load(
+            wx.arm_coverage_at_load(
                 model,
                 rank=0,
                 tag_bytes=_tag_bytes_stub(),
                 region_tag=GPU_MEMORY_TYPE_WEIGHTS,
                 log=log,
             )
-        self.assertFalse(vote.ok)
-        self.assertIn("W84", vote.reason)
-        self.assertIn("no plan provider is registered", vote.reason)
+        # And the provider's own refusal (no group identity in this process)
+        # arrives as a NOT-OK VOTE, never as a raise: there is no group fence
+        # here, so a rank-local raise would strand the other five.
+        self.assertIsNotNone(
+            wx.plan_provider(),
+            "the arm left this rank without a plan provider, which is the "
+            "state S1's TODO described and step 6b closed")
+        wx.register_plan_provider(None)
+
+    def test_the_ring_arm_still_installs_no_provider(self):
+        """The default path pays nothing, as every other S2 line does."""
+        wx.register_plan_provider(None)
+        wx.arm_coverage_at_load(
+            _Model(),
+            rank=0,
+            tag_bytes=_tag_bytes_stub(),
+            region_tag=GPU_MEMORY_TYPE_WEIGHTS,
+            log=_CaptureLog(),
+        )
+        self.assertIsNone(wx.plan_provider())
 
     def test_arm_at_load_does_not_raise_where_there_is_no_fence(self):
         model = _Model()

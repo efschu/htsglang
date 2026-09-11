@@ -2767,10 +2767,45 @@ def arm_coverage_at_load(
         logger.error("%s", vote.reason)
         return vote
 
+    # THE PROVIDER MAY REFUSE, AND THIS FUNCTION MAY NOT RAISE.
+    #
+    # `default_plan_provider` raises W68 when the derivation refuses or the
+    # rank has no Weg-2 group identity -- correct for a caller that can handle
+    # it, and fatal here: the docstring above is explicit that there is NO
+    # GROUP FENCE at the end of weight loading (refuter F5), so a rank-local
+    # raise leaves the other five in a collective that no longer has six
+    # members.  The refusal therefore becomes this rank's not-ok VOTE, which
+    # the wake RPC's fenced preamble reads and stops the whole group on -- the
+    # same path NO_PLAN_REASON already takes.  Found by
+    # `test_arm_at_load_installs_the_plan_provider` the moment the provider
+    # became real; before step 6b nothing was registered, so nothing could
+    # raise here and the contract was never exercised.
+    try:
+        planned = provider(model)
+    except BaseException as exc:  # noqa: BLE001 -- see above: no fence here
+        vote = CoverageVote(
+            rank=int(rank),
+            mode=mode,
+            region_tag=region_tag,
+            rows={},
+            ok=False,
+            reason=(
+                f"{COVERAGE_REFUSAL_MARKER}: the plan provider refused on this "
+                f"rank, so nothing is accounted for: {type(exc).__name__}: "
+                f"{exc} -- carried as this rank's NOT-OK vote rather than as a "
+                f"raise, because there is no group fence at the end of weight "
+                f"loading and a rank-local raise would leave the other five in "
+                f"a collective without six members. The wake RPC's fenced "
+                f"preamble reads this vote."
+            ),
+        )
+        _record_boot_vote(vote)
+        logger.error("%s", vote.reason)
+        return vote
     vote = arm_coverage(
         model,
         rank=rank,
-        planned_bytes_by_tag=provider(model),
+        planned_bytes_by_tag=planned,
         tag_bytes=_bytes,
         log=emit,
         region_tag=region_tag,
