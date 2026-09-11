@@ -114,9 +114,14 @@ echo "BASELINE: $(run)"
 m() { echo "$1"; if mutate "$2" "$3" "$4"; then run; else echo "(anchor stale -- FIX THE ANCHOR)"; fi; restore "$2"; echo; }
 
 # --- THE danger direction: a mismatched partition silently accepted --------
+# NOTE ON M1: its first form was `_WAVE_DISAGREEMENT = None or (...)`, which
+# CHANGES THE FILE and NOT THE SEMANTICS -- `None or x` is `x` -- so it scored
+# GREEN-SURVIVED against correct code.  mutate() verifies the file changed; it
+# cannot verify the MEANING changed, and that is the gap a no-op mutant falls
+# into.  Rebinding the name is the honest form: the recording is really gone.
 m "M1 the mismatch is not recorded at all (silent acceptance)" "$CE" \
   '        _WAVE_DISAGREEMENT = (' \
-  '        _WAVE_DISAGREEMENT = None or ('
+  '        _unrecorded_disagreement = ('
 m "M2 the derived partition wins over the priced one" "$CE" \
   '    _PLANNED_WAVES = tuple(tuple(w) for w in published)
     return [list(w) for w in published]' \
