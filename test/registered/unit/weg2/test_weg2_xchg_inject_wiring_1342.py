@@ -357,3 +357,61 @@ def test_the_deleted_second_mover_is_really_gone(symbol):
             if callpat.search(line):
                 found.append(f"{f.name}:{i} (call)")
     assert not found, f"{symbol} is still live in shipped code: {found}"
+
+
+def test_an_explicit_mode_from_the_caller_wins(monkeypatch, armed):
+    """THE CALLER'S `mode` REACHES THE LEG -- #1256's class, one level in.
+
+    `_weg2_xchg_shadow_compare` (the step-6c grader) calls
+    `_weg2_xchg_inject_weights(mode=wx.INJECT_SHADOW)`, and that argument
+    travels through `**kw`.  The first version of this wiring computed
+    `wx.inject_mode()` and ignored `kw`, which on the S6I argv produced the
+    SAME answer -- so the defect was invisible and still wrong: an argument
+    published by a caller, read, and never acted upon.
+
+    The fixture arms `authoritative`, so the flag and the caller DISAGREE here
+    on purpose: that is the only configuration in which the assertion can
+    distinguish "honoured the caller" from "recomputed and got lucky".
+    """
+    m = _manager(monkeypatch)
+    calls = {}
+
+    def _record_bounce(self, **kw):
+        calls["bounce"] = kw
+        return _real_bounce_result(mode=kw.get("mode", ""))
+
+    monkeypatch.setattr(wu.SchedulerWeightUpdaterManager, "_weg2_shadow_plan",
+                        lambda self, hook, g, r, agreed=None:
+                            (_FakePlan([_FakeDesc("a.w")]), ""), raising=True)
+    monkeypatch.setattr(wu.SchedulerWeightUpdaterManager, "_weg2_xchg_bounce_leg",
+                        _record_bounce, raising=True)
+    monkeypatch.setattr(wu.SchedulerWeightUpdaterManager, "_weg2_xchg_device_ops",
+                        lambda self: object(), raising=True)
+
+    assert wx.inject_mode() == wx.INJECT_AUTHORITATIVE  # the flag says this
+    m._weg2_xchg_inject_from_peer(terms=_FakeTerms(), mode=wx.INJECT_SHADOW)
+    assert calls["bounce"]["mode"] == wx.INJECT_SHADOW, \
+        "the caller's explicit mode was dropped in favour of the flag"
+
+
+def test_the_step_6c_grader_is_the_shadow_arm_driver():
+    """WHY items (a)/(c) become reachable on the S6I argv at all.
+
+    `_weg2_xchg_shadow_compare` fires under `exchange_armed() and inject_mode()
+    == INJECT_SHADOW` -- the S6I order's exact argv -- and calls the inject
+    with `mode=shadow`.  With S2's delegation in place that now reaches
+    `run_bounce_leg`, where `comparing = mode == INJECT_SHADOW` produces the
+    `InjectVerdict` whose line IS grading item (a).
+
+    Pinned as SOURCE structure rather than executed, because the driver sits
+    behind a flip RPC: what matters is that the chain exists and that the
+    grader is itself called (it is, from this same file).
+    """
+    import inspect
+    src = inspect.getsource(wu.SchedulerWeightUpdaterManager)
+    assert "self._weg2_xchg_shadow_compare()" in src, \
+        "the step-6c grader has no caller"
+    grader = inspect.getsource(
+        wu.SchedulerWeightUpdaterManager._weg2_xchg_shadow_compare)
+    assert "mode=wx.INJECT_SHADOW" in grader
+    assert "_weg2_xchg_inject_weights(" in grader

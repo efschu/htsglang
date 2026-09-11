@@ -1057,11 +1057,24 @@ class SchedulerWeightUpdaterManager:
                 f"rank {rank}, so no copy can be issued at all."
             )
 
-        # THE MODE IS READ ONCE HERE and passed down, for the same reason
-        # :meth:`_weg2_xchg_bounce_leg` says so: a leg that re-read it further
+        # THE MODE IS THE CALLER'S IF IT GAVE ONE, else the flag's, and it is
+        # resolved ONCE here and passed down -- a leg that re-read it further
         # in could act on a different answer than the one it was entered with,
         # and the two differ by "does this write into the live weights".
-        mode = wx.inject_mode()
+        #
+        # THE CALLER'S `mode` MUST WIN, and getting this wrong was a real bug
+        # in the first version of this wiring: it computed `wx.inject_mode()`
+        # and IGNORED `kw` entirely. There are two callers, and one of them
+        # passes the mode explicitly --
+        # `_weg2_xchg_shadow_compare` calls `_weg2_xchg_inject_weights(
+        # mode=wx.INJECT_SHADOW)` (this file, the step-6c grader). On the S6I
+        # order's own argv the two agree, so the bug would have been INVISIBLE
+        # and still wrong: an argument published by the caller, read into
+        # `**kw`, and never acted upon -- the exact class #1256 names and this
+        # slice exists to remove. Silently dropping it would also break the
+        # grader the day the flag and the call site disagree, which is
+        # precisely when a grade matters.
+        mode = str(kw.get("mode") or "") or wx.inject_mode()
         self._weg2_xchg_bounce_leg(
             descs=list(plan.raw_descs), ops=ops, boot_nonce=boot_nonce,
             terms=terms, mode=mode, device=int(device),
