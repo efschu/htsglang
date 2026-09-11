@@ -590,11 +590,13 @@ class CoverageTest(_ChunkedCase):
         )
         row = vote.rows["weights_0"]
         self.assertAlmostEqual(row.buffers_bytes / MIB, 256.0, places=3)
-        self.assertAlmostEqual(row.slack_bytes / MIB, 7.0, places=3)
+        # #1335: the same 7 MiB, under the name that means free room.
+        self.assertAlmostEqual(row.overhang_bytes / MIB, 7.0, places=3)
+        self.assertEqual(row.attribution_verdict, row.ATTRIBUTION_OVERHANG)
         self.assertEqual(row.uncovered, ())
         self.assertTrue(vote.ok)
 
-    def test_slack_is_printed_never_asserted(self):
+    def test_slack_is_printed_never_asserted_and_an_absence_forms_no_delta(self):
         """+0.08 to +0.58 GiB/rank is measured and normal; an equality assert
         on the census would refuse every boot.  A NEGATIVE slack (the census
         answering 0 because the saver has no such symbol) is likewise printed,
@@ -608,7 +610,7 @@ class CoverageTest(_ChunkedCase):
             tag_bytes=lambda tag: int(600 * MIB),
             log=log,
         )
-        self.assertGreater(vote.rows["weights_0"].slack_bytes, 0)
+        self.assertGreater(vote.rows["weights_0"].overhang_bytes, 0)
         self.assertTrue(vote.ok)
         vote = wx.arm_coverage(
             model,
@@ -617,7 +619,16 @@ class CoverageTest(_ChunkedCase):
             tag_bytes=lambda tag: 0,
             log=log,
         )
-        self.assertLess(vote.rows["weights_0"].slack_bytes, 0)
+        # #1335 REVERSED, with its argument: a saver that could not answer
+        # is an ABSENCE, and subtracting the walk's book from an absence
+        # produced a large negative "slack" indistinguishable from a real
+        # divergence -- the reading that cost four boots.  No delta is
+        # formed against an absence now, and the state has its own name.
+        row0 = vote.rows["weights_0"]
+        self.assertIsNone(row0.attribution_delta_bytes)
+        self.assertIsNone(row0.overhang_bytes)
+        self.assertEqual(row0.attribution_verdict, row0.ATTRIBUTION_NO_ANSWER)
+        self.assertIn("slack_mib=n/a", row0.cover_line())
         self.assertTrue(vote.ok)
 
     def test_alias_view_of_a_covered_tensor_is_not_uncovered(self):
