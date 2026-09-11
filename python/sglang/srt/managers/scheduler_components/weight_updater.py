@@ -1713,7 +1713,7 @@ class SchedulerWeightUpdaterManager:
             pass
         return -1
 
-    def _weg2_shadow_gate_rows(self, hook: str, group: str):
+    def _weg2_shadow_gate_rows(self, hook: str, group: str, leg: int):
         """The rows this hook may expect to see voted AT THIS INSTANT.
 
         MEASURED-BY-REVIEW DEFECT (S5b refuter, must_fix 1).  The two hooks sit
@@ -1732,10 +1732,31 @@ class SchedulerWeightUpdaterManager:
         six, because the source rows were sealed earlier in this same flip with
         this region's ``epoch_hash`` and this ``leg`` and are therefore free.
         ``None`` means all six.
+
+        **#1337: THAT LAST SENTENCE IS FALSE ON LEG 1, and it cost 6/24 legs
+        per group on XSN12.**  Rooted by boot seat 3: on the FIRST flip there is
+        no earlier instant in which source rows could have been sealed, so the
+        destination waited the whole ``SHADOW_GATE_BUDGET_S`` = 5.0 s for three
+        rows nobody can write (measured 4.953/4.956/4.960 s) and then read
+        ``ran=no``.  Under ``--weg2-xchg-inject authoritative`` that would be
+        weight bytes nobody injected.
+
+        The EXPECTATION is what was wrong, not the gate -- so on a leg whose
+        source rows cannot yet exist the destination expects its OWN rows, for
+        the mirror image of the reason the source already does.  From leg 2 the
+        justification holds again and the cross-group expectation is restored,
+        because narrowing it everywhere would silently stop checking the
+        agreement this gate exists for.
+
+        ``leg`` IS REQUIRED, deliberately with no default: the call site had
+        ``leg`` in scope the whole time (``:2078``) and simply did not pass it,
+        so a default is exactly the shape that let this survive.
         """
         from sglang.srt.weg2 import weight_exchange_region as xr
 
-        if hook != "source" or group not in ("P", "D"):
+        if group not in ("P", "D"):
+            return None
+        if hook != "source" and int(leg) > 1:
             return None
         return tuple(xr.rank_row(group, r) for r in range(xr.N_CARDS))
 
@@ -2087,7 +2108,8 @@ class SchedulerWeightUpdaterManager:
                 free_mib=int(free_bytes // MIB_),
                 resume_reserve_bytes=int(reserve_bytes),
                 ring_ms=ring_ms,
-                gate_rows=self._weg2_shadow_gate_rows(str(hook), group),
+                gate_rows=self._weg2_shadow_gate_rows(str(hook), group,
+                                                      leg=int(leg)),
                 plan_reason=str(plan_reason),
                 # THE ON-CARD LANE HAS NO CONCURRENT PEER ON THIS PLACEMENT.
                 # Same structural fact as ``_weg2_shadow_gate_rows`` above, one

@@ -2593,14 +2593,21 @@ def test_the_two_hooks_expect_different_rows_and_the_adapter_says_which():
     """MUST_FIX 1, the producer.  The adapter is the only thing that knows the
     GROUP, so it is the only thing that can answer this."""
     rows = _wu().SchedulerWeightUpdaterManager._weg2_shadow_gate_rows
-    assert rows(None, "source", "P") == (0, 1, 2)
-    assert rows(None, "source", "D") == (3, 4, 5)
-    # The destination runs LAST in the flip, so the source rows are already
-    # sealed with this epoch_hash and this leg: all six, for free.
-    assert rows(None, "destination", "P") is None
-    assert rows(None, "destination", "D") is None
+    assert rows(None, "source", "P", leg=1) == (0, 1, 2)
+    assert rows(None, "source", "D", leg=1) == (3, 4, 5)
+    # The destination runs LAST in the flip, so from leg 2 on the source rows
+    # are already sealed with this epoch_hash: all six, for free.
+    #
+    # #1337: NOT ON LEG 1. There is no earlier instant on the first flip, so a
+    # leg-1 destination that expected six waited the full 5.0 s gate budget for
+    # rows nobody can write (XSN12: 4.953/4.956/4.960 s, then ran=no). On leg 1
+    # it expects its OWN rows; test_weg2_shadow_gate_rows_leg1_1337 owns that.
+    assert rows(None, "destination", "P", leg=1) == (0, 1, 2)
+    assert rows(None, "destination", "P", leg=2) is None
+    assert rows(None, "destination", "D", leg=1) == (3, 4, 5)
+    assert rows(None, "destination", "D", leg=2) is None
     # MUTANT: an unknown group must not invent a group's rows.
-    assert rows(None, "source", "?") is None
+    assert rows(None, "source", "?", leg=1) is None
 
 
 def test_the_gate_rows_reach_the_transport_and_are_not_dropped(
@@ -4839,7 +4846,8 @@ def _armed_probe(monkeypatch, *, leg_epoch, card="GPU-abc", free_bytes=8 << 30):
     monkeypatch.setattr(M, "_weg2_device_index", lambda self: 0)
     monkeypatch.setattr(M, "_weg2_card_uuid", lambda self: card)
     monkeypatch.setattr(M, "_weg2_free_bytes", lambda self: free_bytes)
-    monkeypatch.setattr(M, "_weg2_shadow_gate_rows", lambda self, h, g: ())
+    monkeypatch.setattr(M, "_weg2_shadow_gate_rows",
+                        lambda self, h, g, leg=1: ())
     monkeypatch.setattr(M, "_weg2_shadow_host_budget", lambda self: 0)
     monkeypatch.setattr(M, "_weg2_shadow_plan",
                         lambda self, h, g, r: (None, "stub"))
