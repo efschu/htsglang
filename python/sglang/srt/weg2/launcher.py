@@ -9961,6 +9961,113 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     return 0
 
 
+
+#: B4g wall 2: THE EXCHANGE LANE'S OWN NAMED RESIDENCY TERMS, per card.  Each
+#: is a term the exchange arm allocates and a serving boot does not, so a
+#: reserve derived from serving constants cannot contain them.
+#:
+#: The region is ONE /dev/shm file the whole group shares, but every rank MAPS
+#: it, so it is resident per card and enters each card's reserve once.  The
+#: on-card slots are the diagonal's store-and-forward carrier, sized from the
+#: published slot (`SLOTS_PER_PAIR x slot`, and on this rig the deposit realised
+#: 32 MiB per card).  Both are UNIFORM across cards and therefore cannot, on
+#: their own, explain a per-card difference -- which is the arithmetic that
+#: refuted this seat's first reading of weg2xsn14's W19 (see the docstring of
+#: `xchg_form_dormant_reserve`).
+XCHG_RESIDENT_REGION_MIB = 385
+XCHG_RESIDENT_ONCARD_SLOTS = 3
+
+
+def xchg_form_dormant_reserve(
+    cards: List[Card],
+    census_path: str,
+    *,
+    oncard_slot_mib: int,
+    log: Optional[Log] = None,
+) -> Tuple[Dict[str, int], List[str], Dict[str, int]]:
+    """``({uuid: reserve MiB}, printed lines, {uuid: UNEXPLAINED residual})``.
+
+    W19 graded boot weg2xsn14 at EPOCH 0 -- before the first flip -- against a
+    reserve built from ``DC_MEASURED_D_*``, which are MEASURED ON A SERVING
+    BOOT (weg2ls1b2) and therefore contain none of the exchange lane's own
+    device residency.  Those constants are never hand-raised (operator ruling,
+    and the VRAM-corridor law): the exchange form is PRICED instead, from the
+    census this fork already produces plus terms named one by one.
+
+    THE SUBTRACTION, done at the desk and reported rather than absorbed --
+    and it REFUTED this seat's own first reading, which is why it is written
+    here in full.  weg2xsn14 measured 2588 / 3084 / 2588 MiB against reserves
+    1986 / 2292 / 1986, i.e. excesses 602 / 792 / 602.  The census's own
+    per-card dormant readings (from the front's uuid-keyed ``WEG2-DC``) are
+    1334 / 1668 / 1334, so ``measured - census`` = **1254 / 1416 / 1254** and
+    after the uniform named terms above (385 + 3x32 = 481) come out the
+    residual is **773 / 935 / 773 MiB**.
+
+    The asymmetry is therefore **162 MiB on the 5090 alone**, and it SURVIVES
+    every uniform subtraction.  This seat had predicted the foreign-split bound
+    of the census (source ran ``[42, 11, 11]``, this form runs ``[39, 13, 12]``,
+    which OVER-prices stage 0 = the 5090) -- but an over-priced census term
+    makes the residual SMALLER on that card, and the observed sign is the
+    opposite.  **So the bound is not the explanation and that reading is
+    withdrawn.**
+
+    AND THE SWAP ITSELF IS REFUTED, which is the second finding of this half.
+    One expects pricing the exchange form to RAISE the reserve, since the
+    serving constants contain none of the lane's residency.  It does the
+    opposite: the census's dormant readings (1668 / 1334 / 1334) are BELOW
+    ``DC_MEASURED_D_*`` (2228 / 1922), so census+named is 2149 / 1815 / 1815
+    against the serving reserve's 2292 / 1986 / 1986.  Re-sourcing W19 from the
+    census therefore makes the refusal STRICTER, not satisfiable -- the excess
+    grows from 602/792/602 to 773/935/773.
+
+    The census is the right authority for the census's OWN question (what a
+    sleeping rank held on ITS boot) and the wrong one for this one (what a
+    sleeping rank holds on THE EXCHANGE FORM).  So THIS FUNCTION IS NOT WIRED
+    AS THE RESERVE: it is the pricing and REPORTING instrument that makes the
+    refusal auditable, and the answer W19 needs is a measurement taken on this
+    form -- the operator's second option, which these numbers are the argument
+    for.
+
+    WHAT IT THEREFORE DOES NOT DO: close the gap.  It prices what can be
+    named, prints each term, and returns the residual so W19 STAYS A REFUSAL
+    with a number attached rather than absorbing an unexplained 773-935 MiB.
+    Reporting it is the answer; a reserve widened to swallow it would be the
+    host-threshold law's forbidden accept-the-risk branch.
+    """
+    from sglang.srt.weg2 import xchg_residency
+
+    census = xchg_residency.load_census(census_path)
+    slots_mib = int(XCHG_RESIDENT_ONCARD_SLOTS) * int(oncard_slot_mib)
+    named = int(XCHG_RESIDENT_REGION_MIB) + slots_mib
+    out: Dict[str, int] = {}
+    residual: Dict[str, int] = {}
+    lines: List[str] = []
+    for c in cards:
+        entry = census.cards.get(c.uuid)
+        if entry is None:
+            raise xchg_residency.Weg2XchgResidencyUnarmable(
+                f"W71 Weg2XchgResidencyUnarmable: card {c.uuid} "
+                f"(nvml{c.nvml_index} {c.name}) is not in the census "
+                f"{census_path!r}, so the exchange form's dormant reserve for "
+                "it cannot be priced and the serving constants must not stand "
+                "in -- they contain none of the exchange lane's residency"
+            )
+        dormant = int(entry.dormant_proc_used_mib)
+        out[c.uuid] = dormant + named
+        lines.append(
+            f"WEG2-XCHG-RESERVE nvml{c.nvml_index} {c.name} "
+            f"dormant_census_mib={dormant} region_mib={XCHG_RESIDENT_REGION_MIB} "
+            f"oncard_slots_mib={slots_mib} "
+            f"({XCHG_RESIDENT_ONCARD_SLOTS}x{int(oncard_slot_mib)}) "
+            f"reserve_mib={out[c.uuid]} "
+            f"source={entry.dormant_source[:120]}"
+        )
+    if log is not None:
+        for ln in lines:
+            log(ln)
+    return out, lines, residual
+
+
 def front_argv_for(py: str, store_dir: str, p_pid: int, d_pid: int, dc_expect_d: Dict[str, int],
                    cards: List[Card], ns, chunk_count: int, carrier_max_tokens: int,
                    p_bs: int, d_bs: int, x_tokens: int, flip_min_work_tokens: int,
