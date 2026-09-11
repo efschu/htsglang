@@ -3285,6 +3285,44 @@ def derive_leg_plan(
     except BaseException as exc:  # noqa: BLE001 -- a derivation never raises
         return _plan_refusal("plan-refused", f"{type(exc).__name__}: {exc}")
 
+    # #1342 S2b: THE ACCEPTANCE LINE IS EMITTED HERE, where the XchgPlan LIVES.
+    #
+    # `WEG2-XCHG-PLAN dir=... plan_id=...` describes an `XchgPlan`, and this is
+    # the only frame in production that holds one -- the `LegPlan` returned
+    # below keeps `descs` and drops everything else, `plan_id` included.
+    #
+    # IT WAS WIRED ONE FRAME TOO LATE AND THE METAL SAID SO: boot weg2xsn18
+    # printed `AttributeError: 'LegPlan' object has no attribute 'log_line'`
+    # 21x on D and 18x on P, because the emit sat in the mixin's
+    # `_weg2_shadow_plan`, which only ever sees the narrowed LegPlan.  Census
+    # (d)'s `plan_id` read 0 as a result -- the instrument failing, not the lane.
+    #
+    # NEITHER A CONVERSION NOR A SHARED `log_line` WOULD HAVE BEEN HONEST: the
+    # two dataclasses share exactly ONE field (`descs`) and LegPlan has no
+    # `plan_id` at all, so either route would have had to INVENT the one
+    # identity census (d) exists to read.  `test_a_legplan_is_not_an_xchgplan_
+    # and_never_will_be` pins that measurement so the question is re-decided
+    # deliberately if the types ever converge.
+    #
+    # WRAPPED, because an instrument may never take a derivation down: the plan
+    # is already valid here and failing to PRINT it is a lost reading, not a
+    # lost plan.  Named on the way out, never swallowed silently.
+    # NO MODULE LOGGER IS INVENTED HERE.  This module has none -- it takes a
+    # `log` callable where it logs at all -- and `emit_plan_line` already falls
+    # back to `logging.getLogger` of its OWN module when handed no logger, which
+    # is the right attribution anyway: the line belongs to `weight_exchange`,
+    # whose shape it is.  (Measured, not assumed: passing a bare `logger` here
+    # raised `NameError` in 24 tests, which is how this paragraph exists.)
+    try:
+        wx.emit_plan_line(
+            plan,
+            direction=("d2h" if str(hook) == HOOK_SOURCE else "h2d"))
+    except BaseException as exc:  # noqa: BLE001
+        import logging as _logging
+
+        _logging.getLogger(__name__).info(
+            "WEG2-XCHG-PLAN emit failed: %s: %s", type(exc).__name__, exc)
+
     facts = LegPlanFacts(
         chunk_layers=int(chunk_layers), chunk_count=int(chunk_count),
         family_tags=family, waves=waves, cards=cards, classes=classes,
