@@ -152,13 +152,47 @@ class BothArmsReachTheOneCallSite(CustomTestCase):
         self.assertEqual(sig.parameters["inject_mode"].default,
                          weight_exchange.INJECT_SHADOW)
 
-    def test_choose_host_ledger_computes_it_through_the_helper(self):
-        self.assertIn(
-            "ring_absent_by_design=ring_absent_by_design(weight_source, inject_mode)",
-            self._src(launcher.choose_host_ledger))
+    def _kwargs_of_call(self, fn, callee):
+        """``{keyword: unparsed value}`` of the call to ``callee`` inside ``fn``.
 
-    def test_main_hands_it_the_flag_and_not_a_default(self):
-        self.assertIn("inject_mode=ns.weg2_xchg_inject", self._src(launcher.main))
+        STRUCTURAL, not textual, and a MUTANT bought this: the first version of
+        the pin below asserted that ``inject_mode=ns.weg2_xchg_inject`` appears
+        SOMEWHERE in ``main``, and it appears TWICE -- the ``prepare_xchg_env``
+        call three statements earlier hands the same flag to a different
+        consumer.  So a mutant that redirected the LEDGER's argument to a
+        literal left the other occurrence standing and the pin passed.  A text
+        scan cannot say WHICH call site an argument reached; an AST walk can,
+        and it is immune to wrapping, indentation and neighbour order too --
+        the other two traps this campaign has paid for.
+        """
+        import ast
+        import inspect
+        import textwrap
+
+        tree = ast.parse(textwrap.dedent(inspect.getsource(fn)))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            f = node.func
+            name = f.attr if isinstance(f, ast.Attribute) else getattr(f, "id", "")
+            if name == callee:
+                return {k.arg: ast.unparse(k.value) for k in node.keywords if k.arg}
+        self.fail(f"{fn.__name__} contains no call to {callee}()")
+
+    def test_choose_host_ledger_computes_it_through_the_helper(self):
+        kw = self._kwargs_of_call(launcher.choose_host_ledger, "dict")
+        self.assertEqual(kw.get("ring_absent_by_design"),
+                         "ring_absent_by_design(weight_source, inject_mode)")
+
+    def test_main_hands_the_LEDGER_call_the_flag_and_not_a_default(self):
+        kw = self._kwargs_of_call(launcher.main, "choose_host_ledger")
+        self.assertEqual(kw.get("inject_mode"), "ns.weg2_xchg_inject")
+
+    def test_and_the_env_publisher_still_gets_it_too(self):
+        """The other consumer of the same flag, so neither can be starved to
+        satisfy the other."""
+        kw = self._kwargs_of_call(launcher.main, "prepare_xchg_env")
+        self.assertEqual(kw.get("inject_mode"), "ns.weg2_xchg_inject")
 
     def test_the_flags_default_is_shadow_so_the_bug_was_the_default_path(self):
         self.assertEqual(weight_exchange.INJECT_SHADOW, "shadow")
