@@ -59,6 +59,7 @@ WHAT IS ASSERTED, and what is deliberately NOT:
 """
 
 import os
+import pathlib
 import re
 import unittest
 from collections import defaultdict
@@ -523,8 +524,29 @@ class TestOneWCodePerException(CustomTestCase):
         # is only held by `code: str = "Wnn"` can no longer be named free here.
         # That is how W88 was mis-named free by B1b's first enumeration --
         # 19 textual hits under python/sglang/srt, 0 visible to this file.
-        for n in (39,):
-            self.assertNotIn(n, used, f"W{n} was named free and is not")
+        # #1273 B4d (2026-09-11) TOOK W39 for `Weg2XchgWavePartitionDisagree`,
+        # the published-vs-derived wave-partition reason.  The list shrinks
+        # HERE, in the same commit, for the fourth code running -- the register
+        # entry is part of the work.
+        self.assertIn(39, used, "W39 is the wave-partition refusal's number now")
+        # AND THE REMAINING FREE LIST IS NOW STATED WITH ITS OWN LIMIT, because
+        # this census has a BLIND SPOT that named a taken number free:
+        # `W19 DormantResidueRefused` is raised by front.py through
+        # `do_stop("W19 DormantResidueRefused", ...)`, and NONE of the four
+        # forms above can see it -- every one requires a `Weg2`-prefixed name.
+        # So W19 is TAKEN and this file would have offered it.  Same class as
+        # the W88 hole B1b hit, one naming convention further out.  Until a
+        # fifth form lands, a number from this list is a CANDIDATE and the
+        # author greps the tree for it before minting.
+        self.assertNotIn(19, used, "the census still cannot see W19's holder")
+        front = pathlib.Path(_repo_root(), "python", "sglang", "srt", "weg2", "front.py")
+        self.assertIn(
+            "W19 DormantResidueRefused", front.read_text(errors="replace"),
+            "W19 IS held in front.py -- if this ever fails the holder moved and "
+            "the free list above must be re-derived, not trusted",
+        )
+        for n in (5, 90):
+            self.assertNotIn(n, used, f"W{n} is free and is the next candidate")
         self.assertIn(88, used, "form 4 must see scheduler.py's signature code")
 
 
