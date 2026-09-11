@@ -2796,6 +2796,12 @@ def default_plan_provider(*, rank: int, region_tag: str = "") -> Callable[[Any],
             )
         return plan_bytes_from_descs(getattr(plan, "descs", ()))
 
+    # #1273 B4k: THE REGION THIS DEFAULT WAS BUILT FOR, recorded ON the closure.
+    # `region_tag` is baked into the derivation above, so a default built for
+    # one runner cannot answer for another -- see
+    # `install_default_plan_provider`.  An EXPLICITLY registered provider
+    # carries no such marker and is therefore never replaced.
+    provider._weg2_default_region = str(region_tag)  # type: ignore[attr-defined]
     return provider
 
 
@@ -2808,15 +2814,32 @@ def install_default_plan_provider(*, rank: int, region_tag: str = "") -> bool:
     file this slice owns -- and because one place should answer "does this rank
     have a plan provider".
 
-    AN ALREADY-REGISTERED PROVIDER WINS.  A test's or a later slice's provider
-    must not be replaced by the default, or the default becomes the only
-    reachable producer and every caller that installed its own is silently
+    AN EXPLICITLY REGISTERED PROVIDER WINS.  A test's or a later slice's
+    provider must not be replaced by the default, or the default becomes the
+    only reachable producer and every caller that installed its own is silently
     disarmed.
+
+    **BUT A DEFAULT BUILT FOR A DIFFERENT REGION DOES NOT WIN, and that
+    distinction is #1273 B4k's** -- before it, no second runner ever reached
+    this function.  The draft worker and the target runner are TWO
+    ``ModelRunner``s in ONE process and this slot is a MODULE slot, so the
+    second one to arm used to inherit the first one's default -- whose
+    ``region_tag`` is baked into its closure.  Once ``weights_draft`` is in the
+    family (AMENDMENT 6) that is a silent wrong answer rather than a no-op: the
+    draft runner would derive with the TARGET's region, key its plan map by
+    chunk tags taken from the drafter's ``layers.0.*`` names, then look those
+    bytes up under ``weights_draft`` and find nothing -- every draft parameter
+    UNCOVERED and W84 suppressing the leg, which is exactly the shape B4i
+    closed.  So a default whose region is not this one is REPLACED, and the
+    marker is what tells the two cases apart.
     """
     if not exchange_armed():
         return False
-    if plan_provider() is not None:
-        return False
+    current = plan_provider()
+    if current is not None:
+        theirs = getattr(current, "_weg2_default_region", None)
+        if theirs is None or theirs == str(region_tag):
+            return False
     register_plan_provider(default_plan_provider(rank=rank,
                                                  region_tag=region_tag))
     return True

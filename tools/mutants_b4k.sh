@@ -146,5 +146,16 @@ m "M9 the rotation predicate reverts to CHUNK-only (the draft runner refuses its
         and g.tag != wx.GPU_MEMORY_TYPE_WEIGHTS}))' \
   '        if ms.is_weights_chunk_tag(g.tag)}))'
 
+m "M10 a default provider built for ANOTHER runner wins again (draft plan keyed on the target's region)" "$WX" \
+  '        theirs = getattr(current, "_weg2_default_region", None)
+        if theirs is None or theirs == str(region_tag):
+            return False' \
+  '        return False'
+m "M11 an EXPLICITLY registered provider is replaced too (every caller silently disarmed)" "$WX" \
+  '        theirs = getattr(current, "_weg2_default_region", None)
+        if theirs is None or theirs == str(region_tag):
+            return False' \
+  '        pass'
+
 echo "BASELINE AFTER: $(run)"
 verify_all

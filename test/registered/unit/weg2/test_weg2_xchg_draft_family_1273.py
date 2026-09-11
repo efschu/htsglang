@@ -424,5 +424,115 @@ class TheDraftRunnerCanPlanItsOwnWeights(unittest.TestCase):
             self.assertIn("no-chunk-classes", reason)
 
 
+class _TargetModel(nn.Module):
+    """The target runner's model: two GDN-free layers under chunk tags."""
+
+    def __init__(self):
+        super().__init__()
+        self.model = nn.Module()
+        self.model.layers = nn.ModuleList([nn.Module(), nn.Module()])
+        for i in range(2):
+            self.model.layers[i].self_attn = nn.Module()
+            self.model.layers[i].self_attn.qkv_proj = nn.Parameter(
+                torch.zeros(384, 512, dtype=torch.bfloat16), requires_grad=False
+            )
+        self.model.embed_tokens = nn.Parameter(
+            torch.zeros(1024, 512, dtype=torch.bfloat16), requires_grad=False
+        )
+
+
+class TwoRunnersOneProcessOnePlanSlot(unittest.TestCase):
+    """THE HAZARD B4k CREATES, and it is invisible until the draft runner is in
+    the family.
+
+    The draft worker and the target runner are TWO ``ModelRunner``s in ONE
+    process, and ``_PLAN_PROVIDER`` is a module slot.
+    ``install_default_plan_provider`` documents that an already-registered
+    provider WINS -- correct for a test's or a later slice's provider, and wrong
+    for the second RUNNER of the same process: the default the target installed
+    has the target's ``region_tag`` baked into its closure, so the draft runner
+    would derive its plan with ``region_tag="weights"`` over the DRAFT model,
+    key the map by chunk tags derived from the drafter's ``layers.0.*`` names,
+    and then look those bytes up under ``weights_draft`` -- finding nothing.
+    Every draft parameter comes back UNCOVERED and W84 suppresses the leg again,
+    which is exactly the shape B4i closed.
+
+    Before B4k this could not happen: the arm short-circuited on the draft
+    region before it ever reached the provider.
+    """
+
+    def setUp(self):
+        os.environ["SGLANG_WEG2_WEIGHT_CHUNK_LAYERS"] = "8"
+        os.environ["SGLANG_WEG2_WEIGHT_CHUNKS"] = "8"
+        wx.register_plan_provider(None)
+        # Substitute the GROUP READER, not the env var: `weg2_group_name`
+        # caches for the process lifetime on purpose ("a sleep and its wake must
+        # not be able to read different answers"), so `setenv` would pass or
+        # fail depending on test ORDER.
+        from sglang.srt.managers import weg2_memory_saver as ms
+
+        self._saved_group = ms.weg2_group_name
+        ms.weg2_group_name = lambda: "D"
+
+    def tearDown(self):
+        from sglang.srt.managers import weg2_memory_saver as ms
+
+        ms.weg2_group_name = self._saved_group
+        wx.register_plan_provider(None)
+        os.environ.pop("SGLANG_WEG2_WEIGHT_CHUNK_LAYERS", None)
+        os.environ.pop("SGLANG_WEG2_WEIGHT_CHUNKS", None)
+
+    def _arm(self, model, region_tag):
+        lines = []
+        vote = wx.arm_coverage_at_load(
+            model, rank=0, tag_bytes=lambda _t: 0,
+            region_tag=region_tag, log=lines.append,
+        )
+        return vote, lines
+
+    def test_the_second_runner_gets_a_provider_for_ITS_OWN_region(self):
+        with _Exchange():
+            t_vote, _ = self._arm(_TargetModel(), GPU_MEMORY_TYPE_WEIGHTS)
+            self.assertTrue(t_vote.ok, t_vote.reason)
+            d_vote, d_lines = self._arm(
+                _DraftModel(), GPU_MEMORY_TYPE_WEIGHTS_DRAFT
+            )
+            self.assertTrue(d_vote.ok, d_vote.reason)
+            self.assertIn(GPU_MEMORY_TYPE_WEIGHTS_DRAFT, d_vote.rows)
+            row = d_vote.rows[GPU_MEMORY_TYPE_WEIGHTS_DRAFT]
+            self.assertEqual([t.name for t in row.uncovered], [])
+            cover = [ln for ln in d_lines if wx.COVER_LINE_PREFIX in ln]
+            self.assertEqual(len(cover), 1, d_lines)
+            self.assertIn("uncovered=0", cover[0])
+
+    def test_the_order_does_not_matter_draft_first_then_target(self):
+        """Neither runner may depend on arming first."""
+        with _Exchange():
+            d_vote, _ = self._arm(_DraftModel(), GPU_MEMORY_TYPE_WEIGHTS_DRAFT)
+            self.assertTrue(d_vote.ok, d_vote.reason)
+            t_vote, t_lines = self._arm(_TargetModel(), GPU_MEMORY_TYPE_WEIGHTS)
+            self.assertTrue(t_vote.ok, t_vote.reason)
+            for tag, row in t_vote.rows.items():
+                self.assertEqual([x.name for x in row.uncovered], [], tag)
+            self.assertTrue(
+                [ln for ln in t_lines if wx.COVER_LINE_PREFIX in ln], t_lines
+            )
+
+    def test_an_EXPLICITLY_registered_provider_still_wins(self):
+        """The documented behaviour that must survive the fix: a test's or a
+        later slice's provider is never replaced by a default."""
+        with _Exchange():
+            mine = {GPU_MEMORY_TYPE_WEIGHTS_DRAFT: {"mtp.eh_proj": 1}}
+
+            def provider(_model):
+                return mine
+
+            wx.register_plan_provider(provider)
+            self._arm(_TargetModel(), GPU_MEMORY_TYPE_WEIGHTS)
+            self.assertIs(wx.plan_provider(), provider)
+            self._arm(_DraftModel(), GPU_MEMORY_TYPE_WEIGHTS_DRAFT)
+            self.assertIs(wx.plan_provider(), provider)
+
+
 if __name__ == "__main__":
     unittest.main()
