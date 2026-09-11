@@ -61,7 +61,7 @@ The three that remain, each with its class (the operator's ruling of
 2026-09-11 after verifying all three at ``2c9592fd19``):
 
 1. ``weight_exchange.refuse_if_not_ok`` (W84,
-   ``weight_exchange.py:2513``) -- class UNWIRED-BY-DESIGN-AND-PINNED.  An
+   ``weight_exchange.py:2544``) -- class UNWIRED-BY-DESIGN-AND-PINNED.  An
    EXISTING test asserts it stays that way
    (``test_weg2_coverage_verdict_1273.py::test_refuse_if_not_ok_stays_unwired``);
    its docstring gives the reason (no group fence at the end of weight
@@ -75,7 +75,7 @@ The three that remain, each with its class (the operator's ruling of
    raise at ``:2377``) -- class DECLARED-TODO(S6), NOT a silent defect, and
    this is the operator's CORRECTION of this ratchet's first reading.  The
    on-card MODE IS decided and wired: the launcher publishes
-   ``env[ENV_ONCARD_MODE]`` from argv at ``launcher.py:3512``.  What has no
+   ``env[ENV_ONCARD_MODE]`` from argv at ``launcher.py:3532``.  What has no
    producer yet is the S6 PROBE-AND-DEGRADE arm (the W72 two-arm shape),
    and that is DECLARED: the docstring carries ``TODO(S6)``, an existing
    test asserts the marker is present
@@ -88,9 +88,10 @@ The three that remain, each with its class (the operator's ruling of
    (``Weg2XchgOncardSlotRefused``, ``:2410``, raise at ``:2429``, #1334) --
    class SECOND-AUTHORITY-CANDIDATE, and the operator's correction here
    matters: **the W82 slot-size guard is LIVE**.  ``Weg2XchgOncardSlotRefused``
-   has REACHABLE raisers at ``weight_exchange_transport.py:198`` and
-   ``:204`` inside ``validate_oncard_slot_mib``, which the launcher calls at
-   ``:3518``; only the raise inside THIS unused helper is unreachable, so
+   has REACHABLE raisers at ``weight_exchange_transport.py:198`` and ``:204``
+   inside ``validate_oncard_slot_mib`` (``:176``), which the launcher calls at
+   THREE sites (``launcher.py:3538``, ``:4585``, ``:9463``); only the raise
+   inside THIS unused helper is unreachable, so
    "the class is unreachable" was wrong as written.  What the finding
    actually uncovers is better: ``:2453``'s docstring names
    ``diagonal_carrier_bytes`` as the sizer "and the ledger charges the
@@ -217,7 +218,7 @@ UNWIRED_DEBT = (
         "file": "weg2/weight_exchange.py",
         "fn": "refuse_if_not_ok",
         "code": "Weg2XchgCoverageRefused",
-        "line": 2513,
+        "line": 2544,
         "class": "UNWIRED-BY-DESIGN-AND-PINNED",
         "why": "no group fence at the end of weight loading; "
                "test_weg2_coverage_verdict_1273.py::test_refuse_if_not_ok_stays_unwired "
@@ -229,7 +230,7 @@ UNWIRED_DEBT = (
         "code": "Weg2XchgOnCardUnavailable",
         "line": 2325,
         "class": "DECLARED-TODO",
-        "why": "the MODE is decided and wired (launcher.py:3512 publishes "
+        "why": "the MODE is decided and wired (launcher.py:3532 publishes "
                "env[ENV_ONCARD_MODE] from argv); the missing half is S6's "
                "probe-and-degrade arm, declared by TODO(S6) here, pinned by "
                "test_weg2_xchg_transport_1273.py:1995 and stated in prose at "
@@ -242,7 +243,8 @@ UNWIRED_DEBT = (
         "line": 2410,
         "class": "SECOND-AUTHORITY-CANDIDATE",
         "why": "#1334. The W82 guard itself is LIVE (reachable raisers at :198 "
-               "and :204 in validate_oncard_slot_mib, called from launcher.py:3518); "
+               "and :204 in validate_oncard_slot_mib (:176), called from "
+               "launcher.py:3538, :4585 and :9463); "
                "this helper is a SECOND authority for the carrier size -- :2453's "
                "docstring names it as the sizer while #1334 sized the deposit "
                "inline as 2x the published slot. Upstream-minimal law: seat 6 "
