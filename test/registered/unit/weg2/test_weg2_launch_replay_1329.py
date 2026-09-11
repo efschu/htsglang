@@ -46,6 +46,23 @@ sourced in ``recorded.json``:
   ``solve`` and is therefore an INPUT, not decoration.
 * ``recorded.json`` -- the recorded inputs AND the recorded verdicts.
 
+ONE DEPENDENCY THAT IS NOT A RECORDED INPUT, found by running this file on the
+REMOTE desk and not on the rig: arming the W48 form gate (i.e. handing ``solve``
+this boot's own P argv) makes it price that argv against the CHECKPOINT HEADERS
+of ``--model-path`` -- ``planner/pp_cut.checkpoint_weight_terms`` globs
+``*.safetensors`` and reads each shard's header -- and that 27 GB directory
+exists only on the rig.  On cachyllama the three form-gate tests failed with
+``W48 Weg2RingFormMismatch: ... the checkpoint terms of '<model path>' could not
+be read``.  So the replay is hermetic with respect to NVML, CUDA, /dev/shm and
+the boot, and NOT with respect to the model directory.  That is now DATA
+(``recorded.json`` -> ``checkpoint_dependency``, with the path, the reader, the
+call that reaches it and the consequence), the three tests that need it SKIP by
+name where it is absent, and a second ring pin -- the same solve with the gate
+UNARMED, its own answer recorded separately -- runs EVERYWHERE and still guards
+the whole parse surface of the extracted evidence.  Making the armed pin
+hermetic too means recording ``checkpoint_weight_terms``'s OUTPUT; that is owed
+and named in the fixture.
+
 WHAT THIS REPLAY DOES NOT COVER, named rather than implied: the W20/W21
 LADDER.  ``choose_host_ledger`` already has the seam for it (its
 ``meminfo_path`` / ``cgroup_root`` parameters exist "so a test can hand this
@@ -70,6 +87,7 @@ pre-fix constants on this tip.
 
 import ast
 import copy
+import glob
 import json
 import os
 import subprocess
@@ -124,11 +142,42 @@ def recorded_p_argv() -> list[str]:
         return fh.read().split()
 
 
-def solve_recorded_ring(evidence_dir: str = RING_EVIDENCE):
+def solve_recorded_ring(evidence_dir: str = RING_EVIDENCE, *, form_gate: bool = True):
+    """``ring_table.solve`` over the recorded evidence.
+
+    ``form_gate=True`` hands it this boot's own P argv, which is what makes the
+    answer byte-identical to the boot's -- and what makes it NON-HERMETIC: the
+    W48 form gate prices the argv against the CHECKPOINT HEADERS of
+    ``--model-path`` (``planner/pp_cut.checkpoint_weight_terms`` globs
+    ``*.safetensors`` and reads each shard's header), and that 27 GB directory
+    exists only on the rig.  ``form_gate=False`` is the hermetic form: no
+    checkpoint is touched, and its answer is recorded separately.
+    """
     return ring_table.solve(
         recorded_cards(), evidence_dir, RECORDED["ring_table"]["boot_stem"],
-        p_argv=recorded_p_argv(),
+        p_argv=recorded_p_argv() if form_gate else None,
     )
+
+
+def checkpoint_present() -> bool:
+    """Is the checkpoint the recorded P argv names on THIS box?
+
+    FOUND ON cachyllama, not on the rig (2026-09-11): the three form-gate
+    tests failed there with ``W48 Weg2RingFormMismatch: ... the checkpoint
+    terms of '<model path>' could not be read``.  The replay is hermetic with
+    respect to NVML, CUDA, /dev/shm and the boot -- but not with respect to the
+    model directory, so the tests that need it say so and SKIP instead of
+    failing for a reason that is not about the code they grade.
+    """
+    path = RECORDED["checkpoint_dependency"]["model_path"]
+    return bool(glob.glob(os.path.join(path, "*.safetensors")))
+
+
+NEEDS_CHECKPOINT = unittest.skipUnless(
+    checkpoint_present(),
+    "the checkpoint named by the recorded P argv is not on this box -- the W48 "
+    "form gate cannot be armed (see recorded.json checkpoint_dependency)",
+)
 
 
 class _NoNvml:
@@ -185,6 +234,7 @@ class TestTheFixtureIsFaithful(CustomTestCase):
             "-- most likely the root *.log ignore; see ring_evidence/.gitignore",
         )
 
+    @NEEDS_CHECKPOINT
     def test_solve_reproduces_the_boots_own_ring_bytes(self):
         table, reason = solve_recorded_ring()
         self.assertIsNotNone(table, f"no table from the fixture: {reason}")
@@ -193,6 +243,7 @@ class TestTheFixtureIsFaithful(CustomTestCase):
         self.assertEqual(table.total_span1_bytes, rec["ring_span1_bytes"])
         self.assertIn(rec["boot_stem"], reason.split("\n")[0])
 
+    @NEEDS_CHECKPOINT
     def test_solve_reproduces_the_boots_own_per_card_L6_rows(self):
         """Not only the total: the per-card H and span1 of XSN14's three
         ``WEG2-HOST-LEDGER RING`` lines.  A total can match while two cards
@@ -206,6 +257,40 @@ class TestTheFixtureIsFaithful(CustomTestCase):
         self.assertEqual(span1, {k: int(v) for k, v in
                                  RECORDED["ring_table"]["per_card_span1_mib"].items()})
 
+    def test_the_hermetic_solve_reproduces_its_own_recorded_answer(self):
+        """THE RING-SOLVE PIN THAT RUNS EVERYWHERE.  With the W48 form gate
+        UNARMED no checkpoint is read, so this one holds on the remote desk
+        too -- and it still guards the whole parse surface of the extracted
+        evidence (chunk bytes, flip tags, the ordinal map, the sidecar), which
+        is what a regression in ``solve`` or a lossy extraction would move.
+
+        Its number is NOT the boot's: the boot armed the gate.  Both are
+        recorded, separately and with the reason, so neither can be quoted as
+        the other.
+        """
+        table, reason = solve_recorded_ring(form_gate=False)
+        rec = RECORDED["ring_table"]
+        self.assertIsNotNone(table, f"no table from the fixture: {reason}")
+        self.assertEqual(table.total_h_bytes, rec["no_form_gate_h_bytes"])
+        self.assertEqual(table.total_span1_bytes, rec["no_form_gate_span1_bytes"])
+        self.assertIn(rec["boot_stem"], reason.split("\n")[0])
+        self.assertNotEqual(rec["no_form_gate_h_bytes"], rec["ring_bytes"],
+                            "the two recorded answers must stay distinguishable")
+
+    def test_the_checkpoint_dependency_is_declared_not_discovered(self):
+        """The dependency that cost a remote run is now DATA: the path, the
+        function that reads it, the call that reaches it, and what happens
+        without it.  A box fact that is not written down is a test that passes
+        only where it was written."""
+        dep = RECORDED["checkpoint_dependency"]
+        for key in ("model_path", "read_by", "reached_from", "consequence", "owed"):
+            self.assertIn(key, dep)
+        self.assertIn("--model-path", " ".join(recorded_p_argv()))
+        self.assertIn(dep["model_path"], " ".join(recorded_p_argv()),
+                      "the declared checkpoint path is not the one the recorded "
+                      "argv actually names")
+
+    @NEEDS_CHECKPOINT
     def test_the_p_argv_is_an_input_and_not_decoration(self):
         """Dropping it changes the answer, so it belongs in the fixture.
         Measured while building this: 46133149696 with it, 46888124416
@@ -217,6 +302,7 @@ class TestTheFixtureIsFaithful(CustomTestCase):
         self.assertIsNotNone(without)
         self.assertNotEqual(with_argv.total_h_bytes, without.total_h_bytes)
 
+    @NEEDS_CHECKPOINT
     @unittest.skipUnless(os.path.isdir(FULL_EVIDENCE_DIR),
                          "the real evidence dir is not on this box")
     def test_the_extract_equals_the_full_evidence_dir(self):
@@ -524,9 +610,11 @@ class TestTheReplayNeedsNoBootAndNoNvml(CustomTestCase):
         saved = sys.modules.get("pynvml")
         sys.modules["pynvml"] = _NoNvml()
         try:
-            table, _ = solve_recorded_ring()
+            # form_gate=False: the armed gate reads the checkpoint, which is a
+            # box fact, not a recorded input -- and this test is about NVML.
+            table, _ = solve_recorded_ring(form_gate=False)
             self.assertEqual(table.total_h_bytes,
-                             RECORDED["ring_table"]["ring_bytes"])
+                             RECORDED["ring_table"]["no_form_gate_h_bytes"])
             with self.assertRaises(ValueError):
                 host_ledger.price(
                     memtotal_bytes=APPROX_MEMTOTAL_BYTES,
@@ -550,7 +638,7 @@ class TestTheReplayNeedsNoBootAndNoNvml(CustomTestCase):
 
     def test_the_replay_writes_nothing_into_dev_shm(self):
         before = set(os.listdir("/dev/shm")) if os.path.isdir("/dev/shm") else set()
-        solve_recorded_ring()
+        solve_recorded_ring(form_gate=False)
         lines: list[str] = []
         L.prepare_weight_exchange(
             recorded_cards(), lines.append, L.WEIGHT_SOURCE_EXCHANGE, CENSUS,

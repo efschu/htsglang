@@ -45,7 +45,10 @@
       "GPU-5c648f96-be1d-42d5-0221-34d11ab137f7": 8255,
       "GPU-62dbbae1-e859-9ccc-f9c2-d9f2443a84f4": 12527
     },
-    "source": "ring_bytes/ring_span1_bytes are the two fields of XSN13's own ValueError; ring_h_mib is XSN14's WEG2-XCHG-ARMED token 'ring_H_mib=43996'; the per-card rows are XSN14's three 'WEG2-HOST-LEDGER RING card=... H=... span1=...' L6 lines."
+    "source": "ring_bytes/ring_span1_bytes are the two fields of XSN13's own ValueError; ring_h_mib is XSN14's WEG2-XCHG-ARMED token 'ring_H_mib=43996'; the per-card rows are XSN14's three 'WEG2-HOST-LEDGER RING card=... H=... span1=...' L6 lines.",
+    "no_form_gate_h_bytes": 46888124416,
+    "no_form_gate_span1_bytes": 44557139968,
+    "no_form_gate_note": "The SAME solve with p_argv=None, i.e. with the W48 FORM GATE UNARMED. Recorded because it is the only ring-solve answer that is HERMETIC: arming the form gate makes solve read the checkpoint headers of this boot's --model-path (planner/pp_cut.checkpoint_weight_terms globs *.safetensors and reads each shard's header), and that 27 GB directory exists only on the rig. Measured on the rig 2026-09-11: 46133149696 with the form gate armed (== the boot's own number), 46888124416 without. Both are pinned; the armed one only where the checkpoint lives."
   },
   "wall_xsn13_ring_absent_contradiction": {
     "tree": "48f55fb393",
@@ -100,5 +103,12 @@
   "armed_line_source": "XSN14 front log, verbatim up to the ' -- provenance:' tail (the tail quotes the census's own provenance string, which the census fixture carries). XSN15's line is byte-identical except for epoch=1789107074, and BOOT_weg2xsn13_0911.md records the same peaks/frees/wave1_ok on 48f55fb393.",
   "arming_floor_mib": 1229,
   "region_mib": 385,
-  "epoch_xsn14": 1789103306
+  "epoch_xsn14": 1789103306,
+  "checkpoint_dependency": {
+    "model_path": "/spinning/llm_stuff/club-3090/models-cache/Qwen3.8-27B-INT8-gdncov-vocabembed",
+    "read_by": "python/sglang/srt/planner/pp_cut.py:2184 checkpoint_weight_terms -> glob *.safetensors, read each shard header",
+    "reached_from": "ring_table.solve -> checkpoint_stage_weights (ring_table.py:802) when p_argv arms the W48 form gate",
+    "consequence": "W48 Weg2RingFormMismatch on any box without the checkpoint. FOUND ON cachyllama 2026-09-11, not on the rig: the three form-gate tests failed there with \"the checkpoint terms of '<model path>' could not be read\". The replay is hermetic with respect to NVML, CUDA, /dev/shm and the boot -- but NOT with respect to the model directory, and that is now said out loud instead of being true only on one box.",
+    "owed": "record checkpoint_weight_terms()'s OUTPUT as fixture data (its docstring says it measures headers, not bytes), which would make the armed-form-gate pin hermetic too. Needs one local run; deferred with the local execution slot."
+  }
 }
