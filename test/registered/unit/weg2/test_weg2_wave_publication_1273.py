@@ -233,13 +233,38 @@ class TheFenceCarriesItAndTheRaiseStaysW29(CustomTestCase):
                 return {k.value for k in node.value.keys if isinstance(k, ast.Constant)}
         self.fail("the fence no longer builds a per-rank dict called `mine`")
 
+    def _fence_dict_pairs(self):
+        import ast
+        import inspect
+        import textwrap
+
+        from sglang.srt.managers.scheduler_components import weight_updater as wu
+
+        src = textwrap.dedent(inspect.getsource(
+            wu.SchedulerWeightUpdaterManager._weg2_group_fence_impl))
+        for node in ast.walk(ast.parse(src)):
+            if isinstance(node, ast.Assign) and any(
+                    getattr(t, "id", "") == "mine" for t in node.targets):
+                return {k.value: ast.unparse(v)
+                        for k, v in zip(node.value.keys, node.value.values)}
+        self.fail("the fence no longer builds a per-rank dict called `mine`")
+
     def test_both_digests_ride_the_per_rank_dict(self):
-        keys = self._fence_dict_keys()
-        self.assertIn("waves_published", keys)
-        self.assertIn("waves_planned", keys)
+        """THE VALUES, not merely the keys.
+
+        A mutant bought this too: asserting only that `waves_published` is a
+        KEY let a mutant replace its value with `""` and survive -- a field
+        that is always empty carries nothing, and the fence line would have
+        read as agreement on every boot.
+        """
+        pairs = self._fence_dict_pairs()
+        self.assertEqual(pairs.get("waves_published"),
+                         "wx.waves_digest(wx.published_waves() or ())")
+        self.assertEqual(pairs.get("waves_planned"),
+                         "wx.waves_digest(wx.planned_waves() or ())")
         # and the fields the fence's own contract already names are still there
         for k in ("rank", "ok", "failure", "card", "leg_ms", "per_tag"):
-            self.assertIn(k, keys)
+            self.assertIn(k, pairs)
 
     def test_a_recorded_mismatch_makes_this_ranks_vote_not_ok(self):
         """The one line that turns a rank-local finding into a group stop."""
