@@ -424,6 +424,74 @@ class TheDraftRunnerCanPlanItsOwnWeights(unittest.TestCase):
             self.assertIn("no-chunk-classes", reason)
 
 
+class TheArmReachesTheLauncherAndTheFront(unittest.TestCase):
+    """THE ONE THAT WOULD HAVE MADE B4k A NO-OP AT THE BOOT.
+
+    ``weight_exchange.weight_source()`` is the ONE reader of the mode and it
+    reads the ENVIRONMENT.  The launcher took the mode from ARGV and wrote the
+    env var only into the per-group ``build_env`` -- so in the launcher's own
+    process the arm read ``ring``.  That was harmless while the arm changed
+    nothing the launcher computes, and became a silent no-op the moment
+    ``weights_draft`` joined the family: the front's environment is
+    ``dict(os.environ)`` (launcher.py:10056) and the front builds its pause
+    order from ``weights_family_tags`` (front.py:1609), so the RANKS would have
+    carried a 10-tag family while the launcher and the front carried 9 -- the
+    draft tag in no pause order, its bytes resident through every flip, and this
+    whole slice green at the desk and worth nothing at the boot.
+
+    Asserted STRUCTURALLY on ``main``'s source rather than by running the
+    launcher, because ``main`` needs NVML, a git tree and real processes. The
+    ORDER is the load-bearing half: the publication must precede the family
+    list, the reserve line and the front spawn.
+    """
+
+    def test_main_publishes_the_arm_into_its_own_environment(self):
+        import ast
+
+        from sglang.srt.weg2 import launcher as L
+
+        src, _start = inspect.getsourcelines(L.main)
+        tree = ast.parse(__import__("textwrap").dedent("".join(src)))
+        writes = [
+            n for n in ast.walk(tree)
+            if isinstance(n, ast.Assign)
+            and any(
+                isinstance(t, ast.Subscript)
+                and isinstance(t.value, ast.Attribute)
+                and t.value.attr == "environ"
+                and "WEIGHT_SOURCE_ENV" in ast.unparse(t.slice)
+                for t in n.targets
+            )
+        ]
+        self.assertEqual(
+            len(writes), 1,
+            "main() must publish the weight-source arm into its OWN "
+            "os.environ exactly once -- without it the launcher and the front "
+            "read `ring` while the ranks read `exchange`",
+        )
+        self.assertIn("ns.weg2_weight_source", ast.unparse(writes[0].value))
+
+        def _first_call(name):
+            lines = [
+                n.lineno for n in ast.walk(tree)
+                if isinstance(n, ast.Call)
+                and (
+                    getattr(n.func, "id", None) == name
+                    or getattr(n.func, "attr", None) == name
+                )
+            ]
+            return min(lines) if lines else None
+
+        for after in ("weights_family_tags", "xchg_form_dormant_reserve",
+                      "front_argv_for"):
+            at = _first_call(after)
+            self.assertIsNotNone(at, f"{after} is no longer called from main()")
+            self.assertLess(
+                writes[0].lineno, at,
+                f"the arm must be published BEFORE {after} reads it",
+            )
+
+
 class _TargetModel(nn.Module):
     """The target runner's model: two GDN-free layers under chunk tags."""
 

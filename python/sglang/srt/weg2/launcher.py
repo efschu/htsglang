@@ -9013,6 +9013,30 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # BEFORE build_env(), which starts from os.environ: an inherited stage map
     # would reach group P's ranks without passing through the solver at all.
     refuse_inherited_layer_set(os.environ)
+    # #1273 B4k: THE ARM IS PUBLISHED INTO THIS PROCESS'S OWN ENVIRONMENT, and
+    # it has to be, because the flag and the env var were two readings of one
+    # fact.  `weight_exchange.weight_source()` is the ONE reader of the mode and
+    # it reads the ENVIRONMENT; the launcher, however, took the mode from ARGV
+    # and only ever wrote the env var into the per-group `build_env` -- so in the
+    # launcher's own process, and in every process that inherits it, the arm
+    # read as `ring`.
+    #
+    # Harmless while the arm changed nothing the launcher computes; a NO-OP
+    # BOOT the moment `weights_draft` joined the family (AMENDMENT 6).  The
+    # front's environment is `dict(os.environ)` (:10056) and the front builds
+    # the pause order from `weights_family_tags` (front.py:1609): without this
+    # line the ranks would carry a 10-tag family while the launcher and the
+    # front carried 9, the draft tag would never appear in any pause order, its
+    # bytes would stay resident through every flip, and B4k would grade green at
+    # the desk while achieving NOTHING at the boot.  It is also the
+    # ranks-never-disagree law: a family the launcher and the ranks read
+    # differently is a disagreement, not a compensation.
+    #
+    # Written HERE, next to the other two pre-launch environment decisions, and
+    # with the value the launcher publishes to the groups -- so the mode a rank
+    # enforces, the mode the front schedules and the mode the launcher prices
+    # cannot be three readings.
+    os.environ[weight_exchange.WEIGHT_SOURCE_ENV] = str(ns.weg2_weight_source)
     # #1032 RESOLVED HERE, BEFORE THE SWEEPS, THE STORE AND ANY LAUNCH: a
     # retracted token vector is a desk fact, and the whole point of W46 is that
     # it must not cost a boot window -- nor a mount, nor an shm sweep -- to
