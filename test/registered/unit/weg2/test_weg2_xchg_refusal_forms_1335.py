@@ -67,6 +67,8 @@ import collections
 import os
 import pathlib
 
+import pytest
+
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 
 from sglang.srt.weg2 import weight_exchange_region as xr  # noqa: E402
@@ -128,6 +130,12 @@ ZERO_REFERENCE_REFUSERS = (
 )
 
 SIZE_ON_THE_LINE = 3
+
+#: B4l's ratchet, by file name, because the two lists must be read TOGETHER.
+#: It lives on ``weg2/xchg-b4l-b4m-0911`` (@ ``fec81234e9``, based on RE-STAMP 5
+#: ``ec753f00d9``) and is NOT in this tree yet, so the check below is DORMANT
+#: rather than passing -- see its skip reason.
+B4L_RATCHET = "test_weg2_xchg_refusal_reachability_1328.py"
 
 #: Classes a frozen entry may carry.  ``UNKNOWN`` is refused outright: an entry
 #: nobody has classified is a triage note, not a debt anyone owns.
@@ -344,4 +352,110 @@ def test_the_vote_predicate_REJECTS_an_ok_verdict():
     assert owners == ["refuses"], (
         f"the vote predicate classified {owners} -- only an explicit False "
         f"literal is a refusal; True is an approval and a variable is neither"
+    )
+
+# ===========================================================================
+# (5) THE TWO FROZEN DEBT LISTS, AND WHY THEIR SIZES DIFFER BY CONSTRUCTION.
+# ===========================================================================
+#
+# After the merge train this tree carries TWO frozen debt lists over the same
+# lane, of DIFFERENT SIZES, and that is CORRECT.  Written down here because the
+# obvious "fix" is the defect: pulling one list to match the other loses
+# `gate0_check`, i.e. exactly the refusal the operator decided on 2026-09-11 to
+# leave UNWIRED with a reason.  Losing it would turn a recorded decision back
+# into an invisible gap.
+#
+#   B4l  (`test_weg2_xchg_refusal_reachability_1328.py`): predicate = a raise
+#        whose raised expression's callee NAME starts with `Weg2`, i.e.
+#        `raise Weg2X(...)`.  Its debt therefore holds exactly those
+#        zero-reference owners whose ONLY refusal form is that bare raise.
+#        After #1333 paid its `diagonal_carrier_bytes` entry: TWO.
+#
+#   THIS FILE: predicate = the same bare raise PLUS
+#        `raise <recv>._refuse(Weg2X, ...)` (the helper form) PLUS
+#        `write_matrix_verdict(row, False)` (the VOTE form -- a group-wide
+#        refusal that never raises locally).  THREE.
+#
+# The difference is one name, `gate0_check`, and it is not an oversight in
+# either file: its refusal travels ONLY by the helper and by the vote, so B4l's
+# predicate cannot match it.  MEASURED in the lane, and the correlation is
+# one-to-one rather than argued: 174 `raise_direct` sites, 7 `raise_via_refuse`,
+# 1 `vote`; the zero-reference owners are exactly THREE; the two B4l names are
+# exactly those whose only form is `raise_direct`.
+#
+# So the invariant that ties the two lists is NOT "same size" but:
+#
+#     B4l's set == { entries of THIS list whose forms include FORM_RAISE }
+#
+# and the test below ENFORCES that instead of asserting it in prose -- because a
+# prose pointer on one side only is the half nobody reads.  The mirror pointer
+# for B4l's own file travels as a named merge-train item
+# (`/spinning/gpu-arb/weg2/MERGE_TRAIN_WEG2_0911.md`), since that file is not in
+# this tree and a divergent copy of it would itself be the defect.
+
+
+def _b4l_frozen_debt():
+    """``(set of fn names, pinned size)`` from B4l's ratchet, or ``None``.
+
+    Read out of its AST, not imported: importing a sibling test module to
+    inspect its constants couples two suites at collection time, and a literal
+    is the one thing an AST can read with no side effect at all.
+    """
+    path = pathlib.Path(__file__).with_name(B4L_RATCHET)
+    if not path.is_file():
+        return None
+    tree = ast.parse(path.read_text(), filename=str(path))
+    names, size = None, None
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Assign):
+            continue
+        for target in node.targets:
+            if getattr(target, "id", None) == "UNWIRED_DEBT":
+                entries = ast.literal_eval(node.value)
+                names = {e["fn"] for e in entries}
+            elif getattr(target, "id", None) == "DEBT_SIZE_ON_THE_LINE":
+                size = ast.literal_eval(node.value)
+    return names, size
+
+
+def test_the_two_frozen_debt_lists_agree_BY_CONSTRUCTION():
+    """The enforced half of the cross-reference.
+
+    DORMANT until B4l lands, and dormant LOUDLY: a skip that reads as a pass is
+    the #1300 shape, so the reason names the branch, the SHA and the base.
+    """
+    debt = _b4l_frozen_debt()
+    if debt is None:
+        pytest.skip(
+            f"{B4L_RATCHET} is not in this tree -- it lives on "
+            f"weg2/xchg-b4l-b4m-0911 @ fec81234e9, based on RE-STAMP 5 "
+            f"ec753f00d9. This check is DORMANT, not passing, and arms itself "
+            f"the moment that file lands (merge-train Kante F)."
+        )
+    theirs, their_size = debt
+    expected = {e["fn"] for e in ZERO_REFERENCE_REFUSERS
+                if FORM_RAISE in e["forms"]}
+    assert theirs == expected, (
+        f"the two frozen debt lists have drifted. B4l's predicate is the bare "
+        f"`raise Weg2*`, so its set must be exactly this file's entries whose "
+        f"forms include {FORM_RAISE}: expected {sorted(expected)}, found "
+        f"{sorted(theirs)}. DO NOT make the two lists equal -- the difference "
+        f"is the point."
+    )
+    assert their_size == len(expected), (
+        f"B4l pins DEBT_SIZE_ON_THE_LINE={their_size} but the derived set has "
+        f"{len(expected)}; #1333 paid its `diagonal_carrier_bytes` entry, so "
+        f"that entry goes and the size drops with it"
+    )
+    # The two names that must NEVER appear in B4l's list, each for its own
+    # reason -- stated so a future reader does not "restore" either.
+    assert "gate0_check" not in theirs, (
+        "gate0_check belongs to THIS file only: its refusal travels by the "
+        "_refuse helper and by write_matrix_verdict(row, False), neither of "
+        "which B4l's `raise Weg2*` predicate can match. Adding it there would "
+        "claim a detection B4l's scan does not perform."
+    )
+    assert "diagonal_carrier_bytes" not in theirs, (
+        "#1333 deleted it -- that entry's own reason said "
+        "'seat 6 picks one authority, default DELETE', and the debt was paid"
     )
