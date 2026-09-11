@@ -1148,8 +1148,13 @@ def test_the_shadow_arm_is_a_launcher_choice_and_arms_nothing_on_the_others():
 
     assert launcher.WEIGHT_SOURCE_CHOICES == ("ring", "exchange", "shadow")
     assert launcher.WEIGHT_SOURCE_DEFAULT == "ring"
-    for arm in ("ring", "exchange"):
-        assert launcher.prepare_shadow_env(lambda *_a: None, "b", arm) == {}
+    # STEP 7: `exchange` now ARMS, and that is the blocker the HELD S6I order
+    # named -- it used to publish nothing, so the exchange could not reach the
+    # ranks at all.  Only the DEFAULT arm publishes nothing, which is what
+    # keeps a stock boot byte-identical.
+    assert launcher.WEIGHT_SOURCE_ARMED == ("exchange", "shadow")
+    assert launcher.prepare_xchg_env(
+        lambda *_a: None, "b", launcher.WEIGHT_SOURCE_DEFAULT) == {}
 
 
 def _flat(*, nbytes, dst_ptr, name="model.layers.0.self_attn.qkv_proj.weight"):
@@ -2461,7 +2466,7 @@ def test_the_hop_bound_is_a_launcher_flag_and_is_published_to_the_ranks():
     assert "--weg2-shadow-hop-bound-ms" in src
     assert "ns.weg2_shadow_hop_bound_ms" in src
     assert "weight_exchange_shadow.ENV_HOP_BOUND_MS" in src
-    assert ln.prepare_shadow_env(lambda _s: None, "b", "ring") == {}, \
+    assert ln.prepare_xchg_env(lambda _s: None, "b", "ring") == {}, \
         "the ring arm must publish nothing at all"
 
 
@@ -4550,13 +4555,13 @@ def test_the_launcher_publishes_the_on_card_arm_it_charged_for(tmp_path):
     with pytest.raises(SystemExit):
         lc.build_parser().parse_args(["--tree", "/t", "--tag", "x",
                                       "--weg2-xchg-oncard", "staging"])
-    env_src = inspect.getsource(lc.prepare_shadow_env)
+    env_src = inspect.getsource(lc.prepare_xchg_env)
     assert "weight_exchange_transport.ENV_ONCARD_MODE" in env_src, env_src
     build_src = inspect.getsource(lc.build_env)
     assert "weight_exchange_transport.ENV_ONCARD_MODE" in build_src, \
         "an inherited on-card arm must be popped like the hop bound"
     # The ring arm publishes NOTHING, which is what keeps it byte-identical.
-    assert lc.prepare_shadow_env(lambda _s: None, "b1", "ring",
+    assert lc.prepare_xchg_env(lambda _s: None, "b1", "ring",
                                  oncard_mode="host") == {}
 
 
@@ -5249,7 +5254,7 @@ def test_the_launcher_publishes_the_ceiling_to_both_groups_and_pops_it():
     assert "--weg2-xchg-oncard-slot-mib" in src
     assert "ENV_ONCARD_SLOT_MIB] = str(slot_mib)" in src
     # Popped in build_env's launcher-OUTPUT loop and published by
-    # prepare_shadow_env, whose dict build_env applies AFTER that loop -- the
+    # prepare_xchg_env, whose dict build_env applies AFTER that loop -- the
     # ordering that matters is the runtime one (pop, then override), which the
     # arm's three names already rely on and share this loop with.
     assert "weight_exchange_transport.ENV_ONCARD_SLOT_MIB):" in src

@@ -997,6 +997,14 @@ P_MAMBA_SLOTS_PER_RUNNING_REQUEST = 2
 #: without the exchange being able to break a flip.
 WEIGHT_SOURCE_CHOICES = ("ring", "exchange", "shadow")
 WEIGHT_SOURCE_DEFAULT = "ring"
+#: The arms that NEED the region armed and published to the ranks -- every
+#: choice except the default.  DERIVED and not a second literal: a future arm
+#: added to `WEIGHT_SOURCE_CHOICES` is armed by construction instead of
+#: silently publishing nothing, which is precisely the defect step 7 closed for
+#: `exchange` (it had been absent from a hand-written comparison since S5).
+WEIGHT_SOURCE_ARMED = tuple(a for a in WEIGHT_SOURCE_CHOICES
+                            if a != WEIGHT_SOURCE_DEFAULT)
+WEIGHT_SOURCE_EXCHANGE = "exchange"
 
 #: #1273 S6: THE ON-CARD LANE'S ARM, spec section 3.7 degrade 3's own flag
 #: (``--weg2-xchg-oncard {ipc|host}``).  It had no producer at all: the ranks
@@ -3352,7 +3360,7 @@ def prepare_xchg_region(log: Log, boot_nonce: str, hook_mode: int,
     return weight_exchange_region.prepare_region(boot_nonce, hook_mode=hook_mode, log=log)
 
 
-def prepare_shadow_env(log: Log, boot_nonce: str, weight_source: str,
+def prepare_xchg_env(log: Log, boot_nonce: str, weight_source: str,
                        hook_mode: int = 0, dry: bool = False,
                        hop_bound_ms: Optional[float] = None,
                        oncard_mode: str = ONCARD_MODE_DEFAULT,
@@ -3361,18 +3369,36 @@ def prepare_shadow_env(log: Log, boot_nonce: str, weight_source: str,
                        bounce_terms: Optional[xchg_bounce.BounceTerms] = None,
                        inject_mode: str = weight_exchange.INJECT_SHADOW,
                        ) -> Dict[str, str]:
-    """#1273 S5: arm the region for the SHADOW arm, and publish it to both groups.
+    """#1273 S5/S6: arm the region for EVERY non-default arm and publish it.
 
-    ``{}`` on every other arm, and that empty dict is what keeps the default
+    RENAMED FROM ``prepare_shadow_env`` IN STEP 7, because the old name became
+    a lie the moment the exchange needed the same publication: one publisher,
+    one name.  The old name is deliberately NOT kept as an alias -- two names
+    for one publisher is how two readers begin.
+
+    ``{}`` on the DEFAULT arm, and that empty dict is what keeps the default
     boot byte-identical: no region file, no semaphores, no environment, and
-    :func:`build_env` pops the three names so nothing can be inherited.
+    :func:`build_env` pops the names so nothing can be inherited.
+
+    THE GUARD USED TO READ ``weight_source != "shadow"`` AND THAT WAS THE
+    BLOCKER.  Under ``--weg2-weight-source exchange`` it returned ``{}``, so no
+    region was armed and nothing was published -- not the on-card arm, not the
+    slot, and not step 6's two variables.  Three silent wrong answers followed:
+    a rank read ``inject_mode()``'s DEFAULT rather than a published value, so
+    ``--weg2-xchg-inject authoritative`` would have been ignored and the boot's
+    mode was unprovable from its own argv; ``read_published_terms()`` answered
+    ``None`` and the injector refused W4; and with no region there was no Gate
+    0 and no transport.  The set is now derived from
+    :data:`WEIGHT_SOURCE_ARMED`, so an arm added later cannot be missed by a
+    comparison nobody remembered to widen.
 
     THE SHADOW NEEDS EXACTLY WHAT THE EXCHANGE NEEDS, MINUS THE AUTHORITY: the
-    same 385 MiB staging region, the same 24 semaphores, the same two env
-    names.  What it does not get is the mode switch inside the ranks --
-    ``SGLANG_WEG2_WEIGHT_SOURCE=shadow`` leaves ``exchange_armed()`` False, so
-    ``model_runner`` still opens the weights region with ``enable_cpu_backup``
-    and the ring still refills every byte.
+    same 385 MiB staging region, the same 24 semaphores, the same env names.
+    What differs is the MODE SWITCH INSIDE THE RANKS, and it is published as
+    the arm that was asked for: ``SGLANG_WEG2_WEIGHT_SOURCE=shadow`` leaves
+    ``exchange_armed()`` False, so ``model_runner`` still opens the weights
+    region with ``enable_cpu_backup`` and the ring still refills every byte,
+    while ``=exchange`` is what makes the exchange the weight source at all.
 
     W71 IS NOT ARMED HERE, on purpose.  W71 prices the co-residency peak of a
     real exchange, and under ``shadow`` no tag is ever exchanged: both images
@@ -3382,11 +3408,19 @@ def prepare_shadow_env(log: Log, boot_nonce: str, weight_source: str,
     will allocate it, at the moment it would.  Pricing it at launch instead
     would grade a peak this arm does not have.
     """
-    if weight_source != "shadow":
+    if str(weight_source) not in WEIGHT_SOURCE_ARMED:
         return {}
     got = prepare_xchg_region(log, boot_nonce, hook_mode, dry=dry)
     env = dict(got.get("env") or {})
-    env["SGLANG_WEG2_WEIGHT_SOURCE"] = "shadow"
+    # THE ARM THAT WAS ASKED FOR, not a literal.  This read
+    # `env[...] = "shadow"` -- correct while `shadow` was the only arm that
+    # reached this line, and the SECOND HALF of step 7's blocker once
+    # `exchange` did: it would have published `shadow` to every rank, leaving
+    # `exchange_armed()` False in all six, so `model_runner` would still open
+    # the weights region with `enable_cpu_backup` and the ring would still
+    # refill every byte -- an `exchange` boot that silently ran as `shadow`,
+    # with nothing in its own log to say so.
+    env["SGLANG_WEG2_WEIGHT_SOURCE"] = str(weight_source)
     # S5b: the launcher-given hop bound, published by the same mechanism and
     # for the same reason as the region names -- a rank reads a flag it never
     # sees on its own argv, and a bound nobody published is a bound the rank
@@ -4391,7 +4425,7 @@ def xchg_bounce_arm_pins_host(weight_source: str, oncard_mode: str) -> bool:
     `--weg2-xchg-oncard ipc` creates one but exports a VRAM bounce that is
     freed with its own leg, so no bounce FILE exists and no host byte is
     pinned.  Host bytes exist on `shadow`/`exchange` + `host` and nowhere else,
-    and this is the same arm string `prepare_shadow_env` publishes to the
+    and this is the same arm string `prepare_xchg_env` publishes to the
     ranks -- so the arm a rank enforces and the arm that was paid for cannot be
     two readings.
 
@@ -9217,7 +9251,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 depth=xchg_bounce.ASSEMBLE_DEPTH_DEFAULT,
                 slot_bytes=weight_exchange_transport.validate_oncard_slot_mib(
                     ns.weg2_xchg_oncard_slot_mib) * weight_exchange_region.MIB))
-    xchg_env = prepare_shadow_env(log, str(ring_plan.epoch),
+    xchg_env = prepare_xchg_env(log, str(ring_plan.epoch),
                                   ns.weg2_weight_source, dry=dry,
                                   hop_bound_ms=ns.weg2_shadow_hop_bound_ms,
                                   oncard_mode=ns.weg2_xchg_oncard,
