@@ -113,9 +113,29 @@ def ring(monkeypatch):
 
 @pytest.fixture()
 def exchange(monkeypatch):
+    """The exchange arm in AUTHORITATIVE inject mode.
+
+    Both are needed for the exchange to be the carrier (step 6c): the arm says
+    the exchange is the weight SOURCE, the mode says its injection has
+    REPLACED the refill.  Under the default `shadow` the refill stays the
+    authority -- `test_under_shadow_mode_the_refill_stays_the_authority` is
+    that half.
+    """
     monkeypatch.setenv(wx.WEIGHT_SOURCE_ENV, wx.WEIGHT_SOURCE_EXCHANGE)
+    monkeypatch.setenv(wx.INJECT_ENV, wx.INJECT_AUTHORITATIVE)
     assert wx.exchange_armed() is True
+    assert wx.inject_authoritative() is True
     return "exchange"
+
+
+@pytest.fixture()
+def exchange_shadow(monkeypatch):
+    """The exchange arm in the DEFAULT inject mode: grading, not owning."""
+    monkeypatch.setenv(wx.WEIGHT_SOURCE_ENV, wx.WEIGHT_SOURCE_EXCHANGE)
+    monkeypatch.delenv(wx.INJECT_ENV, raising=False)
+    assert wx.exchange_armed() is True
+    assert wx.inject_authoritative() is False
+    return "shadow"
 
 
 # ===========================================================================
@@ -163,6 +183,20 @@ def test_under_exchange_the_bytes_do_not_come_from_disk(monkeypatch, exchange):
     """
     m = _manager(_FakeServerArgs(), monkeypatch)
     assert m._weg2_wake_weight_carrier() == CARRIER_EXCHANGE
+
+
+def test_under_shadow_mode_the_refill_stays_the_authority(monkeypatch,
+                                                          exchange_shadow):
+    """STEP 6c's DEFAULT, and the direction that must not drift.
+
+    The exchange is armed, and it is NOT the carrier: the disk refill still
+    owns the bytes and the injection grades itself against them.  A boot that
+    armed the exchange and had never been graded must not become the authority
+    BY OMISSION, which is exactly what S6I exists to close -- so the default
+    answer here is `disk`, and `authoritative` has to be asked for.
+    """
+    m = _manager(_FakeServerArgs(), monkeypatch)
+    assert m._weg2_wake_weight_carrier() == CARRIER_DISK
 
 
 def test_the_cpu_backup_wins_over_the_exchange_arm(monkeypatch, exchange):

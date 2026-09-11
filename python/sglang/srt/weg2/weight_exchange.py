@@ -1786,6 +1786,50 @@ def weight_source() -> str:
     return WEIGHT_SOURCE_RING
 
 
+#: THE INJECTION MODE, one reader (#1273 S6 step 6c).
+#:
+#: `shadow` (the DEFAULT) runs the bounce legs at the wake seam BESIDE the
+#: unchanged disk refill: the refill stays the authority, the ring stays, the
+#: ledger's `host weights` term prints unchanged, and the assembled bytes are
+#: compared byte-exact per descriptor against the refilled weights.  That is
+#: what B5 = S6I boots first, because a transfer that has never been graded
+#: against a known-correct copy of the same bytes is not evidence.
+#: `authoritative` replaces the refill -- `host weights` goes to 0.00 -- and a
+#: MISMATCH becomes a refusal rather than a log line.
+#:
+#: Published to the ranks by the launcher exactly as the arm strings are, so
+#: the mode a rank enforces and the mode the boot was launched in cannot be
+#: two readings.  Anything unrecognised is `shadow`: this reads an ENVIRONMENT
+#: variable, and the one direction a typo may not take is "become the
+#: authority for 27 GiB of weights".
+INJECT_ENV = "SGLANG_WEG2_XCHG_INJECT"
+INJECT_SHADOW = "shadow"
+INJECT_AUTHORITATIVE = "authoritative"
+INJECT_CHOICES = (INJECT_SHADOW, INJECT_AUTHORITATIVE)
+
+
+def inject_mode() -> str:
+    """``shadow`` (default) or ``authoritative``.  THE one reader.
+
+    A function and not a module constant so the value is read at the moment it
+    is consumed rather than frozen at import -- the defect
+    ``xchg_bounce_charge_bytes`` was fixed for once already (S6 fix E: the
+    launcher's own process had no flag in its environment at import time).
+    """
+    value = (os.environ.get(INJECT_ENV, "") or "").strip().lower()
+    return value if value in INJECT_CHOICES else INJECT_SHADOW
+
+
+def inject_authoritative() -> bool:
+    """Does the injection OWN the bytes?  False under ``shadow``.
+
+    Never implied by :func:`exchange_armed`: that says the exchange is the
+    weight SOURCE, this says whether its injection has replaced the refill.  A
+    boot can be armed and still be grading itself, which is the point of S6I.
+    """
+    return inject_mode() == INJECT_AUTHORITATIVE
+
+
 def exchange_armed() -> bool:
     """Does the EXCHANGE own the weight bytes?  False under ``shadow``.
 

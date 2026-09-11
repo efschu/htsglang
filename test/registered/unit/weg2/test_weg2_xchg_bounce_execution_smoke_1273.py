@@ -302,12 +302,20 @@ def seeded(tmp_path):
 
 
 def _run_bounce(mgr, ops, boot_nonce, root, *, descs=None, depth=DEPTH,
-                slot_bytes=SLOT_BYTES, terms=None):
-    """One call, through the PRODUCT method."""
+                slot_bytes=SLOT_BYTES, terms=None, mode=None):
+    """One call, through the PRODUCT method.
+
+    ``mode`` defaults to AUTHORITATIVE in this file and that is deliberate:
+    every test below asserts what landed in the destination's LIVE storage, so
+    the mode that writes it is the one under test.  The product's default --
+    and the function's -- is ``shadow``, which writes nothing; the shadow-mode
+    tests live in ``test_weg2_xchg_inject_modes_1273``.
+    """
     return mgr._weg2_xchg_bounce_leg(
         descs=_all_descs() if descs is None else descs,
         ops=ops, boot_nonce=boot_nonce, slot_bytes=slot_bytes, depth=depth,
         terms=terms, shm_root=root,
+        mode=wx.INJECT_AUTHORITATIVE if mode is None else mode,
     )
 
 
@@ -556,7 +564,7 @@ def test_the_leg_runs_on_the_arm_term_alone(tmp_path, armed, seeded):
     )
     result = _manager()._weg2_xchg_bounce_leg(
         descs=_all_descs(), ops=seeded, boot_nonce=armed, terms=terms,
-        shm_root=str(tmp_path),
+        shm_root=str(tmp_path), mode=wx.INJECT_AUTHORITATIVE,
     )
     assert result.slot_bytes == LAYER0_BYTES
     assert result.depth == DEPTH

@@ -142,6 +142,8 @@ __all__ = [
     "refuse_if_plan_exceeds_slot",
     "refuse_if_slot_short",
     "registered_bounce_bytes",
+    "InjectVerdict",
+    "inject_summary_line",
     "run_agreed_leg",
     "run_bounce_leg",
     "unit_name",
@@ -511,6 +513,10 @@ class BounceResult:
     deposit_ms: float = 0.0
     collect_ms: float = 0.0
     short: Tuple[str, ...] = field(default_factory=tuple)
+    #: The SHADOW-COMPARE verdict, or None on the authoritative path where
+    #: nothing is compared.  Carried on the result rather than logged and
+    #: dropped, because the per-boot summary is over the legs' verdicts.
+    inject: Optional["InjectVerdict"] = None
     #: Units that did NOT fit one depth-slot and were therefore banded.  By
     #: the AMENDMENT 3 decide these may only ever be UNLAYERED classes
     #: (``lm_head`` takes 4 bands at a 721 MiB slot); a LAYER among them is a
@@ -554,10 +560,80 @@ class BounceResult:
             f"deposited={self.deposited_bytes} collected={self.collected_bytes} "
             f"planned={self.planned_bytes} "
             f"deposit_ms={self.deposit_ms:.1f} collect_ms={self.collect_ms:.1f} "
-            f"banded={len(self.banded)}"
+            f"mode={self.inject.mode if self.inject else wx.INJECT_AUTHORITATIVE} "
+            + (f"inject={self.inject.verdict} " if self.inject else "")
+            + f"banded={len(self.banded)}"
             + (f" banded_units={','.join(self.banded)}" if self.banded else "")
             + f" overlap={self.overlap} verdict={self.verdict}"
         )
+
+
+@dataclass
+class InjectVerdict:
+    """One leg's SHADOW-COMPARE result: assembled bytes vs refilled weights.
+
+    THIS IS A BYTE VERDICT, unlike :attr:`BounceResult.verdict`, and the
+    difference is why S6I boots `shadow` first.  The accounting verdict says
+    every band was moved; this says the bytes the exchange would have served
+    ARE the bytes the disk refill actually produced.  A transfer never graded
+    against a known-correct copy of the same bytes is not evidence, however
+    clean its accounting.
+
+    ``mismatch_first`` names the DESCRIPTOR, not the byte: the next question
+    after MISMATCH is always "which tensor", and a byte offset without the
+    parameter name is a postmortem nobody can start from.
+    """
+
+    mode: str
+    pieces: int
+    bytes_compared: int
+    mismatches: int
+    mismatch_first: str = ""
+    rows_compared: int = 0
+
+    @property
+    def verdict(self) -> str:
+        if self.pieces <= 0:
+            # NOTHING WAS COMPARED, and that may not read as MATCH.  A leg
+            # whose plan was empty, or whose compare was skipped, produced NO
+            # EVIDENCE -- and no evidence printed as MATCH is exactly the
+            # instrument that cannot fail.
+            return "NO-COMPARE"
+        return "MATCH" if self.mismatches == 0 else "MISMATCH"
+
+    def line(self) -> str:
+        return (
+            "WEG2-XCHG-INJECT "
+            f"mode={self.mode} verdict={self.verdict} "
+            f"pieces={self.pieces} bytes={self.bytes_compared} "
+            f"rows={self.rows_compared} mismatches={self.mismatches} "
+            f"mismatch_first={self.mismatch_first or '-'}"
+        )
+
+
+def inject_summary_line(verdicts: Sequence["InjectVerdict"]) -> str:
+    """The per-BOOT summary over every leg's verdict.
+
+    Separate from the per-leg line because the two answer different questions
+    -- "did THIS leg agree" and "has this boot ever disagreed" -- and a boot
+    that matched 35 legs and mismatched one must not read as a pass.
+    ``legs_no_compare`` is printed rather than folded into either side: a leg
+    that compared nothing is neither a match nor a mismatch, and hiding it
+    would let an arm that silently stopped comparing look perfect.
+    """
+    total = len(verdicts)
+    mism = [v for v in verdicts if v.verdict == "MISMATCH"]
+    none = [v for v in verdicts if v.verdict == "NO-COMPARE"]
+    first = next((v.mismatch_first for v in mism if v.mismatch_first), "-")
+    return (
+        "WEG2-XCHG-INJECT-SUMMARY "
+        f"legs={total} legs_match={total - len(mism) - len(none)} "
+        f"legs_mismatch={len(mism)} legs_no_compare={len(none)} "
+        f"pieces={sum(v.pieces for v in verdicts)} "
+        f"bytes={sum(v.bytes_compared for v in verdicts)} "
+        f"mismatch_first={first} "
+        f"verdict={'MATCH' if (total and not mism and not none) else 'NOT-CLEAN'}"
+    )
 
 
 @dataclass
@@ -632,6 +708,50 @@ def _collect_band(ops: tp.DeviceOps, stream: int, descs: Sequence[object],
     return moved
 
 
+def _compare_band(ops: tp.DeviceOps, stream: int, descs: Sequence[object],
+                  batch, base: int, scratch: int,
+                  verdict: "InjectVerdict") -> None:
+    """SHADOW COMPARE: the LIVE destination rows against the staged bytes.
+
+    The staged bytes are already in the slot at ``base`` -- compacted, payload
+    only -- so the compare pulls the destination's CURRENT content (what the
+    refill just wrote) into ``scratch`` with the SAME compaction and memcmps.
+    One extra host slot and one D2H per band; no device scratch at all, which
+    is the point of doing it through the buffer that is already mapped.
+
+    IT COMPARES WHAT THE AUTHORITATIVE PATH WOULD HAVE WRITTEN: the same
+    ``piece`` geometry :func:`_collect_band` writes with is what is read back,
+    so a row-map defect shows here instead of being cancelled out by reading
+    with the same wrong map.
+    """
+    for piece in batch.pieces:
+        desc = descs[piece.desc_index]
+        dst_ptr = int(desc.dst_ptr) + piece.dst_off
+        if piece.kind == wx.FLAT:
+            ops.memcpy_async(scratch + piece.slot_off, dst_ptr, piece.nbytes,
+                             stream)
+        else:
+            ops.memcpy2d_async(scratch + piece.slot_off, piece.run_bytes,
+                               dst_ptr, piece.dpitch,
+                               piece.run_bytes, piece.rows, stream)
+    ops.synchronize(stream)
+    for piece in batch.pieces:
+        desc = descs[piece.desc_index]
+        n = int(piece.nbytes)
+        staged = ctypes.string_at(base + piece.slot_off, n)
+        live = ctypes.string_at(scratch + piece.slot_off, n)
+        verdict.pieces += 1
+        verdict.bytes_compared += n
+        verdict.rows_compared += int(piece.rows)
+        if staged != live:
+            verdict.mismatches += 1
+            if not verdict.mismatch_first:
+                verdict.mismatch_first = (
+                    f"{getattr(desc, 'param_name', '?')}"
+                    f"@dst_rank={getattr(desc, 'dst_rank', '?')}"
+                    f"+{piece.dst_off}")
+
+
 def _missing_pointer(descs: Sequence[object]) -> Optional[str]:
     """W74's case: a destination whose slice no source covers.
 
@@ -655,6 +775,12 @@ def run_bounce_leg(
     slot_bytes: Optional[int] = None,
     depth: Optional[int] = None,
     terms: Optional[xb.BounceTerms] = None,
+    #: DEFAULTS TO `shadow`, the SAFE mode, matching the product's own default
+    #: (`--weg2-xchg-inject`).  A function whose default writes the live
+    #: weights while the flag's default does not is a trap: every caller that
+    #: forgets the argument takes the dangerous path, and the one that matters
+    #: is the product.  Authoritative must be asked for.
+    mode: str = wx.INJECT_SHADOW,
     shm_root: str = xr.SHM_ROOT,
     device: int = 0,
     log=None,
@@ -732,7 +858,24 @@ def run_bounce_leg(
     banded = tuple(u.key[1] for u in units
                    if u.nbytes > int(slot_bytes))
 
-    bounce = LayerBounce(ops, boot_nonce, slot_bytes=slot_bytes, depth=depth,
+    # THE MODE IS READ ONCE, HERE, and carried -- never re-read at the branch.
+    # A second read could see a different answer than the one this leg was
+    # entered with, and the two answers differ by "does this write into the
+    # live weights".
+    mode = str(mode)
+    if mode not in wx.INJECT_CHOICES:
+        raise ValueError(
+            f"unknown inject mode {mode!r}; one of {wx.INJECT_CHOICES}. "
+            f"Refused rather than defaulted: a default here would decide "
+            f"whether this leg owns 27 GiB of weights")
+    comparing = mode == wx.INJECT_SHADOW
+    verdict = InjectVerdict(mode=mode, pieces=0, bytes_compared=0,
+                            mismatches=0)
+    # SHADOW MODE COSTS ONE EXTRA SLOT, priced rather than borrowed: the
+    # compare needs the live bytes beside the staged ones, and reusing a
+    # depth-slot would overwrite the band still in flight.
+    slots = int(depth) + (1 if comparing else 0)
+    bounce = LayerBounce(ops, boot_nonce, slot_bytes=slot_bytes, depth=slots,
                          create=True, shm_root=shm_root)
     d_stream = ops.create_stream(device)
     c_stream = ops.create_stream(device)
@@ -765,9 +908,16 @@ def run_bounce_leg(
                         f"band seq={batch.seq} deposited {moved} of "
                         f"{batch.total_bytes}")
                 deposited += moved
-                collected += _collect_band(ops, c_stream, unit.descs, batch,
-                                           base)
-                inflight[slot] = batch
+                if comparing:
+                    # THE REFILL STAYS THE AUTHORITY.  Nothing is written to
+                    # the live weights on this path -- the staged bytes are
+                    # graded against what the refill already put there.
+                    _compare_band(ops, c_stream, unit.descs, batch, base,
+                                  bounce.slot_address(int(depth)), verdict)
+                else:
+                    collected += _collect_band(ops, c_stream, unit.descs,
+                                               batch, base)
+                    inflight[slot] = batch
                 bands += 1
         t0 = time.perf_counter()
         ops.synchronize(c_stream)
@@ -782,10 +932,14 @@ def run_bounce_leg(
         bounce.close()
 
     result = BounceResult(
+        # NONE ON THE AUTHORITATIVE PATH, because nothing was graded there and
+        # a NO-COMPARE verdict would read as "the grade was attempted and
+        # produced nothing" rather than "no grade was asked for".
+        inject=verdict if comparing else None,
         units=len(units), bands=bands,
         deposited_bytes=deposited, collected_bytes=collected,
         planned_bytes=planned,
-        host_bytes_peak=int(slot_bytes) * int(depth),
+        host_bytes_peak=int(slot_bytes) * slots,
         slot_bytes=int(slot_bytes), depth=int(depth),
         widest_unit_key=widest.key, widest_unit_bytes=widest.nbytes,
         widest_run_bytes=widest_run(descs),

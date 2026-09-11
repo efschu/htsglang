@@ -841,7 +841,15 @@ class SchedulerWeightUpdaterManager:
         try:
             from sglang.srt.weg2 import weight_exchange as wx
 
-            if wx.exchange_armed():
+            # BOTH CONDITIONS, and the second is step 6c's whole point.
+            # `--weg2-weight-source exchange` says the exchange is the weight
+            # SOURCE; `--weg2-xchg-inject authoritative` says its injection has
+            # REPLACED the refill.  Under the default `shadow` the refill stays
+            # the authority and the injection grades itself beside it, so the
+            # carrier is `disk` -- a boot that armed the exchange and has not
+            # been graded must not become the authority BY OMISSION, which is
+            # exactly the direction S6I exists to close.
+            if wx.exchange_armed() and wx.inject_authoritative():
                 return self.CARRIER_EXCHANGE
         except Exception:  # noqa: BLE001 -- an unreadable arm is not an arm
             pass
@@ -1083,6 +1091,47 @@ class SchedulerWeightUpdaterManager:
                 f"weights from {server_args.model_path!r}: "
                 f"{getattr(out, 'message', '')!r}. The VMM pages are committed "
                 "but their content is undefined; this group is fatal."
+            )
+        # STEP 6c: THE SHADOW COMPARE, here, because here is the first instant
+        # the ground truth exists -- the refill has just written every weight
+        # byte, so the exchange's assembled bytes have something to be graded
+        # against.  Same placement rule the shadow's own destination hook
+        # follows ("after family_complete and after the reload").
+        #
+        # NO STATE FIELD carries this: an earlier draft set
+        # `self._weg2_xchg_shadow_compare_pending`, which is a WRITE to an
+        # undeclared attribute on a slots=True dataclass -- #1329 exactly, in
+        # this file, one commit after citing it.
+        self._weg2_xchg_shadow_compare()
+
+    def _weg2_xchg_shadow_compare(self) -> None:
+        """Grade the exchange's assembled bytes against the refilled weights.
+
+        STEP 6c, and a NO-OP unless the exchange is armed in `shadow` mode: on
+        `ring` there is nothing to grade, and on `authoritative` the refill did
+        not run at all (the carrier was `exchange`).
+
+        AN OBSERVER, so it never raises.  In this mode the refill is the
+        authority and the model is already correct; a compare that took the
+        flip down over its own bookkeeping would be the thing S6I exists to
+        avoid -- the grade is evidence, not a gate.  Under `authoritative` the
+        same disagreement IS a gate, and that refusal lives in
+        :meth:`_weg2_xchg_inject_weights`.
+        """
+        try:
+            from sglang.srt.weg2 import weight_exchange as wx
+
+            if not (wx.exchange_armed()
+                    and wx.inject_mode() == wx.INJECT_SHADOW):
+                return
+            self._weg2_xchg_inject_weights(mode=wx.INJECT_SHADOW)
+        except BaseException as exc:  # noqa: BLE001 -- an observer never raises
+            logger.info(
+                "WEG2-XCHG-INJECT mode=shadow verdict=NO-COMPARE pieces=0 "
+                "bytes=0 rows=0 mismatches=0 mismatch_first=- -- the grade "
+                "could not be taken (%s: %s); the refill remains the "
+                "authority and the weights are unaffected",
+                type(exc).__name__, exc,
             )
 
     def _weg2_group_fence(
@@ -2252,7 +2301,7 @@ class SchedulerWeightUpdaterManager:
 
     def _weg2_xchg_bounce_leg(self, *, descs, ops, boot_nonce,
                               slot_bytes=None, depth=None, terms=None,
-                              shm_root=None, device: int = 0):
+                              mode=None, shm_root=None, device: int = 0):
         """PATH (b): assemble each unit in the host bounce, every card slices.
 
         The whole of the user law's fallback sentence, at the one call site
@@ -2273,12 +2322,18 @@ class SchedulerWeightUpdaterManager:
         for tests and tools. The geometry is never derived here -- section
         10.8's "one reader, or they drift".
         """
+        from sglang.srt.weg2 import weight_exchange as wx
         from sglang.srt.weg2 import weight_exchange_bounce as bx
         from sglang.srt.weg2 import weight_exchange_region as xr
 
+        # THE MODE IS READ ONCE, from the one reader, and passed down.  A leg
+        # that re-read it further in could act on a different answer than the
+        # one it was entered with, and the two differ by "does this write into
+        # the live weights".
         return bx.run_bounce_leg(
             descs, ops, boot_nonce,
             slot_bytes=slot_bytes, depth=depth, terms=terms,
+            mode=wx.inject_mode() if mode is None else mode,
             shm_root=xr.SHM_ROOT if shm_root is None else shm_root,
             device=device, log=logger.info,
         )

@@ -74,6 +74,7 @@ from sglang.srt.weg2 import (
     corridor_budget,
     host_ledger,
     ring_table,
+    weight_exchange,
     weight_exchange_region,
     weight_exchange_shadow,
     weight_exchange_transport,
@@ -3358,6 +3359,7 @@ def prepare_shadow_env(log: Log, boot_nonce: str, weight_source: str,
                        oncard_slot_mib: int =
                        weight_exchange_transport.ONCARD_SLOT_MIB_DEFAULT,
                        bounce_terms: Optional[xchg_bounce.BounceTerms] = None,
+                       inject_mode: str = weight_exchange.INJECT_SHADOW,
                        ) -> Dict[str, str]:
     """#1273 S5: arm the region for the SHADOW arm, and publish it to both groups.
 
@@ -3405,6 +3407,13 @@ def prepare_shadow_env(log: Log, boot_nonce: str, weight_source: str,
     slot_mib = weight_exchange_transport.validate_oncard_slot_mib(
         oncard_slot_mib)
     env[weight_exchange_transport.ENV_ONCARD_SLOT_MIB] = str(slot_mib)
+    # #1273 S6 step 6c: THE INJECTION MODE, published by the same mechanism
+    # and for the same reason as the arm -- it decides whether the bounce legs
+    # at the wake seam OWN the weight bytes or merely grade themselves against
+    # the refill, and a rank that read a different answer than the boot was
+    # launched with would either serve ungraded bytes or silently keep paying
+    # for a refill nobody reads.
+    env[weight_exchange.INJECT_ENV] = str(inject_mode)
     # #1273 S6 step 5: THE PRICED TERM ITSELF, published to the ranks.
     #
     # The seam that injects the weight bytes needs the bounce geometry, and a
@@ -8172,6 +8181,23 @@ def build_parser() -> argparse.ArgumentParser:
              "--weg2-weight-source ring",
     )
     ap.add_argument(
+        "--weg2-xchg-inject", choices=list(weight_exchange.INJECT_CHOICES),
+        default=weight_exchange.INJECT_SHADOW,
+        help="Whether the S6-BOUNCE injection OWNS the weight bytes at the "
+             "wake seam. 'shadow' (default) runs the bounce legs BESIDE the "
+             "unchanged disk refill: the refill stays the authority, the ring "
+             "stays, the ledger's host weights term prints unchanged, and the "
+             "assembled bytes are compared byte-exact per descriptor against "
+             "the refilled weights, one WEG2-XCHG-INJECT verdict per leg. That "
+             "is what S6I boots first, because a transfer never graded against "
+             "a known-correct copy of the same bytes is not evidence. "
+             "'authoritative' replaces the refill -- host weights goes to 0.00 "
+             "-- and a MISMATCH is a refusal, not a line. Published to both "
+             "groups so the mode a rank enforces and the mode the boot was "
+             "launched in cannot diverge. Ignored on "
+             "--weg2-weight-source ring",
+    )
+    ap.add_argument(
         "--weg2-shadow-hop-bound-ms", type=float,
         default=weight_exchange_shadow.SHADOW_HOP_BOUND_MS_DEFAULT,
         help="#1273 S5b: the wall the SHADOW is allowed to price its on-card "
@@ -9196,7 +9222,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                                   hop_bound_ms=ns.weg2_shadow_hop_bound_ms,
                                   oncard_mode=ns.weg2_xchg_oncard,
                                   oncard_slot_mib=ns.weg2_xchg_oncard_slot_mib,
-                                  bounce_terms=bounce_terms_for_ranks)
+                                  bounce_terms=bounce_terms_for_ranks,
+                                  inject_mode=ns.weg2_xchg_inject)
 
     # 2. host ledger
     arm, reap_headroom_gib, lines, cg = choose_host_ledger(
