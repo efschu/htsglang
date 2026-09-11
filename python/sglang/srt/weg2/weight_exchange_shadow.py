@@ -3323,6 +3323,36 @@ def derive_leg_plan(
         _logging.getLogger(__name__).info(
             "WEG2-XCHG-PLAN emit failed: %s: %s", type(exc).__name__, exc)
 
+    # #1345 (a''): THE POINTER-RESOLUTION PROFILE, one line per leg.
+    #
+    # THIS is the frame that can answer it: it holds the hook (hence
+    # `is_source`) AND the plan's descriptors.  Two boots could not tell the
+    # `manifest-unagreed` wall from the `unresolved-source` wall, and W74 alone
+    # names only the FIRST offender -- so the census goes here, beside the
+    # acceptance line, with every number carrying its denominator.
+    #
+    # Computed from DESCRIPTORS, so no byte moves and no collective is posted:
+    # legal inside the no-return region, which is why it is an instrument and
+    # not the byte compare (#875 DO-NOT-BUILD stands; the byte-true compare
+    # belongs on the authoritative path after the local landing).
+    #
+    # WRAPPED for the same reason as the line above: an instrument may never
+    # take a derivation down, and a lost READING is not a lost plan.
+    try:
+        _profile = wx.pointer_profile(plan.descs)
+        wx.record_pointer_profile(_profile)
+        import logging as _logging
+
+        _logging.getLogger(__name__).info(
+            "%s", wx.pointer_profile_line(
+                _profile, hook=str(hook), is_source=is_source))
+    except BaseException as exc:  # noqa: BLE001
+        import logging as _logging
+
+        _logging.getLogger(__name__).info(
+            "WEG2-XCHG-POINTER-PROFILE emit failed: %s: %s",
+            type(exc).__name__, exc)
+
     facts = LegPlanFacts(
         chunk_layers=int(chunk_layers), chunk_count=int(chunk_count),
         family_tags=family, waves=waves, cards=cards, classes=classes,

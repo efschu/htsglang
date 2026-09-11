@@ -304,3 +304,111 @@ def test_the_profile_helper_expresses_ptr_of_s_contract():
     # and the helper must not mutate the original
     assert d.src_ptr == 4096 and d.dst_ptr == 8192
     assert dataclasses.is_dataclass(d)
+
+
+# --------------------------------------------------------------------------
+# 8. (a'') THE POINTER-RESOLUTION PROFILE PER LEG, AS NUMBERS WITH DENOMINATORS
+# --------------------------------------------------------------------------
+#
+# WHY THIS INSTRUMENT EXISTS, and the cost that bought it: two boots could not
+# tell the `manifest-unagreed` wall from the `unresolved-source` wall.  XSN19
+# read `verdict=NO-COMPARE pieces=0` twelve times per group and the record had
+# to reason its way to WHICH side was missing from the source code.  W74 names
+# the FIRST offender's side and parameter -- that is (a') and it stays -- but a
+# first offender is not a census: it cannot say whether ONE desc or ALL of them
+# failed to resolve, and that difference is the difference between a plan bug
+# and a lane that structurally has no source.
+#
+# EVERY NUMBER CARRIES ITS DENOMINATOR (the denominator law): `src_resolved` is
+# `a/N` over descs, `legs_src_complete` is `x/L` over legs.  A bare count here
+# would be the exact defect this campaign keeps paying for.
+# ZERO BYTE MOVEMENT: the profile is computed from the PLAN's descriptors, so it
+# is legal outside and inside the no-return region alike -- #875 DO-NOT-BUILD is
+# untouched, and the byte-true compare stays on the authoritative path after the
+# local landing, which is NOT this slice.
+
+def _mk_desc(src_ptr, dst_ptr):
+    from sglang.srt.weg2 import weight_exchange as wx
+    return wx.XchgDesc(param_name="p", tag="weights_0", src_rank=0, dst_rank=0,
+                       src_off=0, dst_off=0, nbytes=16, rows=2, run_bytes=8,
+                       spitch=8, dpitch=8, kind=wx.FLAT,
+                       src_ptr=src_ptr, dst_ptr=dst_ptr)
+
+
+def test_the_profile_counts_resolution_with_denominators():
+    """Numbers over ALL descs, never the first offender alone.
+
+    MUTANT M10, the danger direction the operator named: a profile that counts
+    a side as resolved where nothing resolves must go RED.  That is asserted
+    positively here -- all-None sources read 0/N, not N/N and not silence.
+    """
+    from sglang.srt.weg2 import weight_exchange as wx
+
+    descs = [_mk_desc(None, 8192), _mk_desc(None, 8192), _mk_desc(None, 8192)]
+    prof = wx.pointer_profile(descs)
+    assert prof.descs_total == 3
+    assert prof.src_resolved == 0, "an unresolved source may never count as resolved"
+    assert prof.dst_resolved == 3
+    assert prof.pieces_total == 6, "pieces = sum(rows), the compare's own unit"
+
+    both = [_mk_desc(4096, 8192), _mk_desc(None, 8192)]
+    p2 = wx.pointer_profile(both)
+    assert (p2.src_resolved, p2.dst_resolved, p2.descs_total) == (1, 2, 2)
+    assert not p2.src_complete and p2.dst_complete
+
+
+def test_the_profile_line_names_the_hook_the_side_and_every_denominator():
+    """(a''): hook, is_source, and both ratios -- readable without the source.
+
+    MUTANT M11: drop any denominator (print a bare count) and this goes red.
+    """
+    from sglang.srt.weg2 import weight_exchange as wx
+
+    line = wx.pointer_profile_line(
+        wx.pointer_profile([_mk_desc(None, 8192), _mk_desc(None, 8192)]),
+        hook="authoritative", is_source=False, legs=12, legs_src_complete=0,
+        legs_dst_complete=12)
+    assert "WEG2-XCHG-POINTER-PROFILE" in line
+    assert "hook=authoritative" in line
+    assert "is_source=0" in line
+    assert "src_resolved=0/2" in line, line
+    assert "dst_resolved=2/2" in line, line
+    assert "pieces=4" in line, line
+    assert "legs=12" in line, line
+    assert "legs_src_complete=0/12" in line, line
+    assert "legs_dst_complete=12/12" in line, line
+
+
+def test_the_derivation_emits_the_profile_for_every_leg():
+    """The instrument must be WIRED, not merely present (#1342's lesson).
+
+    An emitter with no production call site is the class this strand has paid
+    for four times.  MUTANT M12: delete the call in ``derive_leg_plan`` and this
+    goes red.
+    """
+    import inspect
+
+    src = inspect.getsource(sh.derive_leg_plan)
+    assert "pointer_profile" in src, (
+        "derive_leg_plan must emit the per-leg profile -- it is the only "
+        "production frame that holds the hook AND the plan's descs"
+    )
+
+
+def test_W74_carries_the_profile_and_not_only_the_first_offender():
+    """(a') STAYS and (a'') is ADDED to the same refusal.
+
+    The refusal already names the first offender's side and parameter; it must
+    now also carry the census, so one line distinguishes "one desc is a hole"
+    from "this lane has no source at all".  MUTANT M13: strip the counts from
+    the W74 message and this goes red.
+    """
+    import inspect
+
+    from sglang.srt.weg2 import weight_exchange_bounce as wb
+
+    src = inspect.getsource(wb.run_bounce_leg)
+    assert "W74 Weg2XchgSourceMissing" in src
+    assert "src_resolved=" in src and "dst_resolved=" in src, (
+        "W74 must carry the resolution census, not just the first offender"
+    )

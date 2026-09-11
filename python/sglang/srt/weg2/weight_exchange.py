@@ -1232,6 +1232,104 @@ class XchgPlan:
         )
 
 
+#: #1345 (a''): THE POINTER-RESOLUTION PROFILE OF ONE LEG'S PLAN.
+#:
+#: WHY IT EXISTS, and it is a measured cost rather than a nicety: boots
+#: weg2xsn18 and weg2xsn19 could not tell the ``manifest-unagreed`` wall from
+#: the ``unresolved-source`` wall.  XSN19 read ``verdict=NO-COMPARE pieces=0``
+#: twelve times per group, and which SIDE was missing had to be recovered by
+#: reading ``ptr_of``'s contract in the source.  ``W74`` names the FIRST
+#: offender's side and parameter -- that half stays -- but a first offender
+#: cannot say whether ONE descriptor is a hole or the whole lane structurally
+#: has no source, and that is exactly the distinction the next boot needs.
+#:
+#: ZERO BYTE MOVEMENT BY CONSTRUCTION: this reads the plan's DESCRIPTORS only.
+#: It therefore stays legal inside the no-return region, where #875's
+#: DO-NOT-BUILD forbids a transfer and a collective alike -- the byte-true
+#: compare belongs on the authoritative path AFTER the local landing, with both
+#: sides rank-owned, and is deliberately not this function's business.
+@dataclass(frozen=True)
+class PointerProfile:
+    """How many of a leg's descriptors resolve on each side, with denominators."""
+
+    descs_total: int
+    src_resolved: int
+    dst_resolved: int
+    pieces_total: int
+
+    @property
+    def src_complete(self) -> bool:
+        return self.descs_total > 0 and self.src_resolved == self.descs_total
+
+    @property
+    def dst_complete(self) -> bool:
+        return self.descs_total > 0 and self.dst_resolved == self.descs_total
+
+
+def pointer_profile(descs) -> PointerProfile:
+    """Count resolution per side over ALL descriptors of one leg.
+
+    A ``None`` pointer is UNRESOLVED and is never counted as resolved -- that
+    inversion is the danger direction this function's test names (M10), because
+    a profile that flatters the plan would hide precisely the wall it exists to
+    expose.  ``pieces_total`` is ``sum(rows)``, the unit ``_compare_band``
+    itself counts in, so the profile and the verdict share a denominator.
+    """
+    n = src = dst = pieces = 0
+    for d in descs:
+        n += 1
+        if getattr(d, "src_ptr", None) is not None:
+            src += 1
+        if getattr(d, "dst_ptr", None) is not None:
+            dst += 1
+        pieces += int(getattr(d, "rows", 0) or 0)
+    return PointerProfile(descs_total=n, src_resolved=src, dst_resolved=dst,
+                          pieces_total=pieces)
+
+
+#: The leg counter behind the ``legs=``/``legs_*_complete=`` denominators.  Same
+#: shape as ``weight_exchange_bounce._INJECT_VERDICTS``: cumulative per process,
+#: so a rank's last line states how many legs it has profiled in total rather
+#: than leaving the reader to count log lines.
+_PROFILE_LEGS: List[PointerProfile] = []
+
+
+def pointer_profile_line(profile: PointerProfile, *, hook: str,
+                         is_source: bool, legs: Optional[int] = None,
+                         legs_src_complete: Optional[int] = None,
+                         legs_dst_complete: Optional[int] = None) -> str:
+    """One line per leg.  EVERY number carries its denominator.
+
+    ``hook`` and ``is_source`` are both printed because they are two different
+    facts and the campaign has already confused them: ``is_source`` is
+    ``hook == HOOK_SOURCE``, so ``authoritative`` prints ``is_source=0`` and a
+    reader who only saw the hook name would have to know that rule by heart.
+    """
+    if legs is None:
+        legs = len(_PROFILE_LEGS)
+        legs_src_complete = sum(1 for p in _PROFILE_LEGS if p.src_complete)
+        legs_dst_complete = sum(1 for p in _PROFILE_LEGS if p.dst_complete)
+    return (
+        "WEG2-XCHG-POINTER-PROFILE "
+        f"hook={hook} is_source={1 if is_source else 0} "
+        f"descs={profile.descs_total} "
+        f"src_resolved={profile.src_resolved}/{profile.descs_total} "
+        f"dst_resolved={profile.dst_resolved}/{profile.descs_total} "
+        f"pieces={profile.pieces_total} "
+        f"legs={legs} "
+        f"legs_src_complete={legs_src_complete}/{legs} "
+        f"legs_dst_complete={legs_dst_complete}/{legs} "
+        "-- computed from the plan's descriptors, no byte moved; an unresolved "
+        "side means the compare has no address on that side, NOT that the "
+        "bytes differ"
+    )
+
+
+def record_pointer_profile(profile: PointerProfile) -> None:
+    """Add one leg to the cumulative denominators."""
+    _PROFILE_LEGS.append(profile)
+
+
 def emit_plan_line(plan: XchgPlan, direction: Optional[str] = None, logger=None) -> str:
     """Log the acceptance line and return it.
 

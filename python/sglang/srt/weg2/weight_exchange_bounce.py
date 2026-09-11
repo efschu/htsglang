@@ -822,10 +822,22 @@ def run_bounce_leg(
     descs = list(descs)
     hole = _missing_pointer(descs)
     if hole is not None:
+        # #1345 (a''): THE CENSUS RIDES THE REFUSAL, not just the first
+        # offender.  `hole` names one parameter and one side -- that is (a') and
+        # it stays -- but only the counts distinguish "one descriptor is a hole
+        # in an otherwise resolvable plan" from "this lane has no source at all
+        # on any descriptor", and boots weg2xsn18/19 each paid a window for that
+        # ambiguity.  Computed from descriptors: no byte moves here either.
+        _prof = wx.pointer_profile(descs)
         raise wx.Weg2XchgSourceMissing(
             f"W74 Weg2XchgSourceMissing bounce: {hole} -- assembly stages a "
             f"source, it does not create one, so this slice would be served "
-            f"with undefined bytes. Refusing before the buffer is mapped."
+            f"with undefined bytes. Refusing before the buffer is mapped. "
+            f"PROFILE mode={mode} "
+            f"src_resolved={_prof.src_resolved}/{_prof.descs_total} "
+            f"dst_resolved={_prof.dst_resolved}/{_prof.descs_total} "
+            f"pieces={_prof.pieces_total} -- an unresolved side means the leg "
+            f"has no ADDRESS there, never that the bytes differ"
         )
     refuse_if_slot_short(slot_bytes, descs)
     # AMENDMENT 2: a unit is assembled COMPLETE in one depth-slot.  This is the
