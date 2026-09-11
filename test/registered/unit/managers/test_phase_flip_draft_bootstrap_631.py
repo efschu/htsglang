@@ -30,7 +30,7 @@ import types
 import pytest
 import torch
 
-from sglang.srt.managers.phase_flip_resident_carry import ResidentCarryError
+from sglang.srt.managers.scheduler import Scheduler as _Scheduler
 from sglang.srt.managers.phase_flip_draft_bootstrap import (
     BOOTSTRAP_ATTR,
     DraftBootstrapError,
@@ -119,6 +119,24 @@ def make_scheduler(draft_runner=True):
     sched.draft_worker = types.SimpleNamespace(draft_worker=inner, topk=1)
     if not draft_runner:
         sched.draft_worker = None
+    # #1347: THE DOUBLE BINDS THE PRODUCT'S OWN `_resident_batches`, it does not
+    # reimplement it.  `retune_carried_batches_for_phase` enumerates through
+    # `_harvest(scheduler)` -> `scheduler._resident_batches()`, which #969 CUT K
+    # moved ONTO the Scheduler (`scheduler.py:7040`, "eight lines replacing
+    # harvest_resident_batches ... 911 LOC").  This file's double predates that
+    # move, so five `test_retune*` tests raised
+    # `AttributeError: 'types.SimpleNamespace' object has no attribute
+    # '_resident_batches'` the moment the module could be collected again.
+    #
+    # A HAND-WRITTEN COPY OF THOSE EIGHT LINES WOULD BE THE WRONG FIX: the
+    # identity dedupe (`running_batch` is normally an alias of one slot) is
+    # load-bearing, and a second copy is free to drift from the one the product
+    # runs.  Binding the real function makes drift impossible by construction --
+    # the same rule this campaign wrote as "a double must carry the production
+    # contract, asserted as the contract and never as a literal".
+    sched._resident_batches = types.MethodType(
+        _Scheduler._resident_batches, sched
+    )
     return sched, pool
 
 
@@ -625,24 +643,30 @@ def test_each_output_holder_is_named_separately():
 
 
 # --------------------------------------------------------------------- #
-# #682: the SECOND copy of the resident ceiling, on the arming leg
+# #682 -> #969: the arming leg ARMS where it once refused
 # --------------------------------------------------------------------- #
 #
-# `harvest_resident_batches` is not the only place that asserts a bound on
-# the resident set: this function checks its own input, deliberately, because
-# `committed_slots` allocates one tensor per request and "a consumer that can
-# be ruined by an implausible input checks that input itself". Correct -- but
-# it inherited the same too-tight bound, so repairing only the carry would
-# have moved the 02:07 crash one function later, on the very configuration
-# that produced it (the flip is PP->TP with NEXTN, so this leg runs).
+# HISTORY, kept because the surviving test below reads as trivial without it:
+# this leg used to carry a SECOND copy of a resident ceiling and refused to arm
+# above it, which moved the 02:07 crash one function later. #969 CUT K deleted
+# the carry and with it that ceiling -- `phase_flip_draft_bootstrap.py:456-461`
+# says so in its own words -- so "more requests than the cap" is now just load,
+# not the signature of a corrupted carried set.
 #
-# The scheduler suspends the running-request cap while a chunked prefill is in
-# flight (see IN_FLIGHT_CHUNKED_ALLOWANCE), so cap + 1 is the true bound here
-# too, and cap + 2 must still refuse.
+# WHAT REMAINS TESTABLE is the ARMING, not the refusal: the leg must arm on the
+# configuration that once raised. The refusal half and the two-ceilings-agree
+# pin were retired here by #1347; the tripwire named at the end of this file is
+# what goes red if a ceiling comes back.
 
 
 def test_the_chunked_prefill_excursion_arms_instead_of_raising():
-    """RED before the fix: ResidentCarryError on the arming leg."""
+    """The arming leg ARMS on cap + an in-flight chunk (#682, now #969).
+
+    It raised here before #682; #969 CUT K then deleted the ceiling outright.
+    The assertion is therefore about arming, and it is still a live contract:
+    `arm_draft_bootstrap` must report `armed` for a batch above
+    `max_running_requests`.
+    """
     sched, _ = make_scheduler()
     sched.max_running_requests = 1  # this batch carries cap + the in-flight chunk
     batch = make_batch()
@@ -651,35 +675,20 @@ def test_the_chunked_prefill_excursion_arms_instead_of_raising():
     assert report["reqs"] == 2
 
 
-def test_a_resident_set_two_above_the_cap_still_refuses_to_arm():
-    """The guard's lethal-half purpose survives the widening."""
-    sched, _ = make_scheduler()
-    sched.max_running_requests = 1
-    batch = FakeBatch(
-        [
-            FakeReq("a", 0, [11, 12, 13], [14]),
-            FakeReq("b", 1, [21, 22], [23, 24]),
-            FakeReq("c", 2, [31, 32], [33, 34]),
-        ],
-        seq_lens=[3, 4, 4],
-    )
-    with pytest.raises(ResidentCarryError) as excinfo:
-        arm_draft_bootstrap(sched, batch, sched.draft_worker)
-    msg = str(excinfo.value)
-    assert "3" in msg
-    assert "max_running_requests=1" in msg, "the configured cap must stay visible"
-
-
-def test_the_two_ceilings_agree():
-    """One allowance, imported by both, so they cannot drift apart.
-
-    The 02:07 crash was one guard asserting a bound the scheduler did not
-    hold. Two guards asserting two different bounds is the same defect with
-    a longer fuse.
-    """
-    from sglang.srt.managers import phase_flip_draft_bootstrap as bootstrap
-    from sglang.srt.managers.phase_flip_resident_carry import (
-        IN_FLIGHT_CHUNKED_ALLOWANCE,
-    )
-
-    assert bootstrap.IN_FLIGHT_CHUNKED_ALLOWANCE is IN_FLIGHT_CHUNKED_ALLOWANCE
+# #1347: TWO TESTS RETIRED HERE, and the production code states the reason in
+# its own words (`phase_flip_draft_bootstrap.py:456-461`):
+#
+#   "#969: THE DEFECT-M CEILING IS GONE with `phase_flip_resident_carry`. It
+#    refused to arm draft state for more 'carried' requests than
+#    max_running_requests + an in-flight-chunked allowance. Nothing is carried
+#    over a cutover any more, so a count above the cap can no longer be the
+#    signature of a corrupted carried set -- it would just be the load."
+#
+# `test_a_resident_set_two_above_the_cap_still_refuses_to_arm` asserted that
+# retired refusal (and imported `ResidentCarryError` from a module #969 CUT K
+# deleted), and `test_the_two_ceilings_agree` asserted that two copies of
+# `IN_FLIGHT_CHUNKED_ALLOWANCE` stay identical -- BOTH copies are now gone, so
+# there is no second ceiling to agree with. Neither is a promise this code
+# still owes. The day either mechanism returns,
+# `test_1347_retired_631_mechanisms_stay_retired.py` goes red and names the
+# arms that are owed again.

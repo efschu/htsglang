@@ -45,9 +45,6 @@ from sglang.srt.managers.phase_flip_draft_bootstrap import (
     _reachable_batches,
     clear_spec_info_for_unspeculated_phase,
 )
-from sglang.srt.managers.phase_flip_resident_carry import (
-    harvest_resident_batches,
-)
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.speculative.eagle_info import EagleDraftInput
 
@@ -225,67 +222,6 @@ def test_seam_clears_every_reachable_batch_then_the_real_merge_succeeds():
     carried.merge_batch(fresh_pp_prefill)
     assert [r.rid for r in carried.reqs] == ["87e74cda", "c099fc4f", "d38bd526"]
     assert carried.spec_info is None
-
-
-def test_reach_covers_last_batch_which_the_resident_harvest_misses():
-    """THE test that would have caught the crash.
-
-    ``last_batch`` is the handle that held the fatal side. The carry's own
-    ``harvest_resident_batches`` does not look at it -- deliberately, since
-    it answers a different question -- so a seam built on that harvest
-    leaves TP draft state reachable. This pins the two reaches apart, and
-    fails if anyone unifies them in the wrong direction.
-    """
-    running = real_batch(["r1"], spec_info=draft_input(bs=1))
-    last = real_batch(["l1"], spec_info=draft_input(bs=1))
-    sched = scheduler_at_cutover(running, last_batch=last, running_mbs=[running])
-
-    # The premise, asserted rather than assumed: the resident harvest does
-    # NOT see last_batch.
-    harvested = harvest_resident_batches(sched)
-    assert running in harvested
-    assert last not in harvested
-
-    # The seam's reach does.
-    assert last in _reachable_batches(sched)
-
-    cleared, _ = clear_spec_info_for_unspeculated_phase(sched)
-    assert cleared == 2
-    assert running.spec_info is None
-    assert last.spec_info is None
-
-
-def test_can_fail_seam_built_on_the_resident_harvest_leaves_the_crash_live():
-    """CAN-FAIL: the narrower reach, and the crash it leaves behind.
-
-    This reproduces the pre-fix build by clearing only what the resident
-    harvest returns, then performing the same merge. It must still refuse
-    -- proving the passing test above is carried by the WIDER reach and not
-    by the guard or by luck.
-    """
-    running = real_batch(["r1"], spec_info=draft_input(bs=1))
-    last = real_batch(["l1"], spec_info=None)
-    sched = scheduler_at_cutover(running, last_batch=last, running_mbs=[running])
-
-    for batch in harvest_resident_batches(sched):
-        batch.spec_info = None
-
-    # running was cleared, so this particular pair is now legal...
-    assert running.spec_info is None
-
-    # ...but flip the roles the way epoch 8 actually had them -- the
-    # carried TP batch reachable ONLY through last_batch -- and the narrow
-    # reach misses it entirely.
-    running2 = real_batch(["r2"], spec_info=None)
-    last2 = real_batch(["l2"], spec_info=draft_input(bs=1))
-    sched2 = scheduler_at_cutover(running2, last_batch=last2, running_mbs=[running2])
-    for batch in harvest_resident_batches(sched2):
-        batch.spec_info = None
-    assert last2.spec_info is not None, "narrow reach must miss last_batch"
-    with pytest.raises(ValueError):
-        running2.merge_batch(last2)
-
-
 def test_reach_deduplicates_aliases_and_includes_empty_batches():
     """running_batch is routinely an ALIAS of a running_mbs slot.
 
@@ -316,43 +252,6 @@ def test_seam_is_idempotent_and_silent_on_an_already_clean_phase():
     sched = scheduler_at_cutover(real_batch(["r1"], spec_info=None))
     assert clear_spec_info_for_unspeculated_phase(sched) == (0, [])
     assert clear_spec_info_for_unspeculated_phase(sched) == (0, [])
-
-
-# --------------------------------------------------------------------------
-# 3. ADMITTED BUT NOT YET ALLOCATED (the 20:59:45Z death).
-# --------------------------------------------------------------------------
-
-
-def test_resident_identity_tolerates_an_unallocated_request():
-    """req_pool_idx is Optional and is None between admission and alloc.
-
-    MEASURED: all three ranks died at 2026-08-09 20:59:45Z on the first
-    line of _cutover with
-
-        TypeError: int() argument must be ... not 'NoneType'
-
-    because `getattr(req, "req_pool_idx", -1)` supplies its default only
-    when the attribute is ABSENT, and this one is present-and-None. The
-    armed park's narrowing is what began letting flips commit between
-    prefill chunks, which is where such a request is reachable.
-    """
-    from sglang.srt.managers.phase_flip_resident_carry import (
-        resident_req_identity,
-    )
-
-    allocated = FakeReq("alloc")
-    allocated.req_pool_idx = 7
-    pending = FakeReq("pending")
-    pending.req_pool_idx = None  # admitted, slot not yet allocated
-
-    batch = real_batch([], spec_info=None)
-    batch.reqs = [allocated, pending]
-    sched = scheduler_at_cutover(batch, running_mbs=[batch])
-
-    ident = resident_req_identity(sched)
-    assert ident == [("alloc", 7), ("pending", -1)]
-
-
 def test_can_fail_the_old_getattr_default_still_raises():
     """CAN-FAIL: prove the default argument never fired on a None value.
 
@@ -363,3 +262,17 @@ def test_can_fail_the_old_getattr_default_still_raises():
     pending.req_pool_idx = None
     with pytest.raises(TypeError):
         int(getattr(pending, "req_pool_idx", -1))
+
+
+# #1347: THREE TESTS RETIRED HERE. All three drove
+# `phase_flip_resident_carry.harvest_resident_batches`, deleted by #969 CUT K
+# ("the cutover is a re-entry, not object surgery"). Two of them were #905-shape
+# falsifiers -- they proved the seam must NOT be built on that harvest -- and a
+# falsifier whose counterfactual cannot be constructed any more is not a test,
+# it is a comment. Per #905 the replacement is a TRIPWIRE, not a skip:
+# `test_1347_retired_631_mechanisms_stay_retired.py` fails the day a resident
+# harvest reappears and names the reach tests then owed again.
+#
+# WHAT SURVIVES IS THE LIVE HALF: seven tests still drive `_reachable_batches`
+# and `clear_spec_info_for_unspeculated_phase`, both of which exist and are the
+# contract this file's own header calls "THE REACH IS THE WHOLE POINT".
