@@ -24,14 +24,16 @@ group's live VRAM, through a buffer whose size is bounded by construction.
 
 TWO PATHS, because P and D do not agree about a tensor's shape
 --------------------------------------------------------------
-* **path (a), byte-identical pieces** -- where the source's piece and the
-  destination's piece are the same bytes, the existing cross-pair staging lane
-  moves them card-to-card (``weight_exchange_transport.run_leg``).  This module
-  adds no transport for that case; :func:`agreed_descs` only says which
-  descriptors qualify, and the AUTHORITY question is settled by handing the
-  transport the ORIGINAL descriptors instead of the shadow's re-targeted ones.
-  Measured on boot weg2xsn8 this set is 4.90 MiB against a 27.52 GiB image, so
-  it is real and byte-negligible.  It is not over-built here for that reason.
+* **path (a), byte-identical pieces** -- DELETED #1342 S3, and named here so
+  the removal is not mistaken for an omission.  Where the source's piece and
+  the destination's piece were the same bytes, a separate lane moved them
+  card-to-card.  It had no production caller, its input (the per-flip-leg
+  agreement verdict from ``reconcile_card_manifest``) does not exist at the one
+  call site that reaches this module, and path (b) carries those bytes anyway.
+  Measured on boot weg2xsn8 the set was 4.90 MiB against a 27.52 GiB image --
+  0.018 %, so it was a SECOND MOVER for one payload rather than a throughput
+  argument.  ``agreed_descs``, ``AgreedResult`` and ``run_agreed_leg`` went
+  with it.
 * **path (b), everything else** -- P is PP (whole layers per stage) and D is TP
   (row-sliced), so there is no byte-identical piece to move.  The source
   deposits the unit into the host bounce buffer and each destination collects
@@ -135,7 +137,6 @@ __all__ = [
     "BounceResult",
     "LayerBounce",
     "Unit",
-    "agreed_descs",
     "bounce_path",
     "leg_geometry",
     "plan_units",
@@ -144,7 +145,7 @@ __all__ = [
     "registered_bounce_bytes",
     "InjectVerdict",
     "inject_summary_line",
-    "run_agreed_leg",
+    "reset_inject_verdicts",
     "run_bounce_leg",
     "unit_name",
     "widest_run",
@@ -461,28 +462,6 @@ def registered_bounce_bytes() -> int:
 # ---------------------------------------------------------------------------
 
 
-def agreed_descs(descs: Sequence[object],
-                 agreed_names: Sequence[str]) -> List[object]:
-    """The descriptors path (a) may carry: those whose parameter both ends
-    agreed byte-identically.
-
-    A FILTER AND NOT A TRANSPORT.  The bytes move through the existing cross
-    lane; what makes them AUTHORITATIVE rather than observed is that the
-    caller hands ``tp.run_leg`` these descriptors with their ORIGINAL
-    ``dst_ptr`` instead of the shadow's ``sh.to_shadow`` re-targeting.  The
-    agreement itself is the manifest reconciliation's answer
-    (``sh.reconcile_card_manifest``) and is not recomputed here -- one
-    producer of that verdict.
-    """
-    want = {str(n) for n in agreed_names}
-    return [d for d in descs if str(getattr(d, "param_name", "")) in want]
-
-
-# ---------------------------------------------------------------------------
-# The result, and what its verdict does and does not claim.
-# ---------------------------------------------------------------------------
-
-
 @dataclass
 class BounceResult:
     """One leg's own accounting, with every number naming its instrument.
@@ -626,6 +605,30 @@ class InjectVerdict:
         )
 
 
+#: EVERY COMPARED LEG OF THIS PROCESS, in order, for the per-BOOT summary.
+#:
+#: #1342 S3.  `inject_summary_line` answers "has this boot ever disagreed",
+#: which needs every leg -- and it had NO production caller at all, so the
+#: question was never once asked on any boot.  A per-leg emitter cannot answer
+#: it, so the legs accumulate here and the summary is re-emitted after each
+#: compared leg: a running answer, which is the right shape for a question
+#: about the boot so far.  Only COMPARED legs are appended (`mode=shadow`);
+#: an authoritative leg produces no verdict and must not be counted as a
+#: `NO-COMPARE`, which would make the arm that owns the bytes look like the
+#: arm that stopped grading.
+_INJECT_VERDICTS: List["InjectVerdict"] = []
+
+
+def reset_inject_verdicts() -> None:
+    """Drop the accumulated verdicts.  For tests, and for a boot that re-arms.
+
+    Exposed rather than left to attribute surgery on the module: a test that
+    reached into `_INJECT_VERDICTS` directly would be the second writer of the
+    same state.
+    """
+    _INJECT_VERDICTS.clear()
+
+
 def inject_summary_line(verdicts: Sequence["InjectVerdict"]) -> str:
     """The per-BOOT summary over every leg's verdict.
 
@@ -649,33 +652,6 @@ def inject_summary_line(verdicts: Sequence["InjectVerdict"]) -> str:
         f"mismatch_first={first} "
         f"verdict={'MATCH' if (total and not mism and not none) else 'NOT-CLEAN'}"
     )
-
-
-@dataclass
-class AgreedResult:
-    """Path (a)'s accounting.  Same verdict semantics as :class:`BounceResult`."""
-
-    pieces: int
-    moved_bytes: int
-    planned_bytes: int
-    slot_bytes: int
-
-    @property
-    def verdict(self) -> str:
-        return "MATCH" if self.moved_bytes == self.planned_bytes else "SHORT"
-
-    def line(self) -> str:
-        return (
-            "WEG2-XCHG-AGREED "
-            f"pieces={self.pieces} moved={self.moved_bytes} "
-            f"planned={self.planned_bytes} slot_bytes={self.slot_bytes} "
-            f"verdict={self.verdict}"
-        )
-
-
-# ---------------------------------------------------------------------------
-# Path (b): the streaming loop.
-# ---------------------------------------------------------------------------
 
 
 def _deposit_band(ops: tp.DeviceOps, stream: int, descs: Sequence[object],
@@ -967,62 +943,23 @@ def run_bounce_leg(
         deposit_ms=deposit_ms, collect_ms=collect_ms,
         short=tuple(short), banded=banded,
     )
-    (log or logger.info)("%s", result.line())
+    emit = log or logger.info
+    emit("%s", result.line())
+    # #1342 S3: `InjectVerdict.line()` -- the emitter of `WEG2-XCHG-INJECT`,
+    # which is grading item (a) -- had NO caller anywhere, so the line had
+    # never been printed by any boot at any argv.  Boot weg2xsn17 measured it
+    # as 0 lines on both groups and could not tell that absence apart from
+    # "the lane did not run".  THIS is the site that holds the verdict, so
+    # this is the site that prints it.
+    #
+    # Only when the leg actually COMPARED: under `authoritative` there is no
+    # comparison (`comparing = mode == INJECT_SHADOW` above, and `inject` is
+    # then None), and printing a verdict for a leg that compared nothing is
+    # the instrument lie #1336 closed one instance of.
+    if result.inject is not None:
+        emit("%s", result.inject.line())
+        _INJECT_VERDICTS.append(result.inject)
+        emit("%s", inject_summary_line(_INJECT_VERDICTS))
     return result
 
 
-def run_agreed_leg(
-    descs: Sequence[object],
-    ops: tp.DeviceOps,
-    boot_nonce: str,
-    *,
-    slot_bytes: Optional[int] = None,
-    shm_root: str = xr.SHM_ROOT,
-    device: int = 0,
-    log=None,
-) -> AgreedResult:
-    """Path (a), AUTHORITATIVE: byte-identical pieces to their LIVE storage.
-
-    The transport is the existing staging lane's own arithmetic and the slot is
-    ``xr.SLOT_BYTES``; the single thing that makes this the authority rather
-    than an observer is that the descriptors keep their ORIGINAL ``dst_ptr``.
-    The shadow's ``sh.to_shadow`` exists precisely to take that away, and the
-    absence of that call here is the whole of B2.
-
-    It is deliberately NOT built on top of ``tp.run_leg``: that function drives
-    six directed pairs through the shared region's semaphores and the wave
-    gate, which is the right shape for a cross-process flip and the wrong one
-    for a set measured at 4.90 MiB.  The staging buffer is the same
-    :class:`LayerBounce` carrier at the lane's own slot size, so path (a) adds
-    no second host term of its own.
-    """
-    slot = int(xr.SLOT_BYTES if slot_bytes is None else slot_bytes)
-    descs = list(descs)
-    hole = _missing_pointer(descs)
-    if hole is not None:
-        raise wx.Weg2XchgSourceMissing(
-            f"W74 Weg2XchgSourceMissing agreed: {hole} -- an agreed piece "
-            f"whose storage one end does not hold is not agreed."
-        )
-    refuse_if_slot_short(slot, descs)
-    planned = sum(int(getattr(d, "nbytes", 0)) for d in descs)
-    bounce = LayerBounce(ops, boot_nonce, slot_bytes=slot, depth=1,
-                         create=True, shm_root=shm_root)
-    stream = ops.create_stream(device)
-    moved = 0
-    pieces = 0
-    try:
-        for batch in tp.batch_descs(descs, slot):
-            base = bounce.slot_address(0)
-            _deposit_band(ops, stream, descs, batch, base)
-            ops.synchronize(stream)
-            moved += _collect_band(ops, stream, descs, batch, base)
-            ops.synchronize(stream)
-            pieces += len(batch.pieces)
-    finally:
-        ops.destroy_stream(stream)
-        bounce.close()
-    result = AgreedResult(pieces=pieces, moved_bytes=moved,
-                          planned_bytes=planned, slot_bytes=slot)
-    (log or logger.info)("%s", result.line())
-    return result

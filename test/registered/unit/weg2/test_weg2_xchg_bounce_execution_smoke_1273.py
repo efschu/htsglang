@@ -588,43 +588,26 @@ def test_the_leg_refuses_to_invent_a_size(tmp_path, armed, seeded):
 
 
 # ===========================================================================
-# STEP 3 -- PATH (a) IS AUTHORITATIVE, not an observer.
+# STEP 3 -- PATH (a) WAS DELETED (#1342 S3).  Its two tests went with it, and
+# the removal is recorded here rather than left as a silent shrink of this
+# file, so the gate's GONE list has its reason attached:
+#
+#   * test_path_a_changes_the_destinations_live_storage
+#   * test_path_a_carries_only_the_agreed_names
+#
+# Path (a) moved the byte-identical card-to-card set to live storage.  It had
+# ZERO production callers; its input (the per-flip-leg agreement verdict from
+# `reconcile_card_manifest`) does not exist at the only call site that reaches
+# the bounce module; and path (b) carries those bytes anyway.  Measured on boot
+# weg2xsn8 the set was 4.90 MiB of a 27.52 GiB image -- 0.018 %, so it was a
+# SECOND MOVER for one payload rather than a throughput argument, which is the
+# UPSTREAM-MINIMAL delete shape.  `run_agreed_leg`, `agreed_descs` and
+# `AgreedResult` were removed with it.
+#
+# The ABSENCE is now itself under test, in
+# test_weg2_xchg_inject_wiring_1342.py::test_the_deleted_second_mover_is_really_gone,
+# so a re-introduction has to argue with that docstring.
 # ===========================================================================
-
-
-class PathAIsTheAuthorityForTheBytesItCarries:
-    """Namespace only; the collected tests are the functions below."""
-
-
-def test_path_a_changes_the_destinations_live_storage(tmp_path, armed, seeded):
-    """The shadow re-targets descriptors into its own buffer; the authority
-    does NOT -- it hands the transport the ORIGINAL destination pointers.
-
-    That one difference is path (a)'s whole authority question, so the
-    assertion is on the destination's LIVE address, not on a report.
-    """
-    descs = _replicated(0, "model.layers.0.mlp.down_proj.weight",
-                        DOWN_OFF, DOWN_ROWS)
-    result = _manager()._weg2_xchg_agreed_leg(
-        descs=descs, ops=seeded, boot_nonce=armed, shm_root=str(tmp_path),
-    )
-    assert result.verdict == "MATCH"
-    assert _mismatched_rows(seeded, descs) == []
-
-
-def test_path_a_carries_only_the_agreed_names(tmp_path):
-    """The filter, and it is a filter rather than a transport.
-
-    Agreement is the manifest reconciliation's verdict, not something this
-    module recomputes, so the only thing under test is that the descriptor set
-    is narrowed to the names it was given.
-    """
-    descs = _all_descs()
-    agreed = bx.agreed_descs(descs, ["model.layers.0.mlp.down_proj.weight"])
-    assert agreed
-    assert {d.param_name for d in agreed} == {
-        "model.layers.0.mlp.down_proj.weight"}
-    assert len(agreed) < len(descs)
 
 
 # ===========================================================================
