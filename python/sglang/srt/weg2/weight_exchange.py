@@ -733,9 +733,34 @@ class ParamGeom:
         class (spec §2.4 rule 2).  ``shard_total`` is in the units the storage
         axis counts in -- storage ROWS for a ROWS shard, storage COLUMNS for a
         COLS shard.
+
+        **A REPLICATED GEOMETRY HAS NO SHARD AXIS TO NAME** (#1273 B4i), so the
+        ndim check below does not apply to it.  This is not a widening of the
+        check; it is the check being asked its own question.  What it refuses is
+        a SHARD BOUNDARY that no (rows, cols, pitch) triple can express -- an
+        expert-major ``[E, N_local, K]`` sharded on N is E strided bands, and
+        planning it as rows would move the wrong bytes.  ``REPLICATED`` means
+        every holder holds the WHOLE tensor: ``_blocks_of`` emits one block of
+        the full extent, there is no boundary anywhere, and ``StorageGeom.of``
+        has already either flattened a genuinely contiguous block to storage
+        rows or refused a non-contiguous one BY NAME.  Boot weg2xsn15 paid for
+        the over-broad reading: the product inventory
+        (``weight_exchange_shadow.derive_leg_plan``, ``derive_card_manifest``)
+        builds every geometry as ``shard_axis=REPLICATED`` in the PP form, so
+        the GDN causal conv ``[C, 1, K]`` and the vision tower's 5-D
+        ``[1152, 3, 2, 16, 16]`` patch embedding were dropped from the inventory
+        (counted as ``undescribed=``), never reached the plan map, and came back
+        out of ``build_coverage`` as 390 ``uncovered`` tensors -- W84 then
+        suppressed every shadow leg of that boot.  They are real non-zero
+        weights, so the exemption path (``is_zerofill_by_design``) could not and
+        must not answer for them: they are COVERED instead.
         """
         ndim = int(tensor.dim()) if hasattr(tensor, "dim") else len(tensor.shape)
-        if ndim > 2 and (shard_dim is None or int(shard_dim) not in (0, ndim - 1)):
+        if (
+            ndim > 2
+            and shard_axis != REPLICATED
+            and (shard_dim is None or int(shard_dim) not in (0, ndim - 1))
+        ):
             raise Weg2XchgPlanDisagree(
                 f"W68 Weg2XchgPlanDisagree: {name} is {ndim}-D and its shard "
                 f"axis is not one a (rows, cols, pitch) triple can name. A "
@@ -743,7 +768,9 @@ class ParamGeom:
                 f"axis shard (conv1d's [C, 1, K]: pass shard_dim=0) or a "
                 f"trailing one; an expert-major MoE weight [E, N_local, K] "
                 f"sharded on N is E strided bands. TODO(S2): that class needs "
-                f"its own descriptor kind before it can be exchanged."
+                f"its own descriptor kind before it can be exchanged. A "
+                f"REPLICATED geometry is not this case and is not refused here "
+                f"-- it has no shard boundary at all (#1273 B4i)."
             )
         live = StorageGeom.of(tensor)
         if shard_axis == COLS:
