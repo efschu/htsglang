@@ -824,5 +824,20 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     return 0 if res.armed else 2
 
 
+def cli(argv: Optional[Sequence[str]] = None) -> int:
+    """``main`` with the named refusals turned into ONE line and exit 2.
+
+    The same shape ``launcher.cli()`` gives ``Weg2XchgRefused`` and for the
+    same reason (#1275 fix 2, "both exits, or the guarantee is only half
+    true"): a refusal that escapes as a traceback exits 1, which any wrapper
+    keying on the exit code reads as a crash rather than as the refusal it is.
+    """
+    try:
+        return main(argv)
+    except Weg2XchgResidencyUnarmable as exc:
+        print(f"WEG2-XCHG-CENSUS REFUSED: {exc}")
+        return 2
+
+
 if __name__ == "__main__":  # pragma: no cover
-    raise SystemExit(main())
+    raise SystemExit(cli())

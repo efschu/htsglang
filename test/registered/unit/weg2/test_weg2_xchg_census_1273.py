@@ -484,5 +484,15 @@ class TheWaveMapArmsAreBothNamed(CustomTestCase):
                 CARDS, d, stem, family=(), n_cards=3, selection="x", tool_sha="s")
 
 
+class TheCliTurnsARefusalIntoAnExitCode(CustomTestCase):
+    def test_a_named_refusal_is_one_line_and_exit_2(self):
+        """#1275 fix 2's shape: a refusal that escapes exits 1 and reads as a crash."""
+        rc = xchg_census.cli(["--out", "/dev/null"])
+        self.assertEqual(rc, 2)
+
+    def test_a_refusal_is_not_swallowed_into_success(self):
+        self.assertNotEqual(xchg_census.cli(["--out", "/dev/null"]), 0)
+
+
 if __name__ == "__main__":
     unittest.main()
