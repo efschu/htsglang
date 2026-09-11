@@ -513,10 +513,21 @@ def test_the_adapter_reconciles_the_manifest_before_it_derives_the_plan():
 
     plan_src = inspect.getsource(wu.SchedulerWeightUpdaterManager._weg2_shadow_plan)
     assert "agreed=agreed" in plan_src
-    assert "require_agreement=True" in plan_src, (
+    # #1345 MOVED THIS ASSERTION, IT DID NOT WEAKEN IT.  The adapter used to
+    # hard-set ``require_agreement=True`` for EVERY caller, and boot weg2xsn19
+    # measured the cost: the injection caller deliberately has no agreement and
+    # no leg identity to gather one by, so it could only ever read
+    # ``manifest-unagreed`` -- 12 of 12 legs on both groups, on every argv.
+    # The narrowing decision now belongs to the CALLER, so this pin asserts
+    # (a) the adapter FORWARDS rather than decides, and (b) the SHADOW hook --
+    # the caller whose lane W80 actually threatens -- still demands it.
+    assert "require_agreement=bool(require_agreement)" in plan_src, (
+        "the adapter must FORWARD the caller's narrowing decision; a literal "
+        "here is the hard-set that disarmed the injection lane")
+    hook = inspect.getsource(wu.SchedulerWeightUpdaterManager._weg2_shadow_hook)
+    assert "require_agreement=True" in hook, (
         "without it a leg whose peer has not published falls back to this "
         "rank's own inventory -- the rank-local derivation W80 came from")
-    hook = inspect.getsource(wu.SchedulerWeightUpdaterManager._weg2_shadow_hook)
     assert "_weg2_shadow_manifest(" in hook
     assert hook.index("_weg2_shadow_manifest(") < hook.index(
         "_weg2_shadow_plan("), "the agreement must precede the derivation"

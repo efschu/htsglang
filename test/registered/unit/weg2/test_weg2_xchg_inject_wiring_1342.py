@@ -134,7 +134,7 @@ def test_the_inject_delegates_to_the_bounce_leg(monkeypatch, armed):
     m = _manager(monkeypatch)
     calls = {}
     monkeypatch.setattr(wu.SchedulerWeightUpdaterManager, "_weg2_shadow_plan",
-                        lambda self, hook, g, r, agreed=None:
+                        lambda self, hook, g, r, agreed=None, require_agreement=None:
                             (_FakePlan([_FakeDesc("a.w"), _FakeDesc("b.w")]), ""),
                         raising=True)
     def _record_bounce(self, **kw):
@@ -191,7 +191,7 @@ def test_a_missing_plan_still_refuses_by_name(monkeypatch, armed):
     """
     m = _manager(monkeypatch)
     monkeypatch.setattr(wu.SchedulerWeightUpdaterManager, "_weg2_shadow_plan",
-                        lambda self, hook, g, r, agreed=None:
+                        lambda self, hook, g, r, agreed=None, require_agreement=None:
                             (None, "no plan on this rank"),
                         raising=True)
     with pytest.raises(Weg2WakeRefused) as e:
@@ -381,7 +381,7 @@ def test_an_explicit_mode_from_the_caller_wins(monkeypatch, armed):
         return _real_bounce_result(mode=kw.get("mode", ""))
 
     monkeypatch.setattr(wu.SchedulerWeightUpdaterManager, "_weg2_shadow_plan",
-                        lambda self, hook, g, r, agreed=None:
+                        lambda self, hook, g, r, agreed=None, require_agreement=None:
                             (_FakePlan([_FakeDesc("a.w")]), ""), raising=True)
     monkeypatch.setattr(wu.SchedulerWeightUpdaterManager, "_weg2_xchg_bounce_leg",
                         _record_bounce, raising=True)

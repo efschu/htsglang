@@ -361,9 +361,11 @@ def _plans(armed_region, boot, *, chunked_ms=None):
         p_mgr, d_mgr, epoch=f"{boot}.1")
     assert p_state == d_state == sh.MANIFEST_AGREED, (p_state, d_state)
     p_plan, p_reason = p_mgr._weg2_shadow_plan(sh.HOOK_SOURCE, "P", 0,
-                                               agreed=p_agreed)
+                                               agreed=p_agreed,
+                                               require_agreement=True)
     d_plan, d_reason = d_mgr._weg2_shadow_plan(sh.HOOK_DESTINATION, "D", 0,
-                                               agreed=d_agreed)
+                                               agreed=d_agreed,
+                                               require_agreement=True)
     assert p_plan is not None, p_reason
     assert d_plan is not None, d_reason
     return p_plan, d_plan

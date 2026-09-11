@@ -232,3 +232,75 @@ def test_authoritative_stays_unreachable_on_this_arm():
         "the grader compares; it must never ask for the authoritative mode"
     )
     assert wx.INJECT_SHADOW != wx.INJECT_AUTHORITATIVE
+
+
+# --------------------------------------------------------------------------
+# 7. THE RATCHET (#1345 §3): a plan double must carry the PRODUCTION profile
+# --------------------------------------------------------------------------
+def test_a_plan_double_of_this_lane_carries_the_production_pointer_profile():
+    """THE RATCHET AGAINST THE NEXT ``MATCH`` CLAIM FROM A FABRICATION.
+
+    Boot weg2xsn19's record quoted ``verdict=MATCH pieces=45`` as a product
+    artifact.  It was not: the chain double monkeypatched the plan producer and
+    fabricated descs with BOTH pointers filled, while production's ``ptr_of``
+    fills only the side this rank owns.  RE-STAMP 10 withdrew the number and
+    made the double a BUILD item -- this is it.
+
+    ASSERT THE PROFILE, NOT THE LITERAL: the pin is that the lane's plan double
+    passes its descs through :func:`as_single_hook_descs`, which is the ONE
+    place the production profile is expressed.  Deleting that call -- the only
+    way back to a both-pointers fabrication -- turns this red (mutant M8).
+    """
+    chain = pathlib.Path(__file__).with_name(
+        "test_weg2_xchg_chain_smoke_1342.py")
+    tree = ast.parse(chain.read_text())
+
+    # the plan double is the lambda that stands in for _weg2_shadow_plan
+    lambdas = [n for n in ast.walk(tree) if isinstance(n, ast.Lambda)]
+    plan_doubles = [
+        n for n in lambdas
+        if any(a.arg == "require_agreement" for a in n.args.kwonlyargs)
+        or any(a.arg == "require_agreement" for a in n.args.args)
+    ]
+    assert plan_doubles, (
+        "no plan double found in the chain smoke -- if it was renamed, this "
+        "ratchet must be re-pointed rather than deleted"
+    )
+    for dbl in plan_doubles:
+        assert _calls_to(dbl, "as_single_hook_descs"), (
+            "the plan double must carry the PRODUCTION pointer-resolution "
+            "profile (as_single_hook_descs); a double that fills a pointer "
+            "production leaves None is how a withdrawn MATCH got into a record"
+        )
+
+
+def test_the_profile_helper_expresses_ptr_of_s_contract():
+    """The helper is only a ratchet if it matches what ``ptr_of`` actually does.
+
+    INDICATOR LAW: a pin on a helper is worthless unless the helper measures
+    what it claims.  ``ptr_of`` resolves the side this rank owns and returns
+    ``None`` on the other, so for a SOURCE hook only ``src_ptr`` survives and
+    for a DESTINATION hook only ``dst_ptr`` does.  MUTANT M9: invert either
+    branch of the helper and this goes red.
+    """
+    import dataclasses
+
+    from sglang.srt.weg2 import weight_exchange as wx
+
+    # RELATIVE import, the shape this package actually uses (the neighbouring
+    # smoke owns the doubles; a second copy would be the drift the ratchet is
+    # about).
+    from .test_weg2_xchg_bounce_execution_smoke_1273 import as_single_hook_descs
+    as_single = as_single_hook_descs
+
+    d = wx.XchgDesc(param_name="p", tag="weights_0", src_rank=0, dst_rank=0,
+                    src_off=0, dst_off=0, nbytes=16, rows=1, run_bytes=16,
+                    spitch=16, dpitch=16, kind=wx.FLAT,
+                    src_ptr=4096, dst_ptr=8192)
+    src_side = as_single([d], is_source=True)[0]
+    dst_side = as_single([d], is_source=False)[0]
+    assert src_side.src_ptr == 4096 and src_side.dst_ptr is None
+    assert dst_side.dst_ptr == 8192 and dst_side.src_ptr is None
+    # and the helper must not mutate the original
+    assert d.src_ptr == 4096 and d.dst_ptr == 8192
+    assert dataclasses.is_dataclass(d)

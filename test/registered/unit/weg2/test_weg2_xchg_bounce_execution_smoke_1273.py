@@ -206,12 +206,50 @@ def _lm_head_descs():
 
 
 def _all_descs(*, lm_head: bool = False, n_layers: int = N_LAYERS):
-    """The plan.  ``layers.0`` carries the GDN family, so it is the WIDEST."""
+    """The plan.  ``layers.0`` carries the GDN family, so it is the WIDEST.
+
+    BOTH POINTERS ARE FILLED HERE ON PURPOSE, and that is legitimate for the
+    tests in THIS file: they drive the transport with one process playing BOTH
+    ends, so both sides really are addressable.  A double standing in for a
+    SINGLE production hook must NOT use this as-is -- see
+    :func:`as_single_hook_descs`, which is the #1345 ratchet.
+    """
     out = []
     for layer in range(n_layers):
         out.extend(_layer_descs(layer, gdn=(layer == 0)))
     if lm_head:
         out.extend(_lm_head_descs())
+    return out
+
+
+def as_single_hook_descs(descs, *, is_source: bool):
+    """#1345 RATCHET: give a double the PRODUCTION POINTER-RESOLUTION PROFILE.
+
+    THE DEFECT THIS CLOSES, and it cost two boots plus a retracted record.
+    ``derive_leg_plan``'s ``ptr_of`` returns an address ONLY for the group and
+    rank THIS process owns and ``None`` on the other side -- "``None`` ON THE
+    SIDE THIS RANK DOES NOT OWN, which is XchgDesc's own documented contract"
+    (``weight_exchange_shadow.py``).  A double that fills BOTH pointers is
+    therefore testing a plan production cannot emit for a single hook, and boot
+    weg2xsn19's record quoted ``verdict=MATCH pieces=45`` from exactly such a
+    fabrication -- withdrawn by RE-STAMP 10.
+
+    ASSERT THE PROFILE, NEVER THE LITERAL: what makes a double faithful is not
+    which constant it holds but WHICH SIDE RESOLVES.  ``is_source=True`` keeps
+    ``src_ptr`` and drops ``dst_ptr`` (the source hook owns the source rows);
+    ``is_source=False`` -- the injection/``authoritative`` hook, since
+    ``is_source = (hook == HOOK_SOURCE)`` -- keeps ``dst_ptr`` and drops
+    ``src_ptr``.
+    """
+    import dataclasses
+
+    out = []
+    for d in descs:
+        out.append(dataclasses.replace(
+            d,
+            src_ptr=(d.src_ptr if is_source else None),
+            dst_ptr=(None if is_source else d.dst_ptr),
+        ))
     return out
 
 

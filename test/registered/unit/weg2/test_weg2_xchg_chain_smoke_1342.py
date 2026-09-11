@@ -66,6 +66,7 @@ from .test_weg2_xchg_bounce_execution_smoke_1273 import (  # noqa: E402
     DEPTH,
     SLOT_BYTES,
     _all_descs,
+    as_single_hook_descs,
     _seed_source,
 )
 from .test_weg2_xchg_transport_1273 import (  # noqa: E402
@@ -188,7 +189,14 @@ def chain(tmp_path, monkeypatch):
     descs = _all_descs()
     monkeypatch.setattr(
         WU, "_weg2_shadow_plan",
-        lambda self, hook, g, r, agreed=None: (_real_legplan(descs), ""),
+        # #1345 RATCHET: the injection hook is the DESTINATION side
+        # (`is_source = (hook == HOOK_SOURCE)`), so production fills ONLY
+        # `dst_ptr` and leaves `src_ptr` None. The double must carry that
+        # profile or it tests a plan production cannot emit -- which is how
+        # `verdict=MATCH pieces=45` got into a boot record and had to be
+        # withdrawn (RE-STAMP 10).
+        lambda self, hook, g, r, agreed=None, require_agreement=None: (
+            _real_legplan(as_single_hook_descs(descs, is_source=False)), ""),
         raising=True)
     monkeypatch.setattr(WU, "_weg2_server_args",
                         lambda self: _ServerArgs(), raising=True)
@@ -265,23 +273,53 @@ def test_the_chain_runs_once_and_produces_the_graded_artifacts(chain, caplog):
         + text[-3000:]
     )
     assert "mode=shadow" in inject[0], inject[0]
-    assert "verdict=MATCH" in inject[0], (
-        "the leg compared but did not MATCH, or compared nothing "
-        "(NO-COMPARE is a FAIL, not a neutral): " + inject[0]
+    # #1345 / RE-STAMP 10: THE TRUE PRODUCT OUTCOME ON THIS ARM IS A NAMED
+    # REFUSAL, NOT `MATCH`.  With the destination-hook profile in force the
+    # leg has no source pointer, and `run_bounce_leg` refuses BY NAME before
+    # mapping the buffer (`W74 Weg2XchgSourceMissing bounce: ... has no source
+    # pointer`, weight_exchange_bounce.py).  The previous `verdict=MATCH`
+    # assertion passed only because the double filled a pointer production
+    # leaves None -- that number is withdrawn and must not return as a
+    # baseline.  A BLANK `NO-COMPARE pieces=0` is still a FAIL: the line has
+    # to say WHICH side was unresolved.
+    assert "W74 Weg2XchgSourceMissing" in text, (
+        "the injection hook must refuse BY NAME when its source side is "
+        "unresolved, never compare nothing silently:\n" + text[-3000:]
+    )
+    assert "has no source pointer" in text, (
+        "the refusal must name WHICH side was unresolved:\n" + text[-2000:]
+    )
+    assert "verdict=MATCH" not in inject[0], (
+        "a MATCH here can only come from a double that filled a pointer "
+        "production leaves None (RE-STAMP 10): " + inject[0]
     )
 
     # -- ARTIFACT 2: the per-boot summary, grading item (a) -------------------
+    # ARTIFACT 2 IS NOT PRODUCED ON THIS ARM, and that is now the assertion.
+    # `inject_summary_line` is emitted only from inside `run_bounce_leg`'s
+    # compared path (`if result.inject is not None:`), which the W74 refusal
+    # above never reaches.  The emitter is WIRED and UNREACHED -- the third of
+    # the three states -- and pretending otherwise is what the retraction was
+    # about.
     summary = [l for l in text.splitlines()
                if "WEG2-XCHG-INJECT-SUMMARY" in l]
-    assert summary, "no WEG2-XCHG-INJECT-SUMMARY line"
-    assert "legs_no_compare=0" in summary[-1], summary[-1]
-    assert "legs_mismatch=0" in summary[-1], summary[-1]
-    assert "verdict=MATCH" in summary[-1], summary[-1]
+    assert not summary, (
+        "a SUMMARY here would mean the compared path ran despite an "
+        "unresolved source: " + str(summary)
+    )
 
     # -- ARTIFACT 3: bounce.bin on disk, grading item (c) --------------------
     import os
     path = bx.bounce_path(boot, shm_root=str(root))
-    assert os.path.exists(path), f"bounce.bin absent at {path}"
+    # #1345: THE REFUSAL IS *BEFORE THE BUFFER IS MAPPED* (its own words), so
+    # `bounce.bin` must be ABSENT here.  Item (c) is therefore not gradeable on
+    # this arm either, and the boot record must say so rather than reporting a
+    # size from a fabricated plan.
+    assert not os.path.exists(path), (
+        f"bounce.bin exists at {path}, but the leg refused before mapping the "
+        f"buffer -- that file can only come from a plan production cannot emit"
+    )
+    return
     # THE SIZE IS DERIVED FROM THE PUBLISHED TERMS, never from this file's
     # constants -- the same rule the grading plan states for the boot ("if
     # depth or slot_mib differ on the build, recompute from THAT boot's
