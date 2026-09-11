@@ -2274,18 +2274,94 @@ class TagCoverage:
     #: ``uncovered=0`` is a real zero and not a relabel of the same tensors.
     exempt: Tuple[str, ...] = ()
 
-    @property
-    def slack_bytes(self) -> int:
-        """``tms_tag_bytes`` minus what this walk accounts for.
+    #: #1335 (B4r): the three verdicts of the two books' comparison.  Named
+    #: because withholding a wrong number without putting a word in its place
+    #: trades a wrong reading for no reading -- and a boot record must be able
+    #: to COUNT this state.
+    ATTRIBUTION_OVERHANG = "OVERHANG"
+    ATTRIBUTION_DIVERGES = "SAVER-BOOKS-LESS-THAN-WALK"
+    ATTRIBUTION_NO_ANSWER = "NO-SAVER-ANSWER"
 
-        PRINTED, NEVER COMPARED FOR EQUALITY (spec section 6/S2).  Allocator
-        overhang is real and measured at +0.08 to +0.58 GiB per rank, so an
-        equality assert would refuse every boot.  It can also be NEGATIVE --
-        that is the saver answering 0 because the running hook has no
-        ``tms_tag_bytes`` symbol, an ABSENCE the reader must see rather than a
-        deficit the code invents a rule about.
+    #: Both books, by name, so a signed difference between them is readable.
+    ATTRIBUTION = "saver:tms_tag_bytes|walk:region+name"
+
+    @property
+    def walk_bytes(self) -> int:
+        """THE WALK'S BOOK, as ONE named total (#1335).
+
+        ``planned`` (the plan's claim for this tag's parameters) plus
+        ``buffers`` (what the walk books as this tag's buffers), both from
+        ``walk_live_tensors``' region+name attribution.  It exists so the
+        walk's side of the comparison has a NAME instead of being a sum a
+        reader has to reconstruct from two fields.
         """
-        return int(self.tms_bytes) - int(self.planned_bytes) - int(self.buffers_bytes)
+        return int(self.planned_bytes) + int(self.buffers_bytes)
+
+    @property
+    def attribution_delta_bytes(self) -> Optional[int]:
+        """THE ONE CROSS-BOOK TERM, and the only signed figure on the line.
+
+        ``tms_tag_bytes`` (the SAVER's ledger) minus :attr:`walk_bytes` (the
+        WALK's book).  ``None`` when the saver did not answer -- a delta against
+        an absence is not a measurement.
+
+        WHY THIS REPLACED ``slack_bytes`` (#1335, operator ruling 2026-09-11).
+        That attribute computed exactly this number and called it *slack*, i.e.
+        FREE ROOM, so its negative side read as "the tag is too small".  It is
+        not: the two terms come from TWO DIFFERENT AUTHORITIES for one fact --
+        which tag these bytes belong to -- and their difference is a BOOKING
+        difference in either sign.  Measured on weg2xsn19: summed over every
+        weights-family tag the saver is LARGER on every rank (+72.9 MiB on P
+        rank 0, +188.9 / +169.0 / +184.5 on D ranks 0/1/2), so nothing is
+        missing anywhere; the per-tag negative on ``weights_draft``
+        (-107.7 / -115.2 / -115.4 / -110.9 over four boots) is a MISATTRIBUTION
+        BETWEEN TAGS.  The cross-check that fixes it as attribution rather than
+        measurement: ``weights_0`` carries one extra ~64 MiB buffer (21 buffers
+        / 64.2 MiB against 20 / 0.2 on every other chunk tag) and THERE the
+        saver agrees (``tms_mib`` 614.0 against 550.0).
+
+        THE AUTHORITY FOR TAG MEMBERSHIP IS THE SAVER, and the argument is
+        OWNERSHIP rather than the more convenient diff:
+        ``torch_memory_saver_adapter`` exposes ``pause(tag)``, ``resume(tag)``
+        and ``tag_bytes(tag)`` on ONE object keyed by the SAME tag string -- the
+        tag that gets paused IS the saver's tag, and its ledger decides which
+        pages a flip releases and restores.  The walk's region+name attribution
+        never moves a page and answers a different question ("which tag does
+        this NAME suggest").  So anything that ever SIZES from these numbers
+        sizes from the saver's book: a tag sized from the walk's book could be
+        SMALLER than what the saver holds, and a tag too small CORRUPTS, while
+        a tag too large only costs VRAM.
+        """
+        if int(self.tms_bytes) == 0:
+            return None
+        return int(self.tms_bytes) - self.walk_bytes
+
+    @property
+    def overhang_bytes(self) -> Optional[int]:
+        """ALLOCATOR OVERHANG -- the only reading that means free room.
+
+        The delta when the saver's book is the LARGER one, else ``None``.
+        ``None`` is "not free room", never zero: with the books disagreeing
+        about membership the true overhang of THIS tag is not computable from
+        these two numbers, and a zero would read as "exactly full".
+
+        PRINTED, NEVER COMPARED FOR EQUALITY (spec section 6/S2) -- overhang is
+        real and measured at +0.08 to +0.58 GiB per rank, so an equality assert
+        would refuse every boot.  That sentence was always right; what was
+        wrong was applying it to a number that could also be a booking
+        difference.
+        """
+        delta = self.attribution_delta_bytes
+        return delta if delta is not None and delta >= 0 else None
+
+    @property
+    def attribution_verdict(self) -> str:
+        """Which of the three states this row is in, as a greppable word."""
+        if self.attribution_delta_bytes is None:
+            return self.ATTRIBUTION_NO_ANSWER
+        if self.overhang_bytes is not None:
+            return self.ATTRIBUTION_OVERHANG
+        return self.ATTRIBUTION_DIVERGES
 
     @property
     def ok(self) -> bool:
@@ -2311,19 +2387,39 @@ class TagCoverage:
         follow are the DENOMINATOR of ``uncovered`` -- a population number
         without its population is the trap this campaign keeps paying for.
         ``planned_mib`` is the PLAN's byte claim, so a plan that covers a
-        parameter only partly shows up here as slack rather than vanishing.
+        parameter only partly shows up here in the walk's book rather than
+        vanishing.
+
+        #1335: ``slack_mib`` NO LONGER CARRIES A CROSS-BOOK DIFFERENCE.  The
+        word stays -- four boot records count it and the census word does not
+        move (#1311 S6b) -- but it now prints ONLY
+        :attr:`overhang_bytes`, i.e. the reading that actually means free room,
+        and ``n/a`` otherwise.  The difference between the two books gets its
+        own name (``attribution_delta_mib``) beside both book names
+        (``attribution``) and a greppable state (``attribution_verdict``), so no
+        reader can conclude "bytes are missing" from a negative figure again --
+        which is exactly what four boots concluded.  ``n/a`` follows this
+        tree's own absent-not-zero precedent (the decode ladder's flip cost).
         """
+        delta = self.attribution_delta_bytes
+        overhang = self.overhang_bytes
         return (
             f"{COVER_LINE_PREFIX} rank={int(self.rank)} tag={self.tag} "
             f"planned_mib={self.planned_bytes / MIB:.1f} "
             f"buffers_mib={self.buffers_bytes / MIB:.1f} "
+            f"walk_mib={self.walk_bytes / MIB:.1f} "
             f"tms_mib={self.tms_bytes / MIB:.1f} "
-            f"slack_mib={self.slack_bytes / MIB:.1f} "
-            f"uncovered={len(self.uncovered)} "
-            f"short={len(self.short)} missing={len(self.missing)} "
-            f"params={self.n_parameters} buffers={self.n_buffers} "
-            f"attrs={self.n_attributes} "
-            f"exempt={len(self.exempt)} "
+            f"attribution={self.ATTRIBUTION} "
+            + (f"attribution_delta_mib={delta / MIB:.1f} " if delta is not None
+               else "attribution_delta_mib=n/a ")
+            + f"attribution_verdict={self.attribution_verdict} "
+            + (f"slack_mib={overhang / MIB:.1f} " if overhang is not None
+               else "slack_mib=n/a ")
+            + f"uncovered={len(self.uncovered)} "
+            + f"short={len(self.short)} missing={len(self.missing)} "
+            + f"params={self.n_parameters} buffers={self.n_buffers} "
+            + f"attrs={self.n_attributes} "
+            + f"exempt={len(self.exempt)} "
             + (f"reason={EXEMPT_REASON} " if self.exempt else "")
             + (
             f"tms_answered={'yes' if self.tms_bytes else 'no'} "
