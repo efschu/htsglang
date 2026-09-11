@@ -2528,9 +2528,13 @@ class SchedulerWeightUpdaterManager:
             # (`_resolve_oncard_slot_bytes_max`), which is exactly the
             # `--weg2-xchg-oncard-slot-mib` the launcher parsed and published,
             # and it is the same number the ARM line printed as `slot_mib=`.
-            # Under S6-BOUNCE it is not a ceiling but THE slot: a plan needing
-            # more than `SLOTS_PER_PAIR` batches per leg is refused by name
-            # (`DEPOSIT_REASON_BATCHES`), never sized up.
+            # Under S6-BOUNCE it is not a ceiling but THE slot, and the deposit
+            # is never sized up: a plan needing more batches than this term
+            # funds is refused by name as `DEPOSIT_REASON_UNFUNDED` -- graded
+            # against THIS number, which is the third and last copy of the
+            # sentence #1333 corrected.  `DEPOSIT_REASON_BATCHES` is a
+            # different lever (`ONCARD_SLOTS_MAX`, the transport's row area)
+            # and is not what binds a 3-batch plan here.
             return int(xb.staging_bytes_per_card(tp.ONCARD_SLOT_BYTES_MAX))
         except Exception:  # noqa: BLE001 -- an observer never raises
             return 0

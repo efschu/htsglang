@@ -46,6 +46,7 @@ os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 from sglang.srt.weg2 import weight_exchange_region as xr  # noqa: E402
 from sglang.srt.weg2 import weight_exchange_shadow as sh  # noqa: E402
 from sglang.srt.weg2 import weight_exchange_transport as tp  # noqa: E402
+from sglang.srt.weg2 import xchg_bounce as xb  # noqa: E402
 
 
 # ===========================================================================
@@ -175,47 +176,66 @@ def test_the_diagonal_has_its_OWN_semaphores_named_by_CARD():
     assert len(every) == 24 + 3 * xr.SLOTS_PER_PAIR * 2
 
 
-def test_the_diagonal_carrier_is_sized_from_the_PUBLISHED_slot():
+def test_the_diagonal_carrier_is_sized_from_the_PUBLISHED_slot_by_its_ONE_owner():
     """MUTANT DIRECTION 2: sized up, or sized from the module default.
 
-    Plan AMENDMENT 5: the deposit is sized from the ONE published value the ARM
-    line charged as staging -- `--weg2-xchg-oncard-slot-mib`, flag default 128
-    -- x `SLOTS_PER_PAIR`. Not the 32 MiB the leg happened to plan, not the
-    module's 64, and never rounded up to fit a bigger plan.
+    RENAMED AND RE-AIMED (#1333), not deleted: the claim is unchanged -- the
+    deposit is sized from the ONE published value the ARM line charged as
+    staging, `--weg2-xchg-oncard-slot-mib` x `SLOTS_PER_PAIR`, not the 32 MiB
+    the leg happened to plan and not the module's 64 -- but it is now asked of
+    the function that OWNS that arithmetic and that the product actually reads
+    (`xchg_bounce.staging_bytes_per_card`, via
+    `weight_updater._weg2_shadow_host_budget`).  It used to be asked of
+    `tp.diagonal_carrier_bytes`, a second copy of the same number with zero
+    production call sites, now deleted.  The MiB round-trip half of the old
+    assertion moved to where the product performs it -- `validate_oncard_slot_mib`
+    at the launcher's three flag sites and at `ONCARD_SLOT_BYTES_MAX` -- because
+    that is the only path by which a slot reaches the charge.
     """
     for slot_mib in (128, 64, 32):
-        nbytes = tp.diagonal_carrier_bytes(slot_bytes=slot_mib * xr.MIB)
+        nbytes = xb.staging_bytes_per_card(slot_mib * xr.MIB)
         assert nbytes == xr.SLOTS_PER_PAIR * slot_mib * xr.MIB, (slot_mib, nbytes)
-    # A slot that is not the published one is refused rather than silently used.
+    # THE PUBLISHED SLOT IS A VALIDATED MiB VALUE BEFORE IT GETS HERE, and a
+    # non-MiB or out-of-range one is refused at that gate rather than at the
+    # multiplication.
+    assert tp.ONCARD_SLOT_BYTES_MAX % xr.MIB == 0
     with pytest.raises(tp.Weg2XchgOncardSlotRefused):
-        tp.diagonal_carrier_bytes(slot_bytes=0)
+        tp.validate_oncard_slot_mib(0)
     with pytest.raises(tp.Weg2XchgOncardSlotRefused):
-        tp.diagonal_carrier_bytes(slot_bytes=7 * xr.MIB + 1)
+        tp.validate_oncard_slot_mib(7)
+    # The deleted second authority stays deleted.
+    assert not hasattr(tp, "diagonal_carrier_bytes")
 
 
-def test_more_batches_than_slots_is_refused_BY_NAME_and_never_sized_up():
-    """MUTANT DIRECTION 3, and it is the one the ruling names explicitly.
+def test_more_batches_than_the_charge_is_refused_BY_NAME_and_never_sized_up():
+    """MUTANT DIRECTION 3 -- with the refusal NAME corrected (#1333).
 
-    `SLOTS_PER_PAIR` is 2. A leg whose plan needs three batches must be refused
-    with `DEPOSIT_REASON_BATCHES` -- growing the file instead would make the
-    deposit's own precondition (one slot per batch, so no reader is needed)
-    depend on a number the ledger did not charge for.
+    The old form of this test asserted `DEPOSIT_REASON_BATCHES` for a 3-batch
+    plan and got it only because it passed `slots_max=xr.SLOTS_PER_PAIR`
+    explicitly.  No production call site passes `slots_max`
+    (`weight_exchange_shadow`'s leg planner is the only one), so the default
+    `ONCARD_SLOTS_MAX` = 8 applies and a 3-batch plan is refused as
+    `DEPOSIT_REASON_UNFUNDED` instead -- graded against the charge, which is the
+    lever that actually binds.  The RULING is untouched (never sized up, always
+    refused by name); what is corrected is which word fires, because
+    `ONCARD_SLOTS_MAX` is the transport's row area and not the ledger's charge.
     """
     slot = 128 * xr.MIB
-    budget = xr.SLOTS_PER_PAIR * slot
+    budget = xb.staging_bytes_per_card(slot)
+    graded = dict(slot_bytes=slot, budget_bytes=budget, mode=tp.ONCARD_MODE_HOST)
+    assert tp.deposit_refusal_reason(batches=2, slots=2, **graded) == ""
+    assert tp.deposit_refusal_reason(batches=3, slots=3, **graded) == \
+        tp.DEPOSIT_REASON_UNFUNDED
+    # BATCHES is still reachable -- above the ROW AREA's own max, the shape it
+    # names -- so the correction narrows the claim rather than removing it.
     assert tp.deposit_refusal_reason(
-        batches=2, slots=2, slot_bytes=slot, budget_bytes=budget,
-        mode=tp.ONCARD_MODE_HOST, slots_max=xr.SLOTS_PER_PAIR) == ""
-    assert tp.deposit_refusal_reason(
-        batches=3, slots=2, slot_bytes=slot, budget_bytes=budget,
-        mode=tp.ONCARD_MODE_HOST,
-        slots_max=xr.SLOTS_PER_PAIR) == tp.DEPOSIT_REASON_BATCHES
-    # And the grading of the budget is UNCHANGED (the argument moved, not the
-    # function): slots x slot_bytes must fit the budget it was handed.
+        batches=tp.ONCARD_SLOTS_MAX + 1, slots=tp.ONCARD_SLOTS_MAX + 1,
+        **graded) == tp.DEPOSIT_REASON_BATCHES
+    # And the grading of the budget is UNCHANGED: slots x slot_bytes must fit
+    # the budget it was handed.
     assert tp.deposit_refusal_reason(
         batches=2, slots=2, slot_bytes=slot, budget_bytes=budget - 1,
-        mode=tp.ONCARD_MODE_HOST,
-        slots_max=xr.SLOTS_PER_PAIR) == tp.DEPOSIT_REASON_UNFUNDED
+        mode=tp.ONCARD_MODE_HOST) == tp.DEPOSIT_REASON_UNFUNDED
 
 
 # ===========================================================================
