@@ -159,9 +159,22 @@ class _ChunkedCase(unittest.TestCase):
 
 
 class DraftTagOutOfFamilyTest(unittest.TestCase):
-    """Spec section 4.1 / S2: ``weights_draft`` is not a weights-family tag."""
+    """The RING arm's family, and it is unchanged.
 
-    def test_draft_tag_is_not_in_the_weights_family(self):
+    NARROWED BY #1273 B4k / spec AMENDMENT 6: what this class pins is now the
+    ring arm only.  Under ``exchange`` ``weights_draft`` IS a family tag (both
+    groups were measured holding the MTP head), and that half lives in
+    ``test_weg2_xchg_draft_family_1273.py``.  The assertions below hold here
+    because no test in this file arms the exchange around them -- the predicate
+    is form-gated through ``weg2_memory_saver.draft_tag_in_family``.
+
+    What has NOT changed, and is the reason this class stays: the family is
+    ``weights`` plus ``weights_<integer>`` plus AT MOST that one measured tag.
+    A tag name is still not a predicate, and S8's ``weights_vision`` is still
+    out on both arms.
+    """
+
+    def test_draft_tag_is_not_in_the_weights_family_under_the_RING_arm(self):
         self.assertEqual(GPU_MEMORY_TYPE_WEIGHTS_DRAFT, "weights_draft")
         # RED AT 3ea18deb95: startswith("weights_") is True for this name.
         self.assertFalse(wms.is_weights_family_tag(GPU_MEMORY_TYPE_WEIGHTS_DRAFT))
@@ -774,10 +787,30 @@ class ArmAtLoadTest(_ChunkedCase):
             len([l for l in log.lines if l.startswith("WEG2-XCHG-COVER ")]), 2
         )
 
-    def test_arm_at_load_under_the_draft_region_emits_resident_only(self):
+    def test_arm_at_load_under_the_draft_region_now_CENSUSES_it(self):
+        """SUPERSEDED BY #1273 B4k / spec AMENDMENT 6, and the reversal is the
+        point rather than a regression.
+
+        This test used to assert ``resident only``: one RESIDENT line,
+        ``in_family=no``, ``rows == {}`` -- the draft tag waved off because
+        section 4.1 said group P had no VRAM source for those bytes.  Boot
+        weg2xsn15 measured the opposite on both groups (``WEG2-XCHG-RESIDENT
+        tag=weights_draft`` 1440/1280/1280 MiB on D and 1572 MiB on P's last
+        stage), the user overruled 4.1, and the draft head now travels the
+        family like every other layer.  So the arm CENSUSES this runner: a
+        COVER line beside the RESIDENT line, ``in_family=yes``, and real rows.
+        The ring arm is unchanged and is asserted separately
+        (``test_weg2_xchg_draft_family_1273.py``).
+        """
         model = _Model()
         log = _CaptureLog()
-        wx.register_plan_provider(lambda m: _planned_bytes(m))
+        planned = {
+            GPU_MEMORY_TYPE_WEIGHTS_DRAFT: {
+                name: int(p.untyped_storage().nbytes())
+                for name, p in model.named_parameters()
+            }
+        }
+        wx.register_plan_provider(lambda _m: planned)
         with wx.weight_source_for_test(wx.WEIGHT_SOURCE_EXCHANGE):
             vote = wx.arm_coverage_at_load(
                 model,
@@ -786,11 +819,16 @@ class ArmAtLoadTest(_ChunkedCase):
                 region_tag=GPU_MEMORY_TYPE_WEIGHTS_DRAFT,
                 log=log,
             )
-        self.assertTrue(vote.ok)
-        self.assertEqual(vote.rows, {})
-        self.assertEqual(len(log.lines), 1)
-        self.assertIn("tag=weights_draft mib=1311.0", log.lines[0])
-        self.assertIn("in_family=no", log.lines[0])
+        self.assertTrue(vote.ok, vote.reason)
+        self.assertIn(GPU_MEMORY_TYPE_WEIGHTS_DRAFT, vote.rows)
+        resident = [ln for ln in log.lines if wx.RESIDENT_LINE_PREFIX in ln]
+        cover = [ln for ln in log.lines if wx.COVER_LINE_PREFIX in ln]
+        self.assertEqual(len(resident), 1, log.lines)
+        self.assertIn("tag=weights_draft mib=1311.0", resident[0])
+        self.assertIn("in_family=yes", resident[0])
+        self.assertEqual(len(cover), 1, log.lines)
+        self.assertIn("tag=weights_draft", cover[0])
+        self.assertIn("uncovered=0", cover[0])
 
     def test_arm_at_load_installs_the_plan_provider(self):
         """S6 step 6b: the arm SELF-ARMS, so `exchange` is no longer

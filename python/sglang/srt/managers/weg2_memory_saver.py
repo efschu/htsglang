@@ -1917,12 +1917,23 @@ def weight_chunk_tag(layer_id: int) -> Optional[str]:
 def weights_family_tags(chunk_count: Optional[int] = None) -> list:
     """Every tag the sleep/wake path treats as 'the weights', chunks FIRST and
     the base tag LAST -- the order the front pauses them in, so the base tag
-    (the remainder: embeddings, head, draft, buffers) closes the sleep."""
+    (the remainder: embeddings, head, buffers) closes the sleep.
+
+    #1273 B4k: under the exchange arm ``weights_draft`` sits BETWEEN the chunks
+    and the base tag, and the position is load-bearing twice.  ``derive_waves``
+    takes ``tags[-1]`` as the base tag that closes the last wave, and
+    ``front.interleave_pause_order``'s stated contract is that the base tag
+    closes the sleep -- appending the draft tag last would silently make IT the
+    base of both.  It is not a chunk either (``is_weights_chunk_tag`` is the
+    integer predicate and says so), because a chunk tag is a LAYER BAND of the
+    target model and the draft head is not a band of anything.
+    """
     if chunk_count is None:
         chunk_count = weight_chunk_geometry()[1]
-    return [f"{WEIGHT_CHUNK_PREFIX}{k}" for k in range(int(chunk_count))] + [
-        GPU_MEMORY_TYPE_WEIGHTS
-    ]
+    tags = [f"{WEIGHT_CHUNK_PREFIX}{k}" for k in range(int(chunk_count))]
+    if draft_tag_in_family():
+        tags.append(GPU_MEMORY_TYPE_WEIGHTS_DRAFT)
+    return tags + [GPU_MEMORY_TYPE_WEIGHTS]
 
 
 def chunk_tag_cards(
@@ -2010,9 +2021,61 @@ def is_weights_chunk_tag(tag: Any) -> bool:
     return isinstance(tag, str) and _WEIGHT_CHUNK_TAG_RE.match(tag) is not None
 
 
+def draft_tag_in_family() -> bool:
+    """Is ``weights_draft`` a member of the weights family on THIS arm?
+
+    #1273 B4k, spec AMENDMENT 6 (user ruling 2026-09-11): *"warum sollte der mtp
+    kopf nur auf d liegen? ... die draft layer bytes, also die draft gewichte,
+    muessen genauso aus dem vram geflippt werden"*.  Section 4.1's premise --
+    *"group P carries no ``--speculative-*`` in this form, so none of those
+    bytes has a VRAM source on the other side"* -- is STALE on the shipped
+    default: ``launcher.DRAFT_KV_ON_P_DEFAULT`` is ``"on"`` and
+    ``model_runner.py:1548`` says the draft-KV group *"runs the checkpoint's MTP
+    head after every target chunk"*.  Boot weg2xsn15 measured the head on both:
+    ``WEG2-XCHG-RESIDENT tag=weights_draft`` 1440/1280/1280 MiB on D's three
+    ranks and 1572 MiB on P's LAST STAGE ONLY, all ``in_family=no`` -- residency
+    the exchange never moved and no flip ever paused.
+
+    ONE GATE, ONE READER OF THE MODE.  It answers through
+    ``weight_exchange.exchange_armed``, the same predicate the tag site
+    (``weights_region_tag_for``) already reads, so the membership and the tag
+    cannot disagree; a second env parse here would be exactly the two-readings
+    defect this lane keeps paying for.  The import is LAZY because
+    ``weight_exchange`` imports THIS module at line 84 -- a module-level import
+    would be a cycle.
+
+    THE RING ARM IS UNTOUCHED, and that is not a cosmetic exclusion (spec 1.1:
+    ``ring`` stays today byte for byte).  Under ``ring`` the draft runner never
+    receives its own tag at all -- ``weights_region_tag_for`` hands it the BASE
+    tag -- so the drafter is already paused as part of the base tag and already
+    travels the host ring.  Admitting the tag to the family there would add a
+    family member with no bytes to the wave list and the pause order, on a path
+    nobody asked to change.
+    """
+    try:
+        from sglang.srt.weg2.weight_exchange import exchange_armed
+    except Exception:  # noqa: BLE001 -- the saver must import without the lane
+        return False
+    return bool(exchange_armed())
+
+
 def is_weights_family_tag(tag: Any) -> bool:
+    """The ONE answer to "are these bytes exchanged".
+
+    Read by the plan's inventory loop, the census, the coverage arm and the
+    wave list, so a tag that is in the family is planned, censused, waved and
+    covered with no special case anywhere -- which is what AMENDMENT 6 asks for
+    and why the draft tag joins HERE rather than at four call sites.
+
+    ``weights_draft`` is the only non-integer suffix that joins, and it joins
+    because BOTH groups were MEASURED holding its bytes.  ``weights_vision``
+    (S8) has had no such measurement and stays out: a naming rule is not a VRAM
+    source.
+    """
     return isinstance(tag, str) and (
-        tag == GPU_MEMORY_TYPE_WEIGHTS or is_weights_chunk_tag(tag)
+        tag == GPU_MEMORY_TYPE_WEIGHTS
+        or is_weights_chunk_tag(tag)
+        or (tag == GPU_MEMORY_TYPE_WEIGHTS_DRAFT and draft_tag_in_family())
     )
 
 

@@ -3225,9 +3225,29 @@ def derive_leg_plan(
     # property of the derivation -- one class present on only one side of the
     # cut would have refused every leg under a different sentence.  Deriving it
     # from the AGREED inventory makes the agreement structural here too.
+    # #1273 B4k: A FAMILY MEMBER THAT IS NOT THE BASE TAG, not "a chunk tag".
+    #
+    # The chunk predicate was a THIRD reading of "is this exchanged", and it
+    # excluded exactly one thing the family predicate now includes: under the
+    # exchange arm ``weights_draft`` is a family tag (AMENDMENT 6, both groups
+    # measured holding the MTP head), and the draft runner's inventory carries
+    # NOTHING ELSE.  So with the chunk predicate here every draft runner would
+    # derive ``classes=()`` and refuse its own plan by name
+    # (``no-chunk-classes``) the moment the membership landed -- a rank that
+    # cannot plan its own weights while every other consumer plans them.
+    #
+    # THE BASE TAG STAYS OUT, and the reason is this function's own docstring
+    # ("WHY THE BASE TAG'S CLASSES ARE NOT IN THE ROTATION"): its bytes --
+    # embeddings on the first stage, head on the last, buffers everywhere -- are
+    # not a layer band, so a rotation built over them has CONTENT that depends
+    # on which card asks and the six ranks would not agree on it.  Excluding it
+    # by name rather than by "is a chunk" is the narrowest statement that keeps
+    # that property while letting a measured family member in; a test dies if
+    # this is widened to the base tag.
     classes = tuple(sorted({
         tensor_class(g.name) for g in inventory
-        if ms.is_weights_chunk_tag(g.tag)}))
+        if ms.is_weights_family_tag(g.tag)
+        and g.tag != wx.GPU_MEMORY_TYPE_WEIGHTS}))
     if not classes:
         return _plan_refusal("no-chunk-classes",
                              f"carried={sorted(carried)}")

@@ -232,5 +232,9 @@ class TheExcessIsAttributedOnOneInstrument(CustomTestCase):
         self.assertIn("RETRACTED", head)
         self.assertIn("weights_draft", head)
         self.assertIn("B4k", head)
-        self.assertIn("PREFLIGHT MEASUREMENT REPLACES THIS", head)
+        # B4k: the successor is NAMED and the expiry is a PREDICTION the next
+        # boot grades, not a re-derivation done by hand here.
+        self.assertIn("REPLACES THIS CONSTANT", head)
+        self.assertIn("B4o", head)
+        self.assertIn("NOT hand-lowered", head)
         self.assertNotIn("UNATTRIBUTED:", head)

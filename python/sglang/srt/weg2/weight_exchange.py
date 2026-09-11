@@ -2380,12 +2380,16 @@ def build_coverage(
 ) -> Dict[str, TagCoverage]:
     """The per-tag arithmetic, over the exchanged tags only.
 
-    An exchanged tag is a WEIGHTS-FAMILY tag: the base tag plus
-    ``weights_<integer>``.  ``weights_draft`` is deliberately not one, so the
-    drafter's bytes are never charged to a family tag's slack and never
-    counted as an uncovered page -- and under a draft region there is no family
-    tag at all, so this returns no rows rather than censusing tags that do not
-    exist in that process.
+    An exchanged tag is whatever ``is_weights_family_tag`` says it is -- the
+    base tag, ``weights_<integer>``, and (#1273 B4k, spec AMENDMENT 6) under the
+    exchange arm ``weights_draft``, because both groups were MEASURED holding
+    the MTP head: 1440/1280/1280 MiB on D's three ranks and 1572 MiB on P's last
+    stage, boot weg2xsn15.  The draft head therefore gets censused, planned,
+    waved and covered like any other tag, with no special case here; under
+    ``ring`` the predicate excludes it and this function's rows are exactly what
+    they were.  A region whose tag is in no family (S8's ``weights_vision``
+    until it is measured) still yields no rows rather than censusing tags that
+    do not exist in that process.
 
     Three refusal populations, not one:
 
@@ -2887,10 +2891,19 @@ def arm_coverage_at_load(
             tag=region_tag, mib=_bytes(region_tag) / MIB, rank=rank, mode=mode
         )
     )
-    if region_tag != GPU_MEMORY_TYPE_WEIGHTS:
-        # This runner's weights are out of the exchanged family by construction
-        # (spec section 4.1).  There is nothing for the exchange to cover here,
-        # and nothing for it to get wrong; the RESIDENT line above is the whole
+    if not is_weights_family_tag(region_tag):
+        # #1273 B4k: THE FAMILY PREDICATE DECIDES, not a literal tag compare.
+        # `region_tag != GPU_MEMORY_TYPE_WEIGHTS` was a SECOND answer to "are
+        # these bytes exchanged" standing beside `is_weights_family_tag`, and
+        # the two disagreed the moment the draft tag joined the family
+        # (AMENDMENT 6): the predicate said yes, this line said no, and the
+        # draft runner would have kept skipping its own census while every
+        # other consumer planned its bytes.  One authority, and it is the
+        # predicate -- which is also why S8's `weights_vision` needs no edit
+        # here when it is measured.
+        #
+        # A runner outside the family has nothing for the exchange to cover and
+        # nothing for it to get wrong; the RESIDENT line above is the whole
         # statement.
         vote = CoverageVote(
             rank=int(rank),

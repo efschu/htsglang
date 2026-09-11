@@ -76,8 +76,8 @@ from sglang.srt.managers.corridor_guard import (
 )
 from sglang.srt.managers.corridor_guard import USER_RESERVE_ENV
 from sglang.srt.managers.weg2_memory_saver import (
-    WEIGHT_CHUNK_PREFIX,
     credit_epoch,
+    is_weights_chunk_tag,
     weights_family_tags,
 )
 from sglang.srt.registry import nvml as nvml_registry
@@ -1242,8 +1242,18 @@ def interleave_pause_order(
     NAMED refusal to reorder (identity), never a partial order.
     """
     tags = list(tags)
-    chunks = [t for t in tags if t.startswith(WEIGHT_CHUNK_PREFIX)]
-    rest = [t for t in tags if not t.startswith(WEIGHT_CHUNK_PREFIX)]
+    # #1273 B4k: THE INTEGER PREDICATE, not the raw prefix.  A CHUNK is a LAYER
+    # BAND and only a band has a card list in ``tag_cards``; the raw
+    # ``startswith("weights_")`` is also True for ``weights_draft`` (and for
+    # S8's planned ``weights_vision``), which is the same defect
+    # ``is_weights_family_tag`` was corrected for one layer up.  Left as the
+    # prefix, the draft tag joining the family would land in ``chunks``, find no
+    # entry in the chunk->card map, and take the ``missing`` branch below -- so
+    # every flip would fall back to the IDENTITY order and lose the
+    # tightest-card-first ordering boot weg2dk4 paid for.  Non-chunk family
+    # members belong in ``rest``, with the base tag still closing the sleep.
+    chunks = [t for t in tags if is_weights_chunk_tag(t)]
+    rest = [t for t in tags if not is_weights_chunk_tag(t)]
     if not tag_cards:
         return tags, "identity: the source has no chunk->card map (uniform/TP source, or no map passed)"
     if not free_mib:

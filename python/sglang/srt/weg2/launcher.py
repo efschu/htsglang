@@ -258,11 +258,31 @@ DC_RESERVE_SLACK_NCCL_MIB = 192
 #: So the whole excess is group D's resident NEXTN/MTP draft tag, which the
 #: exchange never moves because `weights_draft` is out of the weights family,
 #: and which no flip pauses (`in_family=no`, absent from pause_order, ms=-1).
-#: B4k puts the draft head IN the family, and when it lands THIS TRIPLE MUST BE
-#: RE-DERIVED from a boot of that form -- never hand-lowered towards the serving
-#: constants, and never replaced by the serving constants themselves without a
-#: measurement.  A PER-FORM PREFLIGHT MEASUREMENT REPLACES THIS CONSTANT once
-#: B4e's form token lands -- nobody should read this triple as final.
+#:
+#: B4k (spec AMENDMENT 6) puts the draft head IN the family, and THIS TRIPLE IS
+#: THEN EXPECTED TO EXPIRE RATHER THAN MOVE.  The prediction, stated here so the
+#: next boot GRADES it instead of re-deriving it by hand -- exchange-form
+#: reading minus the measured resident draft tag:
+#:
+#:     5090   3084 - 1440 = 1644   against the serving form's census 1668 (-24)
+#:     3080   2588 - 1280 = 1308   against                        1334 (-26)
+#:
+#: i.e. the exchange form's dormant residue should fall to the SERVING form's
+#: own reading, which is already BELOW the serving constants
+#: (`DC_MEASURED_D_5090_MIB` 2228 + 64 slack = 2292; 1922 + 64 = 1986).  If the
+#: B4k boot confirms that, this triple has no reason left to exist and W19 can
+#: grade the exchange arm against the serving constants again -- which is a
+#: RETIREMENT, decided by that measurement and not here.
+#:
+#: UNTIL THEN IT STAYS, deliberately, and it is NOT hand-lowered: it
+#: OVER-reserves, which is the safe direction under the host-threshold law, and
+#: the cost of being wrong the other way is a W19 refusal at epoch 0 (three
+#: boots have paid it).  The price of keeping it is named rather than hidden:
+#: group P's budget loses 666 MiB per 3080 and 856 MiB on the 5090 for residency
+#: that B4k removes.  A PER-FORM MEASURED RECORD REPLACES THIS CONSTANT
+#: WHOLESALE (AMENDMENT 7 item 2 = B4o, keyed on B4e's form token) -- nobody
+#: should read this triple as final, and nobody should re-derive a second
+#: constant that B4o then deletes.
 DC_MEASURED_D_XCHG_MIB = (2588, 3084, 2588)
 DC_MEASURED_D_XCHG_3080_MIB = DC_MEASURED_D_XCHG_MIB[0]
 DC_MEASURED_D_XCHG_5090_MIB = DC_MEASURED_D_XCHG_MIB[1]
