@@ -61,10 +61,18 @@ WHAT THIS RUNNER REFUSES TO DO SILENTLY
    failure set is not a pass.
 
 5. **Hand an UNRECORDED failure to the reader unclassified** (#895).  Check 3
-   is one-way: it asks only whether a recorded failure came back.  On this tree
-   every recorded failure belongs to an EXCLUDED module, so check 3 can never
-   fire at the desk and EVERY desk failure is unrecorded.  Such a failure has
-   two possible causes, and they are not the same finding:
+   is one-way: it asks only whether a recorded failure came back.  It was once
+   true that every recorded failure belonged to an EXCLUDED module, so that
+   check 3 could never fire at the desk and EVERY desk failure was unrecorded.
+   THAT PRECONDITION HAS EXPIRED (#1347): of the four modules carrying
+   ``ref_failures``, three are EXCLUDED but
+   ``test/registered/unit/mem_cache/test_acceptance_emitters_758.py`` is
+   **PARALLEL** -- it runs at the desk and brings two recorded
+   ``RefillTiming`` failures with it.  Those two are therefore NOT adjudicated,
+   which is correct, but until #1347 they also carried no printed class; they
+   now leave the run under ``RECORDED`` (see the block near the re-run loop).
+   An UNRECORDED failure has two possible causes, and they are not the same
+   finding:
 
      * the product is broken -- the ordinary red, and the reason for the gate;
      * the failure needs company.  In a lane with workers that is crowding --
@@ -551,6 +559,40 @@ def main() -> int:
     for lane_name, mods_ in (("wide", wide), ("narrow", narrow), ("serial", serial)):
         for m in mods_:
             lane_of[m] = lane_name
+    # #1347 (D): THE RECORDED-AND-RAN CLASS, REPORTED AND NOT A FOOTNOTE.
+    #
+    # `union - recorded` below is what gets adjudicated, so a failure that IS
+    # recorded never reaches a solo re-run and never reaches a verdict class --
+    # it is printed in the failure set above and then carries no class at all.
+    # Boot-gate reader weg2xsn19 hit exactly that: the two
+    # `test_acceptance_emitters_758.py::RefillTiming` names sat in a 246-name
+    # failure set while the summary counted 240 genuine + 4 inconclusive, and
+    # the two were in NEITHER. A diff taken against the GENUINE list instead of
+    # the failure set would have read them as NEW the moment they surfaced on
+    # the other side -- a false regression verdict out of a bookkeeping gap.
+    #
+    # This is item 5 of this module's own docstring turned on its head: that one
+    # forbids handing an UNRECORDED failure to the reader unclassified, and the
+    # leak was an unclassified RECORDED one. Same rule, other axis.
+    #
+    # DELIBERATELY REPORT-ONLY: `rc` is untouched, the adjudication set is
+    # untouched, and these names stay in `union` exactly as before. A recorded
+    # failure is pre-existing DEBT, not this run's finding -- but it must leave
+    # the run with a NAME for its class, like EXCLUDED and DEMOTED do.
+    recorded_here = sorted(recorded & union)
+    if recorded_here:
+        print("\n=== RECORDED (pre-existing in the table, NOT re-run) ===")
+        print("  Already failing when this module's row was proved, so there is")
+        print("  nothing for a solo re-run to decide: these are not this run's")
+        print("  finding and not a regression. They ARE part of the failure set")
+        print("  above -- diff against THAT set, never against the genuine list,")
+        print("  or a pre-existing failure reads as NEW on the other side.")
+        for name in recorded_here:
+            print(f"  RECORDED  {name}")
+            print(f"            in ref_failures of {module_of(name)}")
+        print(f"  ({len(recorded_here)} recorded failure(s) in "
+              f"{len({module_of(n) for n in recorded_here})} module(s) that ran)")
+
     unrecorded = sorted(union - recorded)
     not_reproduced: list[str] = []
     if unrecorded:
