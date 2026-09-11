@@ -101,9 +101,12 @@ __all__ = [
     "EXEMPT_REASON",
     "is_zerofill_by_design",
     "COVER_LINE_PREFIX",
+    "PLAN_PARAM_LINE_PREFIX",
+    "plan_param_lines",
     "CoverageVote",
     "FLAT",
     "GroupLayout",
+    "INJECT_MODE_UNSET",
     "LiveTensor",
     "MIB",
     "NO_PLAN_REASON",
@@ -146,6 +149,7 @@ __all__ = [
     "device_block_offsets",
     "emit_plan_line",
     "exchange_armed",
+    "bounce_lane_armed",
     "piece_histogram",
     "plan_id",
     "plan_provider",
@@ -1837,6 +1841,15 @@ INJECT_ENV = "SGLANG_WEG2_XCHG_INJECT"
 INJECT_SHADOW = "shadow"
 INJECT_AUTHORITATIVE = "authoritative"
 INJECT_CHOICES = (INJECT_SHADOW, INJECT_AUTHORITATIVE)
+#: The NAMED third state for an instrument that has no recorded mode -- #1336.
+#: NOT a choice `inject_mode()` can return and never a mode a leg can run: it
+#: exists so a log line whose mode was never recorded says so, instead of
+#: printing one of the two real modes.  The direction matters and is the whole
+#: reason this constant exists rather than a bare literal: the site that needed
+#: it printed `authoritative` for an absent value, i.e. it claimed ownership of
+#: 27 GiB of weights on missing evidence, which is exactly the direction the
+#: block above says a typo may not take.
+INJECT_MODE_UNSET = "unset"
 
 
 def inject_mode() -> str:
@@ -1864,10 +1877,27 @@ def inject_authoritative() -> bool:
 def exchange_armed() -> bool:
     """Does the EXCHANGE own the weight bytes?  False under ``shadow``.
 
-    The one predicate that decides ``enable_cpu_backup`` and therefore whether
-    ``pause`` is a pure unmap.  Under ``shadow`` the answer is no -- the ring
-    is authoritative -- and reading it as yes there would delete the very
-    ground truth the shadow compares against.
+    What it decides: the weights-region TAG (:func:`weights_region_tag_for`)
+    and the draft tag's family membership
+    (``weg2_memory_saver.draft_tag_in_family``).  Under ``shadow`` the answer
+    is no -- the ring is authoritative -- and reading it as yes there would
+    delete the very ground truth the shadow compares against.
+
+    IT DOES NOT DECIDE ``enable_cpu_backup``, and this docstring said it did
+    until #1273 B4q measured otherwise.  That flag is decided at
+    ``model_runner.py:2440`` from ``server_args.enable_weights_cpu_backup``
+    (plus the draft-worker variant), and the weg2 launcher passes
+    ``--enable-weights-cpu-backup`` UNCONDITIONALLY in ``common_flags``
+    (``launcher.py:2605``) -- both groups, every arm.  The distinction is
+    load-bearing for the whole S6 axis: it is why widening the LEG gate to
+    both arms cannot delete the shadow's compare ground, and the stale claim
+    is exactly what makes a reader believe it can.  Pinned by
+    ``test_weg2_xchg_gate_axis_1273.py`` so the correction cannot rot back.
+
+    IT ALSO DOES NOT DECIDE WHETHER THE LEGS RUN -- that is
+    :func:`bounce_lane_armed`, and conflating the two is the defect boot
+    weg2xsn16 measured (0 ``WEG2-XCHG-INJECT`` lines while 48 group fences
+    ran).
     """
     return weight_source() == WEIGHT_SOURCE_EXCHANGE
 
@@ -1875,6 +1905,44 @@ def exchange_armed() -> bool:
 def shadow_armed() -> bool:
     """Does the shadow run beside the ring?  Never implies :func:`exchange_armed`."""
     return weight_source() == WEIGHT_SOURCE_SHADOW
+
+
+def bounce_lane_armed() -> bool:
+    """IS THE BOUNCE LANE ARMED AT ALL?  The S6 AXIS, and nothing else.
+
+    #1273 B4q.  ``weight_source()`` is THREE-VALUED
+    (``{ring|exchange|shadow}``), so :func:`exchange_armed` and
+    :func:`shadow_armed` are mutually exclusive -- and both leg gates read
+    ONE of them while the S6I order arms the OTHER.  Boot weg2xsn16 is that
+    defect measured: ARGV ``--weg2-weight-source exchange`` with
+    ``SGLANG_WEG2_XCHG_INJECT=shadow``, the flip path executing (48
+    ``WEG2-GROUP-FENCE`` on D), and ZERO ``WEG2-XCHG-INJECT`` /
+    ``-SHADOW`` / ``-PLAN`` / ``-AGREED`` / ``-BOUNCE-LEG`` lines on either
+    group, because ``shadow_armed()`` is False by construction on the
+    ``exchange`` arm.  Fourth instance in this lane of "published, read,
+    never acted upon".
+
+    THREE QUESTIONS, THREE PREDICATES, and keeping them apart is the whole
+    point of adding a third rather than widening one of the two:
+
+    * DOES THE LANE RUN -- this function.  ``ring`` says no and stays byte
+      for byte today's boot; ``exchange`` and ``shadow`` both say yes.
+    * WHOSE BYTES ARE THEY -- :func:`exchange_armed`, which owns the tag and
+      the family membership, i.e. whether the shadow still HAS a ground
+      truth to compare against.
+    * IS THE INJECTION THE AUTHORITY -- :func:`inject_authoritative`, read
+      at ``weight_updater.py:852`` as ``exchange_armed() and
+      inject_authoritative()``.  Authority does NOT move here: a widened leg
+      gate that also granted authority would take ``host weights`` from
+      42.96 to 0.00 GiB, which is B7's acceptance and not this slice's.
+
+    Spelled as ``!= WEIGHT_SOURCE_RING`` rather than as
+    ``exchange_armed() or shadow_armed()`` deliberately: the two are
+    equivalent today only because the flag has exactly three values, and the
+    disjunction would silently stop covering a fourth arm the day one is
+    added, while the negation keeps meaning "not the untouched default".
+    """
+    return weight_source() != WEIGHT_SOURCE_RING
 
 
 @contextmanager
@@ -2128,6 +2196,10 @@ def roll_forward_refusal_message() -> str:
 # ===========================================================================
 
 COVER_LINE_PREFIX = "WEG2-XCHG-COVER"
+#: #1273 B4r: one line per PLANNED PARAMETER of a tag, with the tag its LIVE
+#: tensor actually carries.  The decisive instrument for a plan that claims
+#: bytes its tag does not hold -- see :func:`plan_param_lines`.
+PLAN_PARAM_LINE_PREFIX = "WEG2-XCHG-PLAN-PARAM"
 COVERAGE_REFUSAL_MARKER = "W84 Weg2XchgCoverageRefused"
 
 #: MINIMAL INTERFACE, TODO(S1, branch weg2/xchg-s1-0908): the plan half of this
@@ -2367,6 +2439,86 @@ def walk_live_tensors(
                 continue
             _add(_join(module_path, attr), value, ATTRIBUTE, module_path)
     return out
+
+
+def plan_param_lines(
+    model: torch.nn.Module,
+    *,
+    rank: int,
+    tag: str,
+    planned_bytes_by_tag: PlanBytes,
+    region_tag: str = GPU_MEMORY_TYPE_WEIGHTS,
+) -> List[str]:
+    """#1273 B4r: the PLAN's per-parameter claim against WHERE THAT PARAMETER
+    ACTUALLY LIVES.  One line per planned parameter of ``tag``.
+
+    THE FINDING THIS ANSWERS, and it is a finding nothing currently refuses.
+    Boot weg2xsn16 printed ``slack_mib`` NEGATIVE on ``weights_draft`` --
+    -107.7 / -115.4 / -115.2 / -110.9 -- with ``uncovered=0 short=0
+    missing=0`` and ``tms_answered=yes`` (``tms_mib`` 1280/1440/1572).  Both
+    terms measure their own population correctly and :attr:`slack_bytes` is
+    "PRINTED, NEVER COMPARED FOR EQUALITY" by design, so nothing gates it and
+    the boot passed that half.  A negative slack means the PLAN CLAIMS MORE
+    BYTES THAN THE TAG HOLDS, which is the one direction that cannot be
+    allocator overhang.
+
+    THE NAMED HYPOTHESIS, not a diagnosis: a tied or shared embedding counted
+    into the draft plan while physically living in the target's ``weights``
+    tag.  The arithmetic that suggests it is per-parameter density --
+    ``params=20`` for 1331-1619 MiB is ~66 MiB/parameter, against
+    ``params=114`` for 515 MiB on ``weights_0``.  A single embedding-sized
+    tensor claimed by the draft plan and resident under another tag would
+    produce exactly this shape.
+
+    SO THIS FUNCTION DOES NOT JUDGE -- it DUMPS, and the next boot answers the
+    question for free.  Per planned parameter: the bytes the plan claims, the
+    tag the live tensor of that name actually carries
+    (:func:`tag_of_parameter_name`, the same authority the coverage walk uses,
+    so the two cannot disagree), that tensor's own size, and a ``verdict``
+    token that says which of the three states it is in:
+
+    * ``here``      -- the live tensor carries THIS tag.  The normal case.
+    * ``elsewhere`` -- it lives under a DIFFERENT tag, and the plan is
+      claiming bytes another tag holds.  This is the hypothesis, confirmed by
+      name and by tag when it appears.
+    * ``absent``    -- no live parameter of that name at all.  Already
+      counted as ``missing`` on the cover line; repeated here so one line
+      shape carries the whole population.
+
+    WHY IT IS WORTH A LINE PER PARAMETER: the population is 20 on the tag in
+    question.  A summary would have to choose an aggregate before anybody
+    knows which one answers the question, and an aggregate chosen before the
+    finding is understood is how this campaign has lost boots before.
+
+    A PRECONDITION FOR B7, stated because it is the reason this is not merely
+    diagnostics: today NOTHING refuses a plan that claims more bytes than its
+    tag holds.  Under ``authoritative`` such a plan would fill live weight
+    pages from a claim no tensor backs.  This instrument is what makes the
+    refusal derivable from a boot log rather than from a second campaign.
+    """
+    planned = dict((planned_bytes_by_tag or {}).get(tag, {}) or {})
+    live: Dict[str, LiveTensor] = {}
+    for tensor in walk_live_tensors(model, region_tag=region_tag):
+        if tensor.kind == PARAMETER:
+            live.setdefault(tensor.name, tensor)
+    lines: List[str] = []
+    for name in sorted(planned):
+        claim = int(planned[name] or 0)
+        found = live.get(name)
+        if found is None:
+            verdict, live_tag, live_mib, dtype, shape = "absent", "-", 0.0, "-", []
+        else:
+            live_tag = found.tag or "-"
+            verdict = "here" if found.tag == tag else "elsewhere"
+            live_mib = found.nbytes / MIB
+            dtype, shape = found.dtype, list(found.shape)
+        lines.append(
+            f"{PLAN_PARAM_LINE_PREFIX} rank={int(rank)} tag={tag} "
+            f"name={name} planned_mib={claim / MIB:.3f} "
+            f"live_tag={live_tag} live_mib={live_mib:.3f} "
+            f"dtype={dtype} shape={shape} verdict={verdict}"
+        )
+    return lines
 
 
 def build_coverage(
@@ -2636,6 +2788,17 @@ def arm_coverage(
         # only caller.  One line per tensor here makes the classification a
         # ONE-BOOT deliverable, whatever the verdict downstream turns out to be.
         for ln in rows[tag].uncovered_lines():
+            emit(ln)
+        # #1273 B4r: and the PLAN's own per-parameter claim beside the tag
+        # that actually holds each one.  Emitted for every tag, not only the
+        # one whose slack went negative on weg2xsn16: a per-tag instrument
+        # that fires only where the symptom was already seen cannot tell a
+        # tag-specific defect from a general one, and the whole question here
+        # is whether the draft tag is special.
+        for ln in plan_param_lines(
+            model, rank=rank, tag=tag,
+            planned_bytes_by_tag=planned_bytes_by_tag, region_tag=region_tag,
+        ):
             emit(ln)
     ok = all(rows[tag].ok for tag in rows)
     return CoverageVote(

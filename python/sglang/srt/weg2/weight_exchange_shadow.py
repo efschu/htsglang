@@ -3735,6 +3735,29 @@ def shadow_armed() -> bool:
     return bool(wxm.shadow_armed())
 
 
+def bounce_lane_armed() -> bool:
+    """Is the bounce lane armed AT ALL -- ``exchange`` OR ``shadow``?
+
+    #1273 B4q, and THE ONE GATE ON BOTH HOOKS is now this rather than
+    :func:`shadow_armed`.  The two arms are mutually exclusive readings of a
+    three-valued flag, so a hook gated on one of them is dead whenever the
+    boot arms the other -- which is boot weg2xsn16 exactly: the ``exchange``
+    arm ran 48 group fences on D and emitted zero leg lines.  ``ring`` still
+    answers False here, so the default boot stays byte for byte today's and
+    ``test_the_hooks_are_never_reached_on_the_ring_arm`` still proves it with
+    its tripwire.
+
+    Same delegation shape as :func:`shadow_armed` above and for the same
+    reason: ``weight_exchange.bounce_lane_armed`` is the OWNER and this only
+    forwards.  Re-spelling the comparison here would be the second copy of a
+    predicate the UPSTREAM-MINIMAL law refuses -- and this module has already
+    paid for that once, which is what the comment above records.
+    """
+    from sglang.srt.weg2 import weight_exchange as wxm
+
+    return bool(wxm.bounce_lane_armed())
+
+
 def publish_no_vote(leg: ShadowLeg, *, reason: str,
                     classes_hash: int = 0, need_mib: int = 0) -> bool:
     """Publish this rank's NO before returning, when the region is already open.
@@ -3887,7 +3910,15 @@ def run_leg_hook(
     hidden cost.
     """
     if armed is None:
-        armed = shadow_armed()
+        # #1273 B4q: the AXIS, not the S5 arm.  `shadow_armed()` here made the
+        # hook dead on the `exchange` arm the S6I order actually launches
+        # (boot weg2xsn16: 0 leg lines against 48 group fences).  `armed` is
+        # still an explicit override for the tests that drive one leg without
+        # an environment -- and note that the override is WHY the desk suite
+        # was green through the defect, so the red-first test for this fix
+        # goes through the PRODUCTION path (`_weg2_shadow_hook`) and does not
+        # pass `armed`.
+        armed = bounce_lane_armed()
     if not armed:
         return None
     started = time.perf_counter()

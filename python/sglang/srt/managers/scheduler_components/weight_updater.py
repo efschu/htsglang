@@ -1971,11 +1971,14 @@ class SchedulerWeightUpdaterManager:
                           ring_ms=None) -> None:
         """Run one leg's shadow, or return having touched nothing.
 
-        THE ARM IS CHECKED FIRST AND CHEAPLY.  ``shadow_armed()`` reads
+        THE ARM IS CHECKED FIRST AND CHEAPLY.  ``bounce_lane_armed()`` reads
         ``--weg2-weight-source``; on ``ring`` -- the default and every boot that
         has run to date -- it is False and this method returns after ONE module
         import, before a device call, an allocation, an env write or a single
-        line of the exchange's machinery.  That is what keeps the default leg
+        line of the exchange's machinery.  (It read ``shadow_armed()`` until
+        #1273 B4q; that is one READING of a three-valued flag and it was not
+        the one the S6I order arms, so the hook was dead on the `exchange`
+        arm by construction -- boot weg2xsn16.)  That is what keeps the default leg
         byte-identical, and it is what
         ``test_the_hooks_are_never_reached_on_the_ring_arm`` proves with a
         tripwire on every door out of the arm check.
@@ -1990,7 +1993,15 @@ class SchedulerWeightUpdaterManager:
         try:
             from sglang.srt.weg2 import weight_exchange_shadow as sh
 
-            if not sh.shadow_armed():
+            # #1273 B4q: THE AXIS, not the S5 arm.  `shadow_armed()` reads
+            # `weight_source() == "shadow"`, and the S6I order launches
+            # `--weg2-weight-source exchange` with
+            # `SGLANG_WEG2_XCHG_INJECT=shadow` -- mutually exclusive readings
+            # of a three-valued flag, so this `return` fired on every leg of
+            # boot weg2xsn16 while the flip path itself ran (48
+            # `WEG2-GROUP-FENCE` on D, 0 `WEG2-XCHG-INJECT`).  `ring` still
+            # returns here, which is what keeps the default leg byte-identical.
+            if not sh.bounce_lane_armed():
                 return
             from sglang.srt.weg2 import weight_exchange_region as xr
 
