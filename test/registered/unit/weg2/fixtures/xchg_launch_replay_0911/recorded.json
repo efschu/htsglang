@@ -4,7 +4,7 @@
     "xsn13": "/spinning/gpu-arb/weg2/BOOT_weg2xsn13_0911.md (48f55fb393, STOP at the dry-run, no card touched)",
     "xsn14": "/spinning/evidence-665-f1/boot_weg2_weg2xsn14_692b1e8698_0911_050756.front.log + BOOT_weg2xsn14_0911.md (692b1e8698, FAIL on two walls)",
     "xsn15": "/spinning/evidence-665-f1/boot_weg2_weg2xsn15_dfceb7004e_0911_061045.front.log + BOOT_weg2xsn15_0911.md (dfceb7004e, W19 genuine 0)",
-    "ring_source_boot": "/spinning/evidence-665-f1/boot_weg2_weg2sn5b_d8ea6261f7_0909_185632.{front,P,D}.log -- the ring table's own source boot; ring_evidence/ holds ONLY the lines ring_table.solve parses out of them (WEG2-CHUNK-BYTES, WEG2-FLIP-TAG, KV Cache is allocated, the NVML->CUDA ordinal map, group P argv, WEG2-HOST-LEDGER CHOSEN, WEG2-CORRIDOR), plus the newest-per-group weg2sn5b samples of the host-ledger sidecar. 151 KB instead of 48 MB, and PROVEN equivalent: ring_table.solve returns byte-identical totals from this directory and from the full evidence dir."
+    "ring_source_boot": "/spinning/evidence-665-f1/boot_weg2_weg2sn5b_d8ea6261f7_0909_185632.{front,P,D}.log -- the ring table's own source boot; ring_evidence/ holds ONLY the lines ring_table.solve parses out of them (WEG2-CHUNK-BYTES, WEG2-FLIP-TAG, KV Cache is allocated, the NVML->CUDA ordinal map, group P argv, WEG2-HOST-LEDGER CHOSEN, WEG2-CORRIDOR), plus the newest-per-group weg2sn5b samples of the host-ledger sidecar. 166 KB instead of 48 MB, and PROVEN equivalent: ring_table.solve returns byte-identical totals from this directory and from the full evidence dir."
   },
   "cards_ordinal_order": [
     {

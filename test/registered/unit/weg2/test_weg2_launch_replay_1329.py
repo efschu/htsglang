@@ -28,12 +28,12 @@ against RECORDED inputs, hermetically, with no boot, no NVML and no CUDA,
 and each of the three walls FIRES here on the inputs of the boot that hit
 it while the fixed tip is GREEN.
 
-THE FIXTURE (``fixtures/xchg_launch_replay_0911/``), 151 KB, every number
+THE FIXTURE (``fixtures/xchg_launch_replay_0911/``), 166 KB, every number
 sourced in ``recorded.json``:
 
 * ``ring_evidence/`` -- ONLY the lines ``ring_table.solve`` parses out of the
   ring source boot's three logs, plus that boot's own samples from the
-  host-ledger sidecar.  48 MB of logs reduced to 151 KB, and the reduction
+  host-ledger sidecar.  48 MB of logs reduced to 166 KB, and the reduction
   is PROVEN lossless rather than assumed: ``solve`` returns byte-identical
   totals from this directory and from ``/spinning/evidence-665-f1``
   (:meth:`TestTheFixtureIsFaithful.test_the_extract_equals_the_full_evidence_dir`,
