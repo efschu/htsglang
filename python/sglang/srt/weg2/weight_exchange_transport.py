@@ -1597,7 +1597,8 @@ def deposit_refusal_reason(*, batches: int, slots: int, slot_bytes: int,
       :data:`DIR_ONCARD_ROWS` once for both processes.
     * ``unfunded``: the deposit is pinned host memory for the span of a flip.
       ``budget_bytes`` is what the #1269 host ledger CHARGED for this arm
-      (:func:`sglang.srt.weg2.host_ledger.xchg_bounce_bytes_per_card`); bytes
+      (:func:`sglang.srt.weg2.xchg_bounce.staging_bytes_per_card`, reaching a
+      rank through ``weight_updater._weg2_shadow_host_budget``); bytes
       above it are host bytes no term carries, and the reap mark is a hard
       bound (``host-schwelle-nie-uebertreten``), never a risk to accept.  A
       ``budget_bytes`` of 0 is "no ledger answer reached this rank" and refuses
@@ -2407,33 +2408,32 @@ class OnCardBounce:
         self.ops.raw_free(self.ptr)
 
 
-def diagonal_carrier_bytes(*, slot_bytes: int) -> int:
-    """The per-card diagonal carrier's size: ``SLOTS_PER_PAIR x slot_bytes``. #1334.
-
-    SIZED FROM THE ONE PUBLISHED SLOT, which is plan AMENDMENT 5's ruling in a
-    function: ``--weg2-xchg-oncard-slot-mib`` (flag default 128) is the value
-    the ARM line charges as staging (``N_CARDS x SLOTS_PER_PAIR x slot``), so
-    the carrier is the per-card share of exactly that term. Boot weg2xsn9
-    printed `slot_mib=128` on the ledger line while its leg planned a 32 MiB
-    slot -- one payload must not have two sizes, and the published one wins
-    because it is the one that was charged.
-
-    NEVER SIZED UP. A plan needing more than :data:`xr.SLOTS_PER_PAIR` batches
-    is refused by name (:data:`DEPOSIT_REASON_BATCHES`) rather than served by a
-    bigger file: the deposit's precondition is one slot per batch, and growing
-    the file to fit would make that precondition depend on a number nobody
-    charged for.
-    """
-    validated = validate_oncard_slot_mib(int(slot_bytes) // xr.MIB)
-    if validated * xr.MIB != int(slot_bytes):
-        raise Weg2XchgOncardSlotRefused(
-            f"slot_bytes={int(slot_bytes)} is not a whole number of MiB; the "
-            f"published slot is a MiB value (--weg2-xchg-oncard-slot-mib) and "
-            f"the carrier is SLOTS_PER_PAIR x it, so a byte count that does "
-            f"not round-trip would size the file from a different number than "
-            f"the ledger charged"
-        )
-    return int(xr.SLOTS_PER_PAIR) * validated * xr.MIB
+# DELETED HERE, #1333: ``diagonal_carrier_bytes(slot_bytes=)``.  It returned
+# ``SLOTS_PER_PAIR x slot`` -- the number ``xchg_bounce.staging_bytes_per_card``
+# already owns and the launcher already charges -- from a SECOND module off a
+# SECOND ``SLOTS_PER_PAIR`` literal, with ZERO production call sites.  Two
+# reasons it is a deletion and not a repair:
+#
+#   * IT NAMED A SIZE NOTHING GUARANTEES.  It called itself "the per-card
+#     carrier's size", while the carrier this module allocates is
+#     ``plan.slots x plan.slot_bytes`` (``HostBounce.__init__``, reached at
+#     :3187/:3295 with ``diag_slots`` from ``require_oncard_slots``, bounded by
+#     ``ONCARD_SLOTS_MAX = 8``), and under store-and-forward ``plan.slots`` IS
+#     ``batches``, returned UNCLAMPED on purpose so
+#     :func:`deposit_refusal_reason` can name it.  So it was restating the
+#     CHARGE while claiming to size the CARRIER -- the same one-payload-two-
+#     sizes shape plan AMENDMENT 5 deleted ``host_ledger.xchg_bounce_bytes``
+#     and ``...bytes_per_card`` for; this one survived that cleanup as a
+#     leftover.
+#   * ITS MiB ROUND-TRIP GUARD WAS ALREADY PAID FOR UPSTREAM OF IT.  The one
+#     slot that reaches the charge is ``ONCARD_SLOT_BYTES_MAX``, which is
+#     ``validate_oncard_slot_mib(raw) * MIB`` by construction (:221), and the
+#     launcher validates the flag at three sites, so no non-MiB byte count can
+#     reach the arithmetic for the guard to catch.
+#
+# Pinned by ``test_weg2_xchg_carrier_one_authority_1333.py`` -- as an ABSENCE,
+# plus an AST ratchet with an allowlist of two (the owner, and the
+# ``BounceTerms`` container that is ``pairs x`` it).
 
 
 def oncard_host_path(boot_nonce: str, card: int, shm_root: str = xr.SHM_ROOT) -> str:
@@ -2449,8 +2449,9 @@ def oncard_host_path(boot_nonce: str, card: int, shm_root: str = xr.SHM_ROOT) ->
 
     CLOSED BY THE BOUNCE TERM, and the CEILING it used to be charged at is
     RETIRED (plan AMENDMENT 5, 2026-09-11).  The host bytes of this file are
-    ``SLOTS_PER_PAIR x the PUBLISHED slot`` -- see
-    :func:`diagonal_carrier_bytes` -- and the ledger charges the group-wide sum
+    ``SLOTS_PER_PAIR x the PUBLISHED slot`` -- owned by
+    :func:`sglang.srt.weg2.xchg_bounce.staging_bytes_per_card`, the ONE place
+    that arithmetic lives (#1333) -- and the ledger charges the group-wide sum
     of exactly that as the bounce's staging half
     (``N_CARDS x SLOTS_PER_PAIR x slot_bytes``, printed on the ARM line as
     ``path_a_staging_mib`` beside ``xchg_bounce``).  The old yardstick

@@ -263,9 +263,22 @@ def staging_bytes_per_card(slot_bytes: int) -> int:
     (``ONCARD_SLOTS_MAX 8 x ONCARD_SLOT_BYTES_MAX``) -- while the ledger
     charged this, so the two disagreed by 4x on the same payload.  That
     ceiling is retired by design: the diagonal store-and-forward IS path (a)'s
-    staging for the co-located pairs, and a plan needing more than
-    ``SLOTS_PER_PAIR`` batches per leg is refused BY NAME
-    (``DEPOSIT_REASON_BATCHES``), never sized up.
+    staging for the co-located pairs.
+
+    THE DEPOSIT IS NEVER SIZED UP, AND THIS TERM IS THE LEVER THAT SAYS SO --
+    ``DEPOSIT_REASON_UNFUNDED``, not ``DEPOSIT_REASON_BATCHES`` (#1333).  The
+    sentence standing here until then named the wrong refusal, and the
+    difference is not cosmetic because the two words point at different knobs.
+    ``weight_exchange_transport.deposit_refusal_reason`` grades ``batches``
+    against ``slots_max``, whose default is ``ONCARD_SLOTS_MAX`` (8) and which
+    the ONE production caller (``weight_exchange_shadow``'s leg planner) does
+    not pass -- that is the transport's ROW AREA, sized once for both processes.
+    A plan needing three batches at the published slot therefore fails on THIS
+    number: ``slots x slot_bytes > budget_bytes``.  Sending a reader to
+    ``ONCARD_SLOTS_MAX`` would send them to a knob that is not binding here.
+    Measured at the desk (#1333): the only test that read ``BATCHES`` for a
+    3-batch plan passed ``slots_max=SLOTS_PER_PAIR`` explicitly, a value no
+    product call site supplies.
 
     ``slot_bytes`` is the LAUNCHER'S PUBLISHED VALUE
     (``--weg2-xchg-oncard-slot-mib``, reaching a rank as
