@@ -417,27 +417,24 @@ def uuid_of_card(env: Optional[str] = None) -> Tuple[str, ...]:
     raw = os.environ.get("CUDA_VISIBLE_DEVICES") if env is None else env
     source = "the environment" if env is None else "the injected string"
     if raw is None or not str(raw).strip():
+        # SHORT BY DESIGN (#1335): this message travels as ONE field of a leg
+        # line through `exc_note`, whose budget a paragraph would spend --
+        # dropping the ` @ file:line` the note exists for. Code, reason and
+        # WHAT WAS READ; the rationale lives in this class's docstring.
         raise Weg2XchgCardUuidMapUnusable(
-            f"W23 Weg2XchgCardUuidMapUnusable reason=unset: the card->uuid "
-            f"map is unset or blank in {source} ({raw!r}). The launcher sets "
-            f"it for every rank of both groups as the comma-joined card uuids "
-            f"in card order; a rank that cannot read it cannot label or "
-            f"identify its cards and must refuse rather than index a map it "
-            f"does not have"
+            f"W23 Weg2XchgCardUuidMapUnusable reason=unset src={source} "
+            f"read={raw!r}"
         )
     entries = [part.strip() for part in str(raw).split(",")]
     if len(entries) != N_CARDS:
         raise Weg2XchgCardUuidMapUnusable(
-            f"W23 Weg2XchgCardUuidMapUnusable reason=count: {source} holds "
-            f"{len(entries)} entr{'y' if len(entries) == 1 else 'ies'} "
-            f"({raw!r}) but this rig has N_CARDS={N_CARDS}. The index into "
-            f"this map IS the card ordinal, so a padded or truncated map "
-            f"would point at the wrong card silently"
+            f"W23 Weg2XchgCardUuidMapUnusable reason=count src={source} "
+            f"got={len(entries)} want={N_CARDS} read={raw!r}"
         )
     if any(not e for e in entries):
         raise Weg2XchgCardUuidMapUnusable(
-            f"W23 Weg2XchgCardUuidMapUnusable reason=blank: {source} has an "
-            f"empty entry ({raw!r}); an empty uuid is not a card"
+            f"W23 Weg2XchgCardUuidMapUnusable reason=blank src={source} "
+            f"read={raw!r}"
         )
     return tuple(entries)
 
@@ -462,24 +459,15 @@ def require_card_uuid_map(
     needed = max([int(c) for c in cards], default=N_CARDS - 1) + 1
     if len(entries) < needed or any(not e for e in entries):
         raise Weg2XchgCardUuidMapUnusable(
-            f"W23 Weg2XchgCardUuidMapUnusable reason=count rank={int(rank)}: "
-            f"this leg labels cards {tuple(int(c) for c in cards) or 'all'} "
-            f"and needs {needed} entr{'y' if needed == 1 else 'ies'}, but the "
-            f"map it was handed is {entries!r}. The map's only consumer is the "
-            f"PairStats src_uuid/dst_uuid label of the per-pair acceptance "
-            f"line; an unusable label is refused here, at the door, so it can "
-            f"never abort a payload that has already started"
+            f"W23 Weg2XchgCardUuidMapUnusable reason=count rank={int(rank)} "
+            f"cards={tuple(int(c) for c in cards)} need={needed} "
+            f"map={entries!r} -- the PairStats label, refused at the door"
         )
     mine = entries[int(rank)]
     if mine != str(card_uuid):
         raise Weg2XchgCardUuidMapUnusable(
             f"W23 Weg2XchgCardUuidMapUnusable reason=disagrees "
-            f"rank={int(rank)}: the card->uuid map says this rank's card is "
-            f"{mine!r}, NVML told the adapter it is {str(card_uuid)!r}. The "
-            f"region's card ordering and the adapter's card identity are "
-            f"naming different cards, so a leg that proceeded would price and "
-            f"label another rank's card. Two halves that disagree STOP; "
-            f"nothing here compensates"
+            f"rank={int(rank)} map_says={mine!r} nvml_says={str(card_uuid)!r}"
         )
     return entries
 

@@ -2610,9 +2610,21 @@ def exc_note(exc: BaseException, *, limit: int = 160) -> str:
         if frames:
             last = frames[-1]
             site = f" @ {last.filename.rsplit('/', 1)[-1]}:{last.lineno}"
-        note = f"{type(exc).__name__}: {msg}{site}" if msg else (
-            f"{type(exc).__name__}{site}")
-        return note[:int(limit)]
+        # THE SITE SURVIVES TRUNCATION, and that is not cosmetic. #1335,
+        # measured on boot weg2xsn11: `W23 Weg2XchgCardUuidMapUnusable`'s
+        # message is longer than `limit`, so a tail-truncated note dropped the
+        # ` @ file:line` it exists to carry -- the one fact a type cannot
+        # carry, silently removed by a long explanation. The site is reserved
+        # FIRST and the message is trimmed into what remains, so a verbose
+        # refusal can crowd out its own prose but never its own location.
+        head = f"{type(exc).__name__}: " if msg else f"{type(exc).__name__}"
+        room = int(limit) - len(head) - len(site)
+        if room < 0:
+            return f"{head}{site}"[:int(limit)]
+        # `rstrip` because a cut that lands on a space would put TWO before
+        # the site, which this module's own bounded-and-single-line test pins
+        # (and which caught exactly this while the change was being made).
+        return f"{head}{msg[:room].rstrip()}{site}"
     except BaseException:  # noqa: BLE001 -- never replace the finding
         return type(exc).__name__
 
@@ -4128,7 +4140,14 @@ def run_leg_hook(
         raise
     except BaseException as exc:  # noqa: BLE001 -- a hook never raises into a leg
         result.counters.errors.append(f"{type(exc).__name__}: {exc}")
-        result.reason = f"hook-failed:{type(exc).__name__}"
+        # #1335: THE THIRD ARM GETS THE INSTRUMENT. Boot weg2xsn11 recorded
+        # `hook-failed:Weg2XchgCardUuidMapUnusable` on 21 legs of D and 18 of
+        # P -- the class name alone, for a class that carries FOUR distinct
+        # `reason=` values -- so `trapsafe_count --marker W23` read genuine 0
+        # beside 39 refusing legs, and the reason had to be recovered from
+        # `/proc/<pid>/environ` of a live rank. Same fix, same reason, as the
+        # transport arm at #1334: a type is a hint, the note is the finding.
+        result.reason = f"hook-failed:{exc_note(exc)}"
         result.ran = False
         return result
     finally:

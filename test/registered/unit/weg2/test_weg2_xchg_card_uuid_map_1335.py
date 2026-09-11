@@ -382,3 +382,48 @@ def test_the_1334_double_now_mirrors_the_adapter_by_default():
     sig = inspect.signature(_store_forward_leg)
     assert "inject_map" in sig.parameters
     assert sig.parameters["inject_map"].default is False
+
+
+# ===========================================================================
+# (5) THE THIRD ARM. Measured on boot weg2xsn11 (1b84c4c69f): the HOOK arm
+#     still swallowed the message, so a refusal that NAMES its reason arrived
+#     as a bare class name and the W-code census could not see it at all.
+# ===========================================================================
+
+
+def test_the_hook_arm_carries_the_message_and_the_site_like_the_transport_arm():
+    """#1328's form on the arm that still lacked it. Red at `1b84c4c69f`.
+
+    MEASURED, boot weg2xsn11 run 2: 21 legs on D and 18 on P recorded
+    `why=hook-failed:Weg2XchgCardUuidMapUnusable` -- the class name ALONE.
+    The class carries four distinct `reason=` values and the message names
+    which one fired and what it read, and NONE of that reached either log; the
+    reason had to be recovered from `/proc/<pid>/environ` of a live rank.
+    Worse, `trapsafe_count --marker W23` read **0 genuine** while 39 legs were
+    refusing, because the W-code lives in the message the field dropped.
+
+    So the hook arm gets `exc_note` exactly as the transport arm did at #1334,
+    and for the same reason: a type alone is a hint, not a finding.
+    """
+    src = inspect.getsource(sh.run_leg_hook)
+    assert 'f"hook-failed:{type(exc).__name__}"' not in src, \
+        "the hook arm must not report the bare type"
+    assert "hook-failed:{exc_note(exc)}" in src, \
+        "the hook arm must carry Type: message @ file:line, like transport-failed"
+
+
+def test_a_hook_refusal_is_VISIBLE_TO_THE_WCODE_CENSUS():
+    """The reason field must contain the W-code, or no census can count it.
+
+    `trapsafe_count`/`log_grep` are how every boot grades a refusal, and they
+    match on the CODE. A refusal whose code never reaches the log is
+    unfalsifiable: weg2xsn11 read `W23 genuine 0` next to 39 refusing legs.
+    Proven here over a REAL refusal from the real producer, not a stand-in.
+    """
+    try:
+        xr.uuid_of_card(env="")
+    except xr.Weg2XchgCardUuidMapUnusable as exc:
+        note = sh.exc_note(exc)
+    assert "W23" in note, note
+    assert "reason=unset" in note, note
+    assert "@ weight_exchange_region.py:" in note, note
