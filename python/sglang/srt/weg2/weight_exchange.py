@@ -198,18 +198,30 @@ VOCAB_FAMILY = "vocab"
 SHARD_FAMILIES = (VOCAB_FAMILY, "mlp", "moe")
 
 
-class Weg2XchgPlanDisagree(RuntimeError):
-    """W68 Weg2XchgPlanDisagree -- the plan does not describe the hardware.
-
-    Raised here when a destination tensor is not tiled exactly by its sources
-    (two sources for one byte, or a piece that runs past the destination's own
-    storage), and when a live tensor's layout cannot be expressed as
-    (rows, cols, pitch).
-
-    TODO(S3): Gate 0 raises this same class for an asymmetric 6x6 byte matrix,
-    a per-tag total that disagrees with ``tms_tag_bytes``
-    (``entrypoint.cpp:131``), and a plan id that disagrees with the front's.
-    """
+#: W68 -- THE REGION'S CLASS, IMPORTED, because for a while there were TWO.
+#:
+#: This module defined its own ``Weg2XchgPlanDisagree(RuntimeError)`` while
+#: ``weight_exchange_region.py:260`` defined another, both documented W68 and
+#: both named the same -- so the W-code census, which keys on (code, NAME),
+#: could not see the duplication, and neither could review.  What it cost is
+#: concrete: the TRANSPORT raises the region's, so an
+#: ``except weight_exchange.Weg2XchgPlanDisagree`` around a staging call caught
+#: NOTHING and the refusal escaped under a different identity than the one the
+#: handler named.  Two classes for one W-code is a second identity for one
+#: fact, which is the same defect family as a second ledger.
+#:
+#: The REGION's is the survivor rather than this one because it is the one the
+#: transport already raises, so nothing that currently works changes identity.
+#: Imported at module level: the region's only sglang import is lazy inside
+#: ``fence_budget_s()``, so there is no cycle.
+#:
+#: Raised here when a destination tensor is not tiled exactly by its sources
+#: (two sources for one byte, or a piece that runs past the destination's own
+#: storage), when a live tensor's layout cannot be expressed as
+#: (rows, cols, pitch), and by the plan provider when the derivation refuses.
+from sglang.srt.weg2.weight_exchange_region import (  # noqa: E402
+    Weg2XchgPlanDisagree,
+)
 
 
 class Weg2XchgSourceMissing(RuntimeError):
@@ -2484,6 +2496,129 @@ _PLAN_PROVIDER: Optional[Callable[[Any], PlanBytes]] = None
 _BOOT_VOTE: Optional[CoverageVote] = None
 
 
+def plan_bytes_from_descs(descs: Any) -> PlanBytes:
+    """``{tag: {param_name: planned bytes}}`` -- S1's own adapter, at last.
+
+    S1 wrote the contract and left the wire: *"S6 registers a provider that
+    sums ``XchgDesc.nbytes`` per ``param_name`` over ``XchgPlan.raw_descs``"*.
+    This is that sum.
+
+    PER PARAMETER, NOT PER DESCRIPTOR, and the difference is the whole reason
+    the adapter exists: one parameter is many descriptors -- one per
+    destination rank, and fewer-but-wider ones after ``coalesce`` merges
+    adjacent spans -- while the coverage arm (W84) asks how many bytes of THIS
+    PARAMETER the plan accounts for.
+
+    ZEROFILL IS NOT PLANNED BYTES.  A zerofill piece has no source and moves
+    nothing over the link; the destination memsets it locally
+    (``weight_exchange_transport.apply_zerofill``).  Counting it would tell the
+    coverage arm that a byte range is accounted for by a transfer that never
+    happens, which is the direction that serves undefined weights.
+    """
+    out: Dict[str, Dict[str, int]] = {}
+    for d in descs or ():
+        if getattr(d, "kind", None) == ZEROFILL:
+            continue
+        tag = str(getattr(d, "tag", ""))
+        name = str(getattr(d, "param_name", ""))
+        bucket = out.setdefault(tag, {})
+        bucket[name] = bucket.get(name, 0) + int(getattr(d, "nbytes", 0))
+    return out
+
+
+#: The env var the launcher publishes this rank's Weg-2 group on
+#: (``launcher.build_env``, ``SGLANG_WEG2_GROUP``).  Read through
+#: ``weg2_memory_saver.weg2_group_name`` so there is one reader.
+GROUP_ENV = "SGLANG_WEG2_GROUP"
+
+
+def default_plan_provider(*, rank: int, region_tag: str = "") -> Callable[[Any], PlanBytes]:
+    """The registrant S1's TODO asked for, deriving through the SHADOW.
+
+    IT DOES NOT FORK THE DERIVATION, and that is the one design decision in
+    here.  ``weight_exchange_shadow.derive_leg_plan`` is the producer BOTH
+    ENDS of the shadow already use -- the plan whose ``plan_digest`` Gate 0
+    agrees across all six ranks, narrowed by the mine/theirs manifest census --
+    so the bytes this provider reports are the bytes that plan will move.  A
+    second derivation here would be a second plan, and a plan two ranks derive
+    differently is precisely what Gate 0 exists to catch; keeping two
+    producers of it in one tree is how they begin to differ.
+
+    THE IMPORT IS LAZY because ``weight_exchange_shadow`` imports THIS module;
+    a module-level import would be a cycle.
+
+    IT RAISES W68 RATHER THAN RETURNING ``{}``.  ``derive_leg_plan`` answers
+    ``(None, reason)`` instead of raising, and that reason is the only thing
+    that says WHY -- an empty mapping would reach the coverage arm as "this
+    plan accounts for nothing" and be reported as an UNDER-COVERAGE of the
+    weights, which is a different and much more confusing finding than "there
+    is no plan".
+
+    ``hook`` is the SOURCE side deliberately: the coverage question is
+    rank-local ("is every weight byte of this runner accounted for"), it is
+    asked at the END OF WEIGHT LOADING when no peer manifest exists yet, and
+    the source hook is the side whose ``src_ptr`` this rank owns.  No
+    ``agreed`` set is passed for the same reason, and ``require_agreement``
+    stays False: at load time there is no co-located peer to agree with, and
+    demanding one would refuse every boot before its first flip.
+    """
+
+    def provider(model: Any) -> PlanBytes:
+        from sglang.srt.managers.weg2_memory_saver import weg2_group_name
+        from sglang.srt.weg2 import weight_exchange_shadow as sh
+
+        group = (weg2_group_name() or "").strip()
+        if group not in ("P", "D"):
+            raise Weg2XchgPlanDisagree(
+                f"W68 Weg2XchgPlanDisagree plan-provider: this rank has no "
+                f"Weg-2 group identity ({GROUP_ENV}={group!r}), so the cut the "
+                f"plan describes is unknown. Guessing a group would plan the "
+                f"PP cut on a TP rank and grade the weights against the wrong "
+                f"shard map -- a silent wrong answer. Refusing instead; the "
+                f"launcher publishes {GROUP_ENV} in build_env."
+            )
+        peer = "D" if group == "P" else "P"
+        plan, reason = sh.derive_leg_plan(
+            hook=sh.HOOK_SOURCE, group=group, peer=peer, rank=int(rank),
+            model=model, region_tag=str(region_tag),
+        )
+        if plan is None:
+            raise Weg2XchgPlanDisagree(
+                f"W68 Weg2XchgPlanDisagree plan-provider: the exchange is "
+                f"armed on this rank (group={group} rank={rank}) but the plan "
+                f"derivation refused: {reason}. Reported as a refusal and not "
+                f"as an empty plan, because an empty plan reaches the coverage "
+                f"arm as 'nothing is accounted for' and is graded as an "
+                f"under-coverage of the weights rather than as an absent plan."
+            )
+        return plan_bytes_from_descs(getattr(plan, "descs", ()))
+
+    return provider
+
+
+def install_default_plan_provider(*, rank: int, region_tag: str = "") -> bool:
+    """Install :func:`default_plan_provider` under ``exchange``, if none is set.
+
+    ``True`` when this call installed one.  THE ARM SELF-ARMS, and it does so
+    here rather than at the call site because the call site
+    (``model_executor/model_runner.py``, the end of weight loading) is not a
+    file this slice owns -- and because one place should answer "does this rank
+    have a plan provider".
+
+    AN ALREADY-REGISTERED PROVIDER WINS.  A test's or a later slice's provider
+    must not be replaced by the default, or the default becomes the only
+    reachable producer and every caller that installed its own is silently
+    disarmed.
+    """
+    if not exchange_armed():
+        return False
+    if plan_provider() is not None:
+        return False
+    register_plan_provider(default_plan_provider(rank=rank,
+                                                 region_tag=region_tag))
+    return True
+
+
 def register_plan_provider(fn: Optional[Callable[[Any], PlanBytes]]) -> None:
     """Register (or, with ``None``, clear) the plan's byte population source."""
     global _PLAN_PROVIDER
@@ -2569,6 +2704,11 @@ def arm_coverage_at_load(
         _record_boot_vote(vote)
         return vote
 
+    # THE TODO's OTHER HALF (S6 step 6b): register the provider.  Before
+    # this, `exchange` was fail-closed BY OMISSION -- every rank voted
+    # ok=False with NO_PLAN_REASON because nothing had ever been registered,
+    # which is a deliberate refusal but not a working arm.
+    install_default_plan_provider(rank=int(rank), region_tag=str(region_tag))
     provider = plan_provider()
     if provider is None or model is None:
         vote = CoverageVote(
