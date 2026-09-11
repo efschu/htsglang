@@ -214,7 +214,10 @@ def test_the_seam_reads_the_mode_and_terms_the_launcher_published(tmp_path,
     # `wx.inject_mode()`, which is the path the product uses.
     result = _manager()._weg2_xchg_bounce_leg(
         descs=_all_descs(), ops=ops,
-        boot_nonce=published[xr.ENV_REGION_BOOT],
+        # The region names are absent under `dry` (no region is created), so
+        # the leg gets the nonce directly -- the publication under test here
+        # is the MODE and the TERMS, which are added unconditionally.
+        boot_nonce="b1",
         slot_bytes=SLOT_BYTES, depth=DEPTH, shm_root=str(tmp_path),
     )
     assert result.inject is not None, \
