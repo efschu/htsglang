@@ -57,8 +57,10 @@ it into ``main()`` before the dry-return.  This file was rebased onto that
 tip, ``test_the_debt_is_not_stale`` fired on the entry, and the entry was
 DELETED.  Debt 4 -> 3.
 
-The three that remain, each with its class (the operator's ruling of
-2026-09-11 after verifying all three at ``2c9592fd19``):
+The two that remain, each with its class (the operator's ruling of
+2026-09-11 after verifying all three at ``2c9592fd19``).  Entry 3 is kept
+below as HISTORY because it was PAID on the merge train, and the way it left
+is the second proof that the GONE direction has teeth:
 
 1. ``weight_exchange.refuse_if_not_ok`` (W84,
    ``weight_exchange.py:2544``) -- class UNWIRED-BY-DESIGN-AND-PINNED.  An
@@ -84,7 +86,8 @@ The three that remain, each with its class (the operator's ruling of
    producer on the boot path.  Owed S6 work with a name -- filing it as a
    fresh defect would commission a second implementation of a function that
    is waiting for its spec.
-3. ``weight_exchange_transport.diagonal_carrier_bytes``
+3. **PAID ON THE MERGE TRAIN, 2026-09-11 (#1333) -- kept for its argument.**
+   ``weight_exchange_transport.diagonal_carrier_bytes``
    (``Weg2XchgOncardSlotRefused``, ``:2410``, raise at ``:2429``, #1334) --
    class SECOND-AUTHORITY-CANDIDATE, and the operator's correction here
    matters: **the W82 slot-size guard is LIVE**.  ``Weg2XchgOncardSlotRefused``
@@ -100,9 +103,20 @@ The three that remain, each with its class (the operator's ruling of
    documented and dead.  That is the second-bookkeeping class under the
    upstream-minimal law, where the default is DELETE, not wire.  Routed to
    seat 6 to pick ONE authority and correct whichever text lies.
+   **OUTCOME: seat 6 DELETED the helper (#1333).**  It found THREE numbers
+   rather than two -- the charge (``xchg_bounce.staging_bytes_per_card``),
+   the deposit's SHAPE maximum (``ONCARD_DEPOSIT_BYTES_MAX``, 8 x slot,
+   deliberately a different number) and this helper, which restated the
+   CHARGE while calling itself the CARRIER's size, a size nothing
+   guarantees (the carrier is ``plan.slots x plan.slot_bytes``, and under
+   store-and-forward ``plan.slots`` IS ``batches``, unclamped on purpose).
+   It also corrected the same wrong refusal name in THREE places
+   (``DEPOSIT_REASON_BATCHES`` where the product fires
+   ``DEPOSIT_REASON_UNFUNDED``).  ``test_the_debt_is_not_stale`` fired on
+   this entry and the entry was DELETED.  Debt 3 -> 2.
 
-Entries 2 and 3 LEAVE the debt the moment seat 6 rules on them, and the
-pinned length is what makes that visible.  Neither file is edited here
+Entry 2 LEAVES the debt the moment its S6 probe-and-degrade arm gets its
+producer, and the pinned length is what makes that visible.  Neither file is edited here
 (both are another seat's) -- the ownership law's answer to a wall in a
 foreign file is file:line plus a report.
 
@@ -213,6 +227,28 @@ DEBT_CLASSES = (
 #: Closed in BOTH directions by the tests below and its length is pinned, so
 #: it can only ever SHRINK -- it already has: B4i wired
 #: ``xchg_form_dormant_reserve`` and that entry was deleted here.
+#: THIS LIST IS THE SMALLER OF TWO, AND DELIBERATELY SO.
+#: `test_weg2_xchg_refusal_forms_1335.py` keeps a second frozen list over the
+#: same lane with THREE entries.  Do NOT make the two equal -- the difference is
+#: the point, and equalising them loses `gate0_check`, the refusal the operator
+#: decided on 2026-09-11 to leave unwired WITH A REASON (wiring Gate 0 adds
+#: collectives to the wake seam whose re-entry HANG at `:1367-1375` the plan of
+#: record names; and the measurement behind the decision is that no bytes are
+#: missing -- the saver is larger than the walk on every rank).
+#:
+#: WHY THE SIZES DIFFER: the predicate below matches a raise whose raised
+#: expression's callee NAME starts with `Weg2`.  `gate0_check`'s refusal travels
+#: ONLY by `raise region._refuse(Weg2XchgPlanDisagree, ...)` (callee `_refuse`)
+#: and by `write_matrix_verdict(row, False)` (a group-wide VOTE that raises
+#: nothing locally), so this scan cannot see it and must not claim to.  The
+#: #1335 list scans all three forms.  MEASURED in the lane: 174 `raise_direct`
+#: sites, 7 `raise_via_refuse`, 1 `vote`; the zero-reference owners are exactly
+#: THREE; the two below are exactly those whose only form is the bare raise.
+#:
+#: THE INVARIANT, enforced from the other side by
+#: `test_the_two_frozen_debt_lists_agree_BY_CONSTRUCTION` (it reads this list
+#: out of this file's AST, so it fails loudly if the two drift):
+#:     this set == { #1335 entries whose forms include FORM_RAISE }
 UNWIRED_DEBT = (
     {
         "file": "weg2/weight_exchange.py",
@@ -236,25 +272,14 @@ UNWIRED_DEBT = (
                "test_weg2_xchg_transport_1273.py:1995 and stated in prose at "
                "weight_exchange_shadow.py:32 -- owed S6 work, not a hidden defect",
     },
-    {
-        "file": "weg2/weight_exchange_transport.py",
-        "fn": "diagonal_carrier_bytes",
-        "code": "Weg2XchgOncardSlotRefused",
-        "line": 2410,
-        "class": "SECOND-AUTHORITY-CANDIDATE",
-        "why": "#1334. The W82 guard itself is LIVE (reachable raisers at :198 "
-               "and :204 in validate_oncard_slot_mib (:176), called from "
-               "launcher.py:3538, :4585 and :9463); "
-               "this helper is a SECOND authority for the carrier size -- :2453's "
-               "docstring names it as the sizer while #1334 sized the deposit "
-               "inline as 2x the published slot. Upstream-minimal law: seat 6 "
-               "picks one authority, default DELETE",
-    },
 )
 
 #: Pinned so the debt cannot grow by accident.  4 on dfceb7004e, 3 on
-#: 2c9592fd19 after B4i wired the reserve instrument.
-DEBT_SIZE_ON_THE_LINE = 3
+#: 2c9592fd19 after B4i wired the reserve instrument, 2 on the merge train
+#: after #1333 DELETED `diagonal_carrier_bytes` -- which is exactly what
+#: that entry's own reason asked for ("seat 6 picks one authority, default
+#: DELETE").  The debt was PAID, so the entry went; it can only SHRINK.
+DEBT_SIZE_ON_THE_LINE = 2
 
 
 # --------------------------------------------------------------------------
@@ -691,15 +716,30 @@ class TestEveryWCodeRaiserHasAProductionCaller(CustomTestCase):
             self.assertEqual(len(quals), 1,
                              f"{entry['file']}::{entry['fn']} is gone or duplicated")
 
-    def test_the_two_bounce_legs_are_wired_not_debt(self):
-        """Named on purpose: ``run_bounce_leg`` / ``run_agreed_leg`` are the
-        S6 product's two executors and they are NOT in the debt, because
-        ``weight_updater.py`` calls them -- their chain is cut at
-        ``_weg2_xchg_inject_from_peer``'s W4 refusal, which is a boot that
-        stops with a reason.  If that call site ever disappears they become
-        debt, and this test says so before the ratchet's totals do."""
+    def test_the_bounce_leg_is_wired_not_debt(self):
+        """``run_bounce_leg`` is the S6 product's executor and is NOT in the
+        debt, because ``weight_updater.py`` calls it.  If that call site ever
+        disappears it becomes debt, and this test says so before the ratchet's
+        totals do.
+
+        WAS "the two bounce legs" UNTIL THE MERGE TRAIN, and the second name is
+        gone on purpose: #1342 S3 DELETED path (a) -- ``run_agreed_leg``,
+        ``_weg2_xchg_agreed_leg``, ``agreed_descs``, ``AgreedResult`` -- as a
+        SECOND MOVER (4.90 MiB of a 27.52 GiB image, 0.018 per cent, input
+        unavailable at the only call site), with the ABSENCE itself under test in
+        ``test_weg2_xchg_inject_wiring_1342.py``.
+
+        MEASURED, and it is the reason this file needed the train and not just a
+        rebase: ``def run_agreed_leg`` does not exist at ``04cd920add``
+        (RE-STAMP 8), so THIS ASSERTION WAS ALREADY RED AGAINST THE LINE BEFORE
+        THE TRAIN STARTED -- this file is based on RE-STAMP 5 (``ec753f00d9``)
+        and never saw #1342.  A branch N re-stamps back must be checked against
+        EVERY slice landed since its base, not only against the one slice being
+        held.  Asking for the deleted leg back would re-introduce the second
+        mover the upstream-minimal law removed, so the NAME is dropped rather
+        than the assertion relaxed."""
         idx = _index()
-        for fn in ("run_bounce_leg", "run_agreed_leg"):
+        for fn in ("run_bounce_leg",):
             quals = [q for q in idx.by_name.get(fn, ())
                      if idx.defs[q][0] == "weg2/weight_exchange_bounce.py"]
             self.assertEqual(len(quals), 1, f"{fn} moved or vanished")

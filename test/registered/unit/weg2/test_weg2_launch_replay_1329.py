@@ -204,6 +204,47 @@ class TestTheFixtureIsFaithful(CustomTestCase):
         self.assertLess(biggest[0], 1 << 20, f"fixture file too big: {biggest}")
         self.assertLess(total, 1 << 21, f"fixture tree grew to {total} bytes")
 
+    def test_the_recorded_p_argv_IS_WHAT_THE_LAUNCHER_BUILDS_TODAY(self):
+        """#1349: a fixture that replays a GENERATED form must assert its form
+        against the GENERATOR, or its green is meaningless from the generator's
+        first change onward.
+
+        THE CONCRETE HOLE, measured 2026-09-11: this fixture is a recording of
+        group P's argv from boot xsn14, and this module's own header says its job
+        is to ARM THE FORM GATE inside ``ring_table.solve``.  B4e makes the
+        launcher append ``ring_table.XCHG_FORM_TOKEN`` to exactly that argv
+        whenever the arm is in ``WEIGHT_SOURCE_ARMED``.  The recording predates
+        B4e and carries the token 0x, while ``recorded.json`` records its arm as
+        ``exchange``.  So from the moment B4e lands, this replay arms the form
+        gate with a form the launcher no longer produces -- and it does NOT go
+        red, it goes STALE and stays green.  A green stale replay is worse than a
+        red one, because nothing reports it.  This test turns stale into red.
+
+        ONE EQUALITY COVERS BOTH DIRECTIONS: ``xchg_form_argv`` is the authority
+        for armed and unarmed alike, so an unarmed recording that grew a token
+        fails here too.  No case split that could itself drift.
+        """
+        arm = RECORDED["wall_xsn13_ring_absent_contradiction"]["weight_source"]
+        builder = getattr(L, "xchg_form_argv", None)
+        if builder is None:
+            self.skipTest(
+                "launcher.xchg_form_argv does not exist yet (B4e, commits "
+                "5578693d8f + 1ce9aa6369 on weg2/xchg-b4d-b4e-0911); until it "
+                "lands the recording cannot be stale by this mechanism. "
+                "DORMANT, not passing -- it arms with B4e (train item [6])."
+            )
+        recorded = recorded_p_argv()
+        rebuilt = builder(recorded, arm)
+        self.assertEqual(
+            rebuilt, recorded,
+            "the recorded p_argv is no longer what the launcher builds for "
+            f"arm={arm!r}: the launcher would hand solve() {len(rebuilt)} "
+            f"tokens, the recording has {len(recorded)}. Re-record the fixture "
+            "from a boot on the current launcher -- do NOT relax this "
+            "assertion, and do NOT patch the token into the recording by hand: "
+            "the fixture's value is that it is a RECORDING.",
+        )
+
     def test_every_fixture_file_is_CARRIED_BY_THE_REPO(self):
         """A fixture the repo does not carry is a test that works only on the
         box that built it.
