@@ -1037,8 +1037,19 @@ class SchedulerWeightUpdaterManager:
             )
 
         # -- the plan, through the ONE product call site of build_plan -------
+        # #1345: NOT NARROWED, and ``agreed=None`` is now a STATED position
+        # rather than an input this path failed to gather.  There is no peer
+        # question here: path (b) carries the bytes, the compare's reference is
+        # the LOCAL landed weights (``ptr_of``), and the agreed set was 0.018 %
+        # of the image.  The reconcile is deliberately NOT called from this
+        # path -- it would be a second writer of a row whose writer is declared
+        # unique, and this method has no leg identity to key one by anyway
+        # (``_weg2_shadow_manifest`` requires ``leg`` and ``epoch``; both
+        # callers of this one pass neither).  Pinned by
+        # ``test_no_manifest_writer_is_reachable_from_the_injection_path``.
         plan, plan_reason = self._weg2_shadow_plan(
-            "authoritative", group, int(rank), agreed=None)
+            "authoritative", group, int(rank), agreed=None,
+            require_agreement=False)
         if plan is None:
             raise Weg2WakeRefused(
                 "W4 Weg2WakeRefused: the exchange owns this wake's weight "
@@ -2138,8 +2149,31 @@ class SchedulerWeightUpdaterManager:
             return None, f"manifest-failed:{_weg2_exc_note(exc)}"
 
     def _weg2_shadow_plan(self, hook: str, group: str, rank: int, *,
-                          agreed=None):
+                          agreed=None, require_agreement: bool):
         """THE PRODUCT CALL SITE OF ``weight_exchange.build_plan``.
+
+        ``require_agreement`` IS THE CALLER'S DECISION AND HAS NO DEFAULT
+        (#1345).  It was hard-set ``True`` here for every caller, and boot
+        weg2xsn19 measured what that cost: the two callers of this method have
+        OPPOSITE and both-documented needs, so the injection caller could only
+        ever read ``manifest-unagreed`` -- 12 of 12 legs on both groups, on
+        every argv, with the refusal reached, named and static.
+
+        * the SHADOW hook compares stripes ACROSS the co-located pair, so it
+          MUST narrow to the agreed set (#1311 S6b; boot weg2xsn5's W80 refused
+          7 of 8 legs because each end hashed its own inventory);
+        * the INJECTION lane has no peer question at all.  Its bytes come from
+          path (b), its acceptance is ``xchg_bounce == expression`` rather than
+          ``== peer``, and its reference is the LOCAL landed weights
+          (``ptr_of`` resolves pointers only for this rank's own group and rank
+          and returns ``None`` on the peer side by ``XchgDesc``'s contract).
+          Narrowing it also made the grader vacuous: the agreed set measured
+          4.90 MiB of a 27.52 GiB image, 0.018 %.
+
+        NO DEFAULT is deliberate: a default is what let one caller inherit the
+        other's requirement silently.  ``derive_leg_plan`` itself defaults to
+        ``require_agreement=False``, so forwarding ``False`` here is the
+        library's sanctioned path and not a relaxed gate.
 
         SECTION 1ai-S5b-fix's UNPROVEN 2 in its own words -- *"``build_plan``
         has no product caller ... unchanged, and still the largest gap"* -- is
@@ -2182,7 +2216,7 @@ class SchedulerWeightUpdaterManager:
                 # silently fall back to this rank's own inventory, which is
                 # exactly the rank-local derivation boot weg2xsn5 refused 7 of 8
                 # legs on.  The product refuses by name instead.
-                agreed=agreed, require_agreement=True)
+                agreed=agreed, require_agreement=bool(require_agreement))
             # THE ACCEPTANCE LINE IS NOT EMITTED HERE, and the reason is
             # recorded because #1342 S3 wired it here and boot weg2xsn18 paid
             # for it: this method only ever holds `derive_leg_plan`'s
@@ -2350,9 +2384,14 @@ class SchedulerWeightUpdaterManager:
             # for the transport.
             agreed, manifest_state = self._weg2_shadow_manifest(
                 group, peer, int(rank), leg=leg, epoch=epoch_token)
+            # #1345: THE SHADOW LANE NARROWS, and says so at the call rather
+            # than relying on the adapter.  This is the danger direction of
+            # that slice: a shadow leg planned over a set the peer never agreed
+            # to is boot weg2xsn5's W80 exactly.
             plan, plan_reason = self._weg2_shadow_plan(str(hook), group,
                                                        int(rank),
-                                                       agreed=agreed)
+                                                       agreed=agreed,
+                                                       require_agreement=True)
             # THE MANIFEST STATE RIDES THE PLAN REASON, so the one line a
             # refused leg prints (W79 ``no-plan``) says WHY the pair could not
             # agree and not merely that it did not.
