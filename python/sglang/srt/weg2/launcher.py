@@ -218,6 +218,75 @@ DC_RESERVE_SLACK_MIB = 64
 #: HERE, behind the switch, and not in the constant -- under 'bar1' nothing
 #: about the flip path changes, which is the entire point.
 DC_RESERVE_SLACK_NCCL_MIB = 192
+#: #1273 B4h -- THE EXCHANGE FORM'S OWN DORMANT RESIDUE, behind the switch and
+#: not in the constant above, which is exactly the precedent the NCCL slack set
+#: twelve lines up ("The extra slack lives HERE, behind the switch, and not in
+#: the constant").  One level MORE honest than that one, because this form was
+#: measured WHOLE rather than as a delta:
+#:
+#: MEASURED on boot weg2xsn14 (BOOT_weg2xsn14_0911.md, the W19 line at EPOCH 0
+#: on tip 692b1e8698, under `--weg2-weight-source exchange` with
+#: `--weg2-xchg-inject shadow` and `--weg2-xchg-oncard ipc`): D's dormant
+#: residue is 2588 / 3084 / 2588 MiB on nvml0 / nvml1 / nvml2, against the
+#: serving reserve's 1986 / 2292 / 1986 -- so every card tripped W19
+#: DormantResidueRefused before the first flip.
+#:
+#: SELECTED IFF `weight_source == "exchange"`, under ANY inject mode: the
+#: residency is PRESENT under `shadow`, which is where it was measured.  That
+#: makes this the one predicate in this slice family that does NOT conjoin the
+#: inject arm -- B4f's conjunction answers a different question (who OWNS the
+#: bytes), not what is RESIDENT.
+#:
+#: KEYED BY CARD IDENTITY, the same way `DC_MEASURED_D_*` is keyed -- by the
+#: board's NAME, never by NVML index, which is not stable across boots on this
+#: rig (#589).  The two 3080s measured IDENTICALLY at 2588, so the name is
+#: exact here rather than a convenient collapse of two different numbers.
+#:
+#: NOT FINAL, AND NOT AN EXPLANATION.  Of this measurement, 773 / 935 / 773 MiB
+#: is UNATTRIBUTED: subtracting the census's own per-card dormant readings
+#: (1334 / 1668 / 1334) and the exchange lane's named residency terms (region
+#: + on-card slots = 481 MiB, both uniform) leaves that much, and 162 MiB of it
+#: sits on the 5090 alone and survives every uniform subtraction (B4g's
+#: subtraction, which also refuted the foreign-split reading on SIGN).  The
+#: open posten that feeds it is B4b: XSN12 measured the flag slot at 128 MiB
+#: against a realised 32 MiB/card, i.e. 4x, plus the shadow lane's device-side
+#: stripes.  The S6I shadow boot with `--weg2-xchg-oncard host` measures the
+#: bounce and prints the UNCOVERED table, then B4b prices the slot and the
+#: residual is re-derived.  A PER-FORM PREFLIGHT MEASUREMENT REPLACES THIS
+#: CONSTANT once B4e's form token lands (after the shadow verdict) -- nobody
+#: should read this triple as final.
+DC_MEASURED_D_XCHG_MIB = (2588, 3084, 2588)
+DC_MEASURED_D_XCHG_3080_MIB = DC_MEASURED_D_XCHG_MIB[0]
+DC_MEASURED_D_XCHG_5090_MIB = DC_MEASURED_D_XCHG_MIB[1]
+
+
+def dc_measured_d_mib(card: Card, weight_source: str) -> int:
+    """Group D's MEASURED dormant residue for this card, on THIS form.
+
+    THE ONE SELECTOR, so there is no second bookkeeping and no parallel
+    reserve object: every consumer of `DC_MEASURED_D_*` goes through here, which
+    is also why group P's per-card budget follows the form automatically
+    (`budgets_from_dc` subtracts this term).  Under the exchange arm P's budget
+    therefore shrinks by 666 MiB on each 3080 and 856 MiB on the 5090 -- the
+    residency is real and the budget that ignored it is what tripped W19.
+
+    An unrecognised board REFUSES rather than borrowing a number: both triples
+    name this rig's inventory only, and a third model's residue is not a
+    property either of them has.
+    """
+    name = str(getattr(card, "name", ""))
+    xchg = str(weight_source) == WEIGHT_SOURCE_EXCHANGE
+    if "5090" in name:
+        return DC_MEASURED_D_XCHG_5090_MIB if xchg else DC_MEASURED_D_5090_MIB
+    if "3080" in name:
+        return DC_MEASURED_D_XCHG_3080_MIB if xchg else DC_MEASURED_D_3080_MIB
+    raise Weg2LaunchRefused(
+        f"W19 dormant-residue reserve: board {name!r} (nvml"
+        f"{getattr(card, 'nvml_index', '?')}) is named by neither DC_MEASURED_D_* "
+        "nor DC_MEASURED_D_XCHG_* -- both triples are measurements of this rig's "
+        "1x5090 + 2x3080 inventory, and a third model's dormant residue is not a "
+        "property either of them has.  Measure it, do not borrow it."
+    )
 #: Flags that only make sense while barlink owns the group's collectives.
 #: Each takes a value except the bare --barlink itself.
 BARLINK_FLAGS_WITH_VALUE = (
@@ -9055,8 +9124,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # re-check under "4. group P", which proves that rather than asserting it),
     # so the move is sound; ``env_p`` stays behind because it does need the ring.
     slack_mib = reserve_slack_mib(ns.transport)
+    # B4h: THE ONE CONSUMER, form-switched through the one selector, so P's
+    # per-card budget follows the arm automatically and no parallel reserve
+    # object exists.
     dc_expect_d = {
-        c.uuid: (DC_MEASURED_D_5090_MIB if "5090" in c.name else DC_MEASURED_D_3080_MIB) + slack_mib
+        c.uuid: dc_measured_d_mib(c, ns.weg2_weight_source) + slack_mib
         for c in cards
     }
     if ns.transport == "nccl":
@@ -9068,9 +9140,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             f"and the whole flip path are untouched."
         )
     state.dc_expect_d = dc_expect_d
-    log("dormant residue RESERVE for group D = MEASURED D_c(D) of boot weg2ls1b2 (2228 / 1922 / 1922 MiB, "
-        f"NVML per-process, windows included) + {slack_mib} MiB slack; spec 1.6 expectation was "
-        f"{DC_EXPECT_5090_MIB}/{DC_EXPECT_3080_MIB} (exceeded); graded by W19 at D's first sleep: "
+    _xchg_form = ns.weg2_weight_source == WEIGHT_SOURCE_EXCHANGE
+    log(("dormant residue RESERVE for group D = MEASURED D_c(D) of boot "
+         + (f"weg2xsn14 ({'/'.join(str(v) for v in DC_MEASURED_D_XCHG_MIB)} MiB, "
+            "the EXCHANGE form's own residue at epoch 0, of which 773/935/773 "
+            "unattributed -- see DC_MEASURED_D_XCHG_MIB)"
+            if _xchg_form else
+            "weg2ls1b2 (2228 / 1922 / 1922 MiB, NVML per-process, windows included)"))
+        + f" + {slack_mib} MiB slack; spec 1.6 expectation was "
+        f"{DC_EXPECT_5090_MIB}/{DC_EXPECT_3080_MIB} (exceeded); "
+        f"form={ns.weg2_weight_source}; graded by W19 at D's first sleep: "
         + ", ".join(f"nvml{c.nvml_index}={dc_expect_d[c.uuid]}" for c in cards))
     # #1257c: the operator's external headroom, resolved ONCE per boot and
     # keyed by CARD UUID -- never by NVML index, which is not stable across
@@ -10074,13 +10153,21 @@ def xchg_form_dormant_reserve(
             )
         dormant = int(entry.dormant_proc_used_mib)
         out[c.uuid] = dormant + named
+        # B4h (2): the MEASURED value beside the PRICED one, on one line, so the
+        # boot record shows both and the unattributed remainder without a
+        # second read.  This function stays the PRICER; the reserve W19
+        # compares against is `dc_measured_d_mib`'s form-keyed measurement.
+        measured = dc_measured_d_mib(c, WEIGHT_SOURCE_EXCHANGE)
+        residual[c.uuid] = int(measured) - int(out[c.uuid])
         lines.append(
             f"WEG2-XCHG-RESERVE nvml{c.nvml_index} {c.name} "
             f"dormant_census_mib={dormant} region_mib={region_mib} "
             f"oncard_slots_mib={slots_mib} "
             f"({XCHG_RESIDENT_ONCARD_SLOTS}x{int(oncard_slot_mib)}) "
-            f"reserve_mib={out[c.uuid]} "
-            f"source={entry.dormant_source[:120]}"
+            f"priced_mib={out[c.uuid]} "
+            f"measured_mib={measured} source=measured:weg2xsn14 "
+            f"residual_unattributed_mib={residual[c.uuid]} "
+            f"census_source={entry.dormant_source[:120]}"
         )
     if log is not None:
         for ln in lines:

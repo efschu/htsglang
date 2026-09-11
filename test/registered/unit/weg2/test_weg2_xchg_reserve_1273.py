@@ -127,8 +127,15 @@ class TheReserveIsPricedFromTheCensusAndNamedTerms(CustomTestCase):
             self.assertIn(f"region_mib={launcher.xchg_resident_region_mib(len(CARDS))}", ln)
             self.assertIn("oncard_slots_mib=96", ln)
             self.assertIn("(3x32)", ln)
-            self.assertIn("reserve_mib=", ln)
-            self.assertIn("source=READING", ln)
+            # RENAMED BY B4h: this function is the PRICER and the MEASURED
+            # value now sits beside it on the same line, so `priced_mib` says
+            # which of the two it is.  The residual between them is printed
+            # rather than left to the reader.
+            self.assertIn("priced_mib=", ln)
+            self.assertIn("measured_mib=", ln)
+            self.assertIn("source=measured:weg2xsn14", ln)
+            self.assertIn("residual_unattributed_mib=", ln)
+            self.assertIn("census_source=READING", ln)
 
     def test_the_slot_term_follows_the_published_slot(self):
         p = _census(os.path.join(tempfile.mkdtemp(), "c.json"))
