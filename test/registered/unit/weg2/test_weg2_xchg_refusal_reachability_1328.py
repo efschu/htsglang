@@ -37,36 +37,75 @@ THE TWO RATCHETS, and why there are two rather than one.
   stale; the debt's length is pinned so it cannot grow by accident).
 
 WHY THE DEBT EXISTS -- a DEVIATION from AMENDMENT 7's "allowlist empty",
-reported rather than papered over.  An empty allowlist on THIS assertion
-cannot be green on ``dfceb7004e``, and that is a measurement, not a
-preference.  Four raise sites on the tip have no production caller at all:
+reported to the operator and ACCEPTED with conditions (2026-09-11: each
+entry carries file:line, one line of reason, AND ITS CLASS -- "a debt whose
+entries are classified is a work list; an unclassified one is an exemption
+with extra steps").  An empty allowlist on THIS assertion cannot be green
+on the shipping line, and that is a measurement, not a preference: a ratchet
+that is red on arrival enforces nothing.  The intent it must serve is "no
+W-code raise without a proven production path", and both directions of a
+pinned, classified debt serve it better than an allowlist that hides by
+omission.
 
-1. ``weight_exchange.refuse_if_not_ok`` (W84) -- unwired BY DESIGN, and an
-   EXISTING test pins it that way
-   (``test_weg2_coverage_verdict_1273.py::test_refuse_if_not_ok_stays_unwired``).
-   Its own docstring states the reason: at the end of weight loading there
-   is no group fence, and a rank that raised there would die while the
-   other five walked into a collective with five members.  Requiring a
-   caller here would demand the opposite of a decision already taken and
-   tested.  The VERDICT it hands over is what must be reachable, and that
-   is :class:`TestNoOrphanVerdict`'s question.
-2. ``launcher.xchg_form_dormant_reserve`` (W71) -- has no caller ANYWHERE
-   in production (``grep -rn`` over ``python/sglang/srt``: one hit, its own
-   ``def``).  Its docstring calls itself "the pricing and REPORTING
-   instrument that makes the refusal auditable"; an instrument nobody
-   calls reports nothing, which is why boot weg2xsn15 emitted
-   ``WEG2-XCHG-RESERVE`` ZERO times (operator handover section 12,
-   "Launcher-Instrument-Defekt").  Owned by desk seat 6 as B4i part 2;
-   named here so the fix is visible to this ratchet the moment it lands.
-3. ``weight_exchange_transport.arm_oncard_lane`` (W72/W? ``Weg2XchgOnCardUnavailable``)
-   -- docstring: "Decide the on-card lane's mode ONCE, at the launcher".
-   The launcher does not call it (zero references outside its own ``def``).
-4. ``weight_exchange_transport.diagonal_carrier_bytes``
-   (``Weg2XchgOncardSlotRefused``, #1334) -- same: zero references.
+THE DEBT'S FOURTH ENTRY IS ALREADY PAID, and the way it left is the
+evidence that the GONE direction has teeth on a real change rather than a
+synthetic one: ``launcher.xchg_form_dormant_reserve`` had no caller
+anywhere in production on ``dfceb7004e`` -- which is statically why boot
+weg2xsn15 emitted ``WEG2-XCHG-RESERVE`` ZERO times (operator handover
+section 12, "Launcher-Instrument-Defekt") -- and B4i (``2c9592fd19``) wired
+it into ``main()`` before the dry-return.  This file was rebased onto that
+tip, ``test_the_debt_is_not_stale`` fired on the entry, and the entry was
+DELETED.  Debt 4 -> 3.
 
-3 and 4 are NEW FINDINGS of this ratchet, desk-proven and reported to the
-operator with these file:lines; they are NOT fixed here (both files are
-another seat's).  The two bounce legs
+The three that remain, each with its class (the operator's ruling of
+2026-09-11 after verifying all three at ``2c9592fd19``):
+
+1. ``weight_exchange.refuse_if_not_ok`` (W84,
+   ``weight_exchange.py:2513``) -- class UNWIRED-BY-DESIGN-AND-PINNED.  An
+   EXISTING test asserts it stays that way
+   (``test_weg2_coverage_verdict_1273.py::test_refuse_if_not_ok_stays_unwired``);
+   its docstring gives the reason (no group fence at the end of weight
+   loading, so a rank raising there dies while the other five walk into a
+   collective with five members).  Requiring a caller would demand the
+   opposite of a decision already taken and tested.  The VERDICT it hands
+   over is what must be reachable, and that is
+   :class:`TestNoOrphanVerdict`'s question.
+2. ``weight_exchange_transport.arm_oncard_lane``
+   (``Weg2XchgOnCardUnavailable``, ``weight_exchange_transport.py:2325``,
+   raise at ``:2377``) -- class DECLARED-TODO(S6), NOT a silent defect, and
+   this is the operator's CORRECTION of this ratchet's first reading.  The
+   on-card MODE IS decided and wired: the launcher publishes
+   ``env[ENV_ONCARD_MODE]`` from argv at ``launcher.py:3512``.  What has no
+   producer yet is the S6 PROBE-AND-DEGRADE arm (the W72 two-arm shape),
+   and that is DECLARED: the docstring carries ``TODO(S6)``, an existing
+   test asserts the marker is present
+   (``test_weg2_xchg_transport_1273.py:1995``), and
+   ``weight_exchange_shadow.py:32`` says in prose that this arm has no
+   producer on the boot path.  Owed S6 work with a name -- filing it as a
+   fresh defect would commission a second implementation of a function that
+   is waiting for its spec.
+3. ``weight_exchange_transport.diagonal_carrier_bytes``
+   (``Weg2XchgOncardSlotRefused``, ``:2410``, raise at ``:2429``, #1334) --
+   class SECOND-AUTHORITY-CANDIDATE, and the operator's correction here
+   matters: **the W82 slot-size guard is LIVE**.  ``Weg2XchgOncardSlotRefused``
+   has REACHABLE raisers at ``weight_exchange_transport.py:198`` and
+   ``:204`` inside ``validate_oncard_slot_mib``, which the launcher calls at
+   ``:3518``; only the raise inside THIS unused helper is unreachable, so
+   "the class is unreachable" was wrong as written.  What the finding
+   actually uncovers is better: ``:2453``'s docstring names
+   ``diagonal_carrier_bytes`` as the sizer "and the ledger charges the
+   group-wide sum", while #1334 sized the deposit inline as 2x the
+   published 128-MiB slot -- two authorities for one quantity, one of them
+   documented and dead.  That is the second-bookkeeping class under the
+   upstream-minimal law, where the default is DELETE, not wire.  Routed to
+   seat 6 to pick ONE authority and correct whichever text lies.
+
+Entries 2 and 3 LEAVE the debt the moment seat 6 rules on them, and the
+pinned length is what makes that visible.  Neither file is edited here
+(both are another seat's) -- the ownership law's answer to a wall in a
+foreign file is file:line plus a report.
+
+The two bounce legs
 (``weight_exchange_bounce.run_bounce_leg`` / ``run_agreed_leg``) and
 ``refuse_if_plan_exceeds_slot`` are NOT in the debt: they HAVE production
 call sites (``weight_updater.py:2370`` / ``:2394``) whose own caller chain
@@ -154,19 +193,65 @@ PRODUCTION_ENTRIES = (
     ("managers/scheduler.py", "run_scheduler_process"),
 )
 
-#: THE FROZEN DEBT: ``(relpath, owner function, W-code class)`` for every
-#: ``raise Weg2*`` site in the lane whose owner has NO production reference
-#: at all on ``dfceb7004e``.  Each entry is argued in this module's
-#: docstring.  Closed in BOTH directions by the tests below, and its length
-#: is pinned, so it can only ever SHRINK.
-UNWIRED_DEBT = (
-    ("weg2/weight_exchange.py", "refuse_if_not_ok", "Weg2XchgCoverageRefused"),
-    ("weg2/launcher.py", "xchg_form_dormant_reserve", "Weg2XchgResidencyUnarmable"),
-    ("weg2/weight_exchange_transport.py", "arm_oncard_lane", "Weg2XchgOnCardUnavailable"),
-    ("weg2/weight_exchange_transport.py", "diagonal_carrier_bytes", "Weg2XchgOncardSlotRefused"),
+#: The four debt CLASSES the operator's condition of 2026-09-11 requires.
+#: A class is not a label for its own sake: it says WHO owes WHAT next, and
+#: ``UNKNOWN`` is the one that must never sit here quietly -- an unclassified
+#: entry is an exemption with extra steps.
+DEBT_CLASSES = (
+    "UNWIRED-BY-DESIGN-AND-PINNED",   # a test asserts it stays unwired
+    "DECLARED-TODO",                  # owed work with a name and a pin
+    "SECOND-AUTHORITY-CANDIDATE",     # upstream-minimal law: delete, not wire
+    "UNKNOWN",                        # unclassified: triage, never ship here
 )
 
-DEBT_SIZE_ON_DFCEB7004E = 4
+#: THE FROZEN DEBT: every ``raise Weg2*`` site in the lane whose owner has NO
+#: production reference at all on the shipping tip, with file:line (as of
+#: ``2c9592fd19``; informational, the tests use the CURRENT line), one line
+#: of reason, and its CLASS.  Argued in full in this module's docstring.
+#: Closed in BOTH directions by the tests below and its length is pinned, so
+#: it can only ever SHRINK -- it already has: B4i wired
+#: ``xchg_form_dormant_reserve`` and that entry was deleted here.
+UNWIRED_DEBT = (
+    {
+        "file": "weg2/weight_exchange.py",
+        "fn": "refuse_if_not_ok",
+        "code": "Weg2XchgCoverageRefused",
+        "line": 2513,
+        "class": "UNWIRED-BY-DESIGN-AND-PINNED",
+        "why": "no group fence at the end of weight loading; "
+               "test_weg2_coverage_verdict_1273.py::test_refuse_if_not_ok_stays_unwired "
+               "asserts it stays unwired, and TestNoOrphanVerdict covers its verdict",
+    },
+    {
+        "file": "weg2/weight_exchange_transport.py",
+        "fn": "arm_oncard_lane",
+        "code": "Weg2XchgOnCardUnavailable",
+        "line": 2325,
+        "class": "DECLARED-TODO",
+        "why": "the MODE is decided and wired (launcher.py:3512 publishes "
+               "env[ENV_ONCARD_MODE] from argv); the missing half is S6's "
+               "probe-and-degrade arm, declared by TODO(S6) here, pinned by "
+               "test_weg2_xchg_transport_1273.py:1995 and stated in prose at "
+               "weight_exchange_shadow.py:32 -- owed S6 work, not a hidden defect",
+    },
+    {
+        "file": "weg2/weight_exchange_transport.py",
+        "fn": "diagonal_carrier_bytes",
+        "code": "Weg2XchgOncardSlotRefused",
+        "line": 2410,
+        "class": "SECOND-AUTHORITY-CANDIDATE",
+        "why": "#1334. The W82 guard itself is LIVE (reachable raisers at :198 "
+               "and :204 in validate_oncard_slot_mib, called from launcher.py:3518); "
+               "this helper is a SECOND authority for the carrier size -- :2453's "
+               "docstring names it as the sizer while #1334 sized the deposit "
+               "inline as 2x the published slot. Upstream-minimal law: seat 6 "
+               "picks one authority, default DELETE",
+    },
+)
+
+#: Pinned so the debt cannot grow by accident.  4 on dfceb7004e, 3 on
+#: 2c9592fd19 after B4i wired the reserve instrument.
+DEBT_SIZE_ON_THE_LINE = 3
 
 
 # --------------------------------------------------------------------------
@@ -494,29 +579,38 @@ class TestEveryWCodeRaiserHasAProductionCaller(CustomTestCase):
     """RATCHET 1: the plain reachability question at every raise site, with
     the failures carried as a frozen, named, shrinking debt."""
 
+    @staticmethod
+    def _debt_keys():
+        return {(e["file"], e["fn"], e["code"]) for e in UNWIRED_DEBT}
+
     def test_no_new_unwired_raiser(self):
         """THE RATCHET.  A raise site whose owner nothing in production even
         names is the W84 state; a NEW one fails here by name."""
         found = unwired_raise_sites(_index(), PRODUCTION_ENTRIES)
-        known = {(rel, fn, exc) for rel, fn, exc in UNWIRED_DEBT}
+        known = self._debt_keys()
         new = sorted(site for site in found if (site[0], site[1], site[2]) not in known)
         self.assertEqual(
             new, [],
             "W-code raise site(s) with NO production caller and not in "
             f"UNWIRED_DEBT: {new} -- either wire the raiser (preferred: this "
             "is the W84 class, a guard that cannot fire) or add it to the "
-            "debt WITH its argument in this module's docstring",
+            "debt WITH its class and one line of reason (see DEBT_CLASSES "
+            "and this module's docstring)",
         )
 
     def test_the_debt_is_not_stale(self):
         """The GONE direction.  A debt entry that became wired must be
         DELETED, so the debt can only shrink; leaving it would let a second
-        regression hide behind a paid-off entry."""
+        regression hide behind a paid-off entry.
+
+        This has already fired for real, which is the proof it has teeth:
+        ``launcher.xchg_form_dormant_reserve`` was entry 2 on
+        ``dfceb7004e`` and B4i (``2c9592fd19``) wired it, so rebasing this
+        file onto that tip turned this test RED and the entry was deleted.
+        """
         found = {(rel, fn, exc) for rel, fn, exc, _ln in
                  unwired_raise_sites(_index(), PRODUCTION_ENTRIES)}
-        stale = sorted(site for site in
-                       {(rel, fn, exc) for rel, fn, exc in UNWIRED_DEBT}
-                       if site not in found)
+        stale = sorted(site for site in self._debt_keys() if site not in found)
         self.assertEqual(
             stale, [],
             f"UNWIRED_DEBT entries that are now wired (or gone): {stale} -- "
@@ -524,7 +618,37 @@ class TestEveryWCodeRaiserHasAProductionCaller(CustomTestCase):
         )
 
     def test_the_debt_cannot_grow_silently(self):
-        self.assertEqual(len(UNWIRED_DEBT), DEBT_SIZE_ON_DFCEB7004E)
+        self.assertEqual(len(UNWIRED_DEBT), DEBT_SIZE_ON_THE_LINE)
+
+    def test_every_debt_entry_carries_its_class_and_reason(self):
+        """The operator's condition of 2026-09-11: "a debt whose entries are
+        classified is a work list; an unclassified one is an exemption with
+        extra steps."  So the shape is enforced, not trusted -- and
+        ``UNKNOWN`` is rejected outright, because an entry nobody has
+        classified is triage that has not happened yet."""
+        for entry in UNWIRED_DEBT:
+            self.assertEqual(sorted(entry), ["class", "code", "file", "fn", "line", "why"],
+                             f"debt entry has the wrong fields: {entry}")
+            self.assertIn(entry["class"], DEBT_CLASSES, f"unknown class: {entry}")
+            self.assertNotEqual(
+                entry["class"], "UNKNOWN",
+                f"{entry['file']}::{entry['fn']} is unclassified -- classify it "
+                "(who owes what next) or wire the raiser",
+            )
+            self.assertGreater(len(entry["why"]), 40,
+                               f"one line of REASON, please: {entry}")
+            self.assertIsInstance(entry["line"], int)
+
+    def test_every_debt_entry_still_names_a_real_function(self):
+        """A debt entry pointing at a function that no longer exists is not a
+        debt, it is a stale comment -- and it would mask a NEW unwired raiser
+        of the same name somewhere else."""
+        idx = _index()
+        for entry in UNWIRED_DEBT:
+            quals = [q for q in idx.by_name.get(entry["fn"], ())
+                     if idx.defs[q][0] == entry["file"]]
+            self.assertEqual(len(quals), 1,
+                             f"{entry['file']}::{entry['fn']} is gone or duplicated")
 
     def test_the_two_bounce_legs_are_wired_not_debt(self):
         """Named on purpose: ``run_bounce_leg`` / ``run_agreed_leg`` are the
