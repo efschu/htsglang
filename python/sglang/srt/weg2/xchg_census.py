@@ -886,7 +886,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--floor-mib", type=float, default=launcher.ARMING_FLOOR_MIB)
     ns = ap.parse_args(list(argv) if argv is not None else None)
 
-    cards = launcher.order_cards(launcher.resolve_cards())
+    # EVERY ARGUMENT CHECK BEFORE ANY HARDWARE, and the order is load-bearing
+    # rather than tidy.  The remote gate caught this: with the NVML read first,
+    # a bad invocation on a GPU-less box died inside `resolve_cards` /
+    # `order_cards` (which refuses an inventory that is not 1x5090 + 2x3080)
+    # instead of with the named refusal it has, so the tool's own refusal path
+    # was unreachable exactly where it is cheapest to exercise -- and the two
+    # tests that assert it were passing here only because this rig has cards.
+    # A CLI that needs hardware to tell you that you mistyped a flag is also
+    # the wrong tool for the desk.
     if ns.weight_chunks > 0:
         from sglang.srt.managers.weg2_memory_saver import weights_family_tags
 
@@ -895,6 +903,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         family = family_from_front(ns.form_from)
     else:
         raise _refuse("pass --form-from or --weight-chunks: the tag family is read, never guessed")
+    cards = launcher.order_cards(launcher.resolve_cards())
     sha = ""
     try:
         sha = subprocess.run(

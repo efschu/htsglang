@@ -488,13 +488,36 @@ class TheWaveMapArmsAreBothNamed(CustomTestCase):
 
 
 class TheCliTurnsARefusalIntoAnExitCode(CustomTestCase):
+    """#1275 fix 2's shape: a refusal that escapes exits 1 and reads as a crash.
+
+    AND IT MUST NOT NEED A GPU TO SAY SO.  The remote gate (a container with no
+    card and ``CUDA_VISIBLE_DEVICES=""``) failed both of these while they
+    passed here, because ``main`` read NVML BEFORE checking its arguments: the
+    bad invocation died inside ``resolve_cards``/``order_cards`` rather than
+    with the tool's own named refusal.  The third test below pins the ordering,
+    so the dependency cannot come back: it makes the NVML read EXPLODE and
+    still expects exit 2.
+    """
+
     def test_a_named_refusal_is_one_line_and_exit_2(self):
-        """#1275 fix 2's shape: a refusal that escapes exits 1 and reads as a crash."""
         rc = xchg_census.cli(["--out", "/dev/null"])
         self.assertEqual(rc, 2)
 
     def test_a_refusal_is_not_swallowed_into_success(self):
         self.assertNotEqual(xchg_census.cli(["--out", "/dev/null"]), 0)
+
+    def test_the_argument_check_happens_before_any_hardware_read(self):
+        from sglang.srt.weg2 import launcher
+
+        def boom():
+            raise AssertionError("resolve_cards must not be reached")
+
+        real = launcher.resolve_cards
+        launcher.resolve_cards = boom
+        try:
+            self.assertEqual(xchg_census.cli(["--out", "/dev/null"]), 2)
+        finally:
+            launcher.resolve_cards = real
 
 
 if __name__ == "__main__":

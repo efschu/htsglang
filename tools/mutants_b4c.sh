@@ -184,5 +184,10 @@ m "M19 the split note never reaches the census" "$CE" \
   '        + ("; " + form_note if form_note else "")' \
   "        + \"\""
 
+# --- the danger direction: the CLI needs hardware to refuse a typo ---------
+m "M20 the argument check falls behind the NVML read" "$CE" \
+  "        raise _refuse(\"pass --form-from or --weight-chunks: the tag family is read, never guessed\")" \
+  '        family = []'
+
 echo "BASELINE AFTER: $(run)"
 verify_all
