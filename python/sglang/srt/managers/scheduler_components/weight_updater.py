@@ -765,14 +765,24 @@ class SchedulerWeightUpdaterManager:
                         ``pass``, nothing was released, there is nothing to
                         refill.  This wins over every other answer -- a stock
                         resume must be byte-for-byte the upstream path.
-        ``tms-backup``  ``--enable-weights-cpu-backup``: the TMS restore
-                        already carried the bytes (2.08 s / 27 GiB, campaign
-                        (a)).  Wins over ``exchange``: two writers for one
-                        payload is the ein-job-ein-mover defect, and the
-                        exchange would be overwriting bytes already correct.
-        ``exchange``    ``--weg2-weight-source exchange``: the peer group's
+        ``exchange``    ``--weg2-weight-source exchange`` AND
+                        ``--weg2-xchg-inject authoritative``: the peer group's
                         live VRAM is the source, through the bounded host
                         bounce.  The bytes MUST NOT come from disk here.
+                        ASKED FIRST of the three below ``stock`` (#1342 S1):
+                        it used to sit behind ``tms-backup``, and because the
+                        weg2 launcher arms the backup UNCONDITIONALLY that
+                        made this answer unreachable on every arm at every
+                        argv -- see the comment at the branch itself.
+        ``tms-backup``  ``--enable-weights-cpu-backup``: the TMS restore
+                        already carried the bytes (2.08 s / 27 GiB, campaign
+                        (a)).  Wins over ``disk`` and over a NON-authoritative
+                        exchange, so a ``shadow`` wake with a backup armed is
+                        this and not ``disk``.  It no longer wins over an
+                        AUTHORITATIVE exchange: two writers for one payload is
+                        the ein-job-ein-mover defect only while neither writer
+                        is the declared authority, and under ``authoritative``
+                        one of them is.
         ``disk``        none of the above: the upstream
                         ``update_weights_from_disk`` path, unchanged, which is
                         every ordinary RL boot.
@@ -836,8 +846,38 @@ class SchedulerWeightUpdaterManager:
                     "(record 1b round-2 Q2, option (ii)); a separate draft "
                     "checkpoint needs its own wake leg, which S1 does not build."
                 )
-        if main_carried:
-            return self.CARRIER_TMS_BACKUP
+        # #1342 S1: THE EXCHANGE IS ASKED FIRST -- ahead of `main_carried`,
+        # still BEHIND `stock` and behind all three W4 refusals above.
+        #
+        # WHY THE ORDER MOVED, measured on boot weg2xsn17 (571a3da963, record
+        # BOOT_weg2xsn17_0911.md).  `main_carried` used to return here FIRST,
+        # and it is `server_args.enable_weights_cpu_backup`, which the weg2
+        # launcher passes UNCONDITIONALLY in `common_flags`.  So this method
+        # could never reach the test below, `CARRIER_EXCHANGE` was unreachable
+        # on EVERY arm at EVERY argv, and FOUR boots of S6I instruments graded
+        # nothing.  The proof is positive rather than inferred: on that boot
+        # `Weg2WakeRefused` was bare 0 / genuine 0, which is what a
+        # never-entered raiser looks like and what an entered one could not be.
+        #
+        # THE ein-job-ein-mover OBJECTION IS NOT REFUTED, IT IS SUPERSEDED,
+        # and it is written out because it is the argument this reorder
+        # overturns.  The old precedence said: if the TMS backup carried the
+        # bytes the exchange must not write them too, because two writers for
+        # one payload is the defect.  True -- but only while neither writer is
+        # the declared authority.  Under `--weg2-xchg-inject authoritative`
+        # the exchange IS the authority by definition, so the situation is
+        # "one authority plus a redundant restore of the same bytes":
+        # wasteful, not incorrect.  B7 closes it properly by taking the host
+        # image from 42.96 GiB to 0.00; until then the redundancy is the price
+        # of the arm being REACHABLE, and an unreachable arm cannot be graded.
+        #
+        # `shadow` MUST NOT CHANGE ANSWER, and after this reorder it does not
+        # -- but it now declines for the RIGHT REASON.  It fails the
+        # `inject_authoritative()` conjunct below and falls through to
+        # `main_carried`, so a shadow wake with a backup is `tms-backup` (not
+        # `disk`: the backup really did carry the bytes) and without one is
+        # `disk`.  Before, the first of those two was decided by a flag's
+        # position rather than by the arm.
         try:
             from sglang.srt.weg2 import weight_exchange as wx
 
@@ -845,25 +885,44 @@ class SchedulerWeightUpdaterManager:
             # `--weg2-weight-source exchange` says the exchange is the weight
             # SOURCE; `--weg2-xchg-inject authoritative` says its injection has
             # REPLACED the refill.  Under the default `shadow` the refill stays
-            # the authority and the injection grades itself beside it, so the
-            # carrier is `disk` -- a boot that armed the exchange and has not
-            # been graded must not become the authority BY OMISSION, which is
-            # exactly the direction S6I exists to close.
+            # the authority and the injection grades itself beside it -- a boot
+            # that armed the exchange and has not been graded must not become
+            # the authority BY OMISSION, which is exactly the direction S6I
+            # exists to close.
             if wx.exchange_armed() and wx.inject_authoritative():
                 return self.CARRIER_EXCHANGE
         except Exception:  # noqa: BLE001 -- an unreadable arm is not an arm
+            # An unreadable arm falls through to the carriers below, which is
+            # the conservative direction: `tms-backup` if the backup is armed,
+            # else `disk`.  Both are answers that serve correct bytes; only
+            # `exchange` would depend on the arm this except clause could not
+            # read.
             pass
+        if main_carried:
+            return self.CARRIER_TMS_BACKUP
         return self.CARRIER_DISK
 
     def _weg2_xchg_inject_weights(self, **kw) -> None:
         """Fill the remapped weight pages from the PEER GROUP, not from disk.
 
-        #1273 S6 step 5, the authoritative half.  Under ``exchange`` the
-        weights region was opened ``enable_cpu_backup=False``, so the resume
-        recommitted pages whose CONTENT IS UNDEFINED and the ring had nothing
-        to restore -- which is why the only thing that filled them until now
-        was ``update_weights_from_disk`` (12.073/14.143/16.749 s per wake on
-        this rig, and the disk route #1317/#1323/#1325 exists to remove).
+        #1273 S6 step 5, the authoritative half.  The bytes come from the peer
+        group's live VRAM instead of from ``update_weights_from_disk``
+        (12.073/14.143/16.749 s per wake on this rig -- the disk route
+        #1317/#1323/#1325 exists to remove).
+
+        CORRECTED #1342: this docstring used to say that under ``exchange``
+        the weights region is opened ``enable_cpu_backup=False``, so the
+        resume recommits pages whose content is undefined.  THAT IS STALE AND
+        IT MISREADS THE ARM.  ``enable_cpu_backup`` is computed at
+        ``model_runner.py:2440-2442`` from ``server_args`` with NO arm
+        predicate, and the weg2 launcher passes ``--enable-weights-cpu-backup``
+        unconditionally, so the region IS cpu-backed on this arm and the TMS
+        restore does carry the bytes (boot weg2xsn17 served correctly through
+        8 flips on exactly this configuration, which is the corroborating
+        reading).  The stale sentence mattered: it makes ``tms-backup`` look
+        like a wrong answer for this arm, and it is not -- it is a redundant
+        one, which is why the carrier decision now asks the AUTHORITY question
+        rather than the "who could have carried it" question.
 
         THE TERM IS THE LAUNCHER'S, READ AND NEVER DERIVED.  A rank may not
         re-run the checkpoint census: that would be a second sizing authority
@@ -901,32 +960,128 @@ class SchedulerWeightUpdaterManager:
 
         SEPARATE FROM THE DECISION ABOVE so the seam's test can drive the
         decision without a device, and so the transport work has one entry
-        point.  It delegates to the two legs built in B2/B3
-        (:meth:`_weg2_xchg_agreed_leg` for the byte-identical pieces,
-        :meth:`_weg2_xchg_bounce_leg` for everything else).
+        point.  It delegates to :meth:`_weg2_xchg_bounce_leg`, which carries
+        the whole plan.  (It used to name a second leg for the byte-identical
+        pieces; that path was deleted in #1342 S3 -- see the note at the
+        section header below for why, and the "ONLY PATH (b)" paragraph.)
 
-        NOT YET REACHABLE ON THE METAL, and it says so rather than pretending:
-        the plan provider has no registrant (``weight_exchange.py``'s
-        ``TODO(S6)``: under ``exchange`` every rank votes ``ok=False`` with
-        ``NO_PLAN_REASON``), and the on-card diagonal lane is being fixed by
-        the boot seat this cycle after XSN9 died on ``pair_id(c, c)``.  Until a
-        plan reaches this method there is nothing to inject, and the honest
-        answer is a REFUSAL naming the missing producer -- not a silent return,
-        which would leave the model serving whatever the remap left behind.
+        WIRED #1342 S2.  This docstring used to end "NOT YET REACHABLE ON THE
+        METAL, and it says so rather than pretending", and the body was a bare
+        ``raise`` -- so the sentence was true and the delegation it described
+        was fiction.  Boot weg2xsn17 is what that cost: zero
+        ``WEG2-XCHG-INJECT`` lines on a boot whose flip path demonstrably ran.
+
+        BOTH OF THE OLD REFUSAL'S PREMISES WERE STALE, which is why it could be
+        removed rather than merely relaxed:
+
+        * *"the plan provider has no registrant (TODO(S6))"* -- it does.
+          ``arm_coverage_at_load`` is called from ``model_runner.py:2564`` at
+          load time and registers it via ``install_default_plan_provider``
+          (``weight_exchange.py:3109``).  Corroborated on metal: weg2xsn17
+          emitted 18 (P) / 21 (D) real ``WEG2-XCHG-PLAN card=`` lines.
+        * *"the on-card diagonal lane is being fixed ... after XSN9 died on
+          ``pair_id(c, c)``"* -- fixed (#1334), and weg2xsn17 realised
+          ``oncard-*.bin`` at 3 x 33,554,432 B.
+
+        THE REFUSALS THAT REMAIN ARE THE IDENTITY SWEEP, and they keep the
+        property the old body had by accident: an input this method cannot
+        resolve is a NAMED refusal, never a silent return.  The resume has
+        already remapped the weight pages, so returning without filling them
+        serves whatever the remap left behind -- that direction is pinned by
+        ``test_a_missing_plan_still_refuses_by_name``.
+
+        ONLY PATH (b) IS DRIVEN, and the reason is recorded because the
+        docstring used to promise two.  Path (a) -- the byte-identical
+        card-to-card set -- was DELETED in this slice, not left unwired: its
+        input is the per-flip-leg agreement verdict from
+        ``reconcile_card_manifest``, which does not exist at a wake refill
+        (this method has no leg identity: ``_weg2_wake_reload_weights`` calls
+        it with no request), and path (b) carries those bytes anyway.  Measured
+        on boot weg2xsn8 the agreed set was 4.90 MiB of a 27.52 GiB image --
+        0.018 %, a second mover for the same payload rather than a throughput
+        argument, which is the UPSTREAM-MINIMAL delete shape.
         """
-        raise Weg2WakeRefused(
-            "W4 Weg2WakeRefused: the exchange owns this wake's weight bytes "
-            f"and the launcher priced its bounce ({terms.total_bytes} B, "
-            f"{terms.expression()}), but no weight-exchange PLAN reached this "
-            "rank, so there is nothing to inject. The plan provider has no "
-            "registrant yet (weight_exchange.register_plan_provider, TODO(S6)) "
-            "and under `exchange` every rank votes ok=False with NO_PLAN_REASON "
-            "by design. Refusing: the resume has already remapped the weight "
-            "pages with UNDEFINED CONTENT, so returning would serve garbage "
-            "and falling back to the disk refill would silently restore the "
-            "very route this arm exists to remove. Boot with "
-            "--weg2-weight-source shadow or ring until the plan is wired."
+        from sglang.srt.weg2 import weight_exchange as wx
+        from sglang.srt.weg2 import weight_exchange_region as xr
+
+        priced = f"({terms.total_bytes} B, {terms.expression()})"
+
+        # -- the identity sweep, in the order the legs consume it ------------
+        boot_nonce = (os.environ.get(xr.ENV_REGION_BOOT, "") or "").strip()
+        if not boot_nonce:
+            raise Weg2WakeRefused(
+                "W4 Weg2WakeRefused: the exchange owns this wake's weight "
+                f"bytes and the launcher priced its bounce {priced}, but "
+                f"{xr.ENV_REGION_BOOT} is empty, so no region epoch names the "
+                "shared buffer the legs key every offset by. Refusing rather "
+                "than guessing a nonce: the resume has already remapped the "
+                "weight pages and their content is undefined."
+            )
+        group = self._weg2_group_name()
+        rank = self._weg2_rank()
+        if group not in ("P", "D") or rank < 0:
+            raise Weg2WakeRefused(
+                "W4 Weg2WakeRefused: the exchange owns this wake's weight "
+                f"bytes, but this rank has no Weg-2 identity (group={group!r} "
+                f"rank={rank}). Every row the plan addresses is keyed by the "
+                "rank's index inside its group; a sentinel may not travel into "
+                "a leg (the #1273 S6 fix-D class)."
+            )
+        device = self._weg2_device_index()
+        if device < 0:
+            raise Weg2WakeRefused(
+                "W4 Weg2WakeRefused: the exchange owns this wake's weight "
+                f"bytes, but torch reports no CUDA device on rank {rank} "
+                f"(group {group}), so there is no device for the bounce leg to "
+                "slice into. Refusing rather than injecting onto device -1."
+            )
+
+        # -- the plan, through the ONE product call site of build_plan -------
+        plan, plan_reason = self._weg2_shadow_plan(
+            "authoritative", group, int(rank), agreed=None)
+        if plan is None:
+            raise Weg2WakeRefused(
+                "W4 Weg2WakeRefused: the exchange owns this wake's weight "
+                f"bytes and the launcher priced its bounce {priced}, but no "
+                f"weight-exchange PLAN reached rank {rank} (group {group}): "
+                f"{plan_reason}. Refusing: returning would serve whatever the "
+                "remap left behind, and falling back to the disk refill would "
+                "silently restore the very route this arm exists to remove."
+            )
+
+        ops = self._weg2_xchg_device_ops()
+        if ops is None:
+            raise Weg2WakeRefused(
+                "W4 Weg2WakeRefused: the exchange owns this wake's weight "
+                f"bytes, but the CUDA device-ops layer could not be opened on "
+                f"rank {rank}, so no copy can be issued at all."
+            )
+
+        # THE MODE IS READ ONCE HERE and passed down, for the same reason
+        # :meth:`_weg2_xchg_bounce_leg` says so: a leg that re-read it further
+        # in could act on a different answer than the one it was entered with,
+        # and the two differ by "does this write into the live weights".
+        mode = wx.inject_mode()
+        self._weg2_xchg_bounce_leg(
+            descs=list(plan.raw_descs), ops=ops, boot_nonce=boot_nonce,
+            terms=terms, mode=mode, device=int(device),
         )
+
+        # THE INSTRUMENTS ARE EMITTED BY THE LEG, NOT HERE, and the first
+        # version of this method got that wrong in a way worth recording: it
+        # called `inject_summary_line([result])` with a `BounceResult` where a
+        # `Sequence[InjectVerdict]` belongs.  It raised on the first real
+        # object the test handed it -- which is exactly the value of driving
+        # the product's own types instead of a hand-written double.
+        #
+        # THE DEEPER REASON IT WAS WRONG: this path runs only under
+        # `authoritative`, and `run_bounce_leg` sets `comparing = mode ==
+        # INJECT_SHADOW`, so an authoritative leg produces NO `InjectVerdict`
+        # at all.  A summary emitted here would have counted a leg that never
+        # compared, printing `NOT-CLEAN` for a correctly-running authoritative
+        # wake -- an instrument lie in the same class as #1336.  The per-leg
+        # `WEG2-XCHG-INJECT` line and the running summary are now emitted
+        # inside `run_bounce_leg`, at the one site that holds the verdict.
 
     def _weg2_wake_reload_weights(self) -> None:
         """Fill the weight pages the resume recommitted, by whatever carries them.
@@ -1952,7 +2107,7 @@ class SchedulerWeightUpdaterManager:
                         wx.RunnerShape.of(runner))
                 except BaseException:  # noqa: BLE001 -- an unclassified shape
                     region_tag = ""
-            return sh.derive_leg_plan(
+            plan, reason = sh.derive_leg_plan(
                 hook=str(hook), group=str(group),
                 peer=("D" if group == "P" else "P"), rank=int(rank),
                 model=model, region_tag=region_tag,
@@ -1962,6 +2117,29 @@ class SchedulerWeightUpdaterManager:
                 # exactly the rank-local derivation boot weg2xsn5 refused 7 of 8
                 # legs on.  The product refuses by name instead.
                 agreed=agreed, require_agreement=True)
+            # #1342 S3: THE ACCEPTANCE LINE GETS ITS PRODUCTION READER HERE.
+            # `weight_exchange.emit_plan_line` -- the ONE emitter of
+            # `WEG2-XCHG-PLAN dir= ... plan_id=`, which census (d) grades --
+            # had ZERO production callers, only its `__all__` export and a
+            # docstring mention.  Boot weg2xsn17 measured the consequence
+            # directly: `plan_id` appeared 0 times in either group's log while
+            # a DIFFERENT emitter (`WEG2-XCHG-PLAN card=`) printed 18/21 lines,
+            # so the census item was ungradeable by construction rather than
+            # by absence of a plan.  This is the site that has the plan and the
+            # direction, so it is the site that prints it.
+            if plan is not None:
+                try:
+                    wx.emit_plan_line(
+                        plan,
+                        direction=("d2h" if hook == sh.HOOK_SOURCE else "h2d"),
+                        logger=logger)
+                except BaseException as exc:  # noqa: BLE001
+                    # An INSTRUMENT may never take the flip down: the plan is
+                    # already derived and valid, and failing to print it is a
+                    # lost reading, not a lost transfer.  Named, not swallowed.
+                    logger.info("WEG2-XCHG-PLAN emit failed: %s",
+                                _weg2_exc_note(exc))
+            return plan, reason
         except BaseException as exc:  # noqa: BLE001 -- an observer never raises
             # #1328, same reason as the manifest arm one method up: a swallowed
             # exception that reports only its type cannot be acted on.
@@ -2332,12 +2510,18 @@ class SchedulerWeightUpdaterManager:
     # These two are the product call sites of the exchange, and they differ
     # from the shadow's two hooks above in the one way that matters: the
     # shadow OBSERVES beside a ring that owns the bytes, and these OWN them.
-    # Under ``--weg2-weight-source exchange`` the weights region is opened
-    # ``enable_cpu_backup=False``, so ``resume`` recommits pages whose content
-    # is undefined and the ring has nothing to restore -- the bytes have to
-    # come from the peer group's live VRAM, through a bounded host buffer,
-    # instead of from ``update_weights_from_disk`` (:meth:`_weg2_wake_reload_weights`,
-    # measured 12.073/14.143/16.749 s per wake on this rig).
+    # Under ``--weg2-weight-source exchange`` the bytes come from the peer
+    # group's live VRAM, through a bounded host buffer, instead of from
+    # ``update_weights_from_disk`` (:meth:`_weg2_wake_reload_weights`, measured
+    # 12.073/14.143/16.749 s per wake on this rig).
+    #
+    # CORRECTED #1342, same stale claim as the one removed from
+    # :meth:`_weg2_xchg_inject_weights`: this comment used to assert that the
+    # arm opens the weights region ``enable_cpu_backup=False``.  It does not --
+    # ``model_runner.py:2440-2442`` computes that from ``server_args`` with no
+    # arm predicate.  The exchange is the authority here because
+    # ``--weg2-xchg-inject authoritative`` SAYS SO, not because nothing else
+    # could have carried the bytes.
     #
     # THEY RAISE.  An observer that took a flip down over its own bookkeeping
     # would be wrong, and that is why every shadow method above swallows; an
@@ -2346,6 +2530,27 @@ class SchedulerWeightUpdaterManager:
     # refusals are W68 (a run no slot can hold), W71 (a unit the buffer cannot
     # assemble whole) and W74 (a slice no source covers) -- all three from
     # modules that already own them, and no new W-code.
+
+    def _weg2_xchg_device_ops(self):
+        """This rank's CUDA device-ops layer, or ``None`` if it cannot open.
+
+        A SEAM, and that is its whole purpose: the transport's ops object is
+        the one input of the authoritative inject that cannot be constructed
+        without a GPU, so it lives behind a one-line method the hermetic tests
+        substitute.  Everything else the inject needs (the nonce, the identity,
+        the plan) is plain data and is driven for real in the tests.
+
+        ``None`` rather than an exception, because the caller turns it into the
+        same NAMED W4 refusal as every other missing input -- the shadow's
+        ``attach`` reports ``"no-ops"`` for the identical condition and this
+        mirrors it instead of inventing a second shape.
+        """
+        try:
+            from sglang.srt.weg2 import weight_exchange_transport as tp
+
+            return tp.CudartDeviceOps()
+        except BaseException:  # noqa: BLE001 -- no ops is not an error to raise
+            return None
 
     def _weg2_xchg_bounce_leg(self, *, descs, ops, boot_nonce,
                               slot_bytes=None, depth=None, terms=None,
@@ -2386,27 +2591,22 @@ class SchedulerWeightUpdaterManager:
             device=device, log=logger.info,
         )
 
-    def _weg2_xchg_agreed_leg(self, *, descs, ops, boot_nonce,
-                              slot_bytes=None, shm_root=None,
-                              device: int = 0):
-        """PATH (a): byte-identical pieces, card-to-card, TO LIVE STORAGE.
-
-        The authority question of path (a) is one line long: the shadow calls
-        ``sh.to_shadow`` to re-target every descriptor into its own buffer, and
-        this does NOT -- the descriptors keep their original ``dst_ptr``, so
-        what changes is the destination's live weight storage.  Measured on
-        boot weg2xsn8 the agreed set is 4.90 MiB against a 27.52 GiB image, so
-        this path is real and byte-negligible, and it is deliberately not
-        over-built for that reason.
-        """
-        from sglang.srt.weg2 import weight_exchange_bounce as bx
-        from sglang.srt.weg2 import weight_exchange_region as xr
-
-        return bx.run_agreed_leg(
-            descs, ops, boot_nonce, slot_bytes=slot_bytes,
-            shm_root=xr.SHM_ROOT if shm_root is None else shm_root,
-            device=device, log=logger.info,
-        )
+    # PATH (a) WAS DELETED HERE (#1342 S3), and the deletion is recorded
+    # rather than silent so a re-introduction has to argue with it.
+    #
+    # `_weg2_xchg_agreed_leg` moved the byte-identical card-to-card set to live
+    # storage.  It had ZERO production callers -- only the two docstring
+    # mentions in the section header above -- and it was a SECOND MOVER for a
+    # payload path (b) already carries: measured on boot weg2xsn8 the agreed
+    # set is 4.90 MiB of a 27.52 GiB image, i.e. 0.018 %, so keeping it is not
+    # a throughput argument.  Its input was unavailable at the one call site
+    # that exists, too: the agreement verdict comes from
+    # `reconcile_card_manifest`, a per-flip-leg artifact, and the wake refill
+    # has no leg identity.  UPSTREAM-MINIMAL: a second accounting of one
+    # payload is a delete candidate, and the repair carries the burden of
+    # proof.  `weight_exchange_bounce.run_agreed_leg`, `agreed_descs` and
+    # `AgreedResult` went with it; `test_the_deleted_second_mover_is_really_gone`
+    # pins the absence by name.
 
     def _weg2_corridor_floor_bytes(self) -> Optional[int]:
         """This card's corridor lower bound in bytes, or None (#1331).

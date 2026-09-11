@@ -199,17 +199,33 @@ def test_under_shadow_mode_the_refill_stays_the_authority(monkeypatch,
     assert m._weg2_wake_weight_carrier() == CARRIER_DISK
 
 
-def test_the_cpu_backup_wins_over_the_exchange_arm(monkeypatch, exchange):
-    """Two carriers armed at once is a CONFIGURATION to decide, not a race.
+def test_the_authoritative_exchange_wins_over_the_cpu_backup(monkeypatch,
+                                                             exchange):
+    """SUPERSEDED PRECEDENCE, INVERTED ON PURPOSE (#1342 S1).
 
-    If the TMS backup carried the bytes, the exchange must not also write them:
-    two writers for one payload is the ein-job-ein-mover defect, and the
-    exchange would be overwriting bytes that are already correct.  The backup
-    is the earlier and cheaper carrier (2.08 s / 27 GiB), so it wins, and the
-    decision says so once instead of two call sites each guessing.
+    THIS TEST USED TO ASSERT THE OPPOSITE and was named
+    `test_the_cpu_backup_wins_over_the_exchange_arm`.  It is renamed and
+    inverted rather than deleted, so the reversal shows up in the gate's name
+    diff as one GONE and one NEW with this docstring attached, instead of
+    vanishing.
+
+    Its old reasoning: two writers for one payload is the ein-job-ein-mover
+    defect, the backup is earlier and cheaper (2.08 s / 27 GiB), so the backup
+    wins.  That holds only while NEITHER writer is the declared authority.
+    Under `--weg2-xchg-inject authoritative` the exchange IS the authority, so
+    this is one authority plus a redundant restore of the same bytes --
+    wasteful, not incorrect -- and B7 closes it by taking the host image to
+    0.00 GiB.
+
+    What the old precedence actually cost, measured on boot weg2xsn17: because
+    the launcher passes `--enable-weights-cpu-backup` unconditionally,
+    `main_carried` was True on every boot, so this branch returned before the
+    exchange was ever asked and `CARRIER_EXCHANGE` was unreachable at every
+    argv.  An arm that cannot be selected cannot be graded, which is why four
+    boots of S6I instruments produced nothing.
     """
     m = _manager(_FakeServerArgs(weights_backup=True), monkeypatch)
-    assert m._weg2_wake_weight_carrier() == CARRIER_TMS_BACKUP
+    assert m._weg2_wake_weight_carrier() == CARRIER_EXCHANGE
 
 
 def test_the_stock_answer_wins_over_the_exchange_arm(monkeypatch, exchange):
@@ -416,11 +432,24 @@ def test_a_published_term_reaches_the_transfer_and_refuses_by_name(monkeypatch,
                                                                    exchange):
     """With the term present, the seam gets as far as the TRANSFER.
 
-    And the transfer refuses by name today, because the plan provider has no
-    registrant (`weight_exchange.register_plan_provider`, TODO(S6)) and the
-    on-card diagonal lane is still being fixed.  The refusal must name the
-    missing producer and print the priced size -- an operator reading it needs
-    to know the term was fine and the PLAN was not.
+    UPDATED #1342 S2, and the update is the point rather than a repair: this
+    test used to assert the refusal contained `NO_PLAN_REASON` or the phrase
+    "plan provider", because the transfer refused UNCONDITIONALLY with a
+    message naming an unregistered provider.  BOTH of that message's premises
+    were stale -- `arm_coverage_at_load` (called from `model_runner.py:2564`)
+    registers the provider via `install_default_plan_provider`, and boot
+    weg2xsn17 emitted 18/21 real `WEG2-XCHG-PLAN card=` lines -- so the
+    delegation was wired and the blanket refusal removed.
+
+    WHAT STILL MUST HOLD, and is what this test now pins: with a valid term
+    but NO plan reachable on this rank (no model on the fake runner, so the
+    derivation yields nothing), the transfer still REFUSES BY NAME and still
+    prints the priced size.  An operator reading it needs to know the term was
+    fine and the plan was not, and the resume has already remapped the weight
+    pages -- so a silent return here would serve whatever the remap left
+    behind.  The refusal now quotes the DERIVATION'S OWN reason instead of a
+    hard-coded sentence about a provider, which is strictly more informative
+    and cannot go stale the same way.
     """
     from sglang.srt.weg2 import xchg_bounce as xb
 
@@ -429,11 +458,134 @@ def test_a_published_term_reaches_the_transfer_and_refuses_by_name(monkeypatch,
         widest_layer_bytes=4_000_000, pairs=3, depth=2,
         slot_bytes=128 * xb.MIB,
     )
+    from sglang.srt.weg2 import weight_exchange_region as xr
+
     monkeypatch.setenv(xb.ENV_BOUNCE_TERMS, xb.publish_terms(terms))
+    # #1342: the inject now runs an IDENTITY SWEEP before it asks for a plan,
+    # so every earlier input has to be satisfied or the refusal this test is
+    # about is not the one that fires.  Supplying them is not test-fitting --
+    # it is what makes the assertion below actually about the PLAN, and on the
+    # way it drives the sweep's success path, which nothing else does.
+    monkeypatch.setenv(xr.ENV_REGION_BOOT, "1789122247")
+    monkeypatch.setattr(wu.SchedulerWeightUpdaterManager, "_weg2_group_name",
+                        lambda self: "D", raising=True)
+    monkeypatch.setattr(wu.SchedulerWeightUpdaterManager, "_weg2_rank",
+                        lambda self: 0, raising=True)
+    monkeypatch.setattr(wu.SchedulerWeightUpdaterManager, "_weg2_device_index",
+                        lambda self: 0, raising=True)
     m = _manager(_FakeServerArgs(), monkeypatch)
     with pytest.raises(wu.Weg2WakeRefused) as e:
         m._weg2_xchg_inject_weights()
     msg = str(e.value)
     assert "W4" in msg
-    assert "NO_PLAN_REASON" in msg or "plan provider" in msg
-    assert str(terms.total_bytes) in msg
+    assert "PLAN" in msg, "the refusal must still name the plan as the gap"
+    assert str(terms.total_bytes) in msg, "the priced size must still print"
+
+
+# ===========================================================================
+# #1342 S1: THE CARRIER PRECEDENCE, REORDERED SO THE EXCHANGE IS ASKED FIRST.
+#
+# WHY THIS BLOCK EXISTS, measured on boot weg2xsn17 (571a3da963, record
+# BOOT_weg2xsn17_0911.md): the router returned `tms-backup` at what was then
+# weight_updater.py:839-840 BEFORE it ever evaluated the exchange test at
+# :852-853, and `main_carried` is `server_args.enable_weights_cpu_backup`,
+# which the weg2 launcher passes UNCONDITIONALLY in `common_flags`.  So
+# CARRIER_EXCHANGE was unreachable on EVERY arm at EVERY argv, and four boots
+# of S6I instruments graded nothing.  Confirmed positively on that boot rather
+# than inferred: `Weg2WakeRefused` bare 0 / genuine 0, which is what a
+# never-entered raiser looks like and what an entered one could not be.
+#
+# THE ORDER SOUGHT (operator ruling): exchange (armed AND authoritative) ->
+# main_carried -> disk.  The point is not that `shadow` changes answer -- it
+# must NOT -- but that it declines for the RIGHT REASON (not authoritative)
+# instead of because a backup flag returned earlier.
+#
+# HONESTY ABOUT WHICH OF THESE IS RED: only
+# `test_the_exchange_is_asked_before_the_backup` is red on 571a3da963.  The
+# two `shadow` pins below PASS on both sides of the fix by construction --
+# they are OVERSHOOT GUARDS, not red tests, and they are labelled so rather
+# than presented as proof of the fix.  Their job is to fail if the reorder
+# ever slides `shadow` into `disk` or `exchange`.
+# ===========================================================================
+
+
+def test_the_exchange_is_asked_before_the_backup(monkeypatch, exchange):
+    """THE BLOCKER, and the one genuinely RED case in this block.
+
+    `exchange` + `authoritative` + `--enable-weights-cpu-backup` must answer
+    `exchange`.  On 571a3da963 it answers `tms-backup`, because the backup
+    branch returned before the exchange branch was reached.
+
+    THIS INVERTS `test_the_cpu_backup_wins_over_the_exchange_arm`, which
+    encoded the OLD precedence deliberately, and the inversion is argued
+    rather than assumed: under `authoritative` the exchange IS the authority
+    by definition, so the ein-job-ein-mover objection ("two writers for one
+    payload") becomes "one authority plus a redundant restore of the same
+    bytes" -- wasteful, not incorrect.  It is B7 that closes it properly by
+    taking the host image to 0.00 GiB; until then the redundancy is the price
+    of the arm being reachable at all, and an unreachable arm cannot be graded.
+    """
+    m = _manager(_FakeServerArgs(weights_backup=True), monkeypatch)
+    assert m._weg2_wake_weight_carrier() == CARRIER_EXCHANGE
+
+
+def test_shadow_with_a_backup_is_tms_backup_not_disk(monkeypatch,
+                                                     exchange_shadow):
+    """OVERSHOOT GUARD (passes before AND after the fix -- stated, not hidden).
+
+    `shadow` + backup armed must be `tms-backup`.  It is NOT `disk`: the
+    backup really did carry the bytes (`model_runner.py:2440-2442` computes
+    `enable_cpu_backup` from server_args with NO arm predicate, so the weights
+    region IS cpu-backed on the exchange arm -- the claim elsewhere in
+    weight_updater.py that `exchange` opens it `enable_cpu_backup=False` is
+    stale prose, corrected in this slice).
+
+    This is the half that makes the reorder safe: moving the exchange test
+    first must not strand `shadow` in `disk`, which would put the measured
+    12.073/14.143/16.749 s checkpoint reload back on every wake.
+    """
+    m = _manager(_FakeServerArgs(weights_backup=True), monkeypatch)
+    assert m._weg2_wake_weight_carrier() == CARRIER_TMS_BACKUP
+
+
+def test_shadow_declines_for_the_right_reason_not_by_flag_order(monkeypatch,
+                                                                exchange_shadow):
+    """OVERSHOOT GUARD, and it pins the REASON rather than only the answer.
+
+    With NO backup armed, `shadow` must still be `disk`.  Together with the
+    test above this separates the two reasons a `shadow` wake is not the
+    exchange: with a backup it is `tms-backup`, without one it is `disk`, and
+    in NEITHER case is it `exchange`.  On the old order the first of those two
+    was decided by the flag, not by the arm.
+    """
+    m = _manager(_FakeServerArgs(), monkeypatch)
+    assert m._weg2_wake_weight_carrier() == CARRIER_DISK
+
+
+def test_the_ring_arm_is_untouched_by_the_reorder(monkeypatch, ring):
+    """THE DANGER DIRECTION of the reorder: the default boot must not move.
+
+    `ring` + backup must stay `tms-backup`, and `ring` without it `disk`.  The
+    exchange test now runs FIRST, so a predicate that answered True on `ring`
+    would silently make every ordinary RL boot inject from a peer that is not
+    there.  Asserted on both flag settings in one test so the pair cannot
+    drift apart.
+    """
+    m = _manager(_FakeServerArgs(weights_backup=True), monkeypatch)
+    assert m._weg2_wake_weight_carrier() == CARRIER_TMS_BACKUP
+    m2 = _manager(_FakeServerArgs(), monkeypatch)
+    assert m2._weg2_wake_weight_carrier() == CARRIER_DISK
+
+
+def test_stock_still_outranks_the_exchange_after_the_reorder(monkeypatch,
+                                                            exchange):
+    """`stock` must remain the FIRST answer, ahead of the moved exchange test.
+
+    No memory saver means `pause()` released nothing, so an exchange that
+    injected here would write into pages the model is still using.  The
+    reorder moves the exchange ABOVE the backup, and this pins that it did not
+    also move above `stock`.
+    """
+    m = _manager(_FakeServerArgs(memory_saver=False, weights_backup=True),
+                 monkeypatch)
+    assert m._weg2_wake_weight_carrier() == CARRIER_STOCK
