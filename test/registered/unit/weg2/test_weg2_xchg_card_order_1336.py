@@ -311,11 +311,58 @@ def test_a_blank_entry_reaches_us_as_a_short_vector_and_that_is_stated(no_env):
         "the docstring must state that the owner's parser drops blank fields"
 
 
+def test_the_blank_ratchet_fires_if_the_owner_ever_preserves_empty_fields(no_env):
+    """THE RATCHET, EXERCISED -- so `reason=blank` is not dead code.
+
+    Raised by seat 4: the mapping "a,,c -> count" is a statement about ANOTHER
+    MODULE's parse, and such statements rot silently. Two answers, both here.
+
+    (1) The `count` test above DRIVES the owner's real parse rather than
+        restating it: it sets the real variable and calls the real producer, so
+        the day `rank_cards` preserves empty fields that test FAILS. When it
+        does, the fix is to update the docstring and expect `blank` -- NOT to
+        relax the assertion. Measured 2026-09-11 with the substitution below:
+        the reason flips `count` -> `blank` exactly then.
+    (2) That day is simulated here, so the branch has been executed at least
+        once. `rank_cards` is the canonical owner and this slice may not change
+        its parse; substituting its reader for one test is how the consumer
+        proves it is ready for a change it does not control.
+    """
+    no_env.setenv(RC.RANK_CARD_UUIDS_ENV, "GPU-aaa,,GPU-ccc")
+    # Today: the owner drops the field, so we see a SHORT vector.
+    assert RC.rank_card_vector().uuids == ("GPU-aaa", "GPU-ccc")
+    with pytest.raises(xr.Weg2XchgCardUuidMapUnusable) as exc:
+        xr.uuid_of_card()
+    assert "reason=count" in str(exc.value)
+
+    # And the day it preserves them, the ratchet -- not a silent re-index.
+    no_env.setattr(
+        RC, "_parse_env_vector",
+        lambda raw: RC.RankCardVector(
+            uuids=tuple(part.strip() for part in raw.split(",")),
+            bdfs=(), source="blank-preserving parser (test substitution)"))
+    assert RC.rank_card_vector().uuids == ("GPU-aaa", "", "GPU-ccc")
+    with pytest.raises(xr.Weg2XchgCardUuidMapUnusable) as exc:
+        xr.uuid_of_card()
+    assert "reason=blank" in str(exc.value), str(exc.value)
+
+
 def test_an_absent_vector_carries_the_owners_own_reason(no_env):
     """A refusal that swallows the producer's reason makes the next reader
-    rediscover it. `rank_cards` names why it has nothing; we forward it."""
+    rediscover it -- which is what cost XSN9 and XSN10 a window each.
+
+    CAUGHT BY A MUTANT, 2026-09-11: the first form of this test asserted
+    `reason=unset` and the variable name, and BOTH survive a mutant that
+    replaces the forwarded reason with a constant. It now compares against the
+    owner's OWN wording, read from the owner at test time, so it tracks a
+    rephrasing there instead of hard-coding one -- and it fails the moment the
+    forwarding is dropped.
+    """
+    owner_reason = RC.rank_card_vector().reason
+    assert owner_reason, "the owner must name why it has no vector"
     with pytest.raises(xr.Weg2XchgCardUuidMapUnusable) as exc:
         xr.uuid_of_card()
     text = str(exc.value)
     assert "reason=unset" in text, text
     assert RC.RANK_CARD_UUIDS_ENV in text, text
+    assert owner_reason in text, (owner_reason, text)
