@@ -242,6 +242,14 @@ class XchgResidency:
     floor_mib: float = 0.0
     refusals: List[str] = field(default_factory=list)
     lines: List[str] = field(default_factory=list)
+    #: B4d: THE PARTITION THIS TABLE WAS SOLVED OVER, carried out so the
+    #: launcher can publish the very object it priced.  ``waves`` above is a
+    #: COUNT (the highest wave index in ``rows``); this is the list, and the
+    #: difference is the whole reason the publication exists -- the ranks
+    #: cannot derive it (a chunk tag is a layer band and a rank holds only its
+    #: own stage's layer count) and a second reader of the census would be a
+    #: second scheduling authority.
+    partition: Tuple[Tuple[str, ...], ...] = ()
 
     @property
     def armed(self) -> bool:
@@ -467,7 +475,8 @@ def solve(
     unmapped.  S6 owns the preamble; until it exists W71 is launch-only and
     that is a WEAKER gate than section 5.3 specifies, not an equal one.
     """
-    res = XchgResidency(provenance=census.provenance, floor_mib=float(floor_mib))
+    res = XchgResidency(provenance=census.provenance, floor_mib=float(floor_mib),
+                        partition=tuple(census.waves))
     res.order = [getattr(c, "uuid", "") for c in cards]
     # Round-2 refuter F13: every per-card figure below is keyed by UUID, so two
     # cards sharing one key (or carrying none) collapse into one row and the

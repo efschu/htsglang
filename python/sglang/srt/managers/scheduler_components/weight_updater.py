@@ -1257,13 +1257,32 @@ class SchedulerWeightUpdaterManager:
         )
         # C15: the ok-bit, strictly AFTER the barrier that names a non-joiner.
         rank = torch.distributed.get_rank(group=cpu_group)
+        # B4d: THE WAVE PARTITION IS A GROUP FACT, so it is decided HERE and
+        # nowhere else.  `waves_for_plan` RECORDS a published-vs-derived
+        # mismatch instead of raising, because a raise inside the plan builder
+        # is rank-local and the other five ranks would carry on and meet a peer
+        # that is gone.  This fence is the wired group-uniform mechanism of the
+        # wake path, so the reason rides its per-rank dict and any one rank's
+        # mismatch makes EVERY rank raise W29 with the same peer list.  No new
+        # bus, and no second group-uniform error: W29's contract already says
+        # "every rank stops in this fence".
+        #
+        # THE DIGESTS TRAVEL EVEN WHEN THEY AGREE, which is the half a reader
+        # needs at 3am: the fence line then states what each rank actually
+        # planned, so "all six agreed on the priced partition" is a MEASUREMENT
+        # rather than an absence of complaint.
+        from sglang.srt.weg2 import weight_exchange as wx
+
+        wave_reason = wx.wave_disagreement()
         mine = {
             "rank": rank,
-            "ok": bool(ok),
-            "failure": str(failure or ""),
+            "ok": bool(ok) and not wave_reason,
+            "failure": str(failure or "") or str(wave_reason or ""),
             "card": self._weg2_card_uuid() or "unknown",
             "leg_ms": float(leg_ms),
             "per_tag": dict(per_tag or {}),
+            "waves_published": wx.waves_digest(wx.published_waves() or ()),
+            "waves_planned": wx.waves_digest(wx.planned_waves() or ()),
         }
         gathered: List[Optional[Dict[str, Any]]] = [None] * world
         torch.distributed.all_gather_object(gathered, mine, group=cpu_group)
