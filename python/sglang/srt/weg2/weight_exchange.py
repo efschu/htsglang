@@ -147,6 +147,7 @@ __all__ = [
     "plan_id",
     "plan_provider",
     "refuse_if_not_ok",
+    "coverage_leg_decision",
     "register_plan_provider",
     "resident_line",
     "roll_forward_refusal_message",
@@ -2484,6 +2485,61 @@ def refuse_if_not_ok(vote: CoverageVote) -> CoverageVote:
     if not vote.ok:
         raise Weg2XchgCoverageRefused(vote.reason)
     return vote
+
+
+
+def coverage_leg_decision() -> Tuple[bool, str, bool]:
+    """``(shadow leg armed, reason, stop the group)`` from THIS boot's vote.
+
+    THE MISSING CONSUMER, and its absence is why boot weg2xsn14 printed
+    ``uncovered=12`` on 39 of 40 ``WEG2-XCHG-COVER`` lines while
+    ``W84 Weg2XchgCoverageRefused`` read genuine 0.  Nothing was mis-predicated:
+    :func:`arm_coverage` is deliberately non-raising (refuter F5 -- at the end
+    of weight loading there is no group fence in scope, and a rank that raised
+    there would die while the other five walked into a collective with five
+    members), it records the verdict through :func:`_record_boot_vote`, and the
+    raiser it hands that verdict to is documented *"ONLY where a group fence
+    covers it"* -- and had no production caller.  A value computed, recorded,
+    and acted on by nobody: the success-value-without-action class this fork
+    keeps a semgrep rule for.
+
+    THE TWO MODES DIFFER, and neither answer is the other's default:
+
+    * ``shadow`` -- the ring is the authority and the exchange lane is
+      report-only, so the SHADOW LEG is refused BY NAME and the flip PROCEEDS.
+      A boot that cannot account for a tag must not also lose its flip; the
+      whole purpose of the shadow arm is to find this out without the exchange
+      being able to break anything.
+    * ``authoritative`` -- the exchange owns the bytes, so an unaccounted tag
+      means the destination would serve whatever its arena held.  That is a
+      STOP, and the caller makes it GROUP-UNIFORM by voting not-ok at the wake
+      fence: every rank then raises ``Weg2FlipRankDisagree`` (W29) carrying
+      this reason.  The rank-local raiser stays unwired, per the same F5
+      reasoning that created the vote in the first place.
+
+    Returned rather than raised for exactly that reason: the decision belongs
+    to whoever holds the fence.
+    """
+    vote = boot_vote()
+    if vote is None or vote.ok:
+        return True, "", False
+    reason = vote.reason or coverage_refusal_message(vote.rows)
+    if inject_authoritative():
+        return False, (
+            f"{reason} -- INJECT=AUTHORITATIVE, so this is a STOP: the "
+            "injection owns the weight bytes and a tag the exchange cannot "
+            "account for means the destination would serve whatever its arena "
+            "held.  Raised group-uniformly at the wake fence (W29) so all six "
+            "ranks stop together."
+        ), True
+    return False, (
+        f"{reason} -- INJECT=SHADOW, so the SHADOW LEG REFUSED and the flip "
+        "PROCEEDS ON THE RING: the refill is the authority here and the "
+        "exchange lane is report-only, so an unaccounted tag disarms the "
+        "comparison rather than the boot.  This is the finding the shadow arm "
+        "exists to produce; it becomes a STOP under --weg2-xchg-inject "
+        "authoritative."
+    ), False
 
 
 def arm_coverage(

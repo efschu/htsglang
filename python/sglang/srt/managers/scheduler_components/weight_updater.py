@@ -1257,10 +1257,25 @@ class SchedulerWeightUpdaterManager:
         )
         # C15: the ok-bit, strictly AFTER the barrier that names a non-joiner.
         rank = torch.distributed.get_rank(group=cpu_group)
+        # B4g wall 1: THE COVERAGE VERDICT, consumed at last.  `arm_coverage`
+        # records it at load and cannot raise there (no fence in scope, refuter
+        # F5); this IS the fence its own docstring names, so the verdict becomes
+        # an action here and nowhere else.  Under `shadow` the leg is disarmed
+        # and the flip proceeds on the ring; under `authoritative` it votes
+        # not-ok and every rank raises W29 carrying W84's own text.  Boot
+        # weg2xsn14 printed uncovered=12 on 39 of 40 COVER lines with W84
+        # genuine 0 because this consumer did not exist.
+        from sglang.srt.weg2 import weight_exchange as wx
+
+        coverage_armed, coverage_reason, coverage_stop = wx.coverage_leg_decision()
+        if coverage_reason:
+            logger.error("%s", coverage_reason)
         mine = {
             "rank": rank,
-            "ok": bool(ok),
-            "failure": str(failure or ""),
+            "ok": bool(ok) and not coverage_stop,
+            "failure": (str(failure or "")
+                        or (str(coverage_reason) if coverage_stop else "")),
+            "coverage_armed": bool(coverage_armed),
             "card": self._weg2_card_uuid() or "unknown",
             "leg_ms": float(leg_ms),
             "per_tag": dict(per_tag or {}),
