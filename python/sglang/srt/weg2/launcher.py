@@ -3622,7 +3622,7 @@ Weg2XchgFormSourceMissing = ring_table.Weg2RingFormMismatch
 
 
 def refuse_unless_same_form_source(
-    table: Optional["ring_table.RingTable"], weight_source: str
+    table: Optional[ring_table.RingTable], weight_source: str
 ) -> None:
     """Under an armed arm, a table solved from ANOTHER form is a refusal.
 
