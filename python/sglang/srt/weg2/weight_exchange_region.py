@@ -123,21 +123,6 @@ N_GROUPS = 2
 N_CARDS = 3
 N_RANKS = N_GROUPS * N_CARDS
 
-#: THE LAUNCHER'S CARD ORDER, published into every rank's environment. #1336.
-#:
-#: Comma-separated GPU UUIDs; **the index IS the card ordinal** that
-#: :data:`CROSS_PAIRS`, :func:`rank_row` and the semaphore names address.  The
-#: launcher publishes it beside the other xchg variables on the shadow and
-#: exchange arms (the ring publishes nothing) and the re-exec'd scheduler
-#: children inherit it.  Named here and read here, once: the launcher publishes
-#: what this module reads, and a retyped literal is how two ends drift.
-#:
-#: NOT ``CUDA_VISIBLE_DEVICES``, and that distinction cost boot weg2xsn11:
-#: measured from ``/proc/<pid>/environ``, every ``sglang::scheduler`` process --
-#: the one that runs the flip leg -- has CVD narrowed to its OWN SINGLE CARD,
-#: while only the parent ``launch_server`` keeps all three.
-ENV_CARD_UUIDS = "SGLANG_WEG2_XCHG_CARD_UUIDS"
-
 #: The six DIRECTED cross-card pairs.  On-card traffic takes the IPC lane and
 #: never a staging slot (spec section 2.2 / S4), so the diagonal is absent.
 CROSS_PAIRS: Tuple[Tuple[int, int], ...] = (
@@ -391,12 +376,14 @@ class Weg2XchgCardUuidMapUnusable(RuntimeError):
     input declared with an unusable default is a defect of its own; the answer
     is a producer plus this refusal, never a padded or truncated map.
 
-    WHY THIS MODULE READS IT AND THE LAUNCHER PUBLISHES IT (#1336, operator
-    ruling).  The card ORDER is the launcher's fact -- it is the order in which
-    the launcher enumerated the cards -- and this module's invariant is that
-    *rank n of either group runs on ``cards[n]``*.  So the launcher publishes
-    :data:`ENV_CARD_UUIDS` and this is the one place it is read: one producer,
-    no handshake between ranks, no second producer of card order.
+    WHY THIS MODULE ONLY CONSUMES (#1336, operator ruling REVISED to Option
+    B).  The card ORDER is the launcher's fact and it already has a canonical
+    mover: :mod:`sglang.srt.registry.rank_cards` publishes it in the parent
+    before the spawn loop and owns the parse and the world-size check.  The
+    ruling's first form would have added a second variable for the same
+    payload; its premise ("no publisher exists") was falsified by measured
+    code, so this module reads the existing vector through the owner's reader
+    and defines nothing.  One job, one mover.
 
     **AND THERE IS NO FALLBACK, WHICH IS A DESIGN DECISION AND NOT AN
     OVERSIGHT.**  Boot weg2xsn11 measured both halves of why:
@@ -415,13 +402,17 @@ class Weg2XchgCardUuidMapUnusable(RuntimeError):
 
     WHAT IT REFUSES, and each reason is NAMED in the message:
 
-    * ``unset`` -- the variable is missing or blank.  A rank with no map cannot
-      label, and must not invent, its pairs -- and must not go looking for one
-      in another variable or in a device enumeration (see above).
-    * ``count`` -- not exactly :data:`N_CARDS` entries.  Padding a short list
-      or dropping a surplus entry would shift the index off the card ordinal,
-      which is a wrong LABEL on the acceptance line and a wrong IDENTITY in
-      the check below -- silently.
+    * ``unset`` -- the owner reports no vector, and its own reason is
+      forwarded verbatim.  A rank with no map cannot label, and must not
+      invent, its pairs -- and must not go looking for one in another variable
+      or in a device enumeration (see above).
+    * ``count`` -- not exactly :data:`N_CARDS` entries.  The published vector
+      is one uuid per WORLD rank while this module indexes by CARD, so the two
+      lengths are different quantities that merely coincide on the three-rank
+      form; slicing or padding to fit would shift the index off the card
+      ordinal, which is a wrong LABEL on the acceptance line and a wrong
+      IDENTITY in the check below -- silently.  Also where a dropped blank
+      field lands, because the owner's parser removes empty entries.
     * ``blank`` -- an empty entry between two commas.
     * ``duplicate`` -- two ordinals naming the same physical card, which would
       turn a CROSS pair into an on-card one behind the pair tables' back.
@@ -435,56 +426,84 @@ class Weg2XchgCardUuidMapUnusable(RuntimeError):
     """
 
 
-def uuid_of_card(env: Optional[str] = None) -> Tuple[str, ...]:
-    """The card->uuid map, in CARD ORDER, from the launcher's own string.
+def uuid_of_card() -> Tuple[str, ...]:
+    """The card->uuid map, in CARD ORDER, from the launcher's own vector.
 
-    ``env`` is for tests and for a caller that already holds the string; when
-    it is ``None`` :data:`ENV_CARD_UUIDS` is read here -- and ONLY that
-    variable.  There is no fallback to ``CUDA_VISIBLE_DEVICES``, to NVML or to
-    CUDA enumeration, for the measured reason in
-    :class:`Weg2XchgCardUuidMapUnusable`: those name the cards in a DIFFERENT
-    ORDER, so a fallback map would be wrong-ordinal rather than absent.  The returned index IS the card
-    ordinal (see :class:`Weg2XchgCardUuidMapUnusable` for why that is a
-    contract and not a convenience).
+    OPTION B (operator ruling, revised 2026-09-11).  This module is a
+    CONSUMER: the canonical mover of this payload is
+    :mod:`sglang.srt.registry.rank_cards`, whose
+    :data:`~sglang.srt.registry.rank_cards.RANK_CARD_UUIDS_ENV` the launcher
+    publishes in the parent BEFORE the spawn loop and whose readers own the
+    parse.  Nothing about the variable is retyped here and no second variable
+    exists -- the first form of the ruling would have added one, and its
+    premise ("no publisher exists") was falsified by measured code.
 
-    Refuses by name rather than returning a partial map: see that class for
-    the four reasons and for the two boots this cost.
+    THE INDEX IS THE CARD ORDINAL, which is what makes :data:`CROSS_PAIRS`,
+    :func:`rank_row` and the semaphore names addressable -- and that holds
+    because ``rank_cards`` builds the vector from the LAUNCHER's placement
+    (``gpu_id_for_rank`` -> the #331 IdentityMap), not from NVML enumeration.
+    Measured on boot weg2xsn11, both groups: ``rank0=<5090> rank1=<3080>
+    rank2=<3080>``, byte-identical to the parent's ``CUDA_VISIBLE_DEVICES``
+    order.
+
+    TWO DIFFERENT QUANTITIES COINCIDE HERE AND THE COINCIDENCE IS ASSERTED,
+    NOT USED.  ``rank_cards`` indexes by WORLD RANK and checks ``world_size``;
+    this module indexes by CARD and its invariant is :data:`N_CARDS`.  They are
+    equal on the Weg-2 form only because each group is three ranks and *rank n
+    of either group runs on cards[n]*.  A world of six -- a pipeline stage, a
+    MoE-TP subgroup -- separates them, and a six-entry vector re-indexed as a
+    card table would attribute one rank's card to another silently.  So the
+    length is checked HERE, by name, against ``N_CARDS``.
+
+    ONE INSTRUMENT NOTE, stated because it reclassifies a refusal: the owner's
+    parser DROPS empty fields, so ``"a,,c"`` arrives as two entries and is
+    refused ``count`` rather than ``blank``.  Re-parsing the raw string here to
+    tell them apart would put a second parser of the same string in a second
+    module, which is exactly what Option B exists to avoid.
+
+    Refuses by name rather than returning a partial or re-indexed map; see
+    :class:`Weg2XchgCardUuidMapUnusable` for the reasons and the two boots this
+    cost.
     """
-    raw = os.environ.get(ENV_CARD_UUIDS) if env is None else env
-    source = ENV_CARD_UUIDS if env is None else "the injected string"
-    if raw is None or not str(raw).strip():
-        # SHORT BY DESIGN (#1335): this message travels as ONE field of a leg
-        # line through `exc_note`, whose budget a paragraph would spend --
-        # dropping the ` @ file:line` the note exists for. Code, reason and
-        # WHAT WAS READ; the rationale lives in this class's docstring.
+    from sglang.srt.registry import rank_cards
+
+    env_name = rank_cards.RANK_CARD_UUIDS_ENV
+    # NO world_size HERE ON PURPOSE: the owner's check would refuse a
+    # wrong-length vector with ITS reason, and this module must refuse it with
+    # ITS OWN name and the N_CARDS it actually indexes by.  Asking for the raw
+    # vector keeps both checks, each owned by the quantity it is about.
+    vector = rank_cards.rank_card_vector()
+    if not vector.present:
         raise Weg2XchgCardUuidMapUnusable(
-            f"W23 Weg2XchgCardUuidMapUnusable reason=unset src={source} "
-            f"read={raw!r}"
+            f"W23 Weg2XchgCardUuidMapUnusable reason=unset src={env_name} "
+            f"owner_reason={vector.reason}"
         )
-    entries = [part.strip() for part in str(raw).split(",")]
+    entries = tuple(str(u).strip() for u in vector.uuids)
     if len(entries) != N_CARDS:
         raise Weg2XchgCardUuidMapUnusable(
-            f"W23 Weg2XchgCardUuidMapUnusable reason=count src={source} "
-            f"got={len(entries)} want={N_CARDS} read={raw!r}"
+            f"W23 Weg2XchgCardUuidMapUnusable reason=count src={env_name} "
+            f"got={len(entries)} want={N_CARDS}: that vector is one uuid per "
+            f"WORLD rank and this module indexes by CARD ordinal -- two "
+            f"different quantities, equal only on the three-rank form. It is "
+            f"NOT sliced to fit"
         )
     if any(not e for e in entries):
         raise Weg2XchgCardUuidMapUnusable(
-            f"W23 Weg2XchgCardUuidMapUnusable reason=blank src={source} "
-            f"read={raw!r}"
+            f"W23 Weg2XchgCardUuidMapUnusable reason=blank src={env_name} "
+            f"read={entries!r}"
         )
     # TWO ORDINALS MAY NOT NAME ONE CARD.  :data:`CROSS_PAIRS` addresses six
     # DIRECTED CROSS-card pairs by ordinal; if two ordinals carry the same
     # uuid, a "cross" pair is really on-card, so the staging lane would be
     # asked to move bytes from a card to itself while the diagonal carrier
-    # that exists for exactly that sits unused.  Refused, with the repeated
-    # uuid named.
+    # that exists for exactly that sits unused.
     repeated = sorted({e for e in entries if entries.count(e) > 1})
     if repeated:
         raise Weg2XchgCardUuidMapUnusable(
-            f"W23 Weg2XchgCardUuidMapUnusable reason=duplicate src={source} "
-            f"repeated={','.join(repeated)} read={raw!r}"
+            f"W23 Weg2XchgCardUuidMapUnusable reason=duplicate src={env_name} "
+            f"repeated={','.join(repeated)} read={entries!r}"
         )
-    return tuple(entries)
+    return entries
 
 
 def require_card_uuid_map(

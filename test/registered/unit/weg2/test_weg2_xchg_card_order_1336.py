@@ -29,12 +29,46 @@ label, and worse a wrong identity check that refuses correct ranks.  A refusal
 is strictly better than a plausible map, so there is no fallback at all and a
 mutant that adds one must go red.
 
-OPERATOR RULING (2026-09-11, plan S6-BOUNCE): the launcher publishes
-``SGLANG_WEG2_XCHG_CARD_UUIDS`` -- comma-separated GPU UUIDs in LAUNCHER CARD
-ORDER, index == the card ordinal the region and pair tables use -- beside the
-other xchg variables, on the shadow and exchange arms (the ring publishes
-nothing), inherited by the re-exec'd scheduler children.  One producer, no
-region handshake, no second producer of card order.
+OPERATOR RULING, FIRST FORM, then REVISED -- and the revision is the point.
+The first ruling had the launcher publish a NEW variable
+``SGLANG_WEG2_XCHG_CARD_UUIDS``.  Its premise ("no publisher exists") is
+FALSIFIED BY MEASURED CODE: a canonical mover of this exact payload already
+exists and already runs on our boots.
+
+    RANK_CARD_UUIDS_ENV = "SGLANG_RANK_CARD_UUIDS"     registry/rank_cards.py:82
+    publish_rank_card_uuids(server_args)               entrypoints/engine.py:671
+      -- in the PARENT, BEFORE the spawn loop, whose own comment states our
+         inheritance premise verbatim: "the channel is the environment, and a
+         spawned scheduler inherits it only if it is set by now"
+    resolve_rank_card_vector -> uuids[rank] = by_cuda_ordinal(ordinals[rank])
+      -- source "launcher placement (gpu_id_for_rank -> #331 IdentityMap)",
+         i.e. LAUNCHER PLACEMENT ORDER and explicitly not NVML enumeration
+    readers rank_card_vector / rank_card_uuids, with their own length check
+    weg2/launcher.py already passes ``--rank-gpu-id 0,1,2``, so the
+      publisher's CUDA-side gate is satisfied on every weg2 boot
+
+MEASURED on XSN11 (both runs, BOTH groups, from the boot logs):
+
+    rank->card vector (launcher placement (gpu_id_for_rank -> #331 IdentityMap)):
+      rank0=GPU-31d7ef41 [0A:00.0]  rank1=GPU-5c648f96 [05:00.0]  rank2=GPU-62dbbae1
+
+byte-identical to the parent's ``CUDA_VISIBLE_DEVICES`` order, the SAME vector
+on P and D, and ``no CUDA context`` 0.  So a second publisher would be the
+one-job-one-mover violation the ruling invoked, entered from the producer side.
+
+**REVISED RULING (OPTION B): the region CONSUMES the existing vector through
+``rank_cards``' own reader and nothing else.  No launcher change; seat 4's
+publisher is parked as the fallback.**  What stays from the first form: the
+W23-family refusals and the NO-FALLBACK rule, because they are load-bearing
+and independent of the source.
+
+AND ONE THING THE REVISION ADDS, because two different quantities coincide
+here by accident of form: ``rank_cards`` checks **WORLD_SIZE**, this module's
+invariant is **N_CARDS**.  They are equal on the Weg-2 form only because each
+group is three ranks and *rank n of either group runs on cards[n]*.  A future
+arm (a pipeline stage, a MoE-TP subgroup, six ranks in one world) separates
+them, and a vector of the wrong length would be silently re-indexed as a card
+table.  The coincidence is therefore ASSERTED, not relied on.
 """
 
 from __future__ import annotations
@@ -46,6 +80,7 @@ import pytest
 
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 
+from sglang.srt.registry import rank_cards as RC  # noqa: E402
 from sglang.srt.weg2 import weight_exchange_region as xr  # noqa: E402
 
 THREE = ("GPU-aaa", "GPU-bbb", "GPU-ccc")
@@ -53,8 +88,8 @@ THREE = ("GPU-aaa", "GPU-bbb", "GPU-ccc")
 
 @pytest.fixture()
 def no_env(monkeypatch):
-    """Neither variable set, so every test states its own input."""
-    monkeypatch.delenv(xr.ENV_CARD_UUIDS, raising=False)
+    """Nothing set, so every test states its own input."""
+    monkeypatch.delenv(RC.RANK_CARD_UUIDS_ENV, raising=False)
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "")
     return monkeypatch
 
@@ -64,29 +99,15 @@ def no_env(monkeypatch):
 # ===========================================================================
 
 
-def test_the_variable_is_the_ruled_name_and_is_a_published_constant():
-    """Red at `8dc93297f7`: `xr.ENV_CARD_UUIDS` does not exist.
-
-    A constant and not a literal, because the launcher publishes what the
-    region reads and a retyped string is how two ends drift (the same reason
-    the transport publishes `ENV_ONCARD_MODE` rather than spelling it twice).
-    """
-    assert xr.ENV_CARD_UUIDS == "SGLANG_WEG2_XCHG_CARD_UUIDS"
-    src = inspect.getsource(xr.uuid_of_card)
-    assert "SGLANG_WEG2_XCHG_CARD_UUIDS" not in src, \
-        "the producer reads the CONSTANT, it does not retype the name"
-    assert "ENV_CARD_UUIDS" in src
-
-
 def test_the_producer_reads_that_variable_in_launcher_card_order(no_env):
-    no_env.setenv(xr.ENV_CARD_UUIDS, ",".join(THREE))
+    no_env.setenv(RC.RANK_CARD_UUIDS_ENV, ",".join(THREE))
     got = xr.uuid_of_card()
     assert got == THREE, got
     # INDEX == CARD ORDINAL is the whole contract; the launcher's order is not
     # NVML's, so this is the only thing that makes CROSS_PAIRS addressable.
     assert got[1] == "GPU-bbb"
     assert len(got) == xr.N_CARDS
-    no_env.setenv(xr.ENV_CARD_UUIDS, " GPU-aaa , GPU-bbb ,GPU-ccc ")
+    no_env.setenv(RC.RANK_CARD_UUIDS_ENV, " GPU-aaa , GPU-bbb ,GPU-ccc ")
     assert xr.uuid_of_card() == THREE
 
 
@@ -123,13 +144,16 @@ def test_the_producer_never_reaches_for_nvml_or_torch(no_env):
     # test that forbade the word would forbid the explanation -- it did, on
     # its first run, and that is a finding about the test.
     src = inspect.getsource(xr.uuid_of_card)
-    for forbidden in ("nvml.", "nvml_registry", "from sglang.srt.registry",
+    # `from sglang.srt.registry import rank_cards` is the OWNER import and is
+    # the whole point of Option B; what stays forbidden is the DEVICE
+    # ENUMERATION side of that same package.
+    for forbidden in ("nvml.", "nvml_registry", "import nvml", "identity_map",
                       "torch.cuda", "device_count", "current_device("):
         assert forbidden not in src, \
             f"the producer must not call {forbidden!r}: a fallback map is wrong-ordinal"
     import sys
     before = {m for m in sys.modules if "nvml" in m.lower()}
-    no_env.setenv(xr.ENV_CARD_UUIDS, ",".join(THREE))
+    no_env.setenv(RC.RANK_CARD_UUIDS_ENV, ",".join(THREE))
     xr.uuid_of_card()
     assert {m for m in sys.modules if "nvml" in m.lower()} == before, \
         "resolving the map imported an NVML module"
@@ -155,14 +179,18 @@ def test_the_whole_region_module_has_no_card_enumeration_fallback():
     ("   ", "unset"),
     ("GPU-aaa,GPU-bbb", "count"),
     ("GPU-aaa,GPU-bbb,GPU-ccc,GPU-ddd", "count"),
-    ("GPU-aaa,,GPU-ccc", "blank"),
-    ("GPU-aaa, ,GPU-ccc", "blank"),
+    # rank_cards' own parser DROPS empty fields, so a blank entry reaches
+    # this module as a SHORT vector and is refused `count`. Reclassified on
+    # purpose: re-parsing the raw string here to say `blank` instead would be
+    # a second bookkeeping of the same string (see the dedicated test below).
+    ("GPU-aaa,,GPU-ccc", "count"),
+    ("GPU-aaa, ,GPU-ccc", "count"),
     ("GPU-aaa,GPU-bbb,GPU-aaa", "duplicate"),
     ("GPU-aaa,GPU-aaa,GPU-aaa", "duplicate"),
 ])
 def test_every_unusable_value_is_refused_by_name_with_its_reason(no_env, value, why):
     if value is not None:
-        no_env.setenv(xr.ENV_CARD_UUIDS, value)
+        no_env.setenv(RC.RANK_CARD_UUIDS_ENV, value)
     with pytest.raises(xr.Weg2XchgCardUuidMapUnusable) as exc:
         xr.uuid_of_card()
     text = str(exc.value)
@@ -179,7 +207,7 @@ def test_duplicate_is_its_own_reason_and_says_why_it_cannot_be_tolerated(no_env)
     carrier -- the thing that exists for exactly that -- sits unused. The
     refusal names the repeated uuid.
     """
-    no_env.setenv(xr.ENV_CARD_UUIDS, "GPU-aaa,GPU-bbb,GPU-aaa")
+    no_env.setenv(RC.RANK_CARD_UUIDS_ENV, "GPU-aaa,GPU-bbb,GPU-aaa")
     with pytest.raises(xr.Weg2XchgCardUuidMapUnusable) as exc:
         xr.uuid_of_card()
     text = str(exc.value)
@@ -194,7 +222,7 @@ def test_the_count_must_equal_N_CARDS_exactly_never_at_least(no_env):
     whose card table it does not describe.
     """
     for n in (1, 2, 4, 5):
-        no_env.setenv(xr.ENV_CARD_UUIDS,
+        no_env.setenv(RC.RANK_CARD_UUIDS_ENV,
                       ",".join(f"GPU-{i}" for i in range(n)))
         with pytest.raises(xr.Weg2XchgCardUuidMapUnusable) as exc:
             xr.uuid_of_card()
@@ -208,7 +236,7 @@ def test_the_refusal_is_countable_by_the_wcode_census(no_env):
     unfalsifiable. Every reason carries `W23` in its first token."""
     from sglang.srt.weg2 import weight_exchange_shadow as sh
     for value in ("", "GPU-a,GPU-b", "GPU-a,,GPU-c", "GPU-a,GPU-b,GPU-a"):
-        no_env.setenv(xr.ENV_CARD_UUIDS, value)
+        no_env.setenv(RC.RANK_CARD_UUIDS_ENV, value)
         try:
             xr.uuid_of_card()
         except xr.Weg2XchgCardUuidMapUnusable as exc:
@@ -218,13 +246,76 @@ def test_the_refusal_is_countable_by_the_wcode_census(no_env):
 
 
 # ===========================================================================
-# (4) INJECTION stays, because the doubles have no launcher.
+# (4) THE COINCIDENCE, ASSERTED. rank_cards checks WORLD_SIZE; this module's
+#     invariant is N_CARDS. They are equal here by accident of form.
 # ===========================================================================
 
 
-def test_an_injected_string_bypasses_the_environment_but_not_the_rules(no_env):
-    assert xr.uuid_of_card(env=",".join(THREE)) == THREE
-    for bad, why in (("", "unset"), ("a,b", "count"), ("a,a,a", "duplicate")):
-        with pytest.raises(xr.Weg2XchgCardUuidMapUnusable) as exc:
-            xr.uuid_of_card(env=bad)
-        assert f"reason={why}" in str(exc.value)
+def test_a_vector_whose_length_is_not_N_CARDS_is_refused_by_name(no_env):
+    """THE RULING'S OWN PIN. Red at `f4b9c8cd91` in the six-rank direction.
+
+    `SGLANG_RANK_CARD_UUIDS` is one uuid per WORLD rank; this module indexes
+    by CARD ORDINAL. On the Weg-2 form both are 3 because each group is three
+    ranks and *rank n of either group runs on cards[n]* -- an accident of this
+    form, not a law. A world of six (one group, six ranks; a pipeline stage; a
+    MoE-TP subgroup) publishes a six-entry vector, and re-indexing that as a
+    card table would attribute one rank's card to another SILENTLY.
+    """
+    six = [f"GPU-{i}" for i in range(6)]
+    no_env.setenv(RC.RANK_CARD_UUIDS_ENV, ",".join(six))
+    with pytest.raises(xr.Weg2XchgCardUuidMapUnusable) as exc:
+        xr.uuid_of_card()
+    text = str(exc.value)
+    assert "reason=count" in text, text
+    assert "got=6" in text and f"want={xr.N_CARDS}" in text, text
+    # The refusal must SAY that two different quantities were compared, or the
+    # next reader will "fix" it by slicing the vector to three.
+    assert "world" in text.lower(), text
+
+
+def test_the_producer_does_not_slice_or_stretch_a_wrong_length_vector(no_env):
+    """The danger direction of the check above: a helpful truncation."""
+    for n in (1, 2, 4, 6):
+        no_env.setenv(RC.RANK_CARD_UUIDS_ENV,
+                      ",".join(f"GPU-{i}" for i in range(n)))
+        with pytest.raises(xr.Weg2XchgCardUuidMapUnusable):
+            xr.uuid_of_card()
+
+
+def test_the_owners_length_check_is_still_there_and_we_do_not_depend_on_it():
+    """Belt and braces, deliberately: `rank_cards` refuses a wrong-length
+    vector when asked with a `world_size`, and this module refuses it again by
+    its own name. Two checks of one fact is right here and is NOT a second
+    bookkeeping: the quantities differ (world ranks vs cards), so each owner
+    checks the quantity it owns."""
+    v = RC.rank_card_vector.__doc__ or ""
+    assert "world_size" in v
+    assert "N_CARDS" in inspect.getsource(xr.uuid_of_card)
+
+
+def test_a_blank_entry_reaches_us_as_a_short_vector_and_that_is_stated(no_env):
+    """NAMED BEHAVIOUR, not a silent reclassification.
+
+    `rank_cards._parse_env_vector` drops empty fields, so "a,,c" arrives as
+    two entries. This module therefore refuses it `count`, not `blank`. The
+    alternative -- re-parsing the raw string here to distinguish them -- would
+    put a second parser of the same string in a second module, which is the
+    defect Option B exists to avoid. The docstring says so, and this test is
+    what keeps the statement true.
+    """
+    no_env.setenv(RC.RANK_CARD_UUIDS_ENV, "GPU-aaa,,GPU-ccc")
+    with pytest.raises(xr.Weg2XchgCardUuidMapUnusable) as exc:
+        xr.uuid_of_card()
+    assert "reason=count" in str(exc.value)
+    assert "drops" in (xr.uuid_of_card.__doc__ or "").lower(), \
+        "the docstring must state that the owner's parser drops blank fields"
+
+
+def test_an_absent_vector_carries_the_owners_own_reason(no_env):
+    """A refusal that swallows the producer's reason makes the next reader
+    rediscover it. `rank_cards` names why it has nothing; we forward it."""
+    with pytest.raises(xr.Weg2XchgCardUuidMapUnusable) as exc:
+        xr.uuid_of_card()
+    text = str(exc.value)
+    assert "reason=unset" in text, text
+    assert RC.RANK_CARD_UUIDS_ENV in text, text

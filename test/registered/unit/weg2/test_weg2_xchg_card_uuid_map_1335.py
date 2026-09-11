@@ -61,6 +61,7 @@ import pytest
 
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 
+from sglang.srt.registry import rank_cards as RC  # noqa: E402
 from sglang.srt.weg2 import weight_exchange_region as xr  # noqa: E402
 from sglang.srt.weg2 import weight_exchange_shadow as sh  # noqa: E402
 from sglang.srt.weg2 import weight_exchange_transport as tp  # noqa: E402
@@ -93,75 +94,6 @@ FAKE_MAP = ("u0", "u1", "u2")
 # (1) THE PRODUCER.  One reader of the launcher's own string, in the module
 #     that already owns "rank n runs on cards[n]".
 # ===========================================================================
-
-
-def test_the_region_produces_the_map_from_the_launchers_cvd_in_card_order():
-    """Red at 57f13aa72b: `xr.uuid_of_card` does not exist."""
-    got = xr.uuid_of_card(env="GPU-aaa,GPU-bbb,GPU-ccc")
-    assert got == ("GPU-aaa", "GPU-bbb", "GPU-ccc"), got
-    # CARD ORDER IS THE CONTRACT, not a convenience: the launcher builds the
-    # string as ",".join(c.uuid for c in cards), so index == card ordinal.
-    assert got[1] == "GPU-bbb"
-    # Whitespace a shell may have left is stripped, never treated as a uuid.
-    assert xr.uuid_of_card(env=" GPU-aaa , GPU-bbb ,GPU-ccc ") == got
-
-
-@pytest.mark.parametrize("bad,why", [
-    ("", "unset"),
-    ("   ", "unset"),
-    ("GPU-aaa,GPU-bbb", "count"),
-    ("GPU-aaa,GPU-bbb,GPU-ccc,GPU-ddd", "count"),
-    ("GPU-aaa,,GPU-ccc", "blank"),
-])
-def test_the_producer_refuses_by_name_and_never_guesses(bad, why):
-    """No default, no padding, no truncation -- a NAMED refusal.
-
-    Red at 57f13aa72b on the missing symbol.  The danger direction is a
-    producer that pads a short list or silently drops a fourth entry: either
-    one hands the transport a map whose index is not the card ordinal, which is
-    a WRONG LABEL on the acceptance line and, worse, a wrong identity check.
-    """
-    with pytest.raises(xr.Weg2XchgCardUuidMapUnusable) as exc:
-        xr.uuid_of_card(env=bad)
-    text = str(exc.value)
-    assert text.startswith("W23 Weg2XchgCardUuidMapUnusable"), text
-    assert why in text, text
-    # The refusal quotes WHAT IT READ -- a refusal that hides its input cannot
-    # be acted on (the #1328 lesson, one arm further down).
-    assert repr(bad) in text or "unset" in text, text
-
-
-def test_the_producer_reads_the_environment_when_no_string_is_injected(monkeypatch):
-    """#1336 MOVED THE SOURCE: the launcher's own variable, never CVD.
-
-    Boot weg2xsn11 refuted #1335's premise on metal -- the scheduler process
-    that runs the leg has `CUDA_VISIBLE_DEVICES` narrowed to its own single
-    card. The operator's ruling gave the card order its own published
-    variable; the full interface is pinned in
-    `test_weg2_xchg_card_order_1336.py` and this is the seam test.
-    """
-    monkeypatch.setenv(xr.ENV_CARD_UUIDS, ",".join(FAKE_MAP))
-    assert xr.uuid_of_card() == FAKE_MAP
-    monkeypatch.delenv(xr.ENV_CARD_UUIDS, raising=False)
-    with pytest.raises(xr.Weg2XchgCardUuidMapUnusable):
-        xr.uuid_of_card()
-
-
-def test_the_env_name_is_the_launchers_and_is_not_retyped():
-    """One spelling of the variable, so the two ends cannot drift.
-
-    CAUGHT PASSING FOR THE WRONG REASON when #1336 moved the source: this
-    asserted `CUDA_VISIBLE_DEVICES` appeared exactly once in the producer, and
-    after the move the one remaining hit was a DOCSTRING MENTION explaining
-    why that variable is NOT read. A count over prose is not a count over
-    code. It now pins the constant the ruling fixed, and the no-fallback rule
-    lives in `test_weg2_xchg_card_order_1336.py` where it is checked by call
-    shape.
-    """
-    src = inspect.getsource(xr.uuid_of_card)
-    assert "ENV_CARD_UUIDS" in src
-    assert 'os.environ.get(ENV_CARD_UUIDS)' in src, \
-        "the producer reads the published constant, once"
 
 
 # ===========================================================================
@@ -356,10 +288,11 @@ def test_the_store_forward_leg_runs_with_the_map_the_adapter_actually_supplies(
     into `ShadowLegInputs` and was green while both boots died; this one leaves
     the keyword out exactly as `weight_updater.py:1881` does, and supplies the
     map the only way the product does -- through the launcher's published
-    `SGLANG_WEG2_XCHG_CARD_UUIDS` (#1336; it was CVD until boot weg2xsn11
-    measured that the leg's own process cannot see it).
+    canonical `SGLANG_RANK_CARD_UUIDS` vector (#1336 Option B; it was CVD until
+    boot weg2xsn11 measured that the leg's own process cannot see it, and a
+    weg2-private variable until the existing publisher was found).
     """
-    monkeypatch.setenv(xr.ENV_CARD_UUIDS, ",".join(FAKE_MAP))
+    monkeypatch.setenv(RC.RANK_CARD_UUIDS_ENV, ",".join(FAKE_MAP))
     result, _p, _d = _store_forward_leg(
         armed, boot, tmp_path, monkeypatch=monkeypatch, inject_map=False)
     assert result is not None
@@ -378,7 +311,7 @@ def test_the_same_leg_refuses_by_name_when_the_launcher_gave_no_map(
     the card order.  It must be a W-coded refusal naming the variable, never 36
     subscripts.
     """
-    monkeypatch.delenv(xr.ENV_CARD_UUIDS, raising=False)
+    monkeypatch.delenv(RC.RANK_CARD_UUIDS_ENV, raising=False)
     result, _p, _d = _store_forward_leg(
         armed, boot, tmp_path, monkeypatch=monkeypatch, inject_map=False)
     assert result is not None
@@ -438,10 +371,15 @@ def test_a_hook_refusal_is_VISIBLE_TO_THE_WCODE_CENSUS():
     unfalsifiable: weg2xsn11 read `W23 genuine 0` next to 39 refusing legs.
     Proven here over a REAL refusal from the real producer, not a stand-in.
     """
+    import os as _os
+    prev = _os.environ.pop(RC.RANK_CARD_UUIDS_ENV, None)
     try:
-        xr.uuid_of_card(env="")
+        xr.uuid_of_card()
     except xr.Weg2XchgCardUuidMapUnusable as exc:
         note = sh.exc_note(exc)
+    finally:
+        if prev is not None:
+            _os.environ[RC.RANK_CARD_UUIDS_ENV] = prev
     assert "W23" in note, note
     assert "reason=unset" in note, note
     assert "@ weight_exchange_region.py:" in note, note
