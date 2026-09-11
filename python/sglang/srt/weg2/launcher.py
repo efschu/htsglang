@@ -9964,7 +9964,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
 #: B4g wall 2: THE EXCHANGE LANE'S OWN NAMED RESIDENCY TERMS, per card.  Each
 #: is a term the exchange arm allocates and a serving boot does not, so a
-#: reserve derived from serving constants cannot contain them.
+#: reserve derived from serving constants cannot contain them.  The region is
+#: DERIVED by :func:`xchg_resident_region_mib`, not typed.
 #:
 #: The region is ONE /dev/shm file the whole group shares, but every rank MAPS
 #: it, so it is resident per card and enters each card's reserve once.  The
@@ -9974,8 +9975,26 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 #: their own, explain a per-card difference -- which is the arithmetic that
 #: refuted this seat's first reading of weg2xsn14's W19 (see the docstring of
 #: `xchg_form_dormant_reserve`).
-XCHG_RESIDENT_REGION_MIB = 385
 XCHG_RESIDENT_ONCARD_SLOTS = 3
+
+
+def xchg_resident_region_mib(n_cards: int) -> int:
+    """The staging region's own MiB, DERIVED -- never the literal 385.
+
+    `region_mib_from_layout`'s docstring makes the rule and
+    `test_weg2_xchg_instruments_1273` enforces it by AST-scanning this module
+    for the constant: *"It is arithmetic over four stated inputs, never a
+    literal 385."*  The first cut of B4g typed it, the remote gate caught it as
+    ONLY-NEW=1, and deriving it is the better code anyway -- on any card count
+    but this rig's, a typed 385 is silently wrong (the pair count is
+    ``n*(n-1)``, which is 6 here and 12 on four cards).
+    """
+    return xchg_residency.region_mib_from_layout(
+        xchg_region_pairs(int(n_cards)),
+        XCHG_REGION_SLOTS_PER_PAIR,
+        XCHG_REGION_SLOT_MIB,
+        XCHG_REGION_HEADER_MIB,
+    )
 
 
 def xchg_form_dormant_reserve(
@@ -10038,7 +10057,8 @@ def xchg_form_dormant_reserve(
 
     census = xchg_residency.load_census(census_path)
     slots_mib = int(XCHG_RESIDENT_ONCARD_SLOTS) * int(oncard_slot_mib)
-    named = int(XCHG_RESIDENT_REGION_MIB) + slots_mib
+    region_mib = xchg_resident_region_mib(len(cards))
+    named = int(region_mib) + slots_mib
     out: Dict[str, int] = {}
     residual: Dict[str, int] = {}
     lines: List[str] = []
@@ -10056,7 +10076,7 @@ def xchg_form_dormant_reserve(
         out[c.uuid] = dormant + named
         lines.append(
             f"WEG2-XCHG-RESERVE nvml{c.nvml_index} {c.name} "
-            f"dormant_census_mib={dormant} region_mib={XCHG_RESIDENT_REGION_MIB} "
+            f"dormant_census_mib={dormant} region_mib={region_mib} "
             f"oncard_slots_mib={slots_mib} "
             f"({XCHG_RESIDENT_ONCARD_SLOTS}x{int(oncard_slot_mib)}) "
             f"reserve_mib={out[c.uuid]} "

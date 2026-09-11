@@ -86,7 +86,7 @@ class TheReserveIsPricedFromTheCensusAndNamedTerms(CustomTestCase):
 
     def test_the_reserve_is_the_census_plus_the_named_terms(self):
         out, lines, _res = self._run()
-        named = launcher.XCHG_RESIDENT_REGION_MIB + 3 * 32
+        named = launcher.xchg_resident_region_mib(len(CARDS)) + 3 * 32
         self.assertEqual(named, 481)
         for u in (BIG, SM1, SM2):
             self.assertEqual(out[u], CENSUS_DORMANT[u] + named)
@@ -124,7 +124,7 @@ class TheReserveIsPricedFromTheCensusAndNamedTerms(CustomTestCase):
         for ln in lines:
             self.assertIn("WEG2-XCHG-RESERVE", ln)
             self.assertIn("dormant_census_mib=", ln)
-            self.assertIn("region_mib=385", ln)
+            self.assertIn(f"region_mib={launcher.xchg_resident_region_mib(len(CARDS))}", ln)
             self.assertIn("oncard_slots_mib=96", ln)
             self.assertIn("(3x32)", ln)
             self.assertIn("reserve_mib=", ln)
@@ -134,7 +134,7 @@ class TheReserveIsPricedFromTheCensusAndNamedTerms(CustomTestCase):
         p = _census(os.path.join(tempfile.mkdtemp(), "c.json"))
         out, lines, _r = launcher.xchg_form_dormant_reserve(
             CARDS, p, oncard_slot_mib=128)
-        self.assertEqual(out[BIG], 1668 + 385 + 3 * 128)
+        self.assertEqual(out[BIG], 1668 + launcher.xchg_resident_region_mib(len(CARDS)) + 3 * 128)
         self.assertTrue(any("oncard_slots_mib=384" in ln for ln in lines))
 
     def test_a_card_missing_from_the_census_refuses(self):
@@ -156,7 +156,7 @@ class TheUnexplainedResidualIsReportedNotAbsorbed(CustomTestCase):
     """The arithmetic, asserted, so the next reader inherits the refutation."""
 
     def test_the_named_terms_are_uniform_and_cannot_explain_the_asymmetry(self):
-        named = launcher.XCHG_RESIDENT_REGION_MIB + 3 * 32
+        named = launcher.xchg_resident_region_mib(len(CARDS)) + 3 * 32
         gaps = {u: MEASURED[u] - CENSUS_DORMANT[u] - named for u in MEASURED}
         self.assertEqual(gaps[SM1], 773)
         self.assertEqual(gaps[SM2], 773)
@@ -172,7 +172,7 @@ class TheUnexplainedResidualIsReportedNotAbsorbed(CustomTestCase):
         card's residual SMALLER; the 5090's residual is the LARGER one.  So the
         bound cannot be the explanation.
         """
-        named = launcher.XCHG_RESIDENT_REGION_MIB + 3 * 32
+        named = launcher.xchg_resident_region_mib(len(CARDS)) + 3 * 32
         over = 3 * 387   # three layers at the measured mean, the bound's size
         corrected = MEASURED[BIG] - (CENSUS_DORMANT[BIG] - over) - named
         self.assertGreater(corrected, MEASURED[BIG] - CENSUS_DORMANT[BIG] - named,
