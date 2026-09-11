@@ -517,6 +517,21 @@ class BounceResult:
     #: nothing is compared.  Carried on the result rather than logged and
     #: dropped, because the per-boot summary is over the legs' verdicts.
     inject: Optional["InjectVerdict"] = None
+    #: THE MODE THIS LEG RAN, carried from the one place that validated it
+    #: (`run_bounce_leg`, which REFUSES an unknown mode rather than defaulting
+    #: -- "a default here would decide whether this leg owns 27 GiB of
+    #: weights").  #1336: the summary line used to INFER this from
+    #: `inject is None`, which is a SECOND decision on the question the module
+    #: states it refuses to decide twice, and it inferred in the DANGEROUS
+    #: direction: `authoritative`.  The inference happened to be faithful at
+    #: the single construction site below -- `comparing = mode ==
+    #: INJECT_SHADOW`, so `inject is None` did mean authoritative there -- but
+    #: it is the FIELD DEFAULT of a plain dataclass, so any other
+    #: construction (an error path, a future early return, a test double)
+    #: printed `mode=authoritative` for a leg that never ran authoritative.
+    #: An empty string prints as `unset`: a named state, never a lie in the
+    #: direction that costs 27 GiB.
+    mode: str = ""
     #: Units that did NOT fit one depth-slot and were therefore banded.  By
     #: the AMENDMENT 3 decide these may only ever be UNLAYERED classes
     #: (``lm_head`` takes 4 bands at a 721 MiB slot); a LAYER among them is a
@@ -560,7 +575,7 @@ class BounceResult:
             f"deposited={self.deposited_bytes} collected={self.collected_bytes} "
             f"planned={self.planned_bytes} "
             f"deposit_ms={self.deposit_ms:.1f} collect_ms={self.collect_ms:.1f} "
-            f"mode={self.inject.mode if self.inject else wx.INJECT_AUTHORITATIVE} "
+            f"mode={self.mode or wx.INJECT_MODE_UNSET} "
             + (f"inject={self.inject.verdict} " if self.inject else "")
             + f"banded={len(self.banded)}"
             + (f" banded_units={','.join(self.banded)}" if self.banded else "")
@@ -936,6 +951,11 @@ def run_bounce_leg(
         # a NO-COMPARE verdict would read as "the grade was attempted and
         # produced nothing" rather than "no grade was asked for".
         inject=verdict if comparing else None,
+        # #1336: the mode TRAVELS instead of being inferred from `inject`.
+        # `mode` is the validated parameter -- unknown values were refused
+        # above -- so this line and the `comparing` decision above now read
+        # the same single source.
+        mode=mode,
         units=len(units), bands=bands,
         deposited_bytes=deposited, collected_bytes=collected,
         planned_bytes=planned,
