@@ -5257,7 +5257,12 @@ def test_the_launcher_publishes_the_ceiling_to_both_groups_and_pops_it():
     # prepare_xchg_env, whose dict build_env applies AFTER that loop -- the
     # ordering that matters is the runtime one (pop, then override), which the
     # arm's three names already rely on and share this loop with.
-    assert "weight_exchange_transport.ENV_ONCARD_SLOT_MIB):" in src
+    # POSITION-INDEPENDENT, and that is a gate finding worth keeping (#1336
+    # local pair gate): this asserted the slot followed by the pop-tuple's
+    # CLOSING PAREN, so appending any name to that tuple broke the guard while
+    # the property it exists for -- the slot IS popped -- still held. The
+    # parked #1336 publisher hit exactly that. Assert membership, not place.
+    assert "weight_exchange_transport.ENV_ONCARD_SLOT_MIB" in src
     i_loop = src.index("for key in (\"SGLANG_WEG2_XCHG_REGION\"")
     i_apply = src.index("for key, value in (xchg_env or {}).items():")
     assert i_loop < i_apply, "the pop loop must run before the xchg_env overrides"
