@@ -427,6 +427,25 @@ class TheWaveMapArmsAreBothNamed(CustomTestCase):
         with self.assertRaises(xchg_residency.Weg2XchgResidencyUnarmable):
             xchg_census.resolve_wave_map("whatever", "")
 
+    def test_build_census_defaults_to_the_launcher_arm(self):
+        """The DEFAULT is the arm that fits, and the default is asserted.
+
+        Without this the arms could be swapped at the signature and every
+        other test here would still pass, because they all name their arm.
+        """
+        d, stem = _rig(front_extra=(ORDER_MAP_LINE,))
+        front = os.path.join(d, f"{stem}.front.log")
+
+        class Table:
+            boot = stem
+
+        build = xchg_census.build_census(
+            CARDS, d, family=FAMILY, n_cards=3, tool_sha="s",
+            solver=lambda *a, **k: (Table(), ""), wave_map_from=front)
+        self.assertIn("per-card chunk_tag_cards", build.provenance)
+        self.assertIn("PRECONDITION", build.provenance)
+        self.assertTrue(any("map=per-card" in ln for ln in build.lines), build.lines)
+
     def test_a_partition_that_is_not_the_family_refuses(self):
         """``build_plan``'s stale-wave-map ratchet, one layer earlier.
 
