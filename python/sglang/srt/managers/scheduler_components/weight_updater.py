@@ -1075,8 +1075,28 @@ class SchedulerWeightUpdaterManager:
         # grader the day the flag and the call site disagree, which is
         # precisely when a grade matters.
         mode = str(kw.get("mode") or "") or wx.inject_mode()
+        # `descs`, NOT `raw_descs` (#1342 B4, the FIFTH defect of this slice's
+        # own form, found by the chain smoke at the desk).
+        #
+        # `_weg2_shadow_plan` returns `derive_leg_plan`'s **LegPlan**, and a
+        # LegPlan has `descs` and no `raw_descs` at all -- `raw_descs` is an
+        # XchgPlan field.  The chain died here with
+        # `AttributeError: 'LegPlan' object has no attribute 'raw_descs'`,
+        # swallowed by the observer into a single `verdict=NO-COMPARE` line,
+        # which the grading plan scores as a FAIL and not a neutral.
+        #
+        # `descs` IS THE RIGHT POPULATION, not merely the attribute that exists:
+        # `derive_leg_plan` sets `descs=tuple(plan.descs)` from the XchgPlan, so
+        # this is the COALESCED set -- the pieces the leg should actually move.
+        # `raw_descs` would have been the uncoalesced population even where it
+        # existed.
+        #
+        # Why the unit test missed it, recorded because it is the same miss
+        # twice: the double was shaped after what THIS line reads, so it grew a
+        # `raw_descs` the producer never had. The chain smoke builds a real
+        # LegPlan from the producer's field set instead.
         self._weg2_xchg_bounce_leg(
-            descs=list(plan.raw_descs), ops=ops, boot_nonce=boot_nonce,
+            descs=list(plan.descs), ops=ops, boot_nonce=boot_nonce,
             terms=terms, mode=mode, device=int(device),
         )
 
@@ -1260,37 +1280,70 @@ class SchedulerWeightUpdaterManager:
                 f"{getattr(out, 'message', '')!r}. The VMM pages are committed "
                 "but their content is undefined; this group is fatal."
             )
-        # STEP 6c: THE SHADOW COMPARE, here, because here is the first instant
-        # the ground truth exists -- the refill has just written every weight
-        # byte, so the exchange's assembled bytes have something to be graded
-        # against.  Same placement rule the shadow's own destination hook
-        # follows ("after family_complete and after the reload").
+        # THE STEP-6c COMPARE WAS HERE AND IS GONE (#1342 S1b).  GRADING IS NOT
+        # REFILLING, and this method is a refill.
         #
-        # NO STATE FIELD carries this: an earlier draft set
-        # `self._weg2_xchg_shadow_compare_pending`, which is a WRITE to an
-        # undeclared attribute on a slots=True dataclass -- #1329 exactly, in
-        # this file, one commit after citing it.
-        self._weg2_xchg_shadow_compare()
+        # It sat at the end of this branch with a comment that was half right:
+        # "the refill has just written every weight byte" IS the correct
+        # precondition, but it is only reached when the refill actually runs.
+        # This method has FOUR carriers and two of them return at :1137-1141 --
+        # and `tms-backup` is the carrier EVERY weg2 boot on this rig selects,
+        # because the launcher passes `--enable-weights-cpu-backup`
+        # unconditionally.  So the grader was unreachable on the only
+        # configuration that grades, which boot weg2xsn18 measured as 0
+        # `WEG2-XCHG-INJECT` lines with `Weg2WakeRefused`/`W4`/`NO-COMPARE` all
+        # 0 -- a never-entered method, not a failing one.
+        #
+        # The early return above is NOT the defect and is untouched: its own
+        # comment is right that a second writer here would be the
+        # ein-job-ein-mover defect.  The grader moved to the WAKE path, after
+        # the weights-family resume and after this method returns, which is
+        # where the bytes have landed whichever carrier wrote them -- the same
+        # placement rule the shadow's destination hook states and follows.
+        # See `resume_memory_occupation`.
 
     def _weg2_xchg_shadow_compare(self) -> None:
-        """Grade the exchange's assembled bytes against the refilled weights.
+        """Grade the exchange's assembled bytes against the weights as landed.
 
-        STEP 6c, and a NO-OP unless the exchange is armed in `shadow` mode: on
-        `ring` there is nothing to grade, and on `authoritative` the refill did
-        not run at all (the carrier was `exchange`).
+        STEP 6c.  Called from the WAKE path (`resume_memory_occupation`), after
+        `family_complete` and after `_weg2_wake_reload_weights` -- i.e. once the
+        bytes are final no matter WHICH carrier wrote them.  #1342 S1b moved it
+        there out of the refill branch, where it was only reachable when the
+        disk refill actually ran; see the note left at the old site.
 
-        AN OBSERVER, so it never raises.  In this mode the refill is the
-        authority and the model is already correct; a compare that took the
-        flip down over its own bookkeeping would be the thing S6I exists to
-        avoid -- the grade is evidence, not a gate.  Under `authoritative` the
-        same disagreement IS a gate, and that refusal lives in
-        :meth:`_weg2_xchg_inject_weights`.
+        THREE ARMS DECLINE, and each for its own reason rather than by
+        placement luck:
+
+        ``ring``          nothing was exchanged, so there is nothing to grade.
+        ``authoritative`` the injection IS the authority and grades itself, and
+                          its disagreement is a GATE (the refusal lives in
+                          :meth:`_weg2_xchg_inject_weights`).  Two graders for
+                          one leg would be the ein-job-ein-mover shape.
+        ``stock``         DANGER DIRECTION 1, and it is now a NAMED gate rather
+                          than a consequence of where this call sits.  Without
+                          ``--enable-memory-saver`` every ``pause()`` was a
+                          no-op: the weights were never released, never
+                          recommitted and never rewritten, so a compare would
+                          grade the same bytes against themselves and any
+                          MISMATCH could only be an instrument fault.  The
+                          carrier is asked through the ONE authority,
+                          :meth:`_weg2_wake_weight_carrier` -- a READ of a pure
+                          decision, not a second decider.
+
+        AN OBSERVER, so it never raises.  Here the refill (or the TMS restore)
+        is the authority and the model is already correct; a compare that took
+        the flip down over its own bookkeeping would be the thing S6I exists to
+        avoid -- the grade is evidence, not a gate.
         """
         try:
             from sglang.srt.weg2 import weight_exchange as wx
 
             if not (wx.exchange_armed()
                     and wx.inject_mode() == wx.INJECT_SHADOW):
+                return
+            # DANGER DIRECTION 1, gated here so the call site stays a plain
+            # call and the whole question lives in ONE place.
+            if self._weg2_wake_weight_carrier() == self.CARRIER_STOCK:
                 return
             self._weg2_xchg_inject_weights(mode=wx.INJECT_SHADOW)
         except BaseException as exc:  # noqa: BLE001 -- an observer never raises
@@ -2130,28 +2183,21 @@ class SchedulerWeightUpdaterManager:
                 # exactly the rank-local derivation boot weg2xsn5 refused 7 of 8
                 # legs on.  The product refuses by name instead.
                 agreed=agreed, require_agreement=True)
-            # #1342 S3: THE ACCEPTANCE LINE GETS ITS PRODUCTION READER HERE.
-            # `weight_exchange.emit_plan_line` -- the ONE emitter of
-            # `WEG2-XCHG-PLAN dir= ... plan_id=`, which census (d) grades --
-            # had ZERO production callers, only its `__all__` export and a
-            # docstring mention.  Boot weg2xsn17 measured the consequence
-            # directly: `plan_id` appeared 0 times in either group's log while
-            # a DIFFERENT emitter (`WEG2-XCHG-PLAN card=`) printed 18/21 lines,
-            # so the census item was ungradeable by construction rather than
-            # by absence of a plan.  This is the site that has the plan and the
-            # direction, so it is the site that prints it.
-            if plan is not None:
-                try:
-                    wx.emit_plan_line(
-                        plan,
-                        direction=("d2h" if hook == sh.HOOK_SOURCE else "h2d"),
-                        logger=logger)
-                except BaseException as exc:  # noqa: BLE001
-                    # An INSTRUMENT may never take the flip down: the plan is
-                    # already derived and valid, and failing to print it is a
-                    # lost reading, not a lost transfer.  Named, not swallowed.
-                    logger.info("WEG2-XCHG-PLAN emit failed: %s",
-                                _weg2_exc_note(exc))
+            # THE ACCEPTANCE LINE IS NOT EMITTED HERE, and the reason is
+            # recorded because #1342 S3 wired it here and boot weg2xsn18 paid
+            # for it: this method only ever holds `derive_leg_plan`'s
+            # **LegPlan**, while `WEG2-XCHG-PLAN dir=.../plan_id=...` is an
+            # **XchgPlan** line.  The emit raised
+            # `AttributeError: 'LegPlan' object has no attribute 'log_line'`
+            # 21x on D and 18x on P, and census (d) read `plan_id` 0.
+            #
+            # It now lives one frame earlier, at the plan-construction call
+            # inside `weight_exchange_shadow.derive_leg_plan`, which is the only
+            # production frame that holds an XchgPlan.  (The constructor is
+            # deliberately NOT named literally here: a single test asserts there
+            # is exactly ONE call site for it across the package, and a mention
+            # in prose counts -- which this comment discovered by tripping it.)
+            # `test_the_wrong_site_no_longer_emits` keeps this site quiet.
             return plan, reason
         except BaseException as exc:  # noqa: BLE001 -- an observer never raises
             # #1328, same reason as the manifest arm one method up: a swallowed
@@ -3318,6 +3364,26 @@ class SchedulerWeightUpdaterManager:
                                       for t in pending_tags),
                     ring_ms=sum(float(v[1]) for v in weg2_per_tag.values()),
                 )
+                # STEP 6c: THE SHADOW COMPARE (#1342 S1b -- moved here out of
+                # `_weg2_wake_reload_weights`, where it was parked at the end of
+                # the DISK-REFILL branch and therefore unreachable on the
+                # `tms-backup` carrier every boot on this rig selects).
+                #
+                # THIS IS WHERE THE BYTES HAVE LANDED, for every carrier:
+                # `tms-backup` restored them in the resume above, `disk` and
+                # `exchange` wrote them inside the reload call, and `stock`
+                # never released them at all -- which is why the grader's own
+                # gate declines that one BY NAME rather than relying on this
+                # placement.  Same rule the destination leg above follows:
+                # after `family_complete`, after the reload.
+                #
+                # AFTER the reload and AFTER the destination leg, deliberately:
+                # a compare that ran earlier would grade content the reload has
+                # not settled, and a MISMATCH from that is an instrument fault
+                # dressed as a finding.
+                # `test_the_compare_comes_after_the_reload_in_the_wake_path`
+                # pins the order; mutant M11 pulls it above the reload.
+                self._weg2_xchg_shadow_compare()
 
         if GPU_MEMORY_TYPE_KV_CACHE in tags:
             self.memory_saver_adapter.resume(GPU_MEMORY_TYPE_KV_CACHE)
