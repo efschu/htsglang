@@ -107,7 +107,6 @@ import tempfile
 import textwrap
 import unittest
 from collections import defaultdict
-from typing import Dict, List, Optional, Set, Tuple
 
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 
@@ -180,25 +179,25 @@ class _Index:
     """Name-resolved reference graph over one source tree."""
 
     def __init__(self) -> None:
-        self.defs: Dict[str, Tuple[str, str, int]] = {}   # qual -> (rel, fn, lineno)
-        self.by_name: Dict[str, Set[str]] = defaultdict(set)
-        self.classes: Dict[str, Set[str]] = defaultdict(set)
-        self.refs: Dict[str, Set[str]] = defaultdict(set)  # qual -> referenced names
+        self.defs: dict[str, tuple[str, str, int]] = {}   # qual -> (rel, fn, lineno)
+        self.by_name: dict[str, set[str]] = defaultdict(set)
+        self.classes: dict[str, set[str]] = defaultdict(set)
+        self.refs: dict[str, set[str]] = defaultdict(set)  # qual -> referenced names
         #: ``(rel, lineno, exc_name, owner_qual)`` for every lane raise site.
-        self.raises: List[Tuple[str, int, str, Optional[str]]] = []
+        self.raises: list[tuple[str, int, str, str | None]] = []
         #: module-level names written under ``global`` -> {writer qual}
-        self.global_writers: Dict[Tuple[str, str], Set[str]] = defaultdict(set)
+        self.global_writers: dict[tuple[str, str], set[str]] = defaultdict(set)
         #: module-level names read -> {reader qual}
-        self.global_readers: Dict[Tuple[str, str], Set[str]] = defaultdict(set)
+        self.global_readers: dict[tuple[str, str], set[str]] = defaultdict(set)
         #: every module-level assignment target, per module
-        self.module_globals: Dict[str, Set[str]] = defaultdict(set)
+        self.module_globals: dict[str, set[str]] = defaultdict(set)
 
 
-def _module_qual(rel: str, scope: List[str], name: str) -> str:
+def _module_qual(rel: str, scope: list[str], name: str) -> str:
     return "::".join([rel, *scope, name]) if scope else f"{rel}::{name}"
 
 
-def _py_files(root: str) -> List[Tuple[str, str]]:
+def _py_files(root: str) -> list[tuple[str, str]]:
     out = []
     for dirpath, dirnames, filenames in os.walk(root):
         dirnames[:] = sorted(d for d in dirnames if d != "__pycache__")
@@ -215,7 +214,7 @@ def _py_files(root: str) -> List[Tuple[str, str]]:
     return out
 
 
-def build_index(root: str, lane_files: Tuple[str, ...]) -> _Index:
+def build_index(root: str, lane_files: tuple[str, ...]) -> _Index:
     """Index every non-test module under ``root``; collect raise sites for
     the members of ``lane_files`` only."""
     idx = _Index()
@@ -245,9 +244,9 @@ class _IndexVisitor(ast.NodeVisitor):
         self.idx = idx
         self.rel = rel
         self.is_lane = is_lane
-        self.scope: List[str] = []
-        self.fn_stack: List[str] = []
-        self.global_here: List[Set[str]] = []
+        self.scope: list[str] = []
+        self.fn_stack: list[str] = []
+        self.global_here: list[set[str]] = []
 
     # -- scopes ------------------------------------------------------------
     def visit_ClassDef(self, node: ast.ClassDef) -> None:
@@ -271,7 +270,7 @@ class _IndexVisitor(ast.NodeVisitor):
     visit_FunctionDef = _function
     visit_AsyncFunctionDef = _function
 
-    def _owner(self) -> Optional[str]:
+    def _owner(self) -> str | None:
         return self.fn_stack[-1] if self.fn_stack else None
 
     # -- module-level state ------------------------------------------------
@@ -319,7 +318,7 @@ class _IndexVisitor(ast.NodeVisitor):
         self.generic_visit(node)
 
 
-def reachable(idx: _Index, entries: Tuple[Tuple[str, str], ...]) -> Set[str]:
+def reachable(idx: _Index, entries: tuple[tuple[str, str], ...]) -> set[str]:
     """Transitive closure of reference edges from ``entries``.
 
     A class name resolves to that class's ``__init__`` as well, so
@@ -328,7 +327,7 @@ def reachable(idx: _Index, entries: Tuple[Tuple[str, str], ...]) -> Set[str]:
     """
     seeds = [q for rel, fn in entries
              for q in idx.by_name.get(fn, ()) if idx.defs.get(q, ("",))[0] == rel]
-    seen: Set[str] = set()
+    seen: set[str] = set()
     stack = list(seeds)
     while stack:
         qual = stack.pop()
@@ -353,14 +352,14 @@ def _referenced_anywhere(idx: _Index, qual: str) -> bool:
     outside its own definition.  ``False`` is the W84 state -- nothing in
     production so much as spells the name.
     """
-    rel, fn, _ = idx.defs[qual]
+    _rel, fn, _lineno = idx.defs[qual]
     for owner, names in idx.refs.items():
         if owner != qual and fn in names:
             return True
     return False
 
 
-def _wired_owners(idx: _Index, reach: Set[str]) -> Set[str]:
+def _wired_owners(idx: _Index, reach: set[str]) -> set[str]:
     """Owners whose raise sites count as WIRED.
 
     Two ways, and the second is why this is a function and not ``in reach``:
@@ -379,7 +378,7 @@ def _wired_owners(idx: _Index, reach: Set[str]) -> Set[str]:
     return wired
 
 
-def unwired_raise_sites(idx: _Index, entries: Tuple[Tuple[str, str], ...]):
+def unwired_raise_sites(idx: _Index, entries: tuple[tuple[str, str], ...]):
     """``[(rel, owner_fn, exc_name, lineno), ...]``, sorted, for every lane
     raise site whose owner is neither reachable nor named in production."""
     reach = reachable(idx, entries)
@@ -392,8 +391,8 @@ def unwired_raise_sites(idx: _Index, entries: Tuple[Tuple[str, str], ...]):
     return sorted(set(out))
 
 
-def orphan_verdicts(idx: _Index, entries: Tuple[Tuple[str, str], ...],
-                    lane_files: Tuple[str, ...]):
+def orphan_verdicts(idx: _Index, entries: tuple[tuple[str, str], ...],
+                    lane_files: tuple[str, ...]):
     """``[(rel, global_name, writers, readers), ...]`` for every lane module
     global that a REACHABLE function writes and NO reachable function reads.
 
@@ -421,7 +420,7 @@ def orphan_verdicts(idx: _Index, entries: Tuple[Tuple[str, str], ...],
 # the scope check share it).
 # --------------------------------------------------------------------------
 
-_INDEX: Optional[_Index] = None
+_INDEX: _Index | None = None
 
 
 def _index() -> _Index:

@@ -75,13 +75,11 @@ import os
 import sys
 import tempfile
 import unittest
-from typing import Dict, List
 
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 
-from sglang.srt.weg2 import host_ledger
+from sglang.srt.weg2 import host_ledger, ring_table
 from sglang.srt.weg2 import launcher as L
-from sglang.srt.weg2 import ring_table
 from sglang.srt.weg2 import weight_exchange as wx
 from sglang.srt.weg2 import xchg_residency as xr
 from sglang.test.test_utils import CustomTestCase
@@ -107,7 +105,7 @@ APPROX_MEMTOTAL_BYTES = 135 * GIB
 APPROX_MEMAVAIL_BYTES = 109 * GIB
 
 
-def recorded_cards() -> List[L.Card]:
+def recorded_cards() -> list[L.Card]:
     """This boot's live cards, IN ORDINAL ORDER, from the recorded NVML map.
 
     Order is load-bearing (``recorded.json`` says why and quotes the measured
@@ -120,7 +118,7 @@ def recorded_cards() -> List[L.Card]:
     ]
 
 
-def recorded_p_argv() -> List[str]:
+def recorded_p_argv() -> list[str]:
     with open(os.path.join(FIXTURES, "p_argv_xsn14.txt"), encoding="utf-8") as fh:
         return fh.read().split()
 
@@ -304,20 +302,20 @@ class TestWallXsn14W19DormantResidue(CustomTestCase):
     """WALL 2 -- W19 at the desk: the launcher's reserve against XSN14's own
     per-card measurement, under both arm strings."""
 
-    def _reserve(self, weight_source: str, transport: str = "bar1") -> Dict[str, int]:
+    def _reserve(self, weight_source: str, transport: str = "bar1") -> dict[str, int]:
         slack = L.reserve_slack_mib(transport)
         return {c.uuid: L.dc_measured_d_mib(c, weight_source) + slack
                 for c in recorded_cards()}
 
     @staticmethod
-    def _over(measured: Dict[str, int], reserve: Dict[str, int]) -> Dict[str, int]:
+    def _over(measured: dict[str, int], reserve: dict[str, int]) -> dict[str, int]:
         """The front's own predicate (``front.py:4071``), one line, pinned
         against the front's source by
         :meth:`test_the_predicate_is_the_fronts_own`."""
         return {u: m - reserve[u] for u, m in measured.items()
                 if reserve.get(u) is not None and m > reserve[u]}
 
-    def _measured(self) -> Dict[str, int]:
+    def _measured(self) -> dict[str, int]:
         return {r["uuid"]: int(r["measured_mib"])
                 for r in RECORDED["wall_xsn14_w19_dormant_residue"]["rows"]}
 
@@ -407,7 +405,7 @@ class TestWallW71NoCensus(CustomTestCase):
         totals in, one ARMED line out), so the boot's own acceptance line is
         re-derivable at the desk -- peaks, frees, wave1_ok, floor, region and
         ring_H together."""
-        lines: List[str] = []
+        lines: list[str] = []
         res = L.prepare_weight_exchange(
             recorded_cards(), lines.append, L.WEIGHT_SOURCE_EXCHANGE, CENSUS,
             RECORDED["epoch_xsn14"], int(RECORDED["ring_table"]["ring_h_mib"]),
@@ -420,7 +418,7 @@ class TestWallW71NoCensus(CustomTestCase):
         self.assertEqual(got, RECORDED["armed_line_xsn14"].strip())
 
     def test_the_ring_arm_has_no_subject(self):
-        lines: List[str] = []
+        lines: list[str] = []
         self.assertIsNone(L.prepare_weight_exchange(
             recorded_cards(), lines.append, L.WEIGHT_SOURCE_DEFAULT, "",
             RECORDED["epoch_xsn14"], 0))
@@ -439,7 +437,7 @@ class TestWallW71NoCensus(CustomTestCase):
             path = os.path.join(tmp, f"census_delta_{delta}.json")
             with open(path, "w", encoding="utf-8") as fh:
                 json.dump(mutated, fh)
-            lines: List[str] = []
+            lines: list[str] = []
             try:
                 L.prepare_weight_exchange(
                     recorded_cards(), lines.append, L.WEIGHT_SOURCE_EXCHANGE,
@@ -507,7 +505,7 @@ class TestTheReplayNeedsNoBootAndNoNvml(CustomTestCase):
                     ring_absent_by_design=True)
             self.assertTrue(L.dc_measured_d_mib(recorded_cards()[0],
                                                 L.WEIGHT_SOURCE_EXCHANGE) > 0)
-            lines: List[str] = []
+            lines: list[str] = []
             self.assertIsNotNone(L.prepare_weight_exchange(
                 recorded_cards(), lines.append, L.WEIGHT_SOURCE_EXCHANGE,
                 CENSUS, RECORDED["epoch_xsn14"],
@@ -522,7 +520,7 @@ class TestTheReplayNeedsNoBootAndNoNvml(CustomTestCase):
     def test_the_replay_writes_nothing_into_dev_shm(self):
         before = set(os.listdir("/dev/shm")) if os.path.isdir("/dev/shm") else set()
         solve_recorded_ring()
-        lines: List[str] = []
+        lines: list[str] = []
         L.prepare_weight_exchange(
             recorded_cards(), lines.append, L.WEIGHT_SOURCE_EXCHANGE, CENSUS,
             RECORDED["epoch_xsn14"], int(RECORDED["ring_table"]["ring_h_mib"]),

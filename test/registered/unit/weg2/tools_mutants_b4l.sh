@@ -35,7 +35,7 @@ cp "$BASE" "$WORK"
 python3 - "$WORK" <<'EOF'
 import sys, re
 p=sys.argv[1]; s=open(p).read()
-s=s.replace('    rel, fn, _ = idx.defs[qual]\n', '    return True  # M1\n', 1)
+s=s.replace('    _rel, fn, _lineno = idx.defs[qual]\n', '    return True  # M1\n', 1)
 open(p,'w').write(s)
 EOF
 run "M1 _referenced_anywhere always True" RED
