@@ -1,0 +1,115 @@
+{
+ "samples": [
+  {
+   "group": "P",
+   "at": "2026-09-09T18:58:03Z",
+   "boot_tag": "weg2sn5b",
+   "commit": "d8ea6261f7",
+   "shmem_before_bytes": 4588048384,
+   "shmem_after_bytes": 45979992064,
+   "shmem_delta_gib": 38.549251556396484,
+   "rss_shmem_gib": 43.06980895996094,
+   "weight_tags_gib": 28.833746910095215,
+   "extra_gib": 14.236062049865723,
+   "pids": [
+    4058917,
+    4059529,
+    4059530,
+    4059531,
+    4059532,
+    4059533
+   ],
+   "pids_asked": [
+    4058917,
+    4059529,
+    4059530,
+    4059531,
+    4059532,
+    4059533
+   ],
+   "interleaved": false,
+   "cg_current_bytes": null,
+   "arm": null,
+   "run_residual_gib": null,
+   "run_residual_note": "not the run moment (need a cgroup reading and the arm); NOT derived, and not 0"
+  },
+  {
+   "group": "D",
+   "at": "2026-09-09T19:00:30Z",
+   "boot_tag": "weg2sn5b",
+   "commit": "d8ea6261f7",
+   "shmem_before_bytes": 52091379712,
+   "shmem_after_bytes": 54903672832,
+   "shmem_delta_gib": 2.619152069091797,
+   "rss_shmem_gib": 46.859840393066406,
+   "weight_tags_gib": 27.1480530500412,
+   "extra_gib": 19.711787343025208,
+   "pids": [
+    4065316,
+    4067123,
+    4067125,
+    4067126,
+    4067128,
+    4067129,
+    4072344,
+    4072345,
+    4072346
+   ],
+   "pids_asked": [
+    4065316,
+    4067123,
+    4067125,
+    4067126,
+    4067128,
+    4067129,
+    4072344,
+    4072345,
+    4072346
+   ],
+   "interleaved": true,
+   "cg_current_bytes": 99591041024,
+   "arm": {
+    "m_mib": 1200,
+    "s_gb": 1
+   },
+   "run_residual_gib": 2.373163952827454,
+   "run_residual_note": ""
+  },
+  {
+   "group": "P",
+   "at": "2026-09-09T19:00:49Z",
+   "boot_tag": "weg2sn5b",
+   "commit": "d8ea6261f7",
+   "shmem_before_bytes": 54903672832,
+   "shmem_after_bytes": 54903672832,
+   "shmem_delta_gib": 0.0,
+   "rss_shmem_gib": 45.68894958496094,
+   "weight_tags_gib": 28.833746910095215,
+   "extra_gib": 16.855202674865723,
+   "pids": [
+    4058917,
+    4059529,
+    4059530,
+    4059531,
+    4059532,
+    4059533
+   ],
+   "pids_asked": [
+    4058917,
+    4059529,
+    4059530,
+    4059531,
+    4059532,
+    4059533
+   ],
+   "interleaved": true,
+   "cg_current_bytes": 98898604032,
+   "arm": {
+    "m_mib": 1200,
+    "s_gb": 1
+   },
+   "run_residual_gib": 5.10954682469368,
+   "run_residual_note": ""
+  }
+ ]
+}

@@ -1,0 +1,106 @@
+{
+  "cards": {
+    "GPU-31d7ef41-f574-4d0e-21ad-e773fd938f6d": {
+      "dormant_proc_used_mib": 1668,
+      "dormant_source": "READING: boot boot_weg2_weg2sn5b_d8ea6261f7_0909_185632 front WEG2-DC (NVML per-process at that group's sleep), peak per group P=1326, D=1668 MiB; the LARGER is charged (group D) because one field states both ranks",
+      "tags": {
+        "D": {
+          "weights": 3052,
+          "weights_0": 2218,
+          "weights_1": 1904,
+          "weights_2": 1906,
+          "weights_3": 1906,
+          "weights_4": 1906,
+          "weights_5": 1904,
+          "weights_6": 1906,
+          "weights_7": 1906
+        },
+        "P": {
+          "weights": 2124,
+          "weights_0": 2988,
+          "weights_1": 2916,
+          "weights_2": 2916,
+          "weights_3": 2916,
+          "weights_4": 2916,
+          "weights_5": 734,
+          "weights_6": 0,
+          "weights_7": 0
+        }
+      }
+    },
+    "GPU-5c648f96-be1d-42d5-0221-34d11ab137f7": {
+      "dormant_proc_used_mib": 1334,
+      "dormant_source": "READING: boot boot_weg2_weg2sn5b_d8ea6261f7_0909_185632 front WEG2-DC (NVML per-process at that group's sleep), peak per group P=864, D=1334 MiB; the LARGER is charged (group D) because one field states both ranks",
+      "tags": {
+        "D": {
+          "weights": 2606,
+          "weights_0": 678,
+          "weights_1": 550,
+          "weights_2": 550,
+          "weights_3": 550,
+          "weights_4": 550,
+          "weights_5": 550,
+          "weights_6": 552,
+          "weights_7": 550
+        },
+        "P": {
+          "weights": 910,
+          "weights_0": 0,
+          "weights_1": 0,
+          "weights_2": 0,
+          "weights_3": 0,
+          "weights_4": 0,
+          "weights_5": 2252,
+          "weights_6": 1826,
+          "weights_7": 0
+        }
+      }
+    },
+    "GPU-62dbbae1-e859-9ccc-f9c2-d9f2443a84f4": {
+      "dormant_proc_used_mib": 1334,
+      "dormant_source": "READING: boot boot_weg2_weg2sn5b_d8ea6261f7_0909_185632 front WEG2-DC (NVML per-process at that group's sleep), peak per group P=926, D=1334 MiB; the LARGER is charged (group D) because one field states both ranks",
+      "tags": {
+        "D": {
+          "weights": 2606,
+          "weights_0": 678,
+          "weights_1": 550,
+          "weights_2": 550,
+          "weights_3": 550,
+          "weights_4": 550,
+          "weights_5": 550,
+          "weights_6": 552,
+          "weights_7": 550
+        },
+        "P": {
+          "weights": 4552,
+          "weights_0": 356,
+          "weights_1": 0,
+          "weights_2": 0,
+          "weights_3": 0,
+          "weights_4": 0,
+          "weights_5": 0,
+          "weights_6": 1222,
+          "weights_7": 2854
+        }
+      }
+    }
+  },
+  "provenance": "ring-table boot boot_weg2_weg2sn5b_d8ea6261f7_0909_185632; selection: ring_table.solve(unpinned); solver note: solved from boot_weg2_weg2sn5b_d8ea6261f7_0909_185632 (form DIFFERENT, source key e3fe683c5d40; dormant sample boot weg2sn5b: D+P; 0 same-form candidate(s) ranked ahead of 59 of another form (form key f003de5bc71a; other-form ranking by form DISTANCE then age: weg2sn5b_d8ea6261f7_0909_185632(d=8), weg2sn5pre_319e76d60b_0909_175835(d=8), weg2t2b_d32e0bb316_0908_124003(d=8), weg2t2a_d7e7df4ed1_0908_; oracle boot_weg2_weg2xsn12_dab9baba94_0911_024941.front.log agrees (boot_weg2_weg2sn5b_d8ea6261f7_0909_185632); tool weg2/xchg_census.py sha=48f55fb393; tags from that boot's own WEG2-FLIP-TAG census (tms_tag_bytes over the saver's enable_cpu_backup metadata), re-keyed rank -> card by that boot's card= UUID and its NVML -> CUDA ordinal map, never by position; waves from weight_exchange.derive_waves over per-card chunk_tag_cards of the PP form, rebuilt through its owner from the reference boot's own REALIZED layer split [39, 13, 12] over 64 layers at 8 per chunk, and CHECKED against the map that boot published (nvml stage order [1, 0, 2] -> ordinals).  THE PRICED PARTITION AND THE PARTITION THE RANKS DERIVE ARE TWO OBJECTS: build_plan passes the EMPTY map and gets ONE wave, this census prices the per-card map and gets more.  On a SHADOW-inject boot that cannot overcommit anything -- the refill is the authority and the exchange lane does not own the flip's VRAM schedule -- but at S6I AUTHORITATIVE it can, so publishing this wave list to the ranks and having them refuse a mismatch (XchgCensus.waves' own TODO) is a PRECONDITION of that boot; dormant residue per card as stated in its own dormant_source; SPLIT DIFFERS AND GROUP P IS THEREFORE A BOUND: the source ran [42, 11, 11], this form runs [39, 13, 12].  A chunk tag is a LAYER BAND, so P's per-card rows describe the source's placement, not this one's; group D is TP and its rows are split-independent.  Per stage: stage 0 (card ordinal 0): source 42 layers vs this form 39 -> OVER-priced by 3 layer(s), stage 1 (card ordinal 1): source 11 layers vs this form 13 -> UNDER-priced by 2 layer(s), stage 2 (card ordinal 2): source 11 layers vs this form 12 -> UNDER-priced by 1 layer(s).  A layer of this checkpoint is 387 MiB at the mean and 721 MiB at the widest (weg2/checkpoint_census.py, boot-measured), so the error is bounded by that many layers on the stages named.  ROOT, not a property of this census: every boot that ran this form's split carries the xchg marker and is excluded from the ring table's selection by #1305 item 4, because the launcher does not hand solve() the XCHG_FORM_TOKEN that ring_table's own note prescribes once the xchg slice is on the line",
+  "waves": [
+    [
+      "weights_0",
+      "weights_4",
+      "weights_6"
+    ],
+    [
+      "weights_1",
+      "weights_5",
+      "weights_7"
+    ],
+    [
+      "weights_2",
+      "weights_3",
+      "weights"
+    ]
+  ]
+}

@@ -1,0 +1,104 @@
+{
+  "_what": "#1329 B4m -- RECORDED INPUTS AND RECORDED VERDICTS of the S6I boots of 2026-09-11, so the launcher's arm/dry-run arithmetic can be replayed at the desk with no boot, no NVML and no CUDA. Every number below is quoted from a boot record or a boot log named in its own `source` field; nothing here is derived at the desk.",
+  "_sources": {
+    "xsn13": "/spinning/gpu-arb/weg2/BOOT_weg2xsn13_0911.md (48f55fb393, STOP at the dry-run, no card touched)",
+    "xsn14": "/spinning/evidence-665-f1/boot_weg2_weg2xsn14_692b1e8698_0911_050756.front.log + BOOT_weg2xsn14_0911.md (692b1e8698, FAIL on two walls)",
+    "xsn15": "/spinning/evidence-665-f1/boot_weg2_weg2xsn15_dfceb7004e_0911_061045.front.log + BOOT_weg2xsn15_0911.md (dfceb7004e, W19 genuine 0)",
+    "ring_source_boot": "/spinning/evidence-665-f1/boot_weg2_weg2sn5b_d8ea6261f7_0909_185632.{front,P,D}.log -- the ring table's own source boot; ring_evidence/ holds ONLY the lines ring_table.solve parses out of them (WEG2-CHUNK-BYTES, WEG2-FLIP-TAG, KV Cache is allocated, the NVML->CUDA ordinal map, group P argv, WEG2-HOST-LEDGER CHOSEN, WEG2-CORRIDOR), plus the newest-per-group weg2sn5b samples of the host-ledger sidecar. 151 KB instead of 48 MB, and PROVEN equivalent: ring_table.solve returns byte-identical totals from this directory and from the full evidence dir."
+  },
+  "cards_ordinal_order": [
+    {
+      "ordinal": 0,
+      "nvml_index": 1,
+      "uuid": "GPU-31d7ef41-f574-4d0e-21ad-e773fd938f6d",
+      "name": "NVIDIA GeForce RTX 5090",
+      "total_mib": 32607
+    },
+    {
+      "ordinal": 1,
+      "nvml_index": 0,
+      "uuid": "GPU-5c648f96-be1d-42d5-0221-34d11ab137f7",
+      "name": "NVIDIA GeForce RTX 3080",
+      "total_mib": 20480
+    },
+    {
+      "ordinal": 2,
+      "nvml_index": 2,
+      "uuid": "GPU-62dbbae1-e859-9ccc-f9c2-d9f2443a84f4",
+      "name": "NVIDIA GeForce RTX 3080",
+      "total_mib": 20480
+    }
+  ],
+  "cards_source": "xsn14 front log, verbatim: 'NVML -> CUDA ordinal map: ordinal 0 = nvml 1 NVIDIA GeForce RTX 5090 GPU-31d7ef41-f574-4d0e-21ad-e773fd938f6d total 32607 MiB, ordinal 1 = nvml 0 NVIDIA GeForce RTX 3080 GPU-5c648f96-be1d-42d5-0221-34d11ab137f7 total 20480 MiB, ordinal 2 = nvml 2 NVIDIA GeForce RTX 3080 GPU-62dbbae1-e859-9ccc-f9c2-d9f2443a84f4 total 20480 MiB'. THE ORDER IS LOAD-BEARING: ring_table.solve maps list position to PP stage, so a card list in nvml order (0,1,2) instead of ordinal order (1,0,2) produces a different -- and silently wrong -- per-card H. Measured while building this fixture: nvml order gave total_h 55370055680, ordinal order gives the boot's own 46133149696.",
+  "ring_table": {
+    "boot_stem": "boot_weg2_weg2sn5b_d8ea6261f7_0909_185632",
+    "ring_bytes": 46133149696,
+    "ring_span1_bytes": 44559237120,
+    "ring_h_mib": 43996,
+    "per_card_h_mib": {
+      "GPU-31d7ef41-f574-4d0e-21ad-e773fd938f6d": 21713,
+      "GPU-5c648f96-be1d-42d5-0221-34d11ab137f7": 9756,
+      "GPU-62dbbae1-e859-9ccc-f9c2-d9f2443a84f4": 12527
+    },
+    "per_card_span1_mib": {
+      "GPU-31d7ef41-f574-4d0e-21ad-e773fd938f6d": 21713,
+      "GPU-5c648f96-be1d-42d5-0221-34d11ab137f7": 8255,
+      "GPU-62dbbae1-e859-9ccc-f9c2-d9f2443a84f4": 12527
+    },
+    "source": "ring_bytes/ring_span1_bytes are the two fields of XSN13's own ValueError; ring_h_mib is XSN14's WEG2-XCHG-ARMED token 'ring_H_mib=43996'; the per-card rows are XSN14's three 'WEG2-HOST-LEDGER RING card=... H=... span1=...' L6 lines."
+  },
+  "wall_xsn13_ring_absent_contradiction": {
+    "tree": "48f55fb393",
+    "weight_source": "exchange",
+    "inject_mode": "shadow",
+    "declared_ring_absent_by_design": true,
+    "raised_at": "python/sglang/srt/weg2/host_ledger.py:1832 price",
+    "call_chain": "launcher.py:10283 <module> -> :10249 cli -> :9263 main -> launcher.py:4635 choose_host_ledger -> host_ledger.py:2626 choose -> host_ledger.py:1832 price",
+    "root": "launcher.py:4625 ring_absent_by_design=(weight_source == \"exchange\") -- ring absence is a property of the INJECT ARM, not of the weight source",
+    "message_head": "ring_absent_by_design with a non-zero ring",
+    "fix_predicate": "launcher.ring_absent_by_design(weight_source, inject_mode) == (weight_source == exchange AND inject_mode == authoritative), B4f 692b1e8698"
+  },
+  "wall_xsn14_w19_dormant_residue": {
+    "tree": "692b1e8698",
+    "transport": "bar1",
+    "raised_at": "python/sglang/srt/weg2/front.py:4073 do_stop(\"W19 DormantResidueRefused\", ...)",
+    "predicate": "measured > reserve, per card, at group D's first sleep (front.py:4071)",
+    "rows": [
+      {
+        "uuid": "GPU-5c648f96-be1d-42d5-0221-34d11ab137f7",
+        "nvml_index": 0,
+        "measured_mib": 2588,
+        "reserve_mib": 1986,
+        "excess_mib": 602
+      },
+      {
+        "uuid": "GPU-31d7ef41-f574-4d0e-21ad-e773fd938f6d",
+        "nvml_index": 1,
+        "measured_mib": 3084,
+        "reserve_mib": 2292,
+        "excess_mib": 792
+      },
+      {
+        "uuid": "GPU-62dbbae1-e859-9ccc-f9c2-d9f2443a84f4",
+        "nvml_index": 2,
+        "measured_mib": 2588,
+        "reserve_mib": 1986,
+        "excess_mib": 602
+      }
+    ],
+    "source": "three 'WEG2-DC group=D uuid=... measured=... reserve=...' lines of XSN14's front log, and the W19 refusal text quoting the same three pairs",
+    "fix": "B4h dfceb7004e: DC_MEASURED_D_XCHG_MIB = (2588, 3084, 2588) selected by weight_source == exchange through the one selector dc_measured_d_mib, so the reserve follows the FORM; XSN15 read W19 genuine 0 on both groups"
+  },
+  "wall_w71_no_census": {
+    "tree": "pre-B4c (before 48f55fb393 there was no census producer at all)",
+    "raised_at": "python/sglang/srt/weg2/xchg_residency.py:316 load_census",
+    "trigger": "--weg2-weight-source exchange with no --weg2-xchg-census path",
+    "message_head": "W71 Weg2XchgResidencyUnarmable: --weg2-weight-source exchange needs a",
+    "source": "OPERATOR_HANDOVER_S6_0911.md section 5 wall 1; BOOT_weg2xsn13_0911.md records the fixed state ('W71 genuine 0 ... the census satisfied the gate that refused the previous attempt: B4c works')"
+  },
+  "armed_line_xsn14": "WEG2-XCHG-ARMED epoch=1789103306 waves=3 peak_mib=27848/12102/15358 (d2p) 29900/10714/14356 (p2d) free_mib=4759/8378/5122,2707/9766/6124 wave1_ok=6/6 floor_mib=1229 region_mib=385 ring_H_mib=43996 wired=no reason=S7-gate-only-no-rank-behaviour-until-S6",
+  "armed_line_source": "XSN14 front log, verbatim up to the ' -- provenance:' tail (the tail quotes the census's own provenance string, which the census fixture carries). XSN15's line is byte-identical except for epoch=1789107074, and BOOT_weg2xsn13_0911.md records the same peaks/frees/wave1_ok on 48f55fb393.",
+  "arming_floor_mib": 1229,
+  "region_mib": 385,
+  "epoch_xsn14": 1789103306
+}
