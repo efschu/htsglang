@@ -72,6 +72,7 @@ import ast
 import copy
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -153,6 +154,36 @@ class TestTheFixtureIsFaithful(CustomTestCase):
                     for dp, _dn, fns in os.walk(FIXTURES) for fn in fns)
         self.assertLess(biggest[0], 1 << 20, f"fixture file too big: {biggest}")
         self.assertLess(total, 1 << 21, f"fixture tree grew to {total} bytes")
+
+    def test_every_fixture_file_is_CARRIED_BY_THE_REPO(self):
+        """A fixture the repo does not carry is a test that works only on the
+        box that built it.
+
+        This is not hypothetical: the repo root ignores ``*.log``
+        (``.gitignore:62``), and the first ``git add`` of this tree committed
+        the sidecar and SILENTLY SKIPPED all three recorded boot logs -- the
+        exact three files ``ring_table.solve`` discovers its source boot by.
+        On a fresh clone the replay would have found no table and half of this
+        file would have died for a reason having nothing to do with the code
+        it grades.  ``ring_evidence/.gitignore`` un-ignores them; this test is
+        what makes that structural rather than remembered.
+        """
+        tracked = subprocess.run(
+            ["git", "-C", os.path.dirname(os.path.abspath(__file__)),
+             "ls-files", "--", FIXTURES],
+            capture_output=True, text=True, check=False,
+        )
+        if tracked.returncode != 0:
+            self.skipTest(f"not a git checkout: {tracked.stderr.strip()[:120]}")
+        listed = {os.path.basename(p) for p in tracked.stdout.split()}
+        on_disk = {fn for _dp, _dn, fns in os.walk(FIXTURES) for fn in fns
+                   if fn != ".gitignore"}
+        missing = sorted(on_disk - listed)
+        self.assertEqual(
+            missing, [],
+            f"fixture file(s) present on this box but NOT tracked: {missing} "
+            "-- most likely the root *.log ignore; see ring_evidence/.gitignore",
+        )
 
     def test_solve_reproduces_the_boots_own_ring_bytes(self):
         table, reason = solve_recorded_ring()

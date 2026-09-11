@@ -70,18 +70,23 @@ open(p,'w').write(s)
 EOF
 run "M4 raise scan matches nothing" RED
 
-# M5: TEST modules count as production wiring -- the #1001 mention-vs-use trap.
-# refuse_if_not_ok IS called by test_weg2_xchg_cover_1273.py, so this mutant
-# turns the W84 debt entry "wired" from a test alone.
+# M5: the LANE loses one of its modules -- the scope narrows and two debt
+# entries stop being FOUND, i.e. the debt silently goes stale.  This replaces
+# an earlier M5 ("test modules count as production wiring") that was MEASURED
+# TO SURVIVE after the rebase: the analyser's walk root is python/sglang/srt,
+# so the repo's test tree is not in scope at all and removing the in-srt test
+# filter changes no verdict.  That property is now pinned by a POSITIVE test
+# (test_a_test_module_is_never_production_wiring) instead of by a mutant that
+# could not kill.  Recorded rather than quietly swapped: a mutant harness that
+# reports a survivor as a pass is the false GREEN this whole discipline is against.
 cp "$BASE" "$WORK"
 python3 - "$WORK" <<'EOF'
 import sys
 p=sys.argv[1]; s=open(p).read()
-s=s.replace('        if rel.startswith("test") or "/test" in rel:\n            continue\n',
-            '        pass  # M5: tests count as production\n', 1)
+s=s.replace('    "weg2/weight_exchange_transport.py",\n', '', 1)  # M5
 open(p,'w').write(s)
 EOF
-run "M5 test modules count as production wiring" RED
+run "M5 LANE_FILES loses weight_exchange_transport" RED
 
 # M6: the entry set is emptied -> every ratchet goes vacuously green
 cp "$BASE" "$WORK"

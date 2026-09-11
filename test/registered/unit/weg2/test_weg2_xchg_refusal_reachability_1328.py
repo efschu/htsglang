@@ -541,6 +541,44 @@ class TestTheScopeIsWhatItClaims(CustomTestCase):
                 f"production entry {rel}::{fn} no longer exists",
             )
 
+    def test_a_test_module_is_never_production_wiring(self):
+        """#1001, the mention-vs-use trap, and it is LOAD-BEARING here rather
+        than decorative -- two halves, both measured:
+
+        (a) the scope excludes test code twice over: the walk root is
+            ``python/sglang/srt`` (so the repo's own ``test/`` tree is not in
+            it at all) AND ``_py_files`` filters the test modules that live
+            INSIDE srt (there are several, e.g.
+            ``layers/dcp/test_weightless_kv_math.py``).
+        (b) ``refuse_if_not_ok`` -- debt entry 1, the W84 raiser -- IS called
+            from ``test_weg2_xchg_cover_1273.py``.  So a scope that counted
+            test code would report it WIRED, and the W84 finding would have
+            evaporated into a test calling its own subject.
+
+        Half (b) is what makes half (a) worth pinning: without a real
+        instance, "we exclude tests" is a preference; with it, it is the
+        difference between a finding and a false green.
+        """
+        idx = _index()
+        in_scope = {rel for rel, _fn, _ln in idx.defs.values()}
+        leaked = sorted(r for r in in_scope
+                        if r.startswith("test") or "/test" in r)
+        self.assertEqual(leaked, [], f"test modules entered the scope: {leaked}")
+
+        repo_root = os.path.normpath(os.path.join(SRT, "..", "..", ".."))
+        caller = os.path.join(repo_root, "test", "registered", "unit", "weg2",
+                              "test_weg2_xchg_cover_1273.py")
+        if not os.path.isfile(caller):
+            self.skipTest("the sibling that calls refuse_if_not_ok is gone")
+        with open(caller, encoding="utf-8") as fh:
+            body = fh.read()
+        self.assertIn(
+            "refuse_if_not_ok(", body,
+            "the instance that makes (a) load-bearing is gone: no test calls "
+            "refuse_if_not_ok any more, so re-check whether the debt entry's "
+            "class is still UNWIRED-BY-DESIGN-AND-PINNED",
+        )
+
     def test_reachability_is_not_vacuous(self):
         """INDIKATOR-GESETZ: an instrument is a finding only once it is shown
         to measure what it claims.  With an empty or broken entry set every

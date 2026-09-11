@@ -1,0 +1,10 @@
+# The repo root ignores *.log (.gitignore:62). These three ARE the fixture:
+# ring_table.solve discovers its source boot by the NAMES `<stem>.front.log`,
+# `<stem>.P.log` and `<stem>.D.log` (ring_table._boot_stems), so they cannot be
+# renamed to a non-.log extension without breaking the discovery this replay
+# exists to exercise. Un-ignored HERE rather than committed with `git add -f`,
+# so the next person who adds a recorded boot log to this directory does not
+# have to know the trick -- and #1329's fixture cannot silently stop being
+# carried by the repo. Caught before the first push: the first `git add` of
+# this tree committed the sidecar and silently skipped all three logs.
+!*.log
