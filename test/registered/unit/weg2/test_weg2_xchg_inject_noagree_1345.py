@@ -403,12 +403,22 @@ def test_W74_carries_the_profile_and_not_only_the_first_offender():
     from "this lane has no source at all".  MUTANT M13: strip the counts from
     the W74 message and this goes red.
     """
-    import inspect
-
+    from sglang.srt.weg2 import weight_exchange as wx
     from sglang.srt.weg2 import weight_exchange_bounce as wb
 
-    src = inspect.getsource(wb.run_bounce_leg)
-    assert "W74 Weg2XchgSourceMissing" in src
-    assert "src_resolved=" in src and "dst_resolved=" in src, (
-        "W74 must carry the resolution census, not just the first offender"
-    )
+    # BEHAVIOURAL, NOT A TEXT SCAN -- and the first version of this pin WAS a
+    # text scan over `run_bounce_leg`'s source, which mutant M13 survived: it
+    # stripped the `PROFILE mode=` field while leaving the `src_resolved=`
+    # f-string further down, so the scan still matched.  The #1341 trap in my
+    # own pin.  We now RAISE the real refusal and read the real message; the
+    # refusal happens before any device call, so no ops double is needed.
+    descs = [_mk_desc(None, 8192) for _ in range(3)]
+    with pytest.raises(wx.Weg2XchgSourceMissing) as ei:
+        wb.run_bounce_leg(descs, ops=None, boot_nonce="pin",
+                          slot_bytes=1 << 20, depth=2)
+    msg = str(ei.value)
+    assert "W74 Weg2XchgSourceMissing" in msg
+    assert "has no source pointer" in msg, "(a') must survive: name the side"
+    assert "src_resolved=0/3" in msg, f"(a'') census missing: {msg}"
+    assert "dst_resolved=3/3" in msg, f"(a'') census missing: {msg}"
+    assert "pieces=6" in msg, f"(a'') pieces denominator missing: {msg}"
