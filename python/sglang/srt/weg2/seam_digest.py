@@ -119,6 +119,25 @@ WHAT IS NOT COVERED, said here so a green reading is never over-read
 * A digest detects and localises TO THE PIECE.  When it fires, the localisation
   within that piece has not been done -- it has been justified.
 
+HOW A BOOT SEAT MUST READ THE VERDICT (#1350 S4, from the review).  The W90
+refusal is a RANK-LOCAL raise: it leaves the RPC handler, the scheduler catches
+it, and the parent is signalled (SIGQUIT -> kill_process_tree).  That is a
+CRASH, which RAENGE-NIE-UNEINS permits -- the review checked the code and
+REFUTED the "it wedges at the next collective" reading -- but it means only the
+RAISING rank carries the MISMATCH.  Its siblings wrote their own verdict lines
+in parallel, or had not reached them yet.  **Read all three lines per group,
+never the dying rank's alone**; a single MISMATCH beside two MATCHes is a
+per-rank finding, three MISMATCHes are a leg-wide one, and those are different
+diagnoses.  The same applies to MATCH-PARTIAL: it is per rank, because the
+skipped set is a property of that rank's own walk.
+
+TWO GRADERS RUN ON THE SAME WAKE, ON PURPOSE, WITH DIFFERENT POLICIES.  The
+shadow stripe compare (``_weg2_xchg_shadow_compare``) is an OBSERVER and never
+raises inside a flip leg; this grader REFUSES.  That is deliberate -- one
+samples copy fidelity at the receiving end, the other grades the round trip on
+the same rank -- but a reader who sees one of them silent and the other fatal
+should know it is design and not a missing branch.
+
 LIFECYCLE OF THE ONE PIECE OF STATE (the rule this project pays for otherwise):
 ``SchedulerWeightUpdaterManager.weg2_seam_before``.
   WRITER  -- ``_weg2_seam_digest_before``, at the first weights RPC of a sleep.
