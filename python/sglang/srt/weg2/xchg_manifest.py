@@ -266,13 +266,15 @@ def load_manifests(dump_dir: str, *, boot_token: str = "") -> Tuple[RankManifest
 class JoinedTensor:
     """One tensor, as BOTH groups together describe it.
 
-    ``rows_full``/``cols_full`` are the UNSHARDED extents -- the sum over the
-    destination's rows on the sharded axis -- which is precisely the number
-    ``derive_leg_plan``'s docstring says no single rank holds.  ``dst_widths``
-    is the destination's per-rank extent vector IN PLAN ORDER, which
-    ``_blocks_of`` (``weight_exchange.py:1575``) consumes directly, so no
-    ``ratios`` vector has to be invented for a group whose tensors are not all
-    cut the same way.
+    GROUP-ORIENTED, NOT ROLE-ORIENTED, and that is the whole reason this
+    dataclass names ``pp_stage``/``tp_widths`` instead of ``src``/``dst``: a
+    flip goes BOTH ways, and the two directions must come out of ONE join or
+    they are two derivations of one fact again.  Which side is the source is
+    the DIRECTION's business (:func:`plan_from_join`), never the join's.
+
+    ``rows_full``/``cols_full`` are the UNSHARDED extents -- the TP side's rows
+    summed on the sharded axis -- which is precisely the number
+    ``derive_leg_plan``'s docstring says no single rank holds (``:3121``).
     """
 
     param_name: str
@@ -282,16 +284,41 @@ class JoinedTensor:
     rows_full: int
     cols_full: int
     shard_axis: int
-    stage: int
-    dst_widths: Tuple[int, ...]
-    src_card: int
+    #: Which rank of the PP group holds this tensor WHOLE.
+    pp_stage: int
+    #: The TP group's per-rank extent on the sharded axis, in rank order.
+    tp_widths: Tuple[int, ...]
+    pp_card: int
 
     @property
     def sharded(self) -> bool:
         return self.shard_axis != wx.REPLICATED
 
-    def geom(self) -> wx.ParamGeom:
-        """The ``ParamGeom`` the plan consumes.  No tensor is read."""
+    def geom(self, *, tp_is_dst: bool) -> wx.ParamGeom:
+        """The ``ParamGeom`` the plan consumes.  No tensor is read.
+
+        ``family`` IS THE PARAMETER'S OWN NAME, and that is the hinge that
+        makes the mirror direction work at all.  ``_blocks_of`` honours a
+        per-tensor width vector ONLY on the destination
+        (``weight_exchange.py:1575``: ``if is_dst and geom.dst_widths is not
+        None``); the SOURCE side with ``tp_size > 1`` goes through
+        ``layout.ratios_for(geom.family)`` (``:1594``), which is a GROUP-level
+        lookup.  Under ``tp_to_pp`` the TP group is the source, so a plan that
+        only filled ``dst_widths`` would have fallen back to an even split on
+        the very side that is unevenly cut -- silently, on both ends equally,
+        which is the #1275 class.  Keying ``family_ratios`` by the parameter
+        name turns that group-level lookup into a per-tensor one without a new
+        field in ``ParamGeom`` and without touching ``_blocks_of``.
+
+        THE VOCABULARY LAW IS NOT BYPASSED, IT IS SUPERSEDED BY MEASUREMENT.
+        ``ratios_for`` (``:510``) exists so the vocabulary keeps the even split
+        under an uneven base plan.  Here the widths are not a plan at all --
+        they are what the two groups' loaders ACTUALLY DID, read back off their
+        own manifests.  Whatever ``VocabParallelEmbedding`` chose for
+        ``embed_tokens`` is the vector this returns for ``embed_tokens``, so
+        the law is satisfied by construction rather than by a family taxonomy
+        that has to be kept in step with the loader.
+        """
         geom = wx.ParamGeom(
             name=self.param_name,
             tag=self.tag,
@@ -299,9 +326,10 @@ class JoinedTensor:
             rows_full=int(self.rows_full),
             cols_full=int(self.cols_full),
             itemsize=int(self.itemsize),
-            stage=int(self.stage),
-            dst_widths=(tuple(int(w) for w in self.dst_widths)
-                        if self.sharded else None),
+            stage=int(self.pp_stage),
+            family=(None if not self.sharded else str(self.param_name)),
+            dst_widths=(tuple(int(w) for w in self.tp_widths)
+                        if (self.sharded and tp_is_dst) else None),
         )
         geom.validate()
         return geom
@@ -309,17 +337,17 @@ class JoinedTensor:
 
 @dataclass(frozen=True)
 class ManifestJoin:
-    """The joined placement of one direction, plus its own denominators."""
+    """The joined placement of ONE BOOT -- both directions, one derivation."""
 
-    src_group: str
-    dst_group: str
+    pp_group: str
+    tp_group: str
     cards: Tuple[int, ...]
     tensors: Tuple[JoinedTensor, ...]
-    #: Names present on the destination and on no source -- ALWAYS empty on a
-    #: successful join (they are W74), kept so a caller can print the census.
+    #: ALWAYS empty on a successful join (they are W74); kept so a caller can
+    #: print the census rather than infer it from an exception.
     unsourced: Tuple[str, ...]
-    src_ranks: int
-    dst_ranks: int
+    pp_ranks: int
+    tp_ranks: int
 
     @property
     def by_name(self) -> Dict[str, JoinedTensor]:
@@ -329,242 +357,280 @@ class ManifestJoin:
     def n_sharded(self) -> int:
         return sum(1 for t in self.tensors if t.sharded)
 
-    def line(self) -> str:
-        """Every number with its denominator (the campaign's denominator law)."""
+    def family_ratios(self) -> Dict[str, Tuple[int, ...]]:
+        """The TP group's per-tensor width vector, keyed by parameter name."""
+        return {t.param_name: tuple(int(w) for w in t.tp_widths)
+                for t in self.tensors if t.sharded}
+
+    def line(self, direction: str = "") -> str:
+        """Every number with its denominator (the denominator law)."""
         classes = sorted({t.tensor_class for t in self.tensors})
         return (
-            f"{JOIN_LINE_PREFIX} src={self.src_group} dst={self.dst_group} "
-            f"src_ranks={self.src_ranks} dst_ranks={self.dst_ranks} "
+            f"{JOIN_LINE_PREFIX} pp={self.pp_group} tp={self.tp_group} "
+            f"{('direction=' + direction + ' ') if direction else ''}"
+            f"pp_ranks={self.pp_ranks} tp_ranks={self.tp_ranks} "
             f"tensors={len(self.tensors)} "
             f"sharded={self.n_sharded}/{len(self.tensors)} "
             f"unsourced={len(self.unsourced)} "
             f"classes={len(classes)} "
-            f"-- extents are the JOIN's (the destination's rows summed), not "
-            f"any one rank's reading"
+            f"-- extents are the JOIN's (the TP side's rows summed), not any "
+            f"one rank's reading; the direction chooses roles, not extents"
         )
 
 
-def _axis_of(name: str, src: ManifestPiece,
-             dst_rows: Sequence[ManifestPiece]) -> Tuple[int, int, int, Tuple[int, ...]]:
-    """``(shard_axis, rows_full, cols_full, dst_widths)`` -- READ, not guessed.
+def _axis_of(name: str, whole: ManifestPiece,
+             cut: Sequence[ManifestPiece],
+             ) -> Tuple[int, int, int, Tuple[int, ...]]:
+    """``(shard_axis, rows_full, cols_full, tp_widths)`` -- READ, not guessed.
 
     Four cases and no fifth.  The fifth would be a silent ``REPLICATED``, which
     is exactly the tree's current answer (``weight_exchange_shadow.py:3237``)
     and the reason the shard cut has been invisible since S2: a plan that calls
     every tensor replicated moves whole tensors between differently-shaped
-    groups and calls it agreement.
-    """
-    rows = [int(p.rows_full) for p in dst_rows]
-    cols = [int(p.cols_full) for p in dst_rows]
-    s_rows, s_cols = int(src.rows_full), int(src.cols_full)
+    groups and calls that agreement.
 
-    same_cols = len(set(cols)) == 1 and cols[0] == s_cols
-    same_rows = len(set(rows)) == 1 and rows[0] == s_rows
+    ``whole`` is the PP side (one stage holds the tensor entire) and ``cut`` the
+    TP side's rows.  Both are read off manifests, so this is a comparison of
+    two measurements and not an inference from either.
+    """
+    rows = [int(p.rows_full) for p in cut]
+    cols = [int(p.cols_full) for p in cut]
+    w_rows, w_cols = int(whole.rows_full), int(whole.cols_full)
+
+    same_cols = len(set(cols)) == 1 and cols[0] == w_cols
+    same_rows = len(set(rows)) == 1 and rows[0] == w_rows
 
     if same_rows and same_cols:
-        return wx.REPLICATED, s_rows, s_cols, tuple(rows)
-    if same_cols and sum(rows) == s_rows:
-        return wx.ROWS, s_rows, s_cols, tuple(rows)
-    if same_rows and sum(cols) == s_cols:
-        return wx.COLS, s_rows, s_cols, tuple(cols)
+        return wx.REPLICATED, w_rows, w_cols, tuple(rows)
+    if same_cols and sum(rows) == w_rows:
+        return wx.ROWS, w_rows, w_cols, tuple(rows)
+    if same_rows and sum(cols) == w_cols:
+        return wx.COLS, w_rows, w_cols, tuple(cols)
     raise wx.Weg2XchgPlanDisagree(
-        f"W68 Weg2XchgPlanDisagree: {name}: the source holds "
-        f"({s_rows}, {s_cols}) and the destination rows hold "
-        f"{list(zip(rows, cols))}. That is neither a row cut (equal columns, "
-        f"rows summing to the source's), nor a column cut, nor a replica -- "
-        f"so the two groups cannot both be describing the same tensor. "
-        f"Guessing REPLICATED here is what made the shard cut invisible; the "
-        f"join refuses instead."
+        f"W68 Weg2XchgPlanDisagree: {name}: the PP side holds "
+        f"({w_rows}, {w_cols}) and the TP rows hold {list(zip(rows, cols))}. "
+        f"That is neither a row cut (equal columns, rows summing to the whole), "
+        f"nor a column cut, nor a replica -- so the two groups cannot both be "
+        f"describing the same tensor. Guessing REPLICATED here is what made the "
+        f"shard cut invisible; the join refuses instead."
     )
 
 
 def join_manifests(
     manifests: Sequence[RankManifest],
     *,
-    src_group: str,
-    dst_group: str,
+    pp_group: str = "P",
+    tp_group: str = "D",
 ) -> ManifestJoin:
-    """Join two groups' manifests over ``param_name``.  Never a default.
+    """Join the two groups' manifests over ``param_name``.  Never a default.
 
-    THE SOURCE SIDE IS THE JOIN'S ANSWER, which is the whole point: the
-    destination rank asks "which rank of the other group holds the bytes I
-    need", and the answer comes from a FILE that rank WROTE, not from a
-    pointer the asking process structurally cannot read.
+    ONE JOIN SERVES BOTH DIRECTIONS.  It is deliberately not parameterised by
+    source and destination: a flip runs ``pp_to_tp`` and ``tp_to_pp`` and both
+    must come out of the same derivation, or the campaign has two answers to
+    one placement again.
+
+    THE CROSS-GROUP ANSWER IS THE POINT: a rank asks "which rank of the other
+    group holds the bytes I need, and how is this tensor cut over there", and
+    the answer comes from FILES THOSE RANKS WROTE -- not from a pointer the
+    asking process structurally cannot read (``weight_exchange_shadow.py:3336``).
     """
-    src = sorted((m for m in manifests if m.group == src_group),
-                 key=lambda m: m.rank)
-    dst = sorted((m for m in manifests if m.group == dst_group),
-                 key=lambda m: m.rank)
-    if not src or not dst:
+    pp = sorted((m for m in manifests if m.group == pp_group),
+                key=lambda m: m.rank)
+    tp = sorted((m for m in manifests if m.group == tp_group),
+                key=lambda m: m.rank)
+    if not pp or not tp:
         raise wx.Weg2XchgSourceMissing(
             f"W74 Weg2XchgSourceMissing: the join needs both groups' "
-            f"manifests and has {len(src)} for {src_group!r} and {len(dst)} "
-            f"for {dst_group!r}. An absent manifest is an absent SOURCE, and "
-            f"planning over the ranks that did publish would silently narrow "
-            f"the exchange to whatever happened to be on disk."
+            f"manifests and has {len(pp)} for {pp_group!r} and {len(tp)} for "
+            f"{tp_group!r}. An absent manifest is an absent SOURCE in one of "
+            f"the two directions, and planning over the ranks that did publish "
+            f"would silently narrow the exchange to whatever was on disk."
         )
-    if [m.rank for m in dst] != list(range(len(dst))):
-        raise wx.Weg2XchgPlanDisagree(
-            f"W68 Weg2XchgPlanDisagree: group {dst_group!r} published ranks "
-            f"{[m.rank for m in dst]}, which is not a contiguous 0..n-1 "
-            f"range. The destination's per-rank extents are a VECTOR in rank "
-            f"order; a gap in it would shift every shard boundary."
-        )
+    for label, group, mans in ((pp_group, pp_group, pp), (tp_group, tp_group, tp)):
+        if [m.rank for m in mans] != list(range(len(mans))):
+            raise wx.Weg2XchgPlanDisagree(
+                f"W68 Weg2XchgPlanDisagree: group {group!r} published ranks "
+                f"{[m.rank for m in mans]}, which is not a contiguous 0..n-1 "
+                f"range. The per-rank extents are a VECTOR in rank order; a "
+                f"gap in it would shift every shard boundary."
+            )
 
-    src_by_name: Dict[str, Tuple[int, ManifestPiece]] = {}
-    src_card_by_rank = {m.rank: m.card for m in src}
-    for man in src:
+    pp_by_name: Dict[str, Tuple[int, ManifestPiece]] = {}
+    pp_card_by_rank = {m.rank: m.card for m in pp}
+    for man in pp:
         for piece in man.pieces:
-            prior = src_by_name.get(piece.param_name)
+            prior = pp_by_name.get(piece.param_name)
             if prior is not None and prior[1].key != piece.key:
                 raise wx.Weg2XchgPlanDisagree(
                     f"W68 Weg2XchgPlanDisagree: {piece.param_name} is "
-                    f"published by {src_group} ranks {prior[0]} and "
-                    f"{man.rank} with DIFFERENT identities {prior[1].key} vs "
-                    f"{piece.key}. Under the PP form one stage holds a tensor "
-                    f"whole; two disagreeing holders leave the plan free to "
-                    f"pick either."
+                    f"published by {pp_group} ranks {prior[0]} and {man.rank} "
+                    f"with DIFFERENT identities {prior[1].key} vs {piece.key}. "
+                    f"Under the PP form one stage holds a tensor whole; two "
+                    f"disagreeing holders leave the plan free to pick either."
                 )
             if prior is None:
-                src_by_name[piece.param_name] = (man.rank, piece)
+                pp_by_name[piece.param_name] = (man.rank, piece)
 
-    dst_names: List[str] = []
+    names: List[str] = []
     seen = set()
-    for man in dst:
+    for man in tp:
         for piece in man.pieces:
             if piece.param_name not in seen:
                 seen.add(piece.param_name)
-                dst_names.append(piece.param_name)
-    dst_names.sort()
+                names.append(piece.param_name)
+    names.sort()
 
     tensors: List[JoinedTensor] = []
     unsourced: List[str] = []
-    for name in dst_names:
-        rows = [m.by_name.get(name) for m in dst]
+    for name in names:
+        rows = [m.by_name.get(name) for m in tp]
         if any(p is None for p in rows):
-            # A tensor only SOME destination ranks hold is not a shard cut this
-            # plan can name; it is reported as unsourced rather than planned
-            # over the ranks that have it.
+            # A tensor only SOME TP ranks hold is not a cut this plan can name;
+            # it is reported rather than planned over the ranks that have it.
             unsourced.append(name)
             continue
-        found = src_by_name.get(name)
+        found = pp_by_name.get(name)
         if found is None:
             unsourced.append(name)
             continue
-        stage, src_piece = found
-        if int(src_piece.itemsize) != int(rows[0].itemsize):
+        stage, whole = found
+        if int(whole.itemsize) != int(rows[0].itemsize):
             raise wx.Weg2XchgPlanDisagree(
                 f"W68 Weg2XchgPlanDisagree: {name}: itemsize "
-                f"{src_piece.itemsize} on {src_group} rank {stage} against "
-                f"{rows[0].itemsize} on {dst_group}. The two groups loaded "
-                f"this tensor at different element widths, so no descriptor "
-                f"can name both."
+                f"{whole.itemsize} on {pp_group} rank {stage} against "
+                f"{rows[0].itemsize} on {tp_group}. The two groups loaded this "
+                f"tensor at different element widths, so no descriptor can "
+                f"name both."
             )
-        axis, rows_full, cols_full, widths = _axis_of(name, src_piece, rows)
+        axis, rows_full, cols_full, widths = _axis_of(name, whole, rows)
         tensors.append(
             JoinedTensor(
                 param_name=name,
-                tensor_class=src_piece.tensor_class,
-                tag=str(rows[0].tag or src_piece.tag),
-                itemsize=int(src_piece.itemsize),
+                tensor_class=whole.tensor_class,
+                tag=str(rows[0].tag or whole.tag),
+                itemsize=int(whole.itemsize),
                 rows_full=rows_full,
                 cols_full=cols_full,
                 shard_axis=axis,
-                stage=int(stage),
-                dst_widths=widths,
-                src_card=int(src_card_by_rank.get(stage, stage)),
+                pp_stage=int(stage),
+                tp_widths=widths,
+                pp_card=int(pp_card_by_rank.get(stage, stage)),
             )
         )
 
     if unsourced:
         raise wx.Weg2XchgSourceMissing(
-            f"W74 Weg2XchgSourceMissing: {len(unsourced)} of "
-            f"{len(dst_names)} tensors held by {dst_group} have no counterpart "
-            f"in {src_group}'s manifest (first: {unsourced[0]!r}). Assembly "
-            f"stages a source, it does not create one -- planning the rest "
-            f"would serve those slices with undefined bytes."
+            f"W74 Weg2XchgSourceMissing: {len(unsourced)} of {len(names)} "
+            f"tensors held by {tp_group} have no counterpart in {pp_group}'s "
+            f"manifest (first: {unsourced[0]!r}). Assembly stages a source, it "
+            f"does not create one -- planning the rest would serve those slices "
+            f"with undefined bytes."
         )
 
     return ManifestJoin(
-        src_group=str(src_group),
-        dst_group=str(dst_group),
-        cards=tuple(m.card for m in dst),
-        tensors=tuple(tensors),
-        unsourced=(),
-        src_ranks=len(src),
-        dst_ranks=len(dst),
+        pp_group=str(pp_group), tp_group=str(tp_group),
+        cards=tuple(m.card for m in tp), tensors=tuple(tensors),
+        unsourced=(), pp_ranks=len(pp), tp_ranks=len(tp),
     )
 
 
 # ---------------------------------------------------------------------------
-# THE PROVIDER -- the join turned into descriptors with BOTH sides resolved.
+# THE PROVIDER -- the join turned into descriptors, in EITHER direction.
 # ---------------------------------------------------------------------------
 
 
 def plan_from_join(
     join: ManifestJoin,
     *,
+    direction: str = "",
     waves: Optional[Sequence[Sequence[str]]] = None,
     src_addr=None,
     dst_addr=None,
-    dst_rank: Optional[int] = None,
 ) -> wx.XchgPlan:
-    """Build the CROSS-GROUP plan from the join.
+    """Build the CROSS-GROUP plan for one direction out of the ONE join.
 
-    THE DESTINATION IS A REAL TP GROUP, and that is the half a ``src_ptr``
-    patch would have missed.  ``tp_size=len(cards)`` with the join's own
-    per-tensor ``dst_widths`` makes ``_blocks_of`` cut the shards
-    (``weight_exchange.py:1575``); with ``tp_size=1`` the same descriptors come
-    out whole and ``src_resolved=N/N`` would be green on a plan that moves
-    nothing correctly.  :func:`refuse_diagonal_layout` is the guard, and it
-    runs here rather than being left to the caller.
+    BOTH DIRECTIONS ARE EQUAL CITIZENS.  ``pp_to_tp`` makes the PP group the
+    source and the TP group the destination; ``tp_to_pp`` mirrors it.  Neither
+    is a special case: the extents, the axis and the holder come from the same
+    join, and only the ROLES change.
 
-    ``src_addr(name, rank)`` and ``dst_addr(name, rank)`` are the ADDRESS
-    BOOKS and they stay the caller's: which arena a byte lives in is the
-    loader's and the transport's decision, exactly as the operator ruling
-    says.  What this function supplies is the IDENTITY -- which source covers
-    which destination slice -- which is what the peer's manifest answers and a
-    peer's ``data_ptr()`` cannot.
+    THE TP SIDE IS A REAL TP GROUP IN BOTH OF THEM, which is the half a
+    ``src_ptr`` patch would have missed.  ``tp_size=len(cards)`` with the
+    join's own per-tensor vector makes ``_blocks_of`` cut the shards; with
+    ``tp_size=1`` the same descriptors come out whole and ``src_resolved=N/N``
+    would be green on a plan that moves nothing correctly.
+    :func:`refuse_diagonal_layout` is the guard and it runs here.
+
+    **THE ADDRESS CONTRACT, stated so the next wiring does not re-decide it.**
+    ``src_addr(name, rank)`` and ``dst_addr(name, rank)`` are the caller's, and
+    what this module supplies is the IDENTITY -- which piece of which holder
+    covers which destination slice.  The intended resolution is:
+
+    * the SOURCE hook, on the rank that holds the bytes, answers with its OWN
+      DEVICE ADDRESS (it knows it; it is in its own manifest) and deposits its
+      pieces into the bounce slot;
+    * the DESTINATION side resolves the source to the BOUNCE SLOT OFFSET (host
+      staging) -- never to a peer device address, which no process can read,
+      and never to the ring.
+
+    THE RING IS THE COUNTER-PROOF, NEVER THE SOURCE, at this stage.  Reading
+    the source side out of the ring would be the ring restore through another
+    door, and the goal it defeats -- zero layer bytes resident in host RAM --
+    is the whole point of the exchange.  ``pointer_profile`` counts both
+    resolutions the same way (it asks only whether ``src_ptr`` is set), so
+    ``src_resolved`` is honest under either hook.
     """
+    direction = str(direction or wx.LEGS_PP_TO_TP)
+    if direction not in (wx.LEGS_PP_TO_TP, wx.LEGS_TP_TO_PP):
+        raise wx.Weg2XchgPlanDisagree(
+            f"W68 Weg2XchgPlanDisagree: {direction!r} is not a flip direction. "
+            f"The two are {wx.LEGS_PP_TO_TP!r} and {wx.LEGS_TP_TO_PP!r} "
+            f"(layers/dcp/phase_flip_plan.py), and a third spelling would "
+            f"plan one of them under the other's name."
+        )
     cards = tuple(join.cards)
-    refuse_diagonal_layout(len(cards), dst_group=join.dst_group)
-    src = wx.GroupLayout(name=join.src_group, cards=cards, tp_size=1, base=0)
-    dst = wx.GroupLayout(name=join.dst_group, cards=cards,
-                         tp_size=len(cards), base=len(cards))
+    refuse_diagonal_layout(len(cards), tp_group=join.tp_group)
+    tp_is_dst = direction == wx.LEGS_PP_TO_TP
 
-    inventory = [t.geom() for t in join.tensors]
+    ratios = join.family_ratios()
+    pp = wx.GroupLayout(name=join.pp_group, cards=cards, tp_size=1,
+                        base=(0 if tp_is_dst else len(cards)))
+    tp = wx.GroupLayout(name=join.tp_group, cards=cards, tp_size=len(cards),
+                        family_ratios=ratios,
+                        base=(len(cards) if tp_is_dst else 0))
+    src, dst = (pp, tp) if tp_is_dst else (tp, pp)
+
+    inventory = [t.geom(tp_is_dst=tp_is_dst) for t in join.tensors]
     if waves is None:
         waves = [sorted({str(g.tag) for g in inventory})]
 
     def ptr_of(group: str, rank: int, name: str) -> Optional[int]:
-        if group == join.src_group:
+        if group == src.name:
             return None if src_addr is None else src_addr(name, int(rank))
-        if group == join.dst_group:
-            if dst_rank is not None and int(rank) != int(dst_rank):
-                return None
+        if group == dst.name:
             return None if dst_addr is None else dst_addr(name, int(rank))
         return None
 
     return wx.build_plan(inventory, src, dst, waves=waves, ptr_of=ptr_of)
 
 
-def refuse_diagonal_layout(tp_size: int, *, dst_group: str) -> None:
-    """A destination planned at ``tp_size=1`` is the diagonal, and is refused.
+def refuse_diagonal_layout(tp_size: int, *, tp_group: str) -> None:
+    """A TP group planned at ``tp_size=1`` is the diagonal, and is refused.
 
-    Operator ruling 2026-09-12: *"src_resolved=N/N auf einem Diagonal-Plan
-    zaehlt nicht"*.  This is the pin.  The tree's product path builds exactly
-    that layout (``weight_exchange_shadow.py:3332-3334``), so without this
-    refusal the slice's own acceptance number could be satisfied by the shape
-    the slice exists to replace.
+    Operator ruling 2026-09-12: ``src_resolved=N/N`` on a diagonal plan does
+    not count.  The tree's product path builds exactly that layout
+    (``weight_exchange_shadow.py:3332-3334``, BOTH groups ``tp_size=1``), so
+    without this refusal the slice's own acceptance number could be satisfied
+    by the very shape the slice exists to replace.
     """
     if int(tp_size) <= 1:
         raise wx.Weg2XchgPlanDisagree(
-            f"W68 Weg2XchgPlanDisagree: group {dst_group!r} would be planned "
-            f"at tp_size={tp_size}, which is the PP form on BOTH sides -- the "
-            f"on-card diagonal, not the cross-group exchange. A plan built "
-            f"that way resolves both pointer sides and still cuts no shard, "
-            f"so its src_resolved=N/N would grade a plan that moves whole "
-            f"tensors between two differently shaped groups."
+            f"W68 Weg2XchgPlanDisagree: group {tp_group!r} would be planned at "
+            f"tp_size={tp_size}, which is the PP form on BOTH sides -- the "
+            f"on-card diagonal, not the cross-group exchange. A plan built that "
+            f"way resolves both pointer sides and still cuts no shard, so its "
+            f"src_resolved=N/N would grade a plan that moves whole tensors "
+            f"between two differently shaped groups."
         )
 
 

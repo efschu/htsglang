@@ -17,12 +17,20 @@ over three cards, group D as TP3 with an uneven 17:7:8 cut, INT8-W8A8 element
 width.  No GPU, no model, no checkpoint: every input is a manifest, which is
 the whole point -- the placement is written down, not reconstructed.
 
-ACCEPTANCE, printed and asserted:
-  * ``src_resolved=N/N`` on the destination side, which read ``0/N`` on all 24
-    legs of boot weg2xsn20;
-  * a REAL SHARD CUT -- more descriptors than tensors, and at least one class
-    cut across all three destination ranks.  ``src_resolved=N/N`` on a diagonal
-    plan does not count (operator ruling 2026-09-12) and is refused by name.
+ACCEPTANCE, printed and asserted, IN BOTH DIRECTIONS:
+  * ``src_resolved=N/N``, which read ``0/N`` on all 24 legs of boot weg2xsn20;
+  * a REAL SHARD CUT -- more descriptors than tensors, every tensor cut across
+    all three TP ranks, with the JOIN's uneven boundaries and not an even
+    split.  ``src_resolved=N/N`` on a diagonal plan does not count (operator
+    ruling 2026-09-12) and is refused by name.
+
+THE ADDRESSES HERE ARE STAND-INS FOR A SEAM, AND THE SEAM'S CONTRACT IS NOT
+THE RING.  ``src_addr``/``dst_addr`` belong to the caller: the source hook
+answers with its OWN device address and deposits into the bounce slot, and the
+destination resolves the source to that slot's offset.  The ring is the
+counter-proof for the digest and never the source of the exchange -- reading
+the source out of it would be the ring restore through another door, and it
+defeats the goal (zero layer bytes resident in host RAM).
 """
 
 from __future__ import annotations
@@ -140,7 +148,7 @@ def main() -> int:
 
     # -- 3. THE JOIN -------------------------------------------------------
     print("\n[3] cross-group join (the knowledge no single rank holds)")
-    join = xm.join_manifests(manifests, src_group="P", dst_group="D")
+    join = xm.join_manifests(manifests, pp_group="P", tp_group="D")
     print("  " + join.line())
     check(join.n_sharded == len(join.tensors) > 0,
           f"every tensor's axis read off the join "
@@ -149,59 +157,72 @@ def main() -> int:
     check(wx.ROWS in axes and wx.COLS in axes,
           "both a ROW cut and a COLUMN cut were recognised")
 
-    # -- 4. THE PROVIDER ---------------------------------------------------
-    print("\n[4] provider: src_resolved and the shard cut")
-    book = {}
+    # -- 4. THE PROVIDER, BOTH DIRECTIONS ----------------------------------
+    print("\n[4] provider: src_resolved and the shard cut, BOTH directions")
+    for direction in (wx.LEGS_PP_TO_TP, wx.LEGS_TP_TO_PP):
+        book = {}
 
-    def src_addr(name, rank):
-        return book.setdefault((name, rank), 0x7000_0000 + 4096 * len(book))
+        def addr(name, rank, _b=book):
+            return _b.setdefault((name, rank), 0x7000_0000 + 4096 * len(_b))
 
-    plan = xm.plan_from_join(join, src_addr=src_addr,
-                             dst_addr=lambda name, rank: 0x1000 + 64 * rank)
-    prof = wx.pointer_profile(plan.raw_descs)
-    print("  " + wx.pointer_profile_line(prof, hook="destination",
-                                         is_source=False, legs=1,
-                                         legs_src_complete=1,
-                                         legs_dst_complete=1))
-    check(prof.src_resolved == prof.descs_total > 0,
-          f"src_resolved={prof.src_resolved}/{prof.descs_total} "
-          f"(weg2xsn20 read 0/N on all 24 legs)")
-    check(prof.dst_resolved == prof.descs_total,
-          f"dst_resolved={prof.dst_resolved}/{prof.descs_total}")
+        plan = xm.plan_from_join(join, direction=direction, src_addr=addr,
+                                 dst_addr=lambda n, r: 0x1000 + 64 * r)
+        prof = wx.pointer_profile(plan.raw_descs)
+        print("  " + join.line(direction=direction))
+        print("  " + wx.pointer_profile_line(
+            prof, hook=("destination" if direction == wx.LEGS_PP_TO_TP
+                        else "source"),
+            is_source=False, legs=1, legs_src_complete=1, legs_dst_complete=1))
+        check(prof.src_resolved == prof.descs_total > 0,
+              f"{direction}: src_resolved={prof.src_resolved}/"
+              f"{prof.descs_total} (weg2xsn20 read 0/N on all 24 legs)")
+        check(prof.dst_resolved == prof.descs_total,
+              f"{direction}: dst_resolved={prof.dst_resolved}/{prof.descs_total}")
 
-    per_name = {}
-    for d in plan.raw_descs:
-        per_name.setdefault(d.param_name, set()).add(d.dst_rank)
-    cut = [n for n, ranks in per_name.items() if len(ranks) == len(CARDS)]
-    print(f"  descriptors={len(plan.raw_descs)} tensors={len(join.tensors)} "
-          f"cut_across_all_{len(CARDS)}_ranks={len(cut)}/{len(join.tensors)}")
-    check(len(plan.raw_descs) > len(join.tensors),
-          "n_descriptors > n_tensors -- the plan CUTS, it does not move wholes")
-    check(len(cut) == len(join.tensors),
-          "every tensor is cut across all three destination ranks")
+        tp_side = "dst_rank" if direction == wx.LEGS_PP_TO_TP else "src_rank"
+        pp_side = "src_rank" if direction == wx.LEGS_PP_TO_TP else "dst_rank"
+        per_name, wrong = {}, []
+        for d in plan.raw_descs:
+            if d.kind == wx.ZEROFILL:
+                continue
+            per_name.setdefault(d.param_name, set()).add(getattr(d, tp_side))
+            if getattr(d, pp_side) != stage_of_layer(
+                    int(d.param_name.split(".")[2])):
+                wrong.append(d.param_name)
+        cut = [n for n, r in per_name.items() if len(r) == len(CARDS)]
+        print(f"  descriptors={len(plan.raw_descs)} tensors={len(join.tensors)} "
+              f"cut_across_all_{len(CARDS)}_ranks={len(cut)}/{len(join.tensors)}")
+        check(len(plan.raw_descs) > len(join.tensors),
+              f"{direction}: n_descriptors > n_tensors -- the plan CUTS")
+        check(len(cut) == len(join.tensors),
+              f"{direction}: every tensor cut across all three TP ranks")
+        check(not wrong,
+              f"{direction}: every descriptor's PP side is its layer's stage")
+        check(xb._missing_pointer(plan.descs) is None,
+              f"{direction}: _missing_pointer finds no hole (W74's own site)")
 
-    wrong_src = [d.param_name for d in plan.raw_descs
-                 if d.kind != wx.ZEROFILL
-                 and d.src_rank != stage_of_layer(int(d.param_name.split(".")[2]))]
-    check(not wrong_src,
-          f"every descriptor's source is its layer's P stage "
-          f"({len(plan.raw_descs) - len(wrong_src)}/{len(plan.raw_descs)})")
-
-    check(xb._missing_pointer(plan.descs) is None,
-          "weight_exchange_bounce._missing_pointer finds no hole (W74's site)")
+    # THE CUT IS THE JOIN'S, NOT AN EVEN SPLIT -- the danger direction is a
+    # wrong slice with the right byte total.
+    name = f"model.layers.0.{CLASSES[0][0]}"
+    widths = join.by_name[name].tp_widths
+    print(f"  uneven check: {name} tp_widths={list(widths)} "
+          f"even_split_would_be={[CLASSES[0][1] // len(CARDS)] * len(CARDS)}")
+    check(len(set(widths)) > 1 and sum(widths) == CLASSES[0][1],
+          "the TP widths are UNEVEN and sum to the unsharded extent")
 
     # -- 5. THE DIAGONAL PIN ----------------------------------------------
     print("\n[5] the diagonal pin (N/N on a diagonal plan does not count)")
     try:
-        xm.refuse_diagonal_layout(1, dst_group="D")
+        xm.refuse_diagonal_layout(1, tp_group="D")
         check(False, "a tp_size=1 destination must be refused")
     except wx.Weg2XchgPlanDisagree as exc:
         print(f"  refused: {str(exc)[:110]}...")
         check("W68" in str(exc), "refused by name (W68)")
 
+    TOTAL = 22
     print(f"\nWEG2-XCHG-MANIFEST-SMOKE verdict="
           f"{'PASS' if not failures else 'FAIL'} "
-          f"checks={13 - len(failures)}/13")
+          f"checks={TOTAL - len(failures)}/{TOTAL}")
     for f in failures:
         print(f"  FAILED: {f}")
     return 1 if failures else 0

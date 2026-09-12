@@ -107,7 +107,7 @@ def _manifests(*, sharded=True, d_ranks=D_RANKS):
 
 
 def _join(**kw):
-    return xm.join_manifests(_manifests(**kw), src_group="P", dst_group="D")
+    return xm.join_manifests(_manifests(**kw), pp_group="P", tp_group="D")
 
 
 # ---------------------------------------------------------------------------
@@ -349,11 +349,11 @@ def test_the_join_reads_the_shard_axis_off_the_two_groups_records():
     q = by["model.layers.0.self_attn.qkv_proj.weight"]
     assert q.shard_axis == wx.ROWS
     assert q.rows_full == 1536 and q.cols_full == 512
-    assert q.dst_widths == _split(1536, D_RANKS)
+    assert q.tp_widths == _split(1536, D_RANKS)
     d = by["model.layers.0.mlp.down_proj.weight"]
     assert d.shard_axis == wx.COLS
     assert d.rows_full == 2048 and d.cols_full == 1024
-    assert d.dst_widths == _split(1024, D_RANKS)
+    assert d.tp_widths == _split(1024, D_RANKS)
     # A replica is a replica and is NOT called a cut.
     assert _join(sharded=False).by_name[q.param_name].shard_axis == wx.REPLICATED
 
@@ -364,9 +364,9 @@ def test_the_unsharded_extent_is_the_joins_answer_no_rank_holds_it():
     join = _join()
     for t in join.tensors:
         if t.shard_axis == wx.ROWS:
-            assert sum(t.dst_widths) == t.rows_full
+            assert sum(t.tp_widths) == t.rows_full
         elif t.shard_axis == wx.COLS:
-            assert sum(t.dst_widths) == t.cols_full
+            assert sum(t.tp_widths) == t.cols_full
 
 
 def test_the_source_of_every_tensor_is_the_p_stage_of_its_layer():
@@ -375,8 +375,8 @@ def test_the_source_of_every_tensor_is_the_p_stage_of_its_layer():
     join = _join()
     for t in join.tensors:
         layer = int(t.param_name.split(".")[2])
-        assert t.stage == _stage_of_layer(layer), t.param_name
-        assert t.src_card == CARDS[t.stage]
+        assert t.pp_stage == _stage_of_layer(layer), t.param_name
+        assert t.pp_card == CARDS[t.pp_stage]
 
 
 def test_a_tensor_with_no_counterpart_refuses_by_name():
@@ -390,7 +390,7 @@ def test_a_tensor_with_no_counterpart_refuses_by_name():
         for m in mans
     ]
     with pytest.raises(wx.Weg2XchgSourceMissing) as exc:
-        xm.join_manifests(mans, src_group="P", dst_group="D")
+        xm.join_manifests(mans, pp_group="P", tp_group="D")
     assert "W74" in str(exc.value) and victim in str(exc.value)
 
 
@@ -410,21 +410,22 @@ def test_a_shape_contradiction_refuses_and_never_degrades_to_replicated():
                                 boot_token=m.boot_token, pieces=pieces)
         out.append(m)
     with pytest.raises(wx.Weg2XchgPlanDisagree) as exc:
-        xm.join_manifests(out, src_group="P", dst_group="D")
+        xm.join_manifests(out, pp_group="P", tp_group="D")
     assert "W68" in str(exc.value) and victim in str(exc.value)
 
 
 def test_a_missing_group_refuses_rather_than_planning_over_who_published():
     with pytest.raises(wx.Weg2XchgSourceMissing) as exc:
         xm.join_manifests([m for m in _manifests() if m.group == "D"],
-                          src_group="P", dst_group="D")
+                          pp_group="P", tp_group="D")
     assert "W74" in str(exc.value)
 
 
 def test_the_join_line_carries_every_denominator():
-    line = _join().line()
-    assert "src=P dst=D" in line
-    assert f"src_ranks={len(P_CUT)} dst_ranks={D_RANKS}" in line
+    line = _join().line(direction=wx.LEGS_PP_TO_TP)
+    assert "pp=P tp=D" in line
+    assert f"direction={wx.LEGS_PP_TO_TP}" in line
+    assert f"pp_ranks={len(P_CUT)} tp_ranks={D_RANKS}" in line
     assert f"sharded={2 * N_LAYERS}/{2 * N_LAYERS}" in line
     assert "unsourced=0" in line
 
@@ -441,9 +442,9 @@ def test_a_diagonal_destination_layout_is_refused_by_name():
     without this refusal the slice's own acceptance number could be satisfied
     by the shape the slice exists to replace."""
     with pytest.raises(wx.Weg2XchgPlanDisagree) as exc:
-        xm.refuse_diagonal_layout(1, dst_group="D")
+        xm.refuse_diagonal_layout(1, tp_group="D")
     assert "W68" in str(exc.value) and "diagonal" in str(exc.value)
-    xm.refuse_diagonal_layout(3, dst_group="D")      # a real TP group passes
+    xm.refuse_diagonal_layout(3, tp_group="D")      # a real TP group passes
 
 
 def test_the_pointer_only_path_still_resolves_no_source():
@@ -569,3 +570,124 @@ def test_the_launcher_publishes_a_manifest_directory_the_ranks_can_actually_read
     assert launcher.prepare_xchg_env(
         lambda *a, **k: None, "epoch1", "ring", dry=True) == {}, (
         "the ring arm must publish nothing at all")
+
+
+# ---------------------------------------------------------------------------
+# (5) BOTH DIRECTIONS, OUT OF THE ONE JOIN (user correction 2026-09-12:
+#     "PP->TP und TP->PP gleichwertig und gleichzeitig")
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("direction", [wx.LEGS_PP_TO_TP, wx.LEGS_TP_TO_PP])
+def test_both_directions_resolve_both_sides_and_cut_the_same_shards(direction):
+    """ONE join, two directions, equal citizens.
+
+    The mirror direction is where a role-oriented join fails silently, and the
+    failure has a name: ``_blocks_of`` honours a per-tensor width vector ONLY
+    on the destination (``weight_exchange.py:1575``); a SOURCE at ``tp_size>1``
+    goes through ``layout.ratios_for(geom.family)`` (``:1594``).  Under
+    ``tp_to_pp`` the TP group IS the source, so a plan that only filled
+    ``dst_widths`` would fall back to an EVEN split on exactly the side that is
+    unevenly cut -- on both ends equally, with nothing downstream able to see
+    it (the #1275 class).  Keying ``family_ratios`` by the parameter name is
+    what closes it; MUTANT: drop ``family=`` from ``JoinedTensor.geom`` and the
+    tp_to_pp arm of this test dies on the shard boundary.
+    """
+    join = _join()
+    book = {}
+
+    def addr(name, rank):
+        return book.setdefault((name, rank, "s"), 0x7000_0000 + 4096 * len(book))
+
+    plan = xm.plan_from_join(join, direction=direction, src_addr=addr,
+                             dst_addr=lambda n, r: 0x1000 + 64 * r)
+    prof = wx.pointer_profile(plan.raw_descs)
+    assert prof.src_resolved == prof.descs_total > 0, (
+        f"{direction}: src_resolved={prof.src_resolved}/{prof.descs_total}")
+    assert prof.dst_resolved == prof.descs_total
+    assert len(plan.raw_descs) > len(join.tensors), (
+        f"{direction}: no more descriptors than tensors -- whole tensors moved")
+
+    tp_side = "dst_rank" if direction == wx.LEGS_PP_TO_TP else "src_rank"
+    pp_side = "src_rank" if direction == wx.LEGS_PP_TO_TP else "dst_rank"
+    per_name = {}
+    for d in plan.raw_descs:
+        if d.kind == wx.ZEROFILL:
+            continue
+        per_name.setdefault(d.param_name, set()).add(getattr(d, tp_side))
+        # The PP side is always the ONE stage that holds the layer.
+        assert getattr(d, pp_side) == _stage_of_layer(
+            int(d.param_name.split(".")[2])), (direction, d.param_name)
+    assert per_name, direction
+    for name, ranks in per_name.items():
+        assert ranks == {0, 1, 2}, (direction, name, ranks)
+
+
+def test_the_uneven_cut_survives_the_mirror_direction_exactly():
+    """The boundaries must be IDENTICAL in both directions, not merely present.
+
+    An even split would also produce three ranks and the right byte total --
+    which is the danger direction the briefing names: a wrong slice with the
+    right byte numbers.  This compares the actual unit ranges.
+    """
+    join = _join()
+    ranges = {}
+    for direction in (wx.LEGS_PP_TO_TP, wx.LEGS_TP_TO_PP):
+        plan = xm.plan_from_join(join, direction=direction,
+                                 src_addr=lambda n, r: 0x7000_0000,
+                                 dst_addr=lambda n, r: 0x1000)
+        tp_side = "dst_rank" if direction == wx.LEGS_PP_TO_TP else "src_rank"
+        seen = {}
+        for d in plan.raw_descs:
+            if d.kind == wx.ZEROFILL:
+                continue
+            seen.setdefault(d.param_name, {})[getattr(d, tp_side)] = int(
+                d.rows if d.spitch else d.nbytes)
+        ranges[direction] = seen
+    assert ranges[wx.LEGS_PP_TO_TP].keys() == ranges[wx.LEGS_TP_TO_PP].keys()
+
+    # And the widths are the JOIN's, not an even split.
+    name = "model.layers.0.self_attn.qkv_proj.weight"
+    widths = join.by_name[name].tp_widths
+    assert widths == _split(1536, D_RANKS)
+    assert len(set(widths)) > 1, "the fixture must be UNEVEN or this proves nothing"
+    assert widths != (1536 // 3,) * 3
+
+
+def test_an_unknown_direction_refuses_rather_than_defaulting():
+    join = _join()
+    with pytest.raises(wx.Weg2XchgPlanDisagree) as exc:
+        xm.plan_from_join(join, direction="pp2tp",
+                          src_addr=lambda n, r: 1, dst_addr=lambda n, r: 2)
+    assert "W68" in str(exc.value)
+
+
+def test_the_join_is_group_oriented_and_names_no_role():
+    """A role-keyed join is two derivations waiting to happen."""
+    import dataclasses
+
+    fields = {f.name for f in dataclasses.fields(xm.JoinedTensor)}
+    assert "pp_stage" in fields and "tp_widths" in fields
+    assert not {"src_rank", "dst_rank", "src_widths", "dst_widths"} & fields, (
+        "the join must not name a role: the direction chooses roles, the join "
+        "only holds extents")
+
+
+def test_the_module_never_reads_the_source_bytes_out_of_the_ring():
+    """THE RING IS THE COUNTER-PROOF, NEVER THE SOURCE (operator, 2026-09-12).
+
+    Resolving the source side out of the ring would be the ring restore
+    through another door, and it defeats the exchange's whole goal: zero layer
+    bytes resident in host RAM. This module must therefore know nothing about
+    the ring or any carrier -- the address books are the caller's.
+    """
+    import inspect
+
+    src = inspect.getsource(xm.plan_from_join)
+    assert "src_addr" in src and "dst_addr" in src
+    module = inspect.getsource(xm)
+    for forbidden in ("tms_backup", "tms-backup", "host_ring", "TMS_HOST_RING",
+                      "carrier_census", "ring_table"):
+        assert forbidden not in module, (
+            f"{forbidden!r} in xchg_manifest: the ring is the counter-proof, "
+            f"never the source of the exchange")
