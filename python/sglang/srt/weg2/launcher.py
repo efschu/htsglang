@@ -10115,7 +10115,23 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # re-derived from it and any difference is a refusal -- the alternative is a
     # ring gated on a form that is not the one launched, which is a subtler
     # version of the very defect this gate exists to catch.
-    shipped_key, shipped_norm = ring_table.p_form_key(shipped_argv_p)
+    # #1325c: THE SAME TRANSFORM ON BOTH SIDES OF THE COMPARISON.  `form_key`
+    # above was hashed over `xchg_form_argv(...)`, which APPENDS the SYNTHETIC
+    # `ring_table.XCHG_FORM_TOKEN` when the arm is armed (B4e).  That token is
+    # a marker, never a flag `argv_p` emits, so a shipped argv can never carry
+    # it and it is not in FORM_KEY_EXCLUDED_FLAGS either: comparing the raw
+    # shipped key against the gated key refuses EVERY armed boot by
+    # construction, and equals for every unarmed one -- which is why it was
+    # invisible until the #1325b netting correction let an armed boot past the
+    # host ledger for the first time (weg2xsn21, 2026-09-12: W21 at the ledger
+    # on the head, W48 here the moment the ledger funded).  A check that
+    # compares a TRANSFORMED value against an UNTRANSFORMED one tests the
+    # transform, not its subject.  TRAIN FIX 5's subject -- "are the sentinel
+    # ledger terms inert?" -- is untouched: the token is appended identically
+    # to both sides and cancels, and a REAL form drift still refuses.
+    shipped_key, shipped_norm = ring_table.p_form_key(
+        xchg_form_argv(shipped_argv_p, ns.weg2_weight_source)
+    )
     if shipped_key != form_key:
         mine, theirs = set(shipped_norm.split(" ")), set(form_norm.split(" "))
         raise ring_table.Weg2RingFormMismatch(
