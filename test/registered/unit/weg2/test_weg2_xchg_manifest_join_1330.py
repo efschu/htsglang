@@ -538,3 +538,34 @@ def test_materialisation_drift_refuses_by_name():
         with pytest.raises(wx.Weg2XchgPlanDisagree) as exc:
             xm.refuse_on_materialisation_drift(p, live)
         assert "W68" in str(exc.value) and p.param_name in str(exc.value)
+
+
+def test_the_launcher_publishes_a_manifest_directory_the_ranks_can_actually_read():
+    """THE WRITER'S OWN 'BUILT BUT NEVER EXECUTED' TRAP, pinned.
+
+    The manifest was first keyed on ``SGLANG_PHASE_FOOTPRINT_DUMP``.  That
+    variable reaches a weg2 rank ONLY under ``--xchg-coverage-diff``
+    (``launcher.coverage_dump_dir`` returns ``""`` otherwise, deliberately, so
+    the instrument's OFF state is byte-identical), so the writer would have
+    found an empty directory on every ordinary boot, returned ``None``, and
+    left no file and no line.  Desk-green, metal-silent.
+
+    This asserts the publisher: the directory rides the xchg env, which is
+    published whenever the arm is armed, and is POPPED on the ring arm.
+    """
+    import inspect
+
+    from sglang.srt.weg2 import launcher
+
+    pub = inspect.getsource(launcher.prepare_xchg_env)
+    assert "xchg_manifest.DIR_ENV" in pub
+    assert "manifest_dir" in inspect.signature(
+        launcher.prepare_xchg_env).parameters
+    assert "xchg_manifest.DIR_ENV" in inspect.getsource(launcher.build_env)
+
+    env = launcher.prepare_xchg_env(lambda *a, **k: None, "epoch1", "shadow",
+                                    dry=True, manifest_dir="/tmp/evi")
+    assert env.get(xm.DIR_ENV) == "/tmp/evi"
+    assert launcher.prepare_xchg_env(
+        lambda *a, **k: None, "epoch1", "ring", dry=True) == {}, (
+        "the ring arm must publish nothing at all")
