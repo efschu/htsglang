@@ -818,7 +818,15 @@ class VramCredit:
     resets it and stamps a new epoch, which is the ONLY non-monotone step and is
     taken by the publisher before it releases anything.
 
-    Second bookkeeping?  No: these bytes are not recorded anywhere else.  The
+    TWO HALVES SINCE #1349, AND THE SECOND ONE IS WHY xsn21b DIED.  ``publish``
+    is the credit half; :meth:`claim` is the DEBIT half, and until #1349 it did
+    not exist -- nothing ever subtracted what a tag had already spent, so the
+    same released bytes funded every tag of the leg in turn.  The available
+    balance is therefore ``credit_bytes - consumed_bytes``, never
+    ``credit_bytes``; see :meth:`claim` for the boot that measured it.
+
+    Second bookkeeping?  No: these bytes are not recorded anywhere else, and the
+    debit lives in THIS counter rather than beside it for the same reason.  The
     NVML free figure is the card's, not the peer's intent, and it cannot say
     "the peer has finished and will free no more" -- which is the whole
     terminating predicate.
@@ -883,9 +891,14 @@ class VramCredit:
                 {
                     "epoch": str(epoch),
                     "credit_bytes": 0,
+                    # #1349: the debit half is reset by the SAME step that
+                    # resets the credit half, so a leg can never open with a
+                    # previous leg's spending against this leg's releases.
+                    "consumed_bytes": 0,
                     "leg_complete": False,
                     "publisher_pid": int(pid if pid is not None else os.getpid()),
                     "tags": [],
+                    "claims": [],
                 },
             )
 
@@ -913,6 +926,82 @@ class VramCredit:
     def read(self) -> Dict[str, Any]:
         with self._locked(False) as handle:
             return self._load(handle)
+
+    def claim(
+        self,
+        tag: str,
+        want_bytes: int,
+        *,
+        epoch: Optional[Any] = None,
+        require_full: bool = False,
+        gate=None,
+    ) -> Dict[str, Any]:
+        """W takes bytes OFF this leg's credit -- the debit half of `publish`.
+
+        #1349, MEASURED ON BOOT weg2xsn21b (D rank 0, the 5090
+        GPU-31d7ef41-f574-4d0e-21ad-e773fd938f6d, 2026-09-12 16:06:26Z):
+
+            credit=2560 MiB requested=1906 MiB free_mib=3276   tag=weights_6 GRANTED
+            credit=2560 MiB requested=1906 MiB free_mib=1370   tag=weights_7 W85
+
+        The counter read the SAME 2560 MiB one tag later, because nothing
+        subtracted what ``weights_6`` had just spent.  The card's arithmetic is
+        exact and leaves no unnamed remainder: 3276 - 1906 = 1370, and the whole
+        2560 was ONE peer release (P rank 0's ``weights_4``, P log 16:06:27Z).
+        The 1190 MiB "gap" between credit and free was never held by anything --
+        it is 1906 already-spent minus 716 MiB of card-free that was never
+        credit.  With the debit, ``weights_7`` would have seen 654 MiB available,
+        stayed in the wait, and been funded by the peer's NEXT release (2988 MiB,
+        about a second later) instead of being refused by name.
+
+        WHY THE GATE RUNS INSIDE THE LOCK.  ``gate(available)`` is called between
+        the decision and the write: if it raises, nothing is debited, so a
+        refusal never consumes the bytes it refused, and no second claimant can
+        slip between the grant and the debit.  It is a metadata read (#1250's
+        NVML free column) and the publisher's :meth:`publish` is blocked only for
+        its duration -- that is the price of granting and debiting in ONE step
+        instead of two.
+
+        The write happens ONLY when something is actually taken, so a stale-epoch
+        or empty counter is read and left alone rather than rewritten -- a
+        consumer must not be able to CREATE a counter for a leg nobody opened.
+        """
+        want = max(0, int(want_bytes))
+        with self._locked(True) as handle:
+            state = self._load(handle)
+            stale_epoch = None
+            if epoch is not None and state and str(state.get("epoch")) != str(epoch):
+                # Same rule, same reason as :meth:`wait_for`: another leg's
+                # state is NO credit, and therefore nothing to spend either.
+                stale_epoch = state.get("epoch")
+                state = {}
+            credit = int(state.get("credit_bytes", 0))
+            consumed = int(state.get("consumed_bytes", 0))
+            available = max(0, credit - consumed)
+            covered = available >= want
+            claimed = 0 if (require_full and not covered) else min(available, want)
+            gate_value = None
+            if gate is not None and (covered or not require_full):
+                gate_value = gate(available)  # may raise; nothing is written
+            if claimed > 0:
+                state["credit_bytes"] = credit
+                state["consumed_bytes"] = consumed + claimed
+                claims = list(state.get("claims", []))
+                claims.append(str(tag))
+                state["claims"] = claims
+                self._store(handle, state)
+            return {
+                "tag": str(tag),
+                "credit_bytes": credit,
+                "consumed_bytes": consumed + claimed,
+                "available_before_bytes": available,
+                "available_bytes": available - claimed,
+                "claimed_bytes": claimed,
+                "covered": covered,
+                "leg_complete": bool(state.get("leg_complete")),
+                "stale_epoch": stale_epoch,
+                "gate": gate_value,
+            }
 
     def wait_for(
         self,
@@ -962,10 +1051,27 @@ class VramCredit:
         need = max(0, int(need_bytes))
         if need == 0:
             return {"waited_s": 0.0, "reason": "this tag needs no device bytes"}
+        floor = max(0, int(floor_bytes or 0))
         if free_bytes_now is not None and int(free_bytes_now) >= need:
+            # #1349: THE EARLY EXIT SPENDS CREDIT TOO, and not debiting it was
+            # the second route to the same wall.  "The card already holds the
+            # bytes" does not say WHOSE bytes they are: on a co-located pair the
+            # free this exit is taken against is largely the peer's just-released
+            # pages, i.e. exactly the bytes the counter is publishing.  Leaving
+            # them undebited let a later tag be licensed by a balance earlier
+            # tags had already eaten, which is the xsn21b grant one step removed.
+            # PARTIAL, never `need`: this exit claims the CARD holds the bytes,
+            # not that the peer funded them, so it takes only what the counter
+            # actually has.  `epoch` keeps a stale or absent counter at zero, so
+            # a single-group boot writes nothing and still costs nothing.
+            spent = self.claim(tag, need, epoch=epoch)
             return {
                 "waited_s": 0.0,
                 "free_bytes": int(free_bytes_now),
+                "credit_bytes": spent["credit_bytes"],
+                "consumed_bytes": spent["consumed_bytes"],
+                "available_bytes": spent["available_bytes"],
+                "claimed_bytes": spent["claimed_bytes"],
                 "reason": (
                     "the card already holds the bytes, so no peer release funds "
                     "this tag and none is waited for"
@@ -975,18 +1081,9 @@ class VramCredit:
         t0 = time.perf_counter()
         stale_epoch = None
         while True:
-            state = self.read()
-            if epoch is not None and state and str(state.get("epoch")) != str(epoch):
-                # Not this flip's counter -- and "this flip" means THIS BOOT's
-                # flip: the comparison is on the composed token of
-                # :func:`credit_epoch`, so a previous boot's leftover file is
-                # waited past for the same reason and by the same line as a
-                # previous flip's.  Neither its bytes nor its leg_complete flag
-                # say anything about the leg now in flight.
-                stale_epoch = state.get("epoch")
-                state = {}
-            credit = int(state.get("credit_bytes", 0))
-            if credit >= need:
+            device: Dict[str, Any] = {}
+
+            def _grant_gate(available: int, _dev=device) -> None:
                 # #1331: THE PEER'S ACCOUNTING IS NOT THE CARD'S ANSWER, and
                 # granting on it alone is what killed boot weg2xsn7.
                 #
@@ -1003,31 +1100,23 @@ class VramCredit:
                 # no second look at the device. So the counter said 2560 MiB
                 # were released and the card could not allocate 1906.
                 #
-                # ONE READER, NEVER A SECOND NVML LOOP: `free_reader` is
-                # injected by the caller and is the #1250 v2 free reader
-                # (`registry.nvml.memory_info_for_uuid` /
-                # `memory_snapshot()`); this module opens no NVML handle of its
-                # own. `None` (unreadable, or no reader passed) keeps the
-                # pre-#1331 behaviour exactly -- a blind reading may not
-                # manufacture a refusal any more than it may license a grant.
+                # ONE READER, NEVER A SECOND NVML LOOP -- see :meth:`_free_now`.
                 #
                 # THE PEER TERM SURVIVES as the first condition; it is simply
-                # no longer the only one.
-                free_now = None
-                if free_reader is not None:
-                    try:
-                        got = free_reader()
-                        free_now = None if got is None else int(got)
-                    except Exception:  # noqa: BLE001 -- a probe may not raise
-                        free_now = None
-                floor = max(0, int(floor_bytes or 0))
+                # no longer the only one. #1349 sharpened WHICH peer number that
+                # is: the UNSPENT balance, not the gross published total. This
+                # gate runs INSIDE :meth:`claim`'s lock, between the decision and
+                # the debit, so a tag this gate refuses consumes nothing.
+                free_now = self._free_now(free_reader)
                 allocatable_est = (
                     None if free_now is None else max(0, free_now - floor)
                 )
+                _dev["free_bytes"] = free_now
+                _dev["allocatable_est_bytes"] = allocatable_est
                 if allocatable_est is not None and allocatable_est < need:
                     raise Weg2VramCreditAllocatableShort(
                         f"W85 Weg2VramCreditAllocatableShort card={self.uuid} "
-                        f"tag={tag} credit={credit // MIB} MiB "
+                        f"tag={tag} credit={available // MIB} MiB "
                         f"requested={need // MIB} MiB "
                         f"free_mib={free_now // MIB} "
                         f"allocatable_est={allocatable_est // MIB} MiB "
@@ -1038,22 +1127,79 @@ class VramCredit:
                         f"tensor of this tag unmapped (boot weg2xsn7: that "
                         f"OOM left the barlink control word unmapped and the "
                         f"process died in the driver). Refused by name rather "
-                        f"than granted silently."
+                        f"than granted silently. #1349: `credit` here is the "
+                        f"UNSPENT balance of this leg (published minus claimed), "
+                        f"so this refusal can no longer be a tag re-licensed by "
+                        f"bytes an earlier tag of the same leg already took."
                     )
+
+            rec = self.claim(
+                tag, need, epoch=epoch, require_full=True, gate=_grant_gate
+            )
+            if rec["stale_epoch"] is not None:
+                # Not this flip's counter -- and "this flip" means THIS BOOT's
+                # flip: the comparison is on the composed token of
+                # :func:`credit_epoch`, so a previous boot's leftover file is
+                # waited past for the same reason and by the same line as a
+                # previous flip's.  Neither its bytes nor its leg_complete flag
+                # say anything about the leg now in flight.
+                stale_epoch = rec["stale_epoch"]
+            credit = int(rec["credit_bytes"])
+            available = int(rec["available_before_bytes"])
+            consumed = int(rec["consumed_bytes"])
+            if rec["claimed_bytes"] >= need:
                 return {
                     "waited_s": time.perf_counter() - t0,
-                    "credit_bytes": credit,
-                    "free_bytes": free_now,
-                    "allocatable_est_bytes": allocatable_est,
+                    # #1349: the UNSPENT balance, which is what the grant was
+                    # actually decided on -- the gross `credit_bytes` is beside
+                    # it so a log line can show both halves of the book.
+                    "credit_bytes": available,
+                    "credit_published_bytes": credit,
+                    "consumed_bytes": consumed,
+                    "available_bytes": int(rec["available_bytes"]),
+                    "claimed_bytes": int(rec["claimed_bytes"]),
+                    "free_bytes": device.get("free_bytes"),
+                    "allocatable_est_bytes": device.get("allocatable_est_bytes"),
                     "corridor_floor_bytes": floor,
                     "reason": "the peer's releases funded this tag",
                 }
-            if bool(state.get("leg_complete")):
+            if rec["leg_complete"]:
+                # #1349: ASK THE CARD ONCE MORE BEFORE REFUSING.  The debit makes
+                # the balance shrink within a leg, so "the peer will release no
+                # more" must not be read as "these bytes are not there" -- the
+                # early exit at the top of this method licenses a resume on the
+                # card's own free, and a leg that ends while the card HAS the
+                # bytes must reach the same answer late as it would have reached
+                # early.  Without this the debit would have bought the W85 fix
+                # with a new false W35, i.e. the same refusal MOVED rather than
+                # removed, which is the danger direction this slice was named on.
+                free_now = self._free_now(free_reader)
+                if free_now is not None and free_now - floor >= need:
+                    spent = self.claim(tag, need, epoch=epoch)
+                    return {
+                        "waited_s": time.perf_counter() - t0,
+                        "credit_bytes": available,
+                        "credit_published_bytes": credit,
+                        "consumed_bytes": int(spent["consumed_bytes"]),
+                        "available_bytes": int(spent["available_bytes"]),
+                        "claimed_bytes": int(spent["claimed_bytes"]),
+                        "free_bytes": free_now,
+                        "allocatable_est_bytes": max(0, free_now - floor),
+                        "corridor_floor_bytes": floor,
+                        "reason": (
+                            "the peer's leg is complete and unspent credit is "
+                            "short, but the card itself holds the bytes now"
+                        ),
+                    }
                 raise Weg2VramCreditRefused(
                     f"W35 Weg2VramCreditRefused (spec section 6 lists it as W30) "
-                    f"card={self.uuid} tag={tag} credit={credit // MIB} MiB "
+                    f"card={self.uuid} tag={tag} credit={available // MIB} MiB "
+                    f"published={credit // MIB} MiB "
+                    f"consumed={consumed // MIB} MiB "
                     f"requested={need // MIB} MiB peer_leg_complete=True "
-                    f"free_bytes_now={free_bytes_now} -- the sleeping rank has "
+                    f"free_bytes_now={free_bytes_now} free_mib_at_refusal="
+                    f"{'n/a' if free_now is None else free_now // MIB} -- the "
+                    f"sleeping rank has "
                     f"finished its whole leg and will release nothing further, so "
                     f"these bytes are never coming; refusing by name rather than "
                     f"waiting out the budget or walking into a CUDA OOM"
@@ -1061,7 +1207,9 @@ class VramCredit:
             if time.monotonic() >= deadline:
                 raise Weg2VramCreditRefused(
                     f"W35 Weg2VramCreditRefused (spec section 6 lists it as W30) "
-                    f"card={self.uuid} tag={tag} credit={credit // MIB} MiB "
+                    f"card={self.uuid} tag={tag} credit={available // MIB} MiB "
+                    f"published={credit // MIB} MiB "
+                    f"consumed={consumed // MIB} MiB "
                     f"requested={need // MIB} MiB peer_leg_complete=False "
                     f"budget={budget_s:.0f}s EXPIRED -- the peer neither funded "
                     f"this tag nor completed its leg within the caller's own "
@@ -1074,6 +1222,25 @@ class VramCredit:
                     )
                 )
             time.sleep(poll_s)
+
+    @staticmethod
+    def _free_now(free_reader) -> Optional[int]:
+        """The card's free bytes through the CALLER's reader, or ``None``.
+
+        ONE READER, NEVER A SECOND NVML LOOP (#1331): ``free_reader`` is injected
+        by the caller and is the #1250 v2 free reader
+        (``registry.nvml.memory_info_for_uuid`` / ``memory_snapshot()``); this
+        module opens no NVML handle of its own.  ``None`` -- unreadable, or no
+        reader passed -- keeps the pre-#1331 behaviour exactly: a blind reading
+        may not manufacture a refusal any more than it may license a grant.
+        """
+        if free_reader is None:
+            return None
+        try:
+            got = free_reader()
+        except Exception:  # noqa: BLE001 -- a probe may not raise
+            return None
+        return None if got is None else int(got)
 
 
 def vram_credit(card: Optional[str] = None, *, credit_dir: Optional[str] = None) -> VramCredit:

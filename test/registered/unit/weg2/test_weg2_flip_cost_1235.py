@@ -595,6 +595,177 @@ class VramCreditTest(unittest.TestCase):
             "three mechanisms, three prefixes: a path in a log is never guessed at",
         )
 
+    # -- #1349: the DEBIT half of the counter ------------------------------
+    #
+    # RED WITHOUT THE FIX, every case below: delete the `consumed_bytes` term
+    # from `claim` (or stop calling `claim` from `wait_for`) and the counter
+    # funds every tag of the leg with the same bytes again, which is the
+    # weg2xsn21b wall.
+
+    def _no_free(self):
+        return None
+
+    def test_a_granted_tag_SPENDS_the_credit_it_was_granted(self):
+        # THE DEFECT, in the boot's own numbers (weg2xsn21b, D rank 0, the 5090,
+        # 2026-09-12 16:06:26Z): weights_6 was granted on credit=2560 MiB for a
+        # 1906 MiB request, and weights_7 read the SAME credit=2560 one tag
+        # later while the card had only 1370 MiB left (3276 - 1906, exact, no
+        # remainder). Nothing had subtracted the grant.
+        self.credit.begin_leg(1)
+        self.credit.publish("weights_4", 2560 * MIB)
+        rec = self.credit.wait_for(1906 * MIB, budget_s=1.0, tag="weights_6",
+                                   free_bytes_now=0, epoch=1)
+        self.assertEqual(rec["claimed_bytes"], 1906 * MIB)
+        self.assertEqual(rec["credit_bytes"], 2560 * MIB,
+                         "the grant is decided on the balance BEFORE this debit")
+        self.assertEqual(rec["available_bytes"], (2560 - 1906) * MIB,
+                         "654 MiB is what is left for the next tag, not 2560")
+        self.assertEqual(self.credit.read()["consumed_bytes"], 1906 * MIB)
+
+    def test_the_second_tag_of_a_leg_cannot_be_funded_by_the_first_tags_bytes(self):
+        # The wall itself: with 2560 MiB published, ONE 1906 MiB tag is funded
+        # and the second is NOT -- it must go on waiting for the peer (whose
+        # next release landed about a second later on the real boot), never be
+        # granted and then refused at the device.
+        self.credit.begin_leg(1)
+        self.credit.publish("weights_4", 2560 * MIB)
+        self.credit.wait_for(1906 * MIB, budget_s=1.0, tag="weights_6",
+                             free_bytes_now=0, epoch=1)
+        with self.assertRaises(ms.Weg2VramCreditRefused) as cm:
+            self.credit.wait_for(1906 * MIB, budget_s=0.05, tag="weights_7",
+                                 free_bytes_now=0, epoch=1)
+        msg = str(cm.exception)
+        self.assertIn("EXPIRED", msg,
+                      "the unfunded tag must WAIT OUT its budget, which is the "
+                      "window the peer's next release lands in -- not be "
+                      "granted on spent bytes and then refused by the card")
+        self.assertIn("credit=654 MiB", msg)
+        self.assertIn("published=2560 MiB", msg)
+        self.assertIn("consumed=1906 MiB", msg)
+
+    def test_a_peer_release_arriving_mid_wait_funds_the_debited_tag(self):
+        # The other half of the same claim: the debit must not strand a tag the
+        # peer does fund. This is the xsn21b sequence with the fix -- weights_7
+        # waits, P's next release lands, the tag is granted.
+        self.credit.begin_leg(1)
+        self.credit.publish("weights_4", 2560 * MIB)
+        self.credit.wait_for(1906 * MIB, budget_s=1.0, tag="weights_6",
+                             free_bytes_now=0, epoch=1)
+        import threading
+
+        # The peer's NEXT release, in the window the waiting tag now has because
+        # it was not granted on bytes weights_6 had spent (on the real boot that
+        # was P rank 0's 2988 MiB weights_0, about a second later).
+        peer = threading.Timer(0.2, self.credit.publish, ("weights_0", 2988 * MIB))
+        peer.start()
+        self.addCleanup(peer.cancel)
+        rec = self.credit.wait_for(1906 * MIB, budget_s=5.0, tag="weights_7",
+                                   free_bytes_now=0, epoch=1,
+                                   free_reader=lambda: 4000 * MIB)
+        self.assertIn("funded", rec["reason"])
+        self.assertEqual(rec["claimed_bytes"], 1906 * MIB)
+        self.assertEqual(self.credit.read()["consumed_bytes"], 2 * 1906 * MIB)
+
+    def test_the_early_exit_spends_credit_too(self):
+        # The second route to the same wall: "the card already holds the bytes"
+        # does not say WHOSE bytes. On a co-located pair the free it exits
+        # against is largely the peer's just-released pages, so an undebited
+        # early exit leaves a later tag licensed by bytes that are gone.
+        self.credit.begin_leg(1)
+        self.credit.publish("weights_4", 2560 * MIB)
+        rec = self.credit.wait_for(1906 * MIB, budget_s=1.0, tag="weights_6",
+                                   free_bytes_now=4000 * MIB, epoch=1)
+        self.assertIn("already holds the bytes", rec["reason"])
+        self.assertEqual(rec["claimed_bytes"], 1906 * MIB)
+        self.assertEqual(self.credit.read()["consumed_bytes"], 1906 * MIB)
+
+    def test_the_early_exit_of_a_boot_with_no_peer_writes_nothing(self):
+        # ... and the quiet case stays quiet: with no counter for this leg there
+        # is nothing to spend, so a single-group boot neither waits nor writes.
+        rec = self.credit.wait_for(80 * MIB, budget_s=1.0, tag="weights_0",
+                                   free_bytes_now=100 * MIB, epoch=7)
+        self.assertEqual(rec["claimed_bytes"], 0)
+        self.assertEqual(self.credit.read(), {},
+                         "a consumer must not CREATE a counter for a leg "
+                         "nobody opened")
+
+    def test_a_refused_tag_consumes_nothing(self):
+        # W85 fires inside the debit's lock, between the decision and the write:
+        # a refusal that had already spent the bytes would strand the retry and
+        # the leg's remaining tags.
+        self.credit.begin_leg(1)
+        self.credit.publish("weights_4", 2560 * MIB)
+        with self.assertRaises(ms.Weg2VramCreditAllocatableShort):
+            self.credit.wait_for(1906 * MIB, budget_s=1.0, tag="weights_7",
+                                 free_bytes_now=0, epoch=1,
+                                 free_reader=lambda: 100 * MIB)
+        self.assertEqual(self.credit.read()["consumed_bytes"], 0,
+                         "the refused tag must not have taken the credit")
+
+    def test_the_debit_does_not_buy_the_fix_with_a_new_false_refusal(self):
+        # THE NAMED DANGER DIRECTION: a fix that only MOVES the refusal must go
+        # red. With the balance spent and the peer's leg complete, the card is
+        # asked once more -- and a card that holds the bytes gets the same
+        # answer late that the early exit would have given it early.
+        self.credit.begin_leg(1)
+        self.credit.publish("weights_4", 2560 * MIB)
+        self.credit.wait_for(1906 * MIB, budget_s=1.0, tag="weights_6",
+                             free_bytes_now=0, epoch=1)
+        self.credit.leg_complete()
+        rec = self.credit.wait_for(1906 * MIB, budget_s=1.0, tag="weights_7",
+                                   free_bytes_now=0, epoch=1,
+                                   free_reader=lambda: 4000 * MIB)
+        self.assertIn("the card itself holds the bytes", rec["reason"])
+
+    def test_a_leg_complete_short_card_is_still_the_named_refusal(self):
+        # ... and the late re-read may only LICENSE, never hide the refusal that
+        # is right: peer done, card short, W35 by name with both halves of the
+        # book in the message.
+        self.credit.begin_leg(1)
+        self.credit.publish("weights_4", 2560 * MIB)
+        self.credit.wait_for(1906 * MIB, budget_s=1.0, tag="weights_6",
+                             free_bytes_now=0, epoch=1)
+        self.credit.leg_complete()
+        with self.assertRaises(ms.Weg2VramCreditRefused) as cm:
+            self.credit.wait_for(1906 * MIB, budget_s=30.0, tag="weights_7",
+                                 free_bytes_now=0, epoch=1,
+                                 free_reader=lambda: 100 * MIB)
+        msg = str(cm.exception)
+        self.assertIn("peer_leg_complete=True", msg)
+        self.assertIn("free_mib_at_refusal=100", msg)
+
+    def test_a_new_leg_resets_the_debit_with_the_credit(self):
+        self.credit.begin_leg(1)
+        self.credit.publish("weights_4", 2560 * MIB)
+        self.credit.wait_for(1906 * MIB, budget_s=1.0, tag="weights_6",
+                             free_bytes_now=0, epoch=1)
+        self.credit.begin_leg(2)
+        state = self.credit.read()
+        self.assertEqual(state["credit_bytes"], 0)
+        self.assertEqual(state["consumed_bytes"], 0,
+                         "a leg must never open carrying the last leg's spending")
+
+    def test_the_publisher_is_still_the_only_writer_of_the_credit_half(self):
+        # UPSTREAM-MINIMAL, and the check that the debit did not become a second
+        # ledger: `claim` writes the SAME file, and it may not invent credit.
+        self.credit.begin_leg(1)
+        self.credit.publish("weights_4", 100 * MIB)
+        self.credit.claim("weights_0", 40 * MIB, epoch=1)
+        state = self.credit.read()
+        self.assertEqual(state["credit_bytes"], 100 * MIB)
+        self.assertEqual(state["consumed_bytes"], 40 * MIB)
+        self.assertEqual(state["claims"], ["weights_0"])
+        self.assertEqual(state["tags"], ["weights_4"],
+                         "one file, two halves -- not two files")
+
+    def test_a_claim_against_another_legs_counter_takes_nothing(self):
+        self.credit.begin_leg(1)
+        self.credit.publish("weights_4", 100 * MIB)
+        rec = self.credit.claim("weights_0", 40 * MIB, epoch=2)
+        self.assertEqual(rec["claimed_bytes"], 0)
+        self.assertEqual(rec["stale_epoch"], "1")
+        self.assertEqual(self.credit.read()["consumed_bytes"], 0)
+
     def test_no_new_timeout_constant_lives_in_this_module(self):
         # Spec section 10.9.  The bound is the CALLER's, passed in; a default
         # here would be the second timeout constant the spec forbids.

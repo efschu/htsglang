@@ -3022,14 +3022,31 @@ class SchedulerWeightUpdaterManager:
         except OSError as exc:
             logger.warning("[weg2 credit] unreadable on %s: %s -- not waiting", tag, exc)
             return
-        if rec.get("waited_s", 0.0) > 0.0:
+        # #1349: a tag that TOOK credit is logged even when it waited 0 ms. The
+        # debit is the half that was missing, so it has to be readable per tag,
+        # and the quiet case stays quiet by construction: with no co-located peer
+        # the counter is empty, nothing is ever claimed, and this stays at the
+        # pre-#1349 "only a real wait prints" volume.
+        if rec.get("waited_s", 0.0) > 0.0 or int(rec.get("claimed_bytes", 0)) > 0:
             logger.info(
                 "WEG2-VRAM-CREDIT card=%s tag=%s waited=%.0f ms credit=%d MiB "
+                "published=%d MiB consumed=%d MiB available_after=%d MiB "
                 "requested=%d MiB free_mib=%s allocatable_est=%s "
                 "corridor_floor_mib=%s (%s)",
                 self._weg2_card_uuid() or "unknown", tag,
                 float(rec["waited_s"]) * 1000,
                 int(rec.get("credit_bytes", 0)) // MIB_,
+                # #1349: BOTH HALVES OF THE BOOK ON EVERY LINE. `credit` is the
+                # UNSPENT balance the grant was decided on; `published` is the
+                # peer's gross release total and `consumed` what this leg's tags
+                # have already claimed off it. On weg2xsn21b the two consecutive
+                # grants read `credit=2560` BOTH times -- with these three fields
+                # that double-spend is visible in the log instead of having to be
+                # reconstructed from a `free_mib` that fell by the request size.
+                int(rec.get("credit_published_bytes", rec.get("credit_bytes", 0)))
+                // MIB_,
+                int(rec.get("consumed_bytes", 0)) // MIB_,
+                int(rec.get("available_bytes", 0)) // MIB_,
                 int(need_bytes) // MIB_,
                 # #1331: PRINTED, so the next boot can ATTRIBUTE instead of
                 # infer. weg2xsn7's line carried neither number, which is why
