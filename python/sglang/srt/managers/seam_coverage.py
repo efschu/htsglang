@@ -94,6 +94,29 @@ def enabled() -> bool:
     return bool(os.environ.get(DIR_ENV))
 
 
+def lane_coverage_armed() -> bool:
+    """Is #1348's lane instrument already holding this process's tracer?
+
+    THE GUARD USED TO BE ONE-DIRECTIONAL. ``weg2/lane_coverage.py`` refuses to
+    arm when THIS module's directory variable is set, and this module did not
+    know that one existed -- the string ``lane_coverage`` appeared here zero
+    times. Measured on coverage 7.15.2: a second ``Coverage.start()`` raises
+    nothing and leaves the FIRST object blind for the whole duration of the
+    second, resuming afterwards. A blind window reads as "never executed",
+    i.e. as a seam that is not one -- the exact false finding both instruments
+    exist to prevent. Whoever loses the race has to be told, so the question
+    is asked from both sides.
+
+    Import-safe and cheap: the lane module is stdlib-only until armed.
+    """
+    try:
+        from sglang.srt.weg2 import lane_coverage
+
+        return lane_coverage.lane_armed()
+    except Exception:  # noqa: BLE001 -- a guard may never be the failure
+        return False
+
+
 def _mark_dead(where: str, exc: BaseException) -> None:
     """First failure anywhere in this module: log once, then stay dead.
 
@@ -136,6 +159,16 @@ def _ensure_started(rank: int) -> bool:
             return _cov is not None
         _started = True
         if not enabled():
+            return False
+        if lane_coverage_armed():
+            logger.error(
+                "seam_coverage: REFUSING to start -- weg2/lane_coverage.py "
+                "(#1348, --xchg-coverage-diff) already owns this process's "
+                "tracer. A second Coverage.start() does not raise; it blinds "
+                "the first collector for its whole duration, and a blind "
+                "window reads as a never-executed seam. Arm exactly one of "
+                "the two instruments per boot."
+            )
             return False
         try:
             import coverage  # local import: never paid unless armed
