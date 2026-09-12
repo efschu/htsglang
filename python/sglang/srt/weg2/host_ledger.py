@@ -265,7 +265,70 @@ FLIP_HOST_TRANSIENT_GIB = 9.97
 #: The MAX is taken, not the mean: the margin must cover the worst recorded flip
 #: of this form, and rg3's is explicitly a lower bound, so this term is itself a
 #: lower bound on the true worst case.
+#:
 RING_ERA_FLIP_TRANSIENT_GIB = {"weg2rg2": 1.10, "weg2rg3": 2.88}
+
+#: #1325b -- THE SAME QUANTITY, MEASURED IN THE CURRENCY THE BOUND IS IN.
+#: RECORDED, NOT PRICED, and the split is the whole point of this table.
+#:
+#: Both rows ABOVE were read off RAW ``memory.current`` -- the instrument
+#: #1309 forbids for a host verdict, because it counts the reclaimable page
+#: cache -- and rg3's own record states its +2.88 as "net of store growth
+#: (+3.81 gross)" at a 10 s cadence against a 2.9 s interleave
+#: (WEG2_BUILD_DECISIONS_0906.md:3552).  The growth it charged is the STORE
+#: TMPFS, which #1236 moved to disk, so the binding row prices bytes the run
+#: moment no longer holds in this cgroup at all.  Measured in the bound's own
+#: currency (``anon+shmem+slab_unreclaimable``, the 1 Hz
+#: ``gpu-arb/weg2/hostsample_weg2xsn*.csv`` series), the flip transient is
+#: GONE, exactly as C19 predicts -- the region is preallocated at Sigma H and
+#: the legs copy through it, so a flip allocates nothing:
+#:   weg2rg6  (2026-09-08, 20 flips) "Transient: no rise detected" (its record)
+#:   weg2xsn19 (2026-09-11, 8 flips) max LOCAL transient **-0.019 GiB**
+#:   weg2xsn20 (2026-09-11, 8 flips) max LOCAL transient **-0.023 GiB**
+#: LOCAL = max inside the flip window minus the HIGHER of its two 12 s
+#: shoulders, per flip.  NEGATIVE ON 16 OF 16 FLIPS: the series is a slow
+#: monotone creep and no flip spikes above it.
+#:
+#: WHY THE TERM IS NOT RETIRED HERE, stated rather than done quietly.
+#: Retiring rg3 RAISES the hard bound from 87.30 to 90.18 GiB -- it FUNDS arms
+#: that are refused today, which is the danger direction of the whole ledger,
+#: and eight tests in five other tickets (#1233 fix 8 / host budget /
+#: reclaimable, #1317n, #1317) are ratchets ON that bound and go red the
+#: moment it moves.  It is therefore a PLAN decision with its own red-first,
+#: not a side effect of a netting fix, and #1325b does not need it: the
+#: netting correction alone takes weg2xsn21's cheapest rung from run_peak
+#: 91.99 to 85.15 GiB, below the UNCHANGED 87.30 bound.  The honest limit of
+#: the measurement above belongs with it: 1 Hz against a ~2.9 s interleave is
+#: 2-3 samples per leg, so a sub-second spike is not excluded by it.
+FLIP_TRANSIENT_IN_CURRENCY_GIB = {
+    "weg2rg6": 0.0, "weg2xsn19": -0.019, "weg2xsn20": -0.023,
+}
+
+#: Per boot: (predicted run peak, measured non-reclaimable peak) in GiB, so a
+#: ring provenance line can show the next seat how the SOURCE boot's own
+#: prediction compared with its metal.  #1325b: a ledger that re-prices a form
+#: from a source boot must show that source boot's own error, or the reader
+#: cannot tell an over-estimate from an under-estimate.  Absence stays absence
+#: -- :func:`source_metal_deviation` returns "" for a boot not in here.
+SOURCE_BOOT_METAL_GIB = {
+    #    boot          predicted  measured non-reclaimable peak (1 Hz series)
+    "weg2xsn19": (87.09, 88.794),
+    "weg2xsn20": (87.17, 88.798),
+}
+
+
+def source_metal_deviation(boot_tag: str) -> str:
+    """``predicted X -> metal Y (+Z)`` for a source boot, or "" if unknown."""
+    row = SOURCE_BOOT_METAL_GIB.get(str(boot_tag or ""))
+    if row is None:
+        return ""
+    pred, meas = float(row[0]), float(row[1])
+    return (
+        f"source boot's OWN metal check: predicted run peak {pred:.2f} GiB, "
+        f"MEASURED non-reclaimable peak {meas:.2f} GiB "
+        f"({meas - pred:+.2f} GiB; instrument anon+shmem+slab_unreclaimable, "
+        f"1 Hz)"
+    )
 
 #: RUN-PEAK UNDER-PREDICTION, the term the pre-ring transient was accidentally
 #: standing in for. The estimator does not miss the flip; it misses the STEADY
@@ -549,7 +612,18 @@ def resolve_margin(
         transient, t_src = float(flip_transient_gib), "caller-supplied measured transient"
     elif RING_ERA_FLIP_TRANSIENT_GIB:
         boot, transient = max(RING_ERA_FLIP_TRANSIENT_GIB.items(), key=lambda kv: kv[1])
-        t_src = f"RING-ERA max over {sorted(RING_ERA_FLIP_TRANSIENT_GIB)}, binding {boot}"
+        # #1325b: the binding row is printed WITH the in-currency rows that
+        # contradict it. The term does not move here -- eight ratchets in five
+        # other tickets sit on this bound -- but a reader must not have to
+        # re-derive from scratch that the binding sample is out of currency.
+        t_src = (
+            f"RING-ERA max over {sorted(RING_ERA_FLIP_TRANSIENT_GIB)}, binding "
+            f"{boot} -- priced on raw memory.current (#1309), in-currency "
+            f"{'/'.join(f'{v:+.3f}' for _b, v in sorted(FLIP_TRANSIENT_IN_CURRENCY_GIB.items()))}"
+            f" on {sorted(FLIP_TRANSIENT_IN_CURRENCY_GIB)}, NOT PRICED (#1325b)"
+            if FLIP_TRANSIENT_IN_CURRENCY_GIB else
+            f"RING-ERA max over {sorted(RING_ERA_FLIP_TRANSIENT_GIB)}, binding {boot}"
+        )
     else:
         transient, t_src = FLIP_HOST_TRANSIENT_GIB, "PRE-RING fallback, no ring-era sample exists"
     if transient < RING_GRANULE_GIB:
@@ -1615,7 +1689,9 @@ def read_meminfo(path: str = "/proc/meminfo") -> Dict[str, int]:
     return out
 
 
-def non_backup_host_bytes(group: str, s_gb: int, m_mib: int) -> int:
+def non_backup_host_bytes(
+    group: str, s_gb: int, m_mib: int, s_gb_d: Optional[int] = None
+) -> int:
     """The host bytes ONE group holds that are NOT the flip backup image.
 
     FIX 1 (round 1) finding 3.  A sleeping group's RssShmem is its whole
@@ -1635,13 +1711,60 @@ def non_backup_host_bytes(group: str, s_gb: int, m_mib: int) -> int:
     * rings: record 1e, "group P owns the 2xS half, group D the 6xS half".
 
     ``group`` is ``"P"`` or ``"D"``; anything else raises rather than guessing.
+
+    #1325b -- ``s_gb_d`` IS THE THIRD CONSUMER OF #1325's CURRENCY, and it was
+    the one left unconverted.  #1325 fixed the sampler and the reader of
+    ``run_residual_gib``; this function is named in that very docstring
+    (:func:`read_measured_record`) as "the consumer that corrects it", and it
+    could not express the two-budget arm at all -- its only source was
+    ``ring_table.parse_chosen_arm``, a regex that sees ``S=`` and ``M=``.  So
+    on a source boot that ran ``S_D=4`` it took ``S_D == S`` worth of D's rings
+    out of that boot's measured ``RssShmem`` and left the rest inside the
+    netted image, where :func:`ring_table.solve` turns it into ``Sigma H`` and
+    :meth:`Arm.predicted_run_peak_gib` adds ``rings_gib`` -- AT ``S_D=4`` -- on
+    top of it.  The same bytes, twice, at the run moment.
+
+    MEASURED 2026-09-12, three instruments, one number:
+      * ``("D", 1, 1200)`` = 5499 MiB against ``s_gb_d=4`` = 14426 MiB:
+        **8.718 GiB** under-subtracted -- the #1325 figure exactly;
+      * source boot weg2xsn20 (``S_D=4``) leaves D 9092 MiB above its own
+        census, weg2sn5b (one budget) leaves 329 MiB: difference 8763 MiB;
+      * weg2xsn20's own group-D record carries ``run_residual_gib`` **-8.718**
+        GiB, and a residual defined as "what this term list does NOT name"
+        cannot be negative unless something is named twice.
+      Consequence on the refused boot weg2xsn21: ``Sigma H`` 51584 -> 44587
+      MiB, i.e. ``host_weights`` 50.38 -> 43.54 GiB.
+
+    ``s_gb_d`` is D's budget ALONE (#1317n): passing it must not move P's
+    subtrahend, because crediting D's rings to P would under-charge the box --
+    the danger direction of this whole correction.  ``None`` reproduces the
+    single-budget result byte for byte, so every pre-two-budget source boot
+    prices exactly as it did.
+
+    WHAT IS DELIBERATELY *NOT* IN THE SUBTRAHEND: the xchg bounce.  It IS an
+    arm charge (``charge_terms`` posts ``xchg_bounce_gib`` and
+    ``_boot_charges_gib`` sums it), so the symmetry argues for netting it too
+    -- but weg2xsn20, the source this correction was found on, NEVER MAPPED IT
+    (its record, item (c): ``bounce.bin`` ABSENT, the W74 refusal fires "before
+    the buffer is mapped").  Netting a term that is not in the sample is an
+    UNDER-charge, so it stays out until a source boot's own log proves the
+    buffer was mapped.  Stated here rather than left for a later reader to
+    "complete"; ``test_the_bounce_is_not_netted_off_the_image`` is the ratchet.
+
+    NOR is the host ring itself: the sample also counts the source boot's own
+    ring pages (:func:`read_measured_record` names that ratchet), but the
+    C19 ring is WHERE the backup lives, so subtracting it would cancel the
+    image this function exists to isolate.  Named, not netted, and in the
+    OVER-charging direction.
     """
     if group not in ("P", "D"):
         raise ValueError(f"group must be 'P' or 'D', not {group!r}")
     scale = m_mib / ANCHORS_REFERENCE_M_MIB
     anchors = (ANCHORS_P_AT_2400_BYTES if group == "P" else ANCHORS_D_AT_2400_BYTES) * scale
     ring_mult = RING_P_MULT_GB_PER_S if group == "P" else RING_D_MULT_GB_PER_S
-    rings = ring_mult * s_gb * GB
+    # P keeps `s_gb`; only D's half of the rings is sized by the D budget.
+    ring_s = s_gb if (group == "P" or s_gb_d is None) else int(s_gb_d)
+    rings = ring_mult * ring_s * GB
     # The pool overhead price() posts on top of anchors+rings is charged against
     # the same bytes, so it belongs to the same subtrahend.
     return int(round((anchors + rings) * (1.0 + HOST_POOL_OVERHEAD)))

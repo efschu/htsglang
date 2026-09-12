@@ -647,6 +647,32 @@ def p_form_key(argv: Sequence[str]) -> Tuple[str, str]:
 XCHG_FORM_MARKER = "WEG2-XCHG-REGION"
 XCHG_FORM_TOKEN = "--weg2-xchg-region=armed"
 
+#: #1325b -- THE #995 PROSE TRAP, INSIDE THE PRODUCT.  The marker was tested
+#: with a bare ``in line``, and the launcher PRINTS the marker in its own
+#: explanation of every exclusion it makes ("... EXCLUDED -- an xchg shadow
+#: boot (WEG2-XCHG-REGION in its front log) ..."), one such line per excluded
+#: candidate, growing by one per boot.  MEASURED 2026-09-12 over the 40 newest
+#: boots in /spinning/evidence-665-f1: weg2xsn20 carries the marker 56 times,
+#: 55 of them that prose and exactly ONE a real event line; **weg2sn6t -- a
+#: pure serving boot that never armed the exchange -- carries it 40 times,
+#: ALL prose, and was therefore stamped ``--weg2-xchg-region=armed``**.  A
+#: serving boot wearing the exchange's form key is the exact mirror of the
+#: defect #1305 item 4 and B4e exist to prevent, and it makes an xchg source
+#: rank as a serving boot's twin.
+#:
+#: The anchor is the shape the arm actually emits: the marker as a WHOLE TOKEN
+#: followed by its own ``key=value`` field (``epoch=`` / ``path=`` /
+#: ``slots=`` / ``bytes=``).  Prose puts a lowercase English word after it, and
+#: the one genuine line on every armed boot puts ``epoch=`` there.
+_XCHG_FORM_EVENT_RE = re.compile(
+    r"(?<![\w-])" + re.escape(XCHG_FORM_MARKER) + r"\s+[A-Za-z_][\w.-]*="
+)
+
+
+def xchg_form_event(line: str) -> bool:
+    """True only for a REAL ``WEG2-XCHG-REGION`` event line, never its prose."""
+    return _XCHG_FORM_EVENT_RE.search(line) is not None
+
 
 def parse_p_form(front_log: str) -> Tuple[Optional[List[str]], str]:
     """``(group P's argv, "")`` from a boot's front log, or ``(None, reason)``.
@@ -669,7 +695,10 @@ def parse_p_form(front_log: str) -> Tuple[Optional[List[str]], str]:
                             argv = shlex.split(found.group(1))
                         except ValueError as exc:
                             return None, f"its 'group P argv:' line does not shell-split: {exc}"
-                elif not xchg and XCHG_FORM_MARKER in line:
+                elif not xchg and xchg_form_event(line):
+                    # #1325b: an EVENT line, never the launcher's own prose
+                    # about some other boot's exclusion -- see the note at
+                    # `_XCHG_FORM_EVENT_RE`.
                     xchg = True
                 if argv is not None and xchg:
                     break
@@ -1302,8 +1331,29 @@ class RingTable:
             "the tag census over ALL BACKED-UP tags, cross-checked against the "
             "sleeping group's summed per-rank RssShmem from that boot's own "
             f"WEG2 DORMANT-IMAGE line ({self.image_source}){bound}"
+            f"{self._source_metal()}"
             f"; per-card CREDIT unit: ALLOCATABLE free, source instrument "
             f"{self.credit_instrument} -- {self.credit_correction}"
+        )
+
+    def _source_metal(self) -> str:
+        """#1325b: what the SOURCE boot's own prediction did against ITS metal.
+
+        Every figure above is a re-pricing of one other boot.  Without that
+        boot's own prediction-vs-measured gap the next seat cannot tell whether
+        this ledger over- or under-states the form it is about to run, and a
+        3 GiB over-statement reads exactly like a hard physical limit.  Absence
+        stays absence: a source boot with no recorded metal peak prints the
+        word, never a fabricated 0.00.
+        """
+        from sglang.srt.weg2 import host_ledger
+
+        tag = boot_tag_of_stem(str(self.boot or "")) or ""
+        line = host_ledger.source_metal_deviation(tag)
+        return (
+            f"; {line}" if line
+            else f"; source boot {tag or '?'} has NO recorded metal peak -- this "
+                 "re-pricing's own accuracy is UNKNOWN, not zero"
         )
 
     def env_map(self) -> str:
@@ -1555,6 +1605,20 @@ class DormantImage:
     rss_mib: int
     weight_tags_mib: int
     extra_mib: int
+    #: #1325b THE ARM THAT MEASURED THIS SAMPLE, carried WITH the sample.
+    #: The netting subtrahend (:func:`host_ledger.non_backup_host_bytes`) is a
+    #: pure function of the SOURCE boot's arm, and until now its only source
+    #: was :func:`parse_chosen_arm` -- a regex over the front log that can see
+    #: ``S=`` and ``M=`` and nothing else.  A two-budget boot (``S_D=4``) was
+    #: therefore netted as if it had run ``S_D == S``, leaving 8.72 GiB of D's
+    #: rings inside the image and thus inside ``Sigma H``, which
+    #: ``Arm.predicted_run_peak_gib`` then charges again as ``rings_gib``.
+    #: The sidecar record already holds the arm NEXT TO the sample it wrote,
+    #: so sample and correction are one boot's pair by construction, which is
+    #: what #1264 (B) bound the sample to the stem for.  ``None`` for a record
+    #: written before the arm was stored -> the caller falls back to
+    #: ``parse_chosen_arm`` and prices exactly as it did.
+    arm: Optional[Dict[str, object]] = None
 
 
 def parse_group_log(path: str) -> GroupLog:
@@ -1749,11 +1813,16 @@ def dormant_images(
         extra = rec.get("extra_gib")
         if extra is None:
             extra = float(rss) - float(tags)
+        arm = rec.get("arm")
         out[group] = DormantImage(
             group=group,
             rss_mib=int(round(float(rss) * GIB / MIB)),
             weight_tags_mib=int(round(float(tags) * GIB / MIB)),
             extra_mib=int(round(float(extra) * GIB / MIB)),
+            # #1325b: the arm the sample was taken under, verbatim from the
+            # record.  Not re-derived, not defaulted -- a missing arm is an
+            # absence the caller resolves, never a silently single-budget one.
+            arm=arm if isinstance(arm, dict) else None,
         )
     return out
 
@@ -1792,6 +1861,7 @@ def apportion_dormant(
     fallback_census: Optional[Dict[str, int]] = None,
     non_backup_mib: Optional[int] = None,
     fallback_non_backup_mib: Optional[int] = None,
+    non_backup_currency: str = "",
 ) -> Tuple[Dict[str, int], str, bool]:
     """A1-2's cross-check, turned into per-card MiB -- ``(rows, source, is_bound)``.
 
@@ -1860,7 +1930,8 @@ def apportion_dormant(
                 (
                     f"group {group}: measured RssShmem {measured.rss_mib} MiB minus "
                     f"the ledger's own posted non-backup host terms for this "
-                    f"group's ranks {int(non_backup_mib)} MiB (anchors + rings) = "
+                    f"group's ranks {int(non_backup_mib)} MiB (anchors + rings"
+                    f"{'; ' + non_backup_currency if non_backup_currency else ''}) = "
                     f"{usable} MiB, which does NOT exceed the per-card census "
                     f"{total_census} MiB ({covers}), so the census stands and the "
                     "netted cross-check corroborates it; route = per-card tag census"
@@ -1872,7 +1943,9 @@ def apportion_dormant(
             (
                 f"group {group}: measured RssShmem {measured.rss_mib} MiB minus the "
                 f"ledger's own posted non-backup host terms for this group's ranks "
-                f"{int(non_backup_mib)} MiB (anchors + rings) = {usable} MiB, which "
+                f"{int(non_backup_mib)} MiB (anchors + rings"
+                f"{'; ' + non_backup_currency if non_backup_currency else ''}) = "
+                f"{usable} MiB, which "
                 f"EXCEEDS the per-card census {total_census} MiB ({covers}) by "
                 f"{usable - total_census} MiB; the excess is apportioned over the "
                 "cards by their share of that census, which is the only attribution "
@@ -2153,22 +2226,57 @@ def boot_tag_of_stem(stem: str) -> Optional[str]:
     return m.group("tag") if m else None
 
 
-def _non_backup_mib(arm: Optional[Tuple[int, int]]) -> Mapping[str, Optional[int]]:
-    """``{group: MiB}`` of the source boot's posted anchors + rings, or Nones.
+def _non_backup_mib(
+    arm: Optional[Tuple[int, int]],
+    measured: Optional[Mapping[str, DormantImage]] = None,
+) -> Tuple[Mapping[str, Optional[int]], Mapping[str, str]]:
+    """``({group: MiB}, {group: currency})`` of the source's anchors + rings.
 
     The import is local because :mod:`host_ledger` imports nothing from here and
     this module is read by the launcher before either is priced; keeping the
     edge one-directional is what stops the two from becoming one circular unit.
+
+    #1325b THE CURRENCY COMES FROM THE RECORD, NOT FROM THE REGEX.  ``arm`` is
+    :func:`parse_chosen_arm`'s ``(S, M)`` off the source's front log, which is
+    all the log line carries; the SIDECAR record that holds the sample holds
+    the whole arm beside it, ``s_gb_d`` included.  Preferring the record makes
+    sample and subtrahend one boot's pair by construction and lets the
+    subtraction be in the currency the source boot actually ran.  A record
+    without an arm falls back to ``(S, M)`` and prices byte-identically, so no
+    boot that could be solved before stops being solvable.
+
+    The second element is a per-group WORD for the line to print: a subtrahend
+    whose currency is invisible is precisely how this defect outlived #1325.
     """
-    if arm is None:
-        return {"P": None, "D": None}
+    if arm is None and not measured:
+        return {"P": None, "D": None}, {"P": "", "D": ""}
     from sglang.srt.weg2 import host_ledger
 
-    s_gb, m_mib = arm
-    return {
-        g: int(host_ledger.non_backup_host_bytes(g, s_gb, m_mib) // MIB)
-        for g in ("P", "D")
-    }
+    out: Dict[str, Optional[int]] = {}
+    why: Dict[str, str] = {}
+    for g in ("P", "D"):
+        rec_arm = (measured or {}).get(g)
+        rec_arm = rec_arm.arm if rec_arm is not None else None
+        s_gb = m_mib = s_d = None
+        src = ""
+        if isinstance(rec_arm, dict) and rec_arm.get("s_gb") is not None:
+            try:
+                s_gb, m_mib = int(rec_arm["s_gb"]), int(rec_arm["m_mib"])
+                s_d = None if rec_arm.get("s_gb_d") is None else int(rec_arm["s_gb_d"])
+                src = "the sidecar record's own arm"
+            except (KeyError, TypeError, ValueError):
+                s_gb = m_mib = s_d = None
+        if s_gb is None and arm is not None:
+            s_gb, m_mib = int(arm[0]), int(arm[1])
+            s_d, src = None, "the source boot's WEG2-HOST-LEDGER CHOSEN line (S, M only)"
+        if s_gb is None:
+            out[g], why[g] = None, ""
+            continue
+        out[g] = int(host_ledger.non_backup_host_bytes(g, s_gb, m_mib, s_gb_d=s_d) // MIB)
+        why[g] = (
+            f"S={s_gb} S_D={'=S' if s_d is None else s_d} M={m_mib}, from {src}"
+        )
+    return out, why
 
 
 def solve(
@@ -2426,16 +2534,23 @@ def solve(
         # not from a number typed here.  Unreadable -> None -> the cross-check
         # reports but never raises a census (see :func:`apportion_dormant`).
         arm = parse_chosen_arm(f_log)
-        non_backup = _non_backup_mib(arm)
+        # #1325b: the record's OWN arm first (it carries `s_gb_d`, which the
+        # CHOSEN line does not), the regex only as the fallback for a record
+        # written before the arm was stored.  Netting a two-budget source in a
+        # single-budget currency left 8.72 GiB of D's rings inside Sigma H, to
+        # be charged a second time by `Arm.predicted_run_peak_gib`.
+        non_backup, non_backup_why = _non_backup_mib(arm, measured)
         dorm_p, src_p, bound_p = apportion_dormant(
             "P", measured.get("P"), pairs["image_p"], gp.covers_all_backed_up_tags,
             non_backup_mib=non_backup.get("P"),
+            non_backup_currency=non_backup_why.get("P", ""),
         )
         dorm_d, src_d, bound_d = apportion_dormant(
             "D", measured.get("D"), pairs["image_d"], gd.covers_all_backed_up_tags,
             fallback=measured.get("P"), fallback_census=pairs["image_d"],
             non_backup_mib=non_backup.get("D"),
             fallback_non_backup_mib=non_backup.get("P"),
+            non_backup_currency=non_backup_why.get("D", ""),
         )
         pairs["dorm_p"], pairs["dorm_d"] = dorm_p, dorm_d
 
