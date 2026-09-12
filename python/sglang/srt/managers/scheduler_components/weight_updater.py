@@ -2332,6 +2332,12 @@ class SchedulerWeightUpdaterManager:
                     # live tensors, at the flip -- where the manifest could
                     # have drifted since it was written at the end of loading.
                     model=model,
+                    # THE REGION THIS RUNNER OWNS. A leg addresses only its own
+                    # region's tensors: weg2xsn25 measured what mixing costs --
+                    # P rank 0's leg carried the draft head's eleven pieces,
+                    # which live in ANOTHER runner, and read dst_resolved=893/
+                    # 904 (893 being exactly the main runner's own count).
+                    region_tag=region_tag,
                     log=logger.info)
             plan, reason = sh.derive_leg_plan(
                 hook=str(hook), group=str(group),
