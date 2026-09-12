@@ -21,7 +21,7 @@ executed_pct=<x> ...``
     per-rank lines); a line missed by all of them is a seam nothing in this
     boot reached, which is the stronger finding.
 
-``WEG2-COVERAGE NO-OBSERVATION module=<path> rank=<n> reason=<r>`` + ``W90``
+``WEG2-COVERAGE NO-OBSERVATION module=<path> rank=<n> reason=<r>`` + ``W92``
     THE INDICATOR LAW, and the reason half this file exists.  A coverage
     reader that prints "0 unexecuted" when its input is missing hands the
     reader an ABSENCE OF OBSERVATION dressed as a FULL SWEEP, and closes
@@ -29,7 +29,7 @@ executed_pct=<x> ...``
     is not there, the dump file is empty, the module is absent from the dump,
     the module never got imported.  Each prints a NAMED refusal and no number.
 
-``WEG2-COVERAGE TALLY-REFUSED ...`` + ``W91``, exit 2
+``WEG2-COVERAGE TALLY-REFUSED ...`` + ``W93``, exit 2
     ``executed + unexecuted == executable`` is an identity.  Where it fails,
     the numerator and the denominator were not produced by the same analysis
     of the same source, so their difference is meaningless.  Refused, never

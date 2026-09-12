@@ -14,14 +14,14 @@ instrument: the reader takes an ABSENCE OF OBSERVATION for a FULL SWEEP and
 closes exactly the seam the instrument was built to open.  So the three ways
 this can silently degrade -- the dump file is not there, the dump file is
 empty, the module never appears in the dump -- each print a NAMED refusal
-(``W90 Weg2CoverageNoObservation``) and never a number.  Three of the tests
+(``W92 Weg2CoverageNoObservation``) and never a number.  Three of the tests
 below are that refusal, driven one way each.
 
 THE TALLY IS THE SECOND GUARD.  ``executed + unexecuted == executable`` is an
 identity, not a hope: if it does not hold, either the source drifted between
 the boot and this ingest (the dump is keyed to a sha256 per module for exactly
 that reason) or the line analysis disagrees with the tracer.  Either way the
-numbers are not comparable and the ingest REFUSES (``W91
+numbers are not comparable and the ingest REFUSES (``W93
 Weg2CoverageTallyRefused``) instead of reporting a difference of two
 incompatible denominators.
 
@@ -382,7 +382,7 @@ class TheIngestPrintsUnexecutedLines(CustomTestCase):
             self.assertTrue(any(rel in ln and "group=P" in ln for ln in union))
 
     def test_the_tally_holds_or_the_ingest_refuses(self):
-        """executed + unexecuted == executable, or W91 and a non-zero exit."""
+        """executed + unexecuted == executable, or W93 and a non-zero exit."""
         rel = "python/sglang/srt/weg2/xchg_bounce.py"
         from sglang.srt.weg2 import lane_coverage as lc
 
@@ -395,7 +395,7 @@ class TheIngestPrintsUnexecutedLines(CustomTestCase):
             self._dump(d, "P", 0, {rel: entry})
             out = self._run_ingest("--dump-dir", d, "--root", ROOT, "--expect", "P=1")
             self.assertNotEqual(out.returncode, 0, out.stdout)
-            self.assertIn("W91 Weg2CoverageTallyRefused", out.stdout + out.stderr)
+            self.assertIn("W93 Weg2CoverageTallyRefused", out.stdout + out.stderr)
 
     def test_source_drift_between_boot_and_ingest_refuses(self):
         """The sha256 in the dump is the boot's source, not this checkout's."""
@@ -430,7 +430,7 @@ class NoObservationIsNeverZero(CustomTestCase):
         with tempfile.TemporaryDirectory() as d:
             out = self._run_ingest("--dump-dir", os.path.join(d, "nope"), "--root", ROOT)
             self.assertIn("WEG2-COVERAGE NO-OBSERVATION", out.stdout)
-            self.assertIn("W90 Weg2CoverageNoObservation", out.stdout)
+            self.assertIn("W92 Weg2CoverageNoObservation", out.stdout)
             self.assertNotIn("unexecuted=0", out.stdout)
 
     def test_empty_dump_file_refuses(self):
@@ -590,7 +590,7 @@ class MF1_AnExpectedRankThatWroteNoDumpIsNamed(CustomTestCase):
                 if "rank-wrote-no-dump" in ln and "group=D" in ln
             ]
             self.assertEqual(len(missing), 1, out.stdout)
-            self.assertIn("W90 Weg2CoverageNoObservation", missing[0])
+            self.assertIn("W92 Weg2CoverageNoObservation", missing[0])
 
     def test_the_union_refuses_when_ranks_are_missing(self):
         """An intersection over 2 of 3 ranks is a SUPERSET, printed as a find.
@@ -1026,7 +1026,7 @@ class TheWiringPinsAreAstNotSubstring(CustomTestCase):
 
 
 class TheAllowlistIsSplitByProcessRole(CustomTestCase):
-    """S-2: eleven modules applied to every dump = ~16 meaningless W90s a boot.
+    """S-2: eleven modules applied to every dump = ~16 meaningless W92s a boot.
 
     `launcher.py` is never imported in a rank, so it refused on all six rank
     dumps; the ten rank modules are not imported in the launcher, so they

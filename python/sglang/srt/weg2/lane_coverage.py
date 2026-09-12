@@ -131,16 +131,31 @@ __all__ = [
 #: the footprint dumps already carry.
 SCHEMA = "weg2-lane-coverage-1"
 
-#: ``W90 Weg2CoverageNoObservation`` -- the refusal the ingest prints when it
+#: ``W92 Weg2CoverageNoObservation`` -- the refusal the ingest prints when it
 #: has NO reading for a module.  Enumerated against the tree-wide census
 #: (``test_weg2_wcode_uniqueness_1263``) AND against a word-bounded textual
 #: grep, because the census alone has a documented blind spot that cost a
-#: renumber at W88: both instruments read zero for W90 and W91.
-NO_OBSERVATION_CODE = "W90 Weg2CoverageNoObservation"
+#: renumber at W88.
+#:
+#: RENUMBERED W90 -> W92 AT THE MERGE TRAIN (2026-09-12, #1265 rule: a renumber
+#: is a TRAIN decision, taken at the merge that CONSUMES the number).  The
+#: original enumeration was NOT wrong: both instruments read zero for W90/W91
+#: against this slice's base ``d294bde41d``, and they were right there.  The
+#: collision was created by a SIBLING slice cut from the same base -- #1350
+#: seam-digest minted ``W90 Weg2SeamDigestMismatch`` -- so neither branch could
+#: have seen it alone, and only the per-merge census could.  It did: it went red
+#: on ``test_no_new_collision`` with
+#: ``{'W90': {'Weg2SeamDigestMismatch', 'Weg2CoverageNoObservation'}}``.
+NO_OBSERVATION_CODE = "W92 Weg2CoverageNoObservation"
 
-#: ``W91 Weg2CoverageTallyRefused`` -- the count check failed, so the two
+#: ``W93 Weg2CoverageTallyRefused`` -- the count check failed, so the two
 #: numbers being differenced are not measurements of the same thing.
-TALLY_REFUSED_CODE = "W91 Weg2CoverageTallyRefused"
+#: RENUMBERED W91 -> W93 with its partner above.  W91 did NOT collide visibly:
+#: #1350 holds it for ``Weg2SeamDigestBudgetExceeded`` through a CONCATENATED
+#: marker that no census form can see (the blind spot's sixth instance, pinned
+#: in the census by a second reading at that merge).  Moving both keeps the pair
+#: adjacent and keeps this instrument off a number the tree already holds.
+TALLY_REFUSED_CODE = "W93 Weg2CoverageTallyRefused"
 
 #: Published by ``weg2/launcher.py``'s ``build_env`` when
 #: ``--xchg-coverage-diff`` is set, and POPPED otherwise.  Absent, every entry
@@ -172,7 +187,7 @@ TOKEN_ENV = "SGLANG_WEG2_LANE_COVERAGE_TOKEN"
 #: tidiness (review S-2). Applying all eleven to every dump produced ~16
 #: refusals per boot that mean nothing by construction: ``launcher.py`` is
 #: never imported in a rank, and the ten rank modules are not imported in the
-#: launcher. Sixteen meaningless W90 lines while the ONE refusal that would
+#: launcher. Sixteen meaningless W92 lines while the ONE refusal that would
 #: have meant something -- a rank that never wrote at all -- was not printed:
 #: the indicator law inverted into noise. The ingest picks the list by the
 #: dump's own ``group`` (``"L"`` is the launcher).
