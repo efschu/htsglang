@@ -507,32 +507,7 @@ def rank_proc(group, rank, evidence, root, q, self_test, max_tensors,
         q.put(("done", group, rank, 0, 0, 0))
 
 
-def main() -> int:
-    ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--evidence", default="/spinning/evidence-665-f1/weg2xsn24_0912")
-    ap.add_argument("--self-test", action="store_true")
-    ap.add_argument("--single-runner", action="store_true",
-                    help="CAN-FAIL ARM: build the address book from the MAIN "
-                         "runner only, as weg2xsn24 shipped it. The draft "
-                         "head then has no address and the leg must refuse "
-                         "with W74 on fc.weight (dst_resolved=894/904)")
-    ap.add_argument("--entry", choices=("adapter", "library"),
-                    default="adapter",
-                    help="which entry point the bytes travel; the boot's is "
-                         "the adapter")
-    ap.add_argument("--col-div", type=int, default=1,
-                    help="divide every tensor's COLUMN count by N for "
-                         "materialisation, uniformly on both sides and only "
-                         "where the column count already agrees (i.e. never on "
-                         "a column cut). The ROW vector and the padding are "
-                         "untouched, so the routing under test is unchanged; "
-                         "this is a byte budget, not a change of arithmetic")
-    ap.add_argument("--max-tensors", type=int, default=0,
-                    help="materialise at most N tensors (0 = all that fit the byte "
-                         "budget, which IS the default form the xsn25 "
-                         "acceptance cites); "
-                         "the JOIN always sees every one")
-    ns = ap.parse_args()
+def _run(ns) -> int:
 
     if not ns.self_test and not os.path.isdir(ns.evidence):
         print(f"WEG2-XCHG-LEG-REPLAY REFUSED: no evidence dir {ns.evidence}")
@@ -540,7 +515,11 @@ def main() -> int:
 
     root = f"/dev/shm/weg2-xchg-{NONCE}"
     os.makedirs(root, exist_ok=True)
-    xr.create_semaphores(NONCE)
+    # CREATED AFTER THE BUDGET, and that ordering is a leak I caused:
+    # `budget_manifests` can `SystemExit` on a starved subset, which skips
+    # every line below it -- so a REFUSAL left 36 named semaphores in
+    # /dev/shm. A refusal that leaks is a refusal that costs the next run.
+    # The teardown below is in a `finally` for the same reason.
     print(f"WEG2-XCHG-LEG-REPLAY nonce={NONCE} slot_bytes={SLOT_BYTES} "
           f"depth={DEPTH} max_tensors={ns.max_tensors} col_div={ns.col_div} "
           f"source={'synthetic' if ns.self_test else ns.evidence}")
@@ -564,6 +543,11 @@ def main() -> int:
           f"address_book="
           f"{'single-runner (CAN-FAIL ARM)' if ns.single_runner else 'both runners'}")
 
+    # CREATED ONLY ONCE THE SUBSET IS ACCEPTED. `budget_manifests` can
+    # `SystemExit` on a starved subset, and creating the handshake before that
+    # point leaked 36 named semaphores per refusal -- a refusal that leaks is a
+    # refusal that costs the next run.
+    xr.create_semaphores(NONCE)
     procs = [mp.Process(target=rank_proc,
                         args=(g, r, ns.evidence, root, q, ns.self_test,
                               ns.max_tensors, ns.col_div, ns.single_runner,
@@ -619,14 +603,67 @@ def main() -> int:
           f"ranks_reported={len({(s[1], s[2]) for s in seen})}/6 "
           f"errors={len(errors)}")
 
-    xr.unlink_semaphores(NONCE)
+    return 0 if ok else 1
+
+
+def _teardown(root: str) -> None:
+    """Remove EVERYTHING this run made, on every exit path.
+
+    IN A `finally` BECAUSE A REFUSAL IS AN EXIT PATH TOO: `budget_manifests`
+    raises `SystemExit` on a starved subset, and with the teardown inline each
+    refusal left its root directory (and, before the ordering fix, 36 named
+    semaphores) behind. A refusal that leaks is a refusal that costs the next
+    run -- the same class as a test that does not sweep its own shm.
+    """
+    import shutil
+
+    try:
+        xr.unlink_semaphores(NONCE)
+    except BaseException:  # noqa: BLE001
+        pass
     try:
         wb.BounceSlots(NONCE, shm_root=root).unlink()
     except BaseException:  # noqa: BLE001
         pass
-    import shutil
     shutil.rmtree(root, ignore_errors=True)
-    return 0 if ok else 1
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--evidence", default="/spinning/evidence-665-f1/weg2xsn24_0912")
+    ap.add_argument("--self-test", action="store_true")
+    ap.add_argument("--single-runner", action="store_true",
+                    help="CAN-FAIL ARM: build the address book from the MAIN "
+                         "runner only, as weg2xsn24 shipped it. The draft "
+                         "head then has no address and the leg must refuse "
+                         "with W74 on fc.weight (dst_resolved=894/904)")
+    ap.add_argument("--entry", choices=("adapter", "library"),
+                    default="adapter",
+                    help="which entry point the bytes travel; the boot's is "
+                         "the adapter")
+    ap.add_argument("--col-div", type=int, default=1,
+                    help="divide every tensor's COLUMN count by N for "
+                         "materialisation, uniformly on both sides and only "
+                         "where the column count already agrees (i.e. never on "
+                         "a column cut). The ROW vector and the padding are "
+                         "untouched, so the routing under test is unchanged; "
+                         "this is a byte budget, not a change of arithmetic")
+    ap.add_argument("--max-tensors", type=int, default=0,
+                    help="materialise at most N tensors (0 = all that fit the byte "
+                         "budget, which IS the default form the xsn25 "
+                         "acceptance cites); "
+                         "the JOIN always sees every one")
+    ns = ap.parse_args()
+    root = f"/dev/shm/weg2-xchg-{NONCE}"
+    try:
+        return _run(ns)
+    except SystemExit as exc:
+        # A NAMED REFUSAL, printed as one line and exited 2 -- not a traceback,
+        # and not a silent 0.
+        print(str(exc))
+        return 2
+    finally:
+        _teardown(root)
 
 
 if __name__ == "__main__":
