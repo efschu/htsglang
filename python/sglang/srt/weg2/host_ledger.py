@@ -415,6 +415,21 @@ def source_metal_deviation(boot_tag: str) -> str:
 #: provenance table that only keeps the maximum cannot show that the estimator
 #: is improving.
 RUN_PEAK_RESIDUAL_GIB = {"weg2sb4": 5.16, "weg2rg6": -0.11, "weg2sb5c": 1.54}
+
+#: #1350e THE SAME QUANTITY, RE-MEASURED ON RATCHET-PRICED PREDICTIONS.
+#: ``measured peak - (predicted peak + charged flip ratchet)`` for the five
+#: boots #1350 attributed the term on -- the only rows in existence whose
+#: prediction carries it. NOT a hand-edit of the table above: that one stays
+#: exactly as it was and still binds every arm that does not charge the ratchet.
+RUN_PEAK_RESIDUAL_RATCHET_GIB = {
+    "weg2xsn20": -1.513, "weg2xsn21b": -0.170, "weg2xsn22": 0.375,
+    "weg2xsn23": 0.908, "weg2xsn24": 0.046,
+}
+#: Measured STEADY-STATE drift (#1276), MiB/min, MAX of the recorded 0.01..0.07
+#: band. Two orders below IDLE_ANON_DRIFT_MIB_PER_MIN_DEFAULT because that one
+#: is the sb4 LOAD-era default; this is the quiet serving rate the ratchet-era
+#: residual's own window has to be integrated over.
+RATCHET_RESIDUAL_DRIFT_MIB_PER_MIN = 0.07
 RESIDUAL_WINDOW_MIN = 60.0
 
 #: #1269 / user order 2026-09-08 ("kein uebertreten mehr der schwelle. fuehrt
@@ -751,6 +766,41 @@ def resolve_margin(
         residual = max(0.0, residual)
         r_src = f"RING-ERA max (measured peak - predicted) over {sorted(RUN_PEAK_RESIDUAL_GIB)}, binding {rb}"
         if flip_ratchet_charged_gib is not None:
+            # #1350e: ON A RATCHET-PRICED ARM THE RESIDUAL IS RE-MEASURED, and
+            # the rows it is measured from are the ONLY ones in existence that
+            # were graded against a prediction carrying the ratchet: the five
+            # 0912 replays (xsn20 -1.513, xsn21b -0.170, xsn22 +0.375, xsn23
+            # +0.908, xsn24 +0.046). MAX over them, clamped at >= 0, exactly the
+            # rule the sb4 row is chosen by. sb4's 5.16 stays for every arm that
+            # does NOT charge the ratchet -- it was measured with the ratchet
+            # UNCHARGED and therefore contains it, which is why summing the two
+            # is refused by name (W95).
+            #
+            # Its own window is added rather than assumed away: sb4's row came
+            # from a 60-minute idle window, these came from ~10-minute boots, so
+            # the measured STEADY-STATE drift (#1276: 0.01..0.07 MiB/min; the
+            # MAX is taken) is integrated over the PLANNED window and printed
+            # with both factors. At 0.07 MiB/min x 45 min that is 0.003 GiB --
+            # small, and stated rather than dropped, because a term omitted for
+            # being small is how the ratchet itself stayed invisible.
+            residual = max(0.0, max(RUN_PEAK_RESIDUAL_RATCHET_GIB.values()))
+            _drift_gib = (
+                RATCHET_RESIDUAL_DRIFT_MIB_PER_MIN * float(window_min) / 1024.0
+            )
+            residual += _drift_gib
+            r_src = (
+                f"RATCHET-PRICED: max over the five #1350 replays "
+                f"{ {k: round(v, 3) for k, v in sorted(RUN_PEAK_RESIDUAL_RATCHET_GIB.items())} } "
+                f"= {max(RUN_PEAK_RESIDUAL_RATCHET_GIB.values()):+.3f} GiB, the only "
+                f"rows graded against a prediction that CHARGED the ratchet, plus "
+                f"measured steady-state drift {RATCHET_RESIDUAL_DRIFT_MIB_PER_MIN:.2f} "
+                f"MiB/min (#1276 max) x {float(window_min):.0f} min planned window = "
+                f"{_drift_gib:.3f} GiB. The pre-ratchet rows "
+                f"{sorted(RUN_PEAK_RESIDUAL_GIB)} (binding weg2sb4 5.16) are "
+                f"DELIBERATELY NOT USED here: each was measured with the ratchet "
+                f"UNCHARGED and therefore contains it, and summing them with the "
+                f"charged term is refused by name (W95)"
+            )
             # #1350: RE-DERIVED, AND THE DERIVATION SAYS WHY IT DOES NOT MOVE.
             # Under ratchet pricing each 0912 boot's residual falls by the
             # charged term (weg2xsn20 +1.648 -> -1.513, xsn21b +1.695 -> -0.170,
@@ -1791,11 +1841,33 @@ def run_origin_gib(
     # and is byte-identical for every single-budget record. The sidecar is
     # append-only, so the reader is the only place this can be corrected for a
     # record already on disk -- and the record blocking the next boot is one.
-    _repriced = [
-        (record_run_residual_gib(e), g, e)
-        for g, e in (record or {}).items()
-        if isinstance(e, dict) and e.get("run_residual_gib") is not None
-    ]
+    # #1350e: A MID-FLIP RUN-MOMENT SAMPLE IS NOT AN ORIGIN WHEN A LAUNCH
+    # READING EXISTS.  The front samples a group's residual at its FIRST SLEEP,
+    # i.e. inside a flip, so that reading has already realised the permanent
+    # step `flip_ratchet_gib` charges separately -- measured on weg2xsn24: the
+    # winning floor 7.49 GiB was taken at 19:44:31Z, THREE SECONDS before that
+    # boot's `WEG2-FLIP done epoch=2`.  Using it AND charging the ratchet is the
+    # double count W95 refuses; using the launch-moment reading instead is not a
+    # relaxation but the only reading of the two that is in the right moment --
+    # the origin is defined as what the box holds BEFORE this arm spends, and a
+    # mid-flip sample is after.  The rejected figure is PRINTED, never dropped.
+    _rejected: List[str] = []
+    _repriced = []
+    for g, e in (record or {}).items():
+        if not isinstance(e, dict) or e.get("run_residual_gib") is None:
+            continue
+        _ep = e.get("sampled_at_flip_epoch")
+        _mid = int(_ep) >= 1 if _ep is not None else bool(e.get("interleaved"))
+        if _mid and cg_nonreclaim_gib is not None:
+            _rejected.append(
+                f"{float(e['run_residual_gib']):.2f} (boot "
+                f"{e.get('boot_tag', '?')}, group {g}, "
+                + (f"sampled_at_flip_epoch={int(_ep)}" if _ep is not None
+                   else "interleaved=True")
+                + ")"
+            )
+            continue
+        _repriced.append((record_run_residual_gib(e), g, e))
     residuals = [
         (v, g, e, corr) for (v, corr), g, e in _repriced if v is not None
     ]
@@ -1856,6 +1928,20 @@ def run_origin_gib(
                 + ": this floor was measured DURING a flip and therefore "
                 "already contains the permanent step `flip_ratchet_gib` prices"
             )
+    elif _rejected:
+        # #1350e: A REJECTED SAMPLE IS NOT "NO SAMPLE". Falling through to the
+        # dk7 stand-in here would replace a 7.49 GiB mid-flip reading with a
+        # 24.50 GiB reading of ANOTHER BOOT -- a worse origin than the one just
+        # refused, and a silent one. This line HAS a launch reading (the branch
+        # above guarantees it) and that is the honest origin.
+        floor = cg_nonreclaim_gib
+        floor_src = (
+            "no run-moment residual survives: every stored sample of this line was "
+            "measured DURING a flip, so the launch-moment reading stands alone "
+            "(#1350e). The dk7 stand-in is NOT used here -- it answers 'no record "
+            "at all', not 'the record was refused', and at 24.50 GiB it would be a "
+            "worse origin than the reading just rejected"
+        )
     else:
         floor = dk7_run_residual_gib()
         floor_src = (
@@ -1864,8 +1950,18 @@ def run_origin_gib(
             f"S={DK7_ARM_S_GB} M={DK7_ARM_M_MIB} minus the measured image minus the "
             f"store's measured content {DK7_QUIET_STORE_USED_GIB:.2f} GiB"
         )
+    _rej = (
+        " -- run-moment sample(s) " + ", ".join(_rejected)
+        + " REJECTED: interleaved, i.e. measured DURING a flip, so they already "
+        "contain the permanent step `flip_ratchet_gib` charges separately (#1350e)"
+        if _rejected else ""
+    )
     if cg_nonreclaim_gib >= floor:
-        return cg_nonreclaim_gib, (
+        return cg_nonreclaim_gib, _rej and (
+            f"the launch-moment non-reclaimable reading {cg_nonreclaim_gib:.2f} GiB "
+            f"[source=launch]{_rej}; the remaining run-moment residual floor is "
+            f"{floor:.2f} GiB [{floor_src}]"
+        ) or (
             f"the launch-moment non-reclaimable reading {cg_nonreclaim_gib:.2f} GiB, which is "
             f"AT OR ABOVE the run-moment residual floor {floor:.2f} GiB [{floor_src}]"
         )
@@ -3591,12 +3687,14 @@ def choose(
             # leaves standing (sb4 5.16) must be RE-MEASURED on ratchet-priced
             # boots before it can be trusted at this bound. None exists yet.
             + (
-                "[#1350: transient OUT of the boot margin because run_peak now "
-                f"CHARGES the ratchet -- bound {87.30:.2f} -> {hard_bound_gib:.2f} "
-                "GiB. HONEST LIMIT: the residual row left standing (weg2sb4 5.16, "
-                "60-min idle window) was measured with the ratchet UNCHARGED and "
-                "has NOT been re-measured on a ratchet-priced boot; until it is, "
-                "this bound is provisional in the funding direction] "
+                "[#1350/#1350e: transient OUT of the boot margin because run_peak "
+                f"now CHARGES the ratchet, and the residual is RE-MEASURED on "
+                f"ratchet-priced predictions -- bound {87.30:.2f} -> "
+                f"{hard_bound_gib:.2f} GiB. Both moves are one-way in the FUNDING "
+                "direction, so both are stated here: the residual rows are the "
+                "five #1350 replays (max +0.908, weg2xsn23) plus their own "
+                "measured steady-state drift, and the pre-ratchet weg2sb4 5.16 "
+                "row is deliberately not summed with the charged term (W95)] "
                 if not margin.transient_in_boot else ""
             )
             + "=> "
