@@ -345,9 +345,6 @@ def rank_proc(group, rank, evidence, root, q, self_test, max_tensors,
     flip leg travels.
     """
     try:
-        import torch
-
-        from sglang.srt.managers.scheduler_components import weight_updater as wu
         from test_weg2_xchg_transport_1273 import FakeDeviceOps
 
         os.environ[xm.DIR_ENV] = manifest_dir
