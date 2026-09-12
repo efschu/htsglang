@@ -4989,6 +4989,15 @@ def choose_host_ledger(
         cg_ceiling_source=cg_ceiling_source,
         cg_oom_kill=cg["oom_kill"],
         measured_record=record,
+        # #1350 THE FLIP RATCHET, RESOLVED AT THE ONE CALL SITE THAT ALREADY
+        # KNOWS THE BOOT -- the same placement as `xchg_bounce_host_bytes` and
+        # `ring_absent_by_design` above, and for the same reason: the ledger
+        # never opens the sidecar behind its caller's back, and the REFUSAL
+        # (W94 Weg2HostFlipRatchetUnmeasured) has to be reachable from here or
+        # an absent measurement becomes a silent 0 in the run peak. `record` is
+        # the dict this function already read; the front writes the field into
+        # it at `WEG2-FLIP done epoch=2`.
+        flip_ratchet=host_ledger.resolve_flip_ratchet_gib(record),
         # #1273 S6: the exchange's own pinned host carrier.  The ARM STRINGS
         # decide it here, at the one ledger call site, and not inside the
         # ledger -- `WEIGHT_SOURCE_CHOICES` is this module's, and a ledger that
