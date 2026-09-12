@@ -160,7 +160,8 @@ class ManifestPiece:
         from sglang.srt.weg2 import weight_exchange_shadow as sh
 
         return sh.manifest_entry(self.param_name, self.tensor_class,
-                                 self.rows_full, self.cols_full, self.itemsize)
+                                 self.rows_full, self.cols_full, self.itemsize,
+                                 region=region_of_tag(self.tag))
 
     def as_json(self) -> Dict[str, object]:
         return {
@@ -206,6 +207,12 @@ class RankManifest:
     @property
     def by_name(self) -> Dict[str, ManifestPiece]:
         return {p.param_name: p for p in self.pieces}
+
+    @property
+    def by_region_name(self) -> Dict[Tuple[str, str], ManifestPiece]:
+        """THE IDENTITY MAP. `by_name` cannot be one once two runners of a
+        rank share a parameter name, which weg2xsn25 measured eight times."""
+        return {(region_of_tag(p.tag), p.param_name): p for p in self.pieces}
 
     def as_json(self) -> Dict[str, object]:
         return {
@@ -694,11 +701,17 @@ def join_manifests(
                 f"gap in it would shift every shard boundary."
             )
 
-    pp_by_name: Dict[str, Tuple[int, ManifestPiece]] = {}
+    # KEYED BY (REGION, NAME) at this site too, so all four share ONE key
+    # type. With the region cut running before the join this is belt and
+    # braces on the product path -- and it is the site that makes the key
+    # honest for any caller that joins unfiltered manifests (the replay's own
+    # cost pass does exactly that).
+    pp_by_name: Dict[Tuple[str, str], Tuple[int, ManifestPiece]] = {}
     pp_card_by_rank = {m.rank: m.card for m in pp}
     for man in pp:
         for piece in man.pieces:
-            prior = pp_by_name.get(piece.param_name)
+            nkey = (region_of_tag(piece.tag), piece.param_name)
+            prior = pp_by_name.get(nkey)
             if prior is not None and prior[1].key != piece.key:
                 raise wx.Weg2XchgPlanDisagree(
                     f"W68 Weg2XchgPlanDisagree: {piece.param_name} is "
@@ -708,27 +721,29 @@ def join_manifests(
                     f"disagreeing holders leave the plan free to pick either."
                 )
             if prior is None:
-                pp_by_name[piece.param_name] = (man.rank, piece)
+                pp_by_name[nkey] = (man.rank, piece)
 
-    names: List[str] = []
+    names: List[Tuple[str, str]] = []
     seen = set()
     for man in tp:
         for piece in man.pieces:
-            if piece.param_name not in seen:
-                seen.add(piece.param_name)
-                names.append(piece.param_name)
+            nkey = (region_of_tag(piece.tag), piece.param_name)
+            if nkey not in seen:
+                seen.add(nkey)
+                names.append(nkey)
     names.sort()
 
     tensors: List[JoinedTensor] = []
     unsourced: List[str] = []
-    for name in names:
-        rows = [m.by_name.get(name) for m in tp]
+    for nkey in names:
+        region, name = nkey
+        rows = [m.by_region_name.get(nkey) for m in tp]
         if any(p is None for p in rows):
             # A tensor only SOME TP ranks hold is not a cut this plan can name;
             # it is reported rather than planned over the ranks that have it.
             unsourced.append(name)
             continue
-        found = pp_by_name.get(name)
+        found = pp_by_name.get(nkey)
         if found is None:
             unsourced.append(name)
             continue

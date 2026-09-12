@@ -216,6 +216,17 @@ def budget_manifests(mans, max_tensors: int):
     SELECTED IN THE PARENT so the six children cannot disagree about the
     population: six plans that differ is the one thing this slice prevents.
     """
+    # THE SAME REGION FILTER AS THE LEG AND THE CHILD. Joining unfiltered now
+    # REFUSES by name (`lm_head.weight` has no counterpart in P's draft
+    # region), which is the identity cut working: a draft tensor needs a draft
+    # source, and that is the DRAFT leg's job.
+    mans = [xm.RankManifest(
+        group=m.group, rank=m.rank, card=m.card, region_tag=m.region_tag,
+        boot_token=m.boot_token, tp_rank=m.tp_rank, pp_rank=m.pp_rank,
+        pieces=tuple(p_ for p_ in m.pieces
+                     if xm.region_of_tag(p_.tag) == "weights"))
+        for m in mans]
+    mans = [m for m in mans if m.pieces]
     join = xm.join_manifests(mans, pp_group="P", tp_group="D")
 
     def rank_costs(t):
@@ -413,6 +424,19 @@ def rank_proc(group, rank, evidence, root, q, self_test, max_tensors,
         os.environ["SGLANG_WEG2_GROUP"] = group
 
         mans = xm.load_manifests(manifest_dir, boot_token=BOOT_TOKEN)
+        # THE SAME REGION FILTER THE LEG APPLIES. Without it the replay's own
+        # join (which sizes the tensors and computes the expectation) saw BOTH
+        # runners while the PLAN saw one -- and for the eight names both
+        # runners carry, the expectation described a different tensor than the
+        # plan moved. Measured as `tensors_bad=2` on exactly
+        # model.layers.0.{q,k}_norm.weight, the drafter's own.
+        mans = [xm.RankManifest(
+            group=m.group, rank=m.rank, card=m.card, region_tag=m.region_tag,
+            boot_token=m.boot_token, tp_rank=m.tp_rank, pp_rank=m.pp_rank,
+            pieces=tuple(p_ for p_ in m.pieces
+                         if xm.region_of_tag(p_.tag) == "weights"))
+            for m in mans]
+        mans = [m for m in mans if m.pieces]
         join = xm.join_manifests(mans, pp_group="P", tp_group="D")
 
         ops = FakeDeviceOps(root, rank=(rank if group == "D" else 3 + rank))
@@ -561,32 +585,30 @@ def _run(ns) -> int:
     src_mans = (synthetic_manifests() if ns.self_test
                 else load_manifests(ns.evidence))
     src_mans = narrow(src_mans, ns.col_div)
-    src_mans = budget_manifests(src_mans, ns.max_tensors)
-    # THE CAN-FAIL ARM MODELS THE PRE-FIX PRODUCT, and it needs no production
-    # knob to do it. Before the region cut a leg carried every runner's pieces
-    # in ONE region, so the cut could not separate them and the single-runner
-    # address book had no home for the draft head's. Re-tagging the draft
-    # pieces into the main region reproduces exactly that state -- which is
-    # what weg2xsn25 measured as `dst_resolved=893/904` + W74 on fc.weight,
-    # and (per the operator's causality question) the W68 that follows it.
-    for m in src_mans:
-        pieces = m.pieces
-        region = m.region_tag
-        if ns.single_runner and str(m.region_tag) == "weights_draft":
-            pieces = tuple(
+    # THE CAN-FAIL RE-TAG RUNS BEFORE THE BUDGET, and the ordering is the whole
+    # arm: the budget now filters by region, so a re-tag applied afterwards
+    # would find the draft pieces already gone and the arm would read MATCH --
+    # a can-fail that cannot fail.
+    if ns.single_runner:
+        src_mans = [xm.RankManifest(
+            group=m.group, rank=m.rank, card=m.card, region_tag=m.region_tag,
+            boot_token=m.boot_token, tp_rank=m.tp_rank, pp_rank=m.pp_rank,
+            pieces=tuple(
                 xm.ManifestPiece(
                     param_name=p_.param_name, tensor_class=p_.tensor_class,
                     rows_full=p_.rows_full, cols_full=p_.cols_full,
                     itemsize=p_.itemsize, tag="weights", nbytes=p_.nbytes)
-                for p_ in m.pieces)
-            # THE FILE NAME KEEPS ITS OWN region_tag: the region cut reads the
-            # PIECE's tag, while the name's third axis exists so two runners of
-            # one rank cannot collide (weg2xsn20/22). Changing both made the
-            # overwrite ratchet fire -- correctly.
+                for p_ in m.pieces))
+            for m in src_mans]
+    src_mans = budget_manifests(src_mans, ns.max_tensors)
+    for m in src_mans:
+        # THE FILE NAME KEEPS ITS OWN region_tag: the region cut reads the
+        # PIECE's tag, while the name's third axis exists so two runners of one
+        # rank cannot collide (weg2xsn20/22).
         xm.write_rank_manifest(xm.RankManifest(
-            group=m.group, rank=m.rank, card=m.card, region_tag=region,
+            group=m.group, rank=m.rank, card=m.card, region_tag=m.region_tag,
             boot_token=BOOT_TOKEN, tp_rank=m.tp_rank, pp_rank=m.pp_rank,
-            pieces=pieces), mdir)
+            pieces=m.pieces), mdir)
     print(f"  manifests={len(src_mans)} entry={ns.entry} "
           f"address_book="
           f"{'single-runner (CAN-FAIL ARM)' if ns.single_runner else 'both runners'}")

@@ -2123,7 +2123,7 @@ def _manifest_row_off(row: int) -> int:
 
 
 def manifest_entry(name: str, cls: str, rows_full: int, cols_full: int,
-                   itemsize: int) -> Tuple[int, int, int, int, int]:
+                   itemsize: int, region: str = "") -> Tuple[int, int, int, int, int]:
     """One parameter's POINTER-FREE, PROCESS-STABLE identity.
 
     The two hashes are ``blake2b`` (:func:`weight_exchange_region.epoch_hash`)
@@ -2145,7 +2145,23 @@ def manifest_entry(name: str, cls: str, rows_full: int, cols_full: int,
     # printed as the hex hash, never guessed, and the census stays complete
     # because the counts and bytes come from the entries themselves.
     _MANIFEST_CLASS_NAMES.setdefault(cls_hash, cls)
-    return (xr.epoch_hash(str(name)), cls_hash,
+    # #1330: THE REGION IS PART OF THE NAME'S HASH, not a sixth field.
+    #
+    # The row is a fixed-width struct another process reads, so the arity may
+    # not change -- and it does not need to: what must be unique is the
+    # IDENTITY, and folding the region into the name's hash makes it so at
+    # every one of the four sites that share this key.
+    #
+    # WHY IT IS NEEDED, measured on weg2xsn25: the drafter is a one-layer
+    # Qwen3_5 block, so EIGHT of P rank 0's nineteen draft pieces carry the
+    # same `param_name` as main-model tensors. A name is not an identity
+    # across runners, and two of them (`q_norm`, `k_norm`) were still reading
+    # MISMATCH at the desk after the region cut alone.
+    #
+    # An empty region keeps the historical key byte-for-byte, so every caller
+    # that has only one region is unchanged.
+    keyed = str(name) if not region else f"{region}\0{name}"
+    return (xr.epoch_hash(keyed), cls_hash,
             int(rows_full), int(cols_full), int(itemsize))
 
 
