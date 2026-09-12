@@ -227,25 +227,77 @@ def budget_manifests(mans, max_tensors: int):
             for r in range(len(t.tp_widths)))
         return max(whole, 1), max(shard, 1)
 
-    keep, p_used, d_used, dropped = set(), 0, 0, 0
-    for t in sorted(join.tensors, key=lambda t: sum(rank_costs(t))):
-        w, sh = rank_costs(t)
-        # BOTH SIDES ARE BOUNDED, because they fill on different sets: a P
-        # stage holds whole tensors of its own layers, a D rank a shard of
-        # EVERY tensor. The D side is the binding one and was the one that
-        # asserted mid-leg.
-        if p_used + w > FAKE_DEV_BUDGET or d_used + sh > FAKE_DEV_BUDGET:
-            dropped += 1
-            continue
-        p_used += w
-        d_used += sh
-        keep.add(t.param_name)
-    if max_tensors and len(keep) > max_tensors:
-        keep = set(sorted(keep)[:max_tensors])
+    # STRATIFIED BY SOURCE RANK, and this is the defect the train seat's call
+    # exposed. Picking globally cheapest-first put the whole subset on ONE P
+    # stage: the DEFAULT form read
+    #   `the joined plan has 72 descriptors and none with src_rank=2`
+    # on P ranks 1 and 2 -- `ranks_reported=4/6` -- while my own call with
+    # `--col-div 512` saw all three stages and read MATCH. Two invocations of
+    # one script, and the SELECTION was the whole difference. A filter that can
+    # starve a rank grades a lane it never exercised.
+    #
+    # Round-robin over the stages keeps every source rank represented, which is
+    # what makes a six-rank replay a six-rank replay.
+    by_stage = {}
+    for t in join.tensors:
+        by_stage.setdefault(int(t.pp_stage), []).append(t)
+    for st in by_stage:
+        by_stage[st].sort(key=lambda t: sum(rank_costs(t)))
+    keep, p_used, d_used, dropped = set(), {}, 0, 0
+    order = sorted(by_stage)
+    idx = {st: 0 for st in order}
+    while True:
+        progressed = False
+        for st in order:
+            if idx[st] >= len(by_stage[st]):
+                continue
+            t = by_stage[st][idx[st]]
+            idx[st] += 1
+            progressed = True
+            w, sh = rank_costs(t)
+            # BOTH SIDES BOUNDED, SEPARATELY: a P stage holds whole tensors of
+            # its OWN layers (cap per stage) while a D rank holds a shard of
+            # EVERY tensor (cap global).
+            if (p_used.get(st, 0) + w > FAKE_DEV_BUDGET
+                    or d_used + sh > FAKE_DEV_BUDGET):
+                dropped += 1
+                continue
+            p_used[st] = p_used.get(st, 0) + w
+            d_used += sh
+            keep.add(t.param_name)
+            if max_tensors and len(keep) >= max_tensors:
+                progressed = False
+                break
+        if not progressed:
+            break
+    p_used_max = max(p_used.values()) if p_used else 0
+
+    # COVERAGE PER RANK AND PER DIRECTION, because those are the two things a
+    # leg needs to exist at all. Under `pp_to_tp` the SOURCE ranks are the P
+    # stages; under `tp_to_pp` they are the D ranks, which hold a shard of
+    # every kept tensor.
+    kept_t = [t for t in join.tensors if t.param_name in keep]
+    stages_full = sorted({int(t.pp_stage) for t in join.tensors})
+    stages_kept = sorted({int(t.pp_stage) for t in kept_t})
+    d_full = sorted(range(len(join.cards)))
+    d_kept = sorted({r for t in kept_t for r in range(len(t.tp_widths))
+                     if t.tp_widths[r] > 0})
+    if stages_kept != stages_full or d_kept != d_full:
+        raise SystemExit(
+            f"WEG2-XCHG-LEG-REPLAY REFUSED reason=subset-starves-a-rank "
+            f"subset covers pp_to_tp src ranks {set(stages_kept)} of "
+            f"{set(stages_full)} and tp_to_pp src ranks {set(d_kept)} of "
+            f"{set(d_full)}; kept={len(keep)} of {len(join.tensors)} "
+            f"cap={FAKE_DEV_BUDGET} max_tensors={max_tensors} -- a source rank "
+            f"with no descriptor cannot deposit, so the run would grade four "
+            f"ranks of six and call it a result. THIS IS THE SELECTION'S "
+            f"DEFECT, NOT THE PLAN'S: the full join covers {set(stages_full)}. "
+            f"Raise --max-tensors or lower --col-div.")
     print(f"  BUDGET kept={len(keep)} dropped={dropped} of {len(join.tensors)} "
-          f"p_bytes={p_used} d_bytes={d_used} cap={FAKE_DEV_BUDGET} -- the "
-          f"dropped tensors are NOT byte-routed here; their byte path stays a "
-          f"metal question")
+          f"pp_to_tp_src_ranks={stages_kept}/{stages_full} "
+          f"tp_to_pp_src_ranks={d_kept}/{d_full} p_bytes_max={p_used_max} "
+          f"d_bytes={d_used} cap={FAKE_DEV_BUDGET} -- the dropped tensors are "
+          f"NOT byte-routed here; their byte path stays a metal question")
     out = []
     for m in mans:
         out.append(xm.RankManifest(
@@ -475,8 +527,10 @@ def main() -> int:
                          "a column cut). The ROW vector and the padding are "
                          "untouched, so the routing under test is unchanged; "
                          "this is a byte budget, not a change of arithmetic")
-    ap.add_argument("--max-tensors", type=int, default=24,
-                    help="materialise at most N tensors (0 = all); "
+    ap.add_argument("--max-tensors", type=int, default=0,
+                    help="materialise at most N tensors (0 = all that fit the byte "
+                         "budget, which IS the default form the xsn25 "
+                         "acceptance cites); "
                          "the JOIN always sees every one")
     ns = ap.parse_args()
 
