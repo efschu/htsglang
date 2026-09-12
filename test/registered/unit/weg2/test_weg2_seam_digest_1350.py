@@ -90,6 +90,7 @@ for exactly that reason -- a module-level import would collapse the whole file
 into one collection error and prove nothing per name).
 """
 
+import ast
 import importlib
 import inspect
 import os
@@ -198,20 +199,41 @@ def _reading(mod, stage, inventory, *, tags=("weights",), rank=1, card=2, epoch=
 # ===========================================================================
 
 
+def _code_identifiers(module):
+    """Every name the module's CODE uses -- docstrings and comments excluded.
+
+    ON THE AST AND NOT A TEXT SCAN, and the reason is measured rather than
+    stylistic.  The first version of this test grepped the source and went red
+    on the module's OWN DOCSTRING, which says in prose that it no longer walks
+    ``model.named_parameters()``.  That is the #995 prose-marker trap one level
+    up -- an explanation of what was removed read as the thing itself -- and it
+    is the same reason #1273 B4f moved its wiring pins onto ``main()``'s AST
+    after a text scan let a mutant through.
+    """
+    tree = ast.parse(inspect.getsource(module))
+    out = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Attribute):
+            out.add(node.attr)
+        elif isinstance(node, ast.Name):
+            out.add(node.id)
+    return out
+
+
 def test_the_grader_reads_the_producer_and_builds_no_second_inventory():
-    """The operator's direction of 2026-09-12, asserted on the module's text.
+    """The operator's direction of 2026-09-12, asserted on the module's CODE.
 
     A private ``named_parameters()`` walk here would be a second reading of a
     fact the loader already decided and ``card_inventory`` already publishes --
     the W80/W84/W19 family.  The producer is named; a copy of it is not.
     """
-    src = inspect.getsource(_mod())
-    assert "named_parameters" not in src, (
+    used = _code_identifiers(_mod())
+    assert "named_parameters" not in used, (
         "the grader walks the live model itself: that is the second inventory "
         "the placement re-keying removed"
     )
-    assert "card_inventory" in src
-    assert "manifest_entry" in src and "tensor_class" in src
+    assert "card_inventory" in used
+    assert "manifest_entry" in used and "tensor_class" in used
 
 
 def test_card_inventory_is_the_one_producer_the_manifest_also_uses():
@@ -445,12 +467,33 @@ def test_the_launcher_publishes_the_arm_only_when_the_flag_is_set():
     from sglang.srt.weg2 import launcher
 
     src = inspect.getsource(launcher)
-    assert "seam_digest.ENV_ARM" in src
     assert "--weg2-seam-digest" in src
     # POPPED, not merely unset: the pop list is what makes an inherited value
     # harmless, and it is the half that is easy to forget.
-    pop_block = src[src.index("for key in (\"SGLANG_WEG2_XCHG_REGION\""):]
-    assert "seam_digest.ENV_ARM" in pop_block[: pop_block.index("):")]
+    #
+    # ON THE AST (#1273 B4f's lesson): a text scan for the name would also
+    # match the comment that explains the pop, so it could pass on a tree where
+    # the entry had been removed and only its justification left standing.
+    tree = ast.parse(src)
+    popped = set()
+    published = False
+    for node in ast.walk(tree):
+        if isinstance(node, ast.For) and isinstance(node.iter, ast.Tuple):
+            body = ast.dump(ast.Module(body=node.body, type_ignores=[]))
+            if "'pop'" not in body:
+                continue
+            for element in node.iter.elts:
+                if isinstance(element, ast.Attribute):
+                    popped.add(f"{getattr(element.value, 'id', '?')}.{element.attr}")
+        if (isinstance(node, ast.Assign)
+                and isinstance(node.targets[0], ast.Subscript)
+                and isinstance(node.targets[0].slice, ast.Attribute)
+                and node.targets[0].slice.attr == "ENV_ARM"):
+            published = True
+    assert "seam_digest.ENV_ARM" in popped, (
+        f"the grader's env is not in the launcher's pop list: {sorted(popped)}"
+    )
+    assert published, "the launcher never publishes the grader's env"
 
 
 # ===========================================================================
@@ -545,24 +588,52 @@ def test_a_mismatch_is_a_named_refusal_not_a_log_line():
     assert mod.compare(before, _reading(mod, "after", _inventory(seed=7))).refusal() is None
 
 
+def _code_strings(path):
+    """Every string literal in a file that is NOT a docstring, with its line.
+
+    THE #995 RULE, IN THE INSTRUMENT INSTEAD OF IN THE READER'S MEMORY: a
+    W-code written in a COMMENT or a DOCSTRING is the code being TALKED ABOUT,
+    never a second holder of it.  The first version of this scan counted the
+    mint's own provenance comment ("W90 enumerated from ...") as a rival holder
+    and went red on a tree with exactly one holder.  Strings survive the filter
+    because ``W_CODE = "W90"`` and the launcher's help text are both real
+    holders and both are strings.
+    """
+    try:
+        tree = ast.parse(open(path, encoding="utf-8").read())
+    except (SyntaxError, UnicodeDecodeError):
+        return []
+    docs = set()
+    for node in ast.walk(tree):
+        body = getattr(node, "body", None)
+        if isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef,
+                             ast.AsyncFunctionDef)) and body:
+            first = body[0]
+            if (isinstance(first, ast.Expr)
+                    and isinstance(first.value, ast.Constant)
+                    and isinstance(first.value.value, str)):
+                docs.add(id(first.value))
+    return [
+        (node.lineno, node.value)
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Constant)
+        and isinstance(node.value, str)
+        and id(node) not in docs
+    ]
+
+
 def test_the_w_code_is_this_exception_and_no_other():
     """The #1263 census law, applied at the mint rather than after it."""
     _mod()
-    hits = set()
-    for root, _dirs, names in os.walk(
-        os.path.join(REPO_ROOT, "python", "sglang", "srt")
-    ):
-        for n in names:
-            if not n.endswith(".py"):
-                continue
-            with open(os.path.join(root, n), encoding="utf-8") as fh:
-                for line in fh:
-                    if re.search(r"\bW90\b", line):
-                        hits.add(re.sub(r"\s+", " ", line).strip())
-    assert hits, "W90 is not written anywhere: the refusal was never minted"
-    for line in hits:
-        assert "Weg2SeamDigestMismatch" in line or "W_CODE" in line, (
-            f"W90 names a second holder: {line}"
+    holders = []
+    for path in _py_files():
+        for lineno, value in _code_strings(path):
+            if re.search(r"\bW90\b", value):
+                holders.append((os.path.relpath(path, REPO_ROOT), lineno, value))
+    assert holders, "W90 is not written anywhere: the refusal was never minted"
+    for rel, lineno, value in holders:
+        assert "Weg2SeamDigestMismatch" in value or value.strip() == "W90", (
+            f"W90 names a second holder at {rel}:{lineno}: {value!r}"
         )
 
 
