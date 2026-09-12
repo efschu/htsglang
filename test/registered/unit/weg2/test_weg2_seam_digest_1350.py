@@ -189,10 +189,45 @@ def _rearena(inventory, rank: int = 1):
     return out
 
 
-def _reading(mod, stage, inventory, *, tags=("weights",), rank=1, card=2, epoch=4):
+def _reading(mod, stage, inventory, *, tags=("weights",), rank=1, card=2,
+             epoch=4, **kw):
     return mod.take_reading(
-        stage, inventory, group="P", rank=rank, card=card, tags=tags, epoch=epoch
+        stage, inventory, group="P", rank=rank, card=card, tags=tags,
+        epoch=epoch, **kw
     )
+
+
+#: The MTP/NEXTN draft shard, in its own tag.  Flipped like every other layer
+#: since B4k, and ungraded until the review named it (R4).
+_DRAFT_TENSORS = (
+    ("model.layers.0.self_attn.qkv_proj.weight", (32, 40), torch.bfloat16),
+    ("fc.weight", (40, 80), torch.float32),
+)
+
+
+def _draft_inventory(seed=41, rank=1):
+    from sglang.srt.managers.weg2_memory_saver import GPU_MEMORY_TYPE_WEIGHTS_DRAFT
+
+    out = []
+    for i, (name, shape, dtype) in enumerate(_DRAFT_TENSORS):
+        t = _tensor(shape, dtype, seed + i)
+        geom = wx.ParamGeom.of(
+            t, name=name, tag=GPU_MEMORY_TYPE_WEIGHTS_DRAFT,
+            shard_axis=wx.REPLICATED, shard_total=0, stage=int(rank),
+        )
+        out.append((geom, t))
+    return out
+
+
+def _fake_clock(values):
+    """A monotonic stub for the reading's own clock, so the budget is testable
+    without a slow machine -- the alternative is a sleep in a unit test."""
+    seq = list(values)
+
+    def _next():
+        return seq.pop(0) if len(seq) > 1 else seq[0]
+
+    return _next
 
 
 # ===========================================================================
@@ -805,13 +840,25 @@ class _FakeServerArgs:
 
 
 class _FakeModel:
-    def __init__(self, inventory):
+    """Accepts an INVENTORY (geom, tensor) or raw (name, tensor) pairs.
+
+    Both forms are needed: most tests build the inventory through the real
+    ``ParamGeom.of``, but the population tests must hand the producer a tensor
+    it will REFUSE, which by definition has no geometry.
+    """
+
+    def __init__(self, pairs):
         self._params = [
-            (geom.name, tensor) for geom, tensor in inventory
+            (p[0] if isinstance(p[0], str) else p[0].name, p[1]) for p in pairs
         ]
 
     def named_parameters(self):
         return list(self._params)
+
+
+class _FakeDraftRunner:
+    def __init__(self, model):
+        self.model = model
 
 
 class _FakeRunner:
@@ -822,6 +869,13 @@ class _FakeRunner:
 class _FakeWorker:
     def __init__(self, model):
         self.model_runner = _FakeRunner(model)
+
+
+class _FakeDraftWorker:
+    """The shape ``_get_draft_model_runner`` resolves (DFlash / FrozenKVMTP)."""
+
+    def __init__(self, model):
+        self.draft_model_runner = _FakeDraftRunner(model)
 
 
 class _Req:
@@ -846,9 +900,11 @@ def hooked(monkeypatch):
     monkeypatch.setattr(WU, "_weg2_server_args", lambda self: _FakeServerArgs(),
                         raising=True)
 
-    def _make(inventory):
+    def _make(inventory, draft=None):
         return wu.SchedulerWeightUpdaterManager(
-            tp_worker=_FakeWorker(_FakeModel(inventory)), draft_worker=None,
+            tp_worker=_FakeWorker(_FakeModel(inventory)),
+            draft_worker=(_FakeDraftWorker(_FakeModel(draft))
+                          if draft is not None else None),
             tp_cpu_group=None, memory_saver_adapter=None,
             flush_cache=lambda *a, **k: True, is_fully_idle=lambda *a, **k: True,
         )
@@ -1033,3 +1089,341 @@ def test_an_absent_inventory_is_unarmed_never_a_match():
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
+
+
+# ===========================================================================
+# ADOPTED FROM THE ADVERSARIAL REVIEW (REVIEW_DIGEST_1350_0912.md, 2026-09-12).
+#
+# The review ran ten tests against 4c0a427023: five RED (real defects -- S1/F2/
+# S2/F2/S3) and five GREEN that this suite simply did not have, each of which
+# kills a danger-direction mutant the 34-test suite let SURVIVE (MC, MU, MB,
+# MW, MP).  Both halves are adopted verbatim in substance: the red ones because
+# they name defects, the green ones because "the suite pins the interior of a
+# 2-D piece and nothing else" is itself the finding.
+#
+# The reviewer's own verdict on the survivors is recorded here so nobody
+# re-reads it as a product defect: the code on 4c0a427023 hashed 1-D pieces and
+# the edges CORRECTLY -- the five were TEST gaps, and a refactor (exactly the
+# F1 device-side rewrite below) is what they exist to catch.
+# ===========================================================================
+
+
+def test_two_empty_readings_must_not_grade_match():
+    """R1 -- green-by-vacancy in the PURE function.
+
+    The product path is guarded one level up (``card_inventory`` refuses an
+    empty walk), so this never fired in a boot; the function still graded a
+    population of zero as MATCH, which is the one answer it may never give.
+    """
+    mod = _mod()
+    verdict = mod.compare(_reading(mod, "before", []), _reading(mod, "after", []))
+    assert verdict.verdict != mod.VERDICT_MATCH, (
+        "compare() over ZERO pieces returned MATCH: a grade with no population"
+    )
+    assert verdict.verdict == mod.VERDICT_UNARMED
+    assert verdict.reason == mod.REASON_EMPTY
+
+
+def test_a_skipped_piece_is_counted_on_the_reading_line(hooked, caplog):
+    """R2 -- the docstring claimed a printed skip count; the code printed none.
+
+    Instrument-text-lies class A: a piece the producer refuses vanishes from
+    the graded population and the line says nothing, so MATCH covers a set the
+    reader cannot bound.
+    """
+    mod = _mod()
+    inv = _inventory()
+    pairs = [(g.name, t) for g, t in inv]
+    undescribable = torch.randn(64, 64).as_strided((8, 8), (2, 16))
+    assert undescribable.stride() == (2, 16)
+    with pytest.raises(Exception):
+        wx.ParamGeom.of(undescribable, name="x", tag="weights_0",
+                        shard_axis=wx.REPLICATED, shard_total=0, stage=1)
+    pairs.append(("model.layers.0.mlp.gate_proj.weight", undescribable))
+    m = hooked(pairs)
+    with caplog.at_level("INFO"):
+        m._weg2_seam_digest_before(_Req(), ["weights_0", "weights"])
+    line = [ln for ln in caplog.text.splitlines() if "stage=before" in ln]
+    assert line, caplog.text
+    assert m.weg2_seam_before.n_tensors == len(_TENSORS), "the skip did not happen"
+    assert re.search(r"\bn_skipped=1\b", line[0]), (
+        f"one piece was silently dropped and the line does not say so: {line[0]}"
+    )
+    assert re.search(r"\bn_walked=\d+\b", line[0])
+    assert re.search(r"\bbytes_skipped=\d+\b", line[0])
+    assert "undescribable" in line[0] or "W68" in line[0] or "skip_reasons=" in line[0]
+
+
+def test_a_colliding_key_is_refused_not_last_writer_wins():
+    """R3 -- two pieces under one key: the first vanished from the map.
+
+    Not reachable through ``nn.Module`` today (names are unique), so this is
+    hardening rather than a boot killer -- but the failure direction is a
+    corrupt piece hiding behind its twin, which is the one direction a grader
+    may not have.
+    """
+    mod = _mod()
+    g, t1 = _inventory()[0]
+    t2 = _tensor(t1.shape, t1.dtype, 99)
+    before = _reading(mod, "before", [(g, t1), (g, t2)])
+    t1_bad = t1.clone()
+    t1_bad[0, 0] = t1_bad[0, 0] + 1.0
+    after = _reading(mod, "after", [(g, t1_bad), (g, t2)])
+    assert before.digest != after.digest, "the folded digest DOES see the change"
+    verdict = mod.compare(before, after)
+    assert verdict.verdict != mod.VERDICT_MATCH, (
+        "a changed piece hid behind a key collision"
+    )
+
+
+def test_the_draft_runner_is_part_of_the_graded_population():
+    """R4 -- the MTP/NEXTN draft shard is flipped (B4k) and was ungraded."""
+    hook = _code_identifiers(_wu()._weg2_seam_inventory)
+    assert "draft_worker" in hook, (
+        "the seam inventory never reads the draft worker's model: the draft "
+        "shard the exchange moves (B4k) is ungraded"
+    )
+
+
+def test_the_draft_runner_pieces_are_actually_walked(hooked, caplog):
+    """R4, by EXECUTION rather than by identifier: the draft pieces are graded.
+
+    The AST pin above can be satisfied by naming the attribute and dropping the
+    result; this one counts the pieces.
+    """
+    mod = _mod()
+    main = _inventory()
+    draft = _draft_inventory()
+    m = hooked(main, draft=draft)
+    with caplog.at_level("INFO"):
+        m._weg2_seam_digest_before(_Req(), ["weights_0", "weights"])
+    assert m.weg2_seam_before is not None
+    assert m.weg2_seam_before.n_tensors == len(_TENSORS) + len(draft), (
+        "the draft runner's pieces are not in the graded population"
+    )
+    labels = " ".join(p.identity.label for p in m.weg2_seam_before.pieces)
+    assert "weights_draft" in labels
+
+
+def test_the_verdict_separates_paused_from_resident_pieces(hooked, caplog):
+    """R7 -- the verdict counted the whole family, not this leg's tags.
+
+    A tag that was never paused in this leg contributes MATCH by construction,
+    so ``n_tensors`` overstates what the exchange moved.
+    """
+    mod = _mod()
+    inv = _inventory()
+    m = hooked(inv)
+    with caplog.at_level("INFO"):
+        m._weg2_seam_digest_before(_Req(), ["weights_0"])
+        m.tp_worker = _FakeWorker(_FakeModel(_rearena(inv)))
+        m._weg2_seam_digest_after(_Req(), ["weights_0"])
+    verdict = [ln for ln in caplog.text.splitlines() if "stage=verdict" in ln]
+    assert verdict, caplog.text
+    assert re.search(r"\bn_in_leg=\d+\b", verdict[0]), verdict[0]
+    assert re.search(r"\bn_resident=\d+\b", verdict[0]), verdict[0]
+    # embed_tokens@weights was NOT paused in this leg
+    assert re.search(r"\bn_in_leg=3\b", verdict[0]), verdict[0]
+    assert re.search(r"\bn_resident=1\b", verdict[0]), verdict[0]
+
+
+def test_the_wake_hook_prints_the_named_absence_without_a_before(hooked, caplog):
+    """R5 -- kills MP (a wake without a pre-pause reading returning silently)."""
+    mod = _mod()
+    m = hooked(_inventory())
+    assert m.weg2_seam_before is None
+    with caplog.at_level("INFO"):
+        m._weg2_seam_digest_after(_Req(), ["weights_0"])
+    assert f"verdict={mod.VERDICT_UNARMED}" in caplog.text
+    assert f"reason={mod.REASON_ABSENT}" in caplog.text
+
+
+def test_a_flipped_element_in_a_1d_piece_is_a_mismatch():
+    """R6a -- kills MU (1-D pieces skipped): layernorms and INT8 weight_scale."""
+    mod = _mod()
+    before = _reading(mod, "before", _inventory())
+    landed = _rearena(_inventory())
+    ln = [t for g, t in landed if t.dim() == 1][0]
+    ln[-1] = ln[-1] + 1.0
+    verdict = mod.compare(before, _reading(mod, "after", landed))
+    assert verdict.verdict == mod.VERDICT_MISMATCH
+    assert any("input_layernorm" in p for p in verdict.moved), verdict.moved
+
+
+def test_a_flipped_last_element_of_a_2d_piece_is_a_mismatch():
+    """R6b -- kills MW (last column dropped) and MB (last row dropped)."""
+    mod = _mod()
+    before = _reading(mod, "before", _inventory())
+    landed = _rearena(_inventory())
+    t = landed[1][1]
+    t[-1, -1] = t[-1, -1] + 1.0
+    verdict = mod.compare(before, _reading(mod, "after", landed))
+    assert verdict.verdict == mod.VERDICT_MISMATCH
+    assert any("down_proj" in p for p in verdict.moved), verdict.moved
+
+
+def test_a_flipped_last_row_first_col_of_a_2d_piece_is_a_mismatch():
+    """R6c -- kills MB; the last row is a class of its own from the last column."""
+    mod = _mod()
+    before = _reading(mod, "before", _inventory())
+    landed = _rearena(_inventory())
+    t = landed[0][1]
+    t[-1, 0] = t[-1, 0] + 1.0
+    verdict = mod.compare(before, _reading(mod, "after", landed))
+    assert verdict.verdict == mod.VERDICT_MISMATCH
+
+
+def test_the_graded_count_equals_the_producers_walk(hooked, caplog):
+    """R8 -- kills MC (the hook hands the grader one piece fewer, both sides).
+
+    A shrunken population on BOTH sides reads as a clean MATCH; the only thing
+    that catches it is a count against the producer's own walk.
+    """
+    mod = _mod()
+    m = hooked(_inventory())
+    with caplog.at_level("INFO"):
+        m._weg2_seam_digest_before(_Req(), ["weights_0", "weights"])
+    assert m.weg2_seam_before.n_tensors == len(_TENSORS), (
+        f"graded {m.weg2_seam_before.n_tensors} of {len(_TENSORS)} pieces"
+    )
+    line = [ln for ln in caplog.text.splitlines() if "stage=before" in ln][0]
+    assert re.search(rf"\bn_graded={len(_TENSORS)}\b", line), line
+    assert re.search(rf"\bn_walked={len(_TENSORS)}\b", line), line
+
+
+# ===========================================================================
+# F1 -- THE COST OF THE GRADER IS ON THE FLIP'S CRITICAL PATH.
+#
+# The review's arithmetic: host blake2b measured 0.19 GB/s under foreign load
+# (~0.9-1.0 GB/s is the quiet-box reference for Zen 3), against a population
+# the module itself calls "~9.6 GiB per rank".  That is 10-54 s PER READING,
+# two readings per flip, all of it synchronous on the scheduler thread inside
+# the timed leg -- against `front._flip_stall_bound_s` (drain_deadline_s = 120 s
+# before the first measured flip) and the 120 s C14 credit budget the
+# co-located waking rank is fenced on.  The first armed flip could take the
+# boot down with WEG2-FLIP STALL -> deadman, with no byte wrong anywhere:
+# instrument-lies class A, with the grader as the defect.
+#
+# The fix is a DEVICE-SIDE, POSITION-SENSITIVE fold with ONE host sync per
+# reading.  Position-sensitive is the load-bearing half: `uint8_checksum`
+# (weights_arena.py, 12 callers) already does a device-side int64 SUM, and a
+# plain sum is PERMUTATION-BLIND -- a q<->k swap inside a fused qkv_proj has
+# the same sum.  These tests pin both halves.
+# ===========================================================================
+
+
+def test_the_digest_is_position_sensitive_not_a_plain_sum():
+    """THE REASON `uint8_checksum`'s sum cannot be reused as-is.
+
+    Same multiset of bytes, different order: a permutation-blind fold gives one
+    digest for both, and the q<->k class inside a fused parameter is exactly
+    that permutation.
+    """
+    mod = _mod()
+    a = torch.arange(0, 256, dtype=torch.float32).reshape(16, 16)
+    b = a.flip(0).contiguous()
+    assert a.sum() == b.sum(), "the fixture must hold the multiset fixed"
+    ga = wx.ParamGeom.of(a, name="p", tag="weights_0", shard_axis=wx.REPLICATED,
+                         shard_total=0, stage=1)
+    gb = wx.ParamGeom.of(b, name="p", tag="weights_0", shard_axis=wx.REPLICATED,
+                         shard_total=0, stage=1)
+    da, _ = mod.piece_digest(a)
+    db, _ = mod.piece_digest(b)
+    assert da != db, "the fold is permutation-blind: a row swap is invisible"
+    # and the same at reading level
+    ra = _reading(mod, "before", [(ga, a)])
+    rb = _reading(mod, "after", [(gb, b)])
+    assert mod.compare(ra, rb).verdict == mod.VERDICT_MISMATCH
+
+
+def test_two_swapped_words_inside_one_piece_are_a_mismatch():
+    """The finest position case: two elements exchanged, multiset unchanged."""
+    mod = _mod()
+    t = torch.arange(0, 64, dtype=torch.float32).reshape(8, 8)
+    u = t.clone()
+    u[0, 0], u[7, 7] = t[7, 7].clone(), t[0, 0].clone()
+    assert t.sum() == u.sum()
+    d1, _ = mod.piece_digest(t)
+    d2, _ = mod.piece_digest(u)
+    assert d1 != d2
+
+
+def test_a_truncated_piece_never_shares_a_digest_with_the_whole():
+    """Length is folded in, so dropping the tail cannot collide."""
+    mod = _mod()
+    t = torch.arange(0, 64, dtype=torch.float32).reshape(8, 8)
+    full, nb_full = mod.piece_digest(t)
+    short, nb_short = mod.piece_digest(t[:-1].contiguous())
+    assert full != short
+    assert nb_full > nb_short
+
+
+def test_the_reading_syncs_the_device_once_not_per_block(monkeypatch):
+    """ONE host sync per reading -- the whole point of the device-side fold.
+
+    Counted by instrumenting the module's own transfer helper, so this is a
+    behavioural pin and not a reading of the source.
+    """
+    mod = _mod()
+    calls = {"n": 0}
+    real = mod._drain_accumulators
+
+    def _counting(*a, **kw):
+        calls["n"] += 1
+        return real(*a, **kw)
+
+    monkeypatch.setattr(mod, "_drain_accumulators", _counting, raising=True)
+    inv = _inventory()
+    assert len(inv) > 1, "a single piece could not tell per-piece from per-reading"
+    r = _reading(mod, "before", inv, chunk_bytes=64)
+    assert r.n_tensors == len(inv)
+    assert calls["n"] == 1, (
+        f"the reading drained the device {calls['n']} times for "
+        f"{len(inv)} pieces at a 64-byte chunk: the sync is per block or per "
+        f"piece, not per reading"
+    )
+
+
+def test_the_reading_line_prices_itself_with_a_measured_rate():
+    """The cost must be ON the line: bytes, ms and GB/s, measured, per reading.
+
+    'ms=' alone was already there and was not enough -- a reader cannot turn it
+    into a rate without the denominator, and the rate is what the 120 s stall
+    bound has to be read against.
+    """
+    mod = _mod()
+    r = _reading(mod, "before", _inventory())
+    line = r.line()
+    assert re.search(r"\bbytes=\d+\b", line)
+    assert re.search(r"\bms=[0-9.]+\b", line)
+    assert re.search(r"\bGB_s=[0-9.]+\b", line), line
+    assert re.search(r"\bsyncs=1\b", line), line
+
+
+def test_a_reading_over_budget_refuses_by_name(monkeypatch):
+    """No silent continuation: a reading slower than the budget is a REFUSAL.
+
+    An armed boot whose grader exceeds the budget cannot produce a trustworthy
+    flip band and is on its way to WEG2-FLIP STALL; failing by name at the
+    first leg beats a deadman at 120 s with no byte wrong.
+    """
+    mod = _mod()
+    assert mod.READING_BUDGET_S == 2.0
+    monkeypatch.setattr(mod, "_now", _fake_clock([0.0, 5.0]), raising=True)
+    with pytest.raises(mod.Weg2SeamDigestBudgetExceeded) as exc:
+        _reading(mod, "before", _inventory())
+    assert mod.BUDGET_MARKER in str(exc.value)
+    assert "--weg2-seam-digest" in str(exc.value), "the remedy is not named"
+
+
+def test_the_budget_refusal_has_its_own_w_code():
+    mod = _mod()
+    assert mod.W_CODE_BUDGET != mod.W_CODE
+    assert mod.BUDGET_MARKER.startswith(mod.W_CODE_BUDGET + " Weg2SeamDigest")
+
+
+def test_a_reading_inside_budget_does_not_refuse(monkeypatch):
+    mod = _mod()
+    monkeypatch.setattr(mod, "_now", _fake_clock([0.0, 0.5]), raising=True)
+    r = _reading(mod, "before", _inventory())
+    assert r.n_tensors == len(_TENSORS)
