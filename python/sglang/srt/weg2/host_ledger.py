@@ -279,15 +279,31 @@ RING_ERA_FLIP_TRANSIENT_GIB = {"weg2rg2": 1.10, "weg2rg3": 2.88}
 #: TMPFS, which #1236 moved to disk, so the binding row prices bytes the run
 #: moment no longer holds in this cgroup at all.  Measured in the bound's own
 #: currency (``anon+shmem+slab_unreclaimable``, the 1 Hz
-#: ``gpu-arb/weg2/hostsample_weg2xsn*.csv`` series), the flip transient is
-#: GONE, exactly as C19 predicts -- the region is preallocated at Sigma H and
-#: the legs copy through it, so a flip allocates nothing:
+#: ``gpu-arb/weg2/hostsample_weg2xsn*.csv`` series), the LOCAL transient reads
+#: at or below zero:
 #:   weg2rg6  (2026-09-08, 20 flips) "Transient: no rise detected" (its record)
 #:   weg2xsn19 (2026-09-11, 8 flips) max LOCAL transient **-0.019 GiB**
 #:   weg2xsn20 (2026-09-11, 8 flips) max LOCAL transient **-0.023 GiB**
 #: LOCAL = max inside the flip window minus the HIGHER of its two 12 s
-#: shoulders, per flip.  NEGATIVE ON 16 OF 16 FLIPS: the series is a slow
-#: monotone creep and no flip spikes above it.
+#: shoulders, per flip.  NEGATIVE ON 16 OF 16 FLIPS.
+#:
+#: #1350 WITHDRAWS THE SENTENCE THIS COMMENT USED TO DRAW FROM THOSE ROWS.
+#: It read "the flip transient is GONE, exactly as C19 predicts -- the region
+#: is preallocated at Sigma H and the legs copy through it, so a flip allocates
+#: nothing", and its own last clause ("the series is a slow monotone creep and
+#: no flip spikes above it") named the defect: the LOCAL instrument subtracts
+#: the HIGHER of the two shoulders, so against a STAIRCASE it reads negative BY
+#: CONSTRUCTION -- the trailing shoulder already sits on the new step.  The
+#: quantity is not gone, it is invisible to this instrument, which is an
+#: INDIKATOR-GESETZ violation and not a measurement.  Measured CUMULATIVELY on
+#: the very boot this table carries at -0.023 (ANALYSE_1350_HOST_TERM_0912.md
+#: SS1.3, same 1 Hz series, same currency): weg2xsn20 rises 84.336 -> 88.084
+#: GiB over eight flips and never returns, i.e. **+4.462 GiB**, and 34 of 37
+#: flip-event deltas across the five 0912 boots are >= 0.  The rows above are
+#: therefore kept as WHAT THE LOCAL INSTRUMENT SAID, never as a statement that
+#: a flip costs nothing; the cumulative quantity is
+#: :data:`FLIP_RATCHET_CUMULATIVE_GIB` and it is CHARGED (as
+#: ``flip_ratchet_gib``) rather than left to the margin.
 #:
 #: WHY THE TERM IS NOT RETIRED HERE, stated rather than done quietly.
 #: Retiring rg3 RAISES the hard bound from 87.30 to 90.18 GiB -- it FUNDS arms
@@ -303,6 +319,48 @@ RING_ERA_FLIP_TRANSIENT_GIB = {"weg2rg2": 1.10, "weg2rg3": 2.88}
 FLIP_TRANSIENT_IN_CURRENCY_GIB = {
     "weg2rg6": 0.0, "weg2xsn19": -0.019, "weg2xsn20": -0.023,
 }
+
+#: #1350 -- THE SAME FLIP, MEASURED CUMULATIVELY INSTEAD OF LOCALLY.
+#: RECORDED, NOT PRICED: the priced term is read from the sidecar record
+#: (:func:`resolve_flip_ratchet_gib`), never from this table, because a
+#: constant cannot follow a form that changes between boots.  These rows exist
+#: so a reader can check the resolver's answer against the five boots the term
+#: was attributed on, and so the contradiction with
+#: :data:`FLIP_TRANSIENT_IN_CURRENCY_GIB` is on the page rather than in a
+#: ticket.
+#:
+#: ``peak``   = measured non-reclaimable peak MINUS the reading at the
+#:              ``WEG2-FLIP begin epoch=0`` timestamp.  The whole staircase.
+#: ``pair``   = the reading at ``WEG2-FLIP done epoch=2`` minus the same
+#:              origin: ONE full flip PAIR (one D->P leg + one P->D leg), which
+#:              is what :func:`resolve_flip_ratchet_gib` prices.
+#: Both from the 1 Hz ``anon+shmem+slab_unreclaimable`` series of that boot,
+#: never ``memory.current`` (ANALYSE_1350_HOST_TERM_0912.md SS1.3).
+#:
+#: weg2xsn21b HAS NO ``pair`` AND THAT IS THE POINT: group D died in the second
+#: leg (W85), so the boot never logged ``WEG2-FLIP done epoch=2`` and its 1 Hz
+#: CSV is not on this box any more.  Its 1.865 below is the SUM OF THE TWO LEG
+#: DELTAS the analysis published (+0.302 D->P, +1.563 P->D), marked as such --
+#: a boot that does not complete a pair writes no ``flip_ratchet_gib`` and the
+#: next arm REFUSES by name (W94) rather than inventing one.
+FLIP_RATCHET_CUMULATIVE_GIB = {
+    #    boot          peak-origin   first pair
+    "weg2xsn20":  (4.462, 3.161),
+    "weg2xsn21b": (2.594, 1.865),   # pair = leg deltas, no `done epoch=2`
+    "weg2xsn22":  (2.994, 1.870),
+    "weg2xsn23":  (3.350, 2.062),
+    "weg2xsn24":  (4.280, 4.049),
+}
+
+#: How many flip PAIRS one run window is priced for when the record does not
+#: say.  ONE, and the assumption is printed on the ARM line rather than hidden:
+#: the ratchet SATURATES -- ANALYSE_1350_HOST_TERM_0912.md SS2 item 4 measures
+#: 3.16 of weg2xsn20's 4.46 GiB in the first two legs of eight flips -- so it
+#: is a one-time surcharge at the first waking of each group, not a per-flip
+#: leak, and multiplying it by a flip count would over-charge.  The ledger
+#: carries NO expected-flip-count for the run window (the drift term integrates
+#: MINUTES, not flips), so there is nothing else to multiply by either.
+FLIP_RATCHET_FLIPS_PRICED_DEFAULT = 1
 
 #: Per boot: (predicted run peak, measured non-reclaimable peak) in GiB, so a
 #: ring provenance line can show the next seat how the SOURCE boot's own
@@ -446,6 +504,16 @@ class Margin:
     residual_source: str
     drift_source: str
     foreign_source: str
+    #: #1350 (patch C). FALSE once the prediction CHARGES the flip ratchet.
+    #: The transient term reserves for what a flip spends; a prediction that
+    #: charges `flip_ratchet_gib` has already spent it, and subtracting it from
+    #: the bound as well is the same double deduction #1269 fix 4 removed for
+    #: the residual one layer up. It STAYS in `runtime_total_gib`: W22 grades a
+    #: live reading, and at the moment of that reading the NEXT flip has not
+    #: happened yet, so its step is still future spend the box must have room
+    #: for. Default True, so every caller that does not charge the ratchet is
+    #: byte-identical.
+    transient_in_boot: bool = True
 
     @property
     def total_gib(self) -> float:
@@ -456,7 +524,8 @@ class Margin:
     @property
     def boot_total_gib(self) -> float:
         return (
-            self.transient_gib + self.residual_gib + self.drift_gib + self.foreign_gib
+            (self.transient_gib if self.transient_in_boot else 0.0)
+            + self.residual_gib + self.drift_gib + self.foreign_gib
         )
 
     @property
@@ -501,6 +570,21 @@ class Margin:
                 head + f" GiB; residual {self.residual_gib:.2f} DELIBERATELY NOT "
                 "CHARGED here -- it is model error and this bound grades a "
                 "MEASUREMENT, not a prediction (#1269 fix 4)"
+            )
+        if not self.transient_in_boot:
+            # #1350 patch C: the transient is OMITTED here and the line says so,
+            # exactly as the runtime form says it about the residual. A reader
+            # of an ARM line must be able to see that the omission was decided,
+            # not that a term went missing.
+            return (
+                f"residual {self.residual_gib:.2f} [{self.residual_source}] "
+                f"+ drift {self.drift_gib:.2f} [{self._drift_note()}] "
+                f"+ foreign {self.foreign_gib:.2f} [{self.foreign_source}] GiB; "
+                f"transient {self.transient_gib:.2f} [{self.transient_source}] "
+                "DELIBERATELY NOT CHARGED here -- #1350 charges the flip's "
+                "PERMANENT step as `flip_ratchet_gib` inside the prediction, and a "
+                "bound may not deduct for what the prediction already spent. It "
+                "REMAINS in the runtime margin, where the next flip is still future"
             )
         return (
             f"transient {self.transient_gib:.2f} [{self.transient_source}] "
@@ -601,13 +685,44 @@ def resolve_margin(
     residual_gib: Optional[float] = None,
     foreign_headroom_gib: float = 0.0,
     foreign_source: str = "",
+    flip_ratchet_charged_gib: Optional[float] = None,
 ) -> Margin:
     """Build the margin from measurements, naming every source.
 
     The transient is read from the RING-ERA records of this form (max over the
     recorded flips); the pre-ring :data:`FLIP_HOST_TRANSIENT_GIB` is used only
     when no ring-era sample exists, and the line says which one was used.
+
+    #1350 -- ``flip_ratchet_charged_gib`` IS A DECLARATION, NOT A TERM. It is
+    the GiB the PREDICTION now charges for the flip's permanent step; passing
+    it does two things and neither of them is an addition to this margin:
+
+    * the transient leaves ``boot_total_gib`` (it stays in
+      ``runtime_total_gib``) -- patch C, the same argument #1269 fix 4 made for
+      the residual: a bound may not deduct for what the prediction spent;
+    * the RESIDUAL IS NOT NETTED. :data:`RUN_PEAK_RESIDUAL_GIB`'s rows were
+      measured as ``(measured peak - predicted peak)`` on boots where the
+      ratchet was NOT charged, so each row CONTAINS it. They are kept WHOLE
+      here -- over-reserving is the safe direction and the binding row (sb4
+      5.16, a 60-minute idle window) is not replaceable by the 0912 boots'
+      ten-minute windows -- and the source string says so. The forbidden move
+      is the other one: subtracting the charged ratchet from a legacy row to
+      "correct" it. That is the hand-edit #1350 rules out, and it is refused by
+      name (:class:`Weg2HostRatchetDoubleCharged`) rather than commented
+      against.
+
+    ``None`` (every pre-#1350 caller) is byte-identical to the old behaviour.
     """
+    if flip_ratchet_charged_gib is not None and residual_gib is not None:
+        raise Weg2HostRatchetDoubleCharged(
+            "W95 Weg2HostRatchetDoubleCharged: a caller-supplied residual "
+            f"({float(residual_gib):.2f} GiB) was combined with a charged flip "
+            f"ratchet ({float(flip_ratchet_charged_gib):.2f} GiB). The residual is "
+            "(measured peak - predicted peak) of boots whose prediction did NOT "
+            "carry the ratchet, so it already contains it; hand-supplying one here "
+            "beside the charged term is exactly the netting #1350 forbids. Let this "
+            "function resolve the residual, or do not charge the ratchet."
+        )
     if flip_transient_gib is not None:
         transient, t_src = float(flip_transient_gib), "caller-supplied measured transient"
     elif RING_ERA_FLIP_TRANSIENT_GIB:
@@ -635,6 +750,29 @@ def resolve_margin(
         rb, residual = max(RUN_PEAK_RESIDUAL_GIB.items(), key=lambda kv: kv[1])
         residual = max(0.0, residual)
         r_src = f"RING-ERA max (measured peak - predicted) over {sorted(RUN_PEAK_RESIDUAL_GIB)}, binding {rb}"
+        if flip_ratchet_charged_gib is not None:
+            # #1350: RE-DERIVED, AND THE DERIVATION SAYS WHY IT DOES NOT MOVE.
+            # Under ratchet pricing each 0912 boot's residual falls by the
+            # charged term (weg2xsn20 +1.648 -> -1.513, xsn21b +1.695 -> -0.170,
+            # xsn22 +2.245 -> +0.375, xsn23 +2.970 -> +0.908, xsn24 +4.095 ->
+            # +0.046), so NONE of them exceeds the binding sb4 row and the max
+            # rule leaves it where it is. sb4 is also not replaceable by them:
+            # it was measured over a 60-minute idle window
+            # (RESIDUAL_WINDOW_MIN), which is what lets the drift term be
+            # charged only BEYOND that hour, while the 0912 boots ran ~10
+            # minutes each. The row is kept WHOLE rather than netted by the
+            # charged ratchet -- over-reserving is the safe direction, netting
+            # a row measured in another era is the double count.
+            r_src += (
+                f" -- KEPT WHOLE under #1350 ratchet pricing "
+                f"({float(flip_ratchet_charged_gib):.2f} GiB charged): the row was "
+                "measured with the ratchet UNCHARGED and therefore contains it; it "
+                "is NOT netted, because netting a 60-min idle row by a flip term "
+                "measured on 10-min boots would charge the correction twice. "
+                "Re-derived 0912 residuals under this pricing: xsn20 -1.513, "
+                "xsn21b -0.170, xsn22 +0.375, xsn23 +0.908, xsn24 +0.046 -- none "
+                "binds"
+            )
 
     if drift_mib_per_min is None:
         drift_rate, d_src = IDLE_ANON_DRIFT_MIB_PER_MIN_DEFAULT, "sb4 default, no WEG2-IDLE-CENSUS yet"
@@ -651,6 +789,7 @@ def resolve_margin(
         transient_source=t_src,
         residual_source=r_src,
         drift_source=d_src,
+        transient_in_boot=(flip_ratchet_charged_gib is None),
         foreign_source=foreign_source
         or "0 by design: arm-time foreign load is already in the origin; later "
         "desk load is unbounded and is the RUNTIME guard's job (W22)",
@@ -1021,6 +1160,51 @@ class Weg2HostLedgerRefused(RuntimeError):
     """W20: no arm of the ladder funds both moments plus the store floor."""
 
 
+class Weg2HostFlipRatchetUnmeasured(Weg2HostLedgerRefused):
+    """W94 (#1350): no record of this form carries ``flip_ratchet_gib``.
+
+    THE TERM THIS CLASS EXISTS FOR is the one five formgleiche boots
+    under-predicted by +1.65 / +1.70 / +2.25 / +2.97 / +4.10 GiB while every
+    stationary term of the ledger got MORE accurate
+    (ANALYSE_1350_HOST_TERM_0912.md): what the FIRST waking of each group adds
+    to ``anon`` and never gives back -- +1.18..1.73 GiB on the P->D leg,
+    +0.28..0.30 on D->P, monotone in 34 of 37 measured flip deltas.
+
+    It is a REFUSAL and not a default, for the reason :func:`run_origin_gib`
+    refuses without a cgroup sample and :func:`price` refuses without a ring
+    table: a term whose measurement is missing must not be priced at zero.  A
+    zero here is the #606 class -- the ledger would report FUNDABLE for an arm
+    whose peak it has knowingly stopped modelling, which is the exact direction
+    that kills a boot.
+    """
+
+
+class Weg2HostRatchetDoubleCharged(Weg2HostLedgerRefused):
+    """W95 (#1350): the flip ratchet would be charged TWICE in one prediction.
+
+    ``predicted_run_peak = run_origin + charges + Sigma H``.  The origin is
+    ``max(launch reading, MEASURED run-moment residual floor)``
+    (:func:`run_origin_gib`), and that floor is sampled by the front at a
+    group's first sleep -- i.e. DURING a flip.  ANALYSE_1350_HOST_TERM_0912.md
+    SS2 measured the consequence: ``run-moment residual ... stored=`` walks
+    2.31 -> 2.34 -> 4.09 -> 5.28 GiB over the 0912 boots precisely because the
+    sample is taken after the second leg and therefore ALREADY CONTAINS the
+    ratchet.  The launch reading (6.44-6.47) still wins today, "but at 5.28 and
+    +1 GiB per boot the floor binds in one to two boots".
+
+    The moment it binds, adding ``flip_ratchet_gib`` on top charges the same
+    bytes a second time.  This class makes that impossible BY CONSTRUCTION
+    instead of by a comment: an origin that came from a record which itself
+    carries a ratchet measurement may not be combined with a charged ratchet
+    term, and the arm refuses by name rather than silently over-predicting.
+
+    Over-prediction is the safe direction and could have been left alone --
+    it is refused anyway, because a ledger that is wrong in the safe direction
+    still refuses arms the box can carry, and #1317n's whole finding was that
+    such a refusal is indistinguishable from a real one to the next reader.
+    """
+
+
 class Weg2HostRunPeakRefused(RuntimeError):
     """W21 (fix 8): an arm funds both moments, and its RUN PEAK does not.
 
@@ -1310,7 +1494,12 @@ def charge_terms(
     s_gb: int, m_mib: int, ranks_per_group: int, images: ImageTerms,
     s_gb_d: Optional[int] = None,
     xchg_bounce_host_bytes: int = 0,
-) -> Dict[str, float]:
+    # #1350: NO DEFAULT ZAHLWERT. `None` is ABSENCE, not 0.0 -- the key is
+    # always present and carries `None`, so `_boot_charges_gib` can tell "not
+    # measured" from "measured at zero" and the consumers that grade against a
+    # bound refuse on the first rather than summing the second.
+    flip_ratchet_gib: Optional[float] = None,
+) -> Dict[str, object]:
     """Everything the BOOT ITSELF adds to ``memory.current``, per term.
 
     One authority for "what this arm charges": :func:`price` builds the arm
@@ -1360,11 +1549,36 @@ def charge_terms(
         "image_extra_p_gib": images.extra_p_gib,
         "image_extra_d_gib": images.extra_d_gib,
         "xchg_bounce_gib": max(0, int(xchg_bounce_host_bytes)) / GIB,
+        # #1350: what the first waking of EACH GROUP adds to the cgroup and
+        # NEVER gives back.  A MEASUREMENT (`resolve_flip_ratchet_gib`, read
+        # from the sidecar the front writes at `WEG2-FLIP done epoch=2`), never
+        # a model -- and `None` when no measurement reached this arm, which the
+        # consumers turn into a NAMED refusal (W94) and never into a 0.
+        "flip_ratchet_gib": (
+            None if flip_ratchet_gib is None else float(flip_ratchet_gib)
+        ),
     }
 
 
-def _boot_charges_gib(terms: Dict[str, float]) -> float:
-    """The sum of the arm's own charges, image and store EXCLUDED."""
+def _boot_charges_gib(terms: Dict[str, object]) -> float:
+    """The sum of the arm's own charges, image and store EXCLUDED.
+
+    #1350 ADDS ONE SUMMAND AND ONLY ONE PLACE TO ADD IT.  ``flip_ratchet_gib``
+    lands here rather than in :meth:`Arm.predicted_run_peak_gib`, so the three
+    consumers this function exists to reconcile (``price`` /
+    ``predicted_run_peak_gib`` / ``dk7_run_residual_gib``) cannot disagree about
+    whether the ratchet is in the sum -- the same argument the docstring of
+    :func:`charge_terms` already makes for every other term.
+
+    THE RATCHET IS NOT IN THIS SUM, and the exclusion is measured rather than
+    stylistic.  Every term here is charged at BOTH moments; the ratchet is what
+    the FIRST FLIP spends, and at the launch moment no flip has happened.
+    Putting it here took the pinned M=150 arm's launch leftover from +4.50 to
+    -0.19 GiB on a dry run of this tree -- turning a run-peak refusal (W21)
+    into a launch-moment one (W20) and naming the wrong binding term.  It lives
+    in :func:`_run_moment_charges_gib`, which is the ONE authority for the run
+    moment exactly as this function is for both.
+    """
     return (
         terms["heaps_gib"] + terms["anchors_gib"] + terms["rings_gib"]
         + terms["overhead_gib"] + terms["draft_host_p_gib"] + terms["draft_host_d_gib"]
@@ -1374,6 +1588,40 @@ def _boot_charges_gib(terms: Dict[str, float]) -> float:
         # shrink by exactly the deposit rather than by a note in a docstring.
         + terms["xchg_bounce_gib"]
     )
+
+
+def _flip_ratchet_charge_gib(terms: Dict[str, object]) -> float:
+    """#1350: the charged ratchet of one arm, 0.0 when it was never measured.
+
+    THE KEY MUST EXIST.  ``terms["flip_ratchet_gib"]`` is indexed, not
+    ``.get``-ed: a dict that did not come from :func:`charge_terms` raises
+    KeyError here instead of being silently priced without the term (the #606
+    ``getattr``-default class, which this fork has paid for repeatedly).  Its
+    VALUE may be ``None`` -- a hermetic or legacy caller that was handed no
+    measurement -- and then it contributes 0.0 to the SUM while the arm records
+    the absence by name, so every consumer that grades against the reap bound
+    can refuse instead of reading it as zero.
+    """
+    ratchet = terms["flip_ratchet_gib"]
+    return 0.0 if ratchet is None else float(ratchet)
+
+
+def _run_moment_charges_gib(terms: Dict[str, object]) -> float:
+    """The arm's charges AT THE RUN MOMENT: both-moment charges plus the ratchet.
+
+    ONE addition point for the ratchet, for the same reason
+    :func:`_boot_charges_gib` is one for everything else: its two consumers --
+    ``price``'s ``run`` leftover and :meth:`Arm.predicted_run_peak_gib` -- must
+    not be able to disagree about whether the term is in the sum.  The three
+    consumers of the BOTH-moment sum (``price``'s ``common``,
+    :func:`dk7_run_residual_gib`, :func:`record_run_residual_gib`) deliberately
+    do NOT go through here: dk7 ran zero flips, and the two residual
+    re-derivations reconstruct what a SAMPLER subtracted, which never knew this
+    term -- subtracting it there and adding it back at prediction time would
+    make the term cancel itself and #1350's under-prediction would survive its
+    own fix.
+    """
+    return _boot_charges_gib(terms) + _flip_ratchet_charge_gib(terms)
 
 
 def dk7_run_residual_gib() -> float:
@@ -1393,7 +1641,13 @@ def dk7_run_residual_gib() -> float:
     list with estimates.
     """
     images = resolve_image_terms(None)
-    terms = charge_terms(DK7_ARM_S_GB, DK7_ARM_M_MIB, 3, images)
+    # #1350: EXPLICIT 0.0, NOT AN OMISSION. weg2dk7 ran ZERO FLIPS ("No flip
+    # transient: zero flips ran", above), so the ratchet is zero as a FACT
+    # about that boot rather than as a missing argument -- and this derivation
+    # uses `_boot_charges_gib`, which does not carry the term anyway. Passing
+    # it by name keeps the fact at the call site instead of in a ticket.
+    terms = charge_terms(DK7_ARM_S_GB, DK7_ARM_M_MIB, 3, images,
+                         flip_ratchet_gib=0.0)
     return (
         DK7_QUIET_CG_CURRENT_GIB
         - _boot_charges_gib(terms)
@@ -1466,6 +1720,18 @@ def record_run_residual_gib(
                 int(arm["s_gb"]), int(arm["m_mib"]), ranks_per_group, images,
                 s_gb_d=None if s_d is None else int(s_d),
                 xchg_bounce_host_bytes=int(round(bounce_gib * GIB)),
+                # #1350 EXPLICIT 0.0 ON BOTH SIDES OF THE CORRECTION, and it
+                # is the load-bearing half of the no-double-count rule. This
+                # function re-derives what the WRITING SAMPLER subtracted; that
+                # sampler never knew the ratchet, so a non-zero here would move
+                # the stored run-moment residual DOWN by it -- and that residual
+                # is the origin FLOOR the prediction then adds the ratchet to.
+                # The term would be subtracted once and added once against the
+                # same bytes, and #1350's under-prediction would survive its own
+                # fix. The ratchet is a RUN-MOMENT arm charge
+                # (`_run_moment_charges_gib`), never a currency conversion of a
+                # historical record.
+                flip_ratchet_gib=0.0,
             )
         )
         # WHAT THE WRITING SAMPLER SUBTRACTED. Read from the record when it
@@ -1480,7 +1746,7 @@ def record_run_residual_gib(
         if stored_charges is None:
             old = _boot_charges_gib(
                 charge_terms(int(arm["s_gb"]), int(arm["m_mib"]),
-                             ranks_per_group, images)
+                             ranks_per_group, images, flip_ratchet_gib=0.0)
             )
         else:
             old = float(stored_charges)
@@ -1553,6 +1819,20 @@ def run_origin_gib(
             )
             + ")"
         )
+        # #1350: THE FLOOR SAYS WHETHER IT ALREADY CONTAINS THE RATCHET.
+        # The front samples a group's run-moment residual at that group's FIRST
+        # SLEEP, i.e. inside a flip; such a reading has already realised the
+        # permanent step the flip adds. Marking it here -- at the one place
+        # that knows WHICH entry won the max() -- is what lets `price` refuse
+        # (W95) instead of adding the same bytes to the origin and to the
+        # charges.
+        _ep = entry.get("sampled_at_flip_epoch")
+        if _ep is not None and int(_ep) >= 1:
+            floor_src += (
+                f" {RUN_ORIGIN_RATCHET_MARKER} sampled_at_flip_epoch={int(_ep)}: "
+                "this floor was measured DURING a flip and therefore already "
+                "contains the permanent step `flip_ratchet_gib` prices"
+            )
     else:
         floor = dk7_run_residual_gib()
         floor_src = (
@@ -1571,6 +1851,193 @@ def run_origin_gib(
         f"reading {cg_nonreclaim_gib:.2f} GiB is only a floor and a quieter launch does not "
         f"buy a bigger arm (weg2dk6 46.80 GiB launch -> M=600 -> died at 96.06; weg2dk7 "
         f"15.36 GiB launch -> M=1200 + 9 GiB store -> 90.1-94.6 GiB at IDLE, store EMPTY)"
+    )
+
+
+#: The marker :func:`run_origin_gib` appends to its source string when the
+#: floor it chose came from a record that ITSELF carries a ratchet measurement.
+#: A STRING marker rather than a third return value on purpose: that signature
+#: has four call sites and boot weg2sn6a died of a signature that had drifted
+#: between two of them.  The marker is machine-read in exactly one place
+#: (:func:`price`) and printed everywhere else, so a reader of an ARM line sees
+#: the same fact the guard acted on.
+RUN_ORIGIN_RATCHET_MARKER = "[FLOOR-INCLUDES-RATCHET]"
+
+
+@dataclass(frozen=True)
+class FlipRatchet:
+    """What the flip costs the host PERMANENTLY, and where that number is from.
+
+    ``per_flip_gib`` is ONE full pair (a D->P leg plus a P->D leg), measured as
+    the non-reclaimable reading at ``WEG2-FLIP done epoch=2`` minus the one at
+    ``WEG2-FLIP begin epoch=0``.  ``flips_priced`` is how many pairs the run
+    window is charged for, and it is printed rather than assumed -- see
+    :data:`FLIP_RATCHET_FLIPS_PRICED_DEFAULT` for why it is 1.
+    """
+
+    per_flip_gib: float
+    flips_priced: int
+    source: str
+    from_record: bool
+
+    @property
+    def charged_gib(self) -> float:
+        return float(self.per_flip_gib) * int(self.flips_priced)
+
+    def arm_fields(self) -> str:
+        """The four fields #1350 requires on the ARM line, in one place so the
+        launcher's line and a test read the SAME spelling."""
+        return (
+            f"ratchet_per_flip={self.per_flip_gib:.2f} "
+            f"flips_priced={self.flips_priced} "
+            f"ratchet_charged={self.charged_gib:.2f} "
+            f"source={self.source}"
+        )
+
+
+def flip_ratchet_record(
+    *,
+    pre_gib: Optional[float],
+    post_gib: Optional[float],
+    boot_tag: str,
+    commit: str,
+    at: str,
+    pre_at: str = "",
+    post_at: str = "",
+    form_key: str = "",
+    epochs: str = "begin epoch=0 -> done epoch=2",
+) -> Dict[str, object]:
+    """One sidecar entry carrying the MEASURED ratchet of this boot's first pair.
+
+    Written by the front through :func:`append_measured_record` -- the same
+    writer, the same file and the same reader as the dormant-image and
+    run-moment-residual entries, so #1350 adds a FIELD and not a second
+    bookkeeping.  ``group`` is ``"FLIP"`` because the quantity belongs to
+    neither group: :func:`resolve_image_terms` reads only ``"P"``/``"D"`` and
+    :func:`run_origin_gib` reads only entries carrying ``run_residual_gib``, so
+    this entry is invisible to both by construction.
+
+    Either reading ``None`` (an unreadable ``memory.stat``) yields
+    ``flip_ratchet_gib = None``: the entry is still written, because WHY a boot
+    could not measure is evidence, and the next arm then refuses by name
+    instead of reading the absence as zero.
+    """
+    ratchet = (
+        None if pre_gib is None or post_gib is None
+        else float(post_gib) - float(pre_gib)
+    )
+    return {
+        "group": "FLIP",
+        "at": at,
+        "boot_tag": boot_tag,
+        "commit": commit,
+        "form_key": form_key,
+        "flip_ratchet_gib": ratchet,
+        "flip_ratchet_epochs": epochs,
+        "pre_first_flip_nonreclaim_gib": None if pre_gib is None else float(pre_gib),
+        "post_second_leg_nonreclaim_gib": None if post_gib is None else float(post_gib),
+        "pre_first_flip_at": pre_at,
+        "post_second_leg_at": post_at,
+        # The currency, IN the record, because a figure whose instrument is not
+        # stored beside it is the one #1309 had to re-derive from a comment.
+        "instrument": "anon+shmem+slab_unreclaimable (memory.stat), NEVER memory.current",
+    }
+
+
+def resolve_flip_ratchet_gib(
+    record: Optional[Dict[str, dict]] = None,
+    *,
+    flips_priced: Optional[int] = None,
+    seed_allowed: bool = True,
+) -> FlipRatchet:
+    """The charged flip ratchet and its provenance, or W94.
+
+    PRECEDENCE, and every step says which one answered:
+
+    (a) a sidecar entry carrying ``flip_ratchet_gib`` -- this line's own
+        measurement, written by the front at ``WEG2-FLIP done epoch=2``.  The
+        MAX over such entries binds, which is the rule this module already
+        applies to the reap samples and to the ring-era transient: the margin
+        must cover the worst recorded instance of the form.
+    (b) absent that, and only while ``seed_allowed``: the RECORDED pair column
+        of :data:`FLIP_RATCHET_CUMULATIVE_GIB` -- the five 0912 boots this term
+        was attributed on, max (weg2xsn24, 4.049 GiB, the conservative
+        direction).  It is labelled SEED in the source string and it is NOT
+        this line's own record; it exists because no record on this box carries
+        the field yet, exactly as :func:`dk7_run_residual_gib` stands in for a
+        residual no record has written, and it RETIRES the first time (a)
+        answers.
+    (c) neither -> :class:`Weg2HostFlipRatchetUnmeasured`.
+
+    ``seed_allowed=False`` is how a caller demands this line's OWN measurement
+    -- and it is the state the refusal is tested in, so the refusal is a
+    reachable path and not a decoration.
+    """
+    n = (
+        FLIP_RATCHET_FLIPS_PRICED_DEFAULT if flips_priced is None
+        else max(1, int(flips_priced))
+    )
+    rows = [
+        (float(e["flip_ratchet_gib"]), g, e)
+        for g, e in (record or {}).items()
+        if isinstance(e, dict) and e.get("flip_ratchet_gib") is not None
+    ]
+    if rows:
+        val, group, entry = max(rows, key=lambda r: r[0])
+        return FlipRatchet(
+            per_flip_gib=val,
+            flips_priced=n,
+            source=(
+                f"MEASURED first flip pair of boot {entry.get('boot_tag', '?')} @ "
+                f"{entry.get('commit', '?')} ({entry.get('at', '?')}, group {group}, "
+                f"{entry.get('flip_ratchet_epochs', '?')}, "
+                f"pre={entry.get('pre_first_flip_nonreclaim_gib')} "
+                f"post={entry.get('post_second_leg_nonreclaim_gib')}, MAX over "
+                f"{len(rows)} recorded pair(s))"
+            ),
+            from_record=True,
+        )
+    if seed_allowed and FLIP_RATCHET_CUMULATIVE_GIB:
+        boot, pair = max(
+            ((b, v[1]) for b, v in FLIP_RATCHET_CUMULATIVE_GIB.items()),
+            key=lambda kv: kv[1],
+        )
+        return FlipRatchet(
+            per_flip_gib=float(pair),
+            flips_priced=n,
+            source=(
+                f"SEED (NOT this line's own record): RECORDED first-pair max over "
+                f"{sorted(FLIP_RATCHET_CUMULATIVE_GIB)}, binding {boot} "
+                f"{pair:.3f} GiB, 1 Hz anon+shmem+slab_unreclaimable "
+                f"(ANALYSE_1350_HOST_TERM_0912.md SS1.3). RETIRES as soon as one "
+                f"boot writes flip_ratchet_gib into the sidecar"
+            ),
+            from_record=False,
+        )
+    unmeasured = sorted(
+        str(e.get("boot_tag", "?"))
+        for e in (record or {}).values()
+        if isinstance(e, dict) and "flip_ratchet_gib" in e
+        and e.get("flip_ratchet_gib") is None
+    )
+    raise Weg2HostFlipRatchetUnmeasured(
+        "W94 Weg2HostFlipRatchetUnmeasured: no record of this form carries "
+        "`flip_ratchet_gib`, and no seed is permitted here."
+        + (
+            f" Records that REACHED the measuring moment and could not read it: "
+            f"{unmeasured} -- an unreadable memory.stat, not a missing flip."
+            if unmeasured else ""
+        )
+        + " The term is what the "
+        "FIRST waking of each group adds to the cgroup and never returns "
+        "(+1.18..1.73 GiB on the P->D leg, +0.28..0.30 on D->P, measured on five "
+        "formgleiche boots, ANALYSE_1350_HOST_TERM_0912.md). It is REFUSED rather "
+        "than priced at 0, because a 0 would let this arm report FUNDABLE for a "
+        "peak the ledger has knowingly stopped modelling -- the direction that "
+        "kills a boot. The front writes the field at `WEG2-FLIP done epoch=2`; a "
+        "boot that never completes a first flip PAIR writes nothing, and a boot "
+        "whose predecessor wrote nothing must be priced from the recorded seed or "
+        "not at all."
     )
 
 
@@ -1654,14 +2121,40 @@ class Arm:
 
         FIX 8: that origin is the RUN-moment one (:func:`run_origin_gib`), and
         this number now REFUSES arms (W21) instead of advising about them.
+
+        #1350: THE FLIP RATCHET IS IN ``_boot_charges_gib`` AND NOWHERE ELSE.
+        The sum gains no line here on purpose -- one addition point, three
+        consumers, the argument :func:`charge_terms` already makes.  What IS
+        here is the guard that the term cannot be charged twice: the origin may
+        be a run-moment residual floor sampled DURING a flip, and such a floor
+        has already realised the same permanent step.  That combination raises
+        :class:`Weg2HostRatchetDoubleCharged` rather than returning a number
+        that is silently too high -- an over-prediction refuses arms the box
+        can carry, and #1317n's finding was that such a refusal is
+        indistinguishable from a real one to the next reader.
         """
         origin = self.terms.get("run_origin_gib")
         if origin is None:
             return None
         t = self.terms
+        if (
+            t.get("flip_ratchet_gib") is not None
+            and RUN_ORIGIN_RATCHET_MARKER in str(t.get("run_origin_source") or "")
+        ):
+            raise Weg2HostRatchetDoubleCharged(
+                "W95 Weg2HostRatchetDoubleCharged: this arm charges "
+                f"flip_ratchet_gib={float(t['flip_ratchet_gib']):.2f} GiB AND takes its "
+                f"run origin from a measured run-moment residual floor that was sampled "
+                f"during a flip, so the floor already contains the same permanent step. "
+                f"origin={float(origin):.2f} GiB [{t.get('run_origin_source')}]. "
+                "The two may not be summed. Either re-measure the floor outside a flip "
+                "window, or price this arm from the launch-moment reading; the ledger "
+                "will not quietly count the same bytes twice in the direction that "
+                "refuses fundable arms."
+            )
         return (
             float(origin)
-            + _boot_charges_gib(t)
+            + _run_moment_charges_gib(t)
             + t["host_ring_gib"]
         )
 
@@ -1876,6 +2369,13 @@ def price(
     s_gb_d: Optional[int] = None,
     measured_record: Optional[Dict[str, dict]] = None,
     xchg_bounce_host_bytes: int = 0,
+    # #1350 THE FLIP RATCHET, HANDED IN RATHER THAN RESOLVED HERE. Same shape
+    # as `xchg_bounce_host_bytes` and for the same reason: the ONE call site
+    # that already knows the boot resolves it (`resolve_flip_ratchet_gib`) and
+    # reaches the W94 refusal there; the ledger never opens the sidecar behind
+    # its caller's back. `None` = no measurement reached this arm, and it is
+    # recorded as ABSENT, never printed or summed as 0.
+    flip_ratchet: Optional["FlipRatchet"] = None,
 ) -> Arm:
     """Price one arm at both moments.  Pure.
 
@@ -2024,7 +2524,11 @@ def price(
     # the weights, this carries the draft pages, never the same bytes.
     images = resolve_image_terms(measured_record)
     charges = charge_terms(s_gb, m_mib, ranks_per_group, images, s_gb_d=s_gb_d,
-                           xchg_bounce_host_bytes=xchg_bounce_host_bytes)
+                           xchg_bounce_host_bytes=xchg_bounce_host_bytes,
+                           flip_ratchet_gib=(
+                               None if flip_ratchet is None
+                               else flip_ratchet.charged_gib
+                           ))
     heaps_gib = charges["heaps_gib"]
     anchors_gib = charges["anchors_gib"]
     rings_gib = charges["rings_gib"]
@@ -2058,7 +2562,16 @@ def price(
     _reap_currency = str(base_source or "").startswith("cgroup")
     launch = launch_reap if _reap_currency else launch_sum
     # Sigma H IS the run peak; there is no flip transient beside it (A1-1/A1-3).
-    run = common - host_ring_gib
+    # #1350: ...but the RATCHET is beside it, and only here. `common` carries
+    # the both-moment charges; the flip's permanent step is subtracted from the
+    # RUN leftover alone, because at the launch moment no flip has happened.
+    # Measured on a dry run of this tree: charging it at both moments took the
+    # pinned M=150 arm from launch +4.50 to -0.19 GiB and moved the refusal
+    # from the run peak (W21) to the launch moment (W20) -- a true refusal
+    # under a false name.
+    run = common - host_ring_gib - (
+        0.0 if flip_ratchet is None else flip_ratchet.charged_gib
+    )
     origin_gib, origin_source = run_origin_gib(
         None if cg_nonreclaim_bytes is None else cg_nonreclaim_bytes / GIB,
         measured_record,
@@ -2123,7 +2636,11 @@ def price(
         # #1317n the margin the worst-case launch gate measures against. The
         # DEFAULT resolution, so `price()` alone can enforce the gate; `choose`
         # may pass a different Margin, and it re-reads the same field.
-        "margin_total_gib": resolve_margin().boot_total_gib,
+        "margin_total_gib": resolve_margin(
+            flip_ratchet_charged_gib=(
+                None if flip_ratchet is None else flip_ratchet.charged_gib
+            )
+        ).boot_total_gib,
         "load_transient_gib": LOAD_TRANSIENT_GIB,
         "load_transient_pagecache_gib": LOAD_TRANSIENT_PAGECACHE_GIB,
         "load_transient_anon_gib": LOAD_TRANSIENT_ANON_GIB,
@@ -2140,6 +2657,26 @@ def price(
         # that -- a key that can be absent is how the three consumers this
         # dict exists to reconcile would start disagreeing again.
         "xchg_bounce_gib": charges["xchg_bounce_gib"],
+        # #1350. THE KEY IS ALWAYS HERE and its value is `None` when no
+        # measurement reached this arm -- the one spelling this module does not
+        # allow for an absence is `0.00`, because an unpriced term and a term
+        # priced at zero would then be the same line. The four companion fields
+        # are what the ARM line prints, so a reader can see per-flip, count,
+        # product and provenance without inverting the arithmetic.
+        "flip_ratchet_gib": charges["flip_ratchet_gib"],
+        "flip_ratchet_per_flip_gib": (
+            None if flip_ratchet is None else flip_ratchet.per_flip_gib
+        ),
+        "flip_ratchet_flips_priced": (
+            0 if flip_ratchet is None else int(flip_ratchet.flips_priced)
+        ),
+        "flip_ratchet_source": (
+            "ABSENT: no measurement was handed to price() -- NOT priced at 0"
+            if flip_ratchet is None else flip_ratchet.source
+        ),
+        "flip_ratchet_from_record": bool(
+            flip_ratchet is not None and flip_ratchet.from_record
+        ),
         "store_draft_fraction": STORE_DRAFT_FRACTION,
     }
     arm.launch_leftover_gib = launch
@@ -2158,6 +2695,42 @@ def price(
 #: its successor a number.  The sidecar is that loop, and it stores WHO measured
 #: (commit, boot tag, timestamp), never a bare figure.
 MEASURED_RECORD_NAME = "weg2_measured_record.json"
+
+
+def read_flip_currency_gib(root: str = "/sys/fs/cgroup") -> Optional[float]:
+    """``anon + shmem + slab_unreclaimable`` in GiB, or ``None``.
+
+    #1350.  THE SAME THREE TERMS THE 1 Hz OPERATOR SAMPLER SUMS
+    (``gpu-arb/weg2/hostsample_weg2xsn*.csv``), so a ``flip_ratchet_gib``
+    written by the front and the CSV the term was attributed on are the SAME
+    quantity and can be diffed row against row.
+
+    Deliberately NOT :func:`read_cgroup_pressure`, whose preferred form is
+    ``memory.current - inactive_file - active_file``: that is the better
+    instrument for a LEVEL against the reap watermark (it nets out kernel terms
+    the sum misses), but the ratchet is a DIFFERENCE of two readings minutes
+    apart, and the page-cache half of ``memory.current`` moves between them for
+    reasons that have nothing to do with the flip.  Two readings of the sum
+    subtract cleanly; two readings that each carry a different page-cache
+    residue do not.  ``memory.current`` itself is forbidden outright (#1309).
+
+    ``None`` when ``memory.stat`` is unreadable -- an absence, which the record
+    stores as ``flip_ratchet_gib: None`` and the next arm refuses on (W94).
+    """
+    try:
+        st: Dict[str, int] = {}
+        with open(f"{root}/memory.stat") as f:
+            for line in f:
+                parts = line.split()
+                if len(parts) == 2 and parts[1].isdigit():
+                    st[parts[0]] = int(parts[1])
+    except OSError:
+        return None
+    if not st:
+        return None
+    return (
+        st.get("anon", 0) + st.get("shmem", 0) + st.get("slab_unreclaimable", 0)
+    ) / GIB
 
 
 def read_cgroup_pressure(root: str = "/sys/fs/cgroup") -> Dict[str, Optional[float]]:
@@ -2329,6 +2902,11 @@ def dormant_image_sample(
     arm: Optional[Dict[str, float]] = None,
     ranks_per_group: int = 3,
     load_witness: Optional[Dict[str, int]] = None,
+    # #1350: the flip epoch this sample was taken IN, or None when it was not
+    # taken during a flip (the launcher's first sleep of P, before any flip
+    # exists). It is stored so `run_origin_gib` can say whether the floor it
+    # chose already CONTAINS the ratchet -- see `Weg2HostRatchetDoubleCharged`.
+    sampled_at_flip_epoch: Optional[int] = None,
 ) -> Dict[str, object]:
     """One group's dormant image, measured at its FIRST sleep.  Pure but for /proc.
 
@@ -2429,6 +3007,17 @@ def dormant_image_sample(
             int(arm["s_gb"]), int(arm["m_mib"]), ranks_per_group, images,
             s_gb_d=None if _arm_s_d is None else int(_arm_s_d),
             xchg_bounce_host_bytes=_arm_bounce_bytes,
+            # #1350 EXPLICIT 0.0, AND IT IS THE OPPOSITE DIRECTION TO THE TWO
+            # TERMS ABOVE. S_D and the bounce had to be ADDED here because they
+            # are arm charges the ledger adds back at prediction time. The
+            # ratchet must NOT be subtracted here for exactly the same reason
+            # read the other way round: this residual becomes the origin FLOOR
+            # (`run_origin_gib`), and the prediction adds the ratchet ON TOP of
+            # that origin. Subtracting it here and adding it there would make
+            # the term cancel itself, and the under-prediction #1350 names would
+            # survive the fix. What the FLOOR then carries instead is guarded by
+            # `sampled_at_flip_epoch` below and refused by W95.
+            flip_ratchet_gib=0.0,
         )
         # STORED, so the reader never has to GUESS which currency wrote a
         # record (#1326). `record_run_residual_gib` re-prices records that are
@@ -2460,6 +3049,15 @@ def dormant_image_sample(
         "shmem_after_bytes": shmem_after_bytes,
         "shmem_delta_gib": delta,
         "rss_shmem_gib": rss_gib,
+        # #1350: WHEN, relative to the flips, this sample was taken. The
+        # run-moment residual of a sample taken during or after the first flip
+        # pair ALREADY CONTAINS the ratchet (measured: `stored=` walks
+        # 2.31 -> 2.34 -> 4.09 -> 5.28 over the 0912 boots), so a prediction
+        # that uses it as its origin AND charges `flip_ratchet_gib` would count
+        # the same bytes twice. `None` = not during a flip.
+        "sampled_at_flip_epoch": (
+            None if sampled_at_flip_epoch is None else int(sampled_at_flip_epoch)
+        ),
         "weight_tags_gib": weight_tags_gib,
         "extra_gib": rss_gib - weight_tags_gib,
         "pids": seen,
@@ -2577,7 +3175,24 @@ def read_measured_record(
         return {}
     out: Dict[str, dict] = {}
     for e in entries:
-        if not isinstance(e, dict) or e.get("rss_shmem_gib") is None:
+        # #1350: TWO ENTRY SHAPES, ONE READER. An image entry carries
+        # `rss_shmem_gib`; the flip-ratchet entry (group "FLIP", written by the
+        # front at `WEG2-FLIP done epoch=2`) carries `flip_ratchet_gib` and no
+        # image. Admitting the second here is what makes the ratchet readable
+        # by "the same reader that reads run_origin_gib" instead of adding a
+        # second sidecar reader beside this one. The two consumers stay
+        # separated by their own fields, not by this filter:
+        # `resolve_image_terms` reads only the "P"/"D" keys and
+        # `run_origin_gib` only entries carrying `run_residual_gib`, so neither
+        # can see the other's rows.
+        # KEY PRESENCE, not a non-None value: a boot that reached
+        # `done epoch=2` with an unreadable memory.stat writes the entry with
+        # `flip_ratchet_gib: None`, and that entry is EVIDENCE -- it lets the
+        # W94 refusal name the boot that could not measure instead of reporting
+        # the same emptiness as a boot that never flipped.
+        if not isinstance(e, dict) or (
+            e.get("rss_shmem_gib") is None and "flip_ratchet_gib" not in e
+        ):
             continue
         g = str(e.get("group", ""))
         if not g:
@@ -2712,6 +3327,10 @@ def choose(
     measured_record: Optional[Dict[str, dict]] = None,
     margin: Optional[Margin] = None,
     xchg_bounce_host_bytes: int = 0,
+    # #1350: resolved by the caller (`resolve_flip_ratchet_gib`) and handed in,
+    # like `xchg_bounce_host_bytes`. `None` keeps every pre-#1350 caller and
+    # every recorded arm byte-identical.
+    flip_ratchet: Optional["FlipRatchet"] = None,
 ) -> Tuple[Arm, Optional[float], List[str]]:
     """Walk the ladder; return (arm, reap headroom GiB, printed lines) or W20/W21.
 
@@ -2761,6 +3380,7 @@ def choose(
             s_gb_d=s_gb_d,
             measured_record=measured_record,
             xchg_bounce_host_bytes=xchg_bounce_host_bytes,
+            flip_ratchet=flip_ratchet,
         )
         for s, m in arms
     ]
@@ -2829,7 +3449,11 @@ def choose(
     # box will actually spend and the idle anon drift it will actually
     # accumulate over the planned window. Both WILL happen during the window,
     # so an arm that has not left room for them is already lost.
-    margin = margin if margin is not None else resolve_margin()
+    margin = margin if margin is not None else resolve_margin(
+        flip_ratchet_charged_gib=(
+            None if flip_ratchet is None else flip_ratchet.charged_gib
+        )
+    )
     hard_bound_gib = watermark_gib - margin.total_gib
     lines.append(watermark_provenance(margin, watermark_gib))
     chosen: Optional[Arm] = None
@@ -2894,7 +3518,27 @@ def choose(
             # transition unobservable. Sigma H is also on the TERMS line, but
             # that is a different line and a reader comparing two lines is a
             # reader who can mismatch two boots.
-            f"host_weights={arm.terms['host_ring_gib']:.2f} -> "
+            f"host_weights={arm.terms['host_ring_gib']:.2f} "
+            # #1350 THE FOUR RATCHET FIELDS, ON THE SAME LINE AS THE TERMS THEY
+            # JOIN.  `ratchet_per_flip` is ONE full pair measured
+            # `FLIP begin epoch=0` -> `FLIP done epoch=2`, `flips_priced` is the
+            # assumption (1, because the step SATURATES at the first waking of
+            # each group -- 3.16 of weg2xsn20's 4.46 GiB fall in the first two
+            # legs of eight), `ratchet_charged` is their product and the term
+            # actually inside `run_peak`, and `source` says whether it is this
+            # line's own record or the recorded seed.  An arm that was handed no
+            # measurement prints ABSENT here, never 0.00: an unpriced term and a
+            # term priced at zero must not share a spelling.
+            + (
+                "ratchet_per_flip=ABSENT flips_priced=0 ratchet_charged=ABSENT "
+                f"source={arm.terms.get('flip_ratchet_source')} "
+                if arm.terms.get("flip_ratchet_gib") is None else
+                f"ratchet_per_flip={float(arm.terms['flip_ratchet_per_flip_gib']):.2f} "
+                f"flips_priced={int(arm.terms['flip_ratchet_flips_priced'])} "
+                f"ratchet_charged={float(arm.terms['flip_ratchet_gib']):.2f} "
+                f"source={arm.terms.get('flip_ratchet_source')} "
+            )
+            + f"-> "
             f"leftover launch={arm.launch_leftover_gib:.2f} GiB "
             # #1317n BOTH FORMS ON THE LINE, because the class assignment is
             # the whole change and a reader must be able to see it rather than
@@ -2911,7 +3555,28 @@ def choose(
             "run_peak="
             + ("unreadable (no cgroup sample)" if predicted is None else f"{predicted:.2f} GiB")
             + f" vs hard bound {hard_bound_gib:.2f} GiB (reap {watermark_gib:.2f} - "
-            f"margin {margin.total_gib:.2f}) => "
+            f"margin {margin.total_gib:.2f}) "
+            # #1350 THE HONEST BOUND, PRINTED WHERE THE BOUND IS USED. Patch C
+            # takes the flip transient out of the BOOT margin -- the prediction
+            # now charges the flip's permanent step itself -- which moves the
+            # hard bound 87.30 -> 90.18 GiB and therefore FUNDS ARMS THAT ARE
+            # REFUSED TODAY. That is the danger direction of this whole ledger,
+            # so the line states the condition attached to it instead of
+            # letting a reader discover the move from two numbers:
+            # ANALYSE_1350_HOST_TERM_0912.md SS3 -- the rise is legitimate ONLY
+            # together with the CHARGED ratchet term, and the residual row it
+            # leaves standing (sb4 5.16) must be RE-MEASURED on ratchet-priced
+            # boots before it can be trusted at this bound. None exists yet.
+            + (
+                "[#1350: transient OUT of the boot margin because run_peak now "
+                f"CHARGES the ratchet -- bound {87.30:.2f} -> {hard_bound_gib:.2f} "
+                "GiB. HONEST LIMIT: the residual row left standing (weg2sb4 5.16, "
+                "60-min idle window) was measured with the ratchet UNCHARGED and "
+                "has NOT been re-measured on a ratchet-priced boot; until it is, "
+                "this bound is provisional in the funding direction] "
+                if not margin.transient_in_boot else ""
+            )
+            + "=> "
             + ("FUNDABLE" if ok else "refused (binding: " + ", ".join(binding) + ")")
         )
         if ok and chosen is None:
@@ -2971,6 +3636,10 @@ def choose(
                         cg_ceiling_bytes=cg_ceiling_bytes, s_gb_d=sd,
                         ring_absent_by_design=ring_absent_by_design,
                         measured_record=measured_record,
+                        # #1350: the cap advice must be priced by the SAME model
+                        # the ladder was, or it would name a cap that only fits
+                        # an arm the ledger no longer offers.
+                        flip_ratchet=flip_ratchet,
                     )
                 except Exception:  # noqa: BLE001 - advice may never mask the refusal
                     return False

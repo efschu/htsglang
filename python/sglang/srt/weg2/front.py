@@ -1627,6 +1627,17 @@ class Front:
         self.dc_reserve = dc_reserve
         self.w_s = w_s
         self.epoch = 0
+        #: #1350: the non-reclaimable reading (anon+shmem+slab_unreclaimable)
+        #: taken at `WEG2-FLIP begin epoch=0`, and its timestamp. The FIRST
+        #: FLIP PAIR's permanent step is `post - pre`, and it is written into
+        #: the sidecar at `WEG2-FLIP done epoch=2` so the NEXT boot's ledger can
+        #: CHARGE it instead of leaving it to a margin term measured by an
+        #: instrument that is structurally blind to a monotone rise
+        #: (ANALYSE_1350_HOST_TERM_0912.md SS1.4). No new sampler and no new
+        #: hook: both moments are lines this front already logs.
+        self._flip_ratchet_pre_gib: Optional[float] = None
+        self._flip_ratchet_pre_at: str = ""
+        self._flip_ratchet_written = False
         # C14 / FIX 2 round 2, finding 1: THE BOOT HALF OF THE CREDIT EPOCH.
         # ``self.epoch`` alone dates a flip only WITHIN this front; the counter
         # file it dates lives in /dev/shm and outlives the boot, so flip 7 of
@@ -3806,6 +3817,12 @@ class Front:
             # non-zero and the record is stamped `loaded` -- which is what
             # sn6s's 16.34 GiB sample was, taken at 15:21:55Z with the 120k
             # load running, while sn6p's 9.01 GiB was taken idle.
+            # #1350: this sample is taken INSIDE a flip, so its run-moment
+            # residual already contains that flip's permanent step. Stamping
+            # the epoch is what lets `run_origin_gib` mark the floor and
+            # `predicted_run_peak_gib` refuse (W95) rather than add the same
+            # bytes to the origin and to the charges.
+            sampled_at_flip_epoch=self.epoch,
             load_witness={
                 "queued": len(self.queue),
                 "outstanding": sum(
@@ -3824,6 +3841,73 @@ class Front:
                              "will price the recorded dk7 reading instead", self.measured_record, e)
         return rec
 
+    def _write_flip_ratchet(self, done_epoch: int) -> None:
+        """#1350 READING 2 OF 2: the FIRST FULL PAIR's permanent step, recorded.
+
+        Called from the `WEG2-FLIP done` path and does nothing unless this is
+        ``done epoch=2`` -- one D->P leg plus one P->D leg after the ``begin
+        epoch=0`` reading, i.e. exactly one pair, which is what the next boot's
+        ledger prices (:func:`host_ledger.resolve_flip_ratchet_gib`).
+
+        WHY THE PAIR AND NOT THE PEAK. The peak-minus-origin figure the analysis
+        tabulates (weg2xsn20 +4.462 GiB) is not knowable until the boot is over,
+        and a term the ledger charges must be readable from a record a
+        PREDECESSOR wrote. The pair is both legs' step, measured at two moments
+        this front already logs, available while the boot still runs, and it is
+        the conservative-enough half: it captures 3.161 of weg2xsn20's 4.462 and
+        4.049 of weg2xsn24's 4.280.
+
+        A boot that never completes a pair writes NOTHING (weg2xsn21b died in
+        leg 2 on W85) and the next arm refuses by name rather than inventing a
+        number. Both readings unreadable -> the entry is still written, with
+        ``flip_ratchet_gib: None``, because why a boot could not measure is
+        evidence.
+        """
+        if self._flip_ratchet_written or int(done_epoch) != 2:
+            return
+        self._flip_ratchet_written = True
+        post = host_ledger.read_flip_currency_gib()
+        at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        rec = host_ledger.flip_ratchet_record(
+            pre_gib=self._flip_ratchet_pre_gib,
+            post_gib=post,
+            boot_tag=self.tag,
+            commit=self.commit,
+            at=at,
+            pre_at=self._flip_ratchet_pre_at,
+            post_at=at,
+            # The same shape `dormant_image_sample` builds its form key from --
+            # the terms that fix the host posten -- so a reader can tell whether
+            # a recorded ratchet speaks for THIS boot's form.
+            form_key=f"wtags={len(self.weights_tags)}",
+        )
+        val = rec["flip_ratchet_gib"]
+        logger.info(
+            "WEG2-FLIP-RATCHET post epoch=2 nonreclaim=%s GiB pre=%s GiB -> "
+            "flip_ratchet_gib=%s (ONE full pair, anon+shmem+slab_unreclaimable; "
+            "#1350: the next boot CHARGES this instead of leaving it to a margin "
+            "term whose LOCAL instrument reads negative on a staircase)",
+            "unreadable" if post is None else f"{post:.3f}",
+            "unreadable" if self._flip_ratchet_pre_gib is None
+            else f"{self._flip_ratchet_pre_gib:.3f}",
+            "UNMEASURED (a reading was absent -- the next arm refuses W94, it "
+            "does not read this as 0)" if val is None else f"{float(val):.3f} GiB",
+        )
+        if not self.measured_record:
+            logger.error(
+                "WEG2-FLIP-RATCHET not persisted: this front has no measured-record "
+                "path, so the next boot will find no flip_ratchet_gib and refuse W94"
+            )
+            return
+        try:
+            host_ledger.append_measured_record(self.measured_record, rec)
+        except OSError as e:
+            logger.error(
+                "WEG2-FLIP-RATCHET not persisted to %s: %s -- the next boot will "
+                "find no flip_ratchet_gib and refuse W94 rather than price a 0",
+                self.measured_record, e,
+            )
+
     async def flip(self, src: str, dst: str) -> None:
         S, D = self.groups[src], self.groups[dst]
         self.state = "flipping"
@@ -3835,6 +3919,23 @@ class Front:
         self._flip_t0 = t_flip0
         self._flip_stage = "drain"
         logger.info("WEG2-FLIP begin epoch=%d sleep=%s wake=%s outstanding=%d queue=%d", self.epoch, src, dst, len(S.outstanding), len(self.queue))
+        # #1350 READING 1 OF 2, at a moment this front already owns. Only at
+        # epoch 0: the term is the step the FIRST waking of each group adds, it
+        # SATURATES after the first pair (weg2xsn20: 3.16 of 4.46 GiB in the
+        # first two legs of eight), and re-taking it later would measure a
+        # plateau against a plateau.
+        if self.epoch == 0 and self._flip_ratchet_pre_gib is None:
+            self._flip_ratchet_pre_gib = host_ledger.read_flip_currency_gib()
+            self._flip_ratchet_pre_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+            logger.info(
+                "WEG2-FLIP-RATCHET pre epoch=0 nonreclaim=%s GiB at=%s "
+                "(anon+shmem+slab_unreclaimable, NEVER memory.current; #1350 -- "
+                "the post reading lands at `WEG2-FLIP done epoch=2` and the "
+                "difference is written to the measured record as flip_ratchet_gib)",
+                "unreadable" if self._flip_ratchet_pre_gib is None
+                else f"{self._flip_ratchet_pre_gib:.3f}",
+                self._flip_ratchet_pre_at,
+            )
         # 1. drain (W1/W2)
         if not await self.drain(S):
             # #1317c PROGRESS BEFORE VERDICT. A window in which D made decode
@@ -4149,6 +4250,7 @@ class Front:
         # None at its first line for the whole boot. Read from the SAME key
         # the log line reads, so the two can never disagree again.
         self.note_x_sample("flip_s", float(rec["flip_ms"]) / 1000.0)
+        self._write_flip_ratchet(rec["epoch"])
         logger.info("WEG2-FLIP done epoch=%d slept=%s woke=%s drain+quiesce=%d ms sleep=%d ms (kv RPC + the %s leg of the gathered pair) "
                     "wake=%d ms (the %s leg + kv RPC) "
                     "interleave=%d ms (NOT sleep+wake: the legs overlap -- gather wall %d ms against %d + %d ms of legs) "
