@@ -1131,7 +1131,6 @@ def test_a_skipped_piece_is_counted_on_the_reading_line(hooked, caplog):
     the graded population and the line says nothing, so MATCH covers a set the
     reader cannot bound.
     """
-    mod = _mod()
     inv = _inventory()
     pairs = [(g.name, t) for g, t in inv]
     undescribable = torch.randn(64, 64).as_strided((8, 8), (2, 16))
@@ -1197,7 +1196,6 @@ def test_the_draft_runner_pieces_are_actually_walked(hooked, monkeypatch, caplog
     silently collapse into one answer.
     """
     monkeypatch.setenv(wx.WEIGHT_SOURCE_ENV, wx.WEIGHT_SOURCE_EXCHANGE)
-    mod = _mod()
     main = _inventory()
     draft = _draft_inventory()
     m = hooked(main, draft=draft)
@@ -1233,7 +1231,6 @@ def test_the_verdict_separates_paused_from_resident_pieces(hooked, caplog):
     A tag that was never paused in this leg contributes MATCH by construction,
     so ``n_tensors`` overstates what the exchange moved.
     """
-    mod = _mod()
     inv = _inventory()
     m = hooked(inv)
     with caplog.at_level("INFO"):
@@ -1301,7 +1298,6 @@ def test_the_graded_count_equals_the_producers_walk(hooked, caplog):
     A shrunken population on BOTH sides reads as a clean MATCH; the only thing
     that catches it is a count against the producer's own walk.
     """
-    mod = _mod()
     m = hooked(_inventory())
     with caplog.at_level("INFO"):
         m._weg2_seam_digest_before(_Req(), ["weights_0", "weights"])
