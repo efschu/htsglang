@@ -219,12 +219,12 @@ def test_deposit_then_collect_moves_the_bytes_and_needs_one_pointer_each(
     nonce = "phase1"
     wb.run_bounce_leg(deposit_descs, src_ops, nonce, slot_bytes=SLOT, depth=1,
                       mode=wx.INJECT_AUTHORITATIVE, phase=wb.PHASE_DEPOSIT,
-                      rendezvous=rv, shm_root=str(tmp_path))
+                      rendezvous=rv, shm_root=str(tmp_path), lane="p0")
     assert rv.posted, "the deposit must post `full` after its sync"
 
     wb.run_bounce_leg(collect_descs, dst_ops, nonce, slot_bytes=SLOT, depth=1,
                       mode=wx.INJECT_AUTHORITATIVE, phase=wb.PHASE_COLLECT,
-                      rendezvous=rv, shm_root=str(tmp_path))
+                      rendezvous=rv, shm_root=str(tmp_path), lane="p0")
     assert rv.emptied, "the collect must release the slot"
     assert _read(dst_ops, dst_ptr, nbytes) == b"\xab" * nbytes, (
         "the bytes did not cross the slot")
@@ -250,7 +250,7 @@ def test_M1_a_collect_before_any_deposit_refuses_and_issues_nothing(tmp_path):
         wb.run_bounce_leg(descs, dst_ops, "m1", slot_bytes=SLOT, depth=1,
                           mode=wx.INJECT_AUTHORITATIVE,
                           phase=wb.PHASE_COLLECT, rendezvous=_Rendezvous(),
-                          shm_root=str(tmp_path))
+                          shm_root=str(tmp_path), lane="p0")
     assert "W68" in str(exc.value)
     assert "not posted full" in str(exc.value)
     assert _read(dst_ops, dst_ptr, nbytes) == b"\x11" * nbytes, (
@@ -278,7 +278,7 @@ def test_M2_a_deposit_that_never_posts_full_makes_the_collect_refuse(tmp_path):
         run_bytes=nbytes, spitch=0, dpitch=0, src_off=0, dst_off=0)],
         src_ops, "m2", slot_bytes=SLOT, depth=1,
         mode=wx.INJECT_AUTHORITATIVE, phase=wb.PHASE_DEPOSIT, rendezvous=rv,
-        shm_root=str(tmp_path))
+        shm_root=str(tmp_path), lane="p0")
     assert not rv.posted
 
     with pytest.raises(wb.Weg2XchgBouncePhaseUnordered):
@@ -288,7 +288,7 @@ def test_M2_a_deposit_that_never_posts_full_makes_the_collect_refuse(tmp_path):
             run_bytes=nbytes, spitch=0, dpitch=0, src_off=0, dst_off=0)],
             dst_ops, "m2", slot_bytes=SLOT, depth=1,
             mode=wx.INJECT_AUTHORITATIVE, phase=wb.PHASE_COLLECT,
-            rendezvous=rv, shm_root=str(tmp_path))
+            rendezvous=rv, shm_root=str(tmp_path), lane="p0")
     assert _read(dst_ops, dst_ptr, nbytes) == b"\x22" * nbytes
 
 
@@ -314,7 +314,7 @@ def test_a_slot_whose_byte_count_disagrees_refuses_before_the_first_copy(
             run_bytes=nbytes, spitch=0, dpitch=0, src_off=0, dst_off=0)],
             dst_ops, "short", slot_bytes=SLOT, depth=1,
             mode=wx.INJECT_AUTHORITATIVE, phase=wb.PHASE_COLLECT,
-            rendezvous=rv, shm_root=str(tmp_path))
+            rendezvous=rv, shm_root=str(tmp_path), lane="p0")
     assert "disagree about what is in the slot" in str(exc.value)
     assert _read(dst_ops, dst_ptr, nbytes) == b"\x33" * nbytes
 
@@ -358,20 +358,22 @@ class _FakeSems:
         self.counts[k] += 1
 
 
-class _FakeRegion:
-    """The slot record, as the two halves actually use it."""
+class _FakeSlots:
+    """The BOUNCE's own (seq, bytes) record -- never the region's.
+
+    weg2xsn24 read `carries 1080 bytes` out of the region's slot record
+    because `run_producer_pair` publishes the RING's counts there
+    (weight_exchange_transport.py:1786). One ledger, two payloads.
+    """
 
     def __init__(self):
-        self.slots = {}
-        self.boot_nonce = "adapter"
+        self.rows = {}
 
-    def publish(self, pair, slot, bytes_filled, *, checksum=0):
-        self.slots[(int(pair), int(slot))] = int(bytes_filled)
+    def publish(self, *, slot, seq, nbytes, pair=None, card=None):
+        self.rows[(pair, card, int(slot))] = (int(seq), int(nbytes))
 
-    def read_slot(self, pair, slot):
-        class _R:
-            bytes_filled = self.slots.get((int(pair), int(slot)), 0)
-        return _R()
+    def read(self, *, slot, pair=None, card=None):
+        return self.rows.get((pair, card, int(slot)), (-1, 0))
 
 
 def test_pair_of_names_the_cross_pair_and_the_diagonal_separately():
@@ -407,24 +409,24 @@ def test_the_descs_are_split_by_pair_because_the_semaphores_are_named_that_way()
 
 def test_the_rendezvous_obeys_the_order_run_producer_pair_states():
     """fill -> sync -> publish -> post(full); never post before publish."""
-    sems, region = _FakeSems(), _FakeRegion()
-    rv = wb.CrossSlotRendezvous(region, sems, pair=0, budget_s=0.01)
+    sems, slots = _FakeSems(), _FakeSlots()
+    rv = wb.CrossSlotRendezvous(sems, slots, pair=0, budget_s=0.01)
 
     assert rv.wait_empty(slot=0, seq=0) is True
     rv.post_full(slot=0, seq=0, nbytes=4096)
     # The publish must already be visible when `full` is posted.
     kinds = [k for what, k in sems.log if what == "post"]
     assert kinds and kinds[-1][2] == "full"
-    assert region.slots[(0, 0)] == 4096
+    assert slots.read(slot=0, pair=0) == (0, 4096)
     assert rv.wait_full(slot=0, seq=0) == 4096
     rv.post_empty(slot=0, seq=0)
     assert sems.counts[(0, 0, "empty")] == 1
 
 
 def test_a_collect_whose_producer_never_posted_gets_None_not_a_stale_count():
-    sems, region = _FakeSems(full=0), _FakeRegion()
-    region.publish(0, 0, 9999)          # a PREVIOUS band's count, still there
-    rv = wb.CrossSlotRendezvous(region, sems, pair=0, budget_s=0.01)
+    sems, slots = _FakeSems(full=0), _FakeSlots()
+    slots.publish(slot=0, seq=0, nbytes=9999, pair=0)
+    rv = wb.CrossSlotRendezvous(sems, _FakeSlots(), pair=0, budget_s=0.01)
     assert rv.wait_full(slot=0, seq=0) is None, (
         "an unposted slot must read None even when the record still carries a "
         "byte count -- the record is not the handshake")
@@ -435,8 +437,8 @@ def test_a_deposit_cannot_claim_a_slot_the_consumer_has_not_drained(tmp_path):
     nbytes = 4096
     src_ops = FakeDeviceOps(str(tmp_path), rank=0)
     src_ptr = src_ops.raw_malloc(0, nbytes)
-    sems, region = _FakeSems(empty=0), _FakeRegion()   # nothing drained
-    rv = wb.CrossSlotRendezvous(region, sems, pair=0, budget_s=0.01)
+    sems, slots = _FakeSems(empty=0), _FakeSlots()   # nothing drained
+    rv = wb.CrossSlotRendezvous(sems, _FakeSlots(), pair=0, budget_s=0.01)
     with pytest.raises(wb.Weg2XchgBouncePhaseUnordered) as exc:
         wb.run_bounce_leg([wx.XchgDesc(
             tag=TAG, src_rank=0, dst_rank=1, param_name="model.layers.0.w",
@@ -444,7 +446,7 @@ def test_a_deposit_cannot_claim_a_slot_the_consumer_has_not_drained(tmp_path):
             run_bytes=nbytes, spitch=0, dpitch=0, src_off=0, dst_off=0)],
             src_ops, NONCE, slot_bytes=SLOT, depth=1,
             mode=wx.INJECT_AUTHORITATIVE, phase=wb.PHASE_DEPOSIT,
-            rendezvous=rv, shm_root=str(tmp_path))
+            rendezvous=rv, shm_root=str(tmp_path), lane="p0")
     assert "still full when this deposit tried to claim it" in str(exc.value)
 
 
@@ -490,7 +492,7 @@ def test_the_adapter_passes_deposit_on_source_and_collect_on_the_import_hooks():
             _Stub()._weg2_xchg_bounce_leg(
                 descs=descs, ops=None, boot_nonce=NONCE, slot_bytes=SLOT,
                 depth=1, mode=wx.INJECT_AUTHORITATIVE, hook=hook,
-                region=_FakeRegion(), sems=_FakeSems())
+                region=object(), sems=_FakeSems())
             phases = {p for p, _rv, _r in seen}
             # EVERY LEG IS PHASED, DIAGONAL INCLUDED -- and this assertion was
             # the OPPOSITE one commit ago, which is the finding worth keeping.
@@ -511,8 +513,11 @@ def test_the_adapter_passes_deposit_on_source_and_collect_on_the_import_hooks():
             pairs = {tuple(s[2][0]) for s in seen}
             assert pairs == {(0, 1), (1, 1)}, seen
             kinds = {type(rv).__name__ for rv in rendezvous_seen}
-            assert kinds == {"CrossSlotRendezvous", "DiagonalSlotRendezvous"}, (
-                kinds)
+            assert kinds == {"CrossSlotRendezvous"}, kinds
+            # ONE class, two keyings: the cross pair by pair index, the
+            # diagonal by CARD (#1334). Slice 3 had a second class for the
+            # diagonal whose byte check could not go red; it is gone.
+            assert {(rv.pair is None) for rv in rendezvous_seen} == {True, False}
     finally:
         real.run_bounce_leg = orig
 
