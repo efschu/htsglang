@@ -609,12 +609,32 @@ def n_cards_default() -> int:
 # two facts is the second-bookkeeping defect this whole slice is an instance
 # of removing.
 
-DIR_ENV = "SGLANG_PHASE_FOOTPRINT_DUMP"
+#: MEASURED, not chosen by taste.  This was ``SGLANG_PHASE_FOOTPRINT_DUMP``
+#: first, so that the manifests would share the #1292/#1348 dump directory and
+#: no new name would exist -- and that was WRONG in the one way that matters:
+#: ``weg2/launcher.py``'s ``coverage_dump_dir`` only puts that variable into a
+#: rank's environment under ``--xchg-coverage-diff`` and returns ``""``
+#: otherwise, so a writer keyed on it finds nothing on every boot that does not
+#: also arm the coverage tracer.  It would have written no file and logged no
+#: line: built, green at the desk, never executed.  One new name for a fact
+#: that had none.
+#:
+#: THE TOKEN IS STILL NOT NEW: the boot nonce is the region's own
+#: (``weight_exchange_region.ENV_REGION_BOOT``), already published to both
+#: groups, so a stale manifest from a previous boot in the same evidence
+#: directory is filtered rather than merged.
+DIR_ENV = "SGLANG_WEG2_XCHG_MANIFEST_DIR"
+
+#: Read as a FALLBACK only, for a process that has the coverage dump directory
+#: and not this one (the hermetic tools).  Never the primary: see above.
+FALLBACK_DIR_ENV = "SGLANG_PHASE_FOOTPRINT_DUMP"
 
 
 def manifest_dir(default: str = "") -> str:
-    """The shared dump directory, or ``default``.  One env read."""
-    return str(os.environ.get(DIR_ENV, "") or default)
+    """Where this boot's manifests go, or ``default``.  Two env reads."""
+    return str(os.environ.get(DIR_ENV, "")
+               or os.environ.get(FALLBACK_DIR_ENV, "")
+               or default)
 
 
 def boot_token() -> str:

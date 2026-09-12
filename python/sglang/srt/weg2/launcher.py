@@ -71,6 +71,7 @@ from sglang.srt.weg2 import admin_key as admin_key_mod
 from sglang.srt.registry import nvml as nvml_registry
 from sglang.srt.weg2 import (
     checkpoint_census,
+    xchg_manifest,
     corridor_budget,
     host_ledger,
     ring_table,
@@ -3467,6 +3468,7 @@ def prepare_xchg_env(log: Log, boot_nonce: str, weight_source: str,
                        bounce_terms: Optional[xchg_bounce.BounceTerms] = None,
                        inject_mode: str = weight_exchange.INJECT_SHADOW,
                        legs: str = weight_exchange.LEGS_BOTH,
+                       manifest_dir: str = "",
                        waves: Optional[Sequence[Sequence[str]]] = None,
                        ) -> Dict[str, str]:
     """#1273 S5/S6: arm the region for EVERY non-default arm and publish it.
@@ -3556,6 +3558,26 @@ def prepare_xchg_env(log: Log, boot_nonce: str, weight_source: str,
     # like a leg that ran clean, which is the shape four boots of this campaign
     # were unreadable for.
     env[weight_exchange.XCHG_LEGS_ENV] = str(legs)
+    # #1330 B4n: WHERE THE PLACEMENT MANIFESTS LAND.
+    #
+    # A SEPARATE NAME WAS NOT THE FIRST CHOICE, and the reason it is the right
+    # one is measured rather than argued.  The manifest was written first
+    # against `SGLANG_PHASE_FOOTPRINT_DUMP`, the directory the #1292/#1348
+    # coverage dumps share -- but this launcher only ever puts that variable in
+    # a rank's environment under `--xchg-coverage-diff` (`coverage_dump_dir`,
+    # which returns "" otherwise so the OFF state is byte-identical).  A writer
+    # keyed on it would therefore have found an EMPTY directory on every boot
+    # that did not also arm the coverage tracer, returned None, and left no
+    # file and no line: built, green at the desk, and never executed -- the
+    # exact class this slice exists to remove, re-entered from the publisher
+    # side.
+    #
+    # The TOKEN is still not new: the join keys on the region's own boot nonce
+    # (`SGLANG_WEG2_XCHG_BOOT`, published four statements up), so a stale
+    # manifest from a previous boot in the same evidence directory is filtered
+    # rather than merged.  One new name for one fact that had none, not a
+    # second answer to one that did.
+    env[xchg_manifest.DIR_ENV] = str(manifest_dir or EVIDENCE_DIR)
     # B4d: THE PRICED WAVE PARTITION, published by the same channel and for a
     # sharper version of the same reason.  A rank cannot derive this one at
     # all: a chunk tag is a LAYER BAND, so the map needs the layer count of
@@ -4316,7 +4338,11 @@ def build_env(tree: str, venv: str, cvd: str, store_dir: str, debug_hold: bool, 
                 # ``SGLANG_WEG2_XCHG_LEGS=pp_to_tp`` would SILENTLY REMOVE
                 # half the legs of a boot that asked for both, and a skipped
                 # leg reads in a log exactly like a leg that ran clean.
-                weight_exchange.XCHG_LEGS_ENV):
+                weight_exchange.XCHG_LEGS_ENV,
+                # #1330 B4n: launcher OUTPUT, same rule -- an inherited
+                # directory would make a ring boot write placement manifests
+                # into whatever path the operator's shell happened to name.
+                xchg_manifest.DIR_ENV):
         env.pop(key, None)
     # #1350: armed ONLY by ``--weg2-seam-digest``, and on any weight-source
     # arm -- the grader asks "did the round trip return my bytes", which is a
@@ -9839,6 +9865,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                                   bounce_terms=bounce_terms_for_ranks,
                                   inject_mode=ns.weg2_xchg_inject,
                                   legs=ns.weg2_xchg_legs,
+                                  manifest_dir=getattr(ns, "evidence_dir",
+                                                       EVIDENCE_DIR),
                                   # B4d: the partition W71 PRICED, not a second
                                   # derivation of it -- `xchg_res` is the solved
                                   # table and carries the census's own list.
