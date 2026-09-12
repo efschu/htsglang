@@ -951,6 +951,221 @@ class Weg2HostWatermarkBreached(RuntimeError):
     went into the OOM anyway."""
 
 
+class Weg2HostRateLatched(RuntimeError):
+    """W98 (#1361): the PROJECTED non-reclaimable reading crosses the reap mark.
+
+    WHY A PROJECTION AND NOT A LEVEL.  Boot weg2xsn26b was killed by the GLOBAL
+    host OOM killer (measured: ``/.lxc`` ``memory.events`` ``max 0 high 0``,
+    ``oom_kill`` 1 -> 3, so no cgroup limit was ever hit) while the level guard
+    at 93.0 GiB never fired -- and it never fired because the series it reads
+    STOPPED DELIVERING.  The 1 Hz sampler's own gaps at the death were 19 / 25 /
+    18 s, and the last reading before the blind window was 82.28 GiB while
+    ``memory.peak`` moved to 95.86.  In the final measured seconds ``shmem``
+    was climbing at **2.4-3.3 GiB/s** (50.157 -> 53.415 -> 55.847 in two
+    samples), so the 13.6 GiB to the mark is FOUR TO SIX SECONDS of that slope.
+    A level guard sampled at 1 Hz cannot see it; a level guard whose sampler is
+    starved by the very thrashing it should catch cannot see anything at all.
+
+    So this latch fires on ``nonreclaim + rate x lookahead``, on its OWN
+    cadence, and the line carries ``rate=`` and ``projected=`` so the next
+    reader can check the projection instead of trusting it.  A SAMPLER GAP is
+    itself a finding and gets its own line (``gap_s=``): during a leg, a hole
+    longer than :data:`RATE_LATCH_GAP_S` is the signature that preceded this
+    death, and a guard that goes quiet must SAY that it went quiet.
+
+    NOT A SECOND CURRENCY.  The currency stays ``anon+shmem+slab_unreclaimable``
+    -- the #1361 analysis refuted the file-backed hypothesis outright (at the
+    last sample ``file - shmem`` was **0.008 GiB**; there was no page cache to
+    blame).  What was wrong was the CADENCE and the blindness, not the unit.
+    """
+
+
+#: #1361: how far ahead the latch projects, seconds.  FIVE, because the
+#: measured climb that killed weg2xsn26b covered its remaining 13.6 GiB in 4-6 s
+#: at 2.4-3.3 GiB/s -- a lookahead shorter than the event it must pre-empt is
+#: decoration, and one much longer latches on noise.
+RATE_LATCH_LOOKAHEAD_S = 5.0
+#: The window the rate is fitted over.  Long enough that one jittery pair does
+#: not latch, short enough to see a 3 GiB/s ramp: at that slope 3 s of window
+#: still carries ~9 GiB of signal.
+RATE_LATCH_WINDOW_S = 3.0
+#: A hole in the reader's own series longer than this is REPORTED as a finding.
+#: The deaths' own gaps were 19 / 25 / 18 s, so 3 s is far inside the signature
+#: and still above normal scheduling jitter at a 200-500 ms cadence.
+RATE_LATCH_GAP_S = 3.0
+
+
+def reap_model_line(
+    memtotal_bytes: int,
+    memavailable_bytes: Optional[int],
+    root_current_bytes: Optional[int],
+) -> str:
+    """#1361 (2): the reap mark MEASURED, with the constant as a cross-check.
+
+    :data:`OBSERVED_REAP_NONRECLAIM_BYTES` is 95.90 GiB because two boots were
+    reaped there.  It is NOT a property of the box: it is
+    ``host RAM minus whatever is OUTSIDE this cgroup at that moment``, and the
+    outside term is real and large.  Measured on this rig at idle: ZFS ARC held
+    **5.01 GiB** (``c_max`` 5.00) while the container's own ``Cached`` read
+    1.65 GiB and the cgroup's ``file`` 1.58 -- the ARC appears in NO container
+    figure, because it is host kernel memory charged to no cgroup at all.  Cap
+    it and the mark moves, with nothing in our own instruments changing.
+
+    So the mark is DERIVED here and the constant is printed BESIDE it as the
+    cross-check it has become.  ``outside`` is what neither this cgroup nor the
+    free pool holds; an unreadable term prints ``unreadable`` and the line falls
+    back to the constant, saying so, rather than inventing a mark.
+    """
+    total = memtotal_bytes / GIB
+    if memavailable_bytes is None or root_current_bytes is None:
+        return (
+            f"WEG2-HOST REAP MODEL: MemTotal={total:.2f} GiB outside=unreadable "
+            f"reap_mark=FALLBACK {OBSERVED_REAP_NONRECLAIM_BYTES / GIB:.2f} GiB "
+            f"(the recorded constant; MemAvailable or the root cgroup reading was "
+            f"absent, and an absent term is never priced as zero)"
+        )
+    avail = memavailable_bytes / GIB
+    cur = root_current_bytes / GIB
+    outside = total - avail - cur
+    if outside < 0.0:
+        # THE TWO TERMS OVERLAP, and clamping it to zero would hide that.
+        # `MemAvailable` already counts reclaimable pages that the cgroup's own
+        # `file` also counts, so on a QUIET box the subtraction goes negative --
+        # measured on this rig at idle: 118.05 - 117.67 - 7.56 = -7.18 GiB. A
+        # negative `outside` is therefore not "nothing outside", it is "this
+        # arithmetic does not separate the two here", and the honest answer is
+        # to say so and keep the constant rather than to publish a mark that is
+        # too HIGH -- which is the funding direction.
+        return (
+            f"WEG2-HOST REAP MODEL: MemTotal={total:.2f} MemAvailable={avail:.2f} "
+            f"root_current={cur:.2f} -> outside=OVERLAP {outside:.2f} GiB "
+            f"reap_mark=FALLBACK {OBSERVED_REAP_NONRECLAIM_BYTES / GIB:.2f} GiB. "
+            f"MemAvailable already counts reclaimable pages this cgroup also "
+            f"counts, so the difference does not separate them on a quiet box "
+            f"(measured idle here: 118.05 - 117.67 - 7.56 = -7.18). The model "
+            f"needs the terms taken UNDER LOAD, where the cgroup holds anon and "
+            f"shmem that MemAvailable cannot count -- and it REFUSES to publish a "
+            f"mark it cannot derive rather than publishing one that is too high"
+        )
+    mark = total - outside
+    const = OBSERVED_REAP_NONRECLAIM_BYTES / GIB
+    return (
+        f"WEG2-HOST REAP MODEL: MemTotal={total:.2f} outside={outside:.2f} "
+        f"reap_mark={mark:.2f} GiB (outside = MemTotal - MemAvailable {avail:.2f} "
+        f"- root cgroup memory.current {cur:.2f}: everything holding host RAM that "
+        f"is NOT this cgroup and NOT free -- ZFS ARC above all, measured 5.01 GiB "
+        f"against this container's Cached 1.65, charged to no cgroup and invisible "
+        f"to every figure we print). CROSS-CHECK: the recorded constant is "
+        f"{const:.2f} GiB from two kernel reaps (weg2dk5 95.90, weg2dk6 96.06); "
+        f"delta {mark - const:+.2f} GiB. The constant is a CROSS-CHECK, not the "
+        f"actuator -- boot weg2xsn26b was killed by the GLOBAL host OOM killer "
+        f"(cgroup memory.events max 0 / high 0), so the mark a boot must respect "
+        f"is the host's, not a cgroup limit"
+    )
+
+
+class RateLatch:
+    """#1361 (1): the sampler-independent projection latch.  PURE but for its clock.
+
+    ``observe`` is fed ``(t_s, nonreclaim_gib)`` by a caller on its OWN cadence
+    (200-500 ms) and returns a LINE when something must be said -- a gap, or a
+    latch -- and ``None`` otherwise.  It never raises and never tears anything
+    down: the caller owns that decision, and this class owns the arithmetic and
+    the words.  That split is what makes it testable without a box.
+    """
+
+    def __init__(
+        self,
+        reap_mark_gib: float,
+        lookahead_s: float = RATE_LATCH_LOOKAHEAD_S,
+        window_s: float = RATE_LATCH_WINDOW_S,
+        gap_s: float = RATE_LATCH_GAP_S,
+    ) -> None:
+        self.reap_mark_gib = float(reap_mark_gib)
+        self.lookahead_s = float(lookahead_s)
+        self.window_s = float(window_s)
+        self.gap_s = float(gap_s)
+        self.samples: List[Tuple[float, float]] = []
+        self.latched = False
+        self.gaps: List[float] = []
+
+    def rate_gib_per_s(self) -> Optional[float]:
+        """The WORST consecutive slope inside the trailing window, or ``None``.
+
+        MAX OVER PAIRS, not the endpoint slope, and the difference is the whole
+        latch.  Fitted end-to-end over 3 s, weg2xsn26b's own ramp
+        (49.923 -> 50.157 -> 53.415 -> 55.847) averages to **1.98 GiB/s**
+        because its first second was nearly flat (+0.234) -- and 1.98 x 5 s
+        leaves the projection 3.7 GiB BELOW the mark, i.e. the guard would have
+        watched the boot die exactly as the level guard did.  The worst pair of
+        that same window is **3.26 GiB/s**, which projects past the mark.
+        Averaging is what smooths away a ramp ONSET, and the onset is the only
+        part there is still time to act on.  Same MAX-over-samples rule this
+        module applies to the reap samples and the ring-era transient.
+        """
+        if len(self.samples) < 2:
+            return None
+        t_now = self.samples[-1][0]
+        win = [s for s in self.samples if t_now - s[0] <= self.window_s]
+        if len(win) < 2:
+            win = self.samples[-2:]
+        best = None
+        for (t0, v0), (t1, v1) in zip(win, win[1:]):
+            dt = t1 - t0
+            if dt <= 0:
+                continue
+            r = (v1 - v0) / dt
+            if best is None or r > best:
+                best = r
+        return best
+
+    def projected_gib(self) -> Optional[float]:
+        r = self.rate_gib_per_s()
+        if r is None:
+            return None
+        # A FALLING reading projects to itself, never below: the latch exists to
+        # pre-empt a climb, and crediting a dip as future headroom is how a
+        # guard talks itself out of firing.
+        return self.samples[-1][1] + max(0.0, r) * self.lookahead_s
+
+    def observe(self, t_s: float, nonreclaim_gib: float) -> Optional[str]:
+        gap = None
+        if self.samples:
+            d = t_s - self.samples[-1][0]
+            if d > self.gap_s:
+                gap = d
+                self.gaps.append(d)
+        self.samples.append((float(t_s), float(nonreclaim_gib)))
+        if len(self.samples) > 64:
+            del self.samples[:-64]
+        if gap is not None:
+            return (
+                f"WEG2-HOST RATE-GAP gap_s={gap:.1f} nonreclaim={nonreclaim_gib:.2f} "
+                f"GiB -- this reader went blind for {gap:.1f} s. Boot weg2xsn26b died "
+                f"inside gaps of 19/25/18 s with its last reading 13.6 GiB below the "
+                f"mark; a hole during a leg is a FINDING, not silence"
+            )
+        if self.latched:
+            return None
+        proj = self.projected_gib()
+        if proj is None or proj < self.reap_mark_gib:
+            return None
+        self.latched = True
+        rate = self.rate_gib_per_s() or 0.0
+        return (
+            f"W98 Weg2HostRateLatched: projected={proj:.2f} GiB "
+            f"reap_mark={self.reap_mark_gib:.2f} GiB rate={rate:+.2f} GiB/s "
+            f"lookahead_s={self.lookahead_s:.0f} now={nonreclaim_gib:.2f} GiB "
+            f"gaps_seen={len(self.gaps)} -- the LEVEL is still below the mark and "
+            f"the SLOPE reaches it within the lookahead. Boot weg2xsn26b's last "
+            f"measured slope was 2.4-3.3 GiB/s, which covers 13.6 GiB in 4-6 s: a "
+            f"level guard at 1 Hz cannot pre-empt that, and its sampler was starved "
+            f"by the same thrashing. Currency is anon+shmem+slab_unreclaimable "
+            f"(unchanged -- the file-backed hypothesis was refuted: file - shmem was "
+            f"0.008 GiB at the death). Controlled teardown, never a kernel kill"
+        )
+
+
 def watermark_breach_verdict(
     current_bytes: int,
     margin: Optional[Margin] = None,

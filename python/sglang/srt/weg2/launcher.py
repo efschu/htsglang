@@ -4759,6 +4759,11 @@ def _installed_max_share_from_record() -> Optional[float]:
     return max(v) / float(sum(v))
 
 
+def _gib(v) -> str:
+    """#1361: bytes as GiB, or ``unreadable`` -- never 0.00 for an absence."""
+    return "unreadable" if v is None else f"{int(v) / host_ledger.GIB:.2f} GiB"
+
+
 def measured_record_path() -> str:
     """The sidecar this line writes its own dormant-image measurements into."""
     return f"{EVIDENCE_DIR}/{host_ledger.MEASURED_RECORD_NAME}"
@@ -4943,6 +4948,29 @@ def choose_host_ledger(
     a zero that prices the flip as free.
     """
     mi = host_ledger.read_meminfo(meminfo_path)
+    # #1361 (2) THE PEAK BASELINE, and it is the same lesson as `cg_oom_kill`.
+    # `memory.peak` is a LIFETIME high-water mark of this cgroup with no reset
+    # anywhere in this tree, so a boot record that quotes it as "this boot's
+    # peak" is quoting every boot since the container started. Measured on
+    # weg2xsn26b: the mark already stood at ~95.1 GiB when it launched --
+    # inherited from weg2xsn25's death -- and a reader who diffs nothing reads
+    # 95.86 as xsn26b's own. Baselined here and printed, exactly as the
+    # cumulative `oom_kill` counter is, so the NEXT record can state a DELTA.
+    # Reset is not attempted: the file is `nobody:nogroup` inside this LXC and
+    # a failed write would be a silent no-op, which is worse than a delta.
+    _cg0 = host_ledger.read_cgroup(cgroup_root)
+    _baseline_lines = [
+        (
+            f"WEG2-HOST PEAK BASELINE memory.peak={_gib(_cg0.get('peak'))} "
+        f"memory.current={_gib(_cg0.get('current'))} -- CUMULATIVE marks with no "
+        f"reset in this tree (the file is read-only in this container). Any "
+        f"'peak' in this boot's record is a DELTA against this line, never an "
+        f"absolute: weg2xsn26b inherited ~95.1 GiB of mark from weg2xsn25's death "
+        f"and its record read the inherited figure as its own"
+        ),
+        host_ledger.reap_model_line(
+            mi["MemTotal"], mi.get("MemAvailable"), _cg0.get("current")),
+    ]
     cg = host_ledger.read_cgroup(cgroup_root)
     cg_ceiling, cg_ceiling_source = host_ledger.resolve_cg_ceiling(cg, mi["MemTotal"])
     # fix 8: this line's OWN previous measurements of the dormant image and of
@@ -5081,11 +5109,11 @@ def choose_host_ledger(
             f"against the b0 reading {host_ledger.RING_B0_TOTAL_MULT_GB_PER_S:.3f} xS). "
             "The ladder was restricted to the pinned arm by the operator.",
         ]
-        return arm, reap_headroom_gib, _bounce_lines + lines, cg
+        return arm, reap_headroom_gib, _baseline_lines + _bounce_lines + lines, cg
     arm, reap_headroom_gib, lines = host_ledger.choose(
         mi["MemTotal"], mi["MemAvailable"], **ledger_kw,
     )
-    return arm, reap_headroom_gib, _bounce_lines + lines, cg
+    return arm, reap_headroom_gib, _baseline_lines + _bounce_lines + lines, cg
 
 
 def count_marker(path: str, marker: str) -> int:
