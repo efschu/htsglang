@@ -60,6 +60,7 @@ from sglang.srt.managers.weg2_memory_saver import (
     weg2_graph_tag_armed,
 )
 from sglang.srt.mem_cache.weg2_store_gates import Weg2StoreIndexBlind
+from sglang.srt.weg2 import seam_digest
 
 #: C21 / spec R13.  The group fence's budget, named so the ONE place that owns
 #: it can be re-justified and so C14's credit wait can be bounded by the SAME
@@ -363,6 +364,26 @@ class SchedulerWeightUpdaterManager:
     #: than retried on every leg).
     _weg2_shadow_region_cache: Any = "unset"
     _weg2_shadow_manifest_cache: Any = None
+
+    #: #1350 SEAM GRADER: this rank's pre-pause reading of its own pieces, or
+    #: ``None``.  A FIELD for the sixth time in this class, for the reason the
+    #: five comments above give -- ``slots=True`` turns a lazily assigned
+    #: attribute into an ``AttributeError`` ON THE WRITE, i.e. on the first
+    #: armed flip of an instrument boot, which is the worst place to learn it.
+    #:
+    #: LIFECYCLE, per the standing rule that every new state field carries its
+    #: own table BEFORE the boot:
+    #:   WRITER  -- :meth:`_weg2_seam_digest_before`, at the FIRST weights RPC
+    #:              of a sleep (``not family_paused_before``), while every page
+    #:              is still mapped.
+    #:   READER  -- :meth:`_weg2_seam_digest_after`, after the landing of the
+    #:              next wake (inside ``family_complete``, after the reload).
+    #:   DELETER -- :meth:`_weg2_seam_digest_after` itself, read-and-clear, and
+    #:              the unarmed path, which CLEARS rather than inherits.
+    #: SEPARATING EVENT -- the pause and the whole dormancy between the two.
+    #: Nothing else touches it: no cutover, no fence, no replay.  A deleter
+    #: between writer and reader is what the rule looks for, and there is none.
+    weg2_seam_before: Any = None
 
     @contextmanager
     def _observe_weight_load(self, source: str) -> Iterator[None]:
@@ -2549,6 +2570,128 @@ class SchedulerWeightUpdaterManager:
         except Exception:  # noqa: BLE001 -- an observer's unwind
             pass
 
+    # =======================================================================
+    # #1350 SEAM GRADER -- "did the exchange bring MY bytes back?"
+    #
+    # Rank-local, awake-only, default OFF.  The two hooks below are the ONLY
+    # call sites in the tree, and that is asserted rather than intended
+    # (`test_the_only_call_sites_are_the_two_awake_seams`).  There is no third
+    # one at the cutover, and there cannot be: at flip time the sleeping group
+    # holds NO weight bytes in VRAM (`understand_tensor-map.md` 5.4 with
+    # WEG2_SLEEP_TAGS), so a reading there would hash unmapped pages.
+    # =======================================================================
+
+    def _weg2_seam_inventory(self):
+        """This card's pieces as ``([(ParamGeom, tensor), ...], reason)``.
+
+        Delegated to ``weight_exchange_shadow.card_inventory``, which is the
+        tree's ONE producer of a card's placement.  The grader deliberately
+        does not walk ``named_parameters()`` itself: placement is decided by
+        the loader at boot and already published, and a second inventory here
+        would be second bookkeeping beside it (operator direction 2026-09-12).
+        """
+        try:
+            from sglang.srt.weg2 import weight_exchange_shadow as shadow
+
+            runner = getattr(self.tp_worker, "model_runner", None)
+            model = getattr(runner, "model", None)
+            return shadow.card_inventory(rank=self._weg2_rank(), model=model)
+        except BaseException as exc:  # noqa: BLE001 -- an observer's unwind
+            return None, f"inventory-failed:{type(exc).__name__}:{exc}"
+
+    def _weg2_seam_digest_before(self, recv_req, weights_tags) -> None:
+        """THE PRE-PAUSE READING.  At the last instant the pages are mapped.
+
+        Called only at the FIRST weights RPC of a sleep, for the same reason
+        ``_export_static_state`` is: once any family tag is paused, reading a
+        parameter is a read of unmapped pages -- the campaign (a) fault on the
+        weights tag.
+
+        UNARMED CLEARS RATHER THAN INHERITS.  A boot that turns the grader off
+        between two flips must not leave a stale reading behind for the next
+        wake to grade against; that would be a verdict about two different
+        boots wearing this one's name.
+        """
+        if not seam_digest.seam_digest_armed():
+            self.weg2_seam_before = None
+            return
+        inventory, reason = self._weg2_seam_inventory()
+        if inventory is None:
+            self.weg2_seam_before = None
+            logger.info(
+                "%s",
+                seam_digest.unarmed_verdict(
+                    f"no-inventory:{reason}",
+                    group=self._weg2_group_name(),
+                    rank=self._weg2_rank(),
+                    card=self._weg2_device_index(),
+                    tags=weights_tags,
+                ).line(),
+            )
+            return
+        reading = seam_digest.take_reading(
+            "before",
+            inventory,
+            group=self._weg2_group_name(),
+            rank=self._weg2_rank(),
+            card=self._weg2_device_index(),
+            tags=weights_tags,
+            epoch=getattr(recv_req, "epoch", None),
+        )
+        self.weg2_seam_before = reading
+        logger.info("%s", reading.line())
+
+    def _weg2_seam_digest_after(self, recv_req, weights_tags) -> None:
+        """THE POST-LANDING READING AND THE VERDICT.
+
+        Placement rule, shared with the shadow's destination hook and with the
+        step-6c compare: after ``family_complete``, after the reload, after the
+        shadow compare.  A reading before the bytes settle grades undefined
+        content and its MISMATCH would mean nothing.
+
+        READ-AND-CLEAR on every path, including the raising one: a refusal that
+        left the pre-pause reading standing would grade the NEXT wake against a
+        landing that already failed.
+
+        THE MISMATCH RAISES.  A grader whose verdict nobody consumes is the
+        class this campaign has paid for repeatedly (counter-vs-actuator), and
+        the bytes this rank is about to serve on are not the bytes it had.  The
+        line reaches the log FIRST, so the evidence survives the raise.
+        """
+        if not seam_digest.seam_digest_armed():
+            self.weg2_seam_before = None
+            return
+        before = self.weg2_seam_before
+        self.weg2_seam_before = None
+        group = self._weg2_group_name()
+        rank = self._weg2_rank()
+        card = self._weg2_device_index()
+        inventory, reason = self._weg2_seam_inventory()
+        if inventory is None:
+            logger.info(
+                "%s",
+                seam_digest.unarmed_verdict(
+                    f"no-inventory:{reason}", group=group, rank=rank, card=card,
+                    tags=weights_tags,
+                ).line(),
+            )
+            return
+        after = seam_digest.take_reading(
+            "after",
+            inventory,
+            group=group,
+            rank=rank,
+            card=card,
+            tags=weights_tags,
+            epoch=getattr(recv_req, "epoch", None),
+        )
+        logger.info("%s", after.line())
+        verdict = seam_digest.compare(before, after)
+        logger.info("%s", verdict.line())
+        refusal = verdict.refusal()
+        if refusal is not None:
+            raise refusal
+
     def _weg2_shadow_source_leg(self, recv_req) -> None:
         """SOURCE hook, sleep leg.  Placed BEFORE the pause loop, not after it.
 
@@ -3043,6 +3186,24 @@ class SchedulerWeightUpdaterManager:
             # the hook returns after one import, so the band is unaffected.
             weg2_leg_t0 = time.perf_counter()
             self._weg2_shadow_source_leg(recv_req)
+            # #1350 SEAM GRADER, source side.  HERE for two reasons, both of
+            # which are the same ones the shadow hook above is placed by:
+            #
+            # BEFORE THE PAUSE, because the reading walks this rank's live
+            # parameters and they live inside region(GPU_MEMORY_TYPE_WEIGHTS)
+            # -- after `pause(tag)` they are unmapped pages.
+            #
+            # INSIDE THE TIMED BAND (`weg2_leg_t0` is above it), because the
+            # hash is not free and a leg whose instrument hid its own observer
+            # is exactly the defect S5b refuter must_fix 4 recorded.  On an
+            # unarmed boot -- every serving boot -- the call returns after one
+            # predicate and the band is unchanged.
+            #
+            # Only at the FIRST weights RPC of a sleep: a later chunk RPC
+            # arrives with part of the family already paused, and reading then
+            # would be the campaign (a) fault.
+            if not family_paused_before:
+                self._weg2_seam_digest_before(recv_req, weights_tags)
             # #1284: the NEED series, and the refusal that reads it.  The pause
             # below is what enters ``host_ring.cpp``'s blocking acquire, and on
             # weg2sb5e that acquire sat out its whole 110 s budget in silence
@@ -3427,6 +3588,13 @@ class SchedulerWeightUpdaterManager:
                 # `test_the_compare_comes_after_the_reload_in_the_wake_path`
                 # pins the order; mutant M11 pulls it above the reload.
                 self._weg2_xchg_shadow_compare()
+                # #1350 SEAM GRADER, destination side.  THE SAME PLACEMENT RULE
+                # the two hooks above follow, and for the same reason: this is
+                # where the bytes have landed for every carrier, so a reading
+                # here grades settled content.  Last of the three deliberately
+                # -- it is the only one that can RAISE, and the other two must
+                # have reached the log before it does.
+                self._weg2_seam_digest_after(recv_req, weights_tags)
 
         if GPU_MEMORY_TYPE_KV_CACHE in tags:
             self.memory_saver_adapter.resume(GPU_MEMORY_TYPE_KV_CACHE)
