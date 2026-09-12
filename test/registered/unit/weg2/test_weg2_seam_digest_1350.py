@@ -776,6 +776,174 @@ def test_the_host_buffer_is_bounded():
     assert mod.piece_digest(t) == mod.piece_digest(t, chunk_bytes=1)
 
 
+# ===========================================================================
+# EXECUTION SMOKE OF THE PRODUCT CALL-SITES.
+#
+# desk-written-never-executed: every slice needs proof that its own code RAN,
+# and the tests above are structural or module-level.  These drive the two
+# HOOKS -- the real methods, on a real manager object, through the real
+# producer (`card_inventory`) -- hermetically, CPU only, no device, no process
+# group.  What they cannot drive is the pause/resume around them; that is the
+# boot's job, and the placement pins above are what stand in for it.
+# ===========================================================================
+
+
+class _FakeServerArgs:
+    enable_memory_saver = True
+    enable_weights_cpu_backup = True
+    enable_draft_weights_cpu_backup = False
+    speculative_draft_model_path = None
+    model_path = "/models/main"
+
+
+class _FakeModel:
+    def __init__(self, inventory):
+        self._params = [
+            (geom.name, tensor) for geom, tensor in inventory
+        ]
+
+    def named_parameters(self):
+        return list(self._params)
+
+
+class _FakeRunner:
+    def __init__(self, model):
+        self.model = model
+
+
+class _FakeWorker:
+    def __init__(self, model):
+        self.model_runner = _FakeRunner(model)
+
+
+class _Req:
+    epoch = 11
+
+
+@pytest.fixture()
+def hooked(monkeypatch):
+    """A manager whose model is the fixture inventory, on the real producer."""
+    from sglang.srt.managers import weg2_memory_saver as ms
+    from sglang.srt.managers.scheduler_components import weight_updater as wu
+
+    # The launcher's own channel for the ring layout, so `card_inventory`
+    # resolves the family and the tags exactly as it does in a boot.
+    monkeypatch.setenv(ms.WEIGHT_CHUNK_ENV_LAYERS, "8")
+    monkeypatch.setenv(ms.WEIGHT_CHUNK_ENV_COUNT, "8")
+    monkeypatch.setenv(_mod().ENV_ARM, "1")
+    WU = wu.SchedulerWeightUpdaterManager
+    monkeypatch.setattr(WU, "_weg2_group_name", lambda self: "P", raising=True)
+    monkeypatch.setattr(WU, "_weg2_rank", lambda self: 1, raising=True)
+    monkeypatch.setattr(WU, "_weg2_device_index", lambda self: 2, raising=True)
+    monkeypatch.setattr(WU, "_weg2_server_args", lambda self: _FakeServerArgs(),
+                        raising=True)
+
+    def _make(inventory):
+        return wu.SchedulerWeightUpdaterManager(
+            tp_worker=_FakeWorker(_FakeModel(inventory)), draft_worker=None,
+            tp_cpu_group=None, memory_saver_adapter=None,
+            flush_cache=lambda *a, **k: True, is_fully_idle=lambda *a, **k: True,
+        )
+
+    return _make
+
+
+def test_smoke_the_hooks_run_and_a_clean_round_trip_is_a_match(hooked, caplog):
+    """THE HAPPY PATH, EXECUTED.  Both hooks, the real producer, no device."""
+    mod = _mod()
+    inv = _inventory()
+    m = hooked(inv)
+    with caplog.at_level("INFO"):
+        m._weg2_seam_digest_before(_Req(), ["weights_0", "weights"])
+        assert m.weg2_seam_before is not None, "the pre-pause reading was not kept"
+        assert m.weg2_seam_before.n_tensors > 0, (
+            "the producer yielded no pieces: the smoke proved nothing"
+        )
+        # THE LANDING: the same values, a different arena -- which is what the
+        # exchange does.  The manager's model is replaced, exactly as the
+        # resume replaces the pages behind it.
+        m.tp_worker = _FakeWorker(_FakeModel(_rearena(inv)))
+        m._weg2_seam_digest_after(_Req(), ["weights_0", "weights"])
+    assert m.weg2_seam_before is None, "the reading was not cleared after use"
+    text = caplog.text
+    assert f"verdict={mod.VERDICT_MATCH}" in text
+    assert "stage=before" in text and "stage=after" in text
+    assert mod.LIMIT_CLAUSE in text
+
+
+def test_smoke_a_corrupted_landing_raises_the_named_refusal(hooked, caplog):
+    """THE DANGER PATH, EXECUTED.  One element moves and the wake leg refuses.
+
+    Mutant M5 turns the raise into a log line and this is what goes red -- by
+    EXECUTION, not by reading the method's source.
+    """
+    mod = _mod()
+    inv = _inventory()
+    m = hooked(inv)
+    m._weg2_seam_digest_before(_Req(), ["weights_0"])
+    landed = _rearena(inv)
+    landed[0][1][1, 1] = landed[0][1][1, 1] + 1.0
+    m.tp_worker = _FakeWorker(_FakeModel(landed))
+    with caplog.at_level("INFO"):
+        with pytest.raises(mod.Weg2SeamDigestMismatch) as exc:
+            m._weg2_seam_digest_after(_Req(), ["weights_0"])
+    assert mod.REFUSAL_MARKER in str(exc.value)
+    assert "qkv_proj" in str(exc.value), "the refusal did not name the piece"
+    # the evidence reached the log BEFORE the raise
+    assert f"verdict={mod.VERDICT_MISMATCH}" in caplog.text
+    assert m.weg2_seam_before is None, (
+        "a refusal left the pre-pause reading standing: the next wake would be "
+        "graded against a landing that already failed"
+    )
+
+
+def test_smoke_the_unarmed_hooks_touch_nothing(hooked, monkeypatch, caplog):
+    """Mutant M2 dies here too, and by EXECUTION on the product path.
+
+    The manager is given a model that EXPLODES if anything walks it, so the
+    assertion is "the unarmed boot did not read the weights", not merely "a
+    boolean was False".
+    """
+    from sglang.srt.managers.scheduler_components import weight_updater as wu
+
+    monkeypatch.delenv(_mod().ENV_ARM, raising=False)
+
+    class _Exploder:
+        def named_parameters(self):
+            raise AssertionError("the unarmed hook walked the model")
+
+    m = wu.SchedulerWeightUpdaterManager(
+        tp_worker=_FakeWorker(_Exploder()), draft_worker=None, tp_cpu_group=None,
+        memory_saver_adapter=None, flush_cache=lambda *a, **k: True,
+        is_fully_idle=lambda *a, **k: True,
+    )
+    m.weg2_seam_before = "a stale reading from an armed flip"
+    with caplog.at_level("INFO"):
+        m._weg2_seam_digest_before(_Req(), ["weights_0"])
+        assert m.weg2_seam_before is None, "the unarmed path INHERITED a reading"
+        m._weg2_seam_digest_after(_Req(), ["weights_0"])
+    assert _mod().LINE_PREFIX not in caplog.text, (
+        "the unarmed grader still wrote a line"
+    )
+
+
+def test_smoke_an_unreadable_inventory_is_unarmed_and_never_raises(hooked, caplog):
+    """The observer must not take a flip down because it could not read.
+
+    An inventory the producer refuses is a NAMED absence on the line, never a
+    MISMATCH -- the difference between "I could not grade" and "the bytes are
+    wrong" is the whole reason UNARMED exists.
+    """
+    mod = _mod()
+    m = hooked(_inventory())
+    m._weg2_seam_digest_before(_Req(), ["weights_0"])
+    m.tp_worker = _FakeWorker(None)  # the runner has no model any more
+    with caplog.at_level("INFO"):
+        m._weg2_seam_digest_after(_Req(), ["weights_0"])  # must not raise
+    assert f"verdict={mod.VERDICT_UNARMED}" in caplog.text
+    assert "no-inventory:no-model" in caplog.text
+
+
 def test_an_absent_inventory_is_unarmed_never_a_match():
     """The green-by-vacancy direction: nothing to read is not a pass."""
     mod = _mod()
