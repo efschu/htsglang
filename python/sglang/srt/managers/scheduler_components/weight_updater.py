@@ -3215,6 +3215,11 @@ class SchedulerWeightUpdaterManager:
                     # cross-pair corruption, measured in the desk replay.
                     lane=(f"p{pair}" if pair is not None
                           else f"c{int(getattr(group[0], 'dst_rank', device))}"),
+                    # #1358: the identity the host-slot lines carry. This is
+                    # the only frame where the group and the rank both exist.
+                    leg_group=str(self._weg2_group_name()),
+                    leg_rank=int(self._weg2_rank()),
+                    leg_name=f"{boot_nonce}/{hook}",
                     log=logger.info)
         finally:
             slots.close()
