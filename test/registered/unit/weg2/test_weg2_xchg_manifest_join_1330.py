@@ -991,3 +991,239 @@ def test_the_product_write_site_passes_the_group_unique_rank():
                    fromlist=["x"]).ModelRunner.load_model)
     assert "pp_rank=self.pp_rank" in runner
     assert "tp_size=self.tp_size" in runner
+
+
+# ---------------------------------------------------------------------------
+# (9) BOOT weg2xsn23: THE PADDED VOCABULARY CUT
+# ---------------------------------------------------------------------------
+
+#: THE MEASURED NUMBERS, from P.log verbatim. Kept as literals because the
+#: whole point is that the fix is graded against the boot and not against a
+#: fixture invented to match it.
+XSN23_VOCAB_FULL = 248320
+XSN23_PER_RANK = 82816
+XSN23_HIDDEN = 5120
+
+
+def _vocab_manifests(per_rank=XSN23_PER_RANK, full=XSN23_VOCAB_FULL,
+                     names=("lm_head.weight", "model.embed_tokens.weight")):
+    """xsn23's own constellation: P holds the whole, D holds padded thirds."""
+    out = []
+    for pp in range(3):
+        pieces = tuple(_piece(n, full, XSN23_HIDDEN, 2) for n in names) if pp == 0 else ()
+        out.append(xm.RankManifest(group="P", rank=pp, card=CARDS[pp],
+                                   region_tag=TAG, boot_token="x23",
+                                   tp_rank=0, pp_rank=pp, pieces=pieces))
+    for tp in range(3):
+        out.append(xm.RankManifest(
+            group="D", rank=tp, card=CARDS[tp], region_tag=TAG,
+            boot_token="x23", tp_rank=tp, pp_rank=0,
+            pieces=tuple(_piece(n, per_rank, XSN23_HIDDEN, 2) for n in names)))
+    return out
+
+
+def test_the_pad_unit_is_read_from_the_tree_not_written_here():
+    """A literal 64 would be a second copy of a constant the loader owns."""
+    import inspect
+
+    from sglang.srt.layers.vocab_parallel_embedding import (
+        DEFAULT_VOCAB_PADDING_SIZE, pad_vocab_size,
+    )
+
+    assert xm.vocab_pad_unit() == DEFAULT_VOCAB_PADDING_SIZE
+    # OVER THE AST, because the docstring NAMES 64 in order to explain why it
+    # must not be written -- the #995 prose trap, fourth instance in this
+    # slice. A text grep cannot tell the explanation from the defect.
+    import ast
+
+    tree = ast.parse(inspect.getsource(xm.vocab_pad_unit))
+    consts = {n.value for n in ast.walk(tree)
+              if isinstance(n, ast.Constant) and isinstance(n.value, int)}
+    assert not consts, f"vocab_pad_unit hard-codes {consts}"
+    imported = {a.name for n in ast.walk(tree)
+                if isinstance(n, ast.ImportFrom) for a in n.names}
+    assert "DEFAULT_VOCAB_PADDING_SIZE" in imported
+
+    # And the tree's own function reproduces the boot's number exactly, which
+    # is what makes this a padded cut rather than a coincidence.
+    import math
+
+    assert pad_vocab_size(math.ceil(XSN23_VOCAB_FULL / 3)) == XSN23_PER_RANK
+    assert 3 * XSN23_PER_RANK - XSN23_VOCAB_FULL == 128
+
+
+def test_the_padded_vocab_cut_joins_with_the_excess_declared_as_pad():
+    """RED-FIRST with xsn23's numbers: 248320 vs 3 x 82816.
+
+    Before the fix this raised
+    ``W68 ... neither a row cut ... nor a column cut, nor a replica`` and cost
+    9 legs of 9 (``join-unjoinable``, ``why=no-plan`` 6/6).
+    """
+    join = xm.join_manifests(_vocab_manifests(), pp_group="P", tp_group="D")
+    for name in ("lm_head.weight", "model.embed_tokens.weight"):
+        t = join.by_name[name]
+        assert t.shard_axis == wx.ROWS
+        assert t.tp_widths == (XSN23_PER_RANK,) * 3
+        # The PADDED total is the extent, and the surplus is DECLARED.
+        assert t.rows_full == 3 * XSN23_PER_RANK == 248448
+        assert t.pad_units == 128
+        assert t.cols_full == XSN23_HIDDEN
+    assert "padded=2" in join.line()
+
+
+def test_the_declared_pad_becomes_zerofill_with_no_source():
+    """The pad is not clipped here -- ``_emit`` already owns it.
+
+    ``ParamGeom``'s own docstring names this case: "128 rows exist on no card
+    and in no checkpoint and are ZEROFILL by design". So the check is that the
+    PLAN says so, not that the join invented a clip.
+    """
+    join = xm.join_manifests(_vocab_manifests(), pp_group="P", tp_group="D")
+    geom = join.by_name["lm_head.weight"].geom(tp_is_dst=True)
+    assert geom.pad_units == 128
+    assert geom.content_units == XSN23_VOCAB_FULL, (
+        "the CONTENT extent must be the checkpoint's, or the source side would "
+        "be asked for rows no checkpoint has")
+
+    plan = xm.plan_from_join(join, direction=wx.LEGS_PP_TO_TP,
+                             src_addr=lambda n, r: 0x7000_0000,
+                             dst_addr=lambda n, r: 0x1000)
+    # PER TENSOR: the fixture carries lm_head AND embed_tokens, and both are
+    # padded, so a sum across the plan would double the expected bytes.
+    zf = [d for d in plan.raw_descs
+          if d.kind == wx.ZEROFILL and d.param_name == "lm_head.weight"]
+    assert zf, "the padded tail must be ZEROFILL, not fetched"
+    assert all(d.src_ptr is None for d in zf), (
+        "a ZEROFILL descriptor has no source by definition")
+    # Only the LAST rank's tail is pad: 128 rows past 248320 of 248448.
+    assert {d.dst_rank for d in zf} == {2}, [d.dst_rank for d in zf]
+    # A ROWS shard is not strided, so each descriptor is ONE contiguous run and
+    # the 128 padded rows live in the byte count, not in `rows`.
+    assert sum(int(d.nbytes) for d in zf) == 128 * XSN23_HIDDEN * 2
+
+
+@pytest.mark.parametrize("per_rank,full,ok", [
+    (XSN23_PER_RANK, XSN23_VOCAB_FULL, True),      # xsn23's own, pad 128
+    (XSN23_PER_RANK, 3 * XSN23_PER_RANK, True),    # exact cut, pad 0
+    (XSN23_PER_RANK, XSN23_VOCAB_FULL - 64, False),  # rounding says 82795->82816? no
+    (XSN23_PER_RANK + 64, XSN23_VOCAB_FULL, False),   # one pad unit too many
+    (XSN23_PER_RANK, XSN23_VOCAB_FULL - 5120, False),  # a real disagreement
+])
+def test_only_the_trees_own_rounding_counts_as_padding(per_rank, full, ok):
+    """MUTANT 'Summe egal -> falscher Replica-Guess', and its stronger form.
+
+    A TOLERANCE BAND IS NOT A PREDICATE. The first draft accepted any surplus
+    under ``tp_size x pad_unit`` and immediately swallowed a THREE-ROW skew on
+    ``qkv_proj`` -- a genuine disagreement read as padding, which is exactly
+    the hazard the refusal text names. What counts is that every rank holds
+    EXACTLY ``pad_vocab_size(ceil(full/n))``: the loader's own arithmetic, no
+    slack.
+    """
+    mans = _vocab_manifests(per_rank=per_rank, full=full,
+                            names=("lm_head.weight",))
+    if ok:
+        join = xm.join_manifests(mans, pp_group="P", tp_group="D")
+        t = join.by_name["lm_head.weight"]
+        assert t.rows_full == 3 * per_rank
+        assert t.pad_units == 3 * per_rank - full
+    else:
+        with pytest.raises(wx.Weg2XchgPlanDisagree) as exc:
+            xm.join_manifests(mans, pp_group="P", tp_group="D")
+        assert "nor a PADDED cut" in str(exc.value)
+        assert "the tree's OWN per-rank rounding" in str(exc.value)
+
+
+def test_a_small_skew_on_an_ordinary_tensor_is_never_padding():
+    """THE CASE THAT KILLED THE TOLERANCE BAND, kept as a test.
+
+    Three rows too many on ``qkv_proj`` is a disagreement, not a pad: the
+    widths are unequal and are not the loader's rounding of anything.
+    """
+    mans = _manifests()
+    victim = "model.layers.0.self_attn.qkv_proj.weight"
+    out = []
+    for m in mans:
+        if m.group == "D" and m.rank == 0:
+            m = xm.RankManifest(
+                group=m.group, rank=m.rank, card=m.card,
+                region_tag=m.region_tag, boot_token=m.boot_token,
+                tp_rank=m.tp_rank, pp_rank=m.pp_rank,
+                pieces=tuple(_piece(p.param_name, p.rows_full + 3, p.cols_full,
+                                    p.itemsize)
+                             if p.param_name == victim else p
+                             for p in m.pieces))
+        out.append(m)
+    with pytest.raises(wx.Weg2XchgPlanDisagree) as exc:
+        xm.join_manifests(out, pp_group="P", tp_group="D")
+    assert victim in str(exc.value)
+
+
+def test_a_shortfall_is_never_read_as_padding():
+    """MUTANT 'Padding ignoriert' has a mirror: a DEFICIT is still a refusal.
+
+    Padding can only ADD rows. Rows missing on the TP side mean the two groups
+    disagree, and reading that as a pad would silently drop real weights.
+    """
+    mans = _vocab_manifests(per_rank=XSN23_PER_RANK - 64,
+                            names=("lm_head.weight",))
+    with pytest.raises(wx.Weg2XchgPlanDisagree) as exc:
+        xm.join_manifests(mans, pp_group="P", tp_group="D")
+    assert "nor a PADDED cut" in str(exc.value)
+
+
+def test_the_ordinary_classes_are_untouched_by_the_padded_case():
+    """The exact cuts must still be exact -- pad_units 0, no widening."""
+    join = _join()
+    assert all(t.pad_units == 0 for t in join.tensors)
+    assert "padded=0" in join.line()
+
+
+#: THE BOOT'S OWN MANIFESTS. Evidence-tree bound, so this SKIPS on the remote
+#: desk (it lives only on this box and must not be shipped over the link) --
+#: the documented pattern for the six evidence-bound tests in this suite.
+XSN23_EVIDENCE = "/spinning/evidence-665-f1/weg2xsn23_0912"
+
+
+@pytest.mark.skipif(not os.path.isdir(XSN23_EVIDENCE),
+                    reason="evidence tree not present (remote desk)")
+def test_the_join_takes_weg2xsn23s_own_ten_manifests():
+    """THE STRONGEST GRADE AVAILABLE: the boot's real data, not a fixture.
+
+    weg2xsn23 wrote all ten manifests and the join then refused 9 legs of 9 on
+    ``lm_head.weight``. Against the SAME files the join must now succeed, and
+    the padded class must be exactly the vocabulary tensors -- if it grew, the
+    predicate is swallowing something it should refuse.
+    """
+    import glob
+    import json
+
+    mans = []
+    for f in sorted(glob.glob(os.path.join(XSN23_EVIDENCE,
+                                           "phase_manifest_*.json"))):
+        with open(f, encoding="utf-8") as fh:
+            mans.append(xm.RankManifest.from_json(json.load(fh), path=f))
+    assert len(mans) == 10, "xsn23 wrote ten manifests (two runners per rank)"
+
+    join = xm.join_manifests(mans, pp_group="P", tp_group="D")
+    assert join.unsourced == ()
+    assert len(join.tensors) == 1259
+    assert join.n_sharded == 748
+
+    # THE PADDED SET IS THE VOCABULARY, AND NOTHING ELSE. The third name is a
+    # finding neither the order nor I predicted: the INT8 SCALE tensor of the
+    # embedding is padded on the same axis as its weight, so a fix that had
+    # special-cased the two obvious names would still have refused this boot.
+    padded = sorted(t.param_name for t in join.tensors if t.pad_units)
+    assert padded == ["lm_head.weight",
+                      "model.embed_tokens.weight",
+                      "model.embed_tokens.weight_scale"], padded
+    for t in join.tensors:
+        if t.pad_units:
+            assert t.shard_axis == wx.ROWS
+            # The declared pad is the surplus over the CHECKPOINT's extent, and
+            # the content extent must stay what the source actually holds.
+            assert t.rows_full == sum(t.tp_widths)
+            assert 0 < t.pad_units < len(t.tp_widths) * xm.vocab_pad_unit()
+    lm = join.by_name["lm_head.weight"]
+    assert lm.tp_widths == (82816, 82816, 82816)
+    assert lm.rows_full == 248448 and lm.pad_units == 128

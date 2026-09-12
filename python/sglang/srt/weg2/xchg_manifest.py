@@ -381,6 +381,12 @@ class JoinedTensor:
     #: The TP group's per-rank extent on the sharded axis, in rank order.
     tp_widths: Tuple[int, ...]
     pp_card: int
+    #: DECLARED PAD on the sharded axis (weg2xsn23): the vocabulary is padded
+    #: PER RANK to a multiple of `vocab_pad_unit()`, so the TP side holds more
+    #: rows than the checkpoint has. They exist on no source and are ZEROFILL
+    #: by design -- `ParamGeom.content_units` and `_emit`'s pad branch already
+    #: own that, so this is DECLARED here and clipped nowhere.
+    pad_units: int = 0
 
     @property
     def sharded(self) -> bool:
@@ -419,6 +425,7 @@ class JoinedTensor:
             cols_full=int(self.cols_full),
             itemsize=int(self.itemsize),
             stage=int(self.pp_stage),
+            pad_units=int(self.pad_units),
             family=(None if not self.sharded else str(self.param_name)),
             dst_widths=(tuple(int(w) for w in self.tp_widths)
                         if (self.sharded and tp_is_dst) else None),
@@ -464,18 +471,43 @@ class ManifestJoin:
             f"tensors={len(self.tensors)} "
             f"sharded={self.n_sharded}/{len(self.tensors)} "
             f"unsourced={len(self.unsourced)} "
+            f"padded={sum(1 for t in self.tensors if t.pad_units)} "
             f"classes={len(classes)} "
             f"-- extents are the JOIN's (the TP side's rows summed), not any "
             f"one rank's reading; the direction chooses roles, not extents"
         )
 
 
+def vocab_pad_unit() -> int:
+    """The vocabulary's padding granularity, READ FROM THE TREE.
+
+    ``layers/vocab_parallel_embedding.DEFAULT_VOCAB_PADDING_SIZE``, imported
+    rather than written as 64 here: it is the number ``pad_vocab_size`` rounds
+    to, ``VocabParallelEmbedding``/``ParallelLMHead`` take as their
+    ``padding_size`` default, and the loader actually padded with. A literal
+    would be a second copy of a constant the loader owns, and the two would
+    part company the day anyone passes a different ``padding_size``.
+    """
+    from sglang.srt.layers.vocab_parallel_embedding import (
+        DEFAULT_VOCAB_PADDING_SIZE,
+    )
+
+    return int(DEFAULT_VOCAB_PADDING_SIZE)
+
+
+def _pad_vocab_size(n: int) -> int:
+    """``pad_vocab_size`` from the tree -- the loader's OWN rounding."""
+    from sglang.srt.layers.vocab_parallel_embedding import pad_vocab_size
+
+    return int(pad_vocab_size(int(n)))
+
+
 def _axis_of(name: str, whole: ManifestPiece,
              cut: Sequence[ManifestPiece],
-             ) -> Tuple[int, int, int, Tuple[int, ...]]:
-    """``(shard_axis, rows_full, cols_full, tp_widths)`` -- READ, not guessed.
+             ) -> Tuple[int, int, int, Tuple[int, ...], int]:
+    """``(shard_axis, rows_full, cols_full, tp_widths, pad_units)`` -- READ.
 
-    Four cases and no fifth.  The fifth would be a silent ``REPLICATED``, which
+    FIVE cases and no sixth.  The sixth would be a silent ``REPLICATED``, which
     is exactly the tree's current answer (``weight_exchange_shadow.py:3237``)
     and the reason the shard cut has been invisible since S2: a plan that calls
     every tensor replicated moves whole tensors between differently-shaped
@@ -484,6 +516,33 @@ def _axis_of(name: str, whole: ManifestPiece,
     ``whole`` is the PP side (one stage holds the tensor entire) and ``cut`` the
     TP side's rows.  Both are read off manifests, so this is a comparison of
     two measurements and not an inference from either.
+
+    **THE PADDED CUT IS ITS OWN CLASS, and boot weg2xsn23 is why.**  The exact
+    test ("rows sum to the whole") refused ``lm_head.weight`` 9 legs out of 9::
+
+        W68 ... lm_head.weight: the PP side holds (248320, 5120) and the TP
+        rows hold [(82816, 5120), (82816, 5120), (82816, 5120)]
+
+    3 x 82816 = 248448 = 248320 + 128.  The vocabulary is padded PER RANK to a
+    multiple of :func:`vocab_pad_unit` (``pad_vocab_size``: ceil(248320/3) =
+    82774 -> 82816), so the TP side legitimately holds MORE rows than the
+    checkpoint has.  Those 128 rows exist on no card's source and in no
+    checkpoint -- ``ParamGeom``'s own docstring already names this exact case
+    ("128 rows exist on no card and in no checkpoint and are ZEROFILL by
+    design", spec section 2.2).
+
+    SO THE PAD IS NOT CLIPPED HERE.  It is DECLARED: ``rows_full`` becomes the
+    padded total and ``pad_units`` the excess, which is precisely what
+    ``ParamGeom.content_units`` and ``_emit``'s pad branch already consume --
+    the destination's trailing rows become ZEROFILL descriptors with no source,
+    and the source side's ``content_units`` stays the checkpoint's extent.
+    Re-implementing a clip here would be a second answer to a question the plan
+    machinery already answers.
+
+    THE BOUND IS THE DANGER DIRECTION.  Accepting any surplus would turn a
+    genuinely disagreeing pair into a "padded" one and move the wrong bytes, so
+    the excess must be smaller than ``len(cut) * pad_unit`` -- the most any
+    correct per-rank rounding can add.  Anything larger is still refused.
     """
     rows = [int(p.rows_full) for p in cut]
     cols = [int(p.cols_full) for p in cut]
@@ -493,18 +552,51 @@ def _axis_of(name: str, whole: ManifestPiece,
     same_rows = len(set(rows)) == 1 and rows[0] == w_rows
 
     if same_rows and same_cols:
-        return wx.REPLICATED, w_rows, w_cols, tuple(rows)
+        return wx.REPLICATED, w_rows, w_cols, tuple(rows), 0
     if same_cols and sum(rows) == w_rows:
-        return wx.ROWS, w_rows, w_cols, tuple(rows)
+        return wx.ROWS, w_rows, w_cols, tuple(rows), 0
     if same_rows and sum(cols) == w_cols:
-        return wx.COLS, w_rows, w_cols, tuple(cols)
+        return wx.COLS, w_rows, w_cols, tuple(cols), 0
+
+    # THE PADDED CUTS.  Same shape as the exact ones, plus a DECLARED pad.
+    #
+    # THE PREDICATE IS THE TREE'S OWN ROUNDING, NOT A TOLERANCE, and that
+    # correction came from this slice's own test: a first draft accepted any
+    # surplus below ``tp_size * pad_unit`` and immediately swallowed a
+    # THREE-ROW skew on ``qkv_proj`` -- a genuine disagreement read as padding,
+    # which is precisely the danger direction the refusal text below names. A
+    # width band is not a predicate; ``pad_vocab_size`` is.
+    #
+    # So a padded cut is recognised only when every rank holds EXACTLY what
+    # ``pad_vocab_size(ceil(full / n))`` produces -- equal widths, the tree's
+    # own rounding, no slack. weg2xsn23: ceil(248320/3) = 82774 -> 82816 on
+    # all three, total 248448, declared pad 128.
+    def _padded(total_full: int, widths: Sequence[int]) -> bool:
+        if len(set(widths)) != 1 or widths[0] <= 0:
+            return False
+        n = len(widths)
+        expect = _pad_vocab_size((int(total_full) + n - 1) // n)
+        return int(widths[0]) == int(expect) and n * int(expect) > int(total_full)
+
+    if same_cols and _padded(w_rows, rows):
+        return wx.ROWS, sum(rows), w_cols, tuple(rows), sum(rows) - w_rows
+    if same_rows and _padded(w_cols, cols):
+        return wx.COLS, w_rows, sum(cols), tuple(cols), sum(cols) - w_cols
+
     raise wx.Weg2XchgPlanDisagree(
         f"W68 Weg2XchgPlanDisagree: {name}: the PP side holds "
         f"({w_rows}, {w_cols}) and the TP rows hold {list(zip(rows, cols))}. "
-        f"That is neither a row cut (equal columns, rows summing to the whole), "
-        f"nor a column cut, nor a replica -- so the two groups cannot both be "
-        f"describing the same tensor. Guessing REPLICATED here is what made the "
-        f"shard cut invisible; the join refuses instead."
+        f"That is neither a row cut (equal columns, rows summing to the "
+        f"whole), nor a column cut, nor a replica, nor a PADDED cut (every "
+        f"rank would have to hold exactly pad_vocab_size(ceil(full/"
+        f"{len(cut)})) = {_pad_vocab_size((w_rows + len(cut) - 1) // len(cut))} "
+        f"rows or {_pad_vocab_size((w_cols + len(cut) - 1) // len(cut))} "
+        f"columns, the tree's OWN per-rank rounding at pad unit "
+        f"{vocab_pad_unit()}; a tolerance band here would read a genuine "
+        f"disagreement as padding) -- so the "
+        f"two groups cannot both be describing the same tensor. Guessing "
+        f"REPLICATED here is what made the shard cut invisible; the join "
+        f"refuses instead."
     )
 
 
@@ -638,7 +730,7 @@ def join_manifests(
                 f"tensor at different element widths, so no descriptor can "
                 f"name both."
             )
-        axis, rows_full, cols_full, widths = _axis_of(name, whole, rows)
+        axis, rows_full, cols_full, widths, pad = _axis_of(name, whole, rows)
         tensors.append(
             JoinedTensor(
                 param_name=name,
@@ -651,6 +743,7 @@ def join_manifests(
                 pp_stage=int(stage),
                 tp_widths=widths,
                 pp_card=int(pp_card_by_rank.get(stage, stage)),
+                pad_units=int(pad),
             )
         )
 
