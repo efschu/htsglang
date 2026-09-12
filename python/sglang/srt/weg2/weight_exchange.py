@@ -2163,6 +2163,122 @@ def inject_authoritative() -> bool:
     return inject_mode() == INJECT_AUTHORITATIVE
 
 
+#: #1330 B4n: THE DIRECTION KNOB.  ``--weg2-xchg-legs``, published to the ranks
+#: exactly as the arm and inject strings are.
+#:
+#: WHY IT EXISTS: the first metal test of the manifest-backed lane runs ONE
+#: direction -- TP layers assembled out of the PP layout's card bytes, graded
+#: against the host copy that is still in system RAM.  Running the other
+#: direction beside it would double the surface of a boot whose question is
+#: "does one direction assemble at all".
+#:
+#: THE NAMES ARE NOT NEW.  ``PP_TO_TP``/``TP_TO_PP`` are the tree's canonical
+#: flip-direction strings (``layers/dcp/phase_flip_plan.py:43-44``), already
+#: read by ``seam_coverage.py:228``, ``phase_purity.py`` and
+#: ``model_runner_kv_cache_mixin.py:7014``.  They are IMPORTED, not retyped: a
+#: third spelling of one fact is the second-bookkeeping defect, and the two
+#: vocabularies would diverge on the first rename.  The import is lazy because
+#: ``phase_flip_plan`` pulls in the reshard plan, which this module must not
+#: depend on at import time.
+XCHG_LEGS_ENV = "SGLANG_WEG2_XCHG_LEGS"
+#: ``both`` -- byte-identical to the behaviour before this knob existed.  An
+#: absent or unrecognised value lands here DELIBERATELY: this reads an
+#: environment variable, and the one direction a typo may not take is
+#: "silently stop running half the legs", which reads in a log exactly like a
+#: lane that ran clean.
+LEGS_BOTH = "both"
+
+
+def _flip_directions() -> Tuple[str, str]:
+    from sglang.srt.layers.dcp.phase_flip_plan import PP_TO_TP, TP_TO_PP
+
+    return PP_TO_TP, TP_TO_PP
+
+
+try:  # pragma: no cover -- exercised by every import of this module
+    LEGS_PP_TO_TP, LEGS_TP_TO_PP = _flip_directions()
+except BaseException:  # noqa: BLE001 -- a partially built tree still imports
+    LEGS_PP_TO_TP, LEGS_TP_TO_PP = "pp_to_tp", "tp_to_pp"
+
+XCHG_LEGS_CHOICES = (LEGS_PP_TO_TP, LEGS_TP_TO_PP, LEGS_BOTH)
+
+#: The marker a skipped leg prints.  A direction that is OFF must say so with
+#: its count and its reason: silence is what made four boots of this campaign
+#: unreadable, and a bare count cannot be told from a leg that never fired.
+LEGS_SKIPPED_MARKER = "WEG2-XCHG-LEGS"
+
+
+def xchg_legs() -> str:
+    """``both`` (default), ``pp_to_tp`` or ``tp_to_pp``.  THE one reader.
+
+    A function and not a module constant so the value is read when it is
+    consumed rather than frozen at import -- the same reason
+    :func:`inject_mode` is one (S6 fix E: the launcher's own process had no
+    flag in its environment at import time).
+    """
+    value = (os.environ.get(XCHG_LEGS_ENV, "") or "").strip().lower()
+    return value if value in XCHG_LEGS_CHOICES else LEGS_BOTH
+
+
+def leg_direction(hook: str, group: str) -> str:
+    """Which direction a leg moves, from ``(hook, group)`` alone.
+
+    No new plumbing is needed because the pair already decides it:
+    ``hook=source`` EXPORTS, so the source group is this one; every other hook
+    IMPORTS, so the source is the peer.  Group ``P`` is the PP form and ``D``
+    the TP form (``weight_exchange_region``: rank *n* of either group runs on
+    ``cards[n]``), so:
+
+    * ``source``/``P``, ``destination``/``D``, ``authoritative``/``D``
+      -> ``pp_to_tp``;
+    * ``source``/``D``, ``destination``/``P``, ``authoritative``/``P``
+      -> ``tp_to_pp``.
+    """
+    exporting = str(hook) == "source"
+    src_group = str(group) if exporting else ("D" if str(group) == "P" else "P")
+    return LEGS_PP_TO_TP if src_group == "P" else LEGS_TP_TO_PP
+
+
+def leg_enabled(hook: str, group: str) -> bool:
+    """Is this leg's direction armed?  ``both`` enables every leg."""
+    wanted = xchg_legs()
+    return wanted == LEGS_BOTH or wanted == leg_direction(hook, group)
+
+
+#: The cumulative skip count, per process.  Same shape and same reason as
+#: :data:`_PROFILE_LEGS`: the mixin that reports it is a ``slots=True``
+#: dataclass and cannot hold it, and a per-leg line with no running total
+#: leaves the reader counting log lines.
+_LEGS_SKIPPED = [0]
+
+
+def record_leg_skipped() -> int:
+    """Count one skipped leg and return the running total."""
+    _LEGS_SKIPPED[0] += 1
+    return _LEGS_SKIPPED[0]
+
+
+def legs_skipped_total() -> int:
+    return _LEGS_SKIPPED[0]
+
+
+def reset_legs_skipped() -> None:
+    """For tests -- the product never resets a cumulative counter."""
+    _LEGS_SKIPPED[0] = 0
+
+
+def legs_skipped_line(n: int, *, hook: str, group: str) -> str:
+    """One line per skipped leg, carrying its count, its reason and both
+    directions -- the knob's setting AND the leg's, so a reader never has to
+    infer which one was off."""
+    return (
+        f"{LEGS_SKIPPED_MARKER} legs_skipped={n} reason=direction-knob "
+        f"hook={hook} group={group} leg_direction={leg_direction(hook, group)} "
+        f"armed={xchg_legs()} -- this leg's direction is not the armed one, so "
+        f"it was skipped BY NAME; it did not fail and it did not run"
+    )
+
+
 def exchange_armed() -> bool:
     """Does the EXCHANGE own the weight bytes?  False under ``shadow``.
 
@@ -3423,6 +3539,56 @@ NO_PLAN_REASON = (
 )
 
 
+def _write_placement_manifest(model, *, rank: int, region_tag: str,
+                              log: Callable[[str], None]) -> None:
+    """#1330 B4n. Write this rank's placement manifest; never raise.
+
+    LAZY IMPORT, because ``xchg_manifest`` imports this module: the cross-group
+    join is a CONSUMER of the exchange's own types and a module-level import
+    here would be the cycle.
+    """
+    try:
+        from sglang.srt.managers import weg2_memory_saver as ms
+        from sglang.srt.weg2 import weight_exchange_region as xr
+        from sglang.srt.weg2 import weight_exchange_shadow as sh
+        from sglang.srt.weg2 import xchg_manifest as xm
+
+        group = ms.weg2_group_name()
+        if group not in ("P", "D") or model is None:
+            return
+        directory = xm.manifest_dir()
+        if not directory:
+            return
+        inventory, _skipped, _walked, reason = sh.card_inventory(
+            rank=int(rank), model=model, region_tag=str(region_tag))
+        if not inventory:
+            log(
+                f"{xm.JOIN_LINE_PREFIX}-WRITE group={group} rank={rank} "
+                f"pieces=0 reason={reason or 'empty-inventory'} -- no manifest "
+                f"written, so the join will refuse by name rather than plan "
+                f"over the ranks that happened to publish"
+            )
+            return
+        geoms = [g for g, _t in inventory]
+        cards = tuple(range(xr.N_CARDS))
+        card = cards[int(rank)] if 0 <= int(rank) < len(cards) else int(rank)
+        manifest = xm.RankManifest(
+            group=str(group), rank=int(rank), card=int(card),
+            region_tag=str(region_tag), boot_token=xm.boot_token(),
+            pieces=xm.pieces_from_inventory(geoms))
+        path = xm.write_rank_manifest(manifest, directory)
+        log(xm.written_line(path, manifest))
+    except BaseException as exc:  # noqa: BLE001 -- no fence here; see caller
+        try:
+            log(
+                f"WEG2-XCHG-MANIFEST-WRITE group=? rank={rank} pieces=0 "
+                f"reason=write-failed:{type(exc).__name__}: {exc} -- named "
+                f"rather than swallowed; the join refuses on the absent file"
+            )
+        except BaseException:  # noqa: BLE001
+            pass
+
+
 def arm_coverage_at_load(
     model: Optional[torch.nn.Module],
     *,
@@ -3550,6 +3716,23 @@ def arm_coverage_at_load(
         region_tag=region_tag,
     )
     _record_boot_vote(vote)
+    # #1330 B4n: THE PLACEMENT MANIFEST, WRITTEN HERE AND NOWHERE ELSE.
+    #
+    # This is the one moment in the boot where the loader's decision exists and
+    # is complete: materialisation is done (this function IS the end of weight
+    # loading, `model_runner.py:2564`) and nothing has been paused yet.  Boot
+    # weg2xsn20 measured what its absence costs -- 24 legs of
+    # `W74 ... has no source pointer ... src_resolved=0/N`, because the
+    # destination hook asks a rank for the PEER's address, which no process can
+    # answer for another.  The peer's MANIFEST can, and this is where it is
+    # written.
+    #
+    # IT NEVER RAISES.  The docstring above is explicit that there is no group
+    # fence at the end of weight loading (refuter F5), so a rank-local raise
+    # here would leave the other five in a collective without six members.  A
+    # failed write is a NAMED line and an absent file; the join then refuses by
+    # name at the reader, where a refusal costs nothing.
+    _write_placement_manifest(model, rank=rank, region_tag=region_tag, log=emit)
     if not vote.ok:
         logger.error("%s", vote.reason)
     return vote
