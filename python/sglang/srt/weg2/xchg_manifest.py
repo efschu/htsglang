@@ -622,20 +622,31 @@ def merge_region_tags(manifests: Iterable[RankManifest]) -> List[RankManifest]:
     out: List[RankManifest] = []
     for rank in sorted(by_rank):
         rows = sorted(by_rank[rank], key=lambda m: m.region_tag)
-        pieces: Dict[str, ManifestPiece] = {}
+        # KEYED BY (REGION, NAME), NOT BY NAME. Measured on weg2xsn25: the
+        # drafter is a one-layer Qwen3_5 block, so EIGHT of P rank 0's
+        # nineteen draft pieces carry the SAME param_name as main-model
+        # tensors (`model.embed_tokens.weight`,
+        # `model.layers.0.input_layernorm.weight`, ...). Keyed by name alone
+        # the merge silently kept ONE of each pair -- and when the two
+        # geometries happened to agree, not even the refusal below fired. A
+        # name is not an identity across runners.
+        pieces: Dict[Tuple[str, str], ManifestPiece] = {}
         for man in rows:
             for piece in man.pieces:
-                prior = pieces.get(piece.param_name)
+                pkey = (region_of_tag(piece.tag), piece.param_name)
+                prior = pieces.get(pkey)
                 if prior is not None and prior.key != piece.key:
                     raise wx.Weg2XchgPlanDisagree(
                         f"W68 Weg2XchgPlanDisagree: {piece.param_name} is "
-                        f"published twice by {man.group} rank {rank} with "
-                        f"DIFFERENT identities {prior.key} vs {piece.key}. Two "
-                        f"runners of one rank disagree about one tensor, and "
-                        f"picking either would be exactly the rank-local "
-                        f"derivation the manifest replaces."
+                        f"published twice by {man.group} rank {rank} IN ONE "
+                        f"REGION ({pkey[0]}) with DIFFERENT identities "
+                        f"{prior.key} vs {piece.key}. Two writers of one "
+                        f"region disagree about one tensor, and picking "
+                        f"either would be exactly the rank-local derivation "
+                        f"the manifest replaces. (The same NAME in two "
+                        f"different regions is normal and is kept apart.)"
                     )
-                pieces.setdefault(piece.param_name, piece)
+                pieces.setdefault(pkey, piece)
         head = rows[0]
         out.append(RankManifest(
             group=head.group, rank=rank, card=head.card,
@@ -1116,30 +1127,67 @@ def leg_plan_from_join(
     from sglang.srt.managers import weg2_memory_saver as ms
 
     direction = wx.leg_direction(str(hook), str(group))
+
+    # THE REGION CUT, AND IT RUNS BEFORE THE JOIN -- that ordering is the fix.
+    #
+    # Cutting AFTER the join was not enough: the join keys on `param_name`, and
+    # weg2xsn25 measured eight names carried by BOTH runners of P rank 0 (the
+    # drafter is a one-layer block, so its parameters are `model.layers.0.*`
+    # too). By the time a post-join cut ran, one runner had already displaced
+    # the other and the surviving geometry could be the wrong one -- the desk
+    # replay read `tensors_bad=2 verdict=MISMATCH` on exactly that.
+    #
+    # Filtering the PIECES first means only one region's tensors ever reach the
+    # join, so the collision cannot happen at all. The drafter's tensors are
+    # not lost: they get their own leg from their own `arm_coverage_at_load`.
+    my_region = (region_of_tag(region_tag) if region_tag
+                 else wx.GPU_MEMORY_TYPE_WEIGHTS)
+    excluded = 0
+    excluded_bytes = 0
+    excluded_regions = set()
+    narrowed = []
+    for man in manifests:
+        keep_p, drop_p = [], []
+        for piece in man.pieces:
+            (keep_p if region_of_tag(piece.tag) == my_region
+             else drop_p).append(piece)
+        excluded += len(drop_p)
+        excluded_bytes += sum(int(p.nbytes) for p in drop_p)
+        excluded_regions |= {region_of_tag(p.tag) for p in drop_p}
+        narrowed.append(RankManifest(
+            group=man.group, rank=man.rank, card=man.card,
+            region_tag=man.region_tag, boot_token=man.boot_token,
+            tp_rank=man.tp_rank, pp_rank=man.pp_rank,
+            pieces=tuple(keep_p)))
+    manifests = [m for m in narrowed if m.pieces]
+    if not manifests:
+        return None, refusal(
+            "no-tensors-in-region",
+            f"region={my_region}: no manifest carries a piece of this leg's "
+            f"region. A leg with nothing of its own to move is a plan defect, "
+            f"not an empty one")
+    if excluded:
+        line = (
+            f"WEG2-XCHG-PLAN region={my_region} "
+            f"excluded={'+'.join(sorted(excluded_regions))} "
+            f"pieces={excluded} bytes={excluded_bytes} reason=other-runner "
+            f"-- those tensors belong to a runner this leg cannot address; "
+            f"they get their own leg from their own arm_coverage_at_load "
+            f"(weg2xsn25: eleven of them read as dst_resolved=893/904 and "
+            f"refused the whole leg)")
+        if log is not None:
+            log(line)
+        else:
+            import logging as _logging
+
+            _logging.getLogger(__name__).info("%s", line)
+
     try:
         join = join_manifests(manifests, pp_group=pp_group, tp_group=tp_group)
     except (wx.Weg2XchgSourceMissing, wx.Weg2XchgPlanDisagree) as exc:
         return None, refusal("unjoinable", f"{type(exc).__name__}: {exc}")
 
-    # THE REGION CUT. The join keeps every runner's tensors (that is where the
-    # extents come from); the LEG keeps only its own region's, because only
-    # those have an address in this runner.
-    my_region = region_of_tag(region_tag) if region_tag else \
-        wx.GPU_MEMORY_TYPE_WEIGHTS
-    mine_t = [t for t in join.tensors if region_of_tag(t.tag) == my_region]
-    other = [t for t in join.tensors if region_of_tag(t.tag) != my_region]
-    if not mine_t:
-        return None, refusal(
-            "no-tensors-in-region",
-            f"region={my_region}: the join has {len(join.tensors)} tensors and "
-            f"none of this leg's region. A leg with nothing of its own to move "
-            f"is a plan defect, not an empty one")
-    if other:
-        join = ManifestJoin(
-            pp_group=join.pp_group, tp_group=join.tp_group, cards=join.cards,
-            tensors=tuple(mine_t), unsourced=(), pp_ranks=join.pp_ranks,
-            tp_ranks=join.tp_ranks)
-
+    # (the region cut ran before the join -- see above)
     try:
         plan = plan_from_join(join, direction=direction,
                               src_addr=src_addr, dst_addr=dst_addr)
@@ -1181,27 +1229,6 @@ def leg_plan_from_join(
                     refuse_on_materialisation_drift(piece, tensor)
                 except wx.Weg2XchgPlanDisagree as exc:
                     return None, refusal("materialisation-drift", str(exc))
-
-    # THE EXCLUSION IS NAMED, never silent: a reader must see that this leg
-    # deliberately does not carry another runner's pieces, and how many.
-    if other:
-        excluded_bytes = sum(
-            (t.rows_full - t.pad_units) * t.cols_full * t.itemsize
-            for t in other)
-        line = (
-            f"WEG2-XCHG-PLAN region={my_region} "
-            f"excluded={'+'.join(sorted({region_of_tag(t.tag) for t in other}))} "
-            f"pieces={len(other)} bytes={excluded_bytes} "
-            f"reason=other-runner -- those tensors belong to a runner this leg "
-            f"cannot address; they get their own leg from their own "
-            f"arm_coverage_at_load (weg2xsn25: eleven of them read as "
-            f"dst_resolved=893/904 and refused the whole leg)")
-        if log is not None:
-            log(line)
-        else:
-            import logging as _logging
-
-            _logging.getLogger(__name__).info("%s", line)
 
     is_source = str(hook) == sh.HOOK_SOURCE
     side = "src_rank" if is_source else "dst_rank"
