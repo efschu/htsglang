@@ -4901,6 +4901,8 @@ def choose_host_ledger(
     cgroup_root: str = "/sys/fs/cgroup",
     record_path: Optional[str] = None,
     pin_m_mib: int = 0,
+    deviation_reason: str = "",
+    riegel_gib: Optional[float] = None,
     s_gb_d: Optional[int] = None,
     d_cap_terms: Optional[Dict[str, float]] = None,
     weight_source: str = WEIGHT_SOURCE_DEFAULT,
@@ -4989,6 +4991,11 @@ def choose_host_ledger(
         cg_ceiling_source=cg_ceiling_source,
         cg_oom_kill=cg["oom_kill"],
         measured_record=record,
+        # #1360: handed to the ONE place that computes the verdict, exactly as
+        # every other arm property is. The launcher does not re-implement the
+        # decision; it passes the operator's declaration down to it.
+        deviation_reason=deviation_reason,
+        riegel_gib=riegel_gib,
         # #1350 THE FLIP RATCHET, RESOLVED AT THE ONE CALL SITE THAT ALREADY
         # KNOWS THE BOOT -- the same placement as `xchg_bounce_host_bytes` and
         # `ring_absent_by_design` above, and for the same reason: the ledger
@@ -8399,6 +8406,22 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--tag", required=True)
     ap.add_argument("--venv", default=VENV_DEFAULT)
     ap.add_argument("--model", default=MODEL_DEFAULT)
+    # #1360: THE NAMED DEVIATION, flag only. The user's standing rule of
+    # 2026-09-12 makes the reap mark soft -- crossing it is allowed WITH a
+    # reason and a runtime latch, never silently -- and until now the launcher
+    # had no way to say so: a refused arm simply stopped the boot. NO ENV TWIN
+    # (#781 fossil class): one spelling, on the command line, where it lands in
+    # the argv echo and in the form key.
+    ap.add_argument("--host-ledger-deviation", default="", metavar="REASON",
+                    help="Accept a REFUSED host-ledger fundability verdict under "
+                         "a named reason. Requires --host-riegel-gib. Converts "
+                         "the verdict only: no term, no ring size and no guard "
+                         "is re-priced.")
+    ap.add_argument("--host-riegel-gib", type=float, default=None, metavar="GIB",
+                    help="The RUNTIME LATCH the deviation is accepted under, in "
+                         "GiB non-reclaimable. Must be BELOW the hard bound, or "
+                         "it cannot fire before the bound is crossed. Required "
+                         "with --host-ledger-deviation.")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--debug-hold", choices=["none", "P", "D", "both"], default="none")
     # #1236: --store-min-gib IS DELETED. It was a FLOOR on how much of the host
@@ -9887,6 +9910,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         ring_plan.host_weights_bytes,
         ring_plan.host_weights_span1_bytes, ring_plan.provenance,
         pin_m_mib=int(getattr(ns, "pin_ledger_arm_m", 0) or 0),
+        # #1360: the operator's declaration, from argv and nowhere else.
+        deviation_reason=str(getattr(ns, "host_ledger_deviation", "") or ""),
+        riegel_gib=getattr(ns, "host_riegel_gib", None),
         # #1317n NO BOOT WITH S_D=S_P IN THE LEDGER. D carries 4 GB where P
         # carries 1, which is +8.38 GiB of rings; an arm priced without it is
         # optimistic by that much against a reap mark nobody may touch.
