@@ -95,8 +95,9 @@ FORM_VOTE = "vote"                   # write_matrix_verdict(row, False)
 FORM_FLOOR = {FORM_RAISE: 174, FORM_HELPER: 7, FORM_VOTE: 1}
 
 #: THE FROZEN SET: every refusal-bearing owner in the lane that NOTHING in the
-#: lane references.  It can only SHRINK -- a new entry means an unreachable
-#: refusal was added, a stale entry means one was wired and the debt is paid.
+#: lane references.  It SHRINKS on its own and GROWS only at a merge -- a new
+#: entry means an unreachable refusal was added (and on a train it says WHICH
+#: slice added it), a stale entry means one was wired and the debt is paid.
 ZERO_REFERENCE_REFUSERS = (
     {
         "fn": "arm_oncard_lane",
@@ -127,9 +128,25 @@ ZERO_REFERENCE_REFUSERS = (
                "matches. Wiring it adds collectives to the wake seam -> "
                "operator design call, named in the module docstring",
     },
+    {
+        "fn": "waves_for_plan",
+        "file": "srt/weg2/weight_exchange.py",
+        "forms": (FORM_RAISE,),
+        "class": "DECLARED-TODO",
+        "why": "arrived with #1273 B4d on the merge train; the producer half is "
+               "wired and the reader's ONE call-site line "
+               "(weight_exchange_shadow.py:3094, `or wx.waves_for_plan`) is "
+               "seat 3's, named in B4d's own commit message and not on the "
+               "train. Also B4l's frozen-debt entry 3, so the two censuses agree",
+    },
 )
 
-SIZE_ON_THE_LINE = 3
+#: 3 until the merge train landed #1273 B4d, which ADDED a zero-reference
+#: raiser.  The "can only SHRINK" rule above holds for a tree that gains no new
+#: refusal-bearing owner; a merge train is the event that can, and a growth is
+#: admissible only WITH a class and a reason -- enforced by the shape tests,
+#: not trusted.
+SIZE_ON_THE_LINE = 4
 
 #: B4l's ratchet, by file name, because the two lists must be read TOGETHER.
 #: It lives on ``weg2/xchg-b4l-b4m-0911`` (@ ``fec81234e9``, based on RE-STAMP 5

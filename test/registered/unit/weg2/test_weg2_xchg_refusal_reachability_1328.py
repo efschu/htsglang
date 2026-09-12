@@ -272,14 +272,39 @@ UNWIRED_DEBT = (
                "test_weg2_xchg_transport_1273.py:1995 and stated in prose at "
                "weight_exchange_shadow.py:32 -- owed S6 work, not a hidden defect",
     },
+    {
+        "file": "weg2/weight_exchange.py",
+        "fn": "waves_for_plan",
+        "code": "Weg2XchgWavePartitionDisagree",
+        "line": 1050,
+        "class": "DECLARED-TODO",
+        "why": "arrived with #1273 B4d on the merge train. The PRODUCER half is "
+               "wired (launcher prepare_xchg_env publishes SGLANG_WEG2_XCHG_WAVES "
+               "on the armed arms); the missing half is ONE line that B4d's own "
+               "commit message names and assigns to seat 3 -- "
+               "weight_exchange_shadow.py:3094 still reads `waves_of = waves_of "
+               "or wx.derive_waves` and must read `or wx.waves_for_plan`. "
+               "MEASURED on this tree: zero production callers (the only two "
+               "greps are COMMENTS). Pinned by test_weg2_wave_publication_1273.py. "
+               "This is the #859 PRESENT-BUT-UNWIRED state, recorded rather than "
+               "wired, because wiring it switches the plan builder from "
+               "derivation to publication-reconciliation and that is a product "
+               "decision with a boot behind it, not a merge-train reconciliation",
+    },
 )
 
 #: Pinned so the debt cannot grow by accident.  4 on dfceb7004e, 3 on
 #: 2c9592fd19 after B4i wired the reserve instrument, 2 on the merge train
 #: after #1333 DELETED `diagonal_carrier_bytes` -- which is exactly what
 #: that entry's own reason asked for ("seat 6 picks one authority, default
-#: DELETE").  The debt was PAID, so the entry went; it can only SHRINK.
-DEBT_SIZE_ON_THE_LINE = 2
+#: DELETE").  The debt was PAID, so the entry went.
+#: 3 on the merge train again after #1273 B4d ARRIVED with a new zero-reference
+#: raiser (`waves_for_plan`).  THE "IT CAN ONLY SHRINK" CLAIM IS HEREBY
+#: CORRECTED RATHER THAN QUIETLY BROKEN: it can only shrink for a tree that
+#: gains no new refusal-bearing owner, and a merge train is exactly the event
+#: that can. A GROWTH IS ADMISSIBLE ONLY WITH A CLASS AND A REASON, which is
+#: what the shape tests below already enforce on every entry.
+DEBT_SIZE_ON_THE_LINE = 3
 
 
 # --------------------------------------------------------------------------

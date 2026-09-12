@@ -281,7 +281,34 @@ class TheFenceCarriesItAndTheRaiseStaysW29(CustomTestCase):
                     getattr(t, "id", "") == "mine" for t in node.targets):
                 pairs = dict(zip([k.value for k in node.value.keys],
                                  [ast.unparse(v) for v in node.value.values]))
-                self.assertEqual(pairs["ok"], "bool(ok) and (not wave_reason)")
+                # #1273 B4d x THE MERGE TRAIN: assert the PROPERTY, not the
+                # exact string.  This pinned `ok` to the literal
+                # "bool(ok) and (not wave_reason)".  The train then landed the
+                # B4g/#1333 COVERAGE fence into the same `mine` dict, so the
+                # expression legitimately grew a second conjunct and a literal
+                # equality read a correct union as a defect -- the same
+                # frozen-claim-against-a-moved-tree class this lane has now paid
+                # for three times (#1342 S3 / B4l's `run_agreed_leg`, #1349's
+                # stale replay, and here).  What this test defends is that
+                # `wave_reason` VOTES: `not wave_reason` must be a CONJUNCT of
+                # `ok`.  That survives any further fence joining the same dict,
+                # and it still fails if the conjunct is dropped.
+                ok_node = ast.parse(pairs["ok"], mode="eval").body
+                conjuncts = (
+                    [ast.unparse(v) for v in ok_node.values]
+                    if isinstance(ok_node, ast.BoolOp)
+                    and isinstance(ok_node.op, ast.And)
+                    else [pairs["ok"]]
+                )
+                self.assertIn(
+                    "not wave_reason", conjuncts,
+                    "the wave mismatch no longer votes in the group fence: "
+                    f"`ok` is {pairs['ok']!r}",
+                )
+                self.assertIn(
+                    "bool(ok)", conjuncts,
+                    f"the rank's own ok-bit stopped voting: `ok` is {pairs['ok']!r}",
+                )
                 self.assertIn("wave_reason", pairs["failure"])
                 return
         self.fail("no `mine` dict")
