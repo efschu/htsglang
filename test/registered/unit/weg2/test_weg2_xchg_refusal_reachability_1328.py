@@ -186,6 +186,11 @@ LANE_FILES = (
     "weg2/weight_exchange_shadow.py",
     "weg2/weight_exchange_transport.py",
     "weg2/xchg_bounce.py",
+    # #1352: the page planner is a lane module like the rest, so it is INDEXED
+    # here rather than sitting outside both ratchets.  Leaving it out is how a
+    # new module's refusals become invisible to the census that exists to see
+    # them -- the same shape as a refusal with no caller, one level up.
+    "weg2/xchg_pageplan.py",
     "weg2/xchg_census.py",
     "weg2/xchg_residency.py",
     "weg2/host_ledger.py",
@@ -291,6 +296,51 @@ UNWIRED_DEBT = (
                "derivation to publication-reconciliation and that is a product "
                "decision with a boot behind it, not a merge-train reconciliation",
     },
+    # ------------------------------------------------------------------ #1352
+    # The remap slice's zero-reference entry points, kept in step with
+    # test_weg2_xchg_refusal_forms_1335.py ENTRY BY ENTRY rather than as one
+    # collective line -- each is a separate caller the wiring seat has to add,
+    # and one line would let four be forgotten while the fifth was wired.
+    {
+        "file": "weg2/xchg_pageplan.py",
+        "fn": "plan_pages",
+        "code": "Weg2RemapPageRefused",
+        "line": 541,
+        "class": "UNWIRED-BY-DESIGN-AND-PINNED",
+        "why": "#1352. plan_leg's single-destination case. The production caller is weight_updater.py:2256 (`sh.derive_leg_plan`), named as the wiring seat's site in the plan's STATUS block; it waits on ONE missing manifest field -- the piece's byte offset inside its tag's page sequence (AMENDMENT 8 section 8.9) -- because without it a production plan rests on MODELLED placement, which this module refuses by name. PRESENT-BUT-UNWIRED, recorded",
+    },
+    {
+        "file": "weg2/xchg_pageplan.py",
+        "fn": "minimum_fund",
+        "code": "Weg2RemapPlanUnschedulable",
+        "line": 846,
+        "class": "UNWIRED-BY-DESIGN-AND-PINNED",
+        "why": "#1352. Sizes the BOOT-time page fund against the SCHEDULE rather than the net image difference -- which is more, because the transfers that fund a page lag the collects that consume it. Its caller is the launcher's arm arithmetic, added by the wiring seat together with the seam-fund reservation",
+    },
+    {
+        "file": "weg2/xchg_pageplan.py",
+        "fn": "verify_leg",
+        "code": "Weg2RemapPageRefused",
+        "line": 920,
+        "class": "UNWIRED-BY-DESIGN-AND-PINNED",
+        "why": "#1352. The INDEPENDENT replay of a plan's own steps; it earned itself twice at the desk by rejecting two schedules this seat's own scheduler had just produced. Belongs beside the plan's ARM-TIME print, not in the flip's hot path, so its caller arrives with the arm line",
+    },
+    {
+        "file": "weg2/xchg_pageplan.py",
+        "fn": "extents_from_manifest_order",
+        "code": "Weg2RemapPageRefused",
+        "line": 303,
+        "class": "UNWIRED-BY-DESIGN-AND-PINNED",
+        "why": "#1352. The DESK-ONLY prefix-sum model of arena placement. Deliberately unreachable from production: a plan built on it is refused unless the caller declares desk arithmetic, so WIRING IT WOULD BE THE DEFECT. It is deleted, not wired, once the manifest carries measured offsets",
+    },
+    {
+        "file": "weg2/xchg_pageplan.py",
+        "fn": "cut1_cost_ms",
+        "code": "Weg2RemapPageRefused",
+        "line": 953,
+        "class": "UNWIRED-BY-DESIGN-AND-PINNED",
+        "why": "#1352. Prices Cut 1 (on-card bytes crossing PCIe twice, 1.58-1.70 s per leg at the measured 13-14 GB/s) so that Cut 2 is a decision with a number. Its refusal guards a zero transfer rate; the figure is read by the spec and the execution smoke, and a production caller appears only with the Cut-2 decision",
+    },
 )
 
 #: Pinned so the debt cannot grow by accident.  4 on dfceb7004e, 3 on
@@ -304,7 +354,7 @@ UNWIRED_DEBT = (
 #: gains no new refusal-bearing owner, and a merge train is exactly the event
 #: that can. A GROWTH IS ADMISSIBLE ONLY WITH A CLASS AND A REASON, which is
 #: what the shape tests below already enforce on every entry.
-DEBT_SIZE_ON_THE_LINE = 3
+DEBT_SIZE_ON_THE_LINE = 8
 
 
 # --------------------------------------------------------------------------

@@ -139,14 +139,84 @@ ZERO_REFERENCE_REFUSERS = (
                "seat 3's, named in B4d's own commit message and not on the "
                "train. Also B4l's frozen-debt entry 3, so the two censuses agree",
     },
+    # ---------------------------------------------------------------- #1352
+    # THE REMAP SLICE'S FIVE ZERO-REFERENCE ENTRY POINTS.  (``plan_leg`` is NOT
+    # here: it is referenced by ``minimum_fund`` inside the module, so the
+    # census sees it -- which is the reference-not-call rule earning itself.)  They are PRESENT-BUT-UNWIRED
+    # -- the middle of the three delivery states, and the expensive one to
+    # mis-read in either direction (#859).  The page plan is built, tested at
+    # the measured geometries and executed by its own smoke; what does NOT
+    # exist yet is the ONE manifest field it consumes (the piece's byte offset
+    # inside its tag's page sequence, AMENDMENT 8 section 8.9), so wiring the
+    # production caller before that field lands would be planning on MODELLED
+    # placement -- which the module itself refuses by name.
+    #
+    # They are listed INDIVIDUALLY rather than as one entry because each is a
+    # separate caller the wiring seat has to add, and a single collective line
+    # would let four of them be forgotten while the fifth was wired.
+    {
+        "fn": "plan_pages",
+        "file": "srt/weg2/xchg_pageplan.py",
+        "forms": (FORM_RAISE,),
+        "class": "UNWIRED-BY-DESIGN-AND-PINNED",
+        "why": "#1352. plan_leg's single-destination case, kept public because "
+               "the on-card lane is a legitimate one-destination plan; same "
+               "wiring site and same precondition as plan_leg",
+    },
+    {
+        "fn": "minimum_fund",
+        "file": "srt/weg2/xchg_pageplan.py",
+        "forms": (FORM_RAISE,),
+        "class": "UNWIRED-BY-DESIGN-AND-PINNED",
+        "why": "#1352. Sizes the BOOT-time page fund against the schedule "
+               "rather than the net image difference. Its caller is the "
+               "launcher's arm arithmetic, which the wiring seat adds with the "
+               "seam-fund reservation",
+    },
+    {
+        "fn": "verify_leg",
+        "file": "srt/weg2/xchg_pageplan.py",
+        "forms": (FORM_RAISE,),
+        "class": "UNWIRED-BY-DESIGN-AND-PINNED",
+        "why": "#1352. The INDEPENDENT replay of a plan's own steps -- it "
+               "already earned itself twice at the desk by rejecting two "
+               "schedules this seat's scheduler had just produced. Belongs "
+               "beside the plan's arm-time print, not in the flip's hot path",
+    },
+    {
+        "fn": "extents_from_manifest_order",
+        "file": "srt/weg2/xchg_pageplan.py",
+        "forms": (FORM_RAISE,),
+        "class": "REFUSAL-EXISTS-BUT-UNREACHABLE",
+        "why": "#1352. The DESK-ONLY prefix-sum model of arena placement. It "
+               "is deliberately unreachable from production: a plan built on "
+               "it is refused unless the caller says it is desk arithmetic, so "
+               "wiring it would be the defect, not the fix. It disappears when "
+               "the manifest carries measured offsets",
+    },
+    {
+        "fn": "cut1_cost_ms",
+        "file": "srt/weg2/xchg_pageplan.py",
+        "forms": (FORM_RAISE,),
+        "class": "REFUSAL-EXISTS-BUT-UNREACHABLE",
+        "why": "#1352. Prices Cut 1 (on-card bytes crossing PCIe twice) so "
+               "Cut 2 is a decision with a number. Its refusal guards a zero "
+               "transfer rate; the number is read by the spec and the smoke, "
+               "and a production caller only appears with the Cut-2 decision",
+    },
 )
 
+#: 4 until #1352 added the remap slice's five zero-reference entry points, each of them
+#: PRESENT-BUT-UNWIRED behind ONE missing manifest field (AMENDMENT 8 section
+#: 8.9) rather than behind a decision -- so each carries its own wiring site and
+#: its own reason above, and the list shrinks entry by entry as the wiring seat
+#: lands them.
 #: 3 until the merge train landed #1273 B4d, which ADDED a zero-reference
 #: raiser.  The "can only SHRINK" rule above holds for a tree that gains no new
 #: refusal-bearing owner; a merge train is the event that can, and a growth is
 #: admissible only WITH a class and a reason -- enforced by the shape tests,
 #: not trusted.
-SIZE_ON_THE_LINE = 4
+SIZE_ON_THE_LINE = 9
 
 #: B4l's ratchet, by file name, because the two lists must be read TOGETHER.
 #: It lives on ``weg2/xchg-b4l-b4m-0911`` (@ ``fec81234e9``, based on RE-STAMP 5
