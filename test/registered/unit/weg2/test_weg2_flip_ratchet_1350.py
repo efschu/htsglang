@@ -218,11 +218,16 @@ class FlipRatchetRefusal1350(CustomTestCase):
             )
 
     def test_the_recorded_seed_is_labelled_and_retires_on_the_first_real_record(self):
+        # #1350g SUPERSEDES the SEED this test first pinned: boot weg2xsn25
+        # charged the 4.049 GiB first-pair seed, under-shot by 4.647 and the
+        # host reaped group D. The fallback is now the measured 6-boot SERIES;
+        # what this test still pins is that the fallback is LABELLED as not
+        # being this line's own record, and that it retires on the first one.
         seed = hl.resolve_flip_ratchet_gib(None)
         self.assertFalse(seed.from_record)
-        self.assertIn("SEED", seed.source)
-        # Conservative direction: the MAX pair of the five recorded boots.
-        self.assertAlmostEqual(seed.per_flip_gib, 4.049, places=6)
+        self.assertIn("NOT this line's own record", seed.source)
+        self.assertIn("SERIES", seed.source)
+        self.assertAlmostEqual(seed.per_flip_gib, 8.697, places=3)
         rec = {"FLIP": hl.flip_ratchet_record(
             pre_gib=84.336, post_gib=87.497, boot_tag="weg2xsn20",
             commit="3267f109fb", at="2026-09-11T15:49:53Z")}
@@ -547,6 +552,73 @@ class LaunchWorstCaseHasItsOwnMargin1350f(CustomTestCase):
         arm.launch_leftover_gib = 5.67
         arm.run_leftover_gib = 1.62
         self.assertFalse(arm.fundable_moments)
+
+
+class PricedFromSeries1350g(CustomTestCase):
+    """#1350g: the seed was proven too small ON METAL, so the term is priced
+    from the measured series instead.
+
+    weg2xsn25 charged the 4.049 GiB seed, predicted 90.43 GiB, reached 95.077
+    and the host reaped group D (`oom_kill` 0 -> 1). It completed ONE flip, so
+    `WEG2-FLIP-RATCHET post epoch=2` was never written and the next boot would
+    have run on the same seed: the measurement meant to replace the seed cannot
+    happen, because the boot dies before it.
+    """
+
+    #: predicted, measured peak, ratchet ALREADY charged -> required term.
+    SERIES = (
+        ("weg2xsn20", 87.15, 88.798, 0.000, 1.648),
+        ("weg2xsn21b", 85.30, 86.995, 0.000, 1.695),
+        ("weg2xsn22", 86.25, 88.495, 0.000, 2.245),
+        ("weg2xsn23", 85.24, 88.210, 0.000, 2.970),
+        ("weg2xsn24", 86.38, 90.475, 0.000, 4.095),
+        ("weg2xsn25", 90.43, 95.077, 4.050, 8.697),
+    )
+
+    def test_each_row_is_what_that_boot_needed(self):
+        for boot, pred, peak, charged, row in self.SERIES:
+            with self.subTest(boot=boot):
+                self.assertAlmostEqual(peak - pred + charged, row, places=2)
+                self.assertAlmostEqual(
+                    hl.FLIP_RATCHET_SERIES_GIB[boot], row, places=3)
+
+    def test_the_rule_is_MAX_and_it_binds_the_worst_boot(self):
+        got = hl.resolve_flip_ratchet_gib(None)
+        self.assertAlmostEqual(got.per_flip_gib, 8.697, places=3)
+        self.assertIn("SERIES", got.source)
+        self.assertIn("weg2xsn25", got.source)
+        self.assertFalse(got.from_record)
+        # the retired seed must not come back
+        self.assertNotIn("SEED", got.source)
+        self.assertGreater(got.per_flip_gib, 4.049)
+
+    def test_the_series_term_would_have_refused_xsn25_before_the_host_killed_it(self):
+        """The whole point: an HONEST refusal instead of a reap.
+
+        xsn25's un-ratcheted prediction was 90.43 - 4.050 = 86.38 GiB. With the
+        series term the same arm predicts 86.38 + 8.697 = 95.08 GiB, which is
+        AT its own measured peak 95.077 and far above the 94.43 hard bound --
+        so the ladder refuses by name (W21) instead of booting into the reaper.
+        """
+        unratcheted = 90.43 - 4.050
+        priced = unratcheted + hl.resolve_flip_ratchet_gib(None).per_flip_gib
+        self.assertAlmostEqual(priced, 95.08, places=2)
+        self.assertGreaterEqual(priced, 95.077 - 0.01)   # reaches the real peak
+        margin = hl.resolve_margin(flip_ratchet_charged_gib=priced - unratcheted)
+        bound = hl.OBSERVED_REAP_NONRECLAIM_BYTES / GIB - margin.boot_total_gib
+        self.assertGreater(priced, bound)                 # -> refused, honestly
+
+    def test_a_real_record_still_wins_over_the_series(self):
+        rec = {"FLIP": hl.flip_ratchet_record(
+            pre_gib=84.336, post_gib=87.497, boot_tag="weg2xsn26",
+            commit="c", at="t")}
+        got = hl.resolve_flip_ratchet_gib(rec)
+        self.assertTrue(got.from_record)
+        self.assertNotIn("SERIES", got.source)
+
+    def test_the_refusal_is_still_reachable(self):
+        with self.assertRaises(hl.Weg2HostFlipRatchetUnmeasured):
+            hl.resolve_flip_ratchet_gib({}, seed_allowed=False)
 
 
 class ArmLineFields1350(CustomTestCase):

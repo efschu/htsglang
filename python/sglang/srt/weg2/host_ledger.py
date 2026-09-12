@@ -362,6 +362,45 @@ FLIP_RATCHET_CUMULATIVE_GIB = {
 #: MINUTES, not flips), so there is nothing else to multiply by either.
 FLIP_RATCHET_FLIPS_PRICED_DEFAULT = 1
 
+#: #1350g -- THE TERM PRICED FROM THE MEASURED SERIES, because the measurement
+#: that was supposed to replace it CANNOT HAPPEN.  boot weg2xsn25 died of a host
+#: OOM (`oom_kill` 0 -> 1, group D) after ONE complete flip, so
+#: `WEG2-FLIP-RATCHET post epoch=2` was never written and the next boot would
+#: run on the SEED again -- the measurement that closes the ratchet never comes,
+#: because the boot dies first.  That is a loop, and pricing from the series is
+#: how it is broken.
+#:
+#: EACH ROW IS "WHAT MUST BE ADDED TO THAT BOOT'S UN-RATCHETED PREDICTION SO THE
+#: PREDICTION REACHES ITS OWN MEASURED PEAK".  For weg2xsn20..xsn24 the
+#: prediction carried NO ratchet term, so the row is simply
+#: ``peak - predicted``.  For weg2xsn25 the prediction ALREADY charged 4.05 GiB
+#: (the seed) and still under-shot by 4.647, so its row is 4.05 + 4.647 = 8.697
+#: -- the total the term would have had to be.  Mixing the two forms without
+#: that correction is the arithmetic error this comment exists to prevent.
+#:
+#:   boot        predicted   measured peak   charged   row
+#:   weg2xsn20     87.15        88.798        0.000   1.648
+#:   weg2xsn21b    85.30        86.995        0.000   1.695
+#:   weg2xsn22     86.25        88.495        0.000   2.245
+#:   weg2xsn23     85.24        88.210        0.000   2.970
+#:   weg2xsn24     86.38        90.475        0.000   4.095
+#:   weg2xsn25     90.43        95.077        4.050   8.697
+#:
+#: THE RULE IS MAX, not a trend fit, and the choice is stated rather than
+#: defaulted.  MAX is the rule this module already applies to every other
+#: measured population (REAP_SAMPLES_GIB, RING_ERA_FLIP_TRANSIENT_GIB,
+#: RUN_PEAK_RESIDUAL_GIB): the margin must cover the worst recorded instance of
+#: the form.  Here MAX happens to be the LATEST row, because the last four rows
+#: rise monotonically (2.245 -> 2.970 -> 4.095 -> 8.697) -- so a trend fit would
+#: price HIGHER than MAX, not lower, and MAX is therefore the CONSERVATIVE of
+#: the two available rules rather than the lazy one.  If a seventh row lands
+#: above 8.697 the rule moves on its own; if one lands below, MAX holds the
+#: bound where the worst boot put it.
+FLIP_RATCHET_SERIES_GIB = {
+    "weg2xsn20": 1.648, "weg2xsn21b": 1.695, "weg2xsn22": 2.245,
+    "weg2xsn23": 2.970, "weg2xsn24": 4.095, "weg2xsn25": 8.697,
+}
+
 #: Per boot: (predicted run peak, measured non-reclaimable peak) in GiB, so a
 #: ring provenance line can show the next seat how the SOURCE boot's own
 #: prediction compared with its metal.  #1325b: a ledger that re-prices a form
@@ -2143,20 +2182,30 @@ def resolve_flip_ratchet_gib(
             ),
             from_record=True,
         )
-    if seed_allowed and FLIP_RATCHET_CUMULATIVE_GIB:
-        boot, pair = max(
-            ((b, v[1]) for b, v in FLIP_RATCHET_CUMULATIVE_GIB.items()),
-            key=lambda kv: kv[1],
+    if seed_allowed and FLIP_RATCHET_SERIES_GIB:
+        # #1350g: THE SERIES, NOT THE SEED. The seed was one boot's first flip
+        # PAIR (4.049 GiB) and boot weg2xsn25 proved it too small by 4.647 GiB
+        # -- it predicted 90.43, reached 95.077 and the host reaped group D.
+        # The series prices what the term would have had to BE on each recorded
+        # boot, so it cannot under-shoot the population it is measured from.
+        boot, need = max(FLIP_RATCHET_SERIES_GIB.items(), key=lambda kv: kv[1])
+        rows = " ".join(
+            f"{b}:{v:+.3f}" for b, v in sorted(FLIP_RATCHET_SERIES_GIB.items())
         )
         return FlipRatchet(
-            per_flip_gib=float(pair),
+            per_flip_gib=float(need),
             flips_priced=n,
             source=(
-                f"SEED (NOT this line's own record): RECORDED first-pair max over "
-                f"{sorted(FLIP_RATCHET_CUMULATIVE_GIB)}, binding {boot} "
-                f"{pair:.3f} GiB, 1 Hz anon+shmem+slab_unreclaimable "
-                f"(ANALYSE_1350_HOST_TERM_0912.md SS1.3). RETIRES as soon as one "
-                f"boot writes flip_ratchet_gib into the sidecar"
+                f"SERIES (NOT this line's own record, and NOT the retired "
+                f"first-pair seed): MAX over the measured 6-boot series [{rows}], "
+                f"binding {boot} {need:.3f} GiB. Each row is what that boot's "
+                f"UN-ratcheted prediction had to gain to reach its own measured "
+                f"non-reclaimable peak (weg2xsn25's row adds back the 4.050 GiB "
+                f"its prediction already charged). MAX is the rule, and it is the "
+                f"conservative of the two available: the last four rows rise "
+                f"monotonically, so a trend fit prices HIGHER. RETIRES as soon as "
+                f"one boot writes flip_ratchet_gib into the sidecar -- which needs "
+                f"a boot that completes TWO flips, the one weg2xsn25 died before"
             ),
             from_record=False,
         )

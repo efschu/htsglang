@@ -3620,6 +3620,19 @@ class SchedulerWeightUpdaterManager:
                 group=self._weg2_group_name(),
                 rank=self._weg2_rank(),
             )
+            # #1350g: NAME THE LEG, or the whole NEED series is unusable.
+            # Measured on boot weg2xsn25: 90 of 90 `WEG2-RING NEED` lines read
+            # `leg=unknown`, because `set_leg` existed and nothing called it.
+            # Without a leg identity the per-card sums cannot be split "per
+            # sleep leg" and the ring-anchor measuring boot produces nothing --
+            # the emitter's three fields (#1350d) are inert until this one line.
+            # The epoch is the SAVER's own flip epoch where it is published and
+            # the leg is a d2h sleep by construction here; an absent epoch
+            # prints as `?` rather than as a number this file invents.
+            weg2_ring_guard.set_leg(
+                os.environ.get("TMS_HOST_RING_EPOCH", "") or "?",
+                self._weg2_group_name(), "peer",
+            )
             with self._weg2_pcie_lock("sleep-D2H " + ",".join(weights_tags), direction="d2h"):
                 for tag in weights_tags:
                     weg2_ring_guard.guard_tag(
