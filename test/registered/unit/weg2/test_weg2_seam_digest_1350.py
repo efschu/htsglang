@@ -848,6 +848,38 @@ def hooked(monkeypatch):
     return _make
 
 
+def test_smoke_the_arming_line_is_announced_once_and_only_when_armed(
+    hooked, monkeypatch, caplog
+):
+    """The arming line must have a CALLER, and exactly one announcement.
+
+    An instrument's provenance line that nothing calls is the
+    built-but-never-wired class; a line printed per flip is noise.  Both
+    directions are asserted here because the fix for one is the defect for the
+    other.
+    """
+    mod = _mod()
+    mod.reset_announcement()
+    m = hooked(_inventory())
+    with caplog.at_level("INFO"):
+        m._weg2_seam_digest_before(_Req(), ["weights_0"])
+        m.weg2_seam_before = None
+        m._weg2_seam_digest_before(_Req(), ["weights_0"])
+    assert caplog.text.count("knob provenance") == 1, (
+        "the arming line was announced 0 or >1 times"
+    )
+    assert mod.ARM_FLAG in caplog.text
+
+    # UNARMED: nothing at all, because a serving boot's log gains nothing from
+    # an instrument that is off.
+    mod.reset_announcement()
+    monkeypatch.delenv(mod.ENV_ARM, raising=False)
+    caplog.clear()
+    with caplog.at_level("INFO"):
+        m._weg2_seam_digest_before(_Req(), ["weights_0"])
+    assert "knob provenance" not in caplog.text
+
+
 def test_smoke_the_hooks_run_and_a_clean_round_trip_is_a_match(hooked, caplog):
     """THE HAPPY PATH, EXECUTED.  Both hooks, the real producer, no device."""
     mod = _mod()
