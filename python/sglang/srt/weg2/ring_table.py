@@ -1851,6 +1851,78 @@ def parse_chosen_arm(front_log: str) -> Optional[Tuple[int, int]]:
     return None
 
 
+#: #1350b (#782 class, self-referential recurrence): how much a newly solved
+#: Sigma H may exceed the SOURCE boot's own Sigma H at a MATCHING form before
+#: the raise is refused.  Not a safety factor: it is the noise floor of the two
+#: instruments that produce the figure, and it is deliberately smaller than the
+#: measured per-boot step (+885 / +886 / +1158 / +1158 MiB) so the ratchet
+#: cannot hide under it, and larger than the measured census jitter
+#: (-1 / -1 / -2 / -2 MiB) so an honest re-measurement is not refused.
+SIGMA_H_RECURRENCE_TOLERANCE_MIB = 64
+
+_SOURCE_SIGMA_H_RE = re.compile(r"Sigma H (\d+) MiB = per card the LARGER of")
+
+
+class Weg2RingSigmaRecurrence(RuntimeError):
+    """W96: the solved Sigma H would RISE above its own source at matching form.
+
+    THE MECHANISM, measured over six consecutive boots of one form and closing
+    exactly (ANALYSE_1350 SS1.2 + the #1350b ladder):
+
+        boot        Sigma H   per-card census   measured image
+        xsn20-in     43996        42156            44716
+        xsn21b       44587        42492            44587
+        xsn22        45471        44586            45471
+        xsn23        46356        45470            46356
+        xsn24        47514        46354            47514
+        xsn25(dry)   48672        47512            48672
+
+    Read the third column against the first of the row ABOVE: the per-card TAG
+    CENSUS of boot n is the Sigma H of boot n-1 MINUS ONE OR TWO MiB, on four
+    consecutive boots.  The census is not an independent anchor -- it is last
+    boot's ring measured again, because the saver's ``enable_cpu_backup``
+    metadata reports the size of the REGION each tag was backed into, and that
+    region was sized from the previous Sigma H.  The measured dormant image then
+    adds the ring's own preallocated slack on top (+885..+1160 MiB) and BECOMES
+    the next Sigma H.
+
+    Both instruments therefore measure the ring the solve is trying to size.
+    That is the #782 shape exactly: a quantity whose measurement contains its
+    own previous value, rising monotonically with nothing physical behind it --
+    +4676 MiB (+4.57 GiB) over six boots, which is 16x what the whole M ladder
+    150 -> 80 buys (0.29 GiB) and by itself makes every arm unfundable.
+
+    THE RULE THIS CLASS ENFORCES IS ONE-SIDED: a Sigma H may always SHRINK (a
+    smaller image is a real finding and the whole point of the solve), and it
+    may rise only within :data:`SIGMA_H_RECURRENCE_TOLERANCE_MIB` of the source
+    boot's own figure when the form key matches.  A rise beyond that at
+    MATCHING form has no physical candidate -- the weights did not change --
+    and is refused by name rather than charged.
+    """
+
+
+def parse_source_sigma_h_mib(boot_log: str) -> Optional[int]:
+    """The SOURCE boot's OWN solved Sigma H, from its own provenance line.
+
+    #1350b.  The anti-recurrence guard needs the previous value of the very
+    quantity being solved, and that value is already printed by the boot that
+    produced it -- no new instrument, no new file, and no constant.  ``None``
+    when the log has no such line (a boot from before the provenance line, or
+    an unreadable path), and an absent previous value DISABLES the guard rather
+    than inventing one: the guard refuses a RISE it can prove, never a figure
+    it cannot compare.
+    """
+    try:
+        with open(boot_log, errors="replace") as f:
+            for line in f:
+                m = _SOURCE_SIGMA_H_RE.search(line)
+                if m:
+                    return int(m.group(1))
+    except OSError:
+        return None
+    return None
+
+
 def apportion_dormant(
     group: str,
     measured: Optional[DormantImage],
@@ -1862,6 +1934,11 @@ def apportion_dormant(
     non_backup_mib: Optional[int] = None,
     fallback_non_backup_mib: Optional[int] = None,
     non_backup_currency: str = "",
+    # #1350b: the SOURCE boot's own solved Sigma H, and whether this boot's
+    # form key matches that boot's.  `None` on either disables the guard --
+    # it refuses a rise it can PROVE, never a figure it cannot compare.
+    source_sigma_h_mib: Optional[int] = None,
+    form_matches: bool = False,
 ) -> Tuple[Dict[str, int], str, bool]:
     """A1-2's cross-check, turned into per-card MiB -- ``(rows, source, is_bound)``.
 
@@ -1938,6 +2015,60 @@ def apportion_dormant(
                 ),
                 not census_covers_all_tags,
             )
+        # #1350b THE ANTI-RECURRENCE GUARD, at the one place a census is RAISED.
+        # This `return` is the only step in the whole solve that makes Sigma H
+        # bigger than the tag census, and over six boots of one form it was the
+        # step that made it bigger than PHYSICS: the excess it apportions is the
+        # ring's own preallocated slack (the region was sized from the previous
+        # Sigma H and the sleeping group maps all of it MAP_SHARED), so raising
+        # on it feeds this boot's ring size back into the next boot's. Measured
+        # +885 / +886 / +1158 / +1158 MiB per boot with no weight change behind
+        # it. See `Weg2RingSigmaRecurrence` for the full six-row table.
+        if source_sigma_h_mib is not None and form_matches:
+            headroom = int(source_sigma_h_mib) + SIGMA_H_RECURRENCE_TOLERANCE_MIB
+            if total_census > headroom:
+                # SECOND ORDER: the anchor ITSELF rose above the source. There
+                # is nothing left in this solve that is not a re-measurement of
+                # the source ring, so it refuses by name instead of picking the
+                # least self-referential of two self-referential numbers.
+                raise Weg2RingSigmaRecurrence(
+                    f"W96 Weg2RingSigmaRecurrence: group {group}'s per-card tag census "
+                    f"{total_census} MiB EXCEEDS the source boot's own Sigma H "
+                    f"{int(source_sigma_h_mib)} MiB by "
+                    f"{total_census - int(source_sigma_h_mib)} MiB at a MATCHING form "
+                    f"key (tolerance {SIGMA_H_RECURRENCE_TOLERANCE_MIB} MiB). The "
+                    "weights did not change, so nothing physical explains the rise: "
+                    "the census reports the size of the REGION each tag was backed "
+                    "into, and that region was sized from the previous Sigma H. Both "
+                    "instruments are measuring the ring this solve is sizing (#782 "
+                    "class). A SHRINK is always allowed; this rise is refused rather "
+                    "than charged."
+                )
+            if usable > headroom:
+                return (
+                    dict(census),
+                    (
+                        f"group {group}: measured RssShmem {measured.rss_mib} MiB minus "
+                        f"the ledger's own posted non-backup host terms for this "
+                        f"group's ranks {int(non_backup_mib)} MiB (anchors + rings"
+                        f"{'; ' + non_backup_currency if non_backup_currency else ''}) = "
+                        f"{usable} MiB, which EXCEEDS the per-card census "
+                        f"{total_census} MiB ({covers}) by {usable - total_census} MiB -- "
+                        f"and that excess is REPORTED, NOT CHARGED (#1350b, #782 class): "
+                        f"raising to it would put Sigma H at {usable} MiB against the "
+                        f"SOURCE boot's own {int(source_sigma_h_mib)} MiB at a MATCHING "
+                        f"form key, i.e. a rise of "
+                        f"{usable - int(source_sigma_h_mib)} MiB beyond the "
+                        f"{SIGMA_H_RECURRENCE_TOLERANCE_MIB} MiB tolerance with no weight "
+                        f"change behind it. The excess is the ring's own preallocated "
+                        f"slack: the region was sized from the previous Sigma H and the "
+                        f"sleeping group maps all of it MAP_SHARED, so charging it feeds "
+                        f"this boot's ring into the next boot's (measured +885/+886/"
+                        f"+1158/+1158 MiB over four boots, +4.57 GiB over six). The "
+                        f"census stands; route = per-card tag census (RAISE REFUSED)"
+                    ),
+                    not census_covers_all_tags,
+                )
         return (
             scaled(usable),
             (
@@ -2540,10 +2671,17 @@ def solve(
         # single-budget currency left 8.72 GiB of D's rings inside Sigma H, to
         # be charged a second time by `Arm.predicted_run_peak_gib`.
         non_backup, non_backup_why = _non_backup_mib(arm, measured)
+        # #1350b: the previous value of the quantity being solved, read from
+        # the SOURCE boot's own provenance line. The guard only binds when the
+        # form key MATCHES -- a different form may legitimately need a
+        # different ring, and refusing that would be the mirror defect.
+        _src_sigma = parse_source_sigma_h_mib(f_log)
+        _form_ok = bool(form_same)
         dorm_p, src_p, bound_p = apportion_dormant(
             "P", measured.get("P"), pairs["image_p"], gp.covers_all_backed_up_tags,
             non_backup_mib=non_backup.get("P"),
             non_backup_currency=non_backup_why.get("P", ""),
+            source_sigma_h_mib=_src_sigma, form_matches=_form_ok,
         )
         dorm_d, src_d, bound_d = apportion_dormant(
             "D", measured.get("D"), pairs["image_d"], gd.covers_all_backed_up_tags,
@@ -2551,6 +2689,7 @@ def solve(
             non_backup_mib=non_backup.get("D"),
             fallback_non_backup_mib=non_backup.get("P"),
             non_backup_currency=non_backup_why.get("D", ""),
+            source_sigma_h_mib=_src_sigma, form_matches=_form_ok,
         )
         pairs["dorm_p"], pairs["dorm_d"] = dorm_p, dorm_d
 
