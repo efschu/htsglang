@@ -134,6 +134,12 @@ from sglang.srt.weg2.ring_table import (  # noqa: E402
 #: refusal into a silent partial sleep.
 from sglang.srt.weg2.ring_guard import RingNeedGuard  # noqa: E402
 
+# #1348: the unexecuted-line instrument. Imported at module scope because the
+# module itself is inert and dependency-free until armed -- it imports
+# `coverage` lazily inside `arm()` and only when the launcher published its
+# directory, so an unarmed boot pays this import and nothing else.
+from sglang.srt.weg2 import lane_coverage as wlc  # noqa: E402
+
 logger = logging.getLogger(__name__)
 
 
@@ -2345,6 +2351,25 @@ class SchedulerWeightUpdaterManager:
                     epoch=str(getattr(recv_req, "epoch", "") or ""),
                     detail="torch reports no CUDA device on this rank"))
                 return
+            # #1348: THE COMPLEMENT INSTRUMENT, armed at the earliest point on
+            # this lane that HAS an identity.  It answers the one question no
+            # counter on this path can ("which lines did this boot never
+            # reach"), and walls XSN6..XSN15 were each a line in that set.
+            #
+            # ARMED HERE AND NOT EARLIER for two reasons that pull the same
+            # way: the arm needs `group`/`rank` for the #1292 dump name, which
+            # is first known two lines up; and arming before the
+            # `bounce_lane_armed()` gate above would pay coverage.py's tracer
+            # on every ring boot -- i.e. every boot to date -- for a lane that
+            # returns immediately. The cost of arming LATE is real and is not
+            # hidden: module-scope lines of anything already imported ran
+            # unobserved, so `lane_coverage` records `imported_before_arm` per
+            # module and the ingest prints it on every line.
+            #
+            # NO-OP AND NO IMPORT unless the launcher published the directory
+            # (`--xchg-coverage-diff`); returns bool, never raises, and is
+            # never allowed to be the reason a leg fails.
+            wlc.arm(group=group, rank=rank)
             # ------------------------------------------------------------
             # #1273 S6 fix D -- THE IDENTITY SWEEP, not one more instance.
             #
@@ -2519,6 +2544,13 @@ class SchedulerWeightUpdaterManager:
                 # deliberate: torch's current device is the one the rest of
                 # this leg reads.
                 self._weg2_restore_device(device)
+                # #1348: THIS LEG'S READING IS ON DISK BEFORE THE NEXT ONE
+                # STARTS. In the `finally` on purpose -- the legs whose
+                # coverage matters most are the ones that RAISED, and a dump
+                # written only on the success path is absent on exactly the
+                # boots this instrument exists for. A rank that dies between
+                # two legs still leaves every leg it completed behind.
+                wlc.note_leg_end(hook)
         except BaseException as exc:  # noqa: BLE001 -- an observer never raises
             logger.warning(
                 "[weg2 shadow] the %s hook failed and the flip is unaffected "

@@ -4109,7 +4109,30 @@ def _env_knobs(ns) -> Dict[str, object]:
         "arming_floor_solved": ns.arming_floor_solved,
         "hicache_bigram_keys": ns.hicache_bigram_keys,
         "hicache_flush_publish_sweep": ns.hicache_flush_publish_sweep,
+        "lane_coverage_dir": lane_coverage_dump_dir(ns),
     }
+
+
+def lane_coverage_dump_dir(ns) -> str:
+    """#1348: where the per-rank coverage dumps go, or ``""`` when disarmed.
+
+    THE SAME DIRECTORY #1292 WRITES ITS FOOTPRINT DUMPS INTO, deliberately and
+    in that order of preference: an operator who armed the footprint probe has
+    already named a dump directory for this boot, and a second directory for a
+    second per-rank dump is one more thing to pass to the ingest and one more
+    place for half a boot's evidence to sit. Absent that, the evidence dir the
+    launcher already writes every log into.
+
+    Returns ``""`` unless ``--xchg-coverage-diff`` was passed, which is what
+    makes the OFF state byte-identical rather than merely cheap: ``build_env``
+    POPS the variable on an empty string, so nothing downstream can read a
+    value that was never asked for.
+    """
+    if not getattr(ns, "xchg_coverage_diff", False):
+        return ""
+    return os.environ.get("SGLANG_PHASE_FOOTPRINT_DUMP") or getattr(
+        ns, "evidence_dir", EVIDENCE_DIR
+    )
 
 
 def build_env(tree: str, venv: str, cvd: str, store_dir: str, debug_hold: bool, tag: str,
@@ -4124,8 +4147,21 @@ def build_env(tree: str, venv: str, cvd: str, store_dir: str, debug_hold: bool, 
               hicache_flush_publish_sweep: bool = True,
               seam_digest_armed: bool = False,
               group: str = "",
+              lane_coverage_dir: str = "",
               xchg_env: Optional[Dict[str, str]] = None) -> Dict[str, str]:
     env = dict(os.environ)
+    # #1348: the exchange lane's unexecuted-line instrument. SAME DISCIPLINE
+    # as SGLANG_WEG2_GROUP and the host-ring family below (R19): this is
+    # LAUNCHER OUTPUT, published only when `--xchg-coverage-diff` named a
+    # directory, and POPPED otherwise -- so a value left in the operator's own
+    # shell can never arm a coverage.py line tracer (2x-10x on the traced
+    # modules) on an acceptance boot. That popping is the whole reason the
+    # switch is a FLAG and not an ambient environment variable, which is where
+    # `managers/seam_coverage.py`'s switch differs and must keep differing.
+    if lane_coverage_dir:
+        env["SGLANG_WEG2_LANE_COVERAGE_DIR"] = lane_coverage_dir
+    else:
+        env.pop("SGLANG_WEG2_LANE_COVERAGE_DIR", None)
     # FIX 2, finding 1: WHICH WEG-2 GROUP THIS RANK BELONGS TO, and the only
     # thing in either tree that says so.  Read by
     # `weg2_memory_saver.weg2_group_name()`; it is the discriminator the
@@ -8434,6 +8470,23 @@ def build_parser() -> argparse.ArgumentParser:
              "a size, never a knob: H and both spans are solved from the previous "
              "boot's own lines.",
     )
+    ap.add_argument(
+        "--xchg-coverage-diff",
+        action="store_true",
+        help="#1348 DIAGNOSTIC BOOT ONLY -- record, per rank, which lines of "
+             "the exchange lane's modules this boot actually executed, and "
+             "print the complement afterwards with "
+             "scripts/weg2/lane_coverage_diff.py. The complement is the list "
+             "of seams nothing reached, i.e. the walls not yet found. "
+             "OVERHEAD: coverage.py line tracing, which its own numbers put "
+             "at 2x-10x ON THE TRACED MODULES ONLY (11 files, allowlisted -- "
+             "not the whole tree); the measured per-leg cost of the dump "
+             "itself is printed on every WEG2-COVERAGE DUMP line, never "
+             "estimated. Default OFF and byte-identical off: the environment "
+             "variable it publishes is POPPED when this flag is absent. Do "
+             "NOT combine with SGLANG_SEAM_COVERAGE_DIR -- two coverage "
+             "tracers in one process measure neither, and the arm refuses by "
+             "name if it sees it.")
     ap.add_argument("--evidence-dir", default=EVIDENCE_DIR,
                     help="where ring_table reads the previous boot's logs from")
     ap.add_argument("--duplex-probe", default=DUPLEX_PROBE_DEFAULT,
@@ -9179,6 +9232,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # shape anyway) must never make a fast pre-spawn refusal look post-spawn.
     _ACTIVE_BOOT_STATE = None
     ns = build_parser().parse_args(argv)
+    # #1348: arm the complement instrument in the LAUNCHER's own process too.
+    # The rank processes never import this module, so without this the ingest
+    # could only ever print NO-OBSERVATION for `launcher.py` -- an honest
+    # answer and a useless one, because the arm/ledger half of this file is
+    # exactly the set of decisions an operator wants the complement of ("which
+    # arm branch did this boot NOT take"). Group `L` keeps its dump out of
+    # every rank's filename space. No-op and no import when the flag is off.
+    _lane_cov_dir = lane_coverage_dump_dir(ns)
+    if _lane_cov_dir:
+        from sglang.srt.weg2 import lane_coverage as _wlc
+
+        _wlc.arm_launcher(_lane_cov_dir)
     if ns.teardown:
         return teardown(ns.teardown)
     # BEFORE build_env(), which starts from os.environ: an inherited stage map
