@@ -1980,7 +1980,21 @@ def prepare_region(
 
 def teardown_region(boot_nonce: str, *, shm_root: str = SHM_ROOT,
                     log: Optional[Callable[[str], None]] = None) -> Dict[str, int]:
-    """``sem_unlink`` the 24 names and remove the region directory."""
+    """``sem_unlink`` the 24 names and remove the region directory.
+
+    #1348: this is also where the lane's coverage reading is checkpointed.
+    Teardown is the last moment the lane is definitely still alive on this
+    rank -- after it, the process may serve on, may exit cleanly (``atexit``
+    catches that), or may be killed (``atexit`` does not). Writing here costs
+    one JSON dump on a path that is already doing filesystem work, and it is
+    the only checkpoint a SIGKILLed rank is guaranteed to have passed.
+    """
+    # Imported here rather than at module scope: this module is deliberately
+    # torch-free and import-light (its docstring says so), and the instrument
+    # is inert unless the launcher armed it.
+    from sglang.srt.weg2 import lane_coverage as wlc
+
+    wlc.note_teardown()
     sems = unlink_semaphores(boot_nonce)
     path = region_path(boot_nonce, shm_root)
     removed = 0
