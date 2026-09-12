@@ -65,7 +65,7 @@ xm._pad_vocab_size(1)
 NONCE = f"replay{os.getpid()}"
 SLOT_BYTES = 4 << 20          # the layout, scaled; the RATIO is what matters
 #: Must stay under FakeDeviceOps' FAKE_DEV_BYTES (8 MiB per rank).
-FAKE_DEV_BUDGET = 5 << 20
+FAKE_DEV_BUDGET = 2 << 20
 DEPTH = 1
 
 
@@ -177,155 +177,257 @@ def narrow(mans, col_div: int):
     return out
 
 
+BOOT_TOKEN = "replay"
+
+
+def rank_extents(t, group: str, rank: int):
+    """(rows, cols) THIS rank holds of one joined tensor -- AXIS-AWARE.
+
+    The first version took ``tp_widths[rank]`` as the ROW count for every
+    class, which is right for a row cut and wrong for a column cut. The
+    product's own materialisation check caught it immediately and by name:
+    ``A_log: the manifest records (1, 30) ... and the materialised tensor
+    holds (30, 48)``. That guard is doing exactly what it was wired for -- the
+    manifest is what every other reader plans from -- so the fixture was the
+    thing that had drifted.
+    """
+    if group == "P":
+        rows = t.rows_full - (t.pad_units if t.shard_axis == wx.ROWS else 0)
+        cols = t.cols_full - (t.pad_units if t.shard_axis == wx.COLS else 0)
+        return max(rows, 1), max(cols, 1)
+    if t.shard_axis == wx.COLS:
+        return max(t.rows_full, 1), max(t.tp_widths[rank], 1)
+    if t.shard_axis == wx.ROWS:
+        return max(t.tp_widths[rank], 1), max(t.cols_full, 1)
+    return max(t.rows_full, 1), max(t.cols_full, 1)
+
+
+def budget_manifests(mans, max_tensors: int):
+    """Drop tensors that do not fit, BY NAME, identically on all six ranks.
+
+    THE COST IS COMPUTED FROM THE JOIN, not estimated from the manifests, and
+    that correction is the second one this budget needed. A per-manifest
+    estimate under-counted a D rank by 8x (`allocation 16032228 B over budget
+    2097152 B at visual.blocks.0.attn.qkv_proj.bias`) because what a rank
+    actually allocates is a function of the JOIN's extents -- the padded total,
+    the per-rank width -- and not of any single manifest row. Budgeting on a
+    quantity that is not the one allocated is the same defect twice.
+
+    SELECTED IN THE PARENT so the six children cannot disagree about the
+    population: six plans that differ is the one thing this slice prevents.
+    """
+    join = xm.join_manifests(mans, pp_group="P", tp_group="D")
+
+    def rank_costs(t):
+        """(worst P stage cost, worst D rank cost) for one tensor."""
+        pr, pc = rank_extents(t, "P", 0)
+        whole = pr * pc * t.itemsize
+        shard = max(
+            rank_extents(t, "D", r)[0] * rank_extents(t, "D", r)[1] * t.itemsize
+            for r in range(len(t.tp_widths)))
+        return max(whole, 1), max(shard, 1)
+
+    keep, p_used, d_used, dropped = set(), 0, 0, 0
+    for t in sorted(join.tensors, key=lambda t: sum(rank_costs(t))):
+        w, sh = rank_costs(t)
+        # BOTH SIDES ARE BOUNDED, because they fill on different sets: a P
+        # stage holds whole tensors of its own layers, a D rank a shard of
+        # EVERY tensor. The D side is the binding one and was the one that
+        # asserted mid-leg.
+        if p_used + w > FAKE_DEV_BUDGET or d_used + sh > FAKE_DEV_BUDGET:
+            dropped += 1
+            continue
+        p_used += w
+        d_used += sh
+        keep.add(t.param_name)
+    if max_tensors and len(keep) > max_tensors:
+        keep = set(sorted(keep)[:max_tensors])
+    print(f"  BUDGET kept={len(keep)} dropped={dropped} of {len(join.tensors)} "
+          f"p_bytes={p_used} d_bytes={d_used} cap={FAKE_DEV_BUDGET} -- the "
+          f"dropped tensors are NOT byte-routed here; their byte path stays a "
+          f"metal question")
+    out = []
+    for m in mans:
+        out.append(xm.RankManifest(
+            group=m.group, rank=m.rank, card=m.card, region_tag=m.region_tag,
+            boot_token=m.boot_token, tp_rank=m.tp_rank, pp_rank=m.pp_rank,
+            pieces=tuple(p for p in m.pieces if p.param_name in keep)))
+    return out
+
+
+class _FakeParam:
+    """A tensor as the product path reads one: address AND geometry.
+
+    ``data_ptr()`` is what the address books ask; ``shape``/``stride()``/
+    ``element_size()`` are what `refuse_on_materialisation_drift` reads through
+    `StorageGeom.of`. A double with only the pointer made every rank refuse
+    with ``derivation-failed: '_FakeParam' object has no attribute 'shape'`` --
+    which is the materialisation check doing its job on a fixture that had not
+    materialised anything.
+    """
+
+    def __init__(self, ptr: int, rows: int, cols: int, itemsize: int):
+        self._ptr = int(ptr)
+        self.shape = (int(rows), int(cols))
+        self._stride = (int(cols), 1)
+        self._itemsize = int(itemsize)
+
+    def data_ptr(self) -> int:
+        return self._ptr
+
+    def stride(self):
+        return self._stride
+
+    def element_size(self) -> int:
+        return self._itemsize
+
+    def dim(self) -> int:
+        return 2
+
+
+class _FakeModel:
+    def __init__(self, params):
+        self._p = list(params)
+
+    def named_parameters(self):
+        return list(self._p)
+
+
+class _FakeRunner:
+    def __init__(self, model):
+        self.model = model
+
+
+class _FakeWorker:
+    def __init__(self, model):
+        self.model_runner = _FakeRunner(model)
+
+
+class _FakeDraftWorker:
+    """The shape ``_get_draft_model_runner`` resolves."""
+
+    def __init__(self, model):
+        self.draft_model_runner = _FakeRunner(model)
+
+
+class _Stub:
+    """Borrows the REAL unbound methods -- nothing is re-implemented.
+
+    ``draft_params=None`` is the CAN-FAIL ARM: it reproduces the single-runner
+    address book weg2xsn24 shipped, where ``fc.weight`` had no home and the
+    leg refused with W74 at ``dst_resolved=894/904``.
+    """
+
+    def __init__(self, main_params, draft_params):
+        from sglang.srt.managers.scheduler_components import weight_updater as wu
+
+        self.tp_worker = _FakeWorker(_FakeModel(main_params))
+        self.draft_worker = (None if draft_params is None
+                             else _FakeDraftWorker(_FakeModel(draft_params)))
+        cls = wu.SchedulerWeightUpdaterManager
+        for name in ("_weg2_rank_param_table", "_weg2_join_src_addr",
+                     "_weg2_join_dst_addr", "_weg2_shadow_plan",
+                     "_weg2_xchg_bounce_leg"):
+            setattr(type(self), name, getattr(cls, name))
+
+
 def rank_proc(group, rank, evidence, root, q, self_test, max_tensors,
-              col_div):
-    """ONE rank: build the plan, take its half of every leg, report."""
+              col_div, single_runner, manifest_dir):
+    """ONE rank, THROUGH THE PRODUCT ADAPTER.
+
+    THE ENTRY POINT IS THE BOOT'S, and that is the whole point of this
+    revision. The first version called ``wb.run_bounce_leg`` with an address
+    book the replay built itself, so it graded the library and left the two
+    things weg2xsn24 actually died on -- the adapter's two-runner address
+    table and its lazy import -- UNTESTED at the desk. Now the stub borrows the
+    real unbound methods (`_weg2_shadow_plan`, `_weg2_rank_param_table`, the
+    two address books, `_weg2_xchg_bounce_leg`) and the bytes travel the path a
+    flip leg travels.
+    """
     try:
+        import torch
+
+        from sglang.srt.managers.scheduler_components import weight_updater as wu
         from test_weg2_xchg_transport_1273 import FakeDeviceOps
 
-        mans = synthetic_manifests() if self_test else load_manifests(evidence)
-        mans = narrow(mans, col_div)
-        # THE JOIN SEES EVERY TENSOR -- its refusals must be the real ones.
+        os.environ[xm.DIR_ENV] = manifest_dir
+        os.environ[xr.ENV_REGION_BOOT] = BOOT_TOKEN
+        os.environ["SGLANG_WEG2_WEIGHT_SOURCE"] = "exchange"
+        os.environ["SGLANG_WEG2_GROUP"] = group
+
+        mans = xm.load_manifests(manifest_dir, boot_token=BOOT_TOKEN)
         join = xm.join_manifests(mans, pp_group="P", tp_group="D")
-        # THE REPLAY MATERIALISES A SUBSET, and that is a byte budget, not a
-        # simplification of the arithmetic: each selected tensor keeps its REAL
-        # extents, its real shard vector and its real padding, because those
-        # are what the routing is made of. Materialising all of them would mean
-        # synthesising the whole 27.5 GiB image per rank.
-        #
-        # The selection is DETERMINISTIC and always carries the padded
-        # vocabulary tensors, which are the ones with a ZEROFILL tail and
-        # therefore the ones a naive router gets wrong.
-        # THE BYTE BUDGET IS A REFUSAL, NOT A HOPE. `FakeDeviceOps` maps
-        # FAKE_DEV_BYTES (8 MiB) per rank; allocating past it used to walk off
-        # the mapping and SEGFAULT the child, which reports as
-        # `ranks_reported=0/6 errors=0` -- an absence that looks like nothing
-        # happened. Tensors that do not fit are dropped BY NAME and counted.
-        # THE BUDGET MUST BE THE WORST RANK'S ACTUAL ALLOCATION, not the
-        # tensor's full size: a P stage holds WHOLE tensors of its own layers
-        # while a D rank holds a shard of EVERY tensor, so the two sides fill
-        # up on different sets. Budgeting on the full size let D past the gate
-        # and then `raw_malloc` asserted `fake device out of memory` mid-leg --
-        # after the P side had already deposited, which cascaded into
-        # `slot still full` on all three P ranks. A budget that is not the
-        # quantity actually allocated is not a budget.
-        #
-        # SELECTED IDENTICALLY ON ALL SIX RANKS (same sort, same predicate),
-        # because a per-rank selection would make the six plans differ, which
-        # is the one thing the whole slice exists to prevent.
-        budget = FAKE_DEV_BUDGET
-        fitted, dropped = [], 0
-        worst = 0
-
-        def rank_cost(t):
-            whole = max((t.rows_full - t.pad_units) * t.cols_full * t.itemsize, 1)
-            shard = max(max(t.tp_widths) * t.cols_full * t.itemsize, 1)
-            return max(whole, shard)
-
-        for t in sorted(join.tensors, key=rank_cost):
-            nb = rank_cost(t)
-            if worst + nb > budget:
-                dropped += 1
-                continue
-            worst += nb
-            fitted.append(t)
-        used = worst
-        if dropped:
-            join = xm.ManifestJoin(
-                pp_group=join.pp_group, tp_group=join.tp_group,
-                cards=join.cards,
-                tensors=tuple(sorted(fitted, key=lambda t: t.param_name)),
-                unsourced=(), pp_ranks=join.pp_ranks, tp_ranks=join.tp_ranks)
-            q.put(("budget", group, rank, dropped, used, len(fitted)))
-        if max_tensors and len(join.tensors) > max_tensors:
-            padded = [t for t in join.tensors if t.pad_units]
-            rest = [t for t in join.tensors if not t.pad_units]
-            rest.sort(key=lambda t: t.param_name)
-            step = max(1, len(rest) // max(1, max_tensors - len(padded)))
-            keep = padded + rest[::step][:max_tensors - len(padded)]
-            join = xm.ManifestJoin(
-                pp_group=join.pp_group, tp_group=join.tp_group,
-                cards=join.cards,
-                tensors=tuple(sorted(keep, key=lambda t: t.param_name)),
-                unsourced=(), pp_ranks=join.pp_ranks, tp_ranks=join.tp_ranks)
 
         ops = FakeDeviceOps(root, rank=(rank if group == "D" else 3 + rank))
-        sems = tp.SemSet(NONCE)
-        slots = wb.BounceSlots(NONCE, shm_root=root, create=True)
 
-        # This rank's own tensors, with DETERMINISTIC content. The PP side
-        # holds whole tensors of its stage; the TP side holds its shard.
-        own, dst_of = {}, {}
+        # THE TWO RUNNERS, as the real rank has them. The draft head's tensors
+        # (`fc.weight` and friends) live ONLY in the draft runner -- which is
+        # exactly why a single-runner address book resolved 894 of 904 and
+        # refused the leg.
+        mine = [m for m in mans if m.group == group and m.rank == rank]
+        draft_names = {p.param_name for m in mine for p in m.pieces
+                       if str(p.tag) == "weights_draft"}
+
+        main_params, draft_params, own = [], [], {}
+        allocated = 0
         for t in join.tensors:
-            if group == "P":
-                if t.pp_stage != rank:
-                    continue
-                nb = (t.rows_full - t.pad_units) * t.cols_full * t.itemsize
-            else:
-                nb = t.tp_widths[rank] * t.cols_full * t.itemsize
-            ptr = ops.raw_malloc(0, max(nb, 1))
+            if group == "P" and t.pp_stage != rank:
+                continue
+            rows, cols = rank_extents(t, group, rank)
+            nb = max(rows * cols * t.itemsize, 1)
+            allocated += nb
+            if allocated > FAKE_DEV_BUDGET:
+                # THE CHILD'S OWN CEILING, named rather than asserted deep in
+                # the fake device. The parent budgets on a per-tensor cost; if
+                # that estimate is ever short, this says so with the number
+                # instead of dying as `fake device out of memory` mid-leg.
+                q.put(("error", group, rank,
+                       f"allocation {allocated} B over budget "
+                       f"{FAKE_DEV_BUDGET} B at {t.param_name} -- the "
+                       f"parent's per-tensor cost under-counted this rank",
+                       "", 0))
+                q.put(("done", group, rank, 0, 0, 0))
+                return
+            ptr = ops.raw_malloc(0, nb)
             own[t.param_name] = (ptr, nb)
             if group == "P":
                 ctypes.memmove(ops.real(ptr), seed_bytes(t.param_name, nb), nb)
             else:
                 ctypes.memset(ops.real(ptr), 0, nb)
-            dst_of[t.param_name] = ptr
+            # A TENSOR WHOSE data_ptr() IS THE FAKE DEVICE ADDRESS: the address
+            # books call `.data_ptr()`, so the double must answer it.
+            param = _FakeParam(ptr, rows, cols, t.itemsize)
+            (draft_params if t.param_name in draft_names
+             else main_params).append((t.param_name, param))
 
-        def addr(name, r):
-            got = own.get(str(name))
-            return None if got is None or int(r) != int(rank) else got[0]
+        stub = _Stub(main_params,
+                     None if single_runner else draft_params)
 
-        # PP -> TP: P deposits, D collects.
         hook = "source" if group == "P" else "destination"
-        direction = wx.leg_direction(hook, group)
-        plan = xm.plan_from_join(
-            join, direction=direction,
-            src_addr=(addr if group == "P" else None),
-            dst_addr=(addr if group == "D" else None))
-        side = "src_rank" if group == "P" else "dst_rank"
-        mine = [d for d in plan.descs if int(getattr(d, side, -1)) == rank]
-        prof = wx.pointer_profile(mine)
+        plan, reason = stub._weg2_shadow_plan(
+            hook, group, rank, agreed=None, require_agreement=False)
+        if plan is None:
+            q.put(("error", group, rank, f"no plan: {reason}", "", 0))
+            q.put(("done", group, rank, 0, 0, 0))
+            return
+        prof = wx.pointer_profile(plan.descs)
         q.put(("profile", group, rank, prof.src_resolved, prof.dst_resolved,
                prof.descs_total))
+        q.put(("alloc", group, rank, allocated, len(own), 0))
 
-        phase = wb.PHASE_DEPOSIT if group == "P" else wb.PHASE_COLLECT
-        legs = 0
-        for pair, grp in wb.group_descs_by_pair(mine).items():
-            rv = (wb.CrossSlotRendezvous(sems, slots, pair=pair)
-                  if pair is not None else
-                  wb.CrossSlotRendezvous(sems, slots, card=rank))
-            lane = f"p{pair}" if pair is not None else f"c{rank}"
-            # THE SHMEM EMITTER (operator request, xsn24's +2.207 GiB at the
-            # first flip was unattributed because no line names shmem per
-            # region). Every host slot this leg maps says its bytes and its
-            # region path, so an attribution has an address instead of a total.
-            q.put(("slot", group, rank,
-                   f"lane={lane} slot_bytes={SLOT_BYTES} depth={DEPTH} "
-                   f"bytes={SLOT_BYTES * DEPTH} "
-                   f"region={wb.bounce_path(NONCE, root, lane)}", 0, 0))
-            wb.run_bounce_leg(grp, ops, NONCE, slot_bytes=SLOT_BYTES,
-                              depth=DEPTH, mode=wx.INJECT_AUTHORITATIVE,
-                              phase=phase, rendezvous=rv, shm_root=root,
-                              device=0, lane=lane)
-            legs += 1
-        q.put(("legs", group, rank, legs, 0, 0))
+        sems = tp.SemSet(NONCE)
+        stub._weg2_xchg_bounce_leg(
+            descs=list(plan.descs), ops=ops, boot_nonce=NONCE,
+            slot_bytes=SLOT_BYTES, depth=DEPTH,
+            mode=wx.INJECT_AUTHORITATIVE, shm_root=root, device=0,
+            hook=hook, region=None, sems=sems)
+        q.put(("entry", group, rank, "adapter", 0, 0))
 
-        # THE VERDICT, on the collecting side only: did the bytes that landed
-        # equal the bytes the source held for exactly this rank's slice?
         if group == "D":
             good = bad = 0
             bad_names = []
             for t in join.tensors:
                 ptr, nb = own[t.param_name]
-                if not nb:
-                    continue
-                # THE EXPECTATION IS AXIS-AWARE, and the first draft was not:
-                # it computed a contiguous prefix for every class, which is
-                # right for a ROW cut and wrong for a COLUMN cut -- where this
-                # rank holds a STRIDED sub-block of every row. Four of eight
-                # tensors "mismatched" against an expectation that described a
-                # different tensor. A verdict that cannot express the layout it
-                # grades is an instrument fault, not a finding.
                 rows_content = t.rows_full - t.pad_units
                 whole = seed_bytes(t.param_name,
                                    rows_content * t.cols_full * t.itemsize)
@@ -345,13 +447,7 @@ def rank_proc(group, rank, evidence, root, q, self_test, max_tensors,
                 else:
                     bad += 1
                     if len(bad_names) < 3:
-                        off = next((i for i in range(min(len(got), len(want)))
-                                    if got[i] != want[i]), -1)
-                        zeros = got.count(0)
-                        bad_names.append(
-                            f"{t.param_name} axis={t.shard_axis} nb={nb} "
-                            f"first_diff={off} zero_bytes={zeros}/{len(got)} "
-                            f"stage={t.pp_stage} w={list(t.tp_widths)}")
+                        bad_names.append(t.param_name)
             q.put(("digest", group, rank, good, bad, len(join.tensors)))
             if bad_names:
                 q.put(("badnames", group, rank, ",".join(bad_names), 0, 0))
@@ -359,12 +455,22 @@ def rank_proc(group, rank, evidence, root, q, self_test, max_tensors,
     except BaseException as exc:  # noqa: BLE001
         q.put(("error", group, rank, f"{type(exc).__name__}: {exc}",
                traceback.format_exc()[-900:], 0))
+        q.put(("done", group, rank, 0, 0, 0))
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--evidence", default="/spinning/evidence-665-f1/weg2xsn24_0912")
     ap.add_argument("--self-test", action="store_true")
+    ap.add_argument("--single-runner", action="store_true",
+                    help="CAN-FAIL ARM: build the address book from the MAIN "
+                         "runner only, as weg2xsn24 shipped it. The draft "
+                         "head then has no address and the leg must refuse "
+                         "with W74 on fc.weight (dst_resolved=894/904)")
+    ap.add_argument("--entry", choices=("adapter", "library"),
+                    default="adapter",
+                    help="which entry point the bytes travel; the boot's is "
+                         "the adapter")
     ap.add_argument("--col-div", type=int, default=1,
                     help="divide every tensor's COLUMN count by N for "
                          "materialisation, uniformly on both sides and only "
@@ -389,9 +495,28 @@ def main() -> int:
           f"source={'synthetic' if ns.self_test else ns.evidence}")
 
     q = mp.Queue()
+    # THE PARENT WRITES THE MANIFESTS ONCE, narrowed and budgeted, under ONE
+    # boot token -- the children then read them exactly as a rank reads its
+    # boot's, through `manifests_for_boot`, which is the product's own entry.
+    mdir = os.path.join(root, "manifests")
+    os.makedirs(mdir, exist_ok=True)
+    src_mans = (synthetic_manifests() if ns.self_test
+                else load_manifests(ns.evidence))
+    src_mans = narrow(src_mans, ns.col_div)
+    src_mans = budget_manifests(src_mans, ns.max_tensors)
+    for m in src_mans:
+        xm.write_rank_manifest(xm.RankManifest(
+            group=m.group, rank=m.rank, card=m.card, region_tag=m.region_tag,
+            boot_token=BOOT_TOKEN, tp_rank=m.tp_rank, pp_rank=m.pp_rank,
+            pieces=m.pieces), mdir)
+    print(f"  manifests={len(src_mans)} entry={ns.entry} "
+          f"address_book="
+          f"{'single-runner (CAN-FAIL ARM)' if ns.single_runner else 'both runners'}")
+
     procs = [mp.Process(target=rank_proc,
-                        args=(g, r, ns.evidence, root, q, ns.self_test, ns.max_tensors,
-                              ns.col_div))
+                        args=(g, r, ns.evidence, root, q, ns.self_test,
+                              ns.max_tensors, ns.col_div, ns.single_runner,
+                              mdir))
              for g in ("P", "D") for r in range(xr.N_CARDS)]
     for p in procs:
         p.start()
@@ -420,11 +545,12 @@ def main() -> int:
                   f"src_resolved={a}/{c} dst_resolved={b}/{c}")
         elif kind == "legs":
             print(f"  WEG2-XCHG-LEGS group={g} rank={r} legs={a}")
+        elif kind == "alloc":
+            print(f"  WEG2-XCHG-ALLOC group={g} rank={r} bytes={a} tensors={b}")
+        elif kind == "entry":
+            print(f"  WEG2-XCHG-ENTRY group={g} rank={r} entry={a}")
         elif kind == "slot":
             print(f"  WEG2-XCHG-HOST-SLOT group={g} rank={r} {a}")
-        elif kind == "budget":
-            print(f"    BUDGET group={g} rank={r} dropped={a} tensors "
-                  f"(over {FAKE_DEV_BUDGET} B), materialised={c} using {b} B")
         elif kind == "badnames":
             print(f"    first mismatches group={g} rank={r}: {a}")
         elif kind == "digest":

@@ -3171,7 +3171,14 @@ class SchedulerWeightUpdaterManager:
         # `sem_name` refuses a diagonal id by name (W15) because it has no
         # cross pair at all.  That is not a fallback -- it is the lane the
         # diagonal has always had.
-        if not hook or region is None or sems is None:
+        # `region` IS NO LONGER AN INPUT OF THE PHASED PATH and is not
+        # required here: the byte count moved to the bounce's OWN record
+        # (`BounceSlots`) precisely because sharing the region's slot records
+        # with `run_producer_pair` is what made weg2xsn24 read `carries 1080
+        # bytes`. The parameter stays for the existing caller and is unused;
+        # requiring it would make a leg fall back to the unsplit form for a
+        # dependency it does not have.
+        if not hook or sems is None:
             # The unsplit form, unchanged.  Kept for the hermetic callers and
             # the diagonal-only case; a CROSS leg that reached here without a
             # handshake is refused inside `run_bounce_leg` rather than run as
