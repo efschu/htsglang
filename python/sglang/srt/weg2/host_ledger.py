@@ -1826,12 +1826,35 @@ def run_origin_gib(
         # that knows WHICH entry won the max() -- is what lets `price` refuse
         # (W95) instead of adding the same bytes to the origin and to the
         # charges.
+        # PRE-#1350 RECORDS ARE COVERED TOO, and they had to be: the record
+        # that WINS this max() today (weg2xsn24 group P, 2026-09-12T19:44:31Z,
+        # stored 7.49 GiB) was written before the stamp existed, and the
+        # launch-moment reading 6.44 GiB loses to it -- so the floor binds NOW,
+        # exactly as ANALYSE_1350_HOST_TERM_0912.md SS2 predicted ("bindet in
+        # ein bis zwei Boots"). A guard that only saw the new field would have
+        # been armed for a hazard that had already arrived.
+        #
+        # `interleaved` is the fact that was always there: the front sets it
+        # True for every sample it takes (a flip's sleep, with the destination
+        # resuming), and the launcher sets it False for P's first sleep, which
+        # happens before any flip exists. It is therefore the SAME distinction
+        # `sampled_at_flip_epoch` records, available on every historical
+        # record. The new field still wins where present, because it names the
+        # epoch and not just the fact.
         _ep = entry.get("sampled_at_flip_epoch")
-        if _ep is not None and int(_ep) >= 1:
+        _mid_flip = (
+            int(_ep) >= 1 if _ep is not None else bool(entry.get("interleaved"))
+        )
+        if _mid_flip:
             floor_src += (
-                f" {RUN_ORIGIN_RATCHET_MARKER} sampled_at_flip_epoch={int(_ep)}: "
-                "this floor was measured DURING a flip and therefore already "
-                "contains the permanent step `flip_ratchet_gib` prices"
+                f" {RUN_ORIGIN_RATCHET_MARKER} "
+                + (
+                    f"sampled_at_flip_epoch={int(_ep)}" if _ep is not None
+                    else "interleaved=True (pre-#1350 record: no epoch stamp, "
+                    "but the front only samples during a flip)"
+                )
+                + ": this floor was measured DURING a flip and therefore "
+                "already contains the permanent step `flip_ratchet_gib` prices"
             )
     else:
         floor = dk7_run_residual_gib()
