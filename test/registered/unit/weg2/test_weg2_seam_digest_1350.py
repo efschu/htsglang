@@ -95,6 +95,7 @@ import importlib
 import inspect
 import os
 import re
+import textwrap
 
 import pytest
 import torch
@@ -210,7 +211,7 @@ def _code_identifiers(module):
     is the same reason #1273 B4f moved its wiring pins onto ``main()``'s AST
     after a text scan let a mutant through.
     """
-    tree = ast.parse(inspect.getsource(module))
+    tree = ast.parse(textwrap.dedent(inspect.getsource(module)))
     out = set()
     for node in ast.walk(tree):
         if isinstance(node, ast.Attribute):
@@ -232,8 +233,20 @@ def test_the_grader_reads_the_producer_and_builds_no_second_inventory():
         "the grader walks the live model itself: that is the second inventory "
         "the placement re-keying removed"
     )
-    assert "card_inventory" in used
+    # The grader's own identity comes from the published producers, never from
+    # a private re-implementation of them.
     assert "manifest_entry" in used and "tensor_class" in used
+
+    # AND THE INVENTORY COMES FROM THE PRODUCER AT THE HOOK, not here.  The
+    # module is pure -- it is HANDED (ParamGeom, tensor) pairs -- so asserting
+    # `card_inventory` against THIS file would be asserting against the wrong
+    # one; that mis-scoping is what the first run of this test caught in
+    # itself.  The obligation is real, it just belongs to the caller.
+    hook = _code_identifiers(_wu()._weg2_seam_inventory)
+    assert "card_inventory" in hook, (
+        "the seam hook does not read the shared producer"
+    )
+    assert "named_parameters" not in hook
 
 
 def test_card_inventory_is_the_one_producer_the_manifest_also_uses():
