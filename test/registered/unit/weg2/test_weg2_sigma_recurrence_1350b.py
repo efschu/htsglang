@@ -191,3 +191,44 @@ class TheFixedChainStopsRising1350b(CustomTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TheLegIsNamedOnEveryNeedLine1350g(CustomTestCase):
+    """#1350g: `set_leg` existed and NOTHING called it.
+
+    Measured on boot weg2xsn25: 90 of 90 `WEG2-RING NEED` lines read
+    `leg=unknown`, so the per-card sums cannot be split per sleep leg and the
+    ring-anchor measuring boot produces nothing. The #1350d emitter fields were
+    inert for want of one call.
+    """
+
+    def test_the_leg_bracket_calls_set_leg(self):
+        """The call site itself -- desk-written-never-executed."""
+        import inspect
+        from sglang.srt.managers.scheduler_components import weight_updater as wu
+        src = inspect.getsource(wu)
+        self.assertIn("RingNeedGuard(", src)
+        self.assertIn("weg2_ring_guard.set_leg(", src)
+        # ...and it is INSIDE the same bracket that builds the guard.
+        build = src.index("weg2_ring_guard = RingNeedGuard(")
+        call = src.index("weg2_ring_guard.set_leg(")
+        first_use = src.index("weg2_ring_guard.guard_tag(")
+        self.assertLess(build, call)
+        self.assertLess(call, first_use)   # named BEFORE the first NEED line
+
+    def test_a_named_leg_reaches_the_line_and_an_unnamed_one_says_unknown(self):
+        import logging
+        from sglang.srt.weg2 import ring_guard as rg
+        seen = []
+
+        class _L(logging.Logger):
+            def info(self, msg, *a):
+                seen.append(msg % a if a else msg)
+
+        g = rg.RingNeedGuard("card-x", group="P", rank=0, log=_L("t"))
+        self.assertEqual(g.leg, "unknown")
+        g.record("weights_0", 10, 99)
+        self.assertIn("leg=unknown", seen[-1])
+        self.assertEqual(g.set_leg(7, "P", "D"), "7/P->D")
+        g.record("weights_1", 10, 99)
+        self.assertIn("leg=7/P->D", seen[-1])
