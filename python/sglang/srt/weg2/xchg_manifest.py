@@ -811,3 +811,214 @@ def written_line(path: str, manifest: RankManifest) -> str:
         f"boot_token={manifest.boot_token or 'unset'} path={path} "
         f"-- this rank's loader decision, written down, not reconstructed"
     )
+
+
+# ---------------------------------------------------------------------------
+# THE PRODUCT ENTRY POINT -- one leg's plan, from the six manifests.
+# ---------------------------------------------------------------------------
+
+#: The provenance string a join-derived plan carries, so a reader can tell at a
+#: glance WHICH producer answered.  The derivation's own is
+#: ``weight_exchange_shadow.PLAN_SOURCE`` and names ``walk_live_tensors`` +
+#: ``build_plan`` over THIS rank's model; this one names the manifests.  Two
+#: producers for one leg would be the defect, so the line says which ran.
+JOIN_PLAN_SOURCE = (
+    "weg2/xchg_manifest.load_manifests+merge_region_tags+join_manifests"
+    "(six per-rank manifests, written by each rank's own loader),"
+    "weight_exchange.build_plan,weight_exchange_region.N_CARDS"
+)
+
+
+def refusal(reason: str, detail: str = "") -> str:
+    """The one shape a refused join prints, so the log carries one spelling."""
+    return f"join-{reason}" + (f": {detail}" if detail else "")
+
+
+def manifests_for_boot(
+    *,
+    pp_group: str = "P",
+    tp_group: str = "D",
+    dump_dir: str = "",
+    token: str = "",
+) -> Tuple[Optional[Tuple[RankManifest, ...]], str]:
+    """Every rank's manifest for THIS boot, or a NAMED refusal.
+
+    **NO FALLBACK, AND THE FILE NAME IS IN THE REFUSAL.**  A missing peer
+    manifest used to be answered by deriving the plan from this rank's own
+    model -- which is the on-card DIAGONAL
+    (``weight_exchange_shadow.py:3332-3334``, both groups ``tp_size=1``), the
+    shape that produced ``src_resolved=0/N`` on all 24 legs of weg2xsn20.  It
+    may never step in silently again, so this returns the EXPECTED PATH of
+    what it could not find and the caller refuses on it.
+    """
+    directory = dump_dir or manifest_dir()
+    if not directory:
+        return None, refusal("no-dump-dir",
+                             f"{DIR_ENV} is unset, so no rank published a "
+                             f"manifest and none can be read")
+    tok = token or boot_token()
+    found = load_manifests(directory, boot_token=tok)
+    have = {(m.group, m.rank) for m in found}
+    n_cards = n_cards_default()
+    # The EXPECTED PATH, with the region tag left as a glob: a rank publishes
+    # one file per RUNNER (main model and drafter), so the name carries a tag
+    # this reader cannot know in advance -- and printing a path that never
+    # exists would send an operator hunting for the wrong file.
+    missing = [
+        os.path.join(directory,
+                     f"{MANIFEST_PREFIX}_{g}_rank{r}_*.json")
+        for g in (pp_group, tp_group)
+        for r in range(n_cards)
+        if (g, r) not in have
+    ]
+    if missing:
+        return None, refusal(
+            "manifest-missing",
+            f"{len(missing)} of {2 * n_cards} rank manifests absent for "
+            f"boot_token={tok or 'unset'} (first expected path: "
+            f"{missing[0]}). Refusing: deriving this rank's own view "
+            f"instead is the on-card diagonal, which resolves no source and "
+            f"is what this slice replaces")
+    return found, ""
+
+
+def leg_plan_from_join(
+    *,
+    hook: str,
+    group: str,
+    rank: int,
+    manifests: Sequence[RankManifest],
+    src_addr=None,
+    dst_addr=None,
+    pp_group: str = "P",
+    tp_group: str = "D",
+    #: THIS RANK'S LIVE MODEL, for the materialisation check below.  Optional
+    #: only so the hermetic callers that have no model can drive the join.
+    model=None,
+    log=None,
+):
+    """ONE leg's :class:`~weight_exchange_shadow.LegPlan`, from the manifests.
+
+    THE DIRECTION IS DERIVED, NOT PASSED: ``weight_exchange.leg_direction``
+    already answers it from ``(hook, group)`` -- ``source`` exports, every
+    other hook imports -- so a second answer here could disagree with the one
+    the leg knob gates on.
+
+    THE PLAN IS NARROWED TO THIS RANK'S ROLE, and that is what makes
+    ``src_resolved`` readable per leg rather than per boot: a source-hook leg
+    carries the descriptors THIS rank must supply (``src_rank == rank``), a
+    destination-hook leg the ones it must receive (``dst_rank == rank``).  The
+    full cross-group plan is built first, because ``build_plan``'s tiling
+    check (``_check_tiles``) is a statement about EVERY destination rank and
+    would pass vacuously on a pre-filtered inventory.
+    """
+    from sglang.srt.weg2 import weight_exchange_shadow as sh
+    from sglang.srt.managers import weg2_memory_saver as ms
+
+    direction = wx.leg_direction(str(hook), str(group))
+    try:
+        join = join_manifests(manifests, pp_group=pp_group, tp_group=tp_group)
+    except (wx.Weg2XchgSourceMissing, wx.Weg2XchgPlanDisagree) as exc:
+        return None, refusal("unjoinable", f"{type(exc).__name__}: {exc}")
+
+    try:
+        plan = plan_from_join(join, direction=direction,
+                              src_addr=src_addr, dst_addr=dst_addr)
+    except (wx.Weg2XchgSourceMissing, wx.Weg2XchgPlanDisagree) as exc:
+        return None, refusal("plan-refused", f"{type(exc).__name__}: {exc}")
+
+    # THE MATERIALISATION CHECK, AT THE MOMENT IT IS NOT TAUTOLOGICAL.
+    #
+    # Re-reading the tensor at WRITE time would compare `ParamGeom.of`'s output
+    # against the tensor it was just read from -- true by construction and
+    # worth nothing.  Here it is a real question: the manifest was written at
+    # the END OF WEIGHT LOADING and this runs at the FLIP, after pauses,
+    # resumes and (once AMENDMENT 8 lands) a remap of the very pages it
+    # describes.  A manifest that has drifted from the hardware is worse than
+    # no manifest, because the join and every downstream reader trust it.
+    #
+    # Only THIS RANK'S OWN pieces, because they are the only ones whose tensor
+    # this process can look at -- which is the same boundary the whole slice
+    # rests on.
+    if model is not None:
+        mine_manifest = next(
+            (m for m in manifests
+             if m.group == str(group) and int(m.rank) == int(rank)), None)
+        if mine_manifest is not None:
+            try:
+                live = {str(n): t for n, t in model.named_parameters()}
+            except BaseException:  # noqa: BLE001 -- an observer never raises
+                live = {}
+            for piece in mine_manifest.pieces:
+                tensor = live.get(piece.param_name)
+                if tensor is None:
+                    continue
+                try:
+                    refuse_on_materialisation_drift(piece, tensor)
+                except wx.Weg2XchgPlanDisagree as exc:
+                    return None, refusal("materialisation-drift", str(exc))
+
+    is_source = str(hook) == sh.HOOK_SOURCE
+    side = "src_rank" if is_source else "dst_rank"
+    mine = tuple(d for d in plan.descs
+                 if int(getattr(d, side, -1)) == int(rank))
+    if not mine:
+        return None, refusal(
+            "no-descriptors-for-rank",
+            f"hook={hook} group={group} rank={rank} direction={direction}: the "
+            f"joined plan has {len(plan.descs)} descriptors and none with "
+            f"{side}={rank}. A leg that moves nothing would report a flip that "
+            f"moved no weights")
+
+    # The acceptance line and the pointer profile, at the frame that holds the
+    # XchgPlan -- the #1342 lesson: `WEG2-XCHG-PLAN` describes an XchgPlan and
+    # the LegPlan below has no `plan_id` at all.  Wrapped, because an
+    # instrument may never take a derivation down.
+    emit = log if log is not None else None
+    try:
+        wx.emit_plan_line(plan, direction=("d2h" if is_source else "h2d"))
+    except BaseException as exc:  # noqa: BLE001
+        import logging as _logging
+
+        _logging.getLogger(__name__).info(
+            "WEG2-XCHG-PLAN emit failed: %s: %s", type(exc).__name__, exc)
+    try:
+        profile = wx.pointer_profile(mine)
+        wx.record_pointer_profile(profile)
+        line = wx.pointer_profile_line(profile, hook=str(hook),
+                                       is_source=is_source)
+        if emit is not None:
+            emit(line)
+        else:
+            import logging as _logging
+
+            _logging.getLogger(__name__).info("%s", line)
+    except BaseException as exc:  # noqa: BLE001
+        import logging as _logging
+
+        _logging.getLogger(__name__).info(
+            "WEG2-XCHG-POINTER-PROFILE emit failed: %s: %s",
+            type(exc).__name__, exc)
+
+    tags = tuple(sorted({str(d.tag) for d in mine}))
+    classes = tuple(sorted({t.tensor_class for t in join.tensors}))
+    chunk_layers, chunk_count = ms.weight_chunk_geometry()
+    facts = sh.LegPlanFacts(
+        chunk_layers=int(chunk_layers), chunk_count=int(chunk_count),
+        family_tags=tuple(sorted({str(t.tag) for t in join.tensors})),
+        waves=tuple(tuple(w) for w in plan.waves),
+        cards=tuple(join.cards), classes=classes,
+        # THE PROVENANCE IS THE MANIFESTS', and it must NOT read as the
+        # derivation's: two producers for one leg is the defect, so the line a
+        # reader sees says which one answered.
+        source=JOIN_PLAN_SOURCE)
+    leg = sh.LegPlan(
+        facts=facts, descs=tuple(mine), card=int(rank), tags=tags,
+        # The card digest is over the JOIN's geometry for this rank, computed
+        # by the same function the derivation uses -- one hash, one owner.
+        card_digest=sh.card_geometry_digest(
+            [t.geom(tp_is_dst=(direction == wx.LEGS_PP_TO_TP))
+             for t in join.tensors], classes),
+        agreed_state=sh.MANIFEST_NOT_ASKED,
+        population=len(join.tensors), planned=len(join.tensors))
+    return leg, ""

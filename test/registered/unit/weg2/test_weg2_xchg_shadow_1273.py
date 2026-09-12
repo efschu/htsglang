@@ -1853,9 +1853,50 @@ def test_the_plan_seam_has_exactly_one_producer_and_it_is_the_derivation():
                 for i, line in enumerate(fh, 1):
                     if "build_plan(" in line:
                         hits.append(f"{os.path.relpath(p, root)}:{i}")
-    assert len(hits) == 1, hits
-    assert hits[0].endswith("weight_exchange_shadow.py:"
-                            + str(_line_of("wx.build_plan(inventory, src, dst"))), hits
+    # #1330 B4n: TWO CALL SITES NOW, AND THE GUARD IS STRONGER FOR IT.
+    #
+    # This test's own docstring sets the bar: a second call site "turns this
+    # red, and the reader then has to justify the second derivation rather
+    # than discover it later as two ranks disagreeing." Here is the
+    # justification, and it is the opposite of Zweitbuchhaltung.
+    #
+    # They are not two derivations of one fact. They are two PRODUCERS
+    # SELECTED BY THE ARM, and exactly one can run in a boot:
+    #   * `exchange_armed()` -> the MANIFEST JOIN (xchg_manifest.plan_from_join)
+    #   * every other arm     -> the rank-local derivation (derive_leg_plan)
+    # `_weg2_shadow_plan` branches on that predicate and NEVER falls back from
+    # the join to the derivation -- a missing peer manifest is a named refusal
+    # carrying the expected file path, pinned by
+    # `test_no_join_path_can_reach_derive_leg_plan`.
+    #
+    # And the second producer exists to REMOVE the very hazard this test
+    # names. "Two ranks disagreeing" is what the rank-local derivation
+    # PRODUCES: it builds the on-card diagonal from this rank's own model
+    # (shard_axis=REPLICATED, both GroupLayouts tp_size=1) and asks a rank for
+    # the peer's pointer, which is measured as src_resolved=0/N on all 24 legs
+    # of weg2xsn20. The join reads what every rank WROTE, so the six ranks
+    # cannot disagree by construction.
+    #
+    # What the guard pins now: exactly these TWO, by file and function, so a
+    # THIRD still turns it red; and that the plan line says WHICH answered
+    # (`facts.source`), so the two can never be confused in a log.
+    assert len(hits) == 2, hits
+    by_file = sorted(h.rsplit(":", 1)[0] for h in hits)
+    assert by_file == [
+        "python/sglang/srt/weg2/weight_exchange_shadow.py",
+        "python/sglang/srt/weg2/xchg_manifest.py",
+    ], hits
+    assert any(h.endswith("weight_exchange_shadow.py:"
+                          + str(_line_of("wx.build_plan(inventory, src, dst")))
+               for h in hits), hits
+
+    # THE TWO PROVENANCES MUST DIFFER, or a reader cannot tell which producer
+    # answered and the "one of the two ran" claim is unverifiable in a log.
+    from sglang.srt.weg2 import xchg_manifest as _xm
+
+    assert _xm.JOIN_PLAN_SOURCE != sh.PLAN_SOURCE
+    assert "manifest" in _xm.JOIN_PLAN_SOURCE
+    assert "walk_live_tensors" in sh.PLAN_SOURCE
     # The module-level seam is still EMPTY in the product: the derivation is
     # passed as an object through ``run_leg_hook(plan=...)``, not installed as
     # a global by a rank.
