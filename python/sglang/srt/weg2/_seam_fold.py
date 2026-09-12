@@ -117,7 +117,6 @@ class DeviceAccumulators:
         blocks -- one on every real rank, because a rank's weights live on one
         card.
         """
-        torch = _torch()
         if not self._per_device:
             return [(0, 0)] * self.n_pieces
         total = None
