@@ -91,13 +91,20 @@ def build_manifests():
                 d[r].append(piece(name, w, cols) if axis == "rows"
                             else piece(name, rows, w))
     out = []
+    # THE AXES OF THE REAL FORM: group P is `--tp-size 1 --pp-size 3` (pp_rank
+    # varies, tp_rank is 0 on all three) and group D is TP3. Boot weg2xsn22
+    # keyed the file name on tp_rank alone, so all of P wrote ONE file; this
+    # builder reproduced that shape and the overwrite ratchet caught it here
+    # before the tests did.
     for r, pieces in p.items():
         out.append(xm.RankManifest(group="P", rank=r, card=CARDS[r],
                                    region_tag=TAG, boot_token="smoke",
+                                   tp_rank=0, pp_rank=r,
                                    pieces=tuple(pieces)))
     for r, pieces in d.items():
         out.append(xm.RankManifest(group="D", rank=r, card=CARDS[r],
                                    region_tag=TAG, boot_token="smoke",
+                                   tp_rank=r, pp_rank=0,
                                    pieces=tuple(pieces)))
     return out
 

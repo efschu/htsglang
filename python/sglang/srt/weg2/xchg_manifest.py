@@ -76,26 +76,61 @@ MANIFEST_VERSION = 1
 JOIN_LINE_PREFIX = "WEG2-XCHG-MANIFEST"
 
 
-def manifest_filename(rank: int, group: str = "", region_tag: str = "") -> str:
-    """``phase_manifest_{GROUP}_rank{N}_{REGION_TAG}.json``.
+def group_rank(tp_rank: int, pp_rank: int, tp_size: int = 1) -> int:
+    """The rank's index WITHIN ITS GROUP, unique for any (tp, pp) form.
 
-    #1292's derivation PLUS the region tag, and the third component is not
-    decoration.  ``arm_coverage_at_load`` is called from
-    ``ModelRunner.load_model`` (``model_runner.py:2564``) with that runner's own
-    ``weights_tag`` (``:2461``), and a weg2 rank runs TWO runners in one
-    process: the main model and the drafter.  Boot weg2xsn20's D log proves it
-    -- three ``WEG2-XCHG-RESIDENT tag=weights_draft ... rank={0,1,2}`` lines
-    beside the ``weights_0`` ones.  Keyed on (group, rank) alone, the second
-    write would have CLOBBERED the first and the join would have planned over
-    whichever runner finished last, from a file that looked complete.
+    ``tp_size * pp_rank + tp_rank`` -- the tree's OWN formula, already used at
+    ``model_executor/model_runner.py:998`` to build a rank id from the two
+    axes. Imported as arithmetic rather than invented, because a second
+    spelling of "which rank am I" is how the two would drift.
 
-    AMENDMENT 6 is why that is a loss of real bytes and not a cosmetic one: the
-    draft tag is IN the weights family and is "planned, censused, waved, covered
-    and exchanged like every other layer tag".
+    BOOT weg2xsn22 MEASURED WHAT ITS ABSENCE COSTS. The manifest was keyed on
+    ``tp_rank`` alone (``model_runner.py:2566`` passes ``rank=self.tp_rank``).
+    Group P runs ``--tp-size 1 --pp-size 3``, so ALL THREE PP ranks have
+    ``tp_rank == 0``: four ``WEG2-XCHG-MANIFEST-WRITE rank=0 card=0`` lines
+    with pieces 515/505/893 landed on ONE file, the join read
+    ``join-manifest-missing: 2 of 6``, no plan was produced, and every leg read
+    ``ran=no why=no-plan`` -- ``hook=destination`` fired 0 times and
+    ``phase=collect`` was unreachable. Group D (``tp=3``) wrote its three files
+    correctly from the SAME code path, which is why the defect was invisible on
+    one half of the boot.
+
+    The docstring of :func:`manifest_filename` had closed the GROUP collision
+    (#1292: P overwriting D) and said nothing about the RANK collision inside
+    one group -- a check written against the last incident rather than against
+    the shape.
+    """
+    return int(tp_size) * int(pp_rank) + int(tp_rank)
+
+
+def manifest_filename(rank: int, group: str = "", region_tag: str = "",
+                      *, tp_rank: Optional[int] = None,
+                      pp_rank: Optional[int] = None) -> str:
+    """``phase_manifest_{GROUP}_rank{TP}x{PP}_{REGION_TAG}.json``.
+
+    THREE AXES, EACH FOR A MEASURED COLLISION:
+
+    * ``GROUP`` -- #1292: P and D are independently launched process groups
+      sharing one dump directory and P (booted second) silently overwrote D's.
+    * ``{TP}x{PP}`` -- boot weg2xsn22: keyed on ``tp_rank`` alone, group P's
+      three PP ranks all wrote ``rank0`` (see :func:`group_rank`). BOTH axes
+      are carried rather than "the one that happens to vary in this form", so a
+      future ``tp>1 pp>1`` group cannot collide either -- the fix is against
+      the SHAPE, not against this incident.
+    * ``REGION_TAG`` -- weg2xsn20: one rank runs two runners (main model and
+      drafter) through this same site with different tags.
+
+    ``rank`` stays the GROUP-UNIQUE index the join keys on; the two axes are
+    the provenance the name needs. Passing neither axis falls back to the
+    legacy single-number shape, which only the hermetic callers use.
     """
     grp = f"{group}_" if group else ""
     reg = f"_{region_tag}" if region_tag else ""
-    return f"{MANIFEST_PREFIX}_{grp}rank{rank}{reg}.json"
+    if tp_rank is None and pp_rank is None:
+        axes = str(int(rank))
+    else:
+        axes = f"{int(tp_rank or 0)}x{int(pp_rank or 0)}"
+    return f"{MANIFEST_PREFIX}_{grp}rank{axes}{reg}.json"
 
 
 @dataclass(frozen=True)
@@ -156,11 +191,17 @@ class RankManifest:
     """One rank's whole record, plus the provenance that makes it comparable."""
 
     group: str
+    #: THE GROUP-UNIQUE index -- `group_rank(tp_rank, pp_rank, tp_size)`, not
+    #: `tp_rank`. Boot weg2xsn22 lost every leg to that distinction.
     rank: int
     card: int
     region_tag: str
     boot_token: str
     pieces: Tuple[ManifestPiece, ...]
+    #: The two axes, carried so the FILE NAME cannot collide in any (tp, pp)
+    #: form and so a reader can see which rank of which axis wrote this.
+    tp_rank: int = 0
+    pp_rank: int = 0
 
     @property
     def by_name(self) -> Dict[str, ManifestPiece]:
@@ -174,6 +215,8 @@ class RankManifest:
             "card": int(self.card),
             "region_tag": self.region_tag,
             "boot_token": self.boot_token,
+            "tp_rank": int(self.tp_rank),
+            "pp_rank": int(self.pp_rank),
             "pieces": [p.as_json() for p in self.pieces],
         }
 
@@ -194,6 +237,8 @@ class RankManifest:
             card=int(raw["card"]),
             region_tag=str(raw.get("region_tag", "")),
             boot_token=str(raw.get("boot_token", "")),
+            tp_rank=int(raw.get("tp_rank", 0)),
+            pp_rank=int(raw.get("pp_rank", 0)),
             pieces=tuple(ManifestPiece.from_json(p) for p in raw.get("pieces", ())),
         )
 
@@ -237,7 +282,37 @@ def write_rank_manifest(manifest: RankManifest, dump_dir: str) -> str:
     """
     os.makedirs(dump_dir, exist_ok=True)
     path = os.path.join(dump_dir, manifest_filename(
-        manifest.rank, manifest.group, manifest.region_tag))
+        manifest.rank, manifest.group, manifest.region_tag,
+        tp_rank=manifest.tp_rank, pp_rank=manifest.pp_rank))
+    # THE RATCHET AGAINST weg2xsn22's OWN DEFECT, at the only place that can
+    # see it: a file of THIS boot already here, carrying a DIFFERENT inventory,
+    # means two writers resolved to one name. That is the collision, and it
+    # must be a refusal rather than a last-writer-wins overwrite -- which is
+    # exactly what produced four `rank=0` lines with pieces 515/505/893 on one
+    # file and then `join-manifest-missing: 2 of 6`.
+    #
+    # SAME token AND same piece set is a legitimate re-write (a rank that ran
+    # the site twice for one runner); it is allowed and silent.
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                prior = RankManifest.from_json(json.load(fh), path=path)
+        except BaseException:  # noqa: BLE001 -- an unreadable file is replaced
+            prior = None
+        if (prior is not None
+                and prior.boot_token == manifest.boot_token
+                and tuple(p.key for p in prior.pieces)
+                != tuple(p.key for p in manifest.pieces)):
+            raise wx.Weg2XchgPlanDisagree(
+                f"W68 Weg2XchgPlanDisagree: {path} already holds a manifest of "
+                f"this boot with a DIFFERENT inventory "
+                f"({len(prior.pieces)} pieces, tp_rank={prior.tp_rank} "
+                f"pp_rank={prior.pp_rank}) than the one being written "
+                f"({len(manifest.pieces)} pieces, tp_rank={manifest.tp_rank} "
+                f"pp_rank={manifest.pp_rank}). Two writers resolved to ONE "
+                f"file name, so one rank's placement would stand for another's "
+                f"-- boot weg2xsn22 lost every leg to exactly this. Refusing "
+                f"instead of overwriting.")
     tmp = f"{path}.tmp{os.getpid()}"
     with open(tmp, "w", encoding="utf-8") as fh:
         json.dump(manifest.as_json(), fh, sort_keys=True)
@@ -866,7 +941,7 @@ def manifests_for_boot(
     # exists would send an operator hunting for the wrong file.
     missing = [
         os.path.join(directory,
-                     f"{MANIFEST_PREFIX}_{g}_rank{r}_*.json")
+                     f"{MANIFEST_PREFIX}_{g}_rank*_*.json (group rank {r})")
         for g in (pp_group, tp_group)
         for r in range(n_cards)
         if (g, r) not in have
