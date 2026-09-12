@@ -359,6 +359,42 @@ class NoDoubleCount1350(CustomTestCase):
             arm.predicted_run_peak_gib()
         self.assertIn("W95", str(cm.exception))
 
+    def test_a_pre_1350_record_is_covered_by_its_interleaved_flag(self):
+        """The record that WINS the max() today has no epoch stamp.
+
+        weg2xsn24 group P, 2026-09-12T19:44:31Z, stored 7.49 GiB, written
+        before this field existed -- and the launch reading 6.44 GiB loses to
+        it, so the floor binds NOW. `interleaved` is the same distinction and
+        was always on the record: the front sets it True for every sample it
+        takes (all of them during a flip), the launcher False for P's first
+        sleep before any flip exists.
+        """
+        floor_rec = {"P": {
+            "group": "P", "at": "2026-09-12T19:44:31Z", "boot_tag": "weg2xsn24",
+            "commit": "bfb5e121e7", "rss_shmem_gib": 49.56,
+            "run_residual_gib": 7.49, "interleaved": True,
+            "arm": {"s_gb": 1, "m_mib": 150},
+        }}
+        origin, src = hl.run_origin_gib(6.44, floor_rec)
+        self.assertAlmostEqual(origin, 7.49, places=6)
+        self.assertIn(hl.RUN_ORIGIN_RATCHET_MARKER, src)
+        self.assertIn("pre-#1350 record", src)
+        arm = _priced(_ratchet(4.049))
+        arm.terms["run_origin_gib"] = origin
+        arm.terms["run_origin_source"] = src
+        with self.assertRaises(hl.Weg2HostRatchetDoubleCharged):
+            arm.predicted_run_peak_gib()
+
+    def test_the_launchers_own_uninterleaved_sample_is_not_marked(self):
+        """P's first sleep happens before any flip: interleaved=False."""
+        floor_rec = {"P": {
+            "group": "P", "at": "t", "boot_tag": "b", "commit": "c",
+            "rss_shmem_gib": 38.6, "run_residual_gib": 9.9,
+            "interleaved": False, "arm": {"s_gb": 1, "m_mib": 600},
+        }}
+        _origin, src = hl.run_origin_gib(6.44, floor_rec)
+        self.assertNotIn(hl.RUN_ORIGIN_RATCHET_MARKER, src)
+
     def test_a_floor_sampled_outside_a_flip_prices_normally(self):
         """The guard must not fire on the launcher's own P sample (no flip yet)."""
         floor_rec = {"P": {
