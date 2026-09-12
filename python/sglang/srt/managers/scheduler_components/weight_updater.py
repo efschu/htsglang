@@ -2253,6 +2253,45 @@ class SchedulerWeightUpdaterManager:
                         wx.RunnerShape.of(runner))
                 except BaseException:  # noqa: BLE001 -- an unclassified shape
                     region_tag = ""
+            # #1330 B4n: THE JOIN IS THE PRODUCER WHENEVER THE EXCHANGE IS
+            # ARMED, and there is NO fallback from it to the derivation.
+            #
+            # The derivation builds the on-card DIAGONAL -- inventory
+            # `shard_axis=REPLICATED` (weight_exchange_shadow.py:3237), BOTH
+            # GroupLayouts `tp_size=1` (:3332-3334) -- and asks a rank for the
+            # PEER's pointer, which no process can answer. That is the measured
+            # source of `src_resolved=0/N` on all 24 legs of weg2xsn20. It may
+            # never step in silently again, so a missing peer manifest is a
+            # NAMED refusal carrying the expected FILE PATH, not a quiet
+            # re-derivation. `test_no_join_path_can_reach_derive_leg_plan`
+            # pins that there is no route from the armed arm to the diagonal.
+            #
+            # THE GATE IS THE ARM, not the presence of files: on `ring` and on
+            # the pure `shadow` arm `arm_coverage_at_load` writes no manifests
+            # at all (it returns early on `not exchange_armed()`), so those arms
+            # keep the derivation and the plan line SAYS which producer
+            # answered (`facts.source`). Choosing the producer by whether files
+            # happen to exist would be exactly the silent fallback this
+            # refusal exists to remove.
+            if wx.exchange_armed():
+                from sglang.srt.weg2 import xchg_manifest as xm
+
+                mans, why = xm.manifests_for_boot(
+                    pp_group="P", tp_group="D")
+                if mans is None:
+                    return None, why
+                return xm.leg_plan_from_join(
+                    hook=str(hook), group=str(group), rank=int(rank),
+                    manifests=mans,
+                    src_addr=self._weg2_join_src_addr(
+                        str(hook), str(group), int(rank), model),
+                    dst_addr=self._weg2_join_dst_addr(
+                        str(hook), str(group), int(rank), model),
+                    # The materialisation check runs against THIS rank's own
+                    # live tensors, at the flip -- where the manifest could
+                    # have drifted since it was written at the end of loading.
+                    model=model,
+                    log=logger.info)
             plan, reason = sh.derive_leg_plan(
                 hook=str(hook), group=str(group),
                 peer=("D" if group == "P" else "P"), rank=int(rank),
@@ -2283,6 +2322,67 @@ class SchedulerWeightUpdaterManager:
             # #1328, same reason as the manifest arm one method up: a swallowed
             # exception that reports only its type cannot be acted on.
             return None, f"derivation-failed:{_weg2_exc_note(exc)}"
+
+    def _weg2_join_src_addr(self, hook: str, group: str, rank: int, model):
+        """#1330 B4n. The SOURCE address book for a join-backed leg.
+
+        OWN DEVICE ADDRESS ONLY, and never the ring.  On the SOURCE hook this
+        rank holds the bytes it must supply, so ``data_ptr()`` of its own live
+        tensor is the honest answer and the deposit reads from there.  On every
+        other hook the source is the peer's memory or the bounce slot, neither
+        of which this method may invent: it answers ``None`` and the phase that
+        owns the slot fills it in.
+
+        Reading the source out of the ring would be the ring restore through
+        another door and would defeat the goal the exchange exists for (zero
+        layer bytes resident in host RAM), so the ring appears nowhere here.
+        """
+        if str(hook) != "source" or model is None:
+            return None
+        table = {}
+        try:
+            for name, param in model.named_parameters():
+                table[str(name)] = param
+        except BaseException:  # noqa: BLE001 -- an observer never raises
+            return None
+
+        def src_addr(name: str, r: int):
+            if int(r) != int(rank):
+                return None
+            tensor = table.get(str(name))
+            return None if tensor is None else int(tensor.data_ptr())
+
+        return src_addr
+
+    def _weg2_join_dst_addr(self, hook: str, group: str, rank: int, model):
+        """#1330 B4n. The DESTINATION address book for a join-backed leg.
+
+        The mirror of the source book: on an IMPORTING hook (destination or
+        authoritative) this rank owns the pages the bytes must land in, so its
+        own ``data_ptr()`` is the answer; on the SOURCE hook the destination is
+        the bounce slot and this returns ``None``.
+
+        THE COLLECT'S TARGET IS A PLAN PARAMETER, NOT A REFILL DERIVATION, and
+        that is deliberate for the remap slice (AMENDMENT 8): when the remap
+        replaces WHERE the destination pages come from, only this book changes
+        -- the deposit and the collect stay the same two primitives.
+        """
+        if str(hook) == "source" or model is None:
+            return None
+        table = {}
+        try:
+            for name, param in model.named_parameters():
+                table[str(name)] = param
+        except BaseException:  # noqa: BLE001
+            return None
+
+        def dst_addr(name: str, r: int):
+            if int(r) != int(rank):
+                return None
+            tensor = table.get(str(name))
+            return None if tensor is None else int(tensor.data_ptr())
+
+        return dst_addr
 
     def _weg2_shadow_hook(self, hook: str, *, recv_req, reserve_bytes: int = 0,
                           ring_ms=None) -> None:

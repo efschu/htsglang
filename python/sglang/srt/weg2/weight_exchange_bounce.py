@@ -743,19 +743,86 @@ def _compare_band(ops: tp.DeviceOps, stream: int, descs: Sequence[object],
                     f"+{piece.dst_off}")
 
 
-def _missing_pointer(descs: Sequence[object]) -> Optional[str]:
-    """W74's case: a destination whose slice no source covers.
+#: #1330 B4n. THE THREE PHASES OF A BOUNCE LEG.
+#:
+#: THE ROOT OF weg2xsn20's 24/24 ``verdict=NO-COMPARE``, and it was never a
+#: missing pointer: this function's caller ran DEPOSIT and (COMPARE|COLLECT)
+#: over ONE descriptor list in ONE process in ONE pass (the loop below,
+#: :func:`run_bounce_leg`), so it needed ``src_ptr`` AND ``dst_ptr`` as DEVICE
+#: addresses simultaneously.  At the destination hook ``src_ptr`` is by
+#: construction the PEER's address (``weight_exchange_shadow.py:3336-3344``
+#: picks the side from the hook at ``:3329-3331``), which no process can read.
+#: Hence ``src_resolved=0/N dst_resolved=N/N`` on every leg, never the mirror.
+#:
+#: Split into phases, each side needs only the pointer IT owns:
+#: the depositing rank reads from its own weights, the collecting rank writes
+#: into its own pages, and the host slot is the medium between them.
+PHASE_DEPOSIT = "deposit"
+PHASE_COLLECT = "collect"
+PHASE_BOTH = "both"
+PHASE_CHOICES = (PHASE_DEPOSIT, PHASE_COLLECT, PHASE_BOTH)
 
-    Assembly does not CREATE a source, it only stages one, so a descriptor
-    with no ``src_ptr`` on the depositing side (or no ``dst_ptr`` on the
-    collecting side) is a hole in the plan and must be named, never zeroed.
+
+def _missing_pointer(descs: Sequence[object],
+                     phase: str = PHASE_BOTH) -> Optional[str]:
+    """W74's case, PER PHASE: the pointer the phase actually needs.
+
+    Assembly does not CREATE a source, it only stages one, so a descriptor with
+    no pointer on the side the phase reads is a hole in the plan and must be
+    named, never zeroed.  Which side that is depends on the phase, and treating
+    ``both`` as the universal answer is precisely what turned an unreachable
+    PEER address into 24 refusals:
+
+    * ``deposit`` reads ``src_ptr`` (this rank's own weights) and writes the
+      slot -- it needs NO destination address at all;
+    * ``collect`` reads the slot and writes ``dst_ptr`` (this rank's own pages)
+      -- it needs NO source address;
+    * ``both`` is the single-process form and needs both, unchanged.
     """
+    need_src = str(phase) in (PHASE_DEPOSIT, PHASE_BOTH)
+    need_dst = str(phase) in (PHASE_COLLECT, PHASE_BOTH)
     for d in descs:
-        if getattr(d, "src_ptr", None) is None:
+        if need_src and getattr(d, "src_ptr", None) is None:
             return f"{getattr(d, 'param_name', '?')} has no source pointer"
-        if getattr(d, "dst_ptr", None) is None:
+        if need_dst and getattr(d, "dst_ptr", None) is None:
             return f"{getattr(d, 'param_name', '?')} has no destination pointer"
     return None
+
+
+class Weg2XchgBouncePhaseUnordered(RuntimeError):
+    """W68's class: a collect that would read a slot no deposit has filled.
+
+    THE DANGER DIRECTION OF THE PHASE SPLIT, named rather than discovered.
+    Reading a slot before its producer posted ``full`` returns whatever the
+    previous band left there -- the destination would then be served plausible
+    bytes from the WRONG layer, with every counter green.  That is silent
+    corruption, and it is strictly worse than any refusal, so the collect
+    verifies the handshake BEFORE its first copy and refuses by name.
+
+    Same reasoning as ``run_consumer_pair``'s short-piece check
+    (``weight_exchange_transport.py:1754``: *"raises W70 and issues
+    NOTHING"*) -- this is that rule applied to the bounce's own slots.
+    """
+
+
+def _require_rendezvous(phase: str, rendezvous) -> None:
+    """A phased leg without a handshake is refused, never run optimistically.
+
+    ``both`` is the single-process form and needs none.  ``deposit`` and
+    ``collect`` run in DIFFERENT processes over a shared host slot, so a leg
+    that skipped the handshake would be exactly the unordered read above.
+    """
+    if str(phase) == PHASE_BOTH:
+        return
+    if rendezvous is None:
+        raise Weg2XchgBouncePhaseUnordered(
+            f"W68 Weg2XchgBouncePhaseUnordered: phase={phase} needs a slot "
+            f"handshake and none was given. The depositing and collecting "
+            f"ranks are different processes sharing a host slot; running "
+            f"either without the empty/full protocol would let a collect read "
+            f"a band no deposit has written, which is silent corruption and "
+            f"not a refusal."
+        )
 
 
 def run_bounce_leg(
@@ -774,6 +841,17 @@ def run_bounce_leg(
     mode: str = wx.INJECT_SHADOW,
     shm_root: str = xr.SHM_ROOT,
     device: int = 0,
+    #: #1330 B4n.  WHICH HALF OF THE BOUNCE THIS RANK RUNS.  ``both`` is the
+    #: single-process form and is byte-identical to the behaviour before the
+    #: split; ``deposit``/``collect`` are the two ranks of a cross-group leg.
+    phase: str = PHASE_BOTH,
+    #: The slot handshake, INJECTED rather than constructed here.  The product
+    #: passes an adapter over the region's CROSS semaphores (which already
+    #: exist -- weg2xsn20's teardown census counted 24 of them beside the 12
+    #: diagonal); a test passes a double it can drive OUT OF ORDER, which is
+    #: the only way to prove the refusal can fire.  ``None`` is legal only for
+    #: ``both``.
+    rendezvous=None,
     log=None,
 ) -> BounceResult:
     """Assemble every unit in the bounded buffer; every card takes its rows.
@@ -820,7 +898,14 @@ def run_bounce_leg(
             "own, because the sizing expression has one owner (xchg_bounce)"
         )
     descs = list(descs)
-    hole = _missing_pointer(descs)
+    phase = str(phase)
+    if phase not in PHASE_CHOICES:
+        raise ValueError(
+            f"unknown bounce phase {phase!r}; one of {PHASE_CHOICES}. Refused "
+            f"rather than defaulted: a default here would decide whether this "
+            f"rank writes into the live weights or merely stages bytes")
+    _require_rendezvous(phase, rendezvous)
+    hole = _missing_pointer(descs, phase)
     if hole is not None:
         # #1345 (a''): THE CENSUS RIDES THE REFUSAL, not just the first
         # offender.  `hole` names one parameter and one side -- that is (a') and
@@ -833,7 +918,7 @@ def run_bounce_leg(
             f"W74 Weg2XchgSourceMissing bounce: {hole} -- assembly stages a "
             f"source, it does not create one, so this slice would be served "
             f"with undefined bytes. Refusing before the buffer is mapped. "
-            f"PROFILE mode={mode} "
+            f"PROFILE mode={mode} phase={phase} "
             f"src_resolved={_prof.src_resolved}/{_prof.descs_total} "
             f"dst_resolved={_prof.dst_resolved}/{_prof.descs_total} "
             f"pieces={_prof.pieces_total} -- an unresolved side means the leg "
@@ -899,28 +984,76 @@ def run_bounce_leg(
                     collect_ms += (time.perf_counter() - t0) * 1000.0
                     inflight[slot] = None
                 base = bounce.slot_address(slot)
-                t0 = time.perf_counter()
-                moved = _deposit_band(ops, d_stream, unit.descs, batch, base)
-                # The deposit MUST land before the collect reads the slot; this
-                # is the one synchronisation the pipeline cannot elide, and it
-                # is why the two halves are on two streams rather than one.
-                ops.synchronize(d_stream)
-                deposit_ms += (time.perf_counter() - t0) * 1000.0
-                if moved != int(batch.total_bytes):
-                    short.append(
-                        f"band seq={batch.seq} deposited {moved} of "
-                        f"{batch.total_bytes}")
-                deposited += moved
-                if comparing:
-                    # THE REFILL STAYS THE AUTHORITY.  Nothing is written to
-                    # the live weights on this path -- the staged bytes are
-                    # graded against what the refill already put there.
-                    _compare_band(ops, c_stream, unit.descs, batch, base,
-                                  bounce.slot_address(int(depth)), verdict)
-                else:
-                    collected += _collect_band(ops, c_stream, unit.descs,
-                                               batch, base)
-                    inflight[slot] = batch
+                # ---- THE DEPOSIT HALF ------------------------------------
+                #
+                # Skipped entirely on a COLLECT leg: that rank does not hold
+                # the source bytes (they are the peer's) and its descriptors
+                # carry no `src_ptr` at all -- which is exactly why the
+                # unsplit form refused it.
+                if phase in (PHASE_DEPOSIT, PHASE_BOTH):
+                    t0 = time.perf_counter()
+                    moved = _deposit_band(ops, d_stream, unit.descs, batch,
+                                          base)
+                    # The deposit MUST land before the collect reads the slot;
+                    # this is the one synchronisation the pipeline cannot
+                    # elide, and it is why the two halves are on two streams
+                    # rather than one.  Across PROCESSES the same order is the
+                    # handshake below: fill, sync, THEN post `full` -- the
+                    # order `run_producer_pair` already states as its law.
+                    ops.synchronize(d_stream)
+                    deposit_ms += (time.perf_counter() - t0) * 1000.0
+                    if moved != int(batch.total_bytes):
+                        short.append(
+                            f"band seq={batch.seq} deposited {moved} of "
+                            f"{batch.total_bytes}")
+                    deposited += moved
+                    if rendezvous is not None:
+                        # AFTER the sync, never before: `bytes_filled` is a
+                        # post-sync claim or it is a lie the consumer acts on.
+                        rendezvous.post_full(slot=slot, seq=int(batch.seq),
+                                             nbytes=int(moved))
+                # ---- THE COLLECT / COMPARE HALF --------------------------
+                if phase in (PHASE_COLLECT, PHASE_BOTH):
+                    if rendezvous is not None and phase == PHASE_COLLECT:
+                        # BEFORE THE FIRST COPY, and it RAISES.  A collect that
+                        # read an unposted slot would serve plausible bytes
+                        # from the previous band -- the wrong layer, with every
+                        # counter green.  Same rule as `run_consumer_pair`'s
+                        # short-piece check, which "raises W70 and issues
+                        # NOTHING".
+                        filled = rendezvous.wait_full(slot=slot,
+                                                      seq=int(batch.seq))
+                        if filled is None:
+                            raise Weg2XchgBouncePhaseUnordered(
+                                f"W68 Weg2XchgBouncePhaseUnordered: slot="
+                                f"{slot} seq={batch.seq} was not posted full "
+                                f"by any depositing rank, so this collect "
+                                f"would read whatever the previous band left "
+                                f"there. Issuing NOTHING.")
+                        if int(filled) != int(batch.total_bytes):
+                            raise Weg2XchgBouncePhaseUnordered(
+                                f"W68 Weg2XchgBouncePhaseUnordered: slot="
+                                f"{slot} seq={batch.seq} carries "
+                                f"{int(filled)} bytes and this rank's own "
+                                f"derivation of the same band is "
+                                f"{int(batch.total_bytes)}. The two ends "
+                                f"disagree about what is in the slot; "
+                                f"issuing NOTHING rather than copying the "
+                                f"overlap.")
+                    if comparing:
+                        # THE REFILL STAYS THE AUTHORITY.  Nothing is written
+                        # to the live weights on this path -- the staged bytes
+                        # are graded against what the refill already put there.
+                        _compare_band(ops, c_stream, unit.descs, batch, base,
+                                      bounce.slot_address(int(depth)), verdict)
+                    else:
+                        collected += _collect_band(ops, c_stream, unit.descs,
+                                                   batch, base)
+                        inflight[slot] = batch
+                    if rendezvous is not None and phase == PHASE_COLLECT:
+                        ops.synchronize(c_stream)
+                        inflight[slot] = None
+                        rendezvous.post_empty(slot=slot, seq=int(batch.seq))
                 bands += 1
         t0 = time.perf_counter()
         ops.synchronize(c_stream)

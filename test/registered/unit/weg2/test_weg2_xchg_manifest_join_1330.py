@@ -307,17 +307,31 @@ def test_the_write_site_reads_no_tensor_and_re_walks_nothing():
     import ast
     import inspect
 
+    # SCOPED TO THE WRITE PATH, and the narrowing is a correction of THIS
+    # test rather than a loosening of the rule.  The first version asserted it
+    # over the whole module and then fired on the MATERIALISATION CHECK, which
+    # reads a tensor ON PURPOSE -- at LEG time, comparing the manifest written
+    # at the end of loading against the hardware now, which is the one moment
+    # the comparison is not tautological.  The rule was always about the WRITE
+    # path: what is recorded must be the loader's decision, not a second walk
+    # of the same tensors.  Asserting it module-wide would have forced the
+    # drift check out of the file, i.e. a true rule applied at the wrong scope
+    # deleting a real guard.
+    for fn in (xm.pieces_from_inventory, xm.write_this_rank,
+               xm.write_rank_manifest, xm.manifest_filename):
+        tree = ast.parse(inspect.getsource(fn))
+        called = {
+            node.func.attr
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+        }
+        for forbidden in ("data_ptr", "named_parameters", "named_buffers",
+                          "element_size", "cuda"):
+            assert forbidden not in called, (
+                f"{fn.__name__} CALLS {forbidden}(): the write path records "
+                f"the loader's decision and never re-walks the tensors")
+
     tree = ast.parse(inspect.getsource(xm))
-    called = {
-        node.func.attr
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
-    }
-    for forbidden in ("data_ptr", "named_parameters", "named_buffers",
-                      "element_size", "cuda"):
-        assert forbidden not in called, (
-            f"xchg_manifest CALLS {forbidden}(): a manifest that re-reads a "
-            f"tensor is the reconstruction it replaces")
     imported = {
         alias.name.split(".")[0]
         for node in ast.walk(tree) if isinstance(node, ast.Import)
@@ -776,3 +790,84 @@ def test_the_join_still_works_when_every_rank_has_two_runner_files():
     assert draft.shard_axis == wx.ROWS
     assert draft.tp_widths == _split(64, D_RANKS)
     assert join.unsourced == ()
+
+
+# ---------------------------------------------------------------------------
+# (7) THE RATCHET: the diagonal may never step in silently again
+# ---------------------------------------------------------------------------
+
+
+def test_no_join_path_can_reach_derive_leg_plan():
+    """THE NO-FALLBACK RATCHET (operator order 2026-09-12).
+
+    ``_weg2_shadow_plan`` branches on ``exchange_armed()``: armed -> the
+    manifest join, every other arm -> the rank-local derivation.  What must be
+    impossible is a route from the ARMED branch BACK to the derivation, because
+    that derivation builds the on-card diagonal (``shard_axis=REPLICATED``,
+    both GroupLayouts ``tp_size=1``) and asks a rank for the peer's pointer --
+    measured as ``src_resolved=0/N`` on all 24 legs of weg2xsn20.
+
+    Read over the AST rather than the text: the method's own comments NAME
+    ``derive_leg_plan`` in order to explain why it must not be reached, and a
+    grep cannot tell the explanation from the defect (third instance of that
+    trap in this slice).
+    """
+    import ast
+    import inspect
+    import textwrap
+
+    from sglang.srt.managers.scheduler_components import weight_updater as wu
+
+    src = textwrap.dedent(inspect.getsource(
+        wu.SchedulerWeightUpdaterManager._weg2_shadow_plan))
+    tree = ast.parse(src)
+
+    # Find the `if <...exchange_armed()...>:` branch and prove that no call to
+    # derive_leg_plan lives inside it, and that it always leaves the method.
+    armed_branches = [
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.If)
+        and "exchange_armed" in ast.dump(node.test)
+    ]
+    assert len(armed_branches) == 1, (
+        "expected exactly one exchange_armed() branch in the product provider")
+    branch = armed_branches[0]
+    called = {
+        n.func.attr for n in ast.walk(branch)
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+    }
+    assert "derive_leg_plan" not in called, (
+        "the armed branch can reach the rank-local derivation -- that is the "
+        "silent fallback to the diagonal this ratchet exists to forbid")
+    assert "leg_plan_from_join" in called and "manifests_for_boot" in called
+
+    # Every exit of the armed branch is a return: nothing may fall through it
+    # into the derivation below.
+    tails = [n for n in branch.body if isinstance(n, (ast.Return, ast.If))]
+    assert tails, "the armed branch must return, never fall through"
+    assert isinstance(branch.body[-1], ast.Return), (
+        "the armed branch's last statement must be a return; falling through "
+        "would reach derive_leg_plan with the arm armed")
+    assert not branch.orelse, (
+        "an else here would make the two producers look like alternatives; "
+        "the derivation is the UNARMED path and sits after the branch")
+
+
+def test_a_missing_peer_manifest_names_the_expected_file(tmp_path, monkeypatch):
+    """The refusal must be actionable: the PATH, not merely the condition."""
+    monkeypatch.setenv(xm.DIR_ENV, str(tmp_path))
+    monkeypatch.setenv("SGLANG_WEG2_XCHG_BOOT", "tok")
+    for man in _manifests():
+        if man.group == "P" and man.rank == 2:
+            continue
+        xm.write_rank_manifest(
+            xm.RankManifest(group=man.group, rank=man.rank, card=man.card,
+                            region_tag=man.region_tag, boot_token="tok",
+                            pieces=man.pieces), str(tmp_path))
+    mans, why = xm.manifests_for_boot()
+    assert mans is None
+    assert "manifest-missing" in why
+    assert "phase_manifest_P_rank2_" in why and ".json" in why
+    assert "diagonal" in why, (
+        "the refusal must say WHY there is no fallback, or the next reader "
+        "adds one back")
