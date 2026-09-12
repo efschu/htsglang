@@ -248,7 +248,12 @@ def test_the_manifest_keys_on_the_published_identity_not_a_private_tuple():
 def test_a_manifest_round_trips_through_the_shared_dump_directory(tmp_path):
     man = _manifests()[0]
     path = xm.write_rank_manifest(man, str(tmp_path))
-    assert os.path.basename(path) == xm.manifest_filename(man.rank, man.group)
+    assert os.path.basename(path) == xm.manifest_filename(
+        man.rank, man.group, man.region_tag)
+    assert man.region_tag in os.path.basename(path), (
+        "the region tag must be IN the name: one rank runs two runners (main "
+        "model and drafter) through the same write site, and without it the "
+        "second clobbers the first")
     assert not [f for f in os.listdir(tmp_path) if f.endswith(".tmp")], (
         "the write must be atomic: a half-written file makes the join refuse "
         "a tensor that IS placed, which is the false-red direction")
@@ -691,3 +696,83 @@ def test_the_module_never_reads_the_source_bytes_out_of_the_ring():
         assert forbidden not in module, (
             f"{forbidden!r} in xchg_manifest: the ring is the counter-proof, "
             f"never the source of the exchange")
+
+
+# ---------------------------------------------------------------------------
+# (6) TWO RUNNERS PER RANK -- the main model AND the drafter (AMENDMENT 6)
+# ---------------------------------------------------------------------------
+
+
+def _draft_manifest(group, rank):
+    """What the DRAFT runner publishes from the same rank, same process."""
+    return xm.RankManifest(
+        group=group, rank=rank, card=CARDS[rank], region_tag="weights_draft",
+        boot_token="b1",
+        pieces=(_piece("model.layers.0.mtp.fc.weight", 64, 32,
+                       tag="weights_draft"),))
+
+
+def test_the_draft_runners_manifest_does_not_clobber_the_main_models():
+    """PROVEN ON METAL BEFORE IT COULD BITE (boot weg2xsn20, D log).
+
+    ``arm_coverage_at_load`` is called from ``ModelRunner.load_model``
+    (``model_runner.py:2564``) with that runner's own ``weights_tag``
+    (``:2461``), and a weg2 rank runs TWO runners in ONE process.  XSN20's D
+    log carries three ``WEG2-XCHG-RESIDENT tag=weights_draft ... rank={0,1,2}``
+    lines beside the ``weights_0`` ones, so the site fires twice per rank.
+
+    Keyed on (group, rank) alone, the second write CLOBBERS the first and the
+    join plans over whichever runner finished last -- from a file that looks
+    complete.  AMENDMENT 6 makes that a loss of real exchanged bytes: the draft
+    tag is IN the weights family.
+    """
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp:
+        main = _manifests()[3]                      # D rank 0, weights_0
+        draft = _draft_manifest("D", 0)
+        a = xm.write_rank_manifest(main, tmp)
+        b = xm.write_rank_manifest(draft, tmp)
+        assert a != b, "the two runners of one rank must not share a file name"
+        assert len(os.listdir(tmp)) == 2
+        back = xm.load_manifests(tmp, boot_token="b1")
+        assert len(back) == 2
+        merged = xm.merge_region_tags(back)
+        assert len(merged) == 1, "the join's unit is the RANK, not the runner"
+        names = {p.param_name for p in merged[0].pieces}
+        assert "model.layers.0.mtp.fc.weight" in names, "the draft bytes were lost"
+        assert len(names) == len(main.pieces) + 1
+        assert merged[0].region_tag == "weights_0+weights_draft"
+
+
+def test_two_runners_disagreeing_about_one_tensor_refuse():
+    """Picking either would be the rank-local derivation the manifest removes."""
+    a = xm.RankManifest(group="D", rank=0, card=0, region_tag="weights_0",
+                        boot_token="b1",
+                        pieces=(_piece("shared.weight", 8, 4),))
+    b = xm.RankManifest(group="D", rank=0, card=0, region_tag="weights_draft",
+                        boot_token="b1",
+                        pieces=(_piece("shared.weight", 9, 4),))
+    with pytest.raises(wx.Weg2XchgPlanDisagree) as exc:
+        xm.merge_region_tags([a, b])
+    assert "W68" in str(exc.value) and "shared.weight" in str(exc.value)
+
+
+def test_the_join_still_works_when_every_rank_has_two_runner_files():
+    """End to end: six main files + six draft files -> one join, no refusal."""
+    mans = list(_manifests())
+    for group in ("P", "D"):
+        for rank in range(3):
+            mans.append(xm.RankManifest(
+                group=group, rank=rank, card=CARDS[rank],
+                region_tag="weights_draft", boot_token="b1",
+                pieces=(_piece("model.layers.0.mtp.fc.weight",
+                               *( (64, 32) if group == "P"
+                                  else (_split(64, D_RANKS)[rank], 32) ),
+                               tag="weights_draft"),)))
+    join = xm.join_manifests(mans, pp_group="P", tp_group="D")
+    assert "model.layers.0.mtp.fc.weight" in join.by_name
+    draft = join.by_name["model.layers.0.mtp.fc.weight"]
+    assert draft.shard_axis == wx.ROWS
+    assert draft.tp_widths == _split(64, D_RANKS)
+    assert join.unsourced == ()

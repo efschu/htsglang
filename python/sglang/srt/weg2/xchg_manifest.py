@@ -76,10 +76,26 @@ MANIFEST_VERSION = 1
 JOIN_LINE_PREFIX = "WEG2-XCHG-MANIFEST"
 
 
-def manifest_filename(rank: int, group: str = "") -> str:
-    """``phase_manifest_{GROUP}_rank{N}.json`` -- #1292's derivation, reused."""
-    tag = f"{group}_" if group else ""
-    return f"{MANIFEST_PREFIX}_{tag}rank{rank}.json"
+def manifest_filename(rank: int, group: str = "", region_tag: str = "") -> str:
+    """``phase_manifest_{GROUP}_rank{N}_{REGION_TAG}.json``.
+
+    #1292's derivation PLUS the region tag, and the third component is not
+    decoration.  ``arm_coverage_at_load`` is called from
+    ``ModelRunner.load_model`` (``model_runner.py:2564``) with that runner's own
+    ``weights_tag`` (``:2461``), and a weg2 rank runs TWO runners in one
+    process: the main model and the drafter.  Boot weg2xsn20's D log proves it
+    -- three ``WEG2-XCHG-RESIDENT tag=weights_draft ... rank={0,1,2}`` lines
+    beside the ``weights_0`` ones.  Keyed on (group, rank) alone, the second
+    write would have CLOBBERED the first and the join would have planned over
+    whichever runner finished last, from a file that looked complete.
+
+    AMENDMENT 6 is why that is a loss of real bytes and not a cosmetic one: the
+    draft tag is IN the weights family and is "planned, censused, waved, covered
+    and exchanged like every other layer tag".
+    """
+    grp = f"{group}_" if group else ""
+    reg = f"_{region_tag}" if region_tag else ""
+    return f"{MANIFEST_PREFIX}_{grp}rank{rank}{reg}.json"
 
 
 @dataclass(frozen=True)
@@ -220,7 +236,8 @@ def write_rank_manifest(manifest: RankManifest, dump_dir: str) -> str:
     then refuse a tensor that IS placed, which is the false-red direction.
     """
     os.makedirs(dump_dir, exist_ok=True)
-    path = os.path.join(dump_dir, manifest_filename(manifest.rank, manifest.group))
+    path = os.path.join(dump_dir, manifest_filename(
+        manifest.rank, manifest.group, manifest.region_tag))
     tmp = f"{path}.tmp{os.getpid()}"
     with open(tmp, "w", encoding="utf-8") as fh:
         json.dump(manifest.as_json(), fh, sort_keys=True)
@@ -416,6 +433,52 @@ def _axis_of(name: str, whole: ManifestPiece,
     )
 
 
+def merge_region_tags(manifests: Iterable[RankManifest]) -> List[RankManifest]:
+    """One record per RANK, unioning that rank's region-tag files.
+
+    A rank publishes one manifest per RUNNER (main model, drafter), because
+    ``arm_coverage_at_load`` fires once per runner with that runner's own region
+    tag.  The join's unit is the RANK -- what bytes rank *n* holds -- so the
+    files of one rank are unioned here rather than being three separate rows
+    that would break the contiguous-rank check and, worse, let one runner's
+    view stand for the rank's.
+
+    A parameter NAME claimed by two region tags of one rank with DIFFERENT
+    identities is refused: that is two runners disagreeing about one tensor, and
+    picking either would be the rank-local derivation this module removes.
+    ``region_tag`` on the merged record becomes the sorted join of the tags it
+    covers, so the provenance stays readable.
+    """
+    by_rank: Dict[int, List[RankManifest]] = {}
+    for man in manifests:
+        by_rank.setdefault(int(man.rank), []).append(man)
+    out: List[RankManifest] = []
+    for rank in sorted(by_rank):
+        rows = sorted(by_rank[rank], key=lambda m: m.region_tag)
+        pieces: Dict[str, ManifestPiece] = {}
+        for man in rows:
+            for piece in man.pieces:
+                prior = pieces.get(piece.param_name)
+                if prior is not None and prior.key != piece.key:
+                    raise wx.Weg2XchgPlanDisagree(
+                        f"W68 Weg2XchgPlanDisagree: {piece.param_name} is "
+                        f"published twice by {man.group} rank {rank} with "
+                        f"DIFFERENT identities {prior.key} vs {piece.key}. Two "
+                        f"runners of one rank disagree about one tensor, and "
+                        f"picking either would be exactly the rank-local "
+                        f"derivation the manifest replaces."
+                    )
+                pieces.setdefault(piece.param_name, piece)
+        head = rows[0]
+        out.append(RankManifest(
+            group=head.group, rank=rank, card=head.card,
+            region_tag="+".join(sorted({m.region_tag for m in rows if m.region_tag})),
+            boot_token=head.boot_token,
+            pieces=tuple(sorted(pieces.values(), key=lambda p: p.param_name)),
+        ))
+    return out
+
+
 def join_manifests(
     manifests: Sequence[RankManifest],
     *,
@@ -434,10 +497,8 @@ def join_manifests(
     the answer comes from FILES THOSE RANKS WROTE -- not from a pointer the
     asking process structurally cannot read (``weight_exchange_shadow.py:3336``).
     """
-    pp = sorted((m for m in manifests if m.group == pp_group),
-                key=lambda m: m.rank)
-    tp = sorted((m for m in manifests if m.group == tp_group),
-                key=lambda m: m.rank)
+    pp = merge_region_tags(m for m in manifests if m.group == pp_group)
+    tp = merge_region_tags(m for m in manifests if m.group == tp_group)
     if not pp or not tp:
         raise wx.Weg2XchgSourceMissing(
             f"W74 Weg2XchgSourceMissing: the join needs both groups' "
