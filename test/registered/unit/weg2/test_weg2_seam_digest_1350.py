@@ -724,8 +724,8 @@ def test_the_after_reading_follows_the_landing():
     i_reload = src.index("self._weg2_wake_reload_weights()")
     i_read = src.index("self._weg2_seam_digest_after(")
     assert i_guard < i_reload < i_read
-    line = [l for l in src.splitlines() if "self._weg2_seam_digest_after(" in l][0]
-    guard = [l for l in src.splitlines() if "if family_complete:" in l][0]
+    line = [ln for ln in src.splitlines() if "self._weg2_seam_digest_after(" in ln][0]
+    guard = [ln for ln in src.splitlines() if "if family_complete:" in ln][0]
     assert (len(line) - len(line.lstrip())) > (len(guard) - len(guard.lstrip()))
 
 
