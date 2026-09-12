@@ -499,6 +499,56 @@ class OriginAndResidualCorrections1350e(CustomTestCase):
             hl.resolve_margin(residual_gib=5.16, flip_ratchet_charged_gib=4.05)
 
 
+class LaunchWorstCaseHasItsOwnMargin1350f(CustomTestCase):
+    """#1350f RED-FIRST on the dry-run specimen: -6.33 must pass, -9 must refuse.
+
+    Measured on the xsn25 form at M=150 after #1350e: `launch_sum = -6.33 GiB`
+    with both moment leftovers positive (+5.67 / +1.62) and `run_peak 90.43`
+    against the 94.43 bound -- i.e. an arm whose run peak funds with 4.00 GiB to
+    spare was refused by a conjunct that asks a completely different question.
+    """
+
+    def _arm(self, launch_sum):
+        arm = hl.Arm(s_gb=1, m_mib=150, ranks_per_group=3,
+                     memtotal_bytes=0, memavail_bytes=0)
+        arm.terms = {
+            "launch_leftover_sum_gib": launch_sum,
+            "launch_worst_case_margin_gib": hl.LAUNCH_WORST_CASE_MARGIN_GIB,
+            "margin_total_gib": 1.47,       # the ratchet-era reap margin
+        }
+        arm.launch_leftover_gib = 5.67
+        arm.run_leftover_gib = 1.62
+        return arm
+
+    def test_the_dry_run_specimen_passes(self):
+        self.assertTrue(self._arm(-6.33).fundable_moments)
+
+    def test_nine_gib_short_still_refuses(self):
+        self.assertFalse(self._arm(-9.0).fundable_moments)
+
+    def test_the_reap_margin_no_longer_scores_this_gate(self):
+        """Under the shared number -6.33 vs -1.47 refused; that is the defect."""
+        arm = self._arm(-6.33)
+        self.assertLess(arm.launch_worst_case_gib, -float(arm.terms["margin_total_gib"]))
+        self.assertTrue(arm.fundable_moments)
+
+    def test_the_value_is_the_one_this_gate_always_had(self):
+        self.assertAlmostEqual(hl.LAUNCH_WORST_CASE_MARGIN_GIB, 8.60, places=2)
+        self.assertIn("8.60", hl.LAUNCH_WORST_CASE_MARGIN_SOURCE)
+        # ...and it equals the pre-#1350e boot margin, so no earlier verdict moves
+        self.assertAlmostEqual(
+            hl.resolve_margin().boot_total_gib,
+            hl.LAUNCH_WORST_CASE_MARGIN_GIB, places=2)
+
+    def test_a_pre_1350f_arm_dict_still_grades_by_the_reap_margin(self):
+        arm = hl.Arm(s_gb=1, m_mib=150, ranks_per_group=3,
+                     memtotal_bytes=0, memavail_bytes=0)
+        arm.terms = {"launch_leftover_sum_gib": -6.33, "margin_total_gib": 1.47}
+        arm.launch_leftover_gib = 5.67
+        arm.run_leftover_gib = 1.62
+        self.assertFalse(arm.fundable_moments)
+
+
 class ArmLineFields1350(CustomTestCase):
     """(6) The four fields #1350 requires, on the ARM line."""
 

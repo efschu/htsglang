@@ -430,6 +430,33 @@ RUN_PEAK_RESIDUAL_RATCHET_GIB = {
 #: is the sb4 LOAD-era default; this is the quiet serving rate the ratchet-era
 #: residual's own window has to be integrated over.
 RATCHET_RESIDUAL_DRIFT_MIB_PER_MIN = 0.07
+
+#: #1350f: THE #1317n LAUNCH WORST CASE HAS ITS OWN MARGIN, and the split is the
+#: whole point. That gate asks "and if the page-cache class assignment is
+#: WRONG?" -- it compares the launch leftover with the ENTIRE load transient
+#: charged as non-reclaimable against a reserve. The reap margin answers a
+#: different question (how much room the reap watermark needs) and is now
+#: RE-MEASURED on ratchet-priced arms (#1350e), which took it 8.60 -> 1.47 GiB.
+#: Sharing one number made the two move together, with OPPOSITE sensitivity:
+#: shrinking the reap margin in the funding direction TIGHTENED this gate from
+#: -8.60 to -1.47 and refused an arm whose run peak funds with 4.00 GiB of room
+#: (measured, xsn25 form M=150: launch_sum -6.33, run_peak 90.43 vs 94.43).
+#:
+#: THE VALUE IS THE ONE THIS GATE ACTUALLY HAD, not a new one: 8.60 GiB is the
+#: pre-#1350e boot margin (transient 2.88 + residual 5.16 + drift 0.56 + foreign
+#: 0.00) that this conjunct was written against and passed under for its whole
+#: life. Pinning it here changes NO verdict that was taken before #1350e; it
+#: only stops the reap margin's re-measurement from silently re-scoring a gate
+#: that never asked that question.
+LAUNCH_WORST_CASE_MARGIN_GIB = 8.60
+LAUNCH_WORST_CASE_MARGIN_SOURCE = (
+    "#1350f: the pre-#1350e boot margin this conjunct was written against "
+    "(transient 2.88 + residual 5.16 + drift 0.56 + foreign 0.00 = 8.60 GiB), "
+    "pinned as its OWN term so the reap margin's ratchet-era re-measurement "
+    "cannot re-score a gate that asks a different question (page-cache class "
+    "assignment wrong?), which it did: 8.60 -> 1.47 refused an arm whose run "
+    "peak funds with 4.00 GiB to spare"
+)
 RESIDUAL_WINDOW_MIN = 60.0
 
 #: #1269 / user order 2026-09-08 ("kein uebertreten mehr der schwelle. fuehrt
@@ -2201,7 +2228,11 @@ class Arm:
         """
         if not (self.launch_leftover_gib >= 0.0 and self.run_leftover_gib >= 0.0):
             return False
-        margin = (self.terms or {}).get("margin_total_gib")
+        # #1350f: THIS GATE'S OWN MARGIN, not the reap one. See
+        # LAUNCH_WORST_CASE_MARGIN_GIB for why they were split.
+        margin = (self.terms or {}).get("launch_worst_case_margin_gib")
+        if margin is None:
+            margin = (self.terms or {}).get("margin_total_gib")
         if margin is None:
             return True
         return self.launch_worst_case_gib >= -float(margin)
@@ -2760,6 +2791,8 @@ def price(
                 None if flip_ratchet is None else flip_ratchet.charged_gib
             )
         ).boot_total_gib,
+        "launch_worst_case_margin_gib": LAUNCH_WORST_CASE_MARGIN_GIB,
+        "launch_worst_case_margin_source": LAUNCH_WORST_CASE_MARGIN_SOURCE,
         "load_transient_gib": LOAD_TRANSIENT_GIB,
         "load_transient_pagecache_gib": LOAD_TRANSIENT_PAGECACHE_GIB,
         "load_transient_anon_gib": LOAD_TRANSIENT_ANON_GIB,
@@ -3667,6 +3700,11 @@ def choose(
             # cache (boot weg2sn6r: -2.78 sum against +9.22 by class).
             f"launch_sum={arm.launch_worst_case_gib:.2f} GiB "
             f"launch_cur={(arm.terms or {}).get('launch_currency', '?')} "
+            # #1350f: the two terms the launch worst case is graded by, on the
+            # line, so a reader never has to know which margin applied.
+            f"load_transient={float(arm.terms.get('load_transient_gib', 0.0)):.2f} "
+            f"launch_wc_margin={float(arm.terms.get('launch_worst_case_margin_gib', 0.0)):.2f} "
+            f"[{arm.terms.get('launch_worst_case_margin_source', '?')}] "
             f"run={arm.run_leftover_gib:.2f} GiB "
             f"store=NOT CHARGED HERE (#1236: on disk under launcher.STORE_ROOT, "
             f"page_cache=reclaimable, sized from the P KV pool -- see WEG2-STORE) "
