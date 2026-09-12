@@ -113,6 +113,7 @@ import logging
 import mmap as _mmap
 import os
 import re
+import struct
 import time
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -358,16 +359,32 @@ def leg_geometry(terms: xb.BounceTerms) -> Tuple[int, int]:
 # ---------------------------------------------------------------------------
 
 
-def bounce_path(boot_nonce: str, shm_root: str = xr.SHM_ROOT) -> str:
-    """The group-wide assemble buffer's file, one per boot.
+def bounce_path(boot_nonce: str, shm_root: str = xr.SHM_ROOT,
+                lane: str = "") -> str:
+    """The assemble buffer's file, one per boot and PER LANE.
 
-    ONE FILE FOR THE GROUP, not one per card like
-    ``tp.oncard_host_path``: the point of path (b) is that a unit is assembled
-    ONCE and every destination reads its own rows out of that one copy, so a
-    per-card file would be the image again, three times over.  It lives in the
-    same boot directory as the region and joins the same residue sweep.
+    ONE FILE PER LANE, not one per card: the point of path (b) is that a unit
+    is assembled ONCE and every destination reads its own rows out of that one
+    copy, so a per-card file would be the image again, three times over. A
+    LANE is one directed card pair (or the diagonal's card) -- the same unit a
+    handshake is keyed by.
+
+    THE LANE KEY IS THE DESK REPLAY'S OWN FINDING, and it is a product defect
+    rather than a replay artefact. The file used to be keyed on the boot nonce
+    ALONE while the handshake was keyed per pair, so the six ranks' concurrent
+    legs serialised correctly against their OWN semaphores and then all wrote
+    slot 0 of ONE shared buffer. Measured in the replay: every destination rank
+    received well-formed bytes that belonged to another pair --
+    ``first_diff=0``, `zero_bytes` ~0.4 % (i.e. real content, wrong content) --
+    and the seam digest read MISMATCH on 6 of 8 tensors, deterministically.
+    A boot would have shown the same as silently wrong weights, because
+    nothing in the lane could notice: each pair's own protocol was obeyed.
+
+    Empty ``lane`` keeps the historical single-buffer name, which is what the
+    single-process ``phase=both`` form and every existing test use.
     """
-    return os.path.join(xr.region_dir(boot_nonce, shm_root), "bounce.bin")
+    base = os.path.join(xr.region_dir(boot_nonce, shm_root), "bounce.bin")
+    return base if not lane else f"{base}.{lane}"
 
 
 class LayerBounce:
@@ -393,7 +410,7 @@ class LayerBounce:
     @revert_pinned_posts_on_failure
     def __init__(self, ops: tp.DeviceOps, boot_nonce: str, *,
                  slot_bytes: int, depth: int, create: bool = True,
-                 shm_root: str = xr.SHM_ROOT) -> None:
+                 shm_root: str = xr.SHM_ROOT, lane: str = "") -> None:
         if int(slot_bytes) <= 0:
             raise ValueError(f"slot_bytes must be positive, not {slot_bytes!r}")
         if int(depth) <= 0:
@@ -402,7 +419,7 @@ class LayerBounce:
         self.slot_bytes = int(slot_bytes)
         self.depth = int(depth)
         self.nbytes = self.slot_bytes * self.depth
-        self.path = bounce_path(boot_nonce, shm_root)
+        self.path = bounce_path(boot_nonce, shm_root, lane)
         self._post = f"weg2-xchg-bounce {self.path}"
         check_and_register_pinned_post(self._post, self.POST_FLAG, self.nbytes)
         os.makedirs(os.path.dirname(self.path), exist_ok=True)
@@ -853,6 +870,11 @@ def run_bounce_leg(
     #: single-process form and is byte-identical to the behaviour before the
     #: split; ``deposit``/``collect`` are the two ranks of a cross-group leg.
     phase: str = PHASE_BOTH,
+    #: WHICH LANE's buffer this leg assembles in -- one directed card pair, or
+    #: the diagonal's card. Empty keeps the single shared buffer, which is the
+    #: single-process `both` form. See :func:`bounce_path` for the measured
+    #: reason a phased leg may never share one.
+    lane: str = "",
     #: The slot handshake, INJECTED rather than constructed here.  The product
     #: passes an adapter over the region's CROSS semaphores (which already
     #: exist -- weg2xsn20's teardown census counted 24 of them beside the 12
@@ -971,8 +993,14 @@ def run_bounce_leg(
     # compare needs the live bytes beside the staged ones, and reusing a
     # depth-slot would overwrite the band still in flight.
     slots = int(depth) + (1 if comparing else 0)
+    if phase != PHASE_BOTH and not lane:
+        raise Weg2XchgBouncePhaseUnordered(
+            f"W68 Weg2XchgPlanDisagree: phase={phase} without a lane key. The "
+            f"assemble buffer would be shared with every other pair running "
+            f"concurrently, and each pair's own handshake would still be "
+            f"obeyed -- so the corruption is silent. Refusing.")
     bounce = LayerBounce(ops, boot_nonce, slot_bytes=slot_bytes, depth=slots,
-                         create=True, shm_root=shm_root)
+                         create=True, shm_root=shm_root, lane=lane)
     d_stream = ops.create_stream(device)
     c_stream = ops.create_stream(device)
     #: What each slot is still draining, so a slot is never re-deposited under
@@ -1053,12 +1081,7 @@ def run_bounce_leg(
                                 f"by any depositing rank, so this collect "
                                 f"would read whatever the previous band left "
                                 f"there. Issuing NOTHING.")
-                        if int(filled) == COUNT_UNAVAILABLE:
-                            # ORDERED BUT UNPRICED -- the diagonal carrier
-                            # publishes no byte count, and inventing one would
-                            # be a check comparing a number with itself.
-                            pass
-                        elif int(filled) != int(batch.total_bytes):
+                        if int(filled) != int(batch.total_bytes):
                             raise Weg2XchgBouncePhaseUnordered(
                                 f"W68 Weg2XchgPlanDisagree: slot="
                                 f"{slot} seq={batch.seq} carries "
@@ -1157,53 +1180,82 @@ def run_bounce_leg(
 
 
 class CrossSlotRendezvous:
-    """The empty/full handshake for ONE directed card pair.
+    """The empty/full handshake for ONE directed card pair, or the diagonal.
 
-    ``pair`` is the index into :data:`weight_exchange_region.CROSS_PAIRS`; the
-    diagonal has none by construction (``sem_name`` refuses it by name with
-    W15) and never takes a staging slot -- its carrier is the per-card
-    ``oncard-<card>.bin``.
+    ``pair`` indexes :data:`weight_exchange_region.CROSS_PAIRS`; ``card`` is the
+    diagonal's key instead (#1334 -- "the diagonal is one card talking to
+    itself ... a pair id would be exactly the fiction that produced weg2xsn9's
+    IndexError"). Exactly one of the two is given, and the SAME class serves
+    both, so the diagonal is no longer the unpriced special case slice 3 left
+    it as: it gets the identical short-piece check.
 
-    THE SLOT INDEX IS TAKEN MODULO :data:`SLOTS_PER_PAIR`, and the deposit
-    waits for ``empty`` before it refills one.  Without that wait a third band
-    would overwrite a slot whose consumer has not drained it, which is the same
-    unordered-read hazard from the producing side.
+    THE BYTE COUNT COMES FROM THE BOUNCE'S OWN RECORD, never the region's.
+    weg2xsn24 measured what sharing costs: `slot=0 seq=0 carries 1080 bytes and
+    this rank's own derivation of the same band is 756323776` -- 1080 was the
+    RING's number, published by `run_producer_pair`
+    (`weight_exchange_transport.py:1786`) into the same (pair, slot) record.
+    One ledger, two payloads. :class:`BounceSlots` is the bounce's own.
+
+    THE ORDER IS THE LAW (`run_producer_pair`'s own words): fill, ONE sync,
+    publish, THEN `sem_post(full)`. A post before the publish lets a consumer
+    read the previous band's count.
     """
 
-    def __init__(self, region, sems, *, pair: int, budget_s: float = 120.0):
-        self.region = region
+    def __init__(self, sems, slots: "BounceSlots", *, pair: Optional[int] = None,
+                 card: Optional[int] = None, budget_s: float = 120.0):
+        if (pair is None) == (card is None):
+            raise ValueError(
+                "exactly one of pair= (cross) or card= (diagonal) -- the two "
+                "name different semaphore families and conflating them is the "
+                "W15 fiction")
         self.sems = sems
-        self.pair = int(pair)
+        self.slots = slots
+        self.pair = pair
+        self.card = card
         self.budget_s = float(budget_s)
 
     def _slot(self, slot: int) -> int:
         return int(slot) % int(xr.SLOTS_PER_PAIR)
 
+    def _wait(self, slot: int, kind: str) -> bool:
+        if self.pair is not None:
+            return bool(self.sems.timedwait(self.pair, self._slot(slot), kind,
+                                            self.budget_s))
+        return bool(self.sems.diagonal_timedwait(self.card, self._slot(slot),
+                                                 kind, self.budget_s))
+
+    def _post(self, slot: int, kind: str) -> None:
+        if self.pair is not None:
+            self.sems.post(self.pair, self._slot(slot), kind)
+        else:
+            self.sems.diagonal_post(self.card, self._slot(slot), kind)
+
     def wait_empty(self, *, slot: int, seq: int) -> bool:
-        """Claim a slot for a deposit.  ``False`` means the consumer is behind."""
-        return bool(self.sems.timedwait(self.pair, self._slot(slot), "empty",
-                                        self.budget_s))
+        return self._wait(slot, "empty")
 
     def post_full(self, *, slot: int, seq: int, nbytes: int) -> None:
-        """Publish the post-sync byte count, THEN release the consumer.
-
-        The order is the law (``run_producer_pair``'s own words): a
-        ``sem_post`` before the publish would let a consumer read a count that
-        belongs to the previous band.
-        """
-        s = self._slot(slot)
-        self.region.publish(self.pair, s, int(nbytes))
-        self.sems.post(self.pair, s, "full")
+        self.slots.publish(slot=self._slot(slot), seq=int(seq),
+                           nbytes=int(nbytes), pair=self.pair, card=self.card)
+        self._post(slot, "full")
 
     def wait_full(self, *, slot: int, seq: int):
-        """The producer's post-sync claim, or ``None`` on a real timeout."""
-        s = self._slot(slot)
-        if not self.sems.timedwait(self.pair, s, "full", self.budget_s):
+        """The producer's post-sync claim, or ``None`` on a real timeout.
+
+        THE SEQ IS CHECKED, not only the byte count: a slot posted for a
+        DIFFERENT band would otherwise pass the size test whenever two bands
+        happen to be equally large, which on a uniform layer stack is most of
+        them.
+        """
+        if not self._wait(slot, "full"):
             return None
-        return int(self.region.read_slot(self.pair, s).bytes_filled)
+        got_seq, nbytes = self.slots.read(slot=self._slot(slot), pair=self.pair,
+                                          card=self.card)
+        if int(got_seq) != int(seq):
+            return None
+        return int(nbytes)
 
     def post_empty(self, *, slot: int, seq: int) -> None:
-        self.sems.post(self.pair, self._slot(slot), "empty")
+        self._post(slot, "empty")
 
 
 def pair_of(src_rank: int, dst_rank: int) -> Optional[int]:
@@ -1236,64 +1288,90 @@ def group_descs_by_pair(descs: Sequence[object]):
     return out
 
 
-class DiagonalSlotRendezvous:
-    """#1330 B4n SLICE 3. The ON-CARD handshake, keyed by CARD (#1334).
 
-    MEASURED FINDING THAT MADE THIS CLASS NECESSARY, and it corrects the slice's
-    own brief: ``phase=both`` was to stay "for the diagonal". It cannot. The
-    diagonal is ONE CARD and TWO PROCESSES -- the co-located pair of ranks --
-    so a diagonal descriptor lacks the peer's pointer for exactly the same
-    reason a cross one does. The provider smoke caught it immediately: on the
-    SOURCE hook the diagonal group raised
-    ``_missing_pointer: ... has no destination pointer``, and on the
-    destination hook the mirror. So ``both`` has NO cross-process caller at
-    all; it is the single-process form for hermetic tests and tools, and every
-    FLIP leg -- cross and diagonal alike -- is phased.
 
-    The ordering substrate is the twelve diagonal semaphores that already exist
-    (``diagonal_sem_name``, keyed by CARD because "the diagonal is one card
-    talking to itself ... a pair id would be exactly the fiction that produced
-    weg2xsn9's IndexError"), reached through the same ``SemSet`` handle table.
+# ---------------------------------------------------------------------------
+# #1330 B4n SLICE 4 -- THE BOUNCE'S OWN SLOT RECORD.
+# ---------------------------------------------------------------------------
+#
+# BOOT weg2xsn24 MEASURED WHY THIS CANNOT BE THE REGION'S RECORD:
+#
+#   W68 ... slot=0 seq=0 carries 1080 bytes and this rank's own derivation of
+#   the same band is 756323776
+#
+# 1080 is not a corrupt number, it is SOMEONE ELSE'S. `CrossSlotRendezvous`
+# published into `XchgRegion.publish` -- and `weight_exchange_transport.py:1786`
+# shows `run_producer_pair` publishing into the SAME (pair, slot) records for
+# the ring's own staging. Two payloads, one ledger: the collect read a count
+# the ring had written for a different transfer.
+#
+# That is the two-bookkeepings defect, and the fix is not a bigger check but a
+# record the bounce OWNS. It lives in its own shm file keyed by the boot nonce,
+# beside the LayerBounce buffer both ends already map, and nothing else writes
+# it.
 
-    **THE BYTE-COUNT CHECK IS UNAVAILABLE HERE, AND SAYS SO.** The cross lane's
-    short-piece check reads ``bytes_filled`` from the region's slot record; the
-    diagonal's carrier is the per-card ``oncard-<card>.bin`` and publishes no
-    such record. Returning the consumer's OWN derivation would make the check
-    compare a number with itself -- an instrument that cannot go red, which is
-    the shape this campaign has paid for repeatedly. So ``wait_full`` returns
-    the sentinel :data:`COUNT_UNAVAILABLE`, the collect accepts it as "ordered
-    but unpriced", and the gap is named rather than papered over.
+BOUNCE_SLOT_PREFIX = "weg2-xchg-bnc-"
+
+#: ``(seq, nbytes)`` per (pair, slot), as two int64 -- the smallest record that
+#: answers "which band is in this slot and how many bytes did its producer
+#: publish AFTER its own sync".
+_SLOT_REC = struct.Struct("<qq")
+
+
+def bounce_slots_path(boot_nonce: str, shm_root: str = "/dev/shm") -> str:
+    return os.path.join(shm_root, f"{BOUNCE_SLOT_PREFIX}{boot_nonce}")
+
+
+class BounceSlots:
+    """The bounce's OWN (seq, bytes) table, mmapped by both ends.
+
+    ``n_pairs`` covers the cross pairs AND the diagonal cards, so the diagonal
+    stops being the unpriced special case it was in slice 3: it addresses rows
+    ``N_PAIRS + card`` of the same table and therefore gets the SAME
+    short-piece check as every cross pair. The COUNT_UNAVAILABLE sentinel is
+    gone with it -- an instrument that could not go red on one third of the
+    lanes was a gap, not a design.
     """
 
-    def __init__(self, sems, *, card: int, budget_s: float = 120.0):
-        self.sems = sems
-        self.card = int(card)
-        self.budget_s = float(budget_s)
+    def __init__(self, boot_nonce: str, *, shm_root: str = "/dev/shm",
+                 create: bool = False):
+        self.path = bounce_slots_path(boot_nonce, shm_root)
+        self.rows = (xr.N_PAIRS + xr.N_CARDS) * xr.SLOTS_PER_PAIR
+        size = self.rows * _SLOT_REC.size
+        flags = os.O_RDWR | (os.O_CREAT if create else 0)
+        fd = os.open(self.path, flags, 0o600)
+        try:
+            if create and os.fstat(fd).st_size < size:
+                os.ftruncate(fd, size)
+            self._mm = _mmap.mmap(fd, size, _mmap.MAP_SHARED,
+                                  _mmap.PROT_READ | _mmap.PROT_WRITE)
+        finally:
+            os.close(fd)
 
-    def _slot(self, slot: int) -> int:
-        return int(slot) % int(xr.SLOTS_PER_PAIR)
+    def _row(self, pair: Optional[int], card: Optional[int], slot: int) -> int:
+        base = int(pair) if pair is not None else xr.N_PAIRS + int(card)
+        return base * int(xr.SLOTS_PER_PAIR) + (int(slot) % int(xr.SLOTS_PER_PAIR))
 
-    def _name(self, slot: int, kind: str):
-        return (self.card, self._slot(slot), kind)
+    def publish(self, *, slot: int, seq: int, nbytes: int,
+                pair: Optional[int] = None, card: Optional[int] = None) -> None:
+        off = self._row(pair, card, slot) * _SLOT_REC.size
+        self._mm[off:off + _SLOT_REC.size] = _SLOT_REC.pack(int(seq),
+                                                            int(nbytes))
 
-    def wait_empty(self, *, slot: int, seq: int) -> bool:
-        return bool(self.sems.diagonal_timedwait(
-            self.card, self._slot(slot), "empty", self.budget_s))
+    def read(self, *, slot: int, pair: Optional[int] = None,
+             card: Optional[int] = None) -> Tuple[int, int]:
+        off = self._row(pair, card, slot) * _SLOT_REC.size
+        return _SLOT_REC.unpack(self._mm[off:off + _SLOT_REC.size])
 
-    def post_full(self, *, slot: int, seq: int, nbytes: int) -> None:
-        self.sems.diagonal_post(self.card, self._slot(slot), "full")
+    def close(self) -> None:
+        try:
+            self._mm.close()
+        except BaseException:  # noqa: BLE001
+            pass
 
-    def wait_full(self, *, slot: int, seq: int):
-        if not self.sems.diagonal_timedwait(
-                self.card, self._slot(slot), "full", self.budget_s):
-            return None
-        return COUNT_UNAVAILABLE
-
-    def post_empty(self, *, slot: int, seq: int) -> None:
-        self.sems.diagonal_post(self.card, self._slot(slot), "empty")
-
-
-#: The diagonal's honest answer to "how many bytes are in the slot": it has no
-#: record to read. NOT zero and NOT the consumer's own number -- a check that
-#: compares a value with itself cannot go red.
-COUNT_UNAVAILABLE = -1
+    def unlink(self) -> None:
+        self.close()
+        try:
+            os.unlink(self.path)
+        except OSError:
+            pass

@@ -2346,27 +2346,65 @@ class SchedulerWeightUpdaterManager:
             # exception that reports only its type cannot be acted on.
             return None, f"derivation-failed:{_weg2_exc_note(exc)}"
 
+    def _weg2_rank_param_table(self):
+        """Every live parameter THIS PROCESS holds, across BOTH its runners.
+
+        BOOT weg2xsn24's FIRST ROOT: the collect hook refused with
+        ``W74 bounce: fc.weight has no destination pointer ...
+        dst_resolved=894/904``. ``fc.weight`` is the DRAFT head's, and the
+        address book was built from ``self.tp_worker.model_runner`` alone --
+        one runner. But the manifest join unions a rank's runner files
+        (`merge_region_tags`, added for weg2xsn20's two-runner write), so the
+        PLAN covers both runners while the ADDRESSES covered one. Ten
+        descriptors of 904 had no home, and one hole refuses the whole leg.
+
+        The two populations must therefore be the same two: this walks the main
+        runner AND the draft runner, exactly as `arm_coverage_at_load` is
+        reached once per runner. `_get_draft_model_runner` is the tree's own
+        accessor (DFlash / FrozenKVMTP shapes); absent, the table is the main
+        runner's and the join simply has nothing draft-shaped to place.
+        """
+        table = {}
+        runners = []
+        main = getattr(self.tp_worker, "model_runner", None)
+        if main is not None:
+            runners.append(main)
+        draft_worker = getattr(self, "draft_worker", None)
+        if draft_worker is not None:
+            try:
+                drafter = _get_draft_model_runner(draft_worker)
+            except BaseException:  # noqa: BLE001 -- an observer never raises
+                drafter = None
+            if drafter is not None:
+                runners.append(drafter)
+        for runner in runners:
+            model = getattr(runner, "model", None)
+            if model is None:
+                continue
+            try:
+                for name, param in model.named_parameters():
+                    table.setdefault(str(name), param)
+            except BaseException:  # noqa: BLE001
+                continue
+        return table
+
     def _weg2_join_src_addr(self, hook: str, group: str, rank: int, model):
         """#1330 B4n. The SOURCE address book for a join-backed leg.
 
-        OWN DEVICE ADDRESS ONLY, and never the ring.  On the SOURCE hook this
+        OWN DEVICE ADDRESS ONLY, and never the ring. On the SOURCE hook this
         rank holds the bytes it must supply, so ``data_ptr()`` of its own live
-        tensor is the honest answer and the deposit reads from there.  On every
-        other hook the source is the peer's memory or the bounce slot, neither
-        of which this method may invent: it answers ``None`` and the phase that
-        owns the slot fills it in.
+        tensor is the honest answer and the deposit reads from there. On every
+        other hook the source is the bounce slot, which the collect addresses
+        itself; this returns ``None`` there.
 
         Reading the source out of the ring would be the ring restore through
         another door and would defeat the goal the exchange exists for (zero
         layer bytes resident in host RAM), so the ring appears nowhere here.
         """
-        if str(hook) != "source" or model is None:
+        if str(hook) != "source":
             return None
-        table = {}
-        try:
-            for name, param in model.named_parameters():
-                table[str(name)] = param
-        except BaseException:  # noqa: BLE001 -- an observer never raises
+        table = self._weg2_rank_param_table()
+        if not table:
             return None
 
         def src_addr(name: str, r: int):
@@ -2380,23 +2418,18 @@ class SchedulerWeightUpdaterManager:
     def _weg2_join_dst_addr(self, hook: str, group: str, rank: int, model):
         """#1330 B4n. The DESTINATION address book for a join-backed leg.
 
-        The mirror of the source book: on an IMPORTING hook (destination or
-        authoritative) this rank owns the pages the bytes must land in, so its
-        own ``data_ptr()`` is the answer; on the SOURCE hook the destination is
-        the bounce slot and this returns ``None``.
+        The mirror of the source book, over the SAME two-runner population --
+        see :meth:`_weg2_rank_param_table` for why one runner was not enough.
 
         THE COLLECT'S TARGET IS A PLAN PARAMETER, NOT A REFILL DERIVATION, and
         that is deliberate for the remap slice (AMENDMENT 8): when the remap
         replaces WHERE the destination pages come from, only this book changes
         -- the deposit and the collect stay the same two primitives.
         """
-        if str(hook) == "source" or model is None:
+        if str(hook) == "source":
             return None
-        table = {}
-        try:
-            for name, param in model.named_parameters():
-                table[str(name)] = param
-        except BaseException:  # noqa: BLE001
+        table = self._weg2_rank_param_table()
+        if not table:
             return None
 
         def dst_addr(name: str, r: int):
@@ -3152,31 +3185,32 @@ class SchedulerWeightUpdaterManager:
 
         phase = (bx.PHASE_DEPOSIT if str(hook) == "source"
                  else bx.PHASE_COLLECT)
+        # THE BOUNCE'S OWN SLOT RECORD, created by whoever gets there first and
+        # mapped by both ends. NOT the region's: weg2xsn24 read `carries 1080
+        # bytes` because `run_producer_pair` publishes the RING's counts into
+        # the same (pair, slot) records (weight_exchange_transport.py:1786).
+        slots = bx.BounceSlots(str(boot_nonce), shm_root=root, create=True)
         last = None
-        for pair, group in bx.group_descs_by_pair(descs).items():
-            if pair is None:
-                # ON-CARD IS STILL TWO PROCESSES, and `both` cannot serve it.
-                # Measured by this slice's own provider smoke: on the SOURCE
-                # hook the diagonal group raised `_missing_pointer: ... has no
-                # destination pointer`, because the co-located peer's pages are
-                # in ANOTHER process on the same card. So the diagonal is
-                # phased too, over its own twelve semaphores (keyed by CARD,
-                # #1334) and its own per-card carrier. `both` has no
-                # cross-process caller at all.
+        try:
+            for pair, group in bx.group_descs_by_pair(descs).items():
+                rv = (bx.CrossSlotRendezvous(sems, slots, pair=pair)
+                      if pair is not None else
+                      bx.CrossSlotRendezvous(
+                          sems, slots,
+                          card=int(getattr(group[0], "dst_rank", device))))
                 last = bx.run_bounce_leg(
                     group, ops, boot_nonce, slot_bytes=slot_bytes, depth=depth,
                     terms=terms, mode=resolved_mode, shm_root=root,
-                    device=device, phase=phase,
-                    rendezvous=bx.DiagonalSlotRendezvous(
-                        sems, card=int(getattr(group[0], "dst_rank", device))),
+                    device=device, phase=phase, rendezvous=rv,
+                    # ONE BUFFER PER LANE. Keyed on the boot alone, the six
+                    # ranks' concurrent legs each obeyed their own handshake
+                    # and then all wrote slot 0 of ONE file -- silent
+                    # cross-pair corruption, measured in the desk replay.
+                    lane=(f"p{pair}" if pair is not None
+                          else f"c{int(getattr(group[0], 'dst_rank', device))}"),
                     log=logger.info)
-                continue
-            last = bx.run_bounce_leg(
-                group, ops, boot_nonce, slot_bytes=slot_bytes, depth=depth,
-                terms=terms, mode=resolved_mode, shm_root=root, device=device,
-                phase=phase,
-                rendezvous=bx.CrossSlotRendezvous(region, sems, pair=pair),
-                log=logger.info)
+        finally:
+            slots.close()
         return last
 
     # PATH (a) WAS DELETED HERE (#1342 S3), and the deletion is recorded

@@ -146,6 +146,12 @@ class _Worker:
 class _Stub:
     """Borrows the REAL unbound methods -- nothing here is re-implemented."""
 
+    # BORROWED, INCLUDING THE NEW TWO-RUNNER TABLE: the address books read it,
+    # and a stub that omitted it would exercise a path the product does not
+    # have (weg2xsn24's `fc.weight has no destination pointer` came from the
+    # single-runner table this method replaced).
+    _weg2_rank_param_table = (
+        wu.SchedulerWeightUpdaterManager._weg2_rank_param_table)
     _weg2_join_src_addr = wu.SchedulerWeightUpdaterManager._weg2_join_src_addr
     _weg2_join_dst_addr = wu.SchedulerWeightUpdaterManager._weg2_join_dst_addr
     _weg2_shadow_plan = wu.SchedulerWeightUpdaterManager._weg2_shadow_plan
