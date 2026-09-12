@@ -2561,11 +2561,19 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # (spec section 3.6), which reads weight_exchange.boot_vote().
         from sglang.srt.weg2.weight_exchange import arm_coverage_at_load
 
+        # #1330 B4n: BOTH RANK AXES, and `rank=` stays `tp_rank` because every
+        # other consumer of this call means the TP rank by it. The manifest
+        # needs the GROUP-UNIQUE index, which under `--tp-size 1 --pp-size 3`
+        # is the PP rank -- boot weg2xsn22 lost every leg because all three of
+        # group P's ranks wrote `rank0`.
         arm_coverage_at_load(
             self.model,
             rank=self.tp_rank,
             tag_bytes=self._weg2_xchg_tag_bytes,
             region_tag=weights_tag,
+            tp_rank=self.tp_rank,
+            pp_rank=self.pp_rank,
+            tp_size=self.tp_size,
         )
 
         # Cache needs to be cleared after loading model weights (in the self.loader.load_model function).

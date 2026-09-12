@@ -3540,7 +3540,9 @@ NO_PLAN_REASON = (
 
 
 def _write_placement_manifest(model, *, rank: int, region_tag: str,
-                              log: Callable[[str], None]) -> None:
+                              log: Callable[[str], None],
+                              tp_rank: Optional[int] = None,
+                              pp_rank: int = 0, tp_size: int = 1) -> None:
     """#1330 B4n. Write this rank's placement manifest; never raise.
 
     LAZY IMPORT, because ``xchg_manifest`` imports this module: the cross-group
@@ -3570,12 +3572,19 @@ def _write_placement_manifest(model, *, rank: int, region_tag: str,
             )
             return
         geoms = [g for g, _t in inventory]
+        # THE GROUP-UNIQUE RANK, not `tp_rank`. Under `--tp-size 1 --pp-size 3`
+        # every rank of group P has `tp_rank == 0`, so keying on it made three
+        # writers share one file (weg2xsn22). `group_rank` is the tree's own
+        # `tp_size * pp_rank + tp_rank` from model_runner.py:998.
+        t_rank = int(rank if tp_rank is None else tp_rank)
+        g_rank = xm.group_rank(t_rank, int(pp_rank), int(tp_size))
         cards = tuple(range(xr.N_CARDS))
-        card = cards[int(rank)] if 0 <= int(rank) < len(cards) else int(rank)
+        card = cards[g_rank] if 0 <= g_rank < len(cards) else g_rank
         manifest = xm.RankManifest(
-            group=str(group), rank=int(rank), card=int(card),
+            group=str(group), rank=g_rank, card=int(card),
             region_tag=str(region_tag), boot_token=xm.boot_token(),
-            pieces=xm.pieces_from_inventory(geoms))
+            pieces=xm.pieces_from_inventory(geoms),
+            tp_rank=t_rank, pp_rank=int(pp_rank))
         path = xm.write_rank_manifest(manifest, directory)
         log(xm.written_line(path, manifest))
     except BaseException as exc:  # noqa: BLE001 -- no fence here; see caller
@@ -3596,6 +3605,12 @@ def arm_coverage_at_load(
     tag_bytes: TagBytesFn,
     region_tag: str,
     log: Optional[Callable[[str], None]] = None,
+    #: #1330 B4n: the two rank axes, for the placement manifest's file name.
+    #: Defaulted so every existing caller and test is unchanged; the product
+    #: passes them from `ModelRunner`, which is the only place both exist.
+    tp_rank: Optional[int] = None,
+    pp_rank: int = 0,
+    tp_size: int = 1,
 ) -> Optional[CoverageVote]:
     """THE CALL SITE, spec section 6/S2: the end of weight loading.
 
@@ -3732,7 +3747,10 @@ def arm_coverage_at_load(
     # here would leave the other five in a collective without six members.  A
     # failed write is a NAMED line and an absent file; the join then refuses by
     # name at the reader, where a refusal costs nothing.
-    _write_placement_manifest(model, rank=rank, region_tag=region_tag, log=emit)
+    _write_placement_manifest(
+        model, rank=rank, region_tag=region_tag, log=emit,
+        tp_rank=(rank if tp_rank is None else tp_rank),
+        pp_rank=pp_rank, tp_size=tp_size)
     if not vote.ok:
         logger.error("%s", vote.reason)
     return vote

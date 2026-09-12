@@ -95,13 +95,20 @@ def _manifests(*, sharded=True, d_ranks=D_RANKS):
             for r, w in enumerate(_split(cols, d_ranks)):
                 d_pieces[r].append(_piece(name, rows, w))
     out = []
+    # THE AXES ARE THE FORM'S, not defaults: group P is `--tp-size 1
+    # --pp-size 3` (so pp_rank varies) and group D is TP3 (so tp_rank does).
+    # Leaving them at 0 made every P record resolve to `rank0x0`, which is
+    # weg2xsn22's defect reproduced inside the fixture -- and the new
+    # overwrite ratchet caught it there first.
     for r, pieces in p_pieces.items():
         out.append(xm.RankManifest(group="P", rank=r, card=CARDS[r],
                                    region_tag=TAG, boot_token="b1",
+                                   tp_rank=0, pp_rank=r,
                                    pieces=tuple(pieces)))
     for r, pieces in d_pieces.items():
         out.append(xm.RankManifest(group="D", rank=r, card=CARDS[r],
                                    region_tag=TAG, boot_token="b1",
+                                   tp_rank=r, pp_rank=0,
                                    pieces=tuple(pieces)))
     return out
 
@@ -249,7 +256,8 @@ def test_a_manifest_round_trips_through_the_shared_dump_directory(tmp_path):
     man = _manifests()[0]
     path = xm.write_rank_manifest(man, str(tmp_path))
     assert os.path.basename(path) == xm.manifest_filename(
-        man.rank, man.group, man.region_tag)
+        man.rank, man.group, man.region_tag,
+        tp_rank=man.tp_rank, pp_rank=man.pp_rank)
     assert man.region_tag in os.path.basename(path), (
         "the region tag must be IN the name: one rank runs two runners (main "
         "model and drafter) through the same write site, and without it the "
@@ -276,7 +284,8 @@ def test_a_stale_boots_manifest_is_filtered_not_joined(tmp_path):
     stale = _manifests()[0]
     xm.write_rank_manifest(
         xm.RankManifest(group="P", rank=99, card=0, region_tag=TAG,
-                        boot_token="OLD", pieces=stale.pieces), str(tmp_path))
+                        boot_token="OLD", tp_rank=0, pp_rank=99,
+                        pieces=stale.pieces), str(tmp_path))
     assert all(m.boot_token == "b1"
                for m in xm.load_manifests(str(tmp_path), boot_token="b1"))
     assert len(xm.load_manifests(str(tmp_path), boot_token="b1")) == (
@@ -721,7 +730,8 @@ def _draft_manifest(group, rank):
     """What the DRAFT runner publishes from the same rank, same process."""
     return xm.RankManifest(
         group=group, rank=rank, card=CARDS[rank], region_tag="weights_draft",
-        boot_token="b1",
+        boot_token="b1", tp_rank=(rank if group == "D" else 0),
+        pp_rank=(rank if group == "P" else 0),
         pieces=(_piece("model.layers.0.mtp.fc.weight", 64, 32,
                        tag="weights_draft"),))
 
@@ -780,6 +790,8 @@ def test_the_join_still_works_when_every_rank_has_two_runner_files():
             mans.append(xm.RankManifest(
                 group=group, rank=rank, card=CARDS[rank],
                 region_tag="weights_draft", boot_token="b1",
+                tp_rank=(rank if group == "D" else 0),
+                pp_rank=(rank if group == "P" else 0),
                 pieces=(_piece("model.layers.0.mtp.fc.weight",
                                *( (64, 32) if group == "P"
                                   else (_split(64, D_RANKS)[rank], 32) ),
@@ -863,11 +875,119 @@ def test_a_missing_peer_manifest_names_the_expected_file(tmp_path, monkeypatch):
         xm.write_rank_manifest(
             xm.RankManifest(group=man.group, rank=man.rank, card=man.card,
                             region_tag=man.region_tag, boot_token="tok",
+                            tp_rank=man.tp_rank, pp_rank=man.pp_rank,
                             pieces=man.pieces), str(tmp_path))
     mans, why = xm.manifests_for_boot()
     assert mans is None
     assert "manifest-missing" in why
-    assert "phase_manifest_P_rank2_" in why and ".json" in why
+    assert "phase_manifest_P_rank" in why and ".json" in why
     assert "diagonal" in why, (
         "the refusal must say WHY there is no fallback, or the next reader "
         "adds one back")
+
+
+# ---------------------------------------------------------------------------
+# (8) BOOT weg2xsn22: THE RANK COLLISION INSIDE ONE GROUP
+# ---------------------------------------------------------------------------
+
+
+def test_group_rank_is_unique_within_the_group_for_the_xsn22_form():
+    """``--tp-size 1 --pp-size 3``: three ranks, three indices.
+
+    THE MEASURED DEFECT: the manifest was keyed on ``tp_rank``
+    (``model_runner.py:2566`` passes ``rank=self.tp_rank``), and under group
+    P's form every rank has ``tp_rank == 0``. Boot weg2xsn22 wrote four
+    ``WEG2-XCHG-MANIFEST-WRITE rank=0 card=0`` lines with pieces 515/505/893
+    onto ONE file; the join read ``join-manifest-missing: 2 of 6``, no plan was
+    produced, and every leg read ``ran=no why=no-plan`` with
+    ``hook=destination`` firing 0 times.
+    """
+    # Group P on xsn22: tp_size=1, pp_size=3.
+    assert [xm.group_rank(0, pp, 1) for pp in range(3)] == [0, 1, 2]
+    # Group D on xsn22: tp_size=3, pp_size=1.
+    assert [xm.group_rank(tp, 0, 3) for tp in range(3)] == [0, 1, 2]
+    # The shape, not the incident: a future tp>1 pp>1 group is unique too.
+    assert sorted(xm.group_rank(tp, pp, 2)
+                  for pp in range(3) for tp in range(2)) == list(range(6))
+
+
+def test_the_file_name_carries_both_axes_so_no_form_can_collide():
+    """MUTANT 'tp_rank statt group-rank': all three P names collapse to one."""
+    names = {xm.manifest_filename(xm.group_rank(0, pp, 1), "P", "weights_0",
+                                  tp_rank=0, pp_rank=pp)
+             for pp in range(3)}
+    assert len(names) == 3, names
+    assert "rank0x0" in " ".join(sorted(names))
+    assert "rank0x2" in " ".join(sorted(names))
+    # The mutant, spelled out: keying on tp_rank alone gives ONE name.
+    collapsed = {xm.manifest_filename(0, "P", "weights_0") for _ in range(3)}
+    assert len(collapsed) == 1, (
+        "this is the defect weg2xsn22 shipped -- kept here so the fix is "
+        "measured against it rather than asserted")
+
+
+def test_three_pp_writers_produce_three_files_and_join(tmp_path):
+    """RED-FIRST, in the xsn22 constellation: three writers, three files.
+
+    Before the fix this wrote ONE file and the join refused with
+    ``2 of 6``. The assertion is the file COUNT and then the join, because a
+    single-file outcome is exactly what looked fine per-line in the boot log.
+    """
+    written = []
+    for pp in range(3):
+        g = xm.group_rank(0, pp, 1)
+        written.append(xm.write_rank_manifest(xm.RankManifest(
+            group="P", rank=g, card=CARDS[g], region_tag=TAG,
+            boot_token="x22", tp_rank=0, pp_rank=pp,
+            pieces=(_piece(f"model.layers.{pp}.mlp.down_proj.weight",
+                           2048, 1024),)), str(tmp_path)))
+    for tp in range(3):
+        xm.write_rank_manifest(xm.RankManifest(
+            group="D", rank=tp, card=CARDS[tp], region_tag=TAG,
+            boot_token="x22", tp_rank=tp, pp_rank=0,
+            pieces=tuple(_piece(f"model.layers.{layer}.mlp.down_proj.weight",
+                                _split(2048, 3)[tp], 1024)
+                         for layer in range(3))), str(tmp_path))
+
+    assert len(set(written)) == 3, f"three PP writers, three files: {written}"
+    assert len(os.listdir(tmp_path)) == 6
+    mans = xm.load_manifests(str(tmp_path), boot_token="x22")
+    assert sorted(m.rank for m in mans if m.group == "P") == [0, 1, 2]
+    join = xm.join_manifests(mans, pp_group="P", tp_group="D")
+    assert join.unsourced == () and len(join.tensors) == 3
+    assert {t.pp_stage for t in join.tensors} == {0, 1, 2}, (
+        "each layer's source must be its OWN PP stage")
+
+
+def test_two_writers_on_one_name_refuse_instead_of_overwriting(tmp_path):
+    """THE RATCHET against weg2xsn22's own shape, at the only site that sees it."""
+    a = xm.RankManifest(group="P", rank=0, card=0, region_tag=TAG,
+                        boot_token="x22", tp_rank=0, pp_rank=0,
+                        pieces=(_piece("a.weight", 8, 4),))
+    xm.write_rank_manifest(a, str(tmp_path))
+    # Same name, same boot, DIFFERENT inventory -> refusal.
+    b = xm.RankManifest(group="P", rank=0, card=0, region_tag=TAG,
+                        boot_token="x22", tp_rank=0, pp_rank=0,
+                        pieces=(_piece("b.weight", 16, 4),))
+    with pytest.raises(wx.Weg2XchgPlanDisagree) as exc:
+        xm.write_rank_manifest(b, str(tmp_path))
+    assert "W68" in str(exc.value)
+    assert "Two writers resolved to ONE file name" in str(exc.value)
+    # The same inventory again is a legitimate re-write and stays silent.
+    xm.write_rank_manifest(a, str(tmp_path))
+
+
+def test_the_product_write_site_passes_the_group_unique_rank():
+    """The fix must live on the PRODUCT path, not only in the helper."""
+    import inspect
+
+    src = inspect.getsource(wx._write_placement_manifest)
+    assert "group_rank(" in src
+    assert "rank=g_rank" in src, (
+        "the manifest must carry the GROUP-UNIQUE rank; passing tp_rank is "
+        "the weg2xsn22 defect")
+    runner = inspect.getsource(
+        __import__("sglang.srt.model_executor.model_runner",
+                   fromlist=["x"]).ModelRunner.load_model)
+    assert "pp_rank=self.pp_rank" in runner
+    assert "tp_size=self.tp_size" in runner

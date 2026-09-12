@@ -112,9 +112,15 @@ def build(tmp: str):
                     params.append((name, torch.nn.Parameter(
                         torch.zeros(r, c, dtype=torch.int8),
                         requires_grad=False)))
+            # THE AXES OF THE REAL FORM (weg2xsn22): group P is
+            # `--tp-size 1 --pp-size 3`, group D is TP3. Keyed on `tp_rank`
+            # alone all three P ranks wrote one file and the join refused.
             xm.write_rank_manifest(xm.RankManifest(
                 group=group, rank=rank, card=CARDS[rank], region_tag=TAG,
-                boot_token="smoke", pieces=tuple(pieces)), tmp)
+                boot_token="smoke",
+                tp_rank=(rank if group == "D" else 0),
+                pp_rank=(rank if group == "P" else 0),
+                pieces=tuple(pieces)), tmp)
             models[(group, rank)] = params
     return models, cut
 
@@ -169,6 +175,11 @@ def main() -> int:
         os.environ[xr.ENV_REGION_BOOT] = "smoke"
         os.environ["SGLANG_WEG2_WEIGHT_SOURCE"] = "exchange"
 
+        # THE xsn22 SHAPE IS ASSERTED, not assumed: three distinct P files.
+        p_files = [f for f in os.listdir(tmp) if f.startswith("phase_manifest_P_")]
+        check(len(p_files) == len(CARDS),
+              f"group P (tp=1, pp=3) wrote {len(p_files)} distinct files "
+              f"(weg2xsn22 wrote 1 and lost every leg)")
         check(wx.exchange_armed(),
               "the arm is armed, so the join is the producer (not the "
               "derivation)")
@@ -229,7 +240,8 @@ def main() -> int:
 
         # -- 3. NO FALLBACK TO THE DIAGONAL --------------------------------
         print("\n[3] a missing peer manifest refuses BY FILE NAME")
-        victim = os.path.join(tmp, xm.manifest_filename(2, "P", TAG))
+        victim = os.path.join(tmp, xm.manifest_filename(
+            2, "P", TAG, tp_rank=0, pp_rank=2))
         os.rename(victim, victim + ".hidden")
         stub = _Stub(_Model(models[("D", 0)]))
         plan, reason = stub._weg2_shadow_plan(
@@ -324,7 +336,7 @@ def main() -> int:
         finally:
             _wb.run_bounce_leg = orig
 
-    total = 18
+    total = 19
     print(f"\nWEG2-XCHG-PROVIDER-SMOKE verdict="
           f"{'PASS' if not failures else 'FAIL'} "
           f"checks={total - len(failures)}/{total}")
