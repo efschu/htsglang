@@ -1185,12 +1185,18 @@ def test_the_draft_runner_is_part_of_the_graded_population():
     )
 
 
-def test_the_draft_runner_pieces_are_actually_walked(hooked, caplog):
+def test_the_draft_runner_pieces_are_actually_walked(hooked, monkeypatch, caplog):
     """R4, by EXECUTION rather than by identifier: the draft pieces are graded.
 
     The AST pin above can be satisfied by naming the attribute and dropping the
     result; this one counts the pieces.
+
+    ON THE `exchange` ARM, because that is the arm on which `weights_draft` is
+    a family member at all (B4k). On `ring` the drafter travels the base tag and
+    is a NAMED skip instead -- pinned by the test below, so the two arms cannot
+    silently collapse into one answer.
     """
+    monkeypatch.setenv(wx.WEIGHT_SOURCE_ENV, wx.WEIGHT_SOURCE_EXCHANGE)
     mod = _mod()
     main = _inventory()
     draft = _draft_inventory()
@@ -1203,6 +1209,22 @@ def test_the_draft_runner_pieces_are_actually_walked(hooked, caplog):
     )
     labels = " ".join(p.identity.label for p in m.weg2_seam_before.pieces)
     assert "weights_draft" in labels
+
+
+def test_on_the_ring_arm_the_draft_runner_is_a_named_skip(hooked, monkeypatch, caplog):
+    """The other arm, pinned so the two cannot collapse into one answer.
+
+    Under `ring` the drafter has no tag of its own -- it is paused as part of
+    the base tag -- so grading it under a forced region tag would census a
+    family member that does not exist on that arm. It is named instead.
+    """
+    monkeypatch.delenv(wx.WEIGHT_SOURCE_ENV, raising=False)
+    m = hooked(_inventory(), draft=_draft_inventory())
+    with caplog.at_level("INFO"):
+        m._weg2_seam_digest_before(_Req(), ["weights_0", "weights"])
+    assert m.weg2_seam_before.n_tensors == len(_TENSORS)
+    line = [ln for ln in caplog.text.splitlines() if "stage=before" in ln][0]
+    assert "draft-runner" in line and "not-in-family-on-this-arm" in line, line
 
 
 def test_the_verdict_separates_paused_from_resident_pieces(hooked, caplog):
