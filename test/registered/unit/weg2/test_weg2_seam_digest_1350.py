@@ -688,13 +688,21 @@ def test_no_cutover_or_flip_module_takes_a_reading():
     unmapped pages or an empty set.  There is nothing to open back up here.
     """
     forbidden = []
+    walked = 0
     for path in _py_files():
         rel = os.path.relpath(path, REPO_ROOT)
         if "flip" not in rel and "cutover" not in rel:
             continue
+        walked += 1
         with open(path, encoding="utf-8") as fh:
             if "seam_digest" in fh.read():
                 forbidden.append(rel)
+    # DENOMINATOR FIRST: a walk that matched nothing would pass the assertion
+    # below and prove nothing -- the failure mode this whole family of guards
+    # keeps producing.  Measured 16 flip/cutover modules at d294bde41d.
+    assert walked >= 10, (
+        f"the flip/cutover walk saw only {walked} modules: the guard is vacuous"
+    )
     assert forbidden == [], (
         f"a flip/cutover module references the seam digest: {forbidden}. "
         "The sleeping group holds no weight bytes at that moment; this is "
