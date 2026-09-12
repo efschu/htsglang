@@ -1201,7 +1201,7 @@ class CrossSlotRendezvous:
     read the previous band's count.
     """
 
-    def __init__(self, sems, slots: "BounceSlots", *, pair: Optional[int] = None,
+    def __init__(self, sems, slots, *, pair: Optional[int] = None,
                  card: Optional[int] = None, budget_s: float = 120.0):
         if (pair is None) == (card is None):
             raise ValueError(
