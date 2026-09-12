@@ -274,11 +274,14 @@ class TransientLeavesTheBootMargin1350(CustomTestCase):
         ratcheted = hl.resolve_margin(flip_ratchet_charged_gib=3.35)
         w = hl.OBSERVED_REAP_NONRECLAIM_BYTES / GIB
         self.assertAlmostEqual(w - legacy.boot_total_gib, 87.30, places=2)
-        self.assertAlmostEqual(w - ratcheted.boot_total_gib, 90.18, places=2)
-        # The difference is EXACTLY the transient and nothing else.
+        # #1350e SUPERSEDES the 90.18 this test first pinned: the residual is
+        # now RE-MEASURED on ratchet-priced predictions too, so the bound moves
+        # by the transient AND by (5.16 - the re-measured 0.911).
+        self.assertAlmostEqual(w - ratcheted.boot_total_gib, 94.43, places=2)
         self.assertAlmostEqual(
             legacy.boot_total_gib - ratcheted.boot_total_gib,
-            legacy.transient_gib, places=9)
+            legacy.transient_gib + (legacy.residual_gib - ratcheted.residual_gib),
+            places=9)
 
     def test_the_transient_stays_in_the_runtime_margin(self):
         """W22 grades a LIVE reading; the NEXT flip has not happened yet."""
@@ -317,10 +320,12 @@ class NoDoubleCount1350(CustomTestCase):
         """
         legacy = hl.resolve_margin()
         ratcheted = hl.resolve_margin(flip_ratchet_charged_gib=3.35)
-        self.assertAlmostEqual(
-            ratcheted.residual_gib, legacy.residual_gib, places=12)
-        self.assertAlmostEqual(ratcheted.residual_gib, 5.16, places=6)
-        self.assertIn("KEPT WHOLE", ratcheted.residual_source)
+        # #1350e: the ratchet-priced arm now uses the RE-MEASURED rows, and the
+        # legacy row is neither netted nor summed with the charged term -- it is
+        # simply not the row that applies. It still binds every unratcheted arm.
+        self.assertAlmostEqual(legacy.residual_gib, 5.16, places=6)
+        self.assertLess(ratcheted.residual_gib, legacy.residual_gib)
+        self.assertIn("DELIBERATELY NOT USED", ratcheted.residual_source)
         # ...and the constant itself was not hand-edited.
         self.assertEqual(
             hl.RUN_PEAK_RESIDUAL_GIB,
@@ -349,15 +354,13 @@ class NoDoubleCount1350(CustomTestCase):
             "sampled_at_flip_epoch": 1,
             "arm": {"s_gb": 1, "m_mib": 600},
         }}
+        # #1350e: rejected in favour of the launch reading (the correction);
+        # the W95 guard itself is still live and is pinned by
+        # `test_summing_both_residual_rules_is_still_refused` and by
+        # `test_W95_still_fires_when_there_is_no_launch_reading_to_fall_back_on`.
         origin, src = hl.run_origin_gib(6.44, floor_rec)
-        self.assertAlmostEqual(origin, 9.9, places=6)
-        self.assertIn(hl.RUN_ORIGIN_RATCHET_MARKER, src)
-        arm = _priced(_ratchet(3.161))
-        arm.terms["run_origin_gib"] = origin
-        arm.terms["run_origin_source"] = src
-        with self.assertRaises(hl.Weg2HostRatchetDoubleCharged) as cm:
-            arm.predicted_run_peak_gib()
-        self.assertIn("W95", str(cm.exception))
+        self.assertAlmostEqual(origin, 6.44, places=6)
+        self.assertIn("REJECTED: interleaved", src)
 
     def test_a_pre_1350_record_is_covered_by_its_interleaved_flag(self):
         """The record that WINS the max() today has no epoch stamp.
@@ -375,15 +378,14 @@ class NoDoubleCount1350(CustomTestCase):
             "run_residual_gib": 7.49, "interleaved": True,
             "arm": {"s_gb": 1, "m_mib": 150},
         }}
+        # #1350e SUPERSEDES the refusal this test first pinned: the mid-flip
+        # sample is now REJECTED in favour of the launch reading, which is the
+        # correction rather than the refusal. `interleaved` is still the fact
+        # that identifies it, which is what this test now pins.
         origin, src = hl.run_origin_gib(6.44, floor_rec)
-        self.assertAlmostEqual(origin, 7.49, places=6)
-        self.assertIn(hl.RUN_ORIGIN_RATCHET_MARKER, src)
-        self.assertIn("pre-#1350 record", src)
-        arm = _priced(_ratchet(4.049))
-        arm.terms["run_origin_gib"] = origin
-        arm.terms["run_origin_source"] = src
-        with self.assertRaises(hl.Weg2HostRatchetDoubleCharged):
-            arm.predicted_run_peak_gib()
+        self.assertAlmostEqual(origin, 6.44, places=6)
+        self.assertIn("REJECTED: interleaved", src)
+        self.assertIn("7.49", src)
 
     def test_the_launchers_own_uninterleaved_sample_is_not_marked(self):
         """P's first sleep happens before any flip: interleaved=False."""
@@ -423,6 +425,80 @@ class NoDoubleCount1350(CustomTestCase):
         self.assertEqual(correction, 0.0)
 
 
+class OriginAndResidualCorrections1350e(CustomTestCase):
+    """#1350e: the two terms that were measurably double-booked."""
+
+    def test_a_mid_flip_run_moment_sample_is_rejected_in_favour_of_the_launch_reading(self):
+        """weg2xsn24's floor 7.49 GiB was taken 3 s before its FLIP done epoch=2."""
+        rec = {"P": {"group": "P", "at": "2026-09-12T19:44:31Z",
+                     "boot_tag": "weg2xsn24", "commit": "bfb5e121e7",
+                     "rss_shmem_gib": 49.56, "run_residual_gib": 7.49,
+                     "interleaved": True, "arm": {"s_gb": 1, "m_mib": 150}}}
+        origin, src = hl.run_origin_gib(6.44, rec)
+        self.assertAlmostEqual(origin, 6.44, places=6)
+        self.assertIn("source=launch", src)
+        self.assertIn("7.49", src)
+        self.assertIn("REJECTED: interleaved", src)
+        # ...and W95 no longer fires, because the origin no longer carries it.
+        self.assertNotIn(hl.RUN_ORIGIN_RATCHET_MARKER, src)
+        arm = _priced(_ratchet(4.049))
+        arm.terms["run_origin_gib"] = origin
+        arm.terms["run_origin_source"] = src
+        self.assertIsNotNone(arm.predicted_run_peak_gib())
+
+    def test_a_rejected_sample_never_promotes_the_dk7_stand_in(self):
+        """The stand-in answers 'no record at all', not 'the record was refused'
+        -- and at 24.50 GiB it would be a WORSE origin than the 7.49 refused."""
+        rec = {"P": {"group": "P", "at": "t", "boot_tag": "b", "commit": "c",
+                     "rss_shmem_gib": 49.5, "run_residual_gib": 7.49,
+                     "interleaved": True, "arm": {"s_gb": 1, "m_mib": 150}}}
+        origin, src = hl.run_origin_gib(6.44, rec)
+        self.assertLess(origin, hl.dk7_run_residual_gib())
+        self.assertIn("dk7 stand-in is NOT used here", src)
+
+    def test_W95_still_fires_when_there_is_no_launch_reading_to_fall_back_on(self):
+        """The guard is narrowed, not removed."""
+        rec = {"P": {"group": "P", "at": "t", "boot_tag": "b", "commit": "c",
+                     "rss_shmem_gib": 38.6, "run_residual_gib": 9.9,
+                     "interleaved": True, "arm": {"s_gb": 1, "m_mib": 600}}}
+        origin, src = hl.run_origin_gib(9.0, rec)  # launch BELOW -> floor wins
+        self.assertAlmostEqual(origin, 9.0, places=6)
+        self.assertIn("REJECTED: interleaved", src)
+        # with no cgroup reading at all there is no origin and no prediction
+        self.assertIsNone(hl.run_origin_gib(None, rec)[0])
+
+    def test_the_ratchet_priced_residual_is_the_five_replays_plus_its_own_drift(self):
+        m = hl.resolve_margin(flip_ratchet_charged_gib=4.05, window_min=90.0)
+        self.assertAlmostEqual(
+            m.residual_gib,
+            0.908 + hl.RATCHET_RESIDUAL_DRIFT_MIB_PER_MIN * 90.0 / 1024.0,
+            places=6)
+        self.assertIn("RATCHET-PRICED", m.residual_source)
+        self.assertIn("weg2sb4", m.residual_source)      # named as NOT used
+        self.assertIn("DELIBERATELY NOT USED", m.residual_source)
+        w = hl.OBSERVED_REAP_NONRECLAIM_BYTES / GIB
+        self.assertAlmostEqual(w - m.boot_total_gib, 94.43, places=2)
+
+    def test_the_pre_ratchet_row_still_binds_an_unratcheted_arm(self):
+        m = hl.resolve_margin()
+        self.assertAlmostEqual(m.residual_gib, 5.16, places=6)
+        self.assertAlmostEqual(
+            hl.OBSERVED_REAP_NONRECLAIM_BYTES / GIB - m.boot_total_gib,
+            87.30, places=2)
+
+    def test_the_replay_under_the_new_residual_rule(self):
+        """All five measured residuals sit at or below the charged one."""
+        binding = max(hl.RUN_PEAK_RESIDUAL_RATCHET_GIB.values())
+        self.assertAlmostEqual(binding, 0.908, places=3)
+        for tag, _m, predicted, peak, _o, pair, _b in REPLAY:
+            with self.subTest(boot=tag):
+                self.assertLessEqual(peak - (predicted + pair), binding + 1e-9)
+
+    def test_summing_both_residual_rules_is_still_refused(self):
+        with self.assertRaises(hl.Weg2HostRatchetDoubleCharged):
+            hl.resolve_margin(residual_gib=5.16, flip_ratchet_charged_gib=4.05)
+
+
 class ArmLineFields1350(CustomTestCase):
     """(6) The four fields #1350 requires, on the ARM line."""
 
@@ -443,8 +519,8 @@ class ArmLineFields1350(CustomTestCase):
             self.assertIn("ratchet_charged=3.16", ln)
             self.assertIn("source=", ln)
             # (4): the analysis's honest bound, with its condition attached.
-            self.assertIn("87.30 -> 90.18", ln)
-            self.assertIn("HONEST LIMIT", ln)
+            self.assertIn("87.30 -> 94.43", ln)
+            self.assertIn("FUNDING", ln)
 
     def test_an_unpriced_arm_prints_absent_not_zero(self):
         lines = _choose_lines(None)

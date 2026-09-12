@@ -182,10 +182,18 @@ class RingNeedGuard:
         clock: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], None] = time.sleep,
         log: Optional[logging.Logger] = None,
+        # #1350d: WHICH LEG THIS SAMPLE BELONGS TO. Without it the NEED series
+        # of a boot cannot be summed "per sleep leg" at all -- measured on
+        # weg2xsn24, whose 60 P-lines and 30 D-lines carry no epoch and no
+        # direction, so the per-card sums double-count across legs and are
+        # useless as an image size. Set by the caller that opens the leg
+        # (`set_leg`); "unknown" until it is, and printed either way.
+        leg: str = "",
     ) -> None:
         self.card_uuid = card_uuid or "unknown"
         self.group = group
         self.rank = rank
+        self.leg = str(leg or "unknown")
         self.stall_probe_s = float(stall_probe_s)
         self.slice_s = float(slice_s)
         self.max_wait_s = float(max_wait_s)
@@ -216,6 +224,16 @@ class RingNeedGuard:
 
     # -- the instrument -----------------------------------------------------
 
+    def set_leg(self, epoch: object, src: str = "", dst: str = "") -> str:
+        """#1350d: name the leg every following NEED line belongs to.
+
+        ``leg=<epoch>/<src>-><dst>``.  Called once by whoever opens a leg; the
+        guard never derives it, because deriving a leg identity from a counter
+        this class owns would be a second bookkeeping beside the front's epoch.
+        """
+        self.leg = f"{epoch}/{src or '?'}->{dst or '?'}"
+        return self.leg
+
     def record(self, tag: str, need_mib_: int, free_mib_: int) -> RingNeedSample:
         """Append one sample and emit its ``WEG2-RING NEED`` line."""
         sample = RingNeedSample(
@@ -233,16 +251,16 @@ class RingNeedGuard:
         # series it exists to make readable.
         if self._explained:
             self._log.info(
-                "WEG2-RING NEED tag=%s card=%s need_mib=%d free_mib=%d "
+                "WEG2-RING NEED tag=%s card=%s leg=%s need_mib=%d free_mib=%d "
                 "delta_mib=%d (group=%s rank=%d; fields defined on this leg's "
                 "first WEG2-RING NEED line)",
-                tag, self.card_uuid, sample.need_mib, sample.free_mib,
+                tag, self.card_uuid, self.leg, sample.need_mib, sample.free_mib,
                 sample.delta_mib, self.group or "?", self.rank,
             )
             return sample
         self._explained = True
         self._log.info(
-            "WEG2-RING NEED tag=%s card=%s need_mib=%d free_mib=%d delta_mib=%d "
+            "WEG2-RING NEED tag=%s card=%s leg=%s need_mib=%d free_mib=%d delta_mib=%d "
             "(group=%s rank=%d; need is THIS tag's bytes rounded up to the ring's "
             "%d MiB granule -- a LOWER bound, because the ring rounds per "
             "ALLOCATION and a tag is many; free is granules_free x granule read "
@@ -251,8 +269,8 @@ class RingNeedGuard:
             "has to release, and a positive delta is NORMAL under the "
             "interleaved leg form -- it is a delta that stops SHRINKING that is "
             "the fault, which is what W51 tests)",
-            tag, self.card_uuid, sample.need_mib, sample.free_mib, sample.delta_mib,
-            self.group or "?", self.rank, self.granule_bytes // MIB,
+            tag, self.card_uuid, self.leg, sample.need_mib, sample.free_mib,
+            sample.delta_mib, self.group or "?", self.rank, self.granule_bytes // MIB,
         )
         return sample
 
@@ -295,12 +313,23 @@ class RingNeedGuard:
         stats = stats_fn()
         free = self._free_mib(stats)
         if free is None:
+            # #1350d: NOT-APPLICABLE, NOT `need_mib=0`. On the `exchange` arm
+            # there is no ring, and a 0 here is indistinguishable from "this tag
+            # has nothing to save" -- measured on weg2xsn24, where 32 of group
+            # P's 60 NEED lines read `need_mib=0` for that reason alone and
+            # would have sized an anchor at half the P group. The SAVED BYTES
+            # are printed instead, under their own field name, so the line is
+            # still a measurement of the tag and never of the ring.
             self._log.info(
-                "WEG2-RING NEED tag=%s card=%s need_mib=%d free_mib=n/a delta_mib=n/a "
+                "WEG2-RING NEED tag=%s card=%s leg=%s need_mib=NOT-APPLICABLE "
+                "saved_mib=%d free_mib=n/a delta_mib=n/a "
                 "-- no host ring published on this boot (ring_stats() returned no "
                 "counters), so there is no free reading to compare against and the "
-                "guard stands down; this is an ABSENCE, never a zero",
-                tag, self.card_uuid, need_mib(tag_bytes, self.granule_bytes),
+                "guard stands down; this is an ABSENCE, never a zero. `saved_mib` "
+                "is THIS tag's own bytes and IS a measurement -- it is what the leg "
+                "puts away for this tag whether or not a ring exists",
+                tag, self.card_uuid, self.leg,
+                int(tag_bytes) // MIB,
             )
             return
 
