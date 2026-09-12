@@ -3466,6 +3466,7 @@ def prepare_xchg_env(log: Log, boot_nonce: str, weight_source: str,
                        weight_exchange_transport.ONCARD_SLOT_MIB_DEFAULT,
                        bounce_terms: Optional[xchg_bounce.BounceTerms] = None,
                        inject_mode: str = weight_exchange.INJECT_SHADOW,
+                       legs: str = weight_exchange.LEGS_BOTH,
                        waves: Optional[Sequence[Sequence[str]]] = None,
                        ) -> Dict[str, str]:
     """#1273 S5/S6: arm the region for EVERY non-default arm and publish it.
@@ -3547,6 +3548,14 @@ def prepare_xchg_env(log: Log, boot_nonce: str, weight_source: str,
     # launched with would either serve ungraded bytes or silently keep paying
     # for a refill nobody reads.
     env[weight_exchange.INJECT_ENV] = str(inject_mode)
+    # #1330 B4n: THE DIRECTION KNOB, published by the same mechanism and for
+    # the same reason as the arm and the inject mode.  It decides WHICH legs a
+    # rank runs at all, so a rank that read a different answer than the boot
+    # was launched with would either run a direction the boot did not ask for
+    # or silently skip one it did -- and a skipped leg looks in a log exactly
+    # like a leg that ran clean, which is the shape four boots of this campaign
+    # were unreadable for.
+    env[weight_exchange.XCHG_LEGS_ENV] = str(legs)
     # B4d: THE PRICED WAVE PARTITION, published by the same channel and for a
     # sharper version of the same reason.  A rank cannot derive this one at
     # all: a chunk tag is a LAYER BAND, so the map needs the layer count of
@@ -4301,7 +4310,13 @@ def build_env(tree: str, venv: str, cvd: str, store_dir: str, debug_hold: bool, 
                 # it would turn an instrument into a performance regression
                 # nobody asked for.  Popped first, set below only when the
                 # flag is on.
-                seam_digest.ENV_ARM):
+                seam_digest.ENV_ARM,
+                # #1330 B4n: the direction knob is launcher OUTPUT for the
+                # sharpest version of this reason -- an inherited
+                # ``SGLANG_WEG2_XCHG_LEGS=pp_to_tp`` would SILENTLY REMOVE
+                # half the legs of a boot that asked for both, and a skipped
+                # leg reads in a log exactly like a leg that ran clean.
+                weight_exchange.XCHG_LEGS_ENV):
         env.pop(key, None)
     # #1350: armed ONLY by ``--weg2-seam-digest``, and on any weight-source
     # arm -- the grader asks "did the round trip return my bytes", which is a
@@ -8657,6 +8672,23 @@ def build_parser() -> argparse.ArgumentParser:
              "--weg2-weight-source ring",
     )
     ap.add_argument(
+        "--weg2-xchg-legs", choices=list(weight_exchange.XCHG_LEGS_CHOICES),
+        default=weight_exchange.LEGS_BOTH,
+        help="#1330 B4n. WHICH DIRECTION's exchange legs run. 'both' (the "
+             "default) is byte-identical to the behaviour before this flag "
+             "existed. 'pp_to_tp' runs only the legs whose SOURCE is group P "
+             "-- TP layers assembled out of the PP layout's card bytes, which "
+             "is the first direction to be graded on metal against the host "
+             "copy still in system RAM; 'tp_to_pp' is its mirror. A leg of "
+             "the other direction is skipped BY NAME: every skip prints "
+             "WEG2-XCHG-LEGS legs_skipped=<n> reason=direction-knob with both "
+             "the leg's direction and the armed one, because a silently "
+             "skipped leg reads in a log exactly like a leg that ran clean. "
+             "Published to both groups so the directions a rank runs and the "
+             "ones the boot was launched for cannot diverge. Ignored on "
+             "--weg2-weight-source ring",
+    )
+    ap.add_argument(
         "--weg2-shadow-hop-bound-ms", type=float,
         default=weight_exchange_shadow.SHADOW_HOP_BOUND_MS_DEFAULT,
         help="#1273 S5b: the wall the SHADOW is allowed to price its on-card "
@@ -9806,6 +9838,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                                   oncard_slot_mib=ns.weg2_xchg_oncard_slot_mib,
                                   bounce_terms=bounce_terms_for_ranks,
                                   inject_mode=ns.weg2_xchg_inject,
+                                  legs=ns.weg2_xchg_legs,
                                   # B4d: the partition W71 PRICED, not a second
                                   # derivation of it -- `xchg_res` is the solved
                                   # table and carries the census's own list.

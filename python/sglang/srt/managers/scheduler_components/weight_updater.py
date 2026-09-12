@@ -2340,6 +2340,7 @@ class SchedulerWeightUpdaterManager:
                 wlc.arm(group=self._weg2_group_name(), rank=self._weg2_rank())
             if not sh.bounce_lane_armed():
                 return
+            from sglang.srt.weg2 import weight_exchange as wx_legs
             from sglang.srt.weg2 import weight_exchange_region as xr
 
             group = self._weg2_group_name()
@@ -2362,6 +2363,28 @@ class SchedulerWeightUpdaterManager:
                     detail=f"hook={hook} group={group} rank={rank} -- the "
                            f"rank's own index inside its Weg-2 group is what "
                            f"xr.rank_row keys the six gate rows by"))
+                return
+            # #1330 B4n: THE DIRECTION KNOB, and it is checked HERE -- after
+            # the identity is known (the direction is a function of hook AND
+            # group) and BEFORE any device, region or semaphore is opened, so
+            # a skipped direction costs the leg nothing at all.
+            #
+            # THE SKIP IS NAMED.  A direction that is off prints its count, its
+            # reason and BOTH directions; silence is what made four boots of
+            # this campaign unreadable, and a skipped leg reads in a log
+            # exactly like a leg that ran clean.  Under the default `both` this
+            # branch is never taken and the leg is byte-identical.
+            #
+            # THE COUNTER IS THE MODULE'S, NOT THIS OBJECT'S.  The mixin is a
+            # `slots=True` dataclass: `self._weg2_legs_skipped = ...` would
+            # raise AttributeError inside the flip leg -- which is #1329's own
+            # shape, a first write that raised on a slots dataclass and cost
+            # three boots.  `weight_exchange` keeps the cumulative count beside
+            # the pointer-profile legs, for the same reason it keeps those.
+            if not wx_legs.leg_enabled(str(hook), str(group)):
+                logger.info("%s", wx_legs.legs_skipped_line(
+                    wx_legs.record_leg_skipped(),
+                    hook=str(hook), group=str(group)))
                 return
             device = self._weg2_device_index()
             if device < 0:
