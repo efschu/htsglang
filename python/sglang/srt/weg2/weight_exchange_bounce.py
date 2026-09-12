@@ -789,20 +789,28 @@ def _missing_pointer(descs: Sequence[object],
     return None
 
 
-class Weg2XchgBouncePhaseUnordered(RuntimeError):
-    """W68's class: a collect that would read a slot no deposit has filled.
-
-    THE DANGER DIRECTION OF THE PHASE SPLIT, named rather than discovered.
-    Reading a slot before its producer posted ``full`` returns whatever the
-    previous band left there -- the destination would then be served plausible
-    bytes from the WRONG layer, with every counter green.  That is silent
-    corruption, and it is strictly worse than any refusal, so the collect
-    verifies the handshake BEFORE its first copy and refuses by name.
-
-    Same reasoning as ``run_consumer_pair``'s short-piece check
-    (``weight_exchange_transport.py:1754``: *"raises W70 and issues
-    NOTHING"*) -- this is that rule applied to the bounce's own slots.
-    """
+#: THE PHASE-ORDERING REFUSAL IS W68's, AND IT GETS NO NAME OF ITS OWN.
+#:
+#: A first draft declared ``Weg2XchgBouncePhaseUnordered(RuntimeError)`` and
+#: wrote ``W68 Weg2XchgPlanDisagree:`` into its messages.
+#: ``test_weg2_wcode_uniqueness_1263`` caught it immediately --
+#: ``{'W68': {'Weg2XchgBouncePhaseUnordered', 'Weg2XchgPlanDisagree'}}`` -- and
+#: it was right: the census reads the MESSAGE TEXT (``ASSIGNMENT`` at :96), so
+#: a second name beside a code is a collision whether or not a class exists.
+#: The plan record's rule stands (no new W-code; W23/W39 stay free), and this
+#: condition IS W68's own sentence: the two ends disagree about what is in the
+#: slot.  The alias keeps the call site readable without minting a second
+#: holder.
+#:
+#: THE DANGER DIRECTION IT NAMES, kept here because the alias has no docstring:
+#: reading a slot before its producer posted ``full`` returns whatever the
+#: previous band left there -- the destination is then served plausible bytes
+#: from the WRONG layer, with every counter green.  That is silent corruption
+#: and strictly worse than any refusal, so the collect verifies the handshake
+#: BEFORE its first copy.  Same reasoning as ``run_consumer_pair``'s
+#: short-piece check (``weight_exchange_transport.py:1754``: *"raises W70 and
+#: issues NOTHING"*), applied to the bounce's own slots.
+Weg2XchgBouncePhaseUnordered = wx.Weg2XchgPlanDisagree
 
 
 def _require_rendezvous(phase: str, rendezvous) -> None:
@@ -816,7 +824,7 @@ def _require_rendezvous(phase: str, rendezvous) -> None:
         return
     if rendezvous is None:
         raise Weg2XchgBouncePhaseUnordered(
-            f"W68 Weg2XchgBouncePhaseUnordered: phase={phase} needs a slot "
+            f"W68 Weg2XchgPlanDisagree: phase={phase} needs a slot "
             f"handshake and none was given. The depositing and collecting "
             f"ranks are different processes sharing a host slot; running "
             f"either without the empty/full protocol would let a collect read "
@@ -1025,14 +1033,14 @@ def run_bounce_leg(
                                                       seq=int(batch.seq))
                         if filled is None:
                             raise Weg2XchgBouncePhaseUnordered(
-                                f"W68 Weg2XchgBouncePhaseUnordered: slot="
+                                f"W68 Weg2XchgPlanDisagree: slot="
                                 f"{slot} seq={batch.seq} was not posted full "
                                 f"by any depositing rank, so this collect "
                                 f"would read whatever the previous band left "
                                 f"there. Issuing NOTHING.")
                         if int(filled) != int(batch.total_bytes):
                             raise Weg2XchgBouncePhaseUnordered(
-                                f"W68 Weg2XchgBouncePhaseUnordered: slot="
+                                f"W68 Weg2XchgPlanDisagree: slot="
                                 f"{slot} seq={batch.seq} carries "
                                 f"{int(filled)} bytes and this rank's own "
                                 f"derivation of the same band is "
