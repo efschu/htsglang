@@ -47,6 +47,25 @@ from test_weg2_xchg_transport_1273 import FakeDeviceOps  # noqa: E402
 TAG = "weights_0"
 SLOT = 1 << 16
 
+#: PID-SCOPED, and #1344's argument is the whole reason: a bounce keyed on a
+#: fixed literal writes /dev/shm/weg2-xchg-<literal>, which no per-test cleanup
+#: can claim ownership of and which survives the run.  The name IS the proof of
+#: ownership, so it carries this interpreter's pid and the autouse fixture
+#: below can sweep it without a holder check.
+NONCE = f"phz{os.getpid()}"
+
+
+@pytest.fixture(autouse=True)
+def _sweep_own_shm():
+    """Remove THIS interpreter's bounce residue, and only ever its own."""
+    yield
+    import shutil
+
+    for name in os.listdir("/dev/shm"):
+        if name == f"weg2-xchg-{NONCE}" or name.startswith(
+                f"weg2-xchg-{NONCE}-"):
+            shutil.rmtree(os.path.join("/dev/shm", name), ignore_errors=True)
+
 
 class _Rendezvous:
     """The empty/full handshake, as a double that CAN be driven out of order.
@@ -124,7 +143,7 @@ def test_the_default_phase_is_both_so_the_unsplit_form_is_unchanged():
 
 def test_an_unknown_phase_refuses_rather_than_defaulting():
     with pytest.raises(ValueError) as exc:
-        wb.run_bounce_leg([], ops=None, boot_nonce="pin", slot_bytes=SLOT,
+        wb.run_bounce_leg([], ops=None, boot_nonce=NONCE, slot_bytes=SLOT,
                           depth=1, phase="deposit-ish")
     assert "unknown bounce phase" in str(exc.value)
 
@@ -133,13 +152,13 @@ def test_a_phased_leg_without_a_handshake_is_refused():
     """M2's sibling: running a phase optimistically IS the unordered read."""
     for phase in (wb.PHASE_DEPOSIT, wb.PHASE_COLLECT):
         with pytest.raises(wb.Weg2XchgBouncePhaseUnordered) as exc:
-            wb.run_bounce_leg([_d(0x1000, 0x2000)], ops=None, boot_nonce="pin",
+            wb.run_bounce_leg([_d(0x1000, 0x2000)], ops=None, boot_nonce=NONCE,
                               slot_bytes=SLOT, depth=1, phase=phase,
                               rendezvous=None)
         assert "W68" in str(exc.value)
     # `both` needs none and gets past the guard (it fails later, on ops=None).
     with pytest.raises(Exception) as exc:
-        wb.run_bounce_leg([_d(0x1000, 0x2000)], ops=None, boot_nonce="pin",
+        wb.run_bounce_leg([_d(0x1000, 0x2000)], ops=None, boot_nonce=NONCE,
                           slot_bytes=SLOT, depth=1, phase=wb.PHASE_BOTH)
     assert not isinstance(exc.value, wb.Weg2XchgBouncePhaseUnordered)
 
