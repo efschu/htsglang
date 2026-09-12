@@ -2277,8 +2277,56 @@ class Front:
             drift_mib_per_min=self._observed_anon_drift_mib_per_min
         )
         logger.info("%s", host_ledger.watermark_provenance(margin))
+        # #1361 THE RATE LATCH RIDES THIS LOOP, and it had to: boot weg2xsn26b
+        # was killed by the GLOBAL host OOM killer while the LEVEL verdict below
+        # never fired, because at its cadence the last reading before the blind
+        # window was 82.28 GiB and the climb covered the remaining 13.6 GiB in
+        # 4-6 s (measured 2.4-3.3 GiB/s). The level test asks "are we there
+        # yet"; this one asks "will we be there before we can look again", and
+        # it runs on the SAME clock so `gaps_seen` counts THIS loop's own
+        # blindness, not another sampler's. A built-but-unwired guard is the
+        # #464 / #1017 class; the ratchet on that is
+        # `test_the_guard_loop_constructs_the_rate_latch`.
+        rate_latch = host_ledger.RateLatch(
+            reap_mark_gib=host_ledger.OBSERVED_REAP_NONRECLAIM_BYTES / host_ledger.GIB
+        )
+        # #1361: the latch is only useful FASTER than the level test. 0.5 s is
+        # the slow end of the ordered 200-500 ms band and still ten times the
+        # cadence that went blind; the level verdict keeps its own period, so
+        # nothing about W22 changes.
+        rate_period_s = min(0.5, float(self.host_watermark_period_s))
+        _level_due = 0.0
         while True:
             try:
+                # #1361: the FAST half, every tick. `read_cgroup_pressure` is
+                # two small /sys reads; it is what the latch is fed and what the
+                # level test below reuses, so the two can never disagree about
+                # the reading they graded.
+                _pr_fast = host_ledger.read_cgroup_pressure()
+                _nr = _pr_fast.get("nonreclaim_gib")
+                if _nr is not None:
+                    _line = rate_latch.observe(time.time(), float(_nr))
+                    if _line is not None and "RATE-GAP" in _line:
+                        # Blindness is a finding, never silence -- but it is not
+                        # a teardown: the loop kept running, it just could not
+                        # look. #1361.
+                        self.counters["host_rate_gap"] += 1
+                        logger.warning("%s", _line)
+                    elif _line is not None:
+                        self.counters["host_rate_latch"] += 1
+                        logger.error("%s", _line)
+                        # SAME NAMED TEARDOWN PATH AS W22. The projection is a
+                        # different question from the level, but the answer to
+                        # both is the controlled teardown the user ordered on
+                        # 2026-09-08 -- never a kernel kill, never a silent
+                        # restart, never "accept the risk".
+                        self.do_stop("W98 Weg2HostRateLatched", _line)
+                        return
+                _now = time.time()
+                if _now < _level_due:
+                    await asyncio.sleep(rate_period_s)
+                    continue
+                _level_due = _now + float(self.host_watermark_period_s)
                 cg = host_ledger.read_cgroup()
                 current = (cg or {}).get("current")
                 if current:
@@ -2312,7 +2360,9 @@ class Front:
                         return
             except Exception:  # noqa: BLE001 - a guard may never kill the front
                 logger.exception("host_watermark_sampler")
-            await asyncio.sleep(self.host_watermark_period_s)
+            # #1361: the loop now ticks at the LATCH's cadence; the level test
+            # gates itself on `_level_due`, so W22's own period is unchanged.
+            await asyncio.sleep(rate_period_s)
 
     def do_stop(self, name: str, detail: str) -> None:
         if self.state == "STOP":
