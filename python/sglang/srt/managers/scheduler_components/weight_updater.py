@@ -2601,22 +2601,72 @@ class SchedulerWeightUpdaterManager:
     # =======================================================================
 
     def _weg2_seam_inventory(self):
-        """This card's pieces as ``([(ParamGeom, tensor), ...], reason)``.
+        """This card's pieces: ``(inventory, skipped, walked, reason)``.
 
         Delegated to ``weight_exchange_shadow.card_inventory``, which is the
         tree's ONE producer of a card's placement.  The grader deliberately
         does not walk ``named_parameters()`` itself: placement is decided by
         the loader at boot and already published, and a second inventory here
         would be second bookkeeping beside it (operator direction 2026-09-12).
+
+        BOTH RUNNERS, not just the target model (#1350 F2 / review R4).  The
+        MTP/NEXTN draft shard is flipped like every other layer since B4k
+        (``weg2_memory_saver.weights_family_tags`` puts ``weights_draft``
+        between the chunks and the base tag), so its bytes are bytes the
+        EXCHANGE MOVES -- 1440/1280/1280 MiB on D's three ranks.  Grading the
+        target model alone meant those bytes carried no verdict while the line
+        said MATCH, and the only thing naming the gap was a word in the
+        population prose.  The draft runner is walked through the SAME producer
+        under its own region tag, so it is one walk, not a second inventory.
         """
         try:
+            from sglang.srt.managers.weg2_memory_saver import (
+                GPU_MEMORY_TYPE_WEIGHTS_DRAFT,
+            )
             from sglang.srt.weg2 import weight_exchange_shadow as shadow
 
+            rank = self._weg2_rank()
             runner = getattr(self.tp_worker, "model_runner", None)
             model = getattr(runner, "model", None)
-            return shadow.card_inventory(rank=self._weg2_rank(), model=model)
-        except BaseException as exc:  # noqa: BLE001 -- an observer's unwind
-            return None, f"inventory-failed:{type(exc).__name__}:{exc}"
+            inv, skipped, walked, reason = shadow.card_inventory(
+                rank=rank, model=model
+            )
+            if inv is None:
+                return None, skipped, walked, reason
+            draft_runner = _get_draft_model_runner(self.draft_worker)
+            draft_model = getattr(draft_runner, "model", None)
+            # ONLY WHERE THE DRAFT IS ACTUALLY A FAMILY MEMBER.  Under the
+            # `exchange` arm `weights_draft` joins the family and is flipped as
+            # its own member (B4k), which is what makes it gradable here.  Under
+            # `ring` the drafter never receives its own tag -- it is paused as
+            # part of the base tag and travels the host ring -- and forcing a
+            # region tag on it would be the region-blind reading
+            # `tag_of_parameter_name` warns about, i.e. a census over a family
+            # tag that does not exist on that arm.  So on `ring` it is a NAMED
+            # skip with its reason, never a silent omission and never a
+            # mis-tagged grade.
+            from sglang.srt.managers.weg2_memory_saver import draft_tag_in_family
+
+            if draft_model is not None and not draft_tag_in_family():
+                skipped = list(skipped) + [
+                    ("<draft-runner>", "not-in-family-on-this-arm")
+                ]
+            elif draft_model is not None:
+                d_inv, d_skipped, d_walked, d_reason = shadow.card_inventory(
+                    rank=rank, model=draft_model,
+                    region_tag=GPU_MEMORY_TYPE_WEIGHTS_DRAFT,
+                )
+                walked += d_walked
+                skipped = list(skipped) + list(d_skipped)
+                if d_inv:
+                    inv = list(inv) + list(d_inv)
+                else:
+                    # A draft runner the producer cannot walk is NAMED, never
+                    # dropped: its bytes move either way.
+                    skipped.append(("<draft-runner>", d_reason or "no-inventory"))
+            return inv, skipped, walked, ""
+        except Exception as exc:  # noqa: BLE001 -- an observer never raises
+            return None, [], 0, f"inventory-failed:{type(exc).__name__}:{exc}"
 
     def _weg2_seam_digest_before(self, recv_req, weights_tags) -> None:
         """THE PRE-PAUSE READING.  At the last instant the pages are mapped.
@@ -2638,7 +2688,7 @@ class SchedulerWeightUpdaterManager:
         # launcher intended and what this process resolved are two facts, and
         # only the second one decides what the flip does.
         seam_digest.announce_once(logger.info)
-        inventory, reason = self._weg2_seam_inventory()
+        inventory, skipped, walked, reason = self._weg2_seam_inventory()
         if inventory is None:
             self.weg2_seam_before = None
             logger.info(
@@ -2660,6 +2710,8 @@ class SchedulerWeightUpdaterManager:
             card=self._weg2_device_index(),
             tags=weights_tags,
             epoch=getattr(recv_req, "epoch", None),
+            skipped=skipped,
+            walked=walked,
         )
         self.weg2_seam_before = reading
         logger.info("%s", reading.line())
@@ -2689,7 +2741,7 @@ class SchedulerWeightUpdaterManager:
         group = self._weg2_group_name()
         rank = self._weg2_rank()
         card = self._weg2_device_index()
-        inventory, reason = self._weg2_seam_inventory()
+        inventory, skipped, walked, reason = self._weg2_seam_inventory()
         if inventory is None:
             logger.info(
                 "%s",
@@ -2707,6 +2759,8 @@ class SchedulerWeightUpdaterManager:
             card=card,
             tags=weights_tags,
             epoch=getattr(recv_req, "epoch", None),
+            skipped=skipped,
+            walked=walked,
         )
         logger.info("%s", after.line())
         verdict = seam_digest.compare(before, after)

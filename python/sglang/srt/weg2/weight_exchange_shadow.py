@@ -2940,7 +2940,14 @@ def card_inventory(
     family_tags: Optional[Callable[[int], Sequence[str]]] = None,
     tag_of: Optional[Callable[..., str]] = None,
 ):
-    """This card's PLACEMENT inventory as ``([(ParamGeom, tensor), ...], reason)``.
+    """This card's PLACEMENT inventory.
+
+    ``(inventory, skipped, walked, reason)`` -- ``inventory`` is
+    ``[(ParamGeom, tensor), ...]``, ``skipped`` is ``[(name, reason), ...]``,
+    ``walked`` is every parameter the walk looked at.  The last three are
+    #1350 F2: the grader must be able to PRINT what it did not grade, and a
+    count the reader cannot reconcile with the family is how a shrunken
+    population reads as a clean MATCH.
 
     ONE PRODUCER of a card's placement, extracted from
     :func:`derive_card_manifest` (#1350) rather than copied beside it.  Both
@@ -2970,32 +2977,49 @@ def card_inventory(
     tag_of = tag_of or wx.tag_of_parameter_name
     region_tag = region_tag or wx.GPU_MEMORY_TYPE_WEIGHTS
     if model is None:
-        return None, "no-model"
+        return None, [], 0, "no-model"
     chunk_layers, chunk_count = chunk_geometry()
     if int(chunk_layers) <= 0 or int(chunk_count) <= 0:
-        return None, (f"no-ring-layout:weight_chunk_geometry()="
-                      f"({chunk_layers}, {chunk_count})")
+        return None, [], 0, (f"no-ring-layout:weight_chunk_geometry()="
+                             f"({chunk_layers}, {chunk_count})")
     family = tuple(str(t) for t in family_tags(int(chunk_count)))
     inventory = []
+    skipped = []
+    walked = 0
     for name, param in model.named_parameters():
+        walked += 1
         tag = str(tag_of(str(name), region_tag=region_tag))
         if not ms.is_weights_family_tag(tag):
+            # Not a skip of a FAMILY piece: this parameter is outside the
+            # weights family entirely. Counted in `walked`, named here so the
+            # two exclusions can be told apart by a reader.
+            skipped.append((str(name), f"not-weights-family:{tag}"))
             continue
         if tag not in family:
-            return None, f"tag-not-in-family:{name} tag={tag}"
+            return None, [], walked, f"tag-not-in-family:{name} tag={tag}"
         try:
             geom = wx.ParamGeom.of(param, name=str(name), tag=tag,
                                    shard_axis=wx.REPLICATED, shard_total=0,
                                    stage=int(rank))
-        except BaseException:  # noqa: BLE001 -- a shape this plan cannot name
+        except BaseException as exc:  # noqa: BLE001 -- a shape this plan cannot name
             # THE SAME SKIP RULE AS THE PLAN'S, deliberately: a parameter the
             # plan cannot describe must not be in the manifest either, or the
             # pair would agree on a piece one end can never move.
+            #
+            # #1350 F2: the skip is now REPORTED rather than swallowed. The
+            # plan path has always printed `undescribed=`; the grader path
+            # printed nothing, so a piece that vanished here took its bytes out
+            # of a MATCH with no number anywhere to bound the loss.
+            reason = "undescribable"
+            text = str(exc)
+            if "W68" in text:
+                reason = "undescribable-W68"
+            skipped.append((str(name), reason))
             continue
         inventory.append((geom, param))
     if not inventory:
-        return None, f"no-carried-tags:family={family}"
-    return inventory, ""
+        return None, skipped, walked, f"no-carried-tags:family={family}"
+    return inventory, skipped, walked, ""
 
 
 def derive_card_manifest(
@@ -3022,7 +3046,7 @@ def derive_card_manifest(
     :func:`card_inventory` (#1350), so the grader reads this card's placement
     from the same producer instead of building a second inventory.
     """
-    inventory, reason = card_inventory(
+    inventory, _skipped, _walked, reason = card_inventory(
         rank=rank,
         model=model,
         region_tag=region_tag,

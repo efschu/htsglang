@@ -146,6 +146,7 @@ from dataclasses import dataclass
 from typing import Any, Iterable, List, Optional, Sequence, Tuple
 
 from sglang.srt import knob_resolution as kr
+from sglang.srt.weg2 import _seam_fold as _fold
 
 __all__ = [
     "ARM_FLAG",
@@ -164,7 +165,14 @@ __all__ = [
     "REFUSAL_MARKER",
     "SeamReading",
     "SeamVerdict",
+    "READING_BUDGET_S",
+    "REASON_EMPTY",
+    "REASON_KEY_COLLISION",
     "VERDICT_MATCH",
+    "VERDICT_MATCH_PARTIAL",
+    "W_CODE_BUDGET",
+    "BUDGET_MARKER",
+    "Weg2SeamDigestBudgetExceeded",
     "VERDICT_MISMATCH",
     "VERDICT_UNARMED",
     "W_CODE",
@@ -196,9 +204,33 @@ W_CODE = "W90"
 REFUSAL_NAME = "Weg2SeamDigestMismatch"
 REFUSAL_MARKER = W_CODE + " " + REFUSAL_NAME
 
+#: THE SECOND REFUSAL (#1350 F1).  A reading slower than :data:`READING_BUDGET_S`
+#: is refused BY NAME rather than continued silently.  The review's arithmetic
+#: is the reason: two readings per flip on the scheduler thread, against the
+#: front's 120 s ``drain_deadline_s`` and the 120 s C14 credit budget the
+#: co-located waking rank is fenced on.  A grader that quietly eats that budget
+#: takes the boot down with ``WEG2-FLIP STALL`` and a deadman verdict, with no
+#: byte wrong anywhere -- instrument-lies class A, with the instrument as the
+#: defect.  Failing at the FIRST leg, by name, with the remedy in the message,
+#: is the honest end of that path.
+W_CODE_BUDGET = "W91"
+BUDGET_NAME = "Weg2SeamDigestBudgetExceeded"
+BUDGET_MARKER = W_CODE_BUDGET + " " + BUDGET_NAME
+
+#: Seconds.  Two readings per flip must stay far under the front's 120 s stall
+#: bound AND under the credit budget; 2 s per reading leaves the flip band
+#: readable and still admits a slow card.  It is a BUDGET, not a performance
+#: claim: a reading that needs more than this cannot be subtracted from a flip
+#: measurement honestly.
+READING_BUDGET_S = 2.0
+
 
 class Weg2SeamDigestMismatch(RuntimeError):
     """The pieces that came back are not the pieces that went in."""
+
+
+class Weg2SeamDigestBudgetExceeded(RuntimeError):
+    """The grader itself is too slow to sit inside a flip leg."""
 
 
 # ---------------------------------------------------------------------------
@@ -221,7 +253,7 @@ _TRUTHY = ("1", "true", "yes", "on")
 #: Bounded host buffer per hash step.  A piece is read in blocks and never
 #: assembled into a second image -- re-creating a host-resident weight image
 #: here would reintroduce the exact term #1273 S6-BOUNCE exists to delete.
-DEFAULT_CHUNK_BYTES = 32 << 20
+DEFAULT_CHUNK_BYTES = _fold.DEFAULT_CHUNK_BYTES
 
 #: How many moved pieces the verdict line NAMES before it prints a remainder.
 #: The line is read by a human; an unbounded list would be a log dump, and a
@@ -245,13 +277,32 @@ POPULATION = (
     "covered"
 )
 
+def _now() -> float:
+    """The reading's clock, behind a name so a test can drive the budget.
+
+    A unit test that proved the budget by actually taking two seconds would be
+    a two-second unit test; a monkeypatched clock proves the same branch.
+    """
+    import time
+
+    return time.perf_counter()
+
+
 VERDICT_MATCH = "MATCH"
 VERDICT_MISMATCH = "MISMATCH"
 #: Not a third grade -- the NAMED ABSENCE OF A GRADE.  Never a pass, and it
 #: refuses nothing either: an absence is not a finding in either direction.
 VERDICT_UNARMED = "UNARMED"
 
+#: MATCH over a population the producer could not fully walk.  Not a softer
+#: MATCH -- a DIFFERENT verdict, because "no contradiction in what I graded" and
+#: "the bytes came back" are different claims and the review caught the module
+#: making the second while meaning the first.
+VERDICT_MATCH_PARTIAL = "MATCH-PARTIAL"
+
 REASON_MATCH = "content-identical"
+REASON_EMPTY = "empty-population"
+REASON_KEY_COLLISION = "key-collision"
 REASON_CONTENT = "content-changed"
 REASON_PLACEMENT = "placement-changed"
 REASON_ABSENT = "no-before-reading"
@@ -409,63 +460,52 @@ def identity_of(geom: Any, *, card: int) -> PieceIdentity:
 
 
 # ---------------------------------------------------------------------------
-# The content digest.  CANONICAL ROW-MAJOR BYTES, in bounded blocks.
+# The content digest.  DEVICE-SIDE, POSITION-SENSITIVE, ONE SYNC PER READING.
+# The fold itself lives in ``_seam_fold``; see that module for why a plain sum
+# (``weights_arena.uint8_checksum``) could not be reused and why the word grid
+# is global per piece.  What stays here is the NAMING: a fold result becomes a
+# digest only together with the piece's length and its placement key.
 # ---------------------------------------------------------------------------
-def _canonical_blocks(tensor: Any, chunk_bytes: int):
-    """Yield the piece's logical content as canonical row-major byte blocks.
+def _digest_of(lanes: Tuple[int, int], nbytes: int) -> str:
+    """``(lane0, lane1, nbytes)`` -> the printed digest.
 
-    ``contiguous()`` is what makes this a CONTENT reading rather than a span
-    reading: it materialises the row-major image of the logical values, so a
-    fresh arena, a non-zero storage offset and a padded pitch all produce the
-    SAME bytes -- and, crucially, the pad bytes of a pitched allocation are not
-    in the reading at all.  The slicing keeps the transient bounded: for an
-    already contiguous piece no copy happens, and for a pitched one only one
-    block is ever materialised.
+    blake2b over THREE SMALL INTEGERS, not over the bytes: the expensive fold
+    already happened on the card.  The length is in the pre-image so a
+    truncated piece can never present the whole piece's digest.
     """
-    if tensor.numel() == 0:
-        return
-    if tensor.dim() == 0:
-        yield _block_bytes(tensor.reshape(1))
-        return
-    rows = int(tensor.shape[0])
-    row_elems = max(1, tensor.numel() // max(1, rows))
-    row_bytes = max(1, row_elems * tensor.element_size())
-    rows_per_block = max(1, int(chunk_bytes) // row_bytes)
-    for start in range(0, rows, rows_per_block):
-        yield _block_bytes(tensor[start : start + rows_per_block])
-
-
-def _block_bytes(block: Any):
-    """One block's canonical bytes, as a host buffer hashlib can read.
-
-    ``view(uint8)`` rather than ``numpy()`` on the tensor's own dtype, because
-    this fork's weights are ``bfloat16`` and ``float8_e4m3fn``, neither of which
-    numpy has a dtype for -- and a per-dtype conversion would be a second
-    reading of the same bytes with its own rounding behaviour.  The byte image
-    is hashed exactly as it sits in the canonical row-major layout.
-    """
-    import torch
-
-    host = block.detach().contiguous()
-    if host.device.type != "cpu":
-        host = host.to("cpu")
-    return memoryview(host.reshape(-1).view(torch.uint8).numpy())
+    h = hashlib.blake2b(digest_size=16)
+    h.update(repr((int(lanes[0]), int(lanes[1]), int(nbytes))).encode("utf-8"))
+    return h.hexdigest()
 
 
 def piece_digest(
     tensor: Any, chunk_bytes: int = DEFAULT_CHUNK_BYTES
 ) -> Tuple[str, int]:
-    """``(digest, logical_bytes)`` of ONE piece's content.
+    """``(digest, logical_bytes)`` of ONE piece.  Convenience, one sync.
 
-    ``logical_bytes`` is ``numel * element_size``, i.e. the piece's own extent.
-    It is NOT the storage span, and the difference is condition (1) restated one
-    level down: a pitched piece lives in a larger allocation, and pricing that
-    would print a number no reader could reconcile with the plan.
+    The product path never calls this -- it folds the whole reading into one
+    accumulator and drains once (:func:`read_pieces`).  It exists so a test can
+    ask about a single piece without building an inventory, and it is the same
+    fold, so a pin taken here holds there.
+
+    ``logical_bytes`` is ``numel * element_size``, i.e. the piece's own extent,
+    NOT the storage span: a pitched piece lives in a larger allocation, and
+    pricing that would print a number no reader could reconcile with the plan.
     """
-    h = hashlib.blake2b(digest_size=16)
-    for block in _canonical_blocks(tensor, chunk_bytes):
-        h.update(block)
-    return h.hexdigest(), int(tensor.numel()) * int(tensor.element_size())
+    acc = _fold.DeviceAccumulators(1)
+    nbytes = _fold.fold_piece(tensor, acc, 0, chunk_bytes=chunk_bytes)
+    lanes = _drain_accumulators(acc)[0]
+    return _digest_of(lanes, nbytes), nbytes
+
+
+def _drain_accumulators(acc: "_fold.DeviceAccumulators") -> List[Tuple[int, int]]:
+    """THE ONE HOST SYNC OF A READING, behind a name a test can count.
+
+    Wrapped rather than called inline so
+    ``test_the_reading_syncs_the_device_once_not_per_block`` can assert the
+    count behaviourally instead of reading the shape of a loop.
+    """
+    return acc.drain()
 
 
 @dataclass(frozen=True)
@@ -480,18 +520,34 @@ def read_pieces(
     *,
     card: int,
     chunk_bytes: int = DEFAULT_CHUNK_BYTES,
-) -> Tuple[PieceReading, ...]:
-    """Hash every ``(ParamGeom, tensor)`` pair the producer handed over.
+) -> Tuple[Tuple[PieceReading, ...], int]:
+    """``(pieces, syncs)`` for the whole reading, with ONE drain at the end.
+
+    Every piece is folded on its own device into one accumulator; the host
+    learns nothing until the drain.  ``syncs`` is reported rather than assumed:
+    it is 1 on any real rank (a rank's weights are on one card) and it is
+    PRINTED, because a silent 200 would be the defect this rewrite removed.
 
     Sorted by key, because the walk order is a property of the process and the
     reading must be a property of the card.
     """
-    out: List[PieceReading] = []
-    for geom, tensor in inventory:
-        identity = identity_of(geom, card=card)
-        digest, nbytes = piece_digest(tensor, chunk_bytes=chunk_bytes)
-        out.append(PieceReading(identity=identity, digest=digest, bytes=nbytes))
-    return tuple(sorted(out, key=lambda r: (str(r.identity.key), r.identity.param_name)))
+    items = list(inventory)
+    acc = _fold.DeviceAccumulators(len(items))
+    identities: List[PieceIdentity] = []
+    sizes: List[int] = []
+    for row, (geom, tensor) in enumerate(items):
+        identities.append(identity_of(geom, card=card))
+        sizes.append(_fold.fold_piece(tensor, acc, row, chunk_bytes=chunk_bytes))
+    lanes = _drain_accumulators(acc)
+    out = [
+        PieceReading(identity=identities[i], digest=_digest_of(lanes[i], sizes[i]),
+                     bytes=sizes[i])
+        for i in range(len(items))
+    ]
+    return (
+        tuple(sorted(out, key=lambda r: (str(r.identity.key), r.identity.param_name))),
+        int(acc.syncs),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -509,6 +565,16 @@ class SeamReading:
     epoch: Any
     pieces: Tuple[PieceReading, ...] = ()
     ms: float = 0.0
+    #: #1350 F2 -- THE POPULATION, AS NUMBERS RATHER THAN AS PROSE.  The
+    #: docstring used to claim "the skipped count is PRINTED" while nothing
+    #: printed it, which is instrument-text-lies class A: a reader could not
+    #: bound what a MATCH covered.  ``walked`` is every parameter the producer
+    #: looked at, ``skipped`` the ones it refused, with the reasons.
+    walked: int = 0
+    skipped: Tuple[Tuple[str, str], ...] = ()
+    skipped_bytes: int = 0
+    #: How many host transfers this reading cost.  1 on any real rank.
+    syncs: int = 0
 
     @property
     def tag_field(self) -> str:
@@ -521,6 +587,37 @@ class SeamReading:
     @property
     def bytes(self) -> int:
         return sum(int(p.bytes) for p in self.pieces)
+
+    @property
+    def n_skipped(self) -> int:
+        return len(self.skipped)
+
+    @property
+    def complete(self) -> bool:
+        """Did the producer grade everything it walked?"""
+        return not self.skipped
+
+    @property
+    def rate_gb_s(self) -> float:
+        """MEASURED, never estimated.  0.0 when the reading was instantaneous."""
+        secs = self.ms / 1000.0
+        return (self.bytes / 1e9) / secs if secs > 0 else 0.0
+
+    def pieces_in_leg(self, tags: Sequence[str]) -> Tuple[int, int]:
+        """``(n_in_leg, n_resident)`` against the tags THIS leg paused.
+
+        #1350 S3/R7: the reading covers the whole family, but a tag that was
+        not paused in this leg contributes MATCH by construction, so a verdict
+        that printed only ``n_tensors`` overstated what the exchange moved.
+        """
+        wanted = {str(t) for t in tags}
+        in_leg = sum(1 for p in self.pieces if p.identity.tag in wanted)
+        return in_leg, len(self.pieces) - in_leg
+
+    def skip_field(self) -> str:
+        if not self.skipped:
+            return "none"
+        return ",".join(f"{n}:{r}" for n, r in self.skipped[:MAX_NAMED_PIECES])
 
     @property
     def placement_key(self) -> str:
@@ -559,7 +656,11 @@ class SeamReading:
             f"rank={self.rank} card={self.card} tag={self.tag_field} "
             f"epoch={self.epoch} placement_key={self.placement_key} "
             f"n_tensors={self.n_tensors} bytes={self.bytes} "
-            f"digest={self.digest} ms={self.ms:.0f} population={POPULATION}"
+            f"digest={self.digest} ms={self.ms:.1f} "
+            f"GB_s={self.rate_gb_s:.2f} syncs={self.syncs} "
+            f"n_walked={self.walked} n_graded={self.n_tensors} "
+            f"n_skipped={self.n_skipped} bytes_skipped={self.skipped_bytes} "
+            f"skip_reasons={self.skip_field()} population={POPULATION}"
         )
 
 
@@ -573,12 +674,23 @@ def take_reading(
     tags: Sequence[str],
     epoch: Any,
     chunk_bytes: int = DEFAULT_CHUNK_BYTES,
+    skipped: Sequence[Tuple[str, str]] = (),
+    skipped_bytes: int = 0,
+    walked: Optional[int] = None,
+    budget_s: float = READING_BUDGET_S,
 ) -> SeamReading:
-    import time
+    """One awake moment, folded on the card and drained once.
 
-    t0 = time.perf_counter()
-    pieces = read_pieces(inventory, card=card, chunk_bytes=chunk_bytes)
-    return SeamReading(
+    REFUSES BY NAME when the fold takes longer than ``budget_s``.  The clock is
+    around the whole reading INCLUDING the drain, because the drain is the
+    synchronisation -- timing only the launch side would report the queueing of
+    the work rather than the work, which is the classic device-timing lie.
+    """
+    t0 = _now()
+    items = list(inventory)
+    pieces, syncs = read_pieces(items, card=card, chunk_bytes=chunk_bytes)
+    ms = (_now() - t0) * 1000.0
+    reading = SeamReading(
         stage=stage,
         group=str(group),
         rank=int(rank),
@@ -586,8 +698,26 @@ def take_reading(
         tags=tuple(str(t) for t in tags),
         epoch=epoch,
         pieces=pieces,
-        ms=(time.perf_counter() - t0) * 1000.0,
+        ms=ms,
+        walked=int(walked if walked is not None else len(items) + len(skipped)),
+        skipped=tuple((str(n), str(r)) for n, r in skipped),
+        skipped_bytes=int(skipped_bytes),
+        syncs=int(syncs),
     )
+    if budget_s and ms > float(budget_s) * 1000.0:
+        raise Weg2SeamDigestBudgetExceeded(
+            f"{BUDGET_MARKER}: the {stage} reading took {ms:.0f} ms for "
+            f"{reading.bytes} bytes ({reading.rate_gb_s:.2f} GB/s) on rank "
+            f"{rank} card {card}, over the {budget_s:.1f} s budget. TWO such "
+            f"readings sit inside every flip leg, on the scheduler thread, "
+            f"against the front's drain_deadline_s and the C14 credit budget "
+            f"the co-located waking rank is fenced on -- continuing would "
+            f"trade a named refusal for a WEG2-FLIP STALL and a deadman "
+            f"verdict with no byte wrong. Remedy: drop --weg2-seam-digest for "
+            f"this boot and read the grader in its own instrument boot. "
+            f"{reading.line()}"
+        )
+    return reading
 
 
 def take_reading_if_armed(
@@ -661,6 +791,10 @@ class SeamVerdict:
         group, rank, card, tag = self._identity()
         before, after = self.before, self.after
         ref = after or before
+        # #1350 S3/R7: how much of what is graded was actually PAUSED in this
+        # leg. A resident tag contributes MATCH by construction, so n_tensors
+        # alone overstates what the exchange moved.
+        in_leg, resident = ref.pieces_in_leg(ref.tags) if ref else (0, 0)
         parts = [
             f"{LINE_PREFIX} stage=verdict group={group} rank={rank} "
             f"card={card} tag={tag}",
@@ -672,7 +806,12 @@ class SeamVerdict:
             f"digest_after={after.digest if after else 'n/a'}",
             f"epoch_before={before.epoch if before else 'n/a'}",
             f"epoch_after={after.epoch if after else 'n/a'}",
-            f"ms={(before.ms if before else 0.0) + (after.ms if after else 0.0):.0f}",
+            f"ms={(before.ms if before else 0.0) + (after.ms if after else 0.0):.1f}",
+            f"n_in_leg={in_leg} n_resident={resident}",
+            f"n_walked={ref.walked if ref else 0} n_graded={ref.n_tensors if ref else 0} "
+            f"n_skipped={ref.n_skipped if ref else 0} "
+            f"bytes_skipped={ref.skipped_bytes if ref else 0} "
+            f"skip_reasons={ref.skip_field() if ref else 'none'}",
             f"verdict={self.verdict}",
             f"reason={self.reason}",
             f"moved={len(self.moved)} pieces_moved={_named(self.moved)}",
@@ -683,6 +822,12 @@ class SeamVerdict:
         if self.verdict == VERDICT_UNARMED:
             parts.append(
                 "UNARMED is the named ABSENCE of a verdict and is never a pass"
+            )
+        if self.verdict == VERDICT_MATCH_PARTIAL:
+            parts.append(
+                "MATCH-PARTIAL means: no contradiction in the pieces that were "
+                "GRADED. It does NOT mean the bytes came back -- n_skipped "
+                "pieces carry no verdict at all"
             )
         parts.append(LIMIT_CLAUSE)
         return " ".join(parts)
@@ -719,17 +864,29 @@ def unarmed_verdict(
 def compare(
     before: Optional[SeamReading], after: Optional[SeamReading]
 ) -> SeamVerdict:
-    """The grade.  THREE outcomes, and the third is not a grade.
+    """The grade.  FOUR outcomes, and two of them are not a clean pass.
 
-    THE ORDER OF THE TWO CHECKS IS LOAD-BEARING.  The PLACEMENT is asked first,
-    and a placement change is reported BY ITS OWN NAME rather than falling
-    through into the content comparison.  Two readings over two placements
-    describe different piece sets; grading their content is not a weaker
-    finding, it is a different one, and calling it ``content-changed`` would
-    send a reader hunting for a corrupted byte that does not exist.  Mutant M3
-    removes this check and
-    ``test_a_changed_placement_refuses_the_content_compare_by_name`` is what
-    dies.
+    ORDER IS LOAD-BEARING.  Absence first, then an EMPTY population, then the
+    PLACEMENT, then content.  Each earlier check exists because the later one
+    would otherwise answer a question it was not asked:
+
+    * no reading at all -> UNARMED.  Never a pass, never a refusal.
+    * zero pieces -> UNARMED ``empty-population`` (#1350 S1/R1).  The product
+      path is guarded one level up (``card_inventory`` refuses an empty walk),
+      but the pure function graded a population of nothing as MATCH, which is
+      the one answer a grader may never give.
+    * a KEY COLLISION -> refusal (#1350 S2/R3).  Two pieces under one key meant
+      last-writer-wins in the map below, so a corrupt piece could hide behind
+      its twin while the folded ``digest`` -- never consulted -- disagreed.
+      Not reachable through ``nn.Module`` today; the failure DIRECTION is why
+      it is closed anyway.
+    * a PLACEMENT change -> refusal BY ITS OWN NAME, never as content: two
+      readings over two piece sets describe different things, and calling that
+      ``content-changed`` sends a reader hunting a byte that does not exist.
+
+    And a clean content comparison over an INCOMPLETE population is
+    ``MATCH-PARTIAL``, not ``MATCH`` (#1350 F2): "no contradiction in what I
+    graded" and "the bytes came back" are different claims.
     """
     if after is None or before is None:
         return SeamVerdict(
@@ -738,8 +895,12 @@ def compare(
             before=before,
             after=after,
         )
+    if not before.pieces or not after.pieces:
+        return SeamVerdict(VERDICT_UNARMED, REASON_EMPTY, before, after)
     b_map = {p.identity.key: p for p in before.pieces}
     a_map = {p.identity.key: p for p in after.pieces}
+    if len(b_map) != len(before.pieces) or len(a_map) != len(after.pieces):
+        return SeamVerdict(VERDICT_MISMATCH, REASON_KEY_COLLISION, before, after)
     if before.placement_key != after.placement_key:
         gone = sorted(b_map[k].identity.label for k in b_map.keys() - a_map.keys())
         arrived = sorted(a_map[k].identity.label for k in a_map.keys() - b_map.keys())
@@ -760,4 +921,6 @@ def compare(
         return SeamVerdict(
             VERDICT_MISMATCH, REASON_CONTENT, before, after, moved=tuple(moved)
         )
+    if not (before.complete and after.complete):
+        return SeamVerdict(VERDICT_MATCH_PARTIAL, REASON_MATCH, before, after)
     return SeamVerdict(VERDICT_MATCH, REASON_MATCH, before, after)
