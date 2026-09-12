@@ -1295,6 +1295,28 @@ class Weg2HostFlipRatchetUnmeasured(Weg2HostLedgerRefused):
     """
 
 
+class Weg2HostDeviationRefused(Weg2HostLedgerRefused):
+    """W97 (#1360): the named deviation is itself not admissible.
+
+    The user's standing rule of 2026-09-12 makes the reap watermark SOFT: a
+    boot may cross the ledger's bound with a NAMED reason and a RUNTIME LATCH,
+    never silently.  This class is the "never silently" half, and it refuses
+    three shapes rather than arguing about them:
+
+    * a reason without a latch, or a latch without a reason -- a deviation with
+      no number is exactly the silent crossing the rule forbids, and a latch
+      with no reason leaves the next reader without the why;
+    * a latch AT OR ABOVE the hard bound -- a latch above the bound it is meant
+      to catch a breach beneath can never fire before the bound is already
+      crossed, so it is decoration;
+    * a predicted peak AT OR ABOVE the REAP WATERMARK itself.  The bound is
+      soft; the watermark is where the kernel actually reaped (weg2dk5 95.90,
+      weg2dk6 96.06).  Accepting a prediction that is already at the reap point
+      is not a deviation, it is booting into the killer -- which boot weg2xsn25
+      did on a prediction 5 GiB below it.
+    """
+
+
 class Weg2HostRatchetDoubleCharged(Weg2HostLedgerRefused):
     """W95 (#1350): the flip ratchet would be charged TWICE in one prediction.
 
@@ -3532,6 +3554,14 @@ def choose(
     # like `xchg_bounce_host_bytes`. `None` keeps every pre-#1350 caller and
     # every recorded arm byte-identical.
     flip_ratchet: Optional["FlipRatchet"] = None,
+    # #1360: the NAMED deviation. Both or neither -- see
+    # `Weg2HostDeviationRefused`. It converts the FUNDABILITY VERDICT and
+    # NOTHING ELSE: every term, the ring dimensioning, the manifest guard and
+    # the store sizing are computed exactly as without it, and the arm that
+    # comes back is the arm the ladder priced. The switch accepts a verdict; it
+    # never re-prices one.
+    deviation_reason: str = "",
+    riegel_gib: Optional[float] = None,
 ) -> Tuple[Arm, Optional[float], List[str]]:
     """Walk the ladder; return (arm, reap headroom GiB, printed lines) or W20/W21.
 
@@ -3656,6 +3686,19 @@ def choose(
         )
     )
     hard_bound_gib = watermark_gib - margin.total_gib
+    # #1360: BOTH OR NEITHER, checked before a single arm is priced, so a
+    # half-armed deviation can never reach a verdict it would then convert.
+    _deviation_armed = bool(deviation_reason) and riegel_gib is not None
+    if bool(deviation_reason) != (riegel_gib is not None):
+        raise Weg2HostDeviationRefused(
+            "W97 Weg2HostDeviationRefused: --host-ledger-deviation and "
+            "--host-riegel-gib are BOTH OR NEITHER. "
+            + ("A reason was given with no runtime latch: a deviation without a "
+               "number is the silent crossing the user's 2026-09-12 rule forbids."
+               if deviation_reason else
+               "A latch was given with no reason: the next reader is left without "
+               "the why, which is the other half of the same rule.")
+        )
     lines.append(watermark_provenance(margin, watermark_gib))
     chosen: Optional[Arm] = None
     peak_bound_any = False
@@ -3688,6 +3731,43 @@ def choose(
                 f"[{margin.terms()}])"
             )
         ok = moments_ok and peak_ok
+        # #1360: the deviation converts THIS verdict, after it has been computed
+        # in full. `binding` is left exactly as it was so the DEVIATION line and
+        # the refusal it replaces name the same terms.
+        if not ok and _deviation_armed and predicted is not None:
+            if predicted >= watermark_gib:
+                raise Weg2HostDeviationRefused(
+                    f"W97 Weg2HostDeviationRefused: --host-ledger-deviation cannot "
+                    f"accept a predicted run peak of {predicted:.2f} GiB, which is AT "
+                    f"OR ABOVE the observed reap watermark {watermark_gib:.2f} GiB. "
+                    f"The hard bound is soft (user rule 2026-09-12); the WATERMARK is "
+                    f"where the kernel reaped. Boot weg2xsn25 died on a prediction "
+                    f"5 GiB below it -- accepting one at it is not a deviation."
+                )
+            if float(riegel_gib) >= hard_bound_gib:
+                raise Weg2HostDeviationRefused(
+                    f"W97 Weg2HostDeviationRefused: --host-riegel-gib "
+                    f"{float(riegel_gib):.2f} is AT OR ABOVE the hard bound "
+                    f"{hard_bound_gib:.2f} GiB it is supposed to latch beneath. A "
+                    f"latch above the bound cannot fire before the bound is already "
+                    f"crossed; it is decoration, and the rule asks for a runtime "
+                    f"latch, not a number."
+                )
+            lines.append(
+                f"WEG2-HOST-LEDGER DEVIATION reason=\"{deviation_reason}\" "
+                f"predicted_run_peak={predicted:.2f} hard_bound={hard_bound_gib:.2f} "
+                f"reap={watermark_gib:.2f} excess={predicted - hard_bound_gib:.2f} "
+                f"riegel_gib={float(riegel_gib):.2f} "
+                f"source={(arm.terms or {}).get('flip_ratchet_source', '?').split(' ')[0]} "
+                f"-- the ledger's verdict for this arm was REFUSED (binding: "
+                + ", ".join(binding) + f"); it is ACCEPTED under the user's standing "
+                f"rule of 2026-09-12 that the reap mark is soft and may be crossed "
+                f"WITH a number and a runtime latch, never silently. NOTHING IS "
+                f"RE-PRICED: every term above is the one the ladder computed, the "
+                f"ring dimensioning and the manifest guard are untouched, and the "
+                f"runtime guard (W22) still tears down at the latch."
+            )
+            ok = True
         if moments_ok and not peak_ok:
             peak_bound_any = True
         lines.append(
