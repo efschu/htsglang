@@ -2325,9 +2325,11 @@ class SchedulerWeightUpdaterManager:
                     hook=str(hook), group=str(group), rank=int(rank),
                     manifests=mans,
                     src_addr=self._weg2_join_src_addr(
-                        str(hook), str(group), int(rank), model),
+                        str(hook), str(group), int(rank), model,
+                        region=region_tag),
                     dst_addr=self._weg2_join_dst_addr(
-                        str(hook), str(group), int(rank), model),
+                        str(hook), str(group), int(rank), model,
+                        region=region_tag),
                     # The materialisation check runs against THIS rank's own
                     # live tensors, at the flip -- where the manifest could
                     # have drifted since it was written at the end of loading.
@@ -2388,6 +2390,11 @@ class SchedulerWeightUpdaterManager:
         accessor (DFlash / FrozenKVMTP shapes); absent, the table is the main
         runner's and the join simply has nothing draft-shaped to place.
         """
+        # KEYED BY (REGION, NAME) -- the fourth of the four sites that share
+        # one key. `setdefault` on the NAME alone made the winner depend on
+        # walk ORDER once two runners of a rank share a parameter name, which
+        # weg2xsn25 measured eight times (the drafter is a one-layer block, so
+        # its parameters are `model.layers.0.*` too).
         table = {}
         runners = []
         main = getattr(self.tp_worker, "model_runner", None)
@@ -2401,18 +2408,27 @@ class SchedulerWeightUpdaterManager:
                 drafter = None
             if drafter is not None:
                 runners.append(drafter)
+        from sglang.srt.weg2 import weight_exchange as _wx
+        from sglang.srt.weg2 import xchg_manifest as _xm
+
         for runner in runners:
             model = getattr(runner, "model", None)
             if model is None:
                 continue
             try:
+                region = _xm.region_of_tag(
+                    _wx.weights_region_tag_for(_wx.RunnerShape.of(runner)))
+            except BaseException:  # noqa: BLE001 -- an unclassified shape
+                region = _wx.GPU_MEMORY_TYPE_WEIGHTS
+            try:
                 for name, param in model.named_parameters():
-                    table.setdefault(str(name), param)
+                    table.setdefault((region, str(name)), param)
             except BaseException:  # noqa: BLE001
                 continue
         return table
 
-    def _weg2_join_src_addr(self, hook: str, group: str, rank: int, model):
+    def _weg2_join_src_addr(self, hook: str, group: str, rank: int, model,
+                            region: str = ""):
         """#1330 B4n. The SOURCE address book for a join-backed leg.
 
         OWN DEVICE ADDRESS ONLY, and never the ring. On the SOURCE hook this
@@ -2431,15 +2447,22 @@ class SchedulerWeightUpdaterManager:
         if not table:
             return None
 
+        from sglang.srt.weg2 import weight_exchange as _wx
+        from sglang.srt.weg2 import xchg_manifest as _xm
+
+        my_region = (_xm.region_of_tag(region) if region
+                     else _wx.GPU_MEMORY_TYPE_WEIGHTS)
+
         def src_addr(name: str, r: int):
             if int(r) != int(rank):
                 return None
-            tensor = table.get(str(name))
+            tensor = table.get((my_region, str(name)))
             return None if tensor is None else int(tensor.data_ptr())
 
         return src_addr
 
-    def _weg2_join_dst_addr(self, hook: str, group: str, rank: int, model):
+    def _weg2_join_dst_addr(self, hook: str, group: str, rank: int, model,
+                            region: str = ""):
         """#1330 B4n. The DESTINATION address book for a join-backed leg.
 
         The mirror of the source book, over the SAME two-runner population --
@@ -2456,10 +2479,16 @@ class SchedulerWeightUpdaterManager:
         if not table:
             return None
 
+        from sglang.srt.weg2 import weight_exchange as _wx
+        from sglang.srt.weg2 import xchg_manifest as _xm
+
+        my_region = (_xm.region_of_tag(region) if region
+                     else _wx.GPU_MEMORY_TYPE_WEIGHTS)
+
         def dst_addr(name: str, r: int):
             if int(r) != int(rank):
                 return None
-            tensor = table.get(str(name))
+            tensor = table.get((my_region, str(name)))
             return None if tensor is None else int(tensor.data_ptr())
 
         return dst_addr

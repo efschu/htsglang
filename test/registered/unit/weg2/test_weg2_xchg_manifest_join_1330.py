@@ -248,8 +248,16 @@ def test_the_manifest_keys_on_the_published_identity_not_a_private_tuple():
     from sglang.srt.weg2 import weight_exchange_shadow as sh
 
     p = _piece("model.layers.0.mlp.down_proj.weight", 2048, 1024)
-    assert p.key == sh.manifest_entry(p.param_name, p.tensor_class,
-                                      p.rows_full, p.cols_full, p.itemsize)
+    # THE REGION IS PART OF THE KEY (weg2xsn25): a name is not an identity
+    # across runners, so the published entry is asked for the same region the
+    # piece carries. Called WITHOUT it the key differs -- which is the point.
+    assert p.key == sh.manifest_entry(
+        p.param_name, p.tensor_class, p.rows_full, p.cols_full, p.itemsize,
+        region=xm.region_of_tag(p.tag))
+    assert p.key != sh.manifest_entry(
+        p.param_name, p.tensor_class, p.rows_full, p.cols_full, p.itemsize,
+        region="weights_draft"), (
+        "two regions must not produce one identity")
 
 
 def test_a_manifest_round_trips_through_the_shared_dump_directory(tmp_path):
@@ -1204,10 +1212,24 @@ def test_the_join_takes_weg2xsn23s_own_ten_manifests():
             mans.append(xm.RankManifest.from_json(json.load(fh), path=f))
     assert len(mans) == 10, "xsn23 wrote ten manifests (two runners per rank)"
 
-    join = xm.join_manifests(mans, pp_group="P", tp_group="D")
+    # JOINED PER REGION, as production does since the region cut: a leg only
+    # ever sees its own runner's tensors, and the join now keys by
+    # (region, name) so the drafter's same-named pieces cannot displace the
+    # main model's. Joining both regions at once would ask P's draft manifest
+    # to source every draft name D holds, which is the DRAFT leg's job.
+    main = [xm.RankManifest(
+        group=m.group, rank=m.rank, card=m.card, region_tag=m.region_tag,
+        boot_token=m.boot_token, tp_rank=m.tp_rank, pp_rank=m.pp_rank,
+        pieces=tuple(p for p in m.pieces
+                     if xm.region_of_tag(p.tag) == "weights"))
+        for m in mans]
+    main = [m for m in main if m.pieces]
+    join = xm.join_manifests(main, pp_group="P", tp_group="D")
     assert join.unsourced == ()
-    assert len(join.tensors) == 1259
-    assert join.n_sharded == 748
+    # 1249, NOT the 1259 of the unfiltered join: the ten the region cut leaves
+    # out are the DRAFT runner's, which get their own leg. The number moving
+    # when the cut landed is the cut being visible, not a loss.
+    assert len(join.tensors) == 1249
 
     # THE PADDED SET IS THE VOCABULARY, AND NOTHING ELSE. The third name is a
     # finding neither the order nor I predicted: the INT8 SCALE tensor of the
