@@ -997,6 +997,35 @@ JOIN_PLAN_SOURCE = (
 )
 
 
+#: #1330 B4n SLICE 1 of the region cut (operator ruling 2026-09-12, Option 2).
+#:
+#: A LEG PLANS ONLY ITS OWN REGION'S TENSORS. Boot weg2xsn25 proved by
+#: arithmetic why: P rank 0 wrote TWO manifests -- `region_tag=weights`
+#: pieces=893 and `region_tag=weights_draft` pieces=19 -- and the leg read
+#: `dst_resolved=893/904`. 893 IS EXACTLY THE MAIN RUNNER'S PIECE COUNT, so
+#: the eleven unresolved descriptors were the draft head's, and the address
+#: book only ever had one runner's tensors.
+#:
+#: The join must still UNION the runner files -- that is where the extents and
+#: the shard vector come from -- but the LEG may not be asked to address pages
+#: that belong to another runner. The drafter gets its own leg (slice 2), from
+#: its own `arm_coverage_at_load`.
+#:
+#: OPTION 1 WAS REJECTED BY THE OPERATOR AND THE REASON IS RECORDED: a second
+#: accessor path to `self.draft_worker` is a second way to find one runner,
+#: which is the shape this campaign keeps deleting.
+def region_of_tag(tag: str) -> str:
+    """Which REGION a tag belongs to -- the drafter's, or the main weights'.
+
+    The chunk tags (`weights_0` ... `weights_N`) and the base tag all live in
+    the main runner's region; only the draft tag is its own. Read from
+    `weight_exchange`'s constant, never spelled here.
+    """
+    return (wx.GPU_MEMORY_TYPE_WEIGHTS_DRAFT
+            if str(tag) == wx.GPU_MEMORY_TYPE_WEIGHTS_DRAFT
+            else wx.GPU_MEMORY_TYPE_WEIGHTS)
+
+
 def refusal(reason: str, detail: str = "") -> str:
     """The one shape a refused join prints, so the log carries one spelling."""
     return f"join-{reason}" + (f": {detail}" if detail else "")
@@ -1063,6 +1092,9 @@ def leg_plan_from_join(
     #: THIS RANK'S LIVE MODEL, for the materialisation check below.  Optional
     #: only so the hermetic callers that have no model can drive the join.
     model=None,
+    #: THE REGION THIS LEG BELONGS TO. Empty means the main weights region,
+    #: which is what every caller without a drafter has.
+    region_tag: str = "",
     log=None,
 ):
     """ONE leg's :class:`~weight_exchange_shadow.LegPlan`, from the manifests.
@@ -1088,6 +1120,25 @@ def leg_plan_from_join(
         join = join_manifests(manifests, pp_group=pp_group, tp_group=tp_group)
     except (wx.Weg2XchgSourceMissing, wx.Weg2XchgPlanDisagree) as exc:
         return None, refusal("unjoinable", f"{type(exc).__name__}: {exc}")
+
+    # THE REGION CUT. The join keeps every runner's tensors (that is where the
+    # extents come from); the LEG keeps only its own region's, because only
+    # those have an address in this runner.
+    my_region = region_of_tag(region_tag) if region_tag else \
+        wx.GPU_MEMORY_TYPE_WEIGHTS
+    mine_t = [t for t in join.tensors if region_of_tag(t.tag) == my_region]
+    other = [t for t in join.tensors if region_of_tag(t.tag) != my_region]
+    if not mine_t:
+        return None, refusal(
+            "no-tensors-in-region",
+            f"region={my_region}: the join has {len(join.tensors)} tensors and "
+            f"none of this leg's region. A leg with nothing of its own to move "
+            f"is a plan defect, not an empty one")
+    if other:
+        join = ManifestJoin(
+            pp_group=join.pp_group, tp_group=join.tp_group, cards=join.cards,
+            tensors=tuple(mine_t), unsourced=(), pp_ranks=join.pp_ranks,
+            tp_ranks=join.tp_ranks)
 
     try:
         plan = plan_from_join(join, direction=direction,
@@ -1118,6 +1169,11 @@ def leg_plan_from_join(
             except BaseException:  # noqa: BLE001 -- an observer never raises
                 live = {}
             for piece in mine_manifest.pieces:
+                # ONLY THIS LEG'S REGION: a piece of another runner has no
+                # tensor here by construction, and checking it would refuse on
+                # the very asymmetry the region cut exists to remove.
+                if region_of_tag(piece.tag) != my_region:
+                    continue
                 tensor = live.get(piece.param_name)
                 if tensor is None:
                     continue
@@ -1125,6 +1181,27 @@ def leg_plan_from_join(
                     refuse_on_materialisation_drift(piece, tensor)
                 except wx.Weg2XchgPlanDisagree as exc:
                     return None, refusal("materialisation-drift", str(exc))
+
+    # THE EXCLUSION IS NAMED, never silent: a reader must see that this leg
+    # deliberately does not carry another runner's pieces, and how many.
+    if other:
+        excluded_bytes = sum(
+            (t.rows_full - t.pad_units) * t.cols_full * t.itemsize
+            for t in other)
+        line = (
+            f"WEG2-XCHG-PLAN region={my_region} "
+            f"excluded={'+'.join(sorted({region_of_tag(t.tag) for t in other}))} "
+            f"pieces={len(other)} bytes={excluded_bytes} "
+            f"reason=other-runner -- those tensors belong to a runner this leg "
+            f"cannot address; they get their own leg from their own "
+            f"arm_coverage_at_load (weg2xsn25: eleven of them read as "
+            f"dst_resolved=893/904 and refused the whole leg)")
+        if log is not None:
+            log(line)
+        else:
+            import logging as _logging
+
+            _logging.getLogger(__name__).info("%s", line)
 
     is_source = str(hook) == sh.HOOK_SOURCE
     side = "src_rank" if is_source else "dst_rank"

@@ -477,6 +477,13 @@ def test_the_adapter_passes_deposit_on_source_and_collect_on_the_import_hooks():
     class _Stub:
         _weg2_xchg_bounce_leg = wu.SchedulerWeightUpdaterManager._weg2_xchg_bounce_leg
 
+        # #1358: the adapter reads its own identity for the host-slot lines.
+        def _weg2_group_name(self):
+            return "P"
+
+        def _weg2_rank(self):
+            return 0
+
     rendezvous_seen = []
 
     def _fake_leg(descs, ops, nonce, **kw):
@@ -547,6 +554,13 @@ def test_without_a_handshake_a_cross_leg_is_refused_never_downgraded(tmp_path):
     class _Stub:
         _weg2_xchg_bounce_leg = wu.SchedulerWeightUpdaterManager._weg2_xchg_bounce_leg
 
+        # #1358: the adapter reads its own identity for the host-slot lines.
+        def _weg2_group_name(self):
+            return "P"
+
+        def _weg2_rank(self):
+            return 0
+
     descs = [wx.XchgDesc(
         tag=TAG, src_rank=0, dst_rank=1, param_name="model.layers.0.w",
         src_ptr=None, dst_ptr=0x2000, kind=wx.FLAT, nbytes=16, rows=1,
@@ -570,3 +584,75 @@ def test_the_sems_cache_is_a_declared_field_because_the_manager_has_slots():
     names = {f.name for f in
              dataclasses.fields(wu.SchedulerWeightUpdaterManager)}
     assert "_weg2_xchg_sems_cache" in names
+
+
+# ---------------------------------------------------------------------------
+# (4) #1358 -- THE HOST-SLOT EMITTER, IN THE PRODUCTION PATH
+# ---------------------------------------------------------------------------
+
+
+def test_the_host_slot_emitter_lives_in_product_code_not_in_a_script():
+    """IT DID NOT, AND THAT IS WHY ACCEPTANCE E2 COULD NOT PASS.
+
+    `WEG2-XCHG-HOST-SLOT` existed only as a `print` in
+    scripts/weg2/xchg_leg_replay.py, so no boot could ever have carried it and
+    #1358's host ratchet (+1.2..1.7 GiB anon per P->D leg; xsn25 +4.65 GiB
+    after ONE flip, then oom_kill) had no instrument at all. Built-but-not-
+    wired, in my own instrument this time.
+    """
+    import inspect
+
+    src = inspect.getsource(wb)
+    assert wb.HOST_SLOT_MARKER == "WEG2-XCHG-HOST-SLOT"
+    assert wb.HOST_SLOT_LEG_MARKER == "WEG2-XCHG-HOST-SLOT-LEG"
+    # Emitted through the module logger, never printed.
+    assert "print(" not in inspect.getsource(wb._host_slot_event)
+    assert "logger.info" in src
+
+
+def test_every_slot_says_its_bytes_at_alloc_and_at_free(tmp_path):
+    """One line per slot per event, and the running total is the state AFTER."""
+    wb._LIVE_SLOTS.clear()
+    lines = []
+    ops = FakeDeviceOps(str(tmp_path), rank=0)
+    b = wb.LayerBounce(ops, NONCE, slot_bytes=SLOT, depth=1, create=True,
+                       shm_root=str(tmp_path), lane="p0", group="P", rank=1,
+                       leg="e1/source", slot_index=0)
+    assert wb.host_slot_live_bytes() == SLOT
+    b.close()
+    assert wb.host_slot_live_bytes() == 0, "the free must clear the registry"
+
+    # The line's own shape, built directly so the assertion names the fields.
+    line = wb.host_slot_line(event="alloc", path="/x", nbytes=123, group="D",
+                             rank=2, leg="e1/destination", slot=1,
+                             region="shm,pinned")
+    for field in ("group=D", "rank=2", "leg=e1/destination", "slot=1",
+                  "event=alloc", "bytes=123", "region=shm,pinned",
+                  "total_live_bytes="):
+        assert field in line, (field, line)
+
+
+def test_the_leg_summary_reads_zero_on_the_happy_path_and_nonzero_on_a_leak():
+    """`bytes_live_after != 0` IS the leak suspicion #1358 asked for."""
+    wb._LIVE_SLOTS.clear()
+    clean = wb.host_slot_leg_line(group="P", rank=0, leg="e1/source",
+                                  slots_before=0)
+    assert "slots_live_after=0" in clean and "bytes_live_after=0" in clean
+
+    # A PLANTED FORGOTTEN FREE: the alloc happened, the free did not.
+    wb._host_slot_event("alloc", "/leaked", 4096, group="P", rank=0,
+                        leg="e1/source", slot=0)
+    leaked = wb.host_slot_leg_line(group="P", rank=0, leg="e1/source",
+                                   slots_before=0)
+    assert "slots_live_after=1" in leaked
+    assert "bytes_live_after=4096" in leaked, leaked
+    wb._LIVE_SLOTS.clear()
+
+
+def test_a_free_with_no_alloc_says_so_rather_than_going_quiet():
+    """The accounting and the buffer parting company is itself a finding."""
+    wb._LIVE_SLOTS.clear()
+    seen = []
+    wb._host_slot_event("free", "/never-allocated", 99, log=seen.append)
+    assert "unmatched-free" in seen[0], seen
+    wb._LIVE_SLOTS.clear()

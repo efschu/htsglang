@@ -370,9 +370,10 @@ class _Stub:
     leg refused with W74 at ``dst_resolved=894/904``.
     """
 
-    def __init__(self, main_params, draft_params):
+    def __init__(self, main_params, draft_params, group="P", rank=0):
         from sglang.srt.managers.scheduler_components import weight_updater as wu
 
+        self._group, self._rank = str(group), int(rank)
         self.tp_worker = _FakeWorker(_FakeModel(main_params))
         self.draft_worker = (None if draft_params is None
                              else _FakeDraftWorker(_FakeModel(draft_params)))
@@ -381,6 +382,13 @@ class _Stub:
                      "_weg2_join_dst_addr", "_weg2_shadow_plan",
                      "_weg2_xchg_bounce_leg"):
             setattr(type(self), name, getattr(cls, name))
+
+    # #1358: the adapter reads its own identity for the host-slot lines.
+    def _weg2_group_name(self):
+        return self._group
+
+    def _weg2_rank(self):
+        return self._rank
 
 
 def rank_proc(group, rank, evidence, root, q, self_test, max_tensors,
@@ -414,8 +422,18 @@ def rank_proc(group, rank, evidence, root, q, self_test, max_tensors,
         # exactly why a single-runner address book resolved 894 of 904 and
         # refused the leg.
         mine = [m for m in mans if m.group == group and m.rank == rank]
-        draft_names = {p.param_name for m in mine for p in m.pieces
-                       if str(p.tag) == "weights_draft"}
+        # WHICH RUNNER A TENSOR BELONGS TO IS THE FILE IT CAME FROM, not the
+        # tag on the piece. The can-fail arm deliberately re-tags the draft
+        # PIECES into the main region (so the region cut cannot separate them,
+        # which is the pre-fix state) while the FILE keeps its own region_tag
+        # -- so this is the reading that still places them in the draft runner,
+        # where a single-runner address book cannot reach them.
+        draft_names = {p.param_name for m in mine
+                       if str(m.region_tag) == "weights_draft"
+                       for p in m.pieces}
+        # In the can-fail arm the draft pieces were re-tagged into the
+        # main region, so `draft_names` is empty and every piece lands in
+        # the MAIN double -- except the ones the single-runner book drops.
 
         main_params, draft_params, own = [], [], {}
         allocated = 0
@@ -449,8 +467,8 @@ def rank_proc(group, rank, evidence, root, q, self_test, max_tensors,
             (draft_params if t.param_name in draft_names
              else main_params).append((t.param_name, param))
 
-        stub = _Stub(main_params,
-                     None if single_runner else draft_params)
+        stub = _Stub(main_params, None if single_runner else draft_params,
+                     group=group, rank=rank)
 
         hook = "source" if group == "P" else "destination"
         plan, reason = stub._weg2_shadow_plan(
@@ -465,11 +483,21 @@ def rank_proc(group, rank, evidence, root, q, self_test, max_tensors,
         q.put(("alloc", group, rank, allocated, len(own), 0))
 
         sems = tp.SemSet(NONCE)
+        # #1358: the PRODUCT's own host-slot lines, forwarded verbatim, so the
+        # replay reads the same form a boot does instead of a line of its own.
+        def _capture(line: str) -> None:
+            text = str(line)
+            if text.startswith(wb.HOST_SLOT_MARKER):
+                q.put(("hostslot", group, rank, text, 0, 0))
+
         stub._weg2_xchg_bounce_leg(
             descs=list(plan.descs), ops=ops, boot_nonce=NONCE,
             slot_bytes=SLOT_BYTES, depth=DEPTH,
             mode=wx.INJECT_AUTHORITATIVE, shm_root=root, device=0,
             hook=hook, region=None, sems=sems)
+        q.put(("hostslotleg", group, rank,
+               wb.host_slot_leg_line(group=group, rank=rank,
+                                     leg=f"{NONCE}/{hook}"), 0, 0))
         q.put(("entry", group, rank, "adapter", 0, 0))
 
         if group == "D":
@@ -534,11 +562,31 @@ def _run(ns) -> int:
                 else load_manifests(ns.evidence))
     src_mans = narrow(src_mans, ns.col_div)
     src_mans = budget_manifests(src_mans, ns.max_tensors)
+    # THE CAN-FAIL ARM MODELS THE PRE-FIX PRODUCT, and it needs no production
+    # knob to do it. Before the region cut a leg carried every runner's pieces
+    # in ONE region, so the cut could not separate them and the single-runner
+    # address book had no home for the draft head's. Re-tagging the draft
+    # pieces into the main region reproduces exactly that state -- which is
+    # what weg2xsn25 measured as `dst_resolved=893/904` + W74 on fc.weight,
+    # and (per the operator's causality question) the W68 that follows it.
     for m in src_mans:
+        pieces = m.pieces
+        region = m.region_tag
+        if ns.single_runner and str(m.region_tag) == "weights_draft":
+            pieces = tuple(
+                xm.ManifestPiece(
+                    param_name=p_.param_name, tensor_class=p_.tensor_class,
+                    rows_full=p_.rows_full, cols_full=p_.cols_full,
+                    itemsize=p_.itemsize, tag="weights", nbytes=p_.nbytes)
+                for p_ in m.pieces)
+            # THE FILE NAME KEEPS ITS OWN region_tag: the region cut reads the
+            # PIECE's tag, while the name's third axis exists so two runners of
+            # one rank cannot collide (weg2xsn20/22). Changing both made the
+            # overwrite ratchet fire -- correctly.
         xm.write_rank_manifest(xm.RankManifest(
-            group=m.group, rank=m.rank, card=m.card, region_tag=m.region_tag,
+            group=m.group, rank=m.rank, card=m.card, region_tag=region,
             boot_token=BOOT_TOKEN, tp_rank=m.tp_rank, pp_rank=m.pp_rank,
-            pieces=m.pieces), mdir)
+            pieces=pieces), mdir)
     print(f"  manifests={len(src_mans)} entry={ns.entry} "
           f"address_book="
           f"{'single-runner (CAN-FAIL ARM)' if ns.single_runner else 'both runners'}")
@@ -582,6 +630,8 @@ def _run(ns) -> int:
             print(f"  WEG2-XCHG-LEGS group={g} rank={r} legs={a}")
         elif kind == "alloc":
             print(f"  WEG2-XCHG-ALLOC group={g} rank={r} bytes={a} tensors={b}")
+        elif kind in ("hostslot", "hostslotleg"):
+            print(f"  {a}")
         elif kind == "entry":
             print(f"  WEG2-XCHG-ENTRY group={g} rank={r} entry={a}")
         elif kind == "slot":

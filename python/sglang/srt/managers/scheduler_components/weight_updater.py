@@ -2314,6 +2314,12 @@ class SchedulerWeightUpdaterManager:
                     # live tensors, at the flip -- where the manifest could
                     # have drifted since it was written at the end of loading.
                     model=model,
+                    # THE REGION THIS RUNNER OWNS. A leg addresses only its own
+                    # region's tensors: weg2xsn25 measured what mixing costs --
+                    # P rank 0's leg carried the draft head's eleven pieces,
+                    # which live in ANOTHER runner, and read dst_resolved=893/
+                    # 904 (893 being exactly the main runner's own count).
+                    region_tag=region_tag,
                     log=logger.info)
             plan, reason = sh.derive_leg_plan(
                 hook=str(hook), group=str(group),
@@ -3215,6 +3221,11 @@ class SchedulerWeightUpdaterManager:
                     # cross-pair corruption, measured in the desk replay.
                     lane=(f"p{pair}" if pair is not None
                           else f"c{int(getattr(group[0], 'dst_rank', device))}"),
+                    # #1358: the identity the host-slot lines carry. This is
+                    # the only frame where the group and the rank both exist.
+                    leg_group=str(self._weg2_group_name()),
+                    leg_rank=int(self._weg2_rank()),
+                    leg_name=f"{boot_nonce}/{hook}",
                     log=logger.info)
         finally:
             slots.close()
