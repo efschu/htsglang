@@ -82,6 +82,16 @@ class TorchMemorySaverAdapter(ABC):
     def ring_stats(self):
         raise NotImplementedError
 
+    def tag_pages(self, tag: str):
+        raise NotImplementedError
+
+    def page_stats(self, tag: str):
+        raise NotImplementedError
+
+    def remap_pages(self, src_tag: str, src_page: int, dst_tag: str,
+                    dst_page: int, n_pages: int):
+        raise NotImplementedError
+
     @property
     def enabled(self):
         raise NotImplementedError
@@ -286,6 +296,97 @@ class _TorchMemorySaverAdapterReal(TorchMemorySaverAdapter):
         res["blocked_ms"] = float(blocked.value)
         return res
 
+    def tag_pages(self, tag: str):
+        """REMAP (#1352): how many 2 MiB pages this tag spans, or None.
+
+        None means ABSENCE in both of its forms -- the running hook has no such
+        symbol (stock wheel, or a ``.so`` built before this slice), or the tag
+        is not page-granular under this boot's ``TMS_REMAP_TAGS``.  A tag that
+        IS armed and spans no page is impossible (an armed tag has at least one
+        allocation), so there is no measured zero to confuse with the absence.
+        """
+        import ctypes
+
+        fn = _weg2_ring_symbol("tms_tag_pages")
+        if fn is None:
+            return None
+        fn.restype = ctypes.c_uint64
+        fn.argtypes = [ctypes.c_char_p]
+        n = int(fn(tag.encode()))
+        return n if n > 0 else None
+
+    def page_stats(self, tag: str):
+        """REMAP (#1352): the page ledger of this tag, or None when absent.
+
+        ``{"pages": n, "created": n, "mapped_in": n, "mapped_out": n}``.
+
+        ``created`` IS THE ACCEPTANCE NUMBER OF THE WHOLE DESIGN and the reason
+        this reader exists at all: the claim is "the flip asks the driver for
+        no physical page", and that claim is this counter being 0 after a wake
+        -- not an assertion, not a credit balance, not a promise made by a
+        second set of books.  A non-zero ``created`` after a planned wake is
+        the plan being short by exactly that many pages, stated in the unit the
+        driver itself works in.
+
+        The C side returns presence (0/1) SEPARATELY from the counters, so
+        ``created == 0`` on an armed tag is a MEASUREMENT ("nothing was
+        allocated") and a missing tag is None ("nobody measured") -- the two
+        readings that a single integer would have merged.
+        """
+        import ctypes
+
+        fn = _weg2_ring_symbol("tms_page_stats")
+        if fn is None:
+            return None
+        out = {k: ctypes.c_uint64(0) for k in ("pages", "created", "mapped_in", "mapped_out")}
+        fn.restype = ctypes.c_int
+        fn.argtypes = [ctypes.c_char_p] + [ctypes.POINTER(ctypes.c_uint64)] * 4
+        rc = fn(tag.encode(), *[ctypes.byref(v) for v in out.values()])
+        if rc != 1:
+            return None
+        return {k: int(v.value) for k, v in out.items()}
+
+    def remap_pages(self, src_tag: str, src_page: int, dst_tag: str,
+                    dst_page: int, n_pages: int):
+        """REMAP (#1352): move ``n_pages`` physical pages between two tags.
+
+        Returns the C side's refusal REASON as a string, or ``None`` on
+        success.  It never raises and never falls back: the caller turns the
+        reason into the named W-code refusal, because a remap that could not
+        happen must stop the flip rather than be papered over by an allocation
+        -- that paper is precisely the VramCredit second bookkeeping this
+        replaces.
+
+        Raises ``RuntimeError`` only when the running hook has no such symbol,
+        which is a WIRING defect (a boot armed for remap against a ``.so``
+        built before this slice) and must not read as a refusal of the move.
+        """
+        import ctypes
+
+        fn = _weg2_ring_symbol("tms_remap_pages")
+        if fn is None:
+            raise RuntimeError(
+                "tms_remap_pages is absent from the running preload hook -- this boot is "
+                "armed for the page remap against a torch_memory_saver built before it. "
+                "That is a wiring defect, not a refusal of the move: rebuild with "
+                "scripts/weg2/tms/build_tms_preload.sh and re-point SGLANG_WEG2_TMS_PRELOAD_SO."
+            )
+        err = ctypes.create_string_buffer(512)
+        fn.restype = ctypes.c_int
+        fn.argtypes = [
+            ctypes.c_char_p, ctypes.c_uint64,
+            ctypes.c_char_p, ctypes.c_uint64,
+            ctypes.c_uint64, ctypes.c_char_p, ctypes.c_size_t,
+        ]
+        rc = int(fn(
+            src_tag.encode(), ctypes.c_uint64(int(src_page)),
+            dst_tag.encode(), ctypes.c_uint64(int(dst_page)),
+            ctypes.c_uint64(int(n_pages)), err, ctypes.c_size_t(len(err)),
+        ))
+        if rc == 0:
+            return None
+        return err.value.decode() or f"W95 Weg2RemapPageRefused: rc={rc} without a reason"
+
     @property
     def enabled(self):
         return _memory_saver is not None and _memory_saver.enabled
@@ -323,6 +424,21 @@ class _TorchMemorySaverAdapterNoop(TorchMemorySaverAdapter):
 
     def ring_stats(self):
         return None
+
+    def tag_pages(self, tag: str):
+        return None
+
+    def page_stats(self, tag: str):
+        return None
+
+    def remap_pages(self, src_tag: str, src_page: int, dst_tag: str,
+                    dst_page: int, n_pages: int):
+        # REMAP (#1352): the noop adapter has no saver, so there are no pages
+        # to move.  It says so BY NAME rather than returning None (= success),
+        # because a caller that read a silent success here would believe a wake
+        # was funded that never was.
+        return ("W95 Weg2RemapPageRefused: the memory saver is not enabled in this "
+                "process, so no tag has page-granular backing to move")
 
     def pause(self, tag: str):
         pass

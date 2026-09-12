@@ -23,6 +23,41 @@ cudaError_t TorchMemorySaver::malloc(void **ptr, CUdevice device, size_t size, c
     return ROCmHIPImplementation::rocm_malloc(ptr, device, size, tag, enable_cpu_backup, allocation_metadata_, allocator_metadata_mutex_);
 
 #elif defined(USE_CUDA)
+    // REMAP (#1352): the page-granular arm.  Same VA, same accessibility, same
+    // metadata key -- the ONLY difference is that the backing is N handles of
+    // one page each instead of one handle of ``size``, which is what makes a
+    // single page movable at all (see the AllocationMetadata comment).  The
+    // legacy arm below is untouched, and an unset ``TMS_REMAP_TAGS`` takes it.
+    if (remap_tag(tag)) {
+        if (page_bytes_ == 0) {
+            page_bytes_ = CUDAUtils::cu_mem_min_granularity(device);
+            SIMPLE_CHECK(page_bytes_ > 0, "REMAP: driver reported a zero allocation granularity");
+        }
+        const size_t page = page_bytes_;
+        const size_t aligned = ((size + page - 1) / page) * page;
+        const size_t n_pages = aligned / page;
+
+        CURESULT_CHECK(cuMemAddressReserve((CUdeviceptr *) ptr, aligned, 0, 0, 0));
+        std::vector<CUmemGenericAllocationHandle> handles(n_pages);
+        for (size_t i = 0; i < n_pages; ++i) {
+            CUDAUtils::cu_mem_create(&handles[i], page, device, remap_exportable_);
+            CURESULT_CHECK(cuMemMap((CUdeviceptr) ((char*) *ptr + i * page), page, 0, handles[i], 0));
+        }
+        // ONE set_access over the whole run: it takes a VA RANGE, so the N
+        // separate mappings cost one call, not N.
+        CUDAUtils::cu_mem_set_access(*ptr, aligned, device);
+
+        {
+            const std::lock_guard<std::mutex> lock(allocator_metadata_mutex_);
+            allocation_metadata_.emplace(
+                *ptr,
+                AllocationMetadata{size, device, tag, AllocationState::ACTIVE, enable_cpu_backup,
+                                   {}, false, std::move(handles), aligned, 0}
+            );
+        }
+        return cudaSuccess;
+    }
+
     CUmemGenericAllocationHandle allocHandle;
     CUDAUtils::cu_mem_create(&allocHandle, size, device);
     CURESULT_CHECK(cuMemAddressReserve((CUdeviceptr *) ptr, size, 0, 0, 0));
@@ -33,7 +68,8 @@ cudaError_t TorchMemorySaver::malloc(void **ptr, CUdevice device, size_t size, c
         const std::lock_guard<std::mutex> lock(allocator_metadata_mutex_);
         allocation_metadata_.emplace(
             *ptr,
-            AllocationMetadata{size, device, tag, AllocationState::ACTIVE, enable_cpu_backup, {}, false, allocHandle}
+            AllocationMetadata{size, device, tag, AllocationState::ACTIVE, enable_cpu_backup,
+                               {}, false, {}, size, allocHandle}
         );
     }
 
@@ -66,9 +102,24 @@ cudaError_t TorchMemorySaver::free(void *ptr) {
         allocation_metadata_.erase(ptr);
     }
 
-    CURESULT_CHECK(cuMemUnmap((CUdeviceptr) ptr, metadata.size));
-    CURESULT_CHECK(cuMemRelease(metadata.allocHandle));
-    CURESULT_CHECK(cuMemAddressFree((CUdeviceptr) ptr, metadata.size));
+    if (!metadata.page_handles.empty()) {
+        // REMAP: a zero entry is a page this allocation no longer owns (it was
+        // remapped away, or the tag is paused).  Skipping it is not laxity --
+        // unmapping a VA that carries no mapping is an error, and releasing a
+        // handle the peer now owns would free a page under the peer's feet.
+        for (size_t i = 0; i < metadata.page_handles.size(); ++i) {
+            if (metadata.page_handles[i] == 0) {
+                continue;
+            }
+            CURESULT_CHECK(cuMemUnmap((CUdeviceptr) ((char*) ptr + i * page_bytes_), page_bytes_));
+            CURESULT_CHECK(cuMemRelease(metadata.page_handles[i]));
+        }
+        CURESULT_CHECK(cuMemAddressFree((CUdeviceptr) ptr, metadata.reserved_size));
+    } else {
+        CURESULT_CHECK(cuMemUnmap((CUdeviceptr) ptr, metadata.size));
+        CURESULT_CHECK(cuMemRelease(metadata.allocHandle));
+        CURESULT_CHECK(cuMemAddressFree((CUdeviceptr) ptr, metadata.size));
+    }
 
     // C5: give the granules back to whichever allocator owns them.  A freed
     // allocation whose backup came from the ring MUST release, or the region
@@ -184,6 +235,211 @@ bool TorchMemorySaver::ring_stats(HostRingStats* out, std::string* card_uuid) {
     return true;
 }
 
+// =========================================================== REMAP (#1352) ==
+//
+// The flip stops asking the driver for pages.  A physical page changes owner:
+// ``cuMemUnmap`` in the source arena's VA, ``cuMemMap`` of the SAME handle in
+// the destination arena's VA.  No ``cuMemCreate``, no ``cuMemRelease``, and
+// therefore no credit counter standing in for the physics.
+
+bool TorchMemorySaver::remap_tag(const std::string& tag) {
+    if (!remap_prefixes_parsed_) {
+        remap_prefixes_parsed_ = true;
+        const char* raw = std::getenv("TMS_REMAP_TAGS");
+        if (raw != nullptr && *raw != '\0') {
+            std::string all(raw);
+            size_t start = 0;
+            while (start <= all.size()) {
+                size_t comma = all.find(',', start);
+                if (comma == std::string::npos) {
+                    comma = all.size();
+                }
+                std::string one = all.substr(start, comma - start);
+                if (!one.empty()) {
+                    remap_prefixes_.push_back(one);
+                }
+                start = comma + 1;
+            }
+        }
+        const char* exp = std::getenv("TMS_REMAP_EXPORTABLE");
+        remap_exportable_ = (exp != nullptr && (*exp == '1' || *exp == 't' || *exp == 'T'));
+    }
+    for (size_t i = 0; i < remap_prefixes_.size(); ++i) {
+        const std::string& p = remap_prefixes_[i];
+        if (tag.size() >= p.size() && tag.compare(0, p.size(), p) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+std::vector<void*> TorchMemorySaver::ordered_ptrs(const std::string& tag) {
+    // ADDRESS ORDER, and it is load-bearing rather than tidy: a page index is
+    // only a stable name for a page if both ends of the plan derive it the same
+    // way, and ``allocation_metadata_`` is an unordered_map whose iteration
+    // order is an implementation detail that can differ between two processes
+    // holding identical allocations.
+    std::vector<void*> out;
+    for (auto it = allocation_metadata_.begin(); it != allocation_metadata_.end(); ++it) {
+        if (it->second.tag == tag && !it->second.page_handles.empty()) {
+            out.push_back(it->first);
+        }
+    }
+    std::sort(out.begin(), out.end());
+    return out;
+}
+
+bool TorchMemorySaver::locate_page(const std::vector<void*>& order, uint64_t index,
+                                   void** ptr_out, uint64_t* local_out) {
+    uint64_t seen = 0;
+    for (size_t m = 0; m < order.size(); ++m) {
+        const uint64_t n = (uint64_t) allocation_metadata_[order[m]].page_handles.size();
+        if (index < seen + n) {
+            *ptr_out = order[m];
+            *local_out = index - seen;
+            return true;
+        }
+        seen += n;
+    }
+    return false;
+}
+
+uint64_t TorchMemorySaver::tag_pages(const std::string& tag) {
+    const std::lock_guard<std::mutex> lock(allocator_metadata_mutex_);
+    const std::vector<void*> order = ordered_ptrs(tag);
+    uint64_t total = 0;
+    for (size_t m = 0; m < order.size(); ++m) {
+        total += (uint64_t) allocation_metadata_[order[m]].page_handles.size();
+    }
+    return total;
+}
+
+int TorchMemorySaver::page_stats(const std::string& tag, uint64_t* pages, uint64_t* created,
+                                 uint64_t* mapped_in, uint64_t* mapped_out) {
+    const std::lock_guard<std::mutex> lock(allocator_metadata_mutex_);
+    const std::vector<void*> order = ordered_ptrs(tag);
+    if (order.empty()) {
+        return 0;   // ABSENCE: the tag was never armed for remap.
+    }
+    uint64_t total = 0;
+    for (size_t m = 0; m < order.size(); ++m) {
+        total += (uint64_t) allocation_metadata_[order[m]].page_handles.size();
+    }
+    if (pages != nullptr) *pages = total;
+    if (created != nullptr) *created = pages_created_.count(tag) ? pages_created_[tag] : 0;
+    if (mapped_in != nullptr) *mapped_in = pages_mapped_in_.count(tag) ? pages_mapped_in_[tag] : 0;
+    if (mapped_out != nullptr) *mapped_out = pages_mapped_out_.count(tag) ? pages_mapped_out_[tag] : 0;
+    return 1;
+}
+
+int TorchMemorySaver::remap_pages(const std::string& src_tag, uint64_t src_page,
+                                  const std::string& dst_tag, uint64_t dst_page,
+                                  uint64_t n_pages, char* err, size_t errlen) {
+#if defined(USE_CUDA)
+    const std::lock_guard<std::mutex> lock(allocator_metadata_mutex_);
+
+    auto fail = [&](int code, const std::string& why) {
+        if (err != nullptr && errlen > 0) {
+            const std::string msg = "W95 Weg2RemapPageRefused: " + why;
+            size_t n = msg.size() < (errlen - 1) ? msg.size() : (errlen - 1);
+            memcpy(err, msg.c_str(), n);
+            err[n] = '\0';
+        }
+        return code;
+    };
+
+    if (n_pages == 0) {
+        return 0;
+    }
+    if (src_tag == dst_tag) {
+        return fail(-1, "src_tag == dst_tag (" + src_tag + ") -- a remap within one tag "
+                        "moves a page onto itself and is a plan defect, not a no-op");
+    }
+    const std::vector<void*> src_order = ordered_ptrs(src_tag);
+    const std::vector<void*> dst_order = ordered_ptrs(dst_tag);
+    if (src_order.empty()) {
+        return fail(-2, "tag '" + src_tag + "' has no page-granular allocation -- it was never "
+                        "armed for remap (TMS_REMAP_TAGS), so its pages cannot be named");
+    }
+    if (dst_order.empty()) {
+        return fail(-2, "tag '" + dst_tag + "' has no page-granular allocation -- it was never "
+                        "armed for remap (TMS_REMAP_TAGS), so its pages cannot be named");
+    }
+
+    // ---- VALIDATE THE WHOLE BATCH BEFORE MOVING ANY PAGE -------------------
+    // A half-performed remap leaves pages owned by neither arena, and nothing
+    // above this layer can repair that.  So the loop runs twice.
+    std::vector<void*> sp(n_pages), dp(n_pages);
+    std::vector<uint64_t> sl(n_pages), dl(n_pages);
+    for (uint64_t k = 0; k < n_pages; ++k) {
+        if (!locate_page(src_order, src_page + k, &sp[k], &sl[k])) {
+            return fail(-3, "src page " + std::to_string(src_page + k) + " is past the end of tag '"
+                            + src_tag + "'");
+        }
+        if (!locate_page(dst_order, dst_page + k, &dp[k], &dl[k])) {
+            return fail(-3, "dst page " + std::to_string(dst_page + k) + " is past the end of tag '"
+                            + dst_tag + "'");
+        }
+        AllocationMetadata& sm = allocation_metadata_[sp[k]];
+        AllocationMetadata& dm = allocation_metadata_[dp[k]];
+        if (sm.device != dm.device) {
+            return fail(-4, "src page " + std::to_string(src_page + k) + " is on device "
+                            + std::to_string((int) sm.device) + " and dst page "
+                            + std::to_string(dst_page + k) + " on device "
+                            + std::to_string((int) dm.device)
+                            + " -- a physical page cannot change card, only VA");
+        }
+        if (sm.page_handles[sl[k]] == 0) {
+            return fail(-5, "src page " + std::to_string(src_page + k) + " of tag '" + src_tag
+                            + "' holds no physical page (already moved, or the tag is asleep) "
+                              "-- refusing rather than allocating one");
+        }
+        if (dm.page_handles[dl[k]] != 0) {
+            return fail(-6, "dst page " + std::to_string(dst_page + k) + " of tag '" + dst_tag
+                            + "' is already backed -- mapping over it would strand the page "
+                              "it already owns");
+        }
+    }
+
+    // ---- PERFORM ------------------------------------------------------------
+    for (uint64_t k = 0; k < n_pages; ++k) {
+        AllocationMetadata& sm = allocation_metadata_[sp[k]];
+        AllocationMetadata& dm = allocation_metadata_[dp[k]];
+        const CUmemGenericAllocationHandle h = sm.page_handles[sl[k]];
+        CURESULT_CHECK(cuMemUnmap((CUdeviceptr) ((char*) sp[k] + sl[k] * page_bytes_), page_bytes_));
+        CURESULT_CHECK(cuMemMap((CUdeviceptr) ((char*) dp[k] + dl[k] * page_bytes_),
+                                page_bytes_, 0, h, 0));
+        sm.page_handles[sl[k]] = 0;
+        dm.page_handles[dl[k]] = h;
+    }
+    // Accessibility is granted per DESTINATION ALLOCATION, once, over its whole
+    // reserved range -- a VA-range call, so a thousand moved pages landing in
+    // one allocation cost one call and not a thousand.
+    std::vector<void*> touched;
+    for (uint64_t k = 0; k < n_pages; ++k) {
+        if (std::find(touched.begin(), touched.end(), dp[k]) == touched.end()) {
+            touched.push_back(dp[k]);
+        }
+    }
+    for (size_t m = 0; m < touched.size(); ++m) {
+        AllocationMetadata& dm = allocation_metadata_[touched[m]];
+        CUDAUtils::cu_mem_set_access(touched[m], dm.reserved_size, dm.device);
+    }
+    pages_mapped_out_[src_tag] += n_pages;
+    pages_mapped_in_[dst_tag] += n_pages;
+    return 0;
+#else
+    (void) src_tag; (void) src_page; (void) dst_tag; (void) dst_page; (void) n_pages;
+    if (err != nullptr && errlen > 0) {
+        const char* msg = "W95 Weg2RemapPageRefused: the page remap is CUDA-only";
+        size_t n = strlen(msg) < (errlen - 1) ? strlen(msg) : (errlen - 1);
+        memcpy(err, msg, n);
+        err[n] = '\0';
+    }
+    return -7;
+#endif
+}
+
 void TorchMemorySaver::pause(const std::string& tag) {
 #if defined(USE_ROCM)
     ROCmHIPImplementation::rocm_pause(tag, allocation_metadata_, allocator_metadata_mutex_);
@@ -280,8 +536,23 @@ void TorchMemorySaver::pause(const std::string& tag) {
             continue;
         }
 
-        CURESULT_CHECK(cuMemUnmap((CUdeviceptr) ptr, metadata.size));
-        CURESULT_CHECK(cuMemRelease(metadata.allocHandle));
+        if (!metadata.page_handles.empty()) {
+            // REMAP: page-granular sleep.  Each page is unmapped and released
+            // on its own, and its slot ZEROED -- that zero is what ``resume``
+            // reads as "this page must be created" and what a remapped-in page
+            // is NOT, which is the entire funding mechanism.
+            for (size_t i = 0; i < metadata.page_handles.size(); ++i) {
+                if (metadata.page_handles[i] == 0) {
+                    continue;
+                }
+                CURESULT_CHECK(cuMemUnmap((CUdeviceptr) ((char*) ptr + i * page_bytes_), page_bytes_));
+                CURESULT_CHECK(cuMemRelease(metadata.page_handles[i]));
+                metadata.page_handles[i] = 0;
+            }
+        } else {
+            CURESULT_CHECK(cuMemUnmap((CUdeviceptr) ptr, metadata.size));
+            CURESULT_CHECK(cuMemRelease(metadata.allocHandle));
+        }
 
         metadata.state = AllocationState::PAUSED;
 
@@ -334,9 +605,33 @@ void TorchMemorySaver::resume(const std::string& tag) {
 
     // --- pass 1: map every allocation of the tag ---
     const auto weg2_map_t0 = std::chrono::steady_clock::now();   // S7 (#1273)
+    uint64_t created_this_wake = 0;                              // REMAP (#1352)
     for (size_t m = 0; m < matched_ptrs.size(); ++m) {
         void* ptr = matched_ptrs[m];
         AllocationMetadata& metadata = allocation_metadata_[ptr];
+
+        if (!metadata.page_handles.empty()) {
+            // REMAP: FILL ONLY THE HOLES.  A page that arrived by
+            // ``remap_pages`` is already non-zero and already mapped, so this
+            // loop does not touch it -- which is exactly how a remap FUNDS a
+            // wake instead of a counter promising that it will.  The design's
+            // claim ("the flip asks the driver for no page") is therefore not
+            // an assertion anywhere: it is ``created_this_wake == 0``, and the
+            // number is published by ``page_stats`` whether it is zero or not.
+            for (size_t i = 0; i < metadata.page_handles.size(); ++i) {
+                if (metadata.page_handles[i] != 0) {
+                    continue;
+                }
+                CUDAUtils::cu_mem_create(&metadata.page_handles[i], page_bytes_,
+                                         metadata.device, remap_exportable_);
+                CURESULT_CHECK(cuMemMap((CUdeviceptr) ((char*) ptr + i * page_bytes_),
+                                        page_bytes_, 0, metadata.page_handles[i], 0));
+                ++created_this_wake;
+            }
+            CUDAUtils::cu_mem_set_access(ptr, metadata.reserved_size, metadata.device);
+            metadata.state = AllocationState::ACTIVE;
+            continue;
+        }
 
         CUmemGenericAllocationHandle newAllocHandle;
         CUDAUtils::cu_mem_create(&newAllocHandle, metadata.size, metadata.device);
@@ -356,6 +651,7 @@ void TorchMemorySaver::resume(const std::string& tag) {
     }
 
     const auto weg2_map_t1 = std::chrono::steady_clock::now();   // S7 (#1273)
+    pages_created_[tag] = created_this_wake;                     // REMAP (#1352)
 
     // --- pass 2: async H2D per granule ---
     bool any_copy = false;

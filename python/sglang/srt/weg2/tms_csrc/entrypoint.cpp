@@ -163,6 +163,37 @@ uint64_t tms_resume_stats(char* tag, size_t tag_len,
     return TorchMemorySaver::instance().resume_stats(tag, tag_len, allocations, map_ms, copy_ms);
 }
 
+// REMAP (#1352) -- THE FLIP THAT ALLOCATES NOTHING.
+//
+// ``tms_remap_pages`` moves ``n_pages`` physical pages from one tag's page
+// sequence to another's by unmap+map of the SAME handle.  It returns 0 on
+// success and a negative code otherwise, writing the reason into ``err`` --
+// REFUSAL, never a fallback that allocates the page it could not move, because
+// that fallback is the VramCredit defect under a new name.
+//
+// ``tms_tag_pages`` is the denominator every page plan is stated against, and
+// a 0 from it is an ABSENCE (the tag is not page-granular under this boot's
+// ``TMS_REMAP_TAGS``), not an empty tag -- which is why ``tms_page_stats``
+// returns 0/1 for presence SEPARATELY from the counters it writes.
+int tms_remap_pages(const char* src_tag, uint64_t src_page,
+                    const char* dst_tag, uint64_t dst_page,
+                    uint64_t n_pages, char* err, size_t errlen) {
+    std::string s = (src_tag != nullptr) ? std::string(src_tag) : "";
+    std::string d = (dst_tag != nullptr) ? std::string(dst_tag) : "";
+    return TorchMemorySaver::instance().remap_pages(s, src_page, d, dst_page, n_pages, err, errlen);
+}
+
+uint64_t tms_tag_pages(const char* tag) {
+    std::string tag_str = (tag != nullptr) ? std::string(tag) : "";
+    return TorchMemorySaver::instance().tag_pages(tag_str);
+}
+
+int tms_page_stats(const char* tag, uint64_t* pages, uint64_t* created,
+                   uint64_t* mapped_in, uint64_t* mapped_out) {
+    std::string tag_str = (tag != nullptr) ? std::string(tag) : "";
+    return TorchMemorySaver::instance().page_stats(tag_str, pages, created, mapped_in, mapped_out);
+}
+
 //: Returns 0 when this boot published no ring (stock cudaMallocHost path), 1
 //: otherwise.  Every out-pointer may be null.  ``card_uuid`` is written NUL
 //: terminated and truncated to ``card_uuid_len``.

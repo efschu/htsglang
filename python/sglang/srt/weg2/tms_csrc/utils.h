@@ -179,7 +179,16 @@ namespace CUDAUtils {
     #endif
 
 #elif defined(USE_CUDA)
-    static void cu_mem_create(CUmemGenericAllocationHandle *alloc_handle, size_t size, CUdevice device) {
+    // REMAP (#1352): ``exportable`` requests CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR
+    // AT CREATION TIME, which is the only moment it can be requested.  A handle
+    // created without it can NEVER be exported afterwards
+    // (``CUmemAllocationProp.requestedHandleTypes``, cuda.h:4207; the prop is
+    // zero-initialised here, i.e. CU_MEM_HANDLE_TYPE_NONE, on the legacy path).
+    // The cross-process half of the page remap -- P's physical page becoming
+    // D's -- rests entirely on this flag, so it is a LOAD-TIME precondition of
+    // a FLIP-TIME design and cannot be repaired at the flip.
+    static void cu_mem_create(CUmemGenericAllocationHandle *alloc_handle, size_t size, CUdevice device,
+                              bool exportable = false) {
         CUmemAllocationProp prop = {};
         prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
         prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
@@ -190,8 +199,34 @@ namespace CUDAUtils {
         if (flag) {  // support GPUDirect RDMA if possible
             prop.allocFlags.gpuDirectRDMACapable = 1;
         }
+        if (exportable) {
+            int fd_ok = 0;
+            CURESULT_CHECK(cuDeviceGetAttribute(
+                &fd_ok, CU_DEVICE_ATTRIBUTE_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR_SUPPORTED, device));
+            SIMPLE_CHECK(fd_ok,
+                         "REMAP: exportable page handles were requested but this device does not "
+                         "support CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR -- refusing rather than "
+                         "creating handles that can never cross a process boundary");
+            prop.requestedHandleTypes = CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR;
+        }
 
         CURESULT_CHECK(cuMemCreate(alloc_handle, size, &prop, 0));
+    }
+
+    //: REMAP (#1352): the driver's own minimum allocation granularity for this
+    //: device.  The page plan's arithmetic is stated in these units and must
+    //: never assume 2 MiB -- it is READ, and a device that answers with
+    //: something else makes every plan on this boot refuse rather than
+    //: silently mis-slice.
+    static size_t cu_mem_min_granularity(CUdevice device) {
+        CUmemAllocationProp prop = {};
+        prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+        prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+        prop.location.id = device;
+        size_t granularity = 0;
+        CURESULT_CHECK(cuMemGetAllocationGranularity(&granularity, &prop,
+                                                     CU_MEM_ALLOC_GRANULARITY_MINIMUM));
+        return granularity;
     }
 
     static void cu_mem_set_access(void *ptr, size_t size, CUdevice device) {
