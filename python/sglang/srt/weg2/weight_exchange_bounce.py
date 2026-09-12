@@ -387,6 +387,85 @@ def bounce_path(boot_nonce: str, shm_root: str = xr.SHM_ROOT,
     return base if not lane else f"{base}.{lane}"
 
 
+# ---------------------------------------------------------------------------
+# #1358 -- THE HOST-SLOT EMITTER, IN THE PRODUCTION PATH.
+# ---------------------------------------------------------------------------
+#
+# IT EXISTED ONLY IN THE REPLAY SCRIPT, as a `print`, and never in product
+# code -- so acceptance E2 could not have passed on ANY boot, and #1358's host
+# ratchet (+1.2..1.7 GiB anon per P->D leg; xsn25 +4.65 GiB after ONE flip,
+# then oom_kill) had no instrument at all. Built-but-not-wired, the class this
+# campaign keeps paying for, this time in my own instrument.
+#
+# EVERY SLOT SAYS ITS BYTES AND ITS REGION AT ALLOCATION AND AT RELEASE, and
+# the leg says what is still held when it ends: `bytes_live_after != 0` is the
+# leak suspicion #1358 needs, stated as a number rather than inferred from a
+# host sample.
+
+HOST_SLOT_MARKER = "WEG2-XCHG-HOST-SLOT"
+HOST_SLOT_LEG_MARKER = "WEG2-XCHG-HOST-SLOT-LEG"
+
+#: Bytes this PROCESS currently holds in bounce slots, by path. A process-wide
+#: registry and not a per-object counter: the question #1358 asks is "what does
+#: this rank still hold", which no single buffer can answer.
+_LIVE_SLOTS: Dict[str, int] = {}
+
+
+def host_slot_live_bytes() -> int:
+    """What this rank still holds in bounce slots, right now."""
+    return sum(_LIVE_SLOTS.values())
+
+
+def host_slot_line(*, event: str, path: str, nbytes: int, group: str = "",
+                   rank: int = -1, leg: str = "", slot: int = -1,
+                   region: str = "shm") -> str:
+    """One line per slot per event. Every number carries its denominator."""
+    return (
+        f"{HOST_SLOT_MARKER} group={group or '?'} rank={rank} "
+        f"leg={leg or '?'} slot={slot} event={event} bytes={int(nbytes)} "
+        f"region={region} total_live_bytes={host_slot_live_bytes()} "
+        f"path={path}"
+    )
+
+
+def _host_slot_event(event: str, path: str, nbytes: int, *, group: str = "",
+                     rank: int = -1, leg: str = "", slot: int = -1,
+                     region: str = "shm", log=None) -> None:
+    """Record and announce one slot's allocation or release.
+
+    THE REGISTRY IS UPDATED BEFORE THE LINE IS BUILT, so `total_live_bytes`
+    is the state AFTER this event -- which is the number a reader wants when
+    the event is a free.
+    """
+    if event == "alloc":
+        _LIVE_SLOTS[path] = _LIVE_SLOTS.get(path, 0) + int(nbytes)
+    else:
+        if _LIVE_SLOTS.pop(path, None) is None:
+            # A free with no matching alloc is itself a finding: the accounting
+            # and the buffer have parted company.
+            region = f"{region},unmatched-free"
+    line = host_slot_line(event=event, path=path, nbytes=nbytes, group=group,
+                          rank=rank, leg=leg, slot=slot, region=region)
+    if log is not None:
+        log(line)
+    else:
+        logger.info("%s", line)
+
+
+def host_slot_leg_line(*, group: str = "", rank: int = -1, leg: str = "",
+                       slots_before: int = 0) -> str:
+    """The leg's own summary. `bytes_live_after != 0` is the leak suspicion."""
+    return (
+        f"{HOST_SLOT_LEG_MARKER} group={group or '?'} rank={rank} "
+        f"leg={leg or '?'} slots_before={slots_before} "
+        f"slots_live_after={len(_LIVE_SLOTS)} "
+        f"bytes_live_after={host_slot_live_bytes()} -- a non-zero "
+        f"bytes_live_after means this leg ended still holding host slots, "
+        f"which is #1358's ratchet stated as a number instead of inferred "
+        f"from a host sample"
+    )
+
+
 class LayerBounce:
     """``depth`` slots of ``slot_bytes`` of shm, registered, and DECLARED.
 
@@ -410,7 +489,9 @@ class LayerBounce:
     @revert_pinned_posts_on_failure
     def __init__(self, ops: tp.DeviceOps, boot_nonce: str, *,
                  slot_bytes: int, depth: int, create: bool = True,
-                 shm_root: str = xr.SHM_ROOT, lane: str = "") -> None:
+                 shm_root: str = xr.SHM_ROOT, lane: str = "",
+                 group: str = "", rank: int = -1, leg: str = "",
+                 slot_index: int = -1) -> None:
         if int(slot_bytes) <= 0:
             raise ValueError(f"slot_bytes must be positive, not {slot_bytes!r}")
         if int(depth) <= 0:
@@ -420,6 +501,12 @@ class LayerBounce:
         self.depth = int(depth)
         self.nbytes = self.slot_bytes * self.depth
         self.path = bounce_path(boot_nonce, shm_root, lane)
+        # #1358 identity, carried so the emitter's line is readable without
+        # joining it to anything: which rank, which leg, which slot.
+        self._slot_group = str(group)
+        self._slot_rank = int(rank)
+        self._slot_leg = str(leg or lane)
+        self._slot_index = int(slot_index)
         self._post = f"weg2-xchg-bounce {self.path}"
         check_and_register_pinned_post(self._post, self.POST_FLAG, self.nbytes)
         os.makedirs(os.path.dirname(self.path), exist_ok=True)
@@ -439,6 +526,12 @@ class LayerBounce:
             self._registered = True
         except Exception:  # noqa: BLE001 -- a 7.5 % regression, not a refusal
             self._registered = False
+        # #1358: the slot is now held. `region` names WHERE the bytes are:
+        # shm always, and `pinned` in addition once cudaHostRegister took.
+        _host_slot_event("alloc", self.path, self.nbytes,
+                         group=self._slot_group, rank=self._slot_rank,
+                         leg=self._slot_leg, slot=self._slot_index,
+                         region=("shm,pinned" if self._registered else "shm"))
 
     def slot_address(self, slot: int) -> int:
         return self.ptr + (int(slot) % self.depth) * self.slot_bytes
@@ -460,6 +553,10 @@ class LayerBounce:
             os.close(self._fd)
         finally:
             unregister_pinned_post(self._post)
+            _host_slot_event("free", self.path, self.nbytes,
+                             group=self._slot_group, rank=self._slot_rank,
+                             leg=self._slot_leg, slot=self._slot_index,
+                             region="shm")
 
 
 def registered_bounce_bytes() -> int:
@@ -870,6 +967,12 @@ def run_bounce_leg(
     #: single-process form and is byte-identical to the behaviour before the
     #: split; ``deposit``/``collect`` are the two ranks of a cross-group leg.
     phase: str = PHASE_BOTH,
+    #: #1358 identity for the host-slot lines. Defaulted so every existing
+    #: caller and test is unchanged; the product passes them from the adapter,
+    #: which is the only place group and rank both exist.
+    leg_group: str = "",
+    leg_rank: int = -1,
+    leg_name: str = "",
     #: WHICH LANE's buffer this leg assembles in -- one directed card pair, or
     #: the diagonal's card. Empty keeps the single shared buffer, which is the
     #: single-process `both` form. See :func:`bounce_path` for the measured
@@ -999,8 +1102,13 @@ def run_bounce_leg(
             f"assemble buffer would be shared with every other pair running "
             f"concurrently, and each pair's own handshake would still be "
             f"obeyed -- so the corruption is silent. Refusing.")
+    # #1358: the slot census is taken across THIS leg, so the before-count is
+    # read here and the after-count in the `finally` below.
+    _slots_before = len(_LIVE_SLOTS)
     bounce = LayerBounce(ops, boot_nonce, slot_bytes=slot_bytes, depth=slots,
-                         create=True, shm_root=shm_root, lane=lane)
+                         create=True, shm_root=shm_root, lane=lane,
+                         group=str(leg_group), rank=int(leg_rank),
+                         leg=str(leg_name or lane), slot_index=0)
     d_stream = ops.create_stream(device)
     c_stream = ops.create_stream(device)
     #: What each slot is still draining, so a slot is never re-deposited under
@@ -1117,6 +1225,16 @@ def run_bounce_leg(
         # the error path would hold the bytes for the life of the boot exactly
         # as the ring did.
         bounce.close()
+        # #1358: THE LEG'S OWN SUMMARY, in the `finally` so a refused leg
+        # reports its residue too -- a leg that raises is exactly when a slot
+        # is most likely to be left held.
+        try:
+            log_fn = log if log is not None else logger.info
+            log_fn(host_slot_leg_line(group=str(leg_group), rank=int(leg_rank),
+                                      leg=str(leg_name or lane),
+                                      slots_before=_slots_before))
+        except BaseException:  # noqa: BLE001 -- an instrument never raises
+            pass
 
     result = BounceResult(
         # NONE ON THE AUTHORITATIVE PATH, because nothing was graded there and
