@@ -240,7 +240,91 @@ def main() -> int:
               "the refusal names the missing FILE, not merely the condition")
         os.rename(victim + ".hidden", victim)
 
-    total = 12
+        # -- 4. THE LEG ITSELF, THROUGH THE ADAPTER, BOTH DIRECTIONS -------
+        #
+        # THE POINT OF THIS SECTION: slices 1-3 are only worth something if the
+        # descriptors the provider produced actually reach `run_bounce_leg`
+        # with the right phase and survive the slot check. weg2xsn9 died at
+        # `refuse_if_plan_exceeds_slot` and weg2xsn20 at `_missing_pointer`;
+        # both are on this path.
+        print("\n[4] the adapter -> run_bounce_leg, both hooks")
+        from sglang.srt.managers.scheduler_components import weight_updater as wu
+        import sglang.srt.weg2.weight_exchange_bounce as _wb
+
+        seen = []
+        orig = _wb.run_bounce_leg
+
+        def _record(descs, ops, nonce, **kw):
+            seen.append((kw.get("phase"), kw.get("rendezvous") is not None,
+                         len(descs)))
+            # The two refusals that killed two boots, on the REAL descriptors.
+            hole = _wb._missing_pointer(descs, kw.get("phase", "both"))
+            if hole is not None:
+                raise AssertionError(f"_missing_pointer: {hole}")
+            _wb.refuse_if_plan_exceeds_slot(WIDEST_LAYER_BYTES, descs)
+            return None
+
+        class _LegStub:
+            _weg2_xchg_bounce_leg = (
+                wu.SchedulerWeightUpdaterManager._weg2_xchg_bounce_leg)
+
+        class _Sems:
+            def timedwait(self, *a, **k):
+                return True
+
+            def post(self, *a, **k):
+                pass
+
+            def diagonal_timedwait(self, *a, **k):
+                return True
+
+            def diagonal_post(self, *a, **k):
+                pass
+
+        class _Region:
+            boot_nonce = "smoke"
+
+            def publish(self, *a, **k):
+                pass
+
+            def read_slot(self, pair, slot):
+                class _R:
+                    bytes_filled = 0
+                return _R()
+
+        _wb.run_bounce_leg = _record
+        try:
+            for hook, group in (("source", "P"), ("destination", "D")):
+                plan = plans.get((hook, group))
+                if plan is None:
+                    continue
+                seen.clear()
+                try:
+                    _LegStub()._weg2_xchg_bounce_leg(
+                        descs=list(plan.descs), ops=None, boot_nonce="smoke",
+                        slot_bytes=WIDEST_LAYER_BYTES, depth=1,
+                        mode=wx.INJECT_AUTHORITATIVE, hook=hook,
+                        region=_Region(), sems=_Sems())
+                    ok, why = True, ""
+                except BaseException as exc:  # noqa: BLE001
+                    ok, why = False, f"{type(exc).__name__}: {exc}"
+                want = (_wb.PHASE_DEPOSIT if hook == "source"
+                        else _wb.PHASE_COLLECT)
+                phases = {p for p, _r, _n in seen}
+                print(f"  hook={hook} legs={len(seen)} phases={sorted(phases)} "
+                      f"descs={[n for _p, _r, n in seen]}")
+                check(ok, f"hook={hook}: the leg ran through the adapter "
+                          f"({why or 'no refusal'})")
+                check(want in phases or phases == {_wb.PHASE_BOTH},
+                      f"hook={hook}: the adapter passed {want} for its cross "
+                      f"pairs (saw {sorted(phases)})")
+                cross = [s for s in seen if s[0] != _wb.PHASE_BOTH]
+                check(all(s[1] for s in cross) if cross else True,
+                      f"hook={hook}: every cross leg carries a rendezvous")
+        finally:
+            _wb.run_bounce_leg = orig
+
+    total = 18
     print(f"\nWEG2-XCHG-PROVIDER-SMOKE verdict="
           f"{'PASS' if not failures else 'FAIL'} "
           f"checks={total - len(failures)}/{total}")

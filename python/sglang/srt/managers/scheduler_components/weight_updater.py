@@ -370,6 +370,13 @@ class SchedulerWeightUpdaterManager:
     #: than retried on every leg).
     _weg2_shadow_region_cache: Any = "unset"
     _weg2_shadow_manifest_cache: Any = None
+    #: #1330 B4n SLICE 3.  A FIELD for the same reason as the two above, and
+    #: the reason is measured rather than remembered: boot weg2xsn7 lost 24 of
+    #: 24 legs on BOTH groups to `AttributeError: ... has no attribute
+    #: '_weg2_shadow_region_cache'` because `slots=True` turns a lazily
+    #: assigned attribute into an error ON THE WRITE.  This cache is written
+    #: lazily in :meth:`_weg2_xchg_sems`, so it is declared here.
+    _weg2_xchg_sems_cache: Any = "unset"
 
     #: #1350 SEAM GRADER: this rank's pre-pause reading of its own pieces, or
     #: ``None``.  A FIELD for the sixth time in this class, for the reason the
@@ -1133,9 +1140,25 @@ class SchedulerWeightUpdaterManager:
         # twice: the double was shaped after what THIS line reads, so it grew a
         # `raw_descs` the producer never had. The chain smoke builds a real
         # LegPlan from the producer's field set instead.
+        # #1330 B4n SLICE 3: THE PHASE AND ITS HANDSHAKE, from the hook.
+        #
+        # `authoritative` is an IMPORTING hook -- this rank owns the pages the
+        # bytes must land in -- so its cross pairs run `collect` and wait on
+        # the depositing rank's `full`. The region and the semaphore set are
+        # the ones this process already opens for the shadow; opening a second
+        # pair would be two handles on one handshake.
+        #
+        # A CROSS LEG WITHOUT A HANDSHAKE IS REFUSED, NOT DOWNGRADED: if either
+        # is unavailable the adapter takes the unsplit form, and
+        # `run_bounce_leg` then refuses every cross pair by name rather than
+        # running it as `both` -- which would ask this rank for the peer's
+        # device address again, i.e. weg2xsn20's wall.
         self._weg2_xchg_bounce_leg(
             descs=list(plan.descs), ops=ops, boot_nonce=boot_nonce,
             terms=terms, mode=mode, device=int(device),
+            hook="authoritative",
+            region=self._weg2_shadow_region(),
+            sems=self._weg2_xchg_sems(),
         )
 
         # THE INSTRUMENTS ARE EMITTED BY THE LEG, NOT HERE, and the first
@@ -3037,9 +3060,44 @@ class SchedulerWeightUpdaterManager:
         except BaseException:  # noqa: BLE001 -- no ops is not an error to raise
             return None
 
+    def _weg2_xchg_sems(self):
+        """This process's semaphore set for the boot's CROSS pairs, or None.
+
+        ONE HANDLE PER PROCESS, cached: `SemSet` opens each name lazily and
+        `sem_open` without O_CREAT is the only legal form in a rank (the class
+        says why -- a creating open would silently adopt a name the launcher
+        did not make). Two sets would be two handles on one handshake.
+
+        `None` rather than an exception: the caller turns it into the unsplit
+        form, where every cross pair is then REFUSED by name. That is the
+        honest degradation -- a missing handshake must stop a cross leg, never
+        turn it into a `both` leg that asks for the peer's address.
+        """
+        cached = getattr(self, "_weg2_xchg_sems_cache", "unset")
+        if cached != "unset":
+            return cached
+        sems = None
+        try:
+            from sglang.srt.weg2 import weight_exchange_transport as tp
+
+            region = self._weg2_shadow_region()
+            if region is not None:
+                sems = tp.SemSet(region.boot_nonce)
+        except BaseException:  # noqa: BLE001 -- an observer never raises
+            sems = None
+        self._weg2_xchg_sems_cache = sems
+        return sems
+
     def _weg2_xchg_bounce_leg(self, *, descs, ops, boot_nonce,
                               slot_bytes=None, depth=None, terms=None,
-                              mode=None, shm_root=None, device: int = 0):
+                              mode=None, shm_root=None, device: int = 0,
+                              #: #1330 B4n SLICE 3.  Which half this rank runs.
+                              #: ``None`` derives it from the hook, which is the
+                              #: only honest default: a rank on the SOURCE hook
+                              #: holds the bytes and deposits them, a rank on
+                              #: any importing hook collects them.
+                              hook: str = "",
+                              region=None, sems=None):
         """PATH (b): assemble each unit in the host bounce, every card slices.
 
         The whole of the user law's fallback sentence, at the one call site
@@ -3068,13 +3126,58 @@ class SchedulerWeightUpdaterManager:
         # that re-read it further in could act on a different answer than the
         # one it was entered with, and the two differ by "does this write into
         # the live weights".
-        return bx.run_bounce_leg(
-            descs, ops, boot_nonce,
-            slot_bytes=slot_bytes, depth=depth, terms=terms,
-            mode=wx.inject_mode() if mode is None else mode,
-            shm_root=xr.SHM_ROOT if shm_root is None else shm_root,
-            device=device, log=logger.info,
-        )
+        resolved_mode = wx.inject_mode() if mode is None else mode
+        root = xr.SHM_ROOT if shm_root is None else shm_root
+
+        # #1330 B4n SLICE 3: SPLIT BY DIRECTED CARD PAIR, because that is how
+        # the semaphores are named.  A band that mixed two pairs would post one
+        # pair's `full` for another pair's bytes.
+        #
+        # The DIAGONAL (`src_rank == dst_rank`) keeps `phase=both` and its own
+        # on-card carrier: it is one card, both pointers live in reach, and
+        # `sem_name` refuses a diagonal id by name (W15) because it has no
+        # cross pair at all.  That is not a fallback -- it is the lane the
+        # diagonal has always had.
+        if not hook or region is None or sems is None:
+            # The unsplit form, unchanged.  Kept for the hermetic callers and
+            # the diagonal-only case; a CROSS leg that reached here without a
+            # handshake is refused inside `run_bounce_leg` rather than run as
+            # `both`, which is the ratchet this slice exists to hold.
+            return bx.run_bounce_leg(
+                descs, ops, boot_nonce,
+                slot_bytes=slot_bytes, depth=depth, terms=terms,
+                mode=resolved_mode, shm_root=root, device=device,
+                log=logger.info,
+            )
+
+        phase = (bx.PHASE_DEPOSIT if str(hook) == "source"
+                 else bx.PHASE_COLLECT)
+        last = None
+        for pair, group in bx.group_descs_by_pair(descs).items():
+            if pair is None:
+                # ON-CARD IS STILL TWO PROCESSES, and `both` cannot serve it.
+                # Measured by this slice's own provider smoke: on the SOURCE
+                # hook the diagonal group raised `_missing_pointer: ... has no
+                # destination pointer`, because the co-located peer's pages are
+                # in ANOTHER process on the same card. So the diagonal is
+                # phased too, over its own twelve semaphores (keyed by CARD,
+                # #1334) and its own per-card carrier. `both` has no
+                # cross-process caller at all.
+                last = bx.run_bounce_leg(
+                    group, ops, boot_nonce, slot_bytes=slot_bytes, depth=depth,
+                    terms=terms, mode=resolved_mode, shm_root=root,
+                    device=device, phase=phase,
+                    rendezvous=bx.DiagonalSlotRendezvous(
+                        sems, card=int(getattr(group[0], "dst_rank", device))),
+                    log=logger.info)
+                continue
+            last = bx.run_bounce_leg(
+                group, ops, boot_nonce, slot_bytes=slot_bytes, depth=depth,
+                terms=terms, mode=resolved_mode, shm_root=root, device=device,
+                phase=phase,
+                rendezvous=bx.CrossSlotRendezvous(region, sems, pair=pair),
+                log=logger.info)
+        return last
 
     # PATH (a) WAS DELETED HERE (#1342 S3), and the deletion is recorded
     # rather than silent so a re-introduction has to argue with it.

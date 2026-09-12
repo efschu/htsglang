@@ -83,6 +83,11 @@ class _Rendezvous:
         self.drop_post = bool(drop_post)
         self.lie_bytes = int(lie_bytes)
 
+    def wait_empty(self, *, slot, seq):
+        """Slice 3 added this to the contract: a deposit claims its slot."""
+        self.emptied_waits = getattr(self, "emptied_waits", 0) + 1
+        return True
+
     def post_full(self, *, slot, seq, nbytes):
         if self.drop_post:
             return
@@ -312,3 +317,238 @@ def test_a_slot_whose_byte_count_disagrees_refuses_before_the_first_copy(
             rendezvous=rv, shm_root=str(tmp_path))
     assert "disagree about what is in the slot" in str(exc.value)
     assert _read(dst_ops, dst_ptr, nbytes) == b"\x33" * nbytes
+
+
+# ---------------------------------------------------------------------------
+# (3) THE PRODUCT ADAPTER -- slice 3
+# ---------------------------------------------------------------------------
+
+
+class _FakeSems:
+    """The CROSS semaphores as counters, drivable OUT OF ORDER.
+
+    A real ``SemSet`` would BLOCK instead of refusing, so the only way to prove
+    the refusals can fire is a double whose counts a test sets by hand.
+    """
+
+    def __init__(self, *, empty=1, full=0):
+        self.counts = {}
+        self.init_empty = int(empty)
+        self.init_full = int(full)
+        self.log = []
+
+    def _key(self, pair, slot, kind):
+        k = (int(pair), int(slot), kind)
+        if k not in self.counts:
+            self.counts[k] = (self.init_empty if kind == "empty"
+                              else self.init_full)
+        return k
+
+    def timedwait(self, pair, slot, kind, budget_s):
+        k = self._key(pair, slot, kind)
+        self.log.append(("wait", k))
+        if self.counts[k] <= 0:
+            return False
+        self.counts[k] -= 1
+        return True
+
+    def post(self, pair, slot, kind):
+        k = self._key(pair, slot, kind)
+        self.log.append(("post", k))
+        self.counts[k] += 1
+
+
+class _FakeRegion:
+    """The slot record, as the two halves actually use it."""
+
+    def __init__(self):
+        self.slots = {}
+        self.boot_nonce = "adapter"
+
+    def publish(self, pair, slot, bytes_filled, *, checksum=0):
+        self.slots[(int(pair), int(slot))] = int(bytes_filled)
+
+    def read_slot(self, pair, slot):
+        class _R:
+            bytes_filled = self.slots.get((int(pair), int(slot)), 0)
+        return _R()
+
+
+def test_pair_of_names_the_cross_pair_and_the_diagonal_separately():
+    """The diagonal has no cross pair BY CONSTRUCTION, and that is not an error.
+
+    Handing a diagonal id to ``sem_name`` is what weg2xsn9 reported 36 times as
+    a bare IndexError, which is why that function refuses it by name (W15).
+    """
+    from sglang.srt.weg2 import weight_exchange_region as xr
+
+    assert wb.pair_of(0, 1) == xr.CROSS_PAIRS.index((0, 1))
+    assert wb.pair_of(2, 0) == xr.CROSS_PAIRS.index((2, 0))
+    for r in range(xr.N_CARDS):
+        assert wb.pair_of(r, r) is None
+
+
+def test_the_descs_are_split_by_pair_because_the_semaphores_are_named_that_way():
+    """A band mixing two pairs would post one pair's `full` for another's bytes."""
+    descs = [_d(1, 2), _d(1, 2), _d(1, 2)]
+    object.__setattr__(descs[0], "src_rank", 0)
+    object.__setattr__(descs[0], "dst_rank", 1)
+    object.__setattr__(descs[1], "src_rank", 2)
+    object.__setattr__(descs[1], "dst_rank", 1)
+    object.__setattr__(descs[2], "src_rank", 1)
+    object.__setattr__(descs[2], "dst_rank", 1)
+    groups = wb.group_descs_by_pair(descs)
+    from sglang.srt.weg2 import weight_exchange_region as xr
+
+    assert set(groups) == {xr.CROSS_PAIRS.index((0, 1)),
+                           xr.CROSS_PAIRS.index((2, 1)), None}
+    assert len(groups[None]) == 1, "the on-card descriptor is its own group"
+
+
+def test_the_rendezvous_obeys_the_order_run_producer_pair_states():
+    """fill -> sync -> publish -> post(full); never post before publish."""
+    sems, region = _FakeSems(), _FakeRegion()
+    rv = wb.CrossSlotRendezvous(region, sems, pair=0, budget_s=0.01)
+
+    assert rv.wait_empty(slot=0, seq=0) is True
+    rv.post_full(slot=0, seq=0, nbytes=4096)
+    # The publish must already be visible when `full` is posted.
+    kinds = [k for what, k in sems.log if what == "post"]
+    assert kinds and kinds[-1][2] == "full"
+    assert region.slots[(0, 0)] == 4096
+    assert rv.wait_full(slot=0, seq=0) == 4096
+    rv.post_empty(slot=0, seq=0)
+    assert sems.counts[(0, 0, "empty")] == 1
+
+
+def test_a_collect_whose_producer_never_posted_gets_None_not_a_stale_count():
+    sems, region = _FakeSems(full=0), _FakeRegion()
+    region.publish(0, 0, 9999)          # a PREVIOUS band's count, still there
+    rv = wb.CrossSlotRendezvous(region, sems, pair=0, budget_s=0.01)
+    assert rv.wait_full(slot=0, seq=0) is None, (
+        "an unposted slot must read None even when the record still carries a "
+        "byte count -- the record is not the handshake")
+
+
+def test_a_deposit_cannot_claim_a_slot_the_consumer_has_not_drained(tmp_path):
+    """The producing side of the unordered-read hazard, refused by name."""
+    nbytes = 4096
+    src_ops = FakeDeviceOps(str(tmp_path), rank=0)
+    src_ptr = src_ops.raw_malloc(0, nbytes)
+    sems, region = _FakeSems(empty=0), _FakeRegion()   # nothing drained
+    rv = wb.CrossSlotRendezvous(region, sems, pair=0, budget_s=0.01)
+    with pytest.raises(wb.Weg2XchgBouncePhaseUnordered) as exc:
+        wb.run_bounce_leg([wx.XchgDesc(
+            tag=TAG, src_rank=0, dst_rank=1, param_name="model.layers.0.w",
+            src_ptr=src_ptr, dst_ptr=None, kind=wx.FLAT, nbytes=nbytes, rows=1,
+            run_bytes=nbytes, spitch=0, dpitch=0, src_off=0, dst_off=0)],
+            src_ops, NONCE, slot_bytes=SLOT, depth=1,
+            mode=wx.INJECT_AUTHORITATIVE, phase=wb.PHASE_DEPOSIT,
+            rendezvous=rv, shm_root=str(tmp_path))
+    assert "still full when this deposit tried to claim it" in str(exc.value)
+
+
+def test_the_adapter_passes_deposit_on_source_and_collect_on_the_import_hooks():
+    """MUTANT: ignore `hook` and pass `both` -- this test dies.
+
+    It drives the REAL adapter body with a recording stand-in for
+    `run_bounce_leg`, so what is asserted is the argument the product actually
+    passes, not a restatement of the intent.
+    """
+    from sglang.srt.managers.scheduler_components import weight_updater as wu
+
+    seen = []
+
+    class _Stub:
+        _weg2_xchg_bounce_leg = wu.SchedulerWeightUpdaterManager._weg2_xchg_bounce_leg
+
+    rendezvous_seen = []
+
+    def _fake_leg(descs, ops, nonce, **kw):
+        rv = kw.get("rendezvous")
+        rendezvous_seen.append(rv)
+        seen.append((kw.get("phase"), rv is not None,
+                     [(d.src_rank, d.dst_rank) for d in descs]))
+        return None
+
+    descs = [_d(1, 2), _d(1, 2)]
+    object.__setattr__(descs[0], "src_rank", 0)
+    object.__setattr__(descs[0], "dst_rank", 1)
+    object.__setattr__(descs[1], "src_rank", 1)   # on-card
+    object.__setattr__(descs[1], "dst_rank", 1)
+
+    import sglang.srt.weg2.weight_exchange_bounce as real
+
+    orig = real.run_bounce_leg
+    real.run_bounce_leg = _fake_leg
+    try:
+        for hook, expect in (("source", wb.PHASE_DEPOSIT),
+                             ("destination", wb.PHASE_COLLECT),
+                             ("authoritative", wb.PHASE_COLLECT)):
+            seen.clear()
+            rendezvous_seen.clear()
+            _Stub()._weg2_xchg_bounce_leg(
+                descs=descs, ops=None, boot_nonce=NONCE, slot_bytes=SLOT,
+                depth=1, mode=wx.INJECT_AUTHORITATIVE, hook=hook,
+                region=_FakeRegion(), sems=_FakeSems())
+            phases = {p for p, _rv, _r in seen}
+            # EVERY LEG IS PHASED, DIAGONAL INCLUDED -- and this assertion was
+            # the OPPOSITE one commit ago, which is the finding worth keeping.
+            # The brief said `both` stays "for the diagonal"; the provider
+            # smoke refuted it on the first run: on the SOURCE hook the
+            # diagonal group raised `_missing_pointer: ... has no destination
+            # pointer`, because on-card means ONE CARD and TWO PROCESSES -- the
+            # co-located pair of ranks -- so the peer's pages are as
+            # unreachable there as across a link. `both` has no cross-process
+            # caller at all; it is the single-process form for tests and tools.
+            assert phases == {expect}, (hook, phases)
+            assert wb.PHASE_BOTH not in phases, (
+                "a flip leg may never run `both`: it asks this rank for the "
+                "peer's device address, which is weg2xsn20's wall")
+            # Both kinds carry a handshake; they differ in WHICH one -- the
+            # cross lane's 24 by pair, the diagonal's 12 by card (#1334).
+            assert len(seen) == 2 and all(s[1] for s in seen), seen
+            pairs = {tuple(s[2][0]) for s in seen}
+            assert pairs == {(0, 1), (1, 1)}, seen
+            kinds = {type(rv).__name__ for rv in rendezvous_seen}
+            assert kinds == {"CrossSlotRendezvous", "DiagonalSlotRendezvous"}, (
+                kinds)
+    finally:
+        real.run_bounce_leg = orig
+
+
+def test_without_a_handshake_a_cross_leg_is_refused_never_downgraded(tmp_path):
+    """THE RATCHET: no cross leg may fall back to `both`.
+
+    `both` asks this rank for the PEER's device address -- weg2xsn20's wall.
+    The adapter takes the unsplit form when region/sems are missing, and
+    `run_bounce_leg` must then refuse the cross pair by name.
+    """
+    from sglang.srt.managers.scheduler_components import weight_updater as wu
+
+    class _Stub:
+        _weg2_xchg_bounce_leg = wu.SchedulerWeightUpdaterManager._weg2_xchg_bounce_leg
+
+    descs = [wx.XchgDesc(
+        tag=TAG, src_rank=0, dst_rank=1, param_name="model.layers.0.w",
+        src_ptr=None, dst_ptr=0x2000, kind=wx.FLAT, nbytes=16, rows=1,
+        run_bytes=16, spitch=0, dpitch=0, src_off=0, dst_off=0)]
+    # No region, no sems -> the unsplit form -> W74 on the missing source,
+    # which is a REFUSAL and not a silently-run `both` leg.
+    with pytest.raises(Exception) as exc:
+        _Stub()._weg2_xchg_bounce_leg(
+            descs=descs, ops=None, boot_nonce=NONCE, slot_bytes=SLOT, depth=1,
+            mode=wx.INJECT_AUTHORITATIVE, hook="authoritative",
+            region=None, sems=None)
+    assert "W74" in str(exc.value) or "W68" in str(exc.value), str(exc.value)
+
+
+def test_the_sems_cache_is_a_declared_field_because_the_manager_has_slots():
+    """weg2xsn7 lost 24 of 24 legs to exactly this, on both groups."""
+    import dataclasses
+
+    from sglang.srt.managers.scheduler_components import weight_updater as wu
+
+    names = {f.name for f in
+             dataclasses.fields(wu.SchedulerWeightUpdaterManager)}
+    assert "_weg2_xchg_sems_cache" in names
