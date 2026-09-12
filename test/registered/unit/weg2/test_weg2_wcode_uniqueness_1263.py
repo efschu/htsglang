@@ -545,8 +545,68 @@ class TestOneWCodePerException(CustomTestCase):
             "W19 IS held in front.py -- if this ever fails the holder moved and "
             "the free list above must be re-derived, not trusted",
         )
-        for n in (5, 90):
+        # #1350 seam-digest (2026-09-12, ON THE MERGE TRAIN) TOOK W90 for
+        # `Weg2SeamDigestMismatch`.  The list shrinks HERE, in the same commit
+        # that lands the consumer, for the fifth code running -- and this one
+        # was caught BY this census rather than remembered: #1273 B4d wrote
+        # "W90 is free and is the next candidate" into the loop below while a
+        # sibling branch was already minting it.  Two slices, both green alone,
+        # colliding only at the train: exactly what a per-merge census is for.
+        # ...AND THE SAME CONSTRUCTION HOLDS W90, so this line may NOT rest on
+        # the census alone.  MEASURED BY MUTATION while writing this: the ONLY
+        # census-visible W90 in the tree is a string inside the CLI HELP TEXT of
+        # `--weg2-seam-digest` (launcher.py), because that sentence happens to
+        # spell the number and the name adjacently.  The REFUSAL itself is
+        # `REFUSAL_MARKER = W_CODE + " " + REFUSAL_NAME`, invisible like W91's.
+        # Rewording that help sentence -- zero behaviour change -- flips this
+        # census back to "W90 is free" while the code still holds it.  So the
+        # census reading is kept as a record of what the instrument sees, and
+        # the LOAD-BEARING guard is the second reading on the minting site.
+        self.assertIn(90, used, "W90 is the seam-digest mismatch refusal's number now")
+        # AND THE BLIND SPOT BIT AGAIN, A SIXTH TIME, ON THE SAME SLICE -- so it
+        # is closed here the way W19's was, not merely mentioned.
+        # `seam_digest.py` holds W91 for `Weg2SeamDigestBudgetExceeded`, but it
+        # builds the marker by CONCATENATION at import time:
+        #     W_CODE_BUDGET = "W91"
+        #     BUDGET_MARKER = W_CODE_BUDGET + " " + BUDGET_NAME
+        # so NO literal "W91 Weg2SeamDigestBudgetExceeded" exists anywhere for a
+        # text form to find, and every form above needs the number and the name
+        # ADJACENT.  W91 is therefore TAKEN and this file would have offered it
+        # to the next author -- the same shape as W19 and W88, one construction
+        # further out.  MEASURED CONSEQUENCE, not hypothetical: the #1348
+        # coverage-diff slice had independently minted W91 off the same base,
+        # and the census could not have caught that half.  Hence the second
+        # reading, pinned:
+        self.assertNotIn(91, used, "the census still cannot see W91's holder")
+        digest = pathlib.Path(_repo_root(), "python", "sglang", "srt", "weg2",
+                              "seam_digest.py")
+        digest_src = digest.read_text(errors="replace")
+        self.assertIn(
+            'W_CODE_BUDGET = "W91"', digest_src,
+            "W91 IS held in seam_digest.py -- if this ever fails the holder "
+            "moved and the free list above must be re-derived, not trusted",
+        )
+        self.assertIn(
+            'BUDGET_NAME = "Weg2SeamDigestBudgetExceeded"', digest_src,
+            "W91's holder name moved; re-derive the free list rather than "
+            "trusting this register",
+        )
+        self.assertIn(
+            'W_CODE = "W90"', digest_src,
+            "W90's holder moved out of seam_digest.py; the census sees W90 only "
+            "through a help-text sentence, so re-derive the free list rather "
+            "than trusting this register",
+        )
+        self.assertIn(
+            'REFUSAL_NAME = "Weg2SeamDigestMismatch"', digest_src,
+            "W90's holder name moved; re-derive the free list rather than "
+            "trusting this register",
+        )
+        for n in (5,):
             self.assertNotIn(n, used, f"W{n} is free and is the next candidate")
+        # W92 and W93 are the next candidates ABOVE the band this train filled
+        # (#1348's two codes were renumbered onto them at their merge, so by the
+        # time that posten lands these two assertions move with it).
         self.assertIn(88, used, "form 4 must see scheduler.py's signature code")
 
 
