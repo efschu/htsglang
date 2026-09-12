@@ -2931,7 +2931,7 @@ def card_manifest_entries(inventory: Sequence[object],
         for g in inventory))
 
 
-def derive_card_manifest(
+def card_inventory(
     *,
     rank: int,
     model,
@@ -2940,18 +2940,27 @@ def derive_card_manifest(
     family_tags: Optional[Callable[[int], Sequence[str]]] = None,
     tag_of: Optional[Callable[..., str]] = None,
 ):
-    """This rank's card manifest, without building a plan.  ``(entries, reason)``.
+    """This card's PLACEMENT inventory as ``([(ParamGeom, tensor), ...], reason)``.
 
-    THE ADAPTER'S ENTRY POINT, and it is separate from :func:`derive_leg_plan`
-    for a timing reason rather than a taste one: the manifest is a BOOT constant
-    (a rank's parameter inventory does not change across flips) and must be
-    published BEFORE the first plan is derived, because the plan is narrowed by
-    the agreement the publication makes possible.  Deriving a whole plan just to
-    read its inventory would double ``derive_ms`` on the flip's critical path,
-    which the hook budget subtracts from its own deadline.
+    ONE PRODUCER of a card's placement, extracted from
+    :func:`derive_card_manifest` (#1350) rather than copied beside it.  Both
+    consumers read the SAME walk, the SAME tag resolution, the SAME skip rule
+    and the SAME refusal words:
 
-    Every refusal word is :func:`derive_leg_plan`'s, verbatim, so a boot log can
-    be censused by cause across both entry points.
+    * :func:`derive_card_manifest` -- the pointer-free identity the co-located
+      pair agrees over and the plan is narrowed by;
+    * ``weg2.seam_digest`` -- the round-trip grader, which needs the identity
+      AND the live tensor behind it.
+
+    The grader deliberately does NOT walk ``model.named_parameters()`` itself.
+    Placement is a pure function of (header, P cut, D vector, quantisation) and
+    is decided by the loader at boot; a second inventory built from the live
+    model would be second bookkeeping beside this one -- the W80/W84/W19
+    family -- and the two would drift exactly where it matters least visibly.
+
+    The tensor rides along with its geometry because the two must come from the
+    same walk step: pairing them afterwards by name would reintroduce the
+    second reading through the back door.
     """
     from sglang.srt.managers import weg2_memory_saver as ms
     from sglang.srt.weg2 import weight_exchange as wx
@@ -2983,10 +2992,47 @@ def derive_card_manifest(
             # plan cannot describe must not be in the manifest either, or the
             # pair would agree on a piece one end can never move.
             continue
-        inventory.append(geom)
+        inventory.append((geom, param))
     if not inventory:
         return None, f"no-carried-tags:family={family}"
-    return card_manifest_entries(inventory), ""
+    return inventory, ""
+
+
+def derive_card_manifest(
+    *,
+    rank: int,
+    model,
+    region_tag: str = "",
+    chunk_geometry: Optional[Callable[[], Tuple[int, int]]] = None,
+    family_tags: Optional[Callable[[int], Sequence[str]]] = None,
+    tag_of: Optional[Callable[..., str]] = None,
+):
+    """This rank's card manifest, without building a plan.  ``(entries, reason)``.
+
+    THE ADAPTER'S ENTRY POINT, and it is separate from :func:`derive_leg_plan`
+    for a timing reason rather than a taste one: the manifest is a BOOT constant
+    (a rank's parameter inventory does not change across flips) and must be
+    published BEFORE the first plan is derived, because the plan is narrowed by
+    the agreement the publication makes possible.  Deriving a whole plan just to
+    read its inventory would double ``derive_ms`` on the flip's critical path,
+    which the hook budget subtracts from its own deadline.
+
+    Every refusal word is :func:`derive_leg_plan`'s, verbatim, so a boot log can
+    be censused by cause across both entry points.  The walk itself now lives in
+    :func:`card_inventory` (#1350), so the grader reads this card's placement
+    from the same producer instead of building a second inventory.
+    """
+    inventory, reason = card_inventory(
+        rank=rank,
+        model=model,
+        region_tag=region_tag,
+        chunk_geometry=chunk_geometry,
+        family_tags=family_tags,
+        tag_of=tag_of,
+    )
+    if inventory is None:
+        return None, reason
+    return card_manifest_entries([geom for geom, _tensor in inventory]), ""
 
 
 def derive_leg_plan(

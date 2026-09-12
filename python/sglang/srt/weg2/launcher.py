@@ -74,6 +74,7 @@ from sglang.srt.weg2 import (
     corridor_budget,
     host_ledger,
     ring_table,
+    seam_digest,
     weight_exchange,
     weight_exchange_region,
     weight_exchange_shadow,
@@ -4100,6 +4101,7 @@ def _env_knobs(ns) -> Dict[str, object]:
     environments would drift the day an eighth arrives.
     """
     return {
+        "seam_digest_armed": bool(getattr(ns, "weg2_seam_digest", False)),
         "barlink_build_window_cap_s": ns.barlink_build_window_cap_s,
         "pp_chain_recv_stall_s": ns.pp_chain_recv_stall_s,
         "pp_occupant_horizon_s": ns.pp_occupant_horizon_s,
@@ -4120,6 +4122,7 @@ def build_env(tree: str, venv: str, cvd: str, store_dir: str, debug_hold: bool, 
               arming_floor_solved: bool = True,
               hicache_bigram_keys: bool = True,
               hicache_flush_publish_sweep: bool = True,
+              seam_digest_armed: bool = False,
               group: str = "",
               xchg_env: Optional[Dict[str, str]] = None) -> Dict[str, str]:
     env = dict(os.environ)
@@ -4197,8 +4200,22 @@ def build_env(tree: str, venv: str, cvd: str, store_dir: str, debug_hold: bool, 
                 # S6 fix E: the slot ceiling is launcher OUTPUT too -- an
                 # inherited value would size a deposit this boot's ledger
                 # charged a different worst case for.
-                weight_exchange_transport.ENV_ONCARD_SLOT_MIB):
+                weight_exchange_transport.ENV_ONCARD_SLOT_MIB,
+                # #1350: the seam grader's arm, launcher OUTPUT for the
+                # sharpest version of the same reason -- an inherited
+                # ``SGLANG_WEG2_SEAM_DIGEST=1`` would put a whole-shard hash on
+                # the critical path of every flip leg of a SERVING boot, i.e.
+                # it would turn an instrument into a performance regression
+                # nobody asked for.  Popped first, set below only when the
+                # flag is on.
+                seam_digest.ENV_ARM):
         env.pop(key, None)
+    # #1350: armed ONLY by ``--weg2-seam-digest``, and on any weight-source
+    # arm -- the grader asks "did the round trip return my bytes", which is a
+    # question the ring carrier has to answer too, so tying it to the exchange
+    # arms would have made the ring's own round trip ungraded.
+    if seam_digest_armed:
+        env[seam_digest.ENV_ARM] = "1"
     for key, value in (xchg_env or {}).items():
         env[str(key)] = str(value)
     cu13 = f"{venv}/lib/python3.12/site-packages/nvidia/cu13/lib"
@@ -8427,6 +8444,29 @@ def build_parser() -> argparse.ArgumentParser:
                          "card with the R17 gate beside it, and publishes the table "
                          "to the ranks as SGLANG_WEG2_PCIE_DUPLEX. An unreadable or "
                          "rowless file means NO card splits its lock key")
+    ap.add_argument(
+        "--weg2-seam-digest", action="store_true",
+        help="#1350: arm the SEAM GRADER on both groups. It answers one "
+             "question -- 'did the round trip bring MY bytes back' -- by "
+             "hashing this rank's own pieces at the last instant before the "
+             "weights family is paused and again at the first instant after it "
+             "has landed, and refusing by name (W90 Weg2SeamDigestMismatch) "
+             "when they differ. Rank-local: no peer, no collective, no byte "
+             "moved between cards, and both moments AWAKE -- at flip time the "
+             "sleeping group holds no weight bytes in VRAM at all, so a "
+             "cutover-time compare is impossible rather than merely expensive. "
+             "Keyed by the PLACEMENT identity the plan already publishes "
+             "(param_name, class, tag, card, storage extents), so a mismatch "
+             "NAMES the pieces that moved -- and so a change of arena, pointer "
+             "or pitch, which the exchange makes by design, is not mistaken "
+             "for a change of content. "
+             "DEFAULT OFF and meant for an S6I INSTRUMENT boot: the hash costs "
+             "a full read of the shard on every flip leg, so arming it on a "
+             "serving boot is a flip-cost regression. Published to the ranks "
+             "as SGLANG_WEG2_SEAM_DIGEST, which is launcher OUTPUT and is "
+             "POPPED when this flag is absent, so an inherited shell value "
+             "cannot arm it. LIMIT: a green digest says the bytes came back, "
+             "never that the layout was verified.")
     ap.add_argument(
         "--weg2-weight-source", choices=WEIGHT_SOURCE_CHOICES,
         default=WEIGHT_SOURCE_DEFAULT,

@@ -20,49 +20,62 @@ without a grader, which is the class this campaign has paid for all day
 (green-by-vacancy, counter-vs-actuator, delivered-never-wired).
 
 So variant (a): A RANK-LOCAL DIGEST OVER THE SEAM.  Taken before the pause,
-recomputed after the landing, same rank, same shard.  Both sides rank-own: no
+recomputed after the landing, same rank, same pieces.  Both sides rank-own: no
 peer, no collective, no byte movement between cards, both moments OUTSIDE the
 no-return region (#875 DO-NOT-BUILD untouched).  Cost is a hash, not an image,
 so the host-RAM law stays intact.  It is even SUPERIOR to the memcmp it
 replaces: a memcmp against a second copy would have proven COPY fidelity; this
 proves ROUND-TRIP fidelity, which is the question the exchange must answer.
 
+THE KEY IS THE PLACEMENT (operator direction 2026-09-12).  The grader does NOT
+walk ``model.named_parameters()`` itself and does not invent a
+``(name, shape, dtype)`` triple: placement is a pure function of (header, P cut,
+D vector, quantisation), decided by the LOADER at boot, and the tree already
+carries it as ``ParamGeom`` / ``XchgDesc`` through ``build_plan`` and
+``derive_card_manifest``.  A second inventory would be second bookkeeping -- the
+W80/W84/W19 family.  So the piece enumeration comes from ONE producer,
+``weight_exchange_shadow.card_inventory``, and the key is
+``(manifest_entry(name, class, rows, cols, itemsize), tag, card)``.  That is
+what buys the localisation: a mismatch NAMES the pieces.
+
 THE THREE OPERATOR CONDITIONS ARE DESIGN CONDITIONS, NOT ADDENDA, and each has
 its own test below plus a mutant that must die:
 
-  (1) THE DIGEST COVERS THE LOGICAL TENSOR CONTENT, per rank, per shard, never
-      an arena span, and it is FORM-KEYED.  The exchange changes the layout BY
-      DESIGN (other tag, other arena), so a span digest would compare two
+  (1) LOGICAL CONTENT PER PIECE, never an arena span, keyed by PLACEMENT.  The
+      exchange moves the arena BY DESIGN, so a span digest would compare two
       different things and be Instrument-lies class A.
-      -> `test_the_digest_survives_a_layout_change_that_preserves_content`
+      -> `test_the_digest_survives_an_arena_change_that_preserves_content`
       -> `test_the_byte_count_is_the_logical_extent_not_the_storage_span`
-      -> mutant M1 (span instead of content) dies on both.
-  (2) DEFAULT OFF.  Armed only for instrument boots (S6I shape) through a NAMED
-      knob.  Hashing ~9.6 GiB per rank is not free; always-on would be a flip
-      cost regression, i.e. a performance defect the grader itself causes.
+      -> `test_the_key_carries_no_pointer_no_pitch_no_arena`
+      -> mutant M1 (span instead of content) dies on those.
+  (2) DEFAULT OFF, armed only for instrument boots (S6I shape) through a NAMED
+      knob.  Hashing a whole shard per rank is not free; always-on would be a
+      flip cost regression, i.e. a performance defect the grader causes.
       -> `test_default_is_off_and_not_one_byte_is_read`
       -> mutant M2 (always-on) dies there.
-  (3) AN HONEST LIMIT IN THE LOG LINE AND IN THE RECORD: a digest DETECTS, it
-      does not LOCALIZE; a green digest is never "layout verified".
+  (3) AN HONEST LIMIT in the log line and in the record.  AMENDED BY THE
+      RE-KEYING, and the amendment is stated rather than assumed: the operator's
+      original wording was "a digest DETECTS, it does not LOCALIZE".  With the
+      placement key that hole is closed one level -- a mismatch names the pieces
+      -- and what remains true is that it does not localise WITHIN a piece and
+      that a green digest is never "layout verified".
       -> `test_the_verdict_line_carries_the_honest_limit_verbatim`
+      -> `test_a_content_mismatch_names_the_pieces_that_moved`
 
 AWAKE-ONLY IS BINDING, and it is a STRUCTURAL fact rather than a cost choice
 (`understand_tensor-map.md` section 5.4 + ``weg2_memory_saver.py:123``,
 ``WEG2_SLEEP_TAGS = {kv_cache, weights}``): at flip time the sleeping group
 holds NO weight bytes in VRAM at all.  A "compare at the cutover" design is not
-expensive, it is IMPOSSIBLE.  The two moments are therefore: the last instant
-before the pause, and the first instant after the landing -- both on the awake
-side of the same rank.
+expensive, it is IMPOSSIBLE.
   -> `test_the_only_call_sites_are_the_two_awake_seams`
   -> `test_no_cutover_or_flip_module_takes_a_reading`
   -> mutant M4 (a reading at the cutover) dies there.
 
-THE DANGER DIRECTION NOBODY WOULD SEE: a comparison ACROSS TWO FORMS.  If the
-form set moved, the content digests describe different things and comparing
-them is not a finding.  The compare REFUSES by naming the form instead of
-grading content.
-  -> `test_a_changed_form_refuses_the_content_compare_by_name`
-  -> mutant M3 (form_key ignored) dies there.
+THE DANGER DIRECTION NOBODY WOULD SEE: a comparison ACROSS TWO PLACEMENTS.  If
+the piece set moved, the content digests describe different things and comparing
+them is not a finding.  The compare REFUSES by naming the placement.
+  -> `test_a_changed_placement_refuses_the_content_compare_by_name`
+  -> mutant M3 (placement key ignored) dies there.
 
 AND THE ONE THIS PROJECT KEEPS PAYING FOR: a verdict that is produced, logged
 and then not acted upon.  A MISMATCH RAISES.
@@ -71,7 +84,8 @@ and then not acted upon.  A MISMATCH RAISES.
   -> mutant M5 (log, do not refuse) dies on both.
 
 RED-FIRST STATE AT ``d294bde41d``: ``sglang.srt.weg2.seam_digest`` does not
-exist, so every test below fails by NAME (the import is deferred into `_mod()`
+exist and ``weight_exchange_shadow.card_inventory`` does not exist, so every
+test below fails by NAME (the imports are deferred into `_mod()` / `_shadow()`
 for exactly that reason -- a module-level import would collapse the whole file
 into one collection error and prove nothing per name).
 """
@@ -86,6 +100,8 @@ import torch
 
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 
+from sglang.srt.weg2 import weight_exchange as wx
+
 REPO_ROOT = os.path.abspath(
     os.path.join(os.path.dirname(__file__), "..", "..", "..", "..")
 )
@@ -96,6 +112,10 @@ def _mod():
     return importlib.import_module("sglang.srt.weg2.seam_digest")
 
 
+def _shadow():
+    return importlib.import_module("sglang.srt.weg2.weight_exchange_shadow")
+
+
 def _wu():
     from sglang.srt.managers.scheduler_components import weight_updater
 
@@ -103,156 +123,271 @@ def _wu():
 
 
 # ---------------------------------------------------------------------------
-# Fixtures: a rank's shard, in two layouts that hold the SAME logical values.
+# Fixtures.  The inventory is (ParamGeom, tensor) pairs built with EXACTLY the
+# arguments `card_inventory` builds them with -- REPLICATED, shard_total 0,
+# stage = this rank -- so the test drives the product's own geometry rather
+# than a look-alike.
 # ---------------------------------------------------------------------------
-def _shard(seed: int = 7):
+_TENSORS = (
+    ("model.layers.0.self_attn.qkv_proj.weight", "weights_0", (64, 40), torch.bfloat16),
+    ("model.layers.0.mlp.down_proj.weight", "weights_0", (40, 96), torch.float32),
+    ("model.layers.0.input_layernorm.weight", "weights_0", (40,), torch.float32),
+    ("model.embed_tokens.weight", "weights", (128, 40), torch.bfloat16),
+)
+
+
+def _tensor(shape, dtype, seed):
     g = torch.Generator().manual_seed(seed)
-    return [
-        ("layer.0.qkv_proj.weight", torch.randn(64, 40, generator=g).to(torch.bfloat16)),
-        ("layer.0.mlp.down_proj.weight", torch.randn(40, 96, generator=g)),
-        ("layer.0.input_layernorm.weight", torch.randn(40, generator=g)),
-        ("embed_tokens.weight", torch.randn(128, 40, generator=g).to(torch.bfloat16)),
-    ]
+    return torch.randn(*shape, generator=g).to(dtype)
 
 
-def _relaid(named):
-    """The SAME logical values, in a deliberately different physical layout.
-
-    Every property a span digest could key on is moved and the content is not:
-
-    * a FRESH allocation (other arena, other ``data_ptr``),
-    * a non-zero ``storage_offset``,
-    * a transposed, NON-CONTIGUOUS stride,
-    * a storage whose byte extent is far larger than the tensor's own.
-
-    This is the harder half of the red-first falsifier, and the half that
-    proves the digest is not accidentally a layout digest.
-    """
+def _inventory(seed: int = 7, rank: int = 1):
     out = []
-    for name, t in named:
-        if t.dim() == 1:
-            big = torch.zeros(t.shape[0] + 11, dtype=t.dtype)
-            view = big[5 : 5 + t.shape[0]]
-        else:
-            big = torch.zeros(t.shape[1] + 3, t.shape[0] + 5, dtype=t.dtype)
-            view = big[3:, 5:].t()
-        view.copy_(t)
-        out.append((name, view))
+    for i, (name, tag, shape, dtype) in enumerate(_TENSORS):
+        t = _tensor(shape, dtype, seed + i)
+        geom = wx.ParamGeom.of(
+            t, name=name, tag=tag, shard_axis=wx.REPLICATED, shard_total=0,
+            stage=int(rank),
+        )
+        out.append((geom, t))
     return out
 
 
-def _reading(mod, stage, named, *, tags=("weights",), rank=1, epoch=4):
+def _rearena(inventory, rank: int = 1):
+    """The SAME logical values, in a different ARENA -- the change the exchange
+    actually makes.
+
+    Every property that moves when the bytes are re-laid is moved here and the
+    content is not:
+
+    * a FRESH allocation (other ``data_ptr``, other storage object),
+    * a non-zero ``storage_offset``,
+    * a PADDED PITCH, so the storage extent is strictly larger than the piece,
+    * and the pad is filled with GARBAGE rather than zeros, so a digest over the
+      storage SPAN genuinely differs while the content digest does not.
+
+    The placement identity is unchanged by construction: ``manifest_entry``
+    carries ``(name, class, rows, cols, itemsize)`` and deliberately not the
+    pitch, for the same reason this test exists.
+    """
+    out = []
+    for geom, t in inventory:
+        if t.dim() == 1:
+            big = torch.full((t.shape[0] + 11,), 7.0, dtype=t.dtype)
+            view = big[5 : 5 + t.shape[0]]
+        else:
+            big = torch.full((t.shape[0], t.shape[1] + 7), 7.0, dtype=t.dtype)
+            view = big[:, : t.shape[1]]
+        view.copy_(t)
+        new_geom = wx.ParamGeom.of(
+            view, name=geom.name, tag=geom.tag, shard_axis=wx.REPLICATED,
+            shard_total=0, stage=int(rank),
+        )
+        out.append((new_geom, view))
+    return out
+
+
+def _reading(mod, stage, inventory, *, tags=("weights",), rank=1, card=2, epoch=4):
     return mod.take_reading(
-        stage,
-        named,
-        group="P",
-        rank=rank,
-        tags=tags,
-        epoch=epoch,
+        stage, inventory, group="P", rank=rank, card=card, tags=tags, epoch=epoch
     )
 
 
 # ===========================================================================
-# CONDITION (1): content, not span.  Form-keyed.
+# THE KEY: the tree's published placement identity, not a second inventory.
 # ===========================================================================
 
 
-def test_the_digest_survives_a_layout_change_that_preserves_content():
-    """THE HARD HALF OF THE RED-FIRST FALSIFIER, and condition (1) itself.
+def test_the_grader_reads_the_producer_and_builds_no_second_inventory():
+    """The operator's direction of 2026-09-12, asserted on the module's text.
 
-    The exchange changes the layout by design.  A digest that moves when only
-    the layout moved would report MISMATCH on every single correct flip -- the
-    instrument would be the defect.  Mutant M1 (hash the storage span) dies
-    here.
+    A private ``named_parameters()`` walk here would be a second reading of a
+    fact the loader already decided and ``card_inventory`` already publishes --
+    the W80/W84/W19 family.  The producer is named; a copy of it is not.
+    """
+    src = inspect.getsource(_mod())
+    assert "named_parameters" not in src, (
+        "the grader walks the live model itself: that is the second inventory "
+        "the placement re-keying removed"
+    )
+    assert "card_inventory" in src
+    assert "manifest_entry" in src and "tensor_class" in src
+
+
+def test_card_inventory_is_the_one_producer_the_manifest_also_uses():
+    """ONE producer, two consumers -- so the manifest the co-located pair agrees
+    over and the pieces this grader hashes cannot be two different sets."""
+    shadow = _shadow()
+    assert callable(shadow.card_inventory)
+    src = inspect.getsource(shadow.derive_card_manifest)
+    assert "card_inventory(" in src, (
+        "derive_card_manifest no longer reads the shared producer: the walk has "
+        "been copied instead of extracted"
+    )
+
+
+def test_the_key_carries_no_pointer_no_pitch_no_arena():
+    """Condition (1) at the level of the KEY itself.
+
+    The four properties that move when the arena moves must not be in it.  A
+    key that carried any of them would fire on every correct flip.
     """
     mod = _mod()
-    before = _reading(mod, "before", _shard(), tags=("weights_0", "weights_1"))
-    after = _reading(mod, "after", _relaid(_shard()), tags=("weights",))
+    inv = _inventory()
+    re_inv = _rearena(inv)
+    for (geom, t), (re_geom, re_t) in zip(inv, re_inv):
+        a = mod.identity_of(geom, card=2)
+        b = mod.identity_of(re_geom, card=2)
+        assert a.key == b.key, f"{a.label}: the key moved with the arena"
+        assert t.data_ptr() != re_t.data_ptr()
+        assert t.untyped_storage().nbytes() != re_t.untyped_storage().nbytes()
+    # and the key DOES move with the coordinates that are placement
+    geom = inv[0][0]
+    assert mod.identity_of(geom, card=2).key != mod.identity_of(geom, card=3).key
+    other_tag = geom.replace(tag="weights_5")
+    assert mod.identity_of(other_tag, card=2).key != mod.identity_of(geom, card=2).key
+
+
+def test_the_identity_label_names_the_piece_a_human_would_look_for():
+    mod = _mod()
+    identity = mod.identity_of(_inventory()[0][0], card=2)
+    assert identity.param_name == "model.layers.0.self_attn.qkv_proj.weight"
+    assert identity.cls == "qkv_proj"
+    assert identity.tag == "weights_0"
+    assert identity.card == 2
+    for part in ("qkv_proj", "weights_0", "card2"):
+        assert part in identity.label
+
+
+# ===========================================================================
+# CONDITION (1): content, not span.
+# ===========================================================================
+
+
+def test_the_digest_survives_an_arena_change_that_preserves_content():
+    """THE HARD HALF OF THE RED-FIRST FALSIFIER, and condition (1) itself.
+
+    The exchange re-lays the bytes by design.  A digest that moved when only
+    the arena moved would report MISMATCH on every correct flip -- the
+    instrument would be the defect.  Mutant M1 (hash the storage span) dies
+    here, and it dies loudly because the pad bytes are garbage, not zeros.
+    """
+    mod = _mod()
+    before = _reading(mod, "before", _inventory(), tags=("weights_0", "weights"))
+    after = _reading(mod, "after", _rearena(_inventory()), tags=("weights",))
     verdict = mod.compare(before, after)
     assert verdict.verdict == mod.VERDICT_MATCH, (
-        "a layout change that preserves content was graded "
-        f"{verdict.verdict}/{verdict.reason}: this is a layout digest, not a "
-        "content digest"
+        f"an arena change that preserves content was graded "
+        f"{verdict.verdict}/{verdict.reason}: this is a span digest, not a "
+        f"content digest. moved={verdict.moved}"
     )
     assert before.digest == after.digest
+    assert before.placement_key == after.placement_key
 
 
 def test_the_byte_count_is_the_logical_extent_not_the_storage_span():
     """Second face of M1: even the reported ``bytes`` must be the logical one.
 
-    The relaid shard sits in a storage several times its own size.  A reading
-    that priced the span would print a number no reader could reconcile with
-    the shard, and would be the same category error one level down.
+    The re-arena'd pieces sit in padded allocations.  A reading that priced the
+    span would print a number no reader could reconcile with the plan, and
+    would be the same category error one level down.
     """
     mod = _mod()
-    named = _shard()
-    logical = sum(t.numel() * t.element_size() for _, t in named)
-    assert _reading(mod, "before", named).bytes == logical
-    assert _reading(mod, "after", _relaid(named)).bytes == logical
+    inv = _inventory()
+    logical = sum(int(t.numel()) * int(t.element_size()) for _g, t in inv)
+    assert _reading(mod, "before", inv).bytes == logical
+    assert _reading(mod, "after", _rearena(inv)).bytes == logical
 
 
-def test_a_single_flipped_byte_after_the_landing_is_a_mismatch():
+def test_a_single_flipped_element_after_the_landing_is_a_mismatch():
     """THE OTHER HALF OF THE FALSIFIER: the direction the grader exists for."""
     mod = _mod()
-    before = _reading(mod, "before", _shard())
-    landed = _relaid(_shard())
-    # ONE element of ONE shard, in the middle, on the relaid side.
-    name, t = landed[1]
-    t[3, 7] = t[3, 7] + 1.0
+    before = _reading(mod, "before", _inventory())
+    landed = _rearena(_inventory())
+    landed[1][1][3, 7] = landed[1][1][3, 7] + 1.0
     after = _reading(mod, "after", landed)
     verdict = mod.compare(before, after)
     assert verdict.verdict == mod.VERDICT_MISMATCH
     assert verdict.reason == mod.REASON_CONTENT
 
 
-def test_the_digest_is_not_a_count_or_a_name_check():
-    """DENOMINATOR FIRST: a digest that hashed only names and shapes would pass
-    both tests above and detect nothing.  Same forms, different content."""
+def test_a_content_mismatch_names_the_pieces_that_moved():
+    """CONDITION (3) AS AMENDED: the localisation the placement key buys.
+
+    This is the half the pre-re-keying design could not do -- it could say THAT
+    something moved and not WHICH.  A count alone is the hole; the labels close
+    it.
+    """
     mod = _mod()
-    a = _reading(mod, "before", _shard(seed=7))
-    b = _reading(mod, "after", _shard(seed=8))
-    assert a.form_key == b.form_key, "the two shards must share one form"
+    before = _reading(mod, "before", _inventory())
+    landed = _rearena(_inventory())
+    landed[1][1][0, 0] = landed[1][1][0, 0] + 1.0
+    verdict = mod.compare(before, _reading(mod, "after", landed))
+    assert verdict.moved == (
+        "model.layers.0.mlp.down_proj.weight[down_proj]@weights_0/card2",
+    )
+    line = verdict.line()
+    assert "moved=1" in line
+    assert "down_proj" in line
+    # the pieces that did NOT move are not named
+    assert "qkv_proj" not in line
+
+
+def test_the_digest_is_not_a_count_or_a_placement_check():
+    """DENOMINATOR FIRST: a digest that hashed only the placement would pass the
+    two tests above and detect nothing.  Same placement, different content."""
+    mod = _mod()
+    a = _reading(mod, "before", _inventory(seed=7))
+    b = _reading(mod, "after", _inventory(seed=80))
+    assert a.placement_key == b.placement_key, "the two readings must share a placement"
     assert a.digest != b.digest
     assert mod.compare(a, b).verdict == mod.VERDICT_MISMATCH
 
 
 # ===========================================================================
-# THE FORM KEY: a comparison across two forms is refused, never graded.
+# A comparison across two placements is refused, never graded.
 # ===========================================================================
 
 
-def test_a_changed_form_refuses_the_content_compare_by_name():
-    """Mutant M3 (ignore ``form_key``) dies here.
+def test_a_changed_placement_refuses_the_content_compare_by_name():
+    """Mutant M3 (ignore the placement key) dies here.
 
     Note what is asserted: not merely that the verdict is not MATCH -- a
-    content compare across two forms also fails to match, so that assertion
-    would survive M3 -- but that the REASON names the form.  Grading content
-    across two forms is not a weaker finding, it is a different one.
+    content compare across two placements also fails to match, so that
+    assertion would survive M3 -- but that the REASON names the placement, and
+    that the two sides are named.  Grading content across two placements is not
+    a weaker finding, it is a different one.
     """
     mod = _mod()
-    before = _reading(mod, "before", _shard())
-    moved = _shard()
-    moved[0] = (moved[0][0], moved[0][1][:32])  # the shard's own form changed
+    before = _reading(mod, "before", _inventory())
+    moved = _inventory()[:-1]  # a piece is no longer on this card
     after = _reading(mod, "after", moved)
     verdict = mod.compare(before, after)
     assert verdict.verdict == mod.VERDICT_MISMATCH
-    assert verdict.reason == mod.REASON_FORM, (
-        "a form change was graded as a content change: the compare read "
-        "content across two forms"
+    assert verdict.reason == mod.REASON_PLACEMENT, (
+        "a placement change was graded as a content change: the compare read "
+        "content across two placements"
     )
-    assert before.form_key != after.form_key
+    assert verdict.gone == ("model.embed_tokens.weight[embed_tokens]@weights/card2",)
+    assert verdict.arrived == ()
+    assert before.placement_key != after.placement_key
     line = verdict.line()
-    assert f"form_key_before={before.form_key}" in line
-    assert f"form_key_after={after.form_key}" in line
+    assert f"placement_key_before={before.placement_key}" in line
+    assert f"placement_key_after={after.placement_key}" in line
+    assert "embed_tokens" in line
 
 
-def test_the_form_key_ignores_layout_and_moves_with_shape_or_dtype():
+def test_a_piece_that_lands_on_another_card_is_a_placement_refusal():
+    """The card is a placement coordinate, so a piece that comes back on the
+    wrong card is refused by name rather than compared."""
     mod = _mod()
-    named = _shard()
-    assert mod.form_key(named) == mod.form_key(_relaid(named))
-    other = _shard()
-    other[2] = (other[2][0], other[2][1].to(torch.float64))
-    assert mod.form_key(named) != mod.form_key(other)
+    before = _reading(mod, "before", _inventory(), card=2)
+    after = _reading(mod, "after", _inventory(), card=3)
+    verdict = mod.compare(before, after)
+    assert verdict.verdict == mod.VERDICT_MISMATCH
+    assert verdict.reason == mod.REASON_PLACEMENT
+    assert len(verdict.gone) == len(_TENSORS)
+    assert len(verdict.arrived) == len(_TENSORS)
 
 
 # ===========================================================================
@@ -261,13 +396,13 @@ def test_the_form_key_ignores_layout_and_moves_with_shape_or_dtype():
 
 
 class _Exploding(list):
-    """An iterable that refuses to be read.  ~9.6 GiB per rank is the cost this
-    guards; a test that only checked a boolean could not tell an unarmed hook
-    from an armed hook whose result was thrown away."""
+    """An iterable that refuses to be read.  A whole shard per rank is the cost
+    this guards; a test that only checked a boolean could not tell an unarmed
+    hook from an armed hook whose result was thrown away."""
 
     def __iter__(self):
         raise AssertionError(
-            "the unarmed path read the shard: the digest is not default-off"
+            "the unarmed path read the inventory: the digest is not default-off"
         )
 
 
@@ -276,7 +411,8 @@ def test_default_is_off_and_not_one_byte_is_read():
     mod = _mod()
     assert mod.seam_digest_armed({}) is False
     assert mod.take_reading_if_armed(
-        "before", _Exploding(), group="P", rank=0, tags=(), epoch=1, environ={}
+        "before", _Exploding(), group="P", rank=0, card=0, tags=(), epoch=1,
+        environ={},
     ) is None
 
 
@@ -309,8 +445,12 @@ def test_the_launcher_publishes_the_arm_only_when_the_flag_is_set():
     from sglang.srt.weg2 import launcher
 
     src = inspect.getsource(launcher)
-    assert "seam_digest.ENV_ARM" in src or "SGLANG_WEG2_SEAM_DIGEST" in src
+    assert "seam_digest.ENV_ARM" in src
     assert "--weg2-seam-digest" in src
+    # POPPED, not merely unset: the pop list is what makes an inherited value
+    # harmless, and it is the half that is easy to forget.
+    pop_block = src[src.index("for key in (\"SGLANG_WEG2_XCHG_REGION\""):]
+    assert "seam_digest.ENV_ARM" in pop_block[: pop_block.index("):")]
 
 
 # ===========================================================================
@@ -320,32 +460,51 @@ def test_the_launcher_publishes_the_arm_only_when_the_flag_is_set():
 
 def test_the_verdict_line_carries_the_honest_limit_verbatim():
     mod = _mod()
-    before = _reading(mod, "before", _shard())
-    after = _reading(mod, "after", _relaid(_shard()))
+    before = _reading(mod, "before", _inventory())
+    after = _reading(mod, "after", _rearena(_inventory()))
     line = mod.compare(before, after).line()
     assert mod.LIMIT_CLAUSE in line
-    assert "DETECTS" in mod.LIMIT_CLAUSE and "LOCALIZE" in mod.LIMIT_CLAUSE
+    assert "DETECTS" in mod.LIMIT_CLAUSE
+    assert "does NOT localise within a piece" in mod.LIMIT_CLAUSE
+    assert "layout verified" in mod.LIMIT_CLAUSE
 
 
 def test_the_verdict_line_carries_every_field_the_boot_seat_reads():
     mod = _mod()
-    before = _reading(mod, "before", _shard(), tags=("weights_0",), rank=2, epoch=9)
-    after = _reading(mod, "after", _relaid(_shard()), tags=("weights",), rank=2, epoch=10)
+    before = _reading(mod, "before", _inventory(), tags=("weights_0",), rank=2, epoch=9)
+    after = _reading(
+        mod, "after", _rearena(_inventory()), tags=("weights",), rank=2, epoch=10
+    )
     line = mod.compare(before, after).line()
     assert line.startswith(mod.LINE_PREFIX)
     for field in (
         "rank=2",
         "group=P",
+        "card=2",
         "tag=",
-        "n_tensors=4",
+        "placement_key_before=",
+        "placement_key_after=",
+        f"n_tensors={len(_TENSORS)}",
         f"bytes={before.bytes}",
         f"digest_before={before.digest}",
         f"digest_after={after.digest}",
         f"verdict={mod.VERDICT_MATCH}",
         "reason=",
+        "moved=0",
         "population=",
     ):
         assert field in line, f"the verdict line has no {field!r}: {line}"
+
+
+def test_a_long_mismatch_list_is_bounded_but_never_silently_truncated():
+    mod = _mod()
+    labels = tuple(f"p{i}[cls]@weights/card0" for i in range(mod.MAX_NAMED_PIECES + 5))
+    v = mod.SeamVerdict(
+        mod.VERDICT_MISMATCH, mod.REASON_CONTENT, None, None, moved=labels
+    )
+    line = v.line()
+    assert f"moved={len(labels)}" in line
+    assert "+5-more" in line
 
 
 def test_unarmed_is_a_named_absence_and_never_reads_as_a_pass():
@@ -353,7 +512,9 @@ def test_unarmed_is_a_named_absence_and_never_reads_as_a_pass():
     distinguishable from MATCH by anything that reads the line, and it must
     never raise either -- an absence is not a finding in either direction."""
     mod = _mod()
-    v = mod.unarmed_verdict("no-before-reading", group="P", rank=0, tags=("weights",))
+    v = mod.unarmed_verdict(
+        "no-before-reading", group="P", rank=0, card=1, tags=("weights",)
+    )
     assert v.verdict == mod.VERDICT_UNARMED
     assert v.verdict != mod.VERDICT_MATCH
     assert v.refusal() is None
@@ -370,28 +531,31 @@ def test_unarmed_is_a_named_absence_and_never_reads_as_a_pass():
 
 def test_a_mismatch_is_a_named_refusal_not_a_log_line():
     mod = _mod()
-    before = _reading(mod, "before", _shard(seed=7))
-    after = _reading(mod, "after", _shard(seed=8))
+    before = _reading(mod, "before", _inventory(seed=7))
+    after = _reading(mod, "after", _inventory(seed=80))
     verdict = mod.compare(before, after)
     exc = verdict.refusal()
     assert isinstance(exc, mod.Weg2SeamDigestMismatch)
     assert mod.REFUSAL_MARKER in str(exc)
     assert mod.W_CODE == "W90"
     assert mod.REFUSAL_MARKER.startswith("W90 Weg2SeamDigestMismatch")
+    # the refusal carries the localisation, not just the fact
+    assert "pieces_moved=" in str(exc)
     # MATCH and UNARMED refuse nothing.
-    assert mod.compare(before, _reading(mod, "after", _shard(seed=7))).refusal() is None
+    assert mod.compare(before, _reading(mod, "after", _inventory(seed=7))).refusal() is None
 
 
 def test_the_w_code_is_this_exception_and_no_other():
     """The #1263 census law, applied at the mint rather than after it."""
-    mod = _mod()
+    _mod()
     hits = set()
-    for root, _dirs, names in os.walk(os.path.join(REPO_ROOT, "python", "sglang", "srt")):
+    for root, _dirs, names in os.walk(
+        os.path.join(REPO_ROOT, "python", "sglang", "srt")
+    ):
         for n in names:
             if not n.endswith(".py"):
                 continue
-            path = os.path.join(root, n)
-            with open(path, encoding="utf-8") as fh:
+            with open(os.path.join(root, n), encoding="utf-8") as fh:
                 for line in fh:
                     if re.search(r"\bW90\b", line):
                         hits.add(re.sub(r"\s+", " ", line).strip())
@@ -410,7 +574,9 @@ _READING_CALLS = ("_weg2_seam_digest_before", "_weg2_seam_digest_after")
 
 
 def _py_files():
-    for root, _dirs, names in os.walk(os.path.join(REPO_ROOT, "python", "sglang", "srt")):
+    for root, _dirs, names in os.walk(
+        os.path.join(REPO_ROOT, "python", "sglang", "srt")
+    ):
         for n in names:
             if n.endswith(".py"):
                 yield os.path.join(root, n)
@@ -425,9 +591,9 @@ def test_the_only_call_sites_are_the_two_awake_seams():
         for hook in _READING_CALLS:
             if f"self.{hook}(" in body:
                 callers.setdefault(hook, set()).add(os.path.relpath(path, REPO_ROOT))
-    expected = "python/sglang/srt/managers/scheduler_components/weight_updater.py"
-    assert callers.get(_READING_CALLS[0]) == {expected}, callers
-    assert callers.get(_READING_CALLS[1]) == {expected}, callers
+    expected = {"python/sglang/srt/managers/scheduler_components/weight_updater.py"}
+    assert callers.get(_READING_CALLS[0]) == expected, callers
+    assert callers.get(_READING_CALLS[1]) == expected, callers
 
 
 def test_no_cutover_or_flip_module_takes_a_reading():
@@ -443,9 +609,8 @@ def test_no_cutover_or_flip_module_takes_a_reading():
         if "flip" not in rel and "cutover" not in rel:
             continue
         with open(path, encoding="utf-8") as fh:
-            body = fh.read()
-        if "seam_digest" in body:
-            forbidden.append(rel)
+            if "seam_digest" in fh.read():
+                forbidden.append(rel)
     assert forbidden == [], (
         f"a flip/cutover module references the seam digest: {forbidden}. "
         "The sleeping group holds no weight bytes at that moment; this is "
@@ -491,9 +656,9 @@ def test_the_wake_hook_raises_the_named_refusal():
     """
     src = inspect.getsource(_wu()._weg2_seam_digest_after)
     assert "raise " in src, "the wake hook builds a refusal it never raises"
-    i_raise = src.index("raise ")
-    i_log = src.index("logger.info")
-    assert i_log < i_raise, "the verdict line must reach the log before the raise"
+    assert src.index("logger.info") < src.index("raise "), (
+        "the verdict line must reach the log before the raise"
+    )
 
 
 def test_the_reading_is_rank_local_no_peer_no_collective():
@@ -518,19 +683,16 @@ def test_the_reading_is_rank_local_no_peer_no_collective():
 
 
 def test_the_host_buffer_is_bounded():
-    """The host-RAM law again: the shard is hashed in bounded blocks, never
+    """The host-RAM law again: a piece is hashed in bounded blocks, never
     assembled into a second image.  A default chunk larger than a layer would
     reintroduce the very term this whole slice exists to delete."""
     mod = _mod()
     assert 0 < mod.DEFAULT_CHUNK_BYTES <= (64 << 20)
-    named = _shard()
-    # A chunk smaller than one row must not change the answer.
-    full = mod.content_digest(named)
-    tiny = mod.content_digest(named, chunk_bytes=1)
-    assert full == tiny
+    _geom, t = _inventory()[0]
+    assert mod.piece_digest(t) == mod.piece_digest(t, chunk_bytes=1)
 
 
-def test_an_absent_shard_is_unarmed_never_a_match():
+def test_an_absent_inventory_is_unarmed_never_a_match():
     """The green-by-vacancy direction: nothing to read is not a pass."""
     mod = _mod()
     empty = _reading(mod, "after", [])
