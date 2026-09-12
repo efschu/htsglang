@@ -848,6 +848,43 @@ def hooked(monkeypatch):
     return _make
 
 
+def test_smoke_the_launcher_flag_reaches_the_env_and_an_inherited_value_does_not(
+    monkeypatch,
+):
+    """THE LAUNCHER HALF, EXECUTED -- parser to environment, both directions.
+
+    The structural pin above proves the pop entry and the publication EXIST.
+    This one proves they WORK, and it drives the direction that actually hurts:
+    an operator's shell already carrying ``SGLANG_WEG2_SEAM_DIGEST=1`` must not
+    arm a serving boot that did not pass the flag.  ``build_env`` starts from
+    ``os.environ``, so this is not a hypothetical.
+    """
+    from sglang.srt.weg2 import launcher
+
+    mod = _mod()
+    ap = launcher.build_parser()
+    off = ap.parse_args(["--tree", "/t", "--tag", "x"])
+    on = ap.parse_args(["--tree", "/t", "--tag", "x", mod.ARM_FLAG])
+    assert off.weg2_seam_digest is False, "the grader's flag does not default OFF"
+    assert on.weg2_seam_digest is True
+    assert launcher._env_knobs(off)["seam_digest_armed"] is False
+    assert launcher._env_knobs(on)["seam_digest_armed"] is True
+
+    # THE INHERITED VALUE, present in this process's environment on both runs.
+    monkeypatch.setenv(mod.ENV_ARM, "1")
+    env_off = launcher.build_env("/t", "/v", "0", "/s", False, "x",
+                                 **launcher._env_knobs(off))
+    env_on = launcher.build_env("/t", "/v", "0", "/s", False, "x",
+                                **launcher._env_knobs(on))
+    assert mod.ENV_ARM not in env_off, (
+        "an inherited SGLANG_WEG2_SEAM_DIGEST armed a boot that did not pass "
+        "the flag: the pop is not doing its job"
+    )
+    assert env_on[mod.ENV_ARM] == "1"
+    assert mod.seam_digest_armed(env_on) is True
+    assert mod.seam_digest_armed(env_off) is False
+
+
 def test_smoke_the_arming_line_is_announced_once_and_only_when_armed(
     hooked, monkeypatch, caplog
 ):
