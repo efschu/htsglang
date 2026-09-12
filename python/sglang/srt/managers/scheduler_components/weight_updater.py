@@ -132,6 +132,7 @@ from sglang.srt.weg2.ring_table import (  # noqa: E402
 #: the leg's RPC answers non-200 and the front issues its own named stop, the
 #: same way any other leg failure is reported.  Catching it would turn a
 #: refusal into a silent partial sleep.
+from sglang.srt.weg2 import ring_guard
 from sglang.srt.weg2.ring_guard import RingNeedGuard  # noqa: E402
 
 # #1348: the unexecuted-line instrument. Imported at module scope because the
@@ -3726,6 +3727,34 @@ class SchedulerWeightUpdaterManager:
                         # the same number, from the same instrument, that the
                         # waking rank is waiting on.
                         credit.publish(tag, tag_bytes.get(tag, 0))
+            # #1360b: ONE `WEG2-RING NEED` LINE PER SAVED TAG, not per
+            # ring-carried tag.  The loop above guards the `weights_*` family
+            # because those are the tags whose bytes the peer has to release --
+            # but the RING-ANCHOR question is a different one ("does
+            # weights + weights_draft cover everything `enable_cpu_backup`
+            # saves?"), and it cannot be answered from a population that only
+            # contains the weights family.  Measured on weg2xsn24 and weg2xsn25:
+            # the whole NEED tag census reads `weights_0..7`, `weights_draft`,
+            # `weights` and NOTHING else, so the "extra" set the anchor needs is
+            # empty BY CONSTRUCTION and the manifest coverage is unmeasurable.
+            #
+            # OBSERVATION ONLY, and that is the load-bearing restriction: these
+            # tags are emitted through `record()`, never `guard_tag()`, so
+            # nothing waits, nothing refuses and no flip timing moves.  A tag
+            # outside the weights family is not ring-carried, so a `free`
+            # comparison would be meaningless for it -- the line exists to state
+            # its BYTES under its own name, which is exactly what the anchor
+            # sums.  `free` is carried from the guard's own last reading so the
+            # five fixed fields stay on every line and the series still parses.
+            _free_now = weg2_ring_guard.free_mib_or_none(self._weg2_ring_stats)
+            for _tag, _nb in sorted(census.items()):
+                if _tag in weights_tags:
+                    continue
+                weg2_ring_guard.record(
+                    _tag,
+                    ring_guard.need_mib(int(_nb), weg2_ring_guard.granule_bytes),
+                    int(_free_now if _free_now is not None else 0),
+                )
             weg2_leg_ms = (time.perf_counter() - weg2_leg_t0) * 1000
             if credit is not None:
                 credit.leg_complete()

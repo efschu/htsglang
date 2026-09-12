@@ -224,6 +224,17 @@ class RingNeedGuard:
 
     # -- the instrument -----------------------------------------------------
 
+    def free_mib_or_none(self, stats_fn) -> Optional[int]:
+        """#1360b: the current free reading, or ``None`` when no ring exists.
+
+        Public because the OBSERVATION-ONLY pass (one NEED line per SAVED tag,
+        not per ring-carried tag) needs the same reading the guard itself uses
+        and must not reach into a private helper to get it.  ``None`` stays an
+        ABSENCE -- the caller decides what to print for it, and this class never
+        invents a free number.
+        """
+        return self._free_mib(stats_fn())
+
     def set_leg(self, epoch: object, src: str = "", dst: str = "") -> str:
         """#1350d: name the leg every following NEED line belongs to.
 
