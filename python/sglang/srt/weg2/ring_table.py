@@ -1901,6 +1901,155 @@ class Weg2RingSigmaRecurrence(RuntimeError):
     """
 
 
+#: #1350c: how far the MANIFEST sum may sit from the per-card tag census before
+#: one of the two is called wrong.  5 % of the census -- the manifests count
+#: TENSOR bytes and the census counts BACKED-UP TAG bytes, which differ by
+#: padding, alignment and the non-weight tags, so an exact match would be the
+#: suspicious outcome, not the expected one.
+MANIFEST_CENSUS_TOLERANCE = 0.05
+
+
+def sigma_h_from_manifests(
+    manifest_dir: str, *, boot_token: str = ""
+) -> Tuple[Dict[int, int], str, Dict[str, object]]:
+    """Sigma H per card from the PER-RANK MANIFESTS -- an INDEPENDENT anchor.
+
+    #1350c.  Everything the ring solve reads today is downstream of the ring it
+    is sizing (see :class:`Weg2RingSigmaRecurrence`): the per-card tag census is
+    the previous Sigma H minus 1-2 MiB, and the measured dormant image is that
+    census plus the ring's own preallocated slack.  The manifests are the one
+    instrument in this tree that is NOT: ``xchg_manifest`` writes, per rank and
+    per region tag, the NBYTES OF EVERY TENSOR THAT RANK HOLDS, straight from
+    the live parameter inventory.  They know nothing about any ring.
+
+    NO SECOND BOOKKEEPING OF THE BYTE SUM: the pieces are read through
+    :func:`xchg_manifest.load_manifests`, the same reader the join uses, and
+    summed over ``ManifestPiece.nbytes`` -- the field the join itself joins on.
+
+    THE FORMULA IS ``max(P, D)`` PER CARD, NOT ``P + D``, and the difference is
+    29 GiB so it is not a detail.  C19's ring holds the DORMANT image and the
+    legs copy THROUGH it; exactly one group is dormant at a time, so a card must
+    hold the larger of the two images, never both.  MEASURED CORROBORATION from
+    a figure that predates this function and was derived another way -- the
+    ``RUN MOMENT = the host weights term 32.19 GiB`` recorded in
+    ``host_ledger.price``'s own #1327 note:
+
+        manifests of boot weg2xsn24, max per card -> 32785 MiB = 32.02 GiB
+        manifests of boot weg2xsn24, sum per card -> 63093 MiB = 61.61 GiB
+        independently recorded run-moment host weights   32.19 GiB
+
+    ``max`` lands 177 MiB (0.5 %) from a number nothing here produced; ``sum``
+    lands 29.4 GiB away. Both are RETURNED in the third element so the next
+    reader can check the ruling instead of trusting it.
+
+    Returns ``(per_card_mib, provenance_line, detail)``.  An empty or unreadable
+    manifest directory yields ``({}, "...", {})`` -- an ABSENCE, never a zero
+    ring: the caller then keeps the census route and its guard.
+    """
+    try:
+        from sglang.srt.weg2 import xchg_manifest as _xm
+        mans = _xm.load_manifests(manifest_dir, boot_token=boot_token)
+    except Exception as e:  # noqa: BLE001 -- an unreadable set is an absence
+        return {}, (
+            f"SIGMA-H source=manifest UNAVAILABLE dir={manifest_dir}: {e} -- "
+            "ABSENCE, not a zero ring; the census route and its #1350b guard stand"
+        ), {}
+    if not mans:
+        return {}, (
+            f"SIGMA-H source=manifest UNAVAILABLE dir={manifest_dir}: no manifest "
+            "carried a readable piece list -- ABSENCE, not a zero ring"
+        ), {}
+    by_card: Dict[int, Dict[str, int]] = {}
+    boots = set()
+    for m in mans:
+        card = int(getattr(m, "card", -1))
+        group = str(getattr(m, "group", "") or "?")
+        total = sum(int(p.nbytes) for p in getattr(m, "pieces", ()) or ())
+        by_card.setdefault(card, {}).setdefault(group, 0)
+        by_card[card][group] += total
+        boots.add(str(getattr(m, "boot_token", "") or ""))
+    per_card_mib: Dict[int, int] = {}
+    sum_mib = 0
+    for card, groups in sorted(by_card.items()):
+        per_card_mib[card] = int(max(groups.values()) // MIB)
+        sum_mib += int(sum(groups.values()) // MIB)
+    total_mib = sum(per_card_mib.values())
+    detail = {
+        "per_card_mib": dict(per_card_mib),
+        "per_card_group_mib": {
+            c: {g: int(v // MIB) for g, v in gs.items()}
+            for c, gs in sorted(by_card.items())
+        },
+        "sigma_max_mib": total_mib,
+        "sigma_sum_mib": sum_mib,
+        "manifests": len(mans),
+        "boot_tokens": sorted(boots),
+    }
+    cards = " ".join(
+        f"card{c}=" + "/".join(
+            f"{g}:{int(v // MIB)}" for g, v in sorted(by_card[c].items())
+        ) + f"->max:{per_card_mib[c]}"
+        for c in sorted(by_card)
+    )
+    line = (
+        f"SIGMA-H source=manifest boot={sorted(boots)[0] if boots else '?'} "
+        f"manifests={len(mans)} {cards} sum={total_mib} MiB "
+        f"({total_mib / 1024.0:.2f} GiB) -- MAX per card, because C19's ring holds "
+        f"the DORMANT image and exactly one group is dormant at a time; the P+D "
+        f"form would be {sum_mib} MiB ({sum_mib / 1024.0:.2f} GiB) and is REFUTED "
+        f"by the independently recorded run-moment host weights 32.19 GiB, which "
+        f"the MAX form reproduces. Instrument: per-rank tensor nbytes from "
+        f"xchg_manifest.load_manifests -- the reader the JOIN uses, and the only "
+        f"anchor in this solve that is not downstream of the ring it sizes"
+    )
+    return per_card_mib, line, detail
+
+
+def manifest_census_crosscheck(
+    manifest_total_mib: int, census_total_mib: int
+) -> Tuple[bool, str]:
+    """#1350c (2): the two INDEPENDENT sums against each other.
+
+    Within :data:`MANIFEST_CENSUS_TOLERANCE` the manifests corroborate the
+    census.  Beyond it ONE of them is wrong, and the verdict string says which
+    with its evidence rather than picking the smaller: a census that EXCEEDS the
+    manifests is the #1350b recurrence (it inherits the previous ring), a census
+    BELOW them would mean the ring cannot hold the tensors the ranks actually
+    carry, which is a W31/W51 ring exhaustion waiting to happen.
+    """
+    if census_total_mib <= 0:
+        return False, "census is 0 or absent -- no cross-check possible"
+    delta = manifest_total_mib - census_total_mib
+    rel = abs(delta) / float(census_total_mib)
+    if rel <= MANIFEST_CENSUS_TOLERANCE:
+        return True, (
+            f"CROSS-CHECK OK: manifests {manifest_total_mib} MiB vs census "
+            f"{census_total_mib} MiB, delta {delta:+d} MiB ({rel:.1%} <= "
+            f"{MANIFEST_CENSUS_TOLERANCE:.0%})"
+        )
+    if delta < 0:
+        return False, (
+            f"CROSS-CHECK DISAGREES, and the CENSUS is the suspect source: "
+            f"manifests {manifest_total_mib} MiB vs census {census_total_mib} MiB, "
+            f"delta {delta:+d} MiB ({rel:.1%} > {MANIFEST_CENSUS_TOLERANCE:.0%}). "
+            f"The census is ABOVE the tensor bytes the ranks actually hold, which "
+            f"is the #1350b recurrence signature -- the census reports the size of "
+            f"the REGION each tag was backed into, and that region was sized from "
+            f"the previous Sigma H (measured: census(n) = Sigma H(n-1) - 1..2 MiB "
+            f"on four consecutive boots). The manifests know nothing about any "
+            f"ring; they are read from the live parameter inventory"
+        )
+    return False, (
+        f"CROSS-CHECK DISAGREES, and the MANIFESTS are the suspect source: "
+        f"manifests {manifest_total_mib} MiB vs census {census_total_mib} MiB, "
+        f"delta {delta:+d} MiB ({rel:.1%} > {MANIFEST_CENSUS_TOLERANCE:.0%}). A "
+        f"manifest sum ABOVE the census means the ring would be sized BELOW the "
+        f"tensors the ranks carry -- the direction that ends in W31/W51 ring "
+        f"exhaustion at the flip, so it is refused as an anchor rather than "
+        f"charged. Check for a manifest set from a DIFFERENT form or boot token"
+    )
+
+
 def parse_source_sigma_h_mib(boot_log: str) -> Optional[int]:
     """The SOURCE boot's OWN solved Sigma H, from its own provenance line.
 
