@@ -203,6 +203,24 @@ def _weg2_flip_index_of(epoch) -> int:
 
 
 
+def _weg2_identity(owner, method: str, default):
+    """#1358. This rank's group or index, or a default -- never an exception.
+
+    An INSTRUMENT'S identity may not be able to take a leg down. The scheduler
+    mixin has both methods; the smoke harnesses that drive the same product
+    path with stubs do not, and an unguarded call there killed every leg
+    (train [17b], caught by execution smoke, not by unit tests).
+    """
+    fn = getattr(owner, method, None)
+    if fn is None:
+        return default
+    try:
+        got = fn()
+    except BaseException:  # noqa: BLE001 -- an instrument never raises
+        return default
+    return default if got is None else got
+
+
 def _get_draft_model_runner(draft_worker):
     # DFlash / FrozenKVMTP workers expose draft_model_runner directly
     runner = getattr(draft_worker, "draft_model_runner", None)
@@ -3217,8 +3235,24 @@ class SchedulerWeightUpdaterManager:
                           else f"c{int(getattr(group[0], 'dst_rank', device))}"),
                     # #1358: the identity the host-slot lines carry. This is
                     # the only frame where the group and the rank both exist.
-                    leg_group=str(self._weg2_group_name()),
-                    leg_rank=int(self._weg2_rank()),
+                    #
+                    # GUARDED, AND THE GUARD IS THE FIX FOR A DEFECT I SHIPPED.
+                    # The first version called `self._weg2_group_name()`
+                    # unprotected and claimed "every existing caller unchanged".
+                    # The train seat's execution smoke refuted it by bisection
+                    # ([15]/[16]/[17a] all 19/19, [17b] 15/19): the two smoke
+                    # harnesses drive this exact product path with STUBS
+                    # (`_LegStub` in xchg_provider_smoke.py, `_Stub` in
+                    # xchg_leg_replay.py) that carry no such methods, so every
+                    # leg died with AttributeError before it ran.
+                    #
+                    # A getattr default rather than two more stub methods: this
+                    # closes the CLASS (any future caller without the methods)
+                    # instead of the two instances that happened to exist, and
+                    # it matches what the emitter already does one frame down,
+                    # where an absent group prints as `group=?`.
+                    leg_group=str(_weg2_identity(self, "_weg2_group_name", "")),
+                    leg_rank=int(_weg2_identity(self, "_weg2_rank", -1)),
                     leg_name=f"{boot_nonce}/{hook}",
                     log=logger.info)
         finally:
