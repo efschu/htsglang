@@ -4001,7 +4001,61 @@ def _env_knobs(ns) -> Dict[str, object]:
         "hicache_bigram_keys": ns.hicache_bigram_keys,
         "hicache_flush_publish_sweep": ns.hicache_flush_publish_sweep,
         "lane_coverage_dir": lane_coverage_dump_dir(ns),
+        "lane_coverage_token": lane_coverage_boot_token(ns),
     }
+
+
+def lane_coverage_boot_token(ns) -> str:
+    """#1348: WHICH BOOT this run's coverage dumps belong to.
+
+    Memoised on the namespace because `_env_knobs` is called once per group
+    and the two groups must carry the SAME token -- a per-call `time.time()`
+    would give P and D different identities and the ingest would refuse one of
+    them as stale.
+
+    Needed because the dump directory is #1292's and #1292's is reused across
+    boots: without a token, yesterday's `phase_coverage_D_rank0.json` on an
+    unchanged tree passes the sha256 gate and is printed as today's reading
+    for a group that never ran (review MF-2).
+    """
+    if not getattr(ns, "xchg_coverage_diff", False):
+        return ""
+    tok = getattr(ns, "_lane_coverage_token", "")
+    if not tok:
+        tok = f"{getattr(ns, 'tag', 'notag')}:{int(time.time())}:{os.getpid()}"
+        setattr(ns, "_lane_coverage_token", tok)
+    return tok
+
+
+def refuse_double_coverage_arm(env, *, xchg_coverage_diff: bool) -> None:
+    """PRE-SPAWN refusal when both coverage instruments would be armed.
+
+    `lane_coverage.arm` refuses by name when `SGLANG_SEAM_COVERAGE_DIR` is
+    set -- but it does so INSIDE each rank, after the spawn. A leftover value
+    in the operator's shell therefore burned the whole window: six ranks
+    refused, the boot ran with no instrument, and the refusal sat in the rank
+    logs where the ingest report never looks (review S-3). The launcher pops
+    its OWN variable and never that one, so nothing upstream catches it
+    either.
+
+    Measured reason this matters at all: a second `Coverage.start()` raises
+    nothing and blinds the first collector for its duration, so "both armed"
+    does not fail loudly on its own -- it produces two dumps that quietly
+    describe something neither instrument claims.
+    """
+    if not xchg_coverage_diff:
+        return
+    other = env.get("SGLANG_SEAM_COVERAGE_DIR")
+    if other:
+        raise SystemExit(
+            "REFUSING TO BOOT: --xchg-coverage-diff was passed while "
+            f"SGLANG_SEAM_COVERAGE_DIR={other!r} is set in the environment. "
+            "Two coverage tracers in one process measure neither -- the "
+            "second start() silently blinds the first, and a blind window "
+            "reads as a never-executed seam. Unset SGLANG_SEAM_COVERAGE_DIR "
+            "or drop --xchg-coverage-diff. Refused here, before the spawn, "
+            "because the per-rank refusal costs the whole window."
+        )
 
 
 def lane_coverage_dump_dir(ns) -> str:
@@ -4038,6 +4092,7 @@ def build_env(tree: str, venv: str, cvd: str, store_dir: str, debug_hold: bool, 
               hicache_flush_publish_sweep: bool = True,
               group: str = "",
               lane_coverage_dir: str = "",
+              lane_coverage_token: str = "",
               xchg_env: Optional[Dict[str, str]] = None) -> Dict[str, str]:
     env = dict(os.environ)
     # #1348: the exchange lane's unexecuted-line instrument. SAME DISCIPLINE
@@ -4050,8 +4105,10 @@ def build_env(tree: str, venv: str, cvd: str, store_dir: str, debug_hold: bool, 
     # `managers/seam_coverage.py`'s switch differs and must keep differing.
     if lane_coverage_dir:
         env["SGLANG_WEG2_LANE_COVERAGE_DIR"] = lane_coverage_dir
+        env["SGLANG_WEG2_LANE_COVERAGE_TOKEN"] = lane_coverage_token
     else:
         env.pop("SGLANG_WEG2_LANE_COVERAGE_DIR", None)
+        env.pop("SGLANG_WEG2_LANE_COVERAGE_TOKEN", None)
     # FIX 2, finding 1: WHICH WEG-2 GROUP THIS RANK BELONGS TO, and the only
     # thing in either tree that says so.  Read by
     # `weg2_memory_saver.weg2_group_name()`; it is the discriminator the
@@ -9085,8 +9142,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # shape anyway) must never make a fast pre-spawn refusal look post-spawn.
     _ACTIVE_BOOT_STATE = None
     ns = build_parser().parse_args(argv)
-    # #1348: arm the complement instrument in the LAUNCHER's own process too.
-    # The rank processes never import this module, so without this the ingest
+    # #1348: both coverage instruments armed at once is a burnt window, and
+    # the cheapest place to say so is here -- before anything is started.
+    refuse_double_coverage_arm(os.environ, xchg_coverage_diff=getattr(
+        ns, "xchg_coverage_diff", False))
+    if ns.teardown:
+        # AFTER the teardown branch (review N-6): arming before it meant a
+        # `--teardown ... --xchg-coverage-diff` wrote an L-dump into the
+        # evidence dir that a LATER boot's ingest would pick up -- the stale
+        # dump problem, manufactured by the instrument itself.
+        return teardown(ns.teardown)
+    # Arm the complement instrument in the LAUNCHER's own process too. The
+    # rank processes never import this module, so without this the ingest
     # could only ever print NO-OBSERVATION for `launcher.py` -- an honest
     # answer and a useless one, because the arm/ledger half of this file is
     # exactly the set of decisions an operator wants the complement of ("which
@@ -9096,9 +9163,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if _lane_cov_dir:
         from sglang.srt.weg2 import lane_coverage as _wlc
 
-        _wlc.arm_launcher(_lane_cov_dir)
-    if ns.teardown:
-        return teardown(ns.teardown)
+        _wlc.arm_launcher(_lane_cov_dir, boot_token=lane_coverage_boot_token(ns))
     # BEFORE build_env(), which starts from os.environ: an inherited stage map
     # would reach group P's ranks without passing through the solver at all.
     refuse_inherited_layer_set(os.environ)
@@ -9174,6 +9239,25 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         cards_free_check(cards, log)
     cvd = ",".join(c.uuid for c in cards)
     state.cvd = cvd
+    # #1348 (review MF-1): THE BOOT DECLARES WHO MUST REPORT, here, where the
+    # rank count is first known. A report derived from the dumps it FOUND can
+    # never notice a rank that wrote nothing -- which is the #1329 shape and
+    # the whole reason the instrument exists. Both groups run one rank per
+    # card; the launcher itself is the single `L` rank.
+    if _lane_cov_dir:
+        from sglang.srt.weg2 import lane_coverage as _wlc
+
+        _expect_path = _wlc.write_expect_manifest(
+            _lane_cov_dir,
+            lane_coverage_boot_token(ns),
+            {"P": len(cards), "D": len(cards), _wlc.LAUNCHER_GROUP: 1},
+        )
+        log(f"WEG2-COVERAGE ARMED timings=CONFOUNDED token={lane_coverage_boot_token(ns)} "
+            f"expect=P={len(cards)},D={len(cards)},L=1 manifest={_expect_path} -- "
+            f"coverage.py line tracing is ON inside every exchange leg of this "
+            f"boot; it costs 2.6x-4x on EVERY Python call in the traced process "
+            f"while a leg is open, so NO ms/round, prefill, decode or flip "
+            f"duration from this boot is quotable as a measurement.")
     log("NVML -> CUDA ordinal map: " + ", ".join(f"ordinal {i} = nvml {c.nvml_index} {c.name} {c.uuid} total {c.total_mib} MiB" for i, c in enumerate(cards)))
 
     # 1a2. WEG2_SCHEDULING_SPEC_0907 slice A -- THE SCHEDULING KNOBS, RESOLVED

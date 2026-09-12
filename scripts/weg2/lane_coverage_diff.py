@@ -136,6 +136,10 @@ class Report:
         self.per_group: Dict[str, Dict[str, List[Set[int]]]] = defaultdict(
             lambda: defaultdict(list)
         )
+        #: (group, rank) pairs that produced a USABLE dump for THIS boot.
+        self.reported: Set[Tuple[str, int]] = set()
+        #: group -> how many ranks the BOOT said would report
+        self.expect: Dict[str, int] = {}
 
     def say(self, line: str) -> None:
         self.out.append(line)
@@ -176,7 +180,31 @@ def read_dump(path: str) -> Tuple[Optional[dict], str]:
     return blob, ""
 
 
-def process_dump(rep: Report, path: str) -> None:
+def modules_for(group: str) -> List[str]:
+    """The allowlist half that this dump's PROCESS could possibly have run.
+
+    Applying all eleven to every dump produced ~16 refusals per boot that mean
+    nothing by construction (review S-2): `launcher.py` is never imported in a
+    rank, and the ten rank modules are not imported in the launcher. The one
+    refusal that would have meant something -- a rank that never wrote -- was
+    not printed at all. Noise up, signal down; both halves fixed here.
+    """
+    return list(lc.LAUNCHER_MODULES if group == lc.LAUNCHER_GROUP else lc.RANK_MODULES)
+
+
+def parse_expect(spec: str) -> Dict[str, int]:
+    """``"P=3,D=3,L=1"`` -> ``{"P": 3, "D": 3, "L": 1}``."""
+    out: Dict[str, int] = {}
+    for part in spec.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        group, _, n = part.partition("=")
+        out[group.strip()] = int(n)
+    return out
+
+
+def process_dump(rep: Report, path: str, boot_token: str) -> None:
     blob, reason = read_dump(path)
     base = os.path.basename(path)
     if blob is None:
@@ -186,17 +214,53 @@ def process_dump(rep: Report, path: str) -> None:
 
     group = str(blob.get("group", ""))
     rank = str(blob.get("rank", "?"))
+    dump_token = str(blob.get("boot_token", ""))
+
+    # WHICH BOOT WROTE THIS. Refused by NAME, never skipped quietly: a dump
+    # left in the (reused) evidence directory by an earlier boot is the thing
+    # that fills the silence about a rank that did not report today.
+    if dump_token != boot_token:
+        rep.refuse(
+            f"WEG2-COVERAGE STALE-DUMP file={base} group={group or '?'} rank={rank} "
+            f"dump_token={dump_token or '<none>'} boot_token={boot_token} -- this "
+            f"dump belongs to a different boot and is NOT counted as this "
+            f"boot's reading for that rank; delete it or point --dump-dir at a "
+            f"fresh directory"
+        )
+        return
+
     legs = blob.get("legs", "?")
     overhead = blob.get("overhead_ms", {})
+    saves = overhead.get("saves") or 0
+    total = overhead.get("save_total")
+    per_leg = round(total / saves, 3) if (saves and isinstance(total, (int, float))) else "?"
     rep.say(
         f"WEG2-COVERAGE DUMP file={base} group={group or '?'} rank={rank} "
         f"legs={legs} instrument={blob.get('instrument', '?')} "
-        f"arm_ms={overhead.get('arm', '?')} save_total_ms={overhead.get('save_total', '?')} "
-        f"saves={overhead.get('saves', '?')} written_at={blob.get('written_at', '?')}"
+        f"arm_ms={overhead.get('arm', '?')} save_total_ms={total} "
+        f"saves={saves} save_per_leg_ms={per_leg} "
+        f"traced_ms={overhead.get('traced', '?')} timings=CONFOUNDED "
+        f"threads_at_arm={blob.get('threads_at_arm', '?')} "
+        f"written_at={blob.get('written_at', '?')}"
     )
+    try:
+        rep.reported.add((group, int(rank)))
+    except (TypeError, ValueError):
+        pass
+
+    # A COLLECTOR THAT DIED LEAVES A COMPLETE-LOOKING DUMP: it parses, the
+    # modules are present, the tally holds, and every line the legs after the
+    # death executed is printed as a wall.
+    if blob.get("dead"):
+        rep.no_observation(
+            "<all>", rank, group,
+            f"collector-died where={blob.get('dead_where') or '?'} legs_completed={legs}",
+        )
+        return
+
     modules = blob.get("modules") or {}
 
-    for rel in lc.ALLOWLIST:
+    for rel in modules_for(group):
         entry = modules.get(rel)
         if entry is None:
             rep.no_observation(rel, rank, group, "module-absent-from-dump")
@@ -207,7 +271,15 @@ def process_dump(rep: Report, path: str) -> None:
             continue
         tree_sha = sha256_of(src)
         dump_sha = entry.get("sha256") or ""
-        if dump_sha and dump_sha != tree_sha:
+        if not dump_sha:
+            # NOT "no drift". An empty hash was falsy at the old
+            # `if dump_sha and ...`, so a file the booting process could not
+            # read switched the source guard OFF where nobody could see it --
+            # and the line numbers below would refer to a tree this ingest
+            # never checked.
+            rep.no_observation(rel, rank, group, "no-source-hash")
+            continue
+        if dump_sha != tree_sha:
             rep.refuse(
                 f"WEG2-COVERAGE SOURCE-DRIFT module={rel} rank={rank} "
                 f"dump_sha256={dump_sha[:12]} tree_sha256={tree_sha[:12]} -- the "
@@ -260,6 +332,18 @@ def process_dump(rep: Report, path: str) -> None:
             )
             continue
 
+        # THE GUARANTEED ARTEFACTS, NAMED RATHER THAN MIXED IN (review S-1).
+        # If the module was already imported when the tracer went in, its
+        # module-scope lines ran unobserved and appear in `unexecuted` as an
+        # artefact -- 2104 of 8892 lines (23.7 %) across the allowlist, and on
+        # a real boot 10 of 11 modules carry the flag. The old line told the
+        # reader to subtract "exactly those lines" and did not show which they
+        # were. They are NOT removed from the count: a module imported after
+        # the arm has the same lines genuinely unexecuted, and this tool
+        # cannot tell the two apart -- so it prints both numbers and says so.
+        artefacts: set = set()
+        if entry.get("imported_before_arm"):
+            artefacts = lc.module_scope_lines(src) & unexecuted
         pct = 100.0 * len(executed) / len(executable)
         rep.say(
             f"WEG2-COVERAGE UNEXECUTED module={rel} rank={rank} "
@@ -267,22 +351,73 @@ def process_dump(rep: Report, path: str) -> None:
             f"group={group or '?'} executed={len(executed)} "
             f"unexecuted_n={len(unexecuted)} executable={len(executable)} "
             f"off_statement={off_statement} "
-            f"imported_before_arm={int(bool(entry.get('imported_before_arm')))}"
+            f"imported_before_arm={int(bool(entry.get('imported_before_arm')))} "
+            f"artefact_n={len(artefacts)} artefact_lines=[{compress(sorted(artefacts))}]"
         )
         rep.per_group[rel][group].append(unexecuted)
 
 
 def emit_unions(rep: Report) -> None:
+    """Lines no rank of the group reached -- or a refusal if a rank is missing.
+
+    AN INTERSECTION OVER A SUBSET OF THE RANKS IS A SUPERSET, and BOOT_QUEUE
+    calls this line "the work list for the next wall". Over 2 of 3 ranks it
+    contains every line the absent rank DID execute. The old code shrank
+    quietly to `ranks=2` and printed the list anyway; the only tell was a
+    number in the middle of the line. It refuses now.
+    """
     for rel in lc.ALLOWLIST:
         for group, per_rank in sorted(rep.per_group.get(rel, {}).items()):
             if not per_rank:
                 continue
+            want = rep.expect.get(group)
+            if want is not None and len(per_rank) < want:
+                rep.no_observation(
+                    rel, "*", group,
+                    f"union-incomplete-group ranks={len(per_rank)}/{want}",
+                )
+                rep.say(
+                    f"WEG2-COVERAGE UNION module={rel} group={group or '?'} "
+                    f"ranks={len(per_rank)}/{want} REFUSED "
+                    f"reason=incomplete-group -- an intersection over a subset "
+                    f"of the ranks is a SUPERSET of the true union and would "
+                    f"name lines the absent rank executed"
+                )
+                continue
             union = set.intersection(*per_rank)
             rep.say(
                 f"WEG2-COVERAGE UNION module={rel} group={group or '?'} "
-                f"ranks={len(per_rank)} lines=[{compress(sorted(union))}] "
-                f"unexecuted_on_all={len(union)}"
+                f"ranks={len(per_rank)}/{want if want is not None else len(per_rank)} "
+                f"lines=[{compress(sorted(union))}] unexecuted_on_all={len(union)}"
             )
+
+
+def emit_missing_pairs(rep: Report) -> None:
+    """Every (group, rank) the BOOT expected that produced no usable dump.
+
+    THE LINE THE FIRST VERSION COULD NOT PRINT. It iterated the dumps the glob
+    found, so a rank -- or a whole group -- that never armed was absent from
+    the report rather than named in it, and the reader took the surviving
+    group's reading list for the boot's. That is the #1329 shape, which is the
+    shape this instrument exists to catch.
+    """
+    for group in sorted(rep.expect):
+        want = rep.expect[group]
+        for rank in range(want):
+            if (group, rank) in rep.reported:
+                continue
+            rep.no_observation(
+                "<all>", str(rank), group,
+                f"rank-wrote-no-dump expected_by=boot-manifest modules="
+                f"{len(modules_for(group))}",
+            )
+            # AN EXPECTED RANK THAT DID NOT REPORT IS AN ACCEPTANCE BREAK, not
+            # a reading nuance, so it escalates the EXIT CODE without --strict
+            # (review N-1: a caller that reads only `$?` used to read green
+            # over a boot in which nothing was observed at all). Every other
+            # NO-OBSERVATION stays rc=0 unless --strict, because those are
+            # findings about a rank that DID report.
+            rep.rc = max(rep.rc, 1)
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -306,6 +441,23 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "sha256 in each dump is checked against it (default: this checkout)",
     )
     ap.add_argument(
+        "--expect",
+        default="",
+        help="which (group, rank) pairs MUST report, e.g. 'P=3,D=3,L=1'. "
+        "Overrides the launcher's " + lc.EXPECT_FILENAME + " manifest in the "
+        "dump dir. Without either, this tool REFUSES: a report derived from "
+        "the dumps it found can never notice a rank that wrote nothing, which "
+        "is the failure this instrument exists to catch.",
+    )
+    ap.add_argument(
+        "--boot-token",
+        default="",
+        help="the boot whose dumps to read. Overrides the manifest's token. "
+        "Dumps carrying a different token are refused BY NAME, never silently "
+        "skipped -- the dump directory is shared with #1292's and is reused "
+        "across boots.",
+    )
+    ap.add_argument(
         "--strict",
         action="store_true",
         help="exit 1 if ANY module was not observed (default: a NO-OBSERVATION "
@@ -314,21 +466,48 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ns = ap.parse_args(argv)
 
     rep = Report(root=os.path.abspath(ns.root), strict=ns.strict)
+
+    # THE EXPECTATION COMES FROM THE BOOT, never from the dumps.
+    manifest = {}
+    mpath = os.path.join(ns.dump_dir, lc.EXPECT_FILENAME)
+    if os.path.isfile(mpath):
+        try:
+            manifest = json.loads(open(mpath, encoding="utf-8").read())
+        except (OSError, json.JSONDecodeError):
+            manifest = {}
+    rep.expect = parse_expect(ns.expect) if ns.expect else {
+        str(k): int(v) for k, v in (manifest.get("expect") or {}).items()
+    }
+    boot_token = ns.boot_token or str(manifest.get("boot_token") or "")
+
+    if not rep.expect:
+        rep.no_observation(
+            "<all>", "?", "",
+            f"no-expectation-list dir={ns.dump_dir} -- pass --expect or let the "
+            f"launcher write {lc.EXPECT_FILENAME}; without it this tool cannot "
+            f"tell 'no such rank' from 'this rank reported nothing', and a "
+            f"silent report over an empty directory reads exactly like a clean "
+            f"sweep",
+        )
+        rep.rc = max(rep.rc, 1)
+
     if not os.path.isdir(ns.dump_dir):
-        for rel in lc.ALLOWLIST:
-            rep.no_observation(rel, "?", "", f"dump-dir-absent dir={ns.dump_dir}")
+        rep.no_observation("<all>", "?", "", f"dump-dir-absent dir={ns.dump_dir}")
+        emit_missing_pairs(rep)
         print("\n".join(rep.out))
         return rep.rc
 
     dumps = sorted(glob.glob(os.path.join(ns.dump_dir, "phase_coverage_*rank*.json")))
     if not dumps:
-        for rel in lc.ALLOWLIST:
-            rep.no_observation(rel, "?", "", f"no-dump-files-in dir={ns.dump_dir}")
-        print("\n".join(rep.out))
-        return rep.rc
+        # MR1: this branch used to be `if not dumps: <refuse>` but the refusal
+        # only covered the ABSENT directory; an EMPTY one walked the loop zero
+        # times and printed nothing at all -- which is what a reader sees when
+        # no rank ever armed, i.e. the #1329 shape again.
+        rep.no_observation("<all>", "?", "", f"no-dump-files-in dir={ns.dump_dir}")
 
     for path in dumps:
-        process_dump(rep, path)
+        process_dump(rep, path, boot_token)
+    emit_missing_pairs(rep)
     emit_unions(rep)
     print("\n".join(rep.out))
     return rep.rc

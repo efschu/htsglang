@@ -2278,6 +2278,26 @@ class SchedulerWeightUpdaterManager:
             # boot weg2xsn16 while the flip path itself ran (48
             # `WEG2-GROUP-FENCE` on D, 0 `WEG2-XCHG-INJECT`).  `ring` still
             # returns here, which is what keeps the default leg byte-identical.
+            # #1348 (review MF-1): THE ARM GOES BEFORE THE LANE GATE.
+            #
+            # It used to sit ~55 lines further down, after this gate, after the
+            # identity gate and after the device gate -- so a rank whose hook
+            # returned early wrote NO dump, and an ingest that iterated the
+            # dumps it FOUND said nothing whatsoever about that rank. That is
+            # the #1329 shape itself (the shadow returned early for three
+            # boots): group P reports, group D is absent from the report, and
+            # the reader takes P's reading list for the boot's.
+            #
+            # Arming here leaves a `legs=0` dump behind for every rank that
+            # reaches this hook at all, which is what turns "this rank ran no
+            # leg" into a printable fact instead of a silence. The tracer is
+            # NOT started by the arm (it is bracketed to the leg below), so
+            # this costs a rank on the ring arm nothing but one JSON write.
+            #
+            # Guarded on `armed_by_launcher()` -- a single env read -- so an
+            # unarmed boot does not even resolve group and rank here.
+            if wlc.armed_by_launcher():
+                wlc.arm(group=self._weg2_group_name(), rank=self._weg2_rank())
             if not sh.bounce_lane_armed():
                 return
             from sglang.srt.weg2 import weight_exchange_region as xr
@@ -2311,25 +2331,6 @@ class SchedulerWeightUpdaterManager:
                     epoch=str(getattr(recv_req, "epoch", "") or ""),
                     detail="torch reports no CUDA device on this rank"))
                 return
-            # #1348: THE COMPLEMENT INSTRUMENT, armed at the earliest point on
-            # this lane that HAS an identity.  It answers the one question no
-            # counter on this path can ("which lines did this boot never
-            # reach"), and walls XSN6..XSN15 were each a line in that set.
-            #
-            # ARMED HERE AND NOT EARLIER for two reasons that pull the same
-            # way: the arm needs `group`/`rank` for the #1292 dump name, which
-            # is first known two lines up; and arming before the
-            # `bounce_lane_armed()` gate above would pay coverage.py's tracer
-            # on every ring boot -- i.e. every boot to date -- for a lane that
-            # returns immediately. The cost of arming LATE is real and is not
-            # hidden: module-scope lines of anything already imported ran
-            # unobserved, so `lane_coverage` records `imported_before_arm` per
-            # module and the ingest prints it on every line.
-            #
-            # NO-OP AND NO IMPORT unless the launcher published the directory
-            # (`--xchg-coverage-diff`); returns bool, never raises, and is
-            # never allowed to be the reason a leg fails.
-            wlc.arm(group=group, rank=rank)
             # ------------------------------------------------------------
             # #1273 S6 fix D -- THE IDENTITY SWEEP, not one more instance.
             #
@@ -2492,6 +2493,13 @@ class SchedulerWeightUpdaterManager:
                 # host-schwelle-nie-uebertreten forbids.
                 host_bounce_budget_bytes=self._weg2_shadow_host_budget(),
             )
+            # #1348 (review MF-4): THE TRACER IS ON ONLY FOR THE LEG.
+            # sys.settrace is paid by every Python call in the process, not
+            # just the allowlisted files (measured: 4.04x on NON-allowlisted
+            # code), so leaving it on after the leg confounded every other
+            # figure of the boot and ate into the 2.0 s / 20.0 s wall-clock
+            # ring deadlines. In, run, out.
+            wlc.begin_leg(hook)
             try:
                 sh.run_leg_hook(inputs, log=logger.info, plan=plan)
             finally:
