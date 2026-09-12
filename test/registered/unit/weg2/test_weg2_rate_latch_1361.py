@@ -182,3 +182,46 @@ class TheReapMarkIsMeasuredNotAssumed1361(CustomTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TheLatchIsWIRED1361(CustomTestCase):
+    """#1361 (1) RATCHET: a built-but-unwired guard is the #464 / #1017 class.
+
+    The latch is worthless in a module. It has to ride the loop that already
+    carries W22 -- the same clock, so `gaps_seen` counts THAT loop's blindness
+    and not another sampler's, and the same named teardown, so a projection
+    breach ends the way the user ordered a level breach to end on 2026-09-08:
+    controlled, never a kernel kill.
+    """
+
+    def _loop_src(self):
+        import inspect
+        from sglang.srt.weg2 import front as fr
+        src = inspect.getsource(fr)
+        i = src.index("host_ledger.watermark_provenance(margin)")
+        return src[i:src.index("def do_stop", i)]
+
+    def test_the_guard_loop_constructs_the_rate_latch(self):
+        self.assertIn("host_ledger.RateLatch(", self._loop_src())
+
+    def test_it_is_fed_and_its_verdict_reaches_the_named_teardown(self):
+        body = self._loop_src()
+        self.assertIn("rate_latch.observe(", body)
+        self.assertIn('do_stop("W98 Weg2HostRateLatched"', body)
+        # ...and a GAP is reported but never torn down: the loop kept running,
+        # it just could not look.
+        self.assertIn("RATE-GAP", body)
+        gap_branch = body[body.index("RATE-GAP"):body.index("elif _line is not None")]
+        self.assertNotIn("do_stop", gap_branch)
+
+    def test_the_latch_runs_faster_than_the_level_test(self):
+        """A latch no faster than the guard that went blind buys nothing."""
+        body = self._loop_src()
+        self.assertIn("rate_period_s = min(0.5,", body)
+        self.assertIn("_level_due", body)      # the level test keeps its period
+
+    def test_both_halves_grade_the_same_reading(self):
+        """One `read_cgroup_pressure` feeds the latch and the level verdict."""
+        body = self._loop_src()
+        self.assertIn("_pr_fast = host_ledger.read_cgroup_pressure()", body)
+        self.assertIn("nonreclaim_gib", body)
