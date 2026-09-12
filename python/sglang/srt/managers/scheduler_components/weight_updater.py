@@ -2615,6 +2615,10 @@ class SchedulerWeightUpdaterManager:
         if not seam_digest.seam_digest_armed():
             self.weg2_seam_before = None
             return
+        # The rank's OWN reading of the knob, once per process.  What the
+        # launcher intended and what this process resolved are two facts, and
+        # only the second one decides what the flip does.
+        seam_digest.announce_once(logger.info)
         inventory, reason = self._weg2_seam_inventory()
         if inventory is None:
             self.weg2_seam_before = None

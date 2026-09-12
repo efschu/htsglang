@@ -169,12 +169,14 @@ __all__ = [
     "VERDICT_UNARMED",
     "W_CODE",
     "Weg2SeamDigestMismatch",
+    "announce_once",
     "arming_line",
     "arming_resolution",
     "compare",
     "identity_of",
     "piece_digest",
     "read_pieces",
+    "reset_announcement",
     "seam_digest_armed",
     "take_reading",
     "take_reading_if_armed",
@@ -307,6 +309,39 @@ def arming_line(environ: Optional[dict] = None) -> str:
     )
 
 
+#: The latch for the one-time announcement.  ``knob_resolution`` is PURE by
+#: contract -- it logs nothing and latches nothing -- so the latch belongs to
+#: the site that announces, which is what that module's docstring prescribes.
+_ANNOUNCED = False
+
+
+def announce_once(log) -> bool:
+    """Print the arming provenance ONCE per process.  ``True`` if it printed.
+
+    WIRED IN THE SAME STEP IT WAS BUILT.  An arming line with no caller is the
+    built-but-never-wired class this campaign keeps paying for, and the RANK's
+    log is the one place it has to appear: what the launcher intended and what
+    the rank read are two different facts, and only the second decides what the
+    flip does.
+
+    Called from the ARMED branch only, so a serving boot's log gains nothing.
+    """
+    global _ANNOUNCED
+    if _ANNOUNCED:
+        return False
+    _ANNOUNCED = True
+    log("%s", arming_line())
+    return True
+
+
+def reset_announcement() -> None:
+    """Test hook.  The latch is process-global, so without a named reset the
+    second test in a process would silently observe the first one's print and
+    assert against an announcement it did not cause."""
+    global _ANNOUNCED
+    _ANNOUNCED = False
+
+
 # ---------------------------------------------------------------------------
 # THE PLACEMENT IDENTITY.  Built from the producer's ParamGeom, never from the
 # live tensor's shape -- see the module docstring for why each field is in it.
@@ -338,9 +373,14 @@ class PieceIdentity:
         """What a human reads when this piece moved."""
         return f"{self.param_name}[{self.cls}]@{self.tag}/card{self.card}"
 
-    @property
-    def bytes(self) -> int:
-        return int(self.rows) * int(self.cols) * int(self.itemsize)
+    # NO ``bytes`` PROPERTY HERE, and the absence is deliberate.  The obvious
+    # one -- ``rows * cols * itemsize``, the placement's own extent -- would
+    # look like a cross-check against the hashed ``numel * element_size`` and
+    # could never disagree with it: every branch of ``StorageGeom.of`` yields
+    # ``rows * cols == numel`` (the ``.t()`` branch swaps the two, the >2-D
+    # branch folds the leading axes, the 1-D branch is ``1 * n``).  A guard
+    # that cannot fire is green-by-vacancy, which is the class this whole
+    # slice exists to close, so it is not written.
 
 
 def identity_of(geom: Any, *, card: int) -> PieceIdentity:
