@@ -999,6 +999,21 @@ def run_bounce_leg(
                 # carry no `src_ptr` at all -- which is exactly why the
                 # unsplit form refused it.
                 if phase in (PHASE_DEPOSIT, PHASE_BOTH):
+                    if rendezvous is not None and phase == PHASE_DEPOSIT:
+                        # CLAIM THE SLOT BEFORE FILLING IT.  Without this a
+                        # third band overwrites a slot whose consumer has not
+                        # drained it -- the same unordered-read hazard as the
+                        # collect side, entered from the producing end, and
+                        # just as silent.
+                        if not rendezvous.wait_empty(slot=slot,
+                                                     seq=int(batch.seq)):
+                            raise Weg2XchgBouncePhaseUnordered(
+                                f"W68 Weg2XchgPlanDisagree: slot={slot} "
+                                f"seq={batch.seq} was still full when this "
+                                f"deposit tried to claim it -- the collecting "
+                                f"rank has not drained the previous band. "
+                                f"Refusing rather than overwriting bytes a "
+                                f"consumer is about to read.")
                     t0 = time.perf_counter()
                     moved = _deposit_band(ops, d_stream, unit.descs, batch,
                                           base)
@@ -1038,7 +1053,12 @@ def run_bounce_leg(
                                 f"by any depositing rank, so this collect "
                                 f"would read whatever the previous band left "
                                 f"there. Issuing NOTHING.")
-                        if int(filled) != int(batch.total_bytes):
+                        if int(filled) == COUNT_UNAVAILABLE:
+                            # ORDERED BUT UNPRICED -- the diagonal carrier
+                            # publishes no byte count, and inventing one would
+                            # be a check comparing a number with itself.
+                            pass
+                        elif int(filled) != int(batch.total_bytes):
                             raise Weg2XchgBouncePhaseUnordered(
                                 f"W68 Weg2XchgPlanDisagree: slot="
                                 f"{slot} seq={batch.seq} carries "
@@ -1116,3 +1136,164 @@ def run_bounce_leg(
     return result
 
 
+
+
+# ---------------------------------------------------------------------------
+# #1330 B4n SLICE 3 -- THE PRODUCT RENDEZVOUS, over the CROSS semaphores.
+# ---------------------------------------------------------------------------
+#
+# NO NEW SUBSTRATE.  The 24 named semaphores and the slot records they guard
+# already exist and are already counted -- weg2xsn20's teardown census read 36
+# = 24 CROSS (`<epoch>-<r>-<r>-<n>-{empty,full}`) + 12 diagonal -- and
+# `run_producer_pair`/`run_consumer_pair` already state the order this class
+# obeys: fill, ONE sync, publish (which writes `bytes_filled`), then
+# `sem_post(full)`.  Building a second handshake beside them would be the
+# Zweitbuchhaltung this campaign keeps paying for.
+#
+# ONE RENDEZVOUS PER DIRECTED CARD PAIR, because that is how the semaphores are
+# named.  A leg whose descriptors span several pairs is therefore SPLIT BY PAIR
+# by the caller and run once per pair; a band that mixed two pairs would post
+# one pair's `full` for another pair's bytes.
+
+
+class CrossSlotRendezvous:
+    """The empty/full handshake for ONE directed card pair.
+
+    ``pair`` is the index into :data:`weight_exchange_region.CROSS_PAIRS`; the
+    diagonal has none by construction (``sem_name`` refuses it by name with
+    W15) and never takes a staging slot -- its carrier is the per-card
+    ``oncard-<card>.bin``.
+
+    THE SLOT INDEX IS TAKEN MODULO :data:`SLOTS_PER_PAIR`, and the deposit
+    waits for ``empty`` before it refills one.  Without that wait a third band
+    would overwrite a slot whose consumer has not drained it, which is the same
+    unordered-read hazard from the producing side.
+    """
+
+    def __init__(self, region, sems, *, pair: int, budget_s: float = 120.0):
+        self.region = region
+        self.sems = sems
+        self.pair = int(pair)
+        self.budget_s = float(budget_s)
+
+    def _slot(self, slot: int) -> int:
+        return int(slot) % int(xr.SLOTS_PER_PAIR)
+
+    def wait_empty(self, *, slot: int, seq: int) -> bool:
+        """Claim a slot for a deposit.  ``False`` means the consumer is behind."""
+        return bool(self.sems.timedwait(self.pair, self._slot(slot), "empty",
+                                        self.budget_s))
+
+    def post_full(self, *, slot: int, seq: int, nbytes: int) -> None:
+        """Publish the post-sync byte count, THEN release the consumer.
+
+        The order is the law (``run_producer_pair``'s own words): a
+        ``sem_post`` before the publish would let a consumer read a count that
+        belongs to the previous band.
+        """
+        s = self._slot(slot)
+        self.region.publish(self.pair, s, int(nbytes))
+        self.sems.post(self.pair, s, "full")
+
+    def wait_full(self, *, slot: int, seq: int):
+        """The producer's post-sync claim, or ``None`` on a real timeout."""
+        s = self._slot(slot)
+        if not self.sems.timedwait(self.pair, s, "full", self.budget_s):
+            return None
+        return int(self.region.read_slot(self.pair, s).bytes_filled)
+
+    def post_empty(self, *, slot: int, seq: int) -> None:
+        self.sems.post(self.pair, self._slot(slot), "empty")
+
+
+def pair_of(src_rank: int, dst_rank: int) -> Optional[int]:
+    """The CROSS_PAIRS index for a directed card pair, or ``None`` on-card.
+
+    ``None`` is the DIAGONAL and is not an error: rank *n* of either group runs
+    on ``cards[n]``, so ``src == dst`` is one card and has its own carrier.
+    Handing it to ``sem_name`` is what boot weg2xsn9 reported 36 times as a
+    bare IndexError, which is why that function now refuses it by name (W15).
+    """
+    if int(src_rank) == int(dst_rank):
+        return None
+    key = (int(src_rank), int(dst_rank))
+    return xr.CROSS_PAIRS.index(key) if key in xr.CROSS_PAIRS else None
+
+
+def group_descs_by_pair(descs: Sequence[object]):
+    """``{pair_index_or_None: [descs]}`` in first-appearance order.
+
+    ZEROFILL descriptors have no source and never cross a link; they stay with
+    their destination's on-card group so the destination still memsets them.
+    """
+    out = {}
+    for d in descs:
+        if getattr(d, "kind", None) == wx.ZEROFILL:
+            key = None
+        else:
+            key = pair_of(getattr(d, "src_rank", -1), getattr(d, "dst_rank", -1))
+        out.setdefault(key, []).append(d)
+    return out
+
+
+class DiagonalSlotRendezvous:
+    """#1330 B4n SLICE 3. The ON-CARD handshake, keyed by CARD (#1334).
+
+    MEASURED FINDING THAT MADE THIS CLASS NECESSARY, and it corrects the slice's
+    own brief: ``phase=both`` was to stay "for the diagonal". It cannot. The
+    diagonal is ONE CARD and TWO PROCESSES -- the co-located pair of ranks --
+    so a diagonal descriptor lacks the peer's pointer for exactly the same
+    reason a cross one does. The provider smoke caught it immediately: on the
+    SOURCE hook the diagonal group raised
+    ``_missing_pointer: ... has no destination pointer``, and on the
+    destination hook the mirror. So ``both`` has NO cross-process caller at
+    all; it is the single-process form for hermetic tests and tools, and every
+    FLIP leg -- cross and diagonal alike -- is phased.
+
+    The ordering substrate is the twelve diagonal semaphores that already exist
+    (``diagonal_sem_name``, keyed by CARD because "the diagonal is one card
+    talking to itself ... a pair id would be exactly the fiction that produced
+    weg2xsn9's IndexError"), reached through the same ``SemSet`` handle table.
+
+    **THE BYTE-COUNT CHECK IS UNAVAILABLE HERE, AND SAYS SO.** The cross lane's
+    short-piece check reads ``bytes_filled`` from the region's slot record; the
+    diagonal's carrier is the per-card ``oncard-<card>.bin`` and publishes no
+    such record. Returning the consumer's OWN derivation would make the check
+    compare a number with itself -- an instrument that cannot go red, which is
+    the shape this campaign has paid for repeatedly. So ``wait_full`` returns
+    the sentinel :data:`COUNT_UNAVAILABLE`, the collect accepts it as "ordered
+    but unpriced", and the gap is named rather than papered over.
+    """
+
+    def __init__(self, sems, *, card: int, budget_s: float = 120.0):
+        self.sems = sems
+        self.card = int(card)
+        self.budget_s = float(budget_s)
+
+    def _slot(self, slot: int) -> int:
+        return int(slot) % int(xr.SLOTS_PER_PAIR)
+
+    def _name(self, slot: int, kind: str):
+        return (self.card, self._slot(slot), kind)
+
+    def wait_empty(self, *, slot: int, seq: int) -> bool:
+        return bool(self.sems.diagonal_timedwait(
+            self.card, self._slot(slot), "empty", self.budget_s))
+
+    def post_full(self, *, slot: int, seq: int, nbytes: int) -> None:
+        self.sems.diagonal_post(self.card, self._slot(slot), "full")
+
+    def wait_full(self, *, slot: int, seq: int):
+        if not self.sems.diagonal_timedwait(
+                self.card, self._slot(slot), "full", self.budget_s):
+            return None
+        return COUNT_UNAVAILABLE
+
+    def post_empty(self, *, slot: int, seq: int) -> None:
+        self.sems.diagonal_post(self.card, self._slot(slot), "empty")
+
+
+#: The diagonal's honest answer to "how many bytes are in the slot": it has no
+#: record to read. NOT zero and NOT the consumer's own number -- a check that
+#: compares a value with itself cannot go red.
+COUNT_UNAVAILABLE = -1

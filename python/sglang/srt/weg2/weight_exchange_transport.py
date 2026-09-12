@@ -1044,6 +1044,63 @@ class SemSet:
             err = ctypes.get_errno()
             raise OSError(err, f"sem_post failed: {os.strerror(err)}")
 
+    #: #1330 B4n SLICE 3.  THE DIAGONAL'S TWELVE, through the SAME handle
+    #: table, because the diagonal is a FLIP LEG like any other and needs the
+    #: same ordering guarantee.  Keyed by CARD and not by a pair id -- #1334's
+    #: rule, and the fiction a pair id would be is what weg2xsn9 reported 36
+    #: times as a bare IndexError.  The key space cannot collide with the cross
+    #: one: these entries carry the marker below instead of a pair index.
+    _DIAGONAL = "diag"
+
+    def diagonal_handle(self, card: int, slot: int, kind: str) -> int:
+        key = (self._DIAGONAL, int(card), int(slot), kind)
+        got = self._handles.get(key)
+        if got is not None:
+            return got
+        with self._lock:
+            got = self._handles.get(key)
+            if got is not None:
+                return got
+            name = xr.diagonal_sem_name(self.boot_nonce, card, slot, kind)
+            ctypes.set_errno(0)
+            raw = self._lib.sem_open(name.encode("ascii"), 0)
+            if raw in (None, 0, ctypes.c_void_p(-1).value):
+                err = ctypes.get_errno()
+                raise OSError(
+                    err,
+                    f"sem_open({name}) failed: {os.strerror(err)} -- the "
+                    f"launcher creates the diagonal semaphores with O_EXCL; a "
+                    f"rank never creates one, so ENOENT here means the arm "
+                    f"did not run")
+            self._handles[key] = int(raw)
+            return int(raw)
+
+    def diagonal_timedwait(self, card: int, slot: int, kind: str,
+                           budget_s: float) -> bool:
+        # Same EINTR rule as `timedwait`: a signal is NOT a timeout, and
+        # reading it as one is group-fatal (S4 refuter, 2026-09-09).  The
+        # deadline is absolute and computed once, so a storm of signals cannot
+        # extend the fence budget.
+        handle = ctypes.c_void_p(self.diagonal_handle(card, slot, kind))
+        deadline = time.clock_gettime(time.CLOCK_REALTIME) + float(budget_s)
+        ts = _Timespec(int(deadline), int((deadline % 1.0) * 1e9))
+        while True:
+            err = self._timedwait_once(handle, ts)
+            if err == 0:
+                return True
+            if err == errno.EINTR:
+                continue
+            if err in (errno.ETIMEDOUT, 0):
+                return False
+            raise OSError(err, f"sem_timedwait(card={card} slot={slot} "
+                               f"kind={kind}) failed: {os.strerror(err)}")
+
+    def diagonal_post(self, card: int, slot: int, kind: str) -> None:
+        if self._lib.sem_post(
+                ctypes.c_void_p(self.diagonal_handle(card, slot, kind))) != 0:
+            err = ctypes.get_errno()
+            raise OSError(err, f"sem_post failed: {os.strerror(err)}")
+
     def getvalue(self, pair: int, slot: int, kind: str) -> int:
         """The semaphore's CURRENT count.  A read; it takes nothing.
 
