@@ -61,10 +61,23 @@ def _sweep_own_shm():
     yield
     import shutil
 
+    # EVERY PREFIX THIS TEST CAN CREATE, and the list grew once already: slice
+    # 4 added `weg2-xchg-bnc-<nonce>` (the bounce's own slot record) and the
+    # sweep still named only the region prefix, so nine files accumulated
+    # across runs. A cleanup that knows one of its own two artefacts is the
+    # same half-measure as a check written against the last incident.
     for name in os.listdir("/dev/shm"):
-        if name == f"weg2-xchg-{NONCE}" or name.startswith(
-                f"weg2-xchg-{NONCE}-"):
-            shutil.rmtree(os.path.join("/dev/shm", name), ignore_errors=True)
+        if (name == f"weg2-xchg-{NONCE}"
+                or name.startswith(f"weg2-xchg-{NONCE}-")
+                or name == f"{wb.BOUNCE_SLOT_PREFIX}{NONCE}"):
+            target = os.path.join("/dev/shm", name)
+            if os.path.isdir(target):
+                shutil.rmtree(target, ignore_errors=True)
+            else:
+                try:
+                    os.unlink(target)
+                except OSError:
+                    pass
 
 
 class _Rendezvous:
