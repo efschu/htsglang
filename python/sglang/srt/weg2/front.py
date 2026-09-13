@@ -2574,6 +2574,24 @@ class Front:
         # implement it; a 400 would tell the caller its input was wrong.
         _img = _image_parts(payload)
         if _img:
+            # #1356 THE REFUSAL IS LOGGED, NOT ONLY RETURNED. Without this line
+            # W101 existed solely in the caller's response body: `grep W101
+            # front.log` read 0 even when it had fired cleanly, so nobody
+            # reading the boot afterwards could tell a refusal that happened
+            # from one that never came up. That is the absence class this rig
+            # has been paying for all week, and here it sat on the PRODUCT
+            # rather than on a test -- found by the boot seat while building
+            # the vision probe, and it nearly cost that probe a FALSE RED.
+            #
+            # EMITTER RULE, general and not local to this line: every
+            # acceptance marker is a logger emitter. A W-code that only a
+            # client sees is not a marker, because the record is what the next
+            # reader has. All other W-codes in this file are visible; W101 was
+            # the exception.
+            logger.warning(
+                "W101 Weg2VisionRefused rid=%s image_parts=%d -- TEXT-ONLY boot "
+                "(--weg2-vision off), request refused with 501 and NOT routed",
+                f"weg2-{self.epoch}-{self._rid + 1}", int(_img))
             return web.json_response(
                 {"error": f"W101 Weg2VisionRefused: this boot is TEXT-ONLY "
                           f"(--weg2-vision off) and carries no vision tower, so "
