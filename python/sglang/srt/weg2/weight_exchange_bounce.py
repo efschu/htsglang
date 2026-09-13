@@ -360,6 +360,54 @@ def leg_geometry(terms: xb.BounceTerms) -> Tuple[int, int]:
     return int(terms.widest_layer_bytes), int(terms.depth)
 
 
+def leg_slot_bytes(terms: xb.BounceTerms) -> int:
+    """The size of ONE band :func:`run_bounce_leg` actually allocates --
+    THE ONE PRODUCER ``LayerBounce``'s ``slot_bytes=`` argument is built from.
+
+    #1385/xsn31-4 ROOT CAUSE THIS FUNCTION FIXES. Before it, ``run_bounce_leg``
+    read :func:`leg_geometry` for ``slot_bytes`` UNCONDITIONALLY -- the
+    PRE-#1374 AMENDMENT-2 geometry, where one band equals one WHOLE LAYER --
+    while separately reading ``terms.lane_slots`` (Option 1's band COUNT,
+    computed by :func:`xchg_bounce.tag_slots` under the assumption that a
+    band is ``terms.slot_bytes`` wide, the 128 MiB oncard unit) for the band
+    count. Multiplying a count sized for ``terms.slot_bytes``-wide bands by
+    the WIDEST-LAYER size instead inflated the real buffer past what the ARM
+    priced: MEASURED on boot weg2xsn31/4 (two independent instruments,
+    deckungsgleich -- a 0.2 s file-system poller and the lane's own
+    WEG2-XCHG-HOST-SLOT lines), the allocated file was
+    ``756,323,776 B x 24 = 18,151,770,624 B`` (16.905 GiB) against a ledger
+    charge of ``134,217,728 B x 24 = 3,221,225,472 B`` (3.00 GiB) for that
+    same lane -- 5.6x over, with only 2 of 5 lanes active (cushion 0.19 GiB
+    against the 1.50 GiB floor, 4 seconds after flip start, controlled
+    teardown). TWO MECHANISMS FROM THE SAME #1374 "OPTION 1" DAY, never
+    reconciled: the slot COUNT changed, the slot SIZE did not.
+
+    THE FIX IS "ALLOCATOR FOLLOWS THE PRICE", not the other direction: the
+    layered 128 MiB/slot form is what ``BounceTerms.lane_buffer_bytes`` (and
+    so ``total_bytes``, and so the host ledger's own charge) already prices,
+    validated against boot weg2xsn31/3's own measured ARM line
+    (``xchg_bounce=15.75`` GiB, exactly ``5 x (24 x 128 MiB) + staging``).
+    Re-pricing the ledger on the REAL per-tag need instead (the other
+    direction the operator named) would have to price P's most uneven PP
+    stage as one unbroken tag -- correct, but it prices away almost all of
+    the lever #1385 exists to be. This function is the one place that
+    decision is made, so the ledger and the allocator can never drift apart
+    on it again.
+
+    Option 1 ACTIVE (``terms.max_tag_bytes > 0``): returns ``terms.
+    slot_bytes`` -- the SAME oncard-slot unit ``BounceTerms.lane_buffer_bytes``
+    already multiplies by ``terms.lane_slots`` to get the priced total, so
+    ``leg_slot_bytes(terms) * terms.lane_slots == terms.lane_buffer_bytes``
+    by construction, never a third number computed here.
+
+    Option 1 ABSENT: :func:`leg_geometry`'s pre-#1374 pair, byte-identical --
+    every boot that never stated ``max_tag_bytes`` is unaffected.
+    """
+    if int(getattr(terms, "max_tag_bytes", 0) or 0) > 0:
+        return int(terms.slot_bytes)
+    return int(leg_geometry(terms)[0])
+
+
 # ---------------------------------------------------------------------------
 # The carrier.
 # ---------------------------------------------------------------------------
@@ -1056,8 +1104,16 @@ def run_bounce_leg(
     A second offset derivation here is precisely the defect that was paid for
     twice, so there is none.
     """
+    # #1385/xsn31-4: THE ONE BOOLEAN, computed here and reused at every site
+    # below that must agree with it (the slot size, the AMENDMENT-2 refusal,
+    # the slot COUNT) -- three sites spelling this predicate three different
+    # ways is exactly how the slot-size/slot-count mismatch this fixes
+    # reached the metal unnoticed.
+    _option1_leg = (terms is not None
+                    and int(getattr(terms, "max_tag_bytes", 0) or 0) > 0)
     if terms is not None:
-        derived_slot, derived_depth = leg_geometry(terms)
+        derived_slot = leg_slot_bytes(terms)
+        derived_depth = leg_geometry(terms)[1]
         slot_bytes = derived_slot if slot_bytes is None else slot_bytes
         depth = derived_depth if depth is None else depth
     if slot_bytes is None or depth is None:
@@ -1107,10 +1163,24 @@ def run_bounce_leg(
             f"has no ADDRESS there, never that the bytes differ"
         )
     refuse_if_slot_short(slot_bytes, descs)
-    # AMENDMENT 2: a unit is assembled COMPLETE in one depth-slot.  This is the
-    # run-moment half of the ARM's coverage grade -- see the function's
-    # docstring for why one check cannot cover both moments.
-    refuse_if_plan_exceeds_slot(slot_bytes, descs, terms)
+    if not _option1_leg:
+        # AMENDMENT 2: a unit is assembled COMPLETE in one depth-slot.  This
+        # is the run-moment half of the ARM's coverage grade -- see the
+        # function's docstring for why one check cannot cover both moments.
+        #
+        # SKIPPED UNDER OPTION 1 (#1385/xsn31-4), and that is not a hole:
+        # Amendment 2's invariant is "one LAYER, one slot", sized on
+        # `slot_bytes = widest_layer_bytes` so it always held trivially. Under
+        # Option 1 `slot_bytes` is the much smaller 128 MiB oncard unit and a
+        # layer is MEANT to band across many of them within the same
+        # tag-sized buffer -- the guarantee moved from "one layer, one slot"
+        # to "one TAG, one buffer" (Option 1's own design, BounceSlots'
+        # docstring). Calling this check here too would refuse every
+        # Option-1 boot on its very first layer. The equivalent protection
+        # for Option 1 is the in-loop `bands >= slots` refusal a few lines
+        # below (W68 Weg2XchgPlanDisagree), graded against the SAME `slots`
+        # this buffer is actually built with.
+        refuse_if_plan_exceeds_slot(slot_bytes, descs, terms)
 
     units = plan_units(descs)
     if not units:
@@ -1153,8 +1223,7 @@ def run_bounce_leg(
     # allocates is the file the ledger charged for. Without terms -- or with a
     # boot that did not state `max_tag_bytes` -- this is the old depth-sized
     # floor and the wrap refusal below is what keeps it honest.
-    slots = (int(terms.lane_slots) if terms is not None
-             and int(getattr(terms, "max_tag_bytes", 0) or 0) > 0
+    slots = (int(terms.lane_slots) if _option1_leg
              else xb.assemble_slots(int(depth), comparing=comparing))
     if phase != PHASE_BOTH and not lane:
         raise Weg2XchgBouncePhaseUnordered(
@@ -1284,6 +1353,24 @@ def run_bounce_leg(
                         # THE REFILL STAYS THE AUTHORITY.  Nothing is written
                         # to the live weights on this path -- the staged bytes
                         # are graded against what the refill already put there.
+                        #
+                        # NAMED HERE, NOT FIXED (out of #1385/xsn31-4's
+                        # scope): `int(depth)` addresses the shadow-compare
+                        # slot correctly in the PRE-OPTION-1 geometry, where
+                        # `slots = assemble_slots(depth, comparing=True) =
+                        # depth + 1` so index `depth` IS the one extra slot.
+                        # Under Option 1 `slots = terms.lane_slots` reserves
+                        # its own extra slot at index `lane_slots - 1`
+                        # (`xchg_bounce.tag_slots`'s `shadow` term), which is
+                        # NOT `depth` (still `terms.depth`, e.g. 2) once
+                        # `slots` is 24 -- a second, latent geometry mismatch
+                        # this leg's `comparing` path has not exercised on
+                        # any boot yet (xsn31/4's own INJECT lines all read
+                        # `verdict=NO-COMPARE pieces=0`: the flip died before
+                        # a single comparison ran). Fixing the ALLOCATED SIZE
+                        # (this function's whole point) does not fix this by
+                        # itself; a future seat should reconcile it before
+                        # trusting `mode=shadow` under a real Option-1 cap.
                         _compare_band(ops, c_stream, unit.descs, batch, base,
                                       bounce.slot_address(int(depth)), verdict)
                     else:
