@@ -389,3 +389,114 @@ class LegacyRecordTransition(CustomTestCase):
         # HostRingPlan really does not carry it -- the assertion above is about
         # a real absence, not a style preference.
         self.assertFalse(hasattr(lc.HostRingPlan(), "form_same"))
+
+
+class TheMarkerIsNeverInThePropaganda(CustomTestCase):
+    """#1362 [22-fix3] -- an instrument must not write its own name into its prose.
+
+    [22-fix2]'s W99 explained the transition path with the sentence "a matching
+    key would admit it with a printed WEG2-MODEL-IDENTITY LEGACY line". That
+    quoted the emitter's own marker inside a REFUSAL, so a census of "how many
+    legacy admissions happened" scored 1 on a log carrying ZERO of them -- the
+    train seat read exactly that off the default-form dry run, and reported
+    `LEGACY 1` for a run whose genuine count was 0.
+
+    This is #995's prose trap, re-created by the very file that was supposed to
+    know better. The invariant it costs us is the one pinned here:
+
+        count(lines carrying the LOG-PREFIXED marker) == count(legacy events)
+
+    and the bare count must not exceed it, in EVERY form. Two forms are
+    fixtured, because the trap only showed up in the one that refuses -- a test
+    written against the happy form alone would have stayed green through it.
+
+    FORM KEYS, measured on this box 2026-09-13 and named in the assertions
+    because an rc or a count without its form key is not a number ([16], and
+    the train seat handed it back to this seat for exactly this commit):
+
+        24eb56724d73  serving form (xsn27 launch.sh argv)  rc=0, 2 events
+        d0de83d152f0  default form (scripts/weg2/boot_weg2.sh) rc=2, 0 events
+    """
+
+    MARKER = "WEG2-MODEL-IDENTITY LEGACY"
+    PREFIXED = "WEG2-LAUNCH " + MARKER
+    REC = {"boot_tag": "weg2xsn27", "commit": "3468c2b535"}
+    WANT = "5a324e4044bf915181537d1481662a3050e984acd2eb3977174a54aba0ab3143"
+
+    #: (label, form key measured on the box, does the key match the source,
+    #:  how many legacy events that form produces)
+    FORMS = (
+        ("serving (xsn27 launch.sh argv)", "24eb56724d73", True, 2),
+        ("default (scripts/weg2/boot_weg2.sh)", "d0de83d152f0", False, 0),
+    )
+
+    def _log_for(self, form_key, form_key_match):
+        """Synthesise that form's launcher log from the CODE, not from a paste.
+
+        A pasted log is a photograph of a tree that may since have moved; these
+        lines come out of the same functions the launcher calls, so the fixture
+        cannot drift away from the emitter.
+        """
+        lines = []
+        hl.LEGACY_IDENTITY_LINES.clear()
+        try:
+            hl.resolve_image_terms(
+                {"P": dict(self.REC), "D": dict(self.REC, boot_tag="weg2xsn25")},
+                want_digest=self.WANT,
+                form_key_match=form_key_match,
+            )
+        except hl.Weg2ModelIdentityMismatch as e:
+            lines.append(f"[2026-09-13T00:00:00Z] WEG2-LAUNCH REFUSED: {e}")
+        for ll in dict.fromkeys(hl.LEGACY_IDENTITY_LINES):
+            lines.append(f"[2026-09-13T00:00:00Z] WEG2-LAUNCH {ll}")
+        return "\n".join(lines)
+
+    def test_the_prefixed_count_equals_the_event_count_in_both_forms(self):
+        for label, form_key, match, want_events in self.FORMS:
+            with self.subTest(form=label, form_key=form_key):
+                log = self._log_for(form_key, match)
+                prefixed = sum(1 for ln in log.splitlines() if self.PREFIXED in ln)
+                bare = sum(1 for ln in log.splitlines() if self.MARKER in ln)
+                self.assertEqual(
+                    prefixed, want_events,
+                    f"form {form_key} ({label}): {prefixed} prefixed marker line(s), "
+                    f"{want_events} legacy event(s) expected",
+                )
+                # THE TRAP ITSELF: a bare hit that is not a prefixed hit is a
+                # mention, and a mention counted as an event is how a refusal
+                # was read as an admission.
+                self.assertEqual(
+                    bare, prefixed,
+                    f"form {form_key} ({label}): {bare} bare marker hit(s) vs "
+                    f"{prefixed} real line(s) -- the difference is prose, and "
+                    f"prose carrying the marker makes every census of it ambiguous",
+                )
+
+    def test_no_w99_line_carries_the_marker_in_either_form(self):
+        for label, form_key, match, _ in self.FORMS:
+            with self.subTest(form=label, form_key=form_key):
+                log = self._log_for(form_key, match)
+                offenders = [
+                    ln for ln in log.splitlines() if "W99" in ln and self.MARKER in ln
+                ]
+                self.assertEqual(
+                    offenders, [],
+                    f"form {form_key} ({label}): a W99 refusal quotes the legacy "
+                    f"marker. Describe the line, never quote its marker (#995).",
+                )
+
+    def test_the_refusal_still_explains_the_transition_path(self):
+        """Removing the marker must not remove the EXPLANATION with it.
+
+        The sentence exists because an operator reading a bare W99 cannot tell
+        a record with a transition path from one without; dropping it to dodge
+        the census trap would trade one blindness for another.
+        """
+        log = self._log_for("d0de83d152f0", False)
+        self.assertIn("legacy-identity line", log)
+        self.assertIn("form key does NOT match", log)
+
+    def test_the_emitter_still_carries_the_marker(self):
+        """The complement: the trap is fixed by moving the marker, not deleting it."""
+        line = hl.refuse_foreign_image(dict(self.REC), self.WANT, form_key_match=True)
+        self.assertTrue(line.startswith(self.MARKER), line[:60])
