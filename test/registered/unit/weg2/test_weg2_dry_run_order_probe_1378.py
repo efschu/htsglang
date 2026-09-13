@@ -362,7 +362,16 @@ class TestCoverageComplement(_HermeticDryRunBase):
         )
         self.assertIn(launcher_path, weg2_modules, "launcher.py must be in its own dir's glob")
 
-        cov = coverage.Coverage(include=weg2_modules, data_file=None)
+        # config_file=False: the repo-root .coveragerc sets [run] source =
+        # python/sglang/srt, and coverage.py's own precedence rule is that a
+        # configured "source" WINS over a programmatic "include" (that is
+        # exactly the CoverageWarning "--include is ignored because --source
+        # is set" this test used to print and then silently mis-measure
+        # under -- the scope would have quietly been all of srt/, not
+        # launcher.py+srt/weg2/ as the docstring claims). Disabling config
+        # discovery makes "include" the only scope source, which is what
+        # this narrower, driver-only instrument is for.
+        cov = coverage.Coverage(include=weg2_modules, data_file=None, config_file=False)
         cov.start()
         try:
             buf = io.StringIO()
@@ -372,7 +381,6 @@ class TestCoverageComplement(_HermeticDryRunBase):
             cov.stop()
         self.assertEqual(rc, 0)
 
-        data = cov.get_data()
         print(
             "#1378 COVERAGE COMPLEMENT -- a READING LIST of unexecuted lines "
             "in this dry run, never a target (per #1348's own stated "
@@ -381,7 +389,12 @@ class TestCoverageComplement(_HermeticDryRunBase):
         )
         total_never_executed = 0
         for path in weg2_modules:
-            analysis = cov._analyze(cov._get_file_reporter(path))
+            # _analyze() takes a morf (module-or-filename) and resolves its
+            # OWN file reporter internally; passing an already-resolved
+            # reporter here made it re-resolve a FileReporter as if it were
+            # a path, which crashed with "'PythonFileReporter' object has no
+            # attribute 'endswith'" -- a real bug, not a coverage.py defect.
+            analysis = cov._analyze(path)
             executed = analysis.statements - analysis.missing
             never = sorted(analysis.missing)
             total_never_executed += len(never)
