@@ -4487,6 +4487,52 @@ def read_measured_record(
     return out
 
 
+def cushion_min_from_sampler(csv_path: str) -> Optional[float]:
+    """#1377 W11: the MINIMUM cushion of one boot, out of the v3 sampler's own
+    column, or None when the file cannot supply it.
+
+    `cushion_gib` is `file - shmem`, a FLOW, and the minimum over a boot is the
+    only reduction that answers the question the latch asks ("did this boot
+    ever get within the floor"). A mean would hide exactly the dip that fires
+    W98, and a last-sample reading would hide it whenever the boot recovered.
+
+    None, never 0.0, when the column is absent or unparsable: a missing
+    measurement must not read as "no cushion left", which would refuse every
+    arm on a box whose sampler was not armed.
+    """
+    try:
+        import csv as _csv
+
+        with open(csv_path, newline="") as fh:
+            vals = [float(r["cushion_gib"]) for r in _csv.DictReader(fh)
+                    if str(r.get("cushion_gib", "")).strip() not in ("", "n/a")]
+    except (OSError, ValueError, KeyError):
+        return None
+    return min(vals) if vals else None
+
+
+def cushion_headroom_gib(cushion_min_gib: Optional[float],
+                         bounce_now_gib: float,
+                         bounce_then_gib: float) -> Optional[float]:
+    """What the NEXT boot's cushion will be, given how the bounce grew.
+
+    THE W11 ARITHMETIC, and it is NOT `predicted_peak + floor <= bound`. That
+    form was measured against both boots and funds them BOTH:
+        xsn31/2  90.66 + 1.50 = 92.16 <= 94.43 -> funds
+        xsn31/3  90.66 + 1.50 = 92.16 <= 94.43 -> funds  (and W98 fired)
+    The quantity that separates them is the cushion, because what consumed it
+    is PINNED SHM and not predicted peak:
+        xsn31/2 cushion_min 6.99  -  bounce growth (15.75 - 7.79 = 7.96)
+          = -0.97  <  floor 1.50   (the boot then measured cushion=0.20)
+
+    None in, None out: without a recorded cushion there is no prediction, and
+    the caller must say "not measurable" rather than invent one.
+    """
+    if cushion_min_gib is None:
+        return None
+    return float(cushion_min_gib) - (float(bounce_now_gib) - float(bounce_then_gib))
+
+
 def append_measured_record(path: str, rec: Dict[str, object]) -> None:
     """Append one sample to the sidecar (append-only: history is evidence)."""
     try:
