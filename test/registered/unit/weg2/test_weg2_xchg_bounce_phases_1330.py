@@ -747,3 +747,85 @@ def test_no_production_caller_passes_phase_both_1330():
                 if isinstance(v, ast.Name) and v.id == "PHASE_BOTH":
                     offenders.append(f"{path}:{node.lineno} PHASE_BOTH")
     assert not offenders, offenders
+
+
+def test_serving_env_path_yields_a_real_semaphore_set_1330(monkeypatch):
+    """THE SERVING ARGV PATH, driven hermetically -- no boot, no GPU.
+
+    The refusal added beside it would merely RENAME the wall if the armed
+    serving form never built semaphores in the first place. It does: the
+    launcher's own publisher `prepare_xchg_env` creates the region and puts
+    `SGLANG_WEG2_XCHG_REGION` / `_BOOT` into every rank's environment
+    (launcher.py:3463 onward, via `prepare_xchg_region`), and those are the
+    exact two variables `_weg2_shadow_region` reads
+    (weight_updater.py:2162-2165). Measured here end to end.
+    """
+    from sglang.srt.weg2 import launcher as L
+    from sglang.srt.weg2 import weight_exchange_region as xr
+    from sglang.srt.managers.scheduler_components import weight_updater as wu
+
+    class _Log:
+        def __call__(self, *a, **k):
+            pass
+
+        info = warn = error = __call__
+
+    nonce = "b4nsemsprobe"
+    env = L.prepare_xchg_env(_Log(), nonce, "exchange")
+    assert env.get(xr.ENV_REGION_PATH) and env.get(xr.ENV_REGION_BOOT) == nonce
+    try:
+        for k, v in env.items():
+            monkeypatch.setenv(str(k), str(v))
+
+        class _M:
+            _weg2_shadow_region = wu.SchedulerWeightUpdaterManager._weg2_shadow_region
+            _weg2_xchg_sems = wu.SchedulerWeightUpdaterManager._weg2_xchg_sems
+
+        m = _M()
+        assert m._weg2_shadow_region() is not None
+        assert m._weg2_xchg_sems() is not None
+    finally:
+        L.teardown_xchg_region(_Log(), nonce)
+
+
+def test_unavailable_semaphores_are_named_not_swallowed_1330(monkeypatch, caplog):
+    """#505: the swallowed exception is logged BY NAME, and refused when armed.
+
+    `except BaseException: sems = None` (weight_updater.py:3173, before this)
+    is why a lost handshake reached the boot as `W74 ... src_resolved=0/N` --
+    an ADDRESS complaint for a HANDSHAKE cause.
+    """
+    import logging
+
+    from sglang.srt.weg2 import weight_exchange_transport as tp
+    from sglang.srt.managers.scheduler_components import weight_updater as wu
+
+    def _boom(*a, **k):
+        raise OSError("sem_open refused by the probe")
+
+    monkeypatch.setattr(tp, "SemSet", _boom)
+
+    class _M:
+        _weg2_xchg_sems = wu.SchedulerWeightUpdaterManager._weg2_xchg_sems
+
+        def _weg2_shadow_region(self):
+            return type("_R", (), {"boot_nonce": "probe"})()
+
+    # ARMED: refused by name, never silently None.
+    monkeypatch.setattr(wx, "exchange_armed", lambda: True)
+    with caplog.at_level(logging.INFO):
+        with pytest.raises(wx.Weg2XchgPlanDisagree) as ei:
+            _M()._weg2_xchg_sems()
+    assert "OSError" in str(ei.value)
+    assert "sem_open refused by the probe" in str(ei.value)
+    armed_text = " ".join(r.getMessage() for r in caplog.records)
+    assert "WEG2-XCHG-SEMS-UNAVAILABLE" in armed_text, armed_text
+    assert "OSError" in armed_text and "armed=True" in armed_text, armed_text
+
+    # UNARMED: the observer behaviour the `None` was written for, but LOUD.
+    monkeypatch.setattr(wx, "exchange_armed", lambda: False)
+    caplog.clear()
+    with caplog.at_level(logging.INFO):
+        assert _M()._weg2_xchg_sems() is None
+    text = " ".join(r.getMessage() for r in caplog.records)
+    assert "WEG2-XCHG-SEMS-UNAVAILABLE" in text and "OSError" in text
