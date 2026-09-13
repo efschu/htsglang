@@ -301,13 +301,69 @@ def _memory_info(pynvml, handle):
     return fields.total_bytes, fields.reserved_bytes
 
 
+#: #1377 step 4b: the REPLAY SEAM. A recorded device list, as JSON, so a desk
+#: run can drive the real launcher against recorded cards instead of the live
+#: box.
+#:
+#: IT SITS HERE AND NOT IN THE CALLER, and that placement is the whole point.
+#: `launcher.resolve_cards()` (launcher.py:1583) is the one CARD-LIST producer,
+#: but it is NOT the one reader of this function: measured on this tree, 45
+#: files import `registry.nvml` and there are 23 `list_devices()` call sites
+#: outside video_enhance. Five of them sit on the boot path --
+#: mem_ledger/calibration.py `rig_fingerprint`, registry/arbiter.py
+#: `card_totals_from_nvml`, planner/device_map.py `_device_infos`,
+#: turnkey/preflight.py `_real_cards`, managers/kv_ladder_auto.py
+#: `_cards_from_homogeneous_node`. A replay point in `resolve_cards` alone
+#: would hand the launcher cards from the recording while those five kept
+#: reading the running machine: one boot, two machines, and the seam invisible
+#: until metal. That is DRY-RUN-MISST-LIVE-BOX exactly. ONE seam, all readers.
+#:
+#: NOT a second implementation of the device list: the recorded rows are turned
+#: into the SAME `DeviceInfo` the live path builds, so every consumer sees one
+#: type and one field set.
+ENV_NVML_REPLAY = "SGLANG_NVML_REPLAY_JSON"
+
+
+def _replay_devices() -> "list[DeviceInfo] | None":
+    """The recorded device list, or None when no replay is armed.
+
+    None -- never an empty list -- when the variable is unset: an empty list is
+    a legitimate answer on a box with no GPU, and conflating "not replaying"
+    with "no cards" would make a desk run look like a GPU-less machine instead
+    of an unconfigured one.
+    """
+    path = os.environ.get(ENV_NVML_REPLAY, "")
+    if not path:
+        return None
+    with open(path) as fh:
+        rows = json.load(fh)
+    return [
+        DeviceInfo(
+            index=int(r["index"]),
+            uuid=str(r["uuid"]),
+            name=str(r["name"]),
+            total_bytes=int(r["total_bytes"]),
+            reserved_bytes=int(r.get("reserved_bytes", 0)),
+            pci_bus_id=str(r.get("pci_bus_id", "")),
+        )
+        for r in rows
+    ]
+
+
 def list_devices() -> list[DeviceInfo]:
     """Every physical GPU, in NVML index order.
 
     The returned ``index`` is the NVML index. It is intentionally *not* usable
     as a ``torch.cuda`` index: see the module docstring for why conflating the
     two has already cost a defect here.
+
+    Honours :data:`ENV_NVML_REPLAY` so a desk run drives recorded cards through
+    the real code path -- see the note on that constant for why the seam is
+    here and not in any one caller.
     """
+    replayed = _replay_devices()
+    if replayed is not None:
+        return replayed
     with nvml_session() as pynvml:
         devices: list[DeviceInfo] = []
         for index in range(pynvml.nvmlDeviceGetCount()):
