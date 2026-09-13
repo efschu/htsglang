@@ -1057,7 +1057,7 @@ def test_both_product_call_sites_pass_the_arm_terms_1330(monkeypatch):
             seen.append(kw)
 
     monkeypatch.setenv("SGLANG_WEG2_XCHG_BOOT", "b4ndepositsmoke")
-    _Stub()._weg2_xchg_deposit_before_sleep()
+    _Stub()._weg2_xchg_deposit_before_sleep(flip_index=0)
 
     assert seen, "the deposit call site did not run at all"
     kw = seen[0]
@@ -1105,3 +1105,179 @@ def test_teardown_removes_own_slots_and_leaves_foreign_ones_1330(tmp_path):
     # THE DENOMINATOR IS COMPUTED: it read `/24` while the set is 60 names
     # (24 exchange + 12 diagonal + 24 observer).
     assert f"/{len(xr.all_region_sem_names(nonce))}" in line, line
+
+
+def _deposit_stub(group, seen, caplog=None):
+    """The real deposit call site with only its edges doubled."""
+    from sglang.srt.managers.scheduler_components import weight_updater as wu
+
+    class _Stub:
+        _weg2_xchg_deposit_before_sleep = (
+            wu.SchedulerWeightUpdaterManager._weg2_xchg_deposit_before_sleep)
+
+        def _weg2_group_name(self):
+            return group
+
+        def _weg2_rank(self):
+            return 0
+
+        def _weg2_device_index(self):
+            return 0
+
+        def _weg2_shadow_region(self):
+            return object()
+
+        def _weg2_xchg_sems(self):
+            return object()
+
+        def _weg2_xchg_device_ops(self):
+            return object()
+
+        def _weg2_shadow_plan(self, hook, g, r, **kw):
+            return type("_P", (), {"descs": ()})(), ""
+
+        def _weg2_xchg_bounce_leg(self, **kw):
+            seen.append(kw)
+
+    return _Stub()
+
+
+def test_only_the_source_group_of_this_flip_deposits_1368(monkeypatch, caplog):
+    """#1368: the DESTINATION group's sleeping rank must NOT deposit.
+
+    This method fired on every sleeping rank of BOTH groups while the collect
+    half runs only on the group being woken. Boot weg2xsn27 counted 22
+    deposit-hook legs against 6 collect legs, and the two halves then said
+    contradictory things about one slot: D `was still full ... the collecting
+    rank has not drained` (x9), P `was not posted full by any depositing rank`
+    (x2). The rendezvous classes are sound -- a hermetic probe with both sides
+    on one pair drains cleanly -- so the defect was the CALLER's predicate:
+    "I am going to sleep" is a property of the rank, not of the flip.
+    """
+    import logging
+
+    from sglang.srt.weg2 import xchg_bounce as xb
+
+    terms = xb.bounce_terms(
+        bytes_per_direction=64 * 4096, n_layers=64, widest_layer_bytes=4096,
+        pairs=3, depth=2, slot_bytes=4096)
+    monkeypatch.setenv(xb.ENV_BOUNCE_TERMS, xb.publish_terms(terms))
+    monkeypatch.setenv(wx.WEIGHT_SOURCE_ENV, wx.WEIGHT_SOURCE_EXCHANGE)
+    monkeypatch.setenv("SGLANG_WEG2_XCHG_BOOT", "b4n1368")
+
+    # pp_to_tp: P is the source, D is the destination.
+    monkeypatch.setenv(wx.XCHG_LEGS_ENV, wx.LEGS_PP_TO_TP)
+
+    src_seen, dst_seen = [], []
+    _deposit_stub("P", src_seen)._weg2_xchg_deposit_before_sleep(flip_index=0)
+    with caplog.at_level(logging.INFO):
+        _deposit_stub("D", dst_seen)._weg2_xchg_deposit_before_sleep(
+            flip_index=0)
+
+    assert src_seen, "the SOURCE group must still deposit"
+    assert src_seen[0]["hook"] == "source"
+    assert not dst_seen, (
+        "the DESTINATION group deposited -- it claims a slot no collect will "
+        "drain, which is weg2xsn27's `still full` cascade")
+    text = " ".join(r.getMessage() for r in caplog.records)
+    assert "WEG2-XCHG DEPOSIT skipped role=direction-not-armed" in text, text
+    assert "direction=pp_to_tp" in text, text
+
+    # THE MIRROR, so the gate cannot be a constant: tp_to_pp swaps the roles.
+    monkeypatch.setenv(wx.XCHG_LEGS_ENV, wx.LEGS_TP_TO_PP)
+    p2, d2 = [], []
+    _deposit_stub("P", p2)._weg2_xchg_deposit_before_sleep(flip_index=0)
+    _deposit_stub("D", d2)._weg2_xchg_deposit_before_sleep(flip_index=0)
+    assert d2 and not p2, (p2, d2)
+
+
+def test_two_sides_on_one_pair_drain_each_other_1368(tmp_path):
+    """THE RENDEZVOUS ITSELF IS SOUND -- pinned so the next wall looks elsewhere.
+
+    When weg2xsn27 showed a deposit saying `still full` and a collect saying
+    `never posted` about ONE slot, the two obvious suspects were the pair index
+    and the `BounceSlots` record key. Both are symmetric (`_row(pair, card,
+    slot)`), and this drives the real classes end to end to say so. It passed
+    the day the wall was diagnosed, which is what moved the search to the
+    caller's predicate -- a green test that narrows is worth its runtime.
+    """
+    from sglang.srt.weg2 import weight_exchange_region as xr
+    from sglang.srt.weg2 import weight_exchange_transport as tp
+
+    boot = "b4nrdvpin"
+    xr.create_semaphores(boot)
+    sems = tp.SemSet(boot)
+    slots = wb.BounceSlots(boot, shm_root=str(tmp_path), create=True)
+    try:
+        deposit = wb.CrossSlotRendezvous(sems, slots, pair=0)
+        collect = wb.CrossSlotRendezvous(sems, slots, pair=0)
+
+        assert deposit.wait_empty(slot=0, seq=0) is True
+        deposit.post_full(slot=0, seq=0, nbytes=4096)
+        assert collect.wait_full(slot=0, seq=0) == 4096
+        collect.post_empty(slot=0, seq=0)
+        # THE DRAIN IS WHAT MAKES THE NEXT BAND POSSIBLE -- without it the
+        # deposit side reports `still full`, which is the xsn27 cascade.
+        assert deposit.wait_empty(slot=0, seq=1) is True
+
+        # A SEQ THE DEPOSIT NEVER PUBLISHED IS NOT ACCEPTED, so a stale band
+        # cannot pass as this one's.
+        deposit.post_full(slot=0, seq=1, nbytes=2048)
+        assert collect.wait_full(slot=0, seq=7) is None
+    finally:
+        slots.close()
+        xr.unlink_semaphores(boot)
+
+
+def test_the_boot_time_initial_sleep_never_deposits_1368(monkeypatch, caplog):
+    """#1368 FIX 2: no flip epoch, no deposit -- UNDER `legs=both`.
+
+    THE ARM THAT COUNTS IS `both`, the default xsn27 ran and xsn28 runs. My
+    first gate asked `leg_enabled(HOOK_SOURCE, group)`, which is the LEGS
+    CONFIGURATION and not this flip's direction: under `both` it is true for
+    BOTH groups and separates nothing. This test therefore runs under `both`
+    only -- a directed configuration would go green even for a predicate that
+    knows nothing about the flip.
+
+    THE REAL CONDITION IS THE FLIP'S EXISTENCE, and weg2xsn27 said so in the
+    product's own words (W79 on P):
+      `reason=no-flip-epoch detail=hook=source -- this leg carries no flip
+       epoch, so it is not a flip: ... the boot-time initial sleep runs before
+       any flip exists.`
+    Within a real flip exactly one group sleeps and the sleeper IS the source,
+    and this method runs on the sleeper by construction -- so a direction
+    predicate derived from the group would be circular. What was missing is
+    that the boot-time initial sleep is not a flip and must not claim a slot
+    no collect will ever drain.
+    """
+    import logging
+
+    from sglang.srt.weg2 import xchg_bounce as xb
+
+    terms = xb.bounce_terms(
+        bytes_per_direction=64 * 4096, n_layers=64, widest_layer_bytes=4096,
+        pairs=3, depth=2, slot_bytes=4096)
+    monkeypatch.setenv(xb.ENV_BOUNCE_TERMS, xb.publish_terms(terms))
+    monkeypatch.setenv(wx.WEIGHT_SOURCE_ENV, wx.WEIGHT_SOURCE_EXCHANGE)
+    monkeypatch.setenv("SGLANG_WEG2_XCHG_BOOT", "b4n1368b")
+    monkeypatch.setenv(wx.XCHG_LEGS_ENV, wx.LEGS_BOTH)
+
+    for group in ("P", "D"):
+        initial, flipping = [], []
+        with caplog.at_level(logging.INFO):
+            # -1 is the front's own "no flip" (`_weg2_flip_index_of`).
+            _deposit_stub(group, initial)._weg2_xchg_deposit_before_sleep(
+                flip_index=-1)
+        assert not initial, (
+            f"{group} deposited on the BOOT-TIME INITIAL SLEEP -- it claims a "
+            f"slot before any collect exists, which is weg2xsn27's `still "
+            f"full` cascade")
+        text = " ".join(r.getMessage() for r in caplog.records)
+        assert "WEG2-XCHG DEPOSIT skipped role=no-flip" in text, text
+        assert "flip_index=-1" in text, text
+
+        # AND A REAL FLIP STILL DEPOSITS, under the same `both` arm, so the
+        # gate cannot be "never deposit".
+        _deposit_stub(group, flipping)._weg2_xchg_deposit_before_sleep(
+            flip_index=0)
+        assert flipping and flipping[0]["hook"] == "source", (group, flipping)
