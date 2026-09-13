@@ -5263,30 +5263,30 @@ def xchg_bounce_terms_for_arm(weight_source: str, oncard_mode: str,
     # advisory nobody could grep for the flip-time cost of.
     lines.append(xchg_bounce.lanes_concurrent_line(terms))
     if terms.lanes_serialised:
-        # #1385 STEP 1 OF 2, NAMED RATHER THAN HIDDEN: this commit wires the
-        # CAP THROUGH PRICING (this line's own `lanes_priced` is what the
-        # host ledger now charges) but NOT through the per-rank leg driver.
-        # `weight_updater.py`'s lane loop (`group_descs_by_pair` ->
-        # `CrossSlotRendezvous`) still creates every lane it owns
-        # unconditionally -- nothing there yet waits for a concurrency permit
-        # before allocating a buffer. A boot that arms this cap therefore
-        # prices `lanes_priced` while the runtime may still pin
-        # `lanes_total`'s worth of tmpfs, which is #1358's under-charge
-        # reproduced in the other direction if trusted blind. NAMED HERE,
-        # NOT BUILT, exactly the shape #1368's own commit left for its
-        # successor ("the launcher still passes no n_lanes ... it now has a
-        # guarded consumer, which is the right order to build it in"): the
-        # PRICE exists first, so a wrong runtime is caught by the SAME 3-way
-        # measurement #1358 used (filesystem holders, cgroup d_shmem,
-        # host-slot lines) rather than believed from this line alone.
+        # #1385 STEP 2 OF 2: THE CAVEAT NOW SAYS WIRED, BECAUSE IT IS. Step 1
+        # priced `lanes_priced` without touching the per-rank leg driver, and
+        # this line said NOT_WIRED for exactly as long as that was true. Now
+        # `weight_updater.py`'s lane loop opens a boot-wide POSIX permit
+        # (`weight_exchange_transport.LanePermit`, created here by
+        # `weight_exchange_region.create_lane_permit_semaphore` a few lines
+        # below) and acquires it before each lane's `LayerBounce` is created,
+        # releasing it only after `run_bounce_leg`'s own `finally` has closed
+        # (unpinned) that buffer -- so at most `lanes_priced` may be pinned at
+        # once, the SAME number this ARM just charged. THE LINE MUST NEVER
+        # SAY WIRED WHILE IT IS NOT, so it stays a mechanical consequence of
+        # this class's own code (see `test_the_caveat_says_wired_iff_the_
+        # permit_is_really_acquired`) and not a claim typed once and left
+        # behind the next time the runtime changes.
         lines.append(
-            f"WEG2-XCHG-LANES-CONCURRENT-CAVEAT runtime_enforcement=NOT_WIRED "
-            f"(#1385 next step) -- lanes_priced={int(terms.lanes_priced)} is "
-            f"what the host ledger now charges, but the per-rank leg driver "
-            f"still allocates a buffer for every lane it owns "
-            f"unconditionally: verify with the #1358 3-way measurement "
-            f"(tmpfs holders, cgroup d_shmem, host-slot lines) before "
-            f"trusting this ARM's smaller total as the boot's real peak")
+            f"WEG2-XCHG-LANES-CONCURRENT-CAVEAT runtime_enforcement=WIRED "
+            f"(#1385 step 2) -- lanes_priced={int(terms.lanes_priced)} is "
+            f"enforced by a boot-wide permit the lane loop acquires before "
+            f"each buffer and releases right after it closes; a wait beyond "
+            f"{weight_exchange_transport.LANE_PERMIT_TIMEOUT_S:.0f}s refuses "
+            f"by name (W69 Weg2XchgGateTimeout) rather than hanging. NOT YET "
+            f"BOOT-PROVEN: confirm with the #1358 3-way measurement (tmpfs "
+            f"holders, cgroup d_shmem, host-slot lines) that the real peak "
+            f"falls to this number on the metal, not only at the desk")
     if not terms.covers_widest_layer:
         raise xchg_bounce.Weg2XchgBounceUnderCovered(
             xchg_bounce.under_coverage_refusal(terms,
@@ -10592,6 +10592,26 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 n_lanes=int(_pub_lane_n),
                 max_tag_bytes=xchg_max_tag_bytes(str(ns.model)),
                 lanes_concurrent=int(_lanes_concurrent)))
+        if int(_lanes_concurrent) > 0:
+            # #1385 (Wand 11b step 2): THE PERMIT, CREATED HERE -- before
+            # either group starts, exactly where the region's own 24
+            # semaphores are created (`prepare_xchg_region`, a few lines
+            # below) and for the identical reason: a rank may only OPEN this
+            # name (`weight_exchange_transport.LanePermit`), never create it,
+            # so an ENOENT there means "the launcher did not arm a cap",
+            # never "wait longer". Sized to `lanes_priced` -- the SAME number
+            # the ledger just charged with (`bounce_terms_for_ranks`), never
+            # a second count: the boot-wide budget of buffers that may be
+            # pinned at once is exactly what was priced, no more and no
+            # fewer.
+            weight_exchange_region.create_lane_permit_semaphore(
+                str(ring_plan.epoch), int(bounce_terms_for_ranks.lanes_priced))
+            log(f"WEG2-XCHG-LANES-CONCURRENT-PERMIT armed permits="
+                f"{int(bounce_terms_for_ranks.lanes_priced)} "
+                f"name={weight_exchange_region.lane_permit_sem_name(str(ring_plan.epoch))} "
+                f"-- a rank blocks here (W69 Weg2XchgGateTimeout after "
+                f"{weight_exchange_transport.LANE_PERMIT_TIMEOUT_S:.0f}s) "
+                f"rather than pin a lane buffer past this budget")
     xchg_env = prepare_xchg_env(log, str(ring_plan.epoch),
                                   ns.weg2_weight_source, dry=dry,
                                   hop_bound_ms=ns.weg2_shadow_hop_bound_ms,

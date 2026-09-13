@@ -1959,6 +1959,77 @@ def create_semaphores(boot_nonce: str) -> List[str]:
     return made
 
 
+def lane_permit_sem_name(boot_nonce: str) -> str:
+    """#1385: the lane-CONCURRENCY permit's own name.
+
+    Deliberately OUTSIDE the 24/12-name census (:func:`all_region_sem_names`)
+    -- it changes none of their counts, and nothing that enumerates "all
+    region semaphores" for the cross/diagonal rendezvous needs to learn a new
+    member. It IS inside the ``REGION_PREFIX`` namespace on purpose: the
+    EXISTING residue sweep (``launcher.sweep_xchg_semaphores``, prefix-matched
+    on ``sem.<REGION_PREFIX>``) then cleans this name up at the next launch
+    exactly as it already does the other 36, with no second teardown path
+    to build or forget.
+
+    ``lanes-permit`` cannot collide with a cross name (``-<src>-<dst>-<slot>-
+    {empty,full}``, all digits) or a diagonal one (``-card<n>-<slot>-
+    {empty,full}``): it is the only member of this namespace with no digit
+    where the cross/diagonal forms have one.
+    """
+    return f"/{REGION_PREFIX}{boot_nonce}-lanes-permit"
+
+
+def create_lane_permit_semaphore(boot_nonce: str, permits: int) -> str:
+    """Create the lane-concurrency permit, a COUNTING semaphore sized to
+    ``permits``. Returns the created name.
+
+    UNLINK FIRST, THEN ``O_CREAT | O_EXCL`` -- the identical two-step
+    :func:`create_semaphores` uses, for the identical reason: POSIX ignores
+    the initial VALUE when ``sem_open(O_CREAT)`` finds an existing name, so a
+    survivor from a crashed boot would hand the first lane a stale count
+    instead of ``permits``, and nothing would say so.
+
+    Called ONLY when a real cap is active for this boot (the caller,
+    ``launcher.main``, skips this call entirely when ``lanes_concurrent`` is
+    unset) -- so the unset/default path never opens this semaphore at all,
+    matching :func:`create_semaphores`'s own "the launcher, before either
+    group starts, and nobody else" rule and the flag's own "no additional
+    sync when unset" requirement.
+    """
+    if int(permits) < 1:
+        raise ValueError(
+            f"permits must be >= 1, not {permits!r} -- a semaphore that "
+            f"starts at 0 or below would block the first lane forever, "
+            f"which is the unbounded-wait class this feature exists to "
+            f"refuse rather than reproduce")
+    lib = _libc()
+    name = lane_permit_sem_name(boot_nonce)
+    lib.sem_unlink(name.encode("ascii"))
+    handle = lib.sem_open(name.encode("ascii"), _O_CREAT | _O_EXCL, 0o600,
+                          int(permits))
+    if handle in (None, 0, _SEM_FAILED):
+        err = ctypes.get_errno()
+        raise OSError(err, f"sem_open({name}) failed: {os.strerror(err)}")
+    lib.sem_close(ctypes.c_void_p(handle))
+    return name
+
+
+def unlink_lane_permit_semaphore(boot_nonce: str) -> bool:
+    """``sem_unlink`` the lane permit. Idempotent: an absent name is not an
+    error -- the unset/default path never created one, and teardown must not
+    have to know whether this boot armed a cap."""
+    lib = _libc()
+    name = lane_permit_sem_name(boot_nonce)
+    ctypes.set_errno(0)
+    if lib.sem_unlink(name.encode("ascii")) == 0:
+        return True
+    err = ctypes.get_errno()
+    if err == errno.ENOENT:
+        return False
+    raise OSError(err, f"sem_unlink({name}) returned -1 with errno={err} "
+                       f"({os.strerror(err) if err else 'errno unset'})")
+
+
 def unlink_semaphores(boot_nonce: str) -> int:
     """``sem_unlink`` all 24.  Idempotent: an absent name is not an error.
 

@@ -39,6 +39,36 @@ diverge on which values are refused. W103 is the next free number after a
 census of this tree (`grep -rhoE 'W[0-9]+' python/ test/` tops out at W102);
 W52/W53/W54/W56/W58 are a documented collision class (#1265/#1306) of
 guessed digits, so the number is taken from the census, not memory.
+
+STEP 2 (coordinator order, same branch, stacked on 45477c1745): step 1 wired
+the cap through PRICING only, and the boot record's own honesty gate
+(WEG2-XCHG-LANES-CONCURRENT-CAVEAT) said so as `runtime_enforcement=
+NOT_WIRED` -- a ledger that charges LESS than the runtime actually pins
+funds a boot that then dies at the host, the #1358 under-charge reproduced
+in the other direction. This file's second half tests the RUNTIME half:
+`weight_exchange_transport.LanePermit`, a boot-wide POSIX counting
+semaphore the launcher creates (`weight_exchange_region.
+create_lane_permit_semaphore`, sized to `lanes_priced`, never a second
+count) and `weight_updater.py`'s lane loop acquires before each lane's
+buffer and releases only after that lane's `run_bounce_leg` -- and so its
+own `finally: bounce.close()` -- has returned or raised. The caveat line now
+reads `runtime_enforcement=WIRED` for exactly the same reason it used to
+read the opposite: it is a mechanical consequence of the code, checked here,
+not a claim typed once and left behind the next time the runtime changes.
+
+MUTANTS FOR THIS STEP (coordinator-named danger directions):
+  M1  cap set, buffers still all held at once  -> the semaphore's own
+      concurrency bound, proven with real threads and a real POSIX
+      semaphore (`test_at_most_N_permits_are_ever_held_at_once`)
+  M2  release before use instead of after      -> source-order check that
+      `.release()` sits in a `finally` AFTER the `run_bounce_leg` call, and
+      an execution check that a held permit is NOT available until release
+      actually runs (`test_the_permit_is_unavailable_until_release_not_
+      before`)
+  M3  counter reports serialised without real serialisation -> the launcher
+      creates the permit with EXACTLY `lanes_priced` slots (never `n_lanes`,
+      never a hand count), checked by source and by an execution smoke
+      through the real launcher function
 """
 
 from __future__ import annotations
@@ -243,15 +273,17 @@ class NamedAndCountedNeverSilent(CustomTestCase):
         src = inspect.getsource(lc.xchg_bounce_terms_for_arm)
         self.assertIn("lanes_concurrent_line", src)
 
-    def test_a_caveat_line_names_the_unwired_runtime_when_a_cap_serialises(self):
-        """HONESTY GATE: this commit wires the CAP THROUGH PRICING ONLY.
+    def test_a_caveat_line_names_the_wired_runtime_when_a_cap_serialises(self):
+        """HONESTY GATE, STEP 2: the caveat now says WIRED, because it is.
 
-        `weight_updater.py`'s per-rank leg driver still allocates a buffer
-        for every lane it owns unconditionally -- nothing there yet waits
-        for a concurrency permit. A boot that arms a real cap must be told
-        so in its OWN log, not merely in a commit message, or the #1358
-        under-charge reproduces in the other direction: a smaller ARM number
-        trusted as the real peak.
+        The line must never claim more than the code does (coordinator
+        order: "sie darf nie NOT_WIRED sagen, waehrend sie durchsetzt, und
+        nie WIRED, waehrend sie es nicht tut"). This checks the STATIC half
+        of that promise -- the string itself, and that the old NOT_WIRED
+        claim is gone rather than left to coexist with the new one; the
+        DYNAMIC half (the permit really is acquired/released) is
+        `test_at_most_N_permits_are_ever_held_at_once` and the source-order
+        checks in `RuntimeEnforcementIsWiredCorrectly` below.
         """
         import inspect
 
@@ -259,9 +291,13 @@ class NamedAndCountedNeverSilent(CustomTestCase):
 
         src = inspect.getsource(lc.xchg_bounce_terms_for_arm)
         self.assertIn("lanes_serialised", src)
-        self.assertIn("runtime_enforcement=NOT_WIRED", src)
-        self.assertIn("NAMED HERE,", src)
-        self.assertIn("NOT BUILT", src)
+        self.assertIn("runtime_enforcement=WIRED", src)
+        self.assertNotIn("runtime_enforcement=NOT_WIRED", src, (
+            "the old EMITTED claim must not coexist with the new one -- a "
+            "caveat that could print either string depending on nothing "
+            "real would be the same printed-advisory-without-a-reader "
+            "shape (#1256) this whole feature exists to close")
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -310,7 +346,7 @@ class TheCaveatLineIsExecutionSmoked(CustomTestCase):
             "shadow", "host", str(pytest_ckpt), n_lanes=5, lanes_concurrent=2)
         caveats = [ln for ln in lines if "LANES-CONCURRENT-CAVEAT" in ln]
         self.assertEqual(len(caveats), 1, lines)
-        self.assertIn("NOT_WIRED", caveats[0])
+        self.assertIn("runtime_enforcement=WIRED", caveats[0])
         self.assertIn("lanes_priced=2", caveats[0])
         capped_line = [ln for ln in lines if ln.startswith(
             "WEG2-XCHG-LANES-CONCURRENT ")][0]
@@ -409,6 +445,287 @@ class TheLedgerSeesTheSmallerCharge(CustomTestCase):
         self.assertAlmostEqual(
             charged_uncapped["xchg_bounce_gib"] - charged_capped["xchg_bounce_gib"],
             9.00, places=2)
+
+
+# ---------------------------------------------------------------------------
+# STEP 2: the RUNTIME half. A real POSIX semaphore, real threads, real
+# concurrency proof -- not only a source-string check.
+# ---------------------------------------------------------------------------
+
+
+def _fresh_nonce(tag: str) -> str:
+    """A boot nonce unique to this test process and this test, so parallel
+    test runs (or a leftover from a previous crashed run) cannot collide on
+    the same semaphore name."""
+    import uuid
+
+    return f"test1385-{tag}-{os.getpid()}-{uuid.uuid4().hex[:8]}"
+
+
+class TheLanePermitPrimitive(CustomTestCase):
+    """`weight_exchange_region.create_lane_permit_semaphore` +
+    `weight_exchange_transport.LanePermit`, exercised as REAL POSIX IPC --
+    the same `/dev/shm` namespace a boot uses, not a mock of it. Every test
+    unlinks its own name in `finally`, mirroring the launcher's own
+    create-then-unlink discipline."""
+
+    def test_create_refuses_permits_below_one(self):
+        from sglang.srt.weg2 import weight_exchange_region as xr
+
+        nonce = _fresh_nonce("refuse")
+        for bad in (0, -1, -5):
+            with self.subTest(permits=bad):
+                with self.assertRaises(ValueError):
+                    xr.create_lane_permit_semaphore(nonce, bad)
+
+    def test_round_trip_create_open_acquire_release_unlink(self):
+        from sglang.srt.weg2 import weight_exchange_region as xr
+        from sglang.srt.weg2 import weight_exchange_transport as tp
+
+        nonce = _fresh_nonce("roundtrip")
+        xr.create_lane_permit_semaphore(nonce, 2)
+        try:
+            permit = tp.LanePermit(nonce)
+            try:
+                permit.acquire(budget_s=5.0, lane="p0", boot=nonce)
+                permit.acquire(budget_s=5.0, lane="p1", boot=nonce)
+                permit.release()
+                permit.release()
+            finally:
+                permit.close()
+        finally:
+            self.assertTrue(xr.unlink_lane_permit_semaphore(nonce))
+
+    def test_unlink_is_idempotent_like_the_24_name_census(self):
+        from sglang.srt.weg2 import weight_exchange_region as xr
+
+        nonce = _fresh_nonce("idempotent")
+        xr.create_lane_permit_semaphore(nonce, 1)
+        self.assertTrue(xr.unlink_lane_permit_semaphore(nonce))
+        self.assertFalse(xr.unlink_lane_permit_semaphore(nonce),
+                         "an absent name must not be an error")
+
+    def test_a_rank_can_never_create_the_semaphore_by_opening_it(self):
+        """SemSet's own rule, reused: an ENOENT here means the launcher never
+        armed a cap, and it must say so rather than silently creating one
+        with an unknown count (POSIX ignores the value on an existing name,
+        so a silent adopt-or-create would be invisible)."""
+        from sglang.srt.weg2 import weight_exchange_transport as tp
+
+        nonce = _fresh_nonce("never-armed")
+        permit = tp.LanePermit(nonce)
+        with self.assertRaises(OSError):
+            permit.acquire(budget_s=1.0)
+
+    def test_a_wait_beyond_the_permit_count_is_bounded_and_named_W69(self):
+        """M2's first half: a permit that cannot be granted refuses by name,
+        in bounded time -- never hangs, never silently proceeds."""
+        import time as _time
+
+        from sglang.srt.weg2 import weight_exchange_region as xr
+        from sglang.srt.weg2 import weight_exchange_transport as tp
+
+        nonce = _fresh_nonce("timeout")
+        xr.create_lane_permit_semaphore(nonce, 1)
+        holder = tp.LanePermit(nonce)
+        waiter = tp.LanePermit(nonce)
+        try:
+            holder.acquire(budget_s=5.0, lane="p0", boot=nonce)
+            budget = 0.4
+            t0 = _time.monotonic()
+            with self.assertRaises(tp.Weg2XchgGateTimeout) as ctx:
+                waiter.acquire(budget_s=budget, lane="p1", boot=nonce)
+            elapsed = _time.monotonic() - t0
+            self.assertGreaterEqual(elapsed, budget * 0.9,
+                                    "must actually wait, not fail instantly")
+            self.assertLess(elapsed, budget + 5.0,
+                            "must not wait past its own budget -- an "
+                            "unbounded waiter is the worse failure")
+            self.assertIn("W69 Weg2XchgGateTimeout", str(ctx.exception))
+            self.assertIn("lane=p1", str(ctx.exception))
+            # AFTER the holder releases, the SAME waiter (or a new one)
+            # succeeds -- proving the earlier refusal was a real timeout on
+            # a real count, not a permanently broken semaphore.
+            holder.release()
+            waiter.acquire(budget_s=5.0, lane="p1", boot=nonce)
+            waiter.release()
+        finally:
+            holder.close()
+            waiter.close()
+            xr.unlink_lane_permit_semaphore(nonce)
+
+    def test_at_most_N_permits_are_ever_held_at_once(self):
+        """M1, THE CORE MUTANT GUARD: 'cap set but buffers still all held
+        concurrently'. Real threads, a real semaphore, a real shared counter
+        -- if acquire/release were ever no-ops (the mutant), every thread
+        would enter its critical section at once and this assertion catches
+        it directly rather than inferring it from timing.
+        """
+        import threading
+        import time as _time
+
+        from sglang.srt.weg2 import weight_exchange_region as xr
+        from sglang.srt.weg2 import weight_exchange_transport as tp
+
+        nonce = _fresh_nonce("concurrency-bound")
+        PERMITS = 2
+        WORKERS = 6
+        xr.create_lane_permit_semaphore(nonce, PERMITS)
+        lock = threading.Lock()
+        state = {"inside": 0, "peak": 0, "entries": 0}
+
+        def worker():
+            permit = tp.LanePermit(nonce)
+            try:
+                permit.acquire(budget_s=10.0, lane="w", boot=nonce)
+                try:
+                    with lock:
+                        state["inside"] += 1
+                        state["entries"] += 1
+                        state["peak"] = max(state["peak"], state["inside"])
+                    _time.sleep(0.05)
+                finally:
+                    with lock:
+                        state["inside"] -= 1
+                permit.release()
+            finally:
+                permit.close()
+
+        threads = [threading.Thread(target=worker) for _ in range(WORKERS)]
+        try:
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(timeout=30.0)
+                self.assertFalse(t.is_alive(), "a worker hung -- the "
+                                 "unbounded-wait class this feature exists "
+                                 "to refuse rather than reproduce")
+        finally:
+            xr.unlink_lane_permit_semaphore(nonce)
+        self.assertEqual(state["entries"], WORKERS,
+                         "every worker must have actually run")
+        self.assertLessEqual(state["peak"], PERMITS,
+                             f"peak concurrency {state['peak']} exceeded the "
+                             f"{PERMITS} permits -- M1: the cap did not cap")
+        self.assertGreaterEqual(
+            state["peak"], 1, "the instrument itself must be live")
+
+
+class RuntimeEnforcementIsWiredCorrectly(CustomTestCase):
+    """Structural proof, over the REAL product source, that the permit is
+    acquired around exactly the buffer's own lifetime -- the same
+    source-order style `test_the_refusal_is_raised_before_the_first_
+    allocation` (test_weg2_bounce_perlane_1358.py) already uses for this
+    exact class of claim, because a full multi-rank GPU boot is not
+    available to a hermetic desk test."""
+
+    def test_the_permit_object_is_created_only_when_a_real_cap_is_active(self):
+        import inspect
+
+        from sglang.srt.managers.scheduler_components import weight_updater as wu
+
+        src = inspect.getsource(wu)
+        i = src.index("_lane_permit_active = (")
+        window = src[i:i + 4000]
+        self.assertIn("lanes_concurrent", window)
+        self.assertIn(
+            "tp.LanePermit(str(boot_nonce)) if _lane_permit_active else None",
+            window)
+
+    def test_acquire_precedes_run_bounce_leg_precedes_release(self):
+        """M2, the ordering half: acquire before the buffer, release after
+        it closes -- never the reverse, never both before."""
+        import inspect
+
+        from sglang.srt.managers.scheduler_components import weight_updater as wu
+
+        src = inspect.getsource(wu)
+        base = src.index("_lane_permit_active = (")
+        acquire_i = src.index("_lane_permit.acquire(", base)
+        run_i = src.index("bx.run_bounce_leg(", acquire_i)
+        release_i = src.index("_lane_permit.release()", run_i)
+        self.assertLess(acquire_i, run_i,
+                        "the permit must be acquired BEFORE the buffer")
+        self.assertLess(run_i, release_i,
+                        "the permit must be released AFTER the buffer's own "
+                        "leg (and so its close()) has returned or raised")
+
+    def test_the_acquire_call_is_itself_conditioned_on_the_active_flag(self):
+        """A structural guard against a mutant that keeps the semaphore
+        object gated but calls `.acquire()` unconditionally (which would
+        crash on the default path, but only AFTER a syscall the flag
+        promises never happens)."""
+        import inspect
+
+        from sglang.srt.managers.scheduler_components import weight_updater as wu
+
+        src = inspect.getsource(wu)
+        base = src.index("_lane_permit_active = (")
+        acquire_stmt = src.index("_lane_permit.acquire(", base)
+        preceding = src[max(0, acquire_stmt - 200):acquire_stmt]
+        self.assertIn("if _lane_permit_active:", preceding)
+
+    def test_release_lives_inside_a_finally_block(self):
+        """M2's other half: a release that only runs on the happy path is
+        the leak this whole feature exists to bound -- `run_bounce_leg`
+        itself already earns this property for the buffer
+        (`bounce.close()` sits in ITS OWN finally); the permit must match
+        it or a raising lane holds its permit forever, exactly the
+        unbounded-wait class named throughout this file."""
+        import inspect
+
+        from sglang.srt.managers.scheduler_components import weight_updater as wu
+
+        src = inspect.getsource(wu)
+        base = src.index("_lane_permit_active = (")
+        release_i = src.index("_lane_permit.release()", base)
+        preceding = src[max(0, release_i - 300):release_i]
+        self.assertIn("finally:", preceding)
+
+
+class TheLauncherPricesTheOnlyPermitCount(CustomTestCase):
+    """M3: the launcher creates the semaphore with EXACTLY `lanes_priced`,
+    the SAME number the ledger just charged with -- never `n_lanes`, never a
+    hand count, never a second computation of the cap."""
+
+    def test_the_launcher_creates_with_lanes_priced_not_a_second_count(self):
+        import inspect
+
+        from sglang.srt.weg2 import launcher as lc
+
+        src = inspect.getsource(lc.main)
+        i = src.index("create_lane_permit_semaphore(")
+        window = src[max(0, i - 200):i + 200]
+        self.assertIn("bounce_terms_for_ranks.lanes_priced", window)
+        self.assertNotIn("_pub_lane_n)", window)
+
+    def test_the_launcher_only_creates_it_when_a_cap_is_requested(self):
+        import inspect
+
+        from sglang.srt.weg2 import launcher as lc
+
+        src = inspect.getsource(lc.main)
+        i = src.index("create_lane_permit_semaphore(")
+        preceding = src[max(0, i - 1500):i]
+        self.assertIn("if int(_lanes_concurrent) > 0:", preceding)
+
+    def test_the_permit_name_shares_the_region_prefix_so_the_existing_sweep_cleans_it(self):
+        """No second teardown path: naming this inside `REGION_PREFIX` means
+        the launch-time residue sweep (`sweep_xchg_semaphores`, prefix-
+        matched on `sem.<REGION_PREFIX>`) already catches a crashed boot's
+        leftover permit exactly as it catches the other 36 names."""
+        from sglang.srt.weg2 import weight_exchange_region as xr
+
+        name = xr.lane_permit_sem_name("abc123")
+        self.assertTrue(name.startswith(f"/{xr.REGION_PREFIX}"))
+        # And it must never collide with a cross (`-<digit>-<digit>-<digit>-
+        # {kind}`) or diagonal (`-card<n>-<digit>-{kind}`) name.
+        self.assertNotIn("-card", name)
+        for pair in range(xr.N_PAIRS):
+            for slot in range(xr.SLOTS_PER_PAIR):
+                for kind in ("empty", "full"):
+                    self.assertNotEqual(
+                        name, xr.sem_name("abc123", pair, slot, kind))
 
 
 if __name__ == "__main__":

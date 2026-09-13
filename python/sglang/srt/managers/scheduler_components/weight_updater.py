@@ -3467,6 +3467,7 @@ class SchedulerWeightUpdaterManager:
         from sglang.srt.weg2 import weight_exchange as wx
         from sglang.srt.weg2 import weight_exchange_bounce as bx
         from sglang.srt.weg2 import weight_exchange_region as xr
+        from sglang.srt.weg2 import weight_exchange_transport as tp
 
         # THE MODE IS READ ONCE, from the one reader, and passed down.  A leg
         # that re-read it further in could act on a different answer than the
@@ -3632,76 +3633,137 @@ class SchedulerWeightUpdaterManager:
                     f"allocation: an under-priced bounce does not fail here, it "
                     f"fails later as a cushion nobody can account for."
                 )
-            for pair, group in _lanes.items():
-                rv = (bx.CrossSlotRendezvous(sems, slots, pair=pair)
-                      if pair is not None else
-                      bx.CrossSlotRendezvous(
-                          sems, slots,
-                          card=int(getattr(group[0], "dst_rank", device))))
-                # #1374 F1: THE PER-TAG DRAIN, wired where the lane's own
-                # rendezvous exists. Ordering, on the source:
-                #   tag 0: prime the counter to 0 (create_semaphores arms every
-                #          `empty` at 1 for the OLD per-slot meaning, and at
-                #          tag 0 there is no previous tag to have been drained)
-                #   tag t: wait for the collector's `drained(t-1)` BEFORE
-                #          touching the buffer, which is safe because the pause
-                #          loop published credit(t-1) before calling us
-                # On the collector: post `drained(t)` after the tag's last band.
-                # Without this, tag t+1 overwrites bands tag t's collector may
-                # still be reading -- silently, which is worse than the deadlock
-                # the per-band claim caused.
-                if tag is not None and phase == bx.PHASE_DEPOSIT:
-                    if _first_tag:
-                        rv.prime_drain()
-                    elif not rv.wait_drained(tag=str(tag)):
-                        raise bx.Weg2XchgBouncePhaseUnordered(
-                            f"W68 Weg2XchgPlanDisagree: tag={tag} lane="
-                            f"{'p%s' % pair if pair is not None else 'diag'} "
-                            f"waited for the collector to drain the previous "
-                            f"tag and it did not. The credit for that tag was "
-                            f"published before this wait, so the collector was "
-                            f"free to run: this is a stalled or dead peer, not "
-                            f"the weg2xsn30 cycle. Refusing rather than "
-                            f"overwriting bands a consumer may still read.")
-                last = bx.run_bounce_leg(
-                    group, ops, boot_nonce, slot_bytes=slot_bytes, depth=depth,
-                    terms=terms, mode=resolved_mode, shm_root=root,
-                    device=device, phase=phase, rendezvous=rv,
-                    # ONE BUFFER PER LANE. Keyed on the boot alone, the six
-                    # ranks' concurrent legs each obeyed their own handshake
-                    # and then all wrote slot 0 of ONE file -- silent
-                    # cross-pair corruption, measured in the desk replay.
-                    lane=(f"p{pair}" if pair is not None
-                          else f"c{int(getattr(group[0], 'dst_rank', device))}"),
-                    # #1358: the identity the host-slot lines carry. This is
-                    # the only frame where the group and the rank both exist.
+            # #1385 (Wand 11b step 2): THE RUNTIME HALF OF THE CAP. Step 1
+            # (this branch's earlier commit) wired `lanes_concurrent` through
+            # PRICING only -- the ledger charged `lanes_priced` while every
+            # rank still pinned every lane it owned unconditionally, which is
+            # #1358's under-charge reproduced in the other direction (the
+            # WEG2-XCHG-LANES-CONCURRENT-CAVEAT line named exactly this gap).
+            # This closes it: a rank opens the boot-wide permit ONLY when a
+            # real cap is active, so the unset/default path performs the
+            # zero extra syscalls the flag promises (`terms.lanes_concurrent`
+            # is read from the SAME `terms` the ledger priced with -- one
+            # cap value, never a second one computed here).
+            _lane_permit_active = (
+                terms is not None
+                and int(getattr(terms, "lanes_concurrent", 0) or 0) > 0
+            )
+            _lane_permit = tp.LanePermit(str(boot_nonce)) if _lane_permit_active else None
+            try:
+                for pair, group in _lanes.items():
+                    rv = (bx.CrossSlotRendezvous(sems, slots, pair=pair)
+                          if pair is not None else
+                          bx.CrossSlotRendezvous(
+                              sems, slots,
+                              card=int(getattr(group[0], "dst_rank", device))))
+                    # #1374 F1: THE PER-TAG DRAIN, wired where the lane's own
+                    # rendezvous exists. Ordering, on the source:
+                    #   tag 0: prime the counter to 0 (create_semaphores arms
+                    #          every `empty` at 1 for the OLD per-slot
+                    #          meaning, and at tag 0 there is no previous tag
+                    #          to have been drained)
+                    #   tag t: wait for the collector's `drained(t-1)` BEFORE
+                    #          touching the buffer, which is safe because the
+                    #          pause loop published credit(t-1) before
+                    #          calling us
+                    # On the collector: post `drained(t)` after the tag's
+                    # last band. Without this, tag t+1 overwrites bands tag t's
+                    # collector may still be reading -- silently, which is
+                    # worse than the deadlock the per-band claim caused.
                     #
-                    # GUARDED, AND THE GUARD IS THE FIX FOR A DEFECT I SHIPPED.
-                    # The first version called `self._weg2_group_name()`
-                    # unprotected and claimed "every existing caller unchanged".
-                    # The train seat's execution smoke refuted it by bisection
-                    # ([15]/[16]/[17a] all 19/19, [17b] 15/19): the two smoke
-                    # harnesses drive this exact product path with STUBS
-                    # (`_LegStub` in xchg_provider_smoke.py, `_Stub` in
-                    # xchg_leg_replay.py) that carry no such methods, so every
-                    # leg died with AttributeError before it ran.
-                    #
-                    # A getattr default rather than two more stub methods: this
-                    # closes the CLASS (any future caller without the methods)
-                    # instead of the two instances that happened to exist, and
-                    # it matches what the emitter already does one frame down,
-                    # where an absent group prints as `group=?`.
-                    leg_group=str(_weg2_identity(self, "_weg2_group_name", "")),
-                    leg_rank=int(_weg2_identity(self, "_weg2_rank", -1)),
-                    leg_name=f"{boot_nonce}/{hook}",
-                    log=logger.info)
-                # #1374 F1: THIS TAG IS OUT OF THE BUFFER. Posted once per
-                # tag by the collector, after its last band; it is what the
-                # source's `wait_drained` for the NEXT tag releases. The
-                # per-band `empty` post is gone (that row IS this handshake),
-                # so N posts per tag cannot hand the source N tokens.
-                if tag is not None and phase == bx.PHASE_COLLECT:
-                    rv.post_drained(tag=str(tag))
+                    # DELIBERATELY OUTSIDE THE PERMIT HOLD (below): this wait
+                    # is for a PEER'S PROGRESS, not for this lane's own
+                    # buffer, and no buffer exists yet at this point in the
+                    # loop. Holding a permit across it would tie up a
+                    # boot-wide slot while idle, making the cap less
+                    # effective than the number it charges for and risking a
+                    # spurious W69 on a healthy but merely slow peer.
+                    if tag is not None and phase == bx.PHASE_DEPOSIT:
+                        if _first_tag:
+                            rv.prime_drain()
+                        elif not rv.wait_drained(tag=str(tag)):
+                            raise bx.Weg2XchgBouncePhaseUnordered(
+                                f"W68 Weg2XchgPlanDisagree: tag={tag} lane="
+                                f"{'p%s' % pair if pair is not None else 'diag'} "
+                                f"waited for the collector to drain the "
+                                f"previous tag and it did not. The credit for "
+                                f"that tag was published before this wait, so "
+                                f"the collector was free to run: this is a "
+                                f"stalled or dead peer, not the weg2xsn30 "
+                                f"cycle. Refusing rather than overwriting "
+                                f"bands a consumer may still read.")
+                    _lane_key = (f"p{pair}" if pair is not None
+                                else f"c{int(getattr(group[0], 'dst_rank', device))}")
+                    # #1385: ACQUIRE RIGHT BEFORE THE BUFFER, RELEASE RIGHT
+                    # AFTER IT CLOSES -- never earlier, never later. Acquiring
+                    # here (not before the drain wait above) keeps the permit
+                    # held for exactly the window `run_bounce_leg` actually
+                    # pins the buffer, which is `lanes_serialised`'s own
+                    # promise: the boot pays flip time only while a lane
+                    # really is waiting for tmpfs room, not for a peer's
+                    # unrelated progress. `run_bounce_leg`'s OWN `finally`
+                    # closes its `LayerBounce` on every exit path (success or
+                    # raise) BEFORE returning or propagating, so by the time
+                    # this `finally` releases the permit the memory is
+                    # already unpinned -- the buffer is freed BEFORE the next
+                    # acquire can succeed, never after.
+                    if _lane_permit_active:
+                        _lane_permit.acquire(
+                            budget_s=tp.LANE_PERMIT_TIMEOUT_S, lane=_lane_key,
+                            boot=str(boot_nonce))
+                    try:
+                        last = bx.run_bounce_leg(
+                            group, ops, boot_nonce, slot_bytes=slot_bytes,
+                            depth=depth, terms=terms, mode=resolved_mode,
+                            shm_root=root, device=device, phase=phase,
+                            rendezvous=rv,
+                            # ONE BUFFER PER LANE. Keyed on the boot alone, the
+                            # six ranks' concurrent legs each obeyed their own
+                            # handshake and then all wrote slot 0 of ONE file
+                            # -- silent cross-pair corruption, measured in the
+                            # desk replay.
+                            lane=_lane_key,
+                            # #1358: the identity the host-slot lines carry.
+                            # This is the only frame where the group and the
+                            # rank both exist.
+                            #
+                            # GUARDED, AND THE GUARD IS THE FIX FOR A DEFECT I
+                            # SHIPPED. The first version called
+                            # `self._weg2_group_name()` unprotected and
+                            # claimed "every existing caller unchanged". The
+                            # train seat's execution smoke refuted it by
+                            # bisection ([15]/[16]/[17a] all 19/19, [17b]
+                            # 15/19): the two smoke harnesses drive this exact
+                            # product path with STUBS (`_LegStub` in
+                            # xchg_provider_smoke.py, `_Stub` in
+                            # xchg_leg_replay.py) that carry no such methods,
+                            # so every leg died with AttributeError before it
+                            # ran.
+                            #
+                            # A getattr default rather than two more stub
+                            # methods: this closes the CLASS (any future
+                            # caller without the methods) instead of the two
+                            # instances that happened to exist, and it
+                            # matches what the emitter already does one frame
+                            # down, where an absent group prints as `group=?`.
+                            leg_group=str(_weg2_identity(self, "_weg2_group_name", "")),
+                            leg_rank=int(_weg2_identity(self, "_weg2_rank", -1)),
+                            leg_name=f"{boot_nonce}/{hook}",
+                            log=logger.info)
+                    finally:
+                        if _lane_permit_active:
+                            _lane_permit.release()
+                    # #1374 F1: THIS TAG IS OUT OF THE BUFFER. Posted once per
+                    # tag by the collector, after its last band; it is what
+                    # the source's `wait_drained` for the NEXT tag releases.
+                    # The per-band `empty` post is gone (that row IS this
+                    # handshake), so N posts per tag cannot hand the source N
+                    # tokens.
+                    if tag is not None and phase == bx.PHASE_COLLECT:
+                        rv.post_drained(tag=str(tag))
+            finally:
+                if _lane_permit is not None:
+                    _lane_permit.close()
         finally:
             slots.close()
         return last
