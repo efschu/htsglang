@@ -235,3 +235,117 @@ class TheLatchIsWIRED1361(CustomTestCase):
         self.assertEqual(body.count("read_cgroup_pressure()"), 1)
         self.assertIn("_pr_fast = host_ledger.read_cgroup_pressure()", body)
         self.assertIn("pr = _pr_fast", body)
+
+
+#: #1361b THE xsn27 STARTUP SLEEP LEG, from its own v2 sampler
+#: (weg2xsn27_0913/hostsample_v2_weg2xsn27.csv), (t_s, nonreclaim_gib) with t
+#: relative to 00:12:57.052. The kill fell inside the 33 s sampler hole that
+#: opens after the last row.
+XSN27_LEG = (
+    (0.000, 71.08), (0.506, 71.58), (1.012, 72.00), (1.517, 72.17),
+    (2.023, 72.47), (2.528, 72.63), (3.034, 72.74), (3.538, 72.74),
+    (4.042, 72.82), (4.547, 72.97), (5.052, 73.00), (5.557, 73.00),
+    (6.063, 73.89), (6.579, 78.44), (7.100, 80.80), (7.819, 82.47),
+)
+#: The plan that leg was writing: `WEG2-XCHG-PLAN d2h 16.4 + 5.4 + 5.4 GiB`.
+XSN27_PLAN_GIB = 27.2
+#: shmem at the leg's start, so "already written" is derivable per row.
+XSN27_SHMEM0 = 49.69
+
+
+def _xsn27_remaining(nr, shmem):
+    return max(0.0, XSN27_PLAN_GIB - (shmem - XSN27_SHMEM0))
+
+
+class TheReplayFiresBeforeTheKillAndNotBefore1361b(CustomTestCase):
+    """#1361b ACCEPTANCE: the measured leg, replayed through the bounded latch.
+
+    Two halves, and BOTH have to hold or the latch is useless:
+      * it must fire on weg2xsn27's startup sleep leg BEFORE the sampler goes
+        blind at 00:13:04.87 (the kernel reaped inside that 33 s hole);
+      * it must NOT fire earlier on the same leg, where the climb is real but
+        the plan still fits -- the naive `rate x 5 s` form fires at 00:12:57
+        (71.1 + 5.4x5 = 98 > 95.9) on a leg that had every right to run, and a
+        latch that fires there kills every healthy boot.
+    """
+
+    #: shmem per row, needed for the remaining-bytes bound.
+    SHMEM = (49.69, 49.69, 49.69, 49.73, 49.78, 49.83, 49.88, 49.88, 49.90,
+             50.02, 50.02, 50.02, 50.86, 55.40, 57.77, 60.39)
+
+    def _run(self, bounded):
+        lat = hl.RateLatch(reap_mark_gib=95.90)
+        for (t, nr), sh in zip(XSN27_LEG, self.SHMEM):
+            rem = _xsn27_remaining(nr, sh) if bounded else None
+            out = lat.observe(t, nr, remaining_leg_gib=rem)
+            if out and "W98" in out:
+                return t, out
+        return None, None
+
+    def test_the_leg_is_refused_at_its_FIRST_sample_because_it_never_fitted(self):
+        """THE MEASUREMENT CORRECTED THE DESIGN, and this is the number.
+
+        The order asked for `min(rate x lookahead, remaining)`. Replayed against
+        weg2xsn27's own series that is strictly WORSE: the rate is ~1 GiB/s for
+        the first six seconds, so a rate-bounded projection stays silent through
+        a leg that was already impossible -- 71.08 + 27.20 = **98.28** against
+        the 95.90 mark AT THE FIRST ROW. The leg never fitted; nothing about its
+        slope was the finding. So the test is `now + remaining`, it needs no
+        rate, and it fires 7.8 s before the sampler goes blind instead of 1.2 s.
+        """
+        t, line = self._run(bounded=True)
+        self.assertIsNotNone(line, "the latch must fire on this leg")
+        self.assertEqual(t, 0.0)
+        self.assertAlmostEqual(XSN27_LEG[0][1] + XSN27_PLAN_GIB, 98.28, places=2)
+        self.assertGreater(XSN27_LEG[0][1] + XSN27_PLAN_GIB, 95.90)
+        self.assertIn("remaining_leg=", line)
+        self.assertIn("FEASIBILITY", line)
+        self.assertIn("no rate needed", line)
+
+    def test_the_rate_form_would_have_watched_six_seconds_of_a_doomed_leg(self):
+        """CAN-FAIL for the design change: measured, not argued.
+
+        `rate x lookahead` only reaches the mark once the ramp arrives at
+        t=6.579 -- six seconds and 7.4 GiB later, with the sampler about to go
+        blind. Same data, same mark, a whole leg of difference.
+        """
+        lat = hl.RateLatch(reap_mark_gib=95.90)
+        fired = None
+        for t, nr in XSN27_LEG:
+            if lat.observe(t, nr) and fired is None:
+                fired = t
+        self.assertAlmostEqual(fired, 6.579, places=2)
+        self.assertGreater(fired, 6.0)
+
+    def test_the_rate_still_owns_the_case_with_no_plan_to_read(self):
+        """`remaining=None` keeps the pre-#1361b behaviour, unchanged."""
+        lat = hl.RateLatch(reap_mark_gib=95.90)
+        for i, v in enumerate(XSN26B_RAMP):
+            lat.observe(float(i), v + 26.4)
+        self.assertTrue(lat.latched)
+
+    def test_a_healthy_leg_with_room_never_latches(self):
+        """rg6/sb5f shape: the same climb, a plan that fits. Must stay silent."""
+        lat = hl.RateLatch(reap_mark_gib=95.90)
+        nr = 60.0
+        for i in range(12):
+            nr += 1.5                      # a brisk, legitimate ring fill
+            out = lat.observe(i * 0.5, nr, remaining_leg_gib=max(0.0, 18.0 - i * 1.5))
+            self.assertIsNone(out, f"latched at i={i}, nr={nr}")
+        self.assertFalse(lat.latched)
+
+
+class TheLaunchMomentChargesBothAtOnce1361c(CustomTestCase):
+    def test_the_two_terms_are_summed_not_maxed(self):
+        peak, line = hl.launch_moment_peak_gib(
+            anon_load_peak_gib=5.2, ring_fill_gib=11.0, origin_gib=67.2)
+        self.assertAlmostEqual(peak, 83.4, places=2)
+        self.assertIn("SIMULTANEOUS, not sequential", line)
+        self.assertIn("weg2xsn27", line)
+
+    def test_it_reproduces_the_boots_own_thirteen_seconds(self):
+        """anon 17.8 -> 23.0 (+5.2) and shmem 49.4 -> 60.4 (+11.0) OVERLAP;
+        nonreclaim went 67.2 -> 82.5, i.e. the SUM, not the larger."""
+        peak, _l = hl.launch_moment_peak_gib(5.2, 11.0, 67.2)
+        self.assertAlmostEqual(peak, 82.5, delta=1.0)
+        self.assertGreater(peak, 67.2 + max(5.2, 11.0))   # a max() model misses it

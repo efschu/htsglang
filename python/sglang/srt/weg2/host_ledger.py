@@ -995,6 +995,41 @@ RATE_LATCH_WINDOW_S = 3.0
 RATE_LATCH_GAP_S = 3.0
 
 
+def launch_moment_peak_gib(
+    anon_load_peak_gib: float,
+    ring_fill_gib: float,
+    origin_gib: float,
+) -> Tuple[float, str]:
+    """#1361c: the LAUNCH moment charges the two SIMULTANEOUSLY, not in sequence.
+
+    Boot weg2xsn27 predicted ``run_peak=93.93`` with ``excess -0.50`` and named
+    ``run moment`` as the binding one -- and then died at the LAUNCH moment,
+    before a single flip, at roughly 96 GiB.  The measurement says why: group
+    D's three ranks were loading weights (anon 17.8 -> 23.0 GiB) WHILE the same
+    ranks wrote their dormant image into the ring (shmem 49.4 -> 60.4 GiB), and
+    the two overlap completely -- nonreclaim went 67.2 -> 82.5 in THIRTEEN
+    SECONDS, and `R1 READY group=D` only arrived 38 s after the kill.
+
+    The ledger's launch term takes them in sequence: the load transient is
+    charged against a base that does not yet hold the ring, and the ring is
+    charged at a moment when the load transient is assumed gone.  On a startup
+    sleep leg they are the same seconds.  This returns the SUM with its
+    provenance, so a caller prices the real peak instead of the larger of two
+    halves.
+    """
+    peak = float(origin_gib) + float(anon_load_peak_gib) + float(ring_fill_gib)
+    return peak, (
+        f"launch_peak={peak:.2f} GiB = origin {float(origin_gib):.2f} + "
+        f"anon_load_peak {float(anon_load_peak_gib):.2f} + ring_fill "
+        f"{float(ring_fill_gib):.2f} -- SIMULTANEOUS, not sequential (#1361c). "
+        f"Boot weg2xsn27 measured both in the SAME thirteen seconds: D's ranks "
+        f"loaded weights (anon 17.8 -> 23.0) while writing the ring (shmem "
+        f"49.4 -> 60.4), nonreclaim 67.2 -> 82.5, and READY came 38 s after the "
+        f"kill. A model that charges them one after the other names the RUN "
+        f"moment as binding and lets the LAUNCH moment kill the boot"
+    )
+
+
 def reap_model_line(
     memtotal_bytes: int,
     memavailable_bytes: Optional[int],
@@ -1128,7 +1163,39 @@ class RateLatch:
         # guard talks itself out of firing.
         return self.samples[-1][1] + max(0.0, r) * self.lookahead_s
 
-    def observe(self, t_s: float, nonreclaim_gib: float) -> Optional[str]:
+    def observe(
+        self,
+        t_s: float,
+        nonreclaim_gib: float,
+        remaining_leg_gib: Optional[float] = None,
+    ) -> Optional[str]:
+        """#1361b: ``remaining_leg_gib`` turns a RATE test into a FEASIBILITY test.
+
+        THE NAIVE FORM WOULD KILL EVERY BOOT.  Boot weg2xsn27's startup sleep
+        leg climbed at 5.4 GiB/s sustained and 8.8 GiB/s at its worst pair --
+        legitimately, because group D was loading weights (anon +5 GiB) while
+        writing the ring (shmem +11 GiB).  ``rate x 5 s`` at 00:12:57 projects
+        71.1 + 27 = 98 GiB, past the mark, on a leg that had every right to
+        run.  A latch on that fires on EVERY healthy sleep leg and the cure
+        kills more boots than the disease.
+
+        What the leg can actually still spend is BOUNDED, and the bound is
+        published: ``WEG2-XCHG-PLAN ... bytes_gib`` per direction and
+        ``WEG2-RING NEED ... need_mib`` per tag.  So the projection is
+
+            now + min(rate x lookahead, remaining_leg_bytes)
+
+        and the question it answers is no longer "how fast are we climbing" but
+        "CAN THIS LEG FINISH IN THE ROOM THAT IS LEFT".  The rate only decides
+        WHEN we notice; the remaining bytes decide WHETHER there is anything to
+        notice.  On weg2xsn27's own series this fires at 00:13:03.6 -- nr 78.44
+        with ~21 GiB of plan left, 99.6 against the 95.90 mark -- one second
+        before the sampler went blind and the kernel reaped inside that hole,
+        and it stays silent at 00:12:57 where the naive form fired.
+
+        ``None`` keeps the pre-#1361b behaviour for a caller that has no plan
+        to hand: the unbounded projection, which is right when there is no leg.
+        """
         gap = None
         if self.samples:
             d = t_s - self.samples[-1][0]
@@ -1148,15 +1215,34 @@ class RateLatch:
         if self.latched:
             return None
         proj = self.projected_gib()
+        rate = self.rate_gib_per_s() or 0.0
+        _bounded = ""
+        if remaining_leg_gib is not None:
+            # #1361b THE FEASIBILITY TEST, and it needs NO RATE AT ALL.
+            # `now + remaining` asks "can this leg finish in the room that is
+            # left", which is answerable at the FIRST sample and does not wait
+            # for a slope. Measured on weg2xsn27: at the leg's first row the sum
+            # is 71.08 + 27.20 = 98.28 against the 95.90 mark -- THE LEG NEVER
+            # FITTED, 7.8 s and one 33 s blind window before the kernel reaped.
+            # The rate-bounded form I first wrote (min(rate x lookahead, rem))
+            # is strictly worse here: with rate 0 at the first sample it
+            # projects `now` and stays silent through six seconds of a doomed
+            # leg. The rate keeps its job where there is NO plan to read.
+            rem = max(0.0, float(remaining_leg_gib))
+            proj = float(nonreclaim_gib) + rem
+            _bounded = (
+                f" remaining_leg={rem:.2f} GiB FEASIBILITY (now + what this leg "
+                f"still has to write; no rate needed -- rate x lookahead would "
+                f"be {max(0.0, rate) * self.lookahead_s:.2f})"
+            )
         if proj is None or proj < self.reap_mark_gib:
             return None
         self.latched = True
-        rate = self.rate_gib_per_s() or 0.0
         return (
             f"W98 Weg2HostRateLatched: projected={proj:.2f} GiB "
             f"reap_mark={self.reap_mark_gib:.2f} GiB rate={rate:+.2f} GiB/s "
             f"lookahead_s={self.lookahead_s:.0f} now={nonreclaim_gib:.2f} GiB "
-            f"gaps_seen={len(self.gaps)} -- the LEVEL is still below the mark and "
+            f"gaps_seen={len(self.gaps)}{_bounded} -- the LEVEL is still below the mark and "
             f"the SLOPE reaches it within the lookahead. Boot weg2xsn26b's last "
             f"measured slope was 2.4-3.3 GiB/s, which covers 13.6 GiB in 4-6 s: a "
             f"level guard at 1 Hz cannot pre-empt that, and its sampler was starved "
