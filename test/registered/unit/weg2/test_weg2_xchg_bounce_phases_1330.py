@@ -920,3 +920,20 @@ def test_shadow_and_exchange_semaphore_names_are_disjoint_1330():
     every = set(xr.all_region_sem_names(boot))
     assert exchange <= every and observer <= every, sorted(
         (exchange | observer) - every)
+
+
+def test_the_bounce_leg_line_never_omits_the_inject_field_1330():
+    """#1336's class: an absent field is a silence the reader fills in.
+
+    `inject=` used to vanish when no verdict existed, so a SHADOW leg that
+    graded nothing looked exactly like an AUTHORITATIVE leg, which has no
+    comparison by construction (`comparing = mode == INJECT_SHADOW`). The two
+    now say which silence they are, and only one of them is a finding.
+    """
+    mk = lambda mode: wb.BounceResult(  # noqa: E731
+        units=0, bands=0, widest_unit_key=("", "u"), widest_unit_bytes=0,
+        widest_run_bytes=0, slot_bytes=SLOT, depth=1, host_bytes_peak=0,
+        deposited_bytes=0, collected_bytes=0, planned_bytes=0,
+        deposit_ms=0.0, collect_ms=0.0, overlap="none", mode=mode)
+    assert "inject=by-design-authoritative" in mk(wx.INJECT_AUTHORITATIVE).line()
+    assert "inject=NOTHING-COMPARED" in mk(wx.INJECT_SHADOW).line()
