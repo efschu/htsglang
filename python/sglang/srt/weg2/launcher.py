@@ -5208,8 +5208,21 @@ def choose_host_ledger(
     # disagreement readable instead of hidden inside an equal number.
     _bounce_prov = {
         "depth": int(xchg_bounce.ASSEMBLE_DEPTH_DEFAULT),
+        # #1361 [23e] `comparing` IS PASSED, NOT LEFT TO THE PROCESS DEFAULT.
+        # `assemble_slots(depth)` with `comparing=None` asks
+        # `weight_exchange.inject_mode()`, which reads INJECT_ENV -- and the
+        # launcher NEVER sets that for itself: `prepare_xchg_env` puts it only
+        # into the dict handed to the ranks (launcher.py:3594), while the
+        # launcher sets WEIGHT_SOURCE_ENV for its own process (:9631) and not
+        # this one. So a boot armed `authoritative` still got `slots` computed
+        # as if it were shadow, while `bounce_inject` printed `authoritative`
+        # from the argv -- the two fields could contradict each other on the
+        # same line, and the one that disagreed with the ranks was the one
+        # nobody would have checked. Found by B4n on the env publication, not
+        # by me on my own field.
         "slots": int(xchg_bounce.assemble_slots(
-            int(xchg_bounce.ASSEMBLE_DEPTH_DEFAULT))),
+            int(xchg_bounce.ASSEMBLE_DEPTH_DEFAULT),
+            comparing=(str(inject_mode) == weight_exchange.INJECT_SHADOW))),
         "inject_mode": str(inject_mode),
     } if _bounce_charge_bytes else None
     ledger_kw = dict(

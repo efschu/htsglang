@@ -102,3 +102,41 @@ class TheShareSourceIsNamed(CustomTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TheSlotsAgreeWithTheInjectModeOnTheSameLine(CustomTestCase):
+    """#1361 [23e] -- two fields on one line that could contradict each other.
+
+    `assemble_slots(depth)` with `comparing=None` asks
+    `weight_exchange.inject_mode()`, which reads INJECT_ENV. The launcher never
+    sets that for ITSELF -- `prepare_xchg_env` puts it only into the dict handed
+    to the ranks -- so a boot armed `authoritative` got `slots` computed as if
+    it were shadow, while `bounce_inject` printed `authoritative` from the argv.
+
+    Two fields, one line, disagreeing about the same arm, and the one that was
+    wrong about the ranks is the one nobody would have checked. Found by the
+    exchange seat while looking at the env publication, not by this seat while
+    looking at its own field.
+    """
+
+    def test_an_authoritative_arm_prints_one_slot_fewer(self):
+        import inspect
+
+        from sglang.srt.weg2 import launcher as lc
+
+        src = inspect.getsource(lc)
+        i = src.index('"slots": int(xchg_bounce.assemble_slots(')
+        window = src[i:i + 400]
+        self.assertIn("comparing=", window,
+                      "assemble_slots must be told the arm, not left to the "
+                      "launcher's own process default")
+
+    def test_the_two_fields_cannot_disagree(self):
+        from sglang.srt.weg2 import weight_exchange as wx
+        from sglang.srt.weg2 import xchg_bounce as xb
+
+        for mode, want in ((wx.INJECT_SHADOW, 3), ("authoritative", 2)):
+            with self.subTest(inject_mode=mode):
+                self.assertEqual(
+                    xb.assemble_slots(2, comparing=(mode == wx.INJECT_SHADOW)),
+                    want)
