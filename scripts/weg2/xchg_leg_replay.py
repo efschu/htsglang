@@ -198,13 +198,49 @@ def synthetic_manifests():
 CKPT_ENV = "WEG2_REPLAY_CKPT"
 
 
-def checkpoint_header(path: str):
-    """(name -> {dtype, shape, data_offsets}, data_start) without torch."""
+def _one_header(path: str):
+    """(name -> entry, data_start) for ONE safetensors file, without torch."""
     with open(path, "rb") as f:
         n = struct.unpack("<Q", f.read(8))[0]
         head = json.loads(f.read(n))
     head.pop("__metadata__", None)
     return head, 8 + n
+
+
+def checkpoint_header(path: str):
+    """The tensor index of a checkpoint -- ONE FILE OR A SHARDED DIRECTORY.
+
+    The production vehicle (user order 2026-09-13, superseding the INT4 one)
+    is sharded over 18 files with a `model.safetensors.index.json`, so a
+    reader that only knows a single file would have refused the very
+    checkpoint the xsn24 manifests belong to. Each entry carries the file it
+    lives in and that file's data start, so the byte range is absolute.
+    """
+    if os.path.isdir(path):
+        files = sorted(f for f in os.listdir(path)
+                       if f.endswith(".safetensors"))
+        if not files:
+            raise SystemExit(f"no safetensors under {path}")
+        merged = {}
+        for fn in files:
+            full = os.path.join(path, fn)
+            head, start = _one_header(full)
+            for k, v in head.items():
+                v = dict(v)
+                v["_file"], v["_start"] = full, start
+                # ONE NAME, ONE FILE. A duplicate across shards would mean two
+                # different byte ranges answer to one name and the digest
+                # would grade whichever won -- named, not last-wins.
+                if k in merged:
+                    raise SystemExit(
+                        f"{k} appears in two shards ({merged[k]['_file']} and "
+                        f"{full}); the checkpoint index is ambiguous")
+                merged[k] = v
+        return merged, 0
+    head, start = _one_header(path)
+    for v in head.values():
+        v["_file"], v["_start"] = path, start
+    return head, start
 
 
 #: Bytes per element, per safetensors dtype string.
@@ -305,7 +341,7 @@ def checkpoint_manifests(path: str, max_bytes: int, skip=None):
             continue
         rows, cols, it = ckpt_geom(head[name])
         by_layer[int(name.split(".layers.")[1].split(".")[0])].append(
-            (name, rows, cols, it, rows * cols * it))
+            (name, rows, cols, it, rows * cols * it, str(head[name]["dtype"])))
     chosen, total = [], 0
     for lay in sorted(by_layer):
         want = by_layer[lay]
@@ -357,14 +393,14 @@ def checkpoint_manifests(path: str, max_bytes: int, skip=None):
 
     out = []
     for pp in range(xr.N_CARDS):
-        ps = [piece(n, r, c, it) for (n, r, c, it, _) in chosen
+        ps = [piece(n, r, c, it) for (n, r, c, it, _, _dt) in chosen
               if stage_of(int(n.split(".layers.")[1].split(".")[0])) == pp]
         out.append(xm.RankManifest(group="P", rank=pp, card=cards[pp],
                                    region_tag="weights_0", boot_token="rp",
                                    tp_rank=0, pp_rank=pp, pieces=tuple(ps)))
     for t in range(xr.N_CARDS):
         ps = []
-        for (n, r, c, it, _) in chosen:
+        for (n, r, c, it, _, _dt) in chosen:
             if r < xr.N_CARDS:
                 ps.append(piece(n, r, c, it))          # replicated whole
                 continue
@@ -382,14 +418,17 @@ class _CkptReader:
 
     def __init__(self, path: str):
         self.path = path
-        self.head, self.start = checkpoint_header(path)
-        self._fh = open(path, "rb")
+        self.head, _ = checkpoint_header(path)
+        self._fh = {}
 
     def whole(self, name: str) -> bytes:
         e = self.head[name]
         a, b = (int(x) for x in e["data_offsets"])
-        self._fh.seek(self.start + a)
-        return self._fh.read(b - a)
+        fh = self._fh.get(e["_file"])
+        if fh is None:
+            fh = self._fh[e["_file"]] = open(e["_file"], "rb")
+        fh.seek(int(e["_start"]) + a)
+        return fh.read(b - a)
 
 
 _CKPT_READER = [None]
@@ -992,7 +1031,12 @@ def _run(ns) -> int:
     else:
         src_mans = load_manifests(ns.evidence)
     if ckpt_pick is not None:
-        cls = collections.Counter(n.rsplit(".", 1)[-1] for n, *_ in ckpt_pick)
+        # CLASS *AND* DTYPE. Keyed on the suffix alone, the INT8 vehicle's
+        # quantised `weight` (I8) and its bf16 `weight` (norms, conv1d,
+        # in_proj_a/b) counted as one class of 94 -- and the whole point of the
+        # census is to say whether the QUANTISED bytes were walked.
+        cls = collections.Counter(f"{n.rsplit('.', 1)[-1]}:{dt}"
+                                  for (n, _r, _c, _i, _b, dt) in ckpt_pick)
         print("WEG2-XCHG-CKPT-POPULATION file=" + os.path.basename(ns.checkpoint)
               + " tensors=" + str(len(ckpt_pick))
               + " bytes=" + str(sum(x[4] for x in ckpt_pick))
@@ -1026,9 +1070,11 @@ def _run(ns) -> int:
         # by a budget that printed nothing, which is precisely the unnamed
         # hole in a denominator this campaign keeps paying for.
         kept = {p_.param_name for m in src_mans for p_ in m.pieces}
-        final = collections.Counter(n.rsplit(".", 1)[-1] for n in kept)
-        gone = collections.Counter(n.rsplit(".", 1)[-1]
-                                   for n, *_ in ckpt_pick
+        dts = {n: dt for (n, _r, _c, _i, _b, dt) in ckpt_pick}
+        final = collections.Counter(f"{n.rsplit('.', 1)[-1]}:{dts[n]}"
+                                    for n in kept if n in dts)
+        gone = collections.Counter(f"{n.rsplit('.', 1)[-1]}:{dt}"
+                                   for (n, _r, _c, _i, _b, dt) in ckpt_pick
                                    if n not in kept)
         print("WEG2-XCHG-CKPT-GRADED tensors=" + str(len(kept))
               + " classes=" + ",".join(f"{k}:{v}" for k, v in sorted(final.items()))
