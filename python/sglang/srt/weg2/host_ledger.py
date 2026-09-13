@@ -993,6 +993,28 @@ RATE_LATCH_WINDOW_S = 3.0
 #: The deaths' own gaps were 19 / 25 / 18 s, so 3 s is far inside the signature
 #: and still above normal scheduling jitter at a 200-500 ms cadence.
 RATE_LATCH_GAP_S = 3.0
+#: #1361b THE RECLAIM CUSHION FLOOR, GiB.  ``cushion = file - shmem`` from
+#: memory.stat: the page cache the kernel can still trade away to absorb the
+#: next shmem write.  MEASURED on the two boots that decide this number, over
+#: their WHOLE runtime and with the gate a live latch actually has:
+#:   weg2xsn24 SURVIVED -- minimum cushion while shmem was rising **2.67 GiB**,
+#:                         and ZERO samples under this floor in the whole boot;
+#:   weg2xsn27 DIED     -- 0.01 GiB with 16.17 GiB still to write, first sample
+#:                         under the floor at 00:13:03.631 (cushion 1.02);
+#:   weg2xsn26b DIED    -- same shape, first at 23:23:47 (cushion 0.02).
+#: 1.5 sits 1.17 GiB below the survivor's worst and 0.48 above the first firing
+#: sample of a dead boot.  It is NOT a safety factor: it is the midpoint of a
+#: measured separation of 2.66 GiB between a boot that flipped and two that the
+#: kernel reaped.
+RATE_LATCH_CUSHION_FLOOR_GIB = 1.5
+#: How much shmem must grow between two readings to count as "the fill is
+#: RUNNING".  The gate is deliberately this and not ``fill_remaining > x``:
+#: a remaining-bytes gate needs a TARGET, the latch has none, and the target
+#: taken from the ``WEG2-XCHG-PLAN`` line over-states it -- weg2xsn24 planned
+#: 27.15 GiB of d2h and landed 14.80 in shmem, so a plan-based remainder fires
+#: on the boot that survived.  Third over-pricing of the same quantity, after
+#: ``now + remaining`` and ``cushion as a stock``; this one is measured.
+RATE_LATCH_FILL_RISING_GIB = 0.01
 
 
 def launch_moment_peak_gib(
@@ -1121,6 +1143,8 @@ class RateLatch:
         self.window_s = float(window_s)
         self.gap_s = float(gap_s)
         self.samples: List[Tuple[float, float]] = []
+        #: #1361b: previous shmem reading, for the "fill is running" gate.
+        self._last_shmem: Optional[float] = None
         self.latched = False
         self.gaps: List[float] = []
 
@@ -1167,34 +1191,35 @@ class RateLatch:
         self,
         t_s: float,
         nonreclaim_gib: float,
-        remaining_leg_gib: Optional[float] = None,
+        cushion_gib: Optional[float] = None,
+        shmem_gib: Optional[float] = None,
     ) -> Optional[str]:
-        """#1361b: ``remaining_leg_gib`` turns a RATE test into a FEASIBILITY test.
+        """#1361b: the CUSHION test replaces the remaining-bytes one, measured.
 
-        THE NAIVE FORM WOULD KILL EVERY BOOT.  Boot weg2xsn27's startup sleep
-        leg climbed at 5.4 GiB/s sustained and 8.8 GiB/s at its worst pair --
-        legitimately, because group D was loading weights (anon +5 GiB) while
-        writing the ring (shmem +11 GiB).  ``rate x 5 s`` at 00:12:57 projects
-        71.1 + 27 = 98 GiB, past the mark, on a leg that had every right to
-        run.  A latch on that fires on EVERY healthy sleep leg and the cure
-        kills more boots than the disease.
+        ``remaining_leg_gib`` IS DELETED, not left beside this -- a parameter
+        that no longer decides anything is the present-but-unwired state this
+        line has paid for three times.  What it tried to express (can this leg
+        finish in the room left) was refuted on the negative control: at the
+        true leg start weg2xsn24 read 68.29 + 27.15 = 95.44 and weg2xsn27
+        67.24 + 27.20 = 94.44 against a 95.90 mark -- the SURVIVOR closer to
+        firing than the boot that died.
 
-        What the leg can actually still spend is BOUNDED, and the bound is
-        published: ``WEG2-XCHG-PLAN ... bytes_gib`` per direction and
-        ``WEG2-RING NEED ... need_mib`` per tag.  So the projection is
+        WHAT ACTUALLY SEPARATES THEM is the reclaim cushion, and it is a FLOW
+        rather than a stock.  weg2xsn24 traded 20.54 GiB of page cache away to
+        absorb 14.80 GiB of shmem and its ``memory.current`` did not move
+        (91.80 -> 91.36); weg2xsn27 had 11.33 to absorb 11.03, ran the cushion
+        to 0.01 with 16.17 GiB still to write, and ``current`` climbed 4.51 GiB
+        before the kernel reaped it inside a 33 s stall.
 
-            now + min(rate x lookahead, remaining_leg_bytes)
+        So: ``shmem is rising`` AND ``cushion < floor`` -> latch.  The rising
+        gate is what a live latch can actually evaluate -- it needs no target,
+        and it structurally excludes the one-sample dip at a leg's END, where
+        shmem stops rising.  That exclusion was a judgement call in the analysis
+        (it is why this file's first draft read 4.25 instead of the live 2.67)
+        and is now a property of the code.
 
-        and the question it answers is no longer "how fast are we climbing" but
-        "CAN THIS LEG FINISH IN THE ROOM THAT IS LEFT".  The rate only decides
-        WHEN we notice; the remaining bytes decide WHETHER there is anything to
-        notice.  On weg2xsn27's own series this fires at 00:13:03.6 -- nr 78.44
-        with ~21 GiB of plan left, 99.6 against the 95.90 mark -- one second
-        before the sampler went blind and the kernel reaped inside that hole,
-        and it stays silent at 00:12:57 where the naive form fired.
-
-        ``None`` keeps the pre-#1361b behaviour for a caller that has no plan
-        to hand: the unbounded projection, which is right when there is no leg.
+        ``cushion_gib=None`` keeps the pre-#1361b rate path for a caller with no
+        memory.stat to hand.
         """
         gap = None
         if self.samples:
@@ -1217,24 +1242,31 @@ class RateLatch:
         proj = self.projected_gib()
         rate = self.rate_gib_per_s() or 0.0
         _bounded = ""
-        if remaining_leg_gib is not None:
-            # #1361b THE FEASIBILITY TEST, and it needs NO RATE AT ALL.
-            # `now + remaining` asks "can this leg finish in the room that is
-            # left", which is answerable at the FIRST sample and does not wait
-            # for a slope. Measured on weg2xsn27: at the leg's first row the sum
-            # is 71.08 + 27.20 = 98.28 against the 95.90 mark -- THE LEG NEVER
-            # FITTED, 7.8 s and one 33 s blind window before the kernel reaped.
-            # The rate-bounded form I first wrote (min(rate x lookahead, rem))
-            # is strictly worse here: with rate 0 at the first sample it
-            # projects `now` and stays silent through six seconds of a doomed
-            # leg. The rate keeps its job where there is NO plan to read.
-            rem = max(0.0, float(remaining_leg_gib))
-            proj = float(nonreclaim_gib) + rem
-            _bounded = (
-                f" remaining_leg={rem:.2f} GiB FEASIBILITY (now + what this leg "
-                f"still has to write; no rate needed -- rate x lookahead would "
-                f"be {max(0.0, rate) * self.lookahead_s:.2f})"
+        # #1361b THE CUSHION TEST, ahead of the rate one: it fires on the
+        # measured separation, the rate only covers the case with no cushion
+        # reading at all.
+        if cushion_gib is not None:
+            rising = (
+                shmem_gib is not None and self._last_shmem is not None
+                and float(shmem_gib) - self._last_shmem > RATE_LATCH_FILL_RISING_GIB
             )
+            if shmem_gib is not None:
+                self._last_shmem = float(shmem_gib)
+            if rising and float(cushion_gib) < RATE_LATCH_CUSHION_FLOOR_GIB:
+                self.latched = True
+                return (
+                    f"W98 Weg2HostRateLatched: cushion={float(cushion_gib):.2f} GiB "
+                    f"BELOW the floor {RATE_LATCH_CUSHION_FLOOR_GIB:.2f} while shmem is "
+                    f"STILL RISING (now={nonreclaim_gib:.2f} GiB, shmem={float(shmem_gib):.2f}, "
+                    f"gaps_seen={len(self.gaps)}) -- the page cache the kernel trades away "
+                    f"to absorb the next write is spent, and the write has not stopped. "
+                    f"MEASURED separation: weg2xsn24 flipped with a worst cushion of 2.67 "
+                    f"GiB and ZERO samples under this floor in its whole boot; weg2xsn27 "
+                    f"hit 0.01 with 16.17 GiB still to write and was reaped inside a 33 s "
+                    f"stall, weg2xsn26b the same shape. Controlled teardown, never a kernel "
+                    f"kill"
+                )
+            return None
         if proj is None or proj < self.reap_mark_gib:
             return None
         self.latched = True
