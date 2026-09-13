@@ -153,6 +153,13 @@ class ManifestPiece:
     itemsize: int
     tag: str
     nbytes: int
+    #: #1384: this rank's DECLARED (q, k, v, ...) row split of a fused
+    #: parameter, straight off ``ParamGeom.component_rows`` -- itself read off
+    #: the module that already computed the sizes (``linear.py``
+    #: ``q_proj_shard_size`` and friends), never re-derived. ``()`` (default)
+    #: is "no declared split", which is every manifest written before #1384
+    #: and every non-fused tensor -- both round-trip unchanged.
+    component_rows: Tuple[int, ...] = ()
 
     @property
     def key(self) -> Tuple[int, int, int, int, int]:
@@ -172,6 +179,7 @@ class ManifestPiece:
             "itemsize": int(self.itemsize),
             "tag": self.tag,
             "nbytes": int(self.nbytes),
+            "component_rows": [int(x) for x in self.component_rows],
         }
 
     @classmethod
@@ -184,6 +192,9 @@ class ManifestPiece:
             itemsize=int(raw["itemsize"]),
             tag=str(raw.get("tag", "")),
             nbytes=int(raw.get("nbytes", 0)),
+            # ABSENT means a pre-#1384 manifest or a non-fused tensor --
+            # both are "no declared split", not a shape to guess at.
+            component_rows=tuple(int(x) for x in raw.get("component_rows", ())),
         )
 
 
@@ -266,6 +277,7 @@ def pieces_from_inventory(inventory: Iterable[object]) -> Tuple[ManifestPiece, .
         rows = int(getattr(geom, "rows_full", 0))
         cols = int(getattr(geom, "cols_full", 0))
         item = int(getattr(geom, "itemsize", 0))
+        comp = tuple(int(x) for x in getattr(geom, "component_rows", ()) or ())
         out.append(
             ManifestPiece(
                 param_name=name,
@@ -275,6 +287,7 @@ def pieces_from_inventory(inventory: Iterable[object]) -> Tuple[ManifestPiece, .
                 itemsize=item,
                 tag=str(getattr(geom, "tag", "")),
                 nbytes=rows * cols * item,
+                component_rows=comp,
             )
         )
     return tuple(sorted(out, key=lambda p: p.param_name))
@@ -509,16 +522,95 @@ def _pad_vocab_size(n: int) -> int:
     return int(pad_vocab_size(int(n)))
 
 
+def _mixed_fused_axis(
+    whole: ManifestPiece, cut: Sequence[ManifestPiece],
+) -> Optional[Tuple[Tuple[int, int], ...]]:
+    """Per-component ``(axis, rows_full)`` for a DECLARED mixed-fused tensor.
+
+    ``None`` means "this is not (provably) a mixed-fused tensor" -- the
+    caller's ``_axis_of`` then falls through to the ordinary W68 refusal, the
+    same as if this function did not exist.  Every early return here is a
+    REFUSAL TO GUESS, not a relaxed check:
+
+    * no declared components on the whole side -> ``None`` (pre-#1384
+      manifest, or a tensor nobody declared a split for -- most tensors);
+    * a different NUMBER of components declared on one side than another, or
+      a side whose own components do not sum to its own reported row count
+      -> ``None``.  A self-inconsistent declaration is not evidence of
+      anything and is treated exactly like no declaration: the outer W68
+      still fires, naming the outer disagreement.
+    * any ONE component that is neither REPLICATED (equal on every rank,
+      equal to the whole's) nor a plain ROWS cut (summing to the whole's) ->
+      ``None``, immediately -- a real per-component divergence must not be
+      swallowed by treating the other, agreeing components as proof enough.
+      This is the mutant this function is built against: a corrupted
+      replica on one rank must refuse, not classify.
+    * every component agreeing on the SAME single axis -> ``None`` also.
+      That tensor already has an outer-arithmetic answer (one of the five
+      cases above would have returned it already had the caller reached
+      here without them all failing first), so this function is never the
+      reason a single-axis tensor classifies -- keeping the "five outer
+      cases, no silent sixth" claim true for every tensor that already
+      worked, and confining MIXED_FUSED to tensors that are STRUCTURALLY a
+      mix of at least two axes.
+    """
+    w_comp = tuple(int(x) for x in whole.component_rows)
+    if not w_comp or sum(w_comp) != int(whole.rows_full):
+        return None
+    cut_comp: List[Tuple[int, ...]] = []
+    for piece in cut:
+        c = tuple(int(x) for x in piece.component_rows)
+        if len(c) != len(w_comp) or sum(c) != int(piece.rows_full):
+            return None
+        cut_comp.append(c)
+
+    axes: List[Tuple[int, int]] = []
+    for i, w_i in enumerate(w_comp):
+        rows_i = [c[i] for c in cut_comp]
+        if len(set(rows_i)) == 1 and rows_i[0] == w_i:
+            axes.append((wx.REPLICATED, w_i))
+        elif sum(rows_i) == w_i:
+            axes.append((wx.ROWS, w_i))
+        else:
+            return None
+    if len({a for a, _ in axes}) < 2:
+        return None
+    return tuple(axes)
+
+
 def _axis_of(name: str, whole: ManifestPiece,
              cut: Sequence[ManifestPiece],
              ) -> Tuple[int, int, int, Tuple[int, ...], int]:
     """``(shard_axis, rows_full, cols_full, tp_widths, pad_units)`` -- READ.
 
-    FIVE cases and no sixth.  The sixth would be a silent ``REPLICATED``, which
-    is exactly the tree's current answer (``weight_exchange_shadow.py:3237``)
-    and the reason the shard cut has been invisible since S2: a plan that calls
-    every tensor replicated moves whole tensors between differently-shaped
-    groups and calls that agreement.
+    FIVE cases read off the OUTER tensor, plus one MORE that is read off its
+    DECLARED COMPONENTS rather than invented here (#1384, ``W68`` on
+    ``qkv_proj``-style tensors): a fused row tensor whose components do not
+    all share one axis, e.g. ``QKVParallelLinear`` under
+    ``attn_kv_replicated`` (#62/#116) -- Q ratio-split across TP while K/V are
+    FULLY REPLICATED on every rank once ``kv_heads < tp_size`` (#1382).  The
+    outer row counts alone (e.g. D ranks ``3072/2048/2048`` against a P whole
+    of ``5120``) satisfy none of the five outer tests, because the KV rows
+    are counted once on P and ``tp_size`` times across D's ranks -- that is
+    not a shape disagreement, it is two different axes concatenated in one
+    tensor.  ``MIXED_FUSED`` is not a SIXTH GUESS from row-count arithmetic
+    (the danger direction here is exactly that: a wrong guess would compare
+    the wrong bytes and could still report MATCH); it fires only when every
+    side has DECLARED the same component boundaries (``component_rows``,
+    read off the module that already computed them -- ``linear.py``
+    ``q_proj_shard_size``/``kv_proj_shard_size``/``v_proj_shard_size`` --
+    never re-derived here) and EACH declared component independently passes
+    one of the five tests below.  A tensor with no declared components, or
+    whose components do not independently resolve, still raises exactly the
+    W68 below -- the guard stays sharp for genuine disagreement.  See
+    :func:`_mixed_fused_axis`.
+
+    The sixth outer-arithmetic guess the docstring used to warn against is
+    still refused: a silent ``REPLICATED`` for everything unmatched, which is
+    the tree's OLD answer (``weight_exchange_shadow.py:3237``) and the reason
+    the shard cut was invisible since S2 -- a plan that calls every tensor
+    replicated moves whole tensors between differently-shaped groups and
+    calls that agreement.
 
     ``whole`` is the PP side (one stage holds the tensor entire) and ``cut`` the
     TP side's rows.  Both are read off manifests, so this is a comparison of
@@ -589,6 +681,14 @@ def _axis_of(name: str, whole: ManifestPiece,
         return wx.ROWS, sum(rows), w_cols, tuple(rows), sum(rows) - w_rows
     if same_rows and _padded(w_cols, cols):
         return wx.COLS, w_rows, sum(cols), tuple(cols), sum(cols) - w_cols
+
+    # THE MIXED-FUSED FALLBACK (#1384).  Only reached once all five outer
+    # tests above have already failed, so every geometry that used to
+    # classify (kv >= tp: Q and KV split TOGETHER, no replication skew, the
+    # plain ROWS test above already returns) is BYTE-IDENTICAL to before --
+    # this code cannot run for them.
+    if same_cols and _mixed_fused_axis(whole, cut) is not None:
+        return wx.MIXED_FUSED, w_rows, w_cols, tuple(rows), 0
 
     raise wx.Weg2XchgPlanDisagree(
         f"W68 Weg2XchgPlanDisagree: {name}: the PP side holds "
