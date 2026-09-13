@@ -1008,7 +1008,7 @@ class SchedulerWeightUpdaterManager:
             )
         self._weg2_xchg_inject_from_peer(terms=terms, **kw)
 
-    def _weg2_xchg_deposit_before_sleep(self) -> None:
+    def _weg2_xchg_deposit_before_sleep(self, *, flip_index: int = -1) -> None:
         """THE DEPOSIT HALF -- the group going dormant stages its card bytes.
 
         WEG2XSN25 MEASURED THE HOLE: `SEAM-DIGEST MATCH 0/6`, and the cause was
@@ -1052,6 +1052,59 @@ class SchedulerWeightUpdaterManager:
                 "-- the dormant group could not identify itself, so no bytes "
                 "were staged; the waking group's collect will have nothing to "
                 "read and will say so", boot_nonce, group, rank, device)
+            return
+        # #1368: ONLY THE SOURCE GROUP OF THIS FLIP'S DIRECTION DEPOSITS.
+        # This method fired on EVERY sleeping rank of BOTH groups, while the
+        # collect half runs only on the group being woken -- boot weg2xsn27
+        # counted 22 deposit-hook legs against 6 collect legs, so most bands
+        # had no counterpart: D's next deposit found `slot=0 seq=0 was still
+        # full ... the collecting rank has not drained` (x9) while P's collect
+        # found the same slot `was not posted full by any depositing rank`
+        # (x2). The rendezvous classes are not at fault -- a hermetic probe
+        # with both sides on one pair drains cleanly.
+        #
+        # NO NEW STATE: `leg_enabled` is the arm's own predicate over
+        # `leg_direction`, the same derivation the transport's `is_source`
+        # uses. The caller had keyed on "I am going to sleep", which is a
+        # property of this rank and not of the flip.
+        # #1368 FIX 2 -- THE CONDITION IS "IS THERE A FLIP", and the boot said
+        # so in its own words. My first gate asked `leg_enabled(HOOK_SOURCE,
+        # group)`, which is the LEGS CONFIGURATION (may this group ever be a
+        # source) and not the direction of THIS flip: under `legs=both` -- the
+        # default, which xsn27 ran and xsn28 runs -- it is true for both
+        # groups and separates nothing.
+        #
+        # BUT THE REPLACEMENT IS NOT "source_of(direction)" EITHER, and the
+        # evidence is weg2xsn27's own W79 on P:
+        #   `reason=no-flip-epoch detail=hook=source -- this leg carries no
+        #    flip epoch, so it is not a flip: the front publishes the index on
+        #    the request (front.py:2667) and the boot-time initial sleep runs
+        #    before any flip exists.`
+        # Within a real flip exactly ONE group sleeps, and the sleeping group
+        # IS the source -- this method runs on the sleeper by construction, so
+        # a direction predicate derived from the group would be circular. What
+        # was missing is that the BOOT-TIME INITIAL SLEEP is not a flip at all
+        # and must not deposit: it claims a slot before any collect exists.
+        #
+        # `-1` is the front's own "no flip" (`_weg2_flip_index_of`), the same
+        # number `XchgRegion.begin_flip` refuses to stamp with.
+        if int(flip_index) < 0:
+            logger.info(
+                "WEG2-XCHG DEPOSIT skipped role=no-flip direction=%s "
+                "group=%s rank=%s flip_index=%s -- this sleep carries no flip "
+                "epoch (the boot-time initial sleep runs before any flip "
+                "exists), so a deposit here would claim a slot no collect "
+                "will ever drain",
+                wx.xchg_legs(), group, rank, flip_index)
+            return
+        # THE CONFIGURATION GATE STAYS, and only as that: whether this
+        # direction is exchanged at all on this boot.
+        if not wx.leg_enabled(sh.HOOK_SOURCE, group):
+            logger.info(
+                "WEG2-XCHG DEPOSIT skipped role=direction-not-armed "
+                "direction=%s group=%s rank=%s -- this boot does not exchange "
+                "in the direction this group would source",
+                wx.xchg_legs(), group, rank)
             return
         plan, reason = self._weg2_shadow_plan(
             sh.HOOK_SOURCE, group, int(rank), agreed=None,
@@ -3858,7 +3911,9 @@ class SchedulerWeightUpdaterManager:
             # THE DEPOSIT, BEFORE THE PAGES GO. The pause below releases the
             # weight tags; a deposit after it would read pages this rank has
             # already given back. weg2xsn25 ran with no depositor at all.
-            self._weg2_xchg_deposit_before_sleep()
+            self._weg2_xchg_deposit_before_sleep(
+                flip_index=_weg2_flip_index_of(
+                    getattr(recv_req, "epoch", None)))
             with self._weg2_pcie_lock("sleep-D2H " + ",".join(weights_tags), direction="d2h"):
                 for tag in weights_tags:
                     weg2_ring_guard.guard_tag(
