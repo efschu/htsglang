@@ -196,11 +196,17 @@ class TheLaneCountHasOneProducer(CustomTestCase):
             launcher.XCHG_D_VECTOR_DEFAULT)
 
     def test_the_publication_site_passes_a_measured_lane_count(self):
+        """NO TEXT WINDOW. The first version sliced 700 characters around the
+        call and broke the day #1374 added the TAGMAX line above it -- the
+        window moved, the code did not. Both facts are asserted on their own
+        terms instead: the lane count is produced by the ONE producer, and the
+        publication consumes exactly that name."""
         src = inspect.getsource(launcher)
-        i = src.index("bounce_terms_for_ranks, _widest_line, _widest_name")
-        window = src[i - 700: i + 700]
-        self.assertIn("n_lanes=int(_pub_lane_n)", window)
-        self.assertIn("xchg_lane_count(", window)
+        self.assertIn("_pub_lane_n, _ = xchg_lane_count(", src,
+                      "the publication no longer gets its lane count from the "
+                      "one producer")
+        self.assertIn("n_lanes=int(_pub_lane_n)", src,
+                      "the publication no longer passes the measured count")
 
 
 if __name__ == "__main__":
