@@ -5073,6 +5073,28 @@ def xchg_bounce_arm_pins_host(weight_source: str, oncard_mode: str) -> bool:
     return str(oncard_mode) == weight_exchange_transport.ONCARD_MODE_HOST
 
 
+#: The D-side vector every production boot runs, and the DEFAULT of
+#: ``choose_host_ledger``'s ``d_vector`` parameter. Named once because the
+#: lane record is keyed on it: two spellings of this string are two cut keys,
+#: and a boot that prices under one key and publishes under the other charges
+#: for lanes it does not create (or creates lanes it did not charge).
+XCHG_D_VECTOR_DEFAULT = "tp3"
+
+
+def xchg_lane_count(stage_ratio, legs, d_vector: str = XCHG_D_VECTOR_DEFAULT):
+    """``(n_lanes, provenance)`` for THIS boot's cut -- the one producer.
+
+    #1368: the ledger charges the bounce and the launcher publishes its INPUTS
+    to the ranks, and until now each built the cut key at its own call site.
+    The rank-side guard compares the published ``n_lanes`` against the lanes it
+    really enumerates and refuses when the price is below them, so the two
+    sites disagreeing is not a cosmetic drift -- it is a refused boot, and the
+    refusal would name the ledger rather than the publication that diverged.
+    """
+    return host_ledger.resolve_xchg_lanes(
+        host_ledger.xchg_cut_key(str(stage_ratio or ""), str(d_vector), str(legs)))
+
+
 def xchg_bounce_terms_for_arm(weight_source: str, oncard_mode: str,
                               model_dir: str,
                               oncard_slot_mib: Optional[int] = None,
@@ -5220,7 +5242,7 @@ def choose_host_ledger(
     # set follows from which card sends to which, and text-only (#1356) changes
     # the form and not the cut.
     stage_ratio: str = "",
-    d_vector: str = "tp3",
+    d_vector: str = XCHG_D_VECTOR_DEFAULT,
     legs: str = "both",
 
 ) -> Tuple[host_ledger.Arm, Optional[float], List[str], Dict[str, Optional[int]]]:
@@ -5309,8 +5331,7 @@ def choose_host_ledger(
     # would have produced the record the exchange arm needs. A producer that
     # locks out its own bootstrap is worse than the under-charge it fixes.
     if xchg_bounce_arm_pins_host(weight_source, oncard_mode):
-        _lane_n, _lane_prov = host_ledger.resolve_xchg_lanes(
-            host_ledger.xchg_cut_key(str(stage_ratio or ""), d_vector, legs))
+        _lane_n, _lane_prov = xchg_lane_count(stage_ratio, legs, d_vector)
     else:
         _lane_n = 1
         _lane_prov = (
@@ -10347,6 +10368,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # publication need is not a reason to edit either.
     bounce_terms_for_ranks = None
     if xchg_bounce_arm_pins_host(ns.weg2_weight_source, ns.weg2_xchg_oncard):
+        # #1368: THE SAME LANE COUNT THE LEDGER CHARGES. The terms published
+        # here are the INPUTS the ranks recompute from, and `n_lanes` is one of
+        # them (xchg_bounce._TERM_FIELDS) -- so leaving it at the default while
+        # `choose_host_ledger` priced the measured count hands every rank a
+        # one-lane term and the rank-side guard refuses the boot the moment a
+        # rank enumerates two. Measured on this checkpoint: 1 lane charges
+        # 1.784 GiB, 5 charge 7.419 GiB. One producer, called twice with the
+        # same key, exactly as the glue below it already is.
+        _pub_lane_n, _ = xchg_lane_count(
+            stage_ratio, str(getattr(ns, "weg2_xchg_legs", "both") or "both"))
         bounce_terms_for_ranks, _widest_line, _widest_name = (
             checkpoint_census.widest_layer_terms(
                 str(ns.model),
@@ -10354,7 +10385,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 depth=int(getattr(ns, "xchg_bounce_depth",
                                   xchg_bounce.ASSEMBLE_DEPTH_DEFAULT)),
                 slot_bytes=weight_exchange_transport.validate_oncard_slot_mib(
-                    ns.weg2_xchg_oncard_slot_mib) * weight_exchange_region.MIB))
+                    ns.weg2_xchg_oncard_slot_mib) * weight_exchange_region.MIB,
+                n_lanes=int(_pub_lane_n)))
     xchg_env = prepare_xchg_env(log, str(ring_plan.epoch),
                                   ns.weg2_weight_source, dry=dry,
                                   hop_bound_ms=ns.weg2_shadow_hop_bound_ms,
