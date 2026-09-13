@@ -57,8 +57,18 @@ class TheCutReachesTheLedger(CustomTestCase):
         """The two keys that were being confused, as values."""
         self.assertNotEqual(hl.xchg_cut_key(""), hl.xchg_cut_key("39,13,12"))
         self.assertIn("pp=39,13,12", hl.xchg_cut_key("39,13,12"))
-        with self.assertRaises(hl.Weg2XchgLanesUnmeasured):
-            hl.resolve_xchg_lanes(hl.xchg_cut_key(""))
+        # #1362 [bootstrap] SEMANTICS CHANGED DELIBERATELY: an unrecorded cut
+        # is now the FIRST BOOT of that cut, priced at the region's worst case
+        # and named, not refused -- refusing it made the boot that would
+        # produce the record impossible. What must still differ is the KEY, and
+        # what must still be measured is a cut that HAS a record.
+        n_empty, prov = hl.resolve_xchg_lanes(hl.xchg_cut_key(""))
+        self.assertIn("WORST-CASE", prov)
+        n_seed, seed_prov = hl.resolve_xchg_lanes(hl.xchg_cut_key("39,13,12"))
+        self.assertEqual(n_seed, 5)
+        self.assertIn("source=measured", seed_prov)
+        self.assertNotEqual(n_empty, n_seed,
+                            "the empty cut must not silently inherit the seed")
 
 
 class LanesAreResolvedOnlyWhereTheyExist(CustomTestCase):

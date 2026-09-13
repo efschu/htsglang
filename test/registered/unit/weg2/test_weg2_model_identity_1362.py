@@ -195,7 +195,11 @@ class TheDormantImageIsNeverSpentOnAnotherModel1362(CustomTestCase):
         entry = {"boot_tag": "weg2xsn25", "commit": "b568f9afd5",
                  "model_digest": hl.model_digest(M27)}
         with self.assertRaises(hl.Weg2ModelIdentityMismatch) as cm:
-            hl.refuse_foreign_image(entry, hl.model_digest(M4B))
+            # #1362 [bootstrap]: the refusal this guards is the SAME-FORM one.
+            # Without form_key_match the record is another form's and is now
+            # skipped, which is a different verdict and not this test's subject.
+            hl.refuse_foreign_image(entry, hl.model_digest(M4B),
+                                    form_key_match=True)
         msg = str(cm.exception)
         self.assertIn("W99 Weg2ModelIdentityMismatch", msg)
         self.assertIn("47 GiB ring for a 7.48 GiB model", msg)
@@ -203,10 +207,24 @@ class TheDormantImageIsNeverSpentOnAnotherModel1362(CustomTestCase):
         self.assertIn("1.449", msg)          # the named way forward
 
     def test_an_empty_digest_is_UNKNOWN_and_not_matching(self):
-        """DANGER DIRECTION: a pre-#1362 record must not pass as 'same model'."""
-        with self.assertRaises(hl.Weg2ModelIdentityMismatch) as cm:
-            hl.refuse_foreign_image({"boot_tag": "old"}, hl.model_digest(M4B))
-        self.assertIn("NO model digest", str(cm.exception))
+        # #1362 [bootstrap]: with a matching form key an empty digest is the
+        # LEGACY transition (a line, not a raise); the UNKNOWN-not-matching
+        # rule this test names is what makes it a transition rather than an
+        # acceptance, and it is asserted on the line.
+        """DANGER DIRECTION: a pre-#1362 record must not pass as 'same model'.
+
+        #1362 [22-fix2] gave this case a transition instead of a refusal, and
+        the danger direction is held by the LINE rather than by an exception:
+        the record is admitted on the FORM KEY ALONE and the line says so, in
+        those words, so nobody reads it as a digest match. Asserted here on the
+        text, because that text is now the whole guard.
+        """
+        line = hl.refuse_foreign_image({"boot_tag": "old"},
+                                       hl.model_digest(M4B),
+                                       form_key_match=True)
+        self.assertIn("digest=absent", line)
+        self.assertIn("FORM KEY ALONE", line)
+        self.assertIn("WEAKER than a content digest", line)
 
     def test_the_matching_model_passes(self):
         dg = hl.model_digest(M27)
@@ -342,10 +360,23 @@ class LegacyRecordTransition(CustomTestCase):
             hl.refuse_foreign_image(rec, self.WANT, form_key_match=True)
         self.assertIn("W99", str(cm.exception))
 
-    def test_3_legacy_record_without_form_key_match_stays_refused(self):
-        with self.assertRaises(hl.Weg2ModelIdentityMismatch) as cm:
-            hl.refuse_foreign_image(dict(self.REC), self.WANT, form_key_match=False)
-        self.assertIn("W99", str(cm.exception))
+    def test_3_a_record_of_another_form_is_BOOTSTRAP_not_refused(self):
+        """#1362 [bootstrap] SEMANTICS CHANGED DELIBERATELY.
+
+        This used to assert W99 for a legacy record whose form key did not
+        match. That was the third instance of "a form change invalidates every
+        inherited record, and the reader cannot say FIRST BOOT": on
+        e50ac74b7c it gave rc=2, ARM=0, W99=1 on the default arm, so the
+        bootstrap could not run either. A record of another form is neither a
+        match nor a foreign model -- it does not apply, and is skipped by name.
+        The same-form refusals are unchanged and tested above.
+        """
+        line = hl.refuse_foreign_image(dict(self.REC), self.WANT,
+                                       form_key_match=False)
+        self.assertIn("BOOTSTRAP", line)
+        self.assertIn("form=OTHER", line)
+        self.assertNotIn("W99", line,
+                         "a record of another form is not a model mismatch")
 
     def test_4_the_legacy_line_reaches_the_printed_ledger_lines(self):
         """The reachability half: a returned line nobody appends is also unread."""
@@ -430,7 +461,7 @@ class TheMarkerIsNeverInThePropaganda(CustomTestCase):
         ("default (scripts/weg2/boot_weg2.sh)", "d0de83d152f0", False, 0),
     )
 
-    def _log_for(self, form_key, form_key_match):
+    def _log_for(self, form_key, form_key_match, digest=None):
         """Synthesise that form's launcher log from the CODE, not from a paste.
 
         A pasted log is a photograph of a tree that may since have moved; these
@@ -441,7 +472,9 @@ class TheMarkerIsNeverInThePropaganda(CustomTestCase):
         hl.LEGACY_IDENTITY_LINES.clear()
         try:
             hl.resolve_image_terms(
-                {"P": dict(self.REC), "D": dict(self.REC, boot_tag="weg2xsn25")},
+                {"P": dict(self.REC, **({"model_digest": digest} if digest else {})),
+                 "D": dict(self.REC, boot_tag="weg2xsn25",
+                           **({"model_digest": digest} if digest else {}))},
                 want_digest=self.WANT,
                 form_key_match=form_key_match,
             )
@@ -485,16 +518,21 @@ class TheMarkerIsNeverInThePropaganda(CustomTestCase):
                     f"marker. Describe the line, never quote its marker (#995).",
                 )
 
-    def test_the_refusal_still_explains_the_transition_path(self):
-        """Removing the marker must not remove the EXPLANATION with it.
+    def test_the_bootstrap_line_explains_the_situation(self):
+        """#1362 [bootstrap] REPLACES a test whose subject became unreachable.
 
-        The sentence exists because an operator reading a bare W99 cannot tell
-        a record with a transition path from one without; dropping it to dodge
-        the census trap would trade one blindness for another.
+        This used to assert that the W99 text explains the transition path for
+        "no digest AND no form-key match". That case no longer reaches a
+        refusal -- a record of another form is skipped as BOOTSTRAP -- so the
+        explanation moved to the line that IS emitted, and the W99 prose about
+        the vanished branch was deleted with it. Prose describing a branch that
+        cannot occur is the instrument-lies class at its quietest.
         """
-        log = self._log_for("d0de83d152f0", False)
-        self.assertIn("legacy-identity line", log)
-        self.assertIn("form key does NOT match", log)
+        line = hl.refuse_foreign_image(dict(self.REC), self.WANT,
+                                       form_key_match=False)
+        self.assertIn("FIRST BOOT OF THIS FORM", line)
+        self.assertIn("writes its own record", line)
+        self.assertNotIn("legacy-identity line", line)
 
     def test_the_emitter_still_carries_the_marker(self):
         """The complement: the trap is fixed by moving the marker, not deleting it."""

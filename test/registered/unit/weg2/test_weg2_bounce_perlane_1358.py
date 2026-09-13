@@ -169,11 +169,17 @@ class TheLaneCountIsMeasuredAndKeyedOnTheCut(CustomTestCase):
 
     def test_an_unmeasured_cut_is_refused_by_name_not_defaulted(self):
         """A guessed lane count is the 4.88 GiB under-charge with a comment."""
-        with self.assertRaises(hl.Weg2XchgLanesUnmeasured) as cm:
-            hl.resolve_xchg_lanes(hl.xchg_cut_key("40,12,12"))
-        m = str(cm.exception)
-        self.assertIn("W102", m)
-        self.assertIn("39,13,12", m, "the refusal must name the cuts it knows")
+        # #1362 [bootstrap]: no longer a refusal. An unrecorded cut is a first
+        # boot -- priced at the region's worst case, named as such, and the
+        # line still lists the cuts that ARE measured so the reader can see
+        # which case this is. W102 survives for the leg driver, where a
+        # RECORDED cut that disagrees with what the leg creates is still
+        # refused before the first allocation.
+        n, m = hl.resolve_xchg_lanes(hl.xchg_cut_key("40,12,12"))
+        self.assertIn("WORST-CASE", m)
+        self.assertIn("bootstrap", m)
+        self.assertIn("39,13,12", m, "the line must name the cuts it knows")
+        self.assertGreaterEqual(n, 5, "the bootstrap count must not under-charge")
 
     def test_the_key_is_the_cut_and_not_the_form(self):
         """Text-only changes the form key; the cut and so the lanes are the same."""
