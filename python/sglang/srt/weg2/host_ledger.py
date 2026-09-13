@@ -3167,6 +3167,55 @@ def refuse_foreign_calibration(digest: str, why: str) -> "Weg2ModelIdentityMisma
     )
 
 
+def resolve_calibrated_stage_layer_counts(
+    model: str, override_csv: Optional[str],
+    calibration_layers: int,
+) -> Optional[List[int]]:
+    """#1362 [22-fix follow]: the SAME model-identity guard for EVERY consumer
+    of "the incumbent per-stage layer counts", not just :func:`launcher.argv_p`.
+
+    THE GAP THIS CLOSES.  ``argv_p`` (launcher.py ~L2746) already refuses a
+    foreign calibration before it ships ``--pp-stage-ratio`` to group P's own
+    argv.  ``solve_p_cut``'s ``incumbent`` (launcher.py ~L8460) is a SECOND,
+    UNGUARDED reader of the same concept -- it falls straight to
+    ``P_PP_STAGE_RATIO_SCORES`` (the 64-layer bsscale measurement) whenever
+    ``ns.pp_stage_ratio`` is unset, with no calibration lookup and no depth
+    check.  Measured live (DESK6, #1378, 2026-09-13): a dry-run for a
+    24-layer model WITH a valid, complete calibration record for its own
+    digest still crashed in
+    ``pp_cut.family_costs_from_measurement`` with the exact bare
+    ``ValueError`` :func:`refuse_foreign_calibration`'s own message quotes as
+    the failure this ticket exists to turn into a named refusal -- because
+    ``solve_p_cut`` runs BEFORE ``argv_p`` in ``main()`` and never consulted
+    the calibration record at all.
+
+    Returns ``None`` when the caller should keep its own fallback (no
+    override AND the checkpoint digest could not be read, OR the depth
+    matches ``calibration_layers`` so the bsscale incumbent is legitimate for
+    THIS checkpoint) -- never invents a vector. Raises
+    :func:`refuse_foreign_calibration` on the same conditions ``argv_p``
+    already refuses on, so a caller that reaches this function's exception
+    path gets IDENTICAL wording to the existing, tested refusal rather than a
+    parallel, drifting copy of the message.
+    """
+    if override_csv:
+        return None
+    dg, dg_why = checkpoint_digest(model)
+    if not dg:
+        return None
+    # CALIB_DIR passed EXPLICITLY, read fresh off the module global here --
+    # not left to read_pp_calibration's own bound default, which is captured
+    # once at function-definition time and would silently ignore a test (or
+    # any future caller) that patches the module-level constant afterwards.
+    calib, calib_why = read_pp_calibration(dg, CALIB_DIR)
+    depth = checkpoint_layers(model)
+    if calib is None and depth is not None and depth != calibration_layers:
+        raise refuse_foreign_calibration(dg, calib_why)
+    if calib is not None:
+        return [int(n) for n in calib["measured_counts"]]
+    return None
+
+
 def resolve_flip_ratchet_gib(
     record: Optional[Dict[str, dict]] = None,
     *,
