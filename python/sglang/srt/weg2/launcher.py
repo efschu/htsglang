@@ -5260,9 +5260,24 @@ def choose_host_ledger(
     # reads the number a previous boot of THIS CUT allocated, exactly as it
     # reads Sigma H. W102 by name when no boot of this cut has measured one;
     # never a default, because pricing one buffer for a five-lane boot is the
-    # 4.88 GiB under-charge that latched W98 on weg2xsn28.
-    _lane_n, _lane_prov = host_ledger.resolve_xchg_lanes(
-        host_ledger.xchg_cut_key(str(stage_ratio or ""), d_vector, legs))
+    # 5.64 GiB under-charge that latched W98 on weg2xsn28.
+    # #1358 [fix] ONLY WHERE THERE ARE LANES. `xchg_bounce_arm_pins_host` is
+    # the ONE producer of "does this arm pin host bytes for the exchange", and
+    # an arm that pins none creates no assemble buffer at all -- so demanding a
+    # lane record from it refused the DEFAULT arm, which is the very boot that
+    # would have produced the record the exchange arm needs. A producer that
+    # locks out its own bootstrap is worse than the under-charge it fixes.
+    if xchg_bounce_arm_pins_host(weight_source, oncard_mode):
+        _lane_n, _lane_prov = host_ledger.resolve_xchg_lanes(
+            host_ledger.xchg_cut_key(str(stage_ratio or ""), d_vector, legs))
+    else:
+        _lane_n = 1
+        _lane_prov = (
+            f"WEG2-XCHG-LANES cut={host_ledger.xchg_cut_key(str(stage_ratio or ''), d_vector, legs)} "
+            f"lanes=n/a (no exchange) source=arm weight_source={weight_source} "
+            f"oncard={oncard_mode} -- this arm pins no host bounce, so there "
+            f"is no lane to count and no record to demand. The term is 0 and "
+            f"says so; W102 is for an arm that WOULD allocate buffers.")
     _bounce_charge_bytes, _bounce_lines = xchg_bounce_terms_for_arm(
         weight_source, oncard_mode, model_dir, oncard_slot_mib, bounce_depth,
         _lane_n)
@@ -10335,6 +10350,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         # recomputed: a second computation of the same predicate is the second
         # bookkeeping this fork keeps paying for.
         form_key_matches=_form_key_matches,
+        # #1358 [fix] THE CUT REACHES THE LEDGER. `choose_host_ledger` grew
+        # `stage_ratio` with a DEFAULT of "", and this -- its only caller --
+        # never passed it, so the lane record was looked up under
+        # 'pp=;d=tp3;legs=both' while the seed is 'pp=39,13,12;...'. W102 on
+        # every rung, rc=2, ARM=0: the producer locked out every boot.
+        #
+        # A DEFAULT PARAMETER IS THE SAME TRAP AS A POSITIONAL ONE, one step
+        # quieter: the positional shift crashed, this one silently looked up
+        # the wrong key. Desk tests passed `stage_ratio=` explicitly and were
+        # blind to it exactly as they were to the argv_p shift.
+        stage_ratio=str(stage_ratio or ""),
+        legs=str(getattr(ns, "weg2_xchg_legs", "both") or "both"),
         # #1317n NO BOOT WITH S_D=S_P IN THE LEDGER. D carries 4 GB where P
         # carries 1, which is +8.38 GiB of rings; an arm priced without it is
         # optimistic by that much against a reap mark nobody may touch.

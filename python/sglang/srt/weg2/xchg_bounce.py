@@ -102,7 +102,7 @@ class BounceTerms:
     def total_bytes(self) -> int:
         """The one number the ledger charges as ``xchg_bounce_host_bytes``.
 
-        #1358 PER LANE, and this was a 4.88 GiB under-charge measured three
+        #1358 PER LANE, and this was a 5.64 GiB under-charge measured three
         ways on boot weg2xsn28. The term charged ONE buffer while the lane
         created FIVE separate files on tmpfs:
 
