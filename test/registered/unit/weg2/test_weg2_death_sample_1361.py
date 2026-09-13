@@ -133,3 +133,55 @@ class TheDeathSampleIsRefusedByName(CustomTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AbsenceOfEvidenceIsNotEvidenceOfDeath(CustomTestCase):
+    """#1361 [22-fix5b] -- the regression the train seat's red caught.
+
+    [22-fix5] wrote ``len(e.get("pids") or [])``, which reads an ABSENT field as
+    an empty one. Every record written before ``pids`` existed was then refused
+    as a death sample: weg2sn6s's origin went from 7.63 GiB to 0.0 and the
+    #1325 contract broke in two named tests.
+
+    That is absence of evidence scored as evidence of death -- the same error
+    [22-fix] made with an empty model digest and [22-fix2] had to undo, made
+    again by the same seat four commits later. A sample that never recorded its
+    process set says nothing about it; only a sampler that LOOKED and found
+    none is a witness.
+
+    The real weg2xsn25 death sample carries ``pids: []`` AND ``pids_asked: []``
+    -- the keys are PRESENT and empty, which is the sampler reporting that it
+    looked. That is what makes it distinguishable from a legacy record, and it
+    is why this guard can be both strict and safe.
+    """
+
+    #: A pre-`pids` record, shaped like the #1325 weg2sn6s fixture: no process
+    #: set was ever recorded.
+    LEGACY_NO_PIDS = {
+        "group": "P", "at": "2026-09-10T15:21:55Z", "boot_tag": "weg2sn6s",
+        "commit": "23dd8ab2c1", "rss_shmem_gib": 38.63, "weight_tags_gib": 28.83,
+        "arm": {"m_mib": 600, "s_gb": 1, "s_gb_d": 4}, "run_residual_gib": 16.34,
+    }
+
+    def test_a_record_without_a_pids_key_is_not_a_death_sample(self):
+        self.assertNotIn("pids", self.LEGACY_NO_PIDS)
+        _, why = hl.run_origin_gib(8.0, {"P": dict(self.LEGACY_NO_PIDS)})
+        self.assertNotIn("DEATH-SAMPLE", why)
+
+    def test_the_1325_origin_contract_survives_the_new_filter(self):
+        """The exact two numbers the #1325 tests pin, asserted here too.
+
+        Pinned in THIS file as well as in test_weg2_run_residual_currency_1325
+        so the coupling is visible from the guard's own side: whoever changes
+        this filter sees what it may not move.
+        """
+        origin, src = hl.run_origin_gib(8.0, {"P": dict(self.LEGACY_NO_PIDS)})
+        self.assertAlmostEqual(origin, 8.0, places=6)
+        self.assertIn("AT OR ABOVE", src)
+
+    def test_an_empty_but_present_pids_set_is_still_a_death_sample(self):
+        """The complement: the guard must not be softened into uselessness."""
+        entry = dict(self.LEGACY_NO_PIDS, pids=[], pids_asked=[],
+                     run_residual_gib=34.607529713279675)
+        _, why = hl.run_origin_gib(8.0, {"P": entry})
+        self.assertIn("DEATH-SAMPLE", why)
