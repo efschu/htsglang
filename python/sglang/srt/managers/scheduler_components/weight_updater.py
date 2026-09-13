@@ -3453,7 +3453,46 @@ class SchedulerWeightUpdaterManager:
         slots = bx.BounceSlots(str(boot_nonce), shm_root=root, create=True)
         last = None
         try:
-            for pair, group in bx.group_descs_by_pair(descs).items():
+            # #1358 THE LEDGER'S LANE COUNT IS CHECKED AGAINST THE LANE'S OWN
+            # ENUMERATION, here, where both exist for the first time. The term
+            # charges `buffer_bytes x n_lanes`; this dict IS the lane set, so a
+            # ledger that counted fewer lanes than the leg creates is caught
+            # before the first buffer is allocated instead of showing up as a
+            # cushion that vanishes in service.
+            #
+            # That is not hypothetical: on boot weg2xsn28 the term charged ONE
+            # buffer (2.160 GiB) while the boot created FIVE (7.044 GiB of
+            # bounce.bin files, 0 holders at teardown), and W98 latched nine
+            # seconds after `serving` needing 0.51 GiB it did not have.
+            #
+            # A NECESSARY CONDITION, NOT A COMPLETE ONE, and the difference is
+            # a population and must be stated: `n_lanes` is BOOT-WIDE (the host
+            # holds every rank's file at once -- that is what the ledger
+            # charges), while `_lanes` here is THIS RANK's share. The five
+            # xsn28 files came from several ranks: `p1,p2,p4` are pair lanes
+            # and `c0,c1` are two ranks' diagonal groups, and no single rank
+            # ever sees all five. So this catches a price BELOW what one rank
+            # alone needs and CANNOT catch a boot-wide undercount on its own.
+            # Comparing a per-rank count against a boot-wide charge as though
+            # they were the same number is exactly the error this whole ticket
+            # is about; the weaker check is kept because it is sound, and the
+            # complete one belongs where the boot-wide set exists.
+            _lanes = bx.group_descs_by_pair(descs)
+            _priced = int(getattr(terms, "n_lanes", 1) or 1)
+            if terms is not None and _priced < len(_lanes):
+                raise bx.Weg2XchgBouncePhaseUnordered(
+                    f"W68 Weg2XchgPlanDisagree: the ledger priced "
+                    f"n_lanes={_priced} BOOT-WIDE and THIS RANK alone needs "
+                    f"{len(_lanes)} "
+                    f"({sorted(str(k) for k in _lanes)}). Each lane is its own "
+                    f"assemble buffer of {int(getattr(terms, 'buffer_bytes', 0))} "
+                    f"bytes on tmpfs, so the host would hold "
+                    f"{(len(_lanes) - _priced) * int(getattr(terms, 'buffer_bytes', 0))} "
+                    f"bytes the arm never charged. Refusing BEFORE the first "
+                    f"allocation: an under-priced bounce does not fail here, it "
+                    f"fails later as a cushion nobody can account for."
+                )
+            for pair, group in _lanes.items():
                 rv = (bx.CrossSlotRendezvous(sems, slots, pair=pair)
                       if pair is not None else
                       bx.CrossSlotRendezvous(

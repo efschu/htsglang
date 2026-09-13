@@ -92,11 +92,39 @@ class BounceTerms:
     mean_layer_bytes: int
     buffer_bytes: int
     staging_bytes: int
+    #: #1358: HOW MANY ASSEMBLE BUFFERS THIS BOOT ACTUALLY CREATES. One file
+    #: per LANE (`bounce_path`: a lane is one directed card pair, or the
+    #: diagonal's card), enumerated at runtime by `group_descs_by_pair`.
+    #: Default 1 keeps every pre-#1358 caller byte-identical.
+    n_lanes: int = 1
 
     @property
     def total_bytes(self) -> int:
-        """The one number the ledger charges as ``xchg_bounce_host_bytes``."""
-        return int(self.buffer_bytes) + int(self.staging_bytes)
+        """The one number the ledger charges as ``xchg_bounce_host_bytes``.
+
+        #1358 PER LANE, and this was a 4.88 GiB under-charge measured three
+        ways on boot weg2xsn28. The term charged ONE buffer while the lane
+        created FIVE separate files on tmpfs:
+
+            /dev/shm/weg2-xchg-<epoch>/bounce.bin.{c0,c1,p1,p2,p4}
+                5 x 1.409 GiB = 7.044 GiB   (filesystem, 0 holders)
+            d_shmem across the source leg
+                          +7.043 GiB        (cgroup sampler, independent)
+            the lane's OWN HOST-SLOT lines
+                 4.226 + 2.818 = 7.044 GiB  (this boot's own log)
+            ARM line xchg_bounce
+                            2.160 GiB       (this term, before the fix)
+
+        The counter-proof that the instrument is sound: the same method on the
+        same boot summed the host ring to 46.40 GiB against
+        `host_weights=46.40` -- exact. The ledger priced the ring right and the
+        bounce wrong, so it was not a tmpfs or sparse-file artefact.
+
+        ALL FIVE ARE CONCURRENT (measured: the two legs overlap 115 s of
+        120 s), so this is not a peak-vs-sum question -- reducing the count is
+        a lane change, not an accounting one.
+        """
+        return int(self.buffer_bytes) * int(self.n_lanes) + int(self.staging_bytes)
 
     @property
     def staging_per_card(self) -> int:
@@ -204,6 +232,7 @@ def bounce_terms(
     pairs: int,
     depth: int = ASSEMBLE_DEPTH_DEFAULT,
     slot_bytes: int = SLOT_BYTES_DEFAULT,
+    n_lanes: int = 1,
 ) -> BounceTerms:
     """Derive the bounce term. Pure; raises only on inputs that cannot mean anything.
 
@@ -244,6 +273,7 @@ def bounce_terms(
         mean_layer_bytes=mean_layer,
         buffer_bytes=assemble_buffer_bytes(widest_layer_bytes, depth),
         staging_bytes=int(pairs) * SLOTS_PER_PAIR * int(slot_bytes),
+        n_lanes=max(1, int(n_lanes)),
     )
 
 
@@ -256,7 +286,11 @@ def bounce_terms(
 ENV_BOUNCE_TERMS = "SGLANG_WEG2_XCHG_BOUNCE_TERMS"
 
 _TERM_FIELDS = ("bytes_per_direction", "n_layers", "widest_layer_bytes",
-                "pairs", "depth", "slot_bytes")
+                "pairs", "depth", "slot_bytes",
+                # #1358: the lane count rides with the INPUTS, so the rank
+                # recomputes the same total instead of holding one it cannot
+                # check -- the rule this tuple already existed for.
+                "n_lanes")
 
 
 def publish_terms(terms: BounceTerms) -> str:
