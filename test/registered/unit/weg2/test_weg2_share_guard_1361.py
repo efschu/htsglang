@@ -50,6 +50,12 @@ class TheShareGuardCanActuallyFire(CustomTestCase):
         self.assertIn("W89x", msg)
         self.assertIn("0.5000", msg)
         self.assertIn("0.4", msg, "the refusal must name the FLAG it compared against")
+        # BOTH NUMBERS AND BOTH SOURCES. The record overrides the flag a few
+        # lines below this guard, so a refusal naming one value leaves the
+        # reader unable to tell which one sized the arm -- exactly the gap that
+        # let the boot seat read S_D=1 while the ARM line said S_D=2.
+        self.assertIn("source=record", msg)
+        self.assertIn("source=flag", msg)
 
     def test_a_record_share_at_or_below_the_flag_still_passes(self):
         """The control: the guard must not refuse the ordinary case.

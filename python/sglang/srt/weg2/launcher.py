@@ -4752,8 +4752,14 @@ def _derive_d_l2_budget(
     if rec_share is not None and float(rec_share) > _flag_share + 1e-9:
         raise Weg2LaunchRefused(
             f"W89x Weg2L2ShareBelowInstalled: the sizing record's installed "
-            f"KV-token ownership vector has max(v)/sum(v) = {rec_share:.4f}, "
-            f"above --d-cap-rank-share {_flag_share}. Sizing D's L2 on the smaller "
+            f"KV-token ownership vector has max(v)/sum(v) = {rec_share:.4f} "
+            f"(source=record), above --d-cap-rank-share {_flag_share:.4f} "
+            f"(source=flag). BOTH NUMBERS AND BOTH SOURCES are named because "
+            f"the record SILENTLY OVERRIDES the flag a few lines below this "
+            f"guard: without the pair, a reader cannot tell which value the "
+            f"arm was actually sized on -- the boot seat read S_D=1 off its "
+            f"own table while the ARM line said S_D=2, and this refusal was "
+            f"the only thing that could have said so. Sizing D's L2 on the smaller "
             f"share ships a pool that cannot hold one cap-sized read on the "
             f"largest rank -- the 27,466-row wall this change removes -- so it "
             f"is refused by name rather than discovered as a 413. Raise "
