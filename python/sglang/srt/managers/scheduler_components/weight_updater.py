@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import hashlib
 import functools
+import hashlib
 import logging
 import os
 import time
@@ -52,9 +52,9 @@ from sglang.srt.managers.weg2_memory_saver import (
     assert_backup_off_wake_refill_is_defined,
     assert_memory_saver_active,
     checkpoint_quantization,
+    is_weights_family_tag,
     pcie_transfer_lock,
     resolve_pcie_lock_key,
-    is_weights_family_tag,
     sleep_acceptance_census,
     vram_credit,
     weg2_graph_tag_armed,
@@ -113,15 +113,10 @@ def _weg2_group_stop_on_leg_failure(fn):
 #: is only the pre-ring reading.
 TMS_RING_GRANULE_BYTES = 2 * 1024 * 1024
 
-#: The POPULATION token every ``WEG2-FLIP-TAG`` line carries, read back by
-#: ``ring_table.parse_group_log``.  The names are imported from the reader so
-#: the emitter and the parser cannot spell them differently -- a mismatch would
-#: read as "weights only" and silently size the ring from a lower bound.
-from sglang.srt.weg2.ring_table import (  # noqa: E402
-    TAG_POPULATION_ALL as WEG2_TAG_POPULATION_ALL,
-    TAG_POPULATION_WEIGHTS as WEG2_TAG_POPULATION_WEIGHTS,
-)
-
+# #1348: the unexecuted-line instrument. Imported at module scope because the
+# module itself is inert and dependency-free until armed -- it imports
+# `coverage` lazily inside `arm()` and only when the launcher published its
+# directory, so an unarmed boot pays this import and nothing else.
 #: #1284: the NEED series and the W51 refusal that reads it.  Imported here
 #: rather than inlined because the guard is pure arithmetic over a clock and a
 #: stats callable, and that is the half that can be tested with no ring, no
@@ -132,14 +127,20 @@ from sglang.srt.weg2.ring_table import (  # noqa: E402
 #: the leg's RPC answers non-200 and the front issues its own named stop, the
 #: same way any other leg failure is reported.  Catching it would turn a
 #: refusal into a silent partial sleep.
+from sglang.srt.weg2 import lane_coverage as wlc  # noqa: E402
 from sglang.srt.weg2 import ring_guard
 from sglang.srt.weg2.ring_guard import RingNeedGuard  # noqa: E402
 
-# #1348: the unexecuted-line instrument. Imported at module scope because the
-# module itself is inert and dependency-free until armed -- it imports
-# `coverage` lazily inside `arm()` and only when the launcher published its
-# directory, so an unarmed boot pays this import and nothing else.
-from sglang.srt.weg2 import lane_coverage as wlc  # noqa: E402
+#: The POPULATION token every ``WEG2-FLIP-TAG`` line carries, read back by
+#: ``ring_table.parse_group_log``.  The names are imported from the reader so
+#: the emitter and the parser cannot spell them differently -- a mismatch would
+#: read as "weights only" and silently size the ring from a lower bound.
+from sglang.srt.weg2.ring_table import (  # noqa: E402
+    TAG_POPULATION_ALL as WEG2_TAG_POPULATION_ALL,
+)
+from sglang.srt.weg2.ring_table import (
+    TAG_POPULATION_WEIGHTS as WEG2_TAG_POPULATION_WEIGHTS,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1008,7 +1009,8 @@ class SchedulerWeightUpdaterManager:
             )
         self._weg2_xchg_inject_from_peer(terms=terms, **kw)
 
-    def _weg2_xchg_deposit_before_sleep(self, *, flip_index: int = -1) -> None:
+    def _weg2_xchg_deposit_before_sleep(self, *, flip_index: int = -1,
+                                        tag: Optional[str] = None) -> None:
         """THE DEPOSIT HALF -- the group going dormant stages its card bytes.
 
         WEG2XSN25 MEASURED THE HOLE: `SEAM-DIGEST MATCH 0/6`, and the cause was
@@ -1136,12 +1138,35 @@ class SchedulerWeightUpdaterManager:
                 "waking group's collect will find nothing and say so",
                 group, rank, xb.ENV_BOUNCE_TERMS)
             return
+        # #1374 F1 PER-TAG LOCKSTEP. `tag` restricts this deposit to ONE
+        # weight tag, because the caller now runs it INSIDE the pause loop:
+        # deposit(t) -> pause(t) -> credit(t) -> deposit(t+1). Before #1374 the
+        # whole plan was deposited before the first pause, and on the
+        # co-located card that cannot complete -- the collector needs the
+        # credit, the credit needs the pause, the pause needs this deposit
+        # (weg2xsn30: D0 W68 and PP0 W35, both after a full 120 s).
+        #
+        # `None` keeps the whole-plan behaviour for any caller that is not the
+        # pause loop; the descs carry their own tag (`XchgDesc.tag`), so the
+        # filter is a property of the plan and not a second bookkeeping.
+        _descs = list(plan.descs)
+        if tag is not None:
+            _descs = [d for d in _descs if str(getattr(d, "tag", "")) == str(tag)]
+            if not _descs:
+                # Not an error: a tag this rank does not carry has nothing to
+                # deposit, and saying so keeps the per-tag census honest.
+                logger.info(
+                    "WEG2-XCHG DEPOSIT tag=%s group=%s rank=%s pieces=0 -- "
+                    "this rank's plan carries no desc for this tag, so the "
+                    "lockstep step is a no-op rather than a missing band",
+                    tag, group, rank)
+                return
         self._weg2_xchg_bounce_leg(
-            descs=list(plan.descs), ops=self._weg2_xchg_device_ops(),
+            descs=_descs, ops=self._weg2_xchg_device_ops(),
             boot_nonce=boot_nonce, terms=terms, mode=wx.inject_mode(),
             device=int(device), hook=sh.HOOK_SOURCE,
             region=self._weg2_shadow_region(),
-            sems=self._weg2_xchg_sems(),
+            sems=self._weg2_xchg_sems(), tag=tag,
         )
 
     def _weg2_xchg_inject_from_peer(self, *, terms, **kw) -> None:
@@ -3350,7 +3375,13 @@ class SchedulerWeightUpdaterManager:
                               #: holds the bytes and deposits them, a rank on
                               #: any importing hook collects them.
                               hook: str = "",
-                              region=None, sems=None):
+                              region=None, sems=None,
+                              #: #1374 F1: WHICH TAG this leg is the step for,
+                              #: or None for the whole plan. It names the leg in
+                              #: the log and is the key of the per-tag `drained`
+                              #: handshake -- the one wait the contract keeps,
+                              #: taken between tags and never within one.
+                              tag=None):
         """PATH (b): assemble each unit in the host bounce, every card slices.
 
         The whole of the user law's fallback sentence, at the one call site
@@ -3446,6 +3477,21 @@ class SchedulerWeightUpdaterManager:
 
         phase = (bx.PHASE_DEPOSIT if str(hook) == "source"
                  else bx.PHASE_COLLECT)
+        # #1374 F1: THE PER-TAG DRAIN, and where it sits is the whole point.
+        # The source takes it BEFORE tag t's bands and AFTER tag t-1's credit
+        # was published (the pause loop publishes it immediately after the
+        # previous deposit), so the collector it waits for is already able to
+        # run -- no cycle. The first tag primes the counter to 0 instead,
+        # because `create_semaphores` arms every `empty` at 1 for the OLD
+        # meaning and at tag 0 there is no previous tag.
+        _first_tag = tag is not None and not getattr(self, "_weg2_xchg_tag_seen", None)
+        if tag is not None:
+            seen = getattr(self, "_weg2_xchg_tag_seen", None)
+            if seen is None:
+                seen = set()
+                self._weg2_xchg_tag_seen = seen
+            _first_tag = not seen
+            seen.add(str(tag))
         # THE BOUNCE'S OWN SLOT RECORD, created by whoever gets there first and
         # mapped by both ends. NOT the region's: weg2xsn24 read `carries 1080
         # bytes` because `run_producer_pair` publishes the RING's counts into
@@ -3498,6 +3544,31 @@ class SchedulerWeightUpdaterManager:
                       bx.CrossSlotRendezvous(
                           sems, slots,
                           card=int(getattr(group[0], "dst_rank", device))))
+                # #1374 F1: THE PER-TAG DRAIN, wired where the lane's own
+                # rendezvous exists. Ordering, on the source:
+                #   tag 0: prime the counter to 0 (create_semaphores arms every
+                #          `empty` at 1 for the OLD per-slot meaning, and at
+                #          tag 0 there is no previous tag to have been drained)
+                #   tag t: wait for the collector's `drained(t-1)` BEFORE
+                #          touching the buffer, which is safe because the pause
+                #          loop published credit(t-1) before calling us
+                # On the collector: post `drained(t)` after the tag's last band.
+                # Without this, tag t+1 overwrites bands tag t's collector may
+                # still be reading -- silently, which is worse than the deadlock
+                # the per-band claim caused.
+                if tag is not None and phase == bx.PHASE_DEPOSIT:
+                    if _first_tag:
+                        rv.prime_drain()
+                    elif not rv.wait_drained(tag=str(tag)):
+                        raise bx.Weg2XchgBouncePhaseUnordered(
+                            f"W68 Weg2XchgPlanDisagree: tag={tag} lane="
+                            f"{'p%s' % pair if pair is not None else 'diag'} "
+                            f"waited for the collector to drain the previous "
+                            f"tag and it did not. The credit for that tag was "
+                            f"published before this wait, so the collector was "
+                            f"free to run: this is a stalled or dead peer, not "
+                            f"the weg2xsn30 cycle. Refusing rather than "
+                            f"overwriting bands a consumer may still read.")
                 last = bx.run_bounce_leg(
                     group, ops, boot_nonce, slot_bytes=slot_bytes, depth=depth,
                     terms=terms, mode=resolved_mode, shm_root=root,
@@ -3530,6 +3601,13 @@ class SchedulerWeightUpdaterManager:
                     leg_rank=int(_weg2_identity(self, "_weg2_rank", -1)),
                     leg_name=f"{boot_nonce}/{hook}",
                     log=logger.info)
+                # #1374 F1: THIS TAG IS OUT OF THE BUFFER. Posted once per
+                # tag by the collector, after its last band; it is what the
+                # source's `wait_drained` for the NEXT tag releases. The
+                # per-band `empty` post is gone (that row IS this handshake),
+                # so N posts per tag cannot hand the source N tokens.
+                if tag is not None and phase == bx.PHASE_COLLECT:
+                    rv.post_drained(tag=str(tag))
         finally:
             slots.close()
         return last
@@ -3842,7 +3920,6 @@ class SchedulerWeightUpdaterManager:
                     "with %s until resume_memory_occupation",
                     "W25 Weg2DormantRefused",
                 )
-
         if weights_tags:
             # #89 hibernate: destination="disk" parks the FINAL post-transform
             # weights to hibernate_dir before the normal release/pause, so a
@@ -3950,9 +4027,6 @@ class SchedulerWeightUpdaterManager:
             # THE DEPOSIT, BEFORE THE PAGES GO. The pause below releases the
             # weight tags; a deposit after it would read pages this rank has
             # already given back. weg2xsn25 ran with no depositor at all.
-            self._weg2_xchg_deposit_before_sleep(
-                flip_index=_weg2_flip_index_of(
-                    getattr(recv_req, "epoch", None)))
             with self._weg2_pcie_lock("sleep-D2H " + ",".join(weights_tags), direction="d2h"):
                 for tag in weights_tags:
                     weg2_ring_guard.guard_tag(
@@ -3961,6 +4035,16 @@ class SchedulerWeightUpdaterManager:
                         self._weg2_ring_stats,
                         peer_hint="the group waking on this card",
                     )
+                    # #1374 F1: THE DEPOSIT OF THIS TAG, IMMEDIATELY BEFORE
+                    # ITS PAUSE. The bytes are still mapped here and the
+                    # credit below follows, so the collector this deposit
+                    # needs can run -- which is the ordering boot weg2xsn30
+                    # did not have. The buffer holds a whole tag (Option 1),
+                    # so this completes without its collector.
+                    self._weg2_xchg_deposit_before_sleep(
+                        flip_index=_weg2_flip_index_of(
+                            getattr(recv_req, "epoch", None)),
+                        tag=tag)
                     t_tag = time.perf_counter()
                     self.memory_saver_adapter.pause(tag)
                     weg2_per_tag[tag] = [
