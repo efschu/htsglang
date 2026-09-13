@@ -5095,6 +5095,63 @@ def xchg_lane_count(stage_ratio, legs, d_vector: str = XCHG_D_VECTOR_DEFAULT):
         host_ledger.xchg_cut_key(str(stage_ratio or ""), str(d_vector), str(legs)))
 
 
+#: #1374 OPTION 1: the weight-chunk length this boot ships, published by `main`
+#: to the ONE producer below. A module global rather than a new keyword on
+#: `choose_host_ledger`, whose signature is pinned keyword-for-keyword by
+#: `test_weg2_store_priced_x_1317`: the number is a property of the BOOT, set
+#: once before either consumer runs, and an unset value REFUSES rather than
+#: defaulting -- a silent 0 would size the buffer for the old geometry and
+#: re-enter weg2xsn30's deadlock.
+_WEIGHT_CHUNK_LAYERS: Optional[int] = None
+_TAGMAX_CACHE: Dict[tuple, int] = {}
+
+
+def publish_weight_chunk_layers(chunk_layers: int) -> None:
+    """`main` states the chunking once; both term consumers read it."""
+    global _WEIGHT_CHUNK_LAYERS
+    _WEIGHT_CHUNK_LAYERS = int(chunk_layers)
+
+
+def xchg_max_tag_bytes(model_dir: str) -> int:
+    """The largest WEIGHT TAG of any source rank, in bytes -- ONE producer.
+
+    Option 1 sizes the assemble buffer so a tag's deposit completes without its
+    collector; that bound is the largest tag, and the tags are the language
+    model's layer chunks. Cached per (model_dir, chunk_layers) because it reads
+    every safetensors header and both consumers ask the same question.
+
+    VALIDATED against boot weg2xsn30's own manifests before it was wired
+    (operator rule: deviation > 5 % per rank = report, do not wire):
+        stage 0 (layers 0:39)  derived 2907 MiB  manifest 2988 MiB  -2.7 %
+        stage 1 (layers 39:52) derived 2907 MiB  manifest 2856 MiB  +1.8 %
+        stage 2 (layers 52:64) derived 2907 MiB  manifest 2856 MiB  +1.8 %
+    The first draft overshot stage 0 by +9.2 %, and the cause was enumerated
+    rather than scaled away: `LAYER_RE` matches the substring `layers.<k>.`,
+    and this checkpoint carries TWO trees under it -- the language model's and
+    the MTP draft head's `mtp.layers.<k>`. Layer 0 is 366.2 MiB of model plus
+    355.1 MiB of mtp, and 355 MiB was the entire overshoot. The MTP head is its
+    own module with its own tag, so `MTP_TREE_PREFIXES` excludes it BY NAME.
+
+    THE SCALAR MAX OVER SOURCE RANKS, not per lane: it never under-sizes a
+    lane, and on this checkpoint every stage derives the same 2907 MiB, so a
+    per-lane refinement would change no number here. Named as a follow-up
+    rather than built blind.
+    """
+    if _WEIGHT_CHUNK_LAYERS is None:
+        raise checkpoint_census.Weg2XchgWidestLayerUnreadable(
+            "W14 Weg2XchgWidestLayerUnreadable: the weight-chunk length was "
+            "never published (`publish_weight_chunk_layers`), so the largest "
+            "weight tag cannot be derived. REFUSING at launch: a default of 0 "
+            "would size the assemble buffer for the old depth-based geometry, "
+            "and a tag that does not fit it cannot be deposited without its "
+            "collector -- boot weg2xsn30's deadlock, re-entered silently.")
+    key = (str(model_dir), int(_WEIGHT_CHUNK_LAYERS))
+    if key not in _TAGMAX_CACHE:
+        _TAGMAX_CACHE[key] = int(checkpoint_census.max_tag_bytes_from_census(
+            str(model_dir), int(_WEIGHT_CHUNK_LAYERS)))
+    return _TAGMAX_CACHE[key]
+
+
 def xchg_bounce_terms_for_arm(weight_source: str, oncard_mode: str,
                               model_dir: str,
                               oncard_slot_mib: Optional[int] = None,
@@ -5148,7 +5205,8 @@ def xchg_bounce_terms_for_arm(weight_source: str, oncard_mode: str,
             oncard_slot_mib) * weight_exchange_region.MIB)
     terms, widest, widest_name = checkpoint_census.widest_layer_terms(
         str(model_dir), pairs=int(weight_exchange_region.N_CARDS),
-        depth=int(bounce_depth), slot_bytes=slot_bytes, n_lanes=int(n_lanes))
+        depth=int(bounce_depth), slot_bytes=slot_bytes, n_lanes=int(n_lanes),
+        max_tag_bytes=xchg_max_tag_bytes(str(model_dir)))
     lines = [widest, xchg_bounce.arm_line(terms)]
     # PROVENANCE, ADDITIVE: the depth-slot is derived HERE, from this
     # checkpoint's census, and never from a knob -- but no line said so, and a
@@ -10032,6 +10090,21 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "flip (C9, gathered legs) = src.pause(kv) -> ONE src.release(family) and ONE dst.resume(family) "
         "in flight together -> dst.resume(kv); the host holds ONE image per card (H(c) = max_g image_g(c)) "
         "and dst's per-tag releases fund src's acquires inside it")
+    # #1374 OPTION 1: publish the chunking to the ONE producer of the tag
+    # bound, BEFORE either term consumer runs, and say the number out loud per
+    # lane. `source=derived` because it comes from this checkpoint's own
+    # headers; an unpublished chunking REFUSES rather than defaulting to 0.
+    publish_weight_chunk_layers(chunk_layers)
+    if xchg_bounce_arm_pins_host(ns.weg2_weight_source, ns.weg2_xchg_oncard):
+        _tagmax = xchg_max_tag_bytes(str(ns.model))
+        _tm_lanes, _ = xchg_lane_count(
+            stage_ratio, str(getattr(ns, "weg2_xchg_legs", "both") or "both"))
+        for _lane in range(int(_tm_lanes)):
+            log(f"WEG2-XCHG-TAGMAX lane={_lane} src_rank=* "
+                f"max_tag_mib={_tagmax // (1 << 20)} source=derived "
+                f"(chunk_layers={chunk_layers} of {n_layers}; the MTP tree is "
+                f"excluded by name -- checkpoint_census.MTP_TREE_PREFIXES; "
+                f"validated against weg2xsn30's manifests within 5% per rank)")
 
     # 1b'. P's PP LAYER SPLIT is NOT derived here any more (FIX 2).  It was,
     # from the two module score constants, at a point in main that runs BEFORE
@@ -10386,7 +10459,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                                   xchg_bounce.ASSEMBLE_DEPTH_DEFAULT)),
                 slot_bytes=weight_exchange_transport.validate_oncard_slot_mib(
                     ns.weg2_xchg_oncard_slot_mib) * weight_exchange_region.MIB,
-                n_lanes=int(_pub_lane_n)))
+                n_lanes=int(_pub_lane_n),
+                max_tag_bytes=xchg_max_tag_bytes(str(ns.model))))
     xchg_env = prepare_xchg_env(log, str(ring_plan.epoch),
                                   ns.weg2_weight_source, dry=dry,
                                   hop_bound_ms=ns.weg2_shadow_hop_bound_ms,
