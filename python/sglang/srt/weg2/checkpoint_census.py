@@ -208,7 +208,8 @@ def _tensor_bytes(meta: object) -> int:
     return int(nbytes)
 
 
-def layer_census_from_headers(model_dir: str) -> LayerCensus:
+def layer_census_from_headers(model_dir: str, *,
+                              exclude_prefixes: Sequence[str] = ()) -> LayerCensus:
     """Bytes per layer, group-wide, from every shard's header. Never a default."""
     root = str(model_dir)
     try:
@@ -236,6 +237,17 @@ def layer_census_from_headers(model_dir: str) -> LayerCensus:
                 continue
             nbytes = _tensor_bytes(meta)
             if nbytes <= 0:
+                continue
+            # #1374: A MODULE TREE MAY BE EXCLUDED BY NAME. `LAYER_RE` matches
+            # the substring `layers.<k>.`, and this checkpoint has TWO trees
+            # carrying that: `model.language_model.layers.<k>` and the MTP
+            # draft head's own `mtp.layers.<k>`. Measured on the shipped
+            # checkpoint: layer 0 is 366.2 MiB of model plus 355.1 MiB of mtp,
+            # and the 721.3 MiB sum is what made the tag bound overshoot boot
+            # weg2xsn30's own manifest by exactly that 355 MiB. Default ()
+            # keeps every existing caller -- including the widest-layer claim
+            # the #1332 guard grades -- byte-identical.
+            if exclude_prefixes and str(name).startswith(tuple(exclude_prefixes)):
                 continue
             m = LAYER_RE.search(str(name))
             if m is None:
@@ -295,6 +307,12 @@ def widest_line(census: LayerCensus) -> str:
     )
 
 
+#: The module trees whose `layers.<k>.` names are NOT the language model's and
+#: therefore not part of a `weights_<k>` tag. One entry today, named rather
+#: than pattern-matched, so a new tree has to be added deliberately.
+MTP_TREE_PREFIXES = ("mtp.",)
+
+
 def max_tag_bytes_from_census(model_dir: str, chunk_layers: int) -> int:
     """#1374 OPTION 1: the LARGEST WEIGHT TAG this boot will pause, exactly.
 
@@ -307,18 +325,40 @@ def max_tag_bytes_from_census(model_dir: str, chunk_layers: int) -> int:
     from.
 
     EXACT, not a bound with a margin: the widest WINDOW of `chunk_layers`
-    consecutive layers out of the census's own per-layer bytes, and separately
-    the unlayered total, because the chunk that carries the embeddings and the
-    lm_head is a tag too and on this checkpoint it is the big one (measured on
-    weg2xsn30: `weights_0 bytes=2988 MiB` against a widest layer of 721 MiB).
-    Whichever is larger is what a single pause can put in the buffer.
+    consecutive layers out of the census's own per-layer bytes.
+
+    THE UNLAYERED TENSORS DO NOT SET THIS MAXIMUM, and that is measured rather
+    than assumed. `census.unlayered_bytes` is GROUP-WIDE (4516 MiB here:
+    embed_tokens plus lm_head), while the embeddings and the head are
+    TP-SHARDED -- boot weg2xsn30's own plan lines read
+    `model.embed_tokens.weight planned_mib=404.375` and
+    `lm_head.weight planned_mib=808.750` PER RANK, i.e. 1213 MiB, which is
+    BELOW the 2907 MiB window. Taking `max(window, unlayered_bytes)` therefore
+    overshot the boot's own manifest by +51 % (4516 against a measured
+    2988 MiB) -- the group-wide-versus-per-rank confusion, one term over. The
+    rank-side manifest guard (W68 against each rank's own tag maximum) is what
+    catches a checkpoint where that ordering does not hold.
+
+    VALIDATED AGAINST THE RIGHT QUANTITY. The buffer has to hold what the
+    deposit MOVES -- the parameters -- not what the saver's arena occupies.
+    weg2xsn30's manifest for `weights_0` lists 114 tensors summing to
+    2908.1 MiB of `planned_mib`, and this derives 2907 MiB: -0.04 %. The same
+    tag's pause line reads `bytes=2988 MiB`, ~80 MiB more, which is the saver
+    ARENA footprint (alignment and padding) and not bytes any band carries.
+    Grading this number against 2988 would have reported -2.7 % and invited a
+    margin; grading it against the param sum shows there is nothing to add.
 
     `chunk_layers <= 0` means the weights are not chunked: then one tag is the
     whole layer stack and this returns the layered total plus the unlayered --
     a number the ledger will refuse if it cannot be funded, which is the
     correct answer rather than a buffer that deadlocks.
     """
-    census = layer_census_from_headers(model_dir)
+    # THE WEIGHT TAGS ARE THE LANGUAGE MODEL'S LAYER CHUNKS. The MTP head is a
+    # module of its own with its own tag, and its `mtp.layers.<k>` names alias
+    # the language model's layer indices -- see `exclude_prefixes` above for the
+    # measurement. Enumerated and subtracted by NAME, never by a factor.
+    census = layer_census_from_headers(model_dir,
+                                      exclude_prefixes=MTP_TREE_PREFIXES)
     per_layer = [int(b) for _idx, b in census.layer_bytes]
     if not per_layer:
         raise Weg2XchgWidestLayerUnreadable(
@@ -331,7 +371,7 @@ def max_tag_bytes_from_census(model_dir: str, chunk_layers: int) -> int:
     else:
         window = max(sum(per_layer[i:i + width])
                      for i in range(0, len(per_layer) - width + 1))
-    return max(int(window), int(census.unlayered_bytes))
+    return int(window)
 
 
 def widest_layer_terms(model_dir: str, *, pairs: int, depth: int,
