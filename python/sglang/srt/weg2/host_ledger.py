@@ -1732,7 +1732,7 @@ def resolve_xchg_lanes(cut_key: str) -> Tuple[int, str]:
     """``(lanes, provenance)`` for this cut, or W102 by name.
 
     NEVER A DEFAULT. An unmeasured cut gets a refusal, not a 1: pricing one
-    buffer where the boot creates five is exactly the 4.88 GiB under-charge
+    buffer where the boot creates five is exactly the 5.64 GiB under-charge
     that made weg2xsn28 latch W98 nine seconds after `serving` with 0.51 GiB
     missing. A guessed lane count is that defect with a comment in front of it.
     """
