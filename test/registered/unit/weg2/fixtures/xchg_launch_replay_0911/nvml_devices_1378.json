@@ -1,0 +1,26 @@
+[
+  {
+    "index": 0,
+    "uuid": "GPU-5c648f96-be1d-42d5-0221-34d11ab137f7",
+    "name": "NVIDIA GeForce RTX 3080",
+    "total_bytes": 21474836480,
+    "pci_bus_id": "0000:02:00.0",
+    "reserved_bytes": 0
+  },
+  {
+    "index": 1,
+    "uuid": "GPU-31d7ef41-f574-4d0e-21ad-e773fd938f6d",
+    "name": "NVIDIA GeForce RTX 5090",
+    "total_bytes": 34190917632,
+    "pci_bus_id": "0000:01:00.0",
+    "reserved_bytes": 0
+  },
+  {
+    "index": 2,
+    "uuid": "GPU-62dbbae1-e859-9ccc-f9c2-d9f2443a84f4",
+    "name": "NVIDIA GeForce RTX 3080",
+    "total_bytes": 21474836480,
+    "pci_bus_id": "0000:03:00.0",
+    "reserved_bytes": 0
+  }
+]
