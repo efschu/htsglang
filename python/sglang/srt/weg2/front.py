@@ -2340,7 +2340,17 @@ class Front:
                     # a boot 28 GiB below danger.  The split comes from the
                     # PRE-BOOT anon baseline; `cgroup anon - sum(RssAnon)` is
                     # not subtractable and printed foreign=-30.91 on that boot.
-                    pr = host_ledger.read_cgroup_pressure()
+                    # #1361 20c: THE SAME READING THE LATCH GRADED, not a second
+                    # one taken milliseconds later. The promise in [20b] was
+                    # "one read_cgroup_pressure per tick feeds both halves" and
+                    # the code took two -- caught by the train seat's count, not
+                    # by my own ratchet, which asserted a STRING and would have
+                    # stayed green at ten reads. The drift between two reads is
+                    # ~10 MiB at the measured 2.4-3.3 GiB/s and materially
+                    # changes no verdict; what was wrong was the CLAIM, and a
+                    # claim the code does not keep is how the next reader is
+                    # told the two halves cannot disagree when they can.
+                    pr = _pr_fast
                     verdict = host_ledger.watermark_breach_verdict(
                         int(current),
                         margin=margin,
