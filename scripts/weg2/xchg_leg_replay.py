@@ -257,6 +257,42 @@ def device_write(ops, ptr: int, payload: bytes, cuda: bool) -> None:
         ops.destroy_stream(stream)
 
 
+def expected_bytes(t, group: str, rank: int, nbytes: int) -> bytes:
+    """What THIS rank must hold of one tensor -- the one definition both
+    directions share.
+
+    The whole tensor's content is `seed_bytes(name)`; a TP rank holds the
+    slice of it its shard vector names. Seeding the SOURCE and verifying the
+    DESTINATION from the same function is what makes a direction swap a flag
+    rather than a second expectation to keep in step.
+    """
+    rows_content = t.rows_full - t.pad_units
+    whole = seed_bytes(t.param_name, rows_content * t.cols_full * t.itemsize)
+    if group == "P":
+        return whole[:nbytes]
+    # A REPLICATED TENSOR IS HELD WHOLE BY EVERY TP RANK -- it is not cut, so
+    # `tp_widths` is not a shard vector for it (the join records (1, 1, 1)).
+    # WITHOUT THIS BRANCH the ROWS formula below took that (1,1,1) as row
+    # counts and computed `start = rank * cols_full * itemsize`, which for
+    # rank 1 and 2 lies PAST THE END of a one-row tensor: `want` came back
+    # EMPTY and the comparison passed on zero bytes. Measured: the pp_to_tp
+    # arm read MATCH 302/302 on D while every replicated tensor of ranks 1
+    # and 2 was graded vacuously, and only the reverse direction -- where the
+    # PP destination's expectation is non-empty -- could ever show it. A
+    # checker that cannot go red is the defect, not the direction.
+    if t.shard_axis == wx.REPLICATED:
+        return whole[:nbytes]
+    if t.shard_axis == wx.COLS:
+        w = t.tp_widths[rank]
+        off = sum(t.tp_widths[:rank]) * t.itemsize
+        pitch = t.cols_full * t.itemsize
+        run = w * t.itemsize
+        return b"".join(whole[i * pitch + off: i * pitch + off + run]
+                        for i in range(rows_content))[:nbytes]
+    start = sum(t.tp_widths[:rank]) * t.cols_full * t.itemsize
+    return whole[start:start + nbytes]
+
+
 def rank_extents(t, group: str, rank: int):
     """(rows, cols) THIS rank holds of one joined tensor -- AXIS-AWARE.
 
@@ -481,7 +517,7 @@ class _Stub:
 
 def rank_proc(group, rank, evidence, root, q, self_test, max_tensors,
               col_div, single_runner, manifest_dir, cuda=False,
-              uuid=""):
+              uuid="", direction="pp_to_tp"):
     """ONE rank, THROUGH THE PRODUCT ADAPTER.
 
     THE ENTRY POINT IS THE BOOT'S, and that is the whole point of this
@@ -537,6 +573,9 @@ def rank_proc(group, rank, evidence, root, q, self_test, max_tensors,
         # main region, so `draft_names` is empty and every piece lands in
         # the MAIN double -- except the ones the single-runner book drops.
 
+        # WHICH GROUP HOLDS THE BYTES AT THE START -- needed before the
+        # allocation loop, because it decides who is seeded and who is zeroed.
+        src_group = "P" if direction == "pp_to_tp" else "D"
         main_params, draft_params, own = [], [], {}
         allocated = 0
         for t in join.tensors:
@@ -559,8 +598,9 @@ def rank_proc(group, rank, evidence, root, q, self_test, max_tensors,
                 return
             ptr = ops.raw_malloc(0, nb)
             own[t.param_name] = (ptr, nb)
-            if group == "P":
-                device_write(ops, ptr, seed_bytes(t.param_name, nb), cuda)
+            if group == src_group:
+                device_write(ops, ptr,
+                             expected_bytes(t, group, rank, nb), cuda)
             else:
                 device_write(ops, ptr, b"\0" * nb, cuda)
             # A TENSOR WHOSE data_ptr() IS THE FAKE DEVICE ADDRESS: the address
@@ -572,7 +612,7 @@ def rank_proc(group, rank, evidence, root, q, self_test, max_tensors,
         stub = _Stub(main_params, None if single_runner else draft_params,
                      group=group, rank=rank)
 
-        hook = "source" if group == "P" else "destination"
+        hook = "source" if group == src_group else "destination"
         plan, reason = stub._weg2_shadow_plan(
             hook, group, rank, agreed=None, require_agreement=False)
         if plan is None:
@@ -602,24 +642,27 @@ def rank_proc(group, rank, evidence, root, q, self_test, max_tensors,
                                      leg=f"{NONCE}/{hook}"), 0, 0))
         q.put(("entry", group, rank, "adapter", 0, 0))
 
-        if group == "D":
+        if group != src_group:
             good = bad = 0
             bad_names = []
             for t in join.tensors:
+                # A PP DESTINATION HOLDS ONLY ITS OWN STAGE'S TENSORS, so the
+                # verdict asks only about what this rank actually received.
+                if t.param_name not in own:
+                    continue
                 ptr, nb = own[t.param_name]
-                rows_content = t.rows_full - t.pad_units
-                whole = seed_bytes(t.param_name,
-                                   rows_content * t.cols_full * t.itemsize)
-                if t.shard_axis == wx.COLS:
-                    w = t.tp_widths[rank]
-                    off = sum(t.tp_widths[:rank]) * t.itemsize
-                    pitch = t.cols_full * t.itemsize
-                    run = w * t.itemsize
-                    want = b"".join(whole[i * pitch + off: i * pitch + off + run]
-                                    for i in range(rows_content))
-                else:
-                    start = sum(t.tp_widths[:rank]) * t.cols_full * t.itemsize
-                    want = whole[start:start + nb]
+                want = expected_bytes(t, group, rank, nb)
+                if len(want) != nb:
+                    # AN EXPECTATION THAT IS NOT THE RANK'S OWN SIZE GRADES
+                    # NOTHING. Named as a failure rather than counted as a
+                    # pass -- this is exactly how the replicated defect above
+                    # stayed invisible for a whole direction.
+                    bad += 1
+                    if len(bad_names) < 3:
+                        bad_names.append(
+                            f"{t.param_name}(expectation {len(want)}B != "
+                            f"held {nb}B)")
+                    continue
                 got = device_read(ops, ptr, len(want), cuda)
                 if got == want:
                     good += 1
@@ -627,6 +670,18 @@ def rank_proc(group, rank, evidence, root, q, self_test, max_tensors,
                     bad += 1
                     if len(bad_names) < 3:
                         bad_names.append(t.param_name)
+                    if len(bad_names) == 1 and os.environ.get("WEG2_DIAG"):
+                        fd = next((i for i in range(min(len(got), len(want)))
+                                   if got[i] != want[i]), -1)
+                        q.put(("badnames", group, rank,
+                               f"DIAG {t.param_name} axis={t.shard_axis} "
+                               f"rows={t.rows_full} cols={t.cols_full} "
+                               f"pad={t.pad_units} widths={t.tp_widths} "
+                               f"nb={nb} first_diff={fd} "
+                               f"zeros={got.count(0)}/{len(got)} "
+                               f"got_is_shard0={got[:32] == want[:32]} "
+                               f"got_head={got[:16].hex()} "
+                               f"want_head={want[:16].hex()}", 0, 0))
             q.put(("digest", group, rank, good, bad, len(join.tensors)))
             if bad_names:
                 q.put(("badnames", group, rank, ",".join(bad_names), 0, 0))
@@ -715,7 +770,7 @@ def _run(ns) -> int:
                          args=(g, r, ns.evidence, root, q, ns.self_test,
                                ns.max_tensors, ns.col_div, ns.single_runner,
                                mdir, ns.cuda,
-                               uuids[r] if ns.cuda else ""))
+                               uuids[r] if ns.cuda else "", ns.direction))
              for g in ("P", "D") for r in range(xr.N_CARDS)]
     for p in procs:
         p.start()
@@ -797,6 +852,11 @@ def _teardown(root: str) -> None:
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--evidence", default="/spinning/evidence-665-f1/weg2xsn24_0912")
+    ap.add_argument("--direction", choices=("pp_to_tp", "tp_to_pp"),
+                    default="pp_to_tp",
+                    help="which way the bytes move. pp_to_tp seeds P and "
+                         "collects on D; tp_to_pp is the mirror. The "
+                         "acceptance is MATCH in BOTH.")
     ap.add_argument("--cuda", action="store_true",
                     help="THE CUDA ARM: six processes on the three REAL cards "
                          "(one P and one D rank per card), CUDA_VISIBLE_DEVICES "
