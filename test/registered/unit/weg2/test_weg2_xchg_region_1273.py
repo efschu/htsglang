@@ -1014,16 +1014,26 @@ def test_semaphores_are_created_and_unlinked():
         # two named populations rather than as one number -- boot weg2xsn9 died
         # 36 times on a lane that had a carrier and no handshake, so "how many
         # semaphores exist" must fail loudly if either half goes missing.
+        # #1367: A THIRD FAMILY EXISTS, and the sum stays a SUM OF NAMED
+        # POPULATIONS rather than one total. That shape is the point of this
+        # assertion -- the comment above records why: weg2xsn9 died 36 times on
+        # a lane that had a carrier and no handshake, so a missing HALF must
+        # fail loudly. Collapsing to `len(all_region_sem_names)` would pass
+        # while any one family went missing, which is the defect this test
+        # exists to catch. So: three names, three counts, one union.
         n_cross = 24                                    # 6 directed pairs x 2 slots x 2 kinds
         n_diag = xr.N_CARDS * xr.SLOTS_PER_PAIR * 2     # 3 cards x 2 slots x 2 kinds
-        assert len(names) == n_cross + n_diag, (len(names), n_cross, n_diag)
-        assert len(set(names)) == n_cross + n_diag
+        n_shadow = len(xr.all_shadow_sem_names(boot))   # the observer's own 24
+        assert len(names) == n_cross + n_diag + n_shadow, (
+            len(names), n_cross, n_diag, n_shadow)
+        assert len(set(names)) == n_cross + n_diag + n_shadow
         assert set(names) == set(xr.all_sem_names(boot)) | set(
-            xr.all_diagonal_sem_names(boot))
+            xr.all_diagonal_sem_names(boot)) | set(
+            xr.all_shadow_sem_names(boot))
         assert len(xr.all_sem_names(boot)) == n_cross, "the cross half is 24"
         for name in names:
             assert os.path.exists(f"/dev/shm/sem.{name.lstrip('/')}"), name
-        assert xr.unlink_semaphores(boot) == n_cross + n_diag
+        assert xr.unlink_semaphores(boot) == n_cross + n_diag + n_shadow
         for name in names:
             assert not os.path.exists(f"/dev/shm/sem.{name.lstrip('/')}"), name
         assert xr.unlink_semaphores(boot) == 0, "unlink is idempotent"
@@ -1287,7 +1297,11 @@ def test_prepare_and_teardown_round_trip_the_region_and_the_sems(tmp_path):
     lines = []
     try:
         out = xr.prepare_region(boot, shm_root=shm_root, log=lines.append)
-        assert out["sems"] == xr.N_PAIRS * xr.SLOTS_PER_PAIR * 2 + xr.N_CARDS * xr.SLOTS_PER_PAIR * 2
+        # #1367: three families, named -- see the census test for why this is a
+        # sum and not a single total.
+        assert out["sems"] == (xr.N_PAIRS * xr.SLOTS_PER_PAIR * 2
+                               + xr.N_CARDS * xr.SLOTS_PER_PAIR * 2
+                               + len(xr.all_shadow_sem_names(boot)))
         assert out["env"][xr.ENV_REGION_PATH] == xr.region_path(boot, shm_root)
         assert out["env"][xr.ENV_REGION_BOOT] == boot
         assert os.path.getsize(out["path"]) == xr.REGION_BYTES
@@ -1296,7 +1310,8 @@ def test_prepare_and_teardown_round_trip_the_region_and_the_sems(tmp_path):
         # because that is what `create_semaphores` armed.  A literal 24 would
         # pin exactly the half boot weg2xsn9's lane did NOT have.
         n_all = (xr.N_PAIRS * xr.SLOTS_PER_PAIR * 2
-                 + xr.N_CARDS * xr.SLOTS_PER_PAIR * 2)
+                 + xr.N_CARDS * xr.SLOTS_PER_PAIR * 2
+                 + len(xr.all_shadow_sem_names(boot)))
         assert f"sems={n_all}" in lines[0], (
             "the count is read back from the header", lines[0])
         region = xr.XchgRegion.open(out["path"], expect_boot=boot)
