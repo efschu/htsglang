@@ -698,6 +698,14 @@ class InjectVerdict:
     mismatches: int
     mismatch_first: str = ""
     rows_compared: int = 0
+    #: WHICH HALF OF THE HANDSHAKE THIS LEG RAN. The line carried no phase at
+    #: all, and boot weg2xsn25 shows what that costs: three P legs were read as
+    #: "ran without a phase, therefore unsplit" when they had in fact run
+    #: `collect` -- the W68 texts they carried are reachable ONLY under
+    #: `rendezvous is not None and phase == PHASE_COLLECT` (:1176). The ABSENCE
+    #: of a field is not evidence about the value; it is evidence about the
+    #: instrument. Empty means the unsplit form, which is now visible as such.
+    phase: str = ""
 
     @property
     def verdict(self) -> str:
@@ -712,7 +720,8 @@ class InjectVerdict:
     def line(self) -> str:
         return (
             "WEG2-XCHG-INJECT "
-            f"mode={self.mode} verdict={self.verdict} "
+            f"mode={self.mode} phase={self.phase or 'unsplit'} "
+            f"verdict={self.verdict} "
             f"pieces={self.pieces} bytes={self.bytes_compared} "
             f"rows={self.rows_compared} mismatches={self.mismatches} "
             f"mismatch_first={self.mismatch_first or '-'}"
@@ -1091,7 +1100,7 @@ def run_bounce_leg(
             f"whether this leg owns 27 GiB of weights")
     comparing = mode == wx.INJECT_SHADOW
     verdict = InjectVerdict(mode=mode, pieces=0, bytes_compared=0,
-                            mismatches=0)
+                            mismatches=0, phase=str(phase))
     # SHADOW MODE COSTS ONE EXTRA SLOT, priced rather than borrowed: the
     # compare needs the live bytes beside the staged ones, and reusing a
     # depth-slot would overwrite the band still in flight.
