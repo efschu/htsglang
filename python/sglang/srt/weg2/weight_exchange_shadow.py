@@ -3794,7 +3794,12 @@ class ShadowLeg:
             self.sems = sems
         else:
             try:
-                self.sems = tp.SemSet(self.region.boot_nonce)
+                # THE OBSERVER'S OWN NAMESPACE (weg2xsn25): a shadow that
+                # shares the exchange's 24 consumes the flip's handshake with
+                # its sample traffic, and the exchange then waits on a band
+                # nobody will post. Its W78 staleness check below now asks
+                # about ITS set, which is the only set it may disturb.
+                self.sems = tp.SemSet(xr.shadow_nonce(self.region.boot_nonce))
                 self._opened.add("sems")
             except BaseException as exc:  # noqa: BLE001
                 self.sems_reason = f"{type(exc).__name__}: {exc}"

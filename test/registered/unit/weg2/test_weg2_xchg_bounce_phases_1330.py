@@ -846,3 +846,77 @@ def test_the_inject_line_names_its_phase_1330():
         v = wb.InjectVerdict(mode=wx.INJECT_SHADOW, pieces=0,
                              bytes_compared=0, mismatches=0, phase=phase)
         assert want in v.line(), (phase, v.line())
+
+
+def test_both_halves_of_the_handshake_have_a_production_caller_1330():
+    """RATCHET: a depositing call site EXISTS, not only a collecting one.
+
+    weg2xsn25 read `SEAM-DIGEST MATCH 0/6` with no phase bug anywhere: there
+    was exactly ONE production caller, on the waking group, hard-coding
+    `hook="authoritative"` -- which `leg_direction` derives as `collect`. Every
+    rank that ran a leg collected and nobody deposited, so the collect legs
+    waited on a band no one would post (`carries 0 bytes` against a derivation
+    of 756323776). A missing caller is invisible to every test that asserts
+    what a caller does.
+    """
+    import ast
+    import pathlib
+
+    src = pathlib.Path(
+        "python/sglang/srt/managers/scheduler_components/weight_updater.py")
+    if not src.exists():                       # worktree-relative fallback
+        import sglang.srt.managers.scheduler_components.weight_updater as _wu
+        src = pathlib.Path(_wu.__file__)
+    tree = ast.parse(src.read_text(encoding="utf-8"))
+    hooks = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        fn = node.func
+        if not (isinstance(fn, ast.Attribute)
+                and fn.attr == "_weg2_xchg_bounce_leg"):
+            continue
+        for kw_ in node.keywords:
+            if kw_.arg != "hook":
+                continue
+            v = kw_.value
+            if isinstance(v, ast.Constant):
+                hooks.add(str(v.value))
+            elif isinstance(v, ast.Attribute):
+                hooks.add(v.attr)               # sh.HOOK_SOURCE
+    assert "HOOK_SOURCE" in hooks or "source" in hooks, (
+        "no production call site runs the SOURCE hook: the exchange has no "
+        f"depositor and cannot move a byte. hooks seen: {sorted(hooks)}")
+    assert "authoritative" in hooks or "destination" in hooks, (
+        f"no importing call site: nothing collects. hooks seen: {sorted(hooks)}")
+
+
+def test_shadow_and_exchange_semaphore_names_are_disjoint_1330():
+    """RATCHET FOR (B): both sets built from ONE region, names disjoint.
+
+    `sem_name` (weight_exchange_region.py:1766) is total in its nonce and
+    `SemSet.__init__` (weight_exchange_transport.py:934) takes nothing else, so
+    two SemSets built from the same `region.boot_nonce` name the SAME 24
+    semaphores -- identically, not probably. That is what boot weg2xsn25 hit:
+    the observer's sample traffic (`classes=1 subset=A_log`, 0.00 MiB) took
+    `empty` and posted `full`, and the exchange's collect legs then waited on a
+    handshake already consumed.
+
+    Separation therefore has to happen in the NONCE, and every derivation that
+    hangs off it must move together -- which is why `shadow_nonce` is one
+    function and `all_region_sem_names` (the list both `create_semaphores` and
+    `unlink_semaphores` read) carries the observer's 24 rather than a second
+    creator existing anywhere.
+    """
+    from sglang.srt.weg2 import weight_exchange_region as xr
+
+    boot = "b4ndisjoint"
+    exchange = set(xr.all_sem_names(boot))
+    observer = set(xr.all_sem_names(xr.shadow_nonce(boot)))
+    assert len(exchange) == 24 and len(observer) == 24
+    assert exchange.isdisjoint(observer), sorted(exchange & observer)
+    # AND BOTH ARE CREATED AND TORN DOWN BY THE ONE LIST, so the observer's set
+    # cannot be the half that nobody unlinks.
+    every = set(xr.all_region_sem_names(boot))
+    assert exchange <= every and observer <= every, sorted(
+        (exchange | observer) - every)

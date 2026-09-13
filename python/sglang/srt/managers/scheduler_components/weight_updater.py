@@ -1008,6 +1008,66 @@ class SchedulerWeightUpdaterManager:
             )
         self._weg2_xchg_inject_from_peer(terms=terms, **kw)
 
+    def _weg2_xchg_deposit_before_sleep(self) -> None:
+        """THE DEPOSIT HALF -- the group going dormant stages its card bytes.
+
+        WEG2XSN25 MEASURED THE HOLE: `SEAM-DIGEST MATCH 0/6`, and the cause was
+        not a phase bug but a MISSING CALLER. There was exactly one production
+        call site (`_weg2_xchg_inject_from_peer`), it runs on the WAKING group,
+        and it hard-coded `hook="authoritative"` -- which `leg_direction`
+        derives as `collect`. So every rank that ran a leg collected, nobody
+        deposited, and the collect legs waited on a band no one would post:
+        `carries 0 bytes` against a derivation of 756323776. D emitted zero
+        `WEG2-XCHG-INJECT` lines all boot; it never ran a leg at all.
+
+        THE ROLE IS NOT A NEW DERIVATION. `weight_exchange.leg_direction`
+        (:2223) and `weight_exchange_shadow.py:3345` already answer it from the
+        hook, and this method's only contribution is to BE the source hook:
+        the sleeping rank holds the bytes, so it exports. The phase falls out
+        (`_weg2_xchg_bounce_leg` -> `PHASE_DEPOSIT`) and the INJECT line prints
+        it.
+
+        WHERE IT IS CALLED MATTERS MORE THAN WHAT IT DOES: before
+        `memory_saver_adapter.pause(tag)` releases the weight pages. A deposit
+        after the pause would read pages this rank no longer owns.
+
+        An unarmed boot returns immediately -- this is the exchange's half, not
+        the ring's.
+        """
+        from sglang.srt.weg2 import weight_exchange as wx
+        from sglang.srt.weg2 import weight_exchange_region as xr
+        from sglang.srt.weg2 import weight_exchange_shadow as sh
+
+        if not wx.exchange_armed():
+            return
+        boot_nonce = (os.environ.get(xr.ENV_REGION_BOOT, "") or "").strip()
+        group = self._weg2_group_name()
+        rank = self._weg2_rank()
+        device = self._weg2_device_index()
+        if not boot_nonce or not group or rank is None or int(device) < 0:
+            # NAMED, NOT SILENT: this is the class weg2xsn25 paid a boot for.
+            logger.info(
+                "WEG2-XCHG-DEPOSIT-SKIPPED boot=%r group=%r rank=%r device=%s "
+                "-- the dormant group could not identify itself, so no bytes "
+                "were staged; the waking group's collect will have nothing to "
+                "read and will say so", boot_nonce, group, rank, device)
+            return
+        plan, reason = self._weg2_shadow_plan(
+            sh.HOOK_SOURCE, group, int(rank), agreed=None,
+            require_agreement=False)
+        if plan is None:
+            logger.info(
+                "WEG2-XCHG-DEPOSIT-SKIPPED group=%s rank=%s no plan: %s",
+                group, rank, reason)
+            return
+        self._weg2_xchg_bounce_leg(
+            descs=list(plan.descs), ops=self._weg2_xchg_device_ops(),
+            boot_nonce=boot_nonce, terms=None, mode=wx.inject_mode(),
+            device=int(device), hook=sh.HOOK_SOURCE,
+            region=self._weg2_shadow_region(),
+            sems=self._weg2_xchg_sems(),
+        )
+
     def _weg2_xchg_inject_from_peer(self, *, terms, **kw) -> None:
         """The transfer itself, once the term is known.
 
@@ -3772,6 +3832,10 @@ class SchedulerWeightUpdaterManager:
                 os.environ.get("TMS_HOST_RING_EPOCH", "") or "?",
                 self._weg2_group_name(), "peer",
             )
+            # THE DEPOSIT, BEFORE THE PAGES GO. The pause below releases the
+            # weight tags; a deposit after it would read pages this rank has
+            # already given back. weg2xsn25 ran with no depositor at all.
+            self._weg2_xchg_deposit_before_sleep()
             with self._weg2_pcie_lock("sleep-D2H " + ",".join(weights_tags), direction="d2h"):
                 for tag in weights_tags:
                     weg2_ring_guard.guard_tag(

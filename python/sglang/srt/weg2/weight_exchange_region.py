@@ -1839,7 +1839,37 @@ def all_region_sem_names(boot_nonce: str) -> List[str]:
     separately addressable (``all_sem_names`` is still the six pairs' 24) --
     what must never happen again is a lane whose handshake nobody created.
     """
-    return all_sem_names(boot_nonce) + all_diagonal_sem_names(boot_nonce)
+    # THE OBSERVER'S 24 RIDE THE SAME LIST, so `create_semaphores` and
+    # `unlink_semaphores` -- which both read this one function -- cover them
+    # without a second creator, a second teardown or a second count.
+    return (all_sem_names(boot_nonce) + all_diagonal_sem_names(boot_nonce)
+            + all_shadow_sem_names(boot_nonce))
+
+
+#: THE SHADOW OBSERVER'S OWN NAMESPACE, as a DERIVED NONCE rather than a
+#: second naming scheme: `sem_name` stays the only producer of a semaphore
+#: name, and the observer simply gets a different boot to hang its 24 on.
+#:
+#: MEASURED, boot weg2xsn25. The observer and the exchange shared one set of 24
+#: CROSS semaphores. D's shadow leg -- the rotating one-class sample,
+#: `classes=1 subset=A_log pieces=48`, moving 0.00 MiB -- took `empty` and
+#: posted `full` at 07:01:08. One second later P's shadow legs verified the
+#: SAME names, found them exactly inverted (`W78 stale=12/24: empty count=0
+#: armed=1 / full count=1 armed=0`, precisely the 12 cross names) and skipped,
+#: 6 of 6. The exchange's collect legs then waited on that consumed handshake.
+#: An observer may not be able to stop a flip; here its SAMPLE ate the flip's
+#: handshake, which is the same thing by another route.
+SHADOW_NONCE_SUFFIX = "-shadow"
+
+
+def shadow_nonce(boot_nonce: str) -> str:
+    """The observer's boot key -- never the exchange's."""
+    return f"{str(boot_nonce)}{SHADOW_NONCE_SUFFIX}"
+
+
+def all_shadow_sem_names(boot_nonce: str) -> List[str]:
+    """The observer's own 24, created and torn down with the boot's."""
+    return all_sem_names(shadow_nonce(boot_nonce))
 
 
 def all_sem_names(boot_nonce: str) -> List[str]:
