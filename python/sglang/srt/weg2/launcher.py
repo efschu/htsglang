@@ -2551,10 +2551,16 @@ def common_flags(
     max_kv_per_request: int,
     write_policy: str = "write_through",
     group: str = "both",
-    vision: str = VISION_OFF,
     random_seed: int = RANDOM_SEED,
     barlink_cap_cycles: int = BARLINK_BAR1_CAP_CYCLES,
     census_interval: int = COLLECTIVE_CENSUS_INTERVAL,
+    # #1356 [fix] KEYWORD-ONLY. Inserted positionally between `group` and
+    # `random_seed`, this shifted THREE callers at once -- argv_p:2772,
+    # argv_d:2888 and the form-key build at :10060 all pass positionally, so
+    # `random_seed` landed in `vision` and everything after it moved one place.
+    # See argv_p for the failure this produced on the normal start path.
+    *,
+    vision: str = VISION_OFF,
 ) -> List[str]:
     """Flags BOTH groups share.
 
@@ -2679,12 +2685,30 @@ def argv_p(
     m_mib: int,
     store_cfg: str,
     extra: List[str],
+    # #1356 [fix] EVERYTHING OPTIONAL IS KEYWORD-ONLY FROM HERE.
+    #
+    # 2cc618b819 inserted `vision` in the middle of this list while BOTH
+    # production callers pass positionally (:10147, the form-key build, and
+    # :10578, shipped_argv_p). SEVEN parameters shifted one place: vision got
+    # depth, depth got window_mib, window_mib got random_seed, random_seed got
+    # barlink_cap_cycles, census_interval got draft_kv_on_p, and so on.
+    #
+    # WHAT SAVED THIS BOOT WAS A TYPE ACCIDENT, not a guard: `window_mib` is
+    # the string "24,PP_0=96", so `str(int(depth))` raised and every boot died
+    # loudly. Had that value been purely numeric the launch would have SUCCEEDED
+    # with the seed, the BAR1 window and the census interval silently swapped,
+    # and the form key hashed over an argv nobody ever meant -- a wrong ring
+    # table inherited on a form that never existed. A crash was the good case.
+    #
+    # So the repair is not "move the new parameter": it is that a positional
+    # caller can no longer reach ANY optional term. Appending fixes one
+    # instance; the star fixes the class, for whoever adds the next one.
+    *,
     p_bs: int = DEFAULT_P_BS,
     max_kv_per_request: int = CONTEXT_LENGTH_TOKENS,
     stage_ratio: Optional[str] = None,
     attn_stage_ratio: Optional[str] = None,
     write_policy: str = "write_through",
-    vision: str = VISION_OFF,
     depth: int = 0,
     window_mib: str = P_BARLINK_BAR1_WINDOW_MIB,
     random_seed: int = RANDOM_SEED,
@@ -2693,6 +2717,7 @@ def argv_p(
     draft_kv_on_p: bool = True,
     admin_api_key: Optional[str] = None,
     p_max_total_tokens: Optional[int] = None,
+    vision: str = VISION_OFF,
 ) -> List[str]:
     # THE COUNT FLAGS ARE THE CONTIGUOUS FORM, AND ONLY THAT (#1240 FOLLOW FIX
     # 1). --pp-stage-ratio/--pp-attn-stage-ratio are per-stage COUNTS that
@@ -10161,13 +10186,23 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # used for BOTH the key this line prints and the argv `solve` is handed --
     # so the printed provenance IS the form that was selected on, token
     # included, and the two cannot drift.
+    # #1356 [fix] BY KEYWORD. This call and :10620 were the two that shifted
+    # when `vision` was inserted mid-signature; naming each term is what makes
+    # the next insert a no-op here instead of a silent re-binding.
     form_argv_p = xchg_form_argv(argv_p(
         py, ns.model, budgets_p, RING_FORM_SENTINEL_S_GB, RING_FORM_SENTINEL_M_MIB,
-        RING_FORM_SENTINEL_STORE_CFG, shlex.split(ns.extra_p), p_bs, max_kv_per_request,
-        stage_ratio, attn_stage_ratio, ns.p_hicache_write_policy,
-        RING_FORM_SENTINEL_DEPTH, ns.p_barlink_bar1_window_mib, ns.random_seed,
-        ns.barlink_bar1_cap_cycles, ns.collective_census_interval,
-        draft_kv_on_p, p_max_total_tokens=int(cut.pool_tokens),
+        RING_FORM_SENTINEL_STORE_CFG, shlex.split(ns.extra_p),
+        p_bs=p_bs, max_kv_per_request=max_kv_per_request,
+        stage_ratio=stage_ratio, attn_stage_ratio=attn_stage_ratio,
+        write_policy=ns.p_hicache_write_policy,
+        depth=RING_FORM_SENTINEL_DEPTH,
+        window_mib=ns.p_barlink_bar1_window_mib,
+        random_seed=ns.random_seed,
+        barlink_cap_cycles=ns.barlink_bar1_cap_cycles,
+        census_interval=ns.collective_census_interval,
+        draft_kv_on_p=draft_kv_on_p,
+        vision=ns.weg2_vision,
+        p_max_total_tokens=int(cut.pool_tokens),
     ), ns.weg2_weight_source)
     form_key, form_norm = ring_table.p_form_key(form_argv_p)
     log(
@@ -10592,7 +10627,23 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         f"Direct call: curl -s -X POST http://127.0.0.1:{PORT_D}/hicache/storage-backend/resize "
         f"-H \"Authorization: Bearer $(cat {admin_key_file})\" "
         f"-H 'Content-Type: application/json' -d '{{\"max_size_gb\": 8, \"min_free_gb\": 20}}'")
-    shipped_argv_p = argv_p(py, ns.model, budgets_p, arm.s_gb, arm.m_mib, store_cfg, shlex.split(ns.extra_p), p_bs, max_kv_per_request, stage_ratio, attn_stage_ratio, ns.p_hicache_write_policy, depth_decision.depth, ns.p_barlink_bar1_window_mib, ns.random_seed, ns.barlink_bar1_cap_cycles, ns.collective_census_interval, draft_kv_on_p, admin_api_key=admin_api_key, p_max_total_tokens=int(cut.pool_tokens))
+    # #1356 [fix] BY KEYWORD -- see :10189. This is the argv the ranks RUN, so
+    # a silent re-binding here ships a boot with a swapped seed and window.
+    shipped_argv_p = argv_p(
+        py, ns.model, budgets_p, arm.s_gb, arm.m_mib, store_cfg,
+        shlex.split(ns.extra_p),
+        p_bs=p_bs, max_kv_per_request=max_kv_per_request,
+        stage_ratio=stage_ratio, attn_stage_ratio=attn_stage_ratio,
+        write_policy=ns.p_hicache_write_policy,
+        depth=depth_decision.depth,
+        window_mib=ns.p_barlink_bar1_window_mib,
+        random_seed=ns.random_seed,
+        barlink_cap_cycles=ns.barlink_bar1_cap_cycles,
+        census_interval=ns.collective_census_interval,
+        draft_kv_on_p=draft_kv_on_p,
+        vision=ns.weg2_vision,
+        admin_api_key=admin_api_key,
+        p_max_total_tokens=int(cut.pool_tokens))
     # TRAIN FIX 5: THE SENTINEL PREMISE, PROVEN ON EVERY BOOT.  The form key that
     # gated the ring table was hashed over an argv built with sentinel ledger
     # terms, which is sound only while every flag those sentinels reach is
