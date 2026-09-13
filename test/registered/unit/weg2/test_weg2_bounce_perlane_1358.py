@@ -139,3 +139,79 @@ class TheCushionIsReservedNotOnlyPredicted(CustomTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TheLaneCountIsMeasuredAndKeyedOnTheCut(CustomTestCase):
+    """#1358 producer -- the count comes from a boot, not from a derivation.
+
+    The lane set is built at the RANK at runtime by `group_descs_by_pair` over
+    descs carrying pointers. It does not exist at the arm: the xchg census
+    carries `cards` and `waves` and no (src,dst) structure (checked), and
+    deriving it from the P-cut would be a second expression of an enumeration
+    the lane already owns -- the defect this ticket removes, not repeats.
+
+    So it is LEARNED, like Sigma H, from the boot's own HOST-SLOT lines: the
+    distinct `path=` among `event=alloc`. Measured on weg2xsn28 by the #1358
+    reader: 5 -- bounce.bin.{c0,c1,p1,p2,p4}.
+
+    KEYED ON THE CUT, NOT THE FORM KEY, and that decides xsn29: text-only
+    (#1356) moves the form key and leaves the cut alone, so this seed carries.
+    """
+
+    CUT = "39,13,12"
+
+    def test_the_xsn28_seed_is_five_and_names_its_boot(self):
+        n, prov = hl.resolve_xchg_lanes(hl.xchg_cut_key(self.CUT))
+        self.assertEqual(n, 5)
+        for token in ("WEG2-XCHG-LANES", "lanes=5", "boot=weg2xsn28",
+                      "source=measured", "bounce.bin.c0"):
+            self.assertIn(token, prov, f"the provenance omits {token}")
+
+    def test_an_unmeasured_cut_is_refused_by_name_not_defaulted(self):
+        """A guessed lane count is the 4.88 GiB under-charge with a comment."""
+        with self.assertRaises(hl.Weg2XchgLanesUnmeasured) as cm:
+            hl.resolve_xchg_lanes(hl.xchg_cut_key("40,12,12"))
+        m = str(cm.exception)
+        self.assertIn("W102", m)
+        self.assertIn("39,13,12", m, "the refusal must name the cuts it knows")
+
+    def test_the_key_is_the_cut_and_not_the_form(self):
+        """Text-only changes the form key; the cut and so the lanes are the same."""
+        self.assertEqual(hl.xchg_cut_key(self.CUT), hl.xchg_cut_key(self.CUT))
+        self.assertNotEqual(hl.xchg_cut_key(self.CUT),
+                            hl.xchg_cut_key("40,12,12"))
+        self.assertIn("pp=39,13,12", hl.xchg_cut_key(self.CUT))
+        self.assertNotIn("vision", hl.xchg_cut_key(self.CUT))
+        self.assertNotIn("multimodal", hl.xchg_cut_key(self.CUT))
+
+    def test_the_arm_reads_it_and_the_refusal_is_a_ledger_refusal(self):
+        self.assertTrue(
+            issubclass(hl.Weg2XchgLanesUnmeasured, hl.Weg2HostLedgerRefused))
+
+    def test_the_launcher_asks_for_it_rather_than_defaulting(self):
+        import inspect
+
+        from sglang.srt.weg2 import launcher as lc
+
+        src = "\n".join(ln for ln in inspect.getsource(lc).splitlines()
+                        if not ln.strip().startswith("#"))
+        self.assertIn("resolve_xchg_lanes(", src)
+        self.assertIn("xchg_cut_key(", src)
+        i = src.index("xchg_bounce_terms_for_arm(\n")
+        self.assertIn("_lane_n", src[i:i + 300],
+                      "the arm must pass the MEASURED count, not a default")
+
+    def test_the_seed_matches_what_the_reader_measures(self):
+        """THE RATCHET: the recorded number and the boot's own lines agree.
+
+        If they ever diverge, one of them is wrong and this says so here
+        instead of at the next arm.
+        """
+        rec = hl.XCHG_LANES_BY_CUT[hl.xchg_cut_key(self.CUT)]
+        self.assertEqual(int(rec["lanes"]), len(rec["paths"]),
+                         "the recorded count and the recorded paths disagree")
+        self.assertEqual(
+            sorted(rec["paths"]),
+            ["bounce.bin.c0", "bounce.bin.c1", "bounce.bin.p1",
+             "bounce.bin.p2", "bounce.bin.p4"],
+            "the seed is not weg2xsn28's measured file set")

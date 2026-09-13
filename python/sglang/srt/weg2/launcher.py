@@ -5010,7 +5010,8 @@ def xchg_bounce_arm_pins_host(weight_source: str, oncard_mode: str) -> bool:
 def xchg_bounce_terms_for_arm(weight_source: str, oncard_mode: str,
                               model_dir: str,
                               oncard_slot_mib: Optional[int] = None,
-                              bounce_depth: int = xchg_bounce.ASSEMBLE_DEPTH_DEFAULT):
+                              bounce_depth: int = xchg_bounce.ASSEMBLE_DEPTH_DEFAULT,
+                              n_lanes: int = 1):
     """``(charged_bytes, lines)`` for the host bounce. #1332 B1b.
 
     THE SECOND PRODUCER OF THE SAME PREDICATE AS
@@ -5059,7 +5060,7 @@ def xchg_bounce_terms_for_arm(weight_source: str, oncard_mode: str,
             oncard_slot_mib) * weight_exchange_region.MIB)
     terms, widest, widest_name = checkpoint_census.widest_layer_terms(
         str(model_dir), pairs=int(weight_exchange_region.N_CARDS),
-        depth=int(bounce_depth), slot_bytes=slot_bytes)
+        depth=int(bounce_depth), slot_bytes=slot_bytes, n_lanes=int(n_lanes))
     lines = [widest, xchg_bounce.arm_line(terms)]
     # PROVENANCE, ADDITIVE: the depth-slot is derived HERE, from this
     # checkpoint's census, and never from a knob -- but no line said so, and a
@@ -5149,6 +5150,12 @@ def choose_host_ledger(
     # and the published terms all price the same number. A second spelling is
     # how `2.16 GiB` came to have three causes (#1361 [23a]).
     bounce_depth: int = xchg_bounce.ASSEMBLE_DEPTH_DEFAULT,
+    # #1358: THE CUT, for the measured lane count. Not the form key -- the lane
+    # set follows from which card sends to which, and text-only (#1356) changes
+    # the form and not the cut.
+    stage_ratio: str = "",
+    d_vector: str = "tp3",
+    legs: str = "both",
 
 ) -> Tuple[host_ledger.Arm, Optional[float], List[str], Dict[str, Optional[int]]]:
     """THE LAUNCHER'S ONE LEDGER CALL SITE: read the host, price the ladder.
@@ -5223,8 +5230,18 @@ def choose_host_ledger(
     # #1332 B1b -- MEASURED BEFORE THE LEDGER IS ASKED, so the two refusals
     # (unreadable checkpoint, under-covered buffer) land before any host number
     # is priced against them.
+    # #1358 THE LANE COUNT, MEASURED AND KEYED ON THE CUT. One assemble buffer
+    # per lane, and the lane set is built at the rank at runtime -- so the arm
+    # reads the number a previous boot of THIS CUT allocated, exactly as it
+    # reads Sigma H. W102 by name when no boot of this cut has measured one;
+    # never a default, because pricing one buffer for a five-lane boot is the
+    # 4.88 GiB under-charge that latched W98 on weg2xsn28.
+    _lane_n, _lane_prov = host_ledger.resolve_xchg_lanes(
+        host_ledger.xchg_cut_key(str(stage_ratio or ""), d_vector, legs))
     _bounce_charge_bytes, _bounce_lines = xchg_bounce_terms_for_arm(
-        weight_source, oncard_mode, model_dir, oncard_slot_mib, bounce_depth)
+        weight_source, oncard_mode, model_dir, oncard_slot_mib, bounce_depth,
+        _lane_n)
+    _bounce_lines = list(_bounce_lines) + [_lane_prov]
     # #1361 [23a] THE PRICED STATE, NOT ONLY THE PRICE. B4n measured THREE
     # distinct states that all cost 2.16 GiB -- (depth=1, comparing=True),
     # (depth=2, comparing=False) and (depth=2, the OLD expression that was just
