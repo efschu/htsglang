@@ -2916,6 +2916,7 @@ def flip_ratchet_record(
     post_at: str = "",
     form_key: str = "",
     epochs: str = "begin epoch=0 -> done epoch=2",
+    cushion_min_gib: Optional[float] = None,
 ) -> Dict[str, object]:
     """One sidecar entry carrying the MEASURED ratchet of this boot's first pair.
 
@@ -2951,6 +2952,12 @@ def flip_ratchet_record(
         # The currency, IN the record, because a figure whose instrument is not
         # stored beside it is the one #1309 had to re-derive from a comment.
         "instrument": "anon+shmem+slab_unreclaimable (memory.stat), NEVER memory.current",
+        # #1377 W11: the cushion MINIMUM of this boot, so the NEXT arm can
+        # predict the latch instead of meeting it. None when the sampler was
+        # not armed -- and None is a verdict of its own ("not measurable"),
+        # never a 0 that would refuse every arm on an unsampled box.
+        "cushion_min_gib": (None if cushion_min_gib is None
+                            else float(cushion_min_gib)),
     }
 
 
@@ -4485,6 +4492,25 @@ def read_measured_record(
         if g not in out or str(e.get("at", "")) >= str(out[g].get("at", "")):
             out[g] = e
     return out
+
+
+#: #1377 W11: where the v3 sampler's CSV is, published by whoever ARMS the
+#: sampler (the arm script), read by whoever writes the record. ONE name, so
+#: the path convention `<evidence>/<tag>_<date>/hostsample_<tag>.csv` is never
+#: re-derived in a second place -- re-deriving it is how a reader and a writer
+#: come to disagree about which boot they are describing.
+ENV_HOSTSAMPLE_CSV = "WEG2_HOSTSAMPLE_CSV"
+
+
+def cushion_min_of_this_boot() -> Optional[float]:
+    """This boot's cushion minimum, or None when the sampler was not armed.
+
+    None is a first-class answer: a boot without the sampler has no cushion
+    measurement, and the arm must say "not measurable" rather than fund on an
+    invented one or refuse on a zero.
+    """
+    path = os.environ.get(ENV_HOSTSAMPLE_CSV, "")
+    return cushion_min_from_sampler(path) if path else None
 
 
 def cushion_min_from_sampler(csv_path: str) -> Optional[float]:

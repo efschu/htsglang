@@ -4058,7 +4058,10 @@ class Front:
         self._flip_ratchet_written = True
         post = host_ledger.read_flip_currency_gib()
         at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        # #1377 W11: the cushion minimum rides with the ratchet, from the
+        # ONE producer, so the next boot's arm can predict W98.
         rec = host_ledger.flip_ratchet_record(
+            cushion_min_gib=host_ledger.cushion_min_of_this_boot(),
             pre_gib=self._flip_ratchet_pre_gib,
             post_gib=post,
             boot_tag=self.tag,
