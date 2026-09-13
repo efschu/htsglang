@@ -2411,8 +2411,63 @@ def run_origin_gib(
     # mid-flip sample is after.  The rejected figure is PRINTED, never dropped.
     _rejected: List[str] = []
     _repriced = []
+    # #1361 [22-fix5]: the LOWEST kill counter this record has seen PER BOOT --
+    # the closest thing to that boot's baseline that the sidecar actually
+    # holds. A sample whose own counter is ABOVE it was taken after something
+    # in this cgroup was killed. MIN and not max: taking the max compares a
+    # sample against itself and can never fire, which is how the first draft of
+    # this guard passed its own unit test while proving nothing.
+    _oom_floor: Dict[str, int] = {}
+    for _g2, _e2 in (record or {}).items():
+        if isinstance(_e2, dict) and _e2.get("cg_oom_kill") is not None:
+            _bt = str(_e2.get("boot_tag", "?"))
+            _v2 = int(_e2["cg_oom_kill"])
+            _oom_floor[_bt] = min(_oom_floor.get(_bt, _v2), _v2)
     for g, e in (record or {}).items():
         if not isinstance(e, dict) or e.get("run_residual_gib") is None:
+            continue
+        # #1361 [22-fix5] THE DEATH-SAMPLE FILTER, and the evidence it reads was
+        # ALREADY IN EVERY RECORD -- it just had no consumer.
+        #
+        # Boot weg2xsn25 wrote `run_residual_gib=34.61` at 07:03:59Z, three
+        # minutes into its own OOM cascade, with `load_class=idle` and
+        # **`pids=[]`, `pids_asked=[]`**. The load class was TRUE and
+        # meaningless: a box with no live ranks has no queue, so it measures
+        # `idle`. What the sample actually measured is whatever else was on the
+        # host, and the ledger then carried it as this line's run-moment floor:
+        # every arm gained +28 GiB and the next boot could not be priced at all
+        # (measured on three independent trees, 95.22 -> 123.23 GiB on one of
+        # them with no code change in between).
+        #
+        # A residual is a statement about THIS LINE's processes. With none of
+        # them alive there is nothing for it to be a statement about, so it is
+        # refused BY NAME rather than quietly outvoted -- the #1350b Sigma H
+        # guard and the #1350e flip filter, for the third number.
+        _alive = len(e.get("pids") or [])
+        _asked = len(e.get("pids_asked") or [])
+        _death = ""
+        if _alive == 0:
+            _death = (
+                f"{float(e['run_residual_gib']):.2f} (boot "
+                f"{e.get('boot_tag', '?')}, group {g}, at {e.get('at', '?')}) "
+                f"DEATH-SAMPLE: NO live rank (pids=0 of {_asked} asked), so "
+                f"load_class={e.get('load_class', '?')} is true and empty -- a "
+                f"box with no ranks has no queue. A run-moment residual is a "
+                f"statement about THIS line's processes and there were none"
+            )
+        else:
+            _bt = str(e.get("boot_tag", "?"))
+            _own = e.get("cg_oom_kill")
+            if _own is not None and int(_own) > _oom_floor.get(_bt, int(_own)):
+                _death = (
+                    f"{float(e['run_residual_gib']):.2f} (boot {_bt}, group {g}, "
+                    f"at {e.get('at', '?')}) DEATH-SAMPLE: the cgroup kill "
+                    f"counter had risen to {int(_own)} by this sample, above "
+                    f"this boot's earlier {_oom_floor.get(_bt)} -- something in "
+                    f"this cgroup was killed before the reading was taken"
+                )
+        if _death and cg_nonreclaim_gib is not None:
+            _rejected.append(_death)
             continue
         _ep = e.get("sampled_at_flip_epoch")
         _mid = int(_ep) >= 1 if _ep is not None else bool(e.get("interleaved"))
@@ -2510,8 +2565,10 @@ def run_origin_gib(
         )
     _rej = (
         " -- run-moment sample(s) " + ", ".join(_rejected)
-        + " REJECTED: interleaved, i.e. measured DURING a flip, so they already "
-        "contain the permanent step `flip_ratchet_gib` charges separately (#1350e)"
+        + " REJECTED. An entry marked DEATH-SAMPLE was measured while this "
+        "line was not alive (#1361 [22-fix5]); the others are interleaved, "
+        "i.e. measured DURING a flip, so they already contain the permanent "
+        "step `flip_ratchet_gib` charges separately (#1350e)"
         if _rejected else ""
     )
     if cg_nonreclaim_gib >= floor:
@@ -3796,6 +3853,30 @@ def rss_shmem_bytes(pids: Iterable[int]) -> Tuple[int, List[int]]:
     return total, seen
 
 
+def _cg_oom_kill_now() -> Optional[int]:
+    """``memory.events oom_kill`` for this cgroup, or ``None`` if unreadable.
+
+    #1361 [22-fix5]. THROUGH :func:`read_cgroup`, not through a second open()
+    of the same file: the PRIOR-ART GATE on this symbol found that the launcher
+    already reads this counter (`cg["oom_kill"]` -> `choose(cg_oom_kill=...)`,
+    printed as `oom_kill_baseline=` on the TERMS line). That reader is the
+    incumbent and this is a different MOMENT, not a different quantity -- the
+    launcher takes the pre-boot baseline, this takes the value at each group's
+    sleep, and the front writes D's sample in another process entirely, where
+    the launcher's baseline does not exist. Same file, same parse, one
+    implementation; a second regex over /sys would be the second bookkeeping
+    this fork keeps paying for.
+
+    ``None`` is an UNREADABLE counter and never a zero: a sample that could not
+    read it carries no evidence either way, and the reader treats it as "not
+    shown to be healthy", not as "shown to be fine".
+    """
+    try:
+        return read_cgroup().get("oom_kill")
+    except Exception:  # noqa: BLE001 - a sample must never fail to be written
+        return None
+
+
 def dormant_image_sample(
     *,
     group: str,
@@ -3981,6 +4062,13 @@ def dormant_image_sample(
         "extra_gib": rss_gib - weight_tags_gib,
         "pids": seen,
         "pids_asked": [int(p) for p in pids],
+        # #1361 [22-fix5]: THE KILL COUNTER AT THE SAMPLING MOMENT, read here
+        # rather than passed in, so no caller has to be taught and no sample can
+        # be written without it. Absolute, not a delta: the sidecar is
+        # append-only, so a reader compares this boot's successive samples and
+        # sees a kill that happened BETWEEN them. A delta against a baseline the
+        # record does not carry would be a number nobody can check.
+        "cg_oom_kill": _cg_oom_kill_now(),
         "interleaved": bool(interleaved),
         "cg_current_bytes": cg_current_bytes,
         "arm": arm,
