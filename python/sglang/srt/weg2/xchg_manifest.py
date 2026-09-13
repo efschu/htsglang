@@ -407,6 +407,16 @@ class JoinedTensor:
     #: by design -- `ParamGeom.content_units` and `_emit`'s pad branch already
     #: own that, so this is DECLARED here and clipped nowhere.
     pad_units: int = 0
+    #: #1384: for a MIXED_FUSED tensor, the RESOLVED per-component
+    #: ``(axis, whole_rows)`` pairs -- straight off ``_mixed_fused_axis``'s
+    #: own resolution, never recomputed. ``()`` for every one of the five
+    #: ordinary classes.
+    component_axes: Tuple[int, ...] = ()
+    component_whole_rows: Tuple[int, ...] = ()
+    #: #1384: ``component_rank_rows[i][r]`` is TP rank ``r``'s declared row
+    #: count of component ``i`` -- ``cut``'s own ``component_rows``, read off
+    #: by the join and carried through untouched.
+    component_rank_rows: Tuple[Tuple[int, ...], ...] = ()
 
     @property
     def sharded(self) -> bool:
@@ -447,8 +457,26 @@ class JoinedTensor:
             stage=int(self.pp_stage),
             pad_units=int(self.pad_units),
             family=(None if not self.sharded else str(self.param_name)),
+            # `dst_widths` is the ORDINARY seeded-ROWS mechanism and does not
+            # apply to MIXED_FUSED: `_blocks_of`'s MIXED_FUSED branch never
+            # reads it, and the OUTER per-rank totals in `tp_widths` do not
+            # sum to `rows_full` for this axis by construction (they double-
+            # count the replicated components) -- `validate()`'s ordinary
+            # dst_widths check would refuse a perfectly good MIXED_FUSED geom
+            # on that mismatch alone.
             dst_widths=(tuple(int(w) for w in self.tp_widths)
-                        if (self.sharded and tp_is_dst) else None),
+                        if (self.sharded and tp_is_dst
+                            and self.shard_axis != wx.MIXED_FUSED) else None),
+            # #1384: MIXED_FUSED needs its declared components on the geom
+            # regardless of `tp_is_dst` -- `_blocks_of` is called once per
+            # SIDE (source and destination) for the same geom, and the TP
+            # group can be either side depending on direction.
+            component_rows=(self.component_whole_rows
+                            if self.shard_axis == wx.MIXED_FUSED else ()),
+            component_axes=(self.component_axes
+                            if self.shard_axis == wx.MIXED_FUSED else ()),
+            component_rank_rows=(self.component_rank_rows
+                                 if self.shard_axis == wx.MIXED_FUSED else ()),
         )
         geom.validate()
         return geom
@@ -524,8 +552,13 @@ def _pad_vocab_size(n: int) -> int:
 
 def _mixed_fused_axis(
     whole: ManifestPiece, cut: Sequence[ManifestPiece],
-) -> Optional[Tuple[Tuple[int, int], ...]]:
-    """Per-component ``(axis, rows_full)`` for a DECLARED mixed-fused tensor.
+) -> Optional[Tuple[Tuple[int, int, Tuple[int, ...]], ...]]:
+    """Per-component ``(axis, rows_full, per_rank_rows)`` for a declared
+    mixed-fused tensor.  ``per_rank_rows`` is ``cut``'s OWN declared values
+    for that component, in ``cut``'s order -- read, not recomputed; #1384's
+    ``JoinedTensor``/``ParamGeom`` carry it onward so the actual byte
+    copy/compare (``weight_exchange.mixed_fused_blocks``) never has to
+    re-derive a boundary either.
 
     ``None`` means "this is not (provably) a mixed-fused tensor" -- the
     caller's ``_axis_of`` then falls through to the ordinary W68 refusal, the
@@ -564,16 +597,16 @@ def _mixed_fused_axis(
             return None
         cut_comp.append(c)
 
-    axes: List[Tuple[int, int]] = []
+    axes: List[Tuple[int, int, Tuple[int, ...]]] = []
     for i, w_i in enumerate(w_comp):
-        rows_i = [c[i] for c in cut_comp]
+        rows_i = tuple(c[i] for c in cut_comp)
         if len(set(rows_i)) == 1 and rows_i[0] == w_i:
-            axes.append((wx.REPLICATED, w_i))
+            axes.append((wx.REPLICATED, w_i, rows_i))
         elif sum(rows_i) == w_i:
-            axes.append((wx.ROWS, w_i))
+            axes.append((wx.ROWS, w_i, rows_i))
         else:
             return None
-    if len({a for a, _ in axes}) < 2:
+    if len({a for a, _, _ in axes}) < 2:
         return None
     return tuple(axes)
 
@@ -857,6 +890,24 @@ def join_manifests(
                 f"name both."
             )
         axis, rows_full, cols_full, widths, pad = _axis_of(name, whole, rows)
+        # #1384: the SAME pure function _axis_of already ran once to decide
+        # MIXED_FUSED at all -- called again here for its full per-component
+        # breakdown rather than threading a 6th return value through
+        # _axis_of's tuple (which every existing caller unpacks positionally).
+        # Not a second derivation: same inputs, same deterministic function.
+        comp_axes: Tuple[int, ...] = ()
+        comp_whole: Tuple[int, ...] = ()
+        comp_rank: Tuple[Tuple[int, ...], ...] = ()
+        if axis == wx.MIXED_FUSED:
+            comps = _mixed_fused_axis(whole, rows)
+            assert comps is not None, (
+                "W68 internal: _axis_of returned MIXED_FUSED but "
+                "_mixed_fused_axis(whole, rows) returned None on the same "
+                "inputs -- the two must agree, this is not a user-facing "
+                "refusal")
+            comp_axes = tuple(a for a, _w, _r in comps)
+            comp_whole = tuple(w for _a, w, _r in comps)
+            comp_rank = tuple(r for _a, _w, r in comps)
         tensors.append(
             JoinedTensor(
                 param_name=name,
@@ -870,6 +921,9 @@ def join_manifests(
                 tp_widths=widths,
                 pp_card=int(pp_card_by_rank.get(stage, stage)),
                 pad_units=int(pad),
+                component_axes=comp_axes,
+                component_whole_rows=comp_whole,
+                component_rank_rows=comp_rank,
             )
         )
 

@@ -472,6 +472,63 @@ def device_block_offsets(
     return out
 
 
+def mixed_fused_blocks(
+    component_axes: Sequence[int],
+    component_rows: Sequence[int],
+    component_rank_rows: Sequence[Sequence[int]],
+    tp_size: int,
+) -> List[List[Block]]:
+    """Per TP rank, the blocks of a MIXED_FUSED fused parameter (#1384).
+
+    THE SAME DEVICE LAW AS :func:`device_block_offsets` -- ``dev_row`` is the
+    prefix sum of THIS RANK's own per-component sizes, ``global_start`` the
+    prefix sum of the FULL (declared whole) sizes plus this rank's position
+    within the component -- except each component picks its OWN law instead
+    of one ratio vector shared by all of them:
+
+    * ``REPLICATED``: every rank's block starts at the component's own
+      ``global_start`` (position 0 within the component) and spans the WHOLE
+      declared size -- there is no rank-vector to consult, by definition.
+    * ``ROWS``: the component's declared per-rank vector
+      (``component_rank_rows[i]``) IS the ratio-split, already decided by
+      whichever authority produced it (``attn_q_partition_units`` /
+      ``tp_partition_size`` at load time, folded into the manifest by the
+      join) -- this function only prefix-sums it, exactly as
+      ``device_block_offsets`` prefix-sums ``shard_offsets``' output.
+
+    NOTHING HERE RE-DERIVES A BOUNDARY.  Every size comes from
+    ``component_rows``/``component_rank_rows``, which ``ParamGeom.validate()``
+    has already required to be self-consistent (sums match) before this ever
+    runs.
+    """
+    full_prefix, acc = [], 0
+    for w in component_rows:
+        full_prefix.append(acc)
+        acc += int(w)
+    out: List[List[Block]] = []
+    for rank in range(tp_size):
+        blocks, dev_row = [], 0
+        for b, axis in enumerate(component_axes):
+            whole = int(component_rows[b])
+            if axis == REPLICATED:
+                start, size = 0, whole
+            else:
+                rank_sizes = [int(r) for r in component_rank_rows[b]]
+                start = sum(rank_sizes[:rank])
+                size = rank_sizes[rank]
+            blocks.append(
+                Block(
+                    block=b,
+                    global_start=full_prefix[b] + start,
+                    dev_row=dev_row,
+                    size=size,
+                )
+            )
+            dev_row += size
+        out.append(blocks)
+    return out
+
+
 # ---------------------------------------------------------------------------
 # The inputs: one side's layout, one parameter's geometry.
 # ---------------------------------------------------------------------------
@@ -668,11 +725,26 @@ class ParamGeom:
     #: (``linear.py`` ``q_proj_shard_size``/``kv_proj_shard_size``/
     #: ``v_proj_shard_size``) -- never re-derived here. ``()`` (default) means
     #: "no declared sub-split", which is every parameter this field did not
-    #: exist for before #1384 and is untouched by it. Not consumed by
-    #: ``validate()``/the copy path; it exists only so the manifest join
-    #: (``xchg_manifest._axis_of``) can classify a MIXED_FUSED tensor by
-    #: component instead of guessing from the outer row count alone.
+    #: exist for before #1384 and is untouched by it. Consumed by
+    #: ``validate()`` (self-consistency only) and by ``_blocks_of``'s
+    #: MIXED_FUSED branch, which lays out one ``Block`` per component from
+    #: these sizes and nothing else.
     component_rows: Tuple[int, ...] = ()
+    #: #1384: the RESOLVED axis of each declared component, in the SAME order
+    #: as ``component_rows`` -- ``ROWS`` (ratio-split across TP) or
+    #: ``REPLICATED`` (identical on every rank), never ``MIXED_FUSED`` itself
+    #: (a component cannot itself be mixed; that is what makes the recursion
+    #: bottom out). Read off ``xchg_manifest._mixed_fused_axis``'s own
+    #: resolution -- never re-decided here.
+    component_axes: Tuple[int, ...] = ()
+    #: #1384: for a MIXED_FUSED geom, ``component_rank_rows[i][r]`` is TP rank
+    #: ``r``'s row count of component ``i`` -- the per-rank vector
+    #: ``_blocks_of`` needs to lay out a ROWS component's blocks (a REPLICATED
+    #: component ignores this and uses ``component_rows[i]`` on every rank).
+    #: DECLARED, straight off each rank's own manifest piece
+    #: (``ManifestPiece.component_rows``) as gathered by the join -- never
+    #: recomputed from ``component_rows``/``dst_widths``/anything else.
+    component_rank_rows: Tuple[Tuple[int, ...], ...] = ()
 
     def replace(self, **kw) -> ParamGeom:
         return _dc_replace(self, **kw)
@@ -695,11 +767,71 @@ class ParamGeom:
                 f"({self.rows_full}, {self.cols_full}) itemsize "
                 f"{self.itemsize} do not describe a tensor."
             )
-        if self.shard_axis not in (ROWS, COLS, REPLICATED):
+        if self.shard_axis not in (ROWS, COLS, REPLICATED, MIXED_FUSED):
             raise Weg2XchgPlanDisagree(
                 f"W68 Weg2XchgPlanDisagree: {self.name}: shard axis "
-                f"{self.shard_axis} is neither ROWS, COLS nor REPLICATED."
+                f"{self.shard_axis} is neither ROWS, COLS, REPLICATED nor "
+                f"MIXED_FUSED."
             )
+        if self.shard_axis == MIXED_FUSED:
+            # #1384: MIXED_FUSED validates ONLY once the declared components
+            # are self-consistent -- "the compare path really carries" means
+            # exactly this, nothing more speculative. This is the gate that
+            # keeps the axis from being accepted before `_blocks_of` can lay
+            # it out correctly: a MIXED_FUSED geom with no (or a broken)
+            # declaration would otherwise fall through to `_blocks_of`'s
+            # MIXED_FUSED branch and either KeyError or -- worse -- silently
+            # treat garbage as a valid block list.
+            if not self.component_rows:
+                raise Weg2XchgPlanDisagree(
+                    f"W68 Weg2XchgPlanDisagree: {self.name}: shard_axis "
+                    f"MIXED_FUSED with no declared component_rows. The "
+                    f"compare has no boundaries to pair components on, so "
+                    f"this refuses rather than treating the whole tensor as "
+                    f"one guessed block."
+                )
+            if sum(int(c) for c in self.component_rows) != int(self.rows_full):
+                raise Weg2XchgPlanDisagree(
+                    f"W68 Weg2XchgPlanDisagree: {self.name}: declared "
+                    f"components {list(self.component_rows)} sum to "
+                    f"{sum(int(c) for c in self.component_rows)}, not to "
+                    f"rows_full {self.rows_full}. A component declaration "
+                    f"that disagrees with its own tensor's row count is "
+                    f"treated exactly like no declaration at all -- never "
+                    f"as licence to guess."
+                )
+            if len(self.component_axes) != len(self.component_rows):
+                raise Weg2XchgPlanDisagree(
+                    f"W68 Weg2XchgPlanDisagree: {self.name}: "
+                    f"{len(self.component_rows)} declared component rows "
+                    f"but {len(self.component_axes)} resolved component "
+                    f"axes -- one axis per component is required to lay out "
+                    f"its blocks."
+                )
+            for i, a in enumerate(self.component_axes):
+                if a not in (ROWS, REPLICATED):
+                    raise Weg2XchgPlanDisagree(
+                        f"W68 Weg2XchgPlanDisagree: {self.name}: component "
+                        f"{i} carries axis {a}, which is neither ROWS nor "
+                        f"REPLICATED. A component cannot itself be "
+                        f"MIXED_FUSED or COLS in this V1 scope."
+                    )
+                if a == ROWS and (
+                    not self.component_rank_rows
+                    or len(self.component_rank_rows) <= i
+                    or sum(int(r) for r in self.component_rank_rows[i])
+                    != int(self.component_rows[i])
+                ):
+                    raise Weg2XchgPlanDisagree(
+                        f"W68 Weg2XchgPlanDisagree: {self.name}: component "
+                        f"{i} is ROWS but its declared per-rank rows "
+                        f"{list(self.component_rank_rows[i]) if self.component_rank_rows and len(self.component_rank_rows) > i else None} "
+                        f"do not sum to the component's own "
+                        f"{self.component_rows[i]} rows. A ROWS component "
+                        f"needs a per-rank vector to lay out its blocks; a "
+                        f"self-inconsistent one is refused rather than "
+                        f"guessed."
+                    )
         if self.blocks:
             if self.shard_axis != ROWS:
                 raise Weg2XchgPlanDisagree(
@@ -1574,7 +1706,15 @@ def _blocks_of(geom: ParamGeom, layout: GroupLayout, is_dst: bool) -> List[List[
         holders = (
             list(range(layout.n_ranks)) if geom.stage is None else [int(geom.stage)]
         )
-        sizes = list(geom.blocks) if geom.blocks else [geom.content_units]
+        # #1384: a MIXED_FUSED whole-holder's blocks are its DECLARED
+        # components, in order -- never `geom.blocks` (a different, uniform-
+        # axis mechanism) and never one monolithic block, because the
+        # TP-side blocks below are ALSO per-component and `_emit`'s
+        # intersection matches source and destination by `block` index.
+        if geom.shard_axis == MIXED_FUSED:
+            sizes = list(geom.component_rows)
+        else:
+            sizes = list(geom.blocks) if geom.blocks else [geom.content_units]
         full, acc = [], 0
         for b, sz in enumerate(sizes):
             full.append(Block(block=b, global_start=acc, dev_row=acc, size=int(sz)))
@@ -1586,6 +1726,15 @@ def _blocks_of(geom: ParamGeom, layout: GroupLayout, is_dst: bool) -> List[List[
             f"{layout.tp_size} over {layout.n_ranks} ranks. The V1 scope is "
             f"pure TP (tp_size == ranks) or the PP form (tp_size == 1); a mixed "
             f"form is refused rather than guessed."
+        )
+    if geom.shard_axis == MIXED_FUSED:
+        # #1384: laid out ONCE, the same block list serves this geom as
+        # either side (source under `tp_to_pp`, destination under
+        # `pp_to_tp`) -- `is_dst` does not change which bytes a TP rank
+        # holds, only which role `_emit` gives it.
+        return mixed_fused_blocks(
+            geom.component_axes, geom.component_rows,
+            geom.component_rank_rows, layout.tp_size,
         )
     if geom.shard_axis == REPLICATED:
         total = geom.content_units

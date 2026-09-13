@@ -400,15 +400,21 @@ def test_old_manifests_without_the_field_default_to_no_declared_split():
     assert back.component_rows == ()
 
 
-def test_paramgeom_refuses_mixed_fused_axis_at_consumption():
-    """The not-yet-wired byte-copy path fails LOUD, never silently wrong:
-    MIXED_FUSED is deliberately not a valid ``ParamGeom.shard_axis``."""
+def test_paramgeom_refuses_an_undeclared_mixed_fused_axis_at_consumption():
+    """UPDATED by the #1384 follow-up (see
+    ``test_weg2_axisof_mixed_qkv_compare_1384.py``): the per-component byte
+    copy for MIXED_FUSED is now wired, so ``MIXED_FUSED`` IS a valid
+    ``ParamGeom.shard_axis`` -- but only once it carries a real, self-
+    consistent component declaration. A geom that names the axis without
+    declaring any components still fails LOUD instead of silently treating
+    the whole tensor as one guessed block -- the property this test always
+    asserted, now expressed against the sharper refusal."""
     geom = wx.ParamGeom(name=QKV_NAME, tag="weights_0",
                         shard_axis=wx.MIXED_FUSED,
                         rows_full=5120, cols_full=HIDDEN, itemsize=2)
     with pytest.raises(wx.Weg2XchgPlanDisagree) as exc:
         geom.validate()
-    assert "neither ROWS, COLS nor REPLICATED" in str(exc.value)
+    assert "no declared component_rows" in str(exc.value)
 
 
 # ---------------------------------------------------------------------------
