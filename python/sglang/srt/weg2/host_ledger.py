@@ -760,6 +760,35 @@ def split_by_baseline(
     )
 
 
+def cushion_floor_reserve_gib(bounce_total_gib: float) -> float:
+    """#1358: the cushion the arm must LEAVE, not merely predict.
+
+    THE MEASUREMENT: boot weg2xsn28 armed at run_peak 86.79 against reap 95.90
+    -- 9.11 GiB of room, no W97, the first xsn2x arm that funded itself -- and
+    then latched W98 NINE SECONDS after `state=serving`, before any flip, with
+    cushion 0.99 against the floor 1.50. It was short 0.51 GiB.
+
+    The bytes it was short of were on the box already: five assemble buffers,
+    7.044 GiB of tmpfs, of which the arm had charged 2.16. An arm cannot lose
+    at the run moment what it never counted at the launch moment, so the
+    correction is TWO-SIDED and this is the second side:
+
+      * `BounceTerms.total_bytes` now charges per lane, so the peak is honest;
+      * and the cushion floor becomes a RESERVED TERM, so the arm may not
+        spend the page cache the latch is going to demand back.
+
+    THE FLOOR IS IMPORTED, NEVER RESTATED: `RATE_LATCH_CUSHION_FLOOR_GIB` is
+    the same 1.50 the [21b] guard reads at runtime. Two spellings of one
+    threshold is how an arm funds a boot the guard then tears down -- the
+    #1361 [23a] lesson (one number, three causes) in the other direction.
+
+    The bounce is named as the argument rather than read here, because WHICH
+    allocations sit in shmem at serving time is the caller's knowledge and this
+    function must stay a pure floor.
+    """
+    return float(RATE_LATCH_CUSHION_FLOOR_GIB) + max(0.0, float(bounce_total_gib))
+
+
 def refuse_sleep_leg_deficit(
     cushion_gib: Optional[float],
     need_gib: Optional[float],
