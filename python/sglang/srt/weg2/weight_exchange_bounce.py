@@ -442,6 +442,57 @@ def bounce_path(boot_nonce: str, shm_root: str = xr.SHM_ROOT,
     return base if not lane else f"{base}.{lane}"
 
 
+def unlink_lane_buffer(boot_nonce: str, shm_root: str, lane: str) -> bool:
+    """Free THIS lane's file -- #1385 step 3, boot weg2xsn31/6's own finding.
+
+    ``LayerBounce.close()`` DELIBERATELY NEVER UNLINKS (this module's own
+    docstring: cross-process store-and-forward needs the file to outlive
+    either side's own ``close()``, since the depositor may finish and exit
+    well before the collector even opens its mmap). That is correct and
+    stays correct here -- but it also means a lane whose file is never
+    explicitly removed keeps its tmpfs pages committed for the REST OF THE
+    BOOT regardless of any concurrency cap, because nothing else unlinks a
+    ``bounce.bin.<lane>`` file before full boot teardown
+    (``weight_exchange_region.teardown_region``).
+
+    THE GAP THIS CLOSES, MEASURED: on boot weg2xsn31/6, ``--xchg-lanes-
+    concurrent 1`` correctly serialised PINNING -- never more than one
+    ``LayerBounce`` being actively registered at a time (the #1385 step 2
+    permit worked exactly as built) -- while the FILESYSTEM still showed
+    FOUR lanes' files (``c0+p1+p2+p4``, 12.00 GiB against a promised
+    3.00 GiB) coexisting, because the first three were each fully deposited
+    AND collected, released their permit correctly, and then simply never
+    went away. A concurrency cap that limits how many buffers may be PINNED
+    at once is not the same claim as a cap on how many ACCUMULATE unfreed
+    over a flip; by the time every lane has been touched once, the two
+    converge to the SAME uncapped total regardless of the cap. This is the
+    THIRD instance of "a number is priced, a different one is really held"
+    on this one flag (#1358's per-lane undercount, #1385 step 1's slot-size/
+    slot-count mismatch, and now this).
+
+    CALLED ONLY AFTER THE COLLECTOR HAS POSTED ``drained`` FOR THIS TAG --
+    the SAME moment that already tells the depositor it may reuse the
+    buffer for the next tag (``CrossSlotRendezvous.wait_drained``). Unlinking
+    any earlier would destroy bytes a collector on the other side of a real
+    cross-process boot might not have read yet; unlinking here is safe
+    because both this rank's own fd (closed inside ``run_bounce_leg``'s
+    ``finally``, before this function is ever reached) and the depositor's
+    fd (closed at the end of ITS OWN, earlier, ``run_bounce_leg`` call) are
+    already closed by construction, so the kernel frees the pages the
+    instant this call removes the last directory entry.
+
+    Idempotent: an absent file is not an error -- the diagonal's other rank,
+    or a retry, may already have removed it, and this function's caller
+    (a single tag's single lane) has no way to tell those two cases apart
+    from here, nor does it need to.
+    """
+    try:
+        os.unlink(bounce_path(boot_nonce, shm_root, lane))
+        return True
+    except FileNotFoundError:
+        return False
+
+
 # ---------------------------------------------------------------------------
 # #1358 -- THE HOST-SLOT EMITTER, IN THE PRODUCTION PATH.
 # ---------------------------------------------------------------------------
