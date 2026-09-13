@@ -4827,6 +4827,23 @@ def choose(
         # already condemned.
         # #1269: against the HARD BOUND (watermark - margin), not the raw mark.
         peak_ok = predicted is None or predicted <= hard_bound_gib
+        # #1377 (a) W11: THE CUSHION FLOOR IS AN ARM TERM, not a runtime-only
+        # threshold. Boot weg2xsn31/3 funded an arm at predicted 90.66 against
+        # a 94.43 bound and then latched W98 SIX SECONDS after the front's
+        # argv, inside D's startup sleep leg: `cushion=0.20 < 1.50 now=92.40
+        # shmem=67.51`, state=STOP at epoch=0. The latch was PREDICTABLE at
+        # launch and nothing predicted it, because two floors were kept in two
+        # places: this ladder bounded the peak, and `RATE_LATCH_CUSHION_FLOOR_GIB`
+        # bounded the cushion at RUNTIME, with no arithmetic joining them.
+        #
+        # ONE AUTHORITY: the runtime floor is IMPORTED here, never restated, so
+        # an arm that leaves less than the latch demands is refused BY NAME at
+        # the ARM with both numbers on the line -- instead of being funded and
+        # then stopped by its own watchdog before the first flip.
+        cushion_ok = (
+            predicted is None
+            or predicted + RATE_LATCH_CUSHION_FLOOR_GIB <= hard_bound_gib
+        )
         binding: List[str] = []
         if arm.launch_leftover_gib < 0:
             binding.append(f"launch moment ({arm.launch_leftover_gib:.2f} GiB)")
@@ -4838,7 +4855,23 @@ def choose(
                 f"= {watermark_gib:.2f} reap point - {margin.total_gib:.2f} margin "
                 f"[{margin.terms()}])"
             )
-        ok = moments_ok and peak_ok
+        if peak_ok and not cushion_ok:
+            # Named separately from the peak: an arm that fits the bound but
+            # not the bound MINUS the latch's own floor is a different verdict
+            # with a different remedy, and folding the two would hide which one
+            # bound this arm.
+            binding.append(
+                f"CUSHION FLOOR ({predicted:.2f} + "
+                f"{RATE_LATCH_CUSHION_FLOOR_GIB:.2f} floor = "
+                f"{predicted + RATE_LATCH_CUSHION_FLOOR_GIB:.2f} > "
+                f"{hard_bound_gib:.2f} GiB hard bound -- the arm fits the bound "
+                f"and leaves less than W98 Weg2HostRateLatched demands, so the "
+                f"latch fires on this boot before its first flip. Measured on "
+                f"weg2xsn31/3: funded at 90.66, latched `cushion=0.20 < 1.50` "
+                f"six seconds after the front's argv, inside D's startup sleep "
+                f"leg, state=STOP at epoch=0)"
+            )
+        ok = moments_ok and peak_ok and cushion_ok
         # #1360: the deviation converts THIS verdict, after it has been computed
         # in full. `binding` is left exactly as it was so the DEVIATION line and
         # the refusal it replaces name the same terms.

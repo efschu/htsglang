@@ -103,3 +103,66 @@ class TheManagerCanBeBuiltAndItsLockstepStateLands(CustomTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TheRecordRowsComeFromTheSameTermsAsTheBands(CustomTestCase):
+    """#1377 (c) W11 -- boot weg2xsn31/3, 17:01:47Z, all three D ranks:
+
+        W68 Weg2XchgPlanDisagree: band 2 has no row -- this lane's record was
+        built for 2 band(s) per pair
+
+    raised by our OWN `_row` guard (weight_exchange_bounce.py:1646) out of
+    release_memory_occupation, four seconds before the W98. The coupling was
+    verified, not assumed: `run_bounce_leg` takes its slot count from
+    `terms.lane_slots` -- 24 under #1374's Option 1 sizing -- while
+    `weight_updater.py:3563` built the record with the DEFAULT `rows_per_pair`
+    = `SLOTS_PER_PAIR` = 2. Two numbers for one geometry, mine: F1a made `_row`
+    REFUSE instead of fold (which is why this surfaced by name instead of
+    aliasing band 2 onto band 0), and F1b raised the leg's slots without
+    wiring the record to the same source.
+    """
+
+    #: xsn31/3's own geometry, from its ARM and LANES lines.
+    XSN31_3 = dict(bytes_per_direction=24759613440, n_layers=64,
+                   widest_layer_bytes=756323776, pairs=3, depth=1,
+                   slot_bytes=134217728, n_lanes=5,
+                   max_tag_bytes=2907 * (1 << 20))
+
+    def _terms(self):
+        from sglang.srt.weg2 import xchg_bounce as xb
+
+        return xb.bounce_terms(**self.XSN31_3)
+
+    def test_the_geometry_that_died_is_24_bands_against_2_rows(self):
+        self.assertEqual(self._terms().lane_slots, 24)
+
+    def test_a_record_built_from_the_terms_holds_every_band(self):
+        import tempfile
+
+        from sglang.srt.weg2 import weight_exchange_region as xr
+        from sglang.srt.weg2.weight_exchange_bounce import BounceSlots
+
+        n = self._terms().lane_slots
+        root = tempfile.mkdtemp(prefix="weg2-1377-")
+        try:
+            os.makedirs(xr.region_dir("probe1377", root), exist_ok=True)
+            rec = BounceSlots("probe1377", shm_root=root, create=True,
+                              rows_per_pair=n)
+            for band in range(n):
+                rec.publish(slot=band, seq=band, nbytes=band + 1, pair=0)
+            for band in range(n):
+                self.assertEqual(rec.read(slot=band, pair=0),
+                                 (band, band + 1),
+                                 f"band {band} aliased onto another row")
+        finally:
+            import shutil
+
+            shutil.rmtree(root, ignore_errors=True)
+
+    def test_the_callsite_takes_the_row_count_from_the_terms(self):
+        """The fix is the WIRING, and a default here is what the boot died of."""
+        import inspect
+
+        src = inspect.getsource(wu)
+        self.assertIn("rows_per_pair=_rows_per_pair", src)
+        self.assertIn("int(terms.lane_slots) if terms is not None", src)

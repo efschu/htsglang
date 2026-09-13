@@ -3560,7 +3560,28 @@ class SchedulerWeightUpdaterManager:
         # mapped by both ends. NOT the region's: weg2xsn24 read `carries 1080
         # bytes` because `run_producer_pair` publishes the RING's counts into
         # the same (pair, slot) records (weight_exchange_transport.py:1786).
-        slots = bx.BounceSlots(str(boot_nonce), shm_root=root, create=True)
+        # #1377 (c) W11: THE RECORD'S ROW COUNT COMES FROM THE SAME TERMS AS
+        # THE LEG'S BAND COUNT. It did not, and boot weg2xsn31/3 died of it:
+        #   W68 Weg2XchgPlanDisagree: band 2 has no row -- this lane's record
+        #   was built for 2 band(s) per pair
+        # raised by our own `_row` guard (weight_exchange_bounce.py:1646) from
+        # release_memory_occupation at 17:01:47Z, four seconds before the W98.
+        #
+        # THE COUPLING, verified and not assumed: `run_bounce_leg` takes its
+        # slot count from `terms.lane_slots` -- 24 under #1374's Option 1
+        # sizing (2907 MiB largest tag / 128 MiB slots, +1 compare slot) --
+        # while this line built the record with the DEFAULT `rows_per_pair`,
+        # i.e. `xr.SLOTS_PER_PAIR` = 2. The depositor then indexed band 2 into
+        # a two-row table. Two numbers for one geometry: #1374 F1a made `_row`
+        # REFUSE instead of folding (which is why this surfaced by name rather
+        # than as silent aliasing), and #1374 F1b raised the leg's slots
+        # without ever wiring the record to the same source.
+        from sglang.srt.weg2 import weight_exchange_region as xr_mod
+
+        _rows_per_pair = (int(terms.lane_slots) if terms is not None
+                          else int(xr_mod.SLOTS_PER_PAIR))
+        slots = bx.BounceSlots(str(boot_nonce), shm_root=root, create=True,
+                               rows_per_pair=_rows_per_pair)
         last = None
         try:
             # #1358 THE LEDGER'S LANE COUNT IS CHECKED AGAINST THE LANE'S OWN
