@@ -2562,7 +2562,13 @@ def common_flags(
     return [
         "--model-path", model,
         "--trust-remote-code",
-        "--served-model-name", "Qwen3.8-27B",
+        # #1362 FOSSIL 4: this was the LITERAL "Qwen3.8-27B" on every boot,
+        # including the 4B-FP8 transition vehicle -- the served name is what the
+        # front, the load drivers and every probe address, so a wrong one makes
+        # a boot of a DIFFERENT model answer under the old model's name. Derived
+        # from the model path by default and overridable by flag; never a
+        # constant, because a constant here is a silent identity swap.
+        "--served-model-name", served_model_name(model),
         "--rank-gpu-id", "0,1,2",
         "--skip-server-warmup",
         "--kv-cache-dtype", KV_CACHE_DTYPE,
@@ -4844,6 +4850,34 @@ class LaunchGuard:
             + (f" ({why})" if why else "")
         )
         return self.verdict
+
+
+def served_model_name(model_path: str, override: str = "") -> str:
+    """#1362: the name a boot serves under, DERIVED from the model it loads.
+
+    ``--served-model-name`` was the literal ``Qwen3.8-27B`` for every boot this
+    launcher ever made.  It is the name the front routes on, the load drivers
+    address and every probe asserts against, so on the 4B-FP8 transition
+    vehicle the boot would have answered under the 27B's name -- a silent
+    identity swap in the one field whose whole job is identity.
+
+    The basename of the checkpoint directory is the default; an explicit
+    override wins and is the reason the flag exists (a HuggingFace snapshot
+    path ends in a commit hash, which is a correct identity and a terrible
+    name).
+    """
+    if override:
+        return str(override)
+    p = str(model_path or "").rstrip("/")
+    base = os.path.basename(p)
+    # A snapshot directory is named by its commit; walk up to the repo name,
+    # which is what a human and a load driver both mean by "the model".
+    if base and len(base) >= 32 and all(c in "0123456789abcdef" for c in base):
+        parts = [x for x in p.split("/") if x]
+        for cand in reversed(parts[:-1]):
+            if cand not in ("snapshots", "blobs", "refs"):
+                return cand.replace("models--", "").replace("--", "/")
+    return base or "unknown-model"
 
 
 def measured_record_path() -> str:
@@ -10431,6 +10465,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         interleaved=False,
         boot_tag=ns.tag,
         commit=tip,
+        # #1362: stamp the model. Without it the next boot cannot tell whether
+        # this image is its own model's or the previous tenant's, and the
+        # measured 27B numbers walk straight into a 4B boot.
+        model_digest_=host_ledger.model_digest(ns.model),
     )
     log(host_ledger.format_dormant_image(image_rec))
     host_ledger.append_measured_record(measured_record_path(), image_rec)
