@@ -35,7 +35,14 @@ import os
 import sys
 import traceback
 
-os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
+# THE CPU ARM PINS CVD="" SO IT IS HERMETIC. The CUDA arm must NOT inherit
+# that: a spawn child re-imports this module, and torch loading under CVD=""
+# caches "no CUDA-capable device" before any per-rank UUID can be set (rc=100
+# from cudaSetDevice, measured in window dfuqb8). The parent clears CVD and
+# sets this marker before spawning, so the child starts with no device policy
+# and `make_ops` installs the rank's own UUID first.
+if not os.environ.get("WEG2_REPLAY_CUDA"):
+    os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.join(REPO, "python"))
@@ -62,7 +69,12 @@ from sglang.srt.weg2 import xchg_manifest as xm  # noqa: E402
 xm.vocab_pad_unit()
 xm._pad_vocab_size(1)
 
-NONCE = f"replay{os.getpid()}"
+# THE NONCE IS THE PARENT'S, ALWAYS. Computed per process it differed in every
+# spawn child (each re-imports this module and has its own pid), so the six
+# ranks opened six DIFFERENT semaphore sets and every wait hit ENOENT --
+# measured in window dfuqb8. The parent passes it down and the child installs
+# it before anything is named.
+NONCE = os.environ.get("WEG2_REPLAY_NONCE") or f"replay{os.getpid()}"
 SLOT_BYTES = 4 << 20          # the layout, scaled; the RATIO is what matters
 #: Must stay under FakeDeviceOps' FAKE_DEV_BYTES (8 MiB per rank).
 FAKE_DEV_BUDGET = 2 << 20
@@ -687,6 +699,10 @@ def _run(ns) -> int:
     # the parent already imported; the CUDA arm must set CUDA_VISIBLE_DEVICES
     # BEFORE anything CUDA exists in that process, which only a fresh
     # interpreter guarantees.
+    os.environ["WEG2_REPLAY_NONCE"] = NONCE
+    if ns.cuda:
+        os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+        os.environ["WEG2_REPLAY_CUDA"] = "1"
     uuids = card_uuids() if ns.cuda else []
     if ns.cuda and len(uuids) < xr.N_CARDS:
         raise SystemExit(
