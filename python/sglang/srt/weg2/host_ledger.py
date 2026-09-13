@@ -1796,10 +1796,20 @@ def refuse_foreign_image(
             ""
             if got
             else (
+                # #1362 [22-fix3] THE MARKER IS NOT SPELLED OUT HERE, and that
+                # is the whole point of this commit: the first version of this
+                # sentence quoted the legacy line's own marker, so a census of
+                # "how many legacy admissions happened" scored 1 on a log that
+                # contained ZERO of them and only this refusal (measured: the
+                # train seat read LEGACY=1 off a run with 0 genuine lines).
+                # An instrument that writes its own name into its explanatory
+                # prose makes every count of it ambiguous -- #995, and this
+                # file was the one that re-created it. Describe the line;
+                # never quote its marker.
                 " and this boot's group-P form key does NOT match the source"
                 " boot's, so the legacy transition path does not apply (a"
-                " matching key would admit it with a printed"
-                " WEG2-MODEL-IDENTITY LEGACY line)"
+                " matching key would admit it with a printed legacy-identity"
+                " line naming the record)"
             )
         )
         + f", this boot runs {want!r}. A dormant image sizes Sigma H, and Sigma H "
