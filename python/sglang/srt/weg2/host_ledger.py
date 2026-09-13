@@ -1767,7 +1767,10 @@ def refuse_foreign_image(entry: Dict[str, object], want: str) -> None:
     )
 
 
-def resolve_image_terms(record: Optional[Dict[str, dict]] = None) -> ImageTerms:
+def resolve_image_terms(
+    record: Optional[Dict[str, dict]] = None,
+    want_digest: str = "",
+) -> ImageTerms:
     """The dormant image per group, in the fix-8 precedence order.
 
     (a) THIS LINE'S OWN PREVIOUS MEASUREMENT -- an entry written by
@@ -1790,6 +1793,16 @@ def resolve_image_terms(record: Optional[Dict[str, dict]] = None) -> ImageTerms:
     rec = record or {}
     p_entry = rec.get("P") or {}
     d_entry = rec.get("D") or {}
+    # #1362 [22-fix] THE CONSUMER, wired. A dormant image sizes Sigma H and
+    # Sigma H IS the ring, so spending another model's image here hands this
+    # boot a ring measured for a different checkpoint. `want_digest=""` is the
+    # pre-#1362 caller and keeps its behaviour exactly; a caller that KNOWS its
+    # model gets the check, and the refusal names the missing measurement
+    # instead of letting W48 + 3x W51 three layers down be the message.
+    if want_digest:
+        for _e in (p_entry, d_entry):
+            if _e:
+                refuse_foreign_image(_e, want_digest)
     p_meas = p_entry.get("rss_shmem_gib")
     d_meas = d_entry.get("rss_shmem_gib")
 
@@ -2539,6 +2552,78 @@ def flip_ratchet_record(
     }
 
 
+def checkpoint_digest(model_path: str) -> Tuple[Optional[str], str]:
+    """#1362 [22-fix]: the model's CONTENT identity, or ``(None, why)``.
+
+    THE ALGORITHM IS THE BOOT SEAT'S, reproduced bit for bit rather than
+    re-invented -- `digest_inputs.algo` in the calibration record is the
+    authority and this function is its second implementation, so it is verified
+    against a real record instead of trusted:
+
+        sha256( sha256(json.dumps(config.text_config, sort_keys=True,
+                                  separators=(',',':')))
+              || sha256('\n'.join(sorted(index.weight_map.keys()))) )
+
+    NAMES ONLY, not (name, dtype, shape): ``model.safetensors.index.json``
+    carries neither dtype nor shape, which the boot seat found while measuring
+    and reported as a deviation from its own proposal rather than silently.
+
+    WHY NOT THE PATH.  :func:`model_digest` hashes the path, and on a
+    HuggingFace snapshot that is the COMMIT -- so the same checkpoint
+    re-downloaded under a new snapshot hash becomes a different model, and the
+    calibration recorded for it is orphaned.  Measured: the path form yields
+    ``397b7ba47a99...@138b30a8`` where the record is keyed
+    ``89dcd9c4195338...``; the launcher could not have found the file at all.
+    The path form stays as the launch-path fallback for a checkpoint whose
+    config or index cannot be read, and says which one it is wherever printed.
+    """
+    try:
+        with open(os.path.join(model_path, "config.json")) as f:
+            cfg = json.load(f)
+        tc = cfg.get("text_config", cfg)
+        c = hashlib.sha256(
+            json.dumps(tc, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+        with open(os.path.join(model_path, "model.safetensors.index.json")) as f:
+            idx = json.load(f)
+        i = hashlib.sha256(
+            "\n".join(sorted(idx["weight_map"].keys())).encode()
+        ).hexdigest()
+    except (OSError, ValueError, KeyError, TypeError) as e:
+        return None, (
+            f"checkpoint digest unavailable for {model_path}: {e}. A content "
+            f"digest needs config.json and model.safetensors.index.json; without "
+            f"them this boot has no stable model identity and every recorded "
+            f"figure must be treated as another model's"
+        )
+    return hashlib.sha256((c + i).encode()).hexdigest(), (
+        f"content digest over config.text_config + sorted tensor NAMES "
+        f"(config {c[:12]}..., index {i[:12]}...) -- snapshot-independent, the "
+        f"algorithm the calibration records are keyed by"
+    )
+
+
+def checkpoint_layers(model_path: str) -> Optional[int]:
+    """#1362 [22-fix]: the model's layer count from its own config, or ``None``.
+
+    The calibration constants are keyed to a DEPTH (64), so the check needs the
+    depth of the checkpoint actually being loaded -- not a launcher variable,
+    which does not exist at the site where the incumbent vector is handed over.
+    ``None`` when the config cannot be read, and the caller then keeps the
+    pre-#1362 behaviour rather than refusing on a number it does not have.
+    """
+    try:
+        with open(os.path.join(model_path, "config.json")) as f:
+            cfg = json.load(f)
+    except (OSError, ValueError):
+        return None
+    tc = cfg.get("text_config", cfg)
+    for key in ("num_hidden_layers", "n_layer", "num_layers"):
+        if isinstance(tc.get(key), int):
+            return int(tc[key])
+    return None
+
+
 def model_digest(model_path: str) -> str:
     """#1362: a short, stable identity for the model a measurement belongs to.
 
@@ -3119,6 +3204,10 @@ def price(
     # its caller's back. `None` = no measurement reached this arm, and it is
     # recorded as ABSENT, never printed or summed as 0.
     flip_ratchet: Optional["FlipRatchet"] = None,
+    # #1362 [22-fix]: the CHECKPOINT digest of the model this arm is for.
+    # Empty = the pre-#1362 caller, byte-identical; set = every recorded image
+    # must prove it belongs to this model or the arm refuses (W99).
+    model_digest_want: str = "",
 ) -> Arm:
     """Price one arm at both moments.  Pure.
 
@@ -3265,7 +3354,9 @@ def price(
     # load and outliving every flip (that is the point of carrying draft KV
     # across the flip).  It is NOT part of the flip image -- the ring carries
     # the weights, this carries the draft pages, never the same bytes.
-    images = resolve_image_terms(measured_record)
+    # #1362 [22-fix]: the arm knows which model it prices, so the image check
+    # happens here rather than in a comment about who ought to do it.
+    images = resolve_image_terms(measured_record, want_digest=model_digest_want)
     charges = charge_terms(s_gb, m_mib, ranks_per_group, images, s_gb_d=s_gb_d,
                            xchg_bounce_host_bytes=xchg_bounce_host_bytes,
                            flip_ratchet_gib=(
@@ -4085,6 +4176,7 @@ def choose(
     # like `xchg_bounce_host_bytes`. `None` keeps every pre-#1350 caller and
     # every recorded arm byte-identical.
     flip_ratchet: Optional["FlipRatchet"] = None,
+    model_digest_want: str = "",
     # #1360: the NAMED deviation. Both or neither -- see
     # `Weg2HostDeviationRefused`. It converts the FUNDABILITY VERDICT and
     # NOTHING ELSE: every term, the ring dimensioning, the manifest guard and
@@ -4143,6 +4235,7 @@ def choose(
             measured_record=measured_record,
             xchg_bounce_host_bytes=xchg_bounce_host_bytes,
             flip_ratchet=flip_ratchet,
+            model_digest_want=model_digest_want,
         )
         for s, m in arms
     ]

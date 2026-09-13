@@ -493,6 +493,12 @@ P_CORRIDOR_TOP_MIB = 1229.0
 #: :func:`p_stage_layers` (what a score pair derives to); the registered
 #: guard in test_weg2_host_budget_1233 pins that set.
 P_PP_STAGE_RATIO_SCORES = (32, 18, 14)
+#: #1362 [22-fix]: the layer count the vector above was MEASURED on. A model
+#: with this depth may keep using it (that is the 27B, and every boot this line
+#: has run); any other depth must bring its own calibration or be refused by
+#: name. The constant existed with no model reference at all, which is how a
+#: 64-layer measurement reached a 32-layer checkpoint.
+CALIBRATION_LAYERS = 64
 #: Group P's per-stage FULL-ATTENTION scores (#485 ``--pp-attn-stage-ratio``),
 #: the incumbent's other half, defined once for the same three readers.
 P_PP_ATTN_STAGE_RATIO_SCORES = (8, 4, 4)
@@ -2672,7 +2678,26 @@ def argv_p(
     # a bare "32,18,14" here cannot drift away from it again. ``""`` still
     # means OMIT BOTH FLAGS (the gapped kind, FOLLOW FIX 1) and is left alone.
     if stage_ratio is None:
-        stage_ratio = _csv(P_PP_STAGE_RATIO_SCORES)
+        # #1362 [22-fix] THE CALIBRATION IS CHECKED AGAINST THE MODEL, here,
+        # where the incumbent vector is otherwise handed over unasked. The
+        # constants below are a 64-LAYER measurement from boot bsscale and
+        # carry no model reference; on a 32-layer checkpoint the chain ends in
+        # a bare ValueError from the cut solver ("the anchor stage 1 holds 18
+        # linear and 0 attention layers in the calibration cut"), which is the
+        # only unnamed refusal in the whole launch path. Reading the model's own
+        # record first turns that into a verdict that names the missing
+        # measuring run -- and, when the run HAPPENED and refused, the reason it
+        # refused (the 4B-FP8 record carries KERNEL-ARCH-ABBRUCH verbatim, which
+        # no amount of booking another window fixes).
+        _dg, _dg_why = host_ledger.checkpoint_digest(model)
+        if _dg:
+            _calib, _calib_why = host_ledger.read_pp_calibration(_dg)
+            _depth = host_ledger.checkpoint_layers(model)
+            if _calib is None and _depth is not None and _depth != CALIBRATION_LAYERS:
+                raise host_ledger.refuse_foreign_calibration(_dg, _calib_why)
+            if _calib is not None:
+                stage_ratio = _csv(tuple(_calib["measured_counts"]))
+        stage_ratio = stage_ratio or _csv(P_PP_STAGE_RATIO_SCORES)
     if attn_stage_ratio is None:
         attn_stage_ratio = _csv(P_PP_ATTN_STAGE_RATIO_SCORES)
     if bool(stage_ratio) != bool(attn_stage_ratio):
@@ -5024,6 +5049,7 @@ def choose_host_ledger(
     pin_m_mib: int = 0,
     deviation_reason: str = "",
     riegel_gib: Optional[float] = None,
+    model_digest_want: str = "",
     s_gb_d: Optional[int] = None,
     d_cap_terms: Optional[Dict[str, float]] = None,
     weight_source: str = WEIGHT_SOURCE_DEFAULT,
@@ -5140,6 +5166,10 @@ def choose_host_ledger(
         # decision; it passes the operator's declaration down to it.
         deviation_reason=deviation_reason,
         riegel_gib=riegel_gib,
+        # #1362 [22-fix]: the model this boot actually loads, by CONTENT. Every
+        # recorded image now has to prove it belongs to it -- the fossil was a
+        # 47 GiB ring solved from weg2xsn25's census for a 7.48 GiB model.
+        model_digest_want=model_digest_want,
         # #1350 THE FLIP RATCHET, RESOLVED AT THE ONE CALL SITE THAT ALREADY
         # KNOWS THE BOOT -- the same placement as `xchg_bounce_host_bytes` and
         # `ring_absent_by_design` above, and for the same reason: the ledger
@@ -10057,6 +10087,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         # #1360: the operator's declaration, from argv and nowhere else.
         deviation_reason=str(getattr(ns, "host_ledger_deviation", "") or ""),
         riegel_gib=getattr(ns, "host_riegel_gib", None),
+        # #1362 [22-fix]: content digest, snapshot-independent. `None` (an
+        # unreadable checkpoint) stays empty and the arm keeps the pre-#1362
+        # behaviour rather than refusing on a digest it could not compute.
+        model_digest_want=(host_ledger.checkpoint_digest(ns.model)[0] or ""),
         # #1317n NO BOOT WITH S_D=S_P IN THE LEDGER. D carries 4 GB where P
         # carries 1, which is +8.38 GiB of rings; an arm priced without it is
         # optimistic by that much against a reap mark nobody may touch.

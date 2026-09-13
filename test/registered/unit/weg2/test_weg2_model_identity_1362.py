@@ -207,3 +207,91 @@ class TheDormantImageIsNeverSpentOnAnotherModel1362(CustomTestCase):
     def test_the_matching_model_passes(self):
         dg = hl.model_digest(M27)
         hl.refuse_foreign_image({"model_digest": dg}, dg)   # must not raise
+
+
+M4B_REAL = ("/root/.cache/huggingface/hub/models--RedHatAI--Qwen3.5-4B-FP8-dynamic/"
+            "snapshots/397b7ba47a99b3221ebfc0cfc5a279118cb733ad")
+#: The boot seat's own record, keyed by the CONTENT digest.
+REAL_4B_DIGEST = "89dcd9c419533886144102a0df37d292375d5ea678f80d2f8fd19c68413b9675"
+
+
+class TheDigestIsTheCheckpointsNotThePaths1362(CustomTestCase):
+    """[22-fix]: the path digest could never have found the record.
+
+    Measured: the path form yields `397b7ba47a99...@138b30a8` -- the SNAPSHOT
+    COMMIT -- while the record is keyed `89dcd9c4195338...`. The same checkpoint
+    re-downloaded under a new snapshot hash would orphan its own calibration.
+    """
+
+    def test_the_content_digest_reproduces_the_boot_seats_record_bit_for_bit(self):
+        if not os.path.isdir(M4B_REAL):
+            self.skipTest("4B checkpoint not on this box")
+        got, why = hl.checkpoint_digest(M4B_REAL)
+        self.assertEqual(got, REAL_4B_DIGEST)
+        self.assertIn("snapshot-independent", why)
+
+    def test_the_path_digest_would_have_missed_it(self):
+        self.assertNotEqual(hl.model_digest(M4B_REAL), REAL_4B_DIGEST)
+
+    def test_an_unreadable_checkpoint_is_an_absence_with_a_reason(self):
+        got, why = hl.checkpoint_digest("/no/such/model")
+        self.assertIsNone(got)
+        self.assertIn("no stable model identity", why)
+
+
+class TheReadersAreREACHEDFromProduction1362(CustomTestCase):
+    """REACHABILITY RATCHETS -- red on 8509b9ea68, where both counts were 0.
+
+    8509b9ea68 built `read_pp_calibration` and `refuse_foreign_image` and called
+    NEITHER from the production path: counted 0 and 0 outside host_ledger and
+    tests. That is the fourth present-but-unwired instance in this family, and
+    it was produced in the same commit whose message cited the lesson. Counting
+    call sites is the only form of this check that does not depend on my
+    remembering.
+    """
+
+    def _prod_src(self):
+        import inspect
+        from sglang.srt.weg2 import launcher as lc2
+        return inspect.getsource(lc2)
+
+    def test_the_calibration_reader_is_called_on_the_p_cut_path(self):
+        src = self._prod_src()
+        self.assertGreaterEqual(src.count("host_ledger.read_pp_calibration("), 1)
+        self.assertGreaterEqual(src.count("refuse_foreign_calibration("), 1)
+        # ...at the site that otherwise hands the incumbent vector over unasked
+        i = src.index("stage_ratio = stage_ratio or _csv(P_PP_STAGE_RATIO_SCORES)")
+        self.assertIn("read_pp_calibration", src[max(0, i - 2000):i])
+
+    def test_the_image_check_is_reached_through_price(self):
+        import inspect
+        self.assertIn("want_digest=model_digest_want",
+                      inspect.getsource(hl.price))
+        self.assertIn("refuse_foreign_image",
+                      inspect.getsource(hl.resolve_image_terms))
+        self.assertIn("model_digest_want=", self._prod_src())
+
+    def test_the_launcher_computes_the_CONTENT_digest_not_the_path_one(self):
+        src = self._prod_src()
+        self.assertIn("host_ledger.checkpoint_digest(ns.model)", src)
+
+
+class TheRealRecordDrivesTheRefusal1362(CustomTestCase):
+    """ACCEPTANCE against the boot seat's REAL file, not a double."""
+
+    def test_the_refusal_carries_the_measured_reason_verbatim(self):
+        rec, why = hl.read_pp_calibration(REAL_4B_DIGEST)
+        if rec is None and "does not exist" in why:
+            self.skipTest("4B calibration record not on this box")
+        self.assertIsNone(rec)
+        self.assertIn("REFUSED at measuring time", why)
+        self.assertIn("KERNEL-ARCH-ABBRUCH", why)
+        msg = str(hl.refuse_foreign_calibration(REAL_4B_DIGEST, why))
+        self.assertIn("W99 Weg2ModelIdentityMismatch", msg)
+        self.assertIn("KERNEL-ARCH-ABBRUCH", msg)
+        self.assertIn("measuring run", msg)
+
+    def test_a_64_layer_model_keeps_the_incumbent_vector(self):
+        """The 27B measured the constants; it may go on using them."""
+        self.assertEqual(lc.CALIBRATION_LAYERS, 64)
+        self.assertEqual(hl.checkpoint_layers(M27) or 64, 64)
