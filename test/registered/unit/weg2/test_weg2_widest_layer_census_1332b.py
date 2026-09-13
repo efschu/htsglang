@@ -269,7 +269,10 @@ def test_the_host_arm_charges_the_MEASURED_bounce_and_prints_both_lines(ckpt):
         max_tag_bytes=lz.xchg_max_tag_bytes(str(ckpt)))
     assert charged == expected.total_bytes, (charged, expected.total_bytes)
     assert charged > 0, "the whole point of the arm change is a priced bounce"
-    assert len(lines) == 3, lines
+    # #1385 (Wand 11b): a 4th line joined this list, APPENDED so the first
+    # three keep their position -- named and counted, never silent, the
+    # lane-concurrency cap's own line.
+    assert len(lines) == 4, lines
     assert lines[0].startswith(cc.WIDEST_LINE_PREFIX), lines[0]
     assert lines[1].startswith("WEG2-XCHG-BOUNCE "), lines[1]
     # THE PROVENANCE OF THE DEPTH-SLOT, so a boot log says where the size came
@@ -278,6 +281,8 @@ def test_the_host_arm_charges_the_MEASURED_bounce_and_prints_both_lines(ckpt):
     assert lines[2].startswith("WEG2-XCHG DEPTH-SLOT "), lines[2]
     assert "source=census" in lines[2], lines[2]
     assert f"bytes={expected.widest_layer_bytes}" in lines[2], lines[2]
+    assert lines[3].startswith("WEG2-XCHG-LANES-CONCURRENT "), lines[3]
+    assert "lanes_concurrent=off" in lines[3], lines[3]
     # The ARM line's total and the charge are ONE number, not two readings.
     assert f"bounce_total_mib={expected.total_bytes // xb.MIB}" in lines[1]
 

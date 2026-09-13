@@ -5186,7 +5186,8 @@ def xchg_bounce_terms_for_arm(weight_source: str, oncard_mode: str,
                               model_dir: str,
                               oncard_slot_mib: Optional[int] = None,
                               bounce_depth: int = xchg_bounce.ASSEMBLE_DEPTH_DEFAULT,
-                              n_lanes: int = 1):
+                              n_lanes: int = 1,
+                              lanes_concurrent: int = 0):
     """``(charged_bytes, lines)`` for the host bounce. #1332 B1b.
 
     THE SECOND PRODUCER OF THE SAME PREDICATE AS
@@ -5236,7 +5237,8 @@ def xchg_bounce_terms_for_arm(weight_source: str, oncard_mode: str,
     terms, widest, widest_name = checkpoint_census.widest_layer_terms(
         str(model_dir), pairs=int(weight_exchange_region.N_CARDS),
         depth=int(bounce_depth), slot_bytes=slot_bytes, n_lanes=int(n_lanes),
-        max_tag_bytes=xchg_max_tag_bytes(str(model_dir)))
+        max_tag_bytes=xchg_max_tag_bytes(str(model_dir)),
+        lanes_concurrent=int(lanes_concurrent))
     lines = [widest, xchg_bounce.arm_line(terms)]
     # PROVENANCE, ADDITIVE: the depth-slot is derived HERE, from this
     # checkpoint's census, and never from a knob -- but no line said so, and a
@@ -5253,6 +5255,38 @@ def xchg_bounce_terms_for_arm(weight_source: str, oncard_mode: str,
         f"n_layers={int(terms.n_layers)}) -- the assemble buffer's depth-slot "
         f"holds the WIDEST layer of THIS checkpoint; a boot sized on the mean "
         f"dies on whichever layer is above it")
+    # #1385 (Wand 11b): APPENDED, not inserted -- existing callers index
+    # `lines[0..2]` by position (WIDEST, WEG2-XCHG-BOUNCE, WEG2-XCHG
+    # DEPTH-SLOT) and an insertion in the middle would silently shift every
+    # one of them. Named and counted, never silent: a cap that only showed
+    # up as a smaller `bounce_total_mib` would itself be the printed
+    # advisory nobody could grep for the flip-time cost of.
+    lines.append(xchg_bounce.lanes_concurrent_line(terms))
+    if terms.lanes_serialised:
+        # #1385 STEP 1 OF 2, NAMED RATHER THAN HIDDEN: this commit wires the
+        # CAP THROUGH PRICING (this line's own `lanes_priced` is what the
+        # host ledger now charges) but NOT through the per-rank leg driver.
+        # `weight_updater.py`'s lane loop (`group_descs_by_pair` ->
+        # `CrossSlotRendezvous`) still creates every lane it owns
+        # unconditionally -- nothing there yet waits for a concurrency permit
+        # before allocating a buffer. A boot that arms this cap therefore
+        # prices `lanes_priced` while the runtime may still pin
+        # `lanes_total`'s worth of tmpfs, which is #1358's under-charge
+        # reproduced in the other direction if trusted blind. NAMED HERE,
+        # NOT BUILT, exactly the shape #1368's own commit left for its
+        # successor ("the launcher still passes no n_lanes ... it now has a
+        # guarded consumer, which is the right order to build it in"): the
+        # PRICE exists first, so a wrong runtime is caught by the SAME 3-way
+        # measurement #1358 used (filesystem holders, cgroup d_shmem,
+        # host-slot lines) rather than believed from this line alone.
+        lines.append(
+            f"WEG2-XCHG-LANES-CONCURRENT-CAVEAT runtime_enforcement=NOT_WIRED "
+            f"(#1385 next step) -- lanes_priced={int(terms.lanes_priced)} is "
+            f"what the host ledger now charges, but the per-rank leg driver "
+            f"still allocates a buffer for every lane it owns "
+            f"unconditionally: verify with the #1358 3-way measurement "
+            f"(tmpfs holders, cgroup d_shmem, host-slot lines) before "
+            f"trusting this ARM's smaller total as the boot's real peak")
     if not terms.covers_widest_layer:
         raise xchg_bounce.Weg2XchgBounceUnderCovered(
             xchg_bounce.under_coverage_refusal(terms,
@@ -5332,6 +5366,12 @@ def choose_host_ledger(
     stage_ratio: str = "",
     d_vector: str = XCHG_D_VECTOR_DEFAULT,
     legs: str = "both",
+    # #1385 (Wand 11b): THE VALIDATED CAP, never the raw argv value -- the
+    # caller resolves it once through `xchg_bounce.resolve_lanes_concurrent`
+    # (the same function the ranks' publication call resolves it through) and
+    # hands this function the number, exactly as `bounce_depth` already does.
+    # 0 is "not stated": byte-identical, every lane prices as before #1385.
+    lanes_concurrent: int = 0,
 
 ) -> Tuple[host_ledger.Arm, Optional[float], List[str], Dict[str, Optional[int]]]:
     """THE LAUNCHER'S ONE LEDGER CALL SITE: read the host, price the ladder.
@@ -5430,7 +5470,7 @@ def choose_host_ledger(
             f"says so; W102 is for an arm that WOULD allocate buffers.")
     _bounce_charge_bytes, _bounce_lines = xchg_bounce_terms_for_arm(
         weight_source, oncard_mode, model_dir, oncard_slot_mib, bounce_depth,
-        _lane_n)
+        _lane_n, lanes_concurrent)
     _bounce_lines = list(_bounce_lines) + [_lane_prov]
     # #1361 [23a] THE PRICED STATE, NOT ONLY THE PRICE. B4n measured THREE
     # distinct states that all cost 2.16 GiB -- (depth=1, comparing=True),
@@ -9228,6 +9268,41 @@ def build_parser() -> argparse.ArgumentParser:
              "ranks and read back by the host ledger, so all three agree.",
     )
     ap.add_argument(
+        # #1385 (Wand 11b): THE LANE-COUNT LEVER, as a flag and not a
+        # constant, exactly the way #1358 exposed depth. xsn31/3 measured
+        # `lanes=5 source=measured` and `xchg_bounce=15.75` GiB (5 lanes x
+        # 3.00 GiB + 0.75 GiB staging) at the sleep leg the boot dies in --
+        # 13.50 GiB more non-reclaimable than xsn31/2's 78.90 GiB peak, which
+        # is exactly the growth the cushion floor (1.50 GiB) has no room for
+        # (cushion measured 0.20, W98 Weg2HostRateLatched). ALL FIVE lanes are
+        # pair/diagonal buffers of the SAME boot, created by different ranks
+        # (host_ledger.xchg_lane_count is BOOT-WIDE) -- this cap does not
+        # change which lanes exist, only how many of their buffers may be
+        # pinned in tmpfs AT ONCE; the rest are SERIALISED (named on
+        # `WEG2-XCHG-LANES-CONCURRENT`, never a silent flip-time cost).
+        #
+        # DEFAULT UNSET (None) IS BYTE-IDENTICAL: `None` reaches
+        # `xchg_bounce.resolve_lanes_concurrent` as "the flag was never
+        # given" and resolves to the 0 sentinel, which prices every measured
+        # lane exactly as every boot before this flag did. `0` is NOT the
+        # default -- an operator who explicitly types
+        # `--xchg-lanes-concurrent 0` is refused (W103) rather than silently
+        # handed the "uncapped" behaviour their argv says the opposite of.
+        "--xchg-lanes-concurrent", type=int, default=None,
+        help="#1385: cap on how many of this boot's measured exchange lanes "
+             "(host_ledger.xchg_lane_count, boot-wide) may hold their "
+             "assemble buffer in tmpfs at once. Unset (default) is "
+             "byte-identical -- every lane prices, exactly as before this "
+             "flag. `--xchg-lanes-concurrent 2` on a 5-lane cut charges "
+             "min(5, 2) buffers instead of 5 (measured on xsn31/3's "
+             "checkpoint: 15.75 GiB falls to 6.75 GiB) and serialises the "
+             "remaining 3 -- named and counted on WEG2-XCHG-LANES-CONCURRENT, "
+             "because a lane that waits for an earlier one's collector to "
+             "drain costs flip time the size line alone cannot show. A value "
+             "below 1 is refused (W103 Weg2XchgLanesConcurrentInvalid), "
+             "never silently read as 'uncapped'.",
+    )
+    ap.add_argument(
         # #1356: see VISION_OFF. Default `off` = P and D boot TEXT-ONLY.
         "--weg2-vision", choices=list(VISION_CHOICES), default=VISION_OFF,
         help="#1356: `off` (default) boots both groups text-only by passing "
@@ -10476,6 +10551,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # is pinned keyword-for-keyword by `test_weg2_store_priced_x_1317`.  A
     # publication need is not a reason to edit either.
     bounce_terms_for_ranks = None
+    # #1385 (Wand 11b): resolved ONCE, here, before either the ranks'
+    # publication or the ledger's own call (below) prices anything -- the same
+    # value reaches both through `xchg_bounce.resolve_lanes_concurrent`, so a
+    # boot that refuses on one side and passes on the other cannot happen.
+    _lanes_concurrent = xchg_bounce.resolve_lanes_concurrent(
+        getattr(ns, "xchg_lanes_concurrent", None))
     if xchg_bounce_arm_pins_host(ns.weg2_weight_source, ns.weg2_xchg_oncard):
         # #1368: THE SAME LANE COUNT THE LEDGER CHARGES. The terms published
         # here are the INPUTS the ranks recompute from, and `n_lanes` is one of
@@ -10509,7 +10590,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 slot_bytes=weight_exchange_transport.validate_oncard_slot_mib(
                     ns.weg2_xchg_oncard_slot_mib) * weight_exchange_region.MIB,
                 n_lanes=int(_pub_lane_n),
-                max_tag_bytes=xchg_max_tag_bytes(str(ns.model))))
+                max_tag_bytes=xchg_max_tag_bytes(str(ns.model)),
+                lanes_concurrent=int(_lanes_concurrent)))
     xchg_env = prepare_xchg_env(log, str(ring_plan.epoch),
                                   ns.weg2_weight_source, dry=dry,
                                   hop_bound_ms=ns.weg2_shadow_hop_bound_ms,
@@ -10574,6 +10656,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         weight_source=ns.weg2_weight_source,
         bounce_depth=int(getattr(ns, "xchg_bounce_depth",
                                  xchg_bounce.ASSEMBLE_DEPTH_DEFAULT)),
+        # #1385 (Wand 11b): THE SAME RESOLVED VALUE the ranks' publication
+        # call above priced with -- resolved once, before either call, so the
+        # ledger and the ranks cannot disagree about the cap.
+        lanes_concurrent=int(_lanes_concurrent),
         # B4f: ring absence needs BOTH arms, and the inject mode is already in
         # hand here -- `prepare_xchg_env` published it three statements above.
         inject_mode=ns.weg2_xchg_inject,
