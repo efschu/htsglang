@@ -376,7 +376,7 @@ def max_tag_bytes_from_census(model_dir: str, chunk_layers: int) -> int:
 
 def widest_layer_terms(model_dir: str, *, pairs: int, depth: int,
                        slot_bytes: int = 0, n_lanes: int = 1,
-                       max_tag_bytes: int = 0):
+                       max_tag_bytes: int = 0, lanes_concurrent: int = 0):
     """``(BounceTerms, widest_line, widest_layer_name)`` for the launcher.
 
     ONE CALL SITE'S WORTH of glue, kept here so the launcher holds no
@@ -395,6 +395,9 @@ def widest_layer_terms(model_dir: str, *, pairs: int, depth: int,
     existed. Default 1 rather than required, because the two callers differ:
     the ledger passes the MEASURED count and the rank publication passes the
     same one, while every other caller prices a single lane.
+
+    ``lanes_concurrent`` is passed THROUGH the same way, and defaults to 0
+    ("not stated") -- #1385's cap on how many of ``n_lanes`` price at once.
     """
     from sglang.srt.weg2 import xchg_bounce as xb
 
@@ -409,6 +412,7 @@ def widest_layer_terms(model_dir: str, *, pairs: int, depth: int,
         depth=int(depth),
         n_lanes=int(n_lanes),
         max_tag_bytes=int(max_tag_bytes),
+        lanes_concurrent=int(lanes_concurrent),
         **kw,
     )
     return terms, widest_line(census), f"layer {idx}"

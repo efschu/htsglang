@@ -74,6 +74,88 @@ class Weg2XchgBounceUnderCovered(RuntimeError):
     """
 
 
+class Weg2XchgLanesConcurrentInvalid(RuntimeError):
+    """W103-form: ``--xchg-lanes-concurrent`` was given a value that cannot
+    mean anything (N < 1).
+
+    Refused at ARM time, before either group starts -- the same moment
+    :class:`Weg2XchgBounceUnderCovered` (W71) and ``host_ledger``'s
+    ``Weg2XchgLanesUnmeasured`` (W102) refuse, and for the same reason: a
+    bounce whose lane budget cannot be priced is wrong before a single byte
+    moves, never discovered mid-flip.
+
+    NOT FOLDED INTO THE 0-SENTINEL. `BounceTerms.lanes_concurrent` uses 0 to
+    mean "the flag was never given" (byte-identical, every lane runs) --
+    exactly the convention `max_tag_bytes` already uses. An EXPLICIT 0 or a
+    negative number from argv is a different fact (the operator typed
+    something that cannot be a lane count) and refusing it here, rather than
+    silently reading it as "uncapped", is what keeps
+    ``--xchg-lanes-concurrent 0`` from running every lane anyway while the
+    argv says the opposite -- the "printed advisory without a reader" shape
+    #1256 names.
+
+    W103 IS THE NEXT FREE NUMBER, not a guessed digit: a census of this tree
+    (``grep -rhoE 'W[0-9]+' python/ test/``) tops out at W102, and W52/W53/
+    W54/W56/W58 are a DOCUMENTED COLLISION CLASS (#1265/#1306) of numbers
+    picked from memory landing on codes already spoken for.
+    """
+
+
+def resolve_lanes_concurrent(raw: Optional[int]) -> int:
+    """The ONE place ``--xchg-lanes-concurrent`` is validated.
+
+    ``raw`` is the argparse value, and ``None`` -- the flag never given -- is
+    the ONLY way to reach the 0 sentinel (:class:`BounceTerms`'s "not
+    stated", byte-identical default). Both the ledger's call
+    (:func:`bounce_terms` by way of ``choose_host_ledger``) and the ranks'
+    publication call (``main``'s ``widest_layer_terms``) resolve through this
+    one function, so a flag that would refuse one side and pass the other --
+    a boot arming with a number the ranks then reject -- cannot happen; a
+    second, slightly different validation is exactly the two-sources defect
+    #1358's whole family exists to close.
+
+    An explicit ``0`` or a negative value REFUSES rather than becoming the
+    sentinel: collapsing them would let ``--xchg-lanes-concurrent 0`` run
+    every lane concurrently anyway, the silent degradation this flag exists
+    to replace with a named refusal (#1256).
+    """
+    if raw is None:
+        return 0
+    n = int(raw)
+    if n < 1:
+        raise Weg2XchgLanesConcurrentInvalid(
+            f"W103 Weg2XchgLanesConcurrentInvalid: --xchg-lanes-concurrent="
+            f"{raw!r} cannot mean anything -- at least one lane must run to "
+            f"move any bytes at all. Refused at ARM time, before either "
+            f"group starts: folding this into the 'not stated' sentinel "
+            f"would run every lane concurrently while the argv says the "
+            f"opposite, which is the printed-advisory-without-a-reader "
+            f"shape #1256 names, not a smaller boot."
+        )
+    return n
+
+
+def lanes_concurrent_line(terms: BounceTerms) -> str:
+    """Named and counted, never silent (Wand 11b): the flip-time cost of a cap.
+
+    A lane that does not get its own buffer waits for an earlier lane's
+    collector to drain it (`CrossSlotRendezvous.wait_drained`, the per-tag
+    handshake #1374 already gives every lane) and then reuses the freed
+    buffer -- serial where the uncapped boot ran concurrent, and that costs
+    flip time nobody can see on the size line alone. This line puts a number
+    beside it: `lanes_concurrent=off` states plainly that no cap was asked
+    for (every pre-#1385 boot's own reading), never a blank or an implied 0.
+    """
+    cap = int(terms.lanes_concurrent)
+    return (
+        f"WEG2-XCHG-LANES-CONCURRENT "
+        f"lanes_concurrent={cap if cap > 0 else 'off'} "
+        f"lanes_total={int(terms.n_lanes)} "
+        f"lanes_priced={int(terms.lanes_priced)} "
+        f"serialised={int(terms.lanes_serialised)}"
+    )
+
+
 @dataclass(frozen=True)
 class BounceTerms:
     """The bounce term and every input it was derived from.
@@ -104,6 +186,44 @@ class BounceTerms:
     #: 0 means "not stated", and then the old depth-sized geometry stands and
     #: the leg refuses a band that would wrap instead of overwriting it.
     max_tag_bytes: int = 0
+    #: #1385 (Wand 11b, the one host lever named for the cushion floor W98
+    #: latches on xsn31/3): THE CAP on how many of this boot's `n_lanes`
+    #: assemble buffers may be pinned in tmpfs AT ONCE. 0 means "not stated" --
+    #: every lane prices and every pre-#1385 caller is byte-identical, exactly
+    #: the convention `max_tag_bytes` already uses two fields above. A value
+    #: >= 1 charges `min(n_lanes, lanes_concurrent)` buffers instead of
+    #: `n_lanes`; the excess lanes are SERIALISED -- they wait for an earlier
+    #: lane's collector to drain (`CrossSlotRendezvous.wait_drained`, the
+    #: per-tag handshake #1374 already gives every lane) and then reuse its
+    #: buffer -- which is a flip-time cost, never a silent one: see
+    #: `lanes_serialised` and `lanes_concurrent_line`.
+    lanes_concurrent: int = 0
+
+    @property
+    def lanes_priced(self) -> int:
+        """How many lane buffers THIS TERM actually charges.
+
+        `n_lanes` when the cap is not stated (0) -- byte-identical to every
+        caller before #1385 -- otherwise the smaller of the two. Never the
+        cap alone: a cap larger than the measured lane count would be a
+        knob that can INFLATE the charge past what any boot of this cut ever
+        creates, which is the opposite direction from #1358's under-charge
+        but the same defect class (a priced number nothing on the boot
+        produces).
+        """
+        cap = int(self.lanes_concurrent)
+        return int(self.n_lanes) if cap <= 0 else min(int(self.n_lanes), cap)
+
+    @property
+    def lanes_serialised(self) -> int:
+        """Lanes that do NOT get their own buffer and must wait for one.
+
+        Named and counted rather than folded into the total: a boot that
+        pays this in flip-time has nothing else on the ARM line that would
+        tell it why -- `total_bytes` alone reads like a smaller boot, not a
+        slower one.
+        """
+        return max(0, int(self.n_lanes) - int(self.lanes_priced))
 
     @property
     def lane_slots(self) -> int:
@@ -153,13 +273,23 @@ class BounceTerms:
         ALL FIVE ARE CONCURRENT (measured: the two legs overlap 115 s of
         120 s), so this is not a peak-vs-sum question -- reducing the count is
         a lane change, not an accounting one.
+
+        #1385: PRICED, NOT `n_lanes` DIRECTLY. `lanes_priced` is `n_lanes`
+        whenever the cap is unstated (0), so every caller from before this
+        field is byte-identical; a cap only ever LOWERS the multiplier, never
+        raises it, which is the half of #1358's lesson this flag exists to
+        reuse in the other direction: xsn31/3 measured 5 lanes x 3.00 GiB +
+        0.75 GiB staging = 15.75 GiB (`n_lanes=5, lanes_concurrent=0`) and a
+        boot arming `--xchg-lanes-concurrent 2` on the identical checkpoint
+        prices 2 x 3.00 + 0.75 = 6.75 GiB -- the SAME formula, a smaller
+        multiplier, never a second one.
         """
         # #1374: THE LARGER OF THE TWO GEOMETRIES, per lane. `buffer_bytes` is
         # the widest-layer statement and `lane_buffer_bytes` is the file Option
         # 1 allocates; charging the smaller would under-charge the one the leg
         # creates, which is the #1358 defect one geometry over.
         per_lane = max(int(self.buffer_bytes), int(self.lane_buffer_bytes))
-        return per_lane * int(self.n_lanes) + int(self.staging_bytes)
+        return per_lane * int(self.lanes_priced) + int(self.staging_bytes)
 
     @property
     def staging_per_card(self) -> int:
@@ -299,6 +429,7 @@ def bounce_terms(
     slot_bytes: int = SLOT_BYTES_DEFAULT,
     n_lanes: int = 1,
     max_tag_bytes: int = 0,
+    lanes_concurrent: int = 0,
 ) -> BounceTerms:
     """Derive the bounce term. Pure; raises only on inputs that cannot mean anything.
 
@@ -306,6 +437,17 @@ def bounce_terms(
     for the log (it is what the steady stream costs) but a buffer sized on it
     fails on the first layer above it -- section 10.5, and the danger direction
     of this whole slice.
+
+    ``lanes_concurrent`` IS A RAW MAGNITUDE, NEVER THE VALIDATED FLAG. 0 is
+    the "not stated" sentinel (byte-identical) and a NEGATIVE value is folded
+    to 0 rather than refused here, on purpose: this function prices a boot's
+    OWN figures and knows nothing about argv, so it cannot tell "the flag was
+    never given" from "the flag was given something meaningless" -- both
+    reach it as an absence of a stated cap. The refusal for an explicit,
+    meaningless CLI value (`N < 1`) belongs to :func:`resolve_lanes_concurrent`,
+    the one place that still has the caller's intent (a flag that was set)
+    beside the number -- folding it in here would let a mistyped `0` silently
+    become "uncapped" instead of failing the boot that asked for it.
     """
     if int(n_layers) <= 0:
         raise ValueError(
@@ -341,6 +483,7 @@ def bounce_terms(
         staging_bytes=int(pairs) * SLOTS_PER_PAIR * int(slot_bytes),
         n_lanes=max(1, int(n_lanes)),
         max_tag_bytes=max(0, int(max_tag_bytes)),
+        lanes_concurrent=max(0, int(lanes_concurrent)),
     )
 
 
@@ -361,7 +504,12 @@ _TERM_FIELDS = ("bytes_per_direction", "n_layers", "widest_layer_bytes",
                 # #1374: the tag size rides with the inputs too, or the ranks
                 # rebuild a SMALLER buffer than the launcher charged for and
                 # the deposit meets the wrap refusal the launcher priced away.
-                "max_tag_bytes")
+                "max_tag_bytes",
+                # #1385: the cap rides with the inputs for the SAME reason --
+                # a rank that recomputed `total_bytes` without it would price
+                # every lane again, silently un-capping the very number the
+                # host ledger read the smaller charge from.
+                "lanes_concurrent")
 
 
 def publish_terms(terms: BounceTerms) -> str:
