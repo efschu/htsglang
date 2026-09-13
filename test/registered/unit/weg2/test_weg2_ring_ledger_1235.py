@@ -117,7 +117,7 @@ def _write_dormant_sidecar(evidence_dir: str, dormant) -> None:
         host_ledger.append_measured_record(path, {
             "group": group,
             "at": "2026-09-07T21:12:00Z",
-            "boot": "t2",
+            "boot_tag": "t2",
             "commit": "deadbeef",
             "shmem_delta_gib": 1.23,
             "rss_shmem_gib": float(rss_gib),
@@ -862,7 +862,7 @@ class SerialFormLaunchCheckTest(unittest.TestCase):
             return launcher.prepare_host_ring(
                 [], lines.append, "t2", form, "/nonexistent", "", True,
                 leg_form=leg_form, pcie_directional=directional,
-                duplex_probe=duplex_probe)
+                duplex_probe=duplex_probe, p_argv=None)
         finally:
             ring_table.solve = real
 
@@ -1477,6 +1477,27 @@ class SerialFormLaunchCheckTest(unittest.TestCase):
         self.assertIn("need_d2p=6263", line, "R5's row must still be there")
 
 
+class PrepareHostRingRequiresPArgvTest(unittest.TestCase):
+    """#1379: ``p_argv`` is keyword-only with no default -- a ratchet, not a style pin.
+
+    ``prepare_host_ring`` has exactly ONE production caller
+    (``launcher.main()``'s step-1b call), which has always built and passed
+    ``form_argv_p`` unconditionally.  The ``= None`` default this parameter
+    used to carry served no caller and was only ever a landmine: a future
+    refactor could drop the argument and silently disarm the W48 form gate
+    with no signal at the call site.  This test is the signal -- omitting
+    ``p_argv`` must be a ``TypeError`` at the call, not a quiet ``None``.
+    """
+
+    def test_omitting_p_argv_is_a_typeerror_not_a_silent_none(self):
+        from sglang.srt.weg2 import launcher
+
+        with self.assertRaises(TypeError) as cm:
+            launcher.prepare_host_ring([], lambda _l: None, "t", "auto",
+                                       "/nonexistent", "", True)
+        self.assertIn("p_argv", str(cm.exception))
+
+
 class RingTableBootPinTest(unittest.TestCase):
     """FIX 1: ``--ring-table-boot`` is a substring pin, and it never raises."""
 
@@ -1561,18 +1582,35 @@ class OldFormPriceTest(unittest.TestCase):
         self.assertEqual(steps["weights_0"], 1200 + 700)
         self.assertEqual(steps["weights_1"], 1100 + 900)
 
-    @unittest.skipUnless(os.path.isdir(EVIDENCE), "no evidence tree")
     def test_the_default_path_still_selects_an_arm_at_the_record_box(self):
+        # HERMETIC (#1379): this used to replay the real boot weg2zr2 out of
+        # /spinning/evidence-665-f1, which only this rig carries -- and the
+        # claim under test here is the un-armed CHARGE FORMULA (same class as
+        # the sibling test above), not the provenance-replay claim the file's
+        # own module docstring reserves that real-evidence exception for.
+        # Table built the same way as
+        # test_one_tag_is_one_rpc_so_the_sum_is_over_cards_and_the_max_over_tags
+        # above: three cards, one 1000 MiB image each, a 360 MiB max step.
         from sglang.srt.weg2 import launcher
 
-        table, reason = ring_table.solve(REAL_CARDS, EVIDENCE, ZR2)
-        self.assertIsNotNone(table, reason)
+        rows = [ring_table.CardRing(uuid=f"GPU-{i}", nvml_index=i, name="c",
+                                    image_p_mib=1000, image_d_mib=1000,
+                                    max_tag_p_mib=100, max_tag_d_mib=100)
+                for i in range(3)]
+        table = ring_table.RingTable(boot="hermetic-1379", instrument="i",
+                                     lines_read=1, cards=rows,
+                                     max_step_total_mib=360)
         old = launcher.HostRingPlan(form="", armed=False, table=table)
+        # choose()'s own contract (host_ledger.py ~4744): headroom is None
+        # "when no cgroup sample let a peak be predicted at all" -- not a
+        # defect, a documented absence. Supplying one is what this test needs
+        # to keep asserting a real headroom instead of silently accepting None.
         arm, headroom, _ = host_ledger.choose(
             int(118.05 * GIB), int(103.95 * GIB),
             ring_bytes=old.host_weights_bytes,
             ring_span1_bytes=old.host_weights_span1_bytes,
-            ring_provenance=old.provenance)
+            ring_provenance=old.provenance,
+            cg_current_bytes=int(14.1 * GIB), reclaimable_bytes=0)
         self.assertGreaterEqual(arm.launch_leftover_gib, 0.0)
         self.assertIsNotNone(headroom)
         self.assertGreater(headroom, 0.0)
@@ -1650,7 +1688,8 @@ class NoMeasuredTableRefusesTheBootTest(unittest.TestCase):
         ring_table.solve = lambda *a, **k: (None, "no boot in /x carries all three logs")
         try:
             return launcher.prepare_host_ring(
-                [], lines.append, "t2", "auto", "/x", "", True, leg_form="serial")
+                [], lines.append, "t2", "auto", "/x", "", True, leg_form="serial",
+                p_argv=None)
         finally:
             ring_table.solve = real
 
@@ -2214,7 +2253,7 @@ class SkippedBootsAreNamedOnSuccessTest(RingTableSolverTest):
         try:
             launcher.prepare_host_ring([], lines.append, "t3", "auto",
                                        "/nonexistent", "", True,
-                                       leg_form="interleave")
+                                       leg_form="interleave", p_argv=None)
         finally:
             ring_table.solve = real
         self.assertTrue(
