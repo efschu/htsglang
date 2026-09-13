@@ -73,8 +73,34 @@ def mint() -> str:
     stored somewhere durable and rotated by hand, and nothing here needs it to
     survive a restart -- the front is started by the same launcher run that
     mints it.
+
+    #1361 [22-fix4] NO LEADING '-', AND THIS IS A BOOT KILLER THAT ALREADY FIRED.
+    ``token_urlsafe`` draws from base64url -- A-Za-z0-9 plus ``-`` and ``_`` --
+    so 1 key in 64 starts with a hyphen (the boot seat measured 3076 of 200000
+    mints = 1.54 %, which is 1/64 to two digits). argparse then reads the VALUE
+    as an option and the launch dies with
+
+        argument --admin-api-key: expected one argument
+
+    Boot weg2xsn25's first launch (065608) died exactly there: a random dud
+    roughly every 65th boot, with a message that names the flag and not the
+    cause, and which no dry run reproduces because the next mint is fine.
+    A key starting with TWO hyphens is worse and rarer (1/4096): `_flag_pairs`
+    would read it as a flag of its own and MOVE THE P FORM KEY, invalidating
+    every ring table for that boot.
+
+    Fixed at the mint rather than only at the one emitter we know about, because
+    the value travels into argv, /proc, a file and a header, and a rule that
+    holds at one of those is not a rule. The emitter also switched to the
+    single-token ``--flag=value`` form (`launcher.admin_key_flag`); belt AND
+    braces, since an operator-supplied key never passes through here.
+
+    Entropy cost of the rejection: log2(63/64) = 0.023 bits out of 256.
     """
-    return secrets.token_urlsafe(32)
+    while True:
+        tok = secrets.token_urlsafe(32)
+        if not tok.startswith("-"):
+            return tok
 
 
 def key_path(gpu_arb: str, tag: str) -> str:
@@ -141,7 +167,15 @@ def redact_argv(argv) -> list:
     """
     out = list(argv)
     for i, tok in enumerate(out):
-        if tok == "--admin-api-key" and i + 1 < len(out):
+        # #1361 [22-fix4]: BOTH SPELLINGS. The emitter now ships
+        # `--admin-api-key=<value>` as one token; a redactor that only knew the
+        # two-token form would have gone on returning "no match" and printed
+        # the key into a log that gets pasted into records and tickets. A
+        # redactor that silently stops matching is worse than none, because the
+        # call site still believes it redacted.
+        if tok.startswith("--admin-api-key="):
+            out[i] = "--admin-api-key=<redacted>"
+        elif tok == "--admin-api-key" and i + 1 < len(out):
             out[i + 1] = "<redacted>"
     return out
 

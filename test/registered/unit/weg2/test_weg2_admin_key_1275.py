@@ -35,6 +35,7 @@ demand one), which is the boot death expressed as an assertion.
 
 import inspect
 import os
+import secrets
 import re
 import stat
 import tempfile
@@ -163,7 +164,10 @@ class BothGroupsOrNeither(CustomTestCase):
     def test_the_flag_goes_on_p_and_d_from_one_helper(self):
         from sglang.srt.weg2 import launcher as L
 
-        self.assertEqual(L.admin_key_flag("K"), ["--admin-api-key", "K"])
+        # #1361 [22-fix4] RETIGHTENED from the two-token form: the value is now
+        # welded to the flag, because a value starting with '-' was read by
+        # argparse as an option and killed boot weg2xsn25's first launch.
+        self.assertEqual(L.admin_key_flag("K"), ["--admin-api-key=K"])
         self.assertEqual(L.admin_key_flag(None), [])
         for fn in (L.argv_p, L.argv_d):
             self.assertIn("admin_key_flag", inspect.getsource(fn),
@@ -217,8 +221,13 @@ class TheSecretDoesNotLeak(CustomTestCase):
         # the assert-on-a-literal failure this campaign keeps paying for.
         self.assertIn("--admin-key-file", argv)
         self.assertIn("/g/weg2/boot_t.adminkey", argv)
-        self.assertNotIn("--admin-api-key", argv,
-                         "the front's argv must carry the PATH, never the key")
+        # #1361 [22-fix4]: BY PREFIX, not by exact token. The emitter now ships
+        # `--admin-api-key=<value>` as ONE token, so a membership test for the
+        # bare flag would pass on an argv that carries the key welded to it --
+        # this guard would have gone on saying "no key here" while shipping one.
+        self.assertEqual(
+            [a for a in argv if str(a).startswith("--admin-api-key")], [],
+            "the front's argv must carry the PATH, never the key")
 
     def test_the_front_argv_is_unchanged_when_unkeyed(self):
         from types import SimpleNamespace
@@ -345,3 +354,128 @@ class ADryRunWritesNothing(CustomTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TheRandomBootKiller(CustomTestCase):
+    """#1361 [22-fix4] -- a mint that kills 1 boot in 64, by argparse.
+
+    ``secrets.token_urlsafe`` draws from base64url (A-Za-z0-9 plus '-' and
+    '_'), so one key in 64 begins with a hyphen. Emitted as the two-token form
+    ``["--admin-api-key", "-xY..."]`` argparse reads the VALUE as an option and
+    the launch dies with
+
+        argument --admin-api-key: expected one argument
+
+    Boot weg2xsn25's FIRST launch (log ...0913_065608) died exactly there. The
+    boot seat measured the rate directly: 3076 of 200000 mints = 1.54 %, which
+    is 1/64 to two digits. A dud roughly every 65th boot, a message that names
+    the flag and never the cause, and no dry run reproduces it because the next
+    mint is fine -- the worst shape a defect can have.
+
+    Two independent fixes, because the value travels into argv, /proc, a file
+    and an HTTP header, and a rule that holds in one of those is not a rule:
+    the mint no longer produces such a key, and the emitter welds value to flag
+    so that ANY key is safe -- including one an operator passes by hand, which
+    never goes through ``mint()`` at all.
+    """
+
+    #: The boot seat's own sample size, so this test is at least as sensitive
+    #: as the measurement that found the defect. At p=1/64 the chance of 200k
+    #: clean draws from an unfixed mint is 0 to any precision worth naming.
+    N_MINTS = 200_000
+
+    def test_200k_mints_carry_no_leading_hyphen(self):
+        offenders = [k for k in (ak.mint() for _ in range(self.N_MINTS))
+                     if k.startswith("-")]
+        self.assertEqual(
+            offenders[:3], [],
+            f"{len(offenders)}/{self.N_MINTS} mints start with '-' "
+            f"(unfixed rate is 1/64 = 1.56 %); each one is a dead launch",
+        )
+
+    def test_the_mint_is_still_a_full_strength_key(self):
+        """The rejection must not be a truncation in disguise.
+
+        `lstrip('-')` would also pass the test above while shortening the key
+        and biasing its first character; re-drawing keeps the length and the
+        alphabet.
+        """
+        keys = [ak.mint() for _ in range(200)]
+        self.assertEqual({len(k) for k in keys}, {len(secrets.token_urlsafe(32))})
+        self.assertEqual(len(set(keys)), len(keys), "mint repeated a key")
+
+    def test_the_argv_welds_the_value_to_the_flag(self):
+        from sglang.srt.weg2 import launcher as L
+
+        self.assertEqual(L.admin_key_flag("K"), ["--admin-api-key=K"])
+        self.assertEqual(len(L.admin_key_flag("K")), 1, "two tokens is the defect")
+
+    def test_can_fail_a_hyphen_key_survives_the_argv_build(self):
+        """CAN-FAIL: the '-' key the mint no longer produces, built anyway.
+
+        This is the control that makes the emitter fix load-bearing rather than
+        decorative. Under the old two-token emitter this argv is what argparse
+        choked on; under the welded form it is one token and parses.
+        """
+        import argparse
+
+        from sglang.srt.weg2 import launcher as L
+
+        for key in ("-xY7abc", "--weird", "-"):
+            with self.subTest(key=key):
+                flag = L.admin_key_flag(key)
+                self.assertEqual(flag, [f"--admin-api-key={key}"])
+                ap = argparse.ArgumentParser()
+                ap.add_argument("--admin-api-key")
+                ap.add_argument("--port")
+                ns = ap.parse_args(flag + ["--port", "30031"])
+                self.assertEqual(ns.admin_api_key, key)
+                self.assertEqual(ns.port, "30031")
+
+    def test_can_fail_the_old_two_token_form_really_does_die(self):
+        """The counter-proof: without the fix, the same key kills the parse.
+
+        A can-fail that never shows the failure is an assertion about nothing.
+        """
+        import argparse
+
+        ap = argparse.ArgumentParser()
+        ap.add_argument("--admin-api-key")
+        with self.assertRaises(SystemExit):
+            ap.parse_args(["--admin-api-key", "-xY7abc"])
+
+    def test_the_p_form_key_does_not_move_in_either_spelling(self):
+        """The trap that the --served-model-name pass already cost us once.
+
+        A flag whose SPELLING changes can re-hash the form key and invalidate
+        every ring table. `_flag_pairs` normalises `--flag value` into
+        `--flag=value` before hashing and the flag is excluded either way, so
+        all four spellings -- including a key that itself starts with '--' --
+        must hash identically.
+        """
+        from sglang.srt.weg2 import ring_table
+
+        base = ["py", "-m", "sglang.launch_server", "--model-path", "/m",
+                "--tp-size", "1", "--pp-size", "3", "--port", "30031"]
+        k0, _ = ring_table.p_form_key(base)
+        for extra in (["--admin-api-key", "SECRET"],
+                      ["--admin-api-key=SECRET"],
+                      ["--admin-api-key=--weird"],
+                      ["--admin-api-key=-xY7abc"]):
+            with self.subTest(spelling=extra):
+                k, f = ring_table.p_form_key(base + extra)
+                self.assertEqual(k, k0, "the admin key moved the P form key")
+                self.assertNotIn("SECRET", f, "the key leaked into the LOGGED form")
+
+    def test_the_redactor_knows_the_new_spelling(self):
+        """A redactor that silently stops matching is worse than none.
+
+        The call site still believes it redacted, and the key lands in a log
+        that gets pasted into records and tickets.
+        """
+        out = ak.redact_argv(["py", "--admin-api-key=s3cr3t", "--port", "1"])
+        self.assertNotIn("s3cr3t", " ".join(out))
+        self.assertIn("--admin-api-key=<redacted>", out)
+        # and the old spelling still works, for any argv built elsewhere
+        out2 = ak.redact_argv(["--admin-api-key", "s3cr3t"])
+        self.assertNotIn("s3cr3t", " ".join(out2))

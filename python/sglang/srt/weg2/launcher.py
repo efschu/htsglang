@@ -2632,7 +2632,17 @@ def admin_key_flag(admin_api_key: Optional[str]) -> List[str]:
 
     Empty list when unkeyed, which keeps every pre-#1275 argv byte-identical.
     """
-    return ["--admin-api-key", admin_api_key] if admin_api_key else []
+    # #1361 [22-fix4] ONE TOKEN, `--flag=value`. The two-token form hands the
+    # value to argparse as a separate word, and a value that starts with '-'
+    # is then read as an option: boot weg2xsn25's first launch (065608) died
+    # on `argument --admin-api-key: expected one argument` because that mint
+    # began with a hyphen (1 in 64). `mint()` no longer produces such a key,
+    # and this form makes the argv safe for ANY key, including one an operator
+    # supplies by hand, which never passes through `mint()` at all.
+    # The P form key does not move: `ring_table._flag_pairs` normalises
+    # `--flag value` to `--flag=value` before hashing, and the flag is in
+    # FORM_KEY_EXCLUDED_FLAGS either way (verified, both spellings).
+    return [f"--admin-api-key={admin_api_key}"] if admin_api_key else []
 
 
 def argv_p(
