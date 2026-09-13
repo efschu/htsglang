@@ -38,12 +38,15 @@ is meant to be measured.
 
 import inspect
 import os
+import pathlib
 import unittest
+import warnings
 from types import SimpleNamespace
 from unittest import mock
 
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 
+import sglang
 from sglang.srt.environ import envs
 from sglang.srt.server_args import Backend, ServerArgs
 from sglang.test.test_utils import CustomTestCase
@@ -110,7 +113,10 @@ class TheHazardIsNamedNotInherited(CustomTestCase):
 
     def test_the_rule_predicate_mirrors_what_the_backend_refuses(self):
         """Two bookkeepings of one condition drift. The config rule must read
-        the same two things the backend's __init__ reads."""
+        the same two things the backend's __init__ reads.
+
+        NOTE: naming the same VARIABLE is not the same as reading it the same
+        way -- that is what ONE_READER below actually pins."""
         from sglang.srt.model_executor.runner_backend import (
             breakable_cuda_graph_backend as bcg,
         )
@@ -123,6 +129,126 @@ class TheHazardIsNamedNotInherited(CustomTestCase):
             ServerArgs._disable_breakable_cudagraph_if_incompatible)
         self.assertIn("SGLANG_MEMORY_SAVER_CUDA_GRAPH", rule_src)
         self.assertIn("enable_memory_saver", rule_src)
+
+
+#: Every spelling worth asking about, plus the unset case as None.
+_SPELLINGS = ("1", "true", "TRUE", "yes", "y", "0", "false", "no", "n",
+              "t", "f", "on", "off", "", "garbage", None)
+
+
+def _read(fn):
+    try:
+        return fn()
+    except Exception as exc:  # a raising reader is an outcome too
+        return type(exc).__name__
+
+
+def _with(spelling, fn):
+    name = "SGLANG_MEMORY_SAVER_CUDA_GRAPH"
+    env = {} if spelling is None else {name: spelling}
+    with mock.patch.dict(os.environ, env, clear=False):
+        if spelling is None:
+            os.environ.pop(name, None)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            return _read(fn)
+
+
+class OneVariableOneReader(CustomTestCase):
+    """#1366 follow-up. The boot seat found rule and backstop reading the same
+    variable through two different parsers, and the numbers it reported are not
+    the ones this box produces -- so the table below is MEASURED here, in the
+    test, instead of quoted:
+
+        spelling  get_bool_env_var   envs.EnvBool   verdict
+        'yes'     False              True           DIVERGE
+        'y'       False              True           DIVERGE
+        't' 'on' 'off' '' 'garbage'  False  False   same
+        everything else                            same
+
+    Two corrections to the report that motivated this work, both executable:
+      * get_bool_env_var does NOT accept yes/y/t/on -- its truthy set is
+        exactly ("true", "1") (utils/common.py:1777).
+      * envs.EnvBool.get() does NOT raise on an unknown spelling; EnvField.get
+        catches the ValueError, warns and returns the declared default
+        (environ.py:62-67). No ValueError ever reaches a call site.
+    So the divergence is 2 of 16 spellings, not 6 of 10, and it is not an
+    exception -- which matters, because the claimed failure mode (the
+    resolution exploding before the backstop) does not exist.
+
+    It is still two bookkeepings of one declared variable, which is the defect:
+    get_bool_env_var's own first line says `FIXME: move your environment
+    variable to sglang.srt.environ`, and the variable IS declared there
+    (environ.py:1978). So every reader is moved onto the declaration."""
+
+    def test_no_site_reads_this_variable_through_the_lenient_helper(self):
+        """THE POPULATION, not the pair in front of me: at 4a90bf163a this
+        variable had TEN readers, six lenient and four strict."""
+        root = pathlib.Path(sglang.__file__).resolve().parent
+        needle = 'get_bool_env_var("SGLANG_MEMORY_SAVER_CUDA_GRAPH")'
+        hits = [str(f.relative_to(root)) for f in root.rglob("*.py")
+                if needle in f.read_text(encoding="utf-8", errors="ignore")]
+        self.assertEqual(hits, [], f"still reading through two parsers: {hits}")
+
+    def test_the_rule_and_the_backstop_hold_the_very_same_field_object(self):
+        """Identity, not resemblance: one object cannot disagree with itself."""
+        import sglang.srt.server_args as sa_mod
+        from sglang.srt.model_executor.runner_backend import (
+            breakable_cuda_graph_backend as bcg,
+        )
+
+        self.assertIs(bcg.envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH,
+                      sa_mod.envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH)
+
+    def test_rule_and_backstop_agree_on_every_spelling(self):
+        """EXECUTION SMOKE over the DIVERGING spellings -- the earlier smoke
+        only walked '1', which is the half that never disagreed."""
+        from sglang.srt.model_executor.runner_backend import (
+            breakable_cuda_graph_backend as bcg,
+        )
+
+        for spelling in _SPELLINGS:
+            backstop = _with(
+                spelling,
+                lambda: bool(bcg.envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get()))
+            rule_disabled = _with(
+                spelling,
+                lambda: _resolve(_args(enable_memory_saver=True))
+                == Backend.DISABLED)
+            self.assertEqual(
+                backstop, rule_disabled,
+                f"spelling {spelling!r}: backstop would refuse={backstop} "
+                f"but the rule disabled={rule_disabled}")
+
+    def test_the_two_helpers_diverge_exactly_where_measured(self):
+        """The reason-keeper: if upstream ever unifies the helpers, this goes
+        red and the note above stops being true."""
+        from sglang.srt.utils import get_bool_env_var as lenient
+
+        name = "SGLANG_MEMORY_SAVER_CUDA_GRAPH"
+        strict = envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH
+        diverging = [sp for sp in _SPELLINGS
+                     if _with(sp, lambda: lenient(name))
+                     != _with(sp, lambda: strict.get())]
+        self.assertEqual(diverging, ["yes", "y"])
+
+    def test_no_spelling_leaves_the_backstop_armed_behind_a_silent_rule(self):
+        """The only dangerous direction: rule says keep the graph, backstop
+        then kills the rank. It must not exist for ANY spelling."""
+        from sglang.srt.utils import get_bool_env_var as lenient
+
+        name = "SGLANG_MEMORY_SAVER_CUDA_GRAPH"
+        for spelling in _SPELLINGS:
+            would_refuse = _with(spelling, lambda: bool(lenient(name)))
+            disabled = _with(
+                spelling,
+                lambda: _resolve(_args(enable_memory_saver=True))
+                == Backend.DISABLED)
+            if would_refuse:
+                self.assertTrue(
+                    disabled,
+                    f"spelling {spelling!r} arms the backstop while the rule "
+                    f"leaves the prefill graph on -- that is the xsn29 death")
 
 
 class TheLauncherKeepsItsLever(CustomTestCase):

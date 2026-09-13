@@ -24,11 +24,12 @@ from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     set_graph_pool_id,
 )
+from sglang.srt.environ import envs
 from sglang.srt.model_executor.runner.shape_key import ShapeKey
 from sglang.srt.model_executor.runner_backend.base_cuda_graph_backend import (
     BaseCudaGraphBackend,
 )
-from sglang.srt.utils import empty_context, get_bool_env_var
+from sglang.srt.utils import empty_context
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 if TYPE_CHECKING:
@@ -57,7 +58,7 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
         self._capture_stream = None
         self._memory_saver_adapter: Optional[Any] = TorchMemorySaverAdapter.create(
             enable=enable_memory_saver
-            and get_bool_env_var("SGLANG_MEMORY_SAVER_CUDA_GRAPH")
+            and envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get()
         )
         self._enable_torch_compile = getattr(
             cuda_graph_runner, "enable_torch_compile", False
