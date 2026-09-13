@@ -1738,20 +1738,36 @@ def resolve_xchg_lanes(cut_key: str) -> Tuple[int, str]:
     """
     rec = XCHG_LANES_BY_CUT.get(str(cut_key))
     if not rec:
-        raise Weg2XchgLanesUnmeasured(
-            f"W102 Weg2XchgLanesUnmeasured: no lane count is recorded for cut "
-            f"{cut_key!r}, and the assemble buffer is charged PER LANE "
-            f"(one tmpfs file each). Known cuts: "
-            f"{sorted(XCHG_LANES_BY_CUT) or '(none)'}. The count is MEASURED "
-            f"from a boot's own WEG2-XCHG-HOST-SLOT lines -- the distinct "
-            f"`path=` values among `event=alloc` entries -- and never derived "
-            f"from the cut, because the lane set is built at the rank by "
-            f"`group_descs_by_pair` and the arm cannot see it. Boot this cut "
-            f"once with the lane priced from a neighbouring cut and record "
-            f"what it allocated, or add the measurement if a boot already "
-            f"produced one. Refusing rather than pricing ONE buffer for a boot "
-            f"that may create five: that under-charge is what latched W98 on "
-            f"weg2xsn28 nine seconds after serving."
+        # #1358 [bootstrap] FIRST BOOT OF THIS CUT IS A STATE, NOT A FAULT --
+        # the same correction W99 needed, applied here in the same commit so
+        # the class does not cost a fourth window.
+        #
+        # A cut with no record has never been booted, so no boot can have
+        # measured its lanes; refusing it means the boot that would PRODUCE the
+        # measurement can never run. Instead the arm prices the WORST CASE the
+        # region itself defines -- every directed cross pair plus every
+        # diagonal -- and says so. That is conservative (it over-charges a cut
+        # that uses fewer lanes, never under-charges), it is derived from
+        # `weight_exchange_region`'s own vocabulary rather than a literal, and
+        # it RETIRES at the first boot: the #1358 reader lifts the real count
+        # from that boot's HOST-SLOT lines and it is recorded per cut.
+        #
+        # W102 IS NOT DELETED. It stays for the case it was built for: a cut
+        # whose record exists and disagrees with what the leg then creates,
+        # which the leg driver still refuses before the first allocation.
+        from sglang.srt.weg2 import weight_exchange_region as _xr
+
+        _worst = int(_xr.N_PAIRS) + int(_xr.N_CARDS)
+        return _worst, (
+            f"WEG2-XCHG-LANES cut={cut_key} lanes={_worst} source=WORST-CASE "
+            f"(bootstrap: no boot of this cut has measured one) -- "
+            f"N_PAIRS {int(_xr.N_PAIRS)} + N_CARDS {int(_xr.N_CARDS)} from "
+            f"weight_exchange_region, the most lanes this region can carry. "
+            f"CONSERVATIVE BY CONSTRUCTION: a cut that uses fewer is "
+            f"over-charged, never under-charged. Retires at this boot's own "
+            f"HOST-SLOT lines -- record the measured count per cut and this "
+            f"branch is not reached again. Known cuts: "
+            f"{sorted(XCHG_LANES_BY_CUT) or '(none)'}"
         )
     return int(rec["lanes"]), (
         f"WEG2-XCHG-LANES cut={cut_key} lanes={int(rec['lanes'])} "
@@ -1945,6 +1961,35 @@ def refuse_foreign_image(
     got = str(entry.get("model_digest") or "")
     if got == str(want):
         return None
+    if not form_key_match:
+        # #1362 [bootstrap] A RECORD OF ANOTHER FORM IS NOT EVIDENCE ABOUT THIS
+        # ONE -- it is neither a match nor a foreign model, it simply does not
+        # apply, and raising W99 on it confused "wrong model" with "no record
+        # yet". THIRD INSTANCE of the class on this rig (#1358 lanes, #1356
+        # ring, this): a form change invalidates every inherited record, and a
+        # reader that cannot say "first boot of this form" turns the FIRST boot
+        # of every new form into a refusal -- including the boot that would
+        # have written the record it demands.
+        #
+        # Measured on e50ac74b7c: text-only moved the P form key to
+        # 2b66740bedf9, weg2xsn25's image no longer matched, and the default
+        # arm died W99 before the ledger -- so the bootstrap could not run
+        # either.
+        #
+        # The caller SKIPS this entry (it must not price another form's image)
+        # and prices the named fallback instead. This boot then writes its own
+        # record, stamped with its digest, and the next boot of this form
+        # compares digests normally.
+        return (
+            f"WEG2-MODEL-IDENTITY BOOTSTRAP record={entry.get('boot_tag', '?')} "
+            f"form=OTHER skipped -- this record was measured on a DIFFERENT "
+            f"group-P form, so it is not this form's image and is not priced. "
+            f"FIRST BOOT OF THIS FORM: no inherited image exists yet, which is "
+            f"a state and not a fault. This boot writes its own record stamped "
+            f"with {str(want)[:16]}...; the next boot of this form compares "
+            f"digests. A record of another form is never evidence about this "
+            f"one -- neither for it nor against it."
+        )
     if not got and form_key_match:
         # #1362 [22-fix2] THE TRANSITION PATH, and it exists because the strict
         # rule bricked the standing serving form. Every record on this box was
@@ -1980,29 +2025,15 @@ def refuse_foreign_image(
         f"W99 Weg2ModelIdentityMismatch: the recorded dormant image of boot "
         f"{entry.get('boot_tag', '?')} @ {entry.get('commit', '?')} carries "
         + (f"model {got!r}" if got else "NO model digest (written before #1362)")
-        # #1362 [22-fix2]: say WHICH of the two refusals this is. A record with
-        # no digest has a transition path and a foreign one deliberately does
-        # not, and an operator reading only "W99" cannot tell them apart.
-        + (
-            ""
-            if got
-            else (
-                # #1362 [22-fix3] THE MARKER IS NOT SPELLED OUT HERE, and that
-                # is the whole point of this commit: the first version of this
-                # sentence quoted the legacy line's own marker, so a census of
-                # "how many legacy admissions happened" scored 1 on a log that
-                # contained ZERO of them and only this refusal (measured: the
-                # train seat read LEGACY=1 off a run with 0 genuine lines).
-                # An instrument that writes its own name into its explanatory
-                # prose makes every count of it ambiguous -- #995, and this
-                # file was the one that re-created it. Describe the line;
-                # never quote its marker.
-                " and this boot's group-P form key does NOT match the source"
-                " boot's, so the legacy transition path does not apply (a"
-                " matching key would admit it with a printed legacy-identity"
-                " line naming the record)"
-            )
-        )
+        # #1362 [bootstrap]: the clause that used to sit here described
+        # "no digest AND the form key does not match" -- and that case no
+        # longer reaches this raise at all: a record of another form is
+        # skipped as BOOTSTRAP before it gets here. Leaving the sentence would
+        # have been prose about a branch that cannot occur, which is the
+        # instrument-lies class in its quietest form. What remains is the one
+        # no-digest case that DOES reach a refusal: none -- same form plus no
+        # digest is the LEGACY transition, and same form plus a foreign digest
+        # is named by `got` above.
         + f", this boot runs {want!r}. A dormant image sizes Sigma H, and Sigma H "
         f"is the ring: spending another model's image here hands this boot a ring "
         f"measured for a different checkpoint -- on the 4B-FP8 vehicle that is a "
@@ -2055,14 +2086,26 @@ def resolve_image_terms(
     # model gets the check, and the refusal names the missing measurement
     # instead of letting W48 + 3x W51 three layers down be the message.
     if want_digest:
+        # #1362 [bootstrap]: a BOOTSTRAP verdict drops the entry -- another
+        # form's image may not be priced as this form's. `p_entry`/`d_entry`
+        # are rebound to {} so every path below sees "no record", which is the
+        # state that already has a named fallback.
+        _kept = []
         for _e in (p_entry, d_entry):
-            if _e:
-                _legacy = refuse_foreign_image(_e, want_digest, form_key_match)
-                # Bounded by the number of DISTINCT records, not by the number
-                # of pricing calls: the ladder prices one arm per rung and a
-                # long-lived caller may price many times.
-                if _legacy and _legacy not in LEGACY_IDENTITY_LINES:
-                    LEGACY_IDENTITY_LINES.append(_legacy)
+            if not _e:
+                _kept.append(_e)
+                continue
+            _line = refuse_foreign_image(_e, want_digest, form_key_match)
+            # Bounded by the number of DISTINCT records, not by the number of
+            # pricing calls: the ladder prices one arm per rung and a
+            # long-lived caller may price many times.
+            if _line and _line not in LEGACY_IDENTITY_LINES:
+                LEGACY_IDENTITY_LINES.append(_line)
+            # A BOOTSTRAP verdict DROPS the entry: another form's image may not
+            # be priced as this form's. Rebinding to {} puts every path below
+            # into the "no record" state, which already has a named fallback.
+            _kept.append({} if (_line and "BOOTSTRAP" in _line) else _e)
+        p_entry, d_entry = _kept[0], _kept[1]
     p_meas = p_entry.get("rss_shmem_gib")
     d_meas = d_entry.get("rss_shmem_gib")
 
