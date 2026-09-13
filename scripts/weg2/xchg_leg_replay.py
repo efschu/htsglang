@@ -840,8 +840,6 @@ def rank_proc(group, rank, evidence, root, q, self_test, max_tensors,
     flip leg travels.
     """
     try:
-        from test_weg2_xchg_transport_1273 import FakeDeviceOps
-
         os.environ[xm.DIR_ENV] = manifest_dir
         os.environ[xr.ENV_REGION_BOOT] = BOOT_TOKEN
         os.environ["SGLANG_WEG2_WEIGHT_SOURCE"] = "exchange"
