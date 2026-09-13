@@ -1733,7 +1733,9 @@ class ImageTerms:
     extra_d_gib: float
 
 
-def refuse_foreign_image(entry: Dict[str, object], want: str) -> None:
+def refuse_foreign_image(
+    entry: Dict[str, object], want: str, form_key_match: bool = False
+) -> Optional[str]:
     """#1362: a dormant image may only be spent on the model it was measured on.
 
     THE FOSSIL THIS CLOSES, measured at the desk on the 4B-FP8 vehicle: Sigma H
@@ -1751,11 +1753,55 @@ def refuse_foreign_image(entry: Dict[str, object], want: str) -> None:
     """
     got = str(entry.get("model_digest") or "")
     if got == str(want):
-        return
+        return None
+    if not got and form_key_match:
+        # #1362 [22-fix2] THE TRANSITION PATH, and it exists because the strict
+        # rule bricked the standing serving form. Every record on this box was
+        # written before #1362 and carries no digest, so "empty = unknown" --
+        # right as a danger direction -- refused the very model that WROTE
+        # those records. Measured: the gdncov dry run stopped at W99 on
+        # weg2xsn27's own image, which is the same hen-and-egg #1362 set out to
+        # close, re-created by its own fix.
+        #
+        # A legacy record is admitted ONLY when the form key matches, and the
+        # line says plainly that identity is then carried by the FORM KEY alone
+        # -- Klasse A: the instrument states what it can and cannot prove. The
+        # form key contains `--model-path` and excludes labels (#1362, pinned by
+        # the train seat's test_weg2_form_key_label_1362), so a matching key IS
+        # evidence of the same checkpoint path; it is weaker than a content
+        # digest and never claims otherwise. It RETIRES on its own: (2) below
+        # stamps every record this boot writes, so the next boot compares
+        # digests and never reaches this branch.
+        #
+        # RETURNED, not logged here: a line nobody reads is an instrument
+        # without a reader. The caller prints it and a test asserts it.
+        return (
+            f"WEG2-MODEL-IDENTITY LEGACY record={entry.get('boot_tag', '?')} "
+            f"digest=absent form_key=match accepted -- this record predates "
+            f"#1362 and carries no model digest, so its identity is held by the "
+            f"FORM KEY ALONE (which contains --model-path and excludes labels). "
+            f"That is WEAKER than a content digest and is stated rather than "
+            f"implied; it retires as soon as this boot's own records are read, "
+            f"because every record written from here on is stamped with "
+            f"{str(want)[:16]}..."
+        )
     raise Weg2ModelIdentityMismatch(
         f"W99 Weg2ModelIdentityMismatch: the recorded dormant image of boot "
         f"{entry.get('boot_tag', '?')} @ {entry.get('commit', '?')} carries "
         + (f"model {got!r}" if got else "NO model digest (written before #1362)")
+        # #1362 [22-fix2]: say WHICH of the two refusals this is. A record with
+        # no digest has a transition path and a foreign one deliberately does
+        # not, and an operator reading only "W99" cannot tell them apart.
+        + (
+            ""
+            if got
+            else (
+                " and this boot's group-P form key does NOT match the source"
+                " boot's, so the legacy transition path does not apply (a"
+                " matching key would admit it with a printed"
+                " WEG2-MODEL-IDENTITY LEGACY line)"
+            )
+        )
         + f", this boot runs {want!r}. A dormant image sizes Sigma H, and Sigma H "
         f"is the ring: spending another model's image here hands this boot a ring "
         f"measured for a different checkpoint -- on the 4B-FP8 vehicle that is a "
@@ -1767,9 +1813,17 @@ def refuse_foreign_image(entry: Dict[str, object], want: str) -> None:
     )
 
 
+#: #1362 [22-fix2]: legacy-admission lines raised during pricing, so the
+#: launcher can PRINT them and a test can READ them. A module-level sink and
+#: not a logger call, because `resolve_image_terms` is pure and its callers
+#: differ in how they emit; an instrument nobody reads is not an instrument.
+LEGACY_IDENTITY_LINES: List[str] = []
+
+
 def resolve_image_terms(
     record: Optional[Dict[str, dict]] = None,
     want_digest: str = "",
+    form_key_match: bool = False,
 ) -> ImageTerms:
     """The dormant image per group, in the fix-8 precedence order.
 
@@ -1802,7 +1856,12 @@ def resolve_image_terms(
     if want_digest:
         for _e in (p_entry, d_entry):
             if _e:
-                refuse_foreign_image(_e, want_digest)
+                _legacy = refuse_foreign_image(_e, want_digest, form_key_match)
+                # Bounded by the number of DISTINCT records, not by the number
+                # of pricing calls: the ladder prices one arm per rung and a
+                # long-lived caller may price many times.
+                if _legacy and _legacy not in LEGACY_IDENTITY_LINES:
+                    LEGACY_IDENTITY_LINES.append(_legacy)
     p_meas = p_entry.get("rss_shmem_gib")
     d_meas = d_entry.get("rss_shmem_gib")
 
@@ -3208,6 +3267,10 @@ def price(
     # Empty = the pre-#1362 caller, byte-identical; set = every recorded image
     # must prove it belongs to this model or the arm refuses (W99).
     model_digest_want: str = "",
+    # #1362 [22-fix2]: did THIS boot's group-P form key match the source boot's?
+    # The launcher already computes it for the ring solve; a legacy record
+    # (no digest, pre-#1362) is admitted only when it did.
+    form_key_matches: bool = False,
 ) -> Arm:
     """Price one arm at both moments.  Pure.
 
@@ -3356,7 +3419,8 @@ def price(
     # the weights, this carries the draft pages, never the same bytes.
     # #1362 [22-fix]: the arm knows which model it prices, so the image check
     # happens here rather than in a comment about who ought to do it.
-    images = resolve_image_terms(measured_record, want_digest=model_digest_want)
+    images = resolve_image_terms(measured_record, want_digest=model_digest_want,
+                                form_key_match=form_key_matches)
     charges = charge_terms(s_gb, m_mib, ranks_per_group, images, s_gb_d=s_gb_d,
                            xchg_bounce_host_bytes=xchg_bounce_host_bytes,
                            flip_ratchet_gib=(
@@ -4177,6 +4241,7 @@ def choose(
     # every recorded arm byte-identical.
     flip_ratchet: Optional["FlipRatchet"] = None,
     model_digest_want: str = "",
+    form_key_matches: bool = False,
     # #1360: the NAMED deviation. Both or neither -- see
     # `Weg2HostDeviationRefused`. It converts the FUNDABILITY VERDICT and
     # NOTHING ELSE: every term, the ring dimensioning, the manifest guard and
@@ -4212,6 +4277,10 @@ def choose(
     start without one.
     """
     lines: List[str] = []
+    # #1362 [22-fix2]: the ladder prices one arm per rung and every rung walks
+    # the same record, so the sink would otherwise carry the same legacy line
+    # once per arm. Cleared here, read below, deduped in order.
+    LEGACY_IDENTITY_LINES.clear()
     # TRAIN FIX 3: the term the reap watermark's own row LACKED, read live by
     # the caller from memory.stat and never a constant.  It is the only
     # quantity subtracted when the store's reap bound is computed.
@@ -4236,10 +4305,17 @@ def choose(
             xchg_bounce_host_bytes=xchg_bounce_host_bytes,
             flip_ratchet=flip_ratchet,
             model_digest_want=model_digest_want,
+            form_key_matches=form_key_matches,
         )
         for s, m in arms
     ]
     t = priced[0].terms
+    # #1362 [22-fix2]: the transition path is LOUD. A legacy record admitted on
+    # a form-key match prints exactly one line naming the record it admitted --
+    # silent acceptance would make the pre-#1362 records indistinguishable from
+    # verified ones for as long as they survive.
+    for _ll in dict.fromkeys(LEGACY_IDENTITY_LINES):
+        lines.append(_ll)
     lines.append(
         "WEG2-HOST-LEDGER TERMS "
         f"memtotal={t['memtotal_gib']:.2f} GiB memavail={t['memavail_gib']:.2f} GiB "

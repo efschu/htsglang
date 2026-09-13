@@ -5050,6 +5050,7 @@ def choose_host_ledger(
     deviation_reason: str = "",
     riegel_gib: Optional[float] = None,
     model_digest_want: str = "",
+    form_key_matches: bool = False,
     s_gb_d: Optional[int] = None,
     d_cap_terms: Optional[Dict[str, float]] = None,
     weight_source: str = WEIGHT_SOURCE_DEFAULT,
@@ -5170,6 +5171,7 @@ def choose_host_ledger(
         # recorded image now has to prove it belongs to it -- the fossil was a
         # 47 GiB ring solved from weg2xsn25's census for a 7.48 GiB model.
         model_digest_want=model_digest_want,
+        form_key_matches=form_key_matches,
         # #1350 THE FLIP RATCHET, RESOLVED AT THE ONE CALL SITE THAT ALREADY
         # KNOWS THE BOOT -- the same placement as `xchg_bounce_host_bytes` and
         # `ring_absent_by_design` above, and for the same reason: the ledger
@@ -10080,6 +10082,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                                          else None))
 
     # 2. host ledger
+    # #1362 [22-fix2]: the form verdict lives on the SOLVED TABLE, not on the
+    # plan that wraps it -- reading `form_same` off the PLAN with a False
+    # default reads False on every boot and makes the transition path dead code
+    # that no dry run could distinguish from a working one (measured: gdncov2
+    # still refused W99 with the form key printed as MATCHES four lines above).
+    # `None` = the gate was never armed, and an unarmed gate must never read as
+    # a passed one: it stays False, i.e. a legacy record stays refused.
+    _rt = getattr(ring_plan, "table", None)
+    _form_key_matches = bool(getattr(_rt, "form_same", None)) if _rt is not None else False
     arm, reap_headroom_gib, lines, cg = choose_host_ledger(
         ring_plan.host_weights_bytes,
         ring_plan.host_weights_span1_bytes, ring_plan.provenance,
@@ -10091,6 +10102,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         # unreadable checkpoint) stays empty and the arm keeps the pre-#1362
         # behaviour rather than refusing on a digest it could not compute.
         model_digest_want=(host_ledger.checkpoint_digest(ns.model)[0] or ""),
+        # #1362 [22-fix2]: the ring solve already decided whether THIS boot's
+        # group-P form key matches the source boot's. A legacy record (no
+        # digest, written before #1362) is admitted only when it did -- the
+        # form key contains --model-path and excludes labels, so a match is
+        # evidence of the same checkpoint path. Read from the solve rather than
+        # recomputed: a second computation of the same predicate is the second
+        # bookkeeping this fork keeps paying for.
+        form_key_matches=_form_key_matches,
         # #1317n NO BOOT WITH S_D=S_P IN THE LEDGER. D carries 4 GB where P
         # carries 1, which is +8.38 GiB of rings; an arm priced without it is
         # optimistic by that much against a reap mark nobody may touch.
@@ -10502,7 +10521,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         # #1362: stamp the model. Without it the next boot cannot tell whether
         # this image is its own model's or the previous tenant's, and the
         # measured 27B numbers walk straight into a 4B boot.
-        model_digest_=host_ledger.model_digest(ns.model),
+        # #1362 [22-fix2]: the CONTENT digest, the same identity the readers
+        # compare against. [22] stamped the PATH form here, which no reader
+        # keys on -- so every record this boot wrote would have stayed legacy
+        # forever and the transition path below would never retire.
+        model_digest_=(host_ledger.checkpoint_digest(ns.model)[0] or ""),
     )
     log(host_ledger.format_dormant_image(image_rec))
     host_ledger.append_measured_record(measured_record_path(), image_rec)
