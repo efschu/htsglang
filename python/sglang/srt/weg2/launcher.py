@@ -4729,8 +4729,15 @@ def _derive_d_l2_budget(
     # invariant demands, never the pool's price. A decimal S_D would save
     # ~1.18 GiB of rings and needs an upstream int->float change on that flag.
     share = float(ns.d_cap_rank_share)
+    # #1361 [23b] THE SOURCE, NOT ONLY THE VALUE. The record silently overrides
+    # the flag here, and the boot seat read `S_D=1` off its own sizing table
+    # while the ARM line said `S_D=2` -- effective-and-unprinted, the #896
+    # class. Whoever reads the arm has to be able to see WHICH of the two
+    # inputs produced it without re-deriving the precedence from this comment.
+    share_source = "flag"
     if rec_share is not None:
         share = rec_share
+        share_source = "record"
     if rec_share is not None and rec_share > share + 1e-9:
         raise Weg2LaunchRefused(
             f"W89x Weg2L2ShareBelowInstalled: the sizing record's installed "
@@ -4746,6 +4753,7 @@ def _derive_d_l2_budget(
             cap_tokens, share, host_ledger.CELL_BYTES_D_PER_RANK[0],
             HICACHE_LOAD_POOL_USAGE_FRACTION_1317N,
         )
+        terms["max_rank_share_source"] = share_source
     except ValueError as exc:
         raise Weg2LaunchRefused(
             f"W88x Weg2L2Unsizable: group D's L2 budget could not be derived "
@@ -5162,6 +5170,25 @@ def choose_host_ledger(
     # is priced against them.
     _bounce_charge_bytes, _bounce_lines = xchg_bounce_terms_for_arm(
         weight_source, oncard_mode, model_dir, oncard_slot_mib)
+    # #1361 [23a] THE PRICED STATE, NOT ONLY THE PRICE. B4n measured THREE
+    # distinct states that all cost 2.16 GiB -- (depth=1, comparing=True),
+    # (depth=2, comparing=False) and (depth=2, the OLD expression that was just
+    # fixed) -- so the figure alone cannot tell a correctly priced shallow arm
+    # from the underpricing. The ARM line prints the state beside the term.
+    #
+    # NOT a second derivation of the size: `depth` is the same CONSTANT the
+    # helper hands to `widest_layer_terms`, referenced rather than recomputed,
+    # and `slots` comes from `assemble_slots`, which is the one authority
+    # (#1335, B4n). `inject_mode` is resolved by that function from this
+    # process's own `weight_exchange.inject_mode()`, which is exactly the term
+    # a desk run and a boot can disagree about -- printing it is what makes the
+    # disagreement readable instead of hidden inside an equal number.
+    _bounce_prov = {
+        "depth": int(xchg_bounce.ASSEMBLE_DEPTH_DEFAULT),
+        "slots": int(xchg_bounce.assemble_slots(
+            int(xchg_bounce.ASSEMBLE_DEPTH_DEFAULT))),
+        "inject_mode": str(inject_mode),
+    } if _bounce_charge_bytes else None
     ledger_kw = dict(
         # #1317n D's L2 IS PRICED SEPARATELY FROM P'S. It rides the ONE kwargs
         # block for exactly the reason the block exists (boot weg2sn6a died of
@@ -5230,6 +5257,7 @@ def choose_host_ledger(
         # THIS checkpoint's WIDEST layer by `xchg_bounce_terms_for_arm` ->
         # `bounce_terms`, and its two lines join the ledger's printed lines.
         xchg_bounce_host_bytes=_bounce_charge_bytes,
+        xchg_bounce_prov=_bounce_prov,
         # #1327 (S6 slice 2): SIGMA H IS 0 BY DESIGN ON THE AUTHORITATIVE
         # EXCHANGE ARM, and the ledger is TOLD so rather than left to infer it
         # from a zero. There the launcher publishes no `TMS_HOST_RING_*` and the

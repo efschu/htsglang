@@ -4379,6 +4379,12 @@ def choose(
     flip_ratchet: Optional["FlipRatchet"] = None,
     model_digest_want: str = "",
     form_key_matches: bool = False,
+    # #1361 [23a] PRINT-ONLY, and it deliberately stops at `choose`: the ARM
+    # line names the STATE the bounce was priced in. It never reaches `price`,
+    # because nothing here changes a number -- a term that only the printer
+    # needs must not be threaded through the pricing path, where a later reader
+    # would have to prove it does not move an arm.
+    xchg_bounce_prov: Optional[Dict[str, object]] = None,
     # #1360: the NAMED deviation. Both or neither -- see
     # `Weg2HostDeviationRefused`. It converts the FUNDABILITY VERDICT and
     # NOTHING ELSE: every term, the ring dimensioning, the manifest guard and
@@ -4615,7 +4621,18 @@ def choose(
             # masquerading as a semantic one. The new term is additive and the
             # old reading is byte-identical -- which is also the honest shape:
             # nothing about S or M changed, D simply gained its own budget.
-            f"WEG2-HOST-LEDGER ARM S={arm.s_gb} M={arm.m_mib} S_D={_arm_s_d(arm)}: "
+            f"WEG2-HOST-LEDGER ARM S={arm.s_gb} M={arm.m_mib} S_D={_arm_s_d(arm)}"
+            # #1361 [23b]: WHICH INPUT PRODUCED S_D. The sizing record silently
+            # overrides `--d-cap-rank-share`, and the boot seat read S_D=1 off
+            # its own table while this line said S_D=2 -- effective and
+            # unprinted, the #896 class. `source=record` means a measured
+            # ownership vector won; `source=flag` means the argv value stood.
+            + (
+                f" (sd_share={float((d_cap_terms or {}).get('max_rank_share', 0.0)):.4f} "
+                f"source={(d_cap_terms or {}).get('max_rank_share_source', 'unknown')})"
+                if d_cap_terms else ""
+            )
+            + ": "
             f"anchors={arm.terms['anchors_gib']:.2f} rings={arm.terms['rings_gib']:.2f} "
             f"overhead={arm.terms['overhead_gib']:.2f} "
             # #1273 S6: THE EXCHANGE'S PINNED HOST CARRIER, NAMED ON THE ARM
@@ -4624,6 +4641,19 @@ def choose(
             # priced at all -- and `slots x slot_bytes x cards` of /dev/shm on
             # the arms that create the file, charged at both moments.
             f"xchg_bounce={arm.terms['xchg_bounce_gib']:.2f} "
+            # #1361 [23a]: the state the term was priced in, beside the term.
+            # THREE states cost 2.16 GiB (depth=1 comparing=True, depth=2
+            # comparing=False, depth=2 under the pre-#1335 expression), so the
+            # number alone has three readings. `absent` when the arm pins no
+            # bounce at all -- an unpriced state and a state priced at defaults
+            # must not share a spelling, the same rule the ratchet fields obey.
+            + (
+                f"bounce_depth={int(xchg_bounce_prov['depth'])} "
+                f"bounce_slots={int(xchg_bounce_prov['slots'])} "
+                f"bounce_inject={xchg_bounce_prov['inject_mode']} "
+                if xchg_bounce_prov else "bounce_state=absent "
+            )
+            +
             # #1332 (S6 slice 1): THE TWO HOST-WEIGHT RESIDENCIES, SIDE BY
             # SIDE ON ONE LINE. `host_weights` is Sigma H -- the region
             # preallocated at the whole weight image, charged once and never
