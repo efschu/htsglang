@@ -1166,7 +1166,12 @@ def run_bounce_leg(
     c_stream = ops.create_stream(device)
     #: What each slot is still draining, so a slot is never re-deposited under
     #: a collect that has not landed.  This list IS the pipeline's state.
-    inflight: List[Optional[object]] = [None] * int(depth)
+    # #1374: THE FILE'S SLOT COUNT, not `depth`. `slots` is what was
+    # allocated (assemble_slots adds the shadow's compare slot) while the
+    # loop indexed by `depth`, so at the #1358 default depth=1 every band
+    # landed in slot 0: no double buffering at all, and the ledger charged
+    # for a slot the loop could not reach.
+    inflight: List[Optional[object]] = [None] * int(slots)
     deposited = collected = 0
     bands = 0
     deposit_ms = collect_ms = 0.0
@@ -1174,7 +1179,27 @@ def run_bounce_leg(
     try:
         for unit in units:
             for batch in tp.batch_descs(list(unit.descs), int(slot_bytes)):
-                slot = bands % int(depth)
+                slot = bands % int(slots)
+                # #1374 OPTION 1's PRECONDITION, ENFORCED HERE. Removing the
+                # per-band claim is only safe while every band of this tag owns
+                # its own slot; the moment the count wraps, band N would
+                # overwrite band 0 while the collector may still be reading it
+                # -- silently, which is worse than the deadlock it replaced.
+                # The per-tag `drained` handshake covers the NEXT tag; this
+                # covers the bands WITHIN one. Until the terms carry
+                # max_tag_bytes and size the buffer accordingly, this refuses
+                # by name rather than pricing a wrap nobody can see.
+                if int(bands) >= int(slots) and phase == PHASE_DEPOSIT:
+                    raise Weg2XchgBouncePhaseUnordered(
+                        f"W68 Weg2XchgPlanDisagree: band {bands} of this tag "
+                        f"would reuse slot {slot} of {slots} -- the assemble "
+                        f"buffer does not hold the whole tag, so this deposit "
+                        f"cannot complete without its collector and the "
+                        f"collector cannot run before this rank's pause "
+                        f"(boot weg2xsn30). Size the buffer from max_tag_bytes "
+                        f"(Option 1) or reduce the pause granularity below the "
+                        f"tag (Option 3); refusing rather than overwriting a "
+                        f"band a consumer may still be reading.")
                 if inflight[slot] is not None:
                     t0 = time.perf_counter()
                     ops.synchronize(c_stream)
@@ -1188,21 +1213,17 @@ def run_bounce_leg(
                 # carry no `src_ptr` at all -- which is exactly why the
                 # unsplit form refused it.
                 if phase in (PHASE_DEPOSIT, PHASE_BOTH):
-                    if rendezvous is not None and phase == PHASE_DEPOSIT:
-                        # CLAIM THE SLOT BEFORE FILLING IT.  Without this a
-                        # third band overwrites a slot whose consumer has not
-                        # drained it -- the same unordered-read hazard as the
-                        # collect side, entered from the producing end, and
-                        # just as silent.
-                        if not rendezvous.wait_empty(slot=slot,
-                                                     seq=int(batch.seq)):
-                            raise Weg2XchgBouncePhaseUnordered(
-                                f"W68 Weg2XchgPlanDisagree: slot={slot} "
-                                f"seq={batch.seq} was still full when this "
-                                f"deposit tried to claim it -- the collecting "
-                                f"rank has not drained the previous band. "
-                                f"Refusing rather than overwriting bytes a "
-                                f"consumer is about to read.")
+                    # #1374: NO PER-BAND CLAIM. This is where boot weg2xsn30
+                    # died: the claim waited on a collector that could not run
+                    # until this rank had paused, which it could not do until
+                    # this loop finished. Under Option 1 the buffer holds the
+                    # whole tag, so each band owns its slot and there is no
+                    # reuse to protect against; the ONE wait left is
+                    # `wait_drained`, once per tag, taken by the caller AFTER
+                    # the credit is published. `BounceSlots._row` refuses a
+                    # band beyond the table rather than folding it onto
+                    # another band's row, so an undersized buffer is a named
+                    # refusal instead of silent aliasing.
                     t0 = time.perf_counter()
                     moved = _deposit_band(ops, d_stream, unit.descs, batch,
                                           base)
@@ -1265,7 +1286,14 @@ def run_bounce_leg(
                     if rendezvous is not None and phase == PHASE_COLLECT:
                         ops.synchronize(c_stream)
                         inflight[slot] = None
-                        rendezvous.post_empty(slot=slot, seq=int(batch.seq))
+                        # #1374: NO PER-BAND `empty` POST. The `empty` family's
+                        # row 0 now carries the PER-TAG drain, so posting once
+                        # per band would hand the source N drain tokens and let
+                        # it overwrite the tag this collector is still reading
+                        # -- the very hazard the drain exists for. The tag's
+                        # single `post_drained` is the caller's, after its last
+                        # band, because only the caller knows where the tag
+                        # ends.
                 bands += 1
         t0 = time.perf_counter()
         ops.synchronize(c_stream)
@@ -1370,6 +1398,25 @@ class CrossSlotRendezvous:
     THE ORDER IS THE LAW (`run_producer_pair`'s own words): fill, ONE sync,
     publish, THEN `sem_post(full)`. A post before the publish lets a consumer
     read the previous band's count.
+    That rule is per BAND and survives #1374 word for word.
+
+    THE CONTRACT ITSELF CHANGED IN #1374, after boot weg2xsn30 deadlocked on
+    the old one. It used to be "this slot is free / this slot is filled", one
+    semaphore pair per slot, and the deposit claimed a slot before filling it.
+    On the co-located card that wait cannot end: D0's deposit waited on
+    `empty` for PP0's collect, PP0 waited in its resume for D0's VRAM credit,
+    and the credit only follows D0's pause, which only follows the deposit.
+    Both budgets ran their full 120 s (D0 13:48:17->13:50:17 W68 "still full";
+    PP0 13:48:13->13:50:13 W35 `peer_leg_complete=False`). Reproduced at the
+    desk in two processes in seconds: test_weg2_lane_lockstep_1374.
+
+    THE CONTRACT NOW: `full` is COUNTING per pair -- N bands are ready and the
+    `seq` in the record orders them -- and the only wait is `drained`, ONCE per
+    tag, taken by the source AFTER it has published that tag's credit. It
+    follows from Option 1 (operator, 2026-09-13): the buffer holds a whole TAG,
+    so a deposit completes without its collector, so within a tag there is
+    nothing for a per-band wait to protect. The diagonal runs the identical
+    contract with ``card=`` instead of ``pair=`` (#1334).
     """
 
     def __init__(self, sems, slots, *, pair: Optional[int] = None,
@@ -1401,13 +1448,63 @@ class CrossSlotRendezvous:
         else:
             self.sems.diagonal_post(self.card, self._slot(slot), kind)
 
-    def wait_empty(self, *, slot: int, seq: int) -> bool:
-        return self._wait(slot, "empty")
+    #: The per-tag drain handshake rides row 0 of the EXISTING empty family,
+    #: once per tag rather than once per band -- so the semaphore census stays
+    #: 60 and the meaning of the name changes from "this slot is free" to
+    #: "the previous tag has been collected".
+    _DRAIN_SLOT = 0
+
+    def prime_drain(self) -> bool:
+        """Take the drain counter to 0 before the first deposit.
+
+        `create_semaphores` arms every `empty` at 1 (region:1930) because the
+        OLD contract meant "this slot is free" and the first producer had to
+        pass. The NEW meaning is "the previous tag has been collected", and at
+        the first tag there is no previous tag -- so an inherited 1 would let
+        the source deposit tag 1 while tag 0 is still being read, and tag 1
+        reuses the same band rows. Consumed non-blocking, once, by the source
+        at leg start: measured in test_the_next_tag_may_not_overwrite_a_tag_
+        still_being_collected, which passes WITHOUT this call for the wrong
+        reason.
+        """
+        if self.pair is not None:
+            return bool(self.sems.trywait(self.pair, self._DRAIN_SLOT, "empty"))
+        # No `diagonal_trywait` exists; a zero budget IS trywait semantics
+        # (sem_timedwait with a deadline already past returns ETIMEDOUT at
+        # once), and that keeps the diagonal on the identical contract without
+        # widening SemSet for one caller.
+        return bool(self.sems.diagonal_timedwait(self.card, self._DRAIN_SLOT,
+                                                 "empty", 0.0))
+
+    def wait_drained(self, *, tag: str) -> bool:
+        """Block until the peer has collected the PREVIOUS tag.
+
+        THE ONE REMAINING WAIT, and it cannot deadlock: the source takes it
+        AFTER it has published tag t's credit, so the collector it waits for
+        is already able to run. Ordering, in the source's own sequence:
+        deposit(t) -- no waits -- pause(t), credit(t), wait_drained(t),
+        deposit(t+1). Without it, tag t+1 would overwrite a buffer tag t's
+        collector is still reading.
+        """
+        return self._wait(self._DRAIN_SLOT, "empty")
+
+    def post_drained(self, *, tag: str) -> None:
+        """The collector's side: this tag is out of the buffer."""
+        self._post(self._DRAIN_SLOT, "empty")
+
+    #: The COUNTING `full` semaphore is ONE row per pair, not one per band:
+    #: #1374 makes it a count ("N bands are ready") and the record -- indexed
+    #: by the REAL band -- says which band each one is. Folding the band into
+    #: the semaphore row is what made the first draft of this contract read
+    #: band 2's record for band 0: the row held the last writer's seq.
+    _COUNT_SLOT = 0
 
     def post_full(self, *, slot: int, seq: int, nbytes: int) -> None:
-        self.slots.publish(slot=self._slot(slot), seq=int(seq),
+        # THE REAL BAND INDEX into the record, and the ORDER stays the law:
+        # fill and sync happened in the caller, publish here, post after.
+        self.slots.publish(slot=int(slot), seq=int(seq),
                            nbytes=int(nbytes), pair=self.pair, card=self.card)
-        self._post(slot, "full")
+        self._post(self._COUNT_SLOT, "full")
 
     def wait_full(self, *, slot: int, seq: int):
         """The producer's post-sync claim, or ``None`` on a real timeout.
@@ -1415,18 +1512,18 @@ class CrossSlotRendezvous:
         THE SEQ IS CHECKED, not only the byte count: a slot posted for a
         DIFFERENT band would otherwise pass the size test whenever two bands
         happen to be equally large, which on a uniform layer stack is most of
-        them.
+        them. Since #1374 `full` is a COUNTING semaphore per pair -- the source
+        posts once per band and the collector takes it once per band -- so the
+        seq read out of the record is the ORDERING AUTHORITY, not the slot
+        identity, and it is the only thing that says which band this is.
         """
-        if not self._wait(slot, "full"):
+        if not self._wait(self._COUNT_SLOT, "full"):
             return None
-        got_seq, nbytes = self.slots.read(slot=self._slot(slot), pair=self.pair,
+        got_seq, nbytes = self.slots.read(slot=int(slot), pair=self.pair,
                                           card=self.card)
         if int(got_seq) != int(seq):
             return None
         return int(nbytes)
-
-    def post_empty(self, *, slot: int, seq: int) -> None:
-        self._post(slot, "empty")
 
 
 def pair_of(src_rank: int, dst_rank: int) -> Optional[int]:
@@ -1505,9 +1602,19 @@ class BounceSlots:
     """
 
     def __init__(self, boot_nonce: str, *, shm_root: str = "/dev/shm",
-                 create: bool = False):
+                 create: bool = False, rows_per_pair: int = xr.SLOTS_PER_PAIR):
+        # #1374 (c): THE RECORD'S ROWS ARE NOT THE SEMAPHORE CENSUS. They were
+        # both `SLOTS_PER_PAIR` and `_row` folded the slot index with `%`, so a
+        # lane with more slots than 2 silently aliased band 2 onto band 0's
+        # row. Never bit because the #1358 default `depth=1` kept the loop on
+        # slot 0 -- at `depth=2` (slots=3 under shadow) it was one boot away.
+        # Option 1 (operator, 2026-09-13) sizes the buffer to a whole TAG, so
+        # the row count is the BAND COUNT and comes from the terms; the
+        # semaphore census stays 60 because the new contract needs one
+        # counting `full` per pair, not one per band.
         self.path = bounce_slots_path(boot_nonce, shm_root)
-        self.rows = (xr.N_PAIRS + xr.N_CARDS) * xr.SLOTS_PER_PAIR
+        self.rows_per_pair = max(int(rows_per_pair), 1)
+        self.rows = (xr.N_PAIRS + xr.N_CARDS) * self.rows_per_pair
         size = self.rows * _SLOT_REC.size
         flags = os.O_RDWR | (os.O_CREAT if create else 0)
         fd = os.open(self.path, flags, 0o600)
@@ -1520,8 +1627,22 @@ class BounceSlots:
             os.close(fd)
 
     def _row(self, pair: Optional[int], card: Optional[int], slot: int) -> int:
+        """The row for one band. AN OUT-OF-RANGE SLOT RAISES; it does not wrap.
+
+        The `%` this replaced is the whole #1374 (c) defect: a fold turns "this
+        lane has more bands than the table has rows" -- a sizing error the
+        terms can state -- into two bands quietly sharing one (seq, bytes)
+        record, which the collector then reads as the wrong band's size.
+        """
         base = int(pair) if pair is not None else xr.N_PAIRS + int(card)
-        return base * int(xr.SLOTS_PER_PAIR) + (int(slot) % int(xr.SLOTS_PER_PAIR))
+        if not 0 <= int(slot) < self.rows_per_pair:
+            raise Weg2XchgBouncePhaseUnordered(
+                f"W68 Weg2XchgPlanDisagree: band {slot} has no row -- this "
+                f"lane's record was built for {self.rows_per_pair} band(s) per "
+                f"pair. The buffer and the record are sized from the SAME "
+                f"terms, so a band beyond the table is a plan the two sides "
+                f"do not share, not a slot to wrap onto another band's row.")
+        return base * int(self.rows_per_pair) + int(slot)
 
     def publish(self, *, slot: int, seq: int, nbytes: int,
                 pair: Optional[int] = None, card: Optional[int] = None) -> None:
