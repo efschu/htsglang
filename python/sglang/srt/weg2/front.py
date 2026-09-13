@@ -3862,6 +3862,46 @@ class Front:
     # reading never held. A quantity that stopped meaning anything is removed
     # rather than given a new definition beside its old name.
 
+    def _sleep_leg_need_gib(self, group: str) -> Tuple[Optional[float], str]:
+        """How much page cache THIS group's sleep leg writes, and where from.
+
+        The sidecar records `shmem_delta_gib` for every sample it ever took --
+        the measured growth of shmem across that group's own sleep leg. It is
+        the plan's own number for the quantity the gate needs, and it is the
+        only one available BEFORE the leg runs. `None` when no sample of this
+        group exists: an unmeasured leg gets no verdict rather than a guess.
+        """
+        # THE SAME PATH THIS FRONT WRITES ITS OWN SAMPLES TO, not a second
+        # spelling of it: `self.measured_record` is the sidecar the launcher
+        # handed this process, and `sample_dormant_image` appends to exactly it.
+        if not self.measured_record:
+            return None, "no-sidecar"
+        try:
+            rec = host_ledger.read_measured_record(self.measured_record)
+        except Exception:  # noqa: BLE001 - a gate must never break the flip
+            return None, "unreadable"
+        e = (rec or {}).get(str(group))
+        if not isinstance(e, dict):
+            return None, "absent"
+        d = e.get("shmem_delta_gib")
+        if d is None or float(d) <= 0:
+            # A leg that recorded no growth is not a leg that writes nothing --
+            # it is a leg whose growth was never measured. No verdict.
+            return None, "unmeasured"
+        return float(d), f"record:{e.get('boot_tag', '?')}@{e.get('at', '?')}"
+
+    def _sleep_leg_gate(self, group: str) -> None:
+        """#1361 fix6: refuse a sleep leg that does not fit, BEFORE it starts."""
+        try:
+            pr = host_ledger.read_cgroup_pressure()
+            f, sh = pr.get("file_gib"), pr.get("shmem_gib")
+            cushion = None if f is None or sh is None else float(f) - float(sh)
+        except Exception:  # noqa: BLE001
+            cushion = None
+        need, src = self._sleep_leg_need_gib(group)
+        host_ledger.refuse_sleep_leg_deficit(
+            cushion, need, margin_gib=0.0, source=src, group=str(group))
+
     def sample_dormant_image(self, group: str, shmem_before: Optional[int]) -> Optional[dict]:
         """Measure ``group``'s dormant host image, once, at its first sleep.
 
@@ -4197,6 +4237,17 @@ class Front:
         # gather is precisely why one is needed -- there is no happens-before
         # between S's begin_leg and W's first read, so without it W reads the
         # previous flip's terminal state as this flip's funding.
+        # #1361 fix6 THE GATE AT THE START OF THE LEG, at the ONE call site
+        # that issues it. A pure function nobody calls is the state this seat
+        # has paid for four times this week; the smoke test drives THIS line.
+        #
+        # Both terms come from readings that already exist here: the cushion
+        # from `read_cgroup_pressure` -- the SAME call the rate latch is fed,
+        # so the gate and the latch can never disagree about the moment -- and
+        # the write size from the sidecar's own measurement of this group's
+        # last sleep. Either unreadable -> no verdict, and the leg proceeds
+        # exactly as before fix6.
+        self._sleep_leg_gate(S)
         self._flip_stage = "gathered-legs"
         (s_code, s_body, s_ms), (w_code, w_body, w_ms) = await asyncio.gather(
             self.timed_rpc(S, "/release_memory_occupation",

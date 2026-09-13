@@ -760,6 +760,53 @@ def split_by_baseline(
     )
 
 
+def refuse_sleep_leg_deficit(
+    cushion_gib: Optional[float],
+    need_gib: Optional[float],
+    *,
+    margin_gib: float = 0.0,
+    source: str = "unknown",
+    group: str = "?",
+) -> Optional[str]:
+    """Refuse a sleep leg whose write does not fit in the reclaim cushion.
+
+    Returns ``None`` when the leg may proceed, and RAISES
+    :class:`Weg2SleepLegCushionDeficit` when it may not. It never returns a
+    "would refuse" string: a gate that reports instead of stopping is the
+    latch we already have, and the latch is what this exists to supersede.
+
+    EITHER TERM UNREADABLE -> NO VERDICT. `None` is not zero on either side. An
+    unreadable cushion is not "no cushion left" and an unknown write size is
+    not "writes nothing"; both would turn a blind gate into a boot killer, and
+    the sleep leg is the one moment where a wrong refusal costs the whole
+    window. The caller gets `None` and proceeds exactly as before this ticket,
+    which is also what keeps every pre-fix6 call site byte-identical.
+    """
+    if cushion_gib is None or need_gib is None:
+        return None
+    have = float(cushion_gib)
+    want = float(need_gib) + float(margin_gib)
+    if have >= want:
+        return None
+    raise Weg2SleepLegCushionDeficit(
+        f"W100 Weg2SleepLegCushionDeficit: group {group}'s sleep leg would "
+        f"write need_gib={float(need_gib):.2f} GiB of page cache and only "
+        f"cushion_gib={have:.2f} GiB is reclaimable "
+        f"(margin={float(margin_gib):.2f}, source={source}) -- deficit "
+        f"{want - have:.2f} GiB. The cushion is `file` MINUS `shmem` from the "
+        f"SAME cgroup reading the rate latch grades, so the two can never "
+        f"disagree about the moment they describe. REFUSED BEFORE THE FIRST "
+        f"BYTE, because after it there is no lever: boot weg2xsn25 latched W98 "
+        f"4 s before its first OOM kill and prevented nothing -- the STOP stops "
+        f"ADMISSION while the bytes came from the leg itself, already 3.3 s "
+        f"into a 5.6 s RPC. Its cushion was 2.70 GiB against a 4.32 GiB write, "
+        f"and that deficit was knowable ~3 s earlier. Widening the latch floor "
+        f"does not help and was measured: 1.0 through 2.69 GiB all latch on the "
+        f"SAME sample with the same 4.1 s lead, because the cushion is flat for "
+        f"a minute and then vertical inside one 0.5 s tick."
+    )
+
+
 def resolve_margin(
     flip_transient_gib: Optional[float] = None,
     drift_mib_per_min: Optional[float] = None,
@@ -1608,6 +1655,45 @@ DEFAULT_ARMS: Tuple[Tuple[int, int], ...] = ((1, 2400), (1, 1200), (1, 600))
 
 class Weg2HostLedgerRefused(RuntimeError):
     """W20: no arm of the ladder funds both moments plus the store floor."""
+
+
+class Weg2SleepLegCushionDeficit(Weg2HostLedgerRefused):
+    """W100 (#1361 fix6): this sleep leg needs more page cache than is left.
+
+    THE MEASUREMENT THIS EXISTS FOR, boot weg2xsn25 on 2026-09-13:
+
+        07:00:50..07:01:09   cushion FLAT at 2.697 GiB, PSI 0.00
+        ~07:01:07.6          D's sleep leg starts (/release_memory_occupation)
+        07:01:10.0 -> .5     cushion 2.591 -> 0.548 in ONE 0.5 s tick,
+                             shmem +2.26 GiB
+        07:01:10.870         W98 latches, front issues WEG2 STOP
+        07:01:13.188         the sleep RPC RETURNS (ms=5572)
+        07:01:14.6..24.8     first rank killed, global host OOM
+
+    W98 FIRED 4 SECONDS BEFORE THE FIRST KILL AND PREVENTED NOTHING, and the
+    reason is structural rather than a tuning failure: the STOP stops
+    ADMISSION, and the bytes that spent the cushion were D's own sleep leg,
+    already 3.3 s into a 5.6 s RPC when the latch fired. You cannot recall
+    bytes being written by refusing new requests.
+
+    THE FLOOR IS NOT THE LEVER EITHER, measured on the same curve: floors of
+    1.0, 1.5, 2.0, 2.5, 2.60 and 2.69 GiB ALL latch on the SAME sample with the
+    SAME 4.1 s lead. The cushion is flat for a minute and then vertical inside
+    one tick -- there is no slope to catch it on. Only 3.0 moves it one tick,
+    and 5.0 buys 46 s while firing 8 times on the SURVIVING boot weg2xsn24.
+
+    So the lever belongs HERE, at the START of the leg, where the arithmetic is
+    still ordinary: at 07:01:08.484 the cushion was 2.697 GiB and the write
+    that followed added 4.32 GiB of shmem. The deficit was 1.62 GiB and it was
+    knowable ~3 seconds BEFORE the first byte, because the size of what this
+    group is about to write is a quantity the sidecar already measured on the
+    boot that wrote the plan.
+
+    NOT A NEW THRESHOLD: there is no tunable number in this refusal. It
+    compares two measured quantities and refuses when one does not cover the
+    other, with `margin_gib` supplied by the caller and printed rather than
+    chosen here.
+    """
 
 
 class Weg2ModelIdentityMismatch(Weg2HostLedgerRefused):
