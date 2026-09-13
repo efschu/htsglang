@@ -47,63 +47,102 @@ BUDGET = 1.5          # the 120 s budget, scaled so a deadlock costs seconds
 PAIR = 0
 
 
-def _rv(nonce, root, budget=BUDGET):
-    """The REAL rendezvous: real semaphores AND the real shm slot record, which
-    has to be the real one because `wait_full` checks the SEQ out of it and a
-    python stub is not shared across the two processes."""
+def _rv(nonce, root, rows, budget=BUDGET):
+    """The REAL rendezvous: real semaphores AND the real shm record, which has
+    to be real because `wait_full` reads the SEQ out of it and a python stub is
+    not shared across the two processes."""
     from sglang.srt.weg2.weight_exchange_bounce import BounceSlots
 
     return CrossSlotRendezvous(tp.SemSet(nonce),
-                               BounceSlots(nonce, shm_root=root),
+                               BounceSlots(nonce, shm_root=root,
+                                           rows_per_pair=rows),
                                pair=PAIR, budget_s=budget)
 
 
-def _source(nonce, root, batches, slots, credit, per_tag, out):
-    """The sleeping group's leg: deposit, then pause, then publish the credit.
-
-    `per_tag` is the CREDIT GRANULARITY and it is the whole subject:
-      "never" -- TODAY'S ORDER: every band of every tag, then one credit.
-      "tag"   -- F1 AS ORDERED: the credit follows the LAST band of the tag,
-                 because `memory_saver_adapter.pause(tag)` cannot pause half a
-                 tag and the credit may not precede the pause.
-      "band"  -- a finer granularity than the pause allows; kept because it is
-                 the control that shows WHY "tag" is the binding constraint.
-    """
-    rv = _rv(nonce, root)
+# --------------------------------------------------------------------------
+# ARM 1: THE OLD CONTRACT, kept as a MODEL because the code no longer offers
+# it. The per-band claim is what boot weg2xsn30 died on, so it stays testable
+# after being deleted -- otherwise the regression it guards is unobservable.
+# --------------------------------------------------------------------------
+def _old_source(nonce, root, batches, slots, credit, out):
+    sems = tp.SemSet(nonce)
     try:
         for b in range(batches):
-            if not rv.wait_empty(slot=b % slots, seq=b):
+            if not sems.timedwait(PAIR, b % slots, "empty", BUDGET):
                 out.put(("source", f"W68 blocked at band {b} of {batches}"))
                 return
-            rv.post_full(slot=b % slots, seq=b, nbytes=1)
-            if per_tag == "band":
-                credit.set()
-        # "tag" and "never" both land here; with ONE tag they are the same
-        # instant, which is exactly the worst case F1 has to survive.
-        credit.set()
+            sems.post(PAIR, b % slots, "full")
+        credit.set()                      # only after the WHOLE deposit
         out.put(("source", "deposited"))
     except Exception as exc:  # pragma: no cover
         out.put(("source", f"{type(exc).__name__}: {exc}"))
 
 
-def _destination(nonce, root, batches, slots, credit, out):
-    """The waking group's leg: it may not collect before the credit exists."""
-    rv = _rv(nonce, root)
+def _old_destination(nonce, root, batches, slots, credit, out):
+    sems = tp.SemSet(nonce)
     try:
         if not credit.wait(timeout=BUDGET):
             out.put(("dest", "W35 credit never published"))
             return
         for b in range(batches):
-            if rv.wait_full(slot=b % slots, seq=b) is None:
+            if not sems.timedwait(PAIR, b % slots, "full", BUDGET):
                 out.put(("dest", f"W68 no full band at {b}"))
                 return
-            rv.post_empty(slot=b % slots, seq=b)
+            sems.post(PAIR, b % slots, "empty")
         out.put(("dest", "collected"))
     except Exception as exc:  # pragma: no cover
         out.put(("dest", f"{type(exc).__name__}: {exc}"))
 
 
-def _run(nonce, *, batches, slots, per_tag):  # per_tag: never|tag|band
+# --------------------------------------------------------------------------
+# ARM 2: THE #1374 CONTRACT. No per-band wait; `full` counts; `drained` once
+# per tag, taken AFTER the credit.
+# --------------------------------------------------------------------------
+def _source(nonce, root, tags, bands, credit, out, drain_between=True):
+    rv = _rv(nonce, root, bands)
+    try:
+        # The drain counter starts at 0: at tag 0 there is no previous tag.
+        rv.prime_drain()
+        for t in range(tags):
+            for b in range(bands):
+                # fill -> ONE sync -> publish -> post. The per-band order rule
+                # is unchanged; only the claim in front of it is gone.
+                rv.post_full(slot=b, seq=t * bands + b, nbytes=1)
+            credit.set()                        # pause(t) then credit(t)
+            if t + 1 < tags:
+                if drain_between and not rv.wait_drained(tag=f"weights_{t}"):
+                    out.put(("source", f"blocked before tag {t + 1}"))
+                    return
+        out.put(("source", "deposited"))
+    except Exception as exc:
+        out.put(("source", f"{type(exc).__name__}: {exc}"))
+
+
+def _destination(nonce, root, tags, bands, credit, out, post_drain=True):
+    rv = _rv(nonce, root, bands)
+    try:
+        if not credit.wait(timeout=BUDGET):
+            out.put(("dest", "W35 credit never published"))
+            return
+        last = -1
+        for t in range(tags):
+            for b in range(bands):
+                got = rv.wait_full(slot=b, seq=t * bands + b)
+                if got is None:
+                    out.put(("dest", f"W68 no full band at {t}.{b}"))
+                    return
+                if t * bands + b <= last:
+                    out.put(("dest", "W68 seq went backwards"))
+                    return
+                last = t * bands + b
+            if post_drain:
+                rv.post_drained(tag=f"weights_{t}")
+        out.put(("dest", "collected"))
+    except Exception as exc:
+        out.put(("dest", f"{type(exc).__name__}: {exc}"))
+
+
+def _run(target_pair, nonce, **kw):
     from sglang.srt.weg2.weight_exchange_bounce import BounceSlots
 
     xr.unlink_semaphores(nonce)
@@ -112,20 +151,21 @@ def _run(nonce, *, batches, slots, per_tag):  # per_tag: never|tag|band
     # live boot and is only ever cleaned by epoch/holder (shm-residue rule).
     root = tempfile.mkdtemp(prefix="weg2-1374-")
     os.makedirs(xr.region_dir(nonce, root), exist_ok=True)
-    BounceSlots(nonce, shm_root=root, create=True)
+    BounceSlots(nonce, shm_root=root, create=True,
+                rows_per_pair=int(kw.pop("rows", 8)))
     try:
         ctx = mp.get_context("fork")
         credit, out = ctx.Event(), ctx.Queue()
-        ps = [ctx.Process(target=_source,
-                          args=(nonce, root, batches, slots, credit, per_tag,
-                                out)),
-              ctx.Process(target=_destination,
-                          args=(nonce, root, batches, slots, credit, out))]
+        src, dst = target_pair
+        ps = [ctx.Process(target=src, args=(nonce, root), kwargs=dict(
+                  credit=credit, out=out, **kw.get("src", {}))),
+              ctx.Process(target=dst, args=(nonce, root), kwargs=dict(
+                  credit=credit, out=out, **kw.get("dst", {})))]
         for p in ps:
             p.start()
         for p in ps:
             p.join(timeout=4 * BUDGET)
-            if p.is_alive():           # a real hang, not a named refusal
+            if p.is_alive():
                 p.terminate()
                 p.join()
         got = {}
@@ -139,64 +179,87 @@ def _run(nonce, *, batches, slots, per_tag):  # per_tag: never|tag|band
 
 
 class TodaysOrderDeadlocks(CustomTestCase):
-    """RED-FIRST: this is xsn30, in two processes, in seconds."""
+    """RED-FIRST: xsn30, in two processes, in seconds."""
 
-    def test_deposit_before_credit_deadlocks_when_the_tag_exceeds_the_slots(self):
-        got = _run("desk-1374-today", batches=4, slots=2, per_tag="never")
-        self.assertIn("source", got)
-        self.assertIn("blocked at band 2", got["source"],
-                      f"the source must block once the slots are full: {got}")
-        self.assertIn("dest", got)
-        self.assertIn("credit never published", got["dest"],
-                      f"and the destination must starve on the credit: {got}")
-
-
-class LockstepRunsThrough(CustomTestCase):
-    def test_a_tag_that_fits_the_slots_completes_at_depth_one(self):
-        """depth=1 -> assemble_slots(1, comparing=True) = 2 usable slots."""
-        got = _run("desk-1374-fits", batches=2, slots=2, per_tag="tag")
-        self.assertEqual(got.get("source"), "deposited", got)
-        self.assertEqual(got.get("dest"), "collected", got)
-
-
-class TheLockstepUnitMustFitTheBuffer(CustomTestCase):
-    """THE SIZING CONSTRAINT, executable. Per-tag lockstep is deadlock-free
-    only where a tag's bands FIT the deposit buffer -- and xsn30's own
-    `weights_3` does not: 2916 MiB against slots x slot_bytes = 2 x 128 MiB =
-    256 MiB (published terms: slot_bytes=134217728, depth=1), so 23 bands
-    against 2 slots. The pause granularity is the TAG, so no credit can be
-    published mid-tag to let the collector in, and the cycle closes INSIDE the
-    one tag.
-
-    The `band` control below is what proves the constraint is the GRANULARITY
-    and not the buffer as such: publish a credit per band -- which the pause
-    cannot do -- and the same 4 bands through 2 slots complete. That is the
-    measurement that decides between sizing the buffer per tag and pipelining
-    the collect one tag behind the deposit."""
-
-    def test_one_tag_larger_than_the_buffer_deadlocks_under_per_tag_credit(self):
-        got = _run("desk-1374-bigtag", batches=4, slots=2, per_tag="tag")
+    def test_the_old_per_band_claim_deadlocks_when_the_tag_exceeds_the_slots(self):
+        got = _run((_old_source, _old_destination), "desk-1374-today",
+                   rows=8, src={"batches": 4, "slots": 2},
+                   dst={"batches": 4, "slots": 2})
         self.assertIn("blocked at band 2", str(got.get("source")), got)
         self.assertIn("credit never published", str(got.get("dest")), got)
 
-    def test_a_finer_credit_would_drain_it_which_is_why_granularity_is_the_issue(self):
-        got = _run("desk-1374-band", batches=4, slots=2, per_tag="band")
+    def test_the_per_band_claim_is_gone_from_the_code(self):
+        """DELETED, not deprecated (operator wording: "der Wait wird
+        geloescht"). A method kept as a named refusal would be a new UNWIRED
+        raiser and would have to be carried in the #1335 frozen debt list --
+        a recorded decision for a call nobody may make. Absence is cheaper and
+        just as checkable."""
+        rv = CrossSlotRendezvous(None, None, pair=PAIR)
+        self.assertFalse(hasattr(rv, "wait_empty"),
+                         "the per-band claim is back; it is the xsn30 cycle")
+        self.assertTrue(hasattr(rv, "wait_drained"))
+        self.assertTrue(hasattr(rv, "post_drained"))
+
+
+class TheLockstepDrains(CustomTestCase):
+    def test_one_tag_larger_than_the_old_slots_drains_under_the_new_contract(self):
+        """OPTION 1: the buffer holds the whole tag, so the deposit needs no
+        collector -- the same 4 bands that deadlocked above run through."""
+        got = _run((_source, _destination), "desk-1374-sized", rows=8,
+                   src={"tags": 1, "bands": 4}, dst={"tags": 1, "bands": 4})
         self.assertEqual(got.get("source"), "deposited", got)
         self.assertEqual(got.get("dest"), "collected", got)
 
+    def test_two_tags_run_in_lockstep_and_seq_never_goes_backwards(self):
+        got = _run((_source, _destination), "desk-1374-two", rows=4,
+                   src={"tags": 2, "bands": 3}, dst={"tags": 2, "bands": 3})
+        self.assertEqual(got.get("source"), "deposited", got)
+        self.assertEqual(got.get("dest"), "collected", got)
+
+    def test_the_next_tag_may_not_overwrite_a_tag_still_being_collected(self):
+        """The one wait that remains. Without the collector's `drained`, the
+        source must STOP before tag t+1 rather than overwrite the buffer."""
+        got = _run((_source, _destination), "desk-1374-nodrain", rows=4,
+                   src={"tags": 2, "bands": 3},
+                   dst={"tags": 2, "bands": 3, "post_drain": False})
+        self.assertIn("blocked before tag 1", str(got.get("source")), got)
+
+
+class TheRecordRowsAreNotFolded(CustomTestCase):
+    def test_a_band_beyond_the_table_refuses_instead_of_aliasing(self):
+        """#1374 (c): `_row` used `% SLOTS_PER_PAIR`, so band 2 shared band
+        0's (seq, bytes) row. At depth=2 (slots=3 under shadow) that was one
+        boot away; the #1358 depth=1 default is the only reason it never bit."""
+        from sglang.srt.weg2.weight_exchange_bounce import (
+            BounceSlots,
+            Weg2XchgBouncePhaseUnordered,
+        )
+
+        root = tempfile.mkdtemp(prefix="weg2-1374-row-")
+        try:
+            nonce = "desk-1374-rows"
+            os.makedirs(xr.region_dir(nonce, root), exist_ok=True)
+            slots = BounceSlots(nonce, shm_root=root, create=True,
+                                rows_per_pair=2)
+            slots.publish(slot=0, seq=7, nbytes=11, pair=PAIR)
+            with self.assertRaises(Weg2XchgBouncePhaseUnordered):
+                slots.publish(slot=2, seq=9, nbytes=13, pair=PAIR)
+            self.assertEqual(slots.read(slot=0, pair=PAIR), (7, 11),
+                             "band 0's row was overwritten by the fold")
+        finally:
+            shutil.rmtree(root, ignore_errors=True)
+
+
+class TheSizingIsStatedFromTheTerms(CustomTestCase):
     def test_the_arithmetic_is_stated_from_the_published_terms(self):
-        """The numbers that decide the sizing, so the next reader re-derives
-        them instead of trusting this docstring."""
         from sglang.srt.weg2 import xchg_bounce as xb
 
         slot_bytes = 134217728                      # published terms, xsn30
-        slots = xb.assemble_slots(1, comparing=True)
-        self.assertEqual(slots, 2)
-        capacity_mib = slots * slot_bytes // (1 << 20)
-        self.assertEqual(capacity_mib, 256)
-        self.assertGreater(2916, capacity_mib,
-                           "weights_3 (2916 MiB) must exceed the buffer, or "
-                           "xsn30's deadlock had another cause")
+        self.assertEqual(xb.assemble_slots(1, comparing=True), 2)
+        self.assertEqual(2 * slot_bytes // (1 << 20), 256)
+        self.assertGreater(2916, 256,
+                           "weights_3 (2916 MiB) must exceed the old buffer, "
+                           "or xsn30's deadlock had another cause")
 
 
 if __name__ == "__main__":

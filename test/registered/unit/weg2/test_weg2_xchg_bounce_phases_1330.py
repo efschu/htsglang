@@ -40,9 +40,10 @@ os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+from test_weg2_xchg_transport_1273 import FakeDeviceOps  # noqa: E402
+
 from sglang.srt.weg2 import weight_exchange as wx  # noqa: E402
 from sglang.srt.weg2 import weight_exchange_bounce as wb  # noqa: E402
-from test_weg2_xchg_transport_1273 import FakeDeviceOps  # noqa: E402
 
 TAG = "weights_0"
 SLOT = 1 << 16
@@ -238,7 +239,14 @@ def test_deposit_then_collect_moves_the_bytes_and_needs_one_pointer_each(
     wb.run_bounce_leg(collect_descs, dst_ops, nonce, slot_bytes=SLOT, depth=1,
                       mode=wx.INJECT_AUTHORITATIVE, phase=wb.PHASE_COLLECT,
                       rendezvous=rv, shm_root=str(tmp_path), lane="p0")
-    assert rv.emptied, "the collect must release the slot"
+    # #1374: the LEG no longer releases per band -- the `empty` row carries
+    # the per-tag drain, and only the caller knows where a tag ends, so the
+    # release is one `post_drained` at the caller after the tag's last band.
+    # Pinned as ABSENT here so the two cannot both post and hand the source
+    # N drain tokens for one tag.
+    assert rv.emptied == [], (
+        "the leg posted a per-band release; that row is the per-tag drain "
+        "and N posts would let the source overwrite the tag being collected")
     assert _read(dst_ops, dst_ptr, nbytes) == b"\xab" * nbytes, (
         "the bytes did not cross the slot")
 
@@ -425,15 +433,23 @@ def test_the_rendezvous_obeys_the_order_run_producer_pair_states():
     sems, slots = _FakeSems(), _FakeSlots()
     rv = wb.CrossSlotRendezvous(sems, slots, pair=0, budget_s=0.01)
 
-    assert rv.wait_empty(slot=0, seq=0) is True
+    # #1374: no per-band claim in front of the fill any more; the ORDER RULE
+    # this test exists for is per band and is unchanged.
     rv.post_full(slot=0, seq=0, nbytes=4096)
     # The publish must already be visible when `full` is posted.
     kinds = [k for what, k in sems.log if what == "post"]
     assert kinds and kinds[-1][2] == "full"
     assert slots.read(slot=0, pair=0) == (0, 4096)
     assert rv.wait_full(slot=0, seq=0) == 4096
-    rv.post_empty(slot=0, seq=0)
-    assert sems.counts[(0, 0, "empty")] == 1
+    # #1374: the collector's per-band `empty` post is gone -- that row carries
+    # the PER-TAG drain now, and N posts per tag would let the source overwrite
+    # the tag being read. The tag's single drain post is asserted here instead.
+    rv.post_drained(tag="weights_0")
+    # The fake arms `empty` at 1 exactly as `create_semaphores` does, and the
+    # drain post is the only one, so 2. Under the real contract the source
+    # primes that inherited 1 away (`prime_drain`), because at the first tag
+    # there is no previous tag to have been drained.
+    assert sems.counts[(0, 0, "empty")] == 2
 
 
 def test_a_collect_whose_producer_never_posted_gets_None_not_a_stale_count():
@@ -445,22 +461,46 @@ def test_a_collect_whose_producer_never_posted_gets_None_not_a_stale_count():
         "byte count -- the record is not the handshake")
 
 
-def test_a_deposit_cannot_claim_a_slot_the_consumer_has_not_drained(tmp_path):
-    """The producing side of the unordered-read hazard, refused by name."""
+def test_a_deposit_that_outgrows_its_buffer_refuses_by_name(tmp_path):
+    """THE SAME HAZARD, RE-AIMED AT THE #1374 CONTRACT.
+
+    This used to assert the per-band claim: the deposit waited on `empty` and
+    refused when the consumer had not drained. That wait is DELETED -- it is
+    what deadlocked boot weg2xsn30, because on a co-located card the consumer
+    cannot run before this rank's pause and the pause cannot run before this
+    deposit (D0 W68 13:50:17 x PP0 W35 13:50:13, both after a full 120 s).
+
+    The hazard it guarded is real and has not gone away: a band that reuses a
+    slot the collector may still be reading. Under Option 1 the buffer holds
+    the whole tag, so the guard becomes a SIZING refusal at the moment the
+    band count would wrap -- named, before any byte moves, instead of a wait
+    that cannot end.
+    """
     nbytes = 4096
     src_ops = FakeDeviceOps(str(tmp_path), rank=0)
-    src_ptr = src_ops.raw_malloc(0, nbytes)
-    sems, slots = _FakeSems(empty=0), _FakeSlots()   # nothing drained
-    rv = wb.CrossSlotRendezvous(sems, _FakeSlots(), pair=0, budget_s=0.01)
+    descs = [wx.XchgDesc(
+        tag=TAG, src_rank=0, dst_rank=1, param_name=f"model.layers.{i}.w",
+        src_ptr=src_ops.raw_malloc(0, nbytes), dst_ptr=None, kind=wx.FLAT,
+        nbytes=nbytes, rows=1, run_bytes=nbytes, spitch=0, dpitch=0,
+        src_off=0, dst_off=0) for i in range(4)]
+    rv = wb.CrossSlotRendezvous(_FakeSems(empty=0), _FakeSlots(), pair=0,
+                                budget_s=0.01)
     with pytest.raises(wb.Weg2XchgBouncePhaseUnordered) as exc:
-        wb.run_bounce_leg([wx.XchgDesc(
-            tag=TAG, src_rank=0, dst_rank=1, param_name="model.layers.0.w",
-            src_ptr=src_ptr, dst_ptr=None, kind=wx.FLAT, nbytes=nbytes, rows=1,
-            run_bytes=nbytes, spitch=0, dpitch=0, src_off=0, dst_off=0)],
-            src_ops, NONCE, slot_bytes=SLOT, depth=1,
-            mode=wx.INJECT_AUTHORITATIVE, phase=wb.PHASE_DEPOSIT,
-            rendezvous=rv, shm_root=str(tmp_path), lane="p0")
-    assert "still full when this deposit tried to claim it" in str(exc.value)
+        # slot_bytes = one desc, so four descs are four bands against the two
+        # slots `assemble_slots(depth=1, comparing=...)` allocates.
+        wb.run_bounce_leg(descs, src_ops, NONCE, slot_bytes=nbytes, depth=1,
+                          mode=wx.INJECT_AUTHORITATIVE, phase=wb.PHASE_DEPOSIT,
+                          rendezvous=rv, shm_root=str(tmp_path), lane="p0")
+    msg = str(exc.value)
+    assert "does not hold the whole tag" in msg, msg
+    assert "weg2xsn30" in msg, "the refusal must name the boot it comes from"
+
+
+def test_the_per_band_claim_cannot_return(tmp_path):
+    """The deleted wait, pinned as absent: its return is the xsn30 cycle."""
+    rv = wb.CrossSlotRendezvous(_FakeSems(empty=0), _FakeSlots(), pair=0)
+    assert not hasattr(rv, "wait_empty")
+    assert hasattr(rv, "wait_drained") and hasattr(rv, "post_drained")
 
 
 def test_the_adapter_passes_deposit_on_source_and_collect_on_the_import_hooks():
@@ -760,9 +800,9 @@ def test_serving_env_path_yields_a_real_semaphore_set_1330(monkeypatch):
     exact two variables `_weg2_shadow_region` reads
     (weight_updater.py:2162-2165). Measured here end to end.
     """
+    from sglang.srt.managers.scheduler_components import weight_updater as wu
     from sglang.srt.weg2 import launcher as L
     from sglang.srt.weg2 import weight_exchange_region as xr
-    from sglang.srt.managers.scheduler_components import weight_updater as wu
 
     class _Log:
         def __call__(self, *a, **k):
@@ -797,8 +837,8 @@ def test_unavailable_semaphores_are_named_not_swallowed_1330(monkeypatch, caplog
     """
     import logging
 
-    from sglang.srt.weg2 import weight_exchange_transport as tp
     from sglang.srt.managers.scheduler_components import weight_updater as wu
+    from sglang.srt.weg2 import weight_exchange_transport as tp
 
     def _boom(*a, **k):
         raise OSError("sem_open refused by the probe")
@@ -1212,17 +1252,24 @@ def test_two_sides_on_one_pair_drain_each_other_1368(tmp_path):
         deposit = wb.CrossSlotRendezvous(sems, slots, pair=0)
         collect = wb.CrossSlotRendezvous(sems, slots, pair=0)
 
-        assert deposit.wait_empty(slot=0, seq=0) is True
+        # #1374: BANDS NO LONGER HANDSHAKE ONE BY ONE. `full` counts and each
+        # band owns its own record row, so two bands are two posts and two
+        # takes -- and the deposit never waits between them, which is the
+        # deadlock this contract replaced (xsn30).
         deposit.post_full(slot=0, seq=0, nbytes=4096)
+        deposit.post_full(slot=1, seq=1, nbytes=2048)
         assert collect.wait_full(slot=0, seq=0) == 4096
-        collect.post_empty(slot=0, seq=0)
-        # THE DRAIN IS WHAT MAKES THE NEXT BAND POSSIBLE -- without it the
-        # deposit side reports `still full`, which is the xsn27 cascade.
-        assert deposit.wait_empty(slot=0, seq=1) is True
+        assert collect.wait_full(slot=1, seq=1) == 2048
+
+        # THE PER-TAG DRAIN is what makes the NEXT TAG possible; the source
+        # takes it only after publishing that tag's credit, so it cannot
+        # deadlock against the collector it waits for.
+        collect.post_drained(tag="weights_0")
+        assert deposit.wait_drained(tag="weights_0") is True
 
         # A SEQ THE DEPOSIT NEVER PUBLISHED IS NOT ACCEPTED, so a stale band
         # cannot pass as this one's.
-        deposit.post_full(slot=0, seq=1, nbytes=2048)
+        deposit.post_full(slot=0, seq=2, nbytes=1024)
         assert collect.wait_full(slot=0, seq=7) is None
     finally:
         slots.close()
