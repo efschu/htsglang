@@ -515,6 +515,15 @@ _P_ARGV_RE = re.compile(r"\bgroup P argv:\s*(\S.*?)\s*$")
 #:   it moves no weight byte into the host image this table sizes.
 #: * ``--port``: boot identity.
 FORM_KEY_EXCLUDED_FLAGS: Tuple[str, ...] = (
+    #: #1362: THE SERVED NAME IS A LABEL, NOT A FORM. It is what the front
+    #: routes on and every probe asserts against, and it became DERIVED from
+    #: the model path in this commit instead of the literal "Qwen3.8-27B" it
+    #: had been on every boot. Keying on it would have re-spelled the form key
+    #: of the 27B itself (237e36801f4b -> 984effac8fb6, measured on a dry run)
+    #: and invalidated every ring table this line has -- for a string change on
+    #: a model that did not move a single byte. What carries model IDENTITY in
+    #: the key is `--model-path`, which is in it by default and always was.
+    "--served-model-name",
     "--hicache-size",
     "--hicache-mamba-host-mib",
     "--hicache-storage-backend-extra-config",

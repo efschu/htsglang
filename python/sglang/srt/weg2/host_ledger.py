@@ -125,6 +125,7 @@ indicator-law violation the record forbids.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -1609,6 +1610,26 @@ class Weg2HostLedgerRefused(RuntimeError):
     """W20: no arm of the ladder funds both moments plus the store floor."""
 
 
+class Weg2ModelIdentityMismatch(Weg2HostLedgerRefused):
+    """W99 (#1362): a recorded number belongs to a DIFFERENT model.
+
+    THE FOSSIL, found at the desk on the 4B-FP8 transition vehicle
+    (RedHatAI/Qwen3.5-4B-FP8-dynamic, 7.48 GiB): every host number this line
+    carries was measured on the 27B and none of them says so.  Sigma H is
+    solved from the PREVIOUS BOOT's census -- ``Sigma H 48240 MiB = per card
+    the LARGER of [tag census 47512, measured dormant image 48672]``, digit for
+    digit weg2xsn25's -- so a 7.48 GiB model is handed a 47 GiB ring and dies
+    in W48 plus three W51 without ever saying why.
+
+    THAT IS A HEN-AND-EGG BY CONSTRUCTION: the only way to get a record of the
+    new model is to boot it, and it cannot boot because it is priced from the
+    old one.  So a recorded figure may only be spent on the model it was
+    measured on; where the digests differ the ledger refuses BY NAME and says
+    which measurement is missing, instead of reaching for a foreign number and
+    letting a ring-form mismatch three layers down be the message.
+    """
+
+
 class Weg2HostFlipRatchetUnmeasured(Weg2HostLedgerRefused):
     """W94 (#1350): no record of this form carries ``flip_ratchet_gib``.
 
@@ -1710,6 +1731,40 @@ class ImageTerms:
     d_measured: bool
     extra_p_gib: float
     extra_d_gib: float
+
+
+def refuse_foreign_image(entry: Dict[str, object], want: str) -> None:
+    """#1362: a dormant image may only be spent on the model it was measured on.
+
+    THE FOSSIL THIS CLOSES, measured at the desk on the 4B-FP8 vehicle: Sigma H
+    is solved from the previous boot's census, and the 4B would have been handed
+    ``Sigma H 48240 MiB = per card the LARGER of [tag census 47512, measured
+    dormant image 48672]`` -- weg2xsn25's figures, digit for digit, for a model
+    a sixth the size.  The boot then dies in W48 plus three W51, none of which
+    says "wrong model".
+
+    AN EMPTY DIGEST IS UNKNOWN, NOT MATCHING.  Records written before #1362
+    carry none, and treating those as "same model" would re-open the hole for
+    exactly the boots most likely to hit it.  The refusal names the measurement
+    that is missing, because the fix is one boot of the new model -- not a
+    smaller number.
+    """
+    got = str(entry.get("model_digest") or "")
+    if got == str(want):
+        return
+    raise Weg2ModelIdentityMismatch(
+        f"W99 Weg2ModelIdentityMismatch: the recorded dormant image of boot "
+        f"{entry.get('boot_tag', '?')} @ {entry.get('commit', '?')} carries "
+        + (f"model {got!r}" if got else "NO model digest (written before #1362)")
+        + f", this boot runs {want!r}. A dormant image sizes Sigma H, and Sigma H "
+        f"is the ring: spending another model's image here hands this boot a ring "
+        f"measured for a different checkpoint -- on the 4B-FP8 vehicle that is a "
+        f"47 GiB ring for a 7.48 GiB model, and the boot dies in W48 + 3x W51 "
+        f"without ever naming the cause. There is no smaller number to fall back "
+        f"to: the fix is ONE boot of {want!r} to record its own image, or "
+        f"sigma_h_from_manifests with the printed {MANIFEST_CENSUS_SURCHARGE:.3f} "
+        f"surcharge ({MANIFEST_CENSUS_SURCHARGE_SOURCE})"
+    )
 
 
 def resolve_image_terms(record: Optional[Dict[str, dict]] = None) -> ImageTerms:
@@ -2482,6 +2537,140 @@ def flip_ratchet_record(
         # stored beside it is the one #1309 had to re-derive from a comment.
         "instrument": "anon+shmem+slab_unreclaimable (memory.stat), NEVER memory.current",
     }
+
+
+def model_digest(model_path: str) -> str:
+    """#1362: a short, stable identity for the model a measurement belongs to.
+
+    Path-derived and deliberately cheap: basename plus a hash of the full path.
+    It does NOT read the checkpoint -- this runs on the launch path, a multi-GB
+    read would be a new cost, and the question it answers ("is this the same
+    model the recorded number came from") a path answers for every boot this
+    line has run.  A CONTENT digest over config.json + the tensor index is the
+    better identity and is what the calibration records carry; this one is the
+    launch-path fallback for records that predate them, and it says so wherever
+    it is printed rather than passing for the stronger thing.
+    """
+    p = str(model_path or "").rstrip("/")
+    base = os.path.basename(p) or "unknown"
+    return f"{base}@{hashlib.sha256(p.encode()).hexdigest()[:8]}"
+
+
+#: #1362 THE MEASURED SHORTFALL OF THE MANIFEST ANCHOR, named rather than
+#: silently adopted.  #1359 measured it on the 27B: per-card manifests sum to
+#: 32783 MiB against a 47512 MiB tag census -- ratio **1.449** -- because the
+#: manifests count TENSOR bytes while the saver backs up whole REGIONS.  The
+#: gap is real memory, so a manifest-sourced Sigma H without it sizes the ring
+#: 40 % short and ends in W31/W51 at the flip.
+#:
+#: IT IS BORROWED FROM ANOTHER MODEL, which is the very transfer this ticket
+#: refuses elsewhere.  Two things make it admissible and both are printed: it
+#: is the CONSERVATIVE direction (bigger ring, never smaller), and it is
+#: replaced by the model's OWN census after its first boot.
+MANIFEST_CENSUS_SURCHARGE = 1.449
+MANIFEST_CENSUS_SURCHARGE_SOURCE = (
+    "#1359 on the 27B: manifests 32783 MiB vs tag census 47512 = 1.449. "
+    "BORROWED from another model and printed as such; conservative direction "
+    "(bigger ring), retired by this model's own census after its first boot"
+)
+
+
+#: #1362: where a model's own PP calibration lives, one file per model, keyed
+#: by the CHECKPOINT digest the record carries -- not by the boot tag and not by
+#: the argv form key.  The form key answers "same boot form?"; this answers
+#: "same model?", and the fossil this closes is a 64-layer measurement being
+#: spent on a 32-layer model because nothing asked.
+CALIB_DIR = "/spinning/gpu-arb/weg2/calib"
+CALIB_SCHEMA = "weg2-pp-calib/1"
+
+
+def read_pp_calibration(
+    digest: str, calib_dir: str = CALIB_DIR
+) -> Tuple[Optional[Dict[str, object]], str]:
+    """One model's PP calibration, or ``(None, why)``.  Never another model's.
+
+    Returns the record only when its own ``model_digest`` matches the one asked
+    for.  A record that carries ``refused`` is an ABSENCE WITH A REASON -- the
+    measuring run happened and could not produce numbers -- and that reason is
+    handed back verbatim, because "the calibration refused for X" and "nobody
+    ever measured" are different states and only one of them is fixed by
+    booking a window.
+
+    ``measured_ms_per_layer`` and ``measured_counts`` are validated TOGETHER:
+    the solver consumes them as a pair, and a record carrying one without the
+    other is the second-bookkeeping shape that lets ms from one cut be divided
+    by layer counts from another.
+    """
+    path = os.path.join(calib_dir, f"{digest}.json")
+    try:
+        with open(path) as f:
+            rec = json.load(f)
+    except OSError:
+        return None, (
+            f"no PP calibration for model {digest}: {path} does not exist. The "
+            f"constants in this tree were measured on a 64-layer model and are "
+            f"NOT transferable -- a measuring run is needed, not a default"
+        )
+    except ValueError as e:
+        return None, f"PP calibration for {digest} is unreadable ({e})"
+    if str(rec.get("schema", "")) != CALIB_SCHEMA:
+        return None, (
+            f"PP calibration for {digest} carries schema "
+            f"{rec.get('schema')!r}, this reader speaks {CALIB_SCHEMA!r}"
+        )
+    got = str(rec.get("model_digest", ""))
+    if got != digest:
+        return None, (
+            f"PP calibration file {path} carries model_digest {got!r}, asked for "
+            f"{digest!r} -- a file named for one model holding another's numbers "
+            f"is exactly the transfer this check exists to stop"
+        )
+    if rec.get("refused"):
+        return None, (
+            f"PP calibration for {digest} REFUSED at measuring time: "
+            f"{rec['refused']}. That is an absence WITH a reason -- booking "
+            f"another window does not fix it until the reason is addressed"
+        )
+    ms = rec.get("measured_ms_per_layer")
+    counts = rec.get("measured_counts") or rec.get("stage_layer_counts")
+    attn = rec.get("measured_attn_counts") or rec.get("attn_counts")
+    missing = [n for n, v in (("measured_ms_per_layer", ms),
+                              ("measured_counts", counts),
+                              ("measured_attn_counts", attn)) if not v]
+    if missing:
+        return None, (
+            f"PP calibration for {digest} is incomplete: {missing} absent. The "
+            f"solver consumes ms and counts as a PAIR; a record with one half is "
+            f"how ms from one cut get divided by layer counts from another"
+        )
+    if not (len(ms) == len(counts) == len(attn)):
+        return None, (
+            f"PP calibration for {digest} disagrees with itself: "
+            f"{len(ms)} ms figures, {len(counts)} layer counts, {len(attn)} "
+            f"attention counts -- one per stage or the pair is not a pair"
+        )
+    return rec, (
+        f"MEASURED for model {digest}: ms/layer={list(ms)} counts={list(counts)} "
+        f"attn={list(attn)} at prefix "
+        f"{rec.get('calibration_prefix_tokens', '?')} tokens "
+        f"({rec.get('provenance', 'no provenance recorded')})"
+    )
+
+
+def refuse_foreign_calibration(digest: str, why: str) -> "Weg2ModelIdentityMismatch":
+    """The named refusal, so the message is the missing MEASUREMENT and not a
+    ValueError three layers down in the cut solver."""
+    return Weg2ModelIdentityMismatch(
+        f"W99 Weg2ModelIdentityMismatch: the PP calibration for model {digest} "
+        f"is not available and this tree's constants belong to ANOTHER MODEL. "
+        f"{why}. The 64-layer figures (P_PP_STAGE_RATIO_SCORES, "
+        f"MEASURED_MS_PER_LAYER) were taken on boot bsscale's 27B and carry no "
+        f"model reference at all; spending them on a different layer count is "
+        f"what produced a bare ValueError ('the anchor stage 1 holds 18 linear "
+        f"and 0 attention layers in the calibration cut') instead of a verdict. "
+        f"A measuring run for {digest} is the fix; there is no default and a "
+        f"default is what this refusal exists to prevent."
+    )
 
 
 def resolve_flip_ratchet_gib(
@@ -3463,6 +3652,10 @@ def dormant_image_sample(
     # exists). It is stored so `run_origin_gib` can say whether the floor it
     # chose already CONTAINS the ratchet -- see `Weg2HostRatchetDoubleCharged`.
     sampled_at_flip_epoch: Optional[int] = None,
+    # #1362: WHICH MODEL these bytes are. Every host figure this line records
+    # was measured on the 27B and none of them said so, which is how a 7.48 GiB
+    # model would have been handed a 47 GiB ring.
+    model_digest_: str = "",
 ) -> Dict[str, object]:
     """One group's dormant image, measured at its FIRST sleep.  Pure but for /proc.
 
@@ -3614,6 +3807,11 @@ def dormant_image_sample(
         "sampled_at_flip_epoch": (
             None if sampled_at_flip_epoch is None else int(sampled_at_flip_epoch)
         ),
+        # #1362: the model these bytes belong to. Empty on records written
+        # before this commit -- and an EMPTY digest is an UNKNOWN model, never a
+        # matching one: the consumers treat it as "cannot be shown to be the
+        # same" and refuse rather than assume the tree's incumbent.
+        "model_digest": str(model_digest_ or ""),
         "weight_tags_gib": weight_tags_gib,
         "extra_gib": rss_gib - weight_tags_gib,
         "pids": seen,
