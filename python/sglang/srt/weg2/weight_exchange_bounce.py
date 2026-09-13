@@ -389,7 +389,8 @@ def bounce_path(boot_nonce: str, shm_root: str = xr.SHM_ROOT,
     Empty ``lane`` keeps the historical single-buffer name, which is what the
     single-process ``phase=both`` form and every existing test use.
     """
-    base = os.path.join(xr.region_dir(boot_nonce, shm_root), "bounce.bin")
+    base = os.path.join(xr.region_dir(boot_nonce, shm_root),
+                        xr.BOUNCE_SLOT_PREFIX)
     return base if not lane else f"{base}.{lane}"
 
 

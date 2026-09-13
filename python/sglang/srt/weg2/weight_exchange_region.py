@@ -1872,6 +1872,12 @@ def all_shadow_sem_names(boot_nonce: str) -> List[str]:
     return all_sem_names(shadow_nonce(boot_nonce))
 
 
+#: THE BOUNCE SLOT FILE'S NAME, owned HERE because teardown must recognise the
+#: files the leg creates and neither side may spell it twice. `bounce_path`
+#: (weight_exchange_bounce.py) builds `<prefix>` or `<prefix>.<lane>` from it.
+BOUNCE_SLOT_PREFIX = "bounce.bin"
+
+
 def all_sem_names(boot_nonce: str) -> List[str]:
     """All 24: six directed pairs x two slots x {empty, full}."""
     return [
@@ -2033,11 +2039,49 @@ def teardown_region(boot_nonce: str, *, shm_root: str = SHM_ROOT,
         removed = 1
     except FileNotFoundError:
         pass
+    # THE BOUNCE SLOTS, AND ONLY THIS EPOCH'S. Teardown unlinked the region
+    # file and then tried to `rmdir` a directory that still held
+    # `bounce.bin.*`, so the rmdir failed silently and the whole epoch
+    # directory survived -- with its slot files, which are the largest thing
+    # the lane puts in /dev/shm (weg2xsn25: 2268971328 B per live slot).
+    #
+    # SCOPED BY HOLDER, NEVER BY PATTERN. This lists THIS boot's own directory
+    # (`region_dir(boot_nonce)`) and touches nothing outside it. A glob over
+    # /dev/shm for `weg2-*` or `sem.weg2-xchg-*` would reach other epochs and
+    # other holders -- on 2026-09-13 that form came one step from killing a
+    # RUNNING boot, which is why the rule is holder-scoped and not
+    # pattern-scoped. Foreign entries inside our own directory are COUNTED and
+    # LEFT, so a surprise shows up as a number instead of being deleted.
+    slots = foreign = 0
+    try:
+        for entry in sorted(os.listdir(region_dir(boot_nonce, shm_root))):
+            full = os.path.join(region_dir(boot_nonce, shm_root), entry)
+            if entry.startswith(BOUNCE_SLOT_PREFIX):
+                try:
+                    os.unlink(full)
+                    slots += 1
+                except FileNotFoundError:
+                    pass
+            else:
+                foreign += 1
+    except FileNotFoundError:
+        pass
     try:
         os.rmdir(region_dir(boot_nonce, shm_root))
     except OSError:
         pass
     if log is not None:
-        log(f"WEG2-XCHG-TEARDOWN boot={boot_nonce} sems_unlinked={sems}/24 "
-            f"region_removed={removed}")
-    return {"sems": sems, "region": removed}
+        # FIELDS APPENDED, NEVER INTERLEAVED -- same rule the cover line
+        # follows: the greppable prefix and the existing fields do not move,
+        # so the readers that count `sems_unlinked` keep working.
+        # THE DENOMINATOR IS COMPUTED, NOT SPELLED. It read `/24` and was a
+        # lie the moment the observer got its own 24 (`shadow_nonce`): the set
+        # this teardown unlinks is 60 names -- 24 exchange + 12 diagonal + 24
+        # observer -- and the line claimed 24. A hard-coded denominator is the
+        # same defect class as a hard-coded size, one instrument further out.
+        log(f"WEG2-XCHG-TEARDOWN boot={boot_nonce} "
+            f"sems_unlinked={sems}/{len(all_region_sem_names(boot_nonce))} "
+            f"region_removed={removed} epoch={boot_nonce} "
+            f"slots_unlinked={slots} foreign_skipped={foreign}")
+    return {"sems": sems, "region": removed, "slots": slots,
+            "foreign": foreign}

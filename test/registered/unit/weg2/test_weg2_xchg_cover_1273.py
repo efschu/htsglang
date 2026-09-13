@@ -1011,5 +1011,58 @@ class WCodeTest(unittest.TestCase):
         )
 
 
+
+class PlanOverclaimTest(_ChunkedCase):
+    """#1335: a claim LARGER than the tensor is refused at the plan site."""
+
+    def test_a_claim_larger_than_the_tensor_is_refused_1335(self):
+        """The plan may not claim bytes the parameter does not have.
+
+        MEASURED BEFORE BUILDING IT, on boot weg2xsn25's own 44 cover rows:
+        `short=0 missing=0 uncovered=0` on every one, and `planned_mib` above
+        `walk_mib` on NONE -- so this refusal costs today's boots nothing. It
+        exists because nothing gated the condition, not because the condition
+        was observed.
+
+        WHAT WAS OBSERVED IS A DIFFERENT NUMBER, and the distinction is the
+        finding: on 6 of those 44 rows the plan exceeds the SAVER'S BOOK
+        (`attribution_verdict=SAVER-BOOKS-LESS-THAN-WALK`, delta -107.7 to
+        -115.4 MiB), while the saver's book is itself BELOW the walk. The tag
+        holds what the walk found; it is the book that is short. Gating on that
+        comparison would refuse every boot over a known-incomplete book.
+        """
+        model = _Model()
+        planned = _planned_bytes(model)
+        tag = sorted(planned)[0]
+        name = sorted(planned[tag])[0]
+        planned[tag][name] = int(planned[tag][name]) + 4096
+
+        with self.assertRaises(wx.Weg2XchgPlanDisagree) as caught:
+            wx.build_coverage(
+                model, rank=0, planned_bytes_by_tag=planned,
+                tag_bytes=_tag_bytes_stub())
+        text = str(caught.exception)
+        self.assertIn("W68", text)
+        self.assertIn(name, text)
+        self.assertIn("4096 B this parameter does not have", text)
+
+    def test_a_claim_smaller_than_the_tensor_is_still_only_short_1335(self):
+        """PARTIAL COVERAGE IS NOT OVERCLAIM -- the other direction stays a row.
+
+        The guard is one-sided on purpose: a smaller claim is a plan that
+        covers part of a parameter, which `short` books and the cover line
+        counts. Refusing it too would have turned a counted state into a
+        boot-stopper.
+        """
+        model = _Model()
+        name = sorted(dict(model.named_parameters()))[0]
+        live = dict(model.named_parameters())[name].untyped_storage().nbytes()
+        planned = _planned_bytes(model, short={name: live - 4096})
+        rows = wx.build_coverage(
+            model, rank=0, planned_bytes_by_tag=planned,
+            tag_bytes=_tag_bytes_stub())
+        self.assertTrue(any(row.short for row in rows.values()), rows)
+
+
 if __name__ == "__main__":
     unittest.main()

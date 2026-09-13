@@ -1067,3 +1067,41 @@ def test_both_product_call_sites_pass_the_arm_terms_1330(monkeypatch):
         "the deposit path passed terms=None -- run_bounce_leg derives no size "
         "of its own and refuses by W68, which is how weg2xsn26 died")
     assert int(kw["terms"].widest_layer_bytes) == 4096, kw["terms"]
+def test_teardown_removes_own_slots_and_leaves_foreign_ones_1330(tmp_path):
+    """Teardown unlinks THIS epoch's bounce slots -- and nothing else.
+
+    It unlinked the region file and then `rmdir`ed a directory that still held
+    `bounce.bin.*`, so the rmdir failed silently and the whole epoch directory
+    survived with the largest thing the lane puts in /dev/shm (weg2xsn25:
+    2268971328 B per live slot).
+
+    SCOPED BY HOLDER, NEVER BY PATTERN: a glob over /dev/shm for `weg2-*` or
+    `sem.weg2-xchg-*` reaches other epochs and other holders, and on
+    2026-09-13 that form came one step from killing a RUNNING boot. A foreign
+    entry inside our own directory is COUNTED and LEFT, so a surprise is a
+    number instead of a deletion.
+    """
+    import os
+
+    from sglang.srt.weg2 import weight_exchange_region as xr
+
+    nonce = "b4nteardownratchet"
+    root = str(tmp_path)
+    os.makedirs(xr.region_dir(nonce, root), exist_ok=True)
+    for lane in ("", "p0", "p1"):
+        open(wb.bounce_path(nonce, shm_root=root, lane=lane), "wb").close()
+    foreign = os.path.join(xr.region_dir(nonce, root), "someone-elses.bin")
+    open(foreign, "wb").close()
+
+    seen = []
+    got = xr.teardown_region(nonce, shm_root=root, log=seen.append)
+
+    assert got["slots"] == 3, got
+    assert got["foreign"] == 1, got
+    assert os.path.exists(foreign), "a foreign file was DELETED, not skipped"
+    line = seen[0]
+    assert "slots_unlinked=3" in line and "foreign_skipped=1" in line, line
+    assert f"epoch={nonce}" in line, line
+    # THE DENOMINATOR IS COMPUTED: it read `/24` while the set is 60 names
+    # (24 exchange + 12 diagonal + 24 observer).
+    assert f"/{len(xr.all_region_sem_names(nonce))}" in line, line

@@ -3090,6 +3090,31 @@ def build_coverage(
                         exempt.append(t.name)
                         covered_storage.add(t.storage_key)
                         continue
+                    if claim > t.nbytes:
+                        # #1335 THE GATE AT THE PLAN SITE. A claim SMALLER than
+                        # the tensor is partial coverage, which `short` books
+                        # and the line counts. A claim LARGER than the tensor
+                        # is not coverage at all: the plan would move bytes the
+                        # parameter does not have, and every downstream reader
+                        # (the cover row, the ledger's charge, the leg's band)
+                        # would inherit a number the hardware cannot back.
+                        #
+                        # MEASURED BEFORE BUILDING IT, on weg2xsn25's own 44
+                        # cover rows: `short=0 missing=0 uncovered=0` on every
+                        # one, and `planned_mib > walk_mib` on NONE. So this
+                        # refusal costs today's boots nothing -- it exists so
+                        # the condition cannot arrive unannounced, which is
+                        # what "nothing gates it" meant.
+                        raise Weg2XchgPlanDisagree(
+                            f"W68 Weg2XchgPlanDisagree: {t.name} (tag={tag}) "
+                            f"is planned at {claim} B while the live tensor "
+                            f"holds {t.nbytes} B -- the plan claims "
+                            f"{claim - t.nbytes} B this parameter does not "
+                            f"have. Refusing at the plan site: a claim the "
+                            f"hardware cannot back becomes the cover row's "
+                            f"planned_mib, the ledger's charge and the leg's "
+                            f"band, and each of those reads it as a fact."
+                        )
                     if claim != t.nbytes:
                         short.append(
                             ShortParameter(
