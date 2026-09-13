@@ -103,6 +103,54 @@ class TestDraftPageSpec(CustomTestCase):
             build_draft_window(FakeDraftHostPool(1), TOTAL_HEADS, 1, 1, tp_size=3, tp_rank=1)
 
 
+class TestDraftWindowKvLtTp(CustomTestCase):
+    """#1382 (W1): kv < tp -- Zwerg Qwen3.5-2B (num_key_value_heads=2) in the
+    six-rank Weg-2 form (D = TP3). Reproduces BOOT7's ``CanonicalPageError
+    draft head window mismatch (W1)`` at the ``build_draft_window`` level
+    (hermetic, no GPU) and pins the fix: every rank's canonical head window
+    is the FULL ``(0, total)`` range, matching what
+    ``ModelConfig._uneven_tp_num_kv_heads`` already allocates on the host/
+    device draft pool at kv<tp (``attn_kv_replicated`` -- "every rank holds
+    ALL kv heads"). See DESIGN_draftkv_kvlt_tp_0913.md."""
+
+    KV = 2  # Qwen3.5-2B num_key_value_heads
+    PAGE_BYTES = 2 * KV * HEAD_DIM  # 1024
+
+    def test_every_rank_gets_the_full_window(self):
+        for tp_rank in range(3):
+            w = build_draft_window(
+                FakeDraftHostPool(self.KV), self.KV, 0, self.KV, tp_size=3, tp_rank=tp_rank
+            )
+            self.assertTrue(w.is_whole, f"rank {tp_rank} should read/write the whole page")
+            self.assertEqual(w.total_bytes, self.PAGE_BYTES)
+            self.assertEqual(w.payload_bytes, self.PAGE_BYTES)
+
+    def test_mutant_exclusive_split_at_kv_lt_tp_is_refused(self):
+        """Danger direction (#1382): if a future edit reintroduces the old
+        exclusive-split scheme for kv<tp (some ranks get a real slice, excess
+        ranks get an empty window), the window would silently disagree with
+        the pool's actual (full-replica) head count on at least one rank --
+        W1 must catch that, not let it through as a smaller-but-plausible
+        window. Simulates the pre-fix ``local_head_window(2, 3, 1) == (1, 2)``
+        answer directly against a rank-1 pool that (correctly, per
+        ``_uneven_tp_num_kv_heads``) holds all 2 heads."""
+        with self.assertRaisesRegex(CanonicalPageError, "head window mismatch \\(W1\\)"):
+            build_draft_window(
+                FakeDraftHostPool(1), self.KV, 1, 1, tp_size=3, tp_rank=1
+            )
+
+    def test_kv_eq_tp_keeps_the_exclusive_split(self):
+        """kv == tp is deliberately excluded from the replicated regime
+        (attn_kv_replicated docstring, the `<` vs `<=` measurement) -- one
+        head each, not a full-window replica."""
+        for tp_rank, (off, n) in enumerate(((0, 1), (1, 1), (2, 1))):
+            w = build_draft_window(
+                FakeDraftHostPool(n), 3, off, n, tp_size=3, tp_rank=tp_rank
+            )
+            self.assertFalse(w.is_whole)
+            self.assertEqual(w.payload_bytes, 2 * 1 * HEAD_DIM)
+
+
 class TestDraftPageStore(CustomTestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()

@@ -135,8 +135,13 @@ class HeadWindowTest(CustomTestCase):
         self.assertLess(naive_per_rank * 3, 4)
 
     def test_partition_is_exact_for_many_shapes(self):
+        """Exclusive largest-remainder split, but only where it applies:
+        ``num_heads >= tp_size``. Below that threshold every rank owns the
+        FULL window (next test) -- see #1382 (W1)."""
         for num_heads in range(0, 17):
             for tp_size in range(1, 9):
+                if num_heads < tp_size:
+                    continue
                 with self.subTest(heads=num_heads, tp=tp_size):
                     windows = [
                         local_head_window(num_heads, tp_size, r) for r in range(tp_size)
@@ -148,10 +153,40 @@ class HeadWindowTest(CustomTestCase):
                     for (_, prev_end), (start, _) in zip(windows, windows[1:]):
                         self.assertEqual(start, prev_end)
 
-    def test_more_ranks_than_heads_yields_empty_windows(self):
-        """Replicated-KV layouts legitimately do this; it must not raise."""
+    def test_kv_lt_tp_yields_full_replicated_windows_not_empty(self):
+        """#1382 (W1): below the threshold every rank owns the FULL window,
+        not an exclusive slice for some ranks and an empty one for the rest.
+
+        REWRITTEN from ``test_more_ranks_than_heads_yields_empty_windows``,
+        which pinned the wrong convention -- ``(0,1),(1,2),(2,2),(2,2)`` for
+        ``local_head_window(2, 4, r)``. That mixed two regimes: exclusive
+        1-head slices for ranks 0-1, an EMPTY window (meant to signal "read a
+        replica") for ranks 2-3. Every other place in the tree that answers
+        "how many kv heads does a rank hold when kv < tp" -- ``attn_kv_replicated``
+        (``distributed/utils.py``, "REPLICATED-KV geometry ... every rank
+        holds ALL kv heads"), ``ModelConfig._uneven_tp_num_kv_heads`` (same
+        branch, same wording), and the #492 falsifier ("every rank holds the
+        full replicated kv-heads") -- gives ALL ranks the full head count, not
+        just the ones beyond ``num_kv_heads``. A head cannot be exclusively
+        owned by more than one rank while every rank still needs a nonempty
+        kv-head set to attend over; this is what made D's canonical draft
+        window installation raise ``CanonicalPageError`` (W1) on a real
+        kv=2/tp=3 boot (BOOT7, #1382): the pool cut (full window, matching
+        ``_uneven_tp_num_kv_heads``) disagreed with this function's old
+        exclusive-split answer on every rank.
+        """
         windows = [local_head_window(2, 4, r) for r in range(4)]
-        self.assertEqual(windows, [(0, 1), (1, 2), (2, 2), (2, 2)])
+        self.assertEqual(windows, [(0, 2), (0, 2), (0, 2), (0, 2)])
+
+        windows3 = [local_head_window(2, 3, r) for r in range(3)]
+        self.assertEqual(windows3, [(0, 2), (0, 2), (0, 2)], "the #1382 wall shape")
+
+        # kv == tp stays in the exclusive-split regime (attn_kv_replicated
+        # deliberately excludes equality, test_kv_eq_tp_stays_in_normal_mode
+        # measured why) -- 1 head each, not a full-window replica.
+        self.assertEqual(
+            [local_head_window(3, 3, r) for r in range(3)], [(0, 1), (1, 2), (2, 3)]
+        )
 
     def test_invalid_inputs_are_rejected(self):
         for args in ((4, 0, 0), (4, 3, 3), (4, 3, -1), (-1, 3, 0)):

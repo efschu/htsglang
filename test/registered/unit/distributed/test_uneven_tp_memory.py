@@ -394,6 +394,32 @@ class TestNumKvHeadsAutoRank(UnevenTPTestCase):
         with patch.object(rc, "get_parallel", return_value=fake_parallel):
             self.assertEqual(mc.get_num_kv_heads(4), 2)
 
+    def test_kv_lt_tp_replicates_full_head_count_on_every_rank(self):
+        """#1382 (W1): pins that the draft/target host+device pool allocation
+        already gives EVERY rank the FULL kv-head count under
+        ``attn_kv_replicated`` (kv < tp) -- not 0, not a 1-head exclusive
+        slice. This is the "repliziert, nicht head_num=0" half of the #1382
+        design decision (DESIGN_draftkv_kvlt_tp_0913.md); the draft device
+        pool for the NEXTN/MTP head is built through this same
+        ``ModelConfig.get_num_kv_heads``, so a regression here would silently
+        undersize the draft pool at kv < tp, not just miscompute the
+        canonical window."""
+        import sglang.srt.runtime_context as rc
+
+        set_tp_partition_ratios([1, 1, 1])  # tp_plan_active(3) True, uniform
+        mc = self._mc(total_kv=2)  # kv=2 < tp=3, e.g. Qwen3.5-2B under D=TP3
+        for rank in range(3):
+            fake_parallel = SimpleNamespace(attn_tp_rank=rank)
+            with patch.object(rc, "get_parallel", return_value=fake_parallel):
+                self.assertEqual(
+                    mc.get_num_kv_heads(3),
+                    2,
+                    f"rank {rank} must hold ALL kv heads (replicated), not a slice",
+                )
+        # Engine level (no parallel context): conservative smallest share is
+        # ALSO the full count here, because every rank's share IS the total.
+        self.assertEqual(mc.get_num_kv_heads(3), 2)
+
 
 class _FakeMlpLayer(torch.nn.Module):
     def __init__(self, rows, cols, tp_family="mlp", tp_units=None):

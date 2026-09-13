@@ -205,9 +205,24 @@ def local_head_window(
     arithmetic wall general reslicing runs into, and the reason this function
     does not reuse it.
 
-    A rank beyond the head count owns an EMPTY window rather than raising:
-    replicated-KV layouts legitimately place more ranks than heads, and those
-    ranks read a replica instead of a slice.
+    ``num_kv_heads < tp_size`` (fewer heads than ranks) is a DIFFERENT regime,
+    not a degenerate case of the split above: EVERY rank owns the FULL window
+    ``(0, num_kv_heads)``, matching ``attn_kv_replicated`` (#62/#116) and
+    ``ModelConfig._uneven_tp_num_kv_heads``, both of which give every rank ALL
+    kv heads there -- "REPLICATED-KV geometry ... every rank holds ALL kv
+    heads" (``distributed/utils.py:attn_kv_replicated`` docstring), because a
+    head cannot be exclusively owned by more than one rank while every rank
+    still needs a nonempty kv-head set to attend over (#1382, W1). This
+    function does not import ``attn_kv_replicated``/``tp_plan_active`` on
+    purpose: the whole point of a canonical head window is that P (tp_size=1,
+    no installed ratio plan) and D compute it independently from
+    ``(num_kv_heads, tp_size, tp_rank)`` alone, with no shared plan state --
+    depending on plan globals would make the answer depend on which arm's
+    process calls it. The plain arithmetic condition is sufficient: for
+    ``tp_size == 1`` it is true only at ``num_kv_heads == 0`` (never a real
+    checkpoint), and wherever this fork's uneven-TP machinery produces
+    ``num_kv_heads < tp_size`` for a real rank, an uneven-TP plan is by
+    construction already installed there.
     """
     if tp_size <= 0:
         raise ValueError(f"tp_size must be positive, got {tp_size}")
@@ -215,6 +230,9 @@ def local_head_window(
         raise ValueError(f"tp_rank {tp_rank} out of range for tp_size {tp_size}")
     if num_kv_heads < 0:
         raise ValueError(f"num_kv_heads must be non-negative, got {num_kv_heads}")
+
+    if num_kv_heads < tp_size:
+        return 0, num_kv_heads
 
     base, remainder = divmod(num_kv_heads, tp_size)
     # Ranks below `remainder` take one extra head; the offset is therefore
