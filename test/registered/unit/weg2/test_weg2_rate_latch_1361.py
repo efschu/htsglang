@@ -396,3 +396,69 @@ class TheLaunchMomentChargesBothAtOnce1361c(CustomTestCase):
         peak, _l = hl.launch_moment_peak_gib(5.2, 11.0, 67.2)
         self.assertAlmostEqual(peak, 82.5, delta=1.0)
         self.assertGreater(peak, 67.2 + max(5.2, 11.0))   # a max() model misses it
+
+
+class TheGuardRunsFromLAUNCHNotFromREADY1361a(CustomTestCase):
+    """#1361a: the front's loop cannot cover the window that kills these boots.
+
+    Measured on weg2xsn27: group D emitted `WEG2-XCHG-PLAN dir=d2h` at 00:12:42
+    and the kernel reaped at ~00:13:04, while the front printed its first
+    `WEG2-HOST WATERMARK` at 00:13:46 -- **64 s late**. Not because that loop is
+    slow: the launcher starts the front AFTER both groups, so the startup sleep
+    leg (D loading weights into anon WHILE writing its image into shmem) is
+    structurally unguarded. The latch therefore also runs launcher-side, from
+    the first `launch_group` until the front takes over.
+    """
+
+    def _launcher_src(self):
+        import inspect
+        from sglang.srt.weg2 import launcher as lc
+        return inspect.getsource(lc)
+
+    def test_the_guard_is_armed_before_the_first_group_is_launched(self):
+        """RATCHET, red on f299988d06: there was no launcher-side guard at all."""
+        src = self._launcher_src()
+        arm = src.index("LaunchGuard(")
+        first_launch = src.index("launch_group(spec_p, tree, log, dry)")
+        self.assertLess(arm, first_launch, "guard must be armed BEFORE P starts")
+        # ...and it hands over where the front is built, not earlier.
+        self.assertLess(first_launch, src.index("_launch_guard.stop("))
+        self.assertLess(src.index("_launch_guard.stop("),
+                        src.index("front_argv = front_argv_for("))
+
+    def test_it_feeds_the_cushion_from_one_reading_like_the_front_does(self):
+        src = self._launcher_src()
+        body = src[src.index("class LaunchGuard"):src.index("def measured_record_path")]
+        self.assertEqual(body.count("read_cgroup_pressure()"), 1)
+        self.assertIn("cushion_gib=", body)
+        self.assertIn("shmem_gib=", body)
+
+    def test_a_latch_in_that_window_refuses_the_boot_by_name(self):
+        src = self._launcher_src()
+        self.assertIn("W98 Weg2HostRateLatched (launch guard)", src)
+        hand = src[src.index("_launch_guard.stop("):src.index("front_argv = front_argv_for(")]
+        self.assertIn("Weg2HostLedgerRefused", hand)
+
+    def test_it_is_a_thread_because_the_launcher_blocks(self):
+        """`wait_ready` blocks for minutes; an asyncio task would never tick."""
+        src = self._launcher_src()
+        self.assertIn("threading.Thread(", src)
+        self.assertIn("daemon=True", src)
+
+    def test_the_dry_run_arms_nothing(self):
+        src = self._launcher_src()
+        self.assertIn("None if dry else LaunchGuard(", src)
+
+    def test_the_xsn27_window_is_covered_end_to_end(self):
+        """The replay, as a statement about COVERAGE rather than logic.
+
+        The latch itself is pinned by the cushion tests above. What this pins is
+        that the window in which those numbers occur now has a guard at all:
+        plan at 00:12:42, first cushion sample under the floor at 00:13:03.631,
+        front's first line at 00:13:46. The launcher-side guard is armed before
+        00:12:42 and disarmed only where the front is built.
+        """
+        plan, latch_at, front_first = 12 * 60 + 42, 13 * 60 + 3.631, 13 * 60 + 46
+        self.assertLess(plan, latch_at)
+        self.assertLess(latch_at, front_first)
+        self.assertAlmostEqual(front_first - latch_at, 42.4, places=1)

@@ -51,6 +51,7 @@ import signal
 import socket
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -4762,6 +4763,87 @@ def _installed_max_share_from_record() -> Optional[float]:
 def _gib(v) -> str:
     """#1361: bytes as GiB, or ``unreadable`` -- never 0.00 for an absence."""
     return "unreadable" if v is None else f"{int(v) / host_ledger.GIB:.2f} GiB"
+
+
+class LaunchGuard:
+    """#1361a: the host latch, running from LAUNCH instead of from READY.
+
+    THE HOLE IT CLOSES, measured on boot weg2xsn27: group D emitted its
+    ``WEG2-XCHG-PLAN dir=d2h`` at 00:12:42 and the kernel reaped the boot at
+    ~00:13:04 -- while the FRONT's guard loop printed its first
+    ``WEG2-HOST WATERMARK`` line at 00:13:46, **64 s late**.  The front is not
+    slow; it is started by this launcher AFTER both groups, so the most
+    dangerous window of the whole boot -- the startup sleep leg, where D loads
+    weights into anon WHILE writing its dormant image into shmem -- is
+    structurally unguarded no matter how fast that loop ticks.
+
+    So the guard runs HERE, in the launcher, from the first ``launch_group``
+    until the front is up and takes over.  Same latch class, same cushion
+    terms, same reading (``read_cgroup_pressure`` once per tick, feeding both
+    the cushion test and the level), so the two halves of the boot's protection
+    cannot disagree about what they graded.
+
+    A DAEMON THREAD AND NOT A TASK: the launcher is synchronous here and blocks
+    in ``wait_ready`` for minutes at a time; an asyncio task would not get a
+    tick in exactly the window this exists for.
+    """
+
+    def __init__(self, log, reap_mark_gib: float, period_s: float = 0.5) -> None:
+        self._log = log
+        self._latch = host_ledger.RateLatch(reap_mark_gib=reap_mark_gib)
+        self._period = float(period_s)
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self.verdict: Optional[str] = None
+        self.ticks = 0
+
+    def start(self) -> "LaunchGuard":
+        self._thread = threading.Thread(
+            target=self._run, name="weg2-launch-guard", daemon=True)
+        self._thread.start()
+        self._log(
+            f"WEG2-HOST LAUNCH-GUARD armed period={self._period:.2f}s "
+            f"reap_mark={self._latch.reap_mark_gib:.2f} GiB -- the cushion latch runs "
+            f"from THIS moment, not from READY. Boot weg2xsn27's front printed its "
+            f"first WATERMARK line 64 s after the kernel had already reaped it "
+            f"(#1361a); the startup sleep leg is the window this closes"
+        )
+        return self
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            try:
+                pr = host_ledger.read_cgroup_pressure()
+                nr = pr.get("nonreclaim_gib")
+                if nr is not None:
+                    f, sh = pr.get("file_gib"), pr.get("shmem_gib")
+                    line = self._latch.observe(
+                        time.time(), float(nr),
+                        cushion_gib=(
+                            None if f is None or sh is None
+                            else float(f) - float(sh)
+                        ),
+                        shmem_gib=None if sh is None else float(sh),
+                    )
+                    self.ticks += 1
+                    if line is not None:
+                        self._log(line)
+                        if "W98" in line and self.verdict is None:
+                            self.verdict = line
+            except Exception as e:  # noqa: BLE001 -- a guard never kills its host
+                self._log(f"WEG2-HOST LAUNCH-GUARD read failed: {e}")
+            self._stop.wait(self._period)
+
+    def stop(self, why: str = "") -> Optional[str]:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=2.0)
+        self._log(
+            f"WEG2-HOST LAUNCH-GUARD disarmed ticks={self.ticks} "
+            f"verdict={'none' if self.verdict is None else 'W98 LATCHED'}"
+            + (f" ({why})" if why else "")
+        )
+        return self.verdict
 
 
 def measured_record_path() -> str:
@@ -10297,6 +10379,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     log(early_read_provenance())
     for d in state.deviations:
         log(f"DEVIATION (declared): {d}")
+    # #1361a: ARM BEFORE THE FIRST GROUP STARTS. Everything after this line --
+    # P's load, its first sleep, D's load, D's dormant-image write -- is the
+    # window the front cannot see, because the front is started further down.
+    _launch_guard = None if dry else LaunchGuard(
+        log, host_ledger.OBSERVED_REAP_NONRECLAIM_BYTES / host_ledger.GIB).start()
     launch_group(spec_p, tree, log, dry)
     if dry:
         budgets_d = budgets_from_dc(cards, {c.uuid: dc_expect_d[c.uuid] + P_WINDOWS_MIB - D_WINDOWS_MIB for c in cards}, log, "D(dry, expectation)", corridor_sample_path=ns.corridor_budget_sample, corridor_constrain=True, user_reserve_by_card=user_reserve_by_card)
@@ -10543,6 +10630,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         f"nvml {[c.nvml_index for c in cards]} in stage order): {src_chunk_cards['P']}; "
         f"group=D TP -> no map (uniform across cards). Boot weg2dk4 died because the interleave paused P's tag k "
         f"against D's tag k while P's bytes for k=0..5 were on OTHER cards than the one D was allocating on.")
+    # #1361a: the front is up from here on and carries the same latch on the
+    # same terms, so the launcher-side guard hands over rather than doubling.
+    if _launch_guard is not None:
+        _lg_verdict = _launch_guard.stop("front takes over")
+        if _lg_verdict is not None:
+            raise host_ledger.Weg2HostLedgerRefused(
+                "W98 Weg2HostRateLatched (launch guard): the host cushion was "
+                "exhausted while the dormant image was still being written, in the "
+                "window the front's own loop does not cover. " + _lg_verdict
+            )
     front_argv = front_argv_for(
         py, store_dir, spec_p.pid, spec_d.pid, dc_expect_d, cards, ns, chunk_count,
         carrier_max_tokens, p_bs, d_bs, x_tokens, flip_min_work_tokens, idle_layout_front,
