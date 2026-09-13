@@ -172,8 +172,20 @@ def test_the_diagonal_has_its_OWN_semaphores_named_by_CARD():
                 assert f"-card{card}-{slot}-{kind}" in n, n
     # The census the launcher arms is the union, and it is complete.
     every = xr.all_region_sem_names(boot)
-    assert set(every) == set(cross) | set(diag)
-    assert len(every) == 24 + 3 * xr.SLOTS_PER_PAIR * 2
+    # #1367: THREE FAMILIES NOW -- cross, diagonal, and the observer's own
+    # (`shadow_nonce`, added so the shadow's sample traffic cannot consume the
+    # exchange's handshake). The union is still asserted family by family, and
+    # deliberately so: `set(every) == set(all_region_sem_names(boot))` would be
+    # a tautology, and a total would pass with any one family missing. That is
+    # exactly what this test exists to refuse.
+    shadow = xr.all_shadow_sem_names(boot)
+    assert set(every) == set(cross) | set(diag) | set(shadow)
+    assert not (set(cross) & set(diag)), "cross and diagonal must not overlap"
+    assert not (set(cross) & set(shadow)), (
+        "the observer must not name an exchange semaphore -- that overlap IS "
+        "the weg2xsn25 collision")
+    # #1367: the third family counts too, and the sum stays family-by-family.
+    assert len(every) == 24 + 3 * xr.SLOTS_PER_PAIR * 2 + len(shadow)
 
 
 def test_the_diagonal_carrier_is_sized_from_the_PUBLISHED_slot_by_its_ONE_owner():
