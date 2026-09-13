@@ -10409,9 +10409,10 @@ class ServerArgs:
     def _disable_breakable_cudagraph_if_incompatible(self):
         from sglang.srt.arg_groups.overrides import resolved_view as _resolved_view
 
-        """Breakable (segmented capture, no torch.compile). Breakable enforces
-        memory-saver rejection in its own __init__; config-time rules can be
-        added here as they're discovered.
+        """Breakable (segmented capture, no torch.compile). Breakable also
+        enforces memory-saver rejection in its own __init__, as a backstop --
+        but a raise mid-capture kills the rank, so the same condition is a
+        config-time rule below and the backstop should stay unreached.
         """
         from sglang.srt.configs.model_config import is_deepseek_v4
 
@@ -10440,6 +10441,21 @@ class ServerArgs:
             ("DP attention", lambda: self._resolved().enable_dp_attention),
             # Multimodal prefill replay faults under BCG.
             ("multimodal model", lambda: self.get_model_config().is_multimodal),
+            # BCG refuses the memory saver in its own __init__
+            # (breakable_cuda_graph_backend.py:213). Until #1366 that refusal
+            # was the only thing standing between a memory-saver boot and a
+            # NotImplementedError mid-capture -- and it was never reached,
+            # because `is_multimodal` above happened to disable the prefill
+            # graph first on every boot that set the env var. Text-only P/D
+            # (#1356) removed that accident and three D ranks died in
+            # "Capture prefill CUDA graph failed" (weg2xsn29, 2026-09-13).
+            # A hazard covered by an unrelated predicate is not covered, so
+            # it is named here, where the reason reaches the log.
+            (
+                "memory saver CUDA graph",
+                lambda: self.enable_memory_saver
+                and envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get(),
+            ),
         ]
         for name, predicate in rules:
             if predicate():
