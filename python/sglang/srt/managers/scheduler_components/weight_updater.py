@@ -128,7 +128,7 @@ TMS_RING_GRANULE_BYTES = 2 * 1024 * 1024
 #: same way any other leg failure is reported.  Catching it would turn a
 #: refusal into a silent partial sleep.
 from sglang.srt.weg2 import lane_coverage as wlc  # noqa: E402
-from sglang.srt.weg2 import ring_guard
+from sglang.srt.weg2 import ring_guard  # noqa: E402
 from sglang.srt.weg2.ring_guard import RingNeedGuard  # noqa: E402
 
 #: The POPULATION token every ``WEG2-FLIP-TAG`` line carries, read back by
@@ -138,7 +138,7 @@ from sglang.srt.weg2.ring_guard import RingNeedGuard  # noqa: E402
 from sglang.srt.weg2.ring_table import (  # noqa: E402
     TAG_POPULATION_ALL as WEG2_TAG_POPULATION_ALL,
 )
-from sglang.srt.weg2.ring_table import (
+from sglang.srt.weg2.ring_table import (  # noqa: E402
     TAG_POPULATION_WEIGHTS as WEG2_TAG_POPULATION_WEIGHTS,
 )
 
@@ -956,7 +956,7 @@ class SchedulerWeightUpdaterManager:
             return self.CARRIER_TMS_BACKUP
         return self.CARRIER_DISK
 
-    def _weg2_xchg_inject_weights(self, **kw) -> None:
+    def _weg2_xchg_inject_weights(self, *, tag=None, **kw) -> None:
         """Fill the remapped weight pages from the PEER GROUP, not from disk.
 
         #1273 S6 step 5, the authoritative half.  The bytes come from the peer
@@ -1007,7 +1007,7 @@ class SchedulerWeightUpdaterManager:
                 "is not an option either. Launch through the weg2 launcher, "
                 "which publishes the term it charged on the ARM line."
             )
-        self._weg2_xchg_inject_from_peer(terms=terms, **kw)
+        self._weg2_xchg_inject_from_peer(terms=terms, tag=tag, **kw)
 
     def _weg2_xchg_deposit_before_sleep(self, *, flip_index: int = -1,
                                         tag: Optional[str] = None) -> None:
@@ -1169,7 +1169,7 @@ class SchedulerWeightUpdaterManager:
             sems=self._weg2_xchg_sems(), tag=tag,
         )
 
-    def _weg2_xchg_inject_from_peer(self, *, terms, **kw) -> None:
+    def _weg2_xchg_inject_from_peer(self, *, terms, tag=None, **kw) -> None:
         """The transfer itself, once the term is known.
 
         SEPARATE FROM THE DECISION ABOVE so the seam's test can drive the
@@ -1333,12 +1333,28 @@ class SchedulerWeightUpdaterManager:
         # `run_bounce_leg` then refuses every cross pair by name rather than
         # running it as `both` -- which would ask this rank for the peer's
         # device address again, i.e. weg2xsn20's wall.
+        # #1374 F1 PER-TAG LOCKSTEP, the COLLECT half. `tag` restricts this
+        # collect to the tag the resume loop has just mapped, in the SAME order
+        # the depositing rank walks -- both sides read `weights_family_tags`,
+        # so the order has one producer and neither side invents it. The
+        # collector posts `drained(tag)` at the end of the lane loop, which is
+        # what releases the peer's deposit of the NEXT tag.
+        _cdescs = list(plan.descs)
+        if tag is not None:
+            _cdescs = [d for d in _cdescs
+                       if str(getattr(d, "tag", "")) == str(tag)]
+            if not _cdescs:
+                logger.info(
+                    "WEG2-XCHG COLLECT tag=%s pieces=0 -- this rank's plan "
+                    "carries no desc for this tag; the lockstep step is a "
+                    "no-op and the peer's drain still has to be posted",
+                    tag)
         self._weg2_xchg_bounce_leg(
-            descs=list(plan.descs), ops=ops, boot_nonce=boot_nonce,
+            descs=_cdescs, ops=ops, boot_nonce=boot_nonce,
             terms=terms, mode=mode, device=int(device),
             hook="authoritative",
             region=self._weg2_shadow_region(),
-            sems=self._weg2_xchg_sems(),
+            sems=self._weg2_xchg_sems(), tag=tag,
         )
 
         # THE INSTRUMENTS ARE EMITTED BY THE LEG, NOT HERE, and the first
@@ -1401,6 +1417,18 @@ class SchedulerWeightUpdaterManager:
             # the ein-job-ein-mover defect.
             return
         if carrier == self.CARRIER_EXCHANGE:
+            # #1374 F1: the per-tag collect runs INSIDE the resume loop now, so
+            # by the time this is reached every tag has been collected beside
+            # its own resume. Collecting the whole plan again here would be a
+            # second writer over bytes already injected -- the ein-job-ein-mover
+            # defect the branch above names for the other carriers.
+            if getattr(self, "_weg2_xchg_collected_per_tag", False):
+                self._weg2_xchg_collected_per_tag = False
+                logger.info(
+                    "WEG2-XCHG INJECT per-tag=done -- the resume loop "
+                    "collected each tag beside its own resume (#1374); this "
+                    "once-per-wake entry stands down rather than re-injecting")
+                return
             self._weg2_xchg_inject_weights()
             return
         server_args = self._weg2_server_args()
@@ -4306,6 +4334,15 @@ class SchedulerWeightUpdaterManager:
                         float(tag_bytes.get(tag, 0)),
                         (time.perf_counter() - t_tag) * 1000,
                     ]
+                    # #1374 F1: COLLECT THIS TAG NOW, while it is the tag the
+                    # resume has just mapped -- resume(t) -> collect(t) ->
+                    # post_drained(t), the mirror of the source's deposit(t) ->
+                    # pause(t) -> credit(t). Before #1374 the whole plan was
+                    # collected after the loop, which is why the peer's
+                    # per-tag deposit had nobody to drain it.
+                    if self._weg2_wake_weight_carrier() == self.CARRIER_EXCHANGE:
+                        self._weg2_xchg_inject_weights(tag=tag)
+                        self._weg2_xchg_collected_per_tag = True
                     # S7 (#1273): READ THE MAP COST WHILE IT IS STILL THIS TAG'S.
                     # Resume pass 1 maps every allocation of the tag one at a
                     # time, so its wall is proportional to an allocation count
