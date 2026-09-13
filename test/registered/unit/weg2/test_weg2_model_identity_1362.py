@@ -178,7 +178,11 @@ class TheDormantImageIsNeverSpentOnAnotherModel1362(CustomTestCase):
         src = inspect.getsource(lc)
         i = src.index("host_ledger.dormant_image_sample(")
         call = src[i:src.index("log(host_ledger.format_dormant_image", i)]
-        self.assertIn("model_digest_=host_ledger.model_digest(ns.model)", call)
+        # #1362 [22-fix2] TIGHTENED: [22] pinned the PATH digest here, which no
+        # reader ever compares against -- so the stamp was reachable but inert
+        # and every record this boot wrote would have stayed legacy forever.
+        # The pin is now the CONTENT digest, the identity the readers key on.
+        self.assertIn("model_digest_=(host_ledger.checkpoint_digest(ns.model)[0]", call)
 
     def test_the_record_carries_it(self):
         rec = hl.dormant_image_sample(
@@ -295,3 +299,93 @@ class TheRealRecordDrivesTheRefusal1362(CustomTestCase):
         """The 27B measured the constants; it may go on using them."""
         self.assertEqual(lc.CALIBRATION_LAYERS, 64)
         self.assertEqual(hl.checkpoint_layers(M27) or 64, 64)
+
+
+class LegacyRecordTransition(CustomTestCase):
+    """#1362 [22-fix2] -- the hen-and-egg [22-fix] re-created in its own fix.
+
+    [22-fix] wired `refuse_foreign_image` into `price()` and every dormant-image
+    record on this rig instantly became unusable: they were all written BEFORE
+    #1362, so they carry no `model_digest`, and the rule "empty means unknown"
+    refused the very boots that wrote them. Measured on the gdncov serving form:
+    rc=2, zero ARM lines, W99 naming weg2xsn27 @ 3468c2b535.
+
+    The transition path admits a record with NO digest when this boot's group-P
+    FORM KEY matched the source boot's -- the form key carries `--model-path`
+    and excludes labels (`FORM_KEY_EXCLUDED_FLAGS`), so a match is positive
+    evidence of the same checkpoint path, not an absence of evidence. It prints
+    one line per admitted record, and the line is RETURNED so a caller can read
+    it rather than only logged.
+
+    Everything else is unchanged: a FOREIGN digest is still W99 even under a
+    form-key match (a digest that disagrees is evidence, not silence), and a
+    record with no digest AND no form-key match is still refused.
+    """
+
+    REC = {"boot_tag": "weg2xsn27", "commit": "3468c2b535"}
+    WANT = "5a324e4044bf915181537d1481662a3050e984acd2eb3977174a54aba0ab3143"
+
+    def test_1_legacy_record_with_form_key_match_is_admitted_and_names_itself(self):
+        line = hl.refuse_foreign_image(dict(self.REC), self.WANT, form_key_match=True)
+        # READ, not merely emitted: an instrument without a reader is the
+        # defect the train seat named for exactly this line.
+        self.assertIsNotNone(line, "legacy record under a form-key match must be admitted")
+        self.assertIn("WEG2-MODEL-IDENTITY LEGACY", line)
+        self.assertIn("record=weg2xsn27", line)
+        self.assertIn("digest=absent", line)
+        self.assertIn("form_key=match", line)
+        self.assertIn("accepted", line)
+
+    def test_2_foreign_digest_stays_w99_even_under_a_form_key_match(self):
+        rec = dict(self.REC, model_digest="f" * 64)
+        with self.assertRaises(hl.Weg2ModelIdentityMismatch) as cm:
+            hl.refuse_foreign_image(rec, self.WANT, form_key_match=True)
+        self.assertIn("W99", str(cm.exception))
+
+    def test_3_legacy_record_without_form_key_match_stays_refused(self):
+        with self.assertRaises(hl.Weg2ModelIdentityMismatch) as cm:
+            hl.refuse_foreign_image(dict(self.REC), self.WANT, form_key_match=False)
+        self.assertIn("W99", str(cm.exception))
+
+    def test_4_the_legacy_line_reaches_the_printed_ledger_lines(self):
+        """The reachability half: a returned line nobody appends is also unread."""
+        rec = {"P": dict(self.REC), "D": dict(self.REC)}
+        hl.resolve_image_terms(rec, want_digest=self.WANT, form_key_match=True)
+        self.assertTrue(
+            any("WEG2-MODEL-IDENTITY LEGACY" in x for x in hl.LEGACY_IDENTITY_LINES),
+            "resolve_image_terms must hand the legacy line onward to the ledger",
+        )
+
+    def test_5_the_running_boot_stamps_the_content_digest_not_the_path_one(self):
+        """Item (2): records written from here on carry the digest readers key on.
+
+        [22] stamped `model_digest(path)` -- a PATH hash no reader compares
+        against -- so every record this boot wrote would have stayed legacy
+        forever and the transition path would never retire.
+        """
+        import inspect
+
+        src = inspect.getsource(lc)
+        self.assertIn("model_digest_=(host_ledger.checkpoint_digest(ns.model)[0]", src)
+        self.assertNotIn("model_digest_=host_ledger.model_digest(ns.model)", src)
+
+    def test_6_the_form_verdict_is_read_off_the_solved_table_not_the_plan(self):
+        """The getattr trap, pinned.
+
+        `HostRingPlan` has no `form_same`; the verdict lives on the RingTable it
+        wraps (`plan.table.form_same`). A `getattr(ring_plan, "form_same",
+        False)` therefore reads False on EVERY boot, and the transition path
+        becomes dead code that no dry run can tell from a working one --
+        measured: run gdncov2 refused W99 with `form key 24eb56724d73 MATCHES`
+        printed four lines above the refusal. A default that stands in for an
+        absent attribute is the same defect class as a silent 0 in the ledger.
+        """
+        import inspect
+
+        src = inspect.getsource(lc)
+        self.assertNotIn('getattr(ring_plan, "form_same"', src)
+        self.assertIn('_rt = getattr(ring_plan, "table", None)', src)
+        self.assertIn("form_key_matches=_form_key_matches", src)
+        # HostRingPlan really does not carry it -- the assertion above is about
+        # a real absence, not a style preference.
+        self.assertFalse(hasattr(lc.HostRingPlan(), "form_same"))
