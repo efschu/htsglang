@@ -1752,9 +1752,12 @@ def resolve_xchg_lanes(cut_key: str) -> Tuple[int, str]:
         # it RETIRES at the first boot: the #1358 reader lifts the real count
         # from that boot's HOST-SLOT lines and it is recorded per cut.
         #
-        # W102 IS NOT DELETED. It stays for the case it was built for: a cut
-        # whose record exists and disagrees with what the leg then creates,
-        # which the leg driver still refuses before the first allocation.
+        # W102 IS NOT DELETED, AND SINCE #1358 [W102-wired] IT IS RAISED: the
+        # leg driver (weight_updater.py, the `group_descs_by_pair` guard)
+        # refuses with it when a RECORDED count is below what the leg actually
+        # creates, before the first allocation. Until that commit this comment
+        # claimed a refusal that existed nowhere in the tree -- an intention
+        # written as a state, which is what a W-code census reads as covered.
         from sglang.srt.weg2 import weight_exchange_region as _xr
 
         _worst = int(_xr.N_PAIRS) + int(_xr.N_CARDS)
@@ -4579,6 +4582,34 @@ def _advisory_line(arm: Arm, chosen: bool) -> str:
     )
 
 
+def arm_terms_line(arm) -> str:
+    """#1361 [W97-terms]: the ARM line's TERM FIELDS, as one string.
+
+    ONE PRODUCER, because a refusal that names a different set of terms than
+    the ARM line is a refusal whose cause cannot be checked against the arm it
+    refused. The train's dry run (arm_def.log:112) printed only
+    `predicted 98.67 vs 95.90` -- true, and useless: nothing in it says WHICH
+    term carried the 98.67, so the reader cannot tell an honest arm from a
+    mispriced one without re-deriving the whole ladder by hand.
+
+    Used by the ARM line and by every W97 that reports a predicted peak, so the
+    two cannot drift -- the same rule `_TERM_FIELDS` exists for one layer down.
+    """
+    t = arm.terms or {}
+
+    def _g(k):
+        v = t.get(k)
+        return "n/a" if v is None else f"{float(v):.2f}"
+
+    return (
+        f"anchors={_g('anchors_gib')} rings={_g('rings_gib')} "
+        f"overhead={_g('overhead_gib')} xchg_bounce={_g('xchg_bounce_gib')} "
+        f"host_weights={_g('host_ring_gib')} "
+        f"ratchet_charged={_g('flip_ratchet_charged_gib')} "
+        f"source={str(t.get('flip_ratchet_source', '?')).split(' ')[0]}"
+    )
+
+
 def choose(
     memtotal_bytes: int,
     memavail_bytes: int,
@@ -4819,7 +4850,17 @@ def choose(
                     f"OR ABOVE the observed reap watermark {watermark_gib:.2f} GiB. "
                     f"The hard bound is soft (user rule 2026-09-12); the WATERMARK is "
                     f"where the kernel reaped. Boot weg2xsn25 died on a prediction "
-                    f"5 GiB below it -- accepting one at it is not a deviation."
+                    f"5 GiB below it -- accepting one at it is not a deviation. "
+                    # #1361 [W97-terms]: THE SAME TERMS THE ARM LINE PRINTS.
+                    # Without them this refusal said only `predicted X vs Y`,
+                    # which names the verdict and hides the cause: the reader
+                    # cannot tell WHICH term carried the peak, so an honest arm
+                    # and a mispriced one read identically (train dry run,
+                    # arm_def.log:112).
+                    f"TERMS (S={arm.s_gb} M={arm.m_mib} S_D={_arm_s_d(arm)}): "
+                    f"{arm_terms_line(arm)} -- these are the ARM line's own "
+                    f"fields, from the one producer, so the refusal and the arm "
+                    f"it refused can be compared field by field."
                 )
             if float(riegel_gib) >= hard_bound_gib:
                 raise Weg2HostDeviationRefused(
