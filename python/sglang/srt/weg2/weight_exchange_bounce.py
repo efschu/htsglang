@@ -669,7 +669,19 @@ class BounceResult:
             f"planned={self.planned_bytes} "
             f"deposit_ms={self.deposit_ms:.1f} collect_ms={self.collect_ms:.1f} "
             f"mode={self.mode or wx.INJECT_MODE_UNSET} "
-            + (f"inject={self.inject.verdict} " if self.inject else "")
+            # ALWAYS PRINTED, NEVER OMITTED. The field used to vanish when
+            # `inject` was None, and an absent field is a silence a reader
+            # fills in: weg2xsn25 read three legs' MISSING phase as proof they
+            # ran unsplit when they had run collect. Same shape here, so the
+            # same rule -- say which of the two silences this is:
+            #   by-design-authoritative: no comparison EXISTS under this mode
+            #                            (`comparing = mode == INJECT_SHADOW`)
+            #   NOTHING-COMPARED:        a SHADOW leg that graded nothing,
+            #                            which is a finding and not a state
+            + (f"inject={self.inject.verdict} " if self.inject else
+               ("inject=by-design-authoritative "
+                if str(self.mode) == wx.INJECT_AUTHORITATIVE
+                else "inject=NOTHING-COMPARED "))
             + f"banded={len(self.banded)}"
             + (f" banded_units={','.join(self.banded)}" if self.banded else "")
             + f" overlap={self.overlap} verdict={self.verdict}"
