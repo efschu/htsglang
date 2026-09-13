@@ -77,7 +77,15 @@ xm._pad_vocab_size(1)
 # measured in window dfuqb8. The parent passes it down and the child installs
 # it before anything is named.
 NONCE = os.environ.get("WEG2_REPLAY_NONCE") or f"replay{os.getpid()}"
-SLOT_BYTES = 4 << 20          # the layout, scaled; the RATIO is what matters
+#: THE BOUNCE DEPTH-SLOT, from the environment for the same reason the device
+#: budget is: a spawn child must not size it differently from the parent.
+#: At 4 MiB the arm refused full-width real layers by W71 -- correctly, since
+#: a layer that does not fit a slot cannot be assembled whole.
+SLOTBYTES_ENV = "WEG2_REPLAY_SLOTBYTES"
+
+
+def slot_bytes_cfg() -> int:
+    return int(os.environ.get(SLOTBYTES_ENV, "") or (4 << 20))
 #: Must stay under FakeDeviceOps' FAKE_DEV_BYTES (8 MiB per rank).
 #: THE PER-RANK DEVICE BUDGET, read from the environment on every call so a
 #: spawn child and the parent that budgeted for it cannot disagree.
@@ -936,7 +944,7 @@ def rank_proc(group, rank, evidence, root, q, self_test, max_tensors,
 
         stub._weg2_xchg_bounce_leg(
             descs=list(plan.descs), ops=ops, boot_nonce=NONCE,
-            slot_bytes=SLOT_BYTES, depth=DEPTH,
+            slot_bytes=slot_bytes_cfg(), depth=DEPTH,
             mode=wx.INJECT_AUTHORITATIVE, shm_root=root, device=0,
             hook=hook, region=None, sems=sems)
         q.put(("hostslotleg", group, rank,
@@ -1007,7 +1015,7 @@ def _run(ns) -> int:
     # every line below it -- so a REFUSAL left 36 named semaphores in
     # /dev/shm. A refusal that leaks is a refusal that costs the next run.
     # The teardown below is in a `finally` for the same reason.
-    print(f"WEG2-XCHG-LEG-REPLAY nonce={NONCE} slot_bytes={SLOT_BYTES} "
+    print(f"WEG2-XCHG-LEG-REPLAY nonce={NONCE} slot_bytes={slot_bytes_cfg()} "
           f"depth={DEPTH} max_tensors={ns.max_tensors} col_div={ns.col_div} "
           f"source={'synthetic' if ns.self_test else ns.evidence}")
 
@@ -1016,6 +1024,8 @@ def _run(ns) -> int:
     # boot's, through `manifests_for_boot`, which is the product's own entry.
     mdir = os.path.join(root, "manifests")
     os.makedirs(mdir, exist_ok=True)
+    if ns.slot_bytes:
+        os.environ[SLOTBYTES_ENV] = str(int(ns.slot_bytes))
     if ns.dev_budget:
         os.environ[DEVBUDGET_ENV] = str(int(ns.dev_budget))
     ckpt_pick, ckpt_skip = None, None
@@ -1219,6 +1229,9 @@ def main() -> int:
                     help="path to a safetensors file whose REAL bytes seed "
                          "and grade the seam (user order 2026-09-13: "
                          "RedHatAI/Qwen3.8-27B-INT4, read-only)")
+    ap.add_argument("--slot-bytes", type=int, default=0,
+                    help="bounce depth-slot bytes (default 4 MiB); must cover "
+                         "the widest layer unit or the arm refuses by W71")
     ap.add_argument("--dev-budget", type=int, default=0,
                     help="per-rank device byte budget (default 2 MiB); the "
                          "INT4 arm needs room for whole packed tensors")
