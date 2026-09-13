@@ -4982,7 +4982,8 @@ def xchg_bounce_arm_pins_host(weight_source: str, oncard_mode: str) -> bool:
 
 def xchg_bounce_terms_for_arm(weight_source: str, oncard_mode: str,
                               model_dir: str,
-                              oncard_slot_mib: Optional[int] = None):
+                              oncard_slot_mib: Optional[int] = None,
+                              bounce_depth: int = xchg_bounce.ASSEMBLE_DEPTH_DEFAULT):
     """``(charged_bytes, lines)`` for the host bounce. #1332 B1b.
 
     THE SECOND PRODUCER OF THE SAME PREDICATE AS
@@ -5031,7 +5032,7 @@ def xchg_bounce_terms_for_arm(weight_source: str, oncard_mode: str,
             oncard_slot_mib) * weight_exchange_region.MIB)
     terms, widest, widest_name = checkpoint_census.widest_layer_terms(
         str(model_dir), pairs=int(weight_exchange_region.N_CARDS),
-        depth=xchg_bounce.ASSEMBLE_DEPTH_DEFAULT, slot_bytes=slot_bytes)
+        depth=int(bounce_depth), slot_bytes=slot_bytes)
     lines = [widest, xchg_bounce.arm_line(terms)]
     # PROVENANCE, ADDITIVE: the depth-slot is derived HERE, from this
     # checkpoint's census, and never from a knob -- but no line said so, and a
@@ -5117,7 +5118,11 @@ def choose_host_ledger(
     inject_mode: str = weight_exchange.INJECT_SHADOW,
     oncard_mode: str = ONCARD_MODE_DEFAULT,
     oncard_slot_mib: Optional[int] = None,
-    model_dir: str = "",
+    model_dir: str = "",    # #1358: ONE source for the depth -- the ledger term, `assemble_slots`
+    # and the published terms all price the same number. A second spelling is
+    # how `2.16 GiB` came to have three causes (#1361 [23a]).
+    bounce_depth: int = xchg_bounce.ASSEMBLE_DEPTH_DEFAULT,
+
 ) -> Tuple[host_ledger.Arm, Optional[float], List[str], Dict[str, Optional[int]]]:
     """THE LAUNCHER'S ONE LEDGER CALL SITE: read the host, price the ladder.
 
@@ -5192,22 +5197,28 @@ def choose_host_ledger(
     # (unreadable checkpoint, under-covered buffer) land before any host number
     # is priced against them.
     _bounce_charge_bytes, _bounce_lines = xchg_bounce_terms_for_arm(
-        weight_source, oncard_mode, model_dir, oncard_slot_mib)
+        weight_source, oncard_mode, model_dir, oncard_slot_mib, bounce_depth)
     # #1361 [23a] THE PRICED STATE, NOT ONLY THE PRICE. B4n measured THREE
     # distinct states that all cost 2.16 GiB -- (depth=1, comparing=True),
     # (depth=2, comparing=False) and (depth=2, the OLD expression that was just
     # fixed) -- so the figure alone cannot tell a correctly priced shallow arm
     # from the underpricing. The ARM line prints the state beside the term.
     #
-    # NOT a second derivation of the size: `depth` is the same CONSTANT the
-    # helper hands to `widest_layer_terms`, referenced rather than recomputed,
+    # NOT a second derivation of the size: `depth` is the SAME VALUE the helper
+    # hands to `widest_layer_terms` -- since #1358 that is the `bounce_depth`
+    # flag rather than the constant, and it is READ FROM THE SAME VARIABLE.
+    # Leaving the constant here while the arm is priced at depth=1 would make
+    # the ARM line print `bounce_depth=2` for a depth=1 arm: the field [23a]
+    # introduced to stop a number having three readings would itself be the
+    # lie. Caught at the merge by the train seat, who refused to resolve it
+    # mechanically and was right to.
     # and `slots` comes from `assemble_slots`, which is the one authority
     # (#1335, B4n). `inject_mode` is resolved by that function from this
     # process's own `weight_exchange.inject_mode()`, which is exactly the term
     # a desk run and a boot can disagree about -- printing it is what makes the
     # disagreement readable instead of hidden inside an equal number.
     _bounce_prov = {
-        "depth": int(xchg_bounce.ASSEMBLE_DEPTH_DEFAULT),
+        "depth": int(bounce_depth),
         # #1361 [23e] `comparing` IS PASSED, NOT LEFT TO THE PROCESS DEFAULT.
         # `assemble_slots(depth)` with `comparing=None` asks
         # `weight_exchange.inject_mode()`, which reads INJECT_ENV -- and the
@@ -5221,7 +5232,7 @@ def choose_host_ledger(
         # nobody would have checked. Found by B4n on the env publication, not
         # by me on my own field.
         "slots": int(xchg_bounce.assemble_slots(
-            int(xchg_bounce.ASSEMBLE_DEPTH_DEFAULT),
+            int(bounce_depth),
             comparing=(str(inject_mode) == weight_exchange.INJECT_SHADOW))),
         "inject_mode": str(inject_mode),
     } if _bounce_charge_bytes else None
@@ -8938,6 +8949,35 @@ def build_parser() -> argparse.ArgumentParser:
              "can refuse NOTHING ELSE.",
     )
     ap.add_argument(
+        # #1358 THE ONE HOST LEVER FOR xsn28, AS A FLAG AND NOT A CONSTANT.
+        # weg2xsn27 died in `shm,pinned`, and the #1358 reader attributed the
+        # WHOLE 10.565 GiB of that region to five slot holders x 2.113 GiB from
+        # one emit site. The buffer is `widest x assemble_slots(depth)` and
+        # `slots = depth + 1` under shadow, so one step of depth is one widest
+        # layer per holder: 721.3 MiB x 5 = 3.52 GiB of non-reclaimable, at the
+        # sleep leg, in the region the boot died in.
+        #
+        # DEFAULT 2 IS BYTE-IDENTICAL to every boot so far -- the flag exposes
+        # the constant, it does not move it. The value is PUBLISHED with the
+        # rest of the bounce terms, so P, D and the host ledger read ONE
+        # source: a second spelling of the depth is how `2.16 GiB` came to
+        # have three causes (#1361 [23a]).
+        #
+        # THE COST IS NOT PRICED HERE, and that is deliberate: depth=1 leaves
+        # one pipeline stage fewer, and nothing on this rig has measured what
+        # that does to flip duration. Operator order 2026-09-13: measured at
+        # the metal, never estimated.
+        "--xchg-bounce-depth", type=int,
+        default=xchg_bounce.ASSEMBLE_DEPTH_DEFAULT,
+        help="#1358: depth-slots of the assemble buffer (default 2, "
+             "byte-identical). `assemble_slots` adds ONE more under "
+             "inject_mode=shadow, so the buffer is widest_layer x (depth+1) "
+             "there. depth=1 saves one widest layer per slot holder -- "
+             "measured on weg2xsn27: 721.3 MiB x 5 holders = 3.52 GiB of "
+             "non-reclaimable at the sleep leg. The value is published to the "
+             "ranks and read back by the host ledger, so all three agree.",
+    )
+    ap.add_argument(
         "--weg2-xchg-oncard-slot-mib", type=int,
         default=weight_exchange_transport.ONCARD_SLOT_MIB_DEFAULT,
         help="#1273 S6 fix E: the CEILING one diagonal slot may reach, in MiB "
@@ -10151,7 +10191,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             checkpoint_census.widest_layer_terms(
                 str(ns.model),
                 pairs=int(weight_exchange_region.N_CARDS),
-                depth=xchg_bounce.ASSEMBLE_DEPTH_DEFAULT,
+                depth=int(getattr(ns, "xchg_bounce_depth",
+                                  xchg_bounce.ASSEMBLE_DEPTH_DEFAULT)),
                 slot_bytes=weight_exchange_transport.validate_oncard_slot_mib(
                     ns.weg2_xchg_oncard_slot_mib) * weight_exchange_region.MIB))
     xchg_env = prepare_xchg_env(log, str(ring_plan.epoch),
@@ -10204,6 +10245,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         # optimistic by that much against a reap mark nobody may touch.
         s_gb_d=s_gb_d, d_cap_terms=_l2_terms,
         weight_source=ns.weg2_weight_source,
+        bounce_depth=int(getattr(ns, "xchg_bounce_depth",
+                                 xchg_bounce.ASSEMBLE_DEPTH_DEFAULT)),
         # B4f: ring absence needs BOTH arms, and the inject mode is already in
         # hand here -- `prepare_xchg_env` published it three statements above.
         inject_mode=ns.weg2_xchg_inject,
