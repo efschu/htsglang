@@ -452,6 +452,66 @@ def ckpt_reader():
     return _CKPT_READER[0]
 
 
+def shadow_sem_nonce(nonce: str) -> str:
+    """The nonce the OBSERVER's semaphore set hangs on -- read off the product.
+
+    THIS IS THE ARM'S WHOLE POINT, so it must not be a local opinion. Before
+    the fix the shadow built `SemSet(region.boot_nonce)` -- the exchange's own
+    24 -- and `weight_exchange_region.shadow_nonce` did not exist. After it,
+    the observer has a derived nonce and the two sets are disjoint. Asking the
+    PRODUCT for the symbol is therefore the same question the boot asks:
+
+      absent  -> the observer shares the exchange's handshake  (the collision)
+      present -> the observer has its own                       (the fix)
+
+    A `getattr` fallback that quietly did the right thing on both commits
+    would make this arm green everywhere and prove nothing.
+    """
+    fn = getattr(xr, "shadow_nonce", None)
+    return str(fn(nonce)) if callable(fn) else str(nonce)
+
+
+def run_shadow_sample(nonce: str, log=print) -> dict:
+    """THE OBSERVER'S SAMPLE TRAFFIC, reproduced: take `empty`, post `full`.
+
+    Boot weg2xsn25's D ranks ran exactly this and nothing more -- one rotating
+    class, `subset=A_log pieces=48`, `bytes_mib=0.00` -- and it was enough to
+    leave the exchange's 24 semaphores inverted
+    (`W78 stale=12/24: empty count=0 armed=1 / full count=1 armed=0`).
+
+    The sample runs BEFORE the six ranks start, which is the deterministic
+    form of the one-second race the boot log shows (D at 07:01:08, P's verify
+    at 07:01:09).
+    """
+    sn = shadow_sem_nonce(nonce)
+    shares = sn == nonce
+    sems = tp.SemSet(sn)
+    took = posted = 0
+    for pair in range(xr.N_PAIRS):
+        for slot in range(xr.SLOTS_PER_PAIR):
+            try:
+                if sems.trywait(pair, slot, "empty"):
+                    took += 1
+                sems.post(pair, slot, "full")
+                posted += 1
+            except BaseException:  # noqa: BLE001 -- the observer never raises
+                pass
+    # THE W78 QUESTION, asked of the EXCHANGE's set, which is the set the flip
+    # depends on -- never of whichever set the observer happened to touch.
+    stale = ""
+    try:
+        tp.verify_sem_arm(tp.SemSet(nonce), leg=0, epoch="replay",
+                          log=lambda *_a, **_k: None)
+    except BaseException as exc:  # noqa: BLE001
+        stale = f"{type(exc).__name__}"
+    log(f"WEG2-XCHG-SHADOW-SAMPLE nonce={sn} shares_exchange_set={shares} "
+        f"took_empty={took} posted_full={posted} "
+        f"exchange_set_after={stale or 'armed'} -- the observer's sample is "
+        f"all this leg does; if it shares the exchange's set, the flip's "
+        f"handshake is already spent when the first deposit arrives")
+    return {"shares": shares, "took": took, "stale": stale}
+
+
 def narrow(mans, col_div: int):
     """Scale COLUMNS for materialisation -- never rows, never the padding.
 
@@ -1107,6 +1167,8 @@ def _run(ns) -> int:
     # point leaked 36 named semaphores per refusal -- a refusal that leaks is a
     # refusal that costs the next run.
     xr.create_semaphores(NONCE)
+    if ns.shadow_leg:
+        run_shadow_sample(NONCE)
     # SPAWN FOR THE CUDA ARM, fork otherwise. A forked child inherits whatever
     # the parent already imported; the CUDA arm must set CUDA_VISIBLE_DEVICES
     # BEFORE anything CUDA exists in that process, which only a fresh
@@ -1227,6 +1289,10 @@ def main() -> int:
                     help="path to a safetensors file whose REAL bytes seed "
                          "and grade the seam (user order 2026-09-13: "
                          "RedHatAI/Qwen3.8-27B-INT4, read-only)")
+    ap.add_argument("--shadow-leg", action="store_true",
+                    help="run the observer's sample traffic before the ranks, "
+                         "as boot weg2xsn25 did (reproduces the collision on "
+                         "the code that shares one semaphore set)")
     ap.add_argument("--slot-bytes", type=int, default=0,
                     help="bounce depth-slot bytes (default 4 MiB); must cover "
                          "the widest layer unit or the arm refuses by W71")
