@@ -97,6 +97,36 @@ class BounceTerms:
     #: diagonal's card), enumerated at runtime by `group_descs_by_pair`.
     #: Default 1 keeps every pre-#1358 caller byte-identical.
     n_lanes: int = 1
+    #: #1374 OPTION 1: THE LARGEST TAG THIS BOOT PAUSES, in bytes. The pause
+    #: granularity is the tag (`memory_saver_adapter.pause(tag)`), so a tag's
+    #: whole deposit has to fit the buffer or the deposit needs a collector
+    #: that cannot run until this rank has paused -- boot weg2xsn30's deadlock.
+    #: 0 means "not stated", and then the old depth-sized geometry stands and
+    #: the leg refuses a band that would wrap instead of overwriting it.
+    max_tag_bytes: int = 0
+
+    @property
+    def lane_slots(self) -> int:
+        """Slots ONE lane's buffer holds -- the one producer of that number.
+
+        `assemble_slots(depth)` is the FLOOR (and the whole answer before
+        #1374); Option 1 raises it to whatever the largest tag needs, in whole
+        slots, because a partial slot cannot hold a band.
+        """
+        return tag_slots(int(self.max_tag_bytes), int(self.slot_bytes),
+                         int(self.depth), comparing=None,
+                         floor=assemble_slots(int(self.depth), comparing=False))
+
+    @property
+    def lane_buffer_bytes(self) -> int:
+        """What one lane's FILE really is: slots x slot_bytes.
+
+        Distinct from `buffer_bytes`, which states the WIDEST-LAYER claim the
+        #1332 guard grades (`covers_widest_layer`) and is left untouched. The
+        charge below takes the larger of the two, so the ledger can never
+        under-charge whichever geometry the leg actually allocates.
+        """
+        return int(self.lane_slots) * int(self.slot_bytes)
 
     @property
     def total_bytes(self) -> int:
@@ -124,7 +154,12 @@ class BounceTerms:
         120 s), so this is not a peak-vs-sum question -- reducing the count is
         a lane change, not an accounting one.
         """
-        return int(self.buffer_bytes) * int(self.n_lanes) + int(self.staging_bytes)
+        # #1374: THE LARGER OF THE TWO GEOMETRIES, per lane. `buffer_bytes` is
+        # the widest-layer statement and `lane_buffer_bytes` is the file Option
+        # 1 allocates; charging the smaller would under-charge the one the leg
+        # creates, which is the #1358 defect one geometry over.
+        per_lane = max(int(self.buffer_bytes), int(self.lane_buffer_bytes))
+        return per_lane * int(self.n_lanes) + int(self.staging_bytes)
 
     @property
     def staging_per_card(self) -> int:
@@ -217,6 +252,36 @@ def assemble_slots(depth: int, *, comparing: Optional[bool] = None) -> int:
     return int(depth) + (1 if comparing else 0)
 
 
+def tag_slots(max_tag_bytes: int, slot_bytes: int, depth: int, *,
+              comparing: Optional[bool] = None, floor: Optional[int] = None) -> int:
+    """#1374 OPTION 1: slots one lane needs so a TAG's deposit never waits.
+
+    ONE PRODUCER, read by the terms, by the lane allocation and by the ledger
+    charge, because three derivations of this number are three chances for the
+    buffer, the file and the price to disagree -- which is how boot weg2xsn28
+    charged one buffer for five files.
+
+    `max_tag_bytes` 0 means the boot did not state it: the floor stands and the
+    leg refuses a wrapping band by name rather than pricing a wrap nobody can
+    see. The `+1` for a comparing arm is the shadow's live-bytes slot, exactly
+    as `assemble_slots` has always added it.
+    """
+    if comparing is None:
+        from sglang.srt.weg2 import weight_exchange as wx
+
+        comparing = wx.inject_mode() == wx.INJECT_SHADOW
+    # THE SHADOW SLOT HAS ONE OWNER (#1330 ratchet): `assemble_slots(0, ...)`
+    # IS that expression -- 1 under a comparing arm, 0 otherwise -- so this
+    # function never re-spells `+1 if comparing`.
+    shadow = int(assemble_slots(0, comparing=comparing))
+    base = (int(assemble_slots(int(depth), comparing=comparing))
+            if floor is None else int(floor) + shadow)
+    if int(max_tag_bytes) <= 0 or int(slot_bytes) <= 0:
+        return max(base, 1)
+    need = -(-int(max_tag_bytes) // int(slot_bytes))     # ceil
+    return max(base, need + shadow)
+
+
 def assemble_buffer_bytes(widest_layer_bytes: int, depth: int, *,
                           comparing: Optional[bool] = None) -> int:
     """The assemble buffer, in bytes.  The ONLY expression for that number."""
@@ -233,6 +298,7 @@ def bounce_terms(
     depth: int = ASSEMBLE_DEPTH_DEFAULT,
     slot_bytes: int = SLOT_BYTES_DEFAULT,
     n_lanes: int = 1,
+    max_tag_bytes: int = 0,
 ) -> BounceTerms:
     """Derive the bounce term. Pure; raises only on inputs that cannot mean anything.
 
@@ -274,6 +340,7 @@ def bounce_terms(
         buffer_bytes=assemble_buffer_bytes(widest_layer_bytes, depth),
         staging_bytes=int(pairs) * SLOTS_PER_PAIR * int(slot_bytes),
         n_lanes=max(1, int(n_lanes)),
+        max_tag_bytes=max(0, int(max_tag_bytes)),
     )
 
 
@@ -290,7 +357,11 @@ _TERM_FIELDS = ("bytes_per_direction", "n_layers", "widest_layer_bytes",
                 # #1358: the lane count rides with the INPUTS, so the rank
                 # recomputes the same total instead of holding one it cannot
                 # check -- the rule this tuple already existed for.
-                "n_lanes")
+                "n_lanes",
+                # #1374: the tag size rides with the inputs too, or the ranks
+                # rebuild a SMALLER buffer than the launcher charged for and
+                # the deposit meets the wrap refusal the launcher priced away.
+                "max_tag_bytes")
 
 
 def publish_terms(terms: BounceTerms) -> str:
