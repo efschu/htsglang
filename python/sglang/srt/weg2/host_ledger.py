@@ -2410,6 +2410,7 @@ def run_origin_gib(
     # the origin is defined as what the box holds BEFORE this arm spends, and a
     # mid-flip sample is after.  The rejected figure is PRINTED, never dropped.
     _rejected: List[str] = []
+    _any_death = False
     _repriced = []
     # #1361 [22-fix5]: the LOWEST kill counter this record has seen PER BOOT --
     # the closest thing to that boot's baseline that the sidecar actually
@@ -2426,8 +2427,32 @@ def run_origin_gib(
     for g, e in (record or {}).items():
         if not isinstance(e, dict) or e.get("run_residual_gib") is None:
             continue
+        _ep = e.get("sampled_at_flip_epoch")
+        _mid = int(_ep) >= 1 if _ep is not None else bool(e.get("interleaved"))
+        if _mid and cg_nonreclaim_gib is not None:
+            _rejected.append(
+                f"{float(e['run_residual_gib']):.2f} (boot "
+                f"{e.get('boot_tag', '?')}, group {g}, "
+                + (f"sampled_at_flip_epoch={int(_ep)}" if _ep is not None
+                   else "interleaved=True")
+                + ")"
+            )
+            continue
         # #1361 [22-fix5] THE DEATH-SAMPLE FILTER, and the evidence it reads was
         # ALREADY IN EVERY RECORD -- it just had no consumer.
+        #
+        # [22-fix5b] PLACED AFTER THE #1350e CHECK ON PURPOSE. The two
+        # rejecters overlap: a fixture that passes `pids=[]` to
+        # `dormant_image_sample` gets a PRESENT and empty process set, exactly
+        # like the xsn25 death sample, so whichever runs first owns the printed
+        # reason. Four #1350 tests went red when this one ran first -- they
+        # assert the INTERLEAVED reason on mid-flip samples, and were getting a
+        # death reason instead. The established rejecter therefore keeps its
+        # samples, and this one judges only what #1350e lets through. That
+        # costs the xsn25 case nothing: its sample carries
+        # `sampled_at_flip_epoch=0`, so `_mid` is False and it reaches here.
+        # The older rule keeps its meaning; the new one adds a case rather than
+        # shadowing one.
         #
         # Boot weg2xsn25 wrote `run_residual_gib=34.61` at 07:03:59Z, three
         # minutes into its own OOM cascade, with `load_class=idle` and
@@ -2478,17 +2503,7 @@ def run_origin_gib(
                 )
         if _death and cg_nonreclaim_gib is not None:
             _rejected.append(_death)
-            continue
-        _ep = e.get("sampled_at_flip_epoch")
-        _mid = int(_ep) >= 1 if _ep is not None else bool(e.get("interleaved"))
-        if _mid and cg_nonreclaim_gib is not None:
-            _rejected.append(
-                f"{float(e['run_residual_gib']):.2f} (boot "
-                f"{e.get('boot_tag', '?')}, group {g}, "
-                + (f"sampled_at_flip_epoch={int(_ep)}" if _ep is not None
-                   else "interleaved=True")
-                + ")"
-            )
+            _any_death = True
             continue
         _repriced.append((record_run_residual_gib(e), g, e))
     residuals = [
@@ -2575,10 +2590,24 @@ def run_origin_gib(
         )
     _rej = (
         " -- run-moment sample(s) " + ", ".join(_rejected)
-        + " REJECTED. An entry marked DEATH-SAMPLE was measured while this "
-        "line was not alive (#1361 [22-fix5]); the others are interleaved, "
-        "i.e. measured DURING a flip, so they already contain the permanent "
-        "step `flip_ratchet_gib` charges separately (#1350e)"
+        # #1361 [22-fix5b]: THE #1350e TAIL IS VERBATIM WHEN IT IS THE ONLY
+        # REASON. Four #1350 tests assert the literal "REJECTED: interleaved",
+        # and [22-fix5] rewrote this shared sentence for every caller -- the
+        # rejection BEHAVIOUR was untouched (origin 6.44, source=launch, the
+        # 7.49 still named) and only the prose moved, which is the cheapest
+        # possible way to break four green tests for nothing. Each rejected
+        # entry already carries its own reason in its own string; this tail
+        # only names the rule, so it names the rule that actually applied.
+        + (
+            " REJECTED: interleaved, i.e. measured DURING a flip, so they "
+            "already contain the permanent step `flip_ratchet_gib` charges "
+            "separately (#1350e)"
+            if not _any_death
+            else " REJECTED. An entry marked DEATH-SAMPLE was measured while "
+            "this line was not alive (#1361); any other is interleaved, i.e. "
+            "measured DURING a flip, so it already contains the permanent step "
+            "`flip_ratchet_gib` charges separately (#1350e)"
+        )
         if _rejected else ""
     )
     if cg_nonreclaim_gib >= floor:
