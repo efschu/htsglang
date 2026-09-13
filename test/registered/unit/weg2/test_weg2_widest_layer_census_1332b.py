@@ -243,16 +243,30 @@ def test_the_arms_that_pin_nothing_charge_nothing_and_print_nothing(ckpt):
     assert lz.xchg_bounce_terms_for_arm("exchange", "ipc", str(ckpt)) == (0, [])
 
 
+#: The chunking a boot publishes; 8 is what the shipped checkpoint runs
+#: (64 layers / 8 tags, measured: weights_0 = layers 0..7).
+_CHUNK_LAYERS = 8
+
+
 def test_the_host_arm_charges_the_MEASURED_bounce_and_prints_both_lines(ckpt):
     """The charge is the expression's own total, and the lines carry it."""
     lz = _launcher()
+    # #1374 OPTION 1: the arm now sizes the assemble buffer from the LARGEST
+    # WEIGHT TAG, and the chunking that defines a tag is published once by
+    # `main` before either term consumer runs. A caller that skips it meets the
+    # launch refusal by design -- an unpublished chunking must never silently
+    # become a 0 that sizes the old depth-based geometry (weg2xsn30's
+    # deadlock). This test is a term consumer, so it publishes it exactly as
+    # `main` does, and then grades the charge against the SAME producer.
+    lz.publish_weight_chunk_layers(_CHUNK_LAYERS)
     charged, lines = lz.xchg_bounce_terms_for_arm("shadow", "host", str(ckpt))
     census = cc.layer_census_from_headers(str(ckpt))
     _idx, widest, _cls = cc.widest_layer(census)
     expected = xb.bounce_terms(
         bytes_per_direction=census.layer_total_bytes,
         n_layers=census.n_layers, widest_layer_bytes=widest,
-        pairs=3, depth=xb.ASSEMBLE_DEPTH_DEFAULT)
+        pairs=3, depth=xb.ASSEMBLE_DEPTH_DEFAULT,
+        max_tag_bytes=lz.xchg_max_tag_bytes(str(ckpt)))
     assert charged == expected.total_bytes, (charged, expected.total_bytes)
     assert charged > 0, "the whole point of the arm change is a priced bounce"
     assert len(lines) == 3, lines
