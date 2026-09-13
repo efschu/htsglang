@@ -3761,6 +3761,27 @@ class SchedulerWeightUpdaterManager:
                     # tokens.
                     if tag is not None and phase == bx.PHASE_COLLECT:
                         rv.post_drained(tag=str(tag))
+                        # #1385 STEP 3 (boot weg2xsn31/6): FREE THE FILE HERE,
+                        # not only the permit. `LayerBounce.close()` never
+                        # unlinks (by design, for store-and-forward), so
+                        # without this a lane's tmpfs pages stay committed
+                        # until full boot teardown regardless of the
+                        # concurrency cap -- measured on xsn31/6: cap=1
+                        # correctly serialised PINNING (never >1 buffer being
+                        # actively registered) while FOUR lanes' files
+                        # (c0+p1+p2+p4, 12.00 GiB) coexisted on tmpfs because
+                        # none of the earlier ones were ever removed. Safe
+                        # exactly here: this is the SAME point that already
+                        # tells the depositor (via `wait_drained`) it may
+                        # reuse the buffer for the next tag, and both sides'
+                        # own file descriptors are already closed by this
+                        # point (inside their respective `run_bounce_leg`
+                        # calls' own `finally`). Gated on `_lane_permit_active`
+                        # so the unset/default path -- whose own pricing
+                        # already charges for every lane accumulating, by
+                        # design -- is untouched.
+                        if _lane_permit_active:
+                            bx.unlink_lane_buffer(boot_nonce, root, _lane_key)
             finally:
                 if _lane_permit is not None:
                     _lane_permit.close()

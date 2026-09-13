@@ -69,6 +69,52 @@ MUTANTS FOR THIS STEP (coordinator-named danger directions):
       creates the permit with EXACTLY `lanes_priced` slots (never `n_lanes`,
       never a hand count), checked by source and by an execution smoke
       through the real launcher function
+
+STEP 3 (coordinator order, boot weg2xsn31/6, same branch, stacked on
+461fdebca0): xsn31/6 BOOT-PROVED step 1's size fix (every observed lane
+measured exactly 3,221,225,472 B = 128 MiB x 24, both instruments
+deckungsgleich) -- but ALSO measured a THIRD instance of the same class,
+this time in step 2's own runtime enforcement: with `--xchg-lanes-
+concurrent 1`, up to FOUR lane files (c0+p1+p2+p4, 12.00 GiB) coexisted on
+tmpfs at once, against a promised 3.00 GiB.
+
+TRACED (not merely observed): the coordinator's own hypothesis --
+"the semaphore caps within one group, not across P and D" -- does NOT hold
+under source inspection. `create_lane_permit_semaphore` is called exactly
+ONCE in `launcher.main`, keyed on `str(ring_plan.epoch)`, and
+`prepare_xchg_env`'s returned `xchg_env` (built from that SAME boot_nonce)
+is merged into BOTH groups' environment through the SAME `build_env(...,
+xchg_env=xchg_env)` call (`group="P"` and `group="D"`, three call sites, all
+passing the identical dict) -- so both `_weg2_xchg_deposit_before_sleep`
+(D, hook=source) and `_weg2_xchg_inject_from_peer` (P, hook=authoritative)
+read the identical `SGLANG_WEG2_XCHG_BOOT` value and therefore open the
+IDENTICAL semaphore name. The permit genuinely is boot-wide, and
+`test_at_most_N_permits_are_ever_held_at_once` above already proves the
+PRIMITIVE enforces a real cross-process bound (POSIX named semaphores do
+not care which process opens them).
+
+THE REAL GAP: `LayerBounce.close()` deliberately never unlinks (module
+docstring: cross-process store-and-forward needs the file to outlive
+either side's own close). Step 2 released the PERMIT once `run_bounce_leg`
+returned, which correctly let the NEXT lane start PINNING -- but the
+PREVIOUS lane's FILE stayed on tmpfs, uncounted by the semaphore and
+unremoved until full boot teardown. A concurrency cap that limits how many
+buffers may be PINNED at any instant is not the same claim as a cap on how
+many ACCUMULATE unfreed over one flip; by the time a flip has touched every
+lane once, the two converge to the SAME uncapped total regardless of the
+cap -- which is exactly consistent with "up to four files, growing as more
+lanes were touched" and requires no cross-group semaphore failure to
+explain.
+
+THE FIX: `weight_exchange_bounce.unlink_lane_buffer`, called from the
+COLLECTOR side (the side `CrossSlotRendezvous.post_drained` already tells
+"this tag is out of the buffer, the depositor may reuse it") -- the same
+moment already proves both sides' own file descriptors are closed, so
+unlinking here can never race a reader. Gated on `_lane_permit_active`
+exactly like the permit itself, so the unset/default arm -- whose own
+`BounceTerms.total_bytes` formula already charges for every lane
+accumulating, by design (`n_lanes` IS that accumulated count) -- is
+untouched.
 """
 
 from __future__ import annotations
@@ -80,6 +126,8 @@ import unittest
 
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 
+from sglang.srt.weg2 import weight_exchange as wx
+from sglang.srt.weg2 import weight_exchange_bounce as bx
 from sglang.srt.weg2 import xchg_bounce as xb
 from sglang.test.test_utils import CustomTestCase
 
@@ -726,6 +774,203 @@ class TheLauncherPricesTheOnlyPermitCount(CustomTestCase):
                 for kind in ("empty", "full"):
                     self.assertNotEqual(
                         name, xr.sem_name("abc123", pair, slot, kind))
+
+
+# ---------------------------------------------------------------------------
+# STEP 3: the collector must FREE the lane's file, not only its permit, or
+# the cap serialises PINNING while the FILES still accumulate. Real deposit,
+# real collect, real bytes -- through the product's own
+# `_weg2_xchg_bounce_leg` call site, twice (once per side, matching the two
+# real processes a boot actually runs).
+# ---------------------------------------------------------------------------
+
+
+class TheCollectorFreesTheFileNotOnlyThePermit(CustomTestCase):
+    """xsn31/6's own finding, reproduced and fixed at the desk: 3 lanes
+    (one diagonal, two cross), cap=1, deposited then collected -- and after
+    the round trip every file must be gone, while the SAME round trip
+    WITHOUT a cap must leave them exactly as before (byte-identical
+    default)."""
+
+    #: A small-scale Option-1 geometry sharing the same STRUCTURAL relation
+    #: as production (oncard slot far smaller than one layer, tag spanning
+    #: more than one layer) -- reused from
+    #: test_weg2_xchg_leg_slot_bytes_1385.py's own choice for the identical
+    #: reason: fast, hermetic, no gigabyte allocations.
+    SLOT_BYTES = 512
+
+    def _terms(self, cap):
+        from .test_weg2_xchg_bounce_execution_smoke_1273 import (
+            DEPTH,
+            LAYER0_BYTES,
+            N_LAYERS,
+            PLAIN_LAYER_BYTES,
+        )
+
+        kw = dict(n_lanes=3)   # THIS RANK's own lane count (one diagonal,
+                               # two cross -- see _all_descs' own N_DST=3):
+                               # the per-rank guard (#1358) refuses a term
+                               # priced for fewer than the rank enumerates.
+        if cap:
+            kw["lanes_concurrent"] = cap
+        return xb.bounce_terms(
+            bytes_per_direction=PLAIN_LAYER_BYTES * N_LAYERS, n_layers=N_LAYERS,
+            widest_layer_bytes=LAYER0_BYTES, pairs=6, depth=DEPTH,
+            slot_bytes=self.SLOT_BYTES,
+            max_tag_bytes=LAYER0_BYTES * 2, **kw,
+        )
+
+    def _round_trip(self, *, cap):
+        """Deposit ALL of this rank's lanes for ONE tag, then collect them
+        -- two separate calls, matching D's and P's separate processes --
+        and return (terms, lane_paths, mismatched_rows)."""
+        import tempfile
+
+        from sglang.srt.weg2 import weight_exchange_region as xr
+        from sglang.srt.weg2 import weight_exchange_transport as tp
+
+        from .test_weg2_xchg_bounce_execution_smoke_1273 import (
+            TAG,
+            _all_descs,
+            _manager,
+            _mismatched_rows,
+            _seed_source,
+            as_single_hook_descs,
+        )
+        from .test_weg2_xchg_transport_1273 import FakeDeviceOps, _fresh_boot
+
+        root = tempfile.mkdtemp()
+        nonce = _fresh_boot()
+        xr.create_semaphores(nonce)
+        try:
+            terms = self._terms(cap)
+            if cap:
+                xr.create_lane_permit_semaphore(nonce, terms.lanes_priced)
+            try:
+                descs_all = _all_descs()
+                src_descs = [d for d in as_single_hook_descs(descs_all, is_source=True)
+                            if d.tag == TAG]
+                dst_descs = [d for d in as_single_hook_descs(descs_all, is_source=False)
+                            if d.tag == TAG]
+                ops = FakeDeviceOps(root, 0)
+                _seed_source(ops)
+                mgr = _manager()
+                mgr._weg2_xchg_bounce_leg(
+                    descs=src_descs, ops=ops, boot_nonce=nonce, terms=terms,
+                    mode=wx.INJECT_AUTHORITATIVE, device=0, hook="source",
+                    sems=tp.SemSet(nonce), tag=TAG, shm_root=root,
+                )
+                paths_after_deposit = {
+                    lane: bx.bounce_path(nonce, root, lane)
+                    for lane in ("c0", "p0", "p1")
+                }
+                exists_after_deposit = {
+                    lane: os.path.exists(p) for lane, p in paths_after_deposit.items()
+                }
+                mgr._weg2_xchg_bounce_leg(
+                    descs=dst_descs, ops=ops, boot_nonce=nonce, terms=terms,
+                    mode=wx.INJECT_AUTHORITATIVE, device=0, hook="authoritative",
+                    sems=tp.SemSet(nonce), tag=TAG, shm_root=root,
+                )
+                exists_after_collect = {
+                    lane: os.path.exists(p) for lane, p in paths_after_deposit.items()
+                }
+                mismatched = _mismatched_rows(ops, descs_all)
+            finally:
+                if cap:
+                    xr.unlink_lane_permit_semaphore(nonce)
+        finally:
+            xr.unlink_semaphores(nonce)
+        return terms, exists_after_deposit, exists_after_collect, mismatched
+
+    def test_with_a_cap_every_lane_file_is_gone_after_the_collector_is_done(self):
+        terms, after_deposit, after_collect, mismatched = self._round_trip(cap=1)
+        self.assertEqual(terms.lanes_priced, 1)
+        # All three of THIS rank's lanes were deposited (the deposit side
+        # does not know about the cap's runtime enforcement -- it is the
+        # collector's job to free what it just finished with).
+        self.assertTrue(all(after_deposit.values()), after_deposit)
+        # xsn31/6's own regression: NONE may survive the collector.
+        self.assertFalse(any(after_collect.values()),
+                         f"a lane file survived its own collector: {after_collect}")
+        self.assertEqual(mismatched, [], "the fix must not cost correctness")
+
+    def test_without_a_cap_the_default_arm_is_byte_identical_files_persist(self):
+        """The other half of the promise: `_lane_permit_active` gates the
+        unlink exactly as it gates the permit, so a boot that never set
+        `--xchg-lanes-concurrent` keeps its pre-existing behaviour (files
+        outlive the collector, exactly as `BounceTerms.total_bytes`'s own
+        `n_lanes`-wide charge already assumes)."""
+        _terms, after_deposit, after_collect, mismatched = self._round_trip(cap=0)
+        self.assertTrue(all(after_deposit.values()), after_deposit)
+        self.assertTrue(all(after_collect.values()),
+                        "the default arm must be UNCHANGED by this fix: "
+                        f"a file disappeared with no cap set: {after_collect}")
+        self.assertEqual(mismatched, [])
+
+    def test_unlink_lane_buffer_is_idempotent(self):
+        import tempfile
+
+        root = tempfile.mkdtemp()
+        nonce = "idem-test"
+        path = bx.bounce_path(nonce, root, "p0")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as fh:
+            fh.write(b"\0" * 16)
+        self.assertTrue(bx.unlink_lane_buffer(nonce, root, "p0"))
+        self.assertFalse(os.path.exists(path))
+        self.assertFalse(bx.unlink_lane_buffer(nonce, root, "p0"),
+                         "an absent file is not an error")
+
+
+class TheUnlinkIsWiredAtExactlyTheRightPoint(CustomTestCase):
+    """Structural proof, over the real product source: the unlink call sits
+    where `post_drained` already sits (the collector's own "this tag is out
+    of the buffer" moment), gated by the same `_lane_permit_active` boolean
+    the permit itself uses -- never a second, independent condition that
+    could drift from it."""
+
+    def test_unlink_lane_buffer_is_called_after_post_drained(self):
+        import inspect
+
+        from sglang.srt.managers.scheduler_components import weight_updater as wu
+
+        src = inspect.getsource(wu)
+        i = src.index("rv.post_drained(tag=str(tag))")
+        j = src.index("bx.unlink_lane_buffer(", i)
+        self.assertLess(i, j)
+        self.assertLess(j - i, 2000,
+                        "the unlink must be the very next thing this "
+                        "collector does with the tag, not an unrelated "
+                        "later call that happens to match")
+
+    def test_the_unlink_is_gated_on_the_same_boolean_as_the_permit(self):
+        import inspect
+
+        from sglang.srt.managers.scheduler_components import weight_updater as wu
+
+        src = inspect.getsource(wu)
+        i = src.index("rv.post_drained(tag=str(tag))")
+        window = src[i:i + 2000]
+        self.assertIn("if _lane_permit_active:", window)
+        self.assertIn("bx.unlink_lane_buffer(boot_nonce, root, _lane_key)",
+                      window)
+
+    def test_the_unlink_only_ever_runs_on_the_collect_side(self):
+        """`post_drained` (and so the unlink beside it) is reached only
+        inside `if tag is not None and phase == bx.PHASE_COLLECT:` -- the
+        depositor has no way to know when a cross-process peer has finished
+        reading, so it must never be the one that removes the file."""
+        import inspect
+
+        from sglang.srt.managers.scheduler_components import weight_updater as wu
+
+        src = inspect.getsource(wu)
+        i = src.index("if tag is not None and phase == bx.PHASE_COLLECT:\n"
+                      "                        rv.post_drained(tag=str(tag))")
+        j = src.index("bx.unlink_lane_buffer(", i)
+        self.assertLess(i, j)
+        self.assertLess(j - i, 2200)
 
 
 if __name__ == "__main__":
