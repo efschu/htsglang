@@ -140,6 +140,55 @@ class BounceTerms:
         )
 
 
+#: ONE AUTHORITY FOR THE ASSEMBLE BUFFER'S SIZE -- the PRICE and the
+#: ALLOCATION now call the same two functions, because they did not, and the
+#: gap was measurable to the byte:
+#:
+#:   PRICED     xchg_bounce.py:189  widest_layer_bytes * depth
+#:              = 756323776 * 2 = 1512647552 B (1442 MiB)
+#:   ALLOCATED  weight_exchange_bounce.py:1119 slots = depth + (1 if comparing)
+#:              weight_exchange_bounce.py:502  nbytes = slot_bytes * depth
+#:              = 756323776 * 3 = 2268971328 B (2163.9 MiB)
+#:
+#: -- exactly ONE widest layer (756323776 B, 721.4 MiB) unpriced whenever
+#: `mode=shadow`, i.e. on every S6I boot, since S6I boots shadow first. Boot
+#: weg2xsn25 printed the allocated number verbatim:
+#: `WEG2-XCHG-HOST-SLOT ... event=alloc bytes=2268971328`.
+#:
+#: NOT NAMED `bounce_bytes`. That name belonged to
+#: `host_ledger.xchg_bounce_bytes`/`...bytes_per_card`, which plan AMENDMENT 5
+#: DELETED as a second producer (launcher.py:4929 still names it as such).
+#: Reviving a retired name for the function that exists to end second
+#: bookkeeping would be the joke telling itself.
+#:
+#: THE ARM IS READ HERE, not threaded through the launcher: `inject_mode()` is
+#: "THE one reader" (weight_exchange.py:2145), so a caller that passed its own
+#: opinion could disagree with it -- which is the very shape being closed. The
+#: parameter stays available for tests and for a caller that genuinely knows
+#: better, and defaults to the arm.
+
+
+def assemble_slots(depth: int, *, comparing: Optional[bool] = None) -> int:
+    """Depth-slots the assemble buffer holds, INCLUDING the shadow's extra one.
+
+    The compare needs the live bytes beside the staged ones, so a shadow leg
+    holds one slot more than its depth. That was already true in the allocator
+    and false in the price.
+    """
+    if comparing is None:
+        from sglang.srt.weg2 import weight_exchange as wx
+
+        comparing = wx.inject_mode() == wx.INJECT_SHADOW
+    return int(depth) + (1 if comparing else 0)
+
+
+def assemble_buffer_bytes(widest_layer_bytes: int, depth: int, *,
+                          comparing: Optional[bool] = None) -> int:
+    """The assemble buffer, in bytes.  The ONLY expression for that number."""
+    return int(widest_layer_bytes) * assemble_slots(int(depth),
+                                                    comparing=comparing)
+
+
 def bounce_terms(
     *,
     bytes_per_direction: int,
@@ -186,7 +235,7 @@ def bounce_terms(
         pairs=int(pairs),
         slot_bytes=int(slot_bytes),
         mean_layer_bytes=mean_layer,
-        buffer_bytes=int(widest_layer_bytes) * int(depth),
+        buffer_bytes=assemble_buffer_bytes(widest_layer_bytes, depth),
         staging_bytes=int(pairs) * SLOTS_PER_PAIR * int(slot_bytes),
     )
 
