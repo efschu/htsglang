@@ -4735,19 +4735,36 @@ def _derive_d_l2_budget(
     # class. Whoever reads the arm has to be able to see WHICH of the two
     # inputs produced it without re-deriving the precedence from this comment.
     share_source = "flag"
-    if rec_share is not None:
-        share = rec_share
-        share_source = "record"
-    if rec_share is not None and rec_share > share + 1e-9:
+    # #1361 [23c] THE COMPARISON HAPPENS BEFORE THE OVERWRITE, and that is the
+    # whole fix. The guard below read
+    #
+    #     share = rec_share                      # <- the overwrite
+    #     if rec_share > share + 1e-9: raise ...  # <- compares y against y
+    #
+    # so W89x could not fire on any input: `share` had just been set to
+    # `rec_share` one line above. A refusal that is named, documented and
+    # unreachable is worse than no refusal, because every reader downstream
+    # (including this seat, twice) takes it as proof that the case is covered.
+    # Same family as the reader that was never called and the comment that
+    # promised "priced rather than borrowed" -- here the condition is killed by
+    # its own precedent rather than by a missing consumer.
+    _flag_share = float(ns.d_cap_rank_share)
+    if rec_share is not None and float(rec_share) > _flag_share + 1e-9:
         raise Weg2LaunchRefused(
             f"W89x Weg2L2ShareBelowInstalled: the sizing record's installed "
             f"KV-token ownership vector has max(v)/sum(v) = {rec_share:.4f}, "
-            f"above --d-cap-rank-share {share}. Sizing D's L2 on the smaller "
+            f"above --d-cap-rank-share {_flag_share}. Sizing D's L2 on the smaller "
             f"share ships a pool that cannot hold one cap-sized read on the "
             f"largest rank -- the 27,466-row wall this change removes -- so it "
             f"is refused by name rather than discovered as a 413. Raise "
             f"--d-cap-rank-share to at least {rec_share:.4f}."
         )
+    # THE RECORD IS THE SHARE SOURCE WHEN IT HAS ONE -- unchanged behaviour for
+    # every input that was not refused above (#1317n: a measured share is a
+    # reading and the flag is a margin).
+    if rec_share is not None:
+        share = rec_share
+        share_source = "record"
     try:
         terms = host_ledger.derive_d_hicache_size_gb(
             cap_tokens, share, host_ledger.CELL_BYTES_D_PER_RANK[0],
