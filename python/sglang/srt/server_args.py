@@ -1018,7 +1018,21 @@ class ServerArgs:
     is_embedding: A[bool, "Whether to use a CausalLM as an embedding model."] = False
     enable_multimodal: A[
         Optional[bool],
-        "Enable the multimodal functionality for the served model. If the model being served is not multimodal, nothing will happen",
+        Arg(
+            help="Enable the multimodal functionality for the served model. If "
+            "the model being served is not multimodal, nothing will happen. "
+            "Use --no-enable-multimodal to force the vision tower OFF on a "
+            "multimodal checkpoint: the tri-state is None (auto, from the "
+            "model config), True (force on) and False (force off), and only "
+            "the last one was unreachable from the CLI before #1356 -- the "
+            "field was declared Optional[bool] but generated a bare "
+            "store_true, so `False` existed in the type and in "
+            "`model_config.py:436-447` and could not be spelled by any "
+            "caller. Weg-2 boots the 27B text-only and needs exactly that "
+            "spelling (879 MiB of tower per P card, 2.63 GiB across the host "
+            "ring, measured on boot weg2xsn27).",
+            action=argparse.BooleanOptionalAction,
+        ),
     ] = None
     revision: A[
         Optional[str],
