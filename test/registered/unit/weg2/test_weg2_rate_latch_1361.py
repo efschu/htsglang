@@ -324,6 +324,43 @@ class TheCushionSeparatesTheBootsThatLivedFromTheOnesThatDied1361b(CustomTestCas
             self.assertIsNone(out)
         self.assertFalse(lat.latched)
 
+    def test_the_call_site_passes_the_cushion(self):
+        """REACHABILITY, not logic -- the ratchet [21b] was rejected for lacking.
+
+        `observe` falls through to the old rate path when `cushion_gib is None`.
+        So a call site that omits the two arguments deletes the fourth criterion
+        AT THE ONE PLACE IT MUST WORK, while every test in this file stays green
+        because they pass them. That is the present-but-unwired state one NAME
+        OVER from the parameter #1361b deleted -- the condition came back, the
+        name did not. Pinning the name would have missed it; this pins the
+        PROPERTY: the production call site hands both values over.
+        """
+        import inspect
+        from sglang.srt.weg2 import front as fr
+        src = inspect.getsource(fr)
+        i = src.index("rate_latch.observe(")
+        call = src[i:src.index(")", src.index("shmem_gib", i))]
+        self.assertIn("cushion_gib=", call)
+        self.assertIn("shmem_gib=", call)
+        # ...and from the SAME reading the level verdict grades, never a second
+        # one taken milliseconds later.
+        self.assertIn("_pr_fast.get(\"file_gib\")", src)
+        self.assertIn("_pr_fast.get(\"shmem_gib\")", src)
+
+    def test_the_reader_actually_carries_both_terms(self):
+        """If `read_cgroup_pressure` did not carry them, THAT would be the post."""
+        pr = hl.read_cgroup_pressure()
+        self.assertIn("file_gib", pr)
+        self.assertIn("shmem_gib", pr)
+
+    def test_an_absent_term_keeps_the_rate_path_and_never_reads_as_zero(self):
+        """A missing memory.stat must not become `cushion=0` = tear down."""
+        lat = hl.RateLatch(reap_mark_gib=95.90)
+        for i in range(4):
+            self.assertIsNone(
+                lat.observe(float(i), 80.0, cushion_gib=None, shmem_gib=None))
+        self.assertFalse(lat.latched)
+
     def test_the_deleted_parameter_is_gone_not_merely_unused(self):
         """Checkpoint (1): wired or deleted, never a third unwired term."""
         import inspect
