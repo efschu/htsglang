@@ -180,6 +180,71 @@ def narrow(mans, col_div: int):
 BOOT_TOKEN = "replay"
 
 
+def card_uuids():
+    """The three cards' NVML UUIDs, in NVML order. Never torch enumeration.
+
+    The fork's own rule (device identity): PyTorch's ordering and NVML's can
+    diverge, so a rank is pinned by UUID and isolated at the PROCESS level --
+    `CUDA_VISIBLE_DEVICES=<uuid>` before anything CUDA is touched, after which
+    `cuda:0` is unambiguous inside that process.
+    """
+    import subprocess
+
+    out = subprocess.run(
+        ["nvidia-smi", "--query-gpu=uuid", "--format=csv,noheader"],
+        capture_output=True, text=True, timeout=30)
+    return [u.strip() for u in out.stdout.splitlines() if u.strip()]
+
+
+def make_ops(root: str, rank: int, group: str, cuda: bool, uuid: str = ""):
+    """The ONE place the two arms differ -- that is the whole design.
+
+    `FakeDeviceOps` and `CudartDeviceOps` implement the same `tp.DeviceOps`
+    surface (`raw_malloc`, `memcpy_async`, `memcpy2d_async`, `create_stream`,
+    `synchronize`, `host_register`), so join, plan, phase split, rendezvous,
+    budget and region cut are untouched by the arm.
+    """
+    if not cuda:
+        from test_weg2_xchg_transport_1273 import FakeDeviceOps
+
+        return FakeDeviceOps(root, rank=(rank if group == "D" else 3 + rank))
+    # CVD IS SET BEFORE THE CUDART HANDLE EXISTS. With `spawn` the child has
+    # imported nothing CUDA yet, so this is the process-level isolation the
+    # device-identity rule asks for rather than an in-process mapping table.
+    if uuid:
+        os.environ["CUDA_VISIBLE_DEVICES"] = uuid
+    from sglang.srt.weg2 import weight_exchange_transport as _tp
+
+    return _tp.CudartDeviceOps()
+
+
+def device_read(ops, ptr: int, nbytes: int, cuda: bool) -> bytes:
+    """Bytes back from wherever they live -- host mmap, or the card."""
+    if not cuda:
+        return ctypes.string_at(ops.real(ptr), nbytes)
+    buf = (ctypes.c_char * nbytes)()
+    stream = ops.create_stream(0)
+    try:
+        ops.memcpy_async(ctypes.addressof(buf), int(ptr), int(nbytes), stream)
+        ops.synchronize(stream)
+    finally:
+        ops.destroy_stream(stream)
+    return bytes(buf)
+
+
+def device_write(ops, ptr: int, payload: bytes, cuda: bool) -> None:
+    if not cuda:
+        ctypes.memmove(ops.real(ptr), payload, len(payload))
+        return
+    buf = (ctypes.c_char * len(payload)).from_buffer_copy(payload)
+    stream = ops.create_stream(0)
+    try:
+        ops.memcpy_async(int(ptr), ctypes.addressof(buf), len(payload), stream)
+        ops.synchronize(stream)
+    finally:
+        ops.destroy_stream(stream)
+
+
 def rank_extents(t, group: str, rank: int):
     """(rows, cols) THIS rank holds of one joined tensor -- AXIS-AWARE.
 
@@ -403,7 +468,8 @@ class _Stub:
 
 
 def rank_proc(group, rank, evidence, root, q, self_test, max_tensors,
-              col_div, single_runner, manifest_dir):
+              col_div, single_runner, manifest_dir, cuda=False,
+              uuid=""):
     """ONE rank, THROUGH THE PRODUCT ADAPTER.
 
     THE ENTRY POINT IS THE BOOT'S, and that is the whole point of this
@@ -439,7 +505,7 @@ def rank_proc(group, rank, evidence, root, q, self_test, max_tensors,
         mans = [m for m in mans if m.pieces]
         join = xm.join_manifests(mans, pp_group="P", tp_group="D")
 
-        ops = FakeDeviceOps(root, rank=(rank if group == "D" else 3 + rank))
+        ops = make_ops(root, rank, group, cuda, uuid)
 
         # THE TWO RUNNERS, as the real rank has them. The draft head's tensors
         # (`fc.weight` and friends) live ONLY in the draft runner -- which is
@@ -482,9 +548,9 @@ def rank_proc(group, rank, evidence, root, q, self_test, max_tensors,
             ptr = ops.raw_malloc(0, nb)
             own[t.param_name] = (ptr, nb)
             if group == "P":
-                ctypes.memmove(ops.real(ptr), seed_bytes(t.param_name, nb), nb)
+                device_write(ops, ptr, seed_bytes(t.param_name, nb), cuda)
             else:
-                ctypes.memset(ops.real(ptr), 0, nb)
+                device_write(ops, ptr, b"\0" * nb, cuda)
             # A TENSOR WHOSE data_ptr() IS THE FAKE DEVICE ADDRESS: the address
             # books call `.data_ptr()`, so the double must answer it.
             param = _FakeParam(ptr, rows, cols, t.itemsize)
@@ -542,7 +608,7 @@ def rank_proc(group, rank, evidence, root, q, self_test, max_tensors,
                 else:
                     start = sum(t.tp_widths[:rank]) * t.cols_full * t.itemsize
                     want = whole[start:start + nb]
-                got = ctypes.string_at(ops.real(ptr), len(want))
+                got = device_read(ops, ptr, len(want), cuda)
                 if got == want:
                     good += 1
                 else:
@@ -576,7 +642,6 @@ def _run(ns) -> int:
           f"depth={DEPTH} max_tensors={ns.max_tensors} col_div={ns.col_div} "
           f"source={'synthetic' if ns.self_test else ns.evidence}")
 
-    q = mp.Queue()
     # THE PARENT WRITES THE MANIFESTS ONCE, narrowed and budgeted, under ONE
     # boot token -- the children then read them exactly as a rank reads its
     # boot's, through `manifests_for_boot`, which is the product's own entry.
@@ -618,10 +683,23 @@ def _run(ns) -> int:
     # point leaked 36 named semaphores per refusal -- a refusal that leaks is a
     # refusal that costs the next run.
     xr.create_semaphores(NONCE)
-    procs = [mp.Process(target=rank_proc,
-                        args=(g, r, ns.evidence, root, q, ns.self_test,
-                              ns.max_tensors, ns.col_div, ns.single_runner,
-                              mdir))
+    # SPAWN FOR THE CUDA ARM, fork otherwise. A forked child inherits whatever
+    # the parent already imported; the CUDA arm must set CUDA_VISIBLE_DEVICES
+    # BEFORE anything CUDA exists in that process, which only a fresh
+    # interpreter guarantees.
+    uuids = card_uuids() if ns.cuda else []
+    if ns.cuda and len(uuids) < xr.N_CARDS:
+        raise SystemExit(
+            f"WEG2-XCHG-LEG-REPLAY REFUSED reason=cards-unresolved "
+            f"nvml returned {len(uuids)} uuids, need {xr.N_CARDS} -- the arm "
+            f"pins a rank by UUID and never by torch enumeration")
+    ctx = mp.get_context("spawn" if ns.cuda else "fork")
+    q = ctx.Queue()
+    procs = [ctx.Process(target=rank_proc,
+                         args=(g, r, ns.evidence, root, q, ns.self_test,
+                               ns.max_tensors, ns.col_div, ns.single_runner,
+                               mdir, ns.cuda,
+                               uuids[r] if ns.cuda else ""))
              for g in ("P", "D") for r in range(xr.N_CARDS)]
     for p in procs:
         p.start()
@@ -703,6 +781,15 @@ def _teardown(root: str) -> None:
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--evidence", default="/spinning/evidence-665-f1/weg2xsn24_0912")
+    ap.add_argument("--cuda", action="store_true",
+                    help="THE CUDA ARM: six processes on the three REAL cards "
+                         "(one P and one D rank per card), CUDA_VISIBLE_DEVICES "
+                         "per process resolved by NVML UUID, real device "
+                         "memory, real bounce slot, real semaphores. Same "
+                         "pipeline as the CPU arm -- join, plan, phase split, "
+                         "rendezvous, digest -- because the arm is only the "
+                         "DeviceOps implementation. No host ring, no HiCache, "
+                         "no L2, no front, no launcher ledger.")
     ap.add_argument("--self-test", action="store_true")
     ap.add_argument("--single-runner", action="store_true",
                     help="CAN-FAIL ARM: build the address book from the MAIN "
