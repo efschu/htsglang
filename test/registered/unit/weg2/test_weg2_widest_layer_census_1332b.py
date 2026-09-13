@@ -191,7 +191,12 @@ def test_the_census_feeds_bounce_terms_and_the_bound_grades_against_the_max(ckpt
         bytes_per_direction=census.layer_total_bytes,
         n_layers=census.n_layers, widest_layer_bytes=widest,
         pairs=3, depth=2)
-    assert terms.buffer_bytes == widest * 2
+    # THE AUTHORITY, not a literal: the buffer counts the shadow's extra slot
+    # (xchg_bounce.assemble_slots), so `widest * depth` under-states it by
+    # exactly one widest layer -- the 721.4 MiB weg2xsn25 allocated and nobody
+    # charged. Grading against the expression keeps this test pinned to the
+    # one authority rather than to a second copy of it.
+    assert terms.buffer_bytes == xb.assemble_buffer_bytes(widest, 2)
     assert terms.covers_widest_layer is True
     assert terms.mean_layer_bytes < widest
     # THE MUTANT'S SHAPE, stated as the grading actually works: a buffer sized

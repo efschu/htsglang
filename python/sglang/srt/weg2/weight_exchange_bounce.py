@@ -351,7 +351,13 @@ def leg_geometry(terms: xb.BounceTerms) -> Tuple[int, int]:
     LAYER and is why a unit is assembled COMPLETE in one slot (AMENDMENT 2,
     the user law's "vollstaendig zusammengesetzt").
     """
-    return int(terms.buffer_bytes) // int(terms.depth), int(terms.depth)
+    # THE WIDEST LAYER, NAMED -- not `buffer_bytes // depth`, which was a THIRD
+    # expression for the same width and silently assumed
+    # `buffer = widest * depth`. It stopped being true the moment the price
+    # started counting the shadow's extra slot (xchg_bounce.assemble_slots),
+    # and it would have returned `widest * 3 // 2` -- a per-slot width no slot
+    # has. The term already carries the number under its own name.
+    return int(terms.widest_layer_bytes), int(terms.depth)
 
 
 # ---------------------------------------------------------------------------
@@ -1116,7 +1122,11 @@ def run_bounce_leg(
     # SHADOW MODE COSTS ONE EXTRA SLOT, priced rather than borrowed: the
     # compare needs the live bytes beside the staged ones, and reusing a
     # depth-slot would overwrite the band still in flight.
-    slots = int(depth) + (1 if comparing else 0)
+    # ONE AUTHORITY (xchg_bounce.assemble_slots): this line and the launcher's
+    # price were two expressions for one buffer, and the difference was exactly
+    # one widest layer under `mode=shadow` -- 721.4 MiB the ledger never
+    # charged, on every S6I boot.
+    slots = xb.assemble_slots(int(depth), comparing=comparing)
     if phase != PHASE_BOTH and not lane:
         raise Weg2XchgBouncePhaseUnordered(
             f"W68 Weg2XchgPlanDisagree: phase={phase} without a lane key. The "

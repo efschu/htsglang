@@ -937,3 +937,67 @@ def test_the_bounce_leg_line_never_omits_the_inject_field_1330():
         deposit_ms=0.0, collect_ms=0.0, overlap="none", mode=mode)
     assert "inject=by-design-authoritative" in mk(wx.INJECT_AUTHORITATIVE).line()
     assert "inject=NOTHING-COMPARED" in mk(wx.INJECT_SHADOW).line()
+
+
+def test_price_equals_allocation_for_the_assemble_buffer_1330(monkeypatch):
+    """ONE AUTHORITY: what the ledger charges IS what the leg allocates.
+
+    They were two expressions for one buffer:
+      priced     xchg_bounce.py:189            widest * depth
+      allocated  weight_exchange_bounce.py:1119 depth + (1 if comparing)
+                 weight_exchange_bounce.py:502  slot_bytes * depth
+    and the difference was exactly one widest layer whenever `mode=shadow` --
+    721.4 MiB the ledger never charged, on EVERY S6I boot, since S6I boots
+    shadow first.
+
+    The anchor is boot weg2xsn25's own line, not a number invented here:
+    `WEG2-XCHG-HOST-SLOT ... event=alloc bytes=2268971328`.
+    """
+    from sglang.srt.weg2 import xchg_bounce as xb
+
+    WIDEST = 756323776          # weg2xsn25's widest layer, from its own census
+    XSN25_ALLOCATED = 2268971328  # ... and the bytes it allocated for it
+
+    for mode, comparing, want_slots in ((wx.INJECT_SHADOW, True, 3),
+                                        (wx.INJECT_AUTHORITATIVE, False, 2)):
+        monkeypatch.setenv(wx.INJECT_ENV, mode)
+        # THE ARM IS READ BY THE AUTHORITY ITSELF -- no caller may hold an
+        # opinion about it, which is the shape this closes.
+        assert xb.assemble_slots(2) == want_slots, mode
+        priced = xb.bounce_terms(
+            bytes_per_direction=WIDEST * 64, n_layers=64,
+            widest_layer_bytes=WIDEST, pairs=3, depth=2,
+            slot_bytes=134217728).buffer_bytes
+        allocated = WIDEST * xb.assemble_slots(2, comparing=comparing)
+        assert priced == allocated, (mode, priced, allocated)
+
+    monkeypatch.setenv(wx.INJECT_ENV, wx.INJECT_SHADOW)
+    assert xb.assemble_buffer_bytes(WIDEST, 2) == XSN25_ALLOCATED
+
+
+def test_no_second_expression_for_the_shadow_slot_1330():
+    """AST RATCHET: the "one extra slot" idiom exists in ONE place.
+
+    The shape is `<anything> + (1 if <cond> else 0)`. A second one would
+    re-open the priced-vs-allocated gap silently, and grepping for the NUMBER
+    would not find it -- the expression is what has to be unique.
+    """
+    import ast
+    import pathlib
+
+    from sglang.srt.weg2 import xchg_bounce as xb
+
+    root = pathlib.Path(xb.__file__).resolve().parent
+    owners = []
+    for path in sorted(root.glob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if not (isinstance(node, ast.BinOp)
+                    and isinstance(node.op, ast.Add)
+                    and isinstance(node.right, ast.IfExp)):
+                continue
+            body, orelse = node.right.body, node.right.orelse
+            if (isinstance(body, ast.Constant) and body.value == 1
+                    and isinstance(orelse, ast.Constant) and orelse.value == 0):
+                owners.append(f"{path.name}:{node.lineno}")
+    assert len(owners) == 1 and owners[0].startswith("xchg_bounce.py:"), owners
