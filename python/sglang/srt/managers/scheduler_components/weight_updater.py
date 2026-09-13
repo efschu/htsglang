@@ -1037,6 +1037,7 @@ class SchedulerWeightUpdaterManager:
         from sglang.srt.weg2 import weight_exchange as wx
         from sglang.srt.weg2 import weight_exchange_region as xr
         from sglang.srt.weg2 import weight_exchange_shadow as sh
+        from sglang.srt.weg2 import xchg_bounce as xb
 
         if not wx.exchange_armed():
             return
@@ -1060,9 +1061,31 @@ class SchedulerWeightUpdaterManager:
                 "WEG2-XCHG-DEPOSIT-SKIPPED group=%s rank=%s no plan: %s",
                 group, rank, reason)
             return
+        # THE ARM'S OWN DECISION, THE SAME ONE P GETS. This passed `terms=None`
+        # and killed boot weg2xsn26: `run_bounce_leg` derives no size of its
+        # own (the sizing expression has ONE owner), so D's sleep leg raised
+        # `ValueError: ... needs either terms ... or an explicit
+        # slot_bytes/depth pair` nine times, took the group fence down through
+        # `_weg2_leg_failed` and ended the boot at W17 Weg2GroupDead with
+        # 0 legs and 0 SEAM-DIGEST lines.
+        #
+        # I WROTE `terms=None` BELIEVING THE LEG WOULD DERIVE THEM. The
+        # docstring's "the normal way in" describes the terms/slot_bytes PAIR,
+        # not a fallback -- and the call site that proves it is the one I did
+        # not exercise. P reaches `read_published_terms` at :997 and passes the
+        # result; D now reads the SAME publication, so both halves of one flip
+        # are sized by one decision.
+        terms = xb.read_published_terms()
+        if terms is None:
+            logger.info(
+                "WEG2-XCHG-DEPOSIT-SKIPPED group=%s rank=%s: the arm published "
+                "no bounce terms (%s), so this rank cannot size a deposit; the "
+                "waking group's collect will find nothing and say so",
+                group, rank, xb.ENV_BOUNCE_TERMS)
+            return
         self._weg2_xchg_bounce_leg(
             descs=list(plan.descs), ops=self._weg2_xchg_device_ops(),
-            boot_nonce=boot_nonce, terms=None, mode=wx.inject_mode(),
+            boot_nonce=boot_nonce, terms=terms, mode=wx.inject_mode(),
             device=int(device), hook=sh.HOOK_SOURCE,
             region=self._weg2_shadow_region(),
             sems=self._weg2_xchg_sems(),

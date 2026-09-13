@@ -617,12 +617,19 @@ def test_the_leg_refuses_to_invent_a_size(tmp_path, armed, seeded):
     two-ledgers defect; and it would be the one that runs when the launcher
     forgets to pass the measured figure.
     """
-    with pytest.raises(ValueError) as e:
+    # NAMED NOW, AND THE RENAME IS THE POINT. This pinned a bare `ValueError`,
+    # and on boot weg2xsn26 that unnamed raise fired nine times on D's sleep
+    # leg and ended the boot -- visible only because W29 collected the foreign
+    # text. The W-code census scans for codes; an unnamed refusal on a path
+    # that costs a boot is invisible to it by construction. Same refusal, same
+    # reason, now with a name a census can count.
+    with pytest.raises(wx.Weg2XchgPlanDisagree) as e:
         _manager()._weg2_xchg_bounce_leg(
             descs=_all_descs(), ops=seeded, boot_nonce=armed,
             shm_root=str(tmp_path),
         )
     assert "one owner" in str(e.value)
+    assert "W68" in str(e.value)
 
 
 # ===========================================================================

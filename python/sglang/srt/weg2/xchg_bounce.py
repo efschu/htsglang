@@ -118,7 +118,14 @@ class BounceTerms:
         """
         if self.depth <= 0:
             return False
-        return (int(self.buffer_bytes) // int(self.depth)) >= int(
+        # PER SLOT, AND THE SLOT COUNT IS NOT THE DEPTH. This divided by
+        # `depth` while the buffer holds `assemble_slots(depth)` -- one more
+        # under a comparing arm. The division therefore reported a per-slot
+        # width 1.5x the real one, and a MEAN-sized buffer could answer "yes,
+        # it covers the widest layer" when it does not: the exact fail-open
+        # this property exists to prevent, introduced by the very commit that
+        # unified the size. Found by a 1332 pin, not by me.
+        return (int(self.buffer_bytes) // assemble_slots(int(self.depth))) >= int(
             self.widest_layer_bytes
         )
 

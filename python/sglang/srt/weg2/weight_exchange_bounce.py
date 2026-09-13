@@ -1052,10 +1052,23 @@ def run_bounce_leg(
         slot_bytes = derived_slot if slot_bytes is None else slot_bytes
         depth = derived_depth if depth is None else depth
     if slot_bytes is None or depth is None:
-        raise ValueError(
-            "run_bounce_leg needs either `terms` (the ARM's priced decision) "
-            "or an explicit slot_bytes/depth pair; it derives no size of its "
-            "own, because the sizing expression has one owner (xchg_bounce)"
+        # NAMED, BECAUSE IT COST A WHOLE BOOT UNSEEN. This was a bare
+        # `ValueError`, and on weg2xsn26 it fired nine times on D's sleep leg
+        # and ended the boot at W17 Weg2GroupDead -- visible ONLY because W29
+        # Weg2FlipRankDisagree collected the foreign text. A refusal on a path
+        # that costs a boot may not be the one refusal without a code: the
+        # census scans for W-codes, and an unnamed raise is invisible to it by
+        # construction.
+        #
+        # W68 AND NOT A NEW CODE: this is the plan and the arm disagreeing
+        # about a size, which is exactly `Weg2XchgPlanDisagree`'s subject, and
+        # the census reads the MESSAGE TEXT rather than the class.
+        raise wx.Weg2XchgPlanDisagree(
+            "W68 Weg2XchgPlanDisagree: run_bounce_leg needs either `terms` "
+            "(the ARM's priced decision) or an explicit slot_bytes/depth "
+            "pair; it derives no size of its own, because the sizing "
+            "expression has one owner (xchg_bounce). The caller that reaches "
+            "here has a plan but no price, so it would have to invent one."
         )
     descs = list(descs)
     phase = str(phase)

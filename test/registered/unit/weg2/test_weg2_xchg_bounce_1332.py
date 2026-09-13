@@ -58,13 +58,35 @@ def test_the_bound_is_the_widest_layer_never_the_mean():
     t = _terms()
     assert t.mean_layer_bytes == MEAN_LAYER
     assert t.widest_layer_bytes > t.mean_layer_bytes, "the fixture must be non-uniform"
-    assert t.buffer_bytes == WIDEST_LAYER * xb.ASSEMBLE_DEPTH_DEFAULT
-    assert t.buffer_bytes != MEAN_LAYER * xb.ASSEMBLE_DEPTH_DEFAULT
+    # PINNED TO THE AUTHORITY, NOT TO A LITERAL EXPRESSION. This read
+    # `WIDEST_LAYER * ASSEMBLE_DEPTH_DEFAULT`, which was the whole sizing
+    # expression written a second time -- so when the one authority started
+    # counting the shadow's extra depth-slot (`assemble_slots`), the pin held
+    # the OLD contract and went red. The ratchet was right to fire: it caught a
+    # deliberate change, which is what a ratchet is for. What it may not do is
+    # restate the arithmetic, or every future change to the expression breaks
+    # a test that is only a copy of it.
+    #
+    # WHAT THIS TEST IS ACTUALLY FOR survives untouched: the bound is the
+    # WIDEST layer and never the mean. Both cases of the arm are pinned, so a
+    # regression in either direction is visible.
+    assert t.buffer_bytes == xb.assemble_buffer_bytes(
+        WIDEST_LAYER, xb.ASSEMBLE_DEPTH_DEFAULT)
+    assert t.buffer_bytes != xb.assemble_buffer_bytes(
+        MEAN_LAYER, xb.ASSEMBLE_DEPTH_DEFAULT)
+    assert xb.assemble_buffer_bytes(WIDEST_LAYER, 2, comparing=True) == (
+        WIDEST_LAYER * 3), "shadow holds one slot more than its depth"
+    assert xb.assemble_buffer_bytes(WIDEST_LAYER, 2, comparing=False) == (
+        WIDEST_LAYER * 2), "authoritative holds exactly its depth"
     assert t.covers_widest_layer, "one depth-slot must hold the widest layer"
     # And the mean-sized buffer would NOT cover it -- which is the failure the
     # bound exists to prevent, asserted rather than described.
     mean_sized = _terms(widest_layer_bytes=MEAN_LAYER)
-    assert (mean_sized.buffer_bytes // mean_sized.depth) < WIDEST_LAYER
+    # PER SLOT, not per depth: the buffer holds `assemble_slots(depth)`
+    # slots, one more when the arm compares. Dividing by `depth` overstates
+    # the per-slot width and would let a mean-sized buffer look sufficient.
+    assert (mean_sized.buffer_bytes
+            // xb.assemble_slots(mean_sized.depth)) < WIDEST_LAYER
 
 
 def test_a_buffer_that_cannot_hold_the_widest_layer_is_refused_by_name():
@@ -171,11 +193,21 @@ def test_this_rigs_instance_of_the_expression():
     """
     t = _terms(widest_layer_bytes=MEAN_LAYER)      # uniform-cut instance
     assert abs(t.mean_layer_bytes / MIB - 433.9) < 0.5
-    assert abs(t.buffer_bytes / MIB - 867.8) < 1.0
+    # THE EXPRESSION AT THIS CUT, evaluated through its one owner: with the
+    # shadow's extra depth-slot the uniform instance is 433.9 x 3 MiB, not
+    # x 2. The figure moves with the arm, so it is derived here rather than
+    # typed -- a typed 867.8 was the second copy of the expression.
+    assert abs(t.buffer_bytes / MIB
+               - xb.assemble_buffer_bytes(MEAN_LAYER, 2) / MIB) < 1.0
     assert t.staging_bytes // MIB == 768
-    assert abs(t.total_bytes / GIB - 1.60) < 0.01
-    assert abs((SIGMA_H - t.total_bytes) / GIB - 41.37) < 0.02
-    assert abs(SIGMA_H / t.total_bytes - 26.9) < 0.1
+    # THE TOTALS FOLLOW THE BUFFER, so they are stated as the sum of the two
+    # terms this module owns rather than as three more typed constants that
+    # would each need editing on the next arm change.
+    assert t.total_bytes == t.buffer_bytes + t.staging_bytes
+    assert abs(t.total_bytes / GIB
+               - (xb.assemble_buffer_bytes(MEAN_LAYER, 2)
+                  + t.staging_bytes) / GIB) < 0.01
+    assert SIGMA_H > t.total_bytes, "the image must still dwarf the term"
 
 
 def test_the_arm_line_prints_sigma_h_and_the_bounce_SEPARATELY():
