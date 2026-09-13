@@ -195,6 +195,16 @@ ZEROFILL = "ZEROFILL"
 ROWS = 0
 COLS = 1
 REPLICATED = -1
+#: #1384 W68: a fused row tensor (QKVParallelLinear under
+#: ``attn_kv_replicated``, task #62/#116) whose DECLARED components do not
+#: all share one axis -- Q ratio-split across TP, K/V fully replicated on
+#: every rank when ``kv_heads < tp_size`` (#1382). Classified only by
+#: ``xchg_manifest._axis_of`` from DECLARED ``component_rows`` (never
+#: recomputed); NOT a valid ``ParamGeom.shard_axis`` (``validate()`` still
+#: refuses it below, by design -- the actual per-component byte copy is not
+#: wired yet, so a caller that reaches ``.geom()`` for this axis fails LOUD
+#: instead of silently comparing/moving the wrong bytes).
+MIXED_FUSED = 2
 
 #: E4 bounds the granularity: pieces >= 2 MiB issued async cost <= 1 %, while
 #: 256 KiB async costs 4.6-6.4 %.  Only a per-copy SYNC is expensive (2.04x),
@@ -652,6 +662,17 @@ class ParamGeom:
     stage: Optional[int] = None
     dst_widths: Optional[Sequence[int]] = None
     dst_extents: Optional[Sequence[int]] = None
+    #: #1384: DECLARED per-component row sizes of a fused parameter (e.g. a
+    #: QKVParallelLinear weight's (q, k, v) split), read straight off the
+    #: module that already computed them to size its own buffer
+    #: (``linear.py`` ``q_proj_shard_size``/``kv_proj_shard_size``/
+    #: ``v_proj_shard_size``) -- never re-derived here. ``()`` (default) means
+    #: "no declared sub-split", which is every parameter this field did not
+    #: exist for before #1384 and is untouched by it. Not consumed by
+    #: ``validate()``/the copy path; it exists only so the manifest join
+    #: (``xchg_manifest._axis_of``) can classify a MIXED_FUSED tensor by
+    #: component instead of guessing from the outer row count alone.
+    component_rows: Tuple[int, ...] = ()
 
     def replace(self, **kw) -> ParamGeom:
         return _dc_replace(self, **kw)

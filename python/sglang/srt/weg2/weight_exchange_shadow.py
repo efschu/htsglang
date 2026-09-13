@@ -2947,6 +2947,37 @@ def card_manifest_entries(inventory: Sequence[object],
         for g in inventory))
 
 
+def _qkv_component_rows(model, name: str) -> Tuple[int, ...]:
+    """#1384: this parameter's DECLARED (q, k, v) row split, if any.
+
+    Read straight off the ``QKVParallelLinear`` (or a subclass of it) that
+    owns ``name`` -- ``q_proj_shard_size``/``kv_proj_shard_size``/
+    ``v_proj_shard_size`` are already computed in its ``__init__``
+    (``layers/linear.py:1539-1541``) to size the very buffer this parameter
+    IS, including under ``attn_kv_replicated`` (#62: every rank holds the
+    full k/v width, only q is ratio-split). Nothing here derives a boundary;
+    it looks up three integers the loader already decided. Empty for any
+    parameter that is not this module's weight/bias, or whose owner does not
+    expose all three attributes (every parameter this ran against before
+    #1384) -- the caller treats that exactly like "no declared split".
+    """
+    if not (name.endswith(".weight") or name.endswith(".bias")):
+        return ()
+    mod_path, _, _leaf = name.rpartition(".")
+    if not mod_path:
+        return ()
+    try:
+        owner = model.get_submodule(mod_path)
+    except AttributeError:
+        return ()
+    q = getattr(owner, "q_proj_shard_size", None)
+    k = getattr(owner, "kv_proj_shard_size", None)
+    v = getattr(owner, "v_proj_shard_size", None)
+    if q is None or k is None or v is None:
+        return ()
+    return (int(q), int(k), int(v))
+
+
 def card_inventory(
     *,
     rank: int,
@@ -3016,7 +3047,9 @@ def card_inventory(
         try:
             geom = wx.ParamGeom.of(param, name=str(name), tag=tag,
                                    shard_axis=wx.REPLICATED, shard_total=0,
-                                   stage=int(rank))
+                                   stage=int(rank),
+                                   component_rows=_qkv_component_rows(
+                                       model, str(name)))
         except BaseException as exc:  # noqa: BLE001 -- a shape this plan cannot name
             # THE SAME SKIP RULE AS THE PLAN'S, deliberately: a parameter the
             # plan cannot describe must not be in the manifest either, or the
