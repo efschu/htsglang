@@ -140,6 +140,9 @@ from sglang.srt.weg2.ring_guard import RingNeedGuard  # noqa: E402
 # `coverage` lazily inside `arm()` and only when the launcher published its
 # directory, so an unarmed boot pays this import and nothing else.
 from sglang.srt.weg2 import lane_coverage as wlc  # noqa: E402
+# #1358 [W102-wired]: the lanes-specific refusal lives in the ledger, which is
+# also where the count it disagrees with was priced.
+from sglang.srt.weg2 import host_ledger as hl  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
@@ -3480,8 +3483,17 @@ class SchedulerWeightUpdaterManager:
             _lanes = bx.group_descs_by_pair(descs)
             _priced = int(getattr(terms, "n_lanes", 1) or 1)
             if terms is not None and _priced < len(_lanes):
-                raise bx.Weg2XchgBouncePhaseUnordered(
-                    f"W68 Weg2XchgPlanDisagree: the ledger priced "
+                # #1358 [W102-wired] THE CODE MATCHES THE DEFECT. This raised
+                # W68 Weg2XchgPlanDisagree -- the code for a leg whose PHASE or
+                # lane KEY is wrong -- while the condition here is a lane COUNT
+                # the ledger priced too low. `Weg2XchgLanesUnmeasured` (W102)
+                # is the lanes-specific code and, until this commit, had NO
+                # raise site anywhere in the tree while a comment in
+                # host_ledger.py claimed the leg driver used it. An intention
+                # recorded as a state: the exact thing a W-code census reads as
+                # covered.
+                raise hl.Weg2XchgLanesUnmeasured(
+                    f"W102 Weg2XchgLanesUnmeasured: the ledger priced "
                     f"n_lanes={_priced} BOOT-WIDE and THIS RANK alone needs "
                     f"{len(_lanes)} "
                     f"({sorted(str(k) for k in _lanes)}). Each lane is its own "
