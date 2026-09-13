@@ -420,6 +420,31 @@ def _content_text(c: Any) -> str:
     return str(c if c is not None else "")
 
 
+def _image_parts(payload) -> int:
+    """#1356: how many image parts this request carries. 0 for text-only.
+
+    STRUCTURAL, not a string search: it counts OpenAI/Anthropic content parts
+    whose `type` names an image, in `messages[].content[]`. A prompt that
+    merely mentions the word "image" is text and must route normally -- the
+    #995 prose trap, one layer up.
+    """
+    n = 0
+    try:
+        for m in (payload or {}).get("messages") or []:
+            c = m.get("content") if isinstance(m, dict) else None
+            if not isinstance(c, list):
+                continue
+            for part in c:
+                if not isinstance(part, dict):
+                    continue
+                t = str(part.get("type") or "")
+                if t in ("image_url", "image", "input_image"):
+                    n += 1
+    except Exception:  # noqa: BLE001 - a malformed body is not an image
+        return 0
+    return n
+
+
 def request_text(payload: dict) -> str:
     """The prompt as ONE string, for the span estimate and the ledger.
 
@@ -2538,6 +2563,28 @@ class Front:
         if self.state == "STOP":
             return web.json_response({"error": f"WEG2 STOP {self.stop}"}, status=503)
         payload = await request.json()
+        # #1356 IMAGES ARE REFUSED BY NAME, not routed to a group that cannot
+        # serve them. Both groups boot text-only (`--weg2-vision off`), so the
+        # tower is not loaded and an image part would reach a model with no
+        # vision weights. Upstream's own words for that case are "image inputs
+        # would run an uninitialized vision tower" (model_config.py, the GGUF
+        # branch) -- i.e. the failure is WRONG OUTPUT, not an exception, which
+        # is the one shape that must never be reached silently. 501 and not
+        # 400: the request is well-formed and this deployment does not
+        # implement it; a 400 would tell the caller its input was wrong.
+        _img = _image_parts(payload)
+        if _img:
+            return web.json_response(
+                {"error": f"W101 Weg2VisionRefused: this boot is TEXT-ONLY "
+                          f"(--weg2-vision off) and carries no vision tower, so "
+                          f"the {_img} image part(s) in this request cannot be "
+                          f"served. Routing them would run an uninitialised "
+                          f"tower and return plausible WRONG text rather than "
+                          f"an error. Boot with --weg2-vision resident to load "
+                          f"the tower on both groups (879 MiB per P card, "
+                          f"2.63 GiB across the host ring, measured on "
+                          f"weg2xsn27)."},
+                status=501)
         self._rid += 1
         rid = f"weg2-{self.epoch}-{self._rid}"
         text = request_text(payload)

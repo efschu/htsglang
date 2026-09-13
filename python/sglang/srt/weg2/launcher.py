@@ -2528,6 +2528,21 @@ def store_read_cost_line(plan: StoreDiskPlan, cap_tokens: int) -> str:
 # --------------------------------------------------------------------------
 
 
+#: #1356 THE VISION KNOB. `off` (default) boots P and D TEXT-ONLY; `resident`
+#: keeps the tower loaded on both groups, which is what every boot up to and
+#: including weg2xsn27 did. `resident` is kept for the day the tower becomes a
+#: 7th rank transient between the flips -- that is #1356 proper and it is NOT
+#: this slice.
+#:
+#: WHY IT IS A DEFAULT AND NOT AN OPT-IN: weg2xsn27 loaded the tower on all six
+#: ranks and replicated it threefold on P -- 879 MiB per P card in the manifest
+#: and 2.63 GiB across the host ring, measured. No Weg-2 form serves images,
+#: and the front refuses them by name, so the bytes bought nothing.
+VISION_OFF = "off"
+VISION_RESIDENT = "resident"
+VISION_CHOICES = (VISION_OFF, VISION_RESIDENT)
+
+
 def common_flags(
     model: str,
     s_gb: int,
@@ -2536,6 +2551,7 @@ def common_flags(
     max_kv_per_request: int,
     write_policy: str = "write_through",
     group: str = "both",
+    vision: str = VISION_OFF,
     random_seed: int = RANDOM_SEED,
     barlink_cap_cycles: int = BARLINK_BAR1_CAP_CYCLES,
     census_interval: int = COLLECTIVE_CENSUS_INTERVAL,
@@ -2568,6 +2584,16 @@ def common_flags(
     return [
         "--model-path", model,
         "--trust-remote-code",
+        # #1356: TEXT-ONLY BY DEFAULT, on BOTH groups, via the ONE decision the
+        # model config already makes (`model_config.py:436-447`, read at
+        # `server_args.py:14112`). NOT `--language-only`: that flag is the
+        # encoder-disagg RECEIVER and refuses without `--encoder-urls`
+        # (`server_args.py:17996`), so passing it here would kill the launch
+        # rather than drop the tower. And not a model-name list either -- that
+        # is the #1362 fossil class. `--no-enable-multimodal` became spellable
+        # in this same commit; before it, `False` existed in the tri-state and
+        # in the config branch and no caller could say it.
+    ] + (["--no-enable-multimodal"] if vision == VISION_OFF else []) + [
         # #1362 FOSSIL 4: this was the LITERAL "Qwen3.8-27B" on every boot,
         # including the 4B-FP8 transition vehicle -- the served name is what the
         # front, the load drivers and every probe address, so a wrong one makes
@@ -2658,6 +2684,7 @@ def argv_p(
     stage_ratio: Optional[str] = None,
     attn_stage_ratio: Optional[str] = None,
     write_policy: str = "write_through",
+    vision: str = VISION_OFF,
     depth: int = 0,
     window_mib: str = P_BARLINK_BAR1_WINDOW_MIB,
     random_seed: int = RANDOM_SEED,
@@ -8976,6 +9003,22 @@ def build_parser() -> argparse.ArgumentParser:
              "measured on weg2xsn27: 721.3 MiB x 5 holders = 3.52 GiB of "
              "non-reclaimable at the sleep leg. The value is published to the "
              "ranks and read back by the host ledger, so all three agree.",
+    )
+    ap.add_argument(
+        # #1356: see VISION_OFF. Default `off` = P and D boot TEXT-ONLY.
+        "--weg2-vision", choices=list(VISION_CHOICES), default=VISION_OFF,
+        help="#1356: `off` (default) boots both groups text-only by passing "
+             "--no-enable-multimodal; `resident` keeps the vision tower loaded "
+             "on P and D, which is what every boot through weg2xsn27 did "
+             "(879 MiB per P card, 2.63 GiB across the host ring). NOTE: `off` "
+             "CHANGES THE GROUP-P FORM KEY -- the flag is in the argv and is "
+             "not in FORM_KEY_EXCLUDED_FLAGS, because a tower that is absent "
+             "IS a different weight statement. The first boot of the text-only "
+             "form therefore solves its ring from ITS OWN stem and W48 "
+             "Weg2RingFormMismatch is EXPECTED once, not W20: there is no "
+             "same-form predecessor to inherit a census from, and inheriting "
+             "the multimodal form's Sigma H would price 2.63 GiB of tower this "
+             "form does not hold.",
     )
     ap.add_argument(
         "--weg2-xchg-oncard-slot-mib", type=int,
