@@ -4992,6 +4992,21 @@ def xchg_bounce_terms_for_arm(weight_source: str, oncard_mode: str,
         str(model_dir), pairs=int(weight_exchange_region.N_CARDS),
         depth=xchg_bounce.ASSEMBLE_DEPTH_DEFAULT, slot_bytes=slot_bytes)
     lines = [widest, xchg_bounce.arm_line(terms)]
+    # PROVENANCE, ADDITIVE: the depth-slot is derived HERE, from this
+    # checkpoint's census, and never from a knob -- but no line said so, and a
+    # size whose origin is not printed is a size a later reader will assume
+    # came from a default. The desk replay carried its own 4 MiB constant and
+    # met W71 at full width (`widest unit ... 252086022 B against a depth-slot
+    # of 4194304 B`); that was the replay's constant, not this path, and this
+    # line is what makes the difference readable from a boot log.
+    lines.append(
+        f"WEG2-XCHG DEPTH-SLOT bytes={int(terms.widest_layer_bytes)} "
+        f"source=census widest={widest_name} "
+        f"(depth={int(terms.depth)} buffer_bytes={int(terms.buffer_bytes)} "
+        f"staging_slot_bytes={int(terms.slot_bytes)} "
+        f"n_layers={int(terms.n_layers)}) -- the assemble buffer's depth-slot "
+        f"holds the WIDEST layer of THIS checkpoint; a boot sized on the mean "
+        f"dies on whichever layer is above it")
     if not terms.covers_widest_layer:
         raise xchg_bounce.Weg2XchgBounceUnderCovered(
             xchg_bounce.under_coverage_refusal(terms,

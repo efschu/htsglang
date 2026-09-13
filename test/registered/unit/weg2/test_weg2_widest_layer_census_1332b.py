@@ -250,9 +250,15 @@ def test_the_host_arm_charges_the_MEASURED_bounce_and_prints_both_lines(ckpt):
         pairs=3, depth=xb.ASSEMBLE_DEPTH_DEFAULT)
     assert charged == expected.total_bytes, (charged, expected.total_bytes)
     assert charged > 0, "the whole point of the arm change is a priced bounce"
-    assert len(lines) == 2, lines
+    assert len(lines) == 3, lines
     assert lines[0].startswith(cc.WIDEST_LINE_PREFIX), lines[0]
     assert lines[1].startswith("WEG2-XCHG-BOUNCE "), lines[1]
+    # THE PROVENANCE OF THE DEPTH-SLOT, so a boot log says where the size came
+    # from instead of leaving a later reader to assume a default. The size
+    # itself is unchanged -- this asserts only that its ORIGIN is printed.
+    assert lines[2].startswith("WEG2-XCHG DEPTH-SLOT "), lines[2]
+    assert "source=census" in lines[2], lines[2]
+    assert f"bytes={expected.widest_layer_bytes}" in lines[2], lines[2]
     # The ARM line's total and the charge are ONE number, not two readings.
     assert f"bounce_total_mib={expected.total_bytes // xb.MIB}" in lines[1]
 
