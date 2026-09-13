@@ -1328,6 +1328,14 @@ class RingTable:
     #: is not about the form).  Printed as such: an unarmed gate must never read
     #: as a passed one.
     form_same: Optional[bool] = None
+    #: #1367: the same-form candidates :func:`solve` RANKED (it already
+    #: builds this list at the top of the scan to put distance 0 ahead of
+    #: everything). Empty is not "unknown" -- it is the BOOTSTRAP state: no
+    #: boot of this form exists yet, which is what the first armed boot of a
+    #: form looks like, and is never a fault. A NON-empty list with
+    #: ``form_same`` false IS a mismatch: a source of this form existed and
+    #: did not win.
+    same_form_candidates: Tuple[str, ...] = ()
     #: One line naming exactly what differs between the two forms.
     form_diff: str = ""
 
@@ -2661,6 +2669,12 @@ def solve(
     # term that had drifted.  A same-form boot needs no such carry: both halves
     # of its image statement are a measurement of this form.
     form_order = ""
+    #: #1367: bound HERE, not inside the ranking block, because the launcher
+    #: reads it as a state ("is this the first boot of this form?") and a name
+    #: that exists only on the ranking path would read as "no candidates" on
+    #: every path that never ranked -- absence of the variable spelled as
+    #: absence of the thing.
+    same_form: List[str] = []
     xchg_excluded: List[str] = []
     if p_argv is not None and len(stems) > 1:
         # #1305 item 4: OTHER-FORM CANDIDATES RANK BY FORM DISTANCE, then by
@@ -2676,7 +2690,7 @@ def solve(
         # exchange region's host pages, which this boot never allocates.
         mine_toks = set(my_form.split(" ")) if my_form else set()
         i_am_xchg = XCHG_FORM_TOKEN in mine_toks
-        same_form, scored = [], []
+        scored = []
         for s in stems:
             src_argv, _why = parse_p_form(os.path.join(evidence_dir, f"{s}.front.log"))
             if src_argv is None:
@@ -2910,6 +2924,7 @@ def solve(
             source_form_key=src_key,
             form_same=form_same,
             form_diff=form_diff,
+            same_form_candidates=tuple(same_form),
             bound_groups=tuple(
                 g for g, b in (("P", bound_p), ("D", bound_d)) if b
             ),

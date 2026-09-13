@@ -68,11 +68,15 @@ from typing import (
 )
 
 from sglang.srt.managers import corridor_guard
-from sglang.srt.weg2 import admin_key as admin_key_mod
 from sglang.srt.registry import nvml as nvml_registry
 from sglang.srt.weg2 import (
+    DEFAULT_D_BS,
+    DEFAULT_P_BS,
+    DEFAULT_PP_ORDERED_CUT,
+)
+from sglang.srt.weg2 import admin_key as admin_key_mod
+from sglang.srt.weg2 import (
     checkpoint_census,
-    xchg_manifest,
     corridor_budget,
     host_ledger,
     ring_table,
@@ -82,9 +86,9 @@ from sglang.srt.weg2 import (
     weight_exchange_shadow,
     weight_exchange_transport,
     xchg_bounce,
+    xchg_manifest,
     xchg_residency,
 )
-from sglang.srt.weg2 import DEFAULT_D_BS, DEFAULT_P_BS, DEFAULT_PP_ORDERED_CUT
 
 MIB = 1024 * 1024
 PORT_FRONT = 30030
@@ -3765,7 +3769,7 @@ Weg2XchgFormSourceMissing = ring_table.Weg2RingFormMismatch
 
 def refuse_unless_same_form_source(
     table: Optional[ring_table.RingTable], weight_source: str
-) -> None:
+) -> Optional[str]:
     """Under an armed arm, a table solved from ANOTHER form is a refusal.
 
     The token above stops #1305 item 4 from excluding this form's own boots --
@@ -3795,6 +3799,40 @@ def refuse_unless_same_form_source(
     if getattr(table, "form_same", None) is True:
         return None
     unarmed = getattr(table, "form_same", None) is None
+    # #1367 THE FOURTH NON-CASE: THE FIRST ARMED BOOT OF A FORM.
+    # The armed arm puts XCHG_FORM_TOKEN into group P's argv and the token is
+    # IN the form key, so an armed boot's key can never equal an unarmed
+    # boot's. With no same-form candidate in existence, the sentence this
+    # refusal ended with -- "Boot the arm once to produce the first same-form
+    # source" -- names the boot it is refusing: a remedy that cannot be
+    # carried out. Measured: xsn30 dry run rc=2 on all three groups, armed key
+    # 0a15b55459fb against the unarmed 2b66740bedf9 of xsn29.
+    #
+    # The operator's ruling (2026-09-13) is narrow and is NOT a rebuild of the
+    # key: the exchange arm is a different weight statement and keeps its own
+    # key. Absence of a same-form source is the BOOTSTRAP STATE -- the same
+    # reading #1362 gave the model digest and the lane cut -- and it takes the
+    # THIRD W48 shape that already exists for the default arm: the source's
+    # weight statement is discarded and re-derived from THIS boot's argv
+    # (ring_table.py:2737), so only the non-weight residual is carried.
+    #
+    # WHAT IS NOT RELAXED: a same-form source that EXISTS and did not win is a
+    # real mismatch and still stops the boot below -- which is why this reads
+    # the inventory `solve` ranked, and not merely `form_same`.
+    same_form_sources = tuple(getattr(table, "same_form_candidates", ()) or ())
+    if not unarmed and not same_form_sources:
+        return (
+            f"WEG2-RING W48 BOOTSTRAP armed first boot -- form key "
+            f"{table.form_key} has NO boot yet, so there is no same-form source "
+            f"to be missing. The closest twin {table.boot} (form key "
+            f"{table.source_form_key}) is carried for its NON-WEIGHT residual "
+            f"only; this boot's weight statement is source=derived, re-derived "
+            f"from its own argv, and the exchange region's residual comes from "
+            f"the published terms rather than from a foreign form. The next "
+            f"armed boot of this form finds this one and is no longer a "
+            f"bootstrap. A same-form source that EXISTS and disagrees still "
+            f"refuses: {table.form_diff}"
+        )
     raise Weg2XchgFormSourceMissing(
         f"W48 Weg2RingFormMismatch: --weg2-weight-source {weight_source} arms the "
         f"exchange, so this boot's group-P form carries {ring_table.XCHG_FORM_TOKEN} "
@@ -3804,6 +3842,9 @@ def refuse_unless_same_form_source(
            f"The closest twin the ranking could offer is boot {table.boot}, whose "
            f"form key is {table.source_form_key} against this boot's "
            f"{table.form_key}: {table.form_diff}.  ")
+        + (f"A same-form source EXISTS and did not win, so this is a real "
+           f"mismatch and not a first boot: {', '.join(same_form_sources)}.  "
+           if same_form_sources else "")
         + "There is NO fallback: a chunk tag is a LAYER BAND, so a source of "
         "another PP form states group P's bytes on the wrong cards, and the "
         "ring's residual, the ledger's charge and the exchange census would "
@@ -9961,7 +10002,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     n_layers = model_num_layers(ns.model)
     chunk_count = max(0, int(ns.weight_chunks))
     chunk_layers = int(math.ceil(n_layers / chunk_count)) if chunk_count > 0 else 0
-    from sglang.srt.managers.weg2_memory_saver import chunk_tag_cards, weights_family_tags
+    from sglang.srt.managers.weg2_memory_saver import (
+        chunk_tag_cards,
+        weights_family_tags,
+    )
     weights_tags = weights_family_tags(chunk_count)
     log(f"WEG2-WEIGHT-CHUNKS N={chunk_count} tags (layers per chunk {chunk_layers} of {n_layers}; family {weights_tags}); "
         "flip (C9, gathered legs) = src.pause(kv) -> ONE src.release(family) and ONE dst.resume(family) "
@@ -10241,7 +10285,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # B4e (ii): with the token on, an absent same-form source is no longer an
     # EXCLUSION but a silent fall-through to the closest twin -- refuse here,
     # before either group starts, with the twin printed.
-    refuse_unless_same_form_source(ring_plan.table, ns.weg2_weight_source)
+    # #1367: the bootstrap is a LINE, not a silence -- it goes into the ring
+    # evidence, so a reader of this boot's state can tell "first boot of this
+    # form" from "inherited a same-form table" without re-deriving either.
+    bootstrap_w48 = refuse_unless_same_form_source(ring_plan.table, ns.weg2_weight_source)
+    if bootstrap_w48:
+        log(bootstrap_w48)
+        ring_plan.lines.append(bootstrap_w48)
     state.ring_lines = ring_plan.lines
     state.ring_epoch = str(ring_plan.epoch)
     # A1-3: an un-armed ring has no fallback form to name.  The predecessor
