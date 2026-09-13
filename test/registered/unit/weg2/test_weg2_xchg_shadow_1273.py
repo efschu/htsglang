@@ -2058,27 +2058,42 @@ def test_a_priced_hop_under_the_bound_is_not_refused(region, boot, no_active_leg
 
 # --- W78 at leg start (item 3) --------------------------------------------
 
-def test_a_stale_semaphore_stops_the_shadow_and_never_the_flip(region, boot,
-                                                               no_active_leg):
-    """W78 gets its caller, and the caller COUNTS it.
+def test_a_set_in_use_is_counted_and_does_NOT_stop_the_shadow_1366(region, boot,
+                                                                   no_active_leg):
+    """#1366: a non-pristine set is COUNTED, never a skip.
 
-    ``verify_sem_arm`` refuses; on the authoritative path (S6's RPC preamble)
-    that refusal stops a flip.  Here the same event may only stop the SHADOW,
-    so the hook catches it, prints it, and reports ``reason=w78-stale`` with
-    ``sems_armed=n/a`` -- an absent census, not a passed one.
+    THIS TEST ASSERTED THE OPPOSITE ONE COMMIT AGO, and the inversion is the
+    finding. `verify_sem_arm` refusing at LEG START was an arrival-order race:
+    `leg.sems` carries a real CROSS-GROUP handshake, so the group that starts
+    its leg second always finds `empty=0, full=1` -- a set that has done its
+    work. Boot weg2xsn26 measured it in one second: D (d2h) first and
+    `ran=yes why=ok`, P (h2d) after and `ran=no why=w78-stale`, 2 of 2.
+
+    THE COST WAS THE GRADE. The observer may not stop a flip, so the second
+    group simply did not compare -- and a six-rank SEAM-DIGEST is then
+    structurally unreachable, because the ceiling is whichever group arrived
+    first. A criterion asking for 6/6 was measuring the check's timing.
+
+    THE SHAPE BELOW IS THE xsn26 SHAPE: `post(0, 0, "full")` leaves exactly
+    `empty=0, full=1` on that pair -- what the peer leaves behind. The leg must
+    RUN, and the census must still be readable.
     """
     xr.create_semaphores(boot)
     sems = tp.SemSet(boot)
     try:
-        sems.post(0, 0, "full")  # the leftover a rolled-forward flip leaves
+        sems.post(0, 0, "full")  # what the FIRST group leaves for the second
         lines: list = []
         result = sh.run_leg_hook(_inputs(sh.HOOK_DESTINATION), log=lines.append,
                                  descs=[_diag(0, 4096)], region=region,
                                  sems=sems, ops=object(), armed=True)
-        assert result.reason == "w78-stale"
+        assert result.reason != "w78-stale", (
+            "the second-arriving group skipped over a handshake the first "
+            "legitimately used -- #1366's race is back")
+        # THE CENSUS SURVIVES THE REFUSAL'S DELETION: absent, and SAYING so.
         assert result.sems_armed is None
         assert "sems_armed=n/a" in result.line()
-        assert any(tp.SEM_NOT_REARMED_MARKER in ln for ln in lines)
+        assert any(tp.SEM_NOT_REARMED_MARKER in ln for ln in lines), (
+            "the set's state must still be printed; only the skip is gone")
     finally:
         sems.close()
         xr.unlink_semaphores(boot)
