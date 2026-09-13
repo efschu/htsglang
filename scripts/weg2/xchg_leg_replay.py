@@ -230,24 +230,55 @@ def ckpt_geom(entry):
     return rows, cols, it
 
 
-def refuse_packed_column_cut(name: str, cols_full: int, widths) -> None:
-    """A COLUMN cut of a packed tensor must fall on a whole int32 word.
+#: One scale group is 128 logical input weights; the packed representation
+#: holds 8 of those per int32 word, so ONE GROUP IS 16 PACKED COLUMNS.
+PACK_PER_WORD = 8
+GROUP_INPUTS = 128
+WORDS_PER_GROUP = GROUP_INPUTS // PACK_PER_WORD
 
-    THE PREDICATE, stated rather than assumed: ``weight_packed`` holds eight
-    int4 weights per int32 along the INPUT axis, so a column boundary that is
-    not a multiple of one word splits a byte between two ranks and neither end
-    can decode it. ``weight_scale`` has the same property at group
-    granularity. This arm cuts ROWS (the output axis), where the question does
-    not arise -- and this refusal is what keeps that a decision instead of an
-    accident, if a later arm ever cuts the other way.
+
+def refuse_packed_column_cut(name: str, widths, *, packed: bool) -> None:
+    """A COLUMN cut of the quantised classes must fall on a scale group.
+
+    THE PREDICATE, stated rather than assumed. ``weight_packed`` holds eight
+    int4 weights per int32 word along the INPUT axis, and ``weight_scale``
+    holds one scale per 128 inputs -- so a packed column boundary is only
+    decodable if it is a multiple of 16 words (= 128 inputs = one group).
+    A finer boundary puts one group's inputs on two ranks and NEITHER rank can
+    dequantise its own slice: the bytes would arrive intact and decode to
+    nonsense, which is the failure mode a byte digest cannot see.
+
+    THIS ARM CUTS ROWS (the output axis), where the question does not arise.
+    The predicate exists so that a later arm which cuts the other way meets a
+    refusal instead of a silent corruption -- and it is exercised in both
+    directions by ``--self-test`` rather than merely declared. The first draft
+    of it read ``acc % 1 != 0``, which is never true: a check that cannot go
+    red is not a check.
     """
+    step = WORDS_PER_GROUP if packed else 1
     acc = 0
-    for w in widths:
-        acc += int(w)
-        if acc != int(cols_full) and acc % 1 != 0:  # pragma: no cover
+    ws = [int(w) for w in widths]
+    for w in ws[:-1]:
+        acc += w
+        if acc % step:
             raise wx.Weg2XchgPlanDisagree(
-                f"W68 Weg2XchgPlanDisagree: {name} is packed along its column "
-                f"axis; a cut at column {acc} splits an int32 word.")
+                f"W68 Weg2XchgPlanDisagree: {name} is quantised along its "
+                f"column axis; a cut at column {acc} is not a multiple of "
+                f"{step} (one scale group of {GROUP_INPUTS} inputs). One "
+                f"group's inputs would land on two ranks and neither could "
+                f"dequantise its own slice."
+            )
+
+
+def _selfcheck_column_predicate() -> None:
+    """The predicate BOTH WAYS, on the path that runs."""
+    refuse_packed_column_cut("t.weight_packed", (32, 16, 16), packed=True)
+    try:
+        refuse_packed_column_cut("t.weight_packed", (30, 18, 16), packed=True)
+    except wx.Weg2XchgPlanDisagree:
+        return
+    raise SystemExit("refuse_packed_column_cut did not refuse a cut at "
+                     "column 30 -- the predicate cannot go red")
 
 
 def checkpoint_manifests(path: str, max_bytes: int, skip=None):
@@ -284,6 +315,7 @@ def checkpoint_manifests(path: str, max_bytes: int, skip=None):
             continue
         chosen.extend(want)
         total += cost
+    _selfcheck_column_predicate()
     if not chosen:
         raise SystemExit("checkpoint selection empty -- budget too small")
 
@@ -338,7 +370,6 @@ def checkpoint_manifests(path: str, max_bytes: int, skip=None):
                 continue
             w = [r // xr.N_CARDS] * xr.N_CARDS
             w[-1] += r - sum(w)
-            refuse_packed_column_cut(n, c, [c])
             ps.append(piece(n, w[t], c, it))
         out.append(xm.RankManifest(group="D", rank=t, card=cards[t],
                                    region_tag="weights_0", boot_token="rp",
@@ -956,6 +987,7 @@ def _run(ns) -> int:
         src_mans, ckpt_pick, ckpt_skip = checkpoint_manifests(
             ns.checkpoint, int(ns.ckpt_bytes))
     elif ns.self_test:
+        _selfcheck_column_predicate()
         src_mans = synthetic_manifests()
     else:
         src_mans = load_manifests(ns.evidence)
