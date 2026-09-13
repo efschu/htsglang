@@ -209,7 +209,7 @@ def test_the_census_feeds_bounce_terms_and_the_bound_grades_against_the_max(ckpt
         bytes_per_direction=census.layer_total_bytes,
         n_layers=census.n_layers,
         widest_layer_bytes=terms.mean_layer_bytes, pairs=3, depth=2)
-    per_slot = mean_terms.buffer_bytes // mean_terms.depth
+    per_slot = mean_terms.buffer_bytes // xb.assemble_slots(mean_terms.depth)
     assert per_slot < widest, (per_slot, widest)
     # And the refusal text names both numbers, so a reader cannot mistake one
     # for the other.
@@ -304,5 +304,5 @@ def test_the_under_coverage_GUARD_is_present_and_currently_unreachable(ckpt):
         bytes_per_direction=census.layer_total_bytes,
         n_layers=census.n_layers, widest_layer_bytes=widest // 4,
         pairs=3, depth=2)
-    assert (capped.buffer_bytes // capped.depth) < widest
+    assert (capped.buffer_bytes // xb.assemble_slots(capped.depth)) < widest
     assert "W71" in xb.under_coverage_refusal(capped)

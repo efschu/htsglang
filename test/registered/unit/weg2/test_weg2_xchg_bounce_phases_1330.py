@@ -1001,3 +1001,69 @@ def test_no_second_expression_for_the_shadow_slot_1330():
                     and isinstance(orelse, ast.Constant) and orelse.value == 0):
                 owners.append(f"{path.name}:{node.lineno}")
     assert len(owners) == 1 and owners[0].startswith("xchg_bounce.py:"), owners
+
+
+def test_both_product_call_sites_pass_the_arm_terms_1330(monkeypatch):
+    """EXECUTION SMOKE OF BOTH CALL SITES, through the real weight_updater.
+
+    Boot weg2xsn26 died because ONE of the two product call sites passed a
+    literal `terms=None`. The deposit path (`hook=source`, the sleeping group)
+    raised nine times on D, took the group fence down and ended the boot at
+    W17 Weg2GroupDead with 0 legs and 0 SEAM-DIGEST lines -- while the collect
+    path (`hook=authoritative`) passed the arm's decision and was fine. A test
+    that drives `run_bounce_leg` in isolation cannot see that: the defect is in
+    what the CALLER hands it, so the caller is what has to run.
+
+    Neither the xsn25 replay nor any unit test reached the deposit call site,
+    which is why "built, never exercised at the D call site" survived a boot.
+    """
+    from sglang.srt.managers.scheduler_components import weight_updater as wu
+    from sglang.srt.weg2 import xchg_bounce as xb
+
+    terms = xb.bounce_terms(
+        bytes_per_direction=64 * 4096, n_layers=64, widest_layer_bytes=4096,
+        pairs=3, depth=2, slot_bytes=4096)
+    monkeypatch.setenv(xb.ENV_BOUNCE_TERMS, xb.publish_terms(terms))
+    monkeypatch.setenv(wx.WEIGHT_SOURCE_ENV, wx.WEIGHT_SOURCE_EXCHANGE)
+
+    seen = []
+
+    class _Stub:
+        _weg2_xchg_deposit_before_sleep = (
+            wu.SchedulerWeightUpdaterManager._weg2_xchg_deposit_before_sleep)
+
+        def _weg2_group_name(self):
+            return "P"
+
+        def _weg2_rank(self):
+            return 0
+
+        def _weg2_device_index(self):
+            return 0
+
+        def _weg2_shadow_region(self):
+            return object()
+
+        def _weg2_xchg_sems(self):
+            return object()
+
+        def _weg2_xchg_device_ops(self):
+            return object()
+
+        def _weg2_shadow_plan(self, hook, group, rank, **kw):
+            return type("_P", (), {"descs": ()})(), ""
+
+        def _weg2_xchg_bounce_leg(self, **kw):
+            seen.append(kw)
+
+    monkeypatch.setenv("SGLANG_WEG2_XCHG_BOOT", "b4ndepositsmoke")
+    _Stub()._weg2_xchg_deposit_before_sleep()
+
+    assert seen, "the deposit call site did not run at all"
+    kw = seen[0]
+    assert kw["hook"] == "source", kw["hook"]
+    # THE ONE ASSERTION THE BOOT NEEDED: a price, not None.
+    assert kw["terms"] is not None, (
+        "the deposit path passed terms=None -- run_bounce_leg derives no size "
+        "of its own and refuses by W68, which is how weg2xsn26 died")
+    assert int(kw["terms"].widest_layer_bytes) == 4096, kw["terms"]
