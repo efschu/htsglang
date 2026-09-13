@@ -685,10 +685,18 @@ class BounceResult:
             #                            (`comparing = mode == INJECT_SHADOW`)
             #   NOTHING-COMPARED:        a SHADOW leg that graded nothing,
             #                            which is a finding and not a state
+            # #1336 THREE SILENCES, NOT TWO. An ABSENT mode used to fall into
+            # the `NOTHING-COMPARED` arm, i.e. a line with no recorded mode
+            # claimed a SHADOW leg had graded nothing -- a finding invented out
+            # of missing evidence. `mode=` one field to the left already says
+            # `unset` in that case; this field now agrees with it instead of
+            # contradicting it.
             + (f"inject={self.inject.verdict} " if self.inject else
                ("inject=by-design-authoritative "
                 if str(self.mode) == wx.INJECT_AUTHORITATIVE
-                else "inject=NOTHING-COMPARED "))
+                else "inject=NOTHING-COMPARED "
+                if str(self.mode) == wx.INJECT_SHADOW
+                else f"inject={wx.INJECT_MODE_UNSET} "))
             + f"banded={len(self.banded)}"
             + (f" banded_units={','.join(self.banded)}" if self.banded else "")
             + f" overlap={self.overlap} verdict={self.verdict}"

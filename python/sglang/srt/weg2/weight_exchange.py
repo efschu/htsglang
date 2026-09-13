@@ -2141,26 +2141,48 @@ INJECT_CHOICES = (INJECT_SHADOW, INJECT_AUTHORITATIVE)
 INJECT_MODE_UNSET = "unset"
 
 
-def inject_mode() -> str:
+def inject_mode(explicit: Optional[str] = None) -> str:
     """``shadow`` (default) or ``authoritative``.  THE one reader.
 
     A function and not a module constant so the value is read at the moment it
     is consumed rather than frozen at import -- the defect
     ``xchg_bounce_charge_bytes`` was fixed for once already (S6 fix E: the
     launcher's own process had no flag in its environment at import time).
+
+    #1336 THE LAUNCHER AND THE RANKS NOW READ THE SAME SOURCE. S6 fix E fixed
+    the IMPORT-TIME half and left the other one standing: the launcher
+    publishes ``INJECT_ENV`` into the dict it hands the RANKS
+    (``prepare_xchg_env``) and never into its OWN environment, so every
+    launcher-process caller of this function got the ``shadow`` default no
+    matter what the boot was armed with. Measured consequence in #1361 [23a]:
+    a boot armed ``authoritative`` printed ``bounce_slots=3`` (computed as if
+    shadow) beside ``bounce_inject=authoritative`` (from the argv) on the SAME
+    line -- two fields contradicting each other about one arm, and the wrong
+    one was the one describing what the ranks would do.
+
+    ``explicit`` is that one source: a caller that HAS the argv value passes
+    it, and gets an answer about the boot rather than about its own process.
+    The environment stays the source for the ranks, which have no argv. An
+    ``explicit`` that is not one of the two real modes is IGNORED rather than
+    trusted -- a typo must not silently claim ``authoritative``, the direction
+    :data:`INJECT_MODE_UNSET` exists to guard.
     """
+    if explicit is not None:
+        value = str(explicit).strip().lower()
+        if value in INJECT_CHOICES:
+            return value
     value = (os.environ.get(INJECT_ENV, "") or "").strip().lower()
     return value if value in INJECT_CHOICES else INJECT_SHADOW
 
 
-def inject_authoritative() -> bool:
+def inject_authoritative(explicit: Optional[str] = None) -> bool:
     """Does the injection OWN the bytes?  False under ``shadow``.
 
     Never implied by :func:`exchange_armed`: that says the exchange is the
     weight SOURCE, this says whether its injection has replaced the refill.  A
     boot can be armed and still be grading itself, which is the point of S6I.
     """
-    return inject_mode() == INJECT_AUTHORITATIVE
+    return inject_mode(explicit) == INJECT_AUTHORITATIVE
 
 
 #: #1330 B4n: THE DIRECTION KNOB.  ``--weg2-xchg-legs``, published to the ranks
