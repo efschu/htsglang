@@ -3945,11 +3945,11 @@ def prepare_weight_exchange(
 
 
 def prepare_host_ring(cards: List[Card], log: Log, tag: str, form: str,
-                      evidence_dir: str, boot_stem: str, dry: bool,
+                      evidence_dir: str, boot_stem: str, dry: bool, *,
                       leg_form: str = "", pcie_directional: Optional[bool] = None,
                       duplex_probe: str = "", tree: str = "",
                       py: str = "",
-                      p_argv: Optional[Sequence[str]] = None) -> HostRingPlan:
+                      p_argv: Optional[Sequence[str]]) -> HostRingPlan:
     """C20 + C18: solve the table, print L6, REFUSE by name, then arm the region.
 
     Order is load-bearing: the inequalities are checked and the per-card files
@@ -3968,6 +3968,17 @@ def prepare_host_ring(cards: List[Card], log: Log, tag: str, form: str,
     NO TABLE IS NOT A FALLBACK: with ``table`` None this returns an un-armed,
     unpriceable plan and the ledger refuses the launch (W20).  See
     :class:`HostRingPlan`.
+
+    ``p_argv`` is REQUIRED (keyword-only, no default) -- #1379.  This
+    function has exactly ONE production caller (the ``main()`` step-1b call
+    below), which has always built and passed ``form_argv_p`` unconditionally;
+    the ``= None`` default that used to sit here served no caller and was only
+    ever a landmine for a future refactor that could drop the argument and
+    silently disarm the W48 form gate with no signal at the call site. Compare
+    :func:`ring_table.solve`, which DOES keep its own ``p_argv=None`` default,
+    because its own unit-test callers deliberately omit it to test some other
+    property (see its docstring) -- the two functions have different caller
+    populations and therefore different defaults, not one.
     """
     leg_form = leg_form or _front_leg_form()
     # C12/C13 + A1-4: the per-card duplex ratio, SOLVED from the step-0 probe's
