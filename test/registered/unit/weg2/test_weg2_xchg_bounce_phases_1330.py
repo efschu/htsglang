@@ -829,3 +829,20 @@ def test_unavailable_semaphores_are_named_not_swallowed_1330(monkeypatch, caplog
         assert _M()._weg2_xchg_sems() is None
     text = " ".join(r.getMessage() for r in caplog.records)
     assert "WEG2-XCHG-SEMS-UNAVAILABLE" in text and "OSError" in text
+
+
+def test_the_inject_line_names_its_phase_1330():
+    """The INJECT line says WHICH HALF ran -- absence is not evidence.
+
+    weg2xsn25 read three P legs as "no phase field, therefore unsplit". They
+    had run `collect`: the W68 texts they carried
+    (`was not posted full` / `carries N bytes`) are reachable ONLY under
+    `rendezvous is not None and phase == PHASE_COLLECT`
+    (weight_exchange_bounce.py:1176). The field was simply never printed.
+    """
+    for phase, want in ((wb.PHASE_DEPOSIT, "phase=deposit"),
+                        (wb.PHASE_COLLECT, "phase=collect"),
+                        ("", "phase=unsplit")):
+        v = wb.InjectVerdict(mode=wx.INJECT_SHADOW, pieces=0,
+                             bytes_compared=0, mismatches=0, phase=phase)
+        assert want in v.line(), (phase, v.line())
