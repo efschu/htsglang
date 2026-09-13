@@ -1003,6 +1003,25 @@ class VramCredit:
                 "gate": gate_value,
             }
 
+    def peer_deposit_position(self) -> str:
+        """#1374 F3: WHERE THE PEER IS IN ITS PER-TAG DEPOSIT, for a refusal.
+
+        Boot weg2xsn30's W35 said `credit=0 published=0 consumed=0
+        requested=2916 peer_leg_complete=False` -- every number about THIS
+        rank and none about the peer it was waiting for, so the line could not
+        distinguish "the peer has not started" from "the peer is stuck two tags
+        back". The credit ledger already knows: the tags the peer has published
+        ARE the tags it has finished depositing and pausing, in order.
+        """
+        try:
+            with self._locked(False) as handle:
+                published = list(self._load(handle).get("tags", []))
+        except BaseException:  # noqa: BLE001 - a refusal may not depend on this
+            return "unreadable"
+        if not published:
+            return "none-yet (the peer has published no tag's release)"
+        return f"{len(published)} paused, last={published[-1]}"
+
     def wait_for(
         self,
         need_bytes: int,
@@ -1080,6 +1099,12 @@ class VramCredit:
         deadline = time.monotonic() + float(budget_s)
         t0 = time.perf_counter()
         stale_epoch = None
+        # #1374 F3: A WAIT THAT SAYS NOTHING IS INDISTINGUISHABLE FROM A HANG.
+        # Boot weg2xsn30's PP0 was SILENT for 121 s between its resume request
+        # (13:48:12) and its W35 (13:50:13): no line said what it was waiting
+        # for, so the log read as "PP0 did nothing" when it was blocked on a
+        # credit the peer could not publish. One line every 10 s.
+        _next_progress = time.monotonic() + 10.0
         while True:
             device: Dict[str, Any] = {}
 
@@ -1197,6 +1222,7 @@ class VramCredit:
                     f"published={credit // MIB} MiB "
                     f"consumed={consumed // MIB} MiB "
                     f"requested={need // MIB} MiB peer_leg_complete=True "
+                    f"peer_deposit={self.peer_deposit_position()} "
                     f"free_bytes_now={free_bytes_now} free_mib_at_refusal="
                     f"{'n/a' if free_now is None else free_now // MIB} -- the "
                     f"sleeping rank has "
@@ -1211,6 +1237,7 @@ class VramCredit:
                     f"published={credit // MIB} MiB "
                     f"consumed={consumed // MIB} MiB "
                     f"requested={need // MIB} MiB peer_leg_complete=False "
+                    f"peer_deposit={self.peer_deposit_position()} "
                     f"budget={budget_s:.0f}s EXPIRED -- the peer neither funded "
                     f"this tag nor completed its leg within the caller's own "
                     f"budget (this module owns no timeout constant of its own)"
@@ -1221,6 +1248,18 @@ class VramCredit:
                         if stale_epoch is not None else ""
                     )
                 )
+            if time.monotonic() >= _next_progress:
+                _next_progress = time.monotonic() + 10.0
+                logger.info(
+                    "WEG2-VRAM-CREDIT waiting card=%s tag=%s need_mib=%d "
+                    "published_mib=%d consumed_mib=%d peer_leg_complete=%s "
+                    "waited_s=%.0f of %.0f -- #1374 F3: blocked on the "
+                    "co-located peer's per-tag release, which it publishes "
+                    "right after pausing this tag; a growing wait here means "
+                    "the peer has not reached this tag's pause yet",
+                    self.uuid, tag, int(need) // MIB, int(credit) // MIB,
+                    int(consumed) // MIB, bool(rec.get("leg_complete")),
+                    time.perf_counter() - t0, float(budget_s))
             time.sleep(poll_s)
 
     @staticmethod

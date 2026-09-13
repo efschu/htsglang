@@ -3820,7 +3820,21 @@ def refuse_unless_same_form_source(
     # real mismatch and still stops the boot below -- which is why this reads
     # the inventory `solve` ranked, and not merely `form_same`.
     same_form_sources = tuple(getattr(table, "same_form_candidates", ()) or ())
+    # #1374 W9: PRESENT-BUT-UNUSABLE IS NOT A WITNESS. `same_form_candidates`
+    # now carries only the stems that survived `solve`'s own checks; the ones it
+    # ranked and then eliminated come with their reason, and they are NAMED in
+    # the bootstrap line so the zero above is explained rather than merely
+    # asserted. Boot weg2xsn31 is what this costs otherwise: weg2xsn30 died at
+    # wall 8 before D ever slept, so it is same-form (0a15b55459fb) and carries
+    # `no sleep-pass lines for D` -- counted as a witness, it refused its own
+    # successor, and `--ring-table-boot` could not help because the form gate
+    # runs after the stem choice and meets the same missing D lines. Every boot
+    # that dies at a wall would lock the next one out.
+    unusable = tuple(getattr(table, "same_form_unusable", ()) or ())
     if not unarmed and not same_form_sources:
+        _excluded = ("; same-form stems present but unusable: "
+                     + ", ".join(f"{st} reason={why}" for st, why in unusable)
+                     if unusable else "")
         return (
             f"WEG2-RING W48 BOOTSTRAP armed first boot -- form key "
             f"{table.form_key} has NO boot yet, so there is no same-form source "
@@ -3830,8 +3844,8 @@ def refuse_unless_same_form_source(
             f"from its own argv, and the exchange region's residual comes from "
             f"the published terms rather than from a foreign form. The next "
             f"armed boot of this form finds this one and is no longer a "
-            f"bootstrap. A same-form source that EXISTS and disagrees still "
-            f"refuses: {table.form_diff}"
+            f"bootstrap. A USABLE same-form source that disagrees still "
+            f"refuses: {table.form_diff}{_excluded}"
         )
     raise Weg2XchgFormSourceMissing(
         f"W48 Weg2RingFormMismatch: --weg2-weight-source {weight_source} arms the "
@@ -3842,9 +3856,14 @@ def refuse_unless_same_form_source(
            f"The closest twin the ranking could offer is boot {table.boot}, whose "
            f"form key is {table.source_form_key} against this boot's "
            f"{table.form_key}: {table.form_diff}.  ")
-        + (f"A same-form source EXISTS and did not win, so this is a real "
-           f"mismatch and not a first boot: {', '.join(same_form_sources)}.  "
+        + (f"A USABLE same-form source EXISTS and did not win, so this is a "
+           f"real mismatch and not a first boot: "
+           f"{', '.join(same_form_sources)}.  "
            if same_form_sources else "")
+        + (f"(Same-form stems that were ranked and then ELIMINATED do not "
+           f"count as witnesses and are not the reason for this refusal: "
+           f"{', '.join(f'{st} reason={why}' for st, why in unusable)}.)  "
+           if unusable else "")
         + "There is NO fallback: a chunk tag is a LAYER BAND, so a source of "
         "another PP form states group P's bytes on the wrong cards, and the "
         "ring's residual, the ledger's charge and the exchange census would "

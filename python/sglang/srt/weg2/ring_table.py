@@ -1336,6 +1336,13 @@ class RingTable:
     #: ``form_same`` false IS a mismatch: a source of this form existed and
     #: did not win.
     same_form_candidates: Tuple[str, ...] = ()
+    #: #1374 W9: the same-form stems that were RANKED and then ELIMINATED, with
+    #: the reason each was eliminated. Present-but-unusable is not a mismatch:
+    #: boot weg2xsn31 was refused because weg2xsn30 -- which died at wall 8
+    #: before D ever slept -- is same-form (0a15b55459fb) and therefore counted
+    #: as a witness, while carrying `no sleep-pass lines for D`. Every boot that
+    #: dies at a wall would otherwise lock its successor out.
+    same_form_unusable: Tuple[Tuple[str, str], ...] = ()
     #: One line naming exactly what differs between the two forms.
     form_diff: str = ""
 
@@ -2924,7 +2931,19 @@ def solve(
             source_form_key=src_key,
             form_same=form_same,
             form_diff=form_diff,
-            same_form_candidates=tuple(same_form),
+            # #1374 W9: USABLE same-form candidates only. Every elimination
+            # in the loop above appends "<stem>: <why>" to `reasons`, so the
+            # split is derivable HERE, in one place, instead of at the eight
+            # `reasons.append` sites -- and the rejected stems keep their own
+            # reason so the launcher's BOOTSTRAP line can explain the zero.
+            same_form_candidates=tuple(
+                st for st in same_form
+                if not any(r.startswith(f"{st}:") for r in reasons)),
+            same_form_unusable=tuple(
+                (st, next((r.split(": ", 1)[1] for r in reasons
+                           if r.startswith(f"{st}:")), "eliminated"))
+                for st in same_form
+                if any(r.startswith(f"{st}:") for r in reasons)),
             bound_groups=tuple(
                 g for g, b in (("P", bound_p), ("D", bound_d)) if b
             ),
