@@ -113,6 +113,12 @@ def _weg2_group_stop_on_leg_failure(fn):
 #: is only the pre-ring reading.
 TMS_RING_GRANULE_BYTES = 2 * 1024 * 1024
 
+# #1358 [W102-wired]: the lanes-specific refusal lives in the ledger, which is
+# also where the count it disagrees with was priced.
+# #1348: the unexecuted-line instrument. Imported at module scope because the
+# module itself is inert and dependency-free until armed -- it imports
+# `coverage` lazily inside `arm()` and only when the launcher published its
+# directory, so an unarmed boot pays this import and nothing else.
 # #1348: the unexecuted-line instrument. Imported at module scope because the
 # module itself is inert and dependency-free until armed -- it imports
 # `coverage` lazily inside `arm()` and only when the launcher published its
@@ -127,6 +133,7 @@ TMS_RING_GRANULE_BYTES = 2 * 1024 * 1024
 #: the leg's RPC answers non-200 and the front issues its own named stop, the
 #: same way any other leg failure is reported.  Catching it would turn a
 #: refusal into a silent partial sleep.
+from sglang.srt.weg2 import host_ledger as hl  # noqa: E402
 from sglang.srt.weg2 import lane_coverage as wlc  # noqa: E402
 from sglang.srt.weg2 import ring_guard  # noqa: E402
 from sglang.srt.weg2.ring_guard import RingNeedGuard  # noqa: E402
@@ -141,14 +148,6 @@ from sglang.srt.weg2.ring_table import (  # noqa: E402
 from sglang.srt.weg2.ring_table import (  # noqa: E402
     TAG_POPULATION_WEIGHTS as WEG2_TAG_POPULATION_WEIGHTS,
 )
-# #1348: the unexecuted-line instrument. Imported at module scope because the
-# module itself is inert and dependency-free until armed -- it imports
-# `coverage` lazily inside `arm()` and only when the launcher published its
-# directory, so an unarmed boot pays this import and nothing else.
-from sglang.srt.weg2 import lane_coverage as wlc  # noqa: E402
-# #1358 [W102-wired]: the lanes-specific refusal lives in the ledger, which is
-# also where the count it disagrees with was priced.
-from sglang.srt.weg2 import host_ledger as hl  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
@@ -425,6 +424,33 @@ class SchedulerWeightUpdaterManager:
     #: Nothing else touches it: no cutover, no fence, no replay.  A deleter
     #: between writer and reader is what the rule looks for, and there is none.
     weg2_seam_before: Any = None
+    #: #1376 W10: THE PER-TAG LOCKSTEP'S OWN STATE, DECLARED. This class is
+    #: `@dataclass(kw_only=True, slots=True)`, so an attribute that is not a
+    #: field cannot be assigned at all -- and #1374's F1b assigned two of them
+    #: lazily. Boot weg2xsn31/2 died three seconds after
+    #: `WEG2-DORMANT set: kv_cache paused` on all three D ranks:
+    #:   weight_updater.py:4089 release_memory_occupation
+    #:     -> :1172 _weg2_xchg_deposit_before_sleep
+    #:       -> :3528 _weg2_xchg_bounce_leg  self._weg2_xchg_tag_seen = seen
+    #:   AttributeError: 'SchedulerWeightUpdaterManager' object has no
+    #:   attribute '_weg2_xchg_tag_seen'
+    #: then W29 on every rank, the NCCL heartbeat break and W17 Weg2GroupDead.
+    #: The wall sat BEHIND the deadlock F1 removed, which is why no earlier
+    #: boot reached it.
+    #:
+    #: `_weg2_xchg_collected_per_tag` is the SAME defect one call site over and
+    #: had not been reached yet: it would have been the next AttributeError, on
+    #: the wake side. Declared here rather than written lazily, and read as a
+    #: field rather than through a `getattr` default -- a default would hide
+    #: exactly this and is what the operator's order rules out.
+    #: Which tags this leg has already deposited, so the per-tag drain knows
+    #: whether it is at the first tag (prime the counter) or a later one (wait
+    #: for the collector's `drained`). `None` until the first leg sets it.
+    _weg2_xchg_tag_seen: Optional[set] = None
+    #: True once the resume loop has collected tag by tag, so the once-per-wake
+    #: entry stands down instead of injecting a second time over bytes already
+    #: written.
+    _weg2_xchg_collected_per_tag: bool = False
 
     @contextmanager
     def _observe_weight_load(self, source: str) -> Iterator[None]:
@@ -1430,7 +1456,7 @@ class SchedulerWeightUpdaterManager:
             # its own resume. Collecting the whole plan again here would be a
             # second writer over bytes already injected -- the ein-job-ein-mover
             # defect the branch above names for the other carriers.
-            if getattr(self, "_weg2_xchg_collected_per_tag", False):
+            if self._weg2_xchg_collected_per_tag:
                 self._weg2_xchg_collected_per_tag = False
                 logger.info(
                     "WEG2-XCHG INJECT per-tag=done -- the resume loop "
@@ -3520,14 +3546,16 @@ class SchedulerWeightUpdaterManager:
         # run -- no cycle. The first tag primes the counter to 0 instead,
         # because `create_semaphores` arms every `empty` at 1 for the OLD
         # meaning and at tag 0 there is no previous tag.
-        _first_tag = tag is not None and not getattr(self, "_weg2_xchg_tag_seen", None)
+        # #1376 W10: FIELDS, NOT `getattr` DEFAULTS. The default is what let a
+        # lazy assignment onto a `slots=True` dataclass look survivable at the
+        # desk and die on the metal -- the read never raised, so nothing said
+        # the write could not land.
+        _first_tag = False
         if tag is not None:
-            seen = getattr(self, "_weg2_xchg_tag_seen", None)
-            if seen is None:
-                seen = set()
-                self._weg2_xchg_tag_seen = seen
-            _first_tag = not seen
-            seen.add(str(tag))
+            if self._weg2_xchg_tag_seen is None:
+                self._weg2_xchg_tag_seen = set()
+            _first_tag = not self._weg2_xchg_tag_seen
+            self._weg2_xchg_tag_seen.add(str(tag))
         # THE BOUNCE'S OWN SLOT RECORD, created by whoever gets there first and
         # mapped by both ends. NOT the region's: weg2xsn24 read `carries 1080
         # bytes` because `run_producer_pair` publishes the RING's counts into
