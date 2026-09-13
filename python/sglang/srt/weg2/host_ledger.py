@@ -1686,6 +1686,82 @@ class Weg2HostLedgerRefused(RuntimeError):
     """W20: no arm of the ladder funds both moments plus the store floor."""
 
 
+class Weg2XchgLanesUnmeasured(Weg2HostLedgerRefused):
+    """W102 (#1358): no lane count was ever measured for this cut."""
+
+
+#: #1358 THE LANE COUNT IS MEASURED, NOT DERIVED -- the same class as Sigma H.
+#:
+#: One assemble buffer exists per LANE (`bounce_path`: a directed card pair, or
+#: the diagonal's card), and the set is built at the RANK at runtime by
+#: `group_descs_by_pair` over descs that carry pointers. It does not exist at
+#: the arm in any form: the xchg census carries `cards` and `waves` and no
+#: (src,dst) structure (checked, not assumed), and deriving it from the P-cut
+#: would be a second expression of an enumeration the lane already owns --
+#: which is the defect this ticket exists to remove, not to repeat.
+#:
+#: SO IT IS LEARNED FROM A BOOT, like every other number of this kind, and the
+#: source is the boot's own `WEG2-XCHG-HOST-SLOT` lines: the count of DISTINCT
+#: `path=` values among `event=alloc` entries. That is the file set itself, not
+#: a proxy for it.
+#:
+#: KEYED ON THE CUT, NOT THE FORM KEY, and the difference decides whether
+#: weg2xsn29 may use this seed: the lane set follows from WHICH card sends to
+#: which, i.e. the P-cut plus the D-vector plus the legs. Text-only (#1356)
+#: changes the form key and does NOT change the cut, so the xsn28 measurement
+#: carries to xsn29. A form key here would have forced a needless re-measure.
+XCHG_LANES_BY_CUT: Dict[str, Dict[str, object]] = {
+    "pp=39,13,12;d=tp3;legs=both": {
+        "lanes": 5,
+        "boot": "weg2xsn28",
+        "at": "2026-09-13T10:37:53Z",
+        "paths": ("bounce.bin.c0", "bounce.bin.c1", "bounce.bin.p1",
+                  "bounce.bin.p2", "bounce.bin.p4"),
+    },
+}
+
+
+def xchg_cut_key(pp_stage_ratio: str, d_vector: str = "tp3",
+                 legs: str = "both") -> str:
+    """The key the lane count is recorded under. The CUT, never the form."""
+    return (f"pp={str(pp_stage_ratio).strip()};"
+            f"d={str(d_vector).strip()};legs={str(legs).strip()}")
+
+
+def resolve_xchg_lanes(cut_key: str) -> Tuple[int, str]:
+    """``(lanes, provenance)`` for this cut, or W102 by name.
+
+    NEVER A DEFAULT. An unmeasured cut gets a refusal, not a 1: pricing one
+    buffer where the boot creates five is exactly the 4.88 GiB under-charge
+    that made weg2xsn28 latch W98 nine seconds after `serving` with 0.51 GiB
+    missing. A guessed lane count is that defect with a comment in front of it.
+    """
+    rec = XCHG_LANES_BY_CUT.get(str(cut_key))
+    if not rec:
+        raise Weg2XchgLanesUnmeasured(
+            f"W102 Weg2XchgLanesUnmeasured: no lane count is recorded for cut "
+            f"{cut_key!r}, and the assemble buffer is charged PER LANE "
+            f"(one tmpfs file each). Known cuts: "
+            f"{sorted(XCHG_LANES_BY_CUT) or '(none)'}. The count is MEASURED "
+            f"from a boot's own WEG2-XCHG-HOST-SLOT lines -- the distinct "
+            f"`path=` values among `event=alloc` entries -- and never derived "
+            f"from the cut, because the lane set is built at the rank by "
+            f"`group_descs_by_pair` and the arm cannot see it. Boot this cut "
+            f"once with the lane priced from a neighbouring cut and record "
+            f"what it allocated, or add the measurement if a boot already "
+            f"produced one. Refusing rather than pricing ONE buffer for a boot "
+            f"that may create five: that under-charge is what latched W98 on "
+            f"weg2xsn28 nine seconds after serving."
+        )
+    return int(rec["lanes"]), (
+        f"WEG2-XCHG-LANES cut={cut_key} lanes={int(rec['lanes'])} "
+        f"source=measured boot={rec.get('boot', '?')} at={rec.get('at', '?')} "
+        f"paths={','.join(rec.get('paths', ()) or ())} -- distinct alloc paths "
+        f"in that boot's own HOST-SLOT lines; the arm charges "
+        f"buffer_bytes x this"
+    )
+
+
 class Weg2SleepLegCushionDeficit(Weg2HostLedgerRefused):
     """W100 (#1361 fix6): this sleep leg needs more page cache than is left.
 
