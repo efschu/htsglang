@@ -296,7 +296,7 @@ def widest_line(census: LayerCensus) -> str:
 
 
 def widest_layer_terms(model_dir: str, *, pairs: int, depth: int,
-                       slot_bytes: int = 0):
+                       slot_bytes: int = 0, n_lanes: int = 1):
     """``(BounceTerms, widest_line, widest_layer_name)`` for the launcher.
 
     ONE CALL SITE'S WORTH of glue, kept here so the launcher holds no
@@ -305,6 +305,16 @@ def widest_layer_terms(model_dir: str, *, pairs: int, depth: int,
     MEASURED numbers only. ``bytes_per_direction`` is the checkpoint's
     layer-bound total, i.e. what one direction of the exchange has to move,
     and it is named on the line rather than assumed.
+
+    ``n_lanes`` is passed THROUGH to ``bounce_terms`` (one assemble buffer per
+    lane) and defaults to 1, the same default that function declares. #1358
+    added the parameter there and to this function's caller but never to this
+    function, so every armed boot died with ``widest_layer_terms() got an
+    unexpected keyword argument 'n_lanes'`` in ``choose_host_ledger``, before
+    either group started -- a producer commit calling a signature that never
+    existed. Default 1 rather than required, because the two callers differ:
+    the ledger passes the MEASURED count and the rank publication passes the
+    same one, while every other caller prices a single lane.
     """
     from sglang.srt.weg2 import xchg_bounce as xb
 
@@ -317,6 +327,7 @@ def widest_layer_terms(model_dir: str, *, pairs: int, depth: int,
         widest_layer_bytes=nbytes,
         pairs=int(pairs),
         depth=int(depth),
+        n_lanes=int(n_lanes),
         **kw,
     )
     return terms, widest_line(census), f"layer {idx}"

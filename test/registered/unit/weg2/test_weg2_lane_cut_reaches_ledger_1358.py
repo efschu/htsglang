@@ -73,12 +73,36 @@ class TheCutReachesTheLedger(CustomTestCase):
 
 class LanesAreResolvedOnlyWhereTheyExist(CustomTestCase):
     def test_the_guard_uses_the_one_arm_predicate(self):
-        src = "\n".join(ln for ln in inspect.getsource(lc).splitlines()
-                        if not ln.strip().startswith("#"))
-        i = src.index("resolve_xchg_lanes(")
-        self.assertIn("xchg_bounce_arm_pins_host(", src[max(0, i - 700):i],
-                      "the lane lookup must be guarded by the ONE predicate "
-                      "that answers whether this arm pins host bytes")
+        """EVERY lane lookup sits behind the arm predicate.
+
+        #1368 moved the lookup itself into `xchg_lane_count`, because the
+        publication that hands the ranks their terms needs the SAME number the
+        ledger charges. So this no longer greps the neighbourhood of
+        `resolve_xchg_lanes` -- which is now one line in a helper -- but checks
+        the invariant it was written for: each CALL SITE is guarded. Grepping a
+        location instead of a property is how a pin survives its own subject.
+        """
+        import ast
+
+        src = inspect.getsource(lc)
+        tree = ast.parse(src)
+        lines = src.splitlines()
+        sites = [n.lineno for n in ast.walk(tree)
+                 if isinstance(n, ast.Call)
+                 and getattr(n.func, "id", "") == "xchg_lane_count"]
+        self.assertTrue(sites, "xchg_lane_count is no longer called")
+        for lineno in sites:
+            window = "\n".join(lines[max(0, lineno - 25):lineno])
+            self.assertIn(
+                "xchg_bounce_arm_pins_host(", window,
+                f"the lane lookup at line {lineno} is not guarded by the ONE "
+                "predicate that answers whether this arm pins host bytes")
+
+    def test_the_lookup_has_exactly_one_producer(self):
+        """And the helper is the only way to it, so the two consumers cannot
+        build two different cut keys for one boot (#1368)."""
+        self.assertEqual(
+            inspect.getsource(lc).count("host_ledger.resolve_xchg_lanes("), 1)
 
     def test_a_default_arm_pins_nothing_and_must_not_be_refused(self):
         """THE BOOTSTRAP: the arm that would MAKE the record must be bootable."""
