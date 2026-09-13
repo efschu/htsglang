@@ -39,11 +39,24 @@ from sglang.srt.weg2 import checkpoint_census, launcher, xchg_bounce
 from sglang.test.test_utils import CustomTestCase
 
 #: The modules whose signatures the launcher must conform to here.
-_MODULES = {"checkpoint_census": checkpoint_census, "xchg_bounce": xchg_bounce}
+_MODULES = {"checkpoint_census": checkpoint_census, "xchg_bounce": xchg_bounce,
+            "launcher": launcher}
+
+#: The launcher's OWN builders, bare-name calls. Added #1373: the argv builders
+#: are the other family that has killed boots on a signature (2cc618b819), and
+#: a keyword with no receiver there -- `argv_d(..., window_mib=...)` when the
+#: parameter is actually `depth` -- raises the same TypeError at the same place
+#: in the boot as #1368's did. Binding them here is the SAME mechanism, one
+#: inventory, rather than a second scan.
+_LOCAL = ("argv_p", "argv_d", "common_flags")
 
 
 def _calls():
-    """(module_alias, attr, node) for every launcher call into those modules."""
+    """(target_name, attr, node) for every launcher call this pin binds.
+
+    Two shapes: `module.attr(...)` into the sizing modules, and bare-name calls
+    to the launcher's own argv builders.
+    """
     tree = ast.parse(inspect.getsource(launcher))
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
@@ -52,6 +65,8 @@ def _calls():
         if (isinstance(f, ast.Attribute) and isinstance(f.value, ast.Name)
                 and f.value.id in _MODULES):
             yield f.value.id, f.attr, node
+        elif isinstance(f, ast.Name) and f.id in _LOCAL:
+            yield "launcher", f.id, node
 
 
 class TheLauncherCannotCallASignatureThatDoesNotExist(CustomTestCase):
@@ -81,6 +96,54 @@ class TheLauncherCannotCallASignatureThatDoesNotExist(CustomTestCase):
                     )
             checked += 1
         self.assertGreater(checked, 0, "the scan found no calls -- it broke")
+
+    def test_the_argv_builders_are_in_that_set(self):
+        """#1373: the extension must actually reach them. A scan that silently
+        stops covering a family is worse than one that never covered it."""
+        seen = {n for _a, n, _ in _calls() if n in _LOCAL}
+        self.assertTrue(seen, "no argv-builder call site is being bound")
+        self.assertIn("argv_d", seen)
+
+    def test_binding_cannot_replace_the_positional_ratchet(self):
+        """#1373, MEASURED, so the boundary between this pin and
+        test_weg2_argv_positional_pin_1356 is a fact and not an opinion.
+
+        `sig.bind()` answers "does this call exist"; it CANNOT answer "does
+        this call pass meaning by position". A parameter inserted mid-signature
+        -- the 2cc618b819 defect -- leaves every arity unchanged, so binding
+        succeeds before and after while every argument after the insert has
+        been re-bound. Measured here rather than asserted in prose, because a
+        boundary nobody executes is how two mechanisms quietly become one
+        blind one."""
+        def before(a, b, c, d=1, e="x"):
+            pass
+
+        def after(a, b, vision, c, d=1, e="x"):  # the insert
+            pass
+
+        for fn in (before, after):
+            inspect.signature(fn).bind(*[object()] * 5)  # both bind: no signal
+
+        # And the real one: argv_d takes 18 positionals today and binds.
+        inspect.signature(launcher.argv_d).bind(*[object()] * 18)
+        # So the positional profile needs its own ratchet, and it has one.
+        # Loaded BY PATH, not by import name: a sibling test module is only
+        # importable when pytest happens to have put its directory on sys.path,
+        # and a pin that depends on the runner's path layout goes red for a
+        # reason that has nothing to do with its subject.
+        import importlib.util
+
+        sibling = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               "test_weg2_argv_positional_pin_1356.py")
+        self.assertTrue(os.path.exists(sibling),
+                        "the positional ratchet is gone; this pin does NOT "
+                        "cover what it covered")
+        spec = importlib.util.spec_from_file_location("_pos_pin_1356", sibling)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        self.assertEqual(mod.KNOWN_POSITIONAL_CALLS.get(("argv_d", 18)), 2,
+                         "the positional ratchet moved or lost its subject; "
+                         "this pin does NOT cover what it covers")
 
     def test_the_call_that_died_is_in_that_set(self):
         """A scan that would pass on an empty set is not a scan."""
