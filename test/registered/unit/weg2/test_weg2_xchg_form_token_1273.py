@@ -49,7 +49,13 @@ BASE_ARGV = ["/venv/bin/python", "-m", "sglang.launch_server",
 class FakeTable:
     def __init__(self, form_same, boot="boot_weg2_weg2sn5b_x_0909_185632",
                  source_form_key="e3fe683c5d40", form_key="f003de5bc71a",
-                 form_diff="THIS boot has ['--weg2-xchg-region=armed'] that the source has not"):
+                 form_diff="THIS boot has ['--weg2-xchg-region=armed'] that the source has not",
+                 same_form_candidates=("boot_weg2_weg2sn5b_x_0909_185632",)):
+        # #1367: a same-form source EXISTS by default here, because that is
+        # what every test in this file is about -- a MISMATCH. The empty
+        # inventory is a different state (the first armed boot of a form) and
+        # has its own file, test_weg2_w48_armed_bootstrap_1367.py.
+        self.same_form_candidates = same_form_candidates
         self.form_same = form_same
         self.boot = boot
         self.source_form_key = source_form_key
@@ -139,6 +145,17 @@ class WithoutASameFormSourceTheLaunchRefuses(CustomTestCase):
     def test_no_table_is_someone_elses_refusal(self):
         """prepare_host_ring already refuses R22/W20; do not double-refuse."""
         self.assertIsNone(launcher.refuse_unless_same_form_source(None, "exchange"))
+
+    def test_without_a_same_form_source_it_is_a_bootstrap_and_not_a_refusal(self):
+        """#1367 reduced this test file's subject to what it always named: a
+        MISMATCH. With no same-form source in existence there is nothing to
+        mismatch WITH, and refusing there made the remedy circular -- it asked
+        for the boot it was refusing. That path returns a W48 BOOTSTRAP line."""
+        for arm in launcher.WEIGHT_SOURCE_ARMED:
+            line = launcher.refuse_unless_same_form_source(
+                FakeTable(False, same_form_candidates=()), arm)
+            self.assertIsNotNone(line, arm)
+            self.assertIn("BOOTSTRAP armed first boot", line)
 
     def test_an_unarmed_form_gate_is_not_read_as_a_pass(self):
         """``form_same is None`` means the gate never ran -- that is not 'same'."""
