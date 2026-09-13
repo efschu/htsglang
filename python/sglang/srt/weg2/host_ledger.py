@@ -2443,10 +2443,20 @@ def run_origin_gib(
         # them alive there is nothing for it to be a statement about, so it is
         # refused BY NAME rather than quietly outvoted -- the #1350b Sigma H
         # guard and the #1350e flip filter, for the third number.
+        # THE KEY MUST BE PRESENT TO COUNT AS EVIDENCE. `e.get("pids") or []`
+        # reads an ABSENT field as an empty one, and [22-fix5b] shipped exactly
+        # that: every record written before `pids` existed -- and every fixture
+        # that omits it -- was refused as a death sample, which took the
+        # weg2sn6s origin from 7.63 GiB to 0.0 and broke the #1325 contract.
+        # That is absence of evidence scored as evidence of death, the same
+        # error [22-fix] made with an empty model digest and [22-fix2] had to
+        # undo. A sample that never recorded its process set says nothing about
+        # it; only a sampler that LOOKED and found none is a witness.
+        _has_pids = "pids" in e
         _alive = len(e.get("pids") or [])
         _asked = len(e.get("pids_asked") or [])
         _death = ""
-        if _alive == 0:
+        if _has_pids and _alive == 0:
             _death = (
                 f"{float(e['run_residual_gib']):.2f} (boot "
                 f"{e.get('boot_tag', '?')}, group {g}, at {e.get('at', '?')}) "
