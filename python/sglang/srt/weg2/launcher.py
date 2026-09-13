@@ -10095,16 +10095,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # lane. `source=derived` because it comes from this checkpoint's own
     # headers; an unpublished chunking REFUSES rather than defaulting to 0.
     publish_weight_chunk_layers(chunk_layers)
-    if xchg_bounce_arm_pins_host(ns.weg2_weight_source, ns.weg2_xchg_oncard):
-        _tagmax = xchg_max_tag_bytes(str(ns.model))
-        _tm_lanes, _ = xchg_lane_count(
-            stage_ratio, str(getattr(ns, "weg2_xchg_legs", "both") or "both"))
-        for _lane in range(int(_tm_lanes)):
-            log(f"WEG2-XCHG-TAGMAX lane={_lane} src_rank=* "
-                f"max_tag_mib={_tagmax // (1 << 20)} source=derived "
-                f"(chunk_layers={chunk_layers} of {n_layers}; the MTP tree is "
-                f"excluded by name -- checkpoint_census.MTP_TREE_PREFIXES; "
-                f"validated against weg2xsn30's manifests within 5% per rank)")
 
     # 1b'. P's PP LAYER SPLIT is NOT derived here any more (FIX 2).  It was,
     # from the two module score constants, at a point in main that runs BEFORE
@@ -10451,6 +10441,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         # same key, exactly as the glue below it already is.
         _pub_lane_n, _ = xchg_lane_count(
             stage_ratio, str(getattr(ns, "weg2_xchg_legs", "both") or "both"))
+        # #1374 OPTION 1: SAY THE BOUND OUT LOUD, per lane, where both the lane
+        # count and the cut exist. (It was first placed beside the
+        # WEG2-WEIGHT-CHUNKS line, 40 lines before `stage_ratio` is assigned --
+        # an F821 that ruff caught and that would have been a NameError on
+        # every armed boot. The #1368 bind ratchet does not see bare locals.)
+        _tagmax_b = xchg_max_tag_bytes(str(ns.model))
+        for _lane in range(int(_pub_lane_n)):
+            log(f"WEG2-XCHG-TAGMAX lane={_lane} src_rank=* "
+                f"max_tag_mib={_tagmax_b // (1 << 20)} source=derived -- the "
+                f"widest window of {_WEIGHT_CHUNK_LAYERS} consecutive layers "
+                f"of this checkpoint, MTP tree excluded by name "
+                f"(checkpoint_census.MTP_TREE_PREFIXES); validated against "
+                f"weg2xsn30's own manifests, -0.04% on stage 0")
         bounce_terms_for_ranks, _widest_line, _widest_name = (
             checkpoint_census.widest_layer_terms(
                 str(ns.model),
