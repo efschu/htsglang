@@ -221,7 +221,17 @@ class TheLatchIsWIRED1361(CustomTestCase):
         self.assertIn("_level_due", body)      # the level test keeps its period
 
     def test_both_halves_grade_the_same_reading(self):
-        """One `read_cgroup_pressure` feeds the latch and the level verdict."""
+        """EXACTLY ONE `read_cgroup_pressure` per tick, counted -- not greped.
+
+        #1361 20c. The first version of this test carried this very docstring
+        and asserted only that the string `_pr_fast = ...read_cgroup_pressure()`
+        APPEARS. The loop took TWO readings and the test stayed green; it would
+        have stayed green at ten. Docstring and assertion measured different
+        things, which is the same class as "unit test and acceptance measured
+        different things" one level tighter -- and it is why the property is
+        now COUNTED.
+        """
         body = self._loop_src()
+        self.assertEqual(body.count("read_cgroup_pressure()"), 1)
         self.assertIn("_pr_fast = host_ledger.read_cgroup_pressure()", body)
-        self.assertIn("nonreclaim_gib", body)
+        self.assertIn("pr = _pr_fast", body)
