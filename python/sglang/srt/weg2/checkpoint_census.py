@@ -295,8 +295,48 @@ def widest_line(census: LayerCensus) -> str:
     )
 
 
+def max_tag_bytes_from_census(model_dir: str, chunk_layers: int) -> int:
+    """#1374 OPTION 1: the LARGEST WEIGHT TAG this boot will pause, exactly.
+
+    The pause granularity is the tag and the weight tags are LAYER CHUNKS
+    (`weg2_memory_saver.weights_family_tags`: `weights_<k>` per chunk of
+    `chunk_layers` consecutive layers, plus the base that carries the
+    unlayered tensors). A tag's deposit has to fit the assemble buffer or the
+    deposit needs a collector that cannot run until this rank has paused --
+    boot weg2xsn30's deadlock -- so this is the number the buffer is sized
+    from.
+
+    EXACT, not a bound with a margin: the widest WINDOW of `chunk_layers`
+    consecutive layers out of the census's own per-layer bytes, and separately
+    the unlayered total, because the chunk that carries the embeddings and the
+    lm_head is a tag too and on this checkpoint it is the big one (measured on
+    weg2xsn30: `weights_0 bytes=2988 MiB` against a widest layer of 721 MiB).
+    Whichever is larger is what a single pause can put in the buffer.
+
+    `chunk_layers <= 0` means the weights are not chunked: then one tag is the
+    whole layer stack and this returns the layered total plus the unlayered --
+    a number the ledger will refuse if it cannot be funded, which is the
+    correct answer rather than a buffer that deadlocks.
+    """
+    census = layer_census_from_headers(model_dir)
+    per_layer = [int(b) for _idx, b in census.layer_bytes]
+    if not per_layer:
+        raise Weg2XchgWidestLayerUnreadable(
+            "W14 Weg2XchgWidestLayerUnreadable: the census read no layer at "
+            "all, so the largest tag cannot be stated and a buffer sized "
+            "against a default is how the xsn30 deadlock returns")
+    width = int(chunk_layers)
+    if width <= 0 or width >= len(per_layer):
+        window = sum(per_layer)
+    else:
+        window = max(sum(per_layer[i:i + width])
+                     for i in range(0, len(per_layer) - width + 1))
+    return max(int(window), int(census.unlayered_bytes))
+
+
 def widest_layer_terms(model_dir: str, *, pairs: int, depth: int,
-                       slot_bytes: int = 0, n_lanes: int = 1):
+                       slot_bytes: int = 0, n_lanes: int = 1,
+                       max_tag_bytes: int = 0):
     """``(BounceTerms, widest_line, widest_layer_name)`` for the launcher.
 
     ONE CALL SITE'S WORTH of glue, kept here so the launcher holds no
@@ -328,6 +368,7 @@ def widest_layer_terms(model_dir: str, *, pairs: int, depth: int,
         pairs=int(pairs),
         depth=int(depth),
         n_lanes=int(n_lanes),
+        max_tag_bytes=int(max_tag_bytes),
         **kw,
     )
     return terms, widest_line(census), f"layer {idx}"

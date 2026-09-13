@@ -1148,7 +1148,14 @@ def run_bounce_leg(
     # price were two expressions for one buffer, and the difference was exactly
     # one widest layer under `mode=shadow` -- 721.4 MiB the ledger never
     # charged, on every S6I boot.
-    slots = xb.assemble_slots(int(depth), comparing=comparing)
+    # #1374 OPTION 1: the slot count comes from the TERMS, one producer
+    # (`xb.tag_slots` via `BounceTerms.lane_slots`), so the file this leg
+    # allocates is the file the ledger charged for. Without terms -- or with a
+    # boot that did not state `max_tag_bytes` -- this is the old depth-sized
+    # floor and the wrap refusal below is what keeps it honest.
+    slots = (int(terms.lane_slots) if terms is not None
+             and int(getattr(terms, "max_tag_bytes", 0) or 0) > 0
+             else xb.assemble_slots(int(depth), comparing=comparing))
     if phase != PHASE_BOTH and not lane:
         raise Weg2XchgBouncePhaseUnordered(
             f"W68 Weg2XchgPlanDisagree: phase={phase} without a lane key. The "
