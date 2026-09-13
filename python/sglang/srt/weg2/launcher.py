@@ -10635,7 +10635,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if _launch_guard is not None:
         _lg_verdict = _launch_guard.stop("front takes over")
         if _lg_verdict is not None:
-            raise host_ledger.Weg2HostLedgerRefused(
+            # #1361 21a-fix: BOTH TYPES, and the second one is what tears the
+            # already-spawned ranks down. This raise sits AFTER
+            # launch_group(spec_p) and launch_group(spec_d) -- both groups are
+            # live -- and only `Weg2LaunchRefused` runs through the teardown
+            # funnel. Raising a bare `Weg2HostLedgerRefused` here stopped the
+            # boot by name and left six rank processes holding the cards, which
+            # is the exact class #1294 and #1248 exist to catch; both ratchets
+            # caught it. The precedent is #1294's own
+            # `Weg2ChunkCardMismatch(Weg2LaunchRefused, ValueError)`: widen the
+            # CLASS, do not rewrite the raise site, so every existing
+            # `except host_ledger.Weg2HostLedgerRefused` keeps catching it too.
+            raise Weg2LaunchHostLatched(
                 "W98 Weg2HostRateLatched (launch guard): the host cushion was "
                 "exhausted while the dormant image was still being written, in the "
                 "window the front's own loop does not cover. " + _lg_verdict
@@ -11047,6 +11058,23 @@ class Weg2RingFormUnproven(ring_table.Weg2RingRefused):
     A subclass of the ring's own refusal base, so it inherits ``cli()``'s
     handler -- the one named line and exit 2 -- without being enumerated
     anywhere (FIX 2's lesson, applied to the new member rather than repeated).
+    """
+
+
+class Weg2LaunchHostLatched(Weg2LaunchRefused, host_ledger.Weg2HostLedgerRefused):
+    """#1361 21a-fix: the launch guard's latch, as BOTH a launch and a host refusal.
+
+    The launch-guard latch fires after both groups are spawned, so whatever it
+    raises must run through the teardown funnel -- a stopped boot that leaves
+    six ranks holding three cards is worse than the breach it prevented.  Only
+    `Weg2LaunchRefused` reaches that funnel.
+
+    But the host ledger's own callers catch `Weg2HostLedgerRefused`, and the
+    latch IS a host-ledger verdict; narrowing it to a launch type would have
+    moved the defect rather than fixed it.  So it is both, exactly as
+    :class:`Weg2ChunkCardMismatch` is both a launch refusal and a ValueError --
+    the #1294 precedent, not a new pattern.  No layer inversion: this module
+    already imports `host_ledger`, never the other way round.
     """
 
 
