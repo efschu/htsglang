@@ -8457,7 +8457,23 @@ def solve_p_cut(
     # P_PP_STAGE_RATIO_SCORES is defined to be. It was restated here as a bare
     # "32,18,14", a fourth copy of a vector whose whole point is one
     # definition; an operator pin still overrides it.
-    incumbent = _csv_ints(ns.pp_stage_ratio) if ns.pp_stage_ratio else list(P_PP_STAGE_RATIO_SCORES)
+    #
+    # #1362 [22-fix follow, DESK6 #1378]: THE SAME MODEL-IDENTITY GUARD AS
+    # argv_p(), not a second unguarded reader of "the incumbent ratio".
+    # Measured live: without this, a 24-layer model with its OWN complete
+    # calibration record still crashed here with the bare
+    # pp_cut.family_costs_from_measurement ValueError
+    # (refuse_foreign_calibration's own message already quotes that exact
+    # text as the failure #1362 exists to name) -- because this line ran
+    # BEFORE argv_p ever got a chance to consult the calibration record.
+    if ns.pp_stage_ratio:
+        incumbent = _csv_ints(ns.pp_stage_ratio)
+    else:
+        incumbent = (
+            host_ledger.resolve_calibrated_stage_layer_counts(
+                model, ns.pp_stage_ratio, CALIBRATION_LAYERS)
+            or list(P_PP_STAGE_RATIO_SCORES)
+        )
     # THE GAPPED DEFAULT IS NOT TAKEN, AND THE HOOK IS NAMED RATHER THAN LEFT
     # OPEN (#753 / boot weg2gp1, 2026-09-08, /spinning/gpu-arb/weg2/
     # BOOT_weg2gp1_0908.md). The user's 0,8,8 layout was probed on metal for
