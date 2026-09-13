@@ -2305,7 +2305,32 @@ class Front:
                 _pr_fast = host_ledger.read_cgroup_pressure()
                 _nr = _pr_fast.get("nonreclaim_gib")
                 if _nr is not None:
-                    _line = rate_latch.observe(time.time(), float(_nr))
+                    # #1361b THE CUSHION REACHES THE LATCH, or the criterion is
+                    # dead in production. `observe` falls through to the old
+                    # rate path when `cushion_gib is None` -- so omitting these
+                    # two arguments deletes the fourth criterion at the one
+                    # place it has to work, while every unit test stays green
+                    # because they pass them. That is the present-but-unwired
+                    # state one name over from the parameter #1361b deleted, and
+                    # `test_the_call_site_passes_the_cushion` is the ratchet.
+                    # Both values come from the SAME `_pr_fast` reading the
+                    # level verdict grades, so cushion and level can never
+                    # disagree about the moment they describe.
+                    _file = _pr_fast.get("file_gib")
+                    _shm = _pr_fast.get("shmem_gib")
+                    _line = rate_latch.observe(
+                        time.time(), float(_nr),
+                        # cushion = file - shmem: cgroup-v2 `file` INCLUDES
+                        # `shmem`, so this is the page cache the kernel can
+                        # still trade away -- an absent term stays None and the
+                        # latch keeps its rate path rather than reading 0 as
+                        # "no cushion left" and tearing the boot down.
+                        cushion_gib=(
+                            None if _file is None or _shm is None
+                            else float(_file) - float(_shm)
+                        ),
+                        shmem_gib=None if _shm is None else float(_shm),
+                    )
                     if _line is not None and "RATE-GAP" in _line:
                         # Blindness is a finding, never silence -- but it is not
                         # a teardown: the loop kept running, it just could not
