@@ -257,82 +257,92 @@ def _xsn27_remaining(nr, shmem):
     return max(0.0, XSN27_PLAN_GIB - (shmem - XSN27_SHMEM0))
 
 
-class TheReplayFiresBeforeTheKillAndNotBefore1361b(CustomTestCase):
-    """#1361b ACCEPTANCE: the measured leg, replayed through the bounded latch.
+#: #1361b THE TWO LEGS THAT DECIDE THE FLOOR, from their own sampler CSVs:
+#: (cushion_gib, shmem_gib) per reading, cushion = file - shmem.
+#: weg2xsn24 SURVIVED and flipped; weg2xsn27 was reaped inside a 33 s stall.
+XSN24_TAIL = ((4.93, 61.95), (4.93, 61.95), (4.25, 63.90), (2.67, 64.16),
+              (2.41, 64.16), (2.41, 64.16))
+XSN27_TAIL = ((5.72, 50.02), (4.86, 50.86), (1.02, 55.40), (0.03, 57.77),
+              (0.01, 60.39))
 
-    Two halves, and BOTH have to hold or the latch is useless:
-      * it must fire on weg2xsn27's startup sleep leg BEFORE the sampler goes
-        blind at 00:13:04.87 (the kernel reaped inside that 33 s hole);
-      * it must NOT fire earlier on the same leg, where the climb is real but
-        the plan still fits -- the naive `rate x 5 s` form fires at 00:12:57
-        (71.1 + 5.4x5 = 98 > 95.9) on a leg that had every right to run, and a
-        latch that fires there kills every healthy boot.
+
+class TheCushionSeparatesTheBootsThatLivedFromTheOnesThatDied1361b(CustomTestCase):
+    """#1361b ACCEPTANCE: the criterion must SEPARATE, not merely fire.
+
+    Three criteria were refuted on this pair before this one, all at the desk
+    and none at a boot:
+      `now + remaining`      xsn24 95.44 vs xsn27 94.44 -- the SURVIVOR closer
+                             to the mark than the boot that died;
+      `current + max(0, fill_remaining - cushion)`
+                             fires on xsn24 FIRST (95.99 at its leg start);
+      `fill_remaining` from the PLAN line
+                             xsn24 planned 27.15 GiB of d2h and landed 14.80 in
+                             shmem, so a plan-based remainder fires on the
+                             survivor too.
+    What separates them is the reclaim cushion WHILE the fill is still running.
     """
 
-    #: shmem per row, needed for the remaining-bytes bound.
-    SHMEM = (49.69, 49.69, 49.69, 49.73, 49.78, 49.83, 49.88, 49.88, 49.90,
-             50.02, 50.02, 50.02, 50.86, 55.40, 57.77, 60.39)
-
-    def _run(self, bounded):
+    def _run(self, tail):
         lat = hl.RateLatch(reap_mark_gib=95.90)
-        for (t, nr), sh in zip(XSN27_LEG, self.SHMEM):
-            rem = _xsn27_remaining(nr, sh) if bounded else None
-            out = lat.observe(t, nr, remaining_leg_gib=rem)
+        for i, (cush, shm) in enumerate(tail):
+            out = lat.observe(float(i), 80.0, cushion_gib=cush, shmem_gib=shm)
             if out and "W98" in out:
-                return t, out
+                return i, out
         return None, None
 
-    def test_the_leg_is_refused_at_its_FIRST_sample_because_it_never_fitted(self):
-        """THE MEASUREMENT CORRECTED THE DESIGN, and this is the number.
+    def test_the_surviving_boot_never_latches(self):
+        """weg2xsn24: worst cushion while shmem rose was 2.67 GiB."""
+        i, line = self._run(XSN24_TAIL)
+        self.assertIsNone(line, f"latched at index {i}")
+        self.assertGreater(min(c for c, _s in XSN24_TAIL[:4]), 2.6)
 
-        The order asked for `min(rate x lookahead, remaining)`. Replayed against
-        weg2xsn27's own series that is strictly WORSE: the rate is ~1 GiB/s for
-        the first six seconds, so a rate-bounded projection stays silent through
-        a leg that was already impossible -- 71.08 + 27.20 = **98.28** against
-        the 95.90 mark AT THE FIRST ROW. The leg never fitted; nothing about its
-        slope was the finding. So the test is `now + remaining`, it needs no
-        rate, and it fires 7.8 s before the sampler goes blind instead of 1.2 s.
-        """
-        t, line = self._run(bounded=True)
-        self.assertIsNotNone(line, "the latch must fire on this leg")
-        self.assertEqual(t, 0.0)
-        self.assertAlmostEqual(XSN27_LEG[0][1] + XSN27_PLAN_GIB, 98.28, places=2)
-        self.assertGreater(XSN27_LEG[0][1] + XSN27_PLAN_GIB, 95.90)
-        self.assertIn("remaining_leg=", line)
-        self.assertIn("FEASIBILITY", line)
-        self.assertIn("no rate needed", line)
+    def test_the_dead_boot_latches_while_the_fill_is_still_running(self):
+        i, line = self._run(XSN27_TAIL)
+        self.assertIsNotNone(line)
+        self.assertEqual(i, 2)                 # cushion 1.02, shmem still climbing
+        self.assertIn("BELOW the floor", line)
+        self.assertIn("STILL RISING", line)
+        self.assertIn("weg2xsn24", line)       # the separation is ON the line
 
-    def test_the_rate_form_would_have_watched_six_seconds_of_a_doomed_leg(self):
-        """CAN-FAIL for the design change: measured, not argued.
+    def test_the_floor_sits_inside_the_measured_separation(self):
+        survivor_worst, first_firing = 2.67, 1.02
+        self.assertLess(hl.RATE_LATCH_CUSHION_FLOOR_GIB, survivor_worst)
+        self.assertGreater(hl.RATE_LATCH_CUSHION_FLOOR_GIB, first_firing)
+        self.assertAlmostEqual(survivor_worst - first_firing, 1.65, places=2)
 
-        `rate x lookahead` only reaches the mark once the ramp arrives at
-        t=6.579 -- six seconds and 7.4 GiB later, with the sampler about to go
-        blind. Same data, same mark, a whole leg of difference.
+    def test_a_low_cushion_with_the_fill_STOPPED_is_not_a_finding(self):
+        """The leg-END dip, excluded by the code and not by the evaluation.
+
+        This is the sample that made the analysis read 2.67 instead of 4.25: a
+        live latch cannot know it is the last one. With shmem flat it is not a
+        fill at all, so the gate -- not a rule, not a window choice -- drops it.
         """
         lat = hl.RateLatch(reap_mark_gib=95.90)
-        fired = None
-        for t, nr in XSN27_LEG:
-            if lat.observe(t, nr) and fired is None:
-                fired = t
-        self.assertAlmostEqual(fired, 6.579, places=2)
-        self.assertGreater(fired, 6.0)
+        lat.observe(0.0, 80.0, cushion_gib=5.0, shmem_gib=64.16)
+        for i in (1, 2, 3):
+            out = lat.observe(float(i), 80.0, cushion_gib=0.2, shmem_gib=64.16)
+            self.assertIsNone(out)
+        self.assertFalse(lat.latched)
 
-    def test_the_rate_still_owns_the_case_with_no_plan_to_read(self):
-        """`remaining=None` keeps the pre-#1361b behaviour, unchanged."""
+    def test_the_deleted_parameter_is_gone_not_merely_unused(self):
+        """Checkpoint (1): wired or deleted, never a third unwired term."""
+        import inspect
+        src = inspect.getsource(hl.RateLatch.observe)
+        # CODE, not prose: the docstring EXPLAINS the deleted parameter by name,
+        # and a bare substring check reads its own explanation. Same shape as
+        # the guard-loop test that had to strip comments before asserting.
+        body = src[src.index('"""', src.index('"""') + 3) + 3:]
+        self.assertNotIn("remaining_leg_gib", body)
+        self.assertNotIn("if False", body)
+        # ...and it is out of the SIGNATURE, which is the binding half.
+        self.assertNotIn(
+            "remaining_leg_gib", str(inspect.signature(hl.RateLatch.observe)))
+
+    def test_without_a_cushion_reading_the_rate_path_is_unchanged(self):
         lat = hl.RateLatch(reap_mark_gib=95.90)
         for i, v in enumerate(XSN26B_RAMP):
             lat.observe(float(i), v + 26.4)
         self.assertTrue(lat.latched)
-
-    def test_a_healthy_leg_with_room_never_latches(self):
-        """rg6/sb5f shape: the same climb, a plan that fits. Must stay silent."""
-        lat = hl.RateLatch(reap_mark_gib=95.90)
-        nr = 60.0
-        for i in range(12):
-            nr += 1.5                      # a brisk, legitimate ring fill
-            out = lat.observe(i * 0.5, nr, remaining_leg_gib=max(0.0, 18.0 - i * 1.5))
-            self.assertIsNone(out, f"latched at i={i}, nr={nr}")
-        self.assertFalse(lat.latched)
 
 
 class TheLaunchMomentChargesBothAtOnce1361c(CustomTestCase):
