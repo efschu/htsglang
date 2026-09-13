@@ -1625,6 +1625,25 @@ def gate0_check(
 # --------------------------------------------------------------------------
 
 
+def _missing_ranks(rows, joined) -> str:
+    """#1374 F4: WHICH RANK IS MISSING, and on which card.
+
+    `joined=2/3` states a COUNT. Boot weg2xsn30's gate printed exactly that
+    while PP0 sat 121 s in its resume, and the line could not say which rank
+    had not arrived -- so the reader had to cross three logs to learn it was
+    the 5090's rank. The rows carry the identity already; this names it.
+    """
+    absent = [r for r in range(N_RANKS) if r not in set(joined)]
+    if not absent:
+        return "none"
+    out = []
+    for r in absent:
+        row = rows[r] if r < len(rows) else None
+        card = getattr(row, "card_uuid", "") or "card-unknown"
+        out.append(f"rank{r}@{card}")
+    return ",".join(out)
+
+
 def _describe(rows: Sequence[GateRow], which: Sequence[int], want_seq: int,
               proc_root: str) -> str:
     out = []
@@ -1692,6 +1711,7 @@ def wave_gate(
         return Weg2XchgGateTimeout(
             f"W69 Weg2XchgGateTimeout epoch={region.epoch} wave={wave} "
             f"joined={len(joined)}/{N_RANKS} ok={len(voted_ok)}/{N_RANKS} "
+            f"missing={_missing_ranks(rows, joined)} "
             f"budget_s={budget} waited_s={monotonic() - started:.3f} "
             f"{headline}: {_describe(rows, which, want_seq, proc_root)} "
             f"(denominator: the six rows carrying epoch_hash={region.epoch_hash:#x}) "
@@ -1741,6 +1761,7 @@ def wave_gate(
     line = (
         f"WEG2-XCHG-GATE epoch={region.epoch} wave={wave} "
         f"joined={len(joined)}/{N_RANKS} ok={len(voted_ok)}/{N_RANKS} "
+        f"missing={_missing_ranks(rows, joined)} "
         f"skew_ms={skew_ms:.3f} waited_ms={(monotonic() - started) * 1e3:.3f} "
         f"(denominator: the six rows carrying this epoch)"
     )

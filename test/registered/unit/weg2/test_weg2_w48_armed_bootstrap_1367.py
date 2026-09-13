@@ -98,11 +98,23 @@ class TheFirstArmedBootIsAStateNotAFault(CustomTestCase):
 
 
 class TheInventoryIsMeasuredNotAssumed(CustomTestCase):
-    def test_solve_publishes_the_same_form_candidates_it_ranked(self):
-        """`solve` already builds the list (ring_table.py:2679) to rank it; the
-        launcher's decision needs the same list, not a second count."""
+    def test_solve_publishes_the_same_form_candidates_that_SURVIVED(self):
+        """`solve` already builds the ranked list (ring_table.py:2679); the
+        launcher's decision needs the SURVIVING subset of it, not a second
+        count and not the ranked list.
+
+        #1374 W9 narrowed this deliberately: a stem that was ranked same-form
+        and then ELIMINATED (weg2xsn30 died at wall 8 before D slept, so it
+        carries `no sleep-pass lines for D`) is not a witness, and counting it
+        refused weg2xsn31 -- every boot that dies at a wall would lock its
+        successor out. The split is derived in ONE place from the reasons
+        `solve` already writes."""
         src = inspect.getsource(ring_table.solve)
-        self.assertIn("same_form_candidates=tuple(same_form)", src)
+        self.assertIn("same_form_candidates=tuple(", src)
+        self.assertIn("same_form_unusable=tuple(", src)
+        self.assertIn('r.startswith(f"{st}:")', src,
+                      "the survivors must be derived from the elimination "
+                      "reasons, not from a second bookkeeping")
 
     def test_the_field_defaults_to_empty_not_to_none(self):
         """An empty inventory is the bootstrap state; None would be a third
