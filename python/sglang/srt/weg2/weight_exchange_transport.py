@@ -1128,6 +1128,123 @@ class SemSet:
             self._handles.clear()
 
 
+#: #1385 default bound for :meth:`LanePermit.acquire` -- the same 120 s fence
+#: budget :class:`weight_exchange_bounce.CrossSlotRendezvous` already uses for
+#: every slot wait in this file's neighbourhood, so a lane-permit timeout and
+#: a slot timeout read as the same class of event to an operator watching a
+#: boot, not two different patience budgets to remember.
+LANE_PERMIT_TIMEOUT_S = 120.0
+
+
+class LanePermit:
+    """The #1385 lane-CONCURRENCY permit: a single counting semaphore, opened
+    (never created) by a rank, bounding how many of this boot's lane buffers
+    may be pinned in tmpfs at once.
+
+    NEVER ``O_CREAT`` here, for the identical reason :class:`SemSet` gives:
+    the launcher created this name with ``O_EXCL`` after unlinking
+    (``weight_exchange_region.create_lane_permit_semaphore``), so a creating
+    ``sem_open`` in a rank would silently adopt a name the launcher never
+    sized, and POSIX ignores the initial value for an existing name -- the
+    adoption would be invisible and the first lane would wait on a count
+    nobody chose.
+
+    A rank never constructs this class when the cap is unset (0): the caller
+    (the lane loop in ``weight_updater.py``) checks
+    ``terms.lanes_concurrent`` BEFORE opening this semaphore at all, so the
+    default path performs the zero extra syscalls the flag promises.
+    """
+
+    def __init__(self, boot_nonce: str):
+        self.boot_nonce = str(boot_nonce)
+        lib = ctypes.CDLL("libc.so.6", use_errno=True)
+        lib.sem_open.restype = ctypes.c_void_p
+        lib.sem_open.argtypes = [ctypes.c_char_p, ctypes.c_int]
+        lib.sem_timedwait.argtypes = [ctypes.c_void_p, ctypes.POINTER(_Timespec)]
+        lib.sem_post.argtypes = [ctypes.c_void_p]
+        lib.sem_close.argtypes = [ctypes.c_void_p]
+        self._lib = lib
+        self._handle: Optional[int] = None
+        self._lock = threading.Lock()
+
+    def _open(self) -> int:
+        if self._handle is not None:
+            return self._handle
+        with self._lock:
+            if self._handle is not None:
+                return self._handle
+            name = xr.lane_permit_sem_name(self.boot_nonce)
+            ctypes.set_errno(0)
+            raw = self._lib.sem_open(name.encode("ascii"), 0)
+            if raw in (None, 0, ctypes.c_void_p(-1).value):
+                err = ctypes.get_errno()
+                raise OSError(
+                    err,
+                    f"sem_open({name}) without O_CREAT failed: "
+                    f"{os.strerror(err)} -- the launcher creates this "
+                    f"semaphore ONLY when a real lane cap is active "
+                    f"(weight_exchange_region.create_lane_permit_semaphore); "
+                    f"an ENOENT here while a rank believes a cap is active "
+                    f"is the two sides of #1385 disagreeing about whether "
+                    f"one was ever armed",
+                )
+            self._handle = int(raw)
+            return self._handle
+
+    def acquire(self, *, budget_s: float = LANE_PERMIT_TIMEOUT_S, lane: str = "",
+               boot: str = "") -> None:
+        """Block for at most ``budget_s``, or REFUSE by name (W69-form).
+
+        A permit wait that could never end is the worse failure -- the same
+        rule :meth:`SemSet.timedwait`'s own docstring states for slot waits,
+        and this reuses that class's CODE for the identical reason
+        :class:`xchg_bounce.Weg2XchgBounceUnderCovered` reuses W71's: the
+        event this names ("a bounded wait exceeded its budget") already has
+        a code, and a second one for the same shape is a second reader has
+        to learn to recognise.
+
+        **EINTR IS NOT A TIMEOUT** (the same measured lesson
+        :meth:`SemSet.timedwait` documents): the retry is against the SAME
+        absolute deadline, computed once, so a storm of signals cannot
+        extend the budget by even one poll.
+        """
+        handle = ctypes.c_void_p(self._open())
+        deadline = time.clock_gettime(time.CLOCK_REALTIME) + float(budget_s)
+        ts = _Timespec(int(deadline), int((deadline % 1.0) * 1e9))
+        while True:
+            ctypes.set_errno(0)
+            if self._lib.sem_timedwait(handle, ctypes.byref(ts)) == 0:
+                return
+            err = ctypes.get_errno()
+            if err == errno.EINTR:
+                continue
+            if err in (errno.ETIMEDOUT, 0):
+                raise Weg2XchgGateTimeout(
+                    f"W69 Weg2XchgGateTimeout: lane={lane or '?'} waited "
+                    f"{float(budget_s):.1f}s for a #1385 lane-concurrency "
+                    f"permit on boot={boot or self.boot_nonce} and none "
+                    f"freed. Refusing rather than waiting forever: a "
+                    f"permit that can never be granted means the boot's "
+                    f"own accounting of who holds one has already "
+                    f"diverged from reality (a leaked permit, or a peer "
+                    f"that died holding one), and that is a fact about "
+                    f"THIS boot, not a slower one."
+                )
+            raise OSError(err, f"sem_timedwait(lane-permit) failed: "
+                               f"{os.strerror(err)}")
+
+    def release(self) -> None:
+        if self._lib.sem_post(ctypes.c_void_p(self._open())) != 0:
+            err = ctypes.get_errno()
+            raise OSError(err, f"sem_post(lane-permit) failed: "
+                               f"{os.strerror(err)}")
+
+    def close(self) -> None:
+        if self._handle is not None:
+            self._lib.sem_close(ctypes.c_void_p(self._handle))
+            self._handle = None
+
+
 class Weg2XchgSemaphoreNotRearmed(RuntimeError):
     """W78 -- a slot semaphore did not start this leg at its armed count.
 
