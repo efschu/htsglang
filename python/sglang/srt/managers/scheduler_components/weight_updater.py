@@ -3160,6 +3160,8 @@ class SchedulerWeightUpdaterManager:
         honest degradation -- a missing handshake must stop a cross leg, never
         turn it into a `both` leg that asks for the peer's address.
         """
+        from sglang.srt.weg2 import weight_exchange as wx
+
         cached = getattr(self, "_weg2_xchg_sems_cache", "unset")
         if cached != "unset":
             return cached
@@ -3170,7 +3172,35 @@ class SchedulerWeightUpdaterManager:
             region = self._weg2_shadow_region()
             if region is not None:
                 sems = tp.SemSet(region.boot_nonce)
-        except BaseException:  # noqa: BLE001 -- an observer never raises
+        except BaseException as exc:  # noqa: BLE001
+            # #505 SILENT SWALLOW, CLOSED. This was a bare
+            # `except BaseException: sems = None`, and it is the reason a
+            # cutover leg could lose its handshake without one line saying so:
+            # the boot then read `W74 ... src_resolved=0/N` (an ADDRESS
+            # complaint) for a cause that was a missing semaphore set. The
+            # exception is now named -- type AND text -- at the moment it
+            # happens.
+            logger.info(
+                "WEG2-XCHG-SEMS-UNAVAILABLE type=%s text=%s armed=%s -- the "
+                "semaphore set for this boot's CROSS pairs could not be "
+                "opened; a leg without it cannot run the deposit/collect "
+                "handshake",
+                type(exc).__name__, exc, bool(wx.exchange_armed()))
+            # AND NOT SWALLOWED WHERE IT DECIDES A FLIP. With the exchange
+            # armed, this process IS one of the two weg2 groups and a leg
+            # without semaphores is not a degraded observer -- it is a flip
+            # that would move weights with no ordering at all. Unarmed boots
+            # (`ring`, the pure `shadow` arm) keep the observer behaviour,
+            # which is what the `None` return was written for.
+            if wx.exchange_armed():
+                raise wx.Weg2XchgPlanDisagree(
+                    f"W68 Weg2XchgPlanDisagree: the exchange is armed and "
+                    f"this rank's semaphore set could not be opened: "
+                    f"{type(exc).__name__}: {exc}. Refusing by name beats "
+                    f"returning None, which sends the leg to the unsplit "
+                    f"form and reports the missing PEER address instead of "
+                    f"the missing handshake."
+                ) from exc
             sems = None
         self._weg2_xchg_sems_cache = sems
         return sems
