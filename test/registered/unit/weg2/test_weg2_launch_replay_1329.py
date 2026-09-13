@@ -97,8 +97,9 @@ import unittest
 
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 
-from sglang.srt.weg2 import host_ledger, ring_table
+from sglang.srt.weg2 import host_ledger
 from sglang.srt.weg2 import launcher as L
+from sglang.srt.weg2 import ring_table
 from sglang.srt.weg2 import weight_exchange as wx
 from sglang.srt.weg2 import xchg_residency as xr
 from sglang.test.test_utils import CustomTestCase
@@ -209,20 +210,37 @@ class TestTheFixtureIsFaithful(CustomTestCase):
         against the GENERATOR, or its green is meaningless from the generator's
         first change onward.
 
-        THE CONCRETE HOLE, measured 2026-09-11: this fixture is a recording of
-        group P's argv from boot xsn14, and this module's own header says its job
-        is to ARM THE FORM GATE inside ``ring_table.solve``.  B4e makes the
-        launcher append ``ring_table.XCHG_FORM_TOKEN`` to exactly that argv
-        whenever the arm is in ``WEIGHT_SOURCE_ARMED``.  The recording predates
-        B4e and carries the token 0x, while ``recorded.json`` records its arm as
-        ``exchange``.  So from the moment B4e lands, this replay arms the form
-        gate with a form the launcher no longer produces -- and it does NOT go
-        red, it goes STALE and stays green.  A green stale replay is worse than a
-        red one, because nothing reports it.  This test turns stale into red.
+        #1329 REPAIR (2026-09-13). The subject above is right and the
+        comparison under it was not: it read
 
-        ONE EQUALITY COVERS BOTH DIRECTIONS: ``xchg_form_argv`` is the authority
-        for armed and unarmed alike, so an unarmed recording that grew a token
-        fails here too.  No case split that could itself drift.
+            self.assertEqual(xchg_form_argv(recorded, arm), recorded)
+
+        which compares a TRANSFORMED value against an UNTRANSFORMED one. That
+        is the defect #1325c named and fixed one layer up, in TRAIN FIX 5's
+        shipped-form check, in its own words: "A check that compares a
+        TRANSFORMED value against an UNTRANSFORMED one tests the transform,
+        not the thing it was built to test."
+
+        The token is SYNTHETIC -- launcher.py:3727 `xchg_form_argv` appends
+        ring_table.XCHG_FORM_TOKEN on the way to `solve`, and `argv_p` never
+        emits it -- so a RECORDING of a shipped argv cannot contain it, and
+        the equality was UNEQUAL BY CONSTRUCTION for every armed arm. It could
+        not go green for `weight_source=exchange` no matter how fresh the
+        recording was. It was not reporting staleness; it was reporting the
+        transform, every run, for two days.
+
+        SO THE REPAIR IS THE COMPARISON, NOT THE FIXTURE. No re-recording: the
+        fixture's whole value is that it IS a recording (it carries the
+        shipped cut 39,13,12), and hand-patching the token into it would
+        destroy exactly that. Both sides go through the same transform, and
+        what is compared is the FORM KEY -- the quantity the replay actually
+        arms the gate with.
+
+        WHAT STILL GOES RED HERE, i.e. what this is worth:
+          * a generator change that alters any form-bearing flag (the key moves)
+          * a hand-patched fixture that grew the synthetic token (checked by name)
+          * the transform changing shape (armed adds exactly the token; unarmed
+            is byte-identical)
         """
         arm = RECORDED["wall_xsn13_ring_absent_contradiction"]["weight_source"]
         builder = getattr(L, "xchg_form_argv", None)
@@ -234,15 +252,57 @@ class TestTheFixtureIsFaithful(CustomTestCase):
                 "DORMANT, not passing -- it arms with B4e (train item [6])."
             )
         recorded = recorded_p_argv()
-        rebuilt = builder(recorded, arm)
+
+        # 1. A RECORDING OF A SHIPPED ARGV CARRIES NO SYNTHETIC TOKEN.
+        # This is the half the old assertion was really tripping over, and it
+        # is worth keeping as its own statement: if someone ever "fixes" this
+        # test by editing the fixture, this is the line that says no.
+        self.assertNotIn(
+            ring_table.XCHG_FORM_TOKEN, recorded,
+            "the recording grew the synthetic token -- a shipped argv can "
+            "never contain it (argv_p does not emit it; launcher.py:3727 "
+            "appends it AFTER the fact), so the fixture was hand-patched and "
+            "has stopped being a recording",
+        )
+
+        # 2. THE TRANSFORM, BOTH DIRECTIONS, ON THE REAL RECORDING.
         self.assertEqual(
-            rebuilt, recorded,
-            "the recorded p_argv is no longer what the launcher builds for "
-            f"arm={arm!r}: the launcher would hand solve() {len(rebuilt)} "
-            f"tokens, the recording has {len(recorded)}. Re-record the fixture "
-            "from a boot on the current launcher -- do NOT relax this "
-            "assertion, and do NOT patch the token into the recording by hand: "
-            "the fixture's value is that it is a RECORDING.",
+            builder(recorded, arm), list(recorded) + [ring_table.XCHG_FORM_TOKEN],
+            f"arm={arm!r} is armed, so the launcher hands solve() the shipped "
+            "argv plus exactly the token -- no reordering, no second change",
+        )
+        self.assertEqual(
+            builder(recorded, L.WEIGHT_SOURCE_DEFAULT), list(recorded),
+            "the unarmed arm must be byte-identical: acceptance (iii)",
+        )
+
+        # 3. THE KEY THE REPLAY ARMS WITH, ON THE SAME TRANSFORM BOTH SIDES.
+        # `gated` is what B4e hands `solve`; `shipped` is what TRAIN FIX 5
+        # re-derives from the argv the boot really ships, put through the same
+        # transform (#1325c). They must agree, and the shipped cut must be IN
+        # the normalised form -- otherwise the replay is arming the gate with
+        # a form whose defining term the key no longer carries.
+        gated_key, gated_norm = ring_table.p_form_key(builder(recorded, arm))
+        shipped_key, _norm = ring_table.p_form_key(builder(list(recorded), arm))
+        self.assertEqual(gated_key, shipped_key)
+        self.assertIn("--pp-stage-ratio=39,13,12", gated_norm,
+                      "the recorded boot's shipped cut is no longer in the "
+                      "form key's normalised form -- either the generator "
+                      "dropped it or it was excluded by name, and the replay "
+                      "is now arming the gate with a form that cannot tell "
+                      "39,13,12 from 42,11,11 (the split that cost #1305)")
+        self.assertIn(ring_table.XCHG_FORM_TOKEN, gated_norm,
+                      "the token must be IN the key -- that is the premise "
+                      "the armed form's whole identity rests on")
+
+        # 4. AND THE KEY MUST MOVE WHEN THE FORM MOVES, or none of the above
+        # is a measurement. The mutant is the split that actually bit us.
+        mutant = ["--pp-stage-ratio=42,11,11" if t.startswith("--pp-stage-ratio")
+                  else t for t in recorded]
+        self.assertNotEqual(
+            ring_table.p_form_key(builder(mutant, arm))[0], gated_key,
+            "a different PP split hashes to the same form key -- the gate "
+            "cannot be discriminating on it",
         )
 
     def test_every_fixture_file_is_CARRIED_BY_THE_REPO(self):
