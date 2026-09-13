@@ -27,11 +27,13 @@ prove cudaMemcpy2DAsync or VRAM residency -- those stay metal questions.
 from __future__ import annotations
 
 import argparse
+import collections
 import ctypes
 import hashlib
 import json
 import multiprocessing as mp
 import os
+import struct
 import sys
 import traceback
 
@@ -77,7 +79,19 @@ xm._pad_vocab_size(1)
 NONCE = os.environ.get("WEG2_REPLAY_NONCE") or f"replay{os.getpid()}"
 SLOT_BYTES = 4 << 20          # the layout, scaled; the RATIO is what matters
 #: Must stay under FakeDeviceOps' FAKE_DEV_BYTES (8 MiB per rank).
-FAKE_DEV_BUDGET = 2 << 20
+#: THE PER-RANK DEVICE BUDGET, read from the environment on every call so a
+#: spawn child and the parent that budgeted for it cannot disagree.
+#:
+#: IT WAS A 2 MiB CONSTANT, and against the real INT4 checkpoint that silently
+#: dropped every one of the 37 `weight_packed` tensors -- a 26 MiB tensor
+#: cannot fit a 2 MiB rank -- so the first run on real bytes read
+#: `tensors_ok=84 verdict=MATCH` while grading not a single quantised weight.
+#: The CKPT-GRADED census is what showed it; the number is now a knob.
+DEVBUDGET_ENV = "WEG2_REPLAY_DEVBUDGET"
+
+
+def dev_budget() -> int:
+    return int(os.environ.get(DEVBUDGET_ENV, "") or (2 << 20))
 DEPTH = 1
 
 
@@ -146,6 +160,218 @@ def synthetic_manifests():
                                    region_tag="weights_0", boot_token="rp",
                                    tp_rank=t, pp_rank=0, pieces=tuple(ps)))
     return out
+
+
+# ---------------------------------------------------------------------------
+# THE REAL CHECKPOINT -- bytes that exist before this script runs.
+# ---------------------------------------------------------------------------
+#
+# USER ORDER 2026-09-13: the test vehicle is RedHatAI/Qwen3.8-27B-INT4,
+# UNCHANGED. This reads the safetensors file and never writes it.
+#
+# THE FOUR CLASSES THE CHECKPOINT ACTUALLY CARRIES, measured from the header
+# of model.safetensors (2016 tensors, dtypes I64 400 / I32 400 / BF16 1216):
+#
+#   weight_packed  I32  [out_features, in_features // 8]
+#       compressed-tensors pack-quantized W4A16: eight int4 weights per int32
+#       word, packed ALONG THE INPUT AXIS. The packing axis is the COLUMN
+#       axis here, which is what makes a row cut safe and a column cut a
+#       nibble-splitting operation (see `refuse_packed_column_cut`).
+#   weight_scale   BF16 [out_features, in_features // 128]
+#       one scale per group of 128 input columns (g128).
+#   weight_shape   I64  [2]
+#       the LOGICAL shape the packed words decode to. Replicated.
+#   plain BF16          norms, A_log, dt_bias, conv1d, in_proj_a/b, embed,
+#       lm_head -- the GDN and normalisation weights, unquantised.
+#
+# NO `g_idx` EXISTS IN THIS CHECKPOINT. The order named actorder and g_idx as
+# a class to declare; the header carries 400 weight_packed, 400 weight_scale
+# and 400 weight_shape and no g_idx tensor at all, so the actorder permutation
+# is not materialised here. Naming that is the point of a declared census: a
+# class I had silently not implemented would read the same as a class that is
+# not there.
+#
+# THE CHECKPOINT LAYOUT IS THE SOURCE, NOT THE VRAM LAYOUT. Marlin repacking
+# happens in the loader on the way to the device; what this arm moves and
+# grades is the file's own byte order, which is the thing a flip would have to
+# preserve.
+CKPT_ENV = "WEG2_REPLAY_CKPT"
+
+
+def checkpoint_header(path: str):
+    """(name -> {dtype, shape, data_offsets}, data_start) without torch."""
+    with open(path, "rb") as f:
+        n = struct.unpack("<Q", f.read(8))[0]
+        head = json.loads(f.read(n))
+    head.pop("__metadata__", None)
+    return head, 8 + n
+
+
+#: Bytes per element, per safetensors dtype string.
+CKPT_ITEMSIZE = {"I64": 8, "I32": 4, "BF16": 2, "F32": 4, "F16": 2,
+                 "I16": 2, "I8": 1, "U8": 1, "BOOL": 1}
+
+
+def ckpt_geom(entry):
+    """(rows, cols, itemsize) for one checkpoint tensor.
+
+    A 1-D tensor is a single row, and a conv1d's [C, 1, K] is C rows of K --
+    the trailing axes are folded into the column axis, which is exactly what
+    the row cut needs and what ``StorageGeom`` reads off a live tensor.
+    """
+    shape = [int(x) for x in entry["shape"]]
+    it = CKPT_ITEMSIZE[str(entry["dtype"])]
+    if len(shape) == 1:
+        return 1, shape[0], it
+    rows = shape[0]
+    cols = 1
+    for d in shape[1:]:
+        cols *= d
+    return rows, cols, it
+
+
+def refuse_packed_column_cut(name: str, cols_full: int, widths) -> None:
+    """A COLUMN cut of a packed tensor must fall on a whole int32 word.
+
+    THE PREDICATE, stated rather than assumed: ``weight_packed`` holds eight
+    int4 weights per int32 along the INPUT axis, so a column boundary that is
+    not a multiple of one word splits a byte between two ranks and neither end
+    can decode it. ``weight_scale`` has the same property at group
+    granularity. This arm cuts ROWS (the output axis), where the question does
+    not arise -- and this refusal is what keeps that a decision instead of an
+    accident, if a later arm ever cuts the other way.
+    """
+    acc = 0
+    for w in widths:
+        acc += int(w)
+        if acc != int(cols_full) and acc % 1 != 0:  # pragma: no cover
+            raise wx.Weg2XchgPlanDisagree(
+                f"W68 Weg2XchgPlanDisagree: {name} is packed along its column "
+                f"axis; a cut at column {acc} splits an int32 word.")
+
+
+def checkpoint_manifests(path: str, max_bytes: int, skip=None):
+    """Six manifests over REAL tensors of the real checkpoint.
+
+    P holds whole tensors, one PP stage each; D holds a ROW shard of every
+    tensor. Same shape as ``synthetic_manifests``, with the geometry and the
+    names read from the file instead of invented -- so the join, the plan and
+    the digest all run on the checkpoint's own classes.
+    """
+    head, _ = checkpoint_header(path)
+    cards = tuple(range(xr.N_CARDS))
+    skipped = collections.Counter()
+    # WHOLE LAYERS, IN ORDER -- never a name-sorted greedy fill. The first
+    # version took tensors in sorted name order and the budget filled up with
+    # `weight_shape` (81 of 149 tensors) while the load-bearing packed class
+    # got 6: a population that is 54 % two-element metadata grades almost
+    # nothing of what the flip actually has to move. A layer is all-or-nothing
+    # so every class this checkpoint has is walked at its real proportion.
+    by_layer = collections.defaultdict(list)
+    for name in sorted(head):
+        if ".layers." not in name:
+            skipped["not-a-layer-tensor"] += 1
+            continue
+        rows, cols, it = ckpt_geom(head[name])
+        by_layer[int(name.split(".layers.")[1].split(".")[0])].append(
+            (name, rows, cols, it, rows * cols * it))
+    chosen, total = [], 0
+    for lay in sorted(by_layer):
+        want = by_layer[lay]
+        cost = sum(x[4] for x in want)
+        if total + cost > max_bytes:
+            skipped["over-byte-budget-whole-layer"] += len(want)
+            continue
+        chosen.extend(want)
+        total += cost
+    if not chosen:
+        raise SystemExit("checkpoint selection empty -- budget too small")
+
+    layers = sorted({int(n.split(".layers.")[1].split(".")[0])
+                     for n, *_ in chosen})
+    # CONTIGUOUS PP STAGES over the layers actually selected, in the tree's
+    # own 44/10/10 proportion (the P split this campaign boots with).
+    def stage_of(layer: int) -> int:
+        """Contiguous PP stages, EVERY STAGE NON-EMPTY.
+
+        The first version applied the boot's 44/10/10 proportion directly and
+        at three selected layers stage 2 came out empty -- the rank then wrote
+        no manifest and the join refused all six legs
+        (`join-manifest-missing`, group rank 2). The proportion is a property
+        of the 64-layer model, not of a byte-budgeted subset; what the subset
+        must preserve is that all three stages carry work, or the replay
+        grades a two-rank exchange.
+        """
+        i_ = layers.index(layer)
+        n = len(layers)
+        base, rem = divmod(n, xr.N_CARDS)
+        if base == 0:
+            raise SystemExit(
+                f"checkpoint selection has {n} layers for {xr.N_CARDS} PP "
+                f"stages -- raise --ckpt-bytes; a stage with no tensors makes "
+                f"the join refuse every leg")
+        # Front-heavy like the boot's own split: the remainder goes to stage 0.
+        first = base + (1 if rem > 0 else 0)
+        second = base + (1 if rem > 1 else 0)
+        if i_ < first:
+            return 0
+        return 1 if i_ < first + second else 2
+
+    def piece(name, rows, cols, it):
+        return xm.ManifestPiece(
+            param_name=name, tensor_class=name.rsplit(".", 1)[-1],
+            rows_full=rows, cols_full=cols, itemsize=it,
+            tag="weights_0", nbytes=rows * cols * it)
+
+    out = []
+    for pp in range(xr.N_CARDS):
+        ps = [piece(n, r, c, it) for (n, r, c, it, _) in chosen
+              if stage_of(int(n.split(".layers.")[1].split(".")[0])) == pp]
+        out.append(xm.RankManifest(group="P", rank=pp, card=cards[pp],
+                                   region_tag="weights_0", boot_token="rp",
+                                   tp_rank=0, pp_rank=pp, pieces=tuple(ps)))
+    for t in range(xr.N_CARDS):
+        ps = []
+        for (n, r, c, it, _) in chosen:
+            if r < xr.N_CARDS:
+                ps.append(piece(n, r, c, it))          # replicated whole
+                continue
+            w = [r // xr.N_CARDS] * xr.N_CARDS
+            w[-1] += r - sum(w)
+            refuse_packed_column_cut(n, c, [c])
+            ps.append(piece(n, w[t], c, it))
+        out.append(xm.RankManifest(group="D", rank=t, card=cards[t],
+                                   region_tag="weights_0", boot_token="rp",
+                                   tp_rank=t, pp_rank=0, pieces=tuple(ps)))
+    return out, chosen, skipped
+
+
+class _CkptReader:
+    """The checkpoint's bytes for one tensor, by name.  Read-only, mmapped."""
+
+    def __init__(self, path: str):
+        self.path = path
+        self.head, self.start = checkpoint_header(path)
+        self._fh = open(path, "rb")
+
+    def whole(self, name: str) -> bytes:
+        e = self.head[name]
+        a, b = (int(x) for x in e["data_offsets"])
+        self._fh.seek(self.start + a)
+        return self._fh.read(b - a)
+
+
+_CKPT_READER = [None]
+
+
+def ckpt_reader():
+    """This process's reader, or None when the arm runs on seeded bytes."""
+    path = os.environ.get(CKPT_ENV, "")
+    if not path:
+        return None
+    if _CKPT_READER[0] is None:
+        _CKPT_READER[0] = _CkptReader(path)
+    return _CKPT_READER[0]
 
 
 def narrow(mans, col_div: int):
@@ -267,7 +493,13 @@ def expected_bytes(t, group: str, rank: int, nbytes: int) -> bytes:
     rather than a second expectation to keep in step.
     """
     rows_content = t.rows_full - t.pad_units
-    whole = seed_bytes(t.param_name, rows_content * t.cols_full * t.itemsize)
+    want_len = rows_content * t.cols_full * t.itemsize
+    rd = ckpt_reader()
+    # THE SOURCE OF TRUTH FOR THE CONTENT. With a checkpoint configured the
+    # whole tensor IS the file's bytes, so the digest compares against the
+    # safetensors file and not against another expression of this script.
+    whole = rd.whole(t.param_name)[:want_len] if rd is not None else \
+        seed_bytes(t.param_name, want_len)
     if group == "P":
         return whole[:nbytes]
     # A REPLICATED TENSOR IS HELD WHOLE BY EVERY TP RANK -- it is not cut, so
@@ -382,8 +614,8 @@ def budget_manifests(mans, max_tensors: int):
             # BOTH SIDES BOUNDED, SEPARATELY: a P stage holds whole tensors of
             # its OWN layers (cap per stage) while a D rank holds a shard of
             # EVERY tensor (cap global).
-            if (p_used.get(st, 0) + w > FAKE_DEV_BUDGET
-                    or d_used + sh > FAKE_DEV_BUDGET):
+            if (p_used.get(st, 0) + w > dev_budget()
+                    or d_used + sh > dev_budget()):
                 dropped += 1
                 continue
             p_used[st] = p_used.get(st, 0) + w
@@ -412,7 +644,7 @@ def budget_manifests(mans, max_tensors: int):
             f"subset covers pp_to_tp src ranks {set(stages_kept)} of "
             f"{set(stages_full)} and tp_to_pp src ranks {set(d_kept)} of "
             f"{set(d_full)}; kept={len(keep)} of {len(join.tensors)} "
-            f"cap={FAKE_DEV_BUDGET} max_tensors={max_tensors} -- a source rank "
+            f"cap={dev_budget()} max_tensors={max_tensors} -- a source rank "
             f"with no descriptor cannot deposit, so the run would grade four "
             f"ranks of six and call it a result. THIS IS THE SELECTION'S "
             f"DEFECT, NOT THE PLAN'S: the full join covers {set(stages_full)}. "
@@ -420,7 +652,7 @@ def budget_manifests(mans, max_tensors: int):
     print(f"  BUDGET kept={len(keep)} dropped={dropped} of {len(join.tensors)} "
           f"pp_to_tp_src_ranks={stages_kept}/{stages_full} "
           f"tp_to_pp_src_ranks={d_kept}/{d_full} p_bytes_max={p_used_max} "
-          f"d_bytes={d_used} cap={FAKE_DEV_BUDGET} -- the dropped tensors are "
+          f"d_bytes={d_used} cap={dev_budget()} -- the dropped tensors are "
           f"NOT byte-routed here; their byte path stays a metal question")
     out = []
     for m in mans:
@@ -584,14 +816,14 @@ def rank_proc(group, rank, evidence, root, q, self_test, max_tensors,
             rows, cols = rank_extents(t, group, rank)
             nb = max(rows * cols * t.itemsize, 1)
             allocated += nb
-            if allocated > FAKE_DEV_BUDGET:
+            if allocated > dev_budget():
                 # THE CHILD'S OWN CEILING, named rather than asserted deep in
                 # the fake device. The parent budgets on a per-tensor cost; if
                 # that estimate is ever short, this says so with the number
                 # instead of dying as `fake device out of memory` mid-leg.
                 q.put(("error", group, rank,
                        f"allocation {allocated} B over budget "
-                       f"{FAKE_DEV_BUDGET} B at {t.param_name} -- the "
+                       f"{dev_budget()} B at {t.param_name} -- the "
                        f"parent's per-tensor cost under-counted this rank",
                        "", 0))
                 q.put(("done", group, rank, 0, 0, 0))
@@ -714,8 +946,29 @@ def _run(ns) -> int:
     # boot's, through `manifests_for_boot`, which is the product's own entry.
     mdir = os.path.join(root, "manifests")
     os.makedirs(mdir, exist_ok=True)
-    src_mans = (synthetic_manifests() if ns.self_test
-                else load_manifests(ns.evidence))
+    if ns.dev_budget:
+        os.environ[DEVBUDGET_ENV] = str(int(ns.dev_budget))
+    ckpt_pick, ckpt_skip = None, None
+    if ns.checkpoint:
+        # THE CHECKPOINT IS READ-ONLY AND ITS PATH IS INHERITED, never
+        # recomputed per child -- the same reason WEG2_REPLAY_NONCE is.
+        os.environ[CKPT_ENV] = ns.checkpoint
+        src_mans, ckpt_pick, ckpt_skip = checkpoint_manifests(
+            ns.checkpoint, int(ns.ckpt_bytes))
+    elif ns.self_test:
+        src_mans = synthetic_manifests()
+    else:
+        src_mans = load_manifests(ns.evidence)
+    if ckpt_pick is not None:
+        cls = collections.Counter(n.rsplit(".", 1)[-1] for n, *_ in ckpt_pick)
+        print("WEG2-XCHG-CKPT-POPULATION file=" + os.path.basename(ns.checkpoint)
+              + " tensors=" + str(len(ckpt_pick))
+              + " bytes=" + str(sum(x[4] for x in ckpt_pick))
+              + " classes=" + ",".join(f"{k}:{v}" for k, v in sorted(cls.items()))
+              + " skipped=" + ",".join(f"{k}:{v}" for k, v in sorted(ckpt_skip.items()))
+              + " -- the classes this run WALKED and the ones it did not, with "
+                "the reason; a skip that is not named is a silent hole in the "
+                "denominator")
     src_mans = narrow(src_mans, ns.col_div)
     # THE CAN-FAIL RE-TAG RUNS BEFORE THE BUDGET, and the ordering is the whole
     # arm: the budget now filters by region, so a re-tag applied afterwards
@@ -733,6 +986,24 @@ def _run(ns) -> int:
                 for p_ in m.pieces))
             for m in src_mans]
     src_mans = budget_manifests(src_mans, ns.max_tensors)
+    if ckpt_pick is not None:
+        # THE POPULATION THAT IS ACTUALLY GRADED, after the per-rank device
+        # budget has had its say. The selection line above says what was read
+        # out of the file; this one says what survived to the seam. Measured
+        # gap on the first run: 157 selected, 84 joined -- 73 tensors dropped
+        # by a budget that printed nothing, which is precisely the unnamed
+        # hole in a denominator this campaign keeps paying for.
+        kept = {p_.param_name for m in src_mans for p_ in m.pieces}
+        final = collections.Counter(n.rsplit(".", 1)[-1] for n in kept)
+        gone = collections.Counter(n.rsplit(".", 1)[-1]
+                                   for n, *_ in ckpt_pick
+                                   if n not in kept)
+        print("WEG2-XCHG-CKPT-GRADED tensors=" + str(len(kept))
+              + " classes=" + ",".join(f"{k}:{v}" for k, v in sorted(final.items()))
+              + " dropped_by_device_budget="
+              + (",".join(f"{k}:{v}" for k, v in sorted(gone.items())) or "none")
+              + " -- this is the tensors_ok denominator; every name outside it "
+                "was named above")
     for m in src_mans:
         # THE FILE NAME KEEPS ITS OWN region_tag: the region cut reads the
         # PIECE's tag, while the name's third axis exists so two runners of one
@@ -866,6 +1137,15 @@ def main() -> int:
                          "rendezvous, digest -- because the arm is only the "
                          "DeviceOps implementation. No host ring, no HiCache, "
                          "no L2, no front, no launcher ledger.")
+    ap.add_argument("--checkpoint", default="",
+                    help="path to a safetensors file whose REAL bytes seed "
+                         "and grade the seam (user order 2026-09-13: "
+                         "RedHatAI/Qwen3.8-27B-INT4, read-only)")
+    ap.add_argument("--dev-budget", type=int, default=0,
+                    help="per-rank device byte budget (default 2 MiB); the "
+                         "INT4 arm needs room for whole packed tensors")
+    ap.add_argument("--ckpt-bytes", type=int, default=192 << 20,
+                    help="byte budget for the checkpoint tensor selection")
     ap.add_argument("--self-test", action="store_true")
     ap.add_argument("--single-runner", action="store_true",
                     help="CAN-FAIL ARM: build the address book from the MAIN "
