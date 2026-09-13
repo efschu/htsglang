@@ -44,6 +44,7 @@ from sglang.srt.constants import (
     GPU_MEMORY_TYPE_WEIGHTS,
     GPU_MEMORY_TYPE_WEIGHTS_DRAFT,
 )
+from sglang.srt.environ import envs
 
 logger = logging.getLogger(__name__)
 
@@ -1908,14 +1909,21 @@ def weg2_graph_tag_armed(memory_saver_on: bool) -> bool:
         return False
     global _GRAPH_TAG_ARMED
     if _GRAPH_TAG_ARMED is None:
-        from sglang.srt.utils.common import get_bool_env_var
-
-        _GRAPH_TAG_ARMED = bool(get_bool_env_var("SGLANG_MEMORY_SAVER_CUDA_GRAPH"))
+        # #1366: this used to read get_bool_env_var deliberately, "the CAPTURE
+        # site's own reader", to keep arming and capture from disagreeing. The
+        # intent stands and the reader moved with it: every site now reads the
+        # DECLARATION (environ.py:1978), which is where get_bool_env_var's own
+        # first line says the variable belongs. Measured divergence before the
+        # move: 'yes' and 'y' were true to EnvBool and false to the helper.
+        # The import is module-level, so `envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH`
+        # here and at the capture site are one OBJECT, not two equal names.
+        _GRAPH_TAG_ARMED = bool(envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get())
     if not _GRAPH_TAG_ARMED:
         _refuse_graph_tag(
             "env_off",
-            "SGLANG_MEMORY_SAVER_CUDA_GRAPH is not truthy to get_bool_env_var "
-            "(the CAPTURE site's own reader, so the capture did not route into "
+            "SGLANG_MEMORY_SAVER_CUDA_GRAPH is not truthy to its declared "
+            "reader envs.EnvBool (which since #1366 is ALSO the CAPTURE site's "
+            "reader, so the capture did not route into "
             "the tag either -- releasing it alone would pause a workspace the "
             "graph still reads). An operator override of this variable is a "
             "legitimate input; this line says what it costs",

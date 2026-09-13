@@ -385,9 +385,9 @@ def resolve_adaptive_graph_memory_mode(server_args: "ServerArgs") -> str:
             f"decode cuda-graph backend {decode_backend!r} has no per-state "
             "capture-pool routing (backend 'full' required)"
         )
-    from sglang.srt.utils import get_bool_env_var
+    from sglang.srt.environ import envs
 
-    if get_bool_env_var("SGLANG_MEMORY_SAVER_CUDA_GRAPH"):
+    if envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get():
         return _fail_or_scratch(
             "SGLANG_MEMORY_SAVER_CUDA_GRAPH already routes captures through "
             "its own memory-saver tag"

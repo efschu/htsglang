@@ -39,6 +39,34 @@ from sglang.srt.constants import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _no_env_leaks_out_of_this_file():
+    """`_saver` writes the process env on purpose -- it is testing the PARSER.
+    Without this, whatever spelling the last test wrote (up to 'banana') stays
+    set for every file that runs after, and the two `TestModeResolution` cases
+    in test_adaptive_graph_memory.py go red for a reason that has nothing to do
+    with them. Measured at 4a90bf163a, before #1366 touched anything: this file
+    followed by that one = 2 failed; that one alone = 63 passed. A gate that
+    partitions files across workers therefore reported this pair red or green
+    depending on the partition."""
+    from sglang.srt.managers import weg2_memory_saver as ms
+
+    keys = ("SGLANG_MEMORY_SAVER_CUDA_GRAPH", ms.WEG2_GROUP_ENV)
+    saved = {k: os.environ.get(k) for k in keys}
+    try:
+        yield
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        # The resolvers cache on purpose; a cached answer must not outlive the
+        # env that produced it either.
+        ms._GRAPH_TAG_ARMED = None
+        ms._WEG2_GROUP_NAME = None
+
+
 def _saver(armed: bool, group: str = "P", raw: str = None):
     """Import ``weg2_memory_saver`` with the graph tag armed or disarmed.
 
@@ -244,8 +272,8 @@ def test_every_launcher_call_site_names_its_group():
 def test_the_sleep_gate_reads_the_capture_sites_own_reader():
     """The invariant is agreement with the CAPTURE, not with the registry.
 
-    Three parsers exist for this one variable and they disagree; measured, one
-    process per value:
+    Three parsers existed for this one variable and they disagreed; measured,
+    one process per value:
 
         value    hand-rolled(v1)   get_bool_env_var   envs.EnvBool
         'yes'    True              False              True
@@ -257,25 +285,35 @@ def test_the_sleep_gate_reads_the_capture_sites_own_reader():
     flashinfer_backend.py:1060-1061 means by "released together or not at all".
     The launcher honours an operator override of this variable
     (launcher.py:1383-1385), so a non-canonical value is a reachable input.
+
+    #1366 RESOLVED THE DISAGREEMENT INSTEAD OF MIRRORING IT: all six lenient
+    readers of this variable moved onto its declaration (environ.py:1978), the
+    destination get_bool_env_var's own first line names. This tripwire did its
+    job -- it went red on the migration, ahead of any boot -- so it keeps the
+    invariant and drops the reader NAME: agreement is now asserted against the
+    capture site's reader OBJECT, which no further migration can fake.
     """
-    from sglang.srt.utils.common import get_bool_env_var
+    from sglang.srt.model_executor.runner_backend import full_cuda_graph_backend as fg
+
+    capture_reader = fg.envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH
 
     for raw in ("1", "true", "TRUE", "yes", "on", "y", "0", "false", "", "banana"):
         ms = _saver(armed=True, group="P", raw=raw)
-        capture_routes = get_bool_env_var("SGLANG_MEMORY_SAVER_CUDA_GRAPH")
+        capture_routes = capture_reader.get()
         assert ms.weg2_graph_tag_armed(True) is bool(capture_routes), (
             f"value {raw!r}: the sleep gate and the capture site disagree"
         )
 
-    # And the capture site really is the reader mirrored above: if it is ever
-    # migrated to `envs`, this goes red instead of the boot.
-    from sglang.srt.model_executor.runner_backend import full_cuda_graph_backend as fg
+    # The sleep gate must hold the SAME field object, not an equal-looking one.
+    from sglang.srt.managers import weg2_memory_saver as ms_mod
 
-    cap = inspect.getsource(fg)
-    assert 'get_bool_env_var("SGLANG_MEMORY_SAVER_CUDA_GRAPH")' in cap, (
-        "the capture site changed its reader -- weg2_graph_tag_armed mirrors "
-        "get_bool_env_var and the two can now disagree on a value"
+    assert ms_mod.envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH is capture_reader, (
+        "the sleep gate and the capture site no longer share one reader -- "
+        "they can disagree on a value again"
     )
+    assert 'get_bool_env_var("SGLANG_MEMORY_SAVER_CUDA_GRAPH")' not in (
+        inspect.getsource(fg)
+    ), "the capture site went back to a second parser for this variable"
 
 
 def test_the_memory_saver_conjunct_is_read_from_the_callers_server_args():
@@ -620,9 +658,8 @@ def test_captured_graph_static_buffers_keep_their_addresses_across_pause_resume(
     """
     import torch
 
-    from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
-
     from sglang.srt.managers import weg2_memory_saver as ms
+    from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
     adapter = TorchMemorySaverAdapter.create(enable=True)
     static_in = torch.zeros(1024, device="cuda")

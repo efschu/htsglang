@@ -28,6 +28,7 @@ from sglang.srt.distributed.device_communicators import barlink_abort_gate
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     set_graph_pool_id,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.moe import offload_capture_gate
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
@@ -46,7 +47,6 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import 
 from sglang.srt.model_executor.runner_utils.pool import (
     get_or_create_global_graph_memory_pool,
 )
-from sglang.srt.utils import get_bool_env_var
 from sglang.srt.utils.jit_cold_build import run_capture_warmups
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
@@ -203,7 +203,7 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
         self._buffer_rows: int = 0
         self._memory_saver_adapter: Optional[Any] = TorchMemorySaverAdapter.create(
             enable=enable_memory_saver
-            and get_bool_env_var("SGLANG_MEMORY_SAVER_CUDA_GRAPH")
+            and envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get()
         )
         if (
             self._memory_saver_adapter is not None
