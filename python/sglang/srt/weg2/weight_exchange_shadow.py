@@ -3815,35 +3815,56 @@ class ShadowLeg:
                 return "no-ops"
         return ""
 
-    def verify_sems(self) -> str:
-        """W78 AT LEG START -- **counted here, never raised into the leg**.
+    def census_sems(self) -> str:
+        """COUNT the set, never refuse over it.  #1366.
 
-        SECTION 1ai-S5's UNPROVEN 9 said ``verify_sem_arm`` has no caller.  This
-        is the caller, and the placement is a deliberate narrowing of that
-        function's own ``TODO(S6)``: it names the RPC preamble, which is where a
-        refusal that STOPS A FLIP belongs, and the shadow may not stop a flip.
-        So the same check runs at the start of the shadow's leg and its refusal
-        decides only whether the SHADOW runs -- ``reason=w78-stale`` on the
-        line, ``sems=stale`` in the census field, and the flip proceeds on the
-        ring.  When S6 puts it in the preamble as an authoritative refusal this
-        call becomes redundant and should be deleted, not kept as a second one.
+        THIS REPLACED `verify_sems`, which ran the same census AND returned
+        `w78-stale` so the leg skipped. The refusal was an arrival-order race:
+        `leg.sems` carries a REAL cross-group handshake (handed to
+        `shadow_transport` and on into `tp.run_leg`, which splits into
+        producer/consumer by `is_source`), so the group starting SECOND always
+        finds `empty=0, full=1` -- a set that has done its work, not a stale
+        one. Boot weg2xsn26: D first `ran=yes why=ok`, P after `ran=no
+        why=w78-stale`, 2 of 2.
+
+        THE CENSUS STAYS BECAUSE THE LINE IS READ: `WEG2-XCHG-SEMS ...
+        armed=N/N counts=...` is how a boot seat sees the set at all, and
+        deleting the refusal must not cost the instrument. `sems_armed` is
+        still a number when the set is pristine and `None` when it is not, and
+        `sems_reason` still carries the detail -- what changed is that neither
+        stops the leg.
+
+        Returns "" always: the signature keeps its shape for the call site,
+        and the emptiness IS the contract.
         """
         if self.sems is None:
-            return "no-sems"
+            return ""
         try:
             census = tp.verify_sem_arm(self.sems, leg=self.inputs.leg,
                                        epoch=self.inputs.epoch, log=self.log)
         except tp.Weg2XchgSemaphoreNotRearmed as exc:
+            # NAMED AND COUNTED, NOT REFUSED. A set mid-handshake reaches here
+            # on every boot where this group is not the first to arrive.
             self.sems_armed = None
             self.sems_reason = str(exc)
+            # THE REFUSAL'S OWN TEXT STILL PRINTS -- it carries
+            # SEM_NOT_REARMED_MARKER, which is how a boot seat greps the set's
+            # state. Deleting the skip may not delete the evidence: that would
+            # trade one silence for another.
             self.log(str(exc))
-            return "w78-stale"
+            self.log(
+                f"WEG2-XCHG-SEMS-IN-USE leg={self.inputs.leg} "
+                f"epoch={self.inputs.epoch} -- the set is not pristine, which "
+                f"for a CROSS handshake means the peer group has already used "
+                f"it. Counted, not refused (#1366): refusing here skipped the "
+                f"second-arriving group and made a six-rank grade structurally "
+                f"unreachable.")
+            return ""
         except BaseException as exc:  # noqa: BLE001
             self.sems_reason = f"{type(exc).__name__}: {exc}"
-            return "sem-check-failed"
+            return ""
         self.sems_armed = int(census.get("checked", 0))
         return ""
-
 
 def oncard_mode_word(mode: str) -> int:
     """The Gate-0 word for an on-card mode.  THE MODE WORD'S PRODUCER.
@@ -4174,11 +4195,34 @@ def run_leg_hook(
                 raise Weg2XchgShadowRankLocalSkip(reason)
             result.reason = reason
             return result
-        sem_reason = leg.verify_sems()
-        if sem_reason:
-            publish_no_vote(leg, reason=sem_reason)
-            result.reason = sem_reason
-            return result
+        leg.census_sems()
+        # #1366: THE LEG-START PRISTINE REFUSAL IS GONE, as its own docstring
+        # prescribed ("when S6 puts it in the preamble as an authoritative
+        # refusal this call becomes redundant and should be deleted, not kept
+        # as a second one").
+        #
+        # IT WAS AN ARRIVAL-ORDER RACE, not a staleness test. These semaphores
+        # carry a REAL cross-group handshake -- `leg.sems` is handed to
+        # `shadow_transport` (:4283) and on into `tp.run_leg` (:2049), which
+        # splits into producer/consumer by `is_source` -- so the group that
+        # starts its leg SECOND necessarily finds `empty=0, full=1`: a set that
+        # has done its work, which `verify_sem_arm` then called `stale` and
+        # refused. Boot weg2xsn26 measured it in one second: D (d2h) first and
+        # `ran=yes why=ok`, P (h2d) after and `ran=no why=w78-stale`, 2 of 2.
+        #
+        # THE COST WAS THE GRADE, not the flip: the observer may not stop a
+        # flip, so the second group simply did not compare -- and the seam
+        # digest can then never read MATCH on all six ranks, because the
+        # ceiling is whichever group arrived first. A criterion asking for 6/6
+        # was measuring the check's timing, not the lane.
+        #
+        # NO REPLACEMENT IS WIRED HERE ON PURPOSE. The invariant "pristine"
+        # belongs to the ARM, not to a leg, and its only named home --
+        # `weight_exchange_region.gate0_check`, the RPC preamble -- has NO
+        # PRODUCTION CALLER on this tip (grepped: references in prose and its
+        # own body only). Putting the refusal there would be a refusal nothing
+        # reaches, which is the defect class this campaign keeps paying for. It
+        # is reported rather than shipped.
         # S6 fix F2: NO OVERLAP IS A NAMED REFUSAL.  A card whose pair shares
         # no bytes has nothing for this lane, and saying so by name is the
         # whole lesson of boot weg2shadowE, where the honest cause sat behind
