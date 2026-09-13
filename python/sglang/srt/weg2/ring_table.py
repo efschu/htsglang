@@ -515,6 +515,26 @@ _P_ARGV_RE = re.compile(r"\bgroup P argv:\s*(\S.*?)\s*$")
 #:   it moves no weight byte into the host image this table sizes.
 #: * ``--port``: boot identity.
 FORM_KEY_EXCLUDED_FLAGS: Tuple[str, ...] = (
+    #: #1358: THE BOUNCE DEPTH IS HOST STAGING, NOT A WEIGHT STATEMENT.
+    #: `--xchg-bounce-depth` sizes the assemble buffer in /dev/shm
+    #: (`widest_layer x assemble_slots(depth)`); it says nothing about WHICH
+    #: weights group P loads or how they are cut. Sigma H is the DORMANT IMAGE
+    #: -- the backed-up tag census -- and does not contain the staging buffer
+    #: at all, so a ring table solved under depth=2 is a measurement OF THIS
+    #: FORM under depth=1.
+    #:
+    #: MEASURED by the train seat: without the flag fbcf124aabb5, with it
+    #: 7824e006efd8. Left in the key, xsn28 would meet W48 against xsn27's
+    #: table and have to re-solve a census that is already correct for it.
+    #:
+    #: THE CONTRAST THAT MAKES THIS A RULE AND NOT A CONVENIENCE: #1356's
+    #: `--weg2-vision off` STAYS IN the key, deliberately. An absent tower
+    #: changes the tag census by 2.63 GiB, so it IS a different weight
+    #: statement and its first boot must solve from its own stem. The test
+    #: below pins BOTH halves, because "exclude the flags that are noisy" is
+    #: how a form key stops discriminating -- the question is never whether a
+    #: flag is ours, it is whether it moves Sigma H.
+    "--xchg-bounce-depth",
     #: #1362: THE SERVED NAME IS A LABEL, NOT A FORM. It is what the front
     #: routes on and every probe asserts against, and it became DERIVED from
     #: the model path in this commit instead of the literal "Qwen3.8-27B" it
