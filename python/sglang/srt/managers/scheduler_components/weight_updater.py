@@ -3233,10 +3233,44 @@ class SchedulerWeightUpdaterManager:
         # requiring it would make a leg fall back to the unsplit form for a
         # dependency it does not have.
         if not hook or sems is None:
-            # The unsplit form, unchanged.  Kept for the hermetic callers and
-            # the diagonal-only case; a CROSS leg that reached here without a
-            # handshake is refused inside `run_bounce_leg` rather than run as
-            # `both`, which is the ratchet this slice exists to hold.
+            # THE REFUSAL IS HERE, AND IT WAS NOT.  This comment used to say
+            # that a CROSS leg reaching the unsplit form "is refused inside
+            # `run_bounce_leg` rather than run as `both`".  That was FALSE and
+            # is the #1358 class stated at the desk: `_require_rendezvous`
+            # returns immediately for `PHASE_BOTH`
+            # (weight_exchange_bounce.py:937-938) and nothing below it
+            # distinguishes a cross descriptor from a diagonal one, so a cross
+            # leg here ran as `both`, asked THIS rank for the PEER's device
+            # address, and died as `W74 ... src_resolved=0/N` -- weg2xsn24's
+            # own wall, reachable on the cutover path whenever
+            # `_weg2_xchg_sems` returns None (its region is None, or its
+            # `except BaseException` swallowed anything at all).
+            #
+            # A ratchet that lives in a comment is not a ratchet.
+            # THE CONDITION IS `hook AND NOT sems`, not "cross": a hermetic
+            # caller passes NO hook and holds both pointers in one process, so
+            # `both` is honest for it and 20 existing tests drive exactly that.
+            # Only a leg that NAMES a hook can be a cutover leg, and a cutover
+            # leg without its handshake is the one case that cannot work.
+            cross = [d for d in descs
+                     if int(getattr(d, "src_rank", -1))
+                     != int(getattr(d, "dst_rank", -2))] if hook else []
+            if cross:
+                raise wx.Weg2XchgPlanDisagree(
+                    f"W68 Weg2XchgPlanDisagree: {len(cross)} of {len(descs)} "
+                    f"descriptors cross cards (first "
+                    f"{getattr(cross[0], 'param_name', '?')}: "
+                    f"{getattr(cross[0], 'src_rank', '?')} -> "
+                    f"{getattr(cross[0], 'dst_rank', '?')}) and this leg "
+                    f"names hook={hook!r} but has no semaphore set. The "
+                    f"unsplit form runs phase=both, which needs BOTH pointers "
+                    f"in one process -- and the source of a cross pair is the "
+                    f"peer, whose address this rank cannot resolve by "
+                    f"construction. Refusing the leg beats reporting "
+                    f"src_resolved=0/N after the plan was built."
+                )
+            # The unsplit form, for the hermetic callers and the diagonal-only
+            # case -- both of which hold both pointers in one process.
             return bx.run_bounce_leg(
                 descs, ops, boot_nonce,
                 slot_bytes=slot_bytes, depth=depth, terms=terms,

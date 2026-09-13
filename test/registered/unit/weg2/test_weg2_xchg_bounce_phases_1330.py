@@ -656,3 +656,94 @@ def test_a_free_with_no_alloc_says_so_rather_than_going_quiet():
     wb._host_slot_event("free", "/never-allocated", 99, log=seen.append)
     assert "unmatched-free" in seen[0], seen
     wb._LIVE_SLOTS.clear()
+
+
+def test_unsplit_form_refuses_a_cross_leg_1330():
+    """A CROSS leg without a handshake is REFUSED, not run as ``both``.
+
+    THE COMMENT CLAIMED THIS AND THE CODE DID NOT DO IT. `_require_rendezvous`
+    returns immediately for `PHASE_BOTH` (weight_exchange_bounce.py:937-938)
+    and nothing below it separates a cross descriptor from a diagonal one, so
+    before this test a cross leg that reached the unsplit form ran as `both`,
+    asked its own rank for the PEER's device address, and died as
+    `W74 ... src_resolved=0/N` -- weg2xsn24's wall. It is reachable on the
+    cutover path: the single production caller
+    (weight_updater.py:1175) passes `sems=self._weg2_xchg_sems()`, which
+    returns None when its region is None or when its `except BaseException`
+    swallows anything (weight_updater.py:3166-3176).
+    """
+    from sglang.srt.managers.scheduler_components import weight_updater as wu
+
+    class _Stub:
+        _weg2_xchg_bounce_leg = wu.SchedulerWeightUpdaterManager._weg2_xchg_bounce_leg
+
+        def _weg2_group_name(self):
+            return "P"
+
+        def _weg2_rank(self):
+            return 0
+
+    cross = _d(1, 2)
+    object.__setattr__(cross, "src_rank", 0)
+    object.__setattr__(cross, "dst_rank", 1)
+    with pytest.raises(wx.Weg2XchgPlanDisagree) as ei:
+        _Stub()._weg2_xchg_bounce_leg(
+            descs=[cross], ops=None, boot_nonce=NONCE, slot_bytes=SLOT,
+            depth=1, mode=wx.INJECT_AUTHORITATIVE, hook="authoritative",
+            region=object(), sems=None)
+    assert "W68" in str(ei.value) and "cross cards" in str(ei.value)
+
+    # THE DIAGONAL STILL TAKES THE UNSPLIT FORM: it holds both pointers in one
+    # process, which is the one case `both` is honest for.
+    diag = _d(1, 2)
+    object.__setattr__(diag, "src_rank", 1)
+    object.__setattr__(diag, "dst_rank", 1)
+    import sglang.srt.weg2.weight_exchange_bounce as real
+
+    orig, seen = real.run_bounce_leg, []
+    real.run_bounce_leg = lambda descs, ops, nonce, **kw: seen.append(
+        kw.get("phase")) or None
+    try:
+        _Stub()._weg2_xchg_bounce_leg(
+            descs=[diag], ops=None, boot_nonce=NONCE, slot_bytes=SLOT,
+            depth=1, mode=wx.INJECT_AUTHORITATIVE, hook="authoritative",
+            region=object(), sems=None)
+    finally:
+        real.run_bounce_leg = orig
+    assert seen == [None], seen
+
+
+def test_no_production_caller_passes_phase_both_1330():
+    """AST RATCHET: no shipped call site asks for ``phase=both``.
+
+    The phase is derived from the hook at ONE site
+    (weight_updater.py:3247-3248). A second site that named `both` explicitly
+    would re-open exactly the wall this slice closed, and a grep would not see
+    it through an alias -- so this walks the tree instead.
+    """
+    import ast
+    import pathlib
+
+    root = pathlib.Path(wx.__file__).resolve().parents[3]
+    offenders = []
+    for path in sorted(root.rglob("*.py")):
+        if "/test" in str(path) or "/scripts/" in str(path):
+            continue
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+        except SyntaxError:            # not ours to parse
+            continue
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            for kw_ in node.keywords:
+                if kw_.arg != "phase":
+                    continue
+                v = kw_.value
+                if isinstance(v, ast.Constant) and v.value == "both":
+                    offenders.append(f"{path}:{node.lineno} phase='both'")
+                if isinstance(v, ast.Attribute) and v.attr == "PHASE_BOTH":
+                    offenders.append(f"{path}:{node.lineno} PHASE_BOTH")
+                if isinstance(v, ast.Name) and v.id == "PHASE_BOTH":
+                    offenders.append(f"{path}:{node.lineno} PHASE_BOTH")
+    assert not offenders, offenders
