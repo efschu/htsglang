@@ -66,8 +66,11 @@ weight_exchange_region.py): the coordinator's strongest remaining candidate
 was that a co-located DRAFT/MTP leg shares the SAME region-blind semaphore
 names as the main leg (``sem_name``/``diagonal_sem_name``,
 weight_exchange_region.py:1787-1843, neither carries a region/runner key) and
-posts onto card 0's diagonal beside the main leg -- explaining 16=2x8 AND why
-only card 0. REFUTED, on two independent grounds, both verified below:
+posts onto card 0's diagonal beside the main leg. REFUTED, on two
+independent grounds, both verified below (and separately: round 3's own
+metal read showed the diagonal's ``full=16`` is D's OWN TP-shard split
+[17:7:8], one poster, not a second one -- see the module docstring further
+down):
 
   1. ``model_runner.py:736-742`` -- "Only the LAST pipeline stage builds a
      producer" (``self.pp_rank == self.pp_size - 1``): the draft/MTP head
@@ -117,13 +120,17 @@ from __future__ import annotations
 import inspect
 import os
 import tempfile
+import time
 
 import pytest
 
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 
 from sglang.srt.managers.scheduler_components import weight_updater as wu
-from sglang.srt.managers.weg2_memory_saver import Weg2XchgLaneNeverDrainedRefused
+from sglang.srt.managers.weg2_memory_saver import (
+    Weg2VramCreditRefused,
+    Weg2XchgLaneNeverDrainedRefused,
+)
 from sglang.srt.weg2 import weight_exchange as wx
 from sglang.srt.weg2 import weight_exchange_region as xr
 from sglang.srt.weg2 import weight_exchange_transport as tp
@@ -179,6 +186,9 @@ class _FakePlan:
 
 class _FakeTerms:
     total_bytes = 402653184
+    lane_slots = 8
+    n_lanes = 8
+    lanes_concurrent = 0
 
     def expression(self):
         return "(depth+1) x slot = 3 x 134217728"
@@ -353,28 +363,90 @@ def test_an_empty_collect_plan_on_a_clean_lane_stays_a_no_op(
 # ===========================================================================
 
 
-class _CreditMustNotBeAsked:
-    """A credit object whose `wait_for` fails the test if it is ever reached
-    -- the assertion that the new check runs BEFORE the 120 s poll, not
-    beside or after it."""
+class _CreditCapturesTheReader:
+    """A stand-in `wait_for` that records the `stuck_lane_reader` callback
+    and calls it once itself -- proves `_weg2_await_vram_credit` WIRES the
+    callback (right rank, right sems) to the real `VramCredit.wait_for`
+    call site, without needing a live 120s wait to prove it."""
 
-    def wait_for(self, *a, **k):  # pragma: no cover -- must never run
-        raise AssertionError(
-            "credit.wait_for() was called -- the undrained-lane check did "
-            "not short-circuit before the 120s poll")
+    def __init__(self):
+        self.kwargs = None
+        self.stuck = None
+
+    def wait_for(self, *a, **k):
+        self.kwargs = k
+        reader = k.get("stuck_lane_reader")
+        assert reader is not None, "no stuck_lane_reader was passed at all"
+        self.stuck = reader()
+        return {"waited_s": 0.0, "claimed_bytes": 0}
 
 
-def test_the_credit_wait_refuses_before_polling_when_a_lane_is_undrained(
+def test_the_credit_wait_wires_a_stuck_lane_reader_not_a_one_shot_check(
         monkeypatch, real_sems):
+    """#1391 ROUND 3: the coordinator's own finding -- a check taken ONCE at
+    entry cannot see a condition that develops WHILE waiting (boot
+    weg2xsn31's instrument run measured exactly that race: clean at entry,
+    stuck 4s later). The check must be a CALLBACK `VramCredit.wait_for`
+    polls on its own cadence, not code that runs before `wait_for` is even
+    called. This pins the WIRING; the callback's own timing behaviour is
+    pinned separately against the real `VramCredit.wait_for` below."""
     _post_diagonal_bands(real_sems, 0, 16)
     m = _manager(monkeypatch, group="P", rank=0, sems=real_sems)
+    credit = _CreditCapturesTheReader()
+
+    m._weg2_await_vram_credit(credit, "weights_3", 2916)
+
+    assert credit.kwargs is not None, "credit.wait_for was never called"
+    assert credit.kwargs["stuck_lane_reader"] is not None
+    by_lane = {lane: (full, empty) for lane, full, empty in credit.stuck}
+    assert by_lane["card0-0"] == (16, 0)
+
+
+def test_vram_credit_wait_for_catches_a_race_mid_wait_not_after_the_budget(
+        tmp_path):
+    """THE REAL LOOP, driven end to end: `stuck_lane_reader` reports CLEAN
+    for the first ~1.5s (the lane check's own 1s cadence gives it one or two
+    clean looks) and then STUCK -- mirroring boot weg2xsn31's own timeline
+    (clean at entry, saturating post lands 4s later). `wait_for` must raise
+    `Weg2XchgLaneNeverDrainedRefused` well before its OWN 30s budget expires,
+    proving the check lives INSIDE the poll loop and not only at the door.
+    """
+    from sglang.srt.managers.weg2_memory_saver import VramCredit
+
+    credit = VramCredit("GPU-test-1391", credit_dir=str(tmp_path))
+    t0 = time.monotonic()
+    calls = {"n": 0}
+
+    def _reader():
+        calls["n"] += 1
+        if calls["n"] <= 1:
+            return []
+        return [("card0-0", 16, 0)]
 
     with pytest.raises(Weg2XchgLaneNeverDrainedRefused) as exc:
-        m._weg2_await_vram_credit(_CreditMustNotBeAsked(), "weights_3", 2916)
+        credit.wait_for(
+            2916 * 1024 * 1024, budget_s=30.0, tag="weights_3",
+            free_bytes_now=0, stuck_lane_reader=_reader)
+    elapsed = time.monotonic() - t0
+    assert elapsed < 10.0, (
+        f"took {elapsed:.1f}s -- the lane check did not fire on its own "
+        f"cadence, only (if at all) near the full budget")
+    assert calls["n"] >= 2, "the reader was never polled more than once"
     msg = str(exc.value)
     assert "W100" in msg
-    assert "weights_3" in msg
     assert "card0-0" in msg
+
+
+def test_vram_credit_wait_for_with_no_reader_is_byte_identical(tmp_path):
+    """`stuck_lane_reader=None` (every existing caller before #1391) must
+    behave exactly as before: refuse on the ORIGINAL W35 path, at the full
+    budget, never on W100."""
+    from sglang.srt.managers.weg2_memory_saver import VramCredit
+
+    credit = VramCredit("GPU-test-1391b", credit_dir=str(tmp_path))
+    with pytest.raises(Weg2VramCreditRefused) as exc:
+        credit.wait_for(1024, budget_s=0.2, tag="weights_0", free_bytes_now=0)
+    assert "W35" in str(exc.value)
 
 
 def test_the_credit_wait_polls_normally_on_a_clean_lane(monkeypatch, real_sems):
