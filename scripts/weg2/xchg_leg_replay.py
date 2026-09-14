@@ -882,6 +882,9 @@ class _Stub:
     def __init__(self, main_params, draft_params, group="P", rank=0):
         from sglang.srt.managers.scheduler_components import weight_updater as wu
 
+        # the card-uuid cache _weg2_card_uuid reads; "unset" makes it resolve
+        # (fail-soft -> None on this cardless harness).
+        self.weg2_card_uuid_cache = "unset"
         self._group, self._rank = str(group), int(rank)
         self.tp_worker = _FakeWorker(_FakeModel(main_params))
         self.draft_worker = (None if draft_params is None
@@ -891,6 +894,7 @@ class _Stub:
                      "_weg2_join_dst_addr", "_weg2_shadow_plan",
                      "_weg2_xchg_draft_plan_or_none",
                      "_weg2_draft_lm_head_is_target_share",
+                     "_weg2_leg_pcie_uuid", "_weg2_card_uuid",
                      "_weg2_xchg_bounce_leg"):
             setattr(type(self), name, getattr(cls, name))
 

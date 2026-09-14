@@ -1098,6 +1098,16 @@ def run_bounce_leg(
     mode: str = wx.INJECT_SHADOW,
     shm_root: str = xr.SHM_ROOT,
     device: int = 0,
+    #: #1378 xsn36 (the lock-ordering deadlock): THIS rank's NVML uuid. When
+    #: set, run_bounce_leg takes the per-card PCIe serialisation lock around
+    #: EACH COPY (the D2H band write, the H2D band read) and holds it NEVER
+    #: across a rendezvous wait -- the co-located pair on one physical card
+    #: (weg2xsn35/36: P rank0 + D rank0 on the 5090) deadlocked by
+    #: construction when the CALLER held the card lock across the whole leg
+    #: while the leg's waits needed the SIBLING's posts, which the sibling
+    #: could not produce without the same lock. Waits outside, copies inside.
+    pcie_uuid: Optional[str] = None,
+    pcie_direction: Optional[str] = None,
     #: #1330 B4n.  WHICH HALF OF THE BOUNCE THIS RANK RUNS.  ``both`` is the
     #: single-process form and is byte-identical to the behaviour before the
     #: split; ``deposit``/``collect`` are the two ranks of a cross-group leg.
@@ -1430,8 +1440,19 @@ def run_bounce_leg(
                     # another band's row, so an undersized buffer is a named
                     # refusal instead of silent aliasing.
                     t0 = time.perf_counter()
-                    moved = _deposit_band(ops, d_stream, unit.descs, batch,
-                                          base)
+                    if pcie_uuid:
+                        from sglang.srt.managers.weg2_memory_saver import (
+                            pcie_transfer_lock,
+                        )
+                        with pcie_transfer_lock(
+                            nvml_uuid=pcie_uuid, direction=pcie_direction,
+                            label=f"deposit band seq={batch.seq}",
+                        ):
+                            moved = _deposit_band(ops, d_stream, unit.descs,
+                                                  batch, base)
+                    else:
+                        moved = _deposit_band(ops, d_stream, unit.descs,
+                                              batch, base)
                     # The deposit MUST land before the collect reads the slot;
                     # this is the one synchronisation the pipeline cannot
                     # elide, and it is why the two halves are on two streams
@@ -1500,11 +1521,16 @@ def run_bounce_leg(
                         # (this function's whole point) does not fix this by
                         # itself; a future seat should reconcile it before
                         # trusting `mode=shadow` under a real Option-1 cap.
-                        _compare_band(ops, c_stream, unit.descs, batch, base,
-                                      bounce.slot_address(int(depth)), verdict)
+                        with pcie_copy_lock(pcie_uuid, pcie_direction):
+                            _compare_band(ops, c_stream, unit.descs, batch,
+                                          base,
+                                          bounce.slot_address(int(depth)),
+                                          verdict)
                     else:
-                        collected += _collect_band(ops, c_stream, unit.descs,
-                                                   batch, base)
+                        with pcie_copy_lock(pcie_uuid, pcie_direction):
+                            collected += _collect_band(ops, c_stream,
+                                                       unit.descs, batch,
+                                                       base)
                         inflight[slot] = batch
                     if rendezvous is not None and phase == PHASE_COLLECT:
                         ops.synchronize(c_stream)
@@ -1623,6 +1649,21 @@ def run_bounce_leg(
 #: authorities become one number, and a genuinely dead peer still dies at
 #: the same moment the deadman would kill the boot anyway.
 LANE_RENDEZVOUS_BUDGET_S = 600.0
+
+
+class _NullLock:
+    def __enter__(self): return self
+    def __exit__(self, *a): return False
+
+
+def pcie_copy_lock(pcie_uuid, pcie_direction):
+    """The per-copy PCIe serialisation, or a no-op when no uuid is given."""
+    if not pcie_uuid:
+        return _NullLock()
+    from sglang.srt.managers.weg2_memory_saver import pcie_transfer_lock
+    return pcie_transfer_lock(nvml_uuid=pcie_uuid,
+                              direction=pcie_direction,
+                              label="collect band")
 
 
 class CrossSlotRendezvous:

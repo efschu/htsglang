@@ -584,6 +584,23 @@ class SchedulerWeightUpdaterManager:
         return -1.0
 
     @contextmanager
+    def _weg2_pcie_lock_retired(self, label: str, direction: Optional[str] = None):
+        """#1378 xsn36: the WHOLE-LEG card lock is retired for the flip legs.
+
+        It deadlocked the co-located pair by construction: the holder waits
+        INSIDE it for the sibling's semaphore posts, which the sibling cannot
+        produce without the same lock (measured twice -- weg2xsn35's
+        PcieLockTimeout held=124.45s vs budget 120s, weg2xsn36's W68 after a
+        FULL 600 s wait). The serialisation moved per COPY into
+        ``run_bounce_leg`` (``pcie_uuid``); the rendezvous waits sit outside
+        every lock. Named no-op rather than deleted so the call sites keep
+        their shape auditable; the OTHER pcie-lock users (the disk reloads)
+        keep the real lock -- they are single copies with no rendezvous wait
+        inside.
+        """
+        import contextlib
+        return contextlib.nullcontext()
+
     def _weg2_pcie_lock(self, label: str, direction: Optional[str] = None) -> Iterator[None]:
         """Serialise this card's host<->device transfer against its sibling.
 
@@ -3236,6 +3253,18 @@ class SchedulerWeightUpdaterManager:
         except BaseException as exc:  # noqa: BLE001 -- fail-closed observer
             return f"proof-failed:{_weg2_exc_note(exc)}"
 
+    def _weg2_leg_pcie_uuid(self):
+        """THIS rank's NVML uuid for the leg's per-copy locks, fail-soft.
+
+        A stubbed caller (the smoke/replay harnesses borrow this path) has no
+        card cache -- it gets ``None`` and the leg runs unserialised, exactly
+        like the pre-lock boots. Never raises: the leg must not die on an
+        instrument."""
+        try:
+            return self._weg2_card_uuid()
+        except BaseException:  # noqa: BLE001
+            return None
+
     def _weg2_rank_param_table(self):
         """Every live parameter THIS PROCESS holds, across BOTH its runners.
 
@@ -4485,6 +4514,15 @@ class SchedulerWeightUpdaterManager:
                             depth=depth, terms=terms, mode=resolved_mode,
                             shm_root=root, device=device, phase=phase,
                             rendezvous=rv,
+                            # #1378 xsn36: the card lock lives INSIDE the leg
+                            # now, per copy -- never across a rendezvous wait
+                            # (the co-located pair on the 5090 deadlocked
+                            # through the whole-leg lock: the holder waited
+                            # for the sibling's post, which the sibling could
+                            # not produce without the same lock).
+                            pcie_uuid=self._weg2_leg_pcie_uuid(),
+                            pcie_direction=("d2h" if phase == bx.PHASE_DEPOSIT
+                                            else "h2d"),
                             # ONE BUFFER PER LANE. Keyed on the boot alone, the
                             # six ranks' concurrent legs each obeyed their own
                             # handshake and then all wrote slot 0 of ONE file
@@ -5002,7 +5040,11 @@ class SchedulerWeightUpdaterManager:
             # THE DEPOSIT, BEFORE THE PAGES GO. The pause below releases the
             # weight tags; a deposit after it would read pages this rank has
             # already given back. weg2xsn25 ran with no depositor at all.
-            with self._weg2_pcie_lock("sleep-D2H " + ",".join(weights_tags), direction="d2h"):
+            # #1378 xsn36: RETIRED as a whole-leg lock -- it deadlocked the
+            # co-located pair (weg2xsn35/36). The serialisation now happens
+            # per COPY inside run_bounce_leg (pcie_uuid); the waits between
+            # the copies stay outside every lock.
+            with self._weg2_pcie_lock_retired("sleep-D2H " + ",".join(weights_tags)):
                 for tag in weights_tags:
                     weg2_ring_guard.guard_tag(
                         tag,
@@ -5264,7 +5306,8 @@ class SchedulerWeightUpdaterManager:
             credit, credit_epoch = self._weg2_credit_reader(
                 getattr(recv_req, "epoch", None)
             )
-            with self._weg2_pcie_lock("wake-H2D " + ",".join(weights_tags), direction="h2d"):
+            # #1378 xsn36: RETIRED, same shape as the sleep leg above.
+            with self._weg2_pcie_lock_retired("wake-H2D " + ",".join(weights_tags)):
                 for tag in weights_tags:
                     # C14: the device bytes this tag needs may only exist once
                     # the co-located SLEEPING rank has released them, and with

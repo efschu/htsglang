@@ -178,6 +178,8 @@ class _Stub:
     # is exactly what the production code does without the share.
     _weg2_draft_lm_head_is_target_share = (
         wu.SchedulerWeightUpdaterManager._weg2_draft_lm_head_is_target_share)
+    _weg2_leg_pcie_uuid = (
+        wu.SchedulerWeightUpdaterManager._weg2_leg_pcie_uuid)
 
     def __init__(self, model):
         self.tp_worker = _Worker(model)
@@ -193,6 +195,12 @@ class _LegStub:
     """
 
     _weg2_xchg_bounce_leg = wu.SchedulerWeightUpdaterManager._weg2_xchg_bounce_leg
+    # #1378 xsn36: the bounce leg resolves the card uuid for the per-copy
+    # lock; on this stub it resolves to None (fail-soft, unserialised) --
+    # the smoke has no real card to serialise against.
+    _weg2_card_uuid = wu.SchedulerWeightUpdaterManager._weg2_card_uuid
+    _weg2_leg_pcie_uuid = wu.SchedulerWeightUpdaterManager._weg2_leg_pcie_uuid
+    weg2_card_uuid_cache = "unset"
 
 
 class _Sems:
