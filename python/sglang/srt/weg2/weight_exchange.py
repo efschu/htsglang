@@ -2499,6 +2499,100 @@ def exchange_armed() -> bool:
     return weight_source() == WEIGHT_SOURCE_EXCHANGE
 
 
+#: #1369: THE 46.40 GiB HOST RING'S OWN OFF-SWITCH -- user order 2026-09-14,
+#: verbatim: "DIE 48GB MUESSEN WEG... wenn es korrekt implementiert ist
+#: braucht es NIEMALS einen Rueckfall". Published to BOTH ranks exactly as
+#: ``INJECT_ENV`` is (``prepare_xchg_env`` -> ``build_env``, never a second
+#: channel), because the decision is read from TWO places that must never
+#: disagree: the launcher's own process (which has ``ns.weg2_weights_cpu_backup``
+#: on its argv and passes it as ``explicit``) and every rank (which has no
+#: argv and reads this environment variable instead) -- the same split
+#: :func:`inject_mode` exists for, and for the same reason: S6 fix E measured
+#: that a launcher-process caller with no ``explicit`` silently read its own
+#: (unset) environment instead of the boot's real arm.
+WEIGHTS_CPU_BACKUP_ENV = "SGLANG_WEG2_WEIGHTS_CPU_BACKUP"
+WEIGHTS_CPU_BACKUP_AUTO = "auto"
+WEIGHTS_CPU_BACKUP_ON = "on"
+WEIGHTS_CPU_BACKUP_OFF = "off"
+WEIGHTS_CPU_BACKUP_CHOICES = (
+    WEIGHTS_CPU_BACKUP_AUTO, WEIGHTS_CPU_BACKUP_ON, WEIGHTS_CPU_BACKUP_OFF,
+)
+
+WEIGHTS_CPU_BACKUP_MODE_REFUSAL_MARKER = "W107 Weg2WeightsCpuBackupModeUnknown"
+
+
+class Weg2WeightsCpuBackupModeUnknown(RuntimeError):
+    """W107 -- an unrecognised ``--weg2-weights-cpu-backup`` / env value.
+
+    Unlike :func:`inject_mode` (whose typo-guard is "anything unrecognised
+    silently becomes the safe arm"), THIS predicate refuses by name instead:
+    the safe arm here is not obvious in one direction the way ``shadow`` is
+    for injection -- a silent fallback to ``auto`` on a boot that TYPED
+    ``on`` for an explicit A/B comparison would run the experiment it was
+    told not to, indistinguishably from one that ran it correctly, and a
+    silent fallback to ``off`` would delete the ring under a typo nobody
+    asked to delete it under. Named per #1256 (an advisory nobody reads is
+    worse than no advisory) one axis over: a GUARD nobody can trust because
+    it might have silently guessed is worse than a guard that refuses.
+    """
+
+
+def weights_cpu_backup_armed(*, explicit: Optional[str] = None) -> bool:
+    """Bekommt die WEIGHTS-Region Host-Ring-Backup?
+
+    ``auto`` (default): ``not exchange_armed()`` -- under an ARMED exchange
+    the exchange itself is the weight source at the wake seam, so a host ring
+    that ALSO refills the same bytes is exactly the "fallback nobody asked
+    for" the user's order names: "auf der Festplatte liegt ein Snapshot. Das
+    ist auch ein Rueckfall. Aber wenn es korrekt implementiert ist, braucht
+    es NIEMALS einen Rueckfall." Under an un-armed exchange (``ring``, the
+    weight source today) the ring IS the source and stays backed exactly as
+    every pre-#1369 boot was.
+
+    ``on``: always ``True``, REGARDLESS of ``exchange_armed()``. This is a
+    COMPARISON INSTRUMENT for one A/B boot only (does the ring's presence
+    change anything measurable when the exchange already owns the bytes),
+    never a design claim that the ring should ride along with an armed
+    exchange -- the user's order forecloses that claim, it does not need
+    this flag to re-litigate it.
+
+    ``off``: always ``False``, regardless of arm -- the hard kill switch,
+    for a boot that wants to prove the exchange really needs no fallback at
+    all, including under ``ring``.
+
+    ``explicit`` is read FIRST and, if it parses, wins outright -- the
+    :func:`inject_mode` lesson: a value only the launcher's own argv has
+    (``ns.weg2_weights_cpu_backup``) must be handed in by the one caller that
+    holds it, because that caller's own environment was never written by
+    itself (the launcher publishes ``WEIGHTS_CPU_BACKUP_ENV`` into the
+    RANKS' environment via ``build_env``, never into its own). A caller with
+    no ``explicit`` -- every rank -- falls through to the environment.
+
+    An EMPTY value (unset argv default, unset/blank environment) is ``auto``,
+    the documented default, not a refusal: absence must not read as a typo.
+    A NON-EMPTY, UNRECOGNISED value -- typed, but not one of the three -- is
+    refused by name (W107) rather than guessed in either direction.
+    """
+    if explicit is not None and str(explicit).strip():
+        value = str(explicit).strip().lower()
+    else:
+        value = (os.environ.get(WEIGHTS_CPU_BACKUP_ENV, "") or "").strip().lower()
+    if not value:
+        value = WEIGHTS_CPU_BACKUP_AUTO
+    if value not in WEIGHTS_CPU_BACKUP_CHOICES:
+        raise Weg2WeightsCpuBackupModeUnknown(
+            f"{WEIGHTS_CPU_BACKUP_MODE_REFUSAL_MARKER}: "
+            f"--weg2-weights-cpu-backup/{WEIGHTS_CPU_BACKUP_ENV}={value!r} is "
+            f"not one of {WEIGHTS_CPU_BACKUP_CHOICES}. Refusing rather than "
+            f"guessing which side of a 46.40 GiB host ring a typo meant."
+        )
+    if value == WEIGHTS_CPU_BACKUP_ON:
+        return True
+    if value == WEIGHTS_CPU_BACKUP_OFF:
+        return False
+    return not exchange_armed()
+
+
 def shadow_armed() -> bool:
     """Does the shadow run beside the ring?  Never implies :func:`exchange_armed`."""
     return weight_source() == WEIGHT_SOURCE_SHADOW
