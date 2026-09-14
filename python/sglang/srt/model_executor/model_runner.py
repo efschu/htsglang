@@ -2461,20 +2461,22 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # (is_draft_worker and enable_draft_weights_cpu_backup)` with NO arm
         # predicate -- the weg2 launcher passes `--enable-weights-cpu-backup`
         # UNCONDITIONALLY (`launcher.py` `common_flags`), so the host backup
-        # ring was armed for the weights region on every arm, including
-        # `--weg2-weight-source exchange`, where the peer-VRAM bounce is
-        # already the wake's byte source and the ring is a 48.672-MiB/card
-        # fallback nothing reads (measured,
+        # ring was armed for the weights region on every arm, including the
+        # one case where nothing reads it (measured,
         # `/spinning/gpu-arb/weg2/ANALYSE_1369_RINGLESER_0913.md`).
         # `weights_cpu_backup_armed()` ANDs an arm predicate onto the SAME
-        # expression: `auto` (default) is `not exchange_armed()`, so `ring`
-        # and `shadow` are BYTE-IDENTICAL to before (`shadow` still needs the
-        # ring as its compare ground, see the function's docstring) and only
-        # `exchange` changes. `on` reproduces the old unconditional value
-        # exactly, byte for byte -- a comparison instrument, never a design
-        # assumption. See `weights_cpu_backup_armed.__doc__` for `off` and for
-        # why the predicate is spelled as an AND on the outside rather than
-        # threaded into the disjunction below.
+        # expression. DELIBERATELY NOT DUPLICATED HERE: which arm/inject
+        # combination that predicate treats as "ring not needed" is decided
+        # ONCE, in `weights_cpu_backup_armed`'s own docstring -- a formula
+        # copied into a second comment is the next instance of the class of
+        # bug #1369 step 1 fix (`a033f2926a`) already corrected once (`auto`
+        # was briefly, wrongly, `not exchange_armed()`; see that function's
+        # docstring for why bare `exchange_armed()` was insufficient and
+        # which single combination actually drops the ring). `on` reproduces
+        # the old unconditional value exactly, byte for byte -- a comparison
+        # instrument, never a design assumption. The predicate is ANDed onto
+        # the outside of the untouched old disjunction, never threaded into
+        # it, so this line cannot silently re-derive the arm/inject axis.
         enable_cpu_backup = weights_cpu_backup_armed() and (
             self.server_args.enable_weights_cpu_backup
             or (self.is_draft_worker and self.server_args.enable_draft_weights_cpu_backup)
