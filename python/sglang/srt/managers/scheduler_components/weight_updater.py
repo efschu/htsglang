@@ -4548,27 +4548,27 @@ class SchedulerWeightUpdaterManager:
                             budget_s=tp.LANE_PERMIT_TIMEOUT_S, lane=_lane_key,
                             boot=str(boot_nonce))
                     try:
-                        last = bx.run_bounce_leg(
-                            group, ops, boot_nonce, slot_bytes=slot_bytes,
-                            depth=depth, terms=terms, mode=resolved_mode,
+                        # #1378 xsn45 (THE WIRING): the sequential unit
+                        # transport replaces the lane machinery on this leg.
+                        # The units: one per desc, with this rank's own
+                        # addresses (the deposit: its src_ptr; the collect:
+                        # its dst_ptr). The buffer digest and the digest
+                        # record live inside run_sequential_units; the
+                        # liveness callback threads through.
+                        seq_units = [
+                            (str(getattr(d, "param_name",
+                                          getattr(d, "name", f"desc{j}"))),
+                             str(getattr(d, "tag", "")),
+                             int(getattr(d, "nbytes", 0)),
+                             (int(d.src_ptr)
+                              if getattr(d, "src_ptr", None) else None),
+                             (int(d.dst_ptr)
+                              if getattr(d, "dst_ptr", None) else None))
+                            for j, d in enumerate(plan.descs)]
+                        last = bx.run_sequential_units(
+                            seq_units, ops, boot_nonce,
                             shm_root=root, device=device, phase=phase,
-                            rendezvous=rv,
-                            # #1378 xsn36: the card lock lives INSIDE the leg
-                            # now, per copy -- never across a rendezvous wait
-                            # (the co-located pair on the 5090 deadlocked
-                            # through the whole-leg lock: the holder waited
-                            # for the sibling's post, which the sibling could
-                            # not produce without the same lock).
-                            pcie_uuid=self._weg2_leg_pcie_uuid(),
-                            pcie_direction=("d2h" if phase == bx.PHASE_DEPOSIT
-                                            else "h2d"),
                             liveness=self._weg2_cocard_peer_alive,
-                            # ONE BUFFER PER LANE. Keyed on the boot alone, the
-                            # six ranks' concurrent legs each obeyed their own
-                            # handshake and then all wrote slot 0 of ONE file
-                            # -- silent cross-pair corruption, measured in the
-                            # desk replay.
-                            lane=_lane_key,
                             # #1358: the identity the host-slot lines carry.
                             # This is the only frame where the group and the
                             # rank both exist.
@@ -4592,9 +4592,6 @@ class SchedulerWeightUpdaterManager:
                             # instances that happened to exist, and it
                             # matches what the emitter already does one frame
                             # down, where an absent group prints as `group=?`.
-                            leg_group=str(_weg2_identity(self, "_weg2_group_name", "")),
-                            leg_rank=int(_weg2_identity(self, "_weg2_rank", -1)),
-                            leg_name=f"{boot_nonce}/{hook}",
                             log=logger.info)
                     finally:
                         if _lane_permit_active:
