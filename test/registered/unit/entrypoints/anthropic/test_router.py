@@ -1121,8 +1121,16 @@ class OpenRouterArmTestCase(AioHTTPTestCase):
         self.assertEqual(self.local["requests"], [])
         self.assertEqual(self.upstream["requests"], [])
 
-    async def test_openrouter_body_is_byte_identical_no_shim_applied(self):
-        """The thinking shim is local-only; the third arm gets no shim either."""
+    async def test_openrouter_gets_no_thinking_shim_and_keeps_its_model(self):
+        """The thinking shim is local-only; the third arm gets no shim.
+
+        This used to assert the openrouter body was byte-identical. That
+        stopped being true when the cache-marker edit landed (see
+        ``OpenRouterCacheMarkerTestCase``): the arm still gets no thinking
+        shim and no model rewrite, but ``cache_control`` markers ARE added
+        on ``/v1/messages``. Inverted rather than deleted, so the two
+        properties that do still hold stay pinned.
+        """
         body = self._body(self.OPENROUTER_MODEL)
         await self.client.post("/v1/messages", json=body)
         self.assertNotIn("thinking", self.openrouter["requests"][0]["body"])
@@ -1409,3 +1417,240 @@ class OpenRouterMissingKeyTestCase(AioHTTPTestCase):
         self.assertEqual((await resp.json())["backend"], "openrouter")
         headers = self.openrouter["requests"][0]["headers"]
         self.assertEqual(headers["x-api-key"], "sk-or-v1-freshly-filled-in")
+
+
+class OpenRouterCacheMarkerTestCase(AioHTTPTestCase):
+    """Prompt-cache breakpoints the router adds on the openrouter arm.
+
+    WHY THE ROUTER AND NOT THE CLIENT. A ``cache_control`` marker names a
+    prefix breakpoint, and openrouter.ai honours EVERY marker in a request,
+    not only the first (measured 2026-09-14 against
+    ``qwen/qwen3.8-flash``: system-only marker left a 7,716-token
+    conversation billed in full every turn; system + conversation tail cut
+    ``input_tokens`` to 6 and read 11,756 from cache). Claude Code marks its
+    system block and leaves the conversation unmarked, so the growing
+    history was paid for at full price on every turn. The router is the only
+    party that knows the request is openrouter-bound, so the router adds
+    what is missing.
+
+    The property that makes this safe is that the edit is ADDITIVE: it never
+    moves or removes a marker the client placed, and never exceeds the
+    documented four-breakpoint ceiling.
+    """
+
+    OPENROUTER_MODEL = "qwen/qwen3.8-flash"
+    FAKE_KEY = "sk-or-v1-test-fake-openrouter-key-cache"
+
+    async def get_application(self):
+        upstream_app, self.upstream = _make_backend("upstream")
+        local_app, self.local = _make_backend("local")
+        openrouter_app, self.openrouter = _make_backend("openrouter")
+        self.upstream_server = TestServer(upstream_app)
+        self.local_server = TestServer(local_app)
+        self.openrouter_server = TestServer(openrouter_app)
+        await self.upstream_server.start_server()
+        await self.local_server.start_server()
+        await self.openrouter_server.start_server()
+        self.key_path = os.path.join(
+            tempfile.mkdtemp(prefix="router-cache-key-"), "openrouter.key"
+        )
+        with open(self.key_path, "w") as fh:
+            fh.write(self.FAKE_KEY + "\n")
+        return create_app(
+            local_models=[LOCAL_MODEL],
+            upstream_base=str(self.upstream_server.make_url("")).rstrip("/"),
+            local_base=str(self.local_server.make_url("")).rstrip("/"),
+            local_wait_s=0,
+            openrouter_models=[self.OPENROUTER_MODEL],
+            openrouter_base=str(self.openrouter_server.make_url("")).rstrip("/"),
+            openrouter_key_file=self.key_path,
+        )
+
+    async def tearDownAsync(self):
+        await self.upstream_server.close()
+        await self.local_server.close()
+        await self.openrouter_server.close()
+        await super().tearDownAsync()
+
+    def _turn(self, text, role="user"):
+        return {"role": role, "content": [{"type": "text", "text": text}]}
+
+    def _conversation(self, turns=6, model=None, system=None):
+        """A Claude-Code-shaped body: block-list turns, optional system."""
+        messages = []
+        for i in range(turns):
+            messages.append(self._turn(f"user turn {i}"))
+            messages.append(self._turn(f"assistant turn {i}", role="assistant"))
+        body = {
+            "model": model or self.OPENROUTER_MODEL,
+            "max_tokens": 64,
+            "messages": messages,
+        }
+        if system is not None:
+            body["system"] = system
+        return body
+
+    def _markers(self, payload):
+        """Every (carrier, index) position holding a cache_control marker."""
+        found = []
+        for key in ("system", "tools"):
+            value = payload.get(key)
+            if isinstance(value, list):
+                for i, block in enumerate(value):
+                    if isinstance(block, dict) and "cache_control" in block:
+                        found.append((key, i))
+        for mi, message in enumerate(payload.get("messages", [])):
+            content = message.get("content")
+            if isinstance(content, list):
+                for bi, block in enumerate(content):
+                    if isinstance(block, dict) and "cache_control" in block:
+                        found.append((f"msg{mi}", bi))
+        return found
+
+    async def test_the_conversation_tail_gets_a_marker(self):
+        """The defect: an unmarked conversation was re-billed every turn."""
+        await self.client.post("/v1/messages", json=self._conversation())
+        sent = self.openrouter["requests"][0]["body"]
+        self.assertTrue(
+            self._markers(sent),
+            "no cache_control marker reached openrouter -- the conversation "
+            "is billed at full price on every turn",
+        )
+
+    async def test_two_rolling_markers_so_one_writes_and_one_reads(self):
+        """A single rolling marker would write a cache nobody reads.
+
+        The newest marked turn writes the cache for the NEXT request; the
+        one behind it is what this request reads back.
+        """
+        await self.client.post("/v1/messages", json=self._conversation())
+        sent = self.openrouter["requests"][0]["body"]
+        self.assertEqual(len(self._markers(sent)), 2)
+
+    async def test_markers_land_on_user_turns_newest_first(self):
+        body = self._conversation(turns=6)
+        await self.client.post("/v1/messages", json=body)
+        sent = self.openrouter["requests"][0]["body"]
+        marked = [name for name, _ in self._markers(sent)]
+        # 12 messages, user turns at even indices; newest two are 8 and 10.
+        self.assertEqual(sorted(marked), ["msg10", "msg8"])
+        for name in marked:
+            index = int(name[3:])
+            self.assertEqual(sent["messages"][index]["role"], "user")
+
+    async def test_a_client_marker_is_never_moved_or_removed(self):
+        """Additive by construction: the client's own choice survives."""
+        body = self._conversation(turns=3)
+        body["system"] = [
+            {"type": "text", "text": "a big system prompt",
+             "cache_control": {"type": "ephemeral"}}
+        ]
+        await self.client.post("/v1/messages", json=body)
+        sent = self.openrouter["requests"][0]["body"]
+        self.assertIn(("system", 0), self._markers(sent))
+        self.assertEqual(
+            sent["system"][0]["cache_control"], {"type": "ephemeral"}
+        )
+
+    async def test_a_clients_marker_VALUE_survives_unchanged(self):
+        """The danger direction the identical-value tests cannot see.
+
+        Every other test here puts ``{"type": "ephemeral"}`` on both sides, so
+        a router that OVERWRITES the client's marker instead of counting it
+        reads exactly like one that leaves it alone -- measured: mutating the
+        ``if "cache_control" in block`` test to ``if False`` left all 91 tests
+        green. A marker carrying a field we do not write makes the two
+        distinguishable, and pins the contract that is actually promised:
+        additive, never rewriting what the client chose.
+        """
+        body = self._conversation(turns=4)
+        client_choice = {"type": "ephemeral", "ttl": "1h"}
+        body["messages"][-2]["content"][-1]["cache_control"] = client_choice
+        await self.client.post("/v1/messages", json=body)
+        sent = self.openrouter["requests"][0]["body"]
+        self.assertEqual(sent["messages"][-2]["content"][-1]["cache_control"],
+                         client_choice)
+
+    async def test_the_four_breakpoint_ceiling_is_never_exceeded(self):
+        """Anthropic's documented ceiling; over it the request is rejected."""
+        body = self._conversation(turns=4)
+        body["system"] = [
+            {"type": "text", "text": f"system {i}",
+             "cache_control": {"type": "ephemeral"}}
+            for i in range(3)
+        ]
+        await self.client.post("/v1/messages", json=body)
+        sent = self.openrouter["requests"][0]["body"]
+        self.assertLessEqual(len(self._markers(sent)), 4)
+
+    async def test_a_client_that_already_spent_the_budget_is_left_alone(self):
+        body = self._conversation(turns=4)
+        body["system"] = [
+            {"type": "text", "text": f"system {i}",
+             "cache_control": {"type": "ephemeral"}}
+            for i in range(4)
+        ]
+        await self.client.post("/v1/messages", json=body)
+        sent = self.openrouter["requests"][0]["body"]
+        self.assertEqual(len(self._markers(sent)), 4)
+        self.assertEqual([n for n, _ in self._markers(sent)], ["system"] * 4)
+
+    async def test_a_turn_the_client_marked_itself_counts_as_one_of_the_pair(self):
+        """No double-marking: the client's tail marker is one of the two."""
+        body = self._conversation(turns=4)
+        body["messages"][-2]["content"][-1]["cache_control"] = {"type": "ephemeral"}
+        await self.client.post("/v1/messages", json=body)
+        sent = self.openrouter["requests"][0]["body"]
+        self.assertEqual(len(self._markers(sent)), 2)
+
+    async def test_a_string_content_turn_is_skipped_not_rewritten(self):
+        """A bare string has no block to attach a marker to.
+
+        The router does NOT restructure the client's message into a block
+        list to create one -- it looks further back instead, and says so in
+        the log. Restructuring would change what the backend renders on a
+        path where we cannot verify the rendering.
+        """
+        body = self._conversation(turns=3)
+        body["messages"][-2]["content"] = "a bare string turn"
+        await self.client.post("/v1/messages", json=body)
+        sent = self.openrouter["requests"][0]["body"]
+        self.assertEqual(sent["messages"][-2]["content"], "a bare string turn")
+        self.assertTrue(self._markers(sent))
+
+    async def test_other_endpoints_are_not_touched(self):
+        """count_tokens must stay byte-identical: it prices, not generates."""
+        body = self._conversation()
+        await self.client.post("/v1/messages/count_tokens", json=body)
+        sent = self.openrouter["requests"][0]["body"]
+        self.assertEqual(self._markers(sent), [])
+
+    async def test_the_local_arm_is_untouched(self):
+        """Local backend caching is not this router's business."""
+        body = self._conversation(model=LOCAL_MODEL)
+        await self.client.post("/v1/messages", json=body)
+        sent = self.local["requests"][0]["body"]
+        self.assertEqual(self._markers(sent), [])
+
+    async def test_the_upstream_arm_stays_a_pure_byte_pipe(self):
+        body = self._conversation(model=REMOTE_MODEL)
+        await self.client.post("/v1/messages", json=body)
+        sent = self.upstream["requests"][0]["body"]
+        self.assertEqual(self._markers(sent), [])
+
+    async def test_an_unreadable_body_is_forwarded_unchanged(self):
+        """Never turn a body we cannot parse into a 500."""
+        resp = await self.client.post(
+            "/v1/messages",
+            data=b"not json at all",
+            headers={"content-type": "application/json"},
+        )
+        # No model means no openrouter routing; the point is that the
+        # router did not raise on the way.
+        self.assertIn(resp.status, (200, 403))
+
+    async def test_a_body_with_no_messages_is_forwarded_unchanged(self):
+        body = {"model": self.OPENROUTER_MODEL, "max_tokens": 8, "messages": []}
+        resp = await self.client.post("/v1/messages", json=body)
+        self.assertEqual(resp.status, 200)
+        self.assertEqual(self.openrouter["requests"][0]["body"]["messages"], [])

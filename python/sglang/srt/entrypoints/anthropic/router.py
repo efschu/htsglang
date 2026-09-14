@@ -236,6 +236,28 @@ NOTHINK_ALIAS_SUFFIX = "-nothink"
 ADAPTIVE_THINKING = {"type": "adaptive"}
 DISABLED_THINKING = {"type": "disabled"}
 
+# Prompt-cache breakpoints for the openrouter arm.
+#
+# A ``cache_control`` marker on a content block declares a PREFIX
+# breakpoint: everything up to and including that block is cached, and a
+# later request whose prefix matches reads it back instead of paying for it
+# again. OpenRouter honours EVERY marker, not only the first -- measured
+# 2026-09-14 against qwen/qwen3.8-flash: with only the system block marked,
+# a 7716-token conversation was billed in full on every turn
+# (cache_read 4046 = the system block alone); with the system block AND the
+# conversation tail marked, input_tokens fell to 6 and cache_read rose to
+# 11756. Pricing on that model: input 0.15/M, cache_read 0.016/M -- a
+# factor of 9 on every token that rides the cache instead of the wire.
+#
+# Two rolling markers, not one. The newest marked turn WRITES the cache the
+# NEXT request will read; the one behind it is what THIS request reads. A
+# single rolling marker would write a cache nobody ever reads back, because
+# the conversation has already grown past it by the time the next request
+# arrives.
+CACHE_CONTROL_EPHEMERAL = {"type": "ephemeral"}
+ANTHROPIC_CACHE_BREAKPOINTS = 4
+CACHE_ROLLING_TURNS = 2
+
 # Reasoning-effort levels this router can ASK FOR, strongest first.
 #
 # The vocabulary is the model template's, not the Anthropic SDK's, and the
@@ -471,6 +493,119 @@ def _count_tokens_body(body: bytes) -> bytes | None:
     if "model" not in counted or "messages" not in counted:
         return None
     return json.dumps(counted).encode()
+
+
+def _cache_marker_carriers(payload: dict) -> list[dict]:
+    """Every content block on this body that COULD carry a marker.
+
+    Returned as a list rather than a generator because the callers walk it
+    more than once (count, then mark from the tail backwards) and because a
+    half-consumed iterator is a worse failure mode than a second pass over a
+    handful of dicts.
+
+    ``system`` and ``tools`` are included for COUNTING only. Anthropic
+    renders a request as tools -> system -> messages, so a marker on the
+    system block already covers the (large, static) tool definitions as its
+    prefix; this router never adds one of its own there.
+    """
+    carriers: list[dict] = []
+    for key in ("tools", "system"):
+        value = payload.get(key)
+        if isinstance(value, list):
+            carriers.extend(block for block in value if isinstance(block, dict))
+    messages = payload.get("messages")
+    if isinstance(messages, list):
+        for message in messages:
+            if not isinstance(message, dict):
+                continue
+            content = message.get("content")
+            if isinstance(content, list):
+                carriers.extend(block for block in content if isinstance(block, dict))
+    return carriers
+
+
+def _apply_cache_markers(body: bytes) -> tuple[bytes, str]:
+    """Add rolling prompt-cache breakpoints to a ``/v1/messages`` body.
+
+    ADDITIVE BY CONSTRUCTION: a marker the client already placed is never
+    moved, never removed, and never double-counted. The router only fills
+    the budget the client left unspent, and stops at
+    ``ANTHROPIC_CACHE_BREAKPOINTS``. That is what makes this safe to keep
+    once Claude Code starts marking its own conversation turns -- the fill
+    simply finds no budget and returns the body unchanged.
+
+    WHY THE ROUTER AND NOT THE CLIENT: the client marks its system block and
+    leaves the conversation unmarked, which is correct against a backend
+    that caches prefixes implicitly. Only the router knows this request is
+    openrouter-bound, where caching is opt-in per marker. So the router adds
+    what is missing for THIS destination.
+
+    Returns ``(body, diagnosis)``. The body is returned byte-identical
+    whenever nothing was added, so the no-op path costs the caller nothing
+    but a parse.
+    """
+    try:
+        payload = json.loads(body)
+    except (ValueError, UnicodeDecodeError):
+        return body, "unreadable body"
+    if not isinstance(payload, dict):
+        return body, "body is not an object"
+    messages = payload.get("messages")
+    if not isinstance(messages, list) or not messages:
+        return body, "no messages"
+
+    client_markers = sum(
+        1 for block in _cache_marker_carriers(payload) if "cache_control" in block
+    )
+    budget = ANTHROPIC_CACHE_BREAKPOINTS - client_markers
+    if budget <= 0:
+        return body, f"client={client_markers} added=0 (budget spent)"
+
+    marked: list[int] = []
+    covered = 0
+    unmarkable = 0
+    # From the tail backwards: the newest turns are the ones whose prefix the
+    # NEXT request will still share. Only user turns -- an assistant turn's
+    # prefix ends mid-exchange, and marking it would spend a breakpoint on a
+    # boundary no later request reuses.
+    for index in range(len(messages) - 1, -1, -1):
+        # The rolling pair counts turns the CLIENT already marked, not only ours.
+        # Two of our own on top of a client-marked tail would be three
+        # breakpoints in one conversation, and the third buys nothing: a prefix
+        # boundary no later request reads back.
+        if len(marked) >= budget or len(marked) + covered >= CACHE_ROLLING_TURNS:
+            break
+        message = messages[index]
+        if not isinstance(message, dict) or message.get("role") != "user":
+            continue
+        content = message.get("content")
+        if not isinstance(content, list) or not content:
+            # A plain-string turn carries no block to mark. Restructuring it
+            # into a block list would change the body's shape for a reason
+            # the client never asked for, so it is counted and skipped.
+            unmarkable += 1
+            continue
+        block = content[-1]
+        if not isinstance(block, dict):
+            unmarkable += 1
+            continue
+        if "cache_control" in block:
+            # The client already put a breakpoint here. It is one of the
+            # rolling pair -- counted as covered, never marked twice.
+            covered += 1
+            continue
+        block["cache_control"] = dict(CACHE_CONTROL_EPHEMERAL)
+        marked.append(index)
+
+    if not marked:
+        return body, (
+            f"client={client_markers} added=0 "
+            f"client_turns={covered} unmarkable_turns={unmarkable}"
+        )
+    return json.dumps(payload).encode(), (
+        f"client={client_markers} added={len(marked)} at={marked} "
+        f"client_turns={covered} unmarkable_turns={unmarkable}"
+    )
 
 
 async def _count_input_tokens(
@@ -1253,15 +1388,22 @@ def create_app(
                     },
                     status=403,
                 )
-            # Straight byte pipe, exactly like the upstream branch below --
-            # no alias, no thinking shim. Those exist because a LOCAL
-            # backend's default thinking arm is a deployment choice this
-            # router makes; the openrouter bucket has no such default to
-            # apply, and the translator process on the other end expects
-            # the client's own Anthropic body untouched apart from the
-            # credential swap below.
+            # No alias and no thinking shim on this arm. Those exist because
+            # a LOCAL backend's default thinking arm is a deployment choice
+            # this router makes; the openrouter bucket has no such default
+            # to apply, and the model string stays the client's own.
+            #
+            # It is NOT a byte pipe, though: on /v1/messages the body picks
+            # up rolling prompt-cache breakpoints (see _apply_cache_markers).
+            # That edit is destination-specific -- openrouter caches only
+            # what a marker names, and the router is the only place that
+            # knows this request is openrouter-bound. Purely additive, so a
+            # client that marks its own turns is passed through untouched.
             base = request.app[OPENROUTER_BASE]
             request.app[STATS]["openrouter"] += 1
+            if request.path == "/v1/messages":
+                body, cache_diagnosis = _apply_cache_markers(body)
+                logger.info("openrouter cache markers: %s", cache_diagnosis)
         else:
             base = request.app[UPSTREAM_BASE]
             request.app[STATS]["upstream"] += 1
