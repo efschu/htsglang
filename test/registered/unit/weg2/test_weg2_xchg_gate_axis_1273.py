@@ -482,25 +482,117 @@ class TestTheCompareGroundExistsOnThisArm(CustomTestCase):
             self.assertNotIn(predicate, decider_lines[0])
 
     def test_the_launcher_passes_the_flag_unconditionally(self):
-        """``common_flags`` -- both groups, every arm. If this ever becomes
-        conditional on the weight source, THIS test is what says the shadow's
-        ground truth just became arm-dependent."""
+        """SUPERSEDED by #1369 (user order 2026-09-14, "DIE 48GB MUESSEN WEG.
+        UND ZWAR PRONTO") -- an INVERSION WITH REASON, not a deletion or a
+        softening (#1393 class).
+
+        WHAT THIS USED TO SAY: ``--enable-weights-cpu-backup`` must appear in
+        NO conditional inside ``common_flags`` at all, because the only axis
+        the author could see (B4q, boot weg2xsn16) was the weight-source arm,
+        and gating the ring on THAT axis would have deleted the shadow leg's
+        compare ground under ``exchange`` + ``shadow`` -- a silent compare
+        against nothing. That fear was correct and remains answered below.
+
+        WHY IT IS STRONGER NOW, NOT WEAKER: the fix does not gate on the
+        weight source. It gates on ``ring_absent_by_design(weight_source,
+        inject_mode)`` (:func:`sglang.srt.weg2.launcher.ring_absent_by_design`,
+        B4f, boot weg2xsn13's own lesson) -- a conjunction that is False
+        under ``exchange`` + ``shadow`` PRECISELY BECAUSE that is the case
+        this test's own fear describes. Only ``exchange`` + ``authoritative``
+        -- where the exchange truly owns the bytes and nothing compares
+        against the ring any more -- drops it. That is `#1369`'s own history
+        in one predicate: the first contract (SHA edefc42c34, this
+        coordinator's own specification) said the axis was bare
+        ``exchange_armed()``, which WOULD have been the danger this test
+        warns about (it deletes the ground under ``shadow`` too); DESK9's own
+        correction (SHA a033f2926a, found and pushed before any other
+        package built against the wrong version) is what this test now pins.
+        The launcher's own conditional is SHA 0266010523 (picked from
+        DESK9's ``feat/1369-weights-cpu-backup-off``, commit
+        "steps 2+3/4: the argv lever, the publication, and the ledger's own
+        view") -- it does not re-decide the axis itself, it takes the
+        ALREADY-RESOLVED bool as a plain parameter (:func:`launcher.
+        common_flags`'s own ``weights_cpu_backup`` argument), computed once
+        in :func:`launcher.main` from exactly this predicate.
+
+        So the new pin is: the flag IS conditional, on EXACTLY this one
+        predicate name, and the stale, dangerous form -- a bare
+        ``exchange_armed()`` with no ``inject``/``ring_absent_by_design``
+        term -- must still turn this test red if it ever comes back. "If
+        this ever becomes conditional on the weight source [ALONE], THIS
+        test is what says the shadow's ground truth just became
+        arm-dependent" -- the sentence the pre-#1369 docstring closed with,
+        kept verbatim as the assertion message below because the danger it
+        names is real and this is still the test that catches it.
+        """
         from sglang.srt.weg2 import launcher as L
+
+        # 1. common_flags itself: --enable-weights-cpu-backup now sits behind
+        #    exactly one guard, and that guard is the bare parameter name --
+        #    common_flags does not re-derive the axis, it only branches on
+        #    the caller's already-resolved bool.
         src = inspect.getsource(L.common_flags)
         self.assertIn('"--enable-weights-cpu-backup"', src)
         tree = ast.parse(inspect.cleandoc(src) if src.startswith("def") else src)
         fn = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef))
         guarded = [
             n for n in ast.walk(fn)
-            if isinstance(n, (ast.If, ast.IfExp))
+            if isinstance(n, ast.IfExp)
             and "--enable-weights-cpu-backup" in ast.unparse(n)
         ]
         self.assertEqual(
-            guarded, [],
-            "--enable-weights-cpu-backup is now inside a conditional: the "
-            "shadow's compare ground may have become arm-dependent, which is "
-            "the one thing the B4q widening assumed it was not",
+            len(guarded), 1,
+            "--enable-weights-cpu-backup must be behind EXACTLY one "
+            "conditional expression in common_flags -- zero would revert to "
+            "the pre-#1369 unconditional ring, more than one would be a "
+            "second, possibly-disagreeing gate on the same fact",
         )
+        cond_src = ast.unparse(guarded[0].test)
+        self.assertEqual(
+            cond_src, "weights_cpu_backup",
+            "the guard must be the bare resolved parameter, not an inline "
+            "re-derivation of the axis inside common_flags -- ein-job-ein-"
+            "mover: the predicate is decided once, by main(), and handed "
+            "down as a plain bool",
+        )
+
+        # 2. The one caller that resolves it (main) must trace the `auto`
+        #    branch through ring_absent_by_design, never through a bare
+        #    exchange_armed() -- the exact axis this test's own fear is
+        #    about ("the shadow's ground truth just became arm-dependent").
+        main_src = inspect.getsource(L.main)
+        auto_block = [
+            ln for ln in main_src.splitlines()
+            if "weights_cpu_backup_armed = not ring_absent_by_design(" in ln
+        ]
+        self.assertEqual(
+            len(auto_block), 1, (
+                "main()'s `auto` resolution must read "
+                "`not ring_absent_by_design(weight_source, inject_mode)` -- "
+                "not found verbatim; if the resolution moved, this pin "
+                "moved with it and needs updating with the SAME reasoning, "
+                "never silently"
+            ),
+        )
+
+        # 3. THE DANGER-DIRECTION MUTANT, reproduced by hand (the file's own
+        #    convention -- see TestTheGateSitesReadTheAxisAndNothingElse and
+        #    the #1292 collision tests): the coordinator's own first,
+        #    corrected specification. A checker that would pass this text
+        #    would be exactly the regression that cost three build seats an
+        #    afternoon (7ca55a35a0, corrected by a033f2926a).
+        def _passes_the_axis_check(line: str) -> bool:
+            return "ring_absent_by_design(" in line
+
+        mutant_line = "    weights_cpu_backup_armed = not exchange_armed()"
+        self.assertFalse(
+            _passes_the_axis_check(mutant_line),
+            "the mutant line (bare exchange_armed(), the coordinator's "
+            "original, corrected contract) must fail this checker -- if it "
+            "passes, the shadow's ground truth just became arm-dependent "
+            "again and this test cannot see it",
+        )
+        self.assertTrue(_passes_the_axis_check(auto_block[0]))
 
     def test_exchange_armed_no_longer_claims_to_decide_it(self):
         """The stale claim that made this look dangerous. Corrected in the same
