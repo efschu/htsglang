@@ -307,41 +307,68 @@ class Invariant2ReplayedOverTheWholeChain(CustomTestCase):
         self.assertGreaterEqual(v, FLOOR)
 
 
-class CushionHeadroomGibHasNoProductionCallSite(CustomTestCase):
-    """THE WIRING FINDING: `cushion_headroom_gib` -- the ONLY function in
-    this tree that correctly separates xsn31/2 from xsn31/3 -- is never
-    called by `choose()`, by the dry-run FUNDABLE path, or by any other
-    ARM-time decision in `host_ledger.py` or `launcher.py`. Its only
-    callers anywhere in the tree are its own unit tests
-    (test_weg2_cushion_gate_1377.py) and this file. Every xsn31 boot that
-    invariant (2) would have refused pre-flight (xsn31/3, /4, /5, /6) was
-    instead allowed to dry-run FUNDABLE and discovered the breach LIVE
-    (W98, after VRAM had already been mutated) -- named with file:line so
-    the coordinator can route the fix rather than a second sitting having
-    to re-find it."""
+class CushionHeadroomGibIsWiredIntoChooseAndOnlyTightens(CustomTestCase):
+    """HISTORY (2026-09-13, this class's original form, kept for the record
+    rather than deleted): "THE WIRING FINDING: `cushion_headroom_gib` --
+    the ONLY function in this tree that correctly separates xsn31/2 from
+    xsn31/3 -- is never called by `choose()`, by the dry-run FUNDABLE path,
+    or by any other ARM-time decision in `host_ledger.py` or `launcher.py`.
+    [...] Every xsn31 boot that invariant (2) would have refused pre-flight
+    (xsn31/3, /4, /5, /6) was instead allowed to dry-run FUNDABLE and
+    discovered the breach LIVE (W98, after VRAM had already been mutated)."
 
-    def test_no_call_site_in_host_ledger_outside_its_own_definition_and_tests(self):
+    2026-09-14, commit 695c29dd9e (#1378 Stage 2, W105) CLOSED that gap:
+    `choose()` now calls `cushion_headroom_gib` at its ARM point and folds
+    the result into the verdict by AND ONLY -- it may refuse an arm the
+    other checks funded, it can never fund one they refused (the order's
+    own "GRUEN refused nichts und fundiert nichts"). This class inverted
+    from the finding to the ratchet on it: the ORIGINAL two tests here
+    asserted the ABSENCE of a call site as proof of the gap; deleting them
+    once the gap closed would have thrown away the one thing that caught
+    the gap in the first place, so instead they now assert the wiring's
+    two SPECIFIC shapes -- exactly one production call site, and it binds
+    by AND, never OR -- which is exactly what a future refactor could
+    silently break without ever touching this file's own assertions.
+    """
+
+    def test_exactly_one_production_call_site_and_it_is_inside_choose(self):
+        """GENAU EIN Produktions-Call-Site (order 2026-09-14): the def line
+        plus exactly one call, and that call must resolve inside `choose`'s
+        own source -- not merely somewhere in the module, which would pass
+        just as well for a second, looser reader added later beside it."""
         src = inspect.getsource(hl)
-        # One definition, and its own internal reference inside its own
-        # docstring/body does not count as a caller -- count the CALL FORM
-        # `cushion_headroom_gib(` and subtract the def line itself.
         calls = src.count("cushion_headroom_gib(")
         defs = src.count("def cushion_headroom_gib(")
         self.assertEqual(defs, 1)
         self.assertEqual(
-            calls, 1,
-            "cushion_headroom_gib must have exactly its own def as the "
-            "sole occurrence of the call form in host_ledger.py -- any "
-            "additional occurrence would be a production call site this "
-            "test does not yet know about, and the finding above would be "
-            "stale")
+            calls, 2,
+            "expected exactly the def plus ONE production call site in "
+            "host_ledger.py (695c29dd9e wired the one inside choose()); "
+            "a THIRD occurrence is a second, looser reader this test does "
+            "not yet know about and must be named, not silently accepted")
+        choose_src = inspect.getsource(hl.choose)
+        self.assertIn(
+            "cushion_headroom_gib(", choose_src,
+            "the one production call site must be inside choose() itself, "
+            "not merely somewhere else in the module")
 
-    def test_choose_never_reads_cushion_headroom(self):
+    def test_choose_reads_cushion_headroom_and_only_tightens_the_verdict(self):
+        """Round 1's own mutant is the authority here (test_weg2_cushion_
+        headroom_gate_1378_stage2.py::TheGateCanOnlyTightenNeverLoosen):
+        removing `and headroom_ok` from `ok = ...` must still kill that
+        test. This test only pins the STRUCTURE the mutant depends on --
+        the call exists, and it feeds an AND, never an OR or a bare
+        replacement of an existing term."""
         src = inspect.getsource(hl.choose)
-        self.assertNotIn("cushion_headroom_gib", src,
-                         "the ARM decision function does not consult the "
-                         "one invariant that discriminates xsn31/2 from "
-                         "xsn31/3")
+        self.assertIn("cushion_headroom_gib(", src,
+                      "the ARM decision function must consult the one "
+                      "invariant that discriminates xsn31/2 from xsn31/3")
+        i = src.index("ok = moments_ok and peak_ok and cushion_ok")
+        line = src[i:i + 120].splitlines()[0]
+        self.assertIn("and headroom_ok", line,
+                      "the fold must be conjunctive: it can only ever "
+                      "refuse an arm the other checks funded, never fund "
+                      "one they refused")
 
 
 if __name__ == "__main__":
