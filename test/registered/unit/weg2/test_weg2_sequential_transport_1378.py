@@ -40,10 +40,18 @@ class _FakeOps:
         self.registered = set()
 
     def memcpy_async(self, dst, src, nbytes, stream):
-        if isinstance(dst, memoryview):
-            dst[:nbytes] = bytes(src[:nbytes])
-        elif isinstance(src, memoryview):
+        if isinstance(src, memoryview):
+            # H2D: src is the host buffer (a memoryview), dst is a VRAM addr
             self.vram[dst] = bytes(src[:nbytes])
+        elif isinstance(dst, memoryview):
+            # D2H: dst is the host buffer (a memoryview), src is a VRAM addr
+            data = self.vram.get(src, b"\x00" * nbytes)
+            dst[:nbytes] = data[:nbytes]
+        elif isinstance(dst, int) and isinstance(src, int):
+            # BOTH are ints: this is the metal path (the mmap's base as dst
+            # or src, the VRAM pointer as the other side). The desk ops
+            # can't do a device memcpy -- pass through as a no-op.
+            pass
         else:
             raise AssertionError(f"memcpy_async: unknown shape {dst!r}")
 

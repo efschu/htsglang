@@ -2167,10 +2167,18 @@ def _mmap_addr(mmv: "_mmap.mmap") -> int:
     return ctypes.addressof(ctypes.c_char.from_buffer(mmv))
 
 
-def _off(mmv: "_mmap.mmap", start: int) -> memoryview:
-    """The buffer region as a memoryview -- the memcpy takes addresses; the
-    fake ops (the desk harness) takes the view directly."""
-    return memoryview(mmv)[start:]
+def _mmap_base(mm: "_mmap.mmap") -> int:
+    """The mmap's host virtual address -- for ops.memcpy_async, which needs
+    an integer pointer, not a memoryview (the xsn46/xsn47 wall: a memoryview
+    cannot be converted to the pointer cudaMemcpyAsync expects)."""
+    import ctypes
+    # ctypes.addressof(c_char.from_buffer(mm)) returns the mmap's base
+    return ctypes.addressof(ctypes.c_char.from_buffer(mm))
+
+
+def _mm_slice(mm: "_mmap.mmap", start: int, length: int) -> memoryview:
+    """A memoryview of the mmap's region -- for the desk digest_fn."""
+    return memoryview(mm)[start:start + length]
 
 
 def run_sequential_units(units, ops, boot_nonce: str, *,
@@ -2255,9 +2263,11 @@ def run_sequential_units(units, ops, boot_nonce: str, *,
         if phase == PHASE_DEPOSIT:
             src_ptr = src_addr(name, 0) if callable(src_addr) else src_addr
             t0 = _time.perf_counter()
-            ops.memcpy_async(int(src_ptr), _off(buf, 0), nbytes, 0)
+            _base = _mmap_base(buf)
+            ops.memcpy_async(_base, int(src_ptr), nbytes, 0)
             ops.synchronize(0)
-            digest = hashlib.sha256(bytes(buf[:nbytes])).hexdigest()[:16]
+            digest = hashlib.sha256(
+                bytes(_mm_slice(buf, 0, nbytes))).hexdigest()[:16]
             recs = {}
             if os.path.exists(dpath):
                 try:
@@ -2298,7 +2308,8 @@ def run_sequential_units(units, ops, boot_nonce: str, *,
                     recs = {}
             dep = recs.get(str(i), {})
             dep_digest = str(dep.get("digest", ""))
-            my_digest = hashlib.sha256(bytes(buf[:nbytes])).hexdigest()[:16]
+            my_digest = hashlib.sha256(
+                bytes(_mm_slice(buf, 0, nbytes))).hexdigest()[:16]
             if dep_digest and my_digest != dep_digest:
                 dump_rank_stacks(
                     "digest-mismatch-seq", tag=str(name), rank=int(rank_u),
@@ -2307,7 +2318,8 @@ def run_sequential_units(units, ops, boot_nonce: str, *,
                 return (f"digest mismatch at unit {i} {name!r}: "
                         f"deposit={dep_digest} collect={my_digest}")
             dst_ptr = dst_addr(name, 0) if callable(dst_addr) else dst_addr
-            ops.memcpy_async(int(dst_ptr), _off(buf, 0), nbytes, 0)
+            _base = _mmap_base(buf)
+            ops.memcpy_async(_base, int(dst_ptr), nbytes, 0)
             ops.synchronize(0)
             if dst_digest_fn is not None:
                 # #1378 xsn44 (the PLACEMENT witness): what LANDED at this
