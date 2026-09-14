@@ -2603,6 +2603,16 @@ def common_flags(
     # in `host_ledger.charge_terms`; `launcher.main` reads ONE local once and
     # hands it to both, never two.
     hicache_disabled: bool = False,
+    # #1369: user order 2026-09-14 ("DIE 48GB MUESSEN WEG"). True (default)
+    # is byte-identical to every argv this function built before the flag
+    # existed -- `--enable-weights-cpu-backup` unconditional, both groups,
+    # every arm. False drops it: the ROOT this order names
+    # (`weight_exchange.weights_cpu_backup_armed`), resolved ONCE by the one
+    # caller that has both `ns.weg2_weights_cpu_backup` and the arm, and
+    # passed down rather than re-derived here -- a second call site for the
+    # same predicate is the #1358 defect class ("2.16 GiB" had three causes)
+    # one flag over.
+    weights_cpu_backup: bool = True,
 ) -> List[str]:
     """Flags BOTH groups share.
 
@@ -2699,8 +2709,7 @@ def common_flags(
         # rows, because ServerArgs reads them from os.environ before the flags
         # publish themselves. See EarlyReadFact for the ordering evidence.
         "--enable-memory-saver",
-        "--enable-weights-cpu-backup",
-    ]
+    ] + (["--enable-weights-cpu-backup"] if weights_cpu_backup else [])
 
 
 def admin_key_flag(admin_api_key: Optional[str]) -> List[str]:
@@ -2770,6 +2779,8 @@ def argv_p(
     vision: str = VISION_OFF,
     # #1386: forwarded to `common_flags` unchanged; see that function.
     hicache_disabled: bool = False,
+    # #1369: forwarded to `common_flags` unchanged; see that function.
+    weights_cpu_backup: bool = True,
 ) -> List[str]:
     # THE COUNT FLAGS ARE THE CONTIGUOUS FORM, AND ONLY THAT (#1240 FOLLOW FIX
     # 1). --pp-stage-ratio/--pp-attn-stage-ratio are per-stage COUNTS that
@@ -2835,6 +2846,7 @@ def argv_p(
         model, s_gb, m_mib, store_cfg, max_kv_per_request, write_policy, "P",
         random_seed, barlink_cap_cycles, census_interval,
         hicache_disabled=hicache_disabled,
+        weights_cpu_backup=weights_cpu_backup,
     ) + [
         # C1/K1: P's own bs. Concurrency for the front's leg-1 fan-out AND
         # the size of P's req_to_token_pool (R-13), which is why it is
@@ -2953,11 +2965,15 @@ def argv_d(
     # caller passes admin_api_key by keyword or stops before it; none can
     # collide with this.
     hicache_disabled: bool = False,
+    # #1369: APPENDED LAST for the same reason as `hicache_disabled` two
+    # lines up -- `argv_d` has no `*` marker.
+    weights_cpu_backup: bool = True,
 ) -> List[str]:
     return [py, "-m", "sglang.launch_server"] + common_flags(
         model, s_gb, m_mib, store_cfg, max_kv_per_request, "write_through", "D",
         random_seed, barlink_cap_cycles, census_interval,
         hicache_disabled=hicache_disabled,
+        weights_cpu_backup=weights_cpu_backup,
     ) + (
         ["--disable-overlap-schedule"] if disable_overlap else []
     ) + (
@@ -5390,6 +5406,39 @@ def ring_absent_by_design(weight_source: str, inject_mode: str) -> bool:
     )
 
 
+def weg2_weights_cpu_backup_ring_kw(
+    ring_bytes: int, ring_span1_bytes: int,
+    ring_absent_by_design_base: bool,
+    weights_cpu_backup_armed: bool,
+) -> Tuple[int, int, bool]:
+    """``(ring_bytes, ring_span1_bytes, ring_absent_by_design)`` for the ledger.
+
+    #1369: ONE function for BOTH halves of the same fact, because
+    ``host_ledger.price``'s own contradiction guard REFUSES
+    ``ring_absent_by_design=True`` beside a non-zero ring (boot weg2xsn13's
+    own lesson, see :func:`ring_absent_by_design`'s docstring) -- a caller
+    that ORs the DECLARATION into ``True`` without also zeroing the BYTES
+    would turn "the ring is gone" into a boot-time crash instead of a price.
+    Kept here, one call, rather than at each of the two former call sites,
+    so the two halves cannot drift apart the way #1358's slot size/count
+    once did.
+
+    ``weights_cpu_backup_armed`` False -- the operator's explicit
+    ``--weg2-weights-cpu-backup off``, OR ``auto`` under an armed,
+    authoritative exchange -- zeroes both byte counts and forces the
+    declaration True, REGARDLESS of ``ring_absent_by_design_base`` (the
+    pre-#1369 predicate: today only true under exchange+authoritative).
+    True passes every input through unchanged -- byte-identical to every
+    boot before this flag existed.
+    """
+    if weights_cpu_backup_armed:
+        return (
+            int(ring_bytes), int(ring_span1_bytes),
+            bool(ring_absent_by_design_base),
+        )
+    return 0, 0, True
+
+
 def choose_host_ledger(
     ring_bytes: int,
     ring_span1_bytes: int,
@@ -5433,6 +5482,14 @@ def choose_host_ledger(
     # ledger term and the argv this function's caller builds from `arm.s_gb`/
     # `arm.m_mib` must read the identical bool, never a second copy of it.
     hicache_disabled: bool = False,
+    # #1369: resolved ONCE by `main`, beside `hicache_disabled`, from the
+    # SAME predicate that decided whether `--enable-weights-cpu-backup`
+    # ships on either group's argv (`ring_absent_by_design`'s negation, or
+    # the operator's explicit on/off) -- never re-derived here, which is
+    # exactly the #1358 defect class ("2.16 GiB" had three causes) this
+    # order named by name. True (default) is byte-identical to every boot
+    # before this flag existed: the ring prices exactly as it always did.
+    weights_cpu_backup_armed: bool = True,
     # #1378 Stage 2 (W105): the PRIOR boot's own cited numbers. FLAGS ARE AN
     # OVERRIDE ONLY (coordinator order): when either is given explicitly it
     # wins outright; otherwise this function SELF-READS the sidecar via
@@ -5609,6 +5666,15 @@ def choose_host_ledger(
             comparing=(str(inject_mode) == weight_exchange.INJECT_SHADOW))),
         "inject_mode": str(inject_mode),
     } if _bounce_charge_bytes else None
+    # #1369: ONE call, both halves of the same fact -- see the function's own
+    # docstring for why the byte counts and the declaration must never be
+    # computed at two separate call sites.
+    (_ring_bytes_kw, _ring_span1_bytes_kw,
+     _ring_absent_by_design_kw) = weg2_weights_cpu_backup_ring_kw(
+        ring_bytes, ring_span1_bytes,
+        ring_absent_by_design(weight_source, inject_mode),
+        weights_cpu_backup_armed,
+    )
     ledger_kw = dict(
         # #1317n D's L2 IS PRICED SEPARATELY FROM P'S. It rides the ONE kwargs
         # block for exactly the reason the block exists (boot weg2sn6a died of
@@ -5631,8 +5697,12 @@ def choose_host_ledger(
         # `**ledger_kw` is exactly the mechanism the #1317n comment above
         # names to stop a term reaching only one of the two.
         hicache_disabled=hicache_disabled,
-        ring_bytes=ring_bytes,
-        ring_span1_bytes=ring_span1_bytes,
+        # #1369: computed together with the declaration below, by
+        # `weg2_weights_cpu_backup_ring_kw` -- see its docstring for why
+        # zeroing the bytes here and declaring the absence there must never
+        # be two separate call sites again.
+        ring_bytes=_ring_bytes_kw,
+        ring_span1_bytes=_ring_span1_bytes_kw,
         ring_provenance=ring_provenance,
         cg_current_bytes=cg["current"],
         # fix 6: only the NON-reclaimable part of that reading is charged --
@@ -5715,7 +5785,16 @@ def choose_host_ledger(
         # authority, so boot weg2xsn13's dry-run handed the ledger 42.97 GiB of
         # ring beside a declaration that there was none. See
         # `ring_absent_by_design`.
-        ring_absent_by_design=ring_absent_by_design(weight_source, inject_mode),
+        # #1369: computed together with the byte counts above, by
+        # `weg2_weights_cpu_backup_ring_kw` -- under `auto` (the default)
+        # `weights_cpu_backup_armed` is exactly
+        # `not ring_absent_by_design(weight_source, inject_mode)` (see
+        # `main`'s resolution site), so this is unchanged there; it only
+        # forces True for an explicit `off`, which must zero the ring even
+        # under an arm `ring_absent_by_design` itself would call present
+        # (e.g. plain `ring`, the hard-kill-switch case named in that
+        # flag's help text).
+        ring_absent_by_design=_ring_absent_by_design_kw,
     )
     if pin_m_mib and int(pin_m_mib) > 0:
         # #1317/#1318 THE PINNED ARM IS PRICED, NOT ASSUMED. The ladder is run
@@ -9376,6 +9455,31 @@ def build_parser() -> argparse.ArgumentParser:
              "omitted outright, not passed as 0, so no HiCache code path is "
              "entered at all.")
     ap.add_argument(
+        "--weg2-weights-cpu-backup",
+        choices=list(weight_exchange.WEIGHTS_CPU_BACKUP_CHOICES),
+        default=weight_exchange.WEIGHTS_CPU_BACKUP_AUTO,
+        help="#1369: user order 2026-09-14 (\"DIE 48GB MUESSEN WEG... wenn es "
+             "korrekt implementiert ist braucht es NIEMALS einen Rueckfall\"). "
+             "The WEIGHTS region's 46.40 GiB host ring "
+             "(host_ledger.host_ring_gib) has backed both groups' weights "
+             "unconditionally under every arm, including an ARMED exchange, "
+             "where the exchange is already the weight source at the wake "
+             "seam and the ring refills bytes nobody reads. 'auto' (default) "
+             "drops the ring's --enable-weights-cpu-backup flag AND its "
+             "host-ledger Sigma H term exactly when the exchange is armed "
+             "(weight_exchange.exchange_armed()), and keeps both exactly as "
+             "every pre-#1369 boot had them otherwise. 'on' forces the ring "
+             "ON regardless of arm -- an A/B COMPARISON INSTRUMENT for one "
+             "boot only, never a design claim. 'off' forces it OFF "
+             "regardless of arm, the hard kill switch, including under "
+             "'ring' -- for a boot that wants to prove the exchange needs no "
+             "fallback at all. Published to both P and D exactly as "
+             "--weg2-xchg-inject is (weight_exchange.WEIGHTS_CPU_BACKUP_ENV "
+             "via prepare_xchg_env/build_env), so a rank with no argv reads "
+             "the same decision the launcher's own process resolved. An "
+             "unrecognised value refuses by name (W107) rather than "
+             "guessing which side of a 46.40 GiB ring a typo meant.")
+    ap.add_argument(
         "--weg2-weight-source", choices=WEIGHT_SOURCE_CHOICES,
         default=WEIGHT_SOURCE_DEFAULT,
         help="#1273: where a waking group's weight BYTES come from. 'ring' (the "
@@ -10193,6 +10297,31 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # cannot price the switch one way and allocate the other (the exact
     # #1385/#1386 shape three boots already cost).
     hicache_disabled = bool(getattr(ns, "weg2_disable_hicache", False))
+    # #1369: user order 2026-09-14. ONE resolution, here, before the form-key
+    # build and the shipped argvs both need it. Every later reader (the
+    # form-key build, the shipped `argv_p`/`argv_d`, `choose_host_ledger`)
+    # takes this ONE local.
+    #
+    # NOT a bare call to `weight_exchange.weights_cpu_backup_armed()` for the
+    # `auto` case: that function's `auto` branch reads `exchange_armed()` and
+    # `inject_authoritative()`, NEITHER of which take an `explicit` this
+    # process could hand them (`exchange_armed()` has no such parameter at
+    # all) -- exactly the S6 fix E trap `inject_mode()`'s own docstring
+    # warns about, one predicate over: the LAUNCHER's own process never has
+    # `WEIGHT_SOURCE_ENV`/`INJECT_ENV` in its bare environment, only the
+    # ranks do (`prepare_xchg_env`/`build_env` publish them there, never
+    # here). `ring_absent_by_design` already solves exactly this -- it takes
+    # `weight_source`/`inject_mode` as plain VALUES, never through the
+    # env-reading functions -- so `auto` here is that ONE authority's
+    # negation rather than a second, launcher-unsafe spelling of the same
+    # conjunction. `on`/`off` need none of this: both short-circuit inside
+    # `weights_cpu_backup_armed()` before either sub-predicate is touched.
+    if str(ns.weg2_weights_cpu_backup) == weight_exchange.WEIGHTS_CPU_BACKUP_AUTO:
+        weights_cpu_backup_armed = not ring_absent_by_design(
+            str(ns.weg2_weight_source), str(ns.weg2_xchg_inject))
+    else:
+        weights_cpu_backup_armed = weight_exchange.weights_cpu_backup_armed(
+            explicit=ns.weg2_weights_cpu_backup)
     # #1348: both coverage instruments armed at once is a burnt window, and
     # the cheapest place to say so is here -- before anything is started.
     refuse_double_coverage_arm(os.environ, xchg_coverage_diff=getattr(
@@ -10706,6 +10835,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         vision=ns.weg2_vision,
         p_max_total_tokens=int(cut.pool_tokens),
         hicache_disabled=hicache_disabled,
+        # #1369: form-key must reflect the ring's real presence/absence --
+        # the same reasoning `vision` is threaded here for ("a tower that is
+        # absent IS a different weight statement").
+        weights_cpu_backup=weights_cpu_backup_armed,
     ), ns.weg2_weight_source)
     form_key, form_norm = ring_table.p_form_key(form_argv_p)
     log(
@@ -10866,6 +10999,22 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                                   # table and carries the census's own list.
                                   waves=(xchg_res.partition if xchg_res is not None
                                          else None))
+    # #1369: PUBLISHED UNCONDITIONALLY, unlike everything else in `xchg_env`
+    # above -- `prepare_xchg_env` returns `{}` outright under an un-armed
+    # exchange (`weight_source not in WEIGHT_SOURCE_ARMED`), which is correct
+    # for the arm-specific terms above (there is nothing to tell a rank about
+    # a bounce that will not run) but would be wrong here: an operator who
+    # explicitly typed `--weg2-weights-cpu-backup off` under `ring` (the hard
+    # kill switch, named in that flag's own help text as working "including
+    # under ring") must have every rank see that override, not just the
+    # launcher's own process. The raw mode string travels, exactly as
+    # `--weg2-xchg-inject` does through `INJECT_ENV`: a rank with no
+    # `explicit` re-derives `auto` from its OWN `exchange_armed()` read,
+    # which is published to it separately and independently correct either
+    # way.
+    xchg_env[weight_exchange.WEIGHTS_CPU_BACKUP_ENV] = str(
+        getattr(ns, "weg2_weights_cpu_backup",
+                weight_exchange.WEIGHTS_CPU_BACKUP_AUTO))
 
     # 2. host ledger
     # #1362 [22-fix2]: the form verdict lives on the SOLVED TABLE, not on the
@@ -10943,7 +11092,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         model_dir=ns.model,
         # #1386: the SAME local `main` resolved once, above, beside
         # `draft_kv_on_p` -- never re-read from `ns` here.
-        hicache_disabled=hicache_disabled)
+        hicache_disabled=hicache_disabled,
+        # #1369: the SAME local `main` resolved once, above, from the SAME
+        # predicate the shipped argvs read -- never re-read from `ns` here.
+        weights_cpu_backup_armed=weights_cpu_backup_armed)
     state.cgroup = dict(cg)
     for ln in lines:
         log(ln)
@@ -11240,7 +11392,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         vision=ns.weg2_vision,
         admin_api_key=admin_api_key,
         p_max_total_tokens=int(cut.pool_tokens),
-        hicache_disabled=hicache_disabled)
+        hicache_disabled=hicache_disabled,
+        weights_cpu_backup=weights_cpu_backup_armed)
     # TRAIN FIX 5: THE SENTINEL PREMISE, PROVEN ON EVERY BOOT.  The form key that
     # gated the ring table was hashed over an argv built with sentinel ledger
     # terms, which is sound only while every flag those sentinels reach is
@@ -11321,7 +11474,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         log(d_ratio.op_line)
         log(d_tokvec.line)
         env_d = build_env(tree, ns.venv, cvd, store_dir, False, ns.tag, chunk_layers, chunk_count, tms_so, ns.transport, ring_plan, group="D", xchg_env=xchg_env, **_env_knobs(ns))
-        spec_d = GroupSpec("D", PORT_D, transport_argv(argv_d(py, ns.model, budgets_d, s_gb_d, arm.m_mib, store_cfg, shlex.split(ns.extra_d), d_bs, max_kv_per_request, x_tokens, ns.num_continuous_decode_steps, ns.d_disable_overlap_schedule, d_ratio.flags, d_tokvec.flags, ns.random_seed, ns.barlink_bar1_cap_cycles, ns.collective_census_interval, ns.d_disable_cuda_graph, admin_api_key=admin_api_key, hicache_disabled=hicache_disabled), ns.transport), state.logs["D"], env_d)
+        spec_d = GroupSpec("D", PORT_D, transport_argv(argv_d(py, ns.model, budgets_d, s_gb_d, arm.m_mib, store_cfg, shlex.split(ns.extra_d), d_bs, max_kv_per_request, x_tokens, ns.num_continuous_decode_steps, ns.d_disable_overlap_schedule, d_ratio.flags, d_tokvec.flags, ns.random_seed, ns.barlink_bar1_cap_cycles, ns.collective_census_interval, ns.d_disable_cuda_graph, admin_api_key=admin_api_key, hicache_disabled=hicache_disabled, weights_cpu_backup=weights_cpu_backup_armed), ns.transport), state.logs["D"], env_d)
         launch_group(spec_d, tree, log, dry)
         log("front argv (dry): " + " ".join(shlex.quote(a) for a in front_argv_for(
             py, store_dir, 0, 0, dc_expect_d, cards, ns, chunk_count, 0, p_bs, d_bs, x_tokens,
@@ -11420,7 +11573,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     log(d_ratio.op_line)
     log(d_tokvec.line)
     env_d = build_env(tree, ns.venv, cvd, store_dir, ns.debug_hold in ("D", "both"), ns.tag, chunk_layers, chunk_count, tms_so, ns.transport, ring_plan, group="D", xchg_env=xchg_env, **_env_knobs(ns))
-    spec_d = GroupSpec("D", PORT_D, transport_argv(argv_d(py, ns.model, budgets_d, s_gb_d, arm.m_mib, store_cfg, shlex.split(ns.extra_d), d_bs, max_kv_per_request, x_tokens, ns.num_continuous_decode_steps, ns.d_disable_overlap_schedule, d_ratio.flags, d_tokvec.flags, ns.random_seed, ns.barlink_bar1_cap_cycles, ns.collective_census_interval, ns.d_disable_cuda_graph, admin_api_key=admin_api_key, hicache_disabled=hicache_disabled), ns.transport), state.logs["D"], env_d)
+    spec_d = GroupSpec("D", PORT_D, transport_argv(argv_d(py, ns.model, budgets_d, s_gb_d, arm.m_mib, store_cfg, shlex.split(ns.extra_d), d_bs, max_kv_per_request, x_tokens, ns.num_continuous_decode_steps, ns.d_disable_overlap_schedule, d_ratio.flags, d_tokvec.flags, ns.random_seed, ns.barlink_bar1_cap_cycles, ns.collective_census_interval, ns.d_disable_cuda_graph, admin_api_key=admin_api_key, hicache_disabled=hicache_disabled, weights_cpu_backup=weights_cpu_backup_armed), ns.transport), state.logs["D"], env_d)
     state.argv["D"] = " ".join(shlex.quote(a) for a in spec_d.argv)
     launch_group(spec_d, tree, log, dry)
     state.pids["D"] = spec_d.pid
