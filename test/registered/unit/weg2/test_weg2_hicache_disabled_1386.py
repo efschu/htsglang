@@ -24,11 +24,22 @@ resolves `ns.weg2_disable_hicache` into ONE local exactly once (beside
 
 from __future__ import annotations
 
+import glob
+import io
+import json
+import os
+import pathlib
+import tempfile
 import unittest
+from contextlib import redirect_stdout
+from unittest import mock
 
 import pytest
 
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
+
 try:
+    from sglang.srt.registry import nvml as nvml_registry
     from sglang.srt.weg2 import host_ledger, launcher
 except Exception as exc:  # pragma: no cover - no weg2 launcher in this build
     pytest.skip(f"weg2 launcher unavailable: {exc}", allow_module_level=True)
@@ -38,6 +49,81 @@ GB = host_ledger.GB
 
 MODEL = "/spinning/llm_stuff/club-3090/models-cache/Qwen3.8-27B-INT8-gdncov-vocabembed"
 BUDGETS = [28904, 17704, 17672]
+
+# The same #1378 fixture test_weg2_dry_run_order_probe_1378.py uses, for the
+# same reason: this is the ONE place in this file that drives `launcher.main`
+# itself, at the CLI/argv boundary, rather than the arithmetic layer directly
+# -- because the falls-with-it grouping this class tests (P_DRAFT_KV_FLAGS
+# leaving as a whole when `hicache_disabled`) is `main`-local logic, not a
+# `common_flags`/`argv_p` parameter.
+_FIXTURES = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                         "fixtures", "xchg_launch_replay_0911")
+_RING_EVIDENCE = os.path.join(_FIXTURES, "ring_evidence")
+_CENSUS = os.path.join(_FIXTURES, "census_weg2sn5b_48f55fb393.json")
+_NVML_REPLAY_JSON = os.path.join(_FIXTURES, "nvml_devices_1378.json")
+_RING_TABLE_BOOT_STEM_SUBSTR = "d8ea6261f7"
+_TREE_ROOT = str(pathlib.Path(launcher.__file__).resolve().parents[4])
+
+with open(os.path.join(_FIXTURES, "recorded.json"), encoding="utf-8") as _fh:
+    _RECORDED = json.load(_fh)
+
+_MODEL_PATH = _RECORDED["checkpoint_dependency"]["model_path"]
+
+
+def _checkpoint_present() -> bool:
+    return bool(glob.glob(os.path.join(_MODEL_PATH, "*.safetensors")))
+
+
+_NEEDS_CHECKPOINT = unittest.skipUnless(
+    _checkpoint_present(),
+    "the checkpoint the fixture's ring evidence names is not on this box",
+)
+
+
+def _main_argv(tag: str, *extra: str) -> list:
+    return [
+        "--tree", _TREE_ROOT,
+        "--tag", tag,
+        "--dry-run",
+        "--model", _MODEL_PATH,
+        "--weg2-weight-source", "exchange",
+        "--weg2-xchg-census", _CENSUS,
+        "--evidence-dir", _RING_EVIDENCE,
+        "--ring-table-boot", _RING_TABLE_BOOT_STEM_SUBSTR,
+        *extra,
+    ]
+
+
+class _HermeticMainBase(unittest.TestCase):
+    """Same isolation as test_weg2_dry_run_order_probe_1378.py's base class:
+    replayed NVML cards, a private guaranteed-empty SHM_DIR."""
+
+    def setUp(self):
+        super().setUp()
+        self._old_replay_env = os.environ.get(nvml_registry.ENV_NVML_REPLAY)
+        os.environ[nvml_registry.ENV_NVML_REPLAY] = _NVML_REPLAY_JSON
+        self._shm_tmp = tempfile.mkdtemp(prefix="weg2-1386-empty-shm-")
+        self._shm_patch = mock.patch.object(launcher, "SHM_DIR", self._shm_tmp)
+        self._shm_patch.start()
+
+    def tearDown(self):
+        self._shm_patch.stop()
+        if self._old_replay_env is None:
+            os.environ.pop(nvml_registry.ENV_NVML_REPLAY, None)
+        else:
+            os.environ[nvml_registry.ENV_NVML_REPLAY] = self._old_replay_env
+        super().tearDown()
+
+    def run_main(self, argv):
+        buf = io.StringIO()
+        rc = None
+        exc = None
+        try:
+            with redirect_stdout(buf):
+                rc = launcher.main(argv)
+        except Exception as e:  # the refusal path raises rather than returning
+            exc = e
+        return rc, buf.getvalue(), exc
 
 
 def _flag_value(argv, flag):
@@ -282,6 +368,84 @@ class OneSwitchOneTruth(unittest.TestCase):
                 self.assertEqual(priced_zero, argv_absent)
 
 
+@_NEEDS_CHECKPOINT
+class TheDraftKvProducerFallsWithIt(_HermeticMainBase):
+    """xsn31/7 wall follow-up: ``--speculative-draft-kv-only`` belongs in the
+    SAME falls-together group as the ten ``--hicache-*`` flags, because its
+    canonical-page-store target (``--hicache-canonical-kv-page``) has no
+    existence once HiCache is disabled -- ``server_args.py:8432`` crashed
+    group P 9 seconds after launch on exactly this before this fix. MTP
+    itself is untouched: group D keeps its own, independent NEXTN head in
+    both forms (``ring_table.p_carries_drafter`` reads P's SHIPPED argv, not
+    ``ns.draft_kv_on_p``, so this class exercises ``launcher.main`` at the
+    CLI boundary rather than the arithmetic layer -- the falls-with-it
+    grouping is ``main``-local logic).
+    """
+
+    def test_default_draft_kv_on_p_falls_silently_when_hicache_disabled(self):
+        # No explicit --draft-kv-on-p: the operator stated no intent, so the
+        # auto-off fallback applies with no refusal and no crash.
+        rc, out, exc = self.run_main(_main_argv("t1386a", "--weg2-disable-hicache"))
+        self.assertIsNone(exc, f"unexpected exception: {exc}")
+        self.assertEqual(rc, 0)
+        p_line = next(line for line in out.splitlines() if "WEG2-LAUNCH group P argv:" in line)
+        self.assertNotIn("--speculative-draft-kv-only", p_line)
+        self.assertNotIn("--speculative-algorithm", p_line)
+        self.assertNotIn("--hicache-canonical-kv-page", p_line)
+        # group D keeps its own, independent NEXTN head -- MTP itself is
+        # untouched, only P's co-production into the (now nonexistent) store
+        # drops.
+        d_line = next(line for line in out.splitlines() if "WEG2-LAUNCH group D argv:" in line)
+        self.assertIn("--speculative-algorithm", d_line)
+        # the pre-existing #1264 off-form declaration fires -- this class
+        # adds NO second, competing "off" mechanism, it reuses the one that
+        # already exists for --draft-kv-on-p off. (The W10/W11-skip line
+        # itself lives further down main(), past the point --dry-run returns
+        # -- ring_table.p_carries_drafter(shipped_argv_p), which that skip
+        # reads, is exercised by the argv assertions above instead.)
+        self.assertIn("WEG2 DRAFT-KV-ON-P: off", out)
+
+    def test_explicit_draft_kv_on_p_on_refuses_by_name(self):
+        # An EXPLICIT --draft-kv-on-p on is a stated intent this boot cannot
+        # honor -- silently overriding it would repeat the exact "priced one
+        # number, allocated another" shape this whole switch exists to
+        # prevent, so this is a named refusal, not a silent downgrade.
+        rc, out, exc = self.run_main(_main_argv(
+            "t1386b", "--weg2-disable-hicache", "--draft-kv-on-p", "on",
+        ))
+        self.assertIsNotNone(exc, "expected Weg2LaunchRefused, got none")
+        self.assertIsInstance(exc, launcher.Weg2LaunchRefused)
+        self.assertIn("W104 Weg2HicacheDraftKvProducerConflict", str(exc))
+
+    def test_explicit_draft_kv_on_p_off_is_fine_no_refusal(self):
+        # Explicit `off` agrees with the auto-fallback -- no conflict, no
+        # refusal, same as the default case.
+        rc, out, exc = self.run_main(_main_argv(
+            "t1386c", "--weg2-disable-hicache", "--draft-kv-on-p", "off",
+        ))
+        self.assertIsNone(exc, f"unexpected exception: {exc}")
+        self.assertEqual(rc, 0)
+
+    def test_hicache_enabled_default_leaves_the_producer_untouched(self):
+        # Regression control: hicache ENABLED (the byte-identical default)
+        # must not be touched by this fix at all.
+        rc, out, exc = self.run_main(_main_argv("t1386d"))
+        self.assertIsNone(exc, f"unexpected exception: {exc}")
+        self.assertEqual(rc, 0)
+        p_line = next(line for line in out.splitlines() if "WEG2-LAUNCH group P argv:" in line)
+        self.assertIn("--speculative-draft-kv-only", p_line)
+        self.assertIn("--hicache-canonical-kv-page", p_line)
+
+    def test_hicache_enabled_explicit_draft_kv_on_p_on_no_refusal(self):
+        # hicache enabled + explicit --draft-kv-on-p on: no conflict at all,
+        # must never trip the new refusal (it is scoped to hicache_disabled).
+        rc, out, exc = self.run_main(_main_argv(
+            "t1386e", "--draft-kv-on-p", "on",
+        ))
+        self.assertIsNone(exc, f"unexpected exception: {exc}")
+        self.assertEqual(rc, 0)
+
+
 if __name__ == "__main__":
     unittest.main()
 
@@ -305,3 +469,25 @@ if __name__ == "__main__":
 #     -- the mirror direction: the ledger charges 0 while the ranks still
 #     allocate the buffer, which is EXACTLY how #1385's lane cap under-priced
 #     a real boot's allocator twice. Restored; suite green again.
+#
+# xsn31/7 wall follow-up (`TheDraftKvProducerFallsWithIt`), two more manual
+# mutants, same discipline (revert, watch red, restore, diff empty):
+#
+# (c) `launcher.main`: reverted `draft_kv_on_p = _draft_kv_on_p_requested and
+#     not hicache_disabled` back to `draft_kv_on_p = _draft_kv_on_p_requested`
+#     (the switch computed but the producer flag not folded in). Result:
+#     `test_default_draft_kv_on_p_falls_silently_when_hicache_disabled` failed
+#     immediately with `'--speculative-draft-kv-only' unexpectedly found` in
+#     group P's shipped argv -- reproducing the exact xsn31/7 crash condition
+#     (server_args.py:8432) this class exists to prevent. Restored; suite
+#     green again.
+#
+# (d) `launcher.main`: replaced the `if hicache_disabled and
+#     _draft_kv_on_p_requested and (bs_source(...) == "flag"):` guard with
+#     `if False:` (the named refusal disarmed). Result:
+#     `test_explicit_draft_kv_on_p_on_refuses_by_name` failed with
+#     `unexpectedly None : expected Weg2LaunchRefused, got none` -- an
+#     explicit, contradicted `--draft-kv-on-p on` would have been silently
+#     downgraded instead of refused, the exact swallow class this switch's
+#     "EIN Schalter, EINE Wahrheit" doctrine exists to prevent. Restored;
+#     suite green again.

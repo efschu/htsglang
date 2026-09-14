@@ -10529,7 +10529,60 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # is hashed over the form that ships, which is the whole point of the
     # sentinel round trip below.  The OFF line is printed before the ring is
     # solved, because the ring's PP2 span is one of the things it changes.
-    draft_kv_on_p = ns.draft_kv_on_p == "on"
+    #
+    # #1386 FOLLOW-UP (xsn31/7 Versuch 7 wall, server_args.py:8432): P's
+    # draft-KV PRODUCER writes into the canonical page store
+    # (--hicache-canonical-kv-page), and that store has NO existence when
+    # HiCache is disabled -- registry.create_tree_cache builds MambaRadixCache
+    # for this hybrid-SSM model whenever `enable_hierarchical_cache` is False,
+    # and MambaRadixCache carries no cache_controller/canonical_page_store at
+    # all (only HiRadixCache / UnifiedRadixCache.init_hicache do, gated
+    # SOLELY on enable_hierarchical_cache, per scheduler.py's own
+    # `derive_enable_hicache_storage` docstring: "which tree cache gets built
+    # is decided by enable_hierarchical_cache alone... never by the storage
+    # backend"). So the producer flag belongs in the SAME falls-together group
+    # as the ten --hicache-* flags below (P_DRAFT_KV_FLAGS has to leave AS A
+    # WHOLE, not just its --speculative-draft-kv-only member: server_args.py's
+    # own `_refuse_proposing_drafter_under_pp` asserts pp_size>1 implies
+    # speculative_algorithm is None OR speculative_draft_kv_only, so P cannot
+    # keep the other four NEXTN flags without the producer flag either).  MTP
+    # itself is untouched -- group D carries its own, independent NEXTN head
+    # in BOTH forms (see the comment on P_DRAFT_KV_FLAGS's use in argv_p); only
+    # P's CO-PRODUCTION into the now-nonexistent store drops, which is exactly
+    # the pre-#1264 / "draft_kv_on_p=off" serving-base form already named and
+    # logged below.  ONE local, computed here where its #1264 twin already is,
+    # so no downstream reader (the sentinel `common_flags` call, the ledger
+    # call, the form-key build, the shipped `argv_p`) can price the producer
+    # one way and ship a different argv -- the exact #1385/#1386 shape three
+    # boots already cost, now guarded against for this flag too.
+    _draft_kv_on_p_requested = ns.draft_kv_on_p == "on"
+    if hicache_disabled and _draft_kv_on_p_requested and (
+        bs_source("--draft-kv-on-p", argv) == "flag"
+    ):
+        # Named refusal, not a silent downgrade and not a 9s crash inside the
+        # child's server_args.py: an EXPLICIT --draft-kv-on-p on is a stated
+        # intent this boot cannot honor while HiCache is disabled, and
+        # overriding a stated intent without a word is the swallow class this
+        # whole switch exists to prevent. Left at its (on) DEFAULT, no operator
+        # stated an intent, so the auto-off fallback below applies silently
+        # and correctly -- only an explicit, contradicted request refuses.
+        raise Weg2LaunchRefused(
+            "W104 Weg2HicacheDraftKvProducerConflict: --weg2-disable-hicache "
+            "was combined with an EXPLICIT --draft-kv-on-p on. Group P's "
+            "draft-KV producer needs --hicache-canonical-kv-page, and that "
+            "page format has no store to write into once HiCache is disabled "
+            "(server_args.py:8432, root-caused on boot weg2xsn31 Versuch 7: "
+            "MambaRadixCache carries no cache_controller/canonical_page_store "
+            "-- only the HiCache tree caches do, gated solely on "
+            "enable_hierarchical_cache). Drop --weg2-disable-hicache, or drop "
+            "the explicit --draft-kv-on-p on (the default already falls to "
+            "off automatically whenever HiCache is disabled -- MTP/NEXTN "
+            "itself stays on via group D's own independent drafter; only P's "
+            "co-production into the store drops), or pass --draft-kv-on-p "
+            "off yourself to say the same thing without relying on the "
+            "auto-fallback."
+        )
+    draft_kv_on_p = _draft_kv_on_p_requested and not hicache_disabled
     if not draft_kv_on_p:
         log(draft_kv_off_line())
     # #1386: `hicache_disabled` was already resolved once, at the top of
