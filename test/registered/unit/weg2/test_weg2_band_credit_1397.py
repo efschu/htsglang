@@ -121,14 +121,35 @@ class TestSizingIsByteIdenticalByDefault:
         assert t.lane_slots == 24                       # ceil(2907/128)+shadow
         assert t.total_bytes == pytest.approx(15.75 * GIB, rel=1e-9)
 
-    def test_band_credit_true_without_n_cross_lanes_changes_nothing(self):
-        """The SAFE default: turning the flag on alone must never shrink
-        anything -- a caller must ALSO count its cross lanes."""
+    def test_band_credit_true_alone_auto_derives_the_safe_cross_count(self):
+        """#1397 VERDRAHTUNG (2026-09-14): the SINGLE boolean is now enough
+        to arm a real saving -- `n_cross_lanes` left unstated (`None`, the
+        parameter's own default) auto-derives via `resolve_cross_lanes`
+        (`n_lanes - xr.N_CARDS = 5 - 3 = 2`), the WORST-CASE-SAFE split
+        (assumes every one of this rig's 3 possible diagonal lanes is
+        active). This SUPERSEDES the pre-wiring behaviour (band_credit
+        alone used to change nothing, #1397's first commit) -- deliberately:
+        an unpulled lever is the #1367/#1375 defect class this wiring
+        closes."""
         off = xb.bounce_terms(**XSN31, slot_bytes=128 * MIB)
-        on_but_unstated = xb.bounce_terms(**XSN31, slot_bytes=128 * MIB,
-                                          band_credit=True)
-        assert on_but_unstated.total_bytes == off.total_bytes
-        assert on_but_unstated.n_cross_lanes_priced == 0
+        armed = xb.bounce_terms(**XSN31, slot_bytes=128 * MIB,
+                                band_credit=True)
+        assert armed.n_cross_lanes == 2          # 5 - N_CARDS(3)
+        assert armed.n_diag_lanes_priced == 3    # the conservative maximum
+        assert armed.total_bytes < off.total_bytes
+        assert armed.total_bytes == pytest.approx(10.5 * GIB, rel=1e-6)
+
+    def test_an_explicit_zero_cross_lanes_is_respected_literally(self):
+        """The ONLY way to arm `band_credit` and get NO saving on purpose:
+        state `n_cross_lanes=0` explicitly (this boot truly has none) --
+        `None` (never given) is the sole auto-derivation trigger, the same
+        `raw is None` convention `resolve_lanes_concurrent` already uses."""
+        t = xb.bounce_terms(**XSN31, slot_bytes=128 * MIB, band_credit=True,
+                            n_cross_lanes=0)
+        assert t.n_cross_lanes == 0
+        assert t.n_cross_lanes_priced == 0
+        off = xb.bounce_terms(**XSN31, slot_bytes=128 * MIB)
+        assert t.total_bytes == off.total_bytes
 
     def test_the_round_trip_carries_the_two_new_fields(self):
         """A rank that only recomputes the PUBLISHED inputs must reach the
@@ -139,6 +160,42 @@ class TestSizingIsByteIdenticalByDefault:
         assert back.band_credit is True
         assert back.n_cross_lanes == 3
         assert back.total_bytes == t.total_bytes
+
+    def test_round_tripped_band_credit_is_a_real_bool_not_a_truthy_int(self):
+        """BOOT7's pyright gate (2026-09-14): `read_published_terms` used to
+        build its `kw` dict uniformly with `int(value)`, so `band_credit`
+        arrived at `bounce_terms(**kw)` typed `int`, not `bool` -- harmless
+        at THIS boot only because nobody published a nonzero value yet.
+        Pinned as an actual type, not merely a truthy comparison, so the
+        class of bug (an int silently accepted where bool is declared)
+        cannot return unnoticed."""
+        t = xb.bounce_terms(**XSN31, slot_bytes=128 * MIB, band_credit=True,
+                            n_cross_lanes=2)
+        back = xb.read_published_terms(xb.publish_terms(t))
+        assert type(back.band_credit) is bool
+        back_off = xb.read_published_terms(
+            xb.publish_terms(xb.bounce_terms(**XSN31, slot_bytes=128 * MIB)))
+        assert type(back_off.band_credit) is bool
+
+    def test_M_corrupted_band_credit_value_refuses_named_not_silent_arm(self):
+        """MUTANT, RED without the fix: a `band_credit` value that is
+        neither `0` nor `1` in the published string (hand-edited env var, a
+        future producer bug -- `publish_terms` itself never writes anything
+        else) must REFUSE, never silently ARM the feature on bare
+        truthiness. This is the exact danger BOOT7's pyright gate named:
+        "in the moment an int lands on a bool parameter, every nonzero
+        value is truthy -- band_credit would arm itself where nobody is
+        looking." Built by hand-crafting the published string, since
+        `publish_terms` itself can never produce this value -- the
+        corruption this guards against arrives from OUTSIDE this module's
+        own writer.
+        """
+        t = xb.bounce_terms(**XSN31, slot_bytes=128 * MIB)
+        good = xb.publish_terms(t)
+        corrupted = good.replace("band_credit=0", "band_credit=2")
+        assert "band_credit=2" in corrupted, "the replace did not match"
+        with pytest.raises(ValueError, match="band_credit=.*neither 0 nor 1"):
+            xb.read_published_terms(corrupted)
 
 
 class TestBandCreditShrinksOnlyTheCrossShare:
@@ -782,15 +839,31 @@ class TestBandCreditAndLanesConcurrentInteract:
                 max_tag_bytes=0,           # Option 1 NOT active
                 band_credit=True, n_cross_lanes=3)
 
-    def test_band_credit_alone_without_n_cross_lanes_never_refuses(self):
-        """The refusal is conditioned on `n_cross_lanes > 0` -- turning
-        `band_credit` on with nothing yet counted as cross (the safe,
-        inert default, already pinned above) must never raise, since it
-        prices identically to `band_credit=False`."""
+    def test_band_credit_alone_refuses_when_max_tag_bytes_is_unset(self):
+        """#1397 VERDRAHTUNG SUPERSEDES THE PRE-WIRING EXPECTATION: since
+        `n_cross_lanes=None` (unstated) now auto-derives to a POSITIVE count
+        whenever `n_lanes > N_CARDS`, `band_credit=True` ALONE is enough to
+        reach the max_tag_bytes refusal -- exactly the REACHABILITY the
+        wiring exists to guarantee (a refusal nobody can reach on the real
+        arming path is the same defect in smaller form). n_lanes=5 > N_CARDS
+        (3) here, so auto-derivation yields 2, not 0."""
+        with pytest.raises(ValueError, match="band_credit.*max_tag_bytes"):
+            xb.bounce_terms(
+                bytes_per_direction=1000, n_layers=2, widest_layer_bytes=1000,
+                pairs=1, depth=1, slot_bytes=64, n_lanes=5, max_tag_bytes=0,
+                band_credit=True)          # n_cross_lanes auto-derives to 2
+
+    def test_band_credit_alone_stays_inert_when_n_lanes_at_or_below_N_CARDS(
+            self):
+        """The genuinely SAFE-inert case: with `n_lanes <= N_CARDS` there
+        are structurally no GUARANTEED cross lanes to auto-derive
+        (`resolve_cross_lanes` floors at 0), so `band_credit=True` alone
+        prices nothing extra and does not need `max_tag_bytes` at all."""
         t = xb.bounce_terms(
             bytes_per_direction=1000, n_layers=2, widest_layer_bytes=1000,
-            pairs=1, depth=1, slot_bytes=64, n_lanes=5, max_tag_bytes=0,
-            band_credit=True)             # n_cross_lanes defaults to 0
+            pairs=1, depth=1, slot_bytes=64, n_lanes=3, max_tag_bytes=0,
+            band_credit=True)
+        assert t.n_cross_lanes == 0
         assert t.n_cross_lanes_priced == 0
 
 

@@ -1293,9 +1293,24 @@ def run_bounce_leg(
     # `terms.cross_lane_slots` instead -- the SAME producer discipline,
     # `BounceTerms` is still the one authority, just a different property of
     # it for a lane the whole-tag floor was never required for.
-    slots = (int(terms.cross_lane_slots) if _band_credit_leg
-             else int(terms.lane_slots) if _option1_leg
-             else xb.assemble_slots(int(depth), comparing=comparing))
+    #
+    # AN if/elif/else, NOT A TERNARY -- pyright cannot narrow `terms` past
+    # `Optional[BounceTerms]` through a bare `_band_credit_leg`/`_option1_leg`
+    # boolean (it is not an inline `terms is not None` expression), so a
+    # ternary here reads as a possible `None.cross_lane_slots` even though
+    # both booleans PROVE `terms is not None` by their own definitions
+    # above (`_option1_leg = terms is not None and ...`,
+    # `_band_credit_leg = _option1_leg and ...`). The `assert` in each
+    # branch is that proof, spelled for the type checker in the same
+    # branch it is read in -- pinned rather than silenced.
+    if _band_credit_leg:
+        assert terms is not None
+        slots = int(terms.cross_lane_slots)
+    elif _option1_leg:
+        assert terms is not None
+        slots = int(terms.lane_slots)
+    else:
+        slots = xb.assemble_slots(int(depth), comparing=comparing)
     if phase != PHASE_BOTH and not lane:
         raise Weg2XchgBouncePhaseUnordered(
             f"W68 Weg2XchgPlanDisagree: phase={phase} without a lane key. The "
@@ -1320,6 +1335,11 @@ def run_bounce_leg(
     # for a slot the loop could not reach.
     inflight: List[Optional[object]] = [None] * int(slots)
     if _band_credit_leg and phase == PHASE_DEPOSIT:
+        # `_band_credit_leg` proves `rendezvous is not None` (its own
+        # definition above: `getattr(rendezvous, "pair", None) is not
+        # None`) -- spelled for the type checker, same doctrine as the
+        # `slots` if/elif/else two screens up.
+        assert rendezvous is not None
         # #1397: discard a PRIOR tag's uncollected tail before this tag's own
         # first band -- see `CrossSlotRendezvous.prime_band_drain`'s own
         # docstring for why this is the only safe instant.
@@ -1351,6 +1371,14 @@ def run_bounce_leg(
                         # (`_band_credit_leg` requires `rendezvous.pair is
                         # not None`), so it still takes the `else` refusal
                         # below, unchanged, exactly as before #1397.
+                        #
+                        # PROVEN, NOT HOPED: `_band_credit_leg` is False
+                        # whenever `rendezvous` is None (its own definition
+                        # above reads `getattr(rendezvous, "pair", None)`,
+                        # which answers `None` rather than raising on a
+                        # None receiver) -- spelled here for the type
+                        # checker, same doctrine as the two sites above.
+                        assert rendezvous is not None
                         if not rendezvous.wait_band_drained():
                             raise xr.Weg2XchgGateTimeout(
                                 f"W69 Weg2XchgGateTimeout: band {bands} of "
