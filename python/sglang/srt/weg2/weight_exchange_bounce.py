@@ -1654,15 +1654,19 @@ def run_bounce_leg(
 # one pair's `full` for another pair's bytes.
 
 
-#: The rendezvous wait budget for the BOOT'S LANES.
-#: NUTZER-ORDER 14.09. ("den timeout deutlich verringern -- er loest nichts,
-#: er verlaengert nur die Zeit bis zur Erkennung"): 600 s (my first attempt,
-#: also this session) turned the co-located pair's deadlock into a SILENT
-#: stall the operator could not see on cpu/gpu/pcie -- measured twice. The
-#: budget is back at 120 s: the race it must survive is the deposit's
-#: staging (~123 s measured on weg2xsn34), and a REAL deadlock now dies at
-#: 2 minutes with the named W68 instead of hanging silently for ten.
-LANE_RENDEZVOUS_BUDGET_S = 120.0
+#: The rendezvous wait budget for the BOOT'S LANES -- and it MUST cover the
+#: deposit's STAGING: the deposit's first post lands ~123 s after the flip
+#: begins (MEASURED twice: weg2xsn34's post at 123 s, weg2xsn40's W68 at the
+#: 120 s expiry with the post seconds behind). The COPY itself is ~1.5 s
+#: (NUTZER-Modell 14.09.); the STAGING (the deposit's pause chain) is the
+#: flip's own setup phase and is what the collect's first wait has to
+#: survive. History of this number: 600 s (the silent 10-minute stall,
+#: NUTZER: "der timeout loest nichts, er verlaengert nur die Zeit bis zur
+#: Erkennung") -> 120 s (lost the staging race twice) -> 180 s: covers the
+#: measured staging with ~45 s margin, and a REAL deadlock still dies here
+#: with the named W68 -- while the front's W17 gate (dc9cd96c60) keeps the
+#: boot alive during the legitimate leg blocking.
+LANE_RENDEZVOUS_BUDGET_S = 180.0
 
 
 class _NullLock:

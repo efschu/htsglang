@@ -48,11 +48,10 @@ class TheConstructionSiteUsesTheLaneBudget(unittest.TestCase):
                       "bound, not the 120 s tool default -- the xsn34 race "
                       "(120 s expired 3 s before the post) is exactly what "
                       "this pin keeps closed")
-        self.assertEqual(bx.LANE_RENDEZVOUS_BUDGET_S, 120.0,
-                         "NUTZER-ORDER 14.09.: short budgets fail fast -- a "
-                         "long timeout only delays the detection of the fail "
-                         "(measured twice: the 600 s stall was invisible on "
-                         "cpu/gpu/pcie)")
+        # 180 s: the deposit's measured staging (~123 s) + margin. The race
+        # this budget must survive: the collect's first wait vs the deposit's
+        # first post (xsn34: post 123 s, budget 120 s -> W68; xsn40: same).
+        self.assertEqual(bx.LANE_RENDEZVOUS_BUDGET_S, 180.0)
 
 
 if __name__ == "__main__":
