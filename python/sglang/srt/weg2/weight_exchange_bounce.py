@@ -2239,14 +2239,14 @@ def run_sequential_units(units, ops, boot_nonce: str, *,
             fh.truncate(biggest)
     fh = open(path, "r+b")
     buf = _mmap.mmap(fh.fileno(), biggest)
-    # #1378 xsn46 (THE PIN): the device cannot read a plain host mmap --
-    # cudaHostRegister(Portable) makes the host address device-accessible
-    # (the LayerBounce's own mechanism, measured "region=shm,pinned").
-    # Without it, memcpy_async dies with "cannot be converted to pointer"
-    # on all three ranks (the xsn46 wall).
-    ops.host_register(_mmap_addr(buf), biggest,
-                      tp.CUDA_HOST_REGISTER_PORTABLE)
-    _seq_registered = True
+    # #1378 xsn47: NO cudaHostRegister on the sequential buffer. The
+    # buffer is shared across six processes (the same tmpfs file, the same
+    # boot_nonce) -- cudaHostRegister is per-page, and the second process's
+    # registration of the same physical pages fails with rc=712
+    # (HostMemoryAlreadyRegistered). Instead, the copies use the ops' SYNCHRONOUS
+    # memcpy (not async), which works from any host memory without pinning.
+    # The sequential form doesn't need async: each unit completes before
+    # the next begins.
     sems = tp.SemSet(boot_nonce)
     log = log or (lambda *a: None)
     for i, (name, tag, nbytes, src_addr, dst_addr) in enumerate(units):
@@ -2329,11 +2329,6 @@ def run_sequential_units(units, ops, boot_nonce: str, *,
             sems.post(pair=0, slot=_SEQ_SLOT, kind="empty")
             log(f"WEG2-SEQ collect {label} digest={my_digest} "
                 f"matches deposit")
-    if _seq_registered:
-        try:
-            ops.host_unregister(_mmap_addr(buf))
-        except BaseException:  # noqa: BLE001
-            pass
     buf.close()
     fh.close()
     return ""
