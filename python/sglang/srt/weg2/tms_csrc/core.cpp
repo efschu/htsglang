@@ -332,6 +332,15 @@ void TorchMemorySaver::resume(const std::string& tag) {
         matched_ptrs.push_back(ptr);
     }
 
+    // #1280: allocs='s companion denominator for the WEG2-RING LEG line
+    // below, summed BEFORE pass 1 touches the device -- a pure host-side
+    // read of metadata already held under this function's own lock, so it
+    // cannot itself perturb the timings it is about to sit beside.
+    uint64_t weg2_leg_bytes = 0;
+    for (size_t m = 0; m < matched_ptrs.size(); ++m) {
+        weg2_leg_bytes += (uint64_t) allocation_metadata_[matched_ptrs[m]].size;
+    }
+
     // --- pass 1: map every allocation of the tag ---
     const auto weg2_map_t0 = std::chrono::steady_clock::now();   // S7 (#1273)
     for (size_t m = 0; m < matched_ptrs.size(); ++m) {
@@ -384,11 +393,69 @@ void TorchMemorySaver::resume(const std::string& tag) {
         any_copy = true;
     }
 
+    // #1280: THE NEW SPLIT -- between pass 2's issue and pass 3's
+    // synchronise, so a per-tag ms no longer over-attributes the ISSUE
+    // (host-side driver-call overhead x granule count) and the SYNC (the
+    // actual blocking wait for the PCIe transfer) to one lumped number.
+    // Pure std::chrono::steady_clock read, exactly like weg2_map_t0/t1
+    // already were -- no device call, so it cannot introduce a
+    // synchronisation the measurement did not already have.
+    const auto weg2_copy_issue_t1 = std::chrono::steady_clock::now();
+
     // --- pass 3: ONE synchronisation for the whole tag ---
     if (any_copy) {
         CUDA_ERROR_CHECK(cudaStreamSynchronize(backup_stream_));
     }
+    const auto weg2_sync_t1 = std::chrono::steady_clock::now();   // #1280
+    // note_resume's OWN "now()" (map_ms/copy_ms, S7 #1273) is read INSIDE
+    // it -- called here, at the SAME position it always was, so the one
+    // extra chrono read above (nanoseconds, no device call) is the only
+    // thing between pass 3 and it; the WEG2-RING LEG print below runs
+    // AFTER this call, never before it, so the (slower, unbounded) stderr
+    // write cannot leak into S7's own copy_ms reading.
     note_resume(tag, matched_ptrs.size(), weg2_map_t0, weg2_map_t1);   // S7 (#1273)
+
+    // #1280: WEG2-RING LEG -- the ring restore leg split into its three
+    // passes, so a per-tag wall no longer over-attributes to the copy.
+    // remap_ms = pass 1 (VMM cu_mem_create/cuMemMap/cu_mem_set_access,
+    // cost scales with allocs=, never logged before this ticket); copy_ms
+    // = pass 2's async H2D issue ALONE; sync_ms = pass 3's single
+    // blocking synchronise -- the actual PCIe/duplex-bound wait, kept
+    // apart from the issue overhead on purpose, because "is this leg
+    // wire-bound or map-bound" is exactly the question #1369 (ring
+    // teardown) and #1354 (remap flip) both need answered before either
+    // is decided. allocs= is remap_ms's own denominator (#1352b: a rate
+    // printed with no population beside it is a Class-A instrument lie);
+    // bytes= is the same population's size, the natural companion for a
+    // GB/s reading over copy_ms+sync_ms.
+    //
+    // EVERY value here is a GENUINE measurement even when a pass touched
+    // zero allocations or zero bytes needed copying -- 0 allocs -> ~0
+    // remap_ms is real work of nothing, not an absence, the same
+    // convention S7's own map_ms/copy_ms already print (a tag matched to
+    // no allocation logs allocations=0 map_ms=0.0, weight_updater.py
+    // WEG2-FLIP-TAG). "n/a" is reserved for an instrument that could not
+    // run at all, which for this print is only the ROCm build: that is an
+    // entirely different code path (rocm_resume, above) that never
+    // reaches this line at all -- it prints nothing here, never a
+    // fabricated n/a-shaped line.
+    //
+    // NOTE ON THE NAME COLLISION: WEG2-FLIP-TAG's own `copy_ms` (S7,
+    // weight_updater.py) is defined as pass 2's issue PLUS pass 3's
+    // synchronise combined -- a DIFFERENT quantity than this line's
+    // `copy_ms` (issue alone). The two lines are deliberately not merged
+    // (see #1280's own analysis for why: appending here would need a
+    // second, separate ctypes/adapter signature change for one already-
+    // wired instrument, exactly the second-publication-path risk this
+    // fork keeps paying for) -- a reader comparing the two fields across
+    // WEG2-FLIP-TAG and WEG2-RING LEG must read this paragraph, not guess.
+    std::cerr << "[core.cpp] WEG2-RING LEG tag=" << tag
+              << " remap_ms=" << std::chrono::duration<double, std::milli>(weg2_map_t1 - weg2_map_t0).count()
+              << " copy_ms=" << std::chrono::duration<double, std::milli>(weg2_copy_issue_t1 - weg2_map_t1).count()
+              << " sync_ms=" << std::chrono::duration<double, std::milli>(weg2_sync_t1 - weg2_copy_issue_t1).count()
+              << " allocs=" << matched_ptrs.size()
+              << " bytes=" << weg2_leg_bytes
+              << std::endl;
 
     // --- pass 4: give the host bytes back ---
     for (size_t m = 0; m < matched_ptrs.size(); ++m) {
