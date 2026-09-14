@@ -1376,6 +1376,34 @@ def leg_plan_from_join(
         return None, refusal("unjoinable", f"{type(exc).__name__}: {exc}")
 
     # (the region cut ran before the join -- see above)
+    # #1378 xsn52 (DER PLAN-CONTENT-WAECHTER): per co-located card, the two
+    # groups' tag sets for this leg's region must match, or the deposit
+    # posts bands nobody reads and the collect waits for bands nobody
+    # posts (the W68 family, measured on weg2xsn43: the deposit leg
+    # carried 9 tags on D rank0, the collect leg 6 tags on P rank0 -- the
+    # TP/PP phase asymmetry means the per-rank tag sets CANNOT match by
+    # construction, so the exchange scope must be the INTERSECTION,
+    # narrowed BEFORE the bands are derived).
+    _src_g, _dst_g = (pp_group, tp_group) if direction == wx.LEGS_TP_TO_PP else (tp_group, pp_group)
+    _per_card = {}
+    for man in manifests:
+        for pc in man.pieces:
+            if region_of_tag(pc.tag) != my_region: continue
+            _per_card.setdefault(man.card, {}).setdefault(man.group, set()).add(str(pc.tag))
+    for card_id, groups in sorted(_per_card.items()):
+        if len(groups) < 2: continue
+        tag_sets = [tags for g, tags in sorted(groups.items())]
+        if tag_sets[0] != tag_sets[1]:
+            only_src = sorted(tag_sets[0] - tag_sets[1])
+            only_dst = sorted(tag_sets[1] - tag_sets[0])
+            return None, refusal(
+                "plan-tag-divergence",
+                f"card {card_id}: the two groups' tag sets diverge for "
+                f"region {my_region}: only_src={only_src} only_dst={only_dst} "
+                f"-- the deposit would post bands nobody reads and the "
+                f"collect would wait for bands nobody posts (the W68 "
+                f"family, measured on weg2xsn43). Narrow the exchange to "
+                f"the INTERSECTION before deriving bands.")
     try:
         plan = plan_from_join(join, direction=direction,
                               src_addr=src_addr, dst_addr=dst_addr)
