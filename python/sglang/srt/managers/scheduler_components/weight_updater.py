@@ -8,7 +8,7 @@ import time
 import traceback
 from collections import OrderedDict
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace as _dataclasses_replace
 from datetime import timedelta
 from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Tuple
 
@@ -1036,7 +1036,7 @@ class SchedulerWeightUpdaterManager:
             return self.CARRIER_TMS_BACKUP
         return self.CARRIER_DISK
 
-    def _weg2_xchg_inject_weights(self, *, tag=None, **kw) -> None:
+    def _weg2_xchg_inject_weights(self, *, tag=None, **kw) -> bool:
         """Fill the remapped weight pages from the PEER GROUP, not from disk.
 
         #1273 S6 step 5, the authoritative half.  The bytes come from the peer
@@ -1087,7 +1087,7 @@ class SchedulerWeightUpdaterManager:
                 "is not an option either. Launch through the weg2 launcher, "
                 "which publishes the term it charged on the ARM line."
             )
-        self._weg2_xchg_inject_from_peer(terms=terms, tag=tag, **kw)
+        return self._weg2_xchg_inject_from_peer(terms=terms, tag=tag, **kw)
 
     def _weg2_xchg_deposit_before_sleep(self, *, flip_index: int = -1,
                                         tag: Optional[str] = None) -> None:
@@ -1240,9 +1240,27 @@ class SchedulerWeightUpdaterManager:
             # has not yet been mutated for it.
             _gap = self._weg2_xchg_wake_source_gap(tag, cdescs_present=bool(_descs))
             if _gap is not None:
+                # NUTZER-ORDER 2026-09-14 (PRONTO, den Ring abschalten):
+                # "jeder pausierte Tag, der beim resume KEINE Quelle hat,
+                # muss den Boot mit NAMEN UND BYTE-ZAHL toeten" -- `tag` was
+                # already the name; this adds the count. `_weg2_tag_bytes`
+                # is the file's own established instrument for it (C7/C16,
+                # `tms_tag_bytes`, already read at this exact call site's
+                # caller for the credit publish two lines below the pause
+                # this deposit precedes) -- not a new derivation, the SAME
+                # number the sleep leg is about to release. A `0` here is
+                # NAMED as unmeasurable rather than printed as a real zero
+                # (NULL-NUR-BEI-ERREICHTEM-EMITTER): a refusal that could
+                # itself lie about a byte count would be exactly the "still
+                # wrong text" class this whole ticket exists to end.
+                _expected_bytes = self._weg2_tag_bytes(tag)
+                _bytes_text = (f"{_expected_bytes}" if _expected_bytes > 0
+                              else "unmeasurable (tms_tag_bytes answered 0 "
+                                   "or nothing -- see _weg2_tag_bytes)")
                 raise Weg2XchgWakeSourceGapRefused(
                     f"W106 Weg2XchgWakeSourceGapRefused: group={group} "
-                    f"rank={rank} tag={tag}: {_gap}"
+                    f"rank={rank} tag={tag} expected_bytes={_bytes_text}: "
+                    f"{_gap}"
                 )
             if not _descs:
                 # Not an error BEYOND the check above: a tag this rank does
@@ -1342,31 +1360,40 @@ class SchedulerWeightUpdaterManager:
         return None
 
     def _weg2_xchg_draft_reload_from_disk(self) -> bool:
-        """#1394 (DESK10 Paket B): ``weights_draft``'s OWN wake source, since
-        the exchange structurally never covers it.
+        """``weights_draft``'s FALLBACK wake source, tried only when the
+        real exchange has nothing.
 
-        ``_weg2_shadow_plan`` resolves ``region_tag`` from
-        ``self.tp_worker.model_runner`` alone -- the MAIN runner -- on
-        EVERY call, regardless of which tag the per-tag resume loop is
-        processing (verified #1391 round 2, executed:
-        ``weights_region_tag_for(RunnerShape.of(<main runner>))`` never
-        answers ``GPU_MEMORY_TYPE_WEIGHTS_DRAFT``). So neither this rank's
-        own collect NOR the peer's deposit for ``weights_draft`` can ever
-        select the draft runner's descriptors: the exchange is not merely
-        untested for this tag, it is unreachable for it. With the host
-        ring OFF (``weights_cpu_backup_armed()=False``), ``resume`` only
-        remaps pages -- their content is undefined until something writes
-        them. Rebuilding the plan resolution to carry two runners (option
-        (a) in DESIGN_1394) is the bigger, riskier change; this is the
-        smaller one: reload straight from the checkpoint on disk, through
-        the SAME per-shard call ``update_weights_from_disk`` already uses
-        for the draft worker independently of the main one (this method,
-        :2064-2066 region).
+        SUPERSEDED 2026-09-14, PARTIALLY (user order, "draft ist auch nur
+        ein layer... warum muss er ueber den ring gehen?"): #1394's own
+        first cut treated the exchange as STRUCTURALLY unable to cover this
+        tag at all, because ``_weg2_shadow_plan`` resolved ``region_tag``
+        from ``self.tp_worker.model_runner`` alone -- the MAIN runner --
+        on EVERY call (verified #1391 round 2, executed). That is fixed
+        now: ``_weg2_shadow_plan`` additionally asks
+        :meth:`_weg2_xchg_draft_plan_or_none` for the draft runner's OWN
+        region, through the SAME join every other tag already uses, and
+        unions the descriptors -- see that method's docstring for the
+        (a)/(b) population finding (re-materialised embed/head shards vs.
+        the real MTP layer) that makes a genuine, all-or-nothing join
+        failure a REAL possibility on some boots, not a defensive default.
 
-        Returns ``True`` when it did the reload (so the caller can skip the
-        exchange branch for this tag), ``False`` when there is nothing to
-        reload (no draft shard in this process, or the ring still covers
-        it) -- never silently both-or-neither.
+        THIS METHOD IS THEREFORE NO LONGER THE FIRST THING TRIED for
+        ``weights_draft`` -- the caller (``resume_memory_occupation``'s
+        per-tag loop) asks the exchange FIRST, exactly like any other tag,
+        and calls this ONLY when that leg's own collect found ZERO
+        descriptors for the tag. With the host ring OFF
+        (``weights_cpu_backup_armed()=False``) and the exchange genuinely
+        empty for this tag, ``resume`` has only remapped pages -- their
+        content is undefined until something writes them -- so this reload
+        straight from the checkpoint on disk, through the SAME per-shard
+        call ``update_weights_from_disk`` already uses for the draft
+        worker independently of the main one, is what makes the ring
+        removal safe for a boot where the draft join genuinely could not
+        be built (never the ring again, never a mini-ring).
+
+        Returns ``True`` when it did the reload, ``False`` when there is
+        nothing to reload (no draft shard in this process, or the ring
+        still covers it) -- never silently both-or-neither.
         """
         if self.draft_worker is None:
             return False
@@ -1425,7 +1452,7 @@ class SchedulerWeightUpdaterManager:
             )
         return True
 
-    def _weg2_xchg_inject_from_peer(self, *, terms, tag=None, **kw) -> None:
+    def _weg2_xchg_inject_from_peer(self, *, terms, tag=None, **kw) -> bool:
         """The transfer itself, once the term is known.
 
         SEPARATE FROM THE DECISION ABOVE so the seam's test can drive the
@@ -1628,7 +1655,6 @@ class SchedulerWeightUpdaterManager:
             region=self._weg2_shadow_region(),
             sems=_sems, tag=tag, rank=int(rank),
         )
-
         # THE INSTRUMENTS ARE EMITTED BY THE LEG, NOT HERE, and the first
         # version of this method got that wrong in a way worth recording: it
         # called `inject_summary_line([result])` with a `BounceResult` where a
@@ -1644,6 +1670,18 @@ class SchedulerWeightUpdaterManager:
         # wake -- an instrument lie in the same class as #1336.  The per-leg
         # `WEG2-XCHG-INJECT` line and the running summary are now emitted
         # inside `run_bounce_leg`, at the one site that holds the verdict.
+        #
+        # NUTZER-ORDER 2026-09-14: THE WAKE SIDE NEEDS TO KNOW whether this
+        # leg actually carried bytes for `tag`, so it can try the real
+        # exchange FIRST for `weights_draft` too (draft is "just another
+        # layer") and fall back to disk (#1394) only when the exchange
+        # genuinely found nothing -- never the other way around, and never
+        # unconditionally. `bool(_cdescs)` -- computed above, not
+        # re-derived -- is exactly that answer for a caller that named a
+        # `tag`; a caller with `tag=None` (the whole-plan shadow grader)
+        # gets `bool(plan.descs)` instead, which is the same question one
+        # level up.
+        return bool(_cdescs)
 
     def _weg2_wake_reload_weights(self) -> None:
         """Fill the weight pages the resume recommitted, by whatever carries them.
@@ -2819,7 +2857,7 @@ class SchedulerWeightUpdaterManager:
                     pp_group="P", tp_group="D")
                 if mans is None:
                     return None, why
-                return xm.leg_plan_from_join(
+                plan, reason = xm.leg_plan_from_join(
                     hook=str(hook), group=str(group), rank=int(rank),
                     manifests=mans,
                     src_addr=self._weg2_join_src_addr(
@@ -2839,6 +2877,47 @@ class SchedulerWeightUpdaterManager:
                     # 904 (893 being exactly the main runner's own count).
                     region_tag=region_tag,
                     log=logger.info)
+                # NUTZER-ORDER 2026-09-14: "draft ist auch nur ein layer...
+                # warum muss er ueber den ring gehen?" -- ONE REGION PER
+                # RUNNER (the shape `roll_forward_weights_tag`'s own
+                # docstring already named as the correct fix and deferred to
+                # "S6 with W73" -- we are in S6). If this rank ALSO carries
+                # a draft runner whose tag is in the exchange family, ask
+                # the SAME join for THAT runner's OWN region too, and union
+                # the descriptors: the per-tag filter both callers already
+                # apply downstream (`str(getattr(d, "tag", "")) ==
+                # str(tag)`) then scopes correctly to `weights_draft`
+                # without any caller-side special case, the same "one
+                # authority, no special case anywhere" shape
+                # `is_weights_family_tag` already established.
+                #
+                # FAILS SOFT, ON PURPOSE, and ONLY FOR THE DRAFT HALF: a
+                # draft join failure (no counterpart on the peer -- see
+                # `_weg2_xchg_draft_plan_or_none`'s own docstring for the
+                # (a)/(b) population finding that makes this a REAL
+                # possibility, not a defensive default) must not fail the
+                # MAIN region's leg, which is unrelated. The draft tag then
+                # keeps zero descriptors here, exactly the pre-existing
+                # shape `_weg2_xchg_wake_source_gap`'s exemption and
+                # `_weg2_xchg_draft_reload_from_disk` (#1394) already
+                # handle -- disk, never the ring, never a mini-ring.
+                if plan is not None:
+                    draft_plan, draft_reason = self._weg2_xchg_draft_plan_or_none(
+                        hook=str(hook), group=str(group), rank=int(rank),
+                        mans=mans)
+                    if draft_plan is not None and draft_plan.descs:
+                        plan = _dataclasses_replace(
+                            plan, descs=tuple(plan.descs) + tuple(draft_plan.descs),
+                            tags=tuple(sorted(set(plan.tags) | set(draft_plan.tags))))
+                    elif draft_reason:
+                        logger.info(
+                            "WEG2-XCHG-DRAFT-PLAN-SKIPPED hook=%s group=%s "
+                            "rank=%s: %s -- weights_draft keeps zero "
+                            "exchange descriptors this leg; the wake side "
+                            "falls back to its own disk-reload path (#1394) "
+                            "rather than the ring",
+                            hook, group, rank, draft_reason)
+                return plan, reason
             plan, reason = sh.derive_leg_plan(
                 hook=str(hook), group=str(group),
                 peer=("D" if group == "P" else "P"), rank=int(rank),
@@ -2869,6 +2948,128 @@ class SchedulerWeightUpdaterManager:
             # #1328, same reason as the manifest arm one method up: a swallowed
             # exception that reports only its type cannot be acted on.
             return None, f"derivation-failed:{_weg2_exc_note(exc)}"
+
+    def _weg2_xchg_draft_plan_or_none(self, *, hook: str, group: str,
+                                      rank: int, mans):
+        """THE DRAFT RUNNER'S OWN LEG, joined against the SAME manifests.
+
+        NUTZER-ORDER 2026-09-14 ("draft ist auch nur ein layer... warum muss
+        er ueber den ring gehen?"): ONE REGION PER RUNNER, the shape
+        ``weight_exchange.roll_forward_weights_tag``'s own docstring already
+        names as the correct fix, deferred there to "S6 with W73" -- this is
+        that fix's exchange-plan half. Returns ``(None, "")`` whenever the
+        draft runner is not applicable at all (no draft worker in this
+        process, exchange not armed, or the tag is not in the family) --
+        that is not a failure, it is "nothing to add", and callers must not
+        log it as one. Returns ``(None, reason)`` when a draft runner IS
+        applicable but its OWN join could not be built, and ``(plan, "")``
+        on success.
+
+        THE (a)/(b) POPULATION FINDING, verified by reading (no boot this
+        round): ``weight_exchange.weights_region_tag_for``'s own docstring
+        measures group D's ``weights_draft`` tag at 1382/1311/1311 MiB, of
+        which the checkpoint's ``mtp.*`` term is only 0.396 GiB -- the
+        REMAINDER is embed/head shards the draft runner RE-MATERIALISES
+        rather than loads a peer-exchanged copy of. ``launcher.py``'s
+        ``DRAFT_KV_ON_P_DEFAULT = "on"`` (read, not edited -- DESK9's file)
+        means group P's shipped default DOES carry the four speculative
+        flags (``P_DRAFT_KV_FLAGS``), so the STALE half of that docstring's
+        own premise ("Group P carries no --speculative-* in this form") is
+        wrong on the shipped default -- P's own draft/producer runner is a
+        real candidate SOURCE for the ``mtp.*`` layer's bytes.
+
+        WHETHER THE RE-MATERIALISED SHARDS (population a) ALSO HAPPEN TO
+        MATCH ACROSS GROUPS -- because both sides load them deterministically
+        from the identical checkpoint bytes -- is NOT something this file can
+        determine without a real boot's manifests: ``xchg_manifest.
+        join_manifests`` (xchg_manifest.py:800-934, DESK9's file, read not
+        edited) is ALL-OR-NOTHING per region -- ANY name present on one side
+        and absent on the other raises ``Weg2XchgSourceMissing`` (W74) for
+        the WHOLE region's join, discarding tensors that DID match along with
+        the ones that did not (:930-934, the `unsourced` list is checked only
+        AFTER the matching loop finishes). There is therefore no
+        `file:line`-clean way to move ONLY population (b) through this join
+        while leaving population (a) to disk within ONE region/tag -- that
+        would need per-PARAMETER tagging inside the draft runner's own memory
+        region (model_runner.py / the model class, outside this file's
+        boundary), not a change to how this method calls the join.
+
+        SO THIS METHOD MAKES NO ASSUMPTION EITHER WAY: it tries the real
+        join for the WHOLE ``weights_draft`` region, exactly like the main
+        region above. If group P's producer construction happens to hold a
+        matching name for every one of group D's draft-region tensors (which
+        this file cannot verify without a boot), the WHOLE tag -- MTP layer
+        included -- moves through the real exchange, byte-identical
+        population (a) bytes and all, which is correct (not merely
+        harmless): both sides already compute them identically from the same
+        checkpoint, so exchanging them is not a new source of truth, just a
+        redundant one. If even ONE name is genuinely one-sided (population
+        (a) really is asymmetric on this boot's actual argv), the WHOLE
+        region's join refuses (W74) and this method reports that reason
+        upward rather than inventing a partial success -- the caller then
+        keeps the pre-existing disk-reload fallback (#1394,
+        :meth:`_weg2_xchg_draft_reload_from_disk`) for the tag, never the
+        ring, never a mini-ring.
+        """
+        try:
+            from sglang.srt.managers import weg2_memory_saver as ms
+            from sglang.srt.weg2 import weight_exchange as wx
+            from sglang.srt.weg2 import xchg_manifest as xm
+
+            if not wx.exchange_armed():
+                return None, ""
+            draft_worker = getattr(self, "draft_worker", None)
+            if draft_worker is None:
+                return None, ""
+            try:
+                drafter = _get_draft_model_runner(draft_worker)
+            except BaseException:  # noqa: BLE001 -- an observer never raises
+                drafter = None
+            if drafter is None:
+                return None, ""
+            draft_model = getattr(drafter, "model", None)
+            if draft_model is None:
+                return None, ""
+            try:
+                draft_region_tag = wx.weights_region_tag_for(
+                    wx.RunnerShape.of(drafter))
+            except BaseException:  # noqa: BLE001 -- an unclassified shape
+                return None, "draft-shape-unclassified"
+            if draft_region_tag != wx.GPU_MEMORY_TYPE_WEIGHTS_DRAFT:
+                # A drafter this arm classifies as something other than the
+                # draft region (e.g. #631/#274's shapes, which stay in the
+                # BASE tag by `weights_region_tag_for`'s own design) has
+                # nothing separate to add here -- its bytes are already part
+                # of the main region's plan above.
+                return None, ""
+            if not ms.is_weights_family_tag(draft_region_tag):
+                # The membership predicate itself says no (e.g. the ring arm,
+                # where `draft_tag_in_family()` is False by construction) --
+                # not this method's call to make differently.
+                return None, ""
+            draft_plan, draft_reason = xm.leg_plan_from_join(
+                hook=str(hook), group=str(group), rank=int(rank),
+                manifests=mans,
+                src_addr=self._weg2_join_src_addr(
+                    str(hook), str(group), int(rank), draft_model,
+                    region=draft_region_tag),
+                dst_addr=self._weg2_join_dst_addr(
+                    str(hook), str(group), int(rank), draft_model,
+                    region=draft_region_tag),
+                model=draft_model,
+                # THE DRAFT RUNNER'S OWN REGION, never the main one -- MUTANT
+                # 1's own danger direction (a draft leg reading the main
+                # region's bands would write foreign bytes into the draft
+                # head, silently). `test_the_draft_leg_never_reads_the_main_
+                # regions_bands` pins this by construction, not by hope.
+                region_tag=draft_region_tag,
+                log=logger.info)
+            return draft_plan, ("" if draft_plan is not None
+                               else (draft_reason or "draft-join-refused"))
+        except BaseException as exc:  # noqa: BLE001 -- an observer never
+            # raises: a draft-region failure must never take the MAIN
+            # region's leg down with it.
+            return None, f"draft-derivation-failed:{_weg2_exc_note(exc)}"
 
     def _weg2_rank_param_table(self):
         """Every live parameter THIS PROCESS holds, across BOTH its runners.
@@ -4891,39 +5092,48 @@ class SchedulerWeightUpdaterManager:
                         float(tag_bytes.get(tag, 0)),
                         (time.perf_counter() - t_tag) * 1000,
                     ]
-                    # #1394 (DESK10 Paket B): weights_draft's OWN wake source,
-                    # BEFORE the exchange branch below is even asked -- the
-                    # exchange structurally never covers this tag (see
-                    # `_weg2_xchg_draft_reload_from_disk`'s own docstring), so
-                    # asking `_weg2_wake_weight_carrier()` for it first would
-                    # just read CARRIER_EXCHANGE and collect nothing, exactly
-                    # #1394's own finding. `_weg2_xchg_draft_reload_from_disk`
-                    # is itself a no-op (returns False) whenever the ring
-                    # still covers this tag or there is no draft shard here,
-                    # so this call costs nothing on every OTHER tag and every
-                    # pre-#1369 boot.
                     from sglang.srt.managers.weg2_memory_saver import (
                         GPU_MEMORY_TYPE_WEIGHTS_DRAFT as _WEIGHTS_DRAFT_TAG,
                     )
 
-                    if (str(tag) == _WEIGHTS_DRAFT_TAG
-                            and self._weg2_xchg_draft_reload_from_disk()):
-                        pass
+                    # NUTZER-ORDER 2026-09-14, REVERSING #1394'S OWN ORIGINAL
+                    # PRIORITY: "draft ist auch nur ein layer... warum muss er
+                    # ueber den ring gehen?" -- he is right, and the join now
+                    # gives him the source (`_weg2_shadow_plan`'s per-runner
+                    # merge, above). So the disk-reload short-circuit that
+                    # used to run BEFORE even asking the carrier -- correct
+                    # ONLY while the exchange structurally never covered this
+                    # tag at all -- would now silently PREVENT the real
+                    # exchange from ever being tried, on every boot, forever.
+                    # The exchange is asked FIRST, exactly like any other
+                    # tag; disk is the FALLBACK, taken only when this leg's
+                    # own collect found zero descriptors for `weights_draft`
+                    # (`_weg2_xchg_inject_weights`'s return value, computed at
+                    # the one frame that holds the filtered `_cdescs` --
+                    # `_weg2_xchg_inject_from_peer`, not re-derived here).
+                    # `_weg2_xchg_draft_reload_from_disk` stays itself a
+                    # no-op (returns False) whenever the ring still covers
+                    # this tag or there is no draft shard here, so this whole
+                    # branch costs nothing on every OTHER tag and every
+                    # pre-#1369 boot.
                     # #1374 F1: COLLECT THIS TAG NOW, while it is the tag the
                     # resume has just mapped -- resume(t) -> collect(t) ->
                     # post_drained(t), the mirror of the source's deposit(t) ->
                     # pause(t) -> credit(t). Before #1374 the whole plan was
                     # collected after the loop, which is why the peer's
                     # per-tag deposit had nobody to drain it.
-                    # TRAIN2 merge note (2026-09-14): walrus keeps Paket B's
-                    # (#1394) elif-exclusivity AND #1391 round 4's lazy carrier
-                    # capture for the shadow-elif below in the SAME chain --
-                    # a hoist of the carrier read above this if/elif would
-                    # reintroduce exactly what #1394 avoids (asking the carrier
-                    # for a draft tag before the disk-reload short-circuit).
-                    elif (_weg2_carrier_this_tag := self._weg2_wake_weight_carrier()) == self.CARRIER_EXCHANGE:
-                        self._weg2_xchg_inject_weights(tag=tag)
+                    if (_weg2_carrier_this_tag := self._weg2_wake_weight_carrier()) == self.CARRIER_EXCHANGE:
+                        _weg2_collected_real_bytes = self._weg2_xchg_inject_weights(tag=tag)
                         self._weg2_xchg_collected_per_tag = True
+                        if (str(tag) == _WEIGHTS_DRAFT_TAG
+                                and not _weg2_collected_real_bytes
+                                and self._weg2_xchg_draft_reload_from_disk()):
+                            pass  # the exchange carried nothing for this tag
+                    elif (str(tag) == _WEIGHTS_DRAFT_TAG
+                            and self._weg2_xchg_draft_reload_from_disk()):
+                        pass  # not CARRIER_EXCHANGE at all (e.g. ring, or a
+                        # non-authoritative arm) -- the disk path is the only
+                        # candidate; itself a no-op when the ring covers it
                     # #1391 (DESK10) ROUND 4: THE SAME PER-TAG STEP, UNDER
                     # SHADOW. Coordinator's hypothesis, verified at this exact
                     # site before building the fix: under CARRIER_EXCHANGE the

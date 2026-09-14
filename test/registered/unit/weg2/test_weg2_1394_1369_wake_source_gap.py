@@ -330,6 +330,58 @@ def test_the_deposit_leg_refuses_by_name_when_the_plan_is_empty_and_the_ring_is_
     msg = str(exc.value)
     assert "W106" in msg
     assert "weights_0" in msg
+    # NUTZER-ORDER 2026-09-14 (PRONTO): "jeder pausierte Tag ... muss den
+    # Boot mit NAMEN UND BYTE-ZAHL toeten" -- the name was already there,
+    # this checks the count joined it. No fake adapter is wired in
+    # `_manager`, so `_weg2_tag_bytes` genuinely cannot answer here --
+    # exactly the case NULL-NUR-BEI-ERREICHTEM-EMITTER exists for: the
+    # message must say so by name, never print a bare "0" that reads as a
+    # real, measured zero-byte tag.
+    assert "expected_bytes=unmeasurable" in msg
+
+
+class _FakeAdapterWithTagBytes:
+    """A `memory_saver_adapter` double whose `tag_bytes` genuinely answers,
+    for the byte-count-in-the-refusal test below -- the REAL instrument
+    (`_weg2_tag_bytes`) is driven, not reimplemented."""
+
+    def __init__(self, mapping):
+        self._mapping = dict(mapping)
+
+    def tag_bytes(self, tag):
+        return self._mapping.get(str(tag), 0)
+
+
+def test_the_refusal_names_the_real_measured_byte_count(
+        monkeypatch, ring_off, authoritative):
+    """The other half of the same order: when `_weg2_tag_bytes` CAN answer,
+    the refusal carries the actual number, not the unmeasurable text --
+    driven through `self._weg2_tag_bytes(tag)`, the SAME instrument
+    `resume_memory_occupation`'s own credit-publish call already reads for
+    this tag (weight_updater.py's `tag_bytes` dict), not a new derivation."""
+    from sglang.srt.weg2 import weight_exchange_region as xr
+
+    monkeypatch.setenv(xr.ENV_REGION_BOOT, "1394boot-bytes")
+    m = _manager(monkeypatch, group="D", rank=0)
+    m.memory_saver_adapter = _FakeAdapterWithTagBytes({"weights_0": 3057647616})
+    monkeypatch.setattr(
+        Manager, "_weg2_shadow_plan",
+        lambda self, hook, g, r, agreed=None, require_agreement=None:
+            (_FakePlan([_FakeDesc("a.w", tag="weights_9", src_rank=0)]), ""),
+        raising=True)
+    monkeypatch.setattr(Manager, "_weg2_xchg_device_ops", lambda self: object(),
+                        raising=True)
+
+    from sglang.srt.weg2 import xchg_bounce as xb
+
+    monkeypatch.setattr(xb, "read_published_terms", lambda: _FakeTerms(),
+                        raising=False)
+
+    with pytest.raises(Weg2XchgWakeSourceGapRefused) as exc:
+        m._weg2_xchg_deposit_before_sleep(flip_index=0, tag="weights_0")
+    msg = str(exc.value)
+    assert "expected_bytes=3057647616" in msg
+    assert "unmeasurable" not in msg
 
 
 def test_the_deposit_leg_stays_a_no_op_when_the_ring_still_covers_it(

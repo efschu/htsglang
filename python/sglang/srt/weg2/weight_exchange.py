@@ -2789,14 +2789,42 @@ def weights_region_tag_for(shape: RunnerShape) -> str:
     1382/1311/1311 MiB on boot weg2sb4 (``Load weight end.
     type=Qwen3_5ForCausalLMMTP ... mem usage=1.35/1.28/1.28 GB``), of which the
     checkpoint's ``mtp.*`` term is only 0.396 GiB; the rest is embed/head
-    shards the draft runner re-materialises.  Group P carries no
-    ``--speculative-*`` in this form, so NONE of those bytes has a VRAM source
-    on the other side.  Under ``exchange`` they get their own tag, which
-    ``is_weights_family_tag`` does not match, so they are never in a leg, never
-    in a census and never in a wave, and every REMAINING destination byte has a
-    source -- which is what lets the ring go to zero rather than to MTP-only.
+    shards the draft runner re-materialises.
 
-    Cost: 1.35/1.28/1.28 GiB permanently resident per card (spec section 5).
+    STALE PARAGRAPH, CORRECTED 2026-09-14 (this docstring used to claim
+    ``is_weights_family_tag`` never matches this tag, "so they are never in
+    a leg, never in a census and never in a wave" -- that stopped being
+    true the moment AMENDMENT 6 (user ruling 2026-09-11) added
+    ``weg2_memory_saver.draft_tag_in_family()`` beside
+    ``is_weights_family_tag``'s own check, and the two texts were never
+    reconciled). CURRENT REALITY: under an armed exchange
+    ``draft_tag_in_family()`` returns ``exchange_armed()`` == ``True``, so
+    ``GPU_MEMORY_TYPE_WEIGHTS_DRAFT`` IS a member of the weights family --
+    censused, waved and paused like any other tag. What stayed true, and is
+    the REAL gap this docstring meant to describe, is narrower: the PLAN
+    that actually MOVES bytes (``weight_updater._weg2_shadow_plan``) used to
+    resolve every leg's region from the MAIN runner alone, so membership in
+    the family bought this tag a pause with no mover behind it. Fixed
+    2026-09-14 (user order, "draft ist auch nur ein layer... warum muss er
+    ueber den ring gehen?"): ``_weg2_shadow_plan`` now additionally joins
+    the DRAFT runner's own region (``_weg2_xchg_draft_plan_or_none``) and
+    unions the descriptors, so a boot where group P's own producer runner
+    (``--draft-kv-on-p``, ``launcher.py``, default ``on``) holds a matching
+    counterpart for this tag's tensors moves them through the real
+    exchange like any other layer. Whether the re-materialised embed/head
+    shards ALSO match across groups (as opposed to only the ``mtp.*``
+    layer) is unverified without a real boot's manifests -- see that
+    method's docstring for why a partial, per-parameter split is not
+    buildable within one region under the current all-or-nothing join
+    (``xchg_manifest.join_manifests``). Where the join genuinely finds no
+    counterpart, the wake side falls back to a disk reload (#1394,
+    ``weight_updater._weg2_xchg_draft_reload_from_disk``) for this tag --
+    never the ring, never a mini-ring -- which is what still lets the ring
+    go to zero rather than to MTP-only, one way or the other.
+
+    Cost: 1.35/1.28/1.28 GiB permanently resident per card (spec section 5)
+    -- UNCHANGED figure, now describing VRAM the exchange may actually
+    cover instead of VRAM structurally excluded from it.
 
     TWO DEVIATIONS FROM THE SPEC'S PSEUDOCODE, both deliberate:
 
