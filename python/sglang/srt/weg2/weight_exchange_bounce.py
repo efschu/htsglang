@@ -2305,14 +2305,19 @@ def run_sequential_units(units, ops, boot_nonce: str, *,
                             "nbytes": nbytes}
             with open(dpath, "w") as fh:
                 _json.dump(recs, fh)
-            sems.post(pair=0, slot=_SEQ_SLOT, kind="full")
+            # #1378 xsn53 (DIE SEMAPHOREN-WURZEL): the co-located exchange
+            # is the DIAGONAL (one card talking to itself, #1334). The
+            # handshake uses diagonal_sem_name (the per-card infix
+            # -card<n>-), not the cross name (pair=0 = CROSS_PAIRS[0] = a
+            # foreign cross semaphore -- the xsn52 hang).
+            sems.diagonal_post(rank_u, _SEQ_SLOT, "full")
             log(f"WEG2-SEQ deposit {label} digest={digest} "
                 f"ms={(_time.perf_counter()-t0)*1000:.1f}")
         else:
             deadline = _time.monotonic() + float(budget_s)
             got = False
             while _time.monotonic() < deadline:
-                if sems.trywait(pair=0, slot=_SEQ_SLOT, kind="full"):
+                if sems.diagonal_timedwait(rank_u, _SEQ_SLOT, "full", 0.0):
                     got = True
                     break
                 if liveness is not None and not liveness():
@@ -2365,7 +2370,7 @@ def run_sequential_units(units, ops, boot_nonce: str, *,
                               f"destination shape, silent until quality)")
                     return (f"placement mismatch at unit {i} {name!r}: "
                             f"deposit={dep_digest} destination={dst_digest}")
-            sems.post(pair=0, slot=_SEQ_SLOT, kind="empty")
+            sems.diagonal_post(rank_u, _SEQ_SLOT, "empty")
             log(f"WEG2-SEQ collect {label} digest={my_digest} "
                 f"matches deposit")
     return ""
