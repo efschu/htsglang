@@ -4073,6 +4073,12 @@ class Front:
             # the terms that fix the host posten -- so a reader can tell whether
             # a recorded ratchet speaks for THIS boot's form.
             form_key=f"wtags={len(self.weights_tags)}",
+            # #1378 Stage 2: THIS boot's own priced bounce, from the SAME
+            # `ledger_arm` dict `dormant_image_sample` already reads it from
+            # (launcher.py's one producer). Riding beside `cushion_min_gib`
+            # so the next boot's `resolve_prior_cushion` reads both from one
+            # boot's own record, never mixed across two.
+            xchg_bounce_gib=self.ledger_arm.get("xchg_bounce_gib"),
         )
         val = rec["flip_ratchet_gib"]
         logger.info(

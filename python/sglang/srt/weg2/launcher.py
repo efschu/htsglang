@@ -5423,13 +5423,18 @@ def choose_host_ledger(
     # ledger term and the argv this function's caller builds from `arm.s_gb`/
     # `arm.m_mib` must read the identical bool, never a second copy of it.
     hicache_disabled: bool = False,
-    # #1378 Stage 2 (W105): the PRIOR boot's own cited numbers, forwarded
-    # unchanged to `host_ledger.choose` -- same placement, same "None keeps
-    # every existing caller byte-identical" rule as `deviation_reason` /
-    # `riegel_gib` above. Both or neither: `choose` itself refuses a half
-    # citation (W105), so this function does not re-validate the pair.
+    # #1378 Stage 2 (W105): the PRIOR boot's own cited numbers. FLAGS ARE AN
+    # OVERRIDE ONLY (coordinator order): when either is given explicitly it
+    # wins outright; otherwise this function SELF-READS the sidecar via
+    # `flip_ratchet_form_key` below -- the same "record, not operator typing"
+    # shape `record`/`measured_record` already carry for every other term.
     prior_cushion_min_gib: Optional[float] = None,
     prior_bounce_gib: Optional[float] = None,
+    # #1378 Stage 2: THIS boot's own form, for the auto-resolve's exact-match
+    # filter. "" (the default) auto-resolves nothing -- a caller that does
+    # not know its own form gets the byte-identical pre-Stage-2 behaviour,
+    # never a guess at what "this form" means.
+    flip_ratchet_form_key: str = "",
 
 ) -> Tuple[host_ledger.Arm, Optional[float], List[str], Dict[str, Optional[int]]]:
     """THE LAUNCHER'S ONE LEDGER CALL SITE: read the host, price the ladder.
@@ -5488,9 +5493,31 @@ def choose_host_ledger(
     # fix 8: this line's OWN previous measurements of the dormant image and of
     # the run-moment residual.  Absent (first boot, or a wiped sidecar) the
     # ledger prices the named dk7 reading and prints that it is another boot's.
-    record = host_ledger.read_measured_record(
+    _record_path_resolved = (
         measured_record_path() if record_path is None else record_path
     )
+    record = host_ledger.read_measured_record(_record_path_resolved)
+    # #1378 Stage 2 (order): SELF-READ the prior boot's cushion from the same
+    # sidecar `record` came from -- flags stay an OVERRIDE, never the only
+    # path, so a boot that names nobody by hand still gets the gate. The
+    # provenance line is ALWAYS appended (even on a flag override, even on a
+    # miss) -- the order's "nie stumm": an absent auto-resolution must say it
+    # could not measure, not just leave the field blank.
+    if prior_cushion_min_gib is not None or prior_bounce_gib is not None:
+        _auto_cushion, _auto_bounce, _auto_prov = None, None, (
+            "auto-resolve skipped: --prior-cushion-min-gib/--prior-bounce-gib "
+            "override it")
+    elif flip_ratchet_form_key:
+        _auto_cushion, _auto_bounce, _auto_prov = host_ledger.resolve_prior_cushion(
+            _record_path_resolved, flip_ratchet_form_key)
+    else:
+        _auto_cushion, _auto_bounce, _auto_prov = None, None, (
+            "auto-resolve skipped: caller passed no flip_ratchet_form_key")
+    _resolved_prior_cushion_min_gib = (
+        prior_cushion_min_gib if prior_cushion_min_gib is not None else _auto_cushion)
+    _resolved_prior_bounce_gib = (
+        prior_bounce_gib if prior_bounce_gib is not None else _auto_bounce)
+    _baseline_lines.append(f"WEG2-CUSHION-HEADROOM-SOURCE {_auto_prov}")
     # ONE kwargs block for the ladder AND the pin. Boot weg2sn6a (Q6, 07:33Z)
     # died in this function with `price() got an unexpected keyword argument
     # 'ring_provenance'`: the pinned arm had been priced by a hand-copied
@@ -5604,11 +5631,13 @@ def choose_host_ledger(
         # decision; it passes the operator's declaration down to it.
         deviation_reason=deviation_reason,
         riegel_gib=riegel_gib,
-        # #1378 Stage 2 (W105): same forwarding, same reason -- the launcher
-        # does not compute the headroom, it hands the operator's citation of
-        # the PRIOR boot's own numbers down to the one place that does.
-        prior_cushion_min_gib=prior_cushion_min_gib,
-        prior_bounce_gib=prior_bounce_gib,
+        # #1378 Stage 2 (W105): the RESOLVED pair -- the operator's override
+        # when given, else this function's own auto-read of the sidecar
+        # (`_resolved_prior_*` above), never the raw flag values: a caller
+        # that passed neither flag must still reach the gate when the
+        # sidecar has a candidate.
+        prior_cushion_min_gib=_resolved_prior_cushion_min_gib,
+        prior_bounce_gib=_resolved_prior_bounce_gib,
         # #1362 [22-fix]: the model this boot actually loads, by CONTENT. Every
         # recorded image now has to prove it belongs to it -- the fossil was a
         # 47 GiB ring solved from weg2xsn25's census for a 7.48 GiB model.
@@ -10830,6 +10859,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         # "None means unmeasured, not zero" rule as the deviation pair above.
         prior_cushion_min_gib=getattr(ns, "prior_cushion_min_gib", None),
         prior_bounce_gib=getattr(ns, "prior_bounce_gib", None),
+        # #1378 Stage 2: THIS boot's own form, in the EXACT shape
+        # `front.py._write_flip_ratchet` writes it in -- a different spelling
+        # here would auto-resolve nothing (silently, since form_key is a
+        # plain equality filter) rather than raise, so the two producers are
+        # kept to the one literal construction, not re-derived twice.
+        flip_ratchet_form_key=f"wtags={len(weights_tags)}",
         # #1362 [22-fix]: content digest, snapshot-independent. `None` (an
         # unreadable checkpoint) stays empty and the arm keeps the pre-#1362
         # behaviour rather than refusing on a digest it could not compute.
