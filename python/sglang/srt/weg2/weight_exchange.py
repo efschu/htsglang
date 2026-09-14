@@ -2540,14 +2540,22 @@ class Weg2WeightsCpuBackupModeUnknown(RuntimeError):
 def weights_cpu_backup_armed(*, explicit: Optional[str] = None) -> bool:
     """Bekommt die WEIGHTS-Region Host-Ring-Backup?
 
-    ``auto`` (default): ``not exchange_armed()`` -- under an ARMED exchange
-    the exchange itself is the weight source at the wake seam, so a host ring
-    that ALSO refills the same bytes is exactly the "fallback nobody asked
-    for" the user's order names: "auf der Festplatte liegt ein Snapshot. Das
-    ist auch ein Rueckfall. Aber wenn es korrekt implementiert ist, braucht
-    es NIEMALS einen Rueckfall." Under an un-armed exchange (``ring``, the
-    weight source today) the ring IS the source and stays backed exactly as
-    every pre-#1369 boot was.
+    ``auto`` (default): ``not (exchange_armed() and inject_authoritative())``
+    -- NOT bare ``not exchange_armed()``, and that distinction is
+    :func:`launcher.ring_absent_by_design`'s own, already-boot-proven lesson
+    (boot weg2xsn13): ring absence is a property of the INJECT ARM, not of
+    the weight source alone. Under ``exchange`` + ``shadow`` -- the DEFAULT
+    inject mode, and the form the S6I comparison order grades -- the refill
+    is STILL the authority and the ring STILL has to back it, because the
+    shadow leg's whole purpose is grading the exchanged bytes against that
+    ring's known-correct copy; a ``host_weights=0.00`` there is not "the
+    fallback deleted", it is the ground truth deleted, and that order's own
+    acceptance criterion (b) calls it a FAIL. Only ``exchange`` +
+    ``authoritative`` -- the exchange truly owns the bytes at the wake seam,
+    nothing compares against the ring any more -- is the "korrekt
+    implementiert, braucht NIEMALS einen Rueckfall" case the user's order
+    names. Under ``ring`` (unarmed) or ``shadow`` the ring IS still needed
+    and stays backed exactly as every pre-#1369 boot was.
 
     ``on``: always ``True``, REGARDLESS of ``exchange_armed()``. This is a
     COMPARISON INSTRUMENT for one A/B boot only (does the ring's presence
@@ -2590,7 +2598,7 @@ def weights_cpu_backup_armed(*, explicit: Optional[str] = None) -> bool:
         return True
     if value == WEIGHTS_CPU_BACKUP_OFF:
         return False
-    return not exchange_armed()
+    return not (exchange_armed() and inject_authoritative())
 
 
 def shadow_armed() -> bool:
