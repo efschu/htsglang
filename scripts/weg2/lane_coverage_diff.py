@@ -467,10 +467,27 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     rep = Report(root=os.path.abspath(ns.root), strict=ns.strict)
 
-    # THE EXPECTATION COMES FROM THE BOOT, never from the dumps.
+    # #1395: THE PER-BOOT SUBDIRECTORY, PREFERRED, FLAT ROOT AS FALLBACK.
+    # lane_coverage.arm()/write_expect_manifest() now write under
+    # <dump_dir>/<_boot_subdir(boot_token)>/... so two boots of the same
+    # form never compete for one filename (the identity fix this ratchet
+    # exists for). A caller who already knows the token gets that boot's
+    # OWN evidence FIRST; the flat root stays the fallback so every dump
+    # placed directly at --dump-dir (a hand-built fixture, or a dump from
+    # before this fix landed) is still found -- this file's own read path
+    # must not go blind on either shape.
+    mpath = ""
+    if ns.boot_token:
+        cand = os.path.join(
+            ns.dump_dir, lc._boot_subdir(ns.boot_token), lc.EXPECT_FILENAME)
+        if os.path.isfile(cand):
+            mpath = cand
+    if not mpath:
+        cand = os.path.join(ns.dump_dir, lc.EXPECT_FILENAME)
+        if os.path.isfile(cand):
+            mpath = cand
     manifest = {}
-    mpath = os.path.join(ns.dump_dir, lc.EXPECT_FILENAME)
-    if os.path.isfile(mpath):
+    if mpath:
         try:
             manifest = json.loads(open(mpath, encoding="utf-8").read())
         except (OSError, json.JSONDecodeError):
@@ -497,7 +514,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print("\n".join(rep.out))
         return rep.rc
 
-    dumps = sorted(glob.glob(os.path.join(ns.dump_dir, "phase_coverage_*rank*.json")))
+    # #1395: same preference -- the per-boot subdirectory first, the flat
+    # root as fallback (never BOTH merged: a boot's own subdirectory, once
+    # it exists, is a complete and self-consistent set, and mixing in a
+    # stale flat-root dump from a DIFFERENT boot would silently blend two
+    # boots' evidence into one report).
+    dumps: List[str] = []
+    if boot_token:
+        subdir = os.path.join(ns.dump_dir, lc._boot_subdir(boot_token))
+        dumps = sorted(glob.glob(os.path.join(subdir, "phase_coverage_*rank*.json")))
+    if not dumps:
+        dumps = sorted(glob.glob(os.path.join(ns.dump_dir, "phase_coverage_*rank*.json")))
     if not dumps:
         # MR1: this branch used to be `if not dumps: <refuse>` but the refusal
         # only covered the ABSENT directory; an EMPTY one walked the loop zero

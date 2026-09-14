@@ -172,6 +172,67 @@ DIR_ENV = "SGLANG_WEG2_LANE_COVERAGE_DIR"
 #: a confident wrong answer. Never optional.
 TOKEN_ENV = "SGLANG_WEG2_LANE_COVERAGE_TOKEN"
 
+#: #1395: THE TOKEN WAS ALREADY THE ANSWER, JUST NOT IN THE IDENTITY.
+#: ``boot_token`` (above) let a READER detect a stale dump (#1348's own
+#: docstring warned about it, in prose, since the day it was written) --
+#: but nothing on the WRITE path ever consulted it, so the dump directory
+#: stayed #1292's original defect one level up: two boots of the SAME
+#: form (same group, same rank, same directory) write the SAME filename,
+#: and the later one silently wins. Measured the night this was found:
+#: BOOT_weg2xsn31_0913_4.md VERSUCH 8 (2026-09-14, window 2thy75) wrote
+#: phase_coverage_{P,D}_rank{0,1,2}.json (P.log's own
+#: "lane_coverage: final dump ... legs=0" line at 03:21:36Z proves it) --
+#: gone from disk by the time the execution ratchet (#1389) went looking
+#: for them, because this directory has no per-boot identity and a LATER,
+#: unrelated boot on the same shared box reused the same names.
+#:
+#: THE FIX IS AT THE IDENTITY, NOT AT CLEANUP (the standing
+#: SHM-RESIDUE-NUR-PER-HALTER rule's sibling for this instrument: never
+#: clean by pattern -- the fix is that two boots stop competing for one
+#: name). Every dump this module writes -- the rank dumps AND the expect
+#: manifest -- now lives under a PER-BOOT subdirectory named from
+#: ``boot_token`` itself (:func:`_boot_subdir`), so a reader sees which
+#: boot an artefact belongs to from its PATH, without opening the file,
+#: and two boots of the identical form write into two different
+#: directories rather than one file.
+#:
+#: THE DEFENSE IN DEPTH: even with per-boot subdirectories, a write that
+#: would still overwrite an EXISTING file carrying a DIFFERENT
+#: ``boot_token`` is refused by name (never silently), the same shape
+#: #1292's own ``W18 Weg2PhaseFootprintCollision`` uses for a differing
+#: profile digest -- except keyed on the boot, which is the exact case
+#: #1292's own key (the profile digest) cannot see: two boots of the
+#: SAME form have the SAME digest, so W18 never fires for them, and that
+#: is precisely how this file's own dumps were lost.
+COLLISION_CODE = "W106 Weg2LaneCoverageCollision"
+
+
+def _boot_subdir(boot_token: str) -> str:
+    """A filesystem-safe, per-boot directory NAME from ``boot_token``
+    (``"<tag>:<epoch>:<pid>"``) -- ``:`` is not safe in every filesystem
+    and reads as a path separator in some tools, so it becomes ``_``.
+
+    An EMPTY token (a caller that never resolved one) gets its own named
+    fallback rather than collapsing to the bare directory -- silently
+    reusing the un-namespaced path for an untokened boot would reintroduce
+    exactly the collision this function exists to remove, just for the
+    one caller who forgot to pass a token.
+    """
+    if not boot_token:
+        return "no-boot-token"
+    return boot_token.replace(":", "_").replace("/", "_").replace(os.sep, "_")
+
+
+def _read_boot_token(path: str) -> Optional[str]:
+    """The ``boot_token`` field of an existing dump at ``path``, or
+    ``None`` when it cannot be read -- an unreadable existing file is
+    reported as such, never silently treated as "no collision"."""
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return json.load(fh).get("boot_token")
+    except (OSError, ValueError):
+        return None
+
 #: THE EXCHANGE LANE, ENUMERATED.  A glob over ``srt/weg2`` would widen the
 #: instrument's cost and its output every time the package grows a file, and
 #: the point of an allowlist is that the scope is a decision somebody made and
@@ -437,16 +498,47 @@ def arm(
                 branch=False,  # a WHICH-LINES map, not a branch report
                 messages=False,
             )
+            # #1395: THE TOKEN RESOLVED, AND THE COLLISION CHECKED, BEFORE
+            # ANY STATE IS FINALISED -- the same ordering `_seam_coverage_
+            # armed()` above already uses (a refusal here must leave this
+            # process un-armed, not half-armed with a `_data_path` nothing
+            # protects). `directory` itself stays #1292's shared path; the
+            # per-boot identity is a SUBDIRECTORY of it, so every OTHER
+            # caller of `DIR_ENV` keeps reading the same value it always
+            # did -- only where THIS module's own dumps land moves.
+            _token = boot_token or os.environ.get(TOKEN_ENV, "")
+            _boot_dir = os.path.join(directory, _boot_subdir(_token))
+            os.makedirs(_boot_dir, exist_ok=True)
+            candidate_path = os.path.join(_boot_dir, dump_filename(rank, group))
+            if os.path.exists(candidate_path):
+                existing_token = _read_boot_token(candidate_path)
+                if existing_token is not None and existing_token != _token:
+                    # DEFENSE IN DEPTH (#1395): with per-boot subdirectories
+                    # this can only fire if two DIFFERENT boot_tokens
+                    # sanitise to the SAME directory name -- named and
+                    # refused rather than silently overwritten, the same
+                    # shape #1292's own W18 uses for a differing profile
+                    # digest, keyed here on the boot instead.
+                    logger.error(
+                        "lane_coverage: %s REFUSING to arm -- %s already "
+                        "carries boot_token=%s, this process's is %s. Two "
+                        "boots collided on one dump identity instead of "
+                        "writing distinct ones; fix the identity, never "
+                        "force the write. No #1348 dump will be (re)written "
+                        "by this rank for this boot.",
+                        COLLISION_CODE, candidate_path, existing_token, _token,
+                    )
+                    return False
             # NOT cov.start() -- see the docstring. The object is built here so
             # the first leg pays only the start(), not the construction.
             _cov = cov
             _armed = True
             _group = group
             _rank = int(rank)
-            _boot_token = boot_token or os.environ.get(TOKEN_ENV, "")
+            _boot_token = _token
             _armed_at_epoch = time.time()
             _threads_at_arm = threading.active_count()
-            _data_path = os.path.join(directory, dump_filename(_rank, _group))
+            _data_path = candidate_path
             _overhead_ms["arm"] = (time.perf_counter() - t0) * 1000.0
             atexit.register(_save_at_exit)
             _write("arm")
@@ -542,9 +634,30 @@ def write_expect_manifest(directory: str, boot_token: str, expect: Dict[str, int
 
     Written by the launcher, which is the only party that knows how many ranks
     it is about to start.
+
+    #1395: lives under the SAME per-boot subdirectory the rank dumps do
+    (:func:`_boot_subdir`), so the manifest and the dumps it describes stay
+    together as one boot's evidence, and a later boot's manifest cannot
+    silently replace an earlier one's -- the identical defense-in-depth
+    collision check :func:`arm` uses, keyed on ``boot_token`` rather than
+    #1292's profile digest, because two EXPECT manifests of the same form
+    (identical ``expect`` counts) are exactly the case a digest-keyed check
+    would miss.
     """
-    path = os.path.join(directory, EXPECT_FILENAME)
-    os.makedirs(directory, exist_ok=True)
+    boot_dir = os.path.join(directory, _boot_subdir(boot_token))
+    os.makedirs(boot_dir, exist_ok=True)
+    path = os.path.join(boot_dir, EXPECT_FILENAME)
+    if os.path.exists(path):
+        existing_token = _read_boot_token(path)
+        if existing_token is not None and existing_token != boot_token:
+            logger.error(
+                "lane_coverage: %s REFUSING to write %s -- it already "
+                "carries boot_token=%s, this write's is %s. Two boots "
+                "collided on one manifest identity instead of writing "
+                "distinct ones; fix the identity, never force the write.",
+                COLLISION_CODE, path, existing_token, boot_token,
+            )
+            return ""
     tmp = f"{path}.tmp{os.getpid()}"
     with open(tmp, "w") as fh:
         json.dump(

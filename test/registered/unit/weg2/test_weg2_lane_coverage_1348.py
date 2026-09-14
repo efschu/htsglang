@@ -188,7 +188,8 @@ class ArmingWritesAtEveryLegEnd(CustomTestCase):
             lc.begin_leg("leg1")
             xb.staging_bytes_per_card(4096)
             lc.note_leg_end("leg1")
-            path = os.path.join(d, "phase_coverage_P_rank1.json")
+            # #1395: per-boot subdirectory, not the flat root any more.
+            path = os.path.join(d, lc._boot_subdir("T"), "phase_coverage_P_rank1.json")
             self.assertTrue(os.path.isfile(path), f"no dump at {path}")
             blob = json.loads(open(path).read())
             self.assertEqual(blob["group"], "P")
@@ -212,11 +213,13 @@ class ArmingWritesAtEveryLegEnd(CustomTestCase):
             lc.arm(directory=d, group="D", rank=0, boot_token="T")
             from sglang.srt.weg2 import xchg_bounce as xb
 
+            # #1395: per-boot subdirectory, not the flat root any more.
+            subd = os.path.join(d, lc._boot_subdir("T"))
             lc.begin_leg("leg1")
             xb.staging_bytes_per_card(4096)
             lc.note_leg_end("leg1")
             first = json.loads(
-                open(os.path.join(d, "phase_coverage_D_rank0.json")).read()
+                open(os.path.join(subd, "phase_coverage_D_rank0.json")).read()
             )
             lc.begin_leg("leg2")
             xb.bounce_terms(
@@ -227,7 +230,7 @@ class ArmingWritesAtEveryLegEnd(CustomTestCase):
             )
             lc.note_leg_end("leg2")
             second = json.loads(
-                open(os.path.join(d, "phase_coverage_D_rank0.json")).read()
+                open(os.path.join(subd, "phase_coverage_D_rank0.json")).read()
             )
             self.assertEqual(second["legs"], 2)
             mod = "python/sglang/srt/weg2/xchg_bounce.py"
@@ -253,8 +256,11 @@ class ArmingWritesAtEveryLegEnd(CustomTestCase):
             lc.arm(directory=d, group="P", rank=0, boot_token="T")
             lc.begin_leg("leg1")
             lc.note_leg_end("leg1")
+            # #1395: per-boot subdirectory, not the flat root any more.
             blob = json.loads(
-                open(os.path.join(d, "phase_coverage_P_rank0.json")).read()
+                open(os.path.join(
+                    d, lc._boot_subdir("T"), "phase_coverage_P_rank0.json"
+                )).read()
             )
             self.assertIn("overhead_ms", blob)
             self.assertGreaterEqual(blob["overhead_ms"]["traced"], 0.0)
@@ -632,7 +638,13 @@ class MF1_AnExpectedRankThatWroteNoDumpIsNamed(CustomTestCase):
         with tempfile.TemporaryDirectory() as d:
             lc.write_expect_manifest(d, "boot-T", {"P": 2})
             self._dump(d, "P", 0)
-            out = self._run("--dump-dir", d, "--root", ROOT)
+            # #1395: the manifest now lives under the per-boot subdirectory
+            # (lc._boot_subdir("boot-T")); a reader needs the token to find
+            # it, exactly as a real boot's own ingest invocation would --
+            # the dump itself stays flat here because this test writes it
+            # by hand via _dump(), not through arm().
+            out = self._run("--dump-dir", d, "--root", ROOT,
+                           "--boot-token", "boot-T")
             self.assertIn("rank-wrote-no-dump", out.stdout)
             self.assertIn("rank=1", out.stdout)
 
@@ -663,7 +675,10 @@ class MF2_AStaleDumpIsNeverReadAsThisBoot(CustomTestCase):
             lc._reset_for_test()
             lc.arm(directory=d, group="P", rank=0, boot_token="boot-XYZ")
             lc.note_leg_end("leg1")
-            blob = json.loads(open(os.path.join(d, "phase_coverage_P_rank0.json")).read())
+            # #1395: per-boot subdirectory, not the flat root any more.
+            blob = json.loads(open(os.path.join(
+                d, lc._boot_subdir("boot-XYZ"), "phase_coverage_P_rank0.json"
+            )).read())
             self.assertEqual(blob["boot_token"], "boot-XYZ")
             self.assertGreater(blob["armed_at_epoch"], 0)
             lc._reset_for_test()
@@ -763,7 +778,10 @@ class MF4_TheTracerRunsOnlyInsideTheLegBracket(CustomTestCase):
             lc.arm(directory=d, group="P", rank=0, boot_token="T")
             lc.begin_leg("leg1")
             lc.note_leg_end("leg1")
-            blob = json.loads(open(os.path.join(d, "phase_coverage_P_rank0.json")).read())
+            # #1395: per-boot subdirectory, not the flat root any more.
+            blob = json.loads(open(os.path.join(
+                d, lc._boot_subdir("T"), "phase_coverage_P_rank0.json"
+            )).read())
             self.assertIn("traced", blob["overhead_ms"])
             lc._reset_for_test()
 
@@ -779,7 +797,8 @@ class MF4_TheTracerRunsOnlyInsideTheLegBracket(CustomTestCase):
         with tempfile.TemporaryDirectory() as d:
             lc._reset_for_test()
             lc.arm(directory=d, group="D", rank=2, boot_token="T")
-            path = os.path.join(d, "phase_coverage_D_rank2.json")
+            # #1395: per-boot subdirectory, not the flat root any more.
+            path = os.path.join(d, lc._boot_subdir("T"), "phase_coverage_D_rank2.json")
             self.assertTrue(os.path.isfile(path), "arm() left no dump behind")
             self.assertEqual(json.loads(open(path).read())["legs"], 0)
             lc._reset_for_test()
@@ -903,7 +922,10 @@ class ADeadCollectorSaysSo(CustomTestCase):
             lc.begin_leg("leg1")
             # the real path: the first internal failure marks dead AND flushes
             lc._mark_dead("test-injected", RuntimeError("boom"))
-            blob = json.loads(open(os.path.join(d, "phase_coverage_P_rank0.json")).read())
+            # #1395: per-boot subdirectory, not the flat root any more.
+            blob = json.loads(open(os.path.join(
+                d, lc._boot_subdir("T"), "phase_coverage_P_rank0.json"
+            )).read())
             self.assertTrue(blob["dead"])
             self.assertIn("test-injected", blob["dead_where"])
             lc._reset_for_test()
