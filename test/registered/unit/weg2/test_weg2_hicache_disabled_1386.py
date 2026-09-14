@@ -94,9 +94,69 @@ def _main_argv(tag: str, *extra: str) -> list:
     ]
 
 
+# #1390: a QUIET reading of THIS box, 2026-09-14T02:2xZ, via `cat
+# /proc/meminfo` / `cat /sys/fs/cgroup/memory.{current,max,stat,events}` --
+# the SAME numbers `TheDraftKvProducerFallsWithIt`'s five tests were already
+# reading live off the real box whenever no other boot happened to be
+# running, pinned once here instead of re-read every test run. GENAU DIESE
+# GROESSE, not an arbitrarily larger one: an over-generous fixture would
+# fund an arm the real box's own margins might not, silently widening what
+# these tests cover instead of preserving it.
+_QUIET_MEMTOTAL_KB = 123_781_120       # 118.05 GiB
+_QUIET_MEMAVAIL_KB = 118_833_964       # 113.32 GiB
+_QUIET_CG_CURRENT_B = 14_064_181_248   # 13.10 GiB
+_QUIET_CG_ANON_B = 5_015_404_544
+_QUIET_CG_FILE_B = 8_809_852_928
+_QUIET_CG_SHMEM_B = 577_536
+_QUIET_CG_UNEVICTABLE_B = 36_864
+_QUIET_CG_SLAB_RECLAIM_B = 188_900_232
+
+
+def _fake_quiet_host(tmp: str) -> tuple:
+    """Write the pinned quiet-box reading above as real files; return
+    (meminfo_path, cgroup_root). Verified empirically (2026-09-14) that
+    WITHOUT this fixture these five tests read the REAL box and refuse
+    (W20 Weg2HostLedgerRefused) under a simulated busy box (MemAvailable
+    forced to 5 GiB, cgroup current to 100 GiB) -- a live dependency
+    entirely separate from the #1217 SHM/pgrep guard `SHM_DIR` isolates.
+    """
+    meminfo = os.path.join(tmp, "meminfo")
+    with open(meminfo, "w") as f:
+        f.write(
+            f"MemTotal:       {_QUIET_MEMTOTAL_KB} kB\n"
+            f"MemFree:        110046680 kB\n"
+            f"MemAvailable:   {_QUIET_MEMAVAIL_KB} kB\n"
+            f"Shmem:          {_QUIET_CG_SHMEM_B // 1024} kB\n"
+            f"SwapTotal:      0 kB\n"
+        )
+    cg = os.path.join(tmp, "cgroup")
+    os.makedirs(cg, exist_ok=True)
+    with open(os.path.join(cg, "memory.current"), "w") as f:
+        f.write(f"{_QUIET_CG_CURRENT_B}\n")
+    with open(os.path.join(cg, "memory.peak"), "w") as f:
+        f.write(f"{_QUIET_CG_CURRENT_B}\n")
+    with open(os.path.join(cg, "memory.max"), "w") as f:
+        f.write("max\n")
+    with open(os.path.join(cg, "memory.events"), "w") as f:
+        f.write("low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\n")
+    with open(os.path.join(cg, "memory.stat"), "w") as f:
+        f.write(
+            f"anon {_QUIET_CG_ANON_B}\n"
+            f"file {_QUIET_CG_FILE_B}\n"
+            f"shmem {_QUIET_CG_SHMEM_B}\n"
+            f"unevictable {_QUIET_CG_UNEVICTABLE_B}\n"
+            f"slab_reclaimable {_QUIET_CG_SLAB_RECLAIM_B}\n"
+        )
+    return meminfo, cg
+
+
 class _HermeticMainBase(unittest.TestCase):
     """Same isolation as test_weg2_dry_run_order_probe_1378.py's base class:
-    replayed NVML cards, a private guaranteed-empty SHM_DIR."""
+    replayed NVML cards, a private guaranteed-empty SHM_DIR -- PLUS (#1390)
+    a pinned quiet-box /proc/meminfo + cgroup2 tree, reusing the exact
+    fake-host construction test_weg2_cushion_headroom_autoresolve_1378_stage2b.py
+    built for `choose_host_ledger`'s own `meminfo_path`/`cgroup_root` seam,
+    rather than a second fixture path for the same two files."""
 
     def setUp(self):
         super().setUp()
@@ -105,8 +165,16 @@ class _HermeticMainBase(unittest.TestCase):
         self._shm_tmp = tempfile.mkdtemp(prefix="weg2-1386-empty-shm-")
         self._shm_patch = mock.patch.object(launcher, "SHM_DIR", self._shm_tmp)
         self._shm_patch.start()
+        self._host_tmp = tempfile.mkdtemp(prefix="weg2-1386-quiet-host-")
+        meminfo, cg = _fake_quiet_host(self._host_tmp)
+        self._meminfo_patch = mock.patch.object(launcher, "MEMINFO_PATH", meminfo)
+        self._cgroup_patch = mock.patch.object(launcher, "CGROUP_ROOT", cg)
+        self._meminfo_patch.start()
+        self._cgroup_patch.start()
 
     def tearDown(self):
+        self._cgroup_patch.stop()
+        self._meminfo_patch.stop()
         self._shm_patch.stop()
         if self._old_replay_env is None:
             os.environ.pop(nvml_registry.ENV_NVML_REPLAY, None)
@@ -444,6 +512,103 @@ class TheDraftKvProducerFallsWithIt(_HermeticMainBase):
         ))
         self.assertIsNone(exc, f"unexpected exception: {exc}")
         self.assertEqual(rc, 0)
+
+
+class TheFiveTestsAboveAreActuallyHermeticNow(_HermeticMainBase):
+    """#1390: `_HermeticMainBase` LOOKED isolated (a replayed NVML card set,
+    a private SHM_DIR) but two of its three seams were decorative.
+
+    `shm_residue_sweep(shm_dir: str = SHM_DIR)` binds that default ONCE, at
+    module-import time -- `mock.patch.object(launcher, "SHM_DIR", tmp)`
+    changes the ATTRIBUTE, but `main`'s own call
+    (`shm_residue_sweep(log, ns.tag, stamp, dry)`, no `shm_dir=` keyword)
+    kept reading the literal `/dev/shm` the function was DEFINED against,
+    regardless of the mock. `choose_host_ledger`'s `meminfo_path`/
+    `cgroup_root` were never even threaded through `main`'s call at all --
+    every dry run in this file read the REAL `/proc/meminfo` and the REAL
+    cgroup tree. Verified empirically (2026-09-14) with `host_ledger.
+    read_meminfo`/`read_cgroup` monkeypatched to a busy-box reading
+    (MemAvailable forced to 5 GiB, cgroup current to 100 GiB): the SAME
+    five tests' own model/arm combination refuses with W20
+    Weg2HostLedgerRefused under that reading -- a live dependency entirely
+    separate from, and in addition to, the SHM/pgrep one.
+
+    Both are fixed at the ONE call site (`main`, #1390): `shm_dir=SHM_DIR`,
+    `meminfo_path=MEMINFO_PATH`, `cgroup_root=CGROUP_ROOT`, forcing a fresh
+    read of the (now genuinely mockable) module attribute at call time
+    instead of the frozen default. The two tests below reproduce each half
+    of the live dependency HERMETICALLY -- a self-held file descriptor for
+    the SHM live-holder path (no subprocess, no real pgrep target needed:
+    `shm_holder_pids` scans the real `/proc`, and this test process is
+    itself a real, live holder of a file it just opened) and a
+    deliberately too-small fake host for the memory path -- and each is
+    paired with the manual mutant that proves the fix is load-bearing, not
+    decorative like the seam it replaces.
+    """
+
+    def test_a_mocked_shm_residue_with_a_live_holder_is_actually_seen(self):
+        """Proves `main` reads the MOCKED `SHM_DIR`, not the real one: a
+        residue file this test itself holds open (a live holder, found via
+        the real `/proc`, no subprocess needed) must refuse the boot."""
+        marker = os.path.join(self._shm_tmp, "sglang-phase-flip-presence-1390test")
+        fh = open(marker, "wb")
+        try:
+            fh.write(b"x" * 16)
+            fh.flush()
+            rc, out, exc = self.run_main(_main_argv("t1390shm"))
+            self.assertIsNotNone(
+                exc, "a live-held residue file in the MOCKED SHM_DIR must "
+                "refuse the boot -- if it does not, main() is reading the "
+                "real /dev/shm instead of the mock")
+            self.assertIsInstance(exc, launcher.Weg2LaunchRefused)
+            self.assertIn("LIVE HOLDER", str(exc))
+        finally:
+            fh.close()
+
+    def test_a_too_small_mocked_host_actually_refuses_the_ladder(self):
+        """Proves `main` reads the MOCKED `MEMINFO_PATH`/`CGROUP_ROOT`, not
+        the real box: a deliberately too-small fake host must refuse to
+        fund even the frugal end of this file's own arm ladder."""
+        tiny = tempfile.mkdtemp(prefix="weg2-1390-tiny-host-")
+        meminfo = os.path.join(tiny, "meminfo")
+        with open(meminfo, "w") as f:
+            f.write("MemTotal:       2097152 kB\nMemFree:        1048576 kB\n"
+                     "MemAvailable:   1048576 kB\nShmem:          1024 kB\n"
+                     "SwapTotal:      0 kB\n")
+        cg = os.path.join(tiny, "cgroup")
+        os.makedirs(cg, exist_ok=True)
+        with open(os.path.join(cg, "memory.current"), "w") as f:
+            f.write("1073741824\n")
+        with open(os.path.join(cg, "memory.peak"), "w") as f:
+            f.write("1073741824\n")
+        with open(os.path.join(cg, "memory.max"), "w") as f:
+            f.write("2147483648\n")
+        with open(os.path.join(cg, "memory.events"), "w") as f:
+            f.write("oom_kill 0\n")
+        with open(os.path.join(cg, "memory.stat"), "w") as f:
+            f.write("anon 536870912\nfile 0\nshmem 0\nunevictable 0\n"
+                     "slab_reclaimable 0\n")
+        with mock.patch.object(launcher, "MEMINFO_PATH", meminfo), \
+             mock.patch.object(launcher, "CGROUP_ROOT", cg):
+            rc, out, exc = self.run_main(_main_argv("t1390mem"))
+        self.assertIsNotNone(
+            exc, "a 2 GiB fake host must refuse this file's own arm ladder "
+            "-- if it does not, main() is reading the real host instead of "
+            "the mock")
+        self.assertIsInstance(
+            exc, (host_ledger.Weg2HostLedgerRefused,
+                  host_ledger.Weg2HostRunPeakRefused))
+
+    def test_main_names_both_seams_at_their_call_site(self):
+        """Structural companion to the two behavioural tests above: the
+        call site must NAME the module attribute, not rely on a bare call
+        (see the class docstring for why a bare call is silently inert)."""
+        import inspect
+
+        src = inspect.getsource(launcher.main)
+        self.assertIn("shm_dir=SHM_DIR", src)
+        self.assertIn("meminfo_path=MEMINFO_PATH", src)
+        self.assertIn("cgroup_root=CGROUP_ROOT", src)
 
 
 if __name__ == "__main__":
