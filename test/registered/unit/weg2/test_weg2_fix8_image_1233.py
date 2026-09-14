@@ -601,9 +601,18 @@ class TestTheShmOrphanSweep(CustomTestCase):
 
     def test_the_preflight_calls_the_sweep(self):
         # A sweep main() does not call is a sweep nothing runs (the fix-7 class).
+        # #1390: `shm_dir=SHM_DIR` is now NAMED at this call site (a bare
+        # call left `shm_residue_sweep`'s own default -- bound ONCE at that
+        # function's def time -- immune to a test's
+        # `mock.patch.object(launcher, "SHM_DIR", ...)`, which is exactly
+        # why five #1386 tests silently read the real /dev/shm). The pin
+        # widens to match; the call itself is still the one this test
+        # exists to prove main() makes.
         src = inspect.getsource(launcher)
         main_src = src[src.index("\ndef main("):]
-        self.assertIn("shm_residue_sweep(log, ns.tag, stamp, dry)", main_src)
+        self.assertIn(
+            "shm_residue_sweep(log, ns.tag, stamp, dry, shm_dir=SHM_DIR)",
+            main_src)
 
 
 # =====================================================================
