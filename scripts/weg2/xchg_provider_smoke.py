@@ -180,6 +180,8 @@ class _Stub:
         wu.SchedulerWeightUpdaterManager._weg2_draft_lm_head_is_target_share)
     _weg2_leg_pcie_uuid = (
         wu.SchedulerWeightUpdaterManager._weg2_leg_pcie_uuid)
+    _weg2_cocard_peer_alive = (
+        wu.SchedulerWeightUpdaterManager._weg2_cocard_peer_alive)
 
     def __init__(self, model):
         self.tp_worker = _Worker(model)
@@ -201,6 +203,9 @@ class _LegStub:
     _weg2_card_uuid = wu.SchedulerWeightUpdaterManager._weg2_card_uuid
     _weg2_leg_pcie_uuid = wu.SchedulerWeightUpdaterManager._weg2_leg_pcie_uuid
     weg2_card_uuid_cache = "unset"
+
+    _weg2_cocard_peer_alive = (
+        wu.SchedulerWeightUpdaterManager._weg2_cocard_peer_alive)
 
 
 class _Sems:

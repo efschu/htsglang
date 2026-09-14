@@ -583,7 +583,6 @@ class SchedulerWeightUpdaterManager:
             pass
         return -1.0
 
-    @contextmanager
     def _weg2_pcie_lock_retired(self, label: str, direction: Optional[str] = None):
         """#1378 xsn36: the WHOLE-LEG card lock is retired for the flip legs.
 
@@ -601,6 +600,7 @@ class SchedulerWeightUpdaterManager:
         import contextlib
         return contextlib.nullcontext()
 
+    @contextmanager
     def _weg2_pcie_lock(self, label: str, direction: Optional[str] = None) -> Iterator[None]:
         """Serialise this card's host<->device transfer against its sibling.
 
@@ -3253,6 +3253,29 @@ class SchedulerWeightUpdaterManager:
         except BaseException as exc:  # noqa: BLE001 -- fail-closed observer
             return f"proof-failed:{_weg2_exc_note(exc)}"
 
+    def _weg2_cocard_peer_alive(self) -> bool:
+        """Is the co-located rank on THIS card still alive?  NVML per-process
+        pids on the rank's own device, minus self -- during a flip the OTHER
+        compute process on this card is the pair's sibling rank.
+
+        #1378 xsn36/37 (the coordinator's requirement (a)): the collect's
+        wait must distinguish "the deposit is slow" (keep waiting, within
+        the 120 s budget) from "the deposit rank is DEAD" (die NOW, named).
+        FAIL-OPEN: any instrument error answers True -- keep waiting within
+        the budget; the 120 s rendezvous budget remains the hard bound and
+        the detector (the coordinator's requirement (b)).
+        """
+        try:
+            uuid_key = resolve_pcie_lock_key()
+            import pynvml  # noqa: PLC0415
+            handle = pynvml.nvmlDeviceGetHandleByUUID(uuid_key)
+            procs = pynvml.nvmlDeviceGetComputeRunningProcesses_v3(handle)
+            me = os.getpid()
+            others = {int(pr.pid) for pr in procs} - {me}
+            return bool(others)
+        except BaseException:  # noqa: BLE001 -- fail-open, budget is the bound
+            return True
+
     def _weg2_leg_pcie_uuid(self):
         """THIS rank's NVML uuid for the leg's per-copy locks, fail-soft.
 
@@ -4523,6 +4546,7 @@ class SchedulerWeightUpdaterManager:
                             pcie_uuid=self._weg2_leg_pcie_uuid(),
                             pcie_direction=("d2h" if phase == bx.PHASE_DEPOSIT
                                             else "h2d"),
+                            liveness=self._weg2_cocard_peer_alive,
                             # ONE BUFFER PER LANE. Keyed on the boot alone, the
                             # six ranks' concurrent legs each obeyed their own
                             # handshake and then all wrote slot 0 of ONE file

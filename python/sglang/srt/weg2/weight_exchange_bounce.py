@@ -1108,6 +1108,12 @@ def run_bounce_leg(
     #: could not produce without the same lock. Waits outside, copies inside.
     pcie_uuid: Optional[str] = None,
     pcie_direction: Optional[str] = None,
+    #: #1378 xsn36/37 (coordinator requirement (a)): called between the
+    #: chunked waits of the COLLECT phase; False means the co-located deposit
+    #: rank is GONE -- the leg refuses NOW, named, instead of after a silent
+    #: budget burn.  Fail-open by contract: the callback answers True on any
+    #: instrument error, and the 120 s budget remains the detector.
+    liveness=None,
     #: #1330 B4n.  WHICH HALF OF THE BOUNCE THIS RANK RUNS.  ``both`` is the
     #: single-process form and is byte-identical to the behaviour before the
     #: split; ``deposit``/``collect`` are the two ranks of a cross-group leg.
@@ -1480,8 +1486,17 @@ def run_bounce_leg(
                         # counter green.  Same rule as `run_consumer_pair`'s
                         # short-piece check, which "raises W70 and issues
                         # NOTHING".
-                        filled = rendezvous.wait_full(slot=slot,
-                                                      seq=int(batch.seq))
+                        if liveness is not None:
+                            # #1378 xsn36/37: chunked + liveness -- a dead
+                            # deposit rank dies HERE with tag and rank,
+                            # instead of after a silent budget burn.
+                            filled = rendezvous.wait_full_liveness(
+                                slot=slot, seq=int(batch.seq),
+                                liveness=liveness, tag=str(leg_name),
+                                rank=int(leg_rank))
+                        else:
+                            filled = rendezvous.wait_full(slot=slot,
+                                                          seq=int(batch.seq))
                         if filled is None:
                             raise Weg2XchgBouncePhaseUnordered(
                                 f"W68 Weg2XchgPlanDisagree: slot="
@@ -1722,12 +1737,13 @@ class CrossSlotRendezvous:
     def _slot(self, slot: int) -> int:
         return int(slot) % int(xr.SLOTS_PER_PAIR)
 
-    def _wait(self, slot: int, kind: str) -> bool:
+    def _wait(self, slot: int, kind: str, budget_s: Optional[float] = None) -> bool:
+        b = self.budget_s if budget_s is None else float(budget_s)
         if self.pair is not None:
             return bool(self.sems.timedwait(self.pair, self._slot(slot), kind,
-                                            self.budget_s))
+                                            b))
         return bool(self.sems.diagonal_timedwait(self.card, self._slot(slot),
-                                                 kind, self.budget_s))
+                                                 kind, b))
 
     def _post(self, slot: int, kind: str) -> None:
         if self.pair is not None:
@@ -1792,6 +1808,47 @@ class CrossSlotRendezvous:
         self.slots.publish(slot=int(slot), seq=int(seq),
                            nbytes=int(nbytes), pair=self.pair, card=self.card)
         self._post(self._COUNT_SLOT, "full")
+
+    def wait_full_liveness(self, *, slot: int, seq: int, liveness=None,
+                           chunk_s: float = 2.0, tag: str = "",
+                           rank: int = -1):
+        """wait_full, chunked, with a LIVENESS check between the chunks.
+
+        #1378 xsn36/37 (the co-located pair deadlock, the 5090): a wait whose
+        whole budget blocks in ONE timedwait cannot tell "the peer is slow"
+        from "the peer is dead" -- the W68 then names a slot that was only
+        the scene of the standoff.  Chunked: every ``chunk_s`` the caller's
+        liveness callback runs; a peer that is GONE dies HERE -- named with
+        tag and rank, budget still running -- instead of after a silent
+        hang.  ``liveness()`` answers the number of OTHER live holders of
+        this boot's bounce files; zero means the deposit rank is gone.
+
+        The budget stays the caller's (120 s, the DETECTOR per the
+        coordinator's order) -- this method only makes every second of it
+        auditable.
+        """
+        deadline = time.monotonic() + float(self.budget_s)
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            if self._wait(self._COUNT_SLOT, "full", budget_s=min(chunk_s,
+                                                                 remaining)):
+                got_seq, nbytes = self.slots.read(slot=int(slot),
+                                                  pair=self.pair,
+                                                  card=self.card)
+                if int(got_seq) != int(seq):
+                    return None
+                return int(nbytes)
+            if time.monotonic() >= deadline:
+                return None
+            if liveness is not None and not liveness():
+                raise Weg2XchgBouncePhaseUnordered(
+                    f"W68 Weg2PeerGone: slot={slot} seq={seq} tag={tag!r} "
+                    f"rank={rank} -- the deposit rank of this pair is no "
+                    f"longer a live holder of this boot's bounce files. "
+                    f"Refusing NOW with the budget still running, instead "
+                    f"of naming a slot after a dead wait.")
 
     def wait_full(self, *, slot: int, seq: int):
         """The producer's post-sync claim, or ``None`` on a real timeout.

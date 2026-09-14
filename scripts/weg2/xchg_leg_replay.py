@@ -895,6 +895,7 @@ class _Stub:
                      "_weg2_xchg_draft_plan_or_none",
                      "_weg2_draft_lm_head_is_target_share",
                      "_weg2_leg_pcie_uuid", "_weg2_card_uuid",
+                     "_weg2_cocard_peer_alive",
                      "_weg2_xchg_bounce_leg"):
             setattr(type(self), name, getattr(cls, name))
 
