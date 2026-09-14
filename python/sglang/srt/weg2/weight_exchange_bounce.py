@@ -2161,6 +2161,12 @@ def sequential_digest_path(boot_nonce: str, shm_root: str = xr.SHM_ROOT) -> str:
     return f"{shm_root}/weg2-seq-{boot_nonce}/unit_digests.json"
 
 
+def _mmap_addr(mmv: "_mmap.mmap") -> int:
+    """The mmap's host virtual address, for ops.host_register."""
+    import ctypes
+    return ctypes.addressof(ctypes.c_char.from_buffer(mmv))
+
+
 def _off(mmv: "_mmap.mmap", start: int) -> memoryview:
     """The buffer region as a memoryview -- the memcpy takes addresses; the
     fake ops (the desk harness) takes the view directly."""
@@ -2233,6 +2239,14 @@ def run_sequential_units(units, ops, boot_nonce: str, *,
             fh.truncate(biggest)
     fh = open(path, "r+b")
     buf = _mmap.mmap(fh.fileno(), biggest)
+    # #1378 xsn46 (THE PIN): the device cannot read a plain host mmap --
+    # cudaHostRegister(Portable) makes the host address device-accessible
+    # (the LayerBounce's own mechanism, measured "region=shm,pinned").
+    # Without it, memcpy_async dies with "cannot be converted to pointer"
+    # on all three ranks (the xsn46 wall).
+    ops.host_register(_mmap_addr(buf), biggest,
+                      tp.CUDA_HOST_REGISTER_PORTABLE)
+    _seq_registered = True
     sems = tp.SemSet(boot_nonce)
     log = log or (lambda *a: None)
     for i, (name, tag, nbytes, src_addr, dst_addr) in enumerate(units):
@@ -2315,6 +2329,11 @@ def run_sequential_units(units, ops, boot_nonce: str, *,
             sems.post(pair=0, slot=_SEQ_SLOT, kind="empty")
             log(f"WEG2-SEQ collect {label} digest={my_digest} "
                 f"matches deposit")
+    if _seq_registered:
+        try:
+            ops.host_unregister(_mmap_addr(buf))
+        except BaseException:  # noqa: BLE001
+            pass
     buf.close()
     fh.close()
     return ""

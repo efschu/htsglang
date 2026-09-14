@@ -37,6 +37,7 @@ class _FakeOps:
 
     def __init__(self):
         self.vram = {}
+        self.registered = set()
 
     def memcpy_async(self, dst, src, nbytes, stream):
         if isinstance(dst, memoryview):
@@ -48,6 +49,12 @@ class _FakeOps:
 
     def synchronize(self, stream=0):
         return None
+
+    def host_register(self, ptr, nbytes, flags=0):
+        self.registered.add(ptr)
+
+    def host_unregister(self, ptr):
+        self.registered.discard(ptr)
 
 
 def _dst_digest_reader(ops):
