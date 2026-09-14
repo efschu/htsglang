@@ -11338,14 +11338,35 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # group keys by bigram natively. Divergent schemes wrote disjoint chains
     # for the same prompt once (boots weg2ls3b1-b3); the identity-suffix
     # check in the front cannot see it. Refuse the boot before any traffic.
-    _forced = "#1233 HICACHE BIGRAM KEYS FORCED"
-    _p_bigram = ("--speculative-algorithm" in spec_p.argv) or count_marker(spec_p.log, _forced) >= 1
-    _d_bigram = ("--speculative-algorithm" in spec_d.argv) or count_marker(spec_d.log, _forced) >= 1
-    log(f"W9 launch-time key-scheme gate: P bigram={_p_bigram} (forced lines {count_marker(spec_p.log, _forced)}) "
-        f"D bigram={_d_bigram} (forced lines {count_marker(spec_d.log, _forced)})")
-    if _p_bigram != _d_bigram:
-        raise Weg2LaunchRefused(f"W9 Weg2StoreIdentityMismatch (launch-time key scheme): P bigram={_p_bigram} D bigram={_d_bigram} -- "
-                                f"the two groups would key the sole carrier by different page-hash schemes")
+    #
+    # #1386 FOLLOW-UP 3 (xsn31/7 Versuch 3 wall): "the store is one carrier"
+    # is the premise this whole gate stands on, and under `hicache_disabled`
+    # there IS no carrier for either group -- both fall through to plain
+    # MambaRadixCache (no cache_controller, no canonical page store at all,
+    # same fact the W7/W10 skip above already established). The mismatch
+    # this gate exists to catch (P and D writing the SAME store under
+    # DIFFERENT hash schemes) cannot occur when neither group writes a store.
+    # P is unigram here for an unrelated, correct reason (dropping the WHOLE
+    # P_DRAFT_KV_FLAGS bundle drops P's OWN --speculative-algorithm too, not
+    # just --speculative-draft-kv-only -- see the fold-in above); D stays
+    # bigram because D keeps its own, independent NEXTN head. That is a
+    # real divergence in each group's OWN spec config, not a shared-carrier
+    # hazard, so it is not this gate's concern once the carrier is gone.
+    if hicache_disabled:
+        log("W9 SKIPPED (--weg2-disable-hicache): no shared carrier exists for "
+            "either group to key mismatched (same fact as the W7/W10 skip) -- "
+            "P/D's own --speculative-algorithm divergence is expected here "
+            "(P dropped the whole producer bundle, D keeps its independent "
+            "NEXTN head) and immaterial without a store to key.")
+    else:
+        _forced = "#1233 HICACHE BIGRAM KEYS FORCED"
+        _p_bigram = ("--speculative-algorithm" in spec_p.argv) or count_marker(spec_p.log, _forced) >= 1
+        _d_bigram = ("--speculative-algorithm" in spec_d.argv) or count_marker(spec_d.log, _forced) >= 1
+        log(f"W9 launch-time key-scheme gate: P bigram={_p_bigram} (forced lines {count_marker(spec_p.log, _forced)}) "
+            f"D bigram={_d_bigram} (forced lines {count_marker(spec_d.log, _forced)})")
+        if _p_bigram != _d_bigram:
+            raise Weg2LaunchRefused(f"W9 Weg2StoreIdentityMismatch (launch-time key scheme): P bigram={_p_bigram} D bigram={_d_bigram} -- "
+                                    f"the two groups would key the sole carrier by different page-hash schemes")
     # #1246 CARRIER CENSUS.  The bound the front routes by is READ from group D's
     # own prefetch-limit instrument ('#915 PREFETCH LIMIT ... site=<one of the two
     # launch-time cache-init sites>', carrier_census.CENSUS_SITES),
