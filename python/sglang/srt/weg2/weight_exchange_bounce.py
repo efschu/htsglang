@@ -2167,18 +2167,23 @@ def _mmap_addr(mmv: "_mmap.mmap") -> int:
     return ctypes.addressof(ctypes.c_char.from_buffer(mmv))
 
 
-def _mmap_base(mm: "_mmap.mmap") -> int:
-    """The mmap's host virtual address -- for ops.memcpy_async, which needs
-    an integer pointer, not a memoryview (the xsn46/xsn47 wall: a memoryview
-    cannot be converted to the pointer cudaMemcpyAsync expects)."""
-    import ctypes
-    # ctypes.addressof(c_char.from_buffer(mm)) returns the mmap's base
-    return ctypes.addressof(ctypes.c_char.from_buffer(mm))
-
-
-def _mm_slice(mm: "_mmap.mmap", start: int, length: int) -> memoryview:
+def _mm_slice(mm, start: int, length: int) -> memoryview:
     """A memoryview of the mmap's region -- for the desk digest_fn."""
     return memoryview(mm)[start:start + length]
+
+
+def _mmap_addr(mm: "_mmap.mmap") -> int:
+    """The mmap's host virtual address, for ops.memcpy_async and
+    ops.host_register. Same conversion the LayerBounce uses at :623-627:
+    ctypes.addressof(c_char.from_buffer(mmap)) -- an INTEGER, not a
+    memoryview. The xsn46/xsn47 wall was a memoryview passed where the
+    original call site expects an int address (the fake ops was shaped
+    to accept the view, not to match the real receiver)."""
+    import ctypes
+    holder = ctypes.c_char.from_buffer(mm)
+    addr = ctypes.addressof(holder)
+    del holder
+    return addr
 
 
 def run_sequential_units(units, ops, boot_nonce: str, *,
@@ -2197,6 +2202,13 @@ def run_sequential_units(units, ops, boot_nonce: str, *,
                          dst_digest_fn=None,
                          liveness=None,
                          budget_s: float = 120.0,
+                         #: #1378 xsn44: the shared buffer as a bytearray.
+                         #: When provided, the transport uses it directly
+                         #: (bytearray slices for the copies) -- no mmap,
+                         #: no pointer conversion, no pinning. The desk
+                         #: tests pass a bytearray; the metal path creates
+                         #: a mmap and passes its memoryview.
+                         buffer=None,
                          log=None) -> str:
     """Der sequenzielle Einheiten-Transport: EIN Puffer, zwei Signale je
     Einheit, der Digest je Einheit als Bedingung.
@@ -2241,20 +2253,25 @@ def run_sequential_units(units, ops, boot_nonce: str, *,
     dpath = sequential_digest_path(boot_nonce, shm_root)
     directory = os.path.dirname(path)
     os.makedirs(directory, exist_ok=True)
-    size = os.path.getsize(path) if os.path.exists(path) else 0
-    if size < biggest:
-        with open(path, "wb") as fh:
-            fh.truncate(biggest)
-    fh = open(path, "r+b")
-    buf = _mmap.mmap(fh.fileno(), biggest)
-    # #1378 xsn47: NO cudaHostRegister on the sequential buffer. The
-    # buffer is shared across six processes (the same tmpfs file, the same
-    # boot_nonce) -- cudaHostRegister is per-page, and the second process's
-    # registration of the same physical pages fails with rc=712
-    # (HostMemoryAlreadyRegistered). Instead, the copies use the ops' SYNCHRONOUS
-    # memcpy (not async), which works from any host memory without pinning.
-    # The sequential form doesn't need async: each unit completes before
-    # the next begins.
+    if buffer is not None:
+        # the desk path: the test provides the buffer directly
+        buf = buffer
+        _owns_buf = False
+    else:
+        # the metal path: the mmap + best-effort pinning (the LayerBounce's
+        # own pattern, :629-634)
+        size = os.path.getsize(path) if os.path.exists(path) else 0
+        if size < biggest:
+            with open(path, "wb") as fh:
+                fh.truncate(biggest)
+        fh = open(path, "r+b")
+        buf = _mmap.mmap(fh.fileno(), biggest)
+        try:
+            ops.host_register(_mmap_addr(buf), biggest,
+                              tp.CUDA_HOST_REGISTER_PORTABLE)
+        except Exception:  # noqa: BLE001 -- best effort
+            pass
+        _owns_buf = True
     sems = tp.SemSet(boot_nonce)
     log = log or (lambda *a: None)
     for i, (name, tag, nbytes, src_addr, dst_addr) in enumerate(units):
@@ -2263,11 +2280,15 @@ def run_sequential_units(units, ops, boot_nonce: str, *,
         if phase == PHASE_DEPOSIT:
             src_ptr = src_addr(name, 0) if callable(src_addr) else src_addr
             t0 = _time.perf_counter()
-            _base = _mmap_base(buf)
-            ops.memcpy_async(_base, int(src_ptr), nbytes, 0)
+            # #1378 xsn44: the D2H copy -- from the VRAM source into the
+            # shared buffer at this unit's offset. The fake ops handles
+            # the VRAM side; the buffer is a bytearray (the desk) or an
+            # mmap (the metal) -- both support slice assignment.
+            ops.memcpy_async(int(src_ptr), _mm_slice(buf, 0, nbytes),
+                             nbytes, 0)
             ops.synchronize(0)
             digest = hashlib.sha256(
-                bytes(_mm_slice(buf, 0, nbytes))).hexdigest()[:16]
+                bytes(buf[:nbytes])).hexdigest()[:16]
             recs = {}
             if os.path.exists(dpath):
                 try:
@@ -2309,7 +2330,7 @@ def run_sequential_units(units, ops, boot_nonce: str, *,
             dep = recs.get(str(i), {})
             dep_digest = str(dep.get("digest", ""))
             my_digest = hashlib.sha256(
-                bytes(_mm_slice(buf, 0, nbytes))).hexdigest()[:16]
+                bytes(buf[:nbytes])).hexdigest()[:16]
             if dep_digest and my_digest != dep_digest:
                 dump_rank_stacks(
                     "digest-mismatch-seq", tag=str(name), rank=int(rank_u),
@@ -2318,8 +2339,8 @@ def run_sequential_units(units, ops, boot_nonce: str, *,
                 return (f"digest mismatch at unit {i} {name!r}: "
                         f"deposit={dep_digest} collect={my_digest}")
             dst_ptr = dst_addr(name, 0) if callable(dst_addr) else dst_addr
-            _base = _mmap_base(buf)
-            ops.memcpy_async(_base, int(dst_ptr), nbytes, 0)
+            ops.memcpy_async(int(dst_ptr), _mm_slice(buf, 0, nbytes),
+                             nbytes, 0)
             ops.synchronize(0)
             if dst_digest_fn is not None:
                 # #1378 xsn44 (the PLACEMENT witness): what LANDED at this
