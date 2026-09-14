@@ -43,6 +43,8 @@ under-charging the box, never by moving a decimal:
       -> test_an_absent_load_witness_is_unknown_not_idle
 """
 
+import os
+
 from sglang.srt.weg2 import host_ledger as hl
 
 # sn6s, verbatim from BOOT_weg2sn6s_0910.md (g) and the XSN6 order.
@@ -63,8 +65,36 @@ def _images(gib=SN6S_IMAGE_GIB):
 
 def _sample(arm=None, witness=None, nonreclaim_gib=50.0, wtags=SN6S_WTAGS_GIB):
     return hl.dormant_image_sample(
-        group="P", shmem_before_bytes=0, shmem_after_bytes=0, pids=[],
-        weight_tags_gib=wtags, interleaved=True, boot_tag="t", commit="c",
+        group="P", shmem_before_bytes=0, shmem_after_bytes=0,
+        # #1390 (currency-suite audit): a REAL, definitely-alive pid (this
+        # test process's own), not `[]`. Commit 86790917b7 (#1361 22-fix5b)
+        # taught `run_origin_gib` that a `pids` key PRESENT but reading 0
+        # alive is a DEATH-SAMPLE ("only a sampler that LOOKED and found none
+        # is a witness") -- correct for a genuinely dead line, but `[]` here
+        # was never claiming that; it was a placeholder for "this test does
+        # not care about the RSS-based image measurement" (it supplies
+        # `cg_current_bytes` directly for the residual calc). `rss_shmem_bytes`
+        # reads `/proc/<pid>/status`'s own `RssShmem` line, which every real
+        # process has, so this pid always answers and is never a death
+        # signal, hermetically (no subprocess, no /proc fixture needed).
+        pids=[os.getpid()],
+        # #1390 (currency-suite audit): FALSE, not True. `interleaved` means
+        # "sampled during a flip, the destination group RESUMING while this
+        # one sleeps" (dormant_image_sample's own docstring) -- the launcher's
+        # FIRST sleep of P, which is the moment this whole file's scenarios
+        # model, is UN-interleaved by that same docstring ("D does not exist
+        # yet"). It read True here since #1325 was written, harmlessly, until
+        # commit 5c70c2ade2 (#1350e) taught `run_origin_gib` to exclude every
+        # `interleaved=True` record from ever winning its max() -- a mid-flip
+        # sample may already contain the flip ratchet's charged step, and
+        # using it AND charging the ratchet would double-count (host_ledger.py
+        # `run_origin_gib`, the `_mid` filter). SN6S_P_ENTRY, the REAL record
+        # copied verbatim from sn6s's own sidecar entry below, carries no
+        # `interleaved` key at all (falsy) and its own tests
+        # (test_the_reader_reprices_the_record_already_on_disk and siblings)
+        # pass -- which is what proves this was always the accurate value for
+        # what this file's records represent, not a value #1350e invalidated.
+        weight_tags_gib=wtags, interleaved=False, boot_tag="t", commit="c",
         cg_current_bytes=int(nonreclaim_gib * hl.GIB), reclaimable_bytes=0,
         arm=SN6S_ARM if arm is None else arm, ranks_per_group=RANKS,
         load_witness=witness,
