@@ -874,6 +874,7 @@ class _Stub:
         cls = wu.SchedulerWeightUpdaterManager
         for name in ("_weg2_rank_param_table", "_weg2_join_src_addr",
                      "_weg2_join_dst_addr", "_weg2_shadow_plan",
+                     "_weg2_xchg_draft_plan_or_none",
                      "_weg2_xchg_bounce_leg"):
             setattr(type(self), name, getattr(cls, name))
 
