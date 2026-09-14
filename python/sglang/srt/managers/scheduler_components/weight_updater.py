@@ -4564,7 +4564,7 @@ class SchedulerWeightUpdaterManager:
                               if getattr(d, "src_ptr", None) else None),
                              (int(d.dst_ptr)
                               if getattr(d, "dst_ptr", None) else None))
-                            for j, d in enumerate(plan.descs)]
+                            for j, d in enumerate(descs)]
                         last = bx.run_sequential_units(
                             seq_units, ops, boot_nonce,
                             shm_root=root, device=device, phase=phase,
