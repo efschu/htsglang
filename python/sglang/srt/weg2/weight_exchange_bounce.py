@@ -1162,6 +1162,21 @@ def run_bounce_leg(
     # reached the metal unnoticed.
     _option1_leg = (terms is not None
                     and int(getattr(terms, "max_tag_bytes", 0) or 0) > 0)
+    # #1397 OPTION 3: THE ONE BOOLEAN for band-credit reuse, same doctrine as
+    # `_option1_leg` above -- one predicate, reused at every site that must
+    # agree with it (the slot COUNT below, the wrap check, the collector's
+    # post). CROSS PAIRS ONLY (`rendezvous.pair is not None`): see
+    # DESIGN_option3_band_credit_0914.md -- a diagonal lane's own collector's
+    # `resume` is gated on THIS rank's not-yet-published VRAM credit, so a
+    # wait for that collector's drain, inside this rank's own deposit loop,
+    # before that credit is published, is the exact cycle #1374 deleted.
+    # `getattr` on both `terms` and `rendezvous` because neither is
+    # guaranteed non-None here (this predicate is computed before either is
+    # validated further down), and an absent attribute must read as "not
+    # eligible", never raise.
+    _band_credit_leg = (_option1_leg
+                        and bool(getattr(terms, "band_credit", False))
+                        and getattr(rendezvous, "pair", None) is not None)
     if terms is not None:
         derived_slot = leg_slot_bytes(terms)
         derived_depth = leg_geometry(terms)[1]
@@ -1274,7 +1289,12 @@ def run_bounce_leg(
     # allocates is the file the ledger charged for. Without terms -- or with a
     # boot that did not state `max_tag_bytes` -- this is the old depth-sized
     # floor and the wrap refusal below is what keeps it honest.
-    slots = (int(terms.lane_slots) if _option1_leg
+    # #1397 OPTION 3: a CROSS lane with band credit active allocates
+    # `terms.cross_lane_slots` instead -- the SAME producer discipline,
+    # `BounceTerms` is still the one authority, just a different property of
+    # it for a lane the whole-tag floor was never required for.
+    slots = (int(terms.cross_lane_slots) if _band_credit_leg
+             else int(terms.lane_slots) if _option1_leg
              else xb.assemble_slots(int(depth), comparing=comparing))
     if phase != PHASE_BOTH and not lane:
         raise Weg2XchgBouncePhaseUnordered(
@@ -1299,6 +1319,11 @@ def run_bounce_leg(
     # landed in slot 0: no double buffering at all, and the ledger charged
     # for a slot the loop could not reach.
     inflight: List[Optional[object]] = [None] * int(slots)
+    if _band_credit_leg and phase == PHASE_DEPOSIT:
+        # #1397: discard a PRIOR tag's uncollected tail before this tag's own
+        # first band -- see `CrossSlotRendezvous.prime_band_drain`'s own
+        # docstring for why this is the only safe instant.
+        rendezvous.prime_band_drain()
     deposited = collected = 0
     bands = 0
     deposit_ms = collect_ms = 0.0
@@ -1317,16 +1342,41 @@ def run_bounce_leg(
                 # max_tag_bytes and size the buffer accordingly, this refuses
                 # by name rather than pricing a wrap nobody can see.
                 if int(bands) >= int(slots) and phase == PHASE_DEPOSIT:
-                    raise Weg2XchgBouncePhaseUnordered(
-                        f"W68 Weg2XchgPlanDisagree: band {bands} of this tag "
-                        f"would reuse slot {slot} of {slots} -- the assemble "
-                        f"buffer does not hold the whole tag, so this deposit "
-                        f"cannot complete without its collector and the "
-                        f"collector cannot run before this rank's pause "
-                        f"(boot weg2xsn30). Size the buffer from max_tag_bytes "
-                        f"(Option 1) or reduce the pause granularity below the "
-                        f"tag (Option 3); refusing rather than overwriting a "
-                        f"band a consumer may still be reading.")
+                    if _band_credit_leg:
+                        # #1397 OPTION 3: THE QUITTUNG AS PRECONDITION, not a
+                        # removal of the guard above -- a CROSS lane may wait
+                        # here because its collector's readiness never
+                        # depends on THIS rank (see the design doc); a
+                        # diagonal lane can never reach this branch
+                        # (`_band_credit_leg` requires `rendezvous.pair is
+                        # not None`), so it still takes the `else` refusal
+                        # below, unchanged, exactly as before #1397.
+                        if not rendezvous.wait_band_drained():
+                            raise xr.Weg2XchgGateTimeout(
+                                f"W69 Weg2XchgGateTimeout: band {bands} of "
+                                f"this tag waited {rendezvous.budget_s:.0f}s "
+                                f"under the #1397 band credit (Option 3) for "
+                                f"its collector to drain slot {slot} of "
+                                f"{slots} and none arrived. This is a CROSS "
+                                f"lane (rendezvous.pair={rendezvous.pair}), "
+                                f"never the diagonal, so this cannot be the "
+                                f"weg2xsn30 cycle by construction -- a real "
+                                f"timeout here means this lane's collector "
+                                f"genuinely stalled, not that Option 3 "
+                                f"cannot apply.")
+                    else:
+                        raise Weg2XchgBouncePhaseUnordered(
+                            f"W68 Weg2XchgPlanDisagree: band {bands} of this tag "
+                            f"would reuse slot {slot} of {slots} -- the assemble "
+                            f"buffer does not hold the whole tag, so this deposit "
+                            f"cannot complete without its collector and the "
+                            f"collector cannot run before this rank's pause "
+                            f"(boot weg2xsn30). Size the buffer from max_tag_bytes "
+                            f"(Option 1) or reduce the pause granularity below the "
+                            f"tag (Option 3, #1397: CROSS lanes only -- see "
+                            f"DESIGN_option3_band_credit_0914.md); refusing "
+                            f"rather than overwriting a band a consumer may "
+                            f"still be reading.")
                 if inflight[slot] is not None:
                     t0 = time.perf_counter()
                     ops.synchronize(c_stream)
@@ -1431,14 +1481,26 @@ def run_bounce_leg(
                     if rendezvous is not None and phase == PHASE_COLLECT:
                         ops.synchronize(c_stream)
                         inflight[slot] = None
-                        # #1374: NO PER-BAND `empty` POST. The `empty` family's
-                        # row 0 now carries the PER-TAG drain, so posting once
-                        # per band would hand the source N drain tokens and let
-                        # it overwrite the tag this collector is still reading
-                        # -- the very hazard the drain exists for. The tag's
-                        # single `post_drained` is the caller's, after its last
-                        # band, because only the caller knows where the tag
-                        # ends.
+                        # #1374: NO PER-BAND `empty` POST on row 0. That row
+                        # still carries the PER-TAG drain, so posting once
+                        # per band there would hand the source N drain tokens
+                        # and let it overwrite the tag this collector is
+                        # still reading -- the very hazard the drain exists
+                        # for. The tag's single `post_drained` is the
+                        # caller's, after its last band, because only the
+                        # caller knows where the tag ends.
+                        #
+                        # #1397 OPTION 3: A DIFFERENT counter, row 1 of
+                        # `full` (dead since #1374, never `empty`'s row 0
+                        # above), for CROSS lanes only. MUST follow this
+                        # band's own `ops.synchronize(c_stream)` on the line
+                        # directly above -- posting before that sync
+                        # returns is the "too early" mutant this ticket's
+                        # test suite pins RED, because the depositor may
+                        # legally act on this credit the instant it is
+                        # visible.
+                        if _band_credit_leg:
+                            rendezvous.post_band_drained()
                 bands += 1
         t0 = time.perf_counter()
         ops.synchronize(c_stream)
@@ -1669,6 +1731,80 @@ class CrossSlotRendezvous:
         if int(got_seq) != int(seq):
             return None
         return int(nbytes)
+
+    # -------------------------------------------------------------------
+    # #1397 OPTION 3 -- the per-BAND drain credit, CROSS PAIRS ONLY.
+    # -------------------------------------------------------------------
+    #
+    # NO NEW SUBSTRATE, same doctrine as `_COUNT_SLOT`/`_DRAIN_SLOT` above:
+    # row 1 of the `full` family has been dead since #1374 collapsed that
+    # family's meaning onto row 0 ("N bands are ready"). `full`, not
+    # `empty`'s own dead row 1, on purpose: `create_semaphores` arms `full`
+    # at 0 and `empty` at 1 (`SEM_ARMED_COUNTS`), so a fresh COUNTING credit
+    # built on `full` starts at the value it actually wants -- no
+    # `prime_drain`-style "consume the inherited one" step is needed at a
+    # boot's very first tag, only `prime_band_drain`'s narrower one below.
+    _BAND_DRAIN_SLOT = 1
+
+    def _wait_nonblocking(self, slot: int, kind: str) -> bool:
+        """`trywait` for the cross form; a zero-budget wait for the
+        diagonal, the same substitute `prime_drain` already uses (no
+        `diagonal_trywait` exists)."""
+        if self.pair is not None:
+            return bool(self.sems.trywait(self.pair, self._slot(slot), kind))
+        return bool(self.sems.diagonal_timedwait(self.card, self._slot(slot),
+                                                 kind, 0.0))
+
+    def prime_band_drain(self) -> None:
+        """Discard any credit a PRIOR tag's tail left uncollected.
+
+        A tag's own last `min(bands, cross_lane_slots)` bands are never
+        reused WITHIN that tag -- nothing ever calls `wait_band_drained`
+        for them -- so up to `cross_lane_slots` posts from
+        `post_band_drained` can outlive a tag's own leg. Left alone, the
+        NEXT tag's first wrap would consume a credit that names no band of
+        ITS OWN: a count that is right but an identity that is wrong,
+        exactly the shape `wait_full`'s own seq check exists to catch on
+        the OTHER counting family.
+
+        Called ONCE, at the very start of a band-credit DEPOSIT leg, before
+        this tag's own first band is deposited -- the only instant this is
+        provably safe: deposit strictly leads collect within one tag
+        (`post_full` for band k always precedes `post_band_drained` for
+        band k), so at this instant nothing of THIS tag's own could have
+        posted yet, and only a PRIOR tag's leftover credit can exist to be
+        drained.
+        """
+        while self._wait_nonblocking(self._BAND_DRAIN_SLOT, "full"):
+            pass
+
+    def post_band_drained(self) -> None:
+        """The collector's side: ONE post, AFTER this band's own sync.
+
+        Ordering mirrors `post_full`'s own rule: this MUST follow
+        `run_bounce_leg`'s `ops.synchronize(c_stream)` for this exact band,
+        never precede it. A post before that synchronize returns is the
+        "too early" mutant this ticket's test suite pins RED -- the
+        depositor may legally overwrite this slot's host pages the instant
+        it sees this credit, and the collect's own device copy may still be
+        draining them.
+        """
+        self._post(self._BAND_DRAIN_SLOT, "full")
+
+    def wait_band_drained(self) -> bool:
+        """The depositor's side: block up to `budget_s`, or a REAL timeout.
+
+        ONLY EVER CALLED FOR A CROSS PAIR (`self.pair is not None`) --
+        `run_bounce_leg` is the enforcer, this method trusts its caller the
+        same way `_wait`/`_post` already do. A diagonal lane must never
+        reach here: its own collector's `resume` is gated (C14) on THIS
+        SAME rank's not-yet-published VRAM credit
+        (`weight_updater.py`'s pause/credit loop), so this wait would
+        recreate the exact cycle #1374 deleted after boot weg2xsn30
+        (`test_the_per_band_claim_cannot_return`) -- see
+        `DESIGN_option3_band_credit_0914.md` for the full argument.
+        """
+        return self._wait(self._BAND_DRAIN_SLOT, "full")
 
 
 def pair_of(src_rank: int, dst_rank: int) -> Optional[int]:

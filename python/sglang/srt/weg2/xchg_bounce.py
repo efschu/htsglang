@@ -36,6 +36,27 @@ direction / n_layers` is a MEAN and it is the right term for SIZING the steady
 stream; it is the wrong term for the REFUSAL, because a boot sized on the mean
 dies on whichever layer is above it. Both numbers are therefore carried and the
 refusal grades against `widest_layer_bytes`.
+
+#1397 OPTION 3 ADDENDUM (2026-09-14), appended rather than rewritten: #1374
+("OPTION 1") sizes `lane_buffer_bytes` from the LARGEST TAG a lane ever pauses
+(`tag_slots`/`BounceTerms.lane_slots`), because the pause granularity was the
+tag and a tag's deposit had to complete before its own collector could run at
+all (weg2xsn30's circular wait, `weight_exchange_bounce.py`'s own module
+docstring). That is still true for a DIAGONAL lane (a card talking to
+itself) and cannot be relaxed without touching `weg2_memory_saver.pause`
+semantics -- out of this module's scope and, on the design doc's own finding,
+not needed. It is NOT true for a CROSS lane (a directed card pair): that
+lane's collector's VRAM credit gate names the collector's OWN co-located
+peer, a rank whose deposit does not wait on anything from this lane, so a
+per-BAND drain credit (`weight_exchange_bounce.CrossSlotRendezvous.
+wait_band_drained`/`post_band_drained`) can safely let a cross lane reuse a
+slot WITHIN one tag instead of sizing the whole tag in. `BounceTerms.
+band_credit` + `n_cross_lanes` price that smaller cross share
+(`cross_lane_buffer_bytes`) while the diagonal share keeps the #1374 floor,
+unconditionally. See `/spinning/gpu-arb/weg2/DESIGN_option3_band_credit_0914.md`
+for the full derivation, including why the #1386 `max(buffer_bytes,
+lane_buffer_bytes)` trap had to be sidestepped rather than reused for the
+cross share.
 """
 
 from __future__ import annotations
@@ -198,6 +219,88 @@ class BounceTerms:
     #: buffer -- which is a flip-time cost, never a silent one: see
     #: `lanes_serialised` and `lanes_concurrent_line`.
     lanes_concurrent: int = 0
+    #: #1397 OPTION 3 (DESIGN_option3_band_credit_0914.md): whether a CROSS
+    #: lane (a directed card pair, never the diagonal) may reuse a slot
+    #: WITHIN one tag under a per-BAND drain credit
+    #: (`weight_exchange_bounce.CrossSlotRendezvous.wait_band_drained`/
+    #: `post_band_drained`) instead of sizing the whole tag into the buffer.
+    #: ``False`` keeps every pre-#1397 caller byte-identical: `lane_slots`
+    #: is untouched by this field, so this default alone changes nothing.
+    #:
+    #: THIS CAN NEVER SHRINK A DIAGONAL LANE, and that is not a missing
+    #: feature -- it is the finding the design doc is written around. A
+    #: diagonal lane's own collector's `resume` is gated (C14) on THIS SAME
+    #: rank's not-yet-published VRAM credit (weight_updater.py's pause/
+    #: credit loop), which only follows this rank's WHOLE tag deposit; a
+    #: wait for that collector's drain, inside this rank's own deposit loop,
+    #: BEFORE that credit is published, is the exact circular wait #1374
+    #: deleted after boot weg2xsn30. A CROSS lane has no such cycle: its
+    #: collector's credit gate names a DIFFERENT rank (the collector's own
+    #: co-located peer), whose deposit does not wait on anything from this
+    #: lane -- see the design doc's "why cross but never diagonal" section.
+    band_credit: bool = False
+    #: Of `lanes_priced`, how many are genuinely CROSS pairs (never the
+    #: diagonal) and therefore eligible for `band_credit`'s smaller sizing.
+    #: ``0`` is the SAFE default -- exactly the "not stated" sentinel every
+    #: other field on this dataclass already uses (`max_tag_bytes`,
+    #: `lanes_concurrent`): turning `band_credit` on WITHOUT also counting
+    #: how many of this boot's lanes are cross prices `total_bytes`
+    #: identically to `band_credit=False`, never smaller. A caller that
+    #: states a larger count than `lanes_priced` cannot inflate the eligible
+    #: share past 100 % (`n_cross_lanes_priced` clamps it) -- the direction
+    #: that matters is under-stating, which only ever costs bytes back to
+    #: the diagonal-safe floor, never UNDER-charges the boot.
+    n_cross_lanes: int = 0
+
+    @property
+    def n_cross_lanes_priced(self) -> int:
+        """`n_cross_lanes`, clamped to `lanes_priced` and to `band_credit`.
+
+        Clamped rather than trusted: a caller that mis-states more cross
+        lanes than exist would otherwise UNDER-charge `total_bytes` against
+        what `run_bounce_leg` actually allocates for the excess (which it
+        would price as diagonal, i.e. the bigger number, on the metal).
+        """
+        if not self.band_credit:
+            return 0
+        return max(0, min(int(self.n_cross_lanes), int(self.lanes_priced)))
+
+    @property
+    def n_diag_lanes_priced(self) -> int:
+        """The remainder of `lanes_priced` -- always priced at the whole-tag
+        floor, `band_credit` or not."""
+        return max(0, int(self.lanes_priced) - int(self.n_cross_lanes_priced))
+
+    @property
+    def cross_lane_slots(self) -> int:
+        """Option 3's floor for a CROSS lane: `depth`-order, never
+        `ceil(max_tag_bytes / slot_bytes)`.
+
+        NEVER read for a diagonal lane -- `run_bounce_leg` only takes this
+        branch when its `rendezvous.pair is not None`, i.e. never for the
+        diagonal's `card=` form. Reuses `assemble_slots` rather than
+        inventing a third depth-to-slots expression, the same "one producer"
+        rule `lane_slots` itself follows.
+        """
+        return assemble_slots(int(self.depth), comparing=None)
+
+    @property
+    def cross_lane_buffer_bytes(self) -> int:
+        """A CROSS lane's file under Option 3: `cross_lane_slots x slot_bytes`.
+
+        DELIBERATELY NOT maxed against `buffer_bytes` the way
+        `lane_buffer_bytes` is charged in `total_bytes`. Under Option 1
+        (`max_tag_bytes > 0`, a precondition of `band_credit` ever mattering)
+        `run_bounce_leg`/`leg_slot_bytes` never allocate `buffer_bytes` at
+        all for ANY Option-1 lane -- `leg_slot_bytes`'s own docstring: "Option
+        1 ACTIVE ... never a third number computed here" -- so `buffer_bytes`
+        is provably dead weight for a band-credit lane too. Charging it
+        anyway would silently re-substitute the bigger, unallocated number
+        through the very `max()` `total_bytes` uses for the diagonal share,
+        which is the #1386 trap this ticket (#1397) was opened to avoid: a
+        printed saving the buffer never actually gets.
+        """
+        return int(self.cross_lane_slots) * int(self.slot_bytes)
 
     @property
     def lanes_priced(self) -> int:
@@ -284,6 +387,21 @@ class BounceTerms:
         prices 2 x 3.00 + 0.75 = 6.75 GiB -- the SAME formula, a smaller
         multiplier, never a second one.
         """
+        # #1397 OPTION 3: a DIFFERENT sum, not a smaller `per_lane` -- the
+        # diagonal share stays at the #1374 floor (the max() below is still
+        # correct FOR THOSE LANES, unchanged) and only the counted-cross
+        # share prices at `cross_lane_buffer_bytes`, deliberately WITHOUT
+        # that max() (see the property's own docstring for why `buffer_bytes`
+        # is dead weight there). `n_cross_lanes_priced` is 0 whenever
+        # `band_credit` is unset, so this branch is inert and the formula
+        # below is the only one that ever runs for every pre-#1397 caller.
+        if self.band_credit and int(self.n_cross_lanes_priced) > 0:
+            diag_per_lane = max(int(self.buffer_bytes),
+                                int(self.lane_buffer_bytes))
+            diag_total = diag_per_lane * int(self.n_diag_lanes_priced)
+            cross_total = (int(self.cross_lane_buffer_bytes)
+                          * int(self.n_cross_lanes_priced))
+            return diag_total + cross_total + int(self.staging_bytes)
         # #1374: THE LARGER OF THE TWO GEOMETRIES, per lane. `buffer_bytes` is
         # the widest-layer statement and `lane_buffer_bytes` is the file Option
         # 1 allocates; charging the smaller would under-charge the one the leg
@@ -430,6 +548,8 @@ def bounce_terms(
     n_lanes: int = 1,
     max_tag_bytes: int = 0,
     lanes_concurrent: int = 0,
+    band_credit: bool = False,
+    n_cross_lanes: int = 0,
 ) -> BounceTerms:
     """Derive the bounce term. Pure; raises only on inputs that cannot mean anything.
 
@@ -484,6 +604,8 @@ def bounce_terms(
         n_lanes=max(1, int(n_lanes)),
         max_tag_bytes=max(0, int(max_tag_bytes)),
         lanes_concurrent=max(0, int(lanes_concurrent)),
+        band_credit=bool(band_credit),
+        n_cross_lanes=max(0, int(n_cross_lanes)),
     )
 
 
@@ -509,7 +631,12 @@ _TERM_FIELDS = ("bytes_per_direction", "n_layers", "widest_layer_bytes",
                 # a rank that recomputed `total_bytes` without it would price
                 # every lane again, silently un-capping the very number the
                 # host ledger read the smaller charge from.
-                "lanes_concurrent")
+                "lanes_concurrent",
+                # #1397: both ride with the inputs for the identical reason --
+                # a rank that rebuilt `total_bytes` without them would price
+                # every lane at the diagonal floor again, silently erasing the
+                # cross share's saving the launcher already charged for.
+                "band_credit", "n_cross_lanes")
 
 
 def publish_terms(terms: BounceTerms) -> str:
