@@ -4060,8 +4060,14 @@ class Front:
         at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         # #1377 W11: the cushion minimum rides with the ratchet, from the
         # ONE producer, so the next boot's arm can predict W98.
+        # #1378 Posten 4: the producer now returns the case NAMED beside the
+        # value -- until 2026-09-14 nothing set WEG2_HOSTSAMPLE_CSV, every
+        # FLIP record said null, and no line said why. The reason rides the
+        # WEG2-FLIP-RATCHET line below; the record's null (when it is one)
+        # stays, because a missing measurement must not read as 0.0.
+        cushion_gib, cushion_reason = host_ledger.cushion_min_of_this_boot()
         rec = host_ledger.flip_ratchet_record(
-            cushion_min_gib=host_ledger.cushion_min_of_this_boot(),
+            cushion_min_gib=cushion_gib,
             pre_gib=self._flip_ratchet_pre_gib,
             post_gib=post,
             boot_tag=self.tag,
@@ -4085,12 +4091,16 @@ class Front:
             "WEG2-FLIP-RATCHET post epoch=2 nonreclaim=%s GiB pre=%s GiB -> "
             "flip_ratchet_gib=%s (ONE full pair, anon+shmem+slab_unreclaimable; "
             "#1350: the next boot CHARGES this instead of leaving it to a margin "
-            "term whose LOCAL instrument reads negative on a staircase)",
+            "term whose LOCAL instrument reads negative on a staircase); "
+            "cushion_min_gib=%s [#1378 Posten 4: the named case behind the "
+            "value or the null -- sampler not armed / CSV unreadable / no "
+            "cushion_gib column / the measured minimum with its sample count]",
             "unreadable" if post is None else f"{post:.3f}",
             "unreadable" if self._flip_ratchet_pre_gib is None
             else f"{self._flip_ratchet_pre_gib:.3f}",
             "UNMEASURED (a reading was absent -- the next arm refuses W94, it "
             "does not read this as 0)" if val is None else f"{float(val):.3f} GiB",
+            cushion_reason,
         )
         if not self.measured_record:
             logger.error(

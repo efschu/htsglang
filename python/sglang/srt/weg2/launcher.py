@@ -4759,6 +4759,18 @@ def build_env(tree: str, venv: str, cvd: str, store_dir: str, debug_hold: bool, 
     # boot a rank belongs to (mem_ledger.activation_probe.boot_token() reads
     # it so two boots of the identical form never collide on one dump path).
     env["SGLANG_WEG2_BOOT_TOKEN"] = weg2_boot_token
+    # #1378 Posten 4: the cushion sampler's CSV path, published to BOTH
+    # groups so the front's flip-ratchet record carries a MEASURED
+    # cushion_min instead of the null every FLIP record so far wrote
+    # (weg2xsn29/zwerg/ring1 -- the env existed only as a reader,
+    # host_ledger.ENV_HOSTSAMPLE_CSV, and nothing ever set it; the numbers
+    # sat on disk per boot: xsn29 14.857 / zwerg 5.23 / ring1 4.276 /
+    # xsn31 1.082 / xsn32 0.014 GiB, measured 2026-09-14 with the tree's
+    # own reader). ONE PRODUCER of the path: hostsample_csv_path(). The
+    # file may not exist at launch (the sampler writes during the boot);
+    # an absent file reads back as a NAMED absence at the record, never
+    # 0.0 -- host_ledger.cushion_min_and_reason.
+    env[host_ledger.ENV_HOSTSAMPLE_CSV] = hostsample_csv_path(tag)
     for k in list(env):
         if k.startswith("SGLANG_PHASE_FLIP"):
             del env[k]
@@ -5227,6 +5239,22 @@ def served_model_name(model_path: str, override: str = "") -> str:
 def measured_record_path() -> str:
     """The sidecar this line writes its own dormant-image measurements into."""
     return f"{EVIDENCE_DIR}/{host_ledger.MEASURED_RECORD_NAME}"
+
+
+def hostsample_csv_path(tag: str) -> str:
+    """The per-boot cushion sampler's CSV -- ONE PRODUCER of the path.
+
+    #1378 Posten 4. The convention host_ledger documents above
+    ``ENV_HOSTSAMPLE_CSV``: ``<evidence>/<tag>_<yymmdd>/hostsample_<tag>.csv``
+    -- the same dir shape every FLIP-record boot's sampler actually wrote
+    (``weg2zwerg_0913/``, ``weg2ring1_0914/``). Published unconditionally
+    into both groups' env by :func:`build_env`: a boot whose sampler never
+    started reads a NAMED absence at the record (``cushion_min_and_reason``),
+    which is evidence -- a silent null told nobody anything, and a 0.0 would
+    have made the cross-boot gate look armed while it read nothing.
+    """
+    return (f"{EVIDENCE_DIR}/{tag}_{time.strftime('%y%m%d')}/"
+            f"hostsample_{tag}.csv")
 
 
 def xchg_bounce_arm_pins_host(weight_source: str, oncard_mode: str) -> bool:

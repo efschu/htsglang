@@ -4643,15 +4643,69 @@ def read_measured_record(
 ENV_HOSTSAMPLE_CSV = "WEG2_HOSTSAMPLE_CSV"
 
 
-def cushion_min_of_this_boot() -> Optional[float]:
-    """This boot's cushion minimum, or None when the sampler was not armed.
+def cushion_min_and_reason(csv_path: str) -> Tuple[Optional[float], str]:
+    """The MINIMUM cushion of one boot, WITH its provenance.
 
-    None is a first-class answer: a boot without the sampler has no cushion
-    measurement, and the arm must say "not measurable" rather than fund on an
-    invented one or refuse on a zero.
+    #1378 Posten 4: the value and the reason come from ONE reading -- a
+    caller that wanted both would otherwise read the file twice, and the two
+    readings could disagree. Four cases, each NAMED:
+
+    * csv_path empty -> the sampler was never armed for this boot
+      (``WEG2_HOSTSAMPLE_CSV`` unset). This was every FLIP record's state
+      until 2026-09-14: the field existed (91d6df2e50), the env was never
+      published, and the record said null with no reason on any line.
+    * file unreadable -> the sampler was armed but wrote nothing readable
+      (the launcher publishes the path at launch, the sampler writes during
+      the boot, so an absent file at flip-done is possible and must say so).
+    * file readable but no usable ``cushion_gib`` column -> a pre-v3 sampler
+      output; named so a reader does not mistake it for "armed, flat line".
+    * values present -> the minimum and how many samples produced it.
+
+    None, never 0.0, for every absence: a missing measurement must not read
+    as "no cushion left", which would make the cross-boot gate look armed
+    while it reads nothing. The null in the RECORD stays (it is the honest
+    float answer); the NAMING is the reason string beside it, which the
+    front prints on the WEG2-FLIP-RATCHET line.
     """
-    path = os.environ.get(ENV_HOSTSAMPLE_CSV, "")
-    return cushion_min_from_sampler(path) if path else None
+    if not csv_path:
+        return None, ("sampler not armed: WEG2_HOSTSAMPLE_CSV is not set in "
+                      "this process's environment")
+    try:
+        import csv as _csv
+
+        with open(csv_path, newline="") as fh:
+            rows = list(_csv.DictReader(fh))
+    except OSError as e:
+        return None, f"hostsample CSV unreadable at {csv_path}: {e}"
+    vals: List[float] = []
+    for r in rows:
+        raw = str(r.get("cushion_gib", "")).strip()
+        if raw in ("", "n/a"):
+            continue
+        try:
+            vals.append(float(raw))
+        except ValueError:
+            continue
+    if not vals:
+        return None, (f"hostsample CSV carries no usable cushion_gib column: "
+                      f"{csv_path}")
+    v = min(vals)
+    return v, (f"cushion_min={v:.3f} GiB over {len(vals)} samples from "
+               f"{csv_path}")
+
+
+def cushion_min_of_this_boot() -> Tuple[Optional[float], str]:
+    """This boot's cushion minimum and its named provenance, ONE reading.
+
+    The value is None when the sampler was not armed or its output carries
+    no usable column -- a first-class answer: a boot without the sampler has
+    no cushion measurement, and the arm must say "not measurable" rather
+    than fund on an invented one or refuse on a zero. The REASON is the
+    second half of the answer and is not optional: the front prints it on
+    the WEG2-FLIP-RATCHET line, so a null in the record always has its case
+    named beside it.
+    """
+    return cushion_min_and_reason(os.environ.get(ENV_HOSTSAMPLE_CSV, ""))
 
 
 def cushion_min_from_sampler(csv_path: str) -> Optional[float]:
@@ -4666,16 +4720,11 @@ def cushion_min_from_sampler(csv_path: str) -> Optional[float]:
     None, never 0.0, when the column is absent or unparsable: a missing
     measurement must not read as "no cushion left", which would refuse every
     arm on a box whose sampler was not armed.
-    """
-    try:
-        import csv as _csv
 
-        with open(csv_path, newline="") as fh:
-            vals = [float(r["cushion_gib"]) for r in _csv.DictReader(fh)
-                    if str(r.get("cushion_gib", "")).strip() not in ("", "n/a")]
-    except (OSError, ValueError, KeyError):
-        return None
-    return min(vals) if vals else None
+    Value-only view of :func:`cushion_min_and_reason` -- use that one when
+    the reason matters (it is what the front prints).
+    """
+    return cushion_min_and_reason(csv_path)[0]
 
 
 def cushion_headroom_gib(cushion_min_gib: Optional[float],
