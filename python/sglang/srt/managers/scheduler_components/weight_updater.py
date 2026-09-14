@@ -3955,7 +3955,7 @@ class SchedulerWeightUpdaterManager:
                     int(rank), sems, covered=set(_lanes.keys()))
                 if _stuck:
                     raise Weg2XchgLaneNeverDrainedRefused(
-                        f"W100 Weg2XchgLaneNeverDrainedRefused: hook={hook} "
+                        f"W108 Weg2XchgLaneNeverDrainedRefused: hook={hook} "
                         f"rank={rank} tag={tag} boot_nonce={boot_nonce}: "
                         f"this leg's own descriptor set carries no entry for "
                         f"{len(_stuck)} lane(s) targeting this rank's card, "
@@ -4188,8 +4188,10 @@ class SchedulerWeightUpdaterManager:
         # `VramCredit.wait_for` (weg2_memory_saver.py) owns that loop, so
         # the check moves there via this callback -- `_stuck_lane_reader`
         # -- called on its own cadence and raising `Weg2XchgLaneNeverDrainedRefused`
-        # (W100) itself the moment it finds something, well before this
-        # call's own `budget_s` would otherwise expire into a W35.
+        # (W108, renumbered 2026-09-14 from W100 -- TRAIN2's census found it
+        # colliding with host_ledger.py's pre-existing Weg2SleepLegCushionDeficit)
+        # itself the moment it finds something, well before this call's own
+        # `budget_s` would otherwise expire into a W35.
         _rank = self._weg2_rank()
 
         def _stuck_lane_reader():
