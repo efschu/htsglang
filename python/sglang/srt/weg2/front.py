@@ -5013,6 +5013,29 @@ class Front:
                 else:
                     logger.exception("controller error: %s", e)
 
+    def group_dead_should_stop(self, *, state: str, ok: bool, alive: bool,
+                               streak: int) -> bool:
+        """W17's gate, ONE decision for the poller.
+
+        #1378 xsn39 (measured): the flip legs RUN in the groups' event loops
+        (``process_input_requests`` -- the deposit/collect block the loop for
+        the leg's whole duration), so /health is legitimately silent during
+        a flip: W17 fired ~2 min into EVERY ring-off flip (xsn36/37/39) and
+        killed boots whose lanes were healthy. The front KNOWS its own
+        state -- during ``flipping`` the streak is logged, not stopped; the
+        flip's own stall detector (``flip_stall``, bound 120 s) is the
+        authority for a stuck flip, and the deadman covers the front itself.
+        The stop stays armed for every non-flipping state (a dead group at
+        idle is a fact, not a phase).
+        """
+        if streak < 2:
+            return False
+        if health_is_serving_fact(ok, alive):
+            return False
+        if state == "flipping":
+            return False
+        return True
+
     async def health_poller(self) -> None:
         while True:
             await asyncio.sleep(15)
@@ -5029,7 +5052,10 @@ class Front:
                     continue
                 g.health_fail_streak += 1
                 logger.warning("WEG2-HEALTH group=%s http_ok=%s process_alive=%s streak=%d", g.name, ok, alive, g.health_fail_streak)
-                if g.health_fail_streak >= 2 and not health_is_serving_fact(ok, alive):
+                if self.group_dead_should_stop(
+                    state=self.state, ok=ok, alive=alive,
+                    streak=g.health_fail_streak,
+                ):
                     self.do_stop("W17 Weg2GroupDead", f"group {g.name}: /health failed {g.health_fail_streak}x and process_alive={alive} (a 200 alone is a transport fact)")
 
     def corridor_sample(self) -> Optional[str]:
