@@ -4355,11 +4355,19 @@ class SchedulerWeightUpdaterManager:
             _lane_permit = tp.LanePermit(str(boot_nonce)) if _lane_permit_active else None
             try:
                 for pair, group in _lanes.items():
-                    rv = (bx.CrossSlotRendezvous(sems, slots, pair=pair)
+                    # #1378 xsn34 root fix: the lanes' wait budget is the
+                    # boot's own leg bound (600 s, = the deadman's GRACE_S),
+                    # NOT the 120 s tool default -- measured on weg2xsn34:
+                    # the first flip's collect expired 3 s before the sleep
+                    # side's first full post landed (the pause chain IS the
+                    # staging time). See LANE_RENDEZVOUS_BUDGET_S.
+                    rv = (bx.CrossSlotRendezvous(sems, slots, pair=pair,
+                                                 budget_s=bx.LANE_RENDEZVOUS_BUDGET_S)
                           if pair is not None else
                           bx.CrossSlotRendezvous(
                               sems, slots,
-                              card=int(getattr(group[0], "dst_rank", device))))
+                              card=int(getattr(group[0], "dst_rank", device)),
+                              budget_s=bx.LANE_RENDEZVOUS_BUDGET_S))
                     # #1374 F1: THE PER-TAG DRAIN, wired where the lane's own
                     # rendezvous exists. Ordering, on the source:
                     #   tag 0: prime the counter to 0 (create_semaphores arms

@@ -1613,6 +1613,18 @@ def run_bounce_leg(
 # one pair's `full` for another pair's bytes.
 
 
+#: The rendezvous wait budget for the BOOT'S LANES, not the test default.
+#: MEASURED on weg2xsn34 (2026-09-14, first flip, epoch 0): the wake side's
+#: collect waited its full 120 s budget for the sleep side's FIRST full post
+#: and expired 3 s before it landed (collect alloc 13:27:56, free 13:29:56;
+#: deposit alloc 13:29:59) -- the sleep side's pre-deposit staging is the
+#: first flip's pause chain, not a dead peer. 600 s is the boot's OWN bound
+##  for one leg (boot_deadman GRACE_S=600, passed by arm_xsn34.sh): the two
+#: authorities become one number, and a genuinely dead peer still dies at
+#: the same moment the deadman would kill the boot anyway.
+LANE_RENDEZVOUS_BUDGET_S = 600.0
+
+
 class CrossSlotRendezvous:
     """The empty/full handshake for ONE directed card pair, or the diagonal.
 
