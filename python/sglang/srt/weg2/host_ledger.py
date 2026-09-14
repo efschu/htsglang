@@ -2344,6 +2344,16 @@ def charge_terms(
     # measured" from "measured at zero" and the consumers that grade against a
     # bound refuse on the first rather than summing the second.
     flip_ratchet_gib: Optional[float] = None,
+    # #1386 [Minimalform HiCache switch]: OFF MEANS OFF, not a smaller S/M.
+    # True zeroes `anchors_gib`/`rings_gib` HERE, directly -- never by routing
+    # a 0 through `ANCHORS_AT_2400_BYTES`/`RING_*_MULT_GB_PER_S`, which would
+    # still "believe" a size and merely round it to nothing (the very
+    # gepreist-eine-Zahl/belegt-eine-andere shape #1385/#1386 cost three
+    # boots). The SAME bool reaches `launcher.common_flags`, which drops
+    # `--enable-hierarchical-cache` and every `--hicache-*` flag from BOTH
+    # groups' argv under the identical condition -- one switch, priced here
+    # and enforced there, never two.
+    hicache_disabled: bool = False,
 ) -> Dict[str, object]:
     """Everything the BOOT ITSELF adds to ``memory.current``, per term.
 
@@ -2367,20 +2377,28 @@ def charge_terms(
     deliberately NOT named after the module function that produces the value:
     :func:`price`'s own fix-8 note records what a shadowed name costs.
     """
-    anchors_gib = (ANCHORS_AT_2400_BYTES * (m_mib / ANCHORS_REFERENCE_M_MIB)) / GIB
+    anchors_gib = 0.0 if hicache_disabled else (
+        (ANCHORS_AT_2400_BYTES * (m_mib / ANCHORS_REFERENCE_M_MIB)) / GIB
+    )
     # #1317n THE TWO GROUPS ARE PRICED SEPARATELY, because they no longer carry
     # the same budget: P only WRITES the store (its 1 GB staging tier is all it
     # needs) while D must hold a whole cap-sized read. `s_gb_d` defaults to
     # `s_gb`, so every pre-existing caller and every recorded arm is
     # byte-identical; only a caller that passes a different D budget changes.
     _s_d = s_gb if s_gb_d is None else int(s_gb_d)
-    rings_gib = (
-        RING_P_MULT_GB_PER_S * s_gb + RING_D_MULT_GB_PER_S * _s_d
-    ) * GB / GIB
+    rings_gib = 0.0 if hicache_disabled else (
+        (RING_P_MULT_GB_PER_S * s_gb + RING_D_MULT_GB_PER_S * _s_d) * GB / GIB
+    )
     return {
         "heaps_gib": ranks_per_group * (HEAP_AWAKE_GIB + HEAP_DORMANT_GIB),
         "anchors_gib": anchors_gib,
         "rings_gib": rings_gib,
+        # #1386: the term dict is what `arm_terms_line` reads and what a test
+        # checks -- so the switch's OWN state rides here beside its effect,
+        # instead of a reader inferring "was it on?" from "are both 0.00?"
+        # (0.59 GiB of `anchors_gib` alone would round to 0.00 at M small
+        # enough; a 0.00 by itself is not evidence of the switch).
+        "hicache_disabled": bool(hicache_disabled),
         # #1317n the D budget the rings were priced from, so the ARM line
         # prints what it CHARGED rather than what it was asked for.
         "s_gb_d": float(_s_d),
@@ -3670,6 +3688,9 @@ def price(
     # The launcher already computes it for the ring solve; a legacy record
     # (no digest, pre-#1362) is admitted only when it did.
     form_key_matches: bool = False,
+    # #1386: forwarded to `charge_terms` unchanged -- see that function's
+    # docstring for why OFF must zero the term here, not shrink an input.
+    hicache_disabled: bool = False,
 ) -> Arm:
     """Price one arm at both moments.  Pure.
 
@@ -3825,7 +3846,8 @@ def price(
                            flip_ratchet_gib=(
                                None if flip_ratchet is None
                                else flip_ratchet.charged_gib
-                           ))
+                           ),
+                           hicache_disabled=hicache_disabled)
     heaps_gib = charges["heaps_gib"]
     anchors_gib = charges["anchors_gib"]
     rings_gib = charges["rings_gib"]
@@ -3949,6 +3971,11 @@ def price(
         "anchors_gib": anchors_gib,
         "rings_gib": rings_gib,
         "overhead_gib": overhead_gib,
+        # #1386: SAME LABEL DEFECT the #1317n comment above names for
+        # `s_gb_d` -- `arm.terms` is a fresh literal, not `charges` itself,
+        # so a key added only in `charge_terms`'s return would never reach
+        # here (or the ARM line, or a test reading `arm.terms`).
+        "hicache_disabled": bool(charges["hicache_disabled"]),
         "draft_host_p_gib": draft_host_p_gib,
         "draft_host_d_gib": draft_host_d_gib,
         # #1273 S6.  THE KEY IS ALWAYS HERE, 0.0 on the ring arm, because
@@ -4779,6 +4806,10 @@ def choose(
     # never re-prices one.
     deviation_reason: str = "",
     riegel_gib: Optional[float] = None,
+    # #1386: ONE bool, read once by the caller (launcher.main, beside
+    # `draft_kv_on_p`) and handed to every rung of the ladder here -- never
+    # re-derived per rung, so all `arms` price the identical switch state.
+    hicache_disabled: bool = False,
 ) -> Tuple[Arm, Optional[float], List[str]]:
     """Walk the ladder; return (arm, reap headroom GiB, printed lines) or W20/W21.
 
@@ -4835,6 +4866,7 @@ def choose(
             flip_ratchet=flip_ratchet,
             model_digest_want=model_digest_want,
             form_key_matches=form_key_matches,
+            hicache_disabled=hicache_disabled,
         )
         for s, m in arms
     ]
@@ -4901,6 +4933,24 @@ def choose(
         f"draft_host_P={DRAFT_HOST_P_MIB:.1f} MiB draft_host_D={DRAFT_HOST_D_MIB:.1f} MiB "
         f"(#1233 pinned draft host pools, both moments) "
         f"store_draft_fraction={STORE_DRAFT_FRACTION:.4f} (2048 of 32768 B per token)"
+    )
+    # #1386 [Minimalform HiCache switch]: ALWAYS printed, on or off, so an
+    # absent line is never mistaken for "never checked" (the same rule
+    # `lanes_concurrent`'s own line follows). True means BOTH halves of the
+    # switch fired: `anchors_gib`/`rings_gib`/`overhead_gib` price at 0.00
+    # above (charge_terms, this module) AND `--enable-hierarchical-cache`
+    # plus every `--hicache-*` flag are omitted from both groups' argv
+    # (launcher.common_flags) -- one bool, read once by the launcher, never
+    # a second one that could disagree with it. APPENDED, not inserted
+    # before the TERMS line: existing readers of `lines[0]` (pre-#1386) must
+    # keep seeing that line first, byte-identical, when the switch is off.
+    lines.append(
+        f"WEG2-HICACHE-DISABLED hicache_disabled={hicache_disabled} -- "
+        "when True: anchors_gib=0.00 rings_gib=0.00 overhead_gib=0.00 above, "
+        "AND group P/D's argv carries no --enable-hierarchical-cache / "
+        "--hicache-* flag at all (launcher.py common_flags); for the "
+        "Minimalform's two manual flips + shadow compare, which serve 0 "
+        "requests and therefore reuse no prefix HiCache could have cached."
     )
     # FIX 6: origin and watermark in ONE currency -- both non-reclaimable.
     watermark_gib = OBSERVED_REAP_NONRECLAIM_BYTES / GIB

@@ -596,6 +596,25 @@ def draft_kv_off_line() -> str:
         "D reads KV+Mamba from the store, draft state is cold after every "
         "flip (user order 2026-09-07 stands; this form is the rg6 baseline)"
     )
+
+
+def hicache_disabled_line() -> str:
+    """#1386: the one line the launcher prints when --weg2-disable-hicache is set.
+
+    Same reason as :func:`draft_kv_off_line`: an A-B arm that reads like the
+    default is how a measurement gets attributed to the wrong tree. This says,
+    in the boot's own argv-adjacent log, that BOTH groups' argv omit every
+    HiCache flag and the ledger charged 0.00 for it -- the ledger's own
+    ``WEG2-HICACHE-DISABLED`` line (host_ledger.choose) is the other half of
+    this same fact, printed at the other end of the one bool.
+    """
+    return (
+        "WEG2 HICACHE-DISABLED: on -- both groups boot without "
+        "--enable-hierarchical-cache and every --hicache-* flag (Minimalform "
+        "order #1386: 0 requests served means 0 prefixes to reuse); the host "
+        "ledger prices anchors_gib/rings_gib/overhead_gib at 0.00 for the "
+        "identical reason (see WEG2-HICACHE-DISABLED in this boot's ARM lines)"
+    )
 VENV_DEFAULT = "/spinning/htsglang-gpu/.venv"
 #: The model context both groups are launched with.  Named once because K9's
 #: --max-kv-per-request default IS this number (the as-built cap, decoupled
@@ -2565,6 +2584,15 @@ def common_flags(
     # See argv_p for the failure this produced on the normal start path.
     *,
     vision: str = VISION_OFF,
+    # #1386 [Minimalform HiCache switch]: OFF (default) is byte-identical to
+    # every argv this function built before the flag existed. ON drops the
+    # WHOLE hicache block below rather than passing a smaller size through it
+    # -- "abschalten heisst abschalten, nicht kleinrechnen" (no
+    # `--hicache-size 0`, which would still enter the HiCache code path on
+    # both groups). The identical bool also zeroes `anchors_gib`/`rings_gib`
+    # in `host_ledger.charge_terms`; `launcher.main` reads ONE local once and
+    # hands it to both, never two.
+    hicache_disabled: bool = False,
 ) -> List[str]:
     """Flags BOTH groups share.
 
@@ -2624,6 +2652,13 @@ def common_flags(
         "--chat-template-default-kwargs", '{"preserve_thinking": true}',
         "--enable-cache-report",
         "--enable-metrics",
+    ] + ([] if hicache_disabled else [
+        # #1386: the WHOLE block, never a subset -- `--hicache-size 0` or a
+        # bare `--enable-hierarchical-cache` alone would still walk server_args
+        # into the HiCache code path (a smaller cache, not an absent one).
+        # Dropping every flag here is what makes `hicache_disabled` mean the
+        # code path is never entered, matching the ledger side pricing 0.00
+        # for the same reason (host_ledger.charge_terms).
         "--enable-hierarchical-cache",
         "--hicache-host-role", "staging",
         "--hicache-size", str(s_gb),
@@ -2634,6 +2669,7 @@ def common_flags(
         "--hicache-io-backend", "direct",
         "--hicache-storage-backend-extra-config", store_cfg,
         "--hicache-canonical-kv-page",
+    ]) + [
         "--host", "127.0.0.1",
         "--chunked-prefill-size", str(CHUNKED_PREFILL_TOKENS),
         "--scheduler-distributed-teardown",
@@ -2722,6 +2758,8 @@ def argv_p(
     admin_api_key: Optional[str] = None,
     p_max_total_tokens: Optional[int] = None,
     vision: str = VISION_OFF,
+    # #1386: forwarded to `common_flags` unchanged; see that function.
+    hicache_disabled: bool = False,
 ) -> List[str]:
     # THE COUNT FLAGS ARE THE CONTIGUOUS FORM, AND ONLY THAT (#1240 FOLLOW FIX
     # 1). --pp-stage-ratio/--pp-attn-stage-ratio are per-stage COUNTS that
@@ -2786,6 +2824,7 @@ def argv_p(
     return [py, "-m", "sglang.launch_server"] + common_flags(
         model, s_gb, m_mib, store_cfg, max_kv_per_request, write_policy, "P",
         random_seed, barlink_cap_cycles, census_interval,
+        hicache_disabled=hicache_disabled,
     ) + [
         # C1/K1: P's own bs. Concurrency for the front's leg-1 fan-out AND
         # the size of P's req_to_token_pool (R-13), which is why it is
@@ -2898,10 +2937,17 @@ def argv_d(
     census_interval: int = COLLECTIVE_CENSUS_INTERVAL,
     disable_cuda_graph: bool = False,
     admin_api_key: Optional[str] = None,
+    # #1386: APPENDED LAST, deliberately -- `argv_d` has no `*` keyword-only
+    # marker, so a new parameter anywhere else would be the exact positional
+    # shift class #1356 already paid for once in `argv_p`. Every existing
+    # caller passes admin_api_key by keyword or stops before it; none can
+    # collide with this.
+    hicache_disabled: bool = False,
 ) -> List[str]:
     return [py, "-m", "sglang.launch_server"] + common_flags(
         model, s_gb, m_mib, store_cfg, max_kv_per_request, "write_through", "D",
         random_seed, barlink_cap_cycles, census_interval,
+        hicache_disabled=hicache_disabled,
     ) + (
         ["--disable-overlap-schedule"] if disable_overlap else []
     ) + (
@@ -5372,6 +5418,11 @@ def choose_host_ledger(
     # hands this function the number, exactly as `bounce_depth` already does.
     # 0 is "not stated": byte-identical, every lane prices as before #1385.
     lanes_concurrent: int = 0,
+    # #1386 (Minimalform HiCache switch): resolved ONCE by `main`, beside
+    # `draft_kv_on_p`, and handed to `host_ledger.choose` unchanged -- the
+    # ledger term and the argv this function's caller builds from `arm.s_gb`/
+    # `arm.m_mib` must read the identical bool, never a second copy of it.
+    hicache_disabled: bool = False,
 
 ) -> Tuple[host_ledger.Arm, Optional[float], List[str], Dict[str, Optional[int]]]:
     """THE LAUNCHER'S ONE LEDGER CALL SITE: read the host, price the ladder.
@@ -5519,6 +5570,12 @@ def choose_host_ledger(
         # which is every recorded arm.
         s_gb_d=s_gb_d,
         d_cap_terms=d_cap_terms,
+        # #1386: the ONE bool `choose_host_ledger`'s own caller resolved,
+        # forwarded unchanged into BOTH `host_ledger.choose` calls below
+        # (`arms=[(1, pin_m_mib)]` pinned, and the DEFAULT_ARMS ladder) --
+        # `**ledger_kw` is exactly the mechanism the #1317n comment above
+        # names to stop a term reaching only one of the two.
+        hicache_disabled=hicache_disabled,
         ring_bytes=ring_bytes,
         ring_span1_bytes=ring_span1_bytes,
         ring_provenance=ring_provenance,
@@ -9217,6 +9274,25 @@ def build_parser() -> argparse.ArgumentParser:
              "cannot arm it. LIMIT: a green digest says the bytes came back, "
              "never that the layout was verified.")
     ap.add_argument(
+        "--weg2-disable-hicache", action="store_true",
+        help="#1386: for the ZIELFRAGE MINIMALFORM (two manual flips + "
+             "shadow compare, zero requests served) -- drop the "
+             "HiCache/Mamba-anchor host tier that exists to reuse KV pages "
+             "ACROSS requests, which a boot that serves none cannot do. "
+             "ONE SWITCH, ONE TRUTH: this bool reaches BOTH "
+             "`host_ledger.charge_terms` (anchors_gib/rings_gib/overhead_gib "
+             "price at 0.00) AND `common_flags` (no --enable-hierarchical-"
+             "cache, no --hicache-* flag on either group's argv) -- never "
+             "two readers of two copies of the same decision, which is the "
+             "class of defect that under-priced #1385's bounce buffer against "
+             "the allocator xsn31/4 and xsn31/5 actually ran. "
+             "DEFAULT OFF, and OFF is byte-identical to every boot before "
+             "this flag existed: it is for the Minimalform's own use, not "
+             "for the serving basis, and it is NOT a smaller "
+             "--hicache-size/--hicache-mamba-host-mib -- those flags are "
+             "omitted outright, not passed as 0, so no HiCache code path is "
+             "entered at all.")
+    ap.add_argument(
         "--weg2-weight-source", choices=WEIGHT_SOURCE_CHOICES,
         default=WEIGHT_SOURCE_DEFAULT,
         help="#1273: where a waking group's weight BYTES come from. 'ring' (the "
@@ -10025,6 +10101,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # shape anyway) must never make a fast pre-spawn refusal look post-spawn.
     _ACTIVE_BOOT_STATE = None
     ns = build_parser().parse_args(argv)
+    # #1386: THE SWITCH IS RESOLVED HERE, ONCE, AS EARLY AS `ns` EXISTS --
+    # earlier than `draft_kv_on_p` below, because the FIRST `common_flags`
+    # call (the sentinel `chunk_tokens` solve, several hundred lines down)
+    # already needs it. Every later reader (that call, its post-ledger
+    # re-check, the ledger call, the form-key build and the shipped
+    # `argv_p`/`argv_d`) takes this ONE local, never `ns` again -- so a boot
+    # cannot price the switch one way and allocate the other (the exact
+    # #1385/#1386 shape three boots already cost).
+    hicache_disabled = bool(getattr(ns, "weg2_disable_hicache", False))
     # #1348: both coverage instruments armed at once is a burnt window, and
     # the cheapest place to say so is here -- before anything is started.
     refuse_double_coverage_arm(os.environ, xchg_coverage_diff=getattr(
@@ -10334,7 +10419,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         common_flags(ns.model, RING_FORM_SENTINEL_S_GB, RING_FORM_SENTINEL_M_MIB,
                      RING_FORM_SENTINEL_STORE_CFG, max_kv_per_request,
                      ns.p_hicache_write_policy, "P", ns.random_seed,
-                     ns.barlink_bar1_cap_cycles, ns.collective_census_interval)
+                     ns.barlink_bar1_cap_cycles, ns.collective_census_interval,
+                     hicache_disabled=hicache_disabled)
     )
     cut = solve_p_cut(
         ns, cards, budgets_p, ns.model, log, chunk_tokens=chunk_tokens,
@@ -10446,6 +10532,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     draft_kv_on_p = ns.draft_kv_on_p == "on"
     if not draft_kv_on_p:
         log(draft_kv_off_line())
+    # #1386: `hicache_disabled` was already resolved once, at the top of
+    # `main`, before `log` even existed (the first `common_flags` sentinel
+    # call needs it long before this point) -- this is only the LOG SIDE of
+    # the same fact, placed here beside its `draft_kv_on_p` twin now that a
+    # logger is available.
+    if hicache_disabled:
+        log(hicache_disabled_line())
     # B4e: ONE form argv, built with the xchg token when the arm is armed, and
     # used for BOTH the key this line prints and the argv `solve` is handed --
     # so the printed provenance IS the form that was selected on, token
@@ -10467,6 +10560,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         draft_kv_on_p=draft_kv_on_p,
         vision=ns.weg2_vision,
         p_max_total_tokens=int(cut.pool_tokens),
+        hicache_disabled=hicache_disabled,
     ), ns.weg2_weight_source)
     form_key, form_norm = ring_table.p_form_key(form_argv_p)
     log(
@@ -10686,7 +10780,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         oncard_mode=ns.weg2_xchg_oncard,
         oncard_slot_mib=ns.weg2_xchg_oncard_slot_mib,
         # #1332 B1b: the checkpoint whose WIDEST layer sizes the host bounce.
-        model_dir=ns.model)
+        model_dir=ns.model,
+        # #1386: the SAME local `main` resolved once, above, beside
+        # `draft_kv_on_p` -- never re-read from `ns` here.
+        hicache_disabled=hicache_disabled)
     state.cgroup = dict(cg)
     for ln in lines:
         log(ln)
@@ -10817,7 +10914,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     chunk_tokens_armed = chunked_prefill_size_of(
         common_flags(ns.model, arm.s_gb, arm.m_mib, store_cfg, max_kv_per_request,
                      ns.p_hicache_write_policy, "P", ns.random_seed,
-                     ns.barlink_bar1_cap_cycles, ns.collective_census_interval)
+                     ns.barlink_bar1_cap_cycles, ns.collective_census_interval,
+                     hicache_disabled=hicache_disabled)
     )
     if chunk_tokens_armed != chunk_tokens:
         raise Weg2LaunchRefused(
@@ -10981,7 +11079,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         draft_kv_on_p=draft_kv_on_p,
         vision=ns.weg2_vision,
         admin_api_key=admin_api_key,
-        p_max_total_tokens=int(cut.pool_tokens))
+        p_max_total_tokens=int(cut.pool_tokens),
+        hicache_disabled=hicache_disabled)
     # TRAIN FIX 5: THE SENTINEL PREMISE, PROVEN ON EVERY BOOT.  The form key that
     # gated the ring table was hashed over an argv built with sentinel ledger
     # terms, which is sound only while every flag those sentinels reach is
@@ -11062,7 +11161,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         log(d_ratio.op_line)
         log(d_tokvec.line)
         env_d = build_env(tree, ns.venv, cvd, store_dir, False, ns.tag, chunk_layers, chunk_count, tms_so, ns.transport, ring_plan, group="D", xchg_env=xchg_env, **_env_knobs(ns))
-        spec_d = GroupSpec("D", PORT_D, transport_argv(argv_d(py, ns.model, budgets_d, s_gb_d, arm.m_mib, store_cfg, shlex.split(ns.extra_d), d_bs, max_kv_per_request, x_tokens, ns.num_continuous_decode_steps, ns.d_disable_overlap_schedule, d_ratio.flags, d_tokvec.flags, ns.random_seed, ns.barlink_bar1_cap_cycles, ns.collective_census_interval, ns.d_disable_cuda_graph, admin_api_key=admin_api_key), ns.transport), state.logs["D"], env_d)
+        spec_d = GroupSpec("D", PORT_D, transport_argv(argv_d(py, ns.model, budgets_d, s_gb_d, arm.m_mib, store_cfg, shlex.split(ns.extra_d), d_bs, max_kv_per_request, x_tokens, ns.num_continuous_decode_steps, ns.d_disable_overlap_schedule, d_ratio.flags, d_tokvec.flags, ns.random_seed, ns.barlink_bar1_cap_cycles, ns.collective_census_interval, ns.d_disable_cuda_graph, admin_api_key=admin_api_key, hicache_disabled=hicache_disabled), ns.transport), state.logs["D"], env_d)
         launch_group(spec_d, tree, log, dry)
         log("front argv (dry): " + " ".join(shlex.quote(a) for a in front_argv_for(
             py, store_dir, 0, 0, dc_expect_d, cards, ns, chunk_count, 0, p_bs, d_bs, x_tokens,
@@ -11140,7 +11239,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     log(d_ratio.op_line)
     log(d_tokvec.line)
     env_d = build_env(tree, ns.venv, cvd, store_dir, ns.debug_hold in ("D", "both"), ns.tag, chunk_layers, chunk_count, tms_so, ns.transport, ring_plan, group="D", xchg_env=xchg_env, **_env_knobs(ns))
-    spec_d = GroupSpec("D", PORT_D, transport_argv(argv_d(py, ns.model, budgets_d, s_gb_d, arm.m_mib, store_cfg, shlex.split(ns.extra_d), d_bs, max_kv_per_request, x_tokens, ns.num_continuous_decode_steps, ns.d_disable_overlap_schedule, d_ratio.flags, d_tokvec.flags, ns.random_seed, ns.barlink_bar1_cap_cycles, ns.collective_census_interval, ns.d_disable_cuda_graph, admin_api_key=admin_api_key), ns.transport), state.logs["D"], env_d)
+    spec_d = GroupSpec("D", PORT_D, transport_argv(argv_d(py, ns.model, budgets_d, s_gb_d, arm.m_mib, store_cfg, shlex.split(ns.extra_d), d_bs, max_kv_per_request, x_tokens, ns.num_continuous_decode_steps, ns.d_disable_overlap_schedule, d_ratio.flags, d_tokvec.flags, ns.random_seed, ns.barlink_bar1_cap_cycles, ns.collective_census_interval, ns.d_disable_cuda_graph, admin_api_key=admin_api_key, hicache_disabled=hicache_disabled), ns.transport), state.logs["D"], env_d)
     state.argv["D"] = " ".join(shlex.quote(a) for a in spec_d.argv)
     launch_group(spec_d, tree, log, dry)
     state.pids["D"] = spec_d.pid
