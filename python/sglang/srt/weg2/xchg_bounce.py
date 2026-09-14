@@ -62,7 +62,7 @@ cross share.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import Any, Dict, Optional
 
 MIB = 1024 * 1024
 GIB = 1024 * MIB
@@ -156,6 +156,52 @@ def resolve_lanes_concurrent(raw: Optional[int]) -> int:
     return n
 
 
+def resolve_cross_lanes(n_lanes: int, *, max_diag_lanes: Optional[int] = None) -> int:
+    """#1397 VERDRAHTUNG (2026-09-14): the SAFE lower bound on how many of
+    `n_lanes` are genuinely CROSS pairs, for a caller that arms
+    `band_credit` without having measured THIS flip's real split.
+
+    ``max_diag_lanes`` defaults to `weight_exchange_region.N_CARDS`, imported
+    LAZILY -- the same reason `assemble_slots`/`tag_slots` (two functions
+    up) import `weight_exchange` lazily rather than at module level: this
+    file stays free of an unconditional dependency on the rest of weg2, and
+    the ONE non-measured topology fact this function needs (a diagonal lane
+    is one physical card talking to itself, and there are never more of
+    those than there are cards) is read from its OWN owner rather than
+    duplicated as a second literal here -- two ``N_CARDS = 3``s is exactly
+    the "two sources" defect #1358's whole family exists to close, just for
+    a topology constant instead of a measured figure.
+
+    NEVER OVER-COUNTS, BY THE PIGEONHOLE PRINCIPLE, not by an assumption
+    about any PARTICULAR flip. A diagonal lane requires `pair_of(r, r) is
+    None` (`weight_exchange_bounce.py`), i.e. one lane per physical card --
+    so out of ANY `n_lanes` active lanes (`n_lanes` is itself #1358's own
+    MEASURED count, `group_descs_by_pair`'s enumeration, never assumed),
+    AT MOST `max_diag_lanes` of them can be diagonal, REGARDLESS of which
+    specific lanes those are. The remainder, `n_lanes - max_diag_lanes`, is
+    therefore a hard LOWER BOUND on the genuinely-cross count for THIS
+    flip, not a probabilistic guess: this is what answers DESK10's
+    per-rank question (2026-09-14, cross-session) of whether a rank with a
+    DIFFERENT specific set of cross pairs than assumed could exceed what
+    was priced -- it cannot, because the bound never depended on which
+    lanes are cross, only on how many diagonal lanes could possibly exist
+    at all.
+
+    A caller that HAS measured the real split (a boot's own
+    `group_descs_by_pair` census) may state a larger, more precise
+    ``n_cross_lanes`` directly to :func:`bounce_terms` instead of calling
+    this at all -- this function is the answer for a caller that has not
+    measured it, the exact gap #1397's own wiring left open (see the
+    module docstring's Option 3 addendum and
+    ``DESIGN_option3_band_credit_0914.md`` section 9).
+    """
+    if max_diag_lanes is None:
+        from sglang.srt.weg2 import weight_exchange_region as xr
+
+        max_diag_lanes = xr.N_CARDS
+    return max(0, int(n_lanes) - int(max_diag_lanes))
+
+
 def lanes_concurrent_line(terms: BounceTerms) -> str:
     """Named and counted, never silent (Wand 11b): the flip-time cost of a cap.
 
@@ -241,15 +287,21 @@ class BounceTerms:
     band_credit: bool = False
     #: Of `lanes_priced`, how many are genuinely CROSS pairs (never the
     #: diagonal) and therefore eligible for `band_credit`'s smaller sizing.
-    #: ``0`` is the SAFE default -- exactly the "not stated" sentinel every
-    #: other field on this dataclass already uses (`max_tag_bytes`,
-    #: `lanes_concurrent`): turning `band_credit` on WITHOUT also counting
-    #: how many of this boot's lanes are cross prices `total_bytes`
-    #: identically to `band_credit=False`, never smaller. A caller that
-    #: states a larger count than `lanes_priced` cannot inflate the eligible
-    #: share past 100 % (`n_cross_lanes_priced` clamps it) -- the direction
-    #: that matters is under-stating, which only ever costs bytes back to
-    #: the diagonal-safe floor, never UNDER-charges the boot.
+    #: A CONCRETE INT ON THIS FIELD ALWAYS -- the RESOLVED value, never the
+    #: sentinel. `bounce_terms`'s own `n_cross_lanes` PARAMETER is
+    #: `Optional[int] = None` (the identical `raw is None` convention
+    #: `resolve_lanes_concurrent` already uses): `None` (never given) alongside
+    #: `band_credit=True` auto-derives a SAFE, structural value via
+    #: :func:`resolve_cross_lanes` before this field is ever set (#1397
+    #: VERDRAHTUNG, 2026-09-14) -- "built but nobody pulls the lever"
+    #: (#1367/#1375) is closed for this ONE input by construction, so
+    #: arming reduces to the single `band_credit` boolean. An EXPLICIT `0`
+    #: is respected literally (this boot truly has no cross lanes -- band_
+    #: credit then prices and does nothing, safely) and never promoted. A
+    #: caller that states a larger count than `lanes_priced` cannot
+    #: inflate the eligible share past 100 % (`n_cross_lanes_priced` clamps
+    #: it) -- the direction that matters is UNDER-stating, which only ever
+    #: costs bytes back to the diagonal-safe floor, never under-charges.
     n_cross_lanes: int = 0
 
     @property
@@ -549,7 +601,7 @@ def bounce_terms(
     max_tag_bytes: int = 0,
     lanes_concurrent: int = 0,
     band_credit: bool = False,
-    n_cross_lanes: int = 0,
+    n_cross_lanes: Optional[int] = None,
 ) -> BounceTerms:
     """Derive the bounce term. Pure; raises only on inputs that cannot mean anything.
 
@@ -590,6 +642,27 @@ def bounce_terms(
         raise ValueError(f"depth must be positive: {depth!r}")
     if int(pairs) < 0 or int(slot_bytes) <= 0:
         raise ValueError(f"pairs/slot_bytes invalid: {pairs!r}/{slot_bytes!r}")
+    # #1397 VERDRAHTUNG (2026-09-14). `band_credit` still needs an EXPLICIT
+    # `True` from the caller -- this function manufactures no opt-in signal
+    # from nothing, and "unset stays byte-identical" (`band_credit=False`'s
+    # own default) is unconditional. But GIVEN that explicit `True`, a
+    # caller who has not measured this flip's real cross/diagonal split
+    # would otherwise get `n_cross_lanes_priced == 0` (band_credit priced,
+    # nobody pulls it) -- exactly the "built but nobody pulls the lever"
+    # class #1367/#1375 name. `resolve_cross_lanes` (this file) answers the
+    # ONE remaining question this module CAN answer without a boot-specific
+    # measurement -- how many lanes MUST be cross, structurally, given
+    # `n_lanes` and this rig's fixed `weight_exchange_region.N_CARDS` -- so
+    # arming reduces to the single boolean; nothing else to coordinate.
+    # A caller that DID measure the real split still states its own
+    # `n_cross_lanes`, INCLUDING AN EXPLICIT ``0`` (this boot truly has none)
+    # -- `None` (never given, the parameter's own default) is the ONLY
+    # trigger for auto-derivation, the identical `raw is None` convention
+    # `resolve_lanes_concurrent` already uses one screen up, so an explicit
+    # zero is respected literally rather than silently promoted.
+    _n_cross_lanes = (resolve_cross_lanes(max(1, int(n_lanes)))
+                      if bool(band_credit) and n_cross_lanes is None
+                      else max(0, int(n_cross_lanes or 0)))
     # #1397 x #1385 INTERACTION, NAMED RATHER THAN LEFT TO COINCIDE.
     # `band_credit`'s own smaller sizing (`cross_lane_slots x slot_bytes`,
     # the small ONCARD unit) has exactly one precondition: Option 1
@@ -606,12 +679,17 @@ def bounce_terms(
     # priced") measured at 5.6x on boot weg2xsn31/4, just with `band_credit`
     # as the new second reader of one decision. Refused HERE, at
     # construction, rather than left to coincide: a caller that means to
-    # price the cross share smaller must state `max_tag_bytes` too.
-    if (bool(band_credit) and int(n_cross_lanes) > 0
-            and int(max_tag_bytes) <= 0):
+    # price the cross share smaller must state `max_tag_bytes` too. GRADED
+    # AGAINST THE RESOLVED `_n_cross_lanes`, not the raw parameter, so this
+    # is REACHABLE from the single-boolean arming path above: `band_credit
+    # =True` alone (n_lanes > N_CARDS, max_tag_bytes unset) auto-derives a
+    # positive count and hits this raise -- no caller has to ALSO
+    # misconfigure `n_cross_lanes` by hand to reach it.
+    if bool(band_credit) and _n_cross_lanes > 0 and int(max_tag_bytes) <= 0:
         raise ValueError(
-            "band_credit=True with n_cross_lanes stated needs max_tag_bytes "
-            "> 0 (Option 1 active) -- band_credit's cross-lane price is the "
+            "band_credit=True with n_cross_lanes stated (or auto-derived "
+            "from n_lanes via resolve_cross_lanes) needs max_tag_bytes > 0 "
+            "(Option 1 active) -- band_credit's cross-lane price is the "
             "ONCARD slot unit (`terms.slot_bytes`), which `run_bounce_leg` "
             "(`leg_slot_bytes`) only ever allocates when Option 1 is active; "
             "with max_tag_bytes unset the leg falls back to the "
@@ -634,7 +712,7 @@ def bounce_terms(
         max_tag_bytes=max(0, int(max_tag_bytes)),
         lanes_concurrent=max(0, int(lanes_concurrent)),
         band_credit=bool(band_credit),
-        n_cross_lanes=max(0, int(n_cross_lanes)),
+        n_cross_lanes=_n_cross_lanes,
     )
 
 
@@ -698,7 +776,17 @@ def read_published_terms(raw: Optional[str] = None) -> Optional[BounceTerms]:
     text = (text or "").strip()
     if not text:
         return None
-    kw = {}
+    # #1397 FIX: `band_credit` is the ONE field of `_TERM_FIELDS` typed
+    # `bool`, not `int` -- `Dict[str, Any]`, not the uniform `Dict[str,
+    # int]` a bare `{}` would infer from every OTHER field's assignment,
+    # so `bounce_terms(**kw)` hands it a real `bool` rather than an `int`
+    # that happens to be truthy. Harmless at runtime today (Python's own
+    # `bool` is an `int` subtype, and `bounce_terms` casts with
+    # `bool(band_credit)` regardless) but the wrong type on this ONE key
+    # is exactly the seam a genuinely wrong value would cross silently:
+    # BOOT7's pyright gate (2026-09-14) is what caught the type, before any
+    # caller ever published a nonzero `band_credit` for real.
+    kw: Dict[str, Any] = {}
     for part in text.split(","):
         key, _, value = part.partition("=")
         key = key.strip()
@@ -707,7 +795,30 @@ def read_published_terms(raw: Optional[str] = None) -> Optional[BounceTerms]:
                 f"{ENV_BOUNCE_TERMS} carries an unknown field {key!r}; the "
                 f"published term is the launcher's own and its fields are "
                 f"{_TERM_FIELDS}")
-        kw[key] = int(value)
+        if key == "band_credit":
+            # VALIDATED, NOT MERELY CAST: `publish_terms` only ever writes
+            # `int(True)`/`int(False)` (`0` or `1`) for this ONE bool field
+            # among otherwise-int fields, so any OTHER value here is
+            # corruption (a hand-edited env var, a future producer bug), not
+            # a legitimate "how many" the way every other field's int is.
+            # Coercing it with a bare `bool(...)` -- Python's own truthiness
+            # -- would ARM this feature on a `2`, a `-1`, anything nonzero,
+            # SILENTLY, exactly the "a feature arms itself where nobody is
+            # looking" direction BOOT7's pyright gate (2026-09-14) surfaced
+            # as a type error one line up from this comment's history.
+            _bc = int(value)
+            if _bc not in (0, 1):
+                raise ValueError(
+                    f"{ENV_BOUNCE_TERMS} carries band_credit={value!r}, "
+                    f"which is neither 0 nor 1 -- publish_terms never writes "
+                    f"anything else for this field, so this is a corrupted "
+                    f"or hand-edited value. Refusing rather than coercing "
+                    f"it with bare truthiness, which would silently ARM "
+                    f"band_credit on ANY nonzero value nobody intended as "
+                    f"'on'.")
+            kw[key] = bool(_bc)
+        else:
+            kw[key] = int(value)
     missing = [f for f in _TERM_FIELDS if f not in kw]
     if missing:
         raise ValueError(
