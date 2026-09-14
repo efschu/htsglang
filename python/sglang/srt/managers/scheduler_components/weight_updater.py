@@ -50,6 +50,7 @@ from sglang.srt.managers.weg2_memory_saver import (
     Weg2VramCreditRefused,
     Weg2WakeRefused,
     Weg2XchgLaneNeverDrainedRefused,
+    Weg2XchgWakeSourceGapRefused,
     assert_backup_off_wake_refill_is_defined,
     assert_memory_saver_active,
     checkpoint_quantization,
@@ -1187,9 +1188,25 @@ class SchedulerWeightUpdaterManager:
         _descs = list(plan.descs)
         if tag is not None:
             _descs = [d for d in _descs if str(getattr(d, "tag", "")) == str(tag)]
+            # #1369/#1394 (DESK10 Paket B): THE VOLLSTAENDIGKEITS-REFUSAL.
+            # Checked HERE, on the SOURCE/sleep side, before the pause that
+            # would make a gap real: once this tag's ring backup is off,
+            # this deposit (or its structural absence) is the LAST chance to
+            # say "nobody will restore this tag's bytes at wake" while VRAM
+            # has not yet been mutated for it.
+            _gap = self._weg2_xchg_wake_source_gap(tag, cdescs_present=bool(_descs))
+            if _gap is not None:
+                raise Weg2XchgWakeSourceGapRefused(
+                    f"W106 Weg2XchgWakeSourceGapRefused: group={group} "
+                    f"rank={rank} tag={tag}: {_gap}"
+                )
             if not _descs:
-                # Not an error: a tag this rank does not carry has nothing to
-                # deposit, and saying so keeps the per-tag census honest.
+                # Not an error BEYOND the check above: a tag this rank does
+                # not carry has nothing to deposit, and saying so keeps the
+                # per-tag census honest -- reachable only because the gap
+                # check just cleared it (ring still on, or the exchange is
+                # authoritative and genuinely has nothing FOR THIS RANK,
+                # which is fine as long as SOME rank does).
                 logger.info(
                     "WEG2-XCHG DEPOSIT tag=%s group=%s rank=%s pieces=0 -- "
                     "this rank's plan carries no desc for this tag, so the "
@@ -1203,6 +1220,166 @@ class SchedulerWeightUpdaterManager:
             region=self._weg2_shadow_region(),
             sems=self._weg2_xchg_sems(), tag=tag, rank=int(rank),
         )
+
+    def _weg2_xchg_wake_source_gap(self, tag, *, cdescs_present: bool) -> Optional[str]:
+        """``None`` if ``tag``'s wake, WITHOUT its ring backup, has something
+        that will actually restore its bytes -- a short GAP REASON string
+        otherwise.
+
+        #1369/#1394 (DESK10 Paket B), the completeness half of turning the
+        host ring off: with the ring gone, the exchange is the ONLY source
+        of a tag's wake bytes, so a gap here is not a missing optimisation,
+        it is undefined weights served with every counter green. Two
+        independent ways a gap can exist, checked in order (either one is
+        enough to refuse):
+
+        1. THE TAG'S RING BACKUP IS OFF, BUT THE EXCHANGE IS NOT
+           AUTHORITATIVE. ``--weg2-xchg-inject shadow`` compares, it never
+           writes (#1391's own lesson: ``_weg2_xchg_shadow_compare`` and the
+           per-tag shadow branch beside it are graders, not movers -- see
+           ``_weg2_xchg_inject_from_peer``'s ``mode`` argument, which the
+           shadow path sets to ``INJECT_SHADOW`` explicitly). A tag with the
+           ring off and nothing authoritative writing it has NO source at
+           all, independent of how complete its plan is: this check fires
+           even when ``cdescs_present`` is True, because a perfect plan
+           under ``shadow`` still writes nothing.
+        2. THE EXCHANGE IS AUTHORITATIVE, BUT THIS RANK'S OWN PLAN IS EMPTY
+           FOR THIS TAG. ``weights_draft`` is EXEMPTED from this one case
+           only: #1394's fix gives it a dedicated disk-reload wake path
+           (:meth:`_weg2_xchg_draft_reload_from_disk`) instead of the
+           exchange, because ``_weg2_shadow_plan`` structurally never
+           selects the draft runner's region (it reads
+           ``self.tp_worker.model_runner`` alone, on every call, regardless
+           of tag) -- an empty plan for ``weights_draft`` is therefore the
+           EXPECTED shape, not a gap, as long as the reload path is reachable
+           (``self.draft_worker is not None``). It is NOT exempted from
+           needing case 1's authoritative writer.
+
+        ``weights_cpu_backup_armed`` unreadable (the contract not yet on
+        this tree, or an env this process cannot parse) answers ``None``
+        rather than manufacturing a refusal from an absence -- the same
+        rule :meth:`_weg2_xchg_undrained_lanes` follows for an unopened
+        semaphore set.
+        """
+        from sglang.srt.managers.weg2_memory_saver import (
+            GPU_MEMORY_TYPE_WEIGHTS_DRAFT,
+        )
+        from sglang.srt.weg2 import weight_exchange as wx
+
+        try:
+            from sglang.srt.weg2.weight_exchange import weights_cpu_backup_armed
+
+            if weights_cpu_backup_armed():
+                return None
+        except Exception:  # noqa: BLE001 -- an unreadable contract is not a gap
+            return None
+        # The ring is off for this tag. The exchange has to be the writer.
+        if not (wx.exchange_armed() and wx.inject_authoritative()):
+            return (
+                f"weights_cpu_backup_armed()=False for this tag and the "
+                f"exchange is not authoritative (exchange_armed="
+                f"{wx.exchange_armed()} inject_authoritative="
+                f"{wx.inject_authoritative()}) -- shadow mode only COMPARES "
+                f"the exchange's assembled bytes, it never writes them, so "
+                f"nothing would restore this tag at wake"
+            )
+        if str(tag) == GPU_MEMORY_TYPE_WEIGHTS_DRAFT:
+            if self.draft_worker is None:
+                return None
+            return None  # covered by _weg2_xchg_draft_reload_from_disk
+        if not cdescs_present:
+            return (
+                "weights_cpu_backup_armed()=False for this tag and the "
+                "exchange is authoritative, but this rank's own plan "
+                "carries zero descriptors for it on the source side -- "
+                "nobody will deposit these bytes for the peer to collect "
+                "at wake"
+            )
+        return None
+
+    def _weg2_xchg_draft_reload_from_disk(self) -> bool:
+        """#1394 (DESK10 Paket B): ``weights_draft``'s OWN wake source, since
+        the exchange structurally never covers it.
+
+        ``_weg2_shadow_plan`` resolves ``region_tag`` from
+        ``self.tp_worker.model_runner`` alone -- the MAIN runner -- on
+        EVERY call, regardless of which tag the per-tag resume loop is
+        processing (verified #1391 round 2, executed:
+        ``weights_region_tag_for(RunnerShape.of(<main runner>))`` never
+        answers ``GPU_MEMORY_TYPE_WEIGHTS_DRAFT``). So neither this rank's
+        own collect NOR the peer's deposit for ``weights_draft`` can ever
+        select the draft runner's descriptors: the exchange is not merely
+        untested for this tag, it is unreachable for it. With the host
+        ring OFF (``weights_cpu_backup_armed()=False``), ``resume`` only
+        remaps pages -- their content is undefined until something writes
+        them. Rebuilding the plan resolution to carry two runners (option
+        (a) in DESIGN_1394) is the bigger, riskier change; this is the
+        smaller one: reload straight from the checkpoint on disk, through
+        the SAME per-shard call ``update_weights_from_disk`` already uses
+        for the draft worker independently of the main one (this method,
+        :2064-2066 region).
+
+        Returns ``True`` when it did the reload (so the caller can skip the
+        exchange branch for this tag), ``False`` when there is nothing to
+        reload (no draft shard in this process, or the ring still covers
+        it) -- never silently both-or-neither.
+        """
+        if self.draft_worker is None:
+            return False
+        try:
+            from sglang.srt.weg2.weight_exchange import weights_cpu_backup_armed
+
+            if weights_cpu_backup_armed():
+                return False  # the ring already covers this tag
+        except Exception:  # noqa: BLE001 -- an unreadable contract changes nothing
+            return False
+        server_args = self._weg2_server_args()
+        if server_args is None:
+            raise Weg2WakeRefused(
+                "W4 Weg2WakeRefused: weights_draft's disk-reload wake path "
+                "needs server_args to name the checkpoint and none is "
+                "reachable from the weight updater. VRAM has already been "
+                "remapped; refusing rather than serving undefined weights."
+            )
+        from sglang.srt.managers.weg2_memory_saver import (
+            GPU_MEMORY_TYPE_WEIGHTS_DRAFT,
+            weights_region,
+        )
+
+        draft_path = (
+            getattr(server_args, "speculative_draft_model_path", None)
+            or server_args.model_path
+        )
+        with weights_region(
+            self.memory_saver_adapter, GPU_MEMORY_TYPE_WEIGHTS_DRAFT,
+            enable_cpu_backup=False,
+        ):
+            with self._weg2_pcie_lock("wake-H2D weights_draft reload"):
+                try:
+                    success, message = self.draft_worker.update_weights_from_disk(
+                        UpdateWeightFromDiskReqInput(
+                            model_path=draft_path,
+                            load_format=getattr(server_args, "load_format", None),
+                            flush_cache=False,
+                            torch_empty_cache=False,
+                        )
+                    )
+                except Exception as exc:  # noqa: BLE001 -- name it, do not swallow
+                    raise Weg2WakeRefused(
+                        "W4 Weg2WakeRefused: weights_draft's disk-reload wake "
+                        f"path raised while refilling from {draft_path!r}: "
+                        f"{type(exc).__name__}: {exc}. The VMM pages are "
+                        "committed but their content is undefined; this group "
+                        "is fatal."
+                    ) from exc
+        if not success:
+            raise Weg2WakeRefused(
+                "W4 Weg2WakeRefused: weights_draft's disk-reload wake path "
+                f"could not refill from {draft_path!r}: {message!r}. The VMM "
+                "pages are committed but their content is undefined; this "
+                "group is fatal."
+            )
+        return True
 
     def _weg2_xchg_inject_from_peer(self, *, terms, tag=None, **kw) -> None:
         """The transfer itself, once the term is known.
@@ -4632,13 +4809,31 @@ class SchedulerWeightUpdaterManager:
                         float(tag_bytes.get(tag, 0)),
                         (time.perf_counter() - t_tag) * 1000,
                     ]
+                    # #1394 (DESK10 Paket B): weights_draft's OWN wake source,
+                    # BEFORE the exchange branch below is even asked -- the
+                    # exchange structurally never covers this tag (see
+                    # `_weg2_xchg_draft_reload_from_disk`'s own docstring), so
+                    # asking `_weg2_wake_weight_carrier()` for it first would
+                    # just read CARRIER_EXCHANGE and collect nothing, exactly
+                    # #1394's own finding. `_weg2_xchg_draft_reload_from_disk`
+                    # is itself a no-op (returns False) whenever the ring
+                    # still covers this tag or there is no draft shard here,
+                    # so this call costs nothing on every OTHER tag and every
+                    # pre-#1369 boot.
+                    from sglang.srt.managers.weg2_memory_saver import (
+                        GPU_MEMORY_TYPE_WEIGHTS_DRAFT as _WEIGHTS_DRAFT_TAG,
+                    )
+
+                    if (str(tag) == _WEIGHTS_DRAFT_TAG
+                            and self._weg2_xchg_draft_reload_from_disk()):
+                        pass
                     # #1374 F1: COLLECT THIS TAG NOW, while it is the tag the
                     # resume has just mapped -- resume(t) -> collect(t) ->
                     # post_drained(t), the mirror of the source's deposit(t) ->
                     # pause(t) -> credit(t). Before #1374 the whole plan was
                     # collected after the loop, which is why the peer's
                     # per-tag deposit had nobody to drain it.
-                    if self._weg2_wake_weight_carrier() == self.CARRIER_EXCHANGE:
+                    elif self._weg2_wake_weight_carrier() == self.CARRIER_EXCHANGE:
                         self._weg2_xchg_inject_weights(tag=tag)
                         self._weg2_xchg_collected_per_tag = True
                     # S7 (#1273): READ THE MAP COST WHILE IT IS STILL THIS TAG'S.
