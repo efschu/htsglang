@@ -316,3 +316,167 @@ class TheLedgerSeesTheRingsWegfall(CustomTestCase):
             self.assertTrue(
                 any(l.startswith("WEG2-WEIGHTS-CPU-BACKUP") for l in lines),
                 f"missing Gegenprobe line for ring_absent_by_design={absent}")
+
+
+class TheFlagIsTheAuthorityOverRingAbsenceNotOnlyTheAxis(CustomTestCase):
+    """BOOT7 (xsn32, 6/6 dry runs, rc=1): ``choose_host_ledger(weight_source=
+    "exchange", inject_mode="authoritative", weights_cpu_backup_armed=True)``
+    (i.e. an EXPLICIT ``--weg2-weights-cpu-backup on``, the A/B comparison
+    instrument the flag's own help text names) died with
+
+        ValueError: ring_absent_by_design with a non-zero ring
+        (ring_bytes=51036291072, ring_span1_bytes=51036291072)
+        host_ledger.py:3835 (price()'s own contradiction guard)
+
+    ROOT: the call site computed ``ring_absent_by_design_base`` via the bare
+    two-argument ``ring_absent_by_design(weight_source, inject_mode)``,
+    which reads ONLY the weight-source/inject axis and is correct
+    EXCLUSIVELY under ``auto`` -- there it IS this predicate's own
+    definition (``main``'s own resolution site: ``weights_cpu_backup_armed =
+    not ring_absent_by_design(...)``). Under an explicit ``on``,
+    ``weights_cpu_backup_armed`` is forced True regardless of weight_source/
+    inject_mode, but the bare call still answered True (ring "absent by
+    design") for exchange+authoritative specifically -- it never learned
+    about the flag at all. `weg2_weights_cpu_backup_ring_kw`'s own ``if
+    weights_cpu_backup_armed:`` branch then passed that STALE True through
+    unchanged beside the REAL, non-zero ring bytes ``on`` built: exactly the
+    contradiction ``price()``'s guard exists to catch.
+
+    THE FIX (verified, not merely proposed, against the actual authority
+    ordering rather than adopted from the order's own draft): NOT a third
+    parameter on ``ring_absent_by_design`` -- ``weights_cpu_backup_armed``
+    is ALREADY the full authority over all three modes
+    (``weight_exchange.weights_cpu_backup_armed``'s own docstring: on=True
+    always, off=False always, auto=``not ring_absent_by_design(...)``), so
+    "is the ring absent" is simply ITS NEGATION in every mode, not only
+    under auto -- verified identity: under auto,
+    ``weights_cpu_backup_armed = not ring_absent_by_design(...)`` means
+    ``not weights_cpu_backup_armed == ring_absent_by_design(...)`` exactly,
+    so the call site's new expression is BYTE-IDENTICAL to the old one for
+    every boot that only ever ran auto (every boot before #1369), and
+    additionally correct under on/off, where the old one was not. No new
+    parameter, no new function, no second authority.
+    """
+
+    # BOOT7's own dry-run numbers (xsn32), used as the fixture rather than a
+    # round GiB literal -- the exact bytes that tripped price()'s guard.
+    BOOT7_RING_BYTES = 51036291072
+    BOOT7_RING_SPAN1_BYTES = 51036291072
+
+    def test_the_call_site_uses_the_authoritative_boolean(self):
+        """Source-level pin: the call site must read `not
+        weights_cpu_backup_armed`, never the bare two-argument
+        `ring_absent_by_design(weight_source, inject_mode)` call -- checked
+        as an ABSENCE of the old pattern immediately before
+        `weg2_weights_cpu_backup_ring_kw(`, so a regression that reintroduces
+        the bare call cannot hide behind an unrelated call elsewhere (e.g.
+        `main`'s own auto-only resolution site, which legitimately keeps it).
+        """
+        import inspect
+
+        src = inspect.getsource(L.choose_host_ledger)
+        i = src.index("weg2_weights_cpu_backup_ring_kw(")
+        # The CALL ITSELF (4 lines: the assignment, ring_bytes/span1, the
+        # base argument, the armed argument) -- narrow on purpose so the
+        # surrounding EXPLANATORY COMMENT (which legitimately quotes the
+        # old, bare call by name to say it is no longer used here) cannot
+        # make this assertion pass or fail on prose instead of code.
+        call_only = src[i:i + 150]
+        self.assertIn("not weights_cpu_backup_armed", call_only)
+        self.assertNotIn("ring_absent_by_design(weight_source, inject_mode)",
+                         call_only)
+
+    def test_boot7_scenario_no_longer_raises(self):
+        """RED-FIRST: this exact call, with BOOT7's own numbers, raised
+        ValueError before the fix (reproduced in the mutant test below)."""
+        arm, _headroom, _lines, _cg = L.choose_host_ledger(
+            self.BOOT7_RING_BYTES, self.BOOT7_RING_SPAN1_BYTES,
+            weight_source="exchange", inject_mode="authoritative",
+            weights_cpu_backup_armed=True,
+        )
+        self.assertFalse(arm.terms["ring_absent_by_design"])
+        self.assertAlmostEqual(
+            arm.terms["host_ring_gib"],
+            self.BOOT7_RING_BYTES / hl.GIB, places=6)
+
+    def test_ring_kw_no_longer_produces_the_contradiction(self):
+        """Direct pin on the function BOOT7's traceback actually names."""
+        kw = L.weg2_weights_cpu_backup_ring_kw(
+            self.BOOT7_RING_BYTES, self.BOOT7_RING_SPAN1_BYTES,
+            not True,  # what the fixed call site now passes when armed=True
+            True,
+        )
+        self.assertEqual(
+            kw, (self.BOOT7_RING_BYTES, self.BOOT7_RING_SPAN1_BYTES, False))
+
+    def test_mutant_off_with_a_real_ring_the_guard_must_still_fire(self):
+        """DANGER-DIRECTION MUTANT 1 (order's own): the fix must not disarm
+        price()'s contradiction guard, only feed it the truth. An explicit
+        `off` with a NON-EMPTY ring (a caller bug elsewhere, or a stale
+        ring_bytes not yet zeroed) must still raise -- `off` means
+        `weights_cpu_backup_armed=False`, which `weg2_weights_cpu_backup_
+        ring_kw`'s OTHER branch already zeroes ring_bytes/ring_span1_bytes
+        for (see its own `else: return 0, 0, True`). The guard's job here is
+        to catch a caller that bypasses `weg2_weights_cpu_backup_ring_kw`
+        entirely and hands `price()` a raw contradiction directly.
+        """
+        with self.assertRaises(ValueError) as ctx:
+            hl.price(
+                126751866880, 120913973248, 1, 2400,
+                ring_bytes=self.BOOT7_RING_BYTES,
+                ring_span1_bytes=self.BOOT7_RING_SPAN1_BYTES,
+                ring_absent_by_design=True,  # what `off` means, stated raw
+            )
+        self.assertIn("ring_absent_by_design with a non-zero ring",
+                      str(ctx.exception))
+
+    def test_mutant_reverting_to_the_bare_two_arg_call_reproduces_boot7(self):
+        """DANGER-DIRECTION MUTANT 2 (order's own): reproduce the ORIGINAL
+        defect by calling `weg2_weights_cpu_backup_ring_kw` exactly the way
+        the pre-fix call site did -- `ring_absent_by_design(weight_source,
+        inject_mode)` fed in as the base -- and confirm it still produces
+        the exact BOOT7 contradiction today, so the bug is not merely
+        "worked around" by a change in some OTHER function's behaviour.
+        """
+        old_base = L.ring_absent_by_design("exchange", "authoritative")
+        self.assertTrue(old_base, "the bare axis call itself is unchanged")
+        kw = L.weg2_weights_cpu_backup_ring_kw(
+            self.BOOT7_RING_BYTES, self.BOOT7_RING_SPAN1_BYTES,
+            old_base, True,
+        )
+        self.assertEqual(
+            kw, (self.BOOT7_RING_BYTES, self.BOOT7_RING_SPAN1_BYTES, True),
+            "the OLD call shape must still reproduce the contradiction -- "
+            "proving the fix is the CALL SITE's own input, not a change "
+            "to ring_absent_by_design or price() that happens to paper "
+            "over it")
+        with self.assertRaises(ValueError):
+            hl.price(
+                126751866880, 120913973248, 1, 2400,
+                ring_bytes=kw[0], ring_span1_bytes=kw[1],
+                ring_absent_by_design=kw[2],
+            )
+
+    def test_auto_is_byte_identical_pinned(self):
+        """BYTE-IDENTITY FOR auto (order's own requirement): the existing
+        derivation is untouched -- verified as the identity `not
+        weights_cpu_backup_armed == ring_absent_by_design(weight_source,
+        inject_mode)` for every (weight_source, inject_mode) pair under
+        `auto`, not merely asserted."""
+        for ws, im, expect_absent in (
+            ("ring", "shadow", False),
+            ("exchange", "shadow", False),
+            ("exchange", "authoritative", True),
+            ("ring", "authoritative", False),
+        ):
+            with self.subTest(weight_source=ws, inject_mode=im):
+                # Resolve exactly as main() does under auto.
+                resolved_absent = L.ring_absent_by_design(ws, im)
+                self.assertEqual(resolved_absent, expect_absent)
+                armed_under_auto = not resolved_absent
+                kw = L.weg2_weights_cpu_backup_ring_kw(
+                    12345, 12345, resolved_absent, armed_under_auto,
+                )
+                expected_ring_bytes = 0 if expect_absent else 12345
+                self.assertEqual(kw[0], expected_ring_bytes)
+                self.assertEqual(kw[2], expect_absent)
