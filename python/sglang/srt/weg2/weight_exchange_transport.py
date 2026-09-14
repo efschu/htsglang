@@ -1121,6 +1121,25 @@ class SemSet:
                                f"kind={kind}) failed: {os.strerror(err)}")
         return int(value.value)
 
+    #: #1391 (DESK10): THE DIAGONAL HAD NO READ. `getvalue` above answers for
+    #: the 24 cross names; the diagonal's own three (empty/full x N_CARDS) had
+    #: no product accessor at all, so boot weg2xsn31/7's own diagnosis had to
+    #: reach for a hand-rolled ctypes `sem_getvalue` beside this class rather
+    #: than through it -- the READ existed only outside the product, which is
+    #: why the wall's own saturation could not be checked BY the product
+    #: before the 120 s credit budget expired. Mirrors `getvalue` exactly;
+    #: same "a read takes nothing" contract.
+    def diagonal_getvalue(self, card: int, slot: int, kind: str) -> int:
+        value = ctypes.c_int(0)
+        ctypes.set_errno(0)
+        if self._lib.sem_getvalue(
+                ctypes.c_void_p(self.diagonal_handle(card, slot, kind)),
+                ctypes.byref(value)) != 0:
+            err = ctypes.get_errno()
+            raise OSError(err, f"sem_getvalue(card={card} slot={slot} "
+                               f"kind={kind}) failed: {os.strerror(err)}")
+        return int(value.value)
+
     def close(self) -> None:
         with self._lock:
             for raw in self._handles.values():

@@ -727,6 +727,51 @@ class Weg2VramCreditRefused(RuntimeError):
     """
 
 
+class Weg2XchgLaneNeverDrainedRefused(RuntimeError):
+    """W100 -- a bounce lane already carries undrained bands nobody will ever
+    take, named THE MOMENT it is found instead of after a 120 s budget.
+
+    #1391 (DESK10), boot weg2xsn31 versuch 5 AND versuch 7, byte-identical:
+    P PP0 (co-located with D TP0 on the 5090) reaches
+    ``resume_memory_occupation``'s per-tag loop for ``weights_0``/``weights_1``
+    with an EMPTY collect plan for those tags (``_weg2_xchg_inject_from_peer``
+    logs ``WEG2-XCHG COLLECT tag=weights_0 pieces=0`` and returns -- silently,
+    because an empty plan is a legitimate answer on every OTHER card: #1233's
+    ``chunk_tag_cards`` states outright that a PP stage owns only the tags
+    whose layers fall in its own range).  On card 0 that silence was wrong:
+    D's three ranks (diag, ``1-0``, ``2-0``) had ALREADY deposited real bands
+    for those exact tags -- ``sem_getvalue`` read ``full=8/8/16`` with
+    ``empty=0`` on all three, ctypes-probed by hand mid-hold because the
+    product itself had no accessor for the diagonal count
+    (:meth:`weight_exchange_transport.SemSet.diagonal_getvalue`, added
+    alongside this refusal).  Nobody ever called ``wait_full`` on those three
+    lanes, so nobody ever posted ``drained``, so D's next tag's
+    ``wait_drained`` sat for its own full 120 s and P's OWN unrelated
+    ``weights_3`` credit wait sat for its full 120 s beside it -- two
+    100%-unrelated-looking walls (``Weg2XchgBouncePhaseUnordered``, raised as
+    ``W68 Weg2XchgPlanDisagree``, on D; ``W35 Weg2VramCreditRefused`` on P)
+    that cost two DEBUG_HOLD boots to
+    trace back to one collector that structurally never touched card 0's
+    lanes for these two tags.
+
+    THE CHECK, not a guess: an EMPTY collect plan for tag T on THIS rank is
+    only ever legitimate when nobody deposited anything for T on this rank's
+    OWN lanes either -- i.e. every lane whose destination is this rank's own
+    card must read ``full == 0`` at that exact moment (the #1374 contract
+    keeps ``full`` at 0 between tags by construction: the collector drains
+    every band before the depositor's NEXT ``wait_drained`` may pass).  A
+    nonzero ``full`` beside a zero-descriptor plan is not ambiguous -- it is
+    real, undrained work this rank's own plan says does not exist.  Raised
+    from :meth:`weight_updater.SchedulerMixin._weg2_xchg_inject_from_peer`
+    the instant ``_cdescs`` comes back empty, which is seconds into a boot
+    rather than 120 s into one, and from the deposit side's own
+    ``wait_drained``/``prime_drain`` step in
+    :meth:`weight_updater.SchedulerMixin._weg2_xchg_bounce_leg` for the
+    mirror case (a producer about to post into a lane whose OWN prior
+    tag's bands were never drained).
+    """
+
+
 #: Deliberately a THIRD name beside ``weg2-pcie-serialize`` (this module) and
 #: ``weg2-l2-`` (the host ring): three mechanisms, three prefixes, so a path in
 #: a log never has to be guessed at.
