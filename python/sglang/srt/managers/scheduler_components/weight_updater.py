@@ -909,7 +909,42 @@ class SchedulerWeightUpdaterManager:
         # to the draft runner (weight_updater.py:120-121,
         # eagle_worker_v2.py:3104-3107, multi_layer_eagle_worker_v2.py:1352-1362).
         # Shards never disagree: STOP, never compensate.
-        main_carried = bool(getattr(server_args, "enable_weights_cpu_backup", False))
+        #
+        # #1369 CORRECTION (DESK12's find, this line, 2026-09-14): this used
+        # to read the RAW `server_args.enable_weights_cpu_backup` -- the
+        # argv bit the launcher sets UNCONDITIONALLY (launcher.py:2702) and
+        # therefore always True, regardless of arm.  Once #1369's own knob
+        # (`weight_exchange.weights_cpu_backup_armed()`) gates the PHYSICAL
+        # backup at `model_runner.py`'s `pause()` (Paket C, not this file),
+        # the raw bit and the true backup state diverge in exactly the two
+        # cases the completeness refusal (W106, weg2_memory_saver.py) cannot
+        # reach on its own: (a) `--weg2-weights-cpu-backup off` -- W106 never
+        # runs for a tag whose exchange is not armed at all, because
+        # `_weg2_xchg_deposit_before_sleep` returns immediately for an
+        # unarmed exchange (:1080-1081) -- ring mode was never its half to
+        # guard; (b) `exchange`+`shadow`+`off`, which W106 DOES refuse at the
+        # sleep leg, so this second case never reaches a wake here at all,
+        # but the read must still be correct for defense in depth. Reading
+        # the RAW bit here would choose `CARRIER_TMS_BACKUP` -- "the TMS
+        # restore already carried the bytes" -- for a tag nothing backed up,
+        # and `_weg2_xchg_inject_from_peer`'s TMS branch does nothing: the
+        # remapped pages stay on their post-`resume()` undefined content,
+        # silently, with no exception and no distinguishing log line except
+        # weights that read wrong. Reading the PREDICATE instead makes the
+        # fallback fall all the way through to `CARRIER_DISK` (:993) for
+        # exactly the tags case (a) covers -- the checkpoint on disk, the
+        # user's own "das ist das Netz" (2026-09-14), not an undefined page.
+        # An unreadable predicate (the function raising, e.g. an env this
+        # process never saw published) keeps the PRE-#1369 raw-flag answer:
+        # the conservative direction here is the one every boot before
+        # tonight already ran, not a guess about a contract that failed to
+        # answer.
+        try:
+            from sglang.srt.weg2.weight_exchange import weights_cpu_backup_armed
+
+            main_carried = bool(weights_cpu_backup_armed())
+        except Exception:  # noqa: BLE001 -- see comment above: fall back, don't guess
+            main_carried = bool(getattr(server_args, "enable_weights_cpu_backup", False))
         draft_carried = main_carried or bool(
             getattr(server_args, "enable_draft_weights_cpu_backup", False)
         )
