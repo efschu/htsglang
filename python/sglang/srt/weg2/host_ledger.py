@@ -1881,6 +1881,20 @@ class Weg2HostDeviationRefused(Weg2HostLedgerRefused):
     """
 
 
+class Weg2PriorCushionArgsIncomplete(Weg2HostLedgerRefused):
+    """W105 (#1378 Stage 2): ``prior_cushion_min_gib``/``prior_bounce_gib`` are
+    BOTH OR NEITHER, exactly like ``deviation_reason``/``riegel_gib`` (W97).
+
+    ``cushion_headroom_gib`` takes three arguments and returns ``None`` only
+    when the FIRST is ``None`` -- a caller that supplies ``prior_cushion_min``
+    alone would silently divide by an un-cited ``prior_bounce_gib`` of 0.0 (or
+    crash on ``float(None)``), and either way the printed line would show a
+    number that looks measured but rests on a guessed half of its own inputs.
+    That is the #1386 failure class one layer down: an unenforced half of a
+    switch reads as the whole switch to the next boot-seat.
+    """
+
+
 class Weg2HostRatchetDoubleCharged(Weg2HostLedgerRefused):
     """W95 (#1350): the flip ratchet would be charged TWICE in one prediction.
 
@@ -4810,6 +4824,14 @@ def choose(
     # `draft_kv_on_p`) and handed to every rung of the ladder here -- never
     # re-derived per rung, so all `arms` price the identical switch state.
     hicache_disabled: bool = False,
+    # #1378 Stage 2 (W105): the PRIOR boot's own recorded numbers -- the
+    # inputs `cushion_headroom_gib` needs and the two above (`cushion_ok`,
+    # W98's own floor) do not use. BOTH OR NEITHER, like `deviation_reason`/
+    # `riegel_gib`: a caller that names one and not the other has half a
+    # citation, which is worse than none (an operator would read the printed
+    # line as measured when it silently wasn't).
+    prior_cushion_min_gib: Optional[float] = None,
+    prior_bounce_gib: Optional[float] = None,
 ) -> Tuple[Arm, Optional[float], List[str]]:
     """Walk the ladder; return (arm, reap headroom GiB, printed lines) or W20/W21.
 
@@ -4978,6 +5000,18 @@ def choose(
                "A latch was given with no reason: the next reader is left without "
                "the why, which is the other half of the same rule.")
         )
+    # #1378 Stage 2 (W105): BOTH OR NEITHER, checked here for the same reason
+    # as the deviation pair above -- before a single arm is priced, so a
+    # half-cited prior boot can never reach the printed line.
+    _prior_cited = prior_cushion_min_gib is not None and prior_bounce_gib is not None
+    if (prior_cushion_min_gib is not None) != (prior_bounce_gib is not None):
+        raise Weg2PriorCushionArgsIncomplete(
+            "W105 Weg2PriorCushionArgsIncomplete: prior_cushion_min_gib and "
+            "prior_bounce_gib are BOTH OR NEITHER -- one without the other is "
+            "a guessed half of cushion_headroom_gib's own inputs, printed as "
+            f"if it were measured (got prior_cushion_min_gib={prior_cushion_min_gib!r} "
+            f"prior_bounce_gib={prior_bounce_gib!r})."
+        )
     lines.append(watermark_provenance(margin, watermark_gib))
     chosen: Optional[Arm] = None
     peak_bound_any = False
@@ -5015,6 +5049,35 @@ def choose(
             predicted is None
             or predicted + RATE_LATCH_CUSHION_FLOOR_GIB <= hard_bound_gib
         )
+        # #1378 Stage 2 (W105): the CROSS-BOOT gate, wired at last.
+        # `cushion_ok` above is `predicted_run_peak + FLOOR <= bound` -- the
+        # form `cushion_headroom_gib`'s own docstring measured against both
+        # weg2xsn31/2 and /3 and found funds BOTH (92.16 <= 94.43 either way),
+        # because what actually consumed the cushion is PINNED SHM growth
+        # (the bounce, 7.79 -> 15.75 GiB), not the predicted peak. This is
+        # the arithmetic that separates them: `cushion_min` of the PRIOR
+        # boot, minus how much THIS arm's own bounce grew past the PRIOR
+        # boot's bounce.
+        #
+        # ONE-TERM MODEL, NAMED AS SUCH ON THE PRINTED LINE: only the bounce
+        # delta is charged against the prior cushion, every other shmem term
+        # is held constant, and the quantity was measured NON-MONOTONIC
+        # TWICE against real boots (weg2xsn31/5->6: bounce 16.905 -> 12.00
+        # GiB, cushion 0.85 -> 0.20 GiB fell WITH it, not against it) -- so
+        # a GREEN reading here is evidence for exactly one term, never a
+        # clearance for the boot. RED (a negative headroom) is a violated
+        # NECESSARY condition and MAY refuse; GREEN refuses nothing it did
+        # not already pass and FUNDS NOTHING BY ITSELF -- it can only ever
+        # make `ok` stricter (the `and` below), never looser.
+        cushion_headroom_this_arm_gib = (
+            cushion_headroom_gib(
+                prior_cushion_min_gib, arm.terms["xchg_bounce_gib"], prior_bounce_gib,
+            ) if _prior_cited else None
+        )
+        headroom_ok = (
+            cushion_headroom_this_arm_gib is None
+            or cushion_headroom_this_arm_gib >= RATE_LATCH_CUSHION_FLOOR_GIB
+        )
         binding: List[str] = []
         if arm.launch_leftover_gib < 0:
             binding.append(f"launch moment ({arm.launch_leftover_gib:.2f} GiB)")
@@ -5042,7 +5105,24 @@ def choose(
                 f"six seconds after the front's argv, inside D's startup sleep "
                 f"leg, state=STOP at epoch=0)"
             )
-        ok = moments_ok and peak_ok and cushion_ok
+        if peak_ok and cushion_ok and not headroom_ok:
+            # Named separately again: this arm passes BOTH single-boot floors
+            # above and is refused only by the CROSS-BOOT term neither of them
+            # reads -- exactly the arm weg2xsn31/3 was (predicted 90.66,
+            # peak_ok and cushion_ok both true) had this term existed then.
+            binding.append(
+                f"CUSHION HEADROOM ({prior_cushion_min_gib:.2f} prior cushion_min - "
+                f"({arm.terms['xchg_bounce_gib']:.2f} this arm's bounce - "
+                f"{prior_bounce_gib:.2f} prior bounce) = "
+                f"{cushion_headroom_this_arm_gib:.2f} < "
+                f"{RATE_LATCH_CUSHION_FLOOR_GIB:.2f} GiB floor -- ONE-TERM MODEL "
+                f"(bounce delta only, other shmem terms held constant, measured "
+                f"non-monotonic twice: weg2xsn31/5->6 bounce 16.905->12.00 fell "
+                f"WITH cushion 0.85->0.20). This is a violated NECESSARY "
+                f"condition, not a sufficient one -- it may refuse; it never "
+                f"funds by itself)"
+            )
+        ok = moments_ok and peak_ok and cushion_ok and headroom_ok
         # #1360: the deviation converts THIS verdict, after it has been computed
         # in full. `binding` is left exactly as it was so the DEVIATION line and
         # the refusal it replaces name the same terms.
@@ -5132,6 +5212,30 @@ def choose(
                 f"bounce_inject={xchg_bounce_prov['inject_mode']} "
                 if xchg_bounce_prov else "bounce_state=absent "
             )
+            +
+            # #1378 Stage 2 (W105): ALWAYS printed, on or off, so an absent
+            # reading is never mistaken for "never checked" (the same rule
+            # `lanes_concurrent`'s own line and #1386's switch line follow).
+            # The number and its own limitation are on THIS line together --
+            # a reader who sees only the number and not the caveat is a
+            # reader who can mistake a one-term model for a verdict.
+            (
+                f"cushion_headroom={cushion_headroom_this_arm_gib:.2f} GiB "
+                f"(prior cushion_min={prior_cushion_min_gib:.2f} - bounce delta "
+                f"[{arm.terms['xchg_bounce_gib']:.2f} this arm - "
+                f"{prior_bounce_gib:.2f} prior]) "
+                if _prior_cited else
+                "cushion_headroom=not measured (no --prior-cushion-min-gib / "
+                "--prior-bounce-gib passed) "
+            )
+            + "[#1378 Stage 2 ONE-TERM MODEL: bounce delta vs the PRIOR boot's "
+            "own cushion_min only, every other shmem term held constant; "
+            "measured NON-MONOTONIC TWICE against real boots (weg2xsn31/5->6: "
+            "bounce 16.905->12.00 GiB, cushion fell WITH it, 0.85->0.20). RED "
+            "(negative) is a violated necessary condition and MAY refuse this "
+            "arm (see CUSHION HEADROOM binding below); GREEN refuses nothing "
+            "and FUNDS NOTHING BY ITSELF -- it is an indicator, not a "
+            "Freibrief, and no boot-seat or operator may read it as one] "
             +
             # #1332 (S6 slice 1): THE TWO HOST-WEIGHT RESIDENCIES, SIDE BY
             # SIDE ON ONE LINE. `host_weights` is Sigma H -- the region

@@ -5423,6 +5423,13 @@ def choose_host_ledger(
     # ledger term and the argv this function's caller builds from `arm.s_gb`/
     # `arm.m_mib` must read the identical bool, never a second copy of it.
     hicache_disabled: bool = False,
+    # #1378 Stage 2 (W105): the PRIOR boot's own cited numbers, forwarded
+    # unchanged to `host_ledger.choose` -- same placement, same "None keeps
+    # every existing caller byte-identical" rule as `deviation_reason` /
+    # `riegel_gib` above. Both or neither: `choose` itself refuses a half
+    # citation (W105), so this function does not re-validate the pair.
+    prior_cushion_min_gib: Optional[float] = None,
+    prior_bounce_gib: Optional[float] = None,
 
 ) -> Tuple[host_ledger.Arm, Optional[float], List[str], Dict[str, Optional[int]]]:
     """THE LAUNCHER'S ONE LEDGER CALL SITE: read the host, price the ladder.
@@ -5597,6 +5604,11 @@ def choose_host_ledger(
         # decision; it passes the operator's declaration down to it.
         deviation_reason=deviation_reason,
         riegel_gib=riegel_gib,
+        # #1378 Stage 2 (W105): same forwarding, same reason -- the launcher
+        # does not compute the headroom, it hands the operator's citation of
+        # the PRIOR boot's own numbers down to the one place that does.
+        prior_cushion_min_gib=prior_cushion_min_gib,
+        prior_bounce_gib=prior_bounce_gib,
         # #1362 [22-fix]: the model this boot actually loads, by CONTENT. Every
         # recorded image now has to prove it belongs to it -- the fossil was a
         # 47 GiB ring solved from weg2xsn25's census for a 7.48 GiB model.
@@ -9045,6 +9057,27 @@ def build_parser() -> argparse.ArgumentParser:
                          "GiB non-reclaimable. Must be BELOW the hard bound, or "
                          "it cannot fire before the bound is crossed. Required "
                          "with --host-ledger-deviation.")
+    # #1378 Stage 2 (W105): the PRIOR boot's own cited cushion_min/bounce,
+    # operator-supplied like --host-riegel-gib -- there is no automatic
+    # sidecar for this pair yet, so a boot that wants the cross-boot gate
+    # cites its predecessor's own printed numbers (WEG2-HOST-LEDGER TERMS /
+    # the v3 sampler's cushion_min). BOTH OR NEITHER (W105, checked inside
+    # host_ledger.choose, not re-validated here): a half citation is a
+    # guessed input printed as a measured one.
+    ap.add_argument("--prior-cushion-min-gib", type=float, default=None,
+                    metavar="GIB",
+                    help="The PRIOR boot's own measured cushion minimum "
+                         "(the v3 sampler's cushion_gib column, MINIMUM over "
+                         "that boot). Feeds the cross-boot cushion_headroom "
+                         "gate (#1378 Stage 2): ONE-TERM MODEL, measured "
+                         "non-monotonic against real boots -- RED (negative "
+                         "headroom) MAY refuse this boot's arm, GREEN funds "
+                         "nothing by itself. Requires --prior-bounce-gib.")
+    ap.add_argument("--prior-bounce-gib", type=float, default=None,
+                    metavar="GIB",
+                    help="The PRIOR boot's own priced xchg_bounce (the "
+                         "WEG2-HOST-LEDGER ARM line's xchg_bounce= field). "
+                         "Required with --prior-cushion-min-gib.")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--debug-hold", choices=["none", "P", "D", "both"], default="none")
     # #1236: --store-min-gib IS DELETED. It was a FLOOR on how much of the host
@@ -10792,6 +10825,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         # #1360: the operator's declaration, from argv and nowhere else.
         deviation_reason=str(getattr(ns, "host_ledger_deviation", "") or ""),
         riegel_gib=getattr(ns, "host_riegel_gib", None),
+        # #1378 Stage 2 (W105): the operator's citation of the PRIOR boot's
+        # own numbers, from argv and nowhere else -- same placement, same
+        # "None means unmeasured, not zero" rule as the deviation pair above.
+        prior_cushion_min_gib=getattr(ns, "prior_cushion_min_gib", None),
+        prior_bounce_gib=getattr(ns, "prior_bounce_gib", None),
         # #1362 [22-fix]: content digest, snapshot-independent. `None` (an
         # unreadable checkpoint) stays empty and the arm keeps the pre-#1362
         # behaviour rather than refusing on a digest it could not compute.
