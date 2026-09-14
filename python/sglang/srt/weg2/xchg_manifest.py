@@ -1442,11 +1442,39 @@ def leg_plan_from_join(
             type(exc).__name__, exc)
 
     tags = tuple(sorted({str(d.tag) for d in mine}))
+    # #1391 (DESK10): THE ONE LINE A BOOT LOG NEVER CARRIED. Boot weg2xsn31's
+    # own trace named the wedge (P PP0's collect finding zero descriptors for
+    # weights_0/weights_1 while D's three ranks deposited real bands there)
+    # from a DEBUG_HOLD frame dump plus a hand-rolled ctypes sem_getvalue --
+    # two boots of forensics for a fact this leg already holds at construction
+    # time and never printed: WHICH tags this rank's OWN filtered descriptor
+    # set (`mine`) actually carries, beside the full family's tag set. A
+    # mismatch here (this rank's tags missing an entry the OTHER side's own
+    # line, for the SAME (boot, direction), carries for a matching src/dst)
+    # is exactly the #1391 shape, readable from two boot-log lines instead of
+    # a DEBUG_HOLD dump: no new derivation, this is `tags`/`family_tags`
+    # (computed two lines below either way), printed rather than only stored
+    # on the `LegPlan` this function already returns.
+    family_tags = tuple(sorted({str(t.tag) for t in join.tensors}))
+    _tag_line = (
+        f"WEG2-XCHG-LEG-TAGS hook={hook} group={group} rank={rank} "
+        f"direction={direction} descs={len(mine)} tags={','.join(tags) or '-'} "
+        f"family_tags={','.join(family_tags) or '-'} "
+        "-- this rank's OWN tag set out of the full family; a tag missing "
+        "here that a peer's deposit/collect line carries for the matching "
+        "src/dst is an empty per-tag plan beside real bytes (#1391), not a "
+        "legitimate #1233 'this stage owns no layers of that chunk'")
+    if emit is not None:
+        emit(_tag_line)
+    else:
+        import logging as _logging
+
+        _logging.getLogger(__name__).info("%s", _tag_line)
     classes = tuple(sorted({t.tensor_class for t in join.tensors}))
     chunk_layers, chunk_count = ms.weight_chunk_geometry()
     facts = sh.LegPlanFacts(
         chunk_layers=int(chunk_layers), chunk_count=int(chunk_count),
-        family_tags=tuple(sorted({str(t.tag) for t in join.tensors})),
+        family_tags=family_tags,
         waves=tuple(tuple(w) for w in plan.waves),
         cards=tuple(join.cards), classes=classes,
         # THE PROVENANCE IS THE MANIFESTS', and it must NOT read as the
