@@ -813,6 +813,350 @@ class TestNoOrphanVerdict(CustomTestCase):
 
 
 # --------------------------------------------------------------------------
+# #1389 THE PRESENCE RATCHET, a DIFFERENT question from the two ratchets
+# above. Those ask "can production reach this raise/verdict at all" --
+# this asks "does the code that reads a producer's log line run under the
+# SAME precondition the producer's own construction requires".
+#
+# THE DEFECT CLASS, measured, all four instances from one night
+# (2026-09-13/14, BOOT_weg2xsn31 attempts): a launcher gate counted
+# occurrences of a log-line marker that ONLY managers/cache_controller.py's
+# HiCacheController (or its prefetch_budget.log_prefetch_limit) ever
+# prints, and HiCacheController is instantiated ONLY inside
+# `mem_cache/registry.py`'s `if ctx.enable_hierarchical_cache:`
+# (:192-193). Under `--weg2-disable-hicache` that branch never runs, so
+# the marker count is unconditionally 0 -- and three gates (W7/W10 P and
+# D, W9, W45) read that 0 as "this boot is broken" while P and D had
+# booted clean to READY. All four are ALREADY FIXED (#1386 follow-ups
+# 2-4, each adding an `if hicache_disabled: skip` branch beside the
+# unconditional check) -- this ratchet is what would have caught them
+# before the metal did, and what keeps a fifth from landing the same way.
+# --------------------------------------------------------------------------
+
+
+def _guard_chain_by_line(source: str) -> dict:
+    """Map every 1-based line number in ``source`` to the SOURCE TEXT of
+    every enclosing ``if`` test at that line, outermost first.
+
+    PRESENCE, not polarity: an ``if X: skip ... else: gate`` shape records
+    the SAME test string ``"X"`` for lines in EITHER branch, because both
+    fix shapes this ratchet's own corpus uses are exactly that -- the
+    GUARD NAME is what must be present in the chain, not which branch it
+    fires on. A rule that also checked polarity would have to know, for
+    every producer, which branch corresponds to "built" versus "not
+    built", which is the semantic question #1389 declines to automate
+    (see ``PRESENCE_RATCHET_BOUNDARIES`` below for what this tool does
+    NOT attempt).
+    """
+    class _V(ast.NodeVisitor):
+        def __init__(self) -> None:
+            self.stack: list[str] = []
+            self.by_line: dict[int, list[str]] = {}
+
+        def generic_visit(self, node) -> None:
+            if hasattr(node, "lineno"):
+                self.by_line.setdefault(node.lineno, list(self.stack))
+            super().generic_visit(node)
+
+        def visit_If(self, node: ast.If) -> None:
+            if hasattr(node, "lineno"):
+                self.by_line.setdefault(node.lineno, list(self.stack))
+            test_src = ast.unparse(node.test)
+            for stmt in node.body:
+                self.stack.append(test_src)
+                self.visit(stmt)
+                self.stack.pop()
+            for stmt in node.orelse:
+                self.stack.append(test_src)
+                self.visit(stmt)
+                self.stack.pop()
+
+    v = _V()
+    v.visit(ast.parse(source))
+    return v.by_line
+
+
+def _anchor_lines(source: str, anchor: str) -> list:
+    """Every 1-based line number of ``source`` whose text contains the
+    literal ``anchor`` substring. Single-line matching only -- a call
+    wrapped across lines needs its own, longer anchor; every corpus entry
+    below was checked to fit on one line."""
+    return [i + 1 for i, line in enumerate(source.splitlines()) if anchor in line]
+
+
+def _guarded_by(source: str, anchor: str, names: tuple):
+    """Is ``anchor``'s own line PART OF a guard mentioning ANY of
+    ``names``? Returns ``(ok, detail)``, never raises -- callers report
+    the detail so a failure names the exact chain (or its absence) rather
+    than a bare boolean.
+
+    Two shapes both count, because the corpus has both: an anchor INSIDE
+    a guarded branch (the W7/W10/W9 shape -- ``count_marker(...)`` sits
+    under ``else:`` of ``if hicache_disabled:``, so the enclosing chain
+    carries the name) and an anchor that IS itself the guard's own test
+    (the W45 shape -- ``log_prefetch_limit``'s ``if cache_controller is
+    None: return`` guards the SAME function's body, not some ancestor's).
+    Checking the anchor line's own text in addition to its enclosing
+    chain covers both without two separate functions.
+    """
+    lines = _anchor_lines(source, anchor)
+    if len(lines) != 1:
+        return False, f"anchor found {len(lines)} time(s), need exactly 1: {anchor!r}"
+    ln = lines[0]
+    chain = _guard_chain_by_line(source).get(ln, []) + [source.splitlines()[ln - 1]]
+    hit = [t for t in chain if any(n in t for n in names)]
+    if not hit:
+        return False, (
+            f"line {ln} ({anchor!r}) is neither guarded by, nor itself, an "
+            f"`if` mentioning {names} -- context: {chain}"
+        )
+    return True, f"line {ln} guarded by {hit[0]!r}"
+
+
+#: THE CORPUS. Each entry names one historical instance, its gate (in the
+#: LANE) and its producer (usually outside the lane, in mem_cache/), with
+#: the guard NAME each side must carry and the commit that closed it.
+PRESENCE_GATES = (
+    {
+        "name": "W7/W10 group P canonical-page/GDN-blob count",
+        "gate_file": "weg2/launcher.py",
+        "gate_anchor": 'count_marker(spec_p.log, "#706 canonical KV page active")',
+        "gate_guard_names": ("hicache_disabled",),
+        "producer_file": "mem_cache/registry.py",
+        "producer_anchor": "cache.init_hicache(server_args, params)",
+        "producer_guard_names": ("enable_hierarchical_cache",),
+        "why": "both markers are printed by managers/cache_controller.py's "
+               "HiCacheController alone (cache_controller.py:1411 / :1608), "
+               "instantiated only inside registry.py's enable_hierarchical_cache "
+               "branch -- under --weg2-disable-hicache the plain MambaRadixCache "
+               "this arm runs prints neither line, so the pre-fix gate's "
+               "'n_kv < 3' fired on a genuinely clean boot",
+        "fixed_by": "683ccc5dec (#1386 follow-up 2)",
+    },
+    {
+        "name": "W7/W10 group D canonical-page/GDN-blob count",
+        "gate_file": "weg2/launcher.py",
+        "gate_anchor": 'count_marker(spec_d.log, "#706 canonical KV page active")',
+        "gate_guard_names": ("hicache_disabled",),
+        "producer_file": "mem_cache/registry.py",
+        "producer_anchor": "cache.init_hicache(server_args, params)",
+        "producer_guard_names": ("enable_hierarchical_cache",),
+        "why": "mirror of group P's instance above, same producer, same fix, "
+               "same reason -- the D-side gate is a separate call site and a "
+               "separate historical guard, not a re-derivation of P's",
+        "fixed_by": "683ccc5dec (#1386 follow-up 2)",
+    },
+    {
+        "name": "W9 store-identity bigram key-scheme gate",
+        "gate_file": "weg2/launcher.py",
+        "gate_anchor": '_p_bigram = ("--speculative-algorithm" in spec_p.argv) '
+                       "or count_marker(spec_p.log, _forced) >= 1",
+        "gate_guard_names": ("hicache_disabled",),
+        "producer_file": "mem_cache/registry.py",
+        "producer_anchor": "cache.init_hicache(server_args, params)",
+        "producer_guard_names": ("enable_hierarchical_cache",),
+        "why": "Weg2StoreIdentityMismatch compares against the premise 'the "
+               "store is one carrier' -- without HiCache there is no carrier "
+               "to key mismatched, and P/D's own --speculative-algorithm "
+               "divergence there is an expected, unrelated fact, not a hazard",
+        "fixed_by": "2ef1a0979d (#1386 follow-up 3)",
+    },
+    {
+        "name": "W45 carrier census PREFETCH LIMIT read",
+        "gate_file": "weg2/launcher.py",
+        "gate_anchor": "_cen = _cc.census(spec_d.log",
+        "gate_guard_names": ("hicache_disabled",),
+        "producer_file": "mem_cache/prefetch_budget.py",
+        "producer_anchor": "if cache_controller is None:",
+        "producer_guard_names": ("cache_controller is None",),
+        "why": "carrier_census.py's own COMPONENT names the producer as "
+               "'cache_controller.mem_pool_host via "
+               "prefetch_budget.host_pool_anchor' -- log_prefetch_limit "
+               "(prefetch_budget.py) is a no-op whenever its caller passes no "
+               "cache_controller, which is every boot without HiCache",
+        "fixed_by": "d6c3d192f8 (#1386 follow-up 4)",
+    },
+)
+
+#: Pinned the same way ``DEBT_SIZE_ON_THE_LINE`` is: the corpus can only
+#: change with a reason. THE MUTANT THIS PINS AGAINST: delete one entry
+#: from ``PRESENCE_GATES`` above and the two per-entry tests below read
+#: vacuously GREEN over what remains -- this is the ONE test that dies.
+PRESENCE_GATES_SIZE_ON_THE_LINE = 4
+
+
+class ThePresenceRatchet(CustomTestCase):
+    """#1389: for every registered gate, the gate's own guard chain must
+    mention the condition the producer's construction requires."""
+
+    @staticmethod
+    def _read(rel: str) -> str:
+        with open(os.path.join(SRT, rel), encoding="utf-8-sig") as fh:
+            return fh.read()
+
+    def test_every_gate_is_guarded_by_its_declared_condition(self):
+        checked = 0
+        for entry in PRESENCE_GATES:
+            with self.subTest(gate=entry["name"]):
+                ok, detail = _guarded_by(
+                    self._read(entry["gate_file"]), entry["gate_anchor"],
+                    entry["gate_guard_names"],
+                )
+                self.assertTrue(ok, f"{entry['name']}: GATE {detail}")
+                checked += 1
+        self.assertEqual(checked, len(PRESENCE_GATES),
+                         "the scan skipped an entry -- it broke")
+
+    def test_every_producer_is_guarded_by_the_same_condition(self):
+        for entry in PRESENCE_GATES:
+            with self.subTest(gate=entry["name"]):
+                ok, detail = _guarded_by(
+                    self._read(entry["producer_file"]), entry["producer_anchor"],
+                    entry["producer_guard_names"],
+                )
+                self.assertTrue(ok, f"{entry['name']}: PRODUCER {detail}")
+
+    def test_the_corpus_cannot_shrink_or_grow_silently(self):
+        self.assertEqual(len(PRESENCE_GATES), PRESENCE_GATES_SIZE_ON_THE_LINE)
+
+    def test_every_corpus_entry_names_its_incident_and_fix(self):
+        for entry in PRESENCE_GATES:
+            self.assertEqual(
+                sorted(entry),
+                ["fixed_by", "gate_anchor", "gate_file", "gate_guard_names",
+                 "name", "producer_anchor", "producer_file",
+                 "producer_guard_names", "why"],
+                f"entry has the wrong fields: {entry['name']}",
+            )
+            self.assertGreater(len(entry["why"]), 60, entry["name"])
+            self.assertIn("#1386", entry["fixed_by"], entry["name"])
+
+
+class TestThePresenceRatchetCanFail(CustomTestCase):
+    """Desk-written-never-executed law, same as ``TestTheRatchetCanFail``
+    below: a rule with no proof it CAN fail is not a rule. Both the
+    unguarded (pre-fix) and guarded (post-fix) shapes are run over a
+    synthetic snippet -- the historical instances themselves are the
+    real-tree proof (``ThePresenceRatchet`` above IS that proof, run
+    against the ACTUAL, ALREADY-FIXED launcher.py); this class proves the
+    MECHANISM independent of which four instances happen to be fixed
+    today."""
+
+    _UNGUARDED = (
+        'def count_marker(path, marker):\n'
+        '    return 0\n'
+        '\n'
+        'def gate(spec_p_log):\n'
+        '    n = count_marker(spec_p_log, "MARKER")\n'
+        '    if n < 3:\n'
+        '        raise ValueError("refused")\n'
+    )
+    _GUARDED = (
+        'def count_marker(path, marker):\n'
+        '    return 0\n'
+        '\n'
+        'def gate(spec_p_log, hicache_disabled):\n'
+        '    if hicache_disabled:\n'
+        '        pass\n'
+        '    else:\n'
+        '        n = count_marker(spec_p_log, "MARKER")\n'
+        '        if n < 3:\n'
+        '            raise ValueError("refused")\n'
+    )
+    _ANCHOR = 'count_marker(spec_p_log, "MARKER")'
+
+    def test_an_unguarded_gate_is_RED(self):
+        ok, detail = _guarded_by(self._UNGUARDED, self._ANCHOR, ("hicache_disabled",))
+        self.assertFalse(ok, f"the planted pre-fix shape must be RED: {detail}")
+
+    def test_the_guarded_shape_is_GREEN(self):
+        ok, _detail = _guarded_by(self._GUARDED, self._ANCHOR, ("hicache_disabled",))
+        self.assertTrue(ok, "the fixed shape (if hicache_disabled: skip / "
+                            "else: gate) must be GREEN")
+
+    def test_an_anchor_that_does_not_exist_is_reported_not_silently_false(self):
+        ok, detail = _guarded_by(self._UNGUARDED, "NOWHERE IN THIS SOURCE",
+                                 ("hicache_disabled",))
+        self.assertFalse(ok)
+        self.assertIn("0 time(s)", detail)
+
+    def test_an_ambiguous_anchor_is_reported_not_silently_the_first_match(self):
+        doubled = self._UNGUARDED + self._UNGUARDED
+        ok, detail = _guarded_by(doubled, self._ANCHOR, ("hicache_disabled",))
+        self.assertFalse(ok)
+        self.assertIn("2 time(s)", detail)
+
+
+#: #1389 DECLARED BOUNDARIES -- classes of the SAME defect this ratchet is
+#: explicitly told it cannot resolve, named rather than silently skipped
+#: (order 2026-09-14: "was du nicht aufloesen kannst, wird als DEKLARIERTE
+#: SCHRANKE gedruckt, nie stumm uebersprungen").
+PRESENCE_RATCHET_BOUNDARIES = (
+    {
+        "instance": "W100 guard bound to _weg2_xchg_inject_from_peer",
+        "file": "managers/scheduler_components/weight_updater.py",
+        "why": "the wrapper HAS a syntactic AST call site (:1045, inside "
+               "_weg2_xchg_inject_weights), so #1328's own name-based "
+               "reachability (this file, above) correctly reports it "
+               "wired -- and a test checking the SAME function passes for "
+               "the same reason. What neither static check can see is a "
+               "RUNTIME predicate elsewhere that routes real boots around "
+               "this call before it executes ('laeuft am Metall NULL MAL', "
+               "an empirical measurement, not a structural one). This "
+               "file's own RESOLUTION docstring already names the honest "
+               "bound: name-based resolution can call an unwired path "
+               "wired, never the reverse. A dynamic/log-based instrument, "
+               "not this static one, is what would close this. FINDING "
+               "routed to DESK10, who owns the file and is rewiring the "
+               "guard onto the real leaf caller -- not fixed here.",
+    },
+    {
+        "instance": "wait-loop entry-vs-condition race (P enters a wait "
+                   "at 03:19:28Z, the condition it waits for first exists "
+                   "at 03:19:32Z)",
+        "file": "n/a -- a temporal/ordering fact, not a file:line",
+        "why": "an intra-procedural, name-based AST reference graph carries "
+               "no ordering or timing semantics (this file's own "
+               "RESOLUTION docstring). Expressing 'this predicate reads a "
+               "value that is not live yet at loop entry' needs a "
+               "dataflow or timing model this tool does not carry -- a "
+               "Joern CPG (this project's own dataflow-sensitive tool for "
+               "exactly this class of question) is the named alternative, "
+               "not a second AST rule bolted onto a tool that cannot see "
+               "time.",
+    },
+)
+
+
+class TestTheBoundariesAreDeclaredNotInvented(CustomTestCase):
+    """The order's own fallback clause, enforced rather than trusted: a
+    boundary entry with no real reason is an omission wearing a label."""
+
+    def test_every_boundary_carries_a_real_reason(self):
+        for b in PRESENCE_RATCHET_BOUNDARIES:
+            self.assertEqual(sorted(b), ["file", "instance", "why"], b["instance"])
+            self.assertGreater(len(b["why"]), 60, b["instance"])
+
+    def test_the_w100_wrapper_call_site_is_pinned_for_the_next_desk(self):
+        """A structural FACT this file CAN verify without editing the
+        locked source: exactly one AST call site today. If this count
+        ever reads 0, the wrapper has gone fully unreferenced and belongs
+        in ``UNWIRED_DEBT`` above instead of sitting here silently."""
+        path = os.path.join(
+            SRT, "managers/scheduler_components/weight_updater.py")
+        with open(path, encoding="utf-8-sig") as fh:
+            src = fh.read()
+        sites = _anchor_lines(
+            src, "_weg2_xchg_inject_from_peer(terms=terms, tag=tag, **kw)")
+        self.assertEqual(
+            sites, [1045],
+            "the ONE known call site moved, multiplied, or vanished -- "
+            "re-verify DESK10's rewire target against the NEW line(s) "
+            "before quoting :1045 again",
+        )
+
+
+# --------------------------------------------------------------------------
 # CAN-FAIL: the analyser proves its own failure modes on a synthetic tree.
 # --------------------------------------------------------------------------
 
