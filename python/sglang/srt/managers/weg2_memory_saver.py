@@ -209,6 +209,51 @@ class Weg2PcieLockTimeout(RuntimeError):
     """The PCIe serialisation lock was not acquired inside its deadline."""
 
 
+class Weg2XchgWakeSourceGapRefused(RuntimeError):
+    """W106 -- a tag about to lose its host-ring backup has no OTHER wake
+    source, checked at the SLEEP leg, before the pause that would make it
+    true.
+
+    #1369/#1394 (DESK10, Paket B).  User order 2026-09-14: the checkpoint on
+    disk is the fallback, and a correctly-implemented exchange needs no
+    other one -- the host ring is redundant to a net that is already there,
+    and this refusal is the reason removing it is safe: it is the thing
+    that makes "still wrong weights" impossible in the case a plain removal
+    would have made cheap and silent.
+
+    TWO INDEPENDENT WAYS THIS TAG CAN BE LEFT WITH NOTHING, both checked,
+    either one enough to refuse:
+
+    1. **The exchange is armed but not AUTHORITATIVE.**
+       ``--weg2-xchg-inject shadow`` only COMPARES the exchange's assembled
+       bytes against what already landed -- it never writes them (#1391's
+       own lesson, generalised past that ticket). A tag whose ring backup
+       is off under ``weights_cpu_backup_armed()`` because
+       ``exchange_armed()`` is True, while ``inject_authoritative()`` is
+       False, has NO writer at all: not the ring (off), not the exchange
+       (shadow-only, an observer). This fires regardless of how complete
+       the plan is -- a perfect plan under ``shadow`` still writes nothing.
+    2. **The exchange is authoritative but THIS rank's own plan is empty
+       for this tag.** Even with a real writer armed, if
+       ``_weg2_shadow_plan``'s source-side descriptors for this exact tag
+       are empty, nobody deposits these bytes for the peer to collect --
+       #1394's own shape (``weights_draft``'s region is never selected by
+       the single-runner plan resolution) generalised to any tag a future
+       change could silently drop from the plan.
+
+    ``weights_draft`` IS EXEMPTED from case 2 (but not from needing SOME
+    source): #1394's own fix gives it a dedicated disk-reload wake path
+    (:meth:`weight_updater.SchedulerWeightUpdaterManager._weg2_xchg_draft_reload_from_disk`)
+    instead of the exchange, precisely because the exchange structurally
+    never covers it.
+
+    NOT a byte-count check (``Weg2XchgCoverageRefused``/W84's own
+    restriction, kept here too): allocator overhang is real, so this is a
+    POPULATION question -- does the tag have a plan/mechanism at all -- not
+    an equality against ``tms_tag_bytes``.
+    """
+
+
 class Weg2XchgCoverageRefused(RuntimeError):
     """W84 -- a live tensor under an exchanged tag has no source.
 
