@@ -156,6 +156,7 @@ four debt entries are meaningful -- they survive the over-approximation.
 """
 
 import ast
+import json
 import os
 import shutil
 import tempfile
@@ -1287,6 +1288,405 @@ class TestTheRatchetCanFail(CustomTestCase):
         idx = build_index(root, self.LANE)
         self.assertEqual(unwired_raise_sites(idx, self.ENTRIES), [],
                          "a bare reference (no call) must count as an edge")
+
+
+# --------------------------------------------------------------------------
+# #1389 (EXECUTION HALF): the ratchets above answer "is a proven STATIC path
+# reachable" (#1328) and "does a gate's own guard chain match its
+# producer's" (#1389, presence). Neither can see instance 5 -- the W100
+# guard bound to `_weg2_xchg_inject_from_peer`, which HAS a syntactic AST
+# call site (weight_updater.py:1045) and so reads WIRED to both, while the
+# REAL boot ('laeuft am Metall NULL MAL') routes around it through
+# `_weg2_xchg_bounce_leg` instead. Name-based AST resolution can call a
+# dead path wired, never the reverse (#1328's own honest bound) -- so the
+# answer here is EXECUTION EVIDENCE, not a bigger AST rule, composed from
+# TWO INSTRUMENTS THIS TREE ALREADY HAS rather than a third scanner:
+#
+# * #1348 (weg2/lane_coverage.py) writes ONE JSON dump per rank per boot,
+#   keyed by `boot_token`, recording which LINES of the exchange lane's own
+#   allowlisted modules actually executed.
+# * #1328's own machinery above already resolves every guard/refusal call
+#   site by name.
+#
+# This section crosses them: for a WATCHED (function, file, group, boot tag
+# prefix) tuple, it finds the MOST RECENT dump of that tag among whatever is
+# on disk and asks whether the function's BODY (not its `def` line -- see
+# Falle 3 below) ever executed.
+#
+# THREE TRAPS, each measured the night this order was given, each with its
+# own test:
+#
+# 1. "NEVER EXECUTED" IS NOT "DEAD". A guard that ran and found its
+#    condition false is ALIVE; only a guard whose body never ran at all,
+#    on a boot that should have reached it, is the instance-5 shape. This
+#    ratchet answers ONLY "did the body run", never "did the raise fire" --
+#    conflating the two would flag every guard whose condition is usually
+#    false as a false instance-5 positive.
+# 2. NO DUMP = NOT GREEN. A missing dump, or a dump of a different boot tag
+#    prefix, answers "not measurable", named -- never a silent pass. This
+#    is the #1306 trap in new clothes: a scan with no input reads green.
+# 3. `imported_before_arm=True` marks a module whose IMPORT-TIME lines (the
+#    `def` statement itself among them) ran before the tracer armed and
+#    therefore never appear in `executed`, EVEN THOUGH THE MODULE RAN
+#    (#1352f). The discriminator here is the function's BODY range,
+#    `(def_lineno, end_lineno]` -- deliberately EXCLUDING the `def` line
+#    itself, which can read unexecuted purely from import timing and says
+#    nothing about whether the function was ever CALLED. Reading `entry
+#    ["imported"]` (never a body-line proxy) for "was this module loaded
+#    at all" is the other half of not walking into this trap.
+# --------------------------------------------------------------------------
+
+
+def _function_body_range(source: str, func_name: str):
+    """``(def_lineno, end_lineno)`` of the one function named ``func_name``
+    in ``source``. Raises if it is missing or ambiguous -- a silently
+    picked FIRST match would let a moved/duplicated function read as
+    whichever definition happened to parse first."""
+    matches = [
+        n for n in ast.walk(ast.parse(source))
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and n.name == func_name
+    ]
+    if len(matches) != 1:
+        raise ValueError(
+            f"{func_name}: found {len(matches)} definition(s) in this "
+            "source, need exactly 1")
+    return matches[0].lineno, matches[0].end_lineno
+
+
+def entry_evidence(dump: dict, rel_file: str, func_name: str, source: str):
+    """Was ``func_name`` (defined in ``rel_file``) ENTERED per this ONE
+    #1348 dump? Returns ``(verdict, detail)``, ``verdict`` one of
+    ``"entered"``, ``"not-entered"``, ``"not-measured"`` -- never a bare
+    bool, so a caller cannot collapse "not measurable" into "no finding"
+    by accident (Falle 2)."""
+    modules = dump.get("modules", {})
+    if rel_file not in modules:
+        return "not-measured", f"{rel_file} is not in this dump's modules"
+    entry = modules[rel_file]
+    # THE AUTHORITATIVE "was this module loaded" signal is `imported`,
+    # NEVER inferred from whether any of its lines appear in `executed` --
+    # that inference is EXACTLY Falle 3 (`imported_before_arm=True` makes
+    # a loaded module's own import-time lines read as unexecuted).
+    if not entry.get("imported", False):
+        return "not-measured", f"{rel_file} was never imported in this process"
+    def_line, end_line = _function_body_range(source, func_name)
+    executed = set(entry.get("executed") or ())
+    # Falle 3, the other half: the BODY range starts AFTER def_line, on
+    # purpose. `def_line` itself can read executed OR unexecuted for
+    # reasons that have nothing to do with whether the function was ever
+    # CALLED (import timing), so it is excluded from the evidence entirely
+    # rather than trusted either way.
+    body_hits = sorted(l for l in executed if def_line < l <= end_line)
+    if body_hits:
+        return "entered", f"body line(s) {body_hits[:3]}{'...' if len(body_hits) > 3 else ''} executed"
+    return "not-entered", (
+        f"{func_name} ({rel_file}:{def_line}-{end_line}): 0 of its body "
+        f"lines appear in 'executed' (imported_before_arm="
+        f"{entry.get('imported_before_arm')}, which does not apply here -- "
+        "the check already excludes the def line)"
+    )
+
+
+def latest_dump_of_tag(dump_root: str, tag_prefix: str, group: str):
+    """The ``phase_coverage_{group}_rank*.json`` under ``dump_root``
+    (recursive) whose ``boot_token`` starts with ``tag_prefix + ':'``, MOST
+    RECENT by the token's own epoch. ``None`` when nothing matches.
+
+    "Same tag prefix" is a COARSER notion than host_ledger.py's own
+    ``form_key`` (ranks + weight-tag hash) -- stated so the two are never
+    read as the same measurement. This ratchet asks "which boot LINE",
+    not "which exact arm"."""
+    best = None
+    best_epoch = -1.0
+    for dirpath, _dirnames, filenames in os.walk(dump_root):
+        for fn in filenames:
+            if not fn.startswith(f"phase_coverage_{group}_rank"):
+                continue
+            try:
+                with open(os.path.join(dirpath, fn), encoding="utf-8") as fh:
+                    d = json.load(fh)
+            except (OSError, ValueError):
+                continue
+            token = str(d.get("boot_token", ""))
+            if not token.startswith(f"{tag_prefix}:"):
+                continue
+            try:
+                epoch = float(token.split(":")[1])
+            except (IndexError, ValueError):
+                continue
+            if epoch > best_epoch:
+                best_epoch, best = epoch, d
+    return best
+
+
+#: THE WATCHLIST. Each entry is one guard/refusal function #1328's own
+#: reachability ratchet cannot distinguish from genuinely wired (it has a
+#: real AST call site) from a wrapper the metal never enters.
+EXECUTION_WATCHLIST = (
+    {
+        "fn": "_weg2_xchg_inject_from_peer",
+        "file": "managers/scheduler_components/weight_updater.py",
+        "groups": ("P", "D"),
+        "tag_prefix": "weg2xsn31",
+        "why": "the W100 guard sits here, and #1328's own "
+               "_referenced_anywhere reports it wired via the ONE real AST "
+               "call site at :1045 (inside _weg2_xchg_inject_weights) -- "
+               "correctly, by that instrument's own rules. The boot's own "
+               "record (BOOT_weg2xsn31_0913_4.md VERSUCH 8, 2026-09-14, "
+               "window 2thy75): the marker "
+               "'WEG2-XCHG COLLECT tag=%s pieces=0' this function's collect "
+               "path would print appears ZERO times in either P.log or "
+               "D.log across the whole boot -- the real production "
+               "delivery runs through _weg2_xchg_bounce_leg instead, "
+               "called from a DIFFERENT site.",
+    },
+)
+
+
+class TheExecutionRatchet(CustomTestCase):
+    """#1389 execution half: crosses #1328's resolved call sites against
+    #1348's per-boot coverage dumps, on a REAL dump directory (defaults to
+    the shared evidence tree; callers needing hermeticity pass their own
+    ``dump_root`` -- see :class:`TheExecutionRatchetCanFail` for the
+    synthetic proof this file's own test suite runs)."""
+
+    DUMP_ROOT = "/spinning/evidence-665-f1"
+
+    def test_every_watchlist_entry_names_real_code(self):
+        for entry in EXECUTION_WATCHLIST:
+            with self.subTest(fn=entry["fn"]):
+                path = os.path.join(SRT, entry["file"])
+                self.assertTrue(os.path.isfile(path), entry["file"])
+                with open(path, encoding="utf-8-sig") as fh:
+                    src = fh.read()
+                # Raises (ValueError) if missing/ambiguous -- the shape
+                # check IS the assertion here.
+                _function_body_range(src, entry["fn"])
+
+    def test_the_watchlist_against_the_live_evidence_tree(self):
+        """Best-effort against WHATEVER is currently on the shared box --
+        this is a REPORT, not a pinned assertion, because other seats'
+        concurrent boots mutate this directory continuously (the #1233
+        SHARED-BOX fact). It never fails; it prints what it found so a
+        human reads the CURRENT state rather than trusting a stale one.
+        """
+        if not os.path.isdir(self.DUMP_ROOT):
+            self.skipTest(f"{self.DUMP_ROOT} does not exist on this box")
+        for entry in EXECUTION_WATCHLIST:
+            path = os.path.join(SRT, entry["file"])
+            with open(path, encoding="utf-8-sig") as fh:
+                src = fh.read()
+            for group in entry["groups"]:
+                dump = latest_dump_of_tag(
+                    self.DUMP_ROOT, entry["tag_prefix"], group)
+                if dump is None:
+                    print(f"[execution-ratchet] {entry['fn']} group={group}: "
+                          f"NOT MEASURABLE -- no {entry['tag_prefix']} dump "
+                          f"for group {group} on this box right now")
+                    continue
+                verdict, detail = entry_evidence(
+                    dump, entry["file"], entry["fn"], src)
+                print(f"[execution-ratchet] {entry['fn']} group={group} "
+                      f"boot_token={dump.get('boot_token')}: "
+                      f"{verdict} -- {detail}")
+
+
+class TheExecutionRatchetCanFail(CustomTestCase):
+    """Desk-written-never-executed law, same as the two CAN-FAIL classes
+    elsewhere in this file: proven against synthetic dumps built in a temp
+    dir, hermetically, so the mechanism's correctness does not depend on
+    what happens to be on the shared box's evidence tree right now.
+
+    THE CALIBRATION FIXTURE below is RECONSTRUCTED from
+    ``BOOT_weg2xsn31_0913_4.md`` VERSUCH 8's own printed log lines, not
+    copied from the original JSON: the real dump files
+    (``/spinning/evidence-665-f1/phase_coverage_{P,D}_rank{0,1,2}.json``,
+    confirmed written by that boot's own
+    ``lane_coverage: final dump ... legs=N`` log lines at 03:21:35-36Z)
+    were no longer present on this shared box by the time this ratchet was
+    built -- a later, unrelated activity on the same evidence directory
+    had removed them (the #1233 SHARED-BOX fact: this directory is a
+    scratch location every concurrent boot on this rig can write into
+    without a dedicated ``--evidence-dir``). The reconstruction uses PP0's
+    own reported ``legs=0`` (the emptiest, most defensible reading: PP0
+    completed no leg at all, so nothing beyond ARM could have run) and the
+    boot's own textual finding (the collect-path marker never printed) as
+    the fact under test, cited by file:line rather than asserted from
+    memory.
+    """
+
+    REAL_FILE = os.path.join(
+        SRT, "managers/scheduler_components/weight_updater.py")
+
+    def _dump_dir(self, dumps):
+        root = tempfile.mkdtemp(prefix="b4l-execratchet-")
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        for name, blob in dumps.items():
+            with open(os.path.join(root, name), "w", encoding="utf-8") as fh:
+                json.dump(blob, fh)
+        return root
+
+    def _real_source(self):
+        with open(self.REAL_FILE, encoding="utf-8-sig") as fh:
+            return fh.read()
+
+    def test_the_instance_5_case_is_reported_not_entered(self):
+        """THE REQUIRED MUTANT'S OWN BASELINE: against the reconstructed
+        xsn31/8 (VERSUCH 8, PP0, legs=0) shape, the ratchet MUST report
+        _weg2_xchg_inject_from_peer as not-entered -- if it does not, the
+        ratchet is worthless for the one case it was ordered to catch."""
+        dump = {
+            "schema": "weg2-lane-coverage-1",
+            "boot_token": "weg2xsn31:1789355854:1898898",
+            "group": "P", "rank": 0, "legs": 0, "dead": False,
+            "modules": {
+                "managers/scheduler_components/weight_updater.py": {
+                    "imported": True,
+                    "imported_before_arm": False,
+                    "executed": [],  # legs=0: nothing beyond ARM ran
+                },
+            },
+        }
+        root = self._dump_dir({"phase_coverage_P_rank0.json": dump})
+        found = latest_dump_of_tag(root, "weg2xsn31", "P")
+        self.assertIsNotNone(found, "the synthetic dump was not found by tag")
+        verdict, detail = entry_evidence(
+            found, "managers/scheduler_components/weight_updater.py",
+            "_weg2_xchg_inject_from_peer", self._real_source())
+        self.assertEqual(verdict, "not-entered", detail)
+
+    def test_a_dump_that_DID_enter_the_function_reads_entered(self):
+        """The other half of red-first: a body-line hit anywhere in
+        [def_line+1, end_line] must read ENTERED, proving the mechanism
+        can say yes as well as no."""
+        def_line, end_line = _function_body_range(
+            self._real_source(), "_weg2_xchg_inject_from_peer")
+        dump = {
+            "boot_token": "weg2xsn31:1789999999:1",
+            "modules": {
+                "managers/scheduler_components/weight_updater.py": {
+                    "imported": True, "imported_before_arm": False,
+                    "executed": [def_line + 1],
+                },
+            },
+        }
+        verdict, detail = entry_evidence(
+            dump, "managers/scheduler_components/weight_updater.py",
+            "_weg2_xchg_inject_from_peer", self._real_source())
+        self.assertEqual(verdict, "entered", detail)
+        self.assertLess(def_line, end_line)
+
+    def test_falle_1_a_condition_that_ran_and_read_false_is_not_a_finding(self):
+        """"Never executed" != "dead". A function whose FIRST body line ran
+        (the guard's own condition check) is ALIVE even if every line
+        after an early `if`/`return` never fires -- this ratchet only ever
+        asks about the body's OWN entry, never about which branch inside
+        it took."""
+        def_line, _end_line = _function_body_range(
+            self._real_source(), "_weg2_xchg_inject_from_peer")
+        dump = {
+            "boot_token": "weg2xsn31:1789999999:1",
+            "modules": {
+                "managers/scheduler_components/weight_updater.py": {
+                    "imported": True, "imported_before_arm": False,
+                    # ONLY the first body line -- as if every branch after
+                    # an early return never ran.
+                    "executed": [def_line + 1],
+                },
+            },
+        }
+        verdict, _detail = entry_evidence(
+            dump, "managers/scheduler_components/weight_updater.py",
+            "_weg2_xchg_inject_from_peer", self._real_source())
+        self.assertEqual(verdict, "entered",
+                         "a function whose condition ran and read false is "
+                         "ALIVE, not a finding")
+
+    def test_falle_2_no_dump_is_not_measured_never_green(self):
+        empty_root = tempfile.mkdtemp(prefix="b4l-execratchet-empty-")
+        self.addCleanup(shutil.rmtree, empty_root, ignore_errors=True)
+        self.assertIsNone(latest_dump_of_tag(empty_root, "weg2xsn31", "P"))
+
+        # THE NAMED GEGENFALL: a dump for a DIFFERENT boot tag (weg2ring1,
+        # the ring-arm boot the order names as running in parallel) must
+        # not be silently accepted as evidence for weg2xsn31.
+        other_form = {
+            "boot_token": "weg2ring1:1789999999:1",
+            "modules": {
+                "managers/scheduler_components/weight_updater.py": {
+                    "imported": True, "imported_before_arm": False,
+                    "executed": [1, 2, 3],
+                },
+            },
+        }
+        root = self._dump_dir({"phase_coverage_P_rank0.json": other_form})
+        self.assertIsNone(
+            latest_dump_of_tag(root, "weg2xsn31", "P"),
+            "a weg2ring1 dump must never answer a weg2xsn31 question")
+
+        dump = latest_dump_of_tag(root, "weg2ring1", "P")
+        self.assertIsNotNone(dump, "the weg2ring1 dump itself must resolve "
+                             "under its OWN tag")
+
+    def test_falle_2_a_missing_module_key_is_not_measured_not_green(self):
+        dump = {"boot_token": "weg2xsn31:1789999999:1", "modules": {}}
+        verdict, detail = entry_evidence(
+            dump, "managers/scheduler_components/weight_updater.py",
+            "_weg2_xchg_inject_from_peer", self._real_source())
+        self.assertEqual(verdict, "not-measured", detail)
+
+    def test_falle_3_imported_before_arm_does_not_become_module_never_ran(self):
+        """The trap named verbatim in the order: a module whose OWN
+        import-time lines ran before the tracer armed must NOT be reported
+        as unmeasured or as 'never imported' -- `imported` (not a body-line
+        proxy) is what answers that, and the function's BODY range (never
+        the def line) is what answers entry. Both checked at once here: a
+        module marked `imported_before_arm=True` with a genuine body hit
+        must still read ENTERED, not be short-circuited into a false
+        'not-measured' or a false 'not-entered'."""
+        def_line, _end_line = _function_body_range(
+            self._real_source(), "_weg2_xchg_inject_from_peer")
+        dump = {
+            "boot_token": "weg2xsn31:1789999999:1",
+            "modules": {
+                "managers/scheduler_components/weight_updater.py": {
+                    "imported": True,
+                    "imported_before_arm": True,  # THE TRAP FIELD
+                    # the def line ITSELF would read unexecuted under
+                    # imported_before_arm (it ran at the earlier import),
+                    # but a genuine LATER call still leaves a body hit:
+                    "executed": [def_line + 1],
+                },
+            },
+        }
+        verdict, detail = entry_evidence(
+            dump, "managers/scheduler_components/weight_updater.py",
+            "_weg2_xchg_inject_from_peer", self._real_source())
+        self.assertEqual(verdict, "entered", detail)
+
+    def test_falle_3_the_def_line_itself_is_never_used_as_evidence(self):
+        """The other direction of the same trap: if a naive check DID
+        trust the def line, an `imported_before_arm=True` module with NO
+        real body hit but a stray def-line entry (an artefact some
+        instrumentation revisions might emit) must still read
+        not-entered, never entered."""
+        def_line, _end_line = _function_body_range(
+            self._real_source(), "_weg2_xchg_inject_from_peer")
+        dump = {
+            "boot_token": "weg2xsn31:1789999999:1",
+            "modules": {
+                "managers/scheduler_components/weight_updater.py": {
+                    "imported": True, "imported_before_arm": True,
+                    "executed": [def_line],  # ONLY the def line itself
+                },
+            },
+        }
+        verdict, _detail = entry_evidence(
+            dump, "managers/scheduler_components/weight_updater.py",
+            "_weg2_xchg_inject_from_peer", self._real_source())
+        self.assertEqual(verdict, "not-entered",
+                         "the def line alone must never read as entry")
 
 
 if __name__ == "__main__":
