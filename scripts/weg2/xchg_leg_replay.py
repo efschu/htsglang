@@ -100,7 +100,22 @@ DEVBUDGET_ENV = "WEG2_REPLAY_DEVBUDGET"
 
 def dev_budget() -> int:
     return int(os.environ.get(DEVBUDGET_ENV, "") or (2 << 20))
-DEPTH = 1
+#: TWO slots, not one (#1378 Posten 2, measured 2026-09-14). The self-test's
+#: widest tag `weights_0` spans TWO units -- one per layer: P rank 0 carries
+#: layers.0+layers.1 (cut=(2,1,1)), 76160 B each, planned 152320 B -- and the
+#: leg streams them as two sequential batches through ONE buffer. Since
+#: #1374-F1a (c78c326f15) deleted the per-band claim, a multi-band tag on a
+#: 1-slot buffer would overwrite a band the collector may still be reading,
+#: and the `bands >= slots` guard (weight_exchange_bounce.py, W68
+#: Weg2XchgPlanDisagree, boot weg2xsn30) refuses that BY NAME instead. The
+#: one-slot shape was legal when this harness was last tuned (c67f767e75,
+#: before F1a/F1b-1) and is no longer. MEASURED: depth=1 -> P rank 0 W68 on
+#: deposit + D rank 0 collect starvation, verdict=FAIL; depth=2 ->
+#: verdict=MATCH ranks_reported=6/6 errors=0, all three D digests
+#: tensors_ok=8/8. The REAL boot never takes this path: its slot count comes
+#: from BounceTerms (tag_slots/max_tag_bytes), one producer -- this constant
+#: sizes only the desk replay's hand-sized buffer.
+DEPTH = 2
 
 
 def seed_bytes(name: str, nbytes: int) -> bytes:
