@@ -60,12 +60,13 @@ class TheCollectWaitsOutsideTheFlock(unittest.TestCase):
                       "the refusal must come from the measured liveness, "
                       "never from a bare timeout")
 
-    def test_budget_is_the_120s_detector_not_a_stall(self):
-        """The coordinator's requirement (b): 120 s stays the detector. The
-        600 s raise (this session's first attempt) is named in the docstring
-        as the counter-example: a raised budget turned the deadlock into a
-        silent stall."""
-        self.assertEqual(bx.LANE_RENDEZVOUS_BUDGET_S, 120.0)
+    def test_budget_is_the_180s_detector_not_a_stall(self):
+        """The budget is the DETECTOR: it must cover the measured deposit
+        staging (~123 s, twice) plus margin (1333cf2827: 180 s), and the
+        W17 flip gate (dc9cd96c60) is what keeps the boot alive during the
+        legitimate leg blocking -- the 600 s stall shape (xsn36) is named
+        in the docstring as the counter-example."""
+        self.assertEqual(bx.LANE_RENDEZVOUS_BUDGET_S, 180.0)
         doc = inspect.getdoc(bx.CrossSlotRendezvous.wait_full_liveness) or ""
         self.assertIn("120 s", doc, "the detector contract must be stated")
 

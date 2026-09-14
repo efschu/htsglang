@@ -2138,3 +2138,157 @@ class BounceSlots:
             os.unlink(self.path)
         except OSError:
             pass
+
+
+# ---------------------------------------------------------------------------
+# #1378 xsn44: DER SEQUENTIELLE EINHEITEN-TRANSPORT (die Layer-Form, das
+# spezifizierte Design Mechanismus Punkt 2 --gewichtsaustausch-ziel-kein-
+# dauer-hostram.md-- "assemble the FULL layer in a small host bounce buffer,
+# then each card copies its slice"). EIN Puffer (die groesste Einheit),
+# EIN full/empty-Signaalpaar je Einheit, sequenziell. Die Lane-Maschinerie
+# (Lanes, Permit, Cap, Band-Grenzen, whole-leg-Locks) ist dafuer nicht
+# gebaut worden und produzierte die elf Waende der Familie.
+# ---------------------------------------------------------------------------
+
+_SEQ_SLOT = 0
+
+
+def sequential_buffer_path(boot_nonce: str, shm_root: str = xr.SHM_ROOT) -> str:
+    return f"{shm_root}/weg2-seq-{boot_nonce}/unit_buffer.bin"
+
+
+def sequential_digest_path(boot_nonce: str, shm_root: str = xr.SHM_ROOT) -> str:
+    return f"{shm_root}/weg2-seq-{boot_nonce}/unit_digests.json"
+
+
+def _off(mmv: "_mmap.mmap", start: int) -> memoryview:
+    """The buffer region as a memoryview -- the memcpy takes addresses; the
+    fake ops (the desk harness) takes the view directly."""
+    return memoryview(mmv)[start:]
+
+
+def run_sequential_units(units, ops, boot_nonce: str, *,
+                         shm_root: str = xr.SHM_ROOT,
+                         device: int = 0,
+                         phase: str = PHASE_DEPOSIT,
+                         digest_fn=None,
+                         liveness=None,
+                         budget_s: float = 120.0,
+                         log=None) -> str:
+    """Der sequenzielle Einheiten-Transport: EIN Puffer, zwei Signale je
+    Einheit, der Digest je Einheit als Bedingung.
+
+    ``units``: die Einheiten-Liste -- je Einheit (name, tag, nbytes,
+    src_addr, dst_addr), IDENTISCH auf beiden Seiten (die PLAN-PARAM-
+    Liste; gemessen: beide Seiten planen alle Tags).
+    ``phase``: PHASE_DEPOSIT (kopiere src->Puffer, sync, Digest ueber den
+    Puffer, schreibe den Digest, post full) oder PHASE_COLLECT (warte
+    full [chunked, liveness-gekoppelt], lies den Digest des Deposits,
+    vergleiche mit dem Digest ueber den Puffer -- BY NAME, Mismatch =
+    Refusal mit beiden Digests --, kopiere Puffer->dst, sync, post
+    consumed).
+
+    Der Puffer: EIN shm-File, gross genug fuer die groesste Einheit,
+    von beiden Seiten gemappt. Die Signale: das SemSet-Paar full/consumed
+    auf _SEQ_SLOT. Sequenziell: die Einheit i+1 beginnt, nachdem i
+    verbraucht ist -- keine Ueberlappung, kein Band-Grenzvertrag.
+
+    Der Digest: ``digest_fn(bytes) -> hex`` ueber die Puffer-Region; der
+    Deposit schreibt seinen Digest in die Digest-Datei, der Collect
+    vergleicht seinen eigenen (ueber dieselben Shared-Memory-Bytes)
+    dagegen. Der Zeuge fuer das MAPPING liegt in der Zuordnung
+    unit->(src,dst): der Verschiebungs-Mutant (die Einheit i mapped die
+    Bytes der Einheit i+1) produziert andere Puffer-Inhalte -- der
+    Digest des Collects ueber die falsch gemappte dst-Adresse weicht vom
+    Deposit-Digest ab und die Refusal nennt beide.
+
+    ``liveness``: der Co-Card-Check zwischen den Wait-Chunks (die
+    xsn36/37-Lehre: eine Wait ohne Aliveness-Pruefung verwandelt den
+    Deadlock in Schweigen). Fail-open.
+    """
+    import faulthandler  # noqa: PLC0415
+    import hashlib  # noqa: PLC0415
+    import json as _json  # noqa: PLC0415
+    import time as _time  # noqa: PLC0415
+
+    biggest = max((int(u[2]) for u in units), default=0)
+    if biggest <= 0:
+        return "no units"
+    path = sequential_buffer_path(boot_nonce, shm_root)
+    dpath = sequential_digest_path(boot_nonce, shm_root)
+    directory = os.path.dirname(path)
+    os.makedirs(directory, exist_ok=True)
+    size = os.path.getsize(path) if os.path.exists(path) else 0
+    if size < biggest:
+        with open(path, "wb") as fh:
+            fh.truncate(biggest)
+    fh = open(path, "r+b")
+    buf = _mmap.mmap(fh.fileno(), biggest)
+    sems = tp.SemSet(boot_nonce)
+    log = log or (lambda *a: None)
+    for i, (name, tag, nbytes, src_addr, dst_addr) in enumerate(units):
+        rank_u = i
+        label = f"unit {i} {name!r} tag={tag!r} nbytes={nbytes}"
+        if phase == PHASE_DEPOSIT:
+            src_ptr = src_addr(name, 0) if callable(src_addr) else src_addr
+            t0 = _time.perf_counter()
+            ops.memcpy_async(int(src_ptr), _off(buf, 0), nbytes, 0)
+            ops.synchronize(0)
+            digest = hashlib.sha256(bytes(buf[:nbytes])).hexdigest()[:16]
+            recs = {}
+            if os.path.exists(dpath):
+                try:
+                    recs = _json.load(open(dpath))
+                except ValueError:
+                    recs = {}
+            recs[str(i)] = {"name": name, "tag": tag, "digest": digest,
+                            "nbytes": nbytes}
+            with open(dpath, "w") as fh:
+                _json.dump(recs, fh)
+            sems.post(pair=0, slot=_SEQ_SLOT, kind="full")
+            log(f"WEG2-SEQ deposit {label} digest={digest} "
+                f"ms={(_time.perf_counter()-t0)*1000:.1f}")
+        else:
+            deadline = _time.monotonic() + float(budget_s)
+            got = False
+            while _time.monotonic() < deadline:
+                if sems.trywait(pair=0, slot=_SEQ_SLOT, kind="full"):
+                    got = True
+                    break
+                if liveness is not None and not liveness():
+                    dump_rank_stacks(
+                        "PeerGone-seq", tag=str(name), rank=int(rank_u),
+                        extra=f"unit {i} {name!r} -- the deposit peer is "
+                              f"gone while the collect waited")
+                    return f"PeerGone at unit {i} {name!r}"
+                _time.sleep(0.05)
+            if not got:
+                dump_rank_stacks(
+                    "budget-expired-seq", tag=str(name), rank=int(rank_u),
+                    extra=f"unit {i} {name!r} budget={budget_s}s")
+                return f"budget expired at unit {i} {name!r}"
+            recs = {}
+            if os.path.exists(dpath):
+                try:
+                    recs = _json.load(open(dpath))
+                except ValueError:
+                    recs = {}
+            dep = recs.get(str(i), {})
+            dep_digest = str(dep.get("digest", ""))
+            my_digest = hashlib.sha256(bytes(buf[:nbytes])).hexdigest()[:16]
+            if dep_digest and my_digest != dep_digest:
+                dump_rank_stacks(
+                    "digest-mismatch-seq", tag=str(name), rank=int(rank_u),
+                    extra=f"unit {i} {name!r} deposit={dep_digest} "
+                          f"collect={my_digest}")
+                return (f"digest mismatch at unit {i} {name!r}: "
+                        f"deposit={dep_digest} collect={my_digest}")
+            dst_ptr = dst_addr(name, 0) if callable(dst_addr) else dst_addr
+            ops.memcpy_async(int(dst_ptr), _off(buf, 0), nbytes, 0)
+            ops.synchronize(0)
+            sems.post(pair=0, slot=_SEQ_SLOT, kind="empty")
+            log(f"WEG2-SEQ collect {label} digest={my_digest} "
+                f"matches deposit")
+    buf.close()
+    fh.close()
+    return ""
