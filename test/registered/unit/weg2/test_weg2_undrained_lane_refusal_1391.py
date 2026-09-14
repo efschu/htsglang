@@ -60,10 +60,61 @@ report success -- silently wrong weights are worse than a refusal.
 undrained state, checked against the WRONG card identity, and the assertion
 is that IT MISSES the wedge -- pinning why the real call sites must (and do)
 pass this rank's own resolved identity rather than a fixed/derived stand-in.
+
+ROUND 2 (file boundary extended to xchg_manifest.py/weight_exchange.py/
+weight_exchange_region.py): the coordinator's strongest remaining candidate
+was that a co-located DRAFT/MTP leg shares the SAME region-blind semaphore
+names as the main leg (``sem_name``/``diagonal_sem_name``,
+weight_exchange_region.py:1787-1843, neither carries a region/runner key) and
+posts onto card 0's diagonal beside the main leg -- explaining 16=2x8 AND why
+only card 0. REFUTED, on two independent grounds, both verified below:
+
+  1. ``model_runner.py:736-742`` -- "Only the LAST pipeline stage builds a
+     producer" (``self.pp_rank == self.pp_size - 1``): the draft/MTP head
+     lives on P's LAST stage. For P=PP3 that is rank 2, not rank 0 -- boot
+     weg2xsn15 measured this directly (``weg2_memory_saver.py:2283-2296``,
+     ``WEG2-XCHG-RESIDENT tag=weights_draft`` 1572 MiB on "P's LAST STAGE
+     ONLY"). The card the wedge affects and the card the drafter resides on
+     are DIFFERENT cards by construction.
+  2. Even where it resided, no draft leg can currently REACH the shared
+     semaphores at all: ``_weg2_shadow_plan`` (weight_updater.py) computes
+     its region_tag EXCLUSIVELY from ``self.tp_worker.model_runner`` -- the
+     MAIN runner -- on every call, from both
+     ``_weg2_xchg_inject_from_peer`` and ``_weg2_xchg_deposit_before_sleep``,
+     regardless of which ``tag`` string the per-tag loop is processing.
+     ``test_the_draft_region_is_structurally_unreachable_from_either_call_site``
+     below proves this by executing ``weight_exchange.weights_region_tag_for``
+     against both a main and a draft ``RunnerShape``: only the main answer
+     (``"weights"``) is EVER reachable from the real call sites, so a
+     ``tag="weights_draft"`` resume/sleep step always narrows to the main
+     region and finds zero descriptors on BOTH sides -- symmetric, silent,
+     and a SEPARATE real defect (draft bytes never actually move through the
+     bounce even though ``draft_tag_in_family()`` counts them as family
+     members) but not a collision, and not card-0-specific. Flagged for a
+     separate ticket rather than fixed here: fixing it means threading a
+     per-tag region_tag through ``_weg2_shadow_plan``, which changes the
+     signature both its callers use and is a wider diff than #1391's scope.
+
+Since the semaphore names DO lack a region key (verified, ``sem_name``
+concatenates only boot_nonce/src/dst/slot/kind, ``diagonal_sem_name`` only
+boot_nonce/card/slot/kind) but this is NOT #1391's root, the region-key fix
+the operator conditioned ("traegt der Name wirklich keinen Region-Schluessel
+UND ist das die Wurzel") is NOT applied here -- the condition's second half
+fails. W100 stays regardless (operator: "der Refusal ist nicht der Notnagel,
+er ist die Ratsche").
+
+ALSO ADDED: ``WEG2-XCHG-LEG-TAGS`` (xchg_manifest.py, ``leg_plan_from_join``)
+-- a boot log now prints, per leg, exactly which tags THIS rank's filtered
+descriptor set (``mine``) carries beside the join's full family tag set. The
+#1391 wedge (P PP0's ``mine`` missing ``weights_0``/``weights_1`` while D's
+matching deposit line carries them) would show as two comparable log lines
+instead of a DEBUG_HOLD dump plus a hand-rolled ``ctypes`` probe -- the
+diagnostic BOOT7's instrument run can read directly.
 """
 
 from __future__ import annotations
 
+import inspect
 import os
 import tempfile
 
@@ -375,6 +426,133 @@ def test_M1_wrong_rank_misses_the_real_wedge(real_sems):
     # exactly the silent miss the danger direction describes.
     assert Manager._weg2_xchg_undrained_lanes(None, 1, real_sems) == []
     assert Manager._weg2_xchg_undrained_lanes(None, 2, real_sems) == []
+
+
+# ===========================================================================
+# 5. THE DRAFT/MTP COLLISION HYPOTHESIS -- CHECKED AND REFUTED.
+# ===========================================================================
+
+
+def test_draft_residency_is_the_last_pp_stage_not_card_0():
+    """model_runner.py:736-742: only ``pp_rank == pp_size - 1`` builds a draft
+    KV producer. For P=PP3 that is rank 2 -- a different card than the one
+    #1391's wedge affects (rank 0). This is the file:line the desk read to
+    settle ground 1 of the refutation; it is asserted here as a STRING match
+    against the live source so a future edit that moves the gate re-trips
+    this test rather than silently invalidating the refutation."""
+    import inspect
+
+    from sglang.srt.model_executor import model_runner as mr
+
+    src = inspect.getsource(mr.ModelRunner.__init__)
+    assert "self.pp_rank == self.pp_size - 1" in src, (
+        "the draft-KV-producer gate moved or was rephrased -- re-check "
+        "whether the draft/MTP head still resides on the LAST PP stage "
+        "before trusting the #1391 refutation that rests on it")
+
+
+def test_the_draft_region_is_structurally_unreachable_from_either_call_site(
+        monkeypatch):
+    """GROUND 2 OF THE REFUTATION, executed: `_weg2_shadow_plan`'s region_tag
+    is `wx.weights_region_tag_for(wx.RunnerShape.of(runner))` where `runner`
+    is ALWAYS `self.tp_worker.model_runner` (weight_updater.py's own source,
+    both call sites) -- never the draft runner. A main-shaped RunnerShape
+    therefore NEVER classifies as SHAPE_DRAFT, so `tag="weights_draft"` can
+    never select the draft region through either
+    `_weg2_xchg_inject_from_peer` or `_weg2_xchg_deposit_before_sleep`,
+    regardless of what the resume/sleep loop's own `tag` argument says. Not a
+    collision (a collision needs two legs on the same name); a separate,
+    symmetric, silent no-op -- flagged, not fixed here (#1391's scope is the
+    card-0 wedge, not this)."""
+    monkeypatch.setenv(wx.WEIGHT_SOURCE_ENV, wx.WEIGHT_SOURCE_EXCHANGE)
+    monkeypatch.setenv(wx.INJECT_ENV, wx.INJECT_AUTHORITATIVE)
+    assert wx.exchange_armed() is True
+
+    class _MainRunner:
+        is_draft_worker = False
+        server_args = None
+
+    class _DraftRunner:
+        is_draft_worker = True
+
+        class server_args:
+            speculative_algorithm = "eagle"
+
+    main_tag = wx.weights_region_tag_for(wx.RunnerShape.of(_MainRunner()))
+    draft_tag = wx.weights_region_tag_for(wx.RunnerShape.of(_DraftRunner()))
+    assert main_tag == wx.GPU_MEMORY_TYPE_WEIGHTS
+    assert draft_tag == wx.GPU_MEMORY_TYPE_WEIGHTS_DRAFT
+    assert main_tag != draft_tag, (
+        "the two region tags collapsed -- if they ever match, the "
+        "structural argument above (main runner can never resolve the draft "
+        "tag) no longer holds and the refutation needs re-checking")
+    # THE ACTUAL CALL SITES: `self.tp_worker.model_runner` is what both
+    # `_weg2_xchg_inject_from_peer` and `_weg2_xchg_deposit_before_sleep`
+    # read (grep-verified: no call site anywhere threads a per-tag or
+    # per-region override into `_weg2_shadow_plan`), and that object is
+    # always the MAIN runner -- never `_get_draft_model_runner(...)`.
+    from sglang.srt.managers.scheduler_components import weight_updater as _wu
+
+    src = inspect.getsource(_wu.SchedulerWeightUpdaterManager._weg2_shadow_plan)
+    assert 'getattr(self.tp_worker, "model_runner", None)' in src
+    assert "draft_worker" not in src, (
+        "_weg2_shadow_plan now reads the draft runner -- the region-tag "
+        "no-op this test documents may be fixed; re-verify #1391's scope "
+        "note rather than assuming it still applies")
+
+
+def test_the_leg_tags_line_names_this_ranks_own_tags(monkeypatch):
+    """The new WEG2-XCHG-LEG-TAGS line (xchg_manifest.py::leg_plan_from_join):
+    a boot log now carries, per leg, exactly which tags THIS rank's own
+    filtered descriptors hold -- the #1391 wedge (P PP0 missing weights_0/1)
+    would show here as a rank whose `tags=` omits what a peer's own line
+    carries for the matching src/dst, readable without a DEBUG_HOLD dump."""
+    from sglang.srt.weg2 import xchg_manifest as xm
+
+    class _Piece:
+        def __init__(self, name, tag, rows=4, cols=4, item=2):
+            self.param_name = name
+            self.tensor_class = "rows"
+            self.rows_full = rows
+            self.cols_full = cols
+            self.itemsize = item
+            self.tag = tag
+            self.nbytes = rows * cols * item
+            self.component_rows = ()
+
+        @property
+        def key(self):
+            return (self.rows_full, self.cols_full, self.itemsize,
+                    self.tensor_class)
+
+    p_manifest = xm.RankManifest(
+        group="P", rank=0, card=0, region_tag="weights", boot_token="b1",
+        tp_rank=0, pp_rank=0,
+        pieces=(_Piece("model.layers.0.w", "weights_0", rows=4, cols=4),))
+    # A real ROW CUT (D's 3 ranks split the 4 rows 2/1/1 -- summing to the
+    # PP side's whole 4), not three copies of a smaller tensor: the join's
+    # own tiling check (`_check_tiles`) refuses anything else, correctly.
+    d_rows = (2, 1, 1)
+    d_manifests = [
+        xm.RankManifest(
+            group="D", rank=r, card=r, region_tag="weights", boot_token="b1",
+            tp_rank=r, pp_rank=0,
+            pieces=(_Piece("model.layers.0.w", "weights_0",
+                           rows=d_rows[r], cols=4),))
+        for r in range(3)
+    ]
+    lines = []
+    leg, reason = xm.leg_plan_from_join(
+        hook="authoritative", group="P", rank=0,
+        manifests=[p_manifest] + d_manifests, pp_group="P", tp_group="D",
+        model=None, region_tag="weights", log=lines.append)
+    assert leg is not None, reason
+    tag_lines = [l for l in lines if l.startswith("WEG2-XCHG-LEG-TAGS")]
+    assert len(tag_lines) == 1, lines
+    assert "tags=weights_0" in tag_lines[0]
+    assert "family_tags=weights_0" in tag_lines[0]
+    assert "rank=0" in tag_lines[0]
+    assert "hook=authoritative" in tag_lines[0]
 
 
 if __name__ == "__main__":
