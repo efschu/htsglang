@@ -4555,6 +4555,11 @@ class SchedulerWeightUpdaterManager:
                         # its dst_ptr). The buffer digest and the digest
                         # record live inside run_sequential_units; the
                         # liveness callback threads through.
+                        # #1378 xsn46 (NUTZER-FRAGE beantwortet): die
+                        # nbytes kommen von der EMPFANGENDEN Seite (d.nbytes
+                        # = die Desc's Empfangsgroesse, NICHT die Quell-
+                        # groesse). Die Empfangsseite bestimmt, wie gross
+                        # die Einheit im Puffer sein muss.
                         seq_units = [
                             (str(getattr(d, "param_name",
                                           getattr(d, "name", f"desc{j}"))),

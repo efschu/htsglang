@@ -2288,8 +2288,8 @@ def run_sequential_units(units, ops, boot_nonce: str, *,
             # shared buffer at this unit's offset. The fake ops handles
             # the VRAM side; the buffer is a bytearray (the desk) or an
             # mmap (the metal) -- both support slice assignment.
-            ops.memcpy_async(int(src_ptr), _mm_slice(buf, 0, nbytes),
-                             nbytes, 0)
+            _buf_addr = _mmap_addr(buf)
+            ops.memcpy_async(_buf_addr, int(src_ptr), nbytes, 0)
             ops.synchronize(0)
             digest = hashlib.sha256(
                 bytes(buf[:nbytes])).hexdigest()[:16]
@@ -2343,8 +2343,8 @@ def run_sequential_units(units, ops, boot_nonce: str, *,
                 return (f"digest mismatch at unit {i} {name!r}: "
                         f"deposit={dep_digest} collect={my_digest}")
             dst_ptr = dst_addr(name, 0) if callable(dst_addr) else dst_addr
-            ops.memcpy_async(int(dst_ptr), _mm_slice(buf, 0, nbytes),
-                             nbytes, 0)
+            _buf_addr = _mmap_addr(buf)
+            ops.memcpy_async(int(dst_ptr), _buf_addr, nbytes, 0)
             ops.synchronize(0)
             if dst_digest_fn is not None:
                 # #1378 xsn44 (the PLACEMENT witness): what LANDED at this

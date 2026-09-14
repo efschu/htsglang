@@ -46,6 +46,9 @@ class _FakeOps:
         elif isinstance(src, memoryview):
             # H2D: src is the host buffer, dst is a VRAM addr
             self.vram[dst] = bytes(src[:nbytes])
+        elif isinstance(dst, int) and isinstance(src, int):
+            # the metal path: both are addresses -- no-op on the desk
+            pass
         else:
             raise AssertionError(
                 f"memcpy_async: expected memoryview for the buffer side, "
