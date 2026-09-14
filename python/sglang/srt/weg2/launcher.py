@@ -5294,7 +5294,14 @@ def xchg_bounce_terms_for_arm(weight_source: str, oncard_mode: str,
                               oncard_slot_mib: Optional[int] = None,
                               bounce_depth: int = xchg_bounce.ASSEMBLE_DEPTH_DEFAULT,
                               n_lanes: int = 1,
-                              lanes_concurrent: int = 0):
+                              lanes_concurrent: int = 0,
+                              # #1397: THE SINGLE BOOLEAN (design doc section
+                              # 9.2) -- `n_cross_lanes` stays `None` at every
+                              # call site in this file, on purpose, so it
+                              # ALWAYS auto-derives through
+                              # `xchg_bounce.resolve_cross_lanes` rather than
+                              # becoming a second knob nobody asked for.
+                              band_credit: bool = False):
     """``(charged_bytes, lines)`` for the host bounce. #1332 B1b.
 
     THE SECOND PRODUCER OF THE SAME PREDICATE AS
@@ -5345,7 +5352,8 @@ def xchg_bounce_terms_for_arm(weight_source: str, oncard_mode: str,
         str(model_dir), pairs=int(weight_exchange_region.N_CARDS),
         depth=int(bounce_depth), slot_bytes=slot_bytes, n_lanes=int(n_lanes),
         max_tag_bytes=xchg_max_tag_bytes(str(model_dir)),
-        lanes_concurrent=int(lanes_concurrent))
+        lanes_concurrent=int(lanes_concurrent),
+        band_credit=bool(band_credit))
     lines = [widest, xchg_bounce.arm_line(terms)]
     # PROVENANCE, ADDITIVE: the depth-slot is derived HERE, from this
     # checkpoint's census, and never from a knob -- but no line said so, and a
@@ -5512,6 +5520,13 @@ def choose_host_ledger(
     # hands this function the number, exactly as `bounce_depth` already does.
     # 0 is "not stated": byte-identical, every lane prices as before #1385.
     lanes_concurrent: int = 0,
+    # #1397 (Option 3, design doc section 9): resolved ONCE by `main`,
+    # exactly as `lanes_concurrent` two lines up -- the ranks' publication
+    # call and this ledger call must read the identical bool, or a cross
+    # lane's smaller price and a rank's larger allocation could disagree.
+    # False is byte-identical: `n_cross_lanes_priced` is 0 whenever
+    # `band_credit` is unset, so `total_bytes` takes its pre-#1397 branch.
+    band_credit: bool = False,
     # #1386 (Minimalform HiCache switch): resolved ONCE by `main`, beside
     # `draft_kv_on_p`, and handed to `host_ledger.choose` unchanged -- the
     # ledger term and the argv this function's caller builds from `arm.s_gb`/
@@ -5661,7 +5676,7 @@ def choose_host_ledger(
             f"says so; W102 is for an arm that WOULD allocate buffers.")
     _bounce_charge_bytes, _bounce_lines = xchg_bounce_terms_for_arm(
         weight_source, oncard_mode, model_dir, oncard_slot_mib, bounce_depth,
-        _lane_n, lanes_concurrent)
+        _lane_n, lanes_concurrent, band_credit)
     _bounce_lines = list(_bounce_lines) + [_lane_prov]
     # #1361 [23a] THE PRICED STATE, NOT ONLY THE PRICE. B4n measured THREE
     # distinct states that all cost 2.16 GiB -- (depth=1, comparing=True),
@@ -9633,6 +9648,56 @@ def build_parser() -> argparse.ArgumentParser:
              "never silently read as 'uncapped'.",
     )
     ap.add_argument(
+        # #1397 OPTION 3 (DESIGN_option3_band_credit_0914.md section 9):
+        # a CROSS lane's collector gate names a DIFFERENT rank than a
+        # DIAGONAL lane's does (the design doc's own "why cross but never
+        # diagonal" finding), so a cross lane may reuse a slot WITHIN one
+        # tag under a per-band drain credit instead of sizing the whole
+        # tag in -- the diagonal share stays at the #1374 floor,
+        # unconditionally, because relaxing it would re-enter boot
+        # weg2xsn30's circular wait.
+        #
+        # ARMING REDUCES TO THIS ONE BOOLEAN (design doc section 9.2): the
+        # cross-lane COUNT (`n_cross_lanes`) is never a second flag here --
+        # `xchg_bounce.resolve_cross_lanes` derives a SAFE, structural lower
+        # bound from `n_lanes` (measured, #1358) and
+        # `weight_exchange_region.N_CARDS` (a pigeonhole argument: at most
+        # N_CARDS of any `n_lanes` active lanes can be diagonal, so the
+        # remainder is a hard floor on how many must be cross, regardless of
+        # WHICH specific lanes those are). A caller with a real, measured
+        # split may still override it -- `bounce_terms(n_cross_lanes=...)` --
+        # but no CLI flag exposes that override: this switch alone is the
+        # whole arming surface, on purpose.
+        #
+        # DEFAULT OFF IS BYTE-IDENTICAL: `band_credit=False` makes
+        # `n_cross_lanes_priced` 0 by construction (`BounceTerms.
+        # n_cross_lanes_priced`), so `total_bytes` takes its pre-#1397
+        # branch untouched -- no existing boot's price moves by a byte.
+        #
+        # NEEDS `max_tag_bytes > 0` (Option 1 / #1374) OR REFUSES: the
+        # cross-lane price is the small ONCARD slot unit, which
+        # `run_bounce_leg` only ever allocates under Option 1 -- pricing the
+        # small number while Option 1 is absent would allocate the WIDEST-
+        # LAYER-sized slot instead, the #1385-round-3 mismatch class
+        # (measured 5.6x on boot weg2xsn31/4). `bounce_terms` itself refuses
+        # this combination at ARM time, before either group starts.
+        "--xchg-band-credit", action="store_true", default=False,
+        help="#1397 (Option 3): let a CROSS lane (a directed card pair, "
+             "never the diagonal) reuse a slot within one tag under a "
+             "per-band drain credit, instead of sizing the whole tag into "
+             "the buffer -- the diagonal share is unaffected. Default off, "
+             "byte-identical. On a 5-lane cut with weight_exchange_region."
+             "N_CARDS=3, the safe auto-derived cross count is 2 "
+             "(xchg_bounce.resolve_cross_lanes); at slot=128 MiB/depth=2 "
+             "this falls the pinned shm from 15.75 GiB (5 x 3.00 diag + "
+             "0.75 staging) to 10.5 GiB (3 x 3.00 diag + 2 x 384 MiB cross "
+             "+ 0.75 staging). Needs --xchg-bounce-oncard-slot-mib's Option "
+             "1 (max_tag_bytes measured > 0) to price safely -- refuses "
+             "(ValueError, xchg_bounce.bounce_terms) rather than silently "
+             "pricing the small number while the leg allocates the large "
+             "widest-layer one.",
+    )
+    ap.add_argument(
         # #1356: see VISION_OFF. Default `off` = P and D boot TEXT-ONLY.
         "--weg2-vision", choices=list(VISION_CHOICES), default=VISION_OFF,
         help="#1356: `off` (default) boots both groups text-only by passing "
@@ -10996,6 +11061,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # boot that refuses on one side and passes on the other cannot happen.
     _lanes_concurrent = xchg_bounce.resolve_lanes_concurrent(
         getattr(ns, "xchg_lanes_concurrent", None))
+    # #1397 (Option 3): resolved ONCE, here, beside `_lanes_concurrent` and
+    # for the identical reason -- the ranks' publication call and the
+    # ledger's own call below must read the IDENTICAL bool, or a cross
+    # lane's smaller priced buffer and a rank's larger allocated one could
+    # disagree. A plain bool, not a validated int: unlike
+    # `--xchg-lanes-concurrent` there is no "argv value that cannot mean
+    # anything" for a `store_true` flag, so there is nothing for a
+    # `resolve_*` function to refuse here -- `bounce_terms` itself is what
+    # refuses the one real danger (band_credit armed without max_tag_bytes).
+    _band_credit = bool(getattr(ns, "xchg_band_credit", False))
     if xchg_bounce_arm_pins_host(ns.weg2_weight_source, ns.weg2_xchg_oncard):
         # #1368: THE SAME LANE COUNT THE LEDGER CHARGES. The terms published
         # here are the INPUTS the ranks recompute from, and `n_lanes` is one of
@@ -11030,7 +11105,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     ns.weg2_xchg_oncard_slot_mib) * weight_exchange_region.MIB,
                 n_lanes=int(_pub_lane_n),
                 max_tag_bytes=xchg_max_tag_bytes(str(ns.model)),
-                lanes_concurrent=int(_lanes_concurrent)))
+                lanes_concurrent=int(_lanes_concurrent),
+                band_credit=_band_credit))
         if int(_lanes_concurrent) > 0:
             # #1385 (Wand 11b step 2): THE PERMIT, CREATED HERE -- before
             # either group starts, exactly where the region's own 24
@@ -11150,6 +11226,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         # call above priced with -- resolved once, before either call, so the
         # ledger and the ranks cannot disagree about the cap.
         lanes_concurrent=int(_lanes_concurrent),
+        # #1397 (Option 3): the SAME resolved value the ranks' publication
+        # call above priced with -- resolved once, before either call, for
+        # the identical reason `lanes_concurrent` is.
+        band_credit=_band_credit,
         # B4f: ring absence needs BOTH arms, and the inject mode is already in
         # hand here -- `prepare_xchg_env` published it three statements above.
         inject_mode=ns.weg2_xchg_inject,
