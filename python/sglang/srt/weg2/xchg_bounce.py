@@ -590,6 +590,35 @@ def bounce_terms(
         raise ValueError(f"depth must be positive: {depth!r}")
     if int(pairs) < 0 or int(slot_bytes) <= 0:
         raise ValueError(f"pairs/slot_bytes invalid: {pairs!r}/{slot_bytes!r}")
+    # #1397 x #1385 INTERACTION, NAMED RATHER THAN LEFT TO COINCIDE.
+    # `band_credit`'s own smaller sizing (`cross_lane_slots x slot_bytes`,
+    # the small ONCARD unit) has exactly one precondition: Option 1
+    # (`max_tag_bytes > 0`) is what makes `leg_slot_bytes` return
+    # `terms.slot_bytes` at all -- `leg_slot_bytes`'s OTHER branch (Option 1
+    # absent) returns `leg_geometry(terms)[0]`, i.e. `widest_layer_bytes`,
+    # a DIFFERENT and much larger slot unit. A `band_credit=True` term with
+    # `max_tag_bytes` unset would therefore PRICE at the small oncard
+    # geometry while `run_bounce_leg` -- `_band_credit_leg` is `_option1_leg
+    # and ...`, so it silently falls back to the Option-1-absent path --
+    # ALLOCATES at the widest-layer geometry instead: the identical
+    # slot-size/slot-count mismatch #1385 round 3 (`461fdebca0`/
+    # `ccd0173d45`, "the allocator now builds the buffer the ledger
+    # priced") measured at 5.6x on boot weg2xsn31/4, just with `band_credit`
+    # as the new second reader of one decision. Refused HERE, at
+    # construction, rather than left to coincide: a caller that means to
+    # price the cross share smaller must state `max_tag_bytes` too.
+    if (bool(band_credit) and int(n_cross_lanes) > 0
+            and int(max_tag_bytes) <= 0):
+        raise ValueError(
+            "band_credit=True with n_cross_lanes stated needs max_tag_bytes "
+            "> 0 (Option 1 active) -- band_credit's cross-lane price is the "
+            "ONCARD slot unit (`terms.slot_bytes`), which `run_bounce_leg` "
+            "(`leg_slot_bytes`) only ever allocates when Option 1 is active; "
+            "with max_tag_bytes unset the leg falls back to the "
+            "widest-layer-sized slot instead, and pricing the small number "
+            "while allocating the big one is the #1385-round-3 mismatch "
+            "class (measured 5.6x on boot weg2xsn31/4), not a saving"
+        )
     mean_layer = -(-int(bytes_per_direction) // int(n_layers))  # ceil
     return BounceTerms(
         bytes_per_direction=int(bytes_per_direction),

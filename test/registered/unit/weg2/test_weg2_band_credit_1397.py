@@ -663,3 +663,274 @@ def test_M2_posting_the_credit_before_the_copy_lands_corrupts_silently(
         dst_ops.close()
         slots.close()
         xr.unlink_semaphores(nonce)
+
+
+# ===========================================================================
+# (5) THE #1385 x #1397 INTERACTION -- coordinator order 2026-09-14, PAKET D.
+#
+# Two knobs price the SAME lane buffer size and were built separately:
+# `--xchg-lanes-concurrent` (#1385, LanePermit -- how many lanes may be
+# PINNED at once) and `band_credit` (#1397, this file -- how BIG a CROSS
+# lane's own buffer is). The zweitbuchhaltungs risk: either could be right
+# alone and wrong together, in either direction (a puffer priced that is
+# never allocated, or one allocated that is never priced).
+#
+# FOUR QUESTIONS, ANSWERED BELOW WITH file:line CITATIONS, NOT ASSUMED:
+#
+# (1) DOES THE PRICE SEE BOTH KNOBS AT ONCE? Yes, by CONSTRUCTION, not by
+#     luck: `n_cross_lanes_priced`/`n_diag_lanes_priced` are both derived
+#     from `self.lanes_priced` (xchg_bounce.py's own existing property,
+#     `n_lanes if lanes_concurrent<=0 else min(n_lanes, lanes_concurrent)`),
+#     never from the raw `n_lanes` -- so a stated `lanes_concurrent` cap
+#     narrows the SAME `lanes_priced` value both the diagonal and the cross
+#     share are carved out of. Pinned in
+#     `TestBandCreditAndLanesConcurrentInteract`.
+#
+# (2) DOES A "LEDGER PRICES BOTH, LANE LOOP HONOURS NEITHER" MUTANT EXIST?
+#     Read at the source (`weight_updater.py`'s lane loop,
+#     `SchedulerWeightUpdaterManager`, the `for pair, group in
+#     _lanes.items()` block that constructs `LanePermit` and calls
+#     `bx.run_bounce_leg`): the loop passes `terms=terms` straight through
+#     and NEVER independently recomputes a slot count or size -- there is
+#     no second producer of that number in that file. `run_bounce_leg`
+#     (THIS module) is the ONE place `terms.band_credit`/`cross_lane_slots`
+#     is read to decide `slots`, so a caller that priced with `band_credit`
+#     but built a leg the OLD way cannot exist without ALSO not passing
+#     `terms` at all (a different, pre-existing and already-refused shape:
+#     `test_a_phased_leg_without_a_handshake_is_refused` /
+#     `run_bounce_leg`'s own `W68 ... run_bounce_leg needs either terms ...`
+#     raise). What A CALLER *CAN* get wrong is `n_cross_lanes` itself
+#     (over-stating how many lanes are genuinely cross) -- named explicitly
+#     in `BounceTerms.n_cross_lanes`'s own docstring and in the price==
+#     allocation test below, which proves the ONE case that IS wired
+#     (`run_bounce_leg`) never disagrees with its own price.
+#
+# (3) THE `unlink_lane_buffer` GRANULARITY QUESTION. Read at the source
+#     (`weight_updater.py`'s lane loop): `bx.unlink_lane_buffer(...)` is
+#     called EXACTLY ONCE, gated on `tag is not None and phase ==
+#     bx.PHASE_COLLECT`, immediately after `rv.post_drained(tag=str(tag))`
+#     -- the PER-TAG drain row (row 0 of `empty`, #1374's own contract,
+#     UNTOUCHED by #1397). `band_credit`'s new row-1-of-`full` credit never
+#     participates in that call or in `post_drained`/`wait_drained` at all
+#     (`TestBandDrainCredit.test_it_never_touches_the_per_tag_drain_row`,
+#     above, already pins the two rows' independence). So the unlink sits
+#     at EXACTLY the same point regardless of how many intra-tag band-credit
+#     wraps happened -- it is gated on the TAG's own drain, one level
+#     coarser than the BAND credit, and band-credit wraps can only happen
+#     BEFORE that point (while the tag's own leg is still running), never
+#     after. Pinned in `TestUnlinkGranularityUnaffectedByBandCredit`.
+#
+# (4) IMPOSSIBLE COMBINATIONS REFUSE BY NAME. `band_credit=True` with a
+#     stated `n_cross_lanes` needs `max_tag_bytes > 0` (Option 1): without
+#     it, `run_bounce_leg`'s `_band_credit_leg` is false (`_option1_leg`
+#     is its own precondition) and the leg falls back to the PRE-Option-1
+#     floor, which uses a DIFFERENT slot unit entirely (`leg_slot_bytes`'s
+#     other branch: `widest_layer_bytes`, not `terms.slot_bytes`) -- pricing
+#     the small oncard number while allocating the wide-layer one is the
+#     #1385-round-3 mismatch class with a new second reader. `bounce_terms`
+#     now REFUSES this combination by name instead of letting it coincide.
+# ===========================================================================
+
+
+class TestBandCreditAndLanesConcurrentInteract:
+    def test_the_cap_narrows_lanes_priced_before_the_cross_diag_split(self):
+        """#1385's own `lanes_priced` is the ONE quantity both `n_cross_
+        lanes_priced` and `n_diag_lanes_priced` are carved from -- a cap
+        stated alongside `band_credit` therefore narrows BOTH shares
+        together, never just one."""
+        base = dict(XSN31, slot_bytes=128 * MIB, band_credit=True,
+                   n_cross_lanes=5)
+        uncapped = xb.bounce_terms(**base)
+        assert uncapped.lanes_priced == 5
+        assert uncapped.n_cross_lanes_priced == 5
+        assert uncapped.n_diag_lanes_priced == 0
+
+        capped = xb.bounce_terms(**base, lanes_concurrent=2)
+        assert capped.lanes_priced == 2
+        # n_cross_lanes=5 was stated against the UNCAPPED lane count; the
+        # cap must clamp the PRICED share to what can ever be concurrently
+        # open, never let the stale larger number leak through.
+        assert capped.n_cross_lanes_priced == 2
+        assert capped.n_diag_lanes_priced == 0
+        assert capped.total_bytes < uncapped.total_bytes
+
+    def test_a_cap_smaller_than_the_stated_diagonal_share_still_prices_it(self):
+        """The inverse split: MORE diagonal lanes stated than the cap allows
+        concurrently -- `n_diag_lanes_priced` must clamp to what the cap
+        permits, never claim more than `lanes_priced` lanes total exist."""
+        t = xb.bounce_terms(**dict(XSN31, slot_bytes=128 * MIB,
+                                   band_credit=True, n_cross_lanes=0,
+                                   lanes_concurrent=2))
+        assert t.lanes_priced == 2
+        assert t.n_diag_lanes_priced == 2   # every priced lane, none cross
+        assert t.n_cross_lanes_priced == 0
+        # Fully diagonal under the cap must equal the pre-#1397 (band_credit
+        # off) price for the SAME cap -- band_credit buys nothing when every
+        # priced lane is (stated as) diagonal.
+        off = xb.bounce_terms(**dict(XSN31, slot_bytes=128 * MIB,
+                                     lanes_concurrent=2))
+        assert t.total_bytes == off.total_bytes
+
+    def test_band_credit_without_max_tag_bytes_refuses_named(self):
+        """QUESTION 4: the impossible combination refuses BY NAME at
+        construction, rather than pricing the small oncard number while
+        `run_bounce_leg` would allocate the wide-layer one."""
+        with pytest.raises(ValueError, match="band_credit.*max_tag_bytes"):
+            xb.bounce_terms(
+                bytes_per_direction=1000, n_layers=2, widest_layer_bytes=1000,
+                pairs=1, depth=1, slot_bytes=64, n_lanes=5,
+                max_tag_bytes=0,           # Option 1 NOT active
+                band_credit=True, n_cross_lanes=3)
+
+    def test_band_credit_alone_without_n_cross_lanes_never_refuses(self):
+        """The refusal is conditioned on `n_cross_lanes > 0` -- turning
+        `band_credit` on with nothing yet counted as cross (the safe,
+        inert default, already pinned above) must never raise, since it
+        prices identically to `band_credit=False`."""
+        t = xb.bounce_terms(
+            bytes_per_direction=1000, n_layers=2, widest_layer_bytes=1000,
+            pairs=1, depth=1, slot_bytes=64, n_lanes=5, max_tag_bytes=0,
+            band_credit=True)             # n_cross_lanes defaults to 0
+        assert t.n_cross_lanes_priced == 0
+
+
+class TestPriceEqualsAllocationForABandCreditCrossLeg:
+    """QUESTION 2, on real bytes: `run_bounce_leg`'s ACTUAL `LayerBounce`
+    allocation for a band-credit CROSS leg must be BYTE-EQUAL to `terms.
+    cross_lane_buffer_bytes` -- the identical proof
+    `test_price_equals_allocation_for_the_assemble_buffer_1330` already
+    gives the non-band-credit geometry, extended to this one."""
+
+    def test_allocated_bytes_match_the_priced_cross_share_exactly(self, tmp_path):
+        nbytes = 64
+        terms = xb.bounce_terms(
+            bytes_per_direction=nbytes * 5, n_layers=1,
+            widest_layer_bytes=nbytes * 5, pairs=1, depth=2,
+            slot_bytes=nbytes, n_lanes=3, max_tag_bytes=nbytes * 5,
+            band_credit=True, n_cross_lanes=2, lanes_concurrent=2)
+        assert terms.n_cross_lanes_priced == 2   # the cap did not erase it
+
+        nonce = f"{NONCE}-priceeq"
+        xr.create_semaphores(nonce)
+        sems = tp.SemSet(nonce)
+        slots = wb.BounceSlots(nonce, shm_root=str(tmp_path), create=True,
+                               rows_per_pair=max(terms.cross_lane_slots, 1))
+        src_ops = FakeDeviceOps(str(tmp_path), rank=0)
+        rv = wb.CrossSlotRendezvous(sems, slots, pair=PAIR, budget_s=0.2)
+        src_ptr = src_ops.raw_malloc(0, nbytes)
+        desc = wx.XchgDesc(tag=TAG, src_rank=0, dst_rank=1, param_name="p0",
+                           src_ptr=src_ptr, dst_ptr=None, kind=wx.FLAT,
+                           nbytes=nbytes, rows=1, run_bytes=nbytes, spitch=0,
+                           dpitch=0, src_off=0, dst_off=0)
+        try:
+            captured = {}
+            orig_init = wb.LayerBounce.__init__
+
+            def _spy_init(self, *a, **k):
+                orig_init(self, *a, **k)
+                captured["nbytes"] = self.nbytes
+
+            wb.LayerBounce.__init__ = _spy_init
+            try:
+                wb.run_bounce_leg([desc], src_ops, nonce, terms=terms,
+                                  mode=wx.INJECT_AUTHORITATIVE,
+                                  phase=wb.PHASE_DEPOSIT, rendezvous=rv,
+                                  shm_root=str(tmp_path), lane="priceeq")
+            finally:
+                wb.LayerBounce.__init__ = orig_init
+            assert captured["nbytes"] == terms.cross_lane_buffer_bytes, (
+                f"allocated {captured['nbytes']} B but priced "
+                f"{terms.cross_lane_buffer_bytes} B -- the exact #1385 "
+                f"round-3 mismatch class, now for band_credit")
+        finally:
+            src_ops.close()
+            slots.close()
+            xr.unlink_semaphores(nonce)
+
+
+class TestUnlinkGranularityUnaffectedByBandCredit:
+    """QUESTION 3: `unlink_lane_buffer` (weight_updater.py's call site sits
+    at `rv.post_drained(tag=...)`, i.e. the PER-TAG drain row) must be
+    reachable and correct regardless of how many intra-tag band-credit
+    wraps occurred -- because the two rows never interact
+    (`test_it_never_touches_the_per_tag_drain_row`, above). This drives a
+    REAL multi-wrap band-credit tag end to end and then exercises the exact
+    per-tag sequence weight_updater.py's lane loop uses
+    (`post_drained` -> `unlink_lane_buffer`), proving the file is present
+    and removable at exactly that point -- never before (a band-credit wrap
+    is still using it) and correctly after."""
+
+    def test_unlink_after_post_drained_succeeds_following_multiple_wraps(
+            self, tmp_path):
+        n_bands, nbytes = 5, 64
+        terms = _band_credit_terms(n_bands=n_bands, slot_bytes=nbytes)
+        assert terms.cross_lane_slots < n_bands, "must force >=1 real wrap"
+
+        nonce = f"{NONCE}-unlink"
+        xr.create_semaphores(nonce)
+        sems = tp.SemSet(nonce)
+        slots = wb.BounceSlots(nonce, shm_root=str(tmp_path), create=True,
+                               rows_per_pair=max(terms.cross_lane_slots, 1))
+        src_ops = FakeDeviceOps(str(tmp_path), rank=0)
+        dst_ops = FakeDeviceOps(str(tmp_path), rank=1)
+        lane_key = "p0"
+        try:
+            pairs = _descs(n_bands, nbytes, src_ops, dst_ops)
+            deposit_rv = wb.CrossSlotRendezvous(sems, slots, pair=PAIR,
+                                                budget_s=2.0)
+            collect_rv = wb.CrossSlotRendezvous(sems, slots, pair=PAIR,
+                                                budget_s=2.0)
+            for i in range(n_bands):
+                sp, dp = pairs[i]
+                dep_desc = wx.XchgDesc(
+                    tag=TAG, src_rank=0, dst_rank=1, param_name=f"p{i}",
+                    src_ptr=sp, dst_ptr=None, kind=wx.FLAT, nbytes=nbytes,
+                    rows=1, run_bytes=nbytes, spitch=0, dpitch=0,
+                    src_off=0, dst_off=0)
+                col_desc = wx.XchgDesc(
+                    tag=TAG, src_rank=0, dst_rank=1, param_name=f"p{i}",
+                    src_ptr=None, dst_ptr=dp, kind=wx.FLAT, nbytes=nbytes,
+                    rows=1, run_bytes=nbytes, spitch=0, dpitch=0,
+                    src_off=0, dst_off=0)
+                wb.run_bounce_leg([dep_desc], src_ops, nonce,
+                                  slot_bytes=nbytes, terms=terms,
+                                  mode=wx.INJECT_AUTHORITATIVE,
+                                  phase=wb.PHASE_DEPOSIT,
+                                  rendezvous=deposit_rv, shm_root=str(tmp_path),
+                                  lane=lane_key)
+                wb.run_bounce_leg([col_desc], dst_ops, nonce,
+                                  slot_bytes=nbytes, terms=terms,
+                                  mode=wx.INJECT_AUTHORITATIVE,
+                                  phase=wb.PHASE_COLLECT,
+                                  rendezvous=collect_rv, shm_root=str(tmp_path),
+                                  lane=lane_key)
+
+            path = wb.bounce_path(nonce, str(tmp_path), lane_key)
+            assert os.path.exists(path), (
+                "the lane's file must still exist mid-tag, after multiple "
+                "band-credit wraps but before the tag's own per-tag drain")
+
+            # weight_updater.py's EXACT sequence at the collect side:
+            # post_drained(tag) THEN unlink_lane_buffer -- reproduced here
+            # verbatim (weight_updater.py's lane loop, `rv.post_drained` ...
+            # `bx.unlink_lane_buffer`).
+            collect_rv.post_drained(tag=TAG)
+            assert deposit_rv.wait_drained(tag=TAG) is True, (
+                "the per-tag drain must still work exactly once, "
+                "independent of every intra-tag band-credit wrap above")
+            removed = wb.unlink_lane_buffer(nonce, str(tmp_path), lane_key)
+            assert removed is True
+            assert not os.path.exists(path), (
+                "unlink_lane_buffer did not actually remove the file")
+
+            for i, (_sp, dp) in enumerate(pairs):
+                got = ctypes.string_at(dst_ops.real(dp), nbytes)
+                assert got == bytes([i & 0xFF] * nbytes), (
+                    "a band arrived corrupted even though the unlink "
+                    "question is what this test targets -- the correctness "
+                    "check must still hold")
+        finally:
+            src_ops.close()
+            dst_ops.close()
+            slots.close()
+            xr.unlink_semaphores(nonce)
