@@ -80,8 +80,17 @@ def load_script():
 
 
 def read_dump(d, rank=0):
-    with open(os.path.join(str(d), f"phase_footprint_rank{rank}.json")) as f:
-        return json.load(f)
+    # #1395: the dump now lives one level down, under a boot-token
+    # subdirectory (activation_probe.write_footprint_dump) -- walked here
+    # rather than joined flat, since this helper's callers care about the
+    # dump's CONTENT, not about which boot-token subdirectory it landed in.
+    name = f"phase_footprint_rank{rank}.json"
+    for root, _dirs, names in os.walk(str(d)):
+        if name in names:
+            with open(os.path.join(root, name)) as f:
+                return json.load(f)
+    raise FileNotFoundError(
+        f"{name} not found anywhere under {d} (searched recursively)")
 
 
 # ---------------------------------------------------------------------------

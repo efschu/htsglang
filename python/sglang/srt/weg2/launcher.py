@@ -4379,29 +4379,55 @@ def _env_knobs(ns) -> Dict[str, object]:
         "hicache_flush_publish_sweep": ns.hicache_flush_publish_sweep,
         "lane_coverage_dir": lane_coverage_dump_dir(ns),
         "lane_coverage_token": lane_coverage_boot_token(ns),
+        "weg2_boot_token": weg2_boot_token(ns),
     }
 
 
-def lane_coverage_boot_token(ns) -> str:
-    """#1348: WHICH BOOT this run's coverage dumps belong to.
+def weg2_boot_token(ns) -> str:
+    """#1348/#1395: ONE boot identity, shared by BOTH groups -- the single
+    producer :func:`lane_coverage_boot_token` reuses rather than a second
+    ``time.time()`` computation.
 
     Memoised on the namespace because `_env_knobs` is called once per group
     and the two groups must carry the SAME token -- a per-call `time.time()`
-    would give P and D different identities and the ingest would refuse one of
-    them as stale.
+    would give P and D different identities and any reader keying on it
+    would see two boots instead of one.
 
-    Needed because the dump directory is #1292's and #1292's is reused across
-    boots: without a token, yesterday's `phase_coverage_D_rank0.json` on an
-    unchanged tree passes the sha256 gate and is printed as today's reading
-    for a group that never ran (review MF-2).
+    UNCONDITIONAL AND SAFE TO ALWAYS PUBLISH -- unlike
+    `SGLANG_WEG2_LANE_COVERAGE_TOKEN` (see `lane_coverage_boot_token`'s own
+    docstring: that variable's mere PRESENCE arms `coverage.py` line tracing
+    elsewhere, 2x-10x on the traced modules, so it stays a gated FLAG output
+    on purpose), this token decides nothing and arms nothing by existing --
+    it is read-only identity, the same shape #1292's own dump directory
+    reuse problem needs regardless of which instrument is armed. #1395
+    reads it in `mem_ledger.activation_probe.boot_token()` via
+    `SGLANG_WEG2_BOOT_TOKEN` (below) for exactly the sibling defect
+    `lane_coverage_boot_token`'s own docstring already names: "the dump
+    directory is #1292's and #1292's is reused across boots".
+    """
+    tok = getattr(ns, "_weg2_boot_token", "")
+    if not tok:
+        tok = f"{getattr(ns, 'tag', 'notag')}:{int(time.time())}:{os.getpid()}"
+        setattr(ns, "_weg2_boot_token", tok)
+    return tok
+
+
+def lane_coverage_boot_token(ns) -> str:
+    """#1348: WHICH BOOT this run's coverage dumps belong to, or ``""`` when
+    the coverage instrument itself is not armed.
+
+    The GATE stays exactly as it was -- `SGLANG_WEG2_LANE_COVERAGE_TOKEN`'s
+    presence in a rank's environment is what tells `lane_coverage.py`
+    whether to trace lines at all, so an ambient value in the operator's own
+    shell must never arm it by accident (that popping discipline is why the
+    switch is a flag and not an ambient variable in the first place). The
+    VALUE, once armed, is :func:`weg2_boot_token`'s -- one producer, so a
+    boot's coverage dumps and its phase-footprint dumps (#1395) agree on
+    which boot they belong to when both instruments are armed together.
     """
     if not getattr(ns, "xchg_coverage_diff", False):
         return ""
-    tok = getattr(ns, "_lane_coverage_token", "")
-    if not tok:
-        tok = f"{getattr(ns, 'tag', 'notag')}:{int(time.time())}:{os.getpid()}"
-        setattr(ns, "_lane_coverage_token", tok)
-    return tok
+    return weg2_boot_token(ns)
 
 
 def refuse_double_coverage_arm(env, *, xchg_coverage_diff: bool) -> None:
@@ -4471,6 +4497,10 @@ def build_env(tree: str, venv: str, cvd: str, store_dir: str, debug_hold: bool, 
               group: str = "",
               lane_coverage_dir: str = "",
               lane_coverage_token: str = "",
+              # #1395: the generic sibling of `lane_coverage_token` -- see
+              # `weg2_boot_token`'s own docstring for why this one is safe to
+              # publish UNCONDITIONALLY where that one may not be.
+              weg2_boot_token: str = "",
               xchg_env: Optional[Dict[str, str]] = None) -> Dict[str, str]:
     env = dict(os.environ)
     # #1348: the exchange lane's unexecuted-line instrument. SAME DISCIPLINE
@@ -4676,6 +4706,11 @@ def build_env(tree: str, venv: str, cvd: str, store_dir: str, debug_hold: bool, 
     env["SGLANG_PP_OCCUPANT_HORIZON_S"] = str(pp_occupant_horizon_s)
     env["SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR"] = store_dir
     env["SGLANG_MATCH_REFUSAL_CENSUS_EVERY"] = str(match_refusal_census_every)
+    # #1395: UNCONDITIONAL, unlike SGLANG_WEG2_LANE_COVERAGE_TOKEN a few
+    # lines up -- this value arms nothing by existing, it only names which
+    # boot a rank belongs to (mem_ledger.activation_probe.boot_token() reads
+    # it so two boots of the identical form never collide on one dump path).
+    env["SGLANG_WEG2_BOOT_TOKEN"] = weg2_boot_token
     for k in list(env):
         if k.startswith("SGLANG_PHASE_FLIP"):
             del env[k]

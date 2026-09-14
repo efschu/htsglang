@@ -186,7 +186,11 @@ def test_ingest_on_a_mixed_group_dir_produces_two_verdict_blocks(tmp_path, capsy
     _write(1, "D", PROFILE_D, "GPU-d1", 820, 640, dumps)
 
     m = load_script()
-    assert m.ingest(str(dumps), str(cache)) == 0
+    # #1395: dumps now live under a boot-token subdirectory; this test's own
+    # writes (via _write -> write_footprint_dump) share ONE token, memoised
+    # per test process by ap.boot_token(), and the read side must be told
+    # the same token or it reads the (empty) pre-#1395 flat root instead.
+    assert m.ingest(str(dumps), str(cache), boot_token=ap.boot_token()) == 0
 
     out = capsys.readouterr().out
     assert out.count("Wrote 2 card footprint(s)") == 2, out
@@ -207,7 +211,7 @@ def test_load_dumps_glob_widens_to_group_qualified_filenames(tmp_path):
     _write(0, "P", PROFILE_P, "GPU-p0", 900, 700, dumps)
     _write(0, "D", PROFILE_D, "GPU-d0", 850, 640, dumps)
     m = load_script()
-    loaded = m.load_dumps(str(dumps))
+    loaded = m.load_dumps(str(dumps), boot_token=ap.boot_token())
     assert len(loaded) == 2, loaded
 
 
@@ -289,7 +293,7 @@ def test_mutant_merging_groups_at_ingest_attributes_one_groups_peak_to_the_other
     _write(0, "D", PROFILE_D, "GPU-d0", 850, 640, dumps_dir)
 
     m = load_script()
-    raw_dumps = m.load_dumps(str(dumps_dir))
+    raw_dumps = m.load_dumps(str(dumps_dir), boot_token=ap.boot_token())
     assert len(raw_dumps) == 2
 
     # The mutant: everything folds under the FIRST dump's profile digest.
