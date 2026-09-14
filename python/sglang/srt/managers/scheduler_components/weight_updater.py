@@ -1348,7 +1348,39 @@ class SchedulerWeightUpdaterManager:
         if str(tag) == GPU_MEMORY_TYPE_WEIGHTS_DRAFT:
             if self.draft_worker is None:
                 return None
-            return None  # covered by _weg2_xchg_draft_reload_from_disk
+            if cdescs_present:
+                return None  # the real join covers this tag on this leg
+            # NUTZER-ORDER 2026-09-14 (A2, xsn32, W4 Weg2WakeRefused at
+            # weg2_memory_saver.py:368): the exemption below used to answer
+            # "covered by _weg2_xchg_draft_reload_from_disk" UNCONDITIONALLY
+            # -- an ASSUMPTION that disk is always a safe net, which #1394's
+            # own doctrine ("der Checkpoint ist das Netz") never actually
+            # verified against THIS process's checkpoint. It is not: on a
+            # quantized checkpoint, `update_weights_from_disk` writes into
+            # parameters `process_weights_after_loading` already REPLACED
+            # (`assert_backup_off_wake_refill_is_defined`'s own W4 reason,
+            # weg2_memory_saver.py:328-382) -- the SAME undefined operation
+            # the launch-time guard exists to name, reached here via a
+            # DIFFERENT caller it does not know about. "Vollstaendigkeit als
+            # BEDINGUNG, nicht als Annahme": the exemption now checks
+            # whether the fallback it names is ACTUALLY safe before
+            # granting it, and refuses BY NAME (still W106, the tag's own
+            # completeness refusal -- not a new code) when it is not.
+            _draft_quant = self._weg2_draft_checkpoint_quantization()
+            if _draft_quant:
+                return (
+                    f"weights_cpu_backup_armed()=False for this tag, the "
+                    f"exchange's own join carries zero descriptors for it "
+                    f"on this leg, AND the disk-reload fallback (#1394, "
+                    f"_weg2_xchg_draft_reload_from_disk) is undefined on "
+                    f"this {_draft_quant!r} checkpoint -- "
+                    f"update_weights_from_disk would write into parameters "
+                    f"process_weights_after_loading already replaced (W4 "
+                    f"Weg2WakeRefused's own reason, "
+                    f"weg2_memory_saver.py:328-382). No third net exists "
+                    f"for this tag on this checkpoint"
+                )
+            return None  # unquantized checkpoint: the disk reload is a genuine net
         if not cdescs_present:
             return (
                 "weights_cpu_backup_armed()=False for this tag and the "
@@ -1358,6 +1390,41 @@ class SchedulerWeightUpdaterManager:
                 "at wake"
             )
         return None
+
+    def _weg2_draft_checkpoint_quantization(self) -> Optional[str]:
+        """The quantization ACTUALLY IN FORCE for the draft checkpoint
+        ``_weg2_xchg_draft_reload_from_disk`` would reload -- the same
+        question ``checkpoint_quantization`` (weg2_memory_saver.py) already
+        answers for the main shard at weight_updater.py:1753, asked here
+        for the runner ``update_weights_from_disk`` actually targets in
+        THIS method rather than the main one.
+
+        The draft runner's OWN ``model_config`` is read first (a draft
+        checkpoint may be a genuinely different file with its own
+        quantization scheme, per ``_weg2_xchg_draft_reload_from_disk``'s
+        own ``speculative_draft_model_path`` fallback), ``server_args``
+        second -- the identical two-holder order
+        ``checkpoint_quantization`` itself already defines, so this is not
+        a second reading of that decision, only a different runner's view
+        of it.
+
+        ``None`` (never a manufactured answer) when neither the draft
+        runner nor server_args is reachable: an unreadable checkpoint
+        identity is not evidence of an UNQUANTIZED one, and the disk-reload
+        exemption above already treats ``None`` as "no gap" -- the same
+        conservative direction :meth:`_weg2_xchg_wake_source_gap` takes for
+        every other unreadable contract in this method.
+        """
+        server_args = self._weg2_server_args()
+        draft_worker = getattr(self, "draft_worker", None)
+        drafter = None
+        if draft_worker is not None:
+            try:
+                drafter = _get_draft_model_runner(draft_worker)
+            except BaseException:  # noqa: BLE001 -- an observer never raises
+                drafter = None
+        draft_model_config = getattr(drafter, "model_config", None)
+        return checkpoint_quantization(draft_model_config, server_args)
 
     def _weg2_xchg_draft_reload_from_disk(self) -> bool:
         """``weights_draft``'s FALLBACK wake source, tried only when the
@@ -1389,7 +1456,25 @@ class SchedulerWeightUpdaterManager:
         call ``update_weights_from_disk`` already uses for the draft
         worker independently of the main one, is what makes the ring
         removal safe for a boot where the draft join genuinely could not
-        be built (never the ring again, never a mini-ring).
+        be built -- ON AN UNQUANTIZED CHECKPOINT ONLY (never the ring
+        again, never a mini-ring).
+
+        CORRECTED 2026-09-14 (A2, xsn32, coordinator relay of a real boot
+        death, W4 Weg2WakeRefused at weg2_memory_saver.py:368): the
+        sentence above used to end at "be built", stated as an
+        unconditional safety net. It is not one on a quantized checkpoint
+        -- ``update_weights_from_disk`` is the SAME operation
+        :func:`weg2_memory_saver.assert_backup_off_wake_refill_is_defined`
+        already names undefined there (``process_weights_after_loading``
+        replaced the parameters this reload would write into), reached
+        here through a caller that guard did not know about. This method
+        now asks that SAME guard, with the DRAFT checkpoint's own
+        quantization (:meth:`_weg2_draft_checkpoint_quantization`), before
+        touching anything -- so a quantized checkpoint refuses BY NAME
+        here (W4) instead of committing undefined VRAM, exactly the
+        completeness gate :meth:`_weg2_xchg_wake_source_gap` already
+        applies one level higher, at the sleep leg, for every flip except
+        the boot-time initial one.
 
         Returns ``True`` when it did the reload, ``False`` when there is
         nothing to reload (no draft shard in this process, or the ring
@@ -1415,6 +1500,30 @@ class SchedulerWeightUpdaterManager:
         from sglang.srt.managers.weg2_memory_saver import (
             GPU_MEMORY_TYPE_WEIGHTS_DRAFT,
             weights_region,
+        )
+
+        # NUTZER-ORDER 2026-09-14 (A2, xsn32, W4 Weg2WakeRefused at
+        # weg2_memory_saver.py:368; second half of the same finding):
+        # BEFORE ANYTHING IS LOCKED, ENTERED OR MUTATED, the SAME question
+        # the main shard's own disk-carrier branch already asks
+        # (weight_updater.py's `_weg2_wake_reload_weights`, "one definition,
+        # shared with the launch arm" -- reused here rather than
+        # re-derived, exactly that doctrine one caller wider): is
+        # `update_weights_from_disk` a DEFINED operation for the checkpoint
+        # THIS call is about to reload? On a quantized checkpoint it is
+        # not -- `process_weights_after_loading` has already replaced the
+        # parameters this reload would write into with transposed,
+        # weight_loader-less ones, and the raise happens inside the loader
+        # with the VMM pages already committed. This is defense in depth
+        # for the case the sleep-leg's own completeness check
+        # (`_weg2_xchg_wake_source_gap`) never ran for this tag -- the
+        # boot-time INITIAL sleep is explicitly not a flip and skips that
+        # check entirely (`_weg2_xchg_deposit_before_sleep`'s own
+        # `flip_index < 0` return) -- so this is the one check that reaches
+        # every call to this method regardless of how it got here.
+        assert_backup_off_wake_refill_is_defined(
+            quantization=self._weg2_draft_checkpoint_quantization(),
+            context="weights_draft disk-reload wake path",
         )
 
         draft_path = (
