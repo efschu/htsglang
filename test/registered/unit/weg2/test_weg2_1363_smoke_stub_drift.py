@@ -32,6 +32,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from weg2_smoke_stub_support import (  # noqa: E402
     LEGSTUB_EXCLUSIONS,
+    LEG_REPLAY_STUB_EXCLUSIONS,
     STUB_EXCLUSIONS,
     self_reads_reachable,
 )
@@ -72,16 +73,46 @@ def _load_smoke_module():
 _SMOKE = _load_smoke_module()
 
 
-class TheStubDriftRatchet(unittest.TestCase):
-    """The #624-shaped three-way check, run for BOTH stubs this file
-    audits (`_Stub`/`_weg2_shadow_plan`, `_LegStub`/`_weg2_xchg_bounce_leg`)
-    -- two entry points, two exclusion tables, one mechanism."""
+def _load_replay_module():
+    """Same shape as `_load_smoke_module`, for the SIX-PROCESS desk replay
+    (`scripts/weg2/xchg_leg_replay.py`, #1378 Posten 1). Its module level
+    only imports weg2 modules and warms the padded-cut import -- `main()`
+    is `__main__`-guarded, so loading it never spawns a rank."""
+    path = _REPO_ROOT / "scripts" / "weg2" / "xchg_leg_replay.py"
+    spec = importlib.util.spec_from_file_location("xchg_leg_replay", str(path))
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
-    def _check(self, *, stub_cls, entry_names, exclusions, label):
+
+_REPLAY = _load_replay_module()
+
+
+class TheStubDriftRatchet(unittest.TestCase):
+    """The #624-shaped three-way check, run for the THREE stubs this file
+    audits (`xchg_provider_smoke._Stub`/`_weg2_shadow_plan`,
+    `xchg_provider_smoke._LegStub`/`_weg2_xchg_bounce_leg`, and -- since
+    #1378 Posten 1 -- `xchg_leg_replay._Stub` over BOTH of its borrowed
+    entry points) -- three surfaces, three exclusion tables, one mechanism.
+
+    WHY THE THIRD ONE EXISTS. The leg replay's `_Stub` borrowed inside
+    `__init__` (a `setattr` loop) and NO registered test executed the
+    script, so when #1394 added `self._weg2_xchg_draft_plan_or_none` to
+    `_weg2_shadow_plan`'s body (weight_updater.py:3014 @ 18bb175bc6) the
+    gap sat invisible until the 2026-09-14 desk run of the replay itself
+    died with `AttributeError` on all six ranks, 0/6 reported. The audit
+    below turns exactly that gap RED at test time, by name."""
+
+    def _check(self, *, stub_cls, entry_names, exclusions, label,
+               construct=None):
         required = self_reads_reachable(SchedulerWeightUpdaterManager,
                                         entry_names)
-        stub_instance = (stub_cls(_SMOKE._Model([])) if stub_cls is _SMOKE._Stub
-                         else stub_cls())
+        if construct is not None:
+            stub_instance = construct()
+        else:
+            stub_instance = (stub_cls(_SMOKE._Model([]))
+                             if stub_cls is _SMOKE._Stub else stub_cls())
         provided = set(dir(stub_instance))
         excluded = set(exclusions)
         missing = sorted(required - provided - excluded)
@@ -109,6 +140,19 @@ class TheStubDriftRatchet(unittest.TestCase):
         self._check(stub_cls=_SMOKE._LegStub,
                     entry_names=["_weg2_xchg_bounce_leg"],
                     exclusions=LEGSTUB_EXCLUSIONS, label="_LegStub")
+
+    def test_leg_replay_stub_covers_or_excludes_every_reachable_name(self):
+        """#1378 Posten 1: the SIX-PROCESS replay's `_Stub`, over BOTH
+        borrowed entry points it drives (`_weg2_shadow_plan` for the plan,
+        `_weg2_xchg_bounce_leg` for the leg). Its borrows happen in
+        `__init__`, so the audit instantiates it -- which is exactly how
+        the production code sees the stub at replay time."""
+        self._check(
+            stub_cls=_REPLAY._Stub,
+            entry_names=["_weg2_shadow_plan", "_weg2_xchg_bounce_leg"],
+            exclusions=LEG_REPLAY_STUB_EXCLUSIONS,
+            label="xchg_leg_replay._Stub",
+            construct=lambda: _REPLAY._Stub([], None))
 
     def test_M_removing_a_borrowed_method_the_stub_needs_goes_red(self):
         """MUTANT (operator-required danger direction): a stub that lost a
@@ -138,6 +182,47 @@ class TheStubDriftRatchet(unittest.TestCase):
             "the mutant (a borrowed method removed) must be caught by "
             f"name, got missing={missing}")
 
+    def test_M_leg_replay_stub_missing_the_draft_plan_borrow_goes_red(self):
+        """MUTANT for the leg replay's own borrow list (#1378 Posten 1,
+        operator-required danger direction): remove ONE name from what
+        `_Stub.__init__` borrows -- here the exact name the 2026-09-14
+        desk run lost -- and the audit must name it, instead of the next
+        execution dying with `AttributeError` on all six ranks.
+
+        Mirrors the REAL `__init__` borrow list shape (class attributes
+        from `SchedulerWeightUpdaterManager`, `tp_worker` set) minus the
+        one mutant name, then drives the SAME arithmetic
+        `test_leg_replay_stub_covers_or_excludes_every_reachable_name`
+        uses."""
+
+        class _IncompleteReplayStub:
+            _weg2_rank_param_table = (
+                SchedulerWeightUpdaterManager._weg2_rank_param_table)
+            _weg2_join_src_addr = (
+                SchedulerWeightUpdaterManager._weg2_join_src_addr)
+            _weg2_join_dst_addr = (
+                SchedulerWeightUpdaterManager._weg2_join_dst_addr)
+            _weg2_shadow_plan = SchedulerWeightUpdaterManager._weg2_shadow_plan
+            # `_weg2_xchg_draft_plan_or_none` DELIBERATELY OMITTED -- the
+            # mutant: this is the name #1394's call at
+            # weight_updater.py:3014 needs and the pre-fix borrow list
+            # lacked.
+            _weg2_xchg_bounce_leg = (
+                SchedulerWeightUpdaterManager._weg2_xchg_bounce_leg)
+
+            def __init__(self):
+                self.tp_worker = None  # required name; body never runs here
+
+        required = self_reads_reachable(
+            SchedulerWeightUpdaterManager,
+            ["_weg2_shadow_plan", "_weg2_xchg_bounce_leg"])
+        provided = set(dir(_IncompleteReplayStub()))
+        missing = sorted(required - provided - set(LEG_REPLAY_STUB_EXCLUSIONS))
+        self.assertIn(
+            "_weg2_xchg_draft_plan_or_none", missing,
+            "the leg-replay mutant (the draft-plan borrow removed) must be "
+            f"caught by name, got missing={missing}")
+
 
 class TheScriptItselfIsRatchetable(unittest.TestCase):
     """Answers the coordinator's own fallback question first: IS this
@@ -156,6 +241,13 @@ class TheScriptItselfIsRatchetable(unittest.TestCase):
         self.assertTrue(hasattr(_SMOKE, "_LegStub"))
         self.assertIsInstance(_SMOKE._Stub, type)
         self.assertIsInstance(_SMOKE._LegStub, type)
+
+    def test_leg_replay_stub_is_module_level_and_importable(self):
+        """#1378 Posten 1: the leg replay's `_Stub` is auditable by the
+        same mechanism -- module-level, ordinary class. Pinned next to the
+        provider-smoke pin so the two scripts stay symmetric."""
+        self.assertTrue(hasattr(_REPLAY, "_Stub"))
+        self.assertIsInstance(_REPLAY._Stub, type)
 
 
 if __name__ == "__main__":

@@ -145,3 +145,34 @@ LEGSTUB_EXCLUSIONS = {
 #: unreasoned name here would be the same silent drift this file exists to
 #: name.
 STUB_EXCLUSIONS: dict = {}
+
+#: `scripts/weg2/xchg_leg_replay.py`'s `_Stub` exclusions (the SIX-PROCESS
+#: desk replay of a whole exchange leg, #1378 Posten 1). This stub's borrow
+#: list lived in `_Stub.__init__` (a `setattr` loop, not class attributes)
+#: and was NOT audited by the original ratchet -- which is how it lost
+#: `_weg2_shadow_plan`'s new `self._weg2_xchg_draft_plan_or_none` call
+#: (#1394, weight_updater.py:3014 @ 18bb175bc6) and every rank of the
+#: 2026-09-14 desk run died with
+#: `AttributeError: '_Stub' object has no attribute '_weg2_xchg_draft_plan_
+#: or_none'` BEFORE emitting a single leg. Same two names as
+#: `LEGSTUB_EXCLUSIONS`, and the reasons were RE-VERIFIED FOR THIS CALLER,
+#: not copied: `xchg_leg_replay.py`'s `rank_proc` calls
+#: `stub._weg2_xchg_bounce_leg(descs=..., ops=..., boot_nonce=NONCE,
+#: slot_bytes=..., depth=DEPTH, mode=..., shm_root=..., device=0, hook=...,
+#: region=None, sems=sems)` -- neither `tag=` nor `rank=` -- so both guards
+#: below are dead branches for exactly this caller too.
+LEG_REPLAY_STUB_EXCLUSIONS = {
+    "_weg2_xchg_tag_seen": (
+        "dataclass field (weight_updater.py:451, default None), read only "
+        "inside `if tag is not None and phase == bx.PHASE_DEPOSIT:` -- "
+        "xchg_leg_replay.py's rank_proc calls _weg2_xchg_bounce_leg with no "
+        "`tag=` (it replays whole legs from manifests, not the per-tag "
+        "lockstep #1374 added), so `tag` is always None and the branch "
+        "never runs"),
+    "_weg2_xchg_undrained_lanes": (
+        "method (weight_updater.py:3906), read only inside `if phase == "
+        "bx.PHASE_COLLECT and rank is not None and ...` -- xchg_leg_replay."
+        "py never passes `rank=` (the replay's own cross-process teardown "
+        "and digest collect replace the in-process lane audit), so it "
+        "defaults to None and the branch never runs"),
+}
