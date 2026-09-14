@@ -11225,11 +11225,32 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     state.pids["P"] = spec_p.pid
     _write_state(state)
     state.t_ready["P"] = wait_ready(PORT_P, spec_p.pid, ns.ready_deadline_s, log, "P", spec_p.proc)
-    n_kv = count_marker(spec_p.log, "#706 canonical KV page active")
-    n_blob = count_marker(spec_p.log, "canonical GDN blob active")
-    log(f"W7/W10 launcher half, group P log: '#706 canonical KV page active' x{n_kv}, 'canonical GDN blob active' x{n_blob} (need >= 3 each: three ranks)")
-    if n_kv < 3 or n_blob < 3:
-        raise Weg2LaunchRefused(f"W7 Weg2MambaBlobAbsent / W10 Weg2CanonicalPageMissing (launcher half): P logged kv x{n_kv} blob x{n_blob}, need 3 each")
+    # #1386 FOLLOW-UP 2 (xsn31/7 Versuch 2 wall): both markers this gate greps
+    # for are printed by managers/cache_controller.py's HiCacheController
+    # alone (lines ~1411/1608, grep-verified: no other emitter in the tree),
+    # and that class is instantiated ONLY under `enable_hierarchical_cache`
+    # (mem_cache/registry.py's create_tree_cache: `if
+    # ctx.enable_hierarchical_cache: ... init_hicache ...`; this hybrid-SSM
+    # model falls through to plain MambaRadixCache otherwise, which carries
+    # no cache_controller at all). Under
+    # `hicache_disabled` there is therefore NO EMITTER for either marker --
+    # P booted clean to READY (health 200, no exception, no refusal inside
+    # the rank) and was torn down ONLY by this unconditional launcher-side
+    # check never having been taught the switch exists, the exact same class
+    # the draft-KV-producer gate above was fixed for. SKIPPED with a named
+    # line, never silently -- the mirror of "W10/W11 SKIPPED" below.
+    if hicache_disabled:
+        log("W7/W10 SKIPPED (--weg2-disable-hicache): group P's cache_controller "
+            "never builds (enable_hierarchical_cache is False), so there is no "
+            "canonical-page/GDN-blob emitter to grade -- the plain MambaRadixCache "
+            "this arm runs under prints neither marker. P's own health check "
+            "already confirmed it booted clean to READY.")
+    else:
+        n_kv = count_marker(spec_p.log, "#706 canonical KV page active")
+        n_blob = count_marker(spec_p.log, "canonical GDN blob active")
+        log(f"W7/W10 launcher half, group P log: '#706 canonical KV page active' x{n_kv}, 'canonical GDN blob active' x{n_blob} (need >= 3 each: three ranks)")
+        if n_kv < 3 or n_blob < 3:
+            raise Weg2LaunchRefused(f"W7 Weg2MambaBlobAbsent / W10 Weg2CanonicalPageMissing (launcher half): P logged kv x{n_kv} blob x{n_blob}, need 3 each")
 
     # 4d. sleep P, measure D_c(P) -- and, fix 8, P's DORMANT HOST IMAGE.
     # This is the one sleep on this box that is NOT interleaved: group D does
@@ -11298,11 +11319,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     state.pids["D"] = spec_d.pid
     _write_state(state)
     state.t_ready["D"] = wait_ready(PORT_D, spec_d.pid, ns.ready_deadline_s, log, "D", spec_d.proc)
-    n_kv = count_marker(spec_d.log, "#706 canonical KV page active")
-    n_blob = count_marker(spec_d.log, "canonical GDN blob active")
-    log(f"W7/W10 launcher half, group D log: '#706 canonical KV page active' x{n_kv}, 'canonical GDN blob active' x{n_blob}")
-    if n_kv < 3 or n_blob < 3:
-        raise Weg2LaunchRefused(f"W7/W10 (launcher half): D logged kv x{n_kv} blob x{n_blob}, need 3 each")
+    # #1386 FOLLOW-UP 2: the mirror of group P's same skip above -- D's
+    # cache_controller never builds under `hicache_disabled` either (D is a
+    # plain MambaRadixCache then, same as P), so it prints neither marker.
+    if hicache_disabled:
+        log("W7/W10 SKIPPED (--weg2-disable-hicache): group D's cache_controller "
+            "never builds either (enable_hierarchical_cache is False) -- no "
+            "canonical-page/GDN-blob emitter to grade, same as group P above.")
+    else:
+        n_kv = count_marker(spec_d.log, "#706 canonical KV page active")
+        n_blob = count_marker(spec_d.log, "canonical GDN blob active")
+        log(f"W7/W10 launcher half, group D log: '#706 canonical KV page active' x{n_kv}, 'canonical GDN blob active' x{n_blob}")
+        if n_kv < 3 or n_blob < 3:
+            raise Weg2LaunchRefused(f"W7/W10 (launcher half): D logged kv x{n_kv} blob x{n_blob}, need 3 each")
     # #1233 zero-remainder (1j finding 6): W9 LAUNCH-TIME KEY-SCHEME GATE. The
     # store is one carrier; a spec-less group keys pages by unigram unless
     # SGLANG_HICACHE_BIGRAM_KEYS=1 forced the bigram scheme, a NEXTN/EAGLE
