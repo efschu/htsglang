@@ -326,9 +326,21 @@ def checkpoint_quantization(model_config: Any, server_args: Any) -> Optional[str
 
 
 def assert_backup_off_wake_refill_is_defined(
-    *, quantization: Optional[str], context: str
+    *, quantization: Optional[str], context: str,
+    exchange_owns_wake_refill: bool = False,
 ) -> None:
     """W4: refuse a backup-OFF wake whose refill would re-run a repacking pass.
+
+    ``exchange_owns_wake_refill`` (the launch arm's ONLY exemption, #1378
+    Schritt B): under ``exchange`` + ``authoritative`` the wake refill of the
+    exchange-owned weights is the exchange COLLECT, not
+    ``update_weights_from_disk`` -- the premise of everything below does not
+    hold, so the lock passes and the per-tag completeness guard (W106, sleep
+    side, tag + byte count, BEFORE the pause) takes over.  The caller computes
+    it through :func:`exchange_owns_wake_refill` -- ONE authority, never an
+    inline env re-parse.  The DRAFT's disk-reload path does NOT get this
+    exemption: that path really is ``update_weights_from_disk``, undefined on
+    a quantized checkpoint, and its own call site keeps the lock unconditional.
 
     The backup-OFF arm (record 1b round-2 Q2, option (ii)) refills the weights
     with ``update_weights_from_disk``, which ends in
@@ -363,6 +375,8 @@ def assert_backup_off_wake_refill_is_defined(
     ``--enable-weights-cpu-backup`` (the TMS restore carries the post-transform
     bytes and no reload runs at all), or serve an unquantized checkpoint.
     """
+    if exchange_owns_wake_refill:
+        return
     if not quantization:
         return
     raise Weg2WakeRefused(
@@ -2385,6 +2399,41 @@ _WEIGHT_CHUNK_TAG_RE = re.compile(r"^" + re.escape(WEIGHT_CHUNK_PREFIX) + r"(\d+
 def is_weights_chunk_tag(tag: Any) -> bool:
     """``weights_<integer>`` -- one layer band of the weights family."""
     return isinstance(tag, str) and _WEIGHT_CHUNK_TAG_RE.match(tag) is not None
+
+
+def exchange_owns_wake_refill() -> bool:
+    """Is the WAKE refill of the weights the exchange itself, on THIS arm?
+
+    #1378 Posten "Schritt B" (user order 2026-09-14, ring-off boot weg2xsn34):
+    the launch-time W4 lock (``assert_backup_off_wake_refill_is_defined``)
+    refuses every backup-OFF arm because its premise is "the wake refills the
+    weights with ``update_weights_from_disk``".  Under ``exchange`` +
+    ``authoritative`` that premise is FALSE for the weights the exchange owns:
+    the wake refill is the exchange COLLECT (``_weg2_xchg_inject_from_peer``),
+    whose completeness is guarded per tag -- BEFORE the pause mutates any VRAM
+    -- by the sleep-side gate (``weight_updater._weg2_xchg_wake_source_gap`` ->
+    W106, tag + measured byte count), with the draft's own fallback refusing
+    separately on a quantized checkpoint.  A blanket launch refusal there
+    condemns a DEFINED arm, which is exactly the class of wall this lane keeps
+    paying windows for.
+
+    ONE AUTHORITY, the same conjunction everywhere: ``exchange_armed() AND
+    inject_authoritative()`` -- the SAME pair ``weights_cpu_backup_armed``'s
+    auto branch reads (ring absence is a property of the INJECT arm, boot
+    weg2xsn13's lesson).  Shadow keeps the ring as the ground truth it grades
+    against, so shadow+off stays REFUSED by the lock.  The import is LAZY
+    because ``weight_exchange`` imports THIS module at line 84 -- a
+    module-level import would be a cycle (same shape as
+    ``draft_tag_in_family`` beside this function).
+    """
+    try:
+        from sglang.srt.weg2.weight_exchange import (
+            exchange_armed,
+            inject_authoritative,
+        )
+    except Exception:  # noqa: BLE001 -- the saver must import without the lane
+        return False
+    return bool(exchange_armed()) and bool(inject_authoritative())
 
 
 def draft_tag_in_family() -> bool:

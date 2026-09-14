@@ -2288,6 +2288,7 @@ class Scheduler(
                 assert_backup_off_wake_refill_is_defined,
                 assert_memory_saver_active,
                 checkpoint_quantization,
+                exchange_owns_wake_refill,
             )
 
             # W12 Weg2MemorySaverInactive, launch half. `create(enable=True)`
@@ -2307,12 +2308,22 @@ class Scheduler(
             # launch, where nothing is committed yet, rather than at the first
             # wake, where the VMM pages are already recommitted and the group
             # is fatal. Same function the wake calls, so the two cannot drift.
+            # #1378 Schritt B (user order 2026-09-14, ring-off boot weg2xsn34):
+            # the lock's PREMISE -- refill via update_weights_from_disk -- does
+            # not hold under exchange + authoritative, where the wake refill is
+            # the exchange COLLECT and completeness is guarded per tag by W106
+            # (sleep side, tag + byte count, BEFORE the pause). The exemption
+            # is decided INSIDE the assert from the ONE authority
+            # (exchange_owns_wake_refill), never an inline env re-parse and
+            # never a second decision here; the draft's own disk-reload path
+            # keeps the lock unconditional.
             if not self.server_args.enable_weights_cpu_backup:
                 assert_backup_off_wake_refill_is_defined(
                     quantization=checkpoint_quantization(
                         getattr(self, "model_config", None), self.server_args
                     ),
                     context="launch (scheduler init)",
+                    exchange_owns_wake_refill=exchange_owns_wake_refill(),
                 )
 
         # Init recv skipper and input blocker
