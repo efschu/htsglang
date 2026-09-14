@@ -46,9 +46,14 @@ files):
      every cross pair with ``dst == rank``) via the new
      :meth:`SemSet.diagonal_getvalue` and the existing
      :meth:`SemSet.getvalue`.
-  2. Two call sites raise ``Weg2XchgLaneNeverDrainedRefused`` (W100, freed by
-     the wcode census -- ``test_weg2_wcode_uniqueness_1263.py`` stays green
-     with the new code) the INSTANT they see a nonzero ``full`` beside work
+  2. Two call sites raise ``Weg2XchgLaneNeverDrainedRefused`` (W108 -- W100 at
+     the time this was written, renumbered 2026-09-14 when TRAIN2's census
+     against the merged tree found it colliding with host_ledger.py's
+     pre-existing ``Weg2SleepLegCushionDeficit``; the later arrival moves,
+     both freed by manual grep since the wcode census tool's own regex caps
+     at 2 digits and cannot see either 3-digit code --
+     ``test_weg2_wcode_uniqueness_1263.py`` stays green throughout, blind to
+     both) the INSTANT they see a nonzero ``full`` beside work
      that should not exist: ``_weg2_xchg_inject_from_peer`` when its own
      filtered ``_cdescs`` is empty, and ``_weg2_await_vram_credit`` before it
      starts its own 120 s poll.
@@ -103,7 +108,7 @@ concatenates only boot_nonce/src/dst/slot/kind, ``diagonal_sem_name`` only
 boot_nonce/card/slot/kind) but this is NOT #1391's root, the region-key fix
 the operator conditioned ("traegt der Name wirklich keinen Region-Schluessel
 UND ist das die Wurzel") is NOT applied here -- the condition's second half
-fails. W100 stays regardless (operator: "der Refusal ist nicht der Notnagel,
+fails. The refusal (W108, see the renumber note above) stays regardless (operator: "der Refusal ist nicht der Notnagel,
 er ist die Ratsche").
 
 ALSO ADDED: ``WEG2-XCHG-LEG-TAGS`` (xchg_manifest.py, ``leg_plan_from_join``)
@@ -329,7 +334,11 @@ def test_an_empty_collect_plan_beside_real_undrained_bands_refuses_by_name(
     with pytest.raises(Weg2XchgLaneNeverDrainedRefused) as exc:
         m._weg2_xchg_inject_from_peer(terms=_FakeTerms(), tag="weights_0")
     msg = str(exc.value)
-    assert "W100" in msg
+    # Pinned on the CLASS NAME, not the digit (#1265/#1306 collision class):
+    # a digit pin breaks the instant a later census renumbers the code, and
+    # this one already did once (W100 -> W108, 2026-09-14, TRAIN2's census
+    # found it colliding with host_ledger.py's Weg2SleepLegCushionDeficit).
+    assert "Weg2XchgLaneNeverDrainedRefused" in msg
     assert "card0-0" in msg
     assert "full=16" in msg
     assert "weights_0" in msg
@@ -433,14 +442,16 @@ def test_vram_credit_wait_for_catches_a_race_mid_wait_not_after_the_budget(
         f"cadence, only (if at all) near the full budget")
     assert calls["n"] >= 2, "the reader was never polled more than once"
     msg = str(exc.value)
-    assert "W100" in msg
+    # Class-name pin, not the digit -- see the comment at the first such
+    # assertion above.
+    assert "Weg2XchgLaneNeverDrainedRefused" in msg
     assert "card0-0" in msg
 
 
 def test_vram_credit_wait_for_with_no_reader_is_byte_identical(tmp_path):
     """`stuck_lane_reader=None` (every existing caller before #1391) must
     behave exactly as before: refuse on the ORIGINAL W35 path, at the full
-    budget, never on W100."""
+    budget, never on Weg2XchgLaneNeverDrainedRefused."""
     from sglang.srt.managers.weg2_memory_saver import VramCredit
 
     credit = VramCredit("GPU-test-1391b", credit_dir=str(tmp_path))

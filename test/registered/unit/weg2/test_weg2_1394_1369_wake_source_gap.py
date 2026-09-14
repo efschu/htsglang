@@ -28,6 +28,19 @@ weg2_memory_saver.py): the completeness refusal
 the wcode census tool's own regex caps at 2 digits and cannot see 3-digit
 codes -- W100/W101/.../W105/W107 are ALL invisible to it, a sixth instance of
 the #1263 blind-spot class) and weights_draft's disk-reload wake source
+
+SAME-NIGHT RENUMBER (2026-09-14, after this file's own tests were already
+green): TRAIN2's census against the MERGED tree -- something this file's own
+free-number check could not see, since it only ever grepped this branch --
+found `Weg2XchgLaneNeverDrainedRefused` (#1391, `weg2_memory_saver.py` /
+`weight_updater.py`) colliding with host_ledger.py's pre-existing W100
+(`Weg2SleepLegCushionDeficit`, from `8799c7f945`). Renumbered to W108 (also
+invisible to the 2-digit census, same blind spot) in the same commit
+sequence as this file's own tests; the two `test_weg2_undrained_lane_refusal_1391.py`
+assertions that pinned the digit now pin `Weg2XchgLaneNeverDrainedRefused`
+by name instead, which is the actual fix against the next such collision
+(#1265/#1306 precedent) -- W106 above is unaffected, it was free against
+the merged tree from the start.
 (`_weg2_xchg_draft_reload_from_disk`). The flag/publication/ledger halves are
 DESK9's (Paket A, weight_exchange.py/launcher.py/host_ledger.py) and
 model_runner.py/tms_csrc's enable_cpu_backup binding is DESK12's (Paket C) --

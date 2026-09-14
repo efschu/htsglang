@@ -773,8 +773,18 @@ class Weg2VramCreditRefused(RuntimeError):
 
 
 class Weg2XchgLaneNeverDrainedRefused(RuntimeError):
-    """W100 -- a bounce lane already carries undrained bands nobody will ever
+    """W108 -- a bounce lane already carries undrained bands nobody will ever
     take, named THE MOMENT it is found instead of after a 120 s budget.
+
+    RENUMBERED 2026-09-14 from W100 to W108: TRAIN2's census against the
+    merged tree found W100 double-assigned -- ``host_ledger.py``'s
+    ``Weg2SleepLegCushionDeficit`` (from ``8799c7f945``, #1361 fix6) held it
+    FIRST. Per the "later arrival renumbers, the census keys on the
+    exception NAME not the digit" rule, this class (picked tonight, #1391)
+    is the later arrival and moves. W108 was verified free by manual grep
+    against the merged train tip (``bb70894d76``) across
+    weg2/managers/mem_ledger/planner/model_executor/scripts, the same
+    2-digit wcode-census blind spot this docstring already named for W106.
 
     #1391 (DESK10), boot weg2xsn31 versuch 5 AND versuch 7, byte-identical:
     D's three ranks (diag on card 0, cross pairs ``1-0`` and ``2-0``) deposit
@@ -1231,7 +1241,7 @@ class VramCredit:
                     _stuck = []
                 if _stuck:
                     raise Weg2XchgLaneNeverDrainedRefused(
-                        f"W100 Weg2XchgLaneNeverDrainedRefused: card={self.uuid} "
+                        f"W108 Weg2XchgLaneNeverDrainedRefused: card={self.uuid} "
                         f"tag={tag}: waiting for a VRAM credit this card may "
                         f"never receive -- {len(_stuck)} lane(s) targeting "
                         f"this rank's card now hold undrained bands (found "
