@@ -285,6 +285,10 @@ class TheCliReachesTheGateNotJustHlChoose(CustomTestCase):
         self.assertIsNone(ns.prior_bounce_gib)
 
     def test_choose_host_ledger_forwards_both_params_to_hl_choose(self):
+        """#1378 Stage 2b: the forwarded value is the RESOLVED pair (the
+        flag when given, else the sidecar auto-read) -- see
+        test_weg2_cushion_headroom_autoresolve_1378_stage2b.py for the
+        override-vs-auto-resolve behaviour itself."""
         import inspect
 
         from sglang.srt.weg2 import launcher
@@ -295,8 +299,8 @@ class TheCliReachesTheGateNotJustHlChoose(CustomTestCase):
         self.assertIsNone(sig.parameters["prior_cushion_min_gib"].default)
         self.assertIsNone(sig.parameters["prior_bounce_gib"].default)
         src = inspect.getsource(launcher.choose_host_ledger)
-        self.assertIn("prior_cushion_min_gib=prior_cushion_min_gib", src)
-        self.assertIn("prior_bounce_gib=prior_bounce_gib", src)
+        self.assertIn("prior_cushion_min_gib=_resolved_prior_cushion_min_gib", src)
+        self.assertIn("prior_bounce_gib=_resolved_prior_bounce_gib", src)
 
     def test_main_reads_the_two_flags_into_the_seam(self):
         import inspect

@@ -2949,6 +2949,13 @@ def flip_ratchet_record(
     form_key: str = "",
     epochs: str = "begin epoch=0 -> done epoch=2",
     cushion_min_gib: Optional[float] = None,
+    # #1378 Stage 2: THIS BOOT'S OWN PRICED BOUNCE, riding beside the cushion
+    # it was measured under -- the NEXT boot's `resolve_prior_cushion` needs
+    # both from the SAME record (mixing a winner's cushion_min with a
+    # different candidate's bounce would compare two boots that never
+    # coexisted). None (an older record, or a ring arm's caller that never
+    # threads it) means "not available for the cross-boot gate", never 0.0.
+    xchg_bounce_gib: Optional[float] = None,
 ) -> Dict[str, object]:
     """One sidecar entry carrying the MEASURED ratchet of this boot's first pair.
 
@@ -2990,6 +2997,8 @@ def flip_ratchet_record(
         # never a 0 that would refuse every arm on an unsampled box.
         "cushion_min_gib": (None if cushion_min_gib is None
                             else float(cushion_min_gib)),
+        "xchg_bounce_gib": (None if xchg_bounce_gib is None
+                            else float(xchg_bounce_gib)),
     }
 
 
@@ -4647,6 +4656,83 @@ def cushion_headroom_gib(cushion_min_gib: Optional[float],
     if cushion_min_gib is None:
         return None
     return float(cushion_min_gib) - (float(bounce_now_gib) - float(bounce_then_gib))
+
+
+def flip_ratchet_candidates(path: str, form_key: str) -> List[Dict[str, object]]:
+    """Every "FLIP" sidecar entry of the given FORM, in file order.
+
+    #1378 Stage 2 order: NOT :func:`read_measured_record`, which collapses to
+    the newest entry PER GROUP -- exactly the shortcut #1308 named as the
+    cause of two lost boots ("the newest record regardless of shape" let a
+    ring-table default pick an xchg-shadow boot's row). This reader keeps
+    every candidate so the caller can choose among them explicitly, and
+    matches ``form_key`` EXACTLY: a candidate of a different shape measures a
+    different weight-tag layout and is not a comparable prior boot.
+
+    A candidate missing either ``cushion_min_gib`` or ``xchg_bounce_gib``
+    (an older record, an unreadable sampler, a ring arm never threaded
+    through) is dropped -- the caller needs BOTH from the SAME boot, or
+    neither: mixing one candidate's cushion with a different boot's bounce
+    would compare two boots that never coexisted.
+    """
+    try:
+        with open(path) as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return []
+    entries = data.get("samples") if isinstance(data, dict) else None
+    if not isinstance(entries, list):
+        return []
+    out: List[Dict[str, object]] = []
+    for e in entries:
+        if not isinstance(e, dict) or str(e.get("group", "")) != "FLIP":
+            continue
+        if str(e.get("form_key", "")) != form_key:
+            continue
+        if e.get("cushion_min_gib") is None or e.get("xchg_bounce_gib") is None:
+            continue
+        out.append(e)
+    return out
+
+
+def resolve_prior_cushion(
+    path: str, form_key: str
+) -> Tuple[Optional[float], Optional[float], str]:
+    """#1378 Stage 2: the PRIOR boot's own numbers, SELF-read from the
+    sidecar -- no operator has to type them.
+
+    THE MINIMUM, NOT THE NEWEST, over every candidate of THIS form (order
+    item 2). The direction is asymmetric: a prior cushion read too LOW
+    tightens the next boot's gate (safe -- it may refuse an arm that would
+    have been fine); a prior cushion read too HIGH loosens it (unsafe -- a
+    boot that happened to measure a slack cushion would soften every boot
+    after it, the #782 ratchet-from-the-free-column class, here in the
+    threshold direction rather than the capacity one). Taking the minimum
+    over all candidates of this form is the one reduction that cannot be
+    loosened by a lucky boot.
+
+    Returns ``(cushion_min_gib, bounce_gib, provenance)``. Both ``None``
+    with a NAMED reason when no candidate of this form exists -- never a
+    silent guess, and never a refusal: the caller's own "not measured" line
+    is what an absent auto-resolution produces.
+    """
+    candidates = flip_ratchet_candidates(path, form_key)
+    if not candidates:
+        return None, None, (
+            f"auto-resolve found no measured FLIP record of form_key="
+            f"{form_key!r} in {path} -- cannot self-read a prior boot's "
+            "cushion for this form"
+        )
+    winner = min(candidates, key=lambda e: float(e["cushion_min_gib"]))
+    return (
+        float(winner["cushion_min_gib"]),
+        float(winner["xchg_bounce_gib"]),
+        f"auto-resolved boot_tag={winner.get('boot_tag', '?')} "
+        f"form_key={form_key!r} cushion_min="
+        f"{float(winner['cushion_min_gib']):.2f} GiB bounce="
+        f"{float(winner['xchg_bounce_gib']):.2f} GiB -- MINIMUM cushion_min "
+        f"of {len(candidates)} candidate(s) of this form (never the newest)"
+    )
 
 
 def append_measured_record(path: str, rec: Dict[str, object]) -> None:

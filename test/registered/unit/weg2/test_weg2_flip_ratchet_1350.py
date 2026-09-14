@@ -688,6 +688,11 @@ class FrontEmitterSmoke1350(CustomTestCase):
             self._flip_ratchet_pre_gib = 84.336
             self._flip_ratchet_pre_at = "2026-09-11T15:49:22Z"
             self._flip_ratchet_written = False
+            # #1378 Stage 2: a real Front always sets this in __init__
+            # (`self.ledger_arm = dict(ledger_arm or {})`); the stub mirrors
+            # that invariant rather than front.py growing a defensive
+            # getattr for a state a real instance never has.
+            self.ledger_arm = {}
 
     def _run(self, path, done_epoch, monkey_post):
         from sglang.srt.weg2 import front as fr
