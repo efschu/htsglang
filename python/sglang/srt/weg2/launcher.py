@@ -4021,8 +4021,33 @@ def prepare_host_ring(cards: List[Card], log: Log, tag: str, form: str,
                       leg_form: str = "", pcie_directional: Optional[bool] = None,
                       duplex_probe: str = "", tree: str = "",
                       py: str = "",
-                      p_argv: Optional[Sequence[str]]) -> HostRingPlan:
+                      p_argv: Optional[Sequence[str]],
+                      weights_cpu_backup_armed: bool = True) -> HostRingPlan:
     """C20 + C18: solve the table, print L6, REFUSE by name, then arm the region.
+
+    #1369 CLOSEOUT (user order 2026-09-14, "DIE 48GB MUESSEN WEG. UND ZWAR
+    PRONTO"): ``weights_cpu_backup_armed=False`` (the operator's explicit
+    ``--weg2-weights-cpu-backup off``, or ``auto`` under an armed,
+    authoritative exchange) short-circuits BEFORE ``ring_table.solve`` is
+    ever called -- no table is measured, no per-card file is created.  This
+    is the gap ``weg2_weights_cpu_backup_ring_kw`` (``choose_host_ledger``,
+    below in this module) does NOT close: that function zeroes the LEDGER'S
+    PRICE for a ring whose bytes it is handed; this function is what
+    actually calls ``os.ftruncate`` on a REAL per-card file sized from a
+    REAL measured table, regardless of what any later pricing call does
+    with the number.  Byte for byte with the launcher's own established
+    idiom for "this mechanism has no subject on this arm" --
+    :func:`prepare_weight_exchange` returns ``None`` outright for
+    ``weight_source != "exchange"`` rather than pricing an unused exchange
+    at zero -- this returns an unarmed, ``table=None`` plan rather than
+    solving and then discarding a table nothing will read.
+
+    ``table=None`` is safe here, not merely convenient: it is the SAME state
+    :class:`HostRingPlan`'s own properties, ``choose_host_ledger`` ->
+    ``weg2_weights_cpu_backup_ring_kw``, and
+    :func:`refuse_unless_same_form_source` already handle for the R22
+    "could not measure" case -- none of the three raises or overcharges on
+    it, and none of the three needs to know WHY the table is absent.
 
     Order is load-bearing: the inequalities are checked and the per-card files
     are created BEFORE either group starts, so a configuration that cannot walk
@@ -4075,6 +4100,29 @@ def prepare_host_ring(cards: List[Card], log: Log, tag: str, form: str,
     for ln in plan.lines:
         log(ln)
     logged = len(plan.lines)
+    if not weights_cpu_backup_armed:
+        # #1369 CLOSEOUT: no subject, no measurement, no file -- see this
+        # function's own docstring for why `table=None` here is the SAME
+        # safe state three other functions already handle for the R22
+        # "could not measure" case, reached here for a different, NON-
+        # REFUSAL reason. Deliberately NOT worded like the A1-3 refusal
+        # text below (never "REFUSES", never a W-code): a boot that reaches
+        # this line is not failing, it is doing exactly what
+        # `--weg2-weights-cpu-backup off` (or `auto` under an armed,
+        # authoritative exchange) asked for.
+        plan.lines.append(
+            "WEG2-HOST-RING ABSENT-BY-DESIGN: --weg2-weights-cpu-backup "
+            "resolved to off for this boot (explicit, or auto under an "
+            "armed, authoritative exchange) -- the weights region never "
+            "opens with enable_cpu_backup=True on this arm "
+            "(weight_exchange.weights_cpu_backup_armed(), model_runner.py's "
+            "own gate), so a per-card ring file here would be bytes nothing "
+            "ever maps. No table is measured, no directory is made, no file "
+            "is created or ftruncated. This is NOT a refusal."
+        )
+        for ln in plan.lines[logged:]:
+            log(ln)
+        return plan
     table, reason = ring_table.solve(cards, evidence_dir, boot_stem or None, p_argv=p_argv)
     if table is None:
         plan.lines.append(
@@ -10925,7 +10973,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # from also carries the ledger's host weights term, so this runs first.
     ring_plan = prepare_host_ring(cards, log, ns.tag, ns.ring_form, ns.evidence_dir,
                                   ns.ring_table_boot, dry, duplex_probe=ns.duplex_probe,
-                                  tree=tree, py=py, p_argv=form_argv_p)
+                                  tree=tree, py=py, p_argv=form_argv_p,
+                                  # #1369 CLOSEOUT: the SAME resolved local
+                                  # `form_argv_p`/`choose_host_ledger` already
+                                  # read above and below -- never re-derived
+                                  # here, which is the #1358 defect class this
+                                  # order named by name.
+                                  weights_cpu_backup_armed=weights_cpu_backup_armed)
     # B4e (ii): with the token on, an absent same-form source is no longer an
     # EXCLUSION but a silent fall-through to the closest twin -- refuse here,
     # before either group starts, with the twin printed.
@@ -10943,9 +10997,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # file that a form the launcher refuses to start had started.  The claim is
     # retracted rather than re-quoted -- reprinting it would hand the guard test
     # a false positive and the next reader a true one.
-    state.ring_form = (ring_plan.form if ring_plan.armed
-                       else "none -- NOT ARMED (A1-3: no fallback form exists on "
-                            "this host budget; this boot refuses by name)")
+    state.ring_form = (
+        ring_plan.form if ring_plan.armed else
+        # #1369 CLOSEOUT: an intentional off-switch is not a refusal -- the
+        # A1-3 text below describes a boot that COULD NOT get the ring it
+        # needed; this describes one that deliberately does not need one.
+        # Conflating the two would make a state file lie about a boot that
+        # ran exactly as asked.
+        "none -- ABSENT BY DESIGN (--weg2-weights-cpu-backup resolved to "
+        "off for this boot; not a refusal, not a fallback)"
+        if not weights_cpu_backup_armed else
+        "none -- NOT ARMED (A1-3: no fallback form exists on "
+        "this host budget; this boot refuses by name)")
     state.ring_dir = ring_plan.dir if (ring_plan.armed and ring_plan.form == "MAP_SHARED") else ""
 
     # 1c. #1273 S7: W71, the exchange's VRAM residency, per card per direction
