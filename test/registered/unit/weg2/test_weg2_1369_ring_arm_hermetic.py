@@ -5,8 +5,7 @@ ist braucht es NIEMALS einen rueckfall....!"
 
 DESK12 / Paket C of a four-package coordinated fix: bind the WEIGHTS region's
 ``enable_cpu_backup`` to ``weight_exchange.weights_cpu_backup_armed()``
-(``auto`` default: ``not exchange_armed()``) instead of reading
-``server_args.enable_weights_cpu_backup`` unconditionally
+instead of reading ``server_args.enable_weights_cpu_backup`` unconditionally
 (``model_runner.py`` -- was ``:2440-2442`` before this slice). The chain this
 closes is measured, file:line + SHA, in
 ``/spinning/gpu-arb/weg2/ANALYSE_1369_RINGLESER_0913.md``: the launcher passes
@@ -15,10 +14,22 @@ closes is measured, file:line + SHA, in
 (``tms_csrc/core.cpp``) nor the flag's Python computation ever read
 ``weight_source()``/``exchange_armed()``/``bounce_lane_armed()`` -- so the
 48.672-MiB/card host ring was armed for the weights region on every arm,
-including ``exchange``, where the peer-VRAM bounce is already the wake's byte
-source (``weight_updater.py`` ``_weg2_xchg_inject_weights``) and the ring's
-D2H-at-sleep / H2D-at-wake round trip is a second, unread copy of the same
-bytes.
+including the one combination that never reads it.
+
+THE PREDICATE'S OWN FORMULA IS DELIBERATELY NOT REPEATED HERE (Ein-Job-Ein-
+Mover, and the exact lesson #1369 step 1 fix, ``a033f2926a``, cost DESK9 and
+the coordinator once already): a first cut of ``weights_cpu_backup_armed``'s
+``auto`` mode was ``not exchange_armed()``, which is WRONG -- it disarms the
+ring under ``--weg2-weight-source exchange`` with the DEFAULT inject mode
+(``shadow``), where the refill is STILL the authority and the shadow leg
+grades the exchanged bytes against the ring's known-correct copy (boot
+weg2xsn13's lesson). The corrected formula lives in ONE place,
+``weight_exchange.weights_cpu_backup_armed.__doc__`` -- read it there, not
+here, so this file cannot go stale the same way the first cut of
+``model_runner.py``'s own comment did (caught by the coordinator's review of
+this same slice, fixed in the same commit as this correction). What this
+file pins instead is the SHAPE of the correct behaviour via the actual
+function calls, which tracks the real implementation by construction.
 
 WHY THE C++ SIDE NEEDS NO CHANGE (checked, not assumed -- the class this file
 pins is TestDangerDirection*, below): ``core.cpp`` already gates every ring
@@ -27,7 +38,8 @@ touch on ``metadata.enable_cpu_backup``, a field fixed ONCE at
 ``resume()`` (H2D/release) -- neither takes an ``enable_cpu_backup`` parameter
 of its own, so the write side and the read side can never disagree for one
 allocation's lifetime. Once the Python side never opens the weights region
-with ``enable_cpu_backup=True`` under an armed exchange, ``ensure_ring()`` --
+with ``enable_cpu_backup=True`` for the one combination
+``weights_cpu_backup_armed()`` returns ``False`` for, ``ensure_ring()`` --
 the ONLY call site of ``HostBackupRing::open_from_env`` in the whole vendored
 tree, which is what opens/mmaps the launcher's pre-``ftruncate``'d per-card
 file -- is never reached for that region: no allocation ever asks it to.
@@ -62,20 +74,29 @@ package -- Paket B / DESK10) computes
 ``main_carried = bool(getattr(server_args, "enable_weights_cpu_backup",
 False))`` -- the RAW launcher flag, which stays unconditionally True even
 after this fix, rather than the gated value ``model_runner.py`` now actually
-uses. Consequence, walked once here as documentation and NOT asserted as a
-regression test (weight_updater.py is outside this ticket's file boundary,
-Paket B's to fix): under ``--weg2-weight-source exchange`` with
-``SGLANG_WEG2_XCHG_INJECT=shadow`` -- the DOCUMENTED DEFAULT combination,
-``weight_exchange.py``'s own docstring: "shadow (the DEFAULT) runs the bounce
-legs... the refill stays the authority" -- ``main_carried`` stays True,
-``_weg2_wake_weight_carrier`` returns ``CARRIER_TMS_BACKUP`` (exchange is not
-authoritative under ``inject=shadow``, so that branch is skipped first), and
-``_weg2_wake_reload_weights`` returns without refilling anything -- because it
-believes the TMS restore already carried the bytes, when this fix has just
-made that restore a no-op on this arm. That is exactly danger direction (ii),
-one file over: STILL, wrong weights, no refusal anywhere on this arm/inject
-combination until ``weight_updater.py:911`` reads the SAME gated value this
-file's :func:`model_runner`-binding tests pin.
+uses. CORRECTED after the coordinator's review of this same finding: with
+the FIRST-CUT (wrong) ``auto`` formula the risky combination looked like
+``exchange`` + ``inject=shadow`` (today's default); with the CORRECTED
+formula (``not (exchange_armed() and inject_authoritative())``) that
+combination now keeps the ring armed on purpose, so the combination that
+actually drops it -- and where ``main_carried`` is then stale -- is
+``--weg2-weight-source exchange`` WITH ``--weg2-xchg-inject authoritative``.
+There, ``weights_cpu_backup_armed()`` is ``False`` (correctly: the exchange
+now owns the bytes and nothing compares against the ring any more), but
+``main_carried`` still reads the raw flag as ``True`` --
+``_weg2_wake_weight_carrier`` never reaches its ``main_carried`` branch for
+THIS combination specifically because the ``exchange_armed() and
+inject_authoritative()`` check ahead of it already returns
+``CARRIER_EXCHANGE`` correctly, so whether this manifests depends on the
+exact branch order in that function -- named here as the walked chain, not
+re-verified branch-by-branch (that re-verification is Paket B's, the file is
+not mine). The defect class -- a second, independent reader of "was the
+weights region cpu-backed" that does not go through
+``weights_cpu_backup_armed()`` -- remains real regardless of which exact
+combination triggers it. Consequence walked once here as documentation and
+NOT asserted as a regression test (weight_updater.py is outside this
+ticket's file boundary, Paket B's to fix, and the coordinator has tasked
+Paket B with this finding directly).
 
 REGIONS OTHER THAN WEIGHTS THAT ALSO TAKE AN ``enable_cpu_backup`` KEYWORD,
 enumerated so a reader does not have to re-derive that they are unaffected:
@@ -190,51 +211,129 @@ def _backup_mode(value):
             os.environ[wx.WEIGHTS_CPU_BACKUP_ENV] = previous
 
 
-class TestWeightsCpuBackupArmedPredicate(unittest.TestCase):
-    """The predicate itself, all three modes x all three arms."""
+@contextmanager
+def _inject(value):
+    """``SGLANG_WEG2_XCHG_INJECT`` for the duration of a block -- the SECOND
+    axis (shadow vs. authoritative) this predicate's correct ``auto`` mode
+    depends on, independent of the weight-source arm."""
+    from sglang.srt.weg2 import weight_exchange as wx
 
-    def test_auto_is_not_exchange_armed_on_every_arm(self):
+    previous = os.environ.get(wx.INJECT_ENV)
+    if value is None:
+        os.environ.pop(wx.INJECT_ENV, None)
+    else:
+        os.environ[wx.INJECT_ENV] = value
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop(wx.INJECT_ENV, None)
+        else:
+            os.environ[wx.INJECT_ENV] = previous
+
+
+class TestWeightsCpuBackupArmedPredicate(unittest.TestCase):
+    """The predicate itself, driven through the REAL function calls
+    (``exchange_armed()`` / ``inject_authoritative()``) rather than a copied
+    formula, so this class tracks the actual implementation by construction
+    and cannot go stale the way a hardcoded ``not exchange_armed()`` pin did
+    (#1369 step 1 fix, ``a033f2926a`` -- DESK9's own correction, made
+    necessary because that bare formula would have disarmed the ring under
+    ``exchange`` + the DEFAULT inject mode ``shadow``, where the refill is
+    STILL the authority and the shadow leg needs the ring as its
+    known-correct compare ground; boot weg2xsn13's lesson)."""
+
+    def test_auto_matches_exchange_armed_and_inject_authoritative_on_every_combination(self):
+        """THE ACTUAL TWO-AXIS TRUTH TABLE: weight-source arm x inject mode.
+        Computed from the real predicates, not restated as a literal boolean
+        expression, so a future correction to either predicate is picked up
+        here automatically rather than needing a matching edit in this file."""
         from sglang.srt.weg2 import weight_exchange as wx
 
-        for arm, expected_ring in (
-            (None, True),
-            (wx.WEIGHT_SOURCE_RING, True),
-            (wx.WEIGHT_SOURCE_SHADOW, True),
-            (wx.WEIGHT_SOURCE_EXCHANGE, False),
-        ):
-            with _arm(arm), _backup_mode(None):
+        for arm in (None, wx.WEIGHT_SOURCE_RING, wx.WEIGHT_SOURCE_SHADOW,
+                    wx.WEIGHT_SOURCE_EXCHANGE):
+            for inject in (None, wx.INJECT_SHADOW, wx.INJECT_AUTHORITATIVE):
+                with _arm(arm), _inject(inject), _backup_mode(None):
+                    expected = not (wx.exchange_armed() and wx.inject_authoritative())
+                    self.assertIs(
+                        wx.weights_cpu_backup_armed(), expected,
+                        f"arm={arm!r} inject={inject!r}: auto must equal "
+                        "`not (exchange_armed() and inject_authoritative())`",
+                    )
+
+    def test_shadow_arm_keeps_its_compare_ground_unlike_exchange(self):
+        """The weight-SOURCE arm named ``shadow`` (``WEIGHT_SOURCE_SHADOW``,
+        distinct from the INJECT mode of the same name below): exchange_armed()
+        is False there regardless of inject mode, so auto stays True on this
+        arm no matter what -- the one distinction the whole design rests on."""
+        from sglang.srt.weg2 import weight_exchange as wx
+
+        for inject in (None, wx.INJECT_SHADOW, wx.INJECT_AUTHORITATIVE):
+            with _arm(wx.WEIGHT_SOURCE_SHADOW), _inject(inject), _backup_mode(None):
+                self.assertIs(wx.exchange_armed(), False)
+                self.assertIs(wx.shadow_armed(), True)
+                self.assertIs(wx.weights_cpu_backup_armed(), True,
+                              "the WEIGHT_SOURCE_SHADOW arm's ring-backed "
+                              "compare ground must survive regardless of "
+                              "inject mode")
+
+    def test_exchange_arm_under_the_default_shadow_inject_keeps_the_ring_armed(self):
+        """THE CORRECTED DANGER-DIRECTION PIN, explicitly held so nobody
+        later 'optimises' it away as over-caution: under
+        ``--weg2-weight-source exchange`` with the DEFAULT INJECT mode
+        ``shadow`` (unset ``SGLANG_WEG2_XCHG_INJECT`` reads as ``shadow`` --
+        see :func:`weight_exchange.inject_mode`), the refill is STILL the
+        authority and the shadow leg grades the exchanged bytes against the
+        ring's known-correct copy. If ``auto`` ever disarmed the ring here
+        again, THE SHADOW REFERENCE WOULD BE DELETED -- the ground truth the
+        comparison exists to grade against would be gone, silently, which is
+        worse than no comparison at all (boot weg2xsn13's exact lesson, and
+        the reason #1369 step 1's first cut -- bare ``not exchange_armed()``
+        -- was wrong and had to be corrected before this ticket's `auto`
+        could ship)."""
+        from sglang.srt.weg2 import weight_exchange as wx
+
+        for inject in (None, wx.INJECT_SHADOW):
+            with _arm(wx.WEIGHT_SOURCE_EXCHANGE), _inject(inject), _backup_mode(None):
+                self.assertIs(wx.exchange_armed(), True)
+                self.assertIs(wx.inject_authoritative(), False)
                 self.assertIs(
-                    wx.weights_cpu_backup_armed(), expected_ring,
-                    f"arm={arm!r}: auto must equal `not exchange_armed()`",
+                    wx.weights_cpu_backup_armed(), True,
+                    "exchange + shadow-inject must keep the ring armed -- "
+                    "disarming it here deletes the shadow leg's reference "
+                    "copy, not merely a fallback nobody reads",
                 )
 
-    def test_shadow_keeps_its_compare_ground_unlike_exchange(self):
-        """The one distinction the whole design rests on: shadow_armed() and
-        exchange_armed() are mutually exclusive, and only exchange_armed()
-        feeds this predicate -- shadow must not lose the ring beside it."""
+    def test_only_exchange_with_authoritative_inject_drops_the_ring(self):
+        """The ONE combination the user's order actually names: the exchange
+        truly owns the bytes at the wake seam (nothing compares against the
+        ring any more), which is the "korrekt implementiert, braucht NIEMALS
+        einen Rueckfall" case."""
         from sglang.srt.weg2 import weight_exchange as wx
 
-        with _arm(wx.WEIGHT_SOURCE_SHADOW), _backup_mode(None):
-            self.assertIs(wx.exchange_armed(), False)
-            self.assertIs(wx.shadow_armed(), True)
-            self.assertIs(wx.weights_cpu_backup_armed(), True,
-                          "shadow's ring-backed compare ground must survive")
+        with _arm(wx.WEIGHT_SOURCE_EXCHANGE), _inject(wx.INJECT_AUTHORITATIVE), \
+                _backup_mode(None):
+            self.assertIs(wx.exchange_armed(), True)
+            self.assertIs(wx.inject_authoritative(), True)
+            self.assertIs(wx.weights_cpu_backup_armed(), False)
 
-    def test_on_is_unconditionally_true_on_every_arm(self):
-        from sglang.srt.weg2 import weight_exchange as wx
-
-        for arm in (None, wx.WEIGHT_SOURCE_RING, wx.WEIGHT_SOURCE_EXCHANGE,
-                    wx.WEIGHT_SOURCE_SHADOW):
-            with _arm(arm), _backup_mode(wx.WEIGHTS_CPU_BACKUP_ON):
-                self.assertIs(wx.weights_cpu_backup_armed(), True)
-
-    def test_off_is_unconditionally_false_on_every_arm(self):
+    def test_on_is_unconditionally_true_on_every_arm_and_inject_mode(self):
         from sglang.srt.weg2 import weight_exchange as wx
 
         for arm in (None, wx.WEIGHT_SOURCE_RING, wx.WEIGHT_SOURCE_EXCHANGE,
                     wx.WEIGHT_SOURCE_SHADOW):
-            with _arm(arm), _backup_mode(wx.WEIGHTS_CPU_BACKUP_OFF):
-                self.assertIs(wx.weights_cpu_backup_armed(), False)
+            for inject in (None, wx.INJECT_SHADOW, wx.INJECT_AUTHORITATIVE):
+                with _arm(arm), _inject(inject), _backup_mode(wx.WEIGHTS_CPU_BACKUP_ON):
+                    self.assertIs(wx.weights_cpu_backup_armed(), True)
+
+    def test_off_is_unconditionally_false_on_every_arm_and_inject_mode(self):
+        from sglang.srt.weg2 import weight_exchange as wx
+
+        for arm in (None, wx.WEIGHT_SOURCE_RING, wx.WEIGHT_SOURCE_EXCHANGE,
+                    wx.WEIGHT_SOURCE_SHADOW):
+            for inject in (None, wx.INJECT_SHADOW, wx.INJECT_AUTHORITATIVE):
+                with _arm(arm), _inject(inject), _backup_mode(wx.WEIGHTS_CPU_BACKUP_OFF):
+                    self.assertIs(wx.weights_cpu_backup_armed(), False)
 
     def test_an_unrecognised_env_value_refuses_by_name_w107(self):
         """CORRECTED against the landed contract (train tip `edefc42c34`,
@@ -254,12 +353,16 @@ class TestWeightsCpuBackupArmedPredicate(unittest.TestCase):
 
     def test_an_empty_env_value_is_auto_not_a_refusal(self):
         """Absence must not read as a typo: unset/blank is the documented
-        default, not W107."""
+        default, not W107. Exercised on both an `auto` outcome of True (the
+        default arm) and of False (exchange + authoritative inject), so the
+        blank-is-auto behaviour is checked on both sides of the predicate,
+        not only on the side that happens to equal the pre-#1369 default."""
         from sglang.srt.weg2 import weight_exchange as wx
 
         with _arm(None), _backup_mode(None):
             self.assertIs(wx.weights_cpu_backup_armed(), True)
-        with _arm(wx.WEIGHT_SOURCE_EXCHANGE), _backup_mode(""):
+        with _arm(wx.WEIGHT_SOURCE_EXCHANGE), _inject(wx.INJECT_AUTHORITATIVE), \
+                _backup_mode(""):
             self.assertIs(wx.weights_cpu_backup_armed(), False)
 
     def test_explicit_overrides_the_environment_when_recognised(self):
@@ -333,8 +436,10 @@ class TestDangerDirectionIRingNeverOpensWhenDisarmed(unittest.TestCase):
     site in the whole vendored tree, and it sits inside the
     ``enable_cpu_backup`` guard of ``pause()``'s pass 1. An allocation whose
     ``enable_cpu_backup`` is False (which is what this ticket's Python-side
-    binding now produces for the weights region under an armed exchange)
-    never reaches this line, so it never opens the ring -- REGARDLESS of
+    binding now produces for the weights region under the one combination
+    ``weights_cpu_backup_armed()`` returns ``False`` for -- see that
+    function's own docstring for which one) never reaches this line, so it
+    never opens the ring -- REGARDLESS of
     whether some OTHER allocation elsewhere in the process has already done
     so (a shared singleton `ring_` does not un-gate a specific allocation's
     own guard, since the guard is checked per-allocation, before
