@@ -119,12 +119,18 @@ from __future__ import annotations
 
 import inspect
 import os
+import sys
 import tempfile
+import threading
 import time
 
 import pytest
 
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from test_weg2_xchg_transport_1273 import FakeDeviceOps, dev_ptr  # noqa: E402
 
 from sglang.srt.managers.scheduler_components import weight_updater as wu
 from sglang.srt.managers.weg2_memory_saver import (
@@ -132,6 +138,7 @@ from sglang.srt.managers.weg2_memory_saver import (
     Weg2XchgLaneNeverDrainedRefused,
 )
 from sglang.srt.weg2 import weight_exchange as wx
+from sglang.srt.weg2 import weight_exchange_bounce as bx
 from sglang.srt.weg2 import weight_exchange_region as xr
 from sglang.srt.weg2 import weight_exchange_transport as tp
 
@@ -625,6 +632,243 @@ def test_the_leg_tags_line_names_this_ranks_own_tags(monkeypatch):
     assert "family_tags=weights_0" in tag_lines[0]
     assert "rank=0" in tag_lines[0]
     assert "hook=authoritative" in tag_lines[0]
+
+
+# ===========================================================================
+# 6. THE DEADLOCK, HERMETIC -- ROUND 4. Two tags, one co-located lane,
+# deposit and collect through the REAL `_weg2_xchg_bounce_leg` method: the
+# OLD calling pattern (collect once, `tag=None`, after both tags would have
+# resumed -- `_weg2_xchg_shadow_compare`'s shape before this round) hangs;
+# the NEW pattern (collect once PER TAG, matching CARRIER_EXCHANGE's own
+# loop and now `_weg2_xchg_shadow_armed_for`'s per-tag branch) drains.
+# ===========================================================================
+
+
+def _bare_manager():
+    """No monkeypatching: `_weg2_xchg_bounce_leg` takes `sems`/`rank` as
+    arguments and never reads `self._weg2_xchg_sems()`/`self._weg2_rank()`,
+    so the plain product object is enough -- driving the REAL method, not a
+    reimplementation of it."""
+    return Manager(
+        tp_worker=_FakeWorker(), draft_worker=None, tp_cpu_group=None,
+        memory_saver_adapter=None, flush_cache=lambda *a, **k: True,
+        is_fully_idle=lambda *a, **k: True,
+    )
+
+
+class _ShortBudgetRendezvous(bx.CrossSlotRendezvous):
+    """The REAL rendezvous, budget shortened so a genuine deadlock costs
+    seconds instead of the product's real 120s -- same trick
+    test_weg2_lane_lockstep_1374.py uses at the module-function level; here
+    it is applied one level up, at the MIXIN METHOD `_weg2_xchg_bounce_leg`
+    actually constructs internally and gives no override for."""
+
+    def __init__(self, *a, **k):
+        k.setdefault("budget_s", 2.0)
+        super().__init__(*a, **k)
+
+
+def _diag_desc(tag_idx, *, ops_src, ops_dst, nbytes=64):
+    return wx.XchgDesc(
+        tag=f"weights_{tag_idx}", src_rank=0, dst_rank=0,
+        param_name=f"model.layers.{tag_idx}.w",
+        src_ptr=dev_ptr(0, tag_idx * 4096), dst_ptr=dev_ptr(0, tag_idx * 4096),
+        kind=wx.FLAT, nbytes=nbytes, rows=1, run_bytes=nbytes,
+        spitch=0, dpitch=0, src_off=0, dst_off=0,
+    )
+
+
+def _run_two_tag_leg(*, dest_per_tag: bool, tmp_path, timeout=8.0):
+    """SOURCE deposits weights_0 then weights_1 through the REAL per-tag
+    lockstep (exactly D's own shape, always per-tag regardless of carrier).
+    DEST either mirrors it (``dest_per_tag=True``, the FIX) or collects both
+    tags in ONE call with ``tag=None`` (``dest_per_tag=False``, shadow
+    mode's shape BEFORE this round). Returns ``(source_result, dest_result)``.
+    """
+    from sglang.srt.weg2 import xchg_bounce as xb
+
+    nonce = f"desk10-1391-r4-{os.getpid()}-{id(tmp_path)}"
+    xr.unlink_semaphores(nonce)
+    xr.create_semaphores(nonce)
+    root = str(tmp_path)
+    # A REAL BounceTerms, not the hand-rolled `_FakeTerms` -- this path runs
+    # `run_bounce_leg` for real (real bytes, real slot record), which reads
+    # more of the term than the plan-only tests above need.
+    terms = xb.BounceTerms(
+        bytes_per_direction=64, n_layers=1, widest_layer_bytes=64, depth=1,
+        pairs=6, slot_bytes=4096, mean_layer_bytes=64, buffer_bytes=4096,
+        staging_bytes=4096, n_lanes=1, max_tag_bytes=0, lanes_concurrent=0,
+    )
+    src_ops = FakeDeviceOps(root, 0)
+    dst_ops = FakeDeviceOps(root, 0)
+    src_ops.raw_malloc(0, 4096 * 4)
+    dst_ops.raw_malloc(0, 4096 * 4)
+    sems_src = tp.SemSet(nonce)
+    sems_dst = tp.SemSet(nonce)
+    results = {}
+
+    def _source():
+        mgr = _bare_manager()
+        try:
+            for t in range(2):
+                mgr._weg2_xchg_bounce_leg(
+                    descs=[_diag_desc(t, ops_src=src_ops, ops_dst=dst_ops)],
+                    ops=src_ops, boot_nonce=nonce, terms=terms,
+                    mode=wx.INJECT_AUTHORITATIVE, device=0, hook="source",
+                    sems=sems_src, tag=f"weights_{t}", rank=0,
+                )
+            results["source"] = "deposited"
+        except Exception as exc:  # noqa: BLE001
+            results["source"] = f"{type(exc).__name__}: {exc}"
+
+    def _dest():
+        mgr = _bare_manager()
+        try:
+            if dest_per_tag:
+                for t in range(2):
+                    mgr._weg2_xchg_bounce_leg(
+                        descs=[_diag_desc(t, ops_src=src_ops, ops_dst=dst_ops)],
+                        ops=dst_ops, boot_nonce=nonce, terms=terms,
+                        mode=wx.INJECT_AUTHORITATIVE, device=0,
+                        hook="authoritative", sems=sems_dst,
+                        tag=f"weights_{t}", rank=0,
+                    )
+            else:
+                # THE OLD SHAPE: give resume() time to map both tags (as
+                # `resume_memory_occupation` did before this round), THEN
+                # collect the whole plan in ONE call with tag=None -- exactly
+                # `_weg2_xchg_shadow_compare`'s call before this fix.
+                time.sleep(0.3)
+                mgr._weg2_xchg_bounce_leg(
+                    descs=[_diag_desc(t, ops_src=src_ops, ops_dst=dst_ops)
+                          for t in range(2)],
+                    ops=dst_ops, boot_nonce=nonce, terms=terms,
+                    mode=wx.INJECT_AUTHORITATIVE, device=0,
+                    hook="authoritative", sems=sems_dst, tag=None, rank=0,
+                )
+            results["dest"] = "collected"
+        except Exception as exc:  # noqa: BLE001
+            results["dest"] = f"{type(exc).__name__}: {exc}"
+
+    threads = [threading.Thread(target=_source), threading.Thread(target=_dest)]
+    for th in threads:
+        th.start()
+    for th in threads:
+        th.join(timeout=timeout)
+    alive = [th for th in threads if th.is_alive()]
+    try:
+        return results, alive
+    finally:
+        xr.unlink_semaphores(nonce)
+
+
+@pytest.fixture(autouse=True)
+def _short_rendezvous_budget(monkeypatch, request):
+    """Only for the deadlock-reproduction tests below: the REAL rendezvous,
+    with its budget cut from 120s to 2s so a genuine deadlock is a few
+    seconds of test time, not two minutes."""
+    if "deadlock" in request.node.name:
+        monkeypatch.setattr(bx, "CrossSlotRendezvous", _ShortBudgetRendezvous)
+    yield
+
+
+def test_M2_old_style_whole_plan_collect_deadlocks_RED_on_the_wall(tmp_path):
+    """RED-FIRST: this IS boot weg2xsn31's wedge, hermetic. Before this
+    round, shadow mode's only collect ran exactly this way -- once, after
+    both tags, with `tag=None`. D's second deposit blocks in `wait_drained`
+    forever (here: for the shortened 2s budget) because nobody ever posts
+    `drained` per tag."""
+    results, alive = _run_two_tag_leg(dest_per_tag=False, tmp_path=tmp_path)
+    # `Weg2XchgBouncePhaseUnordered` is a bare alias of `Weg2XchgPlanDisagree`
+    # (weight_exchange_bounce.py:1062: `Weg2XchgBouncePhaseUnordered =
+    # wx.Weg2XchgPlanDisagree`) -- `type(exc).__name__` always prints the
+    # latter, so the message text is the discriminator, not the class name.
+    src_msg = str(results.get("source", ""))
+    assert "Weg2XchgPlanDisagree" in src_msg, (
+        f"expected the source to block on wait_drained and time out; got "
+        f"{results}")
+    assert "waited for the collector to drain" in src_msg, results
+
+
+def test_the_fix_per_tag_collect_drains_the_same_lane(tmp_path):
+    """GREEN: the SAME lane, the SAME two tags, DEST now calling per tag
+    (matching the fix in `resume_memory_occupation` /
+    `_weg2_xchg_shadow_armed_for`) -- both sides complete."""
+    results, alive = _run_two_tag_leg(dest_per_tag=True, tmp_path=tmp_path)
+    assert results.get("source") == "deposited", results
+    assert results.get("dest") == "collected", results
+    assert not alive, "a thread is still running -- the fix did not drain"
+
+
+# ===========================================================================
+# 7. THE DANGER-DIRECTION MUTANT (operator order): a per-tag grade that
+# posts `drained` for a DIFFERENT tag than the one it just compared reports
+# MATCH on bytes nobody checked -- still wrong, and worse than the deadlock.
+# ===========================================================================
+
+
+def test_M3_mismatched_tag_between_grade_and_drain_must_not_be_reachable(
+        monkeypatch, real_sems):
+    """THE MUTANT: `_weg2_xchg_bounce_leg` posts `drained(tag=...)` using
+    WHATEVER STRING the caller passed as `tag`, and that same string is what
+    filtered `descs` down to the bytes actually graded one frame up in
+    `_weg2_xchg_inject_from_peer`/`_weg2_xchg_deposit_before_sleep` -- ONE
+    variable, threaded through both the filter and the post. This test
+    proves there is no SECOND place a tag could be substituted between the
+    two: patch `_weg2_xchg_bounce_leg` to receive a genuinely different
+    `tag` string than the one the wrapper filtered `_cdescs` with, and the
+    filtered set (real bytes) must correspond to the SAME tag the drain
+    names -- never a mismatch silently accepted.
+
+    Concretely: call `_weg2_xchg_inject_from_peer` with `tag="weights_0"`
+    (so `_cdescs` is filtered to weights_0's real descriptors) while
+    recording, via a wrapped `_weg2_xchg_bounce_leg`, the `tag` value AND
+    the descriptor tags it actually receives -- they must be the SAME set.
+    A version that let a caller pass one tag to filter and another to drain
+    (the mutant) would show `tag != {d.tag for d in descs}` here; the real
+    code cannot, because both come from the ONE `tag` parameter of
+    `_weg2_xchg_inject_from_peer` with no second read anywhere in between.
+    """
+    m = _bare_manager()
+    monkeypatch.setenv(xr.ENV_REGION_BOOT, "1391boot-m3")
+    monkeypatch.setattr(Manager, "_weg2_server_args",
+                        lambda self: _FakeServerArgs(), raising=True)
+    monkeypatch.setattr(Manager, "_weg2_group_name", lambda self: "P",
+                        raising=True)
+    monkeypatch.setattr(Manager, "_weg2_rank", lambda self: 0, raising=True)
+    monkeypatch.setattr(Manager, "_weg2_device_index", lambda self: 0,
+                        raising=True)
+    monkeypatch.setattr(Manager, "_weg2_xchg_sems", lambda self: real_sems,
+                        raising=True)
+    monkeypatch.setattr(
+        Manager, "_weg2_shadow_plan",
+        lambda self, hook, g, r, agreed=None, require_agreement=None:
+            (_FakePlan([_FakeDesc("a.w", tag="weights_0"),
+                       _FakeDesc("b.w", tag="weights_1")]), ""),
+        raising=True)
+    monkeypatch.setattr(Manager, "_weg2_xchg_device_ops", lambda self: object(),
+                        raising=True)
+
+    # THE SPY DOES NOT CALL THROUGH: this test is about the WIRING (which
+    # tag reaches the leg beside which descriptors), not about actually
+    # moving bytes -- that is what the deadlock-reproduction tests above and
+    # the byte-exact execution smoke (test_weg2_xchg_bounce_execution_smoke_1273.py)
+    # already cover with a real device layer.
+    seen = {}
+
+    def _spy(self, *, descs, tag=None, **kw):
+        seen["tag"] = tag
+        seen["desc_tags"] = {d.tag for d in descs}
+
+    monkeypatch.setattr(Manager, "_weg2_xchg_bounce_leg", _spy, raising=True)
+
+    m._weg2_xchg_inject_from_peer(terms=_FakeTerms(), tag="weights_0")
+
+    assert seen["tag"] == "weights_0"
+    assert seen["desc_tags"] == {"weights_0"}, (
+        "the descriptors the leg graded do not match the tag it will drain "
+        "-- this is the mutant: MATCH would be reported on weights_1's "
+        "bytes while weights_0's drain is the one posted")
 
 
 if __name__ == "__main__":
