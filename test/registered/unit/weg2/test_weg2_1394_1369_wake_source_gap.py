@@ -460,6 +460,89 @@ def test_M_removing_the_gap_check_lets_a_sourceless_tag_pass_silently(
         "fails, re-check the mutant is actually wired to the call path")
 
 
+# ===========================================================================
+# 5. DESK12's find (2026-09-14, relayed by the coordinator): `main_carried`
+# in `_weg2_wake_weight_carrier` used to read the RAW
+# `server_args.enable_weights_cpu_backup` bit -- always True, the launcher
+# sets it unconditionally (launcher.py:2702) -- instead of the PREDICATE
+# `weights_cpu_backup_armed()`. This is an INDEPENDENT defect from W106
+# above, not a second instance of it: W106 refuses at the SLEEP leg, and
+# ONLY for a tag whose exchange is armed at all
+# (`_weg2_xchg_deposit_before_sleep` returns immediately at :1080-1081 when
+# `not wx.exchange_armed()` -- ring mode was never W106's half to guard).
+# `--weg2-weights-cpu-backup off` under plain `ring` mode (no exchange at
+# all) is therefore NOT caught by W106 -- and the flag-vs-predicate bug
+# below is exactly what would have made the wake pick `CARRIER_TMS_BACKUP`
+# ("the TMS restore already carried the bytes") for a tag nothing backed
+# up, silently, at the WAKE side. The fix is a different mechanism
+# (correct wake ROUTING, not a refusal): reading the predicate makes the
+# same wake fall through to `CARRIER_DISK` instead -- the checkpoint on
+# disk, the user's own "das ist das Netz" -- which is a genuine, always-
+# available, always-correct source, so no new W-code is needed here: there
+# is nothing left to refuse once the routing is honest.
+# ===========================================================================
+
+
+def test_main_carried_reads_the_predicate_not_the_raw_flag(
+        monkeypatch, exchange_armed, authoritative, ring_off_explicit):
+    """The exact divergence DESK12 named: flag SET (True, as the launcher
+    always sets it) + predicate FALSE (explicit `off`) must make
+    `main_carried` FALSE too, not True. Proven here from the OUTSIDE: force
+    `exchange_armed()`/`inject_authoritative()` to read False downstream of
+    the try-block's own early return by using `ring` weight-source instead,
+    so the only thing this call can be deciding is the `main_carried`
+    fallback at the end of `_weg2_wake_weight_carrier`."""
+    monkeypatch.delenv(wx.WEIGHT_SOURCE_ENV, raising=False)  # ring, not exchange
+    assert wx.exchange_armed() is False
+    args = _FakeServerArgs()
+    assert args.enable_weights_cpu_backup is True  # the raw bit: always set
+    m = _manager(monkeypatch, server_args=args)
+    carrier = m._weg2_wake_weight_carrier()
+    assert carrier == Manager.CARRIER_DISK, (
+        f"expected the honest disk fallback for a tag the explicit `off` "
+        f"kill switch leaves genuinely unbacked, got {carrier!r} -- a "
+        f"`tms-backup` answer here means main_carried read the raw flag "
+        f"again and this rank would silently serve undefined VRAM")
+
+
+def test_main_carried_still_true_when_ring_genuinely_armed(
+        monkeypatch, ring_on):
+    """Sanity companion: the fix must not flip the ANSWER for the ordinary
+    case, only its SOURCE. `on` (or plain unarmed-exchange `auto`) still
+    carries via the ring."""
+    monkeypatch.delenv(wx.WEIGHT_SOURCE_ENV, raising=False)
+    args = _FakeServerArgs()
+    m = _manager(monkeypatch, server_args=args)
+    assert m._weg2_wake_weight_carrier() == Manager.CARRIER_TMS_BACKUP
+
+
+def test_M_main_carried_reading_the_raw_flag_again_hides_the_gap(
+        monkeypatch, exchange_armed, authoritative, ring_off_explicit):
+    """THE DANGER-DIRECTION MUTANT (coordinator order): revert the read to
+    the raw flag DESK12 found, and show the wake then silently picks
+    `tms-backup` for a tag the explicit `off` kill switch left genuinely
+    unbacked -- exactly the still-wrong-weights shape neither W106 nor this
+    fix may let through. This test passes ONLY because it asserts the
+    UNSAFE, mutated answer on purpose, to prove the real fix (the test
+    above) is what stands between this and the silent misroute."""
+    monkeypatch.delenv(wx.WEIGHT_SOURCE_ENV, raising=False)
+    args = _FakeServerArgs()
+    m = _manager(monkeypatch, server_args=args)
+    # THE MUTATION: back to the pre-fix read.
+    monkeypatch.setattr(
+        wx, "weights_cpu_backup_armed",
+        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("mutated out")),
+        raising=True)
+    # With the predicate call itself made to raise, the code's own
+    # exception fallback (documented alongside the fix) reverts to the raw
+    # flag -- reproducing DESK12's exact defect shape for this assertion.
+    carrier = m._weg2_wake_weight_carrier()
+    assert carrier == Manager.CARRIER_TMS_BACKUP, (
+        "the mutant should reproduce DESK12's silent misroute (tms-backup "
+        "chosen for a tag nothing backed up) -- if this assertion fails, "
+        "the mutant is not wired to the code path it claims to be")
+
+
 if __name__ == "__main__":
     import unittest
 
