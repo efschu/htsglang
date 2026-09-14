@@ -70,14 +70,64 @@ if REPO_PYTHON not in sys.path:
     sys.path.insert(0, REPO_PYTHON)
 
 
-def load_dumps(dump_dir: str) -> List[dict]:
+def _discover_boot_subdirs(dump_dir: str) -> List[str]:
+    """Immediate subdirectories of ``dump_dir`` that hold at least one dump --
+    i.e. every boot's own subdirectory #1395 now writes under, so a caller
+    who ran ``ingest`` with no ``--boot-token`` can be told they exist rather
+    than silently reading the (possibly empty, possibly stale) flat root."""
+    out = []
+    try:
+        for name in sorted(os.listdir(dump_dir)):
+            sub = os.path.join(dump_dir, name)
+            if os.path.isdir(sub) and glob.glob(
+                os.path.join(sub, "phase_footprint_*rank*.json")
+            ):
+                out.append(name)
+    except OSError:
+        pass
+    return out
+
+
+def load_dumps(dump_dir: str, boot_token: Optional[str] = None) -> List[dict]:
     # FIX #1292: the pattern used to be "phase_footprint_rank*.json". It now
     # also matches the group-qualified shape "phase_footprint_P_rank0.json"
     # / "phase_footprint_D_rank0.json" that
     # sglang.srt.mem_ledger.activation_probe.dump_filename() writes, so a
     # directory holding both Weg-2 groups' dumps is read whole rather than
     # half-ignored.
+    #
+    # FIX #1395: dumps now live under <dump_dir>/<_boot_subdir(token)>/, never
+    # under <dump_dir> directly (see activation_probe.write_footprint_dump).
+    # A caller who names a `boot_token` gets EXACTLY that boot's subdirectory
+    # or an honest, named EMPTY result -- never a silent fall-through to
+    # another boot's dumps sitting in a sibling subdirectory or at the flat
+    # root, which is precisely the "reader serves the newest FOREIGN boot's
+    # dump" shape that cost #1389 a calibration case. A caller who names none
+    # keeps the pre-#1395 flat-root read, byte-identical, for old dumps and
+    # for callers who deliberately do not care which boot -- but is told, by
+    # name, when boot-tagged subdirectories exist and were NOT read.
+    from sglang.srt.mem_ledger.activation_probe import _boot_subdir
+
     out = []
+    if boot_token is not None:
+        sub = os.path.join(dump_dir, _boot_subdir(boot_token))
+        pattern = os.path.join(sub, "phase_footprint_*rank*.json")
+        matches = sorted(glob.glob(pattern))
+        if not matches:
+            print(
+                f"NO dumps for boot_token={boot_token!r} under {sub} -- "
+                "reporting this as an absence, never substituting another "
+                "boot's dump. Available boot subdirectories under "
+                f"{dump_dir}: {_discover_boot_subdirs(dump_dir) or '(none)'}"
+            )
+        for path in matches:
+            try:
+                with open(path) as f:
+                    out.append(json.load(f))
+            except (OSError, ValueError) as e:
+                print(f"  skipping unreadable dump {path}: {e}")
+        return out
+
     pattern = os.path.join(dump_dir, "phase_footprint_*rank*.json")
     for path in sorted(glob.glob(pattern)):
         try:
@@ -85,6 +135,14 @@ def load_dumps(dump_dir: str) -> List[dict]:
                 out.append(json.load(f))
         except (OSError, ValueError) as e:
             print(f"  skipping unreadable dump {path}: {e}")
+    subdirs = _discover_boot_subdirs(dump_dir)
+    if subdirs:
+        print(
+            f"NOTE: {len(subdirs)} boot-tagged subdirectory(ies) under "
+            f"{dump_dir} were NOT read (no --boot-token given): "
+            f"{subdirs}. Pass --boot-token to read one specific boot's "
+            "dumps instead of this directory's flat, pre-#1395 root."
+        )
     return out
 
 
@@ -186,16 +244,27 @@ def _ingest_one_group(
     return 0
 
 
-def ingest(dump_dir: str, cache_dir: Optional[str] = None) -> int:
+def ingest(
+    dump_dir: str, cache_dir: Optional[str] = None,
+    boot_token: Optional[str] = None,
+) -> int:
     from sglang.srt.mem_ledger.activation import profile_digest_from_canonical
 
-    dumps = load_dumps(dump_dir)
+    dumps = load_dumps(dump_dir, boot_token=boot_token)
     if not dumps:
-        print(
-            f"No rank dumps in {dump_dir}. Boot the recipe with "
-            "SGLANG_PHASE_FOOTPRINT_DUMP set to that directory, drive a "
-            "representative prefill, then re-run ingest."
-        )
+        if boot_token is not None:
+            print(
+                f"No rank dumps for boot_token={boot_token!r} in {dump_dir} "
+                "-- REFUSING to substitute another boot's dumps (#1395). "
+                "Re-run without --boot-token to list what IS there, or "
+                "confirm the token against the boot's own log."
+            )
+        else:
+            print(
+                f"No rank dumps in {dump_dir}. Boot the recipe with "
+                "SGLANG_PHASE_FOOTPRINT_DUMP set to that directory, drive a "
+                "representative prefill, then re-run ingest."
+            )
         return 1
 
     # FIX #1292: group by profile digest instead of refusing the whole
@@ -253,13 +322,22 @@ def main(argv=None) -> int:
     p_ing = sub.add_parser("ingest", help="Fold per-rank dumps into the cache.")
     p_ing.add_argument("--dump-dir", required=True)
     p_ing.add_argument("--cache-dir", default=None)
+    p_ing.add_argument(
+        "--boot-token", default=None,
+        help="#1395: read exactly this boot's dumps (the "
+             "\"<tag>:<epoch>:<pid>\" value the boot's own dump paths carry, "
+             "e.g. printed in the boot log or in the dump directory's own "
+             "subdirectory names). Omit to read the pre-#1395 flat root "
+             "(and be told, by name, which boot-tagged subdirectories exist "
+             "and were NOT read).",
+    )
 
     p_show = sub.add_parser("show", help="Print the shipped reference bounds.")
     p_show.add_argument("--cache-dir", default=None)
 
     args = parser.parse_args(argv)
     if args.cmd == "ingest":
-        return ingest(args.dump_dir, args.cache_dir)
+        return ingest(args.dump_dir, args.cache_dir, boot_token=args.boot_token)
     return show(args.cache_dir)
 
 

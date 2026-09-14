@@ -330,9 +330,15 @@ def test_armed_hooks_record_capture_and_activation_peak(monkeypatch, tmp_path):
 
 
 def load_dumps_dir(d):
+    # #1395: dumps now live one level down, under
+    # <d>/<_boot_subdir(boot_token)>/phase_footprint_*.json -- walked here
+    # rather than globbed flat, because this helper's callers care about
+    # THIS test's own dump surviving, not about boot-token isolation
+    # (which test_activation_probe_boot_identity_1395.py pins directly).
     out = []
-    for name in sorted(os.listdir(str(d))):
-        if name.startswith("phase_footprint_rank") and name.endswith(".json"):
-            with open(os.path.join(str(d), name)) as f:
-                out.append(json.load(f))
+    for root, _dirs, names in os.walk(str(d)):
+        for name in sorted(names):
+            if name.startswith("phase_footprint_rank") and name.endswith(".json"):
+                with open(os.path.join(root, name)) as f:
+                    out.append(json.load(f))
     return out

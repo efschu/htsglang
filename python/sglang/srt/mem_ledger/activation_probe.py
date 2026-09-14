@@ -30,6 +30,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import time
 from typing import Optional
 
 logger = logging.getLogger(__name__)
@@ -40,6 +41,7 @@ __all__ = [
     "reset_peaks",
     "read_peaks",
     "dump_filename",
+    "boot_token",
     "write_footprint_dump",
     "note_capture_begin",
     "note_capture_end",
@@ -113,9 +115,121 @@ def dump_filename(rank: int, group: str = "") -> str:
     ``weg2_memory_saver.weg2_group_name()``). Outside Weg-2 that group is
     ``""`` and the filename is byte-identical to the pre-fix shape, so a
     single-regime boot is unaffected.
+
+    NAMES ONLY GROUP+RANK, DELIBERATELY -- NOT THE BOOT. #1292 fixed the P-vs-D
+    collision within one boot; it never gave the boot itself an identity, so
+    two boots of the SAME form (P and D unchanged, same rank, same group)
+    still collide on this exact filename and the later boot silently destroys
+    the earlier one's dump -- boot weg2xsn31/8's own dump, proven written by
+    its boot log (03:21:36Z, PP0, legs=0) and gone from disk by the time
+    #1389 needed it. See :func:`boot_token` / :func:`_boot_subdir`: the boot
+    goes into the DIRECTORY, this filename stays exactly as it was so every
+    existing reader of ONE boot's own dumps keeps working unchanged.
     """
     tag = f"{group}_" if group else ""
     return f"phase_footprint_{tag}rank{rank}.json"
+
+
+#: Captured once, at import -- i.e. once per REAL PROCESS, which for Weg-2 is
+#: once per real boot attempt of this rank (boots never run concurrently on
+#: this rig, per the standing arbitration rule, so two attempts of the
+#: identical ``--tag`` are two SEPARATE, SEQUENTIAL processes with two
+#: different import times). This needs no cross-rank agreement: the
+#: collision this fixes is "same rank+group, different BOOT", never "two
+#: ranks of the same boot disagreeing" -- #1292's own group tag already
+#: settled that half.
+#:
+#: NOT PER-PROCESS, DELIBERATELY: an earlier draft of this function derived
+#: its own token from THIS process's own start time. That is wrong -- P and D
+#: are separate OS processes with different PIDs and different start times
+#: for the SAME real boot, so two independently-derived per-process tokens
+#: would scatter one boot's own dumps across two boot-subdirectories, which
+#: breaks the #1292 "P and D share one dump directory, ingest reads both"
+#: reading this exact module's ``ingest`` groups by profile digest for. The
+#: token has to be computed ONCE, by the ONE process that spawns both groups,
+#: and handed down -- see :data:`BOOT_TOKEN_ENV`.
+_PROCESS_START_EPOCH: int = int(time.time())
+_boot_token_cache: Optional[str] = None
+
+#: #1395: published UNCONDITIONALLY by ``weg2/launcher.py build_env``
+#: (``weg2_boot_token(ns)``, memoised on the launcher's own namespace so
+#: BOTH groups' ranks inherit the identical value). Safe to always publish,
+#: unlike ``SGLANG_WEG2_LANE_COVERAGE_TOKEN``: this value decides nothing
+#: and arms nothing by existing, it only names which boot a rank belongs to.
+BOOT_TOKEN_ENV = "SGLANG_WEG2_BOOT_TOKEN"
+
+
+def _boot_tag_from_env() -> str:
+    """The human-readable ``--tag`` this rank's boot ran under, or ``""``.
+
+    Used only by the FALLBACK path in :func:`boot_token` (no
+    :data:`BOOT_TOKEN_ENV` -- outside Weg-2, or a tree older than #1395).
+    ``SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR`` is published to every Weg-2
+    rank UNCONDITIONALLY (``weg2/launcher.py build_env``, "R19 shape...
+    written unconditionally"), and its value is
+    ``f"{STORE_ROOT}/{tag}"`` (``weg2/launcher.py plan_store``) -- the
+    basename IS the tag. Empty outside Weg-2, where this probe's own module
+    docstring says the group is also empty.
+    """
+    store_dir = os.environ.get("SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR", "")
+    return os.path.basename(store_dir.rstrip("/")) if store_dir else ""
+
+
+def boot_token() -> str:
+    """``"<tag>:<epoch>:<pid>"`` -- THE #1348 SHAPE, reused rather than a
+    second one invented for this module.
+
+    Memoised per PROCESS (module-level cache): every call within one rank's
+    lifetime -- ``note_capture_begin``, ``note_capture_end``,
+    ``record_prefill_peak``'s (potentially many) rewrites -- must return the
+    SAME token, or the rank's own dumps would scatter across several
+    boot-subdirectories of their own single boot.
+
+    READS :data:`BOOT_TOKEN_ENV` FIRST -- the launcher's own, ONE token,
+    computed once and shared by every rank of BOTH groups (see the module
+    note above :data:`_PROCESS_START_EPOCH` for why a per-process fallback
+    alone would be wrong). Only when that variable is absent (outside
+    Weg-2, or a launcher older than #1395) does this derive its own
+    per-process token from :func:`_boot_tag_from_env` -- correct there
+    because there is no sibling process to disagree with.
+    """
+    global _boot_token_cache
+    if _boot_token_cache is None:
+        _boot_token_cache = os.environ.get(BOOT_TOKEN_ENV, "") or (
+            f"{_boot_tag_from_env() or 'notag'}:{_PROCESS_START_EPOCH}:"
+            f"{os.getpid()}"
+        )
+    return _boot_token_cache
+
+
+def _boot_subdir(token: str) -> str:
+    """A filesystem-safe, per-boot directory name from :func:`boot_token`.
+
+    IDENTICAL SHAPE to ``weg2.lane_coverage._boot_subdir`` (#1395) --
+    extended here rather than reinvented: ``:`` becomes ``_`` (unsafe on some
+    filesystems, reads as a path separator to some tools), and an empty
+    token -- a caller that could not resolve one at all -- gets its own
+    named fallback rather than collapsing to the un-namespaced directory,
+    which would reintroduce exactly the collision this function removes for
+    the one caller that never got a token.
+    """
+    if not token:
+        return "no-boot-token"
+    return token.replace(":", "_").replace("/", "_").replace(os.sep, "_")
+
+
+def _read_boot_token(path: str) -> Optional[str]:
+    """The ``boot_token`` field of an existing dump at ``path``, or ``None``
+    when it cannot be read -- an unreadable existing file is reported as
+    such, never silently treated as "no collision"."""
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return json.load(fh).get("boot_token")
+    except (OSError, ValueError):
+        return None
+
+
+BOOT_COLLISION_CODE = "W109 Weg2PhaseFootprintBootCollision"
 
 
 def write_footprint_dump(
@@ -131,6 +245,7 @@ def write_footprint_dump(
     dump_dir: Optional[str] = None,
     peak_floor_bytes: Optional[int] = None,
     group: str = "",
+    boot_token_override: str = "",
 ) -> Optional[str]:
     """Write this rank's dump. One file per rank, so no collective is needed
     and a rank that dies mid-run simply contributes nothing.
@@ -156,6 +271,23 @@ def write_footprint_dump(
     collision, and a same-group, same-profile rewrite (the normal
     keep-the-running-peak path in :func:`record_prefill_peak`) is
     unaffected because the digest then matches.
+
+    #1395 (the sibling of #1292's own gap): the write now lands under
+    ``<directory>/<_boot_subdir(token)>/<dump_filename(rank, group)>``, never
+    under ``directory`` directly, so a SECOND boot of the identical form
+    (same group, same rank, same profile digest -- W18 above cannot see this
+    axis at all) writes to a DIFFERENT subdirectory instead of destroying the
+    first boot's dump. ``boot_token_override`` lets a caller that already
+    knows the boot's own token (or a test) supply it directly; the default
+    (empty) resolves through :func:`boot_token`, memoised per process so
+    every rewrite of THIS rank's dump across one boot's lifetime lands in the
+    SAME subdirectory. Defense in depth, matching #1292's own W18 shape one
+    axis over (:data:`BOOT_COLLISION_CODE`): even within one subdirectory, a
+    write that would overwrite an EXISTING file carrying a DIFFERENT
+    ``boot_token`` is refused by name rather than silently replaced -- this
+    can only fire if two distinct tokens sanitise to the identical directory
+    name, or a caller passes an ``boot_token_override`` that collides with
+    another boot's by construction.
     """
     directory = dump_dir or os.environ.get(DUMP_ENV)
     if not directory:
@@ -166,10 +298,31 @@ def write_footprint_dump(
     from sglang.srt.mem_ledger.activation import profile_digest_from_canonical
 
     digest = profile_digest_from_canonical(profile_canonical)
+    token = boot_token_override or boot_token()
     try:
-        os.makedirs(directory, exist_ok=True)
-        path = os.path.join(directory, dump_filename(rank, group))
+        boot_dir = os.path.join(directory, _boot_subdir(token))
+        os.makedirs(boot_dir, exist_ok=True)
+        path = os.path.join(boot_dir, dump_filename(rank, group))
         if os.path.exists(path):
+            existing_token = _read_boot_token(path)
+            if existing_token is not None and existing_token != token:
+                # DEFENSE IN DEPTH (#1395): with per-boot subdirectories this
+                # can only fire if two DIFFERENT tokens sanitise to the SAME
+                # directory name -- named and refused rather than silently
+                # overwritten, the same shape #1292's own W18 uses for a
+                # differing profile digest, except on the axis W18 cannot see
+                # (two boots of the SAME form share one digest).
+                logger.warning(
+                    "%s PHASE-FOOTPRINT REFUSED to overwrite %s (group=%r "
+                    "rank=%d): existing boot_token %r does not match this "
+                    "write's %r. Two boot tokens collided on one directory "
+                    "name instead of writing to distinct subdirectories -- "
+                    "refusing rather than destroying the earlier boot's "
+                    "evidence.",
+                    BOOT_COLLISION_CODE, path, group, rank,
+                    existing_token, token,
+                )
+                return None
             existing_digest = None
             try:
                 with open(path) as f:
@@ -197,6 +350,7 @@ def write_footprint_dump(
         payload = {
             "rank": rank,
             "group": group,
+            "boot_token": token,
             "card_uuid": card_uuid,
             "hw_fingerprint": hw_fingerprint,
             "profile": profile_canonical,
