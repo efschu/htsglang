@@ -155,9 +155,76 @@ class _Stub:
     _weg2_join_src_addr = wu.SchedulerWeightUpdaterManager._weg2_join_src_addr
     _weg2_join_dst_addr = wu.SchedulerWeightUpdaterManager._weg2_join_dst_addr
     _weg2_shadow_plan = wu.SchedulerWeightUpdaterManager._weg2_shadow_plan
+    # #1363 ROUND 2 (2026-09-14): BORROWED, NOT RE-IMPLEMENTED -- same
+    # doctrine as the four names above, and the coordinator's own question
+    # ("neutral answer, or honest refuse?") has a THIRD answer this file
+    # already committed to: run the real code. `_weg2_xchg_draft_plan_or_none`
+    # (added by #1394, weight_updater.py:2952) is called directly from
+    # `_weg2_shadow_plan` -- `test_weg2_1363_smoke_stub_drift.py`'s ratchet
+    # is what FOUND this gap, red-first, against train tip 35e4924369. A
+    # hand-written neutral stub ("always return no draft plan") would be a
+    # SECOND, hand-maintained copy of exactly the judgement call
+    # `_weg2_xchg_draft_plan_or_none` already makes for itself -- and #1394's
+    # own body already answers "no draft worker in this process" gracefully
+    # (`getattr(self, "draft_worker", None)`, `return None, ""` -- never an
+    # exception), which is EXACTLY the state a `_Stub` instance is in (it
+    # never sets `draft_worker` at all). Borrowing the real method therefore
+    # costs nothing here and keeps the file's own stated rule intact: "what
+    # runs here is byte-for-byte the code the flip leg runs."
+    _weg2_xchg_draft_plan_or_none = (
+        wu.SchedulerWeightUpdaterManager._weg2_xchg_draft_plan_or_none)
 
     def __init__(self, model):
         self.tp_worker = _Worker(model)
+
+
+class _LegStub:
+    """Borrows the REAL `_weg2_xchg_bounce_leg` -- the section [4] driver.
+
+    #1363 ROUND 2: hoisted to module level (was a local class inside
+    `main()`) so `test_weg2_1363_smoke_stub_drift.py` can import and audit
+    it without re-running the whole smoke. No behaviour change -- the class
+    body is unchanged, only its scope.
+    """
+
+    _weg2_xchg_bounce_leg = wu.SchedulerWeightUpdaterManager._weg2_xchg_bounce_leg
+
+
+class _Sems:
+    """The FAKE semaphore set section [4] drives `_weg2_xchg_bounce_leg`
+    with -- #1363 ROUND 2: hoisted to module level, same reason as
+    `_LegStub` (no behaviour change)."""
+
+    def timedwait(self, *a, **k):
+        return True
+
+    def post(self, *a, **k):
+        pass
+
+    def diagonal_timedwait(self, *a, **k):
+        return True
+
+    def diagonal_post(self, *a, **k):
+        pass
+
+
+class _Region:
+    """The FAKE region double -- #1363 ROUND 2: hoisted to module level
+    (was a local class inside `main()`, with `boot_nonce` set as a bare
+    class attribute closing over `main()`'s local `SMOKE_NONCE`). Now an
+    explicit constructor argument instead of a closure, so the class can
+    live at module scope; every call site passes its own nonce."""
+
+    def __init__(self, boot_nonce: str):
+        self.boot_nonce = boot_nonce
+
+    def publish(self, *a, **k):
+        pass
+
+    def read_slot(self, pair, slot):
+        class _R:
+            bytes_filled = 0
+        return _R()
 
 
 def main() -> int:
@@ -291,34 +358,8 @@ def main() -> int:
             _wb.refuse_if_plan_exceeds_slot(WIDEST_LAYER_BYTES, descs)
             return None
 
-        class _LegStub:
-            _weg2_xchg_bounce_leg = (
-                wu.SchedulerWeightUpdaterManager._weg2_xchg_bounce_leg)
-
-        class _Sems:
-            def timedwait(self, *a, **k):
-                return True
-
-            def post(self, *a, **k):
-                pass
-
-            def diagonal_timedwait(self, *a, **k):
-                return True
-
-            def diagonal_post(self, *a, **k):
-                pass
-
-        class _Region:
-            boot_nonce = SMOKE_NONCE
-
-            def publish(self, *a, **k):
-                pass
-
-            def read_slot(self, pair, slot):
-                class _R:
-                    bytes_filled = 0
-                return _R()
-
+        # _LegStub, _Sems, _Region: module-level now (#1363 round 2), see
+        # their own docstrings above.
         _wb.run_bounce_leg = _record
         try:
             for hook, group in (("source", "P"), ("destination", "D")):
@@ -332,7 +373,7 @@ def main() -> int:
                         boot_nonce=SMOKE_NONCE,
                         slot_bytes=WIDEST_LAYER_BYTES, depth=1,
                         mode=wx.INJECT_AUTHORITATIVE, hook=hook,
-                        region=_Region(), sems=_Sems())
+                        region=_Region(SMOKE_NONCE), sems=_Sems())
                     ok, why = True, ""
                 except BaseException as exc:  # noqa: BLE001
                     ok, why = False, f"{type(exc).__name__}: {exc}"
