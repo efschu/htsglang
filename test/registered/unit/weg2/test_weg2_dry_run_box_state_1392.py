@@ -46,9 +46,41 @@ import os
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 
 import inspect
+import sys
+import tempfile
+import unittest
+from unittest import mock
 
+from sglang.srt.registry import nvml as nvml_registry
 from sglang.srt.weg2 import host_ledger as hl
+from sglang.srt.weg2 import launcher
 from sglang.test.test_utils import CustomTestCase
+
+# Coordinator order 2026-09-14: prior-art gate first, reuse rather than a
+# second hermetic harness for the identical seam. `_HermeticMainBase` (#1390)
+# already isolates SHM_DIR/MEMINFO_PATH/CGROUP_ROOT and runs `launcher.main`
+# for real; `_fake_quiet_host` is the pinned quiet-box reading. Both live in
+# test_weg2_hicache_disabled_1386.py, one file over -- imported, not
+# reimplemented, the same convention test_weg2_band_credit_1397.py already
+# uses for a sibling test module's fixture (its own explicit sys.path.insert,
+# needed because this directory carries an __init__.py and a bare top-level
+# import would otherwise only resolve when some earlier-collected test
+# happened to import the sibling module first).
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from test_weg2_hicache_disabled_1386 import (  # noqa: E402
+    _HermeticMainBase,
+    _NEEDS_CHECKPOINT,
+    _NVML_REPLAY_JSON,
+    _QUIET_CG_ANON_B,
+    _QUIET_CG_FILE_B,
+    _QUIET_CG_SHMEM_B,
+    _QUIET_CG_SLAB_RECLAIM_B,
+    _QUIET_CG_UNEVICTABLE_B,
+    _QUIET_MEMAVAIL_KB,
+    _QUIET_MEMTOTAL_KB,
+    _main_argv,
+)
 
 GIB = hl.GIB
 
@@ -263,6 +295,188 @@ class TheLauncherThreadsTheThreeReadingsThrough(CustomTestCase):
                 else self.assertEqual(sig.parameters[name].default, "")
 
 
+# ---------------------------------------------------------------------------
+# END-TO-END, per the coordinator's 2026-09-14 order: not `host_ledger.choose`
+# called directly, but `launcher.main(['--dry-run', ...])` through the REAL
+# wiring, using #1390's own `_HermeticMainBase` / quiet-box fixture rather
+# than a second hermetic harness for the identical seam.
+# ---------------------------------------------------------------------------
+
+
+def _fake_loaded_host(tmp: str) -> tuple:
+    """The IDENTICAL quiet-box reading `_fake_quiet_host` writes, except
+    `memory.current` (and `memory.peak`, read the same way) pushed to
+    QUIET_BASELINE_CG_CURRENT_GIB + FOREIGN_LOAD_PROVISIONAL_THRESHOLD_GIB
+    + 1 GiB -- one GiB PAST the threshold #1392's PROVISIONAL text keys on,
+    never AT it (the ARM-line's own comparison is a strict ``>``). Every
+    other reading (MemAvailable, anon/file/shmem/unevictable/slab) is
+    UNCHANGED from the quiet fixture: this isolates the ONE axis under test.
+    """
+    loaded_current_b = int(
+        (hl.QUIET_BASELINE_CG_CURRENT_GIB
+         + hl.FOREIGN_LOAD_PROVISIONAL_THRESHOLD_GIB + 1.0) * GIB
+    )
+    meminfo = os.path.join(tmp, "meminfo")
+    with open(meminfo, "w") as f:
+        f.write(
+            f"MemTotal:       {_QUIET_MEMTOTAL_KB} kB\n"
+            f"MemFree:        110046680 kB\n"
+            f"MemAvailable:   {_QUIET_MEMAVAIL_KB} kB\n"
+            f"Shmem:          {_QUIET_CG_SHMEM_B // 1024} kB\n"
+            f"SwapTotal:      0 kB\n"
+        )
+    cg = os.path.join(tmp, "cgroup")
+    os.makedirs(cg, exist_ok=True)
+    with open(os.path.join(cg, "memory.current"), "w") as f:
+        f.write(f"{loaded_current_b}\n")
+    with open(os.path.join(cg, "memory.peak"), "w") as f:
+        f.write(f"{loaded_current_b}\n")
+    with open(os.path.join(cg, "memory.max"), "w") as f:
+        f.write("max\n")
+    with open(os.path.join(cg, "memory.events"), "w") as f:
+        f.write("low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\n")
+    with open(os.path.join(cg, "memory.stat"), "w") as f:
+        f.write(
+            f"anon {_QUIET_CG_ANON_B}\n"
+            f"file {_QUIET_CG_FILE_B}\n"
+            f"shmem {_QUIET_CG_SHMEM_B}\n"
+            f"unevictable {_QUIET_CG_UNEVICTABLE_B}\n"
+            f"slab_reclaimable {_QUIET_CG_SLAB_RECLAIM_B}\n"
+        )
+    return meminfo, cg
+
+
+class _HermeticMainBaseLoaded(unittest.TestCase):
+    """SAME isolation as `_HermeticMainBase` (#1390: replayed NVML cards, a
+    private guaranteed-empty SHM_DIR) -- the ONE difference is the host
+    reading: `_fake_loaded_host` instead of `_fake_quiet_host`, which is the
+    whole point (the OTHER half of the asymmetry #1392 exists to make
+    visible). Not a subclass of `_HermeticMainBase` overriding `setUp`,
+    because that would run the quiet fixture first and the loaded one
+    second, leaving two live mock.patch layers active at once."""
+
+    def setUp(self):
+        super().setUp()
+        self._old_replay_env = os.environ.get(nvml_registry.ENV_NVML_REPLAY)
+        os.environ[nvml_registry.ENV_NVML_REPLAY] = _NVML_REPLAY_JSON
+        self._shm_tmp = tempfile.mkdtemp(prefix="weg2-1392-empty-shm-")
+        self._shm_patch = mock.patch.object(launcher, "SHM_DIR", self._shm_tmp)
+        self._shm_patch.start()
+        self._host_tmp = tempfile.mkdtemp(prefix="weg2-1392-loaded-host-")
+        meminfo, cg = _fake_loaded_host(self._host_tmp)
+        self._meminfo_patch = mock.patch.object(launcher, "MEMINFO_PATH", meminfo)
+        self._cgroup_patch = mock.patch.object(launcher, "CGROUP_ROOT", cg)
+        self._meminfo_patch.start()
+        self._cgroup_patch.start()
+
+    def tearDown(self):
+        self._cgroup_patch.stop()
+        self._meminfo_patch.stop()
+        self._shm_patch.stop()
+        if self._old_replay_env is None:
+            os.environ.pop(nvml_registry.ENV_NVML_REPLAY, None)
+        else:
+            os.environ[nvml_registry.ENV_NVML_REPLAY] = self._old_replay_env
+        super().tearDown()
+
+    def run_main(self, argv):
+        import io
+        from contextlib import redirect_stdout
+
+        buf = io.StringIO()
+        rc = None
+        exc = None
+        try:
+            with redirect_stdout(buf):
+                rc = launcher.main(argv)
+        except Exception as e:  # the refusal path raises rather than returning
+            exc = e
+        return rc, buf.getvalue(), exc
+
+
+def _box_state_line_from_stdout(out: str) -> str:
+    # NOT startswith: `main()`'s own logger prefixes every line with
+    # "[<timestamp>] WEG2-LAUNCH " before the marker -- the SAME reason
+    # `_box_state_line` (the direct host_ledger.choose() helper above) does
+    # not need this, because `choose()`'s own returned `lines` carry no such
+    # prefix at all.
+    hit = [l for l in out.splitlines() if "WEG2-DRY-RUN-BOX-STATE" in l]
+    assert len(hit) == 1, (
+        f"expected exactly one WEG2-DRY-RUN-BOX-STATE line, found {len(hit)} "
+        f"-- either the line stopped printing or something duplicated it"
+    )
+    return hit[0]
+
+
+@_NEEDS_CHECKPOINT
+class TheRealDryRunLineOnAQuietBox(_HermeticMainBase):
+    """`launcher.main(['--dry-run', ...])`, the REAL wiring end to end, on
+    the quiet-box fixture -- not `host_ledger.choose()` called directly."""
+
+    def test_the_real_printed_line_says_not_stale_suspect(self):
+        rc, out, exc = self.run_main(_main_argv("t1392quiet"))
+        self.assertIsNone(exc, f"main() raised: {exc}\n{out}")
+        line = _box_state_line_from_stdout(out)
+        self.assertIn("not stale-suspect", line)
+        self.assertNotIn("PROVISIONAL", line)
+        self.assertIn("memavail=", line)
+        self.assertIn("anon=", line)
+        self.assertIn("shmem=", line)
+
+
+@_NEEDS_CHECKPOINT
+class TheRealDryRunLineOnALoadedBox(_HermeticMainBaseLoaded):
+    """The other half: the SAME argv, the SAME quiet identity/checkpoint,
+    ONLY the host reading changed -- `main()`'s printed line must say so."""
+
+    def test_the_real_printed_line_says_PROVISIONAL(self):
+        rc, out, exc = self.run_main(_main_argv("t1392loaded"))
+        self.assertIsNone(exc, f"main() raised: {exc}\n{out}")
+        line = _box_state_line_from_stdout(out)
+        self.assertIn("PROVISIONAL", line)
+        self.assertIn("foreign_load_now=", line)
+
+    def test_pflicht_mutant_removing_the_foreign_load_term_still_claims_a_verdict(self):
+        """THE COORDINATOR'S OWN DANGER DIRECTION, verbatim: "Fremdlast-Term
+        aus der Zeile entfernen -> die Zeile behauptet weiter ein Verdikt ->
+        der Test muss sterben." Run against the REAL file
+        (`host_ledger.FOREIGN_LOAD_PROVISIONAL_THRESHOLD_GIB`), not a
+        planted fixture: NOT "the reading is unmeasured" (`None` is an
+        already-supported, honestly-printed state -- see
+        `ProvisionalNeverChangesTheVerdict`'s own tests above) but "the
+        line's own EFFECT of a real, measured, genuinely-loaded box was
+        silently removed" -- the threshold patched to infinity so
+        `foreign_load_now` still prints its real, honest number (the box
+        genuinely IS ~1 GiB over the real threshold) while the PROVISIONAL
+        clause can never fire again, regardless of how loaded the box is.
+        Applied via `mock.patch` against the live module constant `main()`
+        actually reads through `host_ledger.choose` -- not a copy, not a
+        subclass override -- so this exercises exactly the code path the
+        real boot runs.
+        """
+        with mock.patch.object(
+            hl, "FOREIGN_LOAD_PROVISIONAL_THRESHOLD_GIB", float("inf"),
+        ):
+            rc, out, exc = self.run_main(_main_argv("t1392mutant"))
+        self.assertIsNone(exc, f"main() raised: {exc}\n{out}")
+        line = _box_state_line_from_stdout(out)
+        # The mutant's own failure mode, stated as an assertion rather than
+        # only prose: the line still exists, still names a real
+        # foreign_load_now figure (the box genuinely IS loaded, and this
+        # number proves the code still MEASURED it) -- it merely lost the
+        # ability to ever ACT on that measurement in the text.
+        self.assertIn("foreign_load_now=", line)
+        self.assertNotIn("not measured", line)
+        self.assertNotIn(
+            "PROVISIONAL", line,
+            "with the threshold neutralised, the REAL loaded box's dry run "
+            "no longer flags itself as provisional even though "
+            "foreign_load_now proves the box IS loaded -- this is exactly "
+            "the mutant the coordinator named: a verdict that keeps "
+            "claiming FUNDABLE (or a refusal) while going silent about the "
+            "one signal that would have told a reader to re-verify",
+        )
+
+
 if __name__ == "__main__":
-    import unittest
     unittest.main()
