@@ -5253,7 +5253,7 @@ def hostsample_csv_path(tag: str) -> str:
     which is evidence -- a silent null told nobody anything, and a 0.0 would
     have made the cross-boot gate look armed while it read nothing.
     """
-    return (f"{EVIDENCE_DIR}/{tag}_{time.strftime('%y%m%d')}/"
+    return (f"{EVIDENCE_DIR}/{tag}_{time.strftime('%m%d')}/"
             f"hostsample_{tag}.csv")
 
 
