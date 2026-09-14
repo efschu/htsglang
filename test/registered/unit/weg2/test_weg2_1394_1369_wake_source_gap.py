@@ -75,13 +75,20 @@ Manager = wu.SchedulerWeightUpdaterManager
 
 
 class _FakeServerArgs:
-    def __init__(self, model_path="/models/main", draft_path=None):
+    def __init__(self, model_path="/models/main", draft_path=None,
+                quantization=None):
         self.enable_memory_saver = True
         self.enable_weights_cpu_backup = True
         self.enable_draft_weights_cpu_backup = False
         self.speculative_draft_model_path = draft_path
         self.model_path = model_path
         self.load_format = None
+        #: #1394/A2 (2026-09-14): read by `checkpoint_quantization` via
+        #: `_weg2_draft_checkpoint_quantization`'s server_args fallback --
+        #: `None` is "unquantized" (`_FakeRunner.model_config` is also
+        #: always `None` in this file, so server_args is the only holder
+        #: these tests can drive).
+        self.quantization = quantization
 
 
 class _FakeRunner:
@@ -281,6 +288,121 @@ def test_weights_draft_with_no_draft_worker_is_not_a_gap(monkeypatch, ring_off,
         GPU_MEMORY_TYPE_WEIGHTS_DRAFT, cdescs_present=False) is None
 
 
+# ===========================================================================
+# 1b. A2 (xsn32, 2026-09-14): the weights_draft exemption is CONDITIONAL on
+# the disk fallback it names actually being safe -- "der Checkpoint ist das
+# Netz" is not true on a quantized checkpoint, where
+# `assert_backup_off_wake_refill_is_defined` (weg2_memory_saver.py:328-382)
+# already names `update_weights_from_disk` undefined (W4).
+# ===========================================================================
+
+
+def _real_w4_text(quantization="compressed-tensors") -> str:
+    """THE REAL W4 TEXT, driven through the REAL production function
+    (weg2_memory_saver.assert_backup_off_wake_refill_is_defined), never
+    hand-typed -- the fixture the order asked for. Used below only to
+    prove the two texts share the SAME reasoning, not to duplicate it."""
+    from sglang.srt.managers.weg2_memory_saver import (
+        assert_backup_off_wake_refill_is_defined,
+    )
+
+    try:
+        assert_backup_off_wake_refill_is_defined(
+            quantization=quantization, context="fixture")
+    except Weg2WakeRefused as exc:
+        return str(exc)
+    raise AssertionError("the real guard did not raise for a quantized checkpoint")
+
+
+def test_weights_draft_no_descriptors_on_a_quantized_checkpoint_is_a_gap(
+        monkeypatch, ring_off, authoritative):
+    """RED-FIRST shape (this is the fix; reverted, this test is the mutant
+    below): the OLD exemption answered `None` unconditionally the moment
+    `cdescs_present` was False for weights_draft, on ANY checkpoint. On a
+    checkpoint `assert_backup_off_wake_refill_is_defined` itself calls
+    undefined for `update_weights_from_disk`, that answer was wrong -- the
+    disk path this exemption names as the safe net is the SAME undefined
+    operation, reached by a different caller the W4 guard did not know
+    about."""
+    w4_text = _real_w4_text("compressed-tensors")
+    draft = _FakeDraftWorker()
+    m = _manager(monkeypatch, draft_worker=draft,
+                server_args=_FakeServerArgs(quantization="compressed-tensors"))
+    gap = m._weg2_xchg_wake_source_gap(GPU_MEMORY_TYPE_WEIGHTS_DRAFT,
+                                       cdescs_present=False)
+    assert gap is not None, (
+        "no descriptors + a quantized checkpoint must be a gap: the disk "
+        "fallback this exemption used to name unconditionally is undefined "
+        "here, the same reason the real W4 guard names")
+    # SAME REASONING, not a duplicated STRING: both texts name
+    # process_weights_after_loading as the mechanism and update_weights_from_disk
+    # as the undefined call -- proven against the REAL guard's own text,
+    # not a hand-typed copy of it.
+    assert "process_weights_after_loading" in w4_text
+    assert "process_weights_after_loading" in gap
+    assert "update_weights_from_disk" in gap
+    assert "compressed-tensors" in gap
+
+
+def test_weights_draft_no_descriptors_on_an_unquantized_checkpoint_stays_exempt(
+        monkeypatch, ring_off, authoritative):
+    """REGRESSION GUARD: the pre-existing, correct case -- no quantization
+    at all -- must still exempt weights_draft exactly as before."""
+    draft = _FakeDraftWorker()
+    m = _manager(monkeypatch, draft_worker=draft,
+                server_args=_FakeServerArgs(quantization=None))
+    assert m._weg2_xchg_wake_source_gap(
+        GPU_MEMORY_TYPE_WEIGHTS_DRAFT, cdescs_present=False) is None
+
+
+def test_M_declaring_the_lane_covered_without_checking_completeness_is_the_danger(
+        monkeypatch, ring_off, authoritative):
+    """THE DANGER-DIRECTION MUTANT (coordinator order): restore the OLD,
+    unconditional exemption ("covered by _weg2_xchg_draft_reload_from_disk",
+    full stop, no quantization check) and show it answers `None` (no gap)
+    on the EXACT case that must refuse -- a paused tag with zero
+    descriptors on a quantized checkpoint. This test passes ONLY because it
+    demonstrates the DANGEROUS, mutated behaviour on purpose: the real
+    method (tested above) is what stands between this and A2's own boot
+    death reached one level later, with VRAM already committed instead of
+    refused before the pause."""
+    draft = _FakeDraftWorker()
+    m = _manager(monkeypatch, draft_worker=draft,
+                server_args=_FakeServerArgs(quantization="compressed-tensors"))
+
+    # THE MUTATION: the pre-fix exemption, unconditional.
+    def _mutated_gap(self, tag, *, cdescs_present):
+        from sglang.srt.managers.weg2_memory_saver import (
+            GPU_MEMORY_TYPE_WEIGHTS_DRAFT as _DRAFT_TAG,
+        )
+        from sglang.srt.weg2 import weight_exchange as _wx
+
+        try:
+            from sglang.srt.weg2.weight_exchange import weights_cpu_backup_armed
+            if weights_cpu_backup_armed():
+                return None
+        except Exception:  # noqa: BLE001
+            return None
+        if not (_wx.exchange_armed() and _wx.inject_authoritative()):
+            return "case 1"
+        if str(tag) == _DRAFT_TAG:
+            if self.draft_worker is None:
+                return None
+            return None  # the mutant: unconditional, no quantization check
+        if not cdescs_present:
+            return "case 2"
+        return None
+
+    monkeypatch.setattr(Manager, "_weg2_xchg_wake_source_gap", _mutated_gap,
+                        raising=True)
+    gap = m._weg2_xchg_wake_source_gap(GPU_MEMORY_TYPE_WEIGHTS_DRAFT,
+                                       cdescs_present=False)
+    assert gap is None, (
+        "the mutant should have declared the lane covered without checking "
+        "completeness -- if this assertion fails, the mutation did not "
+        "reach the code path it claims to")
+
+
 def test_an_unreadable_contract_answers_no_gap_not_a_refusal(monkeypatch):
     """`weights_cpu_backup_armed` raising (contract not on this tree, or an
     unparseable env) must not manufacture a refusal from an absence -- the
@@ -450,6 +572,30 @@ def test_draft_reload_calls_the_draft_workers_own_update_from_disk(
     assert m._weg2_xchg_draft_reload_from_disk() is True
     assert len(draft.calls) == 1
     assert draft.calls[0].model_path == "/models/draft"
+
+
+def test_draft_reload_refuses_by_name_on_a_quantized_checkpoint(
+        monkeypatch, ring_off, authoritative):
+    """A2 (xsn32, 2026-09-14), DEFENSE IN DEPTH: even reached directly (the
+    sleep-leg's own completeness check never ran for this call -- e.g. the
+    boot-time INITIAL sleep, which `_weg2_xchg_deposit_before_sleep` skips
+    by construction), this method must refuse BY NAME rather than commit
+    to a doomed `update_weights_from_disk`. BEFORE ANYTHING IS LOCKED: the
+    fake draft worker's `update_weights_from_disk` must never even be
+    called."""
+    draft = _FakeDraftWorker(success=True)
+    args = _FakeServerArgs(model_path="/models/main",
+                           draft_path="/models/draft",
+                           quantization="compressed-tensors")
+    m = _manager(monkeypatch, draft_worker=draft, server_args=args)
+
+    with pytest.raises(Weg2WakeRefused) as exc:
+        m._weg2_xchg_draft_reload_from_disk()
+    assert "W4" in str(exc.value)
+    assert "compressed-tensors" in str(exc.value)
+    assert draft.calls == [], (
+        "the refusal must fire BEFORE the reload is attempted, not after "
+        "it fails inside the loader")
 
 
 def test_draft_reload_refuses_by_name_on_failure(monkeypatch, ring_off,
