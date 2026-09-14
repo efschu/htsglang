@@ -453,6 +453,15 @@ class SchedulerWeightUpdaterManager:
     #: entry stands down instead of injecting a second time over bytes already
     #: written.
     _weg2_xchg_collected_per_tag: bool = False
+    #: #1391 (DESK10) ROUND 4: the SAME field, for the SHADOW carrier.
+    #: Declared for the SAME reason `_weg2_xchg_collected_per_tag` is: a
+    #: lazily-assigned attribute is the exact AttributeError class boot
+    #: weg2xsn31/2 died of (see the comment above). Set True the moment the
+    #: per-tag loop runs a SHADOW-mode collect for a tag (mirroring the
+    #: EXCHANGE branch beside it), read by `_weg2_xchg_shadow_compare` to
+    #: stand down its own once-per-wake, whole-plan compare instead of
+    #: grading the same bytes twice.
+    _weg2_xchg_shadow_compared_per_tag: bool = False
 
     @contextmanager
     def _observe_weight_load(self, source: str) -> Iterator[None]:
@@ -1870,12 +1879,28 @@ class SchedulerWeightUpdaterManager:
         try:
             from sglang.srt.weg2 import weight_exchange as wx
 
-            if not (wx.exchange_armed()
-                    and wx.inject_mode() == wx.INJECT_SHADOW):
+            carrier = self._weg2_wake_weight_carrier()
+            if not self._weg2_xchg_shadow_armed_for(carrier):
                 return
-            # DANGER DIRECTION 1, gated here so the call site stays a plain
-            # call and the whole question lives in ONE place.
-            if self._weg2_wake_weight_carrier() == self.CARRIER_STOCK:
+            # #1391 (DESK10) ROUND 4: STAND DOWN, THE SAME PATTERN
+            # `_weg2_wake_reload_weights`'s CARRIER_EXCHANGE branch already
+            # uses for `_weg2_xchg_collected_per_tag`. The resume loop above
+            # (`resume_memory_occupation`) now runs this exact compare PER
+            # TAG, from inside the per-tag loop, precisely so the per-tag
+            # `post_drained` gate fires during the resume instead of never
+            # (#1391's wedge: shadow mode's only collect used to be THIS
+            # call, once, with `tag=None`, after the whole family had
+            # already resumed -- too late for D's lockstep to ever see a
+            # drain). Running it again here over the WHOLE plan would grade
+            # every tag's bytes a second time for no reason and, worse, look
+            # like independent corroboration of a single measurement.
+            if self._weg2_xchg_shadow_compared_per_tag:
+                self._weg2_xchg_shadow_compared_per_tag = False
+                logger.info(
+                    "WEG2-XCHG-INJECT mode=shadow per-tag=done -- the resume "
+                    "loop compared each tag beside its own resume (#1391); "
+                    "this once-per-wake entry stands down rather than "
+                    "grading the same bytes twice")
                 return
             self._weg2_xchg_inject_weights(mode=wx.INJECT_SHADOW)
         except BaseException as exc:  # noqa: BLE001 -- an observer never raises
@@ -1886,6 +1911,26 @@ class SchedulerWeightUpdaterManager:
                 "authority and the weights are unaffected",
                 type(exc).__name__, exc,
             )
+
+    def _weg2_xchg_shadow_armed_for(self, carrier) -> bool:
+        """Is a SHADOW-mode collect due for this wake, on this carrier?
+
+        #1391 (DESK10) ROUND 4: ONE PREDICATE, read from BOTH the per-tag
+        loop (:meth:`resume_memory_occupation`) and the once-per-wake
+        stand-down check (:meth:`_weg2_xchg_shadow_compare`) above, so the
+        two can never disagree about whether a given wake is a shadow wake
+        -- the exact class of defect a second reading of one decision
+        always risks (`ein-job-ein-mover`). Mirrors what
+        `_weg2_xchg_shadow_compare` checked inline before this round:
+        the exchange is armed, the inject mode is shadow, and the carrier
+        is not `stock` (an unreleased-pages wake has nothing to compare --
+        DANGER DIRECTION 1, unchanged from before this round).
+        """
+        from sglang.srt.weg2 import weight_exchange as wx
+
+        if not (wx.exchange_armed() and wx.inject_mode() == wx.INJECT_SHADOW):
+            return False
+        return carrier != self.CARRIER_STOCK
 
     def _weg2_group_fence(
         self,
@@ -4870,9 +4915,41 @@ class SchedulerWeightUpdaterManager:
                     # pause(t) -> credit(t). Before #1374 the whole plan was
                     # collected after the loop, which is why the peer's
                     # per-tag deposit had nobody to drain it.
-                    elif self._weg2_wake_weight_carrier() == self.CARRIER_EXCHANGE:
+                    # TRAIN2 merge note (2026-09-14): walrus keeps Paket B's
+                    # (#1394) elif-exclusivity AND #1391 round 4's lazy carrier
+                    # capture for the shadow-elif below in the SAME chain --
+                    # a hoist of the carrier read above this if/elif would
+                    # reintroduce exactly what #1394 avoids (asking the carrier
+                    # for a draft tag before the disk-reload short-circuit).
+                    elif (_weg2_carrier_this_tag := self._weg2_wake_weight_carrier()) == self.CARRIER_EXCHANGE:
                         self._weg2_xchg_inject_weights(tag=tag)
                         self._weg2_xchg_collected_per_tag = True
+                    # #1391 (DESK10) ROUND 4: THE SAME PER-TAG STEP, UNDER
+                    # SHADOW. Coordinator's hypothesis, verified at this exact
+                    # site before building the fix: under CARRIER_EXCHANGE the
+                    # branch above already collects per tag, with a real
+                    # `tag`, from INSIDE this loop -- so
+                    # `_weg2_xchg_bounce_leg`'s `post_drained(tag=...)` gate
+                    # fires and D's per-tag `wait_drained` is satisfied. Under
+                    # `--weg2-xchg-inject shadow` the ONLY collect used to be
+                    # `_weg2_xchg_shadow_compare`, called once AFTER this
+                    # whole loop with `tag=None` -- so the SAME gate never
+                    # fired and D's lockstep wait never resolved (#1391's
+                    # wedge). The comparison itself was never the problem;
+                    # WHEN it ran was. Running it HERE, per tag, gives the
+                    # per-tag drain its signal without touching the drain
+                    # count's own contract (`post_drained` is still called
+                    # exactly once per tag, from exactly one branch below --
+                    # see the danger-direction mutant in
+                    # test_weg2_shadow_per_tag_collect_1391.py for what a
+                    # wrong pairing between "which tag was graded" and "which
+                    # tag was drained" would cost).
+                    elif self._weg2_xchg_shadow_armed_for(_weg2_carrier_this_tag):
+                        from sglang.srt.weg2 import weight_exchange as _wx_shadow
+
+                        self._weg2_xchg_inject_weights(
+                            tag=tag, mode=_wx_shadow.INJECT_SHADOW)
+                        self._weg2_xchg_shadow_compared_per_tag = True
                     # S7 (#1273): READ THE MAP COST WHILE IT IS STILL THIS TAG'S.
                     # Resume pass 1 maps every allocation of the tag one at a
                     # time, so its wall is proportional to an allocation count
