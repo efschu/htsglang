@@ -25,6 +25,14 @@ from aiohttp import web
 from aiohttp.test_utils import AioHTTPTestCase, TestClient, TestServer, unused_port
 
 from sglang.srt.entrypoints.anthropic.router import (
+    _apply_provider_order,
+    _apply_session_affinity,
+    _cache_marker_sites,
+    _destination_wants_explicit_markers,
+    _drop_redundant_tools_marker,
+    _load_policy_file,
+    _rewrite_body_model,
+    _session_affinity_key,
     NOTHINK_ALIAS_SUFFIX,
     STATS_PATH,
     THINKING_ALIAS_SUFFIX,
@@ -1654,3 +1662,187 @@ class OpenRouterCacheMarkerTestCase(AioHTTPTestCase):
         resp = await self.client.post("/v1/messages", json=body)
         self.assertEqual(resp.status, 200)
         self.assertEqual(self.openrouter["requests"][0]["body"]["messages"], [])
+
+
+class OpenRouterCacheAffinityTestCase(unittest.TestCase):
+    """The four defects found on 2026-09-14, each pinned by the property it broke.
+
+    WHY THESE ARE PURE-FUNCTION TESTS and not end-to-end ones: each defect was
+    a wrong DECISION on a body, and every one of them was invisible end-to-end
+    -- the request succeeded, the answer was correct, only the bill was wrong.
+    The marker fill in particular looked deployed and did nothing for a whole
+    day, because the branch it took (budget spent) is silent by construction.
+
+    Measured context for the numbers quoted below (openrouter, one 13k prefix,
+    same route): Qwen reads 13061 from cache after a 240 s pause and 0 after
+    400 s (5-minute provider TTL, explicit markers only); GLM still reads
+    12992 after 400 s and caches automatically; z-ai/glm-5.3-flash is served
+    by 27 different providers, each with its OWN cache.
+    """
+
+    # ---- defect 1: 27 providers, 27 caches -------------------------------
+    def test_provider_order_is_pinned_so_every_turn_reaches_one_cache(self):
+        body = json.dumps({"model": "z-ai/glm-5.3-flash", "messages": []}).encode()
+        out, diagnosis = _apply_provider_order(body, ["Z.AI"])
+        self.assertEqual(
+            json.loads(out)["provider"],
+            {"order": ["Z.AI"], "allow_fallbacks": True},
+        )
+        self.assertIn("Z.AI", diagnosis)
+
+    def test_fallbacks_stay_allowed_because_a_dead_seat_beats_a_cold_cache(self):
+        """The danger direction: a pin that forbids failover turns one
+        provider's outage into a seat that cannot make requests at all."""
+        body = json.dumps({"model": "m", "messages": []}).encode()
+        out, _ = _apply_provider_order(body, ["Z.AI"])
+        self.assertTrue(json.loads(out)["provider"]["allow_fallbacks"])
+
+    def test_a_clients_own_provider_block_is_never_overwritten(self):
+        body = json.dumps(
+            {"model": "m", "provider": {"order": ["Chosen"], "allow_fallbacks": False}}
+        ).encode()
+        out, diagnosis = _apply_provider_order(body, ["Z.AI"])
+        self.assertEqual(json.loads(out)["provider"]["order"], ["Chosen"])
+        self.assertIn("client", diagnosis)
+
+    # ---- defect 2: no session_id, so no cache affinity -------------------
+    def test_session_key_is_stable_while_the_conversation_grows(self):
+        """The head is fixed for the life of a conversation; only the tail
+        grows. A key that changed per request would pin every turn to its own
+        cache -- worse than sending none."""
+        base = {
+            "system": [{"type": "text", "text": "system prompt"}],
+            "messages": [{"role": "user", "content": [{"type": "text", "text": "first"}]}],
+        }
+        keys = []
+        msgs = list(base["messages"])
+        for i in range(4):
+            msgs = msgs + [
+                {"role": "assistant", "content": [{"type": "text", "text": "ok"}]},
+                {"role": "user", "content": [{"type": "text", "text": "turn %d" % i}]},
+            ]
+            keys.append(_session_affinity_key(dict(base, messages=msgs)))
+        self.assertEqual(len(set(keys)), 1, "key drifted as the tail grew: %s" % keys)
+
+    def test_a_different_conversation_gets_a_different_key(self):
+        a = {"system": [{"type": "text", "text": "s"}],
+             "messages": [{"role": "user", "content": [{"type": "text", "text": "one"}]}]}
+        b = {"system": [{"type": "text", "text": "s"}],
+             "messages": [{"role": "user", "content": [{"type": "text", "text": "two"}]}]}
+        self.assertNotEqual(_session_affinity_key(a), _session_affinity_key(b))
+
+    def test_no_stable_head_means_no_invented_key(self):
+        self.assertIsNone(_session_affinity_key({"messages": []}))
+        body = json.dumps({"model": "m", "messages": []}).encode()
+        out, diagnosis = _apply_session_affinity(body)
+        self.assertEqual(out, body)
+        self.assertNotIn("session_id", json.loads(out))
+        self.assertIn("no stable head", diagnosis)
+
+    def test_a_clients_own_session_id_is_kept(self):
+        for field in ("session_id", "prompt_cache_key"):
+            body = json.dumps({
+                "model": "m", field: "theirs",
+                "messages": [{"role": "user", "content": [{"type": "text", "text": "x"}]}],
+            }).encode()
+            out, diagnosis = _apply_session_affinity(body)
+            self.assertEqual(out, body, field)
+            self.assertIn("kept", diagnosis)
+
+    # ---- defect 3: the fill was inert at four client markers -------------
+    def test_a_redundant_tools_marker_is_freed_for_the_conversation(self):
+        """THE defect the user saw: only the ~3k system block read back while
+        every turn was recomputed. tools -> system -> messages is the render
+        order, so a system marker already has the tools inside its prefix; the
+        tools marker names a strictly shorter prefix of the same bytes and
+        costs a breakpoint the turns need."""
+        payload = {
+            "system": [{"type": "text", "text": "s", "cache_control": {"type": "ephemeral"}}],
+            "tools": [{"name": "T", "cache_control": {"type": "ephemeral"}}],
+        }
+        sites = _cache_marker_sites(payload)
+        self.assertEqual(sites, ["tools[0]", "system[0]"])
+        self.assertTrue(_drop_redundant_tools_marker(payload, sites))
+        self.assertEqual(_cache_marker_sites(payload), ["system[0]"])
+
+    def test_a_lone_tools_marker_is_kept_because_removing_it_would_lose_cache(self):
+        """Danger direction: without a system marker the tools marker is the
+        only front-of-prompt breakpoint and carries the static bulk."""
+        payload = {"tools": [{"name": "T", "cache_control": {"type": "ephemeral"}}]}
+        sites = _cache_marker_sites(payload)
+        self.assertFalse(_drop_redundant_tools_marker(payload, sites))
+        self.assertEqual(_cache_marker_sites(payload), ["tools[0]"])
+
+    def test_marker_sites_name_positions_not_just_a_count(self):
+        """A count cannot tell a client that marked its rolling tail (nothing
+        to do) from one that spent the budget in front of the conversation
+        (everything to do, no room). Same number, opposite defect."""
+        payload = {
+            "system": [{"type": "text", "text": "s", "cache_control": {"type": "ephemeral"}}],
+            "messages": [
+                {"role": "user", "content": [{"type": "text", "text": "a",
+                                              "cache_control": {"type": "ephemeral"}}]},
+            ],
+        }
+        self.assertEqual(_cache_marker_sites(payload), ["system[0]", "msg[0]/user"])
+
+    # ---- defect 4: markers sent to a destination that does not want them --
+    def test_only_destinations_that_require_markers_get_them(self):
+        for model, wants in (
+            ("qwen/qwen3.8-flash[1m]", True),      # "requires explicit cache breakpoints"
+            ("anthropic/claude-sonnet-4", True),
+            ("google/gemini-2.5-pro", True),
+            ("z-ai/glm-5.3-flash[1m]", False),     # "automated, no configuration"
+            ("openai/gpt-5", False),
+            ("deepseek/deepseek-v3.2", False),
+            ("", False),                            # unknown -> conservative
+        ):
+            self.assertEqual(
+                _destination_wants_explicit_markers(model), wants, model
+            )
+
+    # ---- the redirect that made a live seat switch models ----------------
+    def test_body_model_rewrite_is_the_whole_redirect(self):
+        body = json.dumps({"model": "qwen/qwen3.8-flash[1m]", "messages": []}).encode()
+        out, diagnosis = _rewrite_body_model(body, "z-ai/glm-5.3-flash[1m]")
+        self.assertEqual(json.loads(out)["model"], "z-ai/glm-5.3-flash[1m]")
+        self.assertIn("rewritten", diagnosis)
+
+    def test_an_unparseable_body_is_never_silently_half_edited(self):
+        for fn, args in (
+            (_rewrite_body_model, ("target",)),
+            (_apply_provider_order, (["Z.AI"],)),
+            (_apply_session_affinity, ()),
+        ):
+            out, diagnosis = fn(b"not json", *args)
+            self.assertEqual(out, b"not json", fn.__name__)
+            self.assertIn("unreadable", diagnosis, fn.__name__)
+
+    # ---- the policy file is the live steering surface --------------------
+    def test_policy_rejects_malformed_steering_instead_of_applying_it(self):
+        """This file is a live-tuning hook on the process every session is
+        pointed at, so a bad value is ignored with a warning rather than
+        applied -- the same rule allowed_models already follows."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "policy.json")
+            for bad in ({"openrouter_provider_order": "Z.AI"},
+                        {"openrouter_provider_order": []},
+                        {"openrouter_model_map": ["not", "a", "dict"]},
+                        {"openrouter_model_map": {"a": 1}}):
+                with open(path, "w") as fh:
+                    json.dump(bad, fh)
+                got = _load_policy_file(path)
+                for key in bad:
+                    self.assertNotIn(key, got, bad)
+
+    def test_policy_accepts_well_formed_steering(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "policy.json")
+            with open(path, "w") as fh:
+                json.dump({
+                    "openrouter_provider_order": ["Z.AI", "Cloudflare"],
+                    "openrouter_model_map": {"a": "b"},
+                }, fh)
+            got = _load_policy_file(path)
+            self.assertEqual(got["openrouter_provider_order"], ["Z.AI", "Cloudflare"])
+            self.assertEqual(got["openrouter_model_map"], {"a": "b"})

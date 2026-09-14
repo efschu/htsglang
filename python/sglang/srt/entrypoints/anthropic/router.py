@@ -130,6 +130,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -524,6 +525,216 @@ def _cache_marker_carriers(payload: dict) -> list[dict]:
     return carriers
 
 
+# Destinations whose caching is opt-in PER MARKER. Everything not listed here
+# is treated as automatic-caching, which is the safe default for this router:
+# adding a marker a destination does not document is a change with unknown
+# effect, while omitting one on an automatic destination costs nothing.
+# Sources (OpenRouter prompt-caching docs, read 2026-09-14):
+#   Alibaba/Qwen  -- "requires explicit cache breakpoints"
+#   Anthropic     -- explicit per-block breakpoints (or top-level auto mode)
+#   Google Gemini -- "requires you to insert cache_control breakpoints"
+#   Z.AI/GLM      -- "automated and does not require any additional configuration"
+#   OpenAI, Grok, Moonshot, Groq, DeepSeek -- automated
+EXPLICIT_MARKER_PREFIXES = ("qwen/", "alibaba/", "anthropic/", "google/")
+
+
+def _apply_provider_order(body: bytes, order: list) -> tuple[bytes, str]:
+    """Pin the upstream provider, so every turn reaches the SAME cache.
+
+    THE DEFECT (measured 2026-09-14): one model id can be served by dozens of
+    providers -- 27 for z-ai/glm-5.3-flash -- each with its own prompt cache.
+    Without a pin, consecutive turns of one conversation are spread across them
+    and only the turns that happen to land on the same provider twice read back.
+    Observed as "every second or third request is not cached" while the
+    session_id was provably constant (33/33).
+
+    ``allow_fallbacks`` stays TRUE on purpose: the pin expresses a preference,
+    not a hostage. If the preferred provider is down, a cold cache is a far
+    cheaper outcome than a seat that cannot make requests at all.
+
+    ADDITIVE: a client that sent its own ``provider`` block keeps it untouched.
+    """
+    try:
+        payload = json.loads(body)
+    except (ValueError, UnicodeDecodeError):
+        return body, "unreadable body, provider NOT pinned"
+    if not isinstance(payload, dict):
+        return body, "body is not an object, provider NOT pinned"
+    if isinstance(payload.get("provider"), dict):
+        return body, "client provider block kept"
+    payload["provider"] = {"order": list(order), "allow_fallbacks": True}
+    return json.dumps(payload).encode(), "order=" + ",".join(order)
+
+
+def _rewrite_body_model(body: bytes, target: str) -> tuple[bytes, str]:
+    """Replace the body's ``model`` so the destination sees the mapped id.
+
+    The URL carries no model on this API -- the body does -- so a redirect is
+    exactly this one field. Returns the body unchanged with a named reason if
+    it cannot be parsed, because a redirect that silently does not happen is
+    the failure mode this whole mechanism exists to end.
+    """
+    try:
+        payload = json.loads(body)
+    except (ValueError, UnicodeDecodeError):
+        return body, "unreadable body, model NOT rewritten"
+    if not isinstance(payload, dict):
+        return body, "body is not an object, model NOT rewritten"
+    payload["model"] = target
+    return json.dumps(payload).encode(), "body model rewritten"
+
+
+def _destination_wants_explicit_markers(model: str) -> bool:
+    """Does THIS model's provider cache only what a marker names?
+
+    Prefix match on the OpenRouter slug's vendor part. A slug we do not
+    recognise is treated as automatic (no markers added) -- the conservative
+    direction, because an unknown destination is exactly where an undocumented
+    field is most likely to be rejected or to change behaviour silently.
+    """
+    slug = (model or "").lower()
+    return slug.startswith(EXPLICIT_MARKER_PREFIXES)
+
+
+def _drop_redundant_tools_marker(payload: dict, sites: list[str]) -> bool:
+    """Free one breakpoint that buys nothing, so a TURN can have it instead.
+
+    THE DEFECT THIS FIXES (measured 2026-09-14): with four client markers the
+    budget is zero and this router adds nothing at all. The observed result is
+    a conversation where only the ~3k system block reads back from cache and
+    every turn behind it is recomputed on every request.
+
+    WHY REMOVING IS LOSSLESS, not a policy change: Anthropic renders a request
+    as tools -> system -> messages. A breakpoint on `system` therefore has the
+    tool definitions INSIDE its prefix; the cache entry written at `system`
+    already contains them. A second breakpoint on `tools` names a strictly
+    shorter prefix of the same bytes, so a read at `system` returns everything
+    a read at `tools` would have. Dropping it costs zero cached content and
+    buys a breakpoint for the conversation tail, which nothing else covers.
+
+    Deliberately narrow: only a `tools` marker, only when `system` is also
+    marked (otherwise the tools marker is the ONLY front-of-prompt breakpoint
+    and carries the static bulk -- removing it would be a real loss), and only
+    one. Returns True if a marker was removed.
+    """
+    if not any(site.startswith("system[") for site in sites):
+        return False
+    tools = payload.get("tools")
+    if not isinstance(tools, list):
+        return False
+    for block in tools:
+        if isinstance(block, dict) and "cache_control" in block:
+            del block["cache_control"]
+            return True
+    return False
+
+
+def _session_affinity_key(payload: dict) -> Optional[str]:
+    """A stable per-conversation id, so every turn lands on the SAME cache.
+
+    MEASURED DEFECT 2026-09-14: the client sends no ``session_id``. OpenRouter
+    derives its provider-affinity key from account + session_id and documents
+    that supplying one "keeps requests from the same session on the same
+    cache" -- and that sticky routing "activates on any successful request,
+    even before cache usage is observed". Without it, consecutive turns of ONE
+    conversation can land on different provider instances, each with a cold
+    cache. That is indistinguishable from an expired TTL from the outside, and
+    it is why only the client-marked system block (the very front of the
+    prefix) ever read back while the conversation behind it was recomputed.
+
+    WHAT MAKES IT STABLE: the system block plus the FIRST user turn. Both are
+    fixed for the life of a conversation -- the tail grows, the head does not.
+    A new conversation (or one that was compacted, which rewrites the head)
+    hashes differently, which is correct: that IS a different cache context.
+    Truncated before hashing so a huge first turn costs a bounded read.
+
+    Returns ``None`` when there is nothing stable to hash, and the caller then
+    sends no key rather than inventing an unstable one -- a session id that
+    changes per request is worse than none (it pins each turn to its own
+    cache).
+    """
+    parts: list[str] = []
+    system = payload.get("system")
+    if isinstance(system, str):
+        parts.append(system[:4096])
+    elif isinstance(system, list):
+        for block in system:
+            if isinstance(block, dict) and isinstance(block.get("text"), str):
+                parts.append(block["text"][:4096])
+    messages = payload.get("messages")
+    if isinstance(messages, list):
+        for message in messages:
+            if not isinstance(message, dict) or message.get("role") != "user":
+                continue
+            content = message.get("content")
+            if isinstance(content, str):
+                parts.append(content[:4096])
+            elif isinstance(content, list):
+                for block in content:
+                    if isinstance(block, dict) and isinstance(block.get("text"), str):
+                        parts.append(block["text"][:4096])
+            break                       # FIRST user turn only -- the stable head.
+    if not parts:
+        return None
+    digest = hashlib.sha256("\x00".join(parts).encode("utf-8", "replace")).hexdigest()
+    # 32 hex chars: far inside OpenRouter's 256-char cap, and not a credential
+    # -- it is a digest of content the destination already receives in full.
+    return "cc-" + digest[:32]
+
+
+def _apply_session_affinity(body: bytes) -> tuple[bytes, str]:
+    """Add ``session_id`` for provider cache affinity if the client sent none.
+
+    ADDITIVE: a client-supplied ``session_id`` (or ``prompt_cache_key``, which
+    OpenRouter documents as the fallback routing key) is never overwritten.
+    """
+    try:
+        payload = json.loads(body)
+    except (ValueError, UnicodeDecodeError):
+        return body, "unreadable body"
+    if not isinstance(payload, dict):
+        return body, "body is not an object"
+    for key in ("session_id", "prompt_cache_key"):
+        existing = payload.get(key)
+        if isinstance(existing, str) and existing:
+            return body, f"client {key} kept"
+    key = _session_affinity_key(payload)
+    if key is None:
+        return body, "no stable head to key on"
+    payload["session_id"] = key
+    return json.dumps(payload).encode(), f"session_id={key} (derived)"
+
+
+def _cache_marker_sites(payload: dict) -> list[str]:
+    """WHERE the client already placed markers, not just how many.
+
+    The count alone is not actionable: four markers on `tools`+`system`+two
+    rolling user turns needs nothing from this router, while four markers that
+    all sit in front of the conversation need a rolling pair we then have no
+    budget for. Same number, opposite defect. Labels are `tools[i]`,
+    `system[i]`, and `msg[i]/<role>` so a journal line names the position.
+    """
+    sites: list[str] = []
+    for key in ("tools", "system"):
+        value = payload.get(key)
+        if isinstance(value, list):
+            for i, block in enumerate(value):
+                if isinstance(block, dict) and "cache_control" in block:
+                    sites.append(f"{key}[{i}]")
+    messages = payload.get("messages")
+    if isinstance(messages, list):
+        for i, message in enumerate(messages):
+            if not isinstance(message, dict):
+                continue
+            content = message.get("content")
+            if not isinstance(content, list):
+                continue
+            for block in content:
+                if isinstance(block, dict) and "cache_control" in block:
+                    sites.append(f"msg[{i}]/{message.get('role')}")
+    return sites
+
+
 def _apply_cache_markers(body: bytes) -> tuple[bytes, str]:
     """Add rolling prompt-cache breakpoints to a ``/v1/messages`` body.
 
@@ -554,12 +765,22 @@ def _apply_cache_markers(body: bytes) -> tuple[bytes, str]:
     if not isinstance(messages, list) or not messages:
         return body, "no messages"
 
-    client_markers = sum(
-        1 for block in _cache_marker_carriers(payload) if "cache_control" in block
-    )
+    client_sites = _cache_marker_sites(payload)
+    freed = _drop_redundant_tools_marker(payload, client_sites)
+    if freed:
+        client_sites = _cache_marker_sites(payload)
+    client_markers = len(client_sites)
     budget = ANTHROPIC_CACHE_BREAKPOINTS - client_markers
     if budget <= 0:
-        return body, f"client={client_markers} added=0 (budget spent)"
+        # MEASURED 2026-09-14: this is the branch the real client takes, and
+        # it is why the fix looked deployed and did nothing. Reported with the
+        # SITES, not just the count, because "budget spent" alone cannot tell a
+        # client that marked its rolling tail (nothing for us to do) from one
+        # that spent the budget in front of the conversation and left the turns
+        # unmarked (everything for us to do, and no room).
+        return body, (
+            f"client={client_markers} sites={client_sites} added=0 (budget spent)"
+        )
 
     marked: list[int] = []
     covered = 0
@@ -765,6 +986,64 @@ def _load_policy_file(path: str) -> dict:
             "list of model ids); not applied",
             path,
             allowed,
+        )
+    # ``openrouter_model_map``: {client model id -> model id actually sent}.
+    #
+    # WHY THIS EXISTS (2026-09-14): an agent seat's model is fixed in its
+    # definition file and read ONCE when the session starts, so a running
+    # session cannot be moved to a different model by editing that file --
+    # measured: the edit was ignored and the seat kept reaching
+    # qwen/qwen3.8-flash. The router is the only place that can redirect a
+    # LIVE session. Steered from the policy file because that file is
+    # hot-reloaded (no restart, so no 69-s hole in every session's lifeline,
+    # #1320).
+    #
+    # Deliberately applied AFTER the allow-list, so a mapping can never widen
+    # what is permitted: the client's own id must already be allowed, and the
+    # target must be one of the configured --openrouter-model ids or the arm
+    # refuses it by name like any other unknown model.
+    # ``openrouter_provider_order``: [provider name, ...] -- pin which upstream
+    # provider serves openrouter-bound requests.
+    #
+    # WHY (measured 2026-09-14): z-ai/glm-5.3-flash is served by 27 DIFFERENT
+    # providers (DeepInfra, Novita, Fireworks, Together, Cloudflare, Z.AI, ...),
+    # and each keeps its OWN prompt cache. Unpinned, consecutive turns of one
+    # conversation land on different providers, so every second or third request
+    # hits an instance that has never seen the prefix -- observed exactly that
+    # way, with a provably stable session_id (33/33 requests, one id). Affinity
+    # asks for stickiness; an order pins it.
+    #
+    # Fallbacks stay ALLOWED (see the request-side assembly): a pin that also
+    # forbids failover would turn one provider's outage into a dead seat, which
+    # is a worse failure than a cold cache.
+    order = obj.get("openrouter_provider_order")
+    if order is None:
+        pass
+    elif isinstance(order, list) and order and all(
+        isinstance(p, str) and p for p in order
+    ):
+        out["openrouter_provider_order"] = list(order)
+    else:
+        logger.warning(
+            "policy file %s: bad openrouter_provider_order value %r (need a "
+            "non-empty list of provider names); not applied",
+            path,
+            order,
+        )
+    mapping = obj.get("openrouter_model_map")
+    if mapping is None:
+        pass
+    elif isinstance(mapping, dict) and all(
+        isinstance(k, str) and isinstance(v, str) and k and v
+        for k, v in mapping.items()
+    ):
+        out["openrouter_model_map"] = dict(mapping)
+    else:
+        logger.warning(
+            "policy file %s: bad openrouter_model_map value %r (need a flat "
+            "dict of model id -> model id); not applied",
+            path,
+            mapping,
         )
     return out
 
@@ -1401,9 +1680,62 @@ def create_app(
             # client that marks its own turns is passed through untouched.
             base = request.app[OPENROUTER_BASE]
             request.app[STATS]["openrouter"] += 1
+            # Redirect a LIVE session to another model (policy-driven, see
+            # _load_policy_file). The client's id was already checked against
+            # allowed_models above, so this can only narrow, never widen.
+            effective_model = model
+            model_map = _effective_policy(request.app).get("openrouter_model_map")
+            if model_map and model in model_map:
+                effective_model = model_map[model]
+                body, map_diagnosis = _rewrite_body_model(body, effective_model)
+                logger.warning(
+                    "openrouter model map: %s -> %s (%s)",
+                    model,
+                    effective_model,
+                    map_diagnosis,
+                )
             if request.path == "/v1/messages":
-                body, cache_diagnosis = _apply_cache_markers(body)
-                logger.info("openrouter cache markers: %s", cache_diagnosis)
+                # Marker NUR fuer Ziele, die explizite Breakpoints verlangen.
+                # Gemessen + dokumentiert: Alibaba/Qwen cached ausschliesslich
+                # explizit ("requires explicit cache breakpoints"), Z.AI cached
+                # AUTOMATISCH ("does not require any additional configuration")
+                # und die Doku sagt NICHT, was Z.AI mit einem gesendeten Marker
+                # tut. Also schicken wir dorthin keinen: ein Marker, den das
+                # Ziel nicht braucht, kann nichts gewinnen und im unbekannten
+                # Fall etwas kosten. Affinitaet braucht dagegen JEDES Ziel --
+                # sie entscheidet, ob der naechste Turn dieselbe Instanz und
+                # damit denselben Cache trifft.
+                if _destination_wants_explicit_markers(effective_model):
+                    body, cache_diagnosis = _apply_cache_markers(body)
+                else:
+                    # effective_model, NICHT model: nach einer Umschreibung ist
+                    # das Quell-Modell fuer diese Aussage die falsche Auskunft
+                    # (es sagte "automatic caching: qwen/...", und Qwen cached
+                    # genau nicht automatisch). Instrument-Text nennt das Ziel.
+                    cache_diagnosis = (
+                        f"skipped (automatic caching: {effective_model})"
+                    )
+                body, affinity_diagnosis = _apply_session_affinity(body)
+                provider_order = _effective_policy(request.app).get(
+                    "openrouter_provider_order"
+                )
+                if provider_order:
+                    body, provider_diagnosis = _apply_provider_order(
+                        body, provider_order
+                    )
+                else:
+                    provider_diagnosis = "unpinned (no policy order)"
+                # WARNING, not INFO: measured 2026-09-14, this router's INFO
+                # lines never reach the journal, so the one line that says
+                # whether the cache fill did anything was unobservable for the
+                # whole day it was wrong. A diagnosis nobody can read is not a
+                # diagnosis (INDIKATOR-GESETZ).
+                logger.warning(
+                    "openrouter cache: markers[%s] affinity[%s] provider[%s]",
+                    cache_diagnosis,
+                    affinity_diagnosis,
+                    provider_diagnosis,
+                )
         else:
             base = request.app[UPSTREAM_BASE]
             request.app[STATS]["upstream"] += 1
