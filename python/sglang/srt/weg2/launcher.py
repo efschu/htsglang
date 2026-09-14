@@ -5701,13 +5701,45 @@ def choose_host_ledger(
             comparing=(str(inject_mode) == weight_exchange.INJECT_SHADOW))),
         "inject_mode": str(inject_mode),
     } if _bounce_charge_bytes else None
-    # #1369: ONE call, both halves of the same fact -- see the function's own
-    # docstring for why the byte counts and the declaration must never be
-    # computed at two separate call sites.
+    # #1369 BOOT7 FIX (2026-09-14): NOT `ring_absent_by_design(weight_source,
+    # inject_mode)`. That call reads ONLY the weight-source/inject axis and
+    # is correct EXCLUSIVELY under `auto` (where it is this predicate's own
+    # definition -- see `main`'s resolution site, `weights_cpu_backup_armed
+    # = not ring_absent_by_design(...)`). Under an EXPLICIT
+    # `--weg2-weights-cpu-backup on`, `weights_cpu_backup_armed` is forced
+    # True regardless of weight_source/inject_mode (the whole point of an
+    # A/B comparison instrument that keeps the ring under exchange+
+    # authoritative) -- but the bare call above still returned True (ring
+    # "absent by design") for exactly that arm, because it never learned
+    # about the flag at all. `weg2_weights_cpu_backup_ring_kw`'s own `if
+    # weights_cpu_backup_armed:` branch then passed that stale True through
+    # UNCHANGED beside the real, non-zero ring bytes `on` built -- the exact
+    # contradiction `price()`'s own guard exists to catch (boot xsn32,
+    # 6/6 dry runs, ValueError "ring_absent_by_design with a non-zero ring
+    # (ring_bytes=51036291072, ring_span1_bytes=51036291072)",
+    # host_ledger.py:3835).
+    #
+    # `weights_cpu_backup_armed` IS ALREADY THE FULL AUTHORITY over all
+    # three modes (`weight_exchange.weights_cpu_backup_armed`'s own
+    # docstring: on=True always, off=False always, auto=`not
+    # ring_absent_by_design(...)`) -- so "is the ring absent" is simply its
+    # negation in EVERY mode, not only under auto. Verified identity for
+    # auto: `weights_cpu_backup_armed = not ring_absent_by_design(...)`
+    # there means `not weights_cpu_backup_armed == ring_absent_by_design(...)`
+    # exactly, so this is BYTE-IDENTICAL to the old call for every pre-#1369
+    # boot (which only ever ran `auto`). Under `on`/`off` it is now correct
+    # where the old call was not, and it needs no new parameter, no new
+    # function, and no second authority: the SAME resolved bool already
+    # reaches this call site.
+    #
+    # `ring_absent_by_design(weight_source, inject_mode)` ITSELF is
+    # untouched -- it stays exactly what `main`'s own `auto` branch (the
+    # ONE remaining caller of the bare two-argument form) needs, and that
+    # branch already only ever calls it when the mode IS auto.
     (_ring_bytes_kw, _ring_span1_bytes_kw,
      _ring_absent_by_design_kw) = weg2_weights_cpu_backup_ring_kw(
         ring_bytes, ring_span1_bytes,
-        ring_absent_by_design(weight_source, inject_mode),
+        not weights_cpu_backup_armed,
         weights_cpu_backup_armed,
     )
     ledger_kw = dict(
