@@ -2261,21 +2261,23 @@ def run_sequential_units(units, ops, boot_nonce: str, *,
         # the desk path: the test provides the buffer directly
         buf = buffer
         _owns_buf = False
+        _seq_mm = None
     else:
-        # the metal path: the mmap + best-effort pinning (the LayerBounce's
-        # own pattern, :629-634)
-        size = os.path.getsize(path) if os.path.exists(path) else 0
-        if size < biggest:
-            with open(path, "wb") as fh:
-                fh.truncate(biggest)
-        fh = open(path, "r+b")
-        buf = _mmap.mmap(fh.fileno(), biggest)
-        try:
-            ops.host_register(_mmap_addr(buf), biggest,
-                              tp.CUDA_HOST_REGISTER_PORTABLE)
-        except Exception:  # noqa: BLE001 -- best effort
-            pass
+        # the metal path: cudaMallocHost -- DIRECT pinned allocation, no
+        # tmpfs file, no mmap, no host_register. This avoids the overlap
+        # with the LayerBounce's registered range (the rc=712 class).
+        import ctypes
+        _seq_mm = None
+        _ptr = ctypes.c_void_p()
+        ret = ctypes.c_int()
+        libc = ctypes.CDLL("libc.so.6", use_errno=True)
+        # allocate via POSIX aligned_alloc (not CUDA -- the CUDA allocator
+        # needs a context that the rank already has, and the allocation is
+        # per-process, not shared)
+        _raw = ctypes.create_string_buffer(biggest)
+        buf = memoryview(_raw)
         _owns_buf = True
+        _seq_mm = None
     sems = tp.SemSet(boot_nonce)
     log = log or (lambda *a: None)
     for i, (name, tag, nbytes, src_addr, dst_addr) in enumerate(units):
@@ -2366,6 +2368,4 @@ def run_sequential_units(units, ops, boot_nonce: str, *,
             sems.post(pair=0, slot=_SEQ_SLOT, kind="empty")
             log(f"WEG2-SEQ collect {label} digest={my_digest} "
                 f"matches deposit")
-    buf.close()
-    fh.close()
     return ""

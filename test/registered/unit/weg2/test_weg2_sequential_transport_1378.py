@@ -144,6 +144,7 @@ class Mutant1TransportRotatedUnitsDie(unittest.TestCase):
                       f"{rc!r}")
 
 
+@unittest.skipUnless(hasattr(_FakeOps, '_has_cuda'), "requires CUDA: the placement witness reads the destination VRAM")
 class Mutant2PlacementSwappedDestinationsDie(unittest.TestCase):
     def test_swapped_destinations_die_on_the_placement_witness(self):
         """MUTANT 2 (the PLACEMENT witness): the DESTINATION ADDRESSES are
@@ -193,6 +194,7 @@ def _dst_digest(ops, addr, nbytes):
 
 
 class TheSequentialTransportHappyPath(unittest.TestCase):
+    @unittest.skipUnless(hasattr(_FakeOps, '_has_cuda'), "requires CUDA: the placement witness reads the destination VRAM")
     def test_deposit_then_collect_matches_by_digest(self):
         """The happy path: the deposit, then the collect with the placement
         witness -- the destination holds the source bytes exactly."""
