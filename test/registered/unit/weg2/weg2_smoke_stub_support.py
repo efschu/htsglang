@@ -124,6 +124,41 @@ def self_reads_reachable(cls: type, entry_names: Sequence[str]) -> Set[str]:
 #: unchanged) -- named here so a future reader knows to re-check the guard
 #: condition, not just the attribute's continued existence.
 LEGSTUB_EXCLUSIONS = {
+    "_weg2_rank": (
+        "method (weight_updater.py, #1378 xsn53): the sequential lane "
+        "derivation resolves THIS rank's identity when the caller passes no "
+        "`rank=`. Section [4] of the smoke drives the leg through the stub "
+        "override of `_weg2_seq_lane_descs` (a stub has no live model, so "
+        "the real derivation's address books could not answer), so the read "
+        "never runs on this caller."),
+    "_weg2_rank_param_table": (
+        "method (weight_updater.py): the address books' parameter table, "
+        "read by the real `_weg2_seq_lane_descs`. Same shape as "
+        "`_weg2_rank` above: the stub override answers the lane descs, so "
+        "the table is never built here."),
+    "scheduler": (
+        "attribute (weight_updater.py, `_weg2_rank`'s body: "
+        "`scheduler = self.scheduler`). Reached only through the real "
+        "`_weg2_seq_lane_descs`, which the stub overrides; dead for this "
+        "caller."),
+    "tp_worker": (
+        "attribute set in _Stub.__init__ (`self.tp_worker = "
+        "_FakeWorker(...)`) for the address books. Reached only through the "
+        "real `_weg2_seq_lane_descs` (the region-tag read), which the stub "
+        "overrides; dead for this caller."),
+    "_weg2_seq_lane_descs": (
+        "method (weight_updater.py, #1378 xsn53): the sequential lane desc "
+        "derivation from the join. The smoke's `_LegStub` OVERRIDES it with "
+        "its own stub body (a stub has no live model, so the real "
+        "derivation's address books could not answer); excluded because the "
+        "stub provides it by construction, which the source-level walk "
+        "cannot see."),
+    "_weg2_card_uuid": (
+        "method (weight_updater.py): resolves the rank's NVML uuid for the "
+        "per-copy card lock. METAL-ONLY: needs a CUDA device. Section [4] "
+        "of the smoke runs the leg on the desk, where the resolution is "
+        "fail-soft to None (the stub pins `weg2_card_uuid_cache = "
+        "\"unset\"` for exactly that path)."),
     "_weg2_xchg_tag_seen": (
         "dataclass field (weight_updater.py:451, default None), read only "
         "inside `if tag is not None and phase == bx.PHASE_DEPOSIT:` -- this "
@@ -162,31 +197,12 @@ STUB_EXCLUSIONS: dict = {}
 #: region=None, sems=sems)` -- neither `tag=` nor `rank=` -- so both guards
 #: below are dead branches for exactly this caller too.
 LEG_REPLAY_STUB_EXCLUSIONS = {
-    "_weg2_seq_units_from_join": (
-        "method (weight_updater.py, added by #1378 xsn52): the sequential "
-        "transport's unit derivation from the join's tensors. METAL-ONLY: "
-        "it needs real models and address books (the deposit and collect "
-        "address books resolve per-side VRAM pointers). The leg replay's "
-        "stub exercises the transport through its own plan derivation, "
-        "not through this method."),
-    "_weg2_model_for_group": (
-        "method (weight_updater.py, added by #1378 xsn52): returns the "
-        "model runner for a given group. METAL-ONLY: needs real workers. "
-        "The leg replay's stub resolves addresses through its own "
-        "borrowed _weg2_join_src_addr/_weg2_join_dst_addr."),
-    "_weg2_card_uuid": (
-        "method (weight_updater.py): resolves the rank's NVML uuid for "
-        "the per-copy card lock. METAL-ONLY: needs a CUDA device. The "
-        "sequential form's leg replay runs on the desk without CUDA."),
-    "_weg2_rank_param_table": (
-        "borrowed by the leg replay's _Stub.__init__ (a setattr loop, not "
-        "a class attribute) -- the ratchet's dir() check finds it because "
-        "the loop ran during setUp, but the source-level walk doesn't see "
-        "it. Excluded because the stub provides it by construction."),
-    "tp_worker": (
-        "set in _Stub.__init__ as self.tp_worker = _FakeWorker(...) -- "
-        "the production code reads it for the address books. The stub "
-        "provides it by construction."),
+    "scheduler": (
+        "attribute (weight_updater.py, `_weg2_rank`'s body: "
+        "`scheduler = self.scheduler`). The leg replay's _Stub overrides "
+        "`_weg2_rank` outright (its identity is the replayed group/rank, "
+        "not the scheduler's), so the production body -- and with it the "
+        "`self.scheduler` read -- is never reached on this caller."),
     "_weg2_xchg_tag_seen": (
         "dataclass field (weight_updater.py:451, default None), read only "
         "inside `if tag is not None and phase == bx.PHASE_DEPOSIT:` -- "

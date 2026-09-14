@@ -1819,6 +1819,53 @@ def sem_name(boot_nonce: str, pair: int, slot: int, kind: str) -> str:
     return f"/{REGION_PREFIX}{boot_nonce}-{src}-{dst}-{int(slot)}-{kind}"
 
 
+def cross_sem_name(boot_nonce: str, src_card: int, dst_card: int, slot: int,
+                   kind: str) -> str:
+    """The CROSS name, from the two cards the caller actually holds.
+
+    #1378 xsn53 (W15 DIE BLINDHEIT GENOMMEN).  ``sem_name`` above checks only
+    the RANGE of ``pair`` -- and a diagonal id that happens to land in
+    ``[0, N_PAIRS)`` passes it and resolves a FOREIGN cross semaphore.  That is
+    the measured xsn52 wall: the sequential transport held an on-card lane and
+    asked the cross path with the literal ``pair=0``, which is
+    ``CROSS_PAIRS[0]`` -- the link between two DIFFERENT cards -- so all six
+    ranks posted and waited on one semaphore nobody's peer was posting.  A
+    range check cannot catch that shape, because the two namespaces are both
+    plain ints.
+
+    The catch has to happen where the caller still knows WHICH lane it holds:
+    the two cards.  So the CROSS path takes them, and ``src == dst`` -- the
+    definition of the on-card diagonal, the same predicate
+    :func:`weight_exchange_bounce.pair_of` answers ``None`` to -- is refused
+    HERE, by name, before any name is built.  A caller that cannot say the two
+    cards has no business on the cross path; the diagonal's own door is
+    :func:`diagonal_sem_name`.
+    """
+    s, d = int(src_card), int(dst_card)
+    if s == d:
+        raise Weg2XchgDiagonalHasNoCrossPair(
+            f"W15 Weg2XchgDiagonalHasNoCrossPair: src_card={s} == dst_card={d} "
+            f"is the on-card DIAGONAL, and the cross path has no name for it "
+            f"-- the 24 cross names all encode two DIFFERENT cards "
+            f"({CROSS_PAIRS}). Resolving it here would hand the caller a "
+            f"foreign pair's semaphore and both ends of the co-located pair "
+            f"would meet on a lane neither of them owns (the measured xsn52 "
+            f"hang). The diagonal's handshake is "
+            f"diagonal_sem_name(boot, card={s}, slot, kind)"
+        )
+    if not (0 <= s < N_CARDS and 0 <= d < N_CARDS):
+        raise ValueError(
+            f"src_card={s!r} / dst_card={d!r} is not one of this rig's "
+            f"{N_CARDS} cards")
+    key = (s, d)
+    if key not in CROSS_PAIRS:
+        raise ValueError(
+            f"({s}, {d}) is not one of the directed CROSS pairs "
+            f"{CROSS_PAIRS} -- a link this rig does not have, so a name for "
+            f"it would be a handshake nobody armed")
+    return sem_name(boot_nonce, CROSS_PAIRS.index(key), slot, kind)
+
+
 def diagonal_sem_name(boot_nonce: str, card: int, slot: int, kind: str) -> str:
     """The DIAGONAL lane's own semaphore name, keyed by CARD (#1334).
 

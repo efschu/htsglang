@@ -690,7 +690,10 @@ class RuntimeEnforcementIsWiredCorrectly(CustomTestCase):
         src = inspect.getsource(wu)
         base = src.index("_lane_permit_active = (")
         acquire_i = src.index("_lane_permit.acquire(", base)
-        run_i = src.index("bx.run_bounce_leg(", acquire_i)
+        # #1378 xsn53: the leg's transport call is the SEQUENTIAL form now
+        # (`bx.run_sequential_units`, the lane form retired on this path);
+        # the ordering this test pins is acquire -> transport -> release.
+        run_i = src.index("bx.run_sequential_units(", acquire_i)
         release_i = src.index("_lane_permit.release()", run_i)
         self.assertLess(acquire_i, run_i,
                         "the permit must be acquired BEFORE the buffer")
@@ -855,23 +858,48 @@ class TheCollectorFreesTheFileNotOnlyThePermit(CustomTestCase):
                 ops = FakeDeviceOps(root, 0)
                 _seed_source(ops)
                 mgr = _manager()
-                mgr._weg2_xchg_bounce_leg(
-                    descs=src_descs, ops=ops, boot_nonce=nonce, terms=terms,
-                    mode=wx.INJECT_AUTHORITATIVE, device=0, hook="source",
-                    sems=tp.SemSet(nonce), tag=TAG, shm_root=root,
-                )
+                # #1378 xsn53: the leg derives its lane descs from the JOIN,
+                # which needs this boot's manifests. THIS test prices the
+                # #1385 permit/file lifecycle, not the plan, so the
+                # derivation is stubbed to the leg's own descs -- exactly
+                # what the two smokes' stubs do, for the same reason.
+                from sglang.srt.managers.scheduler_components import (
+                    weight_updater as _wu)
+
+                _real_lane = _wu.SchedulerWeightUpdaterManager._weg2_seq_lane_descs
+                _wu.SchedulerWeightUpdaterManager._weg2_seq_lane_descs = (
+                    lambda self, **kw: list(descs_all))
+                try:
+                    mgr._weg2_xchg_bounce_leg(
+                        descs=src_descs, ops=ops, boot_nonce=nonce,
+                        terms=terms, mode=wx.INJECT_AUTHORITATIVE, device=0,
+                        hook="source", sems=tp.SemSet(nonce), tag=TAG,
+                        shm_root=root,
+                    )
+                finally:
+                    _wu.SchedulerWeightUpdaterManager._weg2_seq_lane_descs = _real_lane
+                # #1378 xsn53: the staged bytes live in the SEQUENTIAL
+                # form's per-lane buffer now, not in the lane form's
+                # bounce.bin -- the lifecycle this test prices moved with it.
                 paths_after_deposit = {
-                    lane: bx.bounce_path(nonce, root, lane)
+                    lane: bx.sequential_buffer_path(nonce, root, lane)
                     for lane in ("c0", "p0", "p1")
                 }
                 exists_after_deposit = {
                     lane: os.path.exists(p) for lane, p in paths_after_deposit.items()
                 }
-                mgr._weg2_xchg_bounce_leg(
-                    descs=dst_descs, ops=ops, boot_nonce=nonce, terms=terms,
-                    mode=wx.INJECT_AUTHORITATIVE, device=0, hook="authoritative",
-                    sems=tp.SemSet(nonce), tag=TAG, shm_root=root,
-                )
+                # the stub above stays up for the collect leg too
+                _wu.SchedulerWeightUpdaterManager._weg2_seq_lane_descs = (
+                    lambda self, **kw: list(descs_all))
+                try:
+                    mgr._weg2_xchg_bounce_leg(
+                        descs=dst_descs, ops=ops, boot_nonce=nonce,
+                        terms=terms, mode=wx.INJECT_AUTHORITATIVE, device=0,
+                        hook="authoritative", sems=tp.SemSet(nonce), tag=TAG,
+                        shm_root=root,
+                    )
+                finally:
+                    _wu.SchedulerWeightUpdaterManager._weg2_seq_lane_descs = _real_lane
                 exists_after_collect = {
                     lane: os.path.exists(p) for lane, p in paths_after_deposit.items()
                 }
@@ -895,17 +923,19 @@ class TheCollectorFreesTheFileNotOnlyThePermit(CustomTestCase):
                          f"a lane file survived its own collector: {after_collect}")
         self.assertEqual(mismatched, [], "the fix must not cost correctness")
 
-    def test_without_a_cap_the_default_arm_is_byte_identical_files_persist(self):
-        """The other half of the promise: `_lane_permit_active` gates the
-        unlink exactly as it gates the permit, so a boot that never set
-        `--xchg-lanes-concurrent` keeps its pre-existing behaviour (files
-        outlive the collector, exactly as `BounceTerms.total_bytes`'s own
-        `n_lanes`-wide charge already assumes)."""
+    def test_without_a_cap_the_collector_still_frees_the_lane_buffer(self):
+        """The other half of the promise, AT THE SEQUENTIAL FORM (#1378
+        xsn53): the lane form gated its unlink on `_lane_permit_active`
+        (store-and-forward wanted the bytes to outlive the collector); the
+        sequential form's buffer holds ONE tag's window set that the
+        collector is the last to read, so it is freed at the collect's end
+        with or without a cap -- the #1385 lesson applied at this form's own
+        site, where the host-RAM law needs it."""
         _terms, after_deposit, after_collect, mismatched = self._round_trip(cap=0)
         self.assertTrue(all(after_deposit.values()), after_deposit)
-        self.assertTrue(all(after_collect.values()),
-                        "the default arm must be UNCHANGED by this fix: "
-                        f"a file disappeared with no cap set: {after_collect}")
+        self.assertFalse(any(after_collect.values()),
+                         "the sequential form's lane buffer must be freed by "
+                         f"its collector with no cap set: {after_collect}")
         self.assertEqual(mismatched, [])
 
     def test_unlink_lane_buffer_is_idempotent(self):

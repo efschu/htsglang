@@ -1,25 +1,30 @@
 # SPDX-License-Identifier: Apache-2.0
 """#1378 xsn44: DER SEQUENTIELLE EINHEITEN-TRANSPORT + BEIDE ZEUGEN.
 
-DAS DESIGN: EIN Host-Puffer (die groesste Einheit + Luft), die Einheiten
-= die (tag, name)-Paare der PLAN-PARAM-Liste, der Deposit kopiert die
-Einheit in den Puffer und postet EIN Signal, der Collect wartet auf das
-Signal, kopiert in sein Ziel, postet verbraucht. Sequenziell.
+DAS DESIGN: EIN Host-Puffer je LANE, die Einheiten = die Stuecke des Lane-
+Desc-Listen-Joins, der Deposit kopiert das Stueck in sein Fenster und postet
+EIN Signal, der Collect wartet auf das Signal, liest sein Fenster, kopiert in
+sein Ziel.  Sequenziell, ohne dass der Deposit auf den Collector wartet (die
+#1374-Vertragsform: full ist COUNTING, der einzige Wait ist der je Tag).
 
 DIE ZWEI ZEUGEN:
-* MUTANT 1 (Transport, sha256-Puffer-Digest): die Einheiten rotiert ->
+* MUTANT 1 (Transport, sha256-Fenster-Digest): die Einheiten rotiert ->
   der Digest stirbt (die falschen Bytes gelesen).
-* MUTANT 2 (Platzierung, der Ziel-Digest): die Zieladressen vertauscht
-  bei identischen Puffer-Lesevorgaengen -> der Puffer-Digest laeuft
-  GRUENFAELSCH (der Transport war korrekt), aber die Bytes stehen am Ziel
-  an der falschen Stelle: still falsch, sichtbar erst in der Qualitaet.
-  Stirbt am Ziel-Digest (dst_digest_fn; am Metall: der SEAM-DIGEST-Fold,
-  positionsgewichtete, 362856ea7c).
+* MUTANT 2 (Platzierung, der Ziel-Digest): die Zieladressen vertauscht ->
+  der Puffer-Digest laeuft GRUENFAELSCH, aber die Bytes stehen am Ziel an
+  der falschen Stelle.  Stirbt am Ziel-Digest (dst_digest_fn).
+
+xsn53-KORREKTUR: die Tests fahren jetzt DESC-Liste + ``slot_bytes`` ueber
+``run_sequential_units`` (die Produktform), nicht mehr die fruehere
+Einheiten-Tupel-Form -- und der Puffer ist das GETEILTE tmpfs-mmap, sodass
+die Digests ueber dieselben Bytes laufen, die der Deposit geschrieben hat.
+Die fruehere Form gruentgte auf einem PRIVATEN Puffer, in dem beide Seiten
+denselben Null-Digest bekamen (der int/int-Zweig des Fake-Ops kopierte
+nichts) -- gruen bei Null transportierter Bytes.
 """
 
 from __future__ import annotations
 
-import hashlib
 import os
 import tempfile
 import unittest
@@ -28,203 +33,187 @@ os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 
 from sglang.srt.weg2 import weight_exchange_bounce as bx  # noqa: E402
 from sglang.srt.weg2 import weight_exchange_region as xr  # noqa: E402
+from sglang.srt.weg2 import weight_exchange_transport as tp  # noqa: E402
+from sglang.srt.weg2 import weight_exchange as wx  # noqa: E402
 
 
-class _FakeOps:
-    """Tracks VRAM as a dict; the buffer as a bytearray the test controls.
-    memcpy_async between them is a dict/bytearray copy."""
+class _MemOps:
+    """The same address-honest ops the xsn53 identity file uses, inlined so
+    this module stays importable without a sibling on sys.path."""
 
-    def __init__(self, buffer):
-        self.buffer = buffer  # a bytearray the test controls
-        self.vram = {}  # addr -> bytes
+    def __init__(self):
+        self.vram = {}
+        self.vram_real = {}
+        self.vram_size = {}
+
+    def hook(self, addr, nbytes):
+        import ctypes
+        buf = ctypes.create_string_buffer(nbytes)
+        # KEEP the object alive: only the address would let the allocator hand
+        # the same block out twice, which is a corruption the digest then
+        # cannot attribute.
+        self.vram[addr] = buf
+        self.vram_real[addr] = ctypes.addressof(buf)
+        self.vram_size[addr] = nbytes
+
+    def _real(self, addr):
+        for fake, real in self.vram_real.items():
+            if fake <= addr < fake + self.vram_size[fake]:
+                return real + (addr - fake)
+        return addr  # the shared mmap itself
+
+    def write(self, addr, data):
+        import ctypes
+        ctypes.memmove(self._real(addr), bytes(data), len(data))
+
+    def read(self, addr, nbytes):
+        import ctypes
+        return ctypes.string_at(self._real(addr), nbytes)
+
+    def digest(self, addr, nbytes):
+        import hashlib
+        return hashlib.sha256(self.read(addr, nbytes)).hexdigest()[:16]
 
     def memcpy_async(self, dst, src, nbytes, stream):
-        if isinstance(dst, memoryview):
-            # D2H: dst is the host buffer, src is a VRAM addr
-            data = self.vram.get(src, b"\x00" * nbytes)
-            self.buffer[0:nbytes] = data[:nbytes]
-        elif isinstance(src, memoryview):
-            # H2D: src is the host buffer, dst is a VRAM addr
-            self.vram[dst] = bytes(src[:nbytes])
-        elif isinstance(dst, int) and isinstance(src, int):
-            # the metal path: both are addresses -- no-op on the desk
-            pass
-        else:
-            raise AssertionError(
-                f"memcpy_async: expected memoryview for the buffer side, "
-                f"got dst={type(dst).__name__} src={type(src).__name__}")
+        import ctypes
+        ctypes.memmove(self._real(dst), self._real(src), nbytes)
+
+    def memcpy2d_async(self, dst, dpitch, src, spitch, run_bytes, rows,
+                       stream):
+        import ctypes
+        for r in range(rows):
+            ctypes.memmove(self._real(dst + r * dpitch),
+                           self._real(src + r * spitch), run_bytes)
 
     def synchronize(self, stream=0):
         return None
 
-    def host_register(self, ptr, nbytes, flags=0):
-        pass
 
-    def host_unregister(self, ptr):
-        pass
-
-
-def _make_placement_witness(ops):
-    """Returns a closure: (addr, nbytes) -> hex digest of the fake VRAM."""
-    def witness(addr, nbytes):
-        import hashlib
-        return hashlib.sha256(
-            bytes(ops.vram[addr][:nbytes])).hexdigest()[:16]
-    return witness
+def _desc(name, nbytes, *, src=1, dst=1, src_ptr=None, dst_ptr=None):
+    return wx.XchgDesc(
+        tag="weights_0", src_rank=src, dst_rank=dst, param_name=name,
+        kind=tp.FLAT, nbytes=nbytes, rows=1, run_bytes=nbytes, spitch=0,
+        dpitch=0, src_ptr=src_ptr, dst_ptr=dst_ptr,
+    )
 
 
-def _buf_digest(buf, nbytes):
-    import hashlib
-    return hashlib.sha256(bytes(buf[:nbytes])).hexdigest()[:16]
+class _TransportHarness(unittest.TestCase):
+    """One lane, real shared buffer, real byte moves, no CUDA."""
 
-
-class TheSequentialTransport(unittest.TestCase):
     def setUp(self):
         self.root = tempfile.mkdtemp(prefix="weg2-seq-")
-        self.nonce = f"seqtest{os.getpid()}"
+        self.nonce = f"seq1378{os.getpid()}"
         xr.unlink_semaphores(self.nonce)
         xr.create_semaphores(self.nonce)
-        # the buffer: a real bytearray that both the fake ops and the
-        # sequential form can access (the sequential form creates its own
-        # mmap, but the test's fake ops tracks the same content via the
-        # bytearray reference it was given)
-        self.buf = bytearray(4096)
+        self.ops = _MemOps()
+        self.lines = []
 
     def tearDown(self):
         import shutil
         shutil.rmtree(self.root, ignore_errors=True)
         try:
             xr.unlink_semaphores(self.nonce)
-        except Exception:
+        except BaseException:
             pass
 
-    def _run_deposit_and_collect(self, ops, units, dst_addrs):
-        deposit_units = [(u[0], u[1], u[2], src, None)
-                         for u, (_, src) in zip(units, dst_addrs)]
-        rc = bx.run_sequential_units(
-            deposit_units, ops, self.nonce, shm_root=self.root,
-            phase=bx.PHASE_DEPOSIT, digest_fn=None)
-        self.assertEqual(rc, "", f"deposit failed: {rc}")
-        collect_units = [(u[0], u[1], u[2], None, dst)
-                         for u, (_, dst) in zip(units, dst_addrs)]
-        rc = bx.run_sequential_units(
-            collect_units, ops, self.nonce, shm_root=self.root,
-            phase=bx.PHASE_COLLECT, digest_fn=None)
-        return rc
+    def _vram_pair(self, nbytes, i):
+        """A deposit-side and a collect-side stand-in, both really backed."""
+        src, dst = 0x1000 + i * 512, 0x8000 + i * 512
+        self.ops.hook(src, nbytes)
+        self.ops.hook(dst, nbytes)
+        return src, dst
+
+    def _deposit(self, descs):
+        return bx.run_sequential_units(
+            descs, self.ops, self.nonce, slot_bytes=1 << 30,
+            shm_root=self.root, phase=bx.PHASE_DEPOSIT,
+            log=self.lines.append, card=1)
+
+    def _collect(self, descs, dst_digest_fn=None):
+        return bx.run_sequential_units(
+            descs, self.ops, self.nonce, slot_bytes=1 << 30,
+            shm_root=self.root, phase=bx.PHASE_COLLECT,
+            dst_digest_fn=dst_digest_fn, log=self.lines.append, card=1)
 
 
-class Mutant1TransportRotatedUnitsDie(unittest.TestCase):
+class Mutant1TransportRotatedUnitsDie(_TransportHarness):
     def test_rotated_units_die_on_the_buffer_digest(self):
         """MUTANT 1 (the TRANSPORT witness): the collect's unit list is
-        ROTATED by one -- its unit 0 carries unit1's name/size and reads
-        the wrong window -- dies on the sha256 buffer digest vs the
+        ROTATED by one -- its piece 0 carries piece1's name/size and reads
+        the wrong window -- dies on the sha256 window digest vs the
         deposit's record."""
-        ops = _FakeOps(bytearray(4096))
-        nonce = "rot1"
-        xr.unlink_semaphores(nonce)
-        xr.create_semaphores(nonce)
-        units = [(f"unit{i}", f"weights_{i}", n, None, None)
-                 for i, n in enumerate([64, 128])]
-        src_addrs = [0x1000, 0x1100]
-        # pre-fill the fake VRAM with distinct per-unit data
-        for i, (name, tag, n, src, dst) in enumerate(units):
-            ops.vram[src] = bytes([0xA0 + i] * n)
-        deposit_units = [(u[0], u[1], u[2], src_addrs[i], None)
-                         for i, u in enumerate(units)]
-        bx.run_sequential_units(
-            deposit_units, ops, nonce, shm_root="/dev/shm",
-            phase=bx.PHASE_DEPOSIT, digest_fn=None)
-        rotated = [(units[1][0], units[1][1], units[1][2], None, 0x2000),
-                   (units[0][0], units[0][1], units[0][2], None, 0x2100)]
-        rc = bx.run_sequential_units(
-            rotated, ops, nonce, shm_root="/dev/shm",
-            phase=bx.PHASE_COLLECT, digest_fn=None)
+        nbytes = [64, 128]
+        descs = []
+        for i, n in enumerate(nbytes):
+            src, dst = self._vram_pair(n, i)
+            self.ops.write(src, bytes([0xA0 + i]) * n)
+            descs.append(_desc(f"unit{i}", n, src_ptr=src, dst_ptr=dst))
+        rc = self._deposit(descs)
+        self.assertEqual(rc, "", f"the deposit: {rc}")
+        rotated = [_desc(descs[1].param_name, descs[1].nbytes,
+                         src_ptr=descs[1].src_ptr, dst_ptr=descs[1].dst_ptr),
+                   _desc(descs[0].param_name, descs[0].nbytes,
+                         src_ptr=descs[0].src_ptr, dst_ptr=descs[0].dst_ptr)]
+        rc = self._collect(rotated)
         self.assertIn("digest mismatch", rc,
                       f"the rotated units must die on the transport digest: "
                       f"{rc!r}")
 
+    def test_an_honest_list_passes_and_moves_the_bytes(self):
+        """THE COUNTERPROBE the old form could not run: the unrotated list
+        moves the deposit's own bytes to their own destinations.
 
-@unittest.skipUnless(hasattr(_FakeOps, '_has_cuda'), "requires CUDA: the placement witness reads the destination VRAM")
-class Mutant2PlacementSwappedDestinationsDie(unittest.TestCase):
+        Red on 69f727dac2: the buffer was private, so this passed with ZERO
+        bytes crossing (both sides digested their own zeros)."""
+        nbytes = [64, 128, 32]
+        descs = []
+        for i, n in enumerate(nbytes):
+            src, dst = self._vram_pair(n, i)
+            self.ops.write(src, bytes([0xC0 + i]) * n)
+            descs.append(_desc(f"unit{i}", n, src_ptr=src, dst_ptr=dst))
+        self.assertEqual(self._deposit(descs), "")
+        self.assertEqual(self._collect(descs), "")
+        for i, d in enumerate(descs):
+            self.assertEqual(
+                self.ops.read(int(d.dst_ptr), int(d.nbytes)),
+                bytes([0xC0 + i]) * int(d.nbytes),
+                f"piece {i}: the placement must be exact")
+
+
+class Mutant2PlacementSwappedDestinationsDie(_TransportHarness):
     def test_swapped_destinations_die_on_the_placement_witness(self):
         """MUTANT 2 (the PLACEMENT witness): the DESTINATION ADDRESSES are
-        swapped (unit 0's bytes land at unit 1's destination and vice
-        versa) with IDENTICAL buffer reads -- the sha256 buffer digest
-        passes green-falsely (the transport was correct), and the
-        placement is still wrong: unit 0's destination holds unit 1's
-        bytes, silent until quality. Dies on the destination digest vs
-        the deposit's record -- the witness half the buffer digest does
-        not cover."""
-        ops = _FakeOps(bytearray(4096))
-        nonce = "swap1"
-        xr.unlink_semaphores(nonce)
-        xr.create_semaphores(nonce)
-        units = [(f"unit{i}", f"weights_{i}", n, None, None)
-                 for i, n in enumerate([64, 128])]
-        src_addrs = [0x1000, 0x1100]
-        for i, (name, tag, n, src, dst) in enumerate(units):
-            ops.vram[src] = bytes([0xB0 + i] * n)
-        deposit_units = [(u[0], u[1], u[2], src_addrs[i], None)
-                         for i, u in enumerate(units)]
-        bx.run_sequential_units(
-            deposit_units, ops, nonce, shm_root="/dev/shm",
-            phase=bx.PHASE_DEPOSIT, digest_fn=None)
-        swapped = [(u[0], u[1], u[2], None,
-                    [0x2000, 0x2100][1 - i]) for i, u in enumerate(units)]
-        rc = bx.run_sequential_units(
-            swapped, ops, nonce, shm_root="/dev/shm",
-            phase=bx.PHASE_COLLECT, digest_fn=None,
-            dst_digest_fn=_make_placement_witness(ops))
-        # HONEST SCOPING: the swapped destinations are a MAPPING error, not
-        # a transport error -- the transport executes the caller's mapping
-        # faithfully (unit 0's bytes at unit 1's destination: the content at
-        # the wrong place is the right content). The per-unit digest cannot
-        # see the address swap because the content follows the mapping.
-        # The PLACEMENT WITNESS is the SEAM-DIGEST (positionsgewichtet, am
-        # Ziel, per rank and direction) -- the only instrument that sees
-        # the permutation. The transport's job is to be faithful, which it
-        # is (rc == "" means every unit was copied without error)."""
-        self.assertEqual(rc, "",
-                         f"the transport must be faithful: {rc!r}")
+        swapped with IDENTICAL buffer reads -- the window digest passes
+        green-falsely and the bytes land at each other's place.  Dies on the
+        destination digest vs the deposit's record."""
+        nbytes = [64, 64]  # equal: the swap must not be a buffer overflow,
+        # it must be a PLACEMENT error the witness sees
+        descs = []
+        for i, n in enumerate(nbytes):
+            src, dst = self._vram_pair(n, i)
+            self.ops.write(src, bytes([0xB0 + i]) * n)
+            descs.append(_desc(f"unit{i}", n, src_ptr=src, dst_ptr=dst))
+        self.assertEqual(self._deposit(descs), "")
+        swapped = [_desc("unit0", 64, src_ptr=descs[0].src_ptr,
+                         dst_ptr=descs[1].dst_ptr),
+                   _desc("unit1", 64, src_ptr=descs[1].src_ptr,
+                         dst_ptr=descs[0].dst_ptr)]
 
+        def witness(addr, count):
+            # THE PLACEMENT WITNESS: what this destination holds must be the
+            # bytes of the tensor this destination is FOR -- read from the
+            # SOURCE that owns that tensor, not from the deposit's record
+            # (which follows the piece and would agree with whatever landed
+            # there).  This is the desk form of the SEAM-DIGEST's
+            # position-weighted fold, which is why the swap cannot hide.
+            return self.ops.digest(self.src_of[addr], count)
 
-def _dst_digest(ops, addr, nbytes):
-    import hashlib
-    return hashlib.sha256(bytes(ops.vram[addr][:nbytes])).hexdigest()[:16]
+        self.src_of = {int(d.dst_ptr): int(d.src_ptr) for d in descs}
 
-
-class TheSequentialTransportHappyPath(unittest.TestCase):
-    @unittest.skipUnless(hasattr(_FakeOps, '_has_cuda'), "requires CUDA: the placement witness reads the destination VRAM")
-    def test_deposit_then_collect_matches_by_digest(self):
-        """The happy path: the deposit, then the collect with the placement
-        witness -- the destination holds the source bytes exactly."""
-        ops = _FakeOps(bytearray(4096))
-        nonce = "happy1"
-        xr.unlink_semaphores(nonce)
-        xr.create_semaphores(nonce)
-        units = [(f"unit{i}", f"weights_{i}", n, None, None)
-                 for i, n in enumerate([64, 128, 32])]
-        src_addrs = [0x1000 + i * 0x100 for i in range(len(units))]
-        for i, (name, tag, n, src, dst) in enumerate(units):
-            ops.vram[src] = bytes([0xC0 + i] * n)
-        deposit_units = [(u[0], u[1], u[2], src_addrs[i], None)
-                         for i, u in enumerate(units)]
-        bx.run_sequential_units(
-            deposit_units, ops, nonce, shm_root="/dev/shm",
-            phase=bx.PHASE_DEPOSIT, digest_fn=None)
-        collect_units = [(u[0], u[1], u[2], None, 0x2000 + i * 0x100)
-                         for i, u in enumerate(units)]
-        rc = bx.run_sequential_units(
-            collect_units, ops, nonce, shm_root="/dev/shm",
-            phase=bx.PHASE_COLLECT, digest_fn=None,
-            dst_digest_fn=_make_placement_witness(ops))
-        self.assertEqual(rc, "", f"the collect must run clean: {rc}")
-        for i, (src, dst) in enumerate(zip(src_addrs,
-                                           [0x2000 + j * 0x100
-                                            for j in range(len(units))])):
-            self.assertEqual(bytes(ops.vram[dst][:units[i][2]]),
-                             bytes(ops.vram[src][:units[i][2]]),
-                             f"unit {i}: the placement must be exact")
+        rc = self._collect(swapped, dst_digest_fn=witness)
+        self.assertIn("placement mismatch", rc,
+                      f"the swapped destinations must die on the placement "
+                      f"witness: {rc!r}")
 
 
 if __name__ == "__main__":

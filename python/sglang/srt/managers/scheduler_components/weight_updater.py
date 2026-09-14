@@ -4186,51 +4186,137 @@ class SchedulerWeightUpdaterManager:
                 out.append((f"{src}-{dst}-{slot}", int(full), int(empty)))
         return out
 
-    def _weg2_seq_units_from_join(self, join, hook: str, group: str,
-                                  rank: int) -> list:
-        """The sequential transport's units from the JOIN's tensors.
+    def _weg2_seq_lane_descs(self, *, hook: str, group: str, rank: int,
+                             pair: Optional[int], card: Optional[int],
+                             tag) -> list:
+        """THE LANE'S OWN DESC LIST, derived from the JOIN -- one producer.
 
-        The join's tensors are the NEUTRAL cross-group layout: identical on
-        both sides (the same manifest rows, the same tag sets, the same
-        total bytes). The role-narrowed leg descs are DIFFERENT on each
-        side (the TP/PP phase asymmetry: D rank0 has 9 tags/1116 descs,
-        P rank0 has 6 tags/1937 descs, measured on weg2xsn43) -- a shared
-        buffer requires IDENTICAL unit lists, which only the join's
-        tensors provide.
+        The xsn52 commit derived the units from the join's raw TENSORS, which
+        carries neither the lane (every card would move every tensor) nor the
+        shard cut (the buffer would hold the unsharded extents of the whole
+        image).  What the two ends of a lane must share is the DESC LIST OF
+        THAT LANE, and the join already has a deterministic producer for it:
+        ``plan_from_join`` builds the cross-group plan from the manifests
+        alone, with no pointer input, so both ranks derive the same list
+        without exchanging metadata.  The role-narrowed ``descs`` this method's
+        caller received are NOT used for the layout -- they are the two halves
+        that diverged (measured on weg2xsn43: P rank0 6 tags/1937 descs, D
+        rank0 9 tags/1116 descs) and produced the W90.
 
-        Each unit: (name, tag, nbytes, src_addr, dst_addr).
-        The src_addr is resolved by the deposit rank's address book (its
-        own VRAM pointer for this tensor's shard).
-        The dst_addr is resolved by the collect rank's address book (its
-        own VRAM pointer for this tensor's piece).
+        THE LANE KEY is the same predicate ``pair_of`` answers: ``src ==
+        dst`` is the on-card diagonal (rank n of either group runs on
+        cards[n]), everything else is one of the directed cross pairs.
 
-        The buffer is sized to the SUM of all units' nbytes (the total
-        exchange), and the units are written sequentially into it --
-        the offsets are the running sum, identical on both sides because
-        the unit list is identical.
+        THE POINTERS are resolved per side, by the side that owns them: the
+        deposit answers ``src_ptr`` for the ranks it holds, the collect
+        ``dst_ptr``.  A side that resolves nothing has nothing to move on
+        this lane, and the transport refuses that shape rather than silently
+        moving zero bytes.
         """
-        import hashlib
-        units = []
-        for t in join.tensors:
-            name = str(t.param_name)
-            tag = str(t.tag)
-            nbytes = t.rows_full * t.cols_full * t.itemsize
-            src_addr = None
-            dst_addr = None
-            try:
-                src_addr = self._weg2_join_src_addr(
-                    "source", group, rank, self._weg2_model_for_group(group),
-                    region=tag)
-            except BaseException:
-                pass
-            try:
-                dst_addr = self._weg2_join_dst_addr(
-                    "destination", group, rank, self._weg2_model_for_group(group),
-                    region=tag)
-            except BaseException:
-                pass
-            units.append((name, tag, nbytes, src_addr, dst_addr))
-        return units
+        from sglang.srt.weg2 import weight_exchange as wx
+        from sglang.srt.weg2 import xchg_manifest as xm
+        from sglang.srt.weg2 import weight_exchange_region as xr
+
+        if (pair is None) == (card is None):
+            raise wx.Weg2XchgPlanDisagree(
+                f"W68 Weg2XchgPlanDisagree: the sequential lane needs exactly "
+                f"one of pair= (cross) or card= (diagonal), got pair={pair!r} "
+                f"card={card!r} -- a lane that cannot say which family it "
+                f"belongs to is the xsn52 shape")
+        if pair is not None:
+            src_card, dst_card = xr.CROSS_PAIRS[int(pair)]
+        else:
+            src_card = dst_card = int(card)
+
+        mans, why = xm.manifests_for_boot(pp_group="P", tp_group="D")
+        if mans is None:
+            raise wx.Weg2XchgPlanDisagree(
+                f"W68 Weg2XchgPlanDisagree: the sequential transport could "
+                f"not read the manifests it must derive its lane from: {why}")
+        join = xm.join_manifests(mans, pp_group="P", tp_group="D")
+        plan = xm.plan_from_join(join, direction=wx.leg_direction(hook, group))
+
+        model = self._weg2_model_for_group(group)
+        # THE SAME REGION KEY THE PLAN WAS BUILT WITH: `_weg2_shadow_plan`
+        # hands the books `region=region_tag` (the runner's own region tag), so
+        # a book built without it would key the table by the default region
+        # and answer None for every tensor of a runner whose tag resolves
+        # elsewhere -- a refusal that names the wrong mechanism.
+        region_tag = ""
+        try:
+            runner = getattr(self.tp_worker, "model_runner", None)
+            if runner is not None:
+                region_tag = wx.weights_region_tag_for(wx.RunnerShape.of(runner))
+        except BaseException:  # noqa: BLE001 -- an unclassified shape
+            region_tag = ""
+        if rank is None or int(rank) < 0:
+            # The shadow grader and the leg replay call the leg with no rank
+            # (whole-plan-at-once); the address books need THIS rank's identity
+            # to answer, so take the same resolved identity the instruments
+            # use rather than handing the book a None it cannot compare.
+            rank = self._weg2_rank()
+        if rank is None or int(rank) < 0:
+            raise wx.Weg2XchgPlanDisagree(
+                f"W68 Weg2XchgPlanDisagree: the sequential lane derivation "
+                f"needs this rank's identity and neither the caller nor "
+                f"_weg2_rank() could answer (group={group!r}) -- an "
+                f"unaddressable rank cannot say which bytes it holds")
+        src_book = self._weg2_join_src_addr("source", group, rank, model,
+                                            region=region_tag)
+        dst_book = self._weg2_join_dst_addr("destination", group, rank, model,
+                                            region=region_tag)
+
+        # DOES THIS RANK OWN AN END OF THE LANE?  The lane key is a CARD pair
+        # and rank n of either group runs on cards[n], so under the leg's
+        # direction this rank is the lane's source (source hook, src_card ==
+        # its rank) or its destination (every other hook, dst_card == its
+        # rank).  A lane whose BOTH ends are other ranks is not this rank's
+        # business -- the plan legitimately carries every pair's descs, and a
+        # rank that refused those would refuse lanes it never staged bytes
+        # for.  Skipping is the honest answer; refusing names a defect that
+        # is not there.
+        is_source_hook = str(hook) == "source"
+        my_rank = int(rank)
+        owns_lane = (src_card == my_rank) if is_source_hook else (dst_card == my_rank)
+
+        out = []
+        for d in plan.descs:
+            if int(d.src_rank) != int(src_card) or int(d.dst_rank) != int(dst_card):
+                continue
+            if tag is not None and str(getattr(d, "tag", "")) != str(tag):
+                continue
+            if src_book is not None and d.src_ptr is None:
+                d = d.replace(src_ptr=src_book(str(d.param_name),
+                                               int(d.src_rank)))
+            if dst_book is not None and d.dst_ptr is None:
+                d = d.replace(dst_ptr=dst_book(str(d.param_name),
+                                               int(d.dst_rank)))
+            out.append(d)
+        if not owns_lane:
+            return []
+        if not out:
+            raise wx.Weg2XchgPlanDisagree(
+                f"W68 Weg2XchgPlanDisagree: the join's plan carries NO desc "
+                f"for lane src={src_card} dst={dst_card} tag={tag!r} "
+                f"(direction={wx.leg_direction(hook, group)}), which THIS "
+                f"rank owns an end of.  An empty owned lane is a plan defect "
+                f"here, not an empty one: the caller grouped this lane from "
+                f"descs it did hold, so a join that answers nothing for it is "
+                f"exactly the two-sides-built-from-different-lists shape that "
+                f"the seam digest had to catch on the metal")
+        unresolved = [str(d.param_name) for d in out
+                      if (d.src_ptr is None if is_source_hook
+                          else d.dst_ptr is None)]
+        if unresolved:
+            raise wx.Weg2XchgPlanDisagree(
+                f"W68 Weg2XchgPlanDisagree: lane src={src_card} dst={dst_card} "
+                f"tag={tag!r}: {len(unresolved)} of {len(out)} descs have no "
+                f"address on the side this rank owns (first: "
+                f"{unresolved[0]}) -- the address book answered None, which "
+                f"means this rank does not hold the bytes the lane says it "
+                f"moves.  Copying them would move garbage; refusing names the "
+                f"first tensor instead")
+        return out
 
     def _weg2_model_for_group(self, group: str):
         """The model runner for the given group."""
@@ -4606,30 +4692,46 @@ class SchedulerWeightUpdaterManager:
                     try:
                         # #1378 xsn45 (THE WIRING): the sequential unit
                         # transport replaces the lane machinery on this leg.
-                        # The units: one per desc, with this rank's own
-                        # addresses (the deposit: its src_ptr; the collect:
-                        # its dst_ptr). The buffer digest and the digest
-                        # record live inside run_sequential_units; the
-                        # liveness callback threads through.
                         # #1378 xsn46 (NUTZER-FRAGE beantwortet): die
                         # nbytes kommen von der EMPFANGENDEN Seite (d.nbytes
                         # = die Desc's Empfangsgroesse, NICHT die Quell-
                         # groesse). Die Empfangsseite bestimmt, wie gross
                         # die Einheit im Puffer sein muss.
-                        # #1378 xsn52 (DER MANIFEST-LAYOUT-FIX): the units
-                        # come from the JOIN's tensors (the neutral cross-
-                        # group layout), not from the role-narrowed leg
-                        # descs. The leg descs are role-specific: D rank0
-                        # has 9 tags/1116 descs, P rank0 has 6 tags/1937
-                        # descs (measured on weg2xsn43). A shared buffer
-                        # requires IDENTICAL unit lists -- only the join's
-                        # tensors provide that. The addresses are resolved
-                        # per side by the address books.
-                        seq_units = self._weg2_seq_units_from_join(
-                            join, hook, group, rank)
+                        # #1378 xsn52 (DER MANIFEST-LAYOUT-FIX), CORRECTED IN
+                        # xsn53: the units come from the JOIN, but through the
+                        # join's OWN plan builder and filtered to THIS LANE --
+                        # not the join's raw tensors.  The raw tensor list has
+                        # no lane in it (every card would move every tensor)
+                        # and no shard cut (the buffer would hold the
+                        # unsharded extents, the whole image per rank).  What
+                        # both sides must share is the DESC LIST OF THE LANE,
+                        # and ``plan_from_join`` is the one producer of that:
+                        # deterministic from the manifests alone, so the
+                        # deposit rank and the collect rank derive the same
+                        # list without exchanging a byte of metadata.  That is
+                        # also what fixes the NameError this line died of
+                        # (`join` was read here and defined nowhere --
+                        # provider smoke 15/19, four red, measured).
+                        _lane_descs = self._weg2_seq_lane_descs(
+                            hook=hook, group=group, rank=rank,
+                            pair=pair, card=None if pair is not None
+                            else int(getattr(group[0], "dst_rank", device)),
+                            tag=tag)
+                        if not _lane_descs:
+                            # A lane whose both ends are other ranks: this
+                            # rank holds neither the source bytes nor the
+                            # destination window, so it has nothing to stage
+                            # and no handshake to meet.  Continuing would
+                            # post a token nobody's peer waits for.
+                            continue
                         last = bx.run_sequential_units(
-                            seq_units, ops, boot_nonce,
+                            _lane_descs, ops, boot_nonce,
                             shm_root=root, device=device, phase=phase,
+                            slot_bytes=int(getattr(terms, "buffer_bytes", 0)
+                                           or 0) or xr.SLOT_BYTES,
+                            pair=None if pair is None else int(pair),
+                            card=(None if pair is not None else
+                                  int(getattr(group[0], "dst_rank", device))),
                             liveness=self._weg2_cocard_peer_alive,
                             # #1358: the identity the host-slot lines carry.
                             # This is the only frame where the group and the

@@ -197,8 +197,17 @@ class _LegStub:
     """
 
     _weg2_xchg_bounce_leg = wu.SchedulerWeightUpdaterManager._weg2_xchg_bounce_leg
-    _weg2_seq_units_from_join = (
-        wu.SchedulerWeightUpdaterManager._weg2_seq_units_from_join)
+    # #1378 xsn53: the join-derived units became the LANE desc derivation
+    # (_weg2_seq_lane_descs).  The stub CANNOT borrow that one for real: it
+    # resolves addresses through this rank's live parameter table, and a stub
+    # has no model.  Section [4] audits the ADAPTER's arguments (phase, lane
+    # key, desc count), so the stub answers with the leg's own descs and says
+    # so -- the real derivation is driven by the leg replay and by
+    # test_weg2_sequential_lane_identity_1378.
+    def _weg2_seq_lane_descs(self, *, hook, group, rank, pair, card, tag):
+        return list(self._stub_descs)
+
+    _stub_descs = ()
     _weg2_model_for_group = (
         wu.SchedulerWeightUpdaterManager._weg2_model_for_group)
     _weg2_join_src_addr = wu.SchedulerWeightUpdaterManager._weg2_join_src_addr
@@ -371,6 +380,7 @@ def main() -> int:
 
         seen = []
         orig = _wb.run_bounce_leg
+        orig_seq = _wb.run_sequential_units
 
         def _record(descs, ops, nonce, **kw):
             seen.append((kw.get("phase"), kw.get("rendezvous") is not None,
@@ -385,6 +395,15 @@ def main() -> int:
         # _LegStub, _Sems, _Region: module-level now (#1363 round 2), see
         # their own docstrings above.
         _wb.run_bounce_leg = _record
+
+        def _record_seq(descs, ops, nonce, **kw):
+            seen.append((kw.get("phase"),
+                         kw.get("pair") is not None
+                         or kw.get("card") is not None,
+                         len(descs)))
+            return ""
+
+        _wb.run_sequential_units = _record_seq
         try:
             for hook, group in (("source", "P"), ("destination", "D")):
                 plan = plans.get((hook, group))
@@ -392,7 +411,9 @@ def main() -> int:
                     continue
                 seen.clear()
                 try:
-                    _LegStub()._weg2_xchg_bounce_leg(
+                    _stub = _LegStub()
+                    _stub._stub_descs = list(plan.descs)
+                    _stub._weg2_xchg_bounce_leg(
                         descs=list(plan.descs), ops=None,
                         boot_nonce=SMOKE_NONCE,
                         slot_bytes=WIDEST_LAYER_BYTES, depth=1,
@@ -416,6 +437,7 @@ def main() -> int:
                       f"hook={hook}: every cross leg carries a rendezvous")
         finally:
             _wb.run_bounce_leg = orig
+            _wb.run_sequential_units = orig_seq
             # #1363: THE CALLER-SIDE GAP -- THIRD SIGHTING of
             # `/dev/shm/weg2-xchg-bnc-smoke` left behind after this script
             # exits. `_weg2_xchg_bounce_leg` (weight_updater.py) is a REAL,

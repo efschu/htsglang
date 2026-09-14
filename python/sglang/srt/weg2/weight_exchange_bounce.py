@@ -2153,12 +2153,19 @@ class BounceSlots:
 _SEQ_SLOT = 0
 
 
-def sequential_buffer_path(boot_nonce: str, shm_root: str = xr.SHM_ROOT) -> str:
-    return f"{shm_root}/weg2-seq-{boot_nonce}/unit_buffer.bin"
+def sequential_buffer_path(boot_nonce: str, shm_root: str = xr.SHM_ROOT,
+                           lane: str = "") -> str:
+    # #1378 xsn53: PER LANE.  Three cards run their co-located pairs at the
+    # same time; a boot-wide file would put all three pairs' bytes on the
+    # same windows.  The lane key is the handshake's own (p<pair> / c<card>).
+    return (f"{shm_root}/weg2-seq-{boot_nonce}/"
+            + (f"{lane}_" if lane else "") + "unit_buffer.bin")
 
 
-def sequential_digest_path(boot_nonce: str, shm_root: str = xr.SHM_ROOT) -> str:
-    return f"{shm_root}/weg2-seq-{boot_nonce}/unit_digests.json"
+def sequential_digest_path(boot_nonce: str, shm_root: str = xr.SHM_ROOT,
+                           lane: str = "") -> str:
+    return (f"{shm_root}/weg2-seq-{boot_nonce}/"
+            + (f"{lane}_" if lane else "") + "unit_digests.json")
 
 
 def _mmap_addr(mmv: "_mmap.mmap") -> int:
@@ -2186,11 +2193,11 @@ def _mmap_addr(mm: "_mmap.mmap") -> int:
     return addr
 
 
-def run_sequential_units(units, ops, boot_nonce: str, *,
+def run_sequential_units(descs, ops, boot_nonce: str, *,
+                         slot_bytes: int,
                          shm_root: str = xr.SHM_ROOT,
                          device: int = 0,
                          phase: str = PHASE_DEPOSIT,
-                         digest_fn=None,
                          #: #1378 xsn44 (the PLACEMENT witness): the digest of
                          #: the DESTINATION after the copy-out, compared
  #: against the deposit's record BY NAME. The sha256 buffer digest
@@ -2209,6 +2216,21 @@ def run_sequential_units(units, ops, boot_nonce: str, *,
                          #: tests pass a bytearray; the metal path creates
                          #: a mmap and passes its memoryview.
                          buffer=None,
+                         #: #1378 xsn53 (DIE IDENTITAET): the lane's own
+                         #: handshake key -- EXACTLY ONE of the two, the same
+                         #: contract :class:`CrossSlotRendezvous` states.  A
+                         #: CROSS lane names its directed card pair; the
+                         #: DIAGONAL names its own card (rank n of either
+                         #: group runs on cards[n], ``pair_of``'s law).  The
+                         #: xsn52 wall was this call site asking the cross
+                         #: path with the literal ``pair=0`` for an on-card
+                         #: lane; the xsn53 desk finding was it then passing
+                         #: the UNIT INDEX as the diagonal's card, which
+                         #: bounds out at the fourth unit.  Neither id may be
+                         #: guessed here: the caller that grouped the lanes
+                         #: knows which one this is.
+                         pair: Optional[int] = None,
+                         card: Optional[int] = None,
                          log=None) -> str:
     """Der sequenzielle Einheiten-Transport: EIN Puffer, zwei Signale je
     Einheit, der Digest je Einheit als Bedingung.
@@ -2223,10 +2245,23 @@ def run_sequential_units(units, ops, boot_nonce: str, *,
     Refusal mit beiden Digests --, kopiere Puffer->dst, sync, post
     consumed).
 
-    Der Puffer: EIN shm-File, gross genug fuer die groesste Einheit,
-    von beiden Seiten gemappt. Die Signale: das SemSet-Paar full/consumed
-    auf _SEQ_SLOT. Sequenziell: die Einheit i+1 beginnt, nachdem i
-    verbraucht ist -- keine Ueberlappung, kein Band-Grenzvertrag.
+    Der Puffer: EIN shm-File je LANE, gross genug fuer die Summe der
+    Einheiten, von beiden Seiten der Lane gemappt. JE LANE und nicht je
+    Boot: drei Karten fahren ihre Paare GLEICHZEITIG, ein bootweites File
+    wuerde die drei Paare auf dieselben Bytes legen. Je Einheit EIN
+    Offset-Fenster (der laufende Summe), weil der Deposit ohne Wartung des
+    Collectors weiterschreibt -- die #1374-Vertragsform ("full is COUNTING",
+    der einzige Wait ist der je Tag, den der Aufrufer hinter dieser Funktion
+    fuehrt).  Kein host_register (die xsn47-Lektion: die Doppelregistrierung
+    kam aus der Ueberlappung mit dem LayerBounce-Bereich, nicht aus dem
+    Mapping selbst).
+
+    Das Signal: das full der Lane auf _SEQ_SLOT, je Einheit ein Token. Das
+    empty dieser Zeile ist der je-Tag-Drain des Aufrufers
+    (``CrossSlotRendezvous._DRAIN_SLOT == 0``) -- diese Funktion postet es
+    NICHT, sonst gaebe sie dem Drain-Zaehler Token, die den Deposit des
+    naechsten Tags freigeben wuerden, bevor der Collect sie gelesen hat
+    (gemessen als Weg2XchgBouncePhaseUnordered-Familie).
 
     Der Digest: ``digest_fn(bytes) -> hex`` ueber die Puffer-Region; der
     Deposit schreibt seinen Digest in die Digest-Datei, der Collect
@@ -2246,15 +2281,64 @@ def run_sequential_units(units, ops, boot_nonce: str, *,
     import json as _json  # noqa: PLC0415
     import time as _time  # noqa: PLC0415
 
-    # #1378 xsn46/48: the buffer must hold the SUM of all units' bytes,
-    # not the max of individual units -- the units are sequentially
-    # written into the same buffer, so the total footprint is the sum.
-    total_bytes = sum(int(u[2]) for u in units)
+    # #1378 xsn53: THE LANE'S OWN HANDSHAKE, RESOLVED AND LOGGED ONCE PER
+    # SIDE.  The coordinator's cheapest proof that the two ends of a lane
+    # meet BY NAME: this line is emitted by the deposit rank and by the
+    # collect rank, and the two must spell the same semaphore.  It is also
+    # the guard: a caller that cannot say which lane it holds is refused
+    # here rather than resolved onto somebody else's semaphore.
+    if (pair is None) == (card is None):
+        raise ValueError(
+            "run_sequential_units: exactly one of pair= (cross) or card= "
+            "(diagonal) must be given -- the two name different semaphore "
+            "families and a caller that cannot say which lane it holds is "
+            "the xsn52 shape (all six ranks on one foreign cross name)")
+    log = log or (lambda *a: None)
+    if pair is not None:
+        lane_key = f"p{int(pair)}"
+        # THE CROSS PATH'S NAME COMES FROM THE TWO CARDS, so a caller that
+        # holds an on-card lane and asks the cross path is refused here by
+        # name (W15) instead of resolving a foreign pair's semaphore -- the
+        # exact shape that hung xsn52 on all six ranks at once.
+        _src, _dst = xr.CROSS_PAIRS[int(pair)]
+        resolved_full = xr.cross_sem_name(boot_nonce, _src, _dst, _SEQ_SLOT,
+                                          "full")
+        _is_diagonal = False
+    else:
+        lane_key = f"c{int(card)}"
+        resolved_full = xr.diagonal_sem_name(boot_nonce, int(card), _SEQ_SLOT,
+                                             "full")
+        _is_diagonal = True
+    log(f"WEG2-SEQ lane={lane_key} phase={phase} handshake={resolved_full} "
+        f"descs={len(descs)} slot={_SEQ_SLOT}")
+
+    # THE PIECES, DERIVED IDENTICALLY ON BOTH SIDES.  ``batch_descs`` is the
+    # one producer of the slot layout the lane form already used: deterministic
+    # from the descriptor list alone, FLAT and STRIDED2D handled with the same
+    # pitch arithmetic the lane's own loops run, and a shape it cannot price
+    # REFUSED rather than copied as padding.  Feeding it the whole lane's bytes
+    # as one slot yields ONE batch whose ``slot_off`` fields are the running
+    # offsets this form stages the pieces at -- the W90 fix and the offset
+    # arithmetic from the same tested code, not two derivations of one fact.
+    _batches = tp.batch_descs(list(descs), slot_bytes=int(slot_bytes),
+                              first_seq=0)
+    if len(_batches) != 1:
+        raise ValueError(
+            f"run_sequential_units: the lane's bytes do not fit one buffer "
+            f"(slot_bytes={int(slot_bytes)} produced {len(_batches)} batches) "
+            f"-- the caller's slot_bytes is the lane's priced size and a "
+            f"second batch would need a second handshake this form does not "
+            f"have")
+    _batch = _batches[0]
+    total_bytes = int(_batch.total_bytes)
     biggest = total_bytes
     if biggest <= 0:
         return "no units"
-    path = sequential_buffer_path(boot_nonce, shm_root)
-    dpath = sequential_digest_path(boot_nonce, shm_root)
+    # #1378 xsn53: PER LANE, not per boot -- three cards run their pairs at
+    # the same time and a boot-wide file would put all three pairs' bytes on
+    # top of each other.
+    path = sequential_buffer_path(boot_nonce, shm_root, lane=lane_key)
+    dpath = sequential_digest_path(boot_nonce, shm_root, lane=lane_key)
     directory = os.path.dirname(path)
     os.makedirs(directory, exist_ok=True)
     if buffer is not None:
@@ -2262,39 +2346,64 @@ def run_sequential_units(units, ops, boot_nonce: str, *,
         buf = buffer
         _owns_buf = False
         _seq_mm = None
+        _fh = None
     else:
-        # the metal path: cudaMallocHost -- DIRECT pinned allocation, no
-        # tmpfs file, no mmap, no host_register. This avoids the overlap
-        # with the LayerBounce's registered range (the rc=712 class).
-        import ctypes
-        _seq_mm = None
-        _ptr = ctypes.c_void_p()
-        ret = ctypes.c_int()
-        libc = ctypes.CDLL("libc.so.6", use_errno=True)
-        # allocate via POSIX aligned_alloc (not CUDA -- the CUDA allocator
-        # needs a context that the rank already has, and the allocation is
-        # per-process, not shared)
-        _raw = ctypes.create_string_buffer(biggest)
-        buf = memoryview(_raw)
+        # #1378 xsn53 (DER PUFFER IST WIEDER GETEILT): the SHARED tmpfs mmap,
+        # per lane, NO host_register.  69f727dac2 had replaced this with
+        # ``ctypes.create_string_buffer`` -- a PRIVATE per-process allocation
+        # (its own comment said "per-process, not shared"), so the collect
+        # read its own zero-filled buffer and the transport could not move a
+        # byte between the two ranks.  The mapping itself was never the rc=712
+        # problem: the xsn47 lesson is that the OVERLAP came from
+        # cudaHostRegister on a range the LayerBounce had already registered,
+        # so the shared mmap comes back WITHOUT the registration.
+        size = os.path.getsize(path) if os.path.exists(path) else 0
+        if size < biggest:
+            with open(path, "wb") as _tfh:
+                _tfh.truncate(biggest)
+        _fh = open(path, "r+b")
+        buf = _mmap.mmap(_fh.fileno(), biggest)
         _owns_buf = True
-        _seq_mm = None
+        _seq_mm = buf
     sems = tp.SemSet(boot_nonce)
-    log = log or (lambda *a: None)
-    for i, (name, tag, nbytes, src_addr, dst_addr) in enumerate(units):
-        rank_u = i
-        label = f"unit {i} {name!r} tag={tag!r} nbytes={nbytes}"
+    # The lane the lane-form ran its copies on, or the default stream when the
+    # device ops do not expose stream creation (the desk fakes).
+    try:
+        stream = ops.create_stream(device)
+    except Exception:  # noqa: BLE001 -- a copy stream is an optimisation
+        stream = 0
+    base_addr = _mmap_addr(buf) if _seq_mm is not None else 0
+    for i, piece in enumerate(_batch.pieces):
+        desc = descs[piece.desc_index]
+        # #1378 xsn53: the window's offset is the PIECE'S OWN slot_off from
+        # the shared batch derivation -- not a rank, not a card, not a unit
+        # index.  The semaphore's id comes from the lane key above.
+        rank_u = int(piece.slot_off)
+        name = getattr(desc, "param_name", "?")
+        tag = getattr(desc, "tag", "")
+        nbytes = int(piece.nbytes)
+        label = (f"piece {i} {name!r} tag={tag!r} nbytes={nbytes} "
+                 f"window={rank_u}")
         if phase == PHASE_DEPOSIT:
-            src_ptr = src_addr(name, 0) if callable(src_addr) else src_addr
+            if desc.src_ptr is None:
+                return (f"deposit at piece {i} {name!r}: the desc carries no "
+                        f"src_ptr -- this rank does not hold the bytes this "
+                        f"lane says it moves")
+            src_ptr = int(desc.src_ptr) + int(piece.src_off)
             t0 = _time.perf_counter()
             # #1378 xsn44: the D2H copy -- from the VRAM source into the
-            # shared buffer at this unit's offset. The fake ops handles
-            # the VRAM side; the buffer is a bytearray (the desk) or an
-            # mmap (the metal) -- both support slice assignment.
-            _buf_addr = _mmap_addr(buf)
-            ops.memcpy_async(_buf_addr, int(src_ptr), nbytes, 0)
-            ops.synchronize(0)
+            # shared buffer at this piece's offset, the SAME pitch arithmetic
+            # the lane form runs (a STRIDED2D piece compacts on the way in).
+            _buf_addr = base_addr + rank_u
+            if piece.kind == tp.FLAT:
+                ops.memcpy_async(_buf_addr, src_ptr, nbytes, stream)
+            else:
+                ops.memcpy2d_async(_buf_addr, int(piece.run_bytes), src_ptr,
+                                   int(piece.spitch), int(piece.run_bytes),
+                                   int(piece.rows), stream)
+            ops.synchronize(stream)
             digest = hashlib.sha256(
-                bytes(buf[:nbytes])).hexdigest()[:16]
+                bytes(buf[rank_u:rank_u + nbytes])).hexdigest()[:16]
             recs = {}
             if os.path.exists(dpath):
                 try:
@@ -2305,19 +2414,26 @@ def run_sequential_units(units, ops, boot_nonce: str, *,
                             "nbytes": nbytes}
             with open(dpath, "w") as fh:
                 _json.dump(recs, fh)
-            # #1378 xsn53 (DIE SEMAPHOREN-WURZEL): the co-located exchange
-            # is the DIAGONAL (one card talking to itself, #1334). The
-            # handshake uses diagonal_sem_name (the per-card infix
-            # -card<n>-), not the cross name (pair=0 = CROSS_PAIRS[0] = a
-            # foreign cross semaphore -- the xsn52 hang).
-            sems.diagonal_post(rank_u, _SEQ_SLOT, "full")
+            # #1378 xsn53: THE LANE'S OWN TOKEN.  One full per unit on the
+            # lane's resolved handshake; the deposit posts, the collect
+            # consumes.  A cross lane posts the CROSS family, a diagonal lane
+            # the DIAGONAL family -- never the unit index, never a literal.
+            if _is_diagonal:
+                sems.diagonal_post(int(card), _SEQ_SLOT, "full")
+            else:
+                sems.post(int(pair), _SEQ_SLOT, "full")
             log(f"WEG2-SEQ deposit {label} digest={digest} "
                 f"ms={(_time.perf_counter()-t0)*1000:.1f}")
         else:
             deadline = _time.monotonic() + float(budget_s)
             got = False
             while _time.monotonic() < deadline:
-                if sems.diagonal_timedwait(rank_u, _SEQ_SLOT, "full", 0.0):
+                if _is_diagonal:
+                    _got = sems.diagonal_timedwait(int(card), _SEQ_SLOT,
+                                                   "full", 0.0)
+                else:
+                    _got = sems.timedwait(int(pair), _SEQ_SLOT, "full", 0.0)
+                if _got:
                     got = True
                     break
                 if liveness is not None and not liveness():
@@ -2341,7 +2457,7 @@ def run_sequential_units(units, ops, boot_nonce: str, *,
             dep = recs.get(str(i), {})
             dep_digest = str(dep.get("digest", ""))
             my_digest = hashlib.sha256(
-                bytes(buf[:nbytes])).hexdigest()[:16]
+                bytes(buf[rank_u:rank_u + nbytes])).hexdigest()[:16]
             if dep_digest and my_digest != dep_digest:
                 dump_rank_stacks(
                     "digest-mismatch-seq", tag=str(name), rank=int(rank_u),
@@ -2349,10 +2465,20 @@ def run_sequential_units(units, ops, boot_nonce: str, *,
                           f"collect={my_digest}")
                 return (f"digest mismatch at unit {i} {name!r}: "
                         f"deposit={dep_digest} collect={my_digest}")
-            dst_ptr = dst_addr(name, 0) if callable(dst_addr) else dst_addr
-            _buf_addr = _mmap_addr(buf)
-            ops.memcpy_async(int(dst_ptr), _buf_addr, nbytes, 0)
-            ops.synchronize(0)
+            if desc.dst_ptr is None:
+                return (f"collect at piece {i} {name!r}: the desc carries no "
+                        f"dst_ptr -- this rank does not hold the destination "
+                        f"this lane says it fills")
+            dst_ptr = int(desc.dst_ptr) + int(piece.dst_off)
+            _buf_addr = base_addr + rank_u
+            if piece.kind == tp.FLAT:
+                ops.memcpy_async(int(dst_ptr), _buf_addr, nbytes, stream)
+            else:
+                # on the way OUT a STRIDED2D piece scatters (spitch = run)
+                ops.memcpy2d_async(int(dst_ptr), int(piece.dpitch), _buf_addr,
+                                   int(piece.run_bytes), int(piece.run_bytes),
+                                   int(piece.rows), stream)
+            ops.synchronize(stream)
             if dst_digest_fn is not None:
                 # #1378 xsn44 (the PLACEMENT witness): what LANDED at this
                 # destination vs what the deposit recorded. The buffer
@@ -2370,7 +2496,26 @@ def run_sequential_units(units, ops, boot_nonce: str, *,
                               f"destination shape, silent until quality)")
                     return (f"placement mismatch at unit {i} {name!r}: "
                             f"deposit={dep_digest} destination={dst_digest}")
-            sems.diagonal_post(rank_u, _SEQ_SLOT, "empty")
+            # NO `empty` POST HERE.  This row (slot 0 of the empty family) is
+            # the per-tag DRAIN the caller drives through
+            # `CrossSlotRendezvous.prime_drain/wait_drained/post_drained`; a
+            # per-unit post would hand the drain counter tokens that release
+            # the NEXT tag's deposit before this tag has been read -- the
+            # exact return of the per-band claim that
+            # test_the_per_band_claim_cannot_return pins as absent.
             log(f"WEG2-SEQ collect {label} digest={my_digest} "
                 f"matches deposit")
+    if phase == PHASE_COLLECT and _owns_buf and _seq_mm is not None:
+        # #1385's lesson, at this form's own site: the file is freed by the
+        # side that reads it LAST (the collect; the deposit's next tag is
+        # gated on this side's drained post).  Unlinking keeps the pages
+        # alive for this process's own mapping and drops them at close.
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+    if _owns_buf and _seq_mm is not None:
+        _seq_mm.close()
+    if _owns_buf and _fh is not None:
+        _fh.close()
     return ""

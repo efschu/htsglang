@@ -896,6 +896,11 @@ class _Stub:
                      "_weg2_draft_lm_head_is_target_share",
                      "_weg2_leg_pcie_uuid", "_weg2_card_uuid",
                      "_weg2_cocard_peer_alive",
+                     # #1378 xsn53: the sequential transport's lane descs are
+                     # derived from the join by the REAL method -- six real
+                     # processes must derive the same list for a lane, which
+                     # is the property the W90 was made of.
+                     "_weg2_seq_lane_descs", "_weg2_model_for_group",
                      "_weg2_xchg_bounce_leg"):
             setattr(type(self), name, getattr(cls, name))
 
