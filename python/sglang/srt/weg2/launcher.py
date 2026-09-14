@@ -11403,34 +11403,57 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # by name, never a silent zero.
     from sglang.srt.weg2 import carrier_census as _cc
 
-    # the floor is derived against THIS boot's SHORT bound (slice A's X), not
-    # against a literal: the front routes SHORT on `remainder <= X`.
-    _floor, _floor_why = _cc.route_floor(x_tokens)
-    _expect_ranks = _cc.tp_size_of(spec_d.argv)
-    _cen = _cc.census(spec_d.log, expected_ranks=_expect_ranks, floor=_floor)
-    log(f"CARRIER BOUND: source='{_cc.SOURCE_MARKER}' in {spec_d.log}; component={_cc.COMPONENT}; "
-        f"per-rank(TP)={_cen.per_rank} expected_ranks={_cen.expected_ranks} (from group D argv --tp-size); "
-        f"{_cen.terms()} sites={_cen.site}; "
-        f"floor={_cen.floor} [{_floor_why}]; verdict={_cen.verdict}: {_cen.detail}")
-    for _sl in _cen.lines:
-        log(f"CARRIER BOUND source line: {_sl}")
+    # #1386 FOLLOW-UP 4 (xsn31/7 Versuch 4 wall): the census this whole block
+    # runs greps group D's log for cache_controller's OWN '#915 PREFETCH
+    # LIMIT ... site=(init_hicache|hiradix_init)' line -- COMPONENT is
+    # literally "group D KV carrier host pool (cache_controller.mem_pool_host
+    # via prefetch_budget.host_pool_anchor)" (carrier_census.py). Same root
+    # fact as the three skips above: under `hicache_disabled` D has no
+    # cache_controller and therefore no host-staged carrier pool to overflow
+    # in the first place -- there is nothing for the front's CARRIER-EXCEEDS
+    # route to protect against, so there is nothing to census. Skipped with a
+    # named line; carrier_max_tokens falls back to the context length, which
+    # front.py's own routing reads as "never take the CARRIER-EXCEEDS branch"
+    # (no prompt this rig accepts exceeds --context-length) -- the ZERO-
+    # REQUEST Minimalform never exercises this route regardless, and every
+    # non-Minimalform boot still runs the real census untouched.
+    if hicache_disabled:
+        carrier_max_tokens = CONTEXT_LENGTH_TOKENS
+        _bound_src = "hicache_disabled fallback (no carrier host pool exists)"
+        log(f"W45 SKIPPED (--weg2-disable-hicache): group D's cache_controller never "
+            f"builds (same fact as the W7/W10/W9 skips above), so there is no "
+            f"'#915 PREFETCH LIMIT' emitter to census -- carrier_max_tokens falls "
+            f"back to --context-length {CONTEXT_LENGTH_TOKENS} (front never takes "
+            f"the CARRIER-EXCEEDS branch above the model's own context length).")
+    else:
+        # the floor is derived against THIS boot's SHORT bound (slice A's X), not
+        # against a literal: the front routes SHORT on `remainder <= X`.
+        _floor, _floor_why = _cc.route_floor(x_tokens)
+        _expect_ranks = _cc.tp_size_of(spec_d.argv)
+        _cen = _cc.census(spec_d.log, expected_ranks=_expect_ranks, floor=_floor)
+        log(f"CARRIER BOUND: source='{_cc.SOURCE_MARKER}' in {spec_d.log}; component={_cc.COMPONENT}; "
+            f"per-rank(TP)={_cen.per_rank} expected_ranks={_cen.expected_ranks} (from group D argv --tp-size); "
+            f"{_cen.terms()} sites={_cen.site}; "
+            f"floor={_cen.floor} [{_floor_why}]; verdict={_cen.verdict}: {_cen.detail}")
+        for _sl in _cen.lines:
+            log(f"CARRIER BOUND source line: {_sl}")
 
-    # #1299: the floor is 1.25x X, so a FALLBACK X must not be allowed to refuse
-    # the boot through W45 -- an unmeasured term is a named fallback, never an
-    # actuator. The census bound itself is a measurement and is graded as before.
-    _dec = _cc.decide_bound(_cen, ns.carrier_max_tokens, log_path=spec_d.log,
-                            floor_why=_floor_why, x_measured=x_seed.measured)
-    if _dec.refused:
-        raise Weg2LaunchRefused(_dec.detail)
-    carrier_max_tokens = _dec.bound
-    _bound_src = _dec.source
-    if _dec.note:
-        log(f"CARRIER BOUND: {_dec.note}")
-    log(f"CARRIER BOUND: front --carrier-max-tokens {carrier_max_tokens} (source: {_bound_src}; measured "
-        f"by the census: {_cen.measured}); prompts the front prices above it are served by ONE prefill on "
-        f"D; prompts it prices between the floor {_cen.floor} and it take the leg-1/leg-2 round trip while "
-        f"group D is awake and serving -- SHORT is four conjuncts, so while D sleeps a sub-floor prompt "
-        f"queues to BATCH and round-trips as well")
+        # #1299: the floor is 1.25x X, so a FALLBACK X must not be allowed to refuse
+        # the boot through W45 -- an unmeasured term is a named fallback, never an
+        # actuator. The census bound itself is a measurement and is graded as before.
+        _dec = _cc.decide_bound(_cen, ns.carrier_max_tokens, log_path=spec_d.log,
+                                floor_why=_floor_why, x_measured=x_seed.measured)
+        if _dec.refused:
+            raise Weg2LaunchRefused(_dec.detail)
+        carrier_max_tokens = _dec.bound
+        _bound_src = _dec.source
+        if _dec.note:
+            log(f"CARRIER BOUND: {_dec.note}")
+        log(f"CARRIER BOUND: front --carrier-max-tokens {carrier_max_tokens} (source: {_bound_src}; measured "
+            f"by the census: {_cen.measured}); prompts the front prices above it are served by ONE prefill on "
+            f"D; prompts it prices between the floor {_cen.floor} and it take the leg-1/leg-2 round trip while "
+            f"group D is awake and serving -- SHORT is four conjuncts, so while D sleeps a sub-floor prompt "
+            f"queues to BATCH and round-trips as well")
     state.carrier_max_tokens = carrier_max_tokens
     log(f"D-ADMIT STORE-READ GATE (FIX 4, round 4): the budget is group D's OWN #915 reading "
         f"(available/occupied/limit via /server_info hicache_prefetch), not a launcher-derived "
