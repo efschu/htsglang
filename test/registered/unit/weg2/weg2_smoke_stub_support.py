@@ -162,6 +162,31 @@ STUB_EXCLUSIONS: dict = {}
 #: region=None, sems=sems)` -- neither `tag=` nor `rank=` -- so both guards
 #: below are dead branches for exactly this caller too.
 LEG_REPLAY_STUB_EXCLUSIONS = {
+    "_weg2_seq_units_from_join": (
+        "method (weight_updater.py, added by #1378 xsn52): the sequential "
+        "transport's unit derivation from the join's tensors. METAL-ONLY: "
+        "it needs real models and address books (the deposit and collect "
+        "address books resolve per-side VRAM pointers). The leg replay's "
+        "stub exercises the transport through its own plan derivation, "
+        "not through this method."),
+    "_weg2_model_for_group": (
+        "method (weight_updater.py, added by #1378 xsn52): returns the "
+        "model runner for a given group. METAL-ONLY: needs real workers. "
+        "The leg replay's stub resolves addresses through its own "
+        "borrowed _weg2_join_src_addr/_weg2_join_dst_addr."),
+    "_weg2_card_uuid": (
+        "method (weight_updater.py): resolves the rank's NVML uuid for "
+        "the per-copy card lock. METAL-ONLY: needs a CUDA device. The "
+        "sequential form's leg replay runs on the desk without CUDA."),
+    "_weg2_rank_param_table": (
+        "borrowed by the leg replay's _Stub.__init__ (a setattr loop, not "
+        "a class attribute) -- the ratchet's dir() check finds it because "
+        "the loop ran during setUp, but the source-level walk doesn't see "
+        "it. Excluded because the stub provides it by construction."),
+    "tp_worker": (
+        "set in _Stub.__init__ as self.tp_worker = _FakeWorker(...) -- "
+        "the production code reads it for the address books. The stub "
+        "provides it by construction."),
     "_weg2_xchg_tag_seen": (
         "dataclass field (weight_updater.py:451, default None), read only "
         "inside `if tag is not None and phase == bx.PHASE_DEPOSIT:` -- "

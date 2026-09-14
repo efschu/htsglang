@@ -197,6 +197,12 @@ class _LegStub:
     """
 
     _weg2_xchg_bounce_leg = wu.SchedulerWeightUpdaterManager._weg2_xchg_bounce_leg
+    _weg2_seq_units_from_join = (
+        wu.SchedulerWeightUpdaterManager._weg2_seq_units_from_join)
+    _weg2_model_for_group = (
+        wu.SchedulerWeightUpdaterManager._weg2_model_for_group)
+    _weg2_join_src_addr = wu.SchedulerWeightUpdaterManager._weg2_join_src_addr
+    _weg2_join_dst_addr = wu.SchedulerWeightUpdaterManager._weg2_join_dst_addr
     # #1378 xsn36: the bounce leg resolves the card uuid for the per-copy
     # lock; on this stub it resolves to None (fail-soft, unserialised) --
     # the smoke has no real card to serialise against.

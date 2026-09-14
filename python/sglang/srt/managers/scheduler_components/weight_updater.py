@@ -4186,6 +4186,62 @@ class SchedulerWeightUpdaterManager:
                 out.append((f"{src}-{dst}-{slot}", int(full), int(empty)))
         return out
 
+    def _weg2_seq_units_from_join(self, join, hook: str, group: str,
+                                  rank: int) -> list:
+        """The sequential transport's units from the JOIN's tensors.
+
+        The join's tensors are the NEUTRAL cross-group layout: identical on
+        both sides (the same manifest rows, the same tag sets, the same
+        total bytes). The role-narrowed leg descs are DIFFERENT on each
+        side (the TP/PP phase asymmetry: D rank0 has 9 tags/1116 descs,
+        P rank0 has 6 tags/1937 descs, measured on weg2xsn43) -- a shared
+        buffer requires IDENTICAL unit lists, which only the join's
+        tensors provide.
+
+        Each unit: (name, tag, nbytes, src_addr, dst_addr).
+        The src_addr is resolved by the deposit rank's address book (its
+        own VRAM pointer for this tensor's shard).
+        The dst_addr is resolved by the collect rank's address book (its
+        own VRAM pointer for this tensor's piece).
+
+        The buffer is sized to the SUM of all units' nbytes (the total
+        exchange), and the units are written sequentially into it --
+        the offsets are the running sum, identical on both sides because
+        the unit list is identical.
+        """
+        import hashlib
+        units = []
+        for t in join.tensors:
+            name = str(t.param_name)
+            tag = str(t.tag)
+            nbytes = t.rows_full * t.cols_full * t.itemsize
+            src_addr = None
+            dst_addr = None
+            try:
+                src_addr = self._weg2_join_src_addr(
+                    "source", group, rank, self._weg2_model_for_group(group),
+                    region=tag)
+            except BaseException:
+                pass
+            try:
+                dst_addr = self._weg2_join_dst_addr(
+                    "destination", group, rank, self._weg2_model_for_group(group),
+                    region=tag)
+            except BaseException:
+                pass
+            units.append((name, tag, nbytes, src_addr, dst_addr))
+        return units
+
+    def _weg2_model_for_group(self, group: str):
+        """The model runner for the given group."""
+        if group == "D":
+            worker = getattr(self, "draft_worker", None)
+            runner = _get_draft_model_runner(worker) if worker else None
+            return getattr(runner, "model", None) if runner else None
+        worker = getattr(self, "tp_worker", None)
+        runner = getattr(worker, "model_runner", None) if worker else None
+        return getattr(runner, "model", None) if runner else None
+
     def _weg2_xchg_bounce_leg(self, *, descs, ops, boot_nonce,
                               slot_bytes=None, depth=None, terms=None,
                               mode=None, shm_root=None, device: int = 0,
@@ -4560,16 +4616,17 @@ class SchedulerWeightUpdaterManager:
                         # = die Desc's Empfangsgroesse, NICHT die Quell-
                         # groesse). Die Empfangsseite bestimmt, wie gross
                         # die Einheit im Puffer sein muss.
-                        seq_units = [
-                            (str(getattr(d, "param_name",
-                                          getattr(d, "name", f"desc{j}"))),
-                             str(getattr(d, "tag", "")),
-                             int(getattr(d, "nbytes", 0)),
-                             (int(d.src_ptr)
-                              if getattr(d, "src_ptr", None) else None),
-                             (int(d.dst_ptr)
-                              if getattr(d, "dst_ptr", None) else None))
-                            for j, d in enumerate(descs)]
+                        # #1378 xsn52 (DER MANIFEST-LAYOUT-FIX): the units
+                        # come from the JOIN's tensors (the neutral cross-
+                        # group layout), not from the role-narrowed leg
+                        # descs. The leg descs are role-specific: D rank0
+                        # has 9 tags/1116 descs, P rank0 has 6 tags/1937
+                        # descs (measured on weg2xsn43). A shared buffer
+                        # requires IDENTICAL unit lists -- only the join's
+                        # tensors provide that. The addresses are resolved
+                        # per side by the address books.
+                        seq_units = self._weg2_seq_units_from_join(
+                            join, hook, group, rank)
                         last = bx.run_sequential_units(
                             seq_units, ops, boot_nonce,
                             shm_root=root, device=device, phase=phase,
