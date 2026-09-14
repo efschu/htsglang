@@ -111,6 +111,16 @@ MEMTS = f"{GPU_ARB}/devtools/mem_timeseries.sh"
 HOST_PREFLIGHT = f"{GPU_ARB}/devtools/host_ledger_preflight.sh"
 SHM_DIR = "/dev/shm"
 PRESENCE_DIR = f"{SHM_DIR}/sglang-phase-flip-presence"
+#: #1390: named exactly like `SHM_DIR` above, and for the same reason --
+#: `main`'s ledger call must reference these BY NAME at its own call site
+#: (`meminfo_path=MEMINFO_PATH`, not the literal default `choose_host_ledger`
+#: already carries) so a test's `mock.patch.object(launcher, "MEMINFO_PATH",
+#: fake)` is actually read: a default parameter value is bound ONCE, at
+#: `choose_host_ledger`'s own def time, and a call with no keyword at all
+#: would keep reading the ORIGINAL literal forever, exactly as `shm_dir`
+#: silently did until this ticket.
+MEMINFO_PATH = "/proc/meminfo"
+CGROUP_ROOT = "/sys/fs/cgroup"
 #: #1236, USER RULING 2026-09-09: the Weg-2 page store is "normales hicaching
 #: mit lvl2 und lvl3" -- the UPSTREAM HiCache file backend, pointed at a plain
 #: directory on the ZFS dataset under /spinning.  NOT a tmpfs, NOT a new tier,
@@ -10258,7 +10268,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # call out here was the defect: the residue sweep had already moved every
     # `sem.weg2-xchg-*` file into the archive, so the sem_unlink that follows it
     # sees an empty /dev/shm and logs "residue: none" on every boot regardless.
-    state.shm_sweep = shm_residue_sweep(log, ns.tag, stamp, dry)
+    # #1390: `shm_dir` NAMED HERE, not left to the parameter's own default.
+    # `shm_residue_sweep(shm_dir: str = SHM_DIR)` binds that default ONCE, at
+    # module-import time -- a test's `mock.patch.object(launcher, "SHM_DIR",
+    # tmp)` changes the ATTRIBUTE, but a call with no `shm_dir=` keyword still
+    # gets the ORIGINAL `/dev/shm` the function was defined against. Passing
+    # `shm_dir=SHM_DIR` here forces THIS call to read the name fresh, at call
+    # time, so the mock five #1386 tests already installed actually reaches
+    # the sweep instead of silently falling through to the real box -- which
+    # is why they read live and turned red under any boot on the same host.
+    state.shm_sweep = shm_residue_sweep(log, ns.tag, stamp, dry, shm_dir=SHM_DIR)
     sweep_dead_credit_counters(log, dry=dry)
     stale_deadman_sweep(log, [PORT_FRONT, PORT_P, PORT_D], dry)
     refuse_if_front_unbindable(log, ns.front_host, PORT_FRONT, dry)
@@ -10850,6 +10869,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     arm, reap_headroom_gib, lines, cg = choose_host_ledger(
         ring_plan.host_weights_bytes,
         ring_plan.host_weights_span1_bytes, ring_plan.provenance,
+        # #1390: NAMED, not left to choose_host_ledger's own literal
+        # defaults -- see MEMINFO_PATH/CGROUP_ROOT above for why a bare call
+        # would keep reading the real box even under a test's mock.
+        meminfo_path=MEMINFO_PATH, cgroup_root=CGROUP_ROOT,
         pin_m_mib=int(getattr(ns, "pin_ledger_arm_m", 0) or 0),
         # #1360: the operator's declaration, from argv and nowhere else.
         deviation_reason=str(getattr(ns, "host_ledger_deviation", "") or ""),
