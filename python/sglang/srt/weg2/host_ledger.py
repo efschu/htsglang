@@ -1134,6 +1134,35 @@ RATE_LATCH_CUSHION_FLOOR_GIB = 1.5
 #: on the boot that survived.  Third over-pricing of the same quantity, after
 #: ``now + remaining`` and ``cushion as a stock``; this one is measured.
 RATE_LATCH_FILL_RISING_GIB = 0.01
+#: #1361d (boot weg2xsn32-A2, 2026-09-14T07:37:53Z): the RISING gate above has
+#: no floor on shmem's OWN magnitude, only on its delta -- so it cannot tell
+#: "a multi-GiB/s fill is running" from "a cgroup with near-zero shmem just
+#: crossed a 0.01 GiB (10 MiB) noise band". Measured: xsn32-A2 latched at
+#: cushion=1.49 (0.01 under the floor) with shmem=0.03 GiB -- the emitter's
+#: own line prints that number beside the verdict and fires anyway.  DESK12
+#: traced the WHY (2026-09-14): launcher.teardown() (launcher.py ~12282)
+#: shutil.rmtree's the L3 HiCache store, and neither LRUFileEvictor nor
+#: HiCacheFile ever call madvise/fadvise on it (0 hits, whole tms_csrc tree)
+#: -- so every boot-after-boot starts with a COLD page cache by construction,
+#: not by accident, and the very first tens-of-MiB of shmem a fresh boot
+#: writes will always cross a 10 MiB delta from that near-zero floor.  This
+#: is the NORMAL case of the boot ladder, not an outlier.
+#: A genuine fill is never this small: xsn25's own real reap-adjacent tail
+#: (hostsample_weg2xsn25.csv, 2026-09-13T07:01:10.525Z) shows shmem at
+#: 64.305 GiB the instant cushion crosses the floor (62.046 -> 64.305, a
+#: 2.259 GiB tick), and xsn27 fires in the 60-90 GiB shmem range
+#: (BOOT_weg2xsn27_0913.md: shmem=66.91 at the latch).  This floor sits more
+#: than an order of magnitude above the false-positive reading and almost
+#: two orders below every true-positive one, and it is evaluated ENTIRELY in
+#: the cgroup's own currency (memory.stat shmem) -- never against host-wide
+#: /proc/meminfo.  That is deliberate, not an oversight: #1233 fix 5's own
+#: lesson in this same file (line ~47, "weg2dk5 was reaped with MemAvailable
+#: at 23.96 GB") is that host-wide headroom does not reliably predict this
+#: cgroup's own risk, so it is never wired into a term that can SUPPRESS a
+#: latch -- that would reintroduce the exact indicator class that already
+#: cost a boot once, in the direction (a defused latch that should have
+#: fired) the asymmetry law forbids trading for.
+RATE_LATCH_TRIVIAL_SHMEM_GIB = 1.0
 
 
 def launch_moment_peak_gib(
@@ -1371,7 +1400,21 @@ class RateLatch:
             )
             if shmem_gib is not None:
                 self._last_shmem = float(shmem_gib)
-            if rising and float(cushion_gib) < RATE_LATCH_CUSHION_FLOOR_GIB:
+            # #1361d (xsn32-A2): `rising` alone is a DELTA test with no floor on
+            # shmem's own magnitude, so it cannot separate a genuine multi-GiB
+            # fill from the tens-of-MiB noise every cold boot writes once the
+            # L3 store's page cache is gone (DESK12, teardown() rmtree's it,
+            # no madvise/fadvise anywhere upstream of that -- #1361d above).
+            # `meaningful` gates on the ABSOLUTE reading, never on host-wide
+            # headroom (see the #1233/weg2dk5 note on that same constant): a
+            # shmem this small cannot be "eating" a 1.5 GiB cushion floor in
+            # any sense the guard's own name claims to measure, independent of
+            # what else is free on the box.
+            meaningful = (
+                shmem_gib is not None
+                and float(shmem_gib) >= RATE_LATCH_TRIVIAL_SHMEM_GIB
+            )
+            if rising and meaningful and float(cushion_gib) < RATE_LATCH_CUSHION_FLOOR_GIB:
                 self.latched = True
                 return (
                     f"W98 Weg2HostRateLatched: cushion={float(cushion_gib):.2f} GiB "

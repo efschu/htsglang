@@ -462,3 +462,124 @@ class TheGuardRunsFromLAUNCHNotFromREADY1361a(CustomTestCase):
         self.assertLess(plan, latch_at)
         self.assertLess(latch_at, front_first)
         self.assertAlmostEqual(front_first - latch_at, 42.4, places=1)
+
+
+#: #1361d THE FALSE POSITIVE, verbatim from the boot's own emitted line
+#: (evidence-665-f1/boot_weg2_weg2xsn32_18bb175bc65891ae6ca4af2ce76fd298411146d9_0914_073729.front.log:128):
+#:   "W98 Weg2HostRateLatched: cushion=1.49 GiB BELOW the floor 1.50 while
+#:   shmem is STILL RISING (now=10.67 GiB, shmem=0.03, gaps_seen=0)"
+#: fired 07:37:53Z, ~15 s after P-spawn, before any flip. No hostsample CSV
+#: covers this exact attempt (the logger was not yet sampling this early), so
+#: the single sample BEFORE the fired one is synthesised at a lower shmem
+#: reading -- only its existence matters (RateLatch._last_shmem starts at
+#: None on a fresh boot, so the FIRST call can never fire; some prior sample
+#: is required to exercise `rising` at all) and not its exact value, since a
+#: fresh boot's floor is ~0.00 either way.
+XSN32_A2_FALSE_POSITIVE = ((0.0, 1.55, 0.00), (15.0, 1.49, 0.03))
+
+#: #1361d THE TRUE POSITIVE, verbatim rows from the boot's own sampler
+#: (evidence-665-f1/weg2xsn25_0913/hostsample_weg2xsn25.csv):
+#:   ...T07:01:09.503Z  cushion=2.698  shmem=62.046
+#:   ...T07:01:10.012Z  cushion=2.591  shmem=62.046
+#:   ...T07:01:10.525Z  cushion=0.548  shmem=64.305   <- verdict CUSHION-LOW
+#: This is host_ledger.py's own cited weg2xsn25 sleep-leg incident (line
+#: ~1829): shmem +2.259 GiB in one 0.5 s tick while cushion falls through the
+#: floor, "box stallt" (5.6 s sleep RPC, first rank killed 4 s after latch).
+XSN25_TRUE_POSITIVE = ((0.0, 2.698, 62.046), (0.5, 2.591, 62.046), (1.0, 0.548, 64.305))
+
+
+class TheTrivialShmemFloorSeparatesNoiseFromAFill1361d(CustomTestCase):
+    """#1361d: coverage-check finding for the coordinator's cushion-latch order.
+
+    The trend half of the guard EXISTS in code and IS wired as an AND
+    (host_ledger.py, `if rising and ... < RATE_LATCH_CUSHION_FLOOR_GIB`), not
+    prose-only and not OR-wired -- so neither of the two hypotheses posed for
+    the coverage check is literally what fired on xsn32-A2. What actually
+    fired: `rising` is a bare DELTA test (`shmem - last_shmem >
+    RATE_LATCH_FILL_RISING_GIB`, 0.01 GiB) with NO floor on shmem's own
+    magnitude, so a cold boot's first ~30 MiB of shmem crosses that 10 MiB
+    delta exactly like a genuine multi-GiB/s fill would. `test_the_call_site_
+    passes_the_cushion` (this file, "REACHABILITY, not logic") only proves the
+    two arguments reach `observe()`; it never asserted the trend logic
+    discriminates real risk from noise, and no existing fixture (XSN24_TAIL /
+    XSN27_TAIL) exercises a delta this close to the threshold -- both use
+    GiB-scale deltas.
+    """
+
+    def _run(self, tail):
+        lat = hl.RateLatch(reap_mark_gib=95.90)
+        fired_at = None
+        for i, cush, shm in tail:
+            out = lat.observe(float(i), 80.0, cushion_gib=cush, shmem_gib=shm)
+            if out and "W98" in out and fired_at is None:
+                fired_at = i
+        return fired_at, lat.latched
+
+    def test_xsn32_a2_the_measured_false_positive_does_not_latch(self):
+        fired_at, latched = self._run(XSN32_A2_FALSE_POSITIVE)
+        self.assertIsNone(fired_at)
+        self.assertFalse(latched)
+
+    def test_xsn25_the_measured_true_positive_still_latches(self):
+        fired_at, latched = self._run(XSN25_TRUE_POSITIVE)
+        self.assertEqual(fired_at, 1.0)
+        self.assertTrue(latched)
+
+    def test_the_floor_sits_between_the_two_measured_readings(self):
+        self.assertGreater(hl.RATE_LATCH_TRIVIAL_SHMEM_GIB, 0.03)
+        self.assertLess(hl.RATE_LATCH_TRIVIAL_SHMEM_GIB, 64.305)
+        # more than an order of magnitude of margin on the noise side
+        self.assertGreater(hl.RATE_LATCH_TRIVIAL_SHMEM_GIB / 0.03, 10.0)
+
+    def test_the_cushion_floor_itself_is_unchanged(self):
+        """User law: the 1.50 GiB floor never moves. This fix adds a term
+        beside it; it does not touch RATE_LATCH_CUSHION_FLOOR_GIB."""
+        self.assertEqual(hl.RATE_LATCH_CUSHION_FLOOR_GIB, 1.5)
+
+    def test_the_existing_true_positives_are_unaffected(self):
+        """The new gate must not re-suppress what the #1361b fixtures already
+        proved must fire -- both sit at 50-90 GiB shmem, far above the new
+        floor."""
+        lat = hl.RateLatch(reap_mark_gib=95.90)
+        fired = None
+        for i, (cush, shm) in enumerate(XSN27_TAIL):
+            out = lat.observe(float(i), 80.0, cushion_gib=cush, shmem_gib=shm)
+            if out and "W98" in out and fired is None:
+                fired = i
+        self.assertEqual(fired, 2)
+
+    def test_the_danger_direction_mutant_or_wired_wrongly_latches_the_survivor(self):
+        """Gefahrrichtungs-Mutant: the new term OR-ed into the firing condition
+        instead of AND-ed must make the boot that MUST NEVER latch (xsn24,
+        worst cushion 2.67 against the 1.50 floor) latch anyway -- because
+        `meaningful` is true almost immediately once any real image is
+        resident, an OR would fire independent of the cushion ever breaching
+        the floor at all.
+        """
+        def observe_or_mutant(lat, t_s, nonreclaim_gib, cushion_gib, shmem_gib):
+            rising = (
+                shmem_gib is not None and lat._last_shmem is not None
+                and float(shmem_gib) - lat._last_shmem > hl.RATE_LATCH_FILL_RISING_GIB
+            )
+            if shmem_gib is not None:
+                lat._last_shmem = float(shmem_gib)
+            meaningful = (
+                shmem_gib is not None
+                and float(shmem_gib) >= hl.RATE_LATCH_TRIVIAL_SHMEM_GIB
+            )
+            # THE MUTANT: OR instead of AND.
+            if rising and (meaningful or float(cushion_gib) < hl.RATE_LATCH_CUSHION_FLOOR_GIB):
+                lat.latched = True
+                return "W98 MUTANT"
+            return None
+
+        lat = hl.RateLatch(reap_mark_gib=95.90)
+        fired = None
+        for i, (cush, shm) in enumerate(XSN24_TAIL):
+            out = observe_or_mutant(lat, float(i), 80.0, cush, shm)
+            if out is not None and fired is None:
+                fired = i
+        # the correct (AND-wired, shipped) implementation never fires here --
+        # pinned by TheCushionSeparatesTheBootsThatLivedFromTheOnesThatDied1361b
+        # .test_the_surviving_boot_never_latches above. The OR mutant must.
+        self.assertIsNotNone(fired, "OR-wired mutant failed to over-fire on the survivor")
