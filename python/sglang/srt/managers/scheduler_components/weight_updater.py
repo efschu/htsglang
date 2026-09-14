@@ -1201,7 +1201,7 @@ class SchedulerWeightUpdaterManager:
             boot_nonce=boot_nonce, terms=terms, mode=wx.inject_mode(),
             device=int(device), hook=sh.HOOK_SOURCE,
             region=self._weg2_shadow_region(),
-            sems=self._weg2_xchg_sems(), tag=tag,
+            sems=self._weg2_xchg_sems(), tag=tag, rank=int(rank),
         )
 
     def _weg2_xchg_inject_from_peer(self, *, terms, tag=None, **kw) -> None:
@@ -1374,52 +1374,27 @@ class SchedulerWeightUpdaterManager:
         # so the order has one producer and neither side invents it. The
         # collector posts `drained(tag)` at the end of the lane loop, which is
         # what releases the peer's deposit of the NEXT tag.
+        # #1391 (DESK10) ROUND 3, CORRECTED: the guard used to live HERE,
+        # checking `_cdescs` for emptiness before calling the leg. WRONG
+        # AUFRUFER (coordinator finding, boot weg2xsn31 instrument run): this
+        # method's own "pieces=0" log line appears ZERO times in either
+        # rank's log on the metal, because the shadow-mode grader
+        # (`_weg2_xchg_shadow_compare`) calls `_weg2_xchg_inject_weights`
+        # with NO tag at all (mode=shadow, whole-plan-at-once -- see that
+        # method, weight_updater.py:1693) -- so `tag` here is `None` on the
+        # boot's ACTUAL collect call, this whole `if tag is not None:` branch
+        # never executes, and a guard placed inside it is dead on the metal
+        # even though every desk test that called this method WITH an
+        # explicit tag (hand-built, not the real caller) passed. The guard
+        # now lives in :meth:`_weg2_xchg_bounce_leg` itself, the one frame
+        # BOTH this method and the deposit side actually reach regardless of
+        # whether `tag` is a string or `None`.
         _sems = self._weg2_xchg_sems()
         _cdescs = list(plan.descs)
         if tag is not None:
             _cdescs = [d for d in _cdescs
                        if str(getattr(d, "tag", "")) == str(tag)]
             if not _cdescs:
-                # #1391 (DESK10): AN EMPTY PLAN IS ONLY EVER HONEST WHEN NOBODY
-                # DEPOSITED ANYTHING FOR THIS RANK EITHER. #1233's
-                # chunk_tag_cards already established that a PP stage owning
-                # no layers of a given weights_<k> chunk legitimately sees no
-                # descriptor for it -- that is the case this "pieces=0" log
-                # line was written for, and it stays a log line for exactly
-                # that case. Boot weg2xsn31 (versuch 5 AND 7, byte-identical)
-                # measured the OTHER case: card 0's diag/cross-in lanes read
-                # full=8/8/16 (ctypes-probed by hand, since the product had no
-                # diagonal accessor before this commit) while this rank's own
-                # plan carried zero descs for weights_0/weights_1 -- a
-                # collector that structurally never ran for its own card,
-                # silently, for two full tags, until D's `wait_drained` and
-                # this rank's OWN later `_weg2_await_vram_credit` each burned
-                # their full 120 s and blamed each other's mechanism. Checked
-                # HERE, the instant the plan comes back empty, rather than
-                # inferred two DEBUG_HOLD boots later from raw semaphore
-                # counts: a real, undrained lane beside a zero-descriptor plan
-                # names the wedge in the first second instead of the 121st.
-                _stuck = self._weg2_xchg_undrained_lanes(int(rank), _sems)
-                if _stuck:
-                    raise Weg2XchgLaneNeverDrainedRefused(
-                        f"W100 Weg2XchgLaneNeverDrainedRefused: group={group} "
-                        f"rank={rank} tag={tag}: this rank's own collect plan "
-                        f"carries ZERO descriptors for this tag, but "
-                        f"{len(_stuck)} lane(s) targeting this rank's card "
-                        f"already hold undrained bands: "
-                        + ", ".join(
-                            f"lane={lane} full={full} empty={empty}"
-                            for lane, full, empty in _stuck)
-                        + ". Under the #1374 contract `full` is 0 between "
-                        f"tags by construction, so this is not a race: a peer "
-                        f"deposited real bytes this rank's plan says do not "
-                        f"exist for it, and nobody would ever call "
-                        f"wait_full/post_drained on them. Refusing now beats "
-                        f"the peer's own wait_drained and this rank's next "
-                        f"credit wait each burning their full "
-                        f"{WEG2_GROUP_FENCE_BUDGET_S:.0f}s budget and naming "
-                        f"the wrong mechanism (W68 / W35)."
-                    )
                 logger.info(
                     "WEG2-XCHG COLLECT tag=%s pieces=0 -- this rank's plan "
                     "carries no desc for this tag; the lockstep step is a "
@@ -1430,7 +1405,7 @@ class SchedulerWeightUpdaterManager:
             terms=terms, mode=mode, device=int(device),
             hook="authoritative",
             region=self._weg2_shadow_region(),
-            sems=_sems, tag=tag,
+            sems=_sems, tag=tag, rank=int(rank),
         )
 
         # THE INSTRUMENTS ARE EMITTED BY THE LEG, NOT HERE, and the first
@@ -3470,7 +3445,8 @@ class SchedulerWeightUpdaterManager:
         self._weg2_xchg_sems_cache = sems
         return sems
 
-    def _weg2_xchg_undrained_lanes(self, rank: int, sems) -> list:
+    def _weg2_xchg_undrained_lanes(self, rank: int, sems, *,
+                                   covered: Optional[set] = None) -> list:
         """``[(lane, full, empty)]`` for every lane whose DESTINATION is
         ``rank``'s own card and whose ``full`` count is already nonzero.
 
@@ -3484,6 +3460,14 @@ class SchedulerWeightUpdaterManager:
         could be a destination for: the on-card diagonal (``card=rank``) and
         every directed cross pair whose ``dst == rank``.
 
+        ``covered``, when given, is the SET of ``group_descs_by_pair`` keys
+        (``None`` for the diagonal, a ``CROSS_PAIRS`` index for a cross pair)
+        this call's OWN descriptors already account for -- those are skipped:
+        a lane this leg is about to actually walk is not a silent miss, no
+        matter its current count. ``None`` (the default) checks every lane
+        unconditionally, which is what a caller with no descriptor set of its
+        own (the credit-wait, #1391 round 3) needs.
+
         ``sems=None`` (the unsplit/hermetic form, or an unopened set) answers
         an empty list rather than raising: this check exists to CATCH a
         collect-side no-op earlier, not to demand a handshake exists where the
@@ -3496,16 +3480,19 @@ class SchedulerWeightUpdaterManager:
 
         slot = int(bx.CrossSlotRendezvous._COUNT_SLOT)
         out = []
-        try:
-            full = sems.diagonal_getvalue(int(rank), slot, "full")
-            empty = sems.diagonal_getvalue(int(rank), slot, "empty")
-        except OSError:
-            full = None
-        if full:
-            out.append((f"card{int(rank)}-{slot}", int(full),
-                        -1 if empty is None else int(empty)))
+        if covered is None or None not in covered:
+            try:
+                full = sems.diagonal_getvalue(int(rank), slot, "full")
+                empty = sems.diagonal_getvalue(int(rank), slot, "empty")
+            except OSError:
+                full = None
+            if full:
+                out.append((f"card{int(rank)}-{slot}", int(full),
+                            -1 if empty is None else int(empty)))
         for pair, (src, dst) in enumerate(xr.CROSS_PAIRS):
             if int(dst) != int(rank):
+                continue
+            if covered is not None and pair in covered:
                 continue
             try:
                 full = sems.getvalue(pair, slot, "full")
@@ -3531,7 +3518,16 @@ class SchedulerWeightUpdaterManager:
                               #: the log and is the key of the per-tag `drained`
                               #: handshake -- the one wait the contract keeps,
                               #: taken between tags and never within one.
-                              tag=None):
+                              tag=None,
+                              #: #1391 (DESK10) ROUND 3: this rank's own
+                              #: resolved identity (`self._weg2_rank()`,
+                              #: group-local pp_rank/tp_rank), for the
+                              #: undrained-lane check below. ``None`` skips
+                              #: the check rather than guessing -- a caller
+                              #: with no identity to give is exactly the
+                              #: shape ``_weg2_rank`` itself answers ``-1``
+                              #: for, and ``-1`` is not a card.
+                              rank=None):
         """PATH (b): assemble each unit in the host bounce, every card slices.
 
         The whole of the user law's fallback sentence, at the one call site
@@ -3721,6 +3717,51 @@ class SchedulerWeightUpdaterManager:
                     f"allocation: an under-priced bounce does not fail here, it "
                     f"fails later as a cushion nobody can account for."
                 )
+            # #1391 (DESK10) ROUND 3: THE GUARD, MOVED HERE FROM THE WRAPPER.
+            # It used to live in `_weg2_xchg_inject_from_peer`, gated on
+            # `tag is not None` -- and boot weg2xsn31's own instrument run
+            # showed that gate is DEAD on the metal: the shadow-mode grader
+            # (`_weg2_xchg_shadow_compare`) calls this leg with `tag=None`
+            # (grading the WHOLE plan at once, correctly, for its own
+            # purpose -- weight_updater.py:1693), so a check inside
+            # `if tag is not None:` never runs on THIS boot's actual collect
+            # call, only in a desk test that hand-supplied a tag. THIS frame
+            # is the one both real callers (deposit AND collect, whichever
+            # `tag` they pass) reach every time, which is why it belongs
+            # here instead.
+            #
+            # THE CHECK ITSELF is unchanged in substance: on the COLLECT
+            # side (`phase == PHASE_COLLECT`), a lane targeting THIS rank's
+            # own card that `_lanes` does NOT cover (no descriptor for it in
+            # `descs`, for ANY tag -- not just the one this call names) is
+            # only ever an honest silence when nobody deposited into it
+            # either (#1233's "this stage owns no layers of that chunk").
+            # A nonzero `full` there is real, undrained work this call is
+            # about to walk past without a word.
+            if phase == bx.PHASE_COLLECT and rank is not None and int(rank) >= 0 and sems is not None:
+                _stuck = self._weg2_xchg_undrained_lanes(
+                    int(rank), sems, covered=set(_lanes.keys()))
+                if _stuck:
+                    raise Weg2XchgLaneNeverDrainedRefused(
+                        f"W100 Weg2XchgLaneNeverDrainedRefused: hook={hook} "
+                        f"rank={rank} tag={tag} boot_nonce={boot_nonce}: "
+                        f"this leg's own descriptor set carries no entry for "
+                        f"{len(_stuck)} lane(s) targeting this rank's card, "
+                        f"and they already hold undrained bands: "
+                        + ", ".join(
+                            f"lane={lane} full={full} empty={empty}"
+                            for lane, full, empty in _stuck)
+                        + ". Measured shape (boot weg2xsn31): a COMPLETE, "
+                        f"correctly-sized deposit from the peer's own "
+                        f"TP-shard split that this leg's plan does not "
+                        f"cover for the tag(s) at hand -- not a double "
+                        f"post, not a counting-semaphore invariant break. "
+                        f"Refusing now beats the peer's own wait_drained "
+                        f"and this rank's next credit wait each burning "
+                        f"their full {WEG2_GROUP_FENCE_BUDGET_S:.0f}s "
+                        f"budget and naming the wrong mechanism (W68 / "
+                        f"W35)."
+                    )
             # #1385 (Wand 11b step 2): THE RUNTIME HALF OF THE CAP. Step 1
             # (this branch's earlier commit) wired `lanes_concurrent` through
             # PRICING only -- the ledger charged `lanes_priced` while every
@@ -3925,41 +3966,25 @@ class SchedulerWeightUpdaterManager:
                                 epoch=None) -> None:
         if credit is None or need_bytes <= 0:
             return
-        # #1391 (DESK10): THE SAME CHECK, at the SECOND place the wedge is
-        # visible from. Boot weg2xsn31 died HERE by name -- W35
-        # Weg2VramCreditRefused tag=weights_3, 120s expired -- while the real
-        # cause (card 0's diag/1-0/2-0 lanes never drained for weights_0/1)
-        # was two DEBUG_HOLD boots and a hand-rolled ctypes sem_getvalue away.
-        # A lane already carrying undrained bands for THIS rank's own card, at
-        # the moment a credit wait is about to start, is the same physical
-        # fact `_weg2_xchg_inject_from_peer` checks on an empty collect plan
-        # -- checked again here because the credit wait is reachable even on a
-        # tag whose OWN collect already ran clean; the wedge this refusal
-        # exists for is an EARLIER tag's undrained lane still sitting there
-        # while a LATER tag's credit wait is the one that actually times out
-        # (exactly weg2xsn31's shape: weights_0/1 stuck, weights_3 refused).
+        # #1391 (DESK10) ROUND 3: A CALLBACK, NOT A ONE-SHOT CHECK. The first
+        # version checked ONCE at entry and lost a real race the metal
+        # measured directly (boot weg2xsn31 instrument run): this rank
+        # entered clean, the peer's saturating post landed four seconds
+        # later, and nothing looked again while the 120s poll ran. A
+        # predicate taken once at the door cannot see a condition that
+        # develops WHILE waiting; it has to live inside the poll.
+        # `VramCredit.wait_for` (weg2_memory_saver.py) owns that loop, so
+        # the check moves there via this callback -- `_stuck_lane_reader`
+        # -- called on its own cadence and raising `Weg2XchgLaneNeverDrainedRefused`
+        # (W100) itself the moment it finds something, well before this
+        # call's own `budget_s` would otherwise expire into a W35.
         _rank = self._weg2_rank()
-        if _rank >= 0:
-            _stuck = self._weg2_xchg_undrained_lanes(_rank, self._weg2_xchg_sems())
-            if _stuck:
-                raise Weg2XchgLaneNeverDrainedRefused(
-                    f"W100 Weg2XchgLaneNeverDrainedRefused: rank={_rank} "
-                    f"tag={tag}: about to wait up to "
-                    f"{WEG2_GROUP_FENCE_BUDGET_S:.0f}s for a VRAM credit this "
-                    f"card may never receive -- {len(_stuck)} lane(s) "
-                    f"targeting this rank's card already hold undrained "
-                    f"bands: "
-                    + ", ".join(
-                        f"lane={lane} full={full} empty={empty}"
-                        for lane, full, empty in _stuck)
-                    + ". Under the #1374 contract `full` is 0 between tags by "
-                    f"construction, so a peer deposited real bytes for a "
-                    f"DIFFERENT tag that this rank's collector never drained; "
-                    f"the credit for THIS tag depends on that same peer's "
-                    f"pause loop, which is itself stuck behind the undrained "
-                    f"lane. Refusing now beats a {WEG2_GROUP_FENCE_BUDGET_S:.0f}s "
-                    f"wait that would land on W35 and hide the real lane."
-                )
+
+        def _stuck_lane_reader():
+            if _rank < 0:
+                return []
+            return self._weg2_xchg_undrained_lanes(_rank, self._weg2_xchg_sems())
+
         try:
             rec = credit.wait_for(
                 need_bytes,
@@ -3975,6 +4000,7 @@ class SchedulerWeightUpdaterManager:
                 free_reader=self._weg2_free_bytes,
                 floor_bytes=self._weg2_corridor_floor_bytes(),
                 epoch=epoch,
+                stuck_lane_reader=_stuck_lane_reader,
             )
         except Weg2VramCreditRefused:
             raise

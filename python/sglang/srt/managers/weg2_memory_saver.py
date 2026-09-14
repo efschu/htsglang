@@ -732,43 +732,51 @@ class Weg2XchgLaneNeverDrainedRefused(RuntimeError):
     take, named THE MOMENT it is found instead of after a 120 s budget.
 
     #1391 (DESK10), boot weg2xsn31 versuch 5 AND versuch 7, byte-identical:
-    P PP0 (co-located with D TP0 on the 5090) reaches
-    ``resume_memory_occupation``'s per-tag loop for ``weights_0``/``weights_1``
-    with an EMPTY collect plan for those tags (``_weg2_xchg_inject_from_peer``
-    logs ``WEG2-XCHG COLLECT tag=weights_0 pieces=0`` and returns -- silently,
-    because an empty plan is a legitimate answer on every OTHER card: #1233's
-    ``chunk_tag_cards`` states outright that a PP stage owns only the tags
-    whose layers fall in its own range).  On card 0 that silence was wrong:
-    D's three ranks (diag, ``1-0``, ``2-0``) had ALREADY deposited real bands
-    for those exact tags -- ``sem_getvalue`` read ``full=8/8/16`` with
-    ``empty=0`` on all three, ctypes-probed by hand mid-hold because the
-    product itself had no accessor for the diagonal count
-    (:meth:`weight_exchange_transport.SemSet.diagonal_getvalue`, added
-    alongside this refusal).  Nobody ever called ``wait_full`` on those three
-    lanes, so nobody ever posted ``drained``, so D's next tag's
-    ``wait_drained`` sat for its own full 120 s and P's OWN unrelated
-    ``weights_3`` credit wait sat for its full 120 s beside it -- two
-    100%-unrelated-looking walls (``Weg2XchgBouncePhaseUnordered``, raised as
-    ``W68 Weg2XchgPlanDisagree``, on D; ``W35 Weg2VramCreditRefused`` on P)
-    that cost two DEBUG_HOLD boots to
-    trace back to one collector that structurally never touched card 0's
-    lanes for these two tags.
+    D's three ranks (diag on card 0, cross pairs ``1-0`` and ``2-0``) deposit
+    weights_0 for P PP0 COMPLETELY and CORRECTLY -- ``sem_getvalue`` read
+    ``full=16/8/8 empty=0``, and that is D's own TP-shard split (17:7:8,
+    matched one poster per lane), not a double post and not a broken
+    invariant.  D then tries weights_1 and blocks in ``wait_drained``
+    (waiting for weights_0 to be collected) on all three lanes, for its full
+    120 s, and P's own LATER ``weights_3`` credit wait blocks for its full
+    120 s beside it -- two walls that read as unrelated
+    (``Weg2XchgBouncePhaseUnordered``, raised as ``W68 Weg2XchgPlanDisagree``,
+    on D; ``W35 Weg2VramCreditRefused`` on P) and cost two DEBUG_HOLD boots to
+    trace to one fact: NOBODY EVER COLLECTED weights_0, so nobody ever posted
+    ``drained``.
 
-    THE CHECK, not a guess: an EMPTY collect plan for tag T on THIS rank is
-    only ever legitimate when nobody deposited anything for T on this rank's
-    OWN lanes either -- i.e. every lane whose destination is this rank's own
-    card must read ``full == 0`` at that exact moment (the #1374 contract
-    keeps ``full`` at 0 between tags by construction: the collector drains
-    every band before the depositor's NEXT ``wait_drained`` may pass).  A
-    nonzero ``full`` beside a zero-descriptor plan is not ambiguous -- it is
-    real, undrained work this rank's own plan says does not exist.  Raised
-    from :meth:`weight_updater.SchedulerMixin._weg2_xchg_inject_from_peer`
-    the instant ``_cdescs`` comes back empty, which is seconds into a boot
-    rather than 120 s into one, and from the deposit side's own
-    ``wait_drained``/``prime_drain`` step in
-    :meth:`weight_updater.SchedulerMixin._weg2_xchg_bounce_leg` for the
-    mirror case (a producer about to post into a lane whose OWN prior
-    tag's bands were never drained).
+    THE MECHANISM, found by reading against the boot's own launch flags
+    (``arm_xsn31.sh``: ``--weg2-xchg-inject shadow --weg2-seam-digest``): under
+    shadow mode the only collect call is
+    :meth:`weight_updater.SchedulerWeightUpdaterManager._weg2_xchg_shadow_compare`
+    -> ``_weg2_xchg_inject_weights(mode=INJECT_SHADOW)``, called ONCE after
+    the WHOLE weights family has resumed (``family_complete``), with NO
+    ``tag`` argument -- it grades the assembled plan as one unit, which is
+    correct for grading. But D's per-tag lockstep deposit (#1374) needs
+    ``drained(t)`` posted PER TAG, DURING the resume, to let tag t+1's
+    deposit proceed -- and posting per tag requires knowing which tag, which
+    a whole-plan grading pass run once at the end structurally cannot supply
+    in time. Whenever a co-located pair's traffic spans more than one
+    ``weights_<k>`` chunk tag (true for P's rank 0 in this boot's PP-cut, not
+    for ranks 1/2, which is why only card 0 wedges), the deposit and the
+    only collect can never meet: this is an unconditional ordering deadlock
+    under ``--weg2-xchg-inject shadow``, not a race and not a per-rank
+    identity bug.
+
+    THIS REFUSAL DOES NOT FIX THAT ORDERING GAP -- it only refuses to let a
+    lane already showing the gap's fingerprint (real, undrained bytes beside
+    a leg that has nothing to say about that lane) burn a full 120 s budget
+    first. Checked in two places: from
+    :meth:`weight_updater.SchedulerWeightUpdaterManager._weg2_xchg_bounce_leg`
+    the moment a COLLECT-phase leg's own lane set does not cover a lane that
+    already holds undrained bands for this rank's card (regardless of
+    whether ``tag`` is a string or ``None`` -- the frame both real callers,
+    deposit and collect, reach every time); and from
+    :class:`VramCredit`'s :meth:`~VramCredit.wait_for` poll loop itself (a
+    callback, not a one-shot check at entry -- the metal measured a real
+    race there: this rank entered clean and the peer's saturating post
+    landed four seconds later, invisible to a predicate that only looks
+    once).
     """
 
 
@@ -1079,6 +1087,17 @@ class VramCredit:
         floor_bytes: Optional[int] = None,
         poll_s: float = 0.01,
         epoch: Optional[Any] = None,
+        #: #1391 (DESK10) ROUND 3: an OPTIONAL callback, ``() -> [(lane, full,
+        #: empty), ...]``, polled on its OWN cadence (below, not every
+        #: ``poll_s`` -- each call is a handful of ctypes ``sem_getvalue``
+        #: syscalls, and this loop already spins at 100 Hz) WHILE this method
+        #: waits. A ONE-SHOT check at entry (the first version of this fix)
+        #: cannot see a condition that develops mid-wait: boot weg2xsn31's
+        #: instrument run measured exactly that race -- this rank entered
+        #: clean, the peer's saturating deposit landed 4 s later, and the
+        #: 120 s poll ran to its end without ever looking again. ``None``
+        #: (default) keeps every existing caller's behaviour byte-identical.
+        stuck_lane_reader=None,
     ) -> Dict[str, Any]:
         """W waits for the peer to fund ``need_bytes``, or refuses by name.
 
@@ -1151,7 +1170,40 @@ class VramCredit:
         # for, so the log read as "PP0 did nothing" when it was blocked on a
         # credit the peer could not publish. One line every 10 s.
         _next_progress = time.monotonic() + 10.0
+        # #1391 (DESK10) ROUND 3: A SEPARATE, SHORTER CADENCE for the lane
+        # check -- 1 s, not the progress line's 10 s. The measured race
+        # (peer's saturating post landed 4 s into the wait) would still slip
+        # past a 10 s cadence more than half the time; 1 s bounds the miss to
+        # a small fraction of the 120 s budget it replaces. Cheap: a handful
+        # of ctypes reads, not an allocation or a syscall storm at 100 Hz.
+        _next_lane_check = time.monotonic()
         while True:
+            if stuck_lane_reader is not None and time.monotonic() >= _next_lane_check:
+                _next_lane_check = time.monotonic() + 1.0
+                try:
+                    _stuck = stuck_lane_reader()
+                except Exception:  # noqa: BLE001 -- a probe may not raise
+                    _stuck = []
+                if _stuck:
+                    raise Weg2XchgLaneNeverDrainedRefused(
+                        f"W100 Weg2XchgLaneNeverDrainedRefused: card={self.uuid} "
+                        f"tag={tag}: waiting for a VRAM credit this card may "
+                        f"never receive -- {len(_stuck)} lane(s) targeting "
+                        f"this rank's card now hold undrained bands (found "
+                        f"{time.perf_counter() - t0:.1f}s into the wait): "
+                        + ", ".join(
+                            f"lane={lane} full={full} empty={empty}"
+                            for lane, full, empty in _stuck)
+                        + ". Under the #1374 contract `full` is 0 between "
+                        f"tags by construction, so a peer deposited real "
+                        f"bytes for a DIFFERENT tag that this rank's "
+                        f"collector never drained; the credit for THIS tag "
+                        f"depends on that same peer's pause loop, which is "
+                        f"itself stuck behind the undrained lane. Refusing "
+                        f"now beats riding out the remaining "
+                        f"{budget_s - (time.perf_counter() - t0):.0f}s of "
+                        f"this wait into a W35 that would hide the real lane."
+                    )
             device: Dict[str, Any] = {}
 
             def _grant_gate(available: int, _dev=device) -> None:
