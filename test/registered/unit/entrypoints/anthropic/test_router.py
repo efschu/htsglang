@@ -910,3 +910,502 @@ class AllowedModelsPolicyTestCase(AioHTTPTestCase):
             self.assertNotEqual(resp.status, 403, bad)
         self.assertEqual(len(self.upstream["requests"]), 4)
         self.assertEqual((await self._stats())["refused_model"], 0)
+
+
+# ---------------------------------------------------------------------------
+# OpenRouter third arm (router/openrouter-arm-0914)
+# ---------------------------------------------------------------------------
+#
+# Two classes below. ``ProductionRoutingPinTestCase`` is the ACCEPTANCE GATE
+# named in the task briefing: written BEFORE the third arm existed, wired
+# with today's real production CLI shape (``--local-model Qwen3.8-27B
+# --local-thinking on --local-effort xhigh``, and the real
+# ``allowed_models`` list from /etc/htsglang/router-policy.json as it stood
+# on 2026-09-14) and the real production model ids -- ``claude-opus-5``,
+# ``claude-sonnet-5``, ``Qwen3.8-27B-think``. It must pass BOTH before and
+# after the OpenRouter arm is added, byte-identically: this is the danger
+# direction named in the briefing (an existing model silently starts
+# routing somewhere else), and this class is a set of mutants on exactly
+# that direction, not a design wishlist.
+#
+# ``OpenRouterArmTestCase`` is the new-feature test: it is expected to FAIL
+# until the arm is implemented (there is no ``openrouter_models``/
+# ``openrouter_base`` parameter on ``create_app`` yet), and is the red half
+# of red-first for the new behaviour itself.
+
+PROD_OPUS = "claude-opus-5"
+PROD_SONNET = "claude-sonnet-5"
+PROD_LOCAL_MODEL = "Qwen3.8-27B"
+PROD_THINK_ALIAS = PROD_LOCAL_MODEL + THINKING_ALIAS_SUFFIX
+PROD_NOTHINK_ALIAS = PROD_LOCAL_MODEL + NOTHINK_ALIAS_SUFFIX
+# Real allowed_models as read from /etc/htsglang/router-policy.json,
+# 2026-09-14, before this branch touches it.
+PROD_ALLOWED_MODELS_0914 = [
+    "claude-fable-5-1",
+    "claude-opus-5",
+    "claude-sonnet-5",
+    "Qwen3.8-27B-think",
+    "Qwen3.8-27B",
+]
+
+
+class ProductionRoutingPinTestCase(AioHTTPTestCase):
+    """Pin today's real routing decision for the three live production ids.
+
+    This is the regression gate for "byte identity for all existing
+    models" (task briefing, Phase C). It mirrors the actual deployed CLI
+    line (10-qwen38.conf): local model Qwen3.8-27B, thinking forced ON with
+    xhigh effort for the plain id, plus the real allowed_models list.
+    """
+
+    async def get_application(self):
+        upstream_app, self.upstream = _make_backend("upstream")
+        local_app, self.local = _make_backend("local")
+        self.upstream_server = TestServer(upstream_app)
+        self.local_server = TestServer(local_app)
+        await self.upstream_server.start_server()
+        await self.local_server.start_server()
+        self.policy_path = os.path.join(
+            tempfile.mkdtemp(prefix="router-prodpin-"), "policy.json"
+        )
+        with open(self.policy_path, "w") as fh:
+            json.dump(
+                {
+                    "thinking": "on",
+                    "effort": "xhigh",
+                    "allowed_models": PROD_ALLOWED_MODELS_0914,
+                },
+                fh,
+            )
+        return create_app(
+            local_models=[PROD_LOCAL_MODEL],
+            upstream_base=str(self.upstream_server.make_url("")).rstrip("/"),
+            local_base=str(self.local_server.make_url("")).rstrip("/"),
+            local_wait_s=0,
+            thinking_enabled=True,
+            effort="xhigh",
+            policy_file=self.policy_path,
+        )
+
+    async def tearDownAsync(self):
+        await self.upstream_server.close()
+        await self.local_server.close()
+        await super().tearDownAsync()
+
+    def _body(self, model, **overrides):
+        body = {
+            "model": model,
+            "max_tokens": 64,
+            "messages": [{"role": "user", "content": "hi"}],
+        }
+        body.update(overrides)
+        return body
+
+    async def test_claude_opus_5_goes_upstream_untouched(self):
+        body = self._body(PROD_OPUS)
+        resp = await self.client.post("/v1/messages", json=body)
+        self.assertNotEqual(resp.status, 403)
+        self.assertEqual((await resp.json())["backend"], "upstream")
+        self.assertEqual(len(self.upstream["requests"]), 1)
+        self.assertEqual(self.local["requests"], [])
+        self.assertNotIn("thinking", self.upstream["requests"][0]["body"])
+
+    async def test_claude_sonnet_5_goes_upstream_untouched(self):
+        body = self._body(PROD_SONNET)
+        resp = await self.client.post("/v1/messages", json=body)
+        self.assertNotEqual(resp.status, 403)
+        self.assertEqual((await resp.json())["backend"], "upstream")
+        self.assertEqual(len(self.upstream["requests"]), 1)
+        self.assertEqual(self.local["requests"], [])
+        self.assertNotIn("thinking", self.upstream["requests"][0]["body"])
+
+    async def test_qwen38_think_alias_still_goes_local_with_adaptive_thinking(self):
+        resp = await self.client.post(
+            "/v1/messages", json=self._body(PROD_THINK_ALIAS)
+        )
+        self.assertNotEqual(resp.status, 403)
+        self.assertEqual((await resp.json())["backend"], "local")
+        self.assertEqual(self.upstream["requests"], [])
+        sent = self.local["requests"][0]["body"]
+        self.assertEqual(sent["model"], PROD_LOCAL_MODEL)
+        self.assertEqual(sent["thinking"], {"type": "adaptive"})
+
+    async def test_qwen38_nothink_alias_still_reaches_the_cheap_arm(self):
+        resp = await self.client.post(
+            "/v1/messages", json=self._body(PROD_NOTHINK_ALIAS)
+        )
+        self.assertEqual(resp.status, 403)  # not in the 0914 allowed_models
+        self.assertEqual(self.local["requests"], [])
+        self.assertEqual(self.upstream["requests"], [])
+
+    async def test_unlisted_model_is_still_refused_before_either_backend(self):
+        resp = await self.client.post(
+            "/v1/messages", json=self._body("some-other-model")
+        )
+        self.assertEqual(resp.status, 403)
+        self.assertEqual(self.local["requests"], [])
+        self.assertEqual(self.upstream["requests"], [])
+
+
+class OpenRouterArmTestCase(AioHTTPTestCase):
+    """The new third bucket: a listed model slug routes to a translator port.
+
+    Everything not in ``local_models`` and not in ``openrouter_models``
+    keeps going upstream exactly as before -- this class only exercises the
+    NEW branch; ``ProductionRoutingPinTestCase`` above is what proves the
+    old branches are untouched.
+
+    A real (fake) key is configured in a temp file for most of this class,
+    because the key-ABSENT behaviour (refuse by name) is its own,
+    separately named class below (``OpenRouterMissingKeyTestCase``) --
+    mixing "key present" and "key absent" fixtures in one class makes it too
+    easy for a future edit to add a case under the wrong assumption.
+    """
+
+    OPENROUTER_MODEL = "qwen/qwen3.8-flash"
+    FAKE_KEY = "sk-or-v1-test-fake-openrouter-key-0914"
+
+    async def get_application(self):
+        upstream_app, self.upstream = _make_backend("upstream")
+        local_app, self.local = _make_backend("local")
+        openrouter_app, self.openrouter = _make_backend("openrouter")
+        self.upstream_server = TestServer(upstream_app)
+        self.local_server = TestServer(local_app)
+        self.openrouter_server = TestServer(openrouter_app)
+        await self.upstream_server.start_server()
+        await self.local_server.start_server()
+        await self.openrouter_server.start_server()
+        self.key_path = os.path.join(
+            tempfile.mkdtemp(prefix="router-openrouter-key-"), "openrouter.key"
+        )
+        with open(self.key_path, "w") as fh:
+            fh.write(self.FAKE_KEY + "\n")
+        return create_app(
+            local_models=[LOCAL_MODEL],
+            upstream_base=str(self.upstream_server.make_url("")).rstrip("/"),
+            local_base=str(self.local_server.make_url("")).rstrip("/"),
+            local_wait_s=0,
+            openrouter_models=[self.OPENROUTER_MODEL],
+            openrouter_base=str(self.openrouter_server.make_url("")).rstrip("/"),
+            openrouter_key_file=self.key_path,
+        )
+
+    async def tearDownAsync(self):
+        await self.upstream_server.close()
+        await self.local_server.close()
+        await self.openrouter_server.close()
+        await super().tearDownAsync()
+
+    def _body(self, model, **overrides):
+        body = {
+            "model": model,
+            "max_tokens": 64,
+            "messages": [{"role": "user", "content": "hi"}],
+        }
+        body.update(overrides)
+        return body
+
+    def _write_key(self, content):
+        if os.path.exists(self.key_path):
+            os.utime(self.key_path, None)
+        with open(self.key_path, "w") as fh:
+            fh.write(content)
+
+    async def test_listed_openrouter_model_goes_to_the_translator_port(self):
+        resp = await self.client.post(
+            "/v1/messages", json=self._body(self.OPENROUTER_MODEL)
+        )
+        self.assertEqual(resp.status, 200)
+        self.assertEqual((await resp.json())["backend"], "openrouter")
+        self.assertEqual(len(self.openrouter["requests"]), 1)
+        self.assertEqual(self.local["requests"], [])
+        self.assertEqual(self.upstream["requests"], [])
+
+    async def test_openrouter_body_is_byte_identical_no_shim_applied(self):
+        """The thinking shim is local-only; the third arm gets no shim either."""
+        body = self._body(self.OPENROUTER_MODEL)
+        await self.client.post("/v1/messages", json=body)
+        self.assertNotIn("thinking", self.openrouter["requests"][0]["body"])
+        self.assertEqual(self.openrouter["requests"][0]["body"]["model"], self.OPENROUTER_MODEL)
+
+    async def test_unlisted_model_still_goes_upstream_not_openrouter(self):
+        resp = await self.client.post("/v1/messages", json=self._body(REMOTE_MODEL))
+        self.assertEqual(resp.status, 200)
+        self.assertEqual((await resp.json())["backend"], "upstream")
+        self.assertEqual(self.openrouter["requests"], [])
+
+    async def test_local_model_still_goes_local_not_openrouter(self):
+        resp = await self.client.post("/v1/messages", json=self._body(LOCAL_MODEL))
+        self.assertEqual(resp.status, 200)
+        self.assertEqual((await resp.json())["backend"], "local")
+        self.assertEqual(self.openrouter["requests"], [])
+
+    async def test_stats_reports_openrouter_models_and_counter(self):
+        await self.client.post(
+            "/v1/messages", json=self._body(self.OPENROUTER_MODEL)
+        )
+        resp = await self.client.get(STATS_PATH)
+        stats = await resp.json()
+        self.assertIn(self.OPENROUTER_MODEL, stats["openrouter_models"])
+        self.assertEqual(stats["openrouter"], 1)
+        self.assertTrue(stats["openrouter_key_configured"])
+
+    async def test_the_clients_own_credential_never_reaches_openrouter(self):
+        """The client's Anthropic key must not leak to a third party.
+
+        Forwarding it to OpenRouter would be a strictly worse mistake than
+        a failed request: it hands our Anthropic secret to a different
+        company. The translator gets OUR key from the key file instead.
+        """
+        await self.client.post(
+            "/v1/messages",
+            json=self._body(self.OPENROUTER_MODEL),
+            headers={"x-api-key": "sk-ant-this-must-never-leave-the-building"},
+        )
+        headers = self.openrouter["requests"][0]["headers"]
+        self.assertNotEqual(
+            headers.get("x-api-key"), "sk-ant-this-must-never-leave-the-building"
+        )
+
+    async def test_the_deployments_own_key_reaches_the_translator(self):
+        await self.client.post(
+            "/v1/messages",
+            json=self._body(self.OPENROUTER_MODEL),
+            headers={"x-api-key": "sk-ant-whatever-the-client-sent"},
+        )
+        headers = self.openrouter["requests"][0]["headers"]
+        self.assertEqual(headers["x-api-key"], self.FAKE_KEY)
+
+    async def test_authorization_header_is_also_scrubbed(self):
+        await self.client.post(
+            "/v1/messages",
+            json=self._body(self.OPENROUTER_MODEL),
+            headers={"Authorization": "Bearer sk-ant-also-must-not-leak"},
+        )
+        headers = self.openrouter["requests"][0]["headers"]
+        self.assertNotIn("sk-ant-also-must-not-leak", str(headers))
+        self.assertEqual(headers.get("x-api-key"), self.FAKE_KEY)
+
+    async def test_credentials_never_logged_for_openrouter_arm(self):
+        with self.assertLogs(
+            "sglang.srt.entrypoints.anthropic.router", level="DEBUG"
+        ) as log:
+            await self.client.post(
+                "/v1/messages",
+                json=self._body(self.OPENROUTER_MODEL),
+                headers={"x-api-key": "sk-ant-super-secret"},
+            )
+        joined = "\n".join(log.output)
+        self.assertNotIn("sk-ant-super-secret", joined)
+        # The DEPLOYMENT's own key must not appear either -- this is the
+        # more important half, and the one a naive `logger.info("headers=%s"
+        # % headers)` after the credential swap would fail.
+        self.assertNotIn(self.FAKE_KEY, joined)
+
+    async def test_key_is_hot_reloaded_without_a_restart(self):
+        NEW_KEY = "sk-or-v1-rotated-test-key"
+        self._write_key(NEW_KEY + "\n")
+        await self.client.post("/v1/messages", json=self._body(self.OPENROUTER_MODEL))
+        headers = self.openrouter["requests"][-1]["headers"]
+        self.assertEqual(headers["x-api-key"], NEW_KEY)
+
+    async def test_without_openrouter_models_configured_nothing_changes(self):
+        """No --openrouter-model given: identical to before this branch."""
+        upstream_app, upstream = _make_backend("upstream")
+        local_app, local = _make_backend("local")
+        upstream_server = TestServer(upstream_app)
+        local_server = TestServer(local_app)
+        await upstream_server.start_server()
+        await local_server.start_server()
+        try:
+            app = create_app(
+                local_models=[LOCAL_MODEL],
+                upstream_base=str(upstream_server.make_url("")).rstrip("/"),
+                local_base=str(local_server.make_url("")).rstrip("/"),
+                local_wait_s=0,
+            )
+            server = TestServer(app)
+            await server.start_server()
+            try:
+                async with TestClient(server) as client:
+                    resp = await client.post(
+                        "/v1/messages",
+                        json=self._body(self.OPENROUTER_MODEL),
+                    )
+                    self.assertEqual((await resp.json())["backend"], "upstream")
+            finally:
+                await server.close()
+        finally:
+            await upstream_server.close()
+            await local_server.close()
+
+    async def test_key_never_appears_in_any_response_or_log_across_every_route(self):
+        """Repo guard: a NEW serialization site that forgets to redact the
+        key must turn this test red.
+
+        Rather than hand-pick one code path (the class above for #1275/
+        #1282/#1283 was defeated exactly that way -- a fix for one sink left
+        a second, unrelated one open), this sweeps every route the app
+        currently registers and every log line produced along the way, at
+        the most permissive log level. A future route that spreads app
+        state (config dump, debug endpoint, an expanded /__router/stats)
+        without excluding the key breaks this test the same day it is
+        added, not months later.
+        """
+        with self.assertLogs(
+            "sglang.srt.entrypoints.anthropic.router", level="DEBUG"
+        ) as log:
+            resp1 = await self.client.post(
+                "/v1/messages",
+                json=self._body(self.OPENROUTER_MODEL),
+                headers={"x-api-key": "sk-ant-sweep-probe"},
+            )
+            body1 = await resp1.read()
+            resp2 = await self.client.get(STATS_PATH)
+            body2 = await resp2.read()
+            resp3 = await self.client.post(
+                "/v1/messages/count_tokens",
+                json=self._body(self.OPENROUTER_MODEL),
+            )
+            body3 = await resp3.read()
+        joined_logs = "\n".join(log.output)
+        for label, blob in (
+            ("stream response", body1),
+            ("stats response", body2),
+            ("count_tokens response", body3),
+            ("logs", joined_logs.encode()),
+        ):
+            self.assertNotIn(
+                self.FAKE_KEY.encode(), blob, f"key leaked into {label}"
+            )
+
+
+class OpenRouterMissingKeyTestCase(AioHTTPTestCase):
+    """No key configured: refuse by name, never fall back silently.
+
+    This is the coordinator's explicit correction: an empty/missing/
+    placeholder key file must behave like an unlisted model in the
+    allowed_models check (#1319) -- a named 403, before either backend is
+    touched -- and must NEVER be treated as "connection failed, try
+    upstream" or any other silent substitution. #1319's own root cause was
+    exactly this kind of silent fallback (a refused local model landing an
+    Opus agent on Fable for 54 turns), so this arm is held to the same bar.
+    """
+
+    OPENROUTER_MODEL = "qwen/qwen3.8-flash"
+
+    async def get_application(self):
+        upstream_app, self.upstream = _make_backend("upstream")
+        local_app, self.local = _make_backend("local")
+        openrouter_app, self.openrouter = _make_backend("openrouter")
+        self.upstream_server = TestServer(upstream_app)
+        self.local_server = TestServer(local_app)
+        self.openrouter_server = TestServer(openrouter_app)
+        await self.upstream_server.start_server()
+        await self.local_server.start_server()
+        await self.openrouter_server.start_server()
+        self.key_dir = tempfile.mkdtemp(prefix="router-openrouter-nokey-")
+        self.key_path = os.path.join(self.key_dir, "openrouter.key")
+        # No file written yet -- covers "missing" for the first sub-test;
+        # other sub-tests write empty/placeholder content explicitly.
+        return create_app(
+            local_models=[LOCAL_MODEL],
+            upstream_base=str(self.upstream_server.make_url("")).rstrip("/"),
+            local_base=str(self.local_server.make_url("")).rstrip("/"),
+            local_wait_s=0,
+            openrouter_models=[self.OPENROUTER_MODEL],
+            openrouter_base=str(self.openrouter_server.make_url("")).rstrip("/"),
+            openrouter_key_file=self.key_path,
+        )
+
+    async def tearDownAsync(self):
+        await self.upstream_server.close()
+        await self.local_server.close()
+        await self.openrouter_server.close()
+        await super().tearDownAsync()
+
+    def _body(self, model, **overrides):
+        body = {
+            "model": model,
+            "max_tokens": 64,
+            "messages": [{"role": "user", "content": "hi"}],
+        }
+        body.update(overrides)
+        return body
+
+    async def _stats(self):
+        resp = await self.client.get(STATS_PATH)
+        return await resp.json()
+
+    async def test_missing_key_file_refuses_by_name_before_either_backend(self):
+        resp = await self.client.post(
+            "/v1/messages", json=self._body(self.OPENROUTER_MODEL)
+        )
+        self.assertEqual(resp.status, 403)
+        err = await resp.json()
+        self.assertEqual(err["type"], "error")
+        self.assertEqual(err["error"]["type"], "permission_error")
+        self.assertIn(self.OPENROUTER_MODEL, err["error"]["message"])
+        self.assertEqual(self.openrouter["requests"], [])
+        self.assertEqual(self.local["requests"], [])
+        self.assertEqual(self.upstream["requests"], [])
+
+    async def test_missing_key_never_falls_back_to_local_or_upstream(self):
+        """The #1319 failure class, applied to this arm."""
+        for _ in range(3):
+            resp = await self.client.post(
+                "/v1/messages", json=self._body(self.OPENROUTER_MODEL)
+            )
+            self.assertEqual(resp.status, 403)
+        stats = await self._stats()
+        self.assertEqual(stats["local"], 0)
+        self.assertEqual(stats["upstream"], 0)
+        self.assertEqual(stats["openrouter"], 0)
+        self.assertEqual(stats["openrouter_no_key"], 3)
+        self.assertFalse(stats["openrouter_key_configured"])
+
+    async def test_empty_key_file_refuses_the_same_way(self):
+        with open(self.key_path, "w") as fh:
+            fh.write("")
+        resp = await self.client.post(
+            "/v1/messages", json=self._body(self.OPENROUTER_MODEL)
+        )
+        self.assertEqual(resp.status, 403)
+
+    async def test_whitespace_only_key_file_refuses_the_same_way(self):
+        with open(self.key_path, "w") as fh:
+            fh.write("   \n\n")
+        resp = await self.client.post(
+            "/v1/messages", json=self._body(self.OPENROUTER_MODEL)
+        )
+        self.assertEqual(resp.status, 403)
+
+    async def test_old_format_placeholder_line_refuses_the_same_way(self):
+        """The since-corrected 'OPENROUTER_API_KEY=<...>' draft format.
+
+        A key file left over from that draft (or a user who copy-pasted the
+        old instructions) must not be forwarded as a literal credential
+        containing the string 'OPENROUTER_API_KEY='.
+        """
+        with open(self.key_path, "w") as fh:
+            fh.write("OPENROUTER_API_KEY=PLACEHOLDER_USER_FILLS_THIS\n")
+        resp = await self.client.post(
+            "/v1/messages", json=self._body(self.OPENROUTER_MODEL)
+        )
+        self.assertEqual(resp.status, 403)
+
+    async def test_key_becomes_available_after_being_filled_in_no_restart(self):
+        """The other half of hot-reload: 403 -> works, without a restart."""
+        resp = await self.client.post(
+            "/v1/messages", json=self._body(self.OPENROUTER_MODEL)
+        )
+        self.assertEqual(resp.status, 403)
+        with open(self.key_path, "w") as fh:
+            fh.write("sk-or-v1-freshly-filled-in\n")
+        resp = await self.client.post(
+            "/v1/messages", json=self._body(self.OPENROUTER_MODEL)
+        )
+        self.assertEqual(resp.status, 200)
+        self.assertEqual((await resp.json())["backend"], "openrouter")
+        headers = self.openrouter["requests"][0]["headers"]
+        self.assertEqual(headers["x-api-key"], "sk-or-v1-freshly-filled-in")

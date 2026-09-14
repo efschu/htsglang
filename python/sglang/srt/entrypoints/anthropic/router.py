@@ -145,6 +145,24 @@ DEFAULT_UPSTREAM = "https://api.anthropic.com"
 DEFAULT_LOCAL = "http://127.0.0.1:30030"
 DEFAULT_LISTEN_HOST = "127.0.0.1"
 DEFAULT_LISTEN_PORT = 30099
+# The OpenRouter arm (router/openrouter-arm-0914): a THIRD bucket, alongside
+# local_models->LOCAL_BASE and everything-else->UPSTREAM_BASE. It never
+# speaks OpenRouter's wire format itself -- that translation (Anthropic
+# Messages <-> OpenAI chat/completions, including the SSE event
+# reconstruction) is a local translator process (anthropic-proxy-rs,
+# verified against a byte-level contract before this arm was built; see
+# the Phase A measurement in the task report). This router only forwards
+# the byte-identical Anthropic request to that process's port, exactly as
+# it already does for LOCAL_BASE. Empty by default: no --openrouter-model
+# given means this bucket is never consulted and behaviour is unchanged.
+DEFAULT_OPENROUTER = "http://127.0.0.1:8903"
+# aiohttp's web.run_app default is 60.0s. #1320 (2026-09-10): a restart of
+# THIS process (the endpoint every live Claude Code session on this rig
+# points at) held the port closed for 69s of measured ECONNREFUSED while the
+# old process drained under that default. A refused connection is exactly
+# what makes a client fall back to a different, unapproved model -- so a
+# short timeout here is a safety property, not a tuning knob.
+DEFAULT_SHUTDOWN_TIMEOUT_S = 2.0
 
 # Never forwarded: connection-scoped per RFC 9110, or recomputed by aiohttp.
 _HOP_BY_HOP = frozenset(
@@ -254,6 +272,9 @@ POLICY = web.AppKey("policy", dict)
 POLICY_FILE = web.AppKey("policy_file", object)
 UPSTREAM_BASE = web.AppKey("upstream_base", str)
 LOCAL_BASE = web.AppKey("local_base", str)
+OPENROUTER_MODELS = web.AppKey("openrouter_models", set)
+OPENROUTER_BASE = web.AppKey("openrouter_base", str)
+OPENROUTER_KEY_FILE = web.AppKey("openrouter_key_file", object)
 APPLY_SHIM = web.AppKey("apply_shim", bool)
 STATS = web.AppKey("stats", dict)
 SESSION = web.AppKey("session", aiohttp.ClientSession)
@@ -286,6 +307,25 @@ def _request_headers(headers: Iterable[tuple[str, str]]) -> dict[str, str]:
     out = _filter_headers(headers)
     if not any(k.lower() == "accept-encoding" for k in out):
         out["Accept-Encoding"] = "identity"
+    return out
+
+
+_CREDENTIAL_HEADER_NAMES = frozenset({"x-api-key", "authorization"})
+
+
+def _with_openrouter_credential(headers: dict[str, str], key: str) -> dict[str, str]:
+    """Replace any client credential header with the deployment's own key.
+
+    Openrouter-bound only. Two independent reasons this cannot be a simple
+    ``setdefault``: (1) the client's own Anthropic credential (``x-api-key``/
+    ``Authorization``) must never reach a third-party endpoint -- forwarding
+    it there would leak OUR Anthropic secret to OpenRouter, a strictly worse
+    outcome than a failed request; (2) the value that DOES need to go out is
+    read from the deployment's key file (``_KeyFile``), never from the
+    client. ``key`` itself is never logged by this function or its caller.
+    """
+    out = {k: v for k, v in headers.items() if k.lower() not in _CREDENTIAL_HEADER_NAMES}
+    out["x-api-key"] = key
     return out
 
 
@@ -627,6 +667,96 @@ class _PolicyFile:
         return self._overrides
 
 
+# Placeholder markers a key file may still carry (the user hasn't filled it
+# in yet, or filled it in following an earlier -- since-corrected -- draft of
+# this file's documented format). Either way this is "no key", not a literal
+# credential to hand anywhere. Case-folded before comparison.
+_OPENROUTER_KEY_PLACEHOLDER_MARKERS = ("PLACEHOLDER", "OPENROUTER_API_KEY=", "<", "TODO")
+
+
+class _KeyFile:
+    """Re-reads a one-line secret file when its mtime changes.
+
+    Same hot-reload PRIMITIVE as ``_PolicyFile`` (one ``stat()`` per check,
+    re-read only on a real mtime change) -- reused deliberately rather than
+    building a second mechanism, per the standing rule that this process
+    gets retuned live because it is the endpoint every Claude Code session
+    is pointed at. Deliberately NOT the same CLASS: ``_PolicyFile.overrides``
+    logs its full reloaded content at INFO on every change (line above),
+    which is exactly the right transparency for a thinking/effort flag and
+    exactly the wrong thing to do to a credential. Every logging statement
+    in this class is checked against that: presence, length bucket and
+    mtime are loggable; the key's characters never are, on any path
+    (reload, missing file, unreadable file, placeholder content).
+
+    The file format is ONE line, the bare key value, nothing else -- no
+    ``KEY=VALUE``, no JSON, no ``Bearer`` prefix (2026-09-14 operator
+    correction of an earlier draft that had specified ``OPENROUTER_API_KEY=
+    <...>``; a line still carrying that old prefix is treated as a
+    placeholder, see ``_OPENROUTER_KEY_PLACEHOLDER_MARKERS``, not forwarded
+    as a literal credential containing the string ``OPENROUTER_API_KEY=``).
+    """
+
+    def __init__(self, path: Optional[str]):
+        self.path = path
+        self._mtime: Optional[float] = None
+        self._key: Optional[str] = None
+
+    def key(self) -> Optional[str]:
+        """The current key, or ``None`` if unset/missing/empty/placeholder.
+
+        ``None`` is the router's own signal to refuse an openrouter-bound
+        request by name (see ``proxy``) instead of silently falling back to
+        a different backend -- a missing key is a configuration state, not
+        a transport failure, and must not look like one.
+        """
+        if self.path is None:
+            return None
+        try:
+            mtime = os.stat(self.path).st_mtime
+        except OSError:
+            if self._mtime is not None:
+                logger.warning(
+                    "openrouter key file %s disappeared: openrouter arm now "
+                    "unavailable (existing requests refused by name, not "
+                    "routed elsewhere)",
+                    self.path,
+                )
+            self._mtime = None
+            self._key = None
+            return None
+        if mtime == self._mtime:
+            return self._key
+        self._mtime = mtime
+        try:
+            with open(self.path) as fh:
+                raw = fh.read()
+        except OSError as e:
+            logger.warning("openrouter key file %s unreadable: %s", self.path, e)
+            self._key = None
+            return None
+        candidate = raw.strip()
+        is_placeholder = not candidate or any(
+            candidate.upper().startswith(marker) for marker in _OPENROUTER_KEY_PLACEHOLDER_MARKERS
+        )
+        if is_placeholder:
+            self._key = None
+            logger.info(
+                "openrouter key file %s reloaded: EMPTY/PLACEHOLDER -- "
+                "openrouter arm unavailable until a real key is present",
+                self.path,
+            )
+        else:
+            self._key = candidate
+            # Length only, NEVER content. See class docstring.
+            logger.info(
+                "openrouter key file %s reloaded: key present (%d chars)",
+                self.path,
+                len(candidate),
+            )
+        return self._key
+
+
 def _default_local_wait_s() -> float:
     """The wait cap when no flag was given: ``$ROUTER_LOCAL_WAIT_S``, else 300 s.
 
@@ -861,6 +991,9 @@ def create_app(
     upstream_wait_s: float = 0.0,
     max_buffered: int = MAX_BUFFERED_REQUESTS,
     local_poll_interval_s: float = LOCAL_WAIT_POLL_INTERVAL_S,
+    openrouter_models: Iterable[str] = (),
+    openrouter_base: str = DEFAULT_OPENROUTER,
+    openrouter_key_file: Optional[str] = None,
 ) -> web.Application:
     """Build the proxy application.
 
@@ -877,6 +1010,28 @@ def create_app(
     default backend-unreachable test, gets unless it opts in). ``max_buffered``
     and ``local_poll_interval_s`` are the queue-size cap and the health-probe
     pacing described in the module docstring.
+
+    ``openrouter_models`` is the THIRD bucket (router/openrouter-arm-0914):
+    matched exactly against ``model``, same as ``local_models``, but routed to
+    ``openrouter_base`` instead -- a local Anthropic<->OpenAI translator
+    process, never OpenRouter directly (this router still never translates).
+    No aliases, no thinking shim: that machinery is local-model-specific
+    (the -think/-nothink split exists because a local backend's default arm
+    is configurable), and stamping it onto a third, unrelated backend would
+    change behaviour nobody asked for. Empty by default, in which case this
+    bucket is never consulted and every request keeps going local/upstream
+    exactly as before -- this is the byte-identity guarantee for existing
+    models, checked by
+    ``OpenRouterArmTestCase.test_without_openrouter_models_configured_nothing_changes``.
+
+    ``openrouter_key_file`` names a one-line secret file (hot-reloaded, see
+    ``_KeyFile``) holding the OpenRouter API key. ``None`` (the default) or
+    an empty/placeholder file means the openrouter arm has NO key: a request
+    for an ``openrouter_models`` id is then refused BY NAME with a 403,
+    never silently routed anywhere else (mirrors the ``allowed_models``
+    refusal in shape). When a key IS present, it REPLACES whatever
+    credential header the client sent on this branch only -- the client's
+    own Anthropic credential must never reach a third-party endpoint.
     """
     if upstream_wait_s < 0:
         logger.warning(
@@ -897,6 +1052,9 @@ def create_app(
     app[NOTHINK_ALIASES] = {m + NOTHINK_ALIAS_SUFFIX: m for m in app[LOCAL_MODELS]}
     app[UPSTREAM_BASE] = upstream_base.rstrip("/")
     app[LOCAL_BASE] = local_base.rstrip("/")
+    app[OPENROUTER_MODELS] = set(openrouter_models)
+    app[OPENROUTER_BASE] = (openrouter_base or DEFAULT_OPENROUTER).rstrip("/")
+    app[OPENROUTER_KEY_FILE] = _KeyFile(openrouter_key_file)
     app[APPLY_SHIM] = apply_shim
     app[POLICY] = {
         "thinking_enabled": thinking_enabled,
@@ -910,6 +1068,10 @@ def create_app(
     app[STATS] = {
         "local": 0,
         "upstream": 0,
+        "openrouter": 0,
+        # A request for a listed openrouter model, refused by name because
+        # no key was configured -- never routed elsewhere. See _KeyFile.
+        "openrouter_no_key": 0,
         "errors": 0,
         # Requests answered 403 because their model id was not in the policy
         # file's ``allowed_models`` (see ``proxy``). Lifetime total.
@@ -946,6 +1108,14 @@ def create_app(
         body["local_models"] = sorted(request.app[LOCAL_MODELS])
         body["thinking_aliases"] = sorted(request.app[THINKING_ALIASES])
         body["nothink_aliases"] = sorted(request.app[NOTHINK_ALIASES])
+        body["openrouter_models"] = sorted(request.app[OPENROUTER_MODELS])
+        # Boolean ONLY -- never the key, never its length. This endpoint has
+        # no auth on this rig (LAN-open-without-auth is a deliberate,
+        # documented choice elsewhere), so even a side-channel like a length
+        # is a needless thing to serve over it.
+        body["openrouter_key_configured"] = (
+            request.app[OPENROUTER_KEY_FILE].key() is not None
+        )
         body["policy"] = _effective_policy(request.app)
         # Live local-backend hold-buffer state, not lifetime totals: how many
         # requests are held RIGHT NOW, and the longest any of them has been
@@ -1012,6 +1182,14 @@ def create_app(
         to_local = alias_target is not None or (
             model is not None and model in request.app[LOCAL_MODELS]
         )
+        # Third bucket (router/openrouter-arm-0914): checked only when the
+        # request is not already local, so a model id could never be listed
+        # in both without local silently winning -- local_models keeps first
+        # claim, matching how the alias check already takes precedence over
+        # the local_models set above.
+        to_openrouter = not to_local and (
+            model is not None and model in request.app[OPENROUTER_MODELS]
+        )
 
         if to_local:
             base = request.app[LOCAL_BASE]
@@ -1041,21 +1219,69 @@ def create_app(
                     force=False,
                 )
             request.app[STATS]["local"] += 1
+        elif to_openrouter:
+            # A listed model with no configured key is a CONFIGURATION
+            # state, not a transport failure -- refuse it by name, the same
+            # shape as the allowed_models 403 above, rather than let it
+            # fall through to any other backend. This is checked before
+            # anything else in this branch (no connection opened, no log
+            # line naming a destination that will not be tried).
+            openrouter_key = request.app[OPENROUTER_KEY_FILE].key()
+            if openrouter_key is None:
+                request.app[STATS]["openrouter_no_key"] += 1
+                logger.warning(
+                    "%s %s REFUSED model=%s: openrouter arm has no key "
+                    "configured (openrouter_key_file empty/missing/placeholder)",
+                    request.method,
+                    request.path,
+                    model,
+                )
+                return web.json_response(
+                    {
+                        "type": "error",
+                        "error": {
+                            "type": "permission_error",
+                            "message": (
+                                f"router policy: model {model!r} routes to the "
+                                "openrouter arm, but no key is configured "
+                                "(openrouter_key_file empty, missing, or a "
+                                "placeholder); refusing by name instead of "
+                                "silently routing elsewhere. Fill in the key "
+                                "file to enable this model."
+                            ),
+                        },
+                    },
+                    status=403,
+                )
+            # Straight byte pipe, exactly like the upstream branch below --
+            # no alias, no thinking shim. Those exist because a LOCAL
+            # backend's default thinking arm is a deployment choice this
+            # router makes; the openrouter bucket has no such default to
+            # apply, and the translator process on the other end expects
+            # the client's own Anthropic body untouched apart from the
+            # credential swap below.
+            base = request.app[OPENROUTER_BASE]
+            request.app[STATS]["openrouter"] += 1
         else:
             base = request.app[UPSTREAM_BASE]
             request.app[STATS]["upstream"] += 1
 
         # model is a client-supplied identifier, never a credential.
+        destination = (
+            "local" if to_local else "openrouter" if to_openrouter else "upstream"
+        )
         logger.info(
             "%s %s -> %s (model=%s)",
             request.method,
             request.path,
-            "local" if to_local else "upstream",
+            destination,
             model,
         )
 
         url = base + request.raw_path
         headers = _request_headers(request.headers.items())
+        if to_openrouter:
+            headers = _with_openrouter_credential(headers, openrouter_key)
 
         # Start the token count NOW, so it overlaps the real request instead
         # of adding a round trip in front of it. Only the local streaming
@@ -1085,8 +1311,14 @@ def create_app(
         # would only delay the error. Turn it on when the upstream is a process
         # you restart.
         #
-        # The upstream arm passes no health path: a proxy exposes none this
-        # router may assume, so the retry itself is the probe.
+        # The upstream and openrouter arms pass no health path: neither
+        # exposes one this router may assume, so the retry itself is the
+        # probe. The openrouter arm also gets no wait buffer (0.0, same as
+        # upstream's default) -- nothing asked for one, and the translator
+        # process it points at is not a boot this router is built to ride
+        # out yet; a connect failure there is reported immediately, same as
+        # it always was for every model not in local_models before this arm
+        # existed.
         if to_local:
             opener = _open_backend(
                 request.app[SESSION],
@@ -1101,6 +1333,21 @@ def create_app(
                 request.app[MAX_BUFFERED],
                 request.app[LOCAL_POLL_INTERVAL_S],
                 "local backend",
+            )
+        elif to_openrouter:
+            opener = _open_backend(
+                request.app[SESSION],
+                request.method,
+                url,
+                headers,
+                body if body else None,
+                0.0,
+                None,
+                request.app[STATS],
+                request.app[HELD_STARTS],
+                request.app[MAX_BUFFERED],
+                request.app[LOCAL_POLL_INTERVAL_S],
+                "openrouter backend",
             )
         else:
             opener = _open_backend(
@@ -1207,15 +1454,13 @@ def create_app(
         except aiohttp.ClientError as e:
             request.app[STATS]["errors"] += 1
             # Anthropic-shaped envelope so the client's error handling works.
-            logger.warning(
-                "proxy to %s failed: %s", "local" if to_local else "upstream", e
-            )
+            logger.warning("proxy to %s failed: %s", destination, e)
             return web.json_response(
                 {
                     "type": "error",
                     "error": {
                         "type": "api_error",
-                        "message": f"router could not reach the {'local' if to_local else 'upstream'} endpoint: {e}",
+                        "message": f"router could not reach the {destination} endpoint: {e}",
                     },
                 },
                 status=502,
@@ -1338,6 +1583,60 @@ def main(argv: list[str] | None = None) -> None:
         help="how often (seconds, plus jitter) a held request probes the "
         f"local backend's /health while waiting. Default {LOCAL_WAIT_POLL_INTERVAL_S:.0f}s.",
     )
+    parser.add_argument(
+        "--openrouter-model",
+        action="append",
+        default=[],
+        help="model id to route to --openrouter-base; repeatable. This is "
+        "the THIRD bucket (router/openrouter-arm-0914), alongside "
+        "--local-model->--local-base and everything-else->--upstream-base. "
+        "The id is matched exactly, like --local-model, but gets no "
+        "-think/-nothink alias and no thinking shim -- both are local-model "
+        "specific policy this router imposes on ITS OWN default arm, and "
+        "there is no such default to impose on a third-party backend. "
+        "--openrouter-base must speak the Anthropic Messages wire format "
+        "already (a local translator process, not OpenRouter directly: "
+        "this router never translates). Empty by default, in which case "
+        "this bucket is never consulted. A listed id must also be added to "
+        "the policy file's allowed_models, same as any other model, or the "
+        "403 allow-list check refuses it before either backend is tried.",
+    )
+    parser.add_argument(
+        "--openrouter-base",
+        default=DEFAULT_OPENROUTER,
+        help="base URL of the local Anthropic<->OpenAI translator process "
+        f"that --openrouter-model ids are forwarded to. Default {DEFAULT_OPENROUTER}. "
+        "Unused when --openrouter-model is never given.",
+    )
+    parser.add_argument(
+        "--openrouter-key-file",
+        default=None,
+        help="path to a one-line file holding the OpenRouter API key (bare "
+        "value, no prefix, no JSON), re-read on every mtime change -- same "
+        "live-reload primitive as --policy-file, so the key can be filled "
+        "in or rotated without restarting this process. No default ON "
+        "PURPOSE (unlike --openrouter-base): a test or a copy-pasted "
+        "command line must opt into a real key file explicitly, never "
+        "inherit a production path by accident. Empty, missing, or a "
+        "placeholder file means the openrouter arm has no key and every "
+        "request to an --openrouter-model id is refused with a named 403, "
+        "never silently routed to local or upstream instead.",
+    )
+    parser.add_argument(
+        "--shutdown-timeout-s",
+        type=float,
+        default=DEFAULT_SHUTDOWN_TIMEOUT_S,
+        help="aiohttp's web.run_app(shutdown_timeout=...): how long a "
+        "restart waits for in-flight connections to drain before the "
+        f"listening port is freed. Default {DEFAULT_SHUTDOWN_TIMEOUT_S:.0f}s "
+        "(aiohttp's own default is 60.0s; measured on this rig's "
+        "restart-of-a-live-router class of incident: 69s of ECONNREFUSED "
+        "for every session pointed at this port, #1320, 2026-09-10 "
+        "06:38:30-06:39:39). A short timeout kills in-flight streams faster "
+        "on a restart instead of holding the port; that trade is the whole "
+        "point here, because a refused connection is what makes Claude Code "
+        "silently fall back to a different, unapproved model.",
+    )
     args = parser.parse_args(argv)
 
     logging.basicConfig(
@@ -1358,17 +1657,26 @@ def main(argv: list[str] | None = None) -> None:
         upstream_wait_s=args.upstream_wait_s,
         max_buffered=args.local_max_buffered,
         local_poll_interval_s=args.local_poll_interval_s,
+        openrouter_models=args.openrouter_model,
+        openrouter_base=args.openrouter_base,
+        openrouter_key_file=args.openrouter_key_file,
     )
     logger.info(
         "listening on %s:%d, local models %s (aliases %s) -> %s, "
-        "everything else -> %s; default arm thinking=%s effort=%s%s; "
+        "openrouter models %s -> %s (key file %s, key present=%s), "
+        "everything else -> %s; "
+        "default arm thinking=%s effort=%s%s; "
         "local-backend hold buffer: wait_s=%.0f max_buffered=%d poll_interval_s=%.1f"
-        "; upstream hold buffer: wait_s=%.0f",
+        "; upstream hold buffer: wait_s=%.0f; shutdown_timeout=%.1fs",
         args.host,
         args.port,
         sorted(args.local_model),
         sorted(list(app[THINKING_ALIASES]) + list(app[NOTHINK_ALIASES])),
         args.local_base,
+        sorted(args.openrouter_model),
+        args.openrouter_base,
+        args.openrouter_key_file,
+        app[OPENROUTER_KEY_FILE].key() is not None,
         args.upstream_base,
         args.local_thinking,
         args.local_effort,
@@ -1377,8 +1685,15 @@ def main(argv: list[str] | None = None) -> None:
         app[MAX_BUFFERED],
         app[LOCAL_POLL_INTERVAL_S],
         app[UPSTREAM_WAIT_S],
+        args.shutdown_timeout_s,
     )
-    web.run_app(app, host=args.host, port=args.port, print=None)
+    web.run_app(
+        app,
+        host=args.host,
+        port=args.port,
+        print=None,
+        shutdown_timeout=args.shutdown_timeout_s,
+    )
 
 
 if __name__ == "__main__":
