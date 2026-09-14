@@ -2246,7 +2246,11 @@ def run_sequential_units(units, ops, boot_nonce: str, *,
     import json as _json  # noqa: PLC0415
     import time as _time  # noqa: PLC0415
 
-    biggest = max((int(u[2]) for u in units), default=0)
+    # #1378 xsn46/48: the buffer must hold the SUM of all units' bytes,
+    # not the max of individual units -- the units are sequentially
+    # written into the same buffer, so the total footprint is the sum.
+    total_bytes = sum(int(u[2]) for u in units)
+    biggest = total_bytes
     if biggest <= 0:
         return "no units"
     path = sequential_buffer_path(boot_nonce, shm_root)
