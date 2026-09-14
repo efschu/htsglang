@@ -86,7 +86,7 @@ def scaled_cut(n_layers: int) -> tuple:
     return tuple(parts)
 
 
-def build(tmp: str):
+def build(tmp: str, boot_token: str):
     """Six manifests on disk + this rank's live tensors, per group and rank."""
     cut = scaled_cut(LAYERS)
     models = {}
@@ -117,7 +117,7 @@ def build(tmp: str):
             # alone all three P ranks wrote one file and the join refused.
             xm.write_rank_manifest(xm.RankManifest(
                 group=group, rank=rank, card=CARDS[rank], region_tag=TAG,
-                boot_token="smoke",
+                boot_token=boot_token,
                 tp_rank=(rank if group == "D" else 0),
                 pp_rank=(rank if group == "P" else 0),
                 pieces=tuple(pieces)), tmp)
@@ -173,12 +173,21 @@ def main() -> int:
           f"d_vector={','.join(map(str, D_VECTOR))} cards={list(CARDS)} "
           f"quant=w8a8_int8 layers={LAYERS}")
 
+    # #1363: PID-SCOPED, not the bare literal "smoke" every earlier version
+    # of this script used. #1344's own rule (already stated in this tree's
+    # test suites' shm sweeps): "the NAME is the proof of ownership", so a
+    # fixed literal is an artifact no cleanup can claim without risking
+    # another concurrent run's file, and none can sweep without a holder
+    # check. This also gives the teardown at the end of section [4] a name
+    # it alone could have created.
+    SMOKE_NONCE = f"smoke{os.getpid()}"
+
     with tempfile.TemporaryDirectory(prefix="weg2-b4n-prov") as tmp:
-        models, cut = build(tmp)
+        models, cut = build(tmp, SMOKE_NONCE)
         print(f"  manifests written: {sorted(os.listdir(tmp))[:2]} ... "
               f"({len(os.listdir(tmp))} files, cut={cut})")
         os.environ[xm.DIR_ENV] = tmp
-        os.environ[xr.ENV_REGION_BOOT] = "smoke"
+        os.environ[xr.ENV_REGION_BOOT] = SMOKE_NONCE
         os.environ["SGLANG_WEG2_WEIGHT_SOURCE"] = "exchange"
 
         # THE xsn22 SHAPE IS ASSERTED, not assumed: three distinct P files.
@@ -300,7 +309,7 @@ def main() -> int:
                 pass
 
         class _Region:
-            boot_nonce = "smoke"
+            boot_nonce = SMOKE_NONCE
 
             def publish(self, *a, **k):
                 pass
@@ -319,7 +328,8 @@ def main() -> int:
                 seen.clear()
                 try:
                     _LegStub()._weg2_xchg_bounce_leg(
-                        descs=list(plan.descs), ops=None, boot_nonce="smoke",
+                        descs=list(plan.descs), ops=None,
+                        boot_nonce=SMOKE_NONCE,
                         slot_bytes=WIDEST_LAYER_BYTES, depth=1,
                         mode=wx.INJECT_AUTHORITATIVE, hook=hook,
                         region=_Region(), sems=_Sems())
@@ -341,6 +351,36 @@ def main() -> int:
                       f"hook={hook}: every cross leg carries a rendezvous")
         finally:
             _wb.run_bounce_leg = orig
+            # #1363: THE CALLER-SIDE GAP -- THIRD SIGHTING of
+            # `/dev/shm/weg2-xchg-bnc-smoke` left behind after this script
+            # exits. `_weg2_xchg_bounce_leg` (weight_updater.py) is a REAL,
+            # BORROWED method, not a stub -- only `run_bounce_leg` above is
+            # patched -- and it unconditionally constructs a REAL
+            # `bx.BounceSlots(boot_nonce, shm_root=root, create=True, ...)`
+            # (its own `root = xr.SHM_ROOT if shm_root is None else
+            # shm_root`, and this script never passes `shm_root=`), so every
+            # run of section [4] leaves a real file on the REAL `/dev/shm`,
+            # regardless of whether `region`/`sems` above are fakes.
+            # `weight_exchange_region.teardown_region` would NOT have caught
+            # this even if called: that function only unlinks the REGION
+            # file and `bounce.bin.*` entries INSIDE `region_dir(boot_nonce)`
+            # -- `BounceSlots`' own file lives directly under `shm_root`
+            # (`weight_exchange_bounce.bounce_slots_path`), a different path
+            # entirely. The one correct, holder-scoped cleanup is
+            # `BounceSlots.unlink()` (this module's own method, never a glob
+            # over `/dev/shm`) for THIS RUN'S OWN nonce -- `SMOKE_NONCE` is
+            # PID-scoped (the same #1344 rule the phase tests' own shm sweep
+            # already states: "the NAME is the proof of ownership"), so this
+            # can never touch another concurrent run's or another holder's
+            # file. `create=False`: opening what THIS run already made, not
+            # inventing a fresh one to delete.
+            try:
+                _wb.BounceSlots(SMOKE_NONCE, shm_root=xr.SHM_ROOT,
+                                create=False).unlink()
+            except FileNotFoundError:
+                # Both hooks were skipped (no plan for either), so section
+                # [4]'s loop body never ran and nothing was ever created.
+                pass
 
     total = 19
     print(f"\nWEG2-XCHG-PROVIDER-SMOKE verdict="
