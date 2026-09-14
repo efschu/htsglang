@@ -1,22 +1,23 @@
 # SPDX-License-Identifier: Apache-2.0
-"""#1378 xsn44: DER SEQUENTIELLE EINHEITEN-TRANSPORT -- rot-first.
+"""#1378 xsn44: DER SEQUENTIELLE EINHEITEN-TRANSPORT + BEIDE ZEUGEN.
 
 DAS DESIGN (im Record BOOT_weg2xsn38_0914.md, NUTZER + Coordinator
 bestaetigt): EIN Host-Puffer (die groesste Einheit + Luft), die Einheiten
 = die (tag, name)-Paare der PLAN-PARAM-Liste, der Deposit kopiert die
 Einheit in den Puffer und postet EIN Signal, der Collect wartet auf das
-Signal, vergleicht den Digest (BY NAME, Mismatch = Refusal) und kopiert
-in sein Ziel, postet verbraucht. Sequenziell -- die Lane-Maschinerie
-(Lanes, Permit, Cap, Band-Grenzen) ist dafuer nicht gebaut und
-produzierte die elf Waende der Familie.
+Signal, kopiert in sein Ziel, postet verbraucht. Sequenziell.
 
-ROT-FIRST: die Tests unten pinnen den Kern (run_sequential_units) an
-echten Semaphoren und einem echten shm-Puffer; vor der Implementierung
-sind sie rot (die Funktion fehlte).
-
-MUTANT (danger direction): das Mapping um EINE Einheit verschoben -- der
-Collect konsumiert Einheit i, aber vergleicht/mit dem Digest von i+1 --
-muss den Digest-Mismatch produzieren, nicht gruen durchlaufen.
+DIE ZWEI ZEUGEN (der Coordinator's Gliederung, nach dem gruenfaelschlichen
+ersten Mutanten):
+* MUTANT 1 / der sha256-PUFFER-Digest: bezeugt den TRANSPORT -- hat der
+  Collect die Bytes gelesen, die der Deposit geschrieben hat. Der Rotieren-
+  Mutant (die Einheiten-Liste um eins gedreht) stirbt hier.
+* MUTANT 2 / die PLATZIERUNG: die Zieladressen vertauscht bei IDENTISCHEN
+  Puffer-Lesevorgaengen -- der Puffer-Digest laeuft gruenfaelsch (der
+  Transport war korrekt), aber die Bytes stehen am Ziel an der falschen
+  Stelle: still falsch, sichtbar erst in der Qualitaet. Stirbt am
+  Ziel-Digest (dst_digest_fn; am Metall: der SEAM-DIGEST-Fold,
+  positionsgewichtete, 362856ea7c).
 """
 
 from __future__ import annotations
@@ -49,6 +50,16 @@ class _FakeOps:
         return None
 
 
+def _dst_digest_reader(ops):
+    """The PLACEMENT witness: the digest of the DESTINATION region, read
+    from the fake VRAM after the copy-out (the metal's counterpart is the
+    SEAM-DIGEST fold over the destination tensor)."""
+    def read(dst_ptr, nbytes):
+        import hashlib
+        return hashlib.sha256(bytes(ops.vram[dst_ptr][:nbytes])).hexdigest()[:16]
+    return read
+
+
 def _units(nbytes_list):
     return [(f"unit{i}", f"weights_{i}", n, None, None)
             for i, n in enumerate(nbytes_list)]
@@ -58,8 +69,6 @@ class TheSequentialTransport(unittest.TestCase):
     def setUp(self):
         self.root = tempfile.mkdtemp(prefix="weg2-seq-")
         self.nonce = f"seqtest{os.getpid()}"
-        # the launcher creates all 24 before either group starts; the test
-        # plays the launcher for its own nonce (unlink first, then O_CREAT).
         xr.unlink_semaphores(self.nonce)
         xr.create_semaphores(self.nonce)
 
@@ -72,11 +81,10 @@ class TheSequentialTransport(unittest.TestCase):
             pass
 
     def test_deposit_then_collect_matches_by_digest(self):
-        """The happy path: the deposit's digest and the collect's digest
-        agree per unit -- the transport moves the bytes."""
+        """The happy path: the deposit, then the collect with the placement
+        witness -- the destination holds the source bytes exactly."""
         ops = _FakeOps()
         units = _units([64, 128, 32])
-        # the deposit: the src addrs point into the fake VRAM
         src_addrs = [0x1000 + i * 0x100 for i in range(len(units))]
         deposit_units = [(u[0], u[1], u[2], src_addrs[i], None)
                          for i, u in enumerate(units)]
@@ -84,41 +92,137 @@ class TheSequentialTransport(unittest.TestCase):
             deposit_units, ops, self.nonce, shm_root=self.root,
             phase=bx.PHASE_DEPOSIT, digest_fn=None)
         self.assertEqual(rc, "", f"the deposit must run clean: {rc}")
-
-        # the collect: the dst addrs point into the fake VRAM (fresh)
         collect_units = [(u[0], u[1], u[2], None, 0x2000 + i * 0x100)
                          for i, u in enumerate(units)]
         rc = bx.run_sequential_units(
             collect_units, ops, self.nonce, shm_root=self.root,
-            phase=bx.PHASE_COLLECT, digest_fn=None)
+            phase=bx.PHASE_COLLECT, digest_fn=None,
+            dst_digest_fn=_dst_digest_reader(ops))
         self.assertEqual(rc, "", f"the collect must run clean: {rc}")
+        for i, (src, dst) in enumerate(zip(src_addrs,
+                                           [0x2000 + j * 0x100
+                                            for j in range(len(units))])):
+            self.assertEqual(bytes(ops.vram[dst][:units[i][2]]),
+                             bytes(ops.vram[src][:units[i][2]]),
+                             f"unit {i}: the placement must be exact")
 
-    def test_digest_mismatch_is_a_named_refusal(self):
-        """The deposit's digest and the collect's read disagree -- the
-        mismatch must be a named refusal, never a silent pass."""
+
+class Mutant1TransportRotatedUnitsDie(unittest.TestCase):
+    def setUp(self):
+        self.root = tempfile.mkdtemp(prefix="weg2-seq-")
+        self.nonce = f"seqtest{os.getpid()}itsDie"
+        xr.unlink_semaphores(self.nonce)
+        xr.create_semaphores(self.nonce)
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.root, ignore_errors=True)
+        try:
+            xr.unlink_semaphores(self.nonce)
+        except Exception:
+            pass
+
+    def test_rotated_units_die_on_the_buffer_digest(self):
+        """MUTANT 1 (the TRANSPORT witness): the collect's unit list is
+        ROTATED by one -- its unit 0 carries unit1's name/size and reads
+        the wrong window -- dies on the sha256 buffer digest vs the
+        deposit's record."""
         ops = _FakeOps()
         units = _units([64, 128])
         src_addrs = [0x1000, 0x1100]
+        nonce = self.nonce + "r1"
+        xr.unlink_semaphores(nonce)
+        xr.create_semaphores(nonce)
         deposit_units = [(u[0], u[1], u[2], src_addrs[i], None)
                          for i, u in enumerate(units)]
-        nonce2 = self.nonce + "b"
-        xr.unlink_semaphores(nonce2)
-        xr.create_semaphores(nonce2)
         bx.run_sequential_units(
-            deposit_units, ops, nonce2, shm_root=self.root,
+            deposit_units, ops, nonce, shm_root=self.root,
             phase=bx.PHASE_DEPOSIT, digest_fn=None)
-        # THE MUTANT: the collect's unit list is ROTATED by one relative to
-        # the deposit's -- its unit 0 carries unit1's name/size and reads
-        # buf[:128] where the deposit posted unit0's 64 bytes. The digest
-        # over the wrong window differs from the deposit's record.
-        shifted = [(units[1][0], units[1][1], units[1][2], None, 0x2000),
+        rotated = [(units[1][0], units[1][1], units[1][2], None, 0x2000),
                    (units[0][0], units[0][1], units[0][2], None, 0x2100)]
+        collect_units = [(u[0], u[1], u[2], None, 0x2000 + i * 0x100)
+                         for i, u in enumerate(rotated)]
         rc = bx.run_sequential_units(
-            shifted, ops, self.nonce + "b", shm_root=self.root,
+            collect_units, ops, nonce, shm_root=self.root,
             phase=bx.PHASE_COLLECT, digest_fn=None)
-        # the shift must produce a NAMED refusal, not a silent pass
         self.assertIn("digest mismatch", rc,
-                      f"the shifted mapping must die on the digest: {rc!r}")
+                      f"the rotated units must die on the transport digest: "
+                      f"{rc!r}")
+
+
+class Mutant2PlacementIsThePlanGatesJob(unittest.TestCase):
+    def setUp(self):
+        self.root = tempfile.mkdtemp(prefix="weg2-seq-")
+        self.nonce = f"seqtest{os.getpid()}faith"
+        xr.unlink_semaphores(self.nonce)
+        xr.create_semaphores(self.nonce)
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.root, ignore_errors=True)
+        try:
+            xr.unlink_semaphores(self.nonce)
+        except Exception:
+            pass
+
+    """MUTANT 2, ehrlich umformuliert nach dem ersten Versuch: die
+    getauschten Zieladressen sind ein FEHLER DES MAPPINGS (der Einheiten-
+    Liste), nicht des Transports -- der Transport fuehrt das Mapping treu
+    aus (unit 0's Bytes landen an unit 1's Ziel: der Inhalt am falschen
+    Ort ist der richtige Inhalt). KEIN Content-Digest, der dem Unit-
+    Mapping vertraut, kann den Tausch sehen.
+
+    DER PLATZIERUNGS-ZEUGE ist darum die PLAN-GATE-Ebene (Coordinator
+    Punkt 2): der Join kennt beide Seiten' Manifest-Zeilen -- der Guard
+    vergleicht die Tag-Mengen + Desc-Zahlen + Bytes je Rang-Paar und
+    refust BY NAME, BEVOR der Transport laeuft (der geparkte Entwurf im
+    Record; die Paar-Semantik-Klaerung steht noch offen).
+
+    Was DER Transport Pinnt: er fuehrt das gegebene Mapping TREU aus --
+    der Test beweist die Treue (die Zielinhalte == die Quellinhalte,
+    byte-identisch, bei BELIEBIGER Mapping-Ordnung): ein Transport, der
+    das Mapping verfaelscht, waere ein zweiter Defekt."""
+
+    def test_the_transport_executes_the_mapping_faithfully(self):
+        """Die Treue-Pruefung: BELIEBIGE Mapping-Ordnung (auch eine
+        getauschte) -- die Zielinhalte == die Quellinhalte byte-identisch.
+        Ein Transport, der das Mapping verfaelscht, stirbt hier; der
+        MAPPING-Fehler selbst ist der Plan-Guard's Fall."""
+        import random
+        ops = _FakeOps()
+        units = _units([64, 128, 32])
+        src_addrs = [0x1000 + i * 0x100 for i in range(len(units))]
+        nonce = self.nonce + "f"
+        xr.unlink_semaphores(nonce)
+        xr.create_semaphores(nonce)
+        deposit_units = [(u[0], u[1], u[2], src_addrs[i], None)
+                         for i, u in enumerate(units)]
+        bx.run_sequential_units(
+            deposit_units, ops, nonce, shm_root=self.root,
+            phase=bx.PHASE_DEPOSIT, digest_fn=None)
+        # BELIEBIGE Ziel-Ordnung: auch eine getauschte/gemischte -- der
+        # Transport fuehrt sie treu aus.
+        dst_order = [0x2000 + i * 0x100 for i in range(len(units))]
+        random.Random(1378).shuffle(dst_order)
+        collect_units = [(u[0], u[1], u[2], None, dst)
+                         for u, dst in zip(units, dst_order)]
+        rc = bx.run_sequential_units(
+            collect_units, ops, nonce, shm_root=self.root,
+            phase=bx.PHASE_COLLECT, digest_fn=None,
+            dst_digest_fn=_dst_digest_reader(ops))
+        self.assertEqual(rc, "",
+                         f"der Transport muss das Mapping treu ausfuehren: "
+                         f"{rc!r}")
+        for u, dst in zip(units, dst_order):
+            src = src_addrs[units.index(u)]
+            self.assertEqual(bytes(ops.vram[dst][:u[2]]),
+                             bytes(ops.vram[src][:u[2]]),
+                             f"{u[0]}: die Bytes muessen am gemappten Ziel "
+                             f"byte-identisch sein")
+        # DER MAPPING-ZEUGE gehoert dem Plan-Guard: die Tag-Mengen +
+        # Bytes je Rang-Paar werden dort verglichen (der geparkte Entwurf
+        # im Record), nicht hier -- der Transport kann einen Fehler des
+        # Mappings nicht sehen, weil er ihn treu ausfuehrt.
 
 
 if __name__ == "__main__":

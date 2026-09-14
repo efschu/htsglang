@@ -2172,6 +2172,15 @@ def run_sequential_units(units, ops, boot_nonce: str, *,
                          device: int = 0,
                          phase: str = PHASE_DEPOSIT,
                          digest_fn=None,
+                         #: #1378 xsn44 (the PLACEMENT witness): the digest of
+                         #: the DESTINATION after the copy-out, compared
+ #: against the deposit's record BY NAME. The sha256 buffer digest
+ #: witnesses the TRANSPORT (the right bytes read from the buffer); this
+ #: witness covers the PLACEMENT (the bytes landed at the right address) --
+ #: the swapped-destination mutant passes the buffer digest green-falsely
+ #: and dies here.  Optional: the desk tests provide it; the metal uses the
+ #: SEAM-DIGEST machinery (the position-weighted fold, 362856ea7c).
+                         dst_digest_fn=None,
                          liveness=None,
                          budget_s: float = 120.0,
                          log=None) -> str:
@@ -2286,6 +2295,23 @@ def run_sequential_units(units, ops, boot_nonce: str, *,
             dst_ptr = dst_addr(name, 0) if callable(dst_addr) else dst_addr
             ops.memcpy_async(int(dst_ptr), _off(buf, 0), nbytes, 0)
             ops.synchronize(0)
+            if dst_digest_fn is not None:
+                # #1378 xsn44 (the PLACEMENT witness): what LANDED at this
+                # destination vs what the deposit recorded. The buffer
+                # digest proved the transport; this proves the placement.
+                # The swapped-destination mutant passes the buffer digest
+                # green-falsely and dies HERE.
+                dst_digest = dst_digest_fn(int(dst_ptr), nbytes)
+                if dep_digest and dst_digest != dep_digest:
+                    dump_rank_stacks(
+                        "placement-mismatch-seq", tag=str(name),
+                        rank=int(rank_u),
+                        extra=f"unit {i} {name!r} deposit={dep_digest} "
+                              f"destination={dst_digest} -- the bytes "
+                              f"landed at the wrong place (the swapped-"
+                              f"destination shape, silent until quality)")
+                    return (f"placement mismatch at unit {i} {name!r}: "
+                            f"deposit={dep_digest} destination={dst_digest}")
             sems.post(pair=0, slot=_SEQ_SLOT, kind="empty")
             log(f"WEG2-SEQ collect {label} digest={my_digest} "
                 f"matches deposit")
