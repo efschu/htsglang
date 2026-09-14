@@ -5116,6 +5116,32 @@ def choose(
         "Minimalform's two manual flips + shadow compare, which serve 0 "
         "requests and therefore reuse no prefix HiCache could have cached."
     )
+    # #1369: user order 2026-09-14 ("DIE 48GB MUESSEN WEG"). ALWAYS printed,
+    # on or off, per the SAME rule the HiCache line above follows: an absent
+    # line is never "never checked". This is the GEGENPROBE the order asked
+    # for -- the boot MEASURES the zero from this line (host_ring_gib and the
+    # reason together) rather than believing a silent absence of the flag.
+    # `ring_absent_by_design` is TRUE exactly when `host_ring_gib` was
+    # charged 0 for this reason (`price()`'s own contradiction guard refuses
+    # any boot where the two disagree, so seeing both here is not a hope,
+    # it is what did not raise).
+    lines.append(
+        f"WEG2-WEIGHTS-CPU-BACKUP host_ring_gib={t['host_ring_gib']:.2f} "
+        f"ring_absent_by_design={bool(t.get('ring_absent_by_design'))} -- "
+        "when ring_absent_by_design is True: this term is 0.00 by "
+        "CONSTRUCTION (price()'s own contradiction guard refuses a boot "
+        "where a non-zero ring reaches it anyway), AND group P/D's argv "
+        "carries no --enable-weights-cpu-backup flag (launcher.py "
+        "common_flags/weight_exchange.weights_cpu_backup_armed) -- one "
+        "predicate, read once by the launcher, never a second one that "
+        "could disagree with it. `--weg2-weights-cpu-backup auto` (default) "
+        "sets this True only under an ARMED, AUTHORITATIVE exchange, where "
+        "the exchange itself is the weight source at the wake seam and this "
+        "ring would be a Rueckfall nobody reads; under `ring` or "
+        "exchange+shadow the ring is still the source or the shadow leg's "
+        "ground truth and this stays False, byte-identical to every boot "
+        "before this flag existed."
+    )
     # #1392: ALWAYS printed, on or off -- the missing half of the dry run.
     # `cg_current_bytes` already prices whatever the box holds RIGHT NOW into
     # every arm below (the origin, hence the peak): a parallel suite or boot
