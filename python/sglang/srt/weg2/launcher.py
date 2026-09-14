@@ -4759,6 +4759,11 @@ def build_env(tree: str, venv: str, cvd: str, store_dir: str, debug_hold: bool, 
     # boot a rank belongs to (mem_ledger.activation_probe.boot_token() reads
     # it so two boots of the identical form never collide on one dump path).
     env["SGLANG_WEG2_BOOT_TOKEN"] = weg2_boot_token
+    # #1378 xsn43 (TEIL 1): the evidence dir for the lanes' own stack dumps
+    # (weight_exchange_bounce.dump_rank_stacks) -- every named refusal of
+    # the W68/W29 family carries its diagnosis with it, per rank, named.
+    # Published like the boot token: an identity, never a secret.
+    env["SGLANG_WEG2_RANKDUMP_DIR"] = EVIDENCE_DIR
     # #1378 Posten 4: the cushion sampler's CSV path, published to BOTH
     # groups so the front's flip-ratchet record carries a MEASURED
     # cushion_min instead of the null every FLIP record so far wrote

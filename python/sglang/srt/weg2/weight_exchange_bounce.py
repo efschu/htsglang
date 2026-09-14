@@ -1498,6 +1498,15 @@ def run_bounce_leg(
                             filled = rendezvous.wait_full(slot=slot,
                                                           seq=int(batch.seq))
                         if filled is None:
+                            # #1378 xsn42 (TEIL 1): the refusal carries its
+                            # own diagnosis -- all threads + the leg state,
+                            # named with the group/rank, BEFORE the raise.
+                            dump_rank_stacks(
+                                "W68-not-posted", tag=str(leg_name),
+                                rank=int(leg_rank),
+                                extra=(f"slot={slot} seq={batch.seq} "
+                                       f"unit={unit.key} "
+                                       f"phase={phase} mode={mode}"))
                             raise Weg2XchgBouncePhaseUnordered(
                                 f"W68 Weg2XchgPlanDisagree: slot="
                                 f"{slot} seq={batch.seq} was not posted full "
@@ -1667,6 +1676,46 @@ def run_bounce_leg(
 #: with the named W68 -- while the front's W17 gate (dc9cd96c60) keeps the
 #: boot alive during the legitimate leg blocking.
 LANE_RENDEZVOUS_BUDGET_S = 180.0
+
+
+def dump_rank_stacks(reason: str, tag: str = "", rank: int = -1,
+                     extra: str = "") -> str:
+    """Dump ALL threads' Python stacks plus the rank-local leg state into
+    the evidence dir, named with the reason and the rank.
+
+    #1378 xsn42 (the coordinator's TEIL 1): the W68/W29 family died twice
+    without anyone knowing what the DEPOSIT rank was doing -- the sglang
+    watchdog's own thread dump (utils/watchdog.py:176, seen on weg2xsn38's
+    P log) named the LanePermit deadlock only because it fired LATER than
+    the leg's refusal. This dump fires AT the refusal. faulthandler is the
+    cheapest writer: no external process, no ptrace, works from inside a
+    C-frame (the native part is missing, the Python frames were enough at
+    xsn38). The env dir is published by the launcher (build_env ->
+    SGLANG_WEG2_RANKDUMP_DIR = the boot's evidence dir); without it the
+    dump is skipped silently -- a rank without an evidence dir has no
+    reader for it.
+    """
+    try:
+        out_dir = os.environ.get("SGLANG_WEG2_RANKDUMP_DIR", "")
+        if not out_dir:
+            return ""
+        os.makedirs(out_dir, exist_ok=True)
+        import faulthandler  # noqa: PLC0415
+        import time as _time  # noqa: PLC0415
+        ts = _time.strftime("%H%M%S")
+        safe_tag = str(tag).replace("/", "_").replace(" ", "") or "notag"
+        path = os.path.join(
+            out_dir, f"rankdump_{reason}_{safe_tag}_r{rank}_{ts}.txt")
+        with open(path, "w") as fh:
+            fh.write(f"reason={reason}\ntag={tag}\nrank={rank}\n")
+            if extra:
+                fh.write(f"extra={extra}\n")
+            fh.write("=== faulthandler.dump_traceback (all threads) ===\n")
+            fh.flush()
+            faulthandler.dump_traceback(file=fh)
+        return path
+    except BaseException:  # noqa: BLE001 -- a dump must never take the leg down
+        return ""
 
 
 class _NullLock:
