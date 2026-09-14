@@ -1639,16 +1639,15 @@ def run_bounce_leg(
 # one pair's `full` for another pair's bytes.
 
 
-#: The rendezvous wait budget for the BOOT'S LANES, not the test default.
-#: MEASURED on weg2xsn34 (2026-09-14, first flip, epoch 0): the wake side's
-#: collect waited its full 120 s budget for the sleep side's FIRST full post
-#: and expired 3 s before it landed (collect alloc 13:27:56, free 13:29:56;
-#: deposit alloc 13:29:59) -- the sleep side's pre-deposit staging is the
-#: first flip's pause chain, not a dead peer. 600 s is the boot's OWN bound
-##  for one leg (boot_deadman GRACE_S=600, passed by arm_xsn34.sh): the two
-#: authorities become one number, and a genuinely dead peer still dies at
-#: the same moment the deadman would kill the boot anyway.
-LANE_RENDEZVOUS_BUDGET_S = 600.0
+#: The rendezvous wait budget for the BOOT'S LANES.
+#: NUTZER-ORDER 14.09. ("den timeout deutlich verringern -- er loest nichts,
+#: er verlaengert nur die Zeit bis zur Erkennung"): 600 s (my first attempt,
+#: also this session) turned the co-located pair's deadlock into a SILENT
+#: stall the operator could not see on cpu/gpu/pcie -- measured twice. The
+#: budget is back at 120 s: the race it must survive is the deposit's
+#: staging (~123 s measured on weg2xsn34), and a REAL deadlock now dies at
+#: 2 minutes with the named W68 instead of hanging silently for ten.
+LANE_RENDEZVOUS_BUDGET_S = 120.0
 
 
 class _NullLock:

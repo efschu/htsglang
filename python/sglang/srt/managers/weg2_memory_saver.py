@@ -97,16 +97,14 @@ PCIE_DIRECTIONS = ("d2h", "h2d")
 #: A sleep-D2H or wake-H2D of a 27 GiB shard runs ~2.1 s measured (campaign (a),
 #: 2026-09-06, n=9).  The default deadline allows a full transfer of the sibling
 #: plus slack; the caller may shorten it.
-#: #1378 xsn35 (2026-09-14, MEASURED): 120 s expired while the sibling was
-#: still legitimately HOLDING the lock -- `waited=0.000s held=124.450s` on the
-#: 5090, the wake-H2D of the ring-off flip (the collect stages ~6 GiB through
-#: the bounce over the x4 link before its own bands release).  The holder was
-#: healthy; the waiter's budget was the defect.  600 s is the boot's own leg
-#: bound (LANE_RENDEZVOUS_BUDGET_S in weight_exchange_bounce, the deadman's
-#: GRACE_S) -- one number for every wait in a flip, so no budget loses a race
-#: against a healthy sibling again.  A genuinely dead holder still dies here:
-#: the deadman kills the boot at the same bound.
-DEFAULT_PCIE_LOCK_TIMEOUT_S = 600.0
+#: NUTZER-ORDER 14.09. ("man sollte diesen timeout deutlich verringern -- der
+#: timeout hilft nicht beim problem, sondern laesst nur mehr zeit verstreichen,
+#: bis man den fail erkennt"): the 600 s raise (this session's first attempt)
+#: was the WRONG dimension. The per-copy lock (d491500c71) made the holds
+#: 0.045-0.123 s; a lock wait that exceeds a short budget means a stuck
+#: holder, and failing FAST with the named Weg2PcieLockTimeout is worth more
+#: than hanging. 120 s stays.
+DEFAULT_PCIE_LOCK_TIMEOUT_S = 120.0
 
 #: The S1 sleep-acceptance criterion in its DELTA form: how much of what this
 #: process held before the pause must be gone after it.

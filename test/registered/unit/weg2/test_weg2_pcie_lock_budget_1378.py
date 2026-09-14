@@ -41,8 +41,10 @@ class TheLockBudgetIsTheBootBound(unittest.TestCase):
         budget and the deadman's grace. Changing one without the other
         splits the wait authorities again."""
         from sglang.srt.weg2 import weight_exchange_bounce as bx
-        self.assertEqual(ms.DEFAULT_PCIE_LOCK_TIMEOUT_S, 600.0)
-        self.assertEqual(bx.LANE_RENDEZVOUS_BUDGET_S, 600.0)
+        self.assertEqual(ms.DEFAULT_PCIE_LOCK_TIMEOUT_S, 120.0,
+                         "NUTZER-ORDER 14.09.: fail fast -- the per-copy "
+                         "holds are 0.1 s; a long lock budget only delays "
+                         "the detection of a stuck holder")
 
 
 class TheLockStillRefusesWhenGenuinelyStuck(unittest.TestCase):

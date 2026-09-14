@@ -48,10 +48,11 @@ class TheConstructionSiteUsesTheLaneBudget(unittest.TestCase):
                       "bound, not the 120 s tool default -- the xsn34 race "
                       "(120 s expired 3 s before the post) is exactly what "
                       "this pin keeps closed")
-        self.assertEqual(bx.LANE_RENDEZVOUS_BUDGET_S, 600.0,
-                         "the lane budget and the deadman's GRACE_S are ONE "
-                         "number; changing one without the other splits the "
-                         "two authorities again")
+        self.assertEqual(bx.LANE_RENDEZVOUS_BUDGET_S, 120.0,
+                         "NUTZER-ORDER 14.09.: short budgets fail fast -- a "
+                         "long timeout only delays the detection of the fail "
+                         "(measured twice: the 600 s stall was invisible on "
+                         "cpu/gpu/pcie)")
 
 
 if __name__ == "__main__":
