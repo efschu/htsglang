@@ -446,14 +446,40 @@ class TestTheCompareGroundExistsOnThisArm(CustomTestCase):
     """
 
     def test_enable_cpu_backup_is_decided_by_server_args_not_by_an_arm(self):
+        """SUPERSEDED by #1369 (user order 2026-09-14, "DIE 48GB MUESSEN WEG.
+        UND ZWAR PRONTO"): this test used to pin that NO arm predicate gated
+        ``enable_cpu_backup`` at all, which was true and is the reason the
+        48.672-MiB/card host ring was armed for the weights region on every
+        arm, including ``exchange`` -- where the peer-VRAM bounce is already
+        the wake's byte source and the ring carries bytes nothing reads
+        (measured, ``ANALYSE_1369_RINGLESER_0913.md``). The fix ANDs
+        ``weights_cpu_backup_armed()`` onto the SAME expression rather than
+        replacing it, so this test now pins the NEW invariant: the old
+        disjunction is still there verbatim (``ring``/``shadow`` stay byte
+        for byte -- see :class:`TestTheCompareGroundExistsOnThisArm`'s other
+        tests, all still green), and the gate is exactly the one new
+        predicate, not the three axis predicates read directly."""
         import sglang.srt.model_executor.model_runner as mr
         src = inspect.getsource(mr.ModelRunner)
-        self.assertIn("enable_cpu_backup = self.server_args.enable_weights_cpu_backup", src)
-        decider = next(ln for ln in src.splitlines()
-                       if "enable_cpu_backup = self.server_args" in ln)
+        self.assertIn(
+            "            self.server_args.enable_weights_cpu_backup\n"
+            "            or (self.is_draft_worker and "
+            "self.server_args.enable_draft_weights_cpu_backup)",
+            src,
+            "the pre-#1369 disjunction must survive verbatim -- the fix ANDs "
+            "a predicate on top, it does not re-derive the expression",
+        )
+        decider_lines = [
+            ln for ln in src.splitlines() if "enable_cpu_backup = " in ln
+        ]
+        self.assertEqual(len(decider_lines), 1, decider_lines)
+        self.assertIn("weights_cpu_backup_armed()", decider_lines[0])
         for predicate in ("exchange_armed", "shadow_armed", "bounce_lane_armed",
                           "inject_mode", "weight_source"):
-            self.assertNotIn(predicate, decider)
+            # These are read INSIDE weights_cpu_backup_armed(), never spelled
+            # out again at the call site -- ein-job-ein-mover, not a second
+            # reading of the axis.
+            self.assertNotIn(predicate, decider_lines[0])
 
     def test_the_launcher_passes_the_flag_unconditionally(self):
         """``common_flags`` -- both groups, every arm. If this ever becomes

@@ -2437,9 +2437,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Remove monkey_patch when linear.py quant remove dependencies with vllm
         monkey_patch_vllm_parallel_state()
 
-        enable_cpu_backup = self.server_args.enable_weights_cpu_backup or (
-            self.is_draft_worker and self.server_args.enable_draft_weights_cpu_backup
-        )
         # #1273 S2 (spec section 4.1): under --weg2-weight-source exchange the
         # NEXTN/MTP draft runner's weights carry their OWN tag, outside the
         # weights family -- group P has no --speculative-* in this form, so
@@ -2455,7 +2452,32 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         from sglang.srt.managers.weg2_memory_saver import weights_region
         from sglang.srt.weg2.weight_exchange import (
             RunnerShape,
+            weights_cpu_backup_armed,
             weights_region_tag_for,
+        )
+
+        # #1369 USER ORDER 2026-09-14 ("DIE 48GB MUESSEN WEG. UND ZWAR
+        # PRONTO"): this used to be `enable_weights_cpu_backup or
+        # (is_draft_worker and enable_draft_weights_cpu_backup)` with NO arm
+        # predicate -- the weg2 launcher passes `--enable-weights-cpu-backup`
+        # UNCONDITIONALLY (`launcher.py` `common_flags`), so the host backup
+        # ring was armed for the weights region on every arm, including
+        # `--weg2-weight-source exchange`, where the peer-VRAM bounce is
+        # already the wake's byte source and the ring is a 48.672-MiB/card
+        # fallback nothing reads (measured,
+        # `/spinning/gpu-arb/weg2/ANALYSE_1369_RINGLESER_0913.md`).
+        # `weights_cpu_backup_armed()` ANDs an arm predicate onto the SAME
+        # expression: `auto` (default) is `not exchange_armed()`, so `ring`
+        # and `shadow` are BYTE-IDENTICAL to before (`shadow` still needs the
+        # ring as its compare ground, see the function's docstring) and only
+        # `exchange` changes. `on` reproduces the old unconditional value
+        # exactly, byte for byte -- a comparison instrument, never a design
+        # assumption. See `weights_cpu_backup_armed.__doc__` for `off` and for
+        # why the predicate is spelled as an AND on the outside rather than
+        # threaded into the disjunction below.
+        enable_cpu_backup = weights_cpu_backup_armed() and (
+            self.server_args.enable_weights_cpu_backup
+            or (self.is_draft_worker and self.server_args.enable_draft_weights_cpu_backup)
         )
 
         weights_tag = weights_region_tag_for(RunnerShape.of(self))
