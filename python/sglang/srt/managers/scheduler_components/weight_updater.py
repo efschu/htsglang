@@ -3776,11 +3776,19 @@ class SchedulerWeightUpdaterManager:
                                      ring_ms=None) -> None:
         """DESTINATION hook, wake leg, after ``family_complete`` and the reload.
 
-        This is the only place in the boot where the ground truth exists: the
-        ring has restored every weight byte and the static state is imported, so
-        the shadow's pulled stripes have something to be compared AGAINST.  It
-        runs before the leg reports done, so a mismatch appears in the log
-        beside the flip that produced it rather than one flip later.
+        This is the place in the boot where the ground truth for this wake
+        already exists: whatever carrier ``_weg2_wake_reload_weights``
+        selected (ring, TMS backup, disk, or -- under
+        ``--weg2-weight-source exchange`` + ``--weg2-xchg-inject
+        authoritative`` -- the peer group's own live VRAM via the bounce
+        lane) has already written the bytes, and the static state is
+        imported, so the shadow's pulled stripes have something to be
+        compared AGAINST regardless of which carrier that was (CORRECTED
+        2026-09-14, #1334: this used to name the ring specifically as the
+        only possible ground truth, which is stale once
+        ``CARRIER_EXCHANGE`` exists). It runs before the leg reports done,
+        so a mismatch appears in the log beside the flip that produced it
+        rather than one flip later.
 
         ``reserve_bytes`` IS THE STILL-UNMAPPED DEMAND AT *THIS* INSTANT, and
         the number it used to carry was wrong in the one way that matters.
@@ -4752,8 +4760,16 @@ class SchedulerWeightUpdaterManager:
             credit = self._weg2_open_credit_for_leg(getattr(recv_req, "epoch", None))
             # #1273 S5b: the SOURCE half of the shadow, at the last instant the
             # weight pages are mapped.  See _weg2_shadow_source_leg for why it
-            # is here and not after the pause.  Never raises; on every arm but
-            # --weg2-weight-source shadow it returns having touched nothing.
+            # is here and not after the pause.  Never raises; on the `ring`
+            # arm it returns having touched nothing (`bounce_lane_armed()`
+            # is False there and only there, #1273 B4q -- CORRECTED 2026-09-14,
+            # #1334: this comment used to say "every arm but
+            # --weg2-weight-source shadow", which stopped being true the
+            # moment B4q widened the gate from `shadow_armed()` to
+            # `bounce_lane_armed()` and was never reconciled here -- under
+            # `--weg2-weight-source exchange` (BOOT7's A1) this hook ALSO
+            # runs, proven by execution in
+            # test_weg2_1334_bounce_lane_axis.py).
             #
             # THE LEG'S CLOCK STARTS BEFORE IT (S5b refuter, must_fix 4).  With
             # t0 after the hook, weg2_leg_ms -- the number this leg publishes
@@ -5240,10 +5256,21 @@ class SchedulerWeightUpdaterManager:
                     self.stashed_model_static_state,
                 )
                 del self.stashed_model_static_state
-                # #1273 S5b: the DESTINATION half.  The ring's bytes are final
-                # here -- that is the whole reason this hook is after
-                # family_complete and after the reload -- so the shadow's
-                # stripes have a ground truth to be compared against.
+                # #1273 S5b: the DESTINATION half.  This hook runs after
+                # family_complete and after the reload, so whatever DID
+                # carry the wake's bytes has already written them -- under
+                # `ring`/`tms-backup` that is the ring, and the shadow's
+                # stripes have that ground truth to be compared against
+                # (CORRECTED 2026-09-14, #1334: this comment used to say
+                # "the ring's bytes are final" unconditionally, which is
+                # stale under `--weg2-weight-source exchange` +
+                # `--weg2-xchg-inject authoritative`, where
+                # `_weg2_wake_reload_weights` routes to `CARRIER_EXCHANGE`
+                # and neither the ring nor disk ever wrote these bytes --
+                # the peer group's own live VRAM did, via the bounce lane.
+                # This hook still runs there too (`bounce_lane_armed()` is
+                # True for `exchange`, #1273 B4q), it is simply comparing
+                # against a different, still-correct ground truth).
                 # ``ring_ms`` is the leg's OWN per-tag wall, the same instrument
                 # the WEG2-FLIP-TAG lines above print, so the two numbers on one
                 # log can be subtracted.
