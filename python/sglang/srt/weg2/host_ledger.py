@@ -676,6 +676,48 @@ class Margin:
         )
 
 
+#: #1392: the box's own QUIET reading, measured 2026-09-14 (`cat
+#: /sys/fs/cgroup/memory.current` on this line's own container, no boot, no
+#: local gate, no suite running) -- the SAME snapshot
+#: test_weg2_hicache_disabled_1386.py's `_fake_quiet_host` fixture pins for
+#: `choose_host_ledger`'s own meminfo/cgroup seam (#1390), reused here as the
+#: PRODUCTION reference rather than invented fresh: a second, unrelated
+#: "quiet" number for the same box would be the next reader's #1341 (two
+#: numbers, one fact, destined to disagree).  Like every other measured
+#: constant in this module (`RUN_PEAK_RESIDUAL_GIB`,
+#: `IDLE_ANON_DRIFT_MIB_PER_MIN_DEFAULT`), it is a BASELINE subject to
+#: re-measurement, not a law of physics -- it names what "quiet" meant on the
+#: day it was taken, not what it will always mean.
+QUIET_BASELINE_CG_CURRENT_GIB = 13.10
+
+#: #1392: the dry-run-misst-die-live-box incident, 2026-09-13 (Ledger-Sitz
+#: [22-fix2]): the SAME serving argv worked to the ARM line (run_peak
+#: 95.18 GiB) on a quiet box and was refused (W97, 97.67 GiB) when a parallel
+#: pytest suite added ~2.5 GiB to `memory.current`. This is the one MEASURED
+#: magnitude of "how much a concurrent suite can move this box", not a
+#: guessed safety factor -- crossing it is the signal that THIS reading may
+#: be a box artifact rather than a fact about the form, in EITHER verdict
+#: direction (a refusal may be the box, not the form; a FUNDABLE may not
+#: survive to actual boot time if the box gets noisier still).
+FOREIGN_LOAD_PROVISIONAL_THRESHOLD_GIB = 2.5
+
+
+def foreign_load_now_gib(cg_current_bytes: Optional[int]) -> Optional[float]:
+    """How far ABOVE the quiet baseline this box reads RIGHT NOW, or ``None``
+    when the reading itself is unreadable.
+
+    Not a margin term and not summed into any bound -- `cg_current_bytes` is
+    already fully priced into the origin (:class:`Margin`'s own
+    ``foreign_gib`` docstring: "that load AT ARM TIME IS ALREADY IN THE
+    ORIGIN"). This is PRINT-ONLY evidence for the ARM line's own honesty
+    about which box state its verdict was measured against -- never a second
+    gate answering the question the peak/cushion checks already answer.
+    """
+    if cg_current_bytes is None:
+        return None
+    return max(0.0, float(cg_current_bytes) / GIB - QUIET_BASELINE_CG_CURRENT_GIB)
+
+
 def measure_foreign_anon(
     cgroup_anon_bytes: Optional[int], own_pids: Sequence[int]
 ) -> Tuple[Optional[float], float, str]:
@@ -4918,6 +4960,20 @@ def choose(
     # line as measured when it silently wasn't).
     prior_cushion_min_gib: Optional[float] = None,
     prior_bounce_gib: Optional[float] = None,
+    # #1392 (the missing half of the dry run): PRINT-ONLY, like
+    # `xchg_bounce_prov` above -- it never reaches `price`, because nothing
+    # here changes a number. `cg_current_bytes` already prices the box's
+    # CURRENT reading into every arm's origin (the safe-direction coupling:
+    # foreign load tightens the bound); what was missing was the ARM line
+    # ever SAYING which reading it was funded against, so a verdict measured
+    # on a quiet box and one measured under a parallel suite printed
+    # identically. `at_gib` is the wall-clock the box was read, `anon_bytes`/
+    # `shmem_bytes` are memory.stat's own two components of the same
+    # `cg_current_bytes` reading, printed so a reader does not have to
+    # `free -g` the box by hand (dry-run-misst-die-live-box, 2026-09-13).
+    box_state_at: str = "",
+    cg_anon_bytes: Optional[int] = None,
+    cg_shmem_bytes: Optional[int] = None,
 ) -> Tuple[Arm, Optional[float], List[str]]:
     """Walk the ladder; return (arm, reap headroom GiB, printed lines) or W20/W21.
 
@@ -5059,6 +5115,44 @@ def choose(
         "--hicache-* flag at all (launcher.py common_flags); for the "
         "Minimalform's two manual flips + shadow compare, which serve 0 "
         "requests and therefore reuse no prefix HiCache could have cached."
+    )
+    # #1392: ALWAYS printed, on or off -- the missing half of the dry run.
+    # `cg_current_bytes` already prices whatever the box holds RIGHT NOW into
+    # every arm below (the origin, hence the peak): a parallel suite or boot
+    # TIGHTENS the bound, the safe direction. What was missing is this line
+    # ever SAYING so: "FUNDABLE, measured on a quiet box" and "FUNDABLE,
+    # measured under a parallel suite" printed identically, and the second
+    # kind is the one that does not survive to the ACTUAL boot if the box
+    # gets noisier still between this dry run and then. `at`, `memavail`,
+    # `anon`, `shmem` are the box's own numbers, not derived -- a reader who
+    # wants to judge whether this verdict is stale needs the raw reading,
+    # not a summary of it.
+    _fl_now = foreign_load_now_gib(cg_current_bytes)
+    _cg_anon_gib = None if cg_anon_bytes is None else float(cg_anon_bytes) / GIB
+    _cg_shmem_gib = None if cg_shmem_bytes is None else float(cg_shmem_bytes) / GIB
+    lines.append(
+        f"WEG2-DRY-RUN-BOX-STATE at={box_state_at or 'not stamped by the caller'} "
+        f"memavail={t['memavail_gib']:.2f} GiB anon={_gib_or_none(_cg_anon_gib)} "
+        f"shmem={_gib_or_none(_cg_shmem_gib)} (live /proc + cgroup memory.stat, "
+        "read once for this ladder, not per arm) "
+        f"foreign_load_now={_gib_or_none(_fl_now)} "
+        f"[= cg_current - {QUIET_BASELINE_CG_CURRENT_GIB:.2f} GiB quiet baseline "
+        "(measured 2026-09-14, this box, floored at 0)] "
+        + (
+            f"-- PROVISIONAL: this reading is {_fl_now:.2f} GiB above the "
+            f"{FOREIGN_LOAD_PROVISIONAL_THRESHOLD_GIB:.2f} GiB threshold "
+            "(dry-run-misst-die-live-box, 2026-09-13: +2.5 GiB memory.current "
+            "flipped ARM 95.18 to W97 97.67) -- a refusal below may be about "
+            "THIS box's transient state and not the form; a FUNDABLE below "
+            "should be RE-VERIFIED closer to the actual boot rather than "
+            "trusted as measured, because the box may look different by "
+            "then in EITHER direction"
+            if _fl_now is not None
+            and _fl_now > FOREIGN_LOAD_PROVISIONAL_THRESHOLD_GIB
+            else "-- measured on a quiet box (foreign_load_now at or below "
+            "the threshold, or unmeasured): this verdict's own box-state is "
+            "not stale-suspect by this instrument"
+        )
     )
     # FIX 6: origin and watermark in ONE currency -- both non-reclaimable.
     watermark_gib = OBSERVED_REAP_NONRECLAIM_BYTES / GIB

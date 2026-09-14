@@ -5498,6 +5498,10 @@ def choose_host_ledger(
         host_ledger.reap_model_line(
             mi["MemTotal"], mi.get("MemAvailable"), _cg0.get("current")),
     ]
+    # #1392: the wall-clock THIS box read happened at, captured at the read
+    # itself -- not reconstructed later from a log timestamp that could be
+    # seconds or minutes stale by the time the ARM line prints.
+    _box_state_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     cg = host_ledger.read_cgroup(cgroup_root)
     cg_ceiling, cg_ceiling_source = host_ledger.resolve_cg_ceiling(cg, mi["MemTotal"])
     # fix 8: this line's OWN previous measurements of the dormant image and of
@@ -5614,6 +5618,13 @@ def choose_host_ledger(
         # which is every recorded arm.
         s_gb_d=s_gb_d,
         d_cap_terms=d_cap_terms,
+        # #1392: PRINT-ONLY, like `xchg_bounce_prov` -- the box state THIS
+        # ladder was read against, so the ARM line can say which reading its
+        # verdict is measured on instead of leaving a quiet-box FUNDABLE and
+        # a noisy-box FUNDABLE to print identically.
+        box_state_at=_box_state_at,
+        cg_anon_bytes=cg.get("anon"),
+        cg_shmem_bytes=cg.get("shmem"),
         # #1386: the ONE bool `choose_host_ledger`'s own caller resolved,
         # forwarded unchanged into BOTH `host_ledger.choose` calls below
         # (`arms=[(1, pin_m_mib)]` pinned, and the DEFAULT_ARMS ladder) --
