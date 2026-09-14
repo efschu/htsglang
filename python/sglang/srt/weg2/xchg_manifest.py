@@ -1275,6 +1275,12 @@ def leg_plan_from_join(
     #: THE REGION THIS LEG BELONGS TO. Empty means the main weights region,
     #: which is what every caller without a drafter has.
     region_tag: str = "",
+    #: NAMES dropped from THIS JOIN, before any counterpart is looked up.
+    #: The caller owns the proof (weight_updater's measured target-share for
+    #: the draft's lm_head); a name dropped here is LOGGED by name, and the
+    #: W74 "no counterpart" refusal still guards every other name -- this is
+    #: a narrow, proven exclusion, never a general absence amnesty.
+    skip_names: Optional[frozenset] = None,
     log=None,
 ):
     """ONE leg's :class:`~weight_exchange_shadow.LegPlan`, from the manifests.
@@ -1315,9 +1321,22 @@ def leg_plan_from_join(
     excluded_bytes = 0
     excluded_regions = set()
     narrowed = []
+    skipped = frozenset(skip_names or ())
     for man in manifests:
         keep_p, drop_p = [], []
         for piece in man.pieces:
+            if (str(piece.param_name) in skipped
+                    and region_of_tag(piece.tag) == my_region):
+                # The caller's PROVEN one-sided name (weight_updater's
+                # measured target-share for the draft's lm_head): dropped BY
+                # NAME, in THIS region, with the line a reader can audit.
+                # Every other absence still reaches the W74 refusal below.
+                if log is not None:
+                    log(f"WEG2-XCHG-JOIN-SKIP name={piece.param_name} "
+                        f"region={my_region} group={man.group} "
+                        f"rank={man.rank} -- proven one-sided (target "
+                        f"share), excluded from this join by the caller")
+                continue
             (keep_p if region_of_tag(piece.tag) == my_region
              else drop_p).append(piece)
         excluded += len(drop_p)

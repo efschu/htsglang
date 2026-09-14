@@ -173,6 +173,11 @@ class _Stub:
     # runs here is byte-for-byte the code the flip leg runs."
     _weg2_xchg_draft_plan_or_none = (
         wu.SchedulerWeightUpdaterManager._weg2_xchg_draft_plan_or_none)
+    # #1378 xsn35: the draft join's share proof is on the same path -- the
+    # stub answers it fail-closed (no real runners -> no exclusion), which
+    # is exactly what the production code does without the share.
+    _weg2_draft_lm_head_is_target_share = (
+        wu.SchedulerWeightUpdaterManager._weg2_draft_lm_head_is_target_share)
 
     def __init__(self, model):
         self.tp_worker = _Worker(model)

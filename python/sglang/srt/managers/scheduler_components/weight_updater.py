@@ -3144,6 +3144,28 @@ class SchedulerWeightUpdaterManager:
                     wx.RunnerShape.of(drafter))
             except BaseException:  # noqa: BLE001 -- an unclassified shape
                 return None, "draft-shape-unclassified"
+            # #1378 xsn34 root: the DRAFT's own ``lm_head.weight`` is the
+            # shared TARGET module on this arm (eagle_worker_v2's
+            # set_embed_and_head_modules / set_lm_head_from_target hand the
+            # co-located target's table in by reference, qwen3_5_mtp.py:351
+            # ``self.lm_head = target_lm_head``; the producer side is
+            # #1259(b)'s lm_head_from_target, head_released_mib=2425
+            # measured on weg2tr1). The counterpart therefore CANNOT exist
+            # in the peer's draft manifest -- P's drafter has no such
+            # parameter -- and the bytes the exchange would move are the
+            # TARGET's lm_head, which the MAIN region's leg already moves
+            # (tag=weights, both sides hold it). Excluding it here is not a
+            # hole: the proof is MEASURED at this rank (data_ptr identity of
+            # draft head vs target head), fail-closed -- no proof, no
+            # exclusion, and any OTHER missing counterpart still refuses
+            # W74 (test_weg2_draft_lmhead_share_1378.py's mutant).
+            _lm_head_excluded = ""
+            if draft_region_tag == wx.GPU_MEMORY_TYPE_WEIGHTS_DRAFT:
+                _proof = self._weg2_draft_lm_head_is_target_share()
+                if _proof.startswith("MEASURED-SHARED"):
+                    _lm_head_excluded = "lm_head.weight"
+                    logger.info(
+                        "WEG2-XCHG-DRAFT-LMHEAD-TARGET-SHARED %s", _proof)
             if draft_region_tag != wx.GPU_MEMORY_TYPE_WEIGHTS_DRAFT:
                 # A drafter this arm classifies as something other than the
                 # draft region (e.g. #631/#274's shapes, which stay in the
@@ -3166,6 +3188,11 @@ class SchedulerWeightUpdaterManager:
                     str(hook), str(group), int(rank), draft_model,
                     region=draft_region_tag),
                 model=draft_model,
+                # #1378 xsn34: the one-sided shared head drops out of the
+                # DRAFT side's own tensor list BEFORE the join, so the W74
+                # "no counterpart" refusal keeps guarding every OTHER name.
+                skip_names=({_lm_head_excluded}
+                            if _lm_head_excluded else None),
                 # THE DRAFT RUNNER'S OWN REGION, never the main one -- MUTANT
                 # 1's own danger direction (a draft leg reading the main
                 # region's bands would write foreign bytes into the draft
@@ -3179,6 +3206,35 @@ class SchedulerWeightUpdaterManager:
             # raises: a draft-region failure must never take the MAIN
             # region's leg down with it.
             return None, f"draft-derivation-failed:{_weg2_exc_note(exc)}"
+
+    def _weg2_draft_lm_head_is_target_share(self) -> str:
+        """MEASURED, not assumed: is this rank's draft head the TARGET's
+        lm_head module (data_ptr identity of the weight tensors)?  Returns
+        "MEASURED-SHARED draft_ptr=0x.. target_ptr=0x.." or the reason the
+        share is NOT proven -- the caller excludes the draft's lm_head from
+        the join ONLY on the MEASURED-SHARED prefix (fail-closed)."""
+        try:
+            draft_worker = getattr(self, "draft_worker", None)
+            drafter = _get_draft_model_runner(draft_worker) if draft_worker else None
+            draft_model = getattr(drafter, "model", None)
+            target_runner = getattr(getattr(self, "tp_worker", None),
+                                    "model_runner", None)
+            target_model = getattr(target_runner, "model", None)
+            d_head = getattr(draft_model, "lm_head", None)
+            t_head = getattr(target_model, "lm_head", None)
+            d_w = getattr(d_head, "weight", None)
+            t_w = getattr(t_head, "weight", None)
+            if d_w is None or t_w is None:
+                return "no-weight (draft head deferred or target head absent)"
+            d_ptr, t_ptr = d_w.data_ptr(), t_w.data_ptr()
+            if d_ptr == t_ptr:
+                return (f"MEASURED-SHARED draft_ptr={d_ptr:#x} "
+                        f"target_ptr={t_ptr:#x}")
+            return (f"NOT-SHARED draft_ptr={d_ptr:#x} target_ptr={t_ptr:#x} "
+                    f"(own table, {d_w.numel()} elems -- needs a source, "
+                    f"never silently excluded)")
+        except BaseException as exc:  # noqa: BLE001 -- fail-closed observer
+            return f"proof-failed:{_weg2_exc_note(exc)}"
 
     def _weg2_rank_param_table(self):
         """Every live parameter THIS PROCESS holds, across BOTH its runners.
