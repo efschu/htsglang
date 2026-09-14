@@ -47,7 +47,7 @@ import os
 import re
 import struct
 from dataclasses import dataclass
-from typing import Dict, List, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 #: ``model.layers.<i>.`` / ``layers.<i>.`` -- the layer index, wherever the
 #: checkpoint's naming puts it. Deliberately NOT anchored at the string start:
@@ -376,7 +376,9 @@ def max_tag_bytes_from_census(model_dir: str, chunk_layers: int) -> int:
 
 def widest_layer_terms(model_dir: str, *, pairs: int, depth: int,
                        slot_bytes: int = 0, n_lanes: int = 1,
-                       max_tag_bytes: int = 0, lanes_concurrent: int = 0):
+                       max_tag_bytes: int = 0, lanes_concurrent: int = 0,
+                       band_credit: bool = False,
+                       n_cross_lanes: Optional[int] = None):
     """``(BounceTerms, widest_line, widest_layer_name)`` for the launcher.
 
     ONE CALL SITE'S WORTH of glue, kept here so the launcher holds no
@@ -398,6 +400,18 @@ def widest_layer_terms(model_dir: str, *, pairs: int, depth: int,
 
     ``lanes_concurrent`` is passed THROUGH the same way, and defaults to 0
     ("not stated") -- #1385's cap on how many of ``n_lanes`` price at once.
+
+    ``band_credit``/``n_cross_lanes`` are passed THROUGH the same way,
+    defaulting to ``False``/``None`` (#1397's own byte-identical "never
+    armed" state). #1397's own design doc (section 9.1) named this exact
+    gap: DESK11 built ``BounceTerms.band_credit``/``n_cross_lanes`` and
+    ``xchg_bounce.resolve_cross_lanes`` behind their own file boundary, but
+    this function -- the ONE call site between the launcher and
+    ``bounce_terms`` for every OTHER field above -- never grew the two new
+    parameters, so a caller passing them would have died with the identical
+    ``unexpected keyword argument`` TypeError #1358 already paid for once.
+    Verified here rather than assumed: before this change, ``inspect.
+    signature(widest_layer_terms)`` carried neither name.
     """
     from sglang.srt.weg2 import xchg_bounce as xb
 
@@ -413,6 +427,8 @@ def widest_layer_terms(model_dir: str, *, pairs: int, depth: int,
         n_lanes=int(n_lanes),
         max_tag_bytes=int(max_tag_bytes),
         lanes_concurrent=int(lanes_concurrent),
+        band_credit=bool(band_credit),
+        n_cross_lanes=n_cross_lanes,
         **kw,
     )
     return terms, widest_line(census), f"layer {idx}"
