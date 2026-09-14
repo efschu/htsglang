@@ -4456,6 +4456,22 @@ class SchedulerWeightUpdaterManager:
             # zero extra syscalls the flag promises (`terms.lanes_concurrent`
             # is read from the SAME `terms` the ledger priced with -- one
             # cap value, never a second one computed here).
+            # DIE DOKTRIN (zweite Sperre, zweite Auspraegung -- gemessen
+            # dreimal: weg2xsn35 PcieLockTimeout held=124,45s vs Budget 120s;
+            # weg2xsn36 W68 nach vollen 600s; weg2xsn37 derselbe Deadlock auf
+            # dem falschen SHA):
+            #   EINE SPERRE SERIALISIERT KOPIEN, NIEMALS WAITS.
+            # Das LanePermit wird nur unter dem Cap-Flag armiert
+            # (--xchg-lanes-concurrent; ohne Flag ist lanes_concurrent 0 und
+            # das Permit existiert nicht), und sein Hold-Bereich enthaelt die
+            # Deposit-Waits (wait_drained) -- genau die Form, die das
+            # ko-lokalierte Paar blockiert. Der Ring-off-Boot faehrt OHNE
+            # Cap (arm_xsn39: das Flag ist aus dem Argv genommen); die
+            # 15,06-GiB-Lane-Pinning-Groesse ist vom Nutzer ausdruecklich
+            # erlaubt ("bis dahin darf es auch 15GB 'ringpuffer' geben") und
+            # steht in der ARM-Zeile. Ein Cap auf dieser Form waere der
+            # falsche Trade: ein Deadlock, um Bytes zu sparen, die wir
+            # ausgeben duerfen.
             _lane_permit_active = (
                 terms is not None
                 and int(getattr(terms, "lanes_concurrent", 0) or 0) > 0
