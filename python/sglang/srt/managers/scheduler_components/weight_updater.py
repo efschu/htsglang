@@ -462,6 +462,14 @@ class SchedulerWeightUpdaterManager:
     #: stand down its own once-per-wake, whole-plan compare instead of
     #: grading the same bytes twice.
     _weg2_xchg_shadow_compared_per_tag: bool = False
+    #: #1378 xsn55: the lane audit's per-boot cache of THIS rank's own
+    #: (region, name) keys. Declared for the SAME reason the three fields
+    #: above are -- the class is ``slots=True``, so the lazy write the first
+    #: version used raised ``AttributeError`` on its first call (measured,
+    #: not inferred: executing ``_weg2_owned_name_keys`` on a constructed
+    #: manager raised exactly that) and the audit's ``owned=`` would have
+    #: died on the first lane of the next boot instead of counting.
+    _weg2_owned_name_keys_cache: Optional[set] = None
 
     @contextmanager
     def _observe_weight_load(self, source: str) -> Iterator[None]:
@@ -4188,7 +4196,7 @@ class SchedulerWeightUpdaterManager:
 
     def _weg2_seq_lane_descs(self, *, hook: str, group: str, rank: int,
                              pair: Optional[int], card: Optional[int],
-                             tag) -> list:
+                             tag, log=None) -> list:
         """THE LANE'S OWN DESC LIST, derived from the JOIN -- one producer.
 
         The xsn52 commit derived the units from the join's raw TENSORS, which
@@ -4223,6 +4231,35 @@ class SchedulerWeightUpdaterManager:
                 f"one of pair= (cross) or card= (diagonal), got pair={pair!r} "
                 f"card={card!r} -- a lane that cannot say which family it "
                 f"belongs to is the xsn52 shape")
+        # #1378 xsn55 (THE DIRECTION KEY).  `group` is this leg's GROUP NAME
+        # ('P'/'D') -- the same identity `leg_plan_from_join` documents as the
+        # direction's second input ("THE DIRECTION IS DERIVED, NOT PASSED",
+        # xchg_manifest.py) and the same one this method's own callers refuse
+        # on when they cannot answer it.  A caller that hands down anything
+        # else -- a desc list, a lane key, a plan -- makes
+        # ``leg_direction(hook, group)`` answer from the HOOK ALONE, because
+        # ``str(<non-name>)`` is neither "P" nor "D".  That is correct for
+        # group D by coincidence (source->tp_to_pp, importing->pp_to_tp are
+        # exactly D's two directions) and MIRRORED for group P, which is the
+        # measured weg2xsn53 wall: P rank 1's wake (hook=authoritative)
+        # planned pp_to_tp, its lane (0,1) then carried P rank 0's 102
+        # layer-32..38 descs -- the manifest-true count, on the wrong side --
+        # and P rank 1's own address book correctly answered None for every
+        # one of them ("102 of 102 descs have no address").  The same swap
+        # printed the second wall ("NO desc for lane src=0 dst=2
+        # tag='weights_6' (direction=pp_to_tp)") on P rank 2.  Refusing here
+        # closes the CLASS: a wrong-typed group can no longer plan a mirrored
+        # direction, it names what it was handed instead.
+        if str(group) not in ("P", "D"):
+            raise wx.Weg2XchgPlanDisagree(
+                f"W68 Weg2XchgPlanDisagree: the sequential lane derivation "
+                f"needs the GROUP NAME of the rank running this leg ('P' or "
+                f"'D'), got {type(group).__name__}: {str(group)[:96]!r}.  "
+                f"leg_direction() answers from (hook, group); a non-name keys "
+                f"it off the hook alone, which plans group P's legs in the "
+                f"mirrored direction -- the weg2xsn53 102-of-102 'no address' "
+                f"wall.  The caller must hand down the identity "
+                f"_weg2_group_name() resolves, not a lane's desc list")
         if pair is not None:
             src_card, dst_card = xr.CROSS_PAIRS[int(pair)]
         else:
@@ -4307,7 +4344,7 @@ class SchedulerWeightUpdaterManager:
         
         _own = self._weg2_owned_name_keys()
         owned_n = sum(1 for d in out
-                      if (region_of_tag(d.tag), str(d.param_name)) in _own)
+                      if (xm.region_of_tag(d.tag), str(d.param_name)) in _own)
         if log is not None:
             log(f"WEG2-SEQ-LANE "
                 f"lane={'p%d' % pair if pair is not None else 'c%d' % card} "
@@ -4343,13 +4380,33 @@ class SchedulerWeightUpdaterManager:
         here names bytes this rank does not hold, however many of them the
         plan assigns to it (xsn54: 12 layer-39 pieces on P rank 0's lane).
         """
-        cached = getattr(self, "_weg2_owned_name_keys_cache", None)
+        cached = self._weg2_owned_name_keys_cache
         if cached is not None:
             return cached
+        # #1378 xsn55: `xm` and `region_of_tag` were BARE NAMES here and at
+        # the audit's `owned_n` line -- neither is imported at module level
+        # (this file's weg2 imports are function-local by design), so the
+        # first lane died with `NameError: region_of_tag` inside the audit's
+        # comprehension and this method's own read was swallowed by the
+        # `except BaseException` below into an EMPTY key set, i.e. an
+        # instrument that answered `owned=0` for every lane. Measured by
+        # executing both, not by reading them.
+        from sglang.srt.weg2 import xchg_manifest as xm
+
+        # THE RANK IS COMPARED, NEVER `or`-DEFAULTED: `_weg2_rank()` answers
+        # -1 when it has no identity, and an unknown identity must match
+        # nothing -- but ``self._weg2_rank() or -1`` turns the REAL rank 0
+        # into -1 too, so rank 0 (the holder of the widest share on every
+        # PP boot) would have collected no keys of its own and its audit
+        # would have read `owned=0` on every lane. Measured: the audit on a
+        # rank-0 manager returned set() for a manifest that carries the name.
+        _rank = self._weg2_rank()
+        my_rank = int(_rank) if isinstance(_rank, int) and _rank >= 0 else -1
+
         keys = set()
         try:
             for man in xm.manifests_for_boot(pp_group="P", tp_group="D")[0] or []:
-                if int(man.rank) != int(self._weg2_rank() or -1):
+                if my_rank < 0 or int(man.rank) != my_rank:
                     continue
                 if str(man.group) != str(self._weg2_group_name() or ""):
                     continue
@@ -4754,11 +4811,33 @@ class SchedulerWeightUpdaterManager:
                         # also what fixes the NameError this line died of
                         # (`join` was read here and defined nowhere --
                         # provider smoke 15/19, four red, measured).
+                        # #1378 xsn55 (THE DIRECTION KEY): `group` in THIS
+                        # frame is the LANE's desc list (`for pair, group in
+                        # _lanes.items()` above), not a group name.  Handing
+                        # it down made `leg_direction(hook, group)` answer
+                        # from the hook alone -- right for group D by
+                        # coincidence, MIRRORED for group P, which is the
+                        # measured weg2xsn53 wall (P rank 1's wake lane (0,1)
+                        # carried P rank 0's 102 layer-32..38 descs and its
+                        # own address book answered None for all of them).
+                        # The group NAME is resolved from the identity this
+                        # process already carries; a caller without one is
+                        # refused by name inside the derivation rather than
+                        # planned in a mirrored direction.  The getattr guard
+                        # is the same shape the leg already uses one frame
+                        # down (an execution smoke drives this method with a
+                        # stub that carries no identity methods, and that
+                        # stub overrides the derivation, so the read is dead
+                        # for it by construction -- not skipped silently for
+                        # a caller that reaches it).
+                        _group_reader = getattr(self, "_weg2_group_name", None)
+                        _group_name = (str(_group_reader() or "")
+                                       if _group_reader is not None else "")
                         _lane_descs = self._weg2_seq_lane_descs(
-                            hook=hook, group=group, rank=rank,
+                            hook=hook, group=_group_name, rank=rank,
                             pair=pair, card=None if pair is not None
                             else int(getattr(group[0], "dst_rank", device)),
-                            tag=tag)
+                            tag=tag, log=logger.info)
                         if not _lane_descs:
                             # A lane whose both ends are other ranks: this
                             # rank holds neither the source bytes nor the

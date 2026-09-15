@@ -204,7 +204,12 @@ class _LegStub:
     # key, desc count), so the stub answers with the leg's own descs and says
     # so -- the real derivation is driven by the leg replay and by
     # test_weg2_sequential_lane_identity_1378.
-    def _weg2_seq_lane_descs(self, *, hook, group, rank, pair, card, tag):
+    def _weg2_seq_lane_descs(self, *, hook, group, rank, pair, card, tag,
+                             log=None):
+        # #1378 xsn55: the real signature grew `log=` because the lane audit's
+        # `WEG2-SEQ-LANE owned=/planned=` line was wired to the leg's logger.
+        # The stub accepts and ignores it -- the smoke audits the ADAPTER's
+        # arguments, not the audit line.
         return list(self._stub_descs)
 
     _stub_descs = ()

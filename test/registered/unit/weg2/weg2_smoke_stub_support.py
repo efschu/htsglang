@@ -124,6 +124,28 @@ def self_reads_reachable(cls: type, entry_names: Sequence[str]) -> Set[str]:
 #: unchanged) -- named here so a future reader knows to re-check the guard
 #: condition, not just the attribute's continued existence.
 LEGSTUB_EXCLUSIONS = {
+    "_weg2_group_name": (
+        "method (weight_updater.py, #1378 xsn55): the sequential leg resolves "
+        "the GROUP NAME for the lane derivation's direction key through "
+        "`getattr(self, \"_weg2_group_name\", None)` -- a getattr default, so "
+        "the AST ratchet does not count it -- and the real derivation's audit "
+        "also reads it. Both are dead for this caller: the stub overrides "
+        "`_weg2_seq_lane_descs` (so neither the derivation's audit nor its "
+        "group filter runs) and the getattr answers None on a stub that does "
+        "not carry the method, which the derivation would refuse by name."),
+    "_weg2_owned_name_keys": (
+        "method (weight_updater.py, #1378 xsn55): the lane audit's own "
+        "(region, name) keys, read by the real `_weg2_seq_lane_descs` only. "
+        "Same shape as `_weg2_rank_param_table` above: the stub override "
+        "answers the lane descs, so the audit never runs here."),
+    "_weg2_owned_name_keys_cache": (
+        "field (weight_updater.py, #1378 xsn55): the audit's per-boot cache, "
+        "declared on the dataclass because the class is slots=True and the "
+        "lazy write raised AttributeError. Read only by "
+        "`_weg2_owned_name_keys`, which is only reached through the real "
+        "`_weg2_seq_lane_descs` -- overridden by this stub -- so the read is "
+        "dead for this caller (the leg replay's `_Stub` DOES carry it, "
+        "because that stub borrows the real derivation)."),
     "_weg2_rank": (
         "method (weight_updater.py, #1378 xsn53): the sequential lane "
         "derivation resolves THIS rank's identity when the caller passes no "

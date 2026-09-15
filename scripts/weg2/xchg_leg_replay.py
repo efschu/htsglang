@@ -885,6 +885,11 @@ class _Stub:
         # the card-uuid cache _weg2_card_uuid reads; "unset" makes it resolve
         # (fail-soft -> None on this cardless harness).
         self.weg2_card_uuid_cache = "unset"
+        # #1378 xsn55: the lane audit's cache is a DECLARED FIELD on the
+        # product dataclass, whose __init__ this stub does not run -- so the
+        # stub carries the field itself, the way it carries
+        # `weg2_card_uuid_cache` for the same reason.
+        self._weg2_owned_name_keys_cache = None
         self._group, self._rank = str(group), int(rank)
         self.tp_worker = _FakeWorker(_FakeModel(main_params))
         self.draft_worker = (None if draft_params is None
@@ -901,6 +906,15 @@ class _Stub:
                      # processes must derive the same list for a lane, which
                      # is the property the W90 was made of.
                      "_weg2_seq_lane_descs", "_weg2_model_for_group",
+                     # #1378 xsn55: the derivation's lane audit reads THIS
+                     # rank's own (region, name) keys through the real
+                     # `_weg2_owned_name_keys`; the stub carries the identity
+                     # that method needs (`_weg2_rank`, `_weg2_group_name`)
+                     # and the manifest dir is the one under test, so the
+                     # real body answers. Without the borrow every P rank
+                     # died with AttributeError before emitting a leg
+                     # (measured, --evidence phase_manifest_* of xsn53).
+                     "_weg2_owned_name_keys",
                      "_weg2_xchg_bounce_leg"):
             setattr(type(self), name, getattr(cls, name))
 
