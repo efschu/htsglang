@@ -655,7 +655,8 @@ def test_M_removing_the_gap_check_lets_a_sourceless_tag_pass_silently(
                         raising=False)
     # THE MUTATION:
     monkeypatch.setattr(Manager, "_weg2_xchg_wake_source_gap",
-                        lambda self, tag, *, cdescs_present: None, raising=True)
+                        lambda self, tag, *, cdescs_present, resident_bytes=None: None,
+                        raising=True)
 
     calls = {}
     monkeypatch.setattr(Manager, "_weg2_xchg_bounce_leg",
@@ -758,3 +759,67 @@ if __name__ == "__main__":
     import unittest
 
     unittest.main()
+
+
+# ---------------------------------------------------------------------------
+# #1378 weg2xsn83 -- a PIPELINE stage as the SOURCE walks the whole family's
+# tags in its pause loop but holds only its own layers' tags. PP0 met
+# weights_6 (PP2's) first: plan descs=0, tms_tag_bytes=0 -> the shipped
+# check refused (W106) and killed leg 1 before any deposit. The saver's
+# three-valued census tells that no-op apart from the real gap.
+# ---------------------------------------------------------------------------
+
+
+def test_xsn83_tag_not_resident_on_this_stage_is_not_a_gap(monkeypatch,
+                                                           ring_off,
+                                                           authoritative):
+    m = _manager(monkeypatch, group="P", rank=0)
+    assert m._weg2_xchg_wake_source_gap(
+        "weights_6", cdescs_present=False, resident_bytes=0) is None
+
+
+def test_xsn83_unmeasurable_residency_keeps_the_refusal(monkeypatch,
+                                                        ring_off,
+                                                        authoritative):
+    """`None` is an absence nobody measured -- it vouches for nothing."""
+    m = _manager(monkeypatch, group="P", rank=0)
+    gap = m._weg2_xchg_wake_source_gap(
+        "weights_6", cdescs_present=False, resident_bytes=None)
+    assert gap is not None and "descriptor" in gap.lower()
+
+
+def test_xsn83_resident_bytes_with_empty_plan_is_still_case_2(monkeypatch,
+                                                              ring_off,
+                                                              authoritative):
+    """Bytes HERE and nobody deposits them: the gap the check exists for."""
+    m = _manager(monkeypatch, group="P", rank=0)
+    gap = m._weg2_xchg_wake_source_gap(
+        "weights_0", cdescs_present=False, resident_bytes=1 << 20)
+    assert gap is not None and "descriptor" in gap.lower()
+
+
+def test_xsn83_resident_bytes_reading_is_three_valued(monkeypatch):
+    """`_weg2_tag_resident_bytes`: None without an adapter answer, the
+    integer otherwise -- a real 0 INCLUDED (the reading `_weg2_tag_bytes`
+    folds away on purpose)."""
+    m = _manager(monkeypatch, group="P", rank=0)
+    assert m._weg2_tag_resident_bytes("weights_6") is None  # no adapter
+
+    class _Adapter:
+        def __init__(self, answer):
+            self.answer = answer
+
+        def tag_bytes(self, tag):
+            if isinstance(self.answer, BaseException):
+                raise self.answer
+            return self.answer
+
+    m.memory_saver_adapter = _Adapter(None)
+    assert m._weg2_tag_resident_bytes("weights_6") is None
+    m.memory_saver_adapter = _Adapter(RuntimeError("no symbol"))
+    assert m._weg2_tag_resident_bytes("weights_6") is None
+    m.memory_saver_adapter = _Adapter(0)
+    assert m._weg2_tag_resident_bytes("weights_6") == 0
+    assert m._weg2_tag_bytes("weights_6") == 0
+    m.memory_saver_adapter = _Adapter(4096)
+    assert m._weg2_tag_resident_bytes("weights_6") == 4096

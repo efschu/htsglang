@@ -746,6 +746,37 @@ class SchedulerWeightUpdaterManager:
             return 0
         return int(value or 0)
 
+    def _weg2_tag_resident_bytes(self, tag: str) -> Optional[int]:
+        """The saver's OWN byte sum for ``tag`` as a THREE-VALUED reading:
+        ``None`` when the saver cannot answer (no adapter, no ``tms_tag_bytes``
+        symbol, or the call raised), else the integer it answered -- a real
+        ``0`` INCLUDED.
+
+        :meth:`_weg2_tag_bytes` folds "could not answer" and "answered 0"
+        into one 0 on purpose (its callers print a byte count and must never
+        print a manufactured zero).  The wake-source gap check needs the two
+        apart: on a PIPELINE stage a family tag that lives on ANOTHER stage is
+        a genuine 0 by the allocator's own metadata (weg2xsn83: PP0 owns
+        weights_0..4, asked about weights_6 -> tms_tag_bytes=0, plan
+        descs=0), and that 0 is the fact that makes an empty deposit for the
+        tag a no-op instead of a gap -- while an UNMEASURABLE absence keeps
+        the refusal, because nothing then vouches that the bytes are elsewhere.
+        """
+        adapter = getattr(self, "memory_saver_adapter", None)
+        getter = getattr(adapter, "tag_bytes", None)
+        if getter is None:
+            return None
+        try:
+            value = getter(tag)
+        except Exception:  # noqa: BLE001
+            return None
+        if value is None:
+            return None
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
     @staticmethod
     def _weg2_with_graph_tag(
         tags: Sequence[str], weg2_memory_saver_on: bool
@@ -1298,7 +1329,17 @@ class SchedulerWeightUpdaterManager:
             # this deposit (or its structural absence) is the LAST chance to
             # say "nobody will restore this tag's bytes at wake" while VRAM
             # has not yet been mutated for it.
-            _gap = self._weg2_xchg_wake_source_gap(tag, cdescs_present=bool(_descs))
+            # weg2xsn83 (#1378, leg 1 = P->D, the first time a PIPELINE
+            # group ever reached this check as the SOURCE): the pause loop
+            # walks the whole family (weights_0..7, weights_draft, weights),
+            # but a PP stage holds only ITS layers' tags -- PP0 met
+            # weights_6 first, had no descriptor for it (correct: PP2 owns
+            # it), and W106 killed the leg before any deposit. The tag's
+            # residency on THIS rank, by the saver's own census, is what
+            # tells that no-op apart from the real gap the check exists for.
+            _resident = self._weg2_tag_resident_bytes(tag)
+            _gap = self._weg2_xchg_wake_source_gap(
+                tag, cdescs_present=bool(_descs), resident_bytes=_resident)
             if _gap is not None:
                 # NUTZER-ORDER 2026-09-14 (PRONTO, den Ring abschalten):
                 # "jeder pausierte Tag, der beim resume KEINE Quelle hat,
@@ -1330,10 +1371,13 @@ class SchedulerWeightUpdaterManager:
                 # authoritative and genuinely has nothing FOR THIS RANK,
                 # which is fine as long as SOME rank does).
                 logger.info(
-                    "WEG2-XCHG DEPOSIT tag=%s group=%s rank=%s pieces=0 -- "
-                    "this rank's plan carries no desc for this tag, so the "
-                    "lockstep step is a no-op rather than a missing band",
-                    tag, group, rank)
+                    "WEG2-XCHG DEPOSIT tag=%s group=%s rank=%s pieces=0 "
+                    "resident_bytes=%s -- this rank's plan carries no desc "
+                    "for this tag, so the lockstep step is a no-op rather "
+                    "than a missing band (resident_bytes=0 by the saver's own "
+                    "census: the tag lives on another stage of this group)",
+                    tag, group, rank,
+                    "unmeasurable" if _resident is None else int(_resident))
                 return
         self._weg2_xchg_bounce_leg(
             descs=_descs, ops=self._weg2_xchg_device_ops(),
@@ -1343,10 +1387,21 @@ class SchedulerWeightUpdaterManager:
             sems=self._weg2_xchg_sems(), tag=tag, rank=int(rank),
         )
 
-    def _weg2_xchg_wake_source_gap(self, tag, *, cdescs_present: bool) -> Optional[str]:
+    def _weg2_xchg_wake_source_gap(self, tag, *, cdescs_present: bool,
+                                   resident_bytes: Optional[int] = None,
+                                   ) -> Optional[str]:
         """``None`` if ``tag``'s wake, WITHOUT its ring backup, has something
         that will actually restore its bytes -- a short GAP REASON string
         otherwise.
+
+        ``resident_bytes`` is the saver's three-valued census of ``tag`` on
+        THIS rank (:meth:`_weg2_tag_resident_bytes`): a real ``0`` with an
+        empty plan is NOT a gap -- the tag lives on another stage of this
+        group, which deposits it from its own pause loop (weg2xsn83, PP0
+        asked about PP2's ``weights_6``).  ``None`` (unmeasurable) keeps
+        case 2's refusal: an absence nobody measured vouches for nothing.
+        A POSITIVE count with an empty plan is case 2 exactly -- bytes here,
+        nobody deposits them.
 
         #1369/#1394 (DESK10 Paket B), the completeness half of turning the
         host ring off: with the ring gone, the exchange is the ONLY source
@@ -1441,6 +1496,13 @@ class SchedulerWeightUpdaterManager:
                     f"for this tag on this checkpoint"
                 )
             return None  # unquantized checkpoint: the disk reload is a genuine net
+        if not cdescs_present and resident_bytes is not None and int(resident_bytes) == 0:
+            # A PIPELINE stage's view of a family tag it does not hold: the
+            # allocator has no bytes of it here, so there is nothing a peer
+            # could miss FROM THIS RANK. The stage that holds the tag runs
+            # this same check with its own descriptors (weg2xsn83 PP2 for
+            # weights_6/weights_7) and is the one that would refuse.
+            return None
         if not cdescs_present:
             return (
                 "weights_cpu_backup_armed()=False for this tag and the "
