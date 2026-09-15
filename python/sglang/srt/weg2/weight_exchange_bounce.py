@@ -2373,6 +2373,15 @@ def run_sequential_units(descs, ops, boot_nonce: str, *,
     except Exception:  # noqa: BLE001 -- a copy stream is an optimisation
         stream = 0
     base_addr = _mmap_addr(buf) if _seq_mm is not None else 0
+    # #1378 xsn55 (WO DER DEPOSIT STEHT): xsn55's diagonal lane blocked with
+    # NO c0 buffer file and NO c0 digest json, while both cross lanes wrote
+    # buffers and digests immediately -- so the block was between the lane
+    # line above and the first piece's digest write.  Two lines make that
+    # interval readable on the metal instead of inferred: one after the
+    # mapping (with the lane's byte size), one after the FIRST piece's copy
+    # + digest.  Everything between them is the piece loop's own body.
+    log(f"WEG2-SEQ mapped lane={lane_key} phase={phase} bytes={total_bytes} "
+        f"units={len(_batch.pieces)} path={path}")
     for i, piece in enumerate(_batch.pieces):
         desc = descs[piece.desc_index]
         # #1378 xsn53: the window's offset is the PIECE'S OWN slot_off from
@@ -2424,6 +2433,12 @@ def run_sequential_units(descs, ops, boot_nonce: str, *,
                 sems.post(int(pair), _SEQ_SLOT, "full")
             log(f"WEG2-SEQ deposit {label} digest={digest} "
                 f"ms={(_time.perf_counter()-t0)*1000:.1f}")
+            if i == 0:
+                # #1378 xsn55: the SECOND marker of the same interval -- if
+                # this line prints and the collect still never sees a full,
+                # the block is past the first piece, in the loop's own wait.
+                log(f"WEG2-SEQ first-piece-done lane={lane_key} phase={phase} "
+                    f"ms={(_time.perf_counter()-t0)*1000:.1f}")
         else:
             deadline = _time.monotonic() + float(budget_s)
             got = False
