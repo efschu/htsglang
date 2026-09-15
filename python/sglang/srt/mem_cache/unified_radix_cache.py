@@ -3611,6 +3611,10 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         eligible = reason is None
         _note_prefetch_gate(reason, prefetch_length)
         if not eligible and not symmetric:
+            # #1400: the three local terms used to leave SILENTLY (census
+            # only); boot xsn117 group P declined every intake here without
+            # one line naming the term. Speak like the other exits.
+            self._log_prefetch_refused(reason, req_id, prefetch_length)
             return
 
         anchor_lock_params = None

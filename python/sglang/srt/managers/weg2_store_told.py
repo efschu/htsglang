@@ -164,6 +164,17 @@ def intake(scheduler, req, note_gate: Callable[[str], None]) -> str:
     if int(scheduler.ps.pp_rank) == 0:
         verdict = scheduler._prefetch_kvcache(req)
         held[rid] = req
+        n = getattr(scheduler, "_weg2_store_told_intake_n", 0) + 1
+        scheduler._weg2_store_told_intake_n = n
+        if n <= _LOG_FIRST or n % _LOG_EVERY == 0:
+            logger.info(
+                "#1400 STORE-TOLD INTAKE rid=%s verdict=%s span=%s matched=%s (n=%d)",
+                rid[:8],
+                verdict,
+                getattr(req, "_prefetch_span_tokens", None),
+                getattr(req, "_prefetch_registered_prefix_len", None),
+                n,
+            )
         return verdict
     told = scheduler._weg2_store_told.get(rid)
     if told is not None:
