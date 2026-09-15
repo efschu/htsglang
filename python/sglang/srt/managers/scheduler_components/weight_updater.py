@@ -3617,12 +3617,19 @@ class SchedulerWeightUpdaterManager:
             # _weg2_xchg_no_write) get their bytes with the target's own
             # `weights` tag, so they are folded again with that tag and the
             # later part overrides the draft part's stale entry.
+            # xsn115: the same holds for every draft piece that SHARES its
+            # name with a weights piece on this rank (lm_head.weight is
+            # excluded from the draft join as a measured share and lands
+            # with the target's weights tag) -- refold those with `weights`.
             _nw = getattr(self, "_weg2_xchg_no_write", None) or frozenset()
             _nw_keys = {(str(t), str(n)) for (t, n) in _nw}
+            _w_names = {str(idn.name) for idn, _t in inventory if str(idn.tag) == "weights"}
             items = [(idn, t) for idn, t in inventory
                      if str(idn.tag) == str(tag)
                      or (str(tag) == "weights"
-                         and (str(idn.tag), str(idn.name)) in _nw_keys)]
+                         and ((str(idn.tag), str(idn.name)) in _nw_keys
+                              or (str(idn.tag) == "weights_draft"
+                                  and str(idn.name) in _w_names)))]
             if not items:
                 return
             part = seam_digest.take_reading(
