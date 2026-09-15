@@ -3881,15 +3881,21 @@ class SchedulerWeightUpdaterManager:
             #
             # Guarded on `armed_by_launcher()` -- a single env read -- so an
             # unarmed boot does not even resolve group and rank here.
+            # The phase stamps (WEG2-XCHG-HOOK-TIME) exist for EVERY boot:
+            # boot xsn135 (2026-09-15, the first without --xchg-coverage-diff)
+            # had them defined only under the coverage arm below, so the
+            # first `_hk_ph(...)` raised UnboundLocalError, the hook's
+            # observer-except swallowed it as "the flip is unaffected", P
+            # never deposited, and D's wake waited until the front's W4.
+            _hk_t = [time.perf_counter()]
+            _hk_l = []
+
+            def _hk_ph(name):
+                _n = time.perf_counter()
+                _hk_l.append((name, (_n - _hk_t[0]) * 1000))
+                _hk_t[0] = _n
+
             if wlc.armed_by_launcher():
-                _hk_t = [time.perf_counter()]
-                _hk_l = []
-                
-                def _hk_ph(name):
-                    _n = time.perf_counter()
-                    _hk_l.append((name, (_n - _hk_t[0]) * 1000))
-                    _hk_t[0] = _n
-                
                 wlc.arm(group=self._weg2_group_name(), rank=self._weg2_rank())
                 _hk_ph("arm")
             if not sh.bounce_lane_armed():
