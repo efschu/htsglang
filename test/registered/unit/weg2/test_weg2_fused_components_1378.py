@@ -55,7 +55,10 @@ class _Model:
 
 
 def test_reader_declares_merged_layers_conv1d_and_qkv_and_nothing_else():
-    gdn = SimpleNamespace(key_dim=6, value_dim=10)
+    # global key_dim/value_dim on purpose (2x the local): the reader must
+    # use the LOCAL head counts, xsn75
+    gdn = SimpleNamespace(key_dim=12, value_dim=20, head_k_dim=2, head_v_dim=2,
+                          local_num_k_heads=3, local_num_v_heads=5)
     model = _Model({
         "model.layers.0.self_attn.qkv_proj": SimpleNamespace(
             q_proj_shard_size=8, kv_proj_shard_size=2, v_proj_shard_size=2,

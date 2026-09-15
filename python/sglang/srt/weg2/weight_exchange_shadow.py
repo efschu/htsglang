@@ -2999,10 +2999,28 @@ def _qkv_component_rows(model, name: str) -> Tuple[int, ...]:
             parent = model.get_submodule(parent_path) if parent_path else None
         except AttributeError:
             parent = None
-        kd = getattr(parent, "key_dim", None)
-        vd = getattr(parent, "value_dim", None)
-        if isinstance(kd, int) and isinstance(vd, int) and kd > 0 and vd > 0:
-            return (kd, kd, vd)
+        # xsn75: `key_dim`/`value_dim` on the GDN block are the GLOBAL widths
+        # (config heads x head dim); this rank's are local_num_{k,v}_heads x
+        # head_{k,v}_dim (qwen3_5.py:289-292). The global pair failed the
+        # sum check on every D rank, the declaration was dropped, and conv1d
+        # was the one class still content-changed (30 + 9 + 9) after the
+        # per-component fix -- alongside the sibling in_proj_qkvz, whose
+        # output_partition_sizes carry the same three local widths and are
+        # the fallback here.
+        hk = getattr(parent, "head_k_dim", None)
+        hv = getattr(parent, "head_v_dim", None)
+        nk = getattr(parent, "local_num_k_heads", None)
+        nv = getattr(parent, "local_num_v_heads", None)
+        if all(isinstance(x, int) and x > 0 for x in (hk, hv, nk, nv)):
+            return (hk * nk, hk * nk, hv * nv)
+        sib = getattr(getattr(parent, "in_proj_qkvz", None),
+                      "output_partition_sizes", None)
+        try:
+            sib = tuple(int(x) for x in (sib or ()))
+        except (TypeError, ValueError):
+            sib = ()
+        if len(sib) >= 3:
+            return (sib[0], sib[1], sib[2])
     return ()
 
 
