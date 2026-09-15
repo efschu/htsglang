@@ -5594,8 +5594,9 @@ class SchedulerWeightUpdaterManager:
                                  if f.exception() is not None]
                     logger.info(
                         "WEG2-SEQ-LANES parallel=%d phase=%s tag=%s ms=%.0f "
-                        "errors=%d", len(_lanes), phase, tag,
-                        (time.perf_counter() - _t0) * 1000, len(_errs))
+                        "errors=%d t0=%.3f t=%.3f", len(_lanes), phase, tag,
+                        (time.perf_counter() - _t0) * 1000, len(_errs),
+                        time.time() - (time.perf_counter() - _t0), time.time())
                     if _errs:
                         raise _errs[0][1]
                 else:
@@ -6125,10 +6126,14 @@ class SchedulerWeightUpdaterManager:
                     # work between the previous tag's credit and this deposit.
                     logger.info(
                         "WEG2-SLEEP-TAG-TIME tag=%s deposit_ms=%.0f pause_ms=%.0f "
-                        "credit_ms=%.0f gap_ms=%.0f total_ms=%.0f",
+                        "credit_ms=%.0f gap_ms=%.0f total_ms=%.0f t0=%.3f t=%.3f",
                         tag, (t_tag - _t_dep0) * 1000,
                         weg2_per_tag[tag][1], (_t_prev_end - _t_cr0) * 1000,
-                        _gap_ms, (_t_prev_end - _t_dep0) * 1000)
+                        _gap_ms, (_t_prev_end - _t_dep0) * 1000,
+                        # wall-clock stamps (order point 2 timeline): the
+                        # front log is wall-clock ms, so the legs align on it
+                        time.time() - (time.perf_counter() - _t_dep0),
+                        time.time())
             # #1360b: ONE `WEG2-RING NEED` LINE PER SAVED TAG, not per
             # ring-carried tag.  The loop above guards the `weights_*` family
             # because those are the tags whose bytes the peer has to release --
@@ -6551,6 +6556,13 @@ class SchedulerWeightUpdaterManager:
                         float(tag_bytes.get(tag, 0)),
                         (time.perf_counter() - t_tag) * 1000,
                     ]
+                    # order point 2 timeline: when THIS tag's resume ended
+                    # (wall clock, aligns with the front's ms log and the
+                    # depositor's SLEEP-TAG-TIME t0/t stamps)
+                    logger.info("WEG2-WAKE-TAG-TIME tag=%s resume_ms=%.0f t0=%.3f t=%.3f",
+                                tag, weg2_per_tag[tag][1],
+                                time.time() - (time.perf_counter() - t_tag),
+                                time.time())
                     from sglang.srt.managers.weg2_memory_saver import (
                         GPU_MEMORY_TYPE_WEIGHTS_DRAFT as _WEIGHTS_DRAFT_TAG,
                     )

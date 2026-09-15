@@ -3059,7 +3059,8 @@ def run_sequential_units(descs, ops, boot_nonce: str, *,
             f"bytes={total_bytes} total_ms={(time.perf_counter() - _t_lane0) * 1000:.0f} "
             f"wait_ms={_t_wait * 1000:.0f} copy_sync_ms={_t_copy * 1000:.0f} "
             f"record_ms={_t_rec * 1000:.0f} ipc={'yes' if _ipc_base else 'no'} "
-            f"syncs={_n_sync} batch={_bat_units}u/{_bat_bytes >> 20}MiB")
+            f"syncs={_n_sync} batch={_bat_units}u/{_bat_bytes >> 20}MiB "
+            f"t={_time.time():.3f} t0={_time.time() - (time.perf_counter() - _t_lane0):.3f}")
         if phase == PHASE_COLLECT and _owns_buf and _seq_mm is not None:
             # #1385's lesson, at this form's own site: the file is freed by the
             # side that reads it LAST (the collect; the deposit's next tag is
