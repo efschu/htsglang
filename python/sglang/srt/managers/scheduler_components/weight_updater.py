@@ -4302,6 +4302,33 @@ class SchedulerWeightUpdaterManager:
                                             region=region_tag)
         dst_book = self._weg2_join_dst_addr("destination", group, rank, model,
                                             region=region_tag)
+        # #1378 xsn73 -- ONE BOOK PER REGION OF THE DESC'S OWN TAG. The pair
+        # above is keyed by the MAIN runner's region (`weights`), and this
+        # method fills every desc from it -- so for the draft tag the book
+        # answered the 9 names the draft shares with the target
+        # (embed_tokens, input_layernorm, mlp.*, model.norm) and None for the
+        # 10 it does not (fc.*, qkv_proj, o_proj, q_norm, k_norm,
+        # pre_fc_norm_*: the target's layer 0 is a GDN layer). MEASURED on
+        # weg2xsn73 with the W68 census: `book[weights_draft]=20 names`
+        # on the very rank that refused "10 of 19 descs have no address".
+        # The plan built at :4274 carries no addresses at all, so THIS is the
+        # only resolution the lane ever gets; it has to ask the region the
+        # desc's tag lives in. Built lazily per region, the default pair
+        # stays for a desc without a tag.
+        _books = {}
+
+        def _books_for(desc_tag):
+            reg = xm.region_of_tag(str(desc_tag)) if desc_tag else ""
+            if not reg or reg == xm.region_of_tag(str(region_tag or "")):
+                return src_book, dst_book
+            if reg not in _books:
+                _books[reg] = (
+                    self._weg2_join_src_addr("source", group, rank, model,
+                                             region=reg),
+                    self._weg2_join_dst_addr("destination", group, rank, model,
+                                             region=reg),
+                )
+            return _books[reg]
 
         # DOES THIS RANK OWN AN END OF THE LANE?  The lane key is a CARD pair
         # and rank n of either group runs on cards[n], so under the leg's
@@ -4327,6 +4354,7 @@ class SchedulerWeightUpdaterManager:
                 continue
             if tag is not None and str(getattr(d, "tag", "")) != str(tag):
                 continue
+            src_book, dst_book = _books_for(getattr(d, "tag", ""))
             if src_book is not None and d.src_ptr is None:
                 d = d.replace(src_ptr=src_book(str(d.param_name),
                                                int(d.src_rank)))
