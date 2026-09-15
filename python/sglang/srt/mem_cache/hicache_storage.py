@@ -2448,11 +2448,25 @@ class HiCacheFile(HiCacheStorage):
             from sglang.srt.mem_cache.read_buffer_pool import ReadBufferPool
 
             probe = host_pool.get_dummy_flat_data_page()
+            _page_bytes = int(probe.numel()) * int(probe.element_size())
+            # Boot xsn130 (2026-09-15): the ring is per REGISTERED pool, and
+            # the Mamba anchor pool's "page" is one 46.76 MiB state blob --
+            # 256 of them pinned per rank = 11.7 GiB, six ranks, shmem
+            # 30 -> 67 GiB inside 30 s, W98 Weg2HostRateLatched stopped the
+            # boot. The count is a KV-page count; every pool's ring is capped
+            # by BYTES (SGLANG_HICACHE_READ_BUFFER_MIB, default 64 MiB), so a
+            # blob-sized page gets one or two buffers and a 32 KiB page keeps
+            # its 256.
+            try:
+                _ring_mib = float(os.environ.get("SGLANG_HICACHE_READ_BUFFER_MIB", "64"))
+            except ValueError:
+                _ring_mib = 64.0
+            _cap = max(1, min(int(capacity), int((_ring_mib * (1 << 20)) // max(1, _page_bytes))))
             pool = ReadBufferPool(
                 name=f"HiCache read buffers [{pool_name}]",
                 flag="SGLANG_HICACHE_READ_BUFFERS",
-                capacity=capacity,
-                page_bytes=int(probe.numel()) * int(probe.element_size()),
+                capacity=_cap,
+                page_bytes=_page_bytes,
                 factory=host_pool.get_dummy_flat_data_page,
             )
             pools[pool_name] = pool
