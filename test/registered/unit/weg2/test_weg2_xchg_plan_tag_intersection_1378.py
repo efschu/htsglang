@@ -72,7 +72,7 @@ class ThePlanGateDirection(unittest.TestCase):
         plan, reason = xm.leg_plan_from_join(
             hook="source", group="P", rank=0, manifests=manifests)
         self.assertIsNone(plan, "a source-only tag must refuse")
-        self.assertIn("plan-tag-divergence", reason or "")
+        self.assertIn("plan-name-divergence", reason or "")
 
 
 if __name__ == "__main__":
