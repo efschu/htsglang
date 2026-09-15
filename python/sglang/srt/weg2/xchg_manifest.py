@@ -588,7 +588,16 @@ def _mixed_fused_axis(
       mix of at least two axes.
     """
     w_comp = tuple(int(x) for x in whole.component_rows)
-    if not w_comp or sum(w_comp) != int(whole.rows_full):
+    # #1378 xsn74: TWO OR MORE declared components is the whole condition.
+    # The first form also demanded two DIFFERENT axes among them, so a fused
+    # tensor whose components are all ratio-split (gate_up_proj [gate|up],
+    # in_proj_qkvz [q|k|v|z], in_proj_ba [b|a], conv1d [k|k|v], and QKV
+    # itself once kv >= tp) fell through to the plain ROWS cut -- which lays
+    # rank 0's [c0_0|c1_0] before rank 1's [c0_1|c1_1] where the whole is
+    # [c0_0 c0_1 .. | c1_0 c1_1 ..]. The first SEAM-DIGEST verdict ever
+    # reached (weg2xsn74) read exactly those tensors as content-changed with
+    # placement identical.
+    if len(w_comp) < 2 or sum(w_comp) != int(whole.rows_full):
         return None
     cut_comp: List[Tuple[int, ...]] = []
     for piece in cut:
@@ -606,8 +615,6 @@ def _mixed_fused_axis(
             axes.append((wx.ROWS, w_i, rows_i))
         else:
             return None
-    if len({a for a, _, _ in axes}) < 2:
-        return None
     return tuple(axes)
 
 
@@ -685,6 +692,14 @@ def _axis_of(name: str, whole: ManifestPiece,
 
     if same_rows and same_cols:
         return wx.REPLICATED, w_rows, w_cols, tuple(rows), 0
+    # #1378 xsn74: DECLARED COMPONENTS WIN OVER THE PLAIN ROW CUT. A fused
+    # column-parallel tensor whose components are all ratio-split satisfies
+    # `sum(rows) == w_rows` exactly, and the plain cut then concatenates the
+    # ranks' [c0_r|c1_r] blocks -- the whole is [c0_all|c1_all]. Both sides
+    # declare the same component count and their sums match the row counts,
+    # or this returns None and the outer tests below decide as before.
+    if same_cols and _mixed_fused_axis(whole, cut) is not None:
+        return wx.MIXED_FUSED, w_rows, w_cols, tuple(rows), 0
     if same_cols and sum(rows) == w_rows:
         return wx.ROWS, w_rows, w_cols, tuple(rows), 0
     if same_rows and sum(cols) == w_cols:

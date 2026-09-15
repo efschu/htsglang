@@ -162,7 +162,7 @@ from __future__ import annotations
 import hashlib
 import os
 from dataclasses import dataclass
-from typing import Any, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from sglang.srt import knob_resolution as kr
 from sglang.srt.weg2 import _seam_fold as _fold
@@ -773,6 +773,21 @@ def take_reading_if_armed(
     )
 
 
+def _by_class(labels: Sequence[str]) -> str:
+    """``class:count`` for every label, sorted by count -- the histogram a
+    truncated name list cannot give. A label is ``name[class]@tag/card``;
+    the class between the brackets is what is counted."""
+    counts: Dict[str, int] = {}
+    for lab in labels:
+        s = str(lab)
+        cls = s[s.find("[") + 1:s.find("]")] if "[" in s and "]" in s else s
+        counts[cls] = counts.get(cls, 0) + 1
+    if not counts:
+        return "none"
+    return ",".join(f"{c}:{n}" for c, n in
+                    sorted(counts.items(), key=lambda kv: (-kv[1], kv[0])))
+
+
 def _named(labels: Sequence[str]) -> str:
     """A bounded, never-silently-truncated list of piece labels."""
     shown = list(labels[:MAX_NAMED_PIECES])
@@ -834,6 +849,10 @@ class SeamVerdict:
             f"verdict={self.verdict}",
             f"reason={self.reason}",
             f"moved={len(self.moved)} pieces_moved={_named(self.moved)}",
+            # #1378 xsn74: the class histogram of EVERY moved piece, never
+            # truncated -- "+210-more" could not say whether the 218 were all
+            # fused tensors, all sharded ones, or everything the leg touched.
+            f"moved_by_class={_by_class(self.moved)}",
             f"gone={len(self.gone)} pieces_gone={_named(self.gone)}",
             f"arrived={len(self.arrived)} pieces_arrived={_named(self.arrived)}",
             f"population={POPULATION}",

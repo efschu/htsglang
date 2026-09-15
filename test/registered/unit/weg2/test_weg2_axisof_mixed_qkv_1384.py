@@ -363,13 +363,16 @@ def test_mutant_c_differing_component_count_across_ranks_still_raises():
     assert "W68" in str(exc.value)
 
 
-def test_mutant_d_single_axis_components_never_produce_mixed_fused():
-    """Every component independently agreeing on ONE axis is one of the
-    existing five classes and must not be attributed to the new function --
-    ``_mixed_fused_axis`` itself must decline (``None``), keeping "five outer
-    cases, no silent sixth" true. (The outer ``_axis_of`` never even reaches
-    this helper for such a tensor -- the plain ROWS/REPLICATED test wins
-    first -- so this exercises the helper directly for full branch coverage.)
+def test_mutant_d_single_axis_components_are_placed_per_component_1378():
+    """INVERTED on 2026-09-15 (#1378 xsn74). The first form of this test
+    pinned "every component agreeing on ONE axis is one of the five outer
+    classes" -- and the first SEAM-DIGEST verdict ever reached refuted it on
+    the metal: gate_up_proj [gate|up], in_proj_qkvz [q|k|v|z], in_proj_ba
+    [b|a] and conv1d [k|k|v] are all-ROWS fusions, and the plain ROWS cut
+    lays rank 0's [c0_0|c1_0] before rank 1's [c0_1|c1_1] where the whole is
+    [c0_all|c1_all]: 218 of 560 tensors content-changed, placement identical.
+    A declared fusion with two or more components is placed PER COMPONENT
+    whatever the axes are; a single declared component is still the plain cut.
     """
     whole = _piece(QKV_NAME, 300, HIDDEN, component_rows=(200, 100))
     cut = [
@@ -377,9 +380,16 @@ def test_mutant_d_single_axis_components_never_produce_mixed_fused():
         _piece(QKV_NAME, 100, HIDDEN, component_rows=(70, 30)),
         _piece(QKV_NAME, 100, HIDDEN, component_rows=(60, 40)),
     ]
-    # both components resolve as ROWS (70+70+60=200, 30+30+40=100) -- ONE
-    # axis for the whole tensor, so this must NOT be called MIXED_FUSED.
-    assert xm._mixed_fused_axis(whole, cut) is None
+    assert xm._mixed_fused_axis(whole, cut) == (
+        (wx.ROWS, 200, (70, 70, 60)), (wx.ROWS, 100, (30, 30, 40)))
+    axis, *_ = xm._axis_of(QKV_NAME, whole, cut)
+    assert axis == wx.MIXED_FUSED
+    # one declared component: the plain cut, as before
+    whole1 = _piece(QKV_NAME, 300, HIDDEN, component_rows=(300,))
+    cut1 = [_piece(QKV_NAME, 100, HIDDEN, component_rows=(100,)) for _ in range(3)]
+    assert xm._mixed_fused_axis(whole1, cut1) is None
+    axis1, *_ = xm._axis_of(QKV_NAME, whole1, cut1)
+    assert axis1 == wx.ROWS
 
 
 # ---------------------------------------------------------------------------

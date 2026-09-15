@@ -2961,7 +2961,18 @@ def _qkv_component_rows(model, name: str) -> Tuple[int, ...]:
     expose all three attributes (every parameter this ran against before
     #1384) -- the caller treats that exactly like "no declared split".
     """
-    if not (name.endswith(".weight") or name.endswith(".bias")):
+    # #1378 xsn74 -- EVERY FUSED COLUMN-PARALLEL TENSOR DECLARES ITS
+    # COMPONENTS, not only QKV. The first SEAM-DIGEST verdict ever reached
+    # (weg2xsn74, placement identical, 218 of 560 tensors content-changed)
+    # named gate_up_proj, in_proj_qkvz, in_proj_ba and conv1d first: a rank's
+    # shard of a fused tensor is [c0_r | c1_r | ...] and the whole is
+    # [c0_all | c1_all | ...], so shards concatenated as plain rows interleave
+    # the components. The per-rank sizes are already computed by the layer
+    # (`output_partition_sizes`, uneven-TP aware, linear.py:651-680); conv1d
+    # is a single-output ColumnParallelLinear whose channels are the GDN
+    # block's [key | key | value], read off its parent. `.weight_scale` (the
+    # INT8 per-row scale) shares the row structure of its weight.
+    if not name.endswith((".weight", ".bias", ".weight_scale")):
         return ()
     mod_path, _, _leaf = name.rpartition(".")
     if not mod_path:
@@ -2973,9 +2984,26 @@ def _qkv_component_rows(model, name: str) -> Tuple[int, ...]:
     q = getattr(owner, "q_proj_shard_size", None)
     k = getattr(owner, "kv_proj_shard_size", None)
     v = getattr(owner, "v_proj_shard_size", None)
-    if q is None or k is None or v is None:
-        return ()
-    return (int(q), int(k), int(v))
+    if q is not None and k is not None and v is not None:
+        return (int(q), int(k), int(v))
+    parts = getattr(owner, "output_partition_sizes", None)
+    try:
+        parts = tuple(int(x) for x in (parts or ()))
+    except (TypeError, ValueError):
+        parts = ()
+    if len(parts) >= 2:
+        return parts
+    if mod_path.endswith(".conv1d"):
+        parent_path = mod_path.rpartition(".")[0]
+        try:
+            parent = model.get_submodule(parent_path) if parent_path else None
+        except AttributeError:
+            parent = None
+        kd = getattr(parent, "key_dim", None)
+        vd = getattr(parent, "value_dim", None)
+        if isinstance(kd, int) and isinstance(vd, int) and kd > 0 and vd > 0:
+            return (kd, kd, vd)
+    return ()
 
 
 def card_inventory(
