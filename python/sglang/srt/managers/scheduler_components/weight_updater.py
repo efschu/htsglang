@@ -3457,6 +3457,44 @@ class SchedulerWeightUpdaterManager:
         except BaseException as exc:  # noqa: BLE001 -- fail-closed observer
             return frozenset(), f"proof-failed:{_weg2_exc_note(exc)}"
 
+    def _weg2_xchg_drain_outstanding(self) -> None:
+        """The depositor's leg end (2026-09-15): wait for the collector's
+        drain of the last ``depth`` tags on every lane this rank deposited
+        into, then free the on-card IPC staging. Leaves ZERO leftover
+        credits, so the next leg's per-leg counters start clean."""
+        from sglang.srt.weg2 import weight_exchange_bounce as bx
+        seq = dict(getattr(self, "_weg2_xchg_lane_seq", None) or {})
+        try:
+            sems = self._weg2_xchg_sems()
+        except Exception:  # noqa: BLE001
+            sems = None
+        depth = int(bx.seq_buffer_depth())
+        if sems is not None:
+            for lane_key, n in seq.items():
+                outstanding = min(int(n), depth)
+                if outstanding <= 0:
+                    continue
+                try:
+                    if str(lane_key).startswith("p"):
+                        rv = bx.CrossSlotRendezvous(
+                            sems, None, pair=int(str(lane_key)[1:]),
+                            budget_s=WEG2_GROUP_FENCE_BUDGET_S)
+                    else:
+                        rv = bx.CrossSlotRendezvous(
+                            sems, None, card=int(str(lane_key)[1:]),
+                            budget_s=WEG2_GROUP_FENCE_BUDGET_S)
+                    got = 0
+                    for _ in range(outstanding):
+                        if not rv.wait_drained(tag="leg-end"):
+                            break
+                        got += 1
+                    logger.info("WEG2-SEQ leg-end drain lane=%s outstanding=%d "
+                                "drained=%d", lane_key, outstanding, got)
+                except Exception as exc:  # noqa: BLE001
+                    logger.info("WEG2-SEQ leg-end drain lane=%s failed: %s",
+                                lane_key, exc)
+        bx.release_stage_buffers(None, log=logger.info)
+
     def _weg2_cocard_peer_alive(self) -> bool:
         """Is the co-located rank on THIS card still alive?  NVML per-process
         pids on the rank's own device, minus self -- during a flip the OTHER
@@ -5615,6 +5653,12 @@ class SchedulerWeightUpdaterManager:
         # (buffers are read while every page is still mapped), and the sleep
         # is graded when the whole WEG2_SLEEP_TAGS population is paused.
         weights_tags = [t for t in tags if is_weights_family_tag(t)]
+        # 2026-09-15: per-LEG lane counters (buffer slot, drain rule) -- both
+        # sides walk the same tags per leg, so both start at 0 here.
+        try:
+            self._weg2_xchg_lane_seq = {}
+        except AttributeError:
+            pass
         family_paused_before = any(is_weights_family_tag(t) for t in self.offload_tags)
         sleep_begins = len(self.offload_tags) == 0
 
@@ -5879,6 +5923,9 @@ class SchedulerWeightUpdaterManager:
             # the same tmpfs granules and this delta collapses to ~0 while the
             # bytes above are unchanged (spec R8).  A reader comparing the two
             # must know which one is the instrument.
+            # 2026-09-15: the depositor confirms every outstanding drain
+            # (the last `depth` tags per lane) and frees its on-card staging.
+            self._weg2_xchg_drain_outstanding()
             logger.info(
                 "WEG2-CHUNK-BYTES sleep tags=%s host_image_delta=%.0f MiB (RssShmem %.0f -> %.0f MiB, "
                 "/proc/self/status; CROSS-CHECK ONLY -- tms_tag_bytes above is the instrument, and this "
@@ -6043,6 +6090,12 @@ class SchedulerWeightUpdaterManager:
             )
 
         weights_tags = [t for t in tags if is_weights_family_tag(t)]
+        # 2026-09-15: per-LEG lane counters (buffer slot, drain rule) -- both
+        # sides walk the same tags per leg, so both start at 0 here.
+        try:
+            self._weg2_xchg_lane_seq = {}
+        except AttributeError:
+            pass
         if weights_tags:
             # Wake-H2D: with the cpu backup this recommit refills from the host
             # buffer (and, with the #1233 patched hook, frees that buffer).

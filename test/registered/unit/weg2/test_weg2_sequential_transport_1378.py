@@ -323,6 +323,10 @@ class TheLanePinIsUnregisteredBeforeTheBufferGoes(_TransportHarness):
     died with cudaMemcpyAsync rc=1. Mutant: the shipped close, no unregister."""
 
     def setUp(self):
+        # 2026-09-15: this witness is about the TRANSIENT form (register and
+        # unregister per call); the shipped default keeps a lane's buffer
+        # registered for the process (SEQ_PERSIST_BUFFERS_ENV), see below.
+        os.environ[bx.SEQ_PERSIST_BUFFERS_ENV] = "0"
         super().setUp()
         self.ops = _PinOps()
 
@@ -511,3 +515,92 @@ class PrimeDrainTakesEveryLeftoverCredit(_TransportHarness):
         self.assertFalse(rv.prime_drain())
         self.assertEqual(rv.last_primed, 0)
         self.assertFalse(rv._wait(rv._DRAIN_SLOT, "empty", 0.0))
+
+
+class _IpcOps(_MemOps):
+    """A device with cudaMalloc + CUDA IPC, faked: the staging is a host
+    block, the 64-byte handle carries its fake address."""
+
+    def __init__(self):
+        super().__init__()
+        self.freed = []
+        self._next = 0x100000
+
+    def raw_malloc(self, device, nbytes):
+        addr = self._next
+        self._next += (nbytes + 4095) & ~4095
+        self.hook(addr, nbytes)
+        return addr
+
+    def raw_free(self, ptr):
+        self.freed.append(int(ptr))
+
+    def ipc_get_handle(self, ptr):
+        return int(ptr).to_bytes(8, "little") + b"\0" * 56
+
+    def ipc_open_handle(self, handle):
+        return int.from_bytes(handle[:8], "little")
+
+    def ipc_close_handle(self, ptr):
+        self.closed = int(ptr)
+
+
+class PersistentBuffersAndOnCardIpc(_TransportHarness):
+    """2026-09-15 (Nutzer-Order: persistente Puffer, On-Card per IPC)."""
+
+    def setUp(self):
+        super().setUp()
+        os.environ.pop(bx.SEQ_PERSIST_BUFFERS_ENV, None)  # default: on
+        os.environ.pop(bx.SEQ_ONCARD_IPC_ENV, None)       # default: on
+
+    def test_the_lane_buffer_is_registered_once_and_reused(self):
+        ops = _PinOps()
+        self.ops = ops
+        n = 64
+        src, dst = self._vram_pair(n, 0)
+        self.ops.write(src, b"\x21" * n)
+        d = _desc("persist.unit", n, src_ptr=src, dst_ptr=dst)
+        self.assertEqual(self._deposit([d]), "")
+        self.assertEqual(self._collect([d]), "")
+        self.assertEqual(self.ops.read(dst, n), b"\x21" * n)
+        self.ops.write(src, b"\x22" * n)
+        self.assertEqual(self._deposit([d]), "")
+        self.assertEqual(self._collect([d]), "")
+        self.assertEqual(self.ops.read(dst, n), b"\x22" * n)
+        regs = [c for c in ops.pins if c[0] == "register"]
+        unregs = [c for c in ops.pins if c[0] == "unregister"]
+        self.assertEqual(len(regs), 1, ops.pins)
+        self.assertEqual(unregs, [], "persistent: never unregistered per tag")
+        self.assertTrue(any("persist lane=c1 reuse" in ln for ln in self.lines))
+
+    def test_on_card_lane_stages_by_ipc_and_the_host_path_stays_for_cross(self):
+        ops = _IpcOps()
+        self.ops = ops
+        n = 96
+        src, dst = self._vram_pair(n, 0)
+        self.ops.write(src, b"\x33" * n)
+        d = _desc("ipc.unit", n, src_ptr=src, dst_ptr=dst)
+        self.assertEqual(self._deposit([d]), "")   # card=1: on-card lane
+        self.assertTrue(any("ipc lane=c1 phase=deposit stage=" in ln
+                            for ln in self.lines), self.lines[-4:])
+        self.assertEqual(self._collect([d]), "")
+        self.assertTrue(any("ipc lane=c1 phase=collect opened=" in ln
+                            for ln in self.lines))
+        self.assertEqual(self.ops.read(dst, n), b"\x33" * n)
+        self.assertEqual(getattr(ops, "closed", None) is not None, True)
+        self.assertEqual(bx.release_stage_buffers(self.nonce, log=self.lines.append), 1)
+        self.assertEqual(len(ops.freed), 1)
+
+    def test_ipc_unavailable_falls_back_to_the_host_path(self):
+        class _Broken(_IpcOps):
+            def raw_malloc(self, device, nbytes):
+                raise RuntimeError("cudaMalloc: out of memory")
+        self.ops = _Broken()
+        n = 40
+        src, dst = self._vram_pair(n, 0)
+        self.ops.write(src, b"\x44" * n)
+        d = _desc("fallback.unit", n, src_ptr=src, dst_ptr=dst)
+        self.assertEqual(self._deposit([d]), "")
+        self.assertTrue(any("phase=deposit UNAVAILABLE" in ln for ln in self.lines))
+        self.assertEqual(self._collect([d]), "")
+        self.assertEqual(self.ops.read(dst, n), b"\x44" * n)

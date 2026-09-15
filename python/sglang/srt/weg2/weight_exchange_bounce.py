@@ -2213,6 +2213,126 @@ def seq_lane_file_name(lane_key: str, buffer_slot: int) -> str:
     return lane_key if not buffer_slot else f"{lane_key}_s{int(buffer_slot)}"
 
 
+#: NUTZER-ORDER 2026-09-15 ("bau die naechsten hebel, persistente puffer und
+#: on-card per ipc"). PERSISTENT: a lane slot's host buffer is created,
+#: mmapped and cudaHostRegister'ed ONCE per process (grown when a later tag
+#: needs more), never unlinked per tag -- weg2xsn89 paid a register and an
+#: unregister of up to 2 GB per lane per tag on both sides. The files stay
+#: on tmpfs until the boot's own weg2-seq sweep. ON-CARD IPC: the on-card
+#: lanes (c0/c1/c2, the two ranks of one card) stage in a cudaMalloc'ed
+#: DEVICE buffer the collector opens through cudaIpcOpenMemHandle -- two D2D
+#: copies instead of D2H + H2D through the host. The staging is transient
+#: (allocated per tag, freed at the leg's end after every drain is confirmed,
+#: see the updater), and any failure to allocate or export falls back to the
+#: host path for that tag, logged.
+SEQ_PERSIST_BUFFERS_ENV = "SGLANG_WEG2_SEQ_PERSIST_BUFFERS"
+SEQ_ONCARD_IPC_ENV = "SGLANG_WEG2_SEQ_ONCARD_IPC"
+
+
+def seq_persist_buffers() -> bool:
+    return _env_flag(SEQ_PERSIST_BUFFERS_ENV, "1")
+
+
+def seq_oncard_ipc() -> bool:
+    return _env_flag(SEQ_ONCARD_IPC_ENV, "1")
+
+
+_SEQ_HOST_BUF: dict = {}   # path -> {"fh","mm","addr","size","registered"}
+_SEQ_STAGE: dict = {}      # (boot_nonce, lane_file) -> {"ptr","size","device","ops"}
+_SEQ_CACHE_LOCK = __import__("threading").Lock()
+
+
+def _persistent_host_buffer(path: str, biggest: int, ops, lane_key: str, log):
+    """``(mm, addr, registered_str, refusal_str)`` for one lane slot, cached
+    per process; grown (unregister, remap, re-register) when ``biggest``
+    exceeds the cached size."""
+    with _SEQ_CACHE_LOCK:
+        ent = _SEQ_HOST_BUF.get(path)
+        if ent is not None and int(ent["size"]) >= int(biggest):
+            log(f"WEG2-SEQ persist lane={lane_key} reuse size={int(ent['size'])} "
+                f"registered={ent['registered']}")
+            return ent["mm"], ent["addr"], ent["registered"], ""
+        how = "new"
+        if ent is not None:
+            how = f"grow {int(ent['size'])}->{int(biggest)}"
+            if ent["registered"] == "yes":
+                try:
+                    ops.host_unregister(int(ent["addr"]))
+                except Exception:  # noqa: BLE001
+                    pass
+            try:
+                ent["mm"].close()
+                ent["fh"].close()
+            except Exception:  # noqa: BLE001
+                pass
+            _SEQ_HOST_BUF.pop(path, None)
+        size = os.path.getsize(path) if os.path.exists(path) else 0
+        if size < biggest:
+            with open(path, "ab") as _tfh:
+                _tfh.truncate(biggest)
+        fh = open(path, "r+b")
+        mm = _mmap.mmap(fh.fileno(), biggest)
+        addr = _mmap_addr(mm)
+        registered = "no"
+        refusal = ""
+        t0 = time.perf_counter()
+        try:
+            ops.host_register(int(addr), int(biggest), tp.CUDA_HOST_REGISTER_PORTABLE)
+            registered = "yes"
+        except AttributeError:
+            registered = "unavailable"
+        except Exception as _reg_exc:  # noqa: BLE001
+            registered = f"no({type(_reg_exc).__name__})"
+            refusal = (f"host_register failed for lane {lane_key} addr={int(addr)} "
+                       f"bytes={int(biggest)}: {type(_reg_exc).__name__}: {_reg_exc}")
+        log(f"WEG2-SEQ persist lane={lane_key} {how} size={int(biggest)} "
+            f"addr={int(addr)} registered={registered} "
+            f"register_ms={(time.perf_counter() - t0) * 1000:.0f}")
+        if refusal:
+            mm.close()
+            fh.close()
+            return None, 0, registered, refusal
+        _SEQ_HOST_BUF[path] = {"fh": fh, "mm": mm, "addr": int(addr),
+                               "size": int(biggest), "registered": registered}
+        return mm, int(addr), registered, ""
+
+
+def _stage_alloc(ops, device: int, key, nbytes: int, log, lane_key: str) -> int:
+    """A transient DEVICE staging buffer for one lane slot; an existing
+    entry of the same slot is freed first (the caller runs only after that
+    slot's drain). Freed for good by :func:`release_stage_buffers`."""
+    with _SEQ_CACHE_LOCK:
+        ent = _SEQ_STAGE.pop(key, None)
+        if ent is not None:
+            try:
+                ent["ops"].raw_free(int(ent["ptr"]))
+            except Exception as exc:  # noqa: BLE001
+                log(f"WEG2-SEQ stage lane={lane_key} free-failed: {exc}")
+        ptr = int(ops.raw_malloc(int(device), int(nbytes)))
+        _SEQ_STAGE[key] = {"ptr": ptr, "size": int(nbytes), "device": int(device),
+                           "ops": ops}
+        return ptr
+
+
+def release_stage_buffers(boot_nonce=None, log=None) -> int:
+    """Free every staging buffer this process holds (``boot_nonce`` None =
+    all) -- the depositor's leg end, after every drain is confirmed."""
+    n = 0
+    with _SEQ_CACHE_LOCK:
+        for key in [k for k in _SEQ_STAGE
+                    if boot_nonce is None or k[0] == str(boot_nonce)]:
+            ent = _SEQ_STAGE.pop(key)
+            try:
+                ent["ops"].raw_free(int(ent["ptr"]))
+                n += 1
+            except Exception as exc:  # noqa: BLE001
+                if log is not None:
+                    log(f"WEG2-SEQ stage {key[1]} free-failed: {exc}")
+    if log is not None and n:
+        log(f"WEG2-SEQ stage released={n}")
+    return n
+
+
 def sequential_buffer_path(boot_nonce: str, shm_root: str = xr.SHM_ROOT,
                            lane: str = "") -> str:
     # #1378 xsn53: PER LANE.  Three cards run their co-located pairs at the
@@ -2513,12 +2633,22 @@ def run_sequential_units(descs, ops, boot_nonce: str, *,
     dpath = sequential_digest_path(boot_nonce, shm_root, lane=_lane_file)
     directory = os.path.dirname(path)
     os.makedirs(directory, exist_ok=True)
+    _persist = False
     if buffer is not None:
         # the desk path: the test provides the buffer directly
         buf = buffer
         _owns_buf = False
         _seq_mm = None
         _fh = None
+    elif seq_persist_buffers():
+        buf, _p_addr, _p_reg, _p_refusal = _persistent_host_buffer(
+            path, int(biggest), ops, lane_key, log)
+        if _p_refusal:
+            return _p_refusal
+        _owns_buf = False          # cached: never unregistered/closed/unlinked here
+        _seq_mm = buf
+        _fh = None
+        _persist = True
     else:
         # #1378 xsn53 (DER PUFFER IST WIEDER GETEILT): the SHARED tmpfs mmap,
         # per lane, NO host_register.  69f727dac2 had replaced this with
@@ -2561,13 +2691,17 @@ def run_sequential_units(descs, ops, boot_nonce: str, *,
         # without that method raises AttributeError first and an inline
         # assignment would never run -- which is exactly how the desk suite
         # caught this on the first execution (UnboundLocalError, 8 failures).
+    if buffer is None:
         _seq_addr = _mmap_addr(buf)
         _seq_registered = "no"
         _reg_refusal = ""
         try:
-            ops.host_register(int(_seq_addr), int(biggest),
-                              tp.CUDA_HOST_REGISTER_PORTABLE)
-            _seq_registered = "yes"
+            if _persist:
+                _seq_registered = str(_p_reg)
+            else:
+                ops.host_register(int(_seq_addr), int(biggest),
+                                  tp.CUDA_HOST_REGISTER_PORTABLE)
+                _seq_registered = "yes"
         except AttributeError:
             # the desk fakes carry no pin at all: unpinned, and nothing to
             # unregister later
@@ -2592,8 +2726,9 @@ def run_sequential_units(descs, ops, boot_nonce: str, *,
         log(f"WEG2-SEQ register lane={lane_key} bytes={int(biggest)} "
             f"addr={int(_seq_addr)} registered={_seq_registered}")
         if _reg_refusal:
-            _seq_mm.close()
-            _fh.close()
+            if _fh is not None:
+                _seq_mm.close()
+                _fh.close()
             return _reg_refusal
     try:
         sems = tp.SemSet(boot_nonce)
@@ -2604,6 +2739,22 @@ def run_sequential_units(descs, ops, boot_nonce: str, *,
         except Exception:  # noqa: BLE001 -- a copy stream is an optimisation
             stream = 0
         base_addr = _mmap_addr(buf) if _seq_mm is not None else 0
+        _ipc_base, _ipc_hex, _ipc_opened = 0, "", False
+        if (phase == PHASE_DEPOSIT and card is not None and seq_oncard_ipc()
+                and hasattr(ops, "ipc_get_handle") and hasattr(ops, "raw_malloc")):
+            try:
+                _ipc_base = _stage_alloc(ops, int(device),
+                                         (str(boot_nonce), _lane_file),
+                                         int(total_bytes), log, lane_key)
+                _ipc_hex = bytes(ops.ipc_get_handle(int(_ipc_base))).hex()
+                log(f"WEG2-SEQ ipc lane={lane_key} phase=deposit stage={int(_ipc_base)} "
+                    f"bytes={int(total_bytes)} handle={_ipc_hex[:16]}.. -- on-card "
+                    f"D2D staging, the collector opens it by IPC")
+            except Exception as _ipc_exc:  # noqa: BLE001
+                log(f"WEG2-SEQ ipc lane={lane_key} phase=deposit UNAVAILABLE "
+                    f"({type(_ipc_exc).__name__}: {_ipc_exc}) -- host path for "
+                    f"this tag")
+                _ipc_base, _ipc_hex = 0, ""
         # #1378 xsn55 (WO DER DEPOSIT STEHT): xsn55's diagonal lane blocked with
         # NO c0 buffer file and NO c0 digest json, while both cross lanes wrote
         # buffers and digests immediately -- so the block was between the lane
@@ -2634,7 +2785,7 @@ def run_sequential_units(descs, ops, boot_nonce: str, *,
                 # #1378 xsn44: the D2H copy -- from the VRAM source into the
                 # shared buffer at this piece's offset, the SAME pitch arithmetic
                 # the lane form runs (a STRIDED2D piece compacts on the way in).
-                _buf_addr = base_addr + window_off
+                _buf_addr = (_ipc_base + window_off) if _ipc_base else (base_addr + window_off)
                 if piece.kind == tp.FLAT:
                     ops.memcpy_async(_buf_addr, src_ptr, nbytes, stream)
                 else:
@@ -2644,14 +2795,14 @@ def run_sequential_units(descs, ops, boot_nonce: str, *,
                 ops.synchronize(stream)
                 digest = (hashlib.sha256(
                     bytes(buf[window_off:window_off + nbytes])).hexdigest()[:16]
-                    if _digest_on else "")
+                    if (_digest_on and not _ipc_base) else "")
                 recs = {}
                 if os.path.exists(dpath):
                     try:
                         recs = _json.load(open(dpath))
                     except ValueError:
                         recs = {}
-                recs[str(i)] = {"name": name, "tag": tag, "digest": digest,
+                recs[str(i)] = {"name": name, "tag": tag, "digest": digest, "ipc": _ipc_hex,
                                 "nbytes": nbytes}
                 with open(dpath, "w") as fh:
                     _json.dump(recs, fh)
@@ -2702,6 +2853,13 @@ def run_sequential_units(descs, ops, boot_nonce: str, *,
                     except ValueError:
                         recs = {}
                 dep = recs.get(str(i), {})
+                if dep.get("ipc") and not _ipc_base:
+                    # the deposit staged on-card: open its handle once, read
+                    # every unit of this lane/tag D2D out of the staging.
+                    _ipc_base = int(ops.ipc_open_handle(bytes.fromhex(str(dep["ipc"]))))
+                    _ipc_opened = True
+                    log(f"WEG2-SEQ ipc lane={lane_key} phase=collect opened={int(_ipc_base)} "
+                        f"handle={str(dep['ipc'])[:16]}..")
                 # weg2xsn84 (#1378): THE RECORD NAMES THE TENSOR, SO CHECK IT.
                 # The per-unit digest alone cannot tell "the deposit's bytes
                 # arrived intact" from "the deposit is a DIFFERENT tag's
@@ -2756,7 +2914,7 @@ def run_sequential_units(descs, ops, boot_nonce: str, *,
                             f"dst_ptr -- this rank does not hold the destination "
                             f"this lane says it fills")
                 dst_ptr = int(desc.dst_ptr) + int(piece.dst_off)
-                _buf_addr = base_addr + window_off
+                _buf_addr = (_ipc_base + window_off) if _ipc_base else (base_addr + window_off)
                 # #1378 xsn57: THE NUMBERS BEFORE THE FIRST COPY-OUT, because
                 # weg2xsn56 died here with a SIGSEGV and left NOTHING to read.
                 # P rank0's last line was `WEG2-SEQ mapped ... bytes=1968338488
@@ -2856,6 +3014,11 @@ def run_sequential_units(descs, ops, boot_nonce: str, *,
                 pass
         return ""
     finally:
+        if _ipc_opened:
+            try:
+                ops.ipc_close_handle(int(_ipc_base))
+            except Exception as _cl_exc:  # noqa: BLE001
+                log(f"WEG2-SEQ ipc lane={lane_key} close-failed: {_cl_exc}")
         if _owns_buf and _seq_mm is not None:
             # #1378 xsn70: UNREGISTER BEFORE THE MUNMAP, or the driver keeps this
             # VA range pinned to these pages after they are gone -- the next
