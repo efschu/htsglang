@@ -448,6 +448,10 @@ def new_match_census() -> Optional[MatchRefusalCensus]:
     return MatchRefusalCensus() if census_every() > 0 else None
 
 
+_refused_sig: Optional[str] = None
+_refused_run = 0
+
+
 def emit(census: Optional[MatchRefusalCensus], logger) -> None:
     """Log the census, rate-limited, and ALWAYS when it is the discriminator.
 
@@ -463,9 +467,27 @@ def emit(census: Optional[MatchRefusalCensus], logger) -> None:
     if every <= 0:
         return
     _emitted += 1
-    if census.is_resident_but_unusable() or _emitted % every == 0:
+    _refused = census.is_resident_but_unusable()
+    if _refused:
+        # Boot xsn131: a D wedged on three parked requests re-ran the match
+        # every pass and this line came 90 times per second (58,710 lines in
+        # one boot). A refusal is never sampled AWAY, but an IDENTICAL
+        # refusal repeated pass after pass is one finding: the first 8 print,
+        # then every 512th, with the run length on the line.
+        global _refused_sig, _refused_run
+        _sig = census.format_line()
+        if _sig == _refused_sig:
+            _refused_run += 1
+            if _refused_run > 8 and _refused_run % 512 != 0:
+                return
+        else:
+            _refused_sig, _refused_run = _sig, 1
+    if _refused or _emitted % every == 0:
         try:
-            logger.info("%s", census.format_line())
+            _line = census.format_line()
+            if _refused and _refused_run > 1:
+                _line = f"{_line} identical_run={_refused_run}"
+            logger.info("%s", _line)
         except ValueError:
             logger.error(
                 "[#904 match-census] BROKEN PARTITION reached=%d accepted=%d "

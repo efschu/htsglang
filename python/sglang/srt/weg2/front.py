@@ -3902,6 +3902,38 @@ class Front:
             logger.debug("weg2 decode progress unavailable: %s: %s", type(e).__name__, e)
             return None
 
+    async def _abort_parked_on_drain(self, g: Group, src: str) -> bool:
+        """W1b (boots xsn127/129/131): the drain window ended with requests
+        the awake group HOLDS BUT DOES NOT RUN -- no token, no forward pass
+        in the whole window (`_drain_progress` says so; a progressing group
+        never reaches here). Waiting longer produced W1 x3 -> W2 STOP or a
+        120 s FLIP STALL with the whole box idle. Those requests are parked
+        on a store read that will not complete (D's X-DEFER on a short
+        prefix); the flip they block is the one that would let P prefill
+        them. So: abort them on the group by name (abort_all -- nothing is
+        running, the progress witness established that), drop them from the
+        ledger, answer their clients loudly through the aborted leg, and let
+        the flip proceed. Returns True when the drain is clear afterwards."""
+        parked = sorted(g.outstanding)
+        if not parked:
+            return True
+        self.counters["W1b_parked_aborted"] += len(parked)
+        logger.error("W1b Weg2DrainParkedAborted: %s held %d request(s) without progress "
+                     "through the %.0f s drain window (rids %s); aborting them on %s and "
+                     "flipping -- they answer their clients through the aborted leg",
+                     src, len(parked), self.drain_deadline_s, parked[:8], src)
+        try:
+            code, body = await self.rpc(g, "/abort_request", {"rid": "", "abort_all": True}, 30)
+            logger.error("W1b abort_all on %s -> code=%s body=%s", src, code, str(body)[:120])
+        except Exception as e:  # noqa: BLE001
+            logger.error("W1b abort_all on %s raised: %s: %s", src, type(e).__name__, e)
+        for rid in parked:
+            g.outstanding.pop(rid, None)
+        t0 = time.time()
+        while g.outstanding and time.time() - t0 < 10.0:
+            await asyncio.sleep(0.25)
+        return not g.outstanding
+
     async def drain(self, g: Group) -> bool:
         """Wait for the group to go empty, and RECORD whether it was working.
 
@@ -4206,16 +4238,17 @@ class Front:
                 self.drain_refusals_in_a_row = 0
                 self.state = "serving" if self.state != "STOP" else "STOP"
                 return
-            self.drain_refusals_in_a_row += 1
-            self.counters["W1_Weg2DrainRefused"] += 1
-            logger.error("W1 Weg2DrainRefused: %s still holds %d request(s) after %.0f s (rids %s) suspended=%d; "
-                         "not flipping (%d in a row)",
-                         src, len(S.outstanding), self.drain_deadline_s, sorted(S.outstanding)[:8],
-                         self.counters.get("suspended_now", 0), self.drain_refusals_in_a_row)
-            if self.drain_refusals_in_a_row >= 3:
-                self.do_stop("W2 Weg2DrainStuck", f"three W1 in a row on {src}: {sorted(S.outstanding)[:8]}")
-            self.state = "serving" if self.state != "STOP" else "STOP"
-            return
+            if not await self._abort_parked_on_drain(S, src):
+                self.drain_refusals_in_a_row += 1
+                self.counters["W1_Weg2DrainRefused"] += 1
+                logger.error("W1 Weg2DrainRefused: %s still holds %d request(s) after %.0f s (rids %s) suspended=%d; "
+                             "not flipping (%d in a row)",
+                             src, len(S.outstanding), self.drain_deadline_s, sorted(S.outstanding)[:8],
+                             self.counters.get("suspended_now", 0), self.drain_refusals_in_a_row)
+                if self.drain_refusals_in_a_row >= 3:
+                    self.do_stop("W2 Weg2DrainStuck", f"three W1 in a row on {src}: {sorted(S.outstanding)[:8]}")
+                self.state = "serving" if self.state != "STOP" else "STOP"
+                return
         self.drain_refusals_in_a_row = 0
         # 2. quiesce + double witness (W3)
         self._flip_stage = "quiesce"

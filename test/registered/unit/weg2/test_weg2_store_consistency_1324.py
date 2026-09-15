@@ -592,3 +592,28 @@ def test_a_pp_producer_group_admits_a_partial_hit_instead_of_deferring():
     assert s._weg2_note_store_shortfall(r) is None
     assert not s._weg2_store_read_is_pending(r)
     assert getattr(r, "_weg2_store_delivered", None) is None
+
+
+def test_a_reissue_that_delivers_less_than_the_best_is_not_progress(monkeypatch):
+    """xsn131: the deferral re-issued the read every pass and each read
+    terminated holding a different partial prefix (3328, 1792, 1109 ...), so
+    'delivered' kept moving and no standstill was declared for 164 s. Only a
+    delivered count ABOVE the request's best so far is progress."""
+    from sglang.srt.managers import scheduler as sched_mod
+    s = types.SimpleNamespace(tree_cache=types.SimpleNamespace())
+    s._weg2_prefetch_stall_passes = lambda: 3
+    seq = iter([3328, 1792, 1109, 2000, 3000, 3300])
+    s._weg2_prefetch_progress_terms = lambda req: (0, 0, 0, 0, 0, 0, 0, next(seq))
+    s._weg2_note_prefetch_progress = sched_mod.Scheduler._weg2_note_prefetch_progress.__get__(s)
+    r = types.SimpleNamespace(rid="r1")
+    monkeypatch.setattr(sched_mod, "_weg2_prefetch_stall_s", lambda: 1e9)
+    assert s._weg2_note_prefetch_progress(r) == "progress"   # 3328: first best
+    assert s._weg2_note_prefetch_progress(r) == "stalled"    # 1792 < best
+    assert s._weg2_note_prefetch_progress(r) == "stalled"    # 1109 < best
+    assert s._weg2_note_prefetch_progress(r) == "terminal"   # 2000 < best: 3rd pass
+    r2 = types.SimpleNamespace(rid="r2")
+    seq2 = iter([100, 200, 300])
+    s._weg2_prefetch_progress_terms = lambda req: (0, 0, 0, 0, 0, 0, 0, next(seq2))
+    assert s._weg2_note_prefetch_progress(r2) == "progress"
+    assert s._weg2_note_prefetch_progress(r2) == "progress"  # 200 > 100
+    assert s._weg2_note_prefetch_progress(r2) == "progress"  # 300 > 200

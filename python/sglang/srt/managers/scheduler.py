@@ -6336,8 +6336,23 @@ class Scheduler(
         neighbour cannot mask a dead read (or vice versa).
         """
         terms = self._weg2_prefetch_progress_terms(req)
+        # Boot xsn131 (D, rids 7a4b581e/df86c414): the deferral RE-ISSUED the
+        # store read every pass and each read terminated holding a DIFFERENT
+        # partial prefix (3328, 1792, 1109 ...), so the delivered term kept
+        # "moving" and no standstill was ever declared -- 164 s of '3 queued,
+        # 0 running'. Delivered counts as progress only when it EXCEEDS the
+        # request's best delivered so far; every other term keeps its plain
+        # changed/unchanged reading.
+        _delivered = int(terms[-1]) if terms else 0
+        _best = int(getattr(req, "_weg2_best_delivered", 0) or 0)
+        if _delivered > _best:
+            req._weg2_best_delivered = _delivered
+            _moved = True
+        else:
+            _moved = False
+        terms = tuple(terms[:-1]) + (max(_delivered, _best),)
         last = getattr(req, "_weg2_progress_terms", None)
-        if last != terms:
+        if last != terms or _moved:
             req._weg2_progress_terms = terms
             req._weg2_no_progress_passes = 0
             req._weg2_no_progress_t0 = time.perf_counter()
