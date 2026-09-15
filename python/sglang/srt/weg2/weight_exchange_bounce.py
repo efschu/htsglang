@@ -2242,6 +2242,52 @@ def seq_oncard_ipc() -> bool:
     return _env_flag(SEQ_ONCARD_IPC_ENV, "1")
 
 
+#: Order point 2 (2026-09-15, "Transport an den Link"): ONE stream sync per
+#: BATCH of units instead of one per unit. Measured on xsn122: a 1224-unit
+#: cross lane of 3.5 GB spent 2.1 ms per unit in copy+sync (1.37 GB/s on an
+#: 8 GB/s link), a 3776-unit lane of 12 GB reached 7.5 GB/s -- the per-unit
+#: `cudaStreamSynchronize` round trip is the cost, not the link. The copies
+#: of a batch are queued back to back on the lane's stream, synchronised
+#: ONCE, and only then digested/recorded/posted (deposit) or placement-checked
+#: (collect). The handshake stays one token per unit; the collect still waits
+#: per unit before it issues that unit's copy. Env: the batch closes at
+#: SGLANG_WEG2_SEQ_SYNC_BATCH_MIB (default 64) or at
+#: SGLANG_WEG2_SEQ_SYNC_BATCH_UNITS (default 32) units, whichever first;
+#: UNITS=1 restores the per-unit form.
+SEQ_SYNC_BATCH_MIB_ENV = "SGLANG_WEG2_SEQ_SYNC_BATCH_MIB"
+SEQ_SYNC_BATCH_UNITS_ENV = "SGLANG_WEG2_SEQ_SYNC_BATCH_UNITS"
+
+
+def seq_sync_batch() -> tuple:
+    """``(max_bytes, max_units)`` of one sync batch; clamped to sane values."""
+    try:
+        mib = float(os.environ.get(SEQ_SYNC_BATCH_MIB_ENV, "64"))
+    except ValueError:
+        mib = 64.0
+    try:
+        units = int(os.environ.get(SEQ_SYNC_BATCH_UNITS_ENV, "32"))
+    except ValueError:
+        units = 32
+    return int(max(1.0, mib) * (1 << 20)), max(1, min(units, 4096))
+
+
+def _sync_groups(pieces, max_bytes: int, max_units: int) -> list:
+    """Index groups of ``pieces`` that share one synchronize. Deterministic
+    from the piece list and the two bounds alone (both sides derive it, but
+    only the sync cadence depends on it -- the handshake is per unit)."""
+    groups, cur, cur_bytes = [], [], 0
+    for i, piece in enumerate(pieces):
+        nb = int(piece.nbytes)
+        if cur and (len(cur) >= max_units or cur_bytes + nb > max_bytes):
+            groups.append(cur)
+            cur, cur_bytes = [], 0
+        cur.append(i)
+        cur_bytes += nb
+    if cur:
+        groups.append(cur)
+    return groups
+
+
 _SEQ_HOST_BUF: dict = {}   # path -> {"fh","mm","addr","size","registered"}
 _SEQ_STAGE: dict = {}      # (boot_nonce, lane_file) -> {"ptr","size","device","ops"}
 _SEQ_CACHE_LOCK = __import__("threading").Lock()
@@ -2575,7 +2621,6 @@ def run_sequential_units(descs, ops, boot_nonce: str, *,
     xsn36/37-Lehre: eine Wait ohne Aliveness-Pruefung verwandelt den
     Deadlock in Schweigen). Fail-open.
     """
-    import faulthandler  # noqa: PLC0415
     import hashlib  # noqa: PLC0415
     import json as _json  # noqa: PLC0415
     import time as _time  # noqa: PLC0415
@@ -2782,85 +2827,96 @@ def run_sequential_units(descs, ops, boot_nonce: str, *,
         # + digest.  Everything between them is the piece loop's own body.
         log(f"WEG2-SEQ mapped lane={lane_key} phase={phase} bytes={total_bytes} "
             f"units={len(_batch.pieces)} path={path}")
-        for i, piece in enumerate(_batch.pieces):
-            desc = descs[piece.desc_index]
-            # #1378 xsn53: the window's offset is the PIECE'S OWN slot_off from
-            # the shared batch derivation -- not a rank, not a card, not a unit
-            # index.  The semaphore's id comes from the lane key above.
-            window_off = int(piece.slot_off)
-            name = getattr(desc, "param_name", "?")
-            tag = getattr(desc, "tag", "")
-            nbytes = int(piece.nbytes)
-            label = (f"piece {i} {name!r} tag={tag!r} nbytes={nbytes} "
-                     f"window={window_off}")
+        # Order point 2: batched syncs (see `seq_sync_batch`). The unit loop
+        # keeps every witness of the per-unit form -- identity by name, the
+        # transport digest, NO-WRITE, the placement digest, one `full` per
+        # unit -- and moves only the `synchronize` to the batch boundary.
+        # DEPOSIT: copies of a batch queued, ONE sync, then digest+record+post
+        # per unit (the post is what licenses the collect to read the window,
+        # so it can only follow the sync). COLLECT: per unit wait+record+
+        # identity+digest, copy queued; ONE sync per batch; then the placement
+        # witness per unit (it reads the destination, so only after the sync).
+        _bat_bytes, _bat_units = seq_sync_batch()
+        _groups = _sync_groups(_batch.pieces, _bat_bytes, _bat_units)
+        _n_sync = 0
+        _first_done = False
+        for _grp in _groups:
             if phase == PHASE_DEPOSIT:
-                if desc.src_ptr is None:
-                    return (f"deposit at piece {i} {name!r}: the desc carries no "
-                            f"src_ptr -- this rank does not hold the bytes this "
-                            f"lane says it moves")
-                src_ptr = int(desc.src_ptr) + int(piece.src_off)
-                t0 = _time.perf_counter()
-                # #1378 xsn44: the D2H copy -- from the VRAM source into the
-                # shared buffer at this piece's offset, the SAME pitch arithmetic
-                # the lane form runs (a STRIDED2D piece compacts on the way in).
-                _buf_addr = (_ipc_base + window_off) if _ipc_base else (base_addr + window_off)
+                _issued = []
                 _tc0 = time.perf_counter()
-                if piece.kind == tp.FLAT:
-                    ops.memcpy_async(_buf_addr, src_ptr, nbytes, stream)
-                else:
-                    ops.memcpy2d_async(_buf_addr, int(piece.run_bytes), src_ptr,
-                                       int(piece.spitch), int(piece.run_bytes),
-                                       int(piece.rows), stream)
+                for i in _grp:
+                    piece = _batch.pieces[i]
+                    desc = descs[piece.desc_index]
+                    window_off = int(piece.slot_off)
+                    name = getattr(desc, "param_name", "?")
+                    tag = getattr(desc, "tag", "")
+                    nbytes = int(piece.nbytes)
+                    if desc.src_ptr is None:
+                        return (f"deposit at piece {i} {name!r}: the desc carries no "
+                                f"src_ptr -- this rank does not hold the bytes this "
+                                f"lane says it moves")
+                    src_ptr = int(desc.src_ptr) + int(piece.src_off)
+                    # the D2H (or D2D staging) copy into this piece's window,
+                    # the SAME pitch arithmetic the lane form runs
+                    _buf_addr = (_ipc_base + window_off) if _ipc_base else (base_addr + window_off)
+                    if piece.kind == tp.FLAT:
+                        ops.memcpy_async(_buf_addr, src_ptr, nbytes, stream)
+                    else:
+                        ops.memcpy2d_async(_buf_addr, int(piece.run_bytes), src_ptr,
+                                           int(piece.spitch), int(piece.run_bytes),
+                                           int(piece.rows), stream)
+                    _issued.append((i, window_off, name, tag, nbytes))
                 ops.synchronize(stream)
+                _n_sync += 1
                 _t_copy += time.perf_counter() - _tc0
-                digest = (hashlib.sha256(
-                    bytes(buf[window_off:window_off + nbytes])).hexdigest()[:16]
-                    if (_digest_on and not _ipc_base) else "")
-                # weg2xsn91: no reload of the file per unit (192 x load+dump
-                # of a growing JSON); the tag's records live in memory and
-                # the file is replaced atomically after each unit.
-                recs = _dep_recs
-                recs[str(i)] = {"name": name, "tag": tag, "digest": digest, "ipc": _ipc_hex,
-                                "nbytes": nbytes}
-                # weg2xsn90: ATOMIC -- a collector that read this file mid-
-                # rewrite got `{}` (ValueError -> empty), skipped every guard
-                # and, with the on-card IPC staging, copied the never-written
-                # host buffer into layer 0 (2 pieces moved, W90).
-                _tr0 = time.perf_counter()
-                # weg2xsn111: ONE SMALL FILE PER UNIT (atomic tmp+rename) --
-                # re-dumping the growing per-lane JSON for every unit was
-                # ~290 of a 2 GB lane's ~420 ms deposit (record_ms).
-                _upath = f"{dpath}.u{i}"
-                _tmp = _upath + ".tmp"
-                with open(_tmp, "w") as fh:
-                    _json.dump(recs[str(i)], fh)
-                os.replace(_tmp, _upath)
-                _t_rec += time.perf_counter() - _tr0
-                # #1378 xsn53: THE LANE'S OWN TOKEN.  One full per unit on the
-                # lane's resolved handshake; the deposit posts, the collect
-                # consumes.  A cross lane posts the CROSS family, a diagonal lane
-                # the DIAGONAL family -- never the unit index, never a literal.
-                if _is_diagonal:
-                    sems.diagonal_post(int(card), _SEQ_SLOT, "full")
-                else:
-                    sems.post(int(pair), _SEQ_SLOT, "full")
-                log(f"WEG2-SEQ deposit {label} digest={digest} "
-                    f"ms={(_time.perf_counter()-t0)*1000:.1f}")
-                if i == 0:
-                    # #1378 xsn55: the SECOND marker of the same interval -- if
-                    # this line prints and the collect still never sees a full,
-                    # the block is past the first piece, in the loop's own wait.
-                    log(f"WEG2-SEQ first-piece-done lane={lane_key} phase={phase} "
+                for (i, window_off, name, tag, nbytes) in _issued:
+                    t0 = _time.perf_counter()
+                    digest = (hashlib.sha256(
+                        bytes(buf[window_off:window_off + nbytes])).hexdigest()[:16]
+                        if (_digest_on and not _ipc_base) else "")
+                    recs = _dep_recs
+                    recs[str(i)] = {"name": name, "tag": tag, "digest": digest, "ipc": _ipc_hex,
+                                    "nbytes": nbytes}
+                    # weg2xsn90/xsn111: ONE SMALL FILE PER UNIT, atomic
+                    # tmp+rename -- the collector reads it after the `full`.
+                    _tr0 = time.perf_counter()
+                    _upath = f"{dpath}.u{i}"
+                    _tmp = _upath + ".tmp"
+                    with open(_tmp, "w") as fh:
+                        _json.dump(recs[str(i)], fh)
+                    os.replace(_tmp, _upath)
+                    _t_rec += time.perf_counter() - _tr0
+                    # #1378 xsn53: THE LANE'S OWN TOKEN, one full per unit on
+                    # the lane's resolved handshake -- after the sync above.
+                    if _is_diagonal:
+                        sems.diagonal_post(int(card), _SEQ_SLOT, "full")
+                    else:
+                        sems.post(int(pair), _SEQ_SLOT, "full")
+                    log(f"WEG2-SEQ deposit piece {i} {name!r} tag={tag!r} "
+                        f"nbytes={nbytes} window={window_off} digest={digest} "
                         f"ms={(_time.perf_counter()-t0)*1000:.1f}")
-            else:
+                    if not _first_done:
+                        _first_done = True
+                        # #1378 xsn55: the SECOND marker of the mapping interval.
+                        log(f"WEG2-SEQ first-piece-done lane={lane_key} phase={phase} "
+                            f"ms={(_time.perf_counter()-_t_lane0)*1000:.1f}")
+                continue
+            # ---- COLLECT ----
+            _issued = []
+            for i in _grp:
+                piece = _batch.pieces[i]
+                desc = descs[piece.desc_index]
+                window_off = int(piece.slot_off)
+                name = getattr(desc, "param_name", "?")
+                tag = getattr(desc, "tag", "")
+                nbytes = int(piece.nbytes)
+                label = (f"piece {i} {name!r} tag={tag!r} nbytes={nbytes} "
+                         f"window={window_off}")
                 _tw0 = time.perf_counter()
                 deadline = _time.monotonic() + float(budget_s)
                 got = False
                 while _time.monotonic() < deadline:
                     # weg2xsn91: BLOCK on the semaphore in 0.2 s slices
-                    # instead of trywait + sleep(0.05) -- that poll cost up
-                    # to 50 ms per unit, ~5-10 s per 192-unit lane, and was
-                    # the reason a 2 GB on-card lane took ~2 s D2D.
                     if _is_diagonal:
                         _got = sems.diagonal_timedwait(int(card), _SEQ_SLOT,
                                                        "full", 0.2)
@@ -2881,9 +2937,8 @@ def run_sequential_units(descs, ops, boot_nonce: str, *,
                         extra=f"unit {i} {name!r} budget={budget_s}s")
                     return f"budget expired at unit {i} {name!r}"
                 _t_wait += time.perf_counter() - _tw0
-                # weg2xsn90: the deposit posts `full` only AFTER its record
-                # is written (atomically), so a missing record is a torn read
-                # or a stale file -- wait for it, never proceed on `{}`.
+                # weg2xsn90: the deposit posts `full` only AFTER its record is
+                # written (atomically) -- wait for it, never proceed on `{}`.
                 dep = {}
                 _t_rec0 = time.perf_counter()
                 while True:
@@ -2904,22 +2959,14 @@ def run_sequential_units(descs, ops, boot_nonce: str, *,
                     time.sleep(0.002)
                 _t_rec += time.perf_counter() - _t_rec0
                 if dep.get("ipc") and not _ipc_base:
-                    # the deposit staged on-card: open its handle once, read
-                    # every unit of this lane/tag D2D out of the staging.
+                    # the deposit staged on-card: open its handle once
                     _ipc_base = int(ops.ipc_open_handle(bytes.fromhex(str(dep["ipc"]))))
                     _ipc_opened = True
                     log(f"WEG2-SEQ ipc lane={lane_key} phase=collect opened={int(_ipc_base)} "
                         f"handle={str(dep['ipc'])[:16]}..")
-                # weg2xsn84 (#1378): THE RECORD NAMES THE TENSOR, SO CHECK IT.
-                # The per-unit digest alone cannot tell "the deposit's bytes
-                # arrived intact" from "the deposit is a DIFFERENT tag's
-                # unit i": D collected PP0's weights_4 units 0..173 into
-                # weights_0's tensors with every digest 'matching', because
-                # the source paused in the interleaved order and the
-                # destination resumed in the natural one. A unit whose
-                # record names another tensor is the pause/resume orders
-                # diverging, refused BEFORE the copy-out -- silent wrong
-                # bytes is the one shape this transport must never produce.
+                # weg2xsn84 (#1378): THE RECORD NAMES THE TENSOR, SO CHECK IT --
+                # a unit whose record names another tensor is the pause/resume
+                # orders diverging, refused BEFORE the copy-out.
                 _dep_name = str(dep.get("name", "") or "")
                 _dep_tag = str(dep.get("tag", "") or "")
                 _my_tag = str(getattr(desc, "tag", "") or "")
@@ -2938,8 +2985,6 @@ def run_sequential_units(descs, ops, boot_nonce: str, *,
                             f"buffer, per-tag lockstep #1374); refused before "
                             f"the copy-out")
                 dep_digest = str(dep.get("digest", ""))
-                # The deposit decides (its record carries a digest or not);
-                # an empty record digest means the witness is off there.
                 my_digest = (hashlib.sha256(
                     bytes(buf[window_off:window_off + nbytes])).hexdigest()[:16]
                     if dep_digest else "off")
@@ -2952,8 +2997,7 @@ def run_sequential_units(descs, ops, boot_nonce: str, *,
                             f"deposit={dep_digest} collect={my_digest}")
                 if no_write and (str(getattr(desc, "tag", "") or ""),
                                  str(name)) in no_write:
-                    # weg2xsn86: consumed (handshake, identity, transport
-                    # digest all held above), NOT written -- see `no_write`.
+                    # weg2xsn86: consumed, NOT written -- see `no_write`.
                     log(f"WEG2-SEQ collect piece {i} {name!r} "
                         f"tag={getattr(desc, 'tag', '')!r} digest={my_digest} "
                         f"matches deposit NO-WRITE: a MEASURED target share on "
@@ -2965,55 +3009,13 @@ def run_sequential_units(descs, ops, boot_nonce: str, *,
                             f"this lane says it fills")
                 dst_ptr = int(desc.dst_ptr) + int(piece.dst_off)
                 _buf_addr = (_ipc_base + window_off) if _ipc_base else (base_addr + window_off)
-                # #1378 xsn57: THE NUMBERS BEFORE THE FIRST COPY-OUT, because
-                # weg2xsn56 died here with a SIGSEGV and left NOTHING to read.
-                # P rank0's last line was `WEG2-SEQ mapped ... bytes=1968338488
-                # units=114`; the next line would have been `WEG2-SEQ collect` 4
-                # seconds later and never came, so the whole window between the
-                # mapping and the first byte was dark. The deposit side already
-                # has `first-piece-done`; the collect side had no equivalent.
-                # ONE line, only for piece 0, so a 114-piece lane costs one row:
-                # if the next boot segfaults again, these five numbers say whether
-                # the destination pointer, the window offset or the length is the
-                # one out of range -- none of which a traceback-less SIGSEGV tells.
-                # #1378 xsn59: EVERY PIECE, not just the first -- and the reason is
-                # measured. xsn58 logged `collect-first` at 05:40:47 and died at
-                # 05:40:49: TWO SECONDS LATER, so the first piece (10 KB) copies
-                # FINE and the fault is in a LATER one. A marker on piece 0 alone
-                # cannot name it. `stale_dst=0` on all three lanes in the same boot
-                # also refuted the stale-pointer theory, so the surviving question
-                # is purely WHICH piece -- and that is an index, not a hypothesis.
-                #
-                # 114 rows for the widest lane is the price of naming it; the fields
-                # are kept short for that reason. The log may lose the very last
-                # row to the SIGSEGV (the handler never runs), so read the highest
-                # index that ARRIVED as "died at i or i+1", never as exact.
-                # `src` is back on the line: I cut it in xsn59 to keep the row short
-                # and thereby removed the one number that lets the H2D SOURCE be
-                # checked against the mapping base -- named as my own mistake in the
-                # record rather than quietly restored.
+                # #1378 xsn57/xsn59: the numbers BEFORE the copy-out, every
+                # piece, so a traceback-less SIGSEGV still names its piece.
                 log(f"WEG2-SEQ cf lane={lane_key} i={i}/{len(_batch.pieces)} "
                     f"dst={int(dst_ptr)} src={int(_buf_addr)} base={int(base_addr)} "
                     f"off={window_off} n={nbytes} k={piece.kind} nm={name!r}")
-                # #1378 xsn61: ASK THE DRIVER WHETHER IT KNOWS THIS ADDRESS, before
-                # the copy that dies on it.  Six hypotheses are measured and gone
-                # (offset/length, stale pointer, remap order, source lazy-mapping,
-                # mmap lifetime, host pin -- xsn60 logged `registered=yes` on all
-                # three lanes and still took the SIGSEGV), so the only survivor is
-                # that `dst` is not a writable device address IN THIS PROCESS. The
-                # boot forces `SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS=1`, so every
-                # scheduler sees exactly one GPU as cuda:0 and an address valid in
-                # another device's context is dead here -- while the address book
-                # still hands it over as a NUMBER, because a number always resolves.
-                #
-                # `cudaPointerGetAttributes` is a READ: it returns
-                # cudaErrorInvalidValue for an address the driver does not know
-                # instead of faulting, so this cannot add a crash of its own. Taken
-                # from the ALREADY-LOADED runtime (`CDLL(None)`, torch has it in
-                # process) rather than by dlopen'ing a second copy, and wrapped
-                # whole -- a diagnostic that can break the path it diagnoses is
-                # worse than none.
                 if i == 0:
+                    # #1378 xsn61: ask the driver whether it knows the address
                     _drc, _dty, _ddev = ptr_attrs(int(dst_ptr))
                     _src, _sty, _sdev = ptr_attrs(int(_buf_addr))
                     log(f"WEG2-SEQ ptrattr lane={lane_key} "
@@ -3027,14 +3029,17 @@ def run_sequential_units(descs, ops, boot_nonce: str, *,
                     ops.memcpy2d_async(int(dst_ptr), int(piece.dpitch), _buf_addr,
                                        int(piece.run_bytes), int(piece.run_bytes),
                                        int(piece.rows), stream)
-                ops.synchronize(stream)
                 _t_copy += time.perf_counter() - _tc0
+                _issued.append((i, name, int(dst_ptr), nbytes, dep_digest, my_digest, label))
+            if _issued:
+                _tc0 = time.perf_counter()
+                ops.synchronize(stream)
+                _n_sync += 1
+                _t_copy += time.perf_counter() - _tc0
+            for (i, name, dst_ptr, nbytes, dep_digest, my_digest, label) in _issued:
                 if dst_digest_fn is not None:
                     # #1378 xsn44 (the PLACEMENT witness): what LANDED at this
-                    # destination vs what the deposit recorded. The buffer
-                    # digest proved the transport; this proves the placement.
-                    # The swapped-destination mutant passes the buffer digest
-                    # green-falsely and dies HERE.
+                    # destination vs what the deposit recorded -- after the sync.
                     dst_digest = dst_digest_fn(int(dst_ptr), nbytes)
                     if dep_digest and dst_digest != dep_digest:
                         dump_rank_stacks(
@@ -3046,19 +3051,15 @@ def run_sequential_units(descs, ops, boot_nonce: str, *,
                                   f"destination shape, silent until quality)")
                         return (f"placement mismatch at unit {i} {name!r}: "
                                 f"deposit={dep_digest} destination={dst_digest}")
-                # NO `empty` POST HERE.  This row (slot 0 of the empty family) is
-                # the per-tag DRAIN the caller drives through
-                # `CrossSlotRendezvous.prime_drain/wait_drained/post_drained`; a
-                # per-unit post would hand the drain counter tokens that release
-                # the NEXT tag's deposit before this tag has been read -- the
-                # exact return of the per-band claim that
-                # test_the_per_band_claim_cannot_return pins as absent.
+                # NO `empty` POST HERE -- the per-tag DRAIN is the caller's
+                # (`CrossSlotRendezvous.prime_drain/wait_drained/post_drained`).
                 log(f"WEG2-SEQ collect {label} digest={my_digest} "
                     f"matches deposit")
         log(f"WEG2-SEQ lane-time lane={lane_key} phase={phase} units={len(_batch.pieces)} "
             f"bytes={total_bytes} total_ms={(time.perf_counter() - _t_lane0) * 1000:.0f} "
             f"wait_ms={_t_wait * 1000:.0f} copy_sync_ms={_t_copy * 1000:.0f} "
-            f"record_ms={_t_rec * 1000:.0f} ipc={'yes' if _ipc_base else 'no'}")
+            f"record_ms={_t_rec * 1000:.0f} ipc={'yes' if _ipc_base else 'no'} "
+            f"syncs={_n_sync} batch={_bat_units}u/{_bat_bytes >> 20}MiB")
         if phase == PHASE_COLLECT and _owns_buf and _seq_mm is not None:
             # #1385's lesson, at this form's own site: the file is freed by the
             # side that reads it LAST (the collect; the deposit's next tag is

@@ -604,3 +604,122 @@ class PersistentBuffersAndOnCardIpc(_TransportHarness):
         self.assertTrue(any("phase=deposit UNAVAILABLE" in ln for ln in self.lines))
         self.assertEqual(self._collect([d]), "")
         self.assertEqual(self.ops.read(dst, n), b"\x44" * n)
+
+
+class _DeferredOps(_MemOps):
+    """Order point 2 (batched syncs): copies are ASYNC for real here -- a
+    `memcpy_async` only queues, the bytes move at `synchronize`. A deposit
+    that digests/records/posts before its sync hashes the unwritten window;
+    a collect that runs the placement witness before its sync reads the old
+    destination. Both mutants die on this ops, the per-unit form and the
+    batched form both pass."""
+
+    def __init__(self):
+        super().__init__()
+        self.pending = []
+        self.syncs = 0
+        self.copies = 0
+
+    def memcpy_async(self, dst, src, nbytes, stream):
+        self.copies += 1
+        self.pending.append(("f", dst, src, nbytes))
+
+    def memcpy2d_async(self, dst, dpitch, src, spitch, run_bytes, rows, stream):
+        self.copies += 1
+        self.pending.append(("2d", dst, dpitch, src, spitch, run_bytes, rows))
+
+    def synchronize(self, stream=0):
+        self.syncs += 1
+        pend, self.pending = self.pending, []
+        for op in pend:
+            if op[0] == "f":
+                _MemOps.memcpy_async(self, op[1], op[2], op[3], stream)
+            else:
+                _MemOps.memcpy2d_async(self, *op[1:], stream)
+
+
+class BatchedSyncsMoveTheBytesAndSyncOncePerBatch(_TransportHarness):
+    """Order point 2: N units, one sync per batch, every witness intact."""
+
+    def _env(self, mib, units):
+        os.environ[bx.SEQ_SYNC_BATCH_MIB_ENV] = str(mib)
+        os.environ[bx.SEQ_SYNC_BATCH_UNITS_ENV] = str(units)
+        self.addCleanup(os.environ.pop, bx.SEQ_SYNC_BATCH_MIB_ENV, None)
+        self.addCleanup(os.environ.pop, bx.SEQ_SYNC_BATCH_UNITS_ENV, None)
+
+    def _run(self, n_units=10, nbytes=256):
+        self.ops = _DeferredOps()
+        descs, payloads = [], []
+        for i in range(n_units):
+            src, dst = self._vram_pair(nbytes, i)
+            data = bytes([(i * 7 + 3) % 251]) * nbytes
+            self.ops.write(src, data)
+            payloads.append((dst, data))
+            descs.append(_desc(f"u{i}", nbytes, src_ptr=src, dst_ptr=dst))
+        self.assertEqual(self._deposit(descs), "")
+        dep_syncs = self.ops.syncs
+        self.assertEqual(self._collect(descs, dst_digest_fn=self.ops.digest), "")
+        col_syncs = self.ops.syncs - dep_syncs
+        for dst, data in payloads:
+            self.assertEqual(self.ops.read(dst, nbytes), data)
+        return dep_syncs, col_syncs
+
+    def test_units_batch_bound_gives_ceil_n_over_k_syncs(self):
+        self._env(1024, 4)
+        dep, col = self._run(n_units=10)
+        self.assertEqual((dep, col), (3, 3))
+        lt = [l for l in self.lines if "lane-time" in l]
+        self.assertTrue(any("syncs=3 batch=4u/1024MiB" in l for l in lt), lt)
+
+    def test_bytes_batch_bound_closes_the_batch(self):
+        # 4096-byte units, batch bound 1 MiB -> 256 units per batch; 10 units
+        # fit one batch; with 1 MiB and 300 units the bound is 256.
+        self._env(1, 4096)
+        dep, col = self._run(n_units=10)
+        self.assertEqual((dep, col), (1, 1))
+
+    def test_units_one_is_the_per_unit_form(self):
+        self._env(1024, 1)
+        dep, col = self._run(n_units=6)
+        self.assertEqual((dep, col), (6, 6))
+
+    def test_mutant_post_before_sync_dies_on_the_transport_digest(self):
+        """MUTANT: the deposit digests/posts before the batch sync. With
+        async copies the deposit hashes an unwritten window and the collect
+        (after the deposit's later sync) hashes the real bytes -> refusal."""
+        self._env(1024, 4)
+        real_sync = _DeferredOps.synchronize
+
+        class _LateSyncOps(_DeferredOps):
+            def synchronize(self, stream=0):
+                # the mutant: the deposit's sync does nothing until the
+                # collect side's first sync (models "post before sync")
+                if not getattr(self, "_late", False):
+                    self.syncs += 1
+                    return None
+                return real_sync(self, stream)
+
+        self.ops = _LateSyncOps()
+        descs = []
+        for i in range(6):
+            src, dst = self._vram_pair(256, i)
+            self.ops.write(src, bytes([i + 1]) * 256)
+            descs.append(_desc(f"m{i}", 256, src_ptr=src, dst_ptr=dst))
+        self.assertEqual(self._deposit(descs), "")
+        self.ops._late = True
+        self.ops.pending, self.ops.pending_dep = [], self.ops.pending
+        # flush the deposit's copies now (as if its sync had been late)
+        for op in self.ops.pending_dep:
+            _MemOps.memcpy_async(self.ops, op[1], op[2], op[3], 0)
+        verdict = self._collect(descs, dst_digest_fn=self.ops.digest)
+        self.assertIn("digest mismatch", verdict)
+
+
+class SyncGroupsAreDeterministic(unittest.TestCase):
+    def test_groups_close_on_units_or_bytes(self):
+        from types import SimpleNamespace as NS
+        pieces = [NS(nbytes=n) for n in (10, 10, 10, 50, 10, 10)]
+        self.assertEqual(bx._sync_groups(pieces, 25, 100), [[0, 1], [2], [3], [4, 5]])
+        self.assertEqual(bx._sync_groups(pieces, 10**9, 2), [[0, 1], [2, 3], [4, 5]])
+        self.assertEqual(bx._sync_groups(pieces, 10**9, 1), [[i] for i in range(6)])
+        self.assertEqual(bx._sync_groups([], 1, 1), [])
