@@ -216,5 +216,67 @@ class Mutant2PlacementSwappedDestinationsDie(_TransportHarness):
                       f"witness: {rc!r}")
 
 
+class LaneBufferIsTheLanesOwnSum(_TransportHarness):
+    """#1378 xsn56 -- THE LANE'S BUFFER IS THE LANE'S OWN SUM.
+
+    Operator order 2026-09-15: *"er limitiert die groesse des ringpuffers wohl
+    immernoch."*  Boot weg2xsn55 refused with ``the lane's bytes do not fit one
+    buffer (slot_bytes=756323776 produced 3 batches)``: the call site handed
+    over ``terms.buffer_bytes``, which prices the WIDEST SINGLE LAYER, while a
+    PP-form lane carries a whole band (114 descs, ~2.16 GiB measured).
+
+    **WHY THE EXISTING TESTS COULD NOT CATCH IT:** every one of them passes
+    ``slot_bytes=1 << 30`` -- a generous constant that is neither the priced
+    number nor the lane's sum, so the harness never ran the production value.
+    A fixture that is roomier than production is green by vacancy; this test
+    drives BOTH real numbers instead.
+    """
+
+    #: Sizes stay inside the harness's 512-byte address stride
+    #: (``_vram_pair`` hands out ``0x1000 + i * 512``): a 4096-byte piece made
+    #: piece 1's window overlap piece 0's and aborted the process inside
+    #: ``hook`` -- my own fixture defect, found by running it.  The property
+    #: under test needs only ``sum > widest``, not large numbers.
+    _SIZES = (128, 128, 128)
+
+    def _band(self):
+        descs = []
+        for i, n in enumerate(self._SIZES):
+            src, dst = self._vram_pair(n, i)
+            self.ops.write(src, bytes([0xB0 + i]) * n)
+            descs.append(_desc(f"band{i}", n, src_ptr=src, dst_ptr=dst))
+        return descs
+
+    def test_the_old_pricing_dies_and_the_lane_sum_carries(self):
+        widest, lane_sum = max(self._SIZES), sum(self._SIZES)
+        self.assertGreater(lane_sum, widest, "fixture must model a BAND")
+        # ONE set of descriptors for both calls: `_band` hooks its windows, and
+        # hooking the same address twice aborts the process.
+        descs = self._band()
+
+        # THE DYING MUTANT -- the shipped call site's number until xsn56.  The
+        # refusal is raised before any semaphore is posted, so the second call
+        # below starts from an untouched handshake.
+        with self.assertRaises(ValueError) as caught:
+            bx.run_sequential_units(
+                descs, self.ops, self.nonce, slot_bytes=widest,
+                shm_root=self.root, phase=bx.PHASE_DEPOSIT,
+                log=self.lines.append, card=1)
+        self.assertIn("do not fit one buffer", str(caught.exception))
+
+        # THE PRODUCTION FORM -- the lane's own sum.  `batch_descs` packs
+        # byte-exactly, so the sum is the exact lower bound for one batch:
+        # one fewer byte must already fail, which the mutant above shows.
+        self.lines.clear()
+        out = bx.run_sequential_units(
+            descs, self.ops, self.nonce, slot_bytes=lane_sum,
+            shm_root=self.root, phase=bx.PHASE_DEPOSIT,
+            log=self.lines.append, card=1)
+        self.assertNotIn("no units", str(out))
+        self.assertTrue(
+            any(f"slot_bytes={lane_sum}" in ln for ln in self.lines),
+            f"the lane line must carry its buffer size: {self.lines!r}")
+
+
 if __name__ == "__main__":
     unittest.main()

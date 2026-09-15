@@ -4845,11 +4845,38 @@ class SchedulerWeightUpdaterManager:
                             # and no handshake to meet.  Continuing would
                             # post a token nobody's peer waits for.
                             continue
+                        # #1378 xsn56 -- THE LANE'S BUFFER IS THE LANE'S OWN
+                        # SUM, not the priced single slot.  Operator order
+                        # 2026-09-15: "er limitiert die groesse des
+                        # ringpuffers wohl immernoch."
+                        #
+                        # `terms.buffer_bytes` prices the WIDEST SINGLE LAYER
+                        # (756323776 B = 721 MiB at depth=1).  A PP-form lane
+                        # carries a whole BAND -- 114 descs, ~2.16 GiB on
+                        # weg2xsn55 -- so `batch_descs` cut it into 3 batches
+                        # and this form refuses that by construction: one
+                        # handshake, one buffer.  `slot_bytes` means the
+                        # LANE'S BUFFER SIZE here and the PRICING slot size in
+                        # `bounce_terms`; two meanings, one name, and the
+                        # caller was handing over the wrong one.
+                        #
+                        # THE SUM IS EXACT, not an estimate: `batch_descs`
+                        # packs byte-exactly (FLAT `take = min(room,
+                        # remaining)`, STRIDED2D `cur_bytes += take * run`)
+                        # with no alignment padding, so a slot equal to the
+                        # sum yields exactly one batch and the buffer is then
+                        # sized from `_batch.total_bytes`, not from this
+                        # number.  Funding, measured 2026-09-15: /dev/shm 63
+                        # GiB with 62 free, and the host ring this replaces
+                        # was 43.83 GiB -- the transient buffer is the
+                        # mechanism that keeps the dormant image OFF the host,
+                        # so it is the cheap half of the trade.
+                        _lane_bytes = sum(int(getattr(d, "nbytes", 0) or 0)
+                                          for d in _lane_descs)
                         last = bx.run_sequential_units(
                             _lane_descs, ops, boot_nonce,
                             shm_root=root, device=device, phase=phase,
-                            slot_bytes=int(getattr(terms, "buffer_bytes", 0)
-                                           or 0) or xr.SLOT_BYTES,
+                            slot_bytes=_lane_bytes or xr.SLOT_BYTES,
                             pair=None if pair is None else int(pair),
                             card=(None if pair is not None else
                                   int(getattr(group[0], "dst_rank", device))),

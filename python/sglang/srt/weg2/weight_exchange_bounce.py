@@ -2309,8 +2309,13 @@ def run_sequential_units(descs, ops, boot_nonce: str, *,
         resolved_full = xr.diagonal_sem_name(boot_nonce, int(card), _SEQ_SLOT,
                                              "full")
         _is_diagonal = True
+    # #1378 xsn56: `slot_bytes` ON THE LINE, because it became a per-lane
+    # magnitude rather than a boot-wide constant.  The caller now hands the
+    # lane's OWN byte sum (operator order 2026-09-15), so this is the number a
+    # reader needs to price /dev/shm against -- and the one that made
+    # weg2xsn55's "3 batches" refusal readable only from a traceback.
     log(f"WEG2-SEQ lane={lane_key} phase={phase} handshake={resolved_full} "
-        f"descs={len(descs)} slot={_SEQ_SLOT}")
+        f"descs={len(descs)} slot={_SEQ_SLOT} slot_bytes={int(slot_bytes)}")
 
     # THE PIECES, DERIVED IDENTICALLY ON BOTH SIDES.  ``batch_descs`` is the
     # one producer of the slot layout the lane form already used: deterministic
