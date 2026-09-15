@@ -4411,14 +4411,28 @@ class SchedulerWeightUpdaterManager:
                       if (d.src_ptr is None if is_source_hook
                           else d.dst_ptr is None)]
         if unresolved:
+            # #1378 xsn71: ALL the names, and what the book HOLDS for this
+            # region on this rank -- "first: fc.weight" could not say whether
+            # the draft runner was missing from the table, filed under another
+            # region, or named differently (D rank 0: 10 of 19 unresolved
+            # while its own weights_draft manifest listed every one of them).
+            try:
+                _region = xm.region_of_tag(tag)
+                _have = sorted(n for (r, n) in self._weg2_rank_param_table()
+                               if r == _region)
+                _book = (f" book[{_region}]={len(_have)} names, first: "
+                         f"{_have[:6]}; regions in book: "
+                         f"{sorted({r for (r, _n) in self._weg2_rank_param_table()})}")
+            except BaseException as _bexc:  # noqa: BLE001
+                _book = f" book=NOT-READABLE({type(_bexc).__name__})"
             raise wx.Weg2XchgPlanDisagree(
                 f"W68 Weg2XchgPlanDisagree: lane src={src_card} dst={dst_card} "
                 f"tag={tag!r}: {len(unresolved)} of {len(out)} descs have no "
                 f"address on the side this rank owns (first: "
-                f"{unresolved[0]}) -- the address book answered None, which "
-                f"means this rank does not hold the bytes the lane says it "
-                f"moves.  Copying them would move garbage; refusing names the "
-                f"first tensor instead")
+                f"{unresolved[0]}; all: {unresolved}) -- the address book "
+                f"answered None, which means this rank does not hold the bytes "
+                f"the lane says it moves.  Copying them would move garbage; "
+                f"refusing names the tensors instead.{_book}")
         return out
 
     def _weg2_owned_name_keys(self) -> set:

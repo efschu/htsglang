@@ -785,6 +785,18 @@ class CudartDeviceOps(DeviceOps):
     def _check(self, rc: int, what: str) -> None:
         if int(rc) != 0:
             msg = self.lib.cudaGetErrorString(int(rc))
+            # #1378 xsn71: a failed runtime call leaves its code LATCHED in the
+            # calling thread's last-error slot; the next torch op that polls
+            # cudaGetLastError then throws it as an AcceleratorError ("CUDA
+            # error: part or all of the requested memory range is already
+            # mapped") far from the call that failed -- P ranks 0 and 2 died
+            # that way in resume_memory_occupation after a refused
+            # cudaHostRegister. The exception below already carries the code;
+            # reading the slot clears it, so the failure is reported ONCE, here.
+            try:
+                self.lib.cudaGetLastError()
+            except Exception:  # noqa: BLE001 -- a missing symbol on a fake
+                pass
             raise RuntimeError(
                 f"{what} rc={rc} {msg.decode() if msg else '?'} "
                 f"(libcudart={self.path})"

@@ -2514,238 +2514,240 @@ def run_sequential_units(descs, ops, boot_nonce: str, *,
             _seq_mm.close()
             _fh.close()
             return _reg_refusal
-    sems = tp.SemSet(boot_nonce)
-    # The lane the lane-form ran its copies on, or the default stream when the
-    # device ops do not expose stream creation (the desk fakes).
     try:
-        stream = ops.create_stream(device)
-    except Exception:  # noqa: BLE001 -- a copy stream is an optimisation
-        stream = 0
-    base_addr = _mmap_addr(buf) if _seq_mm is not None else 0
-    # #1378 xsn55 (WO DER DEPOSIT STEHT): xsn55's diagonal lane blocked with
-    # NO c0 buffer file and NO c0 digest json, while both cross lanes wrote
-    # buffers and digests immediately -- so the block was between the lane
-    # line above and the first piece's digest write.  Two lines make that
-    # interval readable on the metal instead of inferred: one after the
-    # mapping (with the lane's byte size), one after the FIRST piece's copy
-    # + digest.  Everything between them is the piece loop's own body.
-    log(f"WEG2-SEQ mapped lane={lane_key} phase={phase} bytes={total_bytes} "
-        f"units={len(_batch.pieces)} path={path}")
-    for i, piece in enumerate(_batch.pieces):
-        desc = descs[piece.desc_index]
-        # #1378 xsn53: the window's offset is the PIECE'S OWN slot_off from
-        # the shared batch derivation -- not a rank, not a card, not a unit
-        # index.  The semaphore's id comes from the lane key above.
-        window_off = int(piece.slot_off)
-        name = getattr(desc, "param_name", "?")
-        tag = getattr(desc, "tag", "")
-        nbytes = int(piece.nbytes)
-        label = (f"piece {i} {name!r} tag={tag!r} nbytes={nbytes} "
-                 f"window={window_off}")
-        if phase == PHASE_DEPOSIT:
-            if desc.src_ptr is None:
-                return (f"deposit at piece {i} {name!r}: the desc carries no "
-                        f"src_ptr -- this rank does not hold the bytes this "
-                        f"lane says it moves")
-            src_ptr = int(desc.src_ptr) + int(piece.src_off)
-            t0 = _time.perf_counter()
-            # #1378 xsn44: the D2H copy -- from the VRAM source into the
-            # shared buffer at this piece's offset, the SAME pitch arithmetic
-            # the lane form runs (a STRIDED2D piece compacts on the way in).
-            _buf_addr = base_addr + window_off
-            if piece.kind == tp.FLAT:
-                ops.memcpy_async(_buf_addr, src_ptr, nbytes, stream)
-            else:
-                ops.memcpy2d_async(_buf_addr, int(piece.run_bytes), src_ptr,
-                                   int(piece.spitch), int(piece.run_bytes),
-                                   int(piece.rows), stream)
-            ops.synchronize(stream)
-            digest = hashlib.sha256(
-                bytes(buf[window_off:window_off + nbytes])).hexdigest()[:16]
-            recs = {}
-            if os.path.exists(dpath):
-                try:
-                    recs = _json.load(open(dpath))
-                except ValueError:
-                    recs = {}
-            recs[str(i)] = {"name": name, "tag": tag, "digest": digest,
-                            "nbytes": nbytes}
-            with open(dpath, "w") as fh:
-                _json.dump(recs, fh)
-            # #1378 xsn53: THE LANE'S OWN TOKEN.  One full per unit on the
-            # lane's resolved handshake; the deposit posts, the collect
-            # consumes.  A cross lane posts the CROSS family, a diagonal lane
-            # the DIAGONAL family -- never the unit index, never a literal.
-            if _is_diagonal:
-                sems.diagonal_post(int(card), _SEQ_SLOT, "full")
-            else:
-                sems.post(int(pair), _SEQ_SLOT, "full")
-            log(f"WEG2-SEQ deposit {label} digest={digest} "
-                f"ms={(_time.perf_counter()-t0)*1000:.1f}")
-            if i == 0:
-                # #1378 xsn55: the SECOND marker of the same interval -- if
-                # this line prints and the collect still never sees a full,
-                # the block is past the first piece, in the loop's own wait.
-                log(f"WEG2-SEQ first-piece-done lane={lane_key} phase={phase} "
-                    f"ms={(_time.perf_counter()-t0)*1000:.1f}")
-        else:
-            deadline = _time.monotonic() + float(budget_s)
-            got = False
-            while _time.monotonic() < deadline:
-                if _is_diagonal:
-                    _got = sems.diagonal_timedwait(int(card), _SEQ_SLOT,
-                                                   "full", 0.0)
-                else:
-                    _got = sems.timedwait(int(pair), _SEQ_SLOT, "full", 0.0)
-                if _got:
-                    got = True
-                    break
-                if liveness is not None and not liveness():
-                    dump_rank_stacks(
-                        "PeerGone-seq", tag=str(name), rank=int(window_off),
-                        extra=f"unit {i} {name!r} -- the deposit peer is "
-                              f"gone while the collect waited")
-                    return f"PeerGone at unit {i} {name!r}"
-                _time.sleep(0.05)
-            if not got:
-                dump_rank_stacks(
-                    "budget-expired-seq", tag=str(name), rank=int(window_off),
-                    extra=f"unit {i} {name!r} budget={budget_s}s")
-                return f"budget expired at unit {i} {name!r}"
-            recs = {}
-            if os.path.exists(dpath):
-                try:
-                    recs = _json.load(open(dpath))
-                except ValueError:
-                    recs = {}
-            dep = recs.get(str(i), {})
-            dep_digest = str(dep.get("digest", ""))
-            my_digest = hashlib.sha256(
-                bytes(buf[window_off:window_off + nbytes])).hexdigest()[:16]
-            if dep_digest and my_digest != dep_digest:
-                dump_rank_stacks(
-                    "digest-mismatch-seq", tag=str(name), rank=int(window_off),
-                    extra=f"unit {i} {name!r} deposit={dep_digest} "
-                          f"collect={my_digest}")
-                return (f"digest mismatch at unit {i} {name!r}: "
-                        f"deposit={dep_digest} collect={my_digest}")
-            if desc.dst_ptr is None:
-                return (f"collect at piece {i} {name!r}: the desc carries no "
-                        f"dst_ptr -- this rank does not hold the destination "
-                        f"this lane says it fills")
-            dst_ptr = int(desc.dst_ptr) + int(piece.dst_off)
-            _buf_addr = base_addr + window_off
-            # #1378 xsn57: THE NUMBERS BEFORE THE FIRST COPY-OUT, because
-            # weg2xsn56 died here with a SIGSEGV and left NOTHING to read.
-            # P rank0's last line was `WEG2-SEQ mapped ... bytes=1968338488
-            # units=114`; the next line would have been `WEG2-SEQ collect` 4
-            # seconds later and never came, so the whole window between the
-            # mapping and the first byte was dark. The deposit side already
-            # has `first-piece-done`; the collect side had no equivalent.
-            # ONE line, only for piece 0, so a 114-piece lane costs one row:
-            # if the next boot segfaults again, these five numbers say whether
-            # the destination pointer, the window offset or the length is the
-            # one out of range -- none of which a traceback-less SIGSEGV tells.
-            # #1378 xsn59: EVERY PIECE, not just the first -- and the reason is
-            # measured. xsn58 logged `collect-first` at 05:40:47 and died at
-            # 05:40:49: TWO SECONDS LATER, so the first piece (10 KB) copies
-            # FINE and the fault is in a LATER one. A marker on piece 0 alone
-            # cannot name it. `stale_dst=0` on all three lanes in the same boot
-            # also refuted the stale-pointer theory, so the surviving question
-            # is purely WHICH piece -- and that is an index, not a hypothesis.
-            #
-            # 114 rows for the widest lane is the price of naming it; the fields
-            # are kept short for that reason. The log may lose the very last
-            # row to the SIGSEGV (the handler never runs), so read the highest
-            # index that ARRIVED as "died at i or i+1", never as exact.
-            # `src` is back on the line: I cut it in xsn59 to keep the row short
-            # and thereby removed the one number that lets the H2D SOURCE be
-            # checked against the mapping base -- named as my own mistake in the
-            # record rather than quietly restored.
-            log(f"WEG2-SEQ cf lane={lane_key} i={i}/{len(_batch.pieces)} "
-                f"dst={int(dst_ptr)} src={int(_buf_addr)} base={int(base_addr)} "
-                f"off={window_off} n={nbytes} k={piece.kind} nm={name!r}")
-            # #1378 xsn61: ASK THE DRIVER WHETHER IT KNOWS THIS ADDRESS, before
-            # the copy that dies on it.  Six hypotheses are measured and gone
-            # (offset/length, stale pointer, remap order, source lazy-mapping,
-            # mmap lifetime, host pin -- xsn60 logged `registered=yes` on all
-            # three lanes and still took the SIGSEGV), so the only survivor is
-            # that `dst` is not a writable device address IN THIS PROCESS. The
-            # boot forces `SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS=1`, so every
-            # scheduler sees exactly one GPU as cuda:0 and an address valid in
-            # another device's context is dead here -- while the address book
-            # still hands it over as a NUMBER, because a number always resolves.
-            #
-            # `cudaPointerGetAttributes` is a READ: it returns
-            # cudaErrorInvalidValue for an address the driver does not know
-            # instead of faulting, so this cannot add a crash of its own. Taken
-            # from the ALREADY-LOADED runtime (`CDLL(None)`, torch has it in
-            # process) rather than by dlopen'ing a second copy, and wrapped
-            # whole -- a diagnostic that can break the path it diagnoses is
-            # worse than none.
-            if i == 0:
-                _drc, _dty, _ddev = ptr_attrs(int(dst_ptr))
-                _src, _sty, _sdev = ptr_attrs(int(_buf_addr))
-                log(f"WEG2-SEQ ptrattr lane={lane_key} "
-                    f"dst_rc={_drc} dst_type={_dty} dst_device={_ddev} "
-                    f"src_rc={_src} src_type={_sty} src_device={_sdev}")
-            if piece.kind == tp.FLAT:
-                ops.memcpy_async(int(dst_ptr), _buf_addr, nbytes, stream)
-            else:
-                # on the way OUT a STRIDED2D piece scatters (spitch = run)
-                ops.memcpy2d_async(int(dst_ptr), int(piece.dpitch), _buf_addr,
-                                   int(piece.run_bytes), int(piece.run_bytes),
-                                   int(piece.rows), stream)
-            ops.synchronize(stream)
-            if dst_digest_fn is not None:
-                # #1378 xsn44 (the PLACEMENT witness): what LANDED at this
-                # destination vs what the deposit recorded. The buffer
-                # digest proved the transport; this proves the placement.
-                # The swapped-destination mutant passes the buffer digest
-                # green-falsely and dies HERE.
-                dst_digest = dst_digest_fn(int(dst_ptr), nbytes)
-                if dep_digest and dst_digest != dep_digest:
-                    dump_rank_stacks(
-                        "placement-mismatch-seq", tag=str(name),
-                        rank=int(window_off),
-                        extra=f"unit {i} {name!r} deposit={dep_digest} "
-                              f"destination={dst_digest} -- the bytes "
-                              f"landed at the wrong place (the swapped-"
-                              f"destination shape, silent until quality)")
-                    return (f"placement mismatch at unit {i} {name!r}: "
-                            f"deposit={dep_digest} destination={dst_digest}")
-            # NO `empty` POST HERE.  This row (slot 0 of the empty family) is
-            # the per-tag DRAIN the caller drives through
-            # `CrossSlotRendezvous.prime_drain/wait_drained/post_drained`; a
-            # per-unit post would hand the drain counter tokens that release
-            # the NEXT tag's deposit before this tag has been read -- the
-            # exact return of the per-band claim that
-            # test_the_per_band_claim_cannot_return pins as absent.
-            log(f"WEG2-SEQ collect {label} digest={my_digest} "
-                f"matches deposit")
-    if phase == PHASE_COLLECT and _owns_buf and _seq_mm is not None:
-        # #1385's lesson, at this form's own site: the file is freed by the
-        # side that reads it LAST (the collect; the deposit's next tag is
-        # gated on this side's drained post).  Unlinking keeps the pages
-        # alive for this process's own mapping and drops them at close.
+        sems = tp.SemSet(boot_nonce)
+        # The lane the lane-form ran its copies on, or the default stream when the
+        # device ops do not expose stream creation (the desk fakes).
         try:
-            os.unlink(path)
-        except OSError:
-            pass
-    if _owns_buf and _seq_mm is not None:
-        # #1378 xsn70: UNREGISTER BEFORE THE MUNMAP, or the driver keeps this
-        # VA range pinned to these pages after they are gone -- the next
-        # lane's mmap reuses the range, its own register fails, and its
-        # copies read the stale pin (see the register site above).
-        if _seq_registered == "yes":
+            stream = ops.create_stream(device)
+        except Exception:  # noqa: BLE001 -- a copy stream is an optimisation
+            stream = 0
+        base_addr = _mmap_addr(buf) if _seq_mm is not None else 0
+        # #1378 xsn55 (WO DER DEPOSIT STEHT): xsn55's diagonal lane blocked with
+        # NO c0 buffer file and NO c0 digest json, while both cross lanes wrote
+        # buffers and digests immediately -- so the block was between the lane
+        # line above and the first piece's digest write.  Two lines make that
+        # interval readable on the metal instead of inferred: one after the
+        # mapping (with the lane's byte size), one after the FIRST piece's copy
+        # + digest.  Everything between them is the piece loop's own body.
+        log(f"WEG2-SEQ mapped lane={lane_key} phase={phase} bytes={total_bytes} "
+            f"units={len(_batch.pieces)} path={path}")
+        for i, piece in enumerate(_batch.pieces):
+            desc = descs[piece.desc_index]
+            # #1378 xsn53: the window's offset is the PIECE'S OWN slot_off from
+            # the shared batch derivation -- not a rank, not a card, not a unit
+            # index.  The semaphore's id comes from the lane key above.
+            window_off = int(piece.slot_off)
+            name = getattr(desc, "param_name", "?")
+            tag = getattr(desc, "tag", "")
+            nbytes = int(piece.nbytes)
+            label = (f"piece {i} {name!r} tag={tag!r} nbytes={nbytes} "
+                     f"window={window_off}")
+            if phase == PHASE_DEPOSIT:
+                if desc.src_ptr is None:
+                    return (f"deposit at piece {i} {name!r}: the desc carries no "
+                            f"src_ptr -- this rank does not hold the bytes this "
+                            f"lane says it moves")
+                src_ptr = int(desc.src_ptr) + int(piece.src_off)
+                t0 = _time.perf_counter()
+                # #1378 xsn44: the D2H copy -- from the VRAM source into the
+                # shared buffer at this piece's offset, the SAME pitch arithmetic
+                # the lane form runs (a STRIDED2D piece compacts on the way in).
+                _buf_addr = base_addr + window_off
+                if piece.kind == tp.FLAT:
+                    ops.memcpy_async(_buf_addr, src_ptr, nbytes, stream)
+                else:
+                    ops.memcpy2d_async(_buf_addr, int(piece.run_bytes), src_ptr,
+                                       int(piece.spitch), int(piece.run_bytes),
+                                       int(piece.rows), stream)
+                ops.synchronize(stream)
+                digest = hashlib.sha256(
+                    bytes(buf[window_off:window_off + nbytes])).hexdigest()[:16]
+                recs = {}
+                if os.path.exists(dpath):
+                    try:
+                        recs = _json.load(open(dpath))
+                    except ValueError:
+                        recs = {}
+                recs[str(i)] = {"name": name, "tag": tag, "digest": digest,
+                                "nbytes": nbytes}
+                with open(dpath, "w") as fh:
+                    _json.dump(recs, fh)
+                # #1378 xsn53: THE LANE'S OWN TOKEN.  One full per unit on the
+                # lane's resolved handshake; the deposit posts, the collect
+                # consumes.  A cross lane posts the CROSS family, a diagonal lane
+                # the DIAGONAL family -- never the unit index, never a literal.
+                if _is_diagonal:
+                    sems.diagonal_post(int(card), _SEQ_SLOT, "full")
+                else:
+                    sems.post(int(pair), _SEQ_SLOT, "full")
+                log(f"WEG2-SEQ deposit {label} digest={digest} "
+                    f"ms={(_time.perf_counter()-t0)*1000:.1f}")
+                if i == 0:
+                    # #1378 xsn55: the SECOND marker of the same interval -- if
+                    # this line prints and the collect still never sees a full,
+                    # the block is past the first piece, in the loop's own wait.
+                    log(f"WEG2-SEQ first-piece-done lane={lane_key} phase={phase} "
+                        f"ms={(_time.perf_counter()-t0)*1000:.1f}")
+            else:
+                deadline = _time.monotonic() + float(budget_s)
+                got = False
+                while _time.monotonic() < deadline:
+                    if _is_diagonal:
+                        _got = sems.diagonal_timedwait(int(card), _SEQ_SLOT,
+                                                       "full", 0.0)
+                    else:
+                        _got = sems.timedwait(int(pair), _SEQ_SLOT, "full", 0.0)
+                    if _got:
+                        got = True
+                        break
+                    if liveness is not None and not liveness():
+                        dump_rank_stacks(
+                            "PeerGone-seq", tag=str(name), rank=int(window_off),
+                            extra=f"unit {i} {name!r} -- the deposit peer is "
+                                  f"gone while the collect waited")
+                        return f"PeerGone at unit {i} {name!r}"
+                    _time.sleep(0.05)
+                if not got:
+                    dump_rank_stacks(
+                        "budget-expired-seq", tag=str(name), rank=int(window_off),
+                        extra=f"unit {i} {name!r} budget={budget_s}s")
+                    return f"budget expired at unit {i} {name!r}"
+                recs = {}
+                if os.path.exists(dpath):
+                    try:
+                        recs = _json.load(open(dpath))
+                    except ValueError:
+                        recs = {}
+                dep = recs.get(str(i), {})
+                dep_digest = str(dep.get("digest", ""))
+                my_digest = hashlib.sha256(
+                    bytes(buf[window_off:window_off + nbytes])).hexdigest()[:16]
+                if dep_digest and my_digest != dep_digest:
+                    dump_rank_stacks(
+                        "digest-mismatch-seq", tag=str(name), rank=int(window_off),
+                        extra=f"unit {i} {name!r} deposit={dep_digest} "
+                              f"collect={my_digest}")
+                    return (f"digest mismatch at unit {i} {name!r}: "
+                            f"deposit={dep_digest} collect={my_digest}")
+                if desc.dst_ptr is None:
+                    return (f"collect at piece {i} {name!r}: the desc carries no "
+                            f"dst_ptr -- this rank does not hold the destination "
+                            f"this lane says it fills")
+                dst_ptr = int(desc.dst_ptr) + int(piece.dst_off)
+                _buf_addr = base_addr + window_off
+                # #1378 xsn57: THE NUMBERS BEFORE THE FIRST COPY-OUT, because
+                # weg2xsn56 died here with a SIGSEGV and left NOTHING to read.
+                # P rank0's last line was `WEG2-SEQ mapped ... bytes=1968338488
+                # units=114`; the next line would have been `WEG2-SEQ collect` 4
+                # seconds later and never came, so the whole window between the
+                # mapping and the first byte was dark. The deposit side already
+                # has `first-piece-done`; the collect side had no equivalent.
+                # ONE line, only for piece 0, so a 114-piece lane costs one row:
+                # if the next boot segfaults again, these five numbers say whether
+                # the destination pointer, the window offset or the length is the
+                # one out of range -- none of which a traceback-less SIGSEGV tells.
+                # #1378 xsn59: EVERY PIECE, not just the first -- and the reason is
+                # measured. xsn58 logged `collect-first` at 05:40:47 and died at
+                # 05:40:49: TWO SECONDS LATER, so the first piece (10 KB) copies
+                # FINE and the fault is in a LATER one. A marker on piece 0 alone
+                # cannot name it. `stale_dst=0` on all three lanes in the same boot
+                # also refuted the stale-pointer theory, so the surviving question
+                # is purely WHICH piece -- and that is an index, not a hypothesis.
+                #
+                # 114 rows for the widest lane is the price of naming it; the fields
+                # are kept short for that reason. The log may lose the very last
+                # row to the SIGSEGV (the handler never runs), so read the highest
+                # index that ARRIVED as "died at i or i+1", never as exact.
+                # `src` is back on the line: I cut it in xsn59 to keep the row short
+                # and thereby removed the one number that lets the H2D SOURCE be
+                # checked against the mapping base -- named as my own mistake in the
+                # record rather than quietly restored.
+                log(f"WEG2-SEQ cf lane={lane_key} i={i}/{len(_batch.pieces)} "
+                    f"dst={int(dst_ptr)} src={int(_buf_addr)} base={int(base_addr)} "
+                    f"off={window_off} n={nbytes} k={piece.kind} nm={name!r}")
+                # #1378 xsn61: ASK THE DRIVER WHETHER IT KNOWS THIS ADDRESS, before
+                # the copy that dies on it.  Six hypotheses are measured and gone
+                # (offset/length, stale pointer, remap order, source lazy-mapping,
+                # mmap lifetime, host pin -- xsn60 logged `registered=yes` on all
+                # three lanes and still took the SIGSEGV), so the only survivor is
+                # that `dst` is not a writable device address IN THIS PROCESS. The
+                # boot forces `SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS=1`, so every
+                # scheduler sees exactly one GPU as cuda:0 and an address valid in
+                # another device's context is dead here -- while the address book
+                # still hands it over as a NUMBER, because a number always resolves.
+                #
+                # `cudaPointerGetAttributes` is a READ: it returns
+                # cudaErrorInvalidValue for an address the driver does not know
+                # instead of faulting, so this cannot add a crash of its own. Taken
+                # from the ALREADY-LOADED runtime (`CDLL(None)`, torch has it in
+                # process) rather than by dlopen'ing a second copy, and wrapped
+                # whole -- a diagnostic that can break the path it diagnoses is
+                # worse than none.
+                if i == 0:
+                    _drc, _dty, _ddev = ptr_attrs(int(dst_ptr))
+                    _src, _sty, _sdev = ptr_attrs(int(_buf_addr))
+                    log(f"WEG2-SEQ ptrattr lane={lane_key} "
+                        f"dst_rc={_drc} dst_type={_dty} dst_device={_ddev} "
+                        f"src_rc={_src} src_type={_sty} src_device={_sdev}")
+                if piece.kind == tp.FLAT:
+                    ops.memcpy_async(int(dst_ptr), _buf_addr, nbytes, stream)
+                else:
+                    # on the way OUT a STRIDED2D piece scatters (spitch = run)
+                    ops.memcpy2d_async(int(dst_ptr), int(piece.dpitch), _buf_addr,
+                                       int(piece.run_bytes), int(piece.run_bytes),
+                                       int(piece.rows), stream)
+                ops.synchronize(stream)
+                if dst_digest_fn is not None:
+                    # #1378 xsn44 (the PLACEMENT witness): what LANDED at this
+                    # destination vs what the deposit recorded. The buffer
+                    # digest proved the transport; this proves the placement.
+                    # The swapped-destination mutant passes the buffer digest
+                    # green-falsely and dies HERE.
+                    dst_digest = dst_digest_fn(int(dst_ptr), nbytes)
+                    if dep_digest and dst_digest != dep_digest:
+                        dump_rank_stacks(
+                            "placement-mismatch-seq", tag=str(name),
+                            rank=int(window_off),
+                            extra=f"unit {i} {name!r} deposit={dep_digest} "
+                                  f"destination={dst_digest} -- the bytes "
+                                  f"landed at the wrong place (the swapped-"
+                                  f"destination shape, silent until quality)")
+                        return (f"placement mismatch at unit {i} {name!r}: "
+                                f"deposit={dep_digest} destination={dst_digest}")
+                # NO `empty` POST HERE.  This row (slot 0 of the empty family) is
+                # the per-tag DRAIN the caller drives through
+                # `CrossSlotRendezvous.prime_drain/wait_drained/post_drained`; a
+                # per-unit post would hand the drain counter tokens that release
+                # the NEXT tag's deposit before this tag has been read -- the
+                # exact return of the per-band claim that
+                # test_the_per_band_claim_cannot_return pins as absent.
+                log(f"WEG2-SEQ collect {label} digest={my_digest} "
+                    f"matches deposit")
+        if phase == PHASE_COLLECT and _owns_buf and _seq_mm is not None:
+            # #1385's lesson, at this form's own site: the file is freed by the
+            # side that reads it LAST (the collect; the deposit's next tag is
+            # gated on this side's drained post).  Unlinking keeps the pages
+            # alive for this process's own mapping and drops them at close.
             try:
-                ops.host_unregister(int(_seq_addr))
-                log(f"WEG2-SEQ unregister lane={lane_key} addr={int(_seq_addr)} ok")
-            except Exception as _unreg_exc:  # noqa: BLE001
-                log(f"WEG2-SEQ unregister lane={lane_key} addr={int(_seq_addr)} "
-                    f"FAILED {type(_unreg_exc).__name__}: {_unreg_exc} -- the "
-                    f"range stays pinned; the next lane on it will refuse")
-        _seq_mm.close()
-    if _owns_buf and _fh is not None:
-        _fh.close()
-    return ""
+                os.unlink(path)
+            except OSError:
+                pass
+        return ""
+    finally:
+        if _owns_buf and _seq_mm is not None:
+            # #1378 xsn70: UNREGISTER BEFORE THE MUNMAP, or the driver keeps this
+            # VA range pinned to these pages after they are gone -- the next
+            # lane's mmap reuses the range, its own register fails, and its
+            # copies read the stale pin (see the register site above).
+            if _seq_registered == "yes":
+                try:
+                    ops.host_unregister(int(_seq_addr))
+                    log(f"WEG2-SEQ unregister lane={lane_key} addr={int(_seq_addr)} ok")
+                except Exception as _unreg_exc:  # noqa: BLE001
+                    log(f"WEG2-SEQ unregister lane={lane_key} addr={int(_seq_addr)} "
+                        f"FAILED {type(_unreg_exc).__name__}: {_unreg_exc} -- the "
+                        f"range stays pinned; the next lane on it will refuse")
+            _seq_mm.close()
+        if _owns_buf and _fh is not None:
+            _fh.close()
