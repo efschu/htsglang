@@ -246,6 +246,14 @@ def _get_draft_model_runner(draft_worker):
     return None
 
 
+def bx_mod_shadow_hook_armed() -> bool:
+    """The region-slot shadow grader (``run_leg_hook``): off by default since
+    2026-09-15, on with ``SGLANG_WEG2_XCHG_SHADOW_HOOK=1``."""
+    import os as _os
+    return str(_os.environ.get("SGLANG_WEG2_XCHG_SHADOW_HOOK", "0") or "0"
+               ).strip().lower() in ("1", "true", "yes", "on")
+
+
 def _weg2_drafter_of(scheduler):
     """The draft ModelRunner THIS PROCESS hosts, or None.
 
@@ -489,6 +497,11 @@ class SchedulerWeightUpdaterManager:
     #: D IS the target's tensor); set by ``_weg2_shadow_plan``'s draft branch,
     #: read by ``_weg2_xchg_bounce_leg`` for ``run_sequential_units``.
     _weg2_xchg_no_write: Optional[frozenset] = None
+    #: 2026-09-15 (Beschleunigung): per-lane count of tags this rank has run
+    #: through ``run_sequential_units`` -- the buffer slot (seq % depth) and
+    #: the depth-2 drain rule read it; BOTH sides count the same tags per
+    #: lane (the join is symmetric), so the slots agree without a message.
+    _weg2_xchg_lane_seq: Optional[dict] = None
     #: True once the resume loop has collected tag by tag, so the once-per-wake
     #: entry stands down instead of injecting a second time over bytes already
     #: written.
@@ -3893,7 +3906,21 @@ class SchedulerWeightUpdaterManager:
             # ring deadlines. In, run, out.
             wlc.begin_leg(hook)
             try:
-                sh.run_leg_hook(inputs, log=logger.info, plan=plan)
+                # NUTZER-ORDER 2026-09-15 (Beschleunigung): the region-slot
+                # shadow grader ran into a stale slot on PP0/PP2 every leg
+                # (W69 after its 5 s budget, weg2xsn84-87) -- 5 s of every
+                # flip for a grader the sequential transport's own witnesses
+                # (identity record, SEAM-DIGEST) have replaced. Off unless
+                # SGLANG_WEG2_XCHG_SHADOW_HOOK=1.
+                if bx_mod_shadow_hook_armed():
+                    sh.run_leg_hook(inputs, log=logger.info, plan=plan)
+                else:
+                    logger.info(
+                        "WEG2-XCHG-SHADOW-HOOK off hook=%s leg=%s -- "
+                        "SGLANG_WEG2_XCHG_SHADOW_HOOK is not 1; the "
+                        "sequential transport's identity record and the "
+                        "SEAM-DIGEST are the witnesses of this leg",
+                        hook, getattr(inputs, "leg", "?"))
             finally:
                 # THE LEG THREAD'S DEVICE IS PUT BACK, ALWAYS.  The shadow's
                 # raw ``cudaMalloc`` and its stream both go through
@@ -5029,7 +5056,18 @@ class SchedulerWeightUpdaterManager:
             _lane_permit = tp.LanePermit(str(boot_nonce)) if _lane_permit_active else None
             try:
                 _lane_failures = []  # #1378 xsn77: every lane's refusal, not the last lane's
-                for pair, group in _lanes.items():
+                _depth = bx.seq_buffer_depth()
+                # getattr: the execution smokes drive this method with stubs
+                # that carry no such field (the #1358 lesson, same frame).
+                _lane_seq = getattr(self, "_weg2_xchg_lane_seq", None)
+                if _lane_seq is None:
+                    _lane_seq = {}
+                    try:
+                        self._weg2_xchg_lane_seq = _lane_seq
+                    except AttributeError:
+                        pass
+
+                def _run_lane(pair, group):
                     # #1378 xsn34 root fix: the lanes' wait budget is the
                     # boot's own leg bound (600 s, = the deadman's GRACE_S),
                     # NOT the 120 s tool default -- measured on weg2xsn34:
@@ -5065,10 +5103,20 @@ class SchedulerWeightUpdaterManager:
                     # boot-wide slot while idle, making the cap less
                     # effective than the number it charges for and risking a
                     # spurious W69 on a healthy but merely slow peer.
+                    _lane_key = (f"p{pair}" if pair is not None
+                                 else f"c{int(getattr(group[0], 'dst_rank', device))}")
+                    _seq = int(_lane_seq.get(_lane_key, 0))
+                    _slot = _seq % max(1, int(_depth))
+                    # 2026-09-15 (Beschleunigung, depth 2): the drain wait
+                    # reaches back `_depth` tags -- seq 0 primes, seq 1 uses
+                    # the second buffer without waiting, seq >= depth waits
+                    # for the collector's drain of seq-depth (the counting
+                    # `empty` hands posts out in order). Depth 1 is the
+                    # xsn87 form: every tag after the first waits.
                     if tag is not None and phase == bx.PHASE_DEPOSIT:
-                        if _first_tag:
+                        if _seq == 0:
                             rv.prime_drain()
-                        elif not rv.wait_drained(tag=str(tag)):
+                        elif _seq >= int(_depth) and not rv.wait_drained(tag=str(tag)):
                             raise bx.Weg2XchgBouncePhaseUnordered(
                                 f"W68 Weg2XchgPlanDisagree: tag={tag} lane="
                                 f"{'p%s' % pair if pair is not None else 'diag'} "
@@ -5079,8 +5127,6 @@ class SchedulerWeightUpdaterManager:
                                 f"stalled or dead peer, not the weg2xsn30 "
                                 f"cycle. Refusing rather than overwriting "
                                 f"bands a consumer may still read.")
-                    _lane_key = (f"p{pair}" if pair is not None
-                                else f"c{int(getattr(group[0], 'dst_rank', device))}")
                     # #1385: ACQUIRE RIGHT BEFORE THE BUFFER, RELEASE RIGHT
                     # AFTER IT CLOSES -- never earlier, never later. Acquiring
                     # here (not before the drain wait above) keeps the permit
@@ -5154,7 +5200,7 @@ class SchedulerWeightUpdaterManager:
                             # destination window, so it has nothing to stage
                             # and no handshake to meet.  Continuing would
                             # post a token nobody's peer waits for.
-                            continue
+                            return
                         # #1378 xsn56 -- THE LANE'S BUFFER IS THE LANE'S OWN
                         # SUM, not the priced single slot.  Operator order
                         # 2026-09-15: "er limitiert die groesse des
@@ -5194,6 +5240,7 @@ class SchedulerWeightUpdaterManager:
                             # weg2xsn86: (tag, name) pairs consumed but not
                             # written -- MEASURED target shares of the draft.
                             no_write=getattr(self, "_weg2_xchg_no_write", None),
+                            buffer_slot=int(_slot),
                             # #1358: the identity the host-slot lines carry.
                             # This is the only frame where the group and the
                             # rank both exist.
@@ -5218,6 +5265,7 @@ class SchedulerWeightUpdaterManager:
                             # matches what the emitter already does one frame
                             # down, where an absent group prints as `group=?`.
                             log=logger.info)
+                        _lane_seq[_lane_key] = _seq + 1
                         if last:
                             _lane_failures.append(f"{_lane_key}/{tag}: {last}")
                     finally:
@@ -5252,6 +5300,30 @@ class SchedulerWeightUpdaterManager:
                         # design -- is untouched.
                         if _lane_permit_active:
                             bx.unlink_lane_buffer(boot_nonce, root, _lane_key)
+
+                # 2026-09-15 (Beschleunigung): a rank's lanes in threads.
+                # Each lane owns its buffer, record file, handshake and
+                # rendezvous; the ctypes copies release the GIL. Off with
+                # SGLANG_WEG2_SEQ_LANES_PARALLEL=0 (the xsn87 serial form).
+                if bx.seq_lanes_parallel() and len(_lanes) > 1:
+                    from concurrent.futures import ThreadPoolExecutor
+                    _t0 = time.perf_counter()
+                    with ThreadPoolExecutor(
+                            max_workers=len(_lanes),
+                            thread_name_prefix="weg2-lane") as _ex:
+                        _futs = [(p, _ex.submit(_run_lane, p, g))
+                                 for p, g in _lanes.items()]
+                        _errs = [(p, f.exception()) for p, f in _futs
+                                 if f.exception() is not None]
+                    logger.info(
+                        "WEG2-SEQ-LANES parallel=%d phase=%s tag=%s ms=%.0f "
+                        "errors=%d", len(_lanes), phase, tag,
+                        (time.perf_counter() - _t0) * 1000, len(_errs))
+                    if _errs:
+                        raise _errs[0][1]
+                else:
+                    for pair, group in _lanes.items():
+                        _run_lane(pair, group)
             finally:
                 if _lane_permit is not None:
                     _lane_permit.close()

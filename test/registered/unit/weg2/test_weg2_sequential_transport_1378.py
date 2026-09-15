@@ -101,6 +101,11 @@ class _TransportHarness(unittest.TestCase):
     """One lane, real shared buffer, real byte moves, no CUDA."""
 
     def setUp(self):
+        # 2026-09-15: the per-unit sha256 is a DEVELOPMENT witness now
+        # (SEQ_UNIT_DIGEST_ENV, default off on the metal); the desk mutants
+        # below are its reason to exist, so arm it here.
+        self._digest_env_before = os.environ.get(bx.SEQ_UNIT_DIGEST_ENV)
+        os.environ[bx.SEQ_UNIT_DIGEST_ENV] = "1"
         self.root = tempfile.mkdtemp(prefix="weg2-seq-")
         self.nonce = f"seq1378{os.getpid()}"
         xr.unlink_semaphores(self.nonce)
@@ -110,6 +115,10 @@ class _TransportHarness(unittest.TestCase):
 
     def tearDown(self):
         import shutil
+        if self._digest_env_before is None:
+            os.environ.pop(bx.SEQ_UNIT_DIGEST_ENV, None)
+        else:
+            os.environ[bx.SEQ_UNIT_DIGEST_ENV] = self._digest_env_before
         shutil.rmtree(self.root, ignore_errors=True)
         try:
             xr.unlink_semaphores(self.nonce)
@@ -445,3 +454,43 @@ class NoWriteConsumesButDoesNotWrite(_TransportHarness):
         self.assertEqual(rc, "", rc)
         self.assertEqual(self.ops.read(dst, n), b"\x11" * n,
                          "tag weights_0 is not in the no-write set: written")
+
+
+class DigestOffByDefaultStillMovesAndChecksIdentity(_TransportHarness):
+    """The default form (flag unset): no sha256 on either side, the record
+    carries digest="" and the collect prints digest=off; the identity guard
+    and the bytes are untouched. MUTANT: a collect that still hashed."""
+
+    def test_default_off_moves_bytes_and_keeps_the_identity_guard(self):
+        os.environ.pop(bx.SEQ_UNIT_DIGEST_ENV, None)
+        self.assertFalse(bx.seq_unit_digest_armed())
+        n = 96
+        src, dst = self._vram_pair(n, 0)
+        self.ops.write(src, b"\x42" * n)
+        d = _desc("plain.unit", n, src_ptr=src, dst_ptr=dst)
+        self.assertEqual(self._deposit([d]), "")
+        self.assertEqual(self._collect([d]), "")
+        self.assertEqual(self.ops.read(dst, n), b"\x42" * n)
+        self.assertTrue(any("digest=off" in ln for ln in self.lines), self.lines[-3:])
+        other = _desc("other.unit", n, src_ptr=src, dst_ptr=dst)
+        self.assertEqual(self._deposit([d]), "")
+        self.assertIn("unit identity mismatch", self._collect([other]))
+
+    def test_buffer_slot_names_a_second_file(self):
+        self.assertEqual(bx.seq_lane_file_name("c0", 0), "c0")
+        self.assertEqual(bx.seq_lane_file_name("c0", 1), "c0_s1")
+        n = 32
+        src, dst = self._vram_pair(n, 0)
+        self.ops.write(src, b"\x07" * n)
+        d = _desc("slot.unit", n, src_ptr=src, dst_ptr=dst)
+        rc = bx.run_sequential_units(
+            [d], self.ops, self.nonce, slot_bytes=1 << 30, shm_root=self.root,
+            phase=bx.PHASE_DEPOSIT, buffer_slot=1, log=self.lines.append, card=1)
+        self.assertEqual(rc, "")
+        self.assertTrue(os.path.exists(
+            bx.sequential_buffer_path(self.nonce, self.root, lane="c1_s1")))
+        rc = bx.run_sequential_units(
+            [d], self.ops, self.nonce, slot_bytes=1 << 30, shm_root=self.root,
+            phase=bx.PHASE_COLLECT, buffer_slot=1, log=self.lines.append, card=1)
+        self.assertEqual(rc, "")
+        self.assertEqual(self.ops.read(dst, n), b"\x07" * n)

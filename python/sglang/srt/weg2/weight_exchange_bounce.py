@@ -2152,6 +2152,47 @@ class BounceSlots:
 
 _SEQ_SLOT = 0
 
+#: NUTZER-ORDER 2026-09-15 ("bau die beschleunigung, die sha256 nur noch als
+#: option (flag), zum verifizieren, defaultmaessig off"): the per-unit CPU
+#: sha256 on BOTH sides was ~50 s of CPU per 26-GB leg (weg2xsn87: a 2-GB
+#: lane took ~2 s per side, ~1 GB/s, against 3-12 GB/s of PCIe). The
+#: identity guard (name+tag in the deposit record) and the device-side
+#: SEAM-DIGEST stay; the transport digest is a DEVELOPMENT witness now.
+SEQ_UNIT_DIGEST_ENV = "SGLANG_WEG2_SEQ_UNIT_DIGEST"
+#: Buffers per lane: 2 lets the depositor fill tag t+1 while the collector
+#: drains tag t (the #1374 drain wait then reaches back TWO tags). 1 = the
+#: xsn87 form (strict alternation, ~3 s idle per tag).
+SEQ_BUFFER_DEPTH_ENV = "SGLANG_WEG2_SEQ_BUFFER_DEPTH"
+#: Run a rank's lanes (c/p/p) in threads instead of one after another.
+SEQ_LANES_PARALLEL_ENV = "SGLANG_WEG2_SEQ_LANES_PARALLEL"
+
+
+def _env_flag(name: str, default: str) -> bool:
+    return str(os.environ.get(name, default) or default).strip().lower() in (
+        "1", "true", "yes", "on")
+
+
+def seq_unit_digest_armed() -> bool:
+    return _env_flag(SEQ_UNIT_DIGEST_ENV, "0")
+
+
+def seq_buffer_depth() -> int:
+    try:
+        d = int(os.environ.get(SEQ_BUFFER_DEPTH_ENV, "2") or 2)
+    except ValueError:
+        d = 2
+    return 1 if d < 1 else (2 if d > 2 else d)
+
+
+def seq_lanes_parallel() -> bool:
+    return _env_flag(SEQ_LANES_PARALLEL_ENV, "1")
+
+
+def seq_lane_file_name(lane_key: str, buffer_slot: int) -> str:
+    """The lane's file stem for buffer slot ``buffer_slot`` (0 = the plain
+    name, so depth 1 is byte-identical to the xsn87 form)."""
+    return lane_key if not buffer_slot else f"{lane_key}_s{int(buffer_slot)}"
+
 
 def sequential_buffer_path(boot_nonce: str, shm_root: str = xr.SHM_ROOT,
                            lane: str = "") -> str:
@@ -2304,6 +2345,13 @@ def run_sequential_units(descs, ops, boot_nonce: str, *,
                          #: lists keep their indices: the source (PP2) holds
                          #: its OWN copy and deposits it.
                          no_write=None,
+                         #: buffer slot of this lane for this tag (0/1 under
+                         #: depth 2) -- BOTH sides derive it from the same
+                         #: per-lane tag counter, see the updater.
+                         buffer_slot: int = 0,
+                         #: None = the env flag (SEQ_UNIT_DIGEST_ENV, default
+                         #: off); True/False forces it (desk witnesses).
+                         unit_digest=None,
                          liveness=None,
                          budget_s: float = 120.0,
                          #: #1378 xsn44: the shared buffer as a bytearray.
@@ -2439,8 +2487,11 @@ def run_sequential_units(descs, ops, boot_nonce: str, *,
     # #1378 xsn53: PER LANE, not per boot -- three cards run their pairs at
     # the same time and a boot-wide file would put all three pairs' bytes on
     # top of each other.
-    path = sequential_buffer_path(boot_nonce, shm_root, lane=lane_key)
-    dpath = sequential_digest_path(boot_nonce, shm_root, lane=lane_key)
+    _digest_on = (seq_unit_digest_armed() if unit_digest is None
+                  else bool(unit_digest))
+    _lane_file = seq_lane_file_name(lane_key, int(buffer_slot or 0))
+    path = sequential_buffer_path(boot_nonce, shm_root, lane=_lane_file)
+    dpath = sequential_digest_path(boot_nonce, shm_root, lane=_lane_file)
     directory = os.path.dirname(path)
     os.makedirs(directory, exist_ok=True)
     if buffer is not None:
@@ -2572,8 +2623,9 @@ def run_sequential_units(descs, ops, boot_nonce: str, *,
                                        int(piece.spitch), int(piece.run_bytes),
                                        int(piece.rows), stream)
                 ops.synchronize(stream)
-                digest = hashlib.sha256(
+                digest = (hashlib.sha256(
                     bytes(buf[window_off:window_off + nbytes])).hexdigest()[:16]
+                    if _digest_on else "")
                 recs = {}
                 if os.path.exists(dpath):
                     try:
@@ -2659,8 +2711,11 @@ def run_sequential_units(descs, ops, boot_nonce: str, *,
                             f"buffer, per-tag lockstep #1374); refused before "
                             f"the copy-out")
                 dep_digest = str(dep.get("digest", ""))
-                my_digest = hashlib.sha256(
+                # The deposit decides (its record carries a digest or not);
+                # an empty record digest means the witness is off there.
+                my_digest = (hashlib.sha256(
                     bytes(buf[window_off:window_off + nbytes])).hexdigest()[:16]
+                    if dep_digest else "off")
                 if dep_digest and my_digest != dep_digest:
                     dump_rank_stacks(
                         "digest-mismatch-seq", tag=str(name), rank=int(window_off),
