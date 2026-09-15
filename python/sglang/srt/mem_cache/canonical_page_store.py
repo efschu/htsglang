@@ -1366,11 +1366,13 @@ def read_extents(
         for off, length in window.extents:
             got = 0
             while got < length:
-                chunk = os.pread(fd, length - got, off + got)
-                if not chunk:
+                # preadv lands the bytes in the caller's buffer directly; the
+                # pread form allocated a bytes object per extent and copied
+                # it in (one extra 32 KiB alloc+copy per KV page, #1402).
+                n = os.preadv(fd, [buf[taken + got : taken + length]], off + got)
+                if n <= 0:
                     break
-                buf[taken + got : taken + got + len(chunk)] = chunk
-                got += len(chunk)
+                got += n
             if got != length:
                 logger.warning(
                     "Short read of canonical %s %s: %d of %d bytes at offset %d.",

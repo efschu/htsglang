@@ -2095,6 +2095,18 @@ class HostPoolGroup:
         )
         return self.anchor_entry.host_pool.set_from_flat_data_page(index, data_page)
 
+    def set_from_flat_data_pages(self, indices, data_pages) -> None:
+        """Batched form of the above (#1402): the stray check per index, then
+        ONE call into the anchor pool's indexed copy."""
+        pool = self.anchor_entry.host_pool
+        for index in indices:
+            _refuse_stray_host_index(pool, index, "set_from_flat_data_pages")
+        batched = getattr(pool, "set_from_flat_data_pages", None)
+        if batched is not None:
+            return batched(indices, data_pages)
+        for index, page in zip(indices, data_pages):
+            pool.set_from_flat_data_page(index, page)
+
     def _entry_for_transfer(self, transfer, direction: str):
         """The entry this transfer names, or a refusal.
 

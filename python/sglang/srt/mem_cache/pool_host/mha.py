@@ -584,6 +584,34 @@ class MHATokenToKVPoolHost(HostKVCache):
         else:
             raise ValueError(f"Unsupported layout: {self.layout}")
 
+    def set_from_flat_data_pages(self, indices, data_pages) -> None:
+        """One indexed copy for a whole storage batch (#1402).
+
+        ``layer_first`` and ``page_first`` gather the N pages into one
+        contiguous ``(2, L, N*p, H, D)`` / ``(2, N*p, L, H, D)`` source and
+        assign it through an index tensor over the token axis -- one kernel
+        instead of N strided copies of 2*L slivers. Other layouts keep the
+        per-page loop.
+        """
+        n = len(indices)
+        if n == 0:
+            return
+        if n == 1 or self.layout not in ("layer_first", "page_first"):
+            return super().set_from_flat_data_pages(indices, data_pages)
+        p = self.page_size
+        starts = torch.as_tensor([int(i) for i in indices], dtype=torch.int64)
+        if p == 1:
+            idx = starts
+        else:
+            idx = (starts[:, None] + torch.arange(p, dtype=torch.int64)[None, :]).reshape(-1)
+        L, H, D = self.layer_num, self.head_num, self.head_dim
+        if self.layout == "layer_first":
+            src = torch.stack([pg.reshape(2, L, p, H, D) for pg in data_pages], dim=2)
+            self.kv_buffer[:, :, idx, :, :] = src.reshape(2, L, n * p, H, D)
+        else:
+            src = torch.stack([pg.reshape(2, p, L, H, D) for pg in data_pages], dim=1)
+            self.kv_buffer[:, idx, :, :, :] = src.reshape(2, n * p, L, H, D)
+
     def get_split_heads_page_buffer_meta(
         self, indices: torch.Tensor, split_factor: int
     ):

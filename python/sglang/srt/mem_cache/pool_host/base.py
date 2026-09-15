@@ -305,6 +305,18 @@ class HostKVCache(abc.ABC):
         """
         raise NotImplementedError()
 
+    def set_from_flat_data_pages(self, indices, data_pages) -> None:
+        """Set ``len(indices)`` flat pages at once (#1402).
+
+        ``indices[i]`` is the host slot of ``data_pages[i]``, exactly as the
+        per-page setter takes them. This default is the per-page loop; pools
+        whose layout allows one indexed copy override it. Profiled on boot
+        xsn132: the per-page strided copy was ~half of the prefetch IO
+        thread, 2 x layer_num small memcpys per 32 KiB page.
+        """
+        for index, page in zip(indices, data_pages):
+            self.set_from_flat_data_page(index, page)
+
     def is_stride_page_aligned(self, page_size_bytes: int = 4096) -> bool:
         """Return True if per-page strides are multiples of *page_size_bytes*.
 

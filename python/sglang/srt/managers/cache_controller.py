@@ -37,6 +37,54 @@ from sglang.srt.mem_cache.hicache_storage import (
 )
 from sglang.srt.mem_cache.weg2_store_gates import check_mamba_blob_present
 
+
+# #1402: module-level on purpose -- the harness doubles bind curated
+# controller methods by name (test_hicache_roundtrip_flip_rebind_0828 and
+# friends), so a helper reached through `self.` is an AttributeError there.
+def _borrow_read_pages(storage_backend, pool_name: str, host_pool, n: int):
+    """``n`` read targets for one storage batch, from the backend's #720
+    ring when it has one, else fresh pages (today's path).
+
+    Boot xsn131 (2026-09-15): the D group read its store at 250-430
+    pages/s per rank while the disk and the presence probe together cost
+    under 200 us a page. The ring (SGLANG_HICACHE_READ_BUFFERS=256) had
+    been switched on and changed nothing, because it served only
+    ``HiCacheFile._read_page`` -- the extra-pool route -- while the KV
+    pages and the draft pages, i.e. every page of a prefix, still took a
+    FRESH ``get_dummy_flat_data_page()`` per page: a ``torch.zeros`` with
+    ``pin_memory=True``, one cudaHostAlloc per 32 KiB page. Both routes
+    now borrow from the same ring, keyed by pool. Returns (buffers,
+    release) -- the caller releases after the copy-out, so a raised read
+    still returns them (the aux thread's broad except keeps running).
+    """
+    ring = None
+    get_ring = getattr(storage_backend, "_read_buffer_pool", None)
+    if get_ring is not None:
+        try:
+            ring = get_ring(pool_name, host_pool)
+        except Exception:  # noqa: BLE001 - a ring is an optimisation
+            ring = None
+    if ring is None:
+        buffers = [host_pool.get_dummy_flat_data_page() for _ in range(n)]
+        return buffers, (lambda: None)
+    buffers = [ring.acquire() for _ in range(n)]
+
+    def _release():
+        for b in buffers:
+            ring.release(b)
+
+    return buffers, _release
+
+
+def _set_host_pages(host_pool, indices, pages) -> None:
+    """Batched host write when the pool offers one, else the page loop."""
+    batched = getattr(host_pool, "set_from_flat_data_pages", None)
+    if batched is not None:
+        batched(indices, pages)
+        return
+    for index, page in zip(indices, pages):
+        host_pool.set_from_flat_data_page(index, page)
+
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
     from sglang.srt.mem_cache.pool_host import HostKVCache
@@ -2664,26 +2712,37 @@ class HiCacheController:
 
     # todo: deprecate
     def _generic_page_get(self, operation, hash_values, host_indices, extra_info=None):
-        dummy_page_dst = [
-            self.mem_pool_host.get_dummy_flat_data_page() for _ in hash_values
-        ]
-        page_data = self.storage_backend.batch_get(hash_values, dummy_page_dst)
-        if page_data is None:
-            return
-        for i in range(len(hash_values)):
-            if page_data[i] is None:
-                logger.warning(
-                    f"Prefetch operation {operation.request_id} failed to retrieve page {hash_values[i]}."
-                )
-                break
+        dummy_page_dst, _release = _borrow_read_pages(
+            self.storage_backend, PoolName.KV, self.mem_pool_host, len(hash_values)
+        )
+        try:
+            page_data = self.storage_backend.batch_get(hash_values, dummy_page_dst)
+            if page_data is None:
+                return
+            # The served prefix of this batch: pages up to the first miss.
+            n_hit = len(hash_values)
+            for i in range(len(hash_values)):
+                if page_data[i] is None:
+                    logger.warning(
+                        f"Prefetch operation {operation.request_id} failed to retrieve page {hash_values[i]}."
+                    )
+                    n_hit = i
+                    break
+            if n_hit == 0:
+                return
             # Must set the data before increasing the completed tokens.
-            # Otherwise this page may be read before being set.
-            self.mem_pool_host.set_from_flat_data_page(
-                host_indices[i * self.page_size],
-                page_data[i],
+            # Otherwise this page may be read before being set. One indexed
+            # copy for the whole served prefix (#1402), then the increments.
+            _set_host_pages(
+                self.mem_pool_host,
+                [int(host_indices[i * self.page_size]) for i in range(n_hit)],
+                page_data[:n_hit],
             )
-            if not operation.increment(self.page_size):
-                break  # Operation terminated by controller
+            for i in range(n_hit):
+                if not operation.increment(self.page_size):
+                    break  # Operation terminated by controller
+        finally:
+            _release()
 
     def _page_transfer(self, operation):
         # Transfer batch by batch
@@ -3531,29 +3590,40 @@ class HiCacheController:
         """
         component = self._draft_component_name()
         draft_keys = [f"{h}.{component}" for h in hash_values]
-        draft_dummy = [
-            self.mem_pool_host_draft.get_dummy_flat_data_page() for _ in draft_keys
-        ]
-        draft_pages = self.storage_backend.batch_get(draft_keys, draft_dummy)
-        if draft_pages is None:
-            # The whole batch failed: no row is known-good, so every one of
-            # them still holds its previous occupant. Zero them all rather
-            # than return early -- an early return here is exactly the state
-            # the admission scrub existed to clean up after.
-            draft_pages = [None] * len(draft_keys)
-        hits = 0
-        flags = []
-        for i, p in enumerate(draft_pages):
-            if p is None:
-                # `draft_dummy[i]` is untouched zeros for a miss.
-                p = draft_dummy[i]
-                flags.append(False)
-            else:
-                hits += 1
-                flags.append(True)
-            self.mem_pool_host_draft.set_from_flat_data_page(
-                host_indices[i * self.page_size], p
+        draft_dummy, _release = _borrow_read_pages(
+            self.storage_backend, component, self.mem_pool_host_draft, len(draft_keys)
+        )
+        try:
+            draft_pages = self.storage_backend.batch_get(draft_keys, draft_dummy)
+            if draft_pages is None:
+                # The whole batch failed: no row is known-good, so every one of
+                # them still holds its previous occupant. Zero them all rather
+                # than return early -- an early return here is exactly the state
+                # the admission scrub existed to clean up after.
+                draft_pages = [None] * len(draft_keys)
+            hits = 0
+            flags = []
+            pages = []
+            for i, p in enumerate(draft_pages):
+                if p is None:
+                    # A miss is the ZERO page (#993). The buffer is borrowed
+                    # from the ring now, so it holds the bytes of the last
+                    # page read into it -- zero it here rather than trust a
+                    # fresh allocation that no longer happens.
+                    p = draft_dummy[i]
+                    p.zero_()
+                    flags.append(False)
+                else:
+                    hits += 1
+                    flags.append(True)
+                pages.append(p)
+            _set_host_pages(
+                self.mem_pool_host_draft,
+                [int(host_indices[i * self.page_size]) for i in range(len(pages))],
+                pages,
             )
+        finally:
+            _release()
         self._draft_l3_hits += hits
         self._draft_l3_misses += len(draft_keys) - hits
         return flags

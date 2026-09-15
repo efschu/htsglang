@@ -1590,6 +1590,53 @@ class HiCacheFile(HiCacheStorage):
         """Pre-sharding path for ``stem`` (read-only compatibility)."""
         return os.path.join(self.file_path, f"{stem}.bin")
 
+    def _flat_layout_present(self) -> bool:
+        """Does this directory still hold pre-sharding flat ``.bin`` files?
+
+        Decided ONCE per backend from one scandir of the top directory (256
+        shard dirs at most): new writes are always sharded, so a False never
+        turns True again, and a True that later turns False costs exactly one
+        extra stat per probe. Before this, every presence probe and every
+        read paid a second ``exists`` on the flat path of a file that has not
+        existed in that layout since the migration.
+        """
+        present = getattr(self, "_legacy_flat", None)
+        if present is None:
+            present = False
+            try:
+                with os.scandir(self.file_path) as it:
+                    for entry in it:
+                        if entry.name.endswith(".bin") and not entry.is_dir():
+                            present = True
+                            break
+            except OSError:
+                present = False
+            self._legacy_flat = present
+        return present
+
+    def _stat_stem(self, stem: str):
+        """``(path, size)`` of the file serving ``stem``, or None: ONE stat.
+
+        Profiled on boot xsn132 (2026-09-15, py-spy on D TP0): the prefetch
+        issuer spent 691 of 710 samples in ``batch_exists_v2``, 533 of them
+        in ``os.path.exists`` -- the probe of one stem cost exists(sharded) +
+        exists(flat) + exists(sharded) again + getsize, four syscalls, and a
+        prefix of 11k tokens probes 33k stems (KV, mamba, draft). Measured on
+        the store: 11.5 us a stem as written, 2.7 us as one stat.
+        """
+        sharded = self._sharded_path(stem)
+        try:
+            return sharded, os.stat(sharded).st_size
+        except OSError:
+            pass
+        if self._flat_layout_present():
+            flat = self._flat_path(stem)
+            try:
+                return flat, os.stat(flat).st_size
+            except OSError:
+                pass
+        return None
+
     def _existing_path(self, stem: str) -> str:
         """Where ``stem`` currently lives: sharded if present, else the legacy
         flat path if present, else the sharded path it would be written to.
@@ -1598,19 +1645,12 @@ class HiCacheFile(HiCacheStorage):
         serving hits and its files stay evictable, while every new write is
         sharded. Nothing rewrites or moves the old files.
         """
-        sharded = self._sharded_path(stem)
-        if os.path.exists(sharded):
-            return sharded
-        flat = self._flat_path(stem)
-        if os.path.exists(flat):
-            return flat
-        return sharded
+        found = self._stat_stem(stem)
+        return found[0] if found is not None else self._sharded_path(stem)
 
     def _stem_exists(self, stem: str) -> bool:
         """True when ``stem`` is on disk, sharded or in the legacy flat layout."""
-        return os.path.exists(self._sharded_path(stem)) or os.path.exists(
-            self._flat_path(stem)
-        )
+        return self._stat_stem(stem) is not None
 
     def _ensure_shard_dir(self, path: str) -> None:
         """Create the shard directory of ``path`` once per shard."""
@@ -2168,15 +2208,13 @@ class HiCacheFile(HiCacheStorage):
         drift the 0828 specimen paid a full re-prefill for. Non-canonical
         stems keep the plain existence answer.
         """
-        if not self._stem_exists(stem):
+        found = self._stat_stem(stem)
+        if found is None:
             return False
         total = self._canonical_total_for_stem(stem)
         if total is None:
             return True
-        try:
-            return os.path.getsize(self._existing_path(stem)) == int(total)
-        except OSError:
-            return False
+        return int(found[1]) == int(total)
 
     # #706 x #719 (0828): occurrences of a refused presence probe, class-wide
     # so the rate limit survives a backend re-attach.
