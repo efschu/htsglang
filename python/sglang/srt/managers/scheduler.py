@@ -5309,10 +5309,11 @@ class Scheduler(
         # moves the number but not the "at most one chunk" bound.
         _match_end = req._compute_max_prefix_len(len(req.full_untruncated_fill_ids))
         if limit_tokens is not None:
-            # #1400: a follower registers EXACTLY PP0's told span beyond the
-            # (rank-uniform) matched prefix, so its host tree ends where PP0's
-            # does and the load-back extent is uniform by content.
-            _match_end = min(_match_end, _matched_len + int(limit_tokens))
+            # #1400: a follower registers up to EXACTLY PP0's told PREFIX
+            # (absolute token position, not a span beyond its own match), so
+            # its host tree ends where PP0's does -- anchor included -- and
+            # the load-back extent is uniform by content.
+            _match_end = min(_match_end, int(limit_tokens))
         _new_input_tokens = req.full_untruncated_fill_ids[_matched_len:_match_end]
         # #1068 (spec A12.2): the request's OWN span, stamped rank-locally
         # before any verdict is taken, so the UNDEFERRABLE exit of the

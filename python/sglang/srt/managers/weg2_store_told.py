@@ -152,6 +152,25 @@ def is_pp0(scheduler) -> bool:
     return int(scheduler.ps.pp_rank) == 0
 
 
+def _completed_prefix(tree, rid: str) -> int:
+    """The HOST-TREE PREFIX this rank's terminated prefetch leaves behind, in
+    tokens from position 0 -- NOT the loaded increment.
+
+    Boot xsn119 (rid eb03bfc5): PP0's read completed 4095 tokens (anchor at
+    4094) of which 64 were already in its host tree, so ``loaded`` said 4031;
+    a follower told 4031 registered [0, 4031), found no anchor in range, and
+    claimed 0 -- the named mismatch. The prefix is the uniform quantity
+    (``#1175 completed_prefetch_tokens`` = matched + loaded on the tree that
+    has it); the increment is rank-local history.
+    """
+    fn = getattr(tree, "completed_prefetch_tokens", None)
+    if callable(fn):
+        value = fn(rid)
+        if value is not None:
+            return int(value)
+    return int(tree.prefetch_loaded_tokens_by_reqid.get(rid, 0) or 0)
+
+
 def _rid(req) -> str:
     return str(getattr(req, "rid", ""))
 
@@ -230,7 +249,7 @@ def pp0_publish(scheduler, recv_reqs: List) -> List:
             continue
         if not tree.check_prefetch_progress(rid):
             continue
-        told = int(tree.prefetch_loaded_tokens_by_reqid.get(rid, 0) or 0)
+        told = _completed_prefix(tree, rid)
         told_map[rid] = told
         held.pop(rid, None)
         out.append(Weg2StoreTold(rid=rid, told=told))
@@ -287,8 +306,8 @@ def follower_absorb(scheduler, recv_reqs: List) -> List:
 
 def admission(scheduler, req, note_skip: Callable[[str, Any], None]) -> Optional[int]:
     """The admission gate on every rank. ``None`` = skip this pass (verdict
-    outstanding). Otherwise the told count, which is also this rank's own
-    loaded count -- or a named refusal."""
+    outstanding). Otherwise this rank's loaded credit, after its completed
+    prefix was checked equal to told -- or a named refusal."""
     told_map: Dict[str, int] = scheduler._weg2_store_told
     rid = _rid(req)
     told = told_map.get(rid)
@@ -308,12 +327,14 @@ def admission(scheduler, req, note_skip: Callable[[str, Any], None]) -> Optional
                 f"have cut it long before, so the storage thread is stuck."
             )
         time.sleep(0.002)
-    own = int(tree.pop_prefetch_loaded_tokens(rid) or 0)
+    own = _completed_prefix(tree, rid)
+    credit = int(tree.pop_prefetch_loaded_tokens(rid) or 0)
     told_map.pop(rid, None)
     if own != told:
         raise Weg2StoreToldMismatch(
             f"#1400 STORE-TOLD MISMATCH rank pp={scheduler.ps.pp_rank} "
-            f"rid={rid[:8]} told={told} own_loaded={own}: this rank's store "
+            f"rid={rid[:8]} told={told} own_prefix={own} own_loaded={credit}: "
+            f"this rank's store "
             f"read does not reproduce PP0's verdict, so its prefix would "
             f"diverge from the batch PP0 built (the W27 width split of "
             f"weg2rg3). Refusing by name instead of planning a different pass."
@@ -330,4 +351,7 @@ def admission(scheduler, req, note_skip: Callable[[str, Any], None]) -> Optional
                 told,
                 n,
             )
-    return told
+    # The CREDIT is this rank's loaded increment (rides into
+    # `storage_hit_length` / cached_tokens_storage, informational); the
+    # uniform fact -- the prefix -- was just checked against told.
+    return credit

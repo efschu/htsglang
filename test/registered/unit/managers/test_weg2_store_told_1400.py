@@ -22,10 +22,15 @@ class _Tree:
         self.prefetch_loaded_tokens_by_reqid = {}
         self.progress_calls = 0
 
-    def register(self, rid, loaded, flips=0):
+    def register(self, rid, loaded, flips=0, completed=None):
+        """`completed` = the host-tree prefix after termination (matched +
+        loaded); defaults to `loaded` (empty tree before the read)."""
         self.progress_left[rid] = flips
         self._loaded_when_done = getattr(self, "_loaded_when_done", {})
         self._loaded_when_done[rid] = loaded
+        self._completed_when_done = getattr(self, "_completed_when_done", {})
+        self._completed_when_done[rid] = loaded if completed is None else completed
+        self._completed = getattr(self, "_completed", {})
 
     def check_prefetch_progress(self, rid):
         self.progress_calls += 1
@@ -36,7 +41,11 @@ class _Tree:
             return False
         del self.progress_left[rid]
         self.prefetch_loaded_tokens_by_reqid[rid] = self._loaded_when_done.pop(rid)
+        self._completed[rid] = self._completed_when_done.pop(rid)
         return True
+
+    def completed_prefetch_tokens(self, rid):
+        return getattr(self, "_completed", {}).get(rid)
 
     def pop_prefetch_loaded_tokens(self, rid):
         return self.prefetch_loaded_tokens_by_reqid.pop(rid, 0)
@@ -175,7 +184,7 @@ def test_follower_refuses_by_name_when_own_read_differs_from_told():
     m.intake(s, r, lambda k: None)
     m.follower_absorb(s, [m.Weg2StoreTold("ffff0001", 4096)])
     s.tree_cache.register("ffff0001", loaded=2048, flips=0)
-    with pytest.raises(m.Weg2StoreToldMismatch, match="told=4096 own_loaded=2048"):
+    with pytest.raises(m.Weg2StoreToldMismatch, match="told=4096 own_prefix=2048"):
         m.admission(s, r, lambda k, rid: None)
 
 
@@ -228,3 +237,36 @@ def test_intake_partition_carries_the_held_term():
     from sglang.srt.mem_cache.match_refusal_census import PREFETCH_INTAKE_PARTITION
 
     assert m.GATE_HELD in PREFETCH_INTAKE_PARTITION
+
+
+def test_told_is_the_completed_prefix_not_the_loaded_increment():
+    """xsn119: PP0 completed 4095 with 64 already in its host tree (loaded
+    4031); the followers must register [0, 4095) -- anchor at 4094 inside."""
+    pp0, pp1 = _Sched(0), _Sched(1)
+    m.armed(pp0)
+    m.armed(pp1)
+    rid = "3d3d0001"
+    r0, r1 = _req(rid), _req(rid)
+    pp0.waiting_queue.append(r0)
+    m.intake(pp0, r0, lambda k: None)
+    m.intake(pp1, r1, lambda k: None)
+    pp0.tree_cache.register(rid, loaded=4031, flips=0, completed=4095)
+    wire = m.pp0_publish(pp0, [])
+    assert wire[0].told == 4095
+    m.follower_absorb(pp1, list(wire))
+    assert pp1.registered == [(rid, 4095)]
+    pp1.tree_cache.register(rid, loaded=4095, flips=0, completed=4095)
+    # PP0's credit is its own increment; the prefix check passed on both.
+    assert m.admission(pp0, r0, lambda k, x: None) == 4031
+    assert m.admission(pp1, r1, lambda k, x: None) == 4095
+
+
+def test_follower_with_short_prefix_refuses_even_if_it_loaded_something():
+    s = _Sched(2)
+    m.armed(s)
+    r = _req("4e4e0001")
+    m.intake(s, r, lambda k: None)
+    m.follower_absorb(s, [m.Weg2StoreTold("4e4e0001", 4095)])
+    s.tree_cache.register("4e4e0001", loaded=4031, flips=0, completed=4031)
+    with pytest.raises(m.Weg2StoreToldMismatch, match="told=4095 own_prefix=4031"):
+        m.admission(s, r, lambda k, rid: None)
