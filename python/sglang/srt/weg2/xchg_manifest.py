@@ -856,6 +856,19 @@ def join_manifests(
             if prior is None:
                 pp_by_name[nkey] = (man.rank, piece)
 
+    # #1378 xsn53 (DER W74-INSTRUMENTS-DEFEKT, am weg2xsn53-Boot gemessen):
+    # the loader returns ONE RankManifest PER (rank, region_tag), not one per
+    # rank -- the measured boot carried 1249 weights pieces PLUS a 20-piece
+    # draft manifest for the same rank.  A rows lookup that walks the group's
+    # manifests one-per-rank therefore asks the DRAFT manifest for weights
+    # names, misses, and reports EVERY cross-region name as unsourced -- 912
+    # of 1249, first `model.layers.0.input_layernorm.weight`, which both
+    # sides publish byte-identically (P rows=1 cols=5120 itemsize=2
+    # tag=weights_0 == D).  The lookup is per RANK, taking whichever of that
+    # rank's manifests carries the name.
+    tp_by_rank: Dict[int, List[RankManifest]] = {}
+    for man in tp:
+        tp_by_rank.setdefault(int(man.rank), []).append(man)
     names: List[Tuple[str, str]] = []
     seen = set()
     for man in tp:
@@ -864,13 +877,48 @@ def join_manifests(
             if nkey not in seen:
                 seen.add(nkey)
                 names.append(nkey)
+    # #1378 xsn53 (DIE RICHTUNG, gemessen am weg2xsn53-Boot): planning over
+    # the destination's WHOLE name set refused 912 of 1249 names that the
+    # source cannot supply -- while the source's own 893 names are ALL held
+    # by the destination (measured: |P|=893, |D|=1249, P subset D, only-P=0).
+    # A name the destination holds and the source does not is the
+    # disk-reload fallback's business, not a refusal: it is named here with
+    # its byte count, and the plan covers the INTERSECTION.  A name the
+    # source holds and the destination does not would be the real W74 -- it
+    # is caught by the per-card guard above and by the planner's own
+    # destination check.
+    pp_keys = {(region_of_tag(pc.tag), pc.param_name)
+               for man in pp for pc in man.pieces}
+    _my_region = wx.GPU_MEMORY_TYPE_WEIGHTS
+    dst_only = sorted(n for n in names if n not in pp_keys)
+    if dst_only:
+        _db = sum(int(pc.nbytes) for man in tp for pc in man.pieces
+                  if (region_of_tag(pc.tag), pc.param_name) in set(dst_only))
+        _line = (f"WEG2-XCHG-PLAN region={_my_region} "
+                 f"destination-only-names={len(dst_only)} "
+                 f"bytes={_db} first={dst_only[0][1]!r} -- the exchange does "
+                 f"not supply these; they come back from the disk-reload "
+                 f"fallback (#1394), never silently")
+        # join_manifests takes no log hook (the plan builder above does), so
+        # the audit line goes through the module logger -- one producer, one
+        # channel, always emitted.
+        import logging as _logging
+        _logging.getLogger(__name__).info("%s", _line)
+        names = [n for n in names if n in pp_keys]
     names.sort()
 
     tensors: List[JoinedTensor] = []
     unsourced: List[str] = []
     for nkey in names:
         region, name = nkey
-        rows = [m.by_region_name.get(nkey) for m in tp]
+        rows = []
+        for rank in sorted(tp_by_rank):
+            piece = None
+            for man in tp_by_rank[rank]:
+                piece = man.by_region_name.get(nkey)
+                if piece is not None:
+                    break
+            rows.append(piece)
         if any(p is None for p in rows):
             # A tensor only SOME TP ranks hold is not a cut this plan can name;
             # it is reported rather than planned over the ranks that have it.
@@ -1347,62 +1395,6 @@ def leg_plan_from_join(
             region_tag=man.region_tag, boot_token=man.boot_token,
             tp_rank=man.tp_rank, pp_rank=man.pp_rank,
             pieces=tuple(keep_p)))
-    # #1378 xsn53 (DIE VOM WAECHTER GEFORDerte VERENGUNG): per co-located
-    # card, the exchange scope is the INTERSECTION of the two groups' tag
-    # sets.  The 52d96f3769 guard below refuses any divergence, and the
-    # measured weg2xsn53 boot died on exactly that refusal
-    # (only_src=['weights_5','weights_6','weights_7'] only_dst=[] on card 0)
-    # The guard was green-by-vacancy until now, because the narrowing it
-    # orders was never written.  A tag dropped here does NOT lose its bytes:
-    # the #1394 design is exchange primary + disk-reload fallback, and a tag
-    # the exchange does not cover on this card comes back from the fallback.
-    # Dropped BY TAG, per card, with the byte count on the line a reader can
-    # audit -- a silent narrowing would be the same unpriced scope change the
-    # rest of this file refuses to make.
-    _scope = {}
-    for man in narrowed:
-        if not man.pieces:
-            continue
-        tags = {str(pc.tag) for pc in man.pieces
-                if region_of_tag(pc.tag) == my_region}
-        _scope.setdefault(man.card, {}).setdefault(man.group, set()).update(tags)
-    _intersection = {}
-    for card_id, groups in sorted(_scope.items()):
-        if len(groups) < 2:
-            continue
-        sets = [t for _g, t in sorted(groups.items())]
-        _intersection[card_id] = sets[0] & sets[1]
-    if _intersection:
-        narrowed2, dropped_tags, dropped_bytes = [], {}, {}
-        for man in narrowed:
-            keep = _intersection.get(man.card)
-            if keep is None:
-                narrowed2.append(man)
-                continue
-            keep_p = [pc for pc in man.pieces
-                      if str(pc.tag) in keep
-                      or region_of_tag(pc.tag) != my_region]
-            drop_here = {str(pc.tag) for pc in man.pieces} - {str(pc.tag) for pc in keep_p}
-            if drop_here:
-                dropped_tags[man.group] = (man.group, sorted(drop_here))
-                dropped_bytes[man.group] = sum(
-                    int(pc.nbytes) for pc in man.pieces
-                    if str(pc.tag) in drop_here)
-            narrowed2.append(RankManifest(
-                group=man.group, rank=man.rank, card=man.card,
-                region_tag=man.region_tag, boot_token=man.boot_token,
-                tp_rank=man.tp_rank, pp_rank=man.pp_rank,
-                pieces=tuple(keep_p)))
-        narrowed = narrowed2
-        for group, tags in sorted(dropped_tags.items()):
-            if log is not None:
-                log(f"WEG2-XCHG-PLAN region={my_region} "
-                    f"exchange-scope=intersection group={group} "
-                    f"dropped_tags={tags[1]} "
-                    f"dropped_bytes={dropped_bytes[group]} "
-                    f"-- the exchange does not cover these tags for this "
-                    f"card; their bytes come back from the disk-reload "
-                    f"fallback (#1394), never silently")
     manifests = [m for m in narrowed if m.pieces]
     if not manifests:
         return None, refusal(
@@ -1440,7 +1432,13 @@ def leg_plan_from_join(
     # TP/PP phase asymmetry means the per-rank tag sets CANNOT match by
     # construction, so the exchange scope must be the INTERSECTION,
     # narrowed BEFORE the bands are derived).
-    _src_g, _dst_g = (pp_group, tp_group) if direction == wx.LEGS_TP_TO_PP else (tp_group, pp_group)
+    # THE SOURCE IS THE GROUP plan_from_join exports FROM: pp for
+    # pp_to_tp, tp for tp_to_pp. The old line had the two arms swapped
+    # relative to plan_from_join's own `src, dst = (pp, tp) if
+    # tp_is_dst else (tp, pp)`, which is the same direction defect the
+    # W74 side had.
+    _src_g, _dst_g = ((tp_group, pp_group) if direction == wx.LEGS_TP_TO_PP
+                      else (pp_group, tp_group))
     _per_card = {}
     for man in manifests:
         for pc in man.pieces:
@@ -1448,18 +1446,30 @@ def leg_plan_from_join(
             _per_card.setdefault(man.card, {}).setdefault(man.group, set()).add(str(pc.tag))
     for card_id, groups in sorted(_per_card.items()):
         if len(groups) < 2: continue
-        tag_sets = [tags for g, tags in sorted(groups.items())]
-        if tag_sets[0] != tag_sets[1]:
+        # THE SETS ARE PAIRED BY THE DIRECTION'S OWN GROUPS, not by name:
+        # sorted() puts 'D' first, which under pp_to_pp-as-source silently
+        # compares the wrong pair and reports the destination's extra tags
+        # as the source's (the measured card-0 shape).
+        tag_sets = [groups.get(_src_g, set()), groups.get(_dst_g, set())]
+        # #1378 xsn53: EQUALITY is the wrong predicate under PP x TP.  The
+        # stages make the source group's tag set a strict SUBSET of the
+        # destination's by construction (measured card 0: source 6 tags,
+        # destination 9) -- and the deposit can only post bands for tags it
+        # HOLDS, so the direction that would post bands nobody reads is a
+        # SOURCE tag the destination lacks.  That direction refuses.  The
+        # destination's extra tags are names the destination holds that this
+        # exchange does not supply; they are the disk-reload fallback's
+        # business (#1394), named on the join's own audit line below.
+        if not tag_sets[0] <= tag_sets[1]:
             only_src = sorted(tag_sets[0] - tag_sets[1])
-            only_dst = sorted(tag_sets[1] - tag_sets[0])
             return None, refusal(
                 "plan-tag-divergence",
-                f"card {card_id}: the two groups' tag sets diverge for "
-                f"region {my_region}: only_src={only_src} only_dst={only_dst} "
-                f"-- the deposit would post bands nobody reads and the "
-                f"collect would wait for bands nobody posts (the W68 "
-                f"family, measured on weg2xsn43). Narrow the exchange to "
-                f"the INTERSECTION before deriving bands.")
+                f"card {card_id}: the source group holds tag(s) the "
+                f"destination group does not, for region {my_region}: "
+                f"only_src={only_src} -- the deposit would post bands "
+                f"nobody reads (the W68 family, measured on weg2xsn43). "
+                f"Narrow the exchange to the INTERSECTION before deriving "
+                f"bands.")
     try:
         plan = plan_from_join(join, direction=direction,
                               src_addr=src_addr, dst_addr=dst_addr)

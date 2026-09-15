@@ -425,9 +425,35 @@ def test_a_tensor_with_no_counterpart_refuses_by_name():
             pieces=tuple(p for p in m.pieces if p.param_name != victim))
         for m in mans
     ]
-    with pytest.raises(wx.Weg2XchgSourceMissing) as exc:
+    # #1378 xsn53 (DIE RICHTUNG, am weg2xsn53-Boot gemessen): a name the
+    # DESTINATION holds and the source does not is the disk-reload fallback's
+    # business, not a refusal -- the plan covers the INTERSECTION and the
+    # name is audited on the destination-only line.  The refusal stays for
+    # the other direction (a source name with no destination), which the
+    # per-card guard owns.
+    join = xm.join_manifests(mans, pp_group="P", tp_group="D")
+    names = {t.param_name for t in join.tensors}
+    assert victim not in names, "the destination-only name must not be planned"
+    import logging as _logging
+    logger = _logging.getLogger("sglang.srt.weg2.xchg_manifest")
+    records = []
+
+    class _Cap(_logging.Handler):
+        def emit(self, record):
+            records.append(record.getMessage())
+
+    handler = _Cap()
+    old_level = logger.level
+    logger.setLevel(_logging.INFO)
+    logger.addHandler(handler)
+    try:
         xm.join_manifests(mans, pp_group="P", tp_group="D")
-    assert "W74" in str(exc.value) and victim in str(exc.value)
+    finally:
+        logger.removeHandler(handler)
+        logger.setLevel(old_level)
+    assert records, "the destination-only names must be audited, never silent"
+    assert any(victim in r and "destination-only-names=" in r for r in records), \
+        f"the line must name the victim: {records[:1]}"
 
 
 def test_a_shape_contradiction_refuses_and_never_degrades_to_replicated():
