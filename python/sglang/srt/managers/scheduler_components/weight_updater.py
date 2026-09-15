@@ -5744,9 +5744,18 @@ class SchedulerWeightUpdaterManager:
                         from sglang.srt.weg2 import (
                             weight_exchange_bounce as _bx_probe,
                         )
-                        _pm = getattr(
-                            getattr(self, "model_runner", None), "model", None)
-                        _probe_row = "no-model"
+                        # #1378 xsn63 -- THE PROBE'S OWN FIRST DEFECT, fixed by
+                        # its first execution. xsn62 printed `no-model` on every
+                        # rank for every tag: `self.model_runner` does not exist
+                        # here. The class has its own accessor and it is the one
+                        # every other site uses -- `_weg2_model_for_group`
+                        # (:4468), which reaches the model via `tp_worker` for P
+                        # and `draft_worker` for D. Guessing an attribute name
+                        # instead of using the accessor the file already has is
+                        # the prior-art failure this ticket keeps repeating.
+                        _pm = self._weg2_model_for_group(
+                            self._weg2_group_name())
+                        _probe_row = None
                         if _pm is not None:
                             for _pn, _pt in _pm.named_parameters():
                                 _prc, _pty, _pdev = _bx_probe.ptr_attrs(
@@ -5754,11 +5763,24 @@ class SchedulerWeightUpdaterManager:
                                 _probe_row = (f"name={_pn!r} rc={_prc} "
                                               f"type={_pty} device={_pdev}")
                                 break
-                        logger.info(
-                            "WEG2-RESUME-PTRATTR tag=%s %s -- type 0 means the "
-                            "driver does not know this tensor's pages AFTER "
-                            "the resume (0=unregistered 1=host 2=device)",
-                            tag, _probe_row)
+                        if _probe_row is None:
+                            # NO explanatory text on a row that measured
+                            # NOTHING. xsn62's version appended "type 0 means
+                            # the driver does not know this tensor's pages" to a
+                            # `no-model` row, which reads as a FINDING where
+                            # there was no reading at all -- the instrument-text
+                            # trap, in my own instrument.
+                            logger.info(
+                                "WEG2-RESUME-PTRATTR tag=%s NOT-MEASURED "
+                                "reason=no-model-for-group -- this row carries "
+                                "no reading and says nothing about the pages",
+                                tag)
+                        else:
+                            logger.info(
+                                "WEG2-RESUME-PTRATTR tag=%s %s -- type 0 means "
+                                "the driver does not know this tensor's pages "
+                                "AFTER the resume (0=unregistered 1=host "
+                                "2=device)", tag, _probe_row)
                     except Exception as _probe_exc:  # noqa: BLE001
                         logger.info("WEG2-RESUME-PTRATTR tag=%s unavailable=%s",
                                     tag, type(_probe_exc).__name__)
