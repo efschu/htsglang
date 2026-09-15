@@ -95,6 +95,25 @@ from typing import Callable, Optional
 
 import torch
 
+
+def canonical_fsync_default() -> bool:
+    """Whether a completing extent write fsyncs before the rename.
+
+    Default OFF (SGLANG_HICACHE_CANONICAL_FSYNC=1 turns it on). Measured on
+    boot xsn132 (py-spy on P PP0, 2026-09-15): the write_back sweep before a
+    flip runs one canonical write per 32 KiB page, three PP stages each, and
+    the completing stage fsynced EVERY page on ZFS -- the backup thread was
+    busy for the whole profile and the sweep drained 1-2 nodes a second while
+    the front held the flip for ~10 s. The store is the carrier between two
+    groups on ONE host: the reader sees the renamed blob through the same
+    page cache, so the fsync bought nothing the next flip could use, and a
+    crash loses the boot's store either way (upstream's file backend never
+    fsyncs a page). The rename-on-complete protocol is unchanged: a reader
+    still never sees a partial blob.
+    """
+    raw = os.environ.get("SGLANG_HICACHE_CANONICAL_FSYNC", "0").strip().lower()
+    return raw not in ("", "0", "false", "no", "off")
+
 from sglang.srt.mem_cache.canonical_kv_page import (
     CanonicalPageError,
     CanonicalPageSpec,
@@ -1203,7 +1222,7 @@ def write_extents(
     window: CanonicalExtentWindow,
     payload: torch.Tensor,
     *,
-    fsync: bool = True,
+    fsync: Optional[bool] = None,
     space_check: Optional[Callable[[int], None]] = None,
 ) -> ExtentWriteResult:
     """Deposit one window's bytes into the canonical blob at ``final_path``.
@@ -1286,6 +1305,8 @@ def write_extents(
                 completed=False, already_complete=False, coverage=coverage
             )
 
+        if fsync is None:
+            fsync = canonical_fsync_default()
         if fsync:
             # The blob becomes visible by rename, so the DATA must reach the
             # medium before the name does; otherwise a crash can publish a
@@ -1310,7 +1331,7 @@ def write_slice(
     window: CanonicalPageWindow,
     payload: torch.Tensor,
     *,
-    fsync: bool = True,
+    fsync: Optional[bool] = None,
     space_check: Optional[Callable[[int], None]] = None,
 ) -> SliceWriteResult:
     """The KV page's view of ``write_extents``: slots instead of byte ranges."""
