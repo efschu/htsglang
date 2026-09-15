@@ -160,6 +160,12 @@ class TestOffSwitchNeverTouchesRingTableOrDisk(CustomTestCase):
             )
         self.assertIsNone(plan.table)
         self.assertFalse(plan.armed)
+        # #1378 xsn64: THIS arm's plan is the boot nonce too (`str(plan.epoch)`
+        # -> SGLANG_WEG2_XCHG_BOOT). With the old default 0 every ringless
+        # boot since 2026-09-14 was boot "0" and xsn63's stale manifests
+        # tripped the W68 ratchet on xsn64. Asserted on the ring-off arm,
+        # where the armed arm's `int(time.time())` is never reached.
+        self.assertGreater(int(plan.epoch), 0)
 
     def test_no_directory_or_file_is_created_even_with_dry_false(self):
         import tempfile

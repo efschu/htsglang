@@ -3141,7 +3141,22 @@ class HostRingPlan:
     form: str = ""
     dir: str = ""
     env_map: str = ""
-    epoch: int = 0
+    #: THE BOOT NONCE, and it must be unique per launch on EVERY arm of
+    #: `prepare_host_ring`, not only on the armed one. `str(plan.epoch)` is
+    #: what `prepare_xchg_env` publishes as SGLANG_WEG2_XCHG_BOOT: the shm
+    #: region name, the flip token's boot half, the credit-counter scope and
+    #: `xchg_manifest.boot_token()`. The armed arm sets `int(time.time())`
+    #: (below, next to the ring files); the #1369 ABSENT-BY-DESIGN arm --
+    #: every boot since 2026-09-14 -- returned early with the old default 0,
+    #: so weg2xsn28..xsn64 ALL ran as boot "0". MEASURED on weg2xsn64: the
+    #: manifest writer's W68 ratchet ("a file of THIS boot with a DIFFERENT
+    #: inventory") refused every rank, because xsn63's stale manifests carried
+    #: token "0" too and the inventory had changed (the tower left). Every
+    #: earlier boot passed only because the inventory never changed; and
+    #: `load_manifests(boot_token=...)`, the filter that is "not a hope",
+    #: could not exclude a stale file either. Same semantics the front already
+    #: uses for TMS_HOST_RING_EPOCH's fallback (front.py: `str(int(time.time()))`).
+    epoch: int = field(default_factory=lambda: int(time.time()))
     armed: bool = False
     table: Optional["ring_table.RingTable"] = None
     lines: List[str] = field(default_factory=list)
