@@ -2202,9 +2202,9 @@ def seq_buffer_depth() -> int:
     Cost: depth x lane bytes on tmpfs per lane (~25 GB at 4), and on-card
     staging that falls back to the host path when VRAM is short."""
     try:
-        d = int(os.environ.get(SEQ_BUFFER_DEPTH_ENV, "4") or 4)
+        d = int(os.environ.get(SEQ_BUFFER_DEPTH_ENV, "2") or 2)
     except ValueError:
-        d = 4
+        d = 2
     return 1 if d < 1 else (8 if d > 8 else d)
 
 
