@@ -4723,6 +4723,10 @@ def build_env(tree: str, venv: str, cvd: str, store_dir: str, debug_hold: bool, 
     # The ring is allocated once and reused; 256 page buffers are a few MiB.
     # An operator value in the environment wins.
     env.setdefault("SGLANG_HICACHE_READ_BUFFERS", "256")
+    # #1402: the store read path is bounded by the GIL hand-off after every
+    # syscall (see run_scheduler_process); 0.2 ms measured 1.07 ms/page vs
+    # 20.6 ms/page at Python's 5 ms default beside a busy main thread.
+    env.setdefault("SGLANG_GIL_SWITCH_INTERVAL_MS", "0.2")
     if arming_floor_solved:
         env["SGLANG_ARMING_FLOOR_SOLVED"] = "1"
     else:

@@ -930,11 +930,17 @@ class LRUFileEvictor:
             if cur is not None:
                 self._total_bytes -= cur
 
-    def touch(self, suffixed_key: str, tensor_path: str) -> None:
-        """Mark key as MRU, adopting an untracked on-disk file if needed."""
+    def touch(self, suffixed_key: str, tensor_path: str, mtime: bool = True) -> None:
+        """Mark key as MRU, adopting an untracked on-disk file if needed.
+
+        ``mtime=False`` skips the utime: the batched reader (#1402) already
+        bumped the inode through its open fd, and a second syscall here would
+        be a second GIL hand-off per page for nothing.
+        """
         if not self._eviction_enabled:
             return
-        self._touch_mtime(tensor_path)
+        if mtime:
+            self._touch_mtime(tensor_path)
         with self._lock:
             if suffixed_key in self._lru:
                 self._lru.move_to_end(suffixed_key, last=True)

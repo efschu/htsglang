@@ -226,8 +226,10 @@ class TestFullDiskDuringCommit(CustomTestCase):
         """The nastiest point: every byte is written and coverage is complete,
         so the very next step would publish. It must not."""
         self._enospc("fsync")
+        # #1402: the per-page fsync is off by default; this test is about
+        # the failure path OF the fsync, so it asks for one explicitly.
         with self.assertRaises(OSError):
-            write_slice(self.page, self.window, _payload(self.window))
+            write_slice(self.page, self.window, _payload(self.window), fsync=True)
         self.assertFalse(page_is_complete(self.page))
 
     def test_a_failed_marker_write_does_not_claim_coverage(self):

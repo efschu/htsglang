@@ -2050,12 +2050,70 @@ class HiCacheFile(HiCacheStorage):
         target_locations: List[torch.Tensor],
         target_sizes: Optional[Any] = None,
     ) -> List[torch.Tensor | None]:
-        return [
-            self.get(key, target_location)
-            for key, target_location in zip(
-                keys, target_locations or [None] * len(keys)
-            )
-        ]
+        """#1402: canonical-window keys are read in ONE C call per batch.
+
+        Per page the Python path is open/fstat/pread/close + the evictor's
+        utime + a stat for the path, six GIL hand-offs; beside a busy main
+        thread each costs up to the switch interval. The helper does the
+        same syscalls for the whole batch under one release of the GIL, and
+        the evictor's in-memory LRU is updated afterwards without a second
+        utime. Keys without a canonical window, targets the window cannot
+        fill, and the legacy flat layout take ``get`` exactly as before.
+        """
+        targets = list(target_locations or [None] * len(keys))
+        results: List[torch.Tensor | None] = [None] * len(keys)
+        from sglang.srt.mem_cache.storage.file.pageio import load as _load_pageio
+
+        pio = _load_pageio()
+        plan = []
+        for i, (key, target) in enumerate(zip(keys, targets)):
+            window = self._canonical_window(key) if pio is not None else None
+            if (
+                window is None
+                or target is None
+                or not target.is_contiguous()
+                or int(target.numel()) * int(target.element_size())
+                != int(window.payload_bytes)
+            ):
+                results[i] = self.get(key, target)
+                continue
+            suffixed = self._get_suffixed_key(key)
+            plan.append((i, key, suffixed, self._sharded_path(suffixed), window, target))
+        if not plan:
+            return results
+        touch = bool(getattr(self._evictor, "_eviction_enabled", True))
+        statuses = pio.read_pages(
+            [p[3] for p in plan],
+            [int(p[4].total_bytes) for p in plan],
+            [tuple(p[4].extents) for p in plan],
+            [int(p[5].data_ptr()) for p in plan],
+            touch,
+        )
+        for (i, key, suffixed, path, window, target), status in zip(plan, statuses):
+            if status == 0:
+                self._evictor.touch(suffixed, path, mtime=False)
+                if self.metadata_cache is not None:
+                    self.metadata_cache.add(suffixed)
+                results[i] = target
+            elif status == 1 and self._flat_layout_present():
+                # Not in the sharded layout: the per-key path knows the flat one.
+                results[i] = self.get(key, target)
+            else:
+                if status != 1:
+                    self._1402_n = getattr(self, "_1402_n", 0) + 1
+                    if self._1402_n <= 8 or self._1402_n % 256 == 0:
+                        logger.warning(
+                            "[#1402 pageio] canonical %s %s refused (status=%d: "
+                            "2=width mismatch, 3=short read, 4=io error; n=%d)",
+                            window.label,
+                            os.path.basename(path),
+                            int(status),
+                            self._1402_n,
+                        )
+                if self.metadata_cache is not None:
+                    self.metadata_cache.remove(suffixed)
+                results[i] = None
+        return results
 
     def set(
         self,
@@ -2157,28 +2215,61 @@ class HiCacheFile(HiCacheStorage):
             for key in keys:
                 target_files.add(f"{self._get_component_key(key, transfer.name)}.bin")
 
-        if self.metadata_cache is None:
-            # One stat per candidate. This used to be a single full-directory
-            # scandir, which was cheaper only while the directory was flat and
-            # small; sharding makes the targeted lookups strictly better (the
-            # incident directory held 11.7M entries, so every sweep walked
-            # them all).
-            existing_files = set()
-            for filename in target_files:
-                if self._stem_readable(filename[:-4]):
-                    existing_files.add(filename)
-            return existing_files
-
+        # One stat per candidate (this used to be a full-directory scandir,
+        # which was cheaper only while the directory was flat and small; the
+        # incident directory held 11.7M entries). #1402: all of them in ONE
+        # C call when the helper is loaded -- the probe of an 11k prefix is
+        # 33k stats, and each os.stat from Python is a GIL hand-off.
         existing_files = set()
+        unknown = []
         for filename in target_files:
             stem = filename[:-4]
-            if self.metadata_cache.contains(stem):
+            if self.metadata_cache is not None and self.metadata_cache.contains(stem):
                 existing_files.add(filename)
             else:
-                if self._stem_readable(stem):
-                    self.metadata_cache.add(stem)
-                    existing_files.add(filename)
+                unknown.append(stem)
+        for stem in self._readable_stems(unknown):
+            existing_files.add(f"{stem}.bin")
+            if self.metadata_cache is not None:
+                self.metadata_cache.add(stem)
         return existing_files
+
+    def _stat_stems(self, stems: List[str]) -> dict:
+        """``{stem: size}`` for the stems that are on disk; one C call when
+        the #1402 helper is available, else ``_stat_stem`` each."""
+        if not stems:
+            return {}
+        from sglang.srt.mem_cache.storage.file.pageio import load as _load_pageio
+
+        pio = _load_pageio()
+        if pio is None:
+            out = {}
+            for stem in stems:
+                found = self._stat_stem(stem)
+                if found is not None:
+                    out[stem] = int(found[1])
+            return out
+        sizes = pio.stat_sizes([self._sharded_path(s) for s in stems])
+        out = {s: int(sz) for s, sz in zip(stems, sizes) if sz >= 0}
+        if len(out) < len(stems) and self._flat_layout_present():
+            rest = [s for s in stems if s not in out]
+            sizes = pio.stat_sizes([self._flat_path(s) for s in rest])
+            out.update({s: int(sz) for s, sz in zip(rest, sizes) if sz >= 0})
+        return out
+
+    def _readable_stems(self, stems: List[str]) -> List[str]:
+        """The subset of ``stems`` a reader can serve (``_stem_readable``'s
+        rule: canonical stems only at the canonical width), batched."""
+        sizes = self._stat_stems(stems)
+        out = []
+        for stem in stems:
+            size = sizes.get(stem)
+            if size is None:
+                continue
+            total = self._canonical_total_for_stem(stem)
+            if total is None or int(size) == int(total):
+                out.append(stem)
+        return out
 
     def _canonical_total_for_stem(self, stem: str) -> Optional[int]:
         """The canonical width a stem's file must have to be readable, or None."""

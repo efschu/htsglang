@@ -18006,6 +18006,20 @@ def run_scheduler_process(
 ):
     # Load plugins so hooks can override Scheduler and its dependencies.
     load_plugins()
+    # #1402 (boot xsn133, 2026-09-15): the HiCache prefetch threads read the
+    # store one syscall at a time, and every syscall hands the GIL back to
+    # this process's busy main thread for up to the switch interval (5 ms by
+    # default). Measured on the desk against the boot's own store: a page
+    # read of six syscalls costs 13 us alone, 20.6 ms beside a busy Python
+    # thread at 5 ms, 4.5 ms at 1 ms, 1.07 ms at 0.2 ms -- the 250-650
+    # pages/s the D group managed on xsn129-133 IS this hand-off. The
+    # launcher sets SGLANG_GIL_SWITCH_INTERVAL_MS; unset leaves the default.
+    _gil_ms = os.environ.get("SGLANG_GIL_SWITCH_INTERVAL_MS", "").strip()
+    if _gil_ms:
+        try:
+            sys.setswitchinterval(max(0.00005, float(_gil_ms) / 1000.0))
+        except ValueError:
+            logger.warning("SGLANG_GIL_SWITCH_INTERVAL_MS=%r ignored", _gil_ms)
     dp_rank = configure_scheduler_process(
         server_args,
         gpu_id,
