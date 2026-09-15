@@ -246,6 +246,14 @@ def _get_draft_model_runner(draft_worker):
     return None
 
 
+def _weg2_wake_overlap_armed() -> bool:
+    """SGLANG_WEG2_WAKE_OVERLAP (default 1): the wake side collects tag t on
+    a single worker thread while resuming tag t+1."""
+    import os as _os
+    return str(_os.environ.get("SGLANG_WEG2_WAKE_OVERLAP", "1") or "1"
+               ).strip().lower() in ("1", "true", "yes", "on")
+
+
 def _weg2_seam_reuse_armed() -> bool:
     """SGLANG_WEG2_SEAM_REUSE (default 1): a leg's ``before`` reading is the
     rank's last graded reading instead of a fresh device walk."""
@@ -3542,6 +3550,16 @@ class SchedulerWeightUpdaterManager:
                                 lane_key, exc)
         bx.release_stage_buffers(None, log=logger.info)
 
+    def _weg2_wake_collect_one(self, tag) -> None:
+        """One tag's collect on the wake side (the exchange carrier), run
+        inline or on the wake worker (2026-09-15, Punkt 2)."""
+        _collected = self._weg2_xchg_inject_weights(tag=tag)
+        self._weg2_xchg_collected_per_tag = True
+        if (str(tag) == _WEIGHTS_DRAFT_TAG
+                and not _collected
+                and self._weg2_xchg_draft_reload_from_disk()):
+            pass  # the exchange carried nothing for this tag
+
     def _weg2_cocard_peer_alive(self) -> bool:
         """Is the co-located rank on THIS card still alive?  NVML per-process
         pids on the rank's own device, minus self -- during a flip the OTHER
@@ -6222,6 +6240,12 @@ class SchedulerWeightUpdaterManager:
             )
             # #1378 xsn36: RETIRED, same shape as the sleep leg above.
             with self._weg2_pcie_lock_retired("wake-H2D " + ",".join(weights_tags)):
+                # 2026-09-15 (Punkt 2, SGLANG_WEG2_WAKE_OVERLAP default 1)
+                _wake_worker = None
+                _wake_futs = []
+                if _weg2_wake_overlap_armed():
+                    from concurrent.futures import ThreadPoolExecutor as _TPE
+                    _wake_worker = _TPE(max_workers=1, thread_name_prefix="weg2-wake-collect")
                 for tag in weights_tags:
                     # C14: the device bytes this tag needs may only exist once
                     # the co-located SLEEPING rank has released them, and with
@@ -6416,12 +6440,15 @@ class SchedulerWeightUpdaterManager:
                     # collected after the loop, which is why the peer's
                     # per-tag deposit had nobody to drain it.
                     if (_weg2_carrier_this_tag := self._weg2_wake_weight_carrier()) == self.CARRIER_EXCHANGE:
-                        _weg2_collected_real_bytes = self._weg2_xchg_inject_weights(tag=tag)
-                        self._weg2_xchg_collected_per_tag = True
-                        if (str(tag) == _WEIGHTS_DRAFT_TAG
-                                and not _weg2_collected_real_bytes
-                                and self._weg2_xchg_draft_reload_from_disk()):
-                            pass  # the exchange carried nothing for this tag
+                        if _wake_worker is not None:
+                            # 2026-09-15 (Punkt 2): the collect of tag t runs
+                            # on ONE worker (sequential, so every lane's unit
+                            # semaphores keep their order) while this thread
+                            # waits for tag t+1's credit and resumes it.
+                            _wake_futs.append((str(tag), _wake_worker.submit(
+                                self._weg2_wake_collect_one, tag)))
+                        else:
+                            self._weg2_wake_collect_one(tag)
                     elif (str(tag) == _WEIGHTS_DRAFT_TAG
                             and self._weg2_xchg_draft_reload_from_disk()):
                         pass  # not CARRIER_EXCHANGE at all (e.g. ring, or a
@@ -6466,6 +6493,20 @@ class SchedulerWeightUpdaterManager:
                     # returns None -- never a fabricated 0 -- when the running
                     # hook has no such symbol or the record names another tag.
                     weg2_map_stats[tag] = self.memory_saver_adapter.resume_stats(tag)
+            if _wake_worker is not None:
+                _t_join = time.perf_counter()
+                _errs = []
+                for _ftag, _fut in _wake_futs:
+                    try:
+                        _fut.result()
+                    except BaseException as _fexc:  # noqa: BLE001
+                        _errs.append((_ftag, _fexc))
+                _wake_worker.shutdown(wait=True)
+                logger.info("WEG2-WAKE-OVERLAP collects=%d joined_ms=%.0f errors=%d",
+                            len(_wake_futs), (time.perf_counter() - _t_join) * 1000,
+                            len(_errs))
+                if _errs:
+                    raise _errs[0][1]
             weg2_leg_ms = (time.perf_counter() - t_w0) * 1000
             card_uuid = self._weg2_card_uuid() or "unknown"
             for tag, (nbytes, tms) in weg2_per_tag.items():
