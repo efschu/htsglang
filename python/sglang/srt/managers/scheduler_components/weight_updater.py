@@ -5712,10 +5712,25 @@ class SchedulerWeightUpdaterManager:
                     # into a bounded wait whose expiry is a NAMED refusal; when
                     # the card is not short the call returns without waiting at
                     # all, which is every non-co-located boot.
+                    # #1378 xsn67: PP0 went silent for >180 s after the resume
+                    # request, printed no W35 (credit budget 120 s) and no
+                    # PTRATTR -- the log could not say WHICH step it was in.
+                    # One line per tag BEFORE the credit wait and the resume,
+                    # so a stuck rank names its phase; nothing to derive.
+                    logger.info(
+                        "WEG2-RESUME begin tag=%s need_mib=%d credit=%s epoch=%s "
+                        "free_mib=%s -- next: credit wait (budget %.0fs), then "
+                        "memory_saver_adapter.resume(tag)",
+                        tag, int(tag_bytes.get(tag, 0)) // MIB_,
+                        "armed" if credit is not None else "none", credit_epoch,
+                        (self._weg2_free_bytes() or 0) // MIB_,
+                        WEG2_GROUP_FENCE_BUDGET_S,
+                    )
                     self._weg2_await_vram_credit(
                         credit, tag, tag_bytes.get(tag, 0), credit_epoch
                     )
                     t_tag = time.perf_counter()
+                    logger.info("WEG2-RESUME credit-ok tag=%s -- entering resume(tag)", tag)
                     self.memory_saver_adapter.resume(tag)
                     # #1378 xsn62: DID THE RESUME ACTUALLY MAP ANYTHING?
                     #
