@@ -2370,6 +2370,40 @@ def run_sequential_units(descs, ops, boot_nonce: str, *,
         buf = _mmap.mmap(_fh.fileno(), biggest)
         _owns_buf = True
         _seq_mm = buf
+        # #1378 xsn60: THE REGISTRATION COMES BACK, TOLERANTLY -- the comment
+        # above already names why removing it outright was the wrong repair:
+        # "the OVERLAP came from cudaHostRegister on a range the LayerBounce had
+        # already registered". The answer to an overlap is to TOLERATE the
+        # already-registered case, exactly as the LayerBounce does at :629-634
+        # ("a 7.5 % regression, not a refusal"), not to drop the pin for every
+        # range including the ones nobody else holds.
+        #
+        # WHY IT IS THE SUSPECT, measured rather than assumed: the DEPOSIT
+        # direction (D2H, device -> this buffer) moves bytes -- 144 pieces with
+        # sha256 on weg2xsn55. The COLLECT direction (H2D, this buffer ->
+        # device) takes a SIGSEGV inside the very first `memcpy_async`
+        # (weg2xsn59: one `cf i=0/114` row at 05:52:16, dead at 05:52:19, no row
+        # for i=1). Same function, opposite direction, and the pin is what the
+        # H2D path needs that the D2H path does not.
+        #
+        # The outcome is LOGGED either way, because "registered" and "tolerated
+        # an overlap" and "failed for another reason" are three different states
+        # and a silent pin would make the next boot guess again.
+        # The address is taken OUTSIDE the try on purpose: Python resolves
+        # `ops.host_register` BEFORE it evaluates the arguments, so a fake
+        # without that method raises AttributeError first and an inline
+        # assignment would never run -- which is exactly how the desk suite
+        # caught this on the first execution (UnboundLocalError, 8 failures).
+        _seq_addr = _mmap_addr(buf)
+        _seq_registered = "no"
+        try:
+            ops.host_register(int(_seq_addr), int(biggest),
+                              tp.CUDA_HOST_REGISTER_PORTABLE)
+            _seq_registered = "yes"
+        except Exception as _reg_exc:  # noqa: BLE001
+            _seq_registered = f"no({type(_reg_exc).__name__})"
+        log(f"WEG2-SEQ register lane={lane_key} bytes={int(biggest)} "
+            f"addr={int(_seq_addr)} registered={_seq_registered}")
     sems = tp.SemSet(boot_nonce)
     # The lane the lane-form ran its copies on, or the default stream when the
     # device ops do not expose stream creation (the desk fakes).
@@ -2514,9 +2548,13 @@ def run_sequential_units(descs, ops, boot_nonce: str, *,
             # are kept short for that reason. The log may lose the very last
             # row to the SIGSEGV (the handler never runs), so read the highest
             # index that ARRIVED as "died at i or i+1", never as exact.
+            # `src` is back on the line: I cut it in xsn59 to keep the row short
+            # and thereby removed the one number that lets the H2D SOURCE be
+            # checked against the mapping base -- named as my own mistake in the
+            # record rather than quietly restored.
             log(f"WEG2-SEQ cf lane={lane_key} i={i}/{len(_batch.pieces)} "
-                f"dst={int(dst_ptr)} off={window_off} n={nbytes} "
-                f"k={piece.kind} nm={name!r}")
+                f"dst={int(dst_ptr)} src={int(_buf_addr)} base={int(base_addr)} "
+                f"off={window_off} n={nbytes} k={piece.kind} nm={name!r}")
             if piece.kind == tp.FLAT:
                 ops.memcpy_async(int(dst_ptr), _buf_addr, nbytes, stream)
             else:
