@@ -95,7 +95,10 @@ from sglang.srt.models.qwen2_moe import (
 )
 
 # Models
-from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
+from sglang.srt.models.qwen3_vl import (
+    Qwen3VLForConditionalGeneration,
+    skip_vision_weight,
+)
 from sglang.srt.models.utils import (
     fused_qk_gemma_rmsnorm,
     fused_qk_gemma_rmsnorm_with_gate,
@@ -1968,7 +1971,13 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
         )
         self.is_mrope_enabled = "mrope_section" in rope_config
 
-        self.deepstack_visual_indexes = self.visual.deepstack_visual_indexes
+        # #1356 slice 2: the tower may not exist (--no-enable-multimodal);
+        # the indexes come from the config the tower itself reads them from.
+        self.deepstack_visual_indexes = (
+            self.visual.deepstack_visual_indexes
+            if self.visual is not None
+            else config.vision_config.deepstack_visual_indexes
+        )
 
     def get_hidden_dim(self, module_name: str, layer_idx: int):
         return self.model.get_hidden_dim(module_name, layer_idx)
@@ -2029,6 +2038,10 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
             if "rotary_emb.inv_freq" in name:
                 continue
             if "mtp" in name:
+                continue
+            if skip_vision_weight(name, self.visual):
+                # #1356 slice 2: no tower built, the checkpoint's tower
+                # tensors have no parameter to land in.
                 continue
             if "language_model" in name:
                 name = name.replace(r"model.language_model.", r"model.")
@@ -2125,7 +2138,13 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
         )
         self.is_mrope_enabled = "mrope_section" in rope_config
 
-        self.deepstack_visual_indexes = self.visual.deepstack_visual_indexes
+        # #1356 slice 2: the tower may not exist (--no-enable-multimodal);
+        # the indexes come from the config the tower itself reads them from.
+        self.deepstack_visual_indexes = (
+            self.visual.deepstack_visual_indexes
+            if self.visual is not None
+            else config.vision_config.deepstack_visual_indexes
+        )
         self.num_fused_shared_experts = 0
         if _use_aiter and not _disable_shared_experts_fusion():
             self.num_fused_shared_experts = self._get_num_fused_shared_experts()
@@ -2281,6 +2300,8 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 continue
             if "mtp" in name:
                 continue
+            if skip_vision_weight(name, self.visual):
+                continue  # #1356 slice 2, see the dense loader above
             if "language_model" in name:
                 name = name.replace(r"model.language_model.", r"model.")
             if ".self_attn." in name:

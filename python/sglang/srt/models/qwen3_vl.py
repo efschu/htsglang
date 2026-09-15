@@ -1210,6 +1210,34 @@ class Qwen3LLMModel(Qwen3Model):
         return hidden_states, aux_hidden_states
 
 
+def vision_tower_forced_off() -> bool:
+    """#1356 slice 2: is the tower FORCED off by ``--no-enable-multimodal``?
+
+    Only the explicit ``False`` of the tri-state counts. ``None`` (auto) and
+    ``True`` build the tower as every boot before this did. MEASURED on
+    weg2xsn63: the argv carried ``--no-enable-multimodal``, the server args
+    printed ``enable_multimodal=False`` -- and the manifest of every P rank
+    still listed 333 ``visual.*`` pieces (921,460,192 bytes), because the flag
+    reached the tokenizer's image path and never the model constructor. The
+    flag was SET and did not ACT; this predicate is where it acts.
+    """
+    try:
+        return getattr(get_server_args(), "enable_multimodal", None) is False
+    except Exception:  # noqa: BLE001 -- no server args (desk, unit tests)
+        return False
+
+
+def is_vision_weight(name: str) -> bool:
+    """The checkpoint-name test the loaders in this file already use."""
+    return "visual" in name
+
+
+def skip_vision_weight(name: str, visual) -> bool:
+    """True when ``name`` is a tower weight and there is NO tower to load it
+    into. With the tower built (``visual`` is a module) nothing is skipped."""
+    return visual is None and is_vision_weight(name)
+
+
 class Qwen3VLForConditionalGeneration(nn.Module):
     # To ensure correct weight loading and mapping.
     hf_to_sglang_mapper = WeightsMapper(
@@ -1239,15 +1267,29 @@ class Qwen3VLForConditionalGeneration(nn.Module):
 
         self.use_data_parallel = get_server_args().mm_enable_dp_encoder
 
-        self.visual = Qwen3VLMoeVisionModel(
-            config.vision_config,
-            # NOTE: Qwen3-VL vision encoder currently supports BitsAndBytes 4-bit quantization.
-            # Other quantization methods (e.g., GPTQ, AWQ) are untested and may not be supported.
-            quant_config=None,
-            norm_eps=getattr(config, "rms_norm_eps", 1e-6),
-            prefix=add_prefix("model.visual", prefix),
-            use_data_parallel=self.use_data_parallel,
-        )
+        if vision_tower_forced_off():
+            # #1356 slice 2 -- TEXT-ONLY MEANS NO TOWER, not a tower nobody
+            # calls. `self.visual` is None: no parameters, so the weight
+            # exchange manifest, the memory saver's `weights` region and the
+            # host ring never see a `visual.*` piece, and `load_weights` drops
+            # the checkpoint's tower tensors by name (skip_vision_weight).
+            # Image and video inputs refuse below instead of dereferencing
+            # None; the Weg-2 front already refuses them by name.
+            self.visual = None
+            logger.info(
+                "Qwen3-VL vision tower NOT BUILT: --no-enable-multimodal "
+                "(#1356 slice 2); visual.* checkpoint tensors will be skipped"
+            )
+        else:
+            self.visual = Qwen3VLMoeVisionModel(
+                config.vision_config,
+                # NOTE: Qwen3-VL vision encoder currently supports BitsAndBytes 4-bit quantization.
+                # Other quantization methods (e.g., GPTQ, AWQ) are untested and may not be supported.
+                quant_config=None,
+                norm_eps=getattr(config, "rms_norm_eps", 1e-6),
+                prefix=add_prefix("model.visual", prefix),
+                use_data_parallel=self.use_data_parallel,
+            )
 
         # TODO: make it more elegant
         if language_model_cls is Qwen3LLMModel:
@@ -1351,7 +1393,15 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         pattern = MultiModalityDataPaddingPatternMultimodalTokens()
         return pattern.pad_input_tokens(input_ids, mm_inputs)
 
+    def _require_visual(self, what: str) -> None:
+        if self.visual is None:
+            raise RuntimeError(
+                f"{what} input reached a model whose vision tower was not built "
+                f"(--no-enable-multimodal, #1356 slice 2); this boot is text-only"
+            )
+
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
+        self._require_visual("image")
         # in qwen-vl, last dim is the same
         pixel_values = torch.cat([item.feature for item in items], dim=0).type(
             self.visual.dtype
@@ -1371,6 +1421,7 @@ class Qwen3VLForConditionalGeneration(nn.Module):
             return self.visual(pixel_values, grid_thw=image_grid_thw)
 
     def get_video_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
+        self._require_visual("video")
         # in qwen-vl, last dim is the same
         pixel_values = torch.cat([item.feature for item in items], dim=0).type(
             self.visual.dtype
@@ -1499,7 +1550,9 @@ class Qwen3VLForConditionalGeneration(nn.Module):
                     )
                     weight_loader(lm_head_param, loaded_weight)
 
-            is_visual = "visual" in name
+            is_visual = is_vision_weight(name)
+            if skip_vision_weight(name, self.visual):
+                continue
             if (
                 not is_visual
                 and layer_id is not None

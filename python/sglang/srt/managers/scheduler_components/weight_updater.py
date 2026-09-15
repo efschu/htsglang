@@ -5757,12 +5757,39 @@ class SchedulerWeightUpdaterManager:
                             self._weg2_group_name())
                         _probe_row = None
                         if _pm is not None:
+                            # xsn63 -- THE PROBE'S THIRD DEFECT: "the first
+                            # parameter" was `visual.patch_embed.proj.weight`,
+                            # which the manifest files under tag `weights`,
+                            # not under the tag just resumed, so its type=0
+                            # said nothing. Two readings now, labelled: the
+                            # first parameter (whatever it is) AND the tensor
+                            # the collect died on, `layers.0.input_layernorm`
+                            # (tag weights_0), after EVERY tag's resume -- a
+                            # time series over the resume sequence. ABSENT
+                            # is a true statement on a PP rank that does not
+                            # hold layer 0, not a reading.
+                            _first = None
+                            _layer0 = None
                             for _pn, _pt in _pm.named_parameters():
+                                if _first is None:
+                                    _first = (_pn, _pt)
+                                if _pn.endswith(
+                                        "layers.0.input_layernorm.weight"):
+                                    _layer0 = (_pn, _pt)
+                                if _first is not None and _layer0 is not None:
+                                    break
+                            _rows = []
+                            for _lbl, _pair in (("first", _first),
+                                                ("layer0", _layer0)):
+                                if _pair is None:
+                                    _rows.append(f"{_lbl}=ABSENT")
+                                    continue
                                 _prc, _pty, _pdev = _bx_probe.ptr_attrs(
-                                    int(_pt.data_ptr()))
-                                _probe_row = (f"name={_pn!r} rc={_prc} "
-                                              f"type={_pty} device={_pdev}")
-                                break
+                                    int(_pair[1].data_ptr()))
+                                _rows.append(
+                                    f"{_lbl} name={_pair[0]!r} rc={_prc} "
+                                    f"type={_pty} device={_pdev}")
+                            _probe_row = " | ".join(_rows)
                         if _probe_row is None:
                             # NO explanatory text on a row that measured
                             # NOTHING. xsn62's version appended "type 0 means
