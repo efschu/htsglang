@@ -2307,6 +2307,16 @@ def _stage_alloc(ops, device: int, key, nbytes: int, log, lane_key: str) -> int:
     entry of the same slot is freed first (the caller runs only after that
     slot's drain). Freed for good by :func:`release_stage_buffers`."""
     with _SEQ_CACHE_LOCK:
+        # weg2xsn100 (depth 4): at most TWO live stagings per lane -- the
+        # depositor's run-ahead otherwise parks 4 x 2 GB on the waker's
+        # card, the waker's credit wait starves and W108 fires. Slots
+        # beyond the cap take the host path (the caller's fallback).
+        _live = [k for k in _SEQ_STAGE
+                 if k[0] == key[0] and k != key
+                 and str(k[1]).split("_s")[0] == str(key[1]).split("_s")[0]]
+        if len(_live) >= 2:
+            raise RuntimeError(f"staging cap: {len(_live)} live stagings on lane "
+                               f"{lane_key} (max 2)")
         ent = _SEQ_STAGE.pop(key, None)
         if ent is not None:
             try:
