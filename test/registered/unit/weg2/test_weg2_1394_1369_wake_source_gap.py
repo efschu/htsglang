@@ -885,3 +885,51 @@ def test_xsn86_unmeasurable_answers_empty_fail_closed(monkeypatch):
     shared, proof = m._weg2_draft_embed_target_shares()
     assert shared == frozenset()
     assert "no-embed" in proof
+
+
+# ---------------------------------------------------------------------------
+# 2026-09-15 "digest nur einmal je leg": the before reading is reused.
+# ---------------------------------------------------------------------------
+
+
+def _seam_env(monkeypatch, calls):
+    from sglang.srt.weg2 import seam_digest as sd
+    monkeypatch.setattr(sd, "seam_digest_armed", lambda: True, raising=True)
+    monkeypatch.setattr(sd, "announce_once", lambda *a, **k: None, raising=True)
+
+    def _take(stage, inventory, **kw):
+        calls.append(stage)
+        return SimpleNamespace(tag_field=",".join(kw.get("tags") or []),
+                               n_tensors=len(inventory), digest=f"d-{stage}",
+                               epoch=kw.get("epoch"), line=lambda: f"fake {stage}")
+    monkeypatch.setattr(sd, "take_reading", _take, raising=True)
+
+
+def test_seam_before_is_reused_from_the_last_graded_reading(monkeypatch):
+    calls = []
+    _seam_env(monkeypatch, calls)
+    m = _manager(monkeypatch, group="D", rank=0)
+    monkeypatch.setattr(Manager, "_weg2_seam_inventory",
+                        lambda self: ([1, 2, 3], 0, 3, ""), raising=True)
+    req = SimpleNamespace(epoch="e.1")
+    m._weg2_seam_digest_before(req, ["weights_0", "weights"])
+    assert calls == ["before"] and m.weg2_seam_ref is m.weg2_seam_before
+    m._weg2_seam_digest_before(req, ["weights_0", "weights"])
+    assert calls == ["before"], "the second before is the stored reading, no walk"
+    assert m.weg2_seam_before is m.weg2_seam_ref
+
+
+def test_seam_before_walks_again_when_the_set_changed_or_reuse_is_off(monkeypatch):
+    calls = []
+    _seam_env(monkeypatch, calls)
+    m = _manager(monkeypatch, group="D", rank=0)
+    monkeypatch.setattr(Manager, "_weg2_seam_inventory",
+                        lambda self: ([1, 2], 0, 2, ""), raising=True)
+    req = SimpleNamespace(epoch="e.1")
+    m.weg2_seam_ref = SimpleNamespace(tag_field="weights_0", n_tensors=3,
+                                      digest="old", epoch="e.0")
+    m._weg2_seam_digest_before(req, ["weights_0"])
+    assert calls == ["before"], "n_tensors differs: a fresh walk"
+    monkeypatch.setenv("SGLANG_WEG2_SEAM_REUSE", "0")
+    m._weg2_seam_digest_before(req, ["weights_0"])
+    assert calls == ["before", "before"], "reuse off: walks"

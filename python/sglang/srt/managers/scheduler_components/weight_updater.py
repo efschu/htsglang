@@ -246,6 +246,14 @@ def _get_draft_model_runner(draft_worker):
     return None
 
 
+def _weg2_seam_reuse_armed() -> bool:
+    """SGLANG_WEG2_SEAM_REUSE (default 1): a leg's ``before`` reading is the
+    rank's last graded reading instead of a fresh device walk."""
+    import os as _os
+    return str(_os.environ.get("SGLANG_WEG2_SEAM_REUSE", "1") or "1"
+               ).strip().lower() in ("1", "true", "yes", "on")
+
+
 def bx_mod_shadow_hook_armed() -> bool:
     """The region-slot shadow grader (``run_leg_hook``): off by default since
     2026-09-15, on with ``SGLANG_WEG2_XCHG_SHADOW_HOOK=1``."""
@@ -469,6 +477,12 @@ class SchedulerWeightUpdaterManager:
     #: Nothing else touches it: no cutover, no fence, no replay.  A deleter
     #: between writer and reader is what the rule looks for, and there is none.
     weg2_seam_before: Any = None
+    #: 2026-09-15 (Nutzer-Order "digest nur einmal je leg"): the rank's last
+    #: GRADED reading of its own bytes -- the wake leg's ``after`` (verdict
+    #: MATCH) or a sleep leg's real ``before``. Serving never writes weights,
+    #: so the next leg's ``before`` IS this reading: one device walk per leg
+    #: (the waking side's ``after``) instead of two on each side.
+    weg2_seam_ref: Any = None
     #: #1376 W10: THE PER-TAG LOCKSTEP'S OWN STATE, DECLARED. This class is
     #: `@dataclass(kw_only=True, slots=True)`, so an attribute that is not a
     #: field cannot be assigned at all -- and #1374's F1b assigned two of them
@@ -4186,6 +4200,22 @@ class SchedulerWeightUpdaterManager:
                 ).line(),
             )
             return
+        _ref = getattr(self, "weg2_seam_ref", None)
+        _tag_field = ",".join(weights_tags) if weights_tags else "none"
+        if (_ref is not None and _weg2_seam_reuse_armed()
+                and str(getattr(_ref, "tag_field", "")) == _tag_field
+                and int(getattr(_ref, "n_tensors", -1)) == len(inventory)):
+            self.weg2_seam_before = _ref
+            logger.info(
+                "WEG2-SEAM-DIGEST stage=before REUSED group=%s rank=%s "
+                "digest=%s epoch=%s n_tensors=%d -- this rank's bytes were "
+                "graded at that reading and serving does not write weights; "
+                "the walk (~0.8 s per 18 GB) is spent once per leg, on the "
+                "waking side's `after` (SGLANG_WEG2_SEAM_REUSE=0 walks here too)",
+                self._weg2_group_name(), self._weg2_rank(),
+                getattr(_ref, "digest", "?"), getattr(_ref, "epoch", "?"),
+                len(inventory))
+            return
         reading = seam_digest.take_reading(
             "before",
             inventory,
@@ -4198,6 +4228,7 @@ class SchedulerWeightUpdaterManager:
             walked=walked,
         )
         self.weg2_seam_before = reading
+        self.weg2_seam_ref = reading
         logger.info("%s", reading.line())
 
     def _weg2_seam_digest_after(self, recv_req, weights_tags) -> None:
@@ -4251,7 +4282,9 @@ class SchedulerWeightUpdaterManager:
         logger.info("%s", verdict.line())
         refusal = verdict.refusal()
         if refusal is not None:
+            self.weg2_seam_ref = None
             raise refusal
+        self.weg2_seam_ref = after
 
     def _weg2_shadow_source_leg(self, recv_req) -> None:
         """SOURCE hook, sleep leg.  Placed BEFORE the pause loop, not after it.
