@@ -2201,7 +2201,30 @@ def ptr_attrs(addr: int) -> Tuple[int, int, int]:
     than raising, because a diagnostic that can break its caller is worse than
     none.
     """
+    # #1378 xsn67/xsn68 -- THE PROBE KILLED THE RANK IT MEASURED. The first
+    # version built the ctypes Structure CLASS and a fresh `CDLL(None)` handle
+    # on EVERY call; one call per tag (xsn66) survived, the purity census
+    # (hundreds of calls per tag, xsn67/xsn68) died inside the ffi call with
+    # faulthandler's "Garbage-collecting" on the very frame -- SIGSEGV on P
+    # rank 0 with no log line, read for two boots as "the resume hangs". The
+    # type object, the function handle and its argtypes are now built ONCE
+    # and held for the process's life; nothing here is created per call.
     try:
+        fn, pa_cls = _ptr_attrs_binding()
+        _a = pa_cls()
+        rc = fn(_ct_byref(_a), int(addr))
+        return int(rc), int(_a.type), int(_a.device)
+    except Exception:  # noqa: BLE001 -- see the docstring's last paragraph
+        return -1, -1, -1
+
+
+_PTR_ATTRS_BINDING = None
+
+
+def _ptr_attrs_binding():
+    """``(cudaPointerGetAttributes, cudaPointerAttributes)`` bound ONCE."""
+    global _PTR_ATTRS_BINDING
+    if _PTR_ATTRS_BINDING is None:
         import ctypes as _ct
 
         class _PA(_ct.Structure):
@@ -2209,12 +2232,20 @@ def ptr_attrs(addr: int) -> Tuple[int, int, int]:
                         ("devicePointer", _ct.c_void_p),
                         ("hostPointer", _ct.c_void_p)]
 
-        _a = _PA()
-        rc = _ct.CDLL(None).cudaPointerGetAttributes(
-            _ct.byref(_a), _ct.c_void_p(int(addr)))
-        return int(rc), int(_a.type), int(_a.device)
-    except Exception:  # noqa: BLE001 -- see the docstring's last paragraph
-        return -1, -1, -1
+        lib = _ct.CDLL(None)
+        fn = lib.cudaPointerGetAttributes
+        fn.restype = _ct.c_int
+        fn.argtypes = [_ct.POINTER(_PA), _ct.c_void_p]
+        # the CDLL object is kept alive by the tuple: a function pointer whose
+        # library handle was collected is the same defect one layer down
+        _PTR_ATTRS_BINDING = (fn, _PA, lib)
+    return _PTR_ATTRS_BINDING[0], _PTR_ATTRS_BINDING[1]
+
+
+def _ct_byref(obj):
+    import ctypes as _ct
+
+    return _ct.byref(obj)
 
 
 def _mmap_addr(mm: "_mmap.mmap") -> int:
