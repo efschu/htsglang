@@ -2555,6 +2555,50 @@ def run_sequential_units(descs, ops, boot_nonce: str, *,
             log(f"WEG2-SEQ cf lane={lane_key} i={i}/{len(_batch.pieces)} "
                 f"dst={int(dst_ptr)} src={int(_buf_addr)} base={int(base_addr)} "
                 f"off={window_off} n={nbytes} k={piece.kind} nm={name!r}")
+            # #1378 xsn61: ASK THE DRIVER WHETHER IT KNOWS THIS ADDRESS, before
+            # the copy that dies on it.  Six hypotheses are measured and gone
+            # (offset/length, stale pointer, remap order, source lazy-mapping,
+            # mmap lifetime, host pin -- xsn60 logged `registered=yes` on all
+            # three lanes and still took the SIGSEGV), so the only survivor is
+            # that `dst` is not a writable device address IN THIS PROCESS. The
+            # boot forces `SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS=1`, so every
+            # scheduler sees exactly one GPU as cuda:0 and an address valid in
+            # another device's context is dead here -- while the address book
+            # still hands it over as a NUMBER, because a number always resolves.
+            #
+            # `cudaPointerGetAttributes` is a READ: it returns
+            # cudaErrorInvalidValue for an address the driver does not know
+            # instead of faulting, so this cannot add a crash of its own. Taken
+            # from the ALREADY-LOADED runtime (`CDLL(None)`, torch has it in
+            # process) rather than by dlopen'ing a second copy, and wrapped
+            # whole -- a diagnostic that can break the path it diagnoses is
+            # worse than none.
+            if i == 0:
+                try:
+                    import ctypes as _ct
+
+                    class _PA(_ct.Structure):
+                        _fields_ = [("type", _ct.c_int),
+                                    ("device", _ct.c_int),
+                                    ("devicePointer", _ct.c_void_p),
+                                    ("hostPointer", _ct.c_void_p)]
+
+                    _rt = _ct.CDLL(None)
+                    _a = _PA()
+                    _rc_d = _rt.cudaPointerGetAttributes(
+                        _ct.byref(_a), _ct.c_void_p(int(dst_ptr)))
+                    _dt, _dd = int(_a.type), int(_a.device)
+                    _b = _PA()
+                    _rc_s = _rt.cudaPointerGetAttributes(
+                        _ct.byref(_b), _ct.c_void_p(int(_buf_addr)))
+                    # type: 0=unregistered 1=host 2=device 3=managed
+                    log(f"WEG2-SEQ ptrattr lane={lane_key} "
+                        f"dst_rc={_rc_d} dst_type={_dt} dst_device={_dd} "
+                        f"src_rc={_rc_s} src_type={int(_b.type)} "
+                        f"src_device={int(_b.device)}")
+                except Exception as _pa_exc:  # noqa: BLE001
+                    log(f"WEG2-SEQ ptrattr lane={lane_key} "
+                        f"unavailable={type(_pa_exc).__name__}")
             if piece.kind == tp.FLAT:
                 ops.memcpy_async(int(dst_ptr), _buf_addr, nbytes, stream)
             else:
