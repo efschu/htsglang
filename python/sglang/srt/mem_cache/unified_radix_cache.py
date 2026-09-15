@@ -3075,6 +3075,17 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             stats["unbacked"] += 1
             if stats["issued"] >= max_issue:
                 continue
+            # write_back at the flip (user order 2026-09-15: "die eviction ist
+            # der flip"): a node whose Mamba anchor cannot be pinned right now
+            # is DEFERRED to the next /flush_cache poll, never issued without
+            # its anchor -- `write_backup` would back the KV and skip the
+            # anchor ("mamba write-through pin budget reached ... skipping
+            # the host backup"), and a KV prefix without its recurrent state
+            # is exactly what D refused on xsn127 (MambaComponent:absent).
+            _adm = getattr(self, "_mamba_write_through_pin_admissible", None)
+            if callable(_adm) and not _adm(node):
+                stats["skipped_pending"] += 1
+                continue
             try:
                 got = self.write_backup(node)
             except Exception as e:  # noqa: BLE001 -- the sweep must not kill the flush

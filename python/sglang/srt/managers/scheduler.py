@@ -651,6 +651,15 @@ def _weg2_store_shortfall_pass(sched) -> int:
     return n
 
 
+def _weg2_prefetch_stall_s() -> float:
+    """Wall-clock bound on a standing store read (beside the pass bound in
+    ``_weg2_note_prefetch_progress``); env-overridable, floor 5 s, default 30 s."""
+    try:
+        return max(5.0, float(os.environ.get("SGLANG_WEG2_PREFETCH_STALL_S", "30")))
+    except (TypeError, ValueError):
+        return 30.0
+
+
 def _weg2_windowed_path(sched) -> bool:
     """Is this group's store read WINDOWED? Asked so a stand-in cannot raise.
 
@@ -6331,9 +6340,25 @@ class Scheduler(
         if last != terms:
             req._weg2_progress_terms = terms
             req._weg2_no_progress_passes = 0
+            req._weg2_no_progress_t0 = time.perf_counter()
             return "progress"
         n = int(getattr(req, "_weg2_no_progress_passes", 0) or 0) + 1
         req._weg2_no_progress_passes = n
+        # Boot xsn127 (D, rids baec88b4/f4b94d87): the store read stood still
+        # from 20:44:46 on, but the pass counter alone declares death -- and
+        # the wedged group ran ~1 pass per 8 s (held_passes=5 after 38 s), so
+        # 64 passes would have been ~8 minutes; the front's flip drain gave
+        # up at 120 s (W1) and the ring stalled. A read that has not moved
+        # for SGLANG_WEG2_PREFETCH_STALL_S seconds (default 30) of wall clock
+        # is as dead as one that has not moved for 64 passes.
+        _t0 = getattr(req, "_weg2_no_progress_t0", None)
+        if _t0 is None:
+            _t0 = time.perf_counter()
+            req._weg2_no_progress_t0 = _t0
+        # MODULE FUNCTION, not a method: the harnesses bind a curated method
+        # list onto a SimpleNamespace (the #1298 lesson, again).
+        if time.perf_counter() - _t0 >= _weg2_prefetch_stall_s():
+            return "terminal"
         return "terminal" if n >= self._weg2_prefetch_stall_passes() else "stalled"
 
     def _weg2_store_load_terminal(
