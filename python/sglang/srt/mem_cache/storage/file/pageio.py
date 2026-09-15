@@ -54,6 +54,58 @@ class PageIO:
             ctypes.POINTER(ctypes.c_int8),
         ]
 
+        lib.hicache_write_pages.restype = ctypes.c_int64
+        lib.hicache_write_pages.argtypes = [
+            ctypes.c_int64,
+            ctypes.POINTER(ctypes.c_char_p),
+            ctypes.POINTER(ctypes.c_char_p),
+            ctypes.POINTER(ctypes.c_char_p),
+            ctypes.POINTER(ctypes.c_int64),
+            ctypes.POINTER(ctypes.c_int64),
+            ctypes.POINTER(ctypes.c_int64),
+            ctypes.POINTER(ctypes.c_int64),
+            ctypes.POINTER(ctypes.c_void_p),
+            ctypes.c_int32,
+            ctypes.POINTER(ctypes.c_int8),
+        ]
+
+    def write_pages(
+        self,
+        finals: Sequence[str],
+        totals: Sequence[int],
+        extents: Sequence[Sequence[tuple[int, int]]],
+        payload_ptrs: Sequence[int],
+        fsync: bool,
+    ) -> list[int]:
+        """canonical_page_store.write_extents for a whole batch, in C.
+
+        Status per page: 0 completed and published, 1 partial (marker
+        written), 2 already complete, 3 shape refused, 4 io/lock error.
+        ``payload_ptrs[i]`` holds the page's extents back to back.
+        """
+        from sglang.srt.mem_cache.canonical_page_store import marker_path, part_path
+
+        n = len(finals)
+        if n == 0:
+            return []
+        c_final = (ctypes.c_char_p * n)(*[os.fsencode(p) for p in finals])
+        c_part = (ctypes.c_char_p * n)(*[os.fsencode(part_path(p)) for p in finals])
+        c_mark = (ctypes.c_char_p * n)(*[os.fsencode(marker_path(p)) for p in finals])
+        c_total = (ctypes.c_int64 * n)(*[int(t) for t in totals])
+        n_ext = (ctypes.c_int64 * n)(*[len(e) for e in extents])
+        flat_off = [int(o) for e in extents for o, _ in e]
+        flat_len = [int(l) for e in extents for _, l in e]
+        m = max(1, len(flat_off))
+        c_off = (ctypes.c_int64 * m)(*flat_off)
+        c_len = (ctypes.c_int64 * m)(*flat_len)
+        c_pay = (ctypes.c_void_p * n)(*[int(p) for p in payload_ptrs])
+        status = (ctypes.c_int8 * n)()
+        self._lib.hicache_write_pages(
+            n, c_final, c_part, c_mark, c_total, n_ext, c_off, c_len, c_pay,
+            1 if fsync else 0, status,
+        )
+        return list(status)
+
     def stat_sizes(self, paths: Sequence[str]) -> list[int]:
         """``st_size`` per path, -1 where the path cannot be stat'ed."""
         n = len(paths)

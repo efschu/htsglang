@@ -2190,10 +2190,92 @@ class HiCacheFile(HiCacheStorage):
         target_locations: Optional[Any] = None,
         target_sizes: Optional[Any] = None,
     ) -> bool:
+        """#1402: canonical-window keys are written in ONE C call per batch.
+
+        The same protocol as ``write_extents`` (part file + flock, marker
+        sidecar, rename on completion), page by page under one release of
+        the GIL -- py-spy on P PP0 (xsn134) had the backup thread in the
+        per-page syscalls of the publish sweep for the whole in-flip window
+        and the P->D drain at 10.5 s. The evictor's reserve/commit/abort
+        bookkeeping and the metadata cache are unchanged per key; keys
+        without a canonical window take ``set`` exactly as before.
+        """
+        from sglang.srt.mem_cache.storage.file.pageio import load as _load_pageio
+
+        pio = _load_pageio()
+        if pio is None:
+            for key, value in zip(keys, values):
+                if not self.set(key, value):
+                    return False
+            return True
+        values = list(values)
+        ok = True
+        plan = []
         for key, value in zip(keys, values):
-            if not self.set(key, value):
-                return False
-        return True
+            window = self._canonical_window(key)
+            if window is None or value is None:
+                if not self.set(key, value):
+                    ok = False
+                continue
+            flat = value.contiguous().view(torch.uint8)
+            if int(flat.numel()) != int(window.payload_bytes):
+                # shape refusals keep their per-key error line
+                if not self._set_canonical_slice(key, window, value):
+                    ok = False
+                continue
+            suffixed = self._get_suffixed_key(key)
+            _969g_trace("write", "canonical", suffixed)
+            plan.append((key, suffixed, window, flat))
+        if not plan:
+            return ok
+        # Presence for the whole batch in one call: a complete blob is
+        # content-addressed and only gets its recency refreshed.
+        present = self._stat_stems([p[1] for p in plan])
+        todo = []
+        for key, suffixed, window, flat in plan:
+            if suffixed in present:
+                self._evictor.touch(suffixed, self._existing_path(suffixed))
+                continue
+            if not self._evictor.reserve(
+                suffixed,
+                window.payload_bytes,
+                key=key,
+                owner_writes_whole_file=owner_write_covers_whole_file(
+                    is_mla_model=self._key_geom["is_mla_model"],
+                    canonical_extent_write=True,
+                ),
+            ):
+                ok = False
+                continue
+            path = self._sharded_path(suffixed)
+            self._ensure_shard_dir(path)
+            todo.append((key, suffixed, window, flat, path))
+        if not todo:
+            return ok
+        from sglang.srt.mem_cache.canonical_page_store import canonical_fsync_default
+
+        statuses = pio.write_pages(
+            [t[4] for t in todo],
+            [int(t[2].total_bytes) for t in todo],
+            [tuple(t[2].extents) for t in todo],
+            [int(t[3].data_ptr()) for t in todo],
+            canonical_fsync_default(),
+        )
+        for (key, suffixed, window, flat, path), status in zip(todo, statuses):
+            if status in (0, 1, 2):
+                self._evictor.commit(suffixed)
+                if status in (0, 2) and self.metadata_cache is not None:
+                    self.metadata_cache.add(suffixed)
+            else:
+                logger.error(
+                    "Failed to save canonical slice for %s: [#1402 pageio] "
+                    "status=%d (3=shape refused, 4=io/lock error)",
+                    key,
+                    int(status),
+                )
+                self._evictor.abort(suffixed)
+                ok = False
+        return ok
 
     def exists(self, key: str) -> bool:
         key = self._get_suffixed_key(key)
