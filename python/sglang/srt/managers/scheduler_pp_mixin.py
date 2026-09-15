@@ -25,6 +25,7 @@ from sglang.srt.distributed.pp_typed_channel import (
 )
 from sglang.srt.distributed.pp_object_recv import get_or_create_frame
 from sglang.srt.distributed.utils import pp_gapped_ownership_active
+from sglang.srt.managers import weg2_store_told
 from sglang.srt.managers.weg2_idle_vote import (
     VOTE_HOME_STEP_BUDGET_S,
     WEG2_VOTE_TAG,
@@ -5951,9 +5952,15 @@ class SchedulerPPMixin:
             # fix for the REQUEST-CHAIN channel, and it is not gated to
             # the gapped layout: the hazard is not gapped-specific.
             self._pp_commit_comm_work(self.send_req_work)
+            # #1400: PP0 puts its store verdicts on this pass's wire BEFORE
+            # it can admit them (weg2_store_told module docstring). The
+            # dispatched list below stays `recv_reqs`.
+            _wire_reqs = recv_reqs
+            if weg2_store_told.armed(self) and weg2_store_told.is_pp0(self):
+                _wire_reqs = weg2_store_told.pp0_publish(self, recv_reqs)
             with torch.profiler.record_function("send_reqs_to_next_stage"):
                 self.send_req_work = self._pp_send_pyobj_to_next_stage(
-                    recv_reqs,
+                    _wire_reqs,
                     async_send=True,
                 )
             # NOTE: no blocking commit here, deliberately. Committing the
@@ -5969,6 +5976,11 @@ class SchedulerPPMixin:
         # leaves `recv_reqs` before dispatch on EVERY rank -- it is a lap, not
         # a request, and `process_input_requests` has no handler for it.
         recv_reqs = self._weg2_vote_after_forward(recv_reqs)
+        # #1400: a follower takes PP0's store verdicts off the list after
+        # forwarding them onward (PP2 gets them one pass later on the same
+        # wire) and registers its held requests with the told span.
+        if weg2_store_told.armed(self) and not weg2_store_told.is_pp0(self):
+            recv_reqs = weg2_store_told.follower_absorb(self, recv_reqs)
 
         # (i): arm in this same pass; the flip hook at the end of this
         # microbatch iteration then joins without an intervening recv.

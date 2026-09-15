@@ -213,6 +213,7 @@ from sglang.srt.managers.phase_purity import (
 # discipline).
 from sglang.srt.managers import prefetch_ballot
 from sglang.srt.managers import tp_head_congruence
+from sglang.srt.managers import weg2_store_told
 from sglang.srt.managers import uniform_floor_scope
 from sglang.srt.managers.pp_admission_congruence import (
     PP_ADMISSION_VACUOUS_ROLLUP_EVERY,
@@ -5137,7 +5138,9 @@ class Scheduler(
         for tokenized_req in recv_req:
             self.handle_generate_request(tokenized_req)
 
-    def _prefetch_kvcache(self, req: Req, rematch: bool = True) -> str:
+    def _prefetch_kvcache(
+        self, req: Req, rematch: bool = True, limit_tokens: Optional[int] = None
+    ) -> str:
         """Issue a storage prefetch for ``req``. Returns WHAT ACTUALLY HAPPENED.
 
         THE DEFECT THIS RETURN VALUE CLOSES, measured on window-946fix-0828.
@@ -5305,6 +5308,11 @@ class Scheduler(
         # dynamic_chunked_prefill_size (scheduler.py:8268-8415) can vary C, which
         # moves the number but not the "at most one chunk" bound.
         _match_end = req._compute_max_prefix_len(len(req.full_untruncated_fill_ids))
+        if limit_tokens is not None:
+            # #1400: a follower registers EXACTLY PP0's told span beyond the
+            # (rank-uniform) matched prefix, so its host tree ends where PP0's
+            # does and the load-back extent is uniform by content.
+            _match_end = min(_match_end, _matched_len + int(limit_tokens))
         _new_input_tokens = req.full_untruncated_fill_ids[_matched_len:_match_end]
         # #1068 (spec A12.2): the request's OWN span, stamped rank-locally
         # before any verdict is taken, so the UNDEFERRABLE exit of the
@@ -5627,7 +5635,18 @@ class Scheduler(
             # line names the host-pool room the verdict was taken against.
             _population = getattr(req, "_969c_population", None)
             _available_before = self._host_pool_available_size()
-            _pf_verdict = self._prefetch_kvcache(req)
+            if weg2_store_told.armed(self):
+                # #1400: PP0 registers and holds; a follower holds and
+                # registers later with PP0's told span (module docstring).
+                from sglang.srt.mem_cache.match_refusal_census import (
+                    note_prefetch_gate as _note_prefetch_gate_1400,
+                )
+
+                _pf_verdict = weg2_store_told.intake(
+                    self, req, _note_prefetch_gate_1400
+                )
+            else:
+                _pf_verdict = self._prefetch_kvcache(req)
             # #1317 C6: WINDOW 1's verdict arms the window mark. This is the
             # only site that arms it; the round seam re-derives it from each
             # re-issue's own verdict thereafter.
@@ -13076,6 +13095,16 @@ class Scheduler(
             # #1175: the group-completion gate, resolved ONCE per request
             # so the kill switch cannot flip mid-loop and split the pass.
             _group_completion_enabled = _pp0_may_withhold and _group_completion_on()
+            _told_armed = _pp_group and weg2_store_told.armed(self)
+            _told_loaded = None
+            if self.enable_hicache_storage and _pp_group and _told_armed:
+                # #1400: the told verdict is the group fact on the carrierless
+                # form -- PP0 admits only what it has put on the wire, the
+                # followers only what has arrived and what their own read
+                # reproduced. Nothing below this branch decides.
+                _told_loaded = weg2_store_told.admission(self, req, _note_skip)
+                if _told_loaded is None:
+                    continue
             if self.enable_hicache_storage and _pp_group:
                 # #1066: PP0 DOES WAIT NOW -- and only PP0. The #969Z verdict
                 # above ("TAKE WITHOUT WAITING, uniform and therefore
@@ -13093,7 +13122,9 @@ class Scheduler(
                 # correct 28672-token fetch (boot_855_tiprevert1033,
                 # 05:04:33). The wait is bounded by the prefetch policy
                 # ('timeout' by default) exactly as on the non-PP path.
-                if self.ps.pp_rank == 0 and not _pp0_may_withhold:
+                if _told_armed:
+                    pass  # #1400 decided above; the wireless terms stay dormant.
+                elif self.ps.pp_rank == 0 and not _pp0_may_withhold:
                     # #973 execution proof, with its denominator: `n` counts
                     # every request PP0 admits through the disarmed gate,
                     # `pending` the subset whose own prefetch had NOT
@@ -13152,7 +13183,11 @@ class Scheduler(
                             continue
                 # Credit a completed store hit if there is one; followers
                 # (pp_rank>0) credit only and decide nothing (#969Z).
-                loaded_tokens = self.tree_cache.pop_prefetch_loaded_tokens(req.rid)
+                loaded_tokens = (
+                    int(_told_loaded)
+                    if _told_loaded is not None
+                    else self.tree_cache.pop_prefetch_loaded_tokens(req.rid)
+                )
                 # #1157: the popped record carries the probe's answer; a
                 # probed miss (or a probed span short of the demand by more
                 # than one chunk) beside a restore stamp is the group STOP,
@@ -13181,7 +13216,9 @@ class Scheduler(
                 # what makes the deletion visible in the #788 verdict trace
                 # instead of being an absence nobody can see.
                 self._969z_followed = getattr(self, "_969z_followed", 0) + 1
-                if self._969z_followed == 1 or self._969z_followed % 512 == 0:
+                if not _told_armed and (
+                    self._969z_followed == 1 or self._969z_followed % 512 == 0
+                ):
                     logger.warning(
                         "#969Z PREFETCH VERDICT NOT TAKEN HERE (rank %d, n=%d): "
                         "no rank of a PP group withholds admission for its own "
@@ -13505,7 +13542,12 @@ class Scheduler(
                 # this drop stops firing on its own. A gate keyed on the flip,
                 # or on pp_size alone, would have to be remembered and removed by
                 # hand -- this one cannot silently outlive its reason.
-                if not pp_row_carrier_present(self):
+                if not pp_row_carrier_present(self) and not weg2_store_told.armed(
+                    self
+                ):
+                    # #1400: with the told carrier the extent IS distributable
+                    # (every rank loaded exactly PP0's told span); the drop
+                    # stays for the carrierless form without it.
                     _dropped = clear_state_aligned_extent_undistributable(req)
                     if _dropped:
                         _n45 = getattr(self, "_1245_loadback_dropped", 0) + 1

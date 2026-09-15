@@ -298,6 +298,9 @@ PREFETCH_DECLINE_ORDER = (
 #: be reconstructed from a different log (denominator law).
 PREFETCH_INTAKE_PARTITION = (
     "issued",
+    # #1400: a PP follower on the carrierless form registers nothing at
+    # intake; its registration follows PP0's told verdict one pass later.
+    "weg2_held",
     "storage_disabled",
     "store_absent",
     "anchor_no_vote",
