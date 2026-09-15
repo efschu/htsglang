@@ -1703,6 +1703,28 @@ def _blocks_of(geom: ParamGeom, layout: GroupLayout, is_dst: bool) -> List[List[
                 f"from the plan with no refusal at all -- fail-open in the "
                 f"direction where this group is the DESTINATION (spec §1.4)."
             )
+        # #1378 xsn54 (DER ZWEITE HALBEN-GUARD, GESCHLOSSEN): `stage is None`
+        # on a tp_size==1 group does NOT make the parameter vanish -- it plans
+        # it on EVERY rank.  Measured on the weg2xsn53 boot: the wake plan
+        # carried 12 layer-39 pieces (P rank 1's own holding) on P rank 0's
+        # lane because the join's stage attribution was absent for them, and
+        # this fall-through answered "every rank holds it".  On the
+        # destination side that is silent cross-rank spill; on the source
+        # side it is the 102-of-102 "no address" refusal.  So a tp_size==1
+        # layout with an unnamed holder is refused, the same class as W15's
+        # half-guard: the comment above names the vanish, the code allowed
+        # the spill.
+        if is_dst and layout.tp_size == 1 and geom.stage is None:
+            raise Weg2XchgPlanDisagree(
+                f"W68 Weg2XchgPlanDisagree: {geom.name} carries NO holder "
+                f"stage for the tp_size==1 group {layout.name!r} -- a PP-form "
+                f"group plans a parameter on EVERY rank when the holder is "
+                f"unnamed, which is how the weg2xsn53 boot put P rank 1's "
+                f"layer-39 bytes on P rank 0's lane (measured: lane c0 "
+                f"planned=114 owned=102). Refusing rather than planning an "
+                f"ownership the manifests do not state (the SOURCE side keeps "
+                f"its every-rank shape until its own defect is measured)."
+            )
         holders = (
             list(range(layout.n_ranks)) if geom.stage is None else [int(geom.stage)]
         )
