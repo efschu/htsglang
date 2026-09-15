@@ -2482,14 +2482,38 @@ def run_sequential_units(descs, ops, boot_nonce: str, *,
         # caught this on the first execution (UnboundLocalError, 8 failures).
         _seq_addr = _mmap_addr(buf)
         _seq_registered = "no"
+        _reg_refusal = ""
         try:
             ops.host_register(int(_seq_addr), int(biggest),
                               tp.CUDA_HOST_REGISTER_PORTABLE)
             _seq_registered = "yes"
+        except AttributeError:
+            # the desk fakes carry no pin at all: unpinned, and nothing to
+            # unregister later
+            _seq_registered = "unavailable"
         except Exception as _reg_exc:  # noqa: BLE001
+            # #1378 xsn70 -- A FAILED PIN IS A REFUSAL, NOT A DEGRADE. The
+            # tolerant form ("no(RuntimeError)", carry on unpinned) hid the
+            # defect this commit fixes: the previous lane's buffer was closed
+            # WITHOUT cudaHostUnregister, so the driver still held its VA
+            # range pinned to the OLD pages; the next lane's mmap landed on the
+            # same range, its register failed (already registered), and the
+            # copy engine read the stale registration -- p2's 72 pieces
+            # "matched" on the CPU digest while the DMA source was another
+            # file's pages, and p4's last piece, 1804 bytes past the stale
+            # range, died with cudaMemcpyAsync rc=1 invalid argument.
             _seq_registered = f"no({type(_reg_exc).__name__})"
+            _reg_refusal = (f"host_register failed for lane {lane_key} "
+                            f"addr={int(_seq_addr)} bytes={int(biggest)}: "
+                            f"{type(_reg_exc).__name__}: {_reg_exc} -- a copy "
+                            f"out of an unpinnable range would read whatever "
+                            f"registration the driver still holds there")
         log(f"WEG2-SEQ register lane={lane_key} bytes={int(biggest)} "
             f"addr={int(_seq_addr)} registered={_seq_registered}")
+        if _reg_refusal:
+            _seq_mm.close()
+            _fh.close()
+            return _reg_refusal
     sems = tp.SemSet(boot_nonce)
     # The lane the lane-form ran its copies on, or the default stream when the
     # device ops do not expose stream creation (the desk fakes).
@@ -2709,6 +2733,18 @@ def run_sequential_units(descs, ops, boot_nonce: str, *,
         except OSError:
             pass
     if _owns_buf and _seq_mm is not None:
+        # #1378 xsn70: UNREGISTER BEFORE THE MUNMAP, or the driver keeps this
+        # VA range pinned to these pages after they are gone -- the next
+        # lane's mmap reuses the range, its own register fails, and its
+        # copies read the stale pin (see the register site above).
+        if _seq_registered == "yes":
+            try:
+                ops.host_unregister(int(_seq_addr))
+                log(f"WEG2-SEQ unregister lane={lane_key} addr={int(_seq_addr)} ok")
+            except Exception as _unreg_exc:  # noqa: BLE001
+                log(f"WEG2-SEQ unregister lane={lane_key} addr={int(_seq_addr)} "
+                    f"FAILED {type(_unreg_exc).__name__}: {_unreg_exc} -- the "
+                    f"range stays pinned; the next lane on it will refuse")
         _seq_mm.close()
     if _owns_buf and _fh is not None:
         _fh.close()

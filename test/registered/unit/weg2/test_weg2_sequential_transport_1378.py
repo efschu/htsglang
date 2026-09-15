@@ -280,3 +280,62 @@ class LaneBufferIsTheLanesOwnSum(_TransportHarness):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class _PinOps(_MemOps):
+    """The address-honest ops WITH a pin: records every register/unregister so
+    the pairing can be asserted. `fail_register` makes the pin raise the way
+    cudart does on an already-registered range (rc=712)."""
+
+    def __init__(self, fail_register=False):
+        super().__init__()
+        self.pins = []
+        self.fail_register = fail_register
+
+    def host_register(self, ptr, nbytes, flags):
+        if self.fail_register:
+            raise RuntimeError("cudaHostRegister rc=712 part or all of the "
+                               "requested memory range is already mapped")
+        self.pins.append(("register", int(ptr), int(nbytes)))
+
+    def host_unregister(self, ptr):
+        self.pins.append(("unregister", int(ptr)))
+
+
+class TheLanePinIsUnregisteredBeforeTheBufferGoes(_TransportHarness):
+    """#1378 xsn70: P rank 0 pinned lane c0's buffer, closed it WITHOUT
+    cudaHostUnregister, and the next two lanes' mmaps landed on the same VA
+    range -- their register failed (already registered), 72 of p2's pieces
+    read the stale pin, and p4's last piece, 1804 bytes past the stale range,
+    died with cudaMemcpyAsync rc=1. Mutant: the shipped close, no unregister."""
+
+    def setUp(self):
+        super().setUp()
+        self.ops = _PinOps()
+
+    def test_every_register_has_its_unregister_at_the_same_address(self):
+        nbytes = [64, 128, 32]
+        descs = []
+        for i, n in enumerate(nbytes):
+            src, dst = self._vram_pair(n, i)
+            self.ops.write(src, bytes([0xA0 + i]) * n)
+            descs.append(_desc(f"unit{i}", n, src_ptr=src, dst_ptr=dst))
+        self.assertEqual(self._deposit(descs), "")
+        self.assertEqual(self._collect(descs), "")
+        regs = [p for p in self.ops.pins if p[0] == "register"]
+        unregs = [p for p in self.ops.pins if p[0] == "unregister"]
+        self.assertEqual(len(regs), 2, self.ops.pins)          # one lane, two phases
+        self.assertEqual(len(unregs), 2, self.ops.pins)
+        for r, u in zip(regs, unregs):
+            self.assertEqual(r[1], u[1], "unregister must name the registered address")
+        # order per phase: register ... unregister
+        kinds = [p[0] for p in self.ops.pins]
+        self.assertEqual(kinds, ["register", "unregister"] * 2, kinds)
+
+    def test_a_failed_pin_refuses_the_lane_instead_of_copying_unpinned(self):
+        self.ops = _PinOps(fail_register=True)
+        src, dst = self._vram_pair(64, 0)
+        self.ops.write(src, b"\x11" * 64)
+        rc = self._deposit([_desc("unit0", 64, src_ptr=src, dst_ptr=dst)])
+        self.assertIn("host_register failed", rc)
+        self.assertTrue(any("registered=no(RuntimeError)" in ln for ln in self.lines))
