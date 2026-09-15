@@ -2577,6 +2577,96 @@ def weights_region_tag(tag: str) -> Iterator[str]:
         _WEIGHTS_REGION_TAG = previous
 
 
+#: #1378 xsn66 -- ONE CACHING-ALLOCATOR POOL PER WEIGHTS TAG, process-local.
+#:
+#: torch_memory_saver tags at ``cudaMalloc`` granularity, i.e. per caching-
+#: allocator SEGMENT, and the allocator packs every allocation under ~10 MiB
+#: into shared segments (2 MiB small pool, 20 MiB medium blocks).  A segment
+#: therefore carries the tag that was current when it was OPENED, and every
+#: later small tensor that lands in it -- from any tag -- is paused and resumed
+#: with THAT tag, not with the tag its name puts it under in the manifest.
+#: MEASURED on weg2xsn66 (846bf739ec): P rank 0 opens the base region
+#: (embed_tokens + its INT8 weight_scale) before layer 0, so layer 0's
+#: ``input_layernorm.weight`` (10240 B) sits in a segment owned by ``weights``;
+#: after ``resume(weights_0)`` the driver read it as type=0 (unmapped) and the
+#: first copy-out of lane c0 died with SIGSEGV -- xsn55..xsn66, twelve boots.
+#: P rank 2 has no embedding, its first small segment was opened under
+#: ``weights_6``, and layer 52's ``dt_bias`` read type=2 after
+#: ``resume(weights_6)``: the same code, pure by accident of load order.
+#:
+#: The pool is what makes a tag's segments its own -- the same mechanism the
+#: graph scratch uses above (``_GRAPH_SCRATCH_POOL``): allocations inside
+#: ``use_mem_pool(pool)`` only ever share segments with each other.  One pool
+#: per tag, for the base region, the draft region and every layer band.  Cost:
+#: each pool keeps its own partially filled small/medium segment, up to ~22 MiB
+#: per tag per rank -- measured by the post-load VRAM census, never assumed.
+_TAG_MEM_POOLS: Dict[str, Any] = {}
+_TAG_POOL_UNAVAILABLE_SAID = False
+
+
+def tag_mem_pool(tag: str) -> Any:
+    """The pool of ``tag``, created on first use; None when torch has none."""
+    import torch
+
+    mempool_cls = getattr(torch.cuda, "MemPool", None)
+    if mempool_cls is None:
+        return None
+    pool = _TAG_MEM_POOLS.get(tag)
+    if pool is None:
+        pool = mempool_cls()
+        _TAG_MEM_POOLS[tag] = pool
+        logger.info(
+            "WEG2-TAG-POOL tag=%s pool=new pools=%d -- this tag's allocations "
+            "share caching-allocator segments with nothing else (#1378 xsn66: "
+            "a segment carries the tag it was OPENED under)",
+            tag, len(_TAG_MEM_POOLS),
+        )
+    return pool
+
+
+@contextmanager
+def tag_pool_scope(tag: str) -> Iterator[Any]:
+    """Route every allocation inside into ``tag``'s own pool.
+
+    Degrades LOUDLY, once, when torch has no ``MemPool``/``use_mem_pool``: the
+    allocations then share segments across tags, which is the weg2xsn66 shape,
+    and a reader of the boot log must be able to see that this is so.
+    """
+    global _TAG_POOL_UNAVAILABLE_SAID
+    import torch
+
+    use_mem_pool = getattr(torch.cuda, "use_mem_pool", None)
+    stack = ExitStack()
+    pool = None
+    why = ""
+    try:
+        pool = tag_mem_pool(tag) if use_mem_pool is not None else None
+        if pool is not None:
+            stack.enter_context(use_mem_pool(pool))
+    except Exception as exc:  # noqa: BLE001 -- no CUDA context, a torch that
+        # refuses the pool: degrade to the shared pool, LOUDLY, same as the
+        # graph scratch region above. Raising here would turn a segment-purity
+        # fix into a load-time boot killer.
+        stack.close()
+        pool = None
+        why = f"{type(exc).__name__}: {exc}"
+    if pool is None:
+        if not _TAG_POOL_UNAVAILABLE_SAID:
+            _TAG_POOL_UNAVAILABLE_SAID = True
+            logger.warning(
+                "WEG2-TAG-POOL UNAVAILABLE (MemPool=%s use_mem_pool=%s%s): weights "
+                "tags SHARE caching-allocator segments -- a small tensor of one "
+                "tag can sit in a segment another tag pauses (weg2xsn66 shape)",
+                getattr(torch.cuda, "MemPool", None) is not None,
+                use_mem_pool is not None,
+                f" {why}" if why else "",
+            )
+        yield None
+        return
+    with stack:
+        yield pool
+
+
 @contextmanager
 def weights_region(adapter: Any, tag: str, *, enable_cpu_backup: bool) -> Iterator[str]:
     """Open a WEIGHTS region AND publish its tag -- the only way to do either.
@@ -2605,7 +2695,12 @@ def weights_region(adapter: Any, tag: str, *, enable_cpu_backup: bool) -> Iterat
         )
     with weights_region_tag(tag):
         with adapter.region(tag, enable_cpu_backup=enable_cpu_backup):
-            yield tag
+            # #1378 xsn66: the base tag's own pool, INSIDE the region so its
+            # segments are cudaMalloc'ed under this tag. A layer band nested
+            # below (weight_chunk_scope) switches to its own pool for its
+            # duration and returns here on exit.
+            with tag_pool_scope(tag):
+                yield tag
 
 
 @contextmanager
@@ -2633,7 +2728,11 @@ def weight_chunk_scope(layer_id: Optional[int]) -> Iterator[Optional[str]]:
         return
     cdll.tms_set_current_tag(tag.encode("utf-8"))
     try:
-        yield tag
+        # #1378 xsn66: the tag alone is not enough -- it names the segment the
+        # allocator OPENS, not the one it REUSES. The band's own pool is what
+        # keeps its small tensors out of another tag's segment.
+        with tag_pool_scope(tag):
+            yield tag
     finally:
         cdll.tms_set_current_tag(base.encode("utf-8"))
 

@@ -5789,6 +5789,44 @@ class SchedulerWeightUpdaterManager:
                                 _rows.append(
                                     f"{_lbl} name={_pair[0]!r} rc={_prc} "
                                     f"type={_pty} device={_pdev}")
+                            # xsn66 -- THE PURITY CENSUS: of the parameters
+                            # whose NAME puts them under this tag (the same
+                            # attribution the manifest uses), how many does
+                            # the driver see mapped after this tag's resume?
+                            # `unmapped>0` here is the weg2xsn66 defect
+                            # (a small tensor in a segment another tag owns);
+                            # 0 is the acceptance of the per-tag pool.
+                            try:
+                                from sglang.srt.layers.utils.common import (
+                                    get_layer_id as _gli,
+                                )
+                                from sglang.srt.managers.weg2_memory_saver import (
+                                    weight_chunk_tag as _wct,
+                                )
+                                _n_map = _n_unmap = 0
+                                _first_unmapped = None
+                                for _pn, _pt in _pm.named_parameters():
+                                    _lid = _gli(_pn)
+                                    _own = (_wct(_lid) if _lid is not None
+                                            else None) or "weights"
+                                    if _own != str(tag):
+                                        continue
+                                    _ty = _bx_probe.ptr_attrs(
+                                        int(_pt.data_ptr()))[1]
+                                    if _ty == 2:
+                                        _n_map += 1
+                                    else:
+                                        _n_unmap += 1
+                                        if _first_unmapped is None:
+                                            _first_unmapped = (
+                                                f"{_pn}({int(_pt.numel()) * int(_pt.element_size())}B,type={_ty})")
+                                _rows.append(
+                                    f"own_tag={tag} mapped={_n_map} "
+                                    f"unmapped={_n_unmap} "
+                                    f"first_unmapped={_first_unmapped}")
+                            except Exception as _cx:  # noqa: BLE001
+                                _rows.append(
+                                    f"census=NOT-MEASURED({type(_cx).__name__})")
                             _probe_row = " | ".join(_rows)
                         if _probe_row is None:
                             # NO explanatory text on a row that measured
