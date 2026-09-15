@@ -429,7 +429,7 @@ class TestFlipUsesTheOrder(CustomTestCase):
     def test_an_order_that_is_not_a_permutation_stops_before_any_weight_moves(self):
         f = self._front({})
         old_fn = front_mod.interleave_pause_order
-        front_mod.interleave_pause_order = lambda tags, cards, free: (["weights_0"] * len(tags), "bogus")
+        front_mod.interleave_pause_order = lambda tags, cards, free, **kw: (["weights_0"] * len(tags), "bogus")
         try:
             self._run(f)
         finally:
@@ -455,3 +455,37 @@ class TestFlipUsesTheOrder(CustomTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestRoundRobinOverDestinationCards(unittest.TestCase):
+    """2026-09-15 (weg2xsn99): with a PIPELINE destination the pause order
+    interleaves the per-card queues so every destination card gets its
+    first tag within the first round (PP1 idled 1.2 s on the metal)."""
+
+    def test_pipeline_destination_gets_every_card_a_tag_in_round_one(self):
+        tags = weights_family_tags(CHUNK_COUNT)
+        src = {t: [0, 1, 2] for t in tags if t.startswith("weights_")}  # TP source: uniform
+        dst = {t: list(v) for t, v in chunk_tag_cards(
+            P_STAGE_LAYERS, LAYERS_PER_CHUNK, CHUNK_COUNT, card_of_stage=NVML_OF_STAGE).items()}
+        order, why = front_mod.interleave_pause_order(
+            tags, src, {0: 5000, 1: 9000, 2: 3000}, dst_cards=dst)
+        self.assertIn("round-robin", why)
+        first_card_of = {}
+        for i, tg in enumerate(order):
+            c = (dst.get(tg) or [-1])[0]
+            first_card_of.setdefault(c, i)
+        cards = sorted(k for k in first_card_of if k >= 0)
+        self.assertGreater(len(cards), 1)
+        self.assertTrue(all(first_card_of[c] < len(cards) for c in cards),
+                        f"every card within round one: {order} {first_card_of}")
+        self.assertEqual(sorted(order), sorted(tags))
+
+    def test_uniform_destination_keeps_the_tightest_card_order(self):
+        tags = weights_family_tags(CHUNK_COUNT)
+        m = {t: list(v) for t, v in chunk_tag_cards(
+            P_STAGE_LAYERS, LAYERS_PER_CHUNK, CHUNK_COUNT, card_of_stage=NVML_OF_STAGE).items()}
+        uni = {t: [0, 1, 2] for t in tags if t.startswith("weights_")}
+        a, _ = front_mod.interleave_pause_order(tags, m, FREE_AT_INTERLEAVE_START)
+        b, why = front_mod.interleave_pause_order(tags, m, FREE_AT_INTERLEAVE_START, dst_cards=uni)
+        self.assertEqual(a, b)
+        self.assertNotIn("round-robin", why)

@@ -1242,6 +1242,7 @@ def interleave_pause_order(
     tags: List[str],
     tag_cards: Dict[str, Any],
     free_mib: Dict[int, int],
+    dst_cards: Optional[Dict[str, Any]] = None,
 ) -> Tuple[List[str], str]:
     """The order the SOURCE group pauses its weights family in: TIGHTEST CARD
     FIRST.  Returns ``(order, why)``; ``why`` names the reason in the log.
@@ -1301,6 +1302,33 @@ def interleave_pause_order(
         return tags, f"identity REFUSED to reorder: cards {unknown} absent from the NVML free sample {sorted(free_mib)}"
     index = {t: i for i, t in enumerate(chunks)}
     order = sorted(chunks, key=lambda t: (min(free_mib[int(c)] for c in tag_cards[t]), index[t]))
+    # 2026-09-15 (weg2xsn99, Nutzer-Order Punkt 1): ROUND-ROBIN OVER THE
+    # DESTINATION CARDS. Under the per-tag lockstep the waking rank on a
+    # card idles until the FIRST tag it holds is deposited; with a pipeline
+    # destination (chunks on distinct stages/cards) the tightest-card-first
+    # walk served four of card 0's tags (~140 ms each) before card 1 saw
+    # its first -- 1.2 s of idle per leg measured on PP1. Keep the
+    # tightest-card priority between the per-card queues, but interleave
+    # the queues so every destination card gets a tag within the first
+    # round. A uniform destination (every tag on every card: the TP group)
+    # has one queue and keeps the order unchanged.
+    if dst_cards:
+        queues: Dict[Any, list] = {}
+        seq: list = []
+        for t in order:
+            cs = dst_cards.get(t) or ()
+            key = int(cs[0]) if cs else -1
+            if key not in queues:
+                queues[key] = []
+                seq.append(key)
+            queues[key].append(t)
+        if len(seq) > 1:
+            rr: list = []
+            while any(queues[k] for k in seq):
+                for k in seq:
+                    if queues[k]:
+                        rr.append(queues[k].pop(0))
+            return rr + rest, "tightest-card-first, round-robin over destination cards"
     return order + rest, "tightest-card-first"
 
 
@@ -4296,7 +4324,8 @@ class Front:
         # `CardFree` cannot break either.
         free_mib = {c.nvml_index: c.free_mib for c in _nvml_free()}
         pause_order, why = interleave_pause_order(
-            self.weights_tags, self.src_chunk_cards.get(src, {}), free_mib
+            self.weights_tags, self.src_chunk_cards.get(src, {}), free_mib,
+            dst_cards=self.src_chunk_cards.get(dst, {}),
         )
         logger.info(
             "WEG2-FLIP-ORDER epoch=%d src=%s driver_free=%s pause_order=%s resume_order=%s (%s) "
