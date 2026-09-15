@@ -5800,6 +5800,14 @@ class SchedulerWeightUpdaterManager:
         # state the first attempt left it, and refusing there would turn a safe
         # no-op into a group death.
         replay = self._weg2_leg_replay("release", recv_req)
+        _weg2_ph_t = [time.perf_counter()]
+        _weg2_ph_l = []
+        
+        def _weg2_ph(name):
+            _n = time.perf_counter()
+            _weg2_ph_l.append((name, (_n - _weg2_ph_t[0]) * 1000))
+            _weg2_ph_t[0] = _n
+        
         if replay is not None:
             return replay
         # C16/C17: this rank's own per-tag report of THIS leg, filled by the
@@ -5861,6 +5869,7 @@ class SchedulerWeightUpdaterManager:
         # judging. Any non-HiCache blocker still fails the assert below.
         if not self.is_fully_idle():
             self._weg2_drain_hicache_before_sleep()
+            _weg2_ph("drain_hicache")
 
         assert (
             self.is_fully_idle()
@@ -5953,6 +5962,7 @@ class SchedulerWeightUpdaterManager:
             # device may be appended after the pause in this block.
             self.flush_cache()
             self.memory_saver_adapter.pause(GPU_MEMORY_TYPE_KV_CACHE)
+            _weg2_ph("kv_pause")
             # W25 Weg2DormantRefused (S1 boot killer K2): from this statement
             # on the req-index / KV / mamba pools are unmapped, so the
             # admission seams (Scheduler.handle_generate_request /
@@ -6010,6 +6020,7 @@ class SchedulerWeightUpdaterManager:
             # anything.  The epoch is THE FLIP'S, carried on the request by the
             # front that owns it -- see :meth:`_weg2_open_credit_for_leg`.
             credit = self._weg2_open_credit_for_leg(getattr(recv_req, "epoch", None))
+            _weg2_ph("census_credit")
             # #1273 S5b: the SOURCE half of the shadow, at the last instant the
             # weight pages are mapped.  See _weg2_shadow_source_leg for why it
             # is here and not after the pause.  Never raises; on the `ring`
@@ -6032,6 +6043,7 @@ class SchedulerWeightUpdaterManager:
             # the hook returns after one import, so the band is unaffected.
             weg2_leg_t0 = time.perf_counter()
             self._weg2_shadow_source_leg(recv_req)
+            _weg2_ph("source_hook")
             # #1350 SEAM GRADER, source side.  HERE for two reasons, both of
             # which are the same ones the shadow hook above is placed by:
             #
@@ -6050,6 +6062,7 @@ class SchedulerWeightUpdaterManager:
             # would be the campaign (a) fault.
             if not family_paused_before:
                 self._weg2_seam_digest_before(recv_req, weights_tags)
+                _weg2_ph("seam_before")
             # #1284: the NEED series, and the refusal that reads it.  The pause
             # below is what enters ``host_ring.cpp``'s blocking acquire, and on
             # weg2sb5e that acquire sat out its whole 110 s budget in silence
@@ -6087,6 +6100,7 @@ class SchedulerWeightUpdaterManager:
             # the copies stay outside every lock.
             with self._weg2_pcie_lock_retired("sleep-D2H " + ",".join(weights_tags)):
                 _t_prev_end = None
+                logger.info("WEG2-SLEEP-PRELOOP ms " + " ".join(f"{_n}={_ms:.0f}" for _n, _ms in _weg2_ph_l) + f" t={time.time():.3f}")
                 for tag in weights_tags:
                     weg2_ring_guard.guard_tag(
                         tag,
@@ -6299,6 +6313,14 @@ class SchedulerWeightUpdaterManager:
         # very first mutation below drops each tag from the offload set, which
         # raises KeyError on a repeat, so without this the retry kills the group.
         replay = self._weg2_leg_replay("resume", recv_req)
+        _weg2_ph_t = [time.perf_counter()]
+        _weg2_ph_l = []
+        
+        def _weg2_ph(name):
+            _n = time.perf_counter()
+            _weg2_ph_l.append((name, (_n - _weg2_ph_t[0]) * 1000))
+            _weg2_ph_t[0] = _n
+        
         if replay is not None:
             return replay
         # C16/C17: this rank's own per-tag report of THIS leg, filled by the
@@ -6327,6 +6349,7 @@ class SchedulerWeightUpdaterManager:
         if GPU_MEMORY_TYPE_CUDA_GRAPH in tags:
             t_graph = time.perf_counter()
             self.memory_saver_adapter.resume(GPU_MEMORY_TYPE_CUDA_GRAPH)
+            _weg2_ph("cg_resume")
             graph_ms = (time.perf_counter() - t_graph) * 1000
             graph_bytes = self._weg2_tag_bytes(GPU_MEMORY_TYPE_CUDA_GRAPH)
             # WAKE INVARIANT FOR THE GRAPH TAG, the exact mirror of the
@@ -6377,6 +6400,7 @@ class SchedulerWeightUpdaterManager:
             # buffer (and, with the #1233 patched hook, frees that buffer).
             # Same lock, same reason as the sleep leg above.
             t_w0 = time.perf_counter()
+            _weg2_ph("pre_leg")
             shm0 = self._weg2_rss_shmem_mib()
             tag_bytes = {tag: self._weg2_tag_bytes(tag) for tag in weights_tags}
             # S7 (#1273): tag -> the saver's own pass-1/pass-2 decomposition of
@@ -6671,6 +6695,7 @@ class SchedulerWeightUpdaterManager:
                 if _errs:
                     raise _errs[0][1]
             weg2_leg_ms = (time.perf_counter() - t_w0) * 1000
+            _weg2_ph("leg_collects")
             card_uuid = self._weg2_card_uuid() or "unknown"
             for tag, (nbytes, tms) in weg2_per_tag.items():
                 # S7 (#1273): THREE FIELDS APPENDED, and the ring planner's
@@ -6732,6 +6757,7 @@ class SchedulerWeightUpdaterManager:
                 # from the live model at sleep stays the last writer for the
                 # buffers.  Both only once the WHOLE family is mapped again.
                 self._weg2_wake_reload_weights()
+                _weg2_ph("reload")
                 _import_static_state(
                     self.tp_worker.model_runner.model,
                     self.stashed_model_static_state,
@@ -6796,6 +6822,7 @@ class SchedulerWeightUpdaterManager:
                 # `test_the_compare_comes_after_the_reload_in_the_wake_path`
                 # pins the order; mutant M11 pulls it above the reload.
                 self._weg2_xchg_shadow_compare()
+                _weg2_ph("dest_hook_compare")
                 # #1350 SEAM GRADER, destination side.  THE SAME PLACEMENT RULE
                 # the two hooks above follow, and for the same reason: this is
                 # where the bytes have landed for every carrier, so a reading
@@ -6803,9 +6830,11 @@ class SchedulerWeightUpdaterManager:
                 # -- it is the only one that can RAISE, and the other two must
                 # have reached the log before it does.
                 self._weg2_seam_digest_after(recv_req, weights_tags)
+                _weg2_ph("seam_after")
 
         if GPU_MEMORY_TYPE_KV_CACHE in tags:
             self.memory_saver_adapter.resume(GPU_MEMORY_TYPE_KV_CACHE)
+            _weg2_ph("kv_resume")
             scheduler = self.scheduler
             if scheduler is not None and weg2_memory_saver_on:
                 # WAKE INVARIANT (boot weg2ls2b1 killer, 2026-09-07): the
@@ -6833,6 +6862,7 @@ class SchedulerWeightUpdaterManager:
                 # sleep) so the flush cannot refuse.
                 t_f0 = time.perf_counter()
                 flushed = self.flush_cache()
+                _weg2_ph("flush")
                 logger.info(
                     "WEG2-WAKE-INVARIANT kv_cache pools re-zeroed after resume: flush_cache=%s in %.0f ms "
                     "(fresh-boot zero invariant restored on recycled pages)",
@@ -6851,6 +6881,7 @@ class SchedulerWeightUpdaterManager:
                     "WEG2-DORMANT cleared: kv_cache resumed, admission seams admit"
                 )
                 self._weg2_rescan_store_index()
+                _weg2_ph("store_rescan")
                 if scheduler.disaggregation_mode == DisaggregationMode.DECODE:
                     for queue_name in (
                         "disagg_decode_transfer_queue",
@@ -6884,6 +6915,8 @@ class SchedulerWeightUpdaterManager:
                 per_tag=weg2_per_tag,
                 leg_ms=weg2_leg_ms,
             )
+            _weg2_ph("fence")
+            logger.info("WEG2-WAKE-TAIL ms " + " ".join(f"{_n}={_ms:.0f}" for _n, _ms in _weg2_ph_l) + f" t={time.time():.3f}")
         if store_failure and not report:
             # The fence did not gather: no memory saver, no cpu group, or
             # world <= 1. A single-rank engine cannot disagree with itself, so
