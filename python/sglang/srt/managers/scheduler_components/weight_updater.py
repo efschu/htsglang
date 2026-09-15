@@ -484,6 +484,11 @@ class SchedulerWeightUpdaterManager:
     #: whether it is at the first tag (prime the counter) or a later one (wait
     #: for the collector's `drained`). `None` until the first leg sets it.
     _weg2_xchg_tag_seen: Optional[set] = None
+    #: weg2xsn86 (#1378): ``{(tag, param_name)}`` this rank consumes but
+    #: never writes -- MEASURED target shares of the draft (embed_tokens on
+    #: D IS the target's tensor); set by ``_weg2_shadow_plan``'s draft branch,
+    #: read by ``_weg2_xchg_bounce_leg`` for ``run_sequential_units``.
+    _weg2_xchg_no_write: Optional[frozenset] = None
     #: True once the resume loop has collected tag by tag, so the once-per-wake
     #: entry stands down instead of injecting a second time over bytes already
     #: written.
@@ -3309,6 +3314,23 @@ class SchedulerWeightUpdaterManager:
                     _lm_head_excluded = "lm_head.weight"
                     logger.info(
                         "WEG2-XCHG-DRAFT-LMHEAD-TARGET-SHARED %s", _proof)
+                # weg2xsn86 (#1378): THE EMBEDDING IS THE OTHER SHARE.
+                # frozen_kv_mtp_worker_v2 hands the draft the target's
+                # embed_tokens AND lm_head (set_embed_and_head); on D the
+                # draft's `model.embed_tokens.weight` IS the target's tensor
+                # (region `weights`, still PAUSED while `weights_draft` is
+                # collected -> SIGSEGV in cuMemcpyAsync at draft unit 2 on
+                # all three TP ranks). lm_head is excluded from the JOIN on
+                # both sides because both measure the share; the embed is
+                # shared on D only (PP2 holds its own copy and deposits it),
+                # so it stays IN the lane -- consumed, never written -- to
+                # keep the two sides' unit indices aligned.
+                _shared, _eproof = self._weg2_draft_embed_target_shares()
+                self._weg2_xchg_no_write = frozenset(
+                    (str(draft_region_tag), str(n)) for n in _shared)
+                logger.info(
+                    "WEG2-XCHG-DRAFT-EMBED-TARGET-SHARED %s -> no_write=%s",
+                    _eproof, sorted(_shared))
             if draft_region_tag != wx.GPU_MEMORY_TYPE_WEIGHTS_DRAFT:
                 # A drafter this arm classifies as something other than the
                 # draft region (e.g. #631/#274's shapes, which stay in the
@@ -3377,6 +3399,50 @@ class SchedulerWeightUpdaterManager:
                     f"never silently excluded)")
         except BaseException as exc:  # noqa: BLE001 -- fail-closed observer
             return f"proof-failed:{_weg2_exc_note(exc)}"
+
+    def _weg2_draft_embed_target_shares(self):
+        """MEASURED, not assumed (weg2xsn86): the draft's ``embed_tokens``
+        parameters that ARE the target's (data_ptr identity), as a set of
+        the draft-side parameter names (``model.embed_tokens.weight``,
+        ``model.embed_tokens.weight_scale`` ...) plus a proof string.
+        Fail-closed: anything unmeasurable answers an EMPTY set -- an
+        unshared embed needs its bytes written, never silently skipped.
+        """
+        try:
+            drafter = _weg2_drafter_of(self)
+            draft_model = getattr(drafter, "model", None)
+            target_runner = getattr(getattr(self, "tp_worker", None),
+                                    "model_runner", None)
+            target_model = getattr(target_runner, "model", None)
+            d_inner = getattr(draft_model, "model", None)
+            t_inner = getattr(target_model, "model", None)
+            d_emb = getattr(d_inner, "embed_tokens", None)
+            t_emb = getattr(t_inner, "embed_tokens", None)
+            if d_emb is None or t_emb is None:
+                return frozenset(), ("no-embed (draft embed=%s target embed=%s)"
+                                     % (d_emb is not None, t_emb is not None))
+            t_ptrs = {}
+            for pname, p in t_emb.named_parameters(recurse=False):
+                try:
+                    t_ptrs[str(pname)] = int(p.data_ptr())
+                except BaseException:  # noqa: BLE001
+                    pass
+            shared, notes = set(), []
+            for pname, p in d_emb.named_parameters(recurse=False):
+                try:
+                    d_ptr = int(p.data_ptr())
+                except BaseException:  # noqa: BLE001
+                    continue
+                t_ptr = t_ptrs.get(str(pname))
+                if t_ptr is not None and t_ptr == d_ptr:
+                    shared.add(f"model.embed_tokens.{pname}")
+                    notes.append(f"{pname}:MEASURED-SHARED {d_ptr:#x}")
+                else:
+                    notes.append(f"{pname}:NOT-SHARED draft={d_ptr:#x} "
+                                 f"target={'-' if t_ptr is None else hex(t_ptr)}")
+            return frozenset(shared), " ".join(notes) or "no-params"
+        except BaseException as exc:  # noqa: BLE001 -- fail-closed observer
+            return frozenset(), f"proof-failed:{_weg2_exc_note(exc)}"
 
     def _weg2_cocard_peer_alive(self) -> bool:
         """Is the co-located rank on THIS card still alive?  NVML per-process
@@ -5125,6 +5191,9 @@ class SchedulerWeightUpdaterManager:
                             card=(None if pair is not None else
                                   int(getattr(group[0], "dst_rank", device))),
                             liveness=self._weg2_cocard_peer_alive,
+                            # weg2xsn86: (tag, name) pairs consumed but not
+                            # written -- MEASURED target shares of the draft.
+                            no_write=getattr(self, "_weg2_xchg_no_write", None),
                             # #1358: the identity the host-slot lines carry.
                             # This is the only frame where the group and the
                             # rank both exist.

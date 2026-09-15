@@ -2293,6 +2293,17 @@ def run_sequential_units(descs, ops, boot_nonce: str, *,
  #: and dies here.  Optional: the desk tests provide it; the metal uses the
  #: SEAM-DIGEST machinery (the position-weighted fold, 362856ea7c).
                          dst_digest_fn=None,
+                         #: weg2xsn86 (#1378): ``{(tag, param_name)}`` this
+                         #: rank must CONSUME but not WRITE -- a MEASURED
+                         #: target share (the draft's embed_tokens on D is
+                         #: the target's own tensor, set_embed_and_head), whose
+                         #: bytes the target's own leg carries and whose VA is
+                         #: still paused while the draft tag is collected
+                         #: (SIGSEGV in cuMemcpyAsync at draft unit 2, TP0/1/2).
+                         #: The unit stays in the lane so the two sides' unit
+                         #: lists keep their indices: the source (PP2) holds
+                         #: its OWN copy and deposits it.
+                         no_write=None,
                          liveness=None,
                          budget_s: float = 120.0,
                          #: #1378 xsn44: the shared buffer as a bytearray.
@@ -2657,6 +2668,15 @@ def run_sequential_units(descs, ops, boot_nonce: str, *,
                               f"collect={my_digest}")
                     return (f"digest mismatch at unit {i} {name!r}: "
                             f"deposit={dep_digest} collect={my_digest}")
+                if no_write and (str(getattr(desc, "tag", "") or ""),
+                                 str(name)) in no_write:
+                    # weg2xsn86: consumed (handshake, identity, transport
+                    # digest all held above), NOT written -- see `no_write`.
+                    log(f"WEG2-SEQ collect piece {i} {name!r} "
+                        f"tag={getattr(desc, 'tag', '')!r} digest={my_digest} "
+                        f"matches deposit NO-WRITE: a MEASURED target share on "
+                        f"this rank, the target's own leg carries these bytes")
+                    continue
                 if desc.dst_ptr is None:
                     return (f"collect at piece {i} {name!r}: the desc carries no "
                             f"dst_ptr -- this rank does not hold the destination "

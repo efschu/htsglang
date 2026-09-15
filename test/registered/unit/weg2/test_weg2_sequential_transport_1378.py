@@ -396,3 +396,52 @@ class Mutant3UnitIdentityMismatchDies(_TransportHarness):
         self.assertEqual(self._deposit([d]), "")
         self.assertEqual(self._collect([d]), "")
         self.assertEqual(self.ops.read(dst, n), b"\x77" * n)
+
+
+class NoWriteConsumesButDoesNotWrite(_TransportHarness):
+    """weg2xsn86: a MEASURED target share (the draft's embed on D IS the
+    target's tensor, region `weights`, still paused while `weights_draft`
+    is collected) must be CONSUMED -- handshake, identity and transport
+    digest as for every unit, so the two sides' unit indices stay aligned
+    -- and NOT written. MUTANT: the shipped collect, which wrote every unit
+    it consumed (SIGSEGV in cuMemcpyAsync at draft unit 2, TP0/1/2)."""
+
+    def test_the_no_write_unit_is_consumed_and_its_destination_untouched(self):
+        nbytes = [64, 128, 32]
+        descs = []
+        for i, n in enumerate(nbytes):
+            src, dst = self._vram_pair(n, i)
+            self.ops.write(src, bytes([0xE0 + i]) * n)
+            descs.append(_desc(f"unit{i}", n, src_ptr=src, dst_ptr=dst))
+        self.assertEqual(self._deposit(descs), "")
+        before = self.ops.read(int(descs[1].dst_ptr), nbytes[1])
+        rc = bx.run_sequential_units(
+            descs, self.ops, self.nonce, slot_bytes=1 << 30,
+            shm_root=self.root, phase=bx.PHASE_COLLECT,
+            no_write={("weights_0", "unit1")}, log=self.lines.append, card=1)
+        self.assertEqual(rc, "", rc)
+        self.assertEqual(self.ops.read(int(descs[0].dst_ptr), nbytes[0]),
+                         bytes([0xE0]) * nbytes[0])
+        self.assertEqual(self.ops.read(int(descs[2].dst_ptr), nbytes[2]),
+                         bytes([0xE2]) * nbytes[2])
+        self.assertEqual(self.ops.read(int(descs[1].dst_ptr), nbytes[1]),
+                         before, "the no-write unit's destination is untouched")
+        self.assertTrue(any("NO-WRITE" in ln and "unit1" in ln
+                            for ln in self.lines))
+
+    def test_no_write_is_keyed_by_tag_too(self):
+        """The target's OWN `weights` leg carries the same name -- a bare
+        name key would skip that write as well."""
+        n = 40
+        src, dst = self._vram_pair(n, 0)
+        self.ops.write(src, b"\x11" * n)
+        d = _desc("model.embed_tokens.weight", n, src_ptr=src, dst_ptr=dst)
+        self.assertEqual(self._deposit([d]), "")
+        rc = bx.run_sequential_units(
+            [d], self.ops, self.nonce, slot_bytes=1 << 30,
+            shm_root=self.root, phase=bx.PHASE_COLLECT,
+            no_write={("weights_draft", "model.embed_tokens.weight")},
+            log=self.lines.append, card=1)
+        self.assertEqual(rc, "", rc)
+        self.assertEqual(self.ops.read(dst, n), b"\x11" * n,
+                         "tag weights_0 is not in the no-write set: written")

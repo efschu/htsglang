@@ -53,6 +53,7 @@ from __future__ import annotations
 import os
 
 import pytest
+from types import SimpleNamespace
 
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 
@@ -823,3 +824,64 @@ def test_xsn83_resident_bytes_reading_is_three_valued(monkeypatch):
     assert m._weg2_tag_bytes("weights_6") == 0
     m.memory_saver_adapter = _Adapter(4096)
     assert m._weg2_tag_resident_bytes("weights_6") == 4096
+
+
+# ---------------------------------------------------------------------------
+# weg2xsn86 (#1378): the draft's embed_tokens on D IS the target's tensor.
+# ---------------------------------------------------------------------------
+
+
+class _P:
+    def __init__(self, ptr):
+        self._ptr = ptr
+
+    def data_ptr(self):
+        return self._ptr
+
+
+class _Emb:
+    def __init__(self, **ptrs):
+        self._ptrs = ptrs
+
+    def named_parameters(self, recurse=False):
+        return [(k, _P(v)) for k, v in self._ptrs.items()]
+
+
+def _wire_models(monkeypatch, m, draft_emb, target_emb):
+    import sglang.srt.managers.scheduler_components.weight_updater as wu
+    draft = SimpleNamespace(model=SimpleNamespace(model=SimpleNamespace(
+        embed_tokens=draft_emb)))
+    monkeypatch.setattr(wu, "_weg2_drafter_of", lambda self: draft, raising=True)
+    m.tp_worker = SimpleNamespace(model_runner=SimpleNamespace(
+        model=SimpleNamespace(model=SimpleNamespace(embed_tokens=target_emb))))
+
+
+def test_xsn86_shared_embed_params_are_measured_by_data_ptr(monkeypatch):
+    m = _manager(monkeypatch, group="D", rank=0)
+    _wire_models(monkeypatch, m,
+                 _Emb(weight=0x302000000, weight_scale=0x302f00000),
+                 _Emb(weight=0x302000000, weight_scale=0x302f00000))
+    shared, proof = m._weg2_draft_embed_target_shares()
+    assert shared == frozenset({"model.embed_tokens.weight",
+                                "model.embed_tokens.weight_scale"})
+    assert "MEASURED-SHARED" in proof
+
+
+def test_xsn86_an_own_embed_copy_is_not_shared_and_stays_written(monkeypatch):
+    """PP2's draft holds its OWN embed (no target embed on the last stage)."""
+    m = _manager(monkeypatch, group="P", rank=2)
+    _wire_models(monkeypatch, m,
+                 _Emb(weight=0x448000000, weight_scale=0x448f00000),
+                 _Emb(weight=0x302000000, weight_scale=0x302f00000))
+    shared, proof = m._weg2_draft_embed_target_shares()
+    assert shared == frozenset()
+    assert "NOT-SHARED" in proof
+
+
+def test_xsn86_unmeasurable_answers_empty_fail_closed(monkeypatch):
+    m = _manager(monkeypatch, group="D", rank=0)
+    import sglang.srt.managers.scheduler_components.weight_updater as wu
+    monkeypatch.setattr(wu, "_weg2_drafter_of", lambda self: None, raising=True)
+    shared, proof = m._weg2_draft_embed_target_shares()
+    assert shared == frozenset()
+    assert "no-embed" in proof
