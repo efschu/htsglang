@@ -4379,7 +4379,7 @@ class SchedulerWeightUpdaterManager:
                 _by_key.update(_m)
                 _ms += float(_p.ms)
                 _syncs += int(getattr(_p, "syncs", 0))
-            _keys = [idn.key for idn, _t in inventory]
+            _keys = [seam_digest.identity_of(idn, int(card)).key for idn, _t in inventory]
             if all(k in _by_key for k in _keys):
                 after = seam_digest.SeamReading(
                     stage="after", group=str(group), rank=int(rank), card=int(card),
