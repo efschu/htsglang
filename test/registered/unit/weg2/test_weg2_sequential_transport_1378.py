@@ -155,9 +155,13 @@ class Mutant1TransportRotatedUnitsDie(_TransportHarness):
                    _desc(descs[0].param_name, descs[0].nbytes,
                          src_ptr=descs[0].src_ptr, dst_ptr=descs[0].dst_ptr)]
         rc = self._collect(rotated)
-        self.assertIn("digest mismatch", rc,
-                      f"the rotated units must die on the transport digest: "
-                      f"{rc!r}")
+        # weg2xsn84: a rotated list now dies one check EARLIER, on the
+        # record's identity (unit 0's record names unit0, the collect asks
+        # for unit1) -- the digest witness behind it is unchanged and is
+        # what Mutant3 leaves standing for a same-name, same-size unit.
+        self.assertTrue("digest mismatch" in rc or "unit identity mismatch" in rc,
+                        f"the rotated units must die before the copy-out: "
+                        f"{rc!r}")
 
     def test_an_honest_list_passes_and_moves_the_bytes(self):
         """THE COUNTERPROBE the old form could not run: the unrotated list
@@ -339,3 +343,56 @@ class TheLanePinIsUnregisteredBeforeTheBufferGoes(_TransportHarness):
         rc = self._deposit([_desc("unit0", 64, src_ptr=src, dst_ptr=dst)])
         self.assertIn("host_register failed", rc)
         self.assertTrue(any("registered=no(RuntimeError)" in ln for ln in self.lines))
+
+
+class Mutant3UnitIdentityMismatchDies(_TransportHarness):
+    """weg2xsn84: the source paused in the interleaved order (weights_4
+    first), the destination resumed in the natural one (weights_0 first),
+    and D collected PP0's weights_4 units as weights_0's with every window
+    digest MATCHING -- same bytes, wrong tensor. The deposit record names
+    the tensor and its tag; a collect whose desc names another one must
+    refuse BEFORE the copy-out. MUTANT: the shipped collect, which checked
+    the digest only."""
+
+    def test_same_bytes_other_name_die_on_the_record_identity(self):
+        nbytes = [64, 128]
+        descs = []
+        for i, n in enumerate(nbytes):
+            src, dst = self._vram_pair(n, i)
+            self.ops.write(src, bytes([0xD0 + i]) * n)
+            descs.append(_desc(f"layer4.unit{i}", n, src_ptr=src, dst_ptr=dst))
+        self.assertEqual(self._deposit(descs), "")
+        other = [_desc(f"layer0.unit{i}", d.nbytes, src_ptr=d.src_ptr,
+                       dst_ptr=d.dst_ptr) for i, d in enumerate(descs)]
+        before = [self.ops.read(int(d.dst_ptr), int(d.nbytes)) for d in other]
+        rc = self._collect(other)
+        self.assertIn("unit identity mismatch", rc, rc)
+        self.assertIn("layer4.unit0", rc)
+        self.assertIn("layer0.unit0", rc)
+        for d, b in zip(other, before):
+            self.assertEqual(self.ops.read(int(d.dst_ptr), int(d.nbytes)), b,
+                             "refused BEFORE the copy-out: no byte moved")
+
+    def test_same_name_other_tag_dies_too(self):
+        n = 96
+        src, dst = self._vram_pair(n, 0)
+        self.ops.write(src, b"\x5a" * n)
+        dep = _desc("shared.name", n, src_ptr=src, dst_ptr=dst)
+        self.assertEqual(self._deposit([dep]), "")
+        col = wx.XchgDesc(
+            tag="weights_4", src_rank=1, dst_rank=1, param_name="shared.name",
+            kind=tp.FLAT, nbytes=n, rows=1, run_bytes=n, spitch=0, dpitch=0,
+            src_ptr=src, dst_ptr=dst)
+        rc = self._collect([col])
+        self.assertIn("unit identity mismatch", rc, rc)
+        self.assertIn("tag=weights_0", rc)
+        self.assertIn("tag=weights_4", rc)
+
+    def test_the_matching_identity_still_passes(self):
+        n = 48
+        src, dst = self._vram_pair(n, 0)
+        self.ops.write(src, b"\x77" * n)
+        d = _desc("same.tensor", n, src_ptr=src, dst_ptr=dst)
+        self.assertEqual(self._deposit([d]), "")
+        self.assertEqual(self._collect([d]), "")
+        self.assertEqual(self.ops.read(dst, n), b"\x77" * n)

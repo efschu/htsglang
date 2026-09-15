@@ -4336,8 +4336,21 @@ class Front:
         (s_code, s_body, s_ms), (w_code, w_body, w_ms) = await asyncio.gather(
             self.timed_rpc(S, "/release_memory_occupation",
                            {"tags": pause_order, "epoch": flip_epoch}, RPC_TIMEOUT_S),
+            # weg2xsn84 (#1378): THE WAKE WALKS THE SAME ORDER AS THE SLEEP.
+            # Since #1374 the two legs are a per-tag LOCKSTEP over one lane
+            # buffer -- deposit(t) -> pause(t) -> credit(t) on S, resume(t)
+            # -> collect(t) on D -- so the i-th tag S deposits must be the
+            # i-th tag D collects. With P as the source the interleave put
+            # weights_4 first (tight card) while D resumed weights_0 first:
+            # D read PP0's 174-unit weights_4 deposit as weights_0's first
+            # 174 units (per-unit digests 'matched' -- the bytes were the
+            # deposit's bytes, just not weights_0's) and waited 120 s for
+            # unit 174 that no deposit of weights_4 has. On the TP source
+            # the interleave happened to return the natural order, which is
+            # why leg 0 never showed it. `family` (natural order) remains
+            # the permutation check's reference above.
             self.timed_rpc(D, "/resume_memory_occupation",
-                           {"tags": family, "epoch": flip_epoch}, RPC_TIMEOUT_S),
+                           {"tags": pause_order, "epoch": flip_epoch}, RPC_TIMEOUT_S),
         )
         legs_wall_ms = (time.perf_counter() - t_gather0) * 1000
         s_done, s_per_tag, s_crit = completed_tags(s_body)

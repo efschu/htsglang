@@ -388,7 +388,7 @@ class TestFlipUsesTheOrder(CustomTestCase):
 
     def _run(self, f):
         old = front_mod._nvml_free
-        front_mod._nvml_free = lambda: [(i, f"uuid{i}", int(v)) for i, v in FREE_AT_INTERLEAVE_START.items()]
+        front_mod._nvml_free = lambda: [front_mod.CardFree(i, f"uuid{i}", int(v), 0) for i, v in FREE_AT_INTERLEAVE_START.items()]
         try:
             asyncio.run(f.flip("P", "D"))
         finally:
@@ -414,8 +414,15 @@ class TestFlipUsesTheOrder(CustomTestCase):
             ["weights_6", "weights_7", "weights_4", "weights_5",
              "weights_0", "weights_1", "weights_2", "weights_3", "weights"],
         )
-        # D resumes the family in the NATURAL order, then its kv.
-        self.assertEqual(resumed, [weights_family_tags(CHUNK_COUNT), ["kv_cache"]])
+        # weg2xsn84 (#1378): D resumes the family in the SAME order P pauses
+        # it, then its kv. The two gathered legs are a per-tag LOCKSTEP over
+        # one lane buffer (#1374: deposit(t)/pause(t) on S, resume(t)/
+        # collect(t) on D), so a natural-order resume against an interleaved
+        # pause read PP0's weights_4 deposit as weights_0 on the metal.
+        # MUTANT: the shipped `{"tags": family}` on the wake RPC.
+        self.assertEqual(resumed, [paused[1], ["kv_cache"]])
+        self.assertNotEqual(paused[1], weights_family_tags(CHUNK_COUNT),
+                            "the case only bites when the interleave reorders")
         self.assertEqual(f.epoch, 1)
         self.assertEqual(f.awake, "D")
 

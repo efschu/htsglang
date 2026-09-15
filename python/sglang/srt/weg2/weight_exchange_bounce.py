@@ -2620,6 +2620,33 @@ def run_sequential_units(descs, ops, boot_nonce: str, *,
                     except ValueError:
                         recs = {}
                 dep = recs.get(str(i), {})
+                # weg2xsn84 (#1378): THE RECORD NAMES THE TENSOR, SO CHECK IT.
+                # The per-unit digest alone cannot tell "the deposit's bytes
+                # arrived intact" from "the deposit is a DIFFERENT tag's
+                # unit i": D collected PP0's weights_4 units 0..173 into
+                # weights_0's tensors with every digest 'matching', because
+                # the source paused in the interleaved order and the
+                # destination resumed in the natural one. A unit whose
+                # record names another tensor is the pause/resume orders
+                # diverging, refused BEFORE the copy-out -- silent wrong
+                # bytes is the one shape this transport must never produce.
+                _dep_name = str(dep.get("name", "") or "")
+                _dep_tag = str(dep.get("tag", "") or "")
+                _my_tag = str(getattr(desc, "tag", "") or "")
+                if dep and (_dep_name != str(name)
+                            or (_dep_tag and _my_tag and _dep_tag != _my_tag)):
+                    dump_rank_stacks(
+                        "unit-identity-mismatch-seq", tag=str(name),
+                        rank=int(window_off),
+                        extra=f"unit {i} deposit={_dep_name!r}/{_dep_tag} "
+                              f"collect={name!r}/{_my_tag}")
+                    return (f"unit identity mismatch at unit {i}: the deposit "
+                            f"record names {_dep_name!r} tag={_dep_tag or '-'}, "
+                            f"this collect expects {name!r} tag="
+                            f"{_my_tag or '-'} -- the source's pause order and "
+                            f"this rank's resume order diverged (one lane "
+                            f"buffer, per-tag lockstep #1374); refused before "
+                            f"the copy-out")
                 dep_digest = str(dep.get("digest", ""))
                 my_digest = hashlib.sha256(
                     bytes(buf[window_off:window_off + nbytes])).hexdigest()[:16]
