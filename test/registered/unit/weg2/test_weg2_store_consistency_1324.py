@@ -578,3 +578,17 @@ def test_the_store_short_mark_is_exempt_from_the_symmetric_vote_refusal():
             f"{reason} is rank-uniform by construction and must not be refused "
             "by a rank-divergence argument"
         )
+
+
+def test_a_pp_producer_group_admits_a_partial_hit_instead_of_deferring():
+    """#1400 (boot xsn121, rid 06089842): on a PP prefill group the store
+    cannot be waited on -- this group IS the producer of the missing rest.
+    A read that terminated short is a partial hit; the arm stays dormant."""
+    deliverable = (SN6S_PROMPT_TOKENS // PAGE) * PAGE
+    s = _sched(PrefetchOutcome(SN6S_DELIVERED, matched=0, deliverable=deliverable,
+                    synced=SN6S_DELIVERED))
+    s.ps = types.SimpleNamespace(pp_size=3, pp_rank=0, tp_size=1)
+    r = _req()
+    assert s._weg2_note_store_shortfall(r) is None
+    assert not s._weg2_store_read_is_pending(r)
+    assert getattr(r, "_weg2_store_delivered", None) is None

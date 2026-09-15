@@ -11721,6 +11721,17 @@ class Scheduler(
         rid = str(getattr(req, "rid", "") or "")
         if not rid:
             return None
+        # #1400: a PP (prefill) group is the PRODUCER of what the store lacks.
+        # A read that terminated short of the span it asked for is a PARTIAL
+        # HIT to admit -- the remainder is this group's own prefill -- never
+        # a producer to wait for. Boot xsn121 (rid 06089842): PP0 deferred
+        # here on delivered=4095 deliverable=11126, re-issued the 7031-token
+        # remainder every pass into an exhausted host anchor pool, sat
+        # '1 queued, 0 running' for 120 s and died on the ring commit while
+        # PP1 (told 4095) had admitted -- the #969Z skew. The arm keeps its
+        # whole meaning on the single-stage consumer form (group D, leg 2).
+        if int(getattr(getattr(self, "ps", None), "pp_size", 1) or 1) > 1:
+            return None
         records = getattr(getattr(self, "tree_cache", None),
                           "prefetch_loaded_tokens_by_reqid", None)
         if not records:
