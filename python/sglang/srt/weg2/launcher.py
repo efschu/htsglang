@@ -4716,6 +4716,13 @@ def build_env(tree: str, venv: str, cvd: str, store_dir: str, debug_hold: bool, 
         env["SGLANG_HICACHE_FLUSH_PUBLISH_SWEEP"] = "1"
     else:
         env.pop("SGLANG_HICACHE_FLUSH_PUBLISH_SWEEP", None)
+    # 2026-09-15 (boot xsn129, D's leg-2 store reads 100-430 pages/s while the
+    # raw file reads run at 15k files/s): with the #720 read-buffer ring OFF
+    # every page read allocates a fresh PINNED host tensor (cudaHostAlloc +
+    # cudaFreeHost per page, under the driver lock the decode loop shares).
+    # The ring is allocated once and reused; 256 page buffers are a few MiB.
+    # An operator value in the environment wins.
+    env.setdefault("SGLANG_HICACHE_READ_BUFFERS", "256")
     if arming_floor_solved:
         env["SGLANG_ARMING_FLOOR_SOLVED"] = "1"
     else:
