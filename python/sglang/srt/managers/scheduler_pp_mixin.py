@@ -4431,7 +4431,10 @@ class SchedulerPPMixin:
                 try:
                     _n = getattr(self, "_969m_n", 0) + 1
                     self._969m_n = _n
-                    if _n <= 3000 or _n % 64 == 0:
+                    # order point 2: 3000-then-every-64th was 9429 lines per
+                    # boot on the pass path; the cross-rank comparison the
+                    # probe serves needs the first passes and a sparse tail.
+                    if _n <= 16 or _n % 512 == 0:
                         logger.warning(
                             "#969M ARM n=%d mb_id=%s epoch=%s",
                             _n,

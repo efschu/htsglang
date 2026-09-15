@@ -2271,6 +2271,16 @@ def seq_sync_batch() -> tuple:
     return int(max(1.0, mib) * (1 << 20)), max(1, min(units, 4096))
 
 
+def _piece_verbose(i: int, n: int) -> bool:
+    """Order point 2: the per-piece deposit/cf/collect lines were ~10k log
+    lines per flip in the scheduler processes. Keep the first four, every
+    64th and the last piece of a lane call -- the SIGSEGV hunt the cf line
+    served (xsn57-61) reads 'died at i or i+1' off the highest index that
+    ARRIVED, which sampling still gives to within 64. Refusals, NO-WRITE,
+    lane-time, first-piece-done and ptrattr stay unconditional."""
+    return i < 4 or i % 64 == 0 or i == n - 1
+
+
 def _sync_groups(pieces, max_bytes: int, max_units: int) -> list:
     """Index groups of ``pieces`` that share one synchronize. Deterministic
     from the piece list and the two bounds alone (both sides derive it, but
@@ -2892,9 +2902,10 @@ def run_sequential_units(descs, ops, boot_nonce: str, *,
                         sems.diagonal_post(int(card), _SEQ_SLOT, "full")
                     else:
                         sems.post(int(pair), _SEQ_SLOT, "full")
-                    log(f"WEG2-SEQ deposit piece {i} {name!r} tag={tag!r} "
-                        f"nbytes={nbytes} window={window_off} digest={digest} "
-                        f"ms={(_time.perf_counter()-t0)*1000:.1f}")
+                    if _piece_verbose(i, len(_batch.pieces)):
+                        log(f"WEG2-SEQ deposit piece {i} {name!r} tag={tag!r} "
+                            f"nbytes={nbytes} window={window_off} digest={digest} "
+                            f"ms={(_time.perf_counter()-t0)*1000:.1f}")
                     if not _first_done:
                         _first_done = True
                         # #1378 xsn55: the SECOND marker of the mapping interval.
@@ -3011,9 +3022,10 @@ def run_sequential_units(descs, ops, boot_nonce: str, *,
                 _buf_addr = (_ipc_base + window_off) if _ipc_base else (base_addr + window_off)
                 # #1378 xsn57/xsn59: the numbers BEFORE the copy-out, every
                 # piece, so a traceback-less SIGSEGV still names its piece.
-                log(f"WEG2-SEQ cf lane={lane_key} i={i}/{len(_batch.pieces)} "
-                    f"dst={int(dst_ptr)} src={int(_buf_addr)} base={int(base_addr)} "
-                    f"off={window_off} n={nbytes} k={piece.kind} nm={name!r}")
+                if _piece_verbose(i, len(_batch.pieces)):
+                    log(f"WEG2-SEQ cf lane={lane_key} i={i}/{len(_batch.pieces)} "
+                        f"dst={int(dst_ptr)} src={int(_buf_addr)} base={int(base_addr)} "
+                        f"off={window_off} n={nbytes} k={piece.kind} nm={name!r}")
                 if i == 0:
                     # #1378 xsn61: ask the driver whether it knows the address
                     _drc, _dty, _ddev = ptr_attrs(int(dst_ptr))
@@ -3053,8 +3065,9 @@ def run_sequential_units(descs, ops, boot_nonce: str, *,
                                 f"deposit={dep_digest} destination={dst_digest}")
                 # NO `empty` POST HERE -- the per-tag DRAIN is the caller's
                 # (`CrossSlotRendezvous.prime_drain/wait_drained/post_drained`).
-                log(f"WEG2-SEQ collect {label} digest={my_digest} "
-                    f"matches deposit")
+                if _piece_verbose(i, len(_batch.pieces)):
+                    log(f"WEG2-SEQ collect {label} digest={my_digest} "
+                        f"matches deposit")
         log(f"WEG2-SEQ lane-time lane={lane_key} phase={phase} units={len(_batch.pieces)} "
             f"bytes={total_bytes} total_ms={(time.perf_counter() - _t_lane0) * 1000:.0f} "
             f"wait_ms={_t_wait * 1000:.0f} copy_sync_ms={_t_copy * 1000:.0f} "

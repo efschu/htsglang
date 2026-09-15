@@ -864,7 +864,13 @@ def _969g_trace(direction: str, tag: str, stem: str) -> None:
     try:
         _n = getattr(HiCacheFile, "_969g_n", 0) + 1
         HiCacheFile._969g_n = _n
-        _cap = int(envs.SGLANG_HICACHE_KEY_TRACE_CAP.get() or 0) or 20000
+        # Order point 2 (xsn123): 20000 lines per rank per boot landed in the
+        # FIRST requests' seconds (PP1: 8151 lines in the second its second
+        # chunk ran 3x slow, 1278 ms for 3616 tokens against 479 ms for
+        # 4096), formatted under the GIL of the scheduler process while it
+        # launches kernels. 64 lines keep the writer/lookup stem comparison
+        # readable; SGLANG_HICACHE_KEY_TRACE_CAP raises it for a key hunt.
+        _cap = int(envs.SGLANG_HICACHE_KEY_TRACE_CAP.get() or 0) or 64
         if _n <= _cap:
             import sys as _sys
 
