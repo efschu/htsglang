@@ -5980,6 +5980,7 @@ class SchedulerWeightUpdaterManager:
             # per COPY inside run_bounce_leg (pcie_uuid); the waits between
             # the copies stay outside every lock.
             with self._weg2_pcie_lock_retired("sleep-D2H " + ",".join(weights_tags)):
+                _t_prev_end = None
                 for tag in weights_tags:
                     weg2_ring_guard.guard_tag(
                         tag,
@@ -5993,6 +5994,9 @@ class SchedulerWeightUpdaterManager:
                     # needs can run -- which is the ordering boot weg2xsn30
                     # did not have. The buffer holds a whole tag (Option 1),
                     # so this completes without its collector.
+                    _t_dep0 = time.perf_counter()
+                    _gap_ms = ((_t_dep0 - _t_prev_end) * 1000
+                               if _t_prev_end is not None else 0.0)
                     self._weg2_xchg_deposit_before_sleep(
                         flip_index=_weg2_flip_index_of(
                             getattr(recv_req, "epoch", None)),
@@ -6003,11 +6007,23 @@ class SchedulerWeightUpdaterManager:
                         float(tag_bytes.get(tag, 0)),
                         (time.perf_counter() - t_tag) * 1000,
                     ]
+                    _t_cr0 = time.perf_counter()
                     if credit is not None:
                         # The device bytes this tag's pause just gave back --
                         # the same number, from the same instrument, that the
                         # waking rank is waiting on.
                         credit.publish(tag, tag_bytes.get(tag, 0))
+                    _t_prev_end = time.perf_counter()
+                    # 2026-09-15 (Nutzer-Order: die Schlaefer-Schleife je Tag
+                    # messen): deposit = plan filter + gap check + lanes,
+                    # pause = tms unmap, credit = publish, gap = the loop's own
+                    # work between the previous tag's credit and this deposit.
+                    logger.info(
+                        "WEG2-SLEEP-TAG-TIME tag=%s deposit_ms=%.0f pause_ms=%.0f "
+                        "credit_ms=%.0f gap_ms=%.0f total_ms=%.0f",
+                        tag, (t_tag - _t_dep0) * 1000,
+                        weg2_per_tag[tag][1], (_t_prev_end - _t_cr0) * 1000,
+                        _gap_ms, (_t_prev_end - _t_dep0) * 1000)
             # #1360b: ONE `WEG2-RING NEED` LINE PER SAVED TAG, not per
             # ring-carried tag.  The loop above guards the `weights_*` family
             # because those are the tags whose bytes the peer has to release --
