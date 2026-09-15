@@ -85,19 +85,21 @@ class TestContinuousDecodeSteps(unittest.TestCase):
 
 
 class TestWritePolicyMeasurementArm(unittest.TestCase):
-    def test_default_is_the_shipped_write_through_on_both_groups(self):
+    def test_default_is_write_back_on_both_groups(self):
+        # 2026-09-15 (user decision, boots xsn128-134): write_back on P and
+        # D; the publish sweep before the flip is the eviction.
         for argv in (p(), d()):
             i = argv.index("--hicache-write-policy")
-            self.assertEqual(argv[i + 1], "write_through")
+            self.assertEqual(argv[i + 1], "write_back")
 
     def test_the_arm_moves_P_only(self):
-        argv_pp = p(write_policy="write_back")
+        argv_pp = p(write_policy="write_through")
         self.assertEqual(
-            argv_pp[argv_pp.index("--hicache-write-policy") + 1], "write_back"
+            argv_pp[argv_pp.index("--hicache-write-policy") + 1], "write_through"
         )
         argv_dd = d()
         self.assertEqual(
-            argv_dd[argv_dd.index("--hicache-write-policy") + 1], "write_through"
+            argv_dd[argv_dd.index("--hicache-write-policy") + 1], "write_back"
         )
 
 

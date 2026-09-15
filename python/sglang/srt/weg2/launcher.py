@@ -1490,6 +1490,8 @@ COLLECTIVE_CENSUS_INTERVAL = 50
 #: carve-out. It is cited here so P's window is not the one number in this file
 #: a reader has to go looking for.
 P_BARLINK_BAR1_WINDOW_MIB = "24,PP_0=96"
+#: Group P's device mamba pool (--max-mamba-cache-size); see argv_p.
+P_MAX_MAMBA_CACHE_SIZE = 24
 
 
 class Weg2LaunchRefused(RuntimeError):
@@ -2592,7 +2594,7 @@ def common_flags(
     m_mib: int,
     store_cfg: str,
     max_kv_per_request: int,
-    write_policy: str = "write_through",
+    write_policy: str = "write_back",
     group: str = "both",
     random_seed: int = RANDOM_SEED,
     barlink_cap_cycles: int = BARLINK_BAR1_CAP_CYCLES,
@@ -2777,7 +2779,7 @@ def argv_p(
     max_kv_per_request: int = CONTEXT_LENGTH_TOKENS,
     stage_ratio: Optional[str] = None,
     attn_stage_ratio: Optional[str] = None,
-    write_policy: str = "write_through",
+    write_policy: str = "write_back",
     depth: int = 0,
     window_mib: str = P_BARLINK_BAR1_WINDOW_MIB,
     random_seed: int = RANDOM_SEED,
@@ -2907,7 +2909,16 @@ def argv_p(
         else []
     ) + [
         "--port", str(PORT_P),
-    ] + admin_key_flag(admin_api_key) + extra
+    ] + admin_key_flag(admin_api_key) + (
+        # Boots xsn127-134 (2026-09-15): P's device mamba pool of 5 left a
+        # pin budget of 1 for the write_back anchors ("skipping the host
+        # backup"), so the store held KV without anchors and D's leg-2 reads
+        # came back short. 24 slots (pin budget 20) carried three parallel
+        # 11k requests. An operator value in --extra-p wins.
+        []
+        if any(str(a).startswith("--max-mamba-cache-size") for a in extra)
+        else ["--max-mamba-cache-size", str(P_MAX_MAMBA_CACHE_SIZE)]
+    ) + extra
 
 
 def w38_armed_line(argv_of_p: Sequence[str]) -> str:
@@ -2975,12 +2986,13 @@ def argv_d(
     # caller passes admin_api_key by keyword or stops before it; none can
     # collide with this.
     hicache_disabled: bool = False,
+    d_write_policy: str = "write_back",
     # #1369: APPENDED LAST for the same reason as `hicache_disabled` two
     # lines up -- `argv_d` has no `*` marker.
     weights_cpu_backup: bool = True,
 ) -> List[str]:
     return [py, "-m", "sglang.launch_server"] + common_flags(
-        model, s_gb, m_mib, store_cfg, max_kv_per_request, "write_through", "D",
+        model, s_gb, m_mib, store_cfg, max_kv_per_request, d_write_policy, "D",
         random_seed, barlink_cap_cycles, census_interval,
         hicache_disabled=hicache_disabled,
         weights_cpu_backup=weights_cpu_backup,
@@ -9415,9 +9427,11 @@ def build_parser() -> argparse.ArgumentParser:
     # against the disk (max_size >= P pool bytes, W57). The two knobs below are
     # the only ones the disk form has, and both have a stated default.
     ap.add_argument(
-        "--pin-ledger-arm-m", type=int, default=0,
+        "--pin-ledger-arm-m", type=int, default=600,
         help="#1317/#1318: PIN the host-ledger arm's mamba-host-pool size M (MiB) "
-             "instead of letting `host_ledger.choose` pick it. 0 = choose as before. "
+             "instead of letting `host_ledger.choose` pick it. 0 = choose. Default 600 "
+             "since 2026-09-15 (12-13 host anchor slots per rank; M=150 gave 4 and "
+             "dropped the next prefetch on xsn127). "
              "WHY IT EXISTS: #1318 derived the host ring multipliers from rows x cell "
              "bytes (D 6.0 -> 3.00 GB/S, P 2.0 -> 1.78), which frees 3.12 GiB at every "
              "arm and moves `choose` from M=600 to M=1200 -- the arm boot weg2dk5 was "
@@ -9478,8 +9492,11 @@ def build_parser() -> argparse.ArgumentParser:
                          f"bs6 (nicht mehr bs4) der standard werden'), which superseded that same day's "
                          f"'bs4 fuer decode' before it reached metal. Equally provisional and equally "
                          f"re-measurable.")
-    ap.add_argument("--tp-prefill-max-tokens", type=int, default=None,
-                    help="K5 (X): uncached tokens D may prefill itself. Unset = DERIVED as "
+    ap.add_argument("--tp-prefill-max-tokens", type=int, default=4096,
+                    help="K5 (X): uncached tokens D may prefill itself. Default 4096 since "
+                         "2026-09-15: the derivation below priced r_P from a single in-flip "
+                         "leg's front wall (1346 tok/s) and routed every request SHORT->D "
+                         "(xsn124-126); pass 0 to derive. Derived = "
                          "2*flip_s/(1/r_D - 1/r_P) from this rig's own front-log rate and flip "
                          "lines, else the recorded PRE-BARLINK pair; floor = --chunked-prefill-size. "
                          "The derivation and its three inputs are printed at launch.")
@@ -10410,10 +10427,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     # -- measurement arms -------------------------------------------------
     ap.add_argument(
-        "--p-hicache-write-policy", default="write_through",
+        "--p-hicache-write-policy", default="write_back",
         choices=["write_through", "write_back", "write_through_selective"],
-        help="MEASUREMENT ONLY. Group P's hicache write policy. Default "
-             "write_through = unchanged shipped behaviour. 'off' is NOT "
+        help="Group P's hicache write policy. Default write_back since "
+             "2026-09-15 (user decision: 'die Eviction ist der Flip' -- the "
+             "publish sweep in flush_cache before sleeping writes the store, "
+             "accepted on boots xsn128-134). 'off' is NOT "
              "offered because this runtime has no such policy "
              "(server_args.py:4318 choices); write_back is the nearest arm "
              "-- it defers the store write rather than removing it, and the "
@@ -10719,7 +10738,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     s_gb_d, _l2_terms, _l2_lines = _derive_d_l2_budget(ns, max_kv_per_request)
     for _ln in _l2_lines:
         log(_ln)
-    x_seed = resolve_x(ns.tp_prefill_max_tokens, EVIDENCE_DIR, CHUNKED_PREFILL_TOKENS)
+    # 0 = derive (the flag's default is the 4096 pin since 2026-09-15).
+    x_seed = resolve_x(ns.tp_prefill_max_tokens or None, EVIDENCE_DIR, CHUNKED_PREFILL_TOKENS)
     x_tokens, x_provenance = x_seed.tokens, x_seed.provenance
     flip_min_work_tokens = int(ns.flip_min_work_tokens) if ns.flip_min_work_tokens is not None else x_tokens
     idle_layout_front = "P" if ns.idle_layout == "pp" else "D"
@@ -11614,10 +11634,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             + " "
             + d_overlap_cost_line(ns.model, False, d_bs)
         )
-    if ns.p_hicache_write_policy != "write_through":
+    if ns.p_hicache_write_policy != "write_back":
         log(
             f"MEASUREMENT ARM: group P --hicache-write-policy "
-            f"{ns.p_hicache_write_policy} (shipped default is write_through; "
+            f"{ns.p_hicache_write_policy} (shipped default is write_back since 2026-09-15; "
             f"#1016 measured the write_through store tax at +3.9 % @50k / "
             f"+11.6 % @12k and BSSCALE_0907.md P5 did NOT re-A/B it -- this "
             f"arm exists to, and changes nothing else). Group D is unchanged."
