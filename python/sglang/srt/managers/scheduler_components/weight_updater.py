@@ -529,6 +529,10 @@ class SchedulerWeightUpdaterManager:
     #: (~1 s per tag on every rank: join_manifests + plan_from_join + books,
     #: and the shadow plan with its 1.2M-piece pointer profile).
     _weg2_xchg_leg_cache: Optional[dict] = None
+    #: Punkt 2 (weg2xsn107): True while the wake worker collects a tag --
+    #: the credit wait's stuck-lane reader must not read those in-flight
+    #: bands as 'never drained' (PP0 W108 at the credit wait on xsn107).
+    _weg2_wake_inflight: bool = False
     #: True once the resume loop has collected tag by tag, so the once-per-wake
     #: entry stands down instead of injecting a second time over bytes already
     #: written.
@@ -3556,7 +3560,17 @@ class SchedulerWeightUpdaterManager:
         from sglang.srt.managers.weg2_memory_saver import (
             GPU_MEMORY_TYPE_WEIGHTS_DRAFT as _DRAFT_TAG,
         )
-        _collected = self._weg2_xchg_inject_weights(tag=tag)
+        try:
+            self._weg2_wake_inflight = True
+        except AttributeError:
+            pass
+        try:
+            _collected = self._weg2_xchg_inject_weights(tag=tag)
+        finally:
+            try:
+                self._weg2_wake_inflight = False
+            except AttributeError:
+                pass
         self._weg2_xchg_collected_per_tag = True
         if (str(tag) == str(_DRAFT_TAG)
                 and not _collected
@@ -5568,6 +5582,8 @@ class SchedulerWeightUpdaterManager:
         def _stuck_lane_reader():
             if _rank < 0:
                 return []
+            if getattr(self, "_weg2_wake_inflight", False):
+                return []   # a collect is in flight on the wake worker
             return self._weg2_xchg_undrained_lanes(_rank, self._weg2_xchg_sems())
 
         try:
