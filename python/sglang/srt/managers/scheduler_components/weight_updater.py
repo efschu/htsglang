@@ -246,6 +246,34 @@ def _get_draft_model_runner(draft_worker):
     return None
 
 
+def _weg2_drafter_of(scheduler):
+    """The draft ModelRunner THIS PROCESS hosts, or None.
+
+    #1378 xsn78: two producers, one accessor. Group D holds the drafter in
+    the speculative worker (``scheduler.draft_worker``); group P's LAST stage
+    holds it in the draft-KV producer (``scheduler.draft_kv_producer
+    .draft_runner``, scheduler.py:1619) and has NO ``draft_worker`` at all --
+    every site that asked ``draft_worker`` alone planned no draft leg on P,
+    refused nothing, and let D's 25 deposited units rot on the lane. The
+    manifest writer (model_runner.load_model -> arm_coverage_at_load) runs
+    inside the draft runner itself and never needed the accessor, which is
+    how P's draft manifest existed while P's plan did not.
+
+    A MODULE FUNCTION, not a method: the smoke harnesses drive these paths
+    with stubs that borrow the methods and carry none of their own (#1358).
+    """
+    draft_worker = getattr(scheduler, "draft_worker", None)
+    if draft_worker is not None:
+        try:
+            drafter = _get_draft_model_runner(draft_worker)
+        except BaseException:  # noqa: BLE001 -- an observer never raises
+            drafter = None
+        if drafter is not None:
+            return drafter
+    producer = getattr(scheduler, "draft_kv_producer", None)
+    return getattr(producer, "draft_runner", None)
+
+
 def _merge_checksum_payloads(target: Dict, draft: Dict) -> Dict:
     merged_checksums = dict(target["checksums"])
     for name, chk in draft["checksums"].items():
@@ -1441,13 +1469,7 @@ class SchedulerWeightUpdaterManager:
         every other unreadable contract in this method.
         """
         server_args = self._weg2_server_args()
-        draft_worker = getattr(self, "draft_worker", None)
-        drafter = None
-        if draft_worker is not None:
-            try:
-                drafter = _get_draft_model_runner(draft_worker)
-            except BaseException:  # noqa: BLE001 -- an observer never raises
-                drafter = None
+        drafter = _weg2_drafter_of(self)
         draft_model_config = getattr(drafter, "model_config", None)
         return checkpoint_quantization(draft_model_config, server_args)
 
@@ -3152,13 +3174,7 @@ class SchedulerWeightUpdaterManager:
 
             if not wx.exchange_armed():
                 return None, ""
-            draft_worker = getattr(self, "draft_worker", None)
-            if draft_worker is None:
-                return None, ""
-            try:
-                drafter = _get_draft_model_runner(draft_worker)
-            except BaseException:  # noqa: BLE001 -- an observer never raises
-                drafter = None
+            drafter = _weg2_drafter_of(self)
             if drafter is None:
                 return None, ""
             draft_model = getattr(drafter, "model", None)
@@ -3255,8 +3271,7 @@ class SchedulerWeightUpdaterManager:
         share is NOT proven -- the caller excludes the draft's lm_head from
         the join ONLY on the MEASURED-SHARED prefix (fail-closed)."""
         try:
-            draft_worker = getattr(self, "draft_worker", None)
-            drafter = _get_draft_model_runner(draft_worker) if draft_worker else None
+            drafter = _weg2_drafter_of(self)
             draft_model = getattr(drafter, "model", None)
             target_runner = getattr(getattr(self, "tp_worker", None),
                                     "model_runner", None)
@@ -3340,14 +3355,9 @@ class SchedulerWeightUpdaterManager:
         main = getattr(self.tp_worker, "model_runner", None)
         if main is not None:
             runners.append(main)
-        draft_worker = getattr(self, "draft_worker", None)
-        if draft_worker is not None:
-            try:
-                drafter = _get_draft_model_runner(draft_worker)
-            except BaseException:  # noqa: BLE001 -- an observer never raises
-                drafter = None
-            if drafter is not None:
-                runners.append(drafter)
+        drafter = _weg2_drafter_of(self)
+        if drafter is not None:
+            runners.append(drafter)
         from sglang.srt.weg2 import weight_exchange as _wx
         from sglang.srt.weg2 import xchg_manifest as _xm
 
@@ -3863,7 +3873,7 @@ class SchedulerWeightUpdaterManager:
             )
             if inv is None:
                 return None, skipped, walked, reason
-            draft_runner = _get_draft_model_runner(self.draft_worker)
+            draft_runner = _weg2_drafter_of(self)
             draft_model = getattr(draft_runner, "model", None)
             # ONLY WHERE THE DRAFT IS ACTUALLY A FAMILY MEMBER.  Under the
             # `exchange` arm `weights_draft` joins the family and is flipped as

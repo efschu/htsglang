@@ -2590,13 +2590,26 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # needs the GROUP-UNIQUE index, which under `--tp-size 1 --pp-size 3`
         # is the PP rank -- boot weg2xsn22 lost every leg because all three of
         # group P's ranks wrote `rank0`.
+        # #1378 xsn78: THE MANIFEST CARRIES THE PROCESS'S PLACE, not the
+        # runner's own. Group P's last stage (PP2, card 2) loads the MTP
+        # drafter as a second ModelRunner whose own pp_rank is 0 (a draft has
+        # one stage), and its manifest was written as rank=0 card=0 pp=0 --
+        # so the join believed P rank 0 held the draft, D deposited 25 units
+        # on lane c0 that PP0 never collected, and the stale handshake tokens
+        # broke the next tag's collect on that lane (embed_tokens, four boots
+        # of "content-changed"). The pipeline group is process-global: its
+        # rank_in_group is 2 on PP2 for the target AND the drafter it hosts.
+        try:
+            _pp_rank_of_process = int(get_pp_group().rank_in_group)
+        except Exception:  # noqa: BLE001 -- no process group on the desk
+            _pp_rank_of_process = int(self.pp_rank)
         arm_coverage_at_load(
             self.model,
             rank=self.tp_rank,
             tag_bytes=self._weg2_xchg_tag_bytes,
             region_tag=weights_tag,
             tp_rank=self.tp_rank,
-            pp_rank=self.pp_rank,
+            pp_rank=_pp_rank_of_process,
             tp_size=self.tp_size,
         )
 
