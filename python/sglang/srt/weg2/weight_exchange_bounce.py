@@ -2740,6 +2740,7 @@ def run_sequential_units(descs, ops, boot_nonce: str, *,
             stream = 0
         base_addr = _mmap_addr(buf) if _seq_mm is not None else 0
         _ipc_base, _ipc_hex, _ipc_opened = 0, "", False
+        _dep_recs = {}   # weg2xsn91: this tag's records, kept in memory
         if (phase == PHASE_DEPOSIT and card is not None and seq_oncard_ipc()
                 and hasattr(ops, "ipc_get_handle") and hasattr(ops, "raw_malloc")):
             try:
@@ -2796,12 +2797,10 @@ def run_sequential_units(descs, ops, boot_nonce: str, *,
                 digest = (hashlib.sha256(
                     bytes(buf[window_off:window_off + nbytes])).hexdigest()[:16]
                     if (_digest_on and not _ipc_base) else "")
-                recs = {}
-                if os.path.exists(dpath):
-                    try:
-                        recs = _json.load(open(dpath))
-                    except ValueError:
-                        recs = {}
+                # weg2xsn91: no reload of the file per unit (192 x load+dump
+                # of a growing JSON); the tag's records live in memory and
+                # the file is replaced atomically after each unit.
+                recs = _dep_recs
                 recs[str(i)] = {"name": name, "tag": tag, "digest": digest, "ipc": _ipc_hex,
                                 "nbytes": nbytes}
                 # weg2xsn90: ATOMIC -- a collector that read this file mid-
@@ -2832,11 +2831,15 @@ def run_sequential_units(descs, ops, boot_nonce: str, *,
                 deadline = _time.monotonic() + float(budget_s)
                 got = False
                 while _time.monotonic() < deadline:
+                    # weg2xsn91: BLOCK on the semaphore in 0.2 s slices
+                    # instead of trywait + sleep(0.05) -- that poll cost up
+                    # to 50 ms per unit, ~5-10 s per 192-unit lane, and was
+                    # the reason a 2 GB on-card lane took ~2 s D2D.
                     if _is_diagonal:
                         _got = sems.diagonal_timedwait(int(card), _SEQ_SLOT,
-                                                       "full", 0.0)
+                                                       "full", 0.2)
                     else:
-                        _got = sems.timedwait(int(pair), _SEQ_SLOT, "full", 0.0)
+                        _got = sems.timedwait(int(pair), _SEQ_SLOT, "full", 0.2)
                     if _got:
                         got = True
                         break
@@ -2846,7 +2849,6 @@ def run_sequential_units(descs, ops, boot_nonce: str, *,
                             extra=f"unit {i} {name!r} -- the deposit peer is "
                                   f"gone while the collect waited")
                         return f"PeerGone at unit {i} {name!r}"
-                    _time.sleep(0.05)
                 if not got:
                     dump_rank_stacks(
                         "budget-expired-seq", tag=str(name), rank=int(window_off),
