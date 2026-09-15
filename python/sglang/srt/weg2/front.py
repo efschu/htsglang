@@ -1280,10 +1280,38 @@ def interleave_pause_order(
     # members belong in ``rest``, with the base tag still closing the sleep.
     chunks = [t for t in tags if is_weights_chunk_tag(t)]
     rest = [t for t in tags if not is_weights_chunk_tag(t)]
+    def _rr(order_chunks, why):
+        # 2026-09-15 (weg2xsn99/xsn104, Nutzer-Order Punkt 1): ROUND-ROBIN
+        # OVER THE DESTINATION CARDS, applied to EVERY order this function
+        # answers -- including the identity a TP source (no chunk->card map)
+        # gets, which is exactly the D->P leg where PP1 idled 1.7 s for its
+        # first tag (xsn104: the round-robin sat behind the identity return).
+        # The per-card queues keep the incoming priority; interleaving them
+        # hands every destination card a tag in round one. A uniform
+        # destination (every tag on every card) has one queue: unchanged.
+        if dst_cards:
+            queues: Dict[Any, list] = {}
+            seq: list = []
+            for t in order_chunks:
+                cs = dst_cards.get(t) or ()
+                key = int(cs[0]) if cs else -1
+                if key not in queues:
+                    queues[key] = []
+                    seq.append(key)
+                queues[key].append(t)
+            if len(seq) > 1:
+                rr: list = []
+                while any(queues[k] for k in seq):
+                    for k in seq:
+                        if queues[k]:
+                            rr.append(queues[k].pop(0))
+                return rr + rest, why + ", round-robin over destination cards"
+        return order_chunks + rest, why
+
     if not tag_cards:
-        return tags, "identity: the source has no chunk->card map (uniform/TP source, or no map passed)"
+        return _rr(chunks, "identity: the source has no chunk->card map (uniform/TP source, or no map passed)")
     if not free_mib:
-        return tags, "identity: no NVML free sample for this flip"
+        return _rr(chunks, "identity: no NVML free sample for this flip")
     # #1233 fix 6: an EMPTY card list is as unusable as an absent tag, and the
     # difference used to be a crash instead of a refusal -- ``min()`` over an
     # empty sequence raises ValueError inside ``flip``, i.e. at the one moment
@@ -1293,43 +1321,16 @@ def interleave_pause_order(
     # to be trusted.
     missing = [t for t in chunks if not tag_cards.get(t)]
     if missing:
-        return tags, (
+        return _rr(chunks, (
             "identity REFUSED to reorder: chunk tags absent from the map or with "
             f"no cards {missing}"
-        )
+        ))
     unknown = sorted({int(c) for t in chunks for c in tag_cards[t]} - set(free_mib))
     if unknown:
-        return tags, f"identity REFUSED to reorder: cards {unknown} absent from the NVML free sample {sorted(free_mib)}"
+        return _rr(chunks, f"identity REFUSED to reorder: cards {unknown} absent from the NVML free sample {sorted(free_mib)}")
     index = {t: i for i, t in enumerate(chunks)}
     order = sorted(chunks, key=lambda t: (min(free_mib[int(c)] for c in tag_cards[t]), index[t]))
-    # 2026-09-15 (weg2xsn99, Nutzer-Order Punkt 1): ROUND-ROBIN OVER THE
-    # DESTINATION CARDS. Under the per-tag lockstep the waking rank on a
-    # card idles until the FIRST tag it holds is deposited; with a pipeline
-    # destination (chunks on distinct stages/cards) the tightest-card-first
-    # walk served four of card 0's tags (~140 ms each) before card 1 saw
-    # its first -- 1.2 s of idle per leg measured on PP1. Keep the
-    # tightest-card priority between the per-card queues, but interleave
-    # the queues so every destination card gets a tag within the first
-    # round. A uniform destination (every tag on every card: the TP group)
-    # has one queue and keeps the order unchanged.
-    if dst_cards:
-        queues: Dict[Any, list] = {}
-        seq: list = []
-        for t in order:
-            cs = dst_cards.get(t) or ()
-            key = int(cs[0]) if cs else -1
-            if key not in queues:
-                queues[key] = []
-                seq.append(key)
-            queues[key].append(t)
-        if len(seq) > 1:
-            rr: list = []
-            while any(queues[k] for k in seq):
-                for k in seq:
-                    if queues[k]:
-                        rr.append(queues[k].pop(0))
-            return rr + rest, "tightest-card-first, round-robin over destination cards"
-    return order + rest, "tightest-card-first"
+    return _rr(order, "tightest-card-first")
 
 
 # --------------------------------------------------------------------------

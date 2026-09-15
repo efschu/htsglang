@@ -489,3 +489,18 @@ class TestRoundRobinOverDestinationCards(unittest.TestCase):
         b, why = front_mod.interleave_pause_order(tags, m, FREE_AT_INTERLEAVE_START, dst_cards=uni)
         self.assertEqual(a, b)
         self.assertNotIn("round-robin", why)
+
+    def test_tp_source_without_a_map_still_round_robins_over_the_destination(self):
+        """xsn104: the D->P leg (TP source, no chunk->card map) answered the
+        identity order and PP1 idled 1.7 s; the round-robin applies here too."""
+        tags = weights_family_tags(CHUNK_COUNT)
+        dst = {t: list(v) for t, v in chunk_tag_cards(
+            P_STAGE_LAYERS, LAYERS_PER_CHUNK, CHUNK_COUNT, card_of_stage=NVML_OF_STAGE).items()}
+        order, why = front_mod.interleave_pause_order(tags, {}, {}, dst_cards=dst)
+        self.assertIn("round-robin", why)
+        first = {}
+        for i, tg in enumerate(order):
+            first.setdefault((dst.get(tg) or [-1])[0], i)
+        cards = sorted(k for k in first if k >= 0)
+        self.assertTrue(all(first[c] < len(cards) for c in cards), (order, first))
+        self.assertEqual(sorted(order), sorted(tags))
