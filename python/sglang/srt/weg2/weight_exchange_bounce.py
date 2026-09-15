@@ -2827,10 +2827,14 @@ def run_sequential_units(descs, ops, boot_nonce: str, *,
                 # and, with the on-card IPC staging, copied the never-written
                 # host buffer into layer 0 (2 pieces moved, W90).
                 _tr0 = time.perf_counter()
-                _tmp = dpath + ".tmp"
+                # weg2xsn111: ONE SMALL FILE PER UNIT (atomic tmp+rename) --
+                # re-dumping the growing per-lane JSON for every unit was
+                # ~290 of a 2 GB lane's ~420 ms deposit (record_ms).
+                _upath = f"{dpath}.u{i}"
+                _tmp = _upath + ".tmp"
                 with open(_tmp, "w") as fh:
-                    _json.dump(recs, fh)
-                os.replace(_tmp, dpath)
+                    _json.dump(recs[str(i)], fh)
+                os.replace(_tmp, _upath)
                 _t_rec += time.perf_counter() - _tr0
                 # #1378 xsn53: THE LANE'S OWN TOKEN.  One full per unit on the
                 # lane's resolved handshake; the deposit posts, the collect
@@ -2883,14 +2887,14 @@ def run_sequential_units(descs, ops, boot_nonce: str, *,
                 dep = {}
                 _t_rec0 = time.perf_counter()
                 while True:
-                    recs = {}
-                    if os.path.exists(dpath):
+                    dep = {}
+                    _upath = f"{dpath}.u{i}"
+                    if os.path.exists(_upath):
                         try:
-                            with open(dpath) as _rf:
-                                recs = _json.load(_rf)
+                            with open(_upath) as _rf:
+                                dep = _json.load(_rf) or {}
                         except ValueError:
-                            recs = {}
-                    dep = recs.get(str(i), {})
+                            dep = {}
                     if dep:
                         break
                     if time.perf_counter() - _t_rec0 > 5.0:
