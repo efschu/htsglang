@@ -271,6 +271,13 @@ def _weg2_drafter_of(scheduler):
         if drafter is not None:
             return drafter
     producer = getattr(scheduler, "draft_kv_producer", None)
+    if producer is None:
+        # xsn82 ("no-drafter" on P rank 2): the caller is the
+        # SchedulerWeightUpdaterManager, a dataclass that COPIES tp_worker
+        # and draft_worker off the scheduler and keeps the scheduler itself
+        # under `.scheduler`; the producer was never copied.
+        host = getattr(scheduler, "scheduler", None)
+        producer = getattr(host, "draft_kv_producer", None)
     return getattr(producer, "draft_runner", None)
 
 
