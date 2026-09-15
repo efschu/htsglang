@@ -4296,10 +4296,15 @@ class SchedulerWeightUpdaterManager:
             return []
         # #1378 xsn54 (DIE ZWEI ZAHLEN NEBENEINANDER): `owned` zaehlt die
         # Descs, deren Name im EIGENEN Manifest dieses Rangs steht; `planned`
-        # ist die Lane-Groesse. Die xsn54-Messung (diag lane c0 planned=114,
-        # owned=102) machte sichtbar, dass 12 Stuecke Layer 39 -- P rank 1's
-        # Besitz -- in P rank 0's Lane liefen. Zwei Zahlen, jede Lane,
-        # diagonal wie cross, auf einer Zeile.
+        # ist die Lane-Groesse. Lesevorschrift (praezisiert 02:3xZ, der
+        # fruehere Verdacht "12 Stuecke Layer 39 auf P rank 0's Lane" ist
+        # ZURUECKGEZOGEN -- gemessen: bei pp_to_tp sammelt D legitim von
+        # BEIDEN Stages, also ist planned=114 gegen owned=102 auf einem
+        # COLLECT-Leg die ERWARTETE Form, weil die Quelle mehrere Stages
+        # stellt). Ein Verdacht ist diese Zahl nur auf dem DEPOSIT-Leg:
+        # dort nennt ein owned < planned Namen, die dieser Rang
+        # hinlegt, ohne sie zu halten.
+        
         _own = self._weg2_owned_name_keys()
         owned_n = sum(1 for d in out
                       if (region_of_tag(d.tag), str(d.param_name)) in _own)
