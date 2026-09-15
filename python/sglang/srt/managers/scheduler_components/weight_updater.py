@@ -1874,12 +1874,22 @@ class SchedulerWeightUpdaterManager:
                     "step is a no-op and the peer's drain still has to be "
                     "posted",
                     tag, sorted({str(getattr(d, "tag", "")) for d in plan.descs}))
+        # weg2xsn85 (#1378): the W108 check inside the leg needs the lanes
+        # the WHOLE plan covers, not this tag's slice -- see the leg's
+        # `covered_lanes` for the lane-sparse-tag shape a pipeline source
+        # produces.
+        from sglang.srt.weg2 import weight_exchange_bounce as _bx
+        try:
+            _covered_lanes = set(_bx.group_descs_by_pair(list(plan.descs)).keys())
+        except Exception:  # noqa: BLE001 -- an unbuildable coverage keeps the per-tag set
+            _covered_lanes = None
         self._weg2_xchg_bounce_leg(
             descs=_cdescs, ops=ops, boot_nonce=boot_nonce,
             terms=terms, mode=mode, device=int(device),
             hook="authoritative",
             region=self._weg2_shadow_region(),
             sems=_sems, tag=tag, rank=int(rank),
+            covered_lanes=_covered_lanes,
         )
         # THE INSTRUMENTS ARE EMITTED BY THE LEG, NOT HERE, and the first
         # version of this method got that wrong in a way worth recording: it
@@ -4661,7 +4671,19 @@ class SchedulerWeightUpdaterManager:
                               #: with no identity to give is exactly the
                               #: shape ``_weg2_rank`` itself answers ``-1``
                               #: for, and ``-1`` is not a card.
-                              rank=None):
+                              rank=None,
+                              #: weg2xsn85 (#1378): the lanes this rank's
+                              #: WHOLE-LEG plan covers (every tag), for the
+                              #: W108 check below. ``descs`` is one tag's
+                              #: slice of the lockstep; under a PIPELINE
+                              #: source a tag is lane-SPARSE (weights_7 rides
+                              #: only the lanes from PP2's card) and the
+                              #: source runs ahead by its no-op tags, so a
+                              #: lane the plan covers for a LATER tag holds
+                              #: that tag's bands while this tag is walked.
+                              #: ``None`` keeps the per-tag set (a caller
+                              #: without a whole plan).
+                              covered_lanes=None):
         """PATH (b): assemble each unit in the host bounce, every card slices.
 
         The whole of the user law's fallback sentence, at the one call site
@@ -4873,13 +4895,24 @@ class SchedulerWeightUpdaterManager:
             # A nonzero `full` there is real, undrained work this call is
             # about to walk past without a word.
             if phase == bx.PHASE_COLLECT and rank is not None and int(rank) >= 0 and sems is not None:
+                # weg2xsn85 (#1378): "for ANY tag" was the docstring, the
+                # per-tag `descs` was the code. With P as the source D
+                # refused at weights_7 (lanes from card 2 only) because
+                # lane 1-0-0 held PP1's weights_4 bands and card0-0 PP0's
+                # weights_4 deposit in flight -- the source had moved on
+                # past its no-op tags (#1374 lockstep is per LANE, and the
+                # per-lane order still matches). The whole-leg coverage is
+                # what the check was written to mean.
+                _covered = set(_lanes.keys()) | set(covered_lanes or ())
                 _stuck = self._weg2_xchg_undrained_lanes(
-                    int(rank), sems, covered=set(_lanes.keys()))
+                    int(rank), sems, covered=_covered)
                 if _stuck:
                     raise Weg2XchgLaneNeverDrainedRefused(
                         f"W108 Weg2XchgLaneNeverDrainedRefused: hook={hook} "
                         f"rank={rank} tag={tag} boot_nonce={boot_nonce}: "
-                        f"this leg's own descriptor set carries no entry for "
+                        f"this leg's own descriptor set (this tag plus the "
+                        f"whole-leg coverage {sorted(str(k) for k in _covered)}) "
+                        f"carries no entry for "
                         f"{len(_stuck)} lane(s) targeting this rank's card, "
                         f"and they already hold undrained bands: "
                         + ", ".join(

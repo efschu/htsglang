@@ -329,11 +329,16 @@ def test_an_empty_collect_plan_beside_real_undrained_bands_refuses_by_name(
     m = _manager(monkeypatch, group="P", rank=0, sems=real_sems)
     # This rank's plan carries real work for weights_3 ONLY -- the #1233
     # legitimate shape -- so filtering by tag="weights_0" is empty, exactly
-    # like P PP0's own resume loop measured on weg2xsn31.
+    # like P PP0's own resume loop measured on weg2xsn31. weg2xsn85: the
+    # plan's one desc rides a CROSS lane (card 1 -> card 0), so the diagonal
+    # card0-0 that holds the bands is covered by NO tag of the whole leg --
+    # the shape W108 is for. (A diagonal desc of another tag would make the
+    # bands that tag's own, see the lane-sparse test below.)
     monkeypatch.setattr(
         Manager, "_weg2_shadow_plan",
         lambda self, hook, g, r, agreed=None, require_agreement=None:
-            (_FakePlan([_FakeDesc("a.w", tag="weights_3")]), ""),
+            (_FakePlan([_FakeDesc("a.w", tag="weights_3", src_rank=1,
+                                  dst_rank=0)]), ""),
         raising=True)
     monkeypatch.setattr(Manager, "_weg2_xchg_device_ops", lambda self: object(),
                         raising=True)
@@ -372,6 +377,45 @@ def test_an_empty_collect_plan_on_a_clean_lane_stays_a_no_op(
                         raising=True)
     m._weg2_xchg_inject_from_peer(terms=_FakeTerms(), tag="weights_0")
     assert calls["kw"]["descs"] == []
+
+
+def test_xsn85_bands_of_a_later_tag_on_a_lane_the_whole_leg_covers_are_not_w108(
+        monkeypatch, armed, real_sems):
+    """weg2xsn85 (#1378): with P as the source, tags are lane-SPARSE and the
+    source runs ahead past its no-op tags -- at D's weights_7 step lane
+    1-0-0 held PP1's weights_4 bands and card0-0 PP0's weights_4 deposit in
+    flight, both lanes the whole leg collects LATER. The check's own
+    docstring said 'for ANY tag'; the code passed this tag's slice.
+    MUTANT: `covered=set(_lanes.keys())` alone (the shipped form) -- the
+    first assertion below is what it fails."""
+    from sglang.srt.weg2 import weight_exchange_bounce as bx
+
+    _post_diagonal_bands(real_sems, 0, 16)
+    # The whole plan covers the diagonal via weights_3; this step is weights_0.
+    plan = _FakePlan([_FakeDesc("a.w", tag="weights_3")])
+    whole = set(bx.group_descs_by_pair(list(plan.descs)).keys())
+    assert None in whole  # src_rank == dst_rank == 0: the on-card diagonal
+    # 1. the check itself, with the whole-leg coverage: nothing is stuck.
+    assert Manager._weg2_xchg_undrained_lanes(None, 0, real_sems,
+                                              covered=whole) == []
+    # ... and with the shipped per-tag (empty) coverage it WOULD refuse:
+    assert Manager._weg2_xchg_undrained_lanes(None, 0, real_sems,
+                                              covered=set()) != []
+    # 2. the wiring: the collect call site hands the whole-leg lanes to the leg.
+    m = _manager(monkeypatch, group="P", rank=0, sems=real_sems)
+    monkeypatch.setattr(
+        Manager, "_weg2_shadow_plan",
+        lambda self, hook, g, r, agreed=None, require_agreement=None: (plan, ""),
+        raising=True)
+    monkeypatch.setattr(Manager, "_weg2_xchg_device_ops", lambda self: object(),
+                        raising=True)
+    calls = {}
+    monkeypatch.setattr(Manager, "_weg2_xchg_bounce_leg",
+                        lambda self, **kw: calls.setdefault("kw", kw),
+                        raising=True)
+    m._weg2_xchg_inject_from_peer(terms=_FakeTerms(), tag="weights_0")
+    assert calls["kw"]["descs"] == []
+    assert calls["kw"]["covered_lanes"] == whole
 
 
 # ===========================================================================
