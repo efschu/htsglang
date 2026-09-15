@@ -1800,10 +1800,11 @@ class SchedulerWeightUpdaterManager:
                        if str(getattr(d, "tag", "")) == str(tag)]
             if not _cdescs:
                 logger.info(
-                    "WEG2-XCHG COLLECT tag=%s pieces=0 -- this rank's plan "
-                    "carries no desc for this tag; the lockstep step is a "
-                    "no-op and the peer's drain still has to be posted",
-                    tag)
+                    "WEG2-XCHG COLLECT tag=%s pieces=0 plan_tags=%s -- this "
+                    "rank's plan carries no desc for this tag; the lockstep "
+                    "step is a no-op and the peer's drain still has to be "
+                    "posted",
+                    tag, sorted({str(getattr(d, "tag", "")) for d in plan.descs}))
         self._weg2_xchg_bounce_leg(
             descs=_cdescs, ops=ops, boot_nonce=boot_nonce,
             terms=terms, mode=mode, device=int(device),
@@ -3174,12 +3175,18 @@ class SchedulerWeightUpdaterManager:
 
             if not wx.exchange_armed():
                 return None, ""
+            # #1378 xsn81: EVERY early exit is NAMED. P rank 2 logged
+            # "COLLECT tag=weights_draft pieces=0" and nothing else while D
+            # deposited 25+4 units towards its card and refused W108 -- an
+            # empty reason here is what kept the merge site's SKIPPED line
+            # silent for six boots.
             drafter = _weg2_drafter_of(self)
             if drafter is None:
-                return None, ""
+                return None, ("no-drafter: neither draft_worker nor "
+                              "draft_kv_producer.draft_runner on this rank")
             draft_model = getattr(drafter, "model", None)
             if draft_model is None:
-                return None, ""
+                return None, f"no-draft-model: {type(drafter).__name__}"
             # #1378 xsn77 -- THE SAME RULE THE MANIFEST WRITER USES. On group
             # P the drafter is resident for the flip but P runs no speculative
             # decoding, so `classify_runner` answers None and
