@@ -5717,6 +5717,51 @@ class SchedulerWeightUpdaterManager:
                     )
                     t_tag = time.perf_counter()
                     self.memory_saver_adapter.resume(tag)
+                    # #1378 xsn62: DID THE RESUME ACTUALLY MAP ANYTHING?
+                    #
+                    # weg2xsn61 read the destination of the first copy-out and
+                    # got `dst_rc=0 dst_type=0 dst_device=-1` -- the call
+                    # SUCCEEDED and the driver does not know the address, which
+                    # is what a reserved-but-not-committed VMM range looks like.
+                    # Two seconds later: SIGSEGV. So the bytes the collect
+                    # writes into are not mapped.
+                    #
+                    # I had already checked that this `resume(tag)` stands
+                    # BEFORE the collect (:5757) and concluded the pages were
+                    # there. That check only proves the CALL precedes it, never
+                    # that it TOOK EFFECT -- "aufgerufen != gewirkt", one level
+                    # past the "resolved != mapped" trap that cost two earlier
+                    # walls. This closes that gap with a reading instead of an
+                    # inference: same probe, same producer (`bx.ptr_attrs`), one
+                    # row per tag, right after the resume.
+                    #
+                    # `type=2` here and `0` at the copy-out means the mapping is
+                    # lost BETWEEN the two -- a second actor. `type=0` already
+                    # here means THIS resume does not map this tag's tensors,
+                    # and the root is in the memory saver or the tag-to-tensor
+                    # attribution, not in the transport at all.
+                    try:
+                        from sglang.srt.weg2 import (
+                            weight_exchange_bounce as _bx_probe,
+                        )
+                        _pm = getattr(
+                            getattr(self, "model_runner", None), "model", None)
+                        _probe_row = "no-model"
+                        if _pm is not None:
+                            for _pn, _pt in _pm.named_parameters():
+                                _prc, _pty, _pdev = _bx_probe.ptr_attrs(
+                                    int(_pt.data_ptr()))
+                                _probe_row = (f"name={_pn!r} rc={_prc} "
+                                              f"type={_pty} device={_pdev}")
+                                break
+                        logger.info(
+                            "WEG2-RESUME-PTRATTR tag=%s %s -- type 0 means the "
+                            "driver does not know this tensor's pages AFTER "
+                            "the resume (0=unregistered 1=host 2=device)",
+                            tag, _probe_row)
+                    except Exception as _probe_exc:  # noqa: BLE001
+                        logger.info("WEG2-RESUME-PTRATTR tag=%s unavailable=%s",
+                                    tag, type(_probe_exc).__name__)
                     weg2_per_tag[tag] = [
                         float(tag_bytes.get(tag, 0)),
                         (time.perf_counter() - t_tag) * 1000,

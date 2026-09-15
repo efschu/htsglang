@@ -2179,6 +2179,44 @@ def _mm_slice(mm, start: int, length: int) -> memoryview:
     return memoryview(mm)[start:start + length]
 
 
+def ptr_attrs(addr: int) -> Tuple[int, int, int]:
+    """``(rc, type, device)`` for one address, as the DRIVER sees it.
+
+    ONE producer for this reading, used by the transport's copy-out probe AND by
+    the wake path's post-resume probe -- two implementations of the same
+    measurement is the defect class this ticket has paid for repeatedly.
+
+    ``type`` is ``cudaMemoryType``: 0 unregistered, 1 host, 2 device, 3 managed.
+    A ``type`` of 0 with ``device`` -1 and ``rc`` 0 is the decisive reading: the
+    call SUCCEEDED and the driver does not know the address -- which is what a
+    reserved-but-not-committed VMM range looks like, and what weg2xsn61 found
+    under the destination of the first copy-out (dst_rc=0 dst_type=0
+    dst_device=-1, src_type=1) two seconds before the SIGSEGV.
+
+    THIS IS A READ AND CANNOT FAULT: ``cudaPointerGetAttributes`` returns
+    ``cudaErrorInvalidValue`` for an unknown address instead of dereferencing
+    it, so the probe never adds a crash to the path it measures. Resolved from
+    the ALREADY-LOADED runtime (torch has libcudart in process) rather than by
+    dlopen'ing a second copy; on any failure it reports ``(-1, -1, -1)`` rather
+    than raising, because a diagnostic that can break its caller is worse than
+    none.
+    """
+    try:
+        import ctypes as _ct
+
+        class _PA(_ct.Structure):
+            _fields_ = [("type", _ct.c_int), ("device", _ct.c_int),
+                        ("devicePointer", _ct.c_void_p),
+                        ("hostPointer", _ct.c_void_p)]
+
+        _a = _PA()
+        rc = _ct.CDLL(None).cudaPointerGetAttributes(
+            _ct.byref(_a), _ct.c_void_p(int(addr)))
+        return int(rc), int(_a.type), int(_a.device)
+    except Exception:  # noqa: BLE001 -- see the docstring's last paragraph
+        return -1, -1, -1
+
+
 def _mmap_addr(mm: "_mmap.mmap") -> int:
     """The mmap's host virtual address, for ops.memcpy_async and
     ops.host_register. Same conversion the LayerBounce uses at :623-627:
@@ -2574,31 +2612,11 @@ def run_sequential_units(descs, ops, boot_nonce: str, *,
             # whole -- a diagnostic that can break the path it diagnoses is
             # worse than none.
             if i == 0:
-                try:
-                    import ctypes as _ct
-
-                    class _PA(_ct.Structure):
-                        _fields_ = [("type", _ct.c_int),
-                                    ("device", _ct.c_int),
-                                    ("devicePointer", _ct.c_void_p),
-                                    ("hostPointer", _ct.c_void_p)]
-
-                    _rt = _ct.CDLL(None)
-                    _a = _PA()
-                    _rc_d = _rt.cudaPointerGetAttributes(
-                        _ct.byref(_a), _ct.c_void_p(int(dst_ptr)))
-                    _dt, _dd = int(_a.type), int(_a.device)
-                    _b = _PA()
-                    _rc_s = _rt.cudaPointerGetAttributes(
-                        _ct.byref(_b), _ct.c_void_p(int(_buf_addr)))
-                    # type: 0=unregistered 1=host 2=device 3=managed
-                    log(f"WEG2-SEQ ptrattr lane={lane_key} "
-                        f"dst_rc={_rc_d} dst_type={_dt} dst_device={_dd} "
-                        f"src_rc={_rc_s} src_type={int(_b.type)} "
-                        f"src_device={int(_b.device)}")
-                except Exception as _pa_exc:  # noqa: BLE001
-                    log(f"WEG2-SEQ ptrattr lane={lane_key} "
-                        f"unavailable={type(_pa_exc).__name__}")
+                _drc, _dty, _ddev = ptr_attrs(int(dst_ptr))
+                _src, _sty, _sdev = ptr_attrs(int(_buf_addr))
+                log(f"WEG2-SEQ ptrattr lane={lane_key} "
+                    f"dst_rc={_drc} dst_type={_dty} dst_device={_ddev} "
+                    f"src_rc={_src} src_type={_sty} src_device={_sdev}")
             if piece.kind == tp.FLAT:
                 ops.memcpy_async(int(dst_ptr), _buf_addr, nbytes, stream)
             else:
