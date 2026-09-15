@@ -2741,6 +2741,8 @@ def run_sequential_units(descs, ops, boot_nonce: str, *,
         base_addr = _mmap_addr(buf) if _seq_mm is not None else 0
         _ipc_base, _ipc_hex, _ipc_opened = 0, "", False
         _dep_recs = {}   # weg2xsn91: this tag's records, kept in memory
+        _t_wait = _t_copy = _t_rec = 0.0   # weg2xsn92: where a lane's time goes
+        _t_lane0 = time.perf_counter()
         if (phase == PHASE_DEPOSIT and card is not None and seq_oncard_ipc()
                 and hasattr(ops, "ipc_get_handle") and hasattr(ops, "raw_malloc")):
             try:
@@ -2787,6 +2789,7 @@ def run_sequential_units(descs, ops, boot_nonce: str, *,
                 # shared buffer at this piece's offset, the SAME pitch arithmetic
                 # the lane form runs (a STRIDED2D piece compacts on the way in).
                 _buf_addr = (_ipc_base + window_off) if _ipc_base else (base_addr + window_off)
+                _tc0 = time.perf_counter()
                 if piece.kind == tp.FLAT:
                     ops.memcpy_async(_buf_addr, src_ptr, nbytes, stream)
                 else:
@@ -2794,6 +2797,7 @@ def run_sequential_units(descs, ops, boot_nonce: str, *,
                                        int(piece.spitch), int(piece.run_bytes),
                                        int(piece.rows), stream)
                 ops.synchronize(stream)
+                _t_copy += time.perf_counter() - _tc0
                 digest = (hashlib.sha256(
                     bytes(buf[window_off:window_off + nbytes])).hexdigest()[:16]
                     if (_digest_on and not _ipc_base) else "")
@@ -2807,10 +2811,12 @@ def run_sequential_units(descs, ops, boot_nonce: str, *,
                 # rewrite got `{}` (ValueError -> empty), skipped every guard
                 # and, with the on-card IPC staging, copied the never-written
                 # host buffer into layer 0 (2 pieces moved, W90).
+                _tr0 = time.perf_counter()
                 _tmp = dpath + ".tmp"
                 with open(_tmp, "w") as fh:
                     _json.dump(recs, fh)
                 os.replace(_tmp, dpath)
+                _t_rec += time.perf_counter() - _tr0
                 # #1378 xsn53: THE LANE'S OWN TOKEN.  One full per unit on the
                 # lane's resolved handshake; the deposit posts, the collect
                 # consumes.  A cross lane posts the CROSS family, a diagonal lane
@@ -2828,6 +2834,7 @@ def run_sequential_units(descs, ops, boot_nonce: str, *,
                     log(f"WEG2-SEQ first-piece-done lane={lane_key} phase={phase} "
                         f"ms={(_time.perf_counter()-t0)*1000:.1f}")
             else:
+                _tw0 = time.perf_counter()
                 deadline = _time.monotonic() + float(budget_s)
                 got = False
                 while _time.monotonic() < deadline:
@@ -2854,11 +2861,12 @@ def run_sequential_units(descs, ops, boot_nonce: str, *,
                         "budget-expired-seq", tag=str(name), rank=int(window_off),
                         extra=f"unit {i} {name!r} budget={budget_s}s")
                     return f"budget expired at unit {i} {name!r}"
+                _t_wait += time.perf_counter() - _tw0
                 # weg2xsn90: the deposit posts `full` only AFTER its record
                 # is written (atomically), so a missing record is a torn read
                 # or a stale file -- wait for it, never proceed on `{}`.
                 dep = {}
-                _t_rec = time.perf_counter()
+                _t_rec0 = time.perf_counter()
                 while True:
                     recs = {}
                     if os.path.exists(dpath):
@@ -2870,11 +2878,12 @@ def run_sequential_units(descs, ops, boot_nonce: str, *,
                     dep = recs.get(str(i), {})
                     if dep:
                         break
-                    if time.perf_counter() - _t_rec > 5.0:
+                    if time.perf_counter() - _t_rec0 > 5.0:
                         return (f"record missing for unit {i} {name!r} on lane "
                                 f"{lane_key} after 5 s -- the deposit posts "
                                 f"'full' only after writing it")
                     time.sleep(0.002)
+                _t_rec += time.perf_counter() - _t_rec0
                 if dep.get("ipc") and not _ipc_base:
                     # the deposit staged on-card: open its handle once, read
                     # every unit of this lane/tag D2D out of the staging.
@@ -2991,6 +3000,7 @@ def run_sequential_units(descs, ops, boot_nonce: str, *,
                     log(f"WEG2-SEQ ptrattr lane={lane_key} "
                         f"dst_rc={_drc} dst_type={_dty} dst_device={_ddev} "
                         f"src_rc={_src} src_type={_sty} src_device={_sdev}")
+                _tc0 = time.perf_counter()
                 if piece.kind == tp.FLAT:
                     ops.memcpy_async(int(dst_ptr), _buf_addr, nbytes, stream)
                 else:
@@ -2999,6 +3009,7 @@ def run_sequential_units(descs, ops, boot_nonce: str, *,
                                        int(piece.run_bytes), int(piece.run_bytes),
                                        int(piece.rows), stream)
                 ops.synchronize(stream)
+                _t_copy += time.perf_counter() - _tc0
                 if dst_digest_fn is not None:
                     # #1378 xsn44 (the PLACEMENT witness): what LANDED at this
                     # destination vs what the deposit recorded. The buffer
@@ -3025,6 +3036,10 @@ def run_sequential_units(descs, ops, boot_nonce: str, *,
                 # test_the_per_band_claim_cannot_return pins as absent.
                 log(f"WEG2-SEQ collect {label} digest={my_digest} "
                     f"matches deposit")
+        log(f"WEG2-SEQ lane-time lane={lane_key} phase={phase} units={len(_batch.pieces)} "
+            f"bytes={total_bytes} total_ms={(time.perf_counter() - _t_lane0) * 1000:.0f} "
+            f"wait_ms={_t_wait * 1000:.0f} copy_sync_ms={_t_copy * 1000:.0f} "
+            f"record_ms={_t_rec * 1000:.0f} ipc={'yes' if _ipc_base else 'no'}")
         if phase == PHASE_COLLECT and _owns_buf and _seq_mm is not None:
             # #1385's lesson, at this form's own site: the file is freed by the
             # side that reads it LAST (the collect; the deposit's next tag is
