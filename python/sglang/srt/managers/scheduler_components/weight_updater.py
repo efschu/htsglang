@@ -3037,14 +3037,17 @@ class SchedulerWeightUpdaterManager:
         and cost ~1 s per derivation. Cached only for ``agreed=None`` and a
         plan that was actually built; the cache is reset at both leg entries."""
         _lc = getattr(self, "_weg2_xchg_leg_cache", None)
+        # class-level call: the execution smokes' stubs copy this method
+        # alone (the #1358 lesson) and carry no `_uncached` attribute.
+        _impl = SchedulerWeightUpdaterManager._weg2_shadow_plan_uncached
         if _lc is None or agreed is not None:
-            return self._weg2_shadow_plan_uncached(
-                hook, group, rank, agreed=agreed, require_agreement=require_agreement)
+            return _impl(self, hook, group, rank, agreed=agreed,
+                         require_agreement=require_agreement)
         key = ("plan", str(hook), str(group), int(rank), bool(require_agreement))
         if key in _lc:
             return _lc[key]
-        out = self._weg2_shadow_plan_uncached(
-            hook, group, rank, agreed=agreed, require_agreement=require_agreement)
+        out = _impl(self, hook, group, rank, agreed=agreed,
+                    require_agreement=require_agreement)
         if out is not None and out[0] is not None:
             _lc[key] = out
         return out

@@ -627,7 +627,7 @@ def test_the_draft_region_is_structurally_unreachable_from_either_call_site(
     # always the MAIN runner -- never `_get_draft_model_runner(...)`.
     from sglang.srt.managers.scheduler_components import weight_updater as _wu
 
-    src = inspect.getsource(_wu.SchedulerWeightUpdaterManager._weg2_shadow_plan)
+    src = inspect.getsource(_wu.SchedulerWeightUpdaterManager._weg2_shadow_plan_uncached)
     assert 'getattr(self.tp_worker, "model_runner", None)' in src
     assert "draft_worker" not in src, (
         "_weg2_shadow_plan now reads the draft runner -- the region-tag "
