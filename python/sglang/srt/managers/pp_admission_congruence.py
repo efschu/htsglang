@@ -1649,10 +1649,28 @@ def state_aligned_load_back_len(req) -> Optional[int]:
     device_len = 0 if prefix_indices is None else len(prefix_indices)
     room = int(anchor) - int(device_len)
     extent = kv if room >= kv else max(0, room)
+    key_depth = getattr(req, "key_match_depth", None)
+    # write_back at the flip (boot xsn128, rid ca49dc53): the host walk
+    # matched keys to 4095 with the anchor AT 4095, but `host_hit_length`
+    # counted only the node the read had just landed (4031) -- the leading
+    # 64-token node had come in hitless on an earlier request. The load-back
+    # applies the KEY match up to the anchor (4095), so an extent of 4031
+    # was the #968 'LOAD-BACK GDN ANCHOR OFF-EXTENT' STOP: the KV would be
+    # clamped below a recurrent state that had already consumed those
+    # tokens. When the key match REACHES the anchor and the anchor lies above
+    # the host hit, the anchor is the extent -- the same coordinate the
+    # load-back applies -- never the shorter count.
+    if (
+        key_depth is not None
+        and int(anchor) > 0
+        and int(key_depth) >= int(anchor)
+        and room > kv
+    ):
+        _1040_ALIGN["raised_to_anchor"] = _1040_ALIGN.get("raised_to_anchor", 0) + 1
+        extent = room
 
     _1040_ALIGN["n"] += 1
-    loss = kv - extent
-    key_depth = getattr(req, "key_match_depth", None)
+    loss = max(0, kv - extent)
     absent_class = None
     if int(anchor) <= 0:
         # No anchor at all -- the WHOLE hit is given back. Which of the two

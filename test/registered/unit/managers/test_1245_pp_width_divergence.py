@@ -186,3 +186,23 @@ def test_the_instrument_counts_events_not_visits():
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-q"]))
+
+
+def test_state_align_raises_the_extent_to_an_anchor_the_key_match_reaches():
+    """write_back at the flip (xsn128, rid ca49dc53): host_hit_length=4031
+    (only the freshly landed node), key match 4095, anchor at 4095 -> the
+    load-back applies 4095; an extent of 4031 is the #968 OFF-EXTENT stop.
+    The extent must be the anchor when the key match reaches it."""
+    from types import SimpleNamespace
+    from sglang.srt.managers.pp_admission_congruence import state_aligned_load_back_len
+    r = SimpleNamespace(rid="ca49dc53", host_hit_length=4031, state_anchor_depth=4095,
+                        prefix_indices=None, key_match_depth=4095)
+    assert state_aligned_load_back_len(r) == 4095
+    # anchor beyond the key match: NOT raised (the walk did not reach it)
+    r2 = SimpleNamespace(rid="x", host_hit_length=4031, state_anchor_depth=4095,
+                         prefix_indices=None, key_match_depth=4031)
+    assert state_aligned_load_back_len(r2) == 4031
+    # anchor below the hit: rounded DOWN as before
+    r3 = SimpleNamespace(rid="y", host_hit_length=4095, state_anchor_depth=4031,
+                         prefix_indices=None, key_match_depth=4095)
+    assert state_aligned_load_back_len(r3) == 4031
