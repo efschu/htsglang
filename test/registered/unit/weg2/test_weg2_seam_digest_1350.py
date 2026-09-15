@@ -1178,7 +1178,7 @@ def test_a_colliding_key_is_refused_not_last_writer_wins():
 def test_the_draft_runner_is_part_of_the_graded_population():
     """R4 -- the MTP/NEXTN draft shard is flipped (B4k) and was ungraded."""
     hook = _code_identifiers(_wu()._weg2_seam_inventory)
-    assert "draft_worker" in hook, (
+    assert ("draft_worker" in hook or "_weg2_drafter_of" in hook), (  # 006088fc: the accessor reaches the draft runner
         "the seam inventory never reads the draft worker's model: the draft "
         "shard the exchange moves (B4k) is ungraded"
     )

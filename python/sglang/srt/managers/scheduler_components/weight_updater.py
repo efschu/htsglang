@@ -4201,10 +4201,22 @@ class SchedulerWeightUpdaterManager:
             )
             return
         _ref = getattr(self, "weg2_seam_ref", None)
-        _tag_field = ",".join(weights_tags) if weights_tags else "none"
+        # weg2xsn97: the before reading is taken under the leg's FIRST
+        # release request, which on the waking side carries only kv_cache/
+        # cuda_graph (no weights tags) -- so the tag field is NOT part of
+        # the reading's identity; the placement key (checked by compare)
+        # and the tensor count are.
+        try:
+            _n_inv = len(inventory)
+        except TypeError:
+            _n_inv = -1
+        if _ref is not None and not (_weg2_seam_reuse_armed()
+                                     and int(getattr(_ref, "n_tensors", -1)) == _n_inv):
+            logger.info("WEG2-SEAM-DIGEST stage=before NOT-REUSED reuse=%s ref_n=%s "
+                        "inventory_n=%s", _weg2_seam_reuse_armed(),
+                        getattr(_ref, "n_tensors", None), _n_inv)
         if (_ref is not None and _weg2_seam_reuse_armed()
-                and str(getattr(_ref, "tag_field", "")) == _tag_field
-                and int(getattr(_ref, "n_tensors", -1)) == len(inventory)):
+                and int(getattr(_ref, "n_tensors", -1)) == _n_inv):
             self.weg2_seam_before = _ref
             logger.info(
                 "WEG2-SEAM-DIGEST stage=before REUSED group=%s rank=%s "
