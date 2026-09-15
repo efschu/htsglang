@@ -4294,6 +4294,19 @@ class SchedulerWeightUpdaterManager:
             out.append(d)
         if not owns_lane:
             return []
+        # #1378 xsn54 (DIE ZWEI ZAHLEN NEBENEINANDER): `owned` zaehlt die
+        # Descs, deren Name im EIGENEN Manifest dieses Rangs steht; `planned`
+        # ist die Lane-Groesse. Die xsn54-Messung (diag lane c0 planned=114,
+        # owned=102) machte sichtbar, dass 12 Stuecke Layer 39 -- P rank 1's
+        # Besitz -- in P rank 0's Lane liefen. Zwei Zahlen, jede Lane,
+        # diagonal wie cross, auf einer Zeile.
+        _own = self._weg2_owned_name_keys()
+        owned_n = sum(1 for d in out
+                      if (region_of_tag(d.tag), str(d.param_name)) in _own)
+        if log is not None:
+            log(f"WEG2-SEQ-LANE "
+                f"lane={'p%d' % pair if pair is not None else 'c%d' % card} "
+                f"owned={owned_n} planned={len(out)} tag={tag!r}")
         if not out:
             raise wx.Weg2XchgPlanDisagree(
                 f"W68 Weg2XchgPlanDisagree: the join's plan carries NO desc "
@@ -4317,6 +4330,30 @@ class SchedulerWeightUpdaterManager:
                 f"moves.  Copying them would move garbage; refusing names the "
                 f"first tensor instead")
         return out
+
+    def _weg2_owned_name_keys(self) -> set:
+        """The (region, name) keys of THIS rank's own manifest, cached per boot.
+
+        The lane audit's `owned=` side: a desc whose (region, name) is not in
+        here names bytes this rank does not hold, however many of them the
+        plan assigns to it (xsn54: 12 layer-39 pieces on P rank 0's lane).
+        """
+        cached = getattr(self, "_weg2_owned_name_keys_cache", None)
+        if cached is not None:
+            return cached
+        keys = set()
+        try:
+            for man in xm.manifests_for_boot(pp_group="P", tp_group="D")[0] or []:
+                if int(man.rank) != int(self._weg2_rank() or -1):
+                    continue
+                if str(man.group) != str(self._weg2_group_name() or ""):
+                    continue
+                for pc in man.pieces:
+                    keys.add((xm.region_of_tag(pc.tag), str(pc.param_name)))
+        except BaseException:  # noqa: BLE001 -- an audit never takes the leg
+            keys = set()
+        self._weg2_owned_name_keys_cache = keys
+        return keys
 
     def _weg2_model_for_group(self, group: str):
         """The model runner for the given group."""
