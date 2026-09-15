@@ -3076,8 +3076,18 @@ class SchedulerWeightUpdaterManager:
                           agreed=None, require_agreement: bool):
         """Per-leg cache in front of :meth:`_weg2_shadow_plan_uncached`
         (2026-09-15, weg2xsn94): the plan is the same for every tag of a leg
-        and cost ~1 s per derivation. Cached only for ``agreed=None`` and a
-        plan that was actually built; the cache is reset at both leg entries."""
+        and cost ~1 s per derivation; the cache lives for the BOOT.
+
+        ORDER POINT 2 (xsn125, WEG2-SLEEP-PRELOOP / WEG2-WAKE-TAIL): the
+        hook ALWAYS passes the manifest agreement, and the first form of this
+        cache bypassed itself for ``agreed is not None`` -- so both hooks
+        re-derived the plan on every leg: source_hook=580-640 ms before the
+        first deposit, dest_hook_compare=600-740 ms after the last collect,
+        1.2-1.3 s of every flip on the critical path. ``AgreedPieces`` is a
+        frozen dataclass (a frozenset of piece keys plus two counts) and the
+        manifest is a boot constant, so the agreement IS a valid cache key:
+        the same agreed set yields the same plan. An unhashable agreement
+        (a desk double) falls back to the uncached call as before."""
         _lc = getattr(self, "_weg2_xchg_leg_cache", None)
         if _lc is None:
             _lc = {}
@@ -3088,10 +3098,17 @@ class SchedulerWeightUpdaterManager:
         # class-level call: the execution smokes' stubs copy this method
         # alone (the #1358 lesson) and carry no `_uncached` attribute.
         _impl = SchedulerWeightUpdaterManager._weg2_shadow_plan_uncached
-        if _lc is None or agreed is not None:
+        _agreed_key = None
+        if agreed is not None:
+            try:
+                _agreed_key = hash(agreed)
+            except TypeError:
+                _lc = None
+        if _lc is None:
             return _impl(self, hook, group, rank, agreed=agreed,
                          require_agreement=require_agreement)
-        key = ("plan", str(hook), str(group), int(rank), bool(require_agreement))
+        key = ("plan", str(hook), str(group), int(rank), bool(require_agreement),
+               _agreed_key)
         if key in _lc:
             return _lc[key]
         out = _impl(self, hook, group, rank, agreed=agreed,
@@ -3865,7 +3882,16 @@ class SchedulerWeightUpdaterManager:
             # Guarded on `armed_by_launcher()` -- a single env read -- so an
             # unarmed boot does not even resolve group and rank here.
             if wlc.armed_by_launcher():
+                _hk_t = [time.perf_counter()]
+                _hk_l = []
+                
+                def _hk_ph(name):
+                    _n = time.perf_counter()
+                    _hk_l.append((name, (_n - _hk_t[0]) * 1000))
+                    _hk_t[0] = _n
+                
                 wlc.arm(group=self._weg2_group_name(), rank=self._weg2_rank())
+                _hk_ph("arm")
             if not sh.bounce_lane_armed():
                 return
             from sglang.srt.weg2 import weight_exchange as wx_legs
@@ -3982,6 +4008,7 @@ class SchedulerWeightUpdaterManager:
                 return
             peer = "D" if group == "P" else "P"
             free_bytes = self._weg2_free_bytes()
+            _hk_ph("free_bytes")
             if free_bytes is None:
                 logger.info(sh.rank_local_skip_message(
                     reason="no-free-column", rank=rank, leg=leg,
@@ -3992,6 +4019,7 @@ class SchedulerWeightUpdaterManager:
                            f"UNAFFORDABLE naming a full card that is not full"))
                 return
             self._weg2_shadow_param_census(group, rank)
+            _hk_ph("census")
             # #1311 S6b -- THE CARD MANIFEST, BEFORE THE PLAN AND NOT AFTER.
             # The plan is narrowed to the pair's agreed piece set, and
             # ``coalesce`` merges descriptors across parameter names, so the
@@ -4001,6 +4029,7 @@ class SchedulerWeightUpdaterManager:
             # for the transport.
             agreed, manifest_state = self._weg2_shadow_manifest(
                 group, peer, int(rank), leg=leg, epoch=epoch_token)
+            _hk_ph("manifest")
             # #1345: THE SHADOW LANE NARROWS, and says so at the call rather
             # than relying on the adapter.  This is the danger direction of
             # that slice: a shadow leg planned over a set the peer never agreed
@@ -4009,6 +4038,7 @@ class SchedulerWeightUpdaterManager:
                                                        int(rank),
                                                        agreed=agreed,
                                                        require_agreement=True)
+            _hk_ph("plan")
             # THE MANIFEST STATE RIDES THE PLAN REASON, so the one line a
             # refused leg prints (W79 ``no-plan``) says WHY the pair could not
             # agree and not merely that it did not.
@@ -4084,6 +4114,7 @@ class SchedulerWeightUpdaterManager:
                 # host-schwelle-nie-uebertreten forbids.
                 host_bounce_budget_bytes=self._weg2_shadow_host_budget(),
             )
+            _hk_ph("inputs_gate_budget")
             # #1348 (review MF-4): THE TRACER IS ON ONLY FOR THE LEG.
             # sys.settrace is paid by every Python call in the process, not
             # just the allowlisted files (measured: 4.04x on NON-allowlisted
@@ -4124,6 +4155,8 @@ class SchedulerWeightUpdaterManager:
                 # boots this instrument exists for. A rank that dies between
                 # two legs still leaves every leg it completed behind.
                 wlc.note_leg_end(hook)
+                _hk_ph("leg_hook")
+                logger.info("WEG2-XCHG-HOOK-TIME hook=%s " + " ".join(f"{_n}={_ms:.0f}" for _n, _ms in _hk_l) + f" t={time.time():.3f}", hook)
         except BaseException as exc:  # noqa: BLE001 -- an observer never raises
             logger.warning(
                 "[weg2 shadow] the %s hook failed and the flip is unaffected "

@@ -50,6 +50,7 @@ test it.
 
 from __future__ import annotations
 
+import unittest
 import os
 
 import pytest
@@ -933,3 +934,50 @@ def test_seam_before_walks_again_when_the_set_changed_or_reuse_is_off(monkeypatc
     monkeypatch.setenv("SGLANG_WEG2_SEAM_REUSE", "0")
     m._weg2_seam_digest_before(req, ["weights_0"])
     assert calls == ["before", "before"], "reuse off: walks"
+
+
+class PlanCacheKeysOnTheAgreement(unittest.TestCase):
+    """Order point 2 (xsn125): the hook always passes the manifest agreement;
+    the cache must HIT on the same agreed set (a frozen dataclass) and MISS on
+    a different one -- the first form bypassed itself for any agreement and
+    re-derived the ~1 s plan on every leg, both hooks."""
+
+    def _mgr(self, calls):
+        from sglang.srt.managers.scheduler_components import weight_updater as wu
+
+        class _M:
+            _weg2_xchg_leg_cache = None
+
+        def _uncached(self, hook, group, rank, *, agreed=None, require_agreement):
+            calls.append((hook, agreed))
+            return (object(), "")
+        orig = wu.SchedulerWeightUpdaterManager._weg2_shadow_plan_uncached
+        wu.SchedulerWeightUpdaterManager._weg2_shadow_plan_uncached = _uncached
+        self.addCleanup(setattr, wu.SchedulerWeightUpdaterManager,
+                        "_weg2_shadow_plan_uncached", orig)
+        m = _M()
+        m._weg2_shadow_plan = wu.SchedulerWeightUpdaterManager._weg2_shadow_plan.__get__(m)
+        return m
+
+    def test_same_agreement_hits_different_agreement_misses(self):
+        from sglang.srt.weg2 import weight_exchange_shadow as sh
+        calls = []
+        m = self._mgr(calls)
+        a1 = sh.AgreedPieces(keys=frozenset({(1, 0, 0, 0, 8), (2, 0, 0, 0, 8)}), digest=7, mine=2, theirs=3)
+        a1b = sh.AgreedPieces(keys=frozenset({(2, 0, 0, 0, 8), (1, 0, 0, 0, 8)}), digest=7, mine=2, theirs=3)
+        a2 = sh.AgreedPieces(keys=frozenset({(1, 0, 0, 0, 8)}), digest=8, mine=1, theirs=3)
+        p1 = m._weg2_shadow_plan("source", "P", 0, agreed=a1, require_agreement=True)
+        p2 = m._weg2_shadow_plan("source", "P", 0, agreed=a1b, require_agreement=True)
+        self.assertIs(p1, p2)
+        self.assertEqual(len(calls), 1)
+        m._weg2_shadow_plan("source", "P", 0, agreed=a2, require_agreement=True)
+        self.assertEqual(len(calls), 2)
+        m._weg2_shadow_plan("destination", "P", 0, agreed=a1, require_agreement=True)
+        self.assertEqual(len(calls), 3)
+
+    def test_unhashable_agreement_stays_uncached(self):
+        calls = []
+        m = self._mgr(calls)
+        m._weg2_shadow_plan("source", "P", 0, agreed={"k": 1}, require_agreement=True)
+        m._weg2_shadow_plan("source", "P", 0, agreed={"k": 1}, require_agreement=True)
+        self.assertEqual(len(calls), 2)
