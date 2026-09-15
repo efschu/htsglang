@@ -2196,11 +2196,16 @@ def seq_unit_digest_armed() -> bool:
 
 
 def seq_buffer_depth() -> int:
+    """Buffers per lane the depositor may run ahead (default 4 since
+    weg2xsn99: the waker on card 1 idled 1.2 s while the depositor walked
+    four of card 0's tags first; at depth 2 it could not get ahead of them).
+    Cost: depth x lane bytes on tmpfs per lane (~25 GB at 4), and on-card
+    staging that falls back to the host path when VRAM is short."""
     try:
-        d = int(os.environ.get(SEQ_BUFFER_DEPTH_ENV, "2") or 2)
+        d = int(os.environ.get(SEQ_BUFFER_DEPTH_ENV, "4") or 4)
     except ValueError:
-        d = 2
-    return 1 if d < 1 else (2 if d > 2 else d)
+        d = 4
+    return 1 if d < 1 else (8 if d > 8 else d)
 
 
 def seq_lanes_parallel() -> bool:
