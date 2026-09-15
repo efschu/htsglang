@@ -270,3 +270,19 @@ def test_follower_with_short_prefix_refuses_even_if_it_loaded_something():
     s.tree_cache.register("4e4e0001", loaded=4031, flips=0, completed=4031)
     with pytest.raises(m.Weg2StoreToldMismatch, match="told=4095 own_prefix=4031"):
         m.admission(s, r, lambda k, rid: None)
+
+
+def test_follower_limit_is_one_token_more_under_bigram_keys():
+    """xsn120: told=4095 keys; a bigram tree (MTP draft) needs 4096 tokens to
+    make 4095 keys so the anchor at key 4094 is inside the registered range."""
+    plain = SimpleNamespace(is_eagle=False)
+    bigram = SimpleNamespace(is_eagle=True)
+    assert m.follower_limit_tokens(plain, 4095) == 4095
+    assert m.follower_limit_tokens(bigram, 4095) == 4096
+    s = _Sched(1)
+    m.armed(s)
+    s.tree_cache.is_eagle = True
+    r = _req("5f5f0001")
+    m.intake(s, r, lambda k: None)
+    m.follower_absorb(s, [m.Weg2StoreTold("5f5f0001", 4095)])
+    assert s.registered == [("5f5f0001", 4096)]

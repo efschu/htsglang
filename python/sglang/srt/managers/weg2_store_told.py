@@ -206,10 +206,22 @@ def intake(scheduler, req, note_gate: Callable[[str], None]) -> str:
     return f"declined:{GATE_HELD}"
 
 
+def follower_limit_tokens(tree, told: int) -> int:
+    """Token position up to which a follower registers so that its KEY count
+    equals PP0's completed count. Under a bigram key (``is_eagle``: MTP draft
+    on this form) n tokens make n-1 keys, and the completed count -- like the
+    anchor index -- is in keys: boot xsn120, told=4095, follower registered
+    4095 tokens = 4094 keys, anchor at key 4094 outside the range, claim 0."""
+    bigram = 1 if bool(getattr(tree, "is_eagle", False)) else 0
+    return int(told) + bigram
+
+
 def _follower_register(scheduler, req, told: int) -> str:
     if told <= 0:
         return "declined:weg2_told_zero"
-    verdict = scheduler._prefetch_kvcache(req, limit_tokens=int(told))
+    verdict = scheduler._prefetch_kvcache(
+        req, limit_tokens=follower_limit_tokens(scheduler.tree_cache, told)
+    )
     if not str(verdict).startswith("issued"):
         logger.warning(
             "#1400 FOLLOWER REGISTRATION DECLINED rid=%s told=%d verdict=%s: this "
