@@ -808,6 +808,11 @@ class SeamVerdict:
     moved: Tuple[str, ...] = ()
     gone: Tuple[str, ...] = ()
     arrived: Tuple[str, ...] = ()
+    #: #1378 xsn76: ``(label, digest_before, digest_after)`` per moved piece
+    #: -- with embed_tokens the one class left content-changed on P rank 0
+    #: while D's three shards are byte-identical to the checkpoint rows, the
+    #: verdict has to say WHICH side's bytes P held before and holds after.
+    moved_digests: Tuple[Tuple[str, str, str], ...] = ()
     #: Only used by :func:`unarmed_verdict`, where there is no reading to read
     #: the identity off.
     group: str = "?"
@@ -853,6 +858,9 @@ class SeamVerdict:
             # truncated -- "+210-more" could not say whether the 218 were all
             # fused tensors, all sharded ones, or everything the leg touched.
             f"moved_by_class={_by_class(self.moved)}",
+            f"moved_digests="
+            + (",".join(f"{lab}:{b}>{a}" for lab, b, a in self.moved_digests)
+               if self.moved_digests else "none"),
             f"gone={len(self.gone)} pieces_gone={_named(self.gone)}",
             f"arrived={len(self.arrived)} pieces_arrived={_named(self.arrived)}",
             f"population={POPULATION}",
@@ -950,14 +958,18 @@ def compare(
             gone=tuple(gone),
             arrived=tuple(arrived),
         )
-    moved = sorted(
-        a_map[k].identity.label
+    moved_keys = sorted(
+        (a_map[k].identity.label, k)
         for k in a_map
         if a_map[k].digest != b_map[k].digest
     )
+    moved = [label for label, _k in moved_keys]
     if moved:
         return SeamVerdict(
-            VERDICT_MISMATCH, REASON_CONTENT, before, after, moved=tuple(moved)
+            VERDICT_MISMATCH, REASON_CONTENT, before, after, moved=tuple(moved),
+            moved_digests=tuple(
+                (label, str(b_map[k].digest), str(a_map[k].digest))
+                for label, k in moved_keys[:MAX_NAMED_PIECES]),
         )
     if not (before.complete and after.complete):
         return SeamVerdict(VERDICT_MATCH_PARTIAL, REASON_MATCH, before, after)
