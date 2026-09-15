@@ -3164,11 +3164,27 @@ class SchedulerWeightUpdaterManager:
             draft_model = getattr(drafter, "model", None)
             if draft_model is None:
                 return None, ""
-            try:
-                draft_region_tag = wx.weights_region_tag_for(
-                    wx.RunnerShape.of(drafter))
-            except BaseException:  # noqa: BLE001 -- an unclassified shape
-                return None, "draft-shape-unclassified"
+            # #1378 xsn77 -- THE SAME RULE THE MANIFEST WRITER USES. On group
+            # P the drafter is resident for the flip but P runs no speculative
+            # decoding, so `classify_runner` answers None and
+            # `weights_region_tag_for` RAISES under an armed exchange; this
+            # site swallowed that as "draft-shape-unclassified" and planned no
+            # draft leg on P, while `_weg2_seam_inventory` had written P's
+            # draft manifest under weights_draft (19 pieces) and D deposited
+            # 25 units on lane c0 that P never collected. The handshake tokens
+            # stayed posted, the NEXT tag's collect on that lane (weights,
+            # embed_tokens) read the stale unit and refused -- four boots of
+            # "embed_tokens content-changed". A drafter reached through
+            # `_get_draft_model_runner` under an armed exchange IS the draft
+            # region, on both groups, exactly as the manifest says.
+            if ms.draft_tag_in_family():
+                draft_region_tag = wx.GPU_MEMORY_TYPE_WEIGHTS_DRAFT
+            else:
+                try:
+                    draft_region_tag = wx.weights_region_tag_for(
+                        wx.RunnerShape.of(drafter))
+                except BaseException:  # noqa: BLE001 -- an unclassified shape
+                    return None, "draft-shape-unclassified"
             # #1378 xsn34 root: the DRAFT's own ``lm_head.weight`` is the
             # shared TARGET module on this arm (eagle_worker_v2's
             # set_embed_and_head_modules / set_lm_head_from_target hand the
@@ -3339,6 +3355,24 @@ class SchedulerWeightUpdaterManager:
             model = getattr(runner, "model", None)
             if model is None:
                 continue
+            if runner is not main:
+                # #1378 xsn77: the drafter is filed under the draft region by
+                # the same rule the manifest writer and the draft plan use
+                # (see _weg2_xchg_draft_plan_or_none). On P the classifier
+                # raises (no speculative config) and the old fallback filed
+                # the draft's tensors under `weights`, where the target's
+                # names shadow them and the draft-only ones are unreachable.
+                from sglang.srt.managers.weg2_memory_saver import (
+                    draft_tag_in_family as _dtif,
+                )
+                if _dtif():
+                    region = _xm.region_of_tag(_wx.GPU_MEMORY_TYPE_WEIGHTS_DRAFT)
+                    try:
+                        for name, param in model.named_parameters():
+                            table.setdefault((region, str(name)), param)
+                    except BaseException:  # noqa: BLE001
+                        pass
+                    continue
             try:
                 region = _xm.region_of_tag(
                     _wx.weights_region_tag_for(_wx.RunnerShape.of(runner)))
@@ -4809,6 +4843,7 @@ class SchedulerWeightUpdaterManager:
             )
             _lane_permit = tp.LanePermit(str(boot_nonce)) if _lane_permit_active else None
             try:
+                _lane_failures = []  # #1378 xsn77: every lane's refusal, not the last lane's
                 for pair, group in _lanes.items():
                     # #1378 xsn34 root fix: the lanes' wait budget is the
                     # boot's own leg bound (600 s, = the deadman's GRACE_S),
@@ -4995,6 +5030,8 @@ class SchedulerWeightUpdaterManager:
                             # matches what the emitter already does one frame
                             # down, where an absent group prints as `group=?`.
                             log=logger.info)
+                        if last:
+                            _lane_failures.append(f"{_lane_key}/{tag}: {last}")
                     finally:
                         if _lane_permit_active:
                             _lane_permit.release()
@@ -5032,6 +5069,16 @@ class SchedulerWeightUpdaterManager:
                     _lane_permit.close()
         finally:
             slots.close()
+        if _lane_failures:
+            # #1378 xsn77: `last` was overwritten by every following lane, so
+            # a lane that refused (P rank 0, lane c0, tag weights: "digest
+            # mismatch at unit 0 model.embed_tokens.weight") vanished behind
+            # two lanes that returned "" -- the embed rows 0..82815 were never
+            # written and four boots read the SEAM-DIGEST mismatch as a
+            # content question. A lane's refusal refuses the leg, by name.
+            raise bx.Weg2XchgBouncePhaseUnordered(
+                f"W68 Weg2XchgPlanDisagree: {len(_lane_failures)} lane(s) of "
+                f"this leg refused: " + " | ".join(_lane_failures[:6]))
         return last
 
     # PATH (a) WAS DELETED HERE (#1342 S3), and the deletion is recorded
