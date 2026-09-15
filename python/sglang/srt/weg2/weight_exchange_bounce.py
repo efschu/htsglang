@@ -2209,11 +2209,29 @@ def ptr_attrs(addr: int) -> Tuple[int, int, int]:
     # rank 0 with no log line, read for two boots as "the resume hangs". The
     # type object, the function handle and its argtypes are now built ONCE
     # and held for the process's life; nothing here is created per call.
+    #
+    # #1378 xsn69 -- AND THE SECOND WAY THE PROBE KILLED ITS RANK: with the
+    # binding cached, all three P ranks still died within two seconds of the
+    # first resume, each in a DIFFERENT pure-Python or C frame (tag_slots
+    # arithmetic, json.raw_decode, torch.cuda.memory_stats on the corridor
+    # thread) -- heap corruption, and P rank 1/2 had made exactly ONE call.
+    # MEASURED on this box: `CDLL(None).cudaPointerGetAttributes` resolves into
+    # nvidia/cu13/lib/libcudart.so.13 while torch runs on libcudart.so.12 --
+    # both are mapped in the process, and the first call into the cu13 runtime
+    # initialises a SECOND runtime's state over the cu12 context.  D, which
+    # never ran the probe, never crashed.  The reading now comes from the
+    # DRIVER API (libcuda.so.1, ONE library, the one torch_memory_saver itself
+    # maps pages with): cuPointerGetAttribute(MEMORY_TYPE) and (DEVICE_ORDINAL).
+    # Same contract: (rc, type, device); driver memory types are HOST=1
+    # DEVICE=2 ARRAY=3 UNIFIED=4, an unknown address is rc!=0 and reported as
+    # type 0 / device -1, which is what the decisive reading has always been.
     try:
-        fn, pa_cls = _ptr_attrs_binding()
-        _a = pa_cls()
-        rc = fn(_ct_byref(_a), int(addr))
-        return int(rc), int(_a.type), int(_a.device)
+        fn = _ptr_attrs_binding()
+        mem_type, rc = _cu_pointer_attr_int(fn, 2, addr)   # CU_POINTER_ATTRIBUTE_MEMORY_TYPE
+        if rc != 0:
+            return int(rc), 0, -1
+        dev, rc2 = _cu_pointer_attr_int(fn, 9, addr)       # CU_POINTER_ATTRIBUTE_DEVICE_ORDINAL
+        return 0, int(mem_type), (int(dev) if rc2 == 0 else -1)
     except Exception:  # noqa: BLE001 -- see the docstring's last paragraph
         return -1, -1, -1
 
@@ -2222,30 +2240,29 @@ _PTR_ATTRS_BINDING = None
 
 
 def _ptr_attrs_binding():
-    """``(cudaPointerGetAttributes, cudaPointerAttributes)`` bound ONCE."""
+    """``cuPointerGetAttribute`` from libcuda.so.1, bound ONCE per process."""
     global _PTR_ATTRS_BINDING
     if _PTR_ATTRS_BINDING is None:
         import ctypes as _ct
 
-        class _PA(_ct.Structure):
-            _fields_ = [("type", _ct.c_int), ("device", _ct.c_int),
-                        ("devicePointer", _ct.c_void_p),
-                        ("hostPointer", _ct.c_void_p)]
-
-        lib = _ct.CDLL(None)
-        fn = lib.cudaPointerGetAttributes
+        lib = _ct.CDLL("libcuda.so.1")
+        fn = lib.cuPointerGetAttribute
         fn.restype = _ct.c_int
-        fn.argtypes = [_ct.POINTER(_PA), _ct.c_void_p]
+        # (void* data, CUpointer_attribute attribute, CUdeviceptr ptr)
+        fn.argtypes = [_ct.c_void_p, _ct.c_int, _ct.c_ulonglong]
         # the CDLL object is kept alive by the tuple: a function pointer whose
         # library handle was collected is the same defect one layer down
-        _PTR_ATTRS_BINDING = (fn, _PA, lib)
-    return _PTR_ATTRS_BINDING[0], _PTR_ATTRS_BINDING[1]
+        _PTR_ATTRS_BINDING = (fn, lib)
+    return _PTR_ATTRS_BINDING[0]
 
 
-def _ct_byref(obj):
+def _cu_pointer_attr_int(fn, attribute: int, addr: int) -> Tuple[int, int]:
+    """``(value, rc)`` of one integer-valued pointer attribute."""
     import ctypes as _ct
 
-    return _ct.byref(obj)
+    out = _ct.c_uint(0)
+    rc = fn(_ct.byref(out), int(attribute), _ct.c_ulonglong(int(addr)))
+    return int(out.value), int(rc)
 
 
 def _mmap_addr(mm: "_mmap.mmap") -> int:
