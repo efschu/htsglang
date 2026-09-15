@@ -2502,12 +2502,21 @@ def run_sequential_units(descs, ops, boot_nonce: str, *,
             # if the next boot segfaults again, these five numbers say whether
             # the destination pointer, the window offset or the length is the
             # one out of range -- none of which a traceback-less SIGSEGV tells.
-            if i == 0:
-                log(f"WEG2-SEQ collect-first lane={lane_key} "
-                    f"dst_ptr={int(dst_ptr)} buf_addr={int(_buf_addr)} "
-                    f"window_off={window_off} nbytes={nbytes} "
-                    f"base_addr={int(base_addr)} total_bytes={total_bytes} "
-                    f"kind={piece.kind} name={name!r}")
+            # #1378 xsn59: EVERY PIECE, not just the first -- and the reason is
+            # measured. xsn58 logged `collect-first` at 05:40:47 and died at
+            # 05:40:49: TWO SECONDS LATER, so the first piece (10 KB) copies
+            # FINE and the fault is in a LATER one. A marker on piece 0 alone
+            # cannot name it. `stale_dst=0` on all three lanes in the same boot
+            # also refuted the stale-pointer theory, so the surviving question
+            # is purely WHICH piece -- and that is an index, not a hypothesis.
+            #
+            # 114 rows for the widest lane is the price of naming it; the fields
+            # are kept short for that reason. The log may lose the very last
+            # row to the SIGSEGV (the handler never runs), so read the highest
+            # index that ARRIVED as "died at i or i+1", never as exact.
+            log(f"WEG2-SEQ cf lane={lane_key} i={i}/{len(_batch.pieces)} "
+                f"dst={int(dst_ptr)} off={window_off} n={nbytes} "
+                f"k={piece.kind} nm={name!r}")
             if piece.kind == tp.FLAT:
                 ops.memcpy_async(int(dst_ptr), _buf_addr, nbytes, stream)
             else:
