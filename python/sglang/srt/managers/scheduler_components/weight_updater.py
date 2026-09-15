@@ -4164,11 +4164,18 @@ class SchedulerWeightUpdaterManager:
                 _hk_ph("leg_hook")
                 logger.info("WEG2-XCHG-HOOK-TIME hook=%s " + " ".join(f"{_n}={_ms:.0f}" for _n, _ms in _hk_l) + f" t={time.time():.3f}", hook)
         except BaseException as exc:  # noqa: BLE001 -- an observer never raises
-            logger.warning(
-                "[weg2 shadow] the %s hook failed and the flip is unaffected "
-                "(%s: %s) -- the ring is and stays the only authority for "
-                "weight bytes",
-                hook, type(exc).__name__, exc,
+            # #1403 (xsn135): this line used to say "the flip is unaffected".
+            # It was wrong the one time it mattered -- on the exchange arm the
+            # sequential transport's deposit runs INSIDE this hook, so a raise
+            # here is a leg that never deposited and a peer that waits for it
+            # until the front's W4. Say so, at ERROR, with the traceback.
+            logger.error(
+                "[weg2 shadow] the %s hook RAISED (%s: %s) -- on the exchange "
+                "arm the transport's deposit/collect runs in this hook, so "
+                "this leg may not have moved its bytes and the peer's wake "
+                "will wait for them (xsn135: W4 after 200 s). The ring, where "
+                "armed, stays the authority for weight bytes.",
+                hook, type(exc).__name__, exc, exc_info=True,
             )
 
     def _weg2_shadow_host_budget(self) -> int:
