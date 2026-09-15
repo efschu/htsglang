@@ -1313,6 +1313,26 @@ class VramCredit:
                 _dev["free_bytes"] = free_now
                 _dev["allocatable_est_bytes"] = allocatable_est
                 if allocatable_est is not None and allocatable_est < need:
+                    # 2026-09-15 (wake overlap, weg2xsn108): the shortfall can
+                    # be TRANSIENT -- the sleeper's on-card IPC staging for
+                    # the tag just collected is freed once the wake worker's
+                    # drain lands, and the waking main thread asks for the
+                    # next tag's credit while that collect is still in
+                    # flight. Poll the allocatable estimate (bounded) before
+                    # refusing; a genuine shortfall still refuses by name.
+                    import time as _time85
+                    _t85 = _time85.perf_counter()
+                    while (allocatable_est is not None and allocatable_est < need
+                           and _time85.perf_counter() - _t85 < 30.0):
+                        _time85.sleep(0.05)
+                        free_now = self._free_now(free_reader)
+                        allocatable_est = (
+                            None if free_now is None else max(0, free_now - floor))
+                    _dev["free_bytes"] = free_now
+                    _dev["allocatable_est_bytes"] = allocatable_est
+                    _dev["allocatable_waited_ms"] = int(
+                        (_time85.perf_counter() - _t85) * 1000)
+                if allocatable_est is not None and allocatable_est < need:
                     raise Weg2VramCreditAllocatableShort(
                         f"W85 Weg2VramCreditAllocatableShort card={self.uuid} "
                         f"tag={tag} credit={available // MIB} MiB "
