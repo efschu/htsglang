@@ -254,6 +254,14 @@ def _weg2_wake_overlap_armed() -> bool:
                ).strip().lower() in ("1", "true", "yes", "on")
 
 
+def _weg2_seam_per_tag_armed() -> bool:
+    """SGLANG_WEG2_SEAM_PER_TAG (default 1): the after reading is folded per
+    tag on the wake worker and assembled (Punkt 3)."""
+    import os as _os
+    return str(_os.environ.get("SGLANG_WEG2_SEAM_PER_TAG", "1") or "1"
+               ).strip().lower() in ("1", "true", "yes", "on")
+
+
 def _weg2_seam_reuse_armed() -> bool:
     """SGLANG_WEG2_SEAM_REUSE (default 1): a leg's ``before`` reading is the
     rank's last graded reading instead of a fresh device walk."""
@@ -533,6 +541,14 @@ class SchedulerWeightUpdaterManager:
     #: the credit wait's stuck-lane reader must not read those in-flight
     #: bands as 'never drained' (PP0 W108 at the credit wait on xsn107).
     _weg2_wake_inflight: bool = False
+    #: Punkt 3 (2026-09-15): the wake worker folds each tag's pieces right
+    #: after that tag's collect (per-tag `after` parts, keyed by piece key)
+    #: and the leg's `after` reading is ASSEMBLED from them in inventory
+    #: order -- the reading digest is an ordered fold over the pieces, so the
+    #: assembled reading equals a whole walk. The leg's inventory is taken
+    #: once (cache) so the worker does not re-walk the model per tag.
+    _weg2_seam_after_parts: Optional[dict] = None
+    _weg2_seam_leg_inventory: Any = None
     #: True once the resume loop has collected tag by tag, so the once-per-wake
     #: entry stands down instead of injecting a second time over bytes already
     #: written.
@@ -3572,10 +3588,44 @@ class SchedulerWeightUpdaterManager:
             except AttributeError:
                 pass
         self._weg2_xchg_collected_per_tag = True
+        self._weg2_seam_after_part(tag)
         if (str(tag) == str(_DRAFT_TAG)
                 and not _collected
                 and self._weg2_xchg_draft_reload_from_disk()):
             pass  # the exchange carried nothing for this tag
+
+    def _weg2_seam_after_part(self, tag) -> None:
+        """Punkt 3: fold THIS tag's pieces now (on the wake worker, while
+        the main thread resumes the next tag); the leg's `after` reading is
+        assembled from the parts. Any failure leaves the part out -- the
+        assembly then falls back to the whole walk, never to a gap."""
+        from sglang.srt.weg2 import seam_digest
+        try:
+            if not (_weg2_seam_per_tag_armed() and seam_digest.seam_digest_armed()):
+                return
+            parts = getattr(self, "_weg2_seam_after_parts", None)
+            if parts is None:
+                return
+            inv = getattr(self, "_weg2_seam_leg_inventory", None)
+            if inv is None:
+                inv = self._weg2_seam_inventory()
+                self._weg2_seam_leg_inventory = inv
+            inventory = inv[0]
+            if inventory is None:
+                return
+            items = [(idn, t) for idn, t in inventory if str(idn.tag) == str(tag)]
+            if not items:
+                return
+            part = seam_digest.take_reading(
+                "after-part", items, group=self._weg2_group_name(),
+                rank=self._weg2_rank(), card=self._weg2_device_index(),
+                tags=[str(tag)], epoch=None, budget_s=0.0)
+            parts[str(tag)] = (part, {p.identity.key: p for p in part.pieces})
+            logger.info("WEG2-SEAM-DIGEST stage=after-part tag=%s pieces=%d ms=%.0f",
+                        tag, len(part.pieces), part.ms)
+        except Exception as exc:  # noqa: BLE001 -- an observer never takes the leg down
+            logger.info("WEG2-SEAM-DIGEST stage=after-part tag=%s FAILED %s: %s",
+                        tag, type(exc).__name__, exc)
 
     def _weg2_cocard_peer_alive(self) -> bool:
         """Is the co-located rank on THIS card still alive?  NVML per-process
@@ -4319,7 +4369,36 @@ class SchedulerWeightUpdaterManager:
                 ).line(),
             )
             return
-        after = seam_digest.take_reading(
+        after = None
+        _parts = getattr(self, "_weg2_seam_after_parts", None) or {}
+        if _parts and _weg2_seam_per_tag_armed():
+            _by_key = {}
+            _ms = 0.0
+            _syncs = 0
+            for _p, _m in _parts.values():
+                _by_key.update(_m)
+                _ms += float(_p.ms)
+                _syncs += int(getattr(_p, "syncs", 0))
+            _keys = [idn.key for idn, _t in inventory]
+            if all(k in _by_key for k in _keys):
+                after = seam_digest.SeamReading(
+                    stage="after", group=str(group), rank=int(rank), card=int(card),
+                    tags=tuple(str(t) for t in weights_tags),
+                    epoch=getattr(recv_req, "epoch", None),
+                    pieces=tuple(_by_key[k] for k in _keys), ms=_ms,
+                    walked=len(inventory) + len(skipped),
+                    skipped=tuple((str(n), str(r)) for n, r in skipped),
+                    skipped_bytes=0, syncs=_syncs)
+                logger.info("WEG2-SEAM-DIGEST stage=after ASSEMBLED parts=%d "
+                            "pieces=%d fold_ms=%.0f -- folded per tag on the wake "
+                            "worker; no whole walk on the leg's critical path",
+                            len(_parts), len(_keys), _ms)
+            else:
+                logger.info("WEG2-SEAM-DIGEST stage=after parts=%d cover=%d/%d -- "
+                            "whole walk", len(_parts),
+                            sum(1 for k in _keys if k in _by_key), len(_keys))
+        if after is None:
+            after = seam_digest.take_reading(
             "after",
             inventory,
             group=group,
@@ -5791,6 +5870,8 @@ class SchedulerWeightUpdaterManager:
         # sides walk the same tags per leg, so both start at 0 here.
         try:
             self._weg2_xchg_lane_seq = {}
+            self._weg2_seam_after_parts = {}
+            self._weg2_seam_leg_inventory = None
             # the derivation cache is PER BOOT (weg2xsn98): the manifests
             # are written at load and the placement key is identical on
             # every leg, so the join/plan/books/shadow plan derived on the
@@ -6251,6 +6332,8 @@ class SchedulerWeightUpdaterManager:
         # sides walk the same tags per leg, so both start at 0 here.
         try:
             self._weg2_xchg_lane_seq = {}
+            self._weg2_seam_after_parts = {}
+            self._weg2_seam_leg_inventory = None
             # the derivation cache is PER BOOT (weg2xsn98): the manifests
             # are written at load and the placement key is identical on
             # every leg, so the join/plan/books/shadow plan derived on the
