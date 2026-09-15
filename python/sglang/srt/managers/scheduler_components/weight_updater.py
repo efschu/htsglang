@@ -3553,9 +3553,12 @@ class SchedulerWeightUpdaterManager:
     def _weg2_wake_collect_one(self, tag) -> None:
         """One tag's collect on the wake side (the exchange carrier), run
         inline or on the wake worker (2026-09-15, Punkt 2)."""
+        from sglang.srt.managers.weg2_memory_saver import (
+            GPU_MEMORY_TYPE_WEIGHTS_DRAFT as _DRAFT_TAG,
+        )
         _collected = self._weg2_xchg_inject_weights(tag=tag)
         self._weg2_xchg_collected_per_tag = True
-        if (str(tag) == _WEIGHTS_DRAFT_TAG
+        if (str(tag) == str(_DRAFT_TAG)
                 and not _collected
                 and self._weg2_xchg_draft_reload_from_disk()):
             pass  # the exchange carried nothing for this tag
