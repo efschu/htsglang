@@ -840,14 +840,33 @@ def join_manifests(
             f"the two directions, and planning over the ranks that did publish "
             f"would silently narrow the exchange to whatever was on disk."
         )
-    for label, group, mans in ((pp_group, pp_group, pp), (tp_group, tp_group, tp)):
-        if [m.rank for m in mans] != list(range(len(mans))):
-            raise wx.Weg2XchgPlanDisagree(
-                f"W68 Weg2XchgPlanDisagree: group {group!r} published ranks "
-                f"{[m.rank for m in mans]}, which is not a contiguous 0..n-1 "
-                f"range. The per-rank extents are a VECTOR in rank order; a "
-                f"gap in it would shift every shard boundary."
-            )
+    # #1378 xsn80: THE RANK VECTOR IS AN AXIS ONLY ON THE TP SIDE. A TP rank's
+    # position in the vector IS its shard boundary, so that side must publish
+    # 0..n-1 without a gap. A PP stage holds every tensor it publishes WHOLE
+    # and is keyed by (region, name) with its own card below, so a region
+    # that lives on ONE stage -- the MTP drafter on P's last stage, manifest
+    # rank=2 card=2 once it carried the process's place -- is a legitimate
+    # publication of ranks [2]. Insisting on [0] there refused the draft
+    # region on both sides (D: WEG2-XCHG-DRAFT-PLAN-SKIPPED, then W106) the
+    # moment the manifest stopped lying about where the drafter lives.
+    # Duplicates are still refused on the PP side: two stages claiming one
+    # rank would leave the plan free to pick either.
+    tp_ranks = [m.rank for m in tp]
+    if tp_ranks != list(range(len(tp))):
+        raise wx.Weg2XchgPlanDisagree(
+            f"W68 Weg2XchgPlanDisagree: group {tp_group!r} published ranks "
+            f"{tp_ranks}, which is not a contiguous 0..n-1 range. The "
+            f"per-rank extents are a VECTOR in rank order; a gap in it would "
+            f"shift every shard boundary."
+        )
+    pp_ranks = [m.rank for m in pp]
+    if len(set(pp_ranks)) != len(pp_ranks):
+        raise wx.Weg2XchgPlanDisagree(
+            f"W68 Weg2XchgPlanDisagree: group {pp_group!r} published ranks "
+            f"{pp_ranks} with a duplicate. Under the PP form one stage holds "
+            f"a tensor whole; two stages claiming one rank leave the plan free "
+            f"to pick either."
+        )
 
     # KEYED BY (REGION, NAME) at this site too, so all four share ONE key
     # type. With the region cut running before the join this is belt and
