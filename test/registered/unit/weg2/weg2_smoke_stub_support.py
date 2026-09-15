@@ -146,19 +146,6 @@ LEGSTUB_EXCLUSIONS = {
         "_FakeWorker(...)`) for the address books. Reached only through the "
         "real `_weg2_seq_lane_descs` (the region-tag read), which the stub "
         "overrides; dead for this caller."),
-    "_weg2_seq_lane_descs": (
-        "method (weight_updater.py, #1378 xsn53): the sequential lane desc "
-        "derivation from the join. The smoke's `_LegStub` OVERRIDES it with "
-        "its own stub body (a stub has no live model, so the real "
-        "derivation's address books could not answer); excluded because the "
-        "stub provides it by construction, which the source-level walk "
-        "cannot see."),
-    "_weg2_card_uuid": (
-        "method (weight_updater.py): resolves the rank's NVML uuid for the "
-        "per-copy card lock. METAL-ONLY: needs a CUDA device. Section [4] "
-        "of the smoke runs the leg on the desk, where the resolution is "
-        "fail-soft to None (the stub pins `weg2_card_uuid_cache = "
-        "\"unset\"` for exactly that path)."),
     "_weg2_xchg_tag_seen": (
         "dataclass field (weight_updater.py:451, default None), read only "
         "inside `if tag is not None and phase == bx.PHASE_DEPOSIT:` -- this "

@@ -1347,6 +1347,62 @@ def leg_plan_from_join(
             region_tag=man.region_tag, boot_token=man.boot_token,
             tp_rank=man.tp_rank, pp_rank=man.pp_rank,
             pieces=tuple(keep_p)))
+    # #1378 xsn53 (DIE VOM WAECHTER GEFORDerte VERENGUNG): per co-located
+    # card, the exchange scope is the INTERSECTION of the two groups' tag
+    # sets.  The 52d96f3769 guard below refuses any divergence, and the
+    # measured weg2xsn53 boot died on exactly that refusal
+    # (only_src=['weights_5','weights_6','weights_7'] only_dst=[] on card 0)
+    # The guard was green-by-vacancy until now, because the narrowing it
+    # orders was never written.  A tag dropped here does NOT lose its bytes:
+    # the #1394 design is exchange primary + disk-reload fallback, and a tag
+    # the exchange does not cover on this card comes back from the fallback.
+    # Dropped BY TAG, per card, with the byte count on the line a reader can
+    # audit -- a silent narrowing would be the same unpriced scope change the
+    # rest of this file refuses to make.
+    _scope = {}
+    for man in narrowed:
+        if not man.pieces:
+            continue
+        tags = {str(pc.tag) for pc in man.pieces
+                if region_of_tag(pc.tag) == my_region}
+        _scope.setdefault(man.card, {}).setdefault(man.group, set()).update(tags)
+    _intersection = {}
+    for card_id, groups in sorted(_scope.items()):
+        if len(groups) < 2:
+            continue
+        sets = [t for _g, t in sorted(groups.items())]
+        _intersection[card_id] = sets[0] & sets[1]
+    if _intersection:
+        narrowed2, dropped_tags, dropped_bytes = [], {}, {}
+        for man in narrowed:
+            keep = _intersection.get(man.card)
+            if keep is None:
+                narrowed2.append(man)
+                continue
+            keep_p = [pc for pc in man.pieces
+                      if str(pc.tag) in keep
+                      or region_of_tag(pc.tag) != my_region]
+            drop_here = {str(pc.tag) for pc in man.pieces} - {str(pc.tag) for pc in keep_p}
+            if drop_here:
+                dropped_tags[man.group] = (man.group, sorted(drop_here))
+                dropped_bytes[man.group] = sum(
+                    int(pc.nbytes) for pc in man.pieces
+                    if str(pc.tag) in drop_here)
+            narrowed2.append(RankManifest(
+                group=man.group, rank=man.rank, card=man.card,
+                region_tag=man.region_tag, boot_token=man.boot_token,
+                tp_rank=man.tp_rank, pp_rank=man.pp_rank,
+                pieces=tuple(keep_p)))
+        narrowed = narrowed2
+        for group, tags in sorted(dropped_tags.items()):
+            if log is not None:
+                log(f"WEG2-XCHG-PLAN region={my_region} "
+                    f"exchange-scope=intersection group={group} "
+                    f"dropped_tags={tags[1]} "
+                    f"dropped_bytes={dropped_bytes[group]} "
+                    f"-- the exchange does not cover these tags for this "
+                    f"card; their bytes come back from the disk-reload "
+                    f"fallback (#1394), never silently")
     manifests = [m for m in narrowed if m.pieces]
     if not manifests:
         return None, refusal(
