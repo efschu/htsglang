@@ -4317,6 +4317,11 @@ class SchedulerWeightUpdaterManager:
         owns_lane = (src_card == my_rank) if is_source_hook else (dst_card == my_rank)
 
         out = []
+        #: #1378 xsn58: how many destinations the plan carried STALE (see the
+        #: re-resolve below).  A field-free local on purpose -- it lives for one
+        #: lane and is reported on this lane's own line, so a second lane cannot
+        #: inherit a count that is not its own.
+        _stale_dst = 0
         for d in plan.descs:
             if int(d.src_rank) != int(src_card) or int(d.dst_rank) != int(dst_card):
                 continue
@@ -4325,9 +4330,47 @@ class SchedulerWeightUpdaterManager:
             if src_book is not None and d.src_ptr is None:
                 d = d.replace(src_ptr=src_book(str(d.param_name),
                                                int(d.src_rank)))
-            if dst_book is not None and d.dst_ptr is None:
-                d = d.replace(dst_ptr=dst_book(str(d.param_name),
-                                               int(d.dst_rank)))
+            # #1378 xsn58 -- THE DESTINATION IS RE-RESOLVED, NOT INHERITED,
+            # AND A DIVERGENCE IS NAMED.
+            #
+            # The old condition was `d.dst_ptr is None`, i.e. a pointer the
+            # PLAN already carries was kept. But the plan resolves every
+            # destination ONCE, before the resume loop -- weg2xsn57 logged
+            # `POINTER-PROFILE ... dst_resolved=1937/1937` for all tags at
+            # 05:28:37 -- while `memory_saver_adapter.resume(tag)` maps that
+            # tag's pages AFTERWARDS, per tag (weight_updater:5671, collect at
+            # :5707). So between the plan's reading and this copy-out the
+            # pages were re-committed, and `dst_resolved` counts RESOLVED
+            # ADDRESSES, never MAPPED PAGES -- the same distinction that has
+            # already cost this ticket two walls.
+            #
+            # xsn57 died exactly here: `collect-first ... dst_ptr=
+            # 134250049263104 window_off=0 nbytes=10240` for
+            # `layers.0.input_layernorm.weight` (5120 x 2 B, the correct
+            # geometry, 10 KB into a 1.97 GB buffer -- source, offset and
+            # length all provably right), then SIGSEGV two seconds later.
+            #
+            # THIS IS A FIX AND A MEASUREMENT AT ONCE, on purpose: if the
+            # fresh address equals the planned one, the staleness theory is
+            # REFUTED and the line never appears -- a no-op, and the next
+            # round does not have to guess again. If it differs, the first
+            # divergence is named with both numbers and the theory is proven
+            # on the metal. Not a silent repair either way.
+            if dst_book is not None:
+                _fresh = dst_book(str(d.param_name), int(d.dst_rank))
+                if _fresh is not None:
+                    if (d.dst_ptr is not None
+                            and int(_fresh) != int(d.dst_ptr)):
+                        _stale_dst += 1
+                        if _stale_dst == 1:
+                            log(f"WEG2-SEQ-STALE-DST hook={hook} "
+                                f"tag={tag!r} first={d.param_name!r} "
+                                f"planned={int(d.dst_ptr)} "
+                                f"fresh={int(_fresh)} "
+                                f"delta={int(_fresh) - int(d.dst_ptr)} -- the "
+                                f"plan's destination was resolved before this "
+                                f"tag's resume re-mapped it")
+                    d = d.replace(dst_ptr=_fresh)
             out.append(d)
         if not owns_lane:
             return []
@@ -4348,7 +4391,12 @@ class SchedulerWeightUpdaterManager:
         if log is not None:
             log(f"WEG2-SEQ-LANE "
                 f"lane={'p%d' % pair if pair is not None else 'c%d' % card} "
-                f"owned={owned_n} planned={len(out)} tag={tag!r}")
+                f"owned={owned_n} planned={len(out)} tag={tag!r} "
+                # #1378 xsn58: ALWAYS printed, including the 0.  A staleness
+                # count that only appears when it is non-zero cannot tell
+                # "measured, none found" from "never measured" -- the
+                # absence-without-an-emitter trap this campaign keeps paying.
+                f"stale_dst={_stale_dst}")
         if not out:
             raise wx.Weg2XchgPlanDisagree(
                 f"W68 Weg2XchgPlanDisagree: the join's plan carries NO desc "
