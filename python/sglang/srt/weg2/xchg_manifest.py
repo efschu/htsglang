@@ -1443,7 +1443,17 @@ def leg_plan_from_join(
     for man in manifests:
         for pc in man.pieces:
             if region_of_tag(pc.tag) != my_region: continue
-            _per_card.setdefault(man.card, {}).setdefault(man.group, set()).add(str(pc.tag))
+            # #1378 xsn54: NAMES, not TAGS.  The tag records WHERE the bytes
+            # were loaded (the chunk the loader used), and under PP x TP the
+            # source group holds tags the destination group never loads --
+            # measured both ways (sleep: source 6 tags vs destination 9;
+            # wake: source 9 vs destination 6), so a tag-set comparison
+            # refuses in BOTH directions on this topology.  What the
+            # exchange actually moves is bounded by NAMES, and the measured
+            # name scope is P subset D (|P|=893, |D|=1249, only-P=0): a
+            # source name the destination lacks is the only real defect.
+            _per_card.setdefault(man.card, {}).setdefault(man.group, set()).add(
+                str(pc.param_name))
     for card_id, groups in sorted(_per_card.items()):
         if len(groups) < 2: continue
         # THE SETS ARE PAIRED BY THE DIRECTION'S OWN GROUPS, not by name:
@@ -1463,13 +1473,13 @@ def leg_plan_from_join(
         if not tag_sets[0] <= tag_sets[1]:
             only_src = sorted(tag_sets[0] - tag_sets[1])
             return None, refusal(
-                "plan-tag-divergence",
-                f"card {card_id}: the source group holds tag(s) the "
+                "plan-name-divergence",
+                f"card {card_id}: the source group holds name(s) the "
                 f"destination group does not, for region {my_region}: "
-                f"only_src={only_src} -- the deposit would post bands "
-                f"nobody reads (the W68 family, measured on weg2xsn43). "
-                f"Narrow the exchange to the INTERSECTION before deriving "
-                f"bands.")
+                f"only_src={only_src[:8]}{'...' if len(only_src) > 8 else ''} "
+                f"({len(only_src)} of {len(tag_sets[0])}) -- the deposit "
+                f"would post bands nobody reads (the W68 family, measured "
+                f"on weg2xsn43).")
     try:
         plan = plan_from_join(join, direction=direction,
                               src_addr=src_addr, dst_addr=dst_addr)
