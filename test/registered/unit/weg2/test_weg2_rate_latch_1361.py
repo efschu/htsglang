@@ -504,22 +504,28 @@ class TheCushionTestIsAVerdictOnlyNearTheMark1378(CustomTestCase):
             self.assertLess(headroom_at_death, hl.RATE_LATCH_CUSHION_RELEVANCE_GIB)
         self.assertGreater(95.90 - 9.89, hl.RATE_LATCH_CUSHION_RELEVANCE_GIB)
 
-    def test_the_rate_path_still_latches_a_real_climb_far_from_the_mark(self):
-        """The bound removes the cushion verdict, not the projection one."""
+    def test_a_cushion_reading_keeps_the_projection_silent_far_from_the_mark_too(self):
+        """weg2xsn72: the D load climbed +11.22 GiB/s at now=51.32 for a few
+        seconds; a projection (5 s lookahead) read 107.39 against 95.90 and
+        the boot was torn down with 44.6 GiB of headroom. With a cushion
+        reading present the projection stays retired (#1361b), inside AND
+        outside the relevance bound. Mutant: the first #1378 form, which
+        fell through to the projection outside the bound."""
         lat = hl.RateLatch(reap_mark_gib=95.90)
-        # 8 GiB/s from 9.9 with a cushion reading present: the projection
-        # (5 s lookahead, +40 GiB) crosses the mark while the level is still
-        # 40 GiB away, i.e. OUTSIDE the relevance bound -- the only region
-        # where the projection is the guard (inside it the cushion test is,
-        # #1361b). Before #1378 a cushion reading silenced the projection
-        # entirely (`return None` at the end of the cushion branch).
+        v = 40.0
+        for i in range(8):
+            out = lat.observe(i * 0.5, v, cushion_gib=3.0, shmem_gib=0.05 + i)
+            self.assertIsNone(out, out)
+            v += 5.6                                   # 11.2 GiB/s, xsn72's slope
+        self.assertFalse(lat.latched)
+        # the projection path is still there for a caller WITHOUT a cushion
+        lat2 = hl.RateLatch(reap_mark_gib=95.90)
         out = None
-        v = 9.9
-        for i in range(60):
-            out = lat.observe(i * 0.5, v, cushion_gib=0.4, shmem_gib=0.05 + i)
+        v = 40.0
+        for i in range(8):
+            out = lat2.observe(i * 0.5, v)
             if out and "W98" in out:
                 break
-            v += 4.0
+            v += 5.6
         self.assertIsNotNone(out)
         self.assertIn("projected=", out)
-        self.assertLess(v, 95.90 - hl.RATE_LATCH_CUSHION_RELEVANCE_GIB)

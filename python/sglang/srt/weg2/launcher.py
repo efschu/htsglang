@@ -170,6 +170,16 @@ SHM_OWN_PREFIXES = (
     # with the region prefix; a prefix list that assumed they did would sweep
     # the region and leave the handshake behind.
     weight_exchange_region.REGION_PREFIX,           # "weg2-xchg-"
+    # #1378 xsn72: the sequential transport's per-boot lane buffers
+    # (`/dev/shm/weg2-seq-<nonce>/<lane>_unit_buffer.bin`, up to ~2 GiB each,
+    # weight_exchange_bounce.run_sequential_units). The collect side unlinks
+    # them when a tag is drained; a boot that dies mid-leg leaves the whole
+    # set. MEASURED 2026-09-15 after six such boots: 20 GiB of tmpfs resident,
+    # 55 GB "in use" on a box running nothing -- the user saw it before the
+    # sweep could, because the prefix was not here. An orphan directory tree
+    # is archived as a manifest and removed (see shm_residue_sweep); a live
+    # holder refuses the boot as for every other entry.
+    "weg2-seq-",
     f"sem.{weight_exchange_region.REGION_PREFIX}",  # "sem.weg2-xchg-"
 )
 #: The corridor law is 819-1229 MiB NVML-free per card under the awake

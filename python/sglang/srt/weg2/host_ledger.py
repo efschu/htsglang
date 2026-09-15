@@ -1410,7 +1410,7 @@ class RateLatch:
                         f"not the page cache, absorbs the next write here "
                         f"(weg2xsn65 was torn down on exactly this reading, "
                         f"cushion 0.43 at 9.89 of 95.90, after a cold-cache "
-                            f"launch); printed once, the rate path stays armed"
+                            f"launch); printed once"
                         )
                 else:
                     self.latched = True
@@ -1430,13 +1430,19 @@ class RateLatch:
                         f"stall, weg2xsn26b the same shape. Controlled teardown, "
                         f"never a kernel kill"
                     )
-            if headroom <= RATE_LATCH_CUSHION_RELEVANCE_GIB:
-                # Inside the bound the cushion test IS the verdict (#1361b:
-                # it replaced the projection there, measured on xsn24/xsn27).
-                return None
-            # Outside it, fall through: the projection latch below is the
-            # only guard left against a genuine climb, so it must stay reachable
-            # -- "the rate path stays armed" on the line above is a promise.
+            # With a cushion reading present the cushion test is the ONLY
+            # verdict, inside the bound (#1361b: it replaced the projection
+            # there, measured on xsn24/xsn27) AND outside it. The first form
+            # of this commit fell through to the projection outside the bound
+            # -- "the rate path stays armed" -- and weg2xsn72 paid for it:
+            # the D group's weight load climbed the host at +11.22 GiB/s
+            # for a few seconds at now=51.32 GiB, the 5 s lookahead projected
+            # 107.39 against 95.90, and the boot was torn down 34 s after the
+            # D launch with 44.6 GiB of headroom. The projection latch was
+            # calibrated on a death slope (xsn26b) NEAR the mark and has no
+            # notion of a load burst that stops by itself; #1361b retired it
+            # wherever a cushion reading exists, and that stands.
+            return None
         if proj is None or proj < self.reap_mark_gib:
             return None
         self.latched = True
