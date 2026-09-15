@@ -2599,8 +2599,18 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # broke the next tag's collect on that lane (embed_tokens, four boots
         # of "content-changed"). The pipeline group is process-global: its
         # rank_in_group is 2 on PP2 for the target AND the drafter it hosts.
+        # xsn79: `get_pp_group()` answers the DRAFT group (size 1, rank 0)
+        # while the draft scope is active (parallel_state.get_pp_group:
+        # `_DRAFT_PP_ACTIVE`), which is exactly when this runner loads -- the
+        # manifest still read rank=0 card=0. The PRIMARY pipeline group is
+        # the module global `_PP`; that is the process's place.
         try:
-            _pp_rank_of_process = int(get_pp_group().rank_in_group)
+            from sglang.srt.distributed import parallel_state as _ps
+
+            _primary_pp = getattr(_ps, "_PP", None)
+            _pp_rank_of_process = (int(_primary_pp.rank_in_group)
+                                   if _primary_pp is not None
+                                   else int(self.pp_rank))
         except Exception:  # noqa: BLE001 -- no process group on the desk
             _pp_rank_of_process = int(self.pp_rank)
         arm_coverage_at_load(
