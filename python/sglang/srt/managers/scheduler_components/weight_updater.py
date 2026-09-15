@@ -3613,7 +3613,16 @@ class SchedulerWeightUpdaterManager:
             inventory = inv[0]
             if inventory is None:
                 return
-            items = [(idn, t) for idn, t in inventory if str(idn.tag) == str(tag)]
+            # xsn114: the draft's NO-WRITE pieces (the target's embed, see
+            # _weg2_xchg_no_write) get their bytes with the target's own
+            # `weights` tag, so they are folded again with that tag and the
+            # later part overrides the draft part's stale entry.
+            _nw = getattr(self, "_weg2_xchg_no_write", None) or frozenset()
+            _nw_keys = {(str(t), str(n)) for (t, n) in _nw}
+            items = [(idn, t) for idn, t in inventory
+                     if str(idn.tag) == str(tag)
+                     or (str(tag) == "weights"
+                         and (str(idn.tag), str(idn.name)) in _nw_keys)]
             if not items:
                 return
             part = seam_digest.take_reading(
@@ -4379,7 +4388,15 @@ class SchedulerWeightUpdaterManager:
                 _by_key.update(_m)
                 _ms += float(_p.ms)
                 _syncs += int(getattr(_p, "syncs", 0))
-            _keys = [seam_digest.identity_of(idn, card=int(card)).key for idn, _t in inventory]
+            # xsn114: the whole walk orders its pieces by read chunking, not
+            # by inventory -- the fold is ordered, so the assembly follows
+            # the BEFORE reading's piece order (same identities), and only
+            # without one the inventory order.
+            if before is not None and getattr(before, "pieces", None):
+                _keys = [p.identity.key for p in before.pieces]
+            else:
+                _keys = [seam_digest.identity_of(idn, card=int(card)).key
+                         for idn, _t in inventory]
             if all(k in _by_key for k in _keys):
                 after = seam_digest.SeamReading(
                     stage="after", group=str(group), rank=int(rank), card=int(card),
