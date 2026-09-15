@@ -2392,12 +2392,12 @@ def run_sequential_units(descs, ops, boot_nonce: str, *,
         # #1378 xsn53: the window's offset is the PIECE'S OWN slot_off from
         # the shared batch derivation -- not a rank, not a card, not a unit
         # index.  The semaphore's id comes from the lane key above.
-        rank_u = int(piece.slot_off)
+        window_off = int(piece.slot_off)
         name = getattr(desc, "param_name", "?")
         tag = getattr(desc, "tag", "")
         nbytes = int(piece.nbytes)
         label = (f"piece {i} {name!r} tag={tag!r} nbytes={nbytes} "
-                 f"window={rank_u}")
+                 f"window={window_off}")
         if phase == PHASE_DEPOSIT:
             if desc.src_ptr is None:
                 return (f"deposit at piece {i} {name!r}: the desc carries no "
@@ -2408,7 +2408,7 @@ def run_sequential_units(descs, ops, boot_nonce: str, *,
             # #1378 xsn44: the D2H copy -- from the VRAM source into the
             # shared buffer at this piece's offset, the SAME pitch arithmetic
             # the lane form runs (a STRIDED2D piece compacts on the way in).
-            _buf_addr = base_addr + rank_u
+            _buf_addr = base_addr + window_off
             if piece.kind == tp.FLAT:
                 ops.memcpy_async(_buf_addr, src_ptr, nbytes, stream)
             else:
@@ -2417,7 +2417,7 @@ def run_sequential_units(descs, ops, boot_nonce: str, *,
                                    int(piece.rows), stream)
             ops.synchronize(stream)
             digest = hashlib.sha256(
-                bytes(buf[rank_u:rank_u + nbytes])).hexdigest()[:16]
+                bytes(buf[window_off:window_off + nbytes])).hexdigest()[:16]
             recs = {}
             if os.path.exists(dpath):
                 try:
@@ -2458,14 +2458,14 @@ def run_sequential_units(descs, ops, boot_nonce: str, *,
                     break
                 if liveness is not None and not liveness():
                     dump_rank_stacks(
-                        "PeerGone-seq", tag=str(name), rank=int(rank_u),
+                        "PeerGone-seq", tag=str(name), rank=int(window_off),
                         extra=f"unit {i} {name!r} -- the deposit peer is "
                               f"gone while the collect waited")
                     return f"PeerGone at unit {i} {name!r}"
                 _time.sleep(0.05)
             if not got:
                 dump_rank_stacks(
-                    "budget-expired-seq", tag=str(name), rank=int(rank_u),
+                    "budget-expired-seq", tag=str(name), rank=int(window_off),
                     extra=f"unit {i} {name!r} budget={budget_s}s")
                 return f"budget expired at unit {i} {name!r}"
             recs = {}
@@ -2477,10 +2477,10 @@ def run_sequential_units(descs, ops, boot_nonce: str, *,
             dep = recs.get(str(i), {})
             dep_digest = str(dep.get("digest", ""))
             my_digest = hashlib.sha256(
-                bytes(buf[rank_u:rank_u + nbytes])).hexdigest()[:16]
+                bytes(buf[window_off:window_off + nbytes])).hexdigest()[:16]
             if dep_digest and my_digest != dep_digest:
                 dump_rank_stacks(
-                    "digest-mismatch-seq", tag=str(name), rank=int(rank_u),
+                    "digest-mismatch-seq", tag=str(name), rank=int(window_off),
                     extra=f"unit {i} {name!r} deposit={dep_digest} "
                           f"collect={my_digest}")
                 return (f"digest mismatch at unit {i} {name!r}: "
@@ -2490,7 +2490,24 @@ def run_sequential_units(descs, ops, boot_nonce: str, *,
                         f"dst_ptr -- this rank does not hold the destination "
                         f"this lane says it fills")
             dst_ptr = int(desc.dst_ptr) + int(piece.dst_off)
-            _buf_addr = base_addr + rank_u
+            _buf_addr = base_addr + window_off
+            # #1378 xsn57: THE NUMBERS BEFORE THE FIRST COPY-OUT, because
+            # weg2xsn56 died here with a SIGSEGV and left NOTHING to read.
+            # P rank0's last line was `WEG2-SEQ mapped ... bytes=1968338488
+            # units=114`; the next line would have been `WEG2-SEQ collect` 4
+            # seconds later and never came, so the whole window between the
+            # mapping and the first byte was dark. The deposit side already
+            # has `first-piece-done`; the collect side had no equivalent.
+            # ONE line, only for piece 0, so a 114-piece lane costs one row:
+            # if the next boot segfaults again, these five numbers say whether
+            # the destination pointer, the window offset or the length is the
+            # one out of range -- none of which a traceback-less SIGSEGV tells.
+            if i == 0:
+                log(f"WEG2-SEQ collect-first lane={lane_key} "
+                    f"dst_ptr={int(dst_ptr)} buf_addr={int(_buf_addr)} "
+                    f"window_off={window_off} nbytes={nbytes} "
+                    f"base_addr={int(base_addr)} total_bytes={total_bytes} "
+                    f"kind={piece.kind} name={name!r}")
             if piece.kind == tp.FLAT:
                 ops.memcpy_async(int(dst_ptr), _buf_addr, nbytes, stream)
             else:
@@ -2509,7 +2526,7 @@ def run_sequential_units(descs, ops, boot_nonce: str, *,
                 if dep_digest and dst_digest != dep_digest:
                     dump_rank_stacks(
                         "placement-mismatch-seq", tag=str(name),
-                        rank=int(rank_u),
+                        rank=int(window_off),
                         extra=f"unit {i} {name!r} deposit={dep_digest} "
                               f"destination={dst_digest} -- the bytes "
                               f"landed at the wrong place (the swapped-"
