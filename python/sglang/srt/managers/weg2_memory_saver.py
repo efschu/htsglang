@@ -2577,6 +2577,33 @@ def weights_region_tag(tag: str) -> Iterator[str]:
         _WEIGHTS_REGION_TAG = previous
 
 
+#: #1378 xsn69 -- A NATIVE BACKTRACE ON SIGSEGV, opt-in by env, loaded from
+#: INSIDE the rank: the tms adapter REPLACES LD_PRELOAD for every rank, so an
+#: operator's preload never arrives. faulthandler (enabled at process start)
+#: stays the previous handler: this one prints the native frames first, then
+#: re-raises into it, so the boot log carries both. Weg2xsn69 died in three
+#: different pure-Python frames within two seconds of the first resume; the
+#: Python frames alone could not name the corrupter.
+_SEGVBT_HANDLE = None
+
+
+def _load_native_segv_backtrace() -> None:
+    global _SEGVBT_HANDLE
+    so = os.environ.get("SGLANG_WEG2_SEGVBT_SO", "")
+    if not so or _SEGVBT_HANDLE is not None:
+        return
+    try:
+        import ctypes
+
+        _SEGVBT_HANDLE = ctypes.CDLL(so)
+        logger.info("WEG2-SEGVBT native SIGSEGV backtrace loaded from %s", so)
+    except Exception as exc:  # noqa: BLE001 -- an instrument never kills a rank
+        logger.warning("WEG2-SEGVBT NOT loaded (%s): %s", so, exc)
+
+
+_load_native_segv_backtrace()
+
+
 #: #1378 xsn66 -- ONE CACHING-ALLOCATOR POOL PER WEIGHTS TAG, process-local.
 #:
 #: torch_memory_saver tags at ``cudaMalloc`` granularity, i.e. per caching-
