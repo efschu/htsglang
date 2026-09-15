@@ -1134,6 +1134,23 @@ RATE_LATCH_CUSHION_FLOOR_GIB = 1.5
 #: on the boot that survived.  Third over-pricing of the same quantity, after
 #: ``now + remaining`` and ``cushion as a stock``; this one is measured.
 RATE_LATCH_FILL_RISING_GIB = 0.01
+#: #1378 xsn64/xsn65: HOW CLOSE TO THE MARK THE CUSHION TEST IS A VERDICT AT
+#: ALL, GiB of headroom (``reap_mark - nonreclaim``).  The cushion is the page
+#: cache the kernel trades away to absorb a shmem write ONCE THE FREE POOL IS
+#: GONE; with 86 GiB of free pool the write lands in free pages and no cache
+#: is traded.  MEASURED: the two boots that decide the floor were at 13.6 GiB
+#: (weg2xsn26b) and ~14-18 GiB (weg2xsn27, 16.17 still to write) of headroom
+#: when they died, the survivor weg2xsn24 at ~4; weg2xsn65 latched W98 at
+#: cushion=0.43 with now=9.89 against 95.90 -- **86.0 GiB of headroom**,
+#: shmem=0.04, after a cold-cache launch (memory.current 5.3 GiB vs 40.4 on
+#: weg2xsn63 an hour earlier, same form).  Nothing this form writes to the
+#: host at once comes near that: the pinned lane (xchg_bounce, 15.75 GiB in
+#: the ARM line) plus the flip transient (~10 GiB) plus the floor is ~27; 32
+#: rounds it up and still sits far outside every measured death.  Inside the
+#: bound the cushion test is unchanged.  Outside it the reading is PRINTED
+#: ONCE and not latched -- a guard that tears a boot down on a cold cache
+#: while 86 GiB are free is not pre-empting a reap, it is the reap.
+RATE_LATCH_CUSHION_RELEVANCE_GIB = 32.0
 
 
 def launch_moment_peak_gib(
@@ -1266,6 +1283,8 @@ class RateLatch:
         self._last_shmem: Optional[float] = None
         self.latched = False
         self.gaps: List[float] = []
+        #: #1378: the far-from-the-mark cushion reading is said ONCE per latch.
+        self._cushion_far_noted = False
 
     def rate_gib_per_s(self) -> Optional[float]:
         """The WORST consecutive slope inside the trailing window, or ``None``.
@@ -1371,21 +1390,53 @@ class RateLatch:
             )
             if shmem_gib is not None:
                 self._last_shmem = float(shmem_gib)
+            headroom = self.reap_mark_gib - float(nonreclaim_gib)
             if rising and float(cushion_gib) < RATE_LATCH_CUSHION_FLOOR_GIB:
-                self.latched = True
-                return (
-                    f"W98 Weg2HostRateLatched: cushion={float(cushion_gib):.2f} GiB "
-                    f"BELOW the floor {RATE_LATCH_CUSHION_FLOOR_GIB:.2f} while shmem is "
-                    f"STILL RISING (now={nonreclaim_gib:.2f} GiB, shmem={float(shmem_gib):.2f}, "
-                    f"gaps_seen={len(self.gaps)}) -- the page cache the kernel trades away "
-                    f"to absorb the next write is spent, and the write has not stopped. "
-                    f"MEASURED separation: weg2xsn24 flipped with a worst cushion of 2.67 "
-                    f"GiB and ZERO samples under this floor in its whole boot; weg2xsn27 "
-                    f"hit 0.01 with 16.17 GiB still to write and was reaped inside a 33 s "
-                    f"stall, weg2xsn26b the same shape. Controlled teardown, never a kernel "
-                    f"kill"
-                )
-            return None
+                if headroom > RATE_LATCH_CUSHION_RELEVANCE_GIB:
+                    # #1378 xsn65: cold cache, 86 GiB of free pool -- the
+                    # write this cushion would absorb lands in free pages.
+                    # Said once, never latched; the rate path below still
+                    # covers a real climb toward the mark.
+                    if not self._cushion_far_noted:
+                        self._cushion_far_noted = True
+                        return (
+                        f"WEG2-HOST CUSHION-BELOW-FLOOR NOT-LATCHED: cushion="
+                        f"{float(cushion_gib):.2f} GiB < floor "
+                        f"{RATE_LATCH_CUSHION_FLOOR_GIB:.2f} while shmem rises "
+                        f"(shmem={float(shmem_gib):.2f}) but headroom="
+                        f"{headroom:.2f} GiB (now={nonreclaim_gib:.2f}, mark="
+                        f"{self.reap_mark_gib:.2f}) is ABOVE the relevance bound "
+                        f"{RATE_LATCH_CUSHION_RELEVANCE_GIB:.2f} -- the free pool, "
+                        f"not the page cache, absorbs the next write here "
+                        f"(weg2xsn65 was torn down on exactly this reading, "
+                        f"cushion 0.43 at 9.89 of 95.90, after a cold-cache "
+                            f"launch); printed once, the rate path stays armed"
+                        )
+                else:
+                    self.latched = True
+                    return (
+                        f"W98 Weg2HostRateLatched: cushion={float(cushion_gib):.2f} "
+                        f"GiB BELOW the floor {RATE_LATCH_CUSHION_FLOOR_GIB:.2f} "
+                        f"while shmem is STILL RISING (now={nonreclaim_gib:.2f} "
+                        f"GiB, shmem={float(shmem_gib):.2f}, headroom="
+                        f"{headroom:.2f} GiB <= relevance "
+                        f"{RATE_LATCH_CUSHION_RELEVANCE_GIB:.2f}, gaps_seen="
+                        f"{len(self.gaps)}) -- the page cache the kernel trades "
+                        f"away to absorb the next write is spent, and the write "
+                        f"has not stopped. MEASURED separation: weg2xsn24 flipped "
+                        f"with a worst cushion of 2.67 GiB and ZERO samples under "
+                        f"this floor in its whole boot; weg2xsn27 hit 0.01 with "
+                        f"16.17 GiB still to write and was reaped inside a 33 s "
+                        f"stall, weg2xsn26b the same shape. Controlled teardown, "
+                        f"never a kernel kill"
+                    )
+            if headroom <= RATE_LATCH_CUSHION_RELEVANCE_GIB:
+                # Inside the bound the cushion test IS the verdict (#1361b:
+                # it replaced the projection there, measured on xsn24/xsn27).
+                return None
+            # Outside it, fall through: the projection latch below is the
+            # only guard left against a genuine climb, so it must stay reachable
+            # -- "the rate path stays armed" on the line above is a promise.
         if proj is None or proj < self.reap_mark_gib:
             return None
         self.latched = True

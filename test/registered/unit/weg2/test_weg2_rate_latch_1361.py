@@ -462,3 +462,64 @@ class TheGuardRunsFromLAUNCHNotFromREADY1361a(CustomTestCase):
         self.assertLess(plan, latch_at)
         self.assertLess(latch_at, front_first)
         self.assertAlmostEqual(front_first - latch_at, 42.4, places=1)
+
+
+class TheCushionTestIsAVerdictOnlyNearTheMark1378(CustomTestCase):
+    """#1378 xsn64/xsn65: a cold-cache launch 86 GiB from the mark is not a reap.
+
+    MEASURED: weg2xsn65 was torn down by W98 at cushion=0.43, shmem 0.04,
+    now=9.89 against a 95.90 mark, 17 s after the P launch, on a box with 112
+    GiB free -- memory.current at launch 5.3 GiB against 40.4 on weg2xsn63 an
+    hour earlier (same form, warm page cache, no W98). The cushion is what
+    absorbs a write once the FREE POOL is gone; with the pool there it is not a
+    verdict. Mutant: the shipped latch, which had no headroom term at all.
+    """
+
+    def test_xsn65s_reading_is_printed_once_and_not_latched(self):
+        lat = hl.RateLatch(reap_mark_gib=95.90)
+        lat.observe(0.0, 9.86, cushion_gib=0.44, shmem_gib=0.02)
+        first = lat.observe(0.5, 9.89, cushion_gib=0.43, shmem_gib=0.04)
+        self.assertIsNotNone(first)
+        self.assertNotIn("W98", first)
+        self.assertIn("NOT-LATCHED", first)
+        self.assertIn("headroom=86.01", first)
+        self.assertFalse(lat.latched)
+        # rising again, still below the floor: quiet now, the line was said once
+        again = lat.observe(1.0, 9.92, cushion_gib=0.40, shmem_gib=0.06)
+        self.assertIsNone(again)
+        self.assertFalse(lat.latched)
+
+    def test_the_same_cushion_near_the_mark_still_latches(self):
+        """CONTROL: the two dead boots' shape, inside the relevance bound."""
+        lat = hl.RateLatch(reap_mark_gib=95.90)
+        lat.observe(0.0, 80.0, cushion_gib=0.44, shmem_gib=50.02)
+        line = lat.observe(0.5, 80.0, cushion_gib=0.43, shmem_gib=50.86)
+        self.assertIsNotNone(line)
+        self.assertIn("W98", line)
+        self.assertIn("headroom=15.90", line)
+        self.assertTrue(lat.latched)
+
+    def test_the_bound_sits_outside_every_measured_death_and_inside_xsn65(self):
+        for headroom_at_death in (13.6, 14.0, 18.0):
+            self.assertLess(headroom_at_death, hl.RATE_LATCH_CUSHION_RELEVANCE_GIB)
+        self.assertGreater(95.90 - 9.89, hl.RATE_LATCH_CUSHION_RELEVANCE_GIB)
+
+    def test_the_rate_path_still_latches_a_real_climb_far_from_the_mark(self):
+        """The bound removes the cushion verdict, not the projection one."""
+        lat = hl.RateLatch(reap_mark_gib=95.90)
+        # 8 GiB/s from 9.9 with a cushion reading present: the projection
+        # (5 s lookahead, +40 GiB) crosses the mark while the level is still
+        # 40 GiB away, i.e. OUTSIDE the relevance bound -- the only region
+        # where the projection is the guard (inside it the cushion test is,
+        # #1361b). Before #1378 a cushion reading silenced the projection
+        # entirely (`return None` at the end of the cushion branch).
+        out = None
+        v = 9.9
+        for i in range(60):
+            out = lat.observe(i * 0.5, v, cushion_gib=0.4, shmem_gib=0.05 + i)
+            if out and "W98" in out:
+                break
+            v += 4.0
+        self.assertIsNotNone(out)
+        self.assertIn("projected=", out)
+        self.assertLess(v, 95.90 - hl.RATE_LATCH_CUSHION_RELEVANCE_GIB)
