@@ -2083,6 +2083,17 @@ class HostPoolGroup:
         _refuse_stray_host_index(self.anchor_entry.host_pool, index, "get_data_page")
         return self.anchor_entry.host_pool.get_data_page(index, flat)
 
+    def get_data_pages(self, indices) -> list:
+        """Batched form of ``get_data_page`` (#1402): the stray check per
+        index, then ONE gather in the anchor pool."""
+        pool = self.anchor_entry.host_pool
+        for index in indices:
+            _refuse_stray_host_index(pool, index, "get_data_pages")
+        batched = getattr(pool, "get_data_pages", None)
+        if batched is not None:
+            return batched(indices)
+        return [pool.get_data_page(i, True) for i in indices]
+
     def get_dummy_flat_data_page(self):
         return self.anchor_entry.host_pool.get_dummy_flat_data_page()
 

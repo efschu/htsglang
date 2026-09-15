@@ -542,6 +542,32 @@ class MHATokenToKVPoolHost(HostKVCache):
             data_page = data_page.flatten()
         return data_page
 
+    def get_data_pages(self, indices) -> list:
+        """Flat pages for ``indices`` from ONE gather (#1402, the write side
+        of ``set_from_flat_data_pages``): ``layer_first`` and ``page_first``
+        gather the N pages in one indexed read and one permute, and hand back
+        N contiguous views of that buffer in the per-page flat order. Other
+        layouts take the per-page path."""
+        n = len(indices)
+        if n == 0:
+            return []
+        if n == 1 or self.layout not in ("layer_first", "page_first"):
+            return [self.get_data_page(i, flat=True) for i in indices]
+        p = self.page_size
+        starts = torch.as_tensor([int(i) for i in indices], dtype=torch.int64)
+        if p == 1:
+            idx = starts
+        else:
+            idx = (starts[:, None] + torch.arange(p, dtype=torch.int64)[None, :]).reshape(-1)
+        L, H, D = self.layer_num, self.head_num, self.head_dim
+        if self.layout == "layer_first":
+            g = self.kv_buffer[:, :, idx, :, :].reshape(2, L, n, p, H, D)
+            flat = g.permute(2, 0, 1, 3, 4, 5).contiguous().view(n, -1)
+        else:
+            g = self.kv_buffer[:, idx, :, :, :].reshape(2, n, p, L, H, D)
+            flat = g.permute(1, 0, 2, 3, 4, 5).contiguous().view(n, -1)
+        return [flat[i] for i in range(n)]
+
     def get_dummy_flat_data_page(self) -> torch.Tensor:
         return torch.zeros(
             (2, self.layer_num, self.page_size, self.head_num, self.head_dim),

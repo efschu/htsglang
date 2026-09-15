@@ -3364,10 +3364,14 @@ class HiCacheController:
 
     # todo: deprecate
     def _generic_page_set(self, hash_values, host_indices, extra_info=None) -> bool:
-        data = [
-            self.mem_pool_host.get_data_page(host_indices[i * self.page_size])
-            for i in range(len(hash_values))
-        ]
+        starts = [int(host_indices[i * self.page_size]) for i in range(len(hash_values))]
+        # #1402: one gather for the batch where the pool offers it (py-spy on
+        # P PP0, xsn137: get_data_page was 36 % of the publish sweep's thread).
+        batched = getattr(self.mem_pool_host, "get_data_pages", None)
+        if batched is not None:
+            data = batched(starts)
+        else:
+            data = [self.mem_pool_host.get_data_page(s) for s in starts]
         return self.storage_backend.batch_set(hash_values, data)
 
     def _page_set_zero_copy(self, hash_values, host_indices, extra_info=None) -> bool:

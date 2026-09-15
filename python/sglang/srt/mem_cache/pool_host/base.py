@@ -305,6 +305,11 @@ class HostKVCache(abc.ABC):
         """
         raise NotImplementedError()
 
+    def get_data_pages(self, indices) -> list:
+        """Flat pages for ``indices`` (#1402); the default is the per-page
+        loop, pools with an indexable layout override it with one gather."""
+        return [self.get_data_page(i, flat=True) for i in indices]
+
     def set_from_flat_data_pages(self, indices, data_pages) -> None:
         """Set ``len(indices)`` flat pages at once (#1402).
 

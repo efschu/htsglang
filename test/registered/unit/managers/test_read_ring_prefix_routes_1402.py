@@ -211,3 +211,19 @@ def test_kv_route_writes_the_served_prefix_in_one_batch_and_stops_at_the_miss():
     c._generic_page_get(op, ["p0", "p1", "p2", "p3"], _idx(4))
     assert calls == [([0, 1], 2)], "one batched write of the served prefix only"
     assert op.completed_tokens == 2
+
+
+def test_batched_host_read_equals_the_per_page_loop():
+    for layout in ("layer_first", "page_first"):
+        for page_size in (1, 2):
+            a = _mha_pool(layout, page_size)
+            a.kv_buffer.copy_(torch.randn_like(a.kv_buffer))
+            starts = [0, 6, 2, 20, 10]
+            loop = [a.get_data_page(s, flat=True) for s in starts]
+            batched = a.get_data_pages(starts)
+            assert len(batched) == len(loop)
+            for x, y in zip(loop, batched):
+                assert torch.equal(x, y), (layout, page_size)
+                assert y.is_contiguous()
+            single = a.get_data_pages([6])
+            assert torch.equal(single[0], loop[1])
