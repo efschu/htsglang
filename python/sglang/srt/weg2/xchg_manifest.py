@@ -1456,30 +1456,30 @@ def leg_plan_from_join(
                 str(pc.param_name))
     for card_id, groups in sorted(_per_card.items()):
         if len(groups) < 2: continue
-        # THE SETS ARE PAIRED BY THE DIRECTION'S OWN GROUPS, not by name:
-        # sorted() puts 'D' first, which under pp_to_pp-as-source silently
-        # compares the wrong pair and reports the destination's extra tags
-        # as the source's (the measured card-0 shape).
-        tag_sets = [groups.get(_src_g, set()), groups.get(_dst_g, set())]
-        # #1378 xsn53: EQUALITY is the wrong predicate under PP x TP.  The
-        # stages make the source group's tag set a strict SUBSET of the
-        # destination's by construction (measured card 0: source 6 tags,
-        # destination 9) -- and the deposit can only post bands for tags it
-        # HOLDS, so the direction that would post bands nobody reads is a
-        # SOURCE tag the destination lacks.  That direction refuses.  The
-        # destination's extra tags are names the destination holds that this
-        # exchange does not supply; they are the disk-reload fallback's
-        # business (#1394), named on the join's own audit line below.
-        if not tag_sets[0] <= tag_sets[1]:
-            only_src = sorted(tag_sets[0] - tag_sets[1])
+        tag_sets = [names for _g, names in sorted(groups.items())]
+        # #1378 xsn54 (DIE ACHSE, DIE BEIDE RICHTUNGEN UEBLEBT): a subset
+        # check refuses in both directions on this topology.  Measured:
+        #   sleep (pp_to_tp): source P 6 tags / 893 names, destination D 9/1249
+        #   wake  (tp_to_pp): source D 9 tags / 1249 names, destination P 6/893
+        # The source legitimately holds names the destination never loads --
+        # the TP side holds every layer, the PP side only its stage's.  What
+        # the exchange moves is the NAME INTERSECTION (measured 893, P subset
+        # D, only-P=0), and the destination-only names are the disk-reload
+        # fallback's business (#1394).  The one defect this guard CAN still
+        # catch is a card whose two groups share NO name in this region: a
+        # deposit and a collect that would never meet, the W68 shape.
+        common = tag_sets[0] & tag_sets[1]
+        if not common:
+            only_src = sorted(tag_sets[0] - tag_sets[1])[:8]
+            only_dst = sorted(tag_sets[1] - tag_sets[0])[:8]
             return None, refusal(
                 "plan-name-divergence",
-                f"card {card_id}: the source group holds name(s) the "
-                f"destination group does not, for region {my_region}: "
-                f"only_src={only_src[:8]}{'...' if len(only_src) > 8 else ''} "
-                f"({len(only_src)} of {len(tag_sets[0])}) -- the deposit "
-                f"would post bands nobody reads (the W68 family, measured "
-                f"on weg2xsn43).")
+                f"card {card_id}: the two groups share NO name for region "
+                f"{my_region} (source {len(tag_sets[0])} names, destination "
+                f"{len(tag_sets[1])}, intersection 0; source-only {only_src} "
+                f"destination-only {only_dst}) -- a deposit and a collect on "
+                f"this card would never meet (the W68 family, measured on "
+                f"weg2xsn43).")
     try:
         plan = plan_from_join(join, direction=direction,
                               src_addr=src_addr, dst_addr=dst_addr)

@@ -65,14 +65,23 @@ class ThePlanGateDirection(unittest.TestCase):
             plan, f"destination-only tags must not refuse: {reason}")
         self.assertNotIn("plan-tag-divergence", reason or "")
 
-    def test_source_only_tags_still_refuse(self):
-        """THE DYING MUTANT: a source tag the destination lacks posts bands
-        nobody reads -- that refusal must survive the relaxation."""
-        manifests = _with_extra_tags(_manifests(), "P", ["weights_extra_a"])
+    def test_a_card_with_no_shared_name_still_refuses(self):
+        """THE DYING MUTANT: the one defect the guard can still catch is a
+        card whose two groups share no name at all -- a deposit and a
+        collect that never meet."""
+        manifests = _manifests()
+        emptied = [
+            m if not (m.group == "P" and m.rank == 0)
+            else xm.RankManifest(group=m.group, rank=m.rank, card=m.card,
+                                 region_tag=m.region_tag,
+                                 boot_token=m.boot_token, tp_rank=m.tp_rank,
+                                 pp_rank=m.pp_rank, pieces=())
+            for m in manifests]
+        emptied = [m for m in emptied if m.pieces]
         plan, reason = xm.leg_plan_from_join(
-            hook="source", group="P", rank=0, manifests=manifests)
-        self.assertIsNone(plan, "a source-only tag must refuse")
-        self.assertIn("plan-name-divergence", reason or "")
+            hook="source", group="P", rank=0, manifests=emptied)
+        self.assertIsNone(plan, "a card with no shared name must refuse")
+        self.assertIn("join-unjoinable", reason or "")
 
 
 if __name__ == "__main__":
