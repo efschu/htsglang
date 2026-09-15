@@ -150,6 +150,29 @@ def _manager(monkeypatch, *, group, rank, device):
     )
 
 
+def _lane_descs_filter(descs):
+    """2026-09-15: the sequential transport derives each lane's unit list
+    from the manifests (`_weg2_seq_lane_descs`); this harness has no
+    manifests, only explicit descs -- hand them to the leg filtered the way
+    the derivation would (by tag, and by lane: the on-card diagonal is
+    src == dst == card, a cross lane is one of CROSS_PAIRS)."""
+    from sglang.srt.weg2 import weight_exchange_region as _xr
+
+    def _f(self, *, hook, group, rank, pair, card, tag, log=None):
+        out = []
+        for d in descs:
+            if tag is not None and str(getattr(d, "tag", "")) != str(tag):
+                continue
+            if pair is None:
+                if int(d.src_rank) == int(d.dst_rank) == int(card):
+                    out.append(d)
+            elif (int(d.src_rank), int(d.dst_rank)) == tuple(
+                    _xr.CROSS_PAIRS[int(pair)]):
+                out.append(d)
+        return out
+    return _f
+
+
 def _cross_descs(n_bands, nbytes, src_ops, dst_ops, *, kind_flat_only=True):
     """`n_bands` descriptors on the SAME cross pair (rank 0 -> rank 1),
     real host pages behind each pointer via `FakeDeviceOps`."""
@@ -213,6 +236,8 @@ def _run_cross_leg_pair(monkeypatch, real_region, *, n_bands, slot_bytes,
     src_ops = FakeDeviceOps(str(tmp_path), rank=SRC_RANK)
     dst_ops = FakeDeviceOps(str(tmp_path), rank=DST_RANK)
     descs = _cross_descs(n_bands, slot_bytes, src_ops, dst_ops)
+    monkeypatch.setattr(Manager, "_weg2_seq_lane_descs",
+                        _lane_descs_filter(descs), raising=True)
 
     m_src = _manager(monkeypatch, group="P", rank=SRC_RANK, device=SRC_RANK)
     m_dst = _manager(monkeypatch, group="D", rank=DST_RANK, device=DST_RANK)
@@ -292,61 +317,52 @@ def test_band_credit_true_reaches_run_bounce_leg_through_the_real_callsite(
 
 
 def test_band_credit_true_allocates_the_small_buffer_not_the_tag_sized_one(
-        monkeypatch, real_region, tmp_path):
-    """THE POSITIVE SIZE PROOF, measured on disk, not predicted from a
-    formula: the SAME descriptor population, run once with
-    `band_credit=True` and once with `band_credit=False`, through the
-    IDENTICAL `_weg2_xchg_bounce_leg` call, must allocate DIFFERENT file
-    sizes for the lane's buffer -- small (`cross_lane_slots`) vs. big
-    (`terms.lane_slots`, tag-sized). If weight_updater.py's threading ever
-    silently dropped `band_credit`/`n_cross_lanes` between
-    `read_published_terms()` and `bx.run_bounce_leg(...)`, both runs would
-    allocate the SAME (big) size and this assertion would catch it -- a
-    stronger claim than "band_credit=True did not raise"."""
+        monkeypatch, real_region, tmp_path, caplog):
+    """THE SIZE PROOF, measured, on the form that ships since 2026-09-15:
+    the SEQUENTIAL transport stages a lane in ONE buffer sized to the
+    lane's OWN byte sum (`_lane_bytes`, weg2xsn56), and `band_credit` is a
+    lever of the retired band form (`LayerBounce`, `bounce.bin.<lane>`) --
+    it reaches the leg unchanged and changes nothing about that size. The
+    SAME descriptor population, run with band_credit=True and False
+    through the IDENTICAL `_weg2_xchg_bounce_leg` call, must map the SAME
+    buffer, and that buffer must be the lane's sum -- never tag-sized
+    (`terms.lane_slots x slot_bytes`) and never the priced single slot."""
+    import logging
     n_bands, slot_bytes = 5, 4096
+    want = n_bands * slot_bytes
 
-    errors_bc, dst_bc, _ = _run_cross_leg_pair(
-        monkeypatch, real_region, n_bands=n_bands, slot_bytes=slot_bytes,
-        band_credit=True, tmp_path=tmp_path, lane_suffix="small")
+    def _mapped_bytes(records, phase):
+        out = []
+        for r in records:
+            msg = r.getMessage()
+            if msg.startswith("WEG2-SEQ mapped lane=p0") and f"phase={phase}" in msg:
+                out.append(int(msg.split("bytes=")[1].split()[0]))
+        return out
+
+    with caplog.at_level(logging.INFO):
+        errors_bc, dst_bc, _ = _run_cross_leg_pair(
+            monkeypatch, real_region, n_bands=n_bands, slot_bytes=slot_bytes,
+            band_credit=True, tmp_path=tmp_path, lane_suffix="small")
     assert errors_bc == {}, f"band_credit=True leg raised: {errors_bc}"
     dst_bc.close()
-    size_small = os.path.getsize(
-        wb.bounce_path(real_region[0], real_region[2], lane="p0"))
-
-    # A FRESH region: the file name is keyed by (boot_nonce, lane), and the
-    # first run's file must not be reused/aliased under the second term.
+    small = _mapped_bytes(caplog.records, "deposit")
+    caplog.clear()
     nonce2 = f"{real_region[0]}-tagsized"
     xr.create_semaphores(nonce2)
     try:
         region2 = (nonce2, tp.SemSet(nonce2), real_region[2])
-        errors_big, dst_big, _ = _run_cross_leg_pair(
-            monkeypatch, region2, n_bands=n_bands, slot_bytes=slot_bytes,
-            band_credit=False, tmp_path=tmp_path, lane_suffix="big")
+        with caplog.at_level(logging.INFO):
+            errors_big, dst_big, _ = _run_cross_leg_pair(
+                monkeypatch, region2, n_bands=n_bands, slot_bytes=slot_bytes,
+                band_credit=False, tmp_path=tmp_path, lane_suffix="big")
         assert errors_big == {}, f"band_credit=False leg raised: {errors_big}"
         dst_big.close()
-        size_big = os.path.getsize(wb.bounce_path(nonce2, real_region[2], lane="p0"))
+        big = _mapped_bytes(caplog.records, "deposit")
     finally:
         xr.unlink_semaphores(nonce2)
-
-    assert size_small < size_big, (
-        f"band_credit=True allocated {size_small} B, band_credit=False "
-        f"allocated {size_big} B -- band_credit must allocate STRICTLY "
-        f"less, or the lever reaching run_bounce_leg changed nothing")
-    # THE EXACT NUMBERS, so a future silent change (e.g. `_band_credit_leg`'s
-    # precondition order) is caught by more than "smaller than something".
-    terms_bc = _band_credit_terms(n_bands=n_bands, slot_bytes=slot_bytes,
-                                  band_credit=True)
-    terms_big = _band_credit_terms(n_bands=n_bands, slot_bytes=slot_bytes,
-                                   band_credit=False)
-    assert size_small == wb.leg_slot_bytes(terms_bc) * terms_bc.cross_lane_slots
-    assert size_big == wb.leg_slot_bytes(terms_big) * terms_big.lane_slots
-
-
-# ===========================================================================
-# 2. THE #1397 REFUSAL'S REACHABILITY -- from `_weg2_xchg_inject_weights()`,
-#    the real wake-side entry point, not a direct `xb.bounce_terms(...)` call.
-# ===========================================================================
-
+    assert small == [want] and big == [want], (
+        f"the lane's buffer must be the lane's own sum ({want} B) under "
+        f"either term: band_credit=True mapped {small}, False mapped {big}")
 
 def _publish_inconsistent_term(monkeypatch, *, max_tag_bytes):
     """Publishes a term whose fields `read_published_terms()` will accept

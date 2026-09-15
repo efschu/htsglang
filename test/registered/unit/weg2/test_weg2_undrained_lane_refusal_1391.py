@@ -733,6 +733,29 @@ def _diag_desc(tag_idx, *, ops_src, ops_dst, nbytes=64):
     )
 
 
+def _lane_descs_filter(descs):
+    """2026-09-15: the sequential transport derives each lane's unit list
+    from the manifests (`_weg2_seq_lane_descs`); this harness has no
+    manifests, only explicit descs -- hand them to the leg filtered the way
+    the derivation would (by tag, and by lane: the on-card diagonal is
+    src == dst == card, a cross lane is one of CROSS_PAIRS)."""
+    from sglang.srt.weg2 import weight_exchange_region as _xr
+
+    def _f(self, *, hook, group, rank, pair, card, tag, log=None):
+        out = []
+        for d in descs:
+            if tag is not None and str(getattr(d, "tag", "")) != str(tag):
+                continue
+            if pair is None:
+                if int(d.src_rank) == int(d.dst_rank) == int(card):
+                    out.append(d)
+            elif (int(d.src_rank), int(d.dst_rank)) == tuple(
+                    _xr.CROSS_PAIRS[int(pair)]):
+                out.append(d)
+        return out
+    return _f
+
+
 def _run_two_tag_leg(*, dest_per_tag: bool, tmp_path, timeout=8.0):
     """SOURCE deposits weights_0 then weights_1 through the REAL per-tag
     lockstep (exactly D's own shape, always per-tag regardless of carrier).
@@ -805,11 +828,15 @@ def _run_two_tag_leg(*, dest_per_tag: bool, tmp_path, timeout=8.0):
         except Exception as exc:  # noqa: BLE001
             results["dest"] = f"{type(exc).__name__}: {exc}"
 
+    from unittest import mock
+    _all_descs = [_diag_desc(t, ops_src=src_ops, ops_dst=dst_ops) for t in range(2)]
     threads = [threading.Thread(target=_source), threading.Thread(target=_dest)]
-    for th in threads:
-        th.start()
-    for th in threads:
-        th.join(timeout=timeout)
+    with mock.patch.object(Manager, "_weg2_seq_lane_descs",
+                           _lane_descs_filter(_all_descs)):
+        for th in threads:
+            th.start()
+        for th in threads:
+            th.join(timeout=timeout)
     alive = [th for th in threads if th.is_alive()]
     try:
         return results, alive
@@ -827,22 +854,31 @@ def _short_rendezvous_budget(monkeypatch, request):
     yield
 
 
-def test_M2_old_style_whole_plan_collect_deadlocks_RED_on_the_wall(tmp_path):
+def test_M2_old_style_whole_plan_collect_deadlocks_RED_on_the_wall(tmp_path, monkeypatch):
+    # 2026-09-15: this mutant models the per-tag drain law at buffer depth 1
+    # (the source waits for tag t's drain before tag t+1). Under the shipped
+    # depth 2 a TWO-tag leg never waits, so the deadlock it reproduces needs
+    # the depth-1 form it was written for.
+    monkeypatch.setenv(bx.SEQ_BUFFER_DEPTH_ENV, "1")
     """RED-FIRST: this IS boot weg2xsn31's wedge, hermetic. Before this
     round, shadow mode's only collect ran exactly this way -- once, after
     both tags, with `tag=None`. D's second deposit blocks in `wait_drained`
     forever (here: for the shortened 2s budget) because nobody ever posts
     `drained` per tag."""
     results, alive = _run_two_tag_leg(dest_per_tag=False, tmp_path=tmp_path)
-    # `Weg2XchgBouncePhaseUnordered` is a bare alias of `Weg2XchgPlanDisagree`
-    # (weight_exchange_bounce.py:1062: `Weg2XchgBouncePhaseUnordered =
-    # wx.Weg2XchgPlanDisagree`) -- `type(exc).__name__` always prints the
-    # latter, so the message text is the discriminator, not the class name.
     src_msg = str(results.get("source", ""))
-    assert "Weg2XchgPlanDisagree" in src_msg, (
-        f"expected the source to block on wait_drained and time out; got "
-        f"{results}")
-    assert "waited for the collector to drain" in src_msg, results
+    # 2026-09-15 (sequential per-unit transport): the old shape now wedges
+    # one step EARLIER as well -- the whole-plan collector waits for tag 1's
+    # units on the lane's own handshake while the source waits for tag 0's
+    # drain; either side may be the one the harness timeout catches. What
+    # the mutant proves is unchanged: the old-style collect never completes
+    # and the source never gets its drain.
+    assert results.get("dest") != "collected", results
+    assert alive or "Weg2XchgPlanDisagree" in src_msg, (
+        f"expected the old-style leg to wedge (a live thread or the source's "
+        f"drain timeout); got results={results} alive={[t.name for t in alive]}")
+    if "Weg2XchgPlanDisagree" in src_msg:
+        assert "waited for the collector to drain" in src_msg, results
 
 
 def test_the_fix_per_tag_collect_drains_the_same_lane(tmp_path):

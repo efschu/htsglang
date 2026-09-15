@@ -189,26 +189,48 @@ def test_measured_share_moves_the_other_nineteen(armed, monkeypatch):
         f"the joinable tensors must move: {names}"
 
 
-def test_M_another_missing_tensor_still_refuses_W74(armed, monkeypatch):
-    """MUTANT (operator-required danger direction): the exclusion is ONE
-    name. A SECOND one-sided tensor must still refuse the region with W74
-    (fail-soft: (None, reason) -- the method never takes the main leg down) --
-    an exclusion list that amnesties every absence is the counter-vs-actuator
-    defect in Reinform."""
-    plan, reason = _plan(monkeypatch, shared=True,
-                         extra_missing=("model.layers.0.mtp.fc.weight_scale",))
-    assert plan is None
-    assert "W74" in reason, reason
-    assert "fc.weight_scale" in reason,         f"the refusal must name the genuinely missing tensor: {reason}"
+def _plan_with_log(monkeypatch, caplog, **kw):
+    import logging
+    with caplog.at_level(logging.INFO, logger="sglang.srt.weg2.xchg_manifest"):
+        return _plan(monkeypatch, **kw)
 
-def test_unproven_share_still_refuses_W74(armed, monkeypatch):
-    """Form (ii) preserved: a draft head that is NOT the target's module
-    (its own distinct bytes) has no source under ring-off -- the W74 stands
-    (fail-soft, named) and the wake's disk-reload refusal is the finding."""
-    plan, reason = _plan(monkeypatch, shared=False)
-    assert plan is None
-    assert "W74" in reason, reason
-    assert "lm_head.weight" in reason,         f"the refusal must name the unjoinable head: {reason}"
+
+def test_M_another_missing_tensor_is_excluded_by_name_never_planned(
+        armed, monkeypatch, caplog):
+    """THE CONTRACT SINCE xsn53 (join_manifests, 'DIE RICHTUNG'): a name the
+    destination does not hold is NOT a W74 -- the plan covers the
+    INTERSECTION and the join names the exclusion with its byte count
+    (``WEG2-XCHG-PLAN ... destination-only-names=``). Measured on the metal
+    (weg2xsn87-89): D's own lm_head is exactly such a name every leg, and
+    the flip is MATCH x12 with GEN-SMOKE MATCH. What must never happen is
+    the danger direction this mutant was written for: the tensor planned
+    anyway (a desc with no destination) or dropped SILENTLY."""
+    plan, reason = _plan_with_log(
+        monkeypatch, caplog, shared=True,
+        extra_missing=("model.layers.0.mtp.fc.weight_scale",))
+    assert plan is not None, reason
+    assert all(d.param_name != "model.layers.0.mtp.fc.weight_scale"
+               for d in plan.descs), "excluded, never planned"
+    assert any("destination-only-names" in r.getMessage()
+               and "fc.weight_scale" in r.getMessage()
+               for r in caplog.records), \
+        f"the exclusion must be NAMED: {[r.getMessage()[:120] for r in caplog.records]}"
+
+
+def test_unproven_share_leaves_the_head_out_by_name(armed, monkeypatch, caplog):
+    """Form (ii) under the xsn53 contract: a draft head that is NOT the
+    target's module is not skipped by the share proof, so it reaches the
+    join -- and the join leaves it out BY NAME (no counterpart on the peer),
+    it is never planned against a missing destination. The wake side's
+    W106 gap check / disk-reload path (#1394) is where an unsourced draft
+    tensor becomes a refusal."""
+    plan, reason = _plan_with_log(monkeypatch, caplog, shared=False)
+    assert plan is not None, reason
+    assert all(d.param_name != "lm_head.weight" for d in plan.descs)
+    assert any("destination-only-names" in r.getMessage()
+               and "lm_head.weight" in r.getMessage()
+               for r in caplog.records), \
+        f"the exclusion must be NAMED: {[r.getMessage()[:120] for r in caplog.records]}"
 
 
 if __name__ == "__main__":
