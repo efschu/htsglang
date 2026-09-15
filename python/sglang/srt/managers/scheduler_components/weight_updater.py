@@ -5116,6 +5116,10 @@ class SchedulerWeightUpdaterManager:
                     if tag is not None and phase == bx.PHASE_DEPOSIT:
                         if _seq == 0:
                             rv.prime_drain()
+                            logger.info(
+                                "WEG2-SEQ prime lane=%s drained=%d depth=%d",
+                                _lane_key, int(getattr(rv, "last_primed", 0)),
+                                int(_depth))
                         elif _seq >= int(_depth) and not rv.wait_drained(tag=str(tag)):
                             raise bx.Weg2XchgBouncePhaseUnordered(
                                 f"W68 Weg2XchgPlanDisagree: tag={tag} lane="

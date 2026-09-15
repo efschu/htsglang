@@ -1823,14 +1823,33 @@ class CrossSlotRendezvous:
         still_being_collected, which passes WITHOUT this call for the wrong
         reason.
         """
-        if self.pair is not None:
-            return bool(self.sems.trywait(self.pair, self._DRAIN_SLOT, "empty"))
-        # No `diagonal_trywait` exists; a zero budget IS trywait semantics
-        # (sem_timedwait with a deadline already past returns ETIMEDOUT at
-        # once), and that keeps the diagonal on the identical contract without
-        # widening SemSet for one caller.
-        return bool(self.sems.diagonal_timedwait(self.card, self._DRAIN_SLOT,
-                                                 "empty", 0.0))
+        # weg2xsn88 (2026-09-15, buffer depth 2): DRAIN EVERY CREDIT, not
+        # one. With depth d the depositor consumes only n-d of the
+        # collector's n drain posts per leg, so d credits are left at a role
+        # switch; a prime that took ONE left the new depositor a stale
+        # credit and it ran a tag further ahead than the buffers allow --
+        # measured: the p3 collect of weights_7 read a record naming
+        # lm_head.weight/tag=weights (three tags later), W68 unit identity
+        # mismatch, and PP0 W90 moved=66. Every leftover credit belongs to a
+        # buffer the previous collector has fully drained (its group fence
+        # closed that leg), so taking them all is exact, never a loss.
+        n = 0
+        while True:
+            if self.pair is not None:
+                got = bool(self.sems.trywait(self.pair, self._DRAIN_SLOT, "empty"))
+            else:
+                # No `diagonal_trywait` exists; a zero budget IS trywait
+                # semantics (sem_timedwait with a deadline already past
+                # returns ETIMEDOUT at once).
+                got = bool(self.sems.diagonal_timedwait(
+                    self.card, self._DRAIN_SLOT, "empty", 0.0))
+            if not got:
+                break
+            n += 1
+            if n > 64:  # a counting semaphore cannot legitimately hold this
+                break
+        self.last_primed = int(n)
+        return n > 0
 
     def wait_drained(self, *, tag: str) -> bool:
         """Block until the peer has collected the PREVIOUS tag.

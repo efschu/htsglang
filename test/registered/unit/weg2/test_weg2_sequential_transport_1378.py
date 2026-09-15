@@ -494,3 +494,20 @@ class DigestOffByDefaultStillMovesAndChecksIdentity(_TransportHarness):
             phase=bx.PHASE_COLLECT, buffer_slot=1, log=self.lines.append, card=1)
         self.assertEqual(rc, "")
         self.assertEqual(self.ops.read(dst, n), b"\x07" * n)
+
+
+class PrimeDrainTakesEveryLeftoverCredit(_TransportHarness):
+    """weg2xsn88: under buffer depth 2 a role switch leaves TWO drain
+    credits; a prime that took one let the new depositor run a tag too far
+    ahead (W68 unit identity mismatch on p3, W90 moved=66 on PP0).
+    MUTANT: the shipped single trywait."""
+
+    def test_prime_drains_all_credits(self):
+        rv = bx.CrossSlotRendezvous(tp.SemSet(self.nonce), None, card=1)
+        rv.post_drained(tag="a")
+        rv.post_drained(tag="b")  # armed 1 + 2 posts = 3 credits
+        self.assertTrue(rv.prime_drain())
+        self.assertEqual(rv.last_primed, 3)
+        self.assertFalse(rv.prime_drain())
+        self.assertEqual(rv.last_primed, 0)
+        self.assertFalse(rv._wait(rv._DRAIN_SLOT, "empty", 0.0))
