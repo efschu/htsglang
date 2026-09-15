@@ -3051,6 +3051,12 @@ class SchedulerWeightUpdaterManager:
         and cost ~1 s per derivation. Cached only for ``agreed=None`` and a
         plan that was actually built; the cache is reset at both leg entries."""
         _lc = getattr(self, "_weg2_xchg_leg_cache", None)
+        if _lc is None:
+            _lc = {}
+            try:
+                self._weg2_xchg_leg_cache = _lc
+            except AttributeError:
+                _lc = None
         # class-level call: the execution smokes' stubs copy this method
         # alone (the #1358 lesson) and carry no `_uncached` attribute.
         _impl = SchedulerWeightUpdaterManager._weg2_shadow_plan_uncached
@@ -4599,6 +4605,12 @@ class SchedulerWeightUpdaterManager:
             src_card = dst_card = int(card)
 
         _lc = getattr(self, "_weg2_xchg_leg_cache", None)
+        if _lc is None:
+            _lc = {}
+            try:
+                self._weg2_xchg_leg_cache = _lc
+            except AttributeError:
+                pass
         _jk = ("join", str(hook), str(group), int(rank))
         if _lc is not None and _jk in _lc:
             join, plan = _lc[_jk]
@@ -5742,7 +5754,13 @@ class SchedulerWeightUpdaterManager:
         # sides walk the same tags per leg, so both start at 0 here.
         try:
             self._weg2_xchg_lane_seq = {}
-            self._weg2_xchg_leg_cache = {}
+            # the derivation cache is PER BOOT (weg2xsn98): the manifests
+            # are written at load and the placement key is identical on
+            # every leg, so the join/plan/books/shadow plan derived on the
+            # first leg serve every later one -- ~1 s off each leg start,
+            # which is what the waking side's first collect waited for.
+            if getattr(self, "_weg2_xchg_leg_cache", None) is None:
+                self._weg2_xchg_leg_cache = {}
         except AttributeError:
             pass
         family_paused_before = any(is_weights_family_tag(t) for t in self.offload_tags)
@@ -6180,7 +6198,13 @@ class SchedulerWeightUpdaterManager:
         # sides walk the same tags per leg, so both start at 0 here.
         try:
             self._weg2_xchg_lane_seq = {}
-            self._weg2_xchg_leg_cache = {}
+            # the derivation cache is PER BOOT (weg2xsn98): the manifests
+            # are written at load and the placement key is identical on
+            # every leg, so the join/plan/books/shadow plan derived on the
+            # first leg serve every later one -- ~1 s off each leg start,
+            # which is what the waking side's first collect waited for.
+            if getattr(self, "_weg2_xchg_leg_cache", None) is None:
+                self._weg2_xchg_leg_cache = {}
         except AttributeError:
             pass
         if weights_tags:
