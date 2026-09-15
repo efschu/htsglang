@@ -6482,6 +6482,15 @@ class SchedulerWeightUpdaterManager:
                             # waits for tag t+1's credit and resumes it.
                             _wake_futs.append((str(tag), _wake_worker.submit(
                                 self._weg2_wake_collect_one, tag)))
+                            # weg2xsn110: BOUNDED run-ahead. Unbounded, the
+                            # main thread resumed all ten tags in one second
+                            # (card 0 free 13442 -> 12 MiB) before the worker
+                            # collected the first; the sleeper's staging then
+                            # found no VRAM and the chain wedged (W68 at the
+                            # sleeper's drain wait). Resume t+1 may overlap
+                            # collect t, nothing further: wait for t-1 here.
+                            if len(_wake_futs) >= 2:
+                                _wake_futs[-2][1].result()
                         else:
                             self._weg2_wake_collect_one(tag)
                     elif (str(tag) == _WEIGHTS_DRAFT_TAG
