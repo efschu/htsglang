@@ -2804,8 +2804,14 @@ def run_sequential_units(descs, ops, boot_nonce: str, *,
                         recs = {}
                 recs[str(i)] = {"name": name, "tag": tag, "digest": digest, "ipc": _ipc_hex,
                                 "nbytes": nbytes}
-                with open(dpath, "w") as fh:
+                # weg2xsn90: ATOMIC -- a collector that read this file mid-
+                # rewrite got `{}` (ValueError -> empty), skipped every guard
+                # and, with the on-card IPC staging, copied the never-written
+                # host buffer into layer 0 (2 pieces moved, W90).
+                _tmp = dpath + ".tmp"
+                with open(_tmp, "w") as fh:
                     _json.dump(recs, fh)
+                os.replace(_tmp, dpath)
                 # #1378 xsn53: THE LANE'S OWN TOKEN.  One full per unit on the
                 # lane's resolved handshake; the deposit posts, the collect
                 # consumes.  A cross lane posts the CROSS family, a diagonal lane
@@ -2846,13 +2852,27 @@ def run_sequential_units(descs, ops, boot_nonce: str, *,
                         "budget-expired-seq", tag=str(name), rank=int(window_off),
                         extra=f"unit {i} {name!r} budget={budget_s}s")
                     return f"budget expired at unit {i} {name!r}"
-                recs = {}
-                if os.path.exists(dpath):
-                    try:
-                        recs = _json.load(open(dpath))
-                    except ValueError:
-                        recs = {}
-                dep = recs.get(str(i), {})
+                # weg2xsn90: the deposit posts `full` only AFTER its record
+                # is written (atomically), so a missing record is a torn read
+                # or a stale file -- wait for it, never proceed on `{}`.
+                dep = {}
+                _t_rec = time.perf_counter()
+                while True:
+                    recs = {}
+                    if os.path.exists(dpath):
+                        try:
+                            with open(dpath) as _rf:
+                                recs = _json.load(_rf)
+                        except ValueError:
+                            recs = {}
+                    dep = recs.get(str(i), {})
+                    if dep:
+                        break
+                    if time.perf_counter() - _t_rec > 5.0:
+                        return (f"record missing for unit {i} {name!r} on lane "
+                                f"{lane_key} after 5 s -- the deposit posts "
+                                f"'full' only after writing it")
+                    time.sleep(0.002)
                 if dep.get("ipc") and not _ipc_base:
                     # the deposit staged on-card: open its handle once, read
                     # every unit of this lane/tag D2D out of the staging.
