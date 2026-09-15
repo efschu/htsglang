@@ -502,6 +502,11 @@ class SchedulerWeightUpdaterManager:
     #: the depth-2 drain rule read it; BOTH sides count the same tags per
     #: lane (the join is symmetric), so the slots agree without a message.
     _weg2_xchg_lane_seq: Optional[dict] = None
+    #: 2026-09-15 (weg2xsn94): per-LEG cache of the join, the lane plan and
+    #: the address books -- derived ONCE per leg instead of per lane and tag
+    #: (~1 s per tag on every rank: join_manifests + plan_from_join + books,
+    #: and the shadow plan with its 1.2M-piece pointer profile).
+    _weg2_xchg_leg_cache: Optional[dict] = None
     #: True once the resume loop has collected tag by tag, so the once-per-wake
     #: entry stands down instead of injecting a second time over bytes already
     #: written.
@@ -3027,6 +3032,25 @@ class SchedulerWeightUpdaterManager:
 
     def _weg2_shadow_plan(self, hook: str, group: str, rank: int, *,
                           agreed=None, require_agreement: bool):
+        """Per-leg cache in front of :meth:`_weg2_shadow_plan_uncached`
+        (2026-09-15, weg2xsn94): the plan is the same for every tag of a leg
+        and cost ~1 s per derivation. Cached only for ``agreed=None`` and a
+        plan that was actually built; the cache is reset at both leg entries."""
+        _lc = getattr(self, "_weg2_xchg_leg_cache", None)
+        if _lc is None or agreed is not None:
+            return self._weg2_shadow_plan_uncached(
+                hook, group, rank, agreed=agreed, require_agreement=require_agreement)
+        key = ("plan", str(hook), str(group), int(rank), bool(require_agreement))
+        if key in _lc:
+            return _lc[key]
+        out = self._weg2_shadow_plan_uncached(
+            hook, group, rank, agreed=agreed, require_agreement=require_agreement)
+        if out is not None and out[0] is not None:
+            _lc[key] = out
+        return out
+
+    def _weg2_shadow_plan_uncached(self, hook: str, group: str, rank: int, *,
+                                   agreed=None, require_agreement: bool):
         """THE PRODUCT CALL SITE OF ``weight_exchange.build_plan``.
 
         ``require_agreement`` IS THE CALLER'S DECISION AND HAS NO DEFAULT
@@ -4526,13 +4550,20 @@ class SchedulerWeightUpdaterManager:
         else:
             src_card = dst_card = int(card)
 
-        mans, why = xm.manifests_for_boot(pp_group="P", tp_group="D")
-        if mans is None:
-            raise wx.Weg2XchgPlanDisagree(
-                f"W68 Weg2XchgPlanDisagree: the sequential transport could "
-                f"not read the manifests it must derive its lane from: {why}")
-        join = xm.join_manifests(mans, pp_group="P", tp_group="D")
-        plan = xm.plan_from_join(join, direction=wx.leg_direction(hook, group))
+        _lc = getattr(self, "_weg2_xchg_leg_cache", None)
+        _jk = ("join", str(hook), str(group), int(rank))
+        if _lc is not None and _jk in _lc:
+            join, plan = _lc[_jk]
+        else:
+            mans, why = xm.manifests_for_boot(pp_group="P", tp_group="D")
+            if mans is None:
+                raise wx.Weg2XchgPlanDisagree(
+                    f"W68 Weg2XchgPlanDisagree: the sequential transport could "
+                    f"not read the manifests it must derive its lane from: {why}")
+            join = xm.join_manifests(mans, pp_group="P", tp_group="D")
+            plan = xm.plan_from_join(join, direction=wx.leg_direction(hook, group))
+            if _lc is not None:
+                _lc[_jk] = (join, plan)
 
         model = self._weg2_model_for_group(group)
         # THE SAME REGION KEY THE PLAN WAS BUILT WITH: `_weg2_shadow_plan`
@@ -4559,10 +4590,16 @@ class SchedulerWeightUpdaterManager:
                 f"needs this rank's identity and neither the caller nor "
                 f"_weg2_rank() could answer (group={group!r}) -- an "
                 f"unaddressable rank cannot say which bytes it holds")
-        src_book = self._weg2_join_src_addr("source", group, rank, model,
-                                            region=region_tag)
-        dst_book = self._weg2_join_dst_addr("destination", group, rank, model,
-                                            region=region_tag)
+        _bk = ("books", str(hook), str(group), int(rank), str(region_tag))
+        if _lc is not None and _bk in _lc:
+            src_book, dst_book = _lc[_bk]
+        else:
+            src_book = self._weg2_join_src_addr("source", group, rank, model,
+                                                region=region_tag)
+            dst_book = self._weg2_join_dst_addr("destination", group, rank, model,
+                                                region=region_tag)
+            if _lc is not None:
+                _lc[_bk] = (src_book, dst_book)
         # #1378 xsn73 -- ONE BOOK PER REGION OF THE DESC'S OWN TAG. The pair
         # above is keyed by the MAIN runner's region (`weights`), and this
         # method fills every desc from it -- so for the draft tag the book
@@ -5657,6 +5694,7 @@ class SchedulerWeightUpdaterManager:
         # sides walk the same tags per leg, so both start at 0 here.
         try:
             self._weg2_xchg_lane_seq = {}
+            self._weg2_xchg_leg_cache = {}
         except AttributeError:
             pass
         family_paused_before = any(is_weights_family_tag(t) for t in self.offload_tags)
@@ -6094,6 +6132,7 @@ class SchedulerWeightUpdaterManager:
         # sides walk the same tags per leg, so both start at 0 here.
         try:
             self._weg2_xchg_lane_seq = {}
+            self._weg2_xchg_leg_cache = {}
         except AttributeError:
             pass
         if weights_tags:
