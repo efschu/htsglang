@@ -6672,6 +6672,16 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         return max(0, self.evictable_size() - self._weg2_undeliverable_evictable_tokens())
 
     def _weg2_undeliverable_evictable_tokens(self) -> int:
+        """#1425b (xsn185): the leaf-only count was not enough. Under
+        write_back a LEAF may be backed while its PARENT is not (the
+        write_back peel skips the parent invariant), so after the backed
+        leaves are demoted the peel meets an un-backed interior node, the
+        ring is full, write_backup returns 0 and the chain stops there --
+        measured on PP1: asked 4096, received 588, tree reports 306,543.
+        So the count walks the tree bottom-up: a node's tokens are
+        deliverable only when every device child below it is deliverable
+        (it becomes a leaf only then) and the node itself is backed or the
+        staging ring can still absorb it. Everything else is subtracted."""
         cc = getattr(self, "cache_controller", None)
         if cc is None or getattr(cc, "write_policy", "") != "write_back":
             return 0
@@ -6679,25 +6689,54 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             avail = int(cc.mem_pool_host.available_size())
         except Exception:  # noqa: BLE001 - no pool reading, no subtraction
             return 0
-        sizes = sorted(
-            len(node.key)
-            for node in list(getattr(self, "evictable_device_leaves", ()) or ())
-            if not getattr(node, "backuped", False)
-        )
+        ct = BASE_COMPONENT_TYPE
+        root = self.root_node
+        # post-order over the tree: children before parents
+        order = []
+        stack = [root]
+        while stack:
+            n = stack.pop()
+            order.append(n)
+            stack.extend(n.children.values())
+        deliverable_subtree = {}  # id(node) -> bool (all device data below is peelable)
         undeliverable = 0
-        for n in sizes:
-            if n <= avail:
-                avail -= n
+        ring_left = avail
+        for n in reversed(order):
+            kids_ok = all(
+                deliverable_subtree.get(id(c), True) for c in n.children.values()
+            )
+            if n is root:
+                continue
+            cd = n.component_data[ct]
+            if cd.value is None:
+                deliverable_subtree[id(n)] = kids_ok
+                continue
+            tokens = len(cd.value)
+            if cd.lock_ref > 0:
+                # protected: not evictable, not counted either way
+                deliverable_subtree[id(n)] = False
+                continue
+            if not kids_ok:
+                undeliverable += tokens
+                deliverable_subtree[id(n)] = False
+                continue
+            if n.backuped:
+                deliverable_subtree[id(n)] = True
+            elif tokens <= ring_left:
+                ring_left -= tokens
+                deliverable_subtree[id(n)] = True
             else:
-                undeliverable += n
+                undeliverable += tokens
+                deliverable_subtree[id(n)] = False
         if undeliverable:
             k = getattr(UnifiedRadixCache, "_1425_n", 0) + 1
             UnifiedRadixCache._1425_n = k
             if k <= 8 or k % 256 == 0:
                 logger.warning(
-                    "#1425 EVICTABLE-BUT-UNDELIVERABLE: %d tokens in %d un-backed device leaves "
-                    "exceed the staging ring (%d rows free) -- not counted for admission (n=%d)",
-                    undeliverable, len(sizes), int(cc.mem_pool_host.available_size()), k,
+                    "#1425 EVICTABLE-BUT-UNDELIVERABLE: %d of %d evictable tokens sit in or "
+                    "under un-backed device nodes the staging ring (%d rows free) cannot absorb "
+                    "-- not counted for admission (n=%d)",
+                    undeliverable, self.evictable_size(), avail, k,
                 )
         return undeliverable
 
