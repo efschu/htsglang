@@ -135,6 +135,8 @@ def test_two_head_shards_join_one_blob(tmp_path):
 def test_an_unbound_pool_hands_out_staging_slots_not_placeholders(tmp_path):
     p = object.__new__(ArenaMambaPoolHost)
     p.size = S; p.page_size = 1; p.free_slots = torch.arange(S, dtype=torch.int64)
+    import threading
+    p.lock = threading.Lock()
     p._arena_init_fields()
     ids = p.alloc_read(1)
     assert ids is not None and int(ids[0]) < S and not p.is_placeholder(int(ids[0]))
