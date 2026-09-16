@@ -514,6 +514,81 @@ int64_t arena_complete(uint8_t *base, int64_t n, const int64_t *slots, const int
     return ok;
 }
 
+
+/* ---- #1439: BLAKE2b (RFC 7693), unkeyed, 16-byte digest -- the same key128
+ * the Python side computes with hashlib.blake2b(stem, digest_size=16), so the
+ * arena can be asked by STEM from C without a Python hash + ctypes array per
+ * key (xsn199 D profile: 6 % of the re-admission of a 100k prompt). */
+static const uint64_t b2b_iv[8] = {
+    0x6a09e667f3bcc908ULL, 0xbb67ae8584caa73bULL, 0x3c6ef372fe94f82bULL, 0xa54ff53a5f1d36f1ULL,
+    0x510e527fade682d1ULL, 0x9b05688c2b3e6c1fULL, 0x1f83d9abfb41bd6bULL, 0x5be0cd19137e2179ULL};
+static const uint8_t b2b_sigma[12][16] = {
+    {0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15}, {14,10,4,8,9,15,13,6,1,12,0,2,11,7,5,3},
+    {11,8,12,0,5,2,15,13,10,14,3,6,7,1,9,4}, {7,9,3,1,13,12,11,14,2,6,5,10,4,0,15,8},
+    {9,0,5,7,2,4,10,15,14,1,11,12,6,8,3,13}, {2,12,6,10,0,11,8,3,4,13,7,5,15,14,1,9},
+    {12,5,1,15,14,13,4,10,0,7,6,3,9,2,8,11}, {13,11,7,14,12,1,3,9,5,0,15,4,8,6,2,10},
+    {6,15,14,9,11,3,0,8,12,2,13,7,1,4,10,5}, {10,2,8,4,7,6,1,5,15,11,9,14,3,12,13,0},
+    {0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15}, {14,10,4,8,9,15,13,6,1,12,0,2,11,7,5,3}};
+static inline uint64_t b2b_rotr(uint64_t x, int n) { return (x >> n) | (x << (64 - n)); }
+static inline uint64_t b2b_ld64(const uint8_t *p) {
+    uint64_t v = 0; for (int i = 7; i >= 0; i--) v = (v << 8) | p[i]; return v;
+}
+#define B2B_G(a, b, c, d, x, y) do { \
+    v[a] += v[b] + (x); v[d] = b2b_rotr(v[d] ^ v[a], 32); \
+    v[c] += v[d];       v[b] = b2b_rotr(v[b] ^ v[c], 24); \
+    v[a] += v[b] + (y); v[d] = b2b_rotr(v[d] ^ v[a], 16); \
+    v[c] += v[d];       v[b] = b2b_rotr(v[b] ^ v[c], 63); } while (0)
+static void b2b_compress(uint64_t h[8], const uint8_t blk[128], uint64_t t, int last) {
+    uint64_t v[16], m[16];
+    for (int i = 0; i < 8; i++) { v[i] = h[i]; v[i + 8] = b2b_iv[i]; }
+    v[12] ^= t; /* t0 (messages here are < 2^64 bytes, t1 = 0) */
+    if (last) v[14] = ~v[14];
+    for (int i = 0; i < 16; i++) m[i] = b2b_ld64(blk + 8 * i);
+    for (int r = 0; r < 12; r++) {
+        const uint8_t *s = b2b_sigma[r];
+        B2B_G(0, 4,  8, 12, m[s[0]],  m[s[1]]);  B2B_G(1, 5,  9, 13, m[s[2]],  m[s[3]]);
+        B2B_G(2, 6, 10, 14, m[s[4]],  m[s[5]]);  B2B_G(3, 7, 11, 15, m[s[6]],  m[s[7]]);
+        B2B_G(0, 5, 10, 15, m[s[8]],  m[s[9]]);  B2B_G(1, 6, 11, 12, m[s[10]], m[s[11]]);
+        B2B_G(2, 7,  8, 13, m[s[12]], m[s[13]]); B2B_G(3, 4,  9, 14, m[s[14]], m[s[15]]);
+    }
+    for (int i = 0; i < 8; i++) h[i] ^= v[i] ^ v[i + 8];
+}
+static void blake2b_16(const uint8_t *in, size_t n, uint8_t out[16]) {
+    uint64_t h[8];
+    for (int i = 0; i < 8; i++) h[i] = b2b_iv[i];
+    h[0] ^= 0x01010000ULL ^ (uint64_t)16; /* param block: digest 16, key 0, fanout 1, depth 1 */
+    uint8_t blk[128];
+    size_t off = 0;
+    while (n - off > 128) { b2b_compress(h, in + off, (uint64_t)(off + 128), 0); off += 128; }
+    size_t rem = n - off;
+    memset(blk, 0, 128); memcpy(blk, in + off, rem);
+    b2b_compress(h, blk, (uint64_t)n, 1);
+    for (int i = 0; i < 2; i++) for (int j = 0; j < 8; j++) out[8 * i + j] = (uint8_t)(h[i] >> (8 * j));
+}
+/* key128(stem) exactly as hicache_arena.key128: lo/hi little-endian halves,
+ * lo in {0, ~0} mapped to 1 (those are the index's empty/tomb markers). */
+static void stem_key128(const char *stem, uint64_t *lo, uint64_t *hi) {
+    uint8_t d[16];
+    blake2b_16((const uint8_t *)stem, strlen(stem), d);
+    uint64_t l = b2b_ld64(d), h = b2b_ld64(d + 8);
+    if (l == 0 || l == ~0ULL) l = 1;
+    *lo = l; *hi = h;
+}
+void arena_key128(const char *stem, uint64_t *lo, uint64_t *hi) { stem_key128(stem, lo, hi); }
+/* find by STEM: hashing in C, one call for a whole prefix. */
+int64_t arena_find_stems(uint8_t *base, int64_t n, const char **stems, int64_t *slots, int8_t *states) {
+    int64_t found = 0;
+    for (int64_t i = 0; i < n; i++) {
+        uint64_t lo, hi;
+        stem_key128(stems[i], &lo, &hi);
+        int64_t s = find_slot(base, lo, hi);
+        slots[i] = s;
+        states[i] = s < 0 ? 0 : (int8_t)atomic_load(&slot_hdr(base, (uint64_t)s)->state);
+        if (s >= 0) found++;
+    }
+    return found;
+}
+
 int64_t arena_ref_slots(uint8_t *base, int64_t n, const int64_t *slots, int32_t delta) {
     int64_t done = 0;
     for (int64_t i = 0; i < n; i++) {

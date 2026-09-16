@@ -94,6 +94,8 @@ def _load_lib() -> Optional[ctypes.CDLL]:
             lib.arena_stats.argtypes = [p_u8, p_i64]
             lib.arena_find_slots.restype = i64
             lib.arena_find_slots.argtypes = [p_u8, i64, p_u64, p_u64, p_i64, p_i8]
+            lib.arena_find_stems.restype = i64
+            lib.arena_find_stems.argtypes = [p_u8, i64, ctypes.POINTER(ctypes.c_char_p), p_i64, p_i8]
             lib.arena_claim.restype = i64
             lib.arena_claim.argtypes = [p_u8, i64, p_u64, p_u64, p_i64,
                                         ctypes.POINTER(ctypes.c_char_p), p_i64, p_i64, p_i8]
@@ -231,15 +233,27 @@ class ShmArena:
 
     # -- Stufe 3 (#1424): address pages in place --------------------------
     def find_slots(self, stems: Sequence[str]) -> list[tuple[int, int]]:
-        """(slot, state) per stem; slot -1 when absent. state 2 = COMPLETE."""
+        """(slot, state) per stem; slot -1 when absent. state 2 = COMPLETE.
+        #1439: hashed in C (arena_find_stems) -- one call for a 100k prefix."""
         n = len(stems)
         if n == 0:
             return []
-        lo, hi = self._keys(stems)
+        c_stems = (ctypes.c_char_p * n)(*[s.encode("utf-8") for s in stems])
         slots = (ctypes.c_int64 * n)()
         st = (ctypes.c_int8 * n)()
-        self._lib.arena_find_slots(self._base, n, lo, hi, slots, st)
-        return [(int(slots[i]), int(st[i])) for i in range(n)]
+        self._lib.arena_find_stems(self._base, n, c_stems, slots, st)
+        return list(zip(slots, st))
+
+    def find_states(self, stems: Sequence[str]) -> list[int]:
+        """#1439: the states only (0 absent/free, 1 claimed, 2 complete), by stem, hashed in C."""
+        n = len(stems)
+        if n == 0:
+            return []
+        c_stems = (ctypes.c_char_p * n)(*[s.encode("utf-8") for s in stems])
+        slots = (ctypes.c_int64 * n)()
+        st = (ctypes.c_int8 * n)()
+        self._lib.arena_find_stems(self._base, n, c_stems, slots, st)
+        return list(st)
 
     def claim_slots(self, stems: Sequence[str], totals: Sequence[int]) -> list[tuple[int, int, int]]:
         """#1427 direct writes: (slot, status, generation) per stem. status

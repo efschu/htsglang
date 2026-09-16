@@ -2412,33 +2412,6 @@ class HiCacheFile(HiCacheStorage):
                 existing_files.add(filename)
             else:
                 unknown.append(stem)
-        # #1438 (xsn198 D profile): the presence probe of a 100k prompt was a
-        # disk stat per key -- 17 % of D's re-admission. A page that is
-        # COMPLETE in the L2 arena is present; ask the arena first (one C
-        # call per width), the disk only for what it does not hold.
-        if unknown and self._arena_dir():
-            unknown_set = set(unknown)
-            by_arena = {}
-            names = [None] + [t.name for t in (pool_transfers or [])]
-            for key in keys:
-                for name in names:
-                    k = key if name is None else f"{key}.{name}"
-                    stem = self._get_suffixed_key(k)
-                    if stem not in unknown_set:
-                        continue
-                    win = self._canonical_window(k)
-                    if win is None:
-                        continue
-                    arena = self._arena_for(int(win.total_bytes))
-                    if arena is None:
-                        continue
-                    by_arena.setdefault(id(arena), (arena, []))[1].append(stem)
-            for arena, stems in by_arena.values():
-                for st, (slot, state) in zip(stems, arena.find_slots(stems)):
-                    if slot >= 0 and state == 2:
-                        existing_files.add(f"{st}.bin")
-                        unknown_set.discard(st)
-            unknown = [st for st in unknown if st in unknown_set]
         for stem in self._readable_stems(unknown):
             existing_files.add(f"{stem}.bin")
             if self.metadata_cache is not None:
@@ -2684,6 +2657,25 @@ class HiCacheFile(HiCacheStorage):
             out.update({s: int(sz) for s, sz in zip(rest, sizes) if sz >= 0})
         return out
 
+    def _arena_kv_present_prefix(self, keys: List[str]) -> Optional[int]:
+        """#1439: how many LEADING KV pages are COMPLETE in the L2 arena, from
+        one C call; None when no arena / no canonical KV window (the caller
+        keeps the per-key path). The pages beyond the answer may still be on
+        the disk -- the caller checks that remainder the old way."""
+        if not keys or not self._arena_dir() or self._canonical_kv_extents is None:
+            return None
+        arena = self._arena_for(int(self._canonical_kv_extents.total_bytes))
+        if arena is None:
+            return None
+        sfx = self._suffix_for_key(keys[0])[0]
+        stems = [k + sfx for k in keys]
+        n = 0
+        for st in arena.find_states(stems):
+            if st != 2:
+                break
+            n += 1
+        return n
+
     def _readable_stems(self, stems: List[str]) -> List[str]:
         """The subset of ``stems`` a reader can serve (``_stem_readable``'s
         rule: canonical stems only at the canonical width), batched. A
@@ -2822,22 +2814,49 @@ class HiCacheFile(HiCacheStorage):
                     mismatch,
                 )
             return PoolTransferResult(0, {}, keys_asked=len(keys))
-        existing_files = self._collect_existing_component_keys(keys, pool_transfers)
+        # #1439 (xsn199 D profile): the presence probe of a 100k prompt was
+        # 27 % of D's re-admission -- 300k stems formatted, hashed and
+        # looked up one by one in Python. Now: the leading KV prefix that is
+        # COMPLETE in the arena comes from ONE C call (arena_find_stems, the
+        # hash in C too); only what the arena does not hold goes through the
+        # old per-key path, and the component pools are asked lazily for
+        # exactly the pages the trailing rule inspects.
+        kv_fast = self._arena_kv_present_prefix(keys)
+        if kv_fast is not None:
+            rest = keys[kv_fast:]
+            if rest:
+                existing_rest = self._collect_existing_component_keys(rest, None)
+                kv_pages = kv_fast + next(
+                    (i for i in range(len(rest))
+                     if f"{self._get_component_key(rest[i])}.bin" not in existing_rest),
+                    len(rest),
+                )
+            else:
+                kv_pages = kv_fast
+            _memo: dict = {}
 
-        def has_component(page_idx: int, name: str) -> bool:
-            return (
-                f"{self._get_component_key(keys[page_idx], name)}.bin" in existing_files
+            def has_component(page_idx: int, name: str) -> bool:
+                k = self._get_component_key(keys[page_idx], name)
+                v = _memo.get(k)
+                if v is None:
+                    v = bool(self._readable_stems([k]))
+                    _memo[k] = v
+                return v
+        else:
+            existing_files = self._collect_existing_component_keys(keys, pool_transfers)
+
+            def has_component(page_idx: int, name: str) -> bool:
+                return (
+                    f"{self._get_component_key(keys[page_idx], name)}.bin" in existing_files
+                )
+            kv_pages = next(
+                (
+                    i
+                    for i in range(len(keys))
+                    if f"{self._get_component_key(keys[i])}.bin" not in existing_files
+                ),
+                len(keys),
             )
-
-        # Longest contiguous KV prefix present in storage.
-        kv_pages = next(
-            (
-                i
-                for i in range(len(keys))
-                if f"{self._get_component_key(keys[i])}.bin" not in existing_files
-            ),
-            len(keys),
-        )
 
         hit_count: dict[str, int] = {PoolName.KV: kv_pages} if kv_pages else {}
         final_pages = kv_pages

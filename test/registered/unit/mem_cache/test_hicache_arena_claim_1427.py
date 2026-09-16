@@ -74,3 +74,21 @@ def test_a_full_arena_refuses_in_constant_time_and_free_restores_the_counters(ar
     arena.free_slots([s for s, _, _ in got[:4]])
     assert [x for _, x, _ in arena.claim_slots(["a", "b", "c", "d"], [SLOT] * 4)] == [0, 0, 0, 0]
     assert arena.claim_slots(["e"], [SLOT])[0][1] == 4
+
+
+def test_find_by_stem_hashes_in_c_and_agrees_with_the_python_key(arena):
+    """#1439: arena_find_stems computes key128 in C; the answer must equal the
+    Python-hashed path for present and absent stems alike."""
+    from sglang.srt.mem_cache.storage.file.hicache_arena import key128
+    stems = [f"cafe{i:02d}_Qwen.kv" for i in range(6)] + ["nope.mamba"]
+    got = arena.claim_slots(stems[:4], [SLOT] * 4)
+    arena.complete_slots([s for s, _, _ in got], [g for _, _, g in got], [(0, SLOT)])
+    by_stem = arena.find_slots(stems)
+    assert [st for _, st in by_stem] == [2, 2, 2, 2, 0, 0, 0]
+    assert arena.find_states(stems) == [2, 2, 2, 2, 0, 0, 0]
+    # the C key equals the Python key: a slot claimed by stem is found by the Python-hashed lookup too
+    lo, hi = arena._keys(stems[:1])
+    import ctypes
+    slots = (ctypes.c_int64 * 1)(); st = (ctypes.c_int8 * 1)()
+    arena._lib.arena_find_slots(arena._base, 1, lo, hi, slots, st)
+    assert (int(slots[0]), int(st[0])) == (by_stem[0][0], 2)
