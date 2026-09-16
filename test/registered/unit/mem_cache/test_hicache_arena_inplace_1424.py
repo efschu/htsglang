@@ -41,7 +41,8 @@ def test_find_ref_and_in_place_read(tmp_path):
     assert bytes(view[:4]) == b"\x07\x07\x07\x07"
     # a reader reference pins it: the clock cannot evict a referenced slot
     assert a.ref_slots([slot], +1) == 1
-    assert a.ref_slots([found[1][0]], +1) == 0, "a CLAIMED slot takes no reader"
+    assert a.ref_slots([found[1][0]], +1) == 1, "#1427: a CLAIMED slot takes a reader too (the writer's node holds one from the claim on)"
+    assert a.ref_slots([found[1][0]], -1) == 1
     cands = a.evict_candidates(8)
     assert slot not in [c[0] for c in cands]
     assert a.ref_slots([slot], -1) == 1
