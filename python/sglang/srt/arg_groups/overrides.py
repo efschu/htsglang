@@ -1048,13 +1048,11 @@ def _qwen4_exp_overrides(server_args: Any, hf_config: Any) -> dict:
         overrides["attention_backend"] = sm100_default_attn_backend
         overrides["page_size"] = 64 if sm100_default_attn_backend == "trtllm_mha" else 1
 
-    from sglang.srt.layers.attention.qsa.config import (
-        QSA_VARIANT_COMPRESSED,
-        parse_qsa_profile,
-    )
+    from sglang.srt.layers.attention.qsa.config import parse_qsa_profile
 
+    # Since upstream #38960 only the compressed QSA variant exists.
     profile = parse_qsa_profile(hf_config)
-    if profile is not None and profile.variant == QSA_VARIANT_COMPRESSED:
+    if profile is not None:
         overrides["page_size"] = 64
         logger.info(
             "Setting page size to 64 for compressed QSA "

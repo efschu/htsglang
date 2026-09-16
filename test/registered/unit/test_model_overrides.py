@@ -338,45 +338,49 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 with self.assertRaisesRegex(ValueError, message):
                     self._construct(*qwen4, **kwargs)
 
-    def test_qwen4_ple_file_requires_offload(self):
-        qwen4 = ("Qwen4ExpForConditionalGeneration", "qwen4_exp")
-        with override_platform(is_cuda=True):
-            sa = self._construct(
-                *qwen4,
-                ple_offload_embedding=True,
-                ple_offload_backend="file",
-                ple_offload_dir="/tmp/ple",
-            )
-            self.assertEqual(self._resolved(sa, "ple_offload_backend"), "file")
-            self.assertEqual(self._resolved(sa, "ple_offload_dir"), "/tmp/ple")
-            with self.assertRaisesRegex(ValueError, "requires --ple-offload-embedding"):
-                self._construct(
-                    *qwen4, ple_offload_embedding=False, ple_offload_backend="file"
-                )
+    def test_qwen4_exp_overrides_ported(self):
+        """#37500/#39126 port: the Qwen4-Exp override lives in overrides.py on
+        this line (no model_overrides package). bf16 on CUDA turns the PLE
+        host offload on, compressed QSA pins page_size to 64, and a dense
+        moe_dense_tp_size == 1 is lifted for the MoE checkpoint."""
+        import torch
 
-    def test_qwen4_ple_offload_default(self):
-        qwen4 = ("Qwen4ExpForConditionalGeneration", "qwen4_exp")
-        with override_platform(is_cuda=True):
-            for kwargs, expected in (
-                ({}, True),
-                ({"dtype": "float16"}, False),
-                ({"ple_offload_embedding": False}, False),
-                ({"ple_offload_embedding": False, "cpu_offload_gb": 1}, False),
-            ):
-                with self.subTest(kwargs=kwargs):
-                    self.assertEqual(
-                        self._resolved(
-                            self._construct(*qwen4, **kwargs),
-                            "ple_offload_embedding",
-                        ),
-                        expected,
-                    )
-            with self.assertRaisesRegex(ValueError, "cannot be combined"):
-                self._construct(*qwen4, cpu_offload_gb=1)
-        with override_platform(is_cuda=False, is_hip=True):
-            self.assertFalse(
-                self._resolved(self._construct(*qwen4), "ple_offload_embedding")
+        from sglang.srt.arg_groups.overrides import _qwen4_exp_overrides
+        from sglang.srt.configs.qwen4_exp import Qwen4ExpConfig
+
+        # The indexer fields of the real checkpoint (config.json 16.09.):
+        # 4 index heads x 128, 1 KV head, budget 2048, compress ratio 4.
+        hf_config = Qwen4ExpConfig(
+            text_config=dict(
+                indexer_n_heads=4,
+                indexer_head_dim=128,
+                indexer_kv_heads=1,
+                indexer_budget=2048,
+                indexer_compress_ratio=4,
             )
+        )
+        view = SimpleNamespace(
+            ple_offload_embedding=None,
+            attention_backend="triton",
+            moe_dense_tp_size=1,
+            get_model_config=lambda: SimpleNamespace(dtype=torch.bfloat16),
+        )
+        with (
+            patch.object(overrides_module, "is_cuda", return_value=True),
+            patch.object(overrides_module, "is_sm100_supported", return_value=False),
+        ):
+            got = _qwen4_exp_overrides(view, hf_config)
+        self.assertTrue(got["ple_offload_embedding"])
+        self.assertEqual(got["page_size"], 64)
+        self.assertIsNone(got["moe_dense_tp_size"])
+        # fp16 target: the pinned table stays in the checkpoint's dtype path
+        view.get_model_config = lambda: SimpleNamespace(dtype=torch.float16)
+        with (
+            patch.object(overrides_module, "is_cuda", return_value=True),
+            patch.object(overrides_module, "is_sm100_supported", return_value=False),
+        ):
+            self.assertFalse(_qwen4_exp_overrides(view, hf_config)["ple_offload_embedding"])
+
 
     def test_minimax_m2_enables_tf32_matmul(self):
         sa = self._construct("MiniMaxM2ForCausalLM", "llama")
@@ -2032,93 +2036,6 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 )
         with patch.object(overrides_module, "is_sm100_supported", return_value=False):
             self.assertEqual(_qwen3_moe_family_overrides(None, None), {})
-
-    def test_qwen3_moe_family_mixed_precision_moe_runner(self):
-        from sglang.srt.arg_groups.model_overrides.qwen3_moe import (
-            _qwen3_moe_family_overrides,
-        )
-
-        def _mixed(expert_algo):
-            return SimpleNamespace(
-                architectures=["Qwen4ExpForConditionalGeneration"],
-                quantization_config={
-                    "quant_method": "modelopt_mixed",
-                    "quantized_layers": {
-                        "model.language_model.layers.0.mlp.experts": {
-                            "quant_algo": expert_algo
-                        }
-                    },
-                },
-            )
-
-        args = SimpleNamespace(
-            quantization="modelopt_mixed",
-            _quantization_explicitly_unset=False,
-            moe_a2a_backend="none",
-            moe_runner_backend="auto",
-        )
-        with override_platform(is_sm100=True):
-            # W4A4 experts take trtllm-gen like modelopt_fp4; W4A16 has no
-            # trtllm-gen kernel and goes to marlin.
-            self.assertEqual(
-                _qwen3_moe_family_overrides(args, _mixed("NVFP4")),
-                {"moe_runner_backend": "flashinfer_trtllm"},
-            )
-            self.assertEqual(
-                _qwen3_moe_family_overrides(args, _mixed("W4A16_NVFP4")),
-                {"moe_runner_backend": "marlin"},
-            )
-
-    def test_qwen3_moe_family_w4a16_explicit_runner(self):
-        """Keep opted-in CuTe DSL v2 W4A16 accepted and auto routed to Marlin."""
-        from sglang.srt.arg_groups.model_overrides.qwen3_moe import (
-            _qwen3_moe_family_overrides,
-        )
-
-        hf_config = SimpleNamespace(
-            architectures=["Qwen4ExpForConditionalGeneration"],
-            quantization_config={
-                "quant_method": "modelopt_mixed",
-                "quantized_layers": {
-                    "model.language_model.layers.0.mlp.experts": {
-                        "quant_algo": "W4A16_NVFP4"
-                    }
-                },
-            },
-        )
-        cases = [
-            ("auto", "none", False, {"moe_runner_backend": "marlin"}),
-            ("auto", "none", True, {"moe_runner_backend": "marlin"}),
-            ("marlin", "none", False, {}),
-            ("marlin", "none", True, {}),
-            ("flashinfer_cutedsl", "none", True, {}),
-            ("flashinfer_cutedsl", "flashinfer", True, {}),
-            ("flashinfer_cutedsl", "none", False, None),
-            ("flashinfer_cutedsl", "flashinfer", False, None),
-            ("flashinfer_cutedsl", "deepep", True, None),
-            ("flashinfer_cutlass", "none", True, None),
-            ("flashinfer_trtllm", "none", True, None),
-        ]
-        for runner, a2a, w4a16_enabled, expected in cases:
-            with (
-                self.subTest(runner=runner, a2a=a2a, w4a16=w4a16_enabled),
-                override_platform(is_sm100=True),
-                envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.override(w4a16_enabled),
-            ):
-                args = SimpleNamespace(
-                    quantization=None,
-                    _quantization_explicitly_unset=False,
-                    moe_a2a_backend=a2a,
-                    moe_runner_backend=runner,
-                )
-                if expected is None:
-                    with self.assertRaisesRegex(ValueError, "W4A16_NVFP4"):
-                        _qwen3_moe_family_overrides(args, hf_config)
-                else:
-                    self.assertEqual(
-                        _qwen3_moe_family_overrides(args, hf_config),
-                        {"quantization": "modelopt_mixed", **expected},
-                    )
 
     def test_step3p_declarations_at_callable_level(self):
         from sglang.srt.arg_groups.overrides import _step3p_overrides

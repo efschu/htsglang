@@ -4492,20 +4492,13 @@ class ModelRunnerKVCacheMixin:
 
                 # #37500 port: Qwen4-Exp compressed QSA carries its index-K
                 # and compressed K/V beside the full KV of the same slots.
-                from sglang.srt.layers.attention.qsa.config import (
-                    QSA_VARIANT_COMPRESSED,
-                    parse_qsa_profile,
-                )
+                from sglang.srt.layers.attention.qsa.config import parse_qsa_profile
 
+                # Since upstream #38960 only the compressed QSA variant exists.
                 _qsa_profile = parse_qsa_profile(self.model_config.hf_config)
                 if _qsa_profile is None:
                     _kv_pool_class = HybridLinearKVPool
                     extra_args["use_mla"] = self.use_mla_backend
-                elif _qsa_profile.variant != QSA_VARIANT_COMPRESSED:
-                    raise ValueError(
-                        f"QSA variant {_qsa_profile.variant!r} is not carried on "
-                        "this line (only the compressed variant is)."
-                    )
                 else:
                     from sglang.srt.mem_cache.qsa_kv_pool import QSATokenToKVPool
 
