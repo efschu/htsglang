@@ -3565,10 +3565,12 @@ class HiCacheController:
         # and never collide across drafters either (#861).
         component = self._draft_component_name()
         draft_keys = [f"{h}.{component}" for h in hash_values]
-        draft_data = [
-            self.mem_pool_host_draft.get_data_page(host_indices[i * self.page_size])
-            for i in range(len(draft_keys))
-        ]
+        starts = [int(host_indices[i * self.page_size]) for i in range(len(draft_keys))]
+        batched = getattr(self.mem_pool_host_draft, "get_data_pages", None)
+        if batched is not None:  # #1402: one gather per batch
+            draft_data = batched(starts)
+        else:
+            draft_data = [self.mem_pool_host_draft.get_data_page(s) for s in starts]
         return bool(self.storage_backend.batch_set(draft_keys, draft_data))
 
     def _draft_page_get_generic(self, hash_values, host_indices) -> list:

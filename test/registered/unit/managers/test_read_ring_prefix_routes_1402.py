@@ -227,3 +227,25 @@ def test_batched_host_read_equals_the_per_page_loop():
                 assert y.is_contiguous()
             single = a.get_data_pages([6])
             assert torch.equal(single[0], loop[1])
+
+
+def test_draft_set_route_gathers_once_per_batch():
+    calls = []
+
+    class _Pool(_HostPool):
+        def get_data_pages(self, starts):
+            calls.append(list(starts))
+            return [torch.full((PAGE,), 3, dtype=torch.uint8) for _ in starts]
+
+    class _BE(_Backend):
+        def batch_set(self, keys, values):
+            self.seen = (list(keys), [int(v[0]) for v in values])
+            return True
+
+    be = _BE()
+    c = _Ctl(be)
+    c.mem_pool_host_draft = _Pool()
+    c._draft_page_set_generic = HiCacheController._draft_page_set_generic.__get__(c)
+    assert c._draft_page_set_generic(["p0", "p1"], _idx(2)) is True
+    assert calls == [[0, 1]]
+    assert be.seen == (["p0.draft-abc", "p1.draft-abc"], [3, 3])
