@@ -1877,7 +1877,9 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
         if not self.pp_group.is_last_rank:
             # Hand the hyper-connection stream to the next stage. The residual
             # is None between Qwen4-Exp layers, so it is not part of the proxy.
-            return PPProxyTensors({"hidden_states": hidden_states})
+            # Flat [tokens, hc_count * hidden]: the runner sizes the proxy
+            # buffer by hc_hidden_size (mHC form, as DeepSeek-V4 does).
+            return PPProxyTensors({"hidden_states": hidden_states.flatten(1)})
 
         hc_hidden_states = hidden_states
         hidden_states, _ = self.hyper_connection_mixer.mix(hidden_states)
