@@ -2082,6 +2082,27 @@ class HiCacheFile(HiCacheStorage):
         if not plan:
             return results
         touch = bool(getattr(self._evictor, "_eviction_enabled", True))
+        # The shared arena first: a page another rank completed there is
+        # served from RAM, no file I/O and no per-process staging.
+        if self._arena_dir():
+            still = []
+            for entry in plan:
+                i, key, suffixed, path, window, target = entry
+                arena = self._arena_for(int(window.total_bytes))
+                if arena is None:
+                    still.append(entry)
+                    continue
+                st = arena.read([suffixed], [int(window.total_bytes)], [tuple(window.extents)],
+                                [int(target.data_ptr())])[0]
+                if st == 0:
+                    if self.metadata_cache is not None:
+                        self.metadata_cache.add(suffixed)
+                    results[i] = target
+                else:
+                    still.append(entry)
+            plan = still
+            if not plan:
+                return results
         statuses = pio.read_pages(
             [p[3] for p in plan],
             [int(p[4].total_bytes) for p in plan],
@@ -2089,6 +2110,17 @@ class HiCacheFile(HiCacheStorage):
             [int(p[5].data_ptr()) for p in plan],
             touch,
         )
+        if self._arena_dir():
+            # a disk hit is promoted into the arena so the next rank reads RAM
+            for (i, key, suffixed, path, window, target), status in zip(plan, statuses):
+                if status != 0:
+                    continue
+                arena = self._arena_for(int(window.total_bytes))
+                if arena is None:
+                    continue
+                if arena.write([suffixed], [int(window.total_bytes)], [tuple(window.extents)],
+                               [int(target.data_ptr())])[0] == 4:
+                    self._arena_evict_to_disk(arena, 256)
         for (i, key, suffixed, path, window, target), status in zip(plan, statuses):
             if status == 0:
                 self._evictor.touch(suffixed, path, mtime=False)
@@ -2226,6 +2258,47 @@ class HiCacheFile(HiCacheStorage):
             plan.append((i, key, suffixed, window, flat))
         if not plan:
             return results
+        if self._arena_dir():
+            # ONE HiCache: the extents land in the shared arena; the disk
+            # store only sees what the arena evicts. Refused extents
+            # (granule alignment, no arena for the width) take the disk path.
+            rest = []
+            by_arena: dict = {}
+            for entry in plan:
+                i, key, suffixed, window, flat = entry
+                arena = self._arena_for(int(window.total_bytes))
+                if arena is None:
+                    rest.append(entry)
+                    continue
+                by_arena.setdefault(id(arena), (arena, []))[1].append(entry)
+            for arena, entries in by_arena.values():
+                for attempt in range(2):
+                    sts = arena.write(
+                        [e[2] for e in entries], [int(e[3].total_bytes) for e in entries],
+                        [tuple(e[3].extents) for e in entries], [int(e[4].data_ptr()) for e in entries],
+                    )
+                    stems = getattr(arena, "_stems", None)
+                    if stems is None:
+                        stems = arena._stems = {}
+                    from sglang.srt.mem_cache.storage.file.hicache_arena import key128
+                    again = []
+                    for entry, st in zip(entries, sts):
+                        i, key, suffixed, window, flat = entry
+                        if st in (0, 1, 2):
+                            stems[key128(suffixed)] = suffixed
+                            if st in (1, 2) and self.metadata_cache is not None:
+                                self.metadata_cache.add(suffixed)
+                        elif st == 4 and attempt == 0:
+                            again.append(entry)
+                        else:
+                            rest.append(entry)
+                    if not again:
+                        break
+                    self._arena_evict_to_disk(arena, max(256, len(again)))
+                    entries = again
+            plan = rest
+            if not plan:
+                return results
         # Presence for the whole batch in one call: a complete blob is
         # content-addressed and only gets its recency refreshed.
         present = self._stat_stems([p[2] for p in plan])
@@ -2314,6 +2387,114 @@ class HiCacheFile(HiCacheStorage):
                 self.metadata_cache.add(stem)
         return existing_files
 
+    # -- the shared-memory arena (BAUPLAN_SHM_ARENA_0916) -----------------
+    def _arena_dir(self) -> str:
+        return os.environ.get("SGLANG_HICACHE_ARENA_DIR", "").strip()
+
+    def _arena_for(self, total_bytes: int):
+        """The shared arena for pages of this canonical width, or None.
+
+        One arena file per width under SGLANG_HICACHE_ARENA_DIR, sized by
+        SGLANG_HICACHE_ARENA_GIB (KV pages; the draft arena gets the same
+        slot COUNT, the mamba arena SGLANG_HICACHE_ARENA_MAMBA_SLOTS). Opened
+        lazily by every rank of both groups on the same path -- that is the
+        ONE HiCache: whoever completes a page, every rank can read it.
+        """
+        d = self._arena_dir()
+        if not d:
+            return None
+        arenas = getattr(self, "_arenas", None)
+        if arenas is None:
+            arenas = self._arenas = {}
+        if total_bytes in arenas:
+            return arenas[total_bytes]
+        try:
+            from sglang.srt.mem_cache.storage.file.hicache_arena import ShmArena
+
+            kv_total = (
+                int(self._canonical_kv_extents.total_bytes)
+                if self._canonical_kv_extents is not None else 32768
+            )
+            gib = float(os.environ.get("SGLANG_HICACHE_ARENA_GIB", "8"))
+            kv_slots = max(1024, int(gib * (1 << 30)) // max(1, kv_total))
+            blob = self.canonical_mamba_blob
+            if blob is not None and int(total_bytes) == int(blob.total_bytes):
+                slots = int(os.environ.get("SGLANG_HICACHE_ARENA_MAMBA_SLOTS", "48"))
+            else:
+                slots = kv_slots
+            os.makedirs(d, exist_ok=True)
+            arena = ShmArena(os.path.join(d, f"arena-{int(total_bytes)}.bin"), int(total_bytes), slots)
+            logger.info(
+                "[arena] %s: %d slots x %d bytes = %.2f GiB (%s)",
+                arena.path, slots, int(total_bytes), arena.file_bytes / (1 << 30),
+                "fresh" if arena.fresh else "attached",
+            )
+        except Exception as e:  # noqa: BLE001 - the arena is a hot tier, not a requirement
+            logger.warning("[arena] unavailable for width %d (%s: %s); disk only",
+                           int(total_bytes), type(e).__name__, str(e)[:160])
+            arena = None
+        arenas[total_bytes] = arena
+        return arena
+
+    def _arena_evict_to_disk(self, arena, want: int) -> int:
+        """Move up to `want` complete, unreferenced, unpinned pages from the
+        arena to the disk store (the cold tier), then free their slots."""
+        from sglang.srt.mem_cache.storage.file.pageio import load as _load_pageio
+        from sglang.srt.mem_cache.canonical_page_store import canonical_fsync_default
+
+        pins = getattr(self, "pins", None)
+        keep = []
+        if pins is not None:
+            try:
+                keep = list(getattr(pins, "pinned_stems", lambda: [])())
+            except Exception:  # noqa: BLE001
+                keep = []
+        cands = arena.evict_candidates(want, keep_stems=keep)
+        if not cands:
+            return 0
+        pio = _load_pageio()
+        stems = getattr(arena, "_stems", {})
+        moved = 0
+        todo = []
+        for slot, lo, hi, total in cands:
+            stem = stems.get((lo, hi))
+            if stem is None or stem in self._stat_stems([stem]):
+                # unknown to this process (another rank wrote it and knows
+                # its stem) or already on disk: nothing to write, just free
+                continue
+            path = self._sharded_path(stem)
+            if not self._evictor.reserve(
+                stem, int(total), key=stem,
+                owner_writes_whole_file=owner_write_covers_whole_file(
+                    is_mla_model=self._key_geom["is_mla_model"],
+                    canonical_extent_write=True,
+                ),
+            ):
+                continue
+            self._ensure_shard_dir(path)
+            todo.append((stem, slot, total, path))
+        if todo and pio is not None:
+            statuses = pio.write_pages(
+                [t[3] for t in todo], [int(t[2]) for t in todo],
+                [((0, int(t[2])),) for t in todo],
+                [int(arena._lib.arena_slot_ptr(arena._base, int(t[1]))) for t in todo],
+                canonical_fsync_default(),
+            )
+            for (stem, slot, total, path), st in zip(todo, statuses):
+                if st in (0, 1, 2):
+                    self._evictor.commit(stem)
+                    moved += 1
+                else:
+                    self._evictor.abort(stem)
+        elif todo:
+            for stem, slot, total, path in todo:
+                self._evictor.abort(stem)
+        arena.free_slots([c[0] for c in cands])
+        arena.reap_stale()
+        for c in cands:
+            stems.pop((c[1], c[2]), None)
+        return moved
+
     def _stat_stems(self, stems: List[str]) -> dict:
         """``{stem: size}`` for the stems that are on disk; one C call when
         the #1402 helper is available, else ``_stat_stem`` each."""
@@ -2339,10 +2520,26 @@ class HiCacheFile(HiCacheStorage):
 
     def _readable_stems(self, stems: List[str]) -> List[str]:
         """The subset of ``stems`` a reader can serve (``_stem_readable``'s
-        rule: canonical stems only at the canonical width), batched."""
-        sizes = self._stat_stems(stems)
-        out = []
-        for stem in stems:
+        rule: canonical stems only at the canonical width), batched. A
+        complete page in the shared arena counts before the disk is asked."""
+        in_arena = set()
+        if self._arena_dir() and stems:
+            by_total: dict = {}
+            for stem in stems:
+                total = self._canonical_total_for_stem(stem)
+                if total is not None:
+                    by_total.setdefault(int(total), []).append(stem)
+            for total, group in by_total.items():
+                arena = self._arena_for(total)
+                if arena is None:
+                    continue
+                for stem, hit in zip(group, arena.lookup(group)):
+                    if hit:
+                        in_arena.add(stem)
+        rest = [s for s in stems if s not in in_arena]
+        sizes = self._stat_stems(rest) if rest else {}
+        out = [s for s in stems if s in in_arena]
+        for stem in rest:
             size = sizes.get(stem)
             if size is None:
                 continue

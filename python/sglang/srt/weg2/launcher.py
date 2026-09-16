@@ -4739,6 +4739,14 @@ def build_env(tree: str, venv: str, cvd: str, store_dir: str, debug_hold: bool, 
     # syscall (see run_scheduler_process); 0.2 ms measured 1.07 ms/page vs
     # 20.6 ms/page at Python's 5 ms default beside a busy main thread.
     env.setdefault("SGLANG_GIL_SWITCH_INTERVAL_MS", "0.2")
+    # BAUPLAN_SHM_ARENA_0916: ONE HiCache for all six ranks -- the shared
+    # page arena under /dev/shm, one directory per boot tag, opened by every
+    # rank of both groups. The disk store stays the cold tier behind it.
+    # SGLANG_HICACHE_ARENA_DIR="" in the operator's environment disables it.
+    if "SGLANG_HICACHE_ARENA_DIR" not in env:
+        env["SGLANG_HICACHE_ARENA_DIR"] = f"/dev/shm/weg2-arena-{tag}"
+    env.setdefault("SGLANG_HICACHE_ARENA_GIB", "8")
+    env.setdefault("SGLANG_HICACHE_ARENA_MAMBA_SLOTS", "48")
     if arming_floor_solved:
         env["SGLANG_ARMING_FLOOR_SOLVED"] = "1"
     else:
