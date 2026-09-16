@@ -366,16 +366,18 @@ def marlin_moe_permute_scales(
     size_n: int,
     group_size: int,
 ):
+    # Batched over experts (16.09.2026, Flash-Next load profile): the
+    # permutation is a column permutation applied row by row, so the [E, k, n]
+    # stack is one [E*k, n] matrix to it. The per-expert loop was 313 calls
+    # per tensor per layer on the 5090 rank. Row-identical to the loop.
     num_experts = s.shape[0]
-    output = torch.empty(
-        (num_experts, s.shape[1], s.shape[2]),
-        device=s.device,
-        dtype=s.dtype,
-    )
-
-    for e in range(num_experts):
-        output[e] = marlin_permute_scales(s[e], size_k, size_n, group_size)
-    return output
+    if num_experts == 0:
+        return torch.empty_like(s)
+    flat = s.reshape(num_experts * s.shape[1], s.shape[2])
+    # `group_size < size_k` selects the grouped permutation exactly as the
+    # per-expert call would (size_k is the per-expert extent).
+    out = marlin_permute_scales(flat, size_k, size_n, group_size)
+    return out.reshape(num_experts, s.shape[1], s.shape[2]).contiguous()
 
 
 def marlin_zero_points(
@@ -428,15 +430,18 @@ def awq_to_marlin_zero_points(
 def moe_awq_to_marlin_zero_points(
     q_zp_packed: torch.Tensor, size_k: int, size_n: int, num_bits: int
 ):
+    # Batched over experts (16.09.2026, Flash-Next load profile): unpack,
+    # de-interleave, marlin permute and repack are all row-wise, so the
+    # [E, k, n/pf] stack is handed through as one [E*k, n/pf] matrix with
+    # size_k = E*k. py-spy on the 5090 rank showed the per-expert numpy loop
+    # (unpack_cols) in 3 of 10 load samples. Row-identical to the loop.
     num_experts = q_zp_packed.shape[0]
-    output = torch.empty(
-        (num_experts, q_zp_packed.shape[1], q_zp_packed.shape[2]),
-        device=q_zp_packed.device,
-        dtype=q_zp_packed.dtype,
-    )
-    for e in range(num_experts):
-        output[e] = awq_to_marlin_zero_points(q_zp_packed[e], size_k, size_n, num_bits)
-    return output
+    if num_experts == 0:
+        return torch.empty_like(q_zp_packed)
+    k = q_zp_packed.shape[1]
+    flat = q_zp_packed.reshape(num_experts * k, q_zp_packed.shape[2])
+    out = awq_to_marlin_zero_points(flat, num_experts * size_k, size_n, num_bits)
+    return out.reshape(num_experts, k, q_zp_packed.shape[2]).contiguous()
 
 
 def maybe_warn_marlin_atomic_add(device, dtype):
