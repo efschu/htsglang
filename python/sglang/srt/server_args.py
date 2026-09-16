@@ -8867,22 +8867,10 @@ class ServerArgs:
                 "ring-row mapping is indexed per TOKEN by the compacted "
                 "physical slot the weighted DCP owner rule produces."
             )
-        if not self.disable_cuda_graph:
-            raise ValueError(
-                "W58 Weg2KvTailFormRefused: the precision tail needs "
-                "--disable-cuda-graph on this tree. The tail's second decode "
-                "attention call runs from a PLAIN eager flashinfer wrapper "
-                "(no use_cuda_graph, no frozen paged_kv_indptr/indices "
-                "buffers) that is re-planned per step against freshly "
-                "allocated tensors, so a captured replay would run it against "
-                "the capture-time plan. Basis 2.9 -- the tail boundary as a "
-                "TENSOR input to the captured graph, no recapture on growth "
-                "or shrink -- is DEFERRED TO SLICE 2 and refused here by "
-                "name, because an unproven capture is the one failure this "
-                "feature cannot be allowed to have silently: it reads a "
-                "stale plan and returns a plausible wrong answer. The "
-                "weg2kvtail1 quality probe already ran this exact form."
-            )
+        # #1426 slice 2: CUDA graphs are supported -- the tail wrappers of a
+        # captured decode/verify are graph-mode wrappers (use_cuda_graph,
+        # frozen buffers sized to the ring) re-planned out of graph per step;
+        # the tail boundary is a tensor input (basis 2.9). No refusal here.
         if self.speculative_algorithm is not None:
             raise ValueError(
                 "W58 Weg2KvTailFormRefused: the precision tail cannot be "
