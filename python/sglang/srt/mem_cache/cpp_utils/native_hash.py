@@ -1,9 +1,18 @@
+import importlib.util
+import logging
 import os
 import platform
+import shutil
 import sys
+import tempfile
+import threading
 from array import array
-from functools import lru_cache
 from typing import Any, Optional
+
+logger = logging.getLogger(__name__)
+
+_MODULE_LOCK = threading.Lock()
+_MODULE: Any = None
 
 
 def _cpu_supports_avx2() -> bool:
@@ -16,8 +25,67 @@ def _cpu_supports_avx2() -> bool:
         return False
 
 
-@lru_cache(maxsize=1)
 def _load_native_hash_module() -> Any:
+    """The native hash module, loaded ONCE per process and VERIFIED.
+
+    #1409 (boot xsn156, 2026-09-16): on two of three D ranks the first call
+    returned a module object WITHOUT ``get_hash`` (the .so on disk was
+    complete and carried it; the third rank and every P rank loaded it fine
+    in the same minute). The prefetch thread died on the AttributeError, the
+    request behind it waited 174 s into a 503, and the group could not stop
+    its storage threads at the next flip. Two things changed here: the load
+    is serialised (an ``lru_cache`` let two threads -- the wake-time store
+    rescan and the prefetch thread -- run torch's ``load()`` concurrently on
+    the same extension name), and the result is checked; a module without the
+    binding is imported again from a private copy of the artifact, which
+    bypasses CPython's per-process (name, path) extension cache, and a second
+    miss raises instead of handing back a dead module.
+    """
+    global _MODULE
+    m = _MODULE
+    if m is not None:
+        return m
+    with _MODULE_LOCK:
+        if _MODULE is not None:
+            return _MODULE
+        m = _load_via_torch()
+        if not hasattr(m, "get_hash"):
+            m = _reload_from_copy(m)
+        _MODULE = m
+        return m
+
+
+def _reload_from_copy(module: Any) -> Any:
+    path = getattr(module, "__file__", None)
+    if not path or not os.path.exists(path):
+        raise RuntimeError(
+            f"#1409 native hash module {module!r} has no get_hash and no "
+            f"artifact path to reload from"
+        )
+    name = os.path.splitext(os.path.basename(path))[0]
+    private = tempfile.mkdtemp(prefix=f"sglang_{name}_{os.getpid()}_")
+    copy = os.path.join(private, os.path.basename(path))
+    shutil.copy2(path, copy)
+    spec = importlib.util.spec_from_file_location(name, copy)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"#1409 cannot build an import spec for {copy}")
+    fresh = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(fresh)
+    if not hasattr(fresh, "get_hash"):
+        raise RuntimeError(
+            f"#1409 native hash artifact {path} has no get_hash even after a "
+            f"fresh import from {copy}; the build is not this tree's"
+        )
+    logger.warning(
+        "#1409 NATIVE-HASH first import of %s returned a module without "
+        "get_hash; reloaded from a private copy %s",
+        path,
+        copy,
+    )
+    return fresh
+
+
+def _load_via_torch() -> Any:
     if sys.byteorder != "little" or not sys.platform.startswith("linux"):
         raise RuntimeError(
             "HiCache native hash is only supported on little-endian Linux"
