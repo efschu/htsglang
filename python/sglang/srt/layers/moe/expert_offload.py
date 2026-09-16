@@ -2601,6 +2601,17 @@ class MoEExpertOffloadCache:
         # absent for a given quant method are skipped by the shape check below.
         "w13_qzeros",
         "w2_qzeros",
+        # compressed-tensors WNA16 Marlin path (WP2, Qwen3.8-Flash-Next AWQ/GPTQ
+        # INT4 as llm-compressor writes it): the same post-repack marlin tensors
+        # under compressed-tensors' names. Scales reuse "w13_weight_scale" /
+        # "w2_weight_scale" above; the zero points exist only for asymmetric
+        # checkpoints and are read per expert by the marlin apply. The NVFP4
+        # schemes that also name "w13_weight_packed" stay refused by class name
+        # (_OFFLOAD_UNSUPPORTED_QUANT_METHOD_NAMES) before any staging.
+        "w13_weight_packed",
+        "w2_weight_packed",
+        "w13_weight_zero_point",
+        "w2_weight_zero_point",
     )
 
     def __init__(self, layer, fraction: float):
