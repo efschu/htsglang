@@ -11000,17 +11000,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         )
     state.dc_expect_d = dc_expect_d
     _xchg_form = ns.weg2_weight_source == WEIGHT_SOURCE_EXCHANGE
-    log(("dormant residue RESERVE for group D = MEASURED D_c(D) of boot "
-         + (f"weg2xsn14 ({'/'.join(str(v) for v in DC_MEASURED_D_XCHG_MIB)} MiB, "
-            "the EXCHANGE form's own residue at epoch 0; its whole excess over "
-            "the serving form is the RESIDENT weights_draft tag -- see "
-            "DC_MEASURED_D_XCHG_MIB)"
-            if _xchg_form else
-            "weg2ls1b2 (2228 / 1922 / 1922 MiB, NVML per-process, windows included)"))
-        + f" + {slack_mib} MiB slack; spec 1.6 expectation was "
-        f"{DC_EXPECT_5090_MIB}/{DC_EXPECT_3080_MIB} (exceeded); "
-        f"form={ns.weg2_weight_source}; graded by W19 at D's first sleep: "
-        + ", ".join(f"nvml{c.nvml_index}={dc_expect_d[c.uuid]}" for c in cards))
+    if _dc_from_record is None:  # #1444: the constant's provenance only when it was priced
+        log(("dormant residue RESERVE for group D = MEASURED D_c(D) of boot "
+             + (f"weg2xsn14 ({'/'.join(str(v) for v in DC_MEASURED_D_XCHG_MIB)} MiB, "
+                "the EXCHANGE form's own residue at epoch 0; its whole excess over "
+                "the serving form is the RESIDENT weights_draft tag -- see "
+                "DC_MEASURED_D_XCHG_MIB)"
+                if _xchg_form else
+                "weg2ls1b2 (2228 / 1922 / 1922 MiB, NVML per-process, windows included)"))
+            + f" + {slack_mib} MiB slack; spec 1.6 expectation was "
+            f"{DC_EXPECT_5090_MIB}/{DC_EXPECT_3080_MIB} (exceeded); "
+            f"form={ns.weg2_weight_source}; graded by W19 at D's first sleep: "
+            + ", ".join(f"nvml{c.nvml_index}={dc_expect_d[c.uuid]}" for c in cards))
     if _xchg_form:
         # B4i: THE LINE, ON EVERY LAUNCH OF THIS FORM, DRY-RUN INCLUDED.
         #
