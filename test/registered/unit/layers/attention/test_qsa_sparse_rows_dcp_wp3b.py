@@ -162,3 +162,25 @@ def test_backend_is_a_valid_owner_bounds_consumer(monkeypatch):
     assert (b.cp_S, b.cp_lo, b.cp_hi, b.cp_ratio) == (8, 6, 8, 2)
     plain = _backend()
     plain.refresh_dcp_owner_bounds()  # no-op off the weighted lane
+
+
+def test_init_dcp_runs_end_to_end_the_way_the_server_builds_it(monkeypatch):
+    """The whole _init_dcp path with a fake parallel state (DCP 3, weighted,
+    replicated kv), including the owner-bounds registry -- the site fn1v
+    (2026-09-16) died at."""
+    import sglang.srt.runtime_context as rc
+    from sglang.srt.layers.attention import qwen_sparse_attn_backend as qb
+    from sglang.srt.layers.dcp import owner
+
+    monkeypatch.setattr(rc, "get_parallel", lambda: SimpleNamespace(attn_dcp_size=3, attn_dcp_rank=1, attn_tp_size=3))
+    monkeypatch.setattr("sglang.srt.distributed.utils.uneven_dcp_kv_replicated", lambda n: True)
+    monkeypatch.setattr("sglang.srt.distributed.utils.uneven_dcp_active", lambda n: True)
+    monkeypatch.setattr("sglang.srt.distributed.utils.attn_kv_replicated", lambda tp, kv: True)
+    monkeypatch.setattr(owner, "dcp_weighted_owner_bounds", lambda size, rank: (64, 39, 52, 13))
+    cfg = SimpleNamespace(get_total_num_kv_heads=lambda: 2, hf_text_config=None, hf_config=None, context_len=32768)
+    b = qb.QwenSparseAttnBackend(runner=SimpleNamespace(model_config=cfg, is_draft_worker=False))
+    assert (b.dcp_size, b.dcp_rank, b.uneven_dcp_weighted) == (3, 1, True)
+    assert (b.cp_S, b.cp_lo, b.cp_hi, b.cp_ratio) == (64, 39, 52, 13)
+    # the draft worker's backend keeps DCP off (its pool holds the full context)
+    d = qb.QwenSparseAttnBackend(runner=SimpleNamespace(model_config=cfg, is_draft_worker=True))
+    assert d.dcp_size == 1
