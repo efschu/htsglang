@@ -27,8 +27,9 @@
 #define S_CLAIMED 1u
 #define S_COMPLETE 2u
 #define S_EVICTING 3u
-#define GRANULE 256
 #define TOMB (~0ULL)
+#define KV_IVALS 64      /* interval capacity for slots <= 1 MiB */
+#define BLOB_IVALS 8192  /* interval capacity for larger slots (mamba blobs) */
 
 typedef struct {
     uint64_t magic;
@@ -46,6 +47,8 @@ typedef struct {
     uint8_t pad[64 - 8 * 11 % 64];
 } ArenaHeader;
 
+typedef struct { uint64_t lo, hi; } Ival;
+
 typedef struct {
     _Atomic uint32_t state;
     _Atomic uint32_t refcount;
@@ -54,10 +57,11 @@ typedef struct {
     uint64_t key_lo;
     uint64_t key_hi;
     uint64_t total_bytes;
-    _Atomic uint64_t bits_set; /* granules covered so far */
-    uint64_t n_words;
+    _Atomic uint32_t lock;     /* spinlock over the interval list */
+    uint32_t n_ivals;          /* merged intervals in use */
+    uint64_t cap_ivals;        /* capacity of ivals[] */
     uint8_t pad[8];
-    _Atomic uint64_t bitmap[]; /* n_words words */
+    Ival ivals[];              /* cap_ivals entries, sorted, disjoint */
 } SlotHeader;
 
 static inline ArenaHeader *hdr(uint8_t *base) { return (ArenaHeader *)base; }
@@ -77,10 +81,13 @@ static inline uint8_t *slot_data(uint8_t *base, uint64_t s) {
 /* Size the file for `slots` slots of `slot_bytes`; returns the total bytes and
  * fills the offsets into out[0..5] = header_bytes, index_off, index_slot_off,
  * headers_off, data_off, index_cap. */
+static uint64_t ival_cap_for(int64_t slot_bytes) {
+    return slot_bytes > (1 << 20) ? BLOB_IVALS : KV_IVALS;
+}
+
 int64_t arena_layout(int64_t slots, int64_t slot_bytes, int64_t *out) {
-    uint64_t granules = ((uint64_t)slot_bytes + GRANULE - 1) / GRANULE;
-    uint64_t n_words = (granules + 63) / 64;
-    uint64_t header_bytes = (sizeof(SlotHeader) + n_words * 8 + 63) & ~63ULL;
+    uint64_t cap_iv = ival_cap_for(slot_bytes);
+    uint64_t header_bytes = (sizeof(SlotHeader) + cap_iv * sizeof(Ival) + 63) & ~63ULL;
     uint64_t cap = 1;
     while (cap < (uint64_t)slots * 2) cap <<= 1;
     uint64_t off = 4096;
@@ -122,11 +129,11 @@ int arena_init(uint8_t *base, int64_t slots, int64_t slot_bytes) {
     h->headers_off = (uint64_t)o[3];
     h->data_off = (uint64_t)o[4];
     h->index_cap = (uint64_t)o[5];
-    uint64_t granules = ((uint64_t)slot_bytes + GRANULE - 1) / GRANULE;
-    uint64_t n_words = (granules + 63) / 64;
+    uint64_t cap_iv = ival_cap_for(slot_bytes);
     for (int64_t s = 0; s < slots; s++) {
         SlotHeader *sh = slot_hdr(base, (uint64_t)s);
-        sh->n_words = n_words;
+        sh->cap_ivals = cap_iv;
+        sh->n_ivals = 0;
     }
     atomic_thread_fence(memory_order_seq_cst);
     h->magic = A_MAGIC;
@@ -176,8 +183,8 @@ static int64_t claim_slot(uint8_t *base, uint64_t klo, uint64_t khi, uint64_t to
             sh->key_hi = khi;
             sh->total_bytes = total;
             sh->generation++;
-            atomic_store(&sh->bits_set, 0);
-            for (uint64_t w = 0; w < sh->n_words; w++) atomic_store(&sh->bitmap[w], 0);
+            sh->n_ivals = 0;
+            atomic_store(&sh->lock, 0);
             atomic_store(&sh->clock_bit, 1);
             atomic_store(&sh->refcount, 0);
             /* publish in the index */
@@ -225,10 +232,7 @@ int64_t arena_write(uint8_t *base, int64_t n, const uint64_t *klo, const uint64_
         if (total > h->slot_bytes) { status[i] = 3; e += k; continue; }
         for (int64_t j = 0; j < k; j++) {
             int64_t off = ext_off[e + j], len = ext_len[e + j];
-            if (off < 0 || len <= 0 || (uint64_t)(off + len) > total ||
-                (off % GRANULE) != 0 || ((off + len) % GRANULE != 0 && (uint64_t)(off + len) != total)) {
-                s = 3; break;
-            }
+            if (off < 0 || len <= 0 || (uint64_t)(off + len) > total) { s = 3; break; }
         }
         if (s) { status[i] = s; e += k; continue; }
         int64_t slot = find_slot(base, klo[i], khi[i]);
@@ -238,19 +242,44 @@ int64_t arena_write(uint8_t *base, int64_t n, const uint64_t *klo, const uint64_
         if (atomic_load(&sh->state) == S_COMPLETE) { status[i] = 2; e += k; ok++; continue; }
         uint8_t *dst = slot_data(base, (uint64_t)slot);
         int64_t taken = 0;
-        uint64_t granules = (total + GRANULE - 1) / GRANULE;
         for (int64_t j = 0; j < k; j++) {
             int64_t off = ext_off[e + j], len = ext_len[e + j];
             memcpy(dst + off, payload[i] + taken, (size_t)len);
             taken += len;
-            uint64_t g0 = (uint64_t)off / GRANULE, g1 = ((uint64_t)(off + len) + GRANULE - 1) / GRANULE;
-            for (uint64_t g = g0; g < g1; g++) {
-                uint64_t before = atomic_fetch_or(&sh->bitmap[g / 64], 1ULL << (g % 64));
-                if (!(before & (1ULL << (g % 64)))) atomic_fetch_add(&sh->bits_set, 1);
-            }
         }
         atomic_thread_fence(memory_order_release);
-        if (atomic_load(&sh->bits_set) >= granules) {
+        /* record coverage: merge the extents into the sorted interval list */
+        int full = 0, overflow = 0;
+        while (atomic_exchange(&sh->lock, 1)) { /* spin */ }
+        for (int64_t j = 0; j < k && !overflow; j++) {
+            uint64_t lo = (uint64_t)ext_off[e + j], hi = lo + (uint64_t)ext_len[e + j];
+            uint32_t n = sh->n_ivals;
+            /* find insertion point and the run of intervals overlapping/touching [lo,hi) */
+            uint32_t a = 0;
+            while (a < n && sh->ivals[a].hi < lo) a++;
+            uint32_t b = a;
+            while (b < n && sh->ivals[b].lo <= hi) {
+                if (sh->ivals[b].lo < lo) lo = sh->ivals[b].lo;
+                if (sh->ivals[b].hi > hi) hi = sh->ivals[b].hi;
+                b++;
+            }
+            /* replace ivals[a..b) with one interval */
+            uint32_t removed = b - a;
+            if (removed == 0) {
+                if (n + 1 > sh->cap_ivals) { overflow = 1; break; }
+                memmove(&sh->ivals[a + 1], &sh->ivals[a], (n - a) * sizeof(Ival));
+                sh->ivals[a].lo = lo; sh->ivals[a].hi = hi;
+                sh->n_ivals = n + 1;
+            } else {
+                sh->ivals[a].lo = lo; sh->ivals[a].hi = hi;
+                if (removed > 1) memmove(&sh->ivals[a + 1], &sh->ivals[b], (n - b) * sizeof(Ival));
+                sh->n_ivals = n - removed + 1;
+            }
+        }
+        full = (sh->n_ivals == 1 && sh->ivals[0].lo == 0 && sh->ivals[0].hi == total);
+        atomic_store(&sh->lock, 0);
+        if (overflow) { status[i] = 3; e += k; continue; }
+        if (full) {
             uint32_t expect = S_CLAIMED;
             if (atomic_compare_exchange_strong(&sh->state, &expect, S_COMPLETE)) {
                 atomic_fetch_add(&h->n_complete, 1);

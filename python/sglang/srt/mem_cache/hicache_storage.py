@@ -2011,6 +2011,26 @@ class HiCacheFile(HiCacheStorage):
     ) -> torch.Tensor | None:
         window = self._canonical_window(key)
         if window is not None:
+            # The shared arena first (the extra-pool route batch_get_v2 ->
+            # _read_page -> get reads one page at a time; boot-xsn142 class:
+            # a mamba blob completed in the arena is invisible to a disk
+            # read), then the disk.
+            if (
+                self._arena_dir()
+                and target_location is not None
+                and target_location.is_contiguous()
+                and int(target_location.numel()) * int(target_location.element_size())
+                == int(window.payload_bytes)
+            ):
+                arena = self._arena_for(int(window.total_bytes))
+                if arena is not None:
+                    suffixed = self._get_suffixed_key(key)
+                    st = arena.read([suffixed], [int(window.total_bytes)],
+                                    [tuple(window.extents)], [int(target_location.data_ptr())])[0]
+                    if st == 0:
+                        if self.metadata_cache is not None:
+                            self.metadata_cache.add(suffixed)
+                        return target_location
             return self._get_canonical_slice(key, window, target_location)
         suffixed = self._get_suffixed_key(key)
         tensor_path = self._existing_path(suffixed)
@@ -2291,6 +2311,16 @@ class HiCacheFile(HiCacheStorage):
                         elif st == 4 and attempt == 0:
                             again.append(entry)
                         else:
+                            self._arena_refused_n = getattr(self, "_arena_refused_n", 0) + 1
+                            if self._arena_refused_n <= 8 or self._arena_refused_n % 512 == 0:
+                                logger.warning(
+                                    "[arena] write refused status=%d key=%s total=%d extents=%d "
+                                    "first=%s (n=%d): this extent goes to the DISK store; a page "
+                                    "split between tiers completes nowhere",
+                                    int(st), suffixed[:24], int(window.total_bytes),
+                                    len(window.extents), tuple(window.extents)[:2],
+                                    self._arena_refused_n,
+                                )
                             rest.append(entry)
                     if not again:
                         break

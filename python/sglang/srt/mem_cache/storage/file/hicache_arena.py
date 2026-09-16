@@ -33,7 +33,7 @@ _lib: Optional[ctypes.CDLL] = None
 _failed = False
 
 #: every extent boundary must sit on this granule (arena.c GRANULE)
-GRANULE = 256
+GRANULE = 1  # coverage is an interval list; any byte range counts
 
 
 def _load_lib() -> Optional[ctypes.CDLL]:

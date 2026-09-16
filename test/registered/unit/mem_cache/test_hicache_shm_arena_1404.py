@@ -53,10 +53,23 @@ def test_two_stages_complete_one_page_and_a_reader_cuts_its_extents(arena):
     assert arena.read(["nope"], [PAGE], [[(0, 256)]], [out.data_ptr()]) == [1]
 
 
-def test_unaligned_extent_is_refused_not_stored(arena):
-    a = _page(1, 512)
-    assert arena.write(["k2"], [PAGE], [[(100, 512)]], [a.data_ptr()]) == [3]
+def test_arbitrary_extents_merge_into_one_coverage(arena):
+    """Coverage is an interval list (boot xsn142: the granule bitmap refused
+    unaligned mamba cuts, those went to disk while the other stages wrote the
+    arena, and the page completed NOWHERE). Any byte range counts."""
+    parts = [(100, 412), (0, 100), (512, 19488), (20512, PAGE - 20512)]  # gap [20000,20512)
+    for off, ln in parts:
+        pg = _page((off // 7) % 200 + 1, ln)
+        st = arena.write(["k2"], [PAGE], [[(off, ln)]], [pg.data_ptr()])[0]
+        assert st == 0, (off, ln, st)
     assert arena.lookup(["k2"]) == [False]
+    pg = _page(9, 512)
+    assert arena.write(["k2"], [PAGE], [[(20000, 512)]], [pg.data_ptr()]) == [1]
+    assert arena.lookup(["k2"]) == [True]
+    out = torch.zeros(PAGE, dtype=torch.uint8)
+    assert arena.read(["k2"], [PAGE], [[(0, PAGE)]], [out.data_ptr()]) == [0]
+    assert int(out[0]) == 1 and int(out[20505]) == 9 and int(out[PAGE - 1]) == (20512 // 7) % 200 + 1
+    assert arena.write(["k3"], [PAGE], [[(0, PAGE + 1)]], [out.data_ptr()]) == [3], "out of range"
 
 
 def test_full_arena_reports_full_and_clock_evicts_complete_pages(arena):
