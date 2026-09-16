@@ -73,6 +73,7 @@ from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
 from sglang.srt.models.qwen4_exp_ple_table import (
     allocate_ple_host_table,
     make_ple_file_prefetcher,
+    make_ple_checkpoint_prefetcher,
     make_ple_file_rss_trimmer,
 )
 from sglang.srt.runtime_context import get_parallel
@@ -937,6 +938,7 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
                 f"match the embedding {self.weight.dtype}x{self.embedding_dim}"
             )
         self._ckpt_table = table
+        self._ckpt_prefetcher = make_ple_checkpoint_prefetcher(table)
 
     def allocate_output(
         self, shape: Tuple[int, ...], device: torch.device
@@ -975,6 +977,13 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
                 raise RuntimeError(
                     "PLE checkpoint table was never attached (load_weights did "
                     "not see the ngram_embedding shards)"
+                )
+            prefetcher = getattr(self, "_ckpt_prefetcher", None)
+            if prefetcher is not None:
+                prefetcher.enqueue(
+                    flat_ids,
+                    vocab_start=self.shard_indices.org_vocab_start_index,
+                    vocab_end=self.shard_indices.org_vocab_end_index,
                 )
             _gather_ple_embedding_from_shards_kernel[(flat_ids.numel(),)](
                 table.bases_on(flat_ids.device),

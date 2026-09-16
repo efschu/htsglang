@@ -138,6 +138,129 @@ class PleFilePrefetcher:
             pass
 
 
+class PleCheckpointPrefetcher:
+    """WP1b: the ``checkpoint`` backend's page-cache warmer.
+
+    The gather kernel reads the table through HMM out of read-only mmaps of
+    the checkpoint's own safetensors files, and every cold row is one 4 KiB
+    page fault served from storage inside the kernel, one at a time. Measured
+    on the 5090 (2026-09-16, cold ZFS): 262144 random rows in 99 s, ~2.6k
+    rows/s -- a 9k-token prefill (~72k rows) spends ~30 s in one PLE layer.
+    This warms the pages first: ``posix_fadvise(WILLNEED)`` per distinct
+    page and, because not every file system honours the hint, a ``pread`` of
+    each page on a small thread pool, so the block layer serves them
+    concurrently and the faults find them in the page cache. Nothing is
+    pinned and nothing is kept: the page cache stays the only copy (PLE law:
+    the table lives on disk). Decode-sized gathers are skipped (min_rows);
+    nothing runs during CUDA-graph capture.
+    """
+
+    def __init__(
+        self,
+        table: "CheckpointMappedPleTable",
+        min_rows: int = PLE_FILE_PREFETCH_MIN_ROWS,
+        workers: int = 8,
+    ) -> None:
+        if not table.shard_files or len(table.shard_files) != len(table.bases):
+            raise ValueError("checkpoint PLE table carries no per-shard file map")
+        self._table = table
+        self._row_bytes = int(table.row_bytes)
+        self._min_rows = int(min_rows)
+        self._fds: dict = {}
+        for path in dict.fromkeys(table.shard_files):
+            self._fds[path] = os.open(path, os.O_RDONLY)
+        self._shard_fd = [self._fds[p] for p in table.shard_files]
+        self._pool = ThreadPoolExecutor(max_workers=max(1, int(workers)))
+        self._workers = max(1, int(workers))
+        self.stats = {"enqueued": 0, "rows": 0, "pages": 0}
+
+    def pages_by_fd(self, row_ids: torch.Tensor) -> dict:
+        """Global row ids (host tensor) -> {fd: sorted unique page numbers}."""
+        row_ids = row_ids.to(torch.int64)
+        shard = torch.div(row_ids, self._table.shard_rows, rounding_mode="floor")
+        row = row_ids - shard * self._table.shard_rows
+        offsets = torch.tensor(self._table.shard_offsets, dtype=torch.int64)
+        start = offsets[shard] + row * self._row_bytes
+        end = start + (self._row_bytes - 1)
+        out: dict = {}
+        for s in torch.unique(shard).tolist():
+            sel = shard == s
+            pages = torch.cat([start[sel] >> _PAGE_SHIFT, end[sel] >> _PAGE_SHIFT])
+            fd = self._shard_fd[int(s)]
+            out.setdefault(fd, []).append(pages)
+        return {fd: torch.cat(v).unique(sorted=True).tolist() for fd, v in out.items()}
+
+    @staticmethod
+    def _touch(fd: int, pages: list) -> None:
+        for p in pages:
+            try:
+                os.posix_fadvise(fd, p << _PAGE_SHIFT, 1 << _PAGE_SHIFT, os.POSIX_FADV_WILLNEED)
+            except OSError:
+                break
+        for p in pages:
+            try:
+                os.pread(fd, 1 << _PAGE_SHIFT, p << _PAGE_SHIFT)
+            except OSError:
+                return
+
+    def enqueue(
+        self,
+        flat_ids: torch.Tensor,
+        *,
+        vocab_start: int = 0,
+        vocab_end: Optional[int] = None,
+    ) -> bool:
+        """Queue the warm-up for ``flat_ids``. Returns whether anything was queued."""
+        if flat_ids.numel() < self._min_rows:
+            return False
+        if flat_ids.is_cuda and torch.cuda.is_current_stream_capturing():
+            return False
+        row_ids = flat_ids.detach().cpu().to(torch.int64)
+        if vocab_end is not None:
+            row_ids = row_ids[(row_ids >= vocab_start) & (row_ids < vocab_end)]
+        row_ids = row_ids[(row_ids >= 0) & (row_ids < self._table.total_rows)]
+        if row_ids.numel() == 0:
+            return False
+        by_fd = self.pages_by_fd(row_ids)
+        n_pages = 0
+        for fd, pages in by_fd.items():
+            n_pages += len(pages)
+            chunk = max(1, (len(pages) + self._workers - 1) // self._workers)
+            for i in range(0, len(pages), chunk):
+                self._pool.submit(self._touch, fd, pages[i : i + chunk])
+        self.stats["enqueued"] += 1
+        self.stats["rows"] += int(row_ids.numel())
+        self.stats["pages"] += n_pages
+        return True
+
+    def close(self) -> None:
+        self._pool.shutdown(wait=False)
+        for fd in self._fds.values():
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+
+def make_ple_checkpoint_prefetcher(
+    table: "CheckpointMappedPleTable",
+) -> Optional["PleCheckpointPrefetcher"]:
+    """The warmer for a ``checkpoint``-backend table; the file backend's
+    SGLANG_QWEN4_PLE_FILE_PREFETCH switch governs both."""
+    if not envs.SGLANG_QWEN4_PLE_FILE_PREFETCH.get():
+        return None
+    prefetcher = PleCheckpointPrefetcher(table)
+    logger.info(
+        "PLE table: checkpoint page warm-up on for gathers of >= %d rows "
+        "(row = %d B, %d files, %d threads)",
+        PLE_FILE_PREFETCH_MIN_ROWS,
+        table.row_bytes,
+        len(prefetcher._fds),
+        prefetcher._workers,
+    )
+    return prefetcher
+
+
 class PleFileRssTrimmer:
     """Keep the mapped table's resident set under a budget.
 
@@ -516,6 +639,8 @@ class CheckpointMappedPleTable:
         embedding_dim: int,
         keepalive: Sequence[object],
         files: Sequence[str],
+        shard_files: Sequence[str] = (),
+        shard_offsets: Sequence[int] = (),
     ) -> None:
         self.bases = tuple(int(b) for b in bases)
         self.shard_rows = int(shard_rows)
@@ -524,6 +649,10 @@ class CheckpointMappedPleTable:
         self.embedding_dim = int(embedding_dim)
         self._keepalive = tuple(keepalive)
         self.files = tuple(files)
+        # Per shard: the file it lives in and the byte offset of its first
+        # row in that file (the prefetcher's page arithmetic).
+        self.shard_files = tuple(shard_files)
+        self.shard_offsets = tuple(int(o) for o in shard_offsets)
         self._device_bases: dict = {}
 
     @property
@@ -589,6 +718,8 @@ def map_ple_table_from_checkpoint(
     mmaps: dict = {}
     headers: dict = {}
     bases = []
+    shard_files: list = []
+    shard_offsets: list = []
     dtype = None
     rows_seen = 0
     for idx, name in shards:
@@ -623,6 +754,8 @@ def map_ple_table_from_checkpoint(
         if off1 - off0 != int(rows) * int(dim) * torch.empty(0, dtype=dtype).element_size():
             raise ValueError(f"PLE shard {name}: byte span does not match its shape")
         bases.append(int(mmaps[path].ctypes.data) + data_start + int(off0))
+        shard_files.append(path)
+        shard_offsets.append(data_start + int(off0))
     if rows_seen != int(total_rows):
         raise ValueError(
             f"PLE shards cover {rows_seen} rows, embedding expects {total_rows}"
@@ -644,4 +777,6 @@ def map_ple_table_from_checkpoint(
         embedding_dim=embedding_dim,
         keepalive=list(mmaps.values()),
         files=list(mmaps),
+        shard_files=shard_files,
+        shard_offsets=shard_offsets,
     )

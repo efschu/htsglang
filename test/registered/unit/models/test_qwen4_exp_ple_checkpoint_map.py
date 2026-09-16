@@ -114,3 +114,37 @@ def test_mapping_keeps_no_copy(tmp_path):
         "model-00001-of-00002.safetensors",
         "model-00002-of-00002.safetensors",
     }
+
+
+def test_checkpoint_prefetcher_warms_exactly_the_rows_pages(tmp_path):
+    """WP1b: the checkpoint backend's warm-up maps global row ids to the
+    (file, page) pairs their bytes occupy -- across the shard and file
+    boundaries the checkpoint layout has -- and touches them on a pool;
+    decode-sized gathers are skipped."""
+    from sglang.srt.models.qwen4_exp_ple_table import PleCheckpointPrefetcher
+
+    _write_checkpoint(tmp_path)
+    table = map_ple_table_from_checkpoint(
+        str(tmp_path), PREFIX, shard_rows=SHARD_ROWS, total_rows=13, embedding_dim=DIM
+    )
+    assert len(table.shard_files) == 3 and len(table.shard_offsets) == 3
+    pf = PleCheckpointPrefetcher(table, min_rows=2, workers=2)
+    # rows 0 and 4 sit in shard 0 (file 1), 6 in shard 1 (file 1), 12 in shard 2 (file 2)
+    by_fd = pf.pages_by_fd(torch.tensor([0, 4, 6, 12, 12]))
+    assert len(by_fd) == 2
+    rb = table.row_bytes
+    for fd, pages in by_fd.items():
+        assert pages == sorted(set(pages))
+    expect = {}
+    for rid in (0, 4, 6, 12):
+        shard, row = divmod(rid, 5)
+        off = table.shard_offsets[shard] + row * rb
+        expect.setdefault(pf._shard_fd[shard], set()).update({off >> 12, (off + rb - 1) >> 12})
+    assert {fd: set(p) for fd, p in by_fd.items()} == expect
+    assert pf.enqueue(torch.tensor([1])) is False  # below min_rows
+    assert pf.enqueue(torch.tensor([0, 6, 12, 99999])) is True  # out-of-range id dropped
+    pf._pool.shutdown(wait=True)
+    assert pf.stats == {"enqueued": 1, "rows": 3, "pages": sum(len(v) for v in pf.pages_by_fd(torch.tensor([0, 6, 12])).values())}
+    # every touched row still reads the checkpoint bytes (warm-up is a read)
+    assert torch.equal(_read_row(table, 12), _read_row(table, 12))
+    pf.close()
