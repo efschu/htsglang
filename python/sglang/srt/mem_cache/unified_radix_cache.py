@@ -3115,6 +3115,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 if slots:
                     pool.arena.ref_slots(slots, -1)
                 return False
+            _pin = getattr(pool, "pin_slots", None) or getattr(getattr(pool, "anchor_entry", None), "host_pool", None) and getattr(pool.anchor_entry.host_pool, "pin_slots", None)
+            if callable(_pin):
+                _pin(slots)
             new = torch.tensor([pool.staging_rows + s for s in slots], dtype=old.dtype, device=old.device)
             dpool = getattr(cc, "mem_pool_host_draft", None)
             if getattr(dpool, "row_slot", None) is not None and dpool.arena is not None:

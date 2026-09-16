@@ -124,12 +124,17 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
             typed.as_strided((A, H, D), (tok, D, 1), storage_offset=base_off + (v_off + l * cell) // e)
             for l in range(L)
         ]
-        if pin and torch.cuda.is_available() and not getattr(arena, "_pinned", False):
-            rc = torch.cuda.cudart().cudaHostRegister(
-                buf.data_ptr(), buf.numel(), _CUDA_HOST_REGISTER_FLAGS)
-            if int(rc) not in (0, _CUDA_ERROR_ALREADY_REGISTERED):
-                raise RuntimeError(f"#1424 cudaHostRegister({buf.numel()} B) failed: {int(rc)}")
-            arena._pinned = True
+        # #1424e (boot xsn177/179): registering the WHOLE mapping materialised
+        # every untouched tmpfs slot (27 GiB resident at once); the ledger
+        # measured it as a 37.95 GiB flip ratchet and refused every later
+        # boot. Pages are pinned LAZILY, per slot, at first use instead -- the
+        # arena stays sparse and residency equals what was actually written.
+        self._pin = bool(pin and torch.cuda.is_available())
+        self._pin_base = int(buf.data_ptr()) + data_off
+        self._pin_bytes = page_bytes
+        self._pinned = getattr(arena, "_pinned_slots", None)
+        if self._pinned is None:
+            self._pinned = arena._pinned_slots = torch.zeros(A, dtype=torch.bool)
         self.arena = arena
         self.arena_slots = A
         self.id_space = self.staging_rows + A + PLACEHOLDERS
@@ -158,6 +163,7 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
     def resolve_rows(self, host_indices: torch.Tensor, slots: Sequence[int]) -> None:
         """KV role: write arena ids over the placeholders, in place."""
         n = len(slots)
+        self.pin_slots(slots)
         vals = torch.tensor([self.staging_rows + int(s) for s in slots], dtype=host_indices.dtype)
         host_indices[:n] = vals.to(host_indices.device)
 
@@ -167,6 +173,7 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
             raise RuntimeError("#1424 resolve_draft_rows on a pool not bound as draft")
         for r, s in zip(rows, slots):
             self.row_slot[int(r)] = int(s)
+        self.pin_slots([int(s) for s in slots if int(s) >= 0])
 
     # -- transfers ------------------------------------------------------------
     def load_to_device_per_layer(self, device_pool, host_indices, device_indices, layer_id, io_backend):
@@ -196,8 +203,41 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
                 self._transfer(device_pool, self.arena_k_refs[layer_id], self.arena_v_refs[layer_id],
                                slots[hit], device_indices[hit], layer_id)
             return
+        self.pin_slots(rows)
         self._transfer(device_pool, self.arena_k_refs[layer_id], self.arena_v_refs[layer_id],
                        rows, device_indices, layer_id)
+
+    def pin_slots(self, slots) -> int:
+        """Register the slots' pages (contiguous runs in one call each) that
+        are not registered yet in this process. Returns the number of slots
+        newly pinned."""
+        if not getattr(self, "_pin", False):
+            return 0
+        idx = torch.as_tensor(list(slots) if not torch.is_tensor(slots) else slots.cpu(), dtype=torch.int64)
+        if idx.numel() == 0:
+            return 0
+        idx = torch.unique(idx)
+        idx = idx[~self._pinned[idx]]
+        if idx.numel() == 0:
+            return 0
+        cudart = torch.cuda.cudart()
+        vals = idx.tolist()
+        n = 0
+        start = prev = vals[0]
+        def _reg(a, b):
+            rc = cudart.cudaHostRegister(self._pin_base + a * self._pin_bytes,
+                                         (b - a + 1) * self._pin_bytes, _CUDA_HOST_REGISTER_FLAGS)
+            if int(rc) not in (0, _CUDA_ERROR_ALREADY_REGISTERED):
+                raise RuntimeError(f"#1424 cudaHostRegister(slots {a}..{b}) failed: {int(rc)}")
+        for v in vals[1:]:
+            if v == prev + 1:
+                prev = v
+                continue
+            _reg(start, prev); n += prev - start + 1
+            start = prev = v
+        _reg(start, prev); n += prev - start + 1
+        self._pinned[idx] = True
+        return n
 
     def _transfer(self, device_pool, k_src, v_src, src_idx, dst_idx, layer_id) -> None:
         if not getattr(self, "can_use_jit", False):

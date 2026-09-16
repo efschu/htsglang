@@ -225,3 +225,21 @@ def test_unbound_arena_pool_reads_are_honest_misses(tmp_path):
     c = object.__new__(HiCacheController)
     c.mem_pool_host = p; c.storage_backend = be; c.page_size = 1
     assert c._arena_page_get(_Op(), ["h0"], p.alloc_read(1)) == 0
+
+
+def test_lazy_pinning_registers_contiguous_runs_once(tmp_path, monkeypatch):
+    """#1424e: pages are registered per slot run at first use, never the whole
+    mapping (xsn177: 27 GiB materialised, ledger refused every later boot)."""
+    calls = []
+    class _Cudart:
+        def cudaHostRegister(self, ptr, nbytes, flags):
+            calls.append((ptr, nbytes)); return 0
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "cudart", lambda: _Cudart())
+    p, arena = _pool(tmp_path)  # bind(pin=False) -> _pin False
+    p._pin = True
+    base = p._pin_base
+    assert p.pin_slots([2, 3, 4, 7]) == 4
+    assert calls == [(base + 2 * PAGE, 3 * PAGE), (base + 7 * PAGE, PAGE)]
+    assert p.pin_slots([3, 7]) == 0, "already registered"
+    assert p.pin_slots(torch.tensor([6, 5])) == 2 and calls[-1] == (base + 5 * PAGE, 2 * PAGE)
