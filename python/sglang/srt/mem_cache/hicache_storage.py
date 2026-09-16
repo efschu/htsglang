@@ -2190,6 +2190,9 @@ class HiCacheFile(HiCacheStorage):
         target_locations: Optional[Any] = None,
         target_sizes: Optional[Any] = None,
     ) -> bool:
+        return all(self._batch_set_each(keys, values))
+
+    def _batch_set_each(self, keys: List[str], values) -> List[bool]:
         """#1402: canonical-window keys are written in ONE C call per batch.
 
         The same protocol as ``write_extents`` (part file + flock, marker
@@ -2203,36 +2206,31 @@ class HiCacheFile(HiCacheStorage):
         from sglang.srt.mem_cache.storage.file.pageio import load as _load_pageio
 
         pio = _load_pageio()
+        values = list(values or [])
         if pio is None:
-            for key, value in zip(keys, values):
-                if not self.set(key, value):
-                    return False
-            return True
-        values = list(values)
-        ok = True
+            return [bool(self.set(key, value)) for key, value in zip(keys, values)]
+        results: List[bool] = [True] * len(keys)
         plan = []
-        for key, value in zip(keys, values):
+        for i, (key, value) in enumerate(zip(keys, values)):
             window = self._canonical_window(key)
             if window is None or value is None:
-                if not self.set(key, value):
-                    ok = False
+                results[i] = bool(self.set(key, value))
                 continue
             flat = value.contiguous().view(torch.uint8)
             if int(flat.numel()) != int(window.payload_bytes):
                 # shape refusals keep their per-key error line
-                if not self._set_canonical_slice(key, window, value):
-                    ok = False
+                results[i] = bool(self._set_canonical_slice(key, window, value))
                 continue
             suffixed = self._get_suffixed_key(key)
             _969g_trace("write", "canonical", suffixed)
-            plan.append((key, suffixed, window, flat))
+            plan.append((i, key, suffixed, window, flat))
         if not plan:
-            return ok
+            return results
         # Presence for the whole batch in one call: a complete blob is
         # content-addressed and only gets its recency refreshed.
-        present = self._stat_stems([p[1] for p in plan])
+        present = self._stat_stems([p[2] for p in plan])
         todo = []
-        for key, suffixed, window, flat in plan:
+        for i, key, suffixed, window, flat in plan:
             if suffixed in present:
                 self._evictor.touch(suffixed, self._existing_path(suffixed))
                 continue
@@ -2245,23 +2243,23 @@ class HiCacheFile(HiCacheStorage):
                     canonical_extent_write=True,
                 ),
             ):
-                ok = False
+                results[i] = False
                 continue
             path = self._sharded_path(suffixed)
             self._ensure_shard_dir(path)
-            todo.append((key, suffixed, window, flat, path))
+            todo.append((i, key, suffixed, window, flat, path))
         if not todo:
-            return ok
+            return results
         from sglang.srt.mem_cache.canonical_page_store import canonical_fsync_default
 
         statuses = pio.write_pages(
-            [t[4] for t in todo],
-            [int(t[2].total_bytes) for t in todo],
-            [tuple(t[2].extents) for t in todo],
-            [int(t[3].data_ptr()) for t in todo],
+            [t[5] for t in todo],
+            [int(t[3].total_bytes) for t in todo],
+            [tuple(t[3].extents) for t in todo],
+            [int(t[4].data_ptr()) for t in todo],
             canonical_fsync_default(),
         )
-        for (key, suffixed, window, flat, path), status in zip(todo, statuses):
+        for (i, key, suffixed, window, flat, path), status in zip(todo, statuses):
             if status in (0, 1, 2):
                 self._evictor.commit(suffixed)
                 if status in (0, 2) and self.metadata_cache is not None:
@@ -2274,8 +2272,8 @@ class HiCacheFile(HiCacheStorage):
                     int(status),
                 )
                 self._evictor.abort(suffixed)
-                ok = False
-        return ok
+                results[i] = False
+        return results
 
     def exists(self, key: str) -> bool:
         key = self._get_suffixed_key(key)
@@ -2742,7 +2740,35 @@ class HiCacheFile(HiCacheStorage):
         transfers: List[PoolTransfer],
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> dict[str, List[bool]]:
-        return self._batch_io_v2(transfers, self._write_page)
+        """#1402: the extra pools (draft pages, mamba blobs) write through
+        the same batched path as the KV pages -- boot xsn138 still spent
+        the publish sweep's thread in _write_page -> get_data_page -> set,
+        one Python canonical write per draft page."""
+        results: dict[str, List[bool]] = {}
+        for transfer in transfers:
+            host_pool = self.registered_pools[transfer.name]
+            keys = transfer.keys or []
+            page_size = getattr(host_pool, "page_size", 1) or 1
+            expected = len(keys) * page_size
+            host_indices = transfer.host_indices
+            if host_indices is None or host_indices.numel() != expected:
+                logger.error(
+                    "_write_page indices length mismatch for %s: expected %s, got %s",
+                    transfer.name,
+                    expected,
+                    host_indices.numel() if host_indices is not None else 0,
+                )
+                results[transfer.name] = [False] * len(keys)
+                continue
+            starts = [int(host_indices[i * page_size]) for i in range(len(keys))]
+            batched = getattr(host_pool, "get_data_pages", None)
+            if batched is not None:
+                pages = batched(starts)
+            else:
+                pages = [host_pool.get_data_page(s, flat=True) for s in starts]
+            storage_keys = [self._log_key(transfer.name, key) for key in keys]
+            results[transfer.name] = self._batch_set_each(storage_keys, pages)
+        return results
 
     def capacity_stats(self) -> Optional[dict]:
         stats = self._evictor.stats()
