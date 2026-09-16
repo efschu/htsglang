@@ -512,10 +512,215 @@ def qwen_sparse_kv_extraction_compact_triton(
     )
 
 
+@triton.jit
+def _sparse_attn_rows_fwd(
+    q,
+    k,
+    v,
+    out,
+    lse,
+    rows,
+    scale,
+    topk,
+    sq_m: tl.constexpr,
+    sq_h: tl.constexpr,
+    sq_d: tl.constexpr,
+    sk_n: tl.constexpr,
+    sk_h: tl.constexpr,
+    sk_d: tl.constexpr,
+    sv_n: tl.constexpr,
+    sv_h: tl.constexpr,
+    sv_d: tl.constexpr,
+    so_m: tl.constexpr,
+    so_h: tl.constexpr,
+    so_d: tl.constexpr,
+    sl_m: tl.constexpr,
+    sl_h: tl.constexpr,
+    sr_m: tl.constexpr,
+    sr_n: tl.constexpr,
+    NUM_KV_HEADS: tl.constexpr,
+    GROUP_SIZE: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+):
+    """WP3b: sparse GQA over ABSOLUTE K/V rows, with the LSE.
+
+    ``rows[query, :]`` are row indices straight into ``k``/``v`` (the KV pool
+    as this rank stores it), ``-1`` = not attended. That is what makes one
+    kernel serve every mode: prefill with a prefix, decode and the
+    speculative paged modes hand it the rows they selected; under uneven DCP
+    the rows are this rank's OWNED subset of the selection and the natural-log
+    ``lse`` this kernel emits is what the group's LSE merge combines. A query
+    whose rows are all ``-1`` (this rank owns none of its keys) gets out=0 and
+    lse=-inf, which the merge weighs as exp(-inf)=0.
+    """
+    query = tl.program_id(0).to(tl.int64)
+    group = tl.program_id(1)
+    offs_h = tl.arange(0, BLOCK_M)
+    offs_d = tl.arange(0, HEAD_DIM)
+    head_start = group * GROUP_SIZE
+    q_values = tl.load(
+        q + query * sq_m + (head_start + offs_h[:, None]) * sq_h + offs_d[None, :] * sq_d,
+        mask=(offs_h < GROUP_SIZE)[:, None],
+        other=0.0,
+    )
+    q_values = (q_values * scale * 1.4426950408).to(q_values.dtype)
+    k_base = k + group * sk_h
+    v_base = v + group * sv_h
+    row_ptr = rows + query * sr_m
+    max_value = tl.full([BLOCK_M], -float("inf"), tl.float32)
+    normalizer = tl.zeros([BLOCK_M], tl.float32)
+    accumulator = tl.zeros([BLOCK_M, HEAD_DIM], tl.float32)
+    offs_n = tl.arange(0, BLOCK_N)
+    for start in range(0, topk, BLOCK_N):
+        current = start + offs_n
+        row = tl.load(row_ptr + current * sr_n, mask=current < topk, other=-1).to(tl.int64)
+        valid = row >= 0
+        safe_row = tl.where(valid, row, 0)
+        keys = tl.load(
+            k_base + safe_row[None, :] * sk_n + offs_d[:, None] * sk_d,
+            mask=valid[None, :],
+            other=0.0,
+        ).to(q_values.dtype)
+        values = tl.load(
+            v_base + safe_row[:, None] * sv_n + offs_d[None, :] * sv_d,
+            mask=valid[:, None],
+            other=0.0,
+        ).to(q_values.dtype)
+        scores = tl.where(valid[None, :], tl.dot(q_values, keys), -float("inf"))
+        next_max = tl.maximum(max_value, tl.max(scores, 1))
+        # A block with no valid key leaves next_max at -inf; exp2(-inf - -inf)
+        # is nan, so the running max is only moved by finite scores.
+        next_max = tl.where(next_max == -float("inf"), max_value, next_max)
+        alpha = tl.where(
+            max_value == -float("inf"), 1.0, tl.math.exp2(max_value - next_max)
+        )
+        probabilities = tl.where(
+            next_max[:, None] == -float("inf"),
+            0.0,
+            tl.math.exp2(scores - next_max[:, None]),
+        )
+        accumulator = tl.dot(
+            probabilities.to(values.dtype), values, accumulator * alpha[:, None]
+        )
+        normalizer = normalizer * alpha + tl.sum(probabilities, 1)
+        max_value = next_max
+    has_keys = normalizer > 0
+    safe_norm = tl.where(has_keys, normalizer, 1.0)
+    output = accumulator / safe_norm[:, None]
+    tl.store(
+        out + query * so_m + (head_start + offs_h[:, None]) * so_h + offs_d[None, :] * so_d,
+        output,
+        mask=(offs_h < GROUP_SIZE)[:, None],
+    )
+    lse_value = tl.where(
+        has_keys, (max_value + tl.math.log2(safe_norm)) * 0.6931471805599453, -float("inf")
+    )
+    tl.store(
+        lse + query * sl_m + (head_start + offs_h) * sl_h,
+        lse_value,
+        mask=offs_h < GROUP_SIZE,
+    )
+
+
+def sparse_attn_rows_triton(q, k_pool, v_pool, rows, scale):
+    """(out [Tq, Hq, D] in q.dtype, lse [Tq, Hq] fp32 natural log) for the
+    selected absolute rows; see ``_sparse_attn_rows_fwd``."""
+    total_q, num_q_heads, head_dim = q.shape
+    num_kv_heads = k_pool.shape[1]
+    group_size = num_q_heads // num_kv_heads
+    rows = rows.to(torch.int32).contiguous()
+    out = torch.empty_like(q)
+    lse = torch.empty((total_q, num_q_heads), dtype=torch.float32, device=q.device)
+    if total_q == 0:
+        return out, lse
+    block_m = max(16, triton.next_power_of_2(group_size))
+    block_n, warps, stages = _get_best_config(total_q)
+    _sparse_attn_rows_fwd[(total_q, num_kv_heads)](
+        q,
+        k_pool,
+        v_pool,
+        out,
+        lse,
+        rows,
+        scale,
+        rows.shape[-1],
+        q.stride(0),
+        q.stride(1),
+        q.stride(2),
+        k_pool.stride(0),
+        k_pool.stride(1),
+        k_pool.stride(2),
+        v_pool.stride(0),
+        v_pool.stride(1),
+        v_pool.stride(2),
+        out.stride(0),
+        out.stride(1),
+        out.stride(2),
+        lse.stride(0),
+        lse.stride(1),
+        rows.stride(0),
+        rows.stride(1),
+        NUM_KV_HEADS=num_kv_heads,
+        GROUP_SIZE=group_size,
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
+        HEAD_DIM=head_dim,
+        num_warps=warps,
+        num_stages=stages,
+    )
+    return out, lse
+
+
+def sparse_attn_rows_reference(q, k_pool, v_pool, rows, scale):
+    """Device-agnostic twin of ``sparse_attn_rows_triton`` (same contract,
+    fp32 math): the pin for the kernel and for the LSE merge."""
+    total_q, num_q_heads, head_dim = q.shape
+    num_kv_heads = k_pool.shape[1]
+    repeats = num_q_heads // num_kv_heads
+    out = torch.zeros((total_q, num_q_heads, head_dim), dtype=torch.float32, device=q.device)
+    lse = torch.full((total_q, num_q_heads), -float("inf"), dtype=torch.float32, device=q.device)
+    for t in range(total_q):
+        valid = rows[t] >= 0
+        if not bool(valid.any()):
+            continue
+        sel = rows[t][valid].long()
+        keys = k_pool[sel].float()  # [n, Hkv, D]
+        values = v_pool[sel].float()
+        for h in range(num_q_heads):
+            g = h // repeats
+            scores = keys[:, g, :] @ q[t, h].float() * scale  # [n]
+            m = scores.max()
+            p = torch.exp(scores - m)
+            l = p.sum()
+            out[t, h] = (p @ values[:, g, :]) / l
+            lse[t, h] = m + torch.log(l)
+    return out.to(q.dtype), lse
+
+
+def merge_partial_attention(outs, lses):
+    """The group LSE merge (the math of ``cp_lse_ag_out_ar_mha_uneven``) over a
+    list of per-rank partials: ``sum_r exp(lse_r - lse) * out_r`` with
+    ``lse = logsumexp_r(lse_r)``. A rank with lse=-inf contributes nothing."""
+    lses = torch.stack([l.float() for l in lses])  # [R, T, H]
+    global_lse = torch.logsumexp(lses, dim=0)
+    total = None
+    for out, l in zip(outs, lses):
+        w = torch.exp(l - global_lse).unsqueeze(-1)
+        w = torch.nan_to_num(w, nan=0.0, posinf=0.0, neginf=0.0)
+        part = torch.nan_to_num(out.float(), nan=0.0) * w
+        total = part if total is None else total + part
+    return total, global_lse
+
+
 __all__ = [
     "qwen_sparse_fa2_cu_seqlens_triton",
     "qwen_sparse_valid_counts_triton",
     "qwen_sparse_kv_extraction_compact_triton",
     "sparse_gqa_fwd_interface_triton",
     "sparse_gqa_fwd_interface_triton_ck",
+    "sparse_attn_rows_triton",
+    "sparse_attn_rows_reference",
+    "merge_partial_attention",
 ]

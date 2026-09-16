@@ -30,6 +30,7 @@ from sglang.srt.layers.attention.qsa.metadata import (
     compressed_decode_view,
 )
 from sglang.srt.layers.attention.qsa.sparse_attn import (
+    sparse_attn_rows_triton,
     qwen_sparse_fa2_cu_seqlens_triton,
     qwen_sparse_kv_extraction_compact_triton,
     qwen_sparse_valid_counts_triton,
@@ -63,6 +64,14 @@ def _resolve_trtllm_sparse_decode():
 
 
 @lru_cache(maxsize=1)
+@lru_cache(maxsize=1)
+def _resolve_flash_attn_varlen_func_or_none():
+    try:
+        return _resolve_flash_attn_varlen_func()
+    except ImportError:
+        return None
+
+
 def _resolve_flash_attn_varlen_func():
     from sglang.srt.utils import is_sm121
 
@@ -193,6 +202,7 @@ class QwenSparseAttnBackend(AttentionBackend):
         self.req_to_token = getattr(req_pool, "req_to_token", None)
         self.req_to_token_pool = req_pool
         self.forward_metadata: Optional[QwenSparseAttnMetadata] = None
+        self._init_dcp(runner, model_config)
         self._cuda_graph_metadata: Dict[
             Tuple[ForwardMode, int], QwenSparseAttnMetadata
         ] = {}
@@ -218,6 +228,163 @@ class QwenSparseAttnBackend(AttentionBackend):
         self._trtllm_workspace = None
         self._graph_extend_lens = None
         self._graph_extend_lens_pin = None
+
+    # ------------------------------------------------------------------
+    # WP3b: uneven DCP (this line's token-sharded KV pool) for the sparse
+    # attention. Upstream's QSA backend reads and writes the pool with the
+    # GLOBAL req_to_token slots; under --rank-tp-ratio every rank stores only
+    # the rows it owns (layers/dcp/owner.py), so the write is masked to the
+    # owned rows and the read runs over this rank's OWNED subset of every
+    # query's top-k, on ALL q heads (gathered across the DCP group), and the
+    # partials are LSE-merged exactly as the dense Triton/FlashInfer paths do.
+    # fn1u boot 2026-09-16: without this TP0 (4100 of 32772 rows) asserted
+    # out of bounds in the indexer's compressed cache; the sparse attention
+    # would have been next.
+    # ------------------------------------------------------------------
+    def _init_dcp(self, runner, model_config) -> None:
+        self.dcp_size = 1
+        self.dcp_rank = 0
+        self.uneven_dcp = False
+        self.uneven_dcp_weighted = False
+        self.cp_S = self.cp_lo = self.cp_hi = self.cp_ratio = 0
+        self.dcp_kv_replicated_heads = True
+        self.dcp_model_config = model_config
+        self.is_draft_worker = bool(getattr(runner, "is_draft_worker", False))
+        if runner is None or model_config is None:
+            return
+        try:
+            from sglang.srt.runtime_context import get_parallel
+
+            parallel = get_parallel()
+            dcp_size = int(parallel.attn_dcp_size)
+            dcp_rank = int(parallel.attn_dcp_rank)
+            attn_tp_size = int(parallel.attn_tp_size)
+        except Exception:
+            return
+        if dcp_size <= 1:
+            return
+        from sglang.srt.distributed.utils import (
+            attn_kv_replicated,
+            uneven_dcp_active,
+            uneven_dcp_kv_replicated,
+        )
+        from sglang.srt.layers.dcp.owner import (
+            dcp_weighted_owner_bounds,
+            register_owner_bounds_consumer,
+        )
+
+        uneven_plan = uneven_dcp_kv_replicated(dcp_size)
+        if self.is_draft_worker:
+            # Same exclusion as the dense backends: the draft's pool keeps the
+            # full token context, so DCP is off for this instance.
+            return
+        self.dcp_size = dcp_size
+        self.dcp_rank = dcp_rank
+        self.uneven_dcp = bool(uneven_plan)
+        self.uneven_dcp_weighted = self.uneven_dcp and uneven_dcp_active(dcp_size)
+        total_kv = int(model_config.get_total_num_kv_heads())
+        self.dcp_kv_replicated_heads = (
+            attn_kv_replicated(attn_tp_size, total_kv) if self.uneven_dcp else False
+        )
+        if self.uneven_dcp and not self.dcp_kv_replicated_heads:
+            raise ValueError(
+                "QSA sparse attention under uneven DCP needs replicated kv heads "
+                f"(kv heads {total_kv} >= attention TP {attn_tp_size}); the "
+                "head-sharded kv gather is not wired for this backend."
+            )
+        if self.uneven_dcp_weighted:
+            self.cp_S, self.cp_lo, self.cp_hi, self.cp_ratio = dcp_weighted_owner_bounds(
+                dcp_size, dcp_rank
+            )
+            register_owner_bounds_consumer(self)
+        logger.info(
+            "[qsa-dcp] sparse attention on DCP rank %d/%d (%s owner rule%s)",
+            dcp_rank,
+            dcp_size,
+            "weighted" if self.uneven_dcp_weighted else "even",
+            f", cp_S={self.cp_S} [{self.cp_lo},{self.cp_hi})" if self.uneven_dcp_weighted else "",
+        )
+
+    def _dcp_group_q_head_counts(self, local_heads: int) -> list:
+        from sglang.srt.layers.attention.triton_backend import (
+            _plan_aware_dcp_group_q_head_counts,
+        )
+
+        return _plan_aware_dcp_group_q_head_counts(
+            self.dcp_model_config, self.dcp_size, local_heads
+        )
+
+    def _set_kv_buffer(self, forward_batch, layer, k: torch.Tensor, v: torch.Tensor) -> None:
+        """Store this forward's k/v: every row on a non-DCP pool, only the
+        owned rows (at their compact slot) under DCP -- the dense backends'
+        write rule, stated through the same shared helpers."""
+        loc = forward_batch.out_cache_loc
+        if self.dcp_size <= 1:
+            self.token_to_kv_pool.set_kv_buffer(layer, loc, k, v)
+            return
+        if self.uneven_dcp_weighted:
+            from sglang.srt.layers.dcp.owner import dcp_weighted_write_slots
+
+            loc, mask = dcp_weighted_write_slots(
+                loc, self.cp_S, self.cp_lo, self.cp_hi, self.cp_ratio
+            )
+        else:
+            from sglang.srt.layers.dcp.owner import dcp_even_write_mask
+
+            mask = dcp_even_write_mask(
+                forward_batch.positions,
+                loc.numel(),
+                self.dcp_size,
+                self.dcp_rank,
+                getattr(forward_batch, "dcp_kv_mask", None),
+            )
+            loc = loc // self.dcp_size
+        self.token_to_kv_pool.set_kv_buffer(layer, loc, k, v, dcp_kv_mask=mask)
+
+    def _local_rows(self, slots: torch.Tensor) -> torch.Tensor:
+        """Global KV slots (-1 = none) -> this rank's pool rows, -1 where the
+        slot is invalid or owned by another rank."""
+        if self.dcp_size <= 1:
+            return slots.to(torch.int32)
+        valid = slots >= 0
+        if self.uneven_dcp_weighted:
+            from sglang.srt.layers.dcp.owner import dcp_weighted_read_slots
+
+            compact, owned = dcp_weighted_read_slots(
+                slots.clamp(min=0), self.cp_S, self.cp_lo, self.cp_hi, self.cp_ratio
+            )
+        else:
+            safe = slots.clamp(min=0)
+            owned = (safe % self.dcp_size) == self.dcp_rank
+            compact = (safe // self.dcp_size).to(torch.int32)
+        return torch.where(valid & owned, compact, torch.full_like(compact, -1))
+
+    def _topk_rows(self, topk_indices: torch.Tensor, metadata) -> torch.Tensor:
+        """Per-query top-k (logical positions) -> this rank's pool rows."""
+        slots = self._logical_to_physical(topk_indices, metadata)
+        return self._local_rows(slots)
+
+    def _attend_rows(self, q: torch.Tensor, layer, rows: torch.Tensor) -> torch.Tensor:
+        """Sparse attention over ``rows`` for this rank's q heads; under DCP the
+        group's heads are gathered, the owned partial computed, and the
+        partials LSE-merged back to this rank's heads."""
+        pool = self.token_to_kv_pool
+        k_pool = pool.get_key_buffer(layer.layer_id)
+        v_pool = pool.get_value_buffer(layer.layer_id)
+        if self.dcp_size <= 1:
+            out, _ = sparse_attn_rows_triton(q.contiguous(), k_pool, v_pool, rows, layer.scaling)
+            return out
+        from sglang.srt.layers.dcp.comm import (
+            cp_all_gather_heads_uneven,
+            cp_lse_ag_out_ar_mha_uneven,
+        )
+        from sglang.srt.runtime_context import get_parallel
+
+        group = get_parallel().dcp_group
+        counts = self._dcp_group_q_head_counts(q.shape[1])
+        q_all = cp_all_gather_heads_uneven(q.contiguous(), group, counts)
+        out, lse = sparse_attn_rows_triton(q_all, k_pool, v_pool, rows, layer.scaling)
+        return cp_lse_ag_out_ar_mha_uneven(out, lse, group, counts)
 
     @staticmethod
     def _is_speculative_paged_mode(forward_mode) -> bool:
@@ -1263,9 +1430,7 @@ class QwenSparseAttnBackend(AttentionBackend):
         if topk_indices is None:
             raise ValueError("QSA sparse attention requires topk_indices")
         if save_kv_cache:
-            self.token_to_kv_pool.set_kv_buffer(
-                layer, forward_batch.out_cache_loc, k, v
-            )
+            self._set_kv_buffer(forward_batch, layer, k, v)
         q = q.reshape(-1, layer.tp_q_head_num, layer.head_dim)
         num_output_rows = q.shape[0]
         num_valid_rows = topk_indices.shape[0]
@@ -1315,6 +1480,14 @@ class QwenSparseAttnBackend(AttentionBackend):
                 cu_seqlens_q,
                 layer.scaling,
             )
+            return self._pad_extend_output(output, num_output_rows)
+
+        if self.dcp_size > 1:
+            # WP3b: the prefix rows live on their owner ranks; attend the owned
+            # subset on the gathered heads and LSE-merge (see _attend_rows).
+            metadata = self._resolve_metadata(forward_batch)
+            rows = self._topk_rows(topk_indices, metadata)
+            output = self._attend_rows(q, layer, rows)
             return self._pad_extend_output(output, num_output_rows)
 
         # The validated chunk-prefill kernel consumes tightly packed full-context
@@ -1501,9 +1674,7 @@ class QwenSparseAttnBackend(AttentionBackend):
         if topk_indices is None:
             raise ValueError("QSA sparse attention requires topk_indices")
         if save_kv_cache:
-            self.token_to_kv_pool.set_kv_buffer(
-                layer, forward_batch.out_cache_loc, k, v
-            )
+            self._set_kv_buffer(forward_batch, layer, k, v)
         q = q.reshape(-1, layer.tp_q_head_num, layer.head_dim)
         return self._forward_paged_attention(q, layer, forward_batch, topk_indices)
 
@@ -1525,7 +1696,16 @@ class QwenSparseAttnBackend(AttentionBackend):
 
         metadata = self._resolve_metadata(forward_batch)
         topk_indices = topk_indices.to(torch.int32).contiguous()
-        trtllm_decode = _resolve_trtllm_sparse_decode()
+        trtllm_decode = _resolve_trtllm_sparse_decode() if self.dcp_size <= 1 else None
+        if trtllm_decode is None and (
+            self.dcp_size > 1 or _resolve_flash_attn_varlen_func_or_none() is None
+        ):
+            # WP3b rows path: the Triton rows kernel over the pool (owned rows
+            # under DCP, merged across the group); also the only decode route
+            # on a host without FA2/FA4 (this rig's serving venv has neither).
+            rows = self._topk_rows(topk_indices, metadata)
+            output = self._attend_rows(q, layer, rows)
+            return output.reshape(q.shape[0], -1)
         if trtllm_decode is not None:
             return self._forward_trtllm_sparse(
                 q,
