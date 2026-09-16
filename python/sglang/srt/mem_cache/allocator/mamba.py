@@ -23,6 +23,7 @@ free-slot bookkeeping.
 from __future__ import annotations
 
 import logging
+import sys
 import traceback
 from typing import Iterator, Optional
 
@@ -220,7 +221,17 @@ class MambaSlotAllocator:
             seq = getattr(self, "_slot_event_seq", 0) + 1
             self._slot_event_seq = seq
             if kind == "FREE":
-                where = "".join(traceback.format_stack(limit=self._PROV_FRAMES + 3)[:-3])
+                # #1429 (xsn190 py-spy): `traceback.format_stack` reads source
+                # lines through linecache on EVERY free, and the idle PP loop
+                # frees a probe slot ~1000x/s (alloc_group_end) -- the main
+                # thread spent its idle time here. A raw frame walk records the
+                # same provenance (file:line function) at microsecond cost.
+                frames = []
+                f = sys._getframe(1)
+                while f is not None and len(frames) < self._PROV_FRAMES:
+                    frames.append(f"  {f.f_code.co_filename}:{f.f_lineno} {f.f_code.co_name}")
+                    f = f.f_back
+                where = "\n".join(reversed(frames))
             else:
                 where = ""
             for slot in index.tolist() if hasattr(index, "tolist") else [index]:
