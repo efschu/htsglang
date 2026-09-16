@@ -53,13 +53,21 @@ class _Tree:
 
 
 def _fake(hold, hicache=True):
-    return SimpleNamespace(
+    f = SimpleNamespace(
         weg2_dormant_hold=hold,
         enable_hicache_storage=hicache,
         tree_cache=_Tree(),
         ipc_channels=SimpleNamespace(send_to_tokenizer=_Tok()),
         waiting_queue=[],
+        prefetched=[],
     )
+    # #1448: the release re-enters intake; the fake's intake records the
+    # prefetch and queues, like the real one does once the flag is cleared.
+    def _intake(req):
+        f.prefetched.append(req.rid)
+        f.waiting_queue.append(req)
+    f._add_request_to_queue = _intake
+    return f
 
 
 def _req(rid):
@@ -80,6 +88,8 @@ class AbortReachesTheHold(CustomTestCase):
         # and the release afterwards no longer re-queues the aborted one
         Scheduler._weg2_release_dormant_hold(f)
         self.assertEqual([r.rid for r in f.waiting_queue], ["weg2-0-1", "weg2-0-2"])
+        self.assertEqual(f.prefetched, ["weg2-0-1", "weg2-0-2"])  # #1448: prefetch at the wake
+        self.assertEqual(f.weg2_dormant_hold, [])
 
     def test_abort_all_empties_the_hold(self):
         f = _fake([_req("a"), _req("b")])
@@ -113,6 +123,14 @@ class Wiring(CustomTestCase):
         # after the waiting-queue loop, before the grammar queue
         self.assertLess(src.index("Abort queued request"), src.index("_weg2_abort_dormant_hold"))
         self.assertLess(src.index("_weg2_abort_dormant_hold"), src.index("grammar_manager.abort_requests"))
+
+    def test_hold_precedes_the_prefetch_1448(self):
+        src = inspect.getsource(Scheduler._add_request_to_queue)
+        self.assertLess(src.index("weg2_dormant_hold"), src.index("_prefetch_kvcache(req)"))
+        self.assertLess(src.index("weg2_dormant_hold"), src.index("weg2_store_told.intake("))
+        rel = inspect.getsource(Scheduler._weg2_release_dormant_hold)
+        self.assertIn("self._add_request_to_queue(req)", rel)
+        self.assertNotIn("waiting_queue.extend", rel)
 
     def test_health_probe_takes_w25_not_the_hold(self):
         src = inspect.getsource(Scheduler.handle_generate_request)
