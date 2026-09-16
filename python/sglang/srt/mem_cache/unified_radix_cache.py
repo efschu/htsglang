@@ -3025,6 +3025,23 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             usable_units, target_units, ok, getattr(UnifiedRadixCache, "_weg2_end_anchor_short", 0),
         )
 
+    def _weg2_host_is_transit(self) -> bool:
+        """Arena = L2 (user order 2026-09-16): with the shared arena in front
+        of the disk store, a node's host copy is transit only -- released on
+        the store ack. Boots xsn148-150: three ~80k prompts (unique ~84k
+        tokens) against P's 54k-slot host pool, write_back kept every acked
+        host copy, the pool filled, the sweep refused the rest (refused=13),
+        D found nothing. SGLANG_WEG2_HOST_TRANSIT=0 keeps the old L2 form."""
+        cached = getattr(self, "_weg2_host_transit", None)
+        if cached is None:
+            import os as _os
+
+            cached = bool(_os.environ.get("SGLANG_HICACHE_ARENA_DIR", "").strip()) and (
+                _os.environ.get("SGLANG_WEG2_HOST_TRANSIT", "1") == "1"
+            )
+            self._weg2_host_transit = cached
+        return bool(cached)
+
     def _weg2_release_chain_piece_host(self, node) -> None:
         """#1407: a publish-chain head piece is in the store now (ack); its
         host copy was transit only. Free the host rows (HOST layer only --
@@ -5299,7 +5316,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                     # would license a free that loses the KV.
                     node.l3_present = True
                     self.dec_host_lock_ref(node, lock_params)
-                    if getattr(node, "_weg2_chain_piece", False):
+                    if getattr(node, "_weg2_chain_piece", False) or self._weg2_host_is_transit():
                         self._weg2_release_chain_piece_host(node)
                 # #810: the storage write acked -- this is the drain the
                 # staging ring measures its residency against. Outside the
