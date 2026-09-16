@@ -176,6 +176,11 @@ static int64_t find_slot(uint8_t *base, uint64_t klo, uint64_t khi) {
 /* claim a FREE slot for key (index entry published); -1 = arena full */
 static int64_t claim_slot(uint8_t *base, uint64_t klo, uint64_t khi, uint64_t total) {
     ArenaHeader *h = hdr(base);
+    /* #1431 (xsn193): a FULL arena refused every page only after walking all
+     * 524288 slot headers -- per page, per sweep -- and P's main thread spent
+     * its bubbles in here. The counters know the answer in O(1). They are
+     * kept exact by claim/complete/evict/free below. */
+    if (atomic_load(&h->n_complete) + atomic_load(&h->n_claimed) >= h->slots) return -1;
     uint64_t start = atomic_fetch_add(&h->clock_hand, 1) % h->slots;
     for (uint64_t n = 0; n < h->slots; n++) {
         uint64_t s = (start + n) % h->slots;
@@ -537,11 +542,16 @@ int64_t arena_data_offset(uint8_t *base) {
     return o[4];
 }
 void arena_free_slots(uint8_t *base, int64_t n, const int64_t *slots) {
+    ArenaHeader *h = hdr(base);
     for (int64_t i = 0; i < n; i++) {
         SlotHeader *sh = slot_hdr(base, (uint64_t)slots[i]);
+        uint32_t prev = atomic_exchange(&sh->state, S_FREE);
         sh->key_lo = 0; sh->key_hi = 0;
         sh->generation++;  /* #1427: a late arena_complete on this slot is refused */
-        atomic_store(&sh->state, S_FREE);
+        /* #1431: keep the occupancy counters exact (EVICTING was already
+         * taken out of n_complete by arena_evict_candidates). */
+        if (prev == S_COMPLETE) atomic_fetch_sub(&h->n_complete, 1);
+        else if (prev == S_CLAIMED) atomic_fetch_sub(&h->n_claimed, 1);
     }
 }
 

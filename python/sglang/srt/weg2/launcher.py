@@ -4751,12 +4751,21 @@ def build_env(tree: str, venv: str, cvd: str, store_dir: str, debug_hold: bool, 
     # 16 GiB = 524k KV pages: three ~100k prefixes fit without eviction
     # (boot xsn153: three 80k prefixes overflowed 8 GiB, evictions dropped
     # pages other ranks had written, followers found "store_absent").
-    env.setdefault("SGLANG_HICACHE_ARENA_GIB", "16")
+    # #1431 (xsn193): the park test's working set is 6 x 100k tokens x 32 KiB
+    # = 19.5 GiB and every page a live tree node references stays in the
+    # arena (the host copy IS the slot); 16 GiB ran full. 28 GiB = 917k
+    # slots at 28; 24 GiB = 786k slots is enough for the 600k and leaves the
+    # mamba arena its share: the ledger's last dry-run had 18.7 GiB of
+    # headroom (75.74 of 94.43 GiB) for both.
+    env.setdefault("SGLANG_HICACHE_ARENA_GIB", "24")
     # #1424 Stufe 3: the host tier IS the arena (rows = slots, reads in place);
     # the per-rank pool shrinks to a 1 GB staging ring for the write side.
     env.setdefault("SGLANG_HICACHE_ARENA_HOST", "1")
     env.setdefault("SGLANG_HICACHE_ARENA_STAGING_GB", "0.05")  # #1430: fallback range only
-    env.setdefault("SGLANG_HICACHE_ARENA_MAMBA_SLOTS", "128")  # #1410: 48 thrashed on 3x100k (xsn159)
+    # #1410: 48 thrashed on 3x100k (xsn159). #1431: one anchor state per 4096
+    # tokens x 6 x 100k = ~150 live blobs in the park test, 128 ran full;
+    # 192 x 46.76 MiB = 8.8 GiB (with 24 GiB KV: 32.8 GiB shm, fundable).
+    env.setdefault("SGLANG_HICACHE_ARENA_MAMBA_SLOTS", "192")
     # write_back + bubble publisher (weg2_bubble_publish, 2026-09-16): the
     # publish sweep runs bounded in the PP loop's bubbles, nothing is left
     # for the flip's flush. "0" in the operator's environment disables it.

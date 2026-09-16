@@ -60,3 +60,17 @@ def test_too_large_and_full_arena(arena):
     got = arena.claim_slots([f"k{i}" for i in range(16)], [SLOT] * 16)
     assert all(st == 0 for _, st, _ in got)
     assert arena.claim_slots(["one_more"], [SLOT])[0][1] == 4
+
+
+def test_a_full_arena_refuses_in_constant_time_and_free_restores_the_counters(arena):
+    import time
+    got = arena.claim_slots([f"f{i}" for i in range(16)], [SLOT] * 16)
+    assert all(st == 0 for _, st, _ in got)
+    st = arena.stats()
+    t0 = time.perf_counter()
+    for _ in range(2000):
+        assert arena.claim_slots(["late"], [SLOT])[0][1] == 4
+    assert time.perf_counter() - t0 < 1.0, "#1431: a full arena must not walk every slot per claim"
+    arena.free_slots([s for s, _, _ in got[:4]])
+    assert [x for _, x, _ in arena.claim_slots(["a", "b", "c", "d"], [SLOT] * 4)] == [0, 0, 0, 0]
+    assert arena.claim_slots(["e"], [SLOT])[0][1] == 4
