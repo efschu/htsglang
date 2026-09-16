@@ -222,6 +222,26 @@ def _follower_register(scheduler, req, told: int) -> str:
     verdict = scheduler._prefetch_kvcache(
         req, limit_tokens=follower_limit_tokens(scheduler.tree_cache, told)
     )
+    if str(verdict) == "declined:too_short" and _local_prefix(req) >= int(told):
+        # Boot xsn141 (2026-09-16, the first with the shared arena): PP0's
+        # device tree had evicted part of a prefix its followers still held
+        # (PP0 carries 39 of 64 layers, so its pool of 487k tokens is the
+        # first to evict), PP0 read 686 tokens from the store to reach
+        # told=3615, and the followers -- already holding >= 3616 locally --
+        # had nothing to fetch: prefetch_length 0 < threshold, "too_short",
+        # declined, and admission raised the mismatch on own_prefix=0. A
+        # follower that already HOLDS the told span has satisfied it; it
+        # registers nothing and admits at told.
+        satisfied = getattr(scheduler, "_weg2_store_told_satisfied", None)
+        if satisfied is None:
+            satisfied = scheduler._weg2_store_told_satisfied = {}
+        satisfied[_rid(req)] = int(told)
+        logger.info(
+            "#1400 FOLLOWER SATISFIED LOCALLY rid=%s told=%d local_prefix=%d: "
+            "nothing to read, this rank already holds the told span",
+            rid8(req), int(told), _local_prefix(req),
+        )
+        return "satisfied:local_prefix"
     if not str(verdict).startswith("issued"):
         logger.warning(
             "#1400 FOLLOWER REGISTRATION DECLINED rid=%s told=%d verdict=%s: this "
@@ -236,6 +256,17 @@ def _follower_register(scheduler, req, told: int) -> str:
 
 def rid8(req) -> str:
     return _rid(req)[:8]
+
+
+def _local_prefix(req) -> int:
+    """Tokens this rank already holds for ``req`` (device + host tier), the
+    same two terms ``_prefetch_kvcache`` subtracts before it reads."""
+    try:
+        return int(len(getattr(req, "prefix_indices", []) or [])) + int(
+            getattr(req, "host_hit_length", 0) or 0
+        )
+    except Exception:  # noqa: BLE001 - a double without the fields holds nothing
+        return 0
 
 
 def pp0_publish(scheduler, recv_reqs: List) -> List:
@@ -327,6 +358,13 @@ def admission(scheduler, req, note_skip: Callable[[str, Any], None]) -> Optional
         note_skip(SKIP_TOLD_PENDING, rid)
         return None
     tree = scheduler.tree_cache
+    satisfied = getattr(scheduler, "_weg2_store_told_satisfied", None) or {}
+    if rid in satisfied:
+        # registered nothing because it already held the span (see
+        # _follower_register): admit at told, no read to wait for.
+        satisfied.pop(rid, None)
+        told_map.pop(rid, None)
+        return 0
     deadline = time.monotonic() + WAIT_CAP_S
     waited = False
     while not tree.check_prefetch_progress(rid):

@@ -286,3 +286,30 @@ def test_follower_limit_is_one_token_more_under_bigram_keys():
     m.intake(s, r, lambda k: None)
     m.follower_absorb(s, [m.Weg2StoreTold("5f5f0001", 4095)])
     assert s.registered == [("5f5f0001", 4096)]
+
+
+def test_follower_that_already_holds_the_told_span_is_satisfied_without_a_read():
+    """Boot xsn141: PP0 read to told=3615, the followers held >= 3616 locally,
+    their prefetch was 'declined:too_short' (nothing to fetch) and admission
+    raised the mismatch on own_prefix=0. Holding the span IS satisfying it."""
+    s = _Sched(1)
+    m.armed(s)
+    s._prefetch_kvcache = lambda req, rematch=True, limit_tokens=None: "declined:too_short"
+    r = SimpleNamespace(rid="eeee0001", prefetch_deferred=None,
+                        prefix_indices=list(range(3000)), host_hit_length=700)
+    s.waiting_queue.append(r)
+    gates = []
+    assert m.intake(s, r, gates.append) == "declined:weg2_held"
+    m.follower_absorb(s, [m.Weg2StoreTold("eeee0001", 3615)])
+    skips, note = _skips()
+    assert m.admission(s, r, note) == 0  # admitted at told, no credit, no wait
+    assert skips == []
+    # a follower that holds LESS than told still refuses by name
+    r2 = SimpleNamespace(rid="eeee0002", prefetch_deferred=None,
+                         prefix_indices=list(range(100)), host_hit_length=0)
+    s.waiting_queue.append(r2)
+    m.intake(s, r2, gates.append)
+    m.follower_absorb(s, [m.Weg2StoreTold("eeee0002", 3615)])
+    s.tree_cache.register("eeee0002", loaded=0, flips=0)
+    with pytest.raises(m.Weg2StoreToldMismatch):
+        m.admission(s, r2, note)
