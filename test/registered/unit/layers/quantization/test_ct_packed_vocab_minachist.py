@@ -241,3 +241,23 @@ def test_load_packed_hc_linear_widens_into_the_dense_parameter():
     assert torch.allclose(param.float(), ref, atol=2e-2, rtol=2e-2)
     assert not load_packed_hc_linear(pending, "model.layers.3.linear_attn.out_proj.weight_packed", packed, params)
     assert not load_packed_hc_linear(pending, mod + ".weight", ref, params)  # a bf16 export loads the plain way
+
+
+def test_vocab_gets_a_quant_config_only_when_a_group_names_it():
+    """cyankiwi: targets [Linear], embedding dense and not in ignore -> no
+    quant_config for the vocab (the ignore-only rule would say quantized).
+    Minachist: `re:.*embed_tokens` names it -> quantized. Explicit names too."""
+    from sglang.srt.layers.quantization.compressed_tensors.ct_embedding import (
+        vocab_named_in_targets,
+    )
+
+    name = "model.language_model.embed_tokens"
+    cyankiwi = {"config_groups": {"group_0": {"targets": ["Linear"]}}, "ignore": ["lm_head"]}
+    assert not vocab_named_in_targets(cyankiwi, name)
+    minachist = {"config_groups": {"group_3": {"targets": ["re:.*lm_head", "re:.*embed_tokens"]}}}
+    assert vocab_named_in_targets(minachist, name)
+    assert vocab_named_in_targets(minachist, "lm_head")
+    explicit = {"config_groups": {"g": {"targets": [name]}}}
+    assert vocab_named_in_targets(explicit, name)
+    assert not vocab_named_in_targets(explicit, "lm_head")
+    assert not vocab_named_in_targets({}, name)

@@ -44,6 +44,9 @@ from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.moe import get_moe_a2a_backend, should_use_dp_reduce_scatterv
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.compressed_tensors.ct_embedding import (
+    vocab_named_in_targets,
+)
 from sglang.srt.layers.quantization.compressed_tensors.schemes.compressed_tensors_wNa16 import (
     dequantize_pack_quantized_weight,
 )
@@ -1728,16 +1731,25 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ) -> nn.Module:
-        # quant_config + prefix: Minachist's AutoRound export packs
-        # embed_tokens (INT8 g128, group_3 `re:.*embed_tokens`); the vocab
-        # branch of the compressed-tensors config answers the dense
-        # UnquantizedEmbeddingMethod for every checkpoint that does not.
+        # Minachist's AutoRound export packs embed_tokens (INT8 g128, group_3
+        # `re:.*embed_tokens`) -- the vocab gets the quant_config only when a
+        # config group NAMES it. cyankiwi (targets [Linear], embedding dense
+        # and, being no Linear, absent from the ignore list) keeps the dense
+        # embedding it always had; the ignore-only vocab rule would have
+        # called it quantized.
+        name = add_prefix("embed_tokens", prefix)
+        raw = getattr(quant_config, "config", None)
+        vocab_quant = (
+            quant_config
+            if isinstance(raw, dict) and vocab_named_in_targets(raw, name)
+            else None
+        )
         return VocabParallelEmbedding(
             config.vocab_size,
             config.hidden_size,
             org_num_embeddings=config.vocab_size,
-            quant_config=quant_config,
-            prefix=add_prefix("embed_tokens", prefix),
+            quant_config=vocab_quant,
+            prefix=name,
             use_attn_tp_group=is_dp_attention_enabled(),
         )
 

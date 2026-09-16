@@ -102,6 +102,35 @@ def vocab_is_quantized(quant_config: Dict[str, Any], layer_name: str) -> bool:
     return True
 
 
+def vocab_named_in_targets(quant_config: Dict[str, Any], layer_name: str) -> bool:
+    """Does a config group NAME this vocab layer -- verbatim or by a ``re:``
+    target? A class-name target (``Linear``) never covers an embedding: HF's
+    ``embed_tokens`` is an ``nn.Embedding``, so an llm-compressor export with
+    ``targets: [Linear]`` (cyankiwi) carries a dense embedding even though
+    its ignore list, which only lists Linears, does not mention it. An
+    AutoRound export that packs the vocab names it (Minachist:
+    ``re:.*embed_tokens``). This is the positive evidence a model class
+    needs before it hands the vocab a quant_config at all; the ignore-list
+    scan in ``vocab_is_quantized`` stays the per-row int8 rule (#727)."""
+    groups = quant_config.get("config_groups") or {}
+    for group in groups.values():
+        for target in (group or {}).get("targets") or []:
+            if not isinstance(target, str):
+                continue
+            if target.startswith("re:"):
+                try:
+                    if re.fullmatch(target[3:], layer_name) or re.search(
+                        target[3:], layer_name
+                    ):
+                        return True
+                except re.error:
+                    if target[3:] == layer_name:
+                        return True
+            elif target == layer_name:
+                return True
+    return False
+
+
 class CompressedTensorsEmbeddingMethod(QuantizeMethodBase):
     """Symmetric per-row int8 vocab, dequantized on gather.
 
