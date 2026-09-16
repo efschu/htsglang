@@ -2504,6 +2504,64 @@ class HiCacheFile(HiCacheStorage):
             return False
         return False
 
+    def arena_fill_from_disk(self, arena, stems, total_bytes: int):
+        """#1433: the L3 -> L2 return path. For every stem that is NOT in the
+        arena but IS on disk: claim a slot, read the whole canonical page from
+        the disk store straight into the slot, complete it. Returns one entry
+        per stem: the slot (COMPLETE, no reference taken yet), or None when
+        the page is not on disk / could not be read / is being filled by
+        another writer right now (join later, it is a miss for this read).
+        Before #1433 the arena was a write-only sink towards the disk: a
+        page evicted to L3 was never read back, the prefix was recomputed."""
+        n = len(stems)
+        out = [None] * n
+        if n == 0:
+            return out
+        try:
+            on_disk = self._stat_stems(list(stems))
+        except Exception:  # noqa: BLE001 - no stat, no fill
+            return out
+        todo = []
+        for i, st in enumerate(stems):
+            if st not in on_disk:
+                continue
+            (slot, status, gen), = arena.claim_slots([st], [int(total_bytes)])
+            if status == 2:
+                out[i] = slot          # raced in by someone else: complete, usable
+            elif status == 0:
+                todo.append((i, slot, gen, st))
+            elif status == 4:
+                try:
+                    self._arena_evict_to_disk(arena, 256)
+                except Exception:  # noqa: BLE001
+                    pass
+                (slot, status, gen), = arena.claim_slots([st], [int(total_bytes)])
+                if status == 0:
+                    todo.append((i, slot, gen, st))
+                elif status == 2:
+                    out[i] = slot
+        if not todo:
+            return out
+        from sglang.srt.mem_cache.storage.file.pageio import load as _load_pageio
+        pio = _load_pageio()
+        paths = [self._existing_path(st) for _, _, _, st in todo]
+        rc = pio.read_pages(paths, [int(total_bytes)] * len(todo), [((0, int(total_bytes)),)] * len(todo),
+                            [arena.slot_ptr(slot) for _, slot, _, _ in todo], True)
+        filled = 0
+        for (i, slot, gen, st), r in zip(todo, rc):
+            if r == 0:
+                cs = arena.complete_slots([slot], [gen], [(0, int(total_bytes))])
+                if cs and cs[0] in (1, 2):
+                    out[i] = slot
+                    filled += 1
+                    continue
+            arena.free_slots([slot])
+        k = getattr(self, "_1433_n", 0) + 1
+        self._1433_n = k
+        if k <= 8 or k % 256 == 0:
+            logger.info("#1433 L3->L2 fill: %d of %d pages read from disk into the arena (n=%d)", filled, len(todo), k)
+        return out
+
     def _arena_evict_to_disk(self, arena, want: int) -> int:
         """Move up to `want` complete, unreferenced, unpinned pages from the
         arena to the disk store (the cold tier), then free their slots."""

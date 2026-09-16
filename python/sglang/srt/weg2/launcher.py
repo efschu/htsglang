@@ -4765,7 +4765,7 @@ def build_env(tree: str, venv: str, cvd: str, store_dir: str, debug_hold: bool, 
     # #1410: 48 thrashed on 3x100k (xsn159). #1431: one anchor state per 4096
     # tokens x 6 x 100k = ~150 live blobs in the park test, 128 ran full;
     # 192 x 46.76 MiB = 8.8 GiB (with 24 GiB KV: 32.8 GiB shm, fundable).
-    env.setdefault("SGLANG_HICACHE_ARENA_MAMBA_SLOTS", "192")
+    env.setdefault("SGLANG_HICACHE_ARENA_MAMBA_SLOTS", "160")  # #1432: 160 x 74.8 MiB = 11.7 GiB, priced
     # write_back + bubble publisher (weg2_bubble_publish, 2026-09-16): the
     # publish sweep runs bounded in the PP loop's bubbles, nothing is left
     # for the flip's flush. "0" in the operator's environment disables it.
@@ -5919,6 +5919,7 @@ def choose_host_ledger(
         weights_cpu_backup_armed,
     )
     ledger_kw = dict(
+        **(_weg2_arena_ledger_terms(model_dir) if model_dir else {}),  # #1432: arena_gib / staging_gb / anchor_mib
         # #1317n D's L2 IS PRICED SEPARATELY FROM P'S. It rides the ONE kwargs
         # block for exactly the reason the block exists (boot weg2sn6a died of
         # a price() call that had drifted from choose()'s keywords): a term
@@ -6138,6 +6139,50 @@ def sleep_group(port: int, log: Log, name: str, weights_tags: List[str]) -> floa
         raise Weg2LaunchRefused(f"sleep({name}) failed: HTTP {code} {body[:300]!r}")
     log(f"sleep({name}) OK in {dt:.0f} ms (tags {','.join(tags)}; flush BEFORE pause per record 1d MUST_FIX)")
     return dt
+
+
+def _weg2_arena_ledger_terms(model: str) -> dict:
+    """#1432: the L2 arena's host bytes and the REAL fallback pool sizes, for
+    the ledger. Sizes come from the same environment the child processes get
+    (SGLANG_HICACHE_ARENA_GIB / _MAMBA_SLOTS / _STAGING_GB, SGLANG_WEG2_MAMBA_
+    ANCHOR_MIB) and the same geometry the store derives: one KV slot per token
+    (all attention layers), one draft slot per KV slot (one layer cell), one
+    mamba slot per canonical GDN blob (hicache_migrate.qwen3_5_mamba_spec,
+    bf16 states -- 78,446,592 B on Qwen3.8-27B, checked against the arena
+    file). Empty dict when the arena host tier is off."""
+    import logging as _logging
+    if os.environ.get("SGLANG_HICACHE_ARENA_HOST", "1") != "1":
+        return {}
+    try:
+        cfg = _model_config(model)
+        text_cfg = cfg.get("text_config") or cfg
+        n_layers = int(text_cfg["num_hidden_layers"])
+        kinds = text_cfg.get("layer_types") or []
+        n_attn = sum(1 for k in kinds if str(k) == "full_attention")
+        n_lin = len(kinds) - n_attn
+        from sglang.srt.planner import pp_cut as _pp_cut
+        cell = int(_pp_cut.kv_mib_per_token_per_attn_layer_from_config(cfg, "fp8_e4m3", n_layers) * (1 << 20))
+        kv_page = cell * n_attn
+        kv_gib = float(os.environ.get("SGLANG_HICACHE_ARENA_GIB", "24") or 24)
+        kv_slots = max(1024, int(kv_gib * (1 << 30)) // max(1, kv_page))
+        from sglang.srt.mem_cache.hicache_migrate import qwen3_5_mamba_spec
+        blob = qwen3_5_mamba_spec(text_cfg, num_linear_layers=n_lin, units=1,
+                                  temporal_itemsize=2, conv_itemsize=2).total_bytes if n_lin else 0
+        mamba_slots = int(os.environ.get("SGLANG_HICACHE_ARENA_MAMBA_SLOTS", "160") or 160)
+        arena_bytes = kv_slots * kv_page + kv_slots * cell + mamba_slots * blob
+        out = dict(
+            arena_gib=arena_bytes / (1 << 30),
+            staging_gb=float(os.environ.get("SGLANG_HICACHE_ARENA_STAGING_GB", "0.05") or 0.05),
+            anchor_mib=int(os.environ.get("SGLANG_WEG2_MAMBA_ANCHOR_MIB", "100") or 100),
+        )
+        _logging.getLogger("weg2.launcher").info(
+            "WEG2-ARENA-LEDGER kv=%d slots x %d B + draft %d x %d B + mamba %d x %d B = %.2f GiB "
+            "(term arena_gib); fallback pools staging=%s GB anchor=%s MiB",
+            kv_slots, kv_page, kv_slots, cell, mamba_slots, blob, out["arena_gib"],
+            out["staging_gb"], out["anchor_mib"])
+        return out
+    except Exception as exc:  # noqa: BLE001 - a mispriced arena is refused, never guessed
+        raise Weg2LaunchRefused(f"W108 Weg2ArenaLedgerRefused: the arena term could not be derived: {exc!r}")
 
 
 def _model_config(model: str) -> dict:

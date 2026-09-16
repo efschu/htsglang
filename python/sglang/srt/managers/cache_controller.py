@@ -2792,9 +2792,16 @@ class HiCacheController:
         stems = [self.storage_backend._get_suffixed_key(k) for k in hash_values]
         found = pool.arena.find_slots(stems)
         slots = []
-        for slot, state in found:
+        for i, (slot, state) in enumerate(found):
             if slot < 0 or state != 2:
-                break
+                # #1433: not in the L2 -- ask the L3. A page on disk is read
+                # straight into a fresh slot and completed; only then is the
+                # prefix really over.
+                fill = self.storage_backend.arena_fill_from_disk(
+                    pool.arena, [stems[i]], int(pool._page_bytes))[0]
+                if fill is None:
+                    break
+                slot = fill
             if pool.arena.ref_slots([slot], +1) != 1:
                 break  # evicted between find and ref: the prefix ends here
             slots.append(slot)
@@ -3715,7 +3722,12 @@ class HiCacheController:
             found = dpool.arena.find_slots(stems)
             rows = [int(host_indices[i * self.page_size]) - dpool.staging_rows for i in range(len(stems))]
             flags, slots, hits = [], [], 0
-            for slot, state in found:
+            for i, (slot, state) in enumerate(found):
+                if slot < 0 or state != 2:  # #1433: L3 -> L2 for the draft page too
+                    fill = self.storage_backend.arena_fill_from_disk(
+                        dpool.arena, [stems[i]], int(dpool._page_bytes))[0]
+                    if fill is not None:
+                        slot, state = fill, 2
                 ok = slot >= 0 and state == 2 and dpool.arena.ref_slots([slot], +1) == 1
                 slots.append(slot if ok else -1)
                 flags.append(bool(ok))

@@ -288,6 +288,10 @@ class ShmArena:
         raw = self._lib.arena_slot_stem(self._base, int(slot))
         return (raw or b"").decode("utf-8", "replace")
 
+    def slot_ptr(self, slot: int) -> int:
+        """Address of slot data inside the mapping (for a C read straight into the slot)."""
+        return int(self._lib.arena_slot_ptr(self._base, int(slot)))
+
     def slot_view(self, slot: int, nbytes: int) -> memoryview:
         off = int(self._lib.arena_slot_ptr(self._base, int(slot))) - int(self._base.value)
         return memoryview(self._mm)[off:off + int(nbytes)]

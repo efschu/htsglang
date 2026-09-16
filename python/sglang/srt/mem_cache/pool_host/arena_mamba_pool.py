@@ -204,6 +204,13 @@ class ArenaMambaPoolHost(MambaPoolHost):
         found = self.arena.find_slots(stems)
         out = []
         for i, (slot, state) in enumerate(found):
+            if slot < 0 or state != 2:
+                # #1433: the L3 return path -- a blob on disk is read straight
+                # into a fresh slot and completed.
+                fill = getattr(backend, "arena_fill_from_disk", None)
+                f = fill(self.arena, [stems[i]], int(self._page_bytes))[0] if callable(fill) else None
+                if f is not None:
+                    slot, state = f, 2
             if slot >= 0 and state == 2 and self.arena.ref_slots([slot], +1) == 1:
                 host_indices[i] = self.staging_rows + slot
                 out.append(True)

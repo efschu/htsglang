@@ -2457,6 +2457,13 @@ def charge_terms(
     # measured" from "measured at zero" and the consumers that grade against a
     # bound refuse on the first rather than summing the second.
     flip_ratchet_gib: Optional[float] = None,
+    # #1432: the arena IS the L2 (Stufe 3/4). Its shm files are a host term of
+    # their own; the per-rank pools behind S/M are fallback ranges now, so a
+    # caller that runs the arena passes their REAL sizes here instead of the
+    # ladder's S/M, which only name the argv arm.
+    arena_gib: float = 0.0,
+    staging_gb: Optional[float] = None,
+    anchor_mib: Optional[int] = None,
     # #1386 [Minimalform HiCache switch]: OFF MEANS OFF, not a smaller S/M.
     # True zeroes `anchors_gib`/`rings_gib` HERE, directly -- never by routing
     # a 0 through `ANCHORS_AT_2400_BYTES`/`RING_*_MULT_GB_PER_S`, which would
@@ -2490,8 +2497,9 @@ def charge_terms(
     deliberately NOT named after the module function that produces the value:
     :func:`price`'s own fix-8 note records what a shadowed name costs.
     """
+    _m_real = m_mib if anchor_mib is None else int(anchor_mib)
     anchors_gib = 0.0 if hicache_disabled else (
-        (ANCHORS_AT_2400_BYTES * (m_mib / ANCHORS_REFERENCE_M_MIB)) / GIB
+        (ANCHORS_AT_2400_BYTES * (_m_real / ANCHORS_REFERENCE_M_MIB)) / GIB
     )
     # #1317n THE TWO GROUPS ARE PRICED SEPARATELY, because they no longer carry
     # the same budget: P only WRITES the store (its 1 GB staging tier is all it
@@ -2499,13 +2507,18 @@ def charge_terms(
     # `s_gb`, so every pre-existing caller and every recorded arm is
     # byte-identical; only a caller that passes a different D budget changes.
     _s_d = s_gb if s_gb_d is None else int(s_gb_d)
+    if staging_gb is not None:  # #1432: both groups run staging-only pools beside the arena
+        _s_p, _s_d = float(staging_gb), float(staging_gb)
+    else:
+        _s_p = s_gb
     rings_gib = 0.0 if hicache_disabled else (
-        (RING_P_MULT_GB_PER_S * s_gb + RING_D_MULT_GB_PER_S * _s_d) * GB / GIB
+        (RING_P_MULT_GB_PER_S * _s_p + RING_D_MULT_GB_PER_S * _s_d) * GB / GIB
     )
     return {
         "heaps_gib": ranks_per_group * (HEAP_AWAKE_GIB + HEAP_DORMANT_GIB),
         "anchors_gib": anchors_gib,
         "rings_gib": rings_gib,
+        "arena_gib": 0.0 if hicache_disabled else float(arena_gib),
         # #1386: the term dict is what `arm_terms_line` reads and what a test
         # checks -- so the switch's OWN state rides here beside its effect,
         # instead of a reader inferring "was it on?" from "are both 0.00?"
@@ -2563,6 +2576,7 @@ def _boot_charges_gib(terms: Dict[str, object]) -> float:
         # what makes `size_store_gib`'s leftover -- and therefore the store --
         # shrink by exactly the deposit rather than by a note in a docstring.
         + terms["xchg_bounce_gib"]
+        + float(terms.get("arena_gib", 0.0) or 0.0)  # #1432: the L2 arena's shm files
     )
 
 
@@ -3813,6 +3827,9 @@ def price(
     # #1386: forwarded to `charge_terms` unchanged -- see that function's
     # docstring for why OFF must zero the term here, not shrink an input.
     hicache_disabled: bool = False,
+    arena_gib: float = 0.0,
+    staging_gb: Optional[float] = None,
+    anchor_mib: Optional[int] = None,
 ) -> Arm:
     """Price one arm at both moments.  Pure.
 
@@ -3969,7 +3986,8 @@ def price(
                                None if flip_ratchet is None
                                else flip_ratchet.charged_gib
                            ),
-                           hicache_disabled=hicache_disabled)
+                           hicache_disabled=hicache_disabled,
+                           arena_gib=arena_gib, staging_gb=staging_gb, anchor_mib=anchor_mib)
     heaps_gib = charges["heaps_gib"]
     anchors_gib = charges["anchors_gib"]
     rings_gib = charges["rings_gib"]
@@ -4998,7 +5016,7 @@ def arm_terms_line(arm) -> str:
         return "n/a" if v is None else f"{float(v):.2f}"
 
     return (
-        f"anchors={_g('anchors_gib')} rings={_g('rings_gib')} "
+        f"anchors={_g('anchors_gib')} rings={_g('rings_gib')} arena={_g('arena_gib')} "
         f"overhead={_g('overhead_gib')} xchg_bounce={_g('xchg_bounce_gib')} "
         f"host_weights={_g('host_ring_gib')} "
         f"ratchet_charged={_g('flip_ratchet_charged_gib')} "
@@ -5080,6 +5098,9 @@ def choose(
     box_state_at: str = "",
     cg_anon_bytes: Optional[int] = None,
     cg_shmem_bytes: Optional[int] = None,
+    arena_gib: float = 0.0,
+    staging_gb: Optional[float] = None,
+    anchor_mib: Optional[int] = None,
 ) -> Tuple[Arm, Optional[float], List[str]]:
     """Walk the ladder; return (arm, reap headroom GiB, printed lines) or W20/W21.
 
@@ -5137,6 +5158,7 @@ def choose(
             model_digest_want=model_digest_want,
             form_key_matches=form_key_matches,
             hicache_disabled=hicache_disabled,
+            arena_gib=arena_gib, staging_gb=staging_gb, anchor_mib=anchor_mib,
         )
         for s, m in arms
     ]
@@ -5690,6 +5712,7 @@ def choose(
                         # the ladder was, or it would name a cap that only fits
                         # an arm the ledger no longer offers.
                         flip_ratchet=flip_ratchet,
+                        arena_gib=arena_gib, staging_gb=staging_gb, anchor_mib=anchor_mib,
                     )
                 except Exception:  # noqa: BLE001 - advice may never mask the refusal
                     return False
