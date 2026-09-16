@@ -8710,6 +8710,63 @@ P_SOLVER_OBJECTIVE_OF = {
 }
 
 
+#: #1447: how much more pinned host bounce a faster cut may cost than the
+#: incumbent (39,13,12), in GiB.  Default 0: the solver ships the fastest cut
+#: at or above the floor whose exchange bounce is no larger than the
+#: incumbent's -- boot weg2xsn204 shipped 40,12,12 under the cap-floor rule and
+#: the ledger refused it (W97, run peak 105 GiB) because that cut's bounce is
+#: priced at the WORST-CASE lane count (no boot has measured it).  An operator
+#: who has the host room grants it here, by number, and the ledger still has
+#: the last word.
+PCUT_BOUNCE_SLACK_ENV = "SGLANG_WEG2_PCUT_BOUNCE_SLACK_GIB"
+
+
+def host_price_for_cut(ns, stage_ratio: str) -> Tuple[float, int, str]:
+    """``(xchg_bounce GiB, lanes, lane source)`` the ledger WOULD charge for
+    this cut -- the same chain ``choose_host_ledger`` prices (``xchg_lane_count``
+    -> ``xchg_bounce_terms_for_arm``), with the same argv-derived inputs, so
+    the solver and the ledger cannot disagree on a candidate's host cost.
+    ``(0.0, 1, "no exchange")`` on an arm that pins no host bounce."""
+    weight_source = str(getattr(ns, "weg2_weight_source", WEIGHT_SOURCE_DEFAULT))
+    oncard_mode = str(getattr(ns, "weg2_xchg_oncard", ONCARD_MODE_DEFAULT))
+    if not xchg_bounce_arm_pins_host(weight_source, oncard_mode):
+        return 0.0, 1, "no exchange"
+    legs = str(getattr(ns, "weg2_xchg_legs", "both") or "both")
+    lanes, prov = xchg_lane_count(stage_ratio, legs)
+    source = ("measured" if "source=measured" in prov
+              else "WORST-CASE" if "WORST-CASE" in prov else "n/a")
+    nbytes, _lines = xchg_bounce_terms_for_arm(
+        weight_source, oncard_mode, str(getattr(ns, "model", "")),
+        getattr(ns, "weg2_xchg_oncard_slot_mib", None),
+        int(getattr(ns, "xchg_bounce_depth", xchg_bounce.ASSEMBLE_DEPTH_DEFAULT)),
+        int(lanes),
+        int(xchg_bounce.resolve_lanes_concurrent(getattr(ns, "xchg_lanes_concurrent", None))),
+        bool(getattr(ns, "xchg_band_credit", False)))
+    return float(nbytes) / GIB, int(lanes), source
+
+
+def host_priced_pick(rows, price, incumbent_gib: float, slack_gib: float):
+    """#1447, pure: ``rows`` are frontier candidates FASTEST FIRST, already at
+    or above the pool floor; ``price(row) -> (gib, lanes, source)``.  Returns
+    ``(first fundable row or None, log lines)`` -- fundable = its bounce is
+    within ``incumbent_gib + slack_gib``.  Every row is priced and printed,
+    the ones the boot did not take included."""
+    picked = None
+    lines = []
+    for row in rows:
+        gib, lanes, source = price(row)
+        ok = float(gib) <= float(incumbent_gib) + float(slack_gib) + 1e-9
+        lines.append(
+            "PP-CUT HOST-PRICE cut=%s attn=%s makespan_ms=%.1f pool=%d xchg_bounce=%.2f GiB "
+            "lanes=%d (%s) vs incumbent %.2f + slack %.2f -> %s"
+            % (_csv(row.layers), _csv(row.attn), float(row.makespan_ms), int(row.pool_tokens),
+               float(gib), int(lanes), source, float(incumbent_gib), float(slack_gib),
+               "FUNDABLE" if ok else "over the host budget"))
+        if ok and picked is None:
+            picked = row
+    return picked, lines
+
+
 def pick_shipped_cut(decision, incumbent_layers, incumbent_attn, objective: str):
     """WHICH priced candidate group P ships, and why.  Pure.
 
@@ -9163,8 +9220,14 @@ def solve_p_cut(
     # 105 GiB over the 95.9 GiB watermark. The rule stays, opt-in
     # (SGLANG_WEG2_PCUT_CAP_FLOOR=1), until the solver prices the exchange
     # bounce of a candidate cut beside its makespan.
+    # #1447: the cap-floor rule is the DEFAULT again on the exchange arm, now
+    # that the solver prices each candidate's host bounce beside its makespan
+    # (host_priced_pick); SGLANG_WEG2_PCUT_CAP_FLOOR=0 turns it off.
+    _cap_floor_default = "1" if xchg_bounce_arm_pins_host(
+        str(getattr(ns, "weg2_weight_source", WEIGHT_SOURCE_DEFAULT)),
+        str(getattr(ns, "weg2_xchg_oncard", ONCARD_MODE_DEFAULT))) else "0"
     if (_floor_flag is None and int(getattr(ns, "p_bs", DEFAULT_P_BS)) == 1
-            and os.environ.get("SGLANG_WEG2_PCUT_CAP_FLOOR", "0") == "1"):
+            and os.environ.get("SGLANG_WEG2_PCUT_CAP_FLOOR", _cap_floor_default) == "1"):
         # #1441 (user 16.09.): with ONE chunked prefill at a time on P (sglang's
         # single chunked_req; --p-bs 1) the pool only has to hold the largest
         # request plus one chunk, so the floor is the cap, not the ordered
@@ -9306,6 +9369,39 @@ def solve_p_cut(
             P_PP_ATTN_STAGE_RATIO_SCORES,
             str(ns.pp_solve_objective),
         )
+        # #1447: on the exchange arm the makespan pick is re-read against the
+        # HOST cost of every frontier row at/above the floor, fastest first:
+        # the boot ships the first one whose pinned bounce fits the incumbent's
+        # plus the operator's slack.  The ledger keeps the last word.
+        if str(ns.pp_solve_objective) == "makespan" and xchg_bounce_arm_pins_host(
+                str(getattr(ns, "weg2_weight_source", WEIGHT_SOURCE_DEFAULT)),
+                str(getattr(ns, "weg2_xchg_oncard", ONCARD_MODE_DEFAULT))):
+            _floor = decision.pool_floor
+            _rows = [c for c in decision.frontier
+                     if _floor is None or float(c.pool_tokens) >= float(_floor)]
+            _inc_gib, _inc_lanes, _inc_src = host_price_for_cut(
+                ns, _csv(P_PP_STAGE_RATIO_SCORES))
+            try:
+                _slack = float(os.environ.get(PCUT_BOUNCE_SLACK_ENV, "0") or 0.0)
+            except ValueError:
+                _slack = 0.0
+            log("PP-CUT HOST-PRICE incumbent %s: xchg_bounce=%.2f GiB lanes=%d (%s); slack %s=%.2f GiB; "
+                "%d frontier rows at/above the floor priced fastest first"
+                % (_csv(P_PP_STAGE_RATIO_SCORES), _inc_gib, _inc_lanes, _inc_src,
+                   PCUT_BOUNCE_SLACK_ENV, _slack, len(_rows)))
+            _picked, _hp_lines = host_priced_pick(
+                _rows, lambda r: host_price_for_cut(ns, _csv(r.layers)), _inc_gib, _slack)
+            for _ln in _hp_lines:
+                log(_ln)
+            if _picked is None:
+                log("PP-CUT HOST-PRICE: NO frontier row at/above the floor is fundable within "
+                    "the incumbent's bounce + slack -- the makespan pick stays and the ledger decides")
+            elif _picked is not chosen:
+                chosen, ship_why = _picked, (
+                    "the fastest frontier cut at/above the floor whose exchange bounce fits the "
+                    "incumbent's + slack (#1447 host-priced; the makespan pick %s/%s costs more host)"
+                    % (_csv((decision.makespan or decision.chosen).layers),
+                       _csv((decision.makespan or decision.chosen).attn)))
     # ALL THREE ARMS PRICED ON EVERY BOOT, the shipped one named.  The two the
     # boot did NOT take are the whole reason this line exists: the makespan
     # default was paid for weeks because its alternative was never printed
