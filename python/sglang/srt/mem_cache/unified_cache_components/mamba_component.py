@@ -1526,11 +1526,27 @@ class MambaComponent(TreeComponent):
             ]
 
         if phase == CacheTransferPhase.PREFETCH:
-            _ar = getattr(self._mamba_pool_host, "alloc_read", None)  # #1427: arena pool, placeholder
-            host_indices = _ar(1) if callable(_ar) else self._mamba_pool_host.alloc(1)
-            if host_indices is None:
-                self.cache.evict_host(1, ComponentType.MAMBA)
-                host_indices = self._mamba_pool_host.alloc(1)
+            _mp = self._mamba_pool_host
+            if hasattr(_mp, "alloc_read"):
+                # #1427/#1430: the arena pool resolves blobs in place; it binds
+                # itself here if init/rebind did not, and an unbound pool
+                # yields NO transfer (the prefix is capped, recomputed) --
+                # never an anchor-slot copy.
+                if getattr(_mp, "arena", None) is None:
+                    _be = getattr(self.cache.cache_controller, "storage_backend", None)
+                    try:
+                        if _be is not None:
+                            _mp.ensure_bound(_be)
+                    except Exception:  # noqa: BLE001
+                        pass
+                if getattr(_mp, "arena", None) is None:
+                    return []
+                host_indices = _mp.alloc_read(1)
+            else:
+                host_indices = _mp.alloc(1)
+                if host_indices is None:
+                    self.cache.evict_host(1, ComponentType.MAMBA)
+                    host_indices = _mp.alloc(1)
             if host_indices is None:
                 return []
             return [

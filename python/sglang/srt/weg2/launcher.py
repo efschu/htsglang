@@ -2694,7 +2694,10 @@ def common_flags(
         "--enable-hierarchical-cache",
         "--hicache-host-role", "staging",
         "--hicache-size", str(s_gb),
-        "--hicache-mamba-host-mib", str(m_mib),
+        # #1430: the mamba anchor pool is a fallback id range too (Stufe 4b
+        # writes the states into the mamba arena); two slots, not 13. The
+        # ledger still prices M (conservative). Override: SGLANG_WEG2_MAMBA_ANCHOR_MIB.
+        "--hicache-mamba-host-mib", str(int(os.environ.get("SGLANG_WEG2_MAMBA_ANCHOR_MIB", "100") or m_mib)),
         "--hicache-write-policy", write_policy,
         "--hicache-storage-backend", "file",
         "--hicache-mem-layout", "layer_first",
@@ -4752,7 +4755,7 @@ def build_env(tree: str, venv: str, cvd: str, store_dir: str, debug_hold: bool, 
     # #1424 Stufe 3: the host tier IS the arena (rows = slots, reads in place);
     # the per-rank pool shrinks to a 1 GB staging ring for the write side.
     env.setdefault("SGLANG_HICACHE_ARENA_HOST", "1")
-    env.setdefault("SGLANG_HICACHE_ARENA_STAGING_GB", "1")
+    env.setdefault("SGLANG_HICACHE_ARENA_STAGING_GB", "0.05")  # #1430: fallback range only
     env.setdefault("SGLANG_HICACHE_ARENA_MAMBA_SLOTS", "128")  # #1410: 48 thrashed on 3x100k (xsn159)
     # write_back + bubble publisher (weg2_bubble_publish, 2026-09-16): the
     # publish sweep runs bounded in the PP loop's bubbles, nothing is left

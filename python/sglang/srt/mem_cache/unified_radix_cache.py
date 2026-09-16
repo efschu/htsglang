@@ -3090,6 +3090,12 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         mamba transfer of `comp_xfers` (if any) gets its arena slot here too."""
         pool = self._weg2_direct_pool()
         if pool is None:
+            # #1430: on an arena boot the staging path no longer exists for
+            # hashed pages -- an unbound pool refuses, named, and the next
+            # sweep retries once the pool is bound (it binds at init/rebind).
+            if getattr(getattr(self.cache_controller, "mem_pool_host", None), "arena_read", False):
+                self._1421_refused("arena_unbound", node)
+                return False
             return None
         hashes = getattr(node, "hash_value", None)
         dv = node.component_data[BASE_COMPONENT_TYPE].value

@@ -54,7 +54,11 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
 
     def __init__(self, device_pool, host_to_device_ratio, host_size, page_size, layout,
                  *args, **kwargs):
-        staging_gb = int(os.environ.get(ENV_STAGING_GB, "1") or 1)
+        # #1430: the staging rows are a FALLBACK id range only (nodes without
+        # hashes on a non-arena boot); every hashed page is claimed and
+        # written in the arena. 0.05 GB (~1.5k rows) instead of the 1 GB
+        # ring the transit needed -- ~6 GB of pinned host RAM on P.
+        staging_gb = float(os.environ.get(ENV_STAGING_GB, "0.05") or 0.05)
         if host_to_device_ratio and not host_size:
             # the draft pool follows the anchor's size by ratio; keep that
             super().__init__(device_pool, host_to_device_ratio, host_size, page_size, layout,

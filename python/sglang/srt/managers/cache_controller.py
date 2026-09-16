@@ -1254,6 +1254,9 @@ class HiCacheController:
                 storage_backend, self.storage_config, self.mem_pool_host
             )
             self.storage_backend.register_mem_pool_host(self.mem_pool_host)
+            _hand0 = getattr(self, "_weg2_hand_mamba_parts", None)  # #1430: bind at init
+            if callable(_hand0):
+                _hand0()
 
             self.enable_storage = True
             # todo: threshold policy for prefetching
@@ -1660,6 +1663,9 @@ class HiCacheController:
                 _mp = get_pool(PoolName.MAMBA)
                 if hasattr(_mp, "_weg2_parts"):
                     _mp._weg2_parts = self._weg2_mamba_window_parts
+                    _be = getattr(self, "storage_backend", None)
+                    if _be is not None and getattr(_mp, "arena", None) is None:
+                        _mp.ensure_bound(_be)  # #1430: bind as soon as the cut is known
         except Exception:  # noqa: BLE001 - the window itself is unaffected
             logger.warning("#1427 could not hand the mamba window parts to the host pool", exc_info=True)
         logger.info(
@@ -1675,13 +1681,28 @@ class HiCacheController:
         return window
 
     def _weg2_hand_mamba_parts(self) -> None:
-        """#1427c (xsn189): the mamba arena host pool of the CURRENT group gets
-        the window parts. On D the pool is built at the flip rebind, after
-        `_canonical_mamba_window` ran against the previous group, so the
-        hand-over inside that function reached the old pool and D's pool
-        stayed unbound -- it then handed out placeholders nobody resolved."""
-        parts = getattr(self, "_weg2_mamba_window_parts", None)
+        """#1427c/#1430: bind EVERY arena host pool of the CURRENT group --
+        KV, draft, mamba -- as soon as the backend and the windows exist
+        (init, every rebind, the draft install). Before this the pools bound
+        lazily on their first read, and a rank that never reads (PP1/PP2,
+        the draft on P, D's rebuilt mamba pool) stayed on the staging path;
+        with #1430 that path is a refusal, so binding must not wait."""
+        backend = getattr(self, "storage_backend", None)
         group = getattr(self, "mem_pool_host", None)
+        if backend is None or group is None:
+            return
+        try:
+            if getattr(group, "arena_read", False) and hasattr(group, "ensure_bound"):
+                group.ensure_bound(backend, role="kv")
+        except Exception:  # noqa: BLE001
+            logger.warning("#1430 KV arena bind at registration failed", exc_info=True)
+        dpool = getattr(self, "mem_pool_host_draft", None)
+        try:
+            if dpool is not None and getattr(dpool, "arena_read", False) and getattr(dpool, "arena", None) is None:
+                dpool.ensure_bound(backend, role="draft")
+        except Exception:  # noqa: BLE001
+            logger.warning("#1430 draft arena bind at registration failed", exc_info=True)
+        parts = getattr(self, "_weg2_mamba_window_parts", None)
         get_pool = getattr(group, "get_pool", None)
         names = getattr(group, "entry_map", None) or {}
         if parts is None or get_pool is None or PoolName.MAMBA not in names:
@@ -1690,8 +1711,8 @@ class HiCacheController:
             mp = get_pool(PoolName.MAMBA)
             if hasattr(mp, "_weg2_parts"):
                 mp._weg2_parts = parts
-                if mp.arena is None and self.storage_backend is not None:
-                    mp.ensure_bound(self.storage_backend)
+                if mp.arena is None:
+                    mp.ensure_bound(backend)
         except Exception:  # noqa: BLE001 - the pool binds lazily at first use otherwise
             logger.warning("#1427c mamba parts hand-over failed", exc_info=True)
 
@@ -2610,6 +2631,9 @@ class HiCacheController:
             layout.version,
             self.draft_identity,
         )
+        _hand_d = getattr(self, "_weg2_hand_mamba_parts", None)  # #1430: bind the draft pool now
+        if callable(_hand_d):
+            _hand_d()
 
     def prefetch(
         self,

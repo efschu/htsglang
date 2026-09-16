@@ -132,15 +132,14 @@ def test_two_head_shards_join_one_blob(tmp_path):
     assert arena.find_slots(["k.mamba.sfx"])[0][1] == 2
 
 
-def test_an_unbound_pool_hands_out_staging_slots_not_placeholders(tmp_path):
+def test_an_unbound_pool_hands_out_nothing(tmp_path):
     p = object.__new__(ArenaMambaPoolHost)
     p.size = S; p.page_size = 1; p.free_slots = torch.arange(S, dtype=torch.int64)
     import threading
     p.lock = threading.Lock()
     p._arena_init_fields()
-    ids = p.alloc_read(1)
-    assert ids is not None and int(ids[0]) < S and not p.is_placeholder(int(ids[0]))
-    assert p.arena_resolve_reads(types.SimpleNamespace(canonical_mamba_blob=None), ids, ["x.mamba"]) is None
+    assert p.alloc_read(1) is None, "#1430: unbound = no read target, never an anchor slot"
+    assert p.arena_resolve_reads(types.SimpleNamespace(canonical_mamba_blob=None), torch.tensor([0]), ["x.mamba"]) == [False]
 
 
 def test_the_storage_read_hook_reaches_the_resolver_and_never_copies_into_a_placeholder(tmp_path):

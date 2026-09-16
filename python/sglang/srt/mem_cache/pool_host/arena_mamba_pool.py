@@ -188,7 +188,7 @@ class ArenaMambaPoolHost(MambaPoolHost):
         # buffer and the load_back crashed on the stale id. Unbound = the old
         # anchor-slot path.
         if self.arena is None:
-            return self.alloc(n)
+            return None  # #1430: unbound = no read target, not an anchor slot
         base = self.staging_rows + self.arena_slots
         start = self._read_ph_next
         self._read_ph_next = (start + n) % PLACEHOLDERS
@@ -199,7 +199,7 @@ class ArenaMambaPoolHost(MambaPoolHost):
         reference, id written over the placeholder. Returns a flag per key:
         True resolved, None = not in the arena (the caller reads the disk)."""
         if not self.ensure_bound(backend):
-            return None
+            return [False] * len(storage_keys)  # #1430: unbound = miss, never the copy path
         stems = [backend._get_suffixed_key(k) for k in storage_keys]
         found = self.arena.find_slots(stems)
         out = []
