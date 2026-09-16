@@ -2719,7 +2719,11 @@ class HiCacheController:
         if not getattr(pool, "arena_read", False) or self.storage_backend is None:
             return None
         if not pool.ensure_bound(self.storage_backend, role="kv"):
-            return None
+            # xsn176: an unbound arena pool must NOT fall through to the copy
+            # path -- the registration handed out placeholders, and a copy
+            # into them is a StrayHostIndexError that hung the read 8 min.
+            # An honest miss instead.
+            return 0
         stems = [self.storage_backend._get_suffixed_key(k) for k in hash_values]
         found = pool.arena.find_slots(stems)
         slots = []

@@ -196,3 +196,32 @@ def test_host_pool_group_delegates_the_arena_api(tmp_path):
     plain = object.__new__(HostPoolGroup)
     plain.anchor_entry = types.SimpleNamespace(host_pool=types.SimpleNamespace(size=3))
     assert plain.arena_read is False and not hasattr(plain, "alloc_read")
+
+
+def test_whole_page_window_binds_as_k_and_v_halves(tmp_path):
+    """xsn176: D's DCP ranks own the whole page -- one extent (0, total)."""
+    class _Whole:
+        total_bytes = PAGE
+        extents = ((0, PAGE),)
+    p = object.__new__(ArenaMHAHostPool)
+    p.layout = "layer_first"; p.page_size = 1; p.layer_num = 4; p.head_num = H; p.head_dim = D
+    p.dtype = torch.uint8; p.device = "cpu"; p.pin_memory = False; p.size = S
+    p.element_dim = H * D; p.can_use_jit = True
+    p.free_slots = torch.arange(S, dtype=torch.int64); p.slot_used = torch.zeros(S, dtype=torch.bool)
+    p._arena_init_fields()
+    arena = ShmArena(str(tmp_path / "w.bin"), PAGE, 4)
+    p.bind(arena, _Whole(), role="kv", pin=False)
+    _write_page(arena, "w0", 6)
+    slot = arena.find_slots(["w0"])[0][0]
+    assert p.arena_k_refs[3][slot].flatten().tolist() == [6] * CELL
+    assert p.arena_v_refs[0][slot].flatten().tolist() == [6] * CELL
+
+
+def test_unbound_arena_pool_reads_are_honest_misses(tmp_path):
+    p, arena = _pool(tmp_path)
+    p.arena = None
+    be = _Backend(arena)
+    be._canonical_kv_extents = types.SimpleNamespace(total_bytes=PAGE, extents=((0, 8), (8, 8), (16, 8)))
+    c = object.__new__(HiCacheController)
+    c.mem_pool_host = p; c.storage_backend = be; c.page_size = 1
+    assert c._arena_page_get(_Op(), ["h0"], p.alloc_read(1)) == 0

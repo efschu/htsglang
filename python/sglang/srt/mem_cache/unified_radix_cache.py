@@ -3845,7 +3845,10 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         if eligible:
             anchor_lock_params = self.inc_host_lock_ref(last_host_node).to_dec_params()
             _alloc_read = getattr(self.cache_controller.mem_pool_host, "alloc_read", None)
-            if callable(_alloc_read):
+            _bind = getattr(self.cache_controller.mem_pool_host, "ensure_bound", None)
+            if callable(_alloc_read) and callable(_bind) and _bind(
+                self.cache_controller.storage_backend, role="kv"
+            ):
                 # #1424 Stufe 3: read rows are arena slots, resolved at the
                 # read; the registration hands out placeholders, no budget.
                 host_indices = _alloc_read(prefetch_length)

@@ -94,6 +94,11 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
         if int(self.page_size) != 1:
             raise ValueError("#1424 the arena host pool needs page_size 1 (one slot per token)")
         ext = [(int(o), int(l)) for o, l in window.extents]
+        if len(ext) == 1 and ext[0][0] == 0 and ext[0][1] == int(window.total_bytes):
+            # the whole page (D's DCP ranks hold every layer and head): the
+            # canonical page is K-major, [K all slots][V all slots]
+            half = int(window.total_bytes) // 2
+            ext = [(0, half), (half, half)]
         if len(ext) != 2:
             raise ValueError(f"#1424 expected a K and a V extent, got {ext}")
         (k_off, k_len), (v_off, v_len) = ext
