@@ -86,3 +86,21 @@ def test_scheme_widens_six_bits_to_the_8bit_kernel_type():
     assert s.quant_type.size_bits == 8
     with pytest.raises(ValueError, match="symmetric"):
         CompressedTensorsWNA16(strategy="group", num_bits=6, group_size=64, symmetric=False)
+
+
+def test_uneven_tp_block_covers_dense_6bit_words_and_the_g64_groups():
+    """Under an uneven TP plan every compressed-tensors linear coarsens its
+    shard family to the marlin block (CompressedTensorsConfig declares
+    marlin_packable_linear). A 6-bit dense packing repeats every 16 input
+    elements (16 * 6 = 96 bits = 3 int32 words) and Minachist's groups are
+    64 wide: both must divide that block, or a row-parallel shard (shared
+    expert down_proj, in=640, ratio 39:13:12) would land mid-word."""
+    from sglang.srt.layers.linear import _marlin_uneven_tp_block
+    from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
+        CompressedTensorsConfig,
+    )
+
+    block = _marlin_uneven_tp_block()
+    assert CompressedTensorsConfig.marlin_packable_linear is True
+    assert block % 16 == 0 and block % 64 == 0
+    assert _exact_div(block, Fraction(32, 6)) == block * 6 // 32
