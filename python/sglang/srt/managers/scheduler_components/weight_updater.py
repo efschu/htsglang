@@ -6996,6 +6996,9 @@ class SchedulerWeightUpdaterManager:
                     "WEG2-DORMANT cleared: kv_cache resumed, admission seams admit"
                 )
                 self._weg2_rescan_store_index()
+                _rel = getattr(scheduler, "_weg2_release_dormant_hold", None)  # #1443
+                if callable(_rel):
+                    _rel()
                 _weg2_ph("store_rescan")
                 if scheduler.disaggregation_mode == DisaggregationMode.DECODE:
                     for queue_name in (

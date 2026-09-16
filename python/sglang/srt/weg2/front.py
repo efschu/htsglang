@@ -1763,6 +1763,12 @@ class Front:
         # writes both, R-6/R-12).  It is the front's D concurrency AND D's
         # own --max-running-requests, one number.
         self.d_bs = max(1, int(d_bs))
+        # #1443: leg-2 requests may be handed to D while D is DORMANT -- D
+        # accepts and holds them (tokenised ids and store lookup now, device
+        # load and decode after the wake), so the first token after the flip
+        # is the load away, not the whole re-admission. SGLANG_WEG2_DORMANT_ADMIT=0
+        # keeps the dispatch behind the wake.
+        self.dormant_admit = os.environ.get("SGLANG_WEG2_DORMANT_ADMIT", "1") == "1"
         # law 4: X.  ONE value for all four front sites (C9); the front's use
         # is an ESTIMATE (no tokenizer here) -- D enforces it for real at
         # get_new_batch_prefill after match_prefix (C11, W31).
@@ -2854,6 +2860,14 @@ class Front:
             return None
         return Seat(self, rid, "short", tokens=est_tokens)
 
+    def _d_accepts_leg2(self) -> bool:
+        """#1443: D takes leg-2 requests when awake, and -- dormant-admit armed --
+        while it is dormant behind an awake P (it holds them until the wake).
+        Never mid-flip: the phase must be settled."""
+        if self.awake == "D":
+            return True
+        return bool(self.dormant_admit) and self.awake == "P" and self.state == "serving"
+
     def _log_admit(self, rid: str, source: str, t_arrive: float, rank: Optional[int] = None) -> None:
         """L2.  ``rank`` is this admission's ORDINAL in the current epoch.
 
@@ -2912,7 +2926,7 @@ class Front:
         while True:
             await asyncio.sleep(0.05)
             try:
-                if self.state != "serving" or self.awake != "D":
+                if self.state != "serving" or not self._d_accepts_leg2():
                     continue
                 if not self._ready_for_d:
                     continue
@@ -2938,7 +2952,7 @@ class Front:
                     # request that would fit cannot be admitted past it.
                     continue
                 await self._d_seat.acquire()
-                if not (self.awake == "D" and self.admit_d and self.state == "serving"):
+                if not (self._d_accepts_leg2() and self.admit_d and self.state == "serving"):
                     # The phase moved while this admitter was queued behind a
                     # running decode.  Give the seat back and leave the
                     # request where it is: the deque head is still the oldest
@@ -5051,7 +5065,8 @@ class Front:
                 # prefilled sitting on `await fut` behind a one-hour client
                 # timeout -- a LOST-REQUEST class introduced by the fix for
                 # law 5.  The admitter (C4) releases them once D is awake.
-                if self.queue or self._ready_for_d:
+                if self.queue or self._ready_for_d or (self.dormant_admit and self.groups["D"].outstanding):
+                    # #1443: requests already handed to the dormant D are a reason to flip too
                     await self.flip("P", "D")
                 elif self._idle_disposition("P", at_rest=True) == "flip":
                     await self.flip("P", "D")

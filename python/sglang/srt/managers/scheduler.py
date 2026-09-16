@@ -691,6 +691,11 @@ def _weg2_windowed_path(sched) -> bool:
         return False
 
 
+def _weg2_dormant_admit_armed() -> bool:
+    """#1443: accept-and-hold while dormant (default on)."""
+    return os.environ.get("SGLANG_WEG2_DORMANT_ADMIT", "1") == "1"
+
+
 class Scheduler(
     SchedulerDisaggregationDecodeMixin,
     SchedulerDisaggregationPrefillMixin,
@@ -4829,6 +4834,19 @@ class Scheduler(
             mm_inputs.release_features()
             req.multimodal_inputs = None
 
+    def _weg2_release_dormant_hold(self) -> int:
+        """#1443: the wake cleared the dormant flag -- the held requests join
+        the waiting queue in arrival order. Called by the resume handler
+        AFTER flush_cache, so the idle witness saw an empty queue."""
+        hold = getattr(self, "weg2_dormant_hold", None) or []
+        if not hold:
+            return 0
+        self.waiting_queue.extend(hold)
+        n = len(hold)
+        hold.clear()
+        logger.info("#1443 DORMANT-RELEASE %d held request(s) queued after the wake", n)
+        return n
+
     def _weg2_refuse_dormant(self, recv_req, *, context: str) -> None:
         """W25 Weg2DormantRefused: abort an admitted request BEFORE it can
         reach prepare_for_extend on a group whose pools are released.
@@ -4859,7 +4877,13 @@ class Scheduler(
         recv_req: TokenizedGenerateReqInput,
     ):
         # W25 Weg2DormantRefused -- FIRST, before any pool is touched.
-        if getattr(self, "weg2_dormant", False):
+        # #1443 (user 16.09.): a dormant group ACCEPTS and HOLDS instead --
+        # tokenised ids and the store lookup (host side: arena slots, refs)
+        # happen now, the device load and the decode wait for the wake. The
+        # held requests live OUTSIDE waiting_queue so the wake's flush_cache
+        # idle witness (waiting_queue == 0) stays true; they are queued right
+        # after the dormant flag clears. SGLANG_WEG2_DORMANT_ADMIT=0 refuses as before.
+        if getattr(self, "weg2_dormant", False) and not _weg2_dormant_admit_armed():
             self._weg2_refuse_dormant(recv_req, context="generate")
             return
         # #261 live handover: a prefix parked for handover must not be
@@ -5742,6 +5766,17 @@ class Scheduler(
                 pass
             # The population marker is consumed by this intake (see above).
             req._969c_population = None
+            if getattr(self, "weg2_dormant", False) and _weg2_dormant_admit_armed():
+                hold = getattr(self, "weg2_dormant_hold", None)
+                if hold is None:
+                    hold = self.weg2_dormant_hold = []
+                hold.append(req)
+                n = getattr(self, "_1443_held_n", 0) + 1
+                self._1443_held_n = n
+                if n <= 8 or n % 64 == 0:
+                    logger.info("#1443 DORMANT-HOLD rid=%s tokens=%d held=%d (prefetch issued, device load waits for the wake)",
+                                str(req.rid)[:12], len(req.origin_input_ids or []), len(hold))
+                return
             self.waiting_queue.append(req)
             req.time_stats.set_wait_queue_entry_time()
         elif self.disaggregation_mode == DisaggregationMode.PREFILL:
