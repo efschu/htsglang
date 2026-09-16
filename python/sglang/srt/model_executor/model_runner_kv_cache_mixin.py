@@ -4511,6 +4511,9 @@ class ModelRunnerKVCacheMixin:
                         num_request_slots=self.req_to_token_pool.req_to_token.shape[
                             0
                         ],
+                        # WP3: the compressed cache mirrors the GLOBAL slot
+                        # space of req_to_token, not this rank's DCP slice.
+                        qsa_slot_space=int(self.max_total_num_tokens),
                     )
 
                 self.token_to_kv_pool = _kv_pool_class(

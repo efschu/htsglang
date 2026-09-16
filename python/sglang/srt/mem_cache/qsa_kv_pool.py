@@ -55,6 +55,7 @@ class QSATokenToKVPool(HybridLinearKVPool):
         full_kv_pool_class: Optional[type] = None,
         quant_method=None,
         post_capture_active: bool = False,
+        qsa_slot_space: Optional[int] = None,
         **fork_pool_kwargs,
     ):
         # #37500 port: this line's HybridLinearKVPool takes extra keyword
@@ -113,7 +114,22 @@ class QSATokenToKVPool(HybridLinearKVPool):
         self.qsa_index_kv_heads = int(qsa_index_kv_heads)
         self.qsa_token_topk = int(qsa_token_topk)
         self.qsa_block_topk = self.qsa_token_topk // self.qsa_compress_ratio
-        state_size = size + page_size
+        # WP3 (DCP x QSA): under uneven DCP ``size`` is this rank's SLICE of
+        # the KV rows, but the slot ids in req_to_token -- which the compressed
+        # cache mirrors 1:ratio -- span the whole token space, and every rank
+        # runs the replicated indexer over every token. fn1u boot 2026-09-16:
+        # TP0 (4100 local rows of 32772) asserted in get_prefill_mqa_inputs,
+        # index_select on a compressed buffer sized for 1025 groups with
+        # global slot ids up to 8193. ``qsa_slot_space`` is that global
+        # count; the compressed cache costs ratio-fold less than the full KV
+        # (Qwen3.8-Flash-Next: 64 B/token/layer), so the full copy is cheap.
+        slot_space = int(qsa_slot_space) if qsa_slot_space else int(size)
+        if slot_space < int(size):
+            raise ValueError(
+                f"QSA slot space {slot_space} is smaller than this rank's KV rows {size}"
+            )
+        state_size = slot_space + page_size
+        self.qsa_slot_space = slot_space
         # Compressed slots mirror the full-KV slot space 1:ratio; the "page"
         # seen by the scoring kernels is one full-KV page's worth of groups.
         self.qsa_compressed_page_size = page_size // self.qsa_compress_ratio
