@@ -6019,6 +6019,12 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 node, lock_params, host_lock_params = self.ongoing_load_back.pop(ack_id)
                 self.dec_lock_ref(node, lock_params)
                 self.dec_host_lock_ref(node, host_lock_params)
+                # #1408 read side (boot xsn152): a span that came out of the
+                # store (l3_present) is on the card now; its host rows were
+                # transit. D's pool held a loaded 79k prefix (occupied 38695)
+                # and the next two 79k reads found available=0 -> W88 -> 503.
+                if getattr(node, "l3_present", False) and self._weg2_host_is_transit():
+                    self._weg2_release_chain_piece_host(node)
             finish_count -= 1
 
     def _staging_host_role(self) -> bool:
