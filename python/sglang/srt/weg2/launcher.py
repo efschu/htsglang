@@ -4749,7 +4749,7 @@ def build_env(tree: str, venv: str, cvd: str, store_dir: str, debug_hold: bool, 
     # (boot xsn153: three 80k prefixes overflowed 8 GiB, evictions dropped
     # pages other ranks had written, followers found "store_absent").
     env.setdefault("SGLANG_HICACHE_ARENA_GIB", "16")
-    env.setdefault("SGLANG_HICACHE_ARENA_MAMBA_SLOTS", "48")
+    env.setdefault("SGLANG_HICACHE_ARENA_MAMBA_SLOTS", "128")  # #1410: 48 thrashed on 3x100k (xsn159)
     # write_back + bubble publisher (weg2_bubble_publish, 2026-09-16): the
     # publish sweep runs bounded in the PP loop's bubbles, nothing is left
     # for the flip's flush. "0" in the operator's environment disables it.

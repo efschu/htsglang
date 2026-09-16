@@ -37,6 +37,14 @@ class TheGroupDeadGateLearnsTheFlipPhase(unittest.TestCase):
         self.assertFalse(self.f.group_dead_should_stop(
             state="flipping", ok=False, alive=True, streak=9))
 
+    def test_a_dead_process_stops_even_while_flipping(self):
+        """#1411 (xsn159): the flip exemption covers a silent /health behind
+        a LIVE leg. A session that is gone is a death in every state."""
+        self.assertTrue(self.f.group_dead_should_stop(
+            state="flipping", ok=False, alive=False, streak=2))
+        self.assertFalse(self.f.group_dead_should_stop(
+            state="flipping", ok=False, alive=False, streak=1))
+
     def test_idle_group_death_still_stops(self):
         """The stop stays armed off the flip: a dead group at idle is a
         fact, not a phase."""

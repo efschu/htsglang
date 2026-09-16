@@ -2287,7 +2287,7 @@ class HiCacheFile(HiCacheStorage):
             for entry in plan:
                 i, key, suffixed, window, flat = entry
                 arena = self._arena_for(int(window.total_bytes))
-                if arena is None:
+                if arena is None or self._arena_home_is_disk(arena, suffixed):
                     rest.append(entry)
                     continue
                 by_arena.setdefault(id(arena), (arena, []))[1].append(entry)
@@ -2321,6 +2321,7 @@ class HiCacheFile(HiCacheStorage):
                                     len(window.extents), tuple(window.extents)[:2],
                                     self._arena_refused_n,
                                 )
+                            self._arena_note_disk_home(arena, suffixed)
                             rest.append(entry)
                     if not again:
                         break
@@ -2465,6 +2466,43 @@ class HiCacheFile(HiCacheStorage):
             arena = None
         arenas[total_bytes] = arena
         return arena
+
+    def _arena_note_disk_home(self, arena, suffixed: str) -> None:
+        """#1410: this blob's home is the DISK tier from now on (this process)."""
+        homes = getattr(arena, "_disk_home", None)
+        if homes is None:
+            homes = arena._disk_home = set()
+        homes.add(suffixed)
+        arena._had_refusal = True
+
+    def _arena_home_is_disk(self, arena, suffixed: str) -> bool:
+        """#1410 (boot xsn159): ONE home per blob, decided by its first writer.
+
+        A blob is written by several ranks, one extent each. When the arena
+        is full, one rank's extent went to disk (partial + marker) while a
+        later rank found room (after an eviction) and put its extent into
+        the arena: the arena slot stayed CLAIMED forever, the disk partial
+        never completed, and NO rank could read the blob -- the mamba anchor
+        of the 4k prefix on xsn159, behind which every follower answered
+        'store_absent' to PP0's told=4095 and P stopped. The rule: once any
+        extent of a blob is on disk, every later extent of it goes to disk.
+        Process-local memory first (free); the marker stat only once this
+        arena has refused a write at all, so a cold arena pays nothing.
+        """
+        homes = getattr(arena, "_disk_home", None)
+        if homes and suffixed in homes:
+            return True
+        if not getattr(arena, "_had_refusal", False):
+            return False
+        try:
+            final = self._sharded_path(suffixed)
+            from sglang.srt.mem_cache.canonical_page_store import marker_path
+            if os.path.exists(marker_path(final)) or os.path.exists(final):
+                self._arena_note_disk_home(arena, suffixed)
+                return True
+        except Exception:  # noqa: BLE001 - a stat failure is not a routing fact
+            return False
+        return False
 
     def _arena_evict_to_disk(self, arena, want: int) -> int:
         """Move up to `want` complete, unreferenced, unpinned pages from the

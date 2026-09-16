@@ -5108,6 +5108,14 @@ class Front:
             return False
         if health_is_serving_fact(ok, alive):
             return False
+        if not alive:
+            # #1411 (boot xsn159): P's schedulers died INSIDE a flip (told
+            # mismatch -> rank exit -> c10 teardown); the front sat in
+            # 'flipping' for 95 s with streak 4..6 and process_alive=False
+            # until the next RPC failed (W3). A dead session is a fact in
+            # every state -- the flipping exemption is for a SILENT /health
+            # behind a live leg, never for a process that is gone.
+            return True
         if state == "flipping":
             return False
         return True
