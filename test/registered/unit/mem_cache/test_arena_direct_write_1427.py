@@ -48,6 +48,8 @@ def _pool(arena, win=_Win, role="kv", layers=L):
     p.dtype = torch.uint8; p.device = "cpu"; p.pin_memory = False; p.size = S
     p.element_dim = H * D; p.can_use_jit = True; p.token_stride_size = CELL
     p.free_slots = torch.arange(S, dtype=torch.int64); p.slot_used = torch.zeros(S, dtype=torch.bool)
+    import threading
+    p.lock = threading.Lock()
     p.kv_buffer = torch.zeros(2, layers, S, H, D, dtype=torch.uint8)
     p._arena_init_fields()
     p.bind(arena, win(), role=role, pin=False)
@@ -147,3 +149,18 @@ def test_an_unbound_pool_skips_foreign_arena_ids_instead_of_indexing_past_stagin
     p._arena_init_fields()
     p.backup_from_device_all_layer(None, torch.tensor([1, S + 7, S + 8]), torch.tensor([10, 11, 12]), "kernel")
     assert calls == [([1], [10])]
+
+
+def test_available_size_reports_the_arena_not_the_staging_fallback(tmp_path, monkeypatch):
+    """#1440 (xsn200): the front's D-seat gate serialised the parked prompts
+    because available_size() answered with the 1.5k staging rows."""
+    _record(monkeypatch)
+    arena = ShmArena(str(tmp_path / "kv.bin"), PAGE, 8)
+    p = _pool(arena)
+    assert p.staging_free() == S
+    assert p.available_size() == 8
+    rows = p.alloc_write(["a", "b"])
+    assert p.available_size() == 6
+    # staging alloc stays bounded by the staging free list
+    assert p.alloc(S + 1) is None
+    assert p.alloc(1) is not None and p.staging_free() == S - 1

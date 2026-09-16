@@ -511,6 +511,30 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
         return super().set_from_flat_data_page(index, data_page)
 
     # -- allocator ----------------------------------------------------------------
+    def available_size(self):
+        """#1440 (xsn200): the front's D-seat gate reads this as 'rows D can
+        still prefetch into' (WEG2 D-SEAT-WAIT available=1526 -- the staging
+        fallback after #1430) and so admitted the six parked 100k prompts one
+        at a time although d_bs=6. Bound to the arena, the answer is the
+        arena's free slot count; the staging fallback is `staging_free`."""
+        if self.arena is None:
+            return len(self.free_slots)
+        try:
+            st = self.arena.stats()
+            return max(0, int(st["slots"]) - int(st["complete"]) - int(st["claimed"]))
+        except Exception:  # noqa: BLE001
+            return len(self.free_slots)
+
+    def staging_free(self) -> int:
+        return len(self.free_slots)
+
+    def alloc(self, need_size: int) -> Optional[torch.Tensor]:
+        """Staging rows only (the fallback range); bounded by the staging free
+        list, never by the arena answer available_size() gives the front."""
+        if need_size > len(self.free_slots):
+            return None
+        return super().alloc(need_size)
+
     def free(self, indices: torch.Tensor) -> int:
         if self.arena is None:
             return super().free(indices)
