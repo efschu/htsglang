@@ -1677,6 +1677,7 @@ class FlashInferAttnBackend(AttentionBackend):
         )
         if _tail_ring is not None:
             _tail_ring.disarm()
+        self._kv_tail_verify_plan = None  # #1426
         # Eager path: never use a graph-bucket ragged wrapper. Tree-spec verify
         # (topk > 1) still needs an override: it plans a draft->draft custom
         # mask, and flashinfer's non-graph plan() does NOT reset _custom_mask_buf
@@ -2438,6 +2439,8 @@ class FlashInferAttnBackend(AttentionBackend):
                     logits_soft_cap=logits_soft_cap,
                 )
 
+                if getattr(self, "_kv_tail_verify_plan", None) is not None:
+                    o2, s2 = self._kv_tail_merge_verify(q, layer, o2, s2)  # #1426
                 o, _ = _safe_merge_state(o1, s1, o2, s2)
 
             if save_kv_cache:
@@ -5836,6 +5839,105 @@ class FlashInferAttnBackend(AttentionBackend):
             self._kv_tail_wrapper = w
         return w
 
+    def _kv_tail_wrapper_for(self, kind: str, bs: int, graph_mode: bool, ring):
+        """#1426: the tail wrapper for (kind, bs, graph_mode). Eager wrappers
+        are shared per kind; graph-mode wrappers are one per bs with frozen
+        buffers (indptr bs+1, indices = ring capacity, last_page_len ones)."""
+        if not graph_mode:
+            if kind == "decode":
+                return self._kv_tail_decode_wrapper()
+            w = getattr(self, "_kv_tail_verify_wrapper_eager", None)
+            if w is None:
+                w = BatchPrefillWithPagedKVCacheWrapper(self.workspace_buffer, "NHD")
+                self._kv_tail_verify_wrapper_eager = w
+            return w
+        pool = getattr(self, "_kv_tail_wrappers", None)
+        if pool is None:
+            pool = self._kv_tail_wrappers = {}
+        key = (kind, int(bs))
+        w = pool.get(key)
+        if w is not None:
+            return w
+        dev = self.workspace_buffer.device
+        rows = int(getattr(ring, "ring_rows", 0) or getattr(getattr(ring, "pool", None), "size", 0) or 0)
+        indptr_buf = torch.zeros(int(bs) + 1, dtype=torch.int32, device=dev)
+        indices_buf = torch.zeros(max(1, rows), dtype=torch.int32, device=dev)
+        lastlen_buf = torch.ones(int(bs), dtype=torch.int32, device=dev)
+        if kind == "decode":
+            w = BatchDecodeWithPagedKVCacheWrapper(
+                self.workspace_buffer, "NHD", use_cuda_graph=True,
+                use_tensor_cores=self.decode_use_tensor_cores,
+                paged_kv_indptr_buffer=indptr_buf, paged_kv_indices_buffer=indices_buf,
+                paged_kv_last_page_len_buffer=lastlen_buf, backend=self.decode_backend,
+            )
+        else:
+            qo_buf = torch.zeros(int(bs) + 1, dtype=torch.int32, device=dev)
+            w = BatchPrefillWithPagedKVCacheWrapper(
+                self.workspace_buffer, "NHD", use_cuda_graph=True,
+                qo_indptr_buf=qo_buf, paged_kv_indptr_buf=indptr_buf,
+                paged_kv_indices_buf=indices_buf, paged_kv_last_page_len_buf=lastlen_buf,
+            )
+        pool[key] = w
+        return w
+
+    def _kv_tail_plan_verify(self, iu, req_pool_indices, paged_kernel_lens, paged_kernel_lens_sum,
+                             kv_indptr, kv_indices, qo_indptr, bs, wrapper_paged):
+        """#1426 slice 2: the MTP target-verify step. The paged body plan comes
+        from `spec_info`; the tail needs the weighted owner rule, so the owned
+        indices are rebuilt with tail lengths, checked EQUAL to spec_info's
+        (RAENGE-NIE-UNEINS: a different index order would attend the wrong
+        rows), split into body and tail, and the tail wrapper planned over
+        the ring. Returns the trimmed (body_indptr, body_indices)."""
+        from sglang.srt.mem_cache.kv_tail import Weg2KvTailFormRefused
+        ring = self.token_to_kv_pool.kv_tail
+        if not getattr(self, "uneven_dcp_weighted", False):
+            raise Weg2KvTailFormRefused(
+                "W58 Weg2KvTailFormRefused: the verify-step tail needs the weighted "
+                "uneven-DCP owner rule; this form is not weighted DCP.")
+        tail_lens = _kv_tail_position_lengths(paged_kernel_lens, ring.knobs.min_tokens)
+        scratch_indptr = torch.zeros_like(kv_indptr)
+        own_indptr, own_indices, owned_tail_len = _build_dcp_weighted_kv_indices(
+            iu.req_to_token, req_pool_indices, paged_kernel_lens, scratch_indptr, None,
+            self.cp_S, self.cp_lo, self.cp_hi, self.cp_ratio,
+            total_tokens=paged_kernel_lens_sum, tail_lens=tail_lens,
+        )
+        n = int(own_indptr[bs].item())
+        if kv_indices.numel() < n or not torch.equal(own_indices[:n].to(kv_indices.dtype), kv_indices[:n]):
+            raise Weg2KvTailFormRefused(
+                "W58 Weg2KvTailFormRefused: spec_info's verify kv_indices differ from "
+                "the weighted owner rule's; the tail split would attend the wrong rows.")
+        body_indptr, body_indices, tail_indptr, tail_ring = ring.plan(
+            own_indptr, own_indices, owned_tail_len, site="verify")
+        graph_mode = bool(getattr(wrapper_paged, "_use_cuda_graph", False)
+                          or getattr(wrapper_paged, "is_cuda_graph_enabled", False))
+        w = self._kv_tail_wrapper_for("verify", bs, graph_mode, ring)
+        w.begin_forward(
+            qo_indptr, tail_indptr, tail_ring, iu.kv_last_page_len[:bs],
+            iu.num_qo_heads, iu.num_kv_heads, iu.head_dim, 1,
+            q_data_type=iu.q_data_type, kv_data_type=torch.bfloat16, non_blocking=True,
+        )
+        self._kv_tail_verify_plan = (w, int(tail_ring.numel()))
+        ring.begin_step("verify")
+        ring.log_counters("verify")
+        return body_indptr, body_indices
+
+    def _kv_tail_merge_verify(self, q, layer, o2, s2):
+        """#1426: fold the ring's contribution into the paged body result of a
+        target-verify step (both partials -inf-safe through _safe_merge_state)."""
+        plan = getattr(self, "_kv_tail_verify_plan", None)
+        ring = getattr(self.token_to_kv_pool, "kv_tail", None)
+        if plan is None or ring is None:
+            return o2, s2
+        w, _rows = plan
+        kvbuf = ring.pool.get_kv_buffer(ring.local_layer_id(layer.layer_id))
+        o3, s3 = w.forward_return_lse(
+            q.view(-1, layer.tp_q_head_num, layer.head_dim), kvbuf,
+            causal=False, sm_scale=layer.scaling,
+        )
+        ring.note_merge()
+        o, s = _safe_merge_state(o2, s2, o3, s3)
+        return o, s
+
     def _kv_tail_plan_decode(self, built, bs, wrapper):
         """Split the owned decode plan and plan the tail wrapper.
 
@@ -5882,23 +5984,14 @@ class FlashInferAttnBackend(AttentionBackend):
                 "It is also why `self.indices_updater_decode` may be read "
                 "below: at num_wrappers == 1 it IS the calling updater."
             )
-        if (
+        # #1426 slice 2 (basis 2.9): a CAPTURED decode gets a graph-mode tail
+        # wrapper (use_cuda_graph, frozen indptr/indices buffers sized to the
+        # ring) whose plan is refreshed out of graph every step -- the tail
+        # boundary is a tensor input, never a recapture.
+        graph_mode = bool(
             hasattr(wrapper.begin_forward, "func")
             and wrapper.begin_forward.func == fast_decode_plan
-        ):
-            raise Weg2KvTailFormRefused(
-                "W58 Weg2KvTailFormRefused: the precision tail refuses a "
-                "CAPTURED CUDA-graph decode. The tail wrapper is a plain "
-                "eager BatchDecodeWithPagedKVCacheWrapper -- no "
-                "use_cuda_graph, no frozen paged_kv_indptr/indices buffers -- "
-                "and it is re-planned per step against freshly allocated "
-                "tensors, so a replay would run it against the capture-time "
-                "plan. Basis 2.9 (tail boundary as a TENSOR input to the "
-                "captured graph, no recapture on growth or shrink) is "
-                "DEFERRED TO SLICE 2 and named, not silently assumed: run "
-                "slice 1 with --disable-cuda-graph, which is also the form "
-                "the weg2kvtail1 quality probe already used."
-            )
+        )
         kv_indptr, kv_indices, owned_tail_len = built
         body_indptr, body_indices, tail_indptr, tail_ring = ring.plan(
             kv_indptr, kv_indices, owned_tail_len, site="decode"
@@ -5908,7 +6001,7 @@ class FlashInferAttnBackend(AttentionBackend):
         # decode wrapper was created on.
         kv_indptr.copy_(body_indptr)
         iu = self.indices_updater_decode
-        w = self._kv_tail_decode_wrapper()
+        w = self._kv_tail_wrapper_for("decode", bs, graph_mode, ring)
         w.begin_forward(
             tail_indptr,
             tail_ring,
@@ -7988,6 +8081,16 @@ class FlashInferIndicesUpdaterPrefill:
                 max_kv_len=int(seq_lens_cpu_i32.max()),
             )
 
+        # #1426 slice 2: under MTP the verify plan arrives in spec_info; the
+        # precision tail splits it (body trimmed, tail over the ring).
+        _ab = self.attn_backend
+        _ab._kv_tail_verify_plan = None
+        _ring = getattr(getattr(_ab, "token_to_kv_pool", None), "kv_tail", None)
+        if _ring is not None and spec_info is not None:
+            kv_indptr, kv_indices = _ab._kv_tail_plan_verify(
+                self, req_pool_indices, paged_kernel_lens, paged_kernel_lens_sum,
+                kv_indptr, kv_indices, qo_indptr, bs, wrapper_paged,
+            )
         wrapper_paged.begin_forward(
             qo_indptr,
             kv_indptr,

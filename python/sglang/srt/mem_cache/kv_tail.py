@@ -783,9 +783,18 @@ class KvTailRing:
         are reused by the remaining layers, so a step costs ONE sync on the
         decode plan path #616c de-synced, not one per attention layer.
         """
+        self.begin_step("decode")
+
+    def begin_step(self, site: str = "decode") -> None:
+        """#1426 slice 2: ARM the ring for one step of `site` ("decode" or
+        "verify" -- the MTP target-verify extend writes the spec tokens' K/V
+        through the same `_dcp_write_scatter` and must double-write them)."""
         self._armed = True
         self._claim_cache = None
-        self.counters.decode_steps += 1
+        if site == "verify":
+            self.counters.verify_steps = getattr(self.counters, "verify_steps", 0) + 1
+        else:
+            self.counters.decode_steps += 1
 
     def disarm(self) -> None:
         """Every non-decode step: extend, draft, spec, idle.  An unarmed ring
