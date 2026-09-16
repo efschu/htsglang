@@ -8769,6 +8769,47 @@ def host_priced_pick(rows, price, incumbent_gib: float, slack_gib: float):
     return picked, lines
 
 
+def _arm_run_peak_gib(arm) -> Optional[float]:
+    """The arm's priced run peak, or None when the arm cannot say."""
+    try:
+        v = arm.predicted_run_peak_gib()
+        return None if v is None else float(v)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _fmt_gib(v: Optional[float]) -> str:
+    return "n/a" if v is None else f"{v:.2f}"
+
+
+#: #1453: the KV arena never shrinks below this (8 GiB = 262144 slots of 32 KiB,
+#: one 262k-token request), and the excess is rounded UP to the next 0.25 GiB.
+ARENA_FROM_LEDGER_FLOOR_GIB = 8.0
+
+
+def arena_from_ledger(cur_gib: float, run_peak_gib: Optional[float], riegel_gib,
+                      *, enabled: bool = True) -> Tuple[Optional[float], str]:
+    """``(new arena GiB or None, why)`` -- pure.  None means: leave it."""
+    if not enabled:
+        return None, "off (SGLANG_WEG2_ARENA_FROM_LEDGER=0 or hicache disabled); arena %.2f GiB stays" % cur_gib
+    if riegel_gib is None:
+        return None, "no --host-riegel-gib on this boot; arena %.2f GiB stays" % cur_gib
+    if run_peak_gib is None:
+        return None, "the arm carries no run peak; arena %.2f GiB stays" % cur_gib
+    over = float(run_peak_gib) - float(riegel_gib)
+    if over <= 0:
+        return None, ("run_peak %.2f <= riegel %.2f GiB (headroom %.2f); arena %.2f GiB stays"
+                      % (run_peak_gib, riegel_gib, -over, cur_gib))
+    give = math.ceil(over * 4) / 4
+    new = max(ARENA_FROM_LEDGER_FLOOR_GIB, float(cur_gib) - give)
+    if new >= float(cur_gib):
+        return None, ("run_peak %.2f is %.2f over the riegel %.2f but the arena is at its floor %.2f GiB"
+                      % (run_peak_gib, over, riegel_gib, cur_gib))
+    return new, ("run_peak %.2f GiB is %.2f over the riegel %.2f -> arena %.2f -> %.2f GiB "
+                 "(%d KV slots of 32 KiB), re-pricing"
+                 % (run_peak_gib, over, riegel_gib, cur_gib, new, int(new * (1 << 30) // 32768)))
+
+
 def pick_shipped_cut(decision, incumbent_layers, incumbent_attn, objective: str):
     """WHICH priced candidate group P ships, and why.  Pure.
 
@@ -11594,81 +11635,100 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # a passed one: it stays False, i.e. a legacy record stays refused.
     _rt = getattr(ring_plan, "table", None)
     _form_key_matches = bool(getattr(_rt, "form_same", None)) if _rt is not None else False
-    arm, reap_headroom_gib, lines, cg = choose_host_ledger(
-        ring_plan.host_weights_bytes,
-        ring_plan.host_weights_span1_bytes, ring_plan.provenance,
-        # #1390: NAMED, not left to choose_host_ledger's own literal
-        # defaults -- see MEMINFO_PATH/CGROUP_ROOT above for why a bare call
-        # would keep reading the real box even under a test's mock.
-        meminfo_path=MEMINFO_PATH, cgroup_root=CGROUP_ROOT,
-        pin_m_mib=int(getattr(ns, "pin_ledger_arm_m", 0) or 0),
-        pin_s_gb=int(getattr(ns, "pin_ledger_arm_s", 0) or 0),
-        # #1360: the operator's declaration, from argv and nowhere else.
-        deviation_reason=str(getattr(ns, "host_ledger_deviation", "") or ""),
-        riegel_gib=getattr(ns, "host_riegel_gib", None),
-        # #1378 Stage 2 (W105): the operator's citation of the PRIOR boot's
-        # own numbers, from argv and nowhere else -- same placement, same
-        # "None means unmeasured, not zero" rule as the deviation pair above.
-        prior_cushion_min_gib=getattr(ns, "prior_cushion_min_gib", None),
-        prior_bounce_gib=getattr(ns, "prior_bounce_gib", None),
-        # #1378 Stage 2: THIS boot's own form, in the EXACT shape
-        # `front.py._write_flip_ratchet` writes it in -- a different spelling
-        # here would auto-resolve nothing (silently, since form_key is a
-        # plain equality filter) rather than raise, so the two producers are
-        # kept to the one literal construction, not re-derived twice.
-        flip_ratchet_form_key=f"wtags={len(weights_tags)}",
-        # #1362 [22-fix]: content digest, snapshot-independent. `None` (an
-        # unreadable checkpoint) stays empty and the arm keeps the pre-#1362
-        # behaviour rather than refusing on a digest it could not compute.
-        model_digest_want=(host_ledger.checkpoint_digest(ns.model)[0] or ""),
-        # #1362 [22-fix2]: the ring solve already decided whether THIS boot's
-        # group-P form key matches the source boot's. A legacy record (no
-        # digest, written before #1362) is admitted only when it did -- the
-        # form key contains --model-path and excludes labels, so a match is
-        # evidence of the same checkpoint path. Read from the solve rather than
-        # recomputed: a second computation of the same predicate is the second
-        # bookkeeping this fork keeps paying for.
-        form_key_matches=_form_key_matches,
-        # #1358 [fix] THE CUT REACHES THE LEDGER. `choose_host_ledger` grew
-        # `stage_ratio` with a DEFAULT of "", and this -- its only caller --
-        # never passed it, so the lane record was looked up under
-        # 'pp=;d=tp3;legs=both' while the seed is 'pp=39,13,12;...'. W102 on
-        # every rung, rc=2, ARM=0: the producer locked out every boot.
-        #
-        # A DEFAULT PARAMETER IS THE SAME TRAP AS A POSITIONAL ONE, one step
-        # quieter: the positional shift crashed, this one silently looked up
-        # the wrong key. Desk tests passed `stage_ratio=` explicitly and were
-        # blind to it exactly as they were to the argv_p shift.
-        stage_ratio=str(stage_ratio or ""),
-        legs=str(getattr(ns, "weg2_xchg_legs", "both") or "both"),
-        # #1317n NO BOOT WITH S_D=S_P IN THE LEDGER. D carries 4 GB where P
-        # carries 1, which is +8.38 GiB of rings; an arm priced without it is
-        # optimistic by that much against a reap mark nobody may touch.
-        s_gb_d=s_gb_d, d_cap_terms=_l2_terms,
-        weight_source=ns.weg2_weight_source,
-        bounce_depth=int(getattr(ns, "xchg_bounce_depth",
-                                 xchg_bounce.ASSEMBLE_DEPTH_DEFAULT)),
-        # #1385 (Wand 11b): THE SAME RESOLVED VALUE the ranks' publication
-        # call above priced with -- resolved once, before either call, so the
-        # ledger and the ranks cannot disagree about the cap.
-        lanes_concurrent=int(_lanes_concurrent),
-        # #1397 (Option 3): the SAME resolved value the ranks' publication
-        # call above priced with -- resolved once, before either call, for
-        # the identical reason `lanes_concurrent` is.
-        band_credit=_band_credit,
-        # B4f: ring absence needs BOTH arms, and the inject mode is already in
-        # hand here -- `prepare_xchg_env` published it three statements above.
-        inject_mode=ns.weg2_xchg_inject,
-        oncard_mode=ns.weg2_xchg_oncard,
-        oncard_slot_mib=ns.weg2_xchg_oncard_slot_mib,
-        # #1332 B1b: the checkpoint whose WIDEST layer sizes the host bounce.
-        model_dir=ns.model,
-        # #1386: the SAME local `main` resolved once, above, beside
-        # `draft_kv_on_p` -- never re-read from `ns` here.
-        hicache_disabled=hicache_disabled,
-        # #1369: the SAME local `main` resolved once, above, from the SAME
-        # predicate the shipped argvs read -- never re-read from `ns` here.
-        weights_cpu_backup_armed=weights_cpu_backup_armed)
+    def _price_host_ledger():
+        """#1453: the ONE ledger pricing, callable twice (see below)."""
+        return choose_host_ledger(
+            ring_plan.host_weights_bytes,
+            ring_plan.host_weights_span1_bytes, ring_plan.provenance,
+            # #1390: NAMED, not left to choose_host_ledger's own literal
+            # defaults -- see MEMINFO_PATH/CGROUP_ROOT above for why a bare call
+            # would keep reading the real box even under a test's mock.
+            meminfo_path=MEMINFO_PATH, cgroup_root=CGROUP_ROOT,
+            pin_m_mib=int(getattr(ns, "pin_ledger_arm_m", 0) or 0),
+            pin_s_gb=int(getattr(ns, "pin_ledger_arm_s", 0) or 0),
+            # #1360: the operator's declaration, from argv and nowhere else.
+            deviation_reason=str(getattr(ns, "host_ledger_deviation", "") or ""),
+            riegel_gib=getattr(ns, "host_riegel_gib", None),
+            # #1378 Stage 2 (W105): the operator's citation of the PRIOR boot's
+            # own numbers, from argv and nowhere else -- same placement, same
+            # "None means unmeasured, not zero" rule as the deviation pair above.
+            prior_cushion_min_gib=getattr(ns, "prior_cushion_min_gib", None),
+            prior_bounce_gib=getattr(ns, "prior_bounce_gib", None),
+            # #1378 Stage 2: THIS boot's own form, in the EXACT shape
+            # `front.py._write_flip_ratchet` writes it in -- a different spelling
+            # here would auto-resolve nothing (silently, since form_key is a
+            # plain equality filter) rather than raise, so the two producers are
+            # kept to the one literal construction, not re-derived twice.
+            flip_ratchet_form_key=f"wtags={len(weights_tags)}",
+            # #1362 [22-fix]: content digest, snapshot-independent. `None` (an
+            # unreadable checkpoint) stays empty and the arm keeps the pre-#1362
+            # behaviour rather than refusing on a digest it could not compute.
+            model_digest_want=(host_ledger.checkpoint_digest(ns.model)[0] or ""),
+            # #1362 [22-fix2]: the ring solve already decided whether THIS boot's
+            # group-P form key matches the source boot's. A legacy record (no
+            # digest, written before #1362) is admitted only when it did -- the
+            # form key contains --model-path and excludes labels, so a match is
+            # evidence of the same checkpoint path. Read from the solve rather than
+            # recomputed: a second computation of the same predicate is the second
+            # bookkeeping this fork keeps paying for.
+            form_key_matches=_form_key_matches,
+            # #1358 [fix] THE CUT REACHES THE LEDGER. `choose_host_ledger` grew
+            # `stage_ratio` with a DEFAULT of "", and this -- its only caller --
+            # never passed it, so the lane record was looked up under
+            # 'pp=;d=tp3;legs=both' while the seed is 'pp=39,13,12;...'. W102 on
+            # every rung, rc=2, ARM=0: the producer locked out every boot.
+            #
+            # A DEFAULT PARAMETER IS THE SAME TRAP AS A POSITIONAL ONE, one step
+            # quieter: the positional shift crashed, this one silently looked up
+            # the wrong key. Desk tests passed `stage_ratio=` explicitly and were
+            # blind to it exactly as they were to the argv_p shift.
+            stage_ratio=str(stage_ratio or ""),
+            legs=str(getattr(ns, "weg2_xchg_legs", "both") or "both"),
+            # #1317n NO BOOT WITH S_D=S_P IN THE LEDGER. D carries 4 GB where P
+            # carries 1, which is +8.38 GiB of rings; an arm priced without it is
+            # optimistic by that much against a reap mark nobody may touch.
+            s_gb_d=s_gb_d, d_cap_terms=_l2_terms,
+            weight_source=ns.weg2_weight_source,
+            bounce_depth=int(getattr(ns, "xchg_bounce_depth",
+                                     xchg_bounce.ASSEMBLE_DEPTH_DEFAULT)),
+            # #1385 (Wand 11b): THE SAME RESOLVED VALUE the ranks' publication
+            # call above priced with -- resolved once, before either call, so the
+            # ledger and the ranks cannot disagree about the cap.
+            lanes_concurrent=int(_lanes_concurrent),
+            # #1397 (Option 3): the SAME resolved value the ranks' publication
+            # call above priced with -- resolved once, before either call, for
+            # the identical reason `lanes_concurrent` is.
+            band_credit=_band_credit,
+            # B4f: ring absence needs BOTH arms, and the inject mode is already in
+            # hand here -- `prepare_xchg_env` published it three statements above.
+            inject_mode=ns.weg2_xchg_inject,
+            oncard_mode=ns.weg2_xchg_oncard,
+            oncard_slot_mib=ns.weg2_xchg_oncard_slot_mib,
+            # #1332 B1b: the checkpoint whose WIDEST layer sizes the host bounce.
+            model_dir=ns.model,
+            # #1386: the SAME local `main` resolved once, above, beside
+            # `draft_kv_on_p` -- never re-read from `ns` here.
+            hicache_disabled=hicache_disabled,
+            # #1369: the SAME local `main` resolved once, above, from the SAME
+            # predicate the shipped argvs read -- never re-read from `ns` here.
+            weights_cpu_backup_armed=weights_cpu_backup_armed)
+
+    arm, reap_headroom_gib, lines, cg = _price_host_ledger()
+    # #1453 (user 16.09.: 'L2-Groesse aus Ledger-Spielraum'): the arena is the
+    # largest host term (33.6 GiB with draft+mamba); when the priced run peak
+    # sits ABOVE the riegel, the KV arena gives that excess back and the
+    # ledger prices once more -- the boot then funds itself without the
+    # --host-ledger-deviation it needed before (weg2xsn207: 93.15 vs 93.00).
+    _arena_new, _arena_why = arena_from_ledger(
+        float(os.environ.get("SGLANG_HICACHE_ARENA_GIB", "22") or 22),
+        _arm_run_peak_gib(arm), getattr(ns, "host_riegel_gib", None),
+        enabled=(os.environ.get("SGLANG_WEG2_ARENA_FROM_LEDGER", "1") == "1" and not hicache_disabled))
+    log("#1453 L2-ARENA FROM LEDGER: " + _arena_why)
+    if _arena_new is not None:
+        os.environ["SGLANG_HICACHE_ARENA_GIB"] = f"{_arena_new:g}"
+        arm, reap_headroom_gib, lines, cg = _price_host_ledger()
+        log("#1453 L2-ARENA FROM LEDGER: re-priced with arena %.2f GiB -> run_peak %s GiB"
+            % (_arena_new, _fmt_gib(_arm_run_peak_gib(arm))))
     state.cgroup = dict(cg)
     for ln in lines:
         log(ln)
