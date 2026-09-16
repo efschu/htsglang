@@ -9107,7 +9107,15 @@ def solve_p_cut(
     # shipped default or something the operator typed, sends the reader to the
     # wrong flag.
     _floor_flag = ns.pp_solve_pool_floor
-    if _floor_flag is None and int(getattr(ns, "p_bs", DEFAULT_P_BS)) == 1:
+    # #1441b (xsn204): the cap-floor rule shipped 40,12,12 and the launch was
+    # refused at the ledger -- the exchange bounce term for that form is 27.75
+    # GiB against 15.75 for 39,13,12 (+12 GiB of pinned host lanes: the 8-layer
+    # tag windows fall differently across the stage boundaries), run peak
+    # 105 GiB over the 95.9 GiB watermark. The rule stays, opt-in
+    # (SGLANG_WEG2_PCUT_CAP_FLOOR=1), until the solver prices the exchange
+    # bounce of a candidate cut beside its makespan.
+    if (_floor_flag is None and int(getattr(ns, "p_bs", DEFAULT_P_BS)) == 1
+            and os.environ.get("SGLANG_WEG2_PCUT_CAP_FLOOR", "0") == "1"):
         # #1441 (user 16.09.): with ONE chunked prefill at a time on P (sglang's
         # single chunked_req; --p-bs 1) the pool only has to hold the largest
         # request plus one chunk, so the floor is the cap, not the ordered
