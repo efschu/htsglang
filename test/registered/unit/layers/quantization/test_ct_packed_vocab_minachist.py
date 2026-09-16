@@ -111,3 +111,42 @@ def test_scheme_selection_by_explicit_target_names():
     head = cfg.get_linear_scheme(layer=torch.nn.Module(), layer_name="lm_head")
     assert isinstance(head, CompressedTensorsWNA16) and head.src_num_bits == 8
     assert head.group_size == 128
+
+
+def test_explicit_target_wins_over_a_parent_entry_in_the_ignore_list(monkeypatch):
+    """Minachist's AutoRound export lists the GDN parent module
+    ``...layers.0.linear_attn`` in ``ignore`` while naming its child
+    ``...linear_attn.in_proj_qkv`` as an INT6 target. The ignore match is a
+    substring match, so the parent used to swallow the child and the layer
+    came up unquantized with ``weight_packed`` tensors to load. An explicit
+    target name must resolve to its scheme; a name only covered by the
+    ignore list stays unquantized."""
+    from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
+        CompressedTensorsConfig,
+    )
+    from sglang.srt.layers.quantization.compressed_tensors.schemes import (
+        CompressedTensorsWNA16,
+    )
+
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a, **k: (8, 6), raising=False)
+    parent = "model.language_model.layers.0.linear_attn"
+    child = parent + ".in_proj_qkv"
+    cfg = CompressedTensorsConfig.from_config(
+        {
+            "quant_method": "compressed-tensors",
+            "format": "pack-quantized",
+            "quantization_status": "compressed",
+            "kv_cache_scheme": None,
+            "ignore": [parent, "model.language_model.layers.0.mlp.gate"],
+            "config_groups": {
+                "group_0": {
+                    "targets": [child],
+                    "weights": {"num_bits": 6, "group_size": 64, "symmetric": True, "strategy": "group", "type": "int"},
+                },
+            },
+        }
+    )
+    six = cfg.get_linear_scheme(layer=torch.nn.Module(), layer_name=child)
+    assert isinstance(six, CompressedTensorsWNA16) and six.src_num_bits == 6 and six.group_size == 64
+    assert cfg.get_linear_scheme(layer=torch.nn.Module(), layer_name=parent + ".in_proj_b") is None
+    assert cfg.get_linear_scheme(layer=torch.nn.Module(), layer_name="model.language_model.layers.0.mlp.gate") is None

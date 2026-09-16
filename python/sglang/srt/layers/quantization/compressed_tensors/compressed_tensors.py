@@ -1109,6 +1109,21 @@ class CompressedTensorsConfig(QuantizationConfig):
                 "format": str | None
             } | None
         """
+        # An EXPLICIT target name wins over the ignore list. The ignore match
+        # is a substring match (a bare "mtp" entry must still cover the whole
+        # draft), which also makes a parent entry such as
+        # "model.language_model.layers.0.linear_attn" (Minachist's AutoRound
+        # export lists the GDN module itself as ignored) swallow its quantized
+        # child "...linear_attn.in_proj_qkv" -- a child the same config names
+        # as a target with its 6-bit scheme. compressed-tensors' own matcher
+        # resolves such a name to the target; so do we.
+        if (
+            self.target_scheme_map
+            and layer_name is not None
+            and layer_name in self.target_scheme_map
+        ):
+            return self.target_scheme_map[layer_name]
+
         if should_ignore_layer(
             layer_name, ignore=self.ignore, fused_mapping=self.packed_modules_mapping
         ):
