@@ -973,6 +973,16 @@ class FusedMoE(torch.nn.Module):
         back to the base plan); works for weight AND block-scale grids because
         moe_tp_units divides both -- that branch was already source-derived.
         """
+        if getattr(self, "_gguf_expert_shard", False):
+            # Expert-index shard (GGUF #82 / generic WP3a): a rank holds WHOLE
+            # experts, so along the intermediate dim every rank's shard starts
+            # at 0 and spans the full width; which experts it holds is decided
+            # by _map_global_expert_id_to_local_expert_id, not here. The plan
+            # partition below is over experts (moe_tp_units == num_experts) and
+            # must never be asked about an intermediate extent -- fn1n boot,
+            # 2026-09-16: "Dimension of size 80 is not a multiple of its unit
+            # count 512" out of _load_w2 on the packed 4-bit intermediate.
+            return 0
         if not tp_plan_active(self.moe_tp_size, self.moe_tp_family):
             tp_size = self.moe_tp_size
             # getattr: the attribute is always set on a real FusedMoE, but this

@@ -135,3 +135,29 @@ def test_stream_presplit_expects_only_the_owned_experts(monkeypatch):
     # cpu ambient does not arm (documented); check the count logic directly
     owned = int(getattr(layer, "_expert_shard_owned", 5))
     assert owned == 4
+
+
+def test_source_start_is_zero_along_the_intermediate_under_the_expert_shard():
+    """fn1n boot 2026-09-16: under the generic expert shard the standard
+    _load_w13/_load_w2 loaders still asked _moe_src_start for this rank's
+    intermediate offset, and the plan partition -- whose units are EXPERTS
+    (512) there -- refused the packed 4-bit intermediate extent (80). A rank
+    holds whole experts: the intermediate start is 0 on every rank."""
+    from types import SimpleNamespace
+
+    from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+
+    me = SimpleNamespace(
+        _gguf_expert_shard=True,
+        moe_tp_size=3,
+        moe_tp_family="moe",
+        moe_tp_units=512,
+        use_presharded_weights=False,
+    )
+    for rank in range(3):
+        assert FusedMoE._moe_src_start(me, 80, 80, rank) == 0
+    # Without the expert shard and without a plan the even split is unchanged.
+    even = SimpleNamespace(
+        _gguf_expert_shard=False, moe_tp_size=2, moe_tp_family="moe", moe_tp_units=1, use_presharded_weights=False
+    )
+    assert FusedMoE._moe_src_start(even, 80, 40, 1) == 40
