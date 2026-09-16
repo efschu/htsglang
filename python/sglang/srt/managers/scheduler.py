@@ -4834,6 +4834,36 @@ class Scheduler(
             mm_inputs.release_features()
             req.multimodal_inputs = None
 
+    def _weg2_abort_dormant_hold(self, recv_req) -> int:
+        """#1445: an abort reaches the #1443 dormant hold exactly as it reaches
+        ``waiting_queue`` -- prefix match or abort_all, the hicache reservation
+        released, the tokenizer told.  Before this, an abort landing while the
+        request was HELD found nothing, and the wake released a request whose
+        sender had already given up (boot weg2xsn205, rid HEALTH_CHECK).
+        Held requests own no device rows and no mamba slot (the hold sits
+        before alloc), so nothing else is released.  Returns the count."""
+        hold = getattr(self, "weg2_dormant_hold", None)
+        if not hold:
+            return 0
+        rid = str(getattr(recv_req, "rid", "") or "")
+        abort_all = bool(getattr(recv_req, "abort_all", False))
+        keep, gone = [], []
+        for req in hold:
+            if abort_all or str(req.rid).startswith(rid):
+                gone.append(req)
+            else:
+                keep.append(req)
+        if not gone:
+            return 0
+        hold[:] = keep
+        for req in gone:
+            if getattr(self, "enable_hicache_storage", False):
+                self.tree_cache.release_aborted_request(req.rid)
+            self.ipc_channels.send_to_tokenizer.send_output(AbortReq(rid=req.rid), req)
+        logger.info("#1445 DORMANT-HOLD abort: %d held request(s) dropped (rid=%s abort_all=%s), %d still held",
+                    len(gone), rid[:12], abort_all, len(keep))
+        return len(gone)
+
     def _weg2_release_dormant_hold(self) -> int:
         """#1443: the wake cleared the dormant flag -- the held requests join
         the waiting queue in arrival order. Called by the resume handler
@@ -4883,7 +4913,14 @@ class Scheduler(
         # held requests live OUTSIDE waiting_queue so the wake's flush_cache
         # idle witness (waiting_queue == 0) stays true; they are queued right
         # after the dormant flag clears. SGLANG_WEG2_DORMANT_ADMIT=0 refuses as before.
-        if getattr(self, "weg2_dormant", False) and not _weg2_dormant_admit_armed():
+        # #1445: a HEALTH probe is never HELD on a dormant group -- its sender
+        # (the tokenizer's /health_generate) aborts it after its timeout, and a
+        # held probe released after the wake sat in P's waiting queue for 90 s
+        # unscheduled (boot weg2xsn205: flush_cache 400 x 180, W3 at flip 2).
+        # It gets the pre-#1443 W25 refusal, streamed straight out.
+        if getattr(self, "weg2_dormant", False) and (
+            not _weg2_dormant_admit_armed() or is_health_check_generate_req(recv_req)
+        ):
             self._weg2_refuse_dormant(recv_req, context="generate")
             return
         # #261 live handover: a prefix parked for handover must not be
@@ -17448,6 +17485,7 @@ class Scheduler(
             ):
                 release_kv_cache(req, self.tree_cache, is_insert=False)
             logger.debug(f"Abort queued request. {req.rid=}")
+        self._weg2_abort_dormant_hold(recv_req)  # #1445: the hold is a queue too
 
         # Delete the requests in the grammar queue
         # Abort method 2: call `set_finish_with_abort`
