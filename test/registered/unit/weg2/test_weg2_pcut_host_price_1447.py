@@ -66,6 +66,38 @@ class Picker(CustomTestCase):
         self.assertEqual((gib, lanes, src), (0.0, 1, "no exchange"))
 
 
+class ExchangeArmPrice(CustomTestCase):
+    def test_exchange_arm_converts_bytes_to_gib(self):
+        """The exchange path, with the two producers faked: catches a NameError
+        in the conversion (boot weg2xsn207's preflight died on 'GIB')."""
+        ns = SimpleNamespace(weg2_weight_source=launcher.WEIGHT_SOURCE_EXCHANGE,
+                             weg2_xchg_oncard="host", model="/nonexistent",
+                             weg2_xchg_oncard_slot_mib=None, xchg_bounce_depth=1,
+                             xchg_lanes_concurrent=None, xchg_band_credit=False,
+                             weg2_xchg_legs="both")
+        calls = {}
+        orig_lanes, orig_terms = launcher.xchg_lane_count, launcher.xchg_bounce_terms_for_arm
+
+        def fake_lanes(stage_ratio, legs, d_vector=launcher.XCHG_D_VECTOR_DEFAULT):
+            calls["cut"] = (stage_ratio, legs)
+            return 5, "WEG2-XCHG-LANES cut=x lanes=5 source=measured boot=t"
+
+        def fake_terms(weight_source, oncard_mode, model_dir, oncard_slot_mib, depth,
+                       n_lanes, lanes_concurrent, band_credit):
+            calls["terms"] = (weight_source, oncard_mode, depth, n_lanes, lanes_concurrent, band_credit)
+            return 15.75 * (1 << 30), ["line"]
+
+        launcher.xchg_lane_count, launcher.xchg_bounce_terms_for_arm = fake_lanes, fake_terms
+        try:
+            gib, lanes, src = launcher.host_price_for_cut(ns, "39,13,12")
+        finally:
+            launcher.xchg_lane_count, launcher.xchg_bounce_terms_for_arm = orig_lanes, orig_terms
+        self.assertAlmostEqual(gib, 15.75)
+        self.assertEqual((lanes, src), (5, "measured"))
+        self.assertEqual(calls["cut"], ("39,13,12", "both"))
+        self.assertEqual(calls["terms"], (launcher.WEIGHT_SOURCE_EXCHANGE, "host", 1, 5, 0, False))
+
+
 class Wiring(CustomTestCase):
     def test_solver_applies_the_host_price(self):
         src = inspect.getsource(launcher.solve_p_cut)

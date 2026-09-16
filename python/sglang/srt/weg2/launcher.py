@@ -8742,7 +8742,7 @@ def host_price_for_cut(ns, stage_ratio: str) -> Tuple[float, int, str]:
         int(lanes),
         int(xchg_bounce.resolve_lanes_concurrent(getattr(ns, "xchg_lanes_concurrent", None))),
         bool(getattr(ns, "xchg_band_credit", False)))
-    return float(nbytes) / GIB, int(lanes), source
+    return float(nbytes) / host_ledger.GIB, int(lanes), source
 
 
 def host_priced_pick(rows, price, incumbent_gib: float, slack_gib: float):
