@@ -65,6 +65,17 @@ def _resolve_trtllm_sparse_decode():
 
 @lru_cache(maxsize=1)
 @lru_cache(maxsize=1)
+def _qsa_rows_path_armed() -> bool:
+    """fn5e 2026-09-16 (PP=3, a 3080 stage): the packed varlen fallback of
+    the paged decode path is FA4 cute on this venv (no FA2), and cute's MLIR
+    refused to build on sm86 ('Operation creation failed', pack_gqa).  The
+    DCP rows kernel (WP3b) already handles dcp_size <= 1 (rows = slots) and
+    is the proven decode path of the TP=3 boots, so it is the default on
+    every rank; SGLANG_QSA_ROWS_PATH=0 restores the paged FA path."""
+    import os
+    return os.environ.get("SGLANG_QSA_ROWS_PATH", "1") != "0"
+
+
 def _resolve_flash_attn_varlen_func_or_none():
     try:
         return _resolve_flash_attn_varlen_func()
@@ -1498,9 +1509,10 @@ class QwenSparseAttnBackend(AttentionBackend):
             )
             return self._pad_extend_output(output, num_output_rows)
 
-        if self.dcp_size > 1:
+        if self.dcp_size > 1 or (_qsa_rows_path_armed() and q.is_cuda):
             # WP3b: the prefix rows live on their owner ranks; attend the owned
             # subset on the gathered heads and LSE-merge (see _attend_rows).
+            # fn5e: also the non-DCP branch -- see _qsa_rows_path_armed.
             metadata = self._resolve_metadata(forward_batch)
             rows = self._topk_rows(topk_indices, metadata)
             output = self._attend_rows(q, layer, rows)
@@ -1692,6 +1704,11 @@ class QwenSparseAttnBackend(AttentionBackend):
         if save_kv_cache:
             self._set_kv_buffer(forward_batch, layer, k, v)
         q = q.reshape(-1, layer.tp_q_head_num, layer.head_dim)
+        if self.dcp_size <= 1 and _qsa_rows_path_armed() and q.is_cuda:
+            # fn5e: rows kernel on every rank (see _qsa_rows_path_armed)
+            metadata = self._resolve_metadata(forward_batch)
+            rows = self._topk_rows(topk_indices, metadata)
+            return self._attend_rows(q, layer, rows).reshape(q.shape[0], -1)
         return self._forward_paged_attention(q, layer, forward_batch, topk_indices)
 
     def _forward_paged_attention(

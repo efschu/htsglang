@@ -250,3 +250,16 @@ def test_compact_kernel_gathers_fp8_pool_rows_on_the_metal(kv_dtype):
     exp_rows = torch.tensor([3, 5, 7, 9, 11, 13, 32, 33, 34, 36, 38, 40, 42, 44], device="cuda")
     assert torch.equal(out_k, pool[exp_rows].to(torch.bfloat16))
     assert torch.equal(out_v, vpool[exp_rows].to(torch.bfloat16))
+
+
+def test_rows_path_is_the_decode_path_on_every_rank_fn5e():
+    """fn5e: the paged FA4-cute fallback failed to build on a 3080 PP stage;
+    decode and the non-DCP extend branch route through the rows kernel."""
+    import inspect
+    from sglang.srt.layers.attention import qwen_sparse_attn_backend as qb
+    assert qb._qsa_rows_path_armed()
+    dec = inspect.getsource(qb.QwenSparseAttnBackend.forward_decode)
+    assert "_qsa_rows_path_armed() and q.is_cuda" in dec
+    assert dec.index("_attend_rows(") < dec.index("_forward_paged_attention(")
+    ext = inspect.getsource(qb.QwenSparseAttnBackend.forward_extend)
+    assert "self.dcp_size > 1 or (_qsa_rows_path_armed() and q.is_cuda)" in ext
