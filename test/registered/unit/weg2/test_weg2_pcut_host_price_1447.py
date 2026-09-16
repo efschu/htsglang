@@ -110,6 +110,10 @@ class Wiring(CustomTestCase):
         # cap floor default follows the arm
         self.assertIn('os.environ.get("SGLANG_WEG2_PCUT_CAP_FLOOR", _cap_floor_default)', src)
         self.assertEqual(launcher.PCUT_BOUNCE_SLACK_ENV, "SGLANG_WEG2_PCUT_BOUNCE_SLACK_GIB")
+        # the host-price incumbent is the ORDERED default cut (the measured lane
+        # set), never the scores' 32,18,14 (desk probe 2026-09-16 priced 27.75 GiB there)
+        self.assertIn("_inc_cut = _csv(DEFAULT_PP_ORDERED_CUT)", src)
+        self.assertEqual(tuple(launcher.DEFAULT_PP_ORDERED_CUT), (39, 13, 12))
 
 
 if __name__ == "__main__":

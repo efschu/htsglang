@@ -9379,15 +9379,17 @@ def solve_p_cut(
             _floor = decision.pool_floor
             _rows = [c for c in decision.frontier
                      if _floor is None or float(c.pool_tokens) >= float(_floor)]
-            _inc_gib, _inc_lanes, _inc_src = host_price_for_cut(
-                ns, _csv(P_PP_STAGE_RATIO_SCORES))
+            # the incumbent of the HOST price is the ordered default cut
+            # (39,13,12 -- the one measured lane set), not the scores' 32,18,14
+            _inc_cut = _csv(DEFAULT_PP_ORDERED_CUT)
+            _inc_gib, _inc_lanes, _inc_src = host_price_for_cut(ns, _inc_cut)
             try:
                 _slack = float(os.environ.get(PCUT_BOUNCE_SLACK_ENV, "0") or 0.0)
             except ValueError:
                 _slack = 0.0
             log("PP-CUT HOST-PRICE incumbent %s: xchg_bounce=%.2f GiB lanes=%d (%s); slack %s=%.2f GiB; "
                 "%d frontier rows at/above the floor priced fastest first"
-                % (_csv(P_PP_STAGE_RATIO_SCORES), _inc_gib, _inc_lanes, _inc_src,
+                % (_inc_cut, _inc_gib, _inc_lanes, _inc_src,
                    PCUT_BOUNCE_SLACK_ENV, _slack, len(_rows)))
             _picked, _hp_lines = host_priced_pick(
                 _rows, lambda r: host_price_for_cut(ns, _csv(r.layers)), _inc_gib, _slack)
