@@ -502,6 +502,7 @@ def build_dcp_weighted_kv_indices(
     pad: int = 0,
     req_to_token_stride: Optional[int] = None,
     total_tokens: Optional[int] = None,
+    tail_lens: Optional[torch.Tensor] = None,
 ):
     """Weighted-DCP paged kv_indices: this rank's OWNED cache slots, compacted.
 
@@ -521,6 +522,16 @@ def build_dcp_weighted_kv_indices(
     the actual owner-rule arithmetic is ``dcp_weighted_read_slots`` /
     ``dcp_weighted_owned_lengths``, which are pure tensor functions pinned on
     CPU against an independent reference.
+
+    ``tail_lens`` (#1243 precision tail) is the per-request tail length in
+    GLOBAL POSITIONS. When given, a THIRD value is returned: how many of each
+    request's owned slots fall in that window. It is computed from the very
+    ``owned`` mask this function already built, so it is not a second
+    bookkeeping of ownership -- recomputing it at the call site would mean
+    rebuilding ``full_kv`` and re-deriving the owner rule a second time, which
+    is exactly the read/write drift the module docstring exists to prevent.
+    Without it the return shape is unchanged, so every existing caller is
+    untouched.
     """
     bs = len(req_pool_indices)
     device = req_pool_indices.device
@@ -568,7 +579,12 @@ def build_dcp_weighted_kv_indices(
         kv_indices = torch.cat([kv_indices, kv_indices.new_zeros(pad)])
     owned_per_req = dcp_weighted_owned_lengths(owned, lens64)
     kv_indptr[1 : bs + 1] = torch.cumsum(owned_per_req, dim=0)
-    return kv_indptr[: bs + 1], kv_indices
+    if tail_lens is None:
+        return kv_indptr[: bs + 1], kv_indices
+    from sglang.srt.mem_cache.kv_tail import tail_window_owned_lengths
+
+    owned_tail_per_req = tail_window_owned_lengths(owned, lens64, tail_lens)
+    return kv_indptr[: bs + 1], kv_indices, owned_tail_per_req
 
 
 # ---------------------------------------------------------------------------
