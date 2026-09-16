@@ -2711,7 +2711,36 @@ class HiCacheController:
         operation.increment(inc)
 
     # todo: deprecate
+    def _arena_page_get(self, operation, hash_values, host_indices) -> Optional[int]:
+        """#1424 Stufe 3: address COMPLETE pages in the arena in place -- key ->
+        slot, reader reference, ids written over the placeholders; no copy.
+        Returns the hit count, or None when this pool is not arena-bound."""
+        pool = self.mem_pool_host
+        if not getattr(pool, "arena_read", False) or self.storage_backend is None:
+            return None
+        if not pool.ensure_bound(self.storage_backend, role="kv"):
+            return None
+        stems = [self.storage_backend._get_suffixed_key(k) for k in hash_values]
+        found = pool.arena.find_slots(stems)
+        slots = []
+        for slot, state in found:
+            if slot < 0 or state != 2:
+                break
+            if pool.arena.ref_slots([slot], +1) != 1:
+                break  # evicted between find and ref: the prefix ends here
+            slots.append(slot)
+        if not slots:
+            return 0
+        pool.resolve_rows(host_indices, slots)
+        for _ in slots:
+            if not operation.increment(self.page_size):
+                break
+        return len(slots)
+
     def _generic_page_get(self, operation, hash_values, host_indices, extra_info=None):
+        _apg = getattr(self, "_arena_page_get", None)
+        if callable(_apg) and _apg(operation, hash_values, host_indices) is not None:
+            return
         dummy_page_dst, _release = _borrow_read_pages(
             self.storage_backend, PoolName.KV, self.mem_pool_host, len(hash_values)
         )
@@ -2959,7 +2988,8 @@ class HiCacheController:
                 "pool and has no value without one; a 0 here would refuse every "
                 "prefetch silently"
             )
-        return int(self.prefetch_capacity_fraction * int(pool.size))
+        cap = getattr(pool, "prefetch_capacity_tokens", None) or int(pool.size)  # #1424
+        return int(self.prefetch_capacity_fraction * int(cap))
 
     def prefetch_rate_limited(self) -> bool:
         """Refuse a new prefetch registration once the registered prefetches
@@ -3596,6 +3626,24 @@ class HiCacheController:
         """
         component = self._draft_component_name()
         draft_keys = [f"{h}.{component}" for h in hash_values]
+        dpool = self.mem_pool_host_draft
+        if (getattr(dpool, "arena_read", False) and self.storage_backend is not None
+                and dpool.ensure_bound(self.storage_backend, role="draft")):
+            # #1424: the draft rows share the KV rows' ids; behind an arena id
+            # the draft page is addressed in the DRAFT arena (miss = zero row).
+            stems = [self.storage_backend._get_suffixed_key(k) for k in draft_keys]
+            found = dpool.arena.find_slots(stems)
+            rows = [int(host_indices[i * self.page_size]) - dpool.staging_rows for i in range(len(stems))]
+            flags, slots, hits = [], [], 0
+            for slot, state in found:
+                ok = slot >= 0 and state == 2 and dpool.arena.ref_slots([slot], +1) == 1
+                slots.append(slot if ok else -1)
+                flags.append(bool(ok))
+                hits += int(ok)
+            dpool.resolve_draft_rows(rows, slots)
+            self._draft_l3_hits += hits
+            self._draft_l3_misses += len(draft_keys) - hits
+            return flags
         draft_dummy, _release = _borrow_read_pages(
             self.storage_backend, component, self.mem_pool_host_draft, len(draft_keys)
         )

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import threading
 from typing import Optional
 
@@ -1396,4 +1397,8 @@ def get_mha_host_pool_cls(device_pool: MHATokenToKVPool) -> type:
     """
     if device_pool.head_dim != device_pool.v_head_dim:
         return AsymmetricMHATokenToKVPoolHost
+    if os.environ.get("SGLANG_HICACHE_ARENA_HOST", "0") == "1":
+        # #1424 Stufe 3: rows beyond the staging ring are arena slots
+        from sglang.srt.mem_cache.pool_host.arena_pool import ArenaMHAHostPool
+        return ArenaMHAHostPool
     return MHATokenToKVPoolHost

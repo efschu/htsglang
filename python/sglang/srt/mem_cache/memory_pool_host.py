@@ -248,7 +248,7 @@ def _refuse_stray_host_index(pool, index, op: str) -> None:
     Subclasses IndexError so existing handlers still catch it, but carries the
     tier story instead of `index 76997 is out of bounds for dimension 0`.
     """
-    size = int(getattr(pool, "size", -1))
+    size = int(getattr(pool, "id_space", None) or getattr(pool, "size", -1))  # #1424
     if size < 0 or index is None:
         return
     if torch.is_tensor(index):
