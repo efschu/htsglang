@@ -981,6 +981,27 @@ class SchedulerWeightUpdaterManager:
         except BaseException:  # noqa: BLE001 -- an instrument never breaks a leg
             return None
 
+    def _weg2_dump_dc_snapshot(self, stage: str) -> Optional[str]:
+        """#1452: torch.cuda.memory._dump_snapshot of THIS rank into the
+        evidence dir (SGLANG_WEG2_RANKDUMP_DIR), once per sleep.  Read with
+        the debugtools memsnapshot_analyze tool.  Fail-soft, never raises."""
+        try:
+            n = getattr(self, "_1452_snapshots", 0) + 1
+            self._1452_snapshots = n
+            if n > 4:
+                return None
+            root = os.environ.get("SGLANG_WEG2_RANKDUMP_DIR") or "/tmp"
+            path = os.path.join(
+                root, "memsnap_%s_rank%s_n%d.pickle"
+                % (self._weg2_group_name() or "g", self._weg2_rank(), n))
+            torch.cuda.memory._dump_snapshot(path)
+            logger.info("WEG2-DC-SNAPSHOT stage=%s wrote %s (untagged census; analyse with memsnapshot_analyze)",
+                        stage, path)
+            return path
+        except BaseException as exc:  # noqa: BLE001
+            logger.info("WEG2-DC-SNAPSHOT stage=%s n/a (%s: %s)", stage, type(exc).__name__, exc)
+            return None
+
     def _weg2_log_dc_breakdown(self, stage: str) -> Optional[Dict[str, Any]]:
         """#1446: print this rank's dormant-residue attribution (see
         weg2_memory_saver.dc_breakdown).  Fail-soft: never raises."""
@@ -1007,6 +1028,14 @@ class SchedulerWeightUpdaterManager:
                 tag_bytes=tag_bytes, offload_tags=getattr(self, "offload_tags", None),
             )
             logger.info("%s", format_dc_breakdown(rec, stage=stage))
+            # #1452: with SGLANG_WEG2_DC_SNAPSHOT=1 the allocator's snapshot of
+            # the UNTAGGED remainder (794 / 772 MiB per card at weg2xsn207)
+            # goes to the evidence dir once all tags are paused -- the census
+            # of what torch still holds, by allocation stack (history is
+            # recorded from scheduler start under the same env).
+            if (os.environ.get("SGLANG_WEG2_DC_SNAPSHOT", "0") == "1"
+                    and int(rec.get("tms_resident_mib") or 0) == 0):
+                self._weg2_dump_dc_snapshot(stage)
             return rec
         except BaseException:  # noqa: BLE001
             logger.info("WEG2-DC-BREAKDOWN stage=%s n/a (instrument failed)", stage)

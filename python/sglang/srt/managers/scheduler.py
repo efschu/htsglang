@@ -18092,6 +18092,20 @@ def configure_scheduler_process(
     return dp_rank
 
 
+def _weg2_arm_dc_snapshot_history() -> None:
+    """#1452: under SGLANG_WEG2_DC_SNAPSHOT=1 record allocation stacks from the
+    start of the scheduler process, so the sleep-time snapshot attributes the
+    untagged remainder to code.  Diagnostic boots only (costs CPU per alloc)."""
+    if os.environ.get("SGLANG_WEG2_DC_SNAPSHOT", "0") != "1":
+        return
+    try:
+        import torch as _torch  # noqa: PLC0415
+        _torch.cuda.memory._record_memory_history(max_entries=200000)
+        logger.info("WEG2-DC-SNAPSHOT history armed (max_entries=200000)")
+    except BaseException as exc:  # noqa: BLE001
+        logger.info("WEG2-DC-SNAPSHOT history n/a (%s: %s)", type(exc).__name__, exc)
+
+
 def run_scheduler_process(
     server_args: ServerArgs,
     port_args: PortArgs,
@@ -18104,6 +18118,7 @@ def run_scheduler_process(
     dp_rank: Optional[int],
     pipe_writer,
 ):
+    _weg2_arm_dc_snapshot_history()  # #1452
     # Load plugins so hooks can override Scheduler and its dependencies.
     load_plugins()
     # #1402 (boot xsn133, 2026-09-15): the HiCache prefetch threads read the
