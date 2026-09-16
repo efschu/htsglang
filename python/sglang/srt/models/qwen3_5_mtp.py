@@ -51,6 +51,39 @@ logger = logging.getLogger(__name__)
 MTP_FC_LAYER_NAME = "mtp.fc"
 
 
+_QUANT_TENSOR_SUFFIXES = (".weight_packed", ".weight_scale", ".weight_scale_inv")
+
+
+def mtp_index_is_dense(model_path) -> Optional[bool]:
+    """Does the checkpoint's safetensors index carry NO quantized tensor under
+    ``mtp.``? True = the draft ships dense (bf16), False = it carries packed
+    weights or scales, None = no index to read (single-file checkpoints, GGUF).
+
+    The compressed-tensors config cannot answer this on its own: an
+    AutoRound export (Minachist Qwen3.8-Flash-Next) lists neither an
+    ``mtp.*`` target nor an ``mtp.*`` ignore entry while shipping the whole
+    MTP module in bf16, so building the draft under the config would refuse
+    every ``mtp.`` layer with 'Unable to find matching target'. The index
+    says what was actually written."""
+    import json
+    import os
+
+    if not model_path or not os.path.isdir(str(model_path)):
+        return None
+    index_path = os.path.join(str(model_path), "model.safetensors.index.json")
+    if not os.path.isfile(index_path):
+        return None
+    try:
+        with open(index_path) as f:
+            weight_map = json.load(f).get("weight_map") or {}
+    except (OSError, ValueError):
+        return None
+    mtp_keys = [k for k in weight_map if k.startswith("mtp.")]
+    if not mtp_keys:
+        return None
+    return not any(k.endswith(_QUANT_TENSOR_SUFFIXES) for k in mtp_keys)
+
+
 def _mtp_quant_config(quant_config):
     """The quantization the MTP module itself is built with (#37500 port:
     shared with qwen4_exp_mtp so the loader's fusion gate sees the same
@@ -77,6 +110,17 @@ def _mtp_quant_config(quant_config):
             isinstance(layer, str) and layer.startswith("mtp.")
             for layer in exclude_layers
         ):
+            return None
+    # compressed-tensors: the safetensors index is the authority on whether
+    # the draft was written quantized (Qwen3.8-27B-INT8: mtp.*.weight_scale
+    # present -> stays quantized) or dense (Minachist / cyankiwi
+    # Qwen3.8-Flash-Next: no packed tensor under mtp. -> bf16 draft).
+    if quant_config and quant_config.get_name() == "compressed-tensors":
+        if mtp_index_is_dense(getattr(get_server_args(), "model_path", None)):
+            logger.info(
+                "[mtp] checkpoint index carries no quantized tensor under 'mtp.'; "
+                "building the MTP draft unquantized"
+            )
             return None
     return quant_config
 
