@@ -5968,7 +5968,9 @@ def choose_host_ledger(
         weights_cpu_backup_armed,
     )
     ledger_kw = dict(
-        **(_weg2_arena_ledger_terms(model_dir) if model_dir else {}),  # #1432: arena_gib / staging_gb / anchor_mib
+        # #1451: no arena on a --weg2-disable-hicache boot -- the term charged
+        # 33.6 GiB there too (test_weg2_hicache_disabled_1386 M=2400 unfundable)
+        **(_weg2_arena_ledger_terms(model_dir) if (model_dir and not hicache_disabled) else {}),  # #1432
         # #1317n D's L2 IS PRICED SEPARATELY FROM P'S. It rides the ONE kwargs
         # block for exactly the reason the block exists (boot weg2sn6a died of
         # a price() call that had drifted from choose()'s keywords): a term
@@ -9679,7 +9681,11 @@ def build_parser() -> argparse.ArgumentParser:
              "holds 271k tokens on PP0 = the 262,144 cap plus one window. Back to 1 with "
              "#1424 (Stufe 3): reads are arena slots, the pool is a 1 GB staging ring. 0 = S=1.")
     ap.add_argument(
-        "--pin-ledger-arm-m", type=int, default=2400,
+        # #1451: default 600 (was 2400) -- the number every arm has pinned
+        # since the arena entered the ledger (#1432): with arena 33.6 GiB the
+        # 2400 rung is unfundable on this box (test_weg2_hicache_disabled_1386
+        # read it against the pinned quiet-box meminfo), 600 is what boots run.
+        "--pin-ledger-arm-m", type=int, default=600,
         help="#1317/#1318: PIN the host-ledger arm's mamba-host-pool size M (MiB) "
              "instead of letting `host_ledger.choose` pick it. 0 = choose. Default 2400 "
              "since 2026-09-16 (#1414, boot xsn163: at M=600 = 13 host anchor slots PP2 "
