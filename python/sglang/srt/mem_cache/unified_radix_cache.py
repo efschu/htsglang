@@ -4626,6 +4626,18 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 self._mark_l3_present_span(
                     insert_result.inserted_host_node, last_host_node
                 )
+                # #1417 (boot xsn167): the span this prefetch just inserted
+                # is host-only until the admission loads it back, and the
+                # anchor lock taken at registration covers `last_host_node`
+                # alone. Under host-pool pressure (three 100k prefixes on a
+                # 122k pool) the fresh chain was evicted between completion
+                # and admission: the walk reached 4314 of 98550, accepted 0,
+                # uncached 4252 > X -> W50 -> requeue -> P recompute. Pin
+                # every node of the inserted chain until the admission pops
+                # the outcome (or the request is aborted).
+                self._pin_prefetched_span(
+                    req_id, insert_result.inserted_host_node, last_host_node
+                )
             # #1061: the adopted tail arrived via the PREFETCH arm. Only the
             # keys the tree NEWLY adopted count as arrivals -- the matched
             # head (`prefix_len`) was already resident, and a declined insert
@@ -5130,7 +5142,43 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         operation.mark_terminate()
 
     def pop_prefetch_loaded_tokens(self, req_id: str) -> int:
+        self._unpin_prefetched_span(req_id)
         return self.prefetch_loaded_tokens_by_reqid.pop(req_id, 0)
+
+    #: #1417 upper bound on pinned spans (rids that never reach admission)
+    _PREFETCH_SPAN_PINS_MAX = 64
+
+    def _pin_prefetched_span(self, req_id: str, deepest, stop_at) -> int:
+        """#1417: host-lock every node from *deepest* up to (excluding)
+        *stop_at*; released by ``pop_prefetch_loaded_tokens`` /
+        ``release_aborted_request``. Returns the number of nodes pinned."""
+        pins = getattr(self, "_prefetch_span_pins", None)
+        if pins is None:
+            pins = self._prefetch_span_pins = {}
+        self._unpin_prefetched_span(req_id)
+        held = []
+        node = deepest
+        while node is not None and node is not stop_at and node is not self.root_node:
+            try:
+                held.append((node, self.inc_host_lock_ref(node).to_dec_params()))
+            except Exception:  # noqa: BLE001 - a pin never breaks a completion
+                break
+            node = node.parent
+        if held:
+            pins[str(req_id)] = held
+        while len(pins) > self._PREFETCH_SPAN_PINS_MAX:
+            self._unpin_prefetched_span(next(iter(pins)))
+        return len(held)
+
+    def _unpin_prefetched_span(self, req_id: str) -> int:
+        pins = getattr(self, "_prefetch_span_pins", None)
+        held = pins.pop(str(req_id), None) if pins else None
+        for node, params in held or []:
+            try:
+                self.dec_host_lock_ref(node, params)
+            except Exception:  # noqa: BLE001
+                pass
+        return len(held or [])
 
     def completed_prefetch_tokens(self, req_id: str) -> Optional[int]:
         """#1175: how many prefix tokens THIS rank's storage prefetch has
@@ -5178,6 +5226,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             return False
 
     def release_aborted_request(self, rid: str) -> None:
+        self._unpin_prefetched_span(rid)
         self.prefetch_loaded_tokens_by_reqid.pop(rid, None)
         self._prefetch_completed_tokens.pop(rid, None)
         if rid not in self.ongoing_prefetch:
