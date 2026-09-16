@@ -1198,6 +1198,7 @@ class FusedMoE(torch.nn.Module):
                 shard_id=shard_id,
                 expert_id=expert_id,
             )
+            self._ct_stream_note(param)
             return
 
         require_global_experts = getattr(param, "_sglang_require_global_experts", False)
@@ -1262,6 +1263,69 @@ class FusedMoE(torch.nn.Module):
             weight_name=weight_name,
             shard_id=shard_id,
             expert_id=expert_id,
+        )
+        self._ct_stream_note(param)
+
+    # -- WP1 (Qwen3.8-Flash-Next): per-layer early presplit for the
+    # compressed-tensors WNA16 offload path ------------------------------
+    #
+    # The safetensors loader delivers EVERY layer's expert shards before the
+    # loader's own process_weights_after_loading pass runs, so with the host
+    # create_weights of CompressedTensorsWNA16MoE the full expert stack of
+    # the checkpoint (Qwen3.8-Flash-Next: 70 GB of INT4 experts) is resident
+    # in host RAM at once, and the pinned spill pool comes ON TOP of it --
+    # the #256 shape one level up. The GGUF path bounds this with per-expert
+    # streaming (#391c); the marlin repack works on stacked [E, ...] tensors,
+    # so this path bounds it per LAYER instead: the scheme arms a shard
+    # counter at create_weights, and the moment the last expected shard of
+    # this layer has landed, the repack + presplit run right here, from the
+    # loader thread, under the same device_loading_context the loader would
+    # use later. The layer's host copy is dropped (0-row placeholder + pinned
+    # spill), so the host peak is the spill pool plus the layers still in
+    # flight, not the whole checkpoint. The loader's later pass sees
+    # ``is_marlin_converted`` and is a no-op.
+
+    def _ct_stream_note(self, param) -> None:
+        state = getattr(self, "_ct_stream_presplit", None)
+        if state is None or state["done"]:
+            return
+        name = state["names"].get(id(param))
+        if name is None:
+            return
+        fire = False
+        with state["lock"]:
+            if state["done"]:
+                return
+            state["seen"][name] = state["seen"].get(name, 0) + 1
+            if all(
+                state["seen"].get(n, 0) >= want for n, want in state["expected"].items()
+            ):
+                state["done"] = True
+                fire = True
+        if fire:
+            self._ct_stream_presplit_now(state)
+
+    def _ct_stream_presplit_now(self, state) -> None:
+        import time
+
+        from sglang.srt.layers.moe.expert_offload import (
+            expert_offload_release_totals,
+        )
+        from sglang.srt.model_loader.loader import device_loading_context
+
+        before = expert_offload_release_totals()
+        t0 = time.perf_counter()
+        with device_loading_context(self, state["device"]):
+            self.quant_method.process_weights_after_loading(self)
+        after = expert_offload_release_totals()
+        logger.info(
+            "[ct-stream-presplit] layer %s: repack + presplit at load "
+            "(%.2f GiB of weight VRAM released, %.2f GiB to the pinned host "
+            "pool, %.1f s)",
+            getattr(self, "layer_id", "?"),
+            (after.device_bytes - before.device_bytes) / 2**30,
+            (after.host_bytes - before.host_bytes) / 2**30,
+            time.perf_counter() - t0,
         )
 
     def _load_gguf_weight(

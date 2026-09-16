@@ -318,3 +318,90 @@ def test_zero_points_share_the_expert_row_with_their_weight(fraction_025):
             assert torch.equal(
                 spill[row].view(torch.uint8), before[attr][expert].view(torch.uint8)
             ), f"{attr}: expert {expert} did not land on pool row {row}"
+
+
+# --------------------------------------------------------------------------
+# WP1: per-layer early presplit during the safetensors stream
+# --------------------------------------------------------------------------
+
+
+def _armed_layer(monkeypatch, sym=False, num_experts=4):
+    """A FusedMoE shell with the scheme's stream-presplit state armed by hand
+    (create_weights arms it only under a CUDA ambient device)."""
+    import threading
+
+    from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+
+    layer = FusedMoE.__new__(FusedMoE)
+    torch.nn.Module.__init__(layer)
+    layer.layer_id = 7
+    params = {}
+    expected = {
+        "w13_weight_packed": 2 * num_experts,
+        "w2_weight_packed": num_experts,
+        "w13_weight_scale": 2 * num_experts,
+        "w2_weight_scale": num_experts,
+    }
+    if not sym:
+        expected["w13_weight_zero_point"] = 2 * num_experts
+        expected["w2_weight_zero_point"] = num_experts
+    for n in expected:
+        p = torch.nn.Parameter(torch.zeros(1), requires_grad=False)
+        layer.register_parameter(n, p)
+        params[n] = p
+    layer._ct_stream_presplit = {
+        "expected": expected,
+        "names": {id(p): n for n, p in params.items()},
+        "seen": {},
+        "lock": threading.Lock(),
+        "done": False,
+        "device": torch.device("cpu"),
+    }
+    fired = []
+    monkeypatch.setattr(
+        layer, "_ct_stream_presplit_now", lambda state: fired.append(state)
+    )
+    return layer, params, expected, fired
+
+
+def test_stream_presplit_fires_once_when_every_expected_shard_landed(monkeypatch):
+    layer, params, expected, fired = _armed_layer(monkeypatch)
+    # every shard but the very last: nothing fires
+    order = [(n, i) for n, want in expected.items() for i in range(want)]
+    for n, _ in order[:-1]:
+        layer._ct_stream_note(params[n])
+    assert fired == []
+    layer._ct_stream_note(params[order[-1][0]])
+    assert len(fired) == 1
+    assert layer._ct_stream_presplit["done"] is True
+    # late, uncounted shards (weight_shape, g_idx) never re-fire it
+    layer._ct_stream_note(params["w2_weight_scale"])
+    layer._ct_stream_note(torch.nn.Parameter(torch.zeros(1)))
+    assert len(fired) == 1
+
+
+def test_stream_presplit_ignores_layers_without_the_armed_state(monkeypatch):
+    from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+
+    layer = FusedMoE.__new__(FusedMoE)
+    torch.nn.Module.__init__(layer)
+    layer._ct_stream_note(torch.nn.Parameter(torch.zeros(1)))  # no state: no-op
+
+
+def test_create_weights_arms_the_stream_presplit_only_on_cuda(fraction_025):
+    """meta ambient (this test) must not arm: the repack needs a card. The
+    CUDA arm is checked by the cuda variant below."""
+    layer = _create_weights(_scheme(sym=False))
+    assert not hasattr(layer, "_ct_stream_presplit")
+
+
+@needs_cuda
+def test_create_weights_arms_the_stream_presplit_on_cuda(fraction_025):
+    layer = _create_weights(_scheme(sym=False), ambient="cuda")
+    state = layer._ct_stream_presplit
+    assert state["device"].type == "cuda"
+    assert state["expected"]["w13_weight_packed"] == 2 * E
+    assert state["expected"]["w2_weight_zero_point"] == E
+    assert set(state["names"].values()) == set(state["expected"])
+    layer_sym = _create_weights(_scheme(sym=True), ambient="cuda")
+    assert "w13_weight_zero_point" not in layer_sym._ct_stream_presplit["expected"]

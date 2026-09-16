@@ -314,6 +314,34 @@ class CompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
             layer._original_shapes["w13_weight_zero_point"] = w13_qzeros.shape
             layer._original_shapes["w2_weight_zero_point"] = tuple(w2_qzeros.shape)
 
+        # WP1: arm the per-layer early presplit (FusedMoE._ct_stream_note).
+        # Only with the host allocation above AND a CUDA ambient device: the
+        # repack needs a card, and without the offload there is nothing to
+        # bound. Expected shard counts: w13-type params get gate and up
+        # (two shards per expert), w2-type params one.
+        if _moe_dev == "cpu":
+            import threading
+
+            ambient = torch.empty(0).device
+            if ambient.type == "cuda":
+                expected = {
+                    "w13_weight_packed": 2 * num_experts,
+                    "w2_weight_packed": num_experts,
+                    "w13_weight_scale": 2 * num_experts,
+                    "w2_weight_scale": num_experts,
+                }
+                if not self.sym:
+                    expected["w13_weight_zero_point"] = 2 * num_experts
+                    expected["w2_weight_zero_point"] = num_experts
+                layer._ct_stream_presplit = {
+                    "expected": expected,
+                    "names": {id(getattr(layer, n)): n for n in expected},
+                    "seen": {},
+                    "lock": threading.Lock(),
+                    "done": False,
+                    "device": ambient,
+                }
+
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
 
         # Skip if the layer is already converted to Marlin format to prevent double-packing.
