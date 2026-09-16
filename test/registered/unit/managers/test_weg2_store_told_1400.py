@@ -347,3 +347,39 @@ def test_1416_told_is_clamped_to_the_anchored_presence():
     assert wst._anchor_clamp(sched, _Req(), 53247) == 53247, "never above completed"
     assert wst._anchor_clamp(types.SimpleNamespace(), _Req(), 7) == 7, "no probe: no clamp"
     assert wst._anchor_clamp(sched, _Req(), 0) == 0
+
+
+def test_1416b_pp0_record_follows_the_clamp(monkeypatch):
+    """xsn169: a clamped told must also clamp PP0's own completed record, or
+    PP0's admission raises the mismatch against itself."""
+    from sglang.srt.managers import weg2_store_told as wst
+
+    class _Tree:
+        _prefetch_completed_tokens = {"r1": 4095}
+
+        def check_prefetch_progress(self, rid):
+            return True
+
+        def completed_prefetch_tokens(self, rid):
+            return self._prefetch_completed_tokens.get(rid)
+
+    class _Req:
+        rid = "r1"
+        origin_input_ids = list(range(8000))
+        prefetch_deferred = None
+
+    class _CC:
+        page_size = 1
+
+        def store_presence_pages(self, ids, lh, prefix_keys=None):
+            return 0
+
+    req = _Req()
+    sched = types.SimpleNamespace(
+        tree_cache=_Tree(), cache_controller=_CC(), waiting_queue=[req],
+        _weg2_store_held={"r1": req}, _weg2_store_told={},
+    )
+    out = wst.pp0_publish(sched, [])
+    assert [o.told for o in out] == [0]
+    assert sched.tree_cache._prefetch_completed_tokens["r1"] == 0
+    assert sched._weg2_store_told["r1"] == 0

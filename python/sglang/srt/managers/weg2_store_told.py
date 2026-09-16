@@ -334,7 +334,17 @@ def pp0_publish(scheduler, recv_reqs: List) -> List:
         if not tree.check_prefetch_progress(rid):
             continue
         told = _completed_prefix(tree, rid)
-        told = _anchor_clamp(scheduler, req, told)
+        clamped = _anchor_clamp(scheduler, req, told)
+        if clamped != told:
+            # #1416b (boot xsn169): PP0's OWN admission compares its recorded
+            # completed prefix with told; a clamped told against the stale
+            # record (told=0 vs own=4095) stopped PP0 itself. The record is
+            # "what this rank can admit" -- clamp it with the same number.
+            try:
+                tree._prefetch_completed_tokens[rid] = int(clamped)
+            except Exception:  # noqa: BLE001 - a tree without the dict keeps its number
+                pass
+        told = clamped
         told_map[rid] = told
         held.pop(rid, None)
         out.append(Weg2StoreTold(rid=rid, told=told))
