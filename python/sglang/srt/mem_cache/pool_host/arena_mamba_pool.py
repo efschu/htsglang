@@ -56,7 +56,7 @@ class ArenaMambaPoolHost(MambaPoolHost):
         self.id_space = self.staging_rows
         self._backend = None
         self._weg2_parts = None  # (spec, ratios, rank, layer_lo, layer_hi) from the controller
-        self._write_extents: Optional[list] = None
+        self._own_extents: Optional[list] = None
         self._page_bytes = 0
         self._pending: dict = {}
         self._pin = False
@@ -142,7 +142,7 @@ class ArenaMambaPoolHost(MambaPoolHost):
             c_views.append(segs)
         self._t_views = t_views
         self._c_views = [c_views]
-        self._write_extents = extents
+        self._own_extents = extents
         self._page_bytes = slot_bytes
         self._pin = bool(pin and torch.cuda.is_available())
         buf = torch.frombuffer(arena._mm, dtype=torch.uint8)

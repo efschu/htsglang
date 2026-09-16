@@ -3535,7 +3535,7 @@ class HiCacheController:
 
         -1 when no reader is installed, 0 when the read failed. The count
         used to be discarded here (#1047's "per-page validity bit" question):
-        `read_extents` is all-or-nothing, so a hit IS a complete canonical
+        the canonical extent read is all-or-nothing, so a hit IS a complete canonical
         page and the count is the validity signal admission needs.
         """
         flags = self._draft_page_get_flags(hash_values, host_indices)

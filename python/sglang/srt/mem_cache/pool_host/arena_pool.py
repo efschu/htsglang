@@ -80,7 +80,7 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
         # complete (slot -> (generation, fresh)), and the per-layer device
         # pointers into the arena data region for the transfer kernel.
         self._backend = None
-        self._write_extents: Optional[list] = None
+        self._own_extents: Optional[list] = None
         self._page_bytes = 0
         self._data_base = 0
         self._k_off = 0
@@ -151,7 +151,7 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
         self._pin = bool(pin and torch.cuda.is_available())
         self._pin_base = int(buf.data_ptr()) + data_off
         self._pin_bytes = page_bytes
-        self._write_extents = [(k_off, k_len), (v_off, v_len)]
+        self._own_extents = [(k_off, k_len), (v_off, v_len)]
         self._page_bytes = page_bytes
         self._data_base = self._pin_base
         self._k_off, self._v_off, self._cell = k_off, v_off, cell
@@ -424,7 +424,7 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
         if not slots:
             return 0
         gens = [self._pending[s][0] for s in slots]
-        st = self.arena.complete_slots(slots, gens, self._write_extents)
+        st = self.arena.complete_slots(slots, gens, self._own_extents)
         done = 0
         for s, r in zip(slots, st):
             self._pending.pop(s, None)

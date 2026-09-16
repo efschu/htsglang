@@ -77,7 +77,7 @@ class PageIO:
         payload_ptrs: Sequence[int],
         fsync: bool,
     ) -> list[int]:
-        """canonical_page_store.write_extents for a whole batch, in C.
+        """the canonical extent writer of canonical_page_store for a whole batch, in C.
 
         Status per page: 0 completed and published, 1 partial (marker
         written), 2 already complete, 3 shape refused, 4 io/lock error.

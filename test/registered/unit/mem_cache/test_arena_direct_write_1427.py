@@ -71,7 +71,7 @@ def test_claim_dma_and_complete_across_two_layer_shards(tmp_path, monkeypatch):
     calls = _record(monkeypatch)
     arena = ShmArena(str(tmp_path / "kv.bin"), PAGE, 8)
     a, b = _pool(arena), _pool(arena, _WinOther, layers=1)
-    a._write_extents = [(1 * CELL, 3 * CELL), (PAGE // 2 + 1 * CELL, 3 * CELL)]  # a: cells 1..3
+    a._own_extents = [(1 * CELL, 3 * CELL), (PAGE // 2 + 1 * CELL, 3 * CELL)]  # a: cells 1..3
     rows = a.alloc_write(["h0", "h1"])
     assert rows is not None and all(a.is_arena_id(int(r)) for r in rows)
     slots = (rows - S).tolist()
@@ -100,7 +100,7 @@ def test_a_second_claim_of_a_complete_page_writes_nothing(tmp_path, monkeypatch)
     calls = _record(monkeypatch)
     arena = ShmArena(str(tmp_path / "kv.bin"), PAGE, 8)
     a = _pool(arena, layers=L)
-    a._write_extents = [(0, PAGE // 2), (PAGE // 2, PAGE // 2)]   # this pool covers the whole page
+    a._own_extents = [(0, PAGE // 2), (PAGE // 2, PAGE // 2)]   # this pool covers the whole page
     rows = a.alloc_write(["h0"]); a.backup_from_device_all_layer(_device_pool(), rows, torch.tensor([1]), "kernel")
     assert a.complete_write(rows) == 1 and len(calls) == 1
     rows2 = a.alloc_write(["h0"])
@@ -132,6 +132,6 @@ def test_draft_role_maps_kv_rows_to_draft_slots(tmp_path, monkeypatch):
     assert all(s >= 0 for s in dslots) and [d.row_slot[int(r) - S] for r in rows] == dslots
     d.backup_from_device_all_layer(_device_pool(), rows, torch.tensor([7, 8]), "kernel")
     assert calls[-1]["indices_dst"].tolist() == dslots
-    d._write_extents = [(0, PAGE // 2), (PAGE // 2, PAGE // 2)]
+    d._own_extents = [(0, PAGE // 2), (PAGE // 2, PAGE // 2)]
     assert d.complete_write(rows) == 2
     assert [st for _, st in dr.find_slots(["h0.eagle.sfx"])] == [2]
