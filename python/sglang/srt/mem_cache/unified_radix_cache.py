@@ -2717,6 +2717,18 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 and self.cache_controller.write_policy == "write_back"
             ):
                 written = self.write_backup(node, write_back=True)
+                if written == 0 and self.ongoing_write_through:
+                    # #1426 (xsn184/185/186): upstream's write-back eviction is
+                    # SYNCHRONOUS -- the host has room because the acks that
+                    # free it are waited for. Here the 1 GB staging ring fills
+                    # with 13 in-flight pages and the peel gave up on the first
+                    # refusal, so the adder's evictable count was undeliverable
+                    # and the extend OOMed. Drain the in-flight writes (their
+                    # acks rebind the rows to arena slots and free the ring),
+                    # then try once more. A second zero is a real wall and is
+                    # reported by the caller's under-delivery check.
+                    self.writing_check(write_back=True)
+                    written = self.write_backup(node, write_back=True)
                 if written == 0:
                     return
                 self.writing_check(write_back=True)
@@ -2789,7 +2801,15 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         silently. Name the branch, rate-limited."""
         n = getattr(UnifiedRadixCache, "_1421_n", 0) + 1
         UnifiedRadixCache._1421_n = n
-        if n <= 24 or n % 256 == 0:
+        # #1426: sampled PER REASON. xsn186 sampled 1/256 over the whole
+        # stream, the parent_unbacked chain lines took every sample and the
+        # innermost reason -- the one that actually refused -- never printed.
+        per = getattr(UnifiedRadixCache, "_1421_per_why", None)
+        if per is None:
+            per = UnifiedRadixCache._1421_per_why = {}
+        key = why.split(":", 1)[0]
+        k = per[key] = per.get(key, 0) + 1
+        if k <= 24 or k % 256 == 0:
             try:
                 p = node.parent
                 logger.warning(
@@ -2938,6 +2958,13 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             # never reaches the drain and its admission must not stay charged.
             if ring is not None:
                 ring.abort(node.id)
+            # #1426: this was the one SILENT zero in write_backup (xsn186:
+            # sweeps refused 8/8 for two minutes with the ring empty and no
+            # reason in the log). The controller names why it returned None.
+            self._1421_refused(
+                "write_none:%s" % getattr(self.cache_controller, "_weg2_last_write_refusal", "?"),
+                node,
+            )
             return 0
 
         # #645: charge the admission against the published floor, so the next
@@ -6662,83 +6689,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         return self.component_protected_size_.get(BASE_COMPONENT_TYPE, 0)
 
     def full_evictable_size(self) -> int:
-        # #1425 (boot xsn184, park test 6 x 100k on P): the adder trusted
-        # 273,342 "evictable" tokens, the peel delivered 0 -- every leaf was
-        # un-backed under write_back and the staging ring had ~1,000 rows
-        # left, so write_backup refused and the extend OOMed. A leaf that
-        # cannot be backed up NOW is not deliverable; the adder must not
-        # count it. P then admits no new chunk until the store drains
-        # (parked on P), instead of dying.
-        return max(0, self.evictable_size() - self._weg2_undeliverable_evictable_tokens())
-
-    def _weg2_undeliverable_evictable_tokens(self) -> int:
-        """#1425b (xsn185): the leaf-only count was not enough. Under
-        write_back a LEAF may be backed while its PARENT is not (the
-        write_back peel skips the parent invariant), so after the backed
-        leaves are demoted the peel meets an un-backed interior node, the
-        ring is full, write_backup returns 0 and the chain stops there --
-        measured on PP1: asked 4096, received 588, tree reports 306,543.
-        So the count walks the tree bottom-up: a node's tokens are
-        deliverable only when every device child below it is deliverable
-        (it becomes a leaf only then) and the node itself is backed or the
-        staging ring can still absorb it. Everything else is subtracted."""
-        cc = getattr(self, "cache_controller", None)
-        if cc is None or getattr(cc, "write_policy", "") != "write_back":
-            return 0
-        try:
-            avail = int(cc.mem_pool_host.available_size())
-        except Exception:  # noqa: BLE001 - no pool reading, no subtraction
-            return 0
-        ct = BASE_COMPONENT_TYPE
-        root = self.root_node
-        # post-order over the tree: children before parents
-        order = []
-        stack = [root]
-        while stack:
-            n = stack.pop()
-            order.append(n)
-            stack.extend(n.children.values())
-        deliverable_subtree = {}  # id(node) -> bool (all device data below is peelable)
-        undeliverable = 0
-        ring_left = avail
-        for n in reversed(order):
-            kids_ok = all(
-                deliverable_subtree.get(id(c), True) for c in n.children.values()
-            )
-            if n is root:
-                continue
-            cd = n.component_data[ct]
-            if cd.value is None:
-                deliverable_subtree[id(n)] = kids_ok
-                continue
-            tokens = len(cd.value)
-            if cd.lock_ref > 0:
-                # protected: not evictable, not counted either way
-                deliverable_subtree[id(n)] = False
-                continue
-            if not kids_ok:
-                undeliverable += tokens
-                deliverable_subtree[id(n)] = False
-                continue
-            if n.backuped:
-                deliverable_subtree[id(n)] = True
-            elif tokens <= ring_left:
-                ring_left -= tokens
-                deliverable_subtree[id(n)] = True
-            else:
-                undeliverable += tokens
-                deliverable_subtree[id(n)] = False
-        if undeliverable:
-            k = getattr(UnifiedRadixCache, "_1425_n", 0) + 1
-            UnifiedRadixCache._1425_n = k
-            if k <= 8 or k % 256 == 0:
-                logger.warning(
-                    "#1425 EVICTABLE-BUT-UNDELIVERABLE: %d of %d evictable tokens sit in or "
-                    "under un-backed device nodes the staging ring (%d rows free) cannot absorb "
-                    "-- not counted for admission (n=%d)",
-                    undeliverable, self.evictable_size(), avail, k,
-                )
-        return undeliverable
+        return self.evictable_size()
 
     def full_protected_size(self) -> int:
         return self.protected_size()

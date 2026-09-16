@@ -1808,14 +1808,18 @@ class HiCacheController:
         # content-addressed key. Refuse: a prefix that is not staged is a miss
         # later, which is the cheap failure.
         if device_tier_disarmed("write"):
+            self._weg2_last_write_refusal = "tier_disarmed"
             return None
         # #923: and the row this copy would READ must be a row this rank's
         # device pool has. Asked before the host allocation, so a refusal
         # strands nothing.
         if self._refuse_unaddressable_kv_rows(device_indices, "write"):
+            self._weg2_last_write_refusal = "unaddressable_rows"
             return None
         host_indices = self.mem_pool_host.alloc(len(device_indices))
         if host_indices is None:
+            self._weg2_last_write_refusal = "host_alloc:%d>%s" % (
+                len(device_indices), getattr(self.mem_pool_host, "available_size", lambda: "?")())
             return None
         self.write_queue.append(
             CacheOperation(host_indices, device_indices, node_id, priority)
