@@ -130,3 +130,12 @@ def test_two_head_shards_join_one_blob(tmp_path):
     b.backup_from_device_all_layer(half, rb, torch.tensor([0]), "direct")
     assert b.complete_write(rb) == 1                     # both shards in: COMPLETE
     assert arena.find_slots(["k.mamba.sfx"])[0][1] == 2
+
+
+def test_an_unbound_pool_hands_out_staging_slots_not_placeholders(tmp_path):
+    p = object.__new__(ArenaMambaPoolHost)
+    p.size = S; p.page_size = 1; p.free_slots = torch.arange(S, dtype=torch.int64)
+    p._arena_init_fields()
+    ids = p.alloc_read(1)
+    assert ids is not None and int(ids[0]) < S and not p.is_placeholder(int(ids[0]))
+    assert p.arena_resolve_reads(types.SimpleNamespace(canonical_mamba_blob=None), ids, ["x.mamba"]) is None

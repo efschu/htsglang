@@ -1674,6 +1674,27 @@ class HiCacheController:
         )
         return window
 
+    def _weg2_hand_mamba_parts(self) -> None:
+        """#1427c (xsn189): the mamba arena host pool of the CURRENT group gets
+        the window parts. On D the pool is built at the flip rebind, after
+        `_canonical_mamba_window` ran against the previous group, so the
+        hand-over inside that function reached the old pool and D's pool
+        stayed unbound -- it then handed out placeholders nobody resolved."""
+        parts = getattr(self, "_weg2_mamba_window_parts", None)
+        group = getattr(self, "mem_pool_host", None)
+        get_pool = getattr(group, "get_pool", None)
+        names = getattr(group, "entry_map", None) or {}
+        if parts is None or get_pool is None or PoolName.MAMBA not in names:
+            return
+        try:
+            mp = get_pool(PoolName.MAMBA)
+            if hasattr(mp, "_weg2_parts"):
+                mp._weg2_parts = parts
+                if mp.arena is None and self.storage_backend is not None:
+                    mp.ensure_bound(self.storage_backend)
+        except Exception:  # noqa: BLE001 - the pool binds lazily at first use otherwise
+            logger.warning("#1427c mamba parts hand-over failed", exc_info=True)
+
     def rebind_canonical_windows(self, incoming_phase: str) -> bool:
         """#706 x #719 (0828 specimen): re-derive the canonical windows from
         the pools the cutover has just bound.
@@ -1730,6 +1751,7 @@ class HiCacheController:
                 phase=incoming_phase,
             )
         install(kv_window, mamba_window)
+        self._weg2_hand_mamba_parts()  # #1427c: the rebound group's pool needs the cut, and binds lazily
         # The v2 component reads/writes must land in the pools bound NOW, not
         # the pools bound at attach -- the same frozen-binding class one layer
         # down (`_batch_io_v2` resolves `registered_pools[name]`, registered
