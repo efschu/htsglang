@@ -3025,15 +3025,45 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             usable_units, target_units, ok, getattr(UnifiedRadixCache, "_weg2_end_anchor_short", 0),
         )
 
+    def _weg2_release_chain_piece_host(self, node) -> None:
+        """#1407: a publish-chain head piece is in the store now (ack); its
+        host copy was transit only. Free the host rows (HOST layer only --
+        the device copy stays matchable, l3_present keeps the sweep off it)
+        so the next piece of a prefix longer than the host pool fits."""
+        try:
+            if any(int(getattr(cd, "host_lock_ref", 0) or 0) > 0 for cd in node.component_data):
+                return
+            freed = 0
+            for comp in self._components_tuple:
+                _, hf = self._evict_component_and_detach_lru(
+                    node, comp, target=EvictLayer.HOST, tracker=None
+                )
+                freed += int(hf or 0)
+            self.evictable_host_leaves.discard(node)
+            node._weg2_chain_piece = False
+            n = getattr(self, "_weg2_chain_release_n", 0) + 1
+            self._weg2_chain_release_n = n
+            if n <= 8 or n % 64 == 0:
+                logger.info("WEG2 PUBLISH-CHAIN host released node=%s tokens=%d freed=%d (n=%d)",
+                            getattr(node, "id", "?"), len(node.key), freed, n)
+        except Exception as e:  # noqa: BLE001 - a release that fails leaves the copy
+            logger.warning("WEG2 PUBLISH-CHAIN host release failed on node %s: %s: %s",
+                           getattr(node, "id", "?"), type(e).__name__, e)
+
     def _weg2_publish_window(self) -> int:
         """Tokens one publish piece may span: a quarter of the host pool,
         page-aligned, at least one chunk; 0 = no splitting (no host pool)."""
         pool = getattr(self.cache_controller, "mem_pool_host", None)
         size = int(getattr(pool, "size", 0) or 0)
         if size <= 0:
-            return 0
+            # the bound-tier wrapper (HostPoolGroup) carries no size of its
+            # own -- boot xsn149: window 0, no split, refused=13 again
+            anchor = getattr(getattr(pool, "anchor_entry", None), "host_pool", None)
+            size = int(getattr(anchor, "size", 0) or 0)
         page = max(1, int(getattr(self, "page_size", 1) or 1))
         chunk = 4096
+        if size <= 0:
+            return 2 * chunk // page * page  # unknown pool: small pieces always fit better
         w = (size // 4) // chunk * chunk
         return max(chunk, w) // page * page
 
@@ -3050,6 +3080,10 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 pieces += 1
                 if head is None:
                     break
+                # transit, not L2: once this piece's store write is acked its
+                # host copy is released again (see _drain_backup), so a
+                # prefix longer than the host pool streams through it.
+                head._weg2_chain_piece = True
             if pieces:
                 n = getattr(self, "_weg2_split_publish_n", 0) + 1
                 self._weg2_split_publish_n = n
@@ -5265,6 +5299,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                     # would license a free that loses the KV.
                     node.l3_present = True
                     self.dec_host_lock_ref(node, lock_params)
+                    if getattr(node, "_weg2_chain_piece", False):
+                        self._weg2_release_chain_piece_host(node)
                 # #810: the storage write acked -- this is the drain the
                 # staging ring measures its residency against. Outside the
                 # `entry is not None` arm on purpose: the charge is keyed by
