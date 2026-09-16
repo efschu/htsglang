@@ -142,6 +142,14 @@ class Wiring(CustomTestCase):
         self.assertIn("weg2_seam_pending_refusal", M.__dataclass_fields__)
         self.assertIn("_weg2_seam_finisher", M.__dataclass_fields__)
 
+    def test_index_cache_released_after_a_reading_1454(self):
+        from sglang.srt.weg2 import _seam_fold, seam_digest
+        _seam_fold._IDX_CACHE[("cpu", 7)] = (__import__("torch").arange(7), __import__("torch").arange(7))
+        self.assertGreater(_seam_fold.release_index_cache(), 0)
+        self.assertEqual(_seam_fold._IDX_CACHE, {})
+        src = inspect.getsource(seam_digest)
+        self.assertEqual(src.count("_fold.release_index_cache()"), 2)
+
     def test_fold_block_default(self):
         from sglang.srt.weg2 import _seam_fold
         if not os.environ.get("SGLANG_WEG2_SEAM_CHUNK_BYTES"):

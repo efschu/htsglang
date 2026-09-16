@@ -176,6 +176,22 @@ def _s64(value: int) -> int:
 _IDX_CACHE: Dict[Tuple[str, int], Tuple[Any, Any]] = {}
 
 
+def release_index_cache() -> int:
+    """#1454: drop the cached index pairs -- called at the END of a reading.
+    Census of boot weg2xsn209 (D rank 0, allocator snapshot): the cache held
+    162 MiB of the 794 MiB untagged residue on the sleeping card (one pair
+    per distinct block length, 2 x 16 MiB each).  A reading rebuilds them in
+    a few launches; the card keeps nothing between readings.  Returns bytes."""
+    freed = 0
+    for i, ii in _IDX_CACHE.values():
+        try:
+            freed += int(i.numel() * i.element_size()) + int(ii.numel() * ii.element_size())
+        except Exception:  # noqa: BLE001
+            pass
+    _IDX_CACHE.clear()
+    return freed
+
+
 def _index_vectors(device, k: int):
     """``(i, i*i)`` for ``i = 1..k``, CACHED per (device, length).
 
