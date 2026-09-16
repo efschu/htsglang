@@ -8871,22 +8871,10 @@ class ServerArgs:
         # captured decode/verify are graph-mode wrappers (use_cuda_graph,
         # frozen buffers sized to the ring) re-planned out of graph per step;
         # the tail boundary is a tensor input (basis 2.9). No refusal here.
-        if self.speculative_algorithm is not None:
-            raise ValueError(
-                "W58 Weg2KvTailFormRefused: the precision tail cannot be "
-                "combined with --speculative-algorithm "
-                f"{self.speculative_algorithm} on this tree. Under EAGLE / "
-                "NEXTN / MTP the TARGET model never runs a plain decode -- it "
-                "runs verify as an EXTEND (ForwardMode.TARGET_VERIFY) -- so "
-                "the decode-only plan slice 1 trims is never reached, while "
-                "the shared write site would still claim ring rows: rows "
-                "held, nothing attended, no counter line, arms bit-identical. "
-                "That is precisely the boot weg2kvtail1 shape, one layer up, "
-                "and refusing at argv costs a launch instead of a boot. The "
-                "extend-side plan trim that lifts this is slice 2 (basis 2.5 "
-                "scopes slice 1 to decode); the draft's own tail is slice 5 "
-                "(basis 7.3)."
-            )
+        # #1426 slice 2: speculative decoding (EAGLE / NEXTN / MTP) is supported
+        # -- the target's verify EXTEND plans the tail over the ring
+        # (_kv_tail_plan_verify) and merges it after the paged body call
+        # (_kv_tail_merge_verify). No refusal here.
 
     def _handle_hicache_host_role(self):
         """#810: fail fast when the host tier is declared staging but sized
