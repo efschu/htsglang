@@ -825,7 +825,11 @@ def prefetch_share_of_rank(
     the local view collapses to one rank while the world has more, the
     world rank is the share index (single-node rig; on a multi-node world
     this merely spreads the warm-up thinner per node, never wrongly)."""
-    if local_size <= 1 and world_size > 1:
+    if world_size > 1 and (local_size <= 1 or int(local_size) == int(world_size)):
+        # Single node (or a collapsed local view): the world rank is the
+        # share index. fn1x 2026-09-16: local_size was 3 but local_rank 0 on
+        # every rank, so the earlier "local_size <= 1" test did not fire and
+        # all three still warmed the same third.
         return int(rank_in_group), int(world_size)
     return int(local_rank), int(local_size)
 
