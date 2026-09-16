@@ -85,3 +85,16 @@ def test_single_stage_is_the_old_path(monkeypatch):
     st = _stub(0, 1, 0, 6, ple_at=1)
     hidden, hc = _forward(st)
     assert torch.equal(hc, torch.full((2, 4), 121.0))
+
+
+def test_load_weights_skips_tensors_of_layers_this_stage_does_not_own():
+    from sglang.srt.models.qwen4_exp import weight_layer_is_owned
+
+    assert weight_layer_is_owned("model.layers.29.mlp.experts.0.gate_proj.weight_packed", 29, 40)
+    assert not weight_layer_is_owned("model.layers.28.mlp.experts.0.gate_proj.weight_packed", 29, 40)
+    assert not weight_layer_is_owned("model.layers.40.linear_attn.out_proj.weight", 29, 40)
+    assert weight_layer_is_owned("model.layers.1.ple.ple_embedding.ngram_embedding.shard_3.weight", 0, 29)
+    assert not weight_layer_is_owned("model.layers.1.ple.ple_embedding.ngram_embedding.shard_3.weight", 29, 40)
+    # tensors without a layer id are decided per module, never by the stage range
+    for n in ("model.embed_tokens.weight_packed", "lm_head.weight", "model.hyper_connection_mixer.input_mix_weight_up.weight"):
+        assert weight_layer_is_owned(n, 29, 40)

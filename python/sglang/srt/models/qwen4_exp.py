@@ -1,5 +1,6 @@
 """Inference-only Qwen4-Exp (text + VL) on the Qwen3.5 backbone."""
 
+import re
 import math
 import contextlib
 from contextlib import nullcontext
@@ -1928,6 +1929,23 @@ class Qwen4ExpVLModel(Qwen4ExpModel):
         return model_output  # a tensor, or the PPProxyTensors of a non-last stage
 
 
+_LAYER_ID_RE = re.compile(r"\.layers\.(\d+)\.")
+
+
+def weight_layer_is_owned(name: str, start_layer: int, end_layer: int) -> bool:
+    """WP5 (pipeline parallelism): does this stage own the decoder layer a
+    checkpoint tensor belongs to? Names without a ``layers.N.`` component
+    (embedding, lm_head, mixers) are owned by whoever has the module -- the
+    per-tensor lookups decide those. Skipping foreign layers here keeps the
+    expert loader's KeyError and the generic branch's per-tensor warning
+    (thousands under PP) off the load path."""
+    m = _LAYER_ID_RE.search(name)
+    if m is None:
+        return True
+    layer_id = int(m.group(1))
+    return start_layer <= layer_id < end_layer
+
+
 _HC_PACKED_SUFFIXES = (".weight_packed", ".weight_scale", ".weight_shape")
 
 
@@ -2223,6 +2241,12 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
         loaded_shard_params: Set[str] = set()
         skipped_visual_count = 0
         hc_packed_pending: dict = {}
+        # WP5: this stage's decoder layer range (whole model when PP is off).
+        pp_start_layer = int(getattr(self.model, "start_layer", 0))
+        pp_end_layer = int(
+            getattr(self.model, "end_layer", getattr(self.config, "num_hidden_layers", 1 << 30))
+        )
+        skipped_foreign_layer_count = 0
 
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
@@ -2234,6 +2258,9 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 continue
             if "language_model" in name:
                 name = name.replace("model.language_model.", "model.")
+            if not weight_layer_is_owned(name, pp_start_layer, pp_end_layer):
+                skipped_foreign_layer_count += 1
+                continue
             if ".self_attn." in name:
                 name = name.replace(".self_attn", "")
             if name.endswith(".k_proj.k_scale"):
@@ -2390,6 +2417,14 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 f"{sorted(hc_packed_pending)}"
             )
 
+        if skipped_foreign_layer_count > 0:
+            logger.info(
+                "[pp] Qwen4 load_weights: skipped %d tensors of layers outside "
+                "this stage [%d, %d)",
+                skipped_foreign_layer_count,
+                pp_start_layer,
+                pp_end_layer,
+            )
         if skipped_visual_count > 0:
             logger.info(
                 f"[language_model_only] Qwen4 load_weights: skipped "
