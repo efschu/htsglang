@@ -135,3 +135,15 @@ def test_draft_role_maps_kv_rows_to_draft_slots(tmp_path, monkeypatch):
     d._own_extents = [(0, PAGE // 2), (PAGE // 2, PAGE // 2)]
     assert d.complete_write(rows) == 2
     assert [st for _, st in dr.find_slots(["h0.eagle.sfx"])] == [2]
+
+
+def test_an_unbound_pool_skips_foreign_arena_ids_instead_of_indexing_past_staging(tmp_path, monkeypatch):
+    """#1427g (xsn192): the draft pool, unbound on P, received the KV arena ids."""
+    calls = []
+    monkeypatch.setattr(ap.MHATokenToKVPoolHost, "backup_from_device_all_layer",
+                        lambda self, dp, hi, di, io: calls.append((hi.tolist(), di.tolist())))
+    p = object.__new__(ArenaMHAHostPool)
+    p.size = S; p.page_size = 1
+    p._arena_init_fields()
+    p.backup_from_device_all_layer(None, torch.tensor([1, S + 7, S + 8]), torch.tensor([10, 11, 12]), "kernel")
+    assert calls == [([1], [10])]

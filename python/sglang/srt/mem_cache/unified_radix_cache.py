@@ -3119,8 +3119,22 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             pend[node.id] = mrows
         cc = self.cache_controller
         dpool = getattr(cc, "mem_pool_host_draft", None)
-        if (dpool is not None and getattr(dpool, "row_slot", None) is not None
+        if (dpool is not None and getattr(dpool, "arena_read", False)
                 and cc.draft_tier_armed("write")):
+            # #1427g (xsn192, PP2): the draft pool binds on its first READ
+            # (draft page get) -- P never reads draft pages, so the pool was
+            # unbound, the KV write carried arena ids, and the draft copy
+            # behind it indexed a 54k-row staging buffer with id 54k+slot.
+            # Bind it here, on the write side, and refuse if that fails.
+            try:
+                bound = dpool.ensure_bound(cc.storage_backend, role="draft")
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("#1427g draft bind raised: %r", exc)
+                bound = False
+            if not bound or getattr(dpool, "row_slot", None) is None:
+                pool.abort_write(pre)
+                self._1421_refused("draft_unbound", node)
+                return False
             try:
                 ok = dpool.alloc_write_draft(pre, hashes, cc._draft_component_name())
             except Exception as exc:  # noqa: BLE001

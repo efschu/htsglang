@@ -382,6 +382,21 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
         )
 
     def backup_from_device_all_layer(self, device_pool, host_indices, device_indices, io_backend):
+        if self.arena is None and host_indices.numel():
+            # #1427g: an unbound pool handed ids beyond its staging rows (a
+            # sibling pool's arena ids) has nothing to write there -- drop
+            # them, named, instead of indexing past the staging buffer.
+            hi = host_indices.cpu()
+            keep = hi < self.staging_rows
+            if not bool(keep.all()):
+                k = getattr(ArenaMHAHostPool, "_1427g_n", 0) + 1
+                ArenaMHAHostPool._1427g_n = k
+                if k <= 8 or k % 256 == 0:
+                    logger.warning("#1427g unbound arena pool: %d of %d backup ids are not staging rows -- skipped (n=%d)",
+                                   int((~keep).sum()), int(hi.numel()), k)
+                sel = keep.nonzero(as_tuple=True)[0]
+                host_indices = host_indices[sel.to(host_indices.device)]
+                device_indices = device_indices[sel.to(device_indices.device)]
         if self.arena is None or host_indices.numel() == 0:
             return super().backup_from_device_all_layer(device_pool, host_indices, device_indices, io_backend)
         hi = host_indices.cpu()
