@@ -177,3 +177,22 @@ def test_backup_ack_rebinds_staging_rows_to_arena_slots(tmp_path):
     cd2 = types.SimpleNamespace(host_value=torch.tensor([1]))
     node2 = types.SimpleNamespace(id=8, hash_value=["gone"], component_data={urc.BASE_COMPONENT_TYPE: cd2})
     assert t._weg2_rebind_host_to_arena(node2) is False and cd2.host_value.tolist() == [1]
+
+
+def test_host_pool_group_delegates_the_arena_api(tmp_path):
+    from sglang.srt.mem_cache.memory_pool_host import HostPoolGroup
+
+    p, arena = _pool(tmp_path)
+    g = object.__new__(HostPoolGroup)
+    g.anchor_entry = types.SimpleNamespace(host_pool=p)
+    assert g.arena_read is True and g.arena is arena and g.staging_rows == S
+    assert g.prefetch_capacity_tokens == 8 and g.id_space == p.id_space
+    ph = g.alloc_read(2)
+    assert all(g.is_placeholder(int(i)) for i in ph)
+    _write_page(arena, "g0", 4)
+    slot = arena.find_slots(["g0"])[0][0]
+    g.resolve_rows(ph, [slot])
+    assert g.is_arena_id(int(ph[0]))
+    plain = object.__new__(HostPoolGroup)
+    plain.anchor_entry = types.SimpleNamespace(host_pool=types.SimpleNamespace(size=3))
+    assert plain.arena_read is False and not hasattr(plain, "alloc_read")

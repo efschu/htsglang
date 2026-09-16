@@ -3627,7 +3627,11 @@ class HiCacheController:
         component = self._draft_component_name()
         draft_keys = [f"{h}.{component}" for h in hash_values]
         dpool = self.mem_pool_host_draft
-        if (getattr(dpool, "arena_read", False) and self.storage_backend is not None
+        _rows_ok = bool(getattr(dpool, "arena_read", False)) and all(
+            int(host_indices[i * self.page_size]) >= int(dpool.staging_rows)
+            for i in range(len(draft_keys))
+        )
+        if (_rows_ok and self.storage_backend is not None
                 and dpool.ensure_bound(self.storage_backend, role="draft")):
             # #1424: the draft rows share the KV rows' ids; behind an arena id
             # the draft page is addressed in the DRAFT arena (miss = zero row).

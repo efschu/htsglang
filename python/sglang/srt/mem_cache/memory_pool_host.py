@@ -2062,6 +2062,54 @@ class HostPoolGroup:
         for entry in self.entries:
             entry.host_pool.clear()
 
+    # -- #1424 Stufe 3: the arena host pool API, delegated to the anchor pool
+    # (the controller holds THIS group, never the MHA pool itself; boot
+    # xsn175 bound only the draft pool because the KV path asked the group).
+    @property
+    def arena_read(self) -> bool:
+        return bool(getattr(self.anchor_entry.host_pool, "arena_read", False))
+
+    @property
+    def arena(self):
+        return getattr(self.anchor_entry.host_pool, "arena", None)
+
+    @property
+    def staging_rows(self) -> int:
+        return int(getattr(self.anchor_entry.host_pool, "staging_rows", self.anchor_entry.host_pool.size))
+
+    @property
+    def arena_slots(self) -> int:
+        return int(getattr(self.anchor_entry.host_pool, "arena_slots", 0))
+
+    @property
+    def prefetch_capacity_tokens(self):
+        return getattr(self.anchor_entry.host_pool, "prefetch_capacity_tokens", None)
+
+    @property
+    def id_space(self) -> int:
+        return int(getattr(self.anchor_entry.host_pool, "id_space", self.anchor_entry.host_pool.size))
+
+    def ensure_bound(self, storage_backend, role: str = "kv") -> bool:
+        fn = getattr(self.anchor_entry.host_pool, "ensure_bound", None)
+        return bool(fn(storage_backend, role=role)) if callable(fn) else False
+
+    def resolve_rows(self, host_indices, slots) -> None:
+        return self.anchor_entry.host_pool.resolve_rows(host_indices, slots)
+
+    def is_arena_id(self, i) -> bool:
+        return bool(self.anchor_entry.host_pool.is_arena_id(i))
+
+    def is_placeholder(self, i) -> bool:
+        return bool(self.anchor_entry.host_pool.is_placeholder(i))
+
+    def __getattr__(self, name):
+        # only reached for attributes the group does not define itself
+        if name == "alloc_read":
+            fn = getattr(self.anchor_entry.host_pool, "alloc_read", None)
+            if callable(fn):
+                return fn
+        raise AttributeError(name)
+
     def available_size(self):
         return self.anchor_entry.host_pool.available_size()
 
