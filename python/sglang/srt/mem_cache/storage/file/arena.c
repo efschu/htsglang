@@ -410,6 +410,46 @@ int64_t arena_evict_candidates(uint8_t *base, int64_t want, int64_t *slots, uint
 
 uint8_t *arena_slot_ptr(uint8_t *base, int64_t slot) { return slot_data(base, (uint64_t)slot); }
 
+/* #1424 Stufe 3: the slot of each key (-1 absent) and its state, so a reader
+ * can address the page IN PLACE instead of copying it out. */
+int64_t arena_find_slots(uint8_t *base, int64_t n, const uint64_t *klo, const uint64_t *khi,
+                         int64_t *slots, int8_t *states) {
+    int64_t found = 0;
+    for (int64_t i = 0; i < n; i++) {
+        int64_t s = find_slot(base, klo[i], khi[i]);
+        slots[i] = s;
+        states[i] = s < 0 ? 0 : (int8_t)atomic_load(&slot_hdr(base, (uint64_t)s)->state);
+        if (s >= 0) found++;
+    }
+    return found;
+}
+/* #1424 Stufe 3: reader references. +1 pins a COMPLETE slot against eviction
+ * (arena_evict_candidates skips refcount != 0), -1 releases. Returns how many
+ * slots took the delta; a +1 on a slot that is not COMPLETE is refused (0). */
+int64_t arena_ref_slots(uint8_t *base, int64_t n, const int64_t *slots, int32_t delta) {
+    int64_t done = 0;
+    for (int64_t i = 0; i < n; i++) {
+        if (slots[i] < 0) continue;
+        SlotHeader *sh = slot_hdr(base, (uint64_t)slots[i]);
+        if (delta > 0) {
+            atomic_fetch_add(&sh->refcount, 1);
+            if (atomic_load(&sh->state) != S_COMPLETE) { atomic_fetch_sub(&sh->refcount, 1); continue; }
+            atomic_store(&sh->clock_bit, 1);
+        } else if (delta < 0) {
+            if (atomic_load(&sh->refcount) > 0) atomic_fetch_sub(&sh->refcount, 1); else continue;
+        }
+        done++;
+    }
+    return done;
+}
+/* #1424 Stufe 3: byte offset of slot 0's data from the mapping base, so a
+ * torch view can address every slot as base + data_off + slot * slot_bytes. */
+int64_t arena_data_offset(uint8_t *base) {
+    ArenaHeader *h = hdr(base);
+    int64_t o[6];
+    arena_layout((int64_t)h->slots, (int64_t)h->slot_bytes, o);
+    return o[4];
+}
 void arena_free_slots(uint8_t *base, int64_t n, const int64_t *slots) {
     for (int64_t i = 0; i < n; i++) {
         SlotHeader *sh = slot_hdr(base, (uint64_t)slots[i]);

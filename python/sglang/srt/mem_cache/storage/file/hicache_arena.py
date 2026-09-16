@@ -91,6 +91,12 @@ def _load_lib() -> Optional[ctypes.CDLL]:
             lib.arena_reap_stale.argtypes = [p_u8]
             lib.arena_stats.restype = None
             lib.arena_stats.argtypes = [p_u8, p_i64]
+            lib.arena_find_slots.restype = i64
+            lib.arena_find_slots.argtypes = [p_u8, i64, p_u64, p_u64, p_i64, p_i8]
+            lib.arena_ref_slots.restype = i64
+            lib.arena_ref_slots.argtypes = [p_u8, i64, p_i64, ctypes.c_int32]
+            lib.arena_data_offset.restype = i64
+            lib.arena_data_offset.argtypes = [p_u8]
             _lib = lib
             return lib
         except Exception as e:  # noqa: BLE001 - the arena is optional
@@ -215,6 +221,31 @@ class ShmArena:
         c_keep = (ctypes.c_uint64 * max(1, len(keep)))(*keep)
         got = self._lib.arena_evict_candidates(self._base, want, slots, lo, hi, tot, c_keep, len(keep))
         return [(int(slots[i]), int(lo[i]), int(hi[i]), int(tot[i])) for i in range(got)]
+
+    # -- Stufe 3 (#1424): address pages in place --------------------------
+    def find_slots(self, stems: Sequence[str]) -> list[tuple[int, int]]:
+        """(slot, state) per stem; slot -1 when absent. state 2 = COMPLETE."""
+        n = len(stems)
+        if n == 0:
+            return []
+        lo, hi = self._keys(stems)
+        slots = (ctypes.c_int64 * n)()
+        st = (ctypes.c_int8 * n)()
+        self._lib.arena_find_slots(self._base, n, lo, hi, slots, st)
+        return [(int(slots[i]), int(st[i])) for i in range(n)]
+
+    def ref_slots(self, slots: Sequence[int], delta: int) -> int:
+        """Reader references: +1 pins COMPLETE slots against eviction, -1 releases.
+        Returns how many slots took the delta."""
+        n = len(slots)
+        if n == 0:
+            return 0
+        c = (ctypes.c_int64 * n)(*[int(s) for s in slots])
+        return int(self._lib.arena_ref_slots(self._base, n, c, int(delta)))
+
+    def data_offset(self) -> int:
+        """Byte offset of slot 0's data inside the mapping."""
+        return int(self._lib.arena_data_offset(self._base))
 
     def slot_stem(self, slot: int) -> str:
         """The store stem recorded in the slot header (any rank may evict it)."""
