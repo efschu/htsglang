@@ -646,6 +646,13 @@ class KvTailRing:
         #: #1427: rows for this step handed out at PLAN time (precommit); the
         #: in-graph claim is then a pure gather.
         self._precommitted = False
+        #: #1429: the READ fact as a DEVICE counter. ``note_merge`` bumps it
+        #: with a captured kernel, so a CUDA-graph REPLAY -- which runs no
+        #: Python -- still moves it; ``plan`` reads it out of graph. Boot kvt7d
+        #: (16.09.): merge captured and replayed, Python counter frozen at 288,
+        #: W56 fired on a tail that WAS read.
+        self._merge_dev = torch.zeros((), dtype=torch.int64, device=self.device)
+        self._merge_dev_seen = 0
         #: attended_rows of the PREVIOUS plan, for the fact-4 gate below.
         self._last_plan_attended = 0
 
@@ -930,6 +937,7 @@ class KvTailRing:
         This is the only fact in the instrument that a PLAN cannot fake."""
         self.counters.tail_merges += 1
         self.counters.tail_merges_this_step += 1
+        self._merge_dev += 1  # captured into the graph; replay moves it, Python does not run
 
     def local_layer_id(self, layer_id: int) -> int:
         """GLOBAL layer id -> the frame the ring's pool is addressed in.
@@ -1036,6 +1044,8 @@ class KvTailRing:
         # completed conversion.
         self.counters.wiped_rows += self.rows_held
         self.counters.resets += 1
+        self._merge_dev.zero_()
+        self._merge_dev_seen = 0
         self.rows_held = 0
         self._armed = False
         self._claim_cache = None
@@ -1057,6 +1067,15 @@ class KvTailRing:
         # FACT 4, the kvtail1 gate: the PREVIOUS step planned a tail and no
         # kernel ever read it. Checked HERE because a plan runs once per step
         # and the merges of the step before it are complete by now.
+        # #1429: fold the device-side merge count in BEFORE judging. Eager
+        # steps counted in Python already (delta == this_step); a graph replay
+        # counted only on the device (this_step == 0, delta == layers merged).
+        dev_total = int(self._merge_dev.item())
+        dev_delta = dev_total - self._merge_dev_seen
+        self._merge_dev_seen = dev_total
+        if dev_delta > self.counters.tail_merges_this_step:
+            self.counters.tail_merges += dev_delta - self.counters.tail_merges_this_step
+            self.counters.tail_merges_this_step = dev_delta
         if self._last_plan_attended > 0 and self.counters.tail_merges_this_step == 0:
             raise Weg2KvTailNoOp(
                 "W56 Weg2KvTailNoOp: the previous decode step planned "

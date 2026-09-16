@@ -2800,6 +2800,34 @@ class TestFactFourTheProbeMustBite(CustomTestCase):
         self._plan(ring, loc)                 # no refusal
         self.assertGreater(ring.counters.tail_merges, 0)
 
+    def test_1429_a_replayed_graph_counts_its_merges_on_the_device(self):
+        """#1429: a CUDA-graph REPLAY runs no Python, so note_merge() is never
+        called -- only the captured `_merge_dev += 1` kernels run. The gate
+        must read the device counter, not the Python one (boot kvt7d)."""
+        ring, loc = self._armed_with_rows()
+        self._plan(ring, loc)                 # step 1 plans 4 tail rows
+        ring.begin_decode_step()
+        ring._merge_dev += 4                  # what the replayed kernels do; no note_merge()
+        self.assertEqual(ring.counters.tail_merges_this_step, 0)
+        self._plan(ring, loc)                 # must NOT refuse
+        self.assertEqual(ring.counters.tail_merges, 4)
+
+    def test_1429_eager_merges_are_not_double_counted(self):
+        ring, loc = self._armed_with_rows()
+        self._plan(ring, loc)
+        ring.begin_decode_step()
+        for _ in range(4):
+            ring.note_merge()                 # Python AND device move together
+        self._plan(ring, loc)
+        self.assertEqual(ring.counters.tail_merges, 4)
+
+    def test_1429_reset_zeroes_the_device_counter(self):
+        ring, loc = self._armed_with_rows()
+        ring.note_merge()
+        ring.reset()
+        self.assertEqual(int(ring._merge_dev.item()), 0)
+        self.assertEqual(ring._merge_dev_seen, 0)
+
     def test_a_step_that_planned_no_tail_needs_no_merge(self):
         """The gate must not fire on a step with an empty tail plan."""
         ring = _ring(rows=16)
