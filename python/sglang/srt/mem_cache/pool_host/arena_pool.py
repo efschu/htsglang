@@ -203,8 +203,15 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
         if not getattr(self, "can_use_jit", False):
             raise RuntimeError("#1424 the arena host pool needs the JIT hicache transfer kernel")
         from sglang.jit_kernel.hicache import transfer_hicache_one_layer
+        dst_k = device_pool.k_buffer[layer_id]
+        # xsn177: the kernel type-checks its index tensors -- "Tensor match
+        # failed for Tensor<4313>[dtype=int64, device=cpu]" -- both live on
+        # the card, like the ordinary path's indices.
+        dev = dst_k.device
+        src_idx = src_idx.to(device=dev, dtype=torch.int64, non_blocking=False)
+        dst_idx = dst_idx.to(device=dev, dtype=torch.int64, non_blocking=False)
         transfer_hicache_one_layer(
-            k_cache_dst=device_pool.k_buffer[layer_id],
+            k_cache_dst=dst_k,
             v_cache_dst=device_pool.v_buffer[layer_id],
             k_cache_src=k_src,
             v_cache_src=v_src,
