@@ -1019,6 +1019,16 @@ def _qwen4_exp_overrides(server_args: Any, hf_config: Any) -> dict:
     """
     overrides: Dict[str, Any] = {}
 
+    # Upstream refusals (test_qwen4_rejects_pd_and_unified_memory): neither PD
+    # disaggregation nor unified memory carries the QSA layer metadata yet.
+    if getattr(server_args, "disaggregation_mode", "null") not in (None, "null"):
+        raise ValueError(
+            "Qwen4-Exp does not support PD disaggregation yet (QSA layer "
+            "metadata is not exchanged across the KV transfer)."
+        )
+    if getattr(server_args, "enable_unified_memory", False):
+        raise ValueError("Qwen4-Exp does not support --enable-unified-memory yet")
+
     if getattr(server_args, "ple_offload_embedding", None) is None:
         import torch
 
