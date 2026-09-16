@@ -2890,3 +2890,27 @@ class Test1427CaptureSafeClaim(unittest.TestCase):
         ring.precommit_skip()
         ring.disarm()
         self.assertFalse(ring._precommitted)
+
+
+class Test1428VerifyMergeIsWiredOnTheDcpExtendPath(unittest.TestCase):
+    """#1428: the read half of the verify tail must follow EVERY paged body read
+    of the DCP extend path (boot kvt6d: planned 3 rows, merged 0 -> W56)."""
+
+    def test_every_dcp_paged_read_is_followed_by_the_tail_merge(self):
+        import inspect
+        from sglang.srt.layers.attention import flashinfer_backend as fb
+
+        src = inspect.getsource(fb.FlashInferAttnBackend._forward_extend_dcp)
+        reads = src.split("prefill_wrapper_paged.forward_return_lse(")[1:]
+        self.assertEqual(len(reads), 2, "the DCP extend path has two paged body reads")
+        for chunk in reads:
+            head = chunk.split("cp_lse_ag_out_ar_mha_uneven(")[0]
+            self.assertIn("_kv_tail_merge_verify(", head,
+                          "tail merge must run before the cross-rank LSE all-gather")
+
+    def test_merge_verify_takes_a_3d_q_unchanged(self):
+        import inspect
+        from sglang.srt.layers.attention import flashinfer_backend as fb
+
+        src = inspect.getsource(fb.FlashInferAttnBackend._kv_tail_merge_verify)
+        self.assertIn("q.dim() == 3", src)

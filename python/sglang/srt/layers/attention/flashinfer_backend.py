@@ -5935,10 +5935,12 @@ class FlashInferAttnBackend(AttentionBackend):
             return o2, s2
         w, _rows = plan
         kvbuf = ring.pool.get_kv_buffer(ring.local_layer_id(layer.layer_id))
-        o3, s3 = w.forward_return_lse(
-            q.view(-1, layer.tp_q_head_num, layer.head_dim), kvbuf,
-            causal=False, sm_scale=layer.scaling,
-        )
+        # Non-DCP callers pass the 2-D q of forward_extend; the DCP extend
+        # path passes q_full already shaped [tokens, heads, head_dim] exactly
+        # as it hands it to the body wrapper -- the tail wrapper was planned
+        # with the same head counts (iu.num_qo_heads), so it takes the same q.
+        q3 = q if q.dim() == 3 else q.view(-1, layer.tp_q_head_num, layer.head_dim)
+        o3, s3 = w.forward_return_lse(q3, kvbuf, causal=False, sm_scale=layer.scaling)
         ring.note_merge()
         o, s = _safe_merge_state(o2, s2, o3, s3)
         return o, s
@@ -6412,6 +6414,16 @@ class FlashInferAttnBackend(AttentionBackend):
                     k_scale=layer.k_scale_float,
                     v_scale=layer.v_scale_float,
                 )
+                # #1428 PRECISION TAIL, verify read half on the DCP extend path:
+                # this rank's owned body (fp8, trimmed plan) + this rank's ring
+                # rows (bf16) are merged HERE, before the cross-rank LSE
+                # all-gather -- the tail is a partition of the owned set. Boot
+                # kvt6d (16.09.): planned 3 tail rows, merge ran 0 times (W56),
+                # because the hook sat only on the non-DCP forward_extend.
+                if getattr(self, "_kv_tail_verify_plan", None) is not None:
+                    o_pre_raw, lse_pre_raw = self._kv_tail_merge_verify(
+                        q_full, layer, o_pre_raw, lse_pre_raw
+                    )
             o_pre, lse_pre = cp_lse_ag_out_ar_mha_uneven(
                 o_pre_raw,
                 lse_pre_raw,
@@ -6515,6 +6527,16 @@ class FlashInferAttnBackend(AttentionBackend):
                 k_scale=layer.k_scale_float,
                 v_scale=layer.v_scale_float,
             )
+            # #1428 PRECISION TAIL, verify read half on the DCP extend path:
+            # this rank's owned body (fp8, trimmed plan) + this rank's ring
+            # rows (bf16) are merged HERE, before the cross-rank LSE
+            # all-gather -- the tail is a partition of the owned set. Boot
+            # kvt6d (16.09.): planned 3 tail rows, merge ran 0 times (W56),
+            # because the hook sat only on the non-DCP forward_extend.
+            if getattr(self, "_kv_tail_verify_plan", None) is not None:
+                o_pre_raw, lse_pre_raw = self._kv_tail_merge_verify(
+                    q_full, layer, o_pre_raw, lse_pre_raw
+                )
         # comm lane: C (LSE all-gather) + merge math + D (out all-reduce) --
         # unchanged function, unchanged reduction order, just issued on the
         # comm stream so the main lane can scatter-write concurrently.
