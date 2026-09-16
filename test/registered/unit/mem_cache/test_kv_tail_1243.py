@@ -1164,11 +1164,11 @@ class TestTheLauncherOnPathRefusals(_OnPathBase):
             sa._handle_kv_tail()
         self.assertIn("--page-size 1", str(cm.exception))
 
-    def test_captured_graphs_are_refused_at_parse_time(self):
+    def test_captured_graphs_are_accepted_at_parse_time_since_slice_2(self):
+        """#1426 slice 2: a captured decode/verify gets a graph-mode tail
+        wrapper; --disable-cuda-graph is no longer demanded at parse time."""
         sa = self._sa(kv_tail_min_tokens=16384, disable_cuda_graph=False)
-        with self.assertRaises(ValueError) as cm:
-            sa._handle_kv_tail()
-        self.assertIn("--disable-cuda-graph", str(cm.exception))
+        sa._handle_kv_tail()  # no ValueError: captured graphs are a supported form now
 
     def test_a_later_slice_flag_is_refused_rather_than_a_parsing_no_op(self):
         for flag in ("kv_tail_virtual_fp8", "kv_tail_sidecar", "kv_tail_draft"):
