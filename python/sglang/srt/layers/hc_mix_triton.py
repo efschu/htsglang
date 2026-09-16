@@ -149,13 +149,17 @@ def _get_counters(device: torch.device) -> torch.Tensor:
 
 
 def _deterministic_inference() -> bool:
-    from sglang.srt.runtime_context import get_exec
+    """This line keeps the flag flat on ServerArgs
+    (--enable-deterministic-inference); upstream's exec view groups it under
+    ``deterministic`` (fn1s boot 2026-09-16: AttributeError on the first
+    forward). False when no server args are published (desk)."""
+    from sglang.srt.runtime_context import get_server_args
 
     try:
-        exec_cfg = get_exec()
-    except ValueError:
+        args = get_server_args()
+    except Exception:
         return False
-    return bool(exec_cfg.deterministic.enable_deterministic_inference)
+    return bool(getattr(args, "enable_deterministic_inference", False))
 
 
 def fused_hc_mix_supported(
