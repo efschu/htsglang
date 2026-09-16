@@ -2012,8 +2012,22 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
         )
 
     @torch.no_grad()
-    def forward(self, *args, **kwargs):
-        output = super().forward(*args, **kwargs)
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        get_embedding: bool = False,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
+    ):
+        # fn5c 2026-09-16: ModelRunner decides PP support by
+        # `"pp_proxy_tensors" in inspect.signature(model.forward).parameters`;
+        # the former `*args, **kwargs` wrapper hid the base signature and PP=3
+        # died at init ("Pipeline Parallel is not compatible with this model").
+        output = super().forward(
+            input_ids, positions, forward_batch,
+            get_embedding=get_embedding, pp_proxy_tensors=pp_proxy_tensors,
+        )
         hc_hidden_states = self.model.last_hc_hidden_states
         if hc_hidden_states is not None and isinstance(output, LogitsProcessorOutput):
             output.hidden_states = hc_hidden_states

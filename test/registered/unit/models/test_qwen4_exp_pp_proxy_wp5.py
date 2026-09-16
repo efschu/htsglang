@@ -7,6 +7,7 @@ on the stage that owns a PLE layer. Pinned with stubs (no kernels)."""
 
 from types import SimpleNamespace
 
+import unittest
 import pytest
 import torch
 
@@ -98,3 +99,13 @@ def test_load_weights_skips_tensors_of_layers_this_stage_does_not_own():
     # tensors without a layer id are decided per module, never by the stage range
     for n in ("model.embed_tokens.weight_packed", "lm_head.weight", "model.hyper_connection_mixer.input_mix_weight_up.weight"):
         assert weight_layer_is_owned(n, 29, 40)
+
+
+class OuterForwardSignature(unittest.TestCase):
+    def test_conditional_generation_forward_names_pp_proxy_tensors(self):
+        """fn5c: the runner's PP check reads the OUTER class's signature."""
+        import inspect
+        from sglang.srt.models.qwen4_exp import Qwen4ExpForConditionalGeneration
+        params = inspect.signature(Qwen4ExpForConditionalGeneration.forward).parameters
+        self.assertIn("pp_proxy_tensors", params)
+        self.assertNotIn("kwargs", params)
