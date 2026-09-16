@@ -6662,7 +6662,44 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         return self.component_protected_size_.get(BASE_COMPONENT_TYPE, 0)
 
     def full_evictable_size(self) -> int:
-        return self.evictable_size()
+        # #1425 (boot xsn184, park test 6 x 100k on P): the adder trusted
+        # 273,342 "evictable" tokens, the peel delivered 0 -- every leaf was
+        # un-backed under write_back and the staging ring had ~1,000 rows
+        # left, so write_backup refused and the extend OOMed. A leaf that
+        # cannot be backed up NOW is not deliverable; the adder must not
+        # count it. P then admits no new chunk until the store drains
+        # (parked on P), instead of dying.
+        return max(0, self.evictable_size() - self._weg2_undeliverable_evictable_tokens())
+
+    def _weg2_undeliverable_evictable_tokens(self) -> int:
+        cc = getattr(self, "cache_controller", None)
+        if cc is None or getattr(cc, "write_policy", "") != "write_back":
+            return 0
+        try:
+            avail = int(cc.mem_pool_host.available_size())
+        except Exception:  # noqa: BLE001 - no pool reading, no subtraction
+            return 0
+        sizes = sorted(
+            len(node.key)
+            for node in list(getattr(self, "evictable_device_leaves", ()) or ())
+            if not getattr(node, "backuped", False)
+        )
+        undeliverable = 0
+        for n in sizes:
+            if n <= avail:
+                avail -= n
+            else:
+                undeliverable += n
+        if undeliverable:
+            k = getattr(UnifiedRadixCache, "_1425_n", 0) + 1
+            UnifiedRadixCache._1425_n = k
+            if k <= 8 or k % 256 == 0:
+                logger.warning(
+                    "#1425 EVICTABLE-BUT-UNDELIVERABLE: %d tokens in %d un-backed device leaves "
+                    "exceed the staging ring (%d rows free) -- not counted for admission (n=%d)",
+                    undeliverable, len(sizes), int(cc.mem_pool_host.available_size()), k,
+                )
+        return undeliverable
 
     def full_protected_size(self) -> int:
         return self.protected_size()
