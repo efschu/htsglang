@@ -2794,7 +2794,25 @@ class HiCacheController:
         found = pool.arena.find_slots(stems)
         _t1 = time.perf_counter()
         slots = []
+        # #1439b: the leading run of COMPLETE slots is referenced in ONE C
+        # call (xsn200: one ref per page in a Python loop was 7 %); only the
+        # first non-complete page, if any, takes the per-page path (L3 fill).
+        lead = 0
+        for slot, state in found:
+            if slot < 0 or state != 2:
+                break
+            lead += 1
+        if lead:
+            lead_slots = [int(slot) for slot, _ in found[:lead]]
+            got = pool.arena.ref_slots(lead_slots, +1)
+            if got == lead:
+                slots.extend(lead_slots)
+            else:
+                pool.arena.ref_slots(lead_slots, -1)  # undo the partial refs, take the slow path
+                lead = 0
         for i, (slot, state) in enumerate(found):
+            if i < lead:
+                continue
             if slot < 0 or state != 2:
                 # #1433: not in the L2 -- ask the L3. A page on disk is read
                 # straight into a fresh slot and completed; only then is the

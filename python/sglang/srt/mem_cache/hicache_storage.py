@@ -2833,9 +2833,38 @@ class HiCacheFile(HiCacheStorage):
                 )
             else:
                 kv_pages = kv_fast
+            # #1439b (xsn200 D profile): the trailing rule walked prefix_len
+            # downwards asking has_component() per page -- for the mamba
+            # blob that is up to one chunk (4096) of single lookups per pool,
+            # 18 % of D's re-admission. One C call per pool over all kv_pages
+            # stems answers every page at once; the disk is asked only for a
+            # page the arena does not hold.
+            _bulk: dict = {}
             _memo: dict = {}
 
+            def _bulk_states(name: str):
+                if name in _bulk:
+                    return _bulk[name]
+                states = None
+                try:
+                    if kv_pages and self._arena_dir():
+                        k0 = keys[0] if name in (None, "__default__", PoolName.KV) else f"{keys[0]}.{name}"
+                        win = self._canonical_window(k0)
+                        arena = self._arena_for(int(win.total_bytes)) if win is not None else None
+                        if arena is not None:
+                            sfx = self._suffix_for_key(k0)[0]
+                            tail = "" if name in (None, "__default__", PoolName.KV) else f".{name}"
+                            stems = [f"{k}{tail}{sfx}" for k in keys[:kv_pages]]
+                            states = arena.find_states(stems)
+                except Exception:  # noqa: BLE001 - fall back to the per-page path
+                    states = None
+                _bulk[name] = states
+                return states
+
             def has_component(page_idx: int, name: str) -> bool:
+                states = _bulk_states(name)
+                if states is not None and page_idx < len(states) and states[page_idx] == 2:
+                    return True
                 k = self._get_component_key(keys[page_idx], name)
                 v = _memo.get(k)
                 if v is None:
