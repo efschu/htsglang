@@ -1,10 +1,10 @@
 // Radix-select fast top-k with the AOT fast_topk_v2 semantics: for each row b,
 // select the kTopK largest scores in [row_starts[b], row_starts[b] + lengths[b])
 // and write their indices relative to row_starts[b]; order within a row is unspecified.
-#include <sgl_kernel/tensor.h>
-#include <sgl_kernel/utils.h>
+#include <sgl_kernel_next/tensor.h>
+#include <sgl_kernel_next/utils.h>
 
-#include <sgl_kernel/utils.cuh>
+#include <sgl_kernel_next/utils.cuh>
 
 #include <tvm/ffi/container/tensor.h>
 

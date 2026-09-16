@@ -1,14 +1,5 @@
 /// \file utils.h
 /// \brief Host-side C++ utilities used by JIT kernel wrappers.
-///
-/// Provides:
-/// - `DebugInfo` - wraps `std::source_location` for error reporting.
-/// - `RuntimeCheck` - runtime assertion with formatted error messages.
-/// - `Panic` - unconditional abort with formatted error messages.
-/// - `pointer::offset` - safe void-pointer arithmetic (host side).
-/// - `div_ceil` - integer ceiling division.
-/// - `dtype_bytes` - byte width of a `DLDataType`.
-/// - `irange` - Python-style integer range for range-for loops.
 
 #pragma once
 
@@ -54,6 +45,8 @@
 #include <sstream>
 #include <utility>
 
+namespace sglang {
+
 namespace host {
 
 template <typename>
@@ -83,7 +76,7 @@ template <typename... Args>
 [[noreturn]]
 inline auto panic(DebugInfo location, Args&&... args) -> void {
   std::ostringstream os;
-  os << "Runtime check failed at " << location.file_name() << ":" << location.line();
+  os << "Failed at " << location.file_name() << ":" << location.line();
   if constexpr (sizeof...(args) > 0) {
     os << ": ";
     (os << ... << std::forward<Args>(args));
@@ -107,22 +100,22 @@ struct RuntimeCheck {
   template <typename Cond>
   explicit RuntimeCheck(Cond&& condition, Args&&... args, DebugInfo location = {}) {
     if (condition) return;
-    [[unlikely]] ::host::panic(location, std::forward<Args>(args)...);
+    [[unlikely]] host::panic(location, std::forward<Args>(args)...);
   }
   template <typename Cond>
   explicit RuntimeCheck(DebugInfo location, Cond&& condition, Args&&... args) {
     if (condition) return;
-    [[unlikely]] ::host::panic(location, std::forward<Args>(args)...);
+    [[unlikely]] host::panic(location, std::forward<Args>(args)...);
   }
 };
 
 template <typename... Args>
 struct Panic {
   explicit Panic(Args&&... args, DebugInfo location = {}) {
-    ::host::panic(location, std::forward<Args>(args)...);
+    host::panic(location, std::forward<Args>(args)...);
   }
   explicit Panic(DebugInfo location, Args&&... args) {
-    ::host::panic(location, std::forward<Args>(args)...);
+    host::panic(location, std::forward<Args>(args)...);
   }
   [[noreturn]] ~Panic() {
     std::terminate();
@@ -183,8 +176,7 @@ inline auto irange(T start, T end) {
   return stdv::iota(start, end);
 }
 
-/** \brief Error class for stream-style error logging (upstream sgl_kernel;
- * ported 2026-09-16 for the #37500 bundle's kernels, which use CHECK_HOST). */
+/** \brief Error class for stream-style error logging. */
 struct Error {
   Error(DebugInfo location = {}) {
     m_oss << "Failed at " << location.file_name() << ":" << location.line() << ": ";
@@ -219,3 +211,5 @@ struct Error {
     host::Error()
 
 }  // namespace host
+
+}  // namespace sglang

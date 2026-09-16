@@ -121,6 +121,18 @@ def _make_wrapper(tup: Tuple[str, str]) -> str:
     return f"TVM_FFI_DLL_EXPORT_TYPED_FUNC({export_name}, ({kernel_name}));"
 
 
+def _wrap_in_namespace(lines: List[str], namespace: str | None) -> List[str]:
+    """Upstream (kernels/jit spec.py) emits every export inside
+    ``namespace sglang { ... }`` so a wrapper may name the kernel struct and
+    its template arguments (``bf16_t``) unqualified. This line keeps the
+    bare form by default -- every existing build hash stays -- and wraps
+    only when a caller asks (the ``sglang.kernels.jit`` alias does, for the
+    #37500 bundle's kernels)."""
+    if not namespace or not lines:
+        return lines
+    return [f"namespace {namespace} {{"] + lines + [f"}}  // namespace {namespace}"]
+
+
 _QUOTED_INCLUDE_RE = re.compile(r'^\s*#\s*include\s*"([^"]+)"', re.MULTILINE)
 _ANGLE_INCLUDE_RE = re.compile(r"^\s*#\s*include\s*<(sgl_kernel/[^>]+)>", re.MULTILINE)
 
@@ -498,6 +510,7 @@ def load_jit(
     extra_dependencies: List[str] | None = None,
     build_directory: str | None = None,
     header_only: bool = True,
+    wrap_namespace: str | None = None,
 ) -> Module:
     """
     Loading a JIT module from C++/CUDA source files.
@@ -592,7 +605,8 @@ def load_jit(
         vendor=vendor,
         backend=_backend,
         header_only=header_only,
-        cpp_wrappers=cpp_wrappers or [],
+        cpp_wrappers=(cpp_wrappers or [])
+        + ([("__wrap_namespace__", wrap_namespace)] if wrap_namespace else []),
         cuda_wrappers=cuda_wrappers or [],
         extra_cflags=all_cflags,
         extra_cuda_cflags=all_cuda_cflags,
@@ -686,11 +700,15 @@ def load_jit(
         cpp_wrappers = cpp_wrappers or []
         cuda_wrappers = cuda_wrappers or []
         cpp_sources = [f'#include "{path}"' for path in cpp_files]
-        cpp_sources += [_make_wrapper(tup) for tup in cpp_wrappers]
+        cpp_sources += _wrap_in_namespace(
+            [_make_wrapper(tup) for tup in cpp_wrappers], wrap_namespace
+        )
 
         # include cuda files
         cuda_sources = [f'#include "{path}"' for path in cuda_files]
-        cuda_sources += [_make_wrapper(tup) for tup in cuda_wrappers]
+        cuda_sources += _wrap_in_namespace(
+            [_make_wrapper(tup) for tup in cuda_wrappers], wrap_namespace
+        )
         # building_marker records host+pid for the duration of the build. It is
         # what lets a co-located rank's sweep tell "a peer is compiling this
         # right now" from "somebody was killed compiling this", without a lock

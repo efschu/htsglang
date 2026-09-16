@@ -1,12 +1,12 @@
-#include <sgl_kernel/tensor.h>
-#include <sgl_kernel/utils.h>
+#include <sgl_kernel_next/tensor.h>
+#include <sgl_kernel_next/utils.h>
 
-#include <sgl_kernel/math.cuh>
-#include <sgl_kernel/tile.cuh>
-#include <sgl_kernel/type.cuh>
-#include <sgl_kernel/utils.cuh>
-#include <sgl_kernel/vec.cuh>
-#include <sgl_kernel/warp.cuh>
+#include <sgl_kernel_next/math.cuh>
+#include <sgl_kernel_next/tile.cuh>
+#include <sgl_kernel_next/type.cuh>
+#include <sgl_kernel_next/utils.cuh>
+#include <sgl_kernel_next/vec.cuh>
+#include <sgl_kernel_next/warp.cuh>
 
 #include <tvm/ffi/container/tensor.h>
 
