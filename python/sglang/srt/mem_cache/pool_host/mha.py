@@ -560,11 +560,16 @@ class MHATokenToKVPoolHost(HostKVCache):
         else:
             idx = (starts[:, None] + torch.arange(p, dtype=torch.int64)[None, :]).reshape(-1)
         L, H, D = self.layer_num, self.head_num, self.head_dim
+        # #1415 (boot xsn166, py-spy of PP0 in the P->D drain): the advanced
+        # index ``kv_buffer[:, :, idx]`` took 31 % of the backup thread --
+        # torch's generic advanced-indexing path on a host tensor, single-
+        # threaded. ``index_select`` on the token axis is the vectorised,
+        # parallel gather of the same bytes.
         if self.layout == "layer_first":
-            g = self.kv_buffer[:, :, idx, :, :].reshape(2, L, n, p, H, D)
+            g = torch.index_select(self.kv_buffer, 2, idx).reshape(2, L, n, p, H, D)
             flat = g.permute(2, 0, 1, 3, 4, 5).contiguous().view(n, -1)
         else:
-            g = self.kv_buffer[:, idx, :, :, :].reshape(2, n, p, L, H, D)
+            g = torch.index_select(self.kv_buffer, 1, idx).reshape(2, n, p, L, H, D)
             flat = g.permute(1, 0, 2, 3, 4, 5).contiguous().view(n, -1)
         return [flat[i] for i in range(n)]
 

@@ -40,6 +40,7 @@ prevent -- and absence is not a mismatch.
 from __future__ import annotations
 
 import logging
+import torch
 from typing import Any, Optional, Sequence
 
 __all__ = ["KvTransferShapeMismatch", "validate_kv_transfer"]
@@ -77,9 +78,17 @@ def _bounds(indices) -> Optional[tuple]:
     if n == 0:
         return (0, -1, 0)
     try:
-        lo = int(min(indices))
-        hi = int(max(indices))
-    except (TypeError, ValueError):
+        if isinstance(indices, torch.Tensor):
+            # #1415 (boot xsn166 drain profile): ``min(tensor)`` iterates the
+            # tensor element by element in Python (one 0-d tensor per item);
+            # the backup thread spent 18 % of the P->D drain here. One
+            # reduction each instead.
+            lo = int(indices.min().item())
+            hi = int(indices.max().item())
+        else:
+            lo = int(min(indices))
+            hi = int(max(indices))
+    except (TypeError, ValueError, RuntimeError):
         return None
     return (lo, hi, n)
 
