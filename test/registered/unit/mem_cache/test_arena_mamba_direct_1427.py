@@ -111,7 +111,7 @@ def test_prefetch_resolves_a_complete_blob_in_place_and_skips_the_copy(tmp_path)
     ph = p.alloc_read(2)
     assert all(p.is_placeholder(int(i)) for i in ph)
     flags = p.arena_resolve_reads(p._backend, ph, ["h1.mamba", "h2.mamba"])
-    assert flags == [True, None]
+    assert flags == [True, False], "#1427d: absent from the arena = miss, never a disk read into a placeholder"
     assert int(ph[0]) == int(rows[0]) and p.is_placeholder(int(ph[1]))
     with pytest.raises(RuntimeError):
         p.set_from_flat_data_page(int(ph[0]), torch.zeros(TOTAL, dtype=torch.uint8))

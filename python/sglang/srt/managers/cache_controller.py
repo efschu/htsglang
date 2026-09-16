@@ -1751,7 +1751,6 @@ class HiCacheController:
                 phase=incoming_phase,
             )
         install(kv_window, mamba_window)
-        self._weg2_hand_mamba_parts()  # #1427c: the rebound group's pool needs the cut, and binds lazily
         # The v2 component reads/writes must land in the pools bound NOW, not
         # the pools bound at attach -- the same frozen-binding class one layer
         # down (`_batch_io_v2` resolves `registered_pools[name]`, registered
@@ -1760,6 +1759,12 @@ class HiCacheController:
         entries = getattr(self.mem_pool_host, "entries", None) or []
         for entry in entries:
             backend.register_mem_host_pool_v2(entry.host_pool, entry.name)
+        # #1427c: the rebound group's mamba pool needs the cut, and binds
+        # lazily. Looked up, not called directly: the roundtrip probes borrow
+        # this method onto a bare object (test 0828) and have no helper.
+        _hand = getattr(self, "_weg2_hand_mamba_parts", None)
+        if callable(_hand):
+            _hand()
         import dataclasses
 
         self.storage_config = dataclasses.replace(
@@ -2974,6 +2979,13 @@ class HiCacheController:
                     exc_info=True,
                 )
                 if operation is not None:
+                    # #1033e: the scheduler must be able to reap this operation
+                    # -- terminated, and its component reads counted as done.
+                    try:
+                        operation.mark_terminate()
+                        operation.pool_transfers_done = True
+                    except Exception:  # noqa: BLE001
+                        pass
                     try:
                         self.append_host_mem_release(
                             operation.host_indices[operation.completed_tokens :],

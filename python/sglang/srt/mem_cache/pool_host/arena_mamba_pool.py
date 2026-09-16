@@ -208,7 +208,13 @@ class ArenaMambaPoolHost(MambaPoolHost):
                 host_indices[i] = self.staging_rows + slot
                 out.append(True)
             else:
-                out.append(None)
+                # #1427d (xsn190): NOT in the arena = an honest miss, exactly
+                # as the KV pages (#1424 `_arena_page_get`): the arena is the
+                # L2, the disk stays the cold tier, and a disk read would have
+                # no row to land in (the placeholder is not a buffer). The
+                # blob is usually just not COMPLETE yet (another layer shard
+                # still writing) -- the prefix is recomputed, nothing crashes.
+                out.append(False)
         return out
 
     # -- transfers -------------------------------------------------------------------
