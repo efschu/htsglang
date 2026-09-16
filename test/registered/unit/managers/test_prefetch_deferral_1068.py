@@ -203,6 +203,9 @@ class _Intake:
     _clear_prefetch_deferral_for_reissue = _method("_clear_prefetch_deferral_for_reissue")
     _host_pool_available_size = _method("_host_pool_available_size")
     _host_pool_identity = _method("_host_pool_identity")
+    # #1436/#1440 added a progress witness to the retry path; this double does
+    # not model delivery, so the witness is a no-op here (sockel-red since).
+    _weg2_note_prefetch_progress = lambda self, req: "n/a"  # noqa: E731
 
     def __init__(
         self,
