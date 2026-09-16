@@ -195,10 +195,15 @@ class TritonGDNKernel(LinearAttnKernelBase):
             import logging as _lg
 
             _q = query_start_loc
-            _total = int(_q[-1].item()) if _q is not None and _q.numel() else -1
             _n = getattr(TritonGDNKernel, "_631b_n", 0) + 1
             TritonGDNKernel._631b_n = _n
-            if _n <= 40 or _total < 0 or _total > 500000:
+            # #1449 (boot weg2xsn206, py-spy on PP0): `_q[-1].item()` is a
+            # DEVICE SYNC on every GDN extend -- 58 % of PP0's samples sat in
+            # it, one per linear layer per chunk, and each one stops the host
+            # from launching the next layer until the GPU has drained.  The
+            # trace reads the value only for the calls it would print.
+            _total = (int(_q[-1].item()) if (_n <= 40 and _q is not None and _q.numel()) else -1)
+            if _n <= 40:
                 _lg.getLogger(__name__).warning(
                     "#631b GDN-EXTEND t%d cu_seqlens=%s total=%s q=%s "
                     "states=%s cache_idx=%s",
