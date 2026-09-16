@@ -4042,11 +4042,18 @@ def presplit_expert_offload_after_repack(
             int(E), buf_slots, row_bytes
         )
         freed_host += spill.numel() * spill.element_size()
-        # Replace the param with a 0-row placeholder so device_loading_context
-        # copies nothing back to host (the full [E] GPU tensor is dropped here).
+        # Replace the param's DATA with a 0-row placeholder so
+        # device_loading_context copies nothing back to host (the full [E]
+        # GPU tensor is dropped here). In place, on the SAME Parameter object:
+        # measured on Qwen3.8-Flash-Next (fn1l, 16.09.2026) a fresh Parameter
+        # left the old one -- with its repacked [E] stack -- alive under
+        # ``model.layers.N.mlp.experts.w13_weight_packed`` in the loader's
+        # params_dict snapshot for the rest of load_weights: +0.81 GiB per
+        # layer on the card, OOM at 71 % of the checkpoint. Swapping .data
+        # frees the stack for every holder of the object.
         empty = torch.empty((0,) + tuple(t.shape[1:]), dtype=t.dtype, device=t.device)
         if isinstance(p, torch.nn.Parameter):
-            setattr(layer, attr, torch.nn.Parameter(empty, requires_grad=False))
+            p.data = empty
         else:
             setattr(layer, attr, empty)
 

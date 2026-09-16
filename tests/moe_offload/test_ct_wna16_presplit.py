@@ -405,3 +405,20 @@ def test_create_weights_arms_the_stream_presplit_on_cuda(fraction_025):
     assert set(state["names"].values()) == set(state["expected"])
     layer_sym = _create_weights(_scheme(sym=True), ambient="cuda")
     assert "w13_weight_zero_point" not in layer_sym._ct_stream_presplit["expected"]
+
+
+@needs_cuda
+def test_presplit_swaps_data_in_place_so_params_dict_holders_drop_the_stack(
+    fraction_025,
+):
+    """fn1l (16.09.2026): load_weights snapshots params_dict before the loop;
+    a presplit that registered a NEW Parameter left the old one alive with the
+    repacked [E] stack (+0.81 GiB per layer on the 5090, OOM at 71 %). The
+    placeholder must land in the SAME Parameter object."""
+    layer = _repacked_ct_layer()
+    params_dict = dict(layer.named_parameters())
+    before = {a: params_dict[a] for a in CT_ATTRS_ASYM}
+    presplit_expert_offload_after_repack(layer)
+    for attr in CT_ATTRS_ASYM:
+        assert getattr(layer, attr) is before[attr], attr
+        assert before[attr].shape[0] == 0, attr

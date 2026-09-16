@@ -1347,10 +1347,42 @@ class FusedMoE(torch.nn.Module):
             torch.cuda.memory_allocated() / 2**30,
             torch.cuda.memory_reserved() / 2**30,
         )
-        if _snap and int(getattr(self, "layer_id", -1)) == 2:
-            _path = f"{_snap}/ct_presplit_layer2_rank{torch.cuda.current_device()}.pickle"
-            torch.cuda.memory._dump_snapshot(_path)
-            logger.info("[ct-stream-presplit] memory snapshot written to %s", _path)
+        if _snap and int(getattr(self, "layer_id", -1)) in (2, 6):
+            # OOM hunt (fn1g-fn1k): +1.17 GiB per presplit layer on the card
+            # while the resident buffers are 0.36 GiB. List the largest live
+            # CUDA tensors of the process with the attribute names that hold
+            # them; the allocator snapshot had no frames for them.
+            import gc as _gc
+
+            _gc.collect()
+            rows = []
+            seen = set()
+            for obj in _gc.get_objects():
+                try:
+                    if not torch.is_tensor(obj) or not obj.is_cuda:
+                        continue
+                    nb = obj.numel() * obj.element_size()
+                    if nb < 32 * 2**20 or (obj.data_ptr(), nb) in seen:
+                        continue
+                    seen.add((obj.data_ptr(), nb))
+                    names = []
+                    for r in _gc.get_referrers(obj):
+                        if isinstance(r, dict):
+                            names += [str(k) for k, v in r.items() if v is obj][:2]
+                        elif isinstance(r, torch.nn.Parameter):
+                            names.append("Parameter")
+                    rows.append((nb, tuple(obj.shape), str(obj.dtype), names[:4]))
+                except Exception:
+                    continue
+            rows.sort(reverse=True)
+            logger.info(
+                "[ct-stream-presplit] layer %s live CUDA tensors >32 MiB: %d, "
+                "sum %.2f GiB; top: %s",
+                getattr(self, "layer_id", "?"),
+                len(rows),
+                sum(r[0] for r in rows) / 2**30,
+                "; ".join(f"{nb/2**20:.0f}MiB{shape}{dt}{names}" for nb, shape, dt, names in rows[:14]),
+            )
 
     def _load_gguf_weight(
         self,
