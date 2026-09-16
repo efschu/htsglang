@@ -151,3 +151,29 @@ def test_controller_resolves_pages_in_place_without_copy(tmp_path):
     flags = c._draft_page_get_generic(["h0", "h1"], host[:2])
     assert flags == [True, False] and c._draft_l3_hits == 1 and c._draft_l3_misses == 1
     assert dp.row_slot == {slots[0]: darena.find_slots(["h0.draft-x_sfx"])[0][0], slots[1]: -1}
+
+
+def test_backup_ack_rebinds_staging_rows_to_arena_slots(tmp_path):
+    from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+
+    p, arena = _pool(tmp_path)
+    be = _Backend(arena)
+    _write_page(arena, "n0_sfx", 1); _write_page(arena, "n1_sfx", 2)
+    released = []
+    cc = types.SimpleNamespace(mem_pool_host=p, storage_backend=be, mem_pool_host_draft=None,
+                               append_host_mem_release=lambda host_indices, **k: released.append(host_indices.tolist()))
+    t = object.__new__(UnifiedRadixCache)
+    t.cache_controller = cc; t.page_size = 1
+    from sglang.srt.mem_cache import unified_radix_cache as urc
+    cd = types.SimpleNamespace(host_value=torch.tensor([3, 4]))
+    node = types.SimpleNamespace(id=7, hash_value=["n0", "n1"], component_data={urc.BASE_COMPONENT_TYPE: cd})
+    assert t._weg2_rebind_host_to_arena(node) is True
+    slots = [s for s, _ in arena.find_slots(["n0_sfx", "n1_sfx"])]
+    assert cd.host_value.tolist() == [S + s for s in slots]
+    assert released == [[3, 4]], "the staging rows are freed"
+    assert arena.evict_candidates(8) == [], "reader references hold the pages"
+    assert t._weg2_rebind_host_to_arena(node) is True, "idempotent on arena rows"
+    # a page missing from the arena keeps the old rows (and takes no reference)
+    cd2 = types.SimpleNamespace(host_value=torch.tensor([1]))
+    node2 = types.SimpleNamespace(id=8, hash_value=["gone"], component_data={urc.BASE_COMPONENT_TYPE: cd2})
+    assert t._weg2_rebind_host_to_arena(node2) is False and cd2.host_value.tolist() == [1]

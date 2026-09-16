@@ -4749,6 +4749,10 @@ def build_env(tree: str, venv: str, cvd: str, store_dir: str, debug_hold: bool, 
     # (boot xsn153: three 80k prefixes overflowed 8 GiB, evictions dropped
     # pages other ranks had written, followers found "store_absent").
     env.setdefault("SGLANG_HICACHE_ARENA_GIB", "16")
+    # #1424 Stufe 3: the host tier IS the arena (rows = slots, reads in place);
+    # the per-rank pool shrinks to a 1 GB staging ring for the write side.
+    env.setdefault("SGLANG_HICACHE_ARENA_HOST", "1")
+    env.setdefault("SGLANG_HICACHE_ARENA_STAGING_GB", "1")
     env.setdefault("SGLANG_HICACHE_ARENA_MAMBA_SLOTS", "128")  # #1410: 48 thrashed on 3x100k (xsn159)
     # write_back + bubble publisher (weg2_bubble_publish, 2026-09-16): the
     # publish sweep runs bounded in the PP loop's bubbles, nothing is left
@@ -9443,12 +9447,13 @@ def build_parser() -> argparse.ArgumentParser:
     # against the disk (max_size >= P pool bytes, W57). The two knobs below are
     # the only ones the disk form has, and both have a stated default.
     ap.add_argument(
-        "--pin-ledger-arm-s", type=int, default=5,
+        "--pin-ledger-arm-s", type=int, default=1,
         help="#1422 (boot xsn172): the pinned arm's host KV pool S (GB) for group P. "
              "The ladder's S=1 gave PP0 a 54,254-token staging pool (cell 18,432 B), "
              "so a re-queued 100k prompt could never be read back from the arena and "
              "was recomputed on P (98k tokens, 29-57 s) with every page in L2. S=5 "
-             "holds 271k tokens on PP0 = the 262,144 cap plus one window. 0 = S=1.")
+             "holds 271k tokens on PP0 = the 262,144 cap plus one window. Back to 1 with "
+             "#1424 (Stufe 3): reads are arena slots, the pool is a 1 GB staging ring. 0 = S=1.")
     ap.add_argument(
         "--pin-ledger-arm-m", type=int, default=2400,
         help="#1317/#1318: PIN the host-ledger arm's mamba-host-pool size M (MiB) "

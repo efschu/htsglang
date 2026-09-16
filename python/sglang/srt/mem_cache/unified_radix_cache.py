@@ -3084,6 +3084,58 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             self._weg2_host_transit = cached
         return bool(cached)
 
+    def _weg2_rebind_host_to_arena(self, node) -> bool:
+        """#1424 Stufe 3 step 5: the store write of this node acked, so every
+        page is COMPLETE in the arena. Point the node's host rows at the
+        arena slots (reader references taken) and free the staging rows --
+        the host copy stays, at no cost, and the next reader on ANY rank of
+        either phase finds it without a copy. False = not an arena pool, or
+        a page not found (the caller keeps the old behaviour)."""
+        cc = self.cache_controller
+        pool = getattr(cc, "mem_pool_host", None)
+        if not getattr(pool, "arena_read", False) or getattr(pool, "arena", None) is None:
+            return False
+        try:
+            cd = node.component_data[BASE_COMPONENT_TYPE]
+            old = cd.host_value
+            hashes = getattr(node, "hash_value", None)
+            if old is None or not hashes or int(old.numel()) != len(hashes) * int(self.page_size):
+                return False
+            if int(old.min()) >= pool.staging_rows:
+                return True  # already arena rows
+            backend = cc.storage_backend
+            stems = [backend._get_suffixed_key(h) for h in hashes]
+            found = pool.arena.find_slots(stems)
+            slots = []
+            for slot, state in found:
+                if slot < 0 or state != 2 or pool.arena.ref_slots([slot], +1) != 1:
+                    break
+                slots.append(slot)
+            if len(slots) != len(found):
+                if slots:
+                    pool.arena.ref_slots(slots, -1)
+                return False
+            new = torch.tensor([pool.staging_rows + s for s in slots], dtype=old.dtype, device=old.device)
+            dpool = getattr(cc, "mem_pool_host_draft", None)
+            if getattr(dpool, "row_slot", None) is not None and dpool.arena is not None:
+                comp = cc._draft_component_name()
+                dstems = [backend._get_suffixed_key(f"{h}.{comp}") for h in hashes]
+                dfound = dpool.arena.find_slots(dstems)
+                dslots = [s if (s >= 0 and st == 2 and dpool.arena.ref_slots([s], +1) == 1) else -1
+                          for s, st in dfound]
+                dpool.resolve_draft_rows(slots, dslots)
+            cd.host_value = new
+            cc.append_host_mem_release(host_indices=old)
+            n = getattr(self, "_weg2_rebind_n", 0) + 1
+            self._weg2_rebind_n = n
+            if n <= 8 or n % 256 == 0:
+                logger.info("#1424 HOST-REBIND node=%s tokens=%d rows->arena slots (n=%d)",
+                            getattr(node, "id", "?"), len(slots), n)
+            return True
+        except Exception as e:  # noqa: BLE001 - a failed rebind keeps the copy
+            logger.warning("#1424 host rebind failed on node %s: %s: %s", getattr(node, "id", "?"), type(e).__name__, e)
+            return False
+
     def _weg2_release_chain_piece_host(self, node) -> None:
         """#1407: a publish-chain head piece is in the store now (ack); its
         host copy was transit only. Free the host rows (HOST layer only --
@@ -5445,7 +5497,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                     # would license a free that loses the KV.
                     node.l3_present = True
                     self.dec_host_lock_ref(node, lock_params)
-                    if getattr(node, "_weg2_chain_piece", False) or self._weg2_host_is_transit():
+                    if self._weg2_rebind_host_to_arena(node):
+                        pass  # #1424: the rows now ARE the arena slots
+                    elif getattr(node, "_weg2_chain_piece", False) or self._weg2_host_is_transit():
                         self._weg2_release_chain_piece_host(node)
                 # #810: the storage write acked -- this is the drain the
                 # staging ring measures its residency against. Outside the
@@ -6146,7 +6200,10 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 # store (l3_present) is on the card now; its host rows were
                 # transit. D's pool held a loaded 79k prefix (occupied 38695)
                 # and the next two 79k reads found available=0 -> W88 -> 503.
-                if getattr(node, "l3_present", False) and self._weg2_host_is_transit():
+                if (getattr(node, "l3_present", False) and self._weg2_host_is_transit()
+                        and not getattr(self.cache_controller.mem_pool_host, "arena_read", False)):
+                    # #1424: arena rows cost nothing to keep; only a copied
+                    # transit row is released after the load-back
                     self._weg2_release_chain_piece_host(node)
             finish_count -= 1
 
