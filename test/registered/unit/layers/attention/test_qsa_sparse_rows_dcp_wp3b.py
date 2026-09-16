@@ -184,3 +184,17 @@ def test_init_dcp_runs_end_to_end_the_way_the_server_builds_it(monkeypatch):
     # the draft worker's backend keeps DCP off (its pool holds the full context)
     d = qb.QwenSparseAttnBackend(runner=SimpleNamespace(model_config=cfg, is_draft_worker=True))
     assert d.dcp_size == 1
+
+
+def test_fp8_byte_decode_matches_torch_for_every_code():
+    """The rows kernel loads an fp8 pool as bytes and decodes them itself
+    (Triton has no fp8e4nv on sm86 -- the 3080 ranks died at compile in
+    fn1w). Same arithmetic, pinned against torch's conversion for all 256."""
+    from sglang.srt.layers.attention.qsa.sparse_attn import fp8_e4m3_bytes_to_f32_reference
+
+    codes = torch.arange(256, dtype=torch.uint8)
+    ref = codes.view(torch.float8_e4m3fn).float()
+    got = fp8_e4m3_bytes_to_f32_reference(codes)
+    nan = torch.isnan(ref)
+    assert torch.equal(nan, torch.isnan(got)) and nan.sum() == 2
+    assert torch.equal(got[~nan], ref[~nan])

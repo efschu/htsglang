@@ -513,6 +513,25 @@ def qwen_sparse_kv_extraction_compact_triton(
 
 
 @triton.jit
+def _fp8_e4m3_bytes_to_f32(x):
+    """float8_e4m3fn stored as uint8 -> float32 by bit arithmetic. Triton
+    refuses the fp8e4nv type below sm89 (the 3080 ranks, fn1w boot
+    2026-09-16), so the pool bytes are loaded as uint8 and decoded here on
+    every architecture alike: sign(1) exp(4, bias 7) mant(3); exp==0 is
+    subnormal (2^-6 * m/8); 0x7F/0xFF (exp 15, mant 7) is NaN."""
+    xi = x.to(tl.int32)
+    sign = (xi >> 7) & 1
+    exp = (xi >> 3) & 0xF
+    man = xi & 0x7
+    normal = tl.where(
+        exp > 0, tl.math.exp2((exp - 7).to(tl.float32)) * (1.0 + man.to(tl.float32) / 8.0), man.to(tl.float32) / 512.0
+    )
+    val = tl.where(sign == 1, -normal, normal)
+    nan = (exp == 15) & (man == 7)
+    return tl.where(nan, float("nan"), val)
+
+
+@triton.jit
 def _sparse_attn_rows_fwd(
     q,
     k,
@@ -543,6 +562,7 @@ def _sparse_attn_rows_fwd(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     HEAD_DIM: tl.constexpr,
+    KV_FP8: tl.constexpr,
 ):
     """WP3b: sparse GQA over ABSOLUTE K/V rows, with the LSE.
 
@@ -578,16 +598,22 @@ def _sparse_attn_rows_fwd(
         row = tl.load(row_ptr + current * sr_n, mask=current < topk, other=-1).to(tl.int64)
         valid = row >= 0
         safe_row = tl.where(valid, row, 0)
-        keys = tl.load(
+        keys_raw = tl.load(
             k_base + safe_row[None, :] * sk_n + offs_d[:, None] * sk_d,
             mask=valid[None, :],
-            other=0.0,
-        ).to(q_values.dtype)
-        values = tl.load(
+            other=0,
+        )
+        values_raw = tl.load(
             v_base + safe_row[:, None] * sv_n + offs_d[None, :] * sv_d,
             mask=valid[:, None],
-            other=0.0,
-        ).to(q_values.dtype)
+            other=0,
+        )
+        if KV_FP8:
+            keys = _fp8_e4m3_bytes_to_f32(keys_raw).to(q_values.dtype)
+            values = _fp8_e4m3_bytes_to_f32(values_raw).to(q_values.dtype)
+        else:
+            keys = keys_raw.to(q_values.dtype)
+            values = values_raw.to(q_values.dtype)
         scores = tl.where(valid[None, :], tl.dot(q_values, keys), -float("inf"))
         next_max = tl.maximum(max_value, tl.max(scores, 1))
         # A block with no valid key leaves next_max at -inf; exp2(-inf - -inf)
@@ -635,6 +661,12 @@ def sparse_attn_rows_triton(q, k_pool, v_pool, rows, scale):
     lse = torch.empty((total_q, num_q_heads), dtype=torch.float32, device=q.device)
     if total_q == 0:
         return out, lse
+    kv_fp8 = k_pool.dtype == torch.float8_e4m3fn
+    if kv_fp8:
+        # Same strides (1 byte per element either way); decoded in-kernel.
+        k_pool, v_pool = k_pool.view(torch.uint8), v_pool.view(torch.uint8)
+    elif k_pool.dtype not in (torch.bfloat16, torch.float16, torch.float32):
+        raise TypeError(f"sparse rows kernel: unsupported KV dtype {k_pool.dtype}")
     block_m = max(16, triton.next_power_of_2(group_size))
     block_n, warps, stages = _get_best_config(total_q)
     _sparse_attn_rows_fwd[(total_q, num_kv_heads)](
@@ -667,10 +699,23 @@ def sparse_attn_rows_triton(q, k_pool, v_pool, rows, scale):
         BLOCK_M=block_m,
         BLOCK_N=block_n,
         HEAD_DIM=head_dim,
+        KV_FP8=kv_fp8,
         num_warps=warps,
         num_stages=stages,
     )
     return out, lse
+
+
+def fp8_e4m3_bytes_to_f32_reference(x: torch.Tensor) -> torch.Tensor:
+    """Torch twin of the in-kernel decode, for the pin against torch's own
+    float8_e4m3fn conversion (all 256 codes)."""
+    xi = x.to(torch.int32)
+    sign, exp, man = (xi >> 7) & 1, (xi >> 3) & 0xF, xi & 0x7
+    normal = torch.where(
+        exp > 0, torch.exp2((exp - 7).float()) * (1.0 + man.float() / 8.0), man.float() / 512.0
+    )
+    val = torch.where(sign == 1, -normal, normal)
+    return torch.where((exp == 15) & (man == 7), torch.full_like(val, float("nan")), val)
 
 
 def sparse_attn_rows_reference(q, k_pool, v_pool, rows, scale):
