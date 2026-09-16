@@ -902,6 +902,9 @@ class Envs:
     # family, MOE = fused expert-weight family.
     SGLANG_UNEVEN_MLP_VECTOR = EnvStr(None)
     SGLANG_UNEVEN_MOE_VECTOR = EnvStr(None)
+    # WP3a: shard MoE experts by INDEX (whole experts per rank, pad expert at
+    # local 0) under an uneven plan for non-GGUF quant paths too.
+    SGLANG_UNEVEN_MOE_EXPERT_SHARD = EnvBool(False)
     # Ratio-weighted vocab sharding vector ("a,b,c", one positive integer
     # per rank) for VocabParallelEmbedding/ParallelLMHead; overrides
     # --rank-vocab-ratio when both are set. Unlike MLP/MOE this family

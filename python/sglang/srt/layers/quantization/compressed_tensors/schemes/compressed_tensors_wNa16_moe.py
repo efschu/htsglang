@@ -324,15 +324,18 @@ class CompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
 
             ambient = torch.empty(0).device
             if ambient.type == "cuda":
+                # under the generic expert shard only the OWNED experts arrive
+                # (the pad expert never does)
+                owned = int(getattr(layer, "_expert_shard_owned", num_experts))
                 expected = {
-                    "w13_weight_packed": 2 * num_experts,
-                    "w2_weight_packed": num_experts,
-                    "w13_weight_scale": 2 * num_experts,
-                    "w2_weight_scale": num_experts,
+                    "w13_weight_packed": 2 * owned,
+                    "w2_weight_packed": owned,
+                    "w13_weight_scale": 2 * owned,
+                    "w2_weight_scale": owned,
                 }
                 if not self.sym:
-                    expected["w13_weight_zero_point"] = 2 * num_experts
-                    expected["w2_weight_zero_point"] = num_experts
+                    expected["w13_weight_zero_point"] = 2 * owned
+                    expected["w2_weight_zero_point"] = owned
                 layer._ct_stream_presplit = {
                     "expected": expected,
                     "names": {id(getattr(layer, n)): n for n in expected},
@@ -347,6 +350,11 @@ class CompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
         # Skip if the layer is already converted to Marlin format to prevent double-packing.
         if getattr(layer, "is_marlin_converted", False):
             return
+
+        # WP3a generic expert shard: the pad expert contributes zero (scales 0)
+        zero_pad = getattr(layer, "zero_expert_shard_pad", None)
+        if callable(zero_pad):
+            zero_pad()
 
         if not hasattr(layer, "_original_shapes"):
             layer._original_shapes = {}

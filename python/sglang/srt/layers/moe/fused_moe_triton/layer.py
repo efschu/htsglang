@@ -443,11 +443,29 @@ class FusedMoE(torch.nn.Module):
         # padding expert (see forward_impl remap + materialize), and the
         # existing reduce_results all-reduce combines the disjoint expert
         # contributions. Even TP and no-plan paths are untouched.
+        _plan_active = tp_plan_active(self.moe_tp_size, self.moe_tp_family)
+        # WP3a (Qwen3.8-Flash-Next, this line): the same expert-index shard
+        # for every other quant path (compressed-tensors/AWQ/GPTQ Marlin,
+        # fp8), opt-in via SGLANG_UNEVEN_MOE_EXPERT_SHARD=1. Whole experts
+        # per rank keep every Marlin tile intact where the intermediate cut
+        # (640 -> 384/128/128) would not, and give the per-rank offload its
+        # own expert set (residents by VRAM, cold traffic by link). Pad expert
+        # at LOCAL INDEX 0 so the static residency plan [0, R) always holds
+        # it; GGUF keeps its trailing pad (index n_local).
+        from sglang.srt.environ import envs as _envs
+
+        self._expert_shard_generic = bool(
+            quant_config is not None
+            and quant_config.get_name() != "gguf"
+            and _plan_active
+            and self.moe_ep_size == 1
+            and _envs.SGLANG_UNEVEN_MOE_EXPERT_SHARD.get()
+        )
         self._gguf_expert_shard = (
             quant_config is not None
             and quant_config.get_name() == "gguf"
-            and tp_plan_active(self.moe_tp_size, self.moe_tp_family)
-        )
+            and _plan_active
+        ) or self._expert_shard_generic
         if self._gguf_expert_shard:
             lo = tp_partition_offset(
                 self.num_experts,
@@ -470,10 +488,23 @@ class FusedMoE(torch.nn.Module):
             # otherwise partition the quant-block units (e.g. 512/256 = 2)
             # over the ranks and raise for 2 units < 3 ranks).
             self.moe_tp_units = self.num_experts
+            if self._expert_shard_generic:
+                if self._has_fused_shared:
+                    raise ValueError(
+                        "SGLANG_UNEVEN_MOE_EXPERT_SHARD does not support fused "
+                        "shared experts"
+                    )
+                # local layout: [pad(0), owned experts lo..hi-1 at 1..n_local]
+                self._expert_shard_pad_index = 0
+                self._expert_shard_owned = n_local
+                self._num_local_routed = n_local + 1
+                self.num_local_experts = n_local + 1
+                self._moe_offload_pinned_experts = [0]
             logging.getLogger(__name__).info(
-                "GGUF MoE uneven TP: expert-dim sharding active — rank %d "
+                "%s MoE uneven TP: expert-dim sharding active — rank %d "
                 "owns experts [%d, %d) of %d (full intermediate %d per "
                 "expert).",
+                "generic" if self._expert_shard_generic else "GGUF",
                 self.moe_tp_rank,
                 lo,
                 lo + n_local,
@@ -1152,6 +1183,11 @@ class FusedMoE(torch.nn.Module):
             expert_data.copy_(loaded_weight)
 
     def _map_global_expert_id_to_local_expert_id(self, expert_id: int) -> int:
+        if getattr(self, "_expert_shard_generic", False):
+            lo, hi = self._gguf_expert_range
+            if lo <= expert_id < hi:
+                return expert_id - lo + 1  # index 0 is the zero pad expert
+            return -1
         start_idx = self.moe_ep_rank * self._num_local_routed
         end_idx = start_idx + self._num_local_routed
         if start_idx <= expert_id < end_idx:
@@ -2208,12 +2244,14 @@ class FusedMoE(torch.nn.Module):
         assert self.quant_method is not None
 
         if getattr(self, "_gguf_expert_shard", False):
-            # Uneven-TP GGUF MoE (expert-dim sharding): translate the
-            # GLOBAL topk expert ids to this rank's LOCAL ids; foreign
-            # experts map to the trailing all-zero padding expert, so their
+            # Uneven-TP expert-dim sharding (GGUF #82 / generic WP3a):
+            # translate the GLOBAL topk expert ids to this rank's LOCAL ids;
+            # foreign experts map to the all-zero padding expert, so their
             # local contribution is exactly 0 and the TP all-reduce sums
             # the true per-owner contributions. Routing (replicated router
             # + identical softmax/topk) is byte-identical on every rank.
+            if not hasattr(self, "_gguf_topk_remap"):
+                self._build_expert_shard_topk_remap()
             assert TopKOutputChecker.format_is_standard(topk_output)
             topk_output = topk_output._replace(
                 topk_ids=self._gguf_topk_remap[topk_output.topk_ids.long()]
@@ -2950,26 +2988,51 @@ class FusedMoE(torch.nn.Module):
         if getattr(self, "_gguf_expert_shard", False) and not hasattr(
             self, "_gguf_topk_remap"
         ):
-            # Global -> local expert id translation for forward_impl:
-            # owned experts map to their local slot (global order), all
-            # foreign experts map to the zero padding expert (index
-            # n_local). Lives on the weights' device; plain indexing, so
-            # CUDA-graph safe.
-            lo, hi = self._gguf_expert_range
-            n_local = hi - lo
-            device = next(
-                (
-                    p.device
-                    for p in self.parameters()
-                    if not isinstance(p, UninitializedParameter)
-                ),
-                torch.device("cuda"),
-            )
+            self._build_expert_shard_topk_remap()
+
+    def _build_expert_shard_topk_remap(self) -> None:
+        """Global -> local expert id translation for forward_local.
+
+        Owned experts map to their local slot, every foreign expert to the
+        zero padding expert: index n_local (trailing, GGUF #82) or index 0
+        (leading, generic shard), so its contribution is exactly 0 and the TP
+        all-reduce sums the true per-owner contributions. Lives on the
+        weights' device; plain indexing, so CUDA-graph safe.
+        """
+        lo, hi = self._gguf_expert_range
+        n_local = hi - lo
+        device = next(
+            (
+                p.device
+                for p in self.parameters()
+                if not isinstance(p, UninitializedParameter)
+            ),
+            torch.device("cuda"),
+        )
+        if getattr(self, "_expert_shard_generic", False):
+            remap = torch.zeros((self.num_experts,), dtype=torch.int32, device=device)
+            remap[lo:hi] = torch.arange(1, n_local + 1, dtype=torch.int32, device=device)
+        else:
             remap = torch.full(
                 (self.num_experts,), n_local, dtype=torch.int32, device=device
             )
             remap[lo:hi] = torch.arange(n_local, dtype=torch.int32, device=device)
-            self._gguf_topk_remap = remap
+        self._gguf_topk_remap = remap
+
+    def zero_expert_shard_pad(self) -> None:
+        """Generic expert shard: make the pad expert (local index 0) contribute
+        exactly 0 -- zero every expert-major parameter's row 0 (group scales at
+        0 make the dequantized weight 0 whatever the packed payload). Called by
+        the quant scheme BEFORE its repack; idempotent."""
+        pad = getattr(self, "_expert_shard_pad_index", None)
+        if pad is None or getattr(self, "_expert_shard_pad_zeroed", False):
+            return
+        n = int(self.num_local_experts)
+        for name, p in self.named_parameters():
+            t = p.data
+            if t.dim() >= 1 and t.shape[0] == n and t.numel():
+                t[pad].zero_()
+        self._expert_shard_pad_zeroed = True
 
 
 @register_custom_op(out_shape="hidden_states")
