@@ -2849,13 +2849,22 @@ def dc_breakdown(
     res = sum(res_tags.values())
     pau = sum(pau_tags.values())
     mib = lambda b: None if b is None else int(round(b / (1024 * 1024)))  # noqa: E731
+    # MEASURED (boot weg2xsn206, TP0 after every leg): torch_reserved 28940 with
+    # tms_paused 28146 and nvml_proc 1640 -- torch's counters KEEP the saver's
+    # regions (resident AND paused) as reserved, so the allocator's own
+    # untagged share is reserved minus BOTH tag sums, and the remainder the
+    # driver reports beyond that is what no allocator owns.
+    untagged = None
     other = None
-    if nvml_proc_bytes is not None and torch_reserved is not None:
-        other = int(nvml_proc_bytes) - int(torch_reserved) - res
+    if torch_reserved is not None:
+        untagged = max(0, int(torch_reserved) - res - pau)
+        if nvml_proc_bytes is not None:
+            other = int(nvml_proc_bytes) - res - untagged
     return {
         "nvml_proc_mib": mib(nvml_proc_bytes),
         "torch_reserved_mib": mib(torch_reserved),
         "torch_allocated_mib": mib(torch_allocated),
+        "torch_untagged_mib": mib(untagged),
         "tms_resident_mib": mib(res),
         "tms_paused_mib": mib(pau),
         "resident_tags_mib": {t: mib(b) for t, b in sorted(res_tags.items())},
@@ -2869,10 +2878,12 @@ def format_dc_breakdown(rec: Dict[str, Any], *, stage: str) -> str:
     n = lambda k: "n/a" if rec.get(k) is None else str(rec.get(k))  # noqa: E731
     return (
         f"WEG2-DC-BREAKDOWN stage={stage} nvml_proc={n('nvml_proc_mib')} MiB = "
-        f"torch_reserved {n('torch_reserved_mib')} (allocated {n('torch_allocated_mib')}) "
-        f"+ tms_resident {n('tms_resident_mib')} {rec.get('resident_tags_mib') or {}} "
+        f"tms_resident {n('tms_resident_mib')} {rec.get('resident_tags_mib') or {}} "
+        f"+ torch_untagged {n('torch_untagged_mib')} (workspaces, static buffers, allocator cache) "
         f"+ other {n('other_mib')} (context+driver+communicator+non-torch); "
-        f"tms_paused {n('tms_paused_mib')} {rec.get('paused_tags_mib') or {}} is unmapped and NOT in nvml_proc "
+        f"tms_paused {n('tms_paused_mib')} {rec.get('paused_tags_mib') or {}} is unmapped and NOT in nvml_proc; "
+        f"raw torch_reserved {n('torch_reserved_mib')} allocated {n('torch_allocated_mib')} "
         f"(instrument: NVML per-process bytes for this pid = the front's WEG2-DC quantity; "
-        f"torch = caching allocator counters; tms = saver tag sums split by offload_tags)"
+        f"torch_untagged = reserved - resident - paused, because torch keeps the saver's regions "
+        f"reserved even when unmapped; tms = saver tag sums split by offload_tags)"
     )

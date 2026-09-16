@@ -38,7 +38,9 @@ class Arithmetic(CustomTestCase):
         self.assertEqual(rec["resident_tags_mib"], {"weights": 200})
         self.assertEqual(rec["tms_paused_mib"], 6458)
         self.assertEqual(rec["paused_tags_mib"], {"cuda_graph": 458, "kv_cache": 6000})
-        self.assertEqual(rec["other_mib"], 1686 - 300 - 200)
+        # torch keeps resident AND paused regions reserved: untagged = 300 - 200 - 6458 -> 0
+        self.assertEqual(rec["torch_untagged_mib"], 0)
+        self.assertEqual(rec["other_mib"], 1686 - 200 - 0)
         self.assertEqual(rec["nvml_proc_mib"], 1686)
 
     def test_paused_tag_is_not_resident(self):
@@ -49,6 +51,16 @@ class Arithmetic(CustomTestCase):
         self.assertEqual(a["other_mib"], -4000)  # an impossible reading shows as such
         self.assertEqual(b["other_mib"], 1000)
 
+    def test_xsn206_tp0_after_every_leg(self):
+        # MEASURED boot weg2xsn206 TP0: nvml 1640, reserved 28940, everything paused 28146
+        rec = ms.dc_breakdown(nvml_proc_bytes=1640 * MIB, torch_reserved=28940 * MIB,
+                              torch_allocated=27218 * MIB,
+                              tag_bytes={"kv_cache": 9642 * MIB, "cuda_graph": 458 * MIB,
+                                         "weights": 18046 * MIB},
+                              offload_tags=["kv_cache", "cuda_graph", "weights"])
+        self.assertEqual(rec["torch_untagged_mib"], 28940 - 28146)   # 794
+        self.assertEqual(rec["other_mib"], 1640 - 794)                # 846
+
     def test_unreadable_is_none_not_zero(self):
         rec = ms.dc_breakdown(nvml_proc_bytes=None, torch_reserved=None, torch_allocated=None,
                               tag_bytes={}, offload_tags=None)
@@ -57,6 +69,7 @@ class Arithmetic(CustomTestCase):
         line = ms.format_dc_breakdown(rec, stage="release tags=['kv_cache']")
         self.assertIn("nvml_proc=n/a", line)
         self.assertIn("other n/a", line)
+        self.assertIn("torch_untagged n/a", line)
         self.assertTrue(line.startswith("WEG2-DC-BREAKDOWN stage=release tags=['kv_cache']"))
 
     def test_line_carries_every_term(self):
@@ -65,7 +78,7 @@ class Arithmetic(CustomTestCase):
                               offload_tags=[])
         line = ms.format_dc_breakdown(rec, stage="s")
         for needle in ("nvml_proc=1600 MiB", "torch_reserved 100", "allocated 90",
-                       "tms_resident 500", "other 1000", "tms_paused 0"):
+                       "tms_resident 500", "torch_untagged 0", "other 1100", "tms_paused 0"):
             self.assertIn(needle, line)
 
 
