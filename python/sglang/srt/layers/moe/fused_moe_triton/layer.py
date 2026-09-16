@@ -4,6 +4,7 @@
 
 import logging
 import math
+import logging
 import threading
 from enum import Enum
 from functools import cached_property
@@ -104,6 +105,7 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 #: twice per layer, so the fast path never touches it and there is nothing to
 #: gain from a per-layer lock -- while a per-layer lock would itself need to be
 #: created by a check-then-build.
+logger = logging.getLogger(__name__)
 _GGUF_STREAM_LATCH_LOCK = threading.Lock()
 
 
@@ -1778,6 +1780,15 @@ class FusedMoE(torch.nn.Module):
 
             clear_mxfp8_shuffle_index_cache()
 
+        # Line fix (Qwen3.8-Flash-Next AWQ, asymmetric compressed-tensors MoE):
+        # upstream left the zero points untransposed ("zero" not in name).
+        # llm-compressor stores them flipped like the packed weights --
+        # measured on the cyankiwi checkpoint: down_proj.weight_zero_point
+        # [320, 20] = [out/pack, groups], gate/up [80, 80] -- while
+        # create_weights lays the param out as [E, groups, out/pack] and
+        # moe_awq_to_marlin_zero_points reads it that way. Untransposed, w2
+        # died on the shape ("320 vs 20") and w13 (square) would have loaded
+        # silently wrong. So the zero points take the same transpose.
         loaded_weight = (
             loaded_weight.t().contiguous()
             if (
@@ -1788,7 +1799,6 @@ class FusedMoE(torch.nn.Module):
                     "CompressedTensorsWNA16TritonMoE",
                 ]
             )
-            and "zero" not in weight_name
             else loaded_weight
         )
 

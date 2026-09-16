@@ -1,6 +1,7 @@
 """Inference-only Qwen4-Exp (text + VL) on the Qwen3.5 backbone."""
 
 import math
+import contextlib
 from contextlib import nullcontext
 from typing import Any, Iterable, Optional, Set, Tuple
 
@@ -507,17 +508,31 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             and not self.use_attn_tp_ngram
         )
         ngram_prefix = f"{prefix}.ngram_embedding" if prefix else "ngram_embedding"
-        self.ngram_embedding = VocabParallelEmbedding(
-            padded_vocab_size,
-            self.head_dim_per_ngram,
-            params_dtype=(
-                torch.float8_e4m3fn
-                if _ple_table_is_fp8(config, quant_config, ngram_prefix)
-                else torch.bfloat16
-            ),
-            output_dtype=torch.bfloat16,
-            use_attn_tp_group=self.use_attn_tp_ngram,
+        # Line note (Qwen3.8-Flash-Next on 20/32 GB cards): with the PLE host
+        # offload on, the device table is only a SHAPE/DTYPE carrier --
+        # Qwen4ExpPinnedHostEmbedding reads those, copies the weight's
+        # attributes and deletes it. Upstream still allocated the full
+        # [vocab/tp, dim] shard on the card first (32 GiB per rank of the
+        # 95 GiB table), which a 20 GB card cannot hold even transiently.
+        # Build it on ``meta`` in that case; nothing downstream touches its
+        # bytes before the wrapper replaces it.
+        _table_device = (
+            torch.device("meta")
+            if getattr(config, "ple_offload_embedding", False)
+            else contextlib.nullcontext()
         )
+        with _table_device:
+            self.ngram_embedding = VocabParallelEmbedding(
+                padded_vocab_size,
+                self.head_dim_per_ngram,
+                params_dtype=(
+                    torch.float8_e4m3fn
+                    if _ple_table_is_fp8(config, quant_config, ngram_prefix)
+                    else torch.bfloat16
+                ),
+                output_dtype=torch.bfloat16,
+                use_attn_tp_group=self.use_attn_tp_ngram,
+            )
         self.ngram_embedding.register_buffer(
             "weight_scale", torch.ones(1, dtype=torch.bfloat16), persistent=True
         )
