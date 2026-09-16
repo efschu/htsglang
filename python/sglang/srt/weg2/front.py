@@ -4312,7 +4312,14 @@ class Front:
         shmem_before = host_ledger.read_cgroup_shmem_bytes()
         t0 = time.time()
         self._flip_stage = "sleep-kv"
-        code, body = await self.rpc(S, "/release_memory_occupation", {"tags": [KV_TAG]}, RPC_TIMEOUT_S)
+        # #1428 (xsn188): the KV legs went out on the shared pooled session
+        # with no epoch, so a stale keep-alive connection ("Server disconnected",
+        # got_response=False) had no retry and killed the boot at the first
+        # wake although P answered 200. Same retry-on-fresh-connection as the
+        # weights legs (#1285); the epoch is the far side's dedup key.
+        code, body = await self.leg_rpc(S, "/release_memory_occupation",
+                                        {"tags": [KV_TAG], "epoch": credit_epoch(self.boot_epoch, self.epoch)},
+                                        RPC_TIMEOUT_S)
         sleep_ms += (time.time() - t0) * 1000
         if code != 200:
             self.do_stop("W4 Weg2WakeRefused", f"sleep({src}, {KV_TAG}) failed HTTP {code}: {body[:400]!r} -- VRAM state undefined, no retry")
@@ -4483,7 +4490,9 @@ class Front:
         # 5. wake dst kv (W4)
         t0 = time.time()
         self._flip_stage = "wake-kv"
-        code, body = await self.rpc(D, "/resume_memory_occupation", {"tags": [KV_TAG]}, RPC_TIMEOUT_S)
+        code, body = await self.leg_rpc(D, "/resume_memory_occupation",
+                                        {"tags": [KV_TAG], "epoch": credit_epoch(self.boot_epoch, self.epoch)},
+                                        RPC_TIMEOUT_S)  # #1428: retryable, see the sleep leg
         t_w = time.time()
         wake_ms += (t_w - t0) * 1000
         if code != 200:
