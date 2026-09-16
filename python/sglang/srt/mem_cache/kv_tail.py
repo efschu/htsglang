@@ -643,6 +643,9 @@ class KvTailRing:
         # Armed only for the duration of one DECODE step; see begin_decode_step.
         self._armed = False
         self._claim_cache = None
+        #: #1427: rows for this step handed out at PLAN time (precommit); the
+        #: in-graph claim is then a pure gather.
+        self._precommitted = False
         #: attended_rows of the PREVIOUS plan, for the fact-4 gate below.
         self._last_plan_attended = 0
 
@@ -791,6 +794,7 @@ class KvTailRing:
         through the same `_dcp_write_scatter` and must double-write them)."""
         self._armed = True
         self._claim_cache = None
+        self._precommitted = False
         if site == "verify":
             self.counters.verify_steps = getattr(self.counters, "verify_steps", 0) + 1
         else:
@@ -801,6 +805,7 @@ class KvTailRing:
         claims nothing and touches no device memory at the write site."""
         self._armed = False
         self._claim_cache = None
+        self._precommitted = False
 
     def claim(self, loc: torch.Tensor, mask: Optional[torch.Tensor] = None):
         """Claim ring rows for the owned body slots in ``loc``.
@@ -817,12 +822,27 @@ class KvTailRing:
         """
         if not getattr(self, "_armed", False):
             return None, None
+        if mask is None:
+            mask = torch.ones_like(loc, dtype=torch.bool)
+        capturing = bool(
+            loc.is_cuda and torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
+        )
+        if capturing or getattr(self, "_precommitted", False):
+            # #1427 CAPTURE-SAFE FORM. The rows were handed out by
+            # ``precommit`` at PLAN time, out of graph; here only fixed-shape,
+            # sync-free gathers run, so the captured graph reads the CURRENT
+            # mapping at every replay. A slot nobody precommitted gathers the
+            # null and is masked out -- never row 0. Boot kvt4d (16.09.) died
+            # at ``loc[mask]`` here: "operation not permitted when stream is
+            # capturing".
+            rows = self.mapping[loc.to(torch.int64)].to(torch.int64)
+            ring_mask = mask & (rows >= 0)
+            ring_loc = torch.where(ring_mask, rows, torch.zeros_like(rows)).to(loc.dtype)
+            return ring_loc, ring_mask
         key = (loc.data_ptr(), int(loc.numel()))
         cached = getattr(self, "_claim_cache", None)
         if cached is not None and cached[0] == key:
             return cached[1], cached[2]
-        if mask is None:
-            mask = torch.ones_like(loc, dtype=torch.bool)
         owned = loc[mask].to(torch.int64)
         if owned.numel() == 0:
             self._claim_cache = (key, None, None)
@@ -860,6 +880,48 @@ class KvTailRing:
         ring_loc = ring_loc.to(loc.dtype)
         self._claim_cache = (key, ring_loc, ring_mask)
         return ring_loc, ring_mask
+
+    def precommit(self, loc: torch.Tensor, mask: Optional[torch.Tensor] = None) -> int:
+        """#1427: hand out ring rows for the slots THIS STEP will write, at PLAN
+        time and OUT OF GRAPH.
+
+        ``loc``/``mask`` are the owner-rule tensors for the step's
+        ``out_cache_loc`` -- the same expression the write site evaluates
+        (``dcp_weighted_write_slots``), computed once here. This is the only
+        place that allocates: the data-dependent ``loc[mask]``, the ``int(...)``
+        of the fresh count and the allocator call all happen here, where a host
+        sync is legal, so the in-graph ``claim`` can be a pure gather. Slots
+        that already hold a row keep it. Returns the number of fresh rows.
+        """
+        if not getattr(self, "_armed", False):
+            return 0
+        if mask is None:
+            mask = torch.ones_like(loc, dtype=torch.bool)
+        owned = loc[mask].to(torch.int64)
+        n_fresh = 0
+        if owned.numel():
+            existing = self.mapping[owned].to(torch.int64)
+            fresh = existing < 0
+            n_fresh = int(fresh.sum())
+            if n_fresh:
+                rows = self.allocator.alloc(n_fresh)
+                if rows is None:
+                    self.counters.clamped_alloc += n_fresh
+                    n_fresh = 0
+                else:
+                    self.mapping[owned[fresh]] = rows.to(torch.int32)
+                    self.rows_held += n_fresh
+                    self.counters.claimed_total += n_fresh
+        self._precommitted = True
+        self._claim_cache = None
+        return n_fresh
+
+    def precommit_skip(self) -> None:
+        """#1427: a step whose write must NOT allocate (the graph CAPTURE pass
+        writes the runner's dummy slots). Switches the claim to the gather
+        form without handing out a row."""
+        self._precommitted = True
+        self._claim_cache = None
 
     def note_merge(self) -> None:
         """The READ half reports itself. Called once per LAYER from
@@ -977,6 +1039,7 @@ class KvTailRing:
         self.rows_held = 0
         self._armed = False
         self._claim_cache = None
+        self._precommitted = False
 
     # -- planning ----------------------------------------------------------
 

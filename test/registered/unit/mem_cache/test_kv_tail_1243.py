@@ -2832,3 +2832,61 @@ def test_1425_va_backed_body_is_refused_only_without_the_memory_saver_tag():
     plain = types.SimpleNamespace(page_size=1, use_mla=False, kv_cache_layout="nhd",
                                   use_hnd=False, swappable_backing=False, post_capture_active=False)
     KvTailRing._refuse_unsupported_form(plain, knobs, under_memory_saver=False)
+
+
+class Test1427CaptureSafeClaim(unittest.TestCase):
+    """#1427: the in-graph claim is a pure gather; rows are handed out by
+    ``precommit`` at plan time. Boot kvt4d (16.09.) died at ``loc[mask]``
+    inside the captured verify graph."""
+
+    def test_precommit_then_claim_equals_the_legacy_claim_and_allocates_nothing_in_claim(self):
+        loc = torch.tensor([5, 9, 2, 7], dtype=torch.int32)
+        mask = torch.tensor([True, False, True, True])
+        legacy = _ring()
+        l_loc, l_mask = legacy.claim(loc, mask)
+        ring = _ring()
+        fresh = ring.precommit(loc, mask)
+        self.assertEqual(fresh, 3)
+        self.assertEqual(ring.rows_held, 3)
+        self.assertTrue(ring._precommitted)
+        held = ring.rows_held
+        alloc_calls = []
+        orig = ring.allocator.alloc
+        ring.allocator.alloc = lambda n: alloc_calls.append(n) or orig(n)
+        r_loc, r_mask = ring.claim(loc, mask)
+        self.assertEqual(alloc_calls, [])
+        self.assertEqual(ring.rows_held, held)
+        self.assertTrue(torch.equal(r_mask, l_mask))
+        self.assertTrue(torch.equal(r_loc, l_loc))
+        self.assertEqual(r_loc.dtype, loc.dtype)
+
+    def test_a_slot_nobody_precommitted_is_masked_out_not_row_zero(self):
+        ring = _ring()
+        ring.precommit(torch.tensor([5, 9], dtype=torch.int32), torch.tensor([True, True]))
+        loc = torch.tensor([5, 11, 9], dtype=torch.int32)
+        r_loc, r_mask = ring.claim(loc, torch.tensor([True, True, True]))
+        self.assertEqual(r_mask.tolist(), [True, False, True])
+        # the unmapped slot 11 must not be written: masked out, and its loc is the harmless 0
+        self.assertEqual(int(r_loc[1]), 0)
+        self.assertEqual(ring.rows_held, 2)
+
+    def test_precommit_skip_hands_out_no_row_and_masks_everything(self):
+        ring = _ring()
+        ring.precommit_skip()
+        r_loc, r_mask = ring.claim(torch.tensor([0, 1], dtype=torch.int32), torch.tensor([True, True]))
+        self.assertEqual(ring.rows_held, 0)
+        self.assertFalse(bool(r_mask.any()))
+
+    def test_precommit_on_an_unarmed_ring_hands_out_nothing(self):
+        ring = _ring(armed=False)
+        self.assertEqual(ring.precommit(torch.tensor([1], dtype=torch.int32)), 0)
+        self.assertEqual(ring.rows_held, 0)
+
+    def test_begin_step_and_disarm_drop_the_precommit(self):
+        ring = _ring()
+        ring.precommit_skip()
+        ring.begin_step("verify")
+        self.assertFalse(ring._precommitted)
+        ring.precommit_skip()
+        ring.disarm()
+        self.assertFalse(ring._precommitted)

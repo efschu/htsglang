@@ -1448,6 +1448,8 @@ class FlashInferAttnBackend(AttentionBackend):
         forward_batch: ForwardBatch,
         in_capture: bool = False,
     ):
+        self._kv_tail_fb = forward_batch  # #1427: the step's out_cache_loc for the tail's plan-time precommit
+        self._kv_tail_in_capture = bool(in_capture)
         # S5 spill-tick graph: out-of-graph prep for the capture / replay of a
         # spill tick (PORT of the _wl out-graph -> _wl_graph_prepare_blocks
         # path). During the spill capture pass `_sess_capture_active` tags the
@@ -1664,6 +1666,8 @@ class FlashInferAttnBackend(AttentionBackend):
                 )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
+        self._kv_tail_fb = forward_batch  # #1427, see init_forward_metadata_out_graph
+        self._kv_tail_in_capture = False
         # #1243 PRECISION TAIL: DISARM the ring at the top of EVERY forward.
         # Only the weighted-DCP decode plan below re-arms it, so extend,
         # target-verify, draft and idle steps claim no ring row at the shared
@@ -5918,6 +5922,7 @@ class FlashInferAttnBackend(AttentionBackend):
         )
         self._kv_tail_verify_plan = (w, int(tail_ring.numel()))
         ring.begin_step("verify")
+        self._kv_tail_precommit_step(ring)
         ring.log_counters("verify")
         return body_indptr, body_indices
 
@@ -5937,6 +5942,46 @@ class FlashInferAttnBackend(AttentionBackend):
         ring.note_merge()
         o, s = _safe_merge_state(o2, s2, o3, s3)
         return o, s
+
+    def _kv_tail_precommit_step(self, ring) -> None:
+        """#1427: hand the ring its rows for THIS step's write, out of graph.
+
+        The write site (``_dcp_write_scatter``) runs INSIDE the captured
+        decode/verify graph, where the data-dependent ``loc[mask]`` and the
+        allocator call are illegal (boot kvt4d 16.09.: "operation not permitted
+        when stream is capturing"). So the owner-rule tensors for the step's
+        ``out_cache_loc`` are evaluated HERE, with the SAME expression the write
+        site uses (``dcp_weighted_write_slots`` -- one definition, two readers),
+        and the ring allocates now; the in-graph claim is a pure gather.
+        """
+        from sglang.srt.mem_cache.kv_tail import Weg2KvTailFormRefused
+
+        if getattr(self, "_kv_tail_in_capture", False):
+            # CAPTURE pass: the write targets are the runner's dummy slots.
+            # Hand out NO rows (they would leak on a slot no request owns);
+            # the gather form still runs so the captured kernels are the
+            # replay's kernels, reading whatever the mapping holds then.
+            ring.precommit_skip()
+            return
+        fb = getattr(self, "_kv_tail_fb", None)
+        out_loc = getattr(fb, "out_cache_loc", None)
+        if out_loc is None:
+            raise Weg2KvTailFormRefused(
+                "W58 Weg2KvTailFormRefused: the precision tail plans a step "
+                "without the step's out_cache_loc (no forward_batch reached "
+                "init_forward_metadata[_out_graph]); the ring cannot precommit "
+                "rows for a write it cannot see."
+            )
+        if self.uneven_dcp_weighted:
+            loc, mask = dcp_weighted_write_slots(
+                out_loc, self.cp_S, self.cp_lo, self.cp_hi, self.cp_ratio
+            )
+        else:
+            loc = out_loc // self.dcp_size
+            mask = dcp_even_write_mask(
+                fb.positions, loc.numel(), self.dcp_size, self.dcp_rank, fb.dcp_kv_mask
+            )
+        ring.precommit(loc, mask)
 
     def _kv_tail_plan_decode(self, built, bs, wrapper):
         """Split the owned decode plan and plan the tail wrapper.
@@ -6028,6 +6073,7 @@ class FlashInferAttnBackend(AttentionBackend):
         ring.log_counters("decode")
         # ARM the write side for exactly this step (see KvTailRing.disarm).
         ring.begin_decode_step()
+        self._kv_tail_precommit_step(ring)
         return kv_indptr, body_indices
 
     def _kv_tail_merge_decode(self, q_full, layer, o, lse):
