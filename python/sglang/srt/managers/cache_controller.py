@@ -3644,7 +3644,12 @@ class HiCacheController:
         # Pages owned by other ranks are persisted by their owners; they still
         # count as completed here so ack/host-release semantics are unchanged.
         owner_mask = getattr(operation, "kv_page_owner_mask", None)
+        from sglang.srt.managers.weg2_bubble_publish import backup_wait_for_bubble
+
         for i in range(0, len(operation.hash_value), STORAGE_BATCH_SIZE):
+            # prefer a bubble of the event loop for this batch's copies
+            # (soft gate, at most 50 ms; the D group has no bubbles).
+            backup_wait_for_bubble(self)
             batch_hashes = operation.hash_value[i : i + STORAGE_BATCH_SIZE]
             batch_host_indices = operation.host_indices[
                 i * self.page_size : (i + len(batch_hashes)) * self.page_size

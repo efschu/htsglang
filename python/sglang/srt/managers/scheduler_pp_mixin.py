@@ -10869,6 +10869,9 @@ class SchedulerPPMixin:
                     "set_run_batch_cpu_start_time",
                     trace_only=True,
                 )
+                from sglang.srt.managers.weg2_bubble_publish import bubble_end
+
+                bubble_end(self)
                 result = self.run_batch(cur_batch, pp_proxy_tensors)
                 set_time_batch(
                     cur_batch.reqs,
@@ -10923,6 +10926,11 @@ class SchedulerPPMixin:
         meter = self._pp_bubble_meter()
         if meter is not None:
             meter.note_no_batch()
+        # write_back + bubble publisher: this gap is where fertige Knoten
+        # leave the card (weg2_bubble_publish; user decision 2026-09-16).
+        from sglang.srt.managers.weg2_bubble_publish import bubble_begin
+
+        bubble_begin(self)
 
     def get_rids(
         self: Scheduler, req_queue: List[Req], is_send: bool, *poll_statuses_group

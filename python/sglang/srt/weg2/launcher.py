@@ -4747,6 +4747,10 @@ def build_env(tree: str, venv: str, cvd: str, store_dir: str, debug_hold: bool, 
         env["SGLANG_HICACHE_ARENA_DIR"] = f"/dev/shm/weg2-arena-{tag}"
     env.setdefault("SGLANG_HICACHE_ARENA_GIB", "8")
     env.setdefault("SGLANG_HICACHE_ARENA_MAMBA_SLOTS", "48")
+    # write_back + bubble publisher (weg2_bubble_publish, 2026-09-16): the
+    # publish sweep runs bounded in the PP loop's bubbles, nothing is left
+    # for the flip's flush. "0" in the operator's environment disables it.
+    env.setdefault("SGLANG_WEG2_BUBBLE_PUBLISH", "1")
     if arming_floor_solved:
         env["SGLANG_ARMING_FLOOR_SOLVED"] = "1"
     else:
