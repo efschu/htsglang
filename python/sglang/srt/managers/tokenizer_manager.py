@@ -261,6 +261,28 @@ class InputFormat(Enum):
     CROSS_ENCODER_PAIRS = 3  # Cross-encoder pairs like [["query", "document"]]
 
 
+def _weg2_handoff_ids(obj):
+    """#1442: the token ids P produced for this rid, from the shared hand-off
+    (None = no hand-off, tokenise as before). Cached on the object so the
+    two calls in the branch above read the file once."""
+    rid = getattr(obj, "rid", None)
+    if not isinstance(rid, str) or not rid.startswith("weg2-"):
+        return None
+    cached = getattr(obj, "_weg2_handoff_ids_cache", "unset")
+    if cached != "unset":
+        return cached
+    try:
+        from sglang.srt.weg2 import handoff as _ho
+        ids = _ho.read_ids(rid)
+    except Exception:  # noqa: BLE001
+        ids = None
+    try:
+        obj._weg2_handoff_ids_cache = ids
+    except Exception:  # noqa: BLE001
+        pass
+    return ids
+
+
 class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     """TokenizerManager is a process that tokenizes the text."""
 
@@ -858,6 +880,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             input_ids = obj.input_ids
         elif obj.input_ids is not None:
             input_ids = obj.input_ids
+        elif _weg2_handoff_ids(obj) is not None:
+            input_ids = _weg2_handoff_ids(obj)  # #1442: P tokenised this prompt already
         else:
             if self.tokenizer is None:
                 raise ValueError(

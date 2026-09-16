@@ -795,9 +795,9 @@ class HybridCacheController(BaseHiCacheController):
             # base class gives; the rank-uniform MIN all_reduce in
             # prefetch_thread_func then agrees on it.
             return [], 0
-        hash_value = self.get_hash_str(
+        hash_value = getattr(operation, "weg2_page_keys", None) or self.get_hash_str(
             operation.token_ids, operation.last_hash, page_size=self.page_size
-        )
+        )  # #1442: P's chain when handed over, else re-derived from the tokens
 
         extra_info = HiCacheStorageExtraInfo(
             prefix_keys=operation.prefix_keys.copy() if operation.prefix_keys else None

@@ -2634,6 +2634,8 @@ class Front:
                 status=501)
         self._rid += 1
         rid = f"weg2-{self.epoch}-{self._rid}"
+        if isinstance(payload, dict):
+            payload["rid"] = rid  # #1442: P and D see the same rid (the hand-off key)
         text = request_text(payload)
         remainder, est_prompt, known = price_remainder(text, self.spans)
         # MF-3: the routing probe's OTHER half, taken here and nowhere else.

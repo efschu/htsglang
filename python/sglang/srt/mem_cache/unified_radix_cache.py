@@ -1585,6 +1585,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             self.token_to_kv_pool_allocator.free(kv_indices[page_aligned_len:])
             if _WEG2_END_ANCHOR:
                 self._weg2_note_end_anchor(req, token_ids)
+            self._weg2_handoff_write(req, radix_key)
         else:
             self.token_to_kv_pool_allocator.free(kv_indices[req.cache_protected_len :])
 
@@ -3228,6 +3229,36 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 if id(node) not in direct:  # #1427: a direct write is in the store already
                     self.write_backup_storage(node)
 
+    def _weg2_handoff_write(self, req, radix_key) -> None:
+        """#1442: hand P's finished prefill to D by rid -- the token ids and
+        the page-key chain of the inserted path -- so D neither re-tokenises
+        nor re-hashes a 100k prompt before its first store lookup."""
+        try:
+            from sglang.srt.weg2 import handoff as _ho
+            rid = str(getattr(req, "rid", "") or "")
+            if not rid.startswith("weg2-") or not _ho.path(rid) or not self.enable_storage:
+                return
+            mr = self.match_prefix(MatchPrefixParams(key=radix_key))
+            node = getattr(mr, "last_device_node", None) or getattr(mr, "last_host_node", None)
+            chain = []
+            while node is not None and node is not self.root_node:
+                hv = getattr(node, "hash_value", None)
+                if not hv:
+                    return  # a node without keys: nothing honest to hand over
+                chain.append(list(hv))
+                node = node.parent
+            keys = [k for part in reversed(chain) for k in part]
+            ids = list(getattr(req, "origin_input_ids", None) or [])
+            if not keys or not ids:
+                return
+            if _ho.write(rid, ids, keys):
+                n = getattr(self, "_1442_n", 0) + 1
+                self._1442_n = n
+                if n <= 8 or n % 256 == 0:
+                    logger.info("#1442 HANDOFF rid=%s ids=%d page_keys=%d (n=%d)", rid[:12], len(ids), len(keys), n)
+        except Exception:  # noqa: BLE001 - the hand-off is an accelerator, never a wall
+            logger.warning("#1442 hand-off write raised", exc_info=True)
+
     def _weg2_note_end_anchor(self, req, token_ids) -> None:
         """#1233 END-OF-PREFILL ANCHOR instrument, one line per finished request.
 
@@ -4450,6 +4481,27 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             prefix_keys,
             extra_pools=aux_xfers or None,
         )
+        # #1442: D takes P's page-key chain for this request instead of
+        # re-hashing the tokens; the chain is indexed from the request start,
+        # the prefetch starts after the locally matched prefix.
+        try:
+            from sglang.srt.weg2 import handoff as _ho
+            _keys = _ho.read_keys(str(req_id)) if str(req_id).startswith("weg2-") else None
+            if _keys:
+                _pages = int(prefetch_length) // int(self.page_size)
+                _total = _keys  # chain length in pages == P's inserted page count
+                _ids = _ho.read_ids(str(req_id))
+                _ntok = len(_ids) if _ids else None
+                _off = (int(_ntok) - int(prefetch_length)) // int(self.page_size) if _ntok is not None else None
+                if _off is not None and 0 <= _off and _off + _pages <= len(_total):
+                    operation.weg2_page_keys = list(_total[_off:_off + _pages])
+                    n = getattr(self, "_1442_use_n", 0) + 1
+                    self._1442_use_n = n
+                    if n <= 8 or n % 256 == 0:
+                        logger.info("#1442 HANDOFF-KEYS rid=%s pages=%d offset=%d (n=%d)",
+                                    str(req_id)[:12], _pages, _off, n)
+        except Exception:  # noqa: BLE001
+            logger.warning("#1442 hand-off keys raised", exc_info=True)
         # DIAGNOSTIC ONLY (#905 window): stamp the host pool identity and its
         # clear-epoch AT REGISTRATION, i.e. at the instant these host slots were
         # allocated. The completion path below compares them against the pool it

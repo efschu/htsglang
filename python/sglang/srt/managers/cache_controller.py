@@ -768,6 +768,18 @@ def _record_quiesce_poison(reason: str, name: str, exc: BaseException) -> None:
         pass
 
 
+_WEG2_DRAFT_POOL = None
+
+
+def _weg2_draft_pool_executor():
+    """#1442: one worker for the draft page lookups that run beside the KV lookups."""
+    global _WEG2_DRAFT_POOL
+    if _WEG2_DRAFT_POOL is None:
+        from concurrent.futures import ThreadPoolExecutor
+        _WEG2_DRAFT_POOL = ThreadPoolExecutor(max_workers=1, thread_name_prefix="weg2-draft-get")
+    return _WEG2_DRAFT_POOL
+
+
 class HiCacheController:
     def __init__(
         self,
@@ -2899,18 +2911,24 @@ class HiCacheController:
             # Best-effort draft L3 read before publishing target completion.
             # Otherwise wait_complete can race and load back target KV before
             # draft KV reaches host memory.
+            _draft_fut = None
             if self.draft_tier_armed("l3-load"):
-                flags = self._draft_page_get_flags(batch_hashes, batch_host_indices)
-                if flags is not None and self._draft_read_broke_the_claim(
-                    operation, i, flags
-                ):
-                    operation.mark_terminate()
-                    break
+                # #1442: the draft lookup does not depend on the KV lookup --
+                # it runs beside it (the C lookups release the GIL).
+                _draft_fut = _weg2_draft_pool_executor().submit(
+                    self._draft_page_get_flags, batch_hashes, batch_host_indices)
 
             prev_completed_tokens = operation.completed_tokens
             # Get one batch token, and update the completed_tokens if succeed
             extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
             self.page_get_func(operation, batch_hashes, batch_host_indices, extra_info)
+            if _draft_fut is not None:
+                flags = _draft_fut.result()
+                if flags is not None and self._draft_read_broke_the_claim(
+                    operation, i, flags
+                ):
+                    operation.mark_terminate()
+                    break
             # Check termination
             if (
                 operation.completed_tokens
