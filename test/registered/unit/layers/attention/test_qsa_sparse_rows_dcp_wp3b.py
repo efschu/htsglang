@@ -135,12 +135,17 @@ def test_exports():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel")
-def test_rows_kernel_matches_the_reference_on_the_metal():
+@pytest.mark.parametrize("kv_dtype", [torch.bfloat16, torch.float8_e4m3fn])
+def test_rows_kernel_matches_the_reference_on_the_metal(kv_dtype):
+    """Run this on a 3080 (CUDA_VISIBLE_DEVICES of an sm86 card) before a
+    boot: the fp8 case is the one fn1w's 3080 ranks died on at compile."""
     q, k, v, rows = _case(2)
     q, k, v, rows = (t.cuda() for t in (q, k, v, rows))
-    q, k, v = q.bfloat16(), k.bfloat16(), v.bfloat16()
+    q = q.bfloat16()
+    k, v = k.to(kv_dtype), v.to(kv_dtype)
     out, lse = sparse_attn_rows_triton(q, k, v, rows, 0.3)
-    ref, ref_lse = sparse_attn_rows_reference(q, k, v, rows, 0.3)
+    # the reference sees the same (rounded) values the pool holds
+    ref, ref_lse = sparse_attn_rows_reference(q, k.to(torch.bfloat16), v.to(torch.bfloat16), rows, 0.3)
     live = rows[:, 0] >= 0
     assert torch.allclose(out[live].float(), ref[live].float(), atol=3e-2, rtol=3e-2)
     assert torch.allclose(lse[live], ref_lse[live], atol=1e-2)
