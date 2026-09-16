@@ -145,3 +145,20 @@ def test_rows_kernel_matches_the_reference_on_the_metal():
     assert torch.allclose(out[live].float(), ref[live].float(), atol=3e-2, rtol=3e-2)
     assert torch.allclose(lse[live], ref_lse[live], atol=1e-2)
     assert bool((out[3] == 0).all()) and bool(torch.isinf(lse[3]).all())
+
+
+def test_backend_is_a_valid_owner_bounds_consumer(monkeypatch):
+    """The owner-bounds registry (layers/dcp/owner.py) refuses a consumer
+    without refresh_dcp_owner_bounds(); fn1v (2026-09-16) died at backend
+    init on exactly that. The refresh re-derives the bounds."""
+    from sglang.srt.layers.dcp import owner
+    from sglang.srt.layers.attention.qwen_sparse_attn_backend import QwenSparseAttnBackend
+
+    b = _backend(2, True, (3, 1), rank=1)
+    assert callable(getattr(b, "refresh_dcp_owner_bounds", None))
+    owner.register_owner_bounds_consumer(b)  # must not raise
+    monkeypatch.setattr(owner, "dcp_weighted_owner_bounds", lambda size, rank: (8, 6, 8, 2))
+    b.refresh_dcp_owner_bounds()
+    assert (b.cp_S, b.cp_lo, b.cp_hi, b.cp_ratio) == (8, 6, 8, 2)
+    plain = _backend()
+    plain.refresh_dcp_owner_bounds()  # no-op off the weighted lane

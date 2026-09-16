@@ -305,6 +305,19 @@ class QwenSparseAttnBackend(AttentionBackend):
             f", cp_S={self.cp_S} [{self.cp_lo},{self.cp_hi})" if self.uneven_dcp_weighted else "",
         )
 
+    def refresh_dcp_owner_bounds(self) -> None:
+        """#297 cutover hook (the owner-bounds registry requires it of every
+        consumer): re-derive the cached weighted owner bounds from the freshly
+        installed token vector. Idle-boundary only, never mid-forward. fn1v
+        boot 2026-09-16: registering without it refused at backend init."""
+        if not self.uneven_dcp_weighted:
+            return
+        from sglang.srt.layers.dcp.owner import dcp_weighted_owner_bounds
+
+        self.cp_S, self.cp_lo, self.cp_hi, self.cp_ratio = dcp_weighted_owner_bounds(
+            self.dcp_size, self.dcp_rank
+        )
+
     def _dcp_group_q_head_counts(self, local_heads: int) -> list:
         from sglang.srt.layers.attention.triton_backend import (
             _plan_aware_dcp_group_q_head_counts,
