@@ -1553,6 +1553,18 @@ class Qwen3_5ForCausalLM(nn.Module):
             pp_size=self.pp_group.world_size,
             prefix=f"{prefix}.layers",
         )
+        # WP8 expert lookahead (SGLANG_MOE_EXPERT_LOOKAHEAD, 0 = off): chain the
+        # MoE blocks so each can run a later block's router on its own stream.
+        from sglang.srt.environ import envs as _envs
+        from sglang.srt.models.qwen2_moe import link_moe_lookahead
+
+        n_links = link_moe_lookahead(self.layers)
+        if n_links:
+            logger.info(
+                "[moe-lookahead] distance %s: %d MoE blocks linked",
+                _envs.SGLANG_MOE_EXPERT_LOOKAHEAD.get(),
+                n_links,
+            )
 
         # #753: the mid-loop crossing wire. NoCrossingWire unless a layer set
         # is configured AND SGLANG_PP_CROSSING_WIRE is on, so the default path

@@ -674,6 +674,9 @@ class FusedMoE(torch.nn.Module):
             self._moe_offload_trace_path
         )
         self._expert_offload = None  # MoEExpertOffloadCache, lazily installed
+        # WP8 lookahead: (next FusedMoE, predicted local ids) set by the MoE
+        # block right before this forward; consumed by exactly one forward.
+        self._lookahead_pending = None
         self._expert_offload_install_failed = False
         self._moe_offload_trace_step = 0
         # CUDA-graph guard -> MODE SWITCH (Stage-3). The eager offload path
@@ -2331,6 +2334,8 @@ class FusedMoE(torch.nn.Module):
             return _apply(dispatch_output)
 
         topk_ids = topk_output.topk_ids
+        if self._expert_offload is None or self._expert_offload_fraction >= 1.0:
+            self._lookahead_pending = None  # nothing to prefetch into yet / ever
 
         from sglang.srt.model_executor.runner_utils.capture_mode import (
             get_is_capture_mode,
@@ -2369,6 +2374,7 @@ class FusedMoE(torch.nn.Module):
         # requires --cuda-graph-backend-prefill=disabled), so prefill forwards
         # fall through to run_waves and keep their wave splitting.
         if self._moe_offload_breakable and get_is_capture_mode():
+            self._drop_lookahead()
             return self._run_moe_core_offload_breakable(
                 dispatch_output, topk_output, topk_ids, _apply
             )
@@ -2378,6 +2384,7 @@ class FusedMoE(torch.nn.Module):
         # gather + a SINGLE-wave apply. Everything else (prefill, eager decode,
         # buckets beyond the captured sizes) keeps run_waves.
         if self._moe_offload_graph_mode and get_is_capture_mode():
+            self._drop_lookahead()
             return self._run_moe_core_offload_capturable(
                 dispatch_output, topk_output, topk_ids, _apply
             )
@@ -2385,7 +2392,31 @@ class FusedMoE(torch.nn.Module):
         # run_waves handles both the single-wave decode fast path (one apply over
         # the full batch) and the multi-wave prefill-overflow path (disjoint
         # token subsets, each fully computed once -> byte-identical accumulation).
-        return self._expert_offload.run_waves(dispatch_output, _apply)
+        return self._expert_offload.run_waves(
+            dispatch_output, _apply, lookahead=self._take_lookahead()
+        )
+
+    def set_lookahead(self, next_layer, predicted_local_ids):
+        """WP8: hand this forward the LATER layer's offload target and the
+        expert ids its router predicted on the current stream (this rank's
+        local ids). Consumed by the next run_moe_core; a route that cannot use
+        it drops it and counts the drop."""
+        self._lookahead_pending = (next_layer, predicted_local_ids)
+
+    def _take_lookahead(self):
+        pending = self._lookahead_pending
+        if pending is None:
+            return None
+        self._lookahead_pending = None
+        next_layer, pred = pending
+        return (getattr(next_layer, "_expert_offload", None), pred)
+
+    def _drop_lookahead(self):
+        if self._lookahead_pending is not None:
+            self._lookahead_pending = None
+            cache = self._expert_offload
+            if cache is not None:
+                cache.planner.stats.lookahead_dropped += 1
 
     def _run_moe_core_offload_breakable(
         self, dispatch_output, topk_output, topk_ids, apply_fn

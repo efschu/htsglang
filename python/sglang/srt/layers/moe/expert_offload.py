@@ -252,6 +252,14 @@ class ResidencyStats:
     # is an arm that silently ran the baseline.
     remote_fetches: int = 0
     remote_h2d_bytes: int = 0
+    # WP8 expert lookahead: spill experts prefetched on a prediction, how many
+    # of a forward's real spill experts were already in a scratch slot when it
+    # resolved (no H2D), how many were not, and predictions that could not be
+    # used (no cache yet, wave overflow, a captured route).
+    lookahead_prefetched: int = 0
+    lookahead_hits: int = 0
+    lookahead_misses: int = 0
+    lookahead_dropped: int = 0
 
     @property
     def hit_rate(self) -> float:
@@ -584,6 +592,69 @@ class ExpertResidencyPlanner:
             slot_of_needed[e] = slot
             fetch_plan.append((e, slot))
         return slot_of_needed, fetch_plan
+
+    def resolve_sticky(
+        self, needed: Sequence[int], holds: Dict[int, int]
+    ) -> Tuple[Dict[int, int], List[Tuple[int, int]], int]:
+        """WP8 lookahead variant of :meth:`resolve`: a spill expert that a
+        scratch slot ALREADY HOLDS (``holds``: slot -> expert, maintained by
+        every fetch) keeps that slot and is not fetched again; the remaining
+        spill experts take the free scratch slots in sorted order. Returns
+        (slot_of_needed, fetch_plan, reused). Residency accounting is the same
+        as resolve(); the reused experts count as lookahead hits, not misses.
+
+        The layout is no longer a pure function of ``needed`` -- which slot an
+        expert sits in only decides where the grouped GEMM reads its weights,
+        never what it computes -- and that is why this is a separate method
+        behind the lookahead switch: resolve() keeps its history-independent
+        layout for every launch that did not ask for the lookahead."""
+        self.stats.forwards += 1
+        self.stats.waves += 1
+        needed_unique = sorted(set(int(e) for e in needed if e >= 0))
+        if self.fully_resident:
+            self.stats.hits += len(needed_unique)
+            return {e: e for e in needed_unique}, [], 0
+        resident, spill = self.split_needed(needed_unique)
+        if self.resident_ids is None:
+            slot_of_needed: Dict[int, int] = {e: e for e in resident}
+        else:
+            slot_of_needed = {e: self.resident_slot[e] for e in resident}
+        if self.delegated_ids is not None:
+            foreign = [e for e in spill if e in self.delegated_ids]
+            if foreign and not self.delegated_reachable:
+                # Same refusal as resolve(); stated once there.
+                return self.resolve(needed)
+            if foreign:
+                self.stats.remote_fetches += len(
+                    [e for e in foreign if e not in holds.values()]
+                )
+        if len(spill) > self.scratch:
+            raise RuntimeError(
+                f"resolve_sticky() got {len(spill)} spill experts but only "
+                f"{self.scratch} scratch slots exist; caller must wave-split "
+                f"with plan_token_waves() first."
+            )
+        held_slot_of = {e: slot for slot, e in holds.items()}
+        reused = [e for e in spill if e in held_slot_of]
+        missing = [e for e in spill if e not in held_slot_of]
+        taken = {held_slot_of[e] for e in reused}
+        free = [
+            slot
+            for slot in range(self.resident_count, self.resident_count + self.scratch)
+            if slot not in taken
+        ]
+        fetch_plan: List[Tuple[int, int]] = []
+        for e in reused:
+            slot_of_needed[e] = held_slot_of[e]
+        for e, slot in zip(missing, free):
+            slot_of_needed[e] = slot
+            fetch_plan.append((e, slot))
+        self.stats.hits += len(resident)
+        self.stats.misses += len(missing)
+        self.stats.fetches += len(missing)
+        self.stats.lookahead_hits += len(reused)
+        self.stats.lookahead_misses += len(missing)
+        return slot_of_needed, fetch_plan, len(reused)
 
 
 def resident_slot_count(num_local_experts: int, fraction: float) -> int:
@@ -2635,6 +2706,13 @@ class MoEExpertOffloadCache:
         self._resident: Dict[str, "object"] = {}  # attr -> GPU buffer [R+C,...]
         self._stream = None
         self._installed = False
+        # WP8 lookahead: what each scratch slot currently holds (slot -> expert),
+        # written by every fetch on every route so a sticky resolve can trust
+        # it; cleared whenever the buffers are physically rearranged.
+        self._scratch_holds: Dict[int, int] = {}
+        from sglang.srt.environ import envs as _envs
+
+        self.lookahead_sticky = int(_envs.SGLANG_MOE_EXPERT_LOOKAHEAD.get()) > 0
 
         # --- Stage-1 hot-expert residency ----------------------------------
         # When enabled, per-expert routing counts are accumulated over the first
@@ -2921,11 +2999,13 @@ class MoEExpertOffloadCache:
         self._installed = True
 
     # --- fetch / remap helpers (GPU window) --------------------------------
-    def _fetch(self, fetch_plan):
+    def _fetch(self, fetch_plan, join: bool = True):
         """Async H2D-copy each wave's SPILL experts into their scratch slots,
         then join the copy stream before compute reads them. ``fetch_plan`` is
         (spill_expert_id, scratch_slot); the spill pool is indexed by
-        (expert_id - resident_count).
+        (expert_id - resident_count). ``join=False`` (WP8 lookahead prefetch)
+        leaves the copies in flight on the copy stream; the next fetch of this
+        cache -- which always joins -- is what makes them visible to compute.
 
         #394 slice 2: an expert in ``self._remote_ids`` is not in this rank's
         pool at all -- its row is a zero-copy view of a PEER's shared segment,
@@ -2936,6 +3016,8 @@ class MoEExpertOffloadCache:
 
         if not fetch_plan:
             return
+        for expert_id, slot in fetch_plan:
+            self._scratch_holds[slot] = expert_id
         R = self.resident_count
         pool_index = self._spill_pool_index  # None => static layout (id - R)
         remote = self._cold_tier
@@ -2982,7 +3064,8 @@ class MoEExpertOffloadCache:
             self._stream.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(self._stream):
                 _copies()
-            torch.cuda.current_stream().wait_stream(self._stream)
+            if join:
+                torch.cuda.current_stream().wait_stream(self._stream)
         self.planner.stats.h2d_bytes += moved
         self.planner.stats.remote_h2d_bytes += remote_moved
 
@@ -3352,9 +3435,16 @@ class MoEExpertOffloadCache:
             if self._heat.due():
                 self._migrate_heat()
 
-    def run_waves(self, dispatch_output, apply_fn):
+    def run_waves(self, dispatch_output, apply_fn, lookahead=None):
         """Run the grouped-GEMM for one forward, wave-splitting when the forward
         needs more unique experts than there are resident slots.
+
+        ``lookahead`` (WP8): ``(next_cache, predicted_ids)`` -- the offload
+        cache of a LATER layer and the expert ids its router predicted on this
+        layer's stream (already this rank's local ids). The prediction rides
+        the same D2H rendezvous as this forward's routing (one ``tolist`` for
+        both) and, when this forward is a single wave, ``next_cache.prefetch``
+        is issued right after this layer's own fetch.
 
         ``apply_fn(sub_dispatch_output) -> CombineInput`` runs the unmodified
         MoE math (``quant_method.apply``) over the resident buffer. We call it
@@ -3369,9 +3459,26 @@ class MoEExpertOffloadCache:
         topk_ids = topk_output.topk_ids
 
         if self.planner.fully_resident:
+            if lookahead is not None:
+                self._issue_lookahead(lookahead, None)
             return apply_fn(dispatch_output)
 
-        ids_list = topk_ids.tolist()  # [T][k]  (device->host sync; eager only)
+        prefetch = None
+        if lookahead is None:
+            ids_list = topk_ids.tolist()  # [T][k]  (device->host sync; eager only)
+        else:
+            # One rendezvous for both: this forward's routing and the later
+            # layer's prediction cross together.
+            next_cache, pred = lookahead
+            n_own = topk_ids.numel()
+            both = torch.cat(
+                [topk_ids.reshape(-1), pred.reshape(-1).to(topk_ids.dtype)]
+            ).tolist()
+            own = both[:n_own]
+            k = topk_ids.shape[-1]
+            ids_list = [own[i : i + k] for i in range(0, n_own, k)]
+            pred_list = both[n_own:]
+            prefetch = self._issue_lookahead(lookahead, pred_list)
 
         self._observe_routing(ids_list)
 
@@ -3383,10 +3490,12 @@ class MoEExpertOffloadCache:
             )
             if len(spill_waves) > 1:
                 self.planner.stats.overflow_forwards += 1
+                if prefetch is not None:
+                    self.planner.stats.lookahead_dropped += 1
                 return self._run_waves_expert_major(
                     dispatch_output, apply_fn, ids_list, resident_used, spill_waves
                 )
-            return self._run_single_wave(dispatch_output, apply_fn, ids_list)
+            return self._run_single_wave(dispatch_output, apply_fn, ids_list, prefetch)
 
         waves = plan_token_waves(
             ids_list, self.resident_count, self.scratch, self.planner.resident_ids
@@ -3395,10 +3504,12 @@ class MoEExpertOffloadCache:
         # Fast path: the whole forward fits in one wave (typical decode). Remap
         # the full batch and run a single apply -- no token slicing overhead.
         if len(waves) == 1:
-            return self._run_single_wave(dispatch_output, apply_fn, ids_list)
+            return self._run_single_wave(dispatch_output, apply_fn, ids_list, prefetch)
 
         # Multi-wave (prefill overflow): process disjoint token subsets.
         self.planner.stats.overflow_forwards += 1
+        if prefetch is not None:
+            self.planner.stats.lookahead_dropped += 1
         h2d_before = self.planner.stats.h2d_bytes
         hidden = dispatch_output.hidden_states
         scale = dispatch_output.hidden_states_scale
@@ -3448,6 +3559,22 @@ class MoEExpertOffloadCache:
         self._log_wave_h2d("token", len(waves), h2d_before)
         return combine_out._replace(hidden_states=out_full)
 
+    def _issue_lookahead(self, lookahead, pred_list):
+        """Build the prefetch thunk for ``lookahead`` (see run_waves). With
+        ``pred_list`` None the prediction was not carried across the
+        rendezvous (fully resident layer) and is dropped by name."""
+        next_cache, pred = lookahead
+        if pred_list is None:
+            pred_list = pred.reshape(-1).tolist()
+        if next_cache is None or not getattr(next_cache, "_installed", False):
+            self.planner.stats.lookahead_dropped += 1
+            return None
+
+        def _thunk():
+            next_cache.prefetch(pred_list)
+
+        return _thunk
+
     def _log_wave_h2d(self, order, waves, before):  # pragma: no cover - CUDA
         """One line per multi-wave forward with the PCIe volume it cost, so the
         token- vs expert-major difference is readable off the log instead of
@@ -3475,15 +3602,56 @@ class MoEExpertOffloadCache:
             gib,
         )
 
-    def _run_single_wave(self, dispatch_output, apply_fn, ids_list):
+    def prefetch(self, predicted):
+        """WP8 lookahead: bring the PREDICTED spill experts of this layer into
+        free scratch slots on the copy stream, without joining compute. Called
+        by an EARLIER layer's forward while that layer's GEMM runs, so the
+        H2D overlaps compute instead of sitting on the critical path. A
+        prediction that does not fit the scratch region is truncated to it
+        (the first sorted experts, as resolve() would place them); an expert
+        already held keeps its slot. Returns the number of experts issued."""
+        if not self._installed or self.planner.fully_resident:
+            return 0
+        needed_unique = sorted(set(int(e) for e in predicted if e >= 0))
+        spill = self.planner.split_needed(needed_unique)[1]
+        if self.planner.delegated_ids is not None and not self.planner.delegated_reachable:
+            spill = [e for e in spill if e not in self.planner.delegated_ids]
+        spill = spill[: self.scratch]
+        held_slot_of = {e: slot for slot, e in self._scratch_holds.items()}
+        missing = [e for e in spill if e not in held_slot_of]
+        if not missing:
+            return 0
+        keep = {held_slot_of[e] for e in spill if e in held_slot_of}
+        free = [
+            slot
+            for slot in range(self.resident_count, self.resident_count + self.scratch)
+            if slot not in keep
+        ]
+        plan = list(zip(missing, free))
+        self._fetch(plan, join=False)
+        self.planner.stats.lookahead_prefetched += len(plan)
+        return len(plan)
+
+    def _run_single_wave(self, dispatch_output, apply_fn, ids_list, prefetch=None):
         """One apply over the full batch: every routed expert fits the buffer at
         once (typical decode, and any prefill whose spill set fits the scratch).
-        Shared by both wave orders -- with a single wave they are the same path."""
+        Shared by both wave orders -- with a single wave they are the same path.
+
+        ``prefetch`` (WP8 lookahead): a thunk issuing the NEXT layer's
+        predicted spill fetch, run right after this layer's own fetch so the
+        copies overlap this layer's GEMM."""
         topk_output = dispatch_output.topk_output
         topk_ids = topk_output.topk_ids
         needed = sorted({e for row in ids_list for e in row if e >= 0})
-        slot_of_needed, fetch_plan = self.planner.resolve(needed)
+        if self.lookahead_sticky:
+            slot_of_needed, fetch_plan, _ = self.planner.resolve_sticky(
+                needed, self._scratch_holds
+            )
+        else:
+            slot_of_needed, fetch_plan = self.planner.resolve(needed)
         self._fetch(fetch_plan)
+        if prefetch is not None:
+            prefetch()
         lut = self._build_lut(slot_of_needed, topk_ids.dtype, topk_ids.device)
         remapped = self._remap(topk_ids, lut)
         sub = dispatch_output._replace(
@@ -3657,6 +3825,7 @@ class MoEExpertOffloadCache:
         §5 file-driven freeze_from_source."""
         import torch
 
+        self._scratch_holds.clear()  # WP8: the slots are about to be rewritten
         R = self.resident_count
         E = self.num_local_experts
         if self._capturable_ready:
@@ -3782,6 +3951,7 @@ class MoEExpertOffloadCache:
         ``SGLANG_MOE_HEAT_PERIOD`` forwards, so a full sync is the cheap,
         obviously correct choice over an event dance.
         """
+        self._scratch_holds.clear()  # WP8: scratch is the exchange buffer below
         import torch
 
         if self._capturable_ready:

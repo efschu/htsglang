@@ -335,6 +335,35 @@ def _shared_expert_uneven_misaligned(
     return False
 
 
+def link_moe_lookahead(layers, distance: Optional[int] = None) -> int:
+    """WP8: point every MoE block at the MoE block ``distance`` layers ahead
+    (``SGLANG_MOE_EXPERT_LOOKAHEAD``; 0 = off). Only blocks that carry a
+    FusedMoE ``experts`` and a ``gate`` take part; a PP-missing or dense layer
+    breaks the chain at that point. Returns the number of links made."""
+    if distance is None:
+        distance = int(envs.SGLANG_MOE_EXPERT_LOOKAHEAD.get())
+    if distance <= 0:
+        return 0
+    blocks = []
+    for layer in layers:
+        mlp = getattr(layer, "mlp", None)
+        ok = (
+            mlp is not None
+            and hasattr(mlp, "lookahead_next")
+            and hasattr(mlp, "gate")
+            and hasattr(mlp, "experts")
+        )
+        blocks.append(mlp if ok else None)
+    links = 0
+    for i, blk in enumerate(blocks):
+        j = i + distance
+        if blk is None or j >= len(blocks) or blocks[j] is None:
+            continue
+        blk.lookahead_next = blocks[j]
+        links += 1
+    return links
+
+
 class Qwen2MoeSparseMoeBlock(nn.Module):
     def __init__(
         self,
@@ -474,6 +503,30 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             )
             self.top_k = config.num_experts_per_tok
         self.is_nextn = is_nextn
+        # WP8 expert lookahead: the MoE block N steps ahead whose router this
+        # block evaluates on its own stream (None = off; see link_moe_lookahead).
+        self.lookahead_next: Optional["Qwen2MoeSparseMoeBlock"] = None
+
+    def _predict_lookahead(self, hidden_states: torch.Tensor):
+        """Run the LATER block's router on this block's MLP input and hand the
+        predicted expert ids (this rank's local ids) to this block's experts,
+        which prefetch them into the later block's scratch while this block's
+        GEMM runs. Eager only: under graph capture the prediction would need
+        a host rendezvous the captured segment cannot pay."""
+        nxt = self.lookahead_next
+        if nxt is None or get_is_capture_mode():
+            return
+        pred_logits, _ = nxt.gate(hidden_states)
+        pred = nxt.topk(hidden_states, pred_logits)
+        if not TopKOutputChecker.format_is_standard(pred):
+            return
+        pred_ids = pred.topk_ids
+        target = nxt.experts
+        if getattr(target, "_gguf_expert_shard", False):
+            if not hasattr(target, "_gguf_topk_remap"):
+                target._build_expert_shard_topk_remap()
+            pred_ids = target._gguf_topk_remap[pred_ids.long()]
+        self.experts.set_lookahead(target, pred_ids)
 
     def get_moe_weights(self):
         return [
@@ -638,6 +691,8 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             topk_output
         ):
             topk_output = self._append_shared_to_topk_output(topk_output, hidden_states)
+        if self.lookahead_next is not None:
+            self._predict_lookahead(hidden_states)
         return self.experts(hidden_states, topk_output)
 
     def forward_normal_dual_stream(

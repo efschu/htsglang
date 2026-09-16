@@ -905,6 +905,11 @@ class Envs:
     # WP3a: shard MoE experts by INDEX (whole experts per rank, pad expert at
     # local 0) under an uneven plan for non-GGUF quant paths too.
     SGLANG_UNEVEN_MOE_EXPERT_SHARD = EnvBool(False)
+    # WP8 expert lookahead (slotstream +11 % decode): a MoE block runs the
+    # router of the block N steps AHEAD on its own stream and that block's
+    # offload cache prefetches the predicted spill experts while the current
+    # block computes. 0 = off (default, byte-identical path); 1 or 2 = distance.
+    SGLANG_MOE_EXPERT_LOOKAHEAD = EnvInt(0)
     # Ratio-weighted vocab sharding vector ("a,b,c", one positive integer
     # per rank) for VocabParallelEmbedding/ParallelLMHead; overrides
     # --rank-vocab-ratio when both are set. Unlike MLP/MOE this family
