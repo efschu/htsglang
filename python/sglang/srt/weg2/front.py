@@ -1644,7 +1644,7 @@ def _session_pids(sid: int) -> set:
 class Front:
     def __init__(self, prefill: str, decode: str, awake: str, tag: str, store_dir: str,
                  prefill_sid: int, decode_sid: int, dc_reserve: Dict[str, int], w_s: float,
-                 weight_chunks: int = 0, carrier_max_tokens: int = 0,
+                 weight_chunks: int = 0, carrier_max_tokens: int = 0, weight_form: str = "",
                  p_concurrency: int = DEFAULT_P_BS, d_bs: int = DEFAULT_D_BS,
                  tp_prefill_max_tokens: int = X_FALLBACK_TOKENS,
                  flip_min_work_tokens: Optional[int] = None,
@@ -1679,6 +1679,7 @@ class Front:
         self.tag = tag
         self.store_dir = store_dir
         self.dc_reserve = dc_reserve
+        self.weight_form = str(weight_form or "")  # #1444: stamps the dormant record
         self.w_s = w_s
         self.epoch = 0
         #: #1350: the non-reclaimable reading (anon+shmem+slab_unreclaimable)
@@ -4044,7 +4045,8 @@ class Front:
         host_ledger.refuse_sleep_leg_deficit(
             cushion, need, margin_gib=0.0, source=src, group=str(group))
 
-    def sample_dormant_image(self, group: str, shmem_before: Optional[int]) -> Optional[dict]:
+    def sample_dormant_image(self, group: str, shmem_before: Optional[int],
+                             vram_residue_mib: Optional[Dict[str, int]] = None) -> Optional[dict]:
         """Measure ``group``'s dormant host image, once, at its first sleep.
 
         The term boot weg2dk7 refuted: the ledger charged the weight-tag byte
@@ -4090,6 +4092,8 @@ class Front:
             # `predicted_run_peak_gib` refuse (W95) rather than add the same
             # bytes to the origin and to the charges.
             sampled_at_flip_epoch=self.epoch,
+            vram_residue_mib=vram_residue_mib,
+            vram_residue_form=self.weight_form,
             load_witness={
                 "queued": len(self.queue),
                 "outstanding": sum(
@@ -4491,9 +4495,12 @@ class Front:
         # 4. measure D_c(src) on the DEVICE axis; W19 for D at its first sleep.
         # fix 8: and the HOST axis, once per group -- the dormant image the next
         # boot's ledger prices instead of the weight-tag census sum.
-        self.sample_dormant_image(src, shmem_before)
         pids = _session_pids(S.sid) if S.sid else set()
         dc = _nvml_process_mib(pids) if pids else {}
+        # #1444: the device residue rides in the dormant-image record, so the
+        # NEXT boot prices this form's MEASURED residue instead of the xsn14
+        # constant (launcher.dc_residue_from_record).
+        self.sample_dormant_image(src, shmem_before, vram_residue_mib=dc)
         for uuid, mib in sorted(dc.items()):
             logger.info("WEG2-DC group=%s uuid=%s measured=%d MiB reserve=%s", src, uuid, mib, self.dc_reserve.get(uuid))
         if src == "D" and not self.dc_measured_d and dc:
@@ -5348,6 +5355,7 @@ def main():
     ap.add_argument("--prefill-sid", type=int, default=0)
     ap.add_argument("--decode-sid", type=int, default=0)
     ap.add_argument("--dc-reserve", default="", help="uuid=mib,uuid=mib")
+    ap.add_argument("--weight-form", default="", help="#1444: weight source form stamped into the dormant record")
     ap.add_argument("--fairness-w-s", type=float, default=45.0,
                     help="A1-1: the ONLY sanctioned pre-emption of a P drain or a D exhaustion. "
                          "Seconds the oldest waiter may wait before the front stops admitting new "
@@ -5442,6 +5450,7 @@ def main():
         dc[k] = int(v)
     front = Front(args.prefill, args.decode, args.awake, args.tag, args.store_dir, args.prefill_sid, args.decode_sid, dc, args.fairness_w_s,
                   weight_chunks=args.weight_chunks, carrier_max_tokens=args.carrier_max_tokens,
+                  weight_form=args.weight_form,
                   p_concurrency=args.p_concurrency, d_bs=args.d_bs,
                   tp_prefill_max_tokens=args.tp_prefill_max_tokens,
                   flip_min_work_tokens=args.flip_min_work_tokens,

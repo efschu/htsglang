@@ -4402,6 +4402,8 @@ def dormant_image_sample(
     # was measured on the 27B and none of them said so, which is how a 7.48 GiB
     # model would have been handed a 47 GiB ring.
     model_digest_: str = "",
+    vram_residue_mib: Optional[Dict[str, int]] = None,
+    vram_residue_form: str = "",
 ) -> Dict[str, object]:
     """One group's dormant image, measured at its FIRST sleep.  Pure but for /proc.
 
@@ -4612,6 +4614,13 @@ def dormant_image_sample(
         ),
         "load_witness": dict(load_witness or {}),
         "form_key": f"ranks={int(ranks_per_group)};wtags={weight_tags_gib:.2f}",
+        # #1444: the DEVICE-axis residue of this group at this sleep (NVML
+        # per-process MiB per card uuid) and the weight form it was measured
+        # under, so the next boot prices the MEASURED residue instead of a
+        # constant (launcher.dc_residue_from_record).  Empty when the caller
+        # measured none.
+        "vram_residue_mib": {str(k): int(v) for k, v in (vram_residue_mib or {}).items()},
+        "vram_residue_form": str(vram_residue_form or ""),
     }
 
 

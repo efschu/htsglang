@@ -315,6 +315,55 @@ DC_MEASURED_D_XCHG_3080_MIB = DC_MEASURED_D_XCHG_MIB[0]
 DC_MEASURED_D_XCHG_5090_MIB = DC_MEASURED_D_XCHG_MIB[1]
 
 
+#: #1444: margin on top of a RECORDED residue.  The front measured group D's
+#: residue on this form at 1616-1686 MiB (5090) and 1256-1356 MiB (3080) across
+#: the flips of one boot (weg2xsn203), a 100 MiB spread; 256 covers it twice.
+#: The constant it replaces over-reserved 1300-1400 MiB per card, because it
+#: was read at boot weg2xsn14 when the weights_draft tag was still RESIDENT --
+#: the tag has travelled with the exchange since, and P's budget paid for
+#: bytes that are no longer there.
+DC_RECORD_MARGIN_MIB = 256
+#: ``=0`` prices the xsn14 constant again (the pre-#1444 form).
+DC_RECORD_ENV = "SGLANG_WEG2_DC_D_RECORD"
+
+
+def dc_residue_from_record(
+    rec: Optional[Dict[str, object]], cards: Sequence[Card], weight_source: str
+) -> Tuple[Optional[Dict[str, int]], str]:
+    """Group D's dormant residue per card from the PREVIOUS boot's record.
+
+    ``(per-uuid MiB incl. :data:`DC_RECORD_MARGIN_MIB`, provenance)`` when the
+    newest group-D dormant-image record carries a ``vram_residue_mib`` for
+    EVERY card of this boot and was measured under the SAME weight form;
+    ``(None, why)`` otherwise, and the caller prices the constant.  A record
+    from another form is not this form's residue (the whole reason the xsn14
+    constant went stale), so the form gate is exact, not fuzzy.
+    """
+    if os.environ.get(DC_RECORD_ENV, "1").strip() == "0":
+        return None, f"{DC_RECORD_ENV}=0 -> constant"
+    if not isinstance(rec, dict):
+        return None, "no group-D dormant-image record in the sidecar -> constant"
+    tag = str(rec.get("boot_tag", "?"))
+    form = str(rec.get("vram_residue_form", "") or "")
+    if form != str(weight_source):
+        return None, (f"record of boot {tag} measured form {form!r}, this boot is "
+                      f"{str(weight_source)!r} -> constant")
+    vals = rec.get("vram_residue_mib") or {}
+    if not isinstance(vals, dict):
+        return None, f"record of boot {tag} carries no vram_residue_mib -> constant"
+    out: Dict[str, int] = {}
+    parts = []
+    for c in cards:
+        v = vals.get(c.uuid)
+        if not isinstance(v, (int, float)) or isinstance(v, bool) or v <= 0:
+            return None, (f"record of boot {tag} carries no residue for card "
+                          f"{c.uuid} ({c.name}) -> constant")
+        out[c.uuid] = int(v) + DC_RECORD_MARGIN_MIB
+        parts.append(f"nvml{c.nvml_index} {c.name} {int(v)}+{DC_RECORD_MARGIN_MIB}={out[c.uuid]}")
+    return out, (f"boot {tag} at {rec.get('at', '?')} form {form!r}: "
+                 + ", ".join(parts) + " MiB")
+
+
 def dc_measured_d_mib(card: Card, weight_source: str) -> int:
     """Group D's MEASURED dormant residue for this card, on THIS form.
 
@@ -10925,10 +10974,22 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # B4h: THE ONE CONSUMER, form-switched through the one selector, so P's
     # per-card budget follows the arm automatically and no parallel reserve
     # object exists.
+    # #1444: the MEASURED residue of the previous boot on this form wins over
+    # the xsn14 constant; the constant is the fallback with a printed reason.
+    _dc_rec_d = host_ledger.read_measured_record(measured_record_path()).get("D")
+    _dc_from_record, _dc_record_prov = dc_residue_from_record(
+        _dc_rec_d, cards, ns.weg2_weight_source)
     dc_expect_d = {
-        c.uuid: dc_measured_d_mib(c, ns.weg2_weight_source) + slack_mib
+        c.uuid: (
+            _dc_from_record[c.uuid] if _dc_from_record is not None
+            else dc_measured_d_mib(c, ns.weg2_weight_source)
+        ) + slack_mib
         for c in cards
     }
+    log(f"#1444 DC-RESIDUE group=D source="
+        f"{'RECORD' if _dc_from_record is not None else 'CONSTANT'}: {_dc_record_prov}; "
+        f"reserve incl. {slack_mib} MiB slack = "
+        + ", ".join(f"nvml{c.nvml_index} {dc_expect_d[c.uuid]}" for c in cards) + " MiB")
     if ns.transport == "nccl":
         log(
             f"TRANSPORT=nccl (development mode, user order 2026-09-07): barlink flags dropped from both groups; "
@@ -12394,6 +12455,7 @@ def front_argv_for(py: str, store_dir: str, p_pid: int, d_pid: int, dc_expect_d:
         "--store-dir", store_dir,
         "--prefill-sid", str(p_pid), "--decode-sid", str(d_pid),
         "--dc-reserve", ",".join(f"{c.uuid}={dc_expect_d.get(c.uuid, 0)}" for c in cards),
+        "--weight-form", str(ns.weg2_weight_source),  # #1444: stamps the record
         "--fairness-w-s", str(ns.fairness_w_s),
         "--weight-chunks", str(chunk_count),
         "--carrier-max-tokens", str(carrier_max_tokens),
