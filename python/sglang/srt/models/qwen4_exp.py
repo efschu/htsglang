@@ -780,6 +780,46 @@ def _gather_ple_embedding_from_pinned_kernel(
     )
 
 
+@triton.jit
+def _gather_ple_embedding_from_shards_kernel(
+    bases_ptr,
+    shard_rows,
+    ids_ptr,
+    output_ptr,
+    embedding_dim,
+    tp_vocab_start,
+    tp_vocab_end,
+    is_fp8: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    """Same gather as the pinned kernel, but the table is a list of shard
+    base pointers (read-only mmaps of the checkpoint files): global row ->
+    (row // shard_rows, row % shard_rows)."""
+    row_id = tl.program_id(0)
+    global_idx = tl.load(ids_ptr + row_id).to(tl.int64)
+    in_range = (global_idx >= tp_vocab_start) & (global_idx < tp_vocab_end)
+    safe_idx = tl.where(in_range, global_idx, 0)
+    shard = safe_idx // shard_rows
+    local = safe_idx - shard * shard_rows
+    base = tl.load(bases_ptr + shard)
+    offsets = tl.arange(0, BLOCK_D)
+    mask = offsets < embedding_dim
+    if is_fp8:
+        weight_ptr = base.to(tl.pointer_type(tl.float8e4nv))
+    else:
+        weight_ptr = base.to(tl.pointer_type(tl.bfloat16))
+    values = tl.load(
+        weight_ptr + local * embedding_dim + offsets,
+        mask=mask,
+        other=0.0,
+    ).to(tl.bfloat16)
+    tl.store(
+        output_ptr + row_id * embedding_dim + offsets,
+        tl.where(in_range, values, 0.0),
+        mask=mask,
+    )
+
+
 class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
     """PLE table read directly from host memory (pinned, or a file-backed mmap).
 
@@ -834,17 +874,30 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         self.quant_method = None
 
         source_weight = embedding.weight
-        host_table = allocate_ple_host_table(
-            shape=source_weight.shape,
-            dtype=source_weight.dtype,
-            backend=backend,
-            table_dir=table_dir,
-            # Each TP rank holds a different vocabulary shard of the same shape.
-            tag=(
-                f"rows{self.shard_indices.org_vocab_start_index}"
-                f"-{self.shard_indices.org_vocab_end_index}"
-            ),
-        )
+        # ``checkpoint`` (this line): the table is never copied; the checkpoint
+        # files themselves are mapped (see qwen4_exp_ple_table) and
+        # ``self.weight`` is a 0-row carrier of dtype/attributes. The mapping
+        # is created by the model's load_weights once it knows the checkpoint
+        # tensor names (``attach_checkpoint_table``); a gather before that
+        # refuses by name.
+        self._ckpt_table = None
+        self._ckpt_backend = backend == "checkpoint"
+        if self._ckpt_backend:
+            host_table = torch.empty(
+                (0, source_weight.shape[1]), dtype=source_weight.dtype, device="cpu"
+            )
+        else:
+            host_table = allocate_ple_host_table(
+                shape=source_weight.shape,
+                dtype=source_weight.dtype,
+                backend=backend,
+                table_dir=table_dir,
+                # Each TP rank holds a different vocabulary shard of the same shape.
+                tag=(
+                    f"rows{self.shard_indices.org_vocab_start_index}"
+                    f"-{self.shard_indices.org_vocab_end_index}"
+                ),
+            )
         # Only the file backend has anything to prefetch (rows live on storage).
         self._file_prefetcher = make_ple_file_prefetcher(host_table)
         # ... and only it needs its resident set bounded: a fault maps a whole
@@ -860,6 +913,17 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         self.register_buffer("weight_scale", embedding.weight_scale, persistent=True)
         del embedding.weight
         self._block_d = triton.next_power_of_2(self.embedding_dim)
+
+    def attach_checkpoint_table(self, table) -> None:
+        """``checkpoint`` backend: adopt the mapped shards (model load_weights)."""
+        if not self._ckpt_backend:
+            raise RuntimeError("attach_checkpoint_table on a non-checkpoint PLE table")
+        if table.embedding_dim != self.embedding_dim or table.dtype != self.weight.dtype:
+            raise ValueError(
+                f"mapped PLE table {table.dtype}x{table.embedding_dim} does not "
+                f"match the embedding {self.weight.dtype}x{self.embedding_dim}"
+            )
+        self._ckpt_table = table
 
     def allocate_output(
         self, shape: Tuple[int, ...], device: torch.device
@@ -892,6 +956,25 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
             output = out
 
         flat_ids = input_ids.reshape(-1).long()
+        if flat_ids.numel() and self._ckpt_backend:
+            table = self._ckpt_table
+            if table is None:
+                raise RuntimeError(
+                    "PLE checkpoint table was never attached (load_weights did "
+                    "not see the ngram_embedding shards)"
+                )
+            _gather_ple_embedding_from_shards_kernel[(flat_ids.numel(),)](
+                table.bases_on(flat_ids.device),
+                table.shard_rows,
+                flat_ids,
+                output,
+                embedding_dim=self.embedding_dim,
+                tp_vocab_start=self.shard_indices.org_vocab_start_index,
+                tp_vocab_end=self.shard_indices.org_vocab_end_index,
+                is_fp8=table.dtype == torch.float8_e4m3fn,
+                BLOCK_D=self._block_d,
+            )
+            return output
         if flat_ids.numel():
             if self._file_prefetcher is not None:
                 self._file_prefetcher.enqueue(
@@ -1932,6 +2015,28 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
             if ple_mod is None:
                 return False
             emb = ple_mod.ngram_embedding
+            if getattr(emb, "_ckpt_backend", False):
+                # checkpoint backend: nothing is copied; map the shards once.
+                if emb._ckpt_table is None:
+                    from sglang.srt.models.qwen4_exp_ple_table import (
+                        map_ple_table_from_checkpoint,
+                    )
+                    from sglang.srt.runtime_context import get_server_args
+
+                    shard_size = (
+                        emb.org_vocab_size + ple_num_sync_shards - 1
+                    ) // ple_num_sync_shards
+                    emb.attach_checkpoint_table(
+                        map_ple_table_from_checkpoint(
+                            get_server_args().model_path,
+                            name[: name.index(".shard_")],
+                            shard_rows=shard_size,
+                            total_rows=emb.org_vocab_size,
+                            embedding_dim=emb.embedding_dim,
+                        )
+                    )
+                loaded_shard_params.add(f"{mod_prefix}.ngram_embedding.weight")
+                return True
             if (
                 loaded_weight.dtype == torch.float8_e4m3fn
                 and emb.weight.dtype != torch.float8_e4m3fn

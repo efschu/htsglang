@@ -36,7 +36,7 @@ import os
 import re
 import threading
 from concurrent.futures import ThreadPoolExecutor
-from typing import Optional, Sequence
+from typing import Optional, Sequence, Tuple
 
 import torch
 
@@ -48,7 +48,7 @@ _LIBC: Optional[ctypes.CDLL] = None
 _SMAPS_HEADER = re.compile(r"^([0-9a-f]+)-([0-9a-f]+) ")
 _SMAPS_RSS = re.compile(r"^Rss:\s+(\d+) kB")
 
-PLE_OFFLOAD_BACKENDS = ("pinned", "file")
+PLE_OFFLOAD_BACKENDS = ("pinned", "file", "checkpoint")
 
 # cudaDeviceAttr enum values (cuda_runtime_api.h).
 _CUDA_DEV_ATTR_PAGEABLE_MEMORY_ACCESS_USES_HOST_PAGE_TABLES = 100
@@ -481,3 +481,167 @@ def _mapping_rss_bytes(
     except OSError:
         return None
     return total
+
+
+# ---------------------------------------------------------------------------
+# ``checkpoint`` backend (this line, user order 2026-09-16 "das PLE bleibt auf
+# disk ... ja genau so machen"): no copy of the table anywhere. The n-gram
+# table already lies in the checkpoint as ``<prefix>.ngram_embedding.shard_N.weight``
+# tensors (Qwen3.8-Flash-Next: 130 x [2500012, 160] bf16, 800 MB each, spread
+# over 22 safetensors files). Each file is mapped read-only, whole, and the
+# gather kernel gets one base pointer per shard; a global row resolves to
+# (row // rows_per_shard, row % rows_per_shard). The GPU reads the pageable,
+# file-backed pages through HMM -- measured on this rig 2026-09-16 (probe
+# hmm_ple_probe.py: bit-exact against a CPU gather, 5.2 GB/s warm).
+# ---------------------------------------------------------------------------
+
+import json as _json
+import struct as _struct
+
+
+class CheckpointMappedPleTable:
+    """The PLE table as base pointers into read-only mmaps of the checkpoint.
+
+    ``shard_rows`` is the row count of every shard but the last (the loader's
+    ``ceil(vocab / split_ngram_parts)``); ``bases`` holds one host address per
+    shard, in shard order. The numpy memmaps are kept alive here.
+    """
+
+    def __init__(
+        self,
+        bases: Sequence[int],
+        shard_rows: int,
+        total_rows: int,
+        dtype: torch.dtype,
+        embedding_dim: int,
+        keepalive: Sequence[object],
+        files: Sequence[str],
+    ) -> None:
+        self.bases = tuple(int(b) for b in bases)
+        self.shard_rows = int(shard_rows)
+        self.total_rows = int(total_rows)
+        self.dtype = dtype
+        self.embedding_dim = int(embedding_dim)
+        self._keepalive = tuple(keepalive)
+        self.files = tuple(files)
+        self._device_bases: dict = {}
+
+    @property
+    def row_bytes(self) -> int:
+        return self.embedding_dim * torch.empty(0, dtype=self.dtype).element_size()
+
+    def bases_on(self, device) -> torch.Tensor:
+        key = str(device)
+        t = self._device_bases.get(key)
+        if t is None:
+            t = torch.tensor(self.bases, dtype=torch.int64, device=device)
+            self._device_bases[key] = t
+        return t
+
+    def row_ptr(self, row: int) -> int:
+        """Host address of one row (CPU-side check / tests)."""
+        shard, off = divmod(int(row), self.shard_rows)
+        return self.bases[shard] + off * self.row_bytes
+
+
+def _safetensors_header(path: str) -> Tuple[dict, int]:
+    with open(path, "rb") as f:
+        n = _struct.unpack("<Q", f.read(8))[0]
+        header = _json.loads(f.read(n))
+    return header, 8 + n
+
+
+def map_ple_table_from_checkpoint(
+    model_path: str,
+    shard_name_pattern: str,
+    *,
+    shard_rows: int,
+    total_rows: int,
+    embedding_dim: int,
+) -> CheckpointMappedPleTable:
+    """Map every ``<shard_name_pattern>.shard_N.weight`` of the checkpoint.
+
+    ``shard_name_pattern`` is the checkpoint-side prefix up to (excluding)
+    ``.shard_``; the index file names the file of each shard. Row counts are
+    taken from the headers and checked against ``shard_rows`` / ``total_rows``
+    so a mismatched checkpoint refuses instead of gathering garbage.
+    """
+    import numpy as np
+
+    index_path = os.path.join(model_path, "model.safetensors.index.json")
+    if os.path.exists(index_path):
+        weight_map = _json.load(open(index_path))["weight_map"]
+    else:
+        single = os.path.join(model_path, "model.safetensors")
+        header, _ = _safetensors_header(single)
+        weight_map = {k: "model.safetensors" for k in header if k != "__metadata__"}
+    pat = re.compile(re.escape(shard_name_pattern) + r"\.shard_(\d+)\.weight$")
+    shards = sorted(
+        ((int(m.group(1)), name) for name in weight_map if (m := pat.search(name))),
+        key=lambda t: t[0],
+    )
+    if not shards:
+        raise ValueError(
+            f"no '{shard_name_pattern}.shard_N.weight' tensors in {index_path}"
+        )
+    if [i for i, _ in shards] != list(range(len(shards))):
+        raise ValueError(f"PLE shards are not contiguous: {[i for i, _ in shards]}")
+    mmaps: dict = {}
+    headers: dict = {}
+    bases = []
+    dtype = None
+    rows_seen = 0
+    for idx, name in shards:
+        fname = weight_map[name]
+        path = os.path.join(model_path, fname)
+        if path not in headers:
+            headers[path] = _safetensors_header(path)
+            mm = np.memmap(path, dtype=np.uint8, mode="r")
+            mmaps[path] = mm
+            _madvise(int(mm.ctypes.data), int(mm.shape[0]), _MADV_RANDOM)
+        header, data_start = headers[path]
+        info = header[name]
+        st_dtype = {"BF16": torch.bfloat16, "F8_E4M3": torch.float8_e4m3fn}.get(
+            info["dtype"]
+        )
+        if st_dtype is None:
+            raise ValueError(f"PLE shard {name}: unsupported dtype {info['dtype']}")
+        dtype = dtype or st_dtype
+        if st_dtype != dtype:
+            raise ValueError(f"PLE shards mix dtypes ({dtype} vs {st_dtype})")
+        rows, dim = info["shape"]
+        if int(dim) != int(embedding_dim):
+            raise ValueError(f"PLE shard {name}: dim {dim} != {embedding_dim}")
+        last = idx == len(shards) - 1
+        if (not last and int(rows) != int(shard_rows)) or int(rows) > int(shard_rows):
+            raise ValueError(
+                f"PLE shard {name}: {rows} rows, loader expects {shard_rows} "
+                f"per shard (split_ngram_parts)"
+            )
+        rows_seen += int(rows)
+        off0, off1 = info["data_offsets"]
+        if off1 - off0 != int(rows) * int(dim) * torch.empty(0, dtype=dtype).element_size():
+            raise ValueError(f"PLE shard {name}: byte span does not match its shape")
+        bases.append(int(mmaps[path].ctypes.data) + data_start + int(off0))
+    if rows_seen != int(total_rows):
+        raise ValueError(
+            f"PLE shards cover {rows_seen} rows, embedding expects {total_rows}"
+        )
+    logger.info(
+        "PLE table: mapped %d checkpoint shards in %d files read-only "
+        "(%.1f GiB, %s, %d rows/shard) -- no copy",
+        len(shards),
+        len(mmaps),
+        rows_seen * embedding_dim * torch.empty(0, dtype=dtype).element_size() / 2**30,
+        dtype,
+        shard_rows,
+    )
+    return CheckpointMappedPleTable(
+        bases=bases,
+        shard_rows=shard_rows,
+        total_rows=rows_seen,
+        dtype=dtype,
+        embedding_dim=embedding_dim,
+        keepalive=list(mmaps.values()),
+        files=list(mmaps),
+    )

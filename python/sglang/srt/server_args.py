@@ -4718,8 +4718,10 @@ class ServerArgs:
             help="#39126: host storage for the offloaded Qwen4 PLE n-gram table. "
             "'pinned' (default) uses CPU pinned memory. 'file' maps a sparse file under "
             "--ple-offload-dir and lets the gather kernel read it directly (upstream: "
-            "unified-memory devices only, cudaDevAttrPageableMemoryAccessUsesHostPageTables).",
-            choices=["pinned", "file"],
+            "unified-memory devices only, cudaDevAttrPageableMemoryAccessUsesHostPageTables). "
+            "'checkpoint' (this line) copies nothing: the checkpoint's own safetensors files are "
+            "mapped read-only and gathered through HMM (needs cudaDevAttrPageableMemoryAccess).",
+            choices=["pinned", "file", "checkpoint"],
         ),
     ] = "pinned"
     ple_offload_dir: A[

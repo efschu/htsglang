@@ -1315,20 +1315,42 @@ class FusedMoE(torch.nn.Module):
         )
         from sglang.srt.model_loader.loader import device_loading_context
 
+        import os as _os
+
+        _snap = _os.environ.get("SGLANG_CT_PRESPLIT_MEMSNAP", "")
+        if _snap and not getattr(FusedMoE, "_ct_memsnap_armed", False):
+            FusedMoE._ct_memsnap_armed = True
+            torch.cuda.memory._record_memory_history(max_entries=200000)
         before = expert_offload_release_totals()
         t0 = time.perf_counter()
         with device_loading_context(self, state["device"]):
             self.quant_method.process_weights_after_loading(self)
+        # The repack's [E] transients are freed but stay reserved in the
+        # caching allocator; hand them back so the next layer's copy-in and
+        # the KV pool are sized against real free memory, not the cache.
+        torch.cuda.empty_cache()
         after = expert_offload_release_totals()
+        presplit = getattr(self, "_moe_offload_presplit", None) or {}
+        buf_bytes = sum(b.numel() * b.element_size() for b, _ in presplit.values())
+        rows = {a: tuple(b.shape) for a, (b, _) in presplit.items()}
         logger.info(
             "[ct-stream-presplit] layer %s: repack + presplit at load "
             "(%.2f GiB of weight VRAM released, %.2f GiB to the pinned host "
-            "pool, %.1f s)",
+            "pool, %.1f s) | resident buffers %.2f GiB %s | torch allocated "
+            "%.2f GiB reserved %.2f GiB",
             getattr(self, "layer_id", "?"),
             (after.device_bytes - before.device_bytes) / 2**30,
             (after.host_bytes - before.host_bytes) / 2**30,
             time.perf_counter() - t0,
+            buf_bytes / 2**30,
+            rows,
+            torch.cuda.memory_allocated() / 2**30,
+            torch.cuda.memory_reserved() / 2**30,
         )
+        if _snap and int(getattr(self, "layer_id", -1)) == 2:
+            _path = f"{_snap}/ct_presplit_layer2_rank{torch.cuda.current_device()}.pickle"
+            torch.cuda.memory._dump_snapshot(_path)
+            logger.info("[ct-stream-presplit] memory snapshot written to %s", _path)
 
     def _load_gguf_weight(
         self,
