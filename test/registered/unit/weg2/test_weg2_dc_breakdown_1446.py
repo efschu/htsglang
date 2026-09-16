@@ -13,6 +13,7 @@ taken must print n/a, never 0; the release handler must actually call it.
 """
 import inspect
 import os
+import re
 import unittest
 
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
@@ -92,6 +93,13 @@ class Wiring(CustomTestCase):
         # the instrument is fail-soft and prints n/a, never a fabricated 0
         body = inspect.getsource(wu.WeightUpdater._weg2_log_dc_breakdown) if hasattr(wu, "WeightUpdater") else src
         self.assertIn("n/a (instrument failed)", body)
+        # #1452b: every attribute the instrument writes on the slots=True
+        # manager is a declared field (the #1437b lesson, paid again at xsn208)
+        fields = wu.SchedulerWeightUpdaterManager.__dataclass_fields__
+        self.assertIn("_1452_snapshots", fields)
+        snap = inspect.getsource(wu.SchedulerWeightUpdaterManager._weg2_dump_dc_snapshot)
+        for attr in re.findall(r"self\.(_[0-9a-z_]+) =", snap):
+            self.assertIn(attr, fields, attr)
 
 
 if __name__ == "__main__":

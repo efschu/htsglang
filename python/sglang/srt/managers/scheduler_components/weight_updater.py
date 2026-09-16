@@ -553,6 +553,9 @@ class SchedulerWeightUpdaterManager:
     #: #1450: a seam-digest refusal graded BEHIND the wake -- raised at this
     #: rank's next leg or idle tick, never lost.  slots=True: declared here.
     weg2_seam_pending_refusal: Optional[BaseException] = None
+    #: #1452b: snapshot counter -- slots=True, so it is a FIELD (boot weg2xsn208
+    #: printed 'n/a (AttributeError ... _1452_snapshots)' on every rank).
+    _1452_snapshots: int = 0
     _weg2_seam_leg_inventory: Any = None
     #: True once the resume loop has collected tag by tag, so the once-per-wake
     #: entry stands down instead of injecting a second time over bytes already

@@ -44,3 +44,35 @@ starb an genau diesem Transit (xsn184-187).
 * KV-Legs des Front brauchen denselben Epoch-Retry wie die Gewichts-Legs
   (#1428); ein abgerissener Keep-alive hat sonst den Boot beim ersten Wake
   gekillt, obwohl P 200 antwortete.
+
+## Nachtrag 16.09. spät: Layout-Leiter je Größenklasse, YaRN je Klasse (Design, Nutzer-Order)
+
+**Ist (nach #1447):** Der P-Cut-Solver preist jeden Frontier-Kandidaten mit seinem
+Host-Bounce (`PP-CUT HOST-PRICE`), der Cap-Floor (262144 + Chunk) ist auf dem
+Austausch-Arm Standard, und es schifft der schnellste fundierbare Schnitt. Fundierbar
+ist heute nur 39,13,12, weil nur dessen Lane-Satz vermessen ist (5 Lanes, 15,75 GiB);
+jeder unvermessene Schnitt wird mit dem Worst-Case (9 Lanes, 27,75 GiB) bepreist und
+fällt am Ledger (Excess −1,3 GiB). Das `WEG2-XCHG-HOST-SLOT`-Instrument, aus dem die
+Lanes gelernt werden, liefert seit Ring-off keine Zeilen mehr (0 in xsn203–208) —
+das ist die eine Wand vor der Leiter: **erst Lane-Messung wieder verdrahten, dann
+kann ein zweiter Schnitt überhaupt vermessen werden** (Boot mit
+`SGLANG_WEG2_PCUT_BOUNCE_SLACK_GIB` und Ledger-Spielraum, danach ist er in
+`XCHG_LANES_BY_CUT` bzw. dem Record).
+
+**Leiter (Design):** Größenklassen nach geschätzter Prompt-Länge des Frontends
+(`est_prompt`, schon vorhanden): ≤32k, ≤64k, ≤128k, ≤262k. Je Klasse der schnellste
+Schnitt der Frontier, dessen Pool `Klasse + Chunk` hält (bs1: der Pool muss nur den
+einen Prefill halten). Der Solver liefert die ganze Frontier bereits je Boot; die
+Leiter ist eine Tabelle `Klasse → (Schnitt, Pool, ms/Chunk)` aus derselben Rechnung.
+
+**Re-Cut zur Laufzeit:** ein P-interner Layout-Flip (PP-Stufen tauschen Layer über
+dieselben Host-Bounce-Lanes wie der P↔D-Austausch, kein D-Beteiligter), ausgelöst vom
+Frontend, wenn die nächste Batch-Klasse einen anderen Schnitt verlangt als der
+installierte; Kosten ~1 Flip (1,6–2,0 s). Nur wenn der Backlog der Klasse den Flip
+amortisiert (dieselbe Break-even-Regel wie `FLIP-ECONOMICS`).
+
+**YaRN je Klasse:** RoPE-Skalierung ist Ladezeit-Konfiguration des Modells; ein
+Faktorwechsel zur Laufzeit hieße Neu-Laden. Deshalb: Faktor pro Boot fest
+(`--json-model-override-args rope_scaling`), Klassen >262k (Faktor 2/3/4 → 524k/786k/
+1M) nur mit einem Boot dieses Faktors; D-Pool 697856 hält ~2,6×262k, P braucht dafür
+die Pool-lastigen Schnitte (33,18,13 ff.). Automatik = Boot-Wahl, nicht Laufzeit-Wechsel.
