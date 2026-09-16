@@ -4745,7 +4745,10 @@ def build_env(tree: str, venv: str, cvd: str, store_dir: str, debug_hold: bool, 
     # SGLANG_HICACHE_ARENA_DIR="" in the operator's environment disables it.
     if "SGLANG_HICACHE_ARENA_DIR" not in env:
         env["SGLANG_HICACHE_ARENA_DIR"] = f"/dev/shm/weg2-arena-{tag}"
-    env.setdefault("SGLANG_HICACHE_ARENA_GIB", "8")
+    # 16 GiB = 524k KV pages: three ~100k prefixes fit without eviction
+    # (boot xsn153: three 80k prefixes overflowed 8 GiB, evictions dropped
+    # pages other ranks had written, followers found "store_absent").
+    env.setdefault("SGLANG_HICACHE_ARENA_GIB", "16")
     env.setdefault("SGLANG_HICACHE_ARENA_MAMBA_SLOTS", "48")
     # write_back + bubble publisher (weg2_bubble_publish, 2026-09-16): the
     # publish sweep runs bounded in the PP loop's bubbles, nothing is left

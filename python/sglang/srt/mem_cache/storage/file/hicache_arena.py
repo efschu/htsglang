@@ -72,7 +72,10 @@ def _load_lib() -> Optional[ctypes.CDLL]:
             lib.arena_init.argtypes = [p_u8, i64, i64]
             lib.arena_write.restype = i64
             lib.arena_write.argtypes = [p_u8, i64, p_u64, p_u64, p_i64, p_i64, p_i64, p_i64,
-                                        ctypes.POINTER(ctypes.c_void_p), p_i8]
+                                        ctypes.POINTER(ctypes.c_void_p),
+                                        ctypes.POINTER(ctypes.c_char_p), p_i8]
+            lib.arena_slot_stem.restype = ctypes.c_char_p
+            lib.arena_slot_stem.argtypes = [p_u8, i64]
             lib.arena_read.restype = i64
             lib.arena_read.argtypes = [p_u8, i64, p_u64, p_u64, p_i64, p_i64, p_i64, p_i64,
                                        ctypes.POINTER(ctypes.c_void_p), p_i8]
@@ -182,8 +185,9 @@ class ShmArena:
         n_ext, c_off, c_len = self._extents(extents)
         c_tot = (ctypes.c_int64 * n)(*[int(t) for t in totals])
         c_pay = (ctypes.c_void_p * n)(*[int(p) for p in payload_ptrs])
+        c_stems = (ctypes.c_char_p * n)(*[s.encode("utf-8") for s in stems])
         st = (ctypes.c_int8 * n)()
-        self._lib.arena_write(self._base, n, lo, hi, c_tot, n_ext, c_off, c_len, c_pay, st)
+        self._lib.arena_write(self._base, n, lo, hi, c_tot, n_ext, c_off, c_len, c_pay, c_stems, st)
         return list(st)
 
     def read(self, stems, totals, extents, out_ptrs) -> list[int]:
@@ -211,6 +215,11 @@ class ShmArena:
         c_keep = (ctypes.c_uint64 * max(1, len(keep)))(*keep)
         got = self._lib.arena_evict_candidates(self._base, want, slots, lo, hi, tot, c_keep, len(keep))
         return [(int(slots[i]), int(lo[i]), int(hi[i]), int(tot[i])) for i in range(got)]
+
+    def slot_stem(self, slot: int) -> str:
+        """The store stem recorded in the slot header (any rank may evict it)."""
+        raw = self._lib.arena_slot_stem(self._base, int(slot))
+        return (raw or b"").decode("utf-8", "replace")
 
     def slot_view(self, slot: int, nbytes: int) -> memoryview:
         off = int(self._lib.arena_slot_ptr(self._base, int(slot))) - int(self._base.value)

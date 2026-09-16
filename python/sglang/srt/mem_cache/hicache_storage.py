@@ -2486,11 +2486,24 @@ class HiCacheFile(HiCacheStorage):
         stems = getattr(arena, "_stems", {})
         moved = 0
         todo = []
+        cand_stems = {}
         for slot, lo, hi, total in cands:
-            stem = stems.get((lo, hi))
-            if stem is None or stem in self._stat_stems([stem]):
-                # unknown to this process (another rank wrote it and knows
-                # its stem) or already on disk: nothing to write, just free
+            stem = stems.get((lo, hi)) or arena.slot_stem(slot) or None
+            cand_stems[slot] = stem
+        on_disk = self._stat_stems([st for st in cand_stems.values() if st])
+        for slot, lo, hi, total in cands:
+            stem = cand_stems.get(slot)
+            if stem is None:
+                # no stem recorded (a slot claimed before this build): the
+                # page cannot be written by name -- LOGGED, it is lost to the
+                # disk tier (boot xsn153: silent drops made followers see
+                # "store_absent" behind PP0's verdict).
+                self._arena_dropped_n = getattr(self, "_arena_dropped_n", 0) + 1
+                if self._arena_dropped_n <= 8 or self._arena_dropped_n % 256 == 0:
+                    logger.warning("[arena] evicting a page WITHOUT a stem (n=%d): not written to disk",
+                                   self._arena_dropped_n)
+                continue
+            if stem in on_disk:
                 continue
             path = self._sharded_path(stem)
             if not self._evictor.reserve(

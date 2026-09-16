@@ -61,8 +61,11 @@ typedef struct {
     uint32_t n_ivals;          /* merged intervals in use */
     uint64_t cap_ivals;        /* capacity of ivals[] */
     uint8_t pad[8];
+    char stem[192];            /* the store stem, so ANY rank can evict this page to disk */
     Ival ivals[];              /* cap_ivals entries, sorted, disjoint */
 } SlotHeader;
+
+#define STEM_CAP 192
 
 static inline ArenaHeader *hdr(uint8_t *base) { return (ArenaHeader *)base; }
 static inline _Atomic uint64_t *index_keys(uint8_t *base) {
@@ -184,6 +187,7 @@ static int64_t claim_slot(uint8_t *base, uint64_t klo, uint64_t khi, uint64_t to
             sh->total_bytes = total;
             sh->generation++;
             sh->n_ivals = 0;
+            sh->stem[0] = 0;
             atomic_store(&sh->lock, 0);
             atomic_store(&sh->clock_bit, 1);
             atomic_store(&sh->refcount, 0);
@@ -222,7 +226,8 @@ static int64_t claim_slot(uint8_t *base, uint64_t klo, uint64_t khi, uint64_t to
  * 3 refused (extent not granule-aligned or out of range), 4 arena full */
 int64_t arena_write(uint8_t *base, int64_t n, const uint64_t *klo, const uint64_t *khi,
                     const int64_t *totals, const int64_t *n_ext, const int64_t *ext_off,
-                    const int64_t *ext_len, const uint8_t **payload, int8_t *status) {
+                    const int64_t *ext_len, const uint8_t **payload, const char **stems,
+                    int8_t *status) {
     ArenaHeader *h = hdr(base);
     int64_t ok = 0, e = 0;
     for (int64_t i = 0; i < n; i++) {
@@ -240,6 +245,12 @@ int64_t arena_write(uint8_t *base, int64_t n, const uint64_t *klo, const uint64_
         if (slot < 0) { status[i] = 4; e += k; continue; }
         SlotHeader *sh = slot_hdr(base, (uint64_t)slot);
         if (atomic_load(&sh->state) == S_COMPLETE) { status[i] = 2; e += k; ok++; continue; }
+        if (stems && stems[i] && sh->stem[0] == 0) {
+            size_t sl = strlen(stems[i]);
+            if (sl >= STEM_CAP) sl = STEM_CAP - 1;
+            memcpy(sh->stem, stems[i], sl);
+            sh->stem[sl] = 0;
+        }
         uint8_t *dst = slot_data(base, (uint64_t)slot);
         int64_t taken = 0;
         for (int64_t j = 0; j < k; j++) {
@@ -357,6 +368,8 @@ int64_t arena_lookup(uint8_t *base, int64_t n, const uint64_t *klo, const uint64
  * slot ids land in `slots`, their keys in klo/khi, their widths in totals.
  * The caller copies the data out (arena_slot_ptr) and then calls
  * arena_free_slots. Slots whose key is listed in `keep` (pinned) are skipped. */
+const char *arena_slot_stem(uint8_t *base, int64_t slot) { return slot_hdr(base, (uint64_t)slot)->stem; }
+
 int64_t arena_evict_candidates(uint8_t *base, int64_t want, int64_t *slots, uint64_t *klo,
                                uint64_t *khi, int64_t *totals, const uint64_t *keep_lo,
                                int64_t n_keep) {
