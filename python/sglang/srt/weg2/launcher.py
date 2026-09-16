@@ -4757,7 +4757,7 @@ def build_env(tree: str, venv: str, cvd: str, store_dir: str, debug_hold: bool, 
     # slots at 28; 24 GiB = 786k slots is enough for the 600k and leaves the
     # mamba arena its share: the ledger's last dry-run had 18.7 GiB of
     # headroom (75.74 of 94.43 GiB) for both.
-    env.setdefault("SGLANG_HICACHE_ARENA_GIB", "24")
+    env.setdefault("SGLANG_HICACHE_ARENA_GIB", "22")  # #1432: 720k slots, fits the priced headroom with the mamba arena
     # #1424 Stufe 3: the host tier IS the arena (rows = slots, reads in place);
     # the per-rank pool shrinks to a 1 GB staging ring for the write side.
     env.setdefault("SGLANG_HICACHE_ARENA_HOST", "1")
@@ -4765,7 +4765,7 @@ def build_env(tree: str, venv: str, cvd: str, store_dir: str, debug_hold: bool, 
     # #1410: 48 thrashed on 3x100k (xsn159). #1431: one anchor state per 4096
     # tokens x 6 x 100k = ~150 live blobs in the park test, 128 ran full;
     # 192 x 46.76 MiB = 8.8 GiB (with 24 GiB KV: 32.8 GiB shm, fundable).
-    env.setdefault("SGLANG_HICACHE_ARENA_MAMBA_SLOTS", "160")  # #1432: 160 x 74.8 MiB = 11.7 GiB, priced
+    env.setdefault("SGLANG_HICACHE_ARENA_MAMBA_SLOTS", "140")  # #1432: 140 x 74.8 MiB = 10.2 GiB, priced; L3 return path covers the rest
     # write_back + bubble publisher (weg2_bubble_publish, 2026-09-16): the
     # publish sweep runs bounded in the PP loop's bubbles, nothing is left
     # for the flip's flush. "0" in the operator's environment disables it.
@@ -6163,12 +6163,12 @@ def _weg2_arena_ledger_terms(model: str) -> dict:
         from sglang.srt.planner import pp_cut as _pp_cut
         cell = int(_pp_cut.kv_mib_per_token_per_attn_layer_from_config(cfg, "fp8_e4m3", n_layers) * (1 << 20))
         kv_page = cell * n_attn
-        kv_gib = float(os.environ.get("SGLANG_HICACHE_ARENA_GIB", "24") or 24)
+        kv_gib = float(os.environ.get("SGLANG_HICACHE_ARENA_GIB", "22") or 22)
         kv_slots = max(1024, int(kv_gib * (1 << 30)) // max(1, kv_page))
         from sglang.srt.mem_cache.hicache_migrate import qwen3_5_mamba_spec
         blob = qwen3_5_mamba_spec(text_cfg, num_linear_layers=n_lin, units=1,
                                   temporal_itemsize=2, conv_itemsize=2).total_bytes if n_lin else 0
-        mamba_slots = int(os.environ.get("SGLANG_HICACHE_ARENA_MAMBA_SLOTS", "160") or 160)
+        mamba_slots = int(os.environ.get("SGLANG_HICACHE_ARENA_MAMBA_SLOTS", "140") or 140)
         arena_bytes = kv_slots * kv_page + kv_slots * cell + mamba_slots * blob
         out = dict(
             arena_gib=arena_bytes / (1 << 30),

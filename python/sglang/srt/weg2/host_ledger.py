@@ -4110,6 +4110,7 @@ def price(
         "launch_currency": "reap" if _reap_currency else "memavailable",
         "anchors_gib": anchors_gib,
         "rings_gib": rings_gib,
+        "arena_gib": float(charges.get("arena_gib", 0.0) or 0.0),  # #1432: in the Arm's own terms, so the run peak carries it
         "overhead_gib": overhead_gib,
         # #1386: SAME LABEL DEFECT the #1317n comment above names for
         # `s_gb_d` -- `arm.terms` is a fresh literal, not `charges` itself,
@@ -5527,6 +5528,7 @@ def choose(
             )
             + ": "
             f"anchors={arm.terms['anchors_gib']:.2f} rings={arm.terms['rings_gib']:.2f} "
+            f"arena={float(arm.terms.get('arena_gib', 0.0) or 0.0):.2f} "
             f"overhead={arm.terms['overhead_gib']:.2f} "
             # #1273 S6: THE EXCHANGE'S PINNED HOST CARRIER, NAMED ON THE ARM
             # LINE.  0.00 on the ring arm -- an unarmed boot says the term was
