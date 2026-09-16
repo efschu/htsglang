@@ -548,6 +548,7 @@ class SchedulerWeightUpdaterManager:
     #: assembled reading equals a whole walk. The leg's inventory is taken
     #: once (cache) so the worker does not re-walk the model per tag.
     _weg2_seam_after_parts: Optional[dict] = None
+    _weg2_seam_after_threads: Optional[list] = None  # #1437: slots=True dataclass, the field must be declared
     _weg2_seam_leg_inventory: Any = None
     #: True once the resume loop has collected tag by tag, so the once-per-wake
     #: entry stands down instead of injecting a second time over bytes already
