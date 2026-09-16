@@ -224,6 +224,42 @@ static int64_t claim_slot(uint8_t *base, uint64_t klo, uint64_t khi, uint64_t to
 
 /* status per page: 0 partial, 1 completed now, 2 already complete,
  * 3 refused (extent not granule-aligned or out of range), 4 arena full */
+/* Merge k extents into the slot's sorted, disjoint interval list under the
+ * slot lock. Returns 1 when the slot is fully covered, 0 when not, -1 on
+ * interval-list overflow. Shared by arena_write (payload copy) and
+ * arena_complete (#1427 direct DMA writes, no payload). */
+static int merge_ivals(SlotHeader *sh, int64_t k, const int64_t *off_arr, const int64_t *len_arr,
+                       uint64_t total) {
+    int overflow = 0;
+    while (atomic_exchange(&sh->lock, 1)) { /* spin */ }
+    for (int64_t j = 0; j < k && !overflow; j++) {
+        uint64_t lo = (uint64_t)off_arr[j], hi = lo + (uint64_t)len_arr[j];
+        uint32_t n = sh->n_ivals;
+        uint32_t a = 0;
+        while (a < n && sh->ivals[a].hi < lo) a++;
+        uint32_t b = a;
+        while (b < n && sh->ivals[b].lo <= hi) {
+            if (sh->ivals[b].lo < lo) lo = sh->ivals[b].lo;
+            if (sh->ivals[b].hi > hi) hi = sh->ivals[b].hi;
+            b++;
+        }
+        uint32_t removed = b - a;
+        if (removed == 0) {
+            if (n + 1 > sh->cap_ivals) { overflow = 1; break; }
+            memmove(&sh->ivals[a + 1], &sh->ivals[a], (n - a) * sizeof(Ival));
+            sh->ivals[a].lo = lo; sh->ivals[a].hi = hi;
+            sh->n_ivals = n + 1;
+        } else {
+            sh->ivals[a].lo = lo; sh->ivals[a].hi = hi;
+            if (removed > 1) memmove(&sh->ivals[a + 1], &sh->ivals[b], (n - b) * sizeof(Ival));
+            sh->n_ivals = n - removed + 1;
+        }
+    }
+    int full = (sh->n_ivals == 1 && sh->ivals[0].lo == 0 && sh->ivals[0].hi == total);
+    atomic_store(&sh->lock, 0);
+    return overflow ? -1 : full;
+}
+
 int64_t arena_write(uint8_t *base, int64_t n, const uint64_t *klo, const uint64_t *khi,
                     const int64_t *totals, const int64_t *n_ext, const int64_t *ext_off,
                     const int64_t *ext_len, const uint8_t **payload, const char **stems,
@@ -260,35 +296,8 @@ int64_t arena_write(uint8_t *base, int64_t n, const uint64_t *klo, const uint64_
         }
         atomic_thread_fence(memory_order_release);
         /* record coverage: merge the extents into the sorted interval list */
-        int full = 0, overflow = 0;
-        while (atomic_exchange(&sh->lock, 1)) { /* spin */ }
-        for (int64_t j = 0; j < k && !overflow; j++) {
-            uint64_t lo = (uint64_t)ext_off[e + j], hi = lo + (uint64_t)ext_len[e + j];
-            uint32_t n = sh->n_ivals;
-            /* find insertion point and the run of intervals overlapping/touching [lo,hi) */
-            uint32_t a = 0;
-            while (a < n && sh->ivals[a].hi < lo) a++;
-            uint32_t b = a;
-            while (b < n && sh->ivals[b].lo <= hi) {
-                if (sh->ivals[b].lo < lo) lo = sh->ivals[b].lo;
-                if (sh->ivals[b].hi > hi) hi = sh->ivals[b].hi;
-                b++;
-            }
-            /* replace ivals[a..b) with one interval */
-            uint32_t removed = b - a;
-            if (removed == 0) {
-                if (n + 1 > sh->cap_ivals) { overflow = 1; break; }
-                memmove(&sh->ivals[a + 1], &sh->ivals[a], (n - a) * sizeof(Ival));
-                sh->ivals[a].lo = lo; sh->ivals[a].hi = hi;
-                sh->n_ivals = n + 1;
-            } else {
-                sh->ivals[a].lo = lo; sh->ivals[a].hi = hi;
-                if (removed > 1) memmove(&sh->ivals[a + 1], &sh->ivals[b], (n - b) * sizeof(Ival));
-                sh->n_ivals = n - removed + 1;
-            }
-        }
-        full = (sh->n_ivals == 1 && sh->ivals[0].lo == 0 && sh->ivals[0].hi == total);
-        atomic_store(&sh->lock, 0);
+        int mr = merge_ivals(sh, k, ext_off + e, ext_len + e, total);
+        int overflow = mr < 0, full = mr > 0;
         if (overflow) { status[i] = 3; e += k; continue; }
         if (full) {
             uint32_t expect = S_CLAIMED;
@@ -426,6 +435,80 @@ int64_t arena_find_slots(uint8_t *base, int64_t n, const uint64_t *klo, const ui
 /* #1424 Stufe 3: reader references. +1 pins a COMPLETE slot against eviction
  * (arena_evict_candidates skips refcount != 0), -1 releases. Returns how many
  * slots took the delta; a +1 on a slot that is not COMPLETE is refused (0). */
+/* #1427 DIRECT WRITES (Stufe 4): the writer DMAs its extents straight into
+ * slot_data instead of handing a host payload to arena_write. claim gives it
+ * the slot; complete merges its extents into the coverage list and flips the
+ * slot COMPLETE when every extent of the page is in. Several ranks (PP layer
+ * shards) claim the SAME key and each completes its own extents.
+ * claim status per key: 0 = claimed by this call (fresh), 1 = CLAIMED by an
+ * earlier writer (join: write your extents, then complete), 2 = already
+ * COMPLETE (nothing to write), 3 = too large, 4 = no free slot. gen_out is
+ * the slot generation to hand back to arena_complete. */
+int64_t arena_claim(uint8_t *base, int64_t n, const uint64_t *klo, const uint64_t *khi,
+                    const int64_t *totals, const char **stems, int64_t *slots_out,
+                    int64_t *gen_out, int8_t *status) {
+    ArenaHeader *h = hdr(base);
+    int64_t ok = 0;
+    for (int64_t i = 0; i < n; i++) {
+        uint64_t total = (uint64_t)totals[i];
+        slots_out[i] = -1; gen_out[i] = 0;
+        if (total > h->slot_bytes) { status[i] = 3; continue; }
+        int64_t slot = find_slot(base, klo[i], khi[i]);
+        int fresh = 0;
+        if (slot < 0) {
+            slot = claim_slot(base, klo[i], khi[i], total);
+            if (slot < 0) { status[i] = 4; continue; }
+            fresh = 1;
+        }
+        SlotHeader *sh = slot_hdr(base, (uint64_t)slot);
+        slots_out[i] = slot;
+        gen_out[i] = (int64_t)sh->generation;
+        if (atomic_load(&sh->state) == S_COMPLETE) { status[i] = 2; ok++; continue; }
+        if (stems && stems[i] && sh->stem[0] == 0) {
+            size_t sl = strlen(stems[i]);
+            if (sl >= STEM_CAP) sl = STEM_CAP - 1;
+            memcpy(sh->stem, stems[i], sl);
+            sh->stem[sl] = 0;
+        }
+        status[i] = fresh ? 0 : 1;
+        ok++;
+    }
+    return ok;
+}
+
+/* status per slot: 1 = completed by this call, 0 = extents merged, page not
+ * yet full (other writers pending), 2 = already COMPLETE, 3 = slot recycled
+ * (generation moved on) or interval overflow -- the writer's bytes are lost. */
+int64_t arena_complete(uint8_t *base, int64_t n, const int64_t *slots, const int64_t *gens,
+                       const int64_t *n_ext, const int64_t *ext_off, const int64_t *ext_len,
+                       int8_t *status) {
+    ArenaHeader *h = hdr(base);
+    int64_t ok = 0, e = 0;
+    for (int64_t i = 0; i < n; i++) {
+        int64_t k = n_ext[i];
+        SlotHeader *sh = slot_hdr(base, (uint64_t)slots[i]);
+        if ((int64_t)sh->generation != gens[i]) { status[i] = 3; e += k; continue; }
+        uint32_t st0 = atomic_load(&sh->state);
+        if (st0 == S_COMPLETE) { status[i] = 2; e += k; ok++; continue; }
+        if (st0 != S_CLAIMED) { status[i] = 3; e += k; continue; }  /* freed or evicting */
+        atomic_thread_fence(memory_order_release);
+        int mr = merge_ivals(sh, k, ext_off + e, ext_len + e, sh->total_bytes);
+        e += k;
+        if (mr < 0) { status[i] = 3; continue; }
+        if (mr == 0) { status[i] = 0; ok++; continue; }
+        uint32_t expect = S_CLAIMED;
+        if (atomic_compare_exchange_strong(&sh->state, &expect, S_COMPLETE)) {
+            atomic_fetch_add(&h->n_complete, 1);
+            atomic_fetch_sub(&h->n_claimed, 1);
+            status[i] = 1;
+        } else {
+            status[i] = 2;
+        }
+        ok++;
+    }
+    return ok;
+}
+
 int64_t arena_ref_slots(uint8_t *base, int64_t n, const int64_t *slots, int32_t delta) {
     int64_t done = 0;
     for (int64_t i = 0; i < n; i++) {
@@ -433,7 +516,10 @@ int64_t arena_ref_slots(uint8_t *base, int64_t n, const int64_t *slots, int32_t 
         SlotHeader *sh = slot_hdr(base, (uint64_t)slots[i]);
         if (delta > 0) {
             atomic_fetch_add(&sh->refcount, 1);
-            if (atomic_load(&sh->state) != S_COMPLETE) { atomic_fetch_sub(&sh->refcount, 1); continue; }
+            /* #1427: a writer's node references the slot from the claim on,
+             * before the page is COMPLETE -- CLAIMED slots take refs too. */
+            uint32_t st = atomic_load(&sh->state);
+            if (st != S_COMPLETE && st != S_CLAIMED) { atomic_fetch_sub(&sh->refcount, 1); continue; }
             atomic_store(&sh->clock_bit, 1);
         } else if (delta < 0) {
             if (atomic_load(&sh->refcount) > 0) atomic_fetch_sub(&sh->refcount, 1); else continue;
@@ -454,6 +540,7 @@ void arena_free_slots(uint8_t *base, int64_t n, const int64_t *slots) {
     for (int64_t i = 0; i < n; i++) {
         SlotHeader *sh = slot_hdr(base, (uint64_t)slots[i]);
         sh->key_lo = 0; sh->key_hi = 0;
+        sh->generation++;  /* #1427: a late arena_complete on this slot is refused */
         atomic_store(&sh->state, S_FREE);
     }
 }

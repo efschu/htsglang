@@ -485,6 +485,7 @@ class HybridCacheController(BaseHiCacheController):
         priority: Optional[int] = None,
         node_id: int = -1,
         extra_pools: Optional[list[PoolTransfer]] = None,
+        host_indices: Optional[torch.Tensor] = None,
     ) -> Optional[torch.Tensor]:
         # #760: THE OVERRIDE IS THE HOLE THE CRASH WENT THROUGH. The base
         # class asks device_tier_disarmed at enqueue; this override did not,
@@ -508,7 +509,8 @@ class HybridCacheController(BaseHiCacheController):
         # copy dies with a bare tensor-size RuntimeError.
         if self._refuse_unaddressable_kv_rows(device_indices, "write"):
             return None
-        host_indices = self.mem_pool_host.alloc(len(device_indices))
+        if host_indices is None:  # #1427: a direct write brings its arena slots along
+            host_indices = self.mem_pool_host.alloc(len(device_indices))
         if host_indices is None:
             return None
         pool_transfers = self._resolve_pool_transfers_allocation(

@@ -81,8 +81,7 @@ def test_kv_pool_id_space_and_in_place_read(tmp_path, monkeypatch):
     # writes and page reads never target arena ids
     with pytest.raises(RuntimeError):
         p.get_data_page(int(host[0]))
-    with pytest.raises(RuntimeError):
-        p.backup_from_device_all_layer(None, host[:2], torch.tensor([0, 1]), "kernel")
+    # #1427: a backup into arena ids is the direct write (covered in test 1427); nothing to raise
     # free releases the reader references (slot evictable again), ignores placeholders
     arena.ref_slots(slots, +1)
     assert p.free(host) == 2

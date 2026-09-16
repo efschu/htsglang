@@ -2923,10 +2923,17 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # With no floor (pools agree, single rank, no host tier) the eviction
         # retry runs exactly as before.
         kv_tokens = len(device_value)
-        host_avail = uniform_host_avail_for_backup(
+        # #1427 Stufe 4: with the arena bound, the host copy IS the arena
+        # slot -- claim one per page and DMA straight into it. No staging
+        # row, no ring, no store thread, no rebind. The mamba/draft aux
+        # pools still follow their own paths (extra_pools below).
+        _pre = self._weg2_direct_claim(node)
+        if _pre is False:
+            return 0
+        host_avail = 0 if _pre is not None else uniform_host_avail_for_backup(
             self, self.cache_controller.mem_pool_host
         )
-        if host_avail < kv_tokens:
+        if _pre is None and host_avail < kv_tokens:
             if uniform_host_floor_active(self):
                 self._1421_refused("host_floor", node)
                 return 0
@@ -2943,7 +2950,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # exhausted tier costs today -- but it is COUNTED and it is reached
         # without the rank-local `evict_host` above. `None` under the default
         # role skips the gate entirely.
-        ring = self.staging_write_ring
+        ring = self.staging_write_ring if _pre is None else None
         if ring is not None and not ring.admit(node.id, kv_tokens):
             self._1421_refused("staging_ring", node)
             return 0
@@ -2951,9 +2958,12 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         aux_xfers = [x for xfers in comp_xfers.values() for x in xfers]
         aux_xfers.extend(sidecar_xfers)
         host_indices = self.cache_controller.write(
-            device_value, node_id=node.id, extra_pools=aux_xfers or None
+            device_value, node_id=node.id, extra_pools=aux_xfers or None,
+            **({"host_indices": _pre} if _pre is not None else {}),
         )
         if host_indices is None:
+            if _pre is not None:
+                self._weg2_direct_abort(_pre)
             # #810: the write failed after the ring admitted it, so the page
             # never reaches the drain and its admission must not stay charged.
             if ring is not None:
@@ -2970,7 +2980,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # #645: charge the admission against the published floor, so the next
         # backup in THIS iteration decides against what is left rather than
         # against the iteration-start snapshot. No-op when no floor is active.
-        note_uniform_host_admitted(self, kv_tokens)
+        if _pre is None:
+            note_uniform_host_admitted(self, kv_tokens)
 
         # Commit
         kv_xfer = PoolTransfer(name=PoolName.KV, host_indices=host_indices)
@@ -3034,12 +3045,94 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             updated_nodes,
         )
 
+    # -- #1427 Stufe 4: direct writes ------------------------------------------
+    def _weg2_direct_pool(self):
+        cc = self.cache_controller
+        pool = getattr(cc, "mem_pool_host", None)
+        if getattr(pool, "arena", None) is None:
+            return None
+        try:
+            if not pool.ensure_bound(cc.storage_backend, role="kv"):
+                return None
+        except Exception:  # noqa: BLE001
+            return None
+        return pool
+
+    def _weg2_direct_claim(self, node):
+        """None = not a direct-write pool (take the staging path); False =
+        refused (counted); a tensor = the arena rows to write into."""
+        pool = self._weg2_direct_pool()
+        if pool is None:
+            return None
+        hashes = getattr(node, "hash_value", None)
+        dv = node.component_data[BASE_COMPONENT_TYPE].value
+        if not hashes or dv is None or len(hashes) * int(self.page_size) != int(dv.numel()):
+            self._1421_refused("direct_no_hashes", node)
+            return False
+        pre = pool.alloc_write(hashes)
+        if pre is None:
+            self._1421_refused("arena_claim", node)
+            return False
+        cc = self.cache_controller
+        dpool = getattr(cc, "mem_pool_host_draft", None)
+        if (dpool is not None and getattr(dpool, "row_slot", None) is not None
+                and cc.draft_tier_armed("write")):
+            try:
+                ok = dpool.alloc_write_draft(pre, hashes, cc._draft_component_name())
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("#1427 draft claim raised: %r", exc)
+                ok = False
+            if not ok:
+                pool.abort_write(pre)
+                self._1421_refused("draft_claim", node)
+                return False
+        return pre
+
+    def _weg2_direct_abort(self, rows) -> None:
+        cc = self.cache_controller
+        pool = getattr(cc, "mem_pool_host", None)
+        dpool = getattr(cc, "mem_pool_host_draft", None)
+        if getattr(dpool, "row_slot", None) is not None:
+            dpool.abort_write(rows)
+        if pool is not None:
+            pool.abort_write(rows)
+
+    def _weg2_direct_complete(self, node) -> bool:
+        """Ack of a direct write: this rank's extents are in the slot. Merge
+        the coverage (COMPLETE when every rank is in), take the reader
+        reference, and mark the node store-present -- the sweep has nothing
+        left to publish for it."""
+        cc = self.cache_controller
+        pool = getattr(cc, "mem_pool_host", None)
+        if getattr(pool, "arena", None) is None:
+            return False
+        hv = node.component_data[BASE_COMPONENT_TYPE].host_value
+        if hv is None or hv.numel() == 0 or int(hv.min()) < pool.staging_rows:
+            return False
+        done = pool.complete_write(hv)
+        dpool = getattr(cc, "mem_pool_host_draft", None)
+        if getattr(dpool, "row_slot", None) is not None:
+            try:
+                dpool.complete_write(hv)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("#1427 draft complete raised: %r", exc)
+        node.l3_present = True
+        n = getattr(self, "_1427_direct_n", 0) + 1
+        self._1427_direct_n = n
+        if n <= 8 or n % 256 == 0:
+            logger.info("#1427 DIRECT-WRITE ACK node=%s pages=%d completed_for_all=%d (n=%d)",
+                        getattr(node, "id", "?"), int(hv.numel()), done, n)
+        return True
+
     def _finish_write_through_ack(self, ack_id: int) -> None:
         lock_node, lock_params, publish_nodes = self.ongoing_write_through.pop(ack_id)
+        direct = set()
         for node in publish_nodes:
             if node.write_through_pending_id == ack_id:
                 node.write_through_pending_id = None
             self._record_store_event(node, medium=StorageMedium.CPU)
+            if self._weg2_direct_complete(node):
+                direct.add(id(node))
         if lock_params is not None:
             self.dec_lock_ref(lock_node, lock_params)
         # #810: end of the ADMITTED phase. The device->host copy has landed, so
@@ -3054,7 +3147,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             # Back up each fragment: after a split, lock_node only holds the
             # suffix; the prefix fragment must be persisted as well.
             for node in publish_nodes:
-                self.write_backup_storage(node)
+                if id(node) not in direct:  # #1427: a direct write is in the store already
+                    self.write_backup_storage(node)
 
     def _weg2_note_end_anchor(self, req, token_ids) -> None:
         """#1233 END-OF-PREFILL ANCHOR instrument, one line per finished request.

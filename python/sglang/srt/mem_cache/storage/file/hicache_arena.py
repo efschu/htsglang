@@ -93,6 +93,11 @@ def _load_lib() -> Optional[ctypes.CDLL]:
             lib.arena_stats.argtypes = [p_u8, p_i64]
             lib.arena_find_slots.restype = i64
             lib.arena_find_slots.argtypes = [p_u8, i64, p_u64, p_u64, p_i64, p_i8]
+            lib.arena_claim.restype = i64
+            lib.arena_claim.argtypes = [p_u8, i64, p_u64, p_u64, p_i64,
+                                        ctypes.POINTER(ctypes.c_char_p), p_i64, p_i64, p_i8]
+            lib.arena_complete.restype = i64
+            lib.arena_complete.argtypes = [p_u8, i64, p_i64, p_i64, p_i64, p_i64, p_i64, p_i8]
             lib.arena_ref_slots.restype = i64
             lib.arena_ref_slots.argtypes = [p_u8, i64, p_i64, ctypes.c_int32]
             lib.arena_data_offset.restype = i64
@@ -233,6 +238,37 @@ class ShmArena:
         st = (ctypes.c_int8 * n)()
         self._lib.arena_find_slots(self._base, n, lo, hi, slots, st)
         return [(int(slots[i]), int(st[i])) for i in range(n)]
+
+    def claim_slots(self, stems: Sequence[str], totals: Sequence[int]) -> list[tuple[int, int, int]]:
+        """#1427 direct writes: (slot, status, generation) per stem. status
+        0 = fresh claim, 1 = join an earlier writer's claim, 2 = already
+        COMPLETE, 3 = too large, 4 = no free slot (slot -1)."""
+        n = len(stems)
+        if n == 0:
+            return []
+        lo, hi = self._keys(stems)
+        c_tot = (ctypes.c_int64 * n)(*[int(t) for t in totals])
+        c_stems = (ctypes.c_char_p * n)(*[s.encode("utf-8") for s in stems])
+        slots = (ctypes.c_int64 * n)()
+        gens = (ctypes.c_int64 * n)()
+        st = (ctypes.c_int8 * n)()
+        self._lib.arena_claim(self._base, n, lo, hi, c_tot, c_stems, slots, gens, st)
+        return [(int(slots[i]), int(st[i]), int(gens[i])) for i in range(n)]
+
+    def complete_slots(self, slots: Sequence[int], gens: Sequence[int], extents) -> list[int]:
+        """#1427: merge this writer's extents (same shape for every slot) into
+        the coverage and flip COMPLETE when the page is full. status per slot:
+        1 completed now, 0 merged but not full, 2 already complete, 3 lost."""
+        n = len(slots)
+        if n == 0:
+            return []
+        ext = [tuple(extents)] * n
+        n_ext, c_off, c_len = self._extents(ext)
+        c_slots = (ctypes.c_int64 * n)(*[int(s) for s in slots])
+        c_gens = (ctypes.c_int64 * n)(*[int(g) for g in gens])
+        st = (ctypes.c_int8 * n)()
+        self._lib.arena_complete(self._base, n, c_slots, c_gens, n_ext, c_off, c_len, st)
+        return list(st)
 
     def ref_slots(self, slots: Sequence[int], delta: int) -> int:
         """Reader references: +1 pins COMPLETE slots against eviction, -1 releases.

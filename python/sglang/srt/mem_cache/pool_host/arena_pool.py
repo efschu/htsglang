@@ -28,6 +28,10 @@ from typing import Optional, Sequence
 
 import torch
 
+from sglang.jit_kernel.hicache import (
+    transfer_hicache_all_layer as jit_transfer_hicache_all_layer,
+)
+
 from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
 
 logger = logging.getLogger(__name__)
@@ -71,6 +75,20 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
         self._read_ph_next = 0
         self.id_space = self.staging_rows
         self.prefetch_capacity_tokens = None
+        # #1427 Stufe 4 (direct writes): the backend that names the keys, this
+        # rank's extents inside a page, the slots this pool still has to
+        # complete (slot -> (generation, fresh)), and the per-layer device
+        # pointers into the arena data region for the transfer kernel.
+        self._backend = None
+        self._write_extents: Optional[list] = None
+        self._page_bytes = 0
+        self._data_base = 0
+        self._k_off = 0
+        self._v_off = 0
+        self._cell = 0
+        self._pending: dict = {}
+        self.arena_k_ptrs = None
+        self.arena_v_ptrs = None
 
     # -- binding -----------------------------------------------------------
     def ensure_bound(self, storage_backend, role: str = "kv") -> bool:
@@ -85,6 +103,7 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
             if arena is None:
                 return False
             self.bind(arena, window, role=role)
+            self._backend = storage_backend
             return True
         except Exception as exc:  # noqa: BLE001 - loud, never silent
             logger.error("#1424 arena host pool bind failed (role=%s): %r", role, exc)
@@ -132,6 +151,10 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
         self._pin = bool(pin and torch.cuda.is_available())
         self._pin_base = int(buf.data_ptr()) + data_off
         self._pin_bytes = page_bytes
+        self._write_extents = [(k_off, k_len), (v_off, v_len)]
+        self._page_bytes = page_bytes
+        self._data_base = self._pin_base
+        self._k_off, self._v_off, self._cell = k_off, v_off, cell
         self._pinned = getattr(arena, "_pinned_slots", None)
         if self._pinned is None:
             self._pinned = arena._pinned_slots = torch.zeros(A, dtype=torch.bool)
@@ -260,10 +283,182 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
             element_dim=self.element_dim,
         )
 
+    # -- #1427 Stufe 4: direct writes, card -> arena slot -------------------------
+    def _stems(self, hashes, suffix: str = ""):
+        if suffix:
+            return [self._backend._get_suffixed_key(f"{h}.{suffix}") for h in hashes]
+        return [self._backend._get_suffixed_key(h) for h in hashes]
+
+    def _claim(self, stems):
+        """Claim (or join, or find complete) one slot per stem. Returns the
+        slot list, or None when a slot could not be had even after one
+        arena-to-disk eviction round; fresh claims of a failed batch are
+        freed again so the key is not poisoned."""
+        arena = self.arena
+        totals = [self._page_bytes] * len(stems)
+        got = arena.claim_slots(stems, totals)
+        if any(st in (3, 4) for _, st, _ in got):
+            ev = getattr(self._backend, "_arena_evict_to_disk", None)
+            if callable(ev) and any(st == 4 for _, st, _ in got):
+                try:
+                    ev(arena, max(256, len(stems)))
+                except Exception as exc:  # noqa: BLE001 - loud, the claim below decides
+                    logger.warning("#1427 arena evict-to-disk failed: %r", exc)
+                redo = [i for i, (_, st, _) in enumerate(got) if st == 4]
+                again = arena.claim_slots([stems[i] for i in redo], [self._page_bytes] * len(redo))
+                for i, g in zip(redo, again):
+                    got[i] = g
+            if any(st in (3, 4) for _, st, _ in got):
+                fresh = [s for s, st, _ in got if st == 0]
+                if fresh:
+                    arena.free_slots(fresh)
+                k = getattr(ArenaMHAHostPool, "_1427_full_n", 0) + 1
+                ArenaMHAHostPool._1427_full_n = k
+                if k <= 8 or k % 256 == 0:
+                    logger.warning("#1427 ARENA-CLAIM REFUSED n=%d pages=%d statuses=%s (4 = no free slot)",
+                                   k, len(stems), sorted({st for _, st, _ in got}))
+                return None
+        slots = []
+        for slot, st, gen in got:
+            if st == 2:
+                arena.ref_slots([slot], +1)      # complete already: reader reference only
+            else:
+                self._pending[slot] = (gen, st == 0)
+            slots.append(slot)
+        return slots
+
+    def alloc_write(self, hashes) -> Optional[torch.Tensor]:
+        """KV role: one arena slot per page hash, claimed for a direct write.
+        Returns the host ids (staging_rows + slot), or None."""
+        if self.arena is None or self._backend is None or not hashes:
+            return None
+        slots = self._claim(self._stems(hashes))
+        if slots is None:
+            return None
+        return torch.tensor([self.staging_rows + s for s in slots], dtype=torch.int64)
+
+    def alloc_write_draft(self, kv_host_indices: torch.Tensor, hashes, comp: str) -> bool:
+        """Draft role: claim the draft slot behind each KV arena row."""
+        if self.arena is None or self._backend is None or self.row_slot is None:
+            return False
+        slots = self._claim(self._stems(hashes, comp))
+        if slots is None:
+            return False
+        rows = (kv_host_indices.cpu() - self.staging_rows).tolist()
+        for r, s in zip(rows, slots):
+            self.row_slot[int(r)] = int(s)
+        return True
+
+    def _arena_ptrs(self, device):
+        if self.arena_k_ptrs is None or self.arena_k_ptrs.device != device:
+            L = int(self.layer_num)
+            self.arena_k_ptrs = torch.tensor(
+                [self._data_base + self._k_off + l * self._cell for l in range(L)],
+                dtype=torch.uint64, device=device)
+            self.arena_v_ptrs = torch.tensor(
+                [self._data_base + self._v_off + l * self._cell for l in range(L)],
+                dtype=torch.uint64, device=device)
+        return self.arena_k_ptrs, self.arena_v_ptrs
+
+    def _backup_arena(self, device_pool, slots: torch.Tensor, device_indices: torch.Tensor) -> None:
+        """This rank's K and V extents of every page go straight from the
+        card into the slot (one all-layer kernel, the arena as the host
+        buffer: per-layer pointers, page stride)."""
+        if slots.numel() == 0:
+            return
+        self.pin_slots(slots)
+        dev = device_pool.k_buffer[0].device
+        k_ptrs, v_ptrs = self._arena_ptrs(dev)
+        jit_transfer_hicache_all_layer(
+            k_ptr_dst=k_ptrs,
+            v_ptr_dst=v_ptrs,
+            indices_dst=slots.to(device=dev, dtype=torch.int64),
+            k_ptr_src=device_pool.k_data_ptrs,
+            v_ptr_src=device_pool.v_data_ptrs,
+            indices_src=device_indices.to(device=dev, dtype=torch.int64),
+            kv_cache_dst_stride_bytes=self._page_bytes,
+            kv_cache_src_stride_bytes=self.token_stride_size,
+            element_size=self.element_dim * self.dtype.itemsize,
+        )
+
     def backup_from_device_all_layer(self, device_pool, host_indices, device_indices, io_backend):
-        if self.arena is not None and host_indices.numel() and int(host_indices.max()) >= self.staging_rows:
-            raise RuntimeError("#1424 backup targets must be staging rows, not arena ids")
-        return super().backup_from_device_all_layer(device_pool, host_indices, device_indices, io_backend)
+        if self.arena is None or host_indices.numel() == 0:
+            return super().backup_from_device_all_layer(device_pool, host_indices, device_indices, io_backend)
+        hi = host_indices.cpu()
+        S, A = self.staging_rows, self.arena_slots
+        is_arena = (hi >= S) & (hi < S + A)
+        if not bool(is_arena.any()):
+            return super().backup_from_device_all_layer(device_pool, host_indices, device_indices, io_backend)
+        sel = is_arena.nonzero(as_tuple=True)[0]
+        rows = (hi[sel] - S).tolist()
+        if self.row_slot is not None:   # draft role: KV row -> draft slot
+            pairs = [(self.row_slot.get(int(r), -1), i) for r, i in zip(rows, sel.tolist())]
+        else:
+            pairs = [(int(r), i) for r, i in zip(rows, sel.tolist())]
+        todo = [(s, i) for s, i in pairs if s >= 0 and s in self._pending]
+        if todo:
+            slots = torch.tensor([s for s, _ in todo], dtype=torch.int64)
+            didx = device_indices.cpu()[torch.tensor([i for _, i in todo], dtype=torch.int64)]
+            self._backup_arena(device_pool, slots, didx)
+        rest = (~is_arena).nonzero(as_tuple=True)[0]
+        if rest.numel():
+            super().backup_from_device_all_layer(
+                device_pool, host_indices[rest.to(host_indices.device)],
+                device_indices[rest.to(device_indices.device)], io_backend)
+
+    def _slots_of(self, host_indices: torch.Tensor):
+        hi = host_indices.cpu()
+        S, A = self.staging_rows, self.arena_slots
+        rows = hi[(hi >= S) & (hi < S + A)] - S
+        if self.row_slot is not None:
+            return [self.row_slot.get(int(r), -1) for r in rows.tolist()]
+        return rows.tolist()
+
+    def complete_write(self, host_indices: torch.Tensor) -> int:
+        """The copy landed (ack): merge this rank's extents into the pages'
+        coverage, take the node's reader reference. Returns how many pages
+        this call completed for everyone."""
+        if self.arena is None:
+            return 0
+        slots = [s for s in self._slots_of(host_indices) if s >= 0 and s in self._pending]
+        if not slots:
+            return 0
+        gens = [self._pending[s][0] for s in slots]
+        st = self.arena.complete_slots(slots, gens, self._write_extents)
+        done = 0
+        for s, r in zip(slots, st):
+            self._pending.pop(s, None)
+            if r == 3:
+                k = getattr(ArenaMHAHostPool, "_1427_lost_n", 0) + 1
+                ArenaMHAHostPool._1427_lost_n = k
+                if k <= 8 or k % 256 == 0:
+                    logger.warning("#1427 ARENA-COMPLETE LOST slot=%d (recycled under the writer) n=%d", s, k)
+                continue
+            done += int(r == 1)
+        self.arena.ref_slots([s for s, r in zip(slots, st) if r != 3], +1)
+        return done
+
+    def abort_write(self, host_indices: torch.Tensor) -> None:
+        """The write never happened: free fresh claims, drop joins, release
+        references taken on complete pages."""
+        if self.arena is None:
+            return
+        fresh, refd = [], []
+        for s in self._slots_of(host_indices):
+            if s < 0:
+                continue
+            p = self._pending.pop(s, None)
+            if p is None:
+                refd.append(s)
+            elif p[1]:
+                fresh.append(s)
+        if fresh:
+            self.arena.free_slots(fresh)
+        if refd:
+            self.arena.ref_slots(refd, -1)
+        if self.row_slot is not None:
+            for r in (host_indices.cpu() - self.staging_rows).tolist():
+                self.row_slot.pop(int(r), None)
 
     # -- page accessors ---------------------------------------------------------
     def get_data_page(self, index, flat: bool = True):
@@ -294,6 +489,12 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
                 slots = [s for s in slots if s >= 0]
             else:
                 slots = rows
+            pend = [s for s in slots if s in self._pending]
+            if pend:
+                fresh = [s for s in pend if self._pending.pop(s)[1]]
+                if fresh:
+                    self.arena.free_slots(fresh)
+                slots = [s for s in slots if s not in pend]
             if slots:
                 self.arena.ref_slots(slots, -1)
             freed += len(rows)

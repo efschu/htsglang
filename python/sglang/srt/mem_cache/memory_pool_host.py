@@ -2104,8 +2104,8 @@ class HostPoolGroup:
 
     def __getattr__(self, name):
         # only reached for attributes the group does not define itself
-        if name == "alloc_read":
-            fn = getattr(self.anchor_entry.host_pool, "alloc_read", None)
+        if name in ("alloc_read", "alloc_write", "complete_write", "abort_write", "pin_slots"):
+            fn = getattr(self.anchor_entry.host_pool, name, None)
             if callable(fn):
                 return fn
         raise AttributeError(name)
