@@ -32,3 +32,15 @@ def test_batched_scales_equal_the_per_expert_loop():
         loop = torch.stack([marlin_permute_scales(s[e], size_k, size_n, group_size) for e in range(E)])
         batched = marlin_moe_permute_scales(s, size_k, size_n, group_size)
         assert batched.shape == loop.shape and torch.equal(batched, loop), (size_k, group_size)
+
+
+def test_torch_zero_point_path_is_bit_identical_to_numpy():
+    from sglang.srt.layers.quantization.marlin_utils import awq_to_marlin_zero_points_torch
+
+    g = torch.Generator().manual_seed(2)
+    for num_bits, size_n, size_k in ((4, 256, 12), (8, 128, 7)):
+        pf = 32 // num_bits
+        packed = torch.randint(-(2**31), 2**31 - 1, (size_k, size_n // pf), generator=g, dtype=torch.int32)
+        ref = awq_to_marlin_zero_points(packed, size_k, size_n, num_bits)
+        got = awq_to_marlin_zero_points_torch(packed, size_k, size_n, num_bits)
+        assert got.dtype == ref.dtype and got.device == ref.device and torch.equal(got, ref), num_bits
