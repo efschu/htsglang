@@ -2370,8 +2370,33 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     "--cpu-offload-gb or --offload-group-size: generic layer "
                     "offload would stage the pinned PLE embedding back to the device."
                 )
+            _ple_backend = getattr(self.server_args, "ple_offload_backend", "pinned")
+            if _ple_backend == "file" and _ple is False:
+                raise ValueError(
+                    "--ple-offload-backend file requires --ple-offload-embedding: "
+                    "the file-backed table is the offloaded table."
+                )
             if _is_qwen4_exp:
-                self.model_config.hf_text_config.ple_offload_embedding = bool(_ple)
+                _tc = self.model_config.hf_text_config
+                _tc.ple_offload_embedding = bool(_ple)
+                _tc.ple_offload_backend = _ple_backend
+                _ple_dir = getattr(self.server_args, "ple_offload_dir", None)
+                if _ple_backend == "file":
+                    from sglang.srt.models.qwen4_exp_ple_table import (
+                        check_file_backend_supported,
+                        default_ple_table_dir,
+                    )
+
+                    _ple_dir = _ple_dir or default_ple_table_dir(
+                        self.server_args.model_path
+                    )
+                    if _ple and self.device == "cuda":
+                        check_file_backend_supported(
+                            torch.cuda.current_device()
+                            if torch.cuda.is_available()
+                            else 0
+                        )
+                _tc.ple_offload_dir = _ple_dir
 
         # This can reduce thread conflicts and speed up weight loading.
         if self.device != "cpu":

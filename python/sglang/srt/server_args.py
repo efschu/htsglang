@@ -4712,6 +4712,21 @@ class ServerArgs:
             action=argparse.BooleanOptionalAction,
         ),
     ] = None
+    ple_offload_backend: A[
+        str,
+        Arg(
+            help="#39126: host storage for the offloaded Qwen4 PLE n-gram table. "
+            "'pinned' (default) uses CPU pinned memory. 'file' maps a sparse file under "
+            "--ple-offload-dir and lets the gather kernel read it directly (upstream: "
+            "unified-memory devices only, cudaDevAttrPageableMemoryAccessUsesHostPageTables).",
+            choices=["pinned", "file"],
+        ),
+    ] = "pinned"
+    ple_offload_dir: A[
+        Optional[str],
+        "#39126: directory for the file-backed PLE table when --ple-offload-backend is 'file'. "
+        "Defaults to $SGLANG_CACHE_DIR/ple/<model path>; the file is sparse and reused across restarts.",
+    ] = None
     offload_group_size: A[int, "Number of layers per group in offloading."] = -1
     offload_num_in_group: A[
         int,
