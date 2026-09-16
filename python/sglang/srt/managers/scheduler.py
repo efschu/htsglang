@@ -15674,6 +15674,11 @@ class Scheduler(
 
     def on_idle(self):
         """Idle housekeeping: guard, check, metrics, reset, sleep."""
+        # #1450: a seam-digest refusal graded behind the wake surfaces here.
+        _wu_chk = getattr(getattr(self, "weight_updater", None),
+                          "_weg2_raise_pending_seam_refusal", None)
+        if _wu_chk is not None:
+            _wu_chk()
         if not self.is_fully_idle():
             # #547: no batch to run, but work is queued somewhere (waiting
             # queue, grammar, disagg, hicache drain). That is the loaded path

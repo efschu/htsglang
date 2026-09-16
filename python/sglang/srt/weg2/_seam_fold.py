@@ -72,7 +72,11 @@ LANE1_ODD = 0x9E3779B97F4A7C15 - (1 << 64)  # signed image of the golden ratio
 #: block in device memory for the index vector plus the product, so this is the
 #: knob that bounds the grader's own VRAM footprint during a flip -- when the
 #: card is at its tightest, which is exactly when the exchange runs.
-DEFAULT_CHUNK_BYTES = 4 << 20
+#: #1450: 16 MiB by default (was 4): the fold's cost on the host is the
+#: Python loop -- ~10 launches per block -- and 9.6 GiB/rank at 4 MiB is 2400
+#: blocks per reading; at 16 MiB it is 600.  The cached index pair grows to
+#: 2 x 16 MiB per device.  SGLANG_WEG2_SEAM_CHUNK_BYTES overrides.
+DEFAULT_CHUNK_BYTES = int(__import__("os").environ.get("SGLANG_WEG2_SEAM_CHUNK_BYTES", str(16 << 20)) or (16 << 20))
 
 
 def _torch():

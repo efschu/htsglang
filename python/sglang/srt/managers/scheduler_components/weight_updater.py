@@ -550,6 +550,9 @@ class SchedulerWeightUpdaterManager:
     #: once (cache) so the worker does not re-walk the model per tag.
     _weg2_seam_after_parts: Optional[dict] = None
     _weg2_seam_after_threads: Optional[list] = None  # #1437: slots=True dataclass, the field must be declared
+    #: #1450: a seam-digest refusal graded BEHIND the wake -- raised at this
+    #: rank's next leg or idle tick, never lost.  slots=True: declared here.
+    weg2_seam_pending_refusal: Optional[BaseException] = None
     _weg2_seam_leg_inventory: Any = None
     #: True once the resume loop has collected tag by tag, so the once-per-wake
     #: entry stands down instead of injecting a second time over bytes already
@@ -4541,6 +4544,51 @@ class SchedulerWeightUpdaterManager:
                 ).line(),
             )
             return
+        _epoch = getattr(recv_req, "epoch", None)
+        _kw = dict(before=before, inventory=inventory, skipped=skipped, walked=walked,
+                   group=group, rank=rank, card=card, weights_tags=weights_tags, epoch=_epoch)
+        _threads = list(getattr(self, "_weg2_seam_after_threads", None) or [])
+        if os.environ.get("SGLANG_WEG2_SEAM_DIGEST_DEFER", "1") == "1" and _threads:
+            # #1450: the whole grade -- join, assemble, compare, verdict --
+            # leaves the wake RPC.  py-spy on TP0 (boot weg2xsn206, flip P->D):
+            # 47 % of the samples sat in the fold while the wake was on the
+            # clock.  A refusal is parked on the object and raised at this
+            # rank's next leg or idle tick (RAENGE-NIE-UNEINS still crashes,
+            # later and named); the wake answers now.
+            self._weg2_seam_after_threads = []
+            import threading as _threading
+
+            def _finish():
+                for _th in _threads:
+                    try:
+                        _th.join(timeout=60.0)
+                    except Exception:  # noqa: BLE001
+                        pass
+                try:
+                    _refusal = self._weg2_seam_digest_finish(**_kw)
+                except BaseException as exc:  # noqa: BLE001 -- the grade itself failed: that IS a refusal
+                    _refusal = exc
+                if _refusal is not None:
+                    self.weg2_seam_pending_refusal = _refusal
+                    logger.error("WEG2-SEAM-DIGEST DEFERRED REFUSAL epoch=%s: %s -- raised at this rank's "
+                                 "next leg or idle tick (#1450)", _epoch, _refusal)
+
+            _threading.Thread(target=_finish, name=f"seam-finish-{_epoch}", daemon=True).start()
+            logger.info("WEG2-SEAM-DIGEST stage=after DEFERRED behind the wake (#1450): %d part "
+                        "thread(s) are joined, assembled and compared on a worker; the RPC returns now",
+                        len(_threads))
+            return
+        refusal = self._weg2_seam_digest_finish(**_kw)
+        if refusal is not None:
+            raise refusal
+
+    def _weg2_seam_digest_finish(self, *, before, inventory, skipped, walked,
+                                 group, rank, card, weights_tags, epoch):
+        """#1450: join the per-tag part threads, assemble the AFTER reading,
+        compare, log -- and RETURN the refusal instead of raising it, so the
+        caller decides whether it lands on the RPC (sync form) or on this
+        rank's next leg / idle tick (deferred form).  Body unchanged from the
+        pre-#1450 tail of _weg2_seam_digest_after."""
         after = None
         # #1437: the after-part readings may still be running on side threads
         for _th in list(getattr(self, "_weg2_seam_after_threads", None) or []):
@@ -4571,7 +4619,7 @@ class SchedulerWeightUpdaterManager:
                 after = seam_digest.SeamReading(
                     stage="after", group=str(group), rank=int(rank), card=int(card),
                     tags=tuple(str(t) for t in weights_tags),
-                    epoch=getattr(recv_req, "epoch", None),
+                    epoch=epoch,
                     pieces=tuple(_by_key[k] for k in _keys), ms=_ms,
                     walked=len(inventory) + len(skipped),
                     skipped=tuple((str(n), str(r)) for n, r in skipped),
@@ -4592,7 +4640,7 @@ class SchedulerWeightUpdaterManager:
             rank=rank,
             card=card,
             tags=weights_tags,
-            epoch=getattr(recv_req, "epoch", None),
+            epoch=epoch,
             skipped=skipped,
             walked=walked,
         )
@@ -4602,8 +4650,17 @@ class SchedulerWeightUpdaterManager:
         refusal = verdict.refusal()
         if refusal is not None:
             self.weg2_seam_ref = None
-            raise refusal
+            return refusal
         self.weg2_seam_ref = after
+        return None
+
+    def _weg2_raise_pending_seam_refusal(self) -> None:
+        """#1450: a refusal graded behind the wake is raised here -- called at
+        the head of every Weg-2 leg and from the scheduler's idle tick."""
+        pending = getattr(self, "weg2_seam_pending_refusal", None)
+        if pending is not None:
+            self.weg2_seam_pending_refusal = None
+            raise pending
 
     def _weg2_shadow_source_leg(self, recv_req) -> None:
         """SOURCE hook, sleep leg.  Placed BEFORE the pause loop, not after it.
@@ -5962,6 +6019,7 @@ class SchedulerWeightUpdaterManager:
         # precede the assert too -- a repeat arrives with the group in whatever
         # state the first attempt left it, and refusing there would turn a safe
         # no-op into a group death.
+        self._weg2_raise_pending_seam_refusal()  # #1450
         replay = self._weg2_leg_replay("release", recv_req)
         _weg2_ph_t = [time.perf_counter()]
         _weg2_ph_l = []
@@ -6477,6 +6535,7 @@ class SchedulerWeightUpdaterManager:
         # #1285: see the release leg.  This one is the sharper case -- the wake's
         # very first mutation below drops each tag from the offload set, which
         # raises KeyError on a repeat, so without this the retry kills the group.
+        self._weg2_raise_pending_seam_refusal()  # #1450
         replay = self._weg2_leg_replay("resume", recv_req)
         _weg2_ph_t = [time.perf_counter()]
         _weg2_ph_l = []
