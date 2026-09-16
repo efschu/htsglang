@@ -315,6 +315,33 @@ class CompressedTensorsConfig(QuantizationConfig):
 
             if not vocab_is_quantized(getattr(self, "config", None) or {}, prefix):
                 return UnquantizedEmbeddingMethod()
+            # pack-quantized group vocab (AutoRound / llm-compressor writes
+            # weight_packed + group weight_scale, e.g. Minachist's INT8 g128
+            # embed_tokens and lm_head): the head is a GEMM and takes the
+            # Marlin linear scheme; the table is gathered and dequantized per
+            # row. Anything else stays on the per-row int8 method (#727).
+            from sglang.srt.layers.quantization.compressed_tensors.ct_embedding import (
+                CompressedTensorsPackedEmbeddingMethod,
+            )
+            from sglang.srt.layers.quantization.compressed_tensors.schemes import (
+                CompressedTensorsWNA16,
+            )
+            from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
+
+            scheme = None
+            try:
+                scheme = self.get_linear_scheme(layer=layer, layer_name=prefix)
+            except Exception:
+                scheme = None
+            if isinstance(scheme, CompressedTensorsWNA16):
+                if isinstance(layer, ParallelLMHead):
+                    layer.scheme = scheme
+                    return CompressedTensorsLinearMethod(self)
+                return CompressedTensorsPackedEmbeddingMethod(
+                    num_bits=scheme.src_num_bits,
+                    group_size=scheme.group_size,
+                    symmetric=scheme.symmetric,
+                )
             return CompressedTensorsEmbeddingMethod()
 
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
