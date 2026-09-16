@@ -888,12 +888,22 @@ def note_walk_node(census, keys, key_tokens, page_size, accepted) -> bool:
         cgen = None
     page = max(1, int(page_size or 1))
     saw_cross = False
-    for i, k in enumerate(keys):
-        t = min(page, tokens - i * page)
-        if t <= 0:
-            break
+    # #1435 (xsn196 py-spy, PP0): this loop ran once per KEY of every walked
+    # node -- 4096 keys per node, ~25 nodes per 100k prefix, two walks per
+    # chunk -- and was 9.4 % of the prefill loop, growing with the prefix.
+    # A node is written by ONE producer in ONE adoption, so the first and
+    # the last key classify it; the tokens are credited in one lump each.
+    # Same fields, same arithmetic, O(1) per node.
+    n_keys = len(keys)
+    probe = [keys[0]] if n_keys == 1 else [keys[0], keys[-1]]
+    for k in probe:
         note_consult(k, accepted=bool(accepted))
-        if not accepted:
+    if not accepted:
+        return False
+    head_t = min(page, tokens)
+    tail_t = max(0, tokens - head_t)
+    for k, t in ((keys[0], head_t), (keys[-1], tail_t)):
+        if t <= 0:
             continue
         producer = producer_phase_of(k, cgen)
         census.note_accepted_tokens(t, producer, adoption_source_of(k))

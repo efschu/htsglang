@@ -2789,16 +2789,18 @@ class HiCacheController:
             # into them is a StrayHostIndexError that hung the read 8 min.
             # An honest miss instead.
             return 0
+        _t0 = time.perf_counter()
         stems = [self.storage_backend._get_suffixed_key(k) for k in hash_values]
         found = pool.arena.find_slots(stems)
+        _t1 = time.perf_counter()
         slots = []
         for i, (slot, state) in enumerate(found):
             if slot < 0 or state != 2:
                 # #1433: not in the L2 -- ask the L3. A page on disk is read
                 # straight into a fresh slot and completed; only then is the
                 # prefix really over.
-                fill = self.storage_backend.arena_fill_from_disk(
-                    pool.arena, [stems[i]], int(pool._page_bytes))[0]
+                _fill_fn = getattr(self.storage_backend, "arena_fill_from_disk", None)
+                fill = _fill_fn(pool.arena, [stems[i]], int(pool._page_bytes))[0] if callable(_fill_fn) else None
                 if fill is None:
                     break
                 slot = fill
@@ -2807,10 +2809,21 @@ class HiCacheController:
             slots.append(slot)
         if not slots:
             return 0
+        _t2 = time.perf_counter()
         pool.resolve_rows(host_indices, slots)
+        _t3 = time.perf_counter()
         for _ in slots:
             if not operation.increment(self.page_size):
                 break
+        # #1436 instrument: where the re-admission of a long prompt spends
+        # its time on the read side (xsn196: ~9 s per 100k prompt on D).
+        _acc = getattr(self, "_1436_acc", None)
+        if _acc is None:
+            _acc = self._1436_acc = [0, 0.0, 0.0, 0.0, 0]
+        _acc[0] += 1; _acc[1] += _t1 - _t0; _acc[2] += _t2 - _t1; _acc[3] += _t3 - _t2; _acc[4] += len(slots)
+        if _acc[0] <= 4 or _acc[0] % 512 == 0:
+            logger.info("#1436 ARENA-GET calls=%d pages=%d find_ms=%.0f ref_ms=%.0f resolve+pin_ms=%.0f",
+                        _acc[0], _acc[4], _acc[1] * 1000, _acc[2] * 1000, _acc[3] * 1000)
         return len(slots)
 
     def _generic_page_get(self, operation, hash_values, host_indices, extra_info=None):
@@ -3724,8 +3737,8 @@ class HiCacheController:
             flags, slots, hits = [], [], 0
             for i, (slot, state) in enumerate(found):
                 if slot < 0 or state != 2:  # #1433: L3 -> L2 for the draft page too
-                    fill = self.storage_backend.arena_fill_from_disk(
-                        dpool.arena, [stems[i]], int(dpool._page_bytes))[0]
+                    _fill_fn = getattr(self.storage_backend, "arena_fill_from_disk", None)
+                    fill = _fill_fn(dpool.arena, [stems[i]], int(dpool._page_bytes))[0] if callable(_fill_fn) else None
                     if fill is not None:
                         slot, state = fill, 2
                 ok = slot >= 0 and state == 2 and dpool.arena.ref_slots([slot], +1) == 1

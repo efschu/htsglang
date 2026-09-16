@@ -3687,13 +3687,36 @@ class SchedulerWeightUpdaterManager:
             items = self._weg2_seam_after_part_items(tag, inventory, _nw_keys, _w_names)
             if not items:
                 return
-            part = seam_digest.take_reading(
-                "after-part", items, group=self._weg2_group_name(),
-                rank=self._weg2_rank(), card=self._weg2_device_index(),
-                tags=[str(tag)], epoch=None, budget_s=0.0)
-            parts[str(tag)] = (part, {p.identity.key: p for p in part.pieces})
-            logger.info("WEG2-SEAM-DIGEST stage=after-part tag=%s pieces=%d ms=%.0f",
-                        tag, len(part.pieces), part.ms)
+            _grp, _rk, _card = self._weg2_group_name(), self._weg2_rank(), self._weg2_device_index()
+
+            def _run(_items=items, _tag=str(tag), _parts=parts):
+                try:
+                    part = seam_digest.take_reading(
+                        "after-part", _items, group=_grp, rank=_rk, card=_card,
+                        tags=[_tag], epoch=None, budget_s=0.0)
+                    _parts[_tag] = (part, {p.identity.key: p for p in part.pieces})
+                    logger.info("WEG2-SEAM-DIGEST stage=after-part tag=%s pieces=%d ms=%.0f",
+                                _tag, len(part.pieces), part.ms)
+                except Exception as exc:  # noqa: BLE001 -- an observer never takes the leg down
+                    logger.info("WEG2-SEAM-DIGEST stage=after-part tag=%s FAILED %s: %s",
+                                _tag, type(exc).__name__, exc)
+
+            # #1437 (xsn196, D wake leg 1800 ms of which ~100 ms per tag was
+            # THIS reading, on the critical path of every resume): the
+            # after-part digest is an observer, the pieces it reads are
+            # resident and static until the next sleep -- take it on a side
+            # thread and join before the verdict. SGLANG_WEG2_SEAM_DIGEST_ASYNC=0
+            # keeps it inline.
+            if os.environ.get("SGLANG_WEG2_SEAM_DIGEST_ASYNC", "1") == "1":
+                import threading as _threading
+                th = _threading.Thread(target=_run, name=f"seam-after-{tag}", daemon=True)
+                lst = getattr(self, "_weg2_seam_after_threads", None)
+                if lst is None:
+                    lst = self._weg2_seam_after_threads = []
+                lst.append(th)
+                th.start()
+            else:
+                _run()
         except Exception as exc:  # noqa: BLE001 -- an observer never takes the leg down
             logger.info("WEG2-SEAM-DIGEST stage=after-part tag=%s FAILED %s: %s",
                         tag, type(exc).__name__, exc)
@@ -4470,6 +4493,13 @@ class SchedulerWeightUpdaterManager:
             )
             return
         after = None
+        # #1437: the after-part readings may still be running on side threads
+        for _th in list(getattr(self, "_weg2_seam_after_threads", None) or []):
+            try:
+                _th.join(timeout=60.0)
+            except Exception:  # noqa: BLE001
+                pass
+        self._weg2_seam_after_threads = []
         _parts = getattr(self, "_weg2_seam_after_parts", None) or {}
         if _parts and _weg2_seam_per_tag_armed():
             _by_key = {}

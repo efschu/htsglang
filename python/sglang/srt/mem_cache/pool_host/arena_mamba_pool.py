@@ -21,6 +21,7 @@ place at prefetch time.
 from __future__ import annotations
 
 import logging
+import os
 from typing import Optional, Sequence
 
 import torch
@@ -151,6 +152,23 @@ class ArenaMambaPoolHost(MambaPoolHost):
         self._pinned = getattr(arena, "_pinned_slots", None)
         if self._pinned is None:
             self._pinned = arena._pinned_slots = torch.zeros(A, dtype=torch.bool)
+        if self._pin and os.environ.get("SGLANG_HICACHE_ARENA_PREPIN", "1") == "1" and not bool(self._pinned.all()):
+            # #1436: the whole mamba arena registered once at bind (see arena_pool.bind)
+            import time as _time
+            from sglang.srt.mem_cache.pool_host.arena_pool import _CUDA_HOST_REGISTER_FLAGS, _CUDA_ERROR_ALREADY_REGISTERED
+            t0 = _time.perf_counter()
+            cudart = torch.cuda.cudart()
+            total = A * slot_bytes
+            step = max(slot_bytes, ((1 << 30) // slot_bytes) * slot_bytes)
+            off = 0
+            while off < total:
+                n = min(step, total - off)
+                rc = cudart.cudaHostRegister(self._pin_base + off, n, _CUDA_HOST_REGISTER_FLAGS)
+                if int(rc) not in (0, _CUDA_ERROR_ALREADY_REGISTERED):
+                    raise RuntimeError(f"#1436 cudaHostRegister(mamba arena {off}+{n}) failed: {int(rc)}")
+                off += n
+            self._pinned[:] = True
+            logger.info("#1436 mamba arena pre-pinned: %.2f GiB in %.1f s", total / (1 << 30), _time.perf_counter() - t0)
         self.arena = arena
         self.arena_slots = A
         self.id_space = self.staging_rows + A + PLACEHOLDERS
