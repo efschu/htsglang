@@ -9442,11 +9442,13 @@ def build_parser() -> argparse.ArgumentParser:
     # against the disk (max_size >= P pool bytes, W57). The two knobs below are
     # the only ones the disk form has, and both have a stated default.
     ap.add_argument(
-        "--pin-ledger-arm-m", type=int, default=600,
+        "--pin-ledger-arm-m", type=int, default=2400,
         help="#1317/#1318: PIN the host-ledger arm's mamba-host-pool size M (MiB) "
-             "instead of letting `host_ledger.choose` pick it. 0 = choose. Default 600 "
-             "since 2026-09-15 (12-13 host anchor slots per rank; M=150 gave 4 and "
-             "dropped the next prefetch on xsn127). "
+             "instead of letting `host_ledger.choose` pick it. 0 = choose. Default 2400 "
+             "since 2026-09-16 (#1414, boot xsn163: at M=600 = 13 host anchor slots PP2 "
+             "answered PP0's told=4095 with 'anchor_pool_exhausted' during 3 x 100k and "
+             "the told mismatch stopped P; 600 gave 12-13 slots since 2026-09-15, M=150 "
+             "gave 4 and dropped the next prefetch on xsn127). "
              "WHY IT EXISTS: #1318 derived the host ring multipliers from rows x cell "
              "bytes (D 6.0 -> 3.00 GB/S, P 2.0 -> 1.78), which frees 3.12 GiB at every "
              "arm and moves `choose` from M=600 to M=1200 -- the arm boot weg2dk5 was "
