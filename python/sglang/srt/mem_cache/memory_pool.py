@@ -921,6 +921,19 @@ def check_cpu_copy_layers(found: int, expected: int, direction: str, what: str) 
 
 
 class MambaPool:
+    # Axis of each two-dimensional conv state that represents the sliding window.
+    # Upstream states use (dim, K-1); subclasses may preserve another layout.
+    conv_window_axis = -1
+
+    # Slot-lifecycle side states (see ple_state_pool.SlotIndexedState);
+    # class-level default because UnifiedMambaPool skips MambaPool.__init__.
+    _slot_siblings: Tuple = ()
+
+    def register_slot_state(self, state) -> None:
+        """Attach a state that rides along on clear / copy / host round-trip,
+        so a slot never changes owner with a stale sibling row attached."""
+        self._slot_siblings = [*self._slot_siblings, state]
+
     @dataclass(frozen=True, kw_only=True)
     class State:
         conv: List[torch.Tensor]
@@ -1415,6 +1428,11 @@ class MambaPool:
 
     def clear_slots(self, indices: torch.Tensor):
         """Zero out mamba state at the given pool indices. Must run on forward stream."""
+        # #37500 port: slot-lifecycle siblings (PLE short-conv / n-gram rows)
+        # are cleared with the slot; the upstream fused-clear fast path
+        # (mamba_slot_fused) is not on this line and is left out.
+        for sibling in self._slot_siblings:
+            sibling.reset_slots(indices)
         if not _is_npu:
             need_size = len(indices)
             for i in range(len(self.mamba_cache.conv)):
@@ -1463,6 +1481,8 @@ class MambaPool:
         ]
         if self.replayssm_write_pos is not None:
             self.replayssm_write_pos[dst_indices] = 0
+        for sibling in self._slot_siblings:
+            sibling.copy_slots(src_indices, dst_indices)
 
     def export_state_blob(self, slot: int):
         """One session's GDN/Mamba state as an OPAQUE blob (#364).
@@ -1585,11 +1605,25 @@ class MambaPool:
         temporal_cpu = self.mamba_cache.temporal[:, indices].to(
             "cpu", non_blocking=True
         )
+        siblings_cpu = [s.get_cpu_slots(indices) for s in self._slot_siblings]
         current_platform.synchronize()
+        if self._slot_siblings:
+            return conv_cpu, temporal_cpu, siblings_cpu
         return conv_cpu, temporal_cpu
 
     def load_cpu_copy(self, mamba_cache_cpu, indices):
-        conv_cpu, temporal_cpu = mamba_cache_cpu
+        # The trailing element exists exactly when this instance registered siblings:
+        # the pool that saved the copy is the pool that loads it.
+        siblings_cpu = None
+        if self._slot_siblings:
+            siblings_cpu = mamba_cache_cpu[-1]
+            mamba_cache_cpu = mamba_cache_cpu[:-1]
+        # Accept historical 3-tuples, but request-keyed replay scratch is not
+        # restored with a physical checkpoint slot.
+        if len(mamba_cache_cpu) == 3:
+            conv_cpu, temporal_cpu, _ = mamba_cache_cpu
+        else:
+            conv_cpu, temporal_cpu = mamba_cache_cpu
         # #861c: the conv list was sized by the SOURCE pool's mamba-layer count;
         # the loop below enumerates the DESTINATION's. Under a phase flip those
         # differ, and neither direction of the mismatch reports itself.
@@ -1611,6 +1645,9 @@ class MambaPool:
         self.mamba_cache.temporal[:, indices] = temporal_cpu.to(
             self.mamba_cache.temporal.device, non_blocking=True
         )
+        if siblings_cpu is not None:
+            for sibling, data in zip(self._slot_siblings, siblings_cpu):
+                sibling.load_cpu_slots(data, indices)
         current_platform.synchronize()
 
     def get_contiguous_buf_infos(self):
@@ -1855,6 +1892,11 @@ class HybridReqToTokenPool(ReqToTokenPool):
         enable_linear_replayssm: bool = False,
         linear_replayssm_cache_len: int = 16,
         mamba_envelope_layout: bool = False,
+        enable_linear_replayssm_spec: bool = False,
+        short_conv_layer_ids: Optional[List[int]] = None,
+        short_conv_state_shape: Optional[Tuple[int, int]] = None,
+        ngram_context_len: int = 0,
+        ngram_eos_token_id: int = 0,
     ):
         super().__init__(
             size=size,
@@ -1876,6 +1918,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
         self.layer_transfer_counter = None
         # #904: set only by a stack whose counter has a step per mamba layer.
         self._mamba_transfer_frame: Optional[int] = None
+        self.ple_window_cache = None
         self._init_mamba_pool(
             mamba_size=mamba_size,
             mamba_spec_state_size=mamba_spec_state_size,
@@ -1888,6 +1931,11 @@ class HybridReqToTokenPool(ReqToTokenPool):
             enable_linear_replayssm=enable_linear_replayssm,
             linear_replayssm_cache_len=linear_replayssm_cache_len,
             mamba_envelope_layout=mamba_envelope_layout,
+            enable_linear_replayssm_spec=enable_linear_replayssm_spec,
+            short_conv_layer_ids=short_conv_layer_ids,
+            short_conv_state_shape=short_conv_state_shape,
+            ngram_context_len=ngram_context_len,
+            ngram_eos_token_id=ngram_eos_token_id,
         )
 
     def _init_mamba_pool(
@@ -1903,6 +1951,11 @@ class HybridReqToTokenPool(ReqToTokenPool):
         enable_linear_replayssm: bool = False,
         linear_replayssm_cache_len: int = 16,
         mamba_envelope_layout: bool = False,
+        enable_linear_replayssm_spec: bool = False,
+        short_conv_layer_ids: Optional[List[int]] = None,
+        short_conv_state_shape: Optional[Tuple[int, int]] = None,
+        ngram_context_len: int = 0,
+        ngram_eos_token_id: int = 0,
     ):
         self.mamba_pool = MambaPool(
             size=mamba_size,
@@ -1931,6 +1984,36 @@ class HybridReqToTokenPool(ReqToTokenPool):
         attach_state_set_activity_probe(self.mamba_pool, self.mamba_allocator)
         self.mamba_map = {layer_id: i for i, layer_id in enumerate(mamba_layer_ids)}
 
+        # Qwen4-Exp PLE side states; built disabled rather than None without a config,
+        # so every hybrid model has both attributes.
+        from sglang.srt.mem_cache.ple_state_pool import NGramPool, ShortConvPool
+
+        self.short_conv_pool = ShortConvPool(
+            size=mamba_size,
+            spec_state_size=mamba_spec_state_size,
+            state_shape=short_conv_state_shape,
+            layer_ids=short_conv_layer_ids or [],
+            dtype=cache_params.dtype.conv,
+            device=device,
+            enable_memory_saver=self.enable_memory_saver,
+            speculative_num_draft_tokens=speculative_num_draft_tokens,
+        )
+        self.ngram_pool = NGramPool(
+            size=mamba_size,
+            spec_state_size=mamba_spec_state_size,
+            context_len=ngram_context_len,
+            eos_token_id=ngram_eos_token_id,
+            device=device,
+            enable_memory_saver=self.enable_memory_saver,
+            speculative_num_draft_tokens=speculative_num_draft_tokens,
+        )
+        # Disabled pools stay off the sibling list so the host-offload payload
+        # keeps its legacy shape for every non-PLE hybrid model.
+        if self.short_conv_pool.enabled:
+            self.mamba_pool.register_slot_state(self.short_conv_pool)
+        if self.ngram_pool.enabled:
+            self.mamba_pool.register_slot_state(self.ngram_pool)
+
         # Optional int8 checkpoint pool: the radix caches states here (int8) instead
         # of holding them in the active bf16 pool -> ~2x cached-prefix capacity at
         # fixed memory. Strategy-agnostic (no_buffer / extra_buffer / spec).
@@ -1944,6 +2027,15 @@ class HybridReqToTokenPool(ReqToTokenPool):
             mamba_layer_ids=mamba_layer_ids,
             device=device,
         )
+        if self.mamba_ckpt_pool is not None and (
+            self.short_conv_pool.enabled or self.ngram_pool.enabled
+        ):
+            # The int8 checkpoint pool frees the bf16 slot after donating its state,
+            # taking the bf16-slot-indexed PLE side states with it.
+            raise ValueError(
+                "--enable-int8-mamba-checkpoint is incompatible with Qwen4-Exp "
+                "PLE side states"
+            )
 
         self.device = device
         req_pool_size = self.req_to_token.shape[0]
@@ -2190,6 +2282,39 @@ class HybridReqToTokenPool(ReqToTokenPool):
         # joined to compute in one direction only.
         self._wait_for_mamba_layer(layer_id)
         return self.mamba_pool.mamba2_layer_cache(self.mamba_map[layer_id])
+
+    def short_conv_layer_cache(self, layer_id: int) -> torch.Tensor:
+        # #37500 port: upstream waits on the LOCAL index; this line's counter
+        # is keyed by GLOBAL layer id (#904/#1206), so join the same way the
+        # GDN read above does.
+        self._wait_for_mamba_layer(layer_id)
+        return self.short_conv_pool.layer_cache(layer_id)
+
+    def short_conv_layer_intermediate_cache(
+        self, layer_id: int
+    ) -> Optional[torch.Tensor]:
+        return self.short_conv_pool.layer_intermediate_cache(layer_id)
+
+    def get_ngram_context(self, ngram_indices: torch.Tensor) -> torch.Tensor:
+        return self.ngram_pool.get_context(ngram_indices)
+
+    def set_ngram_context(
+        self, ngram_indices: torch.Tensor, context: torch.Tensor
+    ) -> None:
+        self.ngram_pool.set_context(ngram_indices, context)
+
+    def set_ngram_intermediate_context(self, context: torch.Tensor) -> None:
+        self.ngram_pool.set_intermediate_context(context)
+
+    def copy_mamba_state(
+        self, src_index: torch.Tensor, dst_index: torch.Tensor
+    ) -> None:
+        if src_index.numel() == 0:
+            return
+        # #37500 port: join the load stream at the last mamba layer (global id
+        # frame, see _wait_for_mamba_layer) before copying slot contents.
+        self._wait_for_mamba_layer(max(self.mamba_map))
+        self.mamba_pool.copy_from(src_index, dst_index)
 
     def get_speculative_mamba2_params_all_layers(self) -> MambaPool.SpeculativeState:
         return self.mamba_pool.get_speculative_mamba2_params_all_layers()
@@ -2514,6 +2639,8 @@ class HybridReqToTokenPool(ReqToTokenPool):
         # per-slot metadata would make a flushed server behave differently
         # from a freshly started one.
         self.mamba_pool.reset_state()
+        self.short_conv_pool.clear()
+        self.ngram_pool.clear()
         # The int8 checkpoint pool holds radix-cached states in its own slots; a
         # flush/reset drops the radix tree, so its slots must be released too,
         # otherwise the (now unreferenced) slots leak and break the int8-pool

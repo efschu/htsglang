@@ -327,6 +327,41 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         # value: readers only ever read flags.
         self.assertEqual(self._publish(sa).dtype, "auto")
 
+    def test_qwen4_rejects_pd_and_unified_memory(self):
+        qwen4 = ("Qwen4ExpForConditionalGeneration", "qwen4_exp")
+        for kwargs, message in (
+            ({"disaggregation_mode": "prefill"}, "PD disaggregation"),
+            ({"disaggregation_mode": "decode"}, "PD disaggregation"),
+            ({"enable_unified_memory": True}, "enable-unified-memory"),
+        ):
+            with self.subTest(**kwargs):
+                with self.assertRaisesRegex(ValueError, message):
+                    self._construct(*qwen4, **kwargs)
+
+    def test_qwen4_ple_offload_default(self):
+        qwen4 = ("Qwen4ExpForConditionalGeneration", "qwen4_exp")
+        with override_platform(is_cuda=True):
+            for kwargs, expected in (
+                ({}, True),
+                ({"dtype": "float16"}, False),
+                ({"ple_offload_embedding": False}, False),
+                ({"ple_offload_embedding": False, "cpu_offload_gb": 1}, False),
+            ):
+                with self.subTest(kwargs=kwargs):
+                    self.assertEqual(
+                        self._resolved(
+                            self._construct(*qwen4, **kwargs),
+                            "ple_offload_embedding",
+                        ),
+                        expected,
+                    )
+            with self.assertRaisesRegex(ValueError, "cannot be combined"):
+                self._construct(*qwen4, cpu_offload_gb=1)
+        with override_platform(is_cuda=False, is_hip=True):
+            self.assertFalse(
+                self._resolved(self._construct(*qwen4), "ple_offload_embedding")
+            )
+
     def test_minimax_m2_enables_tf32_matmul(self):
         sa = self._construct("MiniMaxM2ForCausalLM", "llama")
         self.assertTrue(sa.enable_tf32_matmul)  # materialized

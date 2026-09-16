@@ -6,8 +6,21 @@ The Triton kernels migrated here live in this package
 KV-cache index/write kernels went to the ``kvcache`` group instead.
 """
 
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
 from sglang.kernels.registry import register_kernel
-from sglang.kernels.spec import KernelBackend, KernelSpec
+from sglang.kernels.selector import get_kernel
+from sglang.kernels.spec import (
+    CapabilityRequirement,
+    FormatSignature,
+    KernelBackend,
+    KernelSpec,
+)
+
+if TYPE_CHECKING:
+    import torch
 
 # (module, public_fn) migrated from layers/attention/triton_ops + model_executor.
 _TRITON_KERNELS = [

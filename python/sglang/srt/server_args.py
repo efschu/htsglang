@@ -235,6 +235,7 @@ SPECULATIVE_DRAFT_MODEL_QUANTIZATION_CHOICES = QUANTIZATION_CHOICES
 ATTENTION_BACKEND_CHOICES = [
     # Common
     "triton",
+    "qsa",  # #37500: Qwen sparse attention (Qwen3.8-Flash-Next)
     "torch_native",
     "flex_attention",
     "dsa",
@@ -4702,6 +4703,15 @@ class ServerArgs:
     # Offloading
     # -------------------------------------------------------------------------
     cpu_offload_gb: A[int, "How many GBs of RAM to reserve for CPU offloading."] = 0
+    ple_offload_embedding: A[
+        Optional[bool],
+        Arg(
+            help="#37500: offload the Qwen4-Exp PLE n-gram embedding table (51B rows) to "
+            "CPU pinned memory (or a file-backed table, see --ple-offload-backend). "
+            "Default: enabled for bf16 Qwen4-Exp on CUDA; --no-ple-offload-embedding disables.",
+            action=argparse.BooleanOptionalAction,
+        ),
+    ] = None
     offload_group_size: A[int, "Number of layers per group in offloading."] = -1
     offload_num_in_group: A[
         int,
@@ -15058,6 +15068,7 @@ class ServerArgs:
             "Qwen3_5MoeForConditionalGeneration",
             "InternS2PreviewForConditionalGeneration",
             "Qwen3_5ForConditionalGeneration",
+            "Qwen4ExpForConditionalGeneration",
         ]:
             # The quantization/moe_runner_backend resolution moved to the
             # override registry (arg_groups/overrides.py:
@@ -18049,6 +18060,7 @@ class ServerArgs:
             "Qwen3VLMoeForConditionalGeneration",
             "Qwen3_5ForConditionalGeneration",
             "Qwen3_5MoeForConditionalGeneration",
+            "Qwen4ExpForConditionalGeneration",
             "InternS2PreviewForConditionalGeneration",
             "Qwen3OmniMoeForConditionalGeneration",
             "Qwen2AudioForConditionalGeneration",

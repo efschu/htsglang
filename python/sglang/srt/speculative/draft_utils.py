@@ -1,5 +1,8 @@
 import logging
+from typing import Optional
 
+from sglang.srt.layers.attention.qsa.config import QSA_VARIANT_COMPRESSED, QSAProfile
+from sglang.srt.runtime_context import attention_backends, get_spec
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.common import (
     cpu_has_amx_support,
@@ -20,12 +23,18 @@ class DraftBackendFactory:
         draft_model_runner,
         topk: int,
         speculative_num_steps: int,
+        seed_dsa_topk_from_draft_extend: bool = False,
+        qsa_profile: Optional[QSAProfile] = None,
     ):
         self.server_args = server_args
         self.draft_model_runner = draft_model_runner
         self.topk = topk
         self.speculative_num_steps = speculative_num_steps
         self.draft_attn_backend = server_args.speculative_draft_attention_backend
+        self.seed_dsa_topk_from_draft_extend = seed_dsa_topk_from_draft_extend
+        self.qsa_profile = qsa_profile
+        # The draft runner's own backend, not the process-wide config.
+        self.draft_attn_backend = draft_model_runner.draft_attention_backend
 
     def _create_backend(
         self, backend_name: str, backend_map: dict, error_template: str
@@ -47,6 +56,9 @@ class DraftBackendFactory:
         # No multi-step draft backend for steps=0 (nospec) or steps=1.
         if self.speculative_num_steps <= 1:
             return None
+
+        if self.qsa_profile is not None:
+            return self._create_qwen_qsa_decode_backend()
 
         backend_map = {
             "flashinfer": self._create_flashinfer_decode_backend,
@@ -74,6 +86,9 @@ class DraftBackendFactory:
         )
 
     def create_draft_extend_backend(self):
+        if self.qsa_profile is not None:
+            return self._create_qwen_qsa_draft_extend_backend()
+
         backend_map = {
             "flashinfer": self._create_flashinfer_prefill_backend,
             "triton": self._create_triton_prefill_backend,
@@ -103,6 +118,39 @@ class DraftBackendFactory:
             backend_map,
             "EAGLE is not supported in attention backend {backend_type}",
         )
+
+    @staticmethod
+    def _stamp_qsa(backend) -> None:
+        backend.prefill_attention_backend_str = "qsa"
+        backend.decode_attention_backend_str = "qsa"
+
+    def _create_qwen_qsa_draft_extend_backend(self):
+        if self.qsa_profile.variant != QSA_VARIANT_COMPRESSED:
+            # Tokenwise QSA has no graph-stable indexer metadata: draft extend
+            # stays eager instead of falling back to a dense backend.
+            return None
+        from sglang.srt.layers.attention.qwen_sparse_attn_backend import (
+            QwenSparseAttnBackend,
+        )
+
+        # The draft is full-attention only: give it a QSA backend of its own
+        # instead of the hybrid wrapper whose linear side has no draft layers.
+        backend = QwenSparseAttnBackend(self.draft_model_runner)
+        self._stamp_qsa(backend)
+        return backend
+
+    def _create_qwen_qsa_decode_backend(self):
+        from sglang.srt.layers.attention.qwen_sparse_attn_backend import (
+            QwenSparseMultiStepDraftBackend,
+        )
+
+        backend = QwenSparseMultiStepDraftBackend(
+            self.draft_model_runner, self.topk, self.speculative_num_steps
+        )
+        self._stamp_qsa(backend)
+        for child in backend.attn_backends:
+            self._stamp_qsa(child)
+        return backend
 
     def _create_dsa_decode_backend(self):
         from sglang.srt.layers.attention.dsa_backend import (

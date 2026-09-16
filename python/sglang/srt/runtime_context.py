@@ -972,4 +972,84 @@ def reset_context() -> None:
     _CONTEXT.resources = Resources()
     _CONTEXT.forward = ForwardFlags()
     _LANE_SCOPE.set(_NO_LANE)
+
+
+# ---------------------------------------------------------------------------
+# #37500 port (Qwen3.8-Flash-Next): upstream split ServerArgs into accessor
+# groups (get_exec / get_spec / get_memory / get_model / get_platform). This
+# line keeps ONE flat ServerArgs, so the groups are views on it. Only the
+# nested ``get_exec().offload.*`` shape needs a real object; everything else
+# reads the same attribute names off the flat ServerArgs.
+# ---------------------------------------------------------------------------
+
+
+class _OffloadView:
+    """``get_exec().offload`` -- the three flags the PLE offload check reads."""
+
+    __slots__ = ("_sa",)
+
+    def __init__(self, server_args: Any) -> None:
+        self._sa = server_args
+
+    @property
+    def ple_offload_embedding(self) -> Optional[bool]:
+        return getattr(self._sa, "ple_offload_embedding", None)
+
+    @property
+    def cpu_offload_gb(self) -> int:
+        return int(getattr(self._sa, "cpu_offload_gb", 0) or 0)
+
+    @property
+    def offload_group_size(self) -> int:
+        return int(getattr(self._sa, "offload_group_size", -1) or -1)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._sa, name)
+
+
+class _ExecView:
+    """``get_exec()``: flat ServerArgs plus the nested ``offload`` group."""
+
+    __slots__ = ("_sa", "offload")
+
+    def __init__(self, server_args: Any) -> None:
+        self._sa = server_args
+        self.offload = _OffloadView(server_args)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._sa, name)
+
+
+def get_exec() -> Any:
+    return _ExecView(get_server_args())
+
+
+def get_spec() -> ServerArgs:
+    return get_server_args()
+
+
+def get_memory() -> ServerArgs:
+    return get_server_args()
+
+
+def get_model() -> ServerArgs:
+    return get_server_args()
+
+
+def get_lora() -> ServerArgs:
+    return get_server_args()
+
+
+def get_platform() -> Any:
+    from sglang.srt.platforms import current_platform
+
+    return current_platform
+
+
+def attention_backends(cfg: Any = None) -> tuple:
+    """(prefill, decode) attention backends of ``cfg`` (default: the published
+    ServerArgs); split fields fall back to the base backend."""
+    from sglang.srt.arg_groups.overrides import attention_backends_of
+
+    return attention_backends_of(cfg if cfg is not None else get_server_args())
     _PARALLEL_OVERRIDES.set({})

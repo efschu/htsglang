@@ -1008,6 +1008,61 @@ def _qwen3_5_hybrid_overrides(server_args: Any, hf_config: Any) -> dict:
     }
 
 
+@_register_for("Qwen4ExpForConditionalGeneration")
+def _qwen4_exp_overrides(server_args: Any, hf_config: Any) -> dict:
+    """#37500 port of arg_groups/model_overrides/qwen4_exp.py (Qwen3.8-Flash-Next).
+
+    Compressed QSA owns ``page_size`` (compressed slot = full_slot // ratio,
+    every backend needs page-aligned pages), the PLE n-gram table defaults to
+    the host offload on CUDA/bf16, and a MoE checkpoint never runs its dense
+    parts at moe_dense_tp_size == 1.
+    """
+    overrides: Dict[str, Any] = {}
+
+    if getattr(server_args, "ple_offload_embedding", None) is None:
+        import torch
+
+        overrides["ple_offload_embedding"] = (
+            is_cuda() and server_args.get_model_config().dtype == torch.bfloat16
+        )
+
+    text_config = getattr(hf_config, "text_config", hf_config)
+    if (
+        getattr(text_config, "num_experts", None) is not None
+        and getattr(server_args, "moe_dense_tp_size", None) == 1
+    ):
+        overrides["moe_dense_tp_size"] = None
+
+    if is_sm100_supported() and server_args.attention_backend is None:
+        sm100_default_attn_backend = "triton"
+        default_attn_backend = server_args._get_default_attn_backend(
+            use_mla_backend=server_args.use_mla_backend(),
+            model_config=server_args.get_model_config(),
+        )
+        if default_attn_backend == "trtllm_mha" and not (
+            not mamba_extra_buffer_of(resolved_view(server_args))
+            and not server_args.disable_radix_cache
+            and server_args.speculative_algorithm is None
+        ):
+            sm100_default_attn_backend = "trtllm_mha"
+        overrides["attention_backend"] = sm100_default_attn_backend
+        overrides["page_size"] = 64 if sm100_default_attn_backend == "trtllm_mha" else 1
+
+    from sglang.srt.layers.attention.qsa.config import (
+        QSA_VARIANT_COMPRESSED,
+        parse_qsa_profile,
+    )
+
+    profile = parse_qsa_profile(hf_config)
+    if profile is not None and profile.variant == QSA_VARIANT_COMPRESSED:
+        overrides["page_size"] = 64
+        logger.info(
+            "Setting page size to 64 for compressed QSA "
+            "(full//ratio compressed addressing)."
+        )
+    return overrides
+
+
 @_register_for("Qwen3VLForConditionalGeneration")
 def _qwen3vl_overrides(server_args: Any, hf_config: Any) -> dict:
 
@@ -1156,6 +1211,7 @@ _MAMBA_RADIX_CACHE_ARCHS = frozenset(
         "Qwen3_5MoeForConditionalGeneration",
         "InternS2PreviewForConditionalGeneration",
         "Qwen3_5ForConditionalGeneration",
+        "Qwen4ExpForConditionalGeneration",
         "MiniCPMV4_6ForConditionalGeneration",
         "NemotronHForCausalLM",
         "NemotronHPuzzleForCausalLM",
@@ -1175,6 +1231,7 @@ _MAMBA_EXTRA_BUFFER_ARCHS = frozenset(
         "Qwen3_5ForConditionalGeneration",
         "Qwen3_5MoeForConditionalGeneration",
         "Qwen3NextForCausalLM",
+        "Qwen4ExpForConditionalGeneration",
         "InternS2PreviewForConditionalGeneration",
         "MiniCPMV4_6ForConditionalGeneration",
         "BailingMoeV2_5ForCausalLM",
@@ -1569,6 +1626,7 @@ _FLASHINFER_ALLREDUCE_FUSION_ARCHS = frozenset(
         "Qwen3MoeForCausalLM",
         "Qwen3VLMoeForConditionalGeneration",
         "Qwen3NextForCausalLM",
+        "Qwen4ExpForConditionalGeneration",
         "KimiK25ForConditionalGeneration",
         "Qwen3_5MoeForConditionalGeneration",
         "InternS2PreviewForConditionalGeneration",

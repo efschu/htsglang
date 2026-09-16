@@ -2348,6 +2348,31 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 self.tp_rank,
             )
 
+        # #37500 port (load_model_utils hunk): the PLE n-gram table offload
+        # flag is read by the model off its text config; only Qwen4-Exp has
+        # such a table, and generic layer offload would stage the pinned
+        # table back to the device.
+        if not self.is_draft_worker:
+            _archs = self.model_config.hf_config.architectures or []
+            _is_qwen4_exp = "Qwen4ExpForConditionalGeneration" in _archs
+            _ple = getattr(self.server_args, "ple_offload_embedding", None)
+            if _ple and not _is_qwen4_exp:
+                raise ValueError(
+                    "--ple-offload-embedding only supports "
+                    "Qwen4ExpForConditionalGeneration"
+                )
+            if _ple and (
+                int(getattr(self.server_args, "cpu_offload_gb", 0) or 0) > 0
+                or int(getattr(self.server_args, "offload_group_size", -1) or -1) > 0
+            ):
+                raise ValueError(
+                    "--ple-offload-embedding cannot be combined with "
+                    "--cpu-offload-gb or --offload-group-size: generic layer "
+                    "offload would stage the pinned PLE embedding back to the device."
+                )
+            if _is_qwen4_exp:
+                self.model_config.hf_text_config.ple_offload_embedding = bool(_ple)
+
         # This can reduce thread conflicts and speed up weight loading.
         if self.device != "cpu":
             torch.set_num_threads(1)

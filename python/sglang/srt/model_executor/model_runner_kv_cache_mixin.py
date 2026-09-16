@@ -3812,7 +3812,24 @@ class ModelRunnerKVCacheMixin:
                         pre_alloc_size=pre_alloc_size,
                     )
             elif config := self.mambaish_config:
+                # #37500 port: Qwen4-Exp PLE side states (short conv + n-gram
+                # window) ride on the mamba slots of THIS stage's layers.
+                from sglang.srt.configs.qwen4_exp import Qwen4ExpTextConfig
+
+                _ple_kwargs = {}
+                if isinstance(config, Qwen4ExpTextConfig):
+                    _ple_kwargs = dict(
+                        short_conv_layer_ids=[
+                            i
+                            for i in config.short_conv_layer_ids
+                            if self.start_layer <= i < self.end_layer
+                        ],
+                        short_conv_state_shape=config.short_conv_state_shape,
+                        ngram_context_len=config.ngram_context_len,
+                        ngram_eos_token_id=int(config.eos_token_id),
+                    )
                 self.req_to_token_pool = HybridReqToTokenPool(
+                    **_ple_kwargs,
                     size=max_num_reqs,
                     mamba_size=self.server_args.max_mamba_cache_size,
                     mamba_spec_state_size=max_num_reqs,
@@ -4473,7 +4490,37 @@ class ModelRunnerKVCacheMixin:
                     stage_owned_layer_ids,
                 )
 
-                self.token_to_kv_pool = HybridLinearKVPool(
+                # #37500 port: Qwen4-Exp compressed QSA carries its index-K
+                # and compressed K/V beside the full KV of the same slots.
+                from sglang.srt.layers.attention.qsa.config import (
+                    QSA_VARIANT_COMPRESSED,
+                    parse_qsa_profile,
+                )
+
+                _qsa_profile = parse_qsa_profile(self.model_config.hf_config)
+                if _qsa_profile is None:
+                    _kv_pool_class = HybridLinearKVPool
+                    extra_args["use_mla"] = self.use_mla_backend
+                elif _qsa_profile.variant != QSA_VARIANT_COMPRESSED:
+                    raise ValueError(
+                        f"QSA variant {_qsa_profile.variant!r} is not carried on "
+                        "this line (only the compressed variant is)."
+                    )
+                else:
+                    from sglang.srt.mem_cache.qsa_kv_pool import QSATokenToKVPool
+
+                    _kv_pool_class = QSATokenToKVPool
+                    extra_args.update(
+                        qsa_index_kv_heads=_qsa_profile.kv_heads,
+                        qsa_index_head_dim=_qsa_profile.head_dim,
+                        qsa_compress_ratio=_qsa_profile.compress_ratio,
+                        qsa_token_topk=_qsa_profile.budget,
+                        num_request_slots=self.req_to_token_pool.req_to_token.shape[
+                            0
+                        ],
+                    )
+
+                self.token_to_kv_pool = _kv_pool_class(
                     page_size=self.page_size,
                     size=_b1_size,
                     dtype=self.kv_cache_dtype,
@@ -4506,7 +4553,6 @@ class ModelRunnerKVCacheMixin:
                     enable_kv_cache_copy=(
                         self.server_args.speculative_algorithm is not None
                     ),
-                    use_mla=self.use_mla_backend,
                     start_layer=self.start_layer,
                     full_kv_pool_class=mha_pool_class,
                     post_capture_active=(

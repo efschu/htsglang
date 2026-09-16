@@ -56,6 +56,10 @@ _is_npu = is_npu()
 
 logger = logging.getLogger(__name__)
 
+# #37500 port: upstream's fused Triton vocab-parallel embedding kernel is not on
+# this line; _use_triton_embedding() gates on it and falls back to mask+gather.
+fused_vocab_parallel_embedding = None
+
 
 def pad_vocab_size(vocab_size: int, pad_to: int = DEFAULT_VOCAB_PADDING_SIZE) -> int:
     """Pad the vocab size to the given value."""
@@ -233,6 +237,7 @@ class VocabParallelEmbedding(torch.nn.Module):
         embedding_dim: int,
         *,
         params_dtype: Optional[torch.dtype] = None,
+        output_dtype: Optional[torch.dtype] = None,
         org_num_embeddings: Optional[int] = None,
         padding_size: int = DEFAULT_VOCAB_PADDING_SIZE,
         quant_config: Optional[QuantizationConfig] = None,
@@ -243,6 +248,7 @@ class VocabParallelEmbedding(torch.nn.Module):
     ):
         super().__init__()
         self.quant_config = quant_config
+        self.output_dtype = output_dtype
 
         self.enable_tp = enable_tp
         self.use_attn_tp_group = use_attn_tp_group
@@ -623,6 +629,72 @@ class VocabParallelEmbedding(torch.nn.Module):
             loaded_weight = loaded_weight.narrow(output_dim, start_idx, shard_size)
         param[: loaded_weight.shape[0]].data.copy_(loaded_weight)
         param[loaded_weight.shape[0] :].data.fill_(0)
+
+    def _use_triton_embedding(self, input_: torch.Tensor) -> bool:
+        """Whether the fused Triton kernel can replace the mask+gather+fill unit."""
+        if fused_vocab_parallel_embedding is None or _is_npu:
+            return False
+        if self.tp_size == 1:
+            return False
+        if not isinstance(self.quant_method, UnquantizedEmbeddingMethod):
+            return False
+        if not input_.is_cuda or not input_.is_contiguous():
+            return False
+        if input_.dtype not in (torch.int32, torch.int64):
+            return False
+        return (
+            self.weight.is_cuda
+            and self.weight.ndim == 2
+            and self.weight.stride(1) == 1
+            and self.weight.dtype in (torch.float16, torch.bfloat16, torch.float32)
+        )
+
+    def _embed_local_shard(self, input_: torch.Tensor) -> torch.Tensor:
+        """Embed against the local vocab shard; out-of-shard rows are zero
+        (identity when tp_size == 1).
+
+        The output must be allocated inside the symmetric-memory context so
+        the caller's all-reduce can use it; the mask temporaries and the
+        in-place fill deliberately stay outside the pool.
+        """
+        symm_alloc = use_symmetric_memory(
+            get_tp_group(), disabled=not is_allocation_symmetric()
+        )
+        if self.tp_size == 1:
+            with symm_alloc:
+                output_parallel = self.quant_method.embedding(self, input_.long())
+            if self.output_dtype is not None:
+                output_parallel = output_parallel.to(self.output_dtype)
+            return output_parallel
+        if self._use_triton_embedding(input_):
+            with symm_alloc:
+                output_parallel = fused_vocab_parallel_embedding(
+                    input_,
+                    self.weight,
+                    self.shard_indices.org_vocab_start_index,
+                    self.shard_indices.org_vocab_end_index,
+                    self.shard_indices.num_org_vocab_padding,
+                    self.shard_indices.added_vocab_start_index,
+                    self.shard_indices.added_vocab_end_index,
+                )
+            if self.output_dtype is not None:
+                output_parallel = output_parallel.to(self.output_dtype)
+            return output_parallel
+        # Map out-of-shard ids to index 0, gather, then zero those rows.
+        masked_input, input_mask = get_masked_input_and_mask(
+            input_,
+            self.shard_indices.org_vocab_start_index,
+            self.shard_indices.org_vocab_end_index,
+            self.shard_indices.num_org_vocab_padding,
+            self.shard_indices.added_vocab_start_index,
+            self.shard_indices.added_vocab_end_index,
+        )
+        with symm_alloc:
+            output_parallel = self.quant_method.embedding(self, masked_input.long())
+        if self.output_dtype is not None:
+            output_parallel = output_parallel.to(self.output_dtype)
+        output_parallel.masked_fill_(input_mask.unsqueeze(-1), 0)
+        return output_parallel
 
     def forward(self, input_):
         # Surface a bad token id (>= vocab_size, or a negative / unmasked sentinel) as a
