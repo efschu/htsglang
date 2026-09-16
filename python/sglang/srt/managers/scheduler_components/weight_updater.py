@@ -3641,8 +3641,19 @@ class SchedulerWeightUpdaterManager:
             _nw = getattr(self, "_weg2_xchg_no_write", None) or frozenset()
             _nw_keys = {(str(t), str(n)) for (t, n) in _nw}
             _w_names = {str(idn.name) for idn, _t in inventory if str(idn.tag) == "weights"}
+            # #1405 (boots xsn136/xsn141-class without the coverage tracer): a
+            # NO-WRITE piece of another tag is an ALIAS of a target tensor
+            # whose memory lives in the `weights` region -- resumed by the
+            # main thread while this digest runs on the collect thread. Read
+            # before that resume it is an unmapped address (xsn136: D TP0
+            # "after-part tag=weights_draft FAILED ... illegal memory
+            # access", then the BAR1 poll died). The tracer only hid the race
+            # by slowing this thread down. Alias pieces are graded under
+            # `weights`, where the clause below already includes them.
             items = [(idn, t) for idn, t in inventory
-                     if str(idn.tag) == str(tag)
+                     if (str(idn.tag) == str(tag)
+                         and (str(tag) == "weights"
+                              or (str(idn.tag), str(idn.name)) not in _nw_keys))
                      or (str(tag) == "weights"
                          and ((str(idn.tag), str(idn.name)) in _nw_keys
                               or (str(idn.tag) == "weights_draft"
