@@ -3069,6 +3069,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         if not hasattr(mp, "arena_resolve_reads"):
             return None
         try:
+            if getattr(mp, "_weg2_parts", None) is None:  # #1427c: hand over at the point of use
+                mp._weg2_parts = getattr(cc, "_weg2_mamba_window_parts", None)
             if not mp.ensure_bound(cc.storage_backend):
                 return None
         except Exception:  # noqa: BLE001

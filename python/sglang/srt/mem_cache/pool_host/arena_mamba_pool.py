@@ -182,7 +182,13 @@ class ArenaMambaPoolHost(MambaPoolHost):
     def is_placeholder(self, i: int) -> bool:
         return int(i) >= self.staging_rows + self.arena_slots
 
-    def alloc_read(self, n: int) -> torch.Tensor:
+    def alloc_read(self, n: int) -> Optional[torch.Tensor]:
+        # #1427c (xsn189, D): an UNBOUND pool must not hand out placeholders --
+        # nothing could resolve them, the copy path wrote past the staging
+        # buffer and the load_back crashed on the stale id. Unbound = the old
+        # anchor-slot path.
+        if self.arena is None:
+            return self.alloc(n)
         base = self.staging_rows + self.arena_slots
         start = self._read_ph_next
         self._read_ph_next = (start + n) % PLACEHOLDERS
