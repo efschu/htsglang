@@ -222,7 +222,12 @@ def _follower_register(scheduler, req, told: int) -> str:
     verdict = scheduler._prefetch_kvcache(
         req, limit_tokens=follower_limit_tokens(scheduler.tree_cache, told)
     )
-    if str(verdict) == "declined:too_short" and _local_prefix(req) >= int(told):
+    if str(verdict).startswith("declined") and _local_prefix(req) >= int(told):
+        # xsn155: the same shape with verdict 'declined:store_absent' -- the
+        # follower held 94,206 tokens locally against told=53,246 (PP0's
+        # smaller pool had evicted and re-read), its probe started past the
+        # told span and found nothing to ask for. Any decline while the
+        # local prefix covers told is satisfied, whatever the label.
         # Boot xsn141 (2026-09-16, the first with the shared arena): PP0's
         # device tree had evicted part of a prefix its followers still held
         # (PP0 carries 39 of 64 layers, so its pool of 487k tokens is the
