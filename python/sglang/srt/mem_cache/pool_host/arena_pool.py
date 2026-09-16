@@ -519,9 +519,15 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
         arena's free slot count; the staging fallback is `staging_free`."""
         if self.arena is None:
             return len(self.free_slots)
+        # #1440b (xsn202): 'complete' pages must NOT be subtracted -- a read of
+        # a page that is in the arena consumes no row at all (it is resolved
+        # in place), so with six 100k prompts COMPLETE in the arena the gate
+        # saw 46k 'free' and held the fourth seat again. What a read can
+        # still need is a slot per page NOT in the arena (the L3 fill): the
+        # slots not held by a writer in flight.
         try:
             st = self.arena.stats()
-            return max(0, int(st["slots"]) - int(st["complete"]) - int(st["claimed"]))
+            return max(0, int(st["slots"]) - int(st["claimed"]))
         except Exception:  # noqa: BLE001
             return len(self.free_slots)
 

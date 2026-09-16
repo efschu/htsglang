@@ -160,7 +160,11 @@ def test_available_size_reports_the_arena_not_the_staging_fallback(tmp_path, mon
     assert p.staging_free() == S
     assert p.available_size() == 8
     rows = p.alloc_write(["a", "b"])
-    assert p.available_size() == 6
+    assert p.available_size() == 6            # two claimed by a writer in flight
+    p.backup_from_device_all_layer(_device_pool(), rows, torch.tensor([1, 2]), "kernel")
+    p._own_extents = [(0, PAGE // 2), (PAGE // 2, PAGE // 2)]
+    p.complete_write(rows)
+    assert p.available_size() == 8            # #1440b: COMPLETE pages cost a reader nothing
     # staging alloc stays bounded by the staging free list
     assert p.alloc(S + 1) is None
     assert p.alloc(1) is not None and p.staging_free() == S - 1
