@@ -9106,7 +9106,19 @@ def solve_p_cut(
     # say which floor it was measured against, and whether that floor was the
     # shipped default or something the operator typed, sends the reader to the
     # wrong flag.
-    pool_floor, pool_floor_from_cut, pool_floor_rule = resolve_pool_floor(ns.pp_solve_pool_floor)
+    _floor_flag = ns.pp_solve_pool_floor
+    if _floor_flag is None and int(getattr(ns, "p_bs", DEFAULT_P_BS)) == 1:
+        # #1441 (user 16.09.): with ONE chunked prefill at a time on P (sglang's
+        # single chunked_req; --p-bs 1) the pool only has to hold the largest
+        # request plus one chunk, so the floor is the cap, not the ordered
+        # cut's pool -- 'immer das schnellste Layout, in das der Prefill
+        # reinpasst'. The ordered cut of 2026-09-09 stays the rule for p_bs > 1.
+        _cap = int(ns.max_kv_per_request or CONTEXT_LENGTH_TOKENS)
+        _floor_flag = _cap + int(chunk_tokens)
+        log("PP-CUT POOL FLOOR RULE: source=cap+chunk (p_bs=1, user order 2026-09-16) floor=%d = "
+            "max_kv_per_request %d + chunk %d -- the solver ships the fastest cut at or above it"
+            % (_floor_flag, _cap, int(chunk_tokens)))
+    pool_floor, pool_floor_from_cut, pool_floor_rule = resolve_pool_floor(_floor_flag)
     log("PP-CUT POOL FLOOR RULE: " + pool_floor_rule)
     decision = _cut.solve_launch_cut(
         layer_families=families,
