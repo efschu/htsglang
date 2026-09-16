@@ -16140,6 +16140,17 @@ class Scheduler(
             self.tree_cache.reset()
             self.req_to_token_pool.clear()
             self.token_to_kv_pool_allocator.clear()
+            # #1425: the precision-tail ring's body-slot -> ring-row mapping
+            # follows the pool it maps; a flush (the wake's Cutover-Full-Reset
+            # included) clears it too, or a recycled body slot would read a
+            # dead request's 16-bit rows.
+            _kv_pool = getattr(self, "token_to_kv_pool", None)
+            if _kv_pool is None:
+                _get = getattr(self.token_to_kv_pool_allocator, "get_kvcache", None)
+                _kv_pool = _get() if callable(_get) else None
+            _ring = getattr(_kv_pool, "kv_tail", None)
+            if _ring is not None and callable(getattr(_ring, "reset", None)):
+                _ring.reset()
             if envs.SGLANG_FLUSH_ZERO_KV.get():
                 # Default part of the flush (opt-out env): the post-flush
                 # state must equal a fresh boot, whose pools are torch.zeros.

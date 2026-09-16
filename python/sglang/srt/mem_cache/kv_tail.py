@@ -533,7 +533,7 @@ class KvTailRing:
     ):
         self.knobs = knobs
         self.counters = KvTailCounters()
-        self._refuse_unsupported_form(body_pool, knobs)
+        self._refuse_unsupported_form(body_pool, knobs, under_memory_saver=bool(enable_memory_saver))
         # THE THIRD INDEX SPACE (boot weg2kvtail4's killer).  The two named
         # below are TOKEN spaces; this one is the LAYER space, and slice 1
         # crossed it without translating.
@@ -649,7 +649,7 @@ class KvTailRing:
     # -- form gate ---------------------------------------------------------
 
     @staticmethod
-    def _refuse_unsupported_form(body_pool, knobs: KvTailKnobs) -> None:
+    def _refuse_unsupported_form(body_pool, knobs: KvTailKnobs, under_memory_saver: bool = False) -> None:
         """Refuse by name where the tail cannot be honoured on this form.
 
         Each clause is a broken ASSUMPTION, not a missing feature: the mapping
@@ -684,9 +684,16 @@ class KvTailRing:
                 "vectorized_5d fold (page, head) into the first index, so a "
                 "row of the mapping no longer names one token."
             )
-        if getattr(body_pool, "post_capture_active", False) or getattr(
+        # #1425 (serving form, 16.09.): the weg2 KV pool sits on a VA
+        # reservation for the phase flip (`swappable_backing=True`). The ring
+        # reads NO body row -- the mapping is keyed by body slot but holds ring
+        # rows -- so the body's unmapped layers cannot reach it. What the ring
+        # must follow is the flip itself: under the SAME memory-saver tag it
+        # pauses and resumes with the group. Only a ring that cannot follow the
+        # tag is refused on this form.
+        if (getattr(body_pool, "post_capture_active", False) or getattr(
             body_pool, "swappable_backing", False
-        ):
+        )) and not under_memory_saver:
             raise Weg2KvTailFormRefused(
                 "W58 Weg2KvTailFormRefused: the precision tail refuses a "
                 "VA-backed / post-capture body pool. Those pools may have "

@@ -2809,3 +2809,26 @@ class TestFactFourTheProbeMustBite(CustomTestCase):
                       torch.tensor([0], dtype=torch.int64))
             ring.begin_decode_step()
         self.assertEqual(ring.counters.tail_merges, 0)
+
+
+# ---- #1425: the serving form's VA-backed body pool -----------------------
+
+
+def test_1425_va_backed_body_is_refused_only_without_the_memory_saver_tag():
+    import types
+
+    from sglang.srt.mem_cache.kv_tail import KvTailRing, Weg2KvTailFormRefused
+
+    body = types.SimpleNamespace(page_size=1, use_mla=False, kv_cache_layout="nhd",
+                                 use_hnd=False, swappable_backing=True, post_capture_active=False)
+    knobs = types.SimpleNamespace()
+    try:
+        KvTailRing._refuse_unsupported_form(body, knobs, under_memory_saver=False)
+    except Weg2KvTailFormRefused as e:
+        assert "VA-backed" in str(e)
+    else:
+        raise AssertionError("a ring that cannot follow the flip's tag must be refused")
+    KvTailRing._refuse_unsupported_form(body, knobs, under_memory_saver=True)
+    plain = types.SimpleNamespace(page_size=1, use_mla=False, kv_cache_layout="nhd",
+                                  use_hnd=False, swappable_backing=False, post_capture_active=False)
+    KvTailRing._refuse_unsupported_form(plain, knobs, under_memory_saver=False)
