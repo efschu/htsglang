@@ -410,6 +410,12 @@ def admission(scheduler, req, note_skip: Callable[[str, Any], None]) -> Optional
         note_skip(SKIP_TOLD_PENDING, rid)
         return None
     tree = scheduler.tree_cache
+    # #1419: told bounds this rank's radix match (schedule_batch
+    # _weg2_cap_key_limit) so no rank -- PP0 included -- admits more than told.
+    try:
+        req._weg2_prefix_cap = int(told)
+    except Exception:  # noqa: BLE001
+        pass
     satisfied = getattr(scheduler, "_weg2_store_told_satisfied", None) or {}
     if rid in satisfied:
         # registered nothing because it already held the span (see

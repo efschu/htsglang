@@ -1191,6 +1191,16 @@ class ReqLogprob:
     output_token_ids_logprobs_idx: Optional[list] = None
 
 
+def _weg2_cap_key_limit(req, key_limit):
+    """#1419: the store-told prefix cap (set by weg2_store_told.admission)
+    bounds the radix match; None = no cap."""
+    cap = getattr(req, "_weg2_prefix_cap", None)
+    if cap is None:
+        return key_limit
+    cap = int(cap)
+    return cap if key_limit is None else min(int(key_limit), cap)
+
+
 class Req(ReqDllmMixin):
     """The input and output status of a request."""
 
@@ -1926,6 +1936,13 @@ class Req(ReqDllmMixin):
                 capped = max(0, input_len - reprefill_tail)
                 key_limit = capped if key_limit is None else min(key_limit, capped)
 
+        # #1419 (boot xsn171): under the PP store-told contract every rank
+        # must admit the SAME prefix. PP0 published told=0 (no anchor in the
+        # store, #1416) but its own match found the 4095-token host prefix
+        # with an anchor in its host pool and built chunks at 4095+4096k while
+        # the followers built 4096k: W27 width divergence, P stopped. The
+        # told value caps the match on every rank, PP0 included.
+        key_limit = _weg2_cap_key_limit(self, key_limit)
         # Disable prefix caching when embed overrides are present: same token IDs
         # with different override vectors must not share cached KV values.
         if self.positional_embed_overrides is not None:

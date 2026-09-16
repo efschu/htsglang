@@ -383,3 +383,30 @@ def test_1416b_pp0_record_follows_the_clamp(monkeypatch):
     assert [o.told for o in out] == [0]
     assert sched.tree_cache._prefetch_completed_tokens["r1"] == 0
     assert sched._weg2_store_told["r1"] == 0
+
+
+def test_1419_told_caps_the_radix_match_on_every_rank():
+    from sglang.srt.managers import weg2_store_told as wst
+    from sglang.srt.managers.schedule_batch import _weg2_cap_key_limit
+
+    class _Tree:
+        def check_prefetch_progress(self, rid):
+            return True
+
+        def completed_prefetch_tokens(self, rid):
+            return 4095
+
+        def pop_prefetch_loaded_tokens(self, rid):
+            return 0
+
+    req = types.SimpleNamespace(rid="r9")
+    sched = types.SimpleNamespace(
+        tree_cache=_Tree(), _weg2_store_told={"r9": 4095},
+        _weg2_store_told_satisfied={}, ps=types.SimpleNamespace(pp_rank=1),
+    )
+    assert wst.admission(sched, req, lambda *a: None) == 0
+    assert req._weg2_prefix_cap == 4095
+    assert _weg2_cap_key_limit(req, None) == 4095
+    assert _weg2_cap_key_limit(req, 100000) == 4095
+    assert _weg2_cap_key_limit(req, 10) == 10
+    assert _weg2_cap_key_limit(types.SimpleNamespace(), 77) == 77
