@@ -6,6 +6,7 @@ danger direction is a rank ADMITTING without a told verdict (the W27 width
 split): every admission assertion here fails if `admission` is bypassed.
 """
 
+import types
 import os
 from types import SimpleNamespace
 
@@ -321,3 +322,28 @@ def test_follower_that_already_holds_the_told_span_is_satisfied_without_a_read()
     s.tree_cache.register("eeee0002", loaded=0, flips=0)
     with pytest.raises(m.Weg2StoreToldMismatch):
         m.admission(s, r2, note)
+
+
+# ---- #1416: told is anchor-clamped like the followers' presence probe ------
+
+
+def test_1416_told_is_clamped_to_the_anchored_presence():
+    from sglang.srt.managers import weg2_store_told as wst
+
+    class _CC:
+        page_size = 1
+
+        def store_presence_pages(self, ids, last_hash, prefix_keys=None):
+            assert len(ids) == 53247
+            return 4095
+
+    class _Req:
+        origin_input_ids = list(range(60000))
+        rid = "abcdef0123456789"
+
+    sched = types.SimpleNamespace(cache_controller=_CC())
+    assert wst._anchor_clamp(sched, _Req(), 53247) == 4095
+    sched.cache_controller.store_presence_pages = lambda ids, lh, prefix_keys=None: 99999
+    assert wst._anchor_clamp(sched, _Req(), 53247) == 53247, "never above completed"
+    assert wst._anchor_clamp(types.SimpleNamespace(), _Req(), 7) == 7, "no probe: no clamp"
+    assert wst._anchor_clamp(sched, _Req(), 0) == 0

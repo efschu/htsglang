@@ -274,6 +274,42 @@ def _local_prefix(req) -> int:
         return 0
 
 
+def _anchor_clamp(scheduler, req, told: int) -> int:
+    """#1416 (boots xsn159/162/167): the completed prefix counts KV pages; the
+    admission match accepts a prefix only up to the deepest page that also
+    carries a mamba anchor. PP0 published told=53247 from a host-budget-
+    truncated read (no anchor inside the span), its own match then refused
+    the whole span ("MambaComponent:absent"), and the followers -- whose
+    presence probe IS anchor-clamped since #869b -- answered store_absent:
+    told mismatch, rank exit. Ask the same anchor-clamped question here, so
+    told never names a prefix no rank can admit. Unavailable probe = no
+    clamp (the pre-#1416 number), never a silent zero.
+    """
+    if told <= 0:
+        return int(told)
+    try:
+        cc = getattr(scheduler, "cache_controller", None) or getattr(
+            getattr(scheduler, "tree_cache", None), "cache_controller", None
+        )
+        probe = getattr(cc, "store_presence_pages", None)
+        ids = getattr(req, "origin_input_ids", None)
+        if not callable(probe) or not ids:
+            return int(told)
+        page_size = int(getattr(cc, "page_size", 1) or 1)
+        pages = int(probe(list(ids[: int(told)]), None) or 0)
+        anchored = min(int(told), pages * page_size)
+        if anchored < int(told):
+            logger.warning(
+                "#1416 STORE-TOLD ANCHOR-CLAMP rid=%s completed=%d anchored=%d: the "
+                "span beyond the deepest mamba anchor is not admissible on any rank",
+                rid8(req), int(told), anchored,
+            )
+        return anchored
+    except Exception as exc:  # noqa: BLE001 - a probe never breaks publication
+        logger.warning("#1416 anchor clamp skipped for rid=%s: %r", rid8(req), exc)
+        return int(told)
+
+
 def pp0_publish(scheduler, recv_reqs: List) -> List:
     """Top of a PP0 pass, before the forward: turn terminated prefetches of
     held rids into ``Weg2StoreTold`` objects appended to the outgoing list.
@@ -298,6 +334,7 @@ def pp0_publish(scheduler, recv_reqs: List) -> List:
         if not tree.check_prefetch_progress(rid):
             continue
         told = _completed_prefix(tree, rid)
+        told = _anchor_clamp(scheduler, req, told)
         told_map[rid] = told
         held.pop(rid, None)
         out.append(Weg2StoreTold(rid=rid, told=told))
