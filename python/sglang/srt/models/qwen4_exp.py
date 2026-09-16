@@ -110,7 +110,14 @@ def _get_ple_forward_mode(forward_batch: ForwardBatch) -> ForwardMode:
 def _get_processed_token_count(
     forward_batch: ForwardBatch, physical_tokens: int
 ) -> int:
-    processed_tokens = forward_batch.global_num_token_non_padded_cpu
+    # Upstream keeps a DP-global non-padded count on the batch; this line
+    # carries the per-rank one (attention DP is 1 here), and neither is set
+    # on a forward without padding (fn1p, 2026-09-16: the first forward
+    # after 'ready' died on the missing attribute). The chain falls through
+    # to the extend lengths and finally to the physical count.
+    processed_tokens = getattr(forward_batch, "global_num_token_non_padded_cpu", None)
+    if processed_tokens is None:
+        processed_tokens = getattr(forward_batch, "num_token_non_padded_cpu", None)
     if processed_tokens is None and forward_batch.extend_seq_lens_cpu is not None:
         processed_tokens = sum(forward_batch.extend_seq_lens_cpu)
     if processed_tokens is None:
