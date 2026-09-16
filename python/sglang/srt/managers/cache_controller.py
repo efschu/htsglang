@@ -1652,6 +1652,16 @@ class HiCacheController:
             )
         self._canonical_mamba_layer_ids = [int(i) for i in mamba_layer_ids]
         self._canonical_mamba_spec = spec
+        # #1427 Stufe 4b: the mamba arena host pool needs the same cut the
+        # window was built from (per-layer, per-segment extents, unmerged).
+        try:
+            self._weg2_mamba_window_parts = (spec, list(ratios), int(rank), int(layer_lo), int(layer_hi))
+            if get_pool is not None and PoolName.MAMBA in entry_names:
+                _mp = get_pool(PoolName.MAMBA)
+                if hasattr(_mp, "_weg2_parts"):
+                    _mp._weg2_parts = self._weg2_mamba_window_parts
+        except Exception:  # noqa: BLE001 - the window itself is unaffected
+            logger.warning("#1427 could not hand the mamba window parts to the host pool", exc_info=True)
         logger.info(
             "#706 canonical GDN blob active: layers [%d, %d) of %d, %d of %d "
             "blob bytes on this rank, %d extent(s).",

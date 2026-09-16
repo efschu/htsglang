@@ -2927,7 +2927,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # slot -- claim one per page and DMA straight into it. No staging
         # row, no ring, no store thread, no rebind. The mamba/draft aux
         # pools still follow their own paths (extra_pools below).
-        _pre = self._weg2_direct_claim(node)
+        _pre = self._weg2_direct_claim(node, comp_xfers)
         if _pre is False:
             return 0
         host_avail = 0 if _pre is not None else uniform_host_avail_for_backup(
@@ -2963,7 +2963,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         )
         if host_indices is None:
             if _pre is not None:
-                self._weg2_direct_abort(_pre)
+                self._weg2_direct_abort(_pre, node)
             # #810: the write failed after the ring admitted it, so the page
             # never reaches the drain and its admission must not stay charged.
             if ring is not None:
@@ -3058,9 +3058,27 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             return None
         return pool
 
-    def _weg2_direct_claim(self, node):
+    def _weg2_mamba_pool(self):
+        cc = self.cache_controller
+        group = getattr(cc, "mem_pool_host", None)
+        get_pool = getattr(group, "get_pool", None)
+        names = getattr(group, "entry_map", None) or {}
+        if get_pool is None or PoolName.MAMBA not in names:
+            return None
+        mp = get_pool(PoolName.MAMBA)
+        if not hasattr(mp, "arena_resolve_reads"):
+            return None
+        try:
+            if not mp.ensure_bound(cc.storage_backend):
+                return None
+        except Exception:  # noqa: BLE001
+            return None
+        return mp
+
+    def _weg2_direct_claim(self, node, comp_xfers=None):
         """None = not a direct-write pool (take the staging path); False =
-        refused (counted); a tensor = the arena rows to write into."""
+        refused (counted); a tensor = the arena rows to write into. The
+        mamba transfer of `comp_xfers` (if any) gets its arena slot here too."""
         pool = self._weg2_direct_pool()
         if pool is None:
             return None
@@ -3073,6 +3091,23 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         if pre is None:
             self._1421_refused("arena_claim", node)
             return False
+        mxfer = None
+        for xfers in (comp_xfers or {}).values():
+            for x in xfers:
+                if x.name == PoolName.MAMBA and x.host_indices is None and x.device_indices is not None:
+                    mxfer = x
+        if mxfer is not None:
+            mp = self._weg2_mamba_pool()
+            mrows = mp.alloc_write([hashes[-1]]) if mp is not None else None
+            if mrows is None:
+                pool.abort_write(pre)
+                self._1421_refused("mamba_claim" if mp is not None else "mamba_pool_unbound", node)
+                return False
+            mxfer.host_indices = mrows
+            pend = getattr(self, "_weg2_direct_mamba_rows", None)
+            if pend is None:
+                pend = self._weg2_direct_mamba_rows = {}
+            pend[node.id] = mrows
         cc = self.cache_controller
         dpool = getattr(cc, "mem_pool_host_draft", None)
         if (dpool is not None and getattr(dpool, "row_slot", None) is not None
@@ -3088,7 +3123,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 return False
         return pre
 
-    def _weg2_direct_abort(self, rows) -> None:
+    def _weg2_direct_abort(self, rows, node=None) -> None:
         cc = self.cache_controller
         pool = getattr(cc, "mem_pool_host", None)
         dpool = getattr(cc, "mem_pool_host_draft", None)
@@ -3096,6 +3131,11 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             dpool.abort_write(rows)
         if pool is not None:
             pool.abort_write(rows)
+        if node is not None:
+            mrows = (getattr(self, "_weg2_direct_mamba_rows", None) or {}).pop(node.id, None)
+            mp = self._weg2_mamba_pool() if mrows is not None else None
+            if mp is not None:
+                mp.abort_write(mrows)
 
     def _weg2_direct_complete(self, node) -> bool:
         """Ack of a direct write: this rank's extents are in the slot. Merge
@@ -3116,6 +3156,15 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 dpool.complete_write(hv)
             except Exception as exc:  # noqa: BLE001
                 logger.warning("#1427 draft complete raised: %r", exc)
+        (getattr(self, "_weg2_direct_mamba_rows", None) or {}).pop(node.id, None)
+        mp = self._weg2_mamba_pool()
+        if mp is not None and len(node.component_data) > int(ComponentType.MAMBA):
+            mhv = node.component_data[ComponentType.MAMBA].host_value
+            if mhv is not None and mhv.numel() and mp.is_arena_id(int(mhv.min())):
+                try:
+                    mp.complete_write(mhv)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("#1427 mamba complete raised: %r", exc)
         node.l3_present = True
         n = getattr(self, "_1427_direct_n", 0) + 1
         self._1427_direct_n = n

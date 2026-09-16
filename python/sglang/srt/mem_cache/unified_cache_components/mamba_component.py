@@ -1526,7 +1526,8 @@ class MambaComponent(TreeComponent):
             ]
 
         if phase == CacheTransferPhase.PREFETCH:
-            host_indices = self._mamba_pool_host.alloc(1)
+            _ar = getattr(self._mamba_pool_host, "alloc_read", None)  # #1427: arena pool, placeholder
+            host_indices = _ar(1) if callable(_ar) else self._mamba_pool_host.alloc(1)
             if host_indices is None:
                 self.cache.evict_host(1, ComponentType.MAMBA)
                 host_indices = self._mamba_pool_host.alloc(1)

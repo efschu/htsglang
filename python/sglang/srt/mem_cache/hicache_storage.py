@@ -3000,8 +3000,20 @@ class HiCacheFile(HiCacheStorage):
                 results[transfer.name] = [False] * len(keys)
                 continue
 
+            # #1427 Stufe 4b: a pool that lives in the arena resolves COMPLETE
+            # blobs in place (slot id over the placeholder, no copy); only the
+            # keys it does not hold go through the per-key read.
+            pre = None
+            resolver = getattr(host_pool, "arena_resolve_reads", None)
+            if op_fn is self._read_page and callable(resolver):
+                try:
+                    pre = resolver(self, host_indices, [self._log_key(transfer.name, k) for k in keys])
+                except Exception:  # noqa: BLE001 - fall back to the copy path
+                    logger.warning("#1427 arena resolve failed for %s", transfer.name, exc_info=True)
+                    pre = None
             results[transfer.name] = [
-                op_fn(transfer.name, key, host_pool, host_indices[i * page_size].item())
+                (pre[i] if (pre is not None and pre[i] is not None)
+                 else op_fn(transfer.name, key, host_pool, host_indices[i * page_size].item()))
                 for i, key in enumerate(keys)
             ]
         return results
