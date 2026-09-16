@@ -2908,10 +2908,12 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         )
         if host_avail < kv_tokens:
             if uniform_host_floor_active(self):
+                self._1421_refused("host_floor", node)
                 return 0
             needed = kv_tokens - host_avail
             evicted = self.evict_host(needed)
             if evicted < needed:
+                self._1421_refused(f"host_evict_short:{host_avail}+{evicted}<{kv_tokens}", node)
                 return 0
 
         # #810: the STAGING bound, taken BEFORE the allocation rather than
@@ -2923,6 +2925,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # role skips the gate entirely.
         ring = self.staging_write_ring
         if ring is not None and not ring.admit(node.id, kv_tokens):
+            self._1421_refused("staging_ring", node)
             return 0
 
         aux_xfers = [x for xfers in comp_xfers.values() for x in xfers]
@@ -4652,6 +4655,32 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 host_indices[:min_completed_tokens],
                 hash_value[: min_completed_tokens // self.page_size],
             )
+            # #1423 instrument (boot xsn173, #1420 pair): WHERE did the chain
+            # land? The walk later wanted child (22, 20) under the depth-4314
+            # node and found only (22, 21). Name the registration node (depth,
+            # its children after the insert) and the inserted head unit.
+            try:
+                _n = getattr(UnifiedRadixCache, "_1423_n", 0) + 1
+                UnifiedRadixCache._1423_n = _n
+                if _n <= 24 or _n % 256 == 0:
+                    _d, _x = 0, last_host_node
+                    while _x is not None and _x is not self.root_node:
+                        _d += len(_x.key); _x = _x.parent
+                    _pl = int(insert_result.prefix_len)
+                    _rest = fetched_key[_pl:] if _pl < len(fetched_key) else None
+                    _head = str(_rest.child_key(self.page_size))[:40] if _rest is not None and len(_rest) else "-"
+                    logger.warning(
+                        "#1423 INSERT-PLACED req=%s reg_node=%s reg_depth=%d reg_keylen=%d "
+                        "reg_children_after=%s matched=%d inserted=%d head_unit=%s "
+                        "deepest=%s unclaimed=%s",
+                        str(req_id)[:8], getattr(last_host_node, "id", "?"), _d,
+                        len(last_host_node.key), [str(k)[:30] for k in list(last_host_node.children.keys())[:4]],
+                        _pl, int(min_completed_tokens) - _pl, _head,
+                        getattr(insert_result.inserted_host_node, "id", None),
+                        bool(insert_result.host_span_unclaimed),
+                    )
+            except Exception:  # noqa: BLE001
+                pass
             # #1317 C2 WRITER 2 of 2: these pages CAME OUT OF L3 -- the
             # prefetch is what read them -- so their presence there is a fact
             # of this code path, not a prediction. Marked on the chain the
