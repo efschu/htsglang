@@ -636,11 +636,26 @@ def _adjust_shard_indexes_for_marlin(shard_size, shard_offset, marlin_tile_size)
     return shard_size * marlin_tile_size, shard_offset * marlin_tile_size
 
 
+def _exact_div(value: int, factor) -> int:
+    """``value / factor`` as an int; refuses a non-integral packed extent."""
+    if isinstance(factor, Fraction):
+        q = Fraction(int(value)) / factor
+        if q.denominator != 1:
+            raise ValueError(
+                f"packed extent {value} / {factor} is not integral; the shard "
+                "boundary does not land on a packed word"
+            )
+        return int(q)
+    return int(value) // int(factor)
+
+
 def _adjust_shard_indexes_for_packing(
     shard_size, shard_offset, packed_factor, marlin_tile_size
 ):
-    shard_size = shard_size // packed_factor
-    shard_offset = shard_offset // packed_factor
+    # packed_factor may be a Fraction (dense sub-byte packing, e.g. 6-bit =
+    # Fraction(32, 6)); the packed extent must come out integral.
+    shard_size = _exact_div(shard_size, packed_factor)
+    shard_offset = _exact_div(shard_offset, packed_factor)
     if marlin_tile_size is not None:
         return _adjust_shard_indexes_for_marlin(
             shard_size=shard_size,

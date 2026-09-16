@@ -747,9 +747,11 @@ class CompressedTensorsConfig(QuantizationConfig):
 
         # Detect If Mixed Precision
         if self._is_wNa16_group_channel(weight_quant, input_quant):
-            if (
-                self.quant_format == CompressionFormat.pack_quantized.value
-                and weight_quant.num_bits in WNA16_SUPPORTED_BITS
+            if self.quant_format == CompressionFormat.pack_quantized.value and (
+                weight_quant.num_bits in WNA16_SUPPORTED_BITS
+                # symmetric 6-bit groups are widened to the 8-bit kernel at
+                # load (CompressedTensorsWNA16, Minachist INT4/INT6 mixed)
+                or (weight_quant.num_bits == 6 and weight_quant.symmetric)
             ):
                 return CompressedTensorsWNA16(
                     num_bits=weight_quant.num_bits,
