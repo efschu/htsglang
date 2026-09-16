@@ -19,6 +19,7 @@ from sglang.srt.constants import (
     GPU_MEMORY_TYPE_CUDA_GRAPH,
     GPU_MEMORY_TYPE_KV_CACHE,
     GPU_MEMORY_TYPE_WEIGHTS,
+    GPU_MEMORY_TYPE_WEIGHTS_DRAFT,
 )
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.io_struct import (
@@ -960,6 +961,53 @@ class SchedulerWeightUpdaterManager:
             allocated_before / MIB_,
             allocated_after / MIB_,
         )
+
+    def _weg2_nvml_self_bytes(self) -> Optional[int]:
+        """NVML per-process bytes for THIS pid on THIS card, or None (never 0)."""
+        try:
+            import pynvml  # noqa: PLC0415
+            uuid = self._weg2_card_uuid()
+            if not uuid:
+                return None
+            handle = pynvml.nvmlDeviceGetHandleByUUID(str(uuid))
+            me = os.getpid()
+            for pr in pynvml.nvmlDeviceGetComputeRunningProcesses_v3(handle):
+                if int(pr.pid) == me and pr.usedGpuMemory is not None:
+                    return int(pr.usedGpuMemory)
+            return None
+        except BaseException:  # noqa: BLE001 -- an instrument never breaks a leg
+            return None
+
+    def _weg2_log_dc_breakdown(self, stage: str) -> Optional[Dict[str, Any]]:
+        """#1446: print this rank's dormant-residue attribution (see
+        weg2_memory_saver.dc_breakdown).  Fail-soft: never raises."""
+        try:
+            from sglang.srt.managers.weg2_memory_saver import (  # noqa: PLC0415
+                dc_breakdown, format_dc_breakdown, weights_family_tags,
+            )
+            tags = set(str(t) for t in (getattr(self, "offload_tags", None) or ()))
+            tags |= {GPU_MEMORY_TYPE_KV_CACHE, GPU_MEMORY_TYPE_CUDA_GRAPH,
+                     GPU_MEMORY_TYPE_WEIGHTS, GPU_MEMORY_TYPE_WEIGHTS_DRAFT}
+            try:
+                tags |= set(weights_family_tags())
+            except Exception:  # noqa: BLE001
+                pass
+            tag_bytes = {t: self._weg2_tag_bytes(t) for t in sorted(tags)}
+            try:
+                module = torch.get_device_module()
+                reserved, allocated = int(module.memory_reserved()), int(module.memory_allocated())
+            except Exception:  # noqa: BLE001
+                reserved, allocated = None, None
+            rec = dc_breakdown(
+                nvml_proc_bytes=self._weg2_nvml_self_bytes(),
+                torch_reserved=reserved, torch_allocated=allocated,
+                tag_bytes=tag_bytes, offload_tags=getattr(self, "offload_tags", None),
+            )
+            logger.info("%s", format_dc_breakdown(rec, stage=stage))
+            return rec
+        except BaseException:  # noqa: BLE001
+            logger.info("WEG2-DC-BREAKDOWN stage=%s n/a (instrument failed)", stage)
+            return None
 
     def _weg2_log_sleep_acceptance(
         self, before: Optional[Any] = None, tags: Optional[List[str]] = None
@@ -6401,6 +6449,8 @@ class SchedulerWeightUpdaterManager:
             )
             self.weg2_sleep_before = None
 
+        if weg2_memory_saver_on:
+            self._weg2_log_dc_breakdown("release tags=%s" % (list(tags),))  # #1446
         report: Dict[str, Any] = {}
         if weg2_memory_saver_on:
             report = self._weg2_group_fence(

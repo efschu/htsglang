@@ -2802,3 +2802,77 @@ def dormant_refusal_message(*, rid: str, context: str) -> str:
         "to the awake group via the Weg-2 front on :30030, or wake this group "
         "first (resume_memory_occupation)."
     )
+
+
+# ---------------------------------------------------------------------------
+# #1446: THE DORMANT RESIDUE, ATTRIBUTED ON THE RANK AT EVERY SLEEP
+# ---------------------------------------------------------------------------
+#
+# The front measures the sleeping group's residue as ONE number per card
+# (``WEG2-DC group=D measured=1616..1686 MiB`` on the 5090, boot weg2xsn205)
+# and the launcher prices it (#1444).  Section [1y] above attributed 1462 of
+# rg6's 1820 MiB by reading dumps; 358 MiB stayed unattributed, and with the
+# graph pool and the float workspace now tagged (458 MiB released) the
+# measured residue still sits ~650 MiB above the [1y] rows.  This is the live
+# attribution, printed by the rank itself at every release RPC, from the three
+# instruments the rank owns:
+#
+#   nvml      NVML per-process bytes for THIS pid on THIS card -- the front's
+#             own quantity, so the two lines are comparable;
+#   torch     the caching allocator's reserved/allocated -- everything that
+#             went through torch and is not in a saver region;
+#   tms       the saver's per-tag byte sums, split by ``offload_tags`` into
+#             RESIDENT (mapped) and PAUSED (unmapped -- physically gone, but
+#             still in the saver's ledger).
+#
+# The remainder ``other = nvml - torch_reserved - tms_resident`` is what no
+# allocator owns: the CUDA context and its kernel images, the driver's own
+# state, the communicator/BAR1 windows, and anything cudaMalloc'd outside
+# torch.  That is the part a remap cannot move, and it is the floor the
+# corridor pays; the two allocator parts are the part a tag or an
+# ``empty_cache`` CAN move.  A reading that could not be taken is ``None`` on
+# the line, never 0 (NULL-NUR-BEI-ERREICHTEM-EMITTER).
+
+
+def dc_breakdown(
+    *,
+    nvml_proc_bytes: Optional[int],
+    torch_reserved: Optional[int],
+    torch_allocated: Optional[int],
+    tag_bytes: Dict[str, int],
+    offload_tags: Any,
+) -> Dict[str, Any]:
+    """Pure: the attribution record from the three readings.  MiB, rounded."""
+    paused = {str(t) for t in (offload_tags or ())}
+    res_tags = {t: int(b) for t, b in tag_bytes.items() if b and t not in paused}
+    pau_tags = {t: int(b) for t, b in tag_bytes.items() if b and t in paused}
+    res = sum(res_tags.values())
+    pau = sum(pau_tags.values())
+    mib = lambda b: None if b is None else int(round(b / (1024 * 1024)))  # noqa: E731
+    other = None
+    if nvml_proc_bytes is not None and torch_reserved is not None:
+        other = int(nvml_proc_bytes) - int(torch_reserved) - res
+    return {
+        "nvml_proc_mib": mib(nvml_proc_bytes),
+        "torch_reserved_mib": mib(torch_reserved),
+        "torch_allocated_mib": mib(torch_allocated),
+        "tms_resident_mib": mib(res),
+        "tms_paused_mib": mib(pau),
+        "resident_tags_mib": {t: mib(b) for t, b in sorted(res_tags.items())},
+        "paused_tags_mib": {t: mib(b) for t, b in sorted(pau_tags.items())},
+        "other_mib": mib(other),
+    }
+
+
+def format_dc_breakdown(rec: Dict[str, Any], *, stage: str) -> str:
+    """The one log line (``WEG2-DC-BREAKDOWN``), every figure with its unit."""
+    n = lambda k: "n/a" if rec.get(k) is None else str(rec.get(k))  # noqa: E731
+    return (
+        f"WEG2-DC-BREAKDOWN stage={stage} nvml_proc={n('nvml_proc_mib')} MiB = "
+        f"torch_reserved {n('torch_reserved_mib')} (allocated {n('torch_allocated_mib')}) "
+        f"+ tms_resident {n('tms_resident_mib')} {rec.get('resident_tags_mib') or {}} "
+        f"+ other {n('other_mib')} (context+driver+communicator+non-torch); "
+        f"tms_paused {n('tms_paused_mib')} {rec.get('paused_tags_mib') or {}} is unmapped and NOT in nvml_proc "
+        f"(instrument: NVML per-process bytes for this pid = the front's WEG2-DC quantity; "
+        f"torch = caching allocator counters; tms = saver tag sums split by offload_tags)"
+    )
