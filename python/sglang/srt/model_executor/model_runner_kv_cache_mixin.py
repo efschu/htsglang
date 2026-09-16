@@ -3458,6 +3458,20 @@ class ModelRunnerKVCacheMixin:
         )
         if not knobs.enabled:
             return None
+        if getattr(sa, "speculative_algorithm", None):
+            # #1425: under MTP/EAGLE the target's step is a TARGET-VERIFY
+            # extend served by the prefill wrapper; slice 1 merges the tail on
+            # the decode wrapper only. The ring would stay disarmed, claim
+            # nothing and round nothing -- the banner-only shape the basis
+            # forbids. Refused by name until the verify path merges (slice 2).
+            from sglang.srt.mem_cache.kv_tail import Weg2KvTailFormRefused
+            raise Weg2KvTailFormRefused(
+                "W58 Weg2KvTailFormRefused: the precision tail (slice 1) merges on "
+                "the DECODE wrapper path only; with speculative decoding "
+                f"({sa.speculative_algorithm}) the target step is a target-verify "
+                "extend and the tail would be inert. Slice 2 (verify-path merge) "
+                "is required before --kv-tail-min-tokens can be set on this form."
+            )
         # BASIS 7.3 IS DEFERRED TO SLICE 5, SO THE DRAFT IS EXEMPT BY NAME.
         # This branch is taken by the draft pool worker too, and a draft with a
         # ring is worse than a draft without one: every draft decode step
