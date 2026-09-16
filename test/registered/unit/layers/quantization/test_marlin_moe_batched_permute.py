@@ -44,3 +44,25 @@ def test_torch_zero_point_path_is_bit_identical_to_numpy():
         ref = awq_to_marlin_zero_points(packed, size_k, size_n, num_bits)
         got = awq_to_marlin_zero_points_torch(packed, size_k, size_n, num_bits)
         assert got.dtype == ref.dtype and got.device == ref.device and torch.equal(got, ref), num_bits
+
+
+def test_batched_moe_zero_point_path_never_enters_numpy_unpack(monkeypatch):
+    """fn2a (16.09.2026): the batched [E*k, n/pf] stack through the numpy
+    unpack_cols/pack_cols loops took 93 s per tensor on the desk (strided
+    scatter over a 128 MB array) against 0.23 s for the per-expert loop and
+    0.32 s for the torch path -- 13..65 s per layer on the 5090 rank instead
+    of 1.3 s. The MoE path must stay off the numpy helpers."""
+    import sglang.srt.layers.quantization.marlin_utils as mu
+    import sglang.srt.layers.quantization.utils as qu
+
+    def boom(*a, **k):
+        raise AssertionError("numpy unpack_cols/pack_cols entered on the batched MoE path")
+
+    monkeypatch.setattr(qu, "unpack_cols", boom)
+    monkeypatch.setattr(qu, "pack_cols", boom)
+    monkeypatch.setattr(mu, "unpack_cols", boom, raising=False)
+    monkeypatch.setattr(mu, "pack_cols", boom, raising=False)
+    g = torch.Generator().manual_seed(3)
+    packed = torch.randint(-(2**31), 2**31 - 1, (4, 8, 32), generator=g, dtype=torch.int32)
+    out = mu.moe_awq_to_marlin_zero_points(packed, 8, 256, 4)
+    assert out.shape == packed.shape and out.dtype == torch.int32
