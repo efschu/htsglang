@@ -3723,17 +3723,17 @@ class HiCacheController:
         component = self._draft_component_name()
         draft_keys = [f"{h}.{component}" for h in hash_values]
         dpool = self.mem_pool_host_draft
-        _rows_ok = bool(getattr(dpool, "arena_read", False)) and all(
-            int(host_indices[i * self.page_size]) >= int(dpool.staging_rows)
-            for i in range(len(draft_keys))
-        )
+        _hi_pages = host_indices[:: self.page_size][: len(draft_keys)]
+        _rows_ok = bool(getattr(dpool, "arena_read", False)) and bool(
+            (_hi_pages.cpu() >= int(dpool.staging_rows)).all()
+        )  # #1438: tensor op, not a Python genexpr per page
         if (_rows_ok and self.storage_backend is not None
                 and dpool.ensure_bound(self.storage_backend, role="draft")):
             # #1424: the draft rows share the KV rows' ids; behind an arena id
             # the draft page is addressed in the DRAFT arena (miss = zero row).
             stems = [self.storage_backend._get_suffixed_key(k) for k in draft_keys]
             found = dpool.arena.find_slots(stems)
-            rows = [int(host_indices[i * self.page_size]) - dpool.staging_rows for i in range(len(stems))]
+            rows = (_hi_pages.cpu() - int(dpool.staging_rows)).tolist()
             flags, slots, hits = [], [], 0
             for i, (slot, state) in enumerate(found):
                 if slot < 0 or state != 2:  # #1433: L3 -> L2 for the draft page too

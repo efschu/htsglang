@@ -2412,6 +2412,33 @@ class HiCacheFile(HiCacheStorage):
                 existing_files.add(filename)
             else:
                 unknown.append(stem)
+        # #1438 (xsn198 D profile): the presence probe of a 100k prompt was a
+        # disk stat per key -- 17 % of D's re-admission. A page that is
+        # COMPLETE in the L2 arena is present; ask the arena first (one C
+        # call per width), the disk only for what it does not hold.
+        if unknown and self._arena_dir():
+            unknown_set = set(unknown)
+            by_arena = {}
+            names = [None] + [t.name for t in (pool_transfers or [])]
+            for key in keys:
+                for name in names:
+                    k = key if name is None else f"{key}.{name}"
+                    stem = self._get_suffixed_key(k)
+                    if stem not in unknown_set:
+                        continue
+                    win = self._canonical_window(k)
+                    if win is None:
+                        continue
+                    arena = self._arena_for(int(win.total_bytes))
+                    if arena is None:
+                        continue
+                    by_arena.setdefault(id(arena), (arena, []))[1].append(stem)
+            for arena, stems in by_arena.values():
+                for st, (slot, state) in zip(stems, arena.find_slots(stems)):
+                    if slot >= 0 and state == 2:
+                        existing_files.add(f"{st}.bin")
+                        unknown_set.discard(st)
+            unknown = [st for st in unknown if st in unknown_set]
         for stem in self._readable_stems(unknown):
             existing_files.add(f"{stem}.bin")
             if self.metadata_cache is not None:

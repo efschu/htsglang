@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from typing import Optional, Sequence
 
 import torch
@@ -162,6 +163,26 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
         self._pinned = getattr(arena, "_pinned_slots", None)
         if self._pinned is None:
             self._pinned = arena._pinned_slots = torch.zeros(A, dtype=torch.bool)
+        # #1436 (xsn196): pinning slot runs on first use cost 3.4 % of P's
+        # prefill loop and sat on D's re-admission of every 100k prompt.
+        # Register the whole data region once at bind, in 1 GiB pieces; the
+        # bytes are priced in full by the ledger (#1432 arena_gib), so the
+        # #1424e residency argument no longer applies. PREPIN=0 keeps lazy.
+        if self._pin and os.environ.get("SGLANG_HICACHE_ARENA_PREPIN", "1") == "1" and not bool(self._pinned.all()):
+            t0 = time.perf_counter()
+            cudart = torch.cuda.cudart()
+            total = A * page_bytes
+            step = max(page_bytes, ((1 << 30) // page_bytes) * page_bytes)
+            off = 0
+            while off < total:
+                n = min(step, total - off)
+                rc = cudart.cudaHostRegister(self._pin_base + off, n, _CUDA_HOST_REGISTER_FLAGS)
+                if int(rc) not in (0, _CUDA_ERROR_ALREADY_REGISTERED):
+                    raise RuntimeError(f"#1436 cudaHostRegister(arena {off}+{n}) failed: {int(rc)}")
+                off += n
+            self._pinned[:] = True
+            logger.info("#1436 arena pre-pinned: %.2f GiB in %.1f s (role=%s)", total / (1 << 30),
+                        time.perf_counter() - t0, role)
         self.arena = arena
         self.arena_slots = A
         self.id_space = self.staging_rows + A + PLACEHOLDERS
@@ -191,15 +212,14 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
         """KV role: write arena ids over the placeholders, in place."""
         n = len(slots)
         self.pin_slots(slots)
-        vals = torch.tensor([self.staging_rows + int(s) for s in slots], dtype=host_indices.dtype)
+        vals = torch.as_tensor(list(slots) if not torch.is_tensor(slots) else slots, dtype=host_indices.dtype) + self.staging_rows
         host_indices[:n] = vals.to(host_indices.device)
 
     def resolve_draft_rows(self, rows: Sequence[int], slots: Sequence[int]) -> None:
         """Draft role: remember the DRAFT arena slot behind each KV row (-1 = miss)."""
         if self.row_slot is None:
             raise RuntimeError("#1424 resolve_draft_rows on a pool not bound as draft")
-        for r, s in zip(rows, slots):
-            self.row_slot[int(r)] = int(s)
+        self.row_slot.update(zip(map(int, rows), map(int, slots)))
         self.pin_slots([int(s) for s in slots if int(s) >= 0])
 
     # -- transfers ------------------------------------------------------------

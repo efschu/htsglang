@@ -16,6 +16,7 @@ DMA) pins it with cudaHostRegister.
 from __future__ import annotations
 
 import ctypes
+import functools
 import hashlib
 import logging
 import mmap
@@ -111,6 +112,7 @@ def _load_lib() -> Optional[ctypes.CDLL]:
             return None
 
 
+@functools.lru_cache(maxsize=1 << 20)  # #1438: the same stems are hashed for find/ref/draft; cached
 def key128(stem: str) -> tuple[int, int]:
     """The 128-bit key of a store stem; low word never 0 or ~0 (index sentinels)."""
     d = hashlib.blake2b(stem.encode("utf-8"), digest_size=16).digest()
