@@ -38,7 +38,8 @@ def _fake(threads, finish):
         _weg2_seam_inventory=lambda: ([("w", None)], [], 1, ""),
         _weg2_seam_digest_finish=finish,
     )
-    f._weg2_raise_pending_seam_refusal = lambda: M._weg2_raise_pending_seam_refusal(f)
+    f._weg2_seam_finisher = None
+    f._weg2_raise_pending_seam_refusal = lambda **kw: M._weg2_raise_pending_seam_refusal(f, **kw)
     return f
 
 
@@ -86,6 +87,31 @@ class Deferred(CustomTestCase):
         self.assertIsNone(f.weg2_seam_pending_refusal)          # raised once, then clear
         f._weg2_raise_pending_seam_refusal()                    # idempotent afterwards
 
+    def test_next_leg_joins_the_finisher_before_reading_the_verdict_1450b(self):
+        """boot weg2xsn208: the grade was still folding when the next release
+        unmapped the pages.  The leg head now waits for the finisher."""
+        gate = threading.Event()
+        boom = RuntimeError("late MISMATCH")
+
+        def finish(**kw):
+            gate.wait(5.0)
+            return boom
+
+        th = threading.Thread(target=lambda: None)
+        th.start()
+        f = _fake([th], finish)
+        M._weg2_seam_digest_after(f, SimpleNamespace(epoch=3), ["weights"])
+        self.assertIsNotNone(f._weg2_seam_finisher)
+        self.assertTrue(f._weg2_seam_finisher.is_alive())
+        # idle tick: never blocks, grade not ready -> nothing raised
+        f._weg2_raise_pending_seam_refusal(join=False)
+        self.assertIsNone(f.weg2_seam_pending_refusal)
+        # leg head: joins, then raises the refusal the grade produced
+        gate.set()
+        with self.assertRaises(RuntimeError):
+            f._weg2_raise_pending_seam_refusal()
+        self.assertIsNone(f._weg2_seam_finisher)
+
     def test_match_parks_nothing(self):
         f, _, _ = self._run(None)
         time.sleep(0.05)
@@ -111,9 +137,10 @@ class Wiring(CustomTestCase):
             self.assertLess(body.index("_weg2_raise_pending_seam_refusal()"), body.index("_weg2_leg_replay("))
         from sglang.srt.managers.scheduler import Scheduler
         idle = inspect.getsource(Scheduler.on_idle)
-        self.assertIn("_weg2_raise_pending_seam_refusal", idle)
+        self.assertIn("_wu_chk(join=False)", idle)
         # slots=True dataclass: the field is declared (the #1437b lesson)
         self.assertIn("weg2_seam_pending_refusal", M.__dataclass_fields__)
+        self.assertIn("_weg2_seam_finisher", M.__dataclass_fields__)
 
     def test_fold_block_default(self):
         from sglang.srt.weg2 import _seam_fold

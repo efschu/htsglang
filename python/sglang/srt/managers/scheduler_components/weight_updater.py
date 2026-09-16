@@ -553,6 +553,11 @@ class SchedulerWeightUpdaterManager:
     #: #1450: a seam-digest refusal graded BEHIND the wake -- raised at this
     #: rank's next leg or idle tick, never lost.  slots=True: declared here.
     weg2_seam_pending_refusal: Optional[BaseException] = None
+    #: #1450b: the finisher thread of the deferred grade -- JOINED at the head
+    #: of the next leg before any page is paused (boot weg2xsn208: the fold
+    #: read weight pages the next release had just unmapped -> illegal memory
+    #: access on D, P's leg W68).  slots=True: declared here.
+    _weg2_seam_finisher: Any = None
     #: #1452b: snapshot counter -- slots=True, so it is a FIELD (boot weg2xsn208
     #: printed 'n/a (AttributeError ... _1452_snapshots)' on every rank).
     _1452_snapshots: int = 0
@@ -4605,7 +4610,9 @@ class SchedulerWeightUpdaterManager:
                     logger.error("WEG2-SEAM-DIGEST DEFERRED REFUSAL epoch=%s: %s -- raised at this rank's "
                                  "next leg or idle tick (#1450)", _epoch, _refusal)
 
-            _threading.Thread(target=_finish, name=f"seam-finish-{_epoch}", daemon=True).start()
+            _fin = _threading.Thread(target=_finish, name=f"seam-finish-{_epoch}", daemon=True)
+            self._weg2_seam_finisher = _fin
+            _fin.start()
             logger.info("WEG2-SEAM-DIGEST stage=after DEFERRED behind the wake (#1450): %d part "
                         "thread(s) are joined, assembled and compared on a worker; the RPC returns now",
                         len(_threads))
@@ -4686,9 +4693,24 @@ class SchedulerWeightUpdaterManager:
         self.weg2_seam_ref = after
         return None
 
-    def _weg2_raise_pending_seam_refusal(self) -> None:
+    def _weg2_raise_pending_seam_refusal(self, *, join: bool = True) -> None:
         """#1450: a refusal graded behind the wake is raised here -- called at
-        the head of every Weg-2 leg and from the scheduler's idle tick."""
+        the head of every Weg-2 leg (join=True: the finisher is WAITED FOR
+        first, so no pause overtakes a grade still reading the pages --
+        #1450b, boot weg2xsn208) and from the scheduler's idle tick
+        (join=False: never blocks the loop; a grade still running is simply
+        not graded yet)."""
+        fin = getattr(self, "_weg2_seam_finisher", None)
+        if fin is not None and fin.is_alive():
+            if not join:
+                return
+            t0 = time.perf_counter()
+            fin.join(timeout=180.0)
+            logger.info("WEG2-SEAM-DIGEST finisher joined at the next leg in %.0f ms (#1450b)%s",
+                        (time.perf_counter() - t0) * 1000,
+                        "" if not fin.is_alive() else " -- STILL RUNNING after 180 s")
+        if fin is not None and not fin.is_alive():
+            self._weg2_seam_finisher = None
         pending = getattr(self, "weg2_seam_pending_refusal", None)
         if pending is not None:
             self.weg2_seam_pending_refusal = None
