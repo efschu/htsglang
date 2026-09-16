@@ -3050,6 +3050,12 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         try:
             if any(int(getattr(cd, "host_lock_ref", 0) or 0) > 0 for cd in node.component_data):
                 return
+            # Boot xsn151: a node whose device copy was already evicted is a
+            # host leaf -- freeing its host rows leaves it "dead: no Full
+            # device and no Full host" (sanity_check, P stopped). Transit
+            # applies only while the device copy is still there.
+            if node.component_data[BASE_COMPONENT_TYPE].value is None or getattr(node, "evicted", False):
+                return
             freed = 0
             for comp in self._components_tuple:
                 _, hf = self._evict_component_and_detach_lru(
