@@ -44,6 +44,7 @@ from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.moe import get_moe_a2a_backend, should_use_dp_reduce_scatterv
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.utils import PPMissingLayer
 from sglang.srt.layers.quantization.compressed_tensors.ct_embedding import (
     vocab_named_in_targets,
 )
@@ -56,7 +57,11 @@ from sglang.srt.layers.quantization.modelopt_quant import (
 from sglang.srt.layers.quantization.unquant import UnquantizedEmbeddingMethod
 from sglang.srt.layers.utils import get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.forward_batch_info import (
+    ForwardBatch,
+    ForwardMode,
+    PPProxyTensors,
+)
 from sglang.srt.model_executor.forward_context import (
     get_attn_backend,
     get_req_to_token_pool,
@@ -1753,6 +1758,10 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
         # and, being no Linear, absent from the ignore list) keeps the dense
         # embedding it always had; the ignore-only vocab rule would have
         # called it quantized.
+        if not self.pp_group.is_first_rank:
+            # WP5: like the base backbone -- only the first pipeline stage
+            # embeds (the meta probe built a full embedding on every stage).
+            return PPMissingLayer()
         name = add_prefix("embed_tokens", prefix)
         raw = getattr(quant_config, "config", None)
         vocab_quant = (
@@ -1795,6 +1804,12 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
             hc_per_branch_norm=True,
         )
         self.hyper_connection_mixer = GatedResidual(hc_config, use_combine=False)
+        # WP5 (PP=3 prefill): the PLE batch (n-gram hashing, prefetch, commit)
+        # is only built on the stage that owns a PLE layer.
+        self._stage_has_ple = self.has_ple and any(
+            getattr(self.layers[i], "ple", None) is not None
+            for i in range(self.start_layer, self.end_layer)
+        )
 
     def forward(
         self,
@@ -1802,11 +1817,26 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         inputs_embeds: Optional[torch.Tensor] = None,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
-        if inputs_embeds is not None:
-            hidden_states = inputs_embeds
+        # WP5: under pipeline parallelism the activation crossing a stage
+        # boundary is the hyper-connection stream (hc_count x hidden), which
+        # the decoder layers pass along as ``hidden_states`` with a None
+        # residual (see _postprocess_qwen4_exp_layer). The first stage embeds;
+        # every later stage takes the stream out of the proxy.
+        if self.pp_group.is_first_rank:
+            if inputs_embeds is not None:
+                hidden_states = inputs_embeds
+            else:
+                hidden_states = self.embed_tokens(input_ids)
+        elif pp_proxy_tensors is not None:
+            hidden_states = pp_proxy_tensors["hidden_states"]
         else:
-            hidden_states = self.embed_tokens(input_ids)
+            raise AssertionError(
+                "a non-first PP stage of Qwen4-Exp entered the forward without "
+                "pp_proxy_tensors: the hyper-connection stream of the previous "
+                "stage did not arrive."
+            )
 
         ple_batch = (
             _prepare_ple_batch(
@@ -1815,7 +1845,7 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
                 ngram_size=self.ple_ngram_size,
                 ngram_eos_token_id=self.ple_ngram_eos_token_id,
             )
-            if self.has_ple
+            if self._stage_has_ple
             else None
         )
         residual = None
@@ -1840,7 +1870,13 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
                     ),
                 )
 
-        _commit_ple_batch(ple_batch, forward_batch)
+        if ple_batch is not None:
+            _commit_ple_batch(ple_batch, forward_batch)
+
+        if not self.pp_group.is_last_rank:
+            # Hand the hyper-connection stream to the next stage. The residual
+            # is None between Qwen4-Exp layers, so it is not part of the proxy.
+            return PPProxyTensors({"hidden_states": hidden_states})
 
         hc_hidden_states = hidden_states
         hidden_states, _ = self.hyper_connection_mixer.mix(hidden_states)
@@ -1884,11 +1920,12 @@ class Qwen4ExpVLModel(Qwen4ExpModel):
             positions=positions,
             forward_batch=forward_batch,
             inputs_embeds=input_embeds,
+            pp_proxy_tensors=pp_proxy_tensors,
         )
         if isinstance(model_output, tuple):
             hidden_states, self.last_hc_hidden_states = model_output
             return hidden_states
-        return model_output
+        return model_output  # a tensor, or the PPProxyTensors of a non-last stage
 
 
 _HC_PACKED_SUFFIXES = (".weight_packed", ".weight_scale", ".weight_shape")
