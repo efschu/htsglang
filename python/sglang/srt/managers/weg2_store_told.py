@@ -274,6 +274,32 @@ def _local_prefix(req) -> int:
         return 0
 
 
+def _anchored_pages_full_span(cc, ids, page_size: int):
+    """#1416c (boot xsn174): ``store_presence_pages`` asks the store about
+    the FIRST ``STORAGE_BATCH_SIZE`` (128) pages only -- a 98,550-token span
+    whose anchor sits on its last page answered 0, so told was clamped to 0
+    and P recomputed 98k tokens it had just read back from the arena. Ask
+    the whole span, the way ``_storage_hit_query`` does: one
+    ``batch_exists_v2`` over every page key with the tree's component
+    transfers (the mamba anchor is the trailing-pages pool). None = the
+    question could not be asked.
+    """
+    try:
+        hashes = cc.get_hash_str(list(ids), None, page_size=page_size)
+        if not hashes:
+            return 0
+        transfers = cc._presence_pool_transfers()
+        backend = cc.storage_backend
+        from sglang.srt.mem_cache.hicache_storage import HiCacheStorageExtraInfo
+        extra = HiCacheStorageExtraInfo(prefix_keys=None)
+        if transfers:
+            return int(backend.batch_exists_v2(list(hashes), transfers, extra).kv_hit_pages or 0)
+        return int(backend.batch_exists(list(hashes), extra) or 0)
+    except Exception as exc:  # noqa: BLE001 - see the docstring
+        logger.warning("#1416c full-span anchor probe unavailable: %r", exc)
+        return None
+
+
 def _anchor_clamp(scheduler, req, told: int) -> int:
     """#1416 (boots xsn159/162/167): the completed prefix counts KV pages; the
     admission match accepts a prefix only up to the deepest page that also
@@ -291,12 +317,16 @@ def _anchor_clamp(scheduler, req, told: int) -> int:
         cc = getattr(scheduler, "cache_controller", None) or getattr(
             getattr(scheduler, "tree_cache", None), "cache_controller", None
         )
-        probe = getattr(cc, "store_presence_pages", None)
         ids = getattr(req, "origin_input_ids", None)
-        if not callable(probe) or not ids:
+        if cc is None or not callable(getattr(cc, "get_hash_str", None)) or not ids:
             return int(told)
         page_size = int(getattr(cc, "page_size", 1) or 1)
-        pages = int(probe(list(ids[: int(told)]), None) or 0)
+        pages = _anchored_pages_full_span(cc, list(ids[: int(told)]), page_size)
+        if pages is None:
+            # the full-span question could not be asked: no clamp (the
+            # pre-#1416 number; #1419 caps every rank's match to told, so a
+            # too-large told recomputes on all ranks alike, it never diverges)
+            return int(told)
         anchored = min(int(told), pages * page_size)
         if anchored < int(told):
             logger.warning(

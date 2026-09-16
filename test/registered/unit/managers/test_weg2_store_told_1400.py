@@ -330,12 +330,22 @@ def test_follower_that_already_holds_the_told_span_is_satisfied_without_a_read()
 def test_1416_told_is_clamped_to_the_anchored_presence():
     from sglang.srt.managers import weg2_store_told as wst
 
+    class _Backend:
+        hit = 4095
+
+        def batch_exists_v2(self, keys, transfers, extra):
+            assert len(keys) == 53247, "the WHOLE span, not a 128-page batch (#1416c)"
+            return types.SimpleNamespace(kv_hit_pages=self.hit)
+
     class _CC:
         page_size = 1
+        storage_backend = _Backend()
 
-        def store_presence_pages(self, ids, last_hash, prefix_keys=None):
-            assert len(ids) == 53247
-            return 4095
+        def get_hash_str(self, ids, last_hash, page_size=1):
+            return ["h%d" % i for i in range(len(ids))]
+
+        def _presence_pool_transfers(self):
+            return ["mamba"]
 
     class _Req:
         origin_input_ids = list(range(60000))
@@ -343,8 +353,10 @@ def test_1416_told_is_clamped_to_the_anchored_presence():
 
     sched = types.SimpleNamespace(cache_controller=_CC())
     assert wst._anchor_clamp(sched, _Req(), 53247) == 4095
-    sched.cache_controller.store_presence_pages = lambda ids, lh, prefix_keys=None: 99999
+    _Backend.hit = 99999
     assert wst._anchor_clamp(sched, _Req(), 53247) == 53247, "never above completed"
+    sched.cache_controller.get_hash_str = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("x"))
+    assert wst._anchor_clamp(sched, _Req(), 53247) == 53247, "unaskable: no clamp"
     assert wst._anchor_clamp(types.SimpleNamespace(), _Req(), 7) == 7, "no probe: no clamp"
     assert wst._anchor_clamp(sched, _Req(), 0) == 0
 
@@ -370,9 +382,14 @@ def test_1416b_pp0_record_follows_the_clamp(monkeypatch):
 
     class _CC:
         page_size = 1
+        storage_backend = types.SimpleNamespace(
+            batch_exists_v2=lambda keys, t, e: types.SimpleNamespace(kv_hit_pages=0))
 
-        def store_presence_pages(self, ids, lh, prefix_keys=None):
-            return 0
+        def get_hash_str(self, ids, last_hash, page_size=1):
+            return ["h"] * len(ids)
+
+        def _presence_pool_transfers(self):
+            return ["mamba"]
 
     req = _Req()
     sched = types.SimpleNamespace(
