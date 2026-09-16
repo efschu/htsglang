@@ -813,6 +813,23 @@ def _prefetch_checkpoint_file(file_path: str) -> None:
             pass
 
 
+def prefetch_share_of_rank(
+    local_rank: int, local_size: int, rank_in_group: int, world_size: int
+) -> tuple:
+    """(index, count) of this rank's share of the checkpoint files to warm.
+
+    Under --rank-gpu-id every rank is its own process with CUDA_VISIBLE_DEVICES
+    narrowed to one card, so ``local_rank`` is 0 and ``local_size`` 1 on every
+    rank of the node -- fn1w boot 2026-09-16: all three TP ranks logged
+    "Rank 0: prefetching 13/38" and warmed the SAME third of the files. When
+    the local view collapses to one rank while the world has more, the
+    world rank is the share index (single-node rig; on a multi-node world
+    this merely spreads the warm-up thinner per node, never wrongly)."""
+    if local_size <= 1 and world_size > 1:
+        return int(rank_in_group), int(world_size)
+    return int(local_rank), int(local_size)
+
+
 def _prefetch_all_checkpoints(
     sorted_files: List[str],
     num_threads: int = 4,
@@ -843,8 +860,12 @@ def _prefetch_all_checkpoints(
     # across nodes, but page cache is not shared across nodes.
     if torch.distributed.is_initialized():
         world_group = get_world_group()
-        local_rank = world_group.local_rank
-        local_world_size = world_group.local_size or world_group.world_size
+        local_rank, local_world_size = prefetch_share_of_rank(
+            world_group.local_rank,
+            world_group.local_size or world_group.world_size,
+            world_group.rank_in_group,
+            world_group.world_size,
+        )
     else:
         local_rank = 0
         local_world_size = 1
