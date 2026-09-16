@@ -14,6 +14,7 @@ import pytest
 import torch
 
 from sglang.srt.layers.attention.qsa.kernel import qsa_sparse_attention_reference
+from sglang.srt.layers.attention.qsa.sparse_attn import qwen_sparse_kv_extraction_compact_triton
 from sglang.srt.layers.attention.qsa.sparse_attn import (
     merge_partial_attention,
     sparse_attn_rows_reference,
@@ -224,3 +225,28 @@ def test_attend_rows_returns_the_query_dtype_after_the_merge(monkeypatch):
     q = torch.randn(3, 4, 8).bfloat16()
     out = b._attend_rows(q, SimpleNamespace(layer_id=0, scaling=0.1), torch.zeros(3, 2, dtype=torch.int32))
     assert out.dtype == torch.bfloat16 and out.shape == q.shape
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel")
+@pytest.mark.parametrize("kv_dtype", [torch.bfloat16, torch.float8_e4m3fn])
+def test_compact_kernel_gathers_fp8_pool_rows_on_the_metal(kv_dtype):
+    """fn5d 2026-09-16 (PP=3, a 3080 stage): the paged decode path gathers
+    the selected rows with `_compact_kv`, which read the FP8 pool as fp8e4nv
+    and failed to compile below sm89.  Bytes are now decoded in-kernel."""
+    torch.manual_seed(0)
+    heads, dim, topk, batch = 2, 32, 8, 2
+    pool = torch.randn(64, heads, dim, device="cuda").to(kv_dtype)
+    vpool = torch.randn(64, heads, dim, device="cuda").to(kv_dtype)
+    req_to_token = torch.arange(64, device="cuda", dtype=torch.int32).view(2, 32)
+    req_indices = torch.tensor([0, 1], device="cuda", dtype=torch.int32)
+    indices = torch.tensor([[3, 5, 7, 9, 11, 13, -1, -1], [0, 1, 2, 4, 6, 8, 10, 12]],
+                           device="cuda", dtype=torch.int32)
+    seq_lens = torch.tensor([32, 32], device="cuda", dtype=torch.int32)
+    cu_k = torch.tensor([0, 6, 14], device="cuda", dtype=torch.int32)
+    out_k = torch.zeros(14, heads, dim, device="cuda", dtype=torch.bfloat16)
+    out_v = torch.zeros(14, heads, dim, device="cuda", dtype=torch.bfloat16)
+    qwen_sparse_kv_extraction_compact_triton(
+        pool, vpool, req_to_token, req_indices, indices, seq_lens, cu_k, out_k, out_v, batch, topk)
+    exp_rows = torch.tensor([3, 5, 7, 9, 11, 13, 32, 33, 34, 36, 38, 40, 42, 44], device="cuda")
+    assert torch.equal(out_k, pool[exp_rows].to(torch.bfloat16))
+    assert torch.equal(out_v, vpool[exp_rows].to(torch.bfloat16))

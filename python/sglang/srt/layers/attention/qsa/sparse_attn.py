@@ -392,6 +392,7 @@ def _compact_kv(
     BLOCK_TOPK: tl.constexpr,
     BLOCK_D: tl.constexpr,
     ZERO_FILL: tl.constexpr,
+    KV_FP8: tl.constexpr = False,
 ):
     batch, head, block = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     cols = block * BLOCK_TOPK + tl.arange(0, BLOCK_TOPK)
@@ -430,16 +431,17 @@ def _compact_kv(
     # without per-tensor k/v scales (see set_kv_buffer calls in
     # qwen_sparse_attn_backend.py), so no scale is applied here either.
     out_dtype = out_k.dtype.element_ty
-    tl.store(
-        out_k + dst,
-        tl.load(k + src, mask=load_mask, other=0.0).to(out_dtype),
-        mask=store_mask,
-    )
-    tl.store(
-        out_v + dst,
-        tl.load(v + src, mask=load_mask, other=0.0).to(out_dtype),
-        mask=store_mask,
-    )
+    # fn5d 2026-09-16 (PP=3, 3080 stage): Triton refuses fp8e4nv below sm89, so
+    # an FP8 pool arrives as uint8 bytes (KV_FP8) and is decoded here -- the
+    # same helper the DCP rows kernel uses (WP3b).
+    if KV_FP8:
+        k_vals = _fp8_e4m3_bytes_to_f32(tl.load(k + src, mask=load_mask, other=0)).to(out_dtype)
+        v_vals = _fp8_e4m3_bytes_to_f32(tl.load(v + src, mask=load_mask, other=0)).to(out_dtype)
+    else:
+        k_vals = tl.load(k + src, mask=load_mask, other=0.0).to(out_dtype)
+        v_vals = tl.load(v + src, mask=load_mask, other=0.0).to(out_dtype)
+    tl.store(out_k + dst, k_vals, mask=store_mask)
+    tl.store(out_v + dst, v_vals, mask=store_mask)
 
 
 def qwen_sparse_valid_counts_triton(seq_lens, indices, counts, batch, topk):
@@ -489,6 +491,10 @@ def qwen_sparse_kv_extraction_compact_triton(
     block_topk = 16
     zero_fill = zero_fill_cols > 0
     num_cols = zero_fill_cols if zero_fill else topk
+    kv_fp8 = k.dtype == torch.float8_e4m3fn
+    if kv_fp8:
+        # 1 byte per element either way; decoded in-kernel (fn5d, sm86 stages)
+        k, v = k.view(torch.uint8), v.view(torch.uint8)
     _compact_kv[(batch, heads, triton.cdiv(num_cols, block_topk))](
         k,
         v,
@@ -508,6 +514,7 @@ def qwen_sparse_kv_extraction_compact_triton(
         BLOCK_TOPK=block_topk,
         BLOCK_D=triton.next_power_of_2(dim),
         ZERO_FILL=zero_fill,
+        KV_FP8=kv_fp8,
         num_warps=8,
     )
 
