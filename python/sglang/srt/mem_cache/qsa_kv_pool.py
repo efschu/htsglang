@@ -88,10 +88,14 @@ class QSATokenToKVPool(HybridLinearKVPool):
             use_mla=False,
             start_layer=start_layer,
             full_kv_pool_class=full_kv_pool_class,
-            quant_method=quant_method,
             post_capture_active=post_capture_active,
             **fork_pool_kwargs,
         )
+        # Upstream's HybridLinearKVPool takes the KV quant method; this line's
+        # pool sizes fp8 KV by dtype and has no such parameter (fn1o boot,
+        # 2026-09-16: "unexpected keyword argument 'quant_method'"). Kept on
+        # the instance for the QSA buffers that consult it.
+        self.quant_method = quant_method
         if (
             min(
                 qsa_index_kv_heads,
