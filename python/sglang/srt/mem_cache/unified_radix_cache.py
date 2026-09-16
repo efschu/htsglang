@@ -3025,6 +3025,45 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             usable_units, target_units, ok, getattr(UnifiedRadixCache, "_weg2_end_anchor_short", 0),
         )
 
+    def _weg2_publish_window(self) -> int:
+        """Tokens one publish piece may span: a quarter of the host pool,
+        page-aligned, at least one chunk; 0 = no splitting (no host pool)."""
+        pool = getattr(self.cache_controller, "mem_pool_host", None)
+        size = int(getattr(pool, "size", 0) or 0)
+        if size <= 0:
+            return 0
+        page = max(1, int(getattr(self, "page_size", 1) or 1))
+        chunk = 4096
+        w = (size // 4) // chunk * chunk
+        return max(chunk, w) // page * page
+
+    def _weg2_split_for_publish(self, node, window: int):
+        """Split ``node`` (longer than ``window``) into a chain of pieces of
+        at most ``window`` tokens: head pieces are new KV-only nodes, the
+        original node becomes the tail (keeping its mamba anchor and its
+        children). Returns the tail, whose parent is the last head piece;
+        the caller backs the pieces up parents-first as the walk proceeds."""
+        try:
+            pieces = 0
+            while len(node.key) > window:
+                head = self._split_node(node.key, node, window)
+                pieces += 1
+                if head is None:
+                    break
+            if pieces:
+                n = getattr(self, "_weg2_split_publish_n", 0) + 1
+                self._weg2_split_publish_n = n
+                if n <= 16 or n % 64 == 0:
+                    logger.info(
+                        "WEG2 PUBLISH-SPLIT n=%d node=%s pieces=%d window=%d tail_tokens=%d",
+                        n, getattr(node, "id", "?"), pieces + 1, window, len(node.key),
+                    )
+            return node if pieces else None
+        except Exception as e:  # noqa: BLE001 - a split that fails leaves the node whole
+            logger.warning("WEG2 PUBLISH-SPLIT failed on node %s: %s: %s",
+                           getattr(node, "id", "?"), type(e).__name__, e)
+            return None
+
     def publish_unbacked_sweep(self, max_issue: int = 64) -> dict:
         """#1233 zero-remainder: back every un-backed device node up before a flush.
 
@@ -3075,6 +3114,20 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             stats["unbacked"] += 1
             if stats["issued"] >= max_issue:
                 continue
+            # #1407 (boot xsn148, 80k prompts): a node longer than the host
+            # pool can hold is refused whole by write_backup (77,822 tokens
+            # against 54,254 slots on P: refused=13, D found nothing, the
+            # requests were re-queued to P). Publish it as a CHAIN of window
+            # pieces instead: the head pieces carry KV only (no mamba value,
+            # so no anchor pin is charged), the tail keeps the node's anchor,
+            # and D's claim covers the whole chain because the KV prefix is
+            # contiguous and the trailing page carries the anchor.
+            _w = self._weg2_publish_window()
+            if _w > 0 and len(node.key) > _w:
+                _tail = self._weg2_split_for_publish(node, _w)
+                if _tail is not None:
+                    queue.append(_tail)
+                    node = _tail.parent
             # write_back at the flip (user order 2026-09-15: "die eviction ist
             # der flip"): a node whose Mamba anchor cannot be pinned right now
             # is DEFERRED to the next /flush_cache poll, never issued without
