@@ -44,6 +44,9 @@ from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.moe import get_moe_a2a_backend, should_use_dp_reduce_scatterv
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.compressed_tensors.schemes.compressed_tensors_wNa16 import (
+    dequantize_pack_quantized_weight,
+)
 from sglang.srt.layers.quantization.modelopt_quant import (
     ModelOptMixedPrecisionConfig,
 )
@@ -70,7 +73,7 @@ from sglang.srt.models.qwen4_exp_ple_table import (
     make_ple_file_rss_trimmer,
 )
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import logger
+from sglang.srt.utils import add_prefix, logger
 
 # Decode/verify-sized batches only: at prefill sizes both chains are compute
 # bound and serializing them on one stream is faster than contending.
@@ -1719,11 +1722,22 @@ ALL_DECODER_LAYER_TYPES = {
 class Qwen4ExpModel(Qwen3_5ForCausalLM):
     decoder_layer_types = ALL_DECODER_LAYER_TYPES
 
-    def _build_embed_tokens(self, config: Qwen4ExpTextConfig) -> nn.Module:
+    def _build_embed_tokens(
+        self,
+        config: Qwen4ExpTextConfig,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+    ) -> nn.Module:
+        # quant_config + prefix: Minachist's AutoRound export packs
+        # embed_tokens (INT8 g128, group_3 `re:.*embed_tokens`); the vocab
+        # branch of the compressed-tensors config answers the dense
+        # UnquantizedEmbeddingMethod for every checkpoint that does not.
         return VocabParallelEmbedding(
             config.vocab_size,
             config.hidden_size,
             org_num_embeddings=config.vocab_size,
+            quant_config=quant_config,
+            prefix=add_prefix("embed_tokens", prefix),
             use_attn_tp_group=is_dp_attention_enabled(),
         )
 
@@ -1847,6 +1861,41 @@ class Qwen4ExpVLModel(Qwen4ExpModel):
             hidden_states, self.last_hc_hidden_states = model_output
             return hidden_states
         return model_output
+
+
+_HC_PACKED_SUFFIXES = (".weight_packed", ".weight_scale", ".weight_shape")
+
+
+def load_packed_hc_linear(
+    pending: dict, name: str, loaded_weight: torch.Tensor, params_dict: dict
+) -> bool:
+    """Minachist's AutoRound export quantizes the hyper-connection mixers
+    (``*_hyper_connection.input_mix_weight_down/up``, INT8 g64) which this
+    line keeps as plain ``nn.Linear`` (3 MB each). The packed payload and its
+    scale are collected per module in ``pending`` and, once both are there,
+    widened into the dense parameter. Returns True when ``name`` was one of
+    those tensors. The ``weight_shape`` tensor is implied by the module."""
+    if "hyper_connection" not in name or ".input_mix_weight_" not in name:
+        return False
+    suffix = next((s for s in _HC_PACKED_SUFFIXES if name.endswith(s)), None)
+    if suffix is None:
+        return False
+    module_name = name[: -len(suffix)]
+    if suffix == ".weight_shape":
+        return True
+    param_name = module_name + ".weight"
+    if param_name not in params_dict:
+        raise KeyError(f"packed hyper-connection weight without a module: {name}")
+    slot = pending.setdefault(module_name, {})
+    slot[suffix[1:]] = loaded_weight
+    if "weight_packed" in slot and "weight_scale" in slot:
+        param = params_dict[param_name]
+        dense = dequantize_pack_quantized_weight(
+            slot["weight_packed"], slot["weight_scale"], param.shape
+        )
+        param.data.copy_(dense.to(param.dtype))
+        del pending[module_name]
+    return True
 
 
 class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
@@ -2108,6 +2157,7 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
         loaded_buffers: Set[str] = set()
         loaded_shard_params: Set[str] = set()
         skipped_visual_count = 0
+        hc_packed_pending: dict = {}
 
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
@@ -2126,6 +2176,8 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
             elif name.endswith(".v_proj.v_scale"):
                 name = name.replace(".v_proj.v_scale", ".attn.v_scale")
 
+            if load_packed_hc_linear(hc_packed_pending, name, loaded_weight, params_dict):
+                continue
             if self._load_qwen4_exp_ple_buffer(
                 name, loaded_weight, buffers, loaded_buffers
             ):
@@ -2267,6 +2319,11 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
 
         loaded_params.update(loaded_buffers)
         loaded_params.update(loaded_shard_params)
+        if hc_packed_pending:
+            raise ValueError(
+                "packed hyper-connection weights without their scale (or vice versa): "
+                f"{sorted(hc_packed_pending)}"
+            )
 
         if skipped_visual_count > 0:
             logger.info(

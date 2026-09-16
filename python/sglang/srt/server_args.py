@@ -4710,6 +4710,7 @@ class ServerArgs:
             "CPU pinned memory (or a file-backed table, see --ple-offload-backend). "
             "Default: enabled for bf16 Qwen4-Exp on CUDA; --no-ple-offload-embedding disables.",
             action=argparse.BooleanOptionalAction,
+            resolvable=True,
         ),
     ] = None
     ple_offload_backend: A[

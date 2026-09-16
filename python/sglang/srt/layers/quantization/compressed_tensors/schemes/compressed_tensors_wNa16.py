@@ -63,6 +63,42 @@ WNA16_ZP_SUPPORTED_TYPES_MAP = {4: scalar_types.uint4, 8: scalar_types.uint8}
 WNA16_SUPPORTED_BITS = list(WNA16_SUPPORTED_TYPES_MAP.keys())
 
 
+def dequantize_pack_quantized_weight(
+    packed: torch.Tensor, scale: torch.Tensor, shape: torch.Size
+) -> torch.Tensor:
+    """Dense float weight of a compressed-tensors ``pack-quantized`` linear
+    (symmetric, group strategy, ``packed_dim=1``): ``packed`` is int32
+    ``[out, in/pack_factor]``, ``scale`` is ``[out, in/group]``. Used for the
+    handful of layers this line keeps as plain ``nn.Linear`` (the
+    hyper-connection mixers, a few MB each) -- their bits are read from the
+    checkpoint as they are and widened to the module dtype at load time."""
+    from compressed_tensors.compressors.pack_quantized.helpers import unpack_from_int32
+
+    out_features, in_features = int(shape[0]), int(shape[1])
+    if packed.dtype != torch.int32 or packed.dim() != 2 or packed.shape[0] != out_features:
+        raise ValueError(
+            f"pack-quantized weight: packed {tuple(packed.shape)} {packed.dtype} "
+            f"does not fit a [{out_features}, {in_features}] weight"
+        )
+    if in_features % packed.shape[1] != 0 or 32 % (in_features // packed.shape[1]) != 0:
+        raise ValueError(
+            f"pack-quantized weight: {in_features} inputs in {packed.shape[1]} "
+            "int32 columns is no whole pack factor"
+        )
+    num_bits = 32 // (in_features // packed.shape[1])
+    if scale.dim() != 2 or scale.shape[0] != out_features or in_features % scale.shape[1] != 0:
+        raise ValueError(
+            f"pack-quantized weight: scale {tuple(scale.shape)} does not fit "
+            f"[{out_features}, {in_features}]"
+        )
+    group = in_features // scale.shape[1]
+    q = unpack_from_int32(packed, num_bits, torch.Size((out_features, in_features)))
+    dense = q.view(out_features, scale.shape[1], group).to(torch.float32) * scale.to(
+        torch.float32
+    ).unsqueeze(-1)
+    return dense.view(out_features, in_features)
+
+
 def unpack_dense_subbyte(packed: torch.Tensor, bits: int, n_elems: int) -> torch.Tensor:
     """Unpack a dense little-endian bitstream of ``bits``-wide unsigned values
     (compressed-tensors ``pack-quantized`` for 32 % bits != 0) into int32.

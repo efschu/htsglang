@@ -1527,7 +1527,7 @@ class Qwen3_5ForCausalLM(nn.Module):
         alt_stream = get_stream("alt") if _is_cuda or _hip_use_alt_stream else None
 
         # Embedding layer
-        self.embed_tokens = self._build_embed_tokens(config)
+        self.embed_tokens = self._build_embed_tokens(config, quant_config, prefix)
 
         # Decoder layers
         def get_layer(idx: int, prefix: str):
@@ -1570,8 +1570,16 @@ class Qwen3_5ForCausalLM(nn.Module):
 
         self.layers_to_capture = []
 
-    def _build_embed_tokens(self, config: Qwen3_5TextConfig) -> nn.Module:
-        """Embedding sharding hook for models reusing this backbone."""
+    def _build_embed_tokens(
+        self,
+        config: Qwen3_5TextConfig,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+    ) -> nn.Module:
+        """Embedding sharding hook for models reusing this backbone. The
+        base backbone keeps its embedding dense (no quant_config), as it
+        always did for the Qwen3.5/3.6/3.8-27B checkpoints; a subclass whose
+        checkpoint packs the vocab (Qwen4-Exp / Minachist) passes them on."""
         if not self.pp_group.is_first_rank:
             return PPMissingLayer()
         return VocabParallelEmbedding(

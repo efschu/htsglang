@@ -60,6 +60,7 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     nvfp4_unpackable_reason,
 )
 from sglang.srt.layers.quantization.compressed_tensors.utils import (
+    FALLBACK_FUSED_SHARDS,
     find_matched_target,
     is_activation_quantization_format,
     should_ignore_layer,
@@ -1096,6 +1097,32 @@ class CompressedTensorsConfig(QuantizationConfig):
         )
         return CompressedTensorsW4A4Fp4Dequant()
 
+    def _explicit_target_scheme(self, layer_name: str | None):
+        """The scheme of a layer whose NAME (or, for a fused module, every
+        shard name) is listed verbatim as a target; None when it is not."""
+        if not self.target_scheme_map or not layer_name:
+            return None
+        hit = self.target_scheme_map.get(layer_name)
+        if hit is not None:
+            return hit
+        proj_name = layer_name.split(".")[-1]
+        fused_mapping = self.packed_modules_mapping
+        if proj_name not in fused_mapping and proj_name in FALLBACK_FUSED_SHARDS:
+            fused_mapping = FALLBACK_FUSED_SHARDS
+        if proj_name not in fused_mapping:
+            return None
+        stem = layer_name[: -len(proj_name)]
+        shards = [stem + shard for shard in fused_mapping[proj_name]]
+        schemes = [self.target_scheme_map.get(shard) for shard in shards]
+        if any(scheme is None for scheme in schemes):
+            return None
+        if any(scheme != schemes[0] for scheme in schemes[1:]):
+            raise ValueError(
+                f"Found different quantization schemes for {shards} in "
+                f"{layer_name}. SGLang requires all to use the same scheme."
+            )
+        return schemes[0]
+
     def get_scheme_dict(
         self, layer: torch.nn.Module, layer_name: str | None = None
     ) -> dict[str, QuantizationArgs | str | None] | None:
@@ -1114,15 +1141,14 @@ class CompressedTensorsConfig(QuantizationConfig):
         # draft), which also makes a parent entry such as
         # "model.language_model.layers.0.linear_attn" (Minachist's AutoRound
         # export lists the GDN module itself as ignored) swallow its quantized
-        # child "...linear_attn.in_proj_qkv" -- a child the same config names
-        # as a target with its 6-bit scheme. compressed-tensors' own matcher
-        # resolves such a name to the target; so do we.
-        if (
-            self.target_scheme_map
-            and layer_name is not None
-            and layer_name in self.target_scheme_map
-        ):
-            return self.target_scheme_map[layer_name]
+        # children "...linear_attn.in_proj_qkv" / "in_proj_z" -- children the
+        # same config names as targets with their 6-bit scheme. The fused
+        # module "in_proj_qkvz" resolves the same way through its shards.
+        # compressed-tensors' own matcher resolves such names to the target;
+        # so do we.
+        explicit = self._explicit_target_scheme(layer_name)
+        if explicit is not None:
+            return explicit
 
         if should_ignore_layer(
             layer_name, ignore=self.ignore, fused_mapping=self.packed_modules_mapping

@@ -150,3 +150,94 @@ def test_explicit_target_wins_over_a_parent_entry_in_the_ignore_list(monkeypatch
     assert isinstance(six, CompressedTensorsWNA16) and six.src_num_bits == 6 and six.group_size == 64
     assert cfg.get_linear_scheme(layer=torch.nn.Module(), layer_name=parent + ".in_proj_b") is None
     assert cfg.get_linear_scheme(layer=torch.nn.Module(), layer_name="model.language_model.layers.0.mlp.gate") is None
+
+
+def test_fused_module_resolves_through_its_explicitly_targeted_shards(monkeypatch):
+    """The GDN in-projection is one fused module ``in_proj_qkvz`` built from
+    the checkpoint's ``in_proj_qkv`` + ``in_proj_z`` (both INT6 targets)
+    while their parent ``linear_attn`` sits in the ignore list; the sibling
+    ``in_proj_ba`` (shards in_proj_b/in_proj_a) is bf16 in the checkpoint
+    and listed in ignore. Shards with different schemes are refused."""
+    from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
+        CompressedTensorsConfig,
+    )
+    from sglang.srt.layers.quantization.compressed_tensors.schemes import (
+        CompressedTensorsWNA16,
+    )
+
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a, **k: (8, 6), raising=False)
+    la = "model.language_model.layers.0.linear_attn"
+    six = {"num_bits": 6, "group_size": 64, "symmetric": True, "strategy": "group", "type": "int"}
+    eight = {"num_bits": 8, "group_size": 64, "symmetric": True, "strategy": "group", "type": "int"}
+    base = {
+        "quant_method": "compressed-tensors",
+        "format": "pack-quantized",
+        "quantization_status": "compressed",
+        "kv_cache_scheme": None,
+        "packed_modules_mapping": {
+            "in_proj_qkvz": ["in_proj_qkv", "in_proj_z"],
+            "in_proj_ba": ["in_proj_b", "in_proj_a"],
+        },
+        "ignore": [la, la + ".in_proj_b", la + ".in_proj_a"],
+    }
+    cfg = CompressedTensorsConfig.from_config(
+        dict(base, config_groups={"group_0": {"targets": [la + ".in_proj_qkv", la + ".in_proj_z"], "weights": six}})
+    )
+    fused = cfg.get_linear_scheme(layer=torch.nn.Module(), layer_name=la + ".in_proj_qkvz")
+    assert isinstance(fused, CompressedTensorsWNA16) and fused.src_num_bits == 6
+    assert cfg.get_linear_scheme(layer=torch.nn.Module(), layer_name=la + ".in_proj_ba") is None
+
+    mixed = CompressedTensorsConfig.from_config(
+        dict(
+            base,
+            config_groups={
+                "group_0": {"targets": [la + ".in_proj_qkv"], "weights": six},
+                "group_1": {"targets": [la + ".in_proj_z"], "weights": eight},
+            },
+        )
+    )
+    with pytest.raises(ValueError, match="different quantization schemes"):
+        mixed.get_linear_scheme(layer=torch.nn.Module(), layer_name=la + ".in_proj_qkvz")
+
+
+def test_dequantize_pack_quantized_weight_roundtrips_int8_g64():
+    from sglang.srt.layers.quantization.compressed_tensors.schemes.compressed_tensors_wNa16 import (
+        dequantize_pack_quantized_weight,
+    )
+
+    out, inp, group = 6, 256, 64
+    g = torch.Generator().manual_seed(11)
+    q = torch.randint(-128, 128, (out, inp), generator=g, dtype=torch.int8)
+    scale = (torch.rand(out, inp // group, generator=g) + 0.5) / 127
+    packed = pack_to_int32(q, 8, packed_dim=1)
+    assert packed.shape == (out, inp // 4)
+    ref = (q.view(out, inp // group, group).float() * scale.unsqueeze(-1)).view(out, inp)
+    got = dequantize_pack_quantized_weight(packed, scale.to(torch.float16), torch.Size((out, inp)))
+    assert torch.allclose(got, ref, atol=1e-3, rtol=1e-2)
+    with pytest.raises(ValueError, match="does not fit"):
+        dequantize_pack_quantized_weight(packed, scale, torch.Size((out + 1, inp)))
+
+
+def test_load_packed_hc_linear_widens_into_the_dense_parameter():
+    """Packed and scale arrive as two separate tensors (any order); the
+    weight_shape tensor is absorbed; a foreign name is not claimed."""
+    from sglang.srt.models.qwen4_exp import load_packed_hc_linear
+
+    out, inp, group = 6, 256, 64
+    g = torch.Generator().manual_seed(5)
+    q = torch.randint(-128, 128, (out, inp), generator=g, dtype=torch.int8)
+    scale = (torch.rand(out, inp // group, generator=g) + 0.5) / 127
+    packed = pack_to_int32(q, 8, packed_dim=1)
+    ref = (q.view(out, inp // group, group).float() * scale.unsqueeze(-1)).view(out, inp)
+    mod = "model.layers.3.attn_hyper_connection.input_mix_weight_down"
+    param = torch.nn.Parameter(torch.zeros(out, inp, dtype=torch.bfloat16))
+    params = {mod + ".weight": param}
+    pending = {}
+    assert load_packed_hc_linear(pending, mod + ".weight_shape", torch.tensor([out, inp]), params)
+    assert load_packed_hc_linear(pending, mod + ".weight_scale", scale.to(torch.float16), params)
+    assert pending and torch.count_nonzero(param) == 0  # waits for the payload
+    assert load_packed_hc_linear(pending, mod + ".weight_packed", packed, params)
+    assert not pending
+    assert torch.allclose(param.float(), ref, atol=2e-2, rtol=2e-2)
+    assert not load_packed_hc_linear(pending, "model.layers.3.linear_attn.out_proj.weight_packed", packed, params)
+    assert not load_packed_hc_linear(pending, mod + ".weight", ref, params)  # a bf16 export loads the plain way
