@@ -6545,7 +6545,15 @@ class Scheduler(
                 return "refused"
             limit = self._prefetch_capacity_limit_or_none()
             if not marked:
-                if span is not None and limit is not None and int(span) > int(limit):
+                # #1422 (boot xsn172): under WINDOWED store reads (staging host
+                # role, #1317j) a span above the budget is still servable -- the
+                # pool is transit -- so it is DEFERRED until rows free instead
+                # of sent to the recompute path (two re-queued 100k prompts
+                # recomputed 98k tokens each on P with every page in the arena).
+                _win = getattr(self, "_weg2_windowed_store_read_active", None)
+                _windowed = bool(_win()) if callable(_win) else False
+                if (span is not None and limit is not None and int(span) > int(limit)
+                        and not _windowed):
                     # Exit (1): can never land. Falls to the section-11.2
                     # ledger-cap degradation (recompute), counted.
                     _note_prefetch_gate("undeferrable")

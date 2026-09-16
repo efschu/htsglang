@@ -5634,6 +5634,7 @@ def choose_host_ledger(
     cgroup_root: str = "/sys/fs/cgroup",
     record_path: Optional[str] = None,
     pin_m_mib: int = 0,
+    pin_s_gb: int = 0,
     deviation_reason: str = "",
     riegel_gib: Optional[float] = None,
     model_digest_want: str = "",
@@ -6032,19 +6033,19 @@ def choose_host_ledger(
         try:
             arm, reap_headroom_gib, lines = host_ledger.choose(
                 mi["MemTotal"], mi["MemAvailable"],
-                arms=[(1, int(pin_m_mib))], **ledger_kw,
+                arms=[(int(pin_s_gb) if pin_s_gb else 1, int(pin_m_mib))], **ledger_kw,
             )
         except host_ledger.Weg2HostLedgerRefused as e:
             raise host_ledger.Weg2HostLedgerRefused(
                 f"W87 Weg2PinnedArmRefused: --pin-ledger-arm-m {int(pin_m_mib)} "
-                f"was priced by the ladder itself (S=1 M={int(pin_m_mib)}) and "
+                f"was priced by the ladder itself (S={int(pin_s_gb) if pin_s_gb else 1} M={int(pin_m_mib)}) and "
                 f"is not fundable: {e}. A pin selects among arms the ledger "
                 "would fund; it is not a way past the ledger's verdict, and the "
                 "host-threshold law admits no accept-the-risk branch. Pin a "
                 "smaller M, or drop the pin and let choose() ladder."
             ) from e
         lines = list(lines) + [
-            f"WEG2-LEDGER ARM PINNED by --pin-ledger-arm-m: S=1 M={int(pin_m_mib)} "
+            f"WEG2-LEDGER ARM PINNED by --pin-ledger-arm-m/-s: S={int(pin_s_gb) if pin_s_gb else 1} M={int(pin_m_mib)} "
             f"launch={arm.launch_leftover_gib:.2f} GiB "
             f"run={arm.run_leftover_gib:.2f} GiB "
             f"run_peak={arm.predicted_run_peak_gib():.2f} GiB "
@@ -9442,6 +9443,13 @@ def build_parser() -> argparse.ArgumentParser:
     # against the disk (max_size >= P pool bytes, W57). The two knobs below are
     # the only ones the disk form has, and both have a stated default.
     ap.add_argument(
+        "--pin-ledger-arm-s", type=int, default=5,
+        help="#1422 (boot xsn172): the pinned arm's host KV pool S (GB) for group P. "
+             "The ladder's S=1 gave PP0 a 54,254-token staging pool (cell 18,432 B), "
+             "so a re-queued 100k prompt could never be read back from the arena and "
+             "was recomputed on P (98k tokens, 29-57 s) with every page in L2. S=5 "
+             "holds 271k tokens on PP0 = the 262,144 cap plus one window. 0 = S=1.")
+    ap.add_argument(
         "--pin-ledger-arm-m", type=int, default=2400,
         help="#1317/#1318: PIN the host-ledger arm's mamba-host-pool size M (MiB) "
              "instead of letting `host_ledger.choose` pick it. 0 = choose. Default 2400 "
@@ -11346,6 +11354,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         # would keep reading the real box even under a test's mock.
         meminfo_path=MEMINFO_PATH, cgroup_root=CGROUP_ROOT,
         pin_m_mib=int(getattr(ns, "pin_ledger_arm_m", 0) or 0),
+        pin_s_gb=int(getattr(ns, "pin_ledger_arm_s", 0) or 0),
         # #1360: the operator's declaration, from argv and nowhere else.
         deviation_reason=str(getattr(ns, "host_ledger_deviation", "") or ""),
         riegel_gib=getattr(ns, "host_riegel_gib", None),
