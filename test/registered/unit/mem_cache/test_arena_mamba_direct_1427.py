@@ -141,3 +141,27 @@ def test_an_unbound_pool_hands_out_staging_slots_not_placeholders(tmp_path):
     ids = p.alloc_read(1)
     assert ids is not None and int(ids[0]) < S and not p.is_placeholder(int(ids[0]))
     assert p.arena_resolve_reads(types.SimpleNamespace(canonical_mamba_blob=None), ids, ["x.mamba"]) is None
+
+
+def test_the_storage_read_hook_reaches_the_resolver_and_never_copies_into_a_placeholder(tmp_path):
+    """#1427e: `op_fn is self._read_page` compared two fresh bound-method
+    objects and was always False; the resolver never ran on the metal."""
+    from sglang.srt.mem_cache.hicache_storage import HiCacheFile, PoolName, PoolTransfer
+    arena = ShmArena(str(tmp_path / "mamba.bin"), TOTAL, 8)
+    p = _pool(arena)
+    rows = p.alloc_write(["h1"]); p.backup_from_device_all_layer(_device_pool(), rows, torch.tensor([0]), "direct")
+    p.complete_write(rows)
+    be = object.__new__(HiCacheFile)
+    be.registered_pools = {PoolName.MAMBA: p}
+    be._log_key = lambda pool, k: f"{k}.mamba"
+    be._get_suffixed_key = p._backend._get_suffixed_key
+    calls = []
+    def _read_page(name, key, pool, idx):  # named like the real one: the hook compares by name
+        calls.append((key, idx))
+        return False
+    be._read_page = _read_page
+    ph = p.alloc_read(2)
+    res = HiCacheFile._batch_io_v2(be, [PoolTransfer(name=PoolName.MAMBA, keys=["h1", "h2"], host_indices=ph)], be._read_page)
+    assert res[PoolName.MAMBA] == [True, False]
+    assert calls == [], "a placeholder never reaches the per-key copy"
+    assert int(ph[0]) == int(rows[0])

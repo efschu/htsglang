@@ -3049,12 +3049,19 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
     def _weg2_direct_pool(self):
         cc = self.cache_controller
         pool = getattr(cc, "mem_pool_host", None)
-        if getattr(pool, "arena", None) is None:
+        # #1427e (xsn191): bind FIRST, then look. The old order returned None
+        # on every rank that had not prefetched yet (PP1/PP2 never do: only
+        # PP0 reads the store), so those ranks kept writing through the
+        # staging ring and its 13 in-flight pages -- the very wall Stufe 4
+        # removes -- and PP2 OOMed on a full ring while PP0 wrote directly.
+        if not getattr(pool, "arena_read", False) or not hasattr(pool, "ensure_bound"):
             return None
         try:
             if not pool.ensure_bound(cc.storage_backend, role="kv"):
                 return None
         except Exception:  # noqa: BLE001
+            return None
+        if getattr(pool, "arena", None) is None:
             return None
         return pool
 

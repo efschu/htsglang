@@ -3005,17 +3005,33 @@ class HiCacheFile(HiCacheStorage):
             # keys it does not hold go through the per-key read.
             pre = None
             resolver = getattr(host_pool, "arena_resolve_reads", None)
-            if op_fn is self._read_page and callable(resolver):
+            # #1427e: `op_fn is self._read_page` was always False -- a bound
+            # method is a fresh object per attribute access -- so the resolver
+            # never ran on the metal (xsn190/191) and every read fell into the
+            # per-key copy. Compare by name.
+            is_read = getattr(op_fn, "__name__", "") == "_read_page"
+            if is_read and callable(resolver):
                 try:
                     pre = resolver(self, host_indices, [self._log_key(transfer.name, k) for k in keys])
                 except Exception:  # noqa: BLE001 - fall back to the copy path
                     logger.warning("#1427 arena resolve failed for %s", transfer.name, exc_info=True)
                     pre = None
-            results[transfer.name] = [
-                (pre[i] if (pre is not None and pre[i] is not None)
-                 else op_fn(transfer.name, key, host_pool, host_indices[i * page_size].item()))
-                for i, key in enumerate(keys)
-            ]
+            # #1427e: a placeholder or arena id is never a row the per-key copy
+            # can land in -- on the READ side that is a miss (False), on the
+            # write side the page is in the store already (True); the raise
+            # inside the storage thread took a rank down (xsn191).
+            _is_ph = getattr(host_pool, "is_placeholder", None)
+            _is_ar = getattr(host_pool, "is_arena_id", None)
+            def _one(i, key):
+                if pre is not None and pre[i] is not None:
+                    return pre[i]
+                idx = host_indices[i * page_size].item()
+                if callable(_is_ph) and _is_ph(idx):
+                    return not is_read
+                if callable(_is_ar) and _is_ar(idx):
+                    return not is_read
+                return op_fn(transfer.name, key, host_pool, idx)
+            results[transfer.name] = [_one(i, key) for i, key in enumerate(keys)]
         return results
 
     def batch_get_v2(
