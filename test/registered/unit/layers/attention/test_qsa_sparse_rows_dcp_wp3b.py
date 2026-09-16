@@ -203,3 +203,24 @@ def test_fp8_byte_decode_matches_torch_for_every_code():
     nan = torch.isnan(ref)
     assert torch.equal(nan, torch.isnan(got)) and nan.sum() == 2
     assert torch.equal(got[~nan], ref[~nan])
+
+
+def test_attend_rows_returns_the_query_dtype_after_the_merge(monkeypatch):
+    """fn1x (2026-09-16): the group merge computes in fp32 and returned fp32;
+    o_proj then refused 'float != BFloat16' on every rank."""
+    import sglang.srt.runtime_context as rc
+    from sglang.srt.layers.attention import qwen_sparse_attn_backend as qb
+    from sglang.srt.layers.attention.qsa import sparse_attn as sa
+    from sglang.srt.layers.dcp import comm
+
+    b = _backend(2, True, (3, 1), rank=0)
+    pool = SimpleNamespace(get_key_buffer=lambda i: "k", get_value_buffer=lambda i: "v")
+    b.token_to_kv_pool = pool
+    monkeypatch.setattr(b, "_dcp_group_q_head_counts", lambda h: [h, h])
+    monkeypatch.setattr(rc, "get_parallel", lambda: SimpleNamespace(dcp_group="group"))
+    monkeypatch.setattr(comm, "cp_all_gather_heads_uneven", lambda q, g, c: torch.cat([q, q], dim=1))
+    monkeypatch.setattr(qb, "sparse_attn_rows_triton", lambda q, k, v, rows, s: (q.float(), torch.zeros(q.shape[:2])))
+    monkeypatch.setattr(comm, "cp_lse_ag_out_ar_mha_uneven", lambda out, lse, g, c: out[:, : out.shape[1] // 2].float())
+    q = torch.randn(3, 4, 8).bfloat16()
+    out = b._attend_rows(q, SimpleNamespace(layer_id=0, scaling=0.1), torch.zeros(3, 2, dtype=torch.int32))
+    assert out.dtype == torch.bfloat16 and out.shape == q.shape

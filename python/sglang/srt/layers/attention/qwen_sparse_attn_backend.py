@@ -397,7 +397,10 @@ class QwenSparseAttnBackend(AttentionBackend):
         counts = self._dcp_group_q_head_counts(q.shape[1])
         q_all = cp_all_gather_heads_uneven(q.contiguous(), group, counts)
         out, lse = sparse_attn_rows_triton(q_all, k_pool, v_pool, rows, layer.scaling)
-        return cp_lse_ag_out_ar_mha_uneven(out, lse, group, counts)
+        # The merge scales in fp32 and hands back fp32 (fn1x 2026-09-16: every
+        # rank died in o_proj with 'float != BFloat16'); the layer's output
+        # projection expects the query dtype.
+        return cp_lse_ag_out_ar_mha_uneven(out, lse, group, counts).to(q.dtype)
 
     @staticmethod
     def _is_speculative_paged_mode(forward_mode) -> bool:
