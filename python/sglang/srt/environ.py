@@ -447,6 +447,12 @@ class Envs:
     SGLANG_QWEN4_PLE_FILE_RSS_BUDGET_GB = EnvFloat(8.0)
     SGLANG_QWEN4_PLE_FILE_RSS_INTERVAL_S = EnvFloat(30.0)
     SGLANG_PREFETCH_BLOCK_SIZE_MB = EnvInt(16)
+    # Weight loader: read safetensors tensors with pread() instead of mmap
+    # page faults (ZFS: ~0.5 GB/s per rank through mmap, ~3 GB/s through
+    # read(); fn1v/fn1w 2026-09-16), and let the model veto tensors before
+    # they are read (weight_name_needed: PLE shards the checkpoint backend
+    # only maps, experts and layers other ranks own).
+    SGLANG_WEIGHT_LOADER_PREAD = EnvBool(False)
     SGLANG_GEMMA_OUT_OF_PLACE_POSITION_MUTATION = EnvBool(False)
 
     # HTTP server

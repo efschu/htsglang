@@ -2019,6 +2019,62 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
             output.hidden_states = hc_hidden_states
         return output
 
+    _EXPERT_ID_RE = re.compile(r"\.experts\.(\d+)\.")
+
+    def weight_name_needed(self, name: str):
+        """Loader veto BEFORE a checkpoint tensor is read (weight_utils
+        pread_safetensors_file): True = read, False = skip, "meta" = hand
+        load_weights a meta tensor of the right shape (the name is all it
+        needs). fn1v/fn1w 2026-09-16: the mmap loader materialised 95 GB of
+        PLE shards per rank that the checkpoint backend only maps by name,
+        plus every expert of every layer on every rank."""
+        if "rotary_emb.inv_freq" in name or "mtp" in name:
+            return False  # load_weights drops these on the floor anyway
+        if "visual" in name and self.language_model_only:
+            return False
+        local = name.replace("model.language_model.", "model.")
+        lm = self.model
+        start = int(getattr(lm, "start_layer", 0))
+        end = int(getattr(lm, "end_layer", getattr(self.config, "num_hidden_layers", 1 << 30)))
+        if not weight_layer_is_owned(local, start, end):
+            return False
+        if ".ngram_embedding.shard_" in name:
+            emb = self._ple_ngram_embedding()
+            if emb is not None and getattr(emb, "_ckpt_backend", False):
+                return "meta"
+            return True
+        m = self._EXPERT_ID_RE.search(local)
+        if m is not None:
+            rng = self._owned_expert_range()
+            if rng is not None:
+                lo, hi = rng
+                return lo <= int(m.group(1)) < hi
+        return True
+
+    def _ple_ngram_embedding(self):
+        for layer in getattr(self.model, "layers", ()):
+            ple = getattr(layer, "ple", None)
+            if ple is not None:
+                return getattr(getattr(ple, "ple_embedding", None), "ngram_embedding", None)
+        return None
+
+    def _owned_expert_range(self):
+        """(lo, hi) of the experts this rank holds under the expert-index shard
+        (the same on every MoE layer), None when experts are not index-sharded."""
+        cached = getattr(self, "_owned_expert_range_cache", "unset")
+        if cached != "unset":
+            return cached
+        rng = None
+        for layer in getattr(self.model, "layers", ()):
+            experts = getattr(getattr(layer, "mlp", None), "experts", None)
+            if experts is None:
+                continue
+            if getattr(experts, "_gguf_expert_shard", False):
+                rng = tuple(int(x) for x in experts._gguf_expert_range)
+            break
+        self._owned_expert_range_cache = rng
+        return rng
+
     def _load_qwen4_exp_ple_buffer(
         self,
         name: str,

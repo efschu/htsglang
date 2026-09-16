@@ -637,7 +637,8 @@ class DefaultModelLoader(BaseModelLoader):
             weight_loader_drop_cache_after_load = (
                 server_args.weight_loader_drop_cache_after_load
             )
-            weight_loader_direct_io = server_args.weight_loader_direct_io
+            # getattr: the loader tests drive this with a bare server-args stub.
+            weight_loader_direct_io = getattr(server_args, "weight_loader_direct_io", False)
 
             # Prefetch and multi-threaded loading both read the same shards,
             # competing for I/O on shared/network storage. When prefetch is
@@ -682,6 +683,8 @@ class DefaultModelLoader(BaseModelLoader):
                     prefetch_num_threads=prefetch_num_threads,
                     drop_cache_after_load=weight_loader_drop_cache_after_load,
                     direct_io=weight_loader_direct_io,
+                    should_load=getattr(self, "_weight_name_filter", None),
+                    pread=envs.SGLANG_WEIGHT_LOADER_PREAD.get(),
                 )
             else:
                 weights_iterator = safetensors_weights_iterator(
@@ -690,6 +693,8 @@ class DefaultModelLoader(BaseModelLoader):
                     prefetch=weight_loader_prefetch,
                     prefetch_num_threads=prefetch_num_threads,
                     drop_cache_after_load=weight_loader_drop_cache_after_load,
+                    should_load=getattr(self, "_weight_name_filter", None),
+                    pread=envs.SGLANG_WEIGHT_LOADER_PREAD.get(),
                     direct_io=weight_loader_direct_io,
                 )
 
@@ -741,7 +746,14 @@ class DefaultModelLoader(BaseModelLoader):
     ) -> Generator[Tuple[str, torch.Tensor], None, None]:
 
         primary_weights = DefaultModelLoader.Source.init_new(model_config, model)
-        yield from self._get_weights_iterator(primary_weights)
+        # The model may veto tensors before they are read (weight_name_needed;
+        # see weight_utils.pread_safetensors_file). Only the primary source:
+        # a secondary source (draft) has its own model.
+        self._weight_name_filter = getattr(model, "weight_name_needed", None)
+        try:
+            yield from self._get_weights_iterator(primary_weights)
+        finally:
+            self._weight_name_filter = None
 
         secondary_weights = cast(
             Iterable[DefaultModelLoader.Source], getattr(model, "secondary_weights", ())
