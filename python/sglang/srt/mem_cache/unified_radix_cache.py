@@ -1981,6 +1981,23 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             key = key[prefix_len:]
             if len(key):
                 child_key = key.child_key(self.page_size)
+        if len(key) > 0 and node is not self.root_node and node.children:
+            # #1420 instrument (boot xsn172): D's walk for a 98k prompt stopped at
+            # the 4314-token split node with the prefetched chain hanging below
+            # -- name the child keys the node HAS and the one the walk WANTS.
+            n = getattr(UnifiedRadixCache, "_1420_n", 0) + 1
+            UnifiedRadixCache._1420_n = n
+            if n <= 24 or n % 256 == 0:
+                try:
+                    have = [str(k)[:60] for k in list(node.children.keys())[:4]]
+                    logger.warning(
+                        "#1420 WALK-STOP n=%d depth=%d remaining=%d want=%s have=%s "
+                        "bigram=%s node_evicted=%s node_backuped=%s",
+                        n, cum_tokens, len(key), str(child_key)[:60], have,
+                        getattr(key, "is_bigram", None), node.evicted, node.backuped,
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
 
         census_emit(census, logger)
         if p_census is not None:
@@ -2766,6 +2783,26 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
     # ---- HiCache: Backup / LoadBack ----
 
+    def _1421_refused(self, why: str, node) -> None:
+        """#1421 instrument (boot xsn172): the publish sweep printed refused=34
+        with in_flight=2 for 90 s and the drain hit W3 -- write_backup said 0
+        silently. Name the branch, rate-limited."""
+        n = getattr(UnifiedRadixCache, "_1421_n", 0) + 1
+        UnifiedRadixCache._1421_n = n
+        if n <= 24 or n % 256 == 0:
+            try:
+                p = node.parent
+                logger.warning(
+                    "#1421 BACKUP-REFUSED n=%d why=%s node=%s tokens=%d evicted=%s backuped=%s "
+                    "parent=%s parent_evicted=%s parent_backuped=%s parent_is_root=%s pins=%s/%s",
+                    n, why, getattr(node, "id", "?"), len(getattr(node, "key", []) or []),
+                    node.evicted, node.backuped, getattr(p, "id", "?"),
+                    getattr(p, "evicted", None), getattr(p, "backuped", None),
+                    p is self.root_node, self._mamba_pins_held(), self._mamba_pin_budget,
+                )
+            except Exception:  # noqa: BLE001
+                pass
+
     def write_backup(self, node: UnifiedTreeNode, write_back: bool = False) -> int:
         """Backup a node's data from device to host (D->H)."""
         if self.cache_controller is None:
@@ -2784,6 +2821,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # not use nor strands a host allocation.
         if not self._mamba_write_through_pin_admissible(node, write_back=write_back):
             self._note_mamba_pin_skipped()
+            self._1421_refused("mamba_pin", node)
             return 0
 
         # Backup invariant (write-through): parent must be backuped first
@@ -2791,6 +2829,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             node.parent is not self.root_node and not node.parent.backuped
         ):
             if self.write_backup(node.parent) <= 0:
+                self._1421_refused("parent_unbacked", node)
                 return 0
 
         device_value = node.component_data[BASE_COMPONENT_TYPE].value
