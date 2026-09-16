@@ -3611,6 +3611,40 @@ class SchedulerWeightUpdaterManager:
                 and self._weg2_xchg_draft_reload_from_disk()):
             pass  # the exchange carried nothing for this tag
 
+    @staticmethod
+    def _weg2_seam_after_part_items(tag, inventory, nw_keys, w_names):
+        """The pieces the after-part digest of `tag` may read NOW, on the
+        collect thread, while the main thread resumes the next tag.
+
+        #1405 excluded a foreign tag's NO-WRITE pieces (aliases of target
+        tensors in the `weights` region). #1418 (boots xsn165/xsn170, D TP0,
+        first wake, 2 of 12 boots): the draft pieces that SHARE their name
+        with a `weights` piece (lm_head.weight, model.norm.weight -- measured
+        shares that land with the target's own leg, xsn115) are the same
+        alias class and were still read under `weights_draft`; the `weights`
+        remap on the main thread made them an illegal address. They are
+        graded under `weights`, where the refold clause already includes
+        them, so the draft part leaves them out too.
+        """
+        tag = str(tag)
+        out = []
+        for idn, t in inventory:
+            itag, name = str(idn.tag), str(idn.name)
+            if itag == tag:
+                if tag == "weights":
+                    out.append((idn, t))
+                elif (itag, name) in nw_keys:
+                    continue
+                elif itag == "weights_draft" and name in w_names:
+                    continue
+                else:
+                    out.append((idn, t))
+            elif tag == "weights" and (
+                (itag, name) in nw_keys or (itag == "weights_draft" and name in w_names)
+            ):
+                out.append((idn, t))
+        return out
+
     def _weg2_seam_after_part(self, tag) -> None:
         """Punkt 3: fold THIS tag's pieces now (on the wake worker, while
         the main thread resumes the next tag); the leg's `after` reading is
@@ -3650,14 +3684,7 @@ class SchedulerWeightUpdaterManager:
             # access", then the BAR1 poll died). The tracer only hid the race
             # by slowing this thread down. Alias pieces are graded under
             # `weights`, where the clause below already includes them.
-            items = [(idn, t) for idn, t in inventory
-                     if (str(idn.tag) == str(tag)
-                         and (str(tag) == "weights"
-                              or (str(idn.tag), str(idn.name)) not in _nw_keys))
-                     or (str(tag) == "weights"
-                         and ((str(idn.tag), str(idn.name)) in _nw_keys
-                              or (str(idn.tag) == "weights_draft"
-                                  and str(idn.name) in _w_names)))]
+            items = self._weg2_seam_after_part_items(tag, inventory, _nw_keys, _w_names)
             if not items:
                 return
             part = seam_digest.take_reading(
