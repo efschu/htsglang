@@ -125,3 +125,16 @@ def test_start_is_a_no_op_when_the_exchange_is_not_armed(monkeypatch):
     monkeypatch.setattr(wx, "exchange_armed", lambda: False)
     m._weg2_prewarm_lanes_start()
     assert m._weg2_prewarm_thread is None
+
+
+def test_the_boot_time_prewarm_is_off_by_default_after_xsn263(monkeypatch):
+    """xsn263: pinning every lane at its max for both slots on six ranks at
+    once (10-12 GiB per rank) latched the host ledger's W98 during the
+    launch. Default off; the tmpfs populate before cudaHostRegister keeps
+    the lazy first-use registration cheap."""
+    m = _manager(monkeypatch)
+    from sglang.srt.weg2 import weight_exchange as wx
+    monkeypatch.setattr(wx, "exchange_armed", lambda: True)
+    monkeypatch.delenv("SGLANG_WEG2_LANE_PREWARM", raising=False)
+    m._weg2_prewarm_lanes_start()
+    assert m._weg2_prewarm_thread is None

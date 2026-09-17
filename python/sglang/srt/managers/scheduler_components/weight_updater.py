@@ -605,7 +605,17 @@ class SchedulerWeightUpdaterManager:
 
             if not wx.exchange_armed():
                 return
-            if (os.environ.get("SGLANG_WEG2_LANE_PREWARM", "1") or "1") != "1":
+            # xsn263 (17.09.): DEFAULT OFF. The boot-time form pinned every
+            # lane at its max for BOTH slots on all six ranks at once
+            # (10-12 GiB per rank), shmem rose to 64 GiB during the launch
+            # and the host ledger latched W98 (cushion 1.42 < 1.50 GiB) --
+            # the flip's lazy growth reaches a smaller steady state (slot 1
+            # only where a lane carries a second tag) and never inside the
+            # launch transient. What made the first flip cheap was the tmpfs
+            # populate before cudaHostRegister (register_ms 22-92 instead of
+            # 5000-21000), and that stays on the lazy path. An exact
+            # slot-parity sizing can re-enable this later (=1).
+            if (os.environ.get("SGLANG_WEG2_LANE_PREWARM", "0") or "0") != "1":
                 return
             import threading
 
