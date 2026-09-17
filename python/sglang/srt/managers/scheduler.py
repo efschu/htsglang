@@ -16,6 +16,7 @@
 import dataclasses
 import faulthandler
 import logging
+import functools
 import os
 import re
 import signal
@@ -4872,6 +4873,28 @@ class Scheduler(
                     len(gone), rid[:12], abort_all, len(keep))
         return len(gone)
 
+    def _weg2_refetch_one(self, req, now: float) -> str:
+        """#1456/#1471: one held request's read -- "reading" (still in
+        flight), "complete" (whole prefix on the host), "wait" (short, but
+        re-issued less than 2 s ago), "reissued" (short, re-read now)."""
+        if not self.tree_cache.check_prefetch_progress(req.rid):
+            return "reading"
+        reason = self._weg2_note_store_shortfall(req)
+        if reason is None:
+            return "complete"
+        if now - float(getattr(req, "_1456_last", 0.0) or 0.0) < 2.0:
+            return "wait"
+        req._1456_last = now
+        req._1456_n = int(getattr(req, "_1456_n", 0) or 0) + 1
+        clear = getattr(self, "_clear_prefetch_deferral_fields", None)
+        if clear is not None:
+            clear(req)  # the shortfall mark is ours to re-issue, not the drain's
+        verdict = self._prefetch_kvcache(req)
+        if req._1456_n <= 4 or req._1456_n % 16 == 0:
+            logger.info("#1456 HOLD-REFETCH rid=%s n=%d reason=%s verdict=%s (the store was short; "
+                        "re-read from the registered extent)", str(req.rid)[:12], req._1456_n, reason, verdict)
+        return "reissued"
+
     def _weg2_hold_refetch(self) -> int:
         """#1456: while the group sleeps, finish and TOP UP the reads of the
         held requests.  P's write-through lands a few seconds after its leg
@@ -4884,31 +4907,59 @@ class Scheduler(
         if not hold or not getattr(self, "weg2_dormant", False):
             return 0
         now = time.monotonic()
+        _refetch = getattr(self, "_weg2_refetch_one", None) or functools.partial(Scheduler._weg2_refetch_one, self)
         reissued = 0
         for req in hold:
             try:
-                if not self.tree_cache.check_prefetch_progress(req.rid):
-                    continue  # still reading
-                if now - float(getattr(req, "_1456_last", 0.0) or 0.0) < 2.0:
-                    continue
-                reason = self._weg2_note_store_shortfall(req)
-                if reason is None:
-                    continue  # whole prefix on the host
-                req._1456_last = now
-                req._1456_n = int(getattr(req, "_1456_n", 0) or 0) + 1
-                clear = getattr(self, "_clear_prefetch_deferral_fields", None)
-                if clear is not None:
-                    clear(req)  # the shortfall mark is ours to re-issue, not the drain's
-                verdict = self._prefetch_kvcache(req)
-                reissued += 1
-                if req._1456_n <= 4 or req._1456_n % 16 == 0:
-                    logger.info("#1456 HOLD-REFETCH rid=%s n=%d reason=%s verdict=%s (the store was short at the hold; "
-                                "re-read from the registered extent while the group sleeps)",
-                                str(req.rid)[:12], req._1456_n, reason, verdict)
+                if _refetch(req, now) == "reissued":
+                    reissued += 1
             except Exception as exc:  # noqa: BLE001 -- the hold must never die on a top-up
                 logger.info("#1456 HOLD-REFETCH rid=%s n/a (%s: %s)", str(getattr(req, "rid", "?"))[:12],
                             type(exc).__name__, exc)
         return reissued
+
+    #: #1471: how long a request whose hold read is still short may stay
+    #: held AFTER the wake before it is queued as it is (and meets the X
+    #: gate).  P's sleep flush joins its write-throughs (#1470), so the
+    #: store completes within a few seconds of the wake; the bound is a
+    #: backstop, never the expected path.
+    WEG2_POST_WAKE_SETTLE_S = 20.0
+
+    def _weg2_post_wake_settle_tick(self) -> int:
+        """#1471: release the requests parked at the wake with a SHORT read
+        once their re-read completes (or the bound lapses).  Called every
+        scheduling pass; a no-op when nothing is parked."""
+        settle = getattr(self, "weg2_post_wake_settle", None)
+        if not settle:
+            return 0
+        now = time.monotonic()
+        _refetch = getattr(self, "_weg2_refetch_one", None) or functools.partial(Scheduler._weg2_refetch_one, self)
+        keep, release = [], []
+        for req in settle:
+            try:
+                state = _refetch(req, now)
+            except Exception as exc:  # noqa: BLE001
+                logger.info("#1471 SETTLE rid=%s n/a (%s: %s)", str(getattr(req, "rid", "?"))[:12],
+                            type(exc).__name__, exc)
+                state = "complete"
+            lapsed = now - float(getattr(req, "_1471_since", now)) >= self.WEG2_POST_WAKE_SETTLE_S
+            if state == "complete" or lapsed:
+                release.append((req, state, lapsed))
+            else:
+                keep.append(req)
+        self.weg2_post_wake_settle = keep
+        if release:
+            try:  # #1461: back under the strict claim law
+                _cc = self.tree_cache.cache_controller
+                for _r, _s, _l in release:
+                    getattr(_cc, "weg2_hold_rids", set()).discard(_r.rid)
+            except Exception:  # noqa: BLE001
+                pass
+            self.waiting_queue.extend(r for r, _s, _l in release)
+            for _r, _s, _l in release:
+                logger.info("#1471 SETTLE-RELEASE rid=%s state=%s lapsed=%s held_after_wake_s=%.1f",
+                            str(_r.rid)[:12], _s, _l, now - float(getattr(_r, "_1471_since", now)))
+        return len(release)
 
     def _weg2_release_dormant_hold(self) -> int:
         """#1443: the wake cleared the dormant flag -- the held requests join
@@ -4917,8 +4968,35 @@ class Scheduler(
         hold = getattr(self, "weg2_dormant_hold", None) or []
         if not hold:
             return 0
-        released = list(hold)
+        # #1471: ONLY A COMPLETE READ JOINS THE QUEUE AT THE WAKE.  weg2xsn229
+        # (P --max-running-requests 2): the read issued at the hold ended
+        # short (4095 of 98210), the refetch was issued, and the wake queued
+        # the request anyway -- the X gate then refused it (W31, uncached
+        # 94117 > X 4096), P prefilled the same prompt a second time, and the
+        # second read was complete.  A short read now stays parked after the
+        # wake and joins the queue when its re-read completes (bounded by
+        # WEG2_POST_WAKE_SETTLE_S; ticked by _weg2_post_wake_settle_tick).
+        _now = time.monotonic()
+        _refetch = getattr(self, "_weg2_refetch_one", None) or functools.partial(Scheduler._weg2_refetch_one, self)
+        released, parked = [], []
+        for _r in list(hold):
+            try:
+                _state = _refetch(_r, _now)
+            except Exception:  # noqa: BLE001
+                _state = "complete"
+            if _state == "complete":
+                released.append(_r)
+            else:
+                _r._1471_since = _now
+                parked.append(_r)
         hold.clear()
+        if parked:
+            _settle = getattr(self, "weg2_post_wake_settle", None)
+            if _settle is None:
+                _settle = self.weg2_post_wake_settle = []
+            _settle.extend(parked)
+            logger.info("#1471 SETTLE %d held request(s) parked after the wake (read still short: %s)",
+                        len(parked), [str(r.rid)[:12] for r in parked])
         try:  # #1461: back under the strict claim law
             _cc = self.tree_cache.cache_controller
             for _r in released:
@@ -9261,6 +9339,8 @@ class Scheduler(
         self, running_batch: ScheduleBatch, last_batch: Optional[ScheduleBatch]
     ) -> NextBatchPlan:
         self.process_pending_chunked_abort()
+        if getattr(self, "weg2_post_wake_settle", None):
+            self._weg2_post_wake_settle_tick()  # #1471
 
         # #581: release lock_ref on completed write-through nodes ONCE PER
         # SCHEDULER ITERATION, before any batch is built. This used to sit in
