@@ -140,6 +140,18 @@ class Wiring(CustomTestCase):
         self.assertNotIn("sched.tree_cache.reset", body)  # only the docstring names it
         self.assertIn("req_to_token_pool.clear()", body)
 
+    def test_sleep_flush_skips_the_kv_zeroing_1457(self):
+        """#1457: the sleep leg flushes without the ~10 GB KV memset (the pool
+        is unmapped right after); flush_cache(zero_kv=None) keeps the env law."""
+        import inspect as _i
+        from sglang.srt.managers.scheduler_components import weight_updater as wu
+        self.assertIn("self.flush_cache(zero_kv=False)", _i.getsource(wu))
+        sig = _i.signature(Scheduler.flush_cache)
+        self.assertIn("zero_kv", sig.parameters)
+        self.assertIsNone(sig.parameters["zero_kv"].default)
+        body = _i.getsource(Scheduler.flush_cache)
+        self.assertIn("if envs.SGLANG_FLUSH_ZERO_KV.get() if zero_kv is None else bool(zero_kv):", body)
+
     def test_health_probe_takes_w25_not_the_hold(self):
         src = inspect.getsource(Scheduler.handle_generate_request)
         cond = ("if getattr(self, \"weg2_dormant\", False) and (\n"

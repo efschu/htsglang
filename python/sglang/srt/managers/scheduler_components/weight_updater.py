@@ -6259,7 +6259,9 @@ class SchedulerWeightUpdaterManager:
             # reset runs while the pages are still mapped, and the pause then
             # releases an already-quiesced pool.  Nothing that touches the
             # device may be appended after the pause in this block.
-            self.flush_cache()
+            # #1457: no KV zeroing before a pause that discards the pages (the
+            # mamba/req_to_token resets in the flush still run on mapped pages).
+            self.flush_cache(zero_kv=False)
             self.memory_saver_adapter.pause(GPU_MEMORY_TYPE_KV_CACHE)
             _weg2_ph("kv_pause")
             # W25 Weg2DormantRefused (S1 boot killer K2): from this statement

@@ -16223,8 +16223,13 @@ class Scheduler(
             )
         return ResizeHiCacheStorageReqOutput(success=ok, message=msg, stats=stats)
 
-    def flush_cache(self, empty_cache: bool = True):
-        """Flush memory pools (e.g., KV cache, Mamba cache) and optionally empty device allocator cache."""
+    def flush_cache(self, empty_cache: bool = True, zero_kv: Optional[bool] = None):
+        """Flush memory pools (e.g., KV cache, Mamba cache) and optionally empty device allocator cache.
+        ``zero_kv``: #1457 -- the KV data buffers are zeroed under
+        SGLANG_FLUSH_ZERO_KV by default; the Weg-2 SLEEP leg passes False,
+        because the pool is unmapped right after the flush and the memset of
+        ~10 GB (boot weg2xsn212: ~0.8 s of the 0.9 s sleep-kv stage) zeroes
+        pages that are discarded.  The wake-side restore keeps the zeroing."""
         # #1158 sibling, judged and left: this idle verdict is rank-local,
         # exactly like the health gate was, and it is rank-UNIFORM only while
         # waiting_queue is replicated. With the one health disposal moved to
@@ -16271,9 +16276,10 @@ class Scheduler(
             self.tree_cache.reset()
             self.req_to_token_pool.clear()
             self.token_to_kv_pool_allocator.clear()
-            if envs.SGLANG_FLUSH_ZERO_KV.get():
+            if envs.SGLANG_FLUSH_ZERO_KV.get() if zero_kv is None else bool(zero_kv):
                 # Default part of the flush (opt-out env): the post-flush
                 # state must equal a fresh boot, whose pools are torch.zeros.
+                # #1457: the Weg-2 sleep leg opts out (pages are discarded).
                 self._flush_zero_kv_buffers()
             self.grammar_manager.clear()
             self.metrics_reporter.reset_metrics()
