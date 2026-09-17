@@ -5961,6 +5961,43 @@ class SchedulerWeightUpdaterManager:
         except Exception:  # noqa: BLE001 -- an absent authority is an absence
             return None
 
+    def _weg2_xchg_whole_leg_lanes(self) -> Optional[set]:
+        """The lanes this rank's WHOLE-LEG collect plan covers (every tag),
+        as ``group_descs_by_pair`` keys -- ``None`` for the on-card diagonal,
+        a ``CROSS_PAIRS`` index for a directed cross pair -- or ``None`` when
+        no plan can be derived here (a desk double, an unarmed boot).
+
+        weg2xsn257 (17.09.): the credit wait's W108 reader checked EVERY lane
+        with a nonzero ``full`` and refused ``0.0s into the wait`` on PP0 at
+        tag weights_1 -- lanes 1-0-0 and 2-0-0 held 106 bands each. Those
+        were weights_1's OWN bands: all six ranks walk one tag order
+        (0,4,7,1,5,2,6,3,draft,weights on both groups, read from the
+        SLEEP-TAG-TIME / RESUME-begin stamps), the depositors had finished
+        weights_1 while PP0 still waited for its co-located sleeper's credit,
+        and PP0's very next step was to collect exactly those bands. Under
+        #1397's band credit a lane legally holds the NEXT tag's bands while
+        this rank waits, so "full > 0 between tags" no longer proves a tag
+        nobody will drain. The collect path already knew this (weg2xsn85:
+        ``covered_lanes`` = the whole-leg set); the credit wait did not. This
+        is the one producer of that set for both call sites: the same
+        boot-cached plan ``_weg2_xchg_inject_from_peer`` collects with, so a
+        lane the plan covers for ANY tag is never a "never drained" lane.
+        """
+        try:
+            from sglang.srt.weg2 import weight_exchange_bounce as _bx
+            group = self._weg2_group_name()
+            rank = self._weg2_rank()
+            if not group or rank is None or int(rank) < 0:
+                return None
+            plan, _reason = self._weg2_shadow_plan(
+                "authoritative", group, int(rank), agreed=None,
+                require_agreement=False)
+            if plan is None:
+                return None
+            return set(_bx.group_descs_by_pair(list(plan.descs)).keys())
+        except Exception:  # noqa: BLE001 -- no plan is "not measurable", never a refusal
+            return None
+
     def _weg2_await_vram_credit(self, credit, tag: str, need_bytes: int,
                                 epoch=None) -> None:
         if credit is None or need_bytes <= 0:
@@ -5980,13 +6017,43 @@ class SchedulerWeightUpdaterManager:
         # itself the moment it finds something, well before this call's own
         # `budget_s` would otherwise expire into a W35.
         _rank = self._weg2_rank()
+        _reader_state = {"noted": False}
 
         def _stuck_lane_reader():
             if _rank < 0:
                 return []
             if getattr(self, "_weg2_wake_inflight", False):
                 return []   # a collect is in flight on the wake worker
-            return self._weg2_xchg_undrained_lanes(_rank, self._weg2_xchg_sems())
+            # weg2xsn257: the SAME whole-leg coverage the collect path applies
+            # (`_weg2_xchg_bounce_leg`'s `covered_lanes`). A lane this rank's
+            # plan walks for ANY tag holds the next tag's bands legally; only a
+            # lane the plan never walks is bands nobody will drain. No plan ->
+            # no proof -> no refusal: the credit budget (W35) stays the
+            # detector, exactly as for every caller that passes no reader.
+            covered = self._weg2_xchg_whole_leg_lanes()
+            if covered is None:
+                if not _reader_state["noted"]:
+                    _reader_state["noted"] = True
+                    logger.info(
+                        "WEG2-CREDIT-WAIT tag=%s lane check NOT-MEASURED: no "
+                        "whole-leg plan on this rank, so a full lane cannot be "
+                        "told from the next tag's bands; W108 is not raised "
+                        "from this wait and the credit budget remains the "
+                        "detector", tag)
+                return []
+            sems = self._weg2_xchg_sems()
+            stuck = self._weg2_xchg_undrained_lanes(_rank, sems, covered=covered)
+            if not stuck and not _reader_state["noted"]:
+                held = self._weg2_xchg_undrained_lanes(_rank, sems)
+                if held:
+                    _reader_state["noted"] = True
+                    logger.info(
+                        "WEG2-CREDIT-WAIT tag=%s %d full lane(s) targeting this "
+                        "card are COVERED by this rank's whole-leg plan (%s) -- "
+                        "the next tag's bands, not a wedge; waiting on",
+                        tag, len(held),
+                        ", ".join(f"{lane}:full={full}" for lane, full, _e in held))
+            return stuck
 
         try:
             rec = credit.wait_for(

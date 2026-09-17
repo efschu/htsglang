@@ -452,6 +452,12 @@ def test_the_credit_wait_wires_a_stuck_lane_reader_not_a_one_shot_check(
     pinned separately against the real `VramCredit.wait_for` below."""
     _post_diagonal_bands(real_sems, 0, 16)
     m = _manager(monkeypatch, group="P", rank=0, sems=real_sems)
+    # weg2xsn257: the reader now applies the WHOLE-LEG lane coverage. A plan
+    # that walks only the cross pair (1,0) leaves the diagonal uncovered, so
+    # card0's 16 bands are still the xsn31 wedge this test pins.
+    monkeypatch.setattr(Manager, "_weg2_xchg_whole_leg_lanes",
+                        lambda self: {xr.CROSS_PAIRS.index((1, 0))},
+                        raising=True)
     credit = _CreditCapturesTheReader()
 
     m._weg2_await_vram_credit(credit, "weights_3", 2916)
@@ -460,6 +466,83 @@ def test_the_credit_wait_wires_a_stuck_lane_reader_not_a_one_shot_check(
     assert credit.kwargs["stuck_lane_reader"] is not None
     by_lane = {lane: (full, empty) for lane, full, empty in credit.stuck}
     assert by_lane["card0-0"] == (16, 0)
+
+
+def test_xsn257_the_next_tags_bands_on_covered_lanes_are_not_a_wedge(
+        monkeypatch, real_sems):
+    """weg2xsn257 (17.09.): PP0 at tag weights_1 refused W108 `0.0s into
+    the wait` because lanes 1-0-0 and 2-0-0 held 106 bands each -- the
+    bands of weights_1 ITSELF, deposited by D-TP1/TP2 while PP0 still waited
+    for D-TP0's credit. Every rank walks one tag order, so a full lane the
+    whole-leg plan covers is the next tag's bands, never a wedge. The
+    collect path applied that coverage since weg2xsn85; the credit wait
+    did not. Pinned here: with both lanes covered the reader answers [] and
+    the credit wait proceeds normally."""
+    cross_1_0 = xr.CROSS_PAIRS.index((1, 0))
+    cross_2_0 = xr.CROSS_PAIRS.index((2, 0))
+    _post_cross_bands(real_sems, cross_1_0, 106)
+    _post_cross_bands(real_sems, cross_2_0, 106)
+    m = _manager(monkeypatch, group="P", rank=0, sems=real_sems)
+    monkeypatch.setattr(Manager, "_weg2_xchg_whole_leg_lanes",
+                        lambda self: {None, cross_1_0, cross_2_0},
+                        raising=True)
+    credit = _CreditCapturesTheReader()
+
+    m._weg2_await_vram_credit(credit, "weights_1", 3820)
+
+    assert credit.kwargs is not None, "credit.wait_for was never called"
+    assert credit.stuck == [], (
+        f"the xsn257 shape refused again: {credit.stuck}")
+    # MUTANT (the shipped form before this fix): no coverage at all -- the
+    # same lanes read as a wedge. This is the false refusal that killed the
+    # first DFLASH flip on xsn256 and xsn257.
+    assert len(Manager._weg2_xchg_undrained_lanes(None, 0, real_sems)) == 2
+    assert Manager._weg2_xchg_undrained_lanes(
+        None, 0, real_sems, covered={None, cross_1_0, cross_2_0}) == []
+
+
+def test_no_whole_leg_plan_means_no_w108_from_the_credit_wait(
+        monkeypatch, real_sems):
+    """No plan, no proof: a rank that cannot derive its whole-leg coverage
+    (a desk double, an unarmed boot) must not refuse on a full lane it
+    cannot classify. The credit budget (W35) stays the detector, as for
+    every caller that passes no reader at all."""
+    _post_diagonal_bands(real_sems, 0, 16)
+    m = _manager(monkeypatch, group="P", rank=0, sems=real_sems)
+    monkeypatch.setattr(Manager, "_weg2_xchg_whole_leg_lanes",
+                        lambda self: None, raising=True)
+    credit = _CreditCapturesTheReader()
+
+    m._weg2_await_vram_credit(credit, "weights_3", 2916)
+
+    assert credit.stuck == []
+
+
+def test_whole_leg_lanes_come_from_the_boot_cached_collect_plan(monkeypatch):
+    """The coverage producer reads the SAME plan the collect path collects
+    with (`_weg2_shadow_plan("authoritative", ...)`, boot-cached) and maps
+    it through `group_descs_by_pair` -- one producer for both W108 sites.
+    A plan that cannot be derived answers None, never an empty set (an
+    empty set would mark EVERY full lane as a wedge)."""
+    m = _manager(monkeypatch, group="P", rank=0, sems=None)
+    seen = {}
+
+    def _plan(self, hook, group, rank, *, agreed=None, require_agreement):
+        seen["args"] = (hook, group, rank, agreed, require_agreement)
+        return _FakePlan([
+            _FakeDesc("a", tag="weights_0", src_rank=0, dst_rank=0),
+            _FakeDesc("b", tag="weights_1", src_rank=1, dst_rank=0),
+        ]), "ok"
+
+    monkeypatch.setattr(Manager, "_weg2_shadow_plan", _plan, raising=True)
+    lanes = m._weg2_xchg_whole_leg_lanes()
+    assert seen["args"] == ("authoritative", "P", 0, None, False)
+    assert lanes == {None, xr.CROSS_PAIRS.index((1, 0))}
+
+    monkeypatch.setattr(Manager, "_weg2_shadow_plan",
+                        lambda self, *a, **k: (None, "no manifest"),
+                        raising=True)
+    assert m._weg2_xchg_whole_leg_lanes() is None
 
 
 def test_vram_credit_wait_for_catches_a_race_mid_wait_not_after_the_budget(
