@@ -38,6 +38,7 @@ from sglang.srt.speculative.draft_kv_producer import (
     Weg2DraftRegistrationOffStage,
     _cuda_free_mib,
     _draft_server_args,
+    _live_weight_mib,
 )
 
 logger = logging.getLogger(__name__)
@@ -171,11 +172,17 @@ class DFlashDraftKvProducer:
     # -- the producer contract the scheduler drives ---------------------------
     def load_resident_embedding(self, model_path: str) -> float:
         """A DFlash draft borrows the target's embedding only to embed the
-        decode block; the producer embeds nothing. Nothing to load."""
-        self.resident_mib = sum(
-            p.numel() * p.element_size()
-            for p in self.draft_runner.model.parameters()
-        ) / float(2**20)
+        decode block; the producer embeds nothing. Nothing to load -- but the
+        launcher's W11/W11b accounting reads three instruments off the armed
+        line, the same three DraftKvProducer reports: the live bytes of the
+        draft (resident_mib), the NVML free delta across the build
+        (nvml_delta_mib) and the released head (0 here). A -1 delta is
+        'not measured' and refuses the boot (xsn253, W11b)."""
+        torch.cuda.empty_cache()
+        after = _cuda_free_mib()
+        if after >= 0 and self._free_before_mib >= 0:
+            self.nvml_delta_mib = self._free_before_mib - after
+        self.resident_mib = _live_weight_mib(self.draft_runner.model)
         return 0.0
 
     def alloc_memory_pool(self, **kw):
