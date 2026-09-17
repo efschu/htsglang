@@ -92,10 +92,58 @@ class ExchangeArmPrice(CustomTestCase):
             gib, lanes, src = launcher.host_price_for_cut(ns, "39,13,12")
         finally:
             launcher.xchg_lane_count, launcher.xchg_bounce_terms_for_arm = orig_lanes, orig_terms
-        self.assertAlmostEqual(gib, 15.75)
-        self.assertEqual((lanes, src), (5, "measured"))
+        # #1464: the exchange+host arm is the REGION form -- the cut pick is
+        # priced at the region, the lane term is not consulted for the price
+        self.assertAlmostEqual(gib, launcher.weight_exchange_region.REGION_BYTES / (1 << 30))
+        self.assertEqual((lanes, src), (5, "region-form measured"))
         self.assertEqual(calls["cut"], ("39,13,12", "both"))
-        self.assertEqual(calls["terms"], (launcher.WEIGHT_SOURCE_EXCHANGE, "host", 1, 5, 0, False))
+        self.assertNotIn("terms", calls)
+
+    def test_lane_price_env_restores_the_file_bounce_price(self):
+        """#1464: SGLANG_WEG2_PCUT_LANE_PRICE=1 prices the cut pick by the
+        per-lane file bounce again (diagnosis only)."""
+        import os
+        ns = SimpleNamespace(weg2_weight_source=launcher.WEIGHT_SOURCE_EXCHANGE,
+                             weg2_xchg_oncard="host", model="/nonexistent",
+                             weg2_xchg_oncard_slot_mib=None, xchg_bounce_depth=1,
+                             xchg_lanes_concurrent=None, xchg_band_credit=False,
+                             weg2_xchg_legs="both")
+        orig_lanes, orig_terms = launcher.xchg_lane_count, launcher.xchg_bounce_terms_for_arm
+        launcher.xchg_lane_count = lambda sr, legs, d_vector=launcher.XCHG_D_VECTOR_DEFAULT: (
+            9, "WEG2-XCHG-LANES cut=x lanes=9 source=WORST-CASE")
+        launcher.xchg_bounce_terms_for_arm = lambda *a: (27.75 * (1 << 30), ["line"])
+        os.environ["SGLANG_WEG2_PCUT_LANE_PRICE"] = "1"
+        try:
+            gib, lanes, src = launcher.host_price_for_cut(ns, "43,11,10")
+        finally:
+            os.environ.pop("SGLANG_WEG2_PCUT_LANE_PRICE", None)
+            launcher.xchg_lane_count, launcher.xchg_bounce_terms_for_arm = orig_lanes, orig_terms
+        self.assertAlmostEqual(gib, 27.75)
+        self.assertEqual((lanes, src), (9, "WORST-CASE"))
+
+    def test_region_form_prices_every_cut_the_same_so_the_fastest_ships(self):
+        """#1464: an unmeasured cut (WORST-CASE 9 lanes) costs the region
+        like the incumbent, so host_priced_pick takes the fastest row."""
+        ns = SimpleNamespace(weg2_weight_source=launcher.WEIGHT_SOURCE_EXCHANGE,
+                             weg2_xchg_oncard="host", model="/nonexistent",
+                             weg2_xchg_oncard_slot_mib=None, xchg_bounce_depth=1,
+                             xchg_lanes_concurrent=None, xchg_band_credit=False,
+                             weg2_xchg_legs="both")
+        orig_lanes = launcher.xchg_lane_count
+        launcher.xchg_lane_count = lambda sr, legs, d_vector=launcher.XCHG_D_VECTOR_DEFAULT: (
+            (5, "WEG2-XCHG-LANES cut=x lanes=5 source=measured boot=t") if sr == "39,13,12"
+            else (9, "WEG2-XCHG-LANES cut=x lanes=9 source=WORST-CASE"))
+        try:
+            inc_gib, _l, _s = launcher.host_price_for_cut(ns, "39,13,12")
+            rows = [_row((43, 11, 10), 553.6, 285776), _row((39, 13, 12), 667.3, 401020)]
+            picked, lines = launcher.host_priced_pick(
+                rows, lambda r: launcher.host_price_for_cut(ns, ",".join(map(str, r.layers))),
+                inc_gib, 0.0)
+        finally:
+            launcher.xchg_lane_count = orig_lanes
+        self.assertEqual(picked.layers, (43, 11, 10))
+        self.assertIn("region-form WORST-CASE", lines[0])
+        self.assertIn("FUNDABLE", lines[0])
 
 
 class Wiring(CustomTestCase):

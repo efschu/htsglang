@@ -8723,6 +8723,22 @@ P_SOLVER_OBJECTIVE_OF = {
 PCUT_BOUNCE_SLACK_ENV = "SGLANG_WEG2_PCUT_BOUNCE_SLACK_GIB"
 
 
+def host_price_is_region_form(ns) -> bool:
+    """#1464: does this arm's exchange run its legs through the boot's
+    ``xchg.bin`` region (hook + semaphores) rather than the per-lane file
+    bounce?  True for every exchange+host arm: ``--weg2-xchg-inject`` has no
+    "off" choice, and both leg call sites pass ``hook=``/``sems=``.  Kept as
+    its own predicate so a future arm that really runs ``run_bounce_leg``
+    (no hook) can say so in ONE place; ``SGLANG_WEG2_PCUT_LANE_PRICE=1``
+    restores the lane price for the cut pick (measurement/diagnosis only).
+    """
+    if os.environ.get("SGLANG_WEG2_PCUT_LANE_PRICE", "") == "1":
+        return False
+    return xchg_bounce_arm_pins_host(
+        str(getattr(ns, "weg2_weight_source", WEIGHT_SOURCE_DEFAULT)),
+        str(getattr(ns, "weg2_xchg_oncard", ONCARD_MODE_DEFAULT)))
+
+
 def host_price_for_cut(ns, stage_ratio: str) -> Tuple[float, int, str]:
     """``(xchg_bounce GiB, lanes, lane source)`` the ledger WOULD charge for
     this cut -- the same chain ``choose_host_ledger`` prices (``xchg_lane_count``
@@ -8737,6 +8753,36 @@ def host_price_for_cut(ns, stage_ratio: str) -> Tuple[float, int, str]:
     lanes, prov = xchg_lane_count(stage_ratio, legs)
     source = ("measured" if "source=measured" in prov
               else "WORST-CASE" if "WORST-CASE" in prov else "n/a")
+    if host_price_is_region_form(ns):
+        # #1464: THE PER-LANE ASSEMBLE BUFFERS ARE NOT ALLOCATED IN THE
+        # REGION FORM, so they must not decide the cut.  Every production
+        # exchange boot arms `--weg2-xchg-inject` (choices: shadow |
+        # authoritative -- there is no "off"), and both leg call sites in
+        # weight_updater pass `hook=` + `sems=`, so `_weg2_xchg_bounce_leg`
+        # takes the BounceSlots/region branch and never reaches
+        # `run_bounce_leg` (the `LayerBounce` that creates
+        # bounce.bin.{c0,c1,p1,p2,p4} and emits WEG2-XCHG-HOST-SLOT).
+        # MEASURED, boot weg2xsn218 (0113846b61, 2026-09-17): 0 HOST-SLOT
+        # lines on P and D; /dev/shm/weg2-xchg-<epoch>/ holds xchg.bin
+        # (385 MiB apparent, 1 MiB resident) and a 3.3 KB bnc index; the
+        # host sampler read shmem +0.094 GiB across the D->P flip and
+        # +0.007 GiB across the P->D flip, anon +0.28 GiB.  The 15.75 GiB
+        # lane price (5 lanes x 3.00 GiB + 0.75 staging) was measured on
+        # weg2xsn28/31 (2026-09-13) in the FILE bounce form and kept the
+        # solver on 39,13,12 for every boot since: every unmeasured cut was
+        # charged the WORST-CASE 9 lanes = 27.75 GiB and refused.  Priced
+        # by the form that runs, every cut costs the same 385 MiB region,
+        # so the fastest frontier cut at/above the pool floor ships.
+        # NOT CHANGED HERE: the ledger's ARM term (choose_host_ledger ->
+        # xchg_bounce_terms_for_arm) still charges the lane price.  That
+        # is deliberate and named: xsn218's ledger predicted the run peak
+        # at 91.91 GiB and the sampler measured 85.86 GiB non-reclaimable;
+        # without the 15.75 the prediction would read 76.2 GiB, ~10 GiB
+        # UNDER the measurement.  The lane term currently covers an
+        # unattributed ~10 GiB, and dropping it before that is attributed
+        # would let arena_from_ledger grow the arena into the reap mark.
+        _region_gib = float(weight_exchange_region.REGION_BYTES) / host_ledger.GIB
+        return _region_gib, int(lanes), "region-form %s" % source
     nbytes, _lines = xchg_bounce_terms_for_arm(
         weight_source, oncard_mode, str(getattr(ns, "model", "")),
         getattr(ns, "weg2_xchg_oncard_slot_mib", None),
