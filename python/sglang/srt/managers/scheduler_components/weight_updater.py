@@ -6422,6 +6422,19 @@ class SchedulerWeightUpdaterManager:
                         flip_index=_weg2_flip_index_of(
                             getattr(recv_req, "epoch", None)),
                         tag=tag)
+                    # S1 (PLAN_FLIP_LANES_0917): the native pause() ends in
+                    # cuMemUnmap, which synchronises the WHOLE device -- every
+                    # copy this process still has in flight (the HiCache KV
+                    # write-back among them) is paid inside 'pause_ms'. Take
+                    # that wait out on its own clock so the line says which
+                    # of the two it was: the device's backlog (sync_ms) or the
+                    # unmap itself (pause_ms).
+                    _t_sync0 = time.perf_counter()
+                    try:
+                        torch.cuda.synchronize()
+                    except Exception:  # noqa: BLE001 -- no device: nothing to wait for
+                        pass
+                    _sync_ms = (time.perf_counter() - _t_sync0) * 1000
                     t_tag = time.perf_counter()
                     self.memory_saver_adapter.pause(tag)
                     weg2_per_tag[tag] = [
@@ -6440,9 +6453,9 @@ class SchedulerWeightUpdaterManager:
                     # pause = tms unmap, credit = publish, gap = the loop's own
                     # work between the previous tag's credit and this deposit.
                     logger.info(
-                        "WEG2-SLEEP-TAG-TIME tag=%s deposit_ms=%.0f pause_ms=%.0f "
+                        "WEG2-SLEEP-TAG-TIME tag=%s deposit_ms=%.0f sync_ms=%.0f pause_ms=%.0f "
                         "credit_ms=%.0f gap_ms=%.0f total_ms=%.0f t0=%.3f t=%.3f",
-                        tag, (t_tag - _t_dep0) * 1000,
+                        tag, (_t_sync0 - _t_dep0) * 1000, _sync_ms,
                         weg2_per_tag[tag][1], (_t_prev_end - _t_cr0) * 1000,
                         _gap_ms, (_t_prev_end - _t_dep0) * 1000,
                         # wall-clock stamps (order point 2 timeline): the
