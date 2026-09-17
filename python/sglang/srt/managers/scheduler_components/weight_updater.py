@@ -3832,10 +3832,16 @@ class SchedulerWeightUpdaterManager:
                     logger.info("WEG2-SEQ leg-end drain lane=%s failed: %s",
                                 lane_key, exc)
         bx.release_stage_buffers(None, log=logger.info)
-        # xsn265: the depositor's host lane buffers -- every band drained
-        # above, so the files are truncated and the tmpfs bytes return.
+        # xsn265: the depositor's host lane buffers go at its leg end.
+        # xsn266: UNMAP ONLY, NEVER TRUNCATE HERE -- D-TP0 died of SIGSEGV
+        # mid-collect (lane c0, piece 3/224) while PP0, the depositor, had
+        # already passed this leg end and cut the files to 0: the leg-end
+        # drain wait above consumes the lane's PRIMED credits as readily as
+        # real drains, so it is not a proof that the collector is done. The
+        # COLLECTOR is the last reader and truncates after its own leg end
+        # (resume_memory_occupation, after the wake worker joined).
         if bx.seq_release_lanes():
-            bx.release_host_lane_buffers(truncate=True, log=logger.info)
+            bx.release_host_lane_buffers(truncate=False, log=logger.info)
 
     def _weg2_wake_collect_one(self, tag) -> None:
         """One tag's collect on the wake side (the exchange carrier), run
@@ -7239,13 +7245,15 @@ class SchedulerWeightUpdaterManager:
                             len(_errs))
                 if _errs:
                     raise _errs[0][1]
-            # xsn265: the collector's own mappings of the lane buffers go
-            # at its leg end (unregister + unmap; the depositor truncates).
+            # xsn265/266: the collector is the LAST reader of every lane it
+            # mapped -- the depositor finished writing before it posted full
+            # -- so THIS is where the files are truncated (tmpfs bytes
+            # return); the depositor only unmaps its side.
             try:
                 from sglang.srt.weg2 import weight_exchange_bounce as _bx_rel
 
                 if _bx_rel.seq_release_lanes():
-                    _bx_rel.release_host_lane_buffers(truncate=False, log=logger.info)
+                    _bx_rel.release_host_lane_buffers(truncate=True, log=logger.info)
             except Exception as _rel_exc:  # noqa: BLE001 -- a release never fails a wake
                 logger.info("WEG2-SEQ lane-release skipped: %r", _rel_exc)
             weg2_leg_ms = (time.perf_counter() - t_w0) * 1000

@@ -44,7 +44,7 @@ def _clean_cache():
         bx._SEQ_HOST_BUF.clear()
 
 
-def test_the_depositor_release_unregisters_unmaps_and_truncates(tmp_path):
+def test_the_truncating_release_unregisters_unmaps_and_truncates(tmp_path):
     ops = _Ops()
     lines = []
     path = str(tmp_path / "weg2-seq-t" / "p0_unit_buffer.bin")
@@ -64,7 +64,7 @@ def test_the_depositor_release_unregisters_unmaps_and_truncates(tmp_path):
     assert os.path.getsize(path) == 1 << 20
 
 
-def test_the_collector_release_keeps_the_file_size(tmp_path):
+def test_the_unmapping_release_keeps_the_file_size(tmp_path):
     ops = _Ops()
     path = str(tmp_path / "weg2-seq-t" / "c1_unit_buffer.bin")
     os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -72,7 +72,7 @@ def test_the_collector_release_keeps_the_file_size(tmp_path):
     n, total = bx.release_host_lane_buffers(truncate=False, log=lambda *_a: None)
     assert (n, total) == (1, 4096)
     assert len(ops.unregistered) == 1
-    assert os.path.getsize(path) == 4096      # the depositor truncates, not the collector
+    assert os.path.getsize(path) == 4096      # the collector truncates, not the depositor
 
 
 def test_release_is_on_by_default_and_an_env_zero_keeps_the_boot_long_form(monkeypatch):
@@ -87,6 +87,9 @@ def test_both_leg_ends_call_the_release():
     src = open(wu.__file__).read()
     i = src.index("def _weg2_xchg_drain_outstanding")
     j = src.index("def _weg2_wake_collect_one", i)
-    assert "release_host_lane_buffers(truncate=True" in src[i:j]
+    # xsn266: the DEPOSITOR only unmaps (its leg-end drain wait consumes
+    # primed credits too, so it is no proof the collector is done); the
+    # COLLECTOR, the last reader, truncates after its wake worker joined.
+    assert "release_host_lane_buffers(truncate=False" in src[i:j]
     k = src.index("WEG2-WAKE-OVERLAP collects=")
-    assert "release_host_lane_buffers(truncate=False" in src[k:k + 1500]
+    assert "release_host_lane_buffers(truncate=True" in src[k:k + 1500]
