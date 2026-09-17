@@ -340,6 +340,11 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         # Important: for FP8, this must cover not only `.weight` but also
         # `weight_scale_inv` / `weight_scale` / `input_scale` if present.
         self._bind_packed_weight_loaders(self.in_proj_qkvz)
+        if layer_id == 0:  # #1483 instrument
+            logger.info("#1483 GDN-PROJ layer0 qkvz=%s ba=%s out=%s prefix=%s quant=%s",
+                        type(self.in_proj_qkvz.quant_method).__name__, type(self.in_proj_ba.quant_method).__name__,
+                        type(self.out_proj.quant_method).__name__ if hasattr(self, "out_proj") else "n/a",
+                        prefix, None if quant_config is None else quant_config.get_name())
         self._bind_packed_weight_loaders(self.in_proj_ba)
 
         # Conv1d weight loader setup
