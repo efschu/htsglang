@@ -3474,6 +3474,18 @@ def build_coverage(
                         # tiles only three of four device sub-blocks must move
                         # this number, not the storage size it failed to cover.
                         planned_bytes += claim
+                elif t.nbytes == 0:
+                    # A ZERO-BYTE parameter has no page to source: the
+                    # compressed-tensors pack-quantized loader leaves
+                    # `weight_zero_point`, `weight_g_idx` and
+                    # `g_idx_sort_indices` as shape-[0] parameters on a
+                    # symmetric, non-actorder checkpoint (Qwen3.8-27B-INT8-
+                    # W8A16-MTP-lued: 144 of them under weights_6/7 on P's
+                    # last stage, boot xsn251). They are named as exempt,
+                    # like a zerofill-by-design claim, never as UNCOVERED --
+                    # an empty destination cannot serve stale bytes.
+                    exempt.append(t.name)
+                    covered_storage.add(t.storage_key)
                 else:
                     uncovered.append(t)
             elif t.kind == BUFFER:
