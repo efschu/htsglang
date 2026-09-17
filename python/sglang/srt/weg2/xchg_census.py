@@ -866,6 +866,18 @@ def family_from_front(front_log: str) -> List[str]:
             for line in fh:
                 found = _CHUNKS_RE.search(line)
                 if found:
+                    # The line prints the family the boot PAUSED verbatim
+                    # ("family ['weights_0', ..., 'weights_draft', 'weights']").
+                    # Read it: rebuilding it through weights_family_tags in
+                    # THIS process asks draft_tag_in_family(), which reads the
+                    # exchange environment the tool does not run under, and
+                    # drops weights_draft (refused xsn246 as a source, 17.09.).
+                    listed = re.search(r"family \[([^\]]*)\]", line)
+                    if listed:
+                        tags = [t.strip().strip("'\"") for t in listed.group(1).split(",")]
+                        tags = [t for t in tags if t]
+                        if tags:
+                            return tags
                     return [str(t) for t in weights_family_tags(int(found.group(1)))]
     except OSError as exc:
         raise _refuse(f"front log {front_log!r} unreadable: {exc}")
