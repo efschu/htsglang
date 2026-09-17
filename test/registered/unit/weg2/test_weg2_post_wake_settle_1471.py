@@ -23,7 +23,8 @@ def _holder(states):
     h.weg2_dormant_hold = []
     h.tree_cache = types.SimpleNamespace(cache_controller=types.SimpleNamespace(weg2_hold_rids=set()))
     h.WEG2_POST_WAKE_SETTLE_S = S.WEG2_POST_WAKE_SETTLE_S
-    for n in ("_weg2_release_dormant_hold", "_weg2_post_wake_settle_tick"):
+    h.ps = types.SimpleNamespace(tp_size=1)
+    for n in ("_weg2_release_dormant_hold", "_weg2_post_wake_settle_tick", "_weg2_group_min_flags"):
         setattr(h, n, types.MethodType(getattr(S, n), h))
     h._weg2_refetch_one = lambda req, now: states[req.rid]
     return h
@@ -56,6 +57,11 @@ class Test1471(unittest.TestCase):
         h2.weg2_post_wake_settle = [r2]
         self.assertEqual(h2._weg2_post_wake_settle_tick(), 0)                 # still reading, not lapsed
         self.assertEqual([x.rid for x in h2.weg2_post_wake_settle], ["c"])
+
+    def test_group_min_flags_is_local_on_one_rank(self):
+        h = _holder({})
+        self.assertEqual(h._weg2_group_min_flags([True, False, True]), [1, 0, 1])
+        self.assertEqual(h._weg2_group_min_flags([]), [])
 
     def test_tick_is_wired_into_every_scheduling_pass(self):
         src = inspect.getsource(S.get_next_batch_to_run)

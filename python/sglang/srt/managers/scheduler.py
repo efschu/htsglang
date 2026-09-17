@@ -4888,6 +4888,28 @@ class Scheduler(
                     len(gone), rid[:12], abort_all, len(keep))
         return len(gone)
 
+    def _weg2_group_min_flags(self, flags):
+        """#1471e: ONE verdict for the group.  weg2xsn240: rank 2 released a
+        parked request from its rank-local verdict while ranks 0/1 still held
+        it -> '#791b PREFETCH-BALLOT DIGEST MISMATCH STOP ... queue_len=1
+        head=[weg2-6-3]' on all three ranks (RAENGE-NIE-UNEINS).  The parked
+        lists are replicated in arrival order, so an element-wise MIN over the
+        TP cpu group makes every rank release the same requests on the same
+        pass.  Falls back to the local flags on a single rank / no group."""
+        vals = [1 if f else 0 for f in flags]
+        if not vals:
+            return vals
+        try:
+            tp_size = int(getattr(getattr(self, "ps", None), "tp_size", 1) or 1)
+            group = getattr(self, "tp_cpu_group", None)
+            if tp_size > 1 and group is not None and torch.distributed.is_initialized():
+                t = torch.tensor(vals, dtype=torch.int64)
+                torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.MIN, group=group)
+                return [int(x) for x in t.tolist()]
+        except Exception as exc:  # noqa: BLE001
+            logger.info("#1471 group verdict n/a (%s: %s) -- local flags used", type(exc).__name__, exc)
+        return vals
+
     def _weg2_refetch_one(self, req, now: float) -> str:
         """#1456/#1471: one held request's read -- "reading" (still in
         flight), "complete" (whole prefix on the host), "wait" (short, but
@@ -4977,6 +4999,7 @@ class Scheduler(
         now = time.monotonic()
         _refetch = getattr(self, "_weg2_refetch_one", None) or functools.partial(Scheduler._weg2_refetch_one, self)
         keep, release = [], []
+        _local = []
         for req in settle:
             try:
                 state = _refetch(req, now)
@@ -4985,7 +5008,10 @@ class Scheduler(
                             type(exc).__name__, exc)
                 state = "complete"
             lapsed = now - float(getattr(req, "_1471_since", now)) >= self.WEG2_POST_WAKE_SETTLE_S
-            if state == "complete" or lapsed:
+            _local.append((req, state, lapsed, state == "complete" or lapsed))
+        _agreed = self._weg2_group_min_flags([x[3] for x in _local])  # #1471e
+        for (req, state, lapsed, _r), ok in zip(_local, _agreed):
+            if ok:
                 release.append((req, state, lapsed))
             else:
                 keep.append(req)
@@ -5021,6 +5047,7 @@ class Scheduler(
         _now = time.monotonic()
         _refetch = getattr(self, "_weg2_refetch_one", None) or functools.partial(Scheduler._weg2_refetch_one, self)
         released, parked = [], []
+        _states = []
         for _r in list(hold):
             try:
                 _state = _refetch(_r, _now)
@@ -5028,7 +5055,10 @@ class Scheduler(
                 logger.info("#1471 SETTLE rid=%s wake verdict n/a (%s: %s) -- queued as it is",
                             str(getattr(_r, "rid", "?"))[:12], type(exc).__name__, exc)
                 _state = "complete"
-            if _state == "complete":
+            _states.append(_state)
+        _agreed = self._weg2_group_min_flags([st == "complete" for st in _states])  # #1471e
+        for _r, ok in zip(list(hold), _agreed):
+            if ok:
                 released.append(_r)
             else:
                 _r._1471_since = _now
