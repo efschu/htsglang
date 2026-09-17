@@ -4993,7 +4993,9 @@ class Scheduler(
         for _r in list(hold):
             try:
                 _state = _refetch(_r, _now)
-            except Exception:  # noqa: BLE001
+            except Exception as exc:  # noqa: BLE001
+                logger.info("#1471 SETTLE rid=%s wake verdict n/a (%s: %s) -- queued as it is",
+                            str(getattr(_r, "rid", "?"))[:12], type(exc).__name__, exc)
                 _state = "complete"
             if _state == "complete":
                 released.append(_r)

@@ -3017,6 +3017,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         lock_params: Optional[DecLockRefParams],
     ) -> None:
         node.write_through_pending_id = node.id
+        if "_1472_issued_at" not in self.__dict__:
+            self._1472_issued_at = {}
+        self._1472_issued_at[node.id] = time.perf_counter()  # #1472 WT-ACK latency
         self.ongoing_write_through[node.id] = _OngoingWriteThrough(
             node, lock_params, [node]
         )
@@ -3047,6 +3050,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
         for node in new_nodes:
             node.write_through_pending_id = ack_id
+        if "_1472_issued_at" not in self.__dict__:
+            self._1472_issued_at = {}
+        self._1472_issued_at[ack_id] = time.perf_counter()  # #1472 WT-ACK latency
         self.ongoing_write_through[ack_id] = _OngoingWriteThrough(
             lock_node,
             lock_params,
@@ -3210,8 +3216,20 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                         getattr(node, "id", "?"), int(hv.numel()), done, n)
         return True
 
+    _1472_issued_at: dict = {}
+
     def _finish_write_through_ack(self, ack_id: int) -> None:
         lock_node, lock_params, publish_nodes = self.ongoing_write_through.pop(ack_id)
+        try:  # #1472 WT-ACK: how long a write-through took from issue to ack (P side)
+            _t_iss = self._1472_issued_at.pop(ack_id, None)
+            _k = getattr(type(self), "_1472_ack_n", 0) + 1
+            type(self)._1472_ack_n = _k
+            if _t_iss is not None and (_k <= 40 or _k % 200 == 0):
+                logger.info("#1472 WT-ACK n=%d ack_id=%s nodes=%d latency_ms=%.0f still_in_flight=%d",
+                            _k, ack_id, len(publish_nodes), (time.perf_counter() - _t_iss) * 1000.0,
+                            len(self.ongoing_write_through))
+        except Exception:  # noqa: BLE001
+            pass
         direct = set()
         for node in publish_nodes:
             if node.write_through_pending_id == ack_id:

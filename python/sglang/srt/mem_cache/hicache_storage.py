@@ -2734,13 +2734,29 @@ class HiCacheFile(HiCacheStorage):
         rest = [s for s in stems if s not in in_arena]
         sizes = self._stat_stems(rest) if rest else {}
         out = [s for s in stems if s in in_arena]
+        _first_missing = None
         for stem in rest:
             size = sizes.get(stem)
             if size is None:
+                if _first_missing is None:
+                    _first_missing = (stem, "no-file")
                 continue
             total = self._canonical_total_for_stem(stem)
             if total is None or int(size) == int(total):
                 out.append(stem)
+            elif _first_missing is None:
+                _first_missing = (stem, f"partial size={size} total={total}")
+        if _first_missing is not None:
+            # #1472 READ-TRACE: what the reader could NOT serve, and why.  The
+            # short store reads on group D during the flip (weg2xsn229-231:
+            # delivered 4095 of 98210, 20+ s after P served the prompt) had no
+            # line naming the first unreadable page or the path that refused it.
+            _n = getattr(type(self), "_1472_n", 0) + 1
+            type(self)._1472_n = _n
+            if _n <= 40 or _n % 200 == 0:
+                logger.info("#1472 READ-TRACE n=%d asked=%d readable=%d arena_hits=%d first_missing=%s why=%s arena_dir=%s",
+                            _n, len(stems), len(out), len(in_arena), _first_missing[0][:48], _first_missing[1],
+                            bool(self._arena_dir()))
         return out
 
     def _canonical_total_for_stem(self, stem: str) -> Optional[int]:
