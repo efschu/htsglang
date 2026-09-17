@@ -2877,15 +2877,28 @@ class HiCacheFile(HiCacheStorage):
         kv_fast = self._arena_kv_present_prefix(keys)
         if kv_fast is not None:
             rest = keys[kv_fast:]
-            if rest:
-                existing_rest = self._collect_existing_component_keys(rest, None)
-                kv_pages = kv_fast + next(
-                    (i for i in range(len(rest))
-                     if f"{self._get_component_key(rest[i])}.bin" not in existing_rest),
-                    len(rest),
+            # #1473: LONGEST-PREFIX means STOP AT THE FIRST MISS.  The probe
+            # walked every remaining key through `_readable_stems` (Python per
+            # stem: canonical width, arena lookup, stat) before it took the
+            # prefix -- 94k stems for a fresh 100k prompt, ~1 s in the
+            # scheduler thread of PP0 at every request change (py-spy
+            # weg2xsn223: 150 of 3516 samples in _readable_stems/_stat_stems;
+            # #1466 PASS-STALL input_ms 400-1400).  Chunked in key order, the
+            # walk ends at the chunk holding the first miss: a new prompt costs
+            # one chunk.
+            kv_pages = kv_fast
+            _CH = 512
+            for _off in range(0, len(rest), _CH):
+                _chunk = rest[_off:_off + _CH]
+                existing_rest = self._collect_existing_component_keys(_chunk, None)
+                _hit = next(
+                    (i for i in range(len(_chunk))
+                     if f"{self._get_component_key(_chunk[i])}.bin" not in existing_rest),
+                    len(_chunk),
                 )
-            else:
-                kv_pages = kv_fast
+                kv_pages += _hit
+                if _hit < len(_chunk):
+                    break
             # #1439b (xsn200 D profile): the trailing rule walked prefix_len
             # downwards asking has_component() per page -- for the mamba
             # blob that is up to one chunk (4096) of single lookups per pool,
