@@ -60,6 +60,22 @@ class HoldRefetch(CustomTestCase):
 
 
 class Wiring(CustomTestCase):
+    def test_hold_time_claims_adopt_the_group_min_1461(self):
+        """boot weg2xsn216: TP2 probed 94207 while TP0/TP1 read 97870 (P still
+        writing the tail) -> DRAFT-DISAGREE STOP.  For rids in the hold the
+        controller adopts the MIN; outside the hold the law stays STOP."""
+        from sglang.srt.managers import cache_controller as cc
+        src = inspect.getsource(cc)
+        self.assertIn('operation.request_id in getattr(self, "weg2_hold_rids", ())', src)
+        self.assertIn("#1461 DRAFT-CLAIM MIN-ADOPTED", src)
+        self.assertIn("assert_draft_claims_agree(_mn, _mx, operation.request_id)", src)
+        with self.assertRaises(cc.Weg2DraftDisagree):
+            cc.assert_draft_claims_agree(94207, 97870, "x")
+        sched = inspect.getsource(Scheduler._add_request_to_queue)
+        self.assertIn("_cc.weg2_hold_rids.add(req.rid)", sched)
+        self.assertIn(".discard(_r.rid)", inspect.getsource(Scheduler._weg2_release_dormant_hold))
+        self.assertIn(".discard(_r.rid)  # #1461", inspect.getsource(Scheduler._weg2_abort_dormant_hold))
+
     def test_orphan_collector_spares_the_hold_and_idle_calls_the_top_up(self):
         src = inspect.getsource(Scheduler)
         self.assertIn("if r not in verdicts and str(r) not in _held", src)

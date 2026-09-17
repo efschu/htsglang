@@ -2647,7 +2647,13 @@ class HiCacheFile(HiCacheStorage):
             if not adir:
                 return None
             from sglang.srt.mem_cache.storage.file.l3_index import open_index
-            idx = open_index(os.path.join(adir, "l3idx.bin"))
+            # #1459b (boot weg2xsn216): NOT inside the arena dir -- every file
+            # there is read as an arena of some slot size, and the index file
+            # made the host tiers rebind against a phantom pool (HICACHE-INDEX
+            # REFUSED on the first prefill).  A sibling dir instead.
+            _idir = adir.rstrip("/") + "-l3idx"
+            os.makedirs(_idir, exist_ok=True)
+            idx = open_index(os.path.join(_idir, "l3idx.bin"))
             self._l3idx = idx
             if idx is not None:
                 self._evictor.l3_index = idx

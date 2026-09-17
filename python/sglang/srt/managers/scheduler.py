@@ -4856,6 +4856,12 @@ class Scheduler(
         if not gone:
             return 0
         hold[:] = keep
+        try:
+            _cc = self.tree_cache.cache_controller
+            for _r in gone:
+                getattr(_cc, "weg2_hold_rids", set()).discard(_r.rid)  # #1461
+        except Exception:  # noqa: BLE001
+            pass
         for req in gone:
             if getattr(self, "enable_hicache_storage", False):
                 self.tree_cache.release_aborted_request(req.rid)
@@ -4911,6 +4917,12 @@ class Scheduler(
             return 0
         released = list(hold)
         hold.clear()
+        try:  # #1461: back under the strict claim law
+            _cc = self.tree_cache.cache_controller
+            for _r in released:
+                getattr(_cc, "weg2_hold_rids", set()).discard(_r.rid)
+        except Exception:  # noqa: BLE001
+            pass
         # #1455: the prefetch was issued at the hold and ran during the flip;
         # the wake does not flush any more, so the requests join the queue
         # as they are -- their device load follows at scheduling.
@@ -5855,6 +5867,13 @@ class Scheduler(
                 if hold is None:
                     hold = self.weg2_dormant_hold = []
                 hold.append(req)
+                try:  # #1461: the controller relaxes the claim law for held rids
+                    _cc = self.tree_cache.cache_controller
+                    if getattr(_cc, "weg2_hold_rids", None) is None:
+                        _cc.weg2_hold_rids = set()
+                    _cc.weg2_hold_rids.add(req.rid)
+                except Exception:  # noqa: BLE001
+                    pass
                 n = getattr(self, "_1443_held_n", 0) + 1
                 self._1443_held_n = n
                 if n <= 8 or n % 64 == 0:

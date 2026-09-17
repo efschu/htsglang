@@ -3422,9 +3422,20 @@ class HiCacheController:
                         [storage_hit_count, -storage_hit_count], dtype=torch.int
                     )
                     self._all_reduce_prefetch_groups(packed, torch.distributed.ReduceOp.MIN)
-                    assert_draft_claims_agree(
-                        int(packed[0].item()), -int(packed[1].item()), operation.request_id
-                    )
+                    _mn, _mx = int(packed[0].item()), -int(packed[1].item())
+                    if _mn != _mx and operation.request_id in getattr(self, "weg2_hold_rids", ()):
+                        # #1461 (boot weg2xsn216): a probe issued for a request in
+                        # the DORMANT HOLD reads a store that P is still writing --
+                        # the ranks' probes land ms apart and differ (TP2 94207 vs
+                        # 97870).  That is the one case where the inequality is the
+                        # write-through's clock, not a divergent store: every rank
+                        # adopts the group MIN (the same prefix on every rank) and
+                        # the hold's top-up (#1456) fetches the rest.  Outside the
+                        # hold the law stays STOP.
+                        logger.warning("#1461 DRAFT-CLAIM MIN-ADOPTED rid=%s per_rank_claim=[%d, %d] (hold-time probe, "
+                                       "store in flux; every rank proceeds with %d)", operation.request_id, _mn, _mx, _mn)
+                    else:
+                        assert_draft_claims_agree(_mn, _mx, operation.request_id)
                     storage_hit_count = int(packed[0].item())
                 else:
                     storage_hit_count_tensor = torch.tensor(
