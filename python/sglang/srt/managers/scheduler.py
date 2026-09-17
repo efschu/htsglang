@@ -4881,7 +4881,18 @@ class Scheduler(
             return "reading"
         reason = self._weg2_note_store_shortfall(req)
         if reason is None:
+            # #1471b (weg2xsn230): the shortfall verdict reads the tree's
+            # prefetch_loaded_tokens_by_reqid record, and at the wake that
+            # record is gone (the pools were restored), so a read that was
+            # SHORT at the hold came back "complete" and was queued into the
+            # X gate.  A request once seen short stays short until a record
+            # for it says otherwise.
+            _records = getattr(getattr(self, "tree_cache", None), "prefetch_loaded_tokens_by_reqid", None) or {}
+            if getattr(req, "_1471_short", False) and str(req.rid) not in _records:
+                return "reading"
+            req._1471_short = False
             return "complete"
+        req._1471_short = True
         if now - float(getattr(req, "_1456_last", 0.0) or 0.0) < 2.0:
             return "wait"
         req._1456_last = now
