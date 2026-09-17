@@ -5174,7 +5174,18 @@ def gate_w11(log_p: str, log: Log) -> Dict[str, object]:
     green, because the only caller sits behind two launched servers.  A gate
     nothing can reach is a gate nothing can pin.
     """
-    w11 = check_draft_resident(log_p)
+    # --spec-form DFLASH: the last stage's drafter is the EXTERNAL DFlash
+    # checkpoint, whole (TP1), priced off its headers -- the same term
+    # ring_table.checkpoint_stage_weights charges the stage with
+    # (external_drafter_mib_from_argv); the NEXTN constant is its own head.
+    _w11_budget = None
+    if spec_form_is_dflash():
+        from sglang.srt.speculative.dflash_pricing import dflash_draft_family_bytes
+
+        _w11_budget = float(
+            sum(dflash_draft_family_bytes(str(_SPEC_FORM["draft_path"])).values())
+        ) / float(1 << 20)
+    w11 = check_draft_resident(log_p, budget_mib=_w11_budget)
     log(f"W11 DRAFT-RESIDENT P last stage resident_mib={w11['resident_mib']} budget_mib={w11['budget_mib']:.1f} "
         f"tol_mib={w11['tol_mib']:.0f} over_mib={w11['over_mib']} resident_ok={w11['resident_ok']} "
         f"| W11b BUILD-ACCOUNTING nvml_delta_mib={w11['nvml_delta_mib']} = resident_mib + "

@@ -88,3 +88,26 @@ def test_dflash_attn_family_shards_on_the_drafts_head_grid():
     assert [round(f * 8) for f in fr] == [5, 2, 1]
     m.dflash_kv_heads = 2  # fewer heads than ranks: replicated-KV regime
     assert m._shard_fractions("dflash_attn", [3991, 1000, 1000]) == [1.0, 1.0, 1.0]
+
+
+@pytest.mark.skipif(not os.path.isdir(DRAFT), reason="DFlash2 draft checkpoint not on this host")
+def test_external_drafter_bytes_come_off_the_dflash_headers():
+    from sglang.srt.weg2.ring_table import (
+        checkpoint_stage_weights,
+        external_drafter_mib_from_argv,
+    )
+
+    argv_p = ["--pp-size", "3", "--speculative-algorithm", "DFLASH",
+              "--speculative-draft-model-path", DRAFT, "--speculative-num-draft-tokens", "8",
+              "--speculative-draft-kv-only"]
+    mib = external_drafter_mib_from_argv(argv_p)
+    assert 2040 < mib < 2100  # 258 + 1315 + 499 MiB of headers (measured 2026-09-17)
+    assert external_drafter_mib_from_argv(["--speculative-algorithm", "NEXTN"]) == 0.0
+    assert external_drafter_mib_from_argv([]) == 0.0
+    # the stage term: the whole draft on the last stage, nothing on the others
+    stages = checkpoint_stage_weights(
+        L.MODEL_DEFAULT, [43, 11, 10], [10, 3, 3], True,
+        drafter_head_from_target=True, external_drafter_mib=mib,
+    )
+    assert [round(s.drafter_mib) for s in stages] == [0, 0, round(mib)]
+    assert "external drafter checkpoint" in stages[-1].drafter_terms
