@@ -395,7 +395,7 @@ def pp0_publish(scheduler, recv_reqs: List) -> List:
     return list(recv_reqs) + out
 
 
-def follower_absorb(scheduler, recv_reqs: List) -> List:
+def _follower_absorb_impl(scheduler, recv_reqs: List) -> List:
     """After the forward, before dispatch: take the told objects off the list,
     store them, and register the held requests' prefetch with the told span."""
     if not any(isinstance(r, Weg2StoreTold) for r in recv_reqs):
@@ -493,3 +493,8 @@ def admission(scheduler, req, note_skip: Callable[[str, Any], None]) -> Optional
     # `storage_hit_length` / cached_tokens_storage, informational); the
     # uniform fact -- the prefix -- was just checked against told.
     return credit
+
+
+from sglang.srt.managers.weg2_pass_timer import timed as _pass_timed  # noqa: E402
+
+follower_absorb = _pass_timed("_1475_absorb_ms")(_follower_absorb_impl)  # #1475

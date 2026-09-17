@@ -3151,6 +3151,7 @@ class Scheduler(
         return disable_overlap_for_batch or need_grammar_sync
 
     @scheduler_nvtx_method("scheduler.process_input_requests")
+    @_pass_timed("_1475_process_input_ms")  # #1475
     def process_input_requests(self, recv_reqs: List):
         now = time.monotonic()
         # #1262 (2): the idle census's control-hold is released HERE, on the

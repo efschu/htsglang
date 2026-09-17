@@ -4087,16 +4087,22 @@ class SchedulerPPMixin:
                     _1466_prx = float(getattr(self, "_1463_recv_ms", 0.0) or 0.0)
                     _1466_cmt = float(getattr(self, "_1463_commit_ms", 0.0) or 0.0)
                     _1466_proc = float(getattr(self, "_1463_process_ms", 0.0) or 0.0)  # #1466c: process_batch_result
+                    # #1475: the intake's own parts (weg2xsn232-235: input_ms 1.4-1.9 s
+                    # on every rank in the same pass, handle_generate_request < 200 ms)
+                    _1475 = " ".join("%s=%.0f" % (k, _pt_read(self, a)) for k, a in (
+                        ("vote_ms", "_1475_vote_ms"), ("post_send_ms", "_1475_post_send_ms"),
+                        ("send_ms", "_1475_send_ms"), ("proc_input_ms", "_1475_process_input_ms"),
+                        ("absorb_ms", "_1475_absorb_ms")))
                     if _1466_prev is not None:
                         _1466_pass = (_1466_now - _1466_prev) * 1000.0
                         if _1466_pass - _1466_run >= 300.0:
                             logger.info(
                                 "#1466 PASS-STALL pp_rank=%s slot=%d pass_ms=%.0f fwd_ms=%.0f "
-                                "recv_ms=%.0f input_ms=%.0f schedule_ms=%.0f proxy_recv_ms=%.0f commit_ms=%.0f process_ms=%.0f other_ms=%.0f t=%.3f",
+                                "recv_ms=%.0f input_ms=%.0f schedule_ms=%.0f proxy_recv_ms=%.0f commit_ms=%.0f process_ms=%.0f other_ms=%.0f input[%s] t=%.3f",
                                 getattr(getattr(self, "ps", None), "pp_rank", "?"), mb_id,
                                 _1466_pass, _1466_run, _1466_recv, _1466_input, _1466_sched, _1466_prx, _1466_cmt, _1466_proc,
                                 _1466_pass - _1466_run - _1466_recv - _1466_input - _1466_sched - _1466_prx - _1466_cmt - _1466_proc,
-                                time.time())
+                                _1475, time.time())
                     try:
                         self._1463_recv_ms = 0.0
                         self._1463_commit_ms = 0.0
@@ -6099,6 +6105,7 @@ class SchedulerPPMixin:
         """
         return self.ps.attn_tp_rank == 0 and self.ps.attn_cp_rank == 0
 
+    @_1463_timed("_1475_vote_ms")  # #1475
     def _weg2_vote_pass_hook(self: Scheduler, recv_reqs: List) -> None:
         """Harvest a landed lap, stamp a new one, attach THIS rank's slot.
 
@@ -7773,6 +7780,7 @@ class SchedulerPPMixin:
         """
         return max(1, int(getattr(self.ps, "pp_size", 1) or 1))
 
+    @_1463_timed("_1475_post_send_ms")  # #1475
     def _pp_post_send(self: Scheduler, work: List[P2PWork]) -> None:
         """Post-and-forget: take the send off the pass path entirely.
 
@@ -8004,6 +8012,7 @@ class SchedulerPPMixin:
             self._pp_commit_comm_work(work=pending_output_work)
         return next_pp_outputs, next_batch_result, d2h_event
 
+    @_1463_timed("_1475_send_ms")  # #1475
     def _pp_send_pyobj_to_next_stage(self: Scheduler, data, async_send: bool = False):
         p2p_work = []
         if self.ps.attn_tp_rank == 0 and self.ps.attn_cp_rank == 0:
