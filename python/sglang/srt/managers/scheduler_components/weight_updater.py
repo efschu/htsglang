@@ -2530,7 +2530,7 @@ class SchedulerWeightUpdaterManager:
         votes = [v for v in gathered if isinstance(v, dict)]
         bad = [v for v in votes if not v.get("ok", False)]
         logger.info(
-            "WEG2-GROUP-FENCE %s joined in %.0f ms (world=%d ranks, chain sends joined=%s; "
+            "WEG2-GROUP-FENCE %s joined in %.0f ms t=" + f"{time.time():.3f}" + " (world=%d ranks, chain sends joined=%s; "
             "the RPC answer now means every rank finished this WHOLE LEG) "
             "ok=%d/%d (denominator: the ranks that answered the gather)",
             what,
@@ -6543,7 +6543,7 @@ class SchedulerWeightUpdaterManager:
             # A chunk RPC of an interleaved sleep: the census (whole-process
             # residency) is graded once the population is complete, below.
             logger.info(
-                "WEG2-SLEEP-CHUNK tags=%s paused in %.0f ms (offload_tags now %s)",
+                "WEG2-SLEEP-CHUNK tags=%s paused in %.0f ms (offload_tags now %s) t=" + f"{time.time():.3f}",
                 tags,
                 (time.perf_counter() - t_rpc0) * 1000,
                 sorted(self.offload_tags),
