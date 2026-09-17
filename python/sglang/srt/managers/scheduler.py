@@ -16276,7 +16276,7 @@ class Scheduler(
             self.tree_cache.reset()
             self.req_to_token_pool.clear()
             self.token_to_kv_pool_allocator.clear()
-            if envs.SGLANG_FLUSH_ZERO_KV.get() if zero_kv is None else bool(zero_kv):
+            if self._flush_zero_kv_wanted(zero_kv):
                 # Default part of the flush (opt-out env): the post-flush
                 # state must equal a fresh boot, whose pools are torch.zeros.
                 # #1457: the Weg-2 sleep leg opts out (pages are discarded).
@@ -16588,6 +16588,26 @@ class Scheduler(
         return VramBudgetReqOutput(
             success=ok, message=msg, state=self.kv_capacity_runtime.status()
         )
+
+    def _flush_zero_kv_wanted(self, zero_kv: Optional[bool]) -> bool:
+        """#1457b: explicit ``zero_kv`` wins; otherwise the env law -- EXCEPT
+        on a Weg-2 group rank, where every flush outside the wake restore is
+        on the SLEEP path (the quiesce witness /flush_cache, then the sleep
+        leg) and zeroes pages the pause discards: boot weg2xsn213 showed PP0
+        waiting 793 ms in the group fence for PP1/PP2 to finish the quiesce
+        memset.  The wake restore (_weg2_wake_restore_pools) zeroes under the
+        env law itself, so the fresh-boot invariant on remapped pages holds."""
+        if zero_kv is not None:
+            return bool(zero_kv)
+        if not envs.SGLANG_FLUSH_ZERO_KV.get():
+            return False
+        try:
+            from sglang.srt.managers.weg2_memory_saver import weg2_group_name  # noqa: PLC0415
+            if weg2_group_name():
+                return False
+        except Exception:  # noqa: BLE001
+            pass
+        return True
 
     def _flush_zero_kv_buffers(self):
         """Zero the attention KV data buffers during an idle flush (default,

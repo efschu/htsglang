@@ -150,7 +150,22 @@ class Wiring(CustomTestCase):
         self.assertIn("zero_kv", sig.parameters)
         self.assertIsNone(sig.parameters["zero_kv"].default)
         body = _i.getsource(Scheduler.flush_cache)
-        self.assertIn("if envs.SGLANG_FLUSH_ZERO_KV.get() if zero_kv is None else bool(zero_kv):", body)
+        self.assertIn("if self._flush_zero_kv_wanted(zero_kv):", body)
+        # #1457b: on a Weg-2 group rank the env law does not zero (the quiesce
+        # witness and the sleep leg both precede a pause); explicit wins
+        from sglang.srt.managers import weg2_memory_saver as ms
+        orig = ms.weg2_group_name
+        f = SimpleNamespace()
+        try:
+            ms.weg2_group_name = lambda: "P"
+            self.assertFalse(Scheduler._flush_zero_kv_wanted(f, None))
+            self.assertTrue(Scheduler._flush_zero_kv_wanted(f, True))
+            ms.weg2_group_name = lambda: ""
+            from sglang.srt.environ import envs as _envs
+            self.assertEqual(Scheduler._flush_zero_kv_wanted(f, None), bool(_envs.SGLANG_FLUSH_ZERO_KV.get()))
+            self.assertFalse(Scheduler._flush_zero_kv_wanted(f, False))
+        finally:
+            ms.weg2_group_name = orig
 
     def test_health_probe_takes_w25_not_the_hold(self):
         src = inspect.getsource(Scheduler.handle_generate_request)
