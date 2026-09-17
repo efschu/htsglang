@@ -6493,8 +6493,26 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         finish_count = self._count_ready_acks(cc.ack_load_queue, "loading_check")
 
         while finish_count > 0:
-            _, finish_event, ack_list = cc.ack_load_queue.pop(0)
+            start_event, finish_event, ack_list = cc.ack_load_queue.pop(0)
             finish_event.synchronize()
+            # Task #3 (17.09.): the host->device half of a re-admission,
+            # measured between the load's own two events (device clock) and
+            # against the wall since start_loading (D runs THIS tree).
+            _meta = getattr(cc, "_weg2_load_meta", None)
+            _m = _meta.pop(id(finish_event), None) if _meta else None
+            if _m is not None:
+                try:
+                    _tok, _bpt, _t0 = _m
+                    _ms = float(start_event.elapsed_time(finish_event))
+                    logger.info(
+                        "WEG2-LOAD-DEVICE tokens=%d mib=%.0f gpu_ms=%.0f wall_ms=%.0f "
+                        "GB/s=%.2f (bytes = tokens x 2 x layers x cell on THIS rank; "
+                        "gpu_ms = load_stream start->finish event)",
+                        _tok, _tok * _bpt / (1 << 20), _ms,
+                        (time.perf_counter() - _t0) * 1000,
+                        (_tok * _bpt / 1e9) / max(_ms / 1000.0, 1e-6))
+                except Exception:  # noqa: BLE001 -- an instrument never raises
+                    pass
             for ack_id in ack_list:
                 node, lock_params, host_lock_params = self.ongoing_load_back.pop(ack_id)
                 self.dec_lock_ref(node, lock_params)

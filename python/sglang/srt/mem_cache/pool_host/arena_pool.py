@@ -106,6 +106,8 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
         self._k_off = 0
         self._v_off = 0
         self._cell = 0
+        self._k_offs: list = []
+        self._v_offs: list = []
         self._pending: dict = {}
         self.arena_k_ptrs = None
         self.arena_v_ptrs = None
@@ -138,14 +140,33 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
             # canonical page is K-major, [K all slots][V all slots]
             half = int(window.total_bytes) // 2
             ext = [(0, half), (half, half)]
-        if len(ext) != 2:
-            raise ValueError(f"#1424 expected a K and a V extent, got {ext}")
-        (k_off, k_len), (v_off, v_len) = ext
         L = int(self.layer_num)
         e = int(self.dtype.itemsize)
         cell = int(self.head_num) * int(self.head_dim) * e
-        if k_len != v_len or k_len != L * cell:
-            raise ValueError(f"#1424 window extents {ext} do not match {L} layers x {cell} B")
+        if len(ext) == 2:
+            (k_off, k_len), (v_off, v_len) = ext
+            if k_len != v_len or k_len != L * cell:
+                raise ValueError(f"#1424 window extents {ext} do not match {L} layers x {cell} B")
+            k_offs = [k_off + l * cell for l in range(L)]
+            v_offs = [v_off + l * cell for l in range(L)]
+        elif len(ext) == 2 * L:
+            # xsn267 (17.09., DFlash draft on D): a HEAD-SHARDED window names
+            # its K and V extent PER LAYER -- the canonical draft page is
+            # [K L0 | V L0 | K L1 | ...] and this rank owns a head slice of
+            # each (TP0 5 of 8 heads: (0,640),(1024,640),...; TP1/TP2 2 heads:
+            # (640,256),(1664,256),...). Even extents are K, odd V; every
+            # extent is exactly this pool's own cell. The 2-extent form above
+            # is the whole-page special case of this one.
+            bad = [x for x in ext if x[1] != cell]
+            if bad:
+                raise ValueError(f"#1424 per-layer window extents {ext} carry lengths other "
+                                 f"than this pool's cell {cell} B: {bad[:3]}")
+            k_offs = [ext[2 * l][0] for l in range(L)]
+            v_offs = [ext[2 * l + 1][0] for l in range(L)]
+            k_off, v_off = k_offs[0], v_offs[0]
+        else:
+            raise ValueError(f"#1424 expected a K and a V extent (or {2 * L} per-layer "
+                             f"K/V extents), got {ext}")
         page_bytes = int(window.total_bytes)
         A = int(arena.slots)
         data_off = int(arena.data_offset())
@@ -156,11 +177,11 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
         H, D = int(self.head_num), int(self.head_dim)
         base_off = int(typed.storage_offset())  # the data region's own offset in the mapping
         self.arena_k_refs = [
-            typed.as_strided((A, H, D), (tok, D, 1), storage_offset=base_off + (k_off + l * cell) // e)
+            typed.as_strided((A, H, D), (tok, D, 1), storage_offset=base_off + k_offs[l] // e)
             for l in range(L)
         ]
         self.arena_v_refs = [
-            typed.as_strided((A, H, D), (tok, D, 1), storage_offset=base_off + (v_off + l * cell) // e)
+            typed.as_strided((A, H, D), (tok, D, 1), storage_offset=base_off + v_offs[l] // e)
             for l in range(L)
         ]
         # #1424e (boot xsn177/179): registering the WHOLE mapping materialised
@@ -171,7 +192,8 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
         self._pin = bool(pin and torch.cuda.is_available())
         self._pin_base = int(buf.data_ptr()) + data_off
         self._pin_bytes = page_bytes
-        self._own_extents = [(k_off, k_len), (v_off, v_len)]
+        self._own_extents = list(ext)
+        self._k_offs, self._v_offs = list(k_offs), list(v_offs)
         self._page_bytes = page_bytes
         self._data_base = self._pin_base
         self._k_off, self._v_off, self._cell = k_off, v_off, cell
@@ -412,10 +434,10 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
         if self.arena_k_ptrs is None or self.arena_k_ptrs.device != device:
             L = int(self.layer_num)
             self.arena_k_ptrs = torch.tensor(
-                [self._data_base + self._k_off + l * self._cell for l in range(L)],
+                [self._data_base + int(self._k_offs[l]) for l in range(L)],
                 dtype=torch.uint64, device=device)
             self.arena_v_ptrs = torch.tensor(
-                [self._data_base + self._v_off + l * self._cell for l in range(L)],
+                [self._data_base + int(self._v_offs[l]) for l in range(L)],
                 dtype=torch.uint64, device=device)
         return self.arena_k_ptrs, self.arena_v_ptrs
 

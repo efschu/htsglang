@@ -6358,7 +6358,26 @@ def _weg2_arena_ledger_terms(model: str) -> dict:
         blob = qwen3_5_mamba_spec(text_cfg, num_linear_layers=n_lin, units=1,
                                   temporal_itemsize=2, conv_itemsize=2).total_bytes if n_lin else 0
         mamba_slots = int(os.environ.get("SGLANG_HICACHE_ARENA_MAMBA_SLOTS", "140") or 140)
-        arena_bytes = kv_slots * kv_page + kv_slots * cell + mamba_slots * blob
+        # xsn267 (17.09.): under --spec-form DFLASH the draft slot is the
+        # DFlash draft's own page -- draft_layers x (K+V) x draft kv heads x
+        # head_dim x kv itemsize (5 x 2 x 8 x 128 x 1 = 10240 B, the
+        # arena-10240.bin the boot actually created: 7.76 GiB) -- not one
+        # target attention cell (the NEXTN form's draft). Priced with the
+        # target cell the ledger was 7 GiB short and W98 latched at cushion
+        # 1.07 GiB (xsn267) with the lanes already released per leg.
+        draft_cell = cell
+        try:
+            if str(_SPEC_FORM.get("algorithm") or "").upper() == "DFLASH":
+                _dp = str(_SPEC_FORM.get("draft_path") or "")
+                if _dp:
+                    _dc = json.load(open(os.path.join(_dp, "config.json")))
+                    _dc = _dc.get("text_config") or _dc
+                    _kv_item = 1 if "fp8" in "fp8_e4m3" else 2
+                    draft_cell = (int(_dc["num_hidden_layers"]) * 2
+                                  * int(_dc["num_key_value_heads"]) * int(_dc["head_dim"]) * _kv_item)
+        except Exception as _dexc:  # noqa: BLE001 -- unreadable draft config keeps the target cell
+            _logging.getLogger("weg2.launcher").info("WEG2-ARENA-LEDGER draft page not derived: %r", _dexc)
+        arena_bytes = kv_slots * kv_page + kv_slots * draft_cell + mamba_slots * blob
         out = dict(
             arena_gib=arena_bytes / (1 << 30),
             staging_gb=float(os.environ.get("SGLANG_HICACHE_ARENA_STAGING_GB", "0.05") or 0.05),
@@ -6367,7 +6386,7 @@ def _weg2_arena_ledger_terms(model: str) -> dict:
         _logging.getLogger("weg2.launcher").info(
             "WEG2-ARENA-LEDGER kv=%d slots x %d B + draft %d x %d B + mamba %d x %d B = %.2f GiB "
             "(term arena_gib); fallback pools staging=%s GB anchor=%s MiB",
-            kv_slots, kv_page, kv_slots, cell, mamba_slots, blob, out["arena_gib"],
+            kv_slots, kv_page, kv_slots, draft_cell, mamba_slots, blob, out["arena_gib"],
             out["staging_gb"], out["anchor_mib"])
         return out
     except Exception as exc:  # noqa: BLE001 - a mispriced arena is refused, never guessed
