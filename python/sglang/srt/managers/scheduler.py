@@ -4963,6 +4963,17 @@ class Scheduler(
         settle = getattr(self, "weg2_post_wake_settle", None)
         if not settle:
             return 0
+        # #1471d (weg2xsn239): a parked request stayed "reading" for the whole
+        # 20 s bound and was released short.  The load-back acks that finish
+        # its re-read are drained by check_hicache_events, which only the
+        # prefill scheduling path calls -- and a parked request never reaches
+        # it.  Drive the events here, every tick, while anything is parked.
+        try:
+            _ev = getattr(getattr(self, "tree_cache", None), "check_hicache_events", None)
+            if _ev is not None:
+                _ev()
+        except Exception as exc:  # noqa: BLE001
+            logger.info("#1471 SETTLE hicache events n/a (%s: %s)", type(exc).__name__, exc)
         now = time.monotonic()
         _refetch = getattr(self, "_weg2_refetch_one", None) or functools.partial(Scheduler._weg2_refetch_one, self)
         keep, release = [], []
