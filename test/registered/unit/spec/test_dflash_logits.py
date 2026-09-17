@@ -228,8 +228,10 @@ def test_worker_folds_a_gate_admitted_quantized_selector_head(monkeypatch):
     )
     # This line reads the graph batch sizes from the worker's server_args (no
     # get_exec bag) and screens TP through get_tp_group().
+    # The selector folds under TP>1 on this line (17.09.); the legacy greedy
+    # head sampler is what stays TP=1-only.
     monkeypatch.setattr(
-        worker_mod, "get_tp_group", lambda: SimpleNamespace(world_size=1)
+        worker_mod, "get_tp_group", lambda: SimpleNamespace(world_size=3)
     )
     quant_head = SimpleNamespace(
         weight=torch.empty(8, 2, dtype=torch.int8),

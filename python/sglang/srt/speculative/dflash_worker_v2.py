@@ -15,6 +15,7 @@ from sglang.srt.speculative.dspark_components.kernels.dspark_accept import (
     accept_sampling,
 )
 from sglang.srt.distributed import get_tp_group
+from sglang.srt.environ import envs
 from sglang.srt.layers.logits_processor import should_apply_lm_head_quant_method
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
@@ -935,8 +936,8 @@ class DFlashWorkerV2(BaseSpecWorker):
                 logger.info("DFLASH draft greedy head kept eager (reason=%s).", reason)
             return None
 
-        if get_tp_group().world_size != 1:
-            return _eager("tp>1")
+        if envs.SGLANG_DFLASH_EAGER_DRAFT_SAMPLER.get():
+            return _eager("SGLANG_DFLASH_EAGER_DRAFT_SAMPLER=1")
         if self._spec_solo_active:
             # Solo samples through the vocab-parallel greedy reduction, which
             # is a TP collective and must stay eager (outside the replayed
@@ -971,6 +972,14 @@ class DFlashWorkerV2(BaseSpecWorker):
                 max_bs=max(self.server_args.cuda_graph_config.decode.bs),
                 device=self.device,
             )
+        # The DFlash2 selector above folds under TP as upstream does (df2a,
+        # 17.09.: eager selector 57.9 tok/s vs NEXTN 73.7 on the same prompts):
+        # its candidate top-k all-gathers K logits per rank inside the graph,
+        # the in-graph philox draw is replay-uniform across ranks (same seed,
+        # same replay count), and the accept decisions ride SpecTpSync.  Only
+        # the legacy greedy head sampler below stays TP=1-only on this line.
+        if get_tp_group().world_size != 1:
+            return _eager("tp>1")
         if not hasattr(lm_head, "weight"):
             return _eager("quantized lm_head has no dense weight")
         if not is_dense_head_weight(lm_head.weight):
