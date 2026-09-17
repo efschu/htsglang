@@ -311,6 +311,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         # on the solo HOST when a policy/gate context cap bounds the DFLASH
         # rung; None = full global-mirror pool (default, byte-identical).
         self._solo_pool_mapper = None
+        self._window_pool = False  # set by _maybe_init_solo_small_pool
 
         self._warned_sampling_fallback = False
         self._draft_probs_buf = None
@@ -803,6 +804,9 @@ class DFlashWorkerV2(BaseSpecWorker):
                 token_to_kv_pool_allocator=token_to_kv_pool_allocator,
             )
             pool = self.draft_model_runner.token_to_kv_pool
+            # The cache controller translates its row-addressed draft
+            # transfers (host<->device) through the same mapper.
+            pool.weg2_slot_mapper = self._solo_pool_mapper
             pool_size = int(getattr(pool, "size", -1))
             if pool_size != self._solo_pool_mapper.num_draft_slots:
                 raise RuntimeError(
@@ -841,11 +845,27 @@ class DFlashWorkerV2(BaseSpecWorker):
             resolve_dflash_solo_pool_cap,
         )
 
-        if not (self._spec_solo_active and self._spec_solo_is_host):
-            return None
-        if self.use_compact_draft_cache:
-            return None
-        cap, source = resolve_dflash_solo_pool_cap(self.server_args)
+        # WINDOW POOL (Weg 2 group D, DFlash2): with the compact draft cache
+        # (--speculative-draft-window-size W) the draft attends to the last
+        # W tokens only, so the draft pool needs rows for W tokens per
+        # running request, not a mirror of the target pool (12.8 KiB/token
+        # on the 5090's head share x 670k slots would be 8.6 GB). Same slot
+        # mapper as the small solo pool, cap = W, no per-request ctx guard.
+        self._window_pool = bool(
+            self.use_compact_draft_cache
+            and os.environ.get("SGLANG_DFLASH_WINDOW_POOL", "0") == "1"
+        )
+        if self._window_pool:
+            cap, source = (
+                int(self.draft_window_size),
+                "window pool (SGLANG_DFLASH_WINDOW_POOL=1, cap = --speculative-draft-window-size)",
+            )
+        else:
+            if not (self._spec_solo_active and self._spec_solo_is_host):
+                return None
+            if self.use_compact_draft_cache:
+                return None
+            cap, source = resolve_dflash_solo_pool_cap(self.server_args)
         if cap is None:
             logger.info(
                 "DFLASH solo draft pool: full global-mirror pool (%s).", source
@@ -2417,7 +2437,9 @@ class DFlashWorkerV2(BaseSpecWorker):
             prefill_hidden = target_hidden
             prefill_cache_loc = batch.out_cache_loc
             prefill_positions = positions
-            if self._solo_pool_mapper is not None:
+            if self._solo_pool_mapper is not None and not self._window_pool:
+                # (window pool: every request keeps its last W rows; the
+                # solo pool's "drop requests over the cap" does not apply)
                 (
                     prefill_hidden,
                     prefill_cache_loc,
@@ -2681,6 +2703,14 @@ class DFlashWorkerV2(BaseSpecWorker):
                     start=suffix_start,
                     lengths=draft_prefix_lens,
                 )
+                block_loc = verify_out_cache_loc
+                if self._solo_pool_mapper is not None:
+                    # window pool: the draft rows live in draft-slot space;
+                    # unmapped prefix rows read the zero-KV hole slot.
+                    mapper = self._solo_pool_mapper
+                    mapper.begin_round()
+                    suffix_cache_loc = mapper.translate_read(suffix_cache_loc)
+                    block_loc = mapper.translate_write(verify_out_cache_loc)
                 assign_req_to_token_pool_func(
                     batch.req_pool_indices,
                     self.draft_model_runner.req_to_token_pool.req_to_token,
@@ -2697,12 +2727,12 @@ class DFlashWorkerV2(BaseSpecWorker):
                     self.draft_model_runner.req_to_token_pool.req_to_token,
                     draft_prefix_lens,
                     block_end,
-                    verify_out_cache_loc,
+                    block_loc,
                     bs,
                 )
                 draft_seq_lens = draft_prefix_lens
                 draft_seq_lens_sum = int(seq_lens_cpu.sum().item())
-                draft_out_cache_loc = verify_out_cache_loc
+                draft_out_cache_loc = block_loc
             else:
                 # Non-windowed path uses the shared overallocated mapping directly.
                 # Backend planning only needs a safe upper bound for the committed

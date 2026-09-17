@@ -1984,7 +1984,7 @@ class HiCacheController:
                 self.mem_pool_host_draft.backup_from_device_all_layer(
                     self.mem_pool_device_draft,
                     host_indices,
-                    device_indices,
+                    self._draft_device_indices(device_indices, "write"),
                     self.io_backend,
                 )
             finish_event.record()
@@ -2255,7 +2255,7 @@ class HiCacheController:
                     self.mem_pool_host_draft.load_to_device_per_layer(
                         self.mem_pool_device_draft,
                         host_indices,
-                        device_indices,
+                        self._draft_device_indices(device_indices, "load"),
                         i,
                         self.io_backend,
                     )
@@ -2522,6 +2522,19 @@ class HiCacheController:
         # Otherwise this will be deferred until attach_storage_backend().
         self._maybe_register_draft_with_storage()
 
+    def _draft_device_indices(self, device_indices, direction: str):
+        """Row-addressed draft transfers name TARGET slots. A draft pool that
+        is smaller than the target pool (DFlash window pool, the small solo
+        pool) carries a slot mapper: a backup reads the draft slot behind
+        each target slot (an unmapped row is the zero-KV hole slot), a load
+        allocates one. A mirror pool needs no translation."""
+        mapper = getattr(self.mem_pool_device_draft, "weg2_slot_mapper", None)
+        if mapper is None:
+            return device_indices
+        if direction == "write":
+            return mapper.translate_read(device_indices)
+        return mapper.translate_write(device_indices)
+
     def publish_draft_rows_direct(self, hash_values, device_pool, device_indices) -> int:
         """Producer path (Weg 2 group P, DFlash): publish draft rows that sit
         in ``device_pool`` at ``device_indices`` under the page hashes
@@ -2708,7 +2721,11 @@ class HiCacheController:
         )
         hidden = int(getattr(model_config, "hidden_size", 0) or 0)
         if hidden > 0:
-            check_full_head_shipment_is_justified(layout, hidden, 2)
+            # a DFlash draft's context is one hidden per capture layer
+            # (= its draft layer count); a NEXTN head's is one hidden
+            check_full_head_shipment_is_justified(
+                layout, hidden, 2, num_context_layers=int(pool.layer_num)
+            )
         backend.install_canonical_windows(
             backend.canonical_kv_page, backend.canonical_mamba_blob, draft_page=window
         )
