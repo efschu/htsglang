@@ -115,7 +115,28 @@ class SpecTpSync:
 
     def sync(self, site: SpecTpSyncSite, values: torch.Tensor) -> torch.Tensor:
         if site in self._sites:
+            # #1485 instrument (df2l6, 17.09.): the broadcast ENFORCES rank 0's
+            # decision and thereby hides where the ranks diverged (TP0 finished
+            # a 1024-token decode one round before TP1/TP2, which then hung in
+            # the graph's collective).  Keep the rank-local value and report a
+            # mismatch, bounded.
+            _local = None
+            if self._tp_group.world_size > 1 and getattr(self, "_1485_n", 0) < 40:
+                try:
+                    _local = values.detach().clone()
+                except Exception:  # noqa: BLE001
+                    _local = None
             self._tp_group.broadcast(values, src=0)
+            if _local is not None:
+                try:
+                    if not torch.equal(_local, values):
+                        self._1485_n = getattr(self, "_1485_n", 0) + 1
+                        _d = int((_local != values).sum().item())
+                        logger.warning("#1485 SPEC-TP-DIVERGE site=%s rank=%d differing=%d/%d local=%s synced=%s",
+                                       site.name, int(self._tp_group.rank_in_group), _d, int(values.numel()),
+                                       _local.flatten()[:8].tolist(), values.flatten()[:8].tolist())
+                except Exception:  # noqa: BLE001
+                    pass
         return values
 
     def available_memory_gb(self, site: SpecTpSyncSite, device, gpu_id, *, group):

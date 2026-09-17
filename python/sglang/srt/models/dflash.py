@@ -90,7 +90,8 @@ def _project_candidate_logits(
 
 def _get_dflash_attention_type(config, *, default: AttentionType) -> AttentionType:
     """Honor explicit causality while preserving legacy layer defaults."""
-    text_config = config.get_text_config()
+    _get = getattr(config, "get_text_config", None)
+    text_config = _get() if callable(_get) else config  # test stubs carry no wrapper
     is_causal = getattr(text_config, "is_causal", None)
     if is_causal is None:
         return default
@@ -110,12 +111,22 @@ def _get_dflash_layer_attention_params(
         )
 
     layer_type = layer_types[layer_id]
+    # #1486 (upstream 0dab252ffc / #34524, on this line only the helper had
+    # survived the pick, unused): the checkpoint's ``is_causal`` decides.  The
+    # DFlash2 draft (lued W8, 5x sliding_attention) says is_causal=false --
+    # a block-diffusion draft attends BIDIRECTIONALLY over its mask block;
+    # run causal, the late slots of the 8-block are blind and the accept
+    # length stalls at ~2.3 (df2l4-l10) against upstream's 4.29 on the 5090.
     if layer_type == "full_attention":
-        return -1, AttentionType.ENCODER_ONLY
+        return -1, _get_dflash_attention_type(
+            config, default=AttentionType.ENCODER_ONLY
+        )
     if layer_type == "sliding_attention":
         sliding_window_size = get_dflash_attention_sliding_window_size(config)
         assert sliding_window_size is not None
-        return sliding_window_size, AttentionType.DECODER
+        return sliding_window_size, _get_dflash_attention_type(
+            config, default=AttentionType.DECODER
+        )
     raise ValueError(
         "Unsupported DFLASH draft layer type. "
         f"layer_types[{layer_id}]={layer_type!r}."

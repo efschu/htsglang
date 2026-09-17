@@ -1339,6 +1339,28 @@ class DFlashWorkerV2(BaseSpecWorker):
         candidate_ids, scores = _selector_lattice(
             draft_model, pred_hidden, anchor_token_ids
         )
+        # #1485c instrument (df2l8-10): rank 0's candidates differ from ranks 1/2
+        # (shifted by one slot) with the selector eager AND folded, DCP on and
+        # off.  Name the first stage that differs: draft hidden rows, the
+        # codebooks, the candidate ids, the lattice scores.
+        _n = getattr(self, "_1485c_n", 0)
+        if _n < 4:
+            self._1485c_n = _n + 1
+            try:
+                sel = draft_model.candidate_selector
+                logger.warning(
+                    "#1485c SELECTOR-TRACE rank=%d bs=%d hidden=%s rows_sum=%s anchor=%s cand[0,:3,:4]=%s "
+                    "scores_sum=%.3f codebooks(pred,succ,proj)=(%.4f,%.4f,%.4f) lm_head_shard=%s",
+                    int(self.tp_rank), bs, tuple(draft_hidden.shape),
+                    [round(float(x), 3) for x in draft_hidden[0].float().sum(-1).tolist()],
+                    anchor_token_ids.flatten()[:4].tolist(), candidate_ids[0, :3, :4].tolist(),
+                    float(scores.float().sum().item()),
+                    float(sel.predecessor_codebook.float().sum().item()), float(sel.successor_codebook.float().sum().item()),
+                    float(sel.hidden_projection.weight.float().sum().item()),
+                    (int(lm_head.shard_indices.org_vocab_start_index), int(lm_head.shard_indices.num_org_elements)) if hasattr(lm_head, "shard_indices") else None,
+                )
+            except Exception as _e:  # noqa: BLE001
+                logger.warning("#1485c SELECTOR-TRACE rank=%d n/a (%s: %s)", int(self.tp_rank), type(_e).__name__, _e)
         device = pred_hidden.device
         # Clamped like DSpark so greedy rows don't divide by zero.
         temperatures = (
@@ -2190,6 +2212,9 @@ class DFlashWorkerV2(BaseSpecWorker):
                         prefix_lens=prefix_lens,
                         new_seq_lens_out=new_seq_lens,
                     )
+                    # #1485b: the decisions this kernel derived, group-wide
+                    for _t in (accept_len, commit_lens, bonus, out_tokens, new_seq_lens):
+                        self._tp_sync.sync(SpecTpSyncSite.DFLASH_ACCEPT_GREEDY, _t)
                 except Exception as e:
                     self._use_triton_accept_bonus = False
                     logger.warning(
@@ -2736,6 +2761,12 @@ class DFlashWorkerV2(BaseSpecWorker):
         # TARGET_VERIFY uses standard causal masking; custom masks are unnecessary here.
         custom_mask = None
 
+        # #1485b (moved, agent review 17.09.): the ranks' draft blocks differ
+        # (5090 sm_120 vs 3080 sm_86 in the REPLICATED selector math, TP1==TP2
+        # != TP0); rank 0's block has to be the one every rank VERIFIES and
+        # writes KV for -- syncing after the verify left ranks 1/2 with
+        # target/draft KV of a block they then discarded.
+        self._tp_sync.sync(SpecTpSyncSite.DFLASH_SELECTOR, draft_tokens)
         verify_input_ids = draft_tokens.reshape(-1)
         verify_input = DFlashVerifyInput(
             draft_token=verify_input_ids,
@@ -2789,6 +2820,10 @@ class DFlashWorkerV2(BaseSpecWorker):
         candidates = draft_tokens
         new_seq_lens = None
         target_predict = None  # DFLASH AUDIT (env-gated dump below)
+        # #1485b (df2l6/df2l7): the ranks left a 1024-token greedy decode one
+        # round apart with no divergence at the synced sites -- so the draft
+        # CANDIDATES themselves (the folded selector's out buffer) are what
+        # can differ per rank.  Sync them like upstream syncs the decisions.
         if self._selector_sample is not None:
             selector_candidate_ids, selector_q_rows = self._selector_sample
             accept_len, bonus = self._selector_sampling_accept(
@@ -2839,6 +2874,9 @@ class DFlashWorkerV2(BaseSpecWorker):
                         prefix_lens=prefix_lens,
                         new_seq_lens_out=new_seq_lens,
                     )
+                    # #1485b: the decisions this kernel derived, group-wide
+                    for _t in (accept_len, commit_lens, bonus, out_tokens, new_seq_lens):
+                        self._tp_sync.sync(SpecTpSyncSite.DFLASH_ACCEPT_GREEDY, _t)
                 except Exception as e:
                     self._use_triton_accept_bonus = False
                     logger.warning(
