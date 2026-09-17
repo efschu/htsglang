@@ -1,3 +1,4 @@
+import os
 import logging
 import math
 from typing import List, Optional
@@ -360,6 +361,13 @@ class DFlashWorkerV2(BaseSpecWorker):
                 "have no compact req->token table to maintain."
             )
         self.selector = self.draft_model.candidate_selector
+        # #1489 A/B (17.09.): SGLANG_DFLASH_DISABLE_SELECTOR=1 proposes the
+        # draft's per-slot unary argmax through the legacy greedy head path
+        # instead of the DFlash2 lattice -- separates "the draft hidden rows
+        # are wrong" from "the selector integration is wrong".
+        if os.environ.get("SGLANG_DFLASH_DISABLE_SELECTOR", "0") == "1" and self.selector is not None:
+            logger.warning("#1489 DFlash2 candidate selector DISABLED by env (A/B): unary argmax proposals")
+            self.selector = None
         draft_config = parse_dflash_draft_config(
             draft_hf_config=self.draft_model_runner.model_config.hf_config
         )
@@ -2855,6 +2863,36 @@ class DFlashWorkerV2(BaseSpecWorker):
                 bs, int(self.block_size)
             )
             self._tp_sync.sync(SpecTpSyncSite.DFLASH_ACCEPT_GREEDY, target_predict)
+            # #1488 instrument: per-slot draft quality.  candidates[:, i] is the
+            # draft's proposal for slot i (slot 0 = the verified anchor);
+            # target_predict[:, i-1] is what the target says follows slot i-1.
+            # A histogram of the FIRST mismatching slot over 256 rounds tells
+            # whether the draft is blind from slot 2 on (context/positions) or
+            # merely weak.  Rank 0 only, greedy path only, bounded.
+            if self.tp_rank == 0 and os.environ.get("SGLANG_DFLASH_SLOT_TRACE", "0") == "1":  # #1488 (D2H je Runde, nur zur Diagnose)
+                try:
+                    _h = getattr(self, "_1488_hist", None)
+                    if _h is None:
+                        _h = self._1488_hist = [0] * (int(self.block_size) + 1)
+                        self._1488_n = 0
+                        self._1488_slot_ok = [0] * int(self.block_size)
+                    _c = candidates[0].tolist(); _t = target_predict[0].tolist()
+                    _first = int(self.block_size)
+                    for _i in range(1, int(self.block_size)):
+                        if _c[_i] == _t[_i - 1]:
+                            self._1488_slot_ok[_i] += 1
+                        elif _first == int(self.block_size):
+                            _first = _i
+                    _h[_first] += 1; self._1488_n += 1
+                    if self._1488_n <= 3:
+                        logger.warning("#1488 SLOT-TRACE round=%d prefix_len=%s positions[:8]=%s cand=%s target=%s",
+                                       self._1488_n, int(prefix_lens[0].item()) if prefix_lens is not None else None,
+                                       positions.flatten()[:8].tolist() if positions is not None else None, _c, _t)
+                    if self._1488_n % 64 == 0:
+                        logger.warning("#1488 SLOT-HIST n=%d first_mismatch_slot=%s slot_ok(any-position match, slots1..)=%s",
+                                       self._1488_n, _h, self._1488_slot_ok[1:])
+                except Exception as _e:  # noqa: BLE001
+                    logger.warning("#1488 n/a (%s: %s)", type(_e).__name__, _e)
             if self._use_triton_accept_bonus:
                 try:
                     (
