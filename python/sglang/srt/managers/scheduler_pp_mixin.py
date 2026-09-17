@@ -4086,19 +4086,21 @@ class SchedulerPPMixin:
                     # near 0, i.e. the pass sat in exactly these two.
                     _1466_prx = float(getattr(self, "_1463_recv_ms", 0.0) or 0.0)
                     _1466_cmt = float(getattr(self, "_1463_commit_ms", 0.0) or 0.0)
+                    _1466_proc = float(getattr(self, "_1463_process_ms", 0.0) or 0.0)  # #1466c: process_batch_result
                     if _1466_prev is not None:
                         _1466_pass = (_1466_now - _1466_prev) * 1000.0
                         if _1466_pass - _1466_run >= 300.0:
                             logger.info(
                                 "#1466 PASS-STALL pp_rank=%s slot=%d pass_ms=%.0f fwd_ms=%.0f "
-                                "recv_ms=%.0f input_ms=%.0f schedule_ms=%.0f proxy_recv_ms=%.0f commit_ms=%.0f other_ms=%.0f t=%.3f",
+                                "recv_ms=%.0f input_ms=%.0f schedule_ms=%.0f proxy_recv_ms=%.0f commit_ms=%.0f process_ms=%.0f other_ms=%.0f t=%.3f",
                                 getattr(getattr(self, "ps", None), "pp_rank", "?"), mb_id,
-                                _1466_pass, _1466_run, _1466_recv, _1466_input, _1466_sched, _1466_prx, _1466_cmt,
-                                _1466_pass - _1466_run - _1466_recv - _1466_input - _1466_sched - _1466_prx - _1466_cmt,
+                                _1466_pass, _1466_run, _1466_recv, _1466_input, _1466_sched, _1466_prx, _1466_cmt, _1466_proc,
+                                _1466_pass - _1466_run - _1466_recv - _1466_input - _1466_sched - _1466_prx - _1466_cmt - _1466_proc,
                                 time.time())
                     try:
                         self._1463_recv_ms = 0.0
                         self._1463_commit_ms = 0.0
+                        self._1463_process_ms = 0.0
                     except Exception:  # noqa: BLE001
                         pass
                 except Exception:  # noqa: BLE001
@@ -10728,6 +10730,7 @@ class SchedulerPPMixin:
             # output) and process (finish/backup/handoff host work).
             try:
                 _proc = (time.perf_counter() - _t0) * 1000.0
+                self._1463_process_ms = float(getattr(self, "_1463_process_ms", 0.0) or 0.0) + _proc  # #1466c
                 _recv = float(getattr(self, "_1463_recv_ms", 0.0) or 0.0)
                 _commit = float(getattr(self, "_1463_commit_ms", 0.0) or 0.0)
                 _reqs = getattr(batch, "reqs", None) or ()
