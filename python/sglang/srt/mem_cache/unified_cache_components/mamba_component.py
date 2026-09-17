@@ -729,8 +729,22 @@ class MambaComponent(TreeComponent):
                     x_next = lru.get_lru_no_lock()
                 x = x_next
             else:
-                # Internal: tombstone Mamba + cascade
+                # Internal: tombstone Mamba + cascade.  #1481: the END-ANCHOR
+                # node (N-1 of a finished prompt, see
+                # UnifiedRadixCache._weg2_end_anchor_witness) keeps its state
+                # while un-backed -- it is the one anchor the hand-back reader
+                # can reach; the flip flush (#1470) publishes it and lifts the
+                # hold.  Bounded by the number of finished prompts awaiting the
+                # flip, never the whole backlog (the #1470b hazard).
                 x_next = lru.get_prev_no_lock(x)
+                if (
+                    getattr(x, "_weg2_end_anchor", False)
+                    and not getattr(x, "backuped", False)
+                    and x.component_data[ct].host_value is None
+                ):
+                    _1469_note("HOLD-END-ANCHOR", node=x.id)
+                    x = x_next
+                    continue
                 self.cache._evict_component_and_detach_lru(
                     x, self, target=EvictLayer.DEVICE, tracker=tracker
                 )
