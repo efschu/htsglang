@@ -93,6 +93,38 @@ from sglang.srt.utils.common import Range, get_device_module, is_xpu
 
 logger = logging.getLogger(__name__)
 
+
+def _1463_timed(attr: str):
+    """#1463: per-pass phase timer for the PP follower's request TAIL.
+
+    xsn217 measured the flip's sleep-kv stage at ~860 ms: PP0 forwarded the
+    Flush at t=202.027, PP1 took it at 202.776, PP2 ended its own pass at
+    202.775 -- both followers were still inside a pass with an occupied slot
+    and NO forward (the 1-token END-ANCHOR chunk: 531 ms on PP2 for ~50 ms
+    of compute).  The #1460 gate stamp is throttled to 250 ms and cannot say
+    where such a pass spends its time.  This records the wall time of one
+    method on the holder (``setattr(self, attr, ms)``); ``_pp_process_batch_result``
+    reads the three terms and emits ONE ``#1463 PASS-TAIL`` line when the
+    pass carried a finished request or the terms sum past 100 ms.  A plain
+    function decorator: the #631 test family binds these methods onto a bare
+    SimpleNamespace one at a time, which a decorated function survives.
+    """
+    def deco(fn):
+        def wrapped(self, *a, **kw):
+            t0 = time.perf_counter()
+            try:
+                return fn(self, *a, **kw)
+            finally:
+                try:
+                    setattr(self, attr, (time.perf_counter() - t0) * 1000.0)
+                except Exception:  # noqa: BLE001
+                    pass
+        wrapped.__name__ = fn.__name__
+        wrapped.__doc__ = fn.__doc__
+        wrapped.__wrapped__ = fn
+        return wrapped
+    return deco
+
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
 
@@ -7878,6 +7910,7 @@ class SchedulerPPMixin:
                 raise RingCommitTimeout(message) from exc
         work.clear()
 
+    @_1463_timed("_1463_commit_ms")
     def _pp_commit_send_output_work_and_preprocess_output_tensors(
         self: Scheduler,
         next_first_rank_mb_id: int,
@@ -10205,6 +10238,7 @@ class SchedulerPPMixin:
     #: `self._pp_wait_for_proxy_readiness(mb_id)` is unchanged in meaning.
     _pp_wait_for_proxy_readiness = _pp_wait_for_dict_readiness
 
+    @_1463_timed("_1463_recv_ms")
     def _pp_recv_proxy_tensors(
         self: Scheduler, mb_id: int = -1
     ) -> Optional[PPProxyTensors]:
@@ -10642,7 +10676,30 @@ class SchedulerPPMixin:
     def _pp_process_batch_result(
         self: Scheduler, batch: ScheduleBatch, output_result: GenerationBatchResult
     ):
-        self.process_batch_result(batch, output_result)
+        _t0 = time.perf_counter()
+        try:
+            self.process_batch_result(batch, output_result)
+        finally:
+            # #1463 PASS-TAIL: see `_1463_timed`.  One line per pass that
+            # delivered a finished request or spent >= 100 ms outside the
+            # forward; the three terms are the pass's recv (wait on the
+            # upstream frame), commit (send join + wait on the last rank's
+            # output) and process (finish/backup/handoff host work).
+            try:
+                _proc = (time.perf_counter() - _t0) * 1000.0
+                _recv = float(getattr(self, "_1463_recv_ms", 0.0) or 0.0)
+                _commit = float(getattr(self, "_1463_commit_ms", 0.0) or 0.0)
+                _reqs = getattr(batch, "reqs", None) or ()
+                _fin = sum(1 for r in _reqs if getattr(r, "finished", lambda: False)())
+                if _fin or (_proc + _recv + _commit) >= 100.0:
+                    logger.info(
+                        "#1463 PASS-TAIL pp_rank=%s bs=%d finished=%d recv_ms=%.0f commit_ms=%.0f process_ms=%.0f t=%.3f",
+                        getattr(getattr(self, "ps", None), "pp_rank", "?"), len(_reqs), _fin,
+                        _recv, _commit, _proc, time.time())
+                self._1463_recv_ms = 0.0
+                self._1463_commit_ms = 0.0
+            except Exception:  # noqa: BLE001
+                pass
 
     def _pp_send_output_to_next_stage(
         self: Scheduler,
