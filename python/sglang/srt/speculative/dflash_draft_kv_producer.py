@@ -143,9 +143,17 @@ class DFlashDraftKvProducer:
         # workspaces) -- the fourth W11b instrument, measured not guessed.
         try:
             self._reserved_before_mib = torch.cuda.memory_reserved() / float(2**20)
+            self._allocated_before_mib = torch.cuda.memory_allocated() / float(2**20)
         except Exception:  # noqa: BLE001 -- no CUDA context: not measured
             self._reserved_before_mib = -1.0
+            self._allocated_before_mib = -1.0
         self.context_growth_mib = 0.0
+        # allocator_cache_mib: reserved-but-free blocks the draft's load left
+        # in its (memory-saver) pool -- the W8 dequant scratch. Measured
+        # 2026-09-17 (xsn255, P last stage): live 2174 MiB, NVML delta 3072,
+        # context growth 0 -> ~900 MiB cache. Explained, named, never an
+        # 'unaccounted' remainder.
+        self.allocator_cache_mib = 0.0
         # The fields Scheduler.maybe_init_draft_worker prints for every producer.
         self.resident_mib = -1.0
         self.nvml_delta_mib = -1.0
@@ -193,15 +201,19 @@ class DFlashDraftKvProducer:
         self.resident_mib = _live_weight_mib(self.draft_runner.model)
         try:
             reserved_after = torch.cuda.memory_reserved() / float(2**20)
+            allocated_after = torch.cuda.memory_allocated() / float(2**20)
         except Exception:  # noqa: BLE001
-            reserved_after = -1.0
+            reserved_after = allocated_after = -1.0
         if (
             self.nvml_delta_mib >= 0
             and reserved_after >= 0
             and self._reserved_before_mib >= 0
         ):
-            allocator_delta = reserved_after - self._reserved_before_mib
-            self.context_growth_mib = max(0.0, self.nvml_delta_mib - allocator_delta)
+            reserved_delta = reserved_after - self._reserved_before_mib
+            self.context_growth_mib = max(0.0, self.nvml_delta_mib - reserved_delta)
+            if allocated_after >= 0 and self._allocated_before_mib >= 0:
+                allocated_delta = allocated_after - self._allocated_before_mib
+                self.allocator_cache_mib = max(0.0, reserved_delta - allocated_delta)
         return 0.0
 
     def alloc_memory_pool(self, **kw):

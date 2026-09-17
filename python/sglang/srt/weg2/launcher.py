@@ -5076,6 +5076,11 @@ _NVML_DELTA_RE = re.compile(r"WEG2 DRAFT-KV-PRODUCER armed .*nvml_delta_mib=(-?\
 #: nvml_delta - allocator_reserved_delta; absent on a line = 0 (the NEXTN head
 #: shares the target's kernels and adds none).
 _CONTEXT_GROWTH_RE = re.compile(r"WEG2 DRAFT-KV-PRODUCER armed .*context_growth_mib=(-?\d+(?:\.\d+)?)")
+#: Fifth instrument (boot xsn255): reserved-but-free allocator blocks the
+#: draft's load left in its memory-saver pool (the W8 dequant scratch,
+#: ~900 MiB on P's last stage) -- held VRAM, explained by name, never an
+#: unaccounted remainder. Absent on a line = 0.
+_ALLOCATOR_CACHE_RE = re.compile(r"WEG2 DRAFT-KV-PRODUCER armed .*allocator_cache_mib=(-?\d+(?:\.\d+)?)")
 #: W11b (#1233 fix 6): how far the BUILD may stay unexplained by the two terms
 #: that claim to explain it, IN EITHER DIRECTION.  MEASURED on boot weg2dk5's
 #: own L2 line: nvml_delta 3998.0 against resident 1682.9 + head_released
@@ -5124,7 +5129,7 @@ def check_draft_resident(log_p: str, budget_mib: float = None, tol_mib: float = 
     out: Dict[str, object] = {
         "resident_mib": None, "budget_mib": budget, "tol_mib": tol, "over_mib": None,
         "head_released_mib": None, "nvml_delta_mib": None, "unaccounted_mib": None,
-        "context_growth_mib": 0.0,
+        "context_growth_mib": 0.0, "allocator_cache_mib": 0.0,
         "accounting_tol_mib": P_DRAFT_BUILD_ACCOUNTING_TOL_MIB,
         "resident_ok": False, "accounted": False, "ok": False,
     }
@@ -5136,6 +5141,7 @@ def check_draft_resident(log_p: str, budget_mib: float = None, tol_mib: float = 
                     ("head_released_mib", _HEAD_RELEASED_RE),
                     ("nvml_delta_mib", _NVML_DELTA_RE),
                     ("context_growth_mib", _CONTEXT_GROWTH_RE),
+                    ("allocator_cache_mib", _ALLOCATOR_CACHE_RE),
                 ):
                     m = rx.search(line)
                     if m:
@@ -5160,7 +5166,8 @@ def check_draft_resident(log_p: str, budget_mib: float = None, tol_mib: float = 
         # Neither direction is a pass: an explanation that does not add up is
         # not an explanation, whichever way it fails to add up.
         growth = float(out.get("context_growth_mib") or 0.0)
-        out["unaccounted_mib"] = delta - (r + released + growth)
+        cache = float(out.get("allocator_cache_mib") or 0.0)
+        out["unaccounted_mib"] = delta - (r + released + growth + cache)
         out["accounted"] = abs(out["unaccounted_mib"]) <= P_DRAFT_BUILD_ACCOUNTING_TOL_MIB
     out["ok"] = bool(out["resident_ok"] and out["accounted"])
     return out
