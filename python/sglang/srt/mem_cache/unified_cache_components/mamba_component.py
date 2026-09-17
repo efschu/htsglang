@@ -3,7 +3,6 @@ from __future__ import annotations
 import os
 import logging
 import sys
-import time
 from typing import TYPE_CHECKING, Callable, Optional, Sequence
 
 import torch
@@ -730,60 +729,13 @@ class MambaComponent(TreeComponent):
                     x_next = lru.get_lru_no_lock()
                 x = x_next
             else:
-                # Internal: tombstone Mamba + cascade.  #1480: under write_back
-                # back the node up FIRST (the leaf branch does, this one did
-                # not) -- see _backup_before_mamba_evict.  The #1470b note above
-                # was half right: the final node keeps its state, but its anchor
-                # sits at the request end (97872), OUTSIDE the page-floored
-                # tail a hold re-read asks for (..97870), so with the interior
-                # anchors gone the read has none in range (weg2xsn243).
+                # Internal: tombstone Mamba + cascade
                 x_next = lru.get_prev_no_lock(x)
-                self._backup_before_mamba_evict(x)  # #1480
                 self.cache._evict_component_and_detach_lru(
                     x, self, target=EvictLayer.DEVICE, tracker=tracker
                 )
                 self.cache._cascade_evict(x, self, tracker)
                 x = x_next
-
-    def _backup_before_mamba_evict(self, node: UnifiedTreeNode) -> bool:
-        """#1480 (weg2xsn241/243, P under --max-running-requests 2): the
-        mamba pool evicts INTERIOR nodes without a backup (the leaf branch
-        goes through ``_evict_device_leaf``, which backs an un-backed node up
-        first under write_back).  The second concurrent 98k prompt drove 28
-        such evictions per minute on P, every one ``backuped=False
-        host=False``: the recurrent state left the device before any backup,
-        the node's later KV write-through carried ``mamba_value=EMPTY``, and
-        the store held 93,775 leading KV pages with NO anchor in range --
-        every hold re-read on D answered zero (#1035c CAPPED by=mamba), the
-        settle bound lapsed, W31, a second prefill.  Mirror the leaf branch:
-        under write_back, back the node up (host copy of KV + recurrent
-        state) and join the write BEFORE the device value is freed.  Returns
-        whether a backup was written.  Fail-soft: a refused or failed backup
-        evicts as before."""
-        cache = self.cache
-        cc = getattr(cache, "cache_controller", None)
-        if cc is None or getattr(cc, "write_policy", None) != "write_back":
-            return False
-        if node is cache.root_node or getattr(node, "backuped", False):
-            return False
-        cd = node.component_data[self.component_type]
-        if cd.value is None or cd.host_value is not None:
-            return False
-        t0 = time.perf_counter()
-        try:
-            written = cache.write_backup(node, write_back=True)
-            if written == 0 and getattr(cache, "ongoing_write_through", None):
-                cache.writing_check(write_back=True)
-                written = cache.write_backup(node, write_back=True)
-            if written > 0:
-                cache.writing_check(write_back=True)
-        except Exception as exc:  # noqa: BLE001 -- the eviction must never die on its backup
-            logger.info("#1480 BACKUP-BEFORE-EVICT node=%s n/a (%s: %s)", node.id, type(exc).__name__, exc)
-            return False
-        _1469_note("BACKUP-BEFORE-EVICT", node=node.id, written=written,
-                   ms=round((time.perf_counter() - t0) * 1000.0, 1),
-                   backuped=getattr(node, "backuped", None))
-        return written > 0
 
     def acquire_component_lock(
         self,
