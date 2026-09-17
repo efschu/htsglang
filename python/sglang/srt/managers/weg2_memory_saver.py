@@ -925,6 +925,13 @@ class Weg2VramCreditAllocatableShort(Weg2VramCreditRefused):
     -pattern trap. `test_weg2_wcode_uniqueness_1263` is the authority.
     """
 
+class _AllocatableTransient(Exception):
+    """weg2xsn258: raised by `wait_for`'s grant gate INSIDE `claim`'s lock when
+    the card's allocatable estimate is short of the request but the bounded
+    poll has not expired. `claim` writes nothing on it; `wait_for` catches
+    it, sleeps outside the lock and re-tries. Never leaves `wait_for`."""
+
+
 class VramCredit:
     """The device-side mirror of the host ring's bitmap, per physical GPU.
 
@@ -1174,6 +1181,9 @@ class VramCredit:
         #: 120 s poll ran to its end without ever looking again. ``None``
         #: (default) keeps every existing caller's behaviour byte-identical.
         stuck_lane_reader=None,
+        #: weg2xsn258: the bounded allocatable poll (xsn108, 30 s) -- now
+        #: taken OUTSIDE the counter lock, see `_AllocatableTransient`.
+        alloc_poll_s: float = 30.0,
     ) -> Dict[str, Any]:
         """W waits for the peer to fund ``need_bytes``, or refuses by name.
 
@@ -1253,6 +1263,9 @@ class VramCredit:
         # a small fraction of the 120 s budget it replaces. Cheap: a handful
         # of ctypes reads, not an allocation or a syscall storm at 100 Hz.
         _next_lane_check = time.monotonic()
+        # weg2xsn258: the allocatable poll's own clock, started at the first
+        # short reading and cleared by the first reading that covers `need`.
+        _alloc_wait: Dict[str, Any] = {"t0": None}
         while True:
             if stuck_lane_reader is not None and time.monotonic() >= _next_lane_check:
                 _next_lane_check = time.monotonic() + 1.0
@@ -1320,18 +1333,25 @@ class VramCredit:
                     # next tag's credit while that collect is still in
                     # flight. Poll the allocatable estimate (bounded) before
                     # refusing; a genuine shortfall still refuses by name.
-                    import time as _time85
-                    _t85 = _time85.perf_counter()
-                    while (allocatable_est is not None and allocatable_est < need
-                           and _time85.perf_counter() - _t85 < 30.0):
-                        _time85.sleep(0.05)
-                        free_now = self._free_now(free_reader)
-                        allocatable_est = (
-                            None if free_now is None else max(0, free_now - floor))
+                    #
+                    # weg2xsn258 (17.09.): THAT POLL RAN INSIDE `claim`'s
+                    # EXCLUSIVE flock -- up to 30 s with the counter file
+                    # locked -- and the co-located sleeper's `publish` of the
+                    # very tag this rank waited for blocked behind it
+                    # (D-TP0 weights_1: credit_ms=30008; PP0 then never saw
+                    # a balance >= need and died of the 120 s budget). The
+                    # poll now lives OUTSIDE the lock: this gate raises, the
+                    # claim writes nothing, and `wait_for`'s own loop (below)
+                    # re-tries on the same bounded clock, holding the lock
+                    # only for the ms of one read.
+                    if _alloc_wait["t0"] is None:
+                        _alloc_wait["t0"] = time.perf_counter()
                     _dev["free_bytes"] = free_now
                     _dev["allocatable_est_bytes"] = allocatable_est
                     _dev["allocatable_waited_ms"] = int(
-                        (_time85.perf_counter() - _t85) * 1000)
+                        (time.perf_counter() - _alloc_wait["t0"]) * 1000)
+                    if time.perf_counter() - _alloc_wait["t0"] < float(alloc_poll_s):
+                        raise _AllocatableTransient()
                 if allocatable_est is not None and allocatable_est < need:
                     raise Weg2VramCreditAllocatableShort(
                         f"W85 Weg2VramCreditAllocatableShort card={self.uuid} "
@@ -1352,9 +1372,14 @@ class VramCredit:
                         f"bytes an earlier tag of the same leg already took."
                     )
 
-            rec = self.claim(
-                tag, need, epoch=epoch, require_full=True, gate=_grant_gate
-            )
+            try:
+                rec = self.claim(
+                    tag, need, epoch=epoch, require_full=True, gate=_grant_gate
+                )
+            except _AllocatableTransient:
+                # The lock is released; the peer's publish can land now.
+                time.sleep(0.05)
+                continue
             if rec["stale_epoch"] is not None:
                 # Not this flip's counter -- and "this flip" means THIS BOOT's
                 # flip: the comparison is on the composed token of
