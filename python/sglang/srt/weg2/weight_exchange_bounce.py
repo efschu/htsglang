@@ -2367,8 +2367,70 @@ def _persistent_host_buffer(path: str, biggest: int, ops, lane_key: str, log):
             fh.close()
             return None, 0, registered, refusal
         _SEQ_HOST_BUF[path] = {"fh": fh, "mm": mm, "addr": int(addr),
-                               "size": int(biggest), "registered": registered}
+                               "size": int(biggest), "registered": registered,
+                               "ops": ops, "lane": lane_key}
         return mm, int(addr), registered, ""
+
+
+#: xsn265 (17.09.): the PERSISTENT lane buffers grew, over both flip
+#: directions, to ~25 GB of tmpfs against 15.75 GiB priced -- and under the
+#: DFLASH form (draft arena beside the KV arena) the host ledger latched W98
+#: (cushion 1.42 < 1.50 GiB, shmem 61 GiB) 18 s after the first flip. What
+#: made the buffers persistent was the register cost (weg2xsn89: 2 GB per
+#: lane per tag); with the tmpfs populate before cudaHostRegister that cost
+#: is 22-146 ms per lane, so the buffers are now released at every LEG END:
+#: the depositor (after `_weg2_xchg_drain_outstanding`'s drain waits, i.e.
+#: after the collector confirmed every band) unregisters, unmaps and
+#: TRUNCATES the file to 0 -- tmpfs residency returns to the host -- and the
+#: collector unregisters and unmaps its own mapping. The next leg creates,
+#: populates and registers again. =0 keeps the boot-long form.
+SEQ_RELEASE_LANES_ENV = "SGLANG_WEG2_SEQ_RELEASE_LANES"
+
+
+def seq_release_lanes() -> bool:
+    return _env_flag(SEQ_RELEASE_LANES_ENV, "1")
+
+
+def release_host_lane_buffers(*, truncate: bool, log=None) -> Tuple[int, int]:
+    """Unregister and unmap every cached lane host buffer of this process;
+    with ``truncate`` the files are cut to 0 bytes (the depositor's side,
+    after every band was drained). Returns ``(buffers, bytes)``."""
+    emit = log or logger.info
+    n = 0
+    total = 0
+    t0 = time.perf_counter()
+    with _SEQ_CACHE_LOCK:
+        for path, ent in list(_SEQ_HOST_BUF.items()):
+            try:
+                if ent.get("registered") == "yes" and ent.get("ops") is not None:
+                    try:
+                        ent["ops"].host_unregister(int(ent["addr"]))
+                    except Exception as exc:  # noqa: BLE001 -- unmapped below regardless
+                        emit(f"WEG2-SEQ lane-release lane={ent.get('lane')} "
+                             f"host_unregister failed: {type(exc).__name__}: {exc}")
+                try:
+                    ent["mm"].close()
+                except Exception:  # noqa: BLE001
+                    pass
+                try:
+                    ent["fh"].close()
+                except Exception:  # noqa: BLE001
+                    pass
+                if truncate:
+                    try:
+                        os.truncate(path, 0)
+                    except OSError as exc:
+                        emit(f"WEG2-SEQ lane-release lane={ent.get('lane')} "
+                             f"truncate failed: {exc}")
+                n += 1
+                total += int(ent.get("size", 0) or 0)
+            finally:
+                _SEQ_HOST_BUF.pop(path, None)
+    emit(f"WEG2-SEQ lane-release buffers={n} bytes={total} truncated={int(bool(truncate))} "
+         f"ms={(time.perf_counter() - t0) * 1000:.0f} -- host lane buffers of this leg "
+         f"returned (tmpfs residency falls with the truncate; the next leg registers "
+         f"again, populate+register measured 22-146 ms per lane)")
+    return n, total
 
 
 def _stage_alloc(ops, device: int, key, nbytes: int, log, lane_key: str) -> int:

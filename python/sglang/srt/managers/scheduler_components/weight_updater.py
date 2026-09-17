@@ -3832,6 +3832,10 @@ class SchedulerWeightUpdaterManager:
                     logger.info("WEG2-SEQ leg-end drain lane=%s failed: %s",
                                 lane_key, exc)
         bx.release_stage_buffers(None, log=logger.info)
+        # xsn265: the depositor's host lane buffers -- every band drained
+        # above, so the files are truncated and the tmpfs bytes return.
+        if bx.seq_release_lanes():
+            bx.release_host_lane_buffers(truncate=True, log=logger.info)
 
     def _weg2_wake_collect_one(self, tag) -> None:
         """One tag's collect on the wake side (the exchange carrier), run
@@ -7235,6 +7239,15 @@ class SchedulerWeightUpdaterManager:
                             len(_errs))
                 if _errs:
                     raise _errs[0][1]
+            # xsn265: the collector's own mappings of the lane buffers go
+            # at its leg end (unregister + unmap; the depositor truncates).
+            try:
+                from sglang.srt.weg2 import weight_exchange_bounce as _bx_rel
+
+                if _bx_rel.seq_release_lanes():
+                    _bx_rel.release_host_lane_buffers(truncate=False, log=logger.info)
+            except Exception as _rel_exc:  # noqa: BLE001 -- a release never fails a wake
+                logger.info("WEG2-SEQ lane-release skipped: %r", _rel_exc)
             weg2_leg_ms = (time.perf_counter() - t_w0) * 1000
             _weg2_ph("leg_collects")
             card_uuid = self._weg2_card_uuid() or "unknown"

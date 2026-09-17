@@ -1,0 +1,92 @@
+"""weg2xsn265 (17.09.2026): persistent lane buffers grew over both flip
+directions to ~25 GB of tmpfs (priced 15.75 GiB); under the DFLASH form the
+host ledger latched W98 18 s after the first flip. Registering is cheap now
+(tmpfs populate before cudaHostRegister: 22-146 ms per lane), so the buffers
+are released at every leg end: the depositor truncates after the drain
+waits, the collector unmaps. These tests drive `_persistent_host_buffer` and
+`release_host_lane_buffers` with a fake device-ops on a temp shm root.
+"""
+
+from __future__ import annotations
+
+import os
+
+import pytest
+
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
+
+from sglang.srt.weg2 import weight_exchange_bounce as bx  # noqa: E402
+
+
+class _Ops:
+    def __init__(self):
+        self.registered = []
+        self.unregistered = []
+
+    def host_register(self, addr, nbytes, flags):
+        self.registered.append((int(addr), int(nbytes)))
+
+    def host_unregister(self, addr):
+        self.unregistered.append(int(addr))
+
+
+@pytest.fixture(autouse=True)
+def _clean_cache():
+    with bx._SEQ_CACHE_LOCK:
+        bx._SEQ_HOST_BUF.clear()
+    yield
+    with bx._SEQ_CACHE_LOCK:
+        for ent in list(bx._SEQ_HOST_BUF.values()):
+            try:
+                ent["mm"].close(); ent["fh"].close()
+            except Exception:  # noqa: BLE001
+                pass
+        bx._SEQ_HOST_BUF.clear()
+
+
+def test_the_depositor_release_unregisters_unmaps_and_truncates(tmp_path):
+    ops = _Ops()
+    lines = []
+    path = str(tmp_path / "weg2-seq-t" / "p0_unit_buffer.bin")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    mm, addr, reg, refusal = bx._persistent_host_buffer(path, 1 << 20, ops, "p0", lines.append)
+    assert refusal == "" and reg == "yes" and os.path.getsize(path) == 1 << 20
+    assert any("persist lane=p0 new" in l for l in lines)
+    n, total = bx.release_host_lane_buffers(truncate=True, log=lines.append)
+    assert (n, total) == (1, 1 << 20)
+    assert ops.unregistered == [addr]
+    assert os.path.getsize(path) == 0
+    assert not bx._SEQ_HOST_BUF
+    # the next leg starts fresh: a NEW buffer, registered again
+    lines.clear()
+    mm2, addr2, reg2, _ = bx._persistent_host_buffer(path, 1 << 20, ops, "p0", lines.append)
+    assert reg2 == "yes" and any("persist lane=p0 new" in l for l in lines)
+    assert os.path.getsize(path) == 1 << 20
+
+
+def test_the_collector_release_keeps_the_file_size(tmp_path):
+    ops = _Ops()
+    path = str(tmp_path / "weg2-seq-t" / "c1_unit_buffer.bin")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    bx._persistent_host_buffer(path, 4096, ops, "c1", lambda *_a: None)
+    n, total = bx.release_host_lane_buffers(truncate=False, log=lambda *_a: None)
+    assert (n, total) == (1, 4096)
+    assert len(ops.unregistered) == 1
+    assert os.path.getsize(path) == 4096      # the depositor truncates, not the collector
+
+
+def test_release_is_on_by_default_and_an_env_zero_keeps_the_boot_long_form(monkeypatch):
+    monkeypatch.delenv(bx.SEQ_RELEASE_LANES_ENV, raising=False)
+    assert bx.seq_release_lanes() is True
+    monkeypatch.setenv(bx.SEQ_RELEASE_LANES_ENV, "0")
+    assert bx.seq_release_lanes() is False
+
+
+def test_both_leg_ends_call_the_release():
+    from sglang.srt.managers.scheduler_components import weight_updater as wu
+    src = open(wu.__file__).read()
+    i = src.index("def _weg2_xchg_drain_outstanding")
+    j = src.index("def _weg2_wake_collect_one", i)
+    assert "release_host_lane_buffers(truncate=True" in src[i:j]
+    k = src.index("WEG2-WAKE-OVERLAP collects=")
+    assert "release_host_lane_buffers(truncate=False" in src[k:k + 1500]
