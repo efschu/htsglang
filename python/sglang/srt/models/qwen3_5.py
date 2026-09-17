@@ -1613,6 +1613,10 @@ class Qwen3_5ForCausalLM(nn.Module):
             )
 
         aux_hidden_states = []
+        # DFlash-family capture across PP stages (pp_aux_capture): remember
+        # WHICH layer each captured tensor belongs to, so the last stage can
+        # assemble every stage's captures in layer-id order.
+        captured_layer_ids = []
         # Pass through decoder layers
         for layer_idx in owned_layer_ids(self.layers, self.start_layer, self.end_layer):
             layer = self.layers[layer_idx]
@@ -1621,6 +1625,7 @@ class Qwen3_5ForCausalLM(nn.Module):
             hidden_states, residual = self.pp_crossing_wire.before_layer(
                 layer_idx, hidden_states, residual
             )
+            is_capture_layer = bool(getattr(layer, "_is_layer_to_capture", False))
             with get_global_expert_distribution_recorder().with_current_layer(
                 layer_idx
             ):
@@ -1630,11 +1635,11 @@ class Qwen3_5ForCausalLM(nn.Module):
                     residual=residual,
                     forward_batch=forward_batch,
                     captured_last_layer_outputs=(
-                        aux_hidden_states
-                        if getattr(layer, "_is_layer_to_capture", False)
-                        else None
+                        aux_hidden_states if is_capture_layer else None
                     ),
                 )
+            if is_capture_layer and len(aux_hidden_states) > len(captured_layer_ids):
+                captured_layer_ids.append(layer_idx)
 
             # Process deepstack embeddings if provided
             if (
@@ -1655,6 +1660,25 @@ class Qwen3_5ForCausalLM(nn.Module):
 
             if _LAYER_NORM_TRACE:
                 _trace_layer_norms(layer_idx, hidden_states, residual)
+
+        # DFlash-family capture under PP: every stage captured at its OWN
+        # layers above; hand them to the last stage (which returns them in
+        # layer-id order). One stage: identity. No capture marks: no traffic.
+        if self.layers_to_capture and int(self.pp_group.world_size) > 1:
+            from sglang.srt.distributed.pp_aux_capture import exchange_captured_aux
+
+            if len(captured_layer_ids) != len(aux_hidden_states):
+                raise RuntimeError(
+                    "aux capture bookkeeping disagrees with the layer loop: "
+                    f"{len(captured_layer_ids)} capture layer(s) but "
+                    f"{len(aux_hidden_states)} tensor(s) on pp_rank "
+                    f"{self.pp_group.rank_in_group}"
+                )
+            assembled = exchange_captured_aux(
+                captured=dict(zip(captured_layer_ids, aux_hidden_states)),
+                pp_group=self.pp_group,
+            )
+            aux_hidden_states = assembled if assembled is not None else []
 
         # Return intermediate tensors for pipeline parallelism
         if not self.pp_group.is_last_rank:
