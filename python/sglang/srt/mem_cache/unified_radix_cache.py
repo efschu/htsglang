@@ -2532,6 +2532,13 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # it joins them rather than relying on six callers staying correct.
         if EvictLayer.DEVICE in target:
             cd = node.component_data[comp.component_type]
+            if comp.component_type == ComponentType.MAMBA and cd.value is not None:
+                try:  # #1469: a mamba value leaving the device before/after its backup
+                    from sglang.srt.mem_cache.unified_cache_components.mamba_component import _1469_note
+                    _1469_note("EVICT", node=node.id, backuped=getattr(node, "backuped", None),
+                               host=(cd.host_value is not None), lock_ref=cd.lock_ref)
+                except Exception:  # noqa: BLE001
+                    pass
             if cd.value is not None and cd.lock_ref > 0:
                 raise ValueError(
                     f"#904: refusing to free {comp.component_type.name} device "
