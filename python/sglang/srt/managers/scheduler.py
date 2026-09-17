@@ -16265,33 +16265,49 @@ class Scheduler(
         # what this group computed before its tiers are cleared (see
         # UnifiedRadixCache.publish_unbacked_sweep). The witness then reports
         # the in-flight backups and the front keeps polling until they drain.
+        # #1470: THE FLUSH MUST NOT RESET A TREE WHOSE NODES ARE NOT ON THE HOST.
+        # The sweep above was skipped whenever the waiting queue held anything
+        # (held store-told intakes count), and when it ran nothing waited for
+        # the write-throughs it issued before `tree_cache.reset()` dropped
+        # them.  With group P at --max-running-requests 1 the backlog at the
+        # sleep flush is ~1 node and the race is invisible; at 2 it is 40-72
+        # nodes (weg2xsn225/226/227: PUBLISH-SWEEP unbacked=72,
+        # in_flight_after=56 right before "Cache flushed"), so P slept with
+        # the store missing every node past the first and group D re-entered
+        # 4095 of 97870 tokens ("STORE READ INCOMPLETE shortfall=93775", then
+        # W31/W35, xsn227).  Now: sweep whenever nothing runs (the idle verdict
+        # below still refuses the flush if work is running), loop until no
+        # node is un-backed, join the write-throughs (bounded by the existing
+        # write-back drain), then reset.  SGLANG_HICACHE_FLUSH_PUBLISH_SWEEP=0
+        # restores the old form.
         if (
             self.enable_hierarchical_cache
-            and os.environ.get("SGLANG_HICACHE_FLUSH_PUBLISH_SWEEP", "0") == "1"
+            and os.environ.get("SGLANG_HICACHE_FLUSH_PUBLISH_SWEEP", "1") != "0"
             and self.running_batch.is_empty()
             and self.chunked_req is None
-            and len(self.waiting_queue) == 0
         ):
             _sweep = getattr(self.tree_cache, "publish_unbacked_sweep", None)
+            _wc = getattr(self.tree_cache, "writing_check", None)
             if _sweep is not None:
-                _sweep()
-        # #1268: THE VERDICT IS THE GROUP'S, not this rank's. Boot weg2sb1
-        # (2026-09-08 14:29:29Z) had PP0 and PP1 answer "flushed" while PP2
-        # answered "not-idle because: hicache_prefetch(1: 43c9af54)" in the
-        # same second; only PP0's answer left the group, the front read it as
-        # P's, commanded sleep(P, kv_cache), and PP2 met the rank-side assert
-        # at 14:29:59 -> W29 -> group death. The comment above judged this
-        # verdict rank-uniform "while waiting_queue is replicated", which is
-        # true of the REQUEST clauses and not of the HiCache in-flight ones.
-        #
-        # #1268 FIX 1C -- WHAT IS AND IS NOT MADE GROUP-WIDE. The FACT THAT
-        # LEAVES THE GROUP is reduced over every rank; the flush ACTION below
-        # stays rank-local, exactly as upstream has it. sb1 did not die of a
-        # divergent flush -- three ranks flushing their own pools on their own
-        # idleness is correct and always was. It died because the front took
-        # PP0's answer for P's and commanded sleep(P, kv_cache) on it. So the
-        # one-verdict law binds the ANSWER, and only the rank that answers the
-        # RPC has to take it. World <= 1 keeps the stock path byte-identical.
+                _t0 = time.perf_counter()
+                _issued = 0
+                _stats = {}
+                for _round in range(64):
+                    _stats = _sweep(max_issue=256) or {}
+                    _issued += int(_stats.get("issued", 0) or 0)
+                    if int(_stats.get("unbacked", 0) or 0) == 0:
+                        break
+                    if _wc is not None:
+                        _wc(write_back=True)  # free the pins, then sweep again
+                    if int(_stats.get("issued", 0) or 0) == 0 and _round >= 3:
+                        break
+                if _wc is not None:
+                    _wc(write_back=True)
+                logger.info(
+                    "#1470 FLUSH-PUBLISH issued=%d unbacked_left=%s in_flight_after=%s waited_ms=%.0f "
+                    "(un-backed nodes published and their write-throughs joined BEFORE the reset)",
+                    _issued, _stats.get("unbacked"), _stats.get("in_flight_after"),
+                    (time.perf_counter() - _t0) * 1000.0)
         group_idle, verdict_detail = self.group_idle_verdict()
         if group_idle:
             self.cur_batch_for_debug = None

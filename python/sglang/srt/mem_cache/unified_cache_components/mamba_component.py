@@ -713,8 +713,23 @@ class MambaComponent(TreeComponent):
         ct = self.component_type
         lru = self.cache.lru_lists[ct]
         x = lru.get_lru_no_lock()
+        _skipped_unbacked = 0
         while tracker[ct] < request and x is not None and lru.in_list(x):
             assert x.component_data[ct].value is not None
+            # #1470: NEVER DESTROY A STATE THAT HAS NOT REACHED THE HOST.  The
+            # KV leaf path writes back before it evicts; this path freed the
+            # mamba value outright, and with group P at --max-running-requests
+            # 2 the backup could not keep pace: weg2xsn227 (#1469 trail) shows
+            # 168/168 retentions SET and 88 nodes EVICTED with backuped=False
+            # host=False -- the backup then found EMPTY and group D re-entered
+            # only the first 4095 tokens.  An un-backed node is skipped (its
+            # backup is queued; it becomes evictable the moment it lands); if
+            # nothing else is evictable the request is declined and named by
+            # the starvation log instead of silently eating a checkpoint.
+            if not getattr(x, "backuped", True) and x.component_data[ct].host_value is None:
+                _skipped_unbacked += 1
+                x = lru.get_prev_no_lock(x)
+                continue
             if x in self.cache.evictable_device_leaves:
                 # D-leaf: atomic eviction of all components
                 x_next = lru.get_prev_no_lock(x)
