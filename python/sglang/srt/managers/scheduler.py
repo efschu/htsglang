@@ -4981,21 +4981,51 @@ class Scheduler(
                         "re-read from the registered extent)", str(req.rid)[:12], req._1456_n, reason, verdict)
         return "reissued"
 
+    def _weg2_group_min_ints(self, vals):
+        """#1479b: element-wise MIN of small ints over the TP cpu group;
+        local values when there is no group.  Fail-soft."""
+        vals = [int(v) for v in vals]
+        if not vals:
+            return vals
+        try:
+            tp_size = int(getattr(getattr(self, "ps", None), "tp_size", 1) or 1)
+            group = getattr(self, "tp_cpu_group", None)
+            if tp_size > 1 and group is not None and torch.distributed.is_initialized():
+                t = torch.tensor(vals, dtype=torch.int64)
+                torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.MIN, group=group)
+                return [int(x) for x in t.tolist()]
+        except Exception as exc:  # noqa: BLE001
+            logger.info("#1479 group min n/a (%s: %s) -- local values used", type(exc).__name__, exc)
+        return vals
+
     def _weg2_drain_prefetch_revokes(self) -> None:
         """#1479: pop the re-reads the storage thread REVOKED (hit count
         below the prefetch threshold) out of ``ongoing_prefetch``.  In the
         sleep nothing else drains that queue -- the steady-state drain lives
         on the prefill scheduling path, which a dormant group never walks --
-        so a revoked re-read looked "in flight" forever.  Rank-local and
-        revokes only (the backup/release queues keep their all_reduce'd
-        steady-state drain); every rank runs this at the same point of the
-        same pass, and the hit count that revokes is itself a group MIN, so
-        the pops stay replicated.  Fail-soft."""
-        impl = getattr(getattr(self, "tree_cache", None), "_drain_storage_control_queues_impl", None)
-        if impl is None:
+        so a revoked re-read looked "in flight" forever (weg2xsn241).
+
+        #1479b (weg2xsn242, 14:33:43): the first cut popped RANK-LOCALLY.  The
+        storage threads post their revokes a few ms apart per rank, so one
+        rank had popped (no collective on its next refetch pass) while its
+        peers still held the operation (check_prefetch_progress all_reduce):
+        all three D ranks wedged in different collectives, D fell silent for
+        five minutes, and P died on the lane wait (W68).  The count drained
+        is therefore the group MIN of the local queue sizes -- the same rule
+        the steady-state drain uses -- and every rank runs this at the same
+        point of the same hold pass.  Revokes only; the backup/release
+        queues keep their steady-state drain.  Fail-soft."""
+        tc = getattr(self, "tree_cache", None)
+        impl = getattr(tc, "_drain_storage_control_queues_impl", None)
+        q = getattr(getattr(tc, "cache_controller", None), "prefetch_revoke_queue", None)
+        if impl is None or q is None:
             return
         try:
-            impl(n_revoke=None, n_backup=0, n_release=0, extra_release_counts=None, log_metrics=False)
+            _min = getattr(self, "_weg2_group_min_ints", None) or functools.partial(Scheduler._weg2_group_min_ints, self)
+            n = int(_min([int(q.qsize())])[0])
+            if n <= 0:
+                return
+            impl(n_revoke=n, n_backup=0, n_release=0, extra_release_counts=None, log_metrics=False)
         except Exception as exc:  # noqa: BLE001
             logger.info("#1479 REVOKE-DRAIN n/a (%s: %s)", type(exc).__name__, exc)
 

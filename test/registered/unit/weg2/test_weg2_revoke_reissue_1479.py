@@ -58,14 +58,33 @@ class Test1479(unittest.TestCase):
         self.assertEqual(Scheduler._weg2_refetch_one(h, r, 100.0), "wait")
         self.assertEqual(h.issued, [])
 
-    def test_hold_loop_drains_revokes_only(self):
+    def test_hold_loop_drains_group_min_revokes(self):
+        # #1479b: the count drained is the group MIN of the local queue sizes,
+        # never an unbounded rank-local pop.
         calls = []
         h = _holder(ongoing={}, record={"a": 4095})
         h.tree_cache._drain_storage_control_queues_impl = lambda **kw: calls.append(kw)
+        h.tree_cache.cache_controller = types.SimpleNamespace(prefetch_revoke_queue=types.SimpleNamespace(qsize=lambda: 3))
+        h._weg2_group_min_ints = lambda vals: [min(v, 2) for v in vals]  # a peer holds only 2
         h.weg2_dormant_hold = [_req()]
         h.weg2_dormant = True
         self.assertEqual(Scheduler._weg2_hold_refetch(h), 1)
-        self.assertEqual(calls, [dict(n_revoke=None, n_backup=0, n_release=0, extra_release_counts=None, log_metrics=False)])
+        self.assertEqual(calls, [dict(n_revoke=2, n_backup=0, n_release=0, extra_release_counts=None, log_metrics=False)])
+
+    def test_hold_loop_skips_drain_when_group_min_is_zero(self):
+        calls = []
+        h = _holder(ongoing={}, record={"a": 4095})
+        h.tree_cache._drain_storage_control_queues_impl = lambda **kw: calls.append(kw)
+        h.tree_cache.cache_controller = types.SimpleNamespace(prefetch_revoke_queue=types.SimpleNamespace(qsize=lambda: 1))
+        h._weg2_group_min_ints = lambda vals: [0 for _ in vals]  # a peer has nothing yet
+        h.weg2_dormant_hold = [_req()]
+        h.weg2_dormant = True
+        Scheduler._weg2_hold_refetch(h)
+        self.assertEqual(calls, [])
+
+    def test_group_min_ints_local_without_group(self):
+        h = types.SimpleNamespace(ps=types.SimpleNamespace(tp_size=1), tp_cpu_group=None)
+        self.assertEqual(Scheduler._weg2_group_min_ints(h, [3, 0]), [3, 0])
 
     def test_drain_is_fail_soft_without_impl(self):
         h = _holder(ongoing={}, record={})
