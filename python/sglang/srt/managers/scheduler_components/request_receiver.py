@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import logging
 import time
+
+from sglang.srt.managers.weg2_pass_timer import timed as _pass_timed
 from dataclasses import dataclass
 from http import HTTPStatus
 from typing import (
@@ -195,6 +197,7 @@ class SchedulerRequestReceiver:
         return False
 
     @scheduler_nvtx_method("scheduler.recv_requests")
+    @_pass_timed("_1466_recv_ms")  # #1466: the pass's recv phase
     def recv_requests(
         self,
     ) -> List[Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput, Any]]:

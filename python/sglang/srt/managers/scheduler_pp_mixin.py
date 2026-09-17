@@ -94,6 +94,9 @@ from sglang.srt.utils.common import Range, get_device_module, is_xpu
 logger = logging.getLogger(__name__)
 
 
+from sglang.srt.managers.weg2_pass_timer import read_ms as _pt_read
+
+
 def _1463_timed(attr: str):
     """#1463: per-pass phase timer for the PP follower's request TAIL.
 
@@ -4063,6 +4066,32 @@ class SchedulerPPMixin:
                 next_first_rank_mb_id = (mb_id + self.ps.pp_size) % self.pp_loop_size
                 next_mb_id = (mb_id + 1) % self.pp_loop_size
                 self._pp_flip_pass_tick(mb_id)
+                # #1466 PASS-STALL: boot weg2xsn221 (P running-req 2) still shows
+                # whole seconds without a forward on ALL P ranks, twice per
+                # request change, both inside the new request's store probe
+                # window (STORE-TOLD INTAKE -> PUBLISHED, 3-4 s).  One line per
+                # pass whose wall time minus its forward exceeds 300 ms, with
+                # the phase terms the decorated methods recorded.
+                try:
+                    _1466_now = time.perf_counter()
+                    _1466_prev = getattr(self, "_1466_pass_t", None)
+                    self._1466_pass_t = _1466_now
+                    _1466_run = _pt_read(self, "_1466_run_ms")
+                    _1466_recv = _pt_read(self, "_1466_recv_ms")
+                    _1466_input = _pt_read(self, "_1466_input_ms")
+                    _1466_sched = _pt_read(self, "_1466_schedule_ms")
+                    if _1466_prev is not None:
+                        _1466_pass = (_1466_now - _1466_prev) * 1000.0
+                        if _1466_pass - _1466_run >= 300.0:
+                            logger.info(
+                                "#1466 PASS-STALL pp_rank=%s slot=%d pass_ms=%.0f fwd_ms=%.0f "
+                                "recv_ms=%.0f input_ms=%.0f schedule_ms=%.0f other_ms=%.0f t=%.3f",
+                                getattr(getattr(self, "ps", None), "pp_rank", "?"), mb_id,
+                                _1466_pass, _1466_run, _1466_recv, _1466_input, _1466_sched,
+                                _1466_pass - _1466_run - _1466_recv - _1466_input - _1466_sched,
+                                time.time())
+                except Exception:  # noqa: BLE001
+                    pass
                 # #824 W4(b): honour a slot restore requested by the falling
                 # edge above. Restart the body on that slot rather than
                 # advancing, so this rank re-enters the pipeline where it
@@ -5857,6 +5886,7 @@ class SchedulerPPMixin:
             if server_is_idle and queue_size == 0:
                 self.on_idle()
 
+    @_1463_timed("_1466_input_ms")  # #1466: the pass's intake phase (handle_generate_request etc.)
     def _pp_forward_and_process_input_requests(
         self: Scheduler, recv_reqs: List
     ) -> None:

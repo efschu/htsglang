@@ -178,6 +178,21 @@ class LayerDoneCounter:
         self.consumer_index = -1
 
 
+HICACHE_WRITE_STREAM_PRIORITY_ENV = "SGLANG_HICACHE_WRITE_STREAM_PRIORITY"
+
+
+def hicache_write_stream_priority() -> int:
+    """#1465: CUDA stream priority for the write-through stream.  0 (default,
+    lowest) when unset or unparsable; torch clamps to the device's range,
+    where a NEGATIVE number is a HIGHER priority (-1 is the highest on
+    every current NVIDIA part)."""
+    raw = os.environ.get(HICACHE_WRITE_STREAM_PRIORITY_ENV, "")
+    try:
+        return int(str(raw).strip() or 0)
+    except ValueError:
+        return 0
+
+
 class CacheOperation:
     counter = 0
 
@@ -925,7 +940,19 @@ class HiCacheController:
         self.ack_load_queue: List[HiCacheAck] = []
         self.ack_write_queue: List[HiCacheAck] = []
 
-        self.write_stream = device_module.Stream()
+        # #1465: the write-through copies run as KERNELS (io_backend="kernel",
+        # memory_pool_host.backup_from_device_all_layer) on this stream.  At
+        # default priority they queue behind a group-P prefill that never
+        # idles: boot weg2xsn219 (P --max-running-requests 2, no gap between
+        # prefills) grew the un-backed backlog to 72 -> 103 nodes with 16 in
+        # flight and the pin budget exhausted (pins 4/18 -> 0/18), and the
+        # flip's quiesce flush then drained 56 write-throughs in 2.0-2.8 s
+        # (sleep-kv stage 2.8 s vs 0.3 s in weg2xsn218, where the 3 s gap
+        # between prefills let the copies finish).  A high-priority stream
+        # lets the copy kernels interleave with the prefill kernels; the
+        # launcher sets it for group P only (decode graphs on D keep the
+        # default).  Unset = 0 = byte-identical to before.
+        self.write_stream = device_module.Stream(priority=hicache_write_stream_priority())
         self.load_stream = device_module.Stream()
 
         # If a storage backend is provided at startup, treat it as an implicit attach,

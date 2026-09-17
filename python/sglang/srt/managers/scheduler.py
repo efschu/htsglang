@@ -21,6 +21,8 @@ import re
 import signal
 import sys
 import time
+
+from sglang.srt.managers.weg2_pass_timer import timed as _pass_timed
 from array import array
 from collections import deque
 from contextlib import ExitStack, contextmanager, nullcontext
@@ -9254,6 +9256,7 @@ class Scheduler(
 
 
 
+    @_pass_timed("_1466_schedule_ms")  # #1466: the pass's schedule phase
     def get_next_batch_to_run(
         self, running_batch: ScheduleBatch, last_batch: Optional[ScheduleBatch]
     ) -> NextBatchPlan:
@@ -14971,6 +14974,7 @@ class Scheduler(
     @scheduler_nvtx_method("scheduler.run_batch")
 
 
+    @_pass_timed("_1466_run_ms")  # #1466: the pass's forward phase
     def run_batch(
         self,
         batch: ScheduleBatch,

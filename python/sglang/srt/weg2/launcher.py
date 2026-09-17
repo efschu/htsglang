@@ -11931,6 +11931,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # ANCHOR); D can claim at most N-1 tokens of a prompt, so this is the
     # anchor it resumes from. P only: D's finish anchors serve the NEXT turn.
     env_p["SGLANG_WEG2_END_ANCHOR"] = "1"
+    # #1465: group P's write-through copy kernels at high stream priority, so
+    # the backlog measured on weg2xsn219 (P running-req 2: 72 -> 103 un-backed
+    # nodes, 2.0-2.8 s flush drain at the flip) does not build behind a
+    # prefill that never idles.  P only; D keeps the default (decode graphs).
+    env_p.setdefault("SGLANG_HICACHE_WRITE_STREAM_PRIORITY", "-1")
     # TRAIN FIX 5: the chunk size the cut solver was given BEFORE the ring is
     # re-read here against the arm this boot actually chose.  The hoist above
     # rests on --chunked-prefill-size being a CONSTANT of common_flags rather

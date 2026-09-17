@@ -6396,6 +6396,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
         if write_back:
             # Blocking: wait for all pending write-backs
+            _1465_t0 = time.perf_counter()
+            _1465_n = len(self.ongoing_write_through)
             while self.ongoing_write_through:
                 for _, finish_event, ack_list in cc.ack_write_queue:
                     finish_event.synchronize()
@@ -6404,8 +6406,10 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                             self._finish_write_through_ack(ack_id)
                 cc.ack_write_queue.clear()
                 assert len(self.ongoing_write_through) == 0
+            if _1465_n:
+                logger.info("#1465 WRITE-BACK DRAIN n=%d ms=%.0f (the flush waited for this many in-flight write-throughs)",
+                            _1465_n, (time.perf_counter() - _1465_t0) * 1000.0)
             return
-
         finish_count = self._count_ready_acks(cc.ack_write_queue, "writing_check")
 
         # Process completed acks
