@@ -5069,6 +5069,13 @@ def check_drafter_identity(log_p: str, log_d: str) -> Dict[str, object]:
 _RESIDENT_RE = re.compile(r"WEG2 DRAFT-KV-PRODUCER armed .*resident_mib=(-?\d+(?:\.\d+)?)")
 _HEAD_RELEASED_RE = re.compile(r"WEG2 DRAFT-KV-PRODUCER armed .*head_released_mib=(-?\d+(?:\.\d+)?)")
 _NVML_DELTA_RE = re.compile(r"WEG2 DRAFT-KV-PRODUCER armed .*nvml_delta_mib=(-?\d+(?:\.\d+)?)")
+#: Fourth instrument (boot xsn254, DFlash producer): NVML growth across the
+#: build that is NOT the caching allocator's -- kernel modules and
+#: cuBLAS/JIT workspaces a separate draft checkpoint's kernels bring (897 MiB
+#: measured on P's last stage). Measured by the producer as
+#: nvml_delta - allocator_reserved_delta; absent on a line = 0 (the NEXTN head
+#: shares the target's kernels and adds none).
+_CONTEXT_GROWTH_RE = re.compile(r"WEG2 DRAFT-KV-PRODUCER armed .*context_growth_mib=(-?\d+(?:\.\d+)?)")
 #: W11b (#1233 fix 6): how far the BUILD may stay unexplained by the two terms
 #: that claim to explain it, IN EITHER DIRECTION.  MEASURED on boot weg2dk5's
 #: own L2 line: nvml_delta 3998.0 against resident 1682.9 + head_released
@@ -5117,6 +5124,7 @@ def check_draft_resident(log_p: str, budget_mib: float = None, tol_mib: float = 
     out: Dict[str, object] = {
         "resident_mib": None, "budget_mib": budget, "tol_mib": tol, "over_mib": None,
         "head_released_mib": None, "nvml_delta_mib": None, "unaccounted_mib": None,
+        "context_growth_mib": 0.0,
         "accounting_tol_mib": P_DRAFT_BUILD_ACCOUNTING_TOL_MIB,
         "resident_ok": False, "accounted": False, "ok": False,
     }
@@ -5127,6 +5135,7 @@ def check_draft_resident(log_p: str, budget_mib: float = None, tol_mib: float = 
                     ("resident_mib", _RESIDENT_RE),
                     ("head_released_mib", _HEAD_RELEASED_RE),
                     ("nvml_delta_mib", _NVML_DELTA_RE),
+                    ("context_growth_mib", _CONTEXT_GROWTH_RE),
                 ):
                     m = rx.search(line)
                     if m:
@@ -5150,7 +5159,8 @@ def check_draft_resident(log_p: str, budget_mib: float = None, tol_mib: float = 
         #     enough apart to disagree).  weg2dk5's -109.9 is this side.
         # Neither direction is a pass: an explanation that does not add up is
         # not an explanation, whichever way it fails to add up.
-        out["unaccounted_mib"] = delta - (r + released)
+        growth = float(out.get("context_growth_mib") or 0.0)
+        out["unaccounted_mib"] = delta - (r + released + growth)
         out["accounted"] = abs(out["unaccounted_mib"]) <= P_DRAFT_BUILD_ACCOUNTING_TOL_MIB
     out["ok"] = bool(out["resident_ok"] and out["accounted"])
     return out

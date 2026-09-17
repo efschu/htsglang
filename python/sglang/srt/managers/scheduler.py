@@ -1658,7 +1658,7 @@ class Scheduler(
             "WEG2 DRAFT-KV-PRODUCER armed stage=%d/%d drafter=%s layout=v%d heads=%d "
             "head_dim=%d page_bytes=%d embed=resident mtp_mib=%.1f embed_mib=%.1f "
             "resident_mib=%.1f head_released_mib=%.1f head_deferred=%s "
-            "nvml_delta_mib=%.1f embed_dtype=%s build_s=%.1f",
+            "nvml_delta_mib=%.1f context_growth_mib=%.1f embed_dtype=%s build_s=%.1f",
             self.draft_kv_producer.stage,
             self.draft_kv_producer.stages,
             kv_cache_builder.drafter_identity_hash(self.server_args),
@@ -1692,6 +1692,10 @@ class Scheduler(
             self.draft_kv_producer.head_released_mib,
             self.draft_kv_producer.head_deferred,
             self.draft_kv_producer.nvml_delta_mib,
+            # context_growth_mib: NVML growth that is NOT allocator memory
+            # (kernel modules, cuBLAS/JIT workspaces the draft's own kernels
+            # bring): measured by the producer, 0 when a build adds none.
+            float(getattr(self.draft_kv_producer, "context_growth_mib", 0.0)),
             self.draft_kv_producer.embed_dtype,
             self.draft_kv_producer.build_s,
         )

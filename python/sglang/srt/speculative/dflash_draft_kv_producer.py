@@ -138,6 +138,14 @@ class DFlashDraftKvProducer:
         self._published = 0
         self._peak_mib = 0.0
         self._free_before_mib = _cuda_free_mib()
+        # allocator view before the build: the NVML delta minus the allocator's
+        # reserved delta is context growth (kernel modules, cuBLAS/JIT
+        # workspaces) -- the fourth W11b instrument, measured not guessed.
+        try:
+            self._reserved_before_mib = torch.cuda.memory_reserved() / float(2**20)
+        except Exception:  # noqa: BLE001 -- no CUDA context: not measured
+            self._reserved_before_mib = -1.0
+        self.context_growth_mib = 0.0
         # The fields Scheduler.maybe_init_draft_worker prints for every producer.
         self.resident_mib = -1.0
         self.nvml_delta_mib = -1.0
@@ -183,6 +191,17 @@ class DFlashDraftKvProducer:
         if after >= 0 and self._free_before_mib >= 0:
             self.nvml_delta_mib = self._free_before_mib - after
         self.resident_mib = _live_weight_mib(self.draft_runner.model)
+        try:
+            reserved_after = torch.cuda.memory_reserved() / float(2**20)
+        except Exception:  # noqa: BLE001
+            reserved_after = -1.0
+        if (
+            self.nvml_delta_mib >= 0
+            and reserved_after >= 0
+            and self._reserved_before_mib >= 0
+        ):
+            allocator_delta = reserved_after - self._reserved_before_mib
+            self.context_growth_mib = max(0.0, self.nvml_delta_mib - allocator_delta)
         return 0.0
 
     def alloc_memory_pool(self, **kw):
