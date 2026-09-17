@@ -558,6 +558,8 @@ class SchedulerWeightUpdaterManager:
     #: read weight pages the next release had just unmapped -> illegal memory
     #: access on D, P's leg W68).  slots=True: declared here.
     _weg2_seam_finisher: Any = None
+    #: xsn261: the boot-time lane-buffer registration thread (or None).
+    _weg2_prewarm_thread: Any = None
     #: #1452b: snapshot counter -- slots=True, so it is a FIELD (boot weg2xsn208
     #: printed 'n/a (AttributeError ... _1452_snapshots)' on every rank).
     _1452_snapshots: int = 0
@@ -583,6 +585,130 @@ class SchedulerWeightUpdaterManager:
     #: manager raised exactly that) and the audit's ``owned=`` would have
     #: died on the first lane of the next boot instead of counting.
     _weg2_owned_name_keys_cache: Optional[set] = None
+
+    # ---- xsn261: lane buffers registered at boot, not in the first flip -----
+
+    def _weg2_prewarm_lanes_start(self) -> None:
+        """weg2xsn261 (17.09.): the first flip of every boot paid ~10 s before
+        its second tag -- cudaHostRegister of the lane buffers at first use
+        (P side 5.3-6.4 s per lane, register rate ~0.4 GB/s over freshly
+        truncated tmpfs pages) and, on the shared card, the co-located
+        sleeper's pause() blocked behind it (D-TP0 pause_ms=6174 while TP1/TP2
+        took 20 ms). The same buffers are persistent for the boot anyway
+        (SGLANG_WEG2_SEQ_PERSIST_BUFFERS), so they are created and registered
+        HERE, on a daemon thread that waits for both groups' manifests, sizes
+        every lane from the same join the legs use, and touches nothing the
+        flip would not have touched. SGLANG_WEG2_LANE_PREWARM=0 keeps the old
+        first-use form."""
+        try:
+            from sglang.srt.weg2 import weight_exchange as wx
+
+            if not wx.exchange_armed():
+                return
+            if (os.environ.get("SGLANG_WEG2_LANE_PREWARM", "1") or "1") != "1":
+                return
+            import threading
+
+            t = threading.Thread(target=self._weg2_prewarm_lanes,
+                                 name="weg2-lane-prewarm", daemon=True)
+            self._weg2_prewarm_thread = t
+            t.start()
+        except Exception as exc:  # noqa: BLE001 -- a warm-up never breaks a boot
+            logger.info("WEG2-LANE-PREWARM not started: %r", exc)
+
+    def _weg2_prewarm_lanes(self, *, manifests_ready=None, lane_bytes_of=None,
+                            persist=None, family=None, poll_s: float = 2.0,
+                            budget_s: float = 900.0) -> Dict[str, int]:
+        """Size and register every lane buffer this rank will map (both
+        roles: depositor and collector, both buffer slots) from the join.
+        Returns ``{lane_key: bytes}``; ``{}`` and a line when nothing could be
+        derived. The hooks exist for the hermetic test."""
+        from sglang.srt.weg2 import weight_exchange_bounce as bx
+        from sglang.srt.weg2 import weight_exchange_region as xr
+        from sglang.srt.weg2 import weight_exchange_shadow as sh
+        from sglang.srt.weg2 import xchg_manifest as xm
+        from sglang.srt.managers import weg2_memory_saver as ms
+
+        t0 = time.perf_counter()
+        boot_nonce = (os.environ.get(xr.ENV_REGION_BOOT, "") or "").strip()
+        group = self._weg2_group_name()
+        rank = self._weg2_rank()
+        if not boot_nonce or not group or rank is None or int(rank) < 0:
+            logger.info("WEG2-LANE-PREWARM skipped: boot=%r group=%r rank=%r",
+                        boot_nonce, group, rank)
+            return {}
+        rank = int(rank)
+        if manifests_ready is None:
+            def manifests_ready():
+                mans, _why = xm.manifests_for_boot(pp_group="P", tp_group="D")
+                return mans is not None
+        deadline = time.monotonic() + float(budget_s)
+        while not manifests_ready():
+            if time.monotonic() >= deadline:
+                logger.info("WEG2-LANE-PREWARM NOT-READY: the manifests of both "
+                            "groups did not appear within %.0f s; the first flip "
+                            "registers at first use as before", float(budget_s))
+                return {}
+            time.sleep(float(poll_s))
+        if family is None:
+            _chunk_layers, chunk_count = ms.weight_chunk_geometry()
+            family = list(ms.weights_family_tags(int(chunk_count))) if int(chunk_count) > 0 else []
+        if lane_bytes_of is None:
+            def lane_bytes_of(hook, lane_key, tag):
+                pair = int(lane_key[1:]) if lane_key.startswith("p") else None
+                card = None if pair is not None else int(lane_key[1:])
+                descs = self._weg2_seq_lane_descs(
+                    hook=hook, group=group, rank=rank, pair=pair, card=card,
+                    tag=tag, log=None)
+                return sum(int(getattr(d, "nbytes", 0) or 0) for d in (descs or ()))
+        lanes = [f"c{rank}"] + [f"p{i}" for i, (s, d) in enumerate(xr.CROSS_PAIRS)
+                                 if rank in (int(s), int(d))]
+        biggest: Dict[str, int] = {}
+        failures = 0
+        for hook in (sh.HOOK_SOURCE, "authoritative"):
+            for lk in lanes:
+                for tag in family:
+                    try:
+                        b = int(lane_bytes_of(hook, lk, tag) or 0)
+                    except Exception as exc:  # noqa: BLE001 -- sized lanes still register
+                        failures += 1
+                        if failures <= 3:
+                            logger.info("WEG2-LANE-PREWARM lane=%s hook=%s tag=%s "
+                                        "not sized: %r", lk, hook, tag, exc)
+                        b = 0
+                    if b > biggest.get(lk, 0):
+                        biggest[lk] = b
+        if persist is None:
+            ops = self._weg2_xchg_device_ops()
+            root = xr.SHM_ROOT
+
+            def persist(path, nbytes, lk):
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                return bx._persistent_host_buffer(path, int(nbytes), ops, lk, logger.info)
+        depth = max(1, int(bx.seq_buffer_depth()))
+        n = 0
+        total = 0
+        for lk in sorted(biggest):
+            b = int(biggest[lk])
+            if b <= 0:
+                continue
+            for slot in range(depth):
+                path = bx.sequential_buffer_path(
+                    boot_nonce, xr.SHM_ROOT, lane=bx.seq_lane_file_name(lk, slot))
+                try:
+                    persist(path, b, lk)
+                    n += 1
+                    total += b
+                except Exception as exc:  # noqa: BLE001 -- the leg registers at first use
+                    logger.info("WEG2-LANE-PREWARM lane=%s slot=%d failed: %r", lk, slot, exc)
+        logger.info("WEG2-LANE-PREWARM group=%s rank=%d lanes=%s buffers=%d "
+                    "pinned=%.2f GiB sizing_failures=%d ms=%.0f -- the first flip "
+                    "finds every lane buffer registered (reuse), nothing to "
+                    "register on its critical path",
+                    group, rank,
+                    ",".join(f"{k}:{v >> 20}MiB" for k, v in sorted(biggest.items()) if v > 0),
+                    n, total / (1 << 30), failures, (time.perf_counter() - t0) * 1000)
+        return biggest
 
     @contextmanager
     def _observe_weight_load(self, source: str) -> Iterator[None]:

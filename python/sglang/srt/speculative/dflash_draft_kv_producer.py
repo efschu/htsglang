@@ -51,19 +51,41 @@ class DFlashDraftKvProduceError(RuntimeError):
     """A chunk's draft rows could not be produced or published."""
 
 
+def _token_stream(req) -> List[int]:
+    """The token stream the target consumed for ``req``: origin prompt plus
+    the output already filled. weg2xsn262 (17.09.): this fork's ``Req`` has
+    no ``fill_ids`` attribute -- it keeps ``full_untruncated_fill_ids`` and
+    answers ``get_fill_ids()`` (cut at ``extend_range.end``); PP2 died on the
+    first P prefill with ``AttributeError: 'Req' object has no attribute
+    'fill_ids'`` while the hermetic double carried exactly that attribute.
+    Three sources, in order: ``get_fill_ids()``, a plain ``fill_ids``
+    (upstream/doubles), ``origin_input_ids + output_ids``."""
+    getter = getattr(req, "get_fill_ids", None)
+    if callable(getter):
+        try:
+            return list(getter())
+        except Exception:  # noqa: BLE001 -- extend_range unset: fall through
+            pass
+    direct = getattr(req, "fill_ids", None)
+    if direct is not None:
+        return list(direct)
+    return list(getattr(req, "origin_input_ids", ()) or ()) + list(
+        getattr(req, "output_ids", ()) or ())
+
+
 def chunk_page_hashes(req, prefix_len: int, extend_len: int) -> List[str]:
     """The canonical page hashes of ``req``'s positions
     ``[prefix_len, prefix_len + extend_len)``, continuing the chain cached
     on the request when the previous chunk ended exactly at ``prefix_len``.
 
-    ``req.fill_ids`` is the token stream the target consumed (origin prompt
-    plus any output already filled), which is what the radix keys hash.
+    The token stream (``_token_stream``: ``get_fill_ids()`` on this fork's
+    ``Req``) is what the radix keys hash.
     """
     from sglang.srt.mem_cache.utils import get_hash_str
 
     if extend_len <= 0:
         return []
-    tokens = list(req.fill_ids)
+    tokens = _token_stream(req)
     end = prefix_len + extend_len
     if end > len(tokens):
         raise DFlashDraftKvProduceError(

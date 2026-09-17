@@ -2334,6 +2334,18 @@ def _persistent_host_buffer(path: str, biggest: int, ops, lane_key: str, log):
         fh = open(path, "r+b")
         mm = _mmap.mmap(fh.fileno(), biggest)
         addr = _mmap_addr(mm)
+        # xsn262 (17.09.): cudaHostRegister over freshly truncated tmpfs
+        # pages faults every page in under the driver's lock -- 553 MB
+        # took 21 s with four processes registering at once (they
+        # serialise in the driver). Populate the mapping first, outside
+        # any lock, so the register only pins. MADV_POPULATE_WRITE (Linux
+        # 5.14+, value 23); a kernel without it leaves the old form.
+        _t_pop = time.perf_counter()
+        try:
+            mm.madvise(getattr(_mmap, "MADV_POPULATE_WRITE", 23))
+            _pop_ms = (time.perf_counter() - _t_pop) * 1000
+        except (OSError, ValueError, AttributeError):
+            _pop_ms = -1.0
         registered = "no"
         refusal = ""
         t0 = time.perf_counter()
@@ -2348,7 +2360,8 @@ def _persistent_host_buffer(path: str, biggest: int, ops, lane_key: str, log):
                        f"bytes={int(biggest)}: {type(_reg_exc).__name__}: {_reg_exc}")
         log(f"WEG2-SEQ persist lane={lane_key} {how} size={int(biggest)} "
             f"addr={int(addr)} registered={registered} "
-            f"register_ms={(time.perf_counter() - t0) * 1000:.0f}")
+            f"register_ms={(time.perf_counter() - t0) * 1000:.0f} "
+            f"populate_ms={_pop_ms:.0f}")
         if refusal:
             mm.close()
             fh.close()

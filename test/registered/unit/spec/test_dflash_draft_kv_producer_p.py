@@ -182,3 +182,30 @@ def test_cache_controller_publish_routes_to_the_host_pool():
     cc.mem_pool_host_draft = SimpleNamespace()  # a non-arena host pool
     with pytest.raises(RuntimeError, match="cannot publish directly"):
         cc.publish_draft_rows_direct(["h1"], object(), torch.tensor([0]))
+
+
+def test_xsn262_the_token_stream_comes_from_the_forks_req_get_fill_ids():
+    """weg2xsn262: this fork's Req has no `fill_ids`; PP2 died on the first P
+    prefill. The stream is read through `get_fill_ids()` (cut at the extend
+    range), then a plain `fill_ids`, then origin + output."""
+    from types import SimpleNamespace
+    from sglang.srt.mem_cache.utils import get_hash_str
+    from sglang.srt.speculative.dflash_draft_kv_producer import (
+        _token_stream, chunk_page_hashes,
+    )
+    toks = list(range(100, 112))
+
+    class _ForkReq:
+        rid = "fork"
+        origin_input_ids = toks[:8]
+        output_ids = toks[8:]
+
+        def get_fill_ids(self):
+            return toks[:10]          # extend_range.end = 10
+
+    assert _token_stream(_ForkReq()) == toks[:10]
+    assert _token_stream(SimpleNamespace(fill_ids=toks[:5])) == toks[:5]
+    assert _token_stream(SimpleNamespace(origin_input_ids=toks[:3], output_ids=toks[3:6])) == toks[:6]
+    r = _ForkReq()
+    got = chunk_page_hashes(r, 0, 10)
+    assert got == get_hash_str(toks[:10], None, page_size=1)

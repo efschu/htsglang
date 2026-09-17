@@ -3279,6 +3279,10 @@ class Scheduler(
             scheduler=self,
             metrics_collector=self.metrics_collector,
         )
+        # xsn261: the exchange's lane buffers are registered at boot on a
+        # daemon thread (weight_updater._weg2_prewarm_lanes), not inside
+        # the first flip; no-op unless the exchange is armed.
+        self.weight_updater._weg2_prewarm_lanes_start()
 
     def init_lora_drainer(self) -> None:
         if self.server_args.lora_drain_wait_threshold > 0.0:
