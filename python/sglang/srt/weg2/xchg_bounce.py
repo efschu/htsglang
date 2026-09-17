@@ -303,6 +303,13 @@ class BounceTerms:
     #: it) -- the direction that matters is UNDER-stating, which only ever
     #: costs bytes back to the diagonal-safe floor, never under-charges.
     n_cross_lanes: int = 0
+    #: #1464b: a PRICE-ONLY cap on `lanes_priced`.  The REGION form (hook +
+    #: semaphores, every production exchange boot) allocates no per-lane
+    #: assemble buffer, so the lane term is a coverage constant there (see
+    #: launcher.region_form_lane_price_cap), NOT this cut's buffers.  Unlike
+    #: `lanes_concurrent` it arms no LanePermit on the ranks and leaves
+    #: `n_lanes` (the W102 guard count) untouched.  0 = unstated.
+    price_lane_cap: int = 0
 
     @property
     def n_cross_lanes_priced(self) -> int:
@@ -366,8 +373,8 @@ class BounceTerms:
         but the same defect class (a priced number nothing on the boot
         produces).
         """
-        cap = int(self.lanes_concurrent)
-        return int(self.n_lanes) if cap <= 0 else min(int(self.n_lanes), cap)
+        caps = [int(c) for c in (self.lanes_concurrent, self.price_lane_cap) if int(c) > 0]
+        return min([int(self.n_lanes)] + caps)
 
     @property
     def lanes_serialised(self) -> int:
@@ -602,6 +609,7 @@ def bounce_terms(
     lanes_concurrent: int = 0,
     band_credit: bool = False,
     n_cross_lanes: Optional[int] = None,
+    price_lane_cap: int = 0,
 ) -> BounceTerms:
     """Derive the bounce term. Pure; raises only on inputs that cannot mean anything.
 
@@ -713,6 +721,7 @@ def bounce_terms(
         lanes_concurrent=max(0, int(lanes_concurrent)),
         band_credit=bool(band_credit),
         n_cross_lanes=_n_cross_lanes,
+        price_lane_cap=max(0, int(price_lane_cap or 0)),
     )
 
 
@@ -743,7 +752,9 @@ _TERM_FIELDS = ("bytes_per_direction", "n_layers", "widest_layer_bytes",
                 # a rank that rebuilt `total_bytes` without them would price
                 # every lane at the diagonal floor again, silently erasing the
                 # cross share's saving the launcher already charged for.
-                "band_credit", "n_cross_lanes")
+                "band_credit", "n_cross_lanes",
+                # #1464b: the price-only lane cap rides with the inputs too
+                "price_lane_cap")
 
 
 def publish_terms(terms: BounceTerms) -> str:

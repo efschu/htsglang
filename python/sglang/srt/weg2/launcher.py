@@ -5510,7 +5510,8 @@ def xchg_bounce_terms_for_arm(weight_source: str, oncard_mode: str,
                               # ALWAYS auto-derives through
                               # `xchg_bounce.resolve_cross_lanes` rather than
                               # becoming a second knob nobody asked for.
-                              band_credit: bool = False):
+                              band_credit: bool = False,
+                              price_lane_cap: int = 0):
     """``(charged_bytes, lines)`` for the host bounce. #1332 B1b.
 
     THE SECOND PRODUCER OF THE SAME PREDICATE AS
@@ -5562,7 +5563,8 @@ def xchg_bounce_terms_for_arm(weight_source: str, oncard_mode: str,
         depth=int(bounce_depth), slot_bytes=slot_bytes, n_lanes=int(n_lanes),
         max_tag_bytes=xchg_max_tag_bytes(str(model_dir)),
         lanes_concurrent=int(lanes_concurrent),
-        band_credit=bool(band_credit))
+        band_credit=bool(band_credit),
+        price_lane_cap=int(price_lane_cap or 0))
     lines = [widest, xchg_bounce.arm_line(terms)]
     # PROVENANCE, ADDITIVE: the depth-slot is derived HERE, from this
     # checkpoint's census, and never from a knob -- but no line said so, and a
@@ -5874,8 +5876,27 @@ def choose_host_ledger(
     # lane record from it refused the DEFAULT arm, which is the very boot that
     # would have produced the record the exchange arm needs. A producer that
     # locks out its own bootstrap is worse than the under-charge it fixes.
+    _price_cap = 0
     if xchg_bounce_arm_pins_host(weight_source, oncard_mode):
         _lane_n, _lane_prov = xchg_lane_count(stage_ratio, legs, d_vector)
+        # #1464b: REGION FORM -- the lane term is a coverage constant, not
+        # this cut's buffers.  xsn220 (32a8193805) shipped the solver's
+        # 43,11,10 and the ledger charged its WORST-CASE 9 lanes = 27.75 GiB
+        # -> run peak 103.00 GiB -> W97 at launch, for buffers the region
+        # form never allocates (see host_price_for_cut, #1464).  Charge every
+        # cut what the measured incumbent was charged (5 lanes -> 15.75 GiB,
+        # the term that has covered an unattributed ~10 GiB since xsn31), so
+        # the ledger's prediction does not move with the cut.  The count
+        # published to the ranks stays `_lane_n` (W102 compares counts).
+        if os.environ.get("SGLANG_WEG2_PCUT_LANE_PRICE", "") != "1":
+            _price_cap = region_form_lane_price_cap(d_vector, legs)
+            if _price_cap:
+                _lane_prov += (
+                    f" | #1464b REGION-FORM: lanes charged min(n_lanes={_lane_n}, "
+                    f"{_price_cap}) -- the incumbent {_csv(DEFAULT_PP_ORDERED_CUT)}'s "
+                    f"measured count as a coverage constant; no per-lane buffer "
+                    f"exists in this form (xsn218: 0 HOST-SLOT lines, shmem "
+                    f"+0.09 GiB per flip)")
     else:
         _lane_n = 1
         _lane_prov = (
@@ -5886,7 +5907,7 @@ def choose_host_ledger(
             f"says so; W102 is for an arm that WOULD allocate buffers.")
     _bounce_charge_bytes, _bounce_lines = xchg_bounce_terms_for_arm(
         weight_source, oncard_mode, model_dir, oncard_slot_mib, bounce_depth,
-        _lane_n, lanes_concurrent, band_credit)
+        _lane_n, lanes_concurrent, band_credit, price_lane_cap=_price_cap)
     _bounce_lines = list(_bounce_lines) + [_lane_prov]
     # #1361 [23a] THE PRICED STATE, NOT ONLY THE PRICE. B4n measured THREE
     # distinct states that all cost 2.16 GiB -- (depth=1, comparing=True),
@@ -8721,6 +8742,20 @@ P_SOLVER_OBJECTIVE_OF = {
 #: who has the host room grants it here, by number, and the ledger still has
 #: the last word.
 PCUT_BOUNCE_SLACK_ENV = "SGLANG_WEG2_PCUT_BOUNCE_SLACK_GIB"
+
+
+def region_form_lane_price_cap(d_vector: str = XCHG_D_VECTOR_DEFAULT,
+                               legs: str = "both") -> int:
+    """#1464b: the lane count the ledger charges in the REGION form for EVERY
+    cut -- the measured record of the ordered default cut (39,13,12 -> 5),
+    0 when that record does not exist (then nothing is capped and the old
+    per-cut count prices, as before)."""
+    rec = host_ledger.XCHG_LANES_BY_CUT.get(
+        host_ledger.xchg_cut_key(_csv(DEFAULT_PP_ORDERED_CUT), str(d_vector), str(legs)))
+    try:
+        return max(0, int((rec or {}).get("lanes", 0) or 0))
+    except (TypeError, ValueError):
+        return 0
 
 
 def host_price_is_region_form(ns) -> bool:
