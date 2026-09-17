@@ -652,6 +652,90 @@ P_DRAFT_KV_FLAGS: Tuple[str, ...] = (
 #: never silent -- see :func:`draft_kv_off_line`.
 DRAFT_KV_ON_P_DEFAULT = "on"
 
+#: --spec-form (PLAN_DFLASH2_P_0917). THE SPECULATIVE FORM OF THE BOOT, ONE
+#: WRITER (the same MF-6 argument as SPEC_ALGORITHM above): argv_p, argv_d,
+#: d_plan_inputs and the D environment all read it here. ``NEXTN`` is the
+#: shipping form (the constants above, byte-identical); ``DFLASH`` puts the
+#: external DFlash2 draft on both groups -- P as the draft-KV producer
+#: (dflash_draft_kv_producer), D as the proposer with the compact draft
+#: cache and the window pool.
+SPEC_FORM_DEFAULT = "NEXTN"
+DFLASH_DRAFT_PATH_DEFAULT = (
+    "/spinning/llm_stuff/club-3090/models-cache/Qwen3.8-27B-DFlash2-W8-lued"
+)
+DFLASH_BLOCK_DEFAULT = 8
+DFLASH_WINDOW_DEFAULT = 2048
+_SPEC_FORM: Dict[str, object] = {
+    "form": SPEC_FORM_DEFAULT,
+    "draft_path": DFLASH_DRAFT_PATH_DEFAULT,
+    "block": DFLASH_BLOCK_DEFAULT,
+    "window": DFLASH_WINDOW_DEFAULT,
+}
+
+
+def apply_spec_form(ns) -> None:
+    """Install the CLI's speculative form once, before any argv is built."""
+    _SPEC_FORM["form"] = str(getattr(ns, "spec_form", SPEC_FORM_DEFAULT) or SPEC_FORM_DEFAULT).upper()
+    _SPEC_FORM["draft_path"] = str(getattr(ns, "dflash_draft_path", DFLASH_DRAFT_PATH_DEFAULT) or DFLASH_DRAFT_PATH_DEFAULT)
+    _SPEC_FORM["block"] = int(getattr(ns, "dflash_block", DFLASH_BLOCK_DEFAULT) or DFLASH_BLOCK_DEFAULT)
+    _SPEC_FORM["window"] = int(getattr(ns, "dflash_window", DFLASH_WINDOW_DEFAULT) or DFLASH_WINDOW_DEFAULT)
+    if _SPEC_FORM["form"] == "DFLASH" and not os.path.isdir(_SPEC_FORM["draft_path"]):
+        raise SystemExit(
+            f"--spec-form DFLASH: draft checkpoint {_SPEC_FORM['draft_path']} is not a directory"
+        )
+
+
+def spec_form_is_dflash() -> bool:
+    return str(_SPEC_FORM["form"]) == "DFLASH"
+
+
+def spec_flags(*, producer: bool) -> List[str]:
+    """The speculative flag family of one group. Under NEXTN this is the
+    constant family (P adds the producer silencer); under DFLASH the external
+    draft, byte-identical on P and D (they hash into the drafter identity),
+    D additionally with the compact draft cache window."""
+    if spec_form_is_dflash():
+        flags = [
+            "--speculative-algorithm", "DFLASH",
+            "--speculative-draft-model-path", str(_SPEC_FORM["draft_path"]),
+            "--speculative-num-draft-tokens", str(int(_SPEC_FORM["block"])),
+        ]
+        if producer:
+            flags.append("--speculative-draft-kv-only")
+        else:
+            flags += ["--speculative-draft-window-size", str(int(_SPEC_FORM["window"]))]
+        return flags
+    flags = [
+        "--speculative-algorithm", SPEC_ALGORITHM,
+        "--speculative-num-steps", str(SPEC_NUM_STEPS),
+        "--speculative-eagle-topk", str(SPEC_EAGLE_TOPK),
+        "--speculative-num-draft-tokens", str(SPEC_NUM_DRAFT_TOKENS),
+    ]
+    if producer:
+        flags.append("--speculative-draft-kv-only")
+    return flags
+
+
+def spec_form_env(group: str) -> Dict[str, str]:
+    """Environment the form needs on one group: D's window pool under DFLASH."""
+    if spec_form_is_dflash() and group == "D":
+        return {"SGLANG_DFLASH_WINDOW_POOL": "1"}
+    return {}
+
+
+def spec_plan_fields() -> Dict[str, object]:
+    """The PlanInputs fields of the form (d_plan_inputs)."""
+    if spec_form_is_dflash():
+        return {
+            "speculative_algorithm": "DFLASH",
+            "speculative_num_draft_tokens": int(_SPEC_FORM["block"]),
+            "speculative_draft_model_path": str(_SPEC_FORM["draft_path"]),
+        }
+    return {
+        "speculative_algorithm": SPEC_ALGORITHM,
+        "speculative_num_draft_tokens": SPEC_NUM_DRAFT_TOKENS,
+    }
+
 
 def draft_kv_off_line() -> str:
     """The one line the launcher prints when the producer is switched OFF.
@@ -2951,7 +3035,7 @@ def argv_p(
     # Group D is NOT touched by this switch: D keeps its own NEXTN head in
     # both forms (argv_d, below), because `off` removes the PRODUCER, not
     # speculative decode.
-    ] + (list(P_DRAFT_KV_FLAGS) if draft_kv_on_p else []) + (
+    ] + (spec_flags(producer=True) if draft_kv_on_p else []) + (
         # #1305 item 2: the cap is the SHIPPED cut's priced pool, handed in by
         # the caller that holds PCutFacts; never a constant here.  Head-scoped
         # (see P_DRAFT_KV_FLAGS); absent when no cut was solved (the sentinel
@@ -3115,11 +3199,7 @@ def argv_d(
         # from d_tp_ratio_decision as --d-tp-objective, priced on the launch
         # line; the default is still 'auto' because the maxkv law makes
         # capacity the default objective, not because nothing was decided.
-        "--speculative-algorithm", SPEC_ALGORITHM,
-        "--speculative-num-steps", str(SPEC_NUM_STEPS),
-        "--speculative-eagle-topk", str(SPEC_EAGLE_TOPK),
-        "--speculative-num-draft-tokens", str(SPEC_NUM_DRAFT_TOKENS),
-    ] + list(token_vector_flags) + [
+    ] + spec_flags(producer=False) + list(token_vector_flags) + [
         # NO TOKEN VECTOR BY DEFAULT (#1032). What stood here was
         # `--uneven-token-vector 29,19,16 --uneven-token-vector-role seed`, the
         # emitted value of RETRACTED investigation #602. See
@@ -4948,6 +5028,7 @@ def build_env(tree: str, venv: str, cvd: str, store_dir: str, debug_hold: bool, 
     # the next boot confirms or corrects the value.
     env.setdefault("SGLANG_IDLE_BLOCKING_POLL", "1")
     env.setdefault("MALLOC_ARENA_MAX", "4")
+    env.update(spec_form_env(group))  # --spec-form: D's window pool under DFLASH
     return env
 
 
@@ -6825,9 +6906,8 @@ def d_plan_inputs(model: str, tp_size: int, d_bs: int):
         tp_size=int(tp_size),
         model_path=model,
         kv_cache_dtype=KV_CACHE_DTYPE,
-        speculative_algorithm=SPEC_ALGORITHM,
-        speculative_num_draft_tokens=SPEC_NUM_DRAFT_TOKENS,
         max_running_requests=int(d_bs),
+        **spec_plan_fields(),
     )
 
 
@@ -9958,6 +10038,24 @@ def build_parser() -> argparse.ArgumentParser:
              "(which grade a producer that does not exist under 'off' and are "
              "SKIPPED with a named line rather than refusing the boot).")
     ap.add_argument(
+        "--spec-form", choices=["NEXTN", "DFLASH"], default=SPEC_FORM_DEFAULT,
+        help="PLAN_DFLASH2_P_0917. The speculative form of BOTH groups. NEXTN "
+             "(default) is the shipping form: the checkpoint's mtp.* head, the "
+             "constants SPEC_* above. DFLASH puts the external DFlash2 draft on "
+             "both groups: P as the draft-KV producer (chunk ring, hash-keyed "
+             "direct publish into the draft arena), D as the proposer with the "
+             "compact draft cache (--dflash-window) and the window pool "
+             "(SGLANG_DFLASH_WINDOW_POOL=1 in D's environment). The draft's bytes "
+             "are priced off its own checkpoint headers (uneven_perf dflash_* "
+             "families) so the D budget carries them.")
+    ap.add_argument("--dflash-draft-path", default=DFLASH_DRAFT_PATH_DEFAULT,
+                    help="DFLASH draft checkpoint directory (both groups, byte-identical flag).")
+    ap.add_argument("--dflash-block", type=int, default=DFLASH_BLOCK_DEFAULT,
+                    help="DFLASH block size = --speculative-num-draft-tokens (8 for DFlash2).")
+    ap.add_argument("--dflash-window", type=int, default=DFLASH_WINDOW_DEFAULT,
+                    help="D's compact draft cache window = --speculative-draft-window-size "
+                         "(the draft's sliding_window, 2048 for DFlash2).")
+    ap.add_argument(
         "--transport", choices=["bar1", "nccl"], default="bar1",
         help="Collective transport for BOTH groups. 'bar1' is the shipping "
              "default. 'nccl' is the DEVELOPMENT mode of the user's order of "
@@ -10938,6 +11036,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # shape anyway) must never make a fast pre-spawn refusal look post-spawn.
     _ACTIVE_BOOT_STATE = None
     ns = build_parser().parse_args(argv)
+    apply_spec_form(ns)
     # #1386: THE SWITCH IS RESOLVED HERE, ONCE, AS EARLY AS `ns` EXISTS --
     # earlier than `draft_kv_on_p` below, because the FIRST `common_flags`
     # call (the sentinel `chunk_tokens` solve, several hundred lines down)
