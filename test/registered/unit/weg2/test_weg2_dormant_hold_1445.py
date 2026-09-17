@@ -168,7 +168,7 @@ class Wiring(CustomTestCase):
             ms.weg2_group_name = orig
 
     def test_health_probe_takes_w25_not_the_hold(self):
-        src = inspect.getsource(Scheduler.handle_generate_request)
+        src = inspect.getsource(Scheduler._handle_generate_request_impl)
         cond = ("if getattr(self, \"weg2_dormant\", False) and (\n"
                 "            not _weg2_dormant_admit_armed() or is_health_check_generate_req(recv_req)\n"
                 "        ):\n"

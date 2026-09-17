@@ -25,6 +25,8 @@ from __future__ import annotations
 import logging
 import os
 import time
+
+from sglang.srt.managers.weg2_pass_timer import timed as _pass_timed
 from typing import Optional, Sequence
 
 import torch
@@ -201,6 +203,7 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
     def is_placeholder(self, i: int) -> bool:
         return int(i) >= self.staging_rows + self.arena_slots
 
+    @_pass_timed("_1474_alloc_ms")  # #1474
     def alloc_read(self, n: int) -> torch.Tensor:
         """Placeholders for a prefetch registration; resolved in place later."""
         base = self.staging_rows + self.arena_slots

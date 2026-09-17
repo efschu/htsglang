@@ -6,6 +6,8 @@ import os
 import sys
 import threading
 import time
+
+from sglang.srt.managers.weg2_pass_timer import timed as _pass_timed
 from array import array
 from collections import Counter, defaultdict
 from functools import partial
@@ -4003,6 +4005,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 len(node.component_data[BASE_COMPONENT_TYPE].host_value),
             )
 
+    @_pass_timed("_1474_pfs_ms")  # #1474
     def prefetch_from_storage(
         self,
         req_id: str,

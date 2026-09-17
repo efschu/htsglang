@@ -19,6 +19,8 @@ import signal
 import sys
 import threading
 import time
+
+from sglang.srt.managers.weg2_pass_timer import timed as _pass_timed
 from queue import Empty, Queue
 from typing import TYPE_CHECKING, List, NamedTuple, Optional
 
@@ -3255,6 +3257,7 @@ class HiCacheController:
             )
         ]
 
+    @_pass_timed("_1474_probe_ms")  # #1474
     def store_presence_pages(self, token_ids, last_hash, prefix_keys=None) -> int:
         """#950: how many pages the STORE holds for this span, by CONTENT KEY.
 

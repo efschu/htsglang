@@ -23,6 +23,7 @@ import signal
 import sys
 import time
 
+from sglang.srt.managers.weg2_pass_timer import read_ms as _pt_read
 from sglang.srt.managers.weg2_pass_timer import timed as _pass_timed
 from array import array
 from collections import deque
@@ -5053,6 +5054,39 @@ class Scheduler(
         self,
         recv_req: TokenizedGenerateReqInput,
     ):
+        # #1474 INTAKE: the 1.4-1.9 s per 100k prompt that every P rank spends
+        # in the intake pass (weg2xsn232-234: input_ms 1416/1475/1643 on PP0,
+        # PP1 and PP2 alike -- the followers wait in the chain for PP0's
+        # intake).  The terms are recorded by the decorated methods on their
+        # own holders and read here; one line per intake over 200 ms.
+        _t0 = time.perf_counter()
+        try:
+            return self._handle_generate_request_impl(recv_req)
+        finally:
+            try:
+                _tot = (time.perf_counter() - _t0) * 1000.0
+                _tc = getattr(self, "tree_cache", None)
+                _cc = getattr(_tc, "cache_controller", None)
+                _hp = getattr(_cc, "mem_pool_host", None)
+                if _tot >= 200.0:
+                    logger.info(
+                        "#1474 INTAKE rid=%s tokens=%d total_ms=%.0f prefetch_kvcache_ms=%.0f "
+                        "prefetch_from_storage_ms=%.0f presence_probe_ms=%.0f host_alloc_ms=%.0f",
+                        str(getattr(recv_req, "rid", "?"))[:12],
+                        len(getattr(recv_req, "input_ids", None) or ()), _tot,
+                        _pt_read(self, "_1474_prefetch_ms"), _pt_read(_tc, "_1474_pfs_ms"),
+                        _pt_read(_cc, "_1474_probe_ms"), _pt_read(_hp, "_1474_alloc_ms"))
+                else:
+                    for _h, _a in ((self, "_1474_prefetch_ms"), (_tc, "_1474_pfs_ms"),
+                                   (_cc, "_1474_probe_ms"), (_hp, "_1474_alloc_ms")):
+                        _pt_read(_h, _a)
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _handle_generate_request_impl(
+        self,
+        recv_req: TokenizedGenerateReqInput,
+    ):
         # W25 Weg2DormantRefused -- FIRST, before any pool is touched.
         # #1443 (user 16.09.): a dormant group ACCEPTS and HOLDS instead --
         # tokenised ids and the store lookup (host side: arena slots, refs)
@@ -5355,6 +5389,7 @@ class Scheduler(
         for tokenized_req in recv_req:
             self.handle_generate_request(tokenized_req)
 
+    @_pass_timed("_1474_prefetch_ms")  # #1474
     def _prefetch_kvcache(
         self, req: Req, rematch: bool = True, limit_tokens: Optional[int] = None
     ) -> str:
