@@ -205,6 +205,21 @@ REPLICATED = -1
 #: wired yet, so a caller that reaches ``.geom()`` for this axis fails LOUD
 #: instead of silently comparing/moving the wrong bytes).
 MIXED_FUSED = 2
+#: weg2xsn258 (17.09., W90 on the lued checkpoint): the SAME fused-component
+#: shape with the components laid along the COLUMN axis. compressed-tensors
+#: ``pack-quantized`` (Marlin) stores a column-parallel weight as
+#: ``[K/16, N*pack]`` -- the OUTPUT dim, and with it the q|k|v (or gate|up,
+#: or q|k|v|z) boundaries, is the storage COLUMN axis, and every TP rank's
+#: shard is its own slice of EACH component, not one contiguous column
+#: range. ``_axis_of`` used to see "same rows, columns sum to the whole" and
+#: classify a plain ``COLS`` cut, so the plan copied rank 0's [q|k|v] shard
+#: onto the whole's first N/2 columns (its q prefix, then its k and v over
+#: the whole's REMAINING q) -- measured as ``moved=52`` content-changed
+#: pieces, all three fused classes, on PP1. Same declaration mechanism as
+#: ``MIXED_FUSED`` (``component_rows`` are column widths here, scaled by the
+#: pack factor the tensor itself states), same block layout
+#: (``mixed_fused_blocks``), and ``_emit`` treats it as strided like ``COLS``.
+MIXED_FUSED_COLS = 3
 
 #: E4 bounds the granularity: pieces >= 2 MiB issued async cost <= 1 %, while
 #: 256 KiB async costs 4.6-6.4 %.  Only a per-copy SYNC is expensive (2.04x),
@@ -767,13 +782,14 @@ class ParamGeom:
                 f"({self.rows_full}, {self.cols_full}) itemsize "
                 f"{self.itemsize} do not describe a tensor."
             )
-        if self.shard_axis not in (ROWS, COLS, REPLICATED, MIXED_FUSED):
+        if self.shard_axis not in (ROWS, COLS, REPLICATED, MIXED_FUSED,
+                                   MIXED_FUSED_COLS):
             raise Weg2XchgPlanDisagree(
                 f"W68 Weg2XchgPlanDisagree: {self.name}: shard axis "
-                f"{self.shard_axis} is neither ROWS, COLS, REPLICATED nor "
-                f"MIXED_FUSED."
+                f"{self.shard_axis} is neither ROWS, COLS, REPLICATED, "
+                f"MIXED_FUSED nor MIXED_FUSED_COLS."
             )
-        if self.shard_axis == MIXED_FUSED:
+        if self.shard_axis in (MIXED_FUSED, MIXED_FUSED_COLS):
             # #1384: MIXED_FUSED validates ONLY once the declared components
             # are self-consistent -- "the compare path really carries" means
             # exactly this, nothing more speculative. This is the gate that
@@ -790,12 +806,19 @@ class ParamGeom:
                     f"this refuses rather than treating the whole tensor as "
                     f"one guessed block."
                 )
-            if sum(int(c) for c in self.component_rows) != int(self.rows_full):
+            # weg2xsn258: MIXED_FUSED_COLS declares COLUMN widths, so the
+            # axis it must sum to is the column extent.
+            _fused_total = (int(self.cols_full)
+                            if self.shard_axis == MIXED_FUSED_COLS
+                            else int(self.rows_full))
+            if sum(int(c) for c in self.component_rows) != _fused_total:
                 raise Weg2XchgPlanDisagree(
                     f"W68 Weg2XchgPlanDisagree: {self.name}: declared "
                     f"components {list(self.component_rows)} sum to "
                     f"{sum(int(c) for c in self.component_rows)}, not to "
-                    f"rows_full {self.rows_full}. A component declaration "
+                    f"the fused axis extent {_fused_total} "
+                    f"({'cols' if self.shard_axis == MIXED_FUSED_COLS else 'rows'}_full). "
+                    f"A component declaration "
                     f"that disagrees with its own tensor's row count is "
                     f"treated exactly like no declaration at all -- never "
                     f"as licence to guess."
@@ -961,7 +984,8 @@ class ParamGeom:
     @property
     def shard_total(self) -> int:
         """The sharded axis' full extent, padding included."""
-        return self.cols_full if self.shard_axis == COLS else self.rows_full
+        return (self.cols_full if self.shard_axis in (COLS, MIXED_FUSED_COLS)
+                else self.rows_full)
 
     @property
     def content_units(self) -> int:
@@ -1733,7 +1757,7 @@ def _blocks_of(geom: ParamGeom, layout: GroupLayout, is_dst: bool) -> List[List[
         # axis mechanism) and never one monolithic block, because the
         # TP-side blocks below are ALSO per-component and `_emit`'s
         # intersection matches source and destination by `block` index.
-        if geom.shard_axis == MIXED_FUSED:
+        if geom.shard_axis in (MIXED_FUSED, MIXED_FUSED_COLS):
             sizes = list(geom.component_rows)
         else:
             sizes = list(geom.blocks) if geom.blocks else [geom.content_units]
@@ -1749,7 +1773,7 @@ def _blocks_of(geom: ParamGeom, layout: GroupLayout, is_dst: bool) -> List[List[
             f"pure TP (tp_size == ranks) or the PP form (tp_size == 1); a mixed "
             f"form is refused rather than guessed."
         )
-    if geom.shard_axis == MIXED_FUSED:
+    if geom.shard_axis in (MIXED_FUSED, MIXED_FUSED_COLS):
         # #1384: laid out ONCE, the same block list serves this geom as
         # either side (source under `tp_to_pp`, destination under
         # `pp_to_tp`) -- `is_dst` does not change which bytes a TP rank
@@ -1916,7 +1940,7 @@ def _emit(
     source_units = geom.source_units
     content_units = geom.content_units
     itemsize = int(geom.itemsize)
-    strided = geom.shard_axis == COLS
+    strided = geom.shard_axis in (COLS, MIXED_FUSED_COLS)
     rows = int(geom.rows_full) if strided else 1
     cols = int(geom.cols_full)
 

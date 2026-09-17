@@ -278,6 +278,18 @@ def pieces_from_inventory(inventory: Iterable[object]) -> Tuple[ManifestPiece, .
         cols = int(getattr(geom, "cols_full", 0))
         item = int(getattr(geom, "itemsize", 0))
         comp = tuple(int(x) for x in getattr(geom, "component_rows", ()) or ())
+        # weg2xsn258: the module declares its components in OUTPUT units
+        # (q_proj_shard_size etc.); a pack-quantized weight_packed stores
+        # `pack` of them per storage column ([K/16, N*pack], Marlin), so the
+        # declaration is scaled by the factor the tensor's own extent states.
+        # Untouched when the sum already IS a storage axis (bf16 weights,
+        # weight_scale); never a guess when nothing divides.
+        _s = sum(comp)
+        if comp and _s > 0 and _s not in (rows, cols):
+            if cols > 0 and cols % _s == 0:
+                comp = tuple(int(x) * (cols // _s) for x in comp)
+            elif rows > 0 and rows % _s == 0:
+                comp = tuple(int(x) * (rows // _s) for x in comp)
         out.append(
             ManifestPiece(
                 param_name=name,
@@ -466,17 +478,17 @@ class JoinedTensor:
             # on that mismatch alone.
             dst_widths=(tuple(int(w) for w in self.tp_widths)
                         if (self.sharded and tp_is_dst
-                            and self.shard_axis != wx.MIXED_FUSED) else None),
+                            and self.shard_axis not in (wx.MIXED_FUSED, wx.MIXED_FUSED_COLS)) else None),
             # #1384: MIXED_FUSED needs its declared components on the geom
             # regardless of `tp_is_dst` -- `_blocks_of` is called once per
             # SIDE (source and destination) for the same geom, and the TP
             # group can be either side depending on direction.
             component_rows=(self.component_whole_rows
-                            if self.shard_axis == wx.MIXED_FUSED else ()),
+                            if self.shard_axis in (wx.MIXED_FUSED, wx.MIXED_FUSED_COLS) else ()),
             component_axes=(self.component_axes
-                            if self.shard_axis == wx.MIXED_FUSED else ()),
+                            if self.shard_axis in (wx.MIXED_FUSED, wx.MIXED_FUSED_COLS) else ()),
             component_rank_rows=(self.component_rank_rows
-                                 if self.shard_axis == wx.MIXED_FUSED else ()),
+                                 if self.shard_axis in (wx.MIXED_FUSED, wx.MIXED_FUSED_COLS) else ()),
         )
         geom.validate()
         return geom
@@ -552,6 +564,7 @@ def _pad_vocab_size(n: int) -> int:
 
 def _mixed_fused_axis(
     whole: ManifestPiece, cut: Sequence[ManifestPiece],
+    axis: str = "rows",
 ) -> Optional[Tuple[Tuple[int, int, Tuple[int, ...]], ...]]:
     """Per-component ``(axis, rows_full, per_rank_rows)`` for a declared
     mixed-fused tensor.  ``per_rank_rows`` is ``cut``'s OWN declared values
@@ -587,6 +600,12 @@ def _mixed_fused_axis(
       worked, and confining MIXED_FUSED to tensors that are STRUCTURALLY a
       mix of at least two axes.
     """
+    # weg2xsn258: `axis="cols"` reads the SAME declaration against the
+    # column extent -- compressed-tensors pack-quantized (Marlin) stores a
+    # column-parallel weight as [K/16, N*pack], so the fused q|k|v boundaries
+    # live on the storage COLUMN axis (see weight_exchange.MIXED_FUSED_COLS).
+    _total = ((lambda p: int(p.cols_full)) if axis == "cols"
+              else (lambda p: int(p.rows_full)))
     w_comp = tuple(int(x) for x in whole.component_rows)
     # #1378 xsn74: TWO OR MORE declared components is the whole condition.
     # The first form also demanded two DIFFERENT axes among them, so a fused
@@ -597,12 +616,12 @@ def _mixed_fused_axis(
     # [c0_0 c0_1 .. | c1_0 c1_1 ..]. The first SEAM-DIGEST verdict ever
     # reached (weg2xsn74) read exactly those tensors as content-changed with
     # placement identical.
-    if len(w_comp) < 2 or sum(w_comp) != int(whole.rows_full):
+    if len(w_comp) < 2 or sum(w_comp) != _total(whole):
         return None
     cut_comp: List[Tuple[int, ...]] = []
     for piece in cut:
         c = tuple(int(x) for x in piece.component_rows)
-        if len(c) != len(w_comp) or sum(c) != int(piece.rows_full):
+        if len(c) != len(w_comp) or sum(c) != _total(piece):
             return None
         cut_comp.append(c)
 
@@ -702,6 +721,12 @@ def _axis_of(name: str, whole: ManifestPiece,
         return wx.MIXED_FUSED, w_rows, w_cols, tuple(rows), 0
     if same_cols and sum(rows) == w_rows:
         return wx.ROWS, w_rows, w_cols, tuple(rows), 0
+    # weg2xsn258 (W90 on lued): a column cut whose declared components
+    # each resolve on the column axis is MIXED_FUSED_COLS, never a plain
+    # COLS cut -- the plain cut copies rank 0's [q|k|v] shard onto the
+    # whole's first N/2 columns (measured: moved=52 on PP1).
+    if same_rows and _mixed_fused_axis(whole, cut, axis="cols") is not None:
+        return wx.MIXED_FUSED_COLS, w_rows, w_cols, tuple(cols), 0
     if same_rows and sum(cols) == w_cols:
         return wx.COLS, w_rows, w_cols, tuple(cols), 0
 
@@ -980,8 +1005,10 @@ def join_manifests(
         comp_axes: Tuple[int, ...] = ()
         comp_whole: Tuple[int, ...] = ()
         comp_rank: Tuple[Tuple[int, ...], ...] = ()
-        if axis == wx.MIXED_FUSED:
-            comps = _mixed_fused_axis(whole, rows)
+        if axis in (wx.MIXED_FUSED, wx.MIXED_FUSED_COLS):
+            comps = _mixed_fused_axis(
+                whole, rows,
+                axis=("cols" if axis == wx.MIXED_FUSED_COLS else "rows"))
             assert comps is not None, (
                 "W68 internal: _axis_of returned MIXED_FUSED but "
                 "_mixed_fused_axis(whole, rows) returned None on the same "

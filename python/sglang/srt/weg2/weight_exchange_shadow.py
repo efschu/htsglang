@@ -2972,7 +2972,9 @@ def _qkv_component_rows(model, name: str) -> Tuple[int, ...]:
     # is a single-output ColumnParallelLinear whose channels are the GDN
     # block's [key | key | value], read off its parent. `.weight_scale` (the
     # INT8 per-row scale) shares the row structure of its weight.
-    if not name.endswith((".weight", ".bias", ".weight_scale")):
+    # weg2xsn258: `weight_packed` (compressed-tensors pack-quantized) is
+    # the fused module's weight itself and carries the same q|k|v split.
+    if not name.endswith((".weight", ".bias", ".weight_scale", ".weight_packed")):
         return ()
     mod_path, _, _leaf = name.rpartition(".")
     if not mod_path:
