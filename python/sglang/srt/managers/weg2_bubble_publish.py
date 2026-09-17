@@ -89,11 +89,42 @@ def bubble_end(scheduler) -> None:
         ev.clear()
 
 
+BUBBLE_WAIT_MS_ENV = "SGLANG_WEG2_BUBBLE_WAIT_MS"
+
+
 def backup_wait_for_bubble(controller, timeout_s: float = 0.05) -> bool:
     """Backup thread, before each storage batch: prefer a bubble, never
     block for more than ``timeout_s`` (the D group decodes without bubbles;
-    a hard gate would stop its backups). True = copied inside a bubble."""
+    a hard gate would stop its backups).  True = copied inside a bubble.
+
+    #1468: NEVER WAIT WHILE A BACKLOG STANDS BEHIND THIS BATCH.  With group P
+    at --max-running-requests 2 the pipeline has no bubbles, so every one of
+    the ~32 storage batches of a 4096-token node (STORAGE_BATCH_SIZE 128,
+    page_size 1) paid the full 50 ms -> ~1.6 s per node, below the rate two
+    prefills produce nodes.  Measured on weg2xsn225: PUBLISH-SWEEP unbacked
+    74 with 16 in flight and pins 0/18 at the flip, the flush then drained
+    at 16 nodes per 0.2 s sweep (no waits once the gate opened); the mamba
+    states of the un-issued nodes had been evicted before their backup
+    (#969H mamba_value=EMPTY 102 vs 24 with one running request), so group D
+    could re-enter only the first 4095 tokens (W31/W35).  The bubble
+    preference stays for the empty-queue case (PCIe kept for the frames);
+    with ops queued behind this one the batch goes out at once.
+    ``SGLANG_WEG2_BUBBLE_WAIT_MS`` overrides the wait (0 = never wait)."""
     ev = getattr(controller, "_weg2_bubble_gate", None)
     if ev is None:
         return False
+    q = getattr(controller, "backup_queue", None)
+    try:
+        if q is not None and q.qsize() > 0:
+            return bool(ev.is_set())
+    except Exception:  # noqa: BLE001
+        pass
+    raw = os.environ.get(BUBBLE_WAIT_MS_ENV, "")
+    if raw:
+        try:
+            timeout_s = max(0.0, float(raw)) / 1000.0
+        except ValueError:
+            pass
+    if timeout_s <= 0.0:
+        return bool(ev.is_set())
     return bool(ev.wait(timeout_s))
