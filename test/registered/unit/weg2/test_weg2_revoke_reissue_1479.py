@@ -86,6 +86,25 @@ class Test1479(unittest.TestCase):
         h = types.SimpleNamespace(ps=types.SimpleNamespace(tp_size=1), tp_cpu_group=None)
         self.assertEqual(Scheduler._weg2_group_min_ints(h, [3, 0]), [3, 0])
 
+    def test_zero_answer_first_read_reissues_1478(self):
+        # #1478: a first read that materialized nothing (deliverable=0 -> no
+        # #1324 shortfall, _1471_short never set) must be re-issued, not
+        # reported complete with nothing on the host.
+        class _Rec(int):
+            materialized = 0
+        h = _holder(ongoing={}, record={"a": _Rec(0)})
+        r = _req(short=False)
+        self.assertEqual(Scheduler._weg2_refetch_one(h, r, 100.0), "reissued")
+        self.assertEqual(h.issued, ["a"])
+        self.assertTrue(r._1471_short)
+
+    def test_zero_answer_in_flight_still_reading(self):
+        class _Rec(int):
+            materialized = 0
+        h = _holder(ongoing={"a": object()}, record={"a": _Rec(0)})
+        h.tree_cache.check_prefetch_progress = lambda rid: True
+        self.assertEqual(Scheduler._weg2_refetch_one(h, _req(short=False), 100.0), "reading")
+
     def test_drain_is_fail_soft_without_impl(self):
         h = _holder(ongoing={}, record={})
         Scheduler._weg2_drain_prefetch_revokes(h)  # no impl attribute -> no error

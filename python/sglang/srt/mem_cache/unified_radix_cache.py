@@ -3316,6 +3316,20 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # token than their count (`MambaComponent._raw_token_pos`).
         anchor = usable_units + 1 if (self.is_eagle and usable_units > 0) else usable_units
         ok = usable_units >= target_units
+        # #1481 (weg2xsn243/245): the N-1 node this split exists for becomes an
+        # INTERIOR node the moment the final 1-token chunk is inserted below
+        # it, and the mamba pool's interior branch evicts it un-backed under a
+        # second concurrent prompt (--max-running-requests 2).  The final
+        # node's anchor sits one unit PAST the tail a reader asks for
+        # (token_ids[:-1]), so with the N-1 anchor gone the read has no anchor
+        # in range (#1035c CAPPED by=mamba) -> W31 -> second prefill.  Mark the
+        # node; the mamba eviction skips it while its state is un-backed.
+        try:
+            _n = getattr(mr, "last_device_node", None)
+            if ok and _n is not None and _n is not self.root_node:
+                _n._weg2_end_anchor = True
+        except Exception:  # noqa: BLE001 -- an instrument never kills a rank
+            pass
         if not ok:
             UnifiedRadixCache._weg2_end_anchor_short = getattr(UnifiedRadixCache, "_weg2_end_anchor_short", 0) + 1
         logger.warning(

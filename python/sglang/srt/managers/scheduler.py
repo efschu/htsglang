@@ -4951,6 +4951,18 @@ class Scheduler(
             _records = getattr(getattr(self, "tree_cache", None), "prefetch_loaded_tokens_by_reqid", None) or {}
             _span = int(getattr(req, "_prefetch_span_tokens", 0) or 0)
             _have = _records.get(str(req.rid))
+            # #1478 (weg2xsn241, rid weg2-6-2, 4316 tokens): the FIRST hold read
+            # answered NOTHING (store held 64 leading KV pages, no Mamba anchor
+            # in range yet -> the component pool cut the claim to 0, #1035c),
+            # and a zero answer is recorded with deliverable=0, so it is not
+            # "incomplete" and raised no #1324 shortfall: the request was
+            # "complete" with nothing on the host, and at the wake the anchor
+            # refusal (#928) priced the whole prompt -> W31.  A record that
+            # materialized nothing for a span > 0 is short by construction.
+            _zero = (_have is not None and _span > 0
+                     and int(getattr(_have, "materialized", _have) or 0) == 0)
+            if _zero:
+                req._1471_short = True
             if getattr(req, "_1471_short", False) and (_have is None or (_span > 0 and int(_have) < _span)):
                 # #1479 (weg2xsn241, rid weg2-6-3): the re-read issued at the hold
                 # (14:08:14) probed the store BEFORE P's write-through of that
@@ -4963,7 +4975,7 @@ class Scheduler(
                 _ongoing = getattr(getattr(self, "tree_cache", None), "ongoing_prefetch", None)
                 if isinstance(_ongoing, dict) and (req.rid in _ongoing or str(req.rid) in _ongoing):
                     return "reading"
-                reason = "record-short"
+                reason = "zero-answer" if _zero else "record-short"
             else:
                 req._1471_short = False
                 return "complete"
