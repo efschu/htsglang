@@ -3170,7 +3170,9 @@ class Scheduler(
         # read and one int compare on a boot that has never wedged; see
         # managers/wedge_recovery.py for why the actuator must not run on the
         # watchdog thread (it silenced PP0's detector on 2026-08-22).
+        _t_in = time.perf_counter()  # #1476b: name the untimed tail of this method
         drain_recovery_request(self)
+        _t_rec_ms = (time.perf_counter() - _t_in) * 1000.0
         # #969 §W3: take PP0's flip decision off the stream before anything
         # else looks at the list. THIS site is the one place every loop family
         # reaches once per iteration -- which is exactly the property the
@@ -3178,7 +3180,10 @@ class Scheduler(
         # of the cut needs no second hook per loop. Applied only below PP0:
         # rank 0 built the decision and must not be handed a relayed copy of
         # its own.
+        _t_reap = time.perf_counter()
         self.session_controller.maybe_reap(now)
+        _t_reap_ms = (time.perf_counter() - _t_reap) * 1000.0
+        _disp_n, _disp_sum_ms, _disp_max_ms, _disp_max_kind = 0, 0.0, 0.0, "-"
         for recv_req in recv_reqs:
             # #1158 NO HEALTH-CHECK DISPOSAL HERE, ON ANY RANK. The one
             # disposal is on the request ORIGIN, in
@@ -3201,6 +3206,10 @@ class Scheduler(
                     if self.ipc_channels.recv_from_rpc is not None:
                         sock_send(self.ipc_channels.recv_from_rpc, output)
             _s_ms = (time.perf_counter() - _t_disp) * 1000.0 - _d_ms
+            _disp_n += 1
+            _disp_sum_ms += _d_ms + _s_ms
+            if _d_ms + _s_ms > _disp_max_ms:
+                _disp_max_ms, _disp_max_kind = _d_ms + _s_ms, type(recv_req).__name__
             if _d_ms + _s_ms >= 100.0:
                 # #1476 DISPATCH: weg2xsn236 read process_input_requests=1529 ms on
                 # every P rank in the same pass while no handle_generate_request
@@ -3213,8 +3222,21 @@ class Scheduler(
         _fw_ms = (time.perf_counter() - _t_fw) * 1000.0
         if _fw_ms >= 100.0:
             logger.info("#1476 FLUSH-WRAPPER check_pending_ms=%.0f", _fw_ms)
+        _t_ec = time.perf_counter()
         if self.external_corpus_manager is not None:
             self.external_corpus_manager.check_pending_load()
+        _t_ec_ms = (time.perf_counter() - _t_ec) * 1000.0
+        _total_ms = (time.perf_counter() - _t_in) * 1000.0
+        if _total_ms >= 300.0:
+            # #1476b (weg2xsn234-237): the PP followers spent proc_input_ms=1402..1886
+            # at every request end while no single dispatch reached 100 ms and the
+            # flush wrapper stayed silent -- so the time sits in a part this method
+            # never timed (the recovery drain, the session reap, the corpus check)
+            # or in MANY small dispatches.  Print the whole decomposition once.
+            logger.info("#1476b INPUT-TAIL total_ms=%.0f recovery_ms=%.0f reap_ms=%.0f dispatch[n=%d sum_ms=%.0f "
+                        "max_ms=%.0f max_kind=%s] flush_wrapper_ms=%.0f corpus_ms=%.0f",
+                        _total_ms, _t_rec_ms, _t_reap_ms, _disp_n, _disp_sum_ms, _disp_max_ms, _disp_max_kind,
+                        _fw_ms, _t_ec_ms)
 
     def init_profiler(self) -> None:
         self.profiler_manager = SchedulerProfilerManager(
@@ -4929,11 +4951,22 @@ class Scheduler(
             _records = getattr(getattr(self, "tree_cache", None), "prefetch_loaded_tokens_by_reqid", None) or {}
             _span = int(getattr(req, "_prefetch_span_tokens", 0) or 0)
             _have = _records.get(str(req.rid))
-            if getattr(req, "_1471_short", False):
-                if _have is None or (_span > 0 and int(_have) < _span):
+            if getattr(req, "_1471_short", False) and (_have is None or (_span > 0 and int(_have) < _span)):
+                # #1479 (weg2xsn241, rid weg2-6-3): the re-read issued at the hold
+                # (14:08:14) probed the store BEFORE P's write-through of that
+                # request had landed (WT-ACK 14:08:24), found 0 of 93,775 pages
+                # and was REVOKED below the prefetch threshold -- no operation
+                # in flight, record still 4095, and this branch answered
+                # "reading" for 43 s (until the settle bound lapsed -> W31 ->
+                # a second prefill).  Nothing in flight + a short record is a
+                # shortfall to re-issue, not a read to wait for.
+                _ongoing = getattr(getattr(self, "tree_cache", None), "ongoing_prefetch", None)
+                if isinstance(_ongoing, dict) and (req.rid in _ongoing or str(req.rid) in _ongoing):
                     return "reading"
-            req._1471_short = False
-            return "complete"
+                reason = "record-short"
+            else:
+                req._1471_short = False
+                return "complete"
         req._1471_short = True
         if now - float(getattr(req, "_1456_last", 0.0) or 0.0) < 2.0:
             return "wait"
@@ -4948,6 +4981,24 @@ class Scheduler(
                         "re-read from the registered extent)", str(req.rid)[:12], req._1456_n, reason, verdict)
         return "reissued"
 
+    def _weg2_drain_prefetch_revokes(self) -> None:
+        """#1479: pop the re-reads the storage thread REVOKED (hit count
+        below the prefetch threshold) out of ``ongoing_prefetch``.  In the
+        sleep nothing else drains that queue -- the steady-state drain lives
+        on the prefill scheduling path, which a dormant group never walks --
+        so a revoked re-read looked "in flight" forever.  Rank-local and
+        revokes only (the backup/release queues keep their all_reduce'd
+        steady-state drain); every rank runs this at the same point of the
+        same pass, and the hit count that revokes is itself a group MIN, so
+        the pops stay replicated.  Fail-soft."""
+        impl = getattr(getattr(self, "tree_cache", None), "_drain_storage_control_queues_impl", None)
+        if impl is None:
+            return
+        try:
+            impl(n_revoke=None, n_backup=0, n_release=0, extra_release_counts=None, log_metrics=False)
+        except Exception as exc:  # noqa: BLE001
+            logger.info("#1479 REVOKE-DRAIN n/a (%s: %s)", type(exc).__name__, exc)
+
     def _weg2_hold_refetch(self) -> int:
         """#1456: while the group sleeps, finish and TOP UP the reads of the
         held requests.  P's write-through lands a few seconds after its leg
@@ -4959,6 +5010,8 @@ class Scheduler(
         hold = list(getattr(self, "weg2_dormant_hold", None) or [])
         if not hold or not getattr(self, "weg2_dormant", False):
             return 0
+        _drain = getattr(self, "_weg2_drain_prefetch_revokes", None) or functools.partial(Scheduler._weg2_drain_prefetch_revokes, self)
+        _drain()  # #1479
         now = time.monotonic()
         _refetch = getattr(self, "_weg2_refetch_one", None) or functools.partial(Scheduler._weg2_refetch_one, self)
         reissued = 0
