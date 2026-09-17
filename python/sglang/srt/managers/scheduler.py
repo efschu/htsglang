@@ -5009,7 +5009,8 @@ class Scheduler(
                 state = "complete"
             lapsed = now - float(getattr(req, "_1471_since", now)) >= self.WEG2_POST_WAKE_SETTLE_S
             _local.append((req, state, lapsed, state == "complete" or lapsed))
-        _agreed = self._weg2_group_min_flags([x[3] for x in _local])  # #1471e
+        _gmin = getattr(self, "_weg2_group_min_flags", None) or functools.partial(Scheduler._weg2_group_min_flags, self)
+        _agreed = _gmin([x[3] for x in _local])  # #1471e
         for (req, state, lapsed, _r), ok in zip(_local, _agreed):
             if ok:
                 release.append((req, state, lapsed))
@@ -5056,7 +5057,8 @@ class Scheduler(
                             str(getattr(_r, "rid", "?"))[:12], type(exc).__name__, exc)
                 _state = "complete"
             _states.append(_state)
-        _agreed = self._weg2_group_min_flags([st == "complete" for st in _states])  # #1471e
+        _gmin = getattr(self, "_weg2_group_min_flags", None) or functools.partial(Scheduler._weg2_group_min_flags, self)
+        _agreed = _gmin([st == "complete" for st in _states])  # #1471e
         for _r, ok in zip(list(hold), _agreed):
             if ok:
                 released.append(_r)
