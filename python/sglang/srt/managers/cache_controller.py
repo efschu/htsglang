@@ -877,6 +877,7 @@ class HiCacheController:
         self.draft_owner_phase = None
         self.draft_binding_generation = None
         self.draft_identity = None
+        self.draft_total_kv_heads = None
         self._draft_disarm_warned = set()
         # #993 EXECUTION PROOF for the draft READ path. The write half was
         # observable from the store (pages on disk); the read half had no
@@ -2479,6 +2480,7 @@ class HiCacheController:
         owner_phase=None,
         binding_generation=None,
         drafter_identity=None,
+        draft_total_kv_heads=None,
     ) -> None:
         """Register draft KV pools so L2/L3 ops piggyback draft transfers.
 
@@ -2492,6 +2494,12 @@ class HiCacheController:
         self.draft_owner_phase = owner_phase
         self.draft_binding_generation = binding_generation
         self.draft_identity = drafter_identity
+        # The DRAFTER's total kv-head count (the canonical draft page holds
+        # every head of the draft, not of the target): 8 on DFlash2 against
+        # the target's 4. None keeps the NEXTN head's reading (target = draft).
+        self.draft_total_kv_heads = (
+            int(draft_total_kv_heads) if draft_total_kv_heads else None
+        )
         logger.info(
             "HiCache draft KV registered: %s (host %d slots), owner_phase=%s, "
             "binding_generation=%s, drafter=%s",
@@ -2701,7 +2709,10 @@ class HiCacheController:
                 "canonical draft window: the storage attach recorded no model "
                 "config, so the checkpoint's total kv-head count is unknown (S2)."
             )
-        total = int(model_config.get_total_num_kv_heads())
+        total = int(
+            getattr(self, "draft_total_kv_heads", None)
+            or model_config.get_total_num_kv_heads()
+        )
         pool = self.mem_pool_host_draft
         pool.get_size_per_token()  # binds head_num/head_dim/layer_num
         off, n = self._draft_head_window(total)
