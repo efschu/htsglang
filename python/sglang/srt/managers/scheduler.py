@@ -3191,15 +3191,28 @@ class Scheduler(
             # it put a permanent +1 occupant on the follower queues
             # (23:54:18), voided the #791b ballot for 32 passes, and split
             # the TP admission at 23:59:54.
+            _t_disp = time.perf_counter()  # #1476: per-kind dispatch time
             output = self._request_dispatcher(recv_req)
+            _d_ms = (time.perf_counter() - _t_disp) * 1000.0
             if output is not None:
                 if not isinstance(output, RpcReqOutput):
                     self.ipc_channels.send_to_tokenizer.send_output(output, recv_req)
                 else:
                     if self.ipc_channels.recv_from_rpc is not None:
                         sock_send(self.ipc_channels.recv_from_rpc, output)
-
+            _s_ms = (time.perf_counter() - _t_disp) * 1000.0 - _d_ms
+            if _d_ms + _s_ms >= 100.0:
+                # #1476 DISPATCH: weg2xsn236 read process_input_requests=1529 ms on
+                # every P rank in the same pass while no handle_generate_request
+                # took 200 ms -- name the request kind and split dispatch vs the
+                # output send back to the tokenizer.
+                logger.info("#1476 DISPATCH kind=%s rid=%s dispatch_ms=%.0f send_ms=%.0f",
+                            type(recv_req).__name__, str(getattr(recv_req, "rid", "-"))[:12], _d_ms, _s_ms)
+        _t_fw = time.perf_counter()
         self.flush_wrapper.check_pending()
+        _fw_ms = (time.perf_counter() - _t_fw) * 1000.0
+        if _fw_ms >= 100.0:
+            logger.info("#1476 FLUSH-WRAPPER check_pending_ms=%.0f", _fw_ms)
         if self.external_corpus_manager is not None:
             self.external_corpus_manager.check_pending_load()
 
