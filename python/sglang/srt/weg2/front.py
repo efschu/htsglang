@@ -1752,6 +1752,7 @@ class Front:
         self._flip_stall_reported_epoch: int = -1
         self.drain_refusals_in_a_row = 0
         self.identity_checked = False
+        self._flip_marks: Dict[str, float] = {}  # #1455 timeline stamps
         self.dc_measured_d: Dict[str, int] = {}
         self.t0 = time.time()
         self._rid = 0
@@ -3969,7 +3970,7 @@ class Front:
                 after = await self._weg2_decode_progress(g)
                 self._drain_progress = weg2_drain_progress_delta(before, after)
                 return False
-            await asyncio.sleep(0.25)
+            await asyncio.sleep(0.02)  # #1455: 250 ms poll was a quarter of the drain
         return True
 
     async def quiesce(self, g: Group) -> Tuple[bool, str]:
@@ -3991,7 +3992,7 @@ class Front:
             if code == 200:
                 return True, body
             last = body
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(0.05)  # #1455: the P flush RPC answers in ~5 ms; 500 ms poll cost ~1 s per flip
         return False, last
 
     # #1236: `_store_used_bytes` IS DELETED, not repaired. It read
@@ -4208,6 +4209,7 @@ class Front:
         # "flipping", so there is no path on which a stale t0 can be read.
         self._flip_t0 = t_flip0
         self._flip_stage = "drain"
+        self._flip_marks["drain"] = time.time()
         logger.info("WEG2-FLIP begin epoch=%d sleep=%s wake=%s outstanding=%d queue=%d", self.epoch, src, dst, len(S.outstanding), len(self.queue))
         # #1350 READING 1 OF 2, at a moment this front already owns. Only at
         # epoch 0: the term is the step the FIRST waking of each group adds, it
@@ -4272,6 +4274,7 @@ class Front:
         self.drain_refusals_in_a_row = 0
         # 2. quiesce + double witness (W3)
         self._flip_stage = "quiesce"
+        self._flip_marks["quiesce"] = time.time()
         idle, msg = await self.quiesce(S)
         wv = witness_verdict(len(S.outstanding), idle)
         if wv is not None:
@@ -4332,6 +4335,7 @@ class Front:
         shmem_before = host_ledger.read_cgroup_shmem_bytes()
         t0 = time.time()
         self._flip_stage = "sleep-kv"
+        self._flip_marks["sleep-kv"] = time.time()
         # #1428 (xsn188): the KV legs went out on the shared pooled session
         # with no epoch, so a stale keep-alive connection ("Server disconnected",
         # got_response=False) had no retry and killed the boot at the first
@@ -4423,6 +4427,7 @@ class Front:
         # exactly as before fix6.
         self._sleep_leg_gate(S)
         self._flip_stage = "gathered-legs"
+        self._flip_marks["gathered-legs"] = time.time()
         (s_code, s_body, s_ms), (w_code, w_body, w_ms) = await asyncio.gather(
             self.timed_rpc(S, "/release_memory_occupation",
                            {"tags": pause_order, "epoch": flip_epoch}, RPC_TIMEOUT_S),
@@ -4495,6 +4500,20 @@ class Front:
         # 4. measure D_c(src) on the DEVICE axis; W19 for D at its first sleep.
         # fix 8: and the HOST axis, once per group -- the dormant image the next
         # boot's ledger prices instead of the weight-tag census sum.
+        # 5. wake dst kv (W4)
+        t0 = time.time()
+        self._flip_stage = "wake-kv"
+        self._flip_marks["wake-kv"] = time.time()
+        code, body = await self.leg_rpc(D, "/resume_memory_occupation",
+                                        {"tags": [KV_TAG], "epoch": credit_epoch(self.boot_epoch, self.epoch)},
+                                        RPC_TIMEOUT_S)  # #1428: retryable, see the sleep leg
+        t_w = time.time()
+        wake_ms += (t_w - t0) * 1000
+        if code != 200:
+            self.do_stop("W4 Weg2WakeRefused", f"wake({dst}, {KV_TAG}) failed HTTP {code}: {body[:400]!r} -- group-fatal, recovery = teardown + relaunch")
+            return
+        # #1455: the residue measurement (NVML + host image) runs AFTER the wake answered -- it is
+        # instrumentation, not a precondition; ~250 ms off the critical path.
         pids = _session_pids(S.sid) if S.sid else set()
         dc = _nvml_process_mib(pids) if pids else {}
         # #1444: the device residue rides in the dormant-image record, so the
@@ -4510,17 +4529,7 @@ class Front:
                 self.do_stop("W19 DormantResidueRefused",
                              f"measured D_c(D) exceeds the reserve P's budget assumed: {over} (measured, reserved) MiB -- waking P would overcommit the card")
                 return
-        # 5. wake dst kv (W4)
-        t0 = time.time()
-        self._flip_stage = "wake-kv"
-        code, body = await self.leg_rpc(D, "/resume_memory_occupation",
-                                        {"tags": [KV_TAG], "epoch": credit_epoch(self.boot_epoch, self.epoch)},
-                                        RPC_TIMEOUT_S)  # #1428: retryable, see the sleep leg
-        t_w = time.time()
-        wake_ms += (t_w - t0) * 1000
-        if code != 200:
-            self.do_stop("W4 Weg2WakeRefused", f"wake({dst}, {KV_TAG}) failed HTTP {code}: {body[:400]!r} -- group-fatal, recovery = teardown + relaunch")
-            return
+        self._flip_marks["dc"] = time.time()
         self.awake = dst
         self.epoch += 1
         self.admit_d = True
@@ -4530,6 +4539,17 @@ class Front:
         self._flip_stage = "none"
         # C8: phase dwell restarts here, and the L2 admission ordinal with it.
         self.t_awake = time.time()
+        try:  # #1455 WEG2-FLIP-TIMELINE: every stage as a delta to the flip begin, one line
+            _m = self._flip_marks
+            _b = _m.get("drain", self.t_awake)
+            _order = ["drain", "quiesce", "sleep-kv", "gathered-legs", "wake-kv", "dc"]
+            _parts = " ".join(f"{k}@{(_m[k] - _b) * 1000:.0f}" for k in _order if k in _m)
+            logger.info("WEG2-FLIP-TIMELINE epoch=%d slept=%s woke=%s ms-from-begin: %s done@%.0f "
+                        "(stage@t = the moment that stage BEGAN; the D readmission continues on D after done)",
+                        self.epoch, src, dst, _parts, (self.t_awake - _b) * 1000)
+        except Exception:  # noqa: BLE001 -- a timeline never breaks a flip
+            pass
+        self._flip_marks = {}
         self._admitted_this_epoch = 0
         # C11 / L5.  interleave_ms IS NOT sleep+wake any more, and saying so is
         # the point of the line: with the legs gathered the two are different

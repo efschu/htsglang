@@ -4873,14 +4873,12 @@ class Scheduler(
             return 0
         released = list(hold)
         hold.clear()
-        # #1448: each held request re-enters the intake NOW, with the dormant
-        # flag cleared, so its storage prefetch is issued against the pools
-        # the wake's flush_cache has already zeroed -- the same path an
-        # arriving request takes, not a bare append to the waiting queue.
-        for req in released:
-            self._add_request_to_queue(req)
+        # #1455: the prefetch was issued at the hold and ran during the flip;
+        # the wake does not flush any more, so the requests join the queue
+        # as they are -- their device load follows at scheduling.
+        self.waiting_queue.extend(released)
         n = len(released)
-        logger.info("#1443 DORMANT-RELEASE %d held request(s) re-admitted through intake after the wake (prefetch issued now, #1448)", n)
+        logger.info("#1443 DORMANT-RELEASE %d held request(s) queued after the wake (prefetch ran during the flip -- #1455)", n)
         return n
 
     def _weg2_refuse_dormant(self, recv_req, *, context: str) -> None:
@@ -5703,25 +5701,6 @@ class Scheduler(
         if self.disaggregation_mode == DisaggregationMode.NULL:
             if self._abort_on_queued_limit(req):
                 return
-            # #1448 (boot weg2xsn206): the hold sits BEFORE the prefetch.  #1443
-            # issued the storage prefetch and then held the request; the wake's
-            # flush_cache (WEG2-WAKE-INVARIANT) then zeroed the pools the
-            # prefetch had filled, six 100k requests woke with uncached=full,
-            # W50 refused them and the stale host leaves killed TP1/TP2.  A held
-            # request re-enters THIS intake after the wake (see
-            # _weg2_release_dormant_hold), so its prefetch lands on a pool the
-            # flush has already passed.
-            if getattr(self, "weg2_dormant", False) and _weg2_dormant_admit_armed():
-                hold = getattr(self, "weg2_dormant_hold", None)
-                if hold is None:
-                    hold = self.weg2_dormant_hold = []
-                hold.append(req)
-                n = getattr(self, "_1443_held_n", 0) + 1
-                self._1443_held_n = n
-                if n <= 8 or n % 64 == 0:
-                    logger.info("#1443 DORMANT-HOLD rid=%s tokens=%d held=%d (no prefetch yet: it is issued at the wake, after flush_cache -- #1448)",
-                                str(req.rid)[:12], len(req.origin_input_ids or []), len(hold))
-                return
             # #1068 (spec 4.3, L6): the POPULATION marker the cutover re-issue
             # plants (`readmit_seam_residents`: 'retract' for a retracted
             # resident, 'queue' for a queue occupant) is read here and
@@ -5828,6 +5807,22 @@ class Scheduler(
                 pass
             # The population marker is consumed by this intake (see above).
             req._969c_population = None
+            # #1455 (reverts the #1448 order): the hold sits AFTER the prefetch
+            # again -- the arena lookup, ref and pin run in the prefetch
+            # executor for every held request WHILE the flip runs, and the
+            # wake no longer flushes (SGLANG_WEG2_WAKE_FLUSH=0), so nothing of
+            # it is lost.  The tree was flushed at the sleep leg.
+            if getattr(self, "weg2_dormant", False) and _weg2_dormant_admit_armed():
+                hold = getattr(self, "weg2_dormant_hold", None)
+                if hold is None:
+                    hold = self.weg2_dormant_hold = []
+                hold.append(req)
+                n = getattr(self, "_1443_held_n", 0) + 1
+                self._1443_held_n = n
+                if n <= 8 or n % 64 == 0:
+                    logger.info("#1443 DORMANT-HOLD rid=%s tokens=%d held=%d (prefetch issued during the flip; device load at the wake -- #1455)",
+                                str(req.rid)[:12], len(req.origin_input_ids or []), len(hold))
+                return
             self.waiting_queue.append(req)
             req.time_stats.set_wait_queue_entry_time()
         elif self.disaggregation_mode == DisaggregationMode.PREFILL:

@@ -88,7 +88,7 @@ class AbortReachesTheHold(CustomTestCase):
         # and the release afterwards no longer re-queues the aborted one
         Scheduler._weg2_release_dormant_hold(f)
         self.assertEqual([r.rid for r in f.waiting_queue], ["weg2-0-1", "weg2-0-2"])
-        self.assertEqual(f.prefetched, ["weg2-0-1", "weg2-0-2"])  # #1448: prefetch at the wake
+        self.assertEqual(f.prefetched, [])  # #1455: the prefetch ran at the hold, not at the wake
         self.assertEqual(f.weg2_dormant_hold, [])
 
     def test_abort_all_empties_the_hold(self):
@@ -124,13 +124,21 @@ class Wiring(CustomTestCase):
         self.assertLess(src.index("Abort queued request"), src.index("_weg2_abort_dormant_hold"))
         self.assertLess(src.index("_weg2_abort_dormant_hold"), src.index("grammar_manager.abort_requests"))
 
-    def test_hold_precedes_the_prefetch_1448(self):
+    def test_hold_follows_the_prefetch_and_the_wake_does_not_flush_1455(self):
+        """#1455: the prefetch is issued at the hold (it runs in the executor
+        during the flip) and the wake keeps it -- the wake-side flush is off
+        by default, the sleep-side flush stays."""
         src = inspect.getsource(Scheduler._add_request_to_queue)
-        self.assertLess(src.index("weg2_dormant_hold"), src.index("_prefetch_kvcache(req)"))
-        self.assertLess(src.index("weg2_dormant_hold"), src.index("weg2_store_told.intake("))
+        self.assertGreater(src.index("weg2_dormant_hold"), src.index("_prefetch_kvcache(req)"))
         rel = inspect.getsource(Scheduler._weg2_release_dormant_hold)
-        self.assertIn("self._add_request_to_queue(req)", rel)
-        self.assertNotIn("waiting_queue.extend", rel)
+        self.assertIn("waiting_queue.extend(released)", rel)
+        from sglang.srt.managers.scheduler_components import weight_updater as wu
+        wsrc = inspect.getsource(wu)
+        self.assertIn('os.environ.get("SGLANG_WEG2_WAKE_FLUSH", "0") == "1"', wsrc)
+        self.assertIn("flushed = self._weg2_wake_restore_pools()", wsrc)
+        body = inspect.getsource(wu.SchedulerWeightUpdaterManager._weg2_wake_restore_pools)
+        self.assertNotIn("sched.tree_cache.reset", body)  # only the docstring names it
+        self.assertIn("req_to_token_pool.clear()", body)
 
     def test_health_probe_takes_w25_not_the_hold(self):
         src = inspect.getsource(Scheduler.handle_generate_request)

@@ -4693,6 +4693,30 @@ class SchedulerWeightUpdaterManager:
         self.weg2_seam_ref = after
         return None
 
+    def _weg2_wake_restore_pools(self) -> bool:
+        """#1455: Scheduler.flush_cache minus tree_cache.reset(): the pool
+        state the remap left undefined is restored, the radix tree with the
+        hold's prefetched host nodes stays.  Returns True when it ran."""
+        sched = self.scheduler
+        if sched is None:
+            return False
+        try:
+            sched.req_to_token_pool.clear()
+            sched.token_to_kv_pool_allocator.clear()
+            try:
+                from sglang.srt.environ import envs as _envs  # noqa: PLC0415
+                if _envs.SGLANG_FLUSH_ZERO_KV.get():
+                    sched._flush_zero_kv_buffers()
+            except Exception:  # noqa: BLE001
+                pass
+            if getattr(sched, "draft_worker", None):
+                sched.draft_worker.clear_cache_pool()
+            logger.info("WEG2-WAKE-RESTORE pools cleared, radix tree KEPT (#1455: the hold's prefetch survives the wake)")
+            return True
+        except Exception as exc:  # noqa: BLE001 -- fall back to the full flush, never leave pools undefined
+            logger.warning("WEG2-WAKE-RESTORE failed (%s: %s) -> full flush_cache", type(exc).__name__, exc)
+            return bool(self.flush_cache())
+
     def _weg2_raise_pending_seam_refusal(self, *, join: bool = True) -> None:
         """#1450: a refusal graded behind the wake is raised here -- called at
         the head of every Weg-2 leg (join=True: the finisher is WAITED FOR
@@ -7139,7 +7163,14 @@ class SchedulerWeightUpdaterManager:
                 # BEFORE the pause.  The group is drained (idle assert on the
                 # sleep) so the flush cannot refuse.
                 t_f0 = time.perf_counter()
-                flushed = self.flush_cache()
+                # #1455: the tree keeps what the dormant hold prefetched during
+                # the flip; only the POOL state that the remap left undefined is
+                # restored (req_to_token, mamba maps, allocator, KV zero).
+                # SGLANG_WEG2_WAKE_FLUSH=1 restores the full flush (tree reset).
+                if os.environ.get("SGLANG_WEG2_WAKE_FLUSH", "0") == "1":
+                    flushed = self.flush_cache()
+                else:
+                    flushed = self._weg2_wake_restore_pools()
                 _weg2_ph("flush")
                 logger.info(
                     "WEG2-WAKE-INVARIANT kv_cache pools re-zeroed after resume: flush_cache=%s in %.0f ms "
