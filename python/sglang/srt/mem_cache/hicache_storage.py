@@ -2634,11 +2634,42 @@ class HiCacheFile(HiCacheStorage):
             stems.pop((c[1], c[2]), None)
         return moved
 
+    def _l3_index(self):
+        """#1459: the shared L3 stem index beside the arena, opened once
+        (None without an arena dir, with the env off, or when the build
+        failed).  Handed to the evictor, which keeps it exact."""
+        idx = getattr(self, "_l3idx", None)
+        if idx is not None or getattr(self, "_l3idx_tried", False):
+            return idx
+        self._l3idx_tried = True
+        try:
+            adir = self._arena_dir()
+            if not adir:
+                return None
+            from sglang.srt.mem_cache.storage.file.l3_index import open_index
+            idx = open_index(os.path.join(adir, "l3idx.bin"))
+            self._l3idx = idx
+            if idx is not None:
+                self._evictor.l3_index = idx
+                logger.info("#1459 L3-INDEX %s at %s (cap %d, entries %d)",
+                            "created" if idx.created else "joined", idx.path, idx.cap, idx.count())
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("#1459 L3-INDEX n/a (%s: %s)", type(exc).__name__, exc)
+        return idx
+
     def _stat_stems(self, stems: List[str]) -> dict:
         """``{stem: size}`` for the stems that are on disk; one C call when
-        the #1402 helper is available, else ``_stat_stem`` each."""
+        the #1402 helper is available, else ``_stat_stem`` each.
+        #1459: the shared L3 index answers first -- only the stems it names
+        are stat'ed; a stem it does not know is not on disk."""
         if not stems:
             return {}
+        _idx = self._l3_index()
+        if _idx is not None:
+            _present = _idx.has(stems)
+            stems = [st for st, p in zip(stems, _present) if p]
+            if not stems:
+                return {}
         from sglang.srt.mem_cache.storage.file.pageio import load as _load_pageio
 
         pio = _load_pageio()
@@ -3236,6 +3267,9 @@ class HiCacheFile(HiCacheStorage):
         return self._evictor.check_free_space(force=force)
 
     def clear(self) -> bool:
+        _idx = self._l3_index()
+        if _idx is not None:
+            _idx.clear()  # #1459
         try:
             for dirpath, _dirnames, filenames in os.walk(self.file_path):
                 for filename in filenames:

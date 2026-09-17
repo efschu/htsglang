@@ -656,3 +656,152 @@ void arena_stats(uint8_t *base, int64_t *out) {
     out[2] = (int64_t)atomic_load(&h->n_claimed);
     out[3] = (int64_t)h->slot_bytes;
 }
+
+/* ------------------------------------------------------------------------
+ * #1459: the shared L3 STEM INDEX -- "is this stem on the disk store?"
+ * answered from shared memory instead of a stat() per page.
+ *
+ * Boot weg2xsn214: group P's intake probe for a fresh 100k prompt stat'ed
+ * ~94k page files to learn that none exists (3 s per request, GPU idle).
+ * Every writer that commits a page file and every evictor that unlinks one
+ * updates this table, so a stem that is not here is NOT on disk.
+ *
+ * Layout: L3Hdr (64 B) | keys[2*cap] u64 (lo, hi) per entry; (0,0) = empty,
+ * (~0,~0) = tombstone.  Open addressing, linear probe, keyed by the same
+ * BLAKE2b-128 stem key as the arena.  Writers take a spinlock; readers are
+ * lock-free (a half-written entry reads as a transient miss, never a hit).
+ * ------------------------------------------------------------------------ */
+#define L3_MAGIC 0x4c334944585f5731ULL
+#define L3_HDR_BYTES 64
+typedef struct {
+    uint64_t magic;
+    uint64_t cap;              /* power of two */
+    _Atomic uint64_t count;    /* live entries */
+    _Atomic uint32_t lock;
+    uint32_t pad0;
+    uint64_t pad1[4];
+} L3Hdr;
+
+static inline _Atomic uint64_t *l3_keys(uint8_t *base) {
+    return (_Atomic uint64_t *)(base + L3_HDR_BYTES);
+}
+static inline void l3_lock(L3Hdr *h) { while (atomic_exchange(&h->lock, 1u)) { } }
+static inline void l3_unlock(L3Hdr *h) { atomic_store(&h->lock, 0u); }
+
+int64_t l3idx_layout(int64_t cap) {
+    if (cap < 1024 || (cap & (cap - 1))) return -1;
+    return (int64_t)L3_HDR_BYTES + 16 * cap;
+}
+
+int l3idx_init(uint8_t *base, int64_t cap) {
+    int64_t bytes = l3idx_layout(cap);
+    if (bytes < 0) return -1;
+    memset(base, 0, (size_t)bytes);
+    L3Hdr *h = (L3Hdr *)base;
+    h->cap = (uint64_t)cap;
+    atomic_store(&h->count, 0);
+    atomic_store(&h->lock, 0u);
+    atomic_thread_fence(memory_order_seq_cst);
+    h->magic = L3_MAGIC;
+    return 0;
+}
+
+int64_t l3idx_cap(uint8_t *base) {
+    L3Hdr *h = (L3Hdr *)base;
+    return h->magic == L3_MAGIC ? (int64_t)h->cap : -1;
+}
+
+int64_t l3idx_count(uint8_t *base) {
+    L3Hdr *h = (L3Hdr *)base;
+    return h->magic == L3_MAGIC ? (int64_t)atomic_load(&h->count) : -1;
+}
+
+/* returns: 1 inserted, 0 already present, -2 table full */
+static int l3_add_one(uint8_t *base, uint64_t lo, uint64_t hi) {
+    L3Hdr *h = (L3Hdr *)base;
+    _Atomic uint64_t *k = l3_keys(base);
+    uint64_t mask = h->cap - 1, i = lo & mask;
+    int64_t tomb = -1;
+    for (uint64_t n = 0; n < h->cap; n++, i = (i + 1) & mask) {
+        uint64_t elo = atomic_load(&k[2 * i]), ehi = atomic_load(&k[2 * i + 1]);
+        if (elo == 0 && ehi == 0) break;
+        if (elo == ~0ULL && ehi == ~0ULL) { if (tomb < 0) tomb = (int64_t)i; continue; }
+        if (elo == lo && ehi == hi) return 0;
+    }
+    if (atomic_load(&h->count) * 2 >= h->cap && tomb < 0) return -2;
+    uint64_t at = tomb >= 0 ? (uint64_t)tomb : i;
+    atomic_store(&k[2 * at + 1], hi);
+    atomic_store(&k[2 * at], lo);
+    atomic_fetch_add(&h->count, 1);
+    return 1;
+}
+
+int64_t l3idx_add_stems(uint8_t *base, int64_t n, const char **stems) {
+    L3Hdr *h = (L3Hdr *)base;
+    if (h->magic != L3_MAGIC) return -1;
+    int64_t added = 0, full = 0;
+    l3_lock(h);
+    for (int64_t j = 0; j < n; j++) {
+        uint64_t lo, hi; stem_key128(stems[j], &lo, &hi);
+        int r = l3_add_one(base, lo, hi);
+        if (r == 1) added++; else if (r == -2) full++;
+    }
+    l3_unlock(h);
+    return full ? -2 : added;
+}
+
+int64_t l3idx_del_stems(uint8_t *base, int64_t n, const char **stems) {
+    L3Hdr *h = (L3Hdr *)base;
+    if (h->magic != L3_MAGIC) return -1;
+    _Atomic uint64_t *k = l3_keys(base);
+    uint64_t mask = h->cap - 1;
+    int64_t removed = 0;
+    l3_lock(h);
+    for (int64_t j = 0; j < n; j++) {
+        uint64_t lo, hi; stem_key128(stems[j], &lo, &hi);
+        uint64_t i = lo & mask;
+        for (uint64_t m = 0; m < h->cap; m++, i = (i + 1) & mask) {
+            uint64_t elo = atomic_load(&k[2 * i]), ehi = atomic_load(&k[2 * i + 1]);
+            if (elo == 0 && ehi == 0) break;
+            if (elo == lo && ehi == hi) {
+                atomic_store(&k[2 * i], ~0ULL);
+                atomic_store(&k[2 * i + 1], ~0ULL);
+                atomic_fetch_sub(&h->count, 1);
+                removed++;
+                break;
+            }
+        }
+    }
+    l3_unlock(h);
+    return removed;
+}
+
+int64_t l3idx_has_stems(uint8_t *base, int64_t n, const char **stems, int8_t *out) {
+    L3Hdr *h = (L3Hdr *)base;
+    if (h->magic != L3_MAGIC) return -1;
+    _Atomic uint64_t *k = l3_keys(base);
+    uint64_t mask = h->cap - 1;
+    int64_t hits = 0;
+    for (int64_t j = 0; j < n; j++) {
+        uint64_t lo, hi; stem_key128(stems[j], &lo, &hi);
+        uint64_t i = lo & mask;
+        int8_t found = 0;
+        for (uint64_t m = 0; m < h->cap; m++, i = (i + 1) & mask) {
+            uint64_t elo = atomic_load(&k[2 * i]), ehi = atomic_load(&k[2 * i + 1]);
+            if (elo == 0 && ehi == 0) break;
+            if (elo == lo && ehi == hi) { found = 1; break; }
+        }
+        out[j] = found;
+        hits += found;
+    }
+    return hits;
+}
+
+void l3idx_clear(uint8_t *base) {
+    L3Hdr *h = (L3Hdr *)base;
+    if (h->magic != L3_MAGIC) return;
+    l3_lock(h);
+    memset(base + L3_HDR_BYTES, 0, (size_t)(16 * h->cap));
+    atomic_store(&h->count, 0);
+    l3_unlock(h);
+}

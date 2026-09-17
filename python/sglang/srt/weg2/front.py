@@ -4957,7 +4957,13 @@ class Front:
         return True
 
     async def controller(self) -> None:
-        sem = asyncio.Semaphore(self.p_concurrency)
+        # #1459: P takes p_concurrency + P_QUEUE_AHEAD requests at once; the
+        # extra one waits in P's queue (max-running-requests bounds compute)
+        # while its intake store probe runs in the shadow of the current
+        # prefill -- boot weg2xsn214 measured a 3 s GPU-idle gap per 100k
+        # request between one prefill and the next.
+        _ahead = max(0, int(os.environ.get("SGLANG_WEG2_P_QUEUE_AHEAD", "1") or 0))
+        sem = asyncio.Semaphore(self.p_concurrency + _ahead)
         while True:
             await asyncio.sleep(0.2)
             try:
@@ -5039,7 +5045,7 @@ class Front:
                 while self.queue and self.state == "serving":
                     passes += 1
                     batch = [self.queue.popleft()
-                             for _ in range(min(self.p_concurrency, len(self.queue)))]
+                             for _ in range(min(self.p_concurrency + _ahead, len(self.queue)))]
 
                     async def one(p: Pending):
                         if p.skip_leg1:  # route CARRIER-EXCEEDS: no leg 1, D prefills once
