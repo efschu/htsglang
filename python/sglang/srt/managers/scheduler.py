@@ -4864,6 +4864,44 @@ class Scheduler(
                     len(gone), rid[:12], abort_all, len(keep))
         return len(gone)
 
+    def _weg2_hold_refetch(self) -> int:
+        """#1456: while the group sleeps, finish and TOP UP the reads of the
+        held requests.  P's write-through lands a few seconds after its leg
+        answered, so the read issued at the hold terminates short
+        (weg2xsn211: 69631 of 99570 pages); every 2 s per request a
+        finished-short read is re-issued from the registered extent on, so
+        the wake finds the whole prefix already on the host.  Returns how
+        many reads were re-issued.  Fail-soft."""
+        hold = list(getattr(self, "weg2_dormant_hold", None) or [])
+        if not hold or not getattr(self, "weg2_dormant", False):
+            return 0
+        now = time.monotonic()
+        reissued = 0
+        for req in hold:
+            try:
+                if not self.tree_cache.check_prefetch_progress(req.rid):
+                    continue  # still reading
+                if now - float(getattr(req, "_1456_last", 0.0) or 0.0) < 2.0:
+                    continue
+                reason = self._weg2_note_store_shortfall(req)
+                if reason is None:
+                    continue  # whole prefix on the host
+                req._1456_last = now
+                req._1456_n = int(getattr(req, "_1456_n", 0) or 0) + 1
+                clear = getattr(self, "_clear_prefetch_deferral_fields", None)
+                if clear is not None:
+                    clear(req)  # the shortfall mark is ours to re-issue, not the drain's
+                verdict = self._prefetch_kvcache(req)
+                reissued += 1
+                if req._1456_n <= 4 or req._1456_n % 16 == 0:
+                    logger.info("#1456 HOLD-REFETCH rid=%s n=%d reason=%s verdict=%s (the store was short at the hold; "
+                                "re-read from the registered extent while the group sleeps)",
+                                str(req.rid)[:12], req._1456_n, reason, verdict)
+            except Exception as exc:  # noqa: BLE001 -- the hold must never die on a top-up
+                logger.info("#1456 HOLD-REFETCH rid=%s n/a (%s: %s)", str(getattr(req, "rid", "?"))[:12],
+                            type(exc).__name__, exc)
+        return reissued
+
     def _weg2_release_dormant_hold(self) -> int:
         """#1443: the wake cleared the dormant flag -- the held requests join
         the waiting queue in arrival order. Called by the resume handler
@@ -11764,7 +11802,12 @@ class Scheduler(
         # #1028 trap and not a guarantee.
         _ongoing = getattr(self.tree_cache, "ongoing_prefetch", None)
         if _ongoing:
-            for _rid in [r for r in list(_ongoing) if r not in verdicts]:
+            # #1456: a request in the dormant hold is not an orphan -- its
+            # read is finished and topped up by _weg2_hold_refetch while the
+            # group sleeps (boot weg2xsn211: the collector terminated the
+            # hold's reads at 70 % and the rest loaded after the wake).
+            _held = {str(getattr(r, "rid", "")) for r in (getattr(self, "weg2_dormant_hold", None) or [])}
+            for _rid in [r for r in list(_ongoing) if r not in verdicts and str(r) not in _held]:
                 if self.tree_cache.check_prefetch_progress(_rid):
                     _n = getattr(self, "_1233_prefetch_orphans_collected", 0) + 1
                     self._1233_prefetch_orphans_collected = _n
@@ -15674,6 +15717,8 @@ class Scheduler(
                           "_weg2_raise_pending_seam_refusal", None)
         if _wu_chk is not None:
             _wu_chk(join=False)
+        if getattr(self, "weg2_dormant", False) and getattr(self, "weg2_dormant_hold", None):
+            self._weg2_hold_refetch()  # #1456
         if not self.is_fully_idle():
             # #547: no batch to run, but work is queued somewhere (waiting
             # queue, grammar, disagg, hicache drain). That is the loaded path
