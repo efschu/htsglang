@@ -1205,7 +1205,28 @@ class SchedulerWeightUpdaterManager:
             )
         if self.draft_worker is not None:
             draft_path = getattr(server_args, "speculative_draft_model_path", None)
-            if draft_path is not None and draft_path != server_args.model_path:
+            # weg2xsn264 (17.09., DFLASH form): a SEPARATE draft checkpoint is
+            # legitimate when the EXCHANGE carries the draft -- the draft
+            # runner's region `weights_draft` is a member of the weights
+            # family (`draft_tag_in_family`), its bytes come from the peer
+            # group's live VRAM through the same legs as every other tag, and
+            # `_weg2_xchg_draft_reload_from_disk` reloads from the DRAFT's own
+            # path if the legs carried nothing. The "one model_path" objection
+            # below is about the disk refill and does not apply. Measured:
+            # all three D ranks refused W4 at the first P->D wake with the
+            # DFlash2 draft (`Qwen3.8-27B-DFlash2-W8-lued`) beside the target.
+            _draft_via_exchange = False
+            try:
+                from sglang.srt.managers.weg2_memory_saver import draft_tag_in_family as _dtf
+                from sglang.srt.weg2 import weight_exchange as _wx
+
+                _draft_via_exchange = (bool(_wx.exchange_armed())
+                                       and bool(_wx.inject_authoritative())
+                                       and bool(_dtf()))
+            except Exception:  # noqa: BLE001 -- unreadable arm: keep the refusal
+                _draft_via_exchange = False
+            if (draft_path is not None and draft_path != server_args.model_path
+                    and not _draft_via_exchange):
                 raise Weg2WakeRefused(
                     "W4 Weg2WakeRefused: the draft worker loads from "
                     f"{draft_path!r}, not from {server_args.model_path!r}, and "
