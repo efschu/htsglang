@@ -4896,15 +4896,20 @@ class Scheduler(
             return "reading"
         reason = self._weg2_note_store_shortfall(req)
         if reason is None:
-            # #1471b (weg2xsn230): the shortfall verdict reads the tree's
-            # prefetch_loaded_tokens_by_reqid record, and at the wake that
-            # record is gone (the pools were restored), so a read that was
-            # SHORT at the hold came back "complete" and was queued into the
-            # X gate.  A request once seen short stays short until a record
-            # for it says otherwise.
+            # #1471c (weg2xsn238): the re-read issued at the hold finishes its
+            # DEVICE half only after the wake (#1455: host read in the sleep,
+            # device load at the wake; xsn238: HOLD-REFETCH 13:28:48, wake
+            # 13:29:44, PREFETCH-COMPLETE 97870 at 13:29:46), and at the wake
+            # the shortfall verdict answers None while the record still holds
+            # the short read (4095).  "complete" therefore requires the record
+            # to cover the span the hold registered; a request once seen short
+            # stays "reading" until it does (bounded by the settle tick).
             _records = getattr(getattr(self, "tree_cache", None), "prefetch_loaded_tokens_by_reqid", None) or {}
-            if getattr(req, "_1471_short", False) and str(req.rid) not in _records:
-                return "reading"
+            _span = int(getattr(req, "_prefetch_span_tokens", 0) or 0)
+            _have = _records.get(str(req.rid))
+            if getattr(req, "_1471_short", False):
+                if _have is None or (_span > 0 and int(_have) < _span):
+                    return "reading"
             req._1471_short = False
             return "complete"
         req._1471_short = True
