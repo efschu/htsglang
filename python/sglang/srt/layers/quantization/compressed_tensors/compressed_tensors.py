@@ -313,7 +313,14 @@ class CompressedTensorsConfig(QuantizationConfig):
                 vocab_is_quantized,
             )
 
-            if not vocab_is_quantized(getattr(self, "config", None) or {}, prefix):
+            _model_path = None
+            try:
+                from sglang.srt.runtime_context import get_server_args
+
+                _model_path = getattr(get_server_args(), "model_path", None)
+            except Exception:  # noqa: BLE001 -- no runtime context (tests): ignore-list reading
+                _model_path = None
+            if not vocab_is_quantized(getattr(self, "config", None) or {}, prefix, _model_path):
                 return UnquantizedEmbeddingMethod()
             return CompressedTensorsEmbeddingMethod()
 

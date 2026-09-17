@@ -1482,9 +1482,19 @@ class Qwen3_5ForCausalLM(nn.Module):
                     vocab_is_quantized,
                 )
 
+                _model_path = None
+                try:
+                    from sglang.srt.runtime_context import get_server_args
+
+                    _model_path = getattr(get_server_args(), "model_path", None)
+                except Exception:  # noqa: BLE001 -- no runtime context: ignore-list reading
+                    _model_path = None
+                # #1482: the tensor file decides (weight_scale beside the vocab);
+                # the ignore list is only the fallback -- see vocab_is_quantized.
                 if vocab_is_quantized(
                     getattr(quant_config, "config", None) or {},
                     add_prefix("embed_tokens", prefix),
+                    _model_path,
                 ):
                     embedding_quant_config = quant_config
             self.embed_tokens = VocabParallelEmbedding(
