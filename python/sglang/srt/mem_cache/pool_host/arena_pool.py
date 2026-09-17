@@ -46,6 +46,19 @@ _CUDA_HOST_REGISTER_FLAGS = 3  # Portable | Mapped
 _CUDA_ERROR_ALREADY_REGISTERED = 712
 
 
+def _arena_load_block_quota():
+    """Task #3 (17.09.): the JIT gather's block quota for the ARENA -> device
+    load. The kernel default (2 blocks = 64 warps in flight) is tuned for
+    interference with a running forward; the re-admission after a wake
+    runs on an idle card and is bounded by outstanding PCIe reads of 1-KiB
+    cells (~1 GB/s per rank measured on xsn246). None keeps the default."""
+    v = os.environ.get("SGLANG_HICACHE_ARENA_LOAD_BLOCK_QUOTA", "").strip()
+    try:
+        return int(v) if v else None
+    except ValueError:
+        return None
+
+
 def arena_host_enabled() -> bool:
     return os.environ.get(ENV_ARENA_HOST, "0") == "1"
 
@@ -165,6 +178,7 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
         self._pinned = getattr(arena, "_pinned_slots", None)
         if self._pinned is None:
             self._pinned = arena._pinned_slots = torch.zeros(A, dtype=torch.bool)
+        self._all_pinned = bool(self._pinned.all())
         # #1436 (xsn196): pinning slot runs on first use cost 3.4 % of P's
         # prefill loop and sat on D's re-admission of every 100k prompt.
         # Register the whole data region once at bind, in 1 GiB pieces; the
@@ -183,8 +197,19 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
                     raise RuntimeError(f"#1436 cudaHostRegister(arena {off}+{n}) failed: {int(rc)}")
                 off += n
             self._pinned[:] = True
+            self._all_pinned = True
             logger.info("#1436 arena pre-pinned: %.2f GiB in %.1f s (role=%s)", total / (1 << 30),
                         time.perf_counter() - t0, role)
+        # Task #3: build the load's JIT variant NOW (boot), not inside the
+        # first re-admission after a wake (a cold JIT build there is seconds
+        # on the flip tail's critical path).
+        try:
+            _q = _arena_load_block_quota()
+            if _q and torch.cuda.is_available():
+                from sglang.jit_kernel.hicache import can_use_hicache_jit_kernel
+                can_use_hicache_jit_kernel(element_size=int(cell), block_quota=int(_q))
+        except Exception as exc:  # noqa: BLE001 -- a warm-up never refuses a bind
+            logger.info("#task3 arena load JIT warm-up skipped: %r", exc)
         self.arena = arena
         self.arena_slots = A
         self.id_space = self.staging_rows + A + PLACEHOLDERS
@@ -263,6 +288,12 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
         newly pinned."""
         if not getattr(self, "_pin", False):
             return 0
+        # Task #3 (17.09.): with SGLANG_HICACHE_ARENA_PREPIN=1 (the default)
+        # every slot is registered at bind; the list/unique/index walk per
+        # 128-page batch below was 2.7 s of xsn246's 262k-page re-admission
+        # (ARENA-GET resolve+pin_ms) for an answer that is always 0.
+        if getattr(self, "_all_pinned", False):
+            return 0
         idx = torch.as_tensor(list(slots) if not torch.is_tensor(slots) else slots.cpu(), dtype=torch.int64)
         if idx.numel() == 0:
             return 0
@@ -308,6 +339,7 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
             indices_dst=dst_idx,
             indices_src=src_idx,
             element_dim=self.element_dim,
+            block_quota=_arena_load_block_quota(),
         )
 
     # -- #1427 Stufe 4: direct writes, card -> arena slot -------------------------

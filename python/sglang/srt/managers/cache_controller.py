@@ -2238,6 +2238,23 @@ class HiCacheController:
         kv_host_indices, kv_device_indices = self._dcp_kv_transfer_pairs(
             host_indices, device_indices
         )
+        # Task #3 (17.09., flip tail): WHAT THIS LOAD MOVES, keyed by the
+        # finish event the ack carries, read back by the tree's
+        # `loading_check` once the event has landed -- one line per merged
+        # load with tokens, bytes and the device-side ms between the two
+        # events (WEG2-LOAD-DEVICE). Before this line the host->device
+        # half of a re-admission had no number anywhere.
+        try:
+            _k0 = self.mem_pool_device.k_buffer[0]
+            _cell = int(_k0[0].numel()) * int(_k0.element_size())
+            _meta = getattr(self, "_weg2_load_meta", None)
+            if _meta is None:
+                _meta = self._weg2_load_meta = {}
+            _meta[id(producer_event.finish_event)] = (
+                int(kv_host_indices.numel()), 2 * int(self.layer_num) * _cell,
+                time.perf_counter())
+        except Exception:  # noqa: BLE001 -- an instrument never raises
+            pass
 
         with device_module.stream(self.load_stream):
             producer_event.start_event.wait(self.load_stream)
@@ -2955,9 +2972,12 @@ class HiCacheController:
         _t2 = time.perf_counter()
         pool.resolve_rows(host_indices, slots)
         _t3 = time.perf_counter()
-        for _ in slots:
-            if not operation.increment(self.page_size):
-                break
+        # Task #3: ONE increment per batch. `increment` is a lock + an add;
+        # 262k of them per re-admission (xsn246 ARENA-GET) is a Python
+        # loop on the read path's critical section. A terminated
+        # operation refuses the whole batch, which the caller already
+        # treats as a short batch (completed != prev + len).
+        operation.increment(len(slots) * self.page_size)
         # #1436 instrument: where the re-admission of a long prompt spends
         # its time on the read side (xsn196: ~9 s per 100k prompt on D).
         _acc = getattr(self, "_1436_acc", None)

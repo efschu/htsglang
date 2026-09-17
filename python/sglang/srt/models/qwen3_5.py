@@ -1662,10 +1662,17 @@ class Qwen3_5ForCausalLM(nn.Module):
                 _trace_layer_norms(layer_idx, hidden_states, residual)
 
         # DFlash-family capture under PP: every stage captured at its OWN
-        # layers above; hand them to the last stage (which returns them in
-        # layer-id order). One stage: identity. No capture marks: no traffic.
+        # layers above. The captures RIDE THE PIPELINE PROXY to the next
+        # stage (aux_layer_<id> entries beside hidden_states/residual); the
+        # last stage assembles received + own in layer-id order. weg2xsn261:
+        # a separate cross-stage send from inside this forward deadlocked
+        # the pipeline (see pp_aux_capture). One stage: identity.
+        aux_carry = {}
         if self.layers_to_capture and int(self.pp_group.world_size) > 1:
-            from sglang.srt.distributed.pp_aux_capture import exchange_captured_aux
+            from sglang.srt.distributed.pp_aux_capture import (
+                assemble_aux_on_last_stage,
+                carry_aux_forward,
+            )
 
             if len(captured_layer_ids) != len(aux_hidden_states):
                 raise RuntimeError(
@@ -1674,11 +1681,16 @@ class Qwen3_5ForCausalLM(nn.Module):
                     f"{len(aux_hidden_states)} tensor(s) on pp_rank "
                     f"{self.pp_group.rank_in_group}"
                 )
-            assembled = exchange_captured_aux(
-                captured=dict(zip(captured_layer_ids, aux_hidden_states)),
-                pp_group=self.pp_group,
-            )
-            aux_hidden_states = assembled if assembled is not None else []
+            _received = (pp_proxy_tensors.tensors
+                         if pp_proxy_tensors is not None else None)
+            _own = dict(zip(captured_layer_ids, aux_hidden_states))
+            _stage = int(self.pp_group.rank_in_group)
+            if not self.pp_group.is_last_rank:
+                aux_carry = carry_aux_forward(
+                    received=_received, captured=_own, stage=_stage)
+            else:
+                aux_hidden_states = assemble_aux_on_last_stage(
+                    received=_received, captured=_own, stage=_stage)
 
         # Return intermediate tensors for pipeline parallelism
         if not self.pp_group.is_last_rank:
@@ -1686,6 +1698,7 @@ class Qwen3_5ForCausalLM(nn.Module):
                 {
                     "hidden_states": hidden_states,
                     "residual": residual,
+                    **aux_carry,
                 }
             )
 

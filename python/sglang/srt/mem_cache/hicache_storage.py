@@ -30,7 +30,13 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 # Max pages per batched storage IO call.
-STORAGE_BATCH_SIZE = 128
+# Task #3 (17.09.): the per-call overhead of `_page_transfer`'s batches
+# (ctypes marshalling of the stems, one find_slots + ref_slots + resolve
+# per call) was 2048 calls for a 262k-page re-admission on xsn246. The
+# upstream default stays 128; the arena form raises it through the env
+# (SGLANG_HICACHE_STORAGE_BATCH). Termination still lands at a batch
+# boundary -- a larger batch is a coarser stop, never a wrong one.
+STORAGE_BATCH_SIZE = int(os.environ.get("SGLANG_HICACHE_STORAGE_BATCH", "128") or 128)
 
 
 def compute_model_identity_hash(

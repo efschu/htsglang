@@ -1,133 +1,119 @@
 """DFlash-family aux capture across PP stages (distributed/pp_aux_capture).
 
-Hermetic: a fake typed channel (in-memory inbox keyed by (src, kind)) stands
-in for the PP group. The cases pin the two properties the P-side DFlash
-draft-KV producer depends on: every stage's captures reach the last stage,
-and they arrive in LAYER-ID order regardless of which stage owns which
-layer (group P's ownership is gapped).
+weg2xsn261 (17.09.2026): the first form shipped every stage's captures to the
+last stage as a SEPARATE typed-channel message sent from inside the model
+forward, before the stage returned its proxy. On the metal PP0 blocked in
+that send (PP2 was in its ordinary proxy receive from PP1, PP1 waited for
+PP0's proxy) -- the first P prefill of the DFLASH form after a flip wedged
+for 240 s and the watchdog killed the boot. The hermetic channel double was
+non-blocking and could not show it.
+
+Now the captures RIDE THE PROXY: each stage adds ``aux_layer_<id>`` entries
+to the dict it already hands downstream, forwards what it received, and the
+last stage assembles received + own in layer-id order. These tests drive the
+three stages hop by hop with plain dicts -- exactly what the proxy channel
+carries -- and pin (a) the assembly order, (b) pass-through by a stage that
+captures nothing, (c) duplicate refusal, (d) that the module makes NO
+cross-stage send at all (the deadlock's mechanism, pinned at the source
+since it cannot be executed hermetically).
 """
+
+import os
 
 import pytest
 import torch
 
-from sglang.srt.distributed.pp_aux_capture import (
-    AUX_CAPTURE_KIND,
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
+
+from sglang.srt.distributed import pp_aux_capture as pac  # noqa: E402
+from sglang.srt.distributed.pp_aux_capture import (  # noqa: E402
+    AUX_KEY_PREFIX,
     PpAuxCaptureError,
-    exchange_captured_aux,
+    assemble_aux_on_last_stage,
+    carry_aux_forward,
 )
 
 
-class _Group:
-    def __init__(self, rank, world_size):
-        self.rank_in_group = rank
-        self.world_size = world_size
-        self.is_last_rank = rank == world_size - 1
-
-
-class _Channel:
-    """The typed channel's contract, in memory: dicts land under (src, kind)."""
-
-    def __init__(self):
-        self.inbox = {}
-        self.sent = []
-
-    def send(self, group, payload, dst, kind):
-        self.sent.append((group.rank_in_group, dst, kind, sorted(payload)))
-        self.inbox.setdefault((group.rank_in_group, kind), []).append(dict(payload))
-
-    def recv(self, group, kind, src=None):
-        q = self.inbox.get((src, kind))
-        return q.pop(0) if q else None
-
-
-def _run(ownership, world_size, channel=None, hidden=4):
-    """ownership: {rank: [layer ids]} -> the last stage's assembled list."""
-    channel = channel or _Channel()
+def _stages(ownership, world_size, hidden=4):
+    """ownership: {stage: [layer ids]} -> (assembled list on the last stage,
+    {layer id: tensor}, the proxy dict each stage sent)."""
     tensors = {}
-    out = {}
-    # Non-last stages send first (they finish their loops first), the last
-    # stage receives afterwards -- the order the real pipeline has.
-    for rank in list(range(world_size - 1)) + [world_size - 1]:
+    proxies = {}
+    received = None
+    out = None
+    for stage in range(world_size):
         captured = {}
-        for lid in ownership.get(rank, []):
+        for lid in ownership.get(stage, []):
             t = torch.full((3, hidden), float(lid))
             tensors[lid] = t
             captured[lid] = t
-        out[rank] = exchange_captured_aux(
-            captured=captured,
-            pp_group=_Group(rank, world_size),
-            send=channel.send,
-            recv=channel.recv,
-        )
-    return out, tensors, channel
+        if stage < world_size - 1:
+            carry = carry_aux_forward(received=received, captured=captured, stage=stage)
+            proxy = {"hidden_states": torch.zeros(3, hidden),
+                     "residual": torch.zeros(3, hidden), **carry}
+            proxies[stage] = proxy
+            received = proxy          # the next stage's pp_proxy_tensors.tensors
+        else:
+            out = assemble_aux_on_last_stage(received=received, captured=captured, stage=stage)
+    return out, tensors, proxies
 
 
 def test_gapped_ownership_assembles_in_layer_id_order():
-    # Group P shape: PP0 owns 6/20/34, PP1 owns 48, PP2 (last) owns 62 -- and
-    # an interleaved variant where the last stage owns a LOW layer too.
-    out, tensors, ch = _run({0: [6, 20, 34], 1: [48], 2: [62]}, 3)
-    assert out[0] is None and out[1] is None
-    assert [float(t[0, 0]) for t in out[2]] == [6.0, 20.0, 34.0, 48.0, 62.0]
-    assert all(out[2][i] is tensors[l] for i, l in enumerate([6, 20, 34, 48, 62]))
-    # exactly one aux message per non-last stage, addressed to the last stage
-    assert [(s, d, k) for s, d, k, _ in ch.sent] == [
-        (0, 2, AUX_CAPTURE_KIND),
-        (1, 2, AUX_CAPTURE_KIND),
-    ]
+    """Group P's cut (39,13,12): PP0 owns captures 6/20/34, PP1 48, PP2 62."""
+    out, tensors, proxies = _stages({0: [6, 20, 34], 1: [48], 2: [62]}, 3)
+    assert [float(t[0, 0]) for t in out] == [6.0, 20.0, 34.0, 48.0, 62.0]
+    for lid, t in zip([6, 20, 34, 48, 62], out):
+        assert t is tensors[lid]
+    # the carry grows hop by hop and keeps the pipeline's own keys
+    assert sorted(k for k in proxies[0] if k.startswith(AUX_KEY_PREFIX)) == [
+        "aux_layer_20", "aux_layer_34", "aux_layer_6"]
+    assert sorted(k for k in proxies[1] if k.startswith(AUX_KEY_PREFIX)) == [
+        "aux_layer_20", "aux_layer_34", "aux_layer_48", "aux_layer_6"]
+    assert {"hidden_states", "residual"} <= set(proxies[1])
 
 
 def test_interleaved_ownership_sorts_by_layer_not_stage():
-    out, _, _ = _run({0: [34], 1: [6, 62], 2: [20, 48]}, 3)
-    assert [float(t[0, 0]) for t in out[2]] == [6.0, 20.0, 34.0, 48.0, 62.0]
+    out, _t, _p = _stages({0: [20], 1: [6, 34], 2: [62, 48]}, 3)
+    assert [float(t[0, 0]) for t in out] == [6.0, 20.0, 34.0, 48.0, 62.0]
 
 
-def test_stage_without_capture_layers_still_announces_itself():
-    out, _, ch = _run({0: [6, 20, 34, 48], 2: [62]}, 3)
-    assert [float(t[0, 0]) for t in out[2]] == [6.0, 20.0, 34.0, 48.0, 62.0]
-    # stage 1 sent a message carrying only the count
-    assert ch.sent[1][0] == 1 and ch.sent[1][3] == ["aux_count"]
+def test_a_stage_without_captures_passes_the_carry_through():
+    out, _t, proxies = _stages({0: [6, 20], 1: [], 2: [34]}, 3)
+    assert [float(t[0, 0]) for t in out] == [6.0, 20.0, 34.0]
+    assert sorted(k for k in proxies[1] if k.startswith(AUX_KEY_PREFIX)) == [
+        "aux_layer_20", "aux_layer_6"]
 
 
-def test_single_stage_is_identity_without_channel():
-    ch = _Channel()
-    captured = {20: torch.zeros(2, 2), 6: torch.ones(2, 2)}
-    got = exchange_captured_aux(
-        captured=captured, pp_group=_Group(0, 1), send=ch.send, recv=ch.recv
-    )
-    assert got[0] is captured[6] and got[1] is captured[20]
-    assert ch.sent == []
+def test_last_stage_alone_is_identity():
+    out = assemble_aux_on_last_stage(
+        received=None, captured={20: torch.ones(2, 2), 6: torch.zeros(2, 2)}, stage=0)
+    assert [float(t[0, 0]) for t in out] == [0.0, 1.0]
 
 
-def test_missing_stage_message_is_refused():
-    ch = _Channel()
-    with pytest.raises(PpAuxCaptureError, match="no aux-capture message"):
-        exchange_captured_aux(
-            captured={62: torch.zeros(1, 1)},
-            pp_group=_Group(2, 3),
-            send=ch.send,
-            recv=ch.recv,
-        )
+def test_duplicate_capture_layer_is_refused_on_carry_and_on_assembly():
+    with pytest.raises(PpAuxCaptureError):
+        carry_aux_forward(received={"aux_layer_6": torch.ones(1)},
+                          captured={6: torch.ones(1)}, stage=1)
+    with pytest.raises(PpAuxCaptureError):
+        assemble_aux_on_last_stage(received={"aux_layer_6": torch.ones(1)},
+                                   captured={6: torch.ones(1)}, stage=2)
 
 
-def test_duplicate_capture_layer_is_refused():
-    ch = _Channel()
-    exchange_captured_aux(
-        captured={62: torch.zeros(1, 1)}, pp_group=_Group(0, 2),
-        send=ch.send, recv=ch.recv,
-    )
-    with pytest.raises(PpAuxCaptureError, match="two stages claim"):
-        exchange_captured_aux(
-            captured={62: torch.ones(1, 1)}, pp_group=_Group(1, 2),
-            send=ch.send, recv=ch.recv,
-        )
+def test_a_malformed_carry_key_is_refused():
+    with pytest.raises(PpAuxCaptureError):
+        carry_aux_forward(received={"aux_layer_x": torch.ones(1)}, captured={}, stage=1)
 
 
-def test_declared_count_mismatch_is_refused():
-    ch = _Channel()
-    ch.inbox[(0, AUX_CAPTURE_KIND)] = [
-        {"aux_layer_6": torch.zeros(1, 1), "aux_count": torch.tensor([2])}
-    ]
-    with pytest.raises(PpAuxCaptureError, match="declared 2"):
-        exchange_captured_aux(
-            captured={}, pp_group=_Group(1, 2), send=ch.send, recv=ch.recv
-        )
+def test_the_module_makes_no_cross_stage_send():
+    """THE DEADLOCK'S MECHANISM, pinned at the source: no typed-channel send
+    or receive anywhere in the capture path. The carry is the proxy dict the
+    stage returns; the pipeline's own send is the only message."""
+    src = open(pac.__file__).read()
+    body = src.split('"""', 2)[2]          # past the module docstring
+    for banned in ("send_typed_tensor_dict", "recv_typed_tensor_dict",
+                   "send_tensor_dict", "recv_tensor_dict", "torch.distributed.send",
+                   "dist.send", ".send("):
+        assert banned not in body, f"cross-stage send reintroduced: {banned}"
+    model_src = open(os.path.join(os.path.dirname(pac.__file__), "..", "models", "qwen3_5.py")).read()
+    assert "exchange_captured_aux" not in model_src
+    assert "**aux_carry" in model_src
