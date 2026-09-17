@@ -1352,6 +1352,34 @@ class Group:
         return "prefill" if self.name == "P" else "decode"
 
 
+async def _p_drain_pool(queue, limit: int, one, on_done, may_dispatch) -> int:
+    """#1459c: keep up to ``limit`` leg-1 calls in flight, refilling from
+    ``queue`` (a deque; new arrivals appended while draining are taken too)
+    the moment ONE finishes.  ``on_done(p)`` runs in COMPLETION order.
+    ``may_dispatch()`` False stops NEW dispatches (the phase is leaving
+    "serving"); what is already in flight is always awaited, never
+    abandoned -- the old gather had the same property for its batch.
+    Returns the number of dispatch rounds (the ``passes`` term of the
+    drain summary line).
+    """
+    inflight: set = set()
+    rounds = 0
+    while True:
+        dispatched = False
+        while queue and len(inflight) < limit and may_dispatch():
+            inflight.add(asyncio.ensure_future(one(queue.popleft())))
+            dispatched = True
+        if dispatched:
+            rounds += 1
+        if not inflight:
+            return rounds
+        done, _pending = await asyncio.wait(inflight, return_when=asyncio.FIRST_COMPLETED)
+        for t in done:
+            inflight.discard(t)
+            on_done(t.result())
+
+
+
 @dataclass
 class Pending:
     rid: str
@@ -5042,32 +5070,41 @@ class Front:
                           self.counters.get("p_prefix_tokens_in_store", 0),
                           self.counters.get("p_prefix_tokens_reused", 0))
                 _drain_uncached = 0
-                while self.queue and self.state == "serving":
-                    passes += 1
-                    batch = [self.queue.popleft()
-                             for _ in range(min(self.p_concurrency + _ahead, len(self.queue)))]
+                async def one(p: Pending) -> Pending:
+                    if p.skip_leg1:  # route CARRIER-EXCEEDS: no leg 1, D prefills once
+                        p.leg1_done = True
+                        return p
+                    async with sem:
+                        try:
+                            await self.leg1(p)
+                        except Exception as e:  # noqa: BLE001
+                            self.counters["leg1_failures"] += 1
+                            logger.error("WEG2 leg1 rid=%s failed: %s", p.rid, e)
+                            if not p.fut.done():
+                                p.fut.set_exception(e)
+                            return p
+                        p.leg1_done = True
+                    return p
 
-                    async def one(p: Pending):
-                        if p.skip_leg1:  # route CARRIER-EXCEEDS: no leg 1, D prefills once
-                            p.leg1_done = True
-                            return
-                        async with sem:
-                            try:
-                                await self.leg1(p)
-                            except Exception as e:  # noqa: BLE001
-                                self.counters["leg1_failures"] += 1
-                                logger.error("WEG2 leg1 rid=%s failed: %s", p.rid, e)
-                                if not p.fut.done():
-                                    p.fut.set_exception(e)
-                                return
-                            p.leg1_done = True
-                    await asyncio.gather(*(one(p) for p in batch))
-                    _drain_uncached += sum(int(q.est_uncached) for q in batch)
-                    for p in batch:
-                        if not p.fut.done():
-                            self._ready_for_d.append(p)
-                            self._sync_batch_gate()
-                            prefilled += 1
+                def _on_leg1_done(p: Pending) -> None:
+                    nonlocal _drain_uncached, prefilled
+                    _drain_uncached += int(p.est_uncached)
+                    if not p.fut.done():
+                        self._ready_for_d.append(p)
+                        self._sync_batch_gate()
+                        prefilled += 1
+
+                # #1459c: a CONTINUOUS pool, not paired batches.  The #1459
+                # form dispatched `p_concurrency + ahead` requests as ONE
+                # batch and gathered the whole batch before taking the next,
+                # so only every second request had a successor queued on P
+                # while it ran (xsn217: -7 finished 26.2 s after -6, -8 took
+                # 29.5 s again -- the 3 s store probe was back on every
+                # second request).  The pool refills the moment ONE leg
+                # finishes, so P always has the next request queued.
+                passes = await _p_drain_pool(
+                    self.queue, self.p_concurrency + _ahead, one, _on_leg1_done,
+                    lambda: self.state == "serving")
                 if passes:
                     oldest_short = 0.0
                     if self._ready_for_d:

@@ -73,7 +73,67 @@ class Wiring(CustomTestCase):
         fsrc = inspect.getsource(front)
         self.assertIn('os.environ.get("SGLANG_WEG2_P_QUEUE_AHEAD", "1")', fsrc)
         self.assertIn("asyncio.Semaphore(self.p_concurrency + _ahead)", fsrc)
-        self.assertIn("range(min(self.p_concurrency + _ahead, len(self.queue)))", fsrc)
+        # #1459c: the pool form, not paired batches
+        self.assertIn("passes = await _p_drain_pool(", fsrc)
+        self.assertNotIn("range(min(self.p_concurrency + _ahead, len(self.queue)))", fsrc)
+
+
+class Test1459cDrainPool(unittest.TestCase):
+    """#1459c: the leg-1 pool refills the moment ONE call finishes."""
+
+    def _run(self, durations, limit, stop_after=None):
+        import asyncio
+        import collections
+        from sglang.srt.weg2 import front
+
+        async def main():
+            q = collections.deque(range(len(durations)))
+            t0 = loop.time()
+            starts, ends, done_order, live = {}, {}, [], [0]
+            peak = [0]
+            dispatch_ok = [True]
+
+            async def one(i):
+                starts[i] = loop.time() - t0
+                live[0] += 1
+                peak[0] = max(peak[0], live[0])
+                await asyncio.sleep(durations[i])
+                live[0] -= 1
+                ends[i] = loop.time() - t0
+                if stop_after is not None and i == stop_after:
+                    dispatch_ok[0] = False
+                return i
+
+            rounds = await front._p_drain_pool(q, limit, one, done_order.append, lambda: dispatch_ok[0])
+            return starts, ends, done_order, peak[0], rounds, list(q)
+
+        loop = asyncio.new_event_loop()
+        try:
+            return loop.run_until_complete(main())
+        finally:
+            loop.close()
+
+    def test_third_item_starts_when_first_finishes_not_when_pair_finishes(self):
+        # item 0 short, item 1 long: with paired batches item 2 would wait
+        # for item 1; the pool starts it right after item 0.
+        starts, ends, order, peak, rounds, left = self._run([0.05, 0.30, 0.05, 0.05], limit=2)
+        self.assertLessEqual(peak, 2)
+        self.assertLess(starts[2], ends[1])
+        self.assertAlmostEqual(starts[2], ends[0], delta=0.03)
+        self.assertEqual(order, [0, 2, 3, 1])
+        self.assertEqual(left, [])
+        self.assertGreaterEqual(rounds, 2)
+
+    def test_stop_dispatch_drains_inflight_and_keeps_the_rest_queued(self):
+        starts, ends, order, peak, rounds, left = self._run([0.05, 0.05, 0.05, 0.05], limit=2, stop_after=0)
+        # item 0 finishing flips may_dispatch False: item 1 (already in
+        # flight) is awaited, items 2/3 stay in the queue.
+        self.assertEqual(sorted(order), [0, 1])
+        self.assertEqual(left, [2, 3])
+
+    def test_empty_queue_returns_zero_rounds(self):
+        starts, ends, order, peak, rounds, left = self._run([], limit=2)
+        self.assertEqual((order, rounds, left), ([], 0, []))
 
 
 if __name__ == "__main__":
