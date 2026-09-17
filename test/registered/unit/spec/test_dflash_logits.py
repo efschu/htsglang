@@ -226,14 +226,10 @@ def test_worker_folds_a_gate_admitted_quantized_selector_head(monkeypatch):
         "_SelectorDraftSampler",
         lambda **kwargs: built.setdefault("sampler", object()),
     )
+    # This line reads the graph batch sizes from the worker's server_args (no
+    # get_exec bag) and screens TP through get_tp_group().
     monkeypatch.setattr(
-        worker_mod,
-        "get_exec",
-        lambda: SimpleNamespace(
-            graph=SimpleNamespace(
-                cuda_graph_config=SimpleNamespace(decode=SimpleNamespace(bs=[1]))
-            )
-        ),
+        worker_mod, "get_tp_group", lambda: SimpleNamespace(world_size=1)
     )
     quant_head = SimpleNamespace(
         weight=torch.empty(8, 2, dtype=torch.int8),
@@ -243,6 +239,11 @@ def test_worker_folds_a_gate_admitted_quantized_selector_head(monkeypatch):
         block_size=8,
         selector=object(),
         ps=SimpleNamespace(tp_rank=0),
+        tp_rank=0,
+        _spec_solo_active=False,
+        server_args=SimpleNamespace(
+            cuda_graph_config=SimpleNamespace(decode=SimpleNamespace(bs=[1]))
+        ),
         draft_model=SimpleNamespace(lm_head=None),
         device="cpu",
         _target_worker=SimpleNamespace(
