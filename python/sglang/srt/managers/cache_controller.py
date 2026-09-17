@@ -2421,6 +2421,15 @@ class HiCacheController:
         """
         if not self.has_draft:
             return False
+        if direction in ("write", "load") and getattr(
+            self.mem_pool_device_draft, "weg2_direct_publish", False
+        ):
+            # A producer's chunk ring (DFlash on group P): its rows are
+            # published hash-keyed by publish_draft_rows_direct inside the
+            # producer's own call. Row-addressed backup/load would read the
+            # ring at target slot indices -- meaningless -- so they are off,
+            # silently and by construction, for this pool.
+            return False
         if self.draft_owner_phase is not None:
             from sglang.srt.mem_cache.hicache_phase_guard import active_phase
 
@@ -2512,6 +2521,53 @@ class HiCacheController:
         # If storage is already attached, wire up the draft I/O path now.
         # Otherwise this will be deferred until attach_storage_backend().
         self._maybe_register_draft_with_storage()
+
+    def publish_draft_rows_direct(self, hash_values, device_pool, device_indices) -> int:
+        """Producer path (Weg 2 group P, DFlash): publish draft rows that sit
+        in ``device_pool`` at ``device_indices`` under the page hashes
+        ``hash_values``, straight into the draft arena, keyed like every
+        other draft page of this drafter (``_draft_component_name``). No
+        target host row is involved. Returns the number of pages complete
+        in the arena afterwards; a refusal is COUNTED, never silent."""
+        if not self.has_draft or self.mem_pool_host_draft is None:
+            raise RuntimeError(
+                "publish_draft_rows_direct: no draft pool is registered on "
+                "this cache controller"
+            )
+        publish = getattr(self.mem_pool_host_draft, "publish_direct", None)
+        if publish is None:
+            raise RuntimeError(
+                "publish_draft_rows_direct: the draft host pool "
+                f"{type(self.mem_pool_host_draft).__name__} cannot publish "
+                "directly (the arena host pool is required: "
+                "SGLANG_HICACHE_ARENA_HOST=1)"
+            )
+        if self.storage_backend is None:
+            raise RuntimeError(
+                "publish_draft_rows_direct: no storage backend (L3) to publish into"
+            )
+        n = int(
+            publish(
+                list(hash_values),
+                self._draft_component_name(),
+                device_pool,
+                device_indices,
+                self.storage_backend,
+            )
+        )
+        total = len(hash_values)
+        self._draft_l3_write_issued += n
+        self._draft_l3_write_refused += total - n
+        if n != total:
+            logger.warning(
+                "#706 draft page direct publish: %d of %d page(s) refused by "
+                "the arena (cumulative issued=%d refused=%d)",
+                total - n,
+                total,
+                self._draft_l3_write_issued,
+                self._draft_l3_write_refused,
+            )
+        return n
 
     def disarm_draft_kv_pool(self, reason: str) -> None:
         """#861: leave the draft half unarmed for the phase being entered.

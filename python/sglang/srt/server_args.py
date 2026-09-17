@@ -8430,12 +8430,23 @@ class ServerArgs:
             refuse(f"needs page_size == 1 (got page_size={self.page_size}): a canonical draft page is ONE token's draft layer")
         if not self.hicache_canonical_kv_page:
             refuse("needs --hicache-canonical-kv-page: the draft page rides the canonical page format's geometry-free key")
-        for name in (
-            "speculative_algorithm",
-            "speculative_num_steps",
-            "speculative_eagle_topk",
-            "speculative_num_draft_tokens",
-        ):
+        algo_name = str(self.speculative_algorithm or "").upper()
+        if algo_name == "DFLASH":
+            # The DFlash drafter's identity is its checkpoint + block size;
+            # num_steps/topk are EAGLE's knobs and stay None for it.
+            required = (
+                "speculative_algorithm",
+                "speculative_draft_model_path",
+                "speculative_num_draft_tokens",
+            )
+        else:
+            required = (
+                "speculative_algorithm",
+                "speculative_num_steps",
+                "speculative_eagle_topk",
+                "speculative_num_draft_tokens",
+            )
+        for name in required:
             if getattr(self, name, None) is None:
                 refuse(
                     f"needs --{name.replace('_', '-')} (the decode group's value, byte-for-byte): "

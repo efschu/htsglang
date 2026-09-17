@@ -387,6 +387,51 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
                 dtype=torch.uint64, device=device)
         return self.arena_k_ptrs, self.arena_v_ptrs
 
+    def publish_direct(self, hashes, comp: str, device_pool, device_indices: torch.Tensor,
+                       storage_backend) -> int:
+        """Draft role, PRODUCER path (Weg 2 group P, DFlash): claim one draft
+        slot per page hash, copy the rows straight from ``device_pool`` at
+        ``device_indices`` into the slots, complete them. No target host row
+        is involved and no reader reference is taken: the producer keeps
+        nothing, the page lives in the arena (or on disk after an
+        evict-to-disk round) until a consumer references it. Returns how
+        many of the pages are complete in the arena after this call --
+        freshly written, joined, or already there."""
+        if not hashes:
+            return 0
+        if not self.ensure_bound(storage_backend, role="draft"):
+            raise RuntimeError(
+                "draft arena publish: the draft host pool is not bound to an "
+                "arena (no canonical draft page window or no arena dir)"
+            )
+        if self.row_slot is None:
+            raise RuntimeError("draft arena publish: pool is not bound in the draft role")
+        slots = self._claim(self._stems(hashes, comp))
+        if slots is None:
+            return 0
+        pending_idx = [i for i, s in enumerate(slots) if s in self._pending]
+        complete_idx = [i for i, s in enumerate(slots) if s not in self._pending]
+        if pending_idx:
+            sl = torch.tensor([slots[i] for i in pending_idx], dtype=torch.int64)
+            di = device_indices.reshape(-1)[torch.tensor(pending_idx, device=device_indices.device)]
+            self._backup_arena(device_pool, sl, di)
+            # the all-layer copy runs on the current stream into pinned arena
+            # memory; the completion below publishes the bytes to every rank
+            torch.cuda.current_stream().synchronize()
+            gens = [self._pending[s][0] for s in sl.tolist()]
+            st = self.arena.complete_slots(sl.tolist(), gens, self._own_extents)
+            lost = 0
+            for s, r in zip(sl.tolist(), st):
+                self._pending.pop(s, None)
+                lost += int(r == 3)
+            if lost:
+                logger.warning("#1427 ARENA-COMPLETE LOST %d draft page(s) under the producer", lost)
+        if complete_idx:
+            # _claim took a reader reference on already-complete pages; the
+            # producer holds none.
+            self.arena.ref_slots([slots[i] for i in complete_idx], -1)
+        return len(slots)
+
     def _backup_arena(self, device_pool, slots: torch.Tensor, device_indices: torch.Tensor) -> None:
         """This rank's K and V extents of every page go straight from the
         card into the slot (one all-layer kernel, the arena as the host

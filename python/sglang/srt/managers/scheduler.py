@@ -1635,7 +1635,18 @@ class Scheduler(
         initialize_draft_pp_group()
         if not get_pp_group().is_last_rank:
             return
-        self.draft_kv_producer = DraftKvProducer(self, self.draft_kv_producer_algorithm)
+        if self.draft_kv_producer_algorithm.is_dflash():
+            # DFlash draft-KV producer: chunk ring + hash-keyed direct
+            # publish into the draft arena (dflash_draft_kv_producer).
+            from sglang.srt.speculative.dflash_draft_kv_producer import (
+                DFlashDraftKvProducer,
+            )
+
+            self.draft_kv_producer = DFlashDraftKvProducer(
+                self, self.draft_kv_producer_algorithm
+            )
+        else:
+            self.draft_kv_producer = DraftKvProducer(self, self.draft_kv_producer_algorithm)
         embed_mib = self.draft_kv_producer.load_resident_embedding(self.server_args.model_path)
         draft_model = self.draft_kv_producer.draft_runner.model
         mtp_mib = sum(

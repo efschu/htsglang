@@ -298,6 +298,14 @@ class DFlashWorkerV2(BaseSpecWorker):
             server_args.speculative_draft_window_size
         )
         self.use_compact_draft_cache = self.draft_window_size is not None
+        # Weg 2 group P: --speculative-draft-kv-only turns this worker into a
+        # draft-KV PRODUCER (dflash_draft_kv_producer): no proposals, no
+        # verify, no selector sampler, no graphs; a chunk ring instead of a
+        # pool that mirrors the target's slot space.
+        self.draft_kv_only = bool(
+            getattr(server_args, "speculative_draft_kv_only", False)
+        )
+        self.producer_ring_slots = 0
         self.device = target_worker.device
         # Small solo draft-KV pool (T156 task D): set in alloc_memory_pool
         # on the solo HOST when a policy/gate context cap bounds the DFLASH
@@ -708,6 +716,13 @@ class DFlashWorkerV2(BaseSpecWorker):
         return self._draft_worker
 
     @property
+    def draft_runner(self):
+        # The name the EAGLE family exposes (eagle_worker_v2.draft_runner);
+        # kv_cache_builder.get_draft_kv_pool and the flip's draft bootstrap
+        # reach the draft KV pool through it for every drafter.
+        return self.draft_model_runner
+
+    @property
     def spec_v2_attn_backends(self) -> tuple:
         # Every attn backend a spec_v2 forward touches; consumed by
         # decide_needs_cpu_seq_lens to gate the seq_lens_cpu D2H.
@@ -730,6 +745,41 @@ class DFlashWorkerV2(BaseSpecWorker):
         if self._solo_is_shadow:
             # Shadow rank: NO draft KV pool (the draft never runs here; the
             # solo host holds the whole draft KV). Pure VRAM win.
+            return
+        if self.draft_kv_only:
+            # Producer form (group P): a CHUNK RING the size of one prefill
+            # batch. The rows are published hash-keyed into the draft arena
+            # inside the same produce() call, so nothing outlives the chunk
+            # and no slot of the target pool is mirrored (a mirror would be
+            # 20 KiB x every P slot on the last stage's card).
+            import dataclasses
+
+            ring = int(self.producer_ring_slots or 0)
+            if ring <= 0:
+                raise RuntimeError(
+                    "DFLASH producer: producer_ring_slots is unset; the "
+                    "producer must size the ring before the pools are built"
+                )
+            ring_cfg = dataclasses.replace(
+                memory_pool_config, max_total_num_tokens=ring
+            )
+            self._draft_worker.alloc_memory_pool(
+                memory_pool_config=ring_cfg,
+                req_to_token_pool=None,
+                token_to_kv_pool_allocator=token_to_kv_pool_allocator,
+            )
+            pool_size = int(
+                getattr(self.draft_model_runner.token_to_kv_pool, "size", -1)
+            )
+            if pool_size < ring:
+                raise RuntimeError(
+                    "DFLASH producer: the draft chunk ring was built with "
+                    f"{pool_size} slots, fewer than the {ring} requested"
+                )
+            if self.tp_rank == 0:
+                logger.info(
+                    "DFLASH producer: draft chunk ring of %d slots", pool_size
+                )
             return
         self._solo_pool_mapper = self._maybe_init_solo_small_pool(
             memory_pool_config, token_to_kv_pool_allocator
@@ -903,6 +953,14 @@ class DFlashWorkerV2(BaseSpecWorker):
         if self._solo_is_shadow:
             # Shadow rank: capture NO draft graphs (the draft forward never
             # runs here).
+            return
+        if self.draft_kv_only:
+            # Producer form: no draft round ever runs, so no verify/decode
+            # graph and no greedy-head sampler. The eager-only terminal state
+            # is installed by the draft worker's own init (the same refusal
+            # DraftKvProducer.init_cuda_graphs relies on), never by skipping
+            # the call.
+            self._draft_worker.init_cuda_graphs(capture_decode_cuda_graph=False)
             return
         if self._spec_solo_is_host:
             # Solo host: the draft graphs capture rank-locally (weight-TP=1,
