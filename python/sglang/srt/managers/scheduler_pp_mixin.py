@@ -4117,6 +4117,17 @@ class SchedulerPPMixin:
                         and self.ps.pp_rank != 0
                     ):
                         _chain_gate = self._pp_row_chain_pending()
+                    if self.ps.pp_rank != 0:  # #1460: the follower's gate verdict, at most every 250 ms
+                        _now = time.time()
+                        if _now - float(getattr(self, "_1460_last", 0.0) or 0.0) >= 0.25:
+                            self._1460_last = _now
+                            try:
+                                logger.info("#1460 FOLLOWER-GATE gate=%s proxy=%s mbs=%d chunked=%s t=%.3f",
+                                            _chain_gate, self._pp_row_any_proxy_signal(),
+                                            sum(1 for b in self.mbs if b is not None),
+                                            getattr(self, "chunked_req", None) is not None, _now)
+                            except Exception:  # noqa: BLE001
+                                pass
                     if _chain_gate is None or _chain_gate:
                         recv_reqs = self.request_receiver.recv_requests()
                         # #1071: the ring moved for this rank -- every slot's
@@ -5961,6 +5972,14 @@ class SchedulerPPMixin:
             _wire_reqs = recv_reqs
             if weg2_store_told.armed(self) and weg2_store_told.is_pp0(self):
                 _wire_reqs = weg2_store_told.pp0_publish(self, recv_reqs)
+            try:  # #1460: when did PP0 put a Weg-2 control request on the chain?
+                _ctrl = [type(r).__name__ for r in (_wire_reqs or ())
+                         if type(r).__name__ in ("FlushCacheReqInput", "ReleaseMemoryOccupationReqInput",
+                                                 "ResumeMemoryOccupationReqInput")]
+                if _ctrl:
+                    logger.info("#1460 CTRL-FWD kinds=%s n_wire=%d t=%.3f", _ctrl, len(_wire_reqs or ()), time.time())
+            except Exception:  # noqa: BLE001
+                pass
             with torch.profiler.record_function("send_reqs_to_next_stage"):
                 self.send_req_work = self._pp_send_pyobj_to_next_stage(
                     _wire_reqs,
