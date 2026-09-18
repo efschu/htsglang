@@ -88,3 +88,17 @@ def test_join_of_a_live_claim_is_status_1_not_fresh(tmp_path):
     assert [s for s, _, _ in g2] == [s for s, _, _ in g1]
     assert all(st == 1 for _, st, _ in g2)
     assert a.stats()["claimed"] == 64
+
+
+def test_claim_by_stems_hashes_in_c_like_python(tmp_path):
+    from sglang.srt.mem_cache.storage.file.hicache_arena import key128
+    a = _arena(tmp_path, 2048)
+    st = _stems("h", 300)
+    got = _claim(a, st)
+    assert all(s == 0 for _, s, _ in got)
+    # the C hash agrees with the Python one: find by stem lands on the same slots
+    found = a.find_slots(st)
+    assert [s for s, _ in found] == [s for s, _, _ in got]
+    # and the header keys equal key128
+    lo, hi = a._keys(st[:1])
+    assert (int(lo[0]), int(hi[0])) == key128(st[0])

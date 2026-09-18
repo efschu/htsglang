@@ -20,6 +20,7 @@
 #define _GNU_SOURCE
 #include <stdatomic.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 
 #define A_MAGIC 0x41524e4132363931ULL /* "ARNA2691" */
@@ -469,6 +470,24 @@ int64_t arena_find_slots(uint8_t *base, int64_t n, const uint64_t *klo, const ui
  * earlier writer (join: write your extents, then complete), 2 = already
  * COMPLETE (nothing to write), 3 = too large, 4 = no free slot. gen_out is
  * the slot generation to hand back to arena_complete. */
+static void stem_key128(const char *stem, uint64_t *lo, uint64_t *hi);
+int64_t arena_claim(uint8_t *base, int64_t n, const uint64_t *klo, const uint64_t *khi,
+                    const int64_t *totals, const char **stems, int64_t *slots_out,
+                    int64_t *gen_out, int8_t *status);
+
+/* xsn350: the stems' 128-bit keys hashed HERE (py-spy PP0: key128 in Python
+ * was ~30 ms per 4096-page node of the chunk publish, in the scheduler thread). */
+int64_t arena_claim_stems(uint8_t *base, int64_t n, const char **stems, const int64_t *totals,
+                          int64_t *slots_out, int64_t *gen_out, int8_t *status) {
+    uint64_t *klo = (uint64_t *)malloc(sizeof(uint64_t) * (size_t)(n > 0 ? n : 1));
+    uint64_t *khi = (uint64_t *)malloc(sizeof(uint64_t) * (size_t)(n > 0 ? n : 1));
+    if (!klo || !khi) { free(klo); free(khi); return -1; }
+    for (int64_t i = 0; i < n; i++) stem_key128(stems[i], &klo[i], &khi[i]);
+    int64_t ok = arena_claim(base, n, klo, khi, totals, stems, slots_out, gen_out, status);
+    free(klo); free(khi);
+    return ok;
+}
+
 int64_t arena_claim(uint8_t *base, int64_t n, const uint64_t *klo, const uint64_t *khi,
                     const int64_t *totals, const char **stems, int64_t *slots_out,
                     int64_t *gen_out, int8_t *status) {

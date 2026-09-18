@@ -99,6 +99,8 @@ def _load_lib() -> Optional[ctypes.CDLL]:
             lib.arena_claim.restype = i64
             lib.arena_claim.argtypes = [p_u8, i64, p_u64, p_u64, p_i64,
                                         ctypes.POINTER(ctypes.c_char_p), p_i64, p_i64, p_i8]
+            lib.arena_claim_stems.restype = i64
+            lib.arena_claim_stems.argtypes = [p_u8, i64, ctypes.POINTER(ctypes.c_char_p), p_i64, p_i64, p_i64, p_i8]
             lib.arena_complete.restype = i64
             lib.arena_complete.argtypes = [p_u8, i64, p_i64, p_i64, p_i64, p_i64, p_i64, p_i8]
             lib.arena_ref_slots.restype = i64
@@ -290,13 +292,17 @@ class ShmArena:
         n = len(stems)
         if n == 0:
             return []
-        lo, hi = self._keys(stems)
         c_tot = (ctypes.c_int64 * n)(*[int(t) for t in totals])
         c_stems = (ctypes.c_char_p * n)(*[s.encode("utf-8") for s in stems])
         slots = (ctypes.c_int64 * n)()
         gens = (ctypes.c_int64 * n)()
         st = (ctypes.c_int8 * n)()
-        self._lib.arena_claim(self._base, n, lo, hi, c_tot, c_stems, slots, gens, st)
+        # xsn350: keys hashed in C (arena_claim_stems); the Python key128 per
+        # stem was ~30 ms per 4096-page node in the scheduler thread.
+        rc = self._lib.arena_claim_stems(self._base, n, c_stems, c_tot, slots, gens, st)
+        if rc < 0:
+            lo, hi = self._keys(stems)
+            self._lib.arena_claim(self._base, n, lo, hi, c_tot, c_stems, slots, gens, st)
         return [(int(slots[i]), int(st[i]), int(gens[i])) for i in range(n)]
 
     def complete_slots(self, slots: Sequence[int], gens: Sequence[int], extents) -> list[int]:
