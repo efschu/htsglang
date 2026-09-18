@@ -50,3 +50,17 @@ def test_the_kv_block_is_one_closure_called_early_or_late():
     assert "_weg2_kv_resume_part()" in early and "weg2_dormant = False" not in early
     rp = src.index("        def _weg2_kv_resume_part():"); cp = src.index("        def _weg2_kv_clear_part():")
     assert "weg2_dormant = False" not in src[rp:cp] and "weg2_dormant = False" in src[cp:cp + 2000]
+
+
+def test_the_early_kv_only_call_defers_the_cuda_graph_resume():
+    from sglang.srt.managers.scheduler_components import weight_updater as wu
+    src = open(wu.__file__).read()
+    assert "_weg2_graph_deferred: bool = False" in src
+    k = src.index('if _plan == "early":')
+    assert "self._weg2_graph_deferred = True" in src[k:k + 900]
+    g = src.index("        def _weg2_graph_block():")
+    assert "self.memory_saver_adapter.resume(GPU_MEMORY_TYPE_CUDA_GRAPH)" in src[g:g + 600]
+    assert "if GPU_MEMORY_TYPE_CUDA_GRAPH in tags and not self._weg2_graph_deferred:" in src
+    l = src.index("if self._weg2_graph_deferred:\n                _weg2_graph_block()")
+    assert l > src.index("thread_name_prefix=\"weg2-wake-collect\"", g)  # late: after the legs
+

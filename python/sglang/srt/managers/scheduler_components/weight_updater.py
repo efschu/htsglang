@@ -572,6 +572,7 @@ class SchedulerWeightUpdaterManager:
     _weg2_sleep_count: int = 0
     _weg2_kv_deferred: bool = False       # Wake-Parallel: kv resume deferred to the weights call
     _weg2_kv_epoch_done: object = None    # Wake-Parallel: flip epoch whose kv resume is done
+    _weg2_graph_deferred: bool = False    # Wake-Parallel: cuda_graph resume deferred to the weights call
     #: #1452b: snapshot counter -- slots=True, so it is a FIELD (boot weg2xsn208
     #: printed 'n/a (AttributeError ... _1452_snapshots)' on every rank).
     _1452_snapshots: int = 0
@@ -7233,9 +7234,10 @@ class SchedulerWeightUpdaterManager:
             _weg2_kv_resumed_early = True
             self._weg2_kv_deferred = False
             if not any(is_weights_family_tag(t) for t in tags):
-                # a kv-only call: the CLEAR half belongs to the weights call
-                # (its late site), which arrives with or after the legs
+                # a kv-only call: the CLEAR half and the cuda_graph resume belong
+                # to the weights call (its late site), after the legs
                 self._weg2_kv_deferred = True
+                self._weg2_graph_deferred = True
                 _weg2_kv_done = True
         elif _plan == "defer":
             self._weg2_kv_deferred = True
@@ -7248,7 +7250,10 @@ class SchedulerWeightUpdaterManager:
         for tag in tags:
             self.offload_tags.remove(tag)
 
-        if GPU_MEMORY_TYPE_CUDA_GRAPH in tags:
+        def _weg2_graph_block():
+            # Wake-Parallel (xsn317): the cuda_graph resume references weight VA;
+            # it must never run before the weight legs. An early kv-only call
+            # defers it to the weights call's late site.
             t_graph = time.perf_counter()
             self.memory_saver_adapter.resume(GPU_MEMORY_TYPE_CUDA_GRAPH)
             _weg2_ph("cg_resume")
@@ -7281,6 +7286,18 @@ class SchedulerWeightUpdaterManager:
                 GPU_MEMORY_TYPE_CUDA_GRAPH,
             )
 
+        if GPU_MEMORY_TYPE_CUDA_GRAPH in tags and not self._weg2_graph_deferred:
+            _weg2_graph_block()
+        elif GPU_MEMORY_TYPE_CUDA_GRAPH in tags:
+            logger.info("WEG2-WAKE-KV-FIRST cuda_graph deferred to the weights call (legs first)")
+            try:
+                if GPU_MEMORY_TYPE_CUDA_GRAPH not in self.offload_tags:
+                    self.offload_tags.add(GPU_MEMORY_TYPE_CUDA_GRAPH)
+            except Exception:  # noqa: BLE001 -- list-typed offload_tags
+                try:
+                    self.offload_tags.append(GPU_MEMORY_TYPE_CUDA_GRAPH)
+                except Exception:  # noqa: BLE001
+                    pass
         weights_tags = [t for t in tags if is_weights_family_tag(t)]
         # 2026-09-15: per-LEG lane counters (buffer slot, drain rule) -- both
         # sides walk the same tags per leg, so both start at 0 here.
@@ -7750,6 +7767,9 @@ class SchedulerWeightUpdaterManager:
         if (GPU_MEMORY_TYPE_KV_CACHE in tags or self._weg2_kv_deferred) and not _weg2_kv_done:
             # the late site: legs first, then kv (old order), or the CLEAR half of
             # a kv resume that already happened early (this call or a deferred one)
+            if self._weg2_graph_deferred:
+                _weg2_graph_block()  # the weights are resident now
+                self._weg2_graph_deferred = False
             if _weg2_kv_resumed_early or self._weg2_kv_epoch_done == _kv_epoch:
                 _weg2_kv_clear_part()
             else:
