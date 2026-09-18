@@ -2931,9 +2931,8 @@ class Front:
         """#1443: D takes leg-2 requests when awake, and -- dormant-admit armed --
         while it is dormant behind an awake P (it holds them until the wake).
         Never mid-flip: the phase must be settled."""
-        if self.awake == "D":
-            return True
-        return bool(self.dormant_admit) and self.awake == "P" and self.state == "serving"
+        from sglang.srt.weg2.retain_publish import d_accepts_leg2 as _acc
+        return _acc(self.awake, self.state, self.dormant_admit)   # xsn347: also during the P->D flip
 
     def _log_admit(self, rid: str, source: str, t_arrive: float, rank: Optional[int] = None) -> None:
         """L2.  ``rank`` is this admission's ORDINAL in the current epoch.

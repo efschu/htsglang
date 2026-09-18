@@ -50,7 +50,7 @@ def test_scheduler_holds_the_w88_bound_while_dormant_and_sweep_takes_first():
     assert 'return "stalled"' in src[i:i + 900]
     from sglang.srt.mem_cache import unified_radix_cache as u
     s2 = inspect.getsource(u.UnifiedRadixCache.publish_unbacked_sweep)
-    assert "queue = list(first or []) + [self.root_node]" in s2
+    assert "queue = list(first or []) + ([] if chain_only else [self.root_node])" in s2
 
 
 def test_chunk_publish_gate_and_budget():
@@ -70,3 +70,20 @@ def test_chunk_site_publishes_after_the_cleanup():
     assert "self._weg2_publish_at_chunk(req, radix_key)" in src[i:]
     s2 = inspect.getsource(u.UnifiedRadixCache._weg2_publish_at_chunk)
     assert "chunk_budget_s()" in s2 and "first=first" in s2
+
+
+def test_d_accepts_leg2_also_during_the_p_to_d_flip():
+    assert rp.d_accepts_leg2("D", "flipping", False)
+    assert rp.d_accepts_leg2("P", "serving", True)
+    assert rp.d_accepts_leg2("P", "flipping", True)
+    assert not rp.d_accepts_leg2("P", "flipping", False)
+    assert not rp.d_accepts_leg2("P", "STOP", True)
+
+
+def test_chunk_sweep_is_chain_only():
+    import inspect
+    from sglang.srt.mem_cache import unified_radix_cache as u
+    s = inspect.getsource(u.UnifiedRadixCache._weg2_publish_at_chunk)
+    assert "chain_only=True" in s
+    s2 = inspect.getsource(u.UnifiedRadixCache.publish_unbacked_sweep)
+    assert "([] if chain_only else [self.root_node])" in s2

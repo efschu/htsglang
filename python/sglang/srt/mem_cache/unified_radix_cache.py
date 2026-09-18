@@ -3326,7 +3326,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 return
             stats = self.publish_unbacked_sweep(max_issue=_rp.max_issue(),
                                                 clock=_rp.SweepClock(_rp.chunk_budget_s()),
-                                                first=first) or {}
+                                                first=first, chain_only=True) or {}
             n = getattr(self, "_weg2_chunk_publish_n", 0) + 1
             self._weg2_chunk_publish_n = n
             if n <= 16 or n % 256 == 0:
@@ -3568,7 +3568,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                            getattr(node, "id", "?"), type(e).__name__, e)
             return None
 
-    def publish_unbacked_sweep(self, max_issue: int = 64, clock=None, first=None) -> dict:
+    def publish_unbacked_sweep(self, max_issue: int = 64, clock=None, first=None, chain_only: bool = False) -> dict:
         """#1233 zero-remainder: back every un-backed device node up before a flush.
 
         The hand-back seam. The Weg-2 front quiesces a group through
@@ -3593,9 +3593,11 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             return stats
         from sglang.srt.weg2 import retain_publish as _rp
         self._weg2_sweep_last_refusal = None
-        queue = list(first or []) + [self.root_node]   # xsn344: the retain's own chain first
+        queue = list(first or []) + ([] if chain_only else [self.root_node])   # xsn344: the retain's own chain first
         while queue:
             node = queue.pop(0)
+            if chain_only and node is not self.root_node and node not in first:
+                continue   # xsn347: the chunk sweep walks the chain only (the BFS cost 109 ms per chunk)
             # xsn342: a bounded sweep -- wall budget (retain) and a full mamba
             # arena end it; the remaining nodes stay unbacked for the next one.
             if clock is not None and clock.expired():

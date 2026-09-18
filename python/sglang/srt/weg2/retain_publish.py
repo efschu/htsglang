@@ -107,3 +107,16 @@ def chunk_budget_s(env: Optional[Mapping[str, str]] = None) -> float:
     except ValueError:
         ms = 150.0
     return max(0.0, ms) / 1000.0
+
+
+def d_accepts_leg2(awake: str, state: str, dormant_admit: bool) -> bool:
+    """xsn347: the LAST request of a phase finished P at 17:14:18.8 and the
+    flip began in the same instant; the front admitted it to D only after
+    the wake (17:14:22), so its dormant read ran AFTER the legs and it was
+    extended 2 s behind the others. D takes leg 2 when awake, and -- dormant
+    admit armed -- while it sleeps behind P, INCLUDING the P->D flip itself
+    (awake is still 'P' until the wake returns; D holds the request and its
+    read runs during the legs)."""
+    if awake == "D":
+        return True
+    return bool(dormant_admit) and awake == "P" and state in ("serving", "flipping")
