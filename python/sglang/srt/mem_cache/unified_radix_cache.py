@@ -1624,12 +1624,6 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
     def cache_unfinished_req(self, req: Req, chunked: bool = False, **kwargs) -> None:
         if self.session.try_cache_unfinished_req(req, chunked=chunked, **kwargs):
             return
-        # xsn358: publish the PREVIOUS chunk's chain (req.last_node) HERE, before
-        # prepare_for_caching_req's mamba-slot allocation waits for the card --
-        # the sweep's CPU work then overlaps the forward instead of sitting on
-        # the pass tail (py-spy PP0 xsn357: _alloc_mamba_slot 265 samples of
-        # waiting, publish 87 behind it; bubble_ms 719 -> 876 per chunk).
-        self._weg2_publish_at_chunk(req, None)
 
         token_ids = req.get_fill_ids()
 
@@ -1785,6 +1779,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 insert_result=result,
                 insert_params=insert_params,
             )
+        self._weg2_publish_at_chunk(req, radix_key)   # xsn346: the chunk's node goes out now
 
     # ---- Internal Helpers ----
 
