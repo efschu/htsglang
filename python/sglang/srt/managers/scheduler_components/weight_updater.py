@@ -4143,6 +4143,47 @@ class SchedulerWeightUpdaterManager:
         except Exception:  # noqa: BLE001
             pass
 
+    def _weg2_preload_hold(self) -> int:
+        """18.09. (Flip-Schwanz): the held requests' host pages start loading
+        into the (just resumed) kv pool NOW -- the same match + init_load_back
+        the adder runs at init_new, on the same thread (the wake handler IS
+        the scheduler thread), so the first extend pass finds them on the
+        device. Returns the number of requests with a load issued."""
+        sched = self.scheduler
+        hold = list(getattr(sched, "weg2_dormant_hold", None) or []) if sched is not None else []
+        if not hold:
+            return 0
+        from sglang.srt.managers import schedule_policy as sp
+        tree = sched.tree_cache
+        n = 0
+        t0 = time.perf_counter()
+        for req in hold:
+            try:
+                sp.match_prefix_for_req(tree, req, include_req=True)
+                ext = sp._pp_load_back_extent(req)
+                if not ext:
+                    logger.info("WEG2-PRELOAD rid=%s no host extent (device hit %d)",
+                                str(getattr(req, "rid", "?"))[:12], len(getattr(req, "prefix_indices", []) or []))
+                    continue
+                res = tree.inc_lock_ref(req.last_node)
+                dec = res.to_dec_params() if tree.is_tree_cache() else None
+                old_last = req.last_node
+                try:
+                    req.mamba_loadback_anchor_adopted = False
+                    new_indices, req.last_node = tree.init_load_back(
+                        sp.InitLoadBackParams(best_match_node=req.best_match_node,
+                                              host_hit_length=ext, req=req))
+                finally:
+                    if dec is not None:
+                        tree.dec_lock_ref(old_last, dec)
+                n += 1
+                logger.info("WEG2-PRELOAD rid=%s extent=%d issued=%d tokens",
+                            str(getattr(req, "rid", "?"))[:12], int(ext), int(new_indices.numel()))
+            except Exception as exc:  # noqa: BLE001 -- init_new loads it later as before
+                logger.info("WEG2-PRELOAD rid=%s skipped: %r", str(getattr(req, "rid", "?"))[:12], exc)
+        logger.info("WEG2-PRELOAD held=%d issued=%d ms=%.0f", len(hold), n, (time.perf_counter() - t0) * 1000)
+        return n
+
     def _weg2_tag_done_set(self, tag) -> None:
         """Mark this tag's collect as through for the tag-order gate."""
         try:
@@ -7766,6 +7807,36 @@ class SchedulerWeightUpdaterManager:
                                 tag, weg2_per_tag[tag][1],
                                 time.time() - (time.perf_counter() - t_tag),
                                 time.time())
+                    # 18.09. (Flip-Schwanz): the kv pool comes back MID-LEGS as soon
+                    # as the card funds it plus the next tag, and the held
+                    # requests' pages start loading while the remaining legs run
+                    # (xsn368: 1.1 s of init_new loads AFTER the wake).
+                    if (_kv_in and _plan == "late" and not _weg2_kv_resumed_early
+                            and not (_kv_epoch is not None and self._weg2_kv_resumed_epoch == _kv_epoch)
+                            and str(os.environ.get("SGLANG_WEG2_WAKE_KV_MID", "1")).strip().lower()
+                            not in ("0", "false", "no", "off")):
+                        try:
+                            from sglang.srt.weg2.wake_kv import kv_mid_ok as _kv_mid_ok
+                            _ti_mid = list(weights_tags).index(tag)
+                            _next = list(weights_tags)[_ti_mid + 1] if _ti_mid + 1 < len(weights_tags) else None
+                            _next_need = int(tag_bytes.get(_next, 0) or 0) if _next is not None else 0
+                            _kv_need = int(self._weg2_tag_bytes(GPU_MEMORY_TYPE_KV_CACHE) or 0)
+                            _free_mid = self._weg2_free_bytes()
+                            _floor_mid = int(self._weg2_corridor_floor_bytes() or 0)
+                            _mid_ok = _kv_mid_ok(_free_mid, _floor_mid, _kv_need, _next_need)
+                            logger.info("WEG2-WAKE-KV-MID %s after tag=%s free=%s MiB floor=%d MiB kv=%d MiB "
+                                        "next=%s(%d MiB)", "RESUME" if _mid_ok else "wait", tag,
+                                        (int(_free_mid) >> 20) if _free_mid is not None else None,
+                                        _floor_mid >> 20, _kv_need >> 20, _next, _next_need >> 20)
+                            if _mid_ok:
+                                _t_mid = time.perf_counter()
+                                _weg2_kv_resume_part()
+                                _weg2_kv_resumed_early = True
+                                _n_pre = self._weg2_preload_hold()
+                                logger.info("WEG2-WAKE-KV-MID resumed after tag=%s preload=%d ms=%.0f",
+                                            tag, _n_pre, (time.perf_counter() - _t_mid) * 1000)
+                        except Exception as _mid_exc:  # noqa: BLE001 -- the late site stays
+                            logger.info("WEG2-WAKE-KV-MID skipped after tag=%s: %r", tag, _mid_exc)
                     from sglang.srt.managers.weg2_memory_saver import (
                         GPU_MEMORY_TYPE_WEIGHTS_DRAFT as _WEIGHTS_DRAFT_TAG,
                     )

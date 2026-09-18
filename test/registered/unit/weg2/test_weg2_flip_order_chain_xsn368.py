@@ -28,3 +28,13 @@ def test_identity_when_disabled_one_card_or_no_map():
     assert front.interleave_chain_card(TIGHTEST, "w", {}, env={}) == (TIGHTEST, "w")
     one = {t: (1,) for t in CARDS}
     assert front.interleave_chain_card(TIGHTEST, "w", one, env={}) == (TIGHTEST, "w")
+
+
+def test_kv_mid_legs_needs_the_pool_and_the_next_tag():
+    from sglang.srt.weg2.wake_kv import kv_mid_ok
+    gib = 1 << 30
+    assert kv_mid_ok(20 * gib, 1 * gib, 12 * gib, 2 * gib)          # 20-1-0.25 >= 14
+    assert not kv_mid_ok(15 * gib, 1 * gib, 12 * gib, 2 * gib)      # 13.75 < 14
+    assert not kv_mid_ok(None, 0, 12 * gib, 0)
+    assert not kv_mid_ok(20 * gib, 0, 0, 0)
+    assert kv_mid_ok(13 * gib, 0, 12 * gib, 0)                       # last tag: no next need

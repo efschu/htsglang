@@ -45,3 +45,17 @@ def wake_kv_plan(*, kv_in_tags: bool, weights_in_tags: bool, fundable: bool,
     if kv_in_tags and not weights_in_tags:
         return "defer"
     return "late"
+
+
+def kv_mid_ok(free_bytes, floor_bytes: int, kv_bytes: int, next_tag_bytes: int,
+              margin_bytes: int = 256 << 20) -> bool:
+    """18.09. (Nutzer-Punkt 2, Flip-Schwanz): may the kv_cache pool come back
+    MID-LEGS -- after this tag's resume, before the next one -- so the held
+    requests' pages load while the remaining legs run? Only when the card
+    funds the pool AND the next tag's resume right now (P's later pauses fund
+    the tags after that, one pause > one resume); the credit wait behind the
+    ring would otherwise chase its own tail (deposit needs collect needs
+    resume needs VRAM needs P's pause needs deposit)."""
+    if free_bytes is None or int(kv_bytes) <= 0:
+        return False
+    return int(free_bytes) - int(floor_bytes) - int(margin_bytes) >= int(kv_bytes) + int(next_tag_bytes)
