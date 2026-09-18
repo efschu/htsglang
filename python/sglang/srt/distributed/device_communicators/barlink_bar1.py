@@ -184,6 +184,33 @@ from sglang.srt.distributed.device_communicators.barlink_liveness import (
 _resolve_timeout_cycles = None
 
 
+
+def _untagged_alloc():
+    """A context in which torch allocations bypass the memory saver's tag
+    region (torch_memory_saver.disable()); a no-op context when the saver is
+    absent or not preloaded (desk, tests) -- the saver asserts at __enter__,
+    so the fallback is taken there, not at construction."""
+    import contextlib
+
+    @contextlib.contextmanager
+    def _cm():
+        cm = None
+        try:
+            import torch_memory_saver as _tms
+            cm = _tms.torch_memory_saver.disable()
+            cm.__enter__()
+        except Exception:  # noqa: BLE001 -- no saver / no preload: plain allocations
+            cm = None
+        try:
+            yield
+        finally:
+            if cm is not None:
+                try:
+                    cm.__exit__(None, None, None)
+                except Exception:  # noqa: BLE001
+                    pass
+    return _cm()
+
 def resolve_timeout_cycles(base_cycles: int) -> int:
     """Deadline for a device collective right now -- see utils/jit_cold_build.
 
@@ -2834,8 +2861,14 @@ class BarlinkBar1Transport:
         # the round in word 1 (word 2), which is the round whose payload lines
         # it is about to overwrite. Local VRAM, never touched by a peer -- what
         # crosses the aperture are the ack lines in the flag region.
-        self._round_dev = torch.zeros(3, dtype=torch.int64, device=self.device)
-        self._ctl_dev = torch.zeros(2, dtype=torch.int32, device=self.device)
+        # Wake-Parallel (18.09., xsn317/318): these words are read by the BAR1
+        # status/abort polls at any time, including while a memory-saver tag
+        # region is paused or being resumed under them. Allocated UNTAGGED
+        # (memory saver disabled for the two allocations) so no phase
+        # release, pause or early resume ever remaps their backing.
+        with _untagged_alloc():
+            self._round_dev = torch.zeros(3, dtype=torch.int64, device=self.device)
+            self._ctl_dev = torch.zeros(2, dtype=torch.int32, device=self.device)
         # #517: arm the deferred status read now that the word exists.
         self._arm_status_stage()
         # #616f: and the watchdog's private-stream read of the same word.
