@@ -2705,18 +2705,31 @@ class HiCacheFile(HiCacheStorage):
         one C call; None when no arena / no canonical KV window (the caller
         keeps the per-key path). The pages beyond the answer may still be on
         the disk -- the caller checks that remainder the old way."""
+        _pn = getattr(type(self), "_1439_present_n", 0) + 1
+        type(self)._1439_present_n = _pn
         if not keys or not self._arena_dir() or self._canonical_kv_extents is None:
+            if _pn <= 12 or _pn % 512 == 0:
+                logger.info("#1439 ARENA-PRESENT n=%d keys=%d -> None (arena_dir=%s kv_extents=%s)", _pn, len(keys),
+                            bool(self._arena_dir()), self._canonical_kv_extents is not None)
             return None
         arena = self._arena_for(int(self._canonical_kv_extents.total_bytes))
         if arena is None:
+            if _pn <= 12 or _pn % 512 == 0:
+                logger.info("#1439 ARENA-PRESENT n=%d keys=%d -> None (no arena for total=%d)", _pn, len(keys),
+                            int(self._canonical_kv_extents.total_bytes))
             return None
         sfx = self._suffix_for_key(keys[0])[0]
         stems = [k + sfx for k in keys]
         n = 0
-        for st in arena.find_states(stems):
+        _states = arena.find_states(stems)
+        for st in _states:
             if st != 2:
                 break
             n += 1
+        if _pn <= 12 or _pn % 512 == 0:
+            # xsn327: the dormant hit query answers 0 while P completed the pages
+            logger.info("#1439 ARENA-PRESENT n=%d keys=%d leading_complete=%d first_stem=%s states3=%s arena=%s",
+                        _pn, len(keys), n, stems[0], list(_states[:3]), getattr(arena, "path", "?"))
         return n
 
     def _readable_stems(self, stems: List[str]) -> List[str]:

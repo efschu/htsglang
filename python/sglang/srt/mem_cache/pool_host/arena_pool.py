@@ -572,6 +572,14 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
         arena = self.arena
         totals = [self._page_bytes] * len(stems)
         got = arena.claim_slots(stems, totals)
+        # xsn327: D's dormant re-reads never find P's pages -- name what P claims
+        # (full stem incl. suffix) so the reader's stem can be compared by eye.
+        _cn = getattr(ArenaMHAHostPool, "_1427_claim_n", 0) + 1
+        ArenaMHAHostPool._1427_claim_n = _cn
+        if _cn <= 12 or _cn % 512 == 0:
+            logger.info("#1427 ARENA-CLAIM n=%d stems=%d first=%s last=%s statuses=%s arena=%s",
+                        _cn, len(stems), stems[0] if stems else "-", stems[-1] if stems else "-",
+                        sorted({st for _, st, _ in got}), getattr(arena, "path", "?"))
         if any(st in (3, 4) for _, st, _ in got):
             ev = getattr(self._backend, "_arena_evict_to_disk", None)
             if callable(ev) and any(st == 4 for _, st, _ in got):
