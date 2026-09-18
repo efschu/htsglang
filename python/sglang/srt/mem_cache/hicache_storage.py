@@ -2571,6 +2571,10 @@ class HiCacheFile(HiCacheStorage):
     def _arena_evict_to_disk(self, arena, want: int) -> int:
         """Move up to `want` complete, unreferenced, unpinned pages from the
         arena to the disk store (the cold tier), then free their slots."""
+        _en = getattr(type(self), "_evict_log_n", 0) + 1
+        type(self)._evict_log_n = _en
+        if _en <= 16 or _en % 64 == 0:
+            logger.info("ARENA-EVICT n=%d want=%d (arena clock: COMPLETE unreferenced slots go to disk and FREE -- xsn328)", _en, int(want))
         from sglang.srt.mem_cache.storage.file.pageio import load as _load_pageio
         from sglang.srt.mem_cache.canonical_page_store import canonical_fsync_default
 
@@ -2726,10 +2730,17 @@ class HiCacheFile(HiCacheStorage):
             if st != 2:
                 break
             n += 1
-        if _pn <= 12 or _pn % 512 == 0:
-            # xsn327: the dormant hit query answers 0 while P completed the pages
-            logger.info("#1439 ARENA-PRESENT n=%d keys=%d leading_complete=%d first_stem=%s states3=%s arena=%s",
-                        _pn, len(keys), n, stems[0], list(_states[:3]), getattr(arena, "path", "?"))
+        if _pn <= 24 or _pn % 512 == 0:
+            # xsn327/328: the dormant hit query answers 0 while P completed the
+            # pages; xsn328 showed leading_complete=64 of 4314 -- name the state
+            # at the break and the state census over the asked range.
+            _hist = {}
+            for st in _states:
+                _hist[int(st)] = _hist.get(int(st), 0) + 1
+            _brk = int(_states[n]) if n < len(_states) else -1
+            _brk_stem = stems[n] if n < len(stems) else "-"
+            logger.info("#1439 ARENA-PRESENT n=%d keys=%d leading_complete=%d break_state=%d break_stem=%s census=%s first_stem=%s arena=%s",
+                        _pn, len(keys), n, _brk, _brk_stem[:64], sorted(_hist.items()), stems[0][:64], getattr(arena, "path", "?"))
         return n
 
     def _readable_stems(self, stems: List[str]) -> List[str]:

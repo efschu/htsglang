@@ -341,6 +341,13 @@ class ShmArena:
         return memoryview(self._mm)[off:off + int(nbytes)]
 
     def free_slots(self, slots: Sequence[int]) -> None:
+        # xsn328: who frees which slots (D's dormant re-reads found P's pages FREE/CLAIMED again)
+        _fn = getattr(type(self), "_free_log_n", 0) + 1
+        type(self)._free_log_n = _fn
+        if _fn <= 16 or _fn % 256 == 0:
+            import traceback as _tb
+            _caller = "".join(_tb.format_stack(limit=4)[:-1]).strip().replace("\n", " | ")[-300:]
+            logger.info("ARENA-FREE n=%d slots=%d first=%s caller=%s", _fn, len(slots), (list(slots)[:3] if slots else []), _caller)
         n = len(slots)
         if n == 0:
             return
