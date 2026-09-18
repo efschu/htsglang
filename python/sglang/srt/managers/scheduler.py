@@ -5939,6 +5939,12 @@ class Scheduler(
                     _cc.WEG2_HANDOFF_PAGE_KEYS[req.rid] = _span
                 else:
                     _cc.WEG2_HANDOFF_PAGE_KEYS.pop(req.rid, None)
+                _hr = getattr(self, "_1442_reg_n", 0) + 1
+                self._1442_reg_n = _hr
+                if _hr <= 12 or _hr % 256 == 0:
+                    logger.info("#1442 HANDOFF-KEYS REG rid=%r handoff=%s matched=%d new=%d span=%d (n=%d)",
+                                req.rid, len(_hd) if _hd else None, int(_matched_len), len(new_input_tokens),
+                                len(_span) if _span else 0, _hr)
         except Exception as exc:  # noqa: BLE001 -- the hand-off is a shortcut, never a gate
             logger.info("#1442 HANDOFF-KEYS n/a rid=%s (%s: %s)", req.rid, type(exc).__name__, exc)
 

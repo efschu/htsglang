@@ -3516,6 +3516,13 @@ class HiCacheController:
         # offset=2 for a from-root read of 4314 of 4316 ids)
         _hk = WEG2_HANDOFF_PAGE_KEYS.get(operation.request_id) or getattr(operation, "weg2_page_keys", None)
         _k = min(len(_hk), len(page_hashes)) if _hk else 0
+        if _k == 0 and str(operation.request_id).startswith("weg2-"):
+            _hn0 = getattr(self, "_1442_nokeys_n", 0) + 1
+            self._1442_nokeys_n = _hn0
+            if _hn0 <= 12 or _hn0 % 256 == 0:
+                logger.info("#1442 HANDOFF-KEYS NONE rid=%r pages=%d registry=%s op_keys=%s (n=%d)",
+                            operation.request_id, len(page_hashes), sorted(WEG2_HANDOFF_PAGE_KEYS.keys())[:6],
+                            len(getattr(operation, "weg2_page_keys", None) or []), _hn0)
         if _k > 0:
             # P's list is one page short of the ids (the last token has no
             # cached page): P's keys for the covered prefix, own hashes after.
