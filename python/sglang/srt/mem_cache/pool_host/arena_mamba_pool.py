@@ -205,6 +205,10 @@ class ArenaMambaPoolHost(MambaPoolHost):
     complete_write = ArenaMHAHostPool.complete_write
     abort_write = ArenaMHAHostPool.abort_write
     _slots_of = ArenaMHAHostPool._slots_of
+    # xsn356: the borrowed _claim/complete_write/abort_write call these too
+    _pend_mark = ArenaMHAHostPool._pend_mark
+    _pend_pop = ArenaMHAHostPool._pend_pop
+    _pending_mask = None   # the mamba pool keeps the dict only (1 state per node)
 
     def _stems(self, hashes, suffix: str = ""):
         from sglang.srt.mem_cache.hicache_storage import PoolName

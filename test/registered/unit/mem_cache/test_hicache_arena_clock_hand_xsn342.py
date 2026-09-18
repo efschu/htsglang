@@ -115,3 +115,18 @@ def test_pending_mask_mirrors_the_pending_dict():
     assert p._pend_pop(3) == (1, True) and not p._pending_mask[3]
     assert p._pend_pop(9) is None
     assert p._pending_mask.sum().item() == 1
+
+
+def test_the_mamba_pool_borrows_the_pending_helpers_too():
+    """xsn356: ArenaMambaPoolHost borrows _claim/complete_write/abort_write from
+    ArenaMHAHostPool; the helpers those call must be borrowed as well (the boot
+    died on AttributeError: '_pend_mark')."""
+    from sglang.srt.mem_cache.pool_host.arena_mamba_pool import ArenaMambaPoolHost as M
+    from sglang.srt.mem_cache.pool_host.arena_pool import ArenaMHAHostPool as B
+    for name in ("_claim", "complete_write", "abort_write", "_pend_mark", "_pend_pop"):
+        assert getattr(M, name) is getattr(B, name), name
+    p = M.__new__(M)
+    p._pending = {7: (1, True)}
+    assert p._pending_mask is None
+    p._pend_mark([7], True)                      # mask None: a no-op
+    assert p._pend_pop(7) == (1, True) and p._pend_pop(7) is None
