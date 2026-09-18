@@ -2192,6 +2192,7 @@ class Scheduler(
             self.chunked_prefill_size = None
         self.chunked_req = None
         self._pending_chunked_abort_req = None
+        self._pending_chunked_abort_delay = 0  # xsn324: passes to keep launching chunks (weg2.pp_abort)
         self.is_mixed_chunk = (
             self.chunked_prefill_size is not None
             and self.server_args.enable_mixed_chunk
@@ -7949,7 +7950,13 @@ class Scheduler(
             # it. Drop the marker once the request is actually gone.
             if req.finished() or req.req_pool_idx is None:
                 self._pending_chunked_abort_req = None
+                self._pending_chunked_abort_delay = 0
             return
+        from sglang.srt.weg2.pp_abort import countdown_step
+        _apply, _left = countdown_step(getattr(self, "_pending_chunked_abort_delay", 0))
+        if not _apply:
+            self._pending_chunked_abort_delay = _left
+            return  # xsn324: this stage still launches this pass's chunk
 
         prepare_abort(req, "Aborted")
         req.time_stats.trace_ctx.abort(abort_info={"reason": "Aborted"})
@@ -7969,6 +7976,7 @@ class Scheduler(
 
         self.chunked_req = None
         self._pending_chunked_abort_req = None
+        self._pending_chunked_abort_delay = 0
         self.ipc_channels.send_to_tokenizer.send_output(AbortReq(rid=req.rid), req)
         logger.debug(f"Abort chunked prefill request. {req.rid=}")
 
@@ -18174,6 +18182,14 @@ class Scheduler(
         if (chunked_req := self.chunked_req) is not None:
             if recv_req.abort_all or chunked_req.rid.startswith(recv_req.rid):
                 self._pending_chunked_abort_req = chunked_req
+                # xsn324: on PP the chunk pipeline stops at the same chunk on
+                # every stage -- stage r keeps launching pp_size-1-r passes.
+                from sglang.srt.weg2.pp_abort import chunked_abort_delay
+                self._pending_chunked_abort_delay = chunked_abort_delay(
+                    getattr(self.ps, "pp_size", 1), getattr(self.ps, "pp_rank", 0))
+                if self._pending_chunked_abort_delay:
+                    logger.info("WEG2-PP-CHUNKED-ABORT recorded rid=%s pp_rank=%s: applied in %d pass(es) so the stages stop at the same chunk (xsn324)",
+                                chunked_req.rid, getattr(self.ps, "pp_rank", 0), self._pending_chunked_abort_delay)
 
         # todo hisparse, release resources for abort requests in hisparse coordinator
         # Delete requests in the waiting queue

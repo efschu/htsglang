@@ -5982,7 +5982,7 @@ class SchedulerPPMixin:
         if recv_reqs:
             _rn = getattr(self, "_pp_req_trace_n", 0) + 1
             self._pp_req_trace_n = _rn
-            if _rn <= 30:
+            if _rn <= 30 or any(type(r).__name__ == "AbortReq" for r in recv_reqs):  # xsn324: aborts always traced
                 try:
                     logger.info(
                         "#631 REQ-TRACE r%d rank=%s n=%d kinds=%s rids=%s",
@@ -6056,7 +6056,7 @@ class SchedulerPPMixin:
             try:  # #1460: when did PP0 put a Weg-2 control request on the chain?
                 _ctrl = [type(r).__name__ for r in (_wire_reqs or ())
                          if type(r).__name__ in ("FlushCacheReqInput", "ReleaseMemoryOccupationReqInput",
-                                                 "ResumeMemoryOccupationReqInput")]
+                                                 "ResumeMemoryOccupationReqInput", "AbortReq")]
                 if _ctrl:
                     logger.info("#1460 CTRL-FWD kinds=%s n_wire=%d t=%.3f", _ctrl, len(_wire_reqs or ()), time.time())
             except Exception:  # noqa: BLE001
