@@ -2953,28 +2953,24 @@ class HiCacheController:
             return 0
         _t0 = time.perf_counter()
         stems = weg2_suffixed_stems(self.storage_backend, hash_values)  # Posten 2: suffix memoised per key class
-        found = pool.arena.find_slots(stems)
+        import numpy as _np
+        _fs, _st = pool.arena.find_slots_np(stems)  # Posten 2 (18.09.): numpy, no 520k-tuple list
         _t1 = time.perf_counter()
         slots = []
         # #1439b: the leading run of COMPLETE slots is referenced in ONE C
         # call (xsn200: one ref per page in a Python loop was 7 %); only the
         # first non-complete page, if any, takes the per-page path (L3 fill).
-        lead = 0
-        for slot, state in found:
-            if slot < 0 or state != 2:
-                break
-            lead += 1
+        _bad = _np.flatnonzero((_fs < 0) | (_st != 2))
+        lead = int(_bad[0]) if _bad.size else int(_fs.shape[0])
         if lead:
-            lead_slots = [int(slot) for slot, _ in found[:lead]]
-            got = pool.arena.ref_slots(lead_slots, +1)
+            got = pool.arena.ref_slots_np(_fs[:lead], +1)
             if got == lead:
-                slots.extend(lead_slots)
+                slots = _fs[:lead].tolist()
             else:
-                pool.arena.ref_slots(lead_slots, -1)  # undo the partial refs, take the slow path
+                pool.arena.ref_slots_np(_fs[:lead], -1)  # undo the partial refs, take the slow path
                 lead = 0
-        for i, (slot, state) in enumerate(found):
-            if i < lead:
-                continue
+        for i in range(lead, int(_fs.shape[0])):
+            slot, state = int(_fs[i]), int(_st[i])
             if slot < 0 or state != 2:
                 # #1433: not in the L2 -- ask the L3. A page on disk is read
                 # straight into a fresh slot and completed; only then is the

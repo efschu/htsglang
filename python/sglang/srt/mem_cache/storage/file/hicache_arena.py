@@ -244,6 +244,34 @@ class ShmArena:
         self._lib.arena_find_stems(self._base, n, c_stems, slots, st)
         return list(zip(slots, st))
 
+    def find_slots_np(self, stems: Sequence[str]):
+        """Posten 2 (18.09.): (slots int64[n], states int8[n]) as numpy views --
+        no 520k-tuple Python list (xsn306: zip 95 ms + lead-list 26 ms + the
+        per-element loops downstream)."""
+        import numpy as np
+        n = len(stems)
+        if n == 0:
+            return np.zeros((0,), dtype=np.int64), np.zeros((0,), dtype=np.int8)
+        c_stems = (ctypes.c_char_p * n)(*[s.encode("utf-8") for s in stems])
+        slots = np.empty((n,), dtype=np.int64)
+        st = np.empty((n,), dtype=np.int8)
+        self._lib.arena_find_stems(self._base, n,
+                                   c_stems,
+                                   slots.ctypes.data_as(ctypes.POINTER(ctypes.c_int64)),
+                                   st.ctypes.data_as(ctypes.POINTER(ctypes.c_int8)))
+        return slots, st
+
+    def ref_slots_np(self, slots, delta: int) -> int:
+        """ref_slots over a numpy int64 array (zero-copy pointer)."""
+        import numpy as np
+        a = np.ascontiguousarray(np.asarray(slots, dtype=np.int64))
+        n = int(a.shape[0])
+        if n == 0:
+            return 0
+        return int(self._lib.arena_ref_slots(self._base, n,
+                                             a.ctypes.data_as(ctypes.POINTER(ctypes.c_int64)),
+                                             int(delta)))
+
     def find_states(self, stems: Sequence[str]) -> list[int]:
         """#1439: the states only (0 absent/free, 1 claimed, 2 complete), by stem, hashed in C."""
         n = len(stems)
