@@ -68,6 +68,7 @@ from aiohttp import (
     web,
 )
 
+from sglang.srt.weg2.intake_stall import is_intake_stall  # weg2xsn272
 from sglang.srt.managers import corridor_guard
 from sglang.srt.managers.corridor_guard import (
     corridor_band_ceiling_mib,
@@ -1399,6 +1400,10 @@ class Pending:
     leg1_prompt_tokens: int = 0
     skip_leg1: bool = False  # #1233 route CARRIER-EXCEEDS: one prefill on D, no leg 1
     leg1_done: bool = False
+    #: weg2xsn272: P refused this leg 1 as WEG2-INTAKE-STALL (its pool cannot
+    #: admit the request while it keeps the backlog for D); requeued at the
+    #: head, prefilled in the next P phase. Never a hand-off to D.
+    intake_stalled: bool = False
     #: C4: the D seat this request holds while its leg 2 is in flight, and the
     #: event the admitter waits on before it resolves the next future (R-15).
     seat: Optional[Seat] = None
@@ -2603,6 +2608,34 @@ class Front:
                       "does not exist in P. Re-issue with the cached prefix instead."},
             status=501,
         )
+
+    async def _requeue_intake_stalled(self, p: "Pending", err: object) -> None:
+        """weg2xsn272: P answered leg 1 with WEG2-INTAKE-STALL -- its pool
+        cannot admit ``p`` while it keeps the prefilled backlog for D. The
+        request goes back to the HEAD of the queue (it is the oldest), this
+        drain stops dispatching, the flip to D follows (queue not empty), and
+        the next P phase prefills it into an emptied pool. P's own rank
+        dropped it; ``/abort_request`` drops it on every rank (PP followers
+        hold their own copy) -- idempotent where it is already gone."""
+        p.intake_stalled = True
+        p.leg1_done = False
+        p.x_requeues += 1
+        self._p_intake_stalled = True
+        self.counters["p_intake_stalls"] += 1
+        self.queue.appendleft(p)
+        logger.warning(
+            "WEG2 P-INTAKE-STALL rid=%s est_prompt=%d requeued at the head "
+            "(requeues=%d, queue=%d) -- drain ends, flip to D follows: %s",
+            p.rid, int(p.est_prompt), p.x_requeues, len(self.queue),
+            str(err)[:300],
+        )
+        try:
+            code, _body = await self.rpc(
+                self.groups["P"], "/abort_request", {"rid": p.rid}, 30)
+            logger.info("WEG2 P-INTAKE-STALL rid=%s /abort_request on P -> %s", p.rid, code)
+        except Exception as exc:  # noqa: BLE001 -- P's own rank already dropped it
+            logger.warning("WEG2 P-INTAKE-STALL rid=%s /abort_request on P raised: %s",
+                           p.rid, exc)
 
     async def handle_abort(self, request: web.Request) -> web.Response:
         payload = await request.json()
@@ -5062,6 +5095,10 @@ class Front:
                 queue_at_entry = len(self.queue)
                 prefilled = 0
                 passes = 0
+                # weg2xsn272: a P intake stall ends THIS drain (no new
+                # dispatches, the stalled request stays at the head) and the
+                # flip below follows because the queue is not empty.
+                self._p_intake_stalled = False
                 short_behind_p0 = self.counters.get("short_behind_p", 0)
                 # MF-3: the same delta idiom as `short_behind_p0` -- the
                 # epoch's terms are read off the running counters rather than
@@ -5078,6 +5115,9 @@ class Front:
                         try:
                             await self.leg1(p)
                         except Exception as e:  # noqa: BLE001
+                            if is_intake_stall(e):
+                                await self._requeue_intake_stalled(p, e)
+                                return p
                             self.counters["leg1_failures"] += 1
                             logger.error("WEG2 leg1 rid=%s failed: %s", p.rid, e)
                             if not p.fut.done():
@@ -5088,6 +5128,8 @@ class Front:
 
                 def _on_leg1_done(p: Pending) -> None:
                     nonlocal _drain_uncached, prefilled
+                    if p.intake_stalled:
+                        return  # weg2xsn272: back in the queue, not ready for D
                     _drain_uncached += int(p.est_uncached)
                     if not p.fut.done():
                         self._ready_for_d.append(p)
@@ -5104,7 +5146,7 @@ class Front:
                 # finishes, so P always has the next request queued.
                 passes = await _p_drain_pool(
                     self.queue, self.p_concurrency + _ahead, one, _on_leg1_done,
-                    lambda: self.state == "serving")
+                    lambda: self.state == "serving" and not self._p_intake_stalled)
                 if passes:
                     oldest_short = 0.0
                     if self._ready_for_d:

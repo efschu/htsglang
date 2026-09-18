@@ -14178,6 +14178,17 @@ class Scheduler(
                         running_batch.batch_is_full = True
                     if running_batch.batch_is_full:
                         self._pp_batch_full_setter = "add_one_req_NO_TOKEN"
+                    # weg2xsn272: a NO_TOKEN with NOTHING running and nothing
+                    # admitted this pass can never resolve by itself on group P
+                    # (the prefilled backlog stays for D). Name it, refuse the
+                    # request 503 (the front requeues it and flips) -- see
+                    # weg2/intake_stall.py.
+                    if (
+                        running_batch.is_empty()
+                        and not adder.can_run_list
+                        and self.chunked_req is None
+                    ):
+                        self._weg2_intake_stall_observe(req, adder)
                 # revert matched mamba idx to avoid memory leak, if req is not added.
                 # Only free if the slot was freshly allocated in this batch (not
                 # pre-existing from a session). Session-held slots have their own
@@ -17870,6 +17881,64 @@ class Scheduler(
             deferred,
         )
         self._abort_request_now(recv_req)
+
+    def _weg2_intake_stall_observe(self, req, adder) -> None:
+        """weg2xsn272: the adder refused ``req`` (NO_TOKEN) with an EMPTY
+        running batch. On Weg 2 group P that refusal is permanent for the
+        phase -- P keeps the prefilled backlog for D, nothing runs, nothing
+        frees. After ``IntakeStallWatch.hold_s`` of the same refusal the
+        request is answered 503 with the WEG2-INTAKE-STALL message (W88's
+        exit form) and dropped from THIS rank's waiting queue; the front
+        aborts it on every rank, requeues it at the head and flips. Outside
+        group P (env SGLANG_WEG2_GROUP) this is a no-op."""
+        import os
+        import time as _time
+
+        from sglang.srt.managers.corridor_guard import GROUP_ENV
+        from sglang.srt.weg2.intake_stall import IntakeStallWatch
+
+        if str(os.environ.get(GROUP_ENV, "")).strip().upper() != "P":
+            return
+        watch = getattr(self, "_weg2_intake_watch", None)
+        if watch is None:
+            watch = self._weg2_intake_watch = IntakeStallWatch()
+        try:
+            need = int(adder.ceil_paged_tokens(
+                len(req.full_untruncated_fill_ids) - len(req.prefix_indices)))
+            rem_total = int(adder.rem_total_tokens)
+            cur_rem = int(adder.cur_rem_tokens)
+        except Exception:  # noqa: BLE001 -- a desk double without these terms
+            need, rem_total, cur_rem = -1, -1, -1
+        message = watch.observe(
+            rid=str(req.rid), need_tokens=need, rem_total_tokens=rem_total,
+            cur_rem_tokens=cur_rem, running_empty=True, now=_time.monotonic(),
+        )
+        if message is None:
+            return
+        logger.error(
+            "%s (n=%d) -- answered 503, dropped from this rank's waiting queue; "
+            "the front requeues and flips",
+            message, watch.stalls,
+        )
+        refused_id = id(req)
+        self.waiting_queue = [q for q in self.waiting_queue if id(q) != refused_id]
+        try:
+            if self.enable_hicache_storage:
+                self.tree_cache.release_aborted_request(req.rid)
+            elif self.enable_hierarchical_cache:
+                self.tree_cache.terminate_prefetch(req.rid)
+        except Exception:  # noqa: BLE001 -- the answer must go out regardless
+            logger.warning("WEG2-INTAKE-STALL rid=%s: releasing the store read raised",
+                           str(req.rid)[:16], exc_info=True)
+        abort_req = AbortReq(
+            finished_reason={
+                "type": "abort",
+                "status_code": HTTPStatus.SERVICE_UNAVAILABLE,
+                "message": message,
+            },
+            rid=req.rid,
+        )
+        self.ipc_channels.send_to_tokenizer.send_output(abort_req, req)
 
     def _abort_request_now(self, recv_req: AbortReq):
         if (chunked_req := self.chunked_req) is not None:
