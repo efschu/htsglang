@@ -287,6 +287,53 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
         self._load_arena(device_pool, host_indices[sel] - S, device_indices[sel], layer_id)
         super().load_to_device_per_layer(device_pool, host_indices[rest], device_indices[rest], layer_id, io_backend)
 
+    def _arena_load_guard(self, device_pool, slots, device_indices, layer_id, *, nrows: int, nmiss: int) -> None:
+        """weg2xsn277 (18.09.): the first 98k-token arena->device load of a
+        boot died with 'CUDA error: an illegal memory access' reported
+        asynchronously at `_transfer` (the 4k smoke loaded fine). The kernel
+        takes raw slot/row indices and 64-bit strides; a slot outside the
+        arena or a destination row outside the device pool is exactly the
+        fault that surfaces one kernel later with no name. Refuse BY NAME
+        before the launch, and print the load's terms once per load (layer
+        0) so the next log carries the numbers."""
+        A = int(self.arena_slots)
+        try:
+            dst_rows = int(device_pool.k_buffer[layer_id].shape[0])
+        except Exception:  # noqa: BLE001 -- a desk double without buffers
+            dst_rows = -1
+        s_min = int(slots.min()) if slots.numel() else 0
+        s_max = int(slots.max()) if slots.numel() else -1
+        d_min = int(device_indices.min()) if device_indices.numel() else 0
+        d_max = int(device_indices.max()) if device_indices.numel() else -1
+        pinned = "n/a"
+        bm = getattr(self, "_pinned", None)
+        if bm is not None and slots.numel():
+            try:
+                pinned = "all" if bool(bm[slots.to("cpu")].all()) else "PARTIAL"
+            except Exception:  # noqa: BLE001
+                pinned = "?"
+        if int(layer_id) == 0:
+            logger.info(
+                "WEG2-ARENA-LOAD rows=%d hits=%d miss=%d slot=[%d,%d] of %d dst=[%d,%d] of %d "
+                "pinned=%s layer=%d",
+                nrows, int(slots.numel()), nmiss, s_min, s_max, A, d_min, d_max, dst_rows,
+                pinned, int(layer_id),
+            )
+        if slots.numel() and (s_min < 0 or s_max >= A):
+            raise RuntimeError(
+                f"#1424 WEG2-ARENA-LOAD REFUSED: slot range [{s_min},{s_max}] outside the "
+                f"arena of {A} slots (layer {layer_id}, {nrows} rows) -- the kernel would "
+                f"read past the arena mapping (xsn277: illegal memory access)")
+        if dst_rows > 0 and device_indices.numel() and (d_min < 0 or d_max >= dst_rows):
+            raise RuntimeError(
+                f"#1424 WEG2-ARENA-LOAD REFUSED: device rows [{d_min},{d_max}] outside the "
+                f"pool of {dst_rows} rows (layer {layer_id}, {nrows} rows)")
+        if pinned == "PARTIAL":
+            raise RuntimeError(
+                f"#1424 WEG2-ARENA-LOAD REFUSED: {int(slots.numel())} slot(s) of layer "
+                f"{layer_id} are not all registered (pinned bitmap PARTIAL) -- a device "
+                f"read of an unregistered host page is an illegal address")
+
     def _load_arena(self, device_pool, rows, device_indices, layer_id) -> None:
         if self.row_slot is not None:
             rl = rows.tolist()
@@ -297,10 +344,13 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
                 self._transfer(device_pool, self._zero_k, self._zero_v, z, device_indices[miss], layer_id)
             hit = ~miss
             if bool(hit.any()):
+                self._arena_load_guard(device_pool, slots[hit], device_indices[hit], layer_id,
+                                       nrows=int(rows.numel()), nmiss=int(miss.sum()))
                 self._transfer(device_pool, self.arena_k_refs[layer_id], self.arena_v_refs[layer_id],
                                slots[hit], device_indices[hit], layer_id)
             return
         self.pin_slots(rows)
+        self._arena_load_guard(device_pool, rows, device_indices, layer_id, nrows=int(rows.numel()), nmiss=0)
         self._transfer(device_pool, self.arena_k_refs[layer_id], self.arena_v_refs[layer_id],
                        rows, device_indices, layer_id)
 
