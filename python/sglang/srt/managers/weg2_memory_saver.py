@@ -1266,7 +1266,17 @@ class VramCredit:
         if need == 0:
             return {"waited_s": 0.0, "reason": "this tag needs no device bytes"}
         floor = max(0, int(floor_bytes or 0))
-        if free_bytes_now is not None and int(free_bytes_now) >= need:
+        # weg2xsn274 (18.09.): THE EARLY EXIT GRADED FREE WITHOUT THE FLOOR.
+        # TP0 (5090) took it with free=3156 MiB for a 2502 MiB tag while the
+        # measured floor was 767 MiB: 3156 - 767 = 2389 < 2502, the gate below
+        # would have waited, this exit did not, cu_mem_create ran out of
+        # memory and the memory saver exit(1)'d the rank (xsn272 took the same
+        # exit 58 times and survived by margin). The exit now grades the
+        # ALLOCATABLE estimate, the same term the gate grades.
+        if (
+            free_bytes_now is not None
+            and int(free_bytes_now) - floor >= need
+        ):
             # #1349: THE EARLY EXIT SPENDS CREDIT TOO, and not debiting it was
             # the second route to the same wall.  "The card already holds the
             # bytes" does not say WHOSE bytes they are: on a co-located pair the
@@ -1282,13 +1292,15 @@ class VramCredit:
             return {
                 "waited_s": 0.0,
                 "free_bytes": int(free_bytes_now),
+                "allocatable_est_bytes": max(0, int(free_bytes_now) - floor),
+                "corridor_floor_bytes": floor,
                 "credit_bytes": spent["credit_bytes"],
                 "consumed_bytes": spent["consumed_bytes"],
                 "available_bytes": spent["available_bytes"],
                 "claimed_bytes": spent["claimed_bytes"],
                 "reason": (
-                    "the card already holds the bytes, so no peer release funds "
-                    "this tag and none is waited for"
+                    "the card already holds the bytes above its corridor floor, "
+                    "so no peer release funds this tag and none is waited for"
                 ),
             }
         deadline = time.monotonic() + float(budget_s)
