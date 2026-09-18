@@ -12,7 +12,8 @@ def test_span_slices_the_handed_keys_by_page():
     keys = [f"k{i}" for i in range(10)]
     assert keys_for_span(keys, 0, 10) == keys
     assert keys_for_span(keys, 4, 3) == ["k4", "k5", "k6"]
-    assert keys_for_span(keys, 4, 7) is None          # beyond the hand-off
+    assert keys_for_span(keys, 4, 7) == keys[4:]     # partial coverage: P's list is one page short
+    assert keys_for_span(keys, 10, 2) is None         # nothing covered
     assert keys_for_span(keys, 0, 0) is None
     assert keys_for_span(None, 0, 3) is None
     assert keys_for_span(keys, 3, 4, page_size=2) is None   # unaligned
@@ -35,3 +36,12 @@ def test_hit_query_and_hold_are_wired():
     assert "keys_for_span(_hd, int(_matched_len)" in s2
     j = s2.index("def _weg2_release_dormant_hold")
     assert "WEG2_HANDOFF_PAGE_KEYS.pop" in s2[j:j + 1500]
+
+
+def test_hit_query_uses_the_operation_keys_with_partial_coverage():
+    from sglang.srt.managers import cache_controller as cc
+    src = open(cc.__file__).read()
+    i = src.index("def _storage_hit_query")
+    body = src[i:i + 3500]
+    assert 'getattr(operation, "weg2_page_keys", None)' in body
+    assert "page_hashes = list(_hk[:_k]) + list(page_hashes[_k:])" in body

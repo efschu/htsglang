@@ -3511,16 +3511,18 @@ class HiCacheController:
         # xsn328/329: a held request reads with P's handed-over page keys
         # (weg2.handoff_keys); its own hashes agreed with P's for the first
         # 64 tokens only. The first mismatch is named once.
-        _hk = WEG2_HANDOFF_PAGE_KEYS.get(operation.request_id)
-        if _hk and len(_hk) >= len(page_hashes):
-            _hk = list(_hk[:len(page_hashes)])
-            _mm = first_mismatch(page_hashes, _hk)
+        _hk = getattr(operation, "weg2_page_keys", None) or WEG2_HANDOFF_PAGE_KEYS.get(operation.request_id)
+        _k = min(len(_hk), len(page_hashes)) if _hk else 0
+        if _k > 0:
+            # P's list is one page short of the ids (the last token has no
+            # cached page): P's keys for the covered prefix, own hashes after.
+            _mm = first_mismatch(page_hashes[:_k], list(_hk[:_k]))
             _hn = getattr(self, "_1442_keys_n", 0) + 1
             self._1442_keys_n = _hn
             if _hn <= 12 or _hn % 256 == 0:
-                logger.info("#1442 HANDOFF-KEYS rid=%s pages=%d first_mismatch=%s last_hash=%s (own vs P's keys; P's are used)",
-                            operation.request_id, len(_hk), _mm, (last_hash or "")[:12])
-            page_hashes = _hk
+                logger.info("#1442 HANDOFF-KEYS rid=%s pages=%d covered=%d first_mismatch=%s last_hash=%s (own vs P's keys; P's are used)",
+                            operation.request_id, len(page_hashes), _k, _mm, (last_hash or "")[:12])
+            page_hashes = list(_hk[:_k]) + list(page_hashes[_k:])
 
         for start in range(0, len(page_hashes), STORAGE_BATCH_SIZE):
             if operation.is_terminated():

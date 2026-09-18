@@ -5192,10 +5192,18 @@ class Scheduler(
         the waiting queue in arrival order. Called by the resume handler
         AFTER flush_cache, so the idle witness saw an empty queue."""
         hold = getattr(self, "weg2_dormant_hold", None) or []
-        try:  # xsn329: the handed-over keys served the hold; the wake re-admits from the tree
+        try:  # xsn329/330: the handed-over keys served the hold; the wake re-admits from the tree
             from sglang.srt.managers import cache_controller as _cc
+            from sglang.srt.weg2 import handoff as _ho
             for _r in hold:
-                _cc.WEG2_HANDOFF_PAGE_KEYS.pop(getattr(_r, "rid", None), None)
+                _rid = getattr(_r, "rid", None)
+                _cc.WEG2_HANDOFF_PAGE_KEYS.pop(_rid, None)
+                try:
+                    _p = _ho.path(str(_rid)) if _rid else ""
+                    if _p and os.path.exists(_p):
+                        os.remove(_p)
+                except OSError:
+                    pass
         except Exception:  # noqa: BLE001
             pass
         if not hold:

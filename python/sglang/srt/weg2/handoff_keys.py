@@ -20,8 +20,10 @@ def keys_for_span(page_keys: Optional[Sequence[str]], matched_len: int, n_tokens
         return None
     p0 = matched_len // page_size
     n_pages = (n_tokens + page_size - 1) // page_size
-    if p0 + n_pages > len(page_keys):
+    if p0 >= len(page_keys):
         return None
+    # partial coverage is fine: P's list is one page short of the ids (the
+    # last token has no cached page); the reader hashes the tail itself
     return [str(k) for k in page_keys[p0:p0 + n_pages]]
 
 

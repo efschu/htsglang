@@ -4563,14 +4563,17 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         # the prefetch starts after the locally matched prefix.
         try:
             from sglang.srt.weg2 import handoff as _ho
-            _keys = _ho.read_keys(str(req_id)) if str(req_id).startswith("weg2-") else None
+            # xsn330: keep the file -- the dormant hold re-reads every 2 s
+            # (#1456); the wake's hold release removes it (scheduler).
+            _keys = _ho.read_keys(str(req_id), remove=False) if str(req_id).startswith("weg2-") else None
             if _keys:
                 _pages = int(prefetch_length) // int(self.page_size)
                 _total = _keys  # chain length in pages == P's inserted page count
                 _ids = _ho.read_ids(str(req_id))
                 _ntok = len(_ids) if _ids else None
                 _off = (int(_ntok) - int(prefetch_length)) // int(self.page_size) if _ntok is not None else None
-                if _off is not None and 0 <= _off and _off + _pages <= len(_total):
+                if _off is not None and 0 <= _off < len(_total):
+                    # partial coverage is fine (P's list is one page short of the ids)
                     operation.weg2_page_keys = list(_total[_off:_off + _pages])
                     n = getattr(self, "_1442_use_n", 0) + 1
                     self._1442_use_n = n
