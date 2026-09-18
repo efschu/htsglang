@@ -314,38 +314,53 @@ class ArenaMambaPoolHost(MambaPoolHost):
             return False
         try:
             from sglang.jit_kernel.hicache import transfer_hicache_all_layer_mla
-            L = int(self.num_mamba_layers)
-            e_t = int(self.temporal_dtype.itemsize)
-            e_c = int(self.conv_dtype.itemsize)
             temporal = device_pool.mamba_cache.temporal
             conv = device_pool.mamba_cache.conv[0]
-            pieces = []
-            for l in range(L):
-                t_src = temporal[l]
-                pieces.append((self._t_views[l][0].numel() * e_t, self._t_views[l].data_ptr(),
-                               t_src.data_ptr(), t_src.stride(0) * e_t))
-                c_src = conv[l]
-                per_ch = int(c_src.shape[-1]) * e_c
-                for ch0, n, view in self._c_views[0][l]:
-                    pieces.append((n * per_ch, view.data_ptr(),
-                                   c_src.data_ptr() + ch0 * per_ch, c_src.stride(0) * e_c))
+            # xsn354: the pseudo-layer pointer arrays (52k entries on PP0) do not
+            # depend on the slot or the device row -- the kernel adds
+            # indices * stride -- so they are built ONCE per pool/device layout
+            # and kept on the card; per node only slots and didx cross.
+            key = (int(temporal.data_ptr()), int(conv.data_ptr()), str(dev))
+            plan = getattr(self, "_mamba_kern_plan", None)
+            if plan is None or plan[0] != key:
+                L = int(self.num_mamba_layers)
+                e_t = int(self.temporal_dtype.itemsize)
+                e_c = int(self.conv_dtype.itemsize)
+                pieces = []
+                for l in range(L):
+                    t_src = temporal[l]
+                    pieces.append((self._t_views[l][0].numel() * e_t, self._t_views[l].data_ptr(),
+                                   t_src.data_ptr(), t_src.stride(0) * e_t))
+                    c_src = conv[l]
+                    per_ch = int(c_src.shape[-1]) * e_c
+                    for ch0, n, view in self._c_views[0][l]:
+                        pieces.append((n * per_ch, view.data_ptr(),
+                                       c_src.data_ptr() + ch0 * per_ch, c_src.stride(0) * e_c))
+                # xsn353: fixed element size (1024 B, the KV cell -- its JIT module
+                # is cached); pieces that are not whole elements take the copy path.
+                kern, rest = _aw.split_pieces(pieces, _aw.mamba_element_bytes())
+                if rest:
+                    if not getattr(self, "_mamba_rest_said", False):
+                        self._mamba_rest_said = True
+                        logger.info("WEG2-MAMBA-WRITE %d piece(s) are not whole %d-B elements (e.g. %d B): copy mode",
+                                    len(rest), _aw.mamba_element_bytes(), int(rest[0][0]))
+                    return False
+                groups = []
+                for (es, ss), (dps, sps) in _aw.group_pieces(kern).items():
+                    groups.append((int(es), int(ss),
+                                   torch.tensor(dps, dtype=torch.uint64).to(dev),
+                                   torch.tensor(sps, dtype=torch.uint64).to(dev)))
+                torch.cuda.synchronize(dev)
+                plan = self._mamba_kern_plan = (key, groups, len(pieces))
+            _, groups, n_pieces = plan
+            pieces = [None] * n_pieces
             slots_d = slots.to(dtype=torch.int64).pin_memory().to(dev, non_blocking=True)
             didx_d = didx_d.to(dtype=torch.int64)
-            # xsn353: fixed element size (1024 B, the KV cell -- its JIT module is
-            # cached); pieces that are not whole elements take the copy path.
-            kern, rest = _aw.split_pieces(pieces, _aw.mamba_element_bytes())
-            if rest:
-                if not getattr(self, "_mamba_rest_said", False):
-                    self._mamba_rest_said = True
-                    logger.info("WEG2-MAMBA-WRITE %d piece(s) are not whole %d-B elements (e.g. %d B): copy mode",
-                                len(rest), _aw.mamba_element_bytes(), int(rest[0][0]))
-                return False
-            pieces = kern
-            for (es, ss), (dps, sps) in _aw.group_pieces(pieces).items():
+            for es, ss, ptr_dst, ptr_src in groups:
                 transfer_hicache_all_layer_mla(
-                    ptr_dst=torch.tensor(dps, dtype=torch.uint64).pin_memory().to(dev, non_blocking=True),
+                    ptr_dst=ptr_dst,
                     indices_dst=slots_d,
-                    ptr_src=torch.tensor(sps, dtype=torch.uint64).pin_memory().to(dev, non_blocking=True),
+                    ptr_src=ptr_src,
                     indices_src=didx_d,
                     cache_src_stride_bytes=int(ss),
                     cache_dst_stride_bytes=int(self.arena.slot_bytes),
@@ -355,8 +370,8 @@ class ArenaMambaPoolHost(MambaPoolHost):
             n = getattr(type(self), "_mamba_kernel_n", 0) + 1
             type(self)._mamba_kernel_n = n
             if n <= 8 or n % 256 == 0:
-                logger.info("WEG2-MAMBA-WRITE n=%d states=%d pieces=%d launches=%d mode=kernel",
-                            n, int(slots.numel()), len(pieces), len(_aw.group_pieces(pieces)))
+                logger.info("WEG2-MAMBA-WRITE n=%d states=%d pieces=%d launches=%d mode=kernel (plan cached)",
+                            n, int(slots.numel()), len(pieces), len(groups))
             return True
         except Exception as exc:  # noqa: BLE001 -- one named fallback, then the copy path
             logger.warning("WEG2-MAMBA-WRITE kernel mode failed (%s: %s); copy mode from now on",
