@@ -116,9 +116,22 @@ void tms_pause(const char* tag) {
     TorchMemorySaver::instance().pause(tag_str);
 }
 
-void tms_resume(const char* tag) {
+// weg2xsn269: ``tms_resume`` keeps the pip binding's void ABI -- a caller
+// that never asked for a code still gets the old behaviour (exit(1) with the
+// reason on stderr).  ``tms_resume_rc`` is the same resume for callers that
+// can turn a code into an exception: 0 on success, else the CUresult.
+int tms_resume_rc(const char* tag) {
     std::string tag_str = (tag != nullptr) ? std::string(tag) : "";
-    TorchMemorySaver::instance().resume(tag_str);
+    return TorchMemorySaver::instance().resume(tag_str);
+}
+
+void tms_resume(const char* tag) {
+    int rc = tms_resume_rc(tag);
+    if (rc != 0) {
+        std::cerr << "[torch_memory_saver.cpp] tms_resume failed rc=" << rc
+                  << " tag=" << ((tag != nullptr) ? tag : "") << " (void ABI: exiting)" << std::endl;
+        exit(1);
+    }
 }
 
 // C7 -- THE PLANNER'S NEW SIZING INPUT (spec R8).  The per-tag host bytes used

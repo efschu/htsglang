@@ -5337,6 +5337,27 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             _deliverable,
             max(0, _deliverable - (int(insert_result.prefix_len) + int(loaded_from_storage))),
         )
+        # weg2xsn272 (18.09.): THE LOADBACK INSTRUMENT (task #3). The
+        # prefetch's host->device transfer ends HERE, not in loading_check
+        # (where an earlier WEG2-LOAD-DEVICE never fired). tokens x
+        # bytes/token over the operation's own clock, so the bs6
+        # readmission of 6 x 98k tokens on D is the measurement against
+        # the lane's ceiling; never averaged with the arena-find time.
+        try:
+            _t0 = float(getattr(operation, "start_time", 0.0) or 0.0)
+            _ms = (time.monotonic() - _t0) * 1000.0 if _t0 else -1.0
+            _bpt = int(self.cache_controller.mem_pool_host.get_size_per_token() or 0)
+            _bytes = int(completed_tokens) * _bpt
+            logger.info(
+                "WEG2-LOAD-DEVICE req=%s tokens=%d bytes_per_token=%d bytes=%d ms=%.0f "
+                "GB/s=%.2f (host arena -> device, the operation's own clock from "
+                "start_loading to terminate_prefetch; matched=%d loaded=%d)",
+                req_id, int(completed_tokens), _bpt, _bytes, _ms,
+                (_bytes / (_ms / 1000.0) / 1e9) if _ms > 0 else -1.0,
+                int(insert_result.prefix_len), int(loaded_from_storage),
+            )
+        except Exception:  # noqa: BLE001 -- an instrument never kills the prefetch
+            logger.debug("WEG2-LOAD-DEVICE instrument raised", exc_info=True)
         if self.enable_storage_metrics and self.storage_metrics_collector is not None:
             self.storage_metrics_collector.log_prefetched_tokens(loaded_from_storage)
         return True

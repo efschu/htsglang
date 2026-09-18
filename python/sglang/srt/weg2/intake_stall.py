@@ -47,6 +47,30 @@ class IntakeStallWatch:
         self._rid = None
         self._since = 0.0
 
+    def forget(self, rid: Optional[str]) -> None:
+        """weg2xsn288: the request was aborted (the front's /abort_request
+        after the refusal, or any abort). Its hold and its ``reported`` mark
+        go with it: the SAME rid comes back in the next P phase (the front
+        requeues it at the head) and must be refusable again, and a hold
+        that began before an abort must never ride into the next phase --
+        measured xsn288: PP2 named a stall held for 270.9 s across a sleep,
+        a wake and the abort, and dropped the request alone. ``None`` (an
+        abort_all) forgets everything. Prefix semantics as the abort's."""
+        if rid is None:
+            self.reset()
+            return
+        rid = str(rid)
+        self._reported = {r for r in self._reported if not str(r).startswith(rid)}
+        if self._rid is not None and str(self._rid).startswith(rid):
+            self._rid = None
+            self._since = 0.0
+
+    def reset(self) -> None:
+        """A new phase (the group woke): no hold, no reported rid survives."""
+        self._rid = None
+        self._since = 0.0
+        self._reported = set()
+
     def observe(self, *, rid: str, need_tokens: int, rem_total_tokens: int,
                 cur_rem_tokens: int, running_empty: bool, now: float,
                 extra: str = "", immediate: bool = False) -> Optional[str]:

@@ -45,6 +45,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromTensorReqOutput,
 )
 from sglang.srt.managers.weg2_memory_saver import (
+    weg2_tms_resume,
     WEG2_SLEEP_MIN_RELEASED_FRACTION,
     WEG2_SLEEP_TAGS,
     Weg2FlipRankDisagree,
@@ -7072,7 +7073,9 @@ class SchedulerWeightUpdaterManager:
                     )
                     t_tag = time.perf_counter()
                     logger.info("WEG2-RESUME credit-ok tag=%s -- entering resume(tag)", tag)
-                    self.memory_saver_adapter.resume(tag)
+                    # weg2xsn269: a refused remap raises here (rc from the
+                    # hook's tms_resume_rc) instead of exit(1) inside cuMemCreate.
+                    weg2_tms_resume(self.memory_saver_adapter, tag)
                     # #1378 xsn62: DID THE RESUME ACTUALLY MAP ANYTHING?
                     #
                     # weg2xsn61 read the destination of the first copy-out and
@@ -7527,6 +7530,11 @@ class SchedulerWeightUpdaterManager:
                 logger.info(
                     "WEG2-DORMANT cleared: kv_cache resumed, admission seams admit"
                 )
+                # weg2xsn288: a new phase -- no intake-stall hold and no
+                # reported rid from the previous one survives the wake.
+                _iw = getattr(scheduler, "_weg2_intake_watch", None)
+                if _iw is not None:
+                    _iw.reset()
                 self._weg2_rescan_store_index()
                 _rel = getattr(scheduler, "_weg2_release_dormant_hold", None)  # #1443
                 if callable(_rel):

@@ -93,7 +93,7 @@ class RingLegSplitStructureTest(unittest.TestCase):
     def setUpClass(cls):
         cls.raw = _read("core.cpp")
         cls.core = _code(cls.raw)
-        cls.resume = _body(cls.core, "void TorchMemorySaver::resume(")
+        cls.resume = _body(cls.core, "int TorchMemorySaver::resume(")  # xsn289: resume returns the CUresult
 
     def test_no_new_device_synchronisation_was_added(self):
         """THE HARD BOUNDARY. Exactly one cudaStreamSynchronize must remain

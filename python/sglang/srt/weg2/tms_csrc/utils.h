@@ -194,6 +194,37 @@ namespace CUDAUtils {
         CURESULT_CHECK(cuMemCreate(alloc_handle, size, &prop, 0));
     }
 
+    // weg2xsn269 (18.09.): THE RESUME THAT CAN SAY NO.  ``cu_mem_create``
+    // above exits the process on any CUresult -- measured, the D rank died
+    // with ``CUresult error: out of memory`` and exit code 1, no Python
+    // frame, the scheduler's own log ending in "driver shutting down" as a
+    // consequence.  This variant RETURNS the CUresult (CUDA_SUCCESS on the
+    // happy path) and logs the failing call with its size and device, so
+    // ``TorchMemorySaver::resume`` can roll back and hand the code up to
+    // Python, where it becomes an exception with a traceback instead of a
+    // dead rank.
+    static CUresult cu_mem_create_rc(CUmemGenericAllocationHandle *alloc_handle, size_t size, CUdevice device) {
+        CUmemAllocationProp prop = {};
+        prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+        prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+        prop.location.id = device;
+
+        int flag = 0;
+        CUresult rc = cuDeviceGetAttribute(&flag, CU_DEVICE_ATTRIBUTE_GPU_DIRECT_RDMA_WITH_CUDA_VMM_SUPPORTED, device);
+        if (rc == CUDA_SUCCESS && flag) {
+            prop.allocFlags.gpuDirectRDMACapable = 1;
+        }
+        rc = cuMemCreate(alloc_handle, size, &prop, 0);
+        if (rc != CUDA_SUCCESS) {
+            const char* err_str = nullptr;
+            cuGetErrorString(rc, &err_str);
+            std::cerr << "[torch_memory_saver.cpp] WEG2-TMS-RESUME cuMemCreate FAILED rc=" << (int) rc
+                      << " (" << (err_str ? err_str : "?") << ") size=" << size
+                      << " device=" << (int) device << std::endl;
+        }
+        return rc;
+    }
+
     static void cu_mem_set_access(void *ptr, size_t size, CUdevice device) {
         CUmemAccessDesc access_desc = {};
         access_desc.location.type = CU_MEM_LOCATION_TYPE_DEVICE;

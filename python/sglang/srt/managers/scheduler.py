@@ -17913,6 +17913,19 @@ class Scheduler(
 
         if str(os.environ.get(GROUP_ENV, "")).strip().upper() != "P":
             return
+        # weg2xsn288 (18.09.): ONLY THE AUTHORITY REFUSES (#968 PP0, the
+        # rank that answers the tokenizer). A follower that drops the head
+        # of ITS waiting queue on its own leaves the ring uneven: measured
+        # xsn288, PP2 named the stall 2 s after the wake (its hold had
+        # ridden 270.9 s across sleep, wake and the abort), removed
+        # weg2-6-4 alone while PP0 and PP1 admitted it -- PP0 then waited
+        # on PP2's output, PP1 on PP0's proxy, PP2 on requests: 150 s of
+        # util 0, boot killed. The refusal's propagation path IS the
+        # front's /abort_request, which reaches every rank (xsn276); a
+        # follower's queue is only ever mutated by that.
+        _ps = getattr(self, "ps", None)
+        if _ps is not None and int(getattr(_ps, "pp_rank", 0) or 0) != 0:
+            return
         watch = getattr(self, "_weg2_intake_watch", None)
         if watch is None:
             watch = self._weg2_intake_watch = IntakeStallWatch()
@@ -17961,6 +17974,14 @@ class Scheduler(
         self.ipc_channels.send_to_tokenizer.send_output(abort_req, req)
 
     def _abort_request_now(self, recv_req: AbortReq):
+        # weg2xsn288: an abort ends the intake-stall hold and the reported
+        # mark of that rid on THIS rank (the requeued rid returns next phase).
+        _watch = getattr(self, "_weg2_intake_watch", None)
+        if _watch is not None:
+            try:
+                _watch.forget(None if recv_req.abort_all else recv_req.rid)
+            except Exception:  # noqa: BLE001 -- bookkeeping never blocks an abort
+                logger.warning("WEG2-INTAKE-STALL watch.forget raised", exc_info=True)
         if (chunked_req := self.chunked_req) is not None:
             if recv_req.abort_all or chunked_req.rid.startswith(recv_req.rid):
                 self._pending_chunked_abort_req = chunked_req

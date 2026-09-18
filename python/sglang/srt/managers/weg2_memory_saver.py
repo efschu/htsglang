@@ -2709,6 +2709,66 @@ def weights_region_tag(tag: str) -> Iterator[str]:
 #: Python frames alone could not name the corrupter.
 _SEGVBT_HANDLE = None
 
+#: weg2xsn269 (18.09.): THE RESUME THAT RAISES INSTEAD OF DYING.  The pip
+#: binding's ``resume(tag)`` calls the void ``tms_resume``, whose only failure
+#: mode is exit(1) from inside a driver call -- measured, the D rank of
+#: weg2xsn269 printed ``CUresult error: out of memory`` and was gone, no
+#: traceback, no W-code.  The weg2 hook exports ``tms_resume_rc`` (same
+#: resume, returns the CUresult, rolls the tag back to PAUSED on failure);
+#: this helper prefers it whenever the hook's path is in the rank's env and
+#: the symbol exists, and falls back to the adapter otherwise -- an old hook
+#: keeps the old behaviour, never a silent no-op.
+_TMS_RC_HANDLE = None
+_TMS_RC_MISSING = False
+
+
+def _tms_resume_rc_symbol():
+    global _TMS_RC_HANDLE, _TMS_RC_MISSING
+    if _TMS_RC_MISSING:
+        return None
+    if _TMS_RC_HANDLE is None:
+        so = os.environ.get("SGLANG_WEG2_TMS_PRELOAD_SO", "")
+        if not so:
+            _TMS_RC_MISSING = True
+            return None
+        try:
+            import ctypes
+
+            lib = ctypes.CDLL(so)
+            fn = lib.tms_resume_rc
+            fn.argtypes = [ctypes.c_char_p]
+            fn.restype = ctypes.c_int
+            _TMS_RC_HANDLE = fn
+        except (OSError, AttributeError) as exc:
+            _TMS_RC_MISSING = True
+            logger.warning(
+                "WEG2-TMS-RESUME rc symbol unavailable (%s): %s -- falling back to "
+                "the void resume (a refused resume then exits the rank)", so, exc)
+            return None
+    return _TMS_RC_HANDLE
+
+
+def weg2_tms_resume(adapter, tag: str, *, rc_fn=None) -> int:
+    """Resume ``tag`` and RAISE on a refused resume. Returns the rc (always 0).
+
+    ``rc_fn`` is the injectable ``tms_resume_rc`` (tests); by default the
+    hook's symbol from ``SGLANG_WEG2_TMS_PRELOAD_SO``. Without it the
+    adapter's own resume runs, unchanged.
+    """
+    fn = rc_fn if rc_fn is not None else _tms_resume_rc_symbol()
+    if fn is None:
+        adapter.resume(tag)
+        return 0
+    rc = int(fn(str(tag).encode()))
+    if rc != 0:
+        raise RuntimeError(
+            f"WEG2-TMS-RESUME REFUSED tag={tag} rc={rc} -- the card refused the "
+            f"VMM remap (rc 2 = CUDA_ERROR_OUT_OF_MEMORY); every allocation of the "
+            f"tag is PAUSED again, the rank keeps its frames (weg2xsn269 died here "
+            f"with exit(1) and no traceback)"
+        )
+    return 0
+
 
 def _load_native_segv_backtrace() -> None:
     global _SEGVBT_HANDLE
