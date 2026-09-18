@@ -1600,7 +1600,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             if _WEG2_END_ANCHOR:
                 self._weg2_note_end_anchor(req, token_ids)
             self._weg2_handoff_write(req, radix_key)
-            self._weg2_publish_at_retain(req)
+            self._weg2_publish_at_retain(req, radix_key)
         else:
             self.token_to_kv_pool_allocator.free(kv_indices[req.cache_protected_len :])
 
@@ -3271,7 +3271,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 if id(node) not in direct:  # #1427: a direct write is in the store already
                     self.write_backup_storage(node)
 
-    def _weg2_publish_at_retain(self, req) -> None:
+    def _weg2_publish_at_retain(self, req, radix_key=None) -> None:
         """xsn338: publish the finished request's (and every other unbacked)
         node NOW -- parents first, bounded, the sweep's own pin budget -- instead
         of waiting for a PP bubble or the sleep flush (weg2.retain_publish)."""
@@ -3280,8 +3280,14 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             if not _rp.publish_at_retain_on() or not self.enable_storage:
                 return
             _t0 = time.perf_counter()
+            # xsn344: the finished request's OWN chain first (parents first),
+            # then the rest -- with a budget the BFS from the root spent it on
+            # older nodes and D's dormant read of this request found half.
+            first = self._weg2_chain_nodes(radix_key) if radix_key is not None else []
             stats = self.publish_unbacked_sweep(max_issue=_rp.max_issue(),
-                                                clock=_rp.SweepClock(_rp.budget_s())) or {}
+                                                clock=_rp.SweepClock(_rp.budget_s()),
+                                                first=first) or {}
+            stats["chain"] = len(first)
             n = getattr(self, "_weg2_retain_publish_n", 0) + 1
             self._weg2_retain_publish_n = n
             if n <= 16 or n % 64 == 0:
@@ -3289,6 +3295,21 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                             stats, (time.perf_counter() - _t0) * 1000.0, n)
         except Exception as exc:  # noqa: BLE001 -- a publisher never takes the retain down
             logger.warning("WEG2 RETAIN-PUBLISH raised %s: %s", type(exc).__name__, exc)
+
+    def _weg2_chain_nodes(self, radix_key) -> list:
+        """The tree nodes of `radix_key`'s matched path, ROOT FIRST (a parent
+        publishes before its child: write_backup refuses 'parent_unbacked')."""
+        try:
+            mr = self.match_prefix(MatchPrefixParams(key=radix_key))
+            node = getattr(mr, "last_device_node", None) or getattr(mr, "last_host_node", None)
+            chain = []
+            while node is not None and node is not self.root_node:
+                chain.append(node)
+                node = node.parent
+            chain.reverse()
+            return chain
+        except Exception:  # noqa: BLE001 - an accelerator, never a wall
+            return []
 
     def _weg2_handoff_write(self, req, radix_key) -> None:
         """#1442: hand P's finished prefill to D by rid -- the token ids and
@@ -3523,7 +3544,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                            getattr(node, "id", "?"), type(e).__name__, e)
             return None
 
-    def publish_unbacked_sweep(self, max_issue: int = 64, clock=None) -> dict:
+    def publish_unbacked_sweep(self, max_issue: int = 64, clock=None, first=None) -> dict:
         """#1233 zero-remainder: back every un-backed device node up before a flush.
 
         The hand-back seam. The Weg-2 front quiesces a group through
@@ -3548,7 +3569,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             return stats
         from sglang.srt.weg2 import retain_publish as _rp
         self._weg2_sweep_last_refusal = None
-        queue = [self.root_node]
+        queue = list(first or []) + [self.root_node]   # xsn344: the retain's own chain first
         while queue:
             node = queue.pop(0)
             # xsn342: a bounded sweep -- wall budget (retain) and a full mamba

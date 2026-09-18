@@ -31,13 +31,14 @@ def budget_s(env: Optional[Mapping[str, str]] = None) -> float:
     """xsn342 (18.09.): the retain sweep runs in the scheduler thread; a
     refused chain of 43 nodes cost PP1 minutes (the arena clock-hand wrap,
     fixed in arena.c) and the PP ring stood. Wall budget per sweep in ms
-    (SGLANG_WEG2_PUBLISH_AT_RETAIN_BUDGET_MS, default 400); 0 = unbounded.
+    (SGLANG_WEG2_PUBLISH_AT_RETAIN_BUDGET_MS, default 800;
+    xsn344: 24 nodes of a 100k request take ~700 ms, 400 left half unpublished); 0 = unbounded.
     Whatever is left is the bubble publisher's and the flush's, as before."""
     env = os.environ if env is None else env
     try:
-        ms = float(env.get("SGLANG_WEG2_PUBLISH_AT_RETAIN_BUDGET_MS", "400"))
+        ms = float(env.get("SGLANG_WEG2_PUBLISH_AT_RETAIN_BUDGET_MS", "800"))
     except ValueError:
-        ms = 400.0
+        ms = 800.0
     return max(0.0, ms) / 1000.0
 
 
@@ -70,3 +71,12 @@ def mamba_full_stops_sweep(refused_why: Optional[str]) -> bool:
     sweep stops instead of claiming+aborting 4096 KV pages per node (xsn342:
     16 evict rounds and 48 x 4096 aborts in one second, logs capped)."""
     return refused_why == "mamba_claim"
+
+
+def dormant_standstill_holds(dormant: bool) -> bool:
+    """xsn344 (18.09.): 2 of 4 100k requests were answered 503 (W88) by the
+    SLEEPING D group after 64 passes without progress -- P had just finished
+    them and publishes their pages at retain (budgeted), in bubbles and at its
+    sleep flush, so the store WILL fill; a dormant standstill is a wait, not a
+    dead read. The pass/wall bound applies from the wake on."""
+    return bool(dormant)

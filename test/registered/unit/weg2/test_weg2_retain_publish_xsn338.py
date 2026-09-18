@@ -21,6 +21,7 @@ def test_retain_site_calls_the_publish_after_the_handoff():
     from sglang.srt.mem_cache import unified_radix_cache as u
     src = open(u.__file__).read()
     i = src.index("self._weg2_handoff_write(req, radix_key)\n")
-    assert "self._weg2_publish_at_retain(req)" in src[i:i + 200]
+    assert "self._weg2_publish_at_retain(req, radix_key)" in src[i:i + 200]
     j = src.index("def _weg2_publish_at_retain")
-    assert "publish_unbacked_sweep(max_issue=_rp.max_issue())" in src[j:j + 1200]
+    assert "publish_unbacked_sweep(max_issue=_rp.max_issue()," in src[j:j + 1600]
+    assert "first=first" in src[j:j + 1600]   # xsn344: the finished request's chain first

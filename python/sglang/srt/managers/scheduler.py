@@ -6893,6 +6893,18 @@ class Scheduler(
             return "progress"
         n = int(getattr(req, "_weg2_no_progress_passes", 0) or 0) + 1
         req._weg2_no_progress_passes = n
+        from sglang.srt.weg2 import retain_publish as _rp
+        if _rp.dormant_standstill_holds(getattr(self, "weg2_dormant", False)):
+            # xsn344: while this group sleeps the read can only fill as fast as
+            # P publishes; the clock (and the pass bound below) start at the wake.
+            req._weg2_no_progress_t0 = time.perf_counter()
+            if not getattr(req, "_weg2_dormant_wait_said", False):
+                req._weg2_dormant_wait_said = True
+                logger.info("W88-DORMANT-WAIT rid=%s: standstill (%d passes) is not terminal while "
+                            "this group sleeps -- P publishes at retain, in bubbles and at its sleep "
+                            "flush; the pass/wall bound starts at the wake (xsn344: 2 of 4 100k "
+                            "requests were answered 503 after 5 s)", str(getattr(req, "rid", "?"))[:16], n)
+            return "stalled"
         # Boot xsn127 (D, rids baec88b4/f4b94d87): the store read stood still
         # from 20:44:46 on, but the pass counter alone declares death -- and
         # the wedged group ran ~1 pass per 8 s (held_passes=5 after 38 s), so
