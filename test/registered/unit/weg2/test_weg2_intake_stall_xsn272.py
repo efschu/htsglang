@@ -65,7 +65,7 @@ def test_the_scheduler_names_the_stall_only_with_an_empty_batch_and_on_group_p()
     assert "running_batch.is_empty()" in blk and "not adder.can_run_list" in blk
     assert "self.chunked_req is None" in blk and "_weg2_intake_stall_observe(req, adder)" in blk
     j = src.index("def _weg2_intake_stall_observe")
-    body = src[j:j + 4500]  # xsn288: the authority gate's comment sits in front
+    body = src[j:j + 5600]  # xsn288: the authority gate's comment sits in front; xsn302: + the lock census
     assert 'GROUP_ENV' in body and '!= "P"' in body                 # group P only
     assert "HTTPStatus.SERVICE_UNAVAILABLE" in body                  # W88's exit form
     assert "self.waiting_queue = [q for q in self.waiting_queue if id(q) != refused_id]" in body
@@ -76,7 +76,7 @@ def test_the_front_requeues_at_the_head_stops_dispatching_and_never_hands_off():
     src = open(fr.__file__).read()
     assert "intake_stalled: bool = False" in src                      # Pending field
     i = src.index("async def one(p: Pending) -> Pending:")
-    assert "if is_intake_stall(e):" in src[i:i + 900]
+    assert "if is_intake_stall(e) and not is_too_large(e):" in src[i:i + 900]  # xsn291: too-large is refused, not requeued
     assert "await self._requeue_intake_stalled(p, e)" in src[i:i + 900]
     j = src.index("def _on_leg1_done(p: Pending)")
     assert "if p.intake_stalled:" in src[j:j + 300]

@@ -7139,6 +7139,65 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             )
         return "\n".join(lines) + "\n"
 
+    def weg2_lock_census_str(self, limit: int = 6) -> str:
+        """WHO holds device rows, for the intake stall (Punkt 1, 18.09.).
+        xsn293: PP0's pool read 81 % used with NOTHING running and a 99.5k
+        request refused for 66 s -- the adder's budget counts avail +
+        evictable, so those rows were LOCKED, and no log named the holder.
+        This walks the tree once (only when a stall is named) and reports:
+        the tracked terms, every component's locked node count and rows, the
+        in-flight write-through / load-back memberships, and the largest
+        locked nodes with their per-component lock refs. Cheap enough for a
+        stall path, never for a per-tick path.
+        """
+        try:
+            nodes = self._collect_all_nodes()
+        except Exception as exc:  # noqa: BLE001 - diagnostics never raise
+            return f"lock_census=unavailable({exc!r})"
+        wt = set(getattr(self, "ongoing_write_through", {}) or ())
+        lb = set(getattr(self, "ongoing_load_back", {}) or ())
+        base = BASE_COMPONENT_TYPE
+        parts = [
+            f"nodes={len(nodes)}",
+            f"tracked_evictable={self.component_evictable_size_.get(base, 0)}",
+            f"tracked_protected={self.component_protected_size_.get(base, 0)}",
+            f"ongoing_wt={len(wt)} ongoing_lb={len(lb)}",
+        ]
+        locked_rows = {ct: 0 for ct in self.tree_components}
+        locked_nodes = {ct: 0 for ct in self.tree_components}
+        dev_rows = 0
+        held = []
+        for n in nodes:
+            if n is self.root_node:
+                continue
+            cd_full = n.component_data[base]
+            full_dev = 0 if cd_full.value is None else len(cd_full.value)
+            dev_rows += full_dev
+            any_lock = False
+            for ct in self.tree_components:
+                cd = n.component_data[ct]
+                if cd.lock_ref > 0:
+                    any_lock = True
+                    locked_nodes[ct] += 1
+                    locked_rows[ct] += full_dev
+            if any_lock and full_dev > 0:
+                locks = ",".join(
+                    f"{ct.name[:1]}{n.component_data[ct].lock_ref}"
+                    for ct in self.tree_components
+                    if n.component_data[ct].lock_ref > 0
+                )
+                held.append((full_dev, f"id={n.id} dev={full_dev} locks={locks} "
+                                       f"backuped={int(bool(n.backuped))} "
+                                       f"wt={int(n.id in wt)} lb={int(n.id in lb)}"))
+        parts.append(f"device_rows_in_tree={dev_rows}")
+        for ct in self.tree_components:
+            parts.append(f"{ct.name}_locked_nodes={locked_nodes[ct]} "
+                         f"{ct.name}_locked_rows={locked_rows[ct]}")
+        held.sort(key=lambda t: -t[0])
+        if held:
+            parts.append("top_locked=[" + "; ".join(h for _, h in held[:limit]) + "]")
+        return "lock_census " + " ".join(parts)
+
     def leak_census_str(self) -> str:
         """What the TREE holds, recomputed from the nodes, for a pool leak.
 

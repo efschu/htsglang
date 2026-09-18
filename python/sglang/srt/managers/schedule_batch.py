@@ -4343,6 +4343,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self, server_args: ServerArgs
     ) -> Tuple[List[Req], float, List[Req]]:
         """Retract the decoding requests when there is not enough memory."""
+        # Punkt 3 (18.09.): on Weg 2 group D the retracted span is RETAINED in
+        # the tree (evictable -> write-back to the arena -> loadback at the
+        # re-admission) instead of discarded and re-prefilled.
+        from sglang.srt.weg2.retract_retain import retract_retains as _weg2_rr
+        _retain = bool(_weg2_rr())
         sorted_indices = self._get_decode_retraction_order(
             self.reqs,
             server_args,
@@ -4365,7 +4370,20 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             req = self.reqs[idx]
             retracted_reqs.append(req)
             # release memory and don't insert into the tree because we need the space instantly
-            self.release_req(idx, len(sorted_indices), server_args)
+            # (upstream); with `_retain` (Weg 2 group D) the span is inserted
+            # evictable instead -- the loop's check_decode_mem evicts it as needed.
+            self.release_req(idx, len(sorted_indices), server_args, retain=_retain)
+            if _retain:
+                _n = getattr(ScheduleBatch, "_weg2_retain_n", 0) + 1
+                ScheduleBatch._weg2_retain_n = _n
+                if _n <= 20 or _n % 100 == 0:
+                    logger.info(
+                        "WEG2-RETRACT-RETAIN n=%d rid=%s span=%d (origin=%d out=%d): "
+                        "kept in the tree, evictable; the re-admission loads it back",
+                        _n, str(req.rid)[:16],
+                        len(req.origin_input_ids or ()) + len(req.output_ids or ()),
+                        len(req.origin_input_ids or ()), len(req.output_ids or ()),
+                    )
 
         reqs_to_abort: List[Req] = []
         if len(sorted_indices) <= 1 and not self.check_decode_mem(
@@ -4392,7 +4410,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 # scheduling turn once pressure eases (a spill region frees
                 # up, another request finishes, ...).
                 retracted_reqs.append(last_req)
-                self.release_req(last_idx, 0, server_args)
+                self.release_req(last_idx, 0, server_args, retain=_retain)
                 logger.warning(
                     "retract_decode: retracted the last remaining request "
                     "%s (solo-OOM #%d/%d) instead of aborting it -- the "
@@ -4484,7 +4502,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         )
         return sorted_indices
 
-    def release_req(self, idx: int, remaing_req_count: int, server_args: ServerArgs):
+    def release_req(self, idx: int, remaing_req_count: int, server_args: ServerArgs,
+                    retain: bool = False):
         release_req(
             req=self.reqs[idx],
             remaing_req_count=remaing_req_count,
@@ -4493,6 +4512,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             tree_cache=self.tree_cache,
             hisparse_coordinator=self.hisparse_coordinator,
+            retain=retain,
         )
 
     def prepare_encoder_info_decode(self):

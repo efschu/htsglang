@@ -18027,6 +18027,17 @@ class Scheduler(
             "the front requeues and flips",
             message, watch.stalls,
         )
+        try:  # Punkt 1 (18.09.): name WHO holds the rows the adder could not evict
+            _cs = getattr(self.tree_cache, "weg2_lock_census_str", None)
+            if _cs is not None:
+                logger.error(
+                    "WEG2-INTAKE-STALL-CENSUS rid=%s pool_avail=%d %s",
+                    str(req.rid)[:16],
+                    int(self.token_to_kv_pool_allocator.available_size()),
+                    _cs(),
+                )
+        except Exception:  # noqa: BLE001 -- the census never blocks the answer
+            logger.warning("WEG2-INTAKE-STALL-CENSUS raised", exc_info=True)
         refused_id = id(req)
         self.waiting_queue = [q for q in self.waiting_queue if id(q) != refused_id]
         try:
