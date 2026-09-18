@@ -12,17 +12,18 @@ import torch  # noqa: E402
 def test_release_drain_cap_env(monkeypatch):
     from sglang.srt.mem_cache import unified_radix_cache as u
     monkeypatch.delenv("SGLANG_WEG2_RELEASE_DRAIN_CAP", raising=False)
+    assert u._weg2_release_drain_cap() == 0          # xsn335: off by default
+    monkeypatch.setenv("SGLANG_WEG2_RELEASE_DRAIN_CAP", "64")
     assert u._weg2_release_drain_cap() == 64
-    monkeypatch.setenv("SGLANG_WEG2_RELEASE_DRAIN_CAP", "0")
-    assert u._weg2_release_drain_cap() == 0
     monkeypatch.setenv("SGLANG_WEG2_RELEASE_DRAIN_CAP", "x")
-    assert u._weg2_release_drain_cap() == 64
+    assert u._weg2_release_drain_cap() == 0
     src = open(u.__file__).read()
     i = src.index("def drain_storage_control_queues")
     assert "_cap = _weg2_release_drain_cap()" in src[i:i + 3000]
 
 
-def test_state_loader_splits_layers_like_the_per_layer_path():
+def test_state_loader_splits_layers_like_the_per_layer_path(monkeypatch):
+    monkeypatch.setenv("SGLANG_WEG2_ARENA_STATE_LOAD_BLOCK_BYTES", str(1 << 20))  # the floor: forces blocks of 1 MiB // slot_bytes
     """A synthetic slot blob: L layers of temporal rows and 3 conv extents per
     layer; the all-layers loader must land the same bytes as per-layer copies."""
     from sglang.srt.mem_cache.pool_host import arena_mamba_pool as amp
@@ -58,10 +59,10 @@ def test_state_loader_splits_layers_like_the_per_layer_path():
         for s, d in zip(slots.tolist(), didx.tolist()):
             off, ln = t_ext[l]
             ref_t = blob[s, off:off + ln].contiguous().view(torch.bfloat16).view(t_shape)
-            assert torch.equal(temporal[l][d], ref_t)
+            assert torch.equal(temporal[l][d].contiguous().view(torch.uint8), ref_t.contiguous().view(torch.uint8))  # bytes: random bf16 holds NaN
             ch0 = 0
             for (off_j, ln_j) in c_ext[l]:
                 n_j = ln_j // (width * e)
                 ref_c = blob[s, off_j:off_j + ln_j].contiguous().view(torch.bfloat16).view(n_j, width)
-                assert torch.equal(conv[l][d, ch0:ch0 + n_j], ref_c)
+                assert torch.equal(conv[l][d, ch0:ch0 + n_j].contiguous().view(torch.uint8), ref_c.contiguous().view(torch.uint8))
                 ch0 += n_j

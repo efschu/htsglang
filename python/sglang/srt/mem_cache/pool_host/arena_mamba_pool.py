@@ -35,6 +35,13 @@ logger = logging.getLogger(__name__)
 _STATE_LOAD_N = 0
 
 
+def _arena_state_load_block_bytes() -> int:
+    try:
+        return max(1 << 20, int(os.environ.get("SGLANG_WEG2_ARENA_STATE_LOAD_BLOCK_BYTES", str(256 << 20))))
+    except ValueError:
+        return 256 << 20
+
+
 def _arena_state_load_on() -> bool:
     return str(os.environ.get("SGLANG_WEG2_ARENA_STATE_LOAD", "1")).strip().lower() not in ("0", "false", "no", "off")
 
@@ -305,32 +312,46 @@ class ArenaMambaPoolHost(MambaPoolHost):
         sb = int(self._page_bytes)
         dev = device_pool.mamba_cache.temporal[0].device
         _pin = bool(dev.type == "cuda")
-        if self._state_stage is None or self._state_stage.shape[0] < n:
-            self._state_stage = torch.empty((n, sb), dtype=torch.uint8, pin_memory=_pin)
-        stage = self._state_stage[:n]
-        torch.index_select(self._slot_view, 0, slots.to("cpu", dtype=torch.int64), out=stage)
-        dev_stage = stage.to(dev, non_blocking=_pin)
+        # xsn335: a state is ~78 MiB; 12 at once = 941 MB pinned + 941 MB
+        # device transient, the pass took 1087 ms and the host rate latch (W98)
+        # tripped. Fixed block: at most SGLANG_WEG2_ARENA_STATE_LOAD_BLOCK_BYTES
+        # (256 MiB) per gather, stages reused.
+        B = max(1, _arena_state_load_block_bytes() // sb)
+        if self._state_stage is None or self._state_stage.shape[0] < min(B, n):
+            self._state_stage = torch.empty((min(B, n), sb), dtype=torch.uint8, pin_memory=_pin)
+        if getattr(self, "_state_dev_stage", None) is None or self._state_dev_stage.shape[0] < min(B, n) \
+                or self._state_dev_stage.device != dev:
+            self._state_dev_stage = torch.empty((min(B, n), sb), dtype=torch.uint8, device=dev)
+        slots_cpu = slots.to("cpu", dtype=torch.int64)
         didx = didx.to(dev)
-        e_t = int(self.temporal_dtype.itemsize)
         e_c = int(self.conv_dtype.itemsize)
         t_shape = tuple(lay["t_shape"]); conv_shape = tuple(lay["conv_shape"]); width = int(lay["width"])
-        for l in range(int(lay["L"])):
-            off, ln = lay["t_ext"][l]
-            src = dev_stage[:, off:off + ln].contiguous().view(self.temporal_dtype).view((n,) + t_shape)
-            device_pool.mamba_cache.temporal[l].index_copy_(0, didx, src)
-            dst_c = device_pool.mamba_cache.conv[0][l]
-            row = torch.empty((n,) + conv_shape, dtype=dst_c.dtype, device=dev)
-            ch0 = 0
-            for (off_j, ln_j) in lay["c_ext"][l]:
-                n_j = ln_j // (width * e_c)
-                row[:, ch0:ch0 + n_j] = dev_stage[:, off_j:off_j + ln_j].contiguous().view(self.conv_dtype).view(n, n_j, width)
-                ch0 += n_j
-            dst_c.index_copy_(0, didx, row)
+        for start in range(0, n, B):
+            b = min(B, n - start)
+            stage = self._state_stage[:b]
+            torch.index_select(self._slot_view, 0, slots_cpu[start:start + b], out=stage)
+            dev_stage = self._state_dev_stage[:b]
+            dev_stage.copy_(stage, non_blocking=_pin)
+            d_b = didx[start:start + b]
+            for l in range(int(lay["L"])):
+                off, ln = lay["t_ext"][l]
+                src = dev_stage[:, off:off + ln].contiguous().view(self.temporal_dtype).view((b,) + t_shape)
+                device_pool.mamba_cache.temporal[l].index_copy_(0, d_b, src)
+                dst_c = device_pool.mamba_cache.conv[0][l]
+                row = torch.empty((b,) + conv_shape, dtype=dst_c.dtype, device=dev)
+                ch0 = 0
+                for (off_j, ln_j) in lay["c_ext"][l]:
+                    n_j = ln_j // (width * e_c)
+                    row[:, ch0:ch0 + n_j] = dev_stage[:, off_j:off_j + ln_j].contiguous().view(self.conv_dtype).view(b, n_j, width)
+                    ch0 += n_j
+                dst_c.index_copy_(0, d_b, row)
+            if _pin and start + b < n:
+                torch.cuda.current_stream(dev).synchronize()  # the stage is reused by the next block
         global _STATE_LOAD_N
         _STATE_LOAD_N += 1
         if _STATE_LOAD_N <= 8 or _STATE_LOAD_N % 64 == 0:
-            logger.info("WEG2-ARENA-STATE-LOAD n=%d slots=%d bytes=%d (all layers, one pinned gather + one H2D, split on device)",
-                        _STATE_LOAD_N, n, n * sb)
+            logger.info("WEG2-ARENA-STATE-LOAD n=%d slots=%d bytes=%d block=%d (all layers, pinned gather + H2D per block, split on device)",
+                        _STATE_LOAD_N, n, n * sb, B)
 
     def load_to_device_per_layer(self, device_pool, host_indices, device_indices, layer_id, io_backend="direct"):
         if self.arena is None or host_indices.numel() == 0:

@@ -416,11 +416,14 @@ logger = logging.getLogger(__name__)
 
 def _weg2_release_drain_cap() -> int:
     """Entries of the host-release queues drained per scheduling pass; 0 = all
-    (SGLANG_WEG2_RELEASE_DRAIN_CAP, default 64 -- xsn332)."""
+    (SGLANG_WEG2_RELEASE_DRAIN_CAP, default 0 = all -- xsn332/335)."""
     try:
-        return max(0, int(os.environ.get("SGLANG_WEG2_RELEASE_DRAIN_CAP", "64")))
+        # xsn335: capped at 64, the host rows of the dormant phase stayed
+        # referenced, P claimed fresh arena slots and shmem rose into the W98
+        # host-rate latch -- default OFF until the drain is measured alone.
+        return max(0, int(os.environ.get("SGLANG_WEG2_RELEASE_DRAIN_CAP", "0")))
     except ValueError:
-        return 64
+        return 0
 
 # #1233 zero-remainder: END-OF-PREFILL ANCHOR instrument, armed by the Weg-2
 # launcher on group P together with the schedule_policy split (same env).
