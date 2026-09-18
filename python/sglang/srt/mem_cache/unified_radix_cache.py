@@ -1779,6 +1779,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 insert_result=result,
                 insert_params=insert_params,
             )
+        self._weg2_publish_at_chunk(req, radix_key)   # xsn346: the chunk's node goes out now
 
     # ---- Internal Helpers ----
 
@@ -3310,6 +3311,29 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             return chain
         except Exception:  # noqa: BLE001 - an accelerator, never a wall
             return []
+
+    def _weg2_publish_at_chunk(self, req, radix_key) -> None:
+        """xsn346: publish the request's chain (this chunk's node last, its
+        parents first) while the request still prefills -- a small budget per
+        chunk, so the retain finds one node left and D's dormant read of the
+        LAST request of a phase is complete before the flip begins."""
+        try:
+            from sglang.srt.weg2 import retain_publish as _rp
+            if not _rp.publish_at_chunk_on() or not self.enable_storage:
+                return
+            first = self._weg2_chain_nodes(radix_key)
+            if not first:
+                return
+            stats = self.publish_unbacked_sweep(max_issue=_rp.max_issue(),
+                                                clock=_rp.SweepClock(_rp.chunk_budget_s()),
+                                                first=first) or {}
+            n = getattr(self, "_weg2_chunk_publish_n", 0) + 1
+            self._weg2_chunk_publish_n = n
+            if n <= 16 or n % 256 == 0:
+                logger.info("WEG2 CHUNK-PUBLISH rid=%s chain=%d %s (n=%d)", str(getattr(req, "rid", "?"))[:12],
+                            len(first), stats, n)
+        except Exception as exc:  # noqa: BLE001 -- a publisher never takes the chunk down
+            logger.warning("WEG2 CHUNK-PUBLISH raised %s: %s", type(exc).__name__, exc)
 
     def _weg2_handoff_write(self, req, radix_key) -> None:
         """#1442: hand P's finished prefill to D by rid -- the token ids and

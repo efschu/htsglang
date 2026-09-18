@@ -51,3 +51,22 @@ def test_scheduler_holds_the_w88_bound_while_dormant_and_sweep_takes_first():
     from sglang.srt.mem_cache import unified_radix_cache as u
     s2 = inspect.getsource(u.UnifiedRadixCache.publish_unbacked_sweep)
     assert "queue = list(first or []) + [self.root_node]" in s2
+
+
+def test_chunk_publish_gate_and_budget():
+    assert rp.publish_at_chunk_on({"SGLANG_WEG2_GROUP": "P"})
+    assert not rp.publish_at_chunk_on({"SGLANG_WEG2_GROUP": "D"})
+    assert not rp.publish_at_chunk_on({"SGLANG_WEG2_GROUP": "P", rp.CHUNK_ENV: "0"})
+    assert rp.chunk_budget_s({}) == 0.15
+    assert rp.chunk_budget_s({rp.CHUNK_BUDGET_ENV: "0"}) == 0.0
+    assert rp.chunk_budget_s({rp.CHUNK_BUDGET_ENV: "x"}) == 0.15
+
+
+def test_chunk_site_publishes_after_the_cleanup():
+    import inspect
+    from sglang.srt.mem_cache import unified_radix_cache as u
+    src = inspect.getsource(u.UnifiedRadixCache.cache_unfinished_req)
+    i = src.index("cleanup_after_caching_req")
+    assert "self._weg2_publish_at_chunk(req, radix_key)" in src[i:]
+    s2 = inspect.getsource(u.UnifiedRadixCache._weg2_publish_at_chunk)
+    assert "chunk_budget_s()" in s2 and "first=first" in s2

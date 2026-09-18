@@ -80,3 +80,30 @@ def dormant_standstill_holds(dormant: bool) -> bool:
     sleep flush, so the store WILL fill; a dormant standstill is a wait, not a
     dead read. The pass/wall bound applies from the wake on."""
     return bool(dormant)
+
+
+CHUNK_ENV = "SGLANG_WEG2_PUBLISH_AT_CHUNK"
+CHUNK_BUDGET_ENV = "SGLANG_WEG2_PUBLISH_AT_CHUNK_BUDGET_MS"
+
+
+def publish_at_chunk_on(env: Optional[Mapping[str, str]] = None) -> bool:
+    """xsn346 (18.09.): with the run-mode writer the three EARLIER 100k
+    requests of a phase were extended in D's first wake pass (3,8 s after
+    P's end), the LAST one 2 s later -- its 24 nodes were only issued at its
+    retain. Publish each chunk's node while the request still prefills, so
+    the retain finds one node left. Group P only, default on."""
+    env = os.environ if env is None else env
+    if str(env.get(CHUNK_ENV, "1")).strip().lower() in ("0", "false", "no", "off"):
+        return False
+    return str(env.get("SGLANG_WEG2_GROUP", "")).strip().upper() == "P"
+
+
+def chunk_budget_s(env: Optional[Mapping[str, str]] = None) -> float:
+    """Wall budget per chunk sweep (ms, default 150; 0 = unbounded): one
+    4096-page node issues in ~30 ms, the chunk's compute is ~1 s."""
+    env = os.environ if env is None else env
+    try:
+        ms = float(env.get(CHUNK_BUDGET_ENV, "150"))
+    except ValueError:
+        ms = 150.0
+    return max(0.0, ms) / 1000.0
