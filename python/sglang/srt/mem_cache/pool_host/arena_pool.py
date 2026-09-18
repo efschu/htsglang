@@ -46,6 +46,34 @@ _CUDA_HOST_REGISTER_FLAGS = 3  # Portable | Mapped
 _CUDA_ERROR_ALREADY_REGISTERED = 712
 
 
+ARENA_PAGE_LOAD_ENV = "SGLANG_WEG2_ARENA_PAGE_LOAD"
+ARENA_PAGE_LOAD_BLOCK_ENV = "SGLANG_WEG2_ARENA_PAGE_LOAD_BLOCK"
+
+
+_PAGE_LOAD_N = 0
+
+
+class _NoEvent:
+    """Stand-in for torch.cuda.Event on a CPU-only desk (tests)."""
+    def record(self, *a, **k):
+        pass
+
+    def synchronize(self):
+        pass
+
+
+def _arena_page_load_on() -> bool:
+    """Posten 2 (18.09.): whole-page loadback, standard on; =0 for an A/B."""
+    return str(os.environ.get(ARENA_PAGE_LOAD_ENV, "1")).strip().lower() not in ("0", "false", "no", "off")
+
+
+def _arena_page_load_block() -> int:
+    try:
+        return max(64, int(os.environ.get(ARENA_PAGE_LOAD_BLOCK_ENV, "2048")))
+    except ValueError:
+        return 2048
+
+
 def _arena_load_block_quota():
     """Task #3 (17.09.): the JIT gather's block quota for the ARENA -> device
     load. The kernel default (2 blocks = 64 warps in flight) is tuned for
@@ -184,6 +212,17 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
             typed.as_strided((A, H, D), (tok, D, 1), storage_offset=base_off + v_offs[l] // e)
             for l in range(L)
         ]
+        # Posten 2 (18.09.): WHOLE-PAGE loadback. One arena slot is one page
+        # holding K and V of EVERY layer; the per-layer gather kernel read it
+        # as 2*L separate 1-KiB rows over PCIe (0,6-1,5 GB/s, xsn303). The
+        # page view lets the load fetch 32-KiB pages once and split layers on
+        # the device (`_load_pages_all_layers`).
+        self._page_view = region.view(A, page_bytes)
+        self._page_bytes = int(page_bytes)
+        self._k_offs_b = [int(k_offs[l]) for l in range(L)]
+        self._v_offs_b = [int(v_offs[l]) for l in range(L)]
+        self._page_loaded_key = None
+        self._page_stages = None
         # #1424e (boot xsn177/179): registering the WHOLE mapping materialised
         # every untouched tmpfs slot (27 GiB resident at once); the ledger
         # measured it as a 37.95 GiB flip ratchet and refused every later
@@ -335,6 +374,23 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
                 f"read of an unregistered host page is an illegal address")
 
     def _load_arena(self, device_pool, rows, device_indices, layer_id) -> None:
+        if _arena_page_load_on() and getattr(self, "_page_view", None) is not None:
+            key = (id(rows), id(device_indices), int(rows.numel()), int(device_indices.numel()))
+            if layer_id != 0 and self._page_loaded_key == key:
+                return  # every layer came with the page load at layer 0
+            if layer_id == 0:
+                slots = rows
+                if self.row_slot is not None:
+                    rl = rows.tolist()
+                    slots = torch.tensor([self.row_slot.get(int(r), -1) for r in rl], dtype=rows.dtype, device=rows.device)
+                if slots.numel() and bool((slots >= 0).all()):
+                    self.pin_slots(slots)
+                    self._arena_load_guard(device_pool, slots, device_indices, 0, nrows=int(rows.numel()), nmiss=0)
+                    self._load_pages_all_layers(device_pool, slots, device_indices)
+                    self._page_loaded_key = key
+                    return
+                # misses (row_slot without a slot) keep the per-layer path below
+            self._page_loaded_key = None
         if self.row_slot is not None:
             rl = rows.tolist()
             slots = torch.tensor([self.row_slot.get(int(r), -1) for r in rl], dtype=rows.dtype, device=rows.device)
@@ -353,6 +409,53 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
         self._arena_load_guard(device_pool, rows, device_indices, layer_id, nrows=int(rows.numel()), nmiss=0)
         self._transfer(device_pool, self.arena_k_refs[layer_id], self.arena_v_refs[layer_id],
                        rows, device_indices, layer_id)
+
+    def _load_pages_all_layers(self, device_pool, slots, device_indices) -> None:
+        """Fetch whole 32-KiB pages (all layers of a token) in blocks through
+        a pinned host stage and one H2D copy per block, then scatter each
+        layer on the device. Two pinned stages alternate so the CPU gather of
+        block i+1 overlaps the DMA of block i."""
+        B = _arena_page_load_block()
+        n = int(slots.numel())
+        if n == 0:
+            return
+        dev = device_pool.k_buffer[0].device
+        pb = self._page_bytes
+        H, D = int(self.head_num), int(self.head_dim)
+        e = self.dtype.itemsize
+        cell = H * D * e
+        if self._page_stages is None or self._page_stages[0].shape[0] < B:
+            _pin = bool(dev.type == "cuda")
+            self._page_stages = (
+                torch.empty((B, pb), dtype=torch.uint8, pin_memory=_pin),
+                torch.empty((B, pb), dtype=torch.uint8, pin_memory=_pin),
+            )
+            self._page_events = ((torch.cuda.Event(), torch.cuda.Event()) if _pin
+                                 else (_NoEvent(), _NoEvent()))
+        cpu_slots = slots.to("cpu", dtype=torch.int64)
+        dev_stage = torch.empty((min(B, n), pb), dtype=torch.uint8, device=dev)
+        L = len(self._k_offs_b)
+        for bi, start in enumerate(range(0, n, B)):
+            b = min(B, n - start)
+            k = bi % 2
+            self._page_events[k].synchronize()  # the DMA that last read this stage is done
+            host_stage = self._page_stages[k]
+            torch.index_select(self._page_view, 0, cpu_slots[start:start + b], out=host_stage[:b])
+            dev_stage[:b].copy_(host_stage[:b], non_blocking=True)
+            self._page_events[k].record()
+            dst = device_indices[start:start + b].to(device=dev, dtype=torch.int64)
+            for l in range(L):
+                ko, vo = self._k_offs_b[l], self._v_offs_b[l]
+                device_pool.k_buffer[l].index_copy_(
+                    0, dst, dev_stage[:b, ko:ko + cell].reshape(-1).view(self.dtype).view(b, H, D))
+                device_pool.v_buffer[l].index_copy_(
+                    0, dst, dev_stage[:b, vo:vo + cell].reshape(-1).view(self.dtype).view(b, H, D))
+        global _PAGE_LOAD_N
+        _PAGE_LOAD_N += 1
+        n_log = _PAGE_LOAD_N
+        if n_log <= 8 or n_log % 64 == 0:
+            logger.info("WEG2-ARENA-PAGE-LOAD n=%d rows=%d pages=%d block=%d bytes=%d (whole pages, layers split on device)",
+                        n_log, n, n, B, n * pb)
 
     def pin_slots(self, slots) -> int:
         """Register the slots' pages (contiguous runs in one call each) that
