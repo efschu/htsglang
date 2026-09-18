@@ -2379,8 +2379,15 @@ class PrefillAdder:
                             req, self.tree_cache, site="loadback_no_room"
                         )
                         req.mamba_loadback_anchor_adopted = False
-                        _n = getattr(self, "_weg2_loadback_no_room", 0) + 1
-                        self._weg2_loadback_no_room = _n
+                        # xsn285: the counter lives on the TREE (the adder is
+                        # rebuilt every pass -- on the adder it read n=1 every
+                        # time and printed 102k lines in 150 s).
+                        _tc = self.tree_cache
+                        _n = getattr(_tc, "_weg2_loadback_no_room", 0) + 1
+                        try:
+                            _tc._weg2_loadback_no_room = _n
+                        except Exception:  # noqa: BLE001 -- a slotted double
+                            pass
                         if _n <= 3 or (_n & (_n - 1)) == 0:
                             logger.info(
                                 "WEG2-LOADBACK-WAIT rid=%s extent=%d applied=0: no device "

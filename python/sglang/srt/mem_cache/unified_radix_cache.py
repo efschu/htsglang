@@ -3710,6 +3710,34 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 f"local_available={self.token_to_kv_pool_allocator.available_size()}"
             )
         if floor < kv_tokens:
+            # weg2xsn285 (18.09.): THE FLOOR REFUSED AND NOBODY EVICTED. Group
+            # D held three finished 98k prompts (retained, backed up,
+            # evictable) and the fourth's load-back asked for 99570 tokens
+            # against a uniform floor of 68841 -- refused here every pass,
+            # 102k WEG2-LOADBACK-WAIT lines in 150 s, the flip's drain
+            # stalled, the boot was killed. The floor counts FREE rows only;
+            # the room is in the evictable leaves, and the prefill path's
+            # `evict_from_tree_cache` never runs for a load-back. Evict
+            # RANK-UNIFORMLY -- every rank drains its whole evictable leaf
+            # set in LRU order (the sets are replicas: same tree, same
+            # locks; the flip runtime evicts the same way), so no rank
+            # decides from its own shard -- and refuse THIS pass as before:
+            # the next iteration's floor is published from the freed pools.
+            _ev = int(self.evictable_size())
+            if _ev > 0:
+                _n = getattr(self, "_weg2_loadback_evicts", 0) + 1
+                self._weg2_loadback_evicts = _n
+                _res = self.evict(EvictParams(num_tokens=_ev))
+                if _n <= 3 or (_n & (_n - 1)) == 0:
+                    logger.info(
+                        "WEG2-LOADBACK-EVICT rid=%s kv_tokens=%d floor=%d: the uniform "
+                        "floor is short by %d, the evictable leaves are drained "
+                        "rank-uniformly (requested=%d evicted=%d); this pass refuses, "
+                        "the next floor decides (n=%d)",
+                        getattr(req, "rid", None), int(kv_tokens), int(floor),
+                        int(kv_tokens) - int(floor), _ev,
+                        int(getattr(_res, "num_tokens_evicted", 0) or 0), _n,
+                    )
             self.dec_lock_ref(best_match_node, ancestor_lock_params)
             self.dec_host_lock_ref(best_match_node, host_anchor_params)
             return False

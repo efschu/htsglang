@@ -17,7 +17,7 @@ def test_zero_rows_loaded_under_an_adopted_anchor_waits_instead_of_refusing():
     from sglang.srt.managers import schedule_policy as sp
     src = open(sp.__file__).read()
     i = src.index("_applied = int(new_indices.numel())")
-    blk = src[i:i + 2200]
+    blk = src[i:i + 3200]
     j = blk.index("if _applied == 0 and _lb_extent > 0")
     k = blk.index("if _applied != _lb_extent and getattr(")
     assert j < k, "the no-room wait must be decided BEFORE the #968 refusal"
