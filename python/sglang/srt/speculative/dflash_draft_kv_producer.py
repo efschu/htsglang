@@ -73,13 +73,38 @@ def _token_stream(req) -> List[int]:
         getattr(req, "output_ids", ()) or ())
 
 
-def chunk_page_hashes(req, prefix_len: int, extend_len: int) -> List[str]:
+def _key_units(tokens: List[int], bigram: bool):
+    """The hash input for ``tokens`` in the radix cache's own key scheme.
+    Unigram: the token list itself. Bigram (weg2xsn269, 18.09.): a
+    ``RadixKey(is_bigram=True)`` over the raw tokens -- ``get_hash_str``
+    reads its ``is_bigram`` flag and hashes the N-1 units (t_i, t_i+1)
+    exactly as ``compute_node_hash_values`` does for a tree node."""
+    if not bigram:
+        return tokens
+    from array import array
+
+    from sglang.srt.mem_cache.radix_cache import RadixKey
+
+    return RadixKey(array("q", tokens), None, is_bigram=True)
+
+
+def chunk_page_hashes(req, prefix_len: int, extend_len: int, *,
+                      bigram: bool = False) -> List[str]:
     """The canonical page hashes of ``req``'s positions
     ``[prefix_len, prefix_len + extend_len)``, continuing the chain cached
     on the request when the previous chunk ended exactly at ``prefix_len``.
 
     The token stream (``_token_stream``: ``get_fill_ids()`` on this fork's
     ``Req``) is what the radix keys hash.
+
+    ``bigram`` (weg2xsn268/269, 18.09.): under SGLANG_HICACHE_BIGRAM_KEYS=1
+    (every Weg 2 group, so that P's pages are readable by D) the tree keys
+    page ``i`` by the bigram chain up to (t_i, t_i+1). The unigram chain this
+    producer published under before was a DISJOINT key space: PP2 published
+    4316 draft pages, D's draft L3 READ found 0 of them (xsn268, xsn269).
+    In bigram form position ``i`` needs token ``i+1``; the chunk's last
+    position has none when the chunk ends the filled stream, so that page is
+    NOT produced (the tree cannot key it either) and the list is one short.
     """
     from sglang.srt.mem_cache.utils import get_hash_str
 
@@ -92,31 +117,69 @@ def chunk_page_hashes(req, prefix_len: int, extend_len: int) -> List[str]:
             f"rid={getattr(req, 'rid', '?')}: chunk [{prefix_len}, {end}) "
             f"reaches past the {len(tokens)} filled token(s)"
         )
+    # raw tokens the chain needs: one past the last position in bigram form
+    raw_end = min(end + 1, len(tokens)) if bigram else end
+    want = (raw_end - 1 - prefix_len) if bigram else extend_len
+    if want <= 0:
+        return []
     cached_pos = getattr(req, _HASH_POS_ATTR, None)
     cached_last = getattr(req, _HASH_LAST_ATTR, None)
     if prefix_len == 0:
-        hashes = get_hash_str(tokens[:end], None, page_size=1)
+        hashes = get_hash_str(_key_units(tokens[:raw_end], bigram), None, page_size=1)
     elif cached_pos == prefix_len and cached_last:
-        hashes = get_hash_str(tokens[prefix_len:end], cached_last, page_size=1)
+        hashes = get_hash_str(
+            _key_units(tokens[prefix_len:raw_end], bigram), cached_last, page_size=1
+        )
     else:
         # A prefix hit or a chunk boundary we did not see: rebuild the chain
         # from position 0 (same function, same result, only slower).
-        hashes = get_hash_str(tokens[:end], None, page_size=1)[prefix_len:]
-    if not isinstance(hashes, list) or len(hashes) != extend_len:
+        hashes = get_hash_str(_key_units(tokens[:raw_end], bigram), None, page_size=1)[prefix_len:]
+    if not isinstance(hashes, list) or len(hashes) != want:
         raise DFlashDraftKvProduceError(
-            f"rid={getattr(req, 'rid', '?')}: expected {extend_len} page hash(es) "
+            f"rid={getattr(req, 'rid', '?')}: expected {want} page hash(es) "
             f"for the chunk, got {len(hashes) if isinstance(hashes, list) else type(hashes).__name__}"
         )
-    setattr(req, _HASH_POS_ATTR, end)
+    setattr(req, _HASH_POS_ATTR, prefix_len + want)
     setattr(req, _HASH_LAST_ATTR, hashes[-1])
     return hashes
 
 
-def batch_page_hashes(batch) -> List[str]:
+def batch_page_hashes(batch, *, bigram: bool = False) -> List[str]:
     out: List[str] = []
     for req, pl, el in zip(batch.reqs, batch.prefix_lens, batch.extend_lens):
-        out.extend(chunk_page_hashes(req, int(pl), int(el)))
+        out.extend(chunk_page_hashes(req, int(pl), int(el), bigram=bigram))
     return out
+
+
+def _rows_to_publish(batch, ring_locs, *, bigram: bool):
+    """Per request, the hashes of its chunk and the ring rows they key --
+    in batch order, so that ``ring_locs`` (one row per extend token, in the
+    batch's token order) is sliced per request. A request whose bigram
+    chain is one short (see ``chunk_page_hashes``) contributes one row
+    fewer; no row is ever published under the wrong request's key."""
+    hashes: List[str] = []
+    keep: List[int] = []
+    base = 0
+    for req, pl, el in zip(batch.reqs, batch.prefix_lens, batch.extend_lens):
+        el = int(el)
+        h = chunk_page_hashes(req, int(pl), el, bigram=bigram)
+        hashes.extend(h)
+        keep.extend(range(base, base + len(h)))
+        base += el
+    if len(keep) == int(ring_locs.numel()):
+        return hashes, ring_locs
+    import torch
+
+    idx = torch.tensor(keep, dtype=torch.int64, device=ring_locs.device)
+    return hashes, ring_locs[idx]
+
+
+def tree_keys_are_bigram(scheduler) -> bool:
+    """Whether this group's radix cache keys its pages by bigram (NEXTN/EAGLE
+    form, or SGLANG_HICACHE_BIGRAM_KEYS=1 forcing it) -- read from the tree
+    itself, the one carrier of that fact, never from the env."""
+    tree = getattr(scheduler, "tree_cache", None)
+    return bool(getattr(tree, "is_eagle", False))
 
 
 def ring_capacity(server_args) -> int:
@@ -317,16 +380,28 @@ class DFlashDraftKvProducer:
                 cache_loc=ring_locs,
                 positions=positions,
             )
-        hashes = batch_page_hashes(batch)
-        if len(hashes) != rows:
+        bigram = tree_keys_are_bigram(self.scheduler)
+        hashes, locs = _rows_to_publish(batch, ring_locs, bigram=bigram)
+        if len(hashes) != int(locs.numel()):
             raise DFlashDraftKvProduceError(
-                f"{len(hashes)} page hash(es) for {rows} draft row(s)"
+                f"{len(hashes)} page hash(es) for {int(locs.numel())} draft row(s)"
             )
         published = int(
             self._cache_controller().publish_draft_rows_direct(
-                hashes, self.draft_runner.token_to_kv_pool, ring_locs
+                hashes, self.draft_runner.token_to_kv_pool, locs
             )
-        )
+        ) if hashes else 0
+        if len(hashes) != rows and self._chunks == 0:
+            logger.info(
+                "WEG2 DFLASH DRAFT-KV-PRODUCE keys=%s: %d of %d row(s) of this "
+                "chunk carry a page key; a request's last filled position has "
+                "no bigram partner yet, so its draft page is produced with the "
+                "next chunk of that request (or never, at the prompt end -- the "
+                "tree cannot key it either)",
+                "bigram" if bigram else "unigram",
+                len(hashes),
+                rows,
+            )
         ms = (time.monotonic() - t0) * 1000.0
         peak = (torch.cuda.max_memory_allocated(dev) - before) / float(2**20)
         self._chunks += 1

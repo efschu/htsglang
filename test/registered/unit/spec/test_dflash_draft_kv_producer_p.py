@@ -209,3 +209,76 @@ def test_xsn262_the_token_stream_comes_from_the_forks_req_get_fill_ids():
     r = _ForkReq()
     got = chunk_page_hashes(r, 0, 10)
     assert got == get_hash_str(toks[:10], None, page_size=1)
+
+
+# ---------------------------------------------------------------------------
+# weg2xsn268/269 (18.09.2026): 0 draft hits on D. Every Weg 2 group runs with
+# SGLANG_HICACHE_BIGRAM_KEYS=1, so the tree keys page i by the bigram chain up
+# to (t_i, t_i+1); the producer hashed the raw unigram list -- a disjoint key
+# space (PP2 published 4316 pages, D's draft L3 READ found 0). The producer
+# now hashes in the tree's own scheme and drops the one position that has no
+# bigram partner yet.
+# ---------------------------------------------------------------------------
+
+def _tree_hashes_bigram(tokens):
+    """What the tree keys these tokens' pages by (compute_node_hash_values
+    over a bigram RadixKey, one node)."""
+    from array import array
+    from sglang.srt.mem_cache.radix_cache import RadixKey
+    return get_hash_str(RadixKey(array("q", tokens), None, is_bigram=True), None, page_size=1)
+
+
+def test_xsn269_bigram_chunks_reproduce_the_trees_bigram_chain():
+    tokens = list(range(500, 541))          # 41 tokens -> 40 bigram pages
+    whole = _tree_hashes_bigram(tokens)
+    assert len(whole) == 40
+    r = _req(tokens)
+    got = (chunk_page_hashes(r, 0, 16, bigram=True)
+           + chunk_page_hashes(r, 16, 16, bigram=True)
+           + chunk_page_hashes(r, 32, 9, bigram=True))
+    # the last filled position (40) has no partner: 40 pages, not 41
+    assert got == whole
+    # and the unigram chain is a DIFFERENT key space (the bug's shape)
+    assert got != get_hash_str(tokens, None, page_size=1)[:40]
+
+
+def test_xsn269_a_chunk_ending_the_stream_is_one_short_and_the_next_chunk_completes_it():
+    tokens = list(range(700, 730))          # 30 tokens
+    whole = _tree_hashes_bigram(tokens)
+    r = _req(tokens[:20])                   # only 20 filled so far
+    first = chunk_page_hashes(r, 0, 20, bigram=True)
+    assert first == whole[:19]              # position 19 waits for token 20
+    r.fill_ids = list(tokens)               # the next chunk fills 10 more
+    second = chunk_page_hashes(r, 20, 10, bigram=True)
+    # rebuilt from zero (the cached chain stopped at 19, not 20), positions 20..28
+    assert second == whole[20:29]
+    # position 19's page is produced by NEITHER chunk: the tree keys it when
+    # the request's next chunk/decode inserts it -- consistent, never wrong.
+    assert first + second == whole[:19] + whole[20:29]
+
+
+def test_xsn269_unigram_form_is_unchanged():
+    tokens = list(range(100, 132))
+    r = _req(tokens)
+    assert chunk_page_hashes(r, 0, 32) == get_hash_str(tokens, None, page_size=1)
+    assert chunk_page_hashes(_req(tokens), 0, 32, bigram=False) == chunk_page_hashes(_req(tokens), 0, 32)
+
+
+def test_xsn269_rows_to_publish_slices_the_ring_per_request():
+    from sglang.srt.speculative.dflash_draft_kv_producer import _rows_to_publish
+    a, b = list(range(10, 22)), list(range(40, 48))      # 12 and 8 tokens
+    batch = SimpleNamespace(reqs=[_req(a, "a"), _req(b, "b")], prefix_lens=[0, 0], extend_lens=[12, 8])
+    ring = torch.arange(20, dtype=torch.int64)
+    hashes, locs = _rows_to_publish(batch, ring, bigram=True)
+    assert hashes == _tree_hashes_bigram(a) + _tree_hashes_bigram(b)
+    assert locs.tolist() == list(range(0, 11)) + list(range(12, 19))   # rows 11 and 19 wait
+    h2, l2 = _rows_to_publish(batch, ring, bigram=False)
+    assert len(h2) == 20 and l2 is ring
+
+
+def test_xsn269_the_flag_comes_from_the_tree_not_the_env(monkeypatch):
+    from sglang.srt.speculative.dflash_draft_kv_producer import tree_keys_are_bigram
+    monkeypatch.setenv("SGLANG_HICACHE_BIGRAM_KEYS", "1")
+    assert tree_keys_are_bigram(SimpleNamespace(tree_cache=SimpleNamespace(is_eagle=False))) is False
+    assert tree_keys_are_bigram(SimpleNamespace(tree_cache=SimpleNamespace(is_eagle=True))) is True
+    assert tree_keys_are_bigram(SimpleNamespace()) is False
