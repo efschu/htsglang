@@ -18,8 +18,9 @@ from sglang.srt.mem_cache.hybrid_cache import hybrid_cache_controller as hc  # n
 
 
 class _Mapper:
-    def __init__(self):
+    def __init__(self, device="cpu"):
         self.calls = []
+        self.device = device
 
     def translate_read(self, idx):
         self.calls.append(("read", idx.tolist()))
@@ -52,3 +53,22 @@ def test_both_hybrid_branches_translate_the_draft_rows():
     b = open(cc.__file__).read()
     k = b.index("def _draft_device_indices")
     assert 'if direction == "write":' in b[k:k + 800] and "translate_read(device_indices)" in b[k:k + 800]
+
+
+def test_xsn279_the_rows_are_moved_to_the_mappers_device_first():
+    """xsn279: 'Expected all tensors to be on the same device, cuda:0 and
+    cpu' -- the hybrid path carries CPU pair lists, the mapper's table lives
+    on the device. The rows are moved to mapper.device before translating."""
+    seen = {}
+
+    class _M(_Mapper):
+        def translate_write(self, idx):
+            seen["device"] = str(idx.device)
+            return idx
+    m = _M(device="cpu")
+    pool = SimpleNamespace(weg2_slot_mapper=m)
+    hc._draft_device_rows(pool, torch.tensor([1, 2]), "load")
+    assert seen["device"] == "cpu"
+    src = open(hc.__file__).read()
+    i = src.index("def _draft_device_rows")
+    assert 'getattr(mapper, "device", None)' in src[i:i + 1500] and "device_indices.to(device=dev)" in src[i:i + 1500]

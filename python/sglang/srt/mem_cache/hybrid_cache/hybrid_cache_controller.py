@@ -27,9 +27,15 @@ def _draft_device_rows(draft_pool, device_indices, direction: str):
     mapper = getattr(draft_pool, "weg2_slot_mapper", None)
     if mapper is None:
         return device_indices
+    # xsn279: the hybrid path carries the rows on the CPU (the 'direct' io
+    # backend's pair lists); the mapper's table lives on the device and
+    # `translate_write` masks against it ("Expected all tensors to be on the
+    # same device, cuda:0 and cpu"). Translate on the mapper's device.
+    dev = getattr(mapper, "device", None)
+    rows = device_indices if dev is None else device_indices.to(device=dev)
     if direction == "write":
-        return mapper.translate_read(device_indices)
-    return mapper.translate_write(device_indices)
+        return mapper.translate_read(rows)
+    return mapper.translate_write(rows)
 from sglang.srt.managers.cache_controller import consume_gate
 from sglang.srt.managers.cache_controller import (
     HiCacheAck,
