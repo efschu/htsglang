@@ -36,6 +36,38 @@ def _draft_device_rows(draft_pool, device_indices, direction: str):
     if direction == "write":
         return mapper.translate_read(rows)
     return mapper.translate_write(rows)
+
+
+_DRAFT_SKIP_LOGGED = {"n": 0}
+
+
+def _draft_rows_or_skip(draft_pool, device_indices, direction: str, *, nrows: int):
+    """weg2xsn281: ``(rows, skipped)``. The DFlash window pool on group D is
+    sized for the sub-threshold working set (ctx cap x running x factor:
+    4113 slots for a 2048-token cap); a load whose rows exceed what the pool
+    can hold -- every 100k prompt of the bs6 block, and even the 4316-token
+    smoke -- raised 'DFLASH small solo pool exhausted' on all three ranks
+    and killed the group. DFLASH does not serve an over-threshold context
+    (its writes are skipped by design, reads resolve to the zero hole
+    slot), so its draft KV is not loaded either: skipped BY NAME, the
+    target KV load runs unchanged, accept-rate only."""
+    try:
+        return _draft_device_rows(draft_pool, device_indices, direction), False
+    except RuntimeError as exc:
+        if "solo pool exhausted" not in str(exc):
+            raise
+        _DRAFT_SKIP_LOGGED["n"] += 1
+        n = _DRAFT_SKIP_LOGGED["n"]
+        if n <= 3 or (n & (n - 1)) == 0:
+            mapper = getattr(draft_pool, "weg2_slot_mapper", None)
+            logger.info(
+                "WEG2-DRAFT-LOAD SKIPPED rows=%d: the DFlash window pool cannot hold "
+                "this load (slots=%s ctx_cap=%s) -- over-threshold context, target KV "
+                "loads unchanged, draft KV absent (accept-rate only) (n=%d): %s",
+                nrows, getattr(mapper, "num_draft_slots", "?"),
+                getattr(mapper, "ctx_cap", "?"), n, str(exc)[:160],
+            )
+        return None, True
 from sglang.srt.managers.cache_controller import consume_gate
 from sglang.srt.managers.cache_controller import (
     HiCacheAck,
@@ -705,6 +737,11 @@ class HybridCacheController(BaseHiCacheController):
         )
         producer_event = self.layer_done_counter.events[producer_id]
         producer_event.start_event.record()
+        # xsn281: the draft rows are translated ONCE per load (the mapper
+        # allocates draft slots; a per-layer call would allocate per layer)
+        # and the draft half is skipped by name when the window pool cannot
+        # hold this load (an over-threshold context DFLASH will not serve).
+        draft_rows, draft_rows_skipped = None, False
         with device_module.stream(self.load_stream):
             producer_event.start_event.wait(self.load_stream)
             for i in range(self.mem_pool_host.transfer_layer_domain):
@@ -721,13 +758,18 @@ class HybridCacheController(BaseHiCacheController):
                     and host_indices.numel() > 0
                     and _host_pool_covers_layer(self.mem_pool_host_draft, i)
                 ):
-                    self.mem_pool_host_draft.load_to_device_per_layer(
-                        self.mem_pool_device_draft,
-                        host_indices,
-                        _draft_device_rows(self.mem_pool_device_draft, device_indices, "load"),
-                        i,
-                        self.io_backend,
-                    )
+                    if draft_rows is None and not draft_rows_skipped:
+                        draft_rows, draft_rows_skipped = _draft_rows_or_skip(
+                            self.mem_pool_device_draft, device_indices, "load",
+                            nrows=int(host_indices.numel()))
+                    if draft_rows is not None:
+                        self.mem_pool_host_draft.load_to_device_per_layer(
+                            self.mem_pool_device_draft,
+                            host_indices,
+                            draft_rows,
+                            i,
+                            self.io_backend,
+                        )
                 producer_event.complete(i)
             self._record_transfer_indices_on_stream(
                 self.load_stream,
