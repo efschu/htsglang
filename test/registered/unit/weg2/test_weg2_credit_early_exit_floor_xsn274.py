@@ -74,18 +74,37 @@ def test_the_card_that_frees_up_during_the_poll_is_granted(tmp_path):
     assert rec["claimed_bytes"] == 2502 * MIB and rec["waited_s"] >= 0.15
 
 
-def test_xsn284_a_live_but_short_counter_sends_the_tag_into_the_loop(tmp_path):
-    """xsn284: free=4338, floor=767, need=2502 -- allocatable covered -- but the
-    peer's counter had 741 MiB left; the peer refunded and re-staged 1673 MiB
-    into that free between the reading and cu_mem_create. The early exit now
-    needs the counter to COVER the tag; short, the tag waits on the counter
-    and is granted when the peer publishes."""
-    c = _credit(tmp_path, "GPU-xsn284-a")
+def test_xsn290_a_short_counter_with_physical_room_takes_the_early_exit_overdrawn(tmp_path):
+    """xsn290: TP1 waited on a short counter for weights_4 while the card held
+    the bytes; the peer's next credit sat behind a deposit that needed TP1's
+    collect -- a cycle, 180 s, W68. With physical room above floor and the
+    peer's live staging the exit is taken, the claim overdrawn, and the peer's
+    staging is refused (host path) until it publishes past the deficit."""
+    c = _credit(tmp_path, "GPU-xsn290-a")
     c.publish("weights_3", 741 * MIB)               # a live counter, short
+    rec = c.wait_for(2502 * MIB, budget_s=1.0, tag="weights_4", free_bytes_now=4338 * MIB,
+                     free_reader=lambda: 4338 * MIB, floor_bytes=767 * MIB, epoch="flip-2")
+    assert rec["waited_s"] == 0.0 and rec["claimed_bytes"] == 2502 * MIB
+    assert "OVERDRAWN" in rec["reason"]
+    st = c.read()
+    assert st["consumed_bytes"] == 2502 * MIB and st["credit_bytes"] == 741 * MIB
+    assert c.debit("stage", 1673 * MIB) is False      # the peer's re-stage: host path
+    c.publish("weights_4", 2502 * MIB)                # peer publishes past the deficit
+    assert c.debit("stage", 700 * MIB) is True        # 741 + 2502 - 2502 = 741 >= 700
+
+
+def test_xsn290_a_short_counter_without_physical_room_waits_for_the_peer(tmp_path):
+    """The peer has 1673 MiB staged live on this card (debited): free minus
+    floor minus that staging does not hold the tag, so the tag waits on the
+    counter and is granted when the peer publishes (xsn284's case, intact)."""
+    c = _credit(tmp_path, "GPU-xsn290-b")
+    c.publish("weights_3", 2414 * MIB)
+    assert c.debit("stage", 1673 * MIB) is True       # peer staging live: balance 741
     state = {"free": 4338 * MIB}
 
     def _peer_pauses_next_tag():
         time.sleep(0.25)
+        c.refund("stage", 1673 * MIB)
         c.publish("weights_4", 2502 * MIB)
 
     threading.Thread(target=_peer_pauses_next_tag).start()
@@ -93,7 +112,6 @@ def test_xsn284_a_live_but_short_counter_sends_the_tag_into_the_loop(tmp_path):
                      free_reader=lambda: state["free"], floor_bytes=767 * MIB,
                      epoch="flip-2", alloc_poll_s=3.0)
     assert rec["waited_s"] >= 0.2 and rec["claimed_bytes"] == 2502 * MIB
-    assert c.read()["consumed_bytes"] == 2502 * MIB
 
 
 def test_xsn284_a_single_group_boot_without_a_counter_still_takes_the_early_exit(tmp_path):

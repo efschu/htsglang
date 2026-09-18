@@ -1116,8 +1116,15 @@ class VramCredit:
         epoch: Optional[Any] = None,
         require_full: bool = False,
         gate=None,
+        overdraw: bool = False,
     ) -> Dict[str, Any]:
         """W takes bytes OFF this leg's credit -- the debit half of `publish`.
+
+        ``overdraw`` (weg2xsn290): take the WHOLE ``want`` even when the
+        counter does not cover it, so ``consumed`` runs past ``credit`` and
+        the balance the peer's :meth:`debit` reads is 0 until the peer
+        publishes past the deficit -- the physical bytes were taken off the
+        card's free space, and the counter must say so.
 
         #1349, MEASURED ON BOOT weg2xsn21b (D rank 0, the 5090
         GPU-31d7ef41-f574-4d0e-21ad-e773fd938f6d, 2026-09-12 16:06:26Z):
@@ -1160,9 +1167,12 @@ class VramCredit:
             consumed = int(state.get("consumed_bytes", 0))
             available = max(0, credit - consumed)
             covered = available >= want
-            claimed = 0 if (require_full and not covered) else min(available, want)
+            if overdraw:
+                claimed = want
+            else:
+                claimed = 0 if (require_full and not covered) else min(available, want)
             gate_value = None
-            if gate is not None and (covered or not require_full):
+            if gate is not None and (covered or not require_full or overdraw):
                 gate_value = gate(available)  # may raise; nothing is written
             if claimed > 0:
                 state["credit_bytes"] = credit
@@ -1179,6 +1189,7 @@ class VramCredit:
                 "available_bytes": available - claimed,
                 "claimed_bytes": claimed,
                 "covered": covered,
+                "staged_bytes": int(state.get("staged_bytes", 0)),
                 "leg_complete": bool(state.get("leg_complete")),
                 "stale_epoch": stale_epoch,
                 "gate": gate_value,
@@ -1318,12 +1329,56 @@ class VramCredit:
                            else "and no peer counter licenses them away")
                     ),
                 }
+            # weg2xsn290 (18.09.): A SHORT COUNTER MUST NOT WAIT FOR BYTES THE
+            # CARD ALREADY HOLDS -- that wait is a cycle. TP1 waited here for
+            # weights_4's credit, which PP1 publishes only after pausing
+            # weights_5, whose deposit waits for TP1 to collect weights_4 off
+            # lane c1, which TP1 does only after this wait: 180 s, W68 on every
+            # P rank, boot dead. xsn284's hazard (the peer's refund + re-stage
+            # landing between this reading and cu_mem_create) is closed
+            # differently: the peer's staging is debit-gated on this same
+            # counter (xsn269), so the claim is OVERDRAWN by the whole tag --
+            # the balance the peer reads is 0 until it publishes past the
+            # deficit and its next staging takes the host path -- and the free
+            # reading is taken AGAIN after the claim, minus the staging the
+            # peer has live (debited) right now, so a malloc in flight cannot
+            # be double-counted as free.
+            _free_again = int(free_reader() if free_reader is not None else free_bytes_now)
+            _staged = int(spent.get("staged_bytes", 0))
+            if _free_again - floor - _staged >= need:
+                spent = self.claim(tag, need, epoch=epoch, overdraw=True)
+                logger.info(
+                    "WEG2-CREDIT-EARLY tag=%s free=%d MiB floor=%d MiB peer_staged=%d MiB "
+                    ">= need=%d MiB with the counter SHORT (balance was %d MiB): claim "
+                    "OVERDRAWN by %d MiB -- the peer's next staging takes the host path "
+                    "until it publishes past the deficit (xsn290: waiting here was the "
+                    "deposit/collect cycle)",
+                    tag, _free_again // MIB, floor // MIB, _staged // MIB, need // MIB,
+                    int(spent["available_before_bytes"]) // MIB,
+                    max(0, need - int(spent["available_before_bytes"])) // MIB,
+                )
+                return {
+                    "waited_s": 0.0,
+                    "free_bytes": _free_again,
+                    "allocatable_est_bytes": max(0, _free_again - floor),
+                    "corridor_floor_bytes": floor,
+                    "credit_bytes": spent["credit_bytes"],
+                    "consumed_bytes": spent["consumed_bytes"],
+                    "available_bytes": spent["available_bytes"],
+                    "claimed_bytes": spent["claimed_bytes"],
+                    "reason": (
+                        "the card physically holds the bytes above its corridor floor and "
+                        "the peer's live staging; the counter is short and the claim is "
+                        "OVERDRAWN, so the peer's staging takes the host path (xsn290)"
+                    ),
+                }
             logger.info(
                 "WEG2-CREDIT-WAIT tag=%s free=%d MiB allocatable=%d MiB >= need=%d MiB, "
-                "but the peer's counter is SHORT (balance %d MiB): the peer may still "
-                "stage into that free; waiting on the counter (xsn284)",
-                tag, int(free_bytes_now) // MIB, max(0, int(free_bytes_now) - floor) // MIB,
-                need // MIB, int(spent["available_before_bytes"]) // MIB,
+                "but the peer's counter is SHORT (balance %d MiB) and free minus the "
+                "peer's live staging (%d MiB) does not hold the tag; waiting on the "
+                "counter (xsn284/xsn290)",
+                tag, _free_again // MIB, max(0, _free_again - floor) // MIB,
+                need // MIB, int(spent["available_before_bytes"]) // MIB, _staged // MIB,
             )
         deadline = time.monotonic() + float(budget_s)
         t0 = time.perf_counter()
