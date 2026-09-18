@@ -891,9 +891,35 @@ class HybridCacheController(BaseHiCacheController):
             # base class gives; the rank-uniform MIN all_reduce in
             # prefetch_thread_func then agrees on it.
             return [], 0
-        hash_value = getattr(operation, "weg2_page_keys", None) or self.get_hash_str(
+        # #1442 / xsn328-333: P's handed-over page keys for the covered prefix
+        # (the scheduler's registry is sliced at the MATCHED length; the
+        # tree's operation.weg2_page_keys assumed a tail read -- offset 2 for
+        # a from-root read), own hashes for the tail (P's list is one page
+        # short of the ids). D's own hashes agreed with P's for the first 64
+        # tokens only, so the dormant hold's re-reads answered zero.
+        own_hashes = self.get_hash_str(
             operation.token_ids, operation.last_hash, page_size=self.page_size
-        )  # #1442: P's chain when handed over, else re-derived from the tokens
+        )
+        from sglang.srt.managers import cache_controller as _cc_mod
+        from sglang.srt.weg2.handoff_keys import first_mismatch as _first_mismatch
+        _hk = _cc_mod.WEG2_HANDOFF_PAGE_KEYS.get(operation.request_id) or getattr(operation, "weg2_page_keys", None)
+        _k = min(len(_hk), len(own_hashes)) if _hk else 0
+        if _k > 0:
+            _hn = getattr(self, "_1442_keys_n", 0) + 1
+            self._1442_keys_n = _hn
+            if _hn <= 12 or _hn % 256 == 0:
+                logger.info("#1442 HANDOFF-KEYS USE rid=%s pages=%d covered=%d first_mismatch=%s last_hash=%s (own vs P's keys; P's are used)",
+                            operation.request_id, len(own_hashes), _k, _first_mismatch(own_hashes[:_k], list(_hk[:_k])),
+                            (operation.last_hash or "")[:12])
+            hash_value = list(_hk[:_k]) + list(own_hashes[_k:])
+        else:
+            hash_value = own_hashes
+            if str(operation.request_id).startswith("weg2-"):
+                _hn0 = getattr(self, "_1442_nokeys_n", 0) + 1
+                self._1442_nokeys_n = _hn0
+                if _hn0 <= 12 or _hn0 % 256 == 0:
+                    logger.info("#1442 HANDOFF-KEYS NONE rid=%r pages=%d registry=%s (n=%d)", operation.request_id,
+                                len(own_hashes), sorted(_cc_mod.WEG2_HANDOFF_PAGE_KEYS.keys())[:6], _hn0)
 
         extra_info = HiCacheStorageExtraInfo(
             prefix_keys=operation.prefix_keys.copy() if operation.prefix_keys else None

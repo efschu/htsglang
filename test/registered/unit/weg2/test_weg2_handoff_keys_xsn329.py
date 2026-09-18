@@ -45,3 +45,12 @@ def test_hit_query_uses_the_operation_keys_with_partial_coverage():
     body = src[i:i + 3500]
     assert 'getattr(operation, "weg2_page_keys", None)' in body
     assert "page_hashes = list(_hk[:_k]) + list(page_hashes[_k:])" in body
+
+
+def test_hybrid_controller_hit_query_uses_the_registry_first():
+    from sglang.srt.mem_cache.hybrid_cache import hybrid_cache_controller as hc
+    src = open(hc.__file__).read()
+    i = src.index("def _storage_hit_query")
+    body = src[i:i + 4000]
+    assert "WEG2_HANDOFF_PAGE_KEYS.get(operation.request_id)" in body
+    assert "hash_value = list(_hk[:_k]) + list(own_hashes[_k:])" in body
