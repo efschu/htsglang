@@ -6145,16 +6145,21 @@ class SchedulerWeightUpdaterManager:
                             _ord = getattr(self, "_weg2_leg_tag_order", None) or []
                             _evs = getattr(self, "_weg2_tag_done", None) or {}
                             _ti = _ord.index(str(tag)) if str(tag) in _ord else -1
-                            if _ti > 0 and (_ti - 1) in _evs and not _evs[_ti - 1].is_set():
+                            # EVERY earlier tag, not only the previous one: with
+                            # two collects in flight a small tag t-1 finishes
+                            # while t-2 still holds the lane (xsn371).
+                            _pending = [j for j in range(_ti) if j in _evs and not _evs[j].is_set()]
+                            if _pending:
                                 _tg0 = time.perf_counter()
-                                if not _evs[_ti - 1].wait(600.0):
-                                    _lane_failures.append(
-                                        f"{_lane_key}/{tag}: tag-order gate: the previous tag "
-                                        f"{_ord[_ti - 1]} was not collected within 600 s")
-                                    return
+                                for j in _pending:
+                                    if not _evs[j].wait(600.0):
+                                        _lane_failures.append(
+                                            f"{_lane_key}/{tag}: tag-order gate: the earlier tag "
+                                            f"{_ord[j]} was not collected within 600 s")
+                                        return
                                 logger.info("WEG2-TAG-GATE lane=%s tag=%s waited_ms=%.0f for=%s",
                                             _lane_key, tag, (time.perf_counter() - _tg0) * 1000,
-                                            _ord[_ti - 1])
+                                            ",".join(_ord[j] for j in _pending))
                     _seq = int(_lane_seq.get(_lane_key, 0))
                     _slot = _seq % max(1, int(_depth))
                     # 2026-09-15 (Beschleunigung, depth 2): the drain wait
