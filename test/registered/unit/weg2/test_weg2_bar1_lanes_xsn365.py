@@ -26,20 +26,27 @@ def test_knobs_and_sizing():
     assert b1.slot_bytes_for(256 << 20, {b1.ENV_SMALL_SLOT_MIB: "16"}) == 16 << 20
 
 
-def test_small_bar_lanes_borrow_the_group_windows():
+def test_small_bar_lanes_borrow_the_group_windows_overlap_free():
     big = [0]
     d_win = {"world:0": 16 << 20, "tp:0": 32 << 20, "dcp:0": 40 << 20}
-    assert b1.borrow_plan("D", "p0", PAIRS, big, d_win) == ("tp:0", 0, 32 << 20, 8 << 20)
-    assert b1.borrow_plan("D", "p5", PAIRS, big, d_win) == ("dcp:0", 0, 40 << 20, 10 << 20)
-    assert b1.borrow_plan("D", "p5", PAIRS, big, {"tp:0": 32 << 20}) == ("tp:0", 0, 32 << 20, 8 << 20)
-    assert "no tp/dcp" in b1.borrow_plan("D", "p0", PAIRS, big, {"world:0": 16 << 20})
+    # TP1 receives p0 (from the 5090) and p5 (from card 2): the big-fed lane gets the big region
+    assert b1.borrow_plan("D", "p0", PAIRS, big, d_win, dst_lanes=["p0", "p5"]) == ("dcp:0", 0, 40 << 20, 10 << 20)
+    assert b1.borrow_plan("D", "p5", PAIRS, big, d_win, dst_lanes=["p0", "p5"]) == ("tp:0", 0, 32 << 20, 8 << 20)
+    # xsn366: only dcp in the registry -> the two lanes get its two HALVES, never the same slots
+    only = {"world:0": 16 << 20, "dcp:0": 40 << 20}
+    assert b1.borrow_plan("D", "p0", PAIRS, big, only, dst_lanes=["p0", "p5"]) == ("dcp:0", 0, 20 << 20, 5 << 20)
+    assert b1.borrow_plan("D", "p5", PAIRS, big, only, dst_lanes=["p0", "p5"]) == ("dcp:0", 20 << 20, 20 << 20, 5 << 20)
+    assert "no group window" in b1.borrow_plan("D", "p0", PAIRS, big, {"world:0": 16 << 20}, dst_lanes=["p0", "p5"])
     p_win = {"world:0": 24 << 20, "pp:0": 96 << 20}
-    # PP1 (card 1) receives p0 (from the 5090) and p5 (from card 2): the two halves of pp
-    assert b1.borrow_plan("P", "p0", PAIRS, big, p_win) == ("pp:0", 0, 48 << 20, 12 << 20)
-    assert b1.borrow_plan("P", "p5", PAIRS, big, p_win) == ("pp:0", 48 << 20, 48 << 20, 12 << 20)
-    assert "no pp" in b1.borrow_plan("P", "p0", PAIRS, big, {"world:0": 24 << 20})
-    assert "too small" in b1.borrow_plan("D", "p0", PAIRS, big, {"tp:0": 4 << 20})
+    assert b1.borrow_plan("P", "p0", PAIRS, big, p_win, dst_lanes=["p0", "p5"]) == ("pp:0", 0, 48 << 20, 12 << 20)
+    assert b1.borrow_plan("P", "p5", PAIRS, big, p_win, dst_lanes=["p0", "p5"]) == ("pp:0", 48 << 20, 48 << 20, 12 << 20)
+    assert "too small" in b1.borrow_plan("D", "p0", PAIRS, big, {"tp:0": 4 << 20}, dst_lanes=["p0"])
     assert "not a cross lane" in b1.borrow_plan("D", "c1", PAIRS, big, d_win)
+    # regions never overlap, whatever the lane count
+    regs = b1.borrow_regions(d_win, 5)
+    spans = sorted((n, o, o + z) for n, o, z in regs)
+    for (n1, a1, e1), (n2, a2, e2) in zip(spans, spans[1:]):
+        assert n1 != n2 or e1 <= a2
 
 
 def test_roles_follow_the_directed_pair_and_only_cross_lanes():

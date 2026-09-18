@@ -112,8 +112,46 @@ def lane_role(lane_key: str, rank: int, cross_pairs) -> Optional[str]:
     return None
 
 
+def borrow_regions(windows, n_lanes: int):
+    """The borrowable regions of one receiver process, OVERLAP-FREE and
+    deterministic: the payload regions of its tp/dcp/pp group windows (never
+    world), largest first; while there are fewer regions than lanes the
+    largest one is halved (MiB-aligned). xsn366 (18.09.) had both D lanes of
+    a 3080 on dcp:0 at offset 0 because tp:0 was not in the registry -- two
+    depositors on the same slots."""
+    regs = []
+    for name, size in dict(windows).items():
+        prefix = str(name).split(":")[0]
+        if prefix in ("tp", "dcp", "pp") and int(size) >= (4 << 20):
+            regs.append((str(name), 0, int(size)))
+    regs.sort(key=lambda r: (-r[2], r[0]))
+    while regs and len(regs) < int(n_lanes):
+        name, off, size = regs.pop(0)
+        half = (size // 2) & ~((1 << 20) - 1)
+        if half < (4 << 20):
+            regs.insert(0, (name, off, size))
+            break
+        regs.extend([(name, off, half), (name, off + half, half)])
+        regs.sort(key=lambda r: (-r[2], r[0], r[1]))
+    return regs
+
+
+def lane_order(dst_lanes, cross_pairs, big_cards):
+    """The receiver's lanes, the ones fed by a big-BAR card first (PP0 on
+    the 5090 carries the most bytes and is the flip's critical chain)."""
+    big = {int(c) for c in big_cards}
+
+    def key(lk):
+        try:
+            src = int(cross_pairs[int(str(lk)[1:])][0])
+        except (ValueError, IndexError, TypeError):
+            src = -1
+        return (0 if src in big else 1, str(lk))
+    return sorted(dst_lanes, key=key)
+
+
 def borrow_plan(group: str, lane_key: str, cross_pairs, big_cards, windows,
-                ring: int = 4):
+                ring: int = 4, dst_lanes=None):
     """On a SMALL-BAR receiver card the lane BORROWS the payload region of one
     of this process's own barlink group windows instead of allocating a new
     one (user 18.09.: "warum koennen wir das bar1 fenster in dieser phase
@@ -126,31 +164,22 @@ def borrow_plan(group: str, lane_key: str, cross_pairs, big_cards, windows,
     returns, so no collective ever sees them.
 
     ``windows`` = {group name: payload bytes} of the live transports of this
-    process. Returns (window name, offset, size, slot_bytes) or a reason.
-    D: the lane from the big-BAR card gets ``tp`` (32 MiB), the other one
-    ``dcp`` (40 MiB). P: the two lanes share ``pp`` (96 MiB) half and half."""
+    process; ``dst_lanes`` = every lane this process receives on. Returns
+    (window name, offset, size, slot_bytes) or a reason. The regions come
+    from :func:`borrow_regions` (overlap-free), handed out in
+    :func:`lane_order`."""
     if not lane_is_cross(lane_key):
         return "small BAR1: not a cross lane"
-    try:
-        k = int(str(lane_key)[1:])
-        src, _dst = cross_pairs[k]
-    except (ValueError, IndexError, TypeError):
-        return "small BAR1: not a cross lane"
-    from_big = int(src) in {int(c) for c in big_cards}
-    names = {str(n).split(":")[0]: (str(n), int(b)) for n, b in dict(windows).items()}
-    g = str(group).upper()
-    if g == "D":
-        order = ["tp", "dcp"] if from_big else ["dcp", "tp"]
-        for want in order:
-            if want in names:
-                name, size = names[want]
-                return _slotted(name, 0, size, ring)
-        return f"small BAR1: no tp/dcp group window to borrow (have {sorted(names)})"
-    if "pp" in names:
-        name, size = names["pp"]
-        half = (size // 2) & ~((1 << 20) - 1)
-        return _slotted(name, 0 if from_big else half, half, ring)
-    return f"small BAR1: no pp group window to borrow (have {sorted(names)})"
+    lanes = lane_order(list(dst_lanes or [lane_key]), cross_pairs, big_cards)
+    if lane_key not in lanes:
+        lanes = lane_order(lanes + [lane_key], cross_pairs, big_cards)
+    regs = borrow_regions(windows, len(lanes))
+    i = lanes.index(lane_key)
+    if i >= len(regs):
+        return (f"small BAR1: no group window left to borrow for lane {i + 1}/{len(lanes)} "
+                f"(have {sorted(dict(windows))})")
+    name, off, size = regs[i]
+    return _slotted(name, off, size, ring)
 
 
 def _slotted(name: str, offset: int, size: int, ring: int):
@@ -276,6 +305,8 @@ class Bar1Lanes:
         self._holder = None
         self._bdf = None
         self._group_own: dict = {}
+        self._dst_lanes: list = []
+        self._windows_logged = False
 
     # -- helpers ---------------------------------------------------------
     def _ordinal(self) -> int:
@@ -389,8 +420,13 @@ class Bar1Lanes:
             borrowed = ""
             offset = 0
             if int(win.size) < BIG_BAR_MIN:
+                wins = self.group_windows()
+                if not self._windows_logged:
+                    self._windows_logged = True
+                    self.log(f"WEG2-BAR1 group windows of this process: "
+                             f"{ {k: v >> 20 for k, v in wins.items()} } MiB; dst lanes={self._dst_lanes}")
                 plan = borrow_plan(self.group, lane_key, self.cross_pairs, self.big_cards(),
-                                   self.group_windows(), ring)
+                                   wins, ring, dst_lanes=self._dst_lanes)
                 if isinstance(plan, str):
                     self.refusals[lane_key] = plan
                     self.log(f"WEG2-BAR1 lane={lane_key} role=dst group={self.group} NO-WINDOW {plan} -> host lane")
@@ -560,6 +596,7 @@ class Bar1Lanes:
         except Exception as exc:  # noqa: BLE001 -- the driver calls will name it
             self.log(f"WEG2-BAR1 setup: torch device not set on this thread: {exc!r}")
         roles = {lk: self.role(lk) for lk in lane_keys}
+        self._dst_lanes = sorted(lk for lk, r in roles.items() if r == "dst")
         for lk, r in roles.items():
             if r == "dst":
                 self.open_window(lk)
