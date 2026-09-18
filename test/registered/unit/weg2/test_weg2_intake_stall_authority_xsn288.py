@@ -102,3 +102,37 @@ def test_abort_forgets_and_wake_resets_source_ratchet():
     wsrc = open(wu.__file__).read()
     k = wsrc.index('"WEG2-DORMANT cleared: kv_cache resumed, admission seams admit"')
     assert "_iw.reset()" in wsrc[k:k + 600]
+
+
+def test_xsn291_a_request_larger_than_the_pool_is_named_too_large_and_the_front_refuses(monkeypatch):
+    """xsn291: weg2-6-4 (133,837 tokens) against PP0's pool of 121,190 -- stalled
+    twice, requeued twice, the fairness switch flipped D->P 200 ms after the
+    wake, W35/W68, both groups dead. The refusal names it; the front does
+    not requeue."""
+    from sglang.srt.managers import scheduler as sch
+    from sglang.srt.managers.corridor_guard import GROUP_ENV
+    from sglang.srt.weg2 import front as fr
+    monkeypatch.setenv(GROUP_ENV, "P")
+    w = st.IntakeStallWatch(hold_s=1.0)
+    sent = []
+    obj, req = _scheduler_double(0, w, sent)
+    obj.max_total_num_tokens = 121190
+    req.full_untruncated_fill_ids = [0] * 133837
+    sch.Scheduler._weg2_intake_stall_observe(obj, req, None)       # not immediate: too-large forces it
+    assert len(sent) == 1
+    msg = sent[0].finished_reason["message"]
+    assert st.is_intake_stall(msg) and st.is_too_large(msg) and "pool_tokens=121190" in msg
+    # a request that fits the empty pool is NOT too large (ordinary hold applies)
+    w2 = st.IntakeStallWatch(hold_s=1.0)
+    sent2 = []
+    obj2, req2 = _scheduler_double(0, w2, sent2)
+    obj2.max_total_num_tokens = 121190
+    req2.full_untruncated_fill_ids = [0] * 97872
+    sch.Scheduler._weg2_intake_stall_observe(obj2, req2, None)
+    assert sent2 == []                                              # hold not yet elapsed
+    # the front: too-large is refused, never requeued
+    src = open(fr.__file__).read()
+    i = src.index("if is_intake_stall(e) and not is_too_large(e):")
+    assert "_requeue_intake_stalled(p, e)" in src[i:i + 200]
+    assert "WEG2 P-INTAKE-TOO-LARGE" in src[i:i + 900]
+    assert "p.fut.set_exception(e)" in src[i:i + 1400]

@@ -27,6 +27,11 @@ from typing import Optional
 
 #: The refusal's name; the front matches on it in the leg-1 error text.
 STALL_MARK = "WEG2-INTAKE-STALL"
+#: weg2xsn291: the request would not fit this group's pool even EMPTY --
+#: requeueing it is a flip loop (133,837 tokens against PP0's 121,190:
+#: stalled twice, the fairness switch flipped D->P 200 ms after D's wake,
+#: W35/W68 on the legs, both groups dead). The front refuses it by name.
+TOO_LARGE_MARK = "WEG2-INTAKE-TOO-LARGE"
 
 #: Refused-with-empty-batch this long -> a stall, not a transient.
 HOLD_S_DEFAULT = 1.0
@@ -117,6 +122,11 @@ def abort_must_reach_every_rank(*, rid_known: bool, abort_all: bool) -> bool:
     if rid_known or abort_all:
         return True
     return bool(str(os.environ.get("SGLANG_WEG2_GROUP", "")).strip())
+
+
+def is_too_large(text: object) -> bool:
+    """Does a leg-1 error say the request exceeds the group's pool outright?"""
+    return TOO_LARGE_MARK in str(text or "")
 
 
 def is_intake_stall(text: object) -> bool:

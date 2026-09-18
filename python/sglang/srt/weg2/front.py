@@ -68,7 +68,7 @@ from aiohttp import (
     web,
 )
 
-from sglang.srt.weg2.intake_stall import is_intake_stall  # weg2xsn272
+from sglang.srt.weg2.intake_stall import is_intake_stall, is_too_large  # weg2xsn272
 from sglang.srt.managers import corridor_guard
 from sglang.srt.managers.corridor_guard import (
     corridor_band_ceiling_mib,
@@ -5115,9 +5115,18 @@ class Front:
                         try:
                             await self.leg1(p)
                         except Exception as e:  # noqa: BLE001
-                            if is_intake_stall(e):
+                            if is_intake_stall(e) and not is_too_large(e):
                                 await self._requeue_intake_stalled(p, e)
                                 return p
+                            if is_too_large(e):
+                                # weg2xsn291: larger than P's whole pool -- no
+                                # flip can make room; refused by name, never
+                                # requeued (the requeue loop killed the boot).
+                                self.counters["p_intake_too_large"] += 1
+                                logger.error(
+                                    "WEG2 P-INTAKE-TOO-LARGE rid=%s est_prompt=%d: refused, "
+                                    "not requeued -- the request exceeds P's pool: %s",
+                                    p.rid, int(p.est_prompt), str(e)[:300])
                             self.counters["leg1_failures"] += 1
                             logger.error("WEG2 leg1 rid=%s failed: %s", p.rid, e)
                             if not p.fut.done():

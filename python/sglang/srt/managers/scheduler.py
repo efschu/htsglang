@@ -17938,13 +17938,23 @@ class Scheduler(
                 cur_rem = int(adder.cur_rem_tokens)
         except Exception:  # noqa: BLE001 -- a desk double without these terms
             pass
+        # weg2xsn291: a request larger than this rank's WHOLE pool can never
+        # be admitted by a flip; name it so the front refuses instead of
+        # requeueing (the requeue loop killed xsn291).
+        _pool = int(getattr(self, "max_total_num_tokens", 0) or 0)
+        _too_large = bool(_pool > 0 and need > _pool)
+        _extra = note or "gate=adder_no_token"
+        if _too_large:
+            from sglang.srt.weg2.intake_stall import TOO_LARGE_MARK
+            _extra = f"{_extra} {TOO_LARGE_MARK} pool_tokens={_pool}"
         message = watch.observe(
             rid=str(req.rid), need_tokens=need, rem_total_tokens=rem_total,
             cur_rem_tokens=cur_rem, running_empty=True, now=_time.monotonic(),
-            extra=note or "gate=adder_no_token",
+            extra=_extra,
             # xsn275: the admission-wedge detector already waited >= 20 s
             # with nothing running; its verdict needs no second hold here.
-            immediate=immediate,
+            # xsn291: a too-large request needs no hold either.
+            immediate=immediate or _too_large,
         )
         if message is None:
             return

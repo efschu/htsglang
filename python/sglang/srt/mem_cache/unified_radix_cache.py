@@ -5346,7 +5346,14 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         try:
             _t0 = float(getattr(operation, "start_time", 0.0) or 0.0)
             _ms = (time.monotonic() - _t0) * 1000.0 if _t0 else -1.0
-            _bpt = int(self.cache_controller.mem_pool_host.get_size_per_token() or 0)
+            # xsn291: the arena host pool answers get_ksize_per_token, not
+            # get_size_per_token (its __getattr__ raised on every D rank).
+            _hp = self.cache_controller.mem_pool_host
+            _bpt = int(getattr(_hp, "size_per_token", 0) or 0)
+            if _bpt <= 0 and hasattr(_hp, "get_size_per_token"):
+                _bpt = int(_hp.get_size_per_token() or 0)
+            if _bpt <= 0 and hasattr(_hp, "get_ksize_per_token"):
+                _bpt = 2 * int(_hp.get_ksize_per_token() or 0)   # K + V
             _bytes = int(completed_tokens) * _bpt
             logger.info(
                 "WEG2-LOAD-DEVICE req=%s tokens=%d bytes_per_token=%d bytes=%d ms=%.0f "
