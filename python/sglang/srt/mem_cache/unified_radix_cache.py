@@ -1600,6 +1600,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             if _WEG2_END_ANCHOR:
                 self._weg2_note_end_anchor(req, token_ids)
             self._weg2_handoff_write(req, radix_key)
+            self._weg2_publish_at_retain(req)
         else:
             self.token_to_kv_pool_allocator.free(kv_indices[req.cache_protected_len :])
 
@@ -3267,6 +3268,24 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             for node in publish_nodes:
                 if id(node) not in direct:  # #1427: a direct write is in the store already
                     self.write_backup_storage(node)
+
+    def _weg2_publish_at_retain(self, req) -> None:
+        """xsn338: publish the finished request's (and every other unbacked)
+        node NOW -- parents first, bounded, the sweep's own pin budget -- instead
+        of waiting for a PP bubble or the sleep flush (weg2.retain_publish)."""
+        try:
+            from sglang.srt.weg2 import retain_publish as _rp
+            if not _rp.publish_at_retain_on() or not self.enable_storage:
+                return
+            _t0 = time.perf_counter()
+            stats = self.publish_unbacked_sweep(max_issue=_rp.max_issue()) or {}
+            n = getattr(self, "_weg2_retain_publish_n", 0) + 1
+            self._weg2_retain_publish_n = n
+            if n <= 16 or n % 64 == 0:
+                logger.info("WEG2 RETAIN-PUBLISH rid=%s %s ms=%.0f (n=%d)", str(getattr(req, "rid", "?"))[:12],
+                            stats, (time.perf_counter() - _t0) * 1000.0, n)
+        except Exception as exc:  # noqa: BLE001 -- a publisher never takes the retain down
+            logger.warning("WEG2 RETAIN-PUBLISH raised %s: %s", type(exc).__name__, exc)
 
     def _weg2_handoff_write(self, req, radix_key) -> None:
         """#1442: hand P's finished prefill to D by rid -- the token ids and
