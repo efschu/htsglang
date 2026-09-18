@@ -16,6 +16,7 @@ from sglang.srt.managers.pp_admission_congruence import (
     LOAD_BACK_EXTENT_ATTR,
 )
 
+WEG2_ADMIT_T = {"lb_ms": 0.0, "lb_n": 0}  # xsn325: init_load_back wall per pass, read+reset by the POST-WAKE-PASS line
 _988_LOADBACK_SEEN = {"n": 0, "mamba": 0, "kv_only": 0}
 #: #1048: this rank's own stamp went stale between the match and the apply.
 _1048_STALE = {"n": 0}
@@ -2355,6 +2356,7 @@ class PrefillAdder:
                 # pass, chunk, cutover or flip can land between them, which is
                 # the only lifecycle shape this fact is safe under.
                 req.mamba_loadback_anchor_adopted = False
+                _lb_t0 = time.perf_counter()
                 new_indices, req.last_node = self.tree_cache.init_load_back(
                     InitLoadBackParams(
                         best_match_node=req.best_match_node,
@@ -2367,6 +2369,8 @@ class PrefillAdder:
                         req=req,
                     )
                 )
+                WEG2_ADMIT_T["lb_ms"] += (time.perf_counter() - _lb_t0) * 1000.0
+                WEG2_ADMIT_T["lb_n"] += 1
                 # #968 S1: THE TOLD EXTENT DECIDES *HOW MUCH*, NOT MERELY
                 # *WHETHER* -- enforced HERE because the callee cannot.
                 #

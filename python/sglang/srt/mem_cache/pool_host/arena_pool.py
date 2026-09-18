@@ -78,9 +78,9 @@ def _arena_page_load_timing() -> bool:
 
 def _arena_page_load_block() -> int:
     try:
-        return max(64, int(os.environ.get(ARENA_PAGE_LOAD_BLOCK_ENV, "2048")))
+        return max(64, int(os.environ.get(ARENA_PAGE_LOAD_BLOCK_ENV, "8192")))  # xsn325: 10.4-12.5 GB/s vs 5.9-11 at 2048
     except ValueError:
-        return 2048
+        return 8192
 
 
 def _arena_load_block_quota():

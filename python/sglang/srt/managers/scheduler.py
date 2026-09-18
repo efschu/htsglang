@@ -14273,10 +14273,17 @@ class Scheduler(
                 # e0bc96008e.
 
             try:
+                _ar_t0 = time.perf_counter()  # xsn325: host cost per admission
                 res = adder.add_one_req(
                     req,
                     truncation_align_size=self.truncation_align_size,
                 )
+                if getattr(self, "_weg2_post_wake_pass_n", None) is not None:
+                    _arl = getattr(self, "_weg2_gnbp_addreq", None)
+                    if _arl is None:
+                        _arl = self._weg2_gnbp_addreq = []
+                    _arl.append((str(getattr(req, "rid", "?"))[:10], (time.perf_counter() - _ar_t0) * 1000.0,
+                                 int(getattr(req, "host_hit_length", 0) or 0)))
             except PPScheduleRefused as exc:
                 # NAMED, NOT FOLDED IN (the #797 practice for a sibling with a
                 # different root): requests admitted EARLIER in this same loop
@@ -18060,15 +18067,29 @@ class Scheduler(
             mode, bs = "?", -1
         _g = getattr(self, "_weg2_gnbp_ms", None) or (-1.0, -1.0, -1.0)
         self._weg2_gnbp_ms = None
+        # xsn325: the host cost per admission (add_one_req wall, host hit) and
+        # the init_load_back share of it (the DMA issue), so init_new splits
+        # into DMA and host work per request.
+        _arl = getattr(self, "_weg2_gnbp_addreq", None) or []
+        self._weg2_gnbp_addreq = None
+        _addreq = " ".join(f"{rid}:{ms:.0f}ms/hit{hit}" for rid, ms, hit in _arl[:8]) or "-"
+        try:
+            from sglang.srt.managers import schedule_policy as _sp
+            _lb_ms, _lb_n = float(_sp.WEG2_ADMIT_T.get("lb_ms", 0.0)), int(_sp.WEG2_ADMIT_T.get("lb_n", 0))
+            _sp.WEG2_ADMIT_T["lb_ms"] = 0.0
+            _sp.WEG2_ADMIT_T["lb_n"] = 0
+        except Exception:  # noqa: BLE001
+            _lb_ms, _lb_n = -1.0, -1
         logger.info(
             "WEG2-POST-WAKE-PASS n=%d mode=%s bs=%d gap_ms=%.0f schedule_ms=%.0f run_ms=%.0f "
             "prefetch_ms=%.0f proc_input_ms=%.0f admission_ms=%.0f init_new_ms=%.0f prepare_ms=%.0f "
+            "addreq=[%s] init_load_back_ms=%.0f/%d "
             "(gap = wall since the previous pass; schedule = get_next_batch_to_run incl. the three "
             "prefill terms; run is the launch, the forward itself overlaps)",
             n, mode, bs, ((now - prev) * 1000.0) if prev is not None else -1.0,
             _pt_read(self, "_1466_schedule_ms"), _pt_read(self, "_1466_run_ms"),
             _pt_read(self, "_1474_prefetch_ms"), _pt_read(self, "_1475_process_input_ms"),
-            _g[0], _g[1], _g[2],
+            _g[0], _g[1], _g[2], _addreq, _lb_ms, _lb_n,
         )
 
     def _weg2_intake_stall_observe(self, req, adder, note: str = "",
