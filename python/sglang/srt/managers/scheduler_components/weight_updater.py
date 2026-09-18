@@ -7823,16 +7823,16 @@ class SchedulerWeightUpdaterManager:
                         try:
                             from sglang.srt.weg2.wake_kv import kv_mid_ok as _kv_mid_ok
                             _ti_mid = list(weights_tags).index(tag)
-                            _next = list(weights_tags)[_ti_mid + 1] if _ti_mid + 1 < len(weights_tags) else None
-                            _next_need = int(tag_bytes.get(_next, 0) or 0) if _next is not None else 0
+                            _rest = list(weights_tags)[_ti_mid + 1:]
+                            _rest_need = sum(int(tag_bytes.get(t, 0) or 0) for t in _rest)
                             _kv_need = int(self._weg2_tag_bytes(GPU_MEMORY_TYPE_KV_CACHE) or 0)
                             _free_mid = self._weg2_free_bytes()
                             _floor_mid = int(self._weg2_corridor_floor_bytes() or 0)
-                            _mid_ok = _kv_mid_ok(_free_mid, _floor_mid, _kv_need, _next_need)
+                            _mid_ok = _kv_mid_ok(_free_mid, _floor_mid, _kv_need, _rest_need)
                             logger.info("WEG2-WAKE-KV-MID %s after tag=%s free=%s MiB floor=%d MiB kv=%d MiB "
-                                        "next=%s(%d MiB)", "RESUME" if _mid_ok else "wait", tag,
+                                        "remaining=%d tags(%d MiB)", "RESUME" if _mid_ok else "wait", tag,
                                         (int(_free_mid) >> 20) if _free_mid is not None else None,
-                                        _floor_mid >> 20, _kv_need >> 20, _next, _next_need >> 20)
+                                        _floor_mid >> 20, _kv_need >> 20, len(_rest), _rest_need >> 20)
                             if _mid_ok:
                                 _t_mid = time.perf_counter()
                                 _weg2_kv_resume_part()
