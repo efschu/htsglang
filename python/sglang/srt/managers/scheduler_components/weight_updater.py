@@ -573,6 +573,8 @@ class SchedulerWeightUpdaterManager:
     _weg2_kv_deferred: bool = False       # Wake-Parallel: kv resume deferred to the weights call
     _weg2_kv_epoch_done: object = None    # Wake-Parallel: flip epoch whose kv resume is done
     _weg2_kv_resumed_epoch: object = None  # Wake-Parallel: flip epoch whose kv_cache tms resume (the RESUME half) already ran
+    _weg2_leg_min_free_mib: object = None  # xsn323: the LOWEST card-free (MiB) seen at a tag claim of this rank's last wake legs
+    _weg2_leg_min_free_epoch: object = None  # the epoch that minimum belongs to (reset at the first claim of a new epoch)
     _weg2_graph_deferred: bool = False    # Wake-Parallel: cuda_graph resume deferred to the weights call
     _weg2_weights_epoch_done: object = None  # Wake-Parallel: flip epoch whose weight legs are collected
     #: #1452b: snapshot counter -- slots=True, so it is a FIELD (boot weg2xsn208
@@ -3148,9 +3150,31 @@ class SchedulerWeightUpdaterManager:
             return False
         margin = 256 << 20
         ok = int(free) - floor - margin >= need
-        logger.info("WEG2-WAKE-KV-FIRST %s free=%d MiB floor=%d MiB need=%d MiB (kv_cache resumed %s the weight legs)",
+        # xsn323: the pool up BEFORE the legs takes `need` off every tag claim
+        # of the legs. The legs' tightest point is known from this rank's last
+        # wake (`_weg2_leg_min_free_mib`); with the pool up it must still hold
+        # the legs' reserve (the largest tag + the peer's on-card staging,
+        # SGLANG_WEG2_WAKE_KV_LEG_RESERVE_MIB, default 4352 = 2918 + 1309 + margin
+        # measured on the 5090 in xsn322/323). No record yet: the old order.
+        ref = getattr(self, "_weg2_leg_min_free_mib", None)
+        try:
+            reserve_mib = int(os.environ.get("SGLANG_WEG2_WAKE_KV_LEG_RESERVE_MIB", "4352"))
+        except ValueError:
+            reserve_mib = 4352
+        if ok:
+            if ref is None:
+                ok = False
+                why = "no leg record yet (first wake of this rank): old order"
+            else:
+                legs_ok = int(ref) - (need >> 20) >= (floor >> 20) + (margin >> 20) + reserve_mib
+                ok = bool(legs_ok)
+                why = (f"legs' tightest free last wake={int(ref)} MiB - kv={need >> 20} MiB "
+                       f"{'>=' if legs_ok else '<'} floor+margin+reserve={(floor >> 20) + (margin >> 20) + reserve_mib} MiB")
+        else:
+            why = "free - floor - margin < kv"
+        logger.info("WEG2-WAKE-KV-FIRST %s free=%d MiB floor=%d MiB need=%d MiB (kv_cache resumed %s the weight legs; %s)",
                     "EARLY" if ok else "LATE", int(free) >> 20, floor >> 20, need >> 20,
-                    "before" if ok else "after")
+                    "before" if ok else "after", why)
         return ok
 
     def _weg2_stage_charge(self):
@@ -6472,6 +6496,22 @@ class SchedulerWeightUpdaterManager:
         except OSError as exc:
             logger.warning("[weg2 credit] unreadable on %s: %s -- not waiting", tag, exc)
             return
+        # xsn323: remember the tightest point of these legs. The kv-first gate
+        # of the NEXT wake reads it: kv_cache resumed before the legs must not
+        # eat the free space the legs' tags need (5090: free 9028 MiB at
+        # weights_3 in the old order, 2360 with the pool up -> credit wait ->
+        # the sleeper's tail never paused -> W35 after 120 s).
+        try:
+            _fb = rec.get("free_bytes")
+            if _fb is not None:
+                _fm = int(_fb) >> 20
+                if self._weg2_leg_min_free_epoch != epoch or self._weg2_leg_min_free_mib is None:
+                    self._weg2_leg_min_free_epoch = epoch
+                    self._weg2_leg_min_free_mib = _fm
+                else:
+                    self._weg2_leg_min_free_mib = min(int(self._weg2_leg_min_free_mib), _fm)
+        except Exception:  # noqa: BLE001 -- an instrument for the next gate, never a gate itself
+            pass
         # #1349: a tag that TOOK credit is logged even when it waited 0 ms. The
         # debit is the half that was missing, so it has to be readable per tag,
         # and the quiet case stays quiet by construction: with no co-located peer

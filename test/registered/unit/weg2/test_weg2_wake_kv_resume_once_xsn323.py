@@ -76,3 +76,16 @@ def test_poll_fault_disarms_the_transport_and_survives(monkeypatch):
     finally:
         g.unregister(t)
     assert len(calls) == 1 and "raised" in calls[0]
+
+
+def test_leg_min_free_ratchet_fields_and_update_site():
+    from sglang.srt.managers.scheduler_components.weight_updater import (
+        SchedulerWeightUpdaterManager as M,
+    )
+    m = M.__new__(M)
+    m._weg2_leg_min_free_mib = 9028
+    m._weg2_leg_min_free_epoch = "e"
+    assert m._weg2_leg_min_free_mib == 9028
+    s = _src()
+    i = s.index('_fb = rec.get("free_bytes")')
+    assert "self._weg2_leg_min_free_mib = min(" in s[i:i + 900]

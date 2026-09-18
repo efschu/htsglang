@@ -13,11 +13,13 @@ from sglang.srt.managers.scheduler_components import weight_updater as wu  # noq
 MIB = 1 << 20
 
 
-def _stand_in(free, need, floor):
+def _stand_in(free, need, floor, ref=20000):
+    # ref = the legs' tightest card-free (MiB) at this rank's last wake (xsn323)
     return types.SimpleNamespace(
         _weg2_tag_bytes=lambda tag: need,
         _weg2_free_bytes=lambda: free,
         _weg2_corridor_floor_bytes=lambda: floor,
+        _weg2_leg_min_free_mib=ref,
     )
 
 
@@ -30,6 +32,23 @@ def test_early_only_when_free_minus_floor_covers_kv_plus_margin(monkeypatch):
     assert not f(_stand_in(12000 * MIB, 0, 0), ["kv_cache"])                     # no kv bytes known
     monkeypatch.setenv("SGLANG_WEG2_WAKE_KV_FIRST", "0")
     assert not f(_stand_in(12000 * MIB, 9400 * MIB, 767 * MIB), ["kv_cache"])
+
+
+def test_the_legs_reserve_gates_the_early_pool_xsn323(monkeypatch):
+    """xsn323 (5090): free 14804 funded the 6668 MiB pool before the legs, but
+    the legs' tightest point of the old order was 9028 MiB at weights_3 --
+    with the pool up 2360, below floor 1055 + staging 1309 + tag 2918: credit
+    wait, the sleeper's tail never paused, W35 after 120 s."""
+    monkeypatch.delenv("SGLANG_WEG2_WAKE_KV_FIRST", raising=False)
+    monkeypatch.delenv("SGLANG_WEG2_WAKE_KV_LEG_RESERVE_MIB", raising=False)
+    f = wu.SchedulerWeightUpdaterManager._weg2_wake_kv_first_ok
+    assert not f(_stand_in(14804 * MIB, 6668 * MIB, 1055 * MIB, ref=9028), ["kv_cache"])
+    assert not f(_stand_in(14804 * MIB, 6668 * MIB, 1055 * MIB, ref=None), ["kv_cache"])   # first wake: old order
+    # a 3080 P rank: free 7971, pool 1928, legs' tightest 7600 -> 5672 >= 1095+256+4352 = 5703? no -> LATE
+    assert not f(_stand_in(7971 * MIB, 1928 * MIB, 1095 * MIB, ref=7600), ["kv_cache"])
+    assert f(_stand_in(7971 * MIB, 1928 * MIB, 1095 * MIB, ref=7700), ["kv_cache"])
+    monkeypatch.setenv("SGLANG_WEG2_WAKE_KV_LEG_RESERVE_MIB", "1000")
+    assert f(_stand_in(14804 * MIB, 6668 * MIB, 1055 * MIB, ref=9028), ["kv_cache"])
 
 
 def test_the_kv_block_is_one_closure_called_early_or_late():
