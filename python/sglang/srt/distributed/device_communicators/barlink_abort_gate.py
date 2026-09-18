@@ -465,7 +465,8 @@ def poll_status_words() -> int:
             # stop asking. `poll_status_word`'s own pre-check catches the
             # mapped-but-released case BEFORE the copy; this is the belt for
             # every failure shape it cannot see in advance.
-            _disarm = getattr(t, "_abort_poll_disarm", None)
+            _poll_fault_dump(transport, exc)
+            _disarm = getattr(transport, "_abort_poll_disarm", None)
             if callable(_disarm):
                 _disarm("the status poll raised; see the traceback above")
     return tripped
@@ -553,6 +554,56 @@ def rearm_inline_reads() -> int:
         except Exception:  # noqa: BLE001 - teardown must not raise
             logger.exception("barlink abort gate: could not re-arm an in-line read")
     return changed
+
+
+def _poll_fault_dump(transport: Any, exc: BaseException) -> None:
+    """xsn317/321: the poll's exception was the last line before an exit(1)
+    without a Python traceback. Name the objects the copy touched and take a
+    py-spy dump of THIS process (all threads, native frames) so the moment is
+    recorded even when the process is gone a second later. Never raises."""
+    try:
+        parts = []
+        for name in ("_ctl_dev", "_abort_poll_dst", "_round_dev", "_round_mirror", "_abort_poll_stream"):
+            obj = getattr(transport, name, None)
+            if obj is None:
+                parts.append(f"{name}=None")
+                continue
+            try:
+                parts.append(f"{name}=({type(obj).__name__} dev={getattr(obj, 'device', '?')} "
+                             f"dtype={getattr(obj, 'dtype', '?')} ptr={obj.data_ptr() if hasattr(obj, 'data_ptr') else '?'} "
+                             f"numel={obj.numel() if hasattr(obj, 'numel') else '?'})")
+            except Exception as e:  # noqa: BLE001
+                parts.append(f"{name}=<{type(e).__name__}: {e}>")
+                if is_poison_error(e):
+                    parts.append("(context poisoned: no further device reads)")
+                    break
+        logger.error("WEG2-BARLINK-POLL-DIAG exc=%s: %s | %s", type(exc).__name__, exc, " ".join(parts))
+    except Exception as e:  # noqa: BLE001
+        logger.error("WEG2-BARLINK-POLL-DIAG failed: %s: %s", type(e).__name__, e)
+        if is_poison_error(e):
+            return
+    if os.environ.get("SGLANG_WEG2_POLL_PYSPY", "1").strip().lower() in ("0", "false", "no", "off"):
+        return
+    try:
+        import shutil
+        import subprocess
+        import sys
+        exe = os.path.join(os.path.dirname(sys.executable), "py-spy")
+        if not os.path.exists(exe):
+            exe = shutil.which("py-spy")
+        if not exe:
+            logger.error("WEG2-BARLINK-POLL-PYSPY unavailable: no py-spy next to %s", sys.executable)
+            return
+        out_dir = os.environ.get("SGLANG_WEG2_PYSPY_DIR", "/spinning/evidence-665-f1")
+        path = os.path.join(out_dir, f"pyspy_pollfault_{os.getpid()}_{int(time.time())}.txt")
+        with open(path, "w") as fh:
+            r = subprocess.run([exe, "dump", "--pid", str(os.getpid()), "--native", "--nonblocking"],
+                               stdout=fh, stderr=subprocess.STDOUT, timeout=45)
+        logger.error("WEG2-BARLINK-POLL-PYSPY rc=%s file=%s", r.returncode, path)
+    except Exception as e:  # noqa: BLE001
+        logger.error("WEG2-BARLINK-POLL-PYSPY failed: %s: %s", type(e).__name__, e)
+        if is_poison_error(e):
+            return
 
 
 def registered() -> List[Any]:

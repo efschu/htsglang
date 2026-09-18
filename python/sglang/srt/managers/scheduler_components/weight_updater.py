@@ -572,6 +572,7 @@ class SchedulerWeightUpdaterManager:
     _weg2_sleep_count: int = 0
     _weg2_kv_deferred: bool = False       # Wake-Parallel: kv resume deferred to the weights call
     _weg2_kv_epoch_done: object = None    # Wake-Parallel: flip epoch whose kv resume is done
+    _weg2_kv_resumed_epoch: object = None  # Wake-Parallel: flip epoch whose kv_cache tms resume (the RESUME half) already ran
     _weg2_graph_deferred: bool = False    # Wake-Parallel: cuda_graph resume deferred to the weights call
     _weg2_weights_epoch_done: object = None  # Wake-Parallel: flip epoch whose weight legs are collected
     #: #1452b: snapshot counter -- slots=True, so it is a FIELD (boot weg2xsn208
@@ -7132,7 +7133,16 @@ class SchedulerWeightUpdaterManager:
             # clear and hold release -- one block, called EARLY (before the weight
             # legs, so the held requests' arena loads overlap the legs) when the
             # card can fund the pool now, else LATE (the old order).
+            # xsn317/318/321: the early kv-only call resumed kv_cache and the
+            # weights call's late site resumed it AGAIN -- torch_memory_saver
+            # answers a second resume of an unpaused tag with exit(1) ("Cannot
+            # resume allocation that is not paused"), the rank dies without a
+            # Python traceback. The RESUME half runs once per epoch.
+            if _kv_epoch is not None and self._weg2_kv_resumed_epoch == _kv_epoch:
+                logger.info("WEG2-WAKE-KV-RESUME already ran in epoch=%s: resume half skipped", _kv_epoch)
+                return
             self.memory_saver_adapter.resume(GPU_MEMORY_TYPE_KV_CACHE)
+            self._weg2_kv_resumed_epoch = _kv_epoch
             _weg2_ph("kv_resume")
             scheduler = self.scheduler
             if scheduler is not None and weg2_memory_saver_on:
@@ -7777,7 +7787,7 @@ class SchedulerWeightUpdaterManager:
             if self._weg2_graph_deferred:
                 _weg2_graph_block()  # the weights are resident now
                 self._weg2_graph_deferred = False
-            if _weg2_kv_resumed_early or self._weg2_kv_epoch_done == _kv_epoch:
+            if _weg2_kv_resumed_early or (_kv_epoch is not None and self._weg2_kv_resumed_epoch == _kv_epoch):
                 _weg2_kv_clear_part()
             else:
                 _weg2_kv_block()
