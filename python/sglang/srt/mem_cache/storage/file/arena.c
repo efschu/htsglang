@@ -174,8 +174,9 @@ static int64_t find_slot(uint8_t *base, uint64_t klo, uint64_t khi) {
 }
 
 /* claim a FREE slot for key (index entry published); -1 = arena full */
-static int64_t claim_slot(uint8_t *base, uint64_t klo, uint64_t khi, uint64_t total) {
+static int64_t claim_slot(uint8_t *base, uint64_t klo, uint64_t khi, uint64_t total, int *fresh) {
     ArenaHeader *h = hdr(base);
+    if (fresh) *fresh = 0;
     /* #1431 (xsn193): a FULL arena refused every page only after walking all
      * 524288 slot headers -- per page, per sweep -- and P's main thread spent
      * its bubbles in here. The counters know the answer in O(1). They are
@@ -187,6 +188,12 @@ static int64_t claim_slot(uint8_t *base, uint64_t klo, uint64_t khi, uint64_t to
         SlotHeader *sh = slot_hdr(base, s);
         uint32_t expect = S_FREE;
         if (atomic_compare_exchange_strong(&sh->state, &expect, S_CLAIMED)) {
+            /* xsn342 (18.09.): the hand moved +1 per claim while the scan
+             * ran ahead of it; once it wrapped, EVERY claim re-walked the
+             * whole occupied prefix (measured: 2 us -> 2.8 ms per claim,
+             * 4096-page node = 11.6 s, PP1 wedged 150 s in the retain
+             * sweep). CLOCK semantics: the hand follows the last claim. */
+            atomic_store(&h->clock_hand, s + 1);
             sh->key_lo = klo;
             sh->key_hi = khi;
             sh->total_bytes = total;
@@ -204,16 +211,29 @@ static int64_t claim_slot(uint8_t *base, uint64_t klo, uint64_t khi, uint64_t to
             for (uint64_t m = 0; m < h->index_cap; m++, i = (i + 1) & mask) {
                 uint64_t k = atomic_load(&keys[i]);
                 if (k == klo) {
-                    /* another writer published this key concurrently: yield our slot */
-                    atomic_store(&sh->state, S_FREE);
                     uint32_t other = atomic_load(&slots[i]);
-                    return (int64_t)other;
+                    SlotHeader *oh = slot_hdr(base, other);
+                    uint32_t ost = atomic_load(&oh->state);
+                    if (oh->key_lo == klo && oh->key_hi == khi && (ost == S_CLAIMED || ost == S_COMPLETE)) {
+                        /* another writer published this key concurrently: yield our slot */
+                        atomic_store(&sh->state, S_FREE);
+                        return (int64_t)other;
+                    }
+                    /* xsn342: a STALE cell (its slot was freed by abort_write and
+                     * may already carry another writer's key): take the cell over
+                     * for our fresh slot instead of handing the caller a slot it
+                     * does not own (ARENA-COMPLETE LOST 'recycled under the writer'). */
+                    atomic_store(&slots[i], (uint32_t)s);
+                    atomic_fetch_add(&h->n_claimed, 1);
+                    if (fresh) *fresh = 1;
+                    return (int64_t)s;
                 }
                 if (k == 0 || k == TOMB) {
                     uint64_t expect_k = k;
                     if (atomic_compare_exchange_strong(&keys[i], &expect_k, klo)) {
                         atomic_store(&slots[i], (uint32_t)s);
                         atomic_fetch_add(&h->n_claimed, 1);
+                        if (fresh) *fresh = 1;
                         return (int64_t)s;
                     }
                     /* lost the race for this cell: re-read it */
@@ -282,7 +302,7 @@ int64_t arena_write(uint8_t *base, int64_t n, const uint64_t *klo, const uint64_
         }
         if (s) { status[i] = s; e += k; continue; }
         int64_t slot = find_slot(base, klo[i], khi[i]);
-        if (slot < 0) slot = claim_slot(base, klo[i], khi[i], total);
+        if (slot < 0) slot = claim_slot(base, klo[i], khi[i], total, NULL);
         if (slot < 0) { status[i] = 4; e += k; continue; }
         SlotHeader *sh = slot_hdr(base, (uint64_t)slot);
         if (atomic_load(&sh->state) == S_COMPLETE) { status[i] = 2; e += k; ok++; continue; }
@@ -461,9 +481,11 @@ int64_t arena_claim(uint8_t *base, int64_t n, const uint64_t *klo, const uint64_
         int64_t slot = find_slot(base, klo[i], khi[i]);
         int fresh = 0;
         if (slot < 0) {
-            slot = claim_slot(base, klo[i], khi[i], total);
+            /* xsn342: 'fresh' is what claim_slot says -- a yield to another
+             * writer's slot is a JOIN (status 1), never a fresh claim the
+             * caller may free again on abort. */
+            slot = claim_slot(base, klo[i], khi[i], total, &fresh);
             if (slot < 0) { status[i] = 4; continue; }
-            fresh = 1;
         }
         SlotHeader *sh = slot_hdr(base, (uint64_t)slot);
         slots_out[i] = slot;
@@ -621,6 +643,23 @@ void arena_free_slots(uint8_t *base, int64_t n, const int64_t *slots) {
     for (int64_t i = 0; i < n; i++) {
         SlotHeader *sh = slot_hdr(base, (uint64_t)slots[i]);
         uint32_t prev = atomic_exchange(&sh->state, S_FREE);
+        /* xsn342: unlink the index cell (the evictor does; free did not),
+         * else the next claim of this key finds a stale cell and is handed
+         * a slot it does not own. */
+        if (prev != S_EVICTING && sh->key_lo != 0) {
+            _Atomic uint64_t *keys = index_keys(base);
+            _Atomic uint32_t *islots = index_slots(base);
+            uint64_t mask = h->index_cap - 1;
+            uint64_t j = mix64(sh->key_lo) & mask;
+            for (uint64_t m = 0; m < h->index_cap; m++, j = (j + 1) & mask) {
+                uint64_t k = atomic_load(&keys[j]);
+                if (k == 0) break;
+                if (k == sh->key_lo && atomic_load(&islots[j]) == (uint32_t)slots[i]) {
+                    atomic_store(&keys[j], TOMB);
+                    break;
+                }
+            }
+        }
         sh->key_lo = 0; sh->key_hi = 0;
         sh->generation++;  /* #1427: a late arena_complete on this slot is refused */
         /* #1431: keep the occupancy counters exact (EVICTING was already

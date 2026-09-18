@@ -3145,7 +3145,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             mrows = mp.alloc_write([hashes[-1]]) if mp is not None else None
             if mrows is None:
                 pool.abort_write(pre)
-                self._1421_refused("mamba_claim" if mp is not None else "mamba_pool_unbound", node)
+                _why = "mamba_claim" if mp is not None else "mamba_pool_unbound"
+                self._weg2_sweep_last_refusal = _why   # xsn342: the sweep stops on a full mamba arena
+                self._1421_refused(_why, node)
                 return False
             mxfer.host_indices = mrows
             pend = getattr(self, "_weg2_direct_mamba_rows", None)
@@ -3278,7 +3280,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             if not _rp.publish_at_retain_on() or not self.enable_storage:
                 return
             _t0 = time.perf_counter()
-            stats = self.publish_unbacked_sweep(max_issue=_rp.max_issue()) or {}
+            stats = self.publish_unbacked_sweep(max_issue=_rp.max_issue(),
+                                                clock=_rp.SweepClock(_rp.budget_s())) or {}
             n = getattr(self, "_weg2_retain_publish_n", 0) + 1
             self._weg2_retain_publish_n = n
             if n <= 16 or n % 64 == 0:
@@ -3520,7 +3523,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                            getattr(node, "id", "?"), type(e).__name__, e)
             return None
 
-    def publish_unbacked_sweep(self, max_issue: int = 64) -> dict:
+    def publish_unbacked_sweep(self, max_issue: int = 64, clock=None) -> dict:
         """#1233 zero-remainder: back every un-backed device node up before a flush.
 
         The hand-back seam. The Weg-2 front quiesces a group through
@@ -3543,9 +3546,19 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         stats = {"unbacked": 0, "issued": 0, "refused": 0, "pending": 0, "skipped_pending": 0}
         if self.cache_controller is None or self.disable:
             return stats
+        from sglang.srt.weg2 import retain_publish as _rp
+        self._weg2_sweep_last_refusal = None
         queue = [self.root_node]
         while queue:
             node = queue.pop(0)
+            # xsn342: a bounded sweep -- wall budget (retain) and a full mamba
+            # arena end it; the remaining nodes stay unbacked for the next one.
+            if clock is not None and clock.expired():
+                stats["stopped"] = "budget"
+                break
+            if _rp.mamba_full_stops_sweep(self._weg2_sweep_last_refusal):
+                stats["stopped"] = "mamba_full"
+                break
             for child in list(node.children.values()):
                 queue.append(child)
             # #1317 C2/R-5: `l3_present` joins `backuped` as a skip reason.
@@ -3605,6 +3618,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 stats["issued"] += 1
             else:
                 stats["refused"] += 1
+        if clock is not None:
+            stats["ms"] = round(clock.elapsed_ms())
         stats["pending"] = len(self.ongoing_write_through) + len(getattr(self, "ongoing_backup", {}) or {})
         n = getattr(UnifiedRadixCache, "_weg2_sweep_n", 0) + 1
         UnifiedRadixCache._weg2_sweep_n = n
