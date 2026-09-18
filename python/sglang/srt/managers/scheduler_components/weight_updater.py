@@ -566,6 +566,8 @@ class SchedulerWeightUpdaterManager:
     #: killed group P 60 s after launch (xsn270, AttributeError at the
     #: first sleep leg) -- declare, never just assign.
     _weg2_leg_credit: Any = None
+    #: weg2xsn271: WEG2-CREDIT-FLOOR logged once per rank.
+    _weg2_floor_noted: bool = False
     #: #1452b: snapshot counter -- slots=True, so it is a FIELD (boot weg2xsn208
     #: printed 'n/a (AttributeError ... _1452_snapshots)' on every rank).
     _1452_snapshots: int = 0
@@ -6157,11 +6159,48 @@ class SchedulerWeightUpdaterManager:
         if uuid_key is None:
             return None
         try:
-            from sglang.srt.managers.corridor_guard import corridor_floor_mib
+            from sglang.srt.managers.corridor_guard import (
+                corridor_floor_mib,
+                user_reserve_by_card,
+            )
 
-            mib = corridor_floor_mib(uuid_key, group=self._weg2_group_name())
-            return None if mib is None else int(mib) * 1024 * 1024
-        except Exception:  # noqa: BLE001 -- an absent authority is an absence
+            # weg2xsn271 (18.09.): `corridor_floor_mib` returns a CorridorFloor
+            # OBJECT (transient + reserve, with provenance), never a number.
+            # `int(floor)` raised TypeError, the except below turned it into
+            # None, and every credit wait on every card ran with floor 0 --
+            # the D-side reader logged corridor_floor_mib=0 while the boot
+            # had MEASURED-D 3567 MiB (767 transient + 2800 reserve) for the
+            # 5090. TP0 then entered resume(weights_4) with 8 MiB to spare
+            # and the memory saver's cu_mem_create exit(1)'d the rank.
+            reserve = user_reserve_by_card().get(uuid_key)
+            floor = corridor_floor_mib(
+                uuid_key,
+                group=self._weg2_group_name(),
+                user_reserve_mib=0 if reserve is None else int(reserve),
+            )
+            if floor is None:
+                return None
+            mib = int(getattr(floor, "mib"))
+            if not getattr(self, "_weg2_floor_noted", False):
+                self._weg2_floor_noted = True
+                logger.info(
+                    "WEG2-CREDIT-FLOOR card=%s group=%s floor_mib=%d "
+                    "(transient=%s reserve=%s source=%s) -- the credit wait "
+                    "grades free VRAM against need + this floor",
+                    uuid_key, self._weg2_group_name(), mib,
+                    getattr(floor, "transient_mib", "?"),
+                    getattr(floor, "reserve_mib", "?"),
+                    getattr(floor, "source", "?"),
+                )
+            return mib * 1024 * 1024
+        except Exception as exc:  # noqa: BLE001 -- an absent authority is an absence
+            if not getattr(self, "_weg2_floor_noted", False):
+                self._weg2_floor_noted = True
+                logger.warning(
+                    "WEG2-CREDIT-FLOOR card=%s group=%s UNREADABLE (%s: %s) -- "
+                    "the credit wait grades free VRAM against the request "
+                    "alone (floor 0)", uuid_key, self._weg2_group_name(),
+                    type(exc).__name__, exc)
             return None
 
     def _weg2_xchg_whole_leg_lanes(self) -> Optional[set]:
