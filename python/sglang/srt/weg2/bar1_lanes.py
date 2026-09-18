@@ -43,6 +43,7 @@ import logging
 import mmap
 import os
 import socket
+import struct
 import threading
 import time
 from dataclasses import dataclass
@@ -254,6 +255,70 @@ def take_flag(d: str, kind: str, seq, g: int, timeout_s: float,
         time.sleep(0.00002)
 
 
+# -- credits: file flags (desk, fallback) or the lane's socket (metal) ----------
+
+_FRAME = struct.Struct("<cI")
+
+
+class FileCredits:
+    def __init__(self, d: str, seq, liveness=None):
+        self.d, self.seq, self.liveness = d, seq, liveness
+
+    def send(self, kind: str, g: int = 0, payload=None) -> None:
+        post_flag(self.d, kind, self.seq, g, payload)
+
+    def recv(self, kind: str, g: int, timeout_s: float):
+        return take_flag(self.d, kind, self.seq, g, timeout_s, liveness=self.liveness)
+
+
+class SocketCredits:
+    """One 5-byte frame per credit on the lane's open connection; a plan
+    frame carries a length-prefixed JSON. Both sides read in order, so the
+    kinds are checked, never searched."""
+    KINDS = {"plan": b"P", "full": b"F", "free": b"R", "done": b"D"}
+
+    def __init__(self, sock, liveness=None):
+        self.sock, self.liveness = sock, liveness
+
+    def send(self, kind: str, g: int = 0, payload=None) -> None:
+        body = b"" if payload is None else json.dumps(payload).encode()
+        self.sock.sendall(_FRAME.pack(self.KINDS[kind], int(g)) + struct.pack("<I", len(body)) + body)
+
+    def _read(self, n: int, timeout_s: float) -> Optional[bytes]:
+        buf = b""
+        deadline = time.monotonic() + float(timeout_s)
+        k = 0
+        while len(buf) < n:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                return None
+            self.sock.settimeout(min(left, 0.5))
+            try:
+                chunk = self.sock.recv(n - len(buf))
+            except socket.timeout:
+                k += 1
+                if self.liveness is not None and not self.liveness():
+                    return None
+                continue
+            if not chunk:
+                return None          # peer closed
+            buf += chunk
+        return buf
+
+    def recv(self, kind: str, g: int, timeout_s: float):
+        head = self._read(_FRAME.size + 4, timeout_s)
+        if head is None:
+            return None
+        k, gg = _FRAME.unpack_from(head, 0)
+        (n,) = struct.unpack_from("<I", head, _FRAME.size)
+        body = self._read(n, timeout_s) if n else b""
+        if body is None:
+            return None
+        if k != self.KINDS[kind] or int(gg) != int(g):
+            raise RuntimeError(f"bar1 credit out of order: got {k!r} {gg}, expected {kind} {g}")
+        return json.loads(body.decode()) if body else {}
+
+
 # -- the window (receiver) and the peer mapping (depositor) -------------------
 
 @dataclass
@@ -271,6 +336,7 @@ class RecvWindow:
     listener: object = None
     thread: object = None
     borrowed: str = ""     # the group window whose payload region this ring borrows
+    conn: object = None    # the depositor's open connection = the credit channel
 
 
 @dataclass
@@ -284,6 +350,7 @@ class PeerWindow:
     holder_handle: int
     mmap_obj: object
     reg_address: int
+    sock: object = None    # the open connection to the receiver = the credit channel
 
 
 class Bar1Lanes:
@@ -311,6 +378,8 @@ class Bar1Lanes:
         self._dst_lanes: list = []
         self._windows_logged = False
         self.last_seq: dict = {}       # lane -> the seq this side ran last (the depositor's done-wait)
+        self.turn: dict = {}           # lane -> {"flip": f, "next": i}: the collector's per-lane tag order
+        self.turn_cv = threading.Condition()
 
     # -- helpers ---------------------------------------------------------
     def _ordinal(self) -> int:
@@ -368,6 +437,43 @@ class Bar1Lanes:
     def flags(self, lane_key: str, role: str) -> str:
         dst_group = self.group if role == "dst" else other_group(self.group)
         return flag_dir(self.boot_nonce, lane_key, dst_group, self.root)
+
+    def channel(self, lane_key: str, role: str):
+        """The lane's open AF_UNIX connection from this side, or None (file flags)."""
+        if role == "dst":
+            w = self.recv.get(lane_key)
+            return getattr(w, "conn", None) if w is not None else None
+        p = self.peers.get(lane_key)
+        return getattr(p, "sock", None) if p is not None else None
+
+    def take_turn(self, lane_key: str, order_key, timeout_s: float) -> bool:
+        """Wait until this (flip, index) is next on the lane: index 0 of a new
+        flip always passes; within a flip the indices run in order. With two
+        collects in flight the same lane's tags must not interleave on one
+        byte stream."""
+        if order_key is None:
+            return True
+        flip, idx = int(order_key[0]), int(order_key[1])
+        deadline = time.monotonic() + float(timeout_s)
+        with self.turn_cv:
+            while True:
+                t = self.turn.get(lane_key)
+                if t is None or t["flip"] != flip:
+                    if idx == 0:
+                        return True
+                elif t["next"] == idx:
+                    return True
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    return False
+                self.turn_cv.wait(min(left, 0.5))
+
+    def leave_turn(self, lane_key: str, order_key) -> None:
+        if order_key is None:
+            return
+        with self.turn_cv:
+            self.turn[lane_key] = {"flip": int(order_key[0]), "next": int(order_key[1]) + 1}
+            self.turn_cv.notify_all()
 
     def window_for(self, lane_key: str, role: str):
         """(base device pointer, slot_bytes, ring) of this lane's window as seen
@@ -473,8 +579,17 @@ class Bar1Lanes:
                     socket.send_fds(conn, [meta], [w.dmabuf_fd])
                 except OSError as exc:
                     self.log(f"WEG2-BAR1 lane={lane_key} serve failed: {exc!r}")
-                finally:
                     conn.close()
+                    continue
+                # the connection STAYS OPEN: it is the lane's credit channel
+                # (blocking recv on both sides, no file polling, no GIL spin)
+                old = w.conn
+                w.conn = conn
+                if old is not None:
+                    try:
+                        old.close()
+                    except OSError:
+                        pass
         th = threading.Thread(target=_serve, name=f"bar1-serve-{lane_key}", daemon=True)
         th.start()
         w.listener, w.thread = ls, th
@@ -503,7 +618,6 @@ class Bar1Lanes:
                 s.settimeout(10.0)
                 s.connect(path)
                 data, fds, _flags, _addr = socket.recv_fds(s, 4096, 4)
-                s.close()
                 meta = json.loads(data.decode())
                 break
             except (OSError, ValueError):
@@ -523,6 +637,7 @@ class Bar1Lanes:
                     return None
                 time.sleep(0.25)
         if not fds:
+            s.close()
             self.refusals[lane_key] = "connect: no fd in the message"
             self.log(f"WEG2-BAR1 lane={lane_key} role=src REFUSED {self.refusals[lane_key]} -> host lane")
             return None
@@ -571,14 +686,19 @@ class Bar1Lanes:
                     pass
             self.refusals[lane_key] = f"map: {type(exc).__name__}: {exc}"
             self.log(f"WEG2-BAR1 lane={lane_key} role=src REFUSED {self.refusals[lane_key]} -> host lane")
+            try:
+                s.close()
+            except OSError:
+                pass
             return None
         finally:
             try:
                 os.close(fd)
             except OSError:
                 pass
+        s.settimeout(None)
         p = PeerWindow(lane_key, int(dev), int(meta["size"]), int(meta["slot_bytes"]), int(meta["ring"]),
-                       peer_bdf, int(handle_), mapped, host - lead_in)
+                       peer_bdf, int(handle_), mapped, host - lead_in, sock=s)
         self.peers[lane_key] = p
         self.log(f"WEG2-BAR1 lane={lane_key} role=src group={self.group} mapped peer={peer_bdf} "
                  f"window={p.size >> 20} MiB slot={p.slot_bytes >> 20} MiB ring={p.ring} "
@@ -618,17 +738,23 @@ class Bar1Lanes:
 
 def run_bar1_units(descs, ops, *, lanes: Bar1Lanes, lane_key: str, role: str,
                    seq, phase: str, no_write=None, liveness=None,
-                   budget_s: float = 120.0, device: int = 0, log=None) -> str:
+                   budget_s: float = 120.0, device: int = 0, log=None,
+                   order_key=None) -> str:
     """The BAR1 form of ``run_sequential_units``: the tag's pieces cut at the
     ring slot (``tp.batch_descs``), batch g into slot g % ring.
 
-    DEPOSIT (role 'src'): for g >= ring wait ``free.<seq>.<g-ring>`` (the
-    collector drained the slot), queue every piece's copy into the PEER window
-    (posted DMA over BAR1), ONE sync, then post ``full.<seq>.<g>`` with the
-    batch's record (names, tags, sizes). COLLECT (role 'dst'): wait
-    ``full.<seq>.<g>``, check the record's identity BY NAME per piece, queue
-    the copies out of the OWN window (D2D on this card), ONE sync, post
-    ``free.<seq>.<g>``. Returns "" or the refusal text.
+    Credits ride the lane's open AF_UNIX connection when both ends have it
+    (``SocketCredits``: blocking recv, no polling -- xsn372 measured the
+    file-flag polling at ~9 ms of GIL starvation per batch on a receiver
+    with two collects in flight), else file flags (``FileCredits``, the desk).
+    DEPOSIT (role 'src'): send the plan, for g >= ring wait free(g-ring),
+    queue the batch's copies into the PEER window, sync one behind, send
+    full(g); at the end wait for the collector's done. COLLECT (role 'dst'):
+    take the lane's turn (``order_key`` = (flip, index): with two collects in
+    flight one lane's tags must not interleave), receive the plan and check
+    it against the own cut once, per batch wait full(g), copy out of the OWN
+    window, sync, send free(g); at the end send done. Returns "" or the
+    refusal text.
     """
     from sglang.srt.weg2 import weight_exchange_transport as tp
     log = log or lanes.log
@@ -639,15 +765,25 @@ def run_bar1_units(descs, ops, *, lanes: Bar1Lanes, lane_key: str, role: str,
     batches = tp.batch_descs(list(descs), slot_bytes=int(slot_bytes), first_seq=0)
     if not batches:
         return ""
+    if role == "dst" and not lanes.take_turn(lane_key, order_key, budget_s):
+        return (f"bar1 collect lane={lane_key} seq={seq}: the lane's turn {order_key} did not "
+                f"come within {budget_s:.0f} s (an earlier tag's collect is stuck)")
+    try:
+        return _run_bar1_tag(descs, ops, lanes, lane_key, role, seq, phase, no_write, liveness,
+                             budget_s, device, log, base, slot_bytes, ring, batches, tp)
+    finally:
+        if role == "dst":
+            lanes.leave_turn(lane_key, order_key)
+
+
+def _run_bar1_tag(descs, ops, lanes, lane_key, role, seq, phase, no_write, liveness,
+                  budget_s, device, log, base, slot_bytes, ring, batches, tp) -> str:
     d = lanes.flags(lane_key, role)
+    chan = lanes.channel(lane_key, role)
+    cred = SocketCredits(chan, liveness) if chan is not None else FileCredits(d, seq, liveness)
+    via = "sock" if chan is not None else "file"
     total = sum(int(b.total_bytes) for b in batches)
     npieces = sum(len(b.pieces) for b in batches)
-    # ONE STREAM PER SLOT, and the sync runs ONE BATCH BEHIND: batch g is
-    # queued on stream g % ring, then batch g-1 (already done while g was
-    # being issued) is synced and its flag posted. The copy engine never
-    # waits for Python between batches -- xsn365 measured the per-batch form
-    # (sync, flag, next issue) at ~1 ms of bubble per 8-MiB batch = half the
-    # link on the 5090's lanes.
     streams = []
     for _ in range(int(ring)):
         try:
@@ -658,122 +794,113 @@ def run_bar1_units(descs, ops, *, lanes: Bar1Lanes, lane_key: str, role: str,
     t0 = time.perf_counter()
     t_wait = t_copy = 0.0
     log(f"WEG2-BAR1 mapped lane={lane_key} phase={phase} seq={seq} bytes={total} "
-        f"units={npieces} batches={len(batches)} slot={slot_bytes >> 20}MiB ring={ring}")
+        f"units={npieces} batches={len(batches)} slot={slot_bytes >> 20}MiB ring={ring} credits={via}")
     nb = len(batches)
-
-    def _finish(g):
-        """sync batch g's stream and post its flag (full for the depositor,
-        free for the collector)."""
-        nonlocal t_copy
-        tc = time.perf_counter()
-        ops.synchronize(streams[ring_slot(g, ring)])
-        t_copy += time.perf_counter() - tc
-        post_flag(d, "full" if role == "src" else "free", seq, g)
-
-    # LAG: the depositor syncs one batch behind (its copy engine never idles
-    # between batches); the collector syncs at once (a D2D copy of one slot
-    # is microseconds). That leaves ring-1 batches of SLACK between the two
-    # sides -- xsn367 measured lag 2/1 (one batch of slack) at ~2 ms per
-    # 9-MiB batch: every flag hop through the scheduler process's GIL costs
-    # ~1 ms, and with one batch of slack the two sides waited for each other
-    # hop by hop (PP0 4.7 GB/s per lane, single-lane probe 10.6).
     lag = (1 if role == "src" else 0) if int(ring) >= 3 else 0
-    # ONE plan record per tag (the batches' pieces by name, tag, size and
-    # slot offset) instead of a JSON per batch: the collector checks its own
-    # deterministic cut against it once, the per-batch flags stay empty.
-    prev = lanes.last_seq.get(lane_key)
-    lanes.last_seq[lane_key] = seq
-    if role == "src" and prev is not None:
-        # the collector may still be copying the previous tag's last ring-1
-        # batches out of the slots this tag writes first: wait for its done
-        tw = time.perf_counter()
-        if take_flag(d, "done", prev, 0, budget_s, liveness=liveness) is None:
-            return (f"bar1 deposit lane={lane_key} seq={seq}: the previous tag {prev} was never "
-                    f"reported done by the collector within {budget_s:.0f} s")
-        t_wait += time.perf_counter() - tw
-    if role == "src":
-        post_flag(d, "plan", seq, 0, {"batches": [
-            [[str(getattr(descs[pc.desc_index], "param_name", "?")),
+    plan = [[[str(getattr(descs[pc.desc_index], "param_name", "?")),
               str(getattr(descs[pc.desc_index], "tag", "") or ""), int(pc.nbytes), int(pc.slot_off)]
-             for pc in b.pieces] for b in batches]})
-    else:
-        tw = time.perf_counter()
-        got = take_flag(d, "plan", seq, 0, budget_s, liveness=liveness)
-        t_wait += time.perf_counter() - tw
-        if got is None:
-            return (f"bar1 collect lane={lane_key} seq={seq}: no plan record within "
-                    f"{budget_s:.0f} s (depositor gone or stuck)")
-        theirs = got.get("batches") or []
-        mine = [[[str(getattr(descs[pc.desc_index], "param_name", "?")),
-                  str(getattr(descs[pc.desc_index], "tag", "") or ""), int(pc.nbytes), int(pc.slot_off)]
-                 for pc in b.pieces] for b in batches]
-        if theirs != mine:
-            return (f"bar1 collect lane={lane_key} seq={seq}: the deposit plan ({len(theirs)} batches) "
-                    f"differs from this side's cut ({len(mine)}) -- the two plans disagree")
-    for g, batch in enumerate(batches):
-        sbase = base + ring_slot(g, ring) * slot_bytes
-        stream = streams[ring_slot(g, ring)]
+             for pc in b.pieces] for b in batches]
+    lanes.last_seq[lane_key] = seq
+    try:
         if role == "src":
-            if g >= ring:
-                tw = time.perf_counter()
-                if take_flag(d, "free", seq, g - ring, budget_s, liveness=liveness) is None:
-                    return (f"bar1 deposit lane={lane_key} seq={seq}: no 'free' for batch "
-                            f"{g - ring} within {budget_s:.0f} s (collector gone or stuck)")
-                t_wait += time.perf_counter() - tw
+            cred.send("plan", 0, {"batches": plan})
+        else:
+            tw = time.perf_counter()
+            got = cred.recv("plan", 0, budget_s)
+            t_wait += time.perf_counter() - tw
+            if got is None:
+                return (f"bar1 collect lane={lane_key} seq={seq}: no plan record within "
+                        f"{budget_s:.0f} s (depositor gone or stuck)")
+            if (got.get("batches") or []) != plan:
+                return (f"bar1 collect lane={lane_key} seq={seq}: the deposit plan "
+                        f"({len(got.get('batches') or [])} batches) differs from this side's cut "
+                        f"({len(plan)}) -- the two plans disagree")
+
+        def _finish(g):
+            nonlocal t_copy
+            tc = time.perf_counter()
+            ops.synchronize(streams[ring_slot(g, ring)])
+            t_copy += time.perf_counter() - tc
+            cred.send("full" if role == "src" else "free", g)
+
+        for g, batch in enumerate(batches):
+            sbase = base + ring_slot(g, ring) * slot_bytes
+            stream = streams[ring_slot(g, ring)]
+            if role == "src":
+                if g >= ring:
+                    tw = time.perf_counter()
+                    if cred.recv("free", g - ring, budget_s) is None:
+                        return (f"bar1 deposit lane={lane_key} seq={seq}: no 'free' for batch "
+                                f"{g - ring} within {budget_s:.0f} s (collector gone or stuck)")
+                    t_wait += time.perf_counter() - tw
+                for piece in batch.pieces:
+                    desc = descs[piece.desc_index]
+                    if desc.src_ptr is None:
+                        return (f"bar1 deposit lane={lane_key} batch {g}: desc "
+                                f"{getattr(desc, 'param_name', '?')!r} carries no src_ptr")
+                    src = int(desc.src_ptr) + int(piece.src_off)
+                    dst = sbase + int(piece.slot_off)
+                    if piece.kind == tp.FLAT:
+                        ops.memcpy_async(dst, src, int(piece.nbytes), stream)
+                    else:
+                        ops.memcpy2d_async(dst, int(piece.run_bytes), src, int(piece.spitch),
+                                           int(piece.run_bytes), int(piece.rows), stream)
+                if g >= lag:
+                    _finish(g - lag)
+                continue
+            # ---- COLLECT ----
+            tw = time.perf_counter()
+            got = cred.recv("full", g, budget_s)
+            t_wait += time.perf_counter() - tw
+            if got is None:
+                return (f"bar1 collect lane={lane_key} seq={seq}: no 'full' for batch {g} "
+                        f"within {budget_s:.0f} s (depositor gone or stuck)")
             for piece in batch.pieces:
                 desc = descs[piece.desc_index]
-                if desc.src_ptr is None:
-                    return (f"bar1 deposit lane={lane_key} batch {g}: desc "
-                            f"{getattr(desc, 'param_name', '?')!r} carries no src_ptr")
-                src = int(desc.src_ptr) + int(piece.src_off)
-                dst = sbase + int(piece.slot_off)
+                name = str(getattr(desc, "param_name", "?"))
+                tag = str(getattr(desc, "tag", "") or "")
+                if (tag, name) in _nw or name in _nw:
+                    continue
+                if desc.dst_ptr is None:
+                    return f"bar1 collect lane={lane_key} batch {g}: desc {name!r} carries no dst_ptr"
+                dst = int(desc.dst_ptr) + int(piece.dst_off)
+                src = sbase + int(piece.slot_off)
                 if piece.kind == tp.FLAT:
                     ops.memcpy_async(dst, src, int(piece.nbytes), stream)
                 else:
-                    ops.memcpy2d_async(dst, int(piece.run_bytes), src, int(piece.spitch),
+                    ops.memcpy2d_async(dst, int(piece.dpitch), src, int(piece.run_bytes),
                                        int(piece.run_bytes), int(piece.rows), stream)
             if g >= lag:
                 _finish(g - lag)
-            continue
-        # ---- COLLECT ----
-        tw = time.perf_counter()
-        got = take_flag(d, "full", seq, g, budget_s, liveness=liveness)
-        t_wait += time.perf_counter() - tw
-        if got is None:
-            return (f"bar1 collect lane={lane_key} seq={seq}: no 'full' for batch {g} "
-                    f"within {budget_s:.0f} s (depositor gone or stuck)")
-        for piece in batch.pieces:
-            desc = descs[piece.desc_index]
-            name = str(getattr(desc, "param_name", "?"))
-            tag = str(getattr(desc, "tag", "") or "")
-            if (tag, name) in _nw or name in _nw:
-                continue
-            if desc.dst_ptr is None:
-                return f"bar1 collect lane={lane_key} batch {g}: desc {name!r} carries no dst_ptr"
-            dst = int(desc.dst_ptr) + int(piece.dst_off)
-            src = sbase + int(piece.slot_off)
-            if piece.kind == tp.FLAT:
-                ops.memcpy_async(dst, src, int(piece.nbytes), stream)
-            else:
-                ops.memcpy2d_async(dst, int(piece.dpitch), src, int(piece.run_bytes),
-                                   int(piece.run_bytes), int(piece.rows), stream)
-        if g >= lag:
-            _finish(g - lag)
-    # the tail: every batch still in flight, in order (lag of them)
-    for g in range(max(0, nb - lag), nb):
-        _finish(g)
-    if role == "dst":
-        # the ring's last free flags have no taker: leave none behind; the
-        # depositor's next tag waits for `done` instead
-        for g in range(max(0, len(batches) - ring), len(batches)):
-            try:
-                os.unlink(_flag_path(d, "free", seq, g))
-            except FileNotFoundError:
-                pass
-        post_flag(d, "done", seq, 0)
+        for g in range(max(0, nb - lag), nb):
+            _finish(g)
+        if role == "dst":
+            if via == "file":
+                for g in range(max(0, nb - ring), nb):
+                    try:
+                        os.unlink(_flag_path(d, "free", seq, g))
+                    except FileNotFoundError:
+                        pass
+            cred.send("done", 0)
+        else:
+            # the collector's done closes the tag: its last copies out of the
+            # slots are through before this side's next tag writes them. On a
+            # byte stream the trailing frees (nobody's credit) come first.
+            tw = time.perf_counter()
+            if via == "sock":
+                for g in range(max(0, nb - ring), nb):
+                    if cred.recv("free", g, budget_s) is None:
+                        return (f"bar1 deposit lane={lane_key} seq={seq}: no trailing 'free' for "
+                                f"batch {g} within {budget_s:.0f} s")
+            if cred.recv("done", 0, budget_s) is None:
+                return (f"bar1 deposit lane={lane_key} seq={seq}: the collector never reported "
+                        f"done within {budget_s:.0f} s")
+            t_wait += time.perf_counter() - tw
+    except RuntimeError as exc:
+        return f"bar1 lane={lane_key} seq={seq}: {exc}"
     total_s = time.perf_counter() - t0
     log(f"WEG2-BAR1 lane-time lane={lane_key} phase={phase} seq={seq} units={npieces} "
-        f"batches={len(batches)} bytes={total} total_ms={total_s * 1000:.0f} "
+        f"batches={nb} bytes={total} total_ms={total_s * 1000:.0f} "
         f"wait_ms={t_wait * 1000:.0f} copy_sync_ms={t_copy * 1000:.0f} "
-        f"rate_GBs={(total / max(total_s, 1e-9)) / 1e9:.1f} via=bar1")
+        f"rate_GBs={(total / max(total_s, 1e-9)) / 1e9:.1f} via=bar1 credits={via}")
     return ""

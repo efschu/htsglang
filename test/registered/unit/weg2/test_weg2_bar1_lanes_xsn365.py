@@ -166,9 +166,9 @@ def test_ring_transport_moves_every_byte_flat_and_strided(tmp_path, ring):
         assert s2_dst[r * dpitch:r * dpitch + run] == s2_src[r * spitch:r * spitch + run]
         assert s2_dst[r * dpitch + run:(r + 1) * dpitch] == bytes(dpitch - run)  # only payload
     assert bytes(nw_dst) == bytes(500)                       # consumed, not written
-    # nothing left behind but the collector's `done` (the depositor's next tag consumes it)
+    # nothing left behind: every flag consumed, the done taken by the depositor
     d = dep.flags("p0", "src")
-    assert [f for f in os.listdir(d) if not f.endswith(".tmp")] == ["done.7.0"]
+    assert [f for f in os.listdir(d) if not f.endswith(".tmp")] == []
 
 
 def test_collector_refuses_a_disagreeing_plan(tmp_path):
@@ -185,11 +185,17 @@ def test_collector_refuses_a_disagreeing_plan(tmp_path):
     c_descs = [SimpleNamespace(kind=tp.FLAT, nbytes=3000, src_off=0, dst_off=0, param_name="b",
                                tag="t", src_ptr=None, dst_ptr=_addr(dst))]
     ops = _HostOps()
-    assert b1.run_bar1_units(d_descs, ops, lanes=dep, lane_key="p0", role="src", seq=1,
-                             phase="deposit", budget_s=2.0, log=lambda *_a: None) == ""
-    why = b1.run_bar1_units(c_descs, ops, lanes=col, lane_key="p0", role="dst", seq=1,
-                            phase="collect", budget_s=2.0, log=lambda *_a: None)
-    assert "plans disagree" in why and bytes(dst) == bytes(3000)
+    out = {}
+
+    def _collect():
+        out["c"] = b1.run_bar1_units(c_descs, ops, lanes=col, lane_key="p0", role="dst", seq=1,
+                                     phase="collect", budget_s=2.0, log=lambda *_a: None)
+    th = threading.Thread(target=_collect); th.start()
+    why_d = b1.run_bar1_units(d_descs, ops, lanes=dep, lane_key="p0", role="src", seq=1,
+                              phase="deposit", budget_s=1.0, log=lambda *_a: None)
+    th.join(10)
+    assert "plans disagree" in out["c"] and bytes(dst) == bytes(3000)
+    assert why_d != ""          # the depositor never saw the collector's done
 
 
 def test_no_window_on_this_side_is_a_named_refusal(tmp_path):
@@ -199,10 +205,10 @@ def test_no_window_on_this_side_is_a_named_refusal(tmp_path):
     assert "no window" in why
 
 
-def test_string_seq_and_done_flag_between_tags(tmp_path):
+def test_string_seq_and_the_depositor_waits_for_done(tmp_path):
     """18.09.: the seq is '<flip>-<tag>' (deterministic on both sides); the
-    depositor's next tag waits for the collector's `done` of the previous
-    one before it writes the slots again."""
+    depositor's tag ends only when the collector reported done, so the next
+    tag never writes slots the collector is still copying out of."""
     slot, ring = 4096, 4
     window = bytearray(slot * ring)
     dep = _lanes(tmp_path, "P", 0)
@@ -225,14 +231,54 @@ def test_string_seq_and_done_flag_between_tags(tmp_path):
     th.join(10)
     assert out["7-weights_0"] == "" and bytes(dst) == bytes(src)
     assert dep.last_seq["p0"] == "7-weights_0"
-    # the collector left a `done` for the depositor's next tag; the flags dir holds nothing else
     d = col.flags("p0", "dst")
-    assert sorted(os.listdir(d)) == ["done.7-weights_0.0"]
-    # a second tag without the collector running: the depositor consumes `done` and then
-    # (with a small budget) refuses on the missing `free` -- never overwrites blindly
-    src2 = bytearray(os.urandom(20000))
+    assert [f for f in os.listdir(d) if not f.endswith(".tmp")] == []     # done consumed
+    # a tag without a collector: the depositor refuses (never writes blindly)
     descs2 = [SimpleNamespace(kind=tp.FLAT, nbytes=20000, src_off=0, dst_off=0, param_name="w",
-                              tag="weights_1", src_ptr=_addr(src2), dst_ptr=None)]
+                              tag="weights_1", src_ptr=_addr(src), dst_ptr=None)]
     why = b1.run_bar1_units(descs2, ops, lanes=dep, lane_key="p0", role="src", seq="7-weights_1",
                             phase="deposit", budget_s=0.2, log=lambda *_a: None)
-    assert "no 'free'" in why and "done.7-weights_0.0" not in os.listdir(d)
+    assert "no 'free'" in why or "never reported done" in why
+
+
+def test_socket_credits_and_the_per_lane_turnstile(tmp_path):
+    """The metal form: credits on the lane's open connection; two collects of
+    the same lane in flight run in tag order (turnstile), bytes exact."""
+    import socket as _socket
+    slot, ring = 4096, 4
+    window = bytearray(slot * ring)
+    dep = _lanes(tmp_path, "P", 0)
+    col = _lanes(tmp_path, "D", 1)
+    a, b = _socket.socketpair()
+    col.recv["p0"] = SimpleNamespace(dptr=_addr(window), slot_bytes=slot, ring=ring, conn=b)
+    dep.peers["p0"] = SimpleNamespace(dev_ptr=_addr(window), slot_bytes=slot, ring=ring, sock=a)
+    ops = _HostOps()
+    srcs = [bytearray(os.urandom(15000 + 1000 * k)) for k in range(3)]
+    dsts = [bytearray(len(x)) for x in srcs]
+    tags = ["weights_0", "weights_1", "weights_2"]
+    out = {}
+
+    def _collect(k):
+        descs = [SimpleNamespace(kind=tp.FLAT, nbytes=len(srcs[k]), src_off=0, dst_off=0,
+                                 param_name=f"w{k}", tag=tags[k], src_ptr=None, dst_ptr=_addr(dsts[k]))]
+        out[k] = b1.run_bar1_units(descs, ops, lanes=col, lane_key="p0", role="dst", seq=f"3-{tags[k]}",
+                                   phase="collect", budget_s=5.0, log=lambda *_a: None,
+                                   order_key=(3, k))
+    # the collects start OUT of order (2, 1, 0): the turnstile puts them in order
+    ths = [threading.Thread(target=_collect, args=(k,)) for k in (2, 1, 0)]
+    for th in ths:
+        th.start()
+    for k in range(3):
+        descs = [SimpleNamespace(kind=tp.FLAT, nbytes=len(srcs[k]), src_off=0, dst_off=0,
+                                 param_name=f"w{k}", tag=tags[k], src_ptr=_addr(srcs[k]), dst_ptr=None)]
+        assert b1.run_bar1_units(descs, ops, lanes=dep, lane_key="p0", role="src", seq=f"3-{tags[k]}",
+                                 phase="deposit", budget_s=5.0, log=lambda *_a: None) == ""
+    for th in ths:
+        th.join(10)
+    assert out == {0: "", 1: "", 2: ""}
+    for k in range(3):
+        assert bytes(dsts[k]) == bytes(srcs[k])
+    assert col.turn["p0"] == {"flip": 3, "next": 3}
+    # no file flags were used at all
+    assert not os.path.exists(col.flags("p0", "dst")) or os.listdir(col.flags("p0", "dst")) == []
+    a.close(); b.close()

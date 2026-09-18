@@ -6311,9 +6311,16 @@ class SchedulerWeightUpdaterManager:
                                             (_b1.refusals.get(_lane_key, "peer decided host")
                                              if _b1_role == "src" else "depositor decided host"))
                         if _b1_mode == b1.MODE_BAR1:
+                            # the lane's turn (flip, index in the wake order): with two
+                            # collects in flight one lane's tags stay in order on its
+                            # credit channel
+                            _ord_k = getattr(self, "_weg2_leg_tag_order", None) or []
+                            _b1_order = ((int(_fi), _ord_k.index(str(tag)))
+                                         if (phase == bx.PHASE_COLLECT and _fi is not None
+                                             and int(_fi) >= 0 and str(tag) in _ord_k) else None)
                             last = b1.run_bar1_units(
                                 _lane_descs, ops, lanes=_b1, lane_key=_lane_key,
-                                role=_b1_role, seq=_b1_seq, phase=phase,
+                                role=_b1_role, seq=_b1_seq, phase=phase, order_key=_b1_order,
                                 no_write=getattr(self, "_weg2_xchg_no_write", None),
                                 liveness=self._weg2_cocard_peer_alive,
                                 device=device, log=logger.info)
