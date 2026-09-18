@@ -378,7 +378,7 @@ class Bar1Lanes:
         self._dst_lanes: list = []
         self._windows_logged = False
         self.last_seq: dict = {}       # lane -> the seq this side ran last (the depositor's done-wait)
-        self.turn: dict = {}           # lane -> {"flip": f, "next": i}: the collector's per-lane tag order
+        self.turn: dict = {}           # lane -> {(flip, index), ...} pending tags, oldest runs first
         self.turn_cv = threading.Condition()
 
     # -- helpers ---------------------------------------------------------
@@ -446,22 +446,44 @@ class Bar1Lanes:
         p = self.peers.get(lane_key)
         return getattr(p, "sock", None) if p is not None else None
 
+    def register_turns(self, order_key) -> None:
+        """Called by the wake loop's MAIN thread, in tag order, before a tag's
+        collect is submitted: the tag is pending on every lane this process
+        receives on. A lane runs its tags in the order they were registered;
+        a tag that turns out not to use a lane releases it (release_turns)."""
+        if order_key is None:
+            return
+        key = (int(order_key[0]), int(order_key[1]))
+        with self.turn_cv:
+            for lk in self.recv:
+                self.turn.setdefault(lk, set()).add(key)
+            self.turn_cv.notify_all()
+
+    def release_turns(self, order_key, used=None) -> None:
+        """Drop the tag from the lanes it does not use (``used`` given) or from
+        every lane (the tag's collect is over, whatever happened)."""
+        if order_key is None:
+            return
+        key = (int(order_key[0]), int(order_key[1]))
+        with self.turn_cv:
+            for lk, pend in self.turn.items():
+                if used is None or lk not in set(used):
+                    pend.discard(key)
+            self.turn_cv.notify_all()
+
     def take_turn(self, lane_key: str, order_key, timeout_s: float) -> bool:
-        """Wait until this (flip, index) is next on the lane: index 0 of a new
-        flip always passes; within a flip the indices run in order. With two
-        collects in flight the same lane's tags must not interleave on one
-        byte stream."""
+        """Wait until this tag is the OLDEST pending one on the lane: with two
+        collects in flight one lane's tags must not interleave on its byte
+        stream. A key that was never registered passes (the desk, a lane
+        without registration)."""
         if order_key is None:
             return True
-        flip, idx = int(order_key[0]), int(order_key[1])
+        key = (int(order_key[0]), int(order_key[1]))
         deadline = time.monotonic() + float(timeout_s)
         with self.turn_cv:
             while True:
-                t = self.turn.get(lane_key)
-                if t is None or t["flip"] != flip:
-                    if idx == 0:
-                        return True
-                elif t["next"] == idx:
+                pend = self.turn.get(lane_key) or set()
+                if key not in pend or min(pend) == key:
                     return True
                 left = deadline - time.monotonic()
                 if left <= 0:
@@ -471,8 +493,11 @@ class Bar1Lanes:
     def leave_turn(self, lane_key: str, order_key) -> None:
         if order_key is None:
             return
+        key = (int(order_key[0]), int(order_key[1]))
         with self.turn_cv:
-            self.turn[lane_key] = {"flip": int(order_key[0]), "next": int(order_key[1]) + 1}
+            pend = self.turn.get(lane_key)
+            if pend:
+                pend.discard(key)
             self.turn_cv.notify_all()
 
     def window_for(self, lane_key: str, role: str):
@@ -767,7 +792,8 @@ def run_bar1_units(descs, ops, *, lanes: Bar1Lanes, lane_key: str, role: str,
         return ""
     if role == "dst" and not lanes.take_turn(lane_key, order_key, budget_s):
         return (f"bar1 collect lane={lane_key} seq={seq}: the lane's turn {order_key} did not "
-                f"come within {budget_s:.0f} s (an earlier tag's collect is stuck)")
+                f"come within {budget_s:.0f} s (an earlier tag's collect is stuck; pending="
+                f"{sorted(lanes.turn.get(lane_key) or ())})")
     try:
         return _run_bar1_tag(descs, ops, lanes, lane_key, role, seq, phase, no_write, liveness,
                              budget_s, device, log, base, slot_bytes, ring, batches, tp)

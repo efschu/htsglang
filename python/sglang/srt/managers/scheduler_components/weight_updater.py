@@ -4114,6 +4114,35 @@ class SchedulerWeightUpdaterManager:
         if bx.seq_release_lanes():
             bx.release_host_lane_buffers(truncate=False, log=logger.info)
 
+    def _weg2_bar1_order_key(self, tag):
+        """(flip index, index of the tag in the wake order) or None."""
+        try:
+            fi = self._weg2_flip_index_now
+            order = self._weg2_leg_tag_order or []
+            if fi is None or int(fi) < 0 or str(tag) not in order:
+                return None
+            return (int(fi), order.index(str(tag)))
+        except Exception:  # noqa: BLE001 -- stubs without the fields
+            return None
+
+    def _weg2_bar1_register(self, tag) -> None:
+        """Main thread, in tag order: the tag is pending on every BAR1 lane
+        this rank receives on (bar1_lanes.register_turns)."""
+        try:
+            b1 = self._weg2_bar1
+            if b1 is not None:
+                b1.register_turns(self._weg2_bar1_order_key(tag))
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _weg2_bar1_release(self, tag, used=None) -> None:
+        try:
+            b1 = self._weg2_bar1
+            if b1 is not None:
+                b1.release_turns(self._weg2_bar1_order_key(tag), used)
+        except Exception:  # noqa: BLE001
+            pass
+
     def _weg2_tag_done_set(self, tag) -> None:
         """Mark this tag's collect as through for the tag-order gate."""
         try:
@@ -4143,6 +4172,7 @@ class SchedulerWeightUpdaterManager:
                 self._weg2_wake_inflight = False
             except AttributeError:
                 pass
+            self._weg2_bar1_release(tag)       # every lane: this tag's collect is over
             self._weg2_tag_done_set(tag)
         self._weg2_xchg_collected_per_tag = True
         self._weg2_seam_after_part(tag)
@@ -6402,6 +6432,12 @@ class SchedulerWeightUpdaterManager:
                 # Each lane owns its buffer, record file, handshake and
                 # rendezvous; the ctypes copies release the GIL. Off with
                 # SGLANG_WEG2_SEQ_LANES_PARALLEL=0 (the xsn87 serial form).
+                if phase == bx.PHASE_COLLECT:
+                    # the BAR1 lanes this tag does NOT use give up their turn now
+                    _used_keys = [(f"p{p}" if p is not None
+                                   else f"c{int(getattr(g[0], 'dst_rank', device))}")
+                                  for p, g in _lanes.items()]
+                    self._weg2_bar1_release(tag, used=_used_keys)
                 if bx.seq_lanes_parallel() and len(_lanes) > 1:
                     from concurrent.futures import ThreadPoolExecutor
                     _t0 = time.perf_counter()
@@ -7766,6 +7802,7 @@ class SchedulerWeightUpdaterManager:
                             # on ONE worker (sequential, so every lane's unit
                             # semaphores keep their order) while this thread
                             # waits for tag t+1's credit and resumes it.
+                            self._weg2_bar1_register(tag)
                             _wake_futs.append((str(tag), _wake_worker.submit(
                                 self._weg2_wake_collect_one, tag)))
                             # weg2xsn110: BOUNDED run-ahead. Unbounded, the
@@ -7778,6 +7815,7 @@ class SchedulerWeightUpdaterManager:
                             if len(_wake_futs) > _n_wake_workers:
                                 _wake_futs[-(_n_wake_workers + 1)][1].result()
                         else:
+                            self._weg2_bar1_register(tag)
                             self._weg2_wake_collect_one(tag)
                     elif (str(tag) == _WEIGHTS_DRAFT_TAG
                             and self._weg2_xchg_draft_reload_from_disk()):

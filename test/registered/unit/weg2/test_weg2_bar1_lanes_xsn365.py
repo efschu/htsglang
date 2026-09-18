@@ -264,6 +264,11 @@ def test_socket_credits_and_the_per_lane_turnstile(tmp_path):
         out[k] = b1.run_bar1_units(descs, ops, lanes=col, lane_key="p0", role="dst", seq=f"3-{tags[k]}",
                                    phase="collect", budget_s=5.0, log=lambda *_a: None,
                                    order_key=(3, k))
+    # the wake loop registers the tags in order; a fourth tag (index 3) does not
+    # use this lane and releases it at once -- it must not block anything
+    for k in range(4):
+        col.register_turns((3, k))
+    col.release_turns((3, 3), used=[])
     # the collects start OUT of order (2, 1, 0): the turnstile puts them in order
     ths = [threading.Thread(target=_collect, args=(k,)) for k in (2, 1, 0)]
     for th in ths:
@@ -278,7 +283,7 @@ def test_socket_credits_and_the_per_lane_turnstile(tmp_path):
     assert out == {0: "", 1: "", 2: ""}
     for k in range(3):
         assert bytes(dsts[k]) == bytes(srcs[k])
-    assert col.turn["p0"] == {"flip": 3, "next": 3}
+    assert col.turn["p0"] == set()
     # no file flags were used at all
     assert not os.path.exists(col.flags("p0", "dst")) or os.listdir(col.flags("p0", "dst")) == []
     a.close(); b.close()
