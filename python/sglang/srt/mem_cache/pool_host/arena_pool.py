@@ -32,6 +32,7 @@ from typing import Optional, Sequence
 import torch
 
 from sglang.jit_kernel.hicache import (
+    transfer_hicache_all_layer_mla as jit_transfer_hicache_all_layer_mla,
     transfer_hicache_all_layer as jit_transfer_hicache_all_layer,
 )
 
@@ -51,6 +52,7 @@ ARENA_PAGE_LOAD_BLOCK_ENV = "SGLANG_WEG2_ARENA_PAGE_LOAD_BLOCK"
 
 
 _PAGE_LOAD_N = 0
+_ARENA_WRITE_N = 0
 
 
 class _NoEvent:
@@ -705,6 +707,53 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
             return
         self.pin_slots(slots)
         dev = device_pool.k_buffer[0].device
+        from sglang.srt.weg2 import arena_write as _aw
+        global _ARENA_WRITE_N
+        _ARENA_WRITE_N += 1
+        _n_log = _ARENA_WRITE_N
+        b = int(slots.numel())
+        cell = int(self.element_dim) * int(self.dtype.itemsize)
+        _quota = _aw.write_block_quota()
+        mode = getattr(self, "_write_mode", None) or _aw.write_mode()
+        runs = _aw.contiguous_runs(self._k_offs, self._v_offs, cell) if mode == "run" else None
+        if runs is not None and dev.type == "cuda":
+            # xsn345 RUN MODE: gather this rank's layers into a run-shaped stage
+            # on the card, then two contiguous runs per page (K, V) go to the
+            # slot with the pointer/stride kernel -- L KiB per transfer instead
+            # of 1 KiB, and the loader's block quota instead of the default 2.
+            try:
+                k_off, v_off, run = runs
+                L = len(self._k_offs)
+                didx = device_indices.to(device=dev, dtype=torch.int64)
+                stage = torch.empty((b, 2 * run), dtype=torch.uint8, device=dev)
+                for l in range(L):
+                    kv = device_pool.k_buffer[l]
+                    vv = device_pool.v_buffer[l]
+                    stage[:, l * cell:(l + 1) * cell].copy_(
+                        kv.view(torch.uint8).reshape(kv.shape[0], -1)[didx])
+                    stage[:, run + l * cell:run + (l + 1) * cell].copy_(
+                        vv.view(torch.uint8).reshape(vv.shape[0], -1)[didx])
+                dst_ptrs, src_ptrs, src_stride = _aw.run_pointers(
+                    self._data_base, k_off, v_off, run, stage.data_ptr())
+                jit_transfer_hicache_all_layer_mla(
+                    ptr_dst=torch.tensor(dst_ptrs, dtype=torch.uint64, device=dev),
+                    indices_dst=slots.to(device=dev, dtype=torch.int64),
+                    ptr_src=torch.tensor(src_ptrs, dtype=torch.uint64, device=dev),
+                    indices_src=torch.arange(b, device=dev, dtype=torch.int64),
+                    cache_src_stride_bytes=src_stride,
+                    cache_dst_stride_bytes=self._page_bytes,
+                    element_size=run,
+                    block_quota=_quota,
+                )
+                self._write_stage_keep = stage   # alive until the write stream is done with it
+                if _n_log <= 8 or _n_log % 256 == 0:
+                    logger.info("WEG2-ARENA-WRITE n=%d pages=%d bytes=%d mode=run runs=2x%dB quota=%s",
+                                _n_log, b, b * 2 * run, run, _quota)
+                return
+            except Exception as exc:  # noqa: BLE001 -- one named fallback, then the cell kernel
+                logger.warning("WEG2-ARENA-WRITE run mode failed (%s: %s); cell mode from now on",
+                               type(exc).__name__, exc)
+                self._write_mode = mode = "cell"
         k_ptrs, v_ptrs = self._arena_ptrs(dev)
         jit_transfer_hicache_all_layer(
             k_ptr_dst=k_ptrs,
@@ -715,8 +764,12 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
             indices_src=device_indices.to(device=dev, dtype=torch.int64),
             kv_cache_dst_stride_bytes=self._page_bytes,
             kv_cache_src_stride_bytes=self.token_stride_size,
-            element_size=self.element_dim * self.dtype.itemsize,
+            element_size=cell,
+            block_quota=_quota,
         )
+        if _n_log <= 8 or _n_log % 256 == 0:
+            logger.info("WEG2-ARENA-WRITE n=%d pages=%d bytes=%d mode=cell cell=%dB quota=%s",
+                        _n_log, b, b * 2 * len(self._k_offs) * cell, cell, _quota)
 
     def backup_from_device_all_layer(self, device_pool, host_indices, device_indices, io_backend):
         if self.arena is None and host_indices.numel():

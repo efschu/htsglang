@@ -6602,8 +6602,16 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
 
         # Process completed acks
         while finish_count > 0:
-            _, finish_event, ack_list = cc.ack_write_queue.pop(0)
+            start_event, finish_event, ack_list = cc.ack_write_queue.pop(0)
             finish_event.synchronize()
+            try:  # xsn345: how long the card -> arena write of this op took (events, no extra sync)
+                _wn = getattr(UnifiedRadixCache, "_weg2_write_ack_n", 0) + 1
+                UnifiedRadixCache._weg2_write_ack_n = _wn
+                if _wn <= 16 or _wn % 256 == 0:
+                    logger.info("WEG2-WRITE-ACK n=%d nodes=%d ms=%.0f (start->finish event of the write op)",
+                                _wn, len(ack_list), float(start_event.elapsed_time(finish_event)))
+            except Exception:  # noqa: BLE001 -- an instrument, never the ack
+                pass
             for ack_id in ack_list:
                 self._finish_write_through_ack(ack_id)
             finish_count -= 1
