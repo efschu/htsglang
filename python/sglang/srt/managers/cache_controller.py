@@ -797,6 +797,26 @@ def _weg2_draft_pool_executor():
     return _WEG2_DRAFT_POOL
 
 
+
+def weg2_suffixed_stems(backend, keys):
+    """Posten 2 (18.09.): the store suffix of a key depends only on its CLASS
+    (the tail after the last '.', or '' for a bare KV page hash -- see
+    `_suffix_for_key`: draft identity form, shared-kv = no '.', shared-mamba =
+    endswith('.mamba')). ARENA-GET asked it 520k times per re-admission
+    (find_ms 2,0 s of which the C lookup is 0,4 s offline); one answer per
+    class instead."""
+    memo = {}
+    out = []
+    for k in keys:
+        dot = k.rfind(".")
+        cls = k[dot:] if dot >= 0 else ""
+        suf = memo.get(cls)
+        if suf is None:
+            suf = memo[cls] = backend._suffix_for_key(k)[0]
+        out.append(k + suf)
+    return out
+
+
 class HiCacheController:
     def __init__(
         self,
@@ -2932,7 +2952,7 @@ class HiCacheController:
             # An honest miss instead.
             return 0
         _t0 = time.perf_counter()
-        stems = [self.storage_backend._get_suffixed_key(k) for k in hash_values]
+        stems = weg2_suffixed_stems(self.storage_backend, hash_values)  # Posten 2: suffix memoised per key class
         found = pool.arena.find_slots(stems)
         _t1 = time.perf_counter()
         slots = []
@@ -3912,7 +3932,7 @@ class HiCacheController:
                 and dpool.ensure_bound(self.storage_backend, role="draft")):
             # #1424: the draft rows share the KV rows' ids; behind an arena id
             # the draft page is addressed in the DRAFT arena (miss = zero row).
-            stems = [self.storage_backend._get_suffixed_key(k) for k in draft_keys]
+            stems = weg2_suffixed_stems(self.storage_backend, draft_keys)  # Posten 2
             found = dpool.arena.find_slots(stems)
             rows = (_hi_pages.cpu() - int(dpool.staging_rows)).tolist()
             flags, slots, hits = [], [], 0
