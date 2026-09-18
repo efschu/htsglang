@@ -560,6 +560,12 @@ class SchedulerWeightUpdaterManager:
     _weg2_seam_finisher: Any = None
     #: xsn261: the boot-time lane-buffer registration thread (or None).
     _weg2_prewarm_thread: Any = None
+    #: weg2xsn269/270: the VramCredit of the leg this rank is SLEEPING
+    #: through (set in release_memory_occupation, read by
+    #: _weg2_stage_charge). A slots dataclass: an undeclared attribute
+    #: killed group P 60 s after launch (xsn270, AttributeError at the
+    #: first sleep leg) -- declare, never just assign.
+    _weg2_leg_credit: Any = None
     #: #1452b: snapshot counter -- slots=True, so it is a FIELD (boot weg2xsn208
     #: printed 'n/a (AttributeError ... _1452_snapshots)' on every rank).
     _1452_snapshots: int = 0

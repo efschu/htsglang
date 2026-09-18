@@ -171,3 +171,18 @@ def test_the_bounce_threads_the_charge_to_the_staging_allocator():
     k = usrc.index("last = bx.run_sequential_units(")
     assert "stage_charge=self._weg2_stage_charge()" in usrc[k:k + 1500]
     assert "self._weg2_leg_credit = credit" in usrc
+
+
+def test_xsn270_the_leg_credit_is_a_declared_field_of_the_slots_dataclass():
+    """xsn270: group P died at its first sleep leg -- AttributeError:
+    'SchedulerWeightUpdaterManager' object has no attribute '_weg2_leg_credit'
+    on the ASSIGNMENT: the manager is @dataclass(slots=True). The field must
+    be declared; this test writes it on a bare instance."""
+    import dataclasses
+    from sglang.srt.managers.scheduler_components import weight_updater as wu
+    M = wu.SchedulerWeightUpdaterManager
+    assert "_weg2_leg_credit" in {f.name for f in dataclasses.fields(M)}
+    m = M.__new__(M)
+    m._weg2_leg_credit = "credit"          # raises on an undeclared slot
+    assert m._weg2_leg_credit == "credit"
+    assert M._weg2_stage_charge(M.__new__(M)) is None   # unset: no charge, no raise
