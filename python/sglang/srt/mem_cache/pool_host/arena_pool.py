@@ -735,10 +735,11 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
                         vv.view(torch.uint8).reshape(vv.shape[0], -1)[didx])
                 dst_ptrs, src_ptrs, src_stride = _aw.run_pointers(
                     self._data_base, k_off, v_off, run, stage.data_ptr())
+                _nb = lambda t: t.pin_memory().to(dev, non_blocking=True)   # noqa: E731 -- no stream sync
                 jit_transfer_hicache_all_layer_mla(
-                    ptr_dst=torch.tensor(dst_ptrs, dtype=torch.uint64, device=dev),
-                    indices_dst=slots.to(device=dev, dtype=torch.int64),
-                    ptr_src=torch.tensor(src_ptrs, dtype=torch.uint64, device=dev),
+                    ptr_dst=_nb(torch.tensor(dst_ptrs, dtype=torch.uint64)),
+                    indices_dst=_nb(slots.to(dtype=torch.int64)),
+                    ptr_src=_nb(torch.tensor(src_ptrs, dtype=torch.uint64)),
                     indices_src=torch.arange(b, device=dev, dtype=torch.int64),
                     cache_src_stride_bytes=src_stride,
                     cache_dst_stride_bytes=self._page_bytes,
@@ -755,10 +756,12 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
                                type(exc).__name__, exc)
                 self._write_mode = mode = "cell"
         k_ptrs, v_ptrs = self._arena_ptrs(dev)
+        _slots_dev = (slots.to(dtype=torch.int64).pin_memory().to(dev, non_blocking=True)
+                      if dev.type == "cuda" else slots.to(device=dev, dtype=torch.int64))
         jit_transfer_hicache_all_layer(
             k_ptr_dst=k_ptrs,
             v_ptr_dst=v_ptrs,
-            indices_dst=slots.to(device=dev, dtype=torch.int64),
+            indices_dst=_slots_dev,
             k_ptr_src=device_pool.k_data_ptrs,
             v_ptr_src=device_pool.v_data_ptrs,
             indices_src=device_indices.to(device=dev, dtype=torch.int64),
@@ -803,7 +806,16 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
         todo = [(s, i) for s, i in pairs if s >= 0 and s in self._pending]
         if todo:
             slots = torch.tensor([s for s, _ in todo], dtype=torch.int64)
-            didx = device_indices.cpu()[torch.tensor([i for _, i in todo], dtype=torch.int64)]
+            sel = torch.tensor([i for _, i in todo], dtype=torch.int64)
+            if device_indices.device.type == "cuda":
+                # xsn349: `device_indices.cpu()` here synchronised the scheduler
+                # thread with the write stream (the previous chunk's copy still
+                # in flight): CHUNK-PUBLISH 109 ms per 4096-page node. Select on
+                # the device instead; the index crosses pinned + non-blocking.
+                didx = device_indices.index_select(
+                    0, sel.pin_memory().to(device_indices.device, non_blocking=True))
+            else:
+                didx = device_indices[sel]
             self._backup_arena(device_pool, slots, didx)
         rest = (~is_arena).nonzero(as_tuple=True)[0]
         if rest.numel():
