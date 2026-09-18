@@ -29,11 +29,17 @@ def early_send_on(env=None) -> bool:
 
 
 def wake_kv_plan(*, kv_in_tags: bool, weights_in_tags: bool, fundable: bool,
-                 deferred: bool, epoch: Optional[object], epoch_done: Optional[object]) -> str:
+                 deferred: bool, epoch: Optional[object], epoch_done: Optional[object],
+                 weights_done: bool = False) -> str:
     if not kv_in_tags and not deferred:
         return "none"
     if epoch is not None and epoch_done is not None and epoch == epoch_done:
         return "done"
+    if kv_in_tags and not weights_in_tags and weights_done:
+        # xsn319: the OLD order -- a kv-only call AFTER this epoch's weight legs
+        # is the whole block here and now (resume, graph, clear); "early" would
+        # defer the clear half to a weights call that already happened.
+        return "late"
     if kv_in_tags and fundable:
         return "early"
     if kv_in_tags and not weights_in_tags:

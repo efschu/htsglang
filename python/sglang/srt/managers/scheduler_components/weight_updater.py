@@ -573,6 +573,7 @@ class SchedulerWeightUpdaterManager:
     _weg2_kv_deferred: bool = False       # Wake-Parallel: kv resume deferred to the weights call
     _weg2_kv_epoch_done: object = None    # Wake-Parallel: flip epoch whose kv resume is done
     _weg2_graph_deferred: bool = False    # Wake-Parallel: cuda_graph resume deferred to the weights call
+    _weg2_weights_epoch_done: object = None  # Wake-Parallel: flip epoch whose weight legs are collected
     #: #1452b: snapshot counter -- slots=True, so it is a FIELD (boot weg2xsn208
     #: printed 'n/a (AttributeError ... _1452_snapshots)' on every rank).
     _1452_snapshots: int = 0
@@ -7227,7 +7228,11 @@ class SchedulerWeightUpdaterManager:
             fundable=(self._weg2_wake_kv_first_ok(tags) if _kv_in else False),
             deferred=bool(self._weg2_kv_deferred),
             epoch=_kv_epoch, epoch_done=self._weg2_kv_epoch_done,
+            weights_done=(self._weg2_weights_epoch_done is not None
+                          and self._weg2_weights_epoch_done == _kv_epoch),
         )
+        logger.info("WEG2-WAKE-KV-PLAN %s epoch=%s kv=%s weights=%s deferred=%s", _plan, _kv_epoch,
+                    _kv_in, any(is_weights_family_tag(t) for t in tags), bool(self._weg2_kv_deferred))
         _weg2_kv_resumed_early = False
         if _plan == "early":
             _weg2_kv_resume_part()   # loads may start; admission stays dormant until the legs
@@ -7764,6 +7769,8 @@ class SchedulerWeightUpdaterManager:
                 self._weg2_seam_digest_after(recv_req, weights_tags)
                 _weg2_ph("seam_after")
 
+        if any(is_weights_family_tag(t) for t in tags):
+            self._weg2_weights_epoch_done = _kv_epoch  # the legs of this epoch are collected
         if (GPU_MEMORY_TYPE_KV_CACHE in tags or self._weg2_kv_deferred) and not _weg2_kv_done:
             # the late site: legs first, then kv (old order), or the CLEAR half of
             # a kv resume that already happened early (this call or a deferred one)
