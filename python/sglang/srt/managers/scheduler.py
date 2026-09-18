@@ -3101,6 +3101,7 @@ class Scheduler(
                     self.idle_sleeper.reset()
                 batch_result = self.run_batch(batch)
                 self.result_queue.append((batch.copy(), batch_result))
+                self._weg2_post_wake_pass_log(batch)  # Wake-Parallel item 2
             else:
                 batch_result = None
 
@@ -18018,6 +18019,38 @@ class Scheduler(
             deferred,
         )
         self._abort_request_now(recv_req)
+
+    def _weg2_post_wake_pass_log(self, batch) -> None:
+        """Wake-Parallel item 2 (user 18.09.): the first 8 passes after DORMANT
+        cleared, phase by phase -- schedule (get_next_batch_to_run incl.
+        prepare_for_extend), run (run_batch launch), prefetch, process_input,
+        and the wall gap since the previous pass -- so the ~2 s between the
+        hold release and the first decode (xsn311 flip 8) get a name.
+        Armed by the wake (`_weg2_post_wake_pass_n = 0`), disarms itself."""
+        n = getattr(self, "_weg2_post_wake_pass_n", None)
+        if n is None:
+            return
+        if n >= 8:
+            self._weg2_post_wake_pass_n = None
+            return
+        self._weg2_post_wake_pass_n = n + 1
+        import time as _t
+        now = _t.perf_counter()
+        prev = getattr(self, "_weg2_post_wake_t", None)
+        self._weg2_post_wake_t = now
+        try:
+            mode = getattr(getattr(batch, "forward_mode", None), "name", "?")
+            bs = int(getattr(batch, "batch_size", lambda: 0)()) if callable(getattr(batch, "batch_size", None)) else len(getattr(batch, "reqs", ()) or ())
+        except Exception:  # noqa: BLE001
+            mode, bs = "?", -1
+        logger.info(
+            "WEG2-POST-WAKE-PASS n=%d mode=%s bs=%d gap_ms=%.0f schedule_ms=%.0f run_ms=%.0f "
+            "prefetch_ms=%.0f proc_input_ms=%.0f (gap = wall since the previous pass; schedule "
+            "holds prepare_for_extend; run is the launch, the forward itself overlaps)",
+            n, mode, bs, ((now - prev) * 1000.0) if prev is not None else -1.0,
+            _pt_read(self, "_1466_schedule_ms"), _pt_read(self, "_1466_run_ms"),
+            _pt_read(self, "_1474_prefetch_ms"), _pt_read(self, "_1475_process_input_ms"),
+        )
 
     def _weg2_intake_stall_observe(self, req, adder, note: str = "",
                                    immediate: bool = False) -> None:

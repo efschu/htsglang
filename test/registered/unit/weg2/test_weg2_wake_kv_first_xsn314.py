@@ -35,8 +35,8 @@ def test_early_only_when_free_minus_floor_covers_kv_plus_margin(monkeypatch):
 def test_the_kv_block_is_one_closure_called_early_or_late():
     src = open(wu.__file__).read()
     d = src.index("        def _weg2_kv_block():")
-    e = src.index("        if GPU_MEMORY_TYPE_KV_CACHE in tags and self._weg2_wake_kv_first_ok(tags):")
-    l = src.index("        if GPU_MEMORY_TYPE_KV_CACHE in tags and not _weg2_kv_done:")
+    e = src.index("        _plan = _wk_plan(")  # stage 2: the plan replaces the bare gate
+    l = src.index("        if (GPU_MEMORY_TYPE_KV_CACHE in tags or self._weg2_kv_deferred) and not _weg2_kv_done:")  # stage 2
     assert d < e < l
     body = src[d:e]
     assert "self.memory_saver_adapter.resume(GPU_MEMORY_TYPE_KV_CACHE)" in body

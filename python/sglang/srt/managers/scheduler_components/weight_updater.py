@@ -570,6 +570,8 @@ class SchedulerWeightUpdaterManager:
     #: weg2xsn271: WEG2-CREDIT-FLOOR logged once per rank.
     _weg2_floor_noted: bool = False
     _weg2_sleep_count: int = 0
+    _weg2_kv_deferred: bool = False       # Wake-Parallel: kv resume deferred to the weights call
+    _weg2_kv_epoch_done: object = None    # Wake-Parallel: flip epoch whose kv resume is done
     #: #1452b: snapshot counter -- slots=True, so it is a FIELD (boot weg2xsn208
     #: printed 'n/a (AttributeError ... _1452_snapshots)' on every rank).
     _1452_snapshots: int = 0
@@ -7179,6 +7181,8 @@ class SchedulerWeightUpdaterManager:
                 logger.info(
                     "WEG2-DORMANT cleared: kv_cache resumed, admission seams admit"
                 )
+                scheduler._weg2_post_wake_pass_n = 0  # arm the post-wake pass timer
+                scheduler._weg2_post_wake_t = None
                 # weg2xsn288: a new phase -- no intake-stall hold and no
                 # reported rid from the previous one survives the wake.
                 _iw = getattr(scheduler, "_weg2_intake_watch", None)
@@ -7202,9 +7206,28 @@ class SchedulerWeightUpdaterManager:
                     if queue is not None:
                         queue.resume_memory_occupation()
         _weg2_kv_done = False
-        if GPU_MEMORY_TYPE_KV_CACHE in tags and self._weg2_wake_kv_first_ok(tags):
+        from sglang.srt.weg2.wake_kv import wake_kv_plan as _wk_plan
+        _kv_epoch = getattr(recv_req, "epoch", None)
+        _kv_in = GPU_MEMORY_TYPE_KV_CACHE in tags
+        _plan = _wk_plan(
+            kv_in_tags=_kv_in,
+            weights_in_tags=any(is_weights_family_tag(t) for t in tags),
+            fundable=(self._weg2_wake_kv_first_ok(tags) if _kv_in else False),
+            deferred=bool(self._weg2_kv_deferred),
+            epoch=_kv_epoch, epoch_done=self._weg2_kv_epoch_done,
+        )
+        if _plan == "early":
             _weg2_kv_block()
+            self._weg2_kv_epoch_done = _kv_epoch
+            self._weg2_kv_deferred = False
             _weg2_kv_done = True
+        elif _plan == "defer":
+            self._weg2_kv_deferred = True
+            _weg2_kv_done = True
+            logger.info("WEG2-WAKE-KV-FIRST DEFERRED epoch=%s: kv_cache resumes inside the weights call after its legs", _kv_epoch)
+        elif _plan == "done":
+            _weg2_kv_done = True
+            logger.info("WEG2-WAKE-KV-FIRST already resumed in epoch=%s: nothing to do", _kv_epoch)
 
         for tag in tags:
             self.offload_tags.remove(tag)
@@ -7708,8 +7731,10 @@ class SchedulerWeightUpdaterManager:
                 self._weg2_seam_digest_after(recv_req, weights_tags)
                 _weg2_ph("seam_after")
 
-        if GPU_MEMORY_TYPE_KV_CACHE in tags and not _weg2_kv_done:
-            _weg2_kv_block()  # the late site (old order): legs first, then kv
+        if (GPU_MEMORY_TYPE_KV_CACHE in tags or self._weg2_kv_deferred) and not _weg2_kv_done:
+            _weg2_kv_block()  # the late site (old order, or the deferred early call): legs first, then kv
+            self._weg2_kv_epoch_done = _kv_epoch
+            self._weg2_kv_deferred = False
 
         report: Dict[str, Any] = {}
         # #1295 MUST_FIX 2: THE STORE VERDICT RIDES THE FENCE THAT IS ALREADY

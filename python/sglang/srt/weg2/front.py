@@ -4493,7 +4493,13 @@ class Front:
         self._sleep_leg_gate(S)
         self._flip_stage = "gathered-legs"
         self._flip_marks["gathered-legs"] = time.time()
-        (s_code, s_body, s_ms), (w_code, w_body, w_ms) = await asyncio.gather(
+        # Wake-Parallel (user 18.09.): the kv resume is sent WITH the legs
+        # (listed first, so it lands before the weights call); the waker resumes
+        # it early when its card can fund it, else defers it into the weights
+        # call after the legs -- either way the held requests' loads overlap
+        # the legs. The post-legs kv call below stays (idempotent per epoch).
+        from sglang.srt.weg2.wake_kv import early_send_on as _kv_early_on
+        _legs = [
             self.timed_rpc(S, "/release_memory_occupation",
                            {"tags": pause_order, "epoch": flip_epoch}, RPC_TIMEOUT_S),
             # weg2xsn84 (#1378): THE WAKE WALKS THE SAME ORDER AS THE SLEEP.
@@ -4511,7 +4517,17 @@ class Front:
             # the permutation check's reference above.
             self.timed_rpc(D, "/resume_memory_occupation",
                            {"tags": pause_order, "epoch": flip_epoch}, RPC_TIMEOUT_S),
-        )
+        ]
+        _kv_early = bool(_kv_early_on())
+        if _kv_early:
+            _legs.insert(0, self.timed_rpc(D, "/resume_memory_occupation",
+                                           {"tags": [KV_TAG], "epoch": flip_epoch}, RPC_TIMEOUT_S))
+        _res = await asyncio.gather(*_legs)
+        if _kv_early:
+            (k_code, k_body, k_ms), (s_code, s_body, s_ms), (w_code, w_body, w_ms) = _res
+            logger.info("WEG2-WAKE-KV-EARLY rpc http=%s ms=%.0f (%s)", k_code, k_ms, str(k_body)[:120])
+        else:
+            (s_code, s_body, s_ms), (w_code, w_body, w_ms) = _res
         legs_wall_ms = (time.perf_counter() - t_gather0) * 1000
         s_done, s_per_tag, s_crit = completed_tags(s_body)
         w_done, w_per_tag, w_crit = completed_tags(w_body)
