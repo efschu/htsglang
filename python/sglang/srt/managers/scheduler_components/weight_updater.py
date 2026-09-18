@@ -6127,6 +6127,34 @@ class SchedulerWeightUpdaterManager:
                     # spurious W69 on a healthy but merely slow peer.
                     _lane_key = (f"p{pair}" if pair is not None
                                  else f"c{int(getattr(group[0], 'dst_rank', device))}")
+                    # 18.09. (xsn369/370): the tag-order gate for HOST/IPC
+                    # lanes, BEFORE the slot counter below is read -- with two
+                    # collects in flight, tag t+1 read the same `_seq` as tag
+                    # t and their unit records collided on the lane (xsn370:
+                    # c0/weights_2 identity mismatch). Whether a lane is BAR1
+                    # is static per boot (window mapped at setup), so the
+                    # check needs no mode file here.
+                    if phase == bx.PHASE_COLLECT:
+                        _b1g = getattr(self, "_weg2_bar1", None)
+                        _b1g_role = (_b1g.role(_lane_key)
+                                     if (_b1g is not None and pair is not None) else None)
+                        _is_bar1_lane = bool(
+                            _b1g_role is not None
+                            and _b1g.window_for(_lane_key, _b1g_role) is not None)
+                        if not _is_bar1_lane:
+                            _ord = getattr(self, "_weg2_leg_tag_order", None) or []
+                            _evs = getattr(self, "_weg2_tag_done", None) or {}
+                            _ti = _ord.index(str(tag)) if str(tag) in _ord else -1
+                            if _ti > 0 and (_ti - 1) in _evs and not _evs[_ti - 1].is_set():
+                                _tg0 = time.perf_counter()
+                                if not _evs[_ti - 1].wait(600.0):
+                                    _lane_failures.append(
+                                        f"{_lane_key}/{tag}: tag-order gate: the previous tag "
+                                        f"{_ord[_ti - 1]} was not collected within 600 s")
+                                    return
+                                logger.info("WEG2-TAG-GATE lane=%s tag=%s waited_ms=%.0f for=%s",
+                                            _lane_key, tag, (time.perf_counter() - _tg0) * 1000,
+                                            _ord[_ti - 1])
                     _seq = int(_lane_seq.get(_lane_key, 0))
                     _slot = _seq % max(1, int(_depth))
                     # 2026-09-15 (Beschleunigung, depth 2): the drain wait
@@ -6277,22 +6305,6 @@ class SchedulerWeightUpdaterManager:
                                             "reason=%s", _lane_key, phase, int(_seq),
                                             (_b1.refusals.get(_lane_key, "peer decided host")
                                              if _b1_role == "src" else "depositor decided host"))
-                        if phase == bx.PHASE_COLLECT and _b1_mode != b1.MODE_BAR1:
-                            # the tag-order gate for host/IPC lanes (see the
-                            # wake loop): wait for the previous tag's collect
-                            _ord = getattr(self, "_weg2_leg_tag_order", None) or []
-                            _evs = getattr(self, "_weg2_tag_done", None) or {}
-                            _ti = _ord.index(str(tag)) if str(tag) in _ord else -1
-                            if _ti > 0 and (_ti - 1) in _evs and not _evs[_ti - 1].is_set():
-                                _tg0 = time.perf_counter()
-                                if not _evs[_ti - 1].wait(600.0):
-                                    _lane_failures.append(
-                                        f"{_lane_key}/{tag}: tag-order gate: the previous tag "
-                                        f"{_ord[_ti - 1]} was not collected within 600 s")
-                                    return
-                                logger.info("WEG2-TAG-GATE lane=%s tag=%s waited_ms=%.0f for=%s",
-                                            _lane_key, tag, (time.perf_counter() - _tg0) * 1000,
-                                            _ord[_ti - 1])
                         if _b1_mode == b1.MODE_BAR1:
                             last = b1.run_bar1_units(
                                 _lane_descs, ops, lanes=_b1, lane_key=_lane_key,
