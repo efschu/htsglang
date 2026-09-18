@@ -18,8 +18,14 @@ EARLY_ENV = "SGLANG_WEG2_WAKE_KV_EARLY"
 
 
 def early_send_on(env=None) -> bool:
+    """Default OFF (18.09.): three 33k boots (xsn315/317/318) lost a P rank
+    during the first flip with the early send -- the last two at the barlink
+    BAR1 status poll (#867 unsurvivable CUDA fault / 'unknown parameter type'
+    in poll_status_word) right after the early kv_cache resume, i.e. the
+    peer mapping does not survive a kv region remapped under it before the
+    legs. On until barlink re-arms after an early resume: =1."""
     env = os.environ if env is None else env
-    return str(env.get(EARLY_ENV, "1")).strip().lower() not in ("0", "false", "no", "off")
+    return str(env.get(EARLY_ENV, "0")).strip().lower() in ("1", "true", "yes", "on")
 
 
 def wake_kv_plan(*, kv_in_tags: bool, weights_in_tags: bool, fundable: bool,

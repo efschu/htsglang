@@ -17,7 +17,7 @@ def test_plan():
     assert P(kv_in_tags=True, weights_in_tags=True, fundable=False, deferred=False, epoch=7, epoch_done=None) == "late"
     assert P(kv_in_tags=True, weights_in_tags=False, fundable=True, deferred=False, epoch=7, epoch_done=7) == "done"
     assert P(kv_in_tags=False, weights_in_tags=True, fundable=False, deferred=False, epoch=7, epoch_done=None) == "none"
-    assert wk.early_send_on({}) and not wk.early_send_on({wk.EARLY_ENV: "0"})
+    assert not wk.early_send_on({}) and wk.early_send_on({wk.EARLY_ENV: "1"})  # default OFF since xsn318
 
 
 def test_front_sends_the_kv_resume_with_the_legs_first():
