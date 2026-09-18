@@ -11,6 +11,25 @@ from typing import TYPE_CHECKING, Any, Callable, List, Optional
 import torch
 
 from sglang.srt.managers.cache_controller import CacheOperation as BaseCacheOperation
+
+
+def _draft_device_rows(draft_pool, device_indices, direction: str):
+    """weg2xsn277/278 (18.09.): row-addressed draft transfers name TARGET
+    slots; a draft pool smaller than the target pool (the DFlash window pool
+    on group D: 4113 slots) carries ``weg2_slot_mapper`` and the base
+    controller translates through it (`_draft_device_indices`). This
+    controller passed the RAW target rows: the 4k smoke wrote rows up to
+    4314 into a 4114-row draft pool (silent), the first 98k load ran off
+    the allocation ('illegal memory access', xsn277); xsn278's
+    WEG2-ARENA-LOAD guard named it: dst=[1025,4314] of 4114. Same rule as
+    the base controller: a backup reads the draft slot behind each target
+    slot, a load allocates one; a mirror pool needs no translation."""
+    mapper = getattr(draft_pool, "weg2_slot_mapper", None)
+    if mapper is None:
+        return device_indices
+    if direction == "write":
+        return mapper.translate_read(device_indices)
+    return mapper.translate_write(device_indices)
 from sglang.srt.managers.cache_controller import consume_gate
 from sglang.srt.managers.cache_controller import (
     HiCacheAck,
@@ -585,7 +604,7 @@ class HybridCacheController(BaseHiCacheController):
                 self.mem_pool_host_draft.backup_from_device_all_layer(
                     self.mem_pool_device_draft,
                     host_indices,
-                    device_indices,
+                    _draft_device_rows(self.mem_pool_device_draft, device_indices, "write"),
                     self.io_backend,
                 )
             finish_event.record()
@@ -699,7 +718,7 @@ class HybridCacheController(BaseHiCacheController):
                     self.mem_pool_host_draft.load_to_device_per_layer(
                         self.mem_pool_device_draft,
                         host_indices,
-                        device_indices,
+                        _draft_device_rows(self.mem_pool_device_draft, device_indices, "load"),
                         i,
                         self.io_backend,
                     )
