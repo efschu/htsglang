@@ -413,6 +413,15 @@ COMPONENT_REGISTRY: dict[ComponentType, type[TreeComponent]] = {
 
 logger = logging.getLogger(__name__)
 
+
+def _weg2_release_drain_cap() -> int:
+    """Entries of the host-release queues drained per scheduling pass; 0 = all
+    (SGLANG_WEG2_RELEASE_DRAIN_CAP, default 64 -- xsn332)."""
+    try:
+        return max(0, int(os.environ.get("SGLANG_WEG2_RELEASE_DRAIN_CAP", "64")))
+    except ValueError:
+        return 64
+
 # #1233 zero-remainder: END-OF-PREFILL ANCHOR instrument, armed by the Weg-2
 # launcher on group P together with the schedule_policy split (same env).
 _WEG2_END_ANCHOR = os.environ.get("SGLANG_WEG2_END_ANCHOR", "0") == "1"
@@ -6034,8 +6043,15 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         )
         qsize_list = list(map(int, qsizes.tolist()))
         n_revoke, n_backup, n_release = qsize_list[:3]
+        # xsn332: the release drain after a wake carried the whole dormant
+        # phase's frees (~190 ms of the 535 ms wake pass, torch.cat/unique
+        # over every freed row). Cap the entries per pass -- a constant, so
+        # the rank-uniform MIN above stays uniform; the rest drains next pass.
+        _cap = _weg2_release_drain_cap()
+        if _cap > 0 and n_release > _cap:
+            n_release = _cap
         extra_release_counts = {
-            pool_name: qsize_list[_pool_slot(pool_name, 3)]
+            pool_name: (min(qsize_list[_pool_slot(pool_name, 3)], _cap) if _cap > 0 else qsize_list[_pool_slot(pool_name, 3)])
             for pool_name in extra_release_queues
         }
         self._drain_storage_control_queues_impl(

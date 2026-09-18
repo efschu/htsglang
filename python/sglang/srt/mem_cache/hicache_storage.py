@@ -2739,8 +2739,20 @@ class HiCacheFile(HiCacheStorage):
                 _hist[int(st)] = _hist.get(int(st), 0) + 1
             _brk = int(_states[n]) if n < len(_states) else -1
             _brk_stem = stems[n] if n < len(stems) else "-"
-            logger.info("#1439 ARENA-PRESENT n=%d keys=%d leading_complete=%d break_state=%d break_stem=%s census=%s first_stem=%s arena=%s",
-                        _pn, len(keys), n, _brk, _brk_stem[:64], sorted(_hist.items()), stems[0][:64], getattr(arena, "path", "?"))
+            # xsn334: the keys equal P's (first_mismatch=None) and pages 64.. are
+            # still 'state 0' while dormant -- is the INDEX entry gone (slot -1)
+            # or the slot FREE (slot >= 0)? Plus the arena's own counters.
+            try:
+                _fs2, _st2 = arena.find_slots_np(stems[n:n + 2]) if n < len(stems) else ([], [])
+                _brk_slots = [(int(a), int(b)) for a, b in zip(list(_fs2), list(_st2))]
+            except Exception as exc:  # noqa: BLE001
+                _brk_slots = f"n/a:{type(exc).__name__}"
+            try:
+                _ast = arena.stats()
+            except Exception as exc:  # noqa: BLE001
+                _ast = f"n/a:{type(exc).__name__}"
+            logger.info("#1439 ARENA-PRESENT n=%d keys=%d leading_complete=%d break_state=%d break_stem=%s break_slots=%s stats=%s census=%s first_stem=%s arena=%s",
+                        _pn, len(keys), n, _brk, _brk_stem[:64], _brk_slots, _ast, sorted(_hist.items()), stems[0][:64], getattr(arena, "path", "?"))
         return n
 
     def _readable_stems(self, stems: List[str]) -> List[str]:

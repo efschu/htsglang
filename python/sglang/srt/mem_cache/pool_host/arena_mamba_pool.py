@@ -32,6 +32,13 @@ from sglang.srt.mem_cache.pool_host.arena_pool import PLACEHOLDERS, ArenaMHAHost
 logger = logging.getLogger(__name__)
 
 
+_STATE_LOAD_N = 0
+
+
+def _arena_state_load_on() -> bool:
+    return str(os.environ.get("SGLANG_WEG2_ARENA_STATE_LOAD", "1")).strip().lower() not in ("0", "false", "no", "off")
+
+
 def _contig_strides(shape):
     strides = []
     acc = 1
@@ -145,6 +152,16 @@ class ArenaMambaPoolHost(MambaPoolHost):
         self._c_views = [c_views]
         self._own_extents = extents
         self._page_bytes = slot_bytes
+        # xsn332: the whole slot as ONE (A, slot_bytes) uint8 view -- the
+        # all-layers loader gathers slots into a pinned stage and splits the
+        # layers on the device (the KV page loader's shape, 5.9-12 GB/s).
+        _buf_all = torch.frombuffer(arena._mm, dtype=torch.uint8)
+        self._slot_view = _buf_all[data_off:data_off + A * slot_bytes].view(A, slot_bytes)
+        self._state_stage = None
+        self._state_loaded_key = None
+        self._layout = {"L": L, "t_shape": t_shape, "conv_shape": conv_shape, "width": width,
+                        "t_ext": [(int(t_ext[l][0]), int(t_ext[l][1])) for l in range(L)],
+                        "c_ext": [[(int(c_ext[3 * l + j][0]), int(c_ext[3 * l + j][1])) for j in range(3)] for l in range(L)]}
         self._pin = bool(pin and torch.cuda.is_available())
         buf = torch.frombuffer(arena._mm, dtype=torch.uint8)
         self._pin_base = int(buf.data_ptr()) + data_off
@@ -276,6 +293,45 @@ class ArenaMambaPoolHost(MambaPoolHost):
                 device_pool, host_indices[rest.to(host_indices.device)],
                 device_indices[rest.to(device_indices.device)], io_backend)
 
+    def _load_states_all_layers(self, device_pool, slots, didx) -> None:
+        """xsn332: one pinned gather of the requested slots (all layers, temporal
+        + conv), one H2D copy, then per layer an index_copy_ from the device
+        stage. Replaces L x (index_select on the mmap view + pageable .to(dev)
+        + a conv channel loop) -- ~190 ms of 535 in the loaded wake pass."""
+        n = int(slots.numel())
+        if n == 0:
+            return
+        lay = self._layout
+        sb = int(self._page_bytes)
+        dev = device_pool.mamba_cache.temporal[0].device
+        _pin = bool(dev.type == "cuda")
+        if self._state_stage is None or self._state_stage.shape[0] < n:
+            self._state_stage = torch.empty((n, sb), dtype=torch.uint8, pin_memory=_pin)
+        stage = self._state_stage[:n]
+        torch.index_select(self._slot_view, 0, slots.to("cpu", dtype=torch.int64), out=stage)
+        dev_stage = stage.to(dev, non_blocking=_pin)
+        didx = didx.to(dev)
+        e_t = int(self.temporal_dtype.itemsize)
+        e_c = int(self.conv_dtype.itemsize)
+        t_shape = tuple(lay["t_shape"]); conv_shape = tuple(lay["conv_shape"]); width = int(lay["width"])
+        for l in range(int(lay["L"])):
+            off, ln = lay["t_ext"][l]
+            src = dev_stage[:, off:off + ln].contiguous().view(self.temporal_dtype).view((n,) + t_shape)
+            device_pool.mamba_cache.temporal[l].index_copy_(0, didx, src)
+            dst_c = device_pool.mamba_cache.conv[0][l]
+            row = torch.empty((n,) + conv_shape, dtype=dst_c.dtype, device=dev)
+            ch0 = 0
+            for (off_j, ln_j) in lay["c_ext"][l]:
+                n_j = ln_j // (width * e_c)
+                row[:, ch0:ch0 + n_j] = dev_stage[:, off_j:off_j + ln_j].contiguous().view(self.conv_dtype).view(n, n_j, width)
+                ch0 += n_j
+            dst_c.index_copy_(0, didx, row)
+        global _STATE_LOAD_N
+        _STATE_LOAD_N += 1
+        if _STATE_LOAD_N <= 8 or _STATE_LOAD_N % 64 == 0:
+            logger.info("WEG2-ARENA-STATE-LOAD n=%d slots=%d bytes=%d (all layers, one pinned gather + one H2D, split on device)",
+                        _STATE_LOAD_N, n, n * sb)
+
     def load_to_device_per_layer(self, device_pool, host_indices, device_indices, layer_id, io_backend="direct"):
         if self.arena is None or host_indices.numel() == 0:
             return super().load_to_device_per_layer(device_pool, host_indices, device_indices, layer_id, io_backend)
@@ -284,6 +340,28 @@ class ArenaMambaPoolHost(MambaPoolHost):
             return super().load_to_device_per_layer(device_pool, host_indices, device_indices, layer_id, io_backend)
         sel = is_arena.nonzero(as_tuple=True)[0]
         slots = hi[sel] - self.staging_rows
+        if _arena_state_load_on() and getattr(self, "_slot_view", None) is not None:
+            key = (id(host_indices), id(device_indices), int(host_indices.numel()), int(device_indices.numel()))
+            if layer_id != 0 and self._state_loaded_key == key:
+                rest = (~is_arena).nonzero(as_tuple=True)[0]
+                if rest.numel():
+                    super().load_to_device_per_layer(
+                        device_pool, host_indices[rest.to(host_indices.device)],
+                        device_indices[rest.to(device_indices.device)], layer_id, io_backend)
+                return  # every layer came with the state load at layer 0
+            if layer_id == 0:
+                try:
+                    self._load_states_all_layers(device_pool, slots, device_indices.cpu()[sel])
+                    self._state_loaded_key = key
+                    rest = (~is_arena).nonzero(as_tuple=True)[0]
+                    if rest.numel():
+                        super().load_to_device_per_layer(
+                            device_pool, host_indices[rest.to(host_indices.device)],
+                            device_indices[rest.to(device_indices.device)], layer_id, io_backend)
+                    return
+                except Exception as exc:  # noqa: BLE001 -- one named fallback to the per-layer path
+                    logger.warning("WEG2-ARENA-STATE-LOAD failed (%s: %s); per-layer path", type(exc).__name__, exc)
+                    self._state_loaded_key = None
         dst_t = device_pool.mamba_cache.temporal[layer_id]
         dev = dst_t.device
         didx = device_indices.cpu()[sel].to(dev)
