@@ -477,6 +477,22 @@ int64_t arena_claim(uint8_t *base, int64_t n, const uint64_t *klo, const uint64_
 
 /* xsn350: the stems' 128-bit keys hashed HERE (py-spy PP0: key128 in Python
  * was ~30 ms per 4096-page node of the chunk publish, in the scheduler thread). */
+/* xsn357 (py-spy PP0, prefetch thread): the store hit query of a waiting
+ * prompt hashed thousands of stems in Python for arena_lookup; hash here. */
+int64_t arena_lookup_stems(uint8_t *base, int64_t n, const char **stems, int8_t *out) {
+    int64_t found = 0;
+    for (int64_t i = 0; i < n; i++) {
+        uint64_t lo, hi;
+        stem_key128(stems[i], &lo, &hi);
+        int64_t s = find_slot(base, lo, hi);
+        int8_t hit = 0;
+        if (s >= 0) hit = (atomic_load(&slot_hdr(base, (uint64_t)s)->state) == S_COMPLETE) ? 1 : 0;
+        out[i] = hit;
+        found += hit;
+    }
+    return found;
+}
+
 int64_t arena_claim_stems(uint8_t *base, int64_t n, const char **stems, const int64_t *totals,
                           int64_t *slots_out, int64_t *gen_out, int8_t *status) {
     uint64_t *klo = (uint64_t *)malloc(sizeof(uint64_t) * (size_t)(n > 0 ? n : 1));

@@ -178,3 +178,13 @@ def test_publish_direct_on_the_tensor_path(tmp_path, monkeypatch):
     assert n == 50 and calls == [50]
     assert p._pending_mask.sum().item() == 0
     assert all(st == 2 for _, st in a.find_slots([f"h{i}.draft" for i in range(50)]))
+
+
+def test_lookup_by_stems_matches_find_and_only_complete_counts(tmp_path):
+    a = _arena(tmp_path, 2048)
+    st = _stems("lk", 200)
+    got = _claim(a, st)
+    assert a.lookup(st) == [False] * 200          # claimed, not complete
+    _complete(a, got)
+    assert a.lookup(st) == [True] * 200
+    assert a.lookup(_stems("absent", 5)) == [False] * 5

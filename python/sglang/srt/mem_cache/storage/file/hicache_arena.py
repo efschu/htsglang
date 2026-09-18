@@ -99,6 +99,8 @@ def _load_lib() -> Optional[ctypes.CDLL]:
             lib.arena_claim.restype = i64
             lib.arena_claim.argtypes = [p_u8, i64, p_u64, p_u64, p_i64,
                                         ctypes.POINTER(ctypes.c_char_p), p_i64, p_i64, p_i8]
+            lib.arena_lookup_stems.restype = i64
+            lib.arena_lookup_stems.argtypes = [p_u8, i64, ctypes.POINTER(ctypes.c_char_p), p_i8]
             lib.arena_claim_stems.restype = i64
             lib.arena_claim_stems.argtypes = [p_u8, i64, ctypes.POINTER(ctypes.c_char_p), p_i64, p_i64, p_i64, p_i8]
             lib.arena_complete.restype = i64
@@ -189,9 +191,13 @@ class ShmArena:
         n = len(stems)
         if n == 0:
             return []
-        lo, hi = self._keys(stems)
         st = (ctypes.c_int8 * n)()
-        self._lib.arena_lookup(self._base, n, lo, hi, st)
+        try:  # xsn357: hashed in C (arena_lookup_stems); Python key128 was the prefetch thread's cost
+            c_stems = (ctypes.c_char_p * n)(*[s.encode("utf-8") for s in stems])
+            self._lib.arena_lookup_stems(self._base, n, c_stems, st)
+        except Exception:  # noqa: BLE001 -- the key path stays as the fallback
+            lo, hi = self._keys(stems)
+            self._lib.arena_lookup(self._base, n, lo, hi, st)
         return [bool(x) for x in st]
 
     def write(self, stems, totals, extents, payload_ptrs) -> list[int]:
