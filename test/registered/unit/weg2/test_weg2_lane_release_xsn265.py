@@ -77,11 +77,18 @@ def test_the_unmapping_release_keeps_the_file_size(tmp_path, monkeypatch):
     assert os.path.getsize(path) == 4096      # the collector truncates, not the depositor
 
 
-def test_release_is_on_by_default_and_an_env_zero_keeps_the_boot_long_form(monkeypatch):
+def test_xsn284_lanes_persist_by_default_and_an_env_one_restores_the_release(monkeypatch):
+    """xsn284: registered, persistent lanes at depth 1 ran the flips at
+    1.8-3.3 s per direction (5-12 s before); the per-leg release is the
+    opt-in A/B form now."""
     monkeypatch.delenv(bx.SEQ_RELEASE_LANES_ENV, raising=False)
-    assert bx.seq_release_lanes() is True
-    monkeypatch.setenv(bx.SEQ_RELEASE_LANES_ENV, "0")
     assert bx.seq_release_lanes() is False
+    monkeypatch.setenv(bx.SEQ_RELEASE_LANES_ENV, "1")
+    assert bx.seq_release_lanes() is True
+    monkeypatch.delenv(bx.SEQ_BUFFER_DEPTH_ENV, raising=False)
+    assert bx.seq_buffer_depth() == 1
+    monkeypatch.setenv(bx.SEQ_BUFFER_DEPTH_ENV, "4")
+    assert bx.seq_buffer_depth() == 4
 
 
 def test_both_leg_ends_call_the_release():
@@ -100,9 +107,13 @@ def test_both_leg_ends_call_the_release():
 def test_xsn268_host_lanes_are_not_registered_by_default(tmp_path, monkeypatch):
     """py-spy --native at the DRAIN-STALL of xsn268: PP0 and TP0 of one card
     both inside cudaHostUnregister (ioctl) for the whole ~12.5 s stall. The
-    lane buffers now run pageable by default: no register, no unregister,
-    the release is unmap + truncate only."""
+    pageable form (env 0): no register, no unregister, the release is unmap +
+    truncate only. xsn284: the DEFAULT is registered again (once per lane,
+    never unregistered), because the stall was the unregister, not the
+    register -- 5090 lanes 12-13 GB/s vs 1.6-3.9 pageable."""
     monkeypatch.delenv(bx.SEQ_HOST_REGISTER_ENV, raising=False)
+    assert bx.seq_host_register() is True
+    monkeypatch.setenv(bx.SEQ_HOST_REGISTER_ENV, "0")
     assert bx.seq_host_register() is False
     ops = _Ops()
     lines = []

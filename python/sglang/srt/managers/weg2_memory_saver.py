@@ -1288,21 +1288,43 @@ class VramCredit:
             # not that the peer funded them, so it takes only what the counter
             # actually has.  `epoch` keeps a stale or absent counter at zero, so
             # a single-group boot writes nothing and still costs nothing.
-            spent = self.claim(tag, need, epoch=epoch)
-            return {
-                "waited_s": 0.0,
-                "free_bytes": int(free_bytes_now),
-                "allocatable_est_bytes": max(0, int(free_bytes_now) - floor),
-                "corridor_floor_bytes": floor,
-                "credit_bytes": spent["credit_bytes"],
-                "consumed_bytes": spent["consumed_bytes"],
-                "available_bytes": spent["available_bytes"],
-                "claimed_bytes": spent["claimed_bytes"],
-                "reason": (
-                    "the card already holds the bytes above its corridor floor, "
-                    "so no peer release funds this tag and none is waited for"
-                ),
-            }
+            # weg2xsn284 (18.09.): FREE ALONE IS NO LICENCE ON A SHARED CARD.
+            # TP0 took this exit with free=4338, floor=767 (allocatable 3571
+            # for 2502) and a balance of 741 MiB; the co-located sleeper, whose
+            # refunded staging had just re-funded the balance, staged its next
+            # tag (1673 MiB) between this reading and TP0's cu_mem_create --
+            # OOM, exit(1). The bytes this exit reads as free are exactly what
+            # the peer's counter still licenses the peer to take. So the exit
+            # holds only when the counter COVERS the tag (a full claim), or
+            # when there is no counter at all (single-group boot: credit 0,
+            # nothing published, nothing to spend); a live counter that is
+            # short sends the tag into the loop, whose gate re-reads free
+            # against the balance the peer cannot exceed.
+            spent = self.claim(tag, need, epoch=epoch, require_full=True)
+            if int(spent["claimed_bytes"]) >= need or int(spent["credit_bytes"]) == 0:
+                return {
+                    "waited_s": 0.0,
+                    "free_bytes": int(free_bytes_now),
+                    "allocatable_est_bytes": max(0, int(free_bytes_now) - floor),
+                    "corridor_floor_bytes": floor,
+                    "credit_bytes": spent["credit_bytes"],
+                    "consumed_bytes": spent["consumed_bytes"],
+                    "available_bytes": spent["available_bytes"],
+                    "claimed_bytes": spent["claimed_bytes"],
+                    "reason": (
+                        "the card already holds the bytes above its corridor floor "
+                        + ("and the peer's counter covers the tag"
+                           if int(spent["claimed_bytes"]) >= need
+                           else "and no peer counter licenses them away")
+                    ),
+                }
+            logger.info(
+                "WEG2-CREDIT-WAIT tag=%s free=%d MiB allocatable=%d MiB >= need=%d MiB, "
+                "but the peer's counter is SHORT (balance %d MiB): the peer may still "
+                "stage into that free; waiting on the counter (xsn284)",
+                tag, int(free_bytes_now) // MIB, max(0, int(free_bytes_now) - floor) // MIB,
+                need // MIB, int(spent["available_before_bytes"]) // MIB,
+            )
         deadline = time.monotonic() + float(budget_s)
         t0 = time.perf_counter()
         stale_epoch = None

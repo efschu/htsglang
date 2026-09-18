@@ -2201,10 +2201,16 @@ def seq_buffer_depth() -> int:
     four of card 0's tags first; at depth 2 it could not get ahead of them).
     Cost: depth x lane bytes on tmpfs per lane (~25 GB at 4), and on-card
     staging that falls back to the host path when VRAM is short."""
+    # weg2xsn284 (18.09.): DEPTH 1 IS THE DEFAULT. With registered, persistent
+    # lanes (below) the flips ran 1.8-3.3 s per direction at depth 1 (vs
+    # 5-12 s pageable at depth 2-4), the 5090's lanes at 12-13 GB/s; depth 4
+    # parked ~23 GB of tmpfs beside the full 41 GiB arena and latched W98
+    # (xsn283: shmem 58.5 GiB). The run-ahead depth 2 bought is worth less
+    # than a lane at link rate.
     try:
-        d = int(os.environ.get(SEQ_BUFFER_DEPTH_ENV, "2") or 2)
+        d = int(os.environ.get(SEQ_BUFFER_DEPTH_ENV, "1") or 1)
     except ValueError:
-        d = 2
+        d = 1
     return 1 if d < 1 else (8 if d > 8 else d)
 
 
@@ -2405,11 +2411,19 @@ SEQ_HOST_REGISTER_ENV = "SGLANG_WEG2_SEQ_HOST_REGISTER"
 
 
 def seq_host_register() -> bool:
-    return _env_flag(SEQ_HOST_REGISTER_ENV, "0")
+    """weg2xsn284 (18.09.): REGISTERED BY DEFAULT again -- once per lane,
+    never unregistered (see seq_release_lanes): the 12.5-s stall of xsn265/
+    267 was the per-leg cudaHostUnregister, not the register. Measured with
+    register=1/release=0/depth=1: 5090 lanes 12-13 GB/s (pageable 1.6-3.9),
+    card 2 7-12 GB/s, the x4 slot 2.7-6 GB/s; flips 1.8-3.3 s per direction."""
+    return _env_flag(SEQ_HOST_REGISTER_ENV, "1")
 
 
 def seq_release_lanes() -> bool:
-    return _env_flag(SEQ_RELEASE_LANES_ENV, "1")
+    """weg2xsn284: lanes stay mapped, populated and registered across legs
+    (default OFF = no release). The residency this keeps is depth x lane
+    bytes (~6 GB at depth 1) and is what the host ledger prices."""
+    return _env_flag(SEQ_RELEASE_LANES_ENV, "0")
 
 
 def release_host_lane_buffers(*, truncate: bool, log=None) -> Tuple[int, int]:
