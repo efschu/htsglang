@@ -38,10 +38,9 @@ def test_pages_land_layer_split_on_the_device_in_blocks():
     for l in range(3):
         for i, sl in enumerate(slots.tolist()):
             ko, vo = s._k_offs_b[l], s._v_offs_b[l]
-            want_k = page[sl, ko:ko + cell].view(s.dtype).view(2, 4)
-            want_v = page[sl, vo:vo + cell].view(s.dtype).view(2, 4)
-            assert torch.equal(pool.k_buffer[l][dst[i]], want_k)
-            assert torch.equal(pool.v_buffer[l][dst[i]], want_v)
+            # compare BYTES: random bit patterns include NaNs, and NaN != NaN
+            assert torch.equal(pool.k_buffer[l][dst[i]].reshape(-1).view(torch.uint8), page[sl, ko:ko + cell])
+            assert torch.equal(pool.v_buffer[l][dst[i]].reshape(-1).view(torch.uint8), page[sl, vo:vo + cell])
     assert int(pool.k_buffer[0][0].abs().sum()) == 0  # untouched rows stay
 
 
