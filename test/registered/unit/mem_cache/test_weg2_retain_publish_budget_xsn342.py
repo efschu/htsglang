@@ -66,8 +66,8 @@ def test_chunk_site_publishes_after_the_cleanup():
     import inspect
     from sglang.srt.mem_cache import unified_radix_cache as u
     src = inspect.getsource(u.UnifiedRadixCache.cache_unfinished_req)
-    i = src.index("cleanup_after_caching_req")
-    assert "self._weg2_publish_at_chunk(req, radix_key)" in src[i:]
+    i = src.index("self._weg2_publish_at_chunk(req, None)")
+    assert i < src.index("prepare_for_caching_req("), "xsn358: the publish sits before the card wait"
     s2 = inspect.getsource(u.UnifiedRadixCache._weg2_publish_at_chunk)
     assert "chunk_budget_s()" in s2 and "first=first" in s2
 
