@@ -4955,7 +4955,7 @@ class Scheduler(
             logger.info("#1471 group verdict n/a (%s: %s) -- local flags used", type(exc).__name__, exc)
         return vals
 
-    def _weg2_refetch_one(self, req, now: float) -> str:
+    def _weg2_refetch_one(self, req, now: float, allow_reissue: bool = True) -> str:
         """#1456/#1471: one held request's read -- "reading" (still in
         flight), "complete" (whole prefix on the host), "wait" (short, but
         re-issued less than 2 s ago), "reissued" (short, re-read now)."""
@@ -5005,6 +5005,15 @@ class Scheduler(
         req._1471_short = True
         if now - float(getattr(req, "_1456_last", 0.0) or 0.0) < 2.0:
             return "wait"
+        if not allow_reissue:
+            # weg2xsn296 (Task #9, xsn287 class): the re-read is a TP
+            # collective (prefetch_from_storage -> _all_reduce_attn_groups)
+            # and this 2 s timer is rank-local -- TP0 re-issued alone while
+            # TP1/TP2 sat in the next pass's request broadcast: D stood for
+            # the rest of the boot (stacks stall_weg2xsn296_ep7_*). The
+            # caller now asks every rank "due?" first, takes the group MIN,
+            # and only then re-issues on every rank in the same pass.
+            return "due"
         req._1456_last = now
         req._1456_n = int(getattr(req, "_1456_n", 0) or 0) + 1
         clear = getattr(self, "_clear_prefetch_deferral_fields", None)
@@ -5079,10 +5088,25 @@ class Scheduler(
         _drain()  # #1479
         now = time.monotonic()
         _refetch = getattr(self, "_weg2_refetch_one", None) or functools.partial(Scheduler._weg2_refetch_one, self)
-        reissued = 0
+        # weg2xsn296: RANKS NEVER DISAGREE ABOUT A COLLECTIVE. Pass 1 asks
+        # each held request "due?" without side effects, the group MIN makes
+        # the verdict uniform, pass 2 re-issues exactly the agreed set.
+        due = []
         for req in hold:
             try:
-                if _refetch(req, now) == "reissued":
+                due.append(1 if _refetch(req, now, allow_reissue=False) == "due" else 0)
+            except Exception as exc:  # noqa: BLE001 -- the hold must never die on a top-up
+                logger.info("#1456 HOLD-REFETCH rid=%s n/a (%s: %s)", str(getattr(req, "rid", "?"))[:12],
+                            type(exc).__name__, exc)
+                due.append(0)
+        _gmin = getattr(self, "_weg2_group_min_flags", None) or functools.partial(Scheduler._weg2_group_min_flags, self)
+        agreed = _gmin(due)
+        reissued = 0
+        for req, ok in zip(hold, agreed):
+            if not ok:
+                continue
+            try:
+                if _refetch(req, now, allow_reissue=True) == "reissued":
                     reissued += 1
             except Exception as exc:  # noqa: BLE001 -- the hold must never die on a top-up
                 logger.info("#1456 HOLD-REFETCH rid=%s n/a (%s: %s)", str(getattr(req, "rid", "?"))[:12],
@@ -5118,9 +5142,22 @@ class Scheduler(
         _refetch = getattr(self, "_weg2_refetch_one", None) or functools.partial(Scheduler._weg2_refetch_one, self)
         keep, release = [], []
         _local = []
+        # weg2xsn296: the re-read is a collective -- verdict first (no side
+        # effects), group MIN on "due", then re-issue the agreed set on every
+        # rank in the same pass (see _weg2_hold_refetch).
+        _pre = []
         for req in settle:
             try:
-                state = _refetch(req, now)
+                _pre.append(1 if _refetch(req, now, allow_reissue=False) == "due" else 0)
+            except Exception:  # noqa: BLE001
+                _pre.append(0)
+        _gmin0 = getattr(self, "_weg2_group_min_flags", None) or functools.partial(Scheduler._weg2_group_min_flags, self)
+        _agreed_due = _gmin0(_pre)
+        for req, _ok in zip(settle, _agreed_due):
+            try:
+                state = _refetch(req, now, allow_reissue=bool(_ok))
+                if state == "due":
+                    state = "wait"
             except Exception as exc:  # noqa: BLE001
                 logger.info("#1471 SETTLE rid=%s n/a (%s: %s)", str(getattr(req, "rid", "?"))[:12],
                             type(exc).__name__, exc)
@@ -5167,9 +5204,14 @@ class Scheduler(
         _refetch = getattr(self, "_weg2_refetch_one", None) or functools.partial(Scheduler._weg2_refetch_one, self)
         released, parked = [], []
         _states = []
+        # weg2xsn296: the wake verdict must not re-issue a collective read
+        # from a rank-local timer; "due" parks the request (the settle tick
+        # re-issues it group-uniformly).
         for _r in list(hold):
             try:
-                _state = _refetch(_r, _now)
+                _state = _refetch(_r, _now, allow_reissue=False)
+                if _state == "due":
+                    _state = "wait"
             except Exception as exc:  # noqa: BLE001
                 logger.info("#1471 SETTLE rid=%s wake verdict n/a (%s: %s) -- queued as it is",
                             str(getattr(_r, "rid", "?"))[:12], type(exc).__name__, exc)

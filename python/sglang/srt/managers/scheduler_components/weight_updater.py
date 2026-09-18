@@ -1252,7 +1252,7 @@ class SchedulerWeightUpdaterManager:
             family |= {f"weights_{i}" for i in range(16)}
             tagged = 0
             for t in sorted(family):
-                a = int(self._weg2_xchg_tag_bytes(t) or 0)
+                a = int(self._weg2_tag_bytes(t) or 0)
                 b = int(self._weg2_tag_resident_bytes(t) or 0)
                 tagged += max(a, b)
             terms = sleep_residue_terms(
