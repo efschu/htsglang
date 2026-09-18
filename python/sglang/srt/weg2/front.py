@@ -5124,6 +5124,12 @@ class Front:
                                 p.fut.set_exception(e)
                             return p
                         p.leg1_done = True
+                        # xsn286: a request requeued by an intake stall is an
+                        # ordinary request again once its leg 1 succeeded --
+                        # the flag stayed set, _on_leg1_done skipped it, it
+                        # never reached D (weg2-6-4: prefilled 44 s on P in the
+                        # next phase, then nothing; D idle, IDLE-WEDGE).
+                        p.intake_stalled = False
                     return p
 
                 def _on_leg1_done(p: Pending) -> None:

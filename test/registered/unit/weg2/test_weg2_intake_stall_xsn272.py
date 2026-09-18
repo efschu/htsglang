@@ -202,3 +202,19 @@ def test_xsn276_the_tokenizer_abort_reaches_every_rank_on_a_weg2_group(monkeypat
     assert st.abort_must_reach_every_rank(rid_known=False, abort_all=True) is True
     monkeypatch.setenv("SGLANG_WEG2_GROUP", "P")
     assert st.abort_must_reach_every_rank(rid_known=False, abort_all=False) is True
+
+
+def test_xsn286_a_requeued_request_is_ordinary_again_after_its_next_leg1():
+    """xsn286: the requeued weg2-6-4 was prefilled on P in the next phase
+    (44 s) and then never handed to D -- `intake_stalled` stayed True and
+    _on_leg1_done skipped it; D idled into an IDLE-WEDGE. The flag is
+    cleared where leg 1 succeeds."""
+    from sglang.srt.weg2 import front as fr
+    src = open(fr.__file__).read()
+    i = src.index("async def one(p: Pending) -> Pending:")
+    blk = src[i:i + 1600]
+    j = blk.index("await self.leg1(p)")          # the real leg 1, not the skip_leg1 stub
+    k2 = blk.index("p.leg1_done = True", j)
+    assert "p.intake_stalled = False" in blk[k2:k2 + 700]
+    k = src.index("def _on_leg1_done(p: Pending)")
+    assert "if p.intake_stalled:" in src[k:k + 300]
