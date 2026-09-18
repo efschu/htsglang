@@ -53,3 +53,12 @@ def test_mamba_pieces_group_by_element_size_and_stride():
     assert list(g.keys()) == [(4096, 4096), (256, 768), (512, 768)]
     assert g[(4096, 4096)] == ([10, 11], [20, 21])
     assert g[(256, 768)] == ([12, 14], [22, 24])
+
+
+def test_mamba_pieces_split_into_cached_1k_elements():
+    assert aw.mamba_element_bytes({}) == 1024
+    kern, rest = aw.split_pieces([(3072, 100, 500, 4096), (1000, 200, 600, 4096)], 1024)
+    assert kern == [(1024, 100, 500, 4096), (1024, 1124, 1524, 4096), (1024, 2148, 2548, 4096)]
+    assert rest == [(1000, 200, 600, 4096)]
+    g = aw.group_pieces(kern)
+    assert list(g.keys()) == [(1024, 4096)] and g[(1024, 4096)][0] == [100, 1124, 2148]

@@ -331,6 +331,16 @@ class ArenaMambaPoolHost(MambaPoolHost):
                                    c_src.data_ptr() + ch0 * per_ch, c_src.stride(0) * e_c))
             slots_d = slots.to(dtype=torch.int64).pin_memory().to(dev, non_blocking=True)
             didx_d = didx_d.to(dtype=torch.int64)
+            # xsn353: fixed element size (1024 B, the KV cell -- its JIT module is
+            # cached); pieces that are not whole elements take the copy path.
+            kern, rest = _aw.split_pieces(pieces, _aw.mamba_element_bytes())
+            if rest:
+                if not getattr(self, "_mamba_rest_said", False):
+                    self._mamba_rest_said = True
+                    logger.info("WEG2-MAMBA-WRITE %d piece(s) are not whole %d-B elements (e.g. %d B): copy mode",
+                                len(rest), _aw.mamba_element_bytes(), int(rest[0][0]))
+                return False
+            pieces = kern
             for (es, ss), (dps, sps) in _aw.group_pieces(pieces).items():
                 transfer_hicache_all_layer_mla(
                     ptr_dst=torch.tensor(dps, dtype=torch.uint64).pin_memory().to(dev, non_blocking=True),

@@ -83,3 +83,38 @@ def group_pieces(pieces):
         d, s = out.setdefault(key, ([], []))
         d.append(int(dp)); s.append(int(sp))
     return out
+
+
+MAMBA_ELEMENT_ENV = "SGLANG_WEG2_MAMBA_WRITE_ELEMENT"   # bytes per kernel element, default 1024
+
+
+def mamba_element_bytes(env: Optional[Mapping[str, str]] = None) -> int:
+    """xsn353: a NEW element size means a NEW JIT module -- the first mamba
+    write of the boot compiled kernels for 1.5-MB temporal rows in the
+    scheduler thread of all three P ranks (ninja, minutes) and the PP ring
+    stood (FLIP STALL). 1024 B is the cell size the KV write always used, so
+    its module is in every rank's cache; a piece is split into bytes/1024
+    pseudo-layers instead."""
+    env = os.environ if env is None else env
+    try:
+        v = int(env.get(MAMBA_ELEMENT_ENV, "1024"))
+    except ValueError:
+        return 1024
+    return v if v > 0 else 1024
+
+
+def split_pieces(pieces, element: int):
+    """(bytes, dst_ptr, src_ptr, src_stride) -> kernel pieces of `element` bytes
+    (dst/src advanced by j*element) and the remainder pieces that are not a
+    whole number of elements (the caller copies those synchronously)."""
+    kern, rest = [], []
+    for nbytes, dp, sp, ss in pieces:
+        nbytes = int(nbytes)
+        if nbytes <= 0:
+            continue
+        if nbytes % element:
+            rest.append((nbytes, dp, sp, ss))
+            continue
+        for j in range(nbytes // element):
+            kern.append((element, int(dp) + j * element, int(sp) + j * element, int(ss)))
+    return kern, rest
