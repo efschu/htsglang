@@ -3122,6 +3122,32 @@ class SchedulerWeightUpdaterManager:
             return weights_only
         return {str(t): int(v) for t, v in census.items()}, WEG2_TAG_POPULATION_ALL
 
+    def _weg2_wake_kv_first_ok(self, tags) -> bool:
+        """Wake-Parallel (user 18.09.): may the kv_cache pool be resumed BEFORE
+        the weight legs? Only when the card can fund it right now: free -
+        floor >= kv bytes (+256 MiB margin). On the 3080s this holds (the
+        sleeper's KV pool went at sleep-kv); on the 5090 it holds only once
+        the sleeper's weights are far enough paused -- else the old order.
+        SGLANG_WEG2_WAKE_KV_FIRST=0 disables it."""
+        if str(os.environ.get("SGLANG_WEG2_WAKE_KV_FIRST", "1")).strip().lower() in ("0", "false", "no", "off"):
+            return False
+        try:
+            need = int(self._weg2_tag_bytes(GPU_MEMORY_TYPE_KV_CACHE) or 0)
+            free = self._weg2_free_bytes()
+            floor = int(self._weg2_corridor_floor_bytes() or 0)
+        except Exception as exc:  # noqa: BLE001 -- no probe, old order
+            logger.info("WEG2-WAKE-KV-FIRST skipped (%s: %s)", type(exc).__name__, exc)
+            return False
+        if free is None or need <= 0:
+            logger.info("WEG2-WAKE-KV-FIRST skipped free=%s need=%d", free, need)
+            return False
+        margin = 256 << 20
+        ok = int(free) - floor - margin >= need
+        logger.info("WEG2-WAKE-KV-FIRST %s free=%d MiB floor=%d MiB need=%d MiB (kv_cache resumed %s the weight legs)",
+                    "EARLY" if ok else "LATE", int(free) >> 20, floor >> 20, need >> 20,
+                    "before" if ok else "after")
+        return ok
+
     def _weg2_stage_charge(self):
         """weg2xsn269 (18.09.): the deposit lanes' on-card IPC staging is a
         cudaMalloc on the card the WAKING rank resumes into. Booked here
@@ -7094,6 +7120,92 @@ class SchedulerWeightUpdaterManager:
         # sleep added.  It runs BEFORE the remove loop for that reason.
         tags = self._weg2_with_graph_tag(tags, weg2_memory_saver_on)
 
+        def _weg2_kv_block():
+            # Wake-Parallel (user 18.09.): the kv_cache resume, pool restore, DORMANT
+            # clear and hold release -- one block, called EARLY (before the weight
+            # legs, so the held requests' arena loads overlap the legs) when the
+            # card can fund the pool now, else LATE (the old order).
+            self.memory_saver_adapter.resume(GPU_MEMORY_TYPE_KV_CACHE)
+            _weg2_ph("kv_resume")
+            scheduler = self.scheduler
+            if scheduler is not None and weg2_memory_saver_on:
+                # WAKE INVARIANT (boot weg2ls2b1 killer, 2026-09-07): the
+                # resume maps FRESH physical pages under the kv_cache region
+                # -- on the two-group form they are the pages the OTHER group
+                # released one RPC earlier -- and this tag has no cpu backup,
+                # so every table that was created WITH A VALUE inside the
+                # region is garbage now: req_to_token (torch.zeros,
+                # memory_pool.py ReqToTokenPool.__init__), the hybrid
+                # req->mamba index maps, MambaPool's conv/temporal states and
+                # cursors.  The fork states the invariant itself ("freshly
+                # booted pools are torch.zeros", zero_kv_data_buffers) and
+                # relies on it: a reader of an unwritten index position read a
+                # benign 0 on every boot before this one and read a page
+                # index from another group's KV after the first wake -> PP1
+                # 'CUDA error: an illegal memory access' in the first GDN
+                # extend after the wake (qwen3_5.py linear_attn), group P
+                # dead.  flush_cache() is the fork's own restore of that
+                # state (ReqToTokenPool.clear -> req_to_token.zero_(),
+                # HybridReqToTokenPool.clear -> mamba maps + reset_state,
+                # allocator + tree reset, KV bytes under SGLANG_FLUSH_ZERO_KV),
+                # and upstream already runs it in this handler; here it runs
+                # AFTER the resume, the mirror image of the MUST_FIX flush
+                # BEFORE the pause.  The group is drained (idle assert on the
+                # sleep) so the flush cannot refuse.
+                t_f0 = time.perf_counter()
+                # #1455: the tree keeps what the dormant hold prefetched during
+                # the flip; only the POOL state that the remap left undefined is
+                # restored (req_to_token, mamba maps, allocator, KV zero).
+                # SGLANG_WEG2_WAKE_FLUSH=1 restores the full flush (tree reset).
+                if os.environ.get("SGLANG_WEG2_WAKE_FLUSH", "0") == "1":
+                    flushed = self.flush_cache()
+                else:
+                    flushed = self._weg2_wake_restore_pools()
+                _weg2_ph("flush")
+                logger.info(
+                    "WEG2-WAKE-INVARIANT kv_cache pools re-zeroed after resume: flush_cache=%s in %.0f ms "
+                    "(fresh-boot zero invariant restored on recycled pages)",
+                    flushed,
+                    (time.perf_counter() - t_f0) * 1000,
+                )
+                if not flushed:
+                    raise RuntimeError(
+                        "W26 Weg2WakeInvariantRefused: flush_cache() refused after resume(kv_cache) "
+                        "(the group is not idle?) -- the pools hold recycled pages, serving on them is unsafe"
+                    )
+            if scheduler is not None:
+                # W25: the pools are mapped again; the admission seams admit.
+                scheduler.weg2_dormant = False
+                logger.info(
+                    "WEG2-DORMANT cleared: kv_cache resumed, admission seams admit"
+                )
+                # weg2xsn288: a new phase -- no intake-stall hold and no
+                # reported rid from the previous one survives the wake.
+                _iw = getattr(scheduler, "_weg2_intake_watch", None)
+                if _iw is not None:
+                    _iw.reset()
+                self._weg2_rescan_store_index()
+                _rel = getattr(scheduler, "_weg2_release_dormant_hold", None)  # #1443
+                if callable(_rel):
+                    _rel()
+                _weg2_ph("store_rescan")
+                if scheduler.disaggregation_mode == DisaggregationMode.DECODE:
+                    for queue_name in (
+                        "disagg_decode_transfer_queue",
+                        "disagg_decode_prealloc_queue",
+                    ):
+                        queue = getattr(scheduler, queue_name, None)
+                        if queue is not None:
+                            queue.resume_memory_occupation()
+                elif scheduler.disaggregation_mode == DisaggregationMode.PREFILL:
+                    queue = getattr(scheduler, "disagg_prefill_bootstrap_queue", None)
+                    if queue is not None:
+                        queue.resume_memory_occupation()
+        _weg2_kv_done = False
+        if GPU_MEMORY_TYPE_KV_CACHE in tags and self._weg2_wake_kv_first_ok(tags):
+            _weg2_kv_block()
+            _weg2_kv_done = True
+
         for tag in tags:
             self.offload_tags.remove(tag)
 
@@ -7596,83 +7708,8 @@ class SchedulerWeightUpdaterManager:
                 self._weg2_seam_digest_after(recv_req, weights_tags)
                 _weg2_ph("seam_after")
 
-        if GPU_MEMORY_TYPE_KV_CACHE in tags:
-            self.memory_saver_adapter.resume(GPU_MEMORY_TYPE_KV_CACHE)
-            _weg2_ph("kv_resume")
-            scheduler = self.scheduler
-            if scheduler is not None and weg2_memory_saver_on:
-                # WAKE INVARIANT (boot weg2ls2b1 killer, 2026-09-07): the
-                # resume maps FRESH physical pages under the kv_cache region
-                # -- on the two-group form they are the pages the OTHER group
-                # released one RPC earlier -- and this tag has no cpu backup,
-                # so every table that was created WITH A VALUE inside the
-                # region is garbage now: req_to_token (torch.zeros,
-                # memory_pool.py ReqToTokenPool.__init__), the hybrid
-                # req->mamba index maps, MambaPool's conv/temporal states and
-                # cursors.  The fork states the invariant itself ("freshly
-                # booted pools are torch.zeros", zero_kv_data_buffers) and
-                # relies on it: a reader of an unwritten index position read a
-                # benign 0 on every boot before this one and read a page
-                # index from another group's KV after the first wake -> PP1
-                # 'CUDA error: an illegal memory access' in the first GDN
-                # extend after the wake (qwen3_5.py linear_attn), group P
-                # dead.  flush_cache() is the fork's own restore of that
-                # state (ReqToTokenPool.clear -> req_to_token.zero_(),
-                # HybridReqToTokenPool.clear -> mamba maps + reset_state,
-                # allocator + tree reset, KV bytes under SGLANG_FLUSH_ZERO_KV),
-                # and upstream already runs it in this handler; here it runs
-                # AFTER the resume, the mirror image of the MUST_FIX flush
-                # BEFORE the pause.  The group is drained (idle assert on the
-                # sleep) so the flush cannot refuse.
-                t_f0 = time.perf_counter()
-                # #1455: the tree keeps what the dormant hold prefetched during
-                # the flip; only the POOL state that the remap left undefined is
-                # restored (req_to_token, mamba maps, allocator, KV zero).
-                # SGLANG_WEG2_WAKE_FLUSH=1 restores the full flush (tree reset).
-                if os.environ.get("SGLANG_WEG2_WAKE_FLUSH", "0") == "1":
-                    flushed = self.flush_cache()
-                else:
-                    flushed = self._weg2_wake_restore_pools()
-                _weg2_ph("flush")
-                logger.info(
-                    "WEG2-WAKE-INVARIANT kv_cache pools re-zeroed after resume: flush_cache=%s in %.0f ms "
-                    "(fresh-boot zero invariant restored on recycled pages)",
-                    flushed,
-                    (time.perf_counter() - t_f0) * 1000,
-                )
-                if not flushed:
-                    raise RuntimeError(
-                        "W26 Weg2WakeInvariantRefused: flush_cache() refused after resume(kv_cache) "
-                        "(the group is not idle?) -- the pools hold recycled pages, serving on them is unsafe"
-                    )
-            if scheduler is not None:
-                # W25: the pools are mapped again; the admission seams admit.
-                scheduler.weg2_dormant = False
-                logger.info(
-                    "WEG2-DORMANT cleared: kv_cache resumed, admission seams admit"
-                )
-                # weg2xsn288: a new phase -- no intake-stall hold and no
-                # reported rid from the previous one survives the wake.
-                _iw = getattr(scheduler, "_weg2_intake_watch", None)
-                if _iw is not None:
-                    _iw.reset()
-                self._weg2_rescan_store_index()
-                _rel = getattr(scheduler, "_weg2_release_dormant_hold", None)  # #1443
-                if callable(_rel):
-                    _rel()
-                _weg2_ph("store_rescan")
-                if scheduler.disaggregation_mode == DisaggregationMode.DECODE:
-                    for queue_name in (
-                        "disagg_decode_transfer_queue",
-                        "disagg_decode_prealloc_queue",
-                    ):
-                        queue = getattr(scheduler, queue_name, None)
-                        if queue is not None:
-                            queue.resume_memory_occupation()
-                elif scheduler.disaggregation_mode == DisaggregationMode.PREFILL:
-                    queue = getattr(scheduler, "disagg_prefill_bootstrap_queue", None)
-                    if queue is not None:
-                        queue.resume_memory_occupation()
+        if GPU_MEMORY_TYPE_KV_CACHE in tags and not _weg2_kv_done:
+            _weg2_kv_block()  # the late site (old order): legs first, then kv
 
         report: Dict[str, Any] = {}
         # #1295 MUST_FIX 2: THE STORE VERDICT RIDES THE FENCE THAT IS ALREADY
