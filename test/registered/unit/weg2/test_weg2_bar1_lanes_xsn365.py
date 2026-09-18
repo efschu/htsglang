@@ -19,11 +19,27 @@ PAIRS = ((0, 1), (0, 2), (1, 0), (1, 2), (2, 0), (2, 1))
 
 def test_knobs_and_sizing():
     assert b1.lanes_on({}) and not b1.lanes_on({b1.ENV_ON: "0"})
-    assert b1.ring_slots({}) == 2 and b1.ring_slots({b1.ENV_RING: "99"}) == 8
-    assert b1.ring_slots({b1.ENV_RING: "x"}) == 2
-    assert b1.slot_bytes_for(256 << 20, {}) == 8 << 20          # a 3080's BAR1
-    assert b1.slot_bytes_for(32 << 30, {}) == 64 << 20          # the 5090's
+    assert b1.ring_slots({}) == 4 and b1.ring_slots({b1.ENV_RING: "99"}) == 16
+    assert b1.ring_slots({b1.ENV_RING: "x"}) == 4 and b1.ring_slots({b1.ENV_RING: "1"}) == 3
+    assert b1.slot_bytes_for(256 << 20, {}) == 4 << 20          # a 3080's BAR1: 4 x 4 = the one 16-MiB hold
+    assert b1.slot_bytes_for(32 << 30, {}) == 32 << 20          # the 5090's
     assert b1.slot_bytes_for(256 << 20, {b1.ENV_SMALL_SLOT_MIB: "16"}) == 16 << 20
+
+
+def test_small_bar_lanes_borrow_the_group_windows():
+    big = [0]
+    d_win = {"world:0": 16 << 20, "tp:0": 32 << 20, "dcp:0": 40 << 20}
+    assert b1.borrow_plan("D", "p0", PAIRS, big, d_win) == ("tp:0", 0, 32 << 20, 8 << 20)
+    assert b1.borrow_plan("D", "p5", PAIRS, big, d_win) == ("dcp:0", 0, 40 << 20, 10 << 20)
+    assert b1.borrow_plan("D", "p5", PAIRS, big, {"tp:0": 32 << 20}) == ("tp:0", 0, 32 << 20, 8 << 20)
+    assert "no tp/dcp" in b1.borrow_plan("D", "p0", PAIRS, big, {"world:0": 16 << 20})
+    p_win = {"world:0": 24 << 20, "pp:0": 96 << 20}
+    # PP1 (card 1) receives p0 (from the 5090) and p5 (from card 2): the two halves of pp
+    assert b1.borrow_plan("P", "p0", PAIRS, big, p_win) == ("pp:0", 0, 48 << 20, 12 << 20)
+    assert b1.borrow_plan("P", "p5", PAIRS, big, p_win) == ("pp:0", 48 << 20, 48 << 20, 12 << 20)
+    assert "no pp" in b1.borrow_plan("P", "p0", PAIRS, big, {"world:0": 24 << 20})
+    assert "too small" in b1.borrow_plan("D", "p0", PAIRS, big, {"tp:0": 4 << 20})
+    assert "not a cross lane" in b1.borrow_plan("D", "c1", PAIRS, big, d_win)
 
 
 def test_roles_follow_the_directed_pair_and_only_cross_lanes():
@@ -98,8 +114,9 @@ def _addr(buf):
     return ctypes.addressof(ctypes.c_char.from_buffer(buf))
 
 
-def test_ring_transport_moves_every_byte_flat_and_strided(tmp_path):
-    slot, ring = 4096, 2
+@pytest.mark.parametrize("ring", [2, 3, 4, 8])
+def test_ring_transport_moves_every_byte_flat_and_strided(tmp_path, ring):
+    slot = 4096
     window = bytearray(slot * ring)
     dep = _lanes(tmp_path, "P", 0)
     col = _lanes(tmp_path, "D", 1)

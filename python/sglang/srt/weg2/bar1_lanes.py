@@ -55,6 +55,7 @@ ENV_RING = "SGLANG_WEG2_BAR1_RING_SLOTS"
 ENV_SMALL_SLOT_MIB = "SGLANG_WEG2_BAR1_SMALL_SLOT_MIB"
 ENV_BIG_SLOT_MIB = "SGLANG_WEG2_BAR1_BIG_SLOT_MIB"
 ENV_CONNECT_S = "SGLANG_WEG2_BAR1_CONNECT_S"
+ENV_SMALL_BAR_GROUPS = "SGLANG_WEG2_BAR1_SMALL_BAR_GROUPS"
 BIG_BAR_MIN = 4 << 30      # a BAR1 at least this large holds the big slot ring
 MODE_BAR1 = "bar1"
 MODE_HOST = "host"
@@ -70,22 +71,24 @@ def lanes_on(env: Optional[_Map[str, str]] = None) -> bool:
 def ring_slots(env: Optional[_Map[str, str]] = None) -> int:
     env = os.environ if env is None else env
     try:
-        r = int(env.get(ENV_RING, "2"))
+        r = int(env.get(ENV_RING, "4"))
     except ValueError:
-        r = 2
-    return max(2, min(8, r))
+        r = 4
+    return max(3, min(16, r))       # 3 = the smallest ring the one-behind sync can pipeline
 
 
 def slot_bytes_for(bar1_size: int, env: Optional[_Map[str, str]] = None) -> int:
-    """The ring slot of a RECEIVER card: 64 MiB on a big BAR, 8 MiB on the
-    256-MiB BAR of a 3080 (two lanes x two slots x two processes = 64 MiB of
-    the ~88 MiB the group windows leave)."""
+    """The ring slot of a RECEIVER card: 32 MiB on a big BAR, 4 MiB on the
+    256-MiB BAR of a 3080 -- measured xsn365: the group windows (P 24+96,
+    D 16+32 MiB) leave room for exactly ONE 16-MiB hold per 3080, every
+    further DMABUF_HOLDER_IOC_HOLD is ENOMEM. Ring 4 x 4 MiB = that one
+    window, see :func:`small_bar_serves` for who gets it."""
     env = os.environ if env is None else env
     try:
-        small = int(env.get(ENV_SMALL_SLOT_MIB, "8"))
-        big = int(env.get(ENV_BIG_SLOT_MIB, "64"))
+        small = int(env.get(ENV_SMALL_SLOT_MIB, "4"))
+        big = int(env.get(ENV_BIG_SLOT_MIB, "32"))
     except ValueError:
-        small, big = 8, 64
+        small, big = 4, 32
     return (max(1, big) if int(bar1_size) >= BIG_BAR_MIN else max(1, small)) << 20
 
 
@@ -107,6 +110,54 @@ def lane_role(lane_key: str, rank: int, cross_pairs) -> Optional[str]:
     if int(rank) == int(d):
         return "dst"
     return None
+
+
+def borrow_plan(group: str, lane_key: str, cross_pairs, big_cards, windows,
+                ring: int = 4):
+    """On a SMALL-BAR receiver card the lane BORROWS the payload region of one
+    of this process's own barlink group windows instead of allocating a new
+    one (user 18.09.: "warum koennen wir das bar1 fenster in dieser phase
+    nicht von den Gruppenfenstern befreien -- waehrend des flips passiert ja
+    kein traffic von P oder D"). Measured: a 3080 lends 240 of its 256 MiB to
+    holds and the group windows already take 208 of them; a second hold of
+    the same dma-buf by another card costs nothing (bar1_hold_budget.py).
+    The receiver's group is asleep or still waking while its lanes are
+    collected, and a lane's writes into its window end before the collect
+    returns, so no collective ever sees them.
+
+    ``windows`` = {group name: payload bytes} of the live transports of this
+    process. Returns (window name, offset, size, slot_bytes) or a reason.
+    D: the lane from the big-BAR card gets ``tp`` (32 MiB), the other one
+    ``dcp`` (40 MiB). P: the two lanes share ``pp`` (96 MiB) half and half."""
+    if not lane_is_cross(lane_key):
+        return "small BAR1: not a cross lane"
+    try:
+        k = int(str(lane_key)[1:])
+        src, _dst = cross_pairs[k]
+    except (ValueError, IndexError, TypeError):
+        return "small BAR1: not a cross lane"
+    from_big = int(src) in {int(c) for c in big_cards}
+    names = {str(n).split(":")[0]: (str(n), int(b)) for n, b in dict(windows).items()}
+    g = str(group).upper()
+    if g == "D":
+        order = ["tp", "dcp"] if from_big else ["dcp", "tp"]
+        for want in order:
+            if want in names:
+                name, size = names[want]
+                return _slotted(name, 0, size, ring)
+        return f"small BAR1: no tp/dcp group window to borrow (have {sorted(names)})"
+    if "pp" in names:
+        name, size = names["pp"]
+        half = (size // 2) & ~((1 << 20) - 1)
+        return _slotted(name, 0 if from_big else half, half, ring)
+    return f"small BAR1: no pp group window to borrow (have {sorted(names)})"
+
+
+def _slotted(name: str, offset: int, size: int, ring: int):
+    slot = (int(size) // max(1, int(ring))) & ~((1 << 20) - 1)
+    if slot < (2 << 20):
+        return f"small BAR1: window {name} too small for a ring of {ring} ({size >> 20} MiB)"
+    return (name, int(offset), slot * int(ring), slot)
 
 
 def other_group(group: str) -> str:
@@ -187,6 +238,7 @@ class RecvWindow:
     ordinal: int
     listener: object = None
     thread: object = None
+    borrowed: str = ""     # the group window whose payload region this ring borrows
 
 
 @dataclass
@@ -223,6 +275,7 @@ class Bar1Lanes:
         self._cuda = None
         self._holder = None
         self._bdf = None
+        self._group_own: dict = {}
 
     # -- helpers ---------------------------------------------------------
     def _ordinal(self) -> int:
@@ -240,6 +293,39 @@ class Bar1Lanes:
             from sglang.srt.distributed.device_communicators.barlink_matrix import bdf_of_card
             self._bdf = str(bdf_of_card(self.device))
         return self._bdf
+
+    def group_windows(self) -> dict:
+        """{group name: payload bytes} of this process's live barlink
+        transports (abort_gate registry); remembers (dptr, handle, size)."""
+        out = {}
+        try:
+            from sglang.srt.distributed.device_communicators import barlink_abort_gate as gate
+            for t in gate.registered():
+                own = getattr(t, "_own", None)
+                name = str(getattr(t, "group", "") or "")
+                if not own or not own[0] or not name:
+                    continue
+                geo = getattr(t, "_geo", None) or {}
+                size = int(geo.get("region_bytes", own[2]) or own[2])
+                out[name] = size
+                self._group_own[name] = (int(own[0]), int(own[1]), int(own[2]))
+        except Exception as exc:  # noqa: BLE001 -- no registry = nothing to borrow
+            self.log(f"WEG2-BAR1 group_windows: registry unreadable: {exc!r}")
+        return out
+
+    def big_cards(self) -> list:
+        """Card indices whose BAR1 is big (the 5090): rank n of either group
+        runs on cards[n], so the ordinal IS the card index."""
+        from sglang.srt.distributed.device_communicators.barlink_bar1 import bar1_window
+        from sglang.srt.distributed.device_communicators.barlink_matrix import bdf_of_card
+        out = []
+        for c in sorted({int(x) for pair in self.cross_pairs for x in pair}):
+            try:
+                if int(bar1_window(str(bdf_of_card(c))).size) >= BIG_BAR_MIN:
+                    out.append(c)
+            except Exception as exc:  # noqa: BLE001 -- an unreadable card is not big
+                self.log(f"WEG2-BAR1 big_cards: card {c} unreadable: {exc!r}")
+        return out
 
     def role(self, lane_key: str) -> Optional[str]:
         return lane_role(lane_key, self.rank, self.cross_pairs)
@@ -281,6 +367,17 @@ class Bar1Lanes:
             return MODE_HOST
         return mode
 
+    def _mark_no_window(self, lane_key: str, why: str) -> None:
+        """Tell the would-be depositor at once that no window will be served
+        (it would otherwise wait the whole connect budget on the socket)."""
+        try:
+            d = lane_dir(self.boot_nonce, lane_key, self.group, self.root)
+            os.makedirs(d, exist_ok=True)
+            with open(os.path.join(d, "no-window"), "w") as fh:
+                fh.write(str(why))
+        except OSError as exc:
+            self.log(f"WEG2-BAR1 lane={lane_key} no-window marker failed: {exc!r}")
+
     # -- receiver: window + serve --------------------------------------------
     def open_window(self, lane_key: str) -> Optional[RecvWindow]:
         from sglang.srt.distributed.device_communicators.barlink_bar1 import bar1_window
@@ -288,16 +385,31 @@ class Bar1Lanes:
             cu = self._cu()
             bdf = self.bdf()
             win = bar1_window(bdf)
-            slot = slot_bytes_for(int(win.size))
             ring = ring_slots()
-            dptr, handle, size = cu.vmm_alloc(self._ordinal(), slot * ring)
-            fd, hold_fds, how = cu.dmabuf_fd(dptr, handle, size, self._ordinal())
+            borrowed = ""
+            offset = 0
+            if int(win.size) < BIG_BAR_MIN:
+                plan = borrow_plan(self.group, lane_key, self.cross_pairs, self.big_cards(),
+                                   self.group_windows(), ring)
+                if isinstance(plan, str):
+                    self.refusals[lane_key] = plan
+                    self.log(f"WEG2-BAR1 lane={lane_key} role=dst group={self.group} NO-WINDOW {plan} -> host lane")
+                    self._mark_no_window(lane_key, plan)
+                    return None
+                borrowed, offset, size, slot = plan
+                dptr, handle, full = self._group_own[borrowed]
+            else:
+                slot = slot_bytes_for(int(win.size))
+                dptr, handle, full = cu.vmm_alloc(self._ordinal(), slot * ring)
+                size = full
+            fd, hold_fds, how = cu.dmabuf_fd(dptr, handle, full, self._ordinal())
         except Exception as exc:  # noqa: BLE001 -- a named refusal, the host lane stays
             self.refusals[lane_key] = f"window: {type(exc).__name__}: {exc}"
             self.log(f"WEG2-BAR1 lane={lane_key} role=dst REFUSED {self.refusals[lane_key]} -> host lane")
+            self._mark_no_window(lane_key, self.refusals[lane_key])
             return None
-        w = RecvWindow(lane_key, int(dptr), int(handle), int(size), slot, ring, int(fd),
-                       list(hold_fds), bdf, self._ordinal())
+        w = RecvWindow(lane_key, int(dptr) + int(offset), int(handle), int(size), slot, ring, int(fd),
+                       list(hold_fds), bdf, self._ordinal(), borrowed=borrowed)
         path = socket_path(self.boot_nonce, lane_key, self.group, self.root)
         os.makedirs(os.path.dirname(path), exist_ok=True)
         try:
@@ -308,7 +420,8 @@ class Bar1Lanes:
         ls.bind(path)
         ls.listen(4)
         meta = json.dumps({"lane": lane_key, "size": w.size, "slot_bytes": slot, "ring": ring,
-                           "bdf": bdf, "how": how}).encode()
+                           "bdf": bdf, "how": how, "offset": int(offset), "full": int(full),
+                           "borrowed": borrowed}).encode()
 
         def _serve():
             while True:
@@ -327,7 +440,8 @@ class Bar1Lanes:
         w.listener, w.thread = ls, th
         self.recv[lane_key] = w
         self.log(f"WEG2-BAR1 lane={lane_key} role=dst group={self.group} window={size >> 20} MiB "
-                 f"slot={slot >> 20} MiB ring={ring} bdf={bdf} export={how} served={path}")
+                 f"slot={slot >> 20} MiB ring={ring} bdf={bdf} export={how} "
+                 f"borrowed={borrowed or '-'} offset={offset >> 20}MiB served={path}")
         return w
 
     # -- depositor: connect + map --------------------------------------------
@@ -353,6 +467,16 @@ class Bar1Lanes:
                 meta = json.loads(data.decode())
                 break
             except (OSError, ValueError):
+                marker = os.path.join(os.path.dirname(path), "no-window")
+                if os.path.exists(marker):
+                    try:
+                        with open(marker) as fh:
+                            why = fh.read().strip()
+                    except OSError:
+                        why = "?"
+                    self.refusals[lane_key] = f"peer serves no window: {why}"
+                    self.log(f"WEG2-BAR1 lane={lane_key} role=src REFUSED {self.refusals[lane_key]} -> host lane")
+                    return None
                 if time.perf_counter() - t0 > timeout_s:
                     self.refusals[lane_key] = f"connect: no window served at {path} within {timeout_s:.0f} s"
                     self.log(f"WEG2-BAR1 lane={lane_key} role=src REFUSED {self.refusals[lane_key]} -> host lane")
@@ -382,9 +506,10 @@ class Bar1Lanes:
                     break
                 length += e.length
                 expected += e.length
-            if length < int(meta["size"]):
-                raise RuntimeError(f"contiguous BAR1 run {length} < window {meta['size']}")
-            offset = start - window.base
+            m_off = int(meta.get("offset", 0) or 0)
+            if length < m_off + int(meta["size"]):
+                raise RuntimeError(f"contiguous BAR1 run {length} < offset {m_off} + window {meta['size']}")
+            offset = start - window.base + m_off
             page = mmap.PAGESIZE
             m_offset = (offset // page) * page
             lead_in = offset - m_offset
@@ -417,6 +542,7 @@ class Bar1Lanes:
         self.peers[lane_key] = p
         self.log(f"WEG2-BAR1 lane={lane_key} role=src group={self.group} mapped peer={peer_bdf} "
                  f"window={p.size >> 20} MiB slot={p.slot_bytes >> 20} MiB ring={p.ring} "
+                 f"borrowed={meta.get('borrowed') or '-'} "
                  f"dev_ptr={p.dev_ptr:#x} ms={(time.perf_counter() - t0) * 1000:.0f}")
         return p
 
@@ -475,17 +601,48 @@ def run_bar1_units(descs, ops, *, lanes: Bar1Lanes, lane_key: str, role: str,
     d = lanes.flags(lane_key, role)
     total = sum(int(b.total_bytes) for b in batches)
     npieces = sum(len(b.pieces) for b in batches)
-    try:
-        stream = ops.create_stream(int(device))
-    except Exception:  # noqa: BLE001 -- the desk fakes carry no stream
-        stream = 0
+    # ONE STREAM PER SLOT, and the sync runs ONE BATCH BEHIND: batch g is
+    # queued on stream g % ring, then batch g-1 (already done while g was
+    # being issued) is synced and its flag posted. The copy engine never
+    # waits for Python between batches -- xsn365 measured the per-batch form
+    # (sync, flag, next issue) at ~1 ms of bubble per 8-MiB batch = half the
+    # link on the 5090's lanes.
+    streams = []
+    for _ in range(int(ring)):
+        try:
+            streams.append(ops.create_stream(int(device)))
+        except Exception:  # noqa: BLE001 -- the desk fakes carry no stream
+            streams.append(0)
     _nw = no_write or ()
     t0 = time.perf_counter()
     t_wait = t_copy = 0.0
     log(f"WEG2-BAR1 mapped lane={lane_key} phase={phase} seq={int(seq)} bytes={total} "
         f"units={npieces} batches={len(batches)} slot={slot_bytes >> 20}MiB ring={ring}")
+    recs = {}
+    nb = len(batches)
+    # the one-behind form needs a third slot (depositor: g in flight, g-1
+    # syncing, g-ring freed by the collector who is itself one behind); a
+    # 2-slot ring would deadlock, so it syncs each batch at once
+    # (depositor lag + collector lag < ring, or the credits chase each other):
+    # the depositor keeps ring-2 batches queued -- measured 18.09.: with one in
+    # flight a 4-MiB batch cost ~1 ms against 0.3 ms of DMA (3.8 of 14 GB/s).
+    lag = (max(1, int(ring) - 2) if role == "src" else 1) if int(ring) >= 3 else 0
+
+    def _finish(g):
+        """sync batch g's stream and post its flag (full for the depositor,
+        free for the collector)."""
+        nonlocal t_copy
+        tc = time.perf_counter()
+        ops.synchronize(streams[ring_slot(g, ring)])
+        t_copy += time.perf_counter() - tc
+        if role == "src":
+            post_flag(d, "full", seq, g, {"g": g, "bytes": int(batches[g].total_bytes), "rec": recs.pop(g)})
+        else:
+            post_flag(d, "free", seq, g)
+
     for g, batch in enumerate(batches):
         sbase = base + ring_slot(g, ring) * slot_bytes
+        stream = streams[ring_slot(g, ring)]
         if role == "src":
             if g >= ring:
                 tw = time.perf_counter()
@@ -493,7 +650,6 @@ def run_bar1_units(descs, ops, *, lanes: Bar1Lanes, lane_key: str, role: str,
                     return (f"bar1 deposit lane={lane_key} seq={seq}: no 'free' for batch "
                             f"{g - ring} within {budget_s:.0f} s (collector gone or stuck)")
                 t_wait += time.perf_counter() - tw
-            tc = time.perf_counter()
             rec = []
             for piece in batch.pieces:
                 desc = descs[piece.desc_index]
@@ -509,9 +665,9 @@ def run_bar1_units(descs, ops, *, lanes: Bar1Lanes, lane_key: str, role: str,
                                        int(piece.run_bytes), int(piece.rows), stream)
                 rec.append([str(getattr(desc, "param_name", "?")), str(getattr(desc, "tag", "") or ""),
                             int(piece.nbytes), int(piece.slot_off)])
-            ops.synchronize(stream)
-            t_copy += time.perf_counter() - tc
-            post_flag(d, "full", seq, g, {"g": g, "bytes": int(batch.total_bytes), "rec": rec})
+            recs[g] = rec
+            if g >= lag:
+                _finish(g - lag)
             continue
         # ---- COLLECT ----
         tw = time.perf_counter()
@@ -524,7 +680,6 @@ def run_bar1_units(descs, ops, *, lanes: Bar1Lanes, lane_key: str, role: str,
         if len(rec) != len(batch.pieces):
             return (f"bar1 collect lane={lane_key} batch {g}: record has {len(rec)} pieces, "
                     f"this side cut {len(batch.pieces)} -- the two plans disagree")
-        tc = time.perf_counter()
         for piece, r in zip(batch.pieces, rec):
             desc = descs[piece.desc_index]
             name = str(getattr(desc, "param_name", "?"))
@@ -545,9 +700,11 @@ def run_bar1_units(descs, ops, *, lanes: Bar1Lanes, lane_key: str, role: str,
             else:
                 ops.memcpy2d_async(dst, int(piece.dpitch), src, int(piece.run_bytes),
                                    int(piece.run_bytes), int(piece.rows), stream)
-        ops.synchronize(stream)
-        t_copy += time.perf_counter() - tc
-        post_flag(d, "free", seq, g)
+        if g >= lag:
+            _finish(g - lag)
+    # the tail: every batch still in flight, in order (lag of them)
+    for g in range(max(0, nb - lag), nb):
+        _finish(g)
     if role == "dst":
         # the ring's last free flags have no taker: leave none behind
         for g in range(max(0, len(batches) - ring), len(batches)):
