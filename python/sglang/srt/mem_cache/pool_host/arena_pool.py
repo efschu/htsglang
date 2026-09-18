@@ -148,6 +148,7 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
         self._k_offs: list = []
         self._v_offs: list = []
         self._pending: dict = {}
+        self._pending_mask = None   # xsn355: bool[A], mirrors _pending's keys (vectorised membership)
         self.arena_k_ptrs = None
         self.arena_v_ptrs = None
 
@@ -284,6 +285,7 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
             logger.info("#task3 arena load JIT warm-up skipped: %r", exc)
         self.arena = arena
         self.arena_slots = A
+        self._pending_mask = torch.zeros(int(A), dtype=torch.bool)
         self.id_space = self.staging_rows + A + PLACEHOLDERS
         self.prefetch_capacity_tokens = A
         if role == "draft":
@@ -570,6 +572,18 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
         )
 
     # -- #1427 Stufe 4: direct writes, card -> arena slot -------------------------
+    def _pend_mark(self, slots, value: bool) -> None:
+        m = self._pending_mask
+        if m is not None and slots:
+            m[torch.as_tensor(list(slots), dtype=torch.int64)] = value
+
+    def _pend_pop(self, s):
+        p = self._pending.pop(s, None)
+        m = self._pending_mask
+        if m is not None and p is not None:
+            m[int(s)] = False
+        return p
+
     def _stems(self, hashes, suffix: str = ""):
         if suffix:
             return [self._backend._get_suffixed_key(f"{h}.{suffix}") for h in hashes]
@@ -615,6 +629,7 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
         # xsn352 (py-spy PP0): the per-slot loop was ~27 ms per 4096-page node
         # in the scheduler thread -- batched: one dict update, one ref call.
         self._pending.update((slot, (gen, st == 0)) for slot, st, gen in got if st != 2)
+        self._pend_mark([slot for slot, st, _ in got if st != 2], True)
         complete = [slot for slot, st, _ in got if st == 2]
         if complete:
             arena.ref_slots(complete, +1)        # complete already: reader reference only
@@ -688,7 +703,7 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
             st = self.arena.complete_slots(sl.tolist(), gens, self._own_extents)
             lost = 0
             for s, r in zip(sl.tolist(), st):
-                self._pending.pop(s, None)
+                self._pend_pop(s)
                 lost += int(r == 3)
             if lost:
                 logger.warning("#1427 ARENA-COMPLETE LOST %d draft page(s) under the producer", lost)
@@ -797,15 +812,22 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
         if not bool(is_arena.any()):
             return super().backup_from_device_all_layer(device_pool, host_indices, device_indices, io_backend)
         sel = is_arena.nonzero(as_tuple=True)[0]
-        rows = (hi[sel] - S).tolist()
-        if self.row_slot is not None:   # draft role: KV row -> draft slot
-            pairs = [(self.row_slot.get(int(r), -1), i) for r, i in zip(rows, sel.tolist())]
+        if self.row_slot is None and self._pending_mask is not None:
+            # xsn355 (py-spy PP0): the per-row Python pairs/todo lists were ~30 ms
+            # per 4096-page node; KV role membership comes from the mask.
+            rows_t = (hi[sel] - S).to(torch.int64)
+            keep = self._pending_mask[rows_t]
+            slots = rows_t[keep]
+            sel = sel[keep]
+            todo = bool(slots.numel())
         else:
-            pairs = [(int(r), i) for r, i in zip(rows, sel.tolist())]
-        todo = [(s, i) for s, i in pairs if s >= 0 and s in self._pending]
+            rows = (hi[sel] - S).tolist()
+            pairs = [(self.row_slot.get(int(r), -1), i) for r, i in zip(rows, sel.tolist())]
+            todo = [(s, i) for s, i in pairs if s >= 0 and s in self._pending]
+            if todo:
+                slots = torch.tensor([s for s, _ in todo], dtype=torch.int64)
+                sel = torch.tensor([i for _, i in todo], dtype=torch.int64)
         if todo:
-            slots = torch.tensor([s for s, _ in todo], dtype=torch.int64)
-            sel = torch.tensor([i for _, i in todo], dtype=torch.int64)
             if device_indices.device.type == "cuda":
                 # xsn349: `device_indices.cpu()` here synchronised the scheduler
                 # thread with the write stream (the previous chunk's copy still
@@ -843,7 +865,7 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
         st = self.arena.complete_slots(slots, gens, self._own_extents)
         done = 0
         for s, r in zip(slots, st):
-            self._pending.pop(s, None)
+            self._pend_pop(s)
             if r == 3:
                 k = getattr(ArenaMHAHostPool, "_1427_lost_n", 0) + 1
                 ArenaMHAHostPool._1427_lost_n = k
@@ -863,7 +885,7 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
         for s in self._slots_of(host_indices):
             if s < 0:
                 continue
-            p = self._pending.pop(s, None)
+            p = self._pend_pop(s)
             if p is None:
                 refd.append(s)
             elif p[1]:
@@ -937,7 +959,7 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
                 slots = rows
             pend = [s for s in slots if s in self._pending]
             if pend:
-                fresh = [s for s in pend if self._pending.pop(s)[1]]
+                fresh = [s for s in pend if self._pend_pop(s)[1]]
                 if fresh:
                     self.arena.free_slots(fresh)
                 slots = [s for s in slots if s not in pend]

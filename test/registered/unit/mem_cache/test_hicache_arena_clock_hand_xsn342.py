@@ -102,3 +102,16 @@ def test_claim_by_stems_hashes_in_c_like_python(tmp_path):
     # and the header keys equal key128
     lo, hi = a._keys(st[:1])
     assert (int(lo[0]), int(hi[0])) == key128(st[0])
+
+
+def test_pending_mask_mirrors_the_pending_dict():
+    from sglang.srt.mem_cache.pool_host.arena_pool import ArenaMHAHostPool as M
+    import torch
+    p = M.__new__(M)
+    p._pending = {}
+    p._pending_mask = torch.zeros(16, dtype=torch.bool)
+    p._pend_mark([3, 5], True); p._pending.update({3: (1, True), 5: (2, False)})
+    assert p._pending_mask[3] and p._pending_mask[5] and not p._pending_mask[4]
+    assert p._pend_pop(3) == (1, True) and not p._pending_mask[3]
+    assert p._pend_pop(9) is None
+    assert p._pending_mask.sum().item() == 1
