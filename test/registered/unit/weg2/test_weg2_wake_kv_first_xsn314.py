@@ -34,7 +34,7 @@ def test_early_only_when_free_minus_floor_covers_kv_plus_margin(monkeypatch):
 
 def test_the_kv_block_is_one_closure_called_early_or_late():
     src = open(wu.__file__).read()
-    d = src.index("        def _weg2_kv_block():")
+    d = src.index("        def _weg2_kv_resume_part():")  # stage 3: two halves + wrapper
     e = src.index("        _plan = _wk_plan(")  # stage 2: the plan replaces the bare gate
     l = src.index("        if (GPU_MEMORY_TYPE_KV_CACHE in tags or self._weg2_kv_deferred) and not _weg2_kv_done:")  # stage 2
     assert d < e < l
@@ -43,4 +43,10 @@ def test_the_kv_block_is_one_closure_called_early_or_late():
     assert "WEG2-DORMANT cleared" in body and "_weg2_release_dormant_hold" in body
     # the early call precedes the weight legs' collect worker
     assert e < src.index('thread_name_prefix="weg2-wake-collect"', d)  # the collect worker of THIS handler
-    assert src.count("            _weg2_kv_block()") == 2  # early + late call, plus the def
+    assert src.count("            _weg2_kv_block()") == 1  # only the late site runs both halves
+    # the EARLY path resumes the pool only -- never clears DORMANT before the weights (xsn315)
+    k = src.index('if _plan == "early":')
+    early = src[k:k + 500]
+    assert "_weg2_kv_resume_part()" in early and "weg2_dormant = False" not in early
+    rp = src.index("        def _weg2_kv_resume_part():"); cp = src.index("        def _weg2_kv_clear_part():")
+    assert "weg2_dormant = False" not in src[rp:cp] and "weg2_dormant = False" in src[cp:cp + 2000]

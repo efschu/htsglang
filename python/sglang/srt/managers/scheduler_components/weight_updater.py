@@ -7122,7 +7122,10 @@ class SchedulerWeightUpdaterManager:
         # sleep added.  It runs BEFORE the remove loop for that reason.
         tags = self._weg2_with_graph_tag(tags, weg2_memory_saver_on)
 
-        def _weg2_kv_block():
+        def _weg2_kv_resume_part():
+            # Wake-Parallel: kv_cache resume + pool restore ONLY. Safe before
+            # the weight legs (xsn315: clearing DORMANT here admitted requests
+            # onto paused weights -- two P ranks died, the flip hung).
             # Wake-Parallel (user 18.09.): the kv_cache resume, pool restore, DORMANT
             # clear and hold release -- one block, called EARLY (before the weight
             # legs, so the held requests' arena loads overlap the legs) when the
@@ -7175,6 +7178,10 @@ class SchedulerWeightUpdaterManager:
                         "W26 Weg2WakeInvariantRefused: flush_cache() refused after resume(kv_cache) "
                         "(the group is not idle?) -- the pools hold recycled pages, serving on them is unsafe"
                     )
+        def _weg2_kv_clear_part():
+            # Wake-Parallel: DORMANT cleared, hold release, store rescan, disagg
+            # queues -- only once the weights are resumed (the late site).
+            scheduler = self.scheduler
             if scheduler is not None:
                 # W25: the pools are mapped again; the admission seams admit.
                 scheduler.weg2_dormant = False
@@ -7205,6 +7212,10 @@ class SchedulerWeightUpdaterManager:
                     queue = getattr(scheduler, "disagg_prefill_bootstrap_queue", None)
                     if queue is not None:
                         queue.resume_memory_occupation()
+        def _weg2_kv_block():
+            _weg2_kv_resume_part()
+            _weg2_kv_clear_part()
+
         _weg2_kv_done = False
         from sglang.srt.weg2.wake_kv import wake_kv_plan as _wk_plan
         _kv_epoch = getattr(recv_req, "epoch", None)
@@ -7216,11 +7227,16 @@ class SchedulerWeightUpdaterManager:
             deferred=bool(self._weg2_kv_deferred),
             epoch=_kv_epoch, epoch_done=self._weg2_kv_epoch_done,
         )
+        _weg2_kv_resumed_early = False
         if _plan == "early":
-            _weg2_kv_block()
-            self._weg2_kv_epoch_done = _kv_epoch
+            _weg2_kv_resume_part()   # loads may start; admission stays dormant until the legs
+            _weg2_kv_resumed_early = True
             self._weg2_kv_deferred = False
-            _weg2_kv_done = True
+            if not any(is_weights_family_tag(t) for t in tags):
+                # a kv-only call: the CLEAR half belongs to the weights call
+                # (its late site), which arrives with or after the legs
+                self._weg2_kv_deferred = True
+                _weg2_kv_done = True
         elif _plan == "defer":
             self._weg2_kv_deferred = True
             _weg2_kv_done = True
@@ -7732,7 +7748,12 @@ class SchedulerWeightUpdaterManager:
                 _weg2_ph("seam_after")
 
         if (GPU_MEMORY_TYPE_KV_CACHE in tags or self._weg2_kv_deferred) and not _weg2_kv_done:
-            _weg2_kv_block()  # the late site (old order, or the deferred early call): legs first, then kv
+            # the late site: legs first, then kv (old order), or the CLEAR half of
+            # a kv resume that already happened early (this call or a deferred one)
+            if _weg2_kv_resumed_early or self._weg2_kv_epoch_done == _kv_epoch:
+                _weg2_kv_clear_part()
+            else:
+                _weg2_kv_block()
             self._weg2_kv_epoch_done = _kv_epoch
             self._weg2_kv_deferred = False
 
