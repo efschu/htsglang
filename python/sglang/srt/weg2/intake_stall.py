@@ -82,6 +82,19 @@ class IntakeStallWatch:
         )
 
 
+def abort_must_reach_every_rank(*, rid_known: bool, abort_all: bool) -> bool:
+    """weg2xsn276: should the tokenizer dispatch an AbortReq it would
+    otherwise drop (rid unknown to it)? On a Weg 2 group (env
+    SGLANG_WEG2_GROUP set) yes: the intake-stall refusal finalises the
+    stream before the front's abort arrives, and the PP followers still hold
+    the request. Outside Weg 2 the upstream short-cut stands."""
+    import os
+
+    if rid_known or abort_all:
+        return True
+    return bool(str(os.environ.get("SGLANG_WEG2_GROUP", "")).strip())
+
+
 def is_intake_stall(text: object) -> bool:
     """Does a leg-1 error (status line + body) carry the stall refusal?"""
     return STALL_MARK in str(text or "")

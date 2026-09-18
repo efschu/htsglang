@@ -1801,7 +1801,22 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             and self.server_args.tokenizer_worker_num == 1
             and rid not in self.rid_to_state
         ):
-            return
+            # weg2xsn276 (18.09.): on a Weg 2 group the abort must reach EVERY
+            # scheduler rank even when this manager no longer knows the rid --
+            # the scheduler's WEG2-INTAKE-STALL refusal finalised the stream
+            # on this side and dropped the request on ITS rank only; the PP
+            # followers still queued it, the front's /abort_request was
+            # swallowed here, and the flip's release asserted 'server idle'
+            # (W29 on PP2). An AbortReq for a rid no rank holds is a no-op.
+            from sglang.srt.weg2.intake_stall import abort_must_reach_every_rank
+
+            if not abort_must_reach_every_rank(rid_known=False, abort_all=abort_all):
+                return
+            logger.info(
+                "WEG2 abort_request rid=%s not in rid_to_state -- dispatched to every "
+                "scheduler rank anyway (Weg 2 group %s)",
+                rid, os.environ.get("SGLANG_WEG2_GROUP", "?"),
+            )
         req = AbortReq(rid=rid, abort_all=abort_all)
         self._dispatch_to_scheduler(req)
         if self.enable_metrics:

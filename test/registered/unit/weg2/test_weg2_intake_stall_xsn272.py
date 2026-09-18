@@ -181,3 +181,24 @@ def test_xsn275_the_admission_wedge_drain_hands_the_head_to_the_refusal():
     msg = _obs(w, "weg2-5-4", 0.0, immediate=True, extra="gate=admission-wedge")
     assert msg and "gate=admission-wedge" in msg
     assert _obs(w, "weg2-5-4", 0.1, immediate=True) is None
+
+
+def test_xsn276_the_tokenizer_abort_reaches_every_rank_on_a_weg2_group(monkeypatch):
+    """xsn276 (96e5283fd1): the refusal fired (P-INTAKE-STALL, /abort_request
+    -> 200) and P died in the flip: W29 on PP2, 'release_memory_occupation
+    should be called only when server is idle'. The tokenizer's abort_request
+    returned early because the rid was no longer in rid_to_state (the 503 had
+    finalised it), so PP1/PP2 kept the request. On a Weg 2 group the abort is
+    dispatched anyway."""
+    from sglang.srt.managers import tokenizer_manager as tm
+    src = open(tm.__file__).read()
+    i = src.index("def abort_request(self, rid")
+    blk = src[i:i + 1600]
+    assert "abort_must_reach_every_rank(rid_known=False, abort_all=abort_all)" in blk
+    assert "dispatched to every" in blk
+    monkeypatch.delenv("SGLANG_WEG2_GROUP", raising=False)
+    assert st.abort_must_reach_every_rank(rid_known=False, abort_all=False) is False
+    assert st.abort_must_reach_every_rank(rid_known=True, abort_all=False) is True
+    assert st.abort_must_reach_every_rank(rid_known=False, abort_all=True) is True
+    monkeypatch.setenv("SGLANG_WEG2_GROUP", "P")
+    assert st.abort_must_reach_every_rank(rid_known=False, abort_all=False) is True
