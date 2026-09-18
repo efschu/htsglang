@@ -2359,6 +2359,37 @@ class PrefillAdder:
                 # an extent was chosen at all.
                 if _lb_extent is not None:
                     _applied = int(new_indices.numel())
+                    if _applied == 0 and _lb_extent > 0 and getattr(
+                        req, "mamba_loadback_anchor_adopted", False
+                    ):
+                        # weg2xsn282 (18.09.): NOTHING loaded is NOT a skewed
+                        # host tier, it is NO DEVICE ROOM YET. Group D held
+                        # three 98k prompts (retained after finishing until
+                        # their write-through), the fourth's load-back
+                        # yielded 0 rows, the mamba restore had adopted its
+                        # anchor -- and the #968 refusal below became a #791
+                        # STOP that killed the group. The room comes back when
+                        # the finished prompts' rows are evictable; give the
+                        # anchor back and WAIT (NO_TOKEN), as any request does
+                        # while the pool is full.
+                        from sglang.srt.mem_cache.common import (
+                            release_admission_acquired_mamba_slot,
+                        )
+                        release_admission_acquired_mamba_slot(
+                            req, self.tree_cache, site="loadback_no_room"
+                        )
+                        req.mamba_loadback_anchor_adopted = False
+                        _n = getattr(self, "_weg2_loadback_no_room", 0) + 1
+                        self._weg2_loadback_no_room = _n
+                        if _n <= 3 or (_n & (_n - 1)) == 0:
+                            logger.info(
+                                "WEG2-LOADBACK-WAIT rid=%s extent=%d applied=0: no device "
+                                "room for the host hit yet (rem_total_tokens=%s); the anchor "
+                                "is given back and the request waits (n=%d)",
+                                getattr(req, "rid", "?"), int(_lb_extent),
+                                getattr(self, "rem_total_tokens", "?"), _n,
+                            )
+                        return AddReqResult.NO_TOKEN
                     if _applied != _lb_extent and getattr(
                         req, "mamba_loadback_anchor_adopted", False
                     ):
