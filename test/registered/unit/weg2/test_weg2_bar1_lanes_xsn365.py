@@ -189,7 +189,7 @@ def test_collector_refuses_a_disagreeing_plan(tmp_path):
                              phase="deposit", budget_s=2.0, log=lambda *_a: None) == ""
     why = b1.run_bar1_units(c_descs, ops, lanes=col, lane_key="p0", role="dst", seq=1,
                             phase="collect", budget_s=2.0, log=lambda *_a: None)
-    assert "identity mismatch" in why and bytes(dst) == bytes(3000)
+    assert "plans disagree" in why and bytes(dst) == bytes(3000)
 
 
 def test_no_window_on_this_side_is_a_named_refusal(tmp_path):

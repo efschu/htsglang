@@ -655,15 +655,7 @@ def run_bar1_units(descs, ops, *, lanes: Bar1Lanes, lane_key: str, role: str,
     t_wait = t_copy = 0.0
     log(f"WEG2-BAR1 mapped lane={lane_key} phase={phase} seq={int(seq)} bytes={total} "
         f"units={npieces} batches={len(batches)} slot={slot_bytes >> 20}MiB ring={ring}")
-    recs = {}
     nb = len(batches)
-    # the one-behind form needs a third slot (depositor: g in flight, g-1
-    # syncing, g-ring freed by the collector who is itself one behind); a
-    # 2-slot ring would deadlock, so it syncs each batch at once
-    # (depositor lag + collector lag < ring, or the credits chase each other):
-    # the depositor keeps ring-2 batches queued -- measured 18.09.: with one in
-    # flight a 4-MiB batch cost ~1 ms against 0.3 ms of DMA (3.8 of 14 GB/s).
-    lag = (max(1, int(ring) - 2) if role == "src" else 1) if int(ring) >= 3 else 0
 
     def _finish(g):
         """sync batch g's stream and post its flag (full for the depositor,
@@ -672,11 +664,38 @@ def run_bar1_units(descs, ops, *, lanes: Bar1Lanes, lane_key: str, role: str,
         tc = time.perf_counter()
         ops.synchronize(streams[ring_slot(g, ring)])
         t_copy += time.perf_counter() - tc
-        if role == "src":
-            post_flag(d, "full", seq, g, {"g": g, "bytes": int(batches[g].total_bytes), "rec": recs.pop(g)})
-        else:
-            post_flag(d, "free", seq, g)
+        post_flag(d, "full" if role == "src" else "free", seq, g)
 
+    # LAG: the depositor syncs one batch behind (its copy engine never idles
+    # between batches); the collector syncs at once (a D2D copy of one slot
+    # is microseconds). That leaves ring-1 batches of SLACK between the two
+    # sides -- xsn367 measured lag 2/1 (one batch of slack) at ~2 ms per
+    # 9-MiB batch: every flag hop through the scheduler process's GIL costs
+    # ~1 ms, and with one batch of slack the two sides waited for each other
+    # hop by hop (PP0 4.7 GB/s per lane, single-lane probe 10.6).
+    lag = (1 if role == "src" else 0) if int(ring) >= 3 else 0
+    # ONE plan record per tag (the batches' pieces by name, tag, size and
+    # slot offset) instead of a JSON per batch: the collector checks its own
+    # deterministic cut against it once, the per-batch flags stay empty.
+    if role == "src":
+        post_flag(d, "plan", seq, 0, {"batches": [
+            [[str(getattr(descs[pc.desc_index], "param_name", "?")),
+              str(getattr(descs[pc.desc_index], "tag", "") or ""), int(pc.nbytes), int(pc.slot_off)]
+             for pc in b.pieces] for b in batches]})
+    else:
+        tw = time.perf_counter()
+        got = take_flag(d, "plan", seq, 0, budget_s, liveness=liveness)
+        t_wait += time.perf_counter() - tw
+        if got is None:
+            return (f"bar1 collect lane={lane_key} seq={seq}: no plan record within "
+                    f"{budget_s:.0f} s (depositor gone or stuck)")
+        theirs = got.get("batches") or []
+        mine = [[[str(getattr(descs[pc.desc_index], "param_name", "?")),
+                  str(getattr(descs[pc.desc_index], "tag", "") or ""), int(pc.nbytes), int(pc.slot_off)]
+                 for pc in b.pieces] for b in batches]
+        if theirs != mine:
+            return (f"bar1 collect lane={lane_key} seq={seq}: the deposit plan ({len(theirs)} batches) "
+                    f"differs from this side's cut ({len(mine)}) -- the two plans disagree")
     for g, batch in enumerate(batches):
         sbase = base + ring_slot(g, ring) * slot_bytes
         stream = streams[ring_slot(g, ring)]
@@ -687,7 +706,6 @@ def run_bar1_units(descs, ops, *, lanes: Bar1Lanes, lane_key: str, role: str,
                     return (f"bar1 deposit lane={lane_key} seq={seq}: no 'free' for batch "
                             f"{g - ring} within {budget_s:.0f} s (collector gone or stuck)")
                 t_wait += time.perf_counter() - tw
-            rec = []
             for piece in batch.pieces:
                 desc = descs[piece.desc_index]
                 if desc.src_ptr is None:
@@ -700,9 +718,6 @@ def run_bar1_units(descs, ops, *, lanes: Bar1Lanes, lane_key: str, role: str,
                 else:
                     ops.memcpy2d_async(dst, int(piece.run_bytes), src, int(piece.spitch),
                                        int(piece.run_bytes), int(piece.rows), stream)
-                rec.append([str(getattr(desc, "param_name", "?")), str(getattr(desc, "tag", "") or ""),
-                            int(piece.nbytes), int(piece.slot_off)])
-            recs[g] = rec
             if g >= lag:
                 _finish(g - lag)
             continue
@@ -713,19 +728,10 @@ def run_bar1_units(descs, ops, *, lanes: Bar1Lanes, lane_key: str, role: str,
         if got is None:
             return (f"bar1 collect lane={lane_key} seq={seq}: no 'full' for batch {g} "
                     f"within {budget_s:.0f} s (depositor gone or stuck)")
-        rec = got.get("rec") or []
-        if len(rec) != len(batch.pieces):
-            return (f"bar1 collect lane={lane_key} batch {g}: record has {len(rec)} pieces, "
-                    f"this side cut {len(batch.pieces)} -- the two plans disagree")
-        for piece, r in zip(batch.pieces, rec):
+        for piece in batch.pieces:
             desc = descs[piece.desc_index]
             name = str(getattr(desc, "param_name", "?"))
             tag = str(getattr(desc, "tag", "") or "")
-            if (r[0] != name or (r[1] and tag and r[1] != tag) or int(r[2]) != int(piece.nbytes)
-                    or int(r[3]) != int(piece.slot_off)):
-                return (f"bar1 collect lane={lane_key} batch {g}: identity mismatch -- deposit "
-                        f"{r[0]!r}/{r[1]} {r[2]}@{r[3]}, this side {name!r}/{tag} "
-                        f"{int(piece.nbytes)}@{int(piece.slot_off)}")
             if (tag, name) in _nw or name in _nw:
                 continue
             if desc.dst_ptr is None:
