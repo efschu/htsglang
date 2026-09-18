@@ -3297,6 +3297,18 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         except Exception as exc:  # noqa: BLE001 -- a publisher never takes the retain down
             logger.warning("WEG2 RETAIN-PUBLISH raised %s: %s", type(exc).__name__, exc)
 
+    def _weg2_chain_from(self, node) -> list:
+        """The nodes from `node` up to (excluding) the root, ROOT FIRST."""
+        chain = []
+        try:
+            while node is not None and node is not self.root_node:
+                chain.append(node)
+                node = node.parent
+        except Exception:  # noqa: BLE001
+            return []
+        chain.reverse()
+        return chain
+
     def _weg2_chain_nodes(self, radix_key) -> list:
         """The tree nodes of `radix_key`'s matched path, ROOT FIRST (a parent
         publishes before its child: write_backup refuses 'parent_unbacked')."""
@@ -3321,7 +3333,10 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             from sglang.srt.weg2 import retain_publish as _rp
             if not _rp.publish_at_chunk_on() or not self.enable_storage:
                 return
-            first = self._weg2_chain_nodes(radix_key)
+            # xsn348: the chain from the request's own last node (a parent walk),
+            # not a match_prefix over the 98k key per chunk (CHUNK-PUBLISH 114 ms
+            # with one node issued; the retain's single-node issue is ~45 ms).
+            first = self._weg2_chain_from(getattr(req, "last_node", None))
             if not first:
                 return
             stats = self.publish_unbacked_sweep(max_issue=_rp.max_issue(),

@@ -118,5 +118,5 @@ def d_accepts_leg2(awake: str, state: str, dormant_admit: bool) -> bool:
     (awake is still 'P' until the wake returns; D holds the request and its
     read runs during the legs)."""
     if awake == "D":
-        return True
+        return state == "serving"        # never into a D that is being put to sleep
     return bool(dormant_admit) and awake == "P" and state in ("serving", "flipping")

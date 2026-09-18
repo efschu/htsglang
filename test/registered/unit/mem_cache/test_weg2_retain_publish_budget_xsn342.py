@@ -73,7 +73,8 @@ def test_chunk_site_publishes_after_the_cleanup():
 
 
 def test_d_accepts_leg2_also_during_the_p_to_d_flip():
-    assert rp.d_accepts_leg2("D", "flipping", False)
+    assert rp.d_accepts_leg2("D", "serving", False)
+    assert not rp.d_accepts_leg2("D", "flipping", True)   # D being put to sleep
     assert rp.d_accepts_leg2("P", "serving", True)
     assert rp.d_accepts_leg2("P", "flipping", True)
     assert not rp.d_accepts_leg2("P", "flipping", False)
@@ -87,3 +88,20 @@ def test_chunk_sweep_is_chain_only():
     assert "chain_only=True" in s
     s2 = inspect.getsource(u.UnifiedRadixCache.publish_unbacked_sweep)
     assert "([] if chain_only else [self.root_node])" in s2
+
+
+def test_chunk_chain_is_a_parent_walk_from_the_last_node():
+    import inspect
+    from sglang.srt.mem_cache import unified_radix_cache as u
+    s = inspect.getsource(u.UnifiedRadixCache._weg2_publish_at_chunk)
+    assert '_weg2_chain_from(getattr(req, "last_node", None))' in s
+
+    class N:
+        def __init__(self, parent):
+            self.parent = parent
+    root = N(None)
+    a = N(root); b = N(a); c = N(b)
+    fake = type("F", (), {"root_node": root})()
+    assert u.UnifiedRadixCache._weg2_chain_from(fake, c) == [a, b, c]
+    assert u.UnifiedRadixCache._weg2_chain_from(fake, root) == []
+    assert u.UnifiedRadixCache._weg2_chain_from(fake, None) == []

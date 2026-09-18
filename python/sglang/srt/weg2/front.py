@@ -2992,7 +2992,7 @@ class Front:
         while True:
             await asyncio.sleep(0.05)
             try:
-                if self.state != "serving" or not self._d_accepts_leg2():
+                if not self._d_accepts_leg2():   # xsn348: the state rule lives in d_accepts_leg2 (P->D flip admits)
                     continue
                 if not self._ready_for_d:
                     continue
@@ -3018,7 +3018,7 @@ class Front:
                     # request that would fit cannot be admitted past it.
                     continue
                 await self._d_seat.acquire()
-                if not (self._d_accepts_leg2() and self.admit_d and self.state == "serving"):
+                if not (self._d_accepts_leg2() and self.admit_d):
                     # The phase moved while this admitter was queued behind a
                     # running decode.  Give the seat back and leave the
                     # request where it is: the deque head is still the oldest
