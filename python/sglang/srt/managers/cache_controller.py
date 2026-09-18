@@ -3511,7 +3511,10 @@ class HiCacheController:
         # xsn328/329: a held request reads with P's handed-over page keys
         # (weg2.handoff_keys); its own hashes agreed with P's for the first
         # 64 tokens only. The first mismatch is named once.
-        _hk = getattr(operation, "weg2_page_keys", None) or WEG2_HANDOFF_PAGE_KEYS.get(operation.request_id)
+        # the scheduler's registry first: it is sliced at the MATCHED length;
+        # the tree's operation.weg2_page_keys assumed a tail read (xsn331:
+        # offset=2 for a from-root read of 4314 of 4316 ids)
+        _hk = WEG2_HANDOFF_PAGE_KEYS.get(operation.request_id) or getattr(operation, "weg2_page_keys", None)
         _k = min(len(_hk), len(page_hashes)) if _hk else 0
         if _k > 0:
             # P's list is one page short of the ids (the last token has no

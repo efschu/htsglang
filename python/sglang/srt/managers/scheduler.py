@@ -5925,11 +5925,15 @@ class Scheduler(
                 from sglang.srt.managers import cache_controller as _cc
                 from sglang.srt.weg2 import handoff as _ho
                 from sglang.srt.weg2.handoff_keys import keys_for_span
-                _hd = getattr(req, "_weg2_handoff_page_keys", "unset")
-                if _hd == "unset":
+                _hd = getattr(req, "_weg2_handoff_page_keys", None)
+                if not _hd:
+                    # xsn331: the first prefetch races P's hand-off write (the
+                    # leg-2 request lands on D the moment P finishes), so a
+                    # missing file is retried on every re-read, never cached.
                     _rec = _ho.read(req.rid)
                     _hd = list(_rec.get("page_keys") or []) if _rec else None
-                    req._weg2_handoff_page_keys = _hd
+                    if _hd:
+                        req._weg2_handoff_page_keys = _hd
                 _span = keys_for_span(_hd, int(_matched_len), len(new_input_tokens), int(self.page_size))
                 if _span:
                     _cc.WEG2_HANDOFF_PAGE_KEYS[req.rid] = _span
