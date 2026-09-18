@@ -48,9 +48,14 @@ class IntakeStallWatch:
         self._since = 0.0
 
     def observe(self, *, rid: str, need_tokens: int, rem_total_tokens: int,
-                cur_rem_tokens: int, running_empty: bool, now: float) -> Optional[str]:
-        """One NO_TOKEN refusal of ``rid``. Returns the refusal message the
-        moment the stall is established (once per rid), else None."""
+                cur_rem_tokens: int, running_empty: bool, now: float,
+                extra: str = "") -> Optional[str]:
+        """One refusal of ``rid`` with nothing admitted this pass -- the
+        adder's NO_TOKEN, or (xsn273) the seat gate in front of the adder:
+        ``get_num_allocatable_reqs(0) <= 0`` while the parked, prefilled
+        backlog holds every request slot. Returns the refusal message the
+        moment the stall is established (once per rid), else None.
+        ``extra`` names the gate's own terms in the message."""
         if not running_empty:
             # a running batch will free tokens when it finishes: wait for it
             self._rid = None
@@ -69,9 +74,10 @@ class IntakeStallWatch:
         return (
             f"{STALL_MARK} rid={rid} need_tokens={int(need_tokens)} "
             f"rem_total_tokens={int(rem_total_tokens)} cur_rem_tokens={int(cur_rem_tokens)} "
-            f"held_s={held:.1f} running=empty -- this group's pool cannot admit the "
-            f"request while it keeps the prefilled backlog for the other phase; "
-            f"the front requeues it for the next phase of this group and flips"
+            f"held_s={held:.1f} running=empty{(' ' + extra) if extra else ''} -- this "
+            f"group's pool cannot admit the request while it keeps the prefilled "
+            f"backlog for the other phase; the front requeues it for the next "
+            f"phase of this group and flips"
         )
 
 

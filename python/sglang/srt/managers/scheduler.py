@@ -12718,6 +12718,19 @@ class Scheduler(
             (running_batch.batch_is_full and _count_veto)
             or len(self.waiting_queue) == 0
         ) and self.chunked_req is None:
+            # weg2xsn273: the seat gate declined with NOTHING running and a
+            # request waiting -- on group P the parked, prefilled backlog holds
+            # the request slots until the flip, so this never resolves by
+            # itself (xsn272/273: 150 s idle, boot killed). Name it, answer
+            # the head 503 (the front requeues it and flips).
+            if running_batch.is_empty() and self.waiting_queue:
+                self._weg2_intake_stall_observe(
+                    self.waiting_queue[0], None,
+                    note=(f"gate=seats allocatable_reqs="
+                          f"{self.get_num_allocatable_reqs(0)} "
+                          f"req_slots_free={self.req_to_token_pool.available_size()} "
+                          f"waiting={len(self.waiting_queue)}"),
+                )
             self._admission_decline_note = (
                 f"gate=batch_full_or_empty_queue(batch_is_full="
                 f"{int(running_batch.batch_is_full)},queue={len(self.waiting_queue)})"
@@ -17882,7 +17895,7 @@ class Scheduler(
         )
         self._abort_request_now(recv_req)
 
-    def _weg2_intake_stall_observe(self, req, adder) -> None:
+    def _weg2_intake_stall_observe(self, req, adder, note: str = "") -> None:
         """weg2xsn272: the adder refused ``req`` (NO_TOKEN) with an EMPTY
         running batch. On Weg 2 group P that refusal is permanent for the
         phase -- P keeps the prefilled backlog for D, nothing runs, nothing
@@ -17902,16 +17915,19 @@ class Scheduler(
         watch = getattr(self, "_weg2_intake_watch", None)
         if watch is None:
             watch = self._weg2_intake_watch = IntakeStallWatch()
+        need, rem_total, cur_rem = -1, -1, -1
         try:
-            need = int(adder.ceil_paged_tokens(
-                len(req.full_untruncated_fill_ids) - len(req.prefix_indices)))
-            rem_total = int(adder.rem_total_tokens)
-            cur_rem = int(adder.cur_rem_tokens)
+            need = len(req.full_untruncated_fill_ids) - len(req.prefix_indices)
+            if adder is not None:
+                need = int(adder.ceil_paged_tokens(need))
+                rem_total = int(adder.rem_total_tokens)
+                cur_rem = int(adder.cur_rem_tokens)
         except Exception:  # noqa: BLE001 -- a desk double without these terms
-            need, rem_total, cur_rem = -1, -1, -1
+            pass
         message = watch.observe(
             rid=str(req.rid), need_tokens=need, rem_total_tokens=rem_total,
             cur_rem_tokens=cur_rem, running_empty=True, now=_time.monotonic(),
+            extra=note or "gate=adder_no_token",
         )
         if message is None:
             return

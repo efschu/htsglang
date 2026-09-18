@@ -124,3 +124,22 @@ async def _requeue_case():
     assert f._p_intake_stalled is True and f.counters["p_intake_stalls"] == 1
     assert calls == [("/abort_request", {"rid": "weg2-5-4"})]
     assert not p.fut.done()                                           # the client keeps waiting
+
+
+def test_xsn273_the_seat_gate_in_front_of_the_adder_feeds_the_watch_too():
+    """xsn273 (a612f98346): the NO_TOKEN hook never ran -- P declined at the
+    SEAT gate (`get_num_allocatable_reqs(0) <= 0`: the six parked, prefilled
+    requests held every request slot) before any request reached the adder;
+    the same 150-s idle, the same kill. The decline branch now observes the
+    head of the waiting queue with the gate's own terms."""
+    from sglang.srt.managers import scheduler as sch
+    src = open(sch.__file__).read()
+    i = src.index("weg2xsn273: the seat gate declined")
+    blk = src[i:i + 1200]
+    assert "if running_batch.is_empty() and self.waiting_queue:" in blk
+    assert "self._weg2_intake_stall_observe(" in blk and "self.waiting_queue[0], None," in blk
+    assert "allocatable_reqs=" in blk and "req_slots_free=" in blk
+    w = st.IntakeStallWatch(hold_s=1.0)
+    assert _obs(w, "weg2-5-4", 0.0) is None
+    msg = _obs(w, "weg2-5-4", 1.1, extra="gate=seats allocatable_reqs=0 req_slots_free=0 waiting=1")
+    assert msg and "gate=seats allocatable_reqs=0" in msg and "need_tokens=95476" in msg
