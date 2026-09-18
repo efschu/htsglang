@@ -2984,6 +2984,23 @@ class HiCacheController:
                 break  # evicted between find and ref: the prefix ends here
             slots.append(slot)
         if not slots:
+            # xsn314/322/326: the dormant hold's re-reads answered ZERO for
+            # pages P had completed (PP2's ack flips COMPLETE within ~4 s),
+            # while the wake found 520k of them at once. Name the first miss.
+            _mn = getattr(self, "_1436_miss_n", 0) + 1
+            self._1436_miss_n = _mn
+            if _mn <= 12 or _mn % 256 == 0:
+                try:
+                    _ex = self.storage_backend.batch_exists(list(hash_values[:2]), None)
+                except Exception as exc:  # noqa: BLE001
+                    _ex = f"exists-raised:{type(exc).__name__}"
+                logger.info("#1436 ARENA-GET MISS n=%d keys=%d first_stem=%s find=(slot=%d,state=%d) second=(slot=%d,state=%d) "
+                            "lead=%d bad_at=%s batch_exists(first2)=%s arena=%s",
+                            _mn, len(hash_values), stems[0][:48] if stems else "-",
+                            int(_fs[0]) if _fs.shape[0] else -9, int(_st[0]) if _st.shape[0] else -9,
+                            int(_fs[1]) if _fs.shape[0] > 1 else -9, int(_st[1]) if _st.shape[0] > 1 else -9,
+                            lead, int(_bad[0]) if _bad.size else -1, _ex,
+                            getattr(getattr(pool, "arena", None), "path", type(getattr(pool, "arena", None)).__name__))
             return 0
         _t2 = time.perf_counter()
         pool.resolve_rows(host_indices, slots)

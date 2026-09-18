@@ -13930,7 +13930,13 @@ class Scheduler(
                 if loaded_tokens > 0:
                     req.storage_hit_length = int(loaded_tokens)
 
+            _ir_t0 = time.perf_counter()  # xsn326: the match/load_back of a re-admission
             req.init_next_round_input(self.tree_cache)
+            if getattr(self, "_weg2_post_wake_pass_n", None) is not None:
+                _irl = getattr(self, "_weg2_gnbp_initr", None)
+                if _irl is None:
+                    _irl = self._weg2_gnbp_initr = []
+                _irl.append((str(getattr(req, "rid", "?"))[:10], (time.perf_counter() - _ir_t0) * 1000.0))
 
             # WEG2_SCHEDULING_SPEC_0907 C11/W31 -- LAW 4, ENFORCED WHERE THE
             # UNCACHED EXTENT IS REAL.
@@ -18073,6 +18079,9 @@ class Scheduler(
         _arl = getattr(self, "_weg2_gnbp_addreq", None) or []
         self._weg2_gnbp_addreq = None
         _addreq = " ".join(f"{rid}:{ms:.0f}ms/hit{hit}" for rid, ms, hit in _arl[:8]) or "-"
+        _irl = getattr(self, "_weg2_gnbp_initr", None) or []
+        self._weg2_gnbp_initr = None
+        _initr = " ".join(f"{rid}:{ms:.0f}ms" for rid, ms in _irl[:8]) or "-"
         try:
             from sglang.srt.managers import schedule_policy as _sp
             _lb_ms, _lb_n = float(_sp.WEG2_ADMIT_T.get("lb_ms", 0.0)), int(_sp.WEG2_ADMIT_T.get("lb_n", 0))
@@ -18083,13 +18092,13 @@ class Scheduler(
         logger.info(
             "WEG2-POST-WAKE-PASS n=%d mode=%s bs=%d gap_ms=%.0f schedule_ms=%.0f run_ms=%.0f "
             "prefetch_ms=%.0f proc_input_ms=%.0f admission_ms=%.0f init_new_ms=%.0f prepare_ms=%.0f "
-            "addreq=[%s] init_load_back_ms=%.0f/%d "
+            "addreq=[%s] init_load_back_ms=%.0f/%d init_next_round=[%s] "
             "(gap = wall since the previous pass; schedule = get_next_batch_to_run incl. the three "
             "prefill terms; run is the launch, the forward itself overlaps)",
             n, mode, bs, ((now - prev) * 1000.0) if prev is not None else -1.0,
             _pt_read(self, "_1466_schedule_ms"), _pt_read(self, "_1466_run_ms"),
             _pt_read(self, "_1474_prefetch_ms"), _pt_read(self, "_1475_process_input_ms"),
-            _g[0], _g[1], _g[2], _addreq, _lb_ms, _lb_n,
+            _g[0], _g[1], _g[2], _addreq, _lb_ms, _lb_n, _initr,
         )
 
     def _weg2_intake_stall_observe(self, req, adder, note: str = "",
