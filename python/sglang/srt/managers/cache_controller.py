@@ -798,6 +798,9 @@ def _weg2_draft_pool_executor():
 
 
 
+from sglang.srt.weg2.handoff_keys import first_mismatch
+
+
 def weg2_suffixed_stems(backend, keys):
     """Posten 2 (18.09.): the store suffix of a key depends only on its CLASS
     (the tail after the last '.', or '' for a bare KV page hash -- see
@@ -815,6 +818,9 @@ def weg2_suffixed_stems(backend, keys):
             suf = memo[cls] = backend._suffix_for_key(k)[0]
         out.append(k + suf)
     return out
+
+
+WEG2_HANDOFF_PAGE_KEYS: dict = {}  # rid -> P's page keys for the span the dormant prefetch asks (weg2.handoff_keys)
 
 
 class HiCacheController:
@@ -3502,6 +3508,19 @@ class HiCacheController:
         page_hashes = self.get_hash_str(
             tokens_to_fetch, last_hash, page_size=self.page_size
         )
+        # xsn328/329: a held request reads with P's handed-over page keys
+        # (weg2.handoff_keys); its own hashes agreed with P's for the first
+        # 64 tokens only. The first mismatch is named once.
+        _hk = WEG2_HANDOFF_PAGE_KEYS.get(operation.request_id)
+        if _hk and len(_hk) >= len(page_hashes):
+            _hk = list(_hk[:len(page_hashes)])
+            _mm = first_mismatch(page_hashes, _hk)
+            _hn = getattr(self, "_1442_keys_n", 0) + 1
+            self._1442_keys_n = _hn
+            if _hn <= 12 or _hn % 256 == 0:
+                logger.info("#1442 HANDOFF-KEYS rid=%s pages=%d first_mismatch=%s last_hash=%s (own vs P's keys; P's are used)",
+                            operation.request_id, len(_hk), _mm, (last_hash or "")[:12])
+            page_hashes = _hk
 
         for start in range(0, len(page_hashes), STORAGE_BATCH_SIZE):
             if operation.is_terminated():

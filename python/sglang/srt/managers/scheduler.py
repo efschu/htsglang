@@ -5192,6 +5192,12 @@ class Scheduler(
         the waiting queue in arrival order. Called by the resume handler
         AFTER flush_cache, so the idle witness saw an empty queue."""
         hold = getattr(self, "weg2_dormant_hold", None) or []
+        try:  # xsn329: the handed-over keys served the hold; the wake re-admits from the tree
+            from sglang.srt.managers import cache_controller as _cc
+            for _r in hold:
+                _cc.WEG2_HANDOFF_PAGE_KEYS.pop(getattr(_r, "rid", None), None)
+        except Exception:  # noqa: BLE001
+            pass
         if not hold:
             return 0
         # #1471: ONLY A COMPLETE READ JOINS THE QUEUE AT THE WAKE.  weg2xsn229
@@ -5903,6 +5909,26 @@ class Scheduler(
         _ongoing = getattr(self.tree_cache, "ongoing_prefetch", None)
         _was_registered = _ongoing is not None and req.rid in _ongoing
         _gate_before = _gate_snapshot()
+        # xsn328/329: read with P's handed-over page keys (#1442) -- D's own
+        # hashes of the same prompt matched P's for the first 64 tokens only,
+        # so the dormant hold's re-reads answered zero until the wake.
+        try:
+            if new_input_tokens and isinstance(req.rid, str) and req.rid.startswith("weg2-"):
+                from sglang.srt.managers import cache_controller as _cc
+                from sglang.srt.weg2 import handoff as _ho
+                from sglang.srt.weg2.handoff_keys import keys_for_span
+                _hd = getattr(req, "_weg2_handoff_page_keys", "unset")
+                if _hd == "unset":
+                    _rec = _ho.read(req.rid)
+                    _hd = list(_rec.get("page_keys") or []) if _rec else None
+                    req._weg2_handoff_page_keys = _hd
+                _span = keys_for_span(_hd, int(_matched_len), len(new_input_tokens), int(self.page_size))
+                if _span:
+                    _cc.WEG2_HANDOFF_PAGE_KEYS[req.rid] = _span
+                else:
+                    _cc.WEG2_HANDOFF_PAGE_KEYS.pop(req.rid, None)
+        except Exception as exc:  # noqa: BLE001 -- the hand-off is a shortcut, never a gate
+            logger.info("#1442 HANDOFF-KEYS n/a rid=%s (%s: %s)", req.rid, type(exc).__name__, exc)
 
         if group_decides:
             self.tree_cache.prefetch_from_storage(
