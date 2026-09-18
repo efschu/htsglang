@@ -3136,7 +3136,12 @@ class SchedulerWeightUpdaterManager:
 
         def _charge(nbytes: int):
             n = int(nbytes)
-            if not credit.debit("ipc-stage", n):
+            try:  # Task #20: free, unpromised VRAM may be staged (overdraw)
+                _free = self._weg2_free_bytes()
+                _floor = self._weg2_corridor_floor_bytes()
+            except Exception:  # noqa: BLE001 -- no probe, no overdraw
+                _free, _floor = None, None
+            if not credit.debit("ipc-stage", n, free_bytes=_free, floor_bytes=_floor):
                 logger.info(
                     "WEG2-SEQ stage-charge REFUSED %d MiB: the card's credit balance "
                     "is what the waking rank is promised; host path for this tag",

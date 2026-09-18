@@ -1051,7 +1051,8 @@ class VramCredit:
             self._store(handle, state)
             return total
 
-    def debit(self, tag: str, nbytes: int) -> bool:
+    def debit(self, tag: str, nbytes: int, free_bytes: Optional[int] = None,
+              floor_bytes: Optional[int] = None) -> bool:
         """S takes device bytes BACK from its own published credit for a
         transient it parks on this card: the on-card IPC staging of a
         deposit lane (weg2xsn269, 18.09.). The staging is a cudaMalloc on
@@ -1071,10 +1072,32 @@ class VramCredit:
                 return False
             credit = int(state.get("credit_bytes", 0))
             consumed = int(state.get("consumed_bytes", 0))
+            staged = int(state.get("staged_bytes", 0))
             if credit - consumed < want:
-                return False
+                # Task #20 (18.09., xsn302-309): at the START of a leg nothing is
+                # published yet, so every on-card staging fell to the host path
+                # (PP0: 5 x 1309 MiB per flip, ~1 s). The card's FREE VRAM at
+                # that moment is large (the sleeper's KV pool went first,
+                # sleep-kv precedes the legs): bytes that are free AND not
+                # promised to the waker (credit - consumed) AND not already
+                # staged may be staged. Booked as OVERDRAWN staging: it counts
+                # in staged_bytes (the waker's early exit subtracts it) but not
+                # in consumed_bytes (the waker's counter balance is untouched).
+                if free_bytes is None:
+                    return False
+                promised = max(0, credit - consumed)
+                floor = max(0, int(floor_bytes or 0))
+                if int(free_bytes) - floor - promised - staged < want:
+                    return False
+                state["overdraw_bytes"] = int(state.get("overdraw_bytes", 0)) + want
+                state["staged_bytes"] = staged + want
+                stagings = list(state.get("stagings", []))
+                stagings.append(str(tag) + ":overdraw")
+                state["stagings"] = stagings
+                self._store(handle, state)
+                return True
             state["consumed_bytes"] = consumed + want
-            state["staged_bytes"] = int(state.get("staged_bytes", 0)) + want
+            state["staged_bytes"] = staged + want
             stagings = list(state.get("stagings", []))
             stagings.append(str(tag))
             state["stagings"] = stagings
@@ -1092,7 +1115,11 @@ class VramCredit:
             staged = int(state.get("staged_bytes", 0))
             give = min(want, staged)
             state["staged_bytes"] = staged - give
-            state["consumed_bytes"] = max(0, int(state.get("consumed_bytes", 0)) - give)
+            # an overdrawn staging never touched consumed_bytes: refund it first
+            over = int(state.get("overdraw_bytes", 0))
+            from_over = min(give, over)
+            state["overdraw_bytes"] = over - from_over
+            state["consumed_bytes"] = max(0, int(state.get("consumed_bytes", 0)) - (give - from_over))
             self._store(handle, state)
 
     def leg_complete(self) -> None:
