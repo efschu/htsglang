@@ -7867,6 +7867,65 @@ class Scheduler(
     def stash_chunked_request(self, req: Req):
         maybe_cache_unfinished_req(req, self.tree_cache, chunked=True)
 
+    def process_pending_weg2_park(self) -> None:
+        """Punkt 2 (user order 18.09., law of 07.09. item 3): THE YOUNGEST PARKS.
+
+        The adder's #679 branch parks a chunked request IN PLACE when the
+        pool cannot fund its next chunk (`weg2_pool_parked`, group-uniform:
+        `fundable_extend_tokens` reads the uniform floor). Its rows then sit
+        on the device doing nothing while the waiting queue starves. Here,
+        at the head of the step and once no chunk of it is in flight, the
+        request gives its rows BACK: the computed span is inserted into the
+        tree (`release_kv_cache(is_insert=True)`: KV rows, the Mamba/GDN
+        checkpoint of the node, the draft rows) as an EVICTABLE path -- the
+        next allocation demotes it to the host arena -- and the request goes
+        back to the head of the waiting queue. Its resume is the ordinary
+        re-admission (prefix match, `load_back`), admitted WHOLE (the adder
+        skips per-chunk admission for a parked request) so it cannot
+        ping-pong on a tight pool.
+
+        Only when somebody is waiting: a park with nobody to make room for
+        is a pure loss. `process_pending_chunked_abort` is the shape; the
+        difference is `is_insert=True` and no abort to the tokenizer.
+        """
+        req = getattr(self, "chunked_req", None)
+        if req is None or not getattr(req, "weg2_pool_parked", False):
+            return
+        if getattr(req, "finished", lambda: False)() or req.req_pool_idx is None:
+            req.weg2_pool_parked = False
+            return
+        if int(getattr(req, "inflight_middle_chunks", 0) or 0) > 0:
+            return  # a launched chunk still writes its rows; try next step
+        if not getattr(self, "waiting_queue", None):
+            return  # nobody to make room for: keep the in-place park (#679)
+        try:
+            from sglang.srt.weg2.park import park_active
+            if not park_active():
+                return
+        except Exception:  # noqa: BLE001
+            return
+        span = int(len(getattr(req, "prefix_indices", ()) or ()))
+        rid = str(getattr(req, "rid", "?"))
+        try:
+            release_kv_cache(req, self.tree_cache, is_insert=True)
+        except Exception:  # noqa: BLE001 -- a failed park must not kill the rank
+            logger.warning("WEG2-PARK rid=%s: release raised, keeping the in-place park",
+                           rid[:16], exc_info=True)
+            return
+        req.weg2_pool_parked = False
+        req.weg2_parked_span = max(1, span)
+        req.reset_for_retract()
+        self.chunked_req = None
+        self._add_request_to_queue(req, is_retracted=True)
+        n = getattr(self, "_weg2_park_n", 0) + 1
+        self._weg2_park_n = n
+        logger.info(
+            "WEG2-PARK n=%d rid=%s span=%d of %d: rows given back to the tree "
+            "(evictable), request back at the head of the queue; resume by "
+            "prefix match / load_back, admitted whole",
+            n, rid[:16], span, len(getattr(req, "origin_input_ids", ()) or ()),
+        )
+
     def process_pending_chunked_abort(self) -> None:
         """Abort an in-flight chunked-prefill request once it is safe to do so.
 
@@ -9609,6 +9668,7 @@ class Scheduler(
         self, running_batch: ScheduleBatch, last_batch: Optional[ScheduleBatch]
     ) -> NextBatchPlan:
         self.process_pending_chunked_abort()
+        self.process_pending_weg2_park()  # Punkt 2 (18.09.)
         if getattr(self, "weg2_post_wake_settle", None):
             self._weg2_post_wake_settle_tick()  # #1471
 

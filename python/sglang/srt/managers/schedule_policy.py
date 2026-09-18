@@ -790,6 +790,33 @@ def truncation_align_admission_error(
     ), None
 
 
+_WEG2_CHUNK_ADMIT: Optional[bool] = None
+_WEG2_PARK_ON: Optional[bool] = None
+
+
+def _weg2_chunk_admit() -> bool:
+    """Punkt 2: per-chunk admission (group P, rides with the park). Read once."""
+    global _WEG2_CHUNK_ADMIT
+    if _WEG2_CHUNK_ADMIT is None:
+        try:
+            from sglang.srt.weg2.park import chunk_admit_active
+            _WEG2_CHUNK_ADMIT = bool(chunk_admit_active())
+        except Exception:  # noqa: BLE001 -- a desk double without the module
+            _WEG2_CHUNK_ADMIT = False
+    return _WEG2_CHUNK_ADMIT
+
+
+def _weg2_park_on() -> bool:
+    global _WEG2_PARK_ON
+    if _WEG2_PARK_ON is None:
+        try:
+            from sglang.srt.weg2.park import park_active
+            _WEG2_PARK_ON = bool(park_active())
+        except Exception:  # noqa: BLE001
+            _WEG2_PARK_ON = False
+    return _WEG2_PARK_ON
+
+
 class PrefillAdder:
     def __init__(
         self,
@@ -1916,6 +1943,10 @@ class PrefillAdder:
                     req.set_extend_range(
                         len(req.prefix_indices), len(req.prefix_indices)
                     )
+                    if _weg2_park_on():
+                        # Punkt 2: the scheduler turns this in-place park into
+                        # a rows-back park at the head of the next step.
+                        req.weg2_pool_parked = True
                     logger.warning(
                         "chunked prefill PARKED: the pool can fund %d tokens, "
                         "below one page (%d). The request keeps its place and "
@@ -2209,6 +2240,19 @@ class PrefillAdder:
         # Shared Mamba pool: fold the new mamba state's shared-gap cost into
         # `total_tokens` so both `rem_total_tokens` gates reflect the joint budget.
         total_tokens += self._mamba_gap_budget_for_req(req)
+        # Punkt 2 (18.09., Weg 2 group P): ADMISSION PER CHUNK. The gate
+        # charges the NEXT chunk (+ reservation, page, mamba gap), not the
+        # whole extend; the rest is funded chunk by chunk, and when the pool
+        # cannot fund a chunk the #679 park below hands the request's rows
+        # back (`weg2_pool_parked` -> Scheduler.process_pending_weg2_park).
+        # A request that was already parked once is admitted WHOLE again
+        # (today's gate) so a tight pool cannot ping-pong it.
+        if _weg2_chunk_admit() and not getattr(req, "weg2_parked_span", 0):
+            from sglang.srt.weg2.park import chunk_admit_tokens as _cat
+            total_tokens = (
+                _cat(cand_extend_input_len, self.rem_chunk_tokens)
+                + max_new + self.page_size + self._mamba_gap_budget_for_req(req)
+            )
         # Prefill-Spill (PS1-V1a): the born-spilled current-step demand is the
         # lifetime demand MINUS the future decode (max_new) that will spill to
         # host -- i.e. just the prefill input (+ page + mamba gap). Used only if

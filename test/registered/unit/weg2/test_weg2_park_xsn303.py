@@ -57,3 +57,102 @@ def test_park_req_is_a_frozen_ring_object():
         pass
     else:
         raise AssertionError("Weg2ParkReq must be frozen")
+
+
+# ---- wiring (stage 2): adder gate, #679 flag, head-of-step park ---------------
+
+def test_adder_gate_charges_the_next_chunk_on_group_p_only():
+    from sglang.srt.managers import schedule_policy as sp
+    src = open(sp.__file__).read()
+    i = src.index("total_tokens += self._mamba_gap_budget_for_req(req)")
+    blk = src[i:i + 1200]
+    assert "_weg2_chunk_admit()" in blk and "weg2_parked_span" in blk
+    assert "chunk_admit_tokens as _cat" in blk
+    j = src.index("if grant <= 0:")
+    assert "req.weg2_pool_parked = True" in src[j:j + 600]
+    # the knobs are read once and default to OFF outside group P
+    sp._WEG2_CHUNK_ADMIT = None; sp._WEG2_PARK_ON = None
+    os.environ.pop("SGLANG_WEG2_GROUP", None)
+    assert sp._weg2_chunk_admit() is False and sp._weg2_park_on() is False
+    sp._WEG2_CHUNK_ADMIT = None; sp._WEG2_PARK_ON = None
+
+
+def _park_stand_in(sch, *, waiting, inflight=0, parked=True, pool_idx=3):
+    calls = []
+
+    class _Req:
+        rid = "weg2-1-7"
+        req_pool_idx = pool_idx
+        weg2_pool_parked = parked
+        inflight_middle_chunks = inflight
+        prefix_indices = list(range(40960))
+        origin_input_ids = list(range(99000))
+
+        def finished(self):
+            return False
+
+        def reset_for_retract(self):
+            calls.append("reset")
+
+    class _S:
+        chunked_req = _Req()
+        tree_cache = object()
+        waiting_queue = list(waiting)
+
+        def _add_request_to_queue(self, req, is_retracted=False):
+            calls.append(("queue", is_retracted))
+
+    s = _S()
+    return s, calls
+
+
+def test_head_of_step_park_gives_rows_back_and_requeues():
+    from sglang.srt.managers import scheduler as sch
+    os.environ["SGLANG_WEG2_GROUP"] = "P"
+    seen = []
+    orig = sch.release_kv_cache
+    sch.release_kv_cache = lambda req, tree, is_insert=True: seen.append(is_insert)
+    try:
+        s, calls = _park_stand_in(sch, waiting=[object()])
+        req = s.chunked_req
+        sch.Scheduler.process_pending_weg2_park(s)
+        assert seen == [True]                       # inserted, not discarded
+        assert s.chunked_req is None
+        assert calls == ["reset", ("queue", True)]
+        assert req.weg2_parked_span == 40960 and req.weg2_pool_parked is False
+        assert s._weg2_park_n == 1
+    finally:
+        sch.release_kv_cache = orig
+        os.environ.pop("SGLANG_WEG2_GROUP", None)
+
+
+def test_head_of_step_park_waits_for_inflight_chunks_and_needs_a_waiter():
+    from sglang.srt.managers import scheduler as sch
+    os.environ["SGLANG_WEG2_GROUP"] = "P"
+    seen = []
+    orig = sch.release_kv_cache
+    sch.release_kv_cache = lambda req, tree, is_insert=True: seen.append(is_insert)
+    try:
+        s, calls = _park_stand_in(sch, waiting=[object()], inflight=1)
+        sch.Scheduler.process_pending_weg2_park(s)
+        assert seen == [] and s.chunked_req is not None      # a chunk still in flight
+        s, calls = _park_stand_in(sch, waiting=[])
+        sch.Scheduler.process_pending_weg2_park(s)
+        assert seen == [] and s.chunked_req is not None      # nobody to make room for
+        s, calls = _park_stand_in(sch, waiting=[object()], parked=False)
+        sch.Scheduler.process_pending_weg2_park(s)
+        assert seen == []                                    # not #679-parked
+        os.environ["SGLANG_WEG2_GROUP"] = "D"
+        s, calls = _park_stand_in(sch, waiting=[object()])
+        sch.Scheduler.process_pending_weg2_park(s)
+        assert seen == []                                    # group D never parks here
+    finally:
+        sch.release_kv_cache = orig
+        os.environ.pop("SGLANG_WEG2_GROUP", None)
+
+
+def test_the_park_runs_at_the_head_of_the_step():
+    from sglang.srt.managers import scheduler as sch
+    src = open(sch.__file__).read()
+    i = src.index("self.process_pending_chunked_abort()\n")
+    assert "self.process_pending_weg2_park()" in src[i:i + 200]
