@@ -284,16 +284,77 @@ class ArenaMambaPoolHost(MambaPoolHost):
                  if int(r) in self._pending]
         if pairs:
             slots = torch.tensor([s for s, _ in pairs], dtype=torch.int64)
-            didx = device_indices.cpu()[torch.tensor([i for _, i in pairs], dtype=torch.int64)]
+            sel = torch.tensor([i for _, i in pairs], dtype=torch.int64)
             self.pin_slots(slots)
             dev = device_pool.mamba_cache.temporal.device
-            didx_d = didx.to(dev)
+            if device_indices.device.type == "cuda":
+                didx_d = device_indices.index_select(0, sel.pin_memory().to(dev, non_blocking=True))
+            else:
+                didx_d = device_indices[sel].to(dev)
+            if self._mamba_write_kernel(device_pool, slots, didx_d, dev):
+                return self._backup_rest(device_pool, host_indices, device_indices, io_backend, is_arena)
+            didx = didx_d.cpu()
             for l in range(int(self.num_mamba_layers)):
                 src = device_pool.mamba_cache.temporal[l].index_select(0, didx_d).to("cpu")
                 self._t_views[l].index_copy_(0, slots, src)
                 srcc = device_pool.mamba_cache.conv[0][l].index_select(0, didx_d).to("cpu")
                 for ch0, n, view in self._c_views[0][l]:
                     view.index_copy_(0, slots, srcc[:, ch0:ch0 + n].contiguous())
+        return self._backup_rest(device_pool, host_indices, device_indices, io_backend, is_arena)
+
+    def _mamba_write_kernel(self, device_pool, slots, didx_d, dev) -> bool:
+        """xsn351 (py-spy PP0): the per-layer `.to("cpu")` + index_copy_ of the
+        node's mamba state ran SYNCHRONOUSLY in the scheduler thread (~30 ms
+        per chunk). The pointer/stride kernel writes every piece (temporal row,
+        conv channel segments) straight from the card into the pinned slot on
+        the write stream; the write op's finish event covers it and the
+        complete happens at the ack, as for the KV pages. True = done here."""
+        from sglang.srt.weg2 import arena_write as _aw
+        if dev.type != "cuda" or getattr(self, "_mamba_kernel_off", False) or _aw.mamba_write_mode() != "kernel":
+            return False
+        try:
+            from sglang.jit_kernel.hicache import transfer_hicache_all_layer_mla
+            L = int(self.num_mamba_layers)
+            e_t = int(self.temporal_dtype.itemsize)
+            e_c = int(self.conv_dtype.itemsize)
+            temporal = device_pool.mamba_cache.temporal
+            conv = device_pool.mamba_cache.conv[0]
+            pieces = []
+            for l in range(L):
+                t_src = temporal[l]
+                pieces.append((self._t_views[l][0].numel() * e_t, self._t_views[l].data_ptr(),
+                               t_src.data_ptr(), t_src.stride(0) * e_t))
+                c_src = conv[l]
+                per_ch = int(c_src.shape[-1]) * e_c
+                for ch0, n, view in self._c_views[0][l]:
+                    pieces.append((n * per_ch, view.data_ptr(),
+                                   c_src.data_ptr() + ch0 * per_ch, c_src.stride(0) * e_c))
+            slots_d = slots.to(dtype=torch.int64).pin_memory().to(dev, non_blocking=True)
+            didx_d = didx_d.to(dtype=torch.int64)
+            for (es, ss), (dps, sps) in _aw.group_pieces(pieces).items():
+                transfer_hicache_all_layer_mla(
+                    ptr_dst=torch.tensor(dps, dtype=torch.uint64).pin_memory().to(dev, non_blocking=True),
+                    indices_dst=slots_d,
+                    ptr_src=torch.tensor(sps, dtype=torch.uint64).pin_memory().to(dev, non_blocking=True),
+                    indices_src=didx_d,
+                    cache_src_stride_bytes=int(ss),
+                    cache_dst_stride_bytes=int(self.arena.slot_bytes),
+                    element_size=int(es),
+                    block_quota=_aw.write_block_quota(),
+                )
+            n = getattr(type(self), "_mamba_kernel_n", 0) + 1
+            type(self)._mamba_kernel_n = n
+            if n <= 8 or n % 256 == 0:
+                logger.info("WEG2-MAMBA-WRITE n=%d states=%d pieces=%d launches=%d mode=kernel",
+                            n, int(slots.numel()), len(pieces), len(_aw.group_pieces(pieces)))
+            return True
+        except Exception as exc:  # noqa: BLE001 -- one named fallback, then the copy path
+            logger.warning("WEG2-MAMBA-WRITE kernel mode failed (%s: %s); copy mode from now on",
+                           type(exc).__name__, exc)
+            self._mamba_kernel_off = True
+            return False
+
+    def _backup_rest(self, device_pool, host_indices, device_indices, io_backend, is_arena):
         rest = (~is_arena).nonzero(as_tuple=True)[0]
         if rest.numel():
             super().backup_from_device_all_layer(

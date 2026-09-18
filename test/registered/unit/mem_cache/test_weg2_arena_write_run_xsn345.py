@@ -43,3 +43,13 @@ def test_run_pointers_address_both_runs_of_a_page():
     assert dst == [1_010_240, 1_026_624]
     assert src == [5_000, 5_000 + 12288]
     assert stride == 2 * 12288
+
+
+def test_mamba_pieces_group_by_element_size_and_stride():
+    assert aw.mamba_write_mode({}) == "kernel"
+    assert aw.mamba_write_mode({aw.MAMBA_MODE_ENV: "copy"}) == "copy"
+    pieces = [(4096, 10, 20, 4096), (4096, 11, 21, 4096), (256, 12, 22, 768), (512, 13, 23, 768), (256, 14, 24, 768)]
+    g = aw.group_pieces(pieces)
+    assert list(g.keys()) == [(4096, 4096), (256, 768), (512, 768)]
+    assert g[(4096, 4096)] == ([10, 11], [20, 21])
+    assert g[(256, 768)] == ([12, 14], [22, 24])

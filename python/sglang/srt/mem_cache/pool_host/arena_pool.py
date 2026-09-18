@@ -612,14 +612,13 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
                     logger.warning("#1427 ARENA-CLAIM REFUSED n=%d pages=%d statuses=%s (4 = no free slot)",
                                    k, len(stems), sorted({st for _, st, _ in got}))
                 return None
-        slots = []
-        for slot, st, gen in got:
-            if st == 2:
-                arena.ref_slots([slot], +1)      # complete already: reader reference only
-            else:
-                self._pending[slot] = (gen, st == 0)
-            slots.append(slot)
-        return slots
+        # xsn352 (py-spy PP0): the per-slot loop was ~27 ms per 4096-page node
+        # in the scheduler thread -- batched: one dict update, one ref call.
+        self._pending.update((slot, (gen, st == 0)) for slot, st, gen in got if st != 2)
+        complete = [slot for slot, st, _ in got if st == 2]
+        if complete:
+            arena.ref_slots(complete, +1)        # complete already: reader reference only
+        return [slot for slot, _, _ in got]
 
     def alloc_write(self, hashes) -> Optional[torch.Tensor]:
         """KV role: one arena slot per page hash, claimed for a direct write.

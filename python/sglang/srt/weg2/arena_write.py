@@ -61,3 +61,25 @@ def run_pointers(data_base: int, k_off: int, v_off: int, run_bytes: int, stage_p
     dst = [int(data_base) + int(k_off), int(data_base) + int(v_off)]
     src = [int(stage_ptr), int(stage_ptr) + int(run_bytes)]
     return dst, src, 2 * int(run_bytes)
+
+
+MAMBA_MODE_ENV = "SGLANG_WEG2_MAMBA_WRITE_MODE"   # kernel (default) | copy
+
+
+def mamba_write_mode(env: Optional[Mapping[str, str]] = None) -> str:
+    env = os.environ if env is None else env
+    v = str(env.get(MAMBA_MODE_ENV, "kernel")).strip().lower()
+    return v if v in ("kernel", "copy") else "kernel"
+
+
+def group_pieces(pieces):
+    """xsn351: the mamba state's D2H pieces (temporal row per layer, conv
+    channel segments per layer) grouped by element size -- one pointer/stride
+    kernel launch per size. pieces: (element_size, dst_ptr, src_ptr, src_stride).
+    Returns {(element_size, src_stride): ([dst_ptrs], [src_ptrs])} in first-seen order."""
+    out = {}
+    for es, dp, sp, ss in pieces:
+        key = (int(es), int(ss))
+        d, s = out.setdefault(key, ([], []))
+        d.append(int(dp)); s.append(int(sp))
+    return out
