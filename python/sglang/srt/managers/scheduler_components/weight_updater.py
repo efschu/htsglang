@@ -7818,7 +7818,14 @@ class SchedulerWeightUpdaterManager:
                     if (GPU_MEMORY_TYPE_KV_CACHE in self.offload_tags
                             and not _weg2_kv_resumed_early
                             and not (_kv_epoch is not None and self._weg2_kv_resumed_epoch == _kv_epoch)
-                            and str(os.environ.get("SGLANG_WEG2_WAKE_KV_MID", "1")).strip().lower()
+                            # DEFAULT OFF (xsn377): the decision is per rank, and it
+                            # differed (TP1 6.5 GB funded, TP0 12.3 GB never) -- the
+                            # preload then moved one rank's prefixes and the extend
+                            # died on PrefixLensRankDivergence. A group-uniform verdict
+                            # would be the tightest rank's (TP0: never before the last
+                            # tag), so this stays a lever for a STAGED pool, not for
+                            # the whole one.
+                            and str(os.environ.get("SGLANG_WEG2_WAKE_KV_MID", "0")).strip().lower()
                             not in ("0", "false", "no", "off")):
                         try:
                             from sglang.srt.weg2.wake_kv import kv_mid_ok as _kv_mid_ok
