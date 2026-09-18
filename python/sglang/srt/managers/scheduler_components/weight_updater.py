@@ -561,6 +561,8 @@ class SchedulerWeightUpdaterManager:
     _weg2_seam_finisher: Any = None
     #: xsn261: the boot-time lane-buffer registration thread (or None).
     _weg2_prewarm_thread: Any = None
+    _weg2_bar1: Any = None            # BAR1 lanes registry (weg2/bar1_lanes.py), built at boot
+    _weg2_bar1_thread: Any = None     # its setup thread (windows served, peers mapped)
     #: weg2xsn269/270: the VramCredit of the leg this rank is SLEEPING
     #: through (set in release_memory_occupation, read by
     #: _weg2_stage_charge). A slots dataclass: an undeclared attribute
@@ -632,6 +634,11 @@ class SchedulerWeightUpdaterManager:
             # populate before cudaHostRegister (register_ms 22-92 instead of
             # 5000-21000), and that stays on the lazy path. An exact
             # slot-parity sizing can re-enable this later (=1).
+            # 18.09. BAR1 lanes (user order): the registry object exists on
+            # EVERY rank before its thread runs, so a depositor without a
+            # mapped peer writes mode=host at once and no collector waits
+            # for a mode file that never comes.
+            self._weg2_bar1_start()
             if (os.environ.get("SGLANG_WEG2_LANE_PREWARM", "0") or "0") != "1":
                 return
             import threading
@@ -642,6 +649,43 @@ class SchedulerWeightUpdaterManager:
             t.start()
         except Exception as exc:  # noqa: BLE001 -- a warm-up never breaks a boot
             logger.info("WEG2-LANE-PREWARM not started: %r", exc)
+
+    def _weg2_bar1_start(self) -> None:
+        """Build the BAR1 lane registry (weg2/bar1_lanes.py) and run its
+        setup on a helper thread: this rank serves a window for every cross
+        lane it RECEIVES on and maps the peer window of every lane it SENDS
+        on. Refusals are named per lane; the leg falls back to the host
+        buffer for that lane only."""
+        try:
+            from sglang.srt.weg2 import bar1_lanes as b1
+            from sglang.srt.weg2 import weight_exchange_region as xr
+            import torch
+
+            if not b1.lanes_on():
+                logger.info("WEG2-BAR1 off (%s=0): host lanes", b1.ENV_ON)
+                return
+            boot_nonce = (os.environ.get(xr.ENV_REGION_BOOT, "") or "").strip()
+            group = self._weg2_group_name()
+            rank = self._weg2_rank()
+            if not boot_nonce or not group or rank is None or int(rank) < 0:
+                logger.info("WEG2-BAR1 skipped: boot=%r group=%r rank=%r",
+                            boot_nonce, group, rank)
+                return
+            rank = int(rank)
+            device = int(torch.cuda.current_device())
+            lanes = [f"p{i}" for i, (s, d) in enumerate(xr.CROSS_PAIRS)
+                     if rank in (int(s), int(d))]
+            reg = b1.Bar1Lanes(boot_nonce, group, rank, device, xr.CROSS_PAIRS,
+                               log=logger.info)
+            self._weg2_bar1 = reg
+            import threading
+
+            t = threading.Thread(target=reg.setup, args=(lanes,),
+                                 name="weg2-bar1-setup", daemon=True)
+            self._weg2_bar1_thread = t
+            t.start()
+        except Exception as exc:  # noqa: BLE001 -- a lane setup never breaks a boot
+            logger.info("WEG2-BAR1 not started: %r", exc)
 
     def _weg2_prewarm_lanes(self, *, manifests_ready=None, lane_bytes_of=None,
                             persist=None, family=None, poll_s: float = 2.0,
@@ -6185,7 +6229,34 @@ class SchedulerWeightUpdaterManager:
                         # so it is the cheap half of the trade.
                         _lane_bytes = sum(int(getattr(d, "nbytes", 0) or 0)
                                           for d in _lane_descs)
-                        last = bx.run_sequential_units(
+                        # 18.09. BAR1 lanes: the depositor decides per tag
+                        # (peer window mapped or not) and writes mode.<seq>;
+                        # the collector waits for that file first. Diagonal
+                        # lanes (pair None) stay on the on-card IPC form.
+                        from sglang.srt.weg2 import bar1_lanes as b1
+                        _b1 = getattr(self, "_weg2_bar1", None)
+                        _b1_role = (_b1.role(_lane_key)
+                                    if (_b1 is not None and pair is not None) else None)
+                        _b1_mode = None
+                        if (_b1_role is not None
+                                and (_b1_role == "src") == (phase == bx.PHASE_DEPOSIT)):
+                            _b1_mode = _b1.lane_mode(
+                                _lane_key, _b1_role, seq=_seq,
+                                liveness=self._weg2_cocard_peer_alive)
+                            if _b1_mode != b1.MODE_BAR1:
+                                logger.info("WEG2-BAR1 lane=%s phase=%s seq=%d via=host "
+                                            "reason=%s", _lane_key, phase, int(_seq),
+                                            (_b1.refusals.get(_lane_key, "peer decided host")
+                                             if _b1_role == "src" else "depositor decided host"))
+                        if _b1_mode == b1.MODE_BAR1:
+                            last = b1.run_bar1_units(
+                                _lane_descs, ops, lanes=_b1, lane_key=_lane_key,
+                                role=_b1_role, seq=int(_seq), phase=phase,
+                                no_write=getattr(self, "_weg2_xchg_no_write", None),
+                                liveness=self._weg2_cocard_peer_alive,
+                                device=device, log=logger.info)
+                        else:
+                          last = bx.run_sequential_units(
                             _lane_descs, ops, boot_nonce,
                             shm_root=root, device=device, phase=phase,
                             slot_bytes=_lane_bytes or xr.SLOT_BYTES,
