@@ -2670,7 +2670,27 @@ class ModelRunnerKVCacheMixin:
             mamba_slots_per_running_req,
         )
 
-        return min(ratio, mamba_slots_per_running_req(self.server_args))
+        ratio = min(ratio, mamba_slots_per_running_req(self.server_args))
+        # Nutzer 18.09. ("Mamba-Zustandspool-Ratio auf 3 runter"): a cap from
+        # the environment, never below the hard floor of the running set
+        # (mamba_hard_floor per request = what a request structurally needs).
+        cap = os.environ.get("SGLANG_WEG2_MAMBA_RATIO", "").strip()
+        if cap:
+            try:
+                from sglang.srt.mem_cache.mamba_pool_floor import mamba_hard_floor
+                want = int(cap)
+                floor_per_req = max(1, int(mamba_hard_floor(self.server_args, 1)))
+                capped = max(want, floor_per_req)
+                if capped < ratio:
+                    logger.info("WEG2-MAMBA-RATIO cap=%d floor_per_req=%d ratio %d -> %d",
+                                want, floor_per_req, ratio, capped)
+                    ratio = capped
+                elif want < floor_per_req:
+                    logger.info("WEG2-MAMBA-RATIO cap=%d below the floor %d: kept %d",
+                                want, floor_per_req, ratio)
+            except Exception:  # noqa: BLE001 -- a cap must never break sizing
+                logger.warning("WEG2-MAMBA-RATIO cap ignored", exc_info=True)
+        return ratio
 
     def _validate_prefill_only_disable_kv_cache_pool_family(
         self: ModelRunner,
