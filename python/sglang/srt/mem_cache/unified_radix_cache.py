@@ -3580,6 +3580,13 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         cc = self.cache_controller
         stats["draft_issued"] = int(getattr(cc, "_draft_l3_write_issued", 0) or 0)
         stats["draft_refused"] = int(getattr(cc, "_draft_l3_write_refused", 0) or 0)
+        if n % 256 == 0 and self.component_protected_size_.get(BASE_COMPONENT_TYPE, 0) > 0:
+            # Punkt 1 (18.09.): WHO holds device rows, sampled every 256th sweep
+            # (~40 s) -- names the holder without waiting for an intake stall.
+            try:
+                logger.warning("WEG2-LOCK-CENSUS sweep=%d %s", n, self.weg2_lock_census_str(limit=4))
+            except Exception:  # noqa: BLE001 -- the census never breaks the sweep
+                logger.warning("WEG2-LOCK-CENSUS raised", exc_info=True)
         if stats["unbacked"] or n <= 4 or n % 64 == 0:
             logger.warning(
                 "WEG2 PUBLISH-SWEEP n=%d unbacked=%d issued=%d refused=%d skipped_pending=%d "

@@ -144,3 +144,11 @@ def test_the_stall_site_logs_the_census():
     i = src.index("WEG2-INTAKE-STALL-CENSUS rid=")
     blk = src[i - 600:i + 400]
     assert "weg2_lock_census_str" in blk and "available_size()" in blk
+
+
+def test_the_sweep_samples_the_lock_census():
+    from sglang.srt.mem_cache import unified_radix_cache as urc
+    src = open(urc.__file__).read()
+    i = src.index("WEG2-LOCK-CENSUS sweep=")
+    blk = src[i - 500:i + 200]
+    assert "n % 256 == 0" in blk and "weg2_lock_census_str(limit=4)" in blk
