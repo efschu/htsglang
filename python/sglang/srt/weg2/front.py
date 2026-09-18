@@ -69,6 +69,10 @@ from aiohttp import (
 )
 
 from sglang.srt.weg2.intake_stall import is_intake_stall, is_too_large  # weg2xsn272
+
+#: weg2xsn291: the least a woken group keeps the cards even when fairness or
+#: work-exhaustion override the derived min-dwell (see Front._dwell_ok).
+FAIRNESS_DWELL_FLOOR_MS = 2000.0
 from sglang.srt.managers import corridor_guard
 from sglang.srt.managers.corridor_guard import (
     corridor_band_ceiling_mib,
@@ -4704,7 +4708,14 @@ class Front:
             overridden = "fairness"
         elif work_exhausted and self.w_s > 0 and oldest_wait_s >= self.w_s:
             overridden = "work"
-        ok = awake_ms >= need or overridden != "none"
+        # weg2xsn291: an override must not flip a group that woke 200 ms ago
+        # -- xsn291 epoch 10: D woke at :50.19, fairness fired at :50.44 for a
+        # request P can never hold, the D->P legs ran into W35/W68 and both
+        # groups died. A floor under every override: the woken group keeps
+        # the cards for at least FAIRNESS_DWELL_FLOOR_MS.
+        ok = awake_ms >= need or (
+            overridden != "none" and awake_ms >= FAIRNESS_DWELL_FLOOR_MS
+        )
         logger.info("WEG2 MIN-DWELL src=%s dst=%s awake_ms=%d derived_from_flip_ms=%d overridden_by=%s "
                     "provenance=%s verdict=%s",
                     src, dst, int(awake_ms), int(need), overridden, prov, "flip" if ok else "hold")

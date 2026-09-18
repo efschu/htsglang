@@ -638,6 +638,12 @@ def test_t10b_min_dwell_is_derived_from_the_last_flip_and_names_its_overrides():
     f.t_awake = time.time()  # just woke: dwell not served
     assert f._dwell_ok("D", "P", fairness_fired=False, work_exhausted=False,
                        oldest_wait_s=0.0) is False
+    # xsn291: an override does not flip a group that woke 200 ms ago -- the
+    # floor FAIRNESS_DWELL_FLOOR_MS holds first (xsn291 epoch 10: D woke at
+    # :50.19, fairness flipped at :50.44, W35/W68, both groups dead)
+    assert f._dwell_ok("D", "P", fairness_fired=True, work_exhausted=False,
+                       oldest_wait_s=0.0) is False
+    f.t_awake = time.time() - (front_mod.FAIRNESS_DWELL_FLOOR_MS / 1000.0) - 0.5
     assert f._dwell_ok("D", "P", fairness_fired=True, work_exhausted=False,
                        oldest_wait_s=0.0) is True
     assert f._dwell_ok("D", "P", fairness_fired=False, work_exhausted=True,
