@@ -2842,6 +2842,60 @@ def _load_native_segv_backtrace() -> None:
 _load_native_segv_backtrace()
 
 
+#: weg2xsn296 (18.09., Nutzer-Order "ALLES was runter kann in den System-RAM"):
+#: THE RESIDUE INSTRUMENT. After a sleep the process still holds ~1.0 GB (P)
+#: / ~1.5 GB (D) per card (xsn295 [weg2 sleep-acceptance] proc_used) that no
+#: tag covers. Torch's own view says which allocations those are, but only
+#: with stacks recorded from the START of the process: SGLANG_WEG2_MEMHIST=1
+#: arms torch.cuda.memory._record_memory_history at rank start; the sleep
+#: path then dumps a snapshot next to the boot's evidence (see
+#: weight_updater._weg2_log_sleep_residue) for debugtools memsnapshot_analyze.
+MEMHIST_ENV = "SGLANG_WEG2_MEMHIST"
+_MEMHIST_ARMED = False
+
+
+def _arm_memory_history() -> None:
+    global _MEMHIST_ARMED
+    if _MEMHIST_ARMED or os.environ.get(MEMHIST_ENV, "") != "1":
+        return
+    try:
+        import torch
+
+        torch.cuda.memory._record_memory_history(max_entries=200000)
+        _MEMHIST_ARMED = True
+        logger.info("WEG2-MEMHIST armed: torch allocation history with stacks (SGLANG_WEG2_MEMHIST=1)")
+    except Exception as exc:  # noqa: BLE001 -- an instrument never kills a rank
+        logger.warning("WEG2-MEMHIST NOT armed: %s", exc)
+
+
+_arm_memory_history()
+
+
+def sleep_residue_terms(
+    *, active_bytes: int, reserved_bytes: int, tagged_bytes: int, nvml_used_bytes: Optional[int]
+) -> Dict[str, int]:
+    """The post-sleep residue split three ways (all MiB-free integers, bytes):
+
+    * ``untagged_live`` -- torch allocations alive that NO tag covers: what
+      the memory saver cannot pause and the order says must go to host RAM;
+    * ``torch_reserved`` -- torch's cudaMalloc'ed segments (still counting the
+      tagged ones the saver unmapped underneath, so it is NOT device
+      residency);
+    * ``outside_torch`` -- NVML per-process bytes minus what torch holds
+      alive and untagged: CUDA context, comm windows, non-torch allocations.
+      ``None``-safe: an unreadable NVML reading yields -1 here, never 0.
+    """
+    untagged = max(0, int(active_bytes) - int(tagged_bytes))
+    outside = -1 if nvml_used_bytes is None else max(0, int(nvml_used_bytes) - untagged)
+    return {
+        "active_bytes": int(active_bytes),
+        "tagged_bytes": int(tagged_bytes),
+        "untagged_live": untagged,
+        "torch_reserved": int(reserved_bytes),
+        "outside_torch": outside,
+    }
+
+
 #: #1378 xsn66 -- ONE CACHING-ALLOCATOR POOL PER WEIGHTS TAG, process-local.
 #:
 #: torch_memory_saver tags at ``cudaMalloc`` granularity, i.e. per caching-

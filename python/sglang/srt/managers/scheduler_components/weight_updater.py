@@ -569,6 +569,7 @@ class SchedulerWeightUpdaterManager:
     _weg2_leg_credit: Any = None
     #: weg2xsn271: WEG2-CREDIT-FLOOR logged once per rank.
     _weg2_floor_noted: bool = False
+    _weg2_sleep_count: int = 0
     #: #1452b: snapshot counter -- slots=True, so it is a FIELD (boot weg2xsn208
     #: printed 'n/a (AttributeError ... _1452_snapshots)' on every rank).
     _1452_snapshots: int = 0
@@ -1228,6 +1229,67 @@ class SchedulerWeightUpdaterManager:
             logger.info("%s", census.format_line())
         else:
             logger.warning("%s", census.format_line())
+        self._weg2_log_sleep_residue(census, tags)
+
+    def _weg2_log_sleep_residue(self, census: Any, tags: Optional[List[str]]) -> None:
+        """weg2xsn296: name what is STILL on the card after the sleep and dump
+        the allocator snapshot for it (Nutzer-Order: everything that can go
+        down without killing the process goes to host RAM). Never raises."""
+        try:
+            import os
+
+            import torch
+
+            from sglang.srt.managers.weg2_memory_saver import (
+                _MEMHIST_ARMED,
+                sleep_residue_terms,
+            )
+
+            stats = torch.cuda.memory_stats()
+            active = int(stats.get("active_bytes.all.current", 0))
+            reserved = int(stats.get("reserved_bytes.all.current", 0))
+            family = set(tags or ()) | {"weights", "kv_cache", "cuda_graph", "weights_draft"}
+            family |= {f"weights_{i}" for i in range(16)}
+            tagged = 0
+            for t in sorted(family):
+                a = int(self._weg2_xchg_tag_bytes(t) or 0)
+                b = int(self._weg2_tag_resident_bytes(t) or 0)
+                tagged += max(a, b)
+            terms = sleep_residue_terms(
+                active_bytes=active, reserved_bytes=reserved, tagged_bytes=tagged,
+                nvml_used_bytes=getattr(census, "proc_used_bytes", None),
+            )
+            n = int(getattr(self, "_weg2_sleep_count", 0) or 0) + 1
+            try:
+                self._weg2_sleep_count = n
+            except Exception:  # noqa: BLE001 -- slots dataclass without the field
+                pass
+            snap = "off"
+            out_dir = os.environ.get("SGLANG_WEG2_RANKDUMP_DIR", "")
+            if _MEMHIST_ARMED and out_dir:
+                path = os.path.join(
+                    out_dir,
+                    f"memsnap_{os.environ.get('SGLANG_WEG2_GROUP', 'X')}_pid{os.getpid()}_sleep{n}.pickle",
+                )
+                try:
+                    torch.cuda.memory._dump_snapshot(path)
+                    snap = path
+                except Exception as exc:  # noqa: BLE001
+                    snap = f"failed:{type(exc).__name__}"
+            logger.info(
+                "WEG2-SLEEP-RESIDUE sleep=%d untagged_live=%d MiB tagged=%d MiB torch_active=%d MiB "
+                "torch_reserved=%d MiB nvml_proc_used=%s MiB outside_torch=%s MiB snapshot=%s "
+                "(untagged_live = torch active minus every tag's bytes: what no pause covers; "
+                "outside_torch = NVML per-process minus untagged_live: context + comm windows)",
+                n, terms["untagged_live"] >> 20, terms["tagged_bytes"] >> 20, active >> 20,
+                reserved >> 20,
+                "n/a" if getattr(census, "proc_used_bytes", None) is None
+                else int(census.proc_used_bytes) >> 20,
+                "n/a" if terms["outside_torch"] < 0 else terms["outside_torch"] >> 20,
+                snap,
+            )
+        except Exception as exc:  # noqa: BLE001 -- an instrument never kills the sleep
+            logger.info("WEG2-SLEEP-RESIDUE instrument raised (%s: %s)", type(exc).__name__, str(exc)[:160])
 
     #: The four possible carriers of the weight bytes on a wake.  Module-level
     #: strings on the class rather than literals at the branches: the seam's
