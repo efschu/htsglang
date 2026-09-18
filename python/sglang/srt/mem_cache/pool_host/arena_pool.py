@@ -286,6 +286,8 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
         self.arena = arena
         self.arena_slots = A
         self._pending_mask = torch.zeros(int(A), dtype=torch.bool)
+        self._pending_gen = torch.zeros(int(A), dtype=torch.int64)     # xsn359: generation per pending slot
+        self._pending_fresh = torch.zeros(int(A), dtype=torch.bool)   # xsn359: fresh claim (free on abort)
         self.id_space = self.staging_rows + A + PLACEHOLDERS
         self.prefetch_capacity_tokens = A
         if role == "draft":
@@ -572,10 +574,72 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
         )
 
     # -- #1427 Stufe 4: direct writes, card -> arena slot -------------------------
+    def _claim_np(self, stems, totals):
+        """xsn359: the KV/draft pool's claim on numpy arrays -- one C call, the
+        pending state as mask/gen/fresh tensors, no per-slot Python."""
+        import numpy as np
+        arena = self.arena
+        slots, st, gens = arena.claim_slots_np(stems, totals)
+        _cn = getattr(ArenaMHAHostPool, "_1427_claim_n", 0) + 1
+        ArenaMHAHostPool._1427_claim_n = _cn
+        if _cn <= 12 or _cn % 512 == 0:
+            logger.info("#1427 ARENA-CLAIM n=%d stems=%d first=%s last=%s statuses=%s arena=%s",
+                        _cn, len(stems), stems[0] if stems else "-", stems[-1] if stems else "-",
+                        sorted(set(st.tolist())), getattr(arena, "path", "?"))
+        bad = (st == 3) | (st == 4)
+        if bool(bad.any()):
+            ev = getattr(self._backend, "_arena_evict_to_disk", None)
+            if callable(ev) and bool((st == 4).any()):
+                try:
+                    ev(arena, max(256, len(stems)))
+                except Exception as exc:  # noqa: BLE001 - loud, the claim below decides
+                    logger.warning("#1427 arena evict-to-disk failed: %r", exc)
+                redo = np.nonzero(st == 4)[0]
+                s2, st2, g2 = arena.claim_slots_np([stems[int(i)] for i in redo], [self._page_bytes] * int(redo.size))
+                slots[redo] = s2; st[redo] = st2; gens[redo] = g2
+                bad = (st == 3) | (st == 4)
+            if bool(bad.any()):
+                fresh = slots[st == 0]
+                if fresh.size:
+                    arena.free_slots(fresh.tolist())
+                k = getattr(ArenaMHAHostPool, "_1427_full_n", 0) + 1
+                ArenaMHAHostPool._1427_full_n = k
+                if k <= 8 or k % 256 == 0:
+                    logger.warning("#1427 ARENA-CLAIM REFUSED n=%d pages=%d statuses=%s (4 = no free slot)",
+                                   k, len(stems), sorted(set(st.tolist())))
+                return None
+        pend = st != 2
+        if bool(pend.any()):
+            idx = torch.from_numpy(slots[pend])
+            self._pending_mask[idx] = True
+            self._pending_gen[idx] = torch.from_numpy(gens[pend])
+            self._pending_fresh[idx] = torch.from_numpy(st[pend] == 0)
+        complete = slots[st == 2]
+        if complete.size:
+            arena.ref_slots(complete.tolist(), +1)        # complete already: reader reference only
+        return slots.tolist()
+
+    def _pend_take(self, slots_t: torch.Tensor):
+        """xsn359: (pending-mask over slots_t, gens, fresh) and CLEAR them -- the
+        vectorised form of one _pend_pop per slot."""
+        m = self._pending_mask[slots_t]
+        sel = slots_t[m]
+        gens = self._pending_gen[sel].clone()
+        fresh = self._pending_fresh[sel].clone()
+        self._pending_mask[sel] = False
+        return m, sel, gens, fresh
+
     def _pend_mark(self, slots, value: bool) -> None:
         m = self._pending_mask
         if m is not None and slots:
             m[torch.as_tensor(list(slots), dtype=torch.int64)] = value
+
+    def _pend_has(self, slots):
+        """pending? per slot (list of bool), mask or dict."""
+        if self._pending_mask is not None:
+            t = torch.as_tensor(list(slots), dtype=torch.int64)
+            return self._pending_mask[t].tolist() if t.numel() else []
+        return [s in self._pending for s in slots]
 
     def _pend_pop(self, s):
         p = self._pending.pop(s, None)
@@ -596,6 +660,8 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
         freed again so the key is not poisoned."""
         arena = self.arena
         totals = [self._page_bytes] * len(stems)
+        if self._pending_mask is not None:
+            return self._claim_np(stems, totals)
         got = arena.claim_slots(stems, totals)
         # xsn327: D's dormant re-reads never find P's pages -- name what P claims
         # (full stem incl. suffix) so the reader's stem can be compared by eye.
@@ -690,8 +756,9 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
         slots = self._claim(self._stems(hashes, comp))
         if slots is None:
             return 0
-        pending_idx = [i for i, s in enumerate(slots) if s in self._pending]
-        complete_idx = [i for i, s in enumerate(slots) if s not in self._pending]
+        _isp = self._pend_has(slots)
+        pending_idx = [i for i, p in enumerate(_isp) if p]
+        complete_idx = [i for i, p in enumerate(_isp) if not p]
         if pending_idx:
             sl = torch.tensor([slots[i] for i in pending_idx], dtype=torch.int64)
             di = device_indices.reshape(-1)[torch.tensor(pending_idx, device=device_indices.device)]
@@ -823,7 +890,8 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
         else:
             rows = (hi[sel] - S).tolist()
             pairs = [(self.row_slot.get(int(r), -1), i) for r, i in zip(rows, sel.tolist())]
-            todo = [(s, i) for s, i in pairs if s >= 0 and s in self._pending]
+            _isp = self._pend_has([s for s, _ in pairs])   # xsn359: mask or dict
+            todo = [(s, i) for (s, i), p in zip(pairs, _isp) if s >= 0 and p]
             if todo:
                 slots = torch.tensor([s for s, _ in todo], dtype=torch.int64)
                 sel = torch.tensor([i for _, i in todo], dtype=torch.int64)
@@ -858,6 +926,27 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
         this call completed for everyone."""
         if self.arena is None:
             return 0
+        if self._pending_mask is not None:
+            # xsn359: vectorised -- mask/gen/fresh tensors, one C call, no per-slot loop
+            import numpy as np
+            all_t = torch.as_tensor([s for s in self._slots_of(host_indices) if s >= 0], dtype=torch.int64)
+            if all_t.numel() == 0:
+                return 0
+            _, sel, gens, _fresh = self._pend_take(all_t)
+            if sel.numel() == 0:
+                return 0
+            st = self.arena.complete_slots_np(sel.numpy(), gens.numpy(), self._own_extents)
+            lost = int((st == 3).sum())
+            if lost:
+                k = getattr(ArenaMHAHostPool, "_1427_lost_n", 0) + lost
+                ArenaMHAHostPool._1427_lost_n = k
+                if k <= 8 or k % 256 < lost:
+                    logger.warning("#1427 ARENA-COMPLETE LOST slots=%s (recycled under the writer) n=%d",
+                                   sel.numpy()[st == 3][:4].tolist(), k)
+            keep = sel.numpy()[st != 3]
+            if keep.size:
+                self.arena.ref_slots(keep.tolist(), +1)
+            return int((st == 1).sum())
         slots = [s for s in self._slots_of(host_indices) if s >= 0 and s in self._pending]
         if not slots:
             return 0
@@ -882,14 +971,21 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
         if self.arena is None:
             return
         fresh, refd = [], []
-        for s in self._slots_of(host_indices):
-            if s < 0:
-                continue
-            p = self._pend_pop(s)
-            if p is None:
-                refd.append(s)
-            elif p[1]:
-                fresh.append(s)
+        if self._pending_mask is not None:
+            all_t = torch.as_tensor([s for s in self._slots_of(host_indices) if s >= 0], dtype=torch.int64)
+            if all_t.numel():
+                m, sel, _g, fr = self._pend_take(all_t)
+                refd = all_t[~m].tolist()
+                fresh = sel[fr].tolist()
+        else:
+            for s in self._slots_of(host_indices):
+                if s < 0:
+                    continue
+                p = self._pend_pop(s)
+                if p is None:
+                    refd.append(s)
+                elif p[1]:
+                    fresh.append(s)
         if fresh:
             self.arena.free_slots(fresh)
         if refd:
@@ -957,12 +1053,20 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
                 slots = [s for s in slots if s >= 0]
             else:
                 slots = rows
-            pend = [s for s in slots if s in self._pending]
-            if pend:
-                fresh = [s for s in pend if self._pend_pop(s)[1]]
+            if self._pending_mask is not None:
+                st_ = torch.as_tensor(slots, dtype=torch.int64)
+                m, sel, _g, fr = self._pend_take(st_)
+                fresh = sel[fr].tolist()
                 if fresh:
                     self.arena.free_slots(fresh)
-                slots = [s for s in slots if s not in pend]
+                slots = st_[~m].tolist()
+            else:
+                pend = [s for s in slots if s in self._pending]
+                if pend:
+                    fresh = [s for s in pend if self._pend_pop(s)[1]]
+                    if fresh:
+                        self.arena.free_slots(fresh)
+                    slots = [s for s in slots if s not in pend]
             if slots:
                 self.arena.ref_slots(slots, -1)
             freed += len(rows)

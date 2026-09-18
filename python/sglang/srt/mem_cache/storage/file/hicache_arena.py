@@ -305,6 +305,40 @@ class ShmArena:
             self._lib.arena_claim(self._base, n, lo, hi, c_tot, c_stems, slots, gens, st)
         return [(int(slots[i]), int(st[i]), int(gens[i])) for i in range(n)]
 
+    def claim_slots_np(self, stems: Sequence[str], totals: Sequence[int]):
+        """xsn359: claim_slots as numpy arrays (slots int64, status int8,
+        generation int64) -- no 3 x n ctypes reads into Python tuples."""
+        import numpy as np
+        n = len(stems)
+        if n == 0:
+            return (np.zeros(0, dtype=np.int64), np.zeros(0, dtype=np.int8), np.zeros(0, dtype=np.int64))
+        c_tot = (ctypes.c_int64 * n)(*[int(t) for t in totals])
+        c_stems = (ctypes.c_char_p * n)(*[s.encode("utf-8") for s in stems])
+        slots = np.zeros(n, dtype=np.int64); gens = np.zeros(n, dtype=np.int64); st = np.zeros(n, dtype=np.int8)
+        p_slots = slots.ctypes.data_as(ctypes.POINTER(ctypes.c_int64))
+        p_gens = gens.ctypes.data_as(ctypes.POINTER(ctypes.c_int64))
+        p_st = st.ctypes.data_as(ctypes.POINTER(ctypes.c_int8))
+        rc = self._lib.arena_claim_stems(self._base, n, c_stems, c_tot, p_slots, p_gens, p_st)
+        if rc < 0:
+            lo, hi = self._keys(stems)
+            self._lib.arena_claim(self._base, n, lo, hi, c_tot, c_stems, p_slots, p_gens, p_st)
+        return slots, st, gens
+
+    def complete_slots_np(self, slots, gens, extents):
+        """xsn359: complete_slots on numpy int64 arrays; returns status int8."""
+        import numpy as np
+        n = int(len(slots))
+        if n == 0:
+            return np.zeros(0, dtype=np.int8)
+        ext = [tuple(extents)] * n
+        n_ext, c_off, c_len = self._extents(ext)
+        s_np = np.ascontiguousarray(slots, dtype=np.int64); g_np = np.ascontiguousarray(gens, dtype=np.int64)
+        st = np.zeros(n, dtype=np.int8)
+        self._lib.arena_complete(self._base, n, s_np.ctypes.data_as(ctypes.POINTER(ctypes.c_int64)),
+                                 g_np.ctypes.data_as(ctypes.POINTER(ctypes.c_int64)), n_ext, c_off, c_len,
+                                 st.ctypes.data_as(ctypes.POINTER(ctypes.c_int8)))
+        return st
+
     def complete_slots(self, slots: Sequence[int], gens: Sequence[int], extents) -> list[int]:
         """#1427: merge this writer's extents (same shape for every slot) into
         the coverage and flip COMPLETE when the page is full. status per slot:

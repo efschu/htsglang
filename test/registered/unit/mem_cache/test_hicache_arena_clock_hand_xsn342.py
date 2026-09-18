@@ -130,3 +130,29 @@ def test_the_mamba_pool_borrows_the_pending_helpers_too():
     assert p._pending_mask is None
     p._pend_mark([7], True)                      # mask None: a no-op
     assert p._pend_pop(7) == (1, True) and p._pend_pop(7) is None
+
+
+def test_claim_np_and_vectorised_complete_abort(tmp_path):
+    """xsn359: the KV pool's pending state as mask/gen/fresh tensors."""
+    import torch
+    from sglang.srt.mem_cache.pool_host.arena_pool import ArenaMHAHostPool as M
+    a = _arena(tmp_path, 4096)
+    p = M.__new__(M)
+    p.arena = a; p._backend = None; p._page_bytes = SB; p._own_extents = [(0, SB)]
+    p._pending = {}; p.staging_rows = 0; p.arena_slots = 4096; p.row_slot = None
+    p._pending_mask = torch.zeros(4096, dtype=torch.bool)
+    p._pending_gen = torch.zeros(4096, dtype=torch.int64)
+    p._pending_fresh = torch.zeros(4096, dtype=torch.bool)
+    st = _stems("v", 300)
+    slots = p._claim(st)
+    assert len(slots) == 300 and p._pending_mask.sum().item() == 300 and p._pending_fresh[slots].all()
+    # join by a second claim: pending stays 300, not fresh for the joiner? (same pool: stays fresh)
+    # complete: mask cleared, arena COMPLETE
+    done = p.complete_write(torch.as_tensor(slots))
+    assert done == 300 and p._pending_mask.sum().item() == 0
+    assert all(s2 == 2 for _, s2 in a.find_slots(st))
+    # abort of fresh claims frees them
+    st2 = _stems("w", 64)
+    slots2 = p._claim(st2)
+    p.abort_write(torch.as_tensor(slots2))
+    assert p._pending_mask.sum().item() == 0 and a.stats()["claimed"] == 0
