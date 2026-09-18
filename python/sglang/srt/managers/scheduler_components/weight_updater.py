@@ -574,6 +574,8 @@ class SchedulerWeightUpdaterManager:
     _weg2_bar1: Any = None            # BAR1 lanes registry (weg2/bar1_lanes.py), built at boot
     _weg2_bar1_thread: Any = None     # its setup thread (windows served, peers mapped)
     _weg2_flip_index_now: object = None  # the flip index of the leg in progress (BAR1 flag seq = '<flip>-<tag>')
+    _weg2_leg_tag_order: Any = None   # the wake leg's tag list (index = tag order for the tag-order gate)
+    _weg2_tag_done: Any = None        # {tag index: threading.Event}, set when that tag's collect is through
     #: weg2xsn269/270: the VramCredit of the leg this rank is SLEEPING
     #: through (set in release_memory_occupation, read by
     #: _weg2_stage_charge). A slots dataclass: an undeclared attribute
@@ -4112,6 +4114,18 @@ class SchedulerWeightUpdaterManager:
         if bx.seq_release_lanes():
             bx.release_host_lane_buffers(truncate=False, log=logger.info)
 
+    def _weg2_tag_done_set(self, tag) -> None:
+        """Mark this tag's collect as through for the tag-order gate."""
+        try:
+            order = self._weg2_leg_tag_order or []
+            events = self._weg2_tag_done or {}
+            if str(tag) in order:
+                ev = events.get(order.index(str(tag)))
+                if ev is not None:
+                    ev.set()
+        except Exception:  # noqa: BLE001 -- stubs without the fields
+            pass
+
     def _weg2_wake_collect_one(self, tag) -> None:
         """One tag's collect on the wake side (the exchange carrier), run
         inline or on the wake worker (2026-09-15, Punkt 2)."""
@@ -4129,6 +4143,7 @@ class SchedulerWeightUpdaterManager:
                 self._weg2_wake_inflight = False
             except AttributeError:
                 pass
+            self._weg2_tag_done_set(tag)
         self._weg2_xchg_collected_per_tag = True
         self._weg2_seam_after_part(tag)
         if (str(tag) == str(_DRAFT_TAG)
@@ -6262,6 +6277,22 @@ class SchedulerWeightUpdaterManager:
                                             "reason=%s", _lane_key, phase, int(_seq),
                                             (_b1.refusals.get(_lane_key, "peer decided host")
                                              if _b1_role == "src" else "depositor decided host"))
+                        if phase == bx.PHASE_COLLECT and _b1_mode != b1.MODE_BAR1:
+                            # the tag-order gate for host/IPC lanes (see the
+                            # wake loop): wait for the previous tag's collect
+                            _ord = getattr(self, "_weg2_leg_tag_order", None) or []
+                            _evs = getattr(self, "_weg2_tag_done", None) or {}
+                            _ti = _ord.index(str(tag)) if str(tag) in _ord else -1
+                            if _ti > 0 and (_ti - 1) in _evs and not _evs[_ti - 1].is_set():
+                                _tg0 = time.perf_counter()
+                                if not _evs[_ti - 1].wait(600.0):
+                                    _lane_failures.append(
+                                        f"{_lane_key}/{tag}: tag-order gate: the previous tag "
+                                        f"{_ord[_ti - 1]} was not collected within 600 s")
+                                    return
+                                logger.info("WEG2-TAG-GATE lane=%s tag=%s waited_ms=%.0f for=%s",
+                                            _lane_key, tag, (time.perf_counter() - _tg0) * 1000,
+                                            _ord[_ti - 1])
                         if _b1_mode == b1.MODE_BAR1:
                             last = b1.run_bar1_units(
                                 _lane_descs, ops, lanes=_b1, lane_key=_lane_key,
@@ -7477,6 +7508,20 @@ class SchedulerWeightUpdaterManager:
                 self._weg2_flip_index_now = _weg2_flip_index_of(getattr(recv_req, "epoch", None))
             except Exception:  # noqa: BLE001 -- the stubs carry no epoch: the counter seq stays
                 pass
+            # 18.09. (xsn369): with two collects in flight, a HOST/IPC lane
+            # (unit semaphores, slot counter) must still see its tags in
+            # order -- tag t's non-BAR1 lanes wait for tag t-1's collect
+            # (an Event per tag); BAR1 lanes run free (seq per tag, done flag).
+            import threading as _thr
+            self._weg2_leg_tag_order = [str(t) for t in weights_tags]
+            self._weg2_tag_done = {i: _thr.Event() for i in range(len(weights_tags))}
+            try:
+                if self._weg2_wake_weight_carrier() != self.CARRIER_EXCHANGE:
+                    for _ev in self._weg2_tag_done.values():
+                        _ev.set()   # no exchange collects at all: the gate never waits
+            except Exception:  # noqa: BLE001 -- stubs without a carrier
+                for _ev in self._weg2_tag_done.values():
+                    _ev.set()
             with self._weg2_pcie_lock_retired("wake-H2D " + ",".join(weights_tags)):
                 # 2026-09-15 (Punkt 2, SGLANG_WEG2_WAKE_OVERLAP default 1)
                 _wake_worker = None
@@ -7712,6 +7757,7 @@ class SchedulerWeightUpdaterManager:
                             self._weg2_wake_collect_one(tag)
                     elif (str(tag) == _WEIGHTS_DRAFT_TAG
                             and self._weg2_xchg_draft_reload_from_disk()):
+                        self._weg2_tag_done_set(tag)  # no collect: the gate must not wait for it
                         pass  # not CARRIER_EXCHANGE at all (e.g. ring, or a
                         # non-authoritative arm) -- the disk path is the only
                         # candidate; itself a no-op when the ring covers it
