@@ -5356,8 +5356,14 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 (_bytes / (_ms / 1000.0) / 1e9) if _ms > 0 else -1.0,
                 int(insert_result.prefix_len), int(loaded_from_storage),
             )
-        except Exception:  # noqa: BLE001 -- an instrument never kills the prefetch
-            logger.debug("WEG2-LOAD-DEVICE instrument raised", exc_info=True)
+        except Exception as _ie:  # noqa: BLE001 -- an instrument never kills the prefetch
+            # xsn289: 27 prefetch successes on D, 0 WEG2-LOAD-DEVICE lines and
+            # this branch silent at DEBUG -- an instrument that fails must SAY
+            # so at the level its line would have had (once per shape).
+            if not getattr(self, "_weg2_load_device_raised", False):
+                self._weg2_load_device_raised = True
+                logger.info("WEG2-LOAD-DEVICE instrument raised (%s: %s) -- suppressed after the first",
+                            type(_ie).__name__, str(_ie)[:200], exc_info=True)
         if self.enable_storage_metrics and self.storage_metrics_collector is not None:
             self.storage_metrics_collector.log_prefetched_tokens(loaded_from_storage)
         return True

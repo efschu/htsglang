@@ -41,18 +41,47 @@ def _draft_device_rows(draft_pool, device_indices, direction: str):
 _DRAFT_SKIP_LOGGED = {"n": 0}
 
 
-def _draft_rows_or_skip(draft_pool, device_indices, direction: str, *, nrows: int):
-    """weg2xsn281: ``(rows, skipped)``. The DFlash window pool on group D is
-    sized for the sub-threshold working set (ctx cap x running x factor:
-    4113 slots for a 2048-token cap); a load whose rows exceed what the pool
-    can hold -- every 100k prompt of the bs6 block, and even the 4316-token
-    smoke -- raised 'DFLASH small solo pool exhausted' on all three ranks
-    and killed the group. DFLASH does not serve an over-threshold context
-    (its writes are skipped by design, reads resolve to the zero hole
-    slot), so its draft KV is not loaded either: skipped BY NAME, the
-    target KV load runs unchanged, accept-rate only."""
+_DRAFT_WINDOW_LOGGED = {"n": 0}
+
+
+def _draft_rows_or_skip(draft_pool, device_indices, direction: str, *, nrows: int,
+                        host_indices=None):
+    """weg2xsn281/xsn288: ``(draft_rows, host_rows, skipped)``.
+
+    THE WINDOW IS THE LOAD (xsn288). DFlash2's draft attends over the last
+    ``draft_window_size`` positions only (2048; the window pool on group D
+    is sized for exactly that: 4113 slots = (2048 + 8) x running x 2). A
+    98k prefix therefore needs its LAST 2048 draft rows on D, not all 98k
+    -- xsn281 skipped the whole draft half whenever the prefix exceeded
+    the pool ("DFLASH small solo pool exhausted"), so the draft read zero
+    holes for the window's tail and accepted 2.9-3.3 (measured xsn288, five
+    98k prompts) against 5.5-5.9 on the same checkpoint with the window
+    present. Rows are the prefix in token order (the load_back node chain),
+    so the tail slice IS the window; ``host_indices`` is sliced alike so the
+    pair lists stay aligned.
+
+    The skip stays for the case the tail still does not fit (the pool holds
+    fewer than ``ctx_cap`` reclaimable slots): skipped BY NAME, target load
+    unchanged, accept-rate only."""
+    mapper = getattr(draft_pool, "weg2_slot_mapper", None)
+    cap = int(getattr(mapper, "ctx_cap", 0) or 0)
+    dev_rows, host_rows = device_indices, host_indices
+    if mapper is not None and cap > 0 and int(device_indices.numel()) > cap:
+        dev_rows = device_indices.reshape(-1)[-cap:]
+        if host_indices is not None:
+            host_rows = host_indices.reshape(-1)[-cap:]
+        _DRAFT_WINDOW_LOGGED["n"] += 1
+        n = _DRAFT_WINDOW_LOGGED["n"]
+        if n <= 3 or (n & (n - 1)) == 0:
+            logger.info(
+                "WEG2-DRAFT-LOAD WINDOW rows=%d of %d: the DFlash draft attends the "
+                "last ctx_cap=%d positions only, so the prefix's tail is the load "
+                "(window pool slots=%s) (n=%d)",
+                int(dev_rows.numel()), nrows, cap,
+                getattr(mapper, "num_draft_slots", "?"), n,
+            )
     try:
-        return _draft_device_rows(draft_pool, device_indices, direction), False
+        return _draft_device_rows(draft_pool, dev_rows, direction), host_rows, False
     except RuntimeError as exc:
         if "solo pool exhausted" not in str(exc):
             raise
@@ -67,7 +96,7 @@ def _draft_rows_or_skip(draft_pool, device_indices, direction: str, *, nrows: in
                 nrows, getattr(mapper, "num_draft_slots", "?"),
                 getattr(mapper, "ctx_cap", "?"), n, str(exc)[:160],
             )
-        return None, True
+        return None, None, True
 from sglang.srt.managers.cache_controller import consume_gate
 from sglang.srt.managers.cache_controller import (
     HiCacheAck,
@@ -741,7 +770,7 @@ class HybridCacheController(BaseHiCacheController):
         # allocates draft slots; a per-layer call would allocate per layer)
         # and the draft half is skipped by name when the window pool cannot
         # hold this load (an over-threshold context DFLASH will not serve).
-        draft_rows, draft_rows_skipped = None, False
+        draft_rows, draft_host_rows, draft_rows_skipped = None, None, False
         with device_module.stream(self.load_stream):
             producer_event.start_event.wait(self.load_stream)
             for i in range(self.mem_pool_host.transfer_layer_domain):
@@ -759,13 +788,13 @@ class HybridCacheController(BaseHiCacheController):
                     and _host_pool_covers_layer(self.mem_pool_host_draft, i)
                 ):
                     if draft_rows is None and not draft_rows_skipped:
-                        draft_rows, draft_rows_skipped = _draft_rows_or_skip(
+                        draft_rows, draft_host_rows, draft_rows_skipped = _draft_rows_or_skip(
                             self.mem_pool_device_draft, device_indices, "load",
-                            nrows=int(host_indices.numel()))
+                            nrows=int(host_indices.numel()), host_indices=host_indices)
                     if draft_rows is not None:
                         self.mem_pool_host_draft.load_to_device_per_layer(
                             self.mem_pool_device_draft,
-                            host_indices,
+                            draft_host_rows if draft_host_rows is not None else host_indices,
                             draft_rows,
                             i,
                             self.io_backend,
