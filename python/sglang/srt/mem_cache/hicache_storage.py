@@ -2969,10 +2969,38 @@ class HiCacheFile(HiCacheStorage):
                 _bulk[name] = states
                 return states
 
+            _l3bulk: dict = {}
+
+            def _bulk_l3(name: str):
+                """xsn362 (py-spy PP0, prefetch thread 517/1316 samples): the
+                trailing rule asked has_component per page, and every page the
+                arena does not hold went through _readable_stems([k]) -- a
+                lookup, a canonical-width derivation and an L3 stat, one page at
+                a time, ~4k times per pool for a fresh prompt. The shared L3
+                index answers all pages of a pool in ONE call; a stem it does
+                not list is on no disk, so the per-page path runs only for the
+                stems it names."""
+                if name in _l3bulk:
+                    return _l3bulk[name]
+                present = None
+                try:
+                    _idx = self._l3_index()
+                    if _idx is not None and kv_pages:
+                        stems = [self._get_component_key(k, name) for k in keys[:kv_pages]]
+                        present = _idx.has(stems)
+                except Exception:  # noqa: BLE001 - fall back to the per-page path
+                    present = None
+                _l3bulk[name] = present
+                return present
+
             def has_component(page_idx: int, name: str) -> bool:
                 states = _bulk_states(name)
                 if states is not None and page_idx < len(states) and states[page_idx] == 2:
                     return True
+                if states is not None and page_idx < len(states):
+                    l3 = _bulk_l3(name)
+                    if l3 is not None and page_idx < len(l3) and not l3[page_idx]:
+                        return False   # neither COMPLETE in the arena nor on any disk
                 k = self._get_component_key(keys[page_idx], name)
                 v = _memo.get(k)
                 if v is None:
