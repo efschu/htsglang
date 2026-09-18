@@ -7811,7 +7811,12 @@ class SchedulerWeightUpdaterManager:
                     # as the card funds it plus the next tag, and the held
                     # requests' pages start loading while the remaining legs run
                     # (xsn368: 1.1 s of init_new loads AFTER the wake).
-                    if (_kv_in and _plan == "late" and not _weg2_kv_resumed_early
+                    # (the front wakes with TWO RPCs: the weights family first,
+                    # kv_cache + cuda_graph after the legs -- so the pool is
+                    # still PAUSED here whatever this call's tag list says; the
+                    # kv RPC then finds it resumed and runs only the clear half)
+                    if (GPU_MEMORY_TYPE_KV_CACHE in self.offload_tags
+                            and not _weg2_kv_resumed_early
                             and not (_kv_epoch is not None and self._weg2_kv_resumed_epoch == _kv_epoch)
                             and str(os.environ.get("SGLANG_WEG2_WAKE_KV_MID", "1")).strip().lower()
                             not in ("0", "false", "no", "off")):
