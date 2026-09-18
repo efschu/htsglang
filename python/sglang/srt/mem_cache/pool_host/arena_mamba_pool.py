@@ -43,7 +43,7 @@ def _arena_state_load_block_bytes() -> int:
 
 
 def _arena_state_load_on() -> bool:
-    return str(os.environ.get("SGLANG_WEG2_ARENA_STATE_LOAD", "1")).strip().lower() not in ("0", "false", "no", "off")
+    return str(os.environ.get("SGLANG_WEG2_ARENA_STATE_LOAD", "0")).strip().lower() not in ("0", "false", "no", "off")  # xsn337/338: 571-706 ms vs 432 per-layer -- opt-in until it beats the per-layer path
 
 
 def _contig_strides(shape):
