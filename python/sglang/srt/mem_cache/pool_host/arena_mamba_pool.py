@@ -301,48 +301,60 @@ class ArenaMambaPoolHost(MambaPoolHost):
                 device_indices[rest.to(device_indices.device)], io_backend)
 
     def _load_states_all_layers(self, device_pool, slots, didx) -> None:
-        """xsn332: one pinned gather of the requested slots (all layers, temporal
-        + conv), one H2D copy, then per layer an index_copy_ from the device
-        stage. Replaces L x (index_select on the mmap view + pageable .to(dev)
-        + a conv channel loop) -- ~190 ms of 535 in the loaded wake pass."""
+        """xsn332/337: this rank's extents of the requested slots (temporal +
+        conv, all layers) gathered COMPACTLY into a pinned stage, one H2D per
+        block, split on the device. xsn337: copying the whole 78-MiB canonical
+        blob per state (every rank's extents) made the pass slower (706 ms);
+        the compact stage carries only this rank's bytes."""
         n = int(slots.numel())
         if n == 0:
             return
         lay = self._layout
-        sb = int(self._page_bytes)
         dev = device_pool.mamba_cache.temporal[0].device
         _pin = bool(dev.type == "cuda")
-        # xsn335: a state is ~78 MiB; 12 at once = 941 MB pinned + 941 MB
-        # device transient, the pass took 1087 ms and the host rate latch (W98)
-        # tripped. Fixed block: at most SGLANG_WEG2_ARENA_STATE_LOAD_BLOCK_BYTES
-        # (256 MiB) per gather, stages reused.
-        B = max(1, _arena_state_load_block_bytes() // sb)
-        if self._state_stage is None or self._state_stage.shape[0] < min(B, n):
-            self._state_stage = torch.empty((min(B, n), sb), dtype=torch.uint8, pin_memory=_pin)
-        if getattr(self, "_state_dev_stage", None) is None or self._state_dev_stage.shape[0] < min(B, n) \
-                or self._state_dev_stage.device != dev:
-            self._state_dev_stage = torch.empty((min(B, n), sb), dtype=torch.uint8, device=dev)
+        # compact layout: (cursor, off, ln) per extent in layer order: t, c0, c1, c2
+        if getattr(self, "_compact", None) is None:
+            cur, comp = 0, []
+            for l in range(int(lay["L"])):
+                off, ln = lay["t_ext"][l]
+                comp.append((cur, off, ln)); cur += ln
+                for (off_j, ln_j) in lay["c_ext"][l]:
+                    comp.append((cur, off_j, ln_j)); cur += ln_j
+            self._compact = (comp, cur)
+        comp, row_bytes = self._compact
+        B = max(1, _arena_state_load_block_bytes() // max(1, row_bytes))
+        bb = min(B, n)
+        if self._state_stage is None or self._state_stage.shape[0] < bb or self._state_stage.shape[1] != row_bytes:
+            self._state_stage = torch.empty((bb, row_bytes), dtype=torch.uint8, pin_memory=_pin)
+        if getattr(self, "_state_dev_stage", None) is None or self._state_dev_stage.shape[0] < bb \
+                or self._state_dev_stage.shape[1] != row_bytes or self._state_dev_stage.device != dev:
+            self._state_dev_stage = torch.empty((bb, row_bytes), dtype=torch.uint8, device=dev)
         slots_cpu = slots.to("cpu", dtype=torch.int64)
         didx = didx.to(dev)
         e_c = int(self.conv_dtype.itemsize)
         t_shape = tuple(lay["t_shape"]); conv_shape = tuple(lay["conv_shape"]); width = int(lay["width"])
+        L = int(lay["L"])
         for start in range(0, n, B):
             b = min(B, n - start)
             stage = self._state_stage[:b]
-            torch.index_select(self._slot_view, 0, slots_cpu[start:start + b], out=stage)
+            sl = slots_cpu[start:start + b]
+            for (cur, off, ln) in comp:
+                torch.index_select(self._slot_view[:, off:off + ln], 0, sl, out=stage[:, cur:cur + ln])
             dev_stage = self._state_dev_stage[:b]
             dev_stage.copy_(stage, non_blocking=_pin)
             d_b = didx[start:start + b]
-            for l in range(int(lay["L"])):
-                off, ln = lay["t_ext"][l]
-                src = dev_stage[:, off:off + ln].contiguous().view(self.temporal_dtype).view((b,) + t_shape)
+            k = 0
+            for l in range(L):
+                cur, _off, ln = comp[k]; k += 1
+                src = dev_stage[:, cur:cur + ln].contiguous().view(self.temporal_dtype).view((b,) + t_shape)
                 device_pool.mamba_cache.temporal[l].index_copy_(0, d_b, src)
                 dst_c = device_pool.mamba_cache.conv[0][l]
                 row = torch.empty((b,) + conv_shape, dtype=dst_c.dtype, device=dev)
                 ch0 = 0
-                for (off_j, ln_j) in lay["c_ext"][l]:
+                for _j in range(3):
+                    cur_j, _off_j, ln_j = comp[k]; k += 1
                     n_j = ln_j // (width * e_c)
-                    row[:, ch0:ch0 + n_j] = dev_stage[:, off_j:off_j + ln_j].contiguous().view(self.conv_dtype).view(b, n_j, width)
+                    row[:, ch0:ch0 + n_j] = dev_stage[:, cur_j:cur_j + ln_j].contiguous().view(self.conv_dtype).view(b, n_j, width)
                     ch0 += n_j
                 dst_c.index_copy_(0, d_b, row)
             if _pin and start + b < n:
@@ -350,8 +362,8 @@ class ArenaMambaPoolHost(MambaPoolHost):
         global _STATE_LOAD_N
         _STATE_LOAD_N += 1
         if _STATE_LOAD_N <= 8 or _STATE_LOAD_N % 64 == 0:
-            logger.info("WEG2-ARENA-STATE-LOAD n=%d slots=%d bytes=%d block=%d (all layers, pinned gather + H2D per block, split on device)",
-                        _STATE_LOAD_N, n, n * sb, B)
+            logger.info("WEG2-ARENA-STATE-LOAD n=%d slots=%d own_bytes=%d block=%d (this rank's extents, pinned gather + one H2D per block, split on device)",
+                        _STATE_LOAD_N, n, n * row_bytes, B)
 
     def load_to_device_per_layer(self, device_pool, host_indices, device_indices, layer_id, io_backend="direct"):
         if self.arena is None or host_indices.numel() == 0:

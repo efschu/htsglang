@@ -443,6 +443,15 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
                                  else (_NoEvent(), _NoEvent()))
         cpu_slots = slots.to("cpu", dtype=torch.int64)
         dev_stage = torch.empty((min(B, n), pb), dtype=torch.uint8, device=dev)
+        # xsn338: the index tensors cross to the device ONCE from pinned
+        # memory; a pageable `.to(dev)` per block was a host sync per block,
+        # so the scheduler thread waited out the whole DMA (~120-150 ms for
+        # 1.8 GB). The per-block slices below are device views.
+        _async_idx = bool(dev.type == "cuda")
+        if _async_idx:
+            _slots_dev = cpu_slots.pin_memory().to(dev, non_blocking=True)
+            _dst_all = device_indices.to("cpu", dtype=torch.int64).pin_memory().to(dev, non_blocking=True) \
+                if device_indices.device.type != "cuda" else device_indices.to(dtype=torch.int64)
         L = len(self._k_offs_b)
         # xsn305: the CPU gather of three ranks at once (3 x 3 GB memcpy) did
         # not beat the per-layer kernel (0,5-1,95 GB/s). Mode "kernel" lets
@@ -461,7 +470,7 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
             if mode == "kernel":
                 try:
                     from sglang.jit_kernel.hicache import transfer_hicache_one_layer_mla
-                    src_idx = slots[start:start + b].to(device=dev, dtype=torch.int64)
+                    src_idx = _slots_dev[start:start + b] if _async_idx else slots[start:start + b].to(device=dev, dtype=torch.int64)
                     stage_idx = torch.arange(b, device=dev, dtype=torch.int64)
                     transfer_hicache_one_layer_mla(
                         cache_dst=dev_stage[:b], indices_dst=stage_idx,
@@ -479,7 +488,7 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
                 _gather_ms += (time.perf_counter() - _g0) * 1000.0
                 dev_stage[:b].copy_(host_stage[:b], non_blocking=True)
                 self._page_events[k].record()
-            dst = device_indices[start:start + b].to(device=dev, dtype=torch.int64)
+            dst = _dst_all[start:start + b] if _async_idx else device_indices[start:start + b].to(device=dev, dtype=torch.int64)
             for l in range(L):
                 ko, vo = self._k_offs_b[l], self._v_offs_b[l]
                 device_pool.k_buffer[l].index_copy_(
