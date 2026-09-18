@@ -143,3 +143,41 @@ def test_xsn273_the_seat_gate_in_front_of_the_adder_feeds_the_watch_too():
     assert _obs(w, "weg2-5-4", 0.0) is None
     msg = _obs(w, "weg2-5-4", 1.1, extra="gate=seats allocatable_reqs=0 req_slots_free=0 waiting=1")
     assert msg and "gate=seats allocatable_reqs=0" in msg and "need_tokens=95476" in msg
+
+
+def test_xsn275_the_admission_wedge_drain_hands_the_head_to_the_refusal():
+    """xsn275 (812e04a7f4+e1bcd01374): neither the NO_TOKEN hook nor the seat
+    gate ran in the wedged state; the watchdog's ADMISSION-WEDGE detector
+    did (posted, drained NOT_APPLICABLE). The drain now hands the head of
+    the waiting queue to the refusal, immediately (the detector already
+    waited >= 20 s with nothing running)."""
+    from types import SimpleNamespace
+    from sglang.srt.managers import wedge_recovery as wr
+    src = open(wr.__file__).read()
+    i = src.index("def drain(self, scheduler")
+    assert "_weg2_intake_stall_from_wedge(scheduler, reason)" in src[i:i + 2500]
+    calls = []
+
+    class _Batch:
+        def __init__(self, empty): self._e = empty
+        def is_empty(self): return self._e
+
+    head = SimpleNamespace(rid="weg2-5-4")
+    sch = SimpleNamespace(waiting_queue=[head], running_batch=_Batch(True), chunked_req=None,
+                          _weg2_intake_stall_observe=lambda req, adder, note="", immediate=False: calls.append((req.rid, note, immediate)))
+    wr._weg2_intake_stall_from_wedge(sch, "ADMISSION-WEDGE: 1 queued, 0 running")
+    assert calls == [("weg2-5-4", "gate=admission-wedge waiting=1 reason=ADMISSION-WEDGE: 1 queued, 0 running", True)]
+    # something running, or a chunked request in flight: not a stall
+    calls.clear()
+    wr._weg2_intake_stall_from_wedge(SimpleNamespace(waiting_queue=[head], running_batch=_Batch(False), chunked_req=None,
+                                                     _weg2_intake_stall_observe=lambda *a, **k: calls.append(1)), "r")
+    wr._weg2_intake_stall_from_wedge(SimpleNamespace(waiting_queue=[head], running_batch=_Batch(True), chunked_req=object(),
+                                                     _weg2_intake_stall_observe=lambda *a, **k: calls.append(1)), "r")
+    wr._weg2_intake_stall_from_wedge(SimpleNamespace(waiting_queue=[], running_batch=_Batch(True), chunked_req=None,
+                                                     _weg2_intake_stall_observe=lambda *a, **k: calls.append(1)), "r")
+    assert calls == []
+    # immediate: the watch names the stall on the first sight, once
+    w = st.IntakeStallWatch(hold_s=1.0)
+    msg = _obs(w, "weg2-5-4", 0.0, immediate=True, extra="gate=admission-wedge")
+    assert msg and "gate=admission-wedge" in msg
+    assert _obs(w, "weg2-5-4", 0.1, immediate=True) is None

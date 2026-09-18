@@ -49,7 +49,7 @@ class IntakeStallWatch:
 
     def observe(self, *, rid: str, need_tokens: int, rem_total_tokens: int,
                 cur_rem_tokens: int, running_empty: bool, now: float,
-                extra: str = "") -> Optional[str]:
+                extra: str = "", immediate: bool = False) -> Optional[str]:
         """One refusal of ``rid`` with nothing admitted this pass -- the
         adder's NO_TOKEN, or (xsn273) the seat gate in front of the adder:
         ``get_num_allocatable_reqs(0) <= 0`` while the parked, prefilled
@@ -65,9 +65,10 @@ class IntakeStallWatch:
         if self._rid != rid:
             self._rid = rid
             self._since = float(now)
-            return None
+            if not immediate:
+                return None
         held = float(now) - self._since
-        if held < self.hold_s:
+        if held < self.hold_s and not immediate:
             return None
         self._reported.add(rid)
         self.stalls += 1

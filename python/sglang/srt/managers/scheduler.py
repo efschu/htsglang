@@ -17895,7 +17895,8 @@ class Scheduler(
         )
         self._abort_request_now(recv_req)
 
-    def _weg2_intake_stall_observe(self, req, adder, note: str = "") -> None:
+    def _weg2_intake_stall_observe(self, req, adder, note: str = "",
+                                   immediate: bool = False) -> None:
         """weg2xsn272: the adder refused ``req`` (NO_TOKEN) with an EMPTY
         running batch. On Weg 2 group P that refusal is permanent for the
         phase -- P keeps the prefilled backlog for D, nothing runs, nothing
@@ -17928,6 +17929,9 @@ class Scheduler(
             rid=str(req.rid), need_tokens=need, rem_total_tokens=rem_total,
             cur_rem_tokens=cur_rem, running_empty=True, now=_time.monotonic(),
             extra=note or "gate=adder_no_token",
+            # xsn275: the admission-wedge detector already waited >= 20 s
+            # with nothing running; its verdict needs no second hold here.
+            immediate=immediate,
         )
         if message is None:
             return
