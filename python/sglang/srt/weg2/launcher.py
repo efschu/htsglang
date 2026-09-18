@@ -6367,7 +6367,7 @@ def _weg2_arena_ledger_terms(model: str) -> dict:
         # 1.07 GiB (xsn267) with the lanes already released per leg.
         draft_cell = cell
         try:
-            if str(_SPEC_FORM.get("algorithm") or "").upper() == "DFLASH":
+            if str(_SPEC_FORM.get("form") or "").upper() == "DFLASH":
                 _dp = str(_SPEC_FORM.get("draft_path") or "")
                 if _dp:
                     _dc = json.load(open(os.path.join(_dp, "config.json")))

@@ -2350,8 +2350,21 @@ def _persistent_host_buffer(path: str, biggest: int, ops, lane_key: str, log):
         refusal = ""
         t0 = time.perf_counter()
         try:
-            ops.host_register(int(addr), int(biggest), tp.CUDA_HOST_REGISTER_PORTABLE)
-            registered = "yes"
+            # xsn268 (17.09., py-spy --native at the DRAIN-STALL): PP0 and TP0
+            # of one card sat in cudaHostUnregister (ioctl) for the whole
+            # ~12.5 s stall -- the lane release / the grow path unregisters a
+            # 2 GB mapping while the co-located process copies, and the
+            # driver serialises both. Registering became cheap with the
+            # populate above; UNregistering did not. Default: no
+            # registration at all -- the lane copies run pageable (the driver
+            # stages them through its own pinned buffers) and the release is
+            # an unmap + truncate with no driver call. SGLANG_WEG2_SEQ_HOST_
+            # REGISTER=1 keeps the pinned form for an A/B.
+            if not seq_host_register():
+                registered = "no(off)"
+            else:
+                ops.host_register(int(addr), int(biggest), tp.CUDA_HOST_REGISTER_PORTABLE)
+                registered = "yes"
         except AttributeError:
             registered = "unavailable"
         except Exception as _reg_exc:  # noqa: BLE001
@@ -2385,6 +2398,14 @@ def _persistent_host_buffer(path: str, biggest: int, ops, lane_key: str, log):
 #: collector unregisters and unmaps its own mapping. The next leg creates,
 #: populates and registers again. =0 keeps the boot-long form.
 SEQ_RELEASE_LANES_ENV = "SGLANG_WEG2_SEQ_RELEASE_LANES"
+#: xsn268: cudaHostRegister/Unregister of the host lane buffers -- OFF by
+#: default (see `_persistent_host_buffer`): the unregister was the 12.5-s
+#: stall measured on every flip.
+SEQ_HOST_REGISTER_ENV = "SGLANG_WEG2_SEQ_HOST_REGISTER"
+
+
+def seq_host_register() -> bool:
+    return _env_flag(SEQ_HOST_REGISTER_ENV, "0")
 
 
 def seq_release_lanes() -> bool:

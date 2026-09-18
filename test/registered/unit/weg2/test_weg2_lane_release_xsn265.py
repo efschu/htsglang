@@ -44,7 +44,8 @@ def _clean_cache():
         bx._SEQ_HOST_BUF.clear()
 
 
-def test_the_truncating_release_unregisters_unmaps_and_truncates(tmp_path):
+def test_the_truncating_release_unregisters_unmaps_and_truncates(tmp_path, monkeypatch):
+    monkeypatch.setenv(bx.SEQ_HOST_REGISTER_ENV, "1")     # the pinned A/B form
     ops = _Ops()
     lines = []
     path = str(tmp_path / "weg2-seq-t" / "p0_unit_buffer.bin")
@@ -64,7 +65,8 @@ def test_the_truncating_release_unregisters_unmaps_and_truncates(tmp_path):
     assert os.path.getsize(path) == 1 << 20
 
 
-def test_the_unmapping_release_keeps_the_file_size(tmp_path):
+def test_the_unmapping_release_keeps_the_file_size(tmp_path, monkeypatch):
+    monkeypatch.setenv(bx.SEQ_HOST_REGISTER_ENV, "1")
     ops = _Ops()
     path = str(tmp_path / "weg2-seq-t" / "c1_unit_buffer.bin")
     os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -93,3 +95,23 @@ def test_both_leg_ends_call_the_release():
     assert "release_host_lane_buffers(truncate=False" in src[i:j]
     k = src.index("WEG2-WAKE-OVERLAP collects=")
     assert "release_host_lane_buffers(truncate=True" in src[k:k + 1500]
+
+
+def test_xsn268_host_lanes_are_not_registered_by_default(tmp_path, monkeypatch):
+    """py-spy --native at the DRAIN-STALL of xsn268: PP0 and TP0 of one card
+    both inside cudaHostUnregister (ioctl) for the whole ~12.5 s stall. The
+    lane buffers now run pageable by default: no register, no unregister,
+    the release is unmap + truncate only."""
+    monkeypatch.delenv(bx.SEQ_HOST_REGISTER_ENV, raising=False)
+    assert bx.seq_host_register() is False
+    ops = _Ops()
+    lines = []
+    path = str(tmp_path / "weg2-seq-t" / "p1_unit_buffer.bin")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    mm, addr, reg, refusal = bx._persistent_host_buffer(path, 1 << 20, ops, "p1", lines.append)
+    assert refusal == "" and reg == "no(off)"
+    assert ops.registered == []
+    n, total = bx.release_host_lane_buffers(truncate=True, log=lines.append)
+    assert (n, total) == (1, 1 << 20)
+    assert ops.unregistered == []
+    assert os.path.getsize(path) == 0
