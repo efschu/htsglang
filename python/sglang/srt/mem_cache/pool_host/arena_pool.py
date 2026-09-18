@@ -766,12 +766,19 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
             # the all-layer copy runs on the current stream into pinned arena
             # memory; the completion below publishes the bytes to every rank
             torch.cuda.current_stream().synchronize()
-            gens = [self._pending[s][0] for s in sl.tolist()]
-            st = self.arena.complete_slots(sl.tolist(), gens, self._own_extents)
-            lost = 0
-            for s, r in zip(sl.tolist(), st):
-                self._pend_pop(s)
-                lost += int(r == 3)
+            if self._pending_mask is not None:
+                # xsn360: the producer path on the tensors too (KeyError: 0 on
+                # PP2 -- the dict is empty once the mask carries the state)
+                _m, sel, gens_t, _f = self._pend_take(sl)
+                st_np = self.arena.complete_slots_np(sel.numpy(), gens_t.numpy(), self._own_extents)
+                lost = int((st_np == 3).sum())
+            else:
+                gens = [self._pending[s][0] for s in sl.tolist()]
+                st = self.arena.complete_slots(sl.tolist(), gens, self._own_extents)
+                lost = 0
+                for s, r in zip(sl.tolist(), st):
+                    self._pend_pop(s)
+                    lost += int(r == 3)
             if lost:
                 logger.warning("#1427 ARENA-COMPLETE LOST %d draft page(s) under the producer", lost)
         if complete_idx:

@@ -156,3 +156,25 @@ def test_claim_np_and_vectorised_complete_abort(tmp_path):
     slots2 = p._claim(st2)
     p.abort_write(torch.as_tensor(slots2))
     assert p._pending_mask.sum().item() == 0 and a.stats()["claimed"] == 0
+
+
+def test_publish_direct_on_the_tensor_path(tmp_path, monkeypatch):
+    """xsn360: the draft producer's publish_direct read the dict (KeyError: 0)."""
+    import torch
+    from sglang.srt.mem_cache.pool_host.arena_pool import ArenaMHAHostPool as M
+    a = _arena(tmp_path, 4096)
+    p = M.__new__(M)
+    p.arena = a; p._backend = object(); p._page_bytes = SB; p._own_extents = [(0, SB)]
+    p._pending = {}; p.staging_rows = 0; p.arena_slots = 4096; p.row_slot = {}
+    p._pending_mask = torch.zeros(4096, dtype=torch.bool)
+    p._pending_gen = torch.zeros(4096, dtype=torch.int64)
+    p._pending_fresh = torch.zeros(4096, dtype=torch.bool)
+    p.ensure_bound = lambda *a_, **k: True
+    p._stems = lambda hashes, suffix="": [f"{h}.{suffix}" for h in hashes]
+    calls = []
+    p._backup_arena = lambda dp, sl, di: calls.append(int(sl.numel()))
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda *a_, **k: type("S", (), {"synchronize": lambda self: None})())
+    n = p.publish_direct([f"h{i}" for i in range(50)], "draft", None, torch.arange(50), None)
+    assert n == 50 and calls == [50]
+    assert p._pending_mask.sum().item() == 0
+    assert all(st == 2 for _, st in a.find_slots([f"h{i}.draft" for i in range(50)]))
