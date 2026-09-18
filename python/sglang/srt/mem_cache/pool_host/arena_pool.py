@@ -67,6 +67,15 @@ def _arena_page_load_on() -> bool:
     return str(os.environ.get(ARENA_PAGE_LOAD_ENV, "1")).strip().lower() not in ("0", "false", "no", "off")
 
 
+def _arena_page_load_mode() -> str:
+    m = str(os.environ.get("SGLANG_WEG2_ARENA_PAGE_LOAD_MODE", "kernel")).strip().lower()
+    return "cpu" if m == "cpu" else "kernel"
+
+
+def _arena_page_load_timing() -> bool:
+    return str(os.environ.get("SGLANG_WEG2_ARENA_PAGE_LOAD_TIMING", "0")).strip() not in ("", "0")
+
+
 def _arena_page_load_block() -> int:
     try:
         return max(64, int(os.environ.get(ARENA_PAGE_LOAD_BLOCK_ENV, "2048")))
@@ -435,14 +444,41 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
         cpu_slots = slots.to("cpu", dtype=torch.int64)
         dev_stage = torch.empty((min(B, n), pb), dtype=torch.uint8, device=dev)
         L = len(self._k_offs_b)
+        # xsn305: the CPU gather of three ranks at once (3 x 3 GB memcpy) did
+        # not beat the per-layer kernel (0,5-1,95 GB/s). Mode "kernel" lets
+        # the GPU gather WHOLE PAGES straight from the mapped arena (the MLA
+        # one-buffer kernel with element_dim = page bytes); "cpu" is the
+        # pinned-stage form; the first kernel failure falls back to cpu.
+        mode = getattr(self, "_page_mode", None) or _arena_page_load_mode()
+        if mode == "kernel" and dev.type != "cuda":
+            mode = "cpu"
+        _timing = _arena_page_load_timing()
+        _t0 = time.perf_counter() if _timing else 0.0
+        _gather_ms = 0.0
         for bi, start in enumerate(range(0, n, B)):
             b = min(B, n - start)
             k = bi % 2
-            self._page_events[k].synchronize()  # the DMA that last read this stage is done
-            host_stage = self._page_stages[k]
-            torch.index_select(self._page_view, 0, cpu_slots[start:start + b], out=host_stage[:b])
-            dev_stage[:b].copy_(host_stage[:b], non_blocking=True)
-            self._page_events[k].record()
+            if mode == "kernel":
+                try:
+                    from sglang.jit_kernel.hicache import transfer_hicache_one_layer_mla
+                    src_idx = slots[start:start + b].to(device=dev, dtype=torch.int64)
+                    stage_idx = torch.arange(b, device=dev, dtype=torch.int64)
+                    transfer_hicache_one_layer_mla(
+                        cache_dst=dev_stage[:b], indices_dst=stage_idx,
+                        cache_src=self._page_view, indices_src=src_idx,
+                        element_dim=pb, block_quota=_arena_load_block_quota())
+                except Exception as exc:  # noqa: BLE001 -- one named fallback, then cpu
+                    logger.warning("WEG2-ARENA-PAGE-LOAD kernel mode failed (%s: %s); cpu mode from now on",
+                                   type(exc).__name__, exc)
+                    self._page_mode = mode = "cpu"
+            if mode == "cpu":
+                self._page_events[k].synchronize()  # the DMA that last read this stage is done
+                host_stage = self._page_stages[k]
+                _g0 = time.perf_counter()
+                torch.index_select(self._page_view, 0, cpu_slots[start:start + b], out=host_stage[:b])
+                _gather_ms += (time.perf_counter() - _g0) * 1000.0
+                dev_stage[:b].copy_(host_stage[:b], non_blocking=True)
+                self._page_events[k].record()
             dst = device_indices[start:start + b].to(device=dev, dtype=torch.int64)
             for l in range(L):
                 ko, vo = self._k_offs_b[l], self._v_offs_b[l]
@@ -453,9 +489,14 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
         global _PAGE_LOAD_N
         _PAGE_LOAD_N += 1
         n_log = _PAGE_LOAD_N
-        if n_log <= 8 or n_log % 64 == 0:
-            logger.info("WEG2-ARENA-PAGE-LOAD n=%d rows=%d pages=%d block=%d bytes=%d (whole pages, layers split on device)",
-                        n_log, n, n, B, n * pb)
+        _wall = ""
+        if _timing and dev.type == "cuda":
+            torch.cuda.current_stream(dev).synchronize()
+            _ms = (time.perf_counter() - _t0) * 1000.0
+            _wall = f" wall_ms={_ms:.0f} GB/s={(n * pb) / max(_ms, 1e-3) / 1e6:.2f} gather_ms={_gather_ms:.0f}"
+        if n_log <= 8 or n_log % 64 == 0 or _timing:
+            logger.info("WEG2-ARENA-PAGE-LOAD n=%d rows=%d pages=%d block=%d bytes=%d mode=%s%s (whole pages, layers split on device)",
+                        n_log, n, n, B, n * pb, mode, _wall)
 
     def pin_slots(self, slots) -> int:
         """Register the slots' pages (contiguous runs in one call each) that
