@@ -1290,6 +1290,60 @@ class SchedulerWeightUpdaterManager:
             )
         except Exception as exc:  # noqa: BLE001 -- an instrument never kills the sleep
             logger.info("WEG2-SLEEP-RESIDUE instrument raised (%s: %s)", type(exc).__name__, str(exc)[:160])
+        self._weg2_trim_host_heap_at_sleep()
+
+    def _weg2_trim_host_heap_at_sleep(self) -> None:
+        """weg2xsn297 (Nutzer-Order 18.09.: Scheduler-Heap -- bauen, verdrahten,
+        Standard). Each rank held ~2.5 GiB of glibc heap while serving
+        (/proc/<pid>/smaps [heap], xsn296 desk reading); a sleeping rank is the
+        moment to hand freed arenas back to the kernel (malloc_trim(0)) and
+        to say what the heap is made of (a gc census by type, once per sleep,
+        top 8). Never raises."""
+        try:
+            import ctypes
+            import gc
+            import os
+            import sys
+
+            def _rss_anon() -> int:
+                with open("/proc/self/status") as fh:
+                    for line in fh:
+                        if line.startswith("RssAnon:"):
+                            return int(line.split()[1]) * 1024
+                return -1
+
+            before = _rss_anon()
+            trimmed = -1
+            try:
+                trimmed = int(ctypes.CDLL("libc.so.6").malloc_trim(0))
+            except Exception:  # noqa: BLE001
+                pass
+            after = _rss_anon()
+            census = ""
+            try:
+                n = int(getattr(self, "_weg2_sleep_count", 0) or 0)
+                if n <= 2 or (n & (n - 1)) == 0:   # 1, 2, 4, 8, ... sleeps
+                    counts: Dict[str, int] = {}
+                    sizes: Dict[str, int] = {}
+                    for o in gc.get_objects():
+                        k = type(o).__name__
+                        counts[k] = counts.get(k, 0) + 1
+                        try:
+                            sizes[k] = sizes.get(k, 0) + sys.getsizeof(o)
+                        except Exception:  # noqa: BLE001
+                            pass
+                    top = sorted(sizes.items(), key=lambda kv: kv[1], reverse=True)[:8]
+                    census = " census=" + ",".join(f"{k}:{counts[k]}x{v >> 20}MiB" for k, v in top)
+            except Exception as exc:  # noqa: BLE001
+                census = f" census=n/a({type(exc).__name__})"
+            logger.info(
+                "WEG2-SLEEP-HOST-HEAP rss_anon=%d MiB -> %d MiB after malloc_trim(0) (returned=%d MiB, "
+                "trim_rc=%d)%s (instrument: /proc/self/status RssAnon; census = sys.getsizeof over "
+                "gc-tracked objects by type, shallow sizes, top 8 -- containers' payloads not included)",
+                before >> 20, after >> 20, max(0, before - after) >> 20, trimmed, census,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.info("WEG2-SLEEP-HOST-HEAP instrument raised (%s: %s)", type(exc).__name__, str(exc)[:160])
 
     #: The four possible carriers of the weight bytes on a wake.  Module-level
     #: strings on the class rather than literals at the branches: the seam's

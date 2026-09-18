@@ -124,6 +124,19 @@ def abort_must_reach_every_rank(*, rid_known: bool, abort_all: bool) -> bool:
     return bool(str(os.environ.get("SGLANG_WEG2_GROUP", "")).strip())
 
 
+def pending_prefetch_is_a_stall(*, need_tokens: int, pool_free_tokens: int,
+                                running_empty: bool, waiting: int) -> bool:
+    """weg2xsn297 (Task #13): a request whose store read cannot finish because
+    its rows would not fit the FREE pool, with nothing running that could
+    free any, is the intake stall -- not a slow read. xsn293: the seventh
+    prompt sat in the prefetch-pending skip for 66 s (only the wedge path
+    named it) while the loop spun at 45 passes/s over barlink. A slow but
+    fundable read (room for it) is never flagged here."""
+    if not running_empty or int(waiting) <= 0:
+        return False
+    return int(need_tokens) > int(pool_free_tokens)
+
+
 def is_too_large(text: object) -> bool:
     """Does a leg-1 error say the request exceeds the group's pool outright?"""
     return TOO_LARGE_MARK in str(text or "")

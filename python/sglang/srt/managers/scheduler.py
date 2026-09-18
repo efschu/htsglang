@@ -13726,6 +13726,28 @@ class Scheduler(
                         req, prefetch_verdicts
                     )
                     if not _local_prefetch_done:
+                        # weg2xsn297 (Task #13): the prefetch-pending skip was
+                        # the gate that hid the intake stall from every fast
+                        # hook (xsn293: 66 s of a spinning loop before the
+                        # wedge path named it). With nothing running, a read
+                        # whose rows do not fit the free pool can never
+                        # finish -- name it (1 s hold in the watch).
+                        try:
+                            from sglang.srt.weg2.intake_stall import pending_prefetch_is_a_stall
+                            _need = len(req.full_untruncated_fill_ids) - len(req.prefix_indices)
+                            if pending_prefetch_is_a_stall(
+                                need_tokens=_need,
+                                pool_free_tokens=int(self.token_to_kv_pool_allocator.available_size()),
+                                running_empty=running_batch.is_empty(),
+                                waiting=len(self.waiting_queue),
+                            ) and self.chunked_req is None:
+                                self._weg2_intake_stall_observe(
+                                    req, None,
+                                    note=f"gate=prefetch_pending pool_free="
+                                         f"{int(self.token_to_kv_pool_allocator.available_size())}",
+                                )
+                        except Exception:  # noqa: BLE001 -- a gate note never breaks admission
+                            pass
                         _note_skip("prefetch_pending_pp0", req.rid)
                         continue
                     # #1175 (E1): THE ADMISSION FACT IS THE GROUP FACT.
