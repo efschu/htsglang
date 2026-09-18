@@ -13084,6 +13084,7 @@ class Scheduler(
         # lines and wire payloads.
         _996_floor = published_fundable_floor(self.tree_cache)
         self._996_floor = _996_floor
+        _wk_t1 = time.perf_counter()  # Wake-Parallel item 2: admission starts here
         adder = PrefillAdder(
             self.page_size,
             self.tree_cache,
@@ -14724,6 +14725,7 @@ class Scheduler(
         if self.chunked_req is not None:
             self.chunked_req.inflight_middle_chunks += 1
 
+        _wk_t2 = time.perf_counter()  # admission done
         set_time_batch(can_run_list, "set_forward_entry_time")
 
         # Create a new batch
@@ -14758,7 +14760,12 @@ class Scheduler(
                 self.tree_cache.ready_to_load_host_cache()
             )
 
+        _wk_t3 = time.perf_counter()  # init_new done
         new_batch.prepare_for_extend()
+        _wk_t4 = time.perf_counter()
+        if getattr(self, "_weg2_post_wake_pass_n", None) is not None:
+            self._weg2_gnbp_ms = (
+                (_wk_t2 - _wk_t1) * 1000.0, (_wk_t3 - _wk_t2) * 1000.0, (_wk_t4 - _wk_t3) * 1000.0)
 
         # W30: THE SEAM STAMP IS ONE-SHOT AND IS SPENT HERE.
         #
@@ -18043,13 +18050,17 @@ class Scheduler(
             bs = int(getattr(batch, "batch_size", lambda: 0)()) if callable(getattr(batch, "batch_size", None)) else len(getattr(batch, "reqs", ()) or ())
         except Exception:  # noqa: BLE001
             mode, bs = "?", -1
+        _g = getattr(self, "_weg2_gnbp_ms", None) or (-1.0, -1.0, -1.0)
+        self._weg2_gnbp_ms = None
         logger.info(
             "WEG2-POST-WAKE-PASS n=%d mode=%s bs=%d gap_ms=%.0f schedule_ms=%.0f run_ms=%.0f "
-            "prefetch_ms=%.0f proc_input_ms=%.0f (gap = wall since the previous pass; schedule "
-            "holds prepare_for_extend; run is the launch, the forward itself overlaps)",
+            "prefetch_ms=%.0f proc_input_ms=%.0f admission_ms=%.0f init_new_ms=%.0f prepare_ms=%.0f "
+            "(gap = wall since the previous pass; schedule = get_next_batch_to_run incl. the three "
+            "prefill terms; run is the launch, the forward itself overlaps)",
             n, mode, bs, ((now - prev) * 1000.0) if prev is not None else -1.0,
             _pt_read(self, "_1466_schedule_ms"), _pt_read(self, "_1466_run_ms"),
             _pt_read(self, "_1474_prefetch_ms"), _pt_read(self, "_1475_process_input_ms"),
+            _g[0], _g[1], _g[2],
         )
 
     def _weg2_intake_stall_observe(self, req, adder, note: str = "",
