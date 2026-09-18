@@ -2454,10 +2454,35 @@ def release_host_lane_buffers(*, truncate: bool, log=None) -> Tuple[int, int]:
     return n, total
 
 
-def _stage_alloc(ops, device: int, key, nbytes: int, log, lane_key: str) -> int:
+def _stage_free_entry(ent, log, lane_key: str) -> None:
+    """Free one staging entry and give its bytes back to whoever charged
+    them (``ent['refund']``, set by :func:`_stage_alloc` from ``charge``)."""
+    try:
+        ent["ops"].raw_free(int(ent["ptr"]))
+    except Exception as exc:  # noqa: BLE001
+        log(f"WEG2-SEQ stage lane={lane_key} free-failed: {exc}")
+    refund = ent.get("refund")
+    if refund is not None:
+        try:
+            refund()
+        except Exception as exc:  # noqa: BLE001
+            log(f"WEG2-SEQ stage lane={lane_key} refund-failed: {exc}")
+
+
+def _stage_alloc(ops, device: int, key, nbytes: int, log, lane_key: str,
+                 charge=None) -> int:
     """A transient DEVICE staging buffer for one lane slot; an existing
     entry of the same slot is freed first (the caller runs only after that
-    slot's drain). Freed for good by :func:`release_stage_buffers`."""
+    slot's drain). Freed for good by :func:`release_stage_buffers`.
+
+    ``charge`` (weg2xsn269, 18.09.): ``(nbytes) -> refund-callable | None``.
+    The staging sits on the card the WAKING rank resumes into, so its bytes
+    must be booked against that card's VRAM credit BEFORE the cudaMalloc --
+    unbooked, the waker's credit check and this allocation raced (xsn269:
+    TP0 checked 3124 MiB free for a 2502 MiB tag, PP0 staged 1.99 GB 240 ms
+    later, TP0's cuMemCreate ran out of memory and the memory saver's
+    exit(1) killed the rank). A ``None`` from ``charge`` refuses the staging
+    (host path for the tag); the refund runs when the entry is freed."""
     with _SEQ_CACHE_LOCK:
         # weg2xsn100 (depth 4): at most TWO live stagings per lane -- the
         # depositor's run-ahead otherwise parks 4 x 2 GB on the waker's
@@ -2471,13 +2496,23 @@ def _stage_alloc(ops, device: int, key, nbytes: int, log, lane_key: str) -> int:
                                f"{lane_key} (max 2)")
         ent = _SEQ_STAGE.pop(key, None)
         if ent is not None:
-            try:
-                ent["ops"].raw_free(int(ent["ptr"]))
-            except Exception as exc:  # noqa: BLE001
-                log(f"WEG2-SEQ stage lane={lane_key} free-failed: {exc}")
-        ptr = int(ops.raw_malloc(int(device), int(nbytes)))
+            _stage_free_entry(ent, log, lane_key)
+        refund = None
+        if charge is not None:
+            refund = charge(int(nbytes))
+            if refund is None:
+                raise RuntimeError(
+                    f"staging refused by the card's VRAM credit: {int(nbytes)} "
+                    f"B on lane {lane_key} exceed the balance the waking rank "
+                    f"was not promised")
+        try:
+            ptr = int(ops.raw_malloc(int(device), int(nbytes)))
+        except Exception:
+            if refund is not None:
+                refund()
+            raise
         _SEQ_STAGE[key] = {"ptr": ptr, "size": int(nbytes), "device": int(device),
-                           "ops": ops}
+                           "ops": ops, "refund": refund}
         return ptr
 
 
@@ -2485,6 +2520,7 @@ def release_stage_buffers(boot_nonce=None, log=None) -> int:
     """Free every staging buffer this process holds (``boot_nonce`` None =
     all) -- the depositor's leg end, after every drain is confirmed."""
     n = 0
+    _log = log if log is not None else (lambda *_a: None)
     with _SEQ_CACHE_LOCK:
         for key in [k for k in _SEQ_STAGE
                     if boot_nonce is None or k[0] == str(boot_nonce)]:
@@ -2493,8 +2529,13 @@ def release_stage_buffers(boot_nonce=None, log=None) -> int:
                 ent["ops"].raw_free(int(ent["ptr"]))
                 n += 1
             except Exception as exc:  # noqa: BLE001
-                if log is not None:
-                    log(f"WEG2-SEQ stage {key[1]} free-failed: {exc}")
+                _log(f"WEG2-SEQ stage {key[1]} free-failed: {exc}")
+            refund = ent.get("refund")
+            if refund is not None:
+                try:
+                    refund()
+                except Exception as exc:  # noqa: BLE001
+                    _log(f"WEG2-SEQ stage {key[1]} refund-failed: {exc}")
     if log is not None and n:
         log(f"WEG2-SEQ stage released={n}")
     return n
@@ -2631,6 +2672,11 @@ def run_sequential_units(descs, ops, boot_nonce: str, *,
                          shm_root: str = xr.SHM_ROOT,
                          device: int = 0,
                          phase: str = PHASE_DEPOSIT,
+                         #: weg2xsn269: the depositor's on-card IPC staging is
+                         #: booked against the card's VRAM credit through this
+                         #: ``(nbytes) -> refund | None`` before it is
+                         #: allocated; None = unbooked (desk fakes, ring arm).
+                         stage_charge=None,
                          #: #1378 xsn44 (the PLACEMENT witness): the digest of
                          #: the DESTINATION after the copy-out, compared
  #: against the deposit's record BY NAME. The sha256 buffer digest
@@ -2914,7 +2960,8 @@ def run_sequential_units(descs, ops, boot_nonce: str, *,
             try:
                 _ipc_base = _stage_alloc(ops, int(device),
                                          (str(boot_nonce), _lane_file),
-                                         int(total_bytes), log, lane_key)
+                                         int(total_bytes), log, lane_key,
+                                         charge=stage_charge)
                 _ipc_hex = bytes(ops.ipc_get_handle(int(_ipc_base))).hex()
                 log(f"WEG2-SEQ ipc lane={lane_key} phase=deposit stage={int(_ipc_base)} "
                     f"bytes={int(total_bytes)} handle={_ipc_hex[:16]}.. -- on-card "

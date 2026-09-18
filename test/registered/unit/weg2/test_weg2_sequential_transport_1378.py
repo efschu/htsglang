@@ -552,6 +552,13 @@ class PersistentBuffersAndOnCardIpc(_TransportHarness):
         super().setUp()
         os.environ.pop(bx.SEQ_PERSIST_BUFFERS_ENV, None)  # default: on
         os.environ.pop(bx.SEQ_ONCARD_IPC_ENV, None)       # default: on
+        # weg2xsn268/269: host lanes run pageable by default (cudaHostUnregister
+        # was the 12.5-s stall); this class tests the REGISTERED A/B form.
+        os.environ[bx.SEQ_HOST_REGISTER_ENV] = "1"
+
+    def tearDown(self):
+        os.environ.pop(bx.SEQ_HOST_REGISTER_ENV, None)
+        super().tearDown()
 
     def test_the_lane_buffer_is_registered_once_and_reused(self):
         ops = _PinOps()

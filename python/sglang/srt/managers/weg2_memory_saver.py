@@ -1051,6 +1051,50 @@ class VramCredit:
             self._store(handle, state)
             return total
 
+    def debit(self, tag: str, nbytes: int) -> bool:
+        """S takes device bytes BACK from its own published credit for a
+        transient it parks on this card: the on-card IPC staging of a
+        deposit lane (weg2xsn269, 18.09.). The staging is a cudaMalloc on
+        the SAME card the waking rank resumes into; unbooked, the waker's
+        check (credit and free VRAM, both true at that instant) and the
+        depositor's next staging raced 240 ms apart and the waker's
+        cuMemCreate ran out of memory -- the memory saver's CURESULT_CHECK
+        is an exit(1), so TP0 vanished without a traceback and group D died
+        (xsn269 flip 4). Booked here as consumed bytes under the same lock
+        the waker claims under, a staging can only take what the waker was
+        never promised. Returns False (nothing written) when the balance
+        does not cover it; the caller then takes the host path."""
+        want = max(0, int(nbytes))
+        with self._locked(True) as handle:
+            state = self._load(handle)
+            if not state:
+                return False
+            credit = int(state.get("credit_bytes", 0))
+            consumed = int(state.get("consumed_bytes", 0))
+            if credit - consumed < want:
+                return False
+            state["consumed_bytes"] = consumed + want
+            state["staged_bytes"] = int(state.get("staged_bytes", 0)) + want
+            stagings = list(state.get("stagings", []))
+            stagings.append(str(tag))
+            state["stagings"] = stagings
+            self._store(handle, state)
+            return True
+
+    def refund(self, tag: str, nbytes: int) -> None:
+        """The staging booked by :meth:`debit` is freed: the bytes return
+        to the balance (never below zero, never past what was staged)."""
+        want = max(0, int(nbytes))
+        with self._locked(True) as handle:
+            state = self._load(handle)
+            if not state or want == 0:
+                return
+            staged = int(state.get("staged_bytes", 0))
+            give = min(want, staged)
+            state["staged_bytes"] = staged - give
+            state["consumed_bytes"] = max(0, int(state.get("consumed_bytes", 0)) - give)
+            self._store(handle, state)
+
     def leg_complete(self) -> None:
         """S closes its leg.  This is W's terminating predicate."""
         with self._locked(True) as handle:

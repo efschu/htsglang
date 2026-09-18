@@ -2997,6 +2997,35 @@ class SchedulerWeightUpdaterManager:
             return weights_only
         return {str(t): int(v) for t, v in census.items()}, WEG2_TAG_POPULATION_ALL
 
+    def _weg2_stage_charge(self):
+        """weg2xsn269 (18.09.): the deposit lanes' on-card IPC staging is a
+        cudaMalloc on the card the WAKING rank resumes into. Booked here
+        against this leg's VRAM credit (``debit`` under the same lock the
+        waker claims under) so that a staging can only take bytes the waker
+        was never promised; freed stagings ``refund``. Returns the
+        ``(nbytes) -> refund | None`` the bounce expects, or None when this
+        leg has no credit (then the staging is unbooked, as before)."""
+        credit = getattr(self, "_weg2_leg_credit", None)
+        if credit is None or not hasattr(credit, "debit"):
+            return None
+
+        def _charge(nbytes: int):
+            n = int(nbytes)
+            if not credit.debit("ipc-stage", n):
+                logger.info(
+                    "WEG2-SEQ stage-charge REFUSED %d MiB: the card's credit balance "
+                    "is what the waking rank is promised; host path for this tag",
+                    n >> 20,
+                )
+                return None
+
+            def _refund():
+                credit.refund("ipc-stage", n)
+
+            return _refund
+
+        return _charge
+
     def _weg2_open_credit_for_leg(self, epoch):
         """S's side: the counter for THIS card, opened for THIS FLIP.
 
@@ -5983,6 +6012,7 @@ class SchedulerWeightUpdaterManager:
                             # written -- MEASURED target shares of the draft.
                             no_write=getattr(self, "_weg2_xchg_no_write", None),
                             buffer_slot=int(_slot),
+                            stage_charge=self._weg2_stage_charge(),
                             # #1358: the identity the host-slot lines carry.
                             # This is the only frame where the group and the
                             # rank both exist.
@@ -6555,6 +6585,9 @@ class SchedulerWeightUpdaterManager:
             # anything.  The epoch is THE FLIP'S, carried on the request by the
             # front that owns it -- see :meth:`_weg2_open_credit_for_leg`.
             credit = self._weg2_open_credit_for_leg(getattr(recv_req, "epoch", None))
+            # weg2xsn269: the deposit lanes of this leg book their on-card
+            # IPC stagings against this credit (see _weg2_stage_charge).
+            self._weg2_leg_credit = credit
             _weg2_ph("census_credit")
             # #1273 S5b: the SOURCE half of the shadow, at the last instant the
             # weight pages are mapped.  See _weg2_shadow_source_leg for why it
