@@ -248,6 +248,16 @@ def _get_draft_model_runner(draft_worker):
     return None
 
 
+def _weg2_wake_collect_workers() -> int:
+    """Collects in flight on the wake side (SGLANG_WEG2_WAKE_COLLECT_WORKERS,
+    default 2, 1 = the 2026-09-15 form)."""
+    import os as _os
+    try:
+        return max(1, min(4, int(_os.environ.get("SGLANG_WEG2_WAKE_COLLECT_WORKERS", "2") or "2")))
+    except ValueError:
+        return 2
+
+
 def _weg2_wake_overlap_armed() -> bool:
     """SGLANG_WEG2_WAKE_OVERLAP (default 1): the wake side collects tag t on
     a single worker thread while resuming tag t+1."""
@@ -563,6 +573,7 @@ class SchedulerWeightUpdaterManager:
     _weg2_prewarm_thread: Any = None
     _weg2_bar1: Any = None            # BAR1 lanes registry (weg2/bar1_lanes.py), built at boot
     _weg2_bar1_thread: Any = None     # its setup thread (windows served, peers mapped)
+    _weg2_flip_index_now: object = None  # the flip index of the leg in progress (BAR1 flag seq = '<flip>-<tag>')
     #: weg2xsn269/270: the VramCredit of the leg this rank is SLEEPING
     #: through (set in release_memory_occupation, read by
     #: _weg2_stage_charge). A slots dataclass: an undeclared attribute
@@ -6240,8 +6251,11 @@ class SchedulerWeightUpdaterManager:
                         _b1_mode = None
                         if (_b1_role is not None
                                 and (_b1_role == "src") == (phase == bx.PHASE_DEPOSIT)):
+                            _fi = getattr(self, "_weg2_flip_index_now", None)
+                            _b1_seq = (f"{int(_fi)}-{tag}" if _fi is not None and int(_fi) >= 0
+                                       else int(_seq))
                             _b1_mode = _b1.lane_mode(
-                                _lane_key, _b1_role, seq=_seq,
+                                _lane_key, _b1_role, seq=_b1_seq,
                                 liveness=self._weg2_cocard_peer_alive)
                             if _b1_mode != b1.MODE_BAR1:
                                 logger.info("WEG2-BAR1 lane=%s phase=%s seq=%d via=host "
@@ -6251,7 +6265,7 @@ class SchedulerWeightUpdaterManager:
                         if _b1_mode == b1.MODE_BAR1:
                             last = b1.run_bar1_units(
                                 _lane_descs, ops, lanes=_b1, lane_key=_lane_key,
-                                role=_b1_role, seq=int(_seq), phase=phase,
+                                role=_b1_role, seq=_b1_seq, phase=phase,
                                 no_write=getattr(self, "_weg2_xchg_no_write", None),
                                 liveness=self._weg2_cocard_peer_alive,
                                 device=device, log=logger.info)
@@ -6975,6 +6989,10 @@ class SchedulerWeightUpdaterManager:
             # co-located pair (weg2xsn35/36). The serialisation now happens
             # per COPY inside run_bounce_leg (pcie_uuid); the waits between
             # the copies stay outside every lock.
+            try:
+                self._weg2_flip_index_now = _weg2_flip_index_of(getattr(recv_req, "epoch", None))
+            except Exception:  # noqa: BLE001 -- the stubs carry no epoch: the counter seq stays
+                pass
             with self._weg2_pcie_lock_retired("sleep-D2H " + ",".join(weights_tags)):
                 _t_prev_end = None
                 logger.info("WEG2-SLEEP-PRELOOP ms " + " ".join(f"{_n}={_ms:.0f}" for _n, _ms in _weg2_ph_l) + f" t={time.time():.3f}")
@@ -7455,13 +7473,22 @@ class SchedulerWeightUpdaterManager:
                 getattr(recv_req, "epoch", None)
             )
             # #1378 xsn36: RETIRED, same shape as the sleep leg above.
+            try:
+                self._weg2_flip_index_now = _weg2_flip_index_of(getattr(recv_req, "epoch", None))
+            except Exception:  # noqa: BLE001 -- the stubs carry no epoch: the counter seq stays
+                pass
             with self._weg2_pcie_lock_retired("wake-H2D " + ",".join(weights_tags)):
                 # 2026-09-15 (Punkt 2, SGLANG_WEG2_WAKE_OVERLAP default 1)
                 _wake_worker = None
                 _wake_futs = []
                 if _weg2_wake_overlap_armed():
                     from concurrent.futures import ThreadPoolExecutor as _TPE
-                    _wake_worker = _TPE(max_workers=1, thread_name_prefix="weg2-wake-collect")
+                    # 18.09. (xsn367): TWO collects in flight -- the flip's critical chain
+                    # is PP0's tags in series, the other ranks' tags overlap it
+                    # (they arrive over other links); with one worker PP0 idled
+                    # 0.8 s behind weights_6/7 at every flip
+                    _n_wake_workers = _weg2_wake_collect_workers()
+                    _wake_worker = _TPE(max_workers=_n_wake_workers, thread_name_prefix="weg2-wake-collect")
                 for tag in weights_tags:
                     # C14: the device bytes this tag needs may only exist once
                     # the co-located SLEEPING rank has released them, and with
@@ -7679,8 +7706,8 @@ class SchedulerWeightUpdaterManager:
                             # found no VRAM and the chain wedged (W68 at the
                             # sleeper's drain wait). Resume t+1 may overlap
                             # collect t, nothing further: wait for t-1 here.
-                            if len(_wake_futs) >= 2:
-                                _wake_futs[-2][1].result()
+                            if len(_wake_futs) > _n_wake_workers:
+                                _wake_futs[-(_n_wake_workers + 1)][1].result()
                         else:
                             self._weg2_wake_collect_one(tag)
                     elif (str(tag) == _WEIGHTS_DRAFT_TAG

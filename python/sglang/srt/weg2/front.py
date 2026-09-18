@@ -1343,6 +1343,42 @@ def interleave_pause_order(
 # --------------------------------------------------------------------------
 
 
+def interleave_chain_card(order: List[str], why: str, tag_cards: Dict[str, Any],
+                          env=None) -> Tuple[List[str], str]:
+    """18.09. (xsn367): the SOURCE card that carries the most chunk tags (PP0
+    on the 5090: six of eight bands) is the flip's critical chain -- the
+    destination collects two tags at once now, and PP0's chain must never
+    wait behind the other cards' bands. Alternate that card's tags (in the
+    order given) with the others (in the order given); the base tag keeps
+    closing the sleep. ``SGLANG_WEG2_FLIP_ORDER_CHAIN=0`` keeps the order.
+    Identity when there is no map, one card, or fewer than two chunk tags
+    on the chain card."""
+    env = os.environ if env is None else env
+    if str(env.get("SGLANG_WEG2_FLIP_ORDER_CHAIN", "1")).strip().lower() in ("0", "false", "no", "off"):
+        return list(order), why
+    chunks = [t for t in order if is_weights_chunk_tag(t) and tag_cards.get(t)]
+    if len(chunks) < 3:
+        return list(order), why
+    count: Dict[int, int] = {}
+    for t in chunks:
+        count[int(tag_cards[t][0])] = count.get(int(tag_cards[t][0]), 0) + 1
+    if len(count) < 2:
+        return list(order), why
+    chain = max(sorted(count), key=lambda c: count[c])
+    if count[chain] < 2:
+        return list(order), why
+    mine = [t for t in chunks if int(tag_cards[t][0]) == chain]
+    others = [t for t in chunks if int(tag_cards[t][0]) != chain]
+    merged: List[str] = []
+    while mine or others:
+        if mine:
+            merged.append(mine.pop(0))
+        if others:
+            merged.append(others.pop(0))
+    rest = [t for t in order if t not in set(chunks)]
+    return merged + rest, why + f", chain card {chain} interleaved"
+
+
 @dataclass
 class Group:
     name: str
@@ -4456,6 +4492,8 @@ class Front:
             self.weights_tags, self.src_chunk_cards.get(src, {}), free_mib,
             dst_cards=self.src_chunk_cards.get(dst, {}),
         )
+        pause_order, why = interleave_chain_card(
+            pause_order, why, self.src_chunk_cards.get(src, {}))
         logger.info(
             "WEG2-FLIP-ORDER epoch=%d src=%s driver_free=%s pause_order=%s resume_order=%s (%s) "
             "-- applied to the GATHERED sleep leg's tag list (C9), not to a per-tag RPC loop",

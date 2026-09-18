@@ -166,9 +166,9 @@ def test_ring_transport_moves_every_byte_flat_and_strided(tmp_path, ring):
         assert s2_dst[r * dpitch:r * dpitch + run] == s2_src[r * spitch:r * spitch + run]
         assert s2_dst[r * dpitch + run:(r + 1) * dpitch] == bytes(dpitch - run)  # only payload
     assert bytes(nw_dst) == bytes(500)                       # consumed, not written
-    # nothing left behind: every flag consumed, the ring's tail freed
+    # nothing left behind but the collector's `done` (the depositor's next tag consumes it)
     d = dep.flags("p0", "src")
-    assert not [f for f in os.listdir(d) if not f.endswith(".tmp")]
+    assert [f for f in os.listdir(d) if not f.endswith(".tmp")] == ["done.7.0"]
 
 
 def test_collector_refuses_a_disagreeing_plan(tmp_path):
@@ -197,3 +197,42 @@ def test_no_window_on_this_side_is_a_named_refusal(tmp_path):
     why = b1.run_bar1_units([], _HostOps(), lanes=dep, lane_key="p0", role="src", seq=0,
                             phase="deposit", log=lambda *_a: None)
     assert "no window" in why
+
+
+def test_string_seq_and_done_flag_between_tags(tmp_path):
+    """18.09.: the seq is '<flip>-<tag>' (deterministic on both sides); the
+    depositor's next tag waits for the collector's `done` of the previous
+    one before it writes the slots again."""
+    slot, ring = 4096, 4
+    window = bytearray(slot * ring)
+    dep = _lanes(tmp_path, "P", 0)
+    col = _lanes(tmp_path, "D", 1)
+    col.recv["p0"] = SimpleNamespace(dptr=_addr(window), slot_bytes=slot, ring=ring)
+    dep.peers["p0"] = SimpleNamespace(dev_ptr=_addr(window), slot_bytes=slot, ring=ring)
+    ops = _HostOps()
+    src = bytearray(os.urandom(20000))
+    dst = bytearray(20000)
+    descs = [SimpleNamespace(kind=tp.FLAT, nbytes=20000, src_off=0, dst_off=0, param_name="w",
+                             tag="weights_0", src_ptr=_addr(src), dst_ptr=_addr(dst))]
+    out = {}
+
+    def _collect(seq):
+        out[seq] = b1.run_bar1_units(descs, ops, lanes=col, lane_key="p0", role="dst", seq=seq,
+                                     phase="collect", budget_s=5.0, log=lambda *_a: None)
+    th = threading.Thread(target=_collect, args=("7-weights_0",)); th.start()
+    assert b1.run_bar1_units(descs, ops, lanes=dep, lane_key="p0", role="src", seq="7-weights_0",
+                             phase="deposit", budget_s=5.0, log=lambda *_a: None) == ""
+    th.join(10)
+    assert out["7-weights_0"] == "" and bytes(dst) == bytes(src)
+    assert dep.last_seq["p0"] == "7-weights_0"
+    # the collector left a `done` for the depositor's next tag; the flags dir holds nothing else
+    d = col.flags("p0", "dst")
+    assert sorted(os.listdir(d)) == ["done.7-weights_0.0"]
+    # a second tag without the collector running: the depositor consumes `done` and then
+    # (with a small budget) refuses on the missing `free` -- never overwrites blindly
+    src2 = bytearray(os.urandom(20000))
+    descs2 = [SimpleNamespace(kind=tp.FLAT, nbytes=20000, src_off=0, dst_off=0, param_name="w",
+                              tag="weights_1", src_ptr=_addr(src2), dst_ptr=None)]
+    why = b1.run_bar1_units(descs2, ops, lanes=dep, lane_key="p0", role="src", seq="7-weights_1",
+                            phase="deposit", budget_s=0.2, log=lambda *_a: None)
+    assert "no 'free'" in why and "done.7-weights_0.0" not in os.listdir(d)

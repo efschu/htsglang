@@ -389,10 +389,19 @@ class TestFlipUsesTheOrder(CustomTestCase):
     def _run(self, f):
         old = front_mod._nvml_free
         front_mod._nvml_free = lambda: [front_mod.CardFree(i, f"uuid{i}", int(v), 0) for i, v in FREE_AT_INTERLEAVE_START.items()]
+        # 18.09.: the chain-card interleave (test_weg2_flip_order_chain_xsn368)
+        # sits ON TOP of the tightest-card-first law asserted here; off for this law
+        import os as _os
+        _prev = _os.environ.get("SGLANG_WEG2_FLIP_ORDER_CHAIN")
+        _os.environ["SGLANG_WEG2_FLIP_ORDER_CHAIN"] = "0"
         try:
             asyncio.run(f.flip("P", "D"))
         finally:
             front_mod._nvml_free = old
+            if _prev is None:
+                _os.environ.pop("SGLANG_WEG2_FLIP_ORDER_CHAIN", None)
+            else:
+                _os.environ["SGLANG_WEG2_FLIP_ORDER_CHAIN"] = _prev
 
     def test_p_as_source_pauses_tightest_card_first_and_d_resumes_naturally(self):
         m = {t: list(v) for t, v in chunk_tag_cards(

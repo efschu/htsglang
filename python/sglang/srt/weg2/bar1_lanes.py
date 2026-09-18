@@ -212,11 +212,14 @@ def ring_slot(g: int, ring: int) -> int:
 
 # -- flags (cross-process credits) -------------------------------------------
 
-def _flag_path(d: str, kind: str, seq: int, g: int) -> str:
-    return os.path.join(d, f"{kind}.{int(seq)}.{int(g)}")
+def _flag_path(d: str, kind: str, seq, g: int) -> str:
+    """``seq`` names the tag instance: "<flip index>-<tag>" from the updater
+    (deterministic on both sides, safe under concurrent collects), or the
+    per-lane counter of the desk tests."""
+    return os.path.join(d, f"{kind}.{seq}.{int(g)}")
 
 
-def post_flag(d: str, kind: str, seq: int, g: int, payload: Optional[dict] = None) -> None:
+def post_flag(d: str, kind: str, seq, g: int, payload: Optional[dict] = None) -> None:
     """Atomic: written to a tmp name, renamed into place (the reader unlinks it)."""
     os.makedirs(d, exist_ok=True)
     p = _flag_path(d, kind, seq, g)
@@ -227,7 +230,7 @@ def post_flag(d: str, kind: str, seq: int, g: int, payload: Optional[dict] = Non
     os.replace(tmp, p)
 
 
-def take_flag(d: str, kind: str, seq: int, g: int, timeout_s: float,
+def take_flag(d: str, kind: str, seq, g: int, timeout_s: float,
               liveness=None) -> Optional[dict]:
     """The flag's payload ({} when it carried none) once it exists -- consumed
     (unlinked); None on timeout or when ``liveness()`` says the peer is gone.
@@ -307,6 +310,7 @@ class Bar1Lanes:
         self._group_own: dict = {}
         self._dst_lanes: list = []
         self._windows_logged = False
+        self.last_seq: dict = {}       # lane -> the seq this side ran last (the depositor's done-wait)
 
     # -- helpers ---------------------------------------------------------
     def _ordinal(self) -> int:
@@ -375,7 +379,7 @@ class Bar1Lanes:
         return (int(p.dev_ptr), int(p.slot_bytes), int(p.ring)) if p is not None else None
 
     # -- the per-tag agreement ------------------------------------------------
-    def lane_mode(self, lane_key: str, role: str, seq: int, timeout_s: float = 120.0,
+    def lane_mode(self, lane_key: str, role: str, seq, timeout_s: float = 120.0,
                   liveness=None) -> str:
         """The depositor DECIDES (its peer mapping exists or not) and writes
         ``mode.<seq>``; the collector WAITS for it. Both return MODE_BAR1 or
@@ -613,7 +617,7 @@ class Bar1Lanes:
 # -- the transport: ONE tag over the ring -------------------------------------
 
 def run_bar1_units(descs, ops, *, lanes: Bar1Lanes, lane_key: str, role: str,
-                   seq: int, phase: str, no_write=None, liveness=None,
+                   seq, phase: str, no_write=None, liveness=None,
                    budget_s: float = 120.0, device: int = 0, log=None) -> str:
     """The BAR1 form of ``run_sequential_units``: the tag's pieces cut at the
     ring slot (``tp.batch_descs``), batch g into slot g % ring.
@@ -653,7 +657,7 @@ def run_bar1_units(descs, ops, *, lanes: Bar1Lanes, lane_key: str, role: str,
     _nw = no_write or ()
     t0 = time.perf_counter()
     t_wait = t_copy = 0.0
-    log(f"WEG2-BAR1 mapped lane={lane_key} phase={phase} seq={int(seq)} bytes={total} "
+    log(f"WEG2-BAR1 mapped lane={lane_key} phase={phase} seq={seq} bytes={total} "
         f"units={npieces} batches={len(batches)} slot={slot_bytes >> 20}MiB ring={ring}")
     nb = len(batches)
 
@@ -677,6 +681,16 @@ def run_bar1_units(descs, ops, *, lanes: Bar1Lanes, lane_key: str, role: str,
     # ONE plan record per tag (the batches' pieces by name, tag, size and
     # slot offset) instead of a JSON per batch: the collector checks its own
     # deterministic cut against it once, the per-batch flags stay empty.
+    prev = lanes.last_seq.get(lane_key)
+    lanes.last_seq[lane_key] = seq
+    if role == "src" and prev is not None:
+        # the collector may still be copying the previous tag's last ring-1
+        # batches out of the slots this tag writes first: wait for its done
+        tw = time.perf_counter()
+        if take_flag(d, "done", prev, 0, budget_s, liveness=liveness) is None:
+            return (f"bar1 deposit lane={lane_key} seq={seq}: the previous tag {prev} was never "
+                    f"reported done by the collector within {budget_s:.0f} s")
+        t_wait += time.perf_counter() - tw
     if role == "src":
         post_flag(d, "plan", seq, 0, {"batches": [
             [[str(getattr(descs[pc.desc_index], "param_name", "?")),
@@ -749,14 +763,16 @@ def run_bar1_units(descs, ops, *, lanes: Bar1Lanes, lane_key: str, role: str,
     for g in range(max(0, nb - lag), nb):
         _finish(g)
     if role == "dst":
-        # the ring's last free flags have no taker: leave none behind
+        # the ring's last free flags have no taker: leave none behind; the
+        # depositor's next tag waits for `done` instead
         for g in range(max(0, len(batches) - ring), len(batches)):
             try:
                 os.unlink(_flag_path(d, "free", seq, g))
             except FileNotFoundError:
                 pass
+        post_flag(d, "done", seq, 0)
     total_s = time.perf_counter() - t0
-    log(f"WEG2-BAR1 lane-time lane={lane_key} phase={phase} seq={int(seq)} units={npieces} "
+    log(f"WEG2-BAR1 lane-time lane={lane_key} phase={phase} seq={seq} units={npieces} "
         f"batches={len(batches)} bytes={total} total_ms={total_s * 1000:.0f} "
         f"wait_ms={t_wait * 1000:.0f} copy_sync_ms={t_copy * 1000:.0f} "
         f"rate_GBs={(total / max(total_s, 1e-9)) / 1e9:.1f} via=bar1")
