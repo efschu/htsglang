@@ -184,3 +184,13 @@ def test_unquantized_experts_are_eligible_for_the_generic_shard():
     assert not expert_shard_generic_eligible(None, False, 1, True)
     assert not expert_shard_generic_eligible(None, True, 2, True)
     assert not expert_shard_generic_eligible(None, True, 1, False)
+
+
+def test_offload_exclude_draft_switch(monkeypatch):
+    from sglang.srt.layers.moe.fused_moe_triton.layer import _offload_excludes_draft_layer
+
+    monkeypatch.delenv("SGLANG_MOE_OFFLOAD_EXCLUDE_DRAFT", raising=False)
+    assert not _offload_excludes_draft_layer("mtp.layers.0.mlp.experts")
+    monkeypatch.setenv("SGLANG_MOE_OFFLOAD_EXCLUDE_DRAFT", "1")
+    assert _offload_excludes_draft_layer("mtp.layers.0.mlp.experts")
+    assert not _offload_excludes_draft_layer("model.layers.0.mlp.experts")

@@ -337,6 +337,15 @@ def _warn_host_shard_unreachable_once() -> None:
     )
 
 
+def _offload_excludes_draft_layer(prefix: str) -> bool:
+    import os
+
+    if os.environ.get("SGLANG_MOE_OFFLOAD_EXCLUDE_DRAFT", "") != "1":
+        return False
+    prefix = str(prefix or "")
+    return prefix.startswith("mtp") or ".mtp." in prefix
+
+
 def expert_shard_generic_eligible(quant_config, plan_active, moe_ep_size, opt_in):
     """WP3a expert-index shard eligibility: any non-GGUF weight format under
     an active uneven plan, pure TP, opted in. UNQUANTIZED (quant_config None)
@@ -690,6 +699,14 @@ class FusedMoE(torch.nn.Module):
         self._moe_offload_enabled = self._expert_offload_fraction < 1.0 or bool(
             self._moe_offload_trace_path
         )
+        if self._moe_offload_enabled and _offload_excludes_draft_layer(
+            getattr(self, "_sglang_prefix", "")
+        ):
+            # SGLANG_MOE_OFFLOAD_EXCLUDE_DRAFT=1 (fn4x 19.09.): the NEXTN draft's
+            # experts stay fully resident (INT4 g32: 0.3-0.9 GB per rank) -- the
+            # A/B that tells the draft's offload path from the rest of its forward.
+            self._expert_offload_fraction = 1.0
+            self._moe_offload_enabled = False
         self._expert_offload = None  # MoEExpertOffloadCache, lazily installed
         # WP8 lookahead: (next FusedMoE, predicted local ids) set by the MoE
         # block right before this forward; consumed by exactly one forward.
