@@ -2810,6 +2810,30 @@ def _wave_timing_note(layer_id, e0, e1, e2, n_spill, n_tokens):
 
 
 _WAVE_TP = {"ev": [], "layers": 0, "waves": 0, "spill": 0, "tokens": 0, "forwards": 0}
+_WAVE_SLICE = {"pairs": None}
+
+
+def wave_token_slice_pairs() -> int:
+    """SGLANG_MOE_OFFLOAD_WAVE_SLICE: (token, expert) pairs one grouped GEMM of
+    an expert-major wave may take at once; 0 = whole wave (the old behaviour).
+
+    Why: the expert stream is paid ONCE per chunk (fn6u 19.09.: 18.7 GiB on
+    TP0 per forward, 8.1 s of fetch against 0.8 s of GEMM over the needle's
+    forwards), so a 4x larger prefill chunk buys 4x fewer host->device bytes
+    per token -- but the grouped GEMM's workspace (Marlin) grows with the
+    tokens of the wave, and a 16384-token chunk already OOMed a 3080 (fn6m,
+    514 MiB short). Slicing the wave's tokens keeps that workspace at the
+    slice's size while the wave's experts stay resident in scratch for all
+    slices. Default 81920 pairs = 8192 tokens x top-k 10 = the shape that fits."""
+    if _WAVE_SLICE["pairs"] is None:
+        import os
+
+        raw = str(os.environ.get("SGLANG_MOE_OFFLOAD_WAVE_SLICE", "81920")).strip()
+        try:
+            _WAVE_SLICE["pairs"] = max(0, int(raw))
+        except ValueError:
+            _WAVE_SLICE["pairs"] = 81920
+    return int(_WAVE_SLICE["pairs"])
 
 
 def _wave_timing_note_prefill(layer_id, wave_events, n_spill, n_tokens):
@@ -4361,6 +4385,7 @@ class MoEExpertOffloadCache:
         saved_rsf = cfg.routed_scaling_factor
         _tm = _wave_timing_on()
         _tm_ev = []
+        slice_pairs = wave_token_slice_pairs()
         try:
             cfg.routed_scaling_factor = 1.0
             for w, needed in enumerate([resident_used] + spill_waves):
@@ -4375,42 +4400,51 @@ class MoEExpertOffloadCache:
                     _e1 = torch.cuda.Event(enable_timing=True); _e1.record()
                 lut = self._build_lut(slot_of_needed, topk_ids.dtype, device)
 
-                idx = torch.from_numpy(idx_np).to(device, non_blocking=True)
-                rows = torch.div(idx, K, rounding_mode="floor")
-                tid_w = lut[flat_ids.index_select(0, idx)].unsqueeze(1)
-                tw_w = flat_weights.index_select(0, idx)
-                hs_w = hidden.index_select(0, rows).contiguous()
-                sc_w = (
-                    scale.index_select(0, rows)
-                    if isinstance(scale, torch.Tensor) and scale.shape[0] == T
-                    else scale
-                )
-                rl_w = (
-                    router_logits.index_select(0, rows)
-                    if isinstance(router_logits, torch.Tensor)
-                    and router_logits.dim() >= 1
-                    and router_logits.shape[0] == T
-                    else router_logits
-                )
+                # The wave's experts are resident in scratch now; the grouped
+                # GEMM over its (token, expert) pairs runs in slices so its
+                # workspace is bounded by the slice, not by the chunk (see
+                # wave_token_slice_pairs). Byte-identical: every pair is
+                # computed exactly once and lands in its own partials row.
+                step = slice_pairs if slice_pairs > 0 else int(idx_np.size)
+                for start in range(0, int(idx_np.size), step):
+                    idx = torch.from_numpy(idx_np[start : start + step]).to(
+                        device, non_blocking=True
+                    )
+                    rows = torch.div(idx, K, rounding_mode="floor")
+                    tid_w = lut[flat_ids.index_select(0, idx)].unsqueeze(1)
+                    tw_w = flat_weights.index_select(0, idx)
+                    hs_w = hidden.index_select(0, rows).contiguous()
+                    sc_w = (
+                        scale.index_select(0, rows)
+                        if isinstance(scale, torch.Tensor) and scale.shape[0] == T
+                        else scale
+                    )
+                    rl_w = (
+                        router_logits.index_select(0, rows)
+                        if isinstance(router_logits, torch.Tensor)
+                        and router_logits.dim() >= 1
+                        and router_logits.shape[0] == T
+                        else router_logits
+                    )
 
-                sub_topk = topk_output._replace(
-                    topk_weights=tw_w, topk_ids=tid_w, router_logits=rl_w
-                )
-                sub = dispatch_output._replace(
-                    hidden_states=hs_w,
-                    hidden_states_scale=sc_w,
-                    topk_output=sub_topk,
-                )
-                combine_out = apply_fn(sub)
+                    sub_topk = topk_output._replace(
+                        topk_weights=tw_w, topk_ids=tid_w, router_logits=rl_w
+                    )
+                    sub = dispatch_output._replace(
+                        hidden_states=hs_w,
+                        hidden_states_scale=sc_w,
+                        topk_output=sub_topk,
+                    )
+                    combine_out = apply_fn(sub)
+                    part = combine_out.hidden_states
+                    if partials is None:
+                        partials = torch.zeros(
+                            (T * K, part.shape[-1]), dtype=part.dtype, device=device
+                        )
+                    partials.index_copy_(0, idx, part.to(partials.dtype))
                 if _tm:
                     _e2 = torch.cuda.Event(enable_timing=True); _e2.record()
                     _tm_ev.append((_e0, _e1, _e2))
-                part = combine_out.hidden_states
-                if partials is None:
-                    partials = torch.zeros(
-                        (T * K, part.shape[-1]), dtype=part.dtype, device=device
-                    )
-                partials.index_copy_(0, idx, part.to(partials.dtype))
         finally:
             cfg.routed_scaling_factor = saved_rsf
 

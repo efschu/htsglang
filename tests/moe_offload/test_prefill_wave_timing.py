@@ -47,3 +47,29 @@ def test_the_expert_major_path_records_events_only_when_timing_is_on():
     assert "_wave_timing_note_prefill(" in src and "_wave_timing_on()" in src
     assert src.count("torch.cuda.Event(enable_timing=True)") == 3
     ast.parse(src)
+
+
+def test_wave_token_slice_is_env_gated_and_bounded(monkeypatch):
+    """SGLANG_MOE_OFFLOAD_WAVE_SLICE bounds the grouped GEMM of one expert-major
+    wave to that many (token, expert) pairs; 0 = whole wave; default 81920 =
+    8192 tokens x top-k 10 (the shape that fits a 3080's Marlin workspace)."""
+    import ast
+    import inspect
+    import textwrap
+
+    from sglang.srt.layers.moe import expert_offload as eo
+
+    for raw, want in (("", 81920), ("0", 0), ("4096", 4096), ("-5", 0), ("abc", 81920)):
+        eo._WAVE_SLICE["pairs"] = None
+        if raw == "":
+            monkeypatch.delenv("SGLANG_MOE_OFFLOAD_WAVE_SLICE", raising=False)
+        else:
+            monkeypatch.setenv("SGLANG_MOE_OFFLOAD_WAVE_SLICE", raw)
+        assert eo.wave_token_slice_pairs() == want, raw
+    eo._WAVE_SLICE["pairs"] = None
+    src = textwrap.dedent(inspect.getsource(eo.MoEExpertOffloadCache._run_waves_expert_major))
+    ast.parse(src)
+    assert "wave_token_slice_pairs()" in src
+    assert "for start in range(0, int(idx_np.size), step):" in src
+    # the wave is fetched ONCE, outside the slice loop
+    assert src.index("self._fetch(fetch_plan)") < src.index("for start in range(0, int(idx_np.size), step):")
