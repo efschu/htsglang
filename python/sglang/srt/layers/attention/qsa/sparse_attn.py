@@ -548,6 +548,7 @@ def _sparse_attn_rows_fwd(
     rows,
     scale,
     topk,
+    counts,
     sq_m: tl.constexpr,
     sq_h: tl.constexpr,
     sq_d: tl.constexpr,
@@ -570,6 +571,7 @@ def _sparse_attn_rows_fwd(
     BLOCK_N: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     KV_FP8: tl.constexpr,
+    USE_COUNTS: tl.constexpr,
 ):
     """WP3b: sparse GQA over ABSOLUTE K/V rows, with the LSE.
 
@@ -600,7 +602,18 @@ def _sparse_attn_rows_fwd(
     normalizer = tl.zeros([BLOCK_M], tl.float32)
     accumulator = tl.zeros([BLOCK_M, HEAD_DIM], tl.float32)
     offs_n = tl.arange(0, BLOCK_N)
-    for start in range(0, topk, BLOCK_N):
+    # Owned-row compaction (Task #42, 19.09.): under DCP every rank holds only
+    # its OWN subset of a query's top-k rows (the rest are -1). Looping to
+    # ``topk`` and masking the foreign lanes still runs the tile math for every
+    # lane, so each rank paid the whole query x head x top-k work regardless of
+    # its share -- the Ampere ranks at ~210 ms per layer against 33 ms on the
+    # Blackwell rank, and the chunk waited for them. With the rows sorted so
+    # the owned ones lead, ``counts[query]`` bounds the loop to the owned rows.
+    if USE_COUNTS:
+        limit = tl.load(counts + query).to(tl.int32)
+    else:
+        limit = topk
+    for start in range(0, limit, BLOCK_N):
         current = start + offs_n
         row = tl.load(row_ptr + current * sr_n, mask=current < topk, other=-1).to(tl.int64)
         valid = row >= 0
@@ -657,13 +670,37 @@ def _sparse_attn_rows_fwd(
     )
 
 
-def sparse_attn_rows_triton(q, k_pool, v_pool, rows, scale):
+def compact_owned_rows(rows):
+    """Sort each query's rows so the owned ones (>= 0) lead and the -1 lanes
+    trail, and count the owned ones: (rows_sorted [Tq, topk] int32,
+    counts [Tq] int32). Attention is permutation-invariant over the rows, so
+    the order change is exact up to fp32 summation order."""
+    rows = rows.to(torch.int32)
+    if rows.numel() == 0:
+        return rows.contiguous(), torch.zeros((rows.shape[0],), dtype=torch.int32, device=rows.device)
+    rows_sorted, _ = torch.sort(rows, dim=-1, descending=True)
+    counts = (rows_sorted >= 0).sum(dim=-1, dtype=torch.int32)
+    return rows_sorted.contiguous(), counts.contiguous()
+
+
+def sparse_attn_rows_triton(q, k_pool, v_pool, rows, scale, row_counts=None):
     """(out [Tq, Hq, D] in q.dtype, lse [Tq, Hq] fp32 natural log) for the
-    selected absolute rows; see ``_sparse_attn_rows_fwd``."""
+    selected absolute rows; see ``_sparse_attn_rows_fwd``.
+
+    ``row_counts`` ([Tq] int32, from ``compact_owned_rows``) bounds every
+    query's loop to its leading valid rows; without it the loop runs to
+    ``topk`` and masks."""
     total_q, num_q_heads, head_dim = q.shape
     num_kv_heads = k_pool.shape[1]
     group_size = num_q_heads // num_kv_heads
     rows = rows.to(torch.int32).contiguous()
+    use_counts = row_counts is not None
+    if use_counts:
+        row_counts = row_counts.to(torch.int32).contiguous()
+        if row_counts.shape[0] != rows.shape[0]:
+            raise ValueError("row_counts must have one entry per query row")
+    else:
+        row_counts = rows  # unused pointer; USE_COUNTS=False never reads it
     out = torch.empty_like(q)
     lse = torch.empty((total_q, num_q_heads), dtype=torch.float32, device=q.device)
     if total_q == 0:
@@ -685,6 +722,7 @@ def sparse_attn_rows_triton(q, k_pool, v_pool, rows, scale):
         rows,
         scale,
         rows.shape[-1],
+        row_counts,
         q.stride(0),
         q.stride(1),
         q.stride(2),
@@ -707,6 +745,7 @@ def sparse_attn_rows_triton(q, k_pool, v_pool, rows, scale):
         BLOCK_N=block_n,
         HEAD_DIM=head_dim,
         KV_FP8=kv_fp8,
+        USE_COUNTS=use_counts,
         num_warps=warps,
         num_stages=stages,
     )

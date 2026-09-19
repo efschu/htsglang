@@ -63,7 +63,20 @@ def _resolve_trtllm_sparse_decode():
     return trtllm_batch_decode_with_kv_cache
 
 
-@lru_cache(maxsize=1)
+_QSA_ROWS_COMPACT = {"on": None}
+
+
+def _qsa_rows_compact_on() -> bool:
+    """SGLANG_QSA_ROWS_COMPACT (default 1): under DCP, bound every query's
+    sparse-attention loop to the rows this rank owns instead of masking the
+    foreign lanes (Task #42)."""
+    if _QSA_ROWS_COMPACT["on"] is None:
+        import os
+
+        _QSA_ROWS_COMPACT["on"] = str(os.environ.get("SGLANG_QSA_ROWS_COMPACT", "1")).strip() not in ("", "0")
+    return bool(_QSA_ROWS_COMPACT["on"])
+
+
 @lru_cache(maxsize=1)
 def _qsa_rows_path_armed() -> bool:
     """fn5e 2026-09-16 (PP=3, a 3080 stage): the packed varlen fallback of
@@ -534,7 +547,17 @@ class QwenSparseAttnBackend(AttentionBackend):
         group = get_parallel().dcp_group
         counts = self._dcp_group_q_head_counts(q.shape[1])
         q_all = cp_all_gather_heads_uneven(q.contiguous(), group, counts)
-        out, lse = sparse_attn_rows_triton(q_all, k_pool, v_pool, rows, layer.scaling)
+        if _qsa_rows_compact_on():
+            # Task #42: loop only over the rows this rank owns (see
+            # sparse_attn.compact_owned_rows); the foreign lanes are -1 here.
+            from sglang.srt.layers.attention.qsa.sparse_attn import compact_owned_rows
+
+            rows, row_counts = compact_owned_rows(rows)
+            out, lse = sparse_attn_rows_triton(
+                q_all, k_pool, v_pool, rows, layer.scaling, row_counts=row_counts
+            )
+        else:
+            out, lse = sparse_attn_rows_triton(q_all, k_pool, v_pool, rows, layer.scaling)
         # The merge scales in fp32 and hands back fp32 (fn1x 2026-09-16: every
         # rank died in o_proj with 'float != BFloat16'); the layer's output
         # projection expects the query dtype.
