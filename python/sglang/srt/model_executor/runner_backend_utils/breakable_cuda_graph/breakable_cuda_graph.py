@@ -434,9 +434,17 @@ class BreakableCUDAGraphCapture:
         else:
             graph = torch.cuda.CUDAGraph()
             self._current_graph_needs_instantiate = False
-        graph.capture_begin(
-            pool=self._pool, capture_error_mode=self._capture_error_mode
-        )
+        _cap = self._stream or _current_stream_var.get()
+        if _cap is not None and torch.cuda.current_stream() != _cap:
+            # keep every segment on the capture stream (see _end_current_segment)
+            with torch.cuda.stream(_cap):
+                graph.capture_begin(
+                    pool=self._pool, capture_error_mode=self._capture_error_mode
+                )
+        else:
+            graph.capture_begin(
+                pool=self._pool, capture_error_mode=self._capture_error_mode
+            )
         self._current_graph = graph
 
     def _end_current_segment(self) -> None:
@@ -458,7 +466,22 @@ class BreakableCUDAGraphCapture:
                 "reaching here means the capture is being closed from inside "
                 "that window."
             )
-        graph.capture_end()
+        # 19.09. (fn3f, Task #33): torch refuses `capture_end` on a stream other
+        # than the one `capture_begin` ran on. If a forward left another stream
+        # current at a break point, name the site once (the stack) and end the
+        # segment on the capture's own stream -- the forked side streams were
+        # joined above, so the segment's work is complete on it.
+        _cap = self._stream or _current_stream_var.get()
+        if _cap is not None and torch.cuda.current_stream() != _cap:
+            import traceback
+            logger.warning(
+                "BreakableCUDAGraph: segment end reached on stream %s, the capture began on %s "
+                "-- ending on the capture stream. Site:\n%s",
+                torch.cuda.current_stream(), _cap, "".join(traceback.format_stack(limit=12)))
+            with torch.cuda.stream(_cap):
+                graph.capture_end()
+        else:
+            graph.capture_end()
         self.cuda_graph._append_segment(graph, self._current_graph_needs_instantiate)
         self._current_graph = None
         self._current_graph_needs_instantiate = False
