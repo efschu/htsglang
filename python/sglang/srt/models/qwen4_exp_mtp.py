@@ -188,6 +188,15 @@ class Qwen4ExpForCausalLMMTP(Qwen3_5ForCausalLMMTP):
         logits_output.hidden_states = hc_hidden_states
 
     @torch.no_grad()
+    def weight_name_needed(self, name: str):
+        """Loader veto BEFORE a checkpoint tensor is read (see
+        Qwen4ExpForConditionalGeneration.weight_name_needed). fn4f/fn4g
+        19.09.: without it the draft runner read every tensor of the 144 GB
+        checkpoint through the pread loader's shard buffers and the host ran
+        out of memory. ``load_weights`` keeps only the ``mtp`` namespace; the
+        embedding and lm_head are shared in from the target."""
+        return "mtp" in name
+
     def forward(
         self,
         input_ids: torch.Tensor,

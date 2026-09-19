@@ -634,6 +634,17 @@ class DefaultModelLoader(BaseModelLoader):
             weight_loader_disable_mmap = server_args.weight_loader_disable_mmap
             weight_loader_prefetch = server_args.weight_loader_prefetch_checkpoints
             prefetch_num_threads = server_args.weight_loader_prefetch_num_threads
+            # 19.09. (fn4f): a draft runner loads one block out of the target
+            # checkpoint; prefetching every shard for it pulled 144 GB into the
+            # page cache of a 118 GB host and the boot had to be shot. The
+            # target runner already warmed what the draft reads.
+            if weight_loader_prefetch and getattr(model_config, "is_draft_model", False):
+                logger.info(
+                    "weight loader: checkpoint prefetch skipped for the DRAFT "
+                    "runner (its block is a fraction of the checkpoint; the "
+                    "target's prefetch already warmed the page cache)"
+                )
+                weight_loader_prefetch = False
             weight_loader_drop_cache_after_load = (
                 server_args.weight_loader_drop_cache_after_load
             )
