@@ -1609,11 +1609,22 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
         # Draft-extend spec_info for the extend forward; carries only
         # hidden_states + shape info.
+        # SPEC_TRACE teacher forcing (fn4z 19.09.): logits for EVERY prompt
+        # row of a single-request extend, so the draft's argmax at row i can
+        # be scored against the true token i+2 before any verify machinery.
+        _tf_rows = 0
+        if (
+            _spec_trace_rounds() > 0
+            and not batch.forward_mode.is_idle()
+            and len(batch.extend_lens) == 1
+            and 2 < int(batch.extend_lens[0]) <= 8192
+        ):
+            _tf_rows = int(batch.extend_lens[0])
         batch.spec_info = EagleDraftExtendInput(
             hidden_states=target_hidden_states,
             # draft mode is same with decode mode, only 1 token per req
             num_tokens_per_req=1,
-            num_tokens_for_logprob_per_req=1,
+            num_tokens_for_logprob_per_req=_tf_rows if _tf_rows else 1,
         )
 
         # Run forward (LAST mode: only the final hidden state per request,
@@ -1665,6 +1676,27 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             # forward above; everything below seeds a draft round this group
             # never runs. Return before any pick/broadcast.
             return None
+        if _tf_rows and logits_output.next_token_logits.shape[0] == _tf_rows:
+            try:
+                lg = logits_output.next_token_logits.float()
+                truth = forward_batch.input_ids[1:_tf_rows].long()
+                top1 = lg[:-1].argmax(-1)
+                top5 = torch.topk(lg[:-1], 5, dim=-1).indices
+                a1 = (top1 == truth).float().mean().item()
+                a5 = (top5 == truth[:, None]).any(-1).float().mean().item()
+                logger.info(
+                    "SPEC-TF draft-extend after prefill: rows=%d top1_agree=%.3f "
+                    "top5_agree=%.3f first16_pred=%s first16_truth=%s",
+                    _tf_rows, a1, a5, top1[:16].tolist(), truth[:16].tolist(),
+                )
+            except Exception as e:  # noqa: BLE001
+                logger.warning("SPEC-TF skipped: %s", e)
+            logits_output.next_token_logits = logits_output.next_token_logits[-1:]
+        elif _tf_rows:
+            logger.warning(
+                "SPEC-TF: expected %d logit rows, got %d", _tf_rows,
+                int(logits_output.next_token_logits.shape[0]),
+            )
         maybe_detect_nan(logits_output.next_token_logits, "draft_extend_for_prefill")
         maybe_detect_inf(logits_output.next_token_logits, "draft_extend_for_prefill")
 
