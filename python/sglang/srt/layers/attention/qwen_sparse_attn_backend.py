@@ -385,8 +385,43 @@ class QwenSparseAttnBackend(AttentionBackend):
 
     def _topk_rows(self, topk_indices: torch.Tensor, metadata) -> torch.Tensor:
         """Per-query top-k (logical positions) -> this rank's pool rows."""
-        slots = self._logical_to_physical(topk_indices, metadata)
+        if getattr(metadata, "is_cuda_graph", False):
+            slots = self._logical_to_physical_graph(topk_indices, metadata)
+        else:
+            slots = self._logical_to_physical(topk_indices, metadata)
         return self._local_rows(slots)
+
+    def _logical_to_physical_graph(
+        self, logical_indices: torch.Tensor, metadata
+    ) -> torch.Tensor:
+        """The rows path under a CUDA graph (fn3q, 19.09.): the capture-time
+        ``token_slot_table`` is the ``(rows, 1)`` dummy of
+        ``_capture_cuda_graph_metadata`` and NO replay refresh rewrites it (the
+        replay-prep rebuilds the paged-path buffers only), so
+        ``_logical_to_physical`` clamped every top-k position to column 0 and
+        every graph decode attended KV slot 0 -- coherent text, no context
+        (needle MISS at 351 and 10k tokens alike; the #452 B2 divergence at
+        character 5). Resolve through ``req_to_token`` instead: a stable
+        address, indexed by ``row_req_pool_indices`` -- a graph buffer the
+        replay-prep does refresh -- which is exactly what the eager table
+        (``self.req_to_token[req_pool_indices]``) holds. Pure device ops, so
+        the capture records it and every replay reads the live table."""
+        req_to_token = self.req_to_token
+        if req_to_token is None or metadata.row_req_pool_indices is None:
+            raise RuntimeError(
+                "QSA graph rows path needs req_to_token and row_req_pool_indices"
+            )
+        sequence_ids = metadata.token_to_batch_idx.long()
+        if sequence_ids.numel() != logical_indices.shape[0]:
+            raise ValueError("QSA top-k rows do not match query rows")
+        row_lengths = metadata.sequence_lengths.to(torch.int32).index_select(
+            0, sequence_ids
+        )
+        valid = (logical_indices >= 0) & (logical_indices < row_lengths.unsqueeze(1))
+        req_rows = metadata.row_req_pool_indices.long().index_select(0, sequence_ids)
+        safe = logical_indices.clamp(min=0, max=req_to_token.shape[1] - 1).long()
+        slots = req_to_token[req_rows[:, None], safe]
+        return torch.where(valid, slots, torch.full_like(slots, -1)).to(torch.int32)
 
     def _attend_rows(self, q: torch.Tensor, layer, rows: torch.Tensor) -> torch.Tensor:
         """Sparse attention over ``rows`` for this rank's q heads; under DCP the

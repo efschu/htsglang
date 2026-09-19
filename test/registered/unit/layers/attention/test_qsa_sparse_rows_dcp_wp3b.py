@@ -263,3 +263,32 @@ def test_rows_path_is_the_decode_path_on_every_rank_fn5e():
     assert dec.index("_attend_rows(") < dec.index("_forward_paged_attention(")
     ext = inspect.getsource(qb.QwenSparseAttnBackend.forward_extend)
     assert "self.dcp_size > 1 or (_qsa_rows_path_armed() and q.is_cuda)" in ext
+
+
+def test_graph_rows_resolve_through_req_to_token_not_the_capture_dummy_table():
+    """fn3q 19.09.: under a CUDA graph the metadata's token_slot_table is the
+    (rows, 1) capture dummy; the rows path must read req_to_token through the
+    replay-refreshed row_req_pool_indices, and land on the eager table's slots."""
+    from sglang.srt.layers.attention import qwen_sparse_attn_backend as qb
+
+    b = _backend()
+    n_req, width = 4, 16
+    g = torch.Generator().manual_seed(3)
+    b.req_to_token = torch.randperm(n_req * width, generator=g).reshape(n_req, width).to(torch.int32)
+    seq_lens = torch.tensor([10], dtype=torch.int32)
+    req = torch.tensor([2], dtype=torch.int32)
+    topk = torch.tensor([[0, 3, 9, 10, -1]], dtype=torch.int32)  # 10: beyond the length, -1: none
+    common = dict(token_to_batch_idx=torch.zeros(1, dtype=torch.int32), sequence_lengths=seq_lens,
+                  row_req_pool_indices=req)
+    eager = SimpleNamespace(token_slot_table=b.req_to_token[req.long()], is_cuda_graph=False, **common)
+    graph = SimpleNamespace(token_slot_table=torch.zeros((1, 1), dtype=torch.int32), is_cuda_graph=True, **common)
+    r2t = b.req_to_token
+    expected = torch.tensor([[r2t[2, 0], r2t[2, 3], r2t[2, 9], -1, -1]], dtype=torch.int32)
+    assert torch.equal(b._topk_rows(topk, eager), expected)
+    assert torch.equal(b._topk_rows(topk, graph), expected)
+    # the falsifier: the old static resolver over the dummy table lands every position on slot 0
+    dummy = qb.QwenSparseAttnBackend._logical_to_physical(topk, graph)
+    assert bool(dummy[0, :3].eq(0).all()) and not torch.equal(dummy, expected)
+    b.req_to_token = None
+    with pytest.raises(RuntimeError):
+        b._topk_rows(topk, graph)
