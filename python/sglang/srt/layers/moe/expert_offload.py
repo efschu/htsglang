@@ -3387,6 +3387,18 @@ class MoEExpertOffloadCache:
             )
         R, E = self.resident_count, self.num_local_experts
         ids = [int(e) for e in data[key]]
+        if len(ids) != E:
+            # fn4h 19.09.: the file describes another expert space (a rank's
+            # expert-split target layer: 313/105/97 ids) while THIS layer holds
+            # a different set (the MTP draft's replicated 512). Not this
+            # layer's file -> static [0,R) residency, said once.
+            logging.getLogger(__name__).warning(
+                "SGLANG_MOE_HOTSET_FILE %s layer %s lists %d experts but this "
+                "layer holds %d (a different expert space); keeping the static "
+                "[0,R) residency here",
+                path, key, len(ids), E,
+            )
+            return
         if any(e < 0 or e >= E for e in ids):
             raise RuntimeError(
                 f"SGLANG_MOE_HOTSET_FILE layer {key}: expert id out of [0,{E})"
