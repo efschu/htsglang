@@ -285,6 +285,40 @@ def _get_plan_stream(
         return None, contextlib.nullcontext()
 
 
+def _spec_trace_rounds() -> int:
+    """SGLANG_SPEC_TRACE=N: log the first N verify rounds -- draft ids, the
+    target's per-row picks, accept length and the draft-extend top-5 -- to
+    tell 'plausible but wrong' from 'noise' (fn4r-fn4u 19.09.: accept 1.2)."""
+    import os
+
+    try:
+        return int(os.environ.get("SGLANG_SPEC_TRACE", "0") or 0)
+    except ValueError:
+        return 0
+
+
+def _log_spec_trace(worker, verify_input, predict, accept_lens, accept_index) -> None:
+    try:
+        num_draft = int(worker.speculative_num_draft_tokens)
+        draft = verify_input.draft_token.view(-1, num_draft).tolist()
+        if predict.numel() == len(draft) * num_draft:
+            target = predict.view(-1, num_draft).tolist()
+        else:
+            target = [predict.tolist()] * len(draft)
+        acc = accept_lens.tolist()
+        top5 = getattr(worker, "_spec_trace_top5", None)
+        top5 = top5.tolist() if top5 is not None else None
+        for i in range(min(len(draft), 4)):
+            logger.info(
+                "SPEC-TRACE round=%d req=%d draft=%s target=%s accept=%s top5_prev=%s",
+                worker._spec_trace_done, i, draft[i], target[i],
+                acc[i] if i < len(acc) else None,
+                top5[i] if top5 is not None and i < len(top5) else None,
+            )
+    except Exception as e:  # noqa: BLE001 - a trace must never kill the loop
+        logger.warning("SPEC-TRACE skipped: %s", e)
+
+
 def _qsa_index_share_requested(hf_config) -> bool:
     """--json-model-override-args writes top-level hf_config attributes, while
     checkpoint configs carry the flag on the nested text_config; read both.
@@ -1850,6 +1884,10 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             solo_single_rank=self._spec_solo_active,
             fuse=True,
         )
+        if _spec_trace_rounds() > 0:
+            self._spec_trace_top5 = torch.topk(
+                draft_logits_output.next_token_logits.float(), 5, dim=-1
+            ).indices
         ret_hidden_states = draft_logits_output.hidden_states
 
         # Construct the return values
@@ -3000,6 +3038,11 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 "accept_index@post_sample", accept_index, -1, predict.numel()
             )
         new_seq_lens = batch.seq_lens + accept_lens
+        if _spec_trace_rounds() > 0:
+            done = getattr(self, "_spec_trace_done", 0)
+            if done < _spec_trace_rounds():
+                self._spec_trace_done = done + 1
+                _log_spec_trace(self, verify_input, predict, accept_lens, accept_index)
         # Round 7b posten 0: the serving group's PER-POSITION acceptance, so it
         # can be put next to the lane's. Off unless the probe env is set, and
         # the D2H it costs is the reason -- a diagnostic must not price the
