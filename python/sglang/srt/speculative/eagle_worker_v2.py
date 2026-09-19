@@ -1617,14 +1617,14 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             _spec_trace_rounds() > 0
             and not batch.forward_mode.is_idle()
             and len(batch.extend_lens) == 1
-            and 2 < int(batch.extend_lens[0]) <= 8192
+            and 2 < int(batch.extend_lens[0]) <= 2048
         ):
             _tf_rows = int(batch.extend_lens[0])
         batch.spec_info = EagleDraftExtendInput(
             hidden_states=target_hidden_states,
             # draft mode is same with decode mode, only 1 token per req
             num_tokens_per_req=1,
-            num_tokens_for_logprob_per_req=_tf_rows if _tf_rows else 1,
+            num_tokens_for_logprob_per_req=1,
         )
 
         # Run forward (LAST mode: only the final hidden state per request,
@@ -1638,6 +1638,18 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         batch.capture_hidden_mode = capture_hidden_mode
         forward_batch = ForwardBatch.init_new(batch, self.draft_runner)
         forward_batch.return_logprob = False
+        if _tf_rows:
+            # Input logprobs over every prompt row: the LogitsProcessor's own
+            # extend_return_logprob path (top-5 ids per row + logprob of the
+            # true next token); next_token_logits stays the last row.
+            truth = torch.cat(
+                [forward_batch.input_ids[1:_tf_rows], forward_batch.input_ids[-1:]]
+            ).long()
+            forward_batch.return_logprob = True
+            forward_batch.top_logprobs_nums = [5]
+            forward_batch.token_ids_logprobs = [None]
+            forward_batch.extend_logprob_start_lens_cpu = [0]
+            forward_batch.extend_input_logprob_token_ids_gpu = truth
         if mm_input_embeds is not None:
             forward_batch.mm_input_embeds = mm_input_embeds
 
@@ -1676,27 +1688,25 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             # forward above; everything below seeds a draft round this group
             # never runs. Return before any pick/broadcast.
             return None
-        if _tf_rows and logits_output.next_token_logits.shape[0] == _tf_rows:
+        if _tf_rows:
             try:
-                lg = logits_output.next_token_logits.float()
-                truth = forward_batch.input_ids[1:_tf_rows].long()
-                top1 = lg[:-1].argmax(-1)
-                top5 = torch.topk(lg[:-1], 5, dim=-1).indices
-                a1 = (top1 == truth).float().mean().item()
-                a5 = (top5 == truth[:, None]).any(-1).float().mean().item()
+                idx = logits_output.input_top_logprobs_idx
+                idx = idx[0] if isinstance(idx, list) and len(idx) == 1 else idx
+                truth = forward_batch.input_ids[1:_tf_rows].tolist()
+                n = min(len(truth), len(idx))
+                top1 = sum(1 for r in range(n) if idx[r] and idx[r][0] == truth[r])
+                top5 = sum(1 for r in range(n) if idx[r] and truth[r] in idx[r][:5])
+                lp = logits_output.input_token_logprobs
+                lp_mean = float(lp[:n].float().mean().item()) if lp is not None else float("nan")
                 logger.info(
                     "SPEC-TF draft-extend after prefill: rows=%d top1_agree=%.3f "
-                    "top5_agree=%.3f first16_pred=%s first16_truth=%s",
-                    _tf_rows, a1, a5, top1[:16].tolist(), truth[:16].tolist(),
+                    "top5_agree=%.3f mean_logprob_truth=%.3f first12_top1=%s first12_truth=%s",
+                    n, top1 / max(n, 1), top5 / max(n, 1), lp_mean,
+                    [idx[r][0] if idx[r] else -1 for r in range(min(n, 12))], truth[:12],
                 )
             except Exception as e:  # noqa: BLE001
                 logger.warning("SPEC-TF skipped: %s", e)
-            logits_output.next_token_logits = logits_output.next_token_logits[-1:]
-        elif _tf_rows:
-            logger.warning(
-                "SPEC-TF: expected %d logit rows, got %d", _tf_rows,
-                int(logits_output.next_token_logits.shape[0]),
-            )
+            forward_batch.return_logprob = False
         maybe_detect_nan(logits_output.next_token_logits, "draft_extend_for_prefill")
         maybe_detect_inf(logits_output.next_token_logits, "draft_extend_for_prefill")
 
