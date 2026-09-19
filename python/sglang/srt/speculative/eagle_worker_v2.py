@@ -55,7 +55,7 @@ from sglang.srt.model_executor.runner import (
     DecodeCudaGraphRunner,
     get_batch_sizes_to_capture,
 )
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_parallel, get_spec
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative import accept_position_probe
 from sglang.srt.speculative.adaptive_runtime_state import (
