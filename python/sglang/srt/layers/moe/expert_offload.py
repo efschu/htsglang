@@ -3448,6 +3448,9 @@ class MoEExpertOffloadCache:
             from sglang.srt.layers.nan_guard import nan_guard_on
             if not nan_guard_on():
                 return
+            import os
+            if os.environ.get("SGLANG_NAN_GUARD_FETCH", "1").strip() in ("0", "off"):
+                return  # the per-fetch check joins copy and compute -- a race hides behind it
             import torch
             slots = [int(sl) for _e, sl in fetch_plan]
             for attr, dst in self._resident.items():
