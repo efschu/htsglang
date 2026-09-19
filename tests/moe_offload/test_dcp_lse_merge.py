@@ -65,7 +65,9 @@ def _run(monkeypatch, mode, dtype):
     monkeypatch.setattr(comm, "cp_local_head_bounds", lambda g, c: bounds[g.rank_in_group])
     T, H, D = 7, 6, 4
     w = _World()
-    outs = [torch.randn(T, H, D, dtype=torch.bfloat16) for _ in range(3)]
+    # fp32 partials, as the QSA rows kernel hands them over (fn7j): the bf16
+    # wire must be chosen by the option, not inherited from the input dtype
+    outs = [torch.randn(T, H, D, dtype=torch.float32) for _ in range(3)]
     lses = [torch.randn(T, H) for _ in range(3)]
     for r in range(3):
         w.lses[r] = lses[r]

@@ -284,7 +284,7 @@ def cp_lse_ag_out_a2a_mha_uneven(
     scale = torch.exp(cp_attn_lse - global_lse).unsqueeze(-1)
     scale = torch.nan_to_num(scale, nan=0.0, posinf=0.0, neginf=0.0)
     out = torch.nan_to_num(cp_attn_out, nan=0.0, posinf=0.0, neginf=0.0) * scale
-    wire_dtype = cp_attn_out.dtype if lse_merge_reduce_dtype() == "bf16" else torch.float32
+    wire_dtype = torch.bfloat16 if lse_merge_reduce_dtype() == "bf16" else torch.float32
     tokens, _h, dim = out.shape
     rank = cp_group.rank_in_group
     mine = counts[rank]
@@ -335,7 +335,9 @@ def cp_lse_ag_out_ar_mha_uneven(
     # SGLANG_DCP_LSE_MERGE_DTYPE=bf16 the scaled partials are reduced in the
     # query dtype (half the bytes); the scale itself stays fp32.
     if lse_merge_reduce_dtype() == "bf16" and out.dtype == torch.float32:
-        out = cp_group.all_reduce(out.to(cp_attn_out.dtype)).to(torch.float32)
+        # the QSA rows kernel hands its partials over in fp32 (fn7j): the wire
+        # dtype has to be named, not inherited from the input
+        out = cp_group.all_reduce(out.to(torch.bfloat16)).to(torch.float32)
     else:
         out = cp_group.all_reduce(out)
 

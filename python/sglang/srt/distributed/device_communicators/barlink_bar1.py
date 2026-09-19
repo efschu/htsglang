@@ -4986,10 +4986,16 @@ class BarlinkBar1Transport:
                 min(slot, max(0, int(length) - k * slot))
                 for length in recv_bytes
             ]
+            # A block that finished in an earlier round carries length 0 in
+            # this one; its offset must then stay at its own END, not walk
+            # on by k*slot -- fn7j (19.09., uneven LSE-merge a2a, blocks
+            # 15/5/4 heads): the last block's base + k*slot lay past the end
+            # of the input tensor and the extension's bounds check
+            # (off + len <= in_bytes, len 0) refused the whole collective.
             self._a2a_one_round(
                 comm, output, inp, s_len, e_len,
-                [b + k * slot for b in s_base],
-                [b + k * slot for b in e_base],
+                [b + min(k * slot, int(length)) for b, length in zip(s_base, send_bytes)],
+                [b + min(k * slot, int(length)) for b, length in zip(e_base, recv_bytes)],
                 kernel_bytes,
                 op_label=op_label,
             )
