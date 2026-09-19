@@ -41,3 +41,13 @@ def test_the_switch_is_the_moe_timing_switch(monkeypatch):
             monkeypatch.setenv("SGLANG_MOE_OFFLOAD_TIMING", raw)
         assert hb._attn_timing_on() is want, raw
     hb._ATTN_T["on"] = None
+
+
+def test_timing_is_off_while_a_stream_captures(monkeypatch):
+    """fn7e: the verify graph runs an extend forward through forward_extend;
+    inside a capture neither the flush's synchronize nor elapsed_time are
+    permitted, so the timer must stand down there."""
+    import inspect
+
+    src = inspect.getsource(hb.HybridLinearAttnBackend.forward_extend)
+    assert "_attn_timing_on() and not torch.cuda.is_current_stream_capturing()" in src

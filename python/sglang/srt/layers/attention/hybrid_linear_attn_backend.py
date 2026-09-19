@@ -1072,7 +1072,11 @@ class HybridLinearAttnBackend(AttentionBackend):
         **kwargs,
     ):
         is_full = self._is_full_attn(layer, kwargs.get("layer_id"))
-        _tm = _attn_timing_on()
+        # Never inside a graph capture: the verify graph is an extend forward
+        # through this very method, and the flush's synchronize (and the
+        # events' elapsed_time) are not permitted while a stream captures
+        # (fn7e 19.09.: cudaErrorStreamCaptureUnsupported at capture).
+        _tm = _attn_timing_on() and not torch.cuda.is_current_stream_capturing()
         if _tm:
             _attn_timing_begin(
                 getattr(layer, "layer_id", kwargs.get("layer_id")),
