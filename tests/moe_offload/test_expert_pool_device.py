@@ -113,3 +113,10 @@ def test_take_report_counts_misses_since_the_last_report_and_resets():
     ep.step_reference(t, _ids(2), b)
     assert ep.take_report(t) == (2, 2)
     assert ep.take_report(t) == (0, 0)
+
+
+def test_hotset_path_template_names_the_ranks_own_file():
+    from sglang.srt.layers.moe.expert_offload import hotset_path_for_rank
+
+    assert hotset_path_for_rank("/x/hot_tp{rank}.json", 2) == "/x/hot_tp2.json"
+    assert hotset_path_for_rank("/x/hot.json", 2) == "/x/hot.json"

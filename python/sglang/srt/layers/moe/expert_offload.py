@@ -3376,6 +3376,7 @@ class MoEExpertOffloadCache:
             return  # static [0,R) residency (F3)
         if self._hot_frozen:
             return
+        path = hotset_path_for_rank(path, getattr(self.layer, "moe_tp_rank", 0))
         data = _load_hotset_file(path)
         layer_id = getattr(self.layer, "layer_id", None)
         key = str(layer_id)
@@ -3424,6 +3425,10 @@ class MoEExpertOffloadCache:
             return
         if not self._installed:
             raise RuntimeError("install_pool() requires install() first")
+        # The frozen hot set (SGLANG_MOE_HOTSET_FILE) is installed BEFORE the
+        # tables snapshot the layout: the residents [0, R) then are the file's
+        # hottest R experts, not expert ids 0..R-1.
+        self.freeze_from_source()
         if self._hot_enabled and not self._hot_frozen:
             raise RuntimeError(
                 "pool mode: live hot-set calibration (SGLANG_MOE_HOT_RESIDENCY=1) "
@@ -4249,6 +4254,13 @@ class MoEExpertOffloadCache:
 # Per-process cache for SGLANG_MOE_HOTSET_FILE: every MoE layer freezes from
 # the same small JSON, so parse it once.
 _HOTSET_FILE_CACHE: Dict[str, dict] = {}
+
+
+def hotset_path_for_rank(path: str, tp_rank: int) -> str:
+    """One SGLANG_MOE_HOTSET_FILE for a TP group whose ranks own DISJOINT
+    expert sets (the expert-dim shard): ``{rank}`` in the path names this
+    rank's own file (local expert ids). A path without the token is shared."""
+    return str(path).replace("{rank}", str(int(tp_rank)))
 
 
 def _load_hotset_file(path: str) -> dict:
