@@ -67,3 +67,28 @@ def test_knob_off_keeps_the_per_layer_path():
         os.environ.pop(ap.ARENA_PAGE_LOAD_ENV, None)
     assert ap._arena_page_load_on()
     assert ap._arena_page_load_block() >= 64
+
+
+def test_the_layer_zero_key_is_the_callers_objects_not_the_per_layer_temporaries():
+    """xsn398 (19.09.): `host_indices - S` is a NEW tensor per layer; keying the
+    'page-loaded at layer 0' check on its id relied on CPython reusing the freed
+    id. With the caller's hint the later layers are no-ops even when every
+    layer hands in a fresh temporary; the per-layer kernel never runs."""
+    calls, transfers = [], []
+    s, pool, page, cell = _stand_in()
+    s._load_pages_all_layers = lambda p, sl, d: calls.append(int(sl.numel()))
+    s._transfer = lambda *a, **k: transfers.append(1)
+    s.row_slot = None
+    os.environ[ap.ARENA_PAGE_LOAD_ENV] = "1"
+    host = torch.tensor([11, 12, 13]); dst = torch.tensor([5, 6, 7])
+    s._page_key_hint = (id(host), id(dst), 3, 3)          # what load_to_device_per_layer sets
+    for layer in range(3):
+        rows = host - 10                                   # a fresh temporary every layer
+        ap.ArenaMHAHostPool._load_arena(s, pool, rows, dst, layer)
+    assert calls == [3] and transfers == []
+    # a new caller object (the next start_loading) stages again
+    host2 = torch.tensor([14]); dst2 = torch.tensor([8])
+    s._page_key_hint = (id(host2), id(dst2), 1, 1)
+    ap.ArenaMHAHostPool._load_arena(s, pool, host2 - 10, dst2, 0)
+    ap.ArenaMHAHostPool._load_arena(s, pool, host2 - 10, dst2, 1)
+    assert calls == [3, 1] and transfers == []

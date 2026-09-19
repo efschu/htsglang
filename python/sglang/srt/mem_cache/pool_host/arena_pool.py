@@ -334,6 +334,14 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
         is_arena = (host_indices >= S) & (host_indices < S + A)
         if not bool(is_arena.any()):
             return super().load_to_device_per_layer(device_pool, host_indices, device_indices, layer_id, io_backend)
+        # 19.09. (xsn398, Task #3): the page load's "already loaded at layer 0"
+        # key is taken from the CALLER's index objects, which are the same
+        # objects for every layer of one start_loading. Keying on the
+        # per-layer `host_indices - S` temporaries relied on CPython reusing
+        # the freed tensor's id -- when it did not (TP0, xsn398), layers
+        # 1..47 also ran the per-layer kernel: a second full copy (+321 ms).
+        self._page_key_hint = (id(host_indices), id(device_indices),
+                               int(host_indices.numel()), int(device_indices.numel()))
         if bool(is_arena.all()):
             return self._load_arena(device_pool, host_indices - S, device_indices, layer_id)
         sel = is_arena.nonzero(as_tuple=True)[0]
@@ -390,7 +398,8 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
 
     def _load_arena(self, device_pool, rows, device_indices, layer_id) -> None:
         if _arena_page_load_on() and getattr(self, "_page_view", None) is not None:
-            key = (id(rows), id(device_indices), int(rows.numel()), int(device_indices.numel()))
+            key = getattr(self, "_page_key_hint", None) or (
+                id(rows), id(device_indices), int(rows.numel()), int(device_indices.numel()))
             if layer_id != 0 and self._page_loaded_key == key:
                 return  # every layer came with the page load at layer 0
             if layer_id == 0:
