@@ -45,6 +45,8 @@ from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.moe import get_moe_a2a_backend, should_use_dp_reduce_scatterv
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.nan_guard import check as _nan_check
+from sglang.srt.layers.nan_guard import nan_guard_on as _nan_guard_on
 from sglang.srt.layers.utils import PPMissingLayer
 from sglang.srt.layers.quantization.compressed_tensors.ct_embedding import (
     vocab_named_in_targets,
@@ -1525,6 +1527,11 @@ class Qwen4ExpLayerExtensionMixin:
             hidden_states = attn_tp_chunks[get_parallel().attn_tp_rank].contiguous()
 
         hidden_states = self.mlp(hidden_states, forward_batch)
+
+        # Task #49 (19.09.): SGLANG_NAN_GUARD=1 names the first layer whose
+        # MoE output stops being finite (the '!!!' = token-0 answers at 259k)
+        if _nan_guard_on():
+            _nan_check("mlp_out", hidden_states, getattr(self, "layer_id", None), forward_batch)
 
         if use_dp_moe_gather:
             hidden_states, global_hidden_states = (
