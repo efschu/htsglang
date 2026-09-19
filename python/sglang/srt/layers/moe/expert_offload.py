@@ -2500,6 +2500,13 @@ class _PinnedDeviceViewHolder:
         }
 
 
+def _fetch_mode() -> str:
+    """SGLANG_MOE_OFFLOAD_FETCH: 'gather' (default, Task #33) or 'memcpy'."""
+    import os
+    v = str(os.environ.get("SGLANG_MOE_OFFLOAD_FETCH", "gather")).strip().lower()
+    return "memcpy" if v == "memcpy" else "gather"
+
+
 def device_view_of_pinned(pinned):  # pragma: no cover - requires CUDA
     """Return a CUDA tensor aliasing ``pinned`` (no copy; UVA zero-copy view).
 
@@ -2999,6 +3006,16 @@ class MoEExpertOffloadCache:
         self._installed = True
 
     # --- fetch / remap helpers (GPU window) --------------------------------
+    def _uva_pool_view(self, attr, spill):
+        """The cached UVA device view of one pinned spill pool (Task #33)."""
+        views = getattr(self, "_uva_views", None)
+        if views is None:
+            views = self._uva_views = {}
+        v = views.get(attr)
+        if v is None or v.data_ptr() != spill.data_ptr():
+            v = views[attr] = device_view_of_pinned(spill)
+        return v
+
     def _fetch(self, fetch_plan, join: bool = True):
         """Async H2D-copy each wave's SPILL experts into their scratch slots,
         then join the copy stream before compute reads them. ``fetch_plan`` is
@@ -3032,8 +3049,41 @@ class MoEExpertOffloadCache:
         # enough for the copies to win the race (expert-major waves do; the
         # short token-major waves happened not to). The join below covers the
         # other direction (compute must not read before the copy lands).
+        def _copies_gather():
+            # 19.09. (Task #33, fn3e profile): the eager fetch as ONE gather
+            # over the UVA device view of the pinned pool plus ONE scatter into
+            # the scratch slots, per tensor per layer -- instead of one
+            # cudaMemcpyAsync per expert per tensor (~10 x attrs launches a
+            # layer, ~1300 a token; the Python thread was busy 91 % of the
+            # decode wall). Same bytes over the same link (only the misses);
+            # only the launch count changes. Static layout or pool_index alike.
+            nonlocal moved
+            rows = [int(pool_index[e]) if pool_index is not None else int(e) - R
+                    for e, _s in fetch_plan]
+            slots = [int(sl) for _e, sl in fetch_plan]
+            first = next(iter(self._resident.values()))
+            dev = first.device
+            rows_t = torch.tensor(rows, dtype=torch.int64, device=dev)
+            slots_t = torch.tensor(slots, dtype=torch.int64, device=dev)
+            for attr in self._pinned:
+                spill = self._pinned.get(attr)
+                dst = self._resident[attr]
+                pool_dev = self._uva_pool_view(attr, spill)
+                dst.index_copy_(0, slots_t, torch.index_select(pool_dev, 0, rows_t))
+                moved += dst[0].numel() * dst.element_size() * len(rows)
+
         def _copies():
             nonlocal moved, remote_moved
+            if remote is None and self._stream is not None and _fetch_mode() == "gather" and fetch_plan:
+                try:
+                    return _copies_gather()
+                except Exception as exc:  # noqa: BLE001 -- one named fallback, then memcpy
+                    import logging
+                    import os
+                    logging.getLogger(__name__).warning(
+                        "MoE offload gather fetch failed (%s: %s); memcpy fetch from now on",
+                        type(exc).__name__, exc)
+                    os.environ["SGLANG_MOE_OFFLOAD_FETCH"] = "memcpy"
             # With no shared tier the iteration set is exactly what it always
             # was. With one, a rank can own ZERO local cold rows for a tensor
             # (a lopsided ratio is legal), so the attr set has to come from the
