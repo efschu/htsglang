@@ -3178,6 +3178,16 @@ class MoEExpertOffloadCache:
             self.planner.resident_slot = {int(e): i for i, e in enumerate(resident_ids)}
             self._spill_pool_index = {int(e): j for j, e in enumerate(spill_ids)}
             self._hot_frozen = True
+        store_index = getattr(layer, "_moe_offload_store_index", None)
+        if store_index:
+            # Task #47 step 1: spill rows are GLOBAL ids in the shared store.
+            # A static [0,R) layout gets its resident maps spelled out so the
+            # freeze invariant (both maps or neither) holds.
+            if self.planner.resident_slot is None:
+                self.planner.resident_ids = frozenset(range(self.resident_count))
+                self.planner.resident_slot = {e: e for e in range(self.resident_count)}
+            self._spill_pool_index = {int(e): int(r) for e, r in store_index.items()}
+            self._hot_frozen = True
 
         # #394: cold experts a peer's host tier owns. Adopted as a planner
         # guard, not as state: without a shared tier this rank simply has no
@@ -4620,6 +4630,11 @@ class MoEExpertOffloadCache:
         )
 
     def _apply_hotset_freeze(self, hot):  # pragma: no cover - requires CUDA
+        if getattr(self.layer, "_moe_offload_store_index", None):
+            raise RuntimeError(
+                "hot-set freeze rearranges the private spill pool; the shared "
+                "expert store (rows = global ids) has no such pool to rearrange"
+            )
         """Physically install ``hot`` (sorted list of R expert ids) as the
         frozen resident set: in-place buffer rearrange + planner/cache map
         install + freeze. Shared by live calibration (_freeze_hotset) and the
@@ -4931,6 +4946,36 @@ def refuse_cold_shard_at_repack_door(layer) -> None:
     )
 
 
+def _expert_store_rows_for(layer, plan):
+    """``(dir, layer_key, lo, num_global, local->row)`` when the shared expert
+    store is on and this layer is a generic expert-dim shard; else ``None``."""
+    from sglang.srt.layers.moe import expert_store as _es
+
+    if not _es.store_enabled():
+        return None
+    if not getattr(layer, "_expert_shard_generic", False):
+        return None
+    rng = getattr(layer, "_gguf_expert_range", None)
+    if rng is None:
+        return None
+    lo, _hi = rng
+    num_global = int(getattr(layer, "num_experts", 0) or 0)
+    if num_global <= 0:
+        raise RuntimeError(
+            "the shared expert store needs the layer's GLOBAL expert count "
+            "(layer.num_experts) and found none"
+        )
+    from sglang.srt.layers.moe.cold_tier_fetch import layer_key_for
+
+    return (
+        _es.store_dir(),
+        layer_key_for(layer),
+        int(lo),
+        num_global,
+        _es.global_rows(plan.spill_ids, int(lo)),
+    )
+
+
 def presplit_expert_offload_after_repack(
     layer, cold_shard: Optional[ColdShardContext] = None
 ) -> None:  # pragma: no cover - CUDA
@@ -4986,6 +5031,9 @@ def presplit_expert_offload_after_repack(
     R = plan.resident_count
     buf_slots = plan.buffer_slots
     static = plan.is_static_layout
+    store_rows = _expert_store_rows_for(layer, plan)
+    if store_rows is not None:
+        layer._moe_offload_store_index = dict(store_rows[4])
 
     presplit = {}
     freed_device = 0
@@ -5004,10 +5052,27 @@ def presplit_expert_offload_after_repack(
         # Spill -> pinned host; the GPU [E] stack is then freed. The static
         # plan is two contiguous slices, exactly as before; a #394 plan gathers
         # the rows the plan names (whole experts on dim 0 either way).
-        spill = pinned_exact_empty((len(plan.spill_ids),) + tuple(t.shape[1:]), t.dtype)
+        if store_rows is not None:
+            # Task #47 step 1: the spill pool IS the shared store (rows =
+            # global ids); this rank writes every row it loaded, residents
+            # included, so a reader from another rank group finds them.
+            from sglang.srt.layers.moe import expert_store as _es
+
+            s_dir, s_key, s_lo, s_num, _s_index = store_rows
+            spill, _created = _es.open_store(
+                s_dir, s_key, attr, s_num, tuple(t.shape[1:]), t.dtype
+            )
+            written = _es.write_rows(spill, t, range(1, int(E)), s_lo)
+            _es.mark_rows_written(
+                s_dir, s_key, attr, int(getattr(layer, "moe_tp_rank", 0) or 0),
+                written.values(),
+            )
+        else:
+            spill = pinned_exact_empty((len(plan.spill_ids),) + tuple(t.shape[1:]), t.dtype)
         if static:
             buf[:R].copy_(t[:R])
-            spill.copy_(t[R:])
+            if store_rows is None:
+                spill.copy_(t[R:])
         else:
             buf[:R].copy_(
                 t.index_select(
@@ -5017,7 +5082,7 @@ def presplit_expert_offload_after_repack(
                     ),
                 )
             )
-            if plan.spill_ids:
+            if plan.spill_ids and store_rows is None:
                 spill.copy_(
                     t.index_select(
                         0,
@@ -5033,7 +5098,10 @@ def presplit_expert_offload_after_repack(
         freed_device += expert_offload_released_device_bytes(
             int(E), buf_slots, row_bytes
         )
-        freed_host += spill.numel() * spill.element_size()
+        if store_rows is not None:
+            freed_host += len(plan.spill_ids) * row_bytes  # own rows of the shared file
+        else:
+            freed_host += spill.numel() * spill.element_size()
         # Replace the param's DATA with a 0-row placeholder so
         # device_loading_context copies nothing back to host (the full [E]
         # GPU tensor is dropped here). In place, on the SAME Parameter object:
