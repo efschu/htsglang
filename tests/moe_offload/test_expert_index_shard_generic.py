@@ -194,3 +194,21 @@ def test_offload_exclude_draft_switch(monkeypatch):
     monkeypatch.setenv("SGLANG_MOE_OFFLOAD_EXCLUDE_DRAFT", "1")
     assert _offload_excludes_draft_layer("mtp.layers.0.mlp.experts")
     assert not _offload_excludes_draft_layer("model.layers.0.mlp.experts")
+
+
+def test_excluded_draft_layer_never_resolves_the_fraction_vector():
+    """fn5j: solo-placed draft builds under tp_size=1; the 3-entry vector must
+    not be parsed for an excluded layer."""
+    from sglang.srt.layers.moe.fused_moe_triton.layer import (
+        _expert_offload_fraction_for_layer,
+    )
+
+    def boom():
+        raise ValueError("vector length != tp_size")
+
+    assert _expert_offload_fraction_for_layer(True, boom) == 1.0
+    assert _expert_offload_fraction_for_layer(False, lambda: 0.34) == 0.34
+    import pytest
+
+    with pytest.raises(ValueError):
+        _expert_offload_fraction_for_layer(False, boom)

@@ -337,6 +337,20 @@ def _warn_host_shard_unreachable_once() -> None:
     )
 
 
+def _expert_offload_fraction_for_layer(excluded: bool, resolve) -> float:
+    """The resident fraction this FusedMoE layer is sized with.
+
+    An offload-EXCLUDED layer (the NEXTN draft under
+    SGLANG_MOE_OFFLOAD_EXCLUDE_DRAFT=1) is fully resident and never consults
+    the per-rank vector: fn5j 19.09. -- under --speculative-draft-placement
+    solo the draft is built inside a tp_size=1 parallel override, and the
+    3-entry vector of the TP=3 target then fails the length check before the
+    exclusion ever applied."""
+    if excluded:
+        return 1.0
+    return resolve()
+
+
 def _offload_excludes_draft_layer(prefix: str) -> bool:
     import os
 
@@ -688,15 +702,18 @@ class FusedMoE(torch.nn.Module):
         # latch point for the fraction every VRAM figure on this layer derives
         # from, which is why the #439 base-plan correction is applied here and
         # nowhere else.
-        self._expert_offload_fraction = resident_fraction_held_at_base_plan(
-            resident_fraction_for_rank(),
-            num_experts=self.num_experts,
-            num_local_experts=self.num_local_experts,
-            moe_tp_size=self.moe_tp_size,
-            moe_tp_rank=self.moe_tp_rank,
-            expert_sharded=self._gguf_expert_shard,
-            intermediate_size=intermediate_size,
-            intermediate_units=self.moe_tp_units,
+        self._expert_offload_fraction = _expert_offload_fraction_for_layer(
+            self._moe_offload_excluded,
+            lambda: resident_fraction_held_at_base_plan(
+                resident_fraction_for_rank(),
+                num_experts=self.num_experts,
+                num_local_experts=self.num_local_experts,
+                moe_tp_size=self.moe_tp_size,
+                moe_tp_rank=self.moe_tp_rank,
+                expert_sharded=self._gguf_expert_shard,
+                intermediate_size=intermediate_size,
+                intermediate_units=self.moe_tp_units,
+            ),
         )
         self._moe_offload_trace_path = envs.SGLANG_MOE_OFFLOAD_TRACE.get()
         self._moe_offload_enabled = self._expert_offload_fraction < 1.0 or bool(
