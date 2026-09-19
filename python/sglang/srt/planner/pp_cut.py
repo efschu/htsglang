@@ -2179,6 +2179,15 @@ class CheckpointWeightTerms:
     lm_head_weight_bytes: float
     replicated_weight_bytes: float
     replicated_breakdown: Dict[str, float]
+    #: Task #47/#48 (Next Flash): MoE expert tensors (``.mlp.experts.``) and
+    #: per-layer embedding tables (``.ple.``) are measured SEPARATELY and are
+    #: NOT in the family means above. Experts live in a device pool at a
+    #: per-stage resident fraction plus LRU rows; PLE stays an mmap on disk
+    #: and never reaches the device. Zero on a checkpoint without them, so
+    #: every dense model prices exactly as before.
+    expert_layer_weight_bytes: float = 0.0
+    ple_layer_weight_bytes: float = 0.0
+    num_experts: int = 0
 
 
 def checkpoint_weight_terms(model_path: str) -> CheckpointWeightTerms:
@@ -2225,6 +2234,10 @@ def checkpoint_weight_terms(model_path: str) -> CheckpointWeightTerms:
     embedding = lm_head = 0.0
     replicated: Dict[str, float] = {}
     layer_re = re.compile(r"layers\.(\d+)\.")
+    expert_re = re.compile(r"\.mlp\.experts\.(\d+)\.")
+    expert_bytes: Dict[int, float] = {}
+    ple_bytes: Dict[int, float] = {}
+    expert_ids: set = set()
     for name, size in sizes.items():
         if name.startswith("mtp"):
             replicated["mtp"] = replicated.get("mtp", 0.0) + size
@@ -2242,6 +2255,15 @@ def checkpoint_weight_terms(model_path: str) -> CheckpointWeightTerms:
         if found is None:
             continue
         index = int(found.group(1))
+        if ".mlp.experts." in name:
+            expert_bytes[index] = expert_bytes.get(index, 0.0) + size
+            m_e = expert_re.search(name)
+            if m_e is not None:
+                expert_ids.add(int(m_e.group(1)))
+            continue
+        if ".ple." in name:
+            ple_bytes[index] = ple_bytes.get(index, 0.0) + size
+            continue
         layer_bytes[index] = layer_bytes.get(index, 0.0) + size
         if ".self_attn." in name:
             layer_family[index] = LAYER_FAMILY_ATTENTION
@@ -2272,6 +2294,13 @@ def checkpoint_weight_terms(model_path: str) -> CheckpointWeightTerms:
         lm_head_weight_bytes=lm_head,
         replicated_weight_bytes=sum(replicated.values()),
         replicated_breakdown=dict(replicated),
+        expert_layer_weight_bytes=(
+            sum(expert_bytes.values()) / len(expert_bytes) if expert_bytes else 0.0
+        ),
+        ple_layer_weight_bytes=(
+            sum(ple_bytes.values()) / len(ple_bytes) if ple_bytes else 0.0
+        ),
+        num_experts=len(expert_ids),
     )
 
 
@@ -2694,8 +2723,19 @@ class PhasePoolModel:
     weight_mib_per_layer: float
     kv_mib_per_token_per_attn_layer: float
     arming_floor_mib: Tuple[float, ...]
+    #: Task #47/#48: per-STAGE layer weight, MiB, for a checkpoint whose
+    #: experts sit in a device pool at a per-stage resident fraction. Empty
+    #: means the scalar ``weight_mib_per_layer`` applies to every stage.
+    weight_mib_per_layer_by_stage: Tuple[float, ...] = ()
     mamba_mib_per_linear_layer_per_slot: float = 0.0
     mamba_slots: int = 0
+
+    def layer_mib(self, stage: int) -> float:
+        """The weight MiB one layer costs on ``stage`` (Task #47/#48)."""
+        by_stage = self.weight_mib_per_layer_by_stage
+        if by_stage and 0 <= int(stage) < len(by_stage):
+            return float(by_stage[int(stage)])
+        return float(self.weight_mib_per_layer)
 
     #: The sizer's SECOND floor, and it is not the cell (#1286 F7). The runtime
     #: does ``available_bytes // cell_size`` and then
@@ -3592,7 +3632,7 @@ def _stage_free_after_residency(
         )
         out.append(
             float(model.free_mib[r])
-            - float(model.weight_mib_per_layer) * int(n)
+            - float(model.layer_mib(r)) * int(n)
             - (fixed[r] if fixed else 0.0)
             - holdback
             - float(model.mamba_mib_per_linear_layer_per_slot)

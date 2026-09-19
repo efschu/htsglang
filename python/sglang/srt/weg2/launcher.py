@@ -8814,6 +8814,49 @@ def solve_p_cut(
         terms.attn_layer_weight_bytes * n_attn_ckpt
         + terms.linear_layer_weight_bytes * (terms.n_layers - n_attn_ckpt)
     ) / max(1, terms.n_layers) / _pp_cut.MIB
+    # Task #47/#48 (Next Flash): a checkpoint with MoE experts prices its
+    # layers PER STAGE -- dense mean + experts at the stage's resident
+    # fraction + the stage's LRU rows -- and PLE (an mmap on disk) at zero.
+    # No default: a checkpoint with experts and no fractions is refused by
+    # name, because the 27B constants priced 8 layers on rank 0 and refused
+    # every cut (W40, 19.09. dry run nfdry4).
+    layer_mib_by_stage: Tuple[float, ...] = ()
+    if terms.expert_layer_weight_bytes > 0.0:
+        frac_text = str(getattr(ns, "pp_cut_expert_device_fraction", "") or "").strip()
+        rows_text = str(getattr(ns, "pp_cut_expert_lru_rows", "") or "").strip()
+        n_stages_p = len(budgets_p)
+        if not frac_text:
+            raise SystemExit(
+                f"W40 Weg2PPCutRefused: {model} carries {terms.num_experts} MoE "
+                f"experts per layer ({terms.expert_layer_weight_bytes / _pp_cut.MIB:.0f} "
+                f"MiB per layer) that live in a device pool, and no "
+                f"--pp-cut-expert-device-fraction was given for the {n_stages_p} P "
+                f"stages. Pass the resident fraction per stage (the P group's "
+                f"--rank-moe-resident-fraction) and --pp-cut-expert-lru-rows."
+            )
+        fracs = _csv_floats(frac_text)
+        rows = _csv_floats(rows_text) if rows_text else [0.0] * n_stages_p
+        if len(fracs) != n_stages_p or len(rows) != n_stages_p:
+            raise SystemExit(
+                f"--pp-cut-expert-device-fraction has {len(fracs)} entries and "
+                f"--pp-cut-expert-lru-rows {len(rows)}; the P group has {n_stages_p} stages."
+            )
+        row_bytes = terms.expert_layer_weight_bytes / max(1, terms.num_experts)
+        layer_mib_by_stage = tuple(
+            mean_layer_mib
+            + (terms.expert_layer_weight_bytes * float(f) + row_bytes * float(r)) / _pp_cut.MIB
+            for f, r in zip(fracs, rows)
+        )
+        log(
+            "PP-CUT POOL TERM (Task #47/#48): dense %.0f MiB/layer + experts %.0f MiB/layer "
+            "(%d experts, %.2f MiB/row) at fractions %s + LRU rows %s -> per-stage %s MiB/layer; "
+            "PLE %.0f MiB/layer stays on disk (0 on device)"
+            % (
+                mean_layer_mib, terms.expert_layer_weight_bytes / _pp_cut.MIB, terms.num_experts,
+                row_bytes / _pp_cut.MIB, list(fracs), [int(x) for x in rows],
+                [round(x) for x in layer_mib_by_stage], terms.ple_layer_weight_bytes / _pp_cut.MIB,
+            )
+        )
     ms = _csv_floats(ns.pp_cut_measured_ms_per_layer)
     model_pool = _pp_cut.PhasePoolModel(
         free_mib=tuple(float(b) for b in budgets_p),
@@ -8824,6 +8867,7 @@ def solve_p_cut(
         # layer against a ~17-28 GiB free -- two orders of magnitude apart.
         # The total is exact for any cut summing to n_layers.
         weight_mib_per_layer=mean_layer_mib,
+        weight_mib_per_layer_by_stage=layer_mib_by_stage,
         kv_mib_per_token_per_attn_layer=kv_mib,
         arming_floor_mib=tuple(float(ns.pp_cut_arming_floor_mib) for _ in budgets_p),
         # -- #1286: THE POSTS THE BOOT CHARGES AND THIS MODEL DID NOT ------
@@ -10158,6 +10202,20 @@ def build_parser() -> argparse.ArgumentParser:
              f"--pp-cut-design-prefix-tokens. Unset = the newest log in "
              f"{EVIDENCE_DIR} that actually carries the census (a log without "
              "it is skipped, never read as a measured prefix of 0).",
+    )
+    ap.add_argument(
+        "--pp-cut-expert-device-fraction", default="",
+        help="Task #47/#48 (Next Flash): resident fraction of each P stage's MoE "
+             "experts on the device (the P group's --rank-moe-resident-fraction), "
+             "comma vector per stage. REQUIRED for a checkpoint with experts; the "
+             "cut solver prices expert bytes at this fraction plus "
+             "--pp-cut-expert-lru-rows rows per layer, and PLE tables at zero.",
+    )
+    ap.add_argument(
+        "--pp-cut-expert-lru-rows", default="",
+        help="Task #47/#48: LRU + staging rows of the expert pool per layer and "
+             "stage (the P group's SGLANG_MOE_SCRATCH_SLOTS), comma vector; "
+             "default 0 rows.",
     )
     ap.add_argument(
         "--pp-cut-calibration-prefix-tokens", type=float,
