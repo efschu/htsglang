@@ -119,7 +119,16 @@ def maybe_log_vram_peak(runner, forward_batch, cuda=torch.cuda) -> Optional[str]
         if n >= PEAK_EXTEND_MIN_TOKENS:
             st["extend"] = True
             kind = "extend"
-    elif mode is not None and mode.is_decode() and not st["decode_done"]:
+    elif (
+        mode is not None
+        and not st["decode_done"]
+        and (
+            mode.is_decode()
+            # fn7v (19.09.): under spec decoding the target runs verify
+            # forwards, not decode ones -- count them as the decode kind
+            or bool(getattr(mode, "is_target_verify", lambda: False)())
+        )
+    ):
         st["decode"] += 1
         if st["decode"] >= PEAK_DECODE_AT:
             st["decode_done"] = True
