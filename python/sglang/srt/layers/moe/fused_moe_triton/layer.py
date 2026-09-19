@@ -728,7 +728,11 @@ class FusedMoE(torch.nn.Module):
                 _disable_cg = bool(get_server_args().disable_cuda_graph)
             except Exception:
                 _disable_cg = True  # server args not wired (unit/test context)
-            _graph_ok = self._moe_offload_graph_mode or self._moe_offload_breakable
+            _graph_ok = (
+                self._moe_offload_graph_mode
+                or self._moe_offload_breakable
+                or self._moe_offload_pool
+            )
             if not _disable_cg and not _graph_ok:
                 raise RuntimeError(
                     "MoE expert-offload / routing-trace "
