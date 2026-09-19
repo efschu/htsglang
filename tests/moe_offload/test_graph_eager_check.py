@@ -54,3 +54,13 @@ def test_tensors_of_handles_tuple_and_logits_object():
 
     assert len(gec.tensors_of((torch.zeros(1), 5, torch.zeros(2)))) == 2
     assert len(gec.tensors_of(O())) == 1 and gec.tensors_of(3) == []
+
+
+def test_state_deltas_expose_an_untouched_graph_state():
+    pre = {"conv": [torch.zeros(2, 3)], "temporal": torch.zeros(2, 3), "ngram": torch.zeros(1, 2)}
+    post_g = {"conv": [torch.zeros(2, 3)], "temporal": torch.zeros(2, 3), "ngram": torch.zeros(1, 2)}
+    post_e = {"conv": [torch.ones(2, 3)], "temporal": torch.ones(2, 3) * 2, "ngram": torch.ones(1, 2)}
+    lines = gec.state_deltas(pre, post_g, post_e)
+    assert lines[0].startswith("conv: graph-vs-pre=0 eager-vs-pre=1 graph-vs-eager=1")
+    assert "temporal: graph-vs-pre=0 eager-vs-pre=2" in lines[1]
+    assert len(lines) == 3

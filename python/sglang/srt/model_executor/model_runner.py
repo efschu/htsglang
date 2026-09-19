@@ -5057,6 +5057,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
             # Replay cuda graph if applicable
             if can_run_graph:
+                _gec = getattr(self, "_graph_eager_check", None)
+                if _gec is not None:
+                    _gec.before_graph(forward_batch)
                 # #1241. The bracket sits AROUND the replay, on the same
                 # stream, so the round's device time is measured even though
                 # the collectives inside the replay are unobservable. That

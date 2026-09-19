@@ -99,6 +99,29 @@ def compare(graph: Dict[str, List[torch.Tensor]], eager: Dict[str, List[torch.Te
     return lines, first
 
 
+def _maxabs(a: torch.Tensor, b: torch.Tensor) -> float:
+    return float((a.float() - b.float()).abs().max()) if a.numel() else 0.0
+
+
+def state_deltas(pre: dict, post_g: dict, post_e: dict) -> List[str]:
+    """How the graph and the eager pass each moved the recurrent state from
+    the same start: a graph that leaves the state untouched (or writes another
+    slot) shows graph-vs-pre=0 while eager-vs-pre is not."""
+    lines = []
+    for key in ("conv", "temporal", "ngram"):
+        if key not in pre:
+            continue
+        pv, gv, ev = pre[key], post_g[key], post_e[key]
+        if isinstance(pv, list):
+            gp = max(_maxabs(g, p) for g, p in zip(gv, pv))
+            ep = max(_maxabs(e, p) for e, p in zip(ev, pv))
+            ge = max(_maxabs(g, e) for g, e in zip(gv, ev))
+        else:
+            gp, ep, ge = _maxabs(gv, pv), _maxabs(ev, pv), _maxabs(gv, ev)
+        lines.append(f"{key}: graph-vs-pre={gp:.4g} eager-vs-pre={ep:.4g} graph-vs-eager={ge:.4g}")
+    return lines
+
+
 class GraphEagerCheck:
     def __init__(self, model_runner, steps: int):
         self.mr = model_runner
@@ -162,11 +185,28 @@ class GraphEagerCheck:
         if "ngram" in snap:
             pool.ngram_pool.set_context(logical, snap["ngram"])
 
+    def _active(self, forward_batch) -> bool:
+        return (
+            self.left > 0
+            and forward_batch.forward_mode.is_decode()
+            and int(forward_batch.batch_size) == 1
+        )
+
     # ---- the check ---------------------------------------------------------
-    def after_graph(self, forward_batch, ret) -> None:
-        if self.left <= 0 or not forward_batch.forward_mode.is_decode():
+    def before_graph(self, forward_batch) -> None:
+        """Snapshot the request's recurrent state BEFORE the replay, so the
+        eager pass can start from the same state the graph started from."""
+        self._pre = None
+        if not self._active(forward_batch):
             return
-        if int(forward_batch.batch_size) != 1:
+        try:
+            torch.cuda.synchronize()
+            self._pre = self._save_state(forward_batch)
+        except Exception as exc:
+            logger.warning("GRAPH-EAGER-CHECK pre-snapshot failed: %s: %s", type(exc).__name__, exc)
+
+    def after_graph(self, forward_batch, ret) -> None:
+        if not self._active(forward_batch) or getattr(self, "_pre", None) is None:
             return
         self.left -= 1
         self.step += 1
@@ -175,6 +215,8 @@ class GraphEagerCheck:
         except Exception as exc:  # diagnosis must never kill the rank
             logger.warning("GRAPH-EAGER-CHECK step=%d failed: %s: %s", self.step, type(exc).__name__, exc)
             self.mode = None
+        finally:
+            self._pre = None
 
     def _run(self, forward_batch, ret) -> None:
         torch.cuda.synchronize()
@@ -190,15 +232,19 @@ class GraphEagerCheck:
             s = stat[:bs].tolist() if isinstance(stat, torch.Tensor) else None
             return f"{name}: live={l} static={s}"
 
-        logical, phys, snap = self._save_state(forward_batch)
+        logical, phys, post_g = self._save_state(forward_batch)
+        _l, _p, pre = self._pre
         logger.warning(
             "GRAPH-EAGER-CHECK step=%d inputs: %s | %s | %s | %s | %s | mamba slot logical=%s phys=%s | captured roles=%d",
             self.step, _show("input_ids"), _show("positions"), _show("req_pool_indices"),
             _show("seq_lens"), _show("out_cache_loc"), logical.tolist(), phys.tolist(), len(g_layers),
         )
-        # eager pass on the very same batch and start state
+        # eager pass on the very same batch, from the PRE-replay state
+        self._restore_state(logical, phys, pre)
+        torch.cuda.synchronize()
         self.eag = {}
         self.mode = "eager"
+        post_e = None
         try:
             attn = self.mr.attn_backend
             attn.init_forward_metadata(forward_batch)
@@ -206,10 +252,14 @@ class GraphEagerCheck:
                 forward_batch.input_ids, forward_batch.positions, forward_batch
             )
             torch.cuda.synchronize()
+            _l2, _p2, post_e = self._save_state(forward_batch)
         finally:
             self.mode = None
-            self._restore_state(logical, phys, snap)
+            self._restore_state(logical, phys, post_g)  # continue as the graph left it
             torch.cuda.synchronize()
+        if post_e is not None:
+            for ln in state_deltas(pre, post_g, post_e):
+                logger.warning("GRAPH-EAGER-CHECK step=%d STATE %s", self.step, ln)
         e_logits = out_e.next_token_logits[:bs].detach().float()
         lines, first = compare(g_layers, self.eag, self.order)
         ag, ae = int(g_logits.argmax(-1)[0]), int(e_logits.argmax(-1)[0])
