@@ -6635,7 +6635,7 @@ class SchedulerWeightUpdaterManager:
             return None
 
     def _weg2_await_vram_credit(self, credit, tag: str, need_bytes: int,
-                                epoch=None) -> None:
+                                epoch=None, submitted=None) -> None:
         if credit is None or need_bytes <= 0:
             return
         # #1391 (DESK10) ROUND 3: A CALLBACK, NOT A ONE-SHOT CHECK. The first
@@ -6691,6 +6691,13 @@ class SchedulerWeightUpdaterManager:
                         ", ".join(f"{lane}:full={full}" for lane, full, _e in held))
             return stuck
 
+        # #22: name this wait for the other wakers' cycle readers (tag + the
+        # tags whose collect is already submitted), and read theirs.
+        _b1 = getattr(self, "_weg2_bar1", None)
+        _cycle_reader = None
+        if _b1 is not None:
+            _b1.post_credit_wait(tag, submitted)
+            _cycle_reader = _b1.credit_cycle
         try:
             rec = credit.wait_for(
                 need_bytes,
@@ -6707,12 +6714,16 @@ class SchedulerWeightUpdaterManager:
                 floor_bytes=self._weg2_corridor_floor_bytes(),
                 epoch=epoch,
                 stuck_lane_reader=_stuck_lane_reader,
+                cycle_reader=_cycle_reader,
             )
         except Weg2VramCreditRefused:
             raise
         except OSError as exc:
             logger.warning("[weg2 credit] unreadable on %s: %s -- not waiting", tag, exc)
             return
+        finally:
+            if _b1 is not None:
+                _b1.clear_credit_wait()
         # xsn323: remember the tightest point of these legs. The kv-first gate
         # of the NEXT wake reads it: kv_cache resumed before the legs must not
         # eat the free space the legs' tags need (5090: free 9028 MiB at
@@ -7650,7 +7661,7 @@ class SchedulerWeightUpdaterManager:
                     # 0.8 s behind weights_6/7 at every flip
                     _n_wake_workers = _weg2_wake_collect_workers()
                     _wake_worker = _TPE(max_workers=_n_wake_workers, thread_name_prefix="weg2-wake-collect")
-                for tag in weights_tags:
+                for _ti, tag in enumerate(weights_tags):
                     # C14: the device bytes this tag needs may only exist once
                     # the co-located SLEEPING rank has released them, and with
                     # C9 both legs are in flight.  Waiting here turns a race
@@ -7672,7 +7683,8 @@ class SchedulerWeightUpdaterManager:
                         WEG2_GROUP_FENCE_BUDGET_S,
                     )
                     self._weg2_await_vram_credit(
-                        credit, tag, tag_bytes.get(tag, 0), credit_epoch
+                        credit, tag, tag_bytes.get(tag, 0), credit_epoch,
+                        submitted=list(weights_tags[:_ti]),
                     )
                     t_tag = time.perf_counter()
                     logger.info("WEG2-RESUME credit-ok tag=%s -- entering resume(tag)", tag)

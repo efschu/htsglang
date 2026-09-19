@@ -57,6 +57,12 @@ ENV_SMALL_SLOT_MIB = "SGLANG_WEG2_BAR1_SMALL_SLOT_MIB"
 ENV_BIG_SLOT_MIB = "SGLANG_WEG2_BAR1_BIG_SLOT_MIB"
 ENV_CONNECT_S = "SGLANG_WEG2_BAR1_CONNECT_S"
 ENV_SMALL_BAR_GROUPS = "SGLANG_WEG2_BAR1_SMALL_BAR_GROUPS"
+#: #22 (xsn323): a credit wait that waits longer than this while the sleeper
+#: co-located with it is itself blocked on a deposit this group's waker will
+#: only collect AFTER its own credit is a CYCLE -- named after `grace` seconds
+#: (W109) instead of after the 120 s credit budget (W35).
+ENV_CYCLE_GRACE_S = "SGLANG_WEG2_BAR1_CYCLE_GRACE_S"
+SLOW_WAIT_S = 0.5     # a credit wait longer than this posts a `blocked` flag
 BIG_BAR_MIN = 4 << 30      # a BAR1 at least this large holds the big slot ring
 MODE_BAR1 = "bar1"
 MODE_HOST = "host"
@@ -232,7 +238,7 @@ def post_flag(d: str, kind: str, seq, g: int, payload: Optional[dict] = None) ->
 
 
 def take_flag(d: str, kind: str, seq, g: int, timeout_s: float,
-              liveness=None) -> Optional[dict]:
+              liveness=None, on_slow=None) -> Optional[dict]:
     """The flag's payload ({} when it carried none) once it exists -- consumed
     (unlinked); None on timeout or when ``liveness()`` says the peer is gone.
     Hot poll: a batch is 0.6-5 ms of DMA, a 200-us sleep would be 4-30 %."""
@@ -250,6 +256,9 @@ def take_flag(d: str, kind: str, seq, g: int, timeout_s: float,
         n += 1
         if time.perf_counter() - t0 > timeout_s:
             return None
+        if on_slow is not None and time.perf_counter() - t0 > SLOW_WAIT_S:
+            on_slow()
+            on_slow = None
         if liveness is not None and (n & 1023) == 0 and not liveness():
             return None
         time.sleep(0.00002)
@@ -263,12 +272,14 @@ _FRAME = struct.Struct("<cI")
 class FileCredits:
     def __init__(self, d: str, seq, liveness=None):
         self.d, self.seq, self.liveness = d, seq, liveness
+        self.on_slow = None
 
     def send(self, kind: str, g: int = 0, payload=None) -> None:
         post_flag(self.d, kind, self.seq, g, payload)
 
     def recv(self, kind: str, g: int, timeout_s: float):
-        return take_flag(self.d, kind, self.seq, g, timeout_s, liveness=self.liveness)
+        return take_flag(self.d, kind, self.seq, g, timeout_s, liveness=self.liveness,
+                         on_slow=self.on_slow)
 
 
 class SocketCredits:
@@ -279,6 +290,7 @@ class SocketCredits:
 
     def __init__(self, sock, liveness=None):
         self.sock, self.liveness = sock, liveness
+        self.on_slow = None
 
     def send(self, kind: str, g: int = 0, payload=None) -> None:
         body = b"" if payload is None else json.dumps(payload).encode()
@@ -297,6 +309,8 @@ class SocketCredits:
                 chunk = self.sock.recv(n - len(buf))
             except socket.timeout:
                 k += 1
+                if k == 1 and self.on_slow is not None:
+                    self.on_slow()
                 if self.liveness is not None and not self.liveness():
                     return None
                 continue
@@ -317,6 +331,65 @@ class SocketCredits:
         if k != self.KINDS[kind] or int(gg) != int(g):
             raise RuntimeError(f"bar1 credit out of order: got {k!r} {gg}, expected {kind} {g}")
         return json.loads(body.decode()) if body else {}
+
+
+# -- #22: the credit-wait cycle, as numbers ------------------------------------
+
+def tag_of_seq(seq) -> str:
+    """"<flip>-<tag>" -> "<tag>" (a desk counter has no tag: itself)."""
+    s = str(seq)
+    return s.split("-", 1)[1] if "-" in s else s
+
+
+def cycle_grace_s(env: Optional[_Map[str, str]] = None) -> float:
+    env = os.environ if env is None else env
+    try:
+        return max(0.5, float(env.get(ENV_CYCLE_GRACE_S, "3")))
+    except ValueError:
+        return 3.0
+
+
+def credit_cycle(me: int, waits: dict, blocked: dict, grace_s: float, now: float):
+    """The chain of blocked edges that closes at waker ``me``, or None.
+
+    ``waits``: waker rank -> {"tag", "since", "submitted": [tags]} (this
+    group's ranks inside a credit wait). ``blocked``: (src, dst) -> {"seq",
+    "since"} (the OTHER group's rank ``src`` -- co-located with waker
+    ``src`` -- blocked depositing ``seq`` to waker ``dst``). Waker r's
+    credit is funded by the pauses of sleeper r; sleeper r pauses a tag
+    only after depositing it; the deposit drains only when waker dst
+    collects it, which waker dst does only after ITS credit -- unless it
+    already submitted that tag's collect (then the deposit drains anyway
+    and the edge is not blocking). Every edge older than ``grace_s``.
+    """
+    def edges(r):
+        out = []
+        for (s, d), b in blocked.items():
+            if int(s) != int(r) or now - float(b.get("since", now)) < grace_s:
+                continue
+            w = waits.get(int(d))
+            if w is None or now - float(w.get("since", now)) < grace_s:
+                continue
+            if tag_of_seq(b.get("seq", "")) in set(w.get("submitted") or ()):
+                continue
+            out.append((int(s), int(d), tag_of_seq(b.get("seq", ""))))
+        return out
+
+    if int(me) not in waits or now - float(waits[int(me)].get("since", now)) < grace_s:
+        return None
+    stack = [(int(me), [])]
+    seen = set()
+    while stack:
+        cur, chain = stack.pop()
+        for e in edges(cur):
+            nxt = e[1]
+            if nxt == int(me):
+                return chain + [e]
+            if nxt in seen:
+                continue
+            seen.add(nxt)
+            stack.append((nxt, chain + [e]))
+    return None
 
 
 # -- the window (receiver) and the peer mapping (depositor) -------------------
@@ -437,6 +510,70 @@ class Bar1Lanes:
     def flags(self, lane_key: str, role: str) -> str:
         dst_group = self.group if role == "dst" else other_group(self.group)
         return flag_dir(self.boot_nonce, lane_key, dst_group, self.root)
+
+    # -- #22: credit-wait flags and the cycle reader --------------------
+    def credit_dir(self) -> str:
+        return os.path.join(self.root, f"weg2-bar1-{self.boot_nonce}", "credit")
+
+    def post_credit_wait(self, tag: str, submitted=None) -> None:
+        try:
+            post_flag(self.credit_dir(), "wait", self.group, self.rank,
+                      {"tag": str(tag), "since": time.time(),
+                       "submitted": [str(t) for t in (submitted or ())]})
+        except OSError:
+            pass
+
+    def clear_credit_wait(self) -> None:
+        try:
+            os.unlink(_flag_path(self.credit_dir(), "wait", self.group, self.rank))
+        except OSError:
+            pass
+
+    def _read_json(self, p: str) -> Optional[dict]:
+        try:
+            with open(p) as fh:
+                raw = fh.read()
+            return json.loads(raw) if raw.strip() else {}
+        except (OSError, ValueError):
+            return None
+
+    def read_credit_waits(self) -> dict:
+        """waker rank -> payload, for THIS group's ranks in a credit wait."""
+        out = {}
+        d = self.credit_dir()
+        for r in range(len({s for s, _ in self.cross_pairs} | {d_ for _, d_ in self.cross_pairs})):
+            p = self._read_json(_flag_path(d, "wait", self.group, r))
+            if p is not None:
+                out[r] = p
+        return out
+
+    def read_blocked(self) -> dict:
+        """(src, dst) -> payload for every deposit of the OTHER group into
+        this group that is blocked on our collect (its `blocked` flag)."""
+        out = {}
+        for k, (s, d_) in enumerate(self.cross_pairs):
+            fd = flag_dir(self.boot_nonce, f"p{k}", self.group, self.root)
+            try:
+                names = os.listdir(fd)
+            except OSError:
+                continue
+            for n in names:
+                if not n.startswith("blocked.") or n.endswith(".tmp"):
+                    continue
+                p = self._read_json(os.path.join(fd, n))
+                if p is None:
+                    continue
+                parts = n.split(".")
+                p.setdefault("seq", parts[1] if len(parts) >= 3 else "")
+                prev = out.get((int(s), int(d_)))
+                if prev is None or float(p.get("since", 0)) < float(prev.get("since", 0)):
+                    out[(int(s), int(d_))] = p
+        return out
+
+    def credit_cycle(self, grace_s: Optional[float] = None):
+        """The blocked chain closing at this rank, or None (see `credit_cycle`)."""
+        g = cycle_grace_s() if grace_s is None else float(grace_s)
+        return credit_cycle(self.rank, self.read_credit_waits(), self.read_blocked(), g, time.time())
 
     def channel(self, lane_key: str, role: str):
         """The lane's open AF_UNIX connection from this side, or None (file flags)."""
@@ -802,6 +939,33 @@ def run_bar1_units(descs, ops, *, lanes: Bar1Lanes, lane_key: str, role: str,
             lanes.leave_turn(lane_key, order_key)
 
 
+def _recv_marked(cred, kind: str, g: int, budget_s: float, d: str, seq, lane_key: str,
+                 rank: int, wait: str):
+    """The depositor's credit wait; longer than SLOW_WAIT_S it posts a
+    `blocked` flag (#22) the wakers' cycle reader sees, removed on return."""
+    posted = []
+
+    def slow():
+        if not posted:
+            posted.append(1)
+            try:
+                post_flag(d, "blocked", seq, g, {"since": time.time(), "wait": wait,
+                                                 "lane": lane_key, "rank": int(rank)})
+            except OSError:
+                pass
+
+    cred.on_slow = slow
+    try:
+        return cred.recv(kind, g, budget_s)
+    finally:
+        cred.on_slow = None
+        if posted:
+            try:
+                os.unlink(_flag_path(d, "blocked", seq, g))
+            except OSError:
+                pass
+
+
 def _run_bar1_tag(descs, ops, lanes, lane_key, role, seq, phase, no_write, liveness,
                   budget_s, device, log, base, slot_bytes, ring, batches, tp) -> str:
     d = lanes.flags(lane_key, role)
@@ -855,7 +1019,8 @@ def _run_bar1_tag(descs, ops, lanes, lane_key, role, seq, phase, no_write, liven
             if role == "src":
                 if g >= ring:
                     tw = time.perf_counter()
-                    if cred.recv("free", g - ring, budget_s) is None:
+                    if _recv_marked(cred, "free", g - ring, budget_s, d, seq, lane_key,
+                                    lanes.rank, "free") is None:
                         return (f"bar1 deposit lane={lane_key} seq={seq}: no 'free' for batch "
                                 f"{g - ring} within {budget_s:.0f} s (collector gone or stuck)")
                     t_wait += time.perf_counter() - tw
@@ -915,10 +1080,12 @@ def _run_bar1_tag(descs, ops, lanes, lane_key, role, seq, phase, no_write, liven
             tw = time.perf_counter()
             if via == "sock":
                 for g in range(max(0, nb - ring), nb):
-                    if cred.recv("free", g, budget_s) is None:
+                    if _recv_marked(cred, "free", g, budget_s, d, seq, lane_key,
+                                    lanes.rank, "trailing-free") is None:
                         return (f"bar1 deposit lane={lane_key} seq={seq}: no trailing 'free' for "
                                 f"batch {g} within {budget_s:.0f} s")
-            if cred.recv("done", 0, budget_s) is None:
+            if _recv_marked(cred, "done", 0, budget_s, d, seq, lane_key,
+                            lanes.rank, "done") is None:
                 return (f"bar1 deposit lane={lane_key} seq={seq}: the collector never reported "
                         f"done within {budget_s:.0f} s")
             t_wait += time.perf_counter() - tw

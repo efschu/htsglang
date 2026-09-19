@@ -793,6 +793,15 @@ class Weg2VramCreditRefused(RuntimeError):
     """
 
 
+class Weg2XchgCreditCycleRefused(RuntimeError):
+    """W109 (#22, xsn323) -- this rank's credit wait is one edge of a CYCLE:
+    the sleeper co-located with it (whose pauses fund the credit) is itself
+    blocked on a BAR1 deposit that a waker of this group collects only after
+    ITS credit, and the chain of such edges closes here. Named after a few
+    seconds of grace (bar1_lanes.ENV_CYCLE_GRACE_S) instead of after the
+    120 s credit budget (W35) -- the cycle cannot resolve itself."""
+
+
 class Weg2XchgLaneNeverDrainedRefused(RuntimeError):
     """W108 -- a bounce lane already carries undrained bands nobody will ever
     take, named THE MOMENT it is found instead of after a 120 s budget.
@@ -1263,6 +1272,9 @@ class VramCredit:
         #: 120 s poll ran to its end without ever looking again. ``None``
         #: (default) keeps every existing caller's behaviour byte-identical.
         stuck_lane_reader=None,
+        #: #22: ``() -> chain | None`` -- the BAR1 credit-cycle reader, same
+        #: cadence; a chain raises W109 at once.
+        cycle_reader=None,
         #: weg2xsn258: the bounded allocatable poll (xsn108, 30 s) -- now
         #: taken OUTSIDE the counter lock, see `_AllocatableTransient`.
         alloc_poll_s: float = 30.0,
@@ -1427,6 +1439,21 @@ class VramCredit:
         # short reading and cleared by the first reading that covers `need`.
         _alloc_wait: Dict[str, Any] = {"t0": None}
         while True:
+            if cycle_reader is not None and time.monotonic() >= _next_lane_check:
+                try:
+                    _chain = cycle_reader()
+                except Exception:  # noqa: BLE001 -- a probe may not raise
+                    _chain = None
+                if _chain:
+                    raise Weg2XchgCreditCycleRefused(
+                        f"W109 Weg2XchgCreditCycleRefused: card={self.uuid} tag={tag}: "
+                        f"this credit wait is one edge of a cycle (found "
+                        f"{time.perf_counter() - t0:.1f}s into the wait): "
+                        + " -> ".join(f"sleeper{s} blocked depositing {t} to waker{d}"
+                                      for s, d, t in _chain)
+                        + "; every waker in the chain waits for a credit its "
+                        "co-located sleeper cannot fund before its deposit "
+                        "drains, and no collect of these tags is submitted")
             if stuck_lane_reader is not None and time.monotonic() >= _next_lane_check:
                 _next_lane_check = time.monotonic() + 1.0
                 try:
