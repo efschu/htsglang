@@ -727,8 +727,11 @@ ENV_DFLASH_PLACEMENT = "SGLANG_WEG2_DFLASH_PLACEMENT"
 
 
 def dflash_placement() -> str:
-    v = (os.environ.get(ENV_DFLASH_PLACEMENT, "solo") or "solo").strip().lower()
-    return "split" if v == "split" else "solo"
+    # 19.09. (user order): D shards the draft across the TP ranks ("split",
+    # the server default); "solo" (draft whole on one rank, xsn393) is the A/B
+    # opt-in, never the standard -- a replicated or solo draft is refused on D.
+    v = (os.environ.get(ENV_DFLASH_PLACEMENT, "split") or "split").strip().lower()
+    return "solo" if v == "solo" else "split"
 
 
 def spec_form_env(group: str) -> Dict[str, str]:

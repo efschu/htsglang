@@ -49,11 +49,10 @@ def test_dflash_form_is_byte_identical_on_both_groups_but_for_the_role(restore_f
     ident = ["--speculative-algorithm", "DFLASH", "--speculative-draft-model-path", str(tmp_path),
              "--speculative-num-draft-tokens", "8"]
     assert p == ident + ["--speculative-draft-kv-only"]
-    # 19.09. (xsn393): solo placement is D's default under DFLASH
-    assert d == ident + ["--speculative-draft-window-size", "2048",
-                         "--speculative-draft-placement", "solo"]
-    assert L.spec_form_env("D") == {"SGLANG_DFLASH_WINDOW_POOL": "1",
-                                    "SGLANG_DFLASH_SOLO_COMPACT": "1"}
+    # 19.09. (user order): the draft is SHARDED on D ('split' = the server
+    # default, no placement flag); solo is the explicit A/B opt-in below.
+    assert d == ident + ["--speculative-draft-window-size", "2048"]
+    assert L.spec_form_env("D") == {"SGLANG_DFLASH_WINDOW_POOL": "1"}
     assert L.spec_form_env("P") == {}
     assert L.spec_plan_fields() == {
         "speculative_algorithm": "DFLASH",
@@ -116,12 +115,14 @@ def test_external_drafter_bytes_come_off_the_dflash_headers():
     assert "external drafter checkpoint" in stages[-1].drafter_terms
 
 
-def test_split_placement_is_an_explicit_ab_opt_out(restore_form, tmp_path, monkeypatch):
+def test_solo_placement_is_an_explicit_ab_opt_in(restore_form, tmp_path, monkeypatch):
     L.apply_spec_form(
         SimpleNamespace(spec_form="dflash", dflash_draft_path=str(tmp_path), dflash_block=8, dflash_window=2048)
     )
-    monkeypatch.setenv(L.ENV_DFLASH_PLACEMENT, "split")
+    monkeypatch.setenv(L.ENV_DFLASH_PLACEMENT, "solo")
+    assert L.spec_flags(producer=False)[-2:] == ["--speculative-draft-placement", "solo"]
+    assert L.spec_form_env("D") == {"SGLANG_DFLASH_WINDOW_POOL": "1",
+                                    "SGLANG_DFLASH_SOLO_COMPACT": "1"}
+    monkeypatch.setenv(L.ENV_DFLASH_PLACEMENT, "nonsense")
     assert "--speculative-draft-placement" not in L.spec_flags(producer=False)
     assert L.spec_form_env("D") == {"SGLANG_DFLASH_WINDOW_POOL": "1"}
-    monkeypatch.setenv(L.ENV_DFLASH_PLACEMENT, "nonsense")
-    assert L.spec_flags(producer=False)[-2:] == ["--speculative-draft-placement", "solo"]

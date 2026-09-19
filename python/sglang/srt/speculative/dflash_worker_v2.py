@@ -262,6 +262,26 @@ class _SelectorDraftSampler:
         self.q_out[:bs].copy_(q_rows)
 
 
+def _log_draft_param_bytes(model, tp_rank: int) -> None:
+    """One INFO line per rank: the draft's parameter bytes by module group
+    (19.09., Task #37 shard proof -- a sharded draft shows the plan's ratio
+    across the ranks in attention/mlp, a replicated one the same bytes on
+    every rank; fc/selector/conv are the replicated remainder)."""
+    try:
+        groups = {}
+        for name, p in model.named_parameters():
+            key = name.split(".")[0] if not name.startswith("layers.") else "layers." + name.split(".")[2]
+            groups[key] = groups.get(key, 0) + p.numel() * p.element_size()
+        total = sum(groups.values())
+        logger.info(
+            "DFLASH draft parameter bytes on rank %d: total %.0f MB; %s",
+            tp_rank, total / 1e6,
+            ", ".join(f"{k}={v / 1e6:.0f}" for k, v in sorted(groups.items(), key=lambda kv: -kv[1])),
+        )
+    except Exception as exc:  # instrument only
+        logger.warning("DFLASH draft parameter bytes not logged: %s", exc)
+
+
 class DFlashWorkerV2(BaseSpecWorker):
     """DFLASH speculative decoding worker (spec-v2).
 
@@ -341,6 +361,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         self.draft_model_runner = bundle.draft_model_runner
         self._draft_sampler = None
         self.draft_model = bundle.draft_model
+        _log_draft_param_bytes(self.draft_model, tp_rank)
 
         # Draft-solo placement (--speculative-draft-placement solo): the DFLASH
         # draft is a self-drafting block model built weight-TP=1 on the solo
