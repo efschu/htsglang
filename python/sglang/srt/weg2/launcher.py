@@ -704,6 +704,8 @@ def spec_flags(*, producer: bool) -> List[str]:
             flags.append("--speculative-draft-kv-only")
         else:
             flags += ["--speculative-draft-window-size", str(int(_SPEC_FORM["window"]))]
+            if dflash_placement() == "solo":
+                flags += ["--speculative-draft-placement", "solo"]
         return flags
     flags = [
         "--speculative-algorithm", SPEC_ALGORITHM,
@@ -716,10 +718,27 @@ def spec_flags(*, producer: bool) -> List[str]:
     return flags
 
 
+#: 19.09. (xsn393, Punkt 5 D-Kapazitaet): the DFLASH draft on D runs SOLO by
+#: default -- the host rank holds it whole, the other ranks a meta shadow
+#: (measured: decode bs6 58 ms vs 61 ms replicated, KV 259k/193k/208k vs
+#: 290k/132k/141k tokens per rank, needle MATCH). `split` restores the
+#: replicated per-rank draft (A/B only).
+ENV_DFLASH_PLACEMENT = "SGLANG_WEG2_DFLASH_PLACEMENT"
+
+
+def dflash_placement() -> str:
+    v = (os.environ.get(ENV_DFLASH_PLACEMENT, "solo") or "solo").strip().lower()
+    return "split" if v == "split" else "solo"
+
+
 def spec_form_env(group: str) -> Dict[str, str]:
-    """Environment the form needs on one group: D's window pool under DFLASH."""
+    """Environment the form needs on one group: D's window pool under DFLASH,
+    and (solo placement) the solo host's compact draft cache."""
     if spec_form_is_dflash() and group == "D":
-        return {"SGLANG_DFLASH_WINDOW_POOL": "1"}
+        env = {"SGLANG_DFLASH_WINDOW_POOL": "1"}
+        if dflash_placement() == "solo":
+            env["SGLANG_DFLASH_SOLO_COMPACT"] = "1"
+        return env
     return {}
 
 
