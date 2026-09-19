@@ -2759,8 +2759,15 @@ class HiCacheController:
         pool = self.mem_pool_host_draft
         pool.get_size_per_token()  # binds head_num/head_dim/layer_num
         off, n = self._draft_head_window(total)
+        tp_size, tp_rank = self.tp_size, self.tp_rank
+        if int(pool.head_num) == total and int(n) != total:
+            # 19.09. (xsn387, --speculative-draft-placement solo): the solo
+            # host holds the draft UNSHARDED (every kv head, like group P's
+            # tp-1 pool), so its window is the WHOLE canonical page -- the
+            # TP dealing above names the share a sharded rank would hold.
+            off, n, tp_size, tp_rank = 0, total, 1, 0
         window = build_draft_window(
-            pool, total, off, n, tp_size=self.tp_size, tp_rank=self.tp_rank
+            pool, total, off, n, tp_size=tp_size, tp_rank=tp_rank
         )
         layout = DraftKvCanonicalLayout(
             version=CANONICAL_LAYOUT_VERSION,
