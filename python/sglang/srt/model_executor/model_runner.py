@@ -1123,6 +1123,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             extra={"draft_worker": bool(self.is_draft_worker)},
         )
         self._attach_layer_fingerprint()
+        from sglang.srt.model_executor.graph_eager_check import maybe_attach as _gec_attach
+
+        self._graph_eager_check = _gec_attach(self)
         self._prepare_moe_topk()
 
         # Must run before backend/graph init so no draft graph records a
@@ -5070,6 +5073,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                         forward_batch,
                         pp_proxy_tensors=pp_proxy_tensors,
                     )
+                _gec = getattr(self, "_graph_eager_check", None)
+                if _gec is not None:
+                    _gec.after_graph(forward_batch, ret)
                 return ModelRunnerOutput(logits_output=ret, can_run_graph=can_run_graph)
 
             # DP / MLP-sync padding + attn-tp normalization. Only the decode
