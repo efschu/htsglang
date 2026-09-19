@@ -92,7 +92,12 @@ def get_batch_sizes_to_capture(
     # device group may not be usable for a plain integer reduce here. Every rank
     # reaches this line exactly once during runner init, so the reduce itself is
     # rank-uniform -- the property the rest of this comment is about.
-    if get_parallel().tp_size > 1:
+    # 19.09. (xsn386): the solo host's DRAFT runner captures rank-locally
+    # (spec_solo_rank_local_graphs) while the shadows capture no draft graphs
+    # at all -- a group min-reduce here has no peers and hangs the host.
+    if get_parallel().tp_size > 1 and not getattr(
+        model_runner, "spec_solo_rank_local_graphs", False
+    ):
         import torch
         import torch.distributed as dist
 
