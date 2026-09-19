@@ -3506,8 +3506,18 @@ class MoEExpertOffloadCache:
         for the LRU rows run_waves wrote; the rest of the LRU region is free."""
         if not self._pool_ready:
             return
-        from sglang.srt.layers.moe.expert_pool_device import sync_tables
+        import logging
 
+        from sglang.srt.layers.moe.expert_pool_device import sync_tables, take_report
+
+        forwards, misses = take_report(self._pool_tables)
+        lid = getattr(self.layer, "layer_id", None)
+        if forwards and lid in (0, 23, 47):
+            logging.getLogger(__name__).info(
+                "MoE expert pool layer %s: %d decode forwards since last sync, "
+                "%d misses (%.2f per forward, top-k %d)",
+                lid, forwards, misses, misses / forwards, getattr(self.layer, "top_k", -1),
+            )
         sync_tables(self._pool_tables, dict(self._scratch_holds))
 
     def prepare_breakable(self, topk_ids, bridge, stage=None):

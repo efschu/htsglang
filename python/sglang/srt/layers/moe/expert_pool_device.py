@@ -46,6 +46,7 @@ class PoolTables:
     protect_recent: Any  # [1] int32
     miss_count: Any  # [E] int32
     staging_rows: Any  # [S] int32
+    misses_total: Any  # [1] int64 misses (promoted + staged) since the last report
 
 
 @dataclass
@@ -101,6 +102,7 @@ def allocate_pool_tables(
         promote_min_misses=one(1), protect_recent=one(0),
         miss_count=torch.zeros(num_experts, dtype=torch.int32, device=device),
         staging_rows=torch.arange(pool_rows, rows, dtype=torch.int32, device=device),
+        misses_total=one(0, torch.int64),
     )
 
 
@@ -145,6 +147,14 @@ def sync_tables(tables: PoolTables, lru_holds: Dict[int, int]) -> None:
     tables.hot_phys.copy_(hot.to(dev))
     tables.row_key.copy_(key.to(dev))
     tables.row_use.copy_(use.to(dev))
+
+
+def take_report(tables: PoolTables) -> Tuple[int, int]:
+    """(forwards, misses) since the last report; both reset. One host read."""
+    f, m = int(tables.forwards[0]), int(tables.misses_total[0])
+    tables.forwards.fill_(0)
+    tables.misses_total.fill_(0)
+    return f, m
 
 
 def step_reference(tables: PoolTables, ids, buffers: StepBuffers) -> Tuple[List[Tuple[int, int]], Any]:
@@ -246,6 +256,7 @@ def step_reference(tables: PoolTables, ids, buffers: StepBuffers) -> Tuple[List[
     tables.error.fill_(1 if error else 0)
     pairs = gathers + [(host_row[e], row) for e, row in staged]
     buffers.gather_count.fill_(len(pairs))
+    tables.misses_total.add_(len(pairs))
     buffers.promoted_count.fill_(len(gathers))
     buffers.staged_count.fill_(len(staged))
     for i, (s, d) in enumerate(pairs):
@@ -274,6 +285,7 @@ def step(tables: PoolTables, ids, buffers: StepBuffers) -> None:
         tables.clock, tables.gate, tables.error, tables.promote_limit,
         tables.promote_interval, tables.forwards, tables.promote_min_misses,
         tables.protect_recent, tables.miss_count, tables.staging_rows,
+        tables.misses_total,
         buffers.gather_src, buffers.gather_dst, buffers.gather_count,
         buffers.routes, buffers.staged_expert, buffers.staged_row,
         buffers.staged_count, buffers.promoted_count, buffers.step_map,
@@ -301,7 +313,7 @@ def _step_kernel():
         ids_ptr, n,
         hot_phys_ptr, host_row_ptr, row_key_ptr, row_use_ptr,
         clock_ptr, gate_ptr, error_ptr, limit_ptr, interval_ptr, forwards_ptr,
-        min_misses_ptr, protect_ptr, miss_count_ptr, staging_ptr,
+        min_misses_ptr, protect_ptr, miss_count_ptr, staging_ptr, misses_total_ptr,
         gather_src_ptr, gather_dst_ptr, gather_count_ptr, routes_ptr,
         staged_expert_ptr, staged_row_ptr, staged_count_ptr, promoted_count_ptr,
         step_map_ptr, num_experts, pool_rows, lru_start,
@@ -389,6 +401,7 @@ def _step_kernel():
         tl.store(promoted_count_ptr, promoted)
         tl.store(staged_count_ptr, staged)
         tl.store(gather_count_ptr, promoted + staged)
+        tl.store(misses_total_ptr, tl.load(misses_total_ptr) + (promoted + staged).to(tl.int64))
         tl.debug_barrier()
         for i in range(0, staged):
             e = tl.load(staged_expert_ptr + i)
@@ -474,5 +487,5 @@ def _copy_kernel():
 __all__ = [
     "PLAN_WIDTH", "ROW_USE_NEVER", "PoolTables", "StepBuffers",
     "allocate_pool_tables", "allocate_step_buffers", "copy_rows",
-    "copy_rows_reference", "step", "step_reference", "sync_tables",
+    "copy_rows_reference", "step", "step_reference", "sync_tables", "take_report",
 ]

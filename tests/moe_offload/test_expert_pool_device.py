@@ -105,3 +105,11 @@ def test_pool_mode_is_selected_by_name_and_only_with_an_offload(monkeypatch):
     assert g.resolve_offload_graph_mode(1.0, False) == g.MODE_EAGER
     monkeypatch.delenv(g.ENV_GRAPH_MODE)
     assert g.resolve_offload_graph_mode(0.5, False) == g.MODE_EAGER
+
+
+def test_take_report_counts_misses_since_the_last_report_and_resets():
+    t, b = _pool()
+    ep.step_reference(t, _ids(2, 3), b)
+    ep.step_reference(t, _ids(2), b)
+    assert ep.take_report(t) == (2, 2)
+    assert ep.take_report(t) == (0, 0)
