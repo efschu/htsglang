@@ -114,3 +114,37 @@ def test_wrapper_off_passes_through(monkeypatch):
         topk_indices=torch.zeros(3, 2, dtype=torch.int32),
     )
     assert torch.equal(out, wrong)
+
+
+def test_global_kv_map_replicated_kv_plan():
+    """Plan [12, 6, 6] q heads over 24 heads / 2 kv heads: rank 0 -> kv 0 for
+    all 12 heads, ranks 1 and 2 -> kv 1 for all their heads (the kernels'
+    local grouping would pair rank 0's heads 6..11 with kv 1)."""
+    assert qsb._qsa_global_kv_map(0, 12, 24, 2).tolist() == [0] * 12
+    assert qsb._qsa_global_kv_map(12, 6, 24, 2).tolist() == [1] * 6
+    assert qsb._qsa_global_kv_map(18, 6, 24, 2).tolist() == [1] * 6
+    local = (torch.arange(12) // 6).tolist()
+    assert local != [0] * 12  # the local grouping differs on rank 0
+
+
+def test_dense_reference_with_kv_map_uses_given_heads():
+    torch.manual_seed(3)
+    n, hq, hkv, d = 7, 4, 2, 8
+    q = torch.randn(n, hq, d)
+    k = torch.randn(n, hkv, d)
+    v = torch.randn(n, hkv, d)
+    all_kv1 = torch.tensor([1, 1, 1, 1])
+    ref = qsb._qsa_dense_reference(q, k, v, 1.0, kv_map=all_kv1)
+    expect = _sdpa_reference(q, k[:, 1:2], v[:, 1:2], 1.0)
+    assert torch.allclose(ref.float(), expect, atol=1e-5)
+    # identity map == local grouping
+    local_map = torch.arange(hq) // (hq // hkv)
+    assert torch.allclose(
+        qsb._qsa_dense_reference(q, k, v, 1.0, kv_map=local_map),
+        qsb._qsa_dense_reference(q, k, v, 1.0),
+    )
+
+
+def test_mode_subst_global_parses(monkeypatch):
+    monkeypatch.setenv("SGLANG_QSA_DENSE_CHECK", "subst_global")
+    assert qsb._qsa_dense_check_mode() == "subst_global"

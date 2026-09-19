@@ -91,25 +91,55 @@ def _qsa_dense_check_mode() -> str:
     value = os.environ.get("SGLANG_QSA_DENSE_CHECK", "").strip().lower()
     if value in ("", "0", "off", "false"):
         return ""
-    return "subst" if value == "subst" else "check"
+    if value in ("subst", "subst_global"):
+        return value
+    return "check"
+
+
+def _qsa_global_kv_map(
+    head_offset: int, local_heads: int, total_heads: int, total_kv_heads: int
+) -> torch.Tensor:
+    """kv head index of every LOCAL q head under the model's GLOBAL GQA
+    grouping: global q head h belongs to kv head ``h // (H // KV)``. Under the
+    REPLICATED-KV geometry (kv < tp) a rank holds ALL kv heads but only a
+    slice of the q heads, so the kernels' local grouping
+    ``q_local // (hq_local // hkv)`` names the wrong kv head for every rank
+    whose slice does not start at a kv-group boundary AND span whole groups
+    (fn5i 19.09.: rank 0 = heads 0..11 = all of kv group 0, kernel pairs
+    heads 6..11 with kv head 1)."""
+    if total_heads % total_kv_heads:
+        raise ValueError(f"heads {total_heads} not a multiple of kv heads {total_kv_heads}")
+    group = total_heads // total_kv_heads
+    return (torch.arange(local_heads) + int(head_offset)) // group
 
 
 def _qsa_dense_reference(
-    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, scaling: float
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    scaling: float,
+    kv_map: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Dense causal GQA attention in fp32 over one prefix-free sequence.
 
-    ``q`` [n, hq, d], ``k``/``v`` [n, hkv, d]; kv head j serves q heads
-    ``j*g .. (j+1)*g-1`` with ``g = hq // hkv`` (the sparse kernels' grouping).
-    Returns [n, hq*d] in q's dtype."""
+    ``q`` [n, hq, d], ``k``/``v`` [n, hkv, d]. Without ``kv_map`` kv head j
+    serves q heads ``j*g .. (j+1)*g-1`` with ``g = hq // hkv`` (the sparse
+    kernels' LOCAL grouping); with ``kv_map`` ([hq] kv index per q head) the
+    given assignment is used (see _qsa_global_kv_map). Returns [n, hq*d] in
+    q's dtype."""
     n, hq, d = q.shape
     hkv = k.shape[1]
-    if hq % hkv:
-        raise ValueError(f"q heads {hq} not a multiple of kv heads {hkv}")
-    g = hq // hkv
     qf = q.float().transpose(0, 1)
-    kf = k[:n].float().transpose(0, 1).repeat_interleave(g, 0)
-    vf = v[:n].float().transpose(0, 1).repeat_interleave(g, 0)
+    if kv_map is None:
+        if hq % hkv:
+            raise ValueError(f"q heads {hq} not a multiple of kv heads {hkv}")
+        g = hq // hkv
+        kf = k[:n].float().transpose(0, 1).repeat_interleave(g, 0)
+        vf = v[:n].float().transpose(0, 1).repeat_interleave(g, 0)
+    else:
+        idx = kv_map.to(device=q.device, dtype=torch.long)
+        kf = k[:n].float().transpose(0, 1).index_select(0, idx)
+        vf = v[:n].float().transpose(0, 1).index_select(0, idx)
     scores = torch.matmul(qf, kf.transpose(1, 2)) * float(scaling)
     causal = torch.ones(n, n, dtype=torch.bool, device=q.device).tril()
     scores = scores.masked_fill(~causal, float("-inf"))
@@ -1565,21 +1595,59 @@ class QwenSparseAttnBackend(AttentionBackend):
         rows = int(topk_indices.shape[0])
         q3 = q.reshape(-1, layer.tp_q_head_num, layer.head_dim)
         eligible = _qsa_dense_check_eligible(forward_batch, rows, k) and q3.shape[0] >= rows
-        ref = (
-            _qsa_dense_reference(q3[:rows], k, v, layer.scaling) if eligible else None
-        )
+        ref = ref_global = None
+        if eligible:
+            ref = _qsa_dense_reference(q3[:rows], k, v, layer.scaling)
+            kv_map = self._qsa_global_kv_map_for_layer(layer, k.shape[1])
+            if kv_map is not None:
+                ref_global = _qsa_dense_reference(
+                    q3[:rows], k, v, layer.scaling, kv_map=kv_map
+                )
         output = self._forward_extend_impl(
             q, k, v, layer, forward_batch, save_kv_cache, topk_indices, **kwargs
         )
         if ref is None:
             return output
-        self._qsa_dense_check_log(mode, layer, forward_batch, output, ref, rows)
-        if mode == "subst" and output.shape[0] >= rows:
+        self._qsa_dense_check_log(
+            mode, layer, forward_batch, output, ref, rows, ref_global=ref_global
+        )
+        chosen = ref_global if mode == "subst_global" else ref if mode == "subst" else None
+        if chosen is not None and output.shape[0] >= rows:
             output = output.clone()
-            output[:rows] = ref.reshape(rows, -1).to(output.dtype)
+            output[:rows] = chosen.reshape(rows, -1).to(output.dtype)
         return output
 
-    def _qsa_dense_check_log(self, mode, layer, forward_batch, output, ref, rows):
+    def _qsa_global_kv_map_for_layer(self, layer, total_kv_heads: int):
+        """[hq_local] kv index per local q head under the GLOBAL grouping, or
+        None when no shard plan is installed (then local == global)."""
+        try:
+            from sglang.srt.distributed.utils import tp_plan_active
+            from sglang.srt.layers.attention.triton_backend import (
+                _plan_aware_dcp_group_q_head_counts,
+            )
+            from sglang.srt.runtime_context import get_parallel
+
+            parallel = get_parallel()
+            tp_size = int(parallel.attn_tp_size)
+            if tp_size <= 1 or not tp_plan_active(tp_size):
+                return None
+            rank = int(parallel.attn_tp_rank)
+            hq = int(layer.tp_q_head_num)
+            counts = _plan_aware_dcp_group_q_head_counts(
+                self.dcp_model_config, tp_size, hq
+            )
+            if len(counts) != tp_size or int(counts[rank]) != hq:
+                return None
+            return _qsa_global_kv_map(
+                sum(int(c) for c in counts[:rank]), hq, sum(int(c) for c in counts), total_kv_heads
+            )
+        except Exception as exc:  # diagnostics never kill the forward
+            logger.warning("QSA-DENSE-CHECK global map unavailable: %r", exc)
+            return None
+
+    def _qsa_dense_check_log(
+        self, mode, layer, forward_batch, output, ref, rows, ref_global=None
+    ):
         if _QSA_DENSE_CHECK_LOGS[0] >= 240:
             return
         _QSA_DENSE_CHECK_LOGS[0] += 1
@@ -1588,6 +1656,16 @@ class QwenSparseAttnBackend(AttentionBackend):
             b = ref.float().reshape(rows, -1)
             diff = (a - b).abs()
             cos = F.cosine_similarity(a, b, dim=-1)
+            gtxt = ""
+            if ref_global is not None:
+                c = ref_global.float().reshape(rows, -1)
+                dg = (a - c).abs()
+                cg = F.cosine_similarity(a, c, dim=-1)
+                gtxt = (
+                    f" GLOBAL: max_abs={float(dg.max()):.4g} mean_abs={float(dg.mean()):.4g}"
+                    f" cos_mean={float(cg.mean()):.4f} cos_min={float(cg.min()):.4f}"
+                    f" local_vs_global_max_abs={float((b - c).abs().max()):.4g}"
+                )
             pool = self.token_to_kv_pool
             loc = getattr(forward_batch, "out_cache_loc", None)
             loc_min = int(loc.min()) if loc is not None and loc.numel() else -1
@@ -1595,7 +1673,7 @@ class QwenSparseAttnBackend(AttentionBackend):
             logger.warning(
                 "QSA-DENSE-CHECK mode=%s draft=%s layer=%d fmode=%s rows=%d hq=%d hkv=%d "
                 "max_abs=%.4g mean_abs=%.4g ref_mean_abs=%.4g cos_mean=%.4f cos_min=%.4f "
-                "cos_first8=%s pool_size=%s loc_min=%d loc_max=%d dcp=%d",
+                "cos_first8=%s pool_size=%s loc_min=%d loc_max=%d dcp=%d%s",
                 mode,
                 self.is_draft_worker,
                 int(layer.layer_id),
@@ -1613,6 +1691,7 @@ class QwenSparseAttnBackend(AttentionBackend):
                 loc_min,
                 loc_max,
                 int(self.dcp_size),
+                gtxt,
             )
         except Exception as exc:  # diagnostics never kill the forward
             logger.warning("QSA-DENSE-CHECK skipped: %r", exc)
