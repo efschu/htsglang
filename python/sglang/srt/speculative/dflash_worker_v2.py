@@ -1001,12 +1001,21 @@ class DFlashWorkerV2(BaseSpecWorker):
             self.server_args.cuda_graph_config.decode.backend != Backend.DISABLED
         )
         if is_cuda() and capture_decode_cuda_graph:
-            available_mem = self._tp_sync.available_memory_gb(
-                SpecTpSyncSite.DFLASH_MEM,
-                self.device,
-                self.gpu_id,
-                group=get_tp_group(),
-            )
+            if self._spec_solo_is_host:
+                # xsn384/385 (19.09.): the shadows left this method at the top,
+                # so the group-minimum here is a collective with no peers -- the
+                # host hung in it and the shadows timed out in the sampler
+                # warmup barrier. The solo host's draft graphs are rank-local;
+                # so is their memory question.
+                from sglang.srt.utils import get_available_gpu_memory as _gag
+                available_mem = _gag(self.device, self.gpu_id, distributed=False)
+            else:
+                available_mem = self._tp_sync.available_memory_gb(
+                    SpecTpSyncSite.DFLASH_MEM,
+                    self.device,
+                    self.gpu_id,
+                    group=get_tp_group(),
+                )
             if available_mem < 1.0:
                 capture_decode_cuda_graph = False
                 logger.warning(
