@@ -281,6 +281,22 @@ def eager_on_graph(enable: bool):
     return decorator
 
 
+_SYNC_BREAKS: bool | None = None
+
+
+def _sync_breaks() -> bool:
+    """Diagnosis switch (19.09., fn3m): SGLANG_BCG_SYNC_BREAKS=1 drains the
+    device after every eager break function of a replay. It rules a
+    stream-ordering race between the break's work and the next segment in or
+    out at the metal; it is never a production setting. Read once."""
+    global _SYNC_BREAKS
+    if _SYNC_BREAKS is None:
+        import os
+
+        _SYNC_BREAKS = str(os.environ.get("SGLANG_BCG_SYNC_BREAKS", "0")).strip() not in ("", "0")
+    return _SYNC_BREAKS
+
+
 class BreakableCUDAGraph:
     """Container holding one torch.cuda.CUDAGraph per segment plus an
     eager break function between consecutive segments."""
@@ -307,11 +323,14 @@ class BreakableCUDAGraph:
             # per-segment host work, and the ordinal is what turns a graph
             # name into a place to read. Five stores, no device access.
             if clock is None:
+                sync = _sync_breaks()
                 for i, seg in enumerate(self._segments):
                     barlink_abort_gate.note_replay("breakable/seg", None, i)
                     seg.replay()
                     if i < len(self._break_fns):
                         self._break_fns[i]()
+                        if sync:
+                            torch.cuda.synchronize()
             else:
                 self._replay_measured(clock)
         finally:
