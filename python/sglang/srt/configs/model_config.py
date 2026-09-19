@@ -1393,6 +1393,16 @@ class ModelConfig:
         is rank-dependent; pass `rank` to get that rank's share (omitting
         it returns the smallest share as a conservative basis)."""
         total_num_kv_heads = self.get_total_num_kv_heads()
+        from sglang.srt.distributed.utils import draft_rank_local_single_kv_head
+
+        if draft_rank_local_single_kv_head(
+            getattr(self, "is_draft_model", False),
+            total_num_kv_heads,
+            tensor_parallel_size,
+        ):
+            # NEXTN draft under REPLICATED-KV (fn5m 19.09.): one kv head per
+            # rank -- the one its q heads attend to (attn_replicated_kv_local_head).
+            return 1
         uneven = self._uneven_tp_num_kv_heads(
             total_num_kv_heads, tensor_parallel_size, rank
         )

@@ -1617,6 +1617,41 @@ class QwenSparseAttnBackend(AttentionBackend):
             output[:rows] = chosen.reshape(rows, -1).to(output.dtype)
         return output
 
+    def _rank_local_kv_head(self, layer) -> Optional[int]:
+        """kv head this rank's q heads attend to when the layer holds ALL kv
+        heads under REPLICATED-KV (attn_replicated_kv_local_head), else None
+        (single-head layer, no plan, or the geometry does not apply)."""
+        cached = getattr(layer, "_qsa_rank_local_kv_head", "unset")
+        if cached != "unset":
+            return cached
+        head = None
+        try:
+            from sglang.srt.distributed.utils import attn_replicated_kv_local_head
+            from sglang.srt.runtime_context import get_parallel
+
+            cfg = self.dcp_model_config
+            total_kv = int(cfg.get_total_num_kv_heads()) if cfg is not None else 0
+            if cfg is not None and int(layer.tp_k_head_num) == total_kv and total_kv > 1:
+                parallel = get_parallel()
+                total_q = int(cfg.hf_text_config.num_attention_heads)
+                head = attn_replicated_kv_local_head(
+                    total_q, total_kv, int(parallel.attn_tp_size), int(parallel.attn_tp_rank)
+                )
+        except Exception as exc:
+            logger.warning("QSA rank-local kv head unresolved (all heads kept): %r", exc)
+            head = None
+        layer._qsa_rank_local_kv_head = head
+        return head
+
+    def _rank_local_kv_inputs(self, layer, k: torch.Tensor, v: torch.Tensor):
+        """fn5m 19.09.: the prefix-free extend attends rank-locally with the
+        forward's own k/v; under REPLICATED-KV only this rank's kv head may
+        feed the kernel (its local grouping pairs the wrong head otherwise)."""
+        head = self._rank_local_kv_head(layer)
+        if head is None or k.dim() != 3 or k.shape[1] <= 1:
+            return k, v
+        return k.narrow(1, head, 1), v.narrow(1, head, 1)
+
     def _qsa_global_kv_map_for_layer(self, layer, total_kv_heads: int):
         """[hq_local] kv index per local q head under the GLOBAL grouping, or
         None when no shard plan is installed (then local == global)."""
@@ -1751,10 +1786,13 @@ class QwenSparseAttnBackend(AttentionBackend):
             (1, 0),
         ).contiguous()
         if not any(prefix_lens):
+            k_loc, v_loc = self._rank_local_kv_inputs(
+                layer, k[:num_valid_rows], v[:num_valid_rows]
+            )
             output = sparse_gqa_fwd_interface_triton(
                 q.contiguous(),
-                k[:num_valid_rows].contiguous(),
-                v[:num_valid_rows].contiguous(),
+                k_loc.contiguous(),
+                v_loc.contiguous(),
                 max(sequence_lens, default=1),
                 topk_indices,
                 cu_seqlens_q,

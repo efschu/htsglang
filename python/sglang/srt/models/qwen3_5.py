@@ -38,6 +38,7 @@ from sglang.srt.configs.qwen3_5 import (
 from sglang.srt.distributed import get_pp_group
 from sglang.srt.distributed.utils import (
     attn_kv_replicated,
+    attn_replicated_kv_local_head,
     attn_q_partition_groups,
     attn_q_partition_units,
     tp_partition_size,
@@ -913,6 +914,17 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
         return hidden_states, residual
 
 
+def select_rank_local_kv_head(
+    k: torch.Tensor, v: torch.Tensor, num_kv_heads: int, head_dim: int, head: int
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Keep only kv head ``head`` of flat ``[T, num_kv_heads*head_dim]`` k/v
+    (REPLICATED-KV rank-local attention, see attn_replicated_kv_local_head)."""
+    rows = k.shape[0]
+    k = k.reshape(rows, num_kv_heads, head_dim)[:, head].contiguous()
+    v = v.reshape(rows, num_kv_heads, head_dim)[:, head].contiguous()
+    return k, v
+
+
 class Qwen3_5AttentionDecoderLayer(nn.Module):
     """Qwen3.5 Decoder Layer with Full Attention."""
 
@@ -1024,6 +1036,25 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         self._attn_q_groups = _q_groups
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
+        # fn5m 19.09.: the NEXTN draft runs rank-local (replicated pool, no
+        # DCP head gather), so under REPLICATED-KV its attention sees ONLY
+        # the kv head its q heads belong to; the projection still computes
+        # all kv heads (qkv_proj / k_norm are unchanged), the slice happens
+        # in _prepare_qkv_gate and the pool holds one head (model_config
+        # get_num_kv_heads -> 1 for the draft).
+        self._rank_local_kv_head = (
+            attn_replicated_kv_local_head(
+                self.total_num_heads,
+                self.total_num_kv_heads,
+                self.attn_tp_size,
+                self.attn_tp_rank,
+            )
+            if (self._kv_replicated and is_nextn)
+            else None
+        )
+        self.attn_num_kv_heads = (
+            1 if self._rank_local_kv_head is not None else self.num_kv_heads
+        )
         self.scaling = self.head_dim**-0.5
         self.max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
 
@@ -1098,7 +1129,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             self.num_heads,
             self.head_dim,
             self.scaling,
-            num_kv_heads=self.num_kv_heads,
+            num_kv_heads=self.attn_num_kv_heads,
             layer_id=layer_id,
             prefix=f"{prefix}.attn",
         )
@@ -1299,6 +1330,21 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         return q, k, v, gate
 
     def _prepare_qkv_gate(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        q, k, v, gate = self._prepare_qkv_gate_all_kv(
+            positions, hidden_states, forward_batch
+        )
+        if self._rank_local_kv_head is not None:
+            k, v = select_rank_local_kv_head(
+                k, v, self.num_kv_heads, self.head_dim, self._rank_local_kv_head
+            )
+        return q, k, v, gate
+
+    def _prepare_qkv_gate_all_kv(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,

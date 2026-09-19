@@ -1786,6 +1786,58 @@ def attn_q_partition_units(
     return units
 
 
+def attn_replicated_kv_local_head(
+    total_num_q_heads: int, total_num_kv_heads: int, tp_size: int, tp_rank: int
+) -> Optional[int]:
+    """The ONE kv head this rank's q heads attend to under the REPLICATED-KV
+    geometry (kv < tp, uneven plan), or None when the geometry does not apply.
+
+    fn5i/fn5m 19.09. (Qwen3.8-Flash-Next, 24 q / 2 kv heads, plan [39,13,12]
+    -> q heads 0-11 / 12-17 / 18-23): every rank holds BOTH kv heads, and the
+    attention kernels group LOCALLY (``q_local // (hq_local // hkv)``), so rank
+    0 paired its heads 6-11 with kv head 1 and ranks 1/2 paired their first
+    heads with kv head 0 -- although the model's GQA grouping is
+    ``global_head // (H // KV)`` (0-11 -> kv 0, 12-23 -> kv 1). The DCP
+    head-all-gather decode path computes all 24 heads globally and was right;
+    every rank-local path (the NEXTN draft, the prefix-free prefill) was not.
+    The kv-aligned split (task #116) guarantees a rank never straddles a kv
+    group, so the rank needs exactly this one head; a straddling split is
+    refused by name."""
+    if not tp_plan_active(tp_size) or not attn_kv_replicated(
+        tp_size, total_num_kv_heads
+    ):
+        return None
+    units = attn_q_partition_units(total_num_q_heads, total_num_kv_heads, tp_size)
+    groups = attn_q_partition_groups(total_num_kv_heads, tp_size)
+    sizes = tp_partition_sizes(total_num_q_heads, tp_size, units, None, groups)
+    offset = sum(sizes[:tp_rank])
+    group = total_num_q_heads // total_num_kv_heads
+    first = offset // group
+    last = (offset + sizes[tp_rank] - 1) // group
+    if first != last:
+        raise ValueError(
+            f"REPLICATED-KV geometry: rank {tp_rank} holds q heads "
+            f"{offset}..{offset + sizes[tp_rank] - 1}, which straddle the kv "
+            f"groups {first} and {last} (group size {group}); a rank-local "
+            "attention needs a single kv head per rank."
+        )
+    return first
+
+
+def draft_rank_local_single_kv_head(
+    is_draft_model: bool, total_num_kv_heads: int, tp_size: int
+) -> bool:
+    """Whether a draft model's KV pool holds ONE kv head per rank: the NEXTN
+    draft runs rank-local (its pool is replicated, no DCP), so under the
+    REPLICATED-KV geometry it stores only the kv head its q heads attend to
+    (see attn_replicated_kv_local_head)."""
+    return bool(
+        is_draft_model
+        and tp_plan_active(tp_size)
+        and attn_kv_replicated(tp_size, total_num_kv_heads)
+    )
+
+
 def attn_q_partition_groups(total_num_kv_heads: int, tp_size: int) -> Optional[int]:
     """kv-group count to pass as `groups` when partitioning the Q dimension
     (task #116). Returns `total_num_kv_heads` under the REPLICATED-KV
