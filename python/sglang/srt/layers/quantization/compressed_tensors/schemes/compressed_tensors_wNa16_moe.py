@@ -134,7 +134,12 @@ class CompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
         # then keeps only the [R+C] resident slots there (see
         # process_weights_after_loading). fraction >= 1.0 -> _moe_dev is None
         # -> byte-identical stock path.
-        _moe_dev = "cpu" if _moe_offload_active() else None
+        _moe_dev = (
+            "cpu"
+            if _moe_offload_active()
+            and not getattr(layer, "_moe_offload_excluded", False)
+            else None
+        )
 
         w13_weight = torch.nn.Parameter(
             torch.empty(

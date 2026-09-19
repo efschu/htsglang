@@ -619,6 +619,9 @@ class FusedMoE(torch.nn.Module):
         # an MTP draft): the residency machinery tells a draft layer from the
         # target's by it (expert_offload.hotset_covers_layer).
         self._sglang_prefix = prefix
+        # Decided BEFORE create_weights: the quant scheme reads it to keep the
+        # draft's expert stack on the card instead of the host presplit.
+        self._moe_offload_excluded = _offload_excludes_draft_layer(prefix)
         server_args = get_server_args()
         kt_config = create_kt_config_from_server_args(server_args, layer_id)
         if kt_config is not None:
@@ -699,9 +702,7 @@ class FusedMoE(torch.nn.Module):
         self._moe_offload_enabled = self._expert_offload_fraction < 1.0 or bool(
             self._moe_offload_trace_path
         )
-        if self._moe_offload_enabled and _offload_excludes_draft_layer(
-            getattr(self, "_sglang_prefix", "")
-        ):
+        if self._moe_offload_enabled and self._moe_offload_excluded:
             # SGLANG_MOE_OFFLOAD_EXCLUDE_DRAFT=1 (fn4x 19.09.): the NEXTN draft's
             # experts stay fully resident (INT4 g32: 0.3-0.9 GB per rank) -- the
             # A/B that tells the draft's offload path from the rest of its forward.
