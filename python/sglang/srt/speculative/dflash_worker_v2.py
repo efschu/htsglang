@@ -703,6 +703,36 @@ class DFlashWorkerV2(BaseSpecWorker):
         capture_safe_tp_broadcast(tp_group, (buf,), src=self._spec_solo_rank)
         return buf
 
+    def _solo_broadcast_selector_sample(self, bs: int, sampling_info) -> None:
+        """Solo x DFlash2 selector, a SAMPLING round (any non-greedy row):
+        the host's (candidate_ids, q_rows) -- the sparse draft distribution
+        the verify's accept scatters -- to the shadows, one broadcast each.
+        Greedy rounds carry nothing (every rank keeps `_selector_sample`
+        None and the verify accepts greedily). Rank-uniform decision: the
+        sampling params are the same batch on every rank."""
+        if _is_all_greedy(sampling_info):
+            return
+        tp_group = get_tp_group()
+        if tp_group.world_size == 1:
+            return
+        gamma = int(self.block_size) - 1
+        top_k = int(self.selector.top_k)
+        if self._spec_solo_is_host:
+            if self._selector_sample is None:
+                raise RuntimeError(
+                    "DFLASH solo host: a sampling round left no selector sample "
+                    "to publish to the shadows."
+                )
+            cand, q = self._selector_sample
+            cand = cand.contiguous()
+            q = q.contiguous().float()
+        else:
+            dev = self.device
+            cand = torch.empty((bs, gamma, top_k), dtype=torch.int64, device=dev)
+            q = torch.empty((bs, gamma, top_k), dtype=torch.float32, device=dev)
+        capture_safe_tp_broadcast(tp_group, (cand, q), src=self._spec_solo_rank)
+        self._selector_sample = (cand, q)
+
     def _solo_broadcast_draft_block(self, draft_tokens: torch.Tensor) -> None:
         """One broadcast per round: the host's [bs, block_size] draft block to
         the shadow ranks. Eager (never inside a captured region); capture-safe
@@ -2687,11 +2717,23 @@ class DFlashWorkerV2(BaseSpecWorker):
             self._audit_mark("embed")  # DFLASH AUDIT (env-gated)
             recv_hs = self._solo_broadcast_draft_hidden(num_sample_tokens, None)
             self._audit_mark("hs_bcast")  # DFLASH AUDIT (env-gated)
-            self._greedy_sample_from_vocab_parallel_head(
-                hidden_states=recv_hs,
-                lm_head=lm_head,
-            )
-            self._audit_mark("greedy")  # DFLASH AUDIT (env-gated)
+            if self.selector is not None:
+                # 19.09. (xsn388): the host runs the DFlash2 selector; this
+                # shadow joins its `compute_candidates` all-gathers with its
+                # own lm_head shard (3a) and, on a sampling round, receives
+                # the host's (candidate_ids, q) for the verify's accept (3b).
+                from sglang.srt.models.dflash import shadow_join_candidate_gather
+
+                self._selector_sample = None
+                shadow_join_candidate_gather(lm_head, recv_hs, int(self.selector.top_k))
+                self._audit_mark("greedy")  # DFLASH AUDIT (env-gated)
+                self._solo_broadcast_selector_sample(bs, batch.sampling_info)
+            else:
+                self._greedy_sample_from_vocab_parallel_head(
+                    hidden_states=recv_hs,
+                    lm_head=lm_head,
+                )
+                self._audit_mark("greedy")  # DFLASH AUDIT (env-gated)
             # Column 0 (the seeded bonus) is already rank-consistent.
             self._solo_broadcast_draft_block(draft_tokens)
             self._audit_mark("blk_bcast")  # DFLASH AUDIT (env-gated)
@@ -2828,11 +2870,22 @@ class DFlashWorkerV2(BaseSpecWorker):
                     )
             elif self.selector is not None:
                 if self._spec_solo_active:
-                    raise ValueError(
-                        "DFlash2 candidate selector does not support "
-                        "--speculative-draft-placement solo (the shadows run no "
-                        "draft forward); use the per-rank uneven-TP draft."
+                    # 19.09. (xsn388) solo HOST with the DFlash2 selector: the
+                    # lattice and the sample are rank-local (the host's own
+                    # draft codebooks), but `compute_candidates` all-gathers
+                    # every rank's lm_head-shard top-k -- so the shadows need
+                    # the predicted hidden rows first (the same broadcast the
+                    # greedy solo path makes), then they join the two gathers
+                    # (`shadow_join_candidate_gather`), and a sampling round's
+                    # (candidate_ids, q) reaches them by one more broadcast.
+                    _dh = draft_logits_output.hidden_states
+                    if _dh is None:
+                        raise RuntimeError("DFLASH selector draft returned no hidden states.")
+                    _dh = _dh.view(bs, int(self.block_size), -1)
+                    self._solo_broadcast_draft_hidden(
+                        num_sample_tokens, _dh[:, 1:, :].reshape(-1, _dh.shape[-1])
                     )
+                    self._audit_mark("hs_bcast")  # DFLASH AUDIT (env-gated)
                 draft_next = self._propose_selector_block(
                     draft_logits_output=draft_logits_output,
                     bs=bs,
@@ -2840,6 +2893,8 @@ class DFlashWorkerV2(BaseSpecWorker):
                     anchor_token_ids=block_ids[:, 0],
                     sampling_info=batch.sampling_info,
                 )
+                if self._spec_solo_active:
+                    self._solo_broadcast_selector_sample(bs, batch.sampling_info)
             else:
                 draft_hidden = draft_logits_output.hidden_states
                 if draft_hidden is None:

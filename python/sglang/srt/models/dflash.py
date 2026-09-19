@@ -65,6 +65,42 @@ except ImportError:
     _flashinfer_top_k = None
 
 
+def gather_candidate_topk(
+    lm_head, hidden: torch.Tensor, k: int, *, use_quant_head: bool
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """The TP half of :meth:`DFlashDraftModel.compute_candidates`: this rank's
+    lm_head-shard top-k, the two all-gathers (K logits/ids per rank, not the
+    vocab), the global top-k -> ``(global_ids [N, K] long, top_vals [N, K])``.
+    EVERY TP rank must call it -- under ``--speculative-draft-placement solo``
+    the shadows (no draft model, a meta selector) join with the host's
+    broadcast hidden rows via :func:`shadow_join_candidate_gather`."""
+    shard = lm_head.shard_indices
+    vals, ids = _radix_topk(
+        _project_candidate_logits(
+            hidden,
+            lm_head,
+            num_org=int(shard.num_org_elements),
+            use_quant_head=use_quant_head,
+        ),
+        k,
+    )
+    global_ids = ids.long() + int(shard.org_vocab_start_index)
+    gathered_vals = tensor_model_parallel_all_gather(vals.float(), dim=-1)
+    gathered_ids = tensor_model_parallel_all_gather(global_ids, dim=-1)
+    top_vals, sel = torch.topk(gathered_vals, k, dim=-1)
+    return torch.gather(gathered_ids, -1, sel).long(), top_vals
+
+
+def shadow_join_candidate_gather(lm_head, hidden: torch.Tensor, k: int) -> torch.Tensor:
+    """A solo SHADOW's side of the host's ``compute_candidates``: the same
+    shard projection and all-gathers, the global candidate ids as result
+    (identical on every rank; the lattice and the sample stay on the host)."""
+    quant_method = getattr(lm_head, "quant_method", None)
+    use_quant_head = should_apply_lm_head_quant_method(lm_head, quant_method)
+    ids, _vals = gather_candidate_topk(lm_head, hidden, k, use_quant_head=use_quant_head)
+    return ids
+
+
 def _radix_topk(scores: torch.Tensor, k: int) -> Tuple[torch.Tensor, torch.Tensor]:
     # The selector's largest single cost: it reads the whole logits tensor.
     if _flashinfer_top_k is not None:
@@ -1089,23 +1125,10 @@ class DFlash2DraftModel(DFlashDraftModel):
                 k,
             )
             return ids.long(), self._transform_unary_logits(vals)
-        shard = self.lm_head.shard_indices
-        vals, ids = _radix_topk(
-            _project_candidate_logits(
-                hidden,
-                self.lm_head,
-                num_org=int(shard.num_org_elements),
-                use_quant_head=use_quant_head,
-            ),
-            k,
+        ids, top_vals = gather_candidate_topk(
+            self.lm_head, hidden, k, use_quant_head=use_quant_head
         )
-        global_ids = ids.long() + int(shard.org_vocab_start_index)
-        gathered_vals = tensor_model_parallel_all_gather(vals.float(), dim=-1)
-        gathered_ids = tensor_model_parallel_all_gather(global_ids, dim=-1)
-        top_vals, sel = torch.topk(gathered_vals, k, dim=-1)
-        return torch.gather(gathered_ids, -1, sel).long(), self._transform_unary_logits(
-            top_vals
-        )
+        return ids, self._transform_unary_logits(top_vals)
 
 
 class MuseGlimmerAssistantModel(DFlashDraftModel):
