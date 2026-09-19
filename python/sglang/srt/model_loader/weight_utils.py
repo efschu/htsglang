@@ -2350,6 +2350,34 @@ def _warn_draft_load_unchecked(
     )
 
 
+_MARLIN_G_IDX_PARAM_SUFFIXES = (
+    "w13_weight_g_idx",
+    "w2_weight_g_idx",
+    "w13_g_idx_sort_indices",
+    "w2_g_idx_sort_indices",
+)
+
+
+def load_time_derived_param_names(model: torch.nn.Module) -> set:
+    """Parameters a quant scheme creates and fills at load time WITHOUT a
+    checkpoint tensor behind them, so their absence from ``loaded_params`` is
+    not an unloaded weight. Today: the Marlin WNA16 MoE ``g_idx`` /
+    ``g_idx_sort_indices`` placeholders on a layer whose scheme has NO
+    activation ordering (fn4l 19.09.: the INT4 g32 NEXTN draft of
+    Qwen3.8-Flash-Next was refused for exactly these four zero tensors). With
+    actorder set the checkpoint DOES carry ``weight_g_idx`` and a missing one
+    stays a finding."""
+    names = set()
+    for prefix, module in model.named_modules():
+        scheme = getattr(module, "scheme", None)
+        if scheme is None or getattr(scheme, "actorder", None):
+            continue
+        for suffix in _MARLIN_G_IDX_PARAM_SUFFIXES:
+            if hasattr(module, suffix):
+                names.add(f"{prefix}.{suffix}" if prefix else suffix)
+    return names
+
+
 def raise_on_unloaded_draft_parameters(
     model: torch.nn.Module,
     loaded_params: Optional[Iterable[str]],
@@ -2405,10 +2433,12 @@ def raise_on_unloaded_draft_parameters(
         )
         return
 
+    derived = load_time_derived_param_names(model)
     missing = sorted(
         name
         for name in dict(model.named_parameters())
         if name not in loaded
+        and name not in derived
         and not any(
             fragment in name for fragment in _TARGET_PROVIDED_DRAFT_PARAM_FRAGMENTS
         )
