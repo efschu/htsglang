@@ -1560,10 +1560,9 @@ def allocate_spill_pool(spill_ids, row_shape, dtype, cold_tier=None, param_attr=
         return cold_tier.allocate_spill_pool(param_attr, ids, shape, dtype)
     if not ids:
         return None
-    pool = torch.empty((len(ids),) + shape, dtype=dtype, device="cpu")
-    if torch.cuda.is_available():
-        pool = pool.pin_memory()
-    return pool
+    # Page-locked at its exact size (see pinned_exact_empty): plain pageable
+    # memory without a CUDA context, exactly as pin_memory() would be there.
+    return pinned_exact_empty((len(ids),) + shape, dtype)
 
 
 # ===========================================================================
@@ -2552,6 +2551,77 @@ def refuse_capturable_cold_tier(num_experts: int) -> None:
     )
 
 
+# ---------------------------------------------------------------------------
+# Exact-size page-locked host buffers (host-RAM peak of the load-time presplit)
+# ---------------------------------------------------------------------------
+#
+# ``torch.empty(...).pin_memory()`` goes through ATen's CachingHostAllocator,
+# which rounds EVERY request up to the next power of two before it calls
+# cudaHostAlloc (ATen/core/CachingHostAllocator.h:302, ``PowerOf2Ceil``, torch
+# 2.11.0). The presplit allocates one pinned spill pool per layer per expert
+# tensor, so a spill pool that lands 1 % above 256 MiB is page-locked as
+# 512 MiB -- 48 layers x 3 tensors of that is ~18 GiB of host RAM nobody uses
+# (measured 19.09.: MoE vector 32/16/16 lifted the boot from 71 to 89-92 GiB and
+# tripped the 88 GiB RAM guard; 39/13/12 only fit because 311 rows x 1.6384 MB
+# happens to sit 0.5 % below 512 MiB).
+#
+# The buffers below are page-locked at their exact byte size: an anonymous
+# ``mmap`` (page aligned by construction) registered with ``cudaHostRegister``.
+# cudaPointerGetAttributes reports such a range as host memory, so
+# ``Tensor.is_pinned()`` is true for it, H2D copies take the DMA path, and under
+# UVA its device pointer equals the host pointer -- exactly what
+# ``device_view_of_pinned`` needs for the captured spill gather.
+_PINNED_EXACT_REGISTRY: dict = {}
+_CUDA_HOST_REGISTER_MAPPED = 0x02
+
+
+def pinned_exact_empty(shape, dtype):
+    """Uninitialised host tensor of ``shape``/``dtype``, page-locked at its
+    exact byte size (see the module comment). Without a CUDA context (desk
+    tests) it is a plain pageable tensor, like ``pin_memory()`` there."""
+    import torch
+
+    shape = tuple(int(d) for d in shape)
+    n = 1
+    for d in shape:
+        n *= d
+    nbytes = n * torch.empty((), dtype=dtype).element_size()
+    if nbytes == 0 or not torch.cuda.is_available():
+        return torch.empty(shape, dtype=dtype, device="cpu")
+    import mmap
+
+    mm = mmap.mmap(-1, nbytes, flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS)
+    flat = torch.frombuffer(mm, dtype=torch.uint8)
+    ptr = flat.data_ptr()
+    err = torch.cuda.cudart().cudaHostRegister(ptr, nbytes, _CUDA_HOST_REGISTER_MAPPED)
+    if int(err) != 0:
+        mm.close()
+        raise RuntimeError(
+            f"cudaHostRegister({nbytes} bytes) failed with cudaError {int(err)}"
+        )
+    _PINNED_EXACT_REGISTRY[ptr] = (mm, nbytes)
+    return flat.view(dtype).view(shape)
+
+
+def pinned_exact_release(tensor):
+    """Unregister and unmap a buffer from :func:`pinned_exact_empty` once no
+    view of it is used any more (the caller's promise). No-op for others."""
+    import torch
+
+    entry = _PINNED_EXACT_REGISTRY.pop(tensor.data_ptr(), None)
+    if entry is None:
+        return False
+    mm, _nbytes = entry
+    torch.cuda.cudart().cudaHostUnregister(tensor.data_ptr())
+    mm.close()
+    return True
+
+
+def pinned_exact_bytes():
+    """Bytes currently page-locked through :func:`pinned_exact_empty`."""
+    return sum(n for _mm, n in _PINNED_EXACT_REGISTRY.values())
+
+
 class _PinnedDeviceViewHolder:
     """Minimal ``__cuda_array_interface__`` producer used to alias PINNED host
     memory as a CUDA tensor (UVA zero-copy). Under CUDA UVA every page-locked
@@ -3097,10 +3167,10 @@ class MoEExpertOffloadCache:
             self._resident[attr] = buf
             # Pinned host spill pool = experts [R:E].
             spill_src = full[R:].contiguous()
-            if spill_src.is_cpu:
-                spill = spill_src if spill_src.is_pinned() else spill_src.pin_memory()
+            if spill_src.is_cpu and spill_src.is_pinned():
+                spill = spill_src
             else:
-                spill = torch.empty_like(spill_src, device="cpu").pin_memory()
+                spill = pinned_exact_empty(spill_src.shape, spill_src.dtype)
                 spill.copy_(spill_src)
             self._pinned[attr] = spill
             setattr(
@@ -4282,9 +4352,7 @@ class MoEExpertOffloadCache:
                 return resident_host[e] if e < R else old_spill[e - R]
 
             # New spill pool (cold experts), pinned for async H2D fetches later.
-            new_spill = torch.empty(
-                (E - R,) + tail, dtype=old_spill.dtype, device="cpu"
-            ).pin_memory()
+            new_spill = pinned_exact_empty((E - R,) + tail, old_spill.dtype)
             for j, e in enumerate(cold):
                 new_spill[j].copy_(_src(e))  # host<-host (snapshot or old_spill)
 
@@ -4621,9 +4689,7 @@ def presplit_expert_offload_after_repack(
         # Spill -> pinned host; the GPU [E] stack is then freed. The static
         # plan is two contiguous slices, exactly as before; a #394 plan gathers
         # the rows the plan names (whole experts on dim 0 either way).
-        spill = torch.empty(
-            (len(plan.spill_ids),) + tuple(t.shape[1:]), dtype=t.dtype, device="cpu"
-        ).pin_memory()
+        spill = pinned_exact_empty((len(plan.spill_ids),) + tuple(t.shape[1:]), t.dtype)
         if static:
             buf[:R].copy_(t[:R])
             spill.copy_(t[R:])
