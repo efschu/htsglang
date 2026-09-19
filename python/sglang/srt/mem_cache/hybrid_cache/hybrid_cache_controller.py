@@ -827,16 +827,20 @@ class HybridCacheController(BaseHiCacheController):
         )
         _sl_t3 = time.perf_counter()
         _n_tok = int(host_indices.numel()) if hasattr(host_indices, "numel") else -1
+        _comp = getattr(self.mem_pool_host, "_weg2_load_ms", None)
+        _comp_txt = ",".join(f"{k}={v:.0f}" for k, v in sorted((_comp or {}).items()))
+        if isinstance(_comp, dict):
+            _comp.clear()
         if _n_tok >= 8192 or (_sl_t3 - _sl_t0) > 0.05:
             logger.info(
                 "WEG2-START-LOADING tokens=%d nodes=%d total_ms=%.0f merge_move_ms=%.0f dcp_pairs_ms=%.0f "
-                "kv_issue_ms=%.0f draft_issue_ms=%.0f tail_ms=%.0f (CPU time of the scheduler thread; the "
-                "copies run on the load stream; kv_issue includes the page loadback's own sync under "
-                "SGLANG_WEG2_ARENA_PAGE_LOAD_TIMING=1)",
+                "kv_issue_ms=%.0f draft_issue_ms=%.0f tail_ms=%.0f components_ms=[%s] (CPU time of the "
+                "scheduler thread; the copies run on the load stream; kv_issue includes the page loadback's "
+                "own sync under SGLANG_WEG2_ARENA_PAGE_LOAD_TIMING=1)",
                 _n_tok, len(getattr(op, "node_ids", ()) or ()),
                 (_sl_t3 - _sl_t0) * 1000.0, (_sl_t1 - _sl_t0) * 1000.0, (_sl_t2 - _sl_t1) * 1000.0,
                 _sl_kv_ms, _sl_draft_ms,
-                (_sl_t3 - _sl_t2) * 1000.0 - _sl_kv_ms - _sl_draft_ms,
+                (_sl_t3 - _sl_t2) * 1000.0 - _sl_kv_ms - _sl_draft_ms, _comp_txt,
             )
         return producer_id
 

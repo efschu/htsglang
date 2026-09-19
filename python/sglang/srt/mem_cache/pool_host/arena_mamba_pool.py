@@ -43,7 +43,11 @@ def _arena_state_load_block_bytes() -> int:
 
 
 def _arena_state_load_on() -> bool:
-    return str(os.environ.get("SGLANG_WEG2_ARENA_STATE_LOAD", "0")).strip().lower() not in ("0", "false", "no", "off")  # xsn337/338: 571-706 ms vs 432 per-layer -- opt-in until it beats the per-layer path
+    # xsn337/338: 571-706 ms vs 432 per-layer -- opt-in back then. 19.09. xsn397 (compact
+    # stage, only this rank's extents): the wake pass 1039 ms vs 1368-1392 with the
+    # per-layer path (48 layers x synchronous pageable copies, the first one waiting
+    # out the whole page DMA), flip 3.36 s vs 3.66, needle MATCH -> DEFAULT ON.
+    return str(os.environ.get("SGLANG_WEG2_ARENA_STATE_LOAD", "1")).strip().lower() not in ("0", "false", "no", "off")
 
 
 def _contig_strides(shape):

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import time
 import threading
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Callable, Optional
@@ -2221,9 +2222,15 @@ class HostPoolGroup:
         pool_transfers: Optional[list] = None,
     ) -> None:
         # 1. Anchor (KV) transfer
+        # 19.09. (Task #3): CPU ms per component, summed over the layers of one
+        # start_loading; the controller prints and resets `_weg2_load_ms`.
+        _acc = getattr(self, "_weg2_load_ms", None)
+        if _acc is None:
+            _acc = self._weg2_load_ms = {}
         anchor = self.anchor_entry
         local_layer_id = anchor.local_layer(layer_id)
         if local_layer_id is not None and host_indices.numel() > 0:
+            _t = time.perf_counter()
             anchor.host_pool.load_to_device_per_layer(
                 anchor.device_pool,
                 host_indices,
@@ -2231,6 +2238,7 @@ class HostPoolGroup:
                 local_layer_id,
                 io_backend,
             )
+            _acc["kv"] = _acc.get("kv", 0.0) + (time.perf_counter() - _t) * 1000.0
 
         # 2. Extra pool transfers
         for transfer in pool_transfers or []:
@@ -2240,6 +2248,7 @@ class HostPoolGroup:
                 # A layer this pool does not cover. The ONLY legitimate skip
                 # here, and it is per-layer, not per-pool.
                 continue
+            _t = time.perf_counter()
             entry.host_pool.load_to_device_per_layer(
                 entry.device_pool,
                 transfer.host_indices,
@@ -2247,6 +2256,8 @@ class HostPoolGroup:
                 local_layer_id,
                 io_backend,
             )
+            _k = str(getattr(transfer, "name", None) or type(entry.host_pool).__name__)
+            _acc[_k] = _acc.get(_k, 0.0) + (time.perf_counter() - _t) * 1000.0
 
     def backup_from_device_all_layer(
         self,
