@@ -413,6 +413,14 @@ class Weg2DraftDisagree(RuntimeError):
     compensation (spec section 3.4: do NOT invent a vote)."""
 
 
+def draft_claim_packed(controller) -> bool:
+    """See ``HiCacheController.draft_claim_packed``; a module function so the
+    prefetch loop's stubs (tests) need only ``draft_tier_armed``."""
+    armed = getattr(controller, "draft_tier_armed", None)
+    return bool(armed("admission") if armed is not None else False) or bool(
+        getattr(controller, "solo_draft_shadow", False))
+
+
 def assert_draft_claims_agree(min_claim: int, max_claim: int, rid) -> None:
     """L8. ``min_claim``/``max_claim`` come from ONE MIN all_reduce over the
     packed vector ``[claim, -claim]`` (no second collective)."""
@@ -892,6 +900,10 @@ class HiCacheController:
 
         # Draft KV pool support (best-effort piggyback on target L2/L3 ops).
         self.has_draft = False
+        # 19.09. (xsn392, --speculative-draft-placement solo): a SHADOW rank has no
+        # draft pool but must reduce the prefetch claim in the HOST's packed form
+        # (see draft_claim_packed); set by kv_cache_builder.maybe_register_hicache_draft.
+        self.solo_draft_shadow = False
         self.mem_pool_device_draft = None
         self.mem_pool_host_draft = None
         self.draft_page_get_func = None
@@ -2429,6 +2441,16 @@ class HiCacheController:
         self.mem_pool_host.free(host_indices)
         return len(host_indices)
 
+    def draft_claim_packed(self) -> bool:
+        """RANK-UNIFORM form of the prefetch claim reduce: the packed
+        ``[hit, -hit]`` MIN (draft tier armed) or the bare scalar MIN.
+        xsn392 (19.09.): under --speculative-draft-placement solo the host
+        arms the draft tier and the shadows do not -- one rank reduced a
+        2-vector against two scalars, every prefetch probe timed out at its
+        budget with 0 pages on every rank. A solo shadow answers the packed
+        form (its own claim is the KV claim; the MIN adopts the host's)."""
+        return draft_claim_packed(self)
+
     def draft_tier_armed(self, direction: str) -> bool:
         """THE ONE GATE for draft-half I/O. Six consume points, one answer.
 
@@ -3619,7 +3641,7 @@ class HiCacheController:
                     operation.mark_terminate()
                     self._prefetch_drained_after_stop += 1
                 hash_value, storage_hit_count = self._storage_hit_query(operation)
-                if self.draft_tier_armed("admission"):
+                if draft_claim_packed(self):
                     # #1233 L8: ONE collective carries min and max -- MIN over
                     # [count, -count] -- so a rank whose claim differs from
                     # the group's is a named STOP, not a silent MIN (Q11).

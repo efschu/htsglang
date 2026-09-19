@@ -431,6 +431,16 @@ def maybe_register_hicache_draft(
         server_args=server_args,
     )
     if draft_kv_pool is None:
+        # 19.09. (xsn392): a solo-draft SHADOW has no draft pool by design,
+        # but the prefetch claim reduce must keep the host's packed form on
+        # every rank -- mark the controller (cache_controller.draft_claim_packed).
+        try:
+            inner = getattr(draft_worker, "draft_worker", None)
+            runner = getattr(inner, "draft_runner", None)
+            if getattr(runner, "is_draft_solo_shadow", False):
+                tree_cache.cache_controller.solo_draft_shadow = True
+        except Exception:  # noqa: BLE001 -- a marker, never a boot blocker
+            pass
         return
 
     from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
