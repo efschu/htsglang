@@ -2809,6 +2809,39 @@ def _wave_timing_note(layer_id, e0, e1, e2, n_spill, n_tokens):
         t["ev"].clear(); t["spill"] = 0; t["tokens"] = 0
 
 
+_WAVE_TP = {"ev": [], "layers": 0, "waves": 0, "spill": 0, "tokens": 0, "forwards": 0}
+
+
+def _wave_timing_note_prefill(layer_id, wave_events, n_spill, n_tokens):
+    """Expert-major prefill: collect one layer's per-wave (fetch, apply) event
+    triples; when the NEXT forward starts (layer 0 again) synchronize once, sum
+    and log the forward's split. That is the decomposition the 'Prefill rank
+    batch ... compute' figure hides: how much of a chunk's compute is the
+    expert stream (host -> scratch over PCIe) and how much the grouped GEMM."""
+    import logging
+    import torch
+
+    t = _WAVE_TP
+    if layer_id in (0, None) and t["ev"]:
+        torch.cuda.synchronize()
+        f = sum(a.elapsed_time(b) for a, b, _c in t["ev"])
+        g = sum(b.elapsed_time(c) for _a, b, c in t["ev"])
+        t["forwards"] += 1
+        logging.getLogger(__name__).info(
+            "MOE-OFFLOAD-TIMING-PREFILL forward=%d tokens=%d layers=%d waves=%d "
+            "spill_experts=%d fetch_ms=%.1f apply_ms=%.1f (CUDA events per wave: "
+            "fetch = host->scratch incl. the join, apply = grouped GEMM of the wave)",
+            t["forwards"], t["tokens"], t["layers"], t["waves"], t["spill"], f, g,
+        )
+        t["ev"].clear(); t["layers"] = t["waves"] = t["spill"] = t["tokens"] = 0
+    t["ev"].extend(wave_events)
+    t["layers"] += 1
+    t["waves"] += len(wave_events)
+    t["spill"] += int(n_spill)
+    if layer_id in (0, None):
+        t["tokens"] = int(n_tokens)
+
+
 def _fetch_mode() -> str:
     """SGLANG_MOE_OFFLOAD_FETCH: 'gather' (default, Task #33) or 'memcpy'."""
     import os
@@ -4326,6 +4359,8 @@ class MoEExpertOffloadCache:
         h2d_before = self.planner.stats.h2d_bytes
         cfg = self.layer.moe_runner_config
         saved_rsf = cfg.routed_scaling_factor
+        _tm = _wave_timing_on()
+        _tm_ev = []
         try:
             cfg.routed_scaling_factor = 1.0
             for w, needed in enumerate([resident_used] + spill_waves):
@@ -4333,7 +4368,11 @@ class MoEExpertOffloadCache:
                 if idx_np.size == 0:
                     continue
                 slot_of_needed, fetch_plan = self.planner.resolve(needed)
+                if _tm:
+                    _e0 = torch.cuda.Event(enable_timing=True); _e0.record()
                 self._fetch(fetch_plan)
+                if _tm:
+                    _e1 = torch.cuda.Event(enable_timing=True); _e1.record()
                 lut = self._build_lut(slot_of_needed, topk_ids.dtype, device)
 
                 idx = torch.from_numpy(idx_np).to(device, non_blocking=True)
@@ -4363,6 +4402,9 @@ class MoEExpertOffloadCache:
                     topk_output=sub_topk,
                 )
                 combine_out = apply_fn(sub)
+                if _tm:
+                    _e2 = torch.cuda.Event(enable_timing=True); _e2.record()
+                    _tm_ev.append((_e0, _e1, _e2))
                 part = combine_out.hidden_states
                 if partials is None:
                     partials = torch.zeros(
@@ -4377,6 +4419,11 @@ class MoEExpertOffloadCache:
         )
         combine_topk_partials(partials.view(T, K, -1), out_full, saved_rsf)
         self._log_wave_h2d("expert", len(spill_waves) + 1, h2d_before)
+        if _tm and _tm_ev:
+            _wave_timing_note_prefill(
+                getattr(self.layer, "layer_id", None), _tm_ev,
+                sum(len(g) for g in spill_waves), int(T),
+            )
         return combine_out._replace(hidden_states=out_full)
 
     # --- Stage-1 hot-set freeze (GPU window) -------------------------------
