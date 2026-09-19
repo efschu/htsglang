@@ -298,6 +298,17 @@ def _qsa_index_share_requested(hf_config) -> bool:
     )
 
 
+def target_shares_vocab_modules(target_lm_head, embed_module) -> bool:
+    """Whether the draft must share the target's vocab MODULES instead of
+    their ``.weight`` tensors: a GGUF quantized-resident lm_head (packed
+    ``qweight``), or -- fn4i 19.09., Next Flash -- an embedding kept on the
+    host (Qwen4ExpPinnedHostEmbedding under --ple-offload-embedding) that has
+    no ``.weight`` tensor to hand over either."""
+    if target_lm_head is not None and not hasattr(target_lm_head, "weight") and hasattr(target_lm_head, "qweight"):
+        return True
+    return embed_module is not None and not hasattr(embed_module, "weight")
+
+
 class EagleDraftWorker(EagleDraftWorkerBase):
     def __init__(
         self,
@@ -645,11 +656,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         # path (M21: before KV profiling; set_embed_and_head_modules calls
         # empty_cache so the profiler sees the released draft dupes).
         # Non-GGUF targets always have `.weight` and never take this branch.
-        if (
-            target_lm_head is not None
-            and not hasattr(target_lm_head, "weight")
-            and hasattr(target_lm_head, "qweight")
-        ):
+        _embed_module = getattr(getattr(target_model, "model", None), "embed_tokens", None)
+        if target_shares_vocab_modules(target_lm_head, _embed_module):
             draft_model = self.draft_runner.model
             if (
                 self.speculative_algorithm.is_eagle3()
@@ -657,8 +665,9 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 or not hasattr(draft_model, "set_embed_and_head_modules")
             ):
                 raise NotImplementedError(
-                    "GGUF quantized-resident lm_head requires a NEXTN/EAGLE "
-                    "draft supporting module-level sharing "
+                    "a target vocab module without a .weight tensor (GGUF "
+                    "quantized-resident lm_head, or a host-resident embedding) "
+                    "requires a NEXTN/EAGLE draft supporting module-level sharing "
                     "(set_embed_and_head_modules) and no hot-token vocab. "
                     "Set SGLANG_GGUF_DENSE_VOCAB=1 to restore the dense "
                     "lm_head path."
