@@ -47,6 +47,76 @@ from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.nan_guard import check as _nan_check
 from sglang.srt.layers.nan_guard import nan_guard_on as _nan_guard_on
+
+
+def _nan_discriminate(layer, mlp_in, mlp_out, forward_batch) -> None:
+    """Task #49 (19.09.): when a layer's MoE output stops being finite, say
+    WHICH of three things happened, on the spot: (1) the MoE input was already
+    non-finite (the fault is upstream: attention / residual / norm); (2) the
+    same input recomputed through the same MoE is finite again (TRANSIENT: a
+    fetch/compute race or a slot read in flight); (3) it is non-finite again
+    (PERSISTENT: corrupted device slot bytes or a deterministic kernel fault)
+    -- then the offload cache's float buffers (scales) are scanned for
+    non-finite slots. The recompute runs the same collectives on every rank,
+    and every rank sees the same post-all-reduce NaN, so the group stays in
+    lockstep. fn8g run 2 (19.09.): layer 0, TP0's partial NaN in 1648 rows,
+    finite again on layer 1 -- this instrument names why."""
+    try:
+        import logging
+
+        import torch
+
+        log = logging.getLogger(__name__)
+        lid = getattr(layer, "layer_id", "?")
+        if mlp_in is None:
+            return
+        in_bad = ~torch.isfinite(mlp_in)
+        in_rows_t = torch.nonzero(in_bad.reshape(mlp_in.shape[0], -1).any(dim=1)).reshape(-1)
+        out_bad = ~torch.isfinite(mlp_out)
+        out_rows_t = torch.nonzero(out_bad.reshape(mlp_out.shape[0], -1).any(dim=1)).reshape(-1)
+        if in_rows_t.numel():
+            log.error(
+                "[nan-guard] DISCRIMINATE layer %s: MoE INPUT already non-finite in %d rows "
+                "(first %s) -> upstream of the experts",
+                lid, int(in_rows_t.numel()), in_rows_t[:8].tolist(),
+            )
+            return
+        again = layer.mlp(mlp_in.clone(), forward_batch)
+        again_bad = ~torch.isfinite(again)
+        again_rows_t = torch.nonzero(again_bad.reshape(again.shape[0], -1).any(dim=1)).reshape(-1)
+        if again_rows_t.numel() == 0:
+            verdict = "TRANSIENT (recompute finite)"
+        elif again_rows_t.numel() == out_rows_t.numel() and bool((again_rows_t == out_rows_t).all().item()):
+            verdict = "PERSISTENT same rows"
+        else:
+            verdict = "PERSISTENT different rows"
+        log.error(
+            "[nan-guard] DISCRIMINATE layer %s: input finite, output %d bad rows (first %s); "
+            "recompute on the same input: %d bad rows (first %s) -> %s",
+            lid, int(out_rows_t.numel()), out_rows_t[:8].tolist(),
+            int(again_rows_t.numel()), again_rows_t[:8].tolist(), verdict,
+        )
+        seen = 0
+        for obj in vars(getattr(layer.mlp, "experts", layer.mlp)).values():
+            resident = getattr(obj, "_resident", None)
+            if not isinstance(resident, dict):
+                continue
+            seen += 1
+            for attr, buf in resident.items():
+                if not torch.is_tensor(buf) or not buf.is_floating_point():
+                    continue
+                flat = buf.reshape(buf.shape[0], -1)
+                bad_slots = torch.nonzero(~torch.isfinite(flat).all(dim=1)).reshape(-1)
+                log.error(
+                    "[nan-guard] DISCRIMINATE layer %s: device buffer %s (%d slots) -> %d non-finite slot(s) %s",
+                    lid, attr, int(buf.shape[0]), int(bad_slots.numel()), bad_slots[:16].tolist(),
+                )
+        if not seen:
+            log.error("[nan-guard] DISCRIMINATE layer %s: no offload cache on the MoE block", lid)
+    except Exception as exc:  # noqa: BLE001
+        import logging
+
+        logging.getLogger(__name__).error("[nan-guard] DISCRIMINATE failed: %r", exc)
 from sglang.srt.layers.utils import PPMissingLayer
 from sglang.srt.layers.quantization.compressed_tensors.ct_embedding import (
     vocab_named_in_targets,
@@ -1526,12 +1596,16 @@ class Qwen4ExpLayerExtensionMixin:
             attn_tp_chunks = list(hidden_states.tensor_split(attn_tp_size))
             hidden_states = attn_tp_chunks[get_parallel().attn_tp_rank].contiguous()
 
+        mlp_in = hidden_states if _nan_guard_on() else None
         hidden_states = self.mlp(hidden_states, forward_batch)
 
         # Task #49 (19.09.): SGLANG_NAN_GUARD=1 names the first layer whose
-        # MoE output stops being finite (the '!!!' = token-0 answers at 259k)
+        # MoE output stops being finite (the '!!!' = token-0 answers at 259k);
+        # on a hit the discriminator says input / transient / persistent.
         if _nan_guard_on():
-            _nan_check("mlp_out", hidden_states, getattr(self, "layer_id", None), forward_batch)
+            ok = _nan_check("mlp_out", hidden_states, getattr(self, "layer_id", None), forward_batch)
+            if not ok:
+                _nan_discriminate(self, mlp_in, hidden_states, forward_batch)
 
         if use_dp_moe_gather:
             hidden_states, global_hidden_states = (
