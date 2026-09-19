@@ -28,6 +28,49 @@ from sglang.srt.speculative.spec_info import SpecInput
 logger = logging.getLogger(__name__)
 
 
+
+# ---------------------------------------------------------------------------
+# SGLANG_MOE_OFFLOAD_TIMING=1 also times the attention halves of every
+# prefill forward: one (begin, end) CUDA-event pair per layer, split by kind
+# (full attention vs linear/GDN), summed and logged when the NEXT forward
+# starts (layer 0 again). Same shape and switch as MOE-OFFLOAD-TIMING-PREFILL
+# in expert_offload.py, so one boot yields the whole per-rank compute split
+# of a chunk: expert stream / MoE GEMM / full attention / linear attention.
+# fn6ae/fn6af (19.09.): the 3080s spend +1.7 s per prefix chunk that neither
+# the KV shard size nor the expert stream explains; this names the kernel
+# family.
+_ATTN_T = {"on": None, "ev": {"full": [], "linear": []}, "layers": 0, "tokens": 0, "forwards": 0}
+
+
+def _attn_timing_on() -> bool:
+    if _ATTN_T["on"] is None:
+        _ATTN_T["on"] = str(os.environ.get("SGLANG_MOE_OFFLOAD_TIMING", "0")).strip() not in ("", "0")
+    return bool(_ATTN_T["on"])
+
+
+def _attn_timing_begin(layer_id, num_tokens: int) -> None:
+    """Called at every timed layer; on layer 0 the previous forward is flushed."""
+    t = _ATTN_T
+    if layer_id in (0, None) and (t["ev"]["full"] or t["ev"]["linear"]):
+        torch.cuda.synchronize()
+        f = sum(a.elapsed_time(b) for a, b in t["ev"]["full"])
+        l = sum(a.elapsed_time(b) for a, b in t["ev"]["linear"])
+        t["forwards"] += 1
+        logging.getLogger(__name__).info(
+            "ATTN-TIMING-PREFILL forward=%d tokens=%d layers=%d full_attn_ms=%.1f (%d layers) "
+            "linear_attn_ms=%.1f (%d layers) (CUDA events around forward_extend per layer)",
+            t["forwards"], t["tokens"], t["layers"], f, len(t["ev"]["full"]), l, len(t["ev"]["linear"]),
+        )
+        t["ev"]["full"].clear(); t["ev"]["linear"].clear(); t["layers"] = 0
+    if layer_id in (0, None):
+        t["tokens"] = int(num_tokens)
+    t["layers"] += 1
+
+
+def _attn_timing_note(kind: str, e0, e1) -> None:
+    _ATTN_T["ev"][kind].append((e0, e1))
+
+
 class MambaAttnBackendBase(AttentionBackend):
     def __init__(self, model_runner: ModelRunner):
         super().__init__()
@@ -1028,11 +1071,24 @@ class HybridLinearAttnBackend(AttentionBackend):
         b: Optional[torch.Tensor] = None,  # For GDN linear attention
         **kwargs,
     ):
-        if self._is_full_attn(layer, kwargs.get("layer_id")):
-            return self.full_attn_backend.forward_extend(
+        is_full = self._is_full_attn(layer, kwargs.get("layer_id"))
+        _tm = _attn_timing_on()
+        if _tm:
+            _attn_timing_begin(
+                getattr(layer, "layer_id", kwargs.get("layer_id")),
+                int(getattr(forward_batch, "extend_num_tokens", None)
+                    or getattr(forward_batch, "seq_lens_sum", 0) or 0),
+            )
+            _e0 = torch.cuda.Event(enable_timing=True); _e0.record()
+        if is_full:
+            out = self.full_attn_backend.forward_extend(
                 q, k, v, layer, forward_batch, save_kv_cache, **kwargs
             )
-        return self.linear_attn_backend.forward_extend(
+            if _tm:
+                _e1 = torch.cuda.Event(enable_timing=True); _e1.record()
+                _attn_timing_note("full", _e0, _e1)
+            return out
+        out = self.linear_attn_backend.forward_extend(
             q=q,
             k=k,
             v=v,
@@ -1044,6 +1100,10 @@ class HybridLinearAttnBackend(AttentionBackend):
             b=b,
             **kwargs,
         )
+        if _tm:
+            _e1 = torch.cuda.Event(enable_timing=True); _e1.record()
+            _attn_timing_note("linear", _e0, _e1)
+        return out
 
     def forward(
         self,
