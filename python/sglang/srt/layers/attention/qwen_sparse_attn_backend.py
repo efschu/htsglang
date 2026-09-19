@@ -76,6 +76,16 @@ def _qsa_rows_path_armed() -> bool:
     return os.environ.get("SGLANG_QSA_ROWS_PATH", "1") != "0"
 
 
+def _speculative_rows_route(
+    dcp_size: int, rows_armed: bool, q_is_cuda: bool, fa_available: bool
+) -> bool:
+    """Whether a speculative-paged forward (target verify / draft extend)
+    takes the WP3b rows kernel: always under DCP, on every CUDA rank while the
+    rows path is armed (SGLANG_QSA_ROWS_PATH, default on -- the same rule as
+    the decode path since fn5e), and whenever no FA varlen kernel exists."""
+    return bool(dcp_size > 1 or (rows_armed and q_is_cuda) or not fa_available)
+
+
 def _resolve_flash_attn_varlen_func_or_none():
     try:
         return _resolve_flash_attn_varlen_func()
@@ -483,7 +493,13 @@ class QwenSparseAttnBackend(AttentionBackend):
             )
             return max(1, int(sequence_lengths.max()))
         spec_info = forward_batch.spec_info
-        draft_window = int(spec_info.draft_token_num) if spec_info is not None else 0
+        # Target verify exposes ``draft_token_num`` while draft-extend exposes
+        # ``num_tokens_per_req`` (upstream form; EagleDraftExtendInput has no
+        # draft_token_num). Both modes use this gather-width bound.
+        draft_window = int(
+            getattr(spec_info, "draft_token_num", getattr(spec_info, "num_tokens_per_req", 0))
+            or 0
+        )
         return max(1, int(seq_lens_cpu.max()) + draft_window)
 
     @staticmethod
@@ -1765,12 +1781,19 @@ class QwenSparseAttnBackend(AttentionBackend):
         metadata = self._resolve_metadata(forward_batch)
         topk_indices = topk_indices.to(torch.int32).contiguous()
         trtllm_decode = _resolve_trtllm_sparse_decode() if self.dcp_size <= 1 else None
-        if trtllm_decode is None and (
-            self.dcp_size > 1 or _resolve_flash_attn_varlen_func_or_none() is None
+        if trtllm_decode is None and _speculative_rows_route(
+            self.dcp_size,
+            _qsa_rows_path_armed(),
+            q.is_cuda,
+            _resolve_flash_attn_varlen_func_or_none() is not None,
         ):
             # WP3b rows path: the Triton rows kernel over the pool (owned rows
             # under DCP, merged across the group); also the only decode route
             # on a host without FA2/FA4 (this rig's serving venv has neither).
+            # fn4o 19.09.: ARMED here like the decode path (fn5e) -- the draft
+            # backend runs dcp_size 1 and the packed varlen fallback is FA4
+            # cute, whose MLIR refuses sm86 ('Operation creation failed',
+            # pack_gqa) in the target-verify / draft-extend capture.
             rows = self._topk_rows(topk_indices, metadata)
             output = self._attend_rows(q, layer, rows)
             return output.reshape(q.shape[0], -1)
