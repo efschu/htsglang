@@ -28,6 +28,9 @@ def _fake_cuda(monkeypatch, calls):
 
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(torch.cuda, "cudart", lambda: _Cudart())
+    monkeypatch.setattr(
+        torch._C, "_host_emptyCache", lambda: calls.append(("empty_cache",)), raising=False
+    )
 
 
 def test_exact_bytes_and_shape_without_cuda(monkeypatch):
@@ -45,7 +48,11 @@ def test_registers_exact_page_aligned_range(monkeypatch):
     t = eo.pinned_exact_empty((rows, cols), torch.bfloat16)
     nbytes = rows * cols * 2
     assert t.shape == (rows, cols) and t.dtype == torch.bfloat16
-    assert calls == [("register", t.data_ptr(), nbytes, eo._CUDA_HOST_REGISTER_MAPPED)]
+    # the torch host cache is released BEFORE the new pages are pinned (fn6p)
+    assert calls == [
+        ("empty_cache",),
+        ("register", t.data_ptr(), nbytes, eo._CUDA_HOST_REGISTER_MAPPED),
+    ]
     assert t.data_ptr() % mmap.PAGESIZE == 0
     # The whole point: NOT the CachingHostAllocator's power-of-two size.
     assert nbytes != 1 << math.ceil(math.log2(nbytes))

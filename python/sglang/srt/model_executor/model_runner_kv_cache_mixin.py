@@ -1074,6 +1074,7 @@ class ModelRunnerKVCacheMixin:
             from sglang.srt.layers.moe.expert_offload import (
                 expert_offload_release_totals,
                 pinned_exact_bytes,
+                torch_host_cache_reserved_bytes,
             )
 
             released = expert_offload_release_totals()
@@ -1084,13 +1085,15 @@ class ModelRunnerKVCacheMixin:
             logger.info(
                 "[offload-kv-regain] rank %d: expert offload released %.2f GiB "
                 "of weight VRAM across %d MoE layer(s) (%.2f GiB moved to the "
-                "pinned host pool, %.2f GiB page-locked exactly); that VRAM is "
-                "part of the %.2f GiB KV budget profiled here.",
+                "pinned host pool, %.2f GiB page-locked exactly, torch host "
+                "cache %.2f GiB); that VRAM is part of the %.2f GiB KV budget "
+                "profiled here.",
                 self.tp_rank,
                 released.device_bytes / (1 << 30),
                 released.layers,
                 released.host_bytes / (1 << 30),
                 pinned_exact_bytes() / (1 << 30),
+                torch_host_cache_reserved_bytes() / (1 << 30),
                 rest_memory,
             )
 

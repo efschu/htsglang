@@ -2590,6 +2590,13 @@ def pinned_exact_empty(shape, dtype):
         return torch.empty(shape, dtype=dtype, device="cpu")
     import mmap
 
+    # Give back what torch's host cache still holds from the weight load
+    # before pinning new pages: the loader's pinned staging blocks sit in the
+    # CachingHostAllocator's free lists after use, and the presplit pools used
+    # to RECYCLE them (same power-of-two sizes). Exact pools cannot, so without
+    # this the cache stays resident on top of them -- fn6p (19.09.) peaked at
+    # 100 GiB host RAM and was OOM-killed at layer 19 of the presplit.
+    release_torch_host_cache()
     mm = mmap.mmap(-1, nbytes, flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS)
     flat = torch.frombuffer(mm, dtype=torch.uint8)
     ptr = flat.data_ptr()
@@ -2615,6 +2622,37 @@ def pinned_exact_release(tensor):
     torch.cuda.cudart().cudaHostUnregister(tensor.data_ptr())
     mm.close()
     return True
+
+
+def release_torch_host_cache() -> None:
+    """Free the CachingHostAllocator's cached (unused) pinned blocks."""
+    import torch
+
+    fn = getattr(torch._C, "_host_emptyCache", None)
+    if fn is not None:
+        fn()
+
+
+def torch_host_cache_reserved_bytes() -> int:
+    """Bytes torch's CachingHostAllocator currently holds (-1 = unknown).
+
+    torch 2.11 exposes the raw stats as nested dicts (``allocated_bytes``
+    counts live blocks plus the ones whose deferred free has not been processed
+    yet; ``reserved_bytes`` is present on builds that track it)."""
+    import torch
+
+    fn = getattr(torch._C, "_cuda_hostMemoryStats", None)
+    if fn is None:
+        return -1
+    try:
+        stats = fn()
+    except Exception:  # pragma: no cover - no CUDA context
+        return -1
+    for key in ("reserved_bytes", "allocated_bytes"):
+        entry = stats.get(key) if hasattr(stats, "get") else None
+        if isinstance(entry, dict) and "current" in entry:
+            return int(entry["current"])
+    return -1
 
 
 def pinned_exact_bytes():
