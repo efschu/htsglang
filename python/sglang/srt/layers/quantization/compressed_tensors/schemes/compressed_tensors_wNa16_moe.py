@@ -136,8 +136,8 @@ class CompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
         # -> byte-identical stock path.
         _moe_dev = (
             "cpu"
-            if _moe_offload_active()
-            and not getattr(layer, "_moe_offload_excluded", False)
+            if not getattr(layer, "_moe_offload_excluded", False)
+            and _moe_offload_active()
             else None
         )
 
