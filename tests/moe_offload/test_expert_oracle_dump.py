@@ -21,20 +21,26 @@ def test_records_small_forwards_and_flushes_files(tmp_path):
     assert od.record_draft("out", torch.randn(3, 16))
     od.flush()
     files = sorted(p.name for p in tmp_path.iterdir())
-    assert files == ["draft_00000.pt", "target_00000.pt"]
-    tgt = torch.load(tmp_path / "target_00000.pt")
+    assert files == ["tp0_draft_00000.pt", "tp0_target_00000.pt"]
+    tgt = torch.load(tmp_path / "tp0_target_00000.pt")
     assert [r["layer"] for r in tgt] == [7, 8]
     assert tgt[0]["hidden"].dtype == torch.bfloat16 and tgt[0]["ids"].dtype == torch.int16
     assert tgt[0]["ids"].tolist() == ids.tolist()
-    drf = torch.load(tmp_path / "draft_00000.pt")
+    drf = torch.load(tmp_path / "tp0_draft_00000.pt")
     assert [r["kind"] for r in drf] == ["in", "out"]
     assert drf[0]["t"] <= drf[1]["t"]
     od._reset_for_tests(None)
 
 
-def test_other_ranks_and_unset_env_record_nothing(tmp_path):
+def test_other_ranks_and_unset_env_record_nothing(tmp_path, monkeypatch):
+    monkeypatch.setenv("SGLANG_EXPERT_ORACLE_DUMP_RANKS", "0")
     od._reset_for_tests(str(tmp_path), rank=1)
     assert not od.record_target("p", 0, torch.randn(1, 4), torch.zeros(1, 2))
+    monkeypatch.setenv("SGLANG_EXPERT_ORACLE_DUMP_RANKS", "all")
+    od._reset_for_tests(str(tmp_path), rank=2)
+    assert od.record_target("p", 0, torch.randn(1, 4), torch.zeros(1, 2))
+    od.flush()
+    assert (tmp_path / "tp2_target_00000.pt").exists()
     od._reset_for_tests(None)
     assert not od.record_draft("in", torch.randn(1, 4))
 

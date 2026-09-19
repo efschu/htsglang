@@ -412,6 +412,23 @@ def _breakable_offload_mode() -> bool:
     return _BREAKABLE_MODE
 
 
+_POOL_PREFETCH_TOPK = {"m": None}
+
+
+def pool_prefetch_topk(k: int) -> int:
+    """How many of the next router's top-k predictions the pool prefetch
+    fetches per token: min(k, SGLANG_MOE_POOL_PREFETCH_TOPK), default k."""
+    if _POOL_PREFETCH_TOPK["m"] is None:
+        import os
+
+        try:
+            _POOL_PREFETCH_TOPK["m"] = int(os.environ.get("SGLANG_MOE_POOL_PREFETCH_TOPK", "0") or 0)
+        except ValueError:
+            _POOL_PREFETCH_TOPK["m"] = 0
+    m = _POOL_PREFETCH_TOPK["m"]
+    return int(k) if m <= 0 else max(1, min(int(k), m))
+
+
 class Qwen2MoeSparseMoeBlock(nn.Module):
     def __init__(
         self,
@@ -603,6 +620,11 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         k = int(cfg.top_k) - int(cfg.num_fused_shared_experts or 0)
         if k <= 0:
             return
+        # Task #45 (fn7m dump, 19.09.): fetching all k predictions costs 1.49x
+        # the bytes at 50 % precision on the fetched rows; the m most probable
+        # per token (SGLANG_MOE_POOL_PREFETCH_TOPK, default k) reach 72 % at
+        # m=3 / 65 % at m=5 for 1.06x / 1.13x bytes -- above the 59 % break-even.
+        k = pool_prefetch_topk(k)
         pred_logits, _ = nxt.gate(hidden_states)
         # top-k of the logits == top-k of softmax(logits): softmax is strictly
         # monotone, so the RenormalizeNaive path selects exactly these ids. We

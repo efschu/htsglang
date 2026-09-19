@@ -53,11 +53,23 @@ def _rank() -> int:
         return 0
 
 
+def _rank_tag() -> str:
+    return f"tp{_STATE.get('rank', 0)}"
+
+
 def active(force_rank: Optional[int] = None) -> bool:
+    """SGLANG_EXPERT_ORACLE_DUMP_RANKS: '0' (default) = TP rank 0 only, 'all'
+    = every rank writes its own files (tp<r>_target_*.pt) -- the routing is
+    global, but the ids in the dump are the rank's LOCAL experts, so each
+    rank's pool question (Task #45, 19.09.: 'gilt das auch fuer TP1/TP2?')
+    needs that rank's own dump."""
     if oracle_dir() is None:
         return False
     if _STATE["rank_ok"] is None:
-        _STATE["rank_ok"] = (_rank() if force_rank is None else force_rank) == 0
+        r = _rank() if force_rank is None else force_rank
+        _STATE["rank"] = r
+        want = os.environ.get("SGLANG_EXPERT_ORACLE_DUMP_RANKS", "0").strip().lower()
+        _STATE["rank_ok"] = want == "all" or str(r) in {x.strip() for x in want.split(",")}
     return bool(_STATE["rank_ok"])
 
 
@@ -109,7 +121,7 @@ def _flush_target():
         return
     d = oracle_dir()
     n = _COUNTS["target_files"]
-    torch.save(_TARGET[:], os.path.join(d, f"target_{n:05d}.pt"))
+    torch.save(_TARGET[:], os.path.join(d, f"{_rank_tag()}_target_{n:05d}.pt"))
     _COUNTS["target_files"] = n + 1
     _TARGET.clear()
 
@@ -119,7 +131,7 @@ def _flush_draft():
         return
     d = oracle_dir()
     n = _COUNTS["draft_files"]
-    torch.save(_DRAFT[:], os.path.join(d, f"draft_{n:05d}.pt"))
+    torch.save(_DRAFT[:], os.path.join(d, f"{_rank_tag()}_draft_{n:05d}.pt"))
     _COUNTS["draft_files"] = n + 1
     _DRAFT.clear()
 
@@ -137,7 +149,9 @@ def flush():
 
 def _reset_for_tests(dir_: Optional[str], rank: int = 0):
     flush() if _STATE["dir"] else None
-    _STATE.update({"dir": dir_, "checked": True, "rank_ok": rank == 0})
+    _STATE.update({"dir": dir_, "checked": True, "rank_ok": None, "rank": rank})
+    os.environ.setdefault("SGLANG_EXPERT_ORACLE_DUMP_RANKS", "0")
+    _STATE["rank_ok"] = active(force_rank=rank) if dir_ else False
     _TARGET.clear(); _DRAFT.clear()
     for k in _COUNTS:
         _COUNTS[k] = 0
