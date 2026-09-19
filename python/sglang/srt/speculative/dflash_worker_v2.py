@@ -362,7 +362,16 @@ class DFlashWorkerV2(BaseSpecWorker):
             if self._spec_solo_active
             else 0
         )
-        if self._spec_solo_active and self.use_compact_draft_cache:
+        # 19.09. (Punkt 5, D-Kapazitaet): SGLANG_DFLASH_SOLO_COMPACT=1 lets the
+        # solo host keep the compact draft cache (the shadows run no draft,
+        # write no draft KV and skip the round prep, so they never touch the
+        # compact req->token table); measured on xsn384 ff. before it becomes
+        # the default. Without the env the v2 refusal below stands.
+        if (self._spec_solo_active and self.use_compact_draft_cache
+                and os.environ.get("SGLANG_DFLASH_SOLO_COMPACT", "0") == "1"):
+            logger.info("DFLASH solo x compact draft cache ALLOWED by SGLANG_DFLASH_SOLO_COMPACT=1 "
+                        "(host=%s window=%s)", self._spec_solo_is_host, self.draft_window_size)
+        elif self._spec_solo_active and self.use_compact_draft_cache:
             raise ValueError(
                 "--speculative-draft-placement solo does not support the "
                 "DFLASH compact draft cache (--speculative-draft-window-size): "
