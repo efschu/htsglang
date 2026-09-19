@@ -2482,9 +2482,14 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
                     if name.endswith(ignore_suffixes) and name not in params_dict:
                         continue
                     if name.endswith("_scale") and name not in params_dict:
-                        assert abs(loaded_weight.item() - 1.0) < 1e-6, (
-                            f"Expected 1.0, got {loaded_weight.item()} in skipped {name}"
-                        )
+                        # fn7r (19.09., PP=3): a stage that does not own the
+                        # module sees its GROUP scales too (lm_head.weight_scale,
+                        # 4.97 M elements on PP1) -- only a scalar scale is the
+                        # "must be 1.0" case; a foreign module's scale is skipped.
+                        if loaded_weight.numel() == 1:
+                            assert abs(loaded_weight.item() - 1.0) < 1e-6, (
+                                f"Expected 1.0, got {loaded_weight.item()} in skipped {name}"
+                            )
                         continue
                     if name in params_dict:
                         param = params_dict[name]
