@@ -2596,6 +2596,13 @@ def pinned_exact_empty(shape, dtype):
     # to RECYCLE them (same power-of-two sizes). Exact pools cannot, so without
     # this the cache stays resident on top of them -- fn6p (19.09.) peaked at
     # 100 GiB host RAM and was OOM-killed at layer 19 of the presplit.
+    # empty_cache only frees blocks whose recorded events have completed, and
+    # nothing but an allocate() call polls those events any more once the
+    # pools stop going through the cache -- so complete them here first.
+    try:
+        torch.cuda.synchronize()
+    except Exception:  # pragma: no cover - no CUDA context
+        pass
     release_torch_host_cache()
     mm = mmap.mmap(-1, nbytes, flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS)
     flat = torch.frombuffer(mm, dtype=torch.uint8)
@@ -2607,7 +2614,48 @@ def pinned_exact_empty(shape, dtype):
             f"cudaHostRegister({nbytes} bytes) failed with cudaError {int(err)}"
         )
     _PINNED_EXACT_REGISTRY[ptr] = (mm, nbytes)
+    _log_pinned_exact_milestone(nbytes)
     return flat.view(dtype).view(shape)
+
+
+_PINNED_EXACT_MILESTONE_GIB = 4
+_pinned_exact_next_milestone = [_PINNED_EXACT_MILESTONE_GIB << 30]
+
+
+def _cgroup_anon_shmem_gib():
+    """(anon, shmem) GiB charged to this process's cgroup (-1, -1 = unknown)."""
+    try:
+        with open("/proc/self/cgroup") as f:
+            path = f.read().strip().split(":", 2)[-1]
+        vals = {}
+        with open(f"/sys/fs/cgroup{path}/memory.stat") as f:
+            for line in f:
+                k, v = line.split()
+                if k in ("anon", "shmem"):
+                    vals[k] = int(v) / (1 << 30)
+        return vals.get("anon", -1.0), vals.get("shmem", -1.0)
+    except Exception:
+        return -1.0, -1.0
+
+
+def _log_pinned_exact_milestone(nbytes: int) -> None:
+    """One line per 4 GiB of exact pools: where the host RAM really sits
+    (fn6p/fn6q 19.09.: TP0 was OOM-killed mid-presplit with nothing in the
+    log saying which allocator held the bytes)."""
+    total = pinned_exact_bytes()
+    if total < _pinned_exact_next_milestone[0]:
+        return
+    while total >= _pinned_exact_next_milestone[0]:
+        _pinned_exact_next_milestone[0] += _PINNED_EXACT_MILESTONE_GIB << 30
+    import logging
+
+    anon, shmem = _cgroup_anon_shmem_gib()
+    logging.getLogger(__name__).info(
+        "[pinned-exact] %.1f GiB page-locked exactly (last +%.0f MiB); torch host "
+        "allocator %.1f GiB; cgroup anon %.1f GiB shmem %.1f GiB",
+        total / (1 << 30), nbytes / (1 << 20),
+        torch_host_cache_reserved_bytes() / (1 << 30), anon, shmem,
+    )
 
 
 def pinned_exact_release(tensor):
