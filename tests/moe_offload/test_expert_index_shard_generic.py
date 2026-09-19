@@ -212,3 +212,17 @@ def test_excluded_draft_layer_never_resolves_the_fraction_vector():
 
     with pytest.raises(ValueError):
         _expert_offload_fraction_for_layer(False, boom)
+
+
+def test_scratch_slots_env_scalar_and_vector():
+    from sglang.srt.layers.moe.expert_offload import scratch_slots_from_env
+
+    assert scratch_slots_from_env("", (0, 3)) is None
+    assert scratch_slots_from_env("48", (2, 3)) == 48
+    assert scratch_slots_from_env("64,48,48", (0, 3)) == 64
+    assert scratch_slots_from_env("64,48,48", (1, 3)) == 48
+    assert scratch_slots_from_env("abc", (0, 3)) is None
+    import pytest
+
+    with pytest.raises(ValueError):
+        scratch_slots_from_env("64,48", (0, 3))

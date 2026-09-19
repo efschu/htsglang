@@ -675,12 +675,50 @@ def scratch_slot_count(resident_count: int) -> int:
     import os
 
     env = os.environ.get("SGLANG_MOE_SCRATCH_SLOTS", "")
-    if env.strip():
-        try:
-            return max(1, int(env))
-        except ValueError:
-            pass
+    picked = scratch_slots_from_env(env, _scratch_env_rank_and_size())
+    if picked is not None:
+        return picked
     return max(8, resident_count // 4)
+
+
+def _scratch_env_rank_and_size():
+    try:
+        from sglang.srt.runtime_context import get_parallel
+
+        parallel = get_parallel()
+        return int(parallel.moe_tp_rank), int(parallel.moe_tp_size)
+    except Exception:
+        return None
+
+
+def scratch_slots_from_env(env: str, rank_and_size) -> Optional[int]:
+    """SGLANG_MOE_SCRATCH_SLOTS as one value for every rank, or a per-rank
+    comma vector (fn5t/fn5u 19.09.: the LRU rows = C - staging are the recency
+    lever of the pool, and only the 5090's link is the round's critical path,
+    so the ranks need different C). A vector must have exactly tp_size
+    entries; anything unparsable falls back to the default."""
+    text = (env or "").strip()
+    if not text:
+        return None
+    if "," in text:
+        try:
+            values = [max(1, int(v)) for v in text.split(",")]
+        except ValueError:
+            return None
+        if rank_and_size is None:
+            return None
+        rank, size = rank_and_size
+        if len(values) != size:
+            raise ValueError(
+                f"SGLANG_MOE_SCRATCH_SLOTS vector has {len(values)} entries "
+                f"({text}) but the MoE tensor parallelism is {size}; give one "
+                "entry per rank or a single value."
+            )
+        return values[rank]
+    try:
+        return max(1, int(text))
+    except ValueError:
+        return None
 
 
 # ===========================================================================
