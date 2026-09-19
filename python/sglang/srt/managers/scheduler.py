@@ -14831,6 +14831,7 @@ class Scheduler(
         new_batch.is_seam_transport = transport_only
 
         self.max_prefill_bs = max(self.max_prefill_bs, len(can_run_list))
+        _wk_t2b = time.perf_counter()  # ScheduleBatch.init_new done (Task #3 split)
         if self.enable_hierarchical_cache:
             # todo (zhiqiang): disable cuda graph execution if hicache loading triggered
             new_batch.hicache_consumer_index = (
@@ -14838,6 +14839,7 @@ class Scheduler(
             )
 
         _wk_t3 = time.perf_counter()  # init_new done
+        self._weg2_ready_ms = (_wk_t3 - _wk_t2b) * 1000.0
         new_batch.prepare_for_extend()
         _wk_t4 = time.perf_counter()
         if getattr(self, "_weg2_post_wake_pass_n", None) is not None:
@@ -18147,14 +18149,14 @@ class Scheduler(
             _lb_ms, _lb_n = -1.0, -1
         logger.info(
             "WEG2-POST-WAKE-PASS n=%d mode=%s bs=%d gap_ms=%.0f schedule_ms=%.0f run_ms=%.0f "
-            "prefetch_ms=%.0f proc_input_ms=%.0f admission_ms=%.0f init_new_ms=%.0f prepare_ms=%.0f "
+            "prefetch_ms=%.0f proc_input_ms=%.0f admission_ms=%.0f init_new_ms=%.0f prepare_ms=%.0f ready_ms=%.0f "
             "addreq=[%s] init_load_back_ms=%.0f/%d init_next_round=[%s] "
             "(gap = wall since the previous pass; schedule = get_next_batch_to_run incl. the three "
             "prefill terms; run is the launch, the forward itself overlaps)",
             n, mode, bs, ((now - prev) * 1000.0) if prev is not None else -1.0,
             _pt_read(self, "_1466_schedule_ms"), _pt_read(self, "_1466_run_ms"),
             _pt_read(self, "_1474_prefetch_ms"), _pt_read(self, "_1475_process_input_ms"),
-            _g[0], _g[1], _g[2], _addreq, _lb_ms, _lb_n, _initr,
+            _g[0], _g[1], _g[2], float(getattr(self, '_weg2_ready_ms', -1.0) or -1.0), _addreq, _lb_ms, _lb_n, _initr,
         )
 
     def _weg2_intake_stall_observe(self, req, adder, note: str = "",

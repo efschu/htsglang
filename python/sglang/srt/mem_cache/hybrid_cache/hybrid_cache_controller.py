@@ -752,18 +752,23 @@ class HybridCacheController(BaseHiCacheController):
         # a producer is allocated.
         if not consume_gate(self, "load_queue", "load"):
             return -1
+        _sl_t0 = time.perf_counter()  # 19.09. Task #3: the wake's start_loading, sectioned
         producer_id = self.layer_done_counter.update_producer()
         op = CacheOperation.merge_ops(self.load_queue)
         host_indices, device_indices, resolved_pool_transfers = (
             self.move_hybrid_indices(op)
         )
         self.load_queue.clear()
+        _sl_t1 = time.perf_counter()
         # Weighted uneven-DCP: load only this rank's owned tokens into their
         # COMPACT device slots (identity when the gate is off). pool_transfers
         # and the draft pool keep the raw pair list (see start_writing).
         kv_host_indices, kv_device_indices = self._dcp_kv_transfer_pairs(
             host_indices, device_indices
         )
+        _sl_t2 = time.perf_counter()
+        _sl_kv_ms = 0.0
+        _sl_draft_ms = 0.0
         producer_event = self.layer_done_counter.events[producer_id]
         producer_event.start_event.record()
         # xsn281: the draft rows are translated ONCE per load (the mapper
@@ -774,6 +779,7 @@ class HybridCacheController(BaseHiCacheController):
         with device_module.stream(self.load_stream):
             producer_event.start_event.wait(self.load_stream)
             for i in range(self.mem_pool_host.transfer_layer_domain):
+                _sl_a = time.perf_counter()
                 self.mem_pool_host.load_to_device_per_layer(
                     self.mem_pool_device,
                     kv_host_indices,
@@ -782,6 +788,7 @@ class HybridCacheController(BaseHiCacheController):
                     self.io_backend,
                     pool_transfers=resolved_pool_transfers,
                 )
+                _sl_kv_ms += (time.perf_counter() - _sl_a) * 1000.0
                 if (
                     self.draft_tier_armed("load")
                     and host_indices.numel() > 0
@@ -792,6 +799,7 @@ class HybridCacheController(BaseHiCacheController):
                             self.mem_pool_device_draft, device_indices, "load",
                             nrows=int(host_indices.numel()), host_indices=host_indices)
                     if draft_rows is not None:
+                        _sl_c = time.perf_counter()
                         self.mem_pool_host_draft.load_to_device_per_layer(
                             self.mem_pool_device_draft,
                             draft_host_rows if draft_host_rows is not None else host_indices,
@@ -799,6 +807,7 @@ class HybridCacheController(BaseHiCacheController):
                             i,
                             self.io_backend,
                         )
+                        _sl_draft_ms += (time.perf_counter() - _sl_c) * 1000.0
                 producer_event.complete(i)
             self._record_transfer_indices_on_stream(
                 self.load_stream,
@@ -816,6 +825,19 @@ class HybridCacheController(BaseHiCacheController):
                 op.node_ids,
             )
         )
+        _sl_t3 = time.perf_counter()
+        _n_tok = int(host_indices.numel()) if hasattr(host_indices, "numel") else -1
+        if _n_tok >= 8192 or (_sl_t3 - _sl_t0) > 0.05:
+            logger.info(
+                "WEG2-START-LOADING tokens=%d nodes=%d total_ms=%.0f merge_move_ms=%.0f dcp_pairs_ms=%.0f "
+                "kv_issue_ms=%.0f draft_issue_ms=%.0f tail_ms=%.0f (CPU time of the scheduler thread; the "
+                "copies run on the load stream; kv_issue includes the page loadback's own sync under "
+                "SGLANG_WEG2_ARENA_PAGE_LOAD_TIMING=1)",
+                _n_tok, len(getattr(op, "node_ids", ()) or ()),
+                (_sl_t3 - _sl_t0) * 1000.0, (_sl_t1 - _sl_t0) * 1000.0, (_sl_t2 - _sl_t1) * 1000.0,
+                _sl_kv_ms, _sl_draft_ms,
+                (_sl_t3 - _sl_t2) * 1000.0 - _sl_kv_ms - _sl_draft_ms,
+            )
         return producer_id
 
     def _record_transfer_indices_on_stream(
