@@ -702,8 +702,10 @@ class FusedMoE(torch.nn.Module):
         from sglang.srt.layers.moe.offload_capture_gate import (
             MODE_BREAKABLE,
             MODE_CAPTURABLE,
+            MODE_POOL,
             resolve_offload_graph_mode,
             validate_breakable_boot,
+            validate_pool_boot,
         )
 
         self._moe_offload_mode = resolve_offload_graph_mode(
@@ -713,6 +715,9 @@ class FusedMoE(torch.nn.Module):
         )
         self._moe_offload_graph_mode = self._moe_offload_mode == MODE_CAPTURABLE
         self._moe_offload_breakable = self._moe_offload_mode == MODE_BREAKABLE
+        self._moe_offload_pool = self._moe_offload_mode == MODE_POOL
+        if self._moe_offload_pool:
+            validate_pool_boot(self._expert_offload_fraction, self.layer_id)
         # Per-layer bridge-buffer registry for the breakable route; built on the
         # first captured forward, never on the default path.
         self._moe_offload_arena = None
@@ -2398,6 +2403,24 @@ class FusedMoE(torch.nn.Module):
             return self._run_moe_core_offload_capturable(
                 dispatch_output, topk_output, topk_ids, _apply
             )
+
+        # 19.09. device-planned pool (vLLM #56177 port): under the full decode
+        # graph the step plans, copies the misses and remaps on the device;
+        # an eager forward (prefill, uncaptured shapes) keeps run_waves and
+        # republishes its scratch occupancy to the device tables afterwards.
+        if getattr(self, "_moe_offload_pool", False):
+            cache = self._expert_offload
+            if get_is_capture_mode():
+                self._drop_lookahead()
+                remapped = cache.prepare_pool(topk_ids)
+                sub = dispatch_output._replace(
+                    topk_output=topk_output._replace(topk_ids=remapped)
+                )
+                return _apply(sub)
+            cache.begin_eager_pool()
+            out = cache.run_waves(dispatch_output, _apply, lookahead=None)
+            cache.sync_pool_from_host()
+            return out
 
         # run_waves handles both the single-wave decode fast path (one apply over
         # the full batch) and the multi-wave prefill-overflow path (disjoint

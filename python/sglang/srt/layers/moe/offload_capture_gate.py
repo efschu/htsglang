@@ -155,7 +155,8 @@ ENV_GRAPH_MODE = "SGLANG_MOE_OFFLOAD_GRAPH_MODE"
 MODE_EAGER = "eager"
 MODE_CAPTURABLE = "capturable"
 MODE_BREAKABLE = "breakable"
-MODES = (MODE_EAGER, MODE_CAPTURABLE, MODE_BREAKABLE)
+MODE_POOL = "pool"  # 19.09.: device-planned expert pool (vLLM #56177 port)
+MODES = (MODE_EAGER, MODE_CAPTURABLE, MODE_BREAKABLE, MODE_POOL)
 
 _FALSE = ("0", "false", "no", "off", "")
 
@@ -270,6 +271,8 @@ def resolve_offload_graph_mode(
     offloading = float(offload_fraction) < 1.0
     mode = env_graph_mode()
 
+    if mode == MODE_POOL:
+        return MODE_POOL if offloading else MODE_EAGER
     if mode == MODE_BREAKABLE:
         if not offloading:
             # Nothing to offload -> nothing for a slot arena to hold. Let
@@ -306,6 +309,44 @@ def resolve_graph_mode(
         resolve_offload_graph_mode(offload_fraction, opt_in, layer_id)
         == MODE_CAPTURABLE
     )
+
+
+def validate_pool_boot(offload_fraction: float, layer_id: Any = None) -> None:
+    """Gate for the device-planned pool (19.09.): something to offload, the
+    refuted capturable opt-in not set, the decode graph captured by the FULL
+    backend (the pool's step and copies are plain device ops that the graph
+    records; no breaks are needed and none may split it), prefill eager."""
+    if not float(offload_fraction) < 1.0:
+        raise BreakableModeRefused(
+            reason=(
+                f"the MoE expert offload is not active on layer {layer_id} "
+                f"(resident fraction {float(offload_fraction):.3f} >= 1.0)"
+            ),
+            remedy=f"Set --rank-moe-resident-fraction below 1.0, or unset {ENV_GRAPH_MODE}.",
+        )
+    if _env_flag("SGLANG_MOE_OFFLOAD_CUDA_GRAPH", False):
+        raise BreakableModeRefused(
+            reason="SGLANG_MOE_OFFLOAD_CUDA_GRAPH=1 (the refuted capturable fetch) is set alongside the pool mode",
+            remedy="Unset SGLANG_MOE_OFFLOAD_CUDA_GRAPH.",
+        )
+    backend = resolved_backend("decode")
+    if backend is NO_SERVER_ARGS:
+        return
+    if backend != "full":
+        raise BreakableModeRefused(
+            reason=(
+                f"the resolved decode CUDA-graph backend is {backend!r}, not 'full'. "
+                f"The pool's step and row copies are device ops the full graph "
+                f"records whole; a breakable graph would split them for nothing"
+            ),
+            remedy="Launch with --cuda-graph-backend-decode=full.",
+        )
+    prefill = resolved_backend("prefill")
+    if prefill is not None and prefill != "disabled":
+        raise BreakableModeRefused(
+            reason=f"the resolved prefill CUDA-graph backend is {prefill!r}, not 'disabled' (prefill runs eager run_waves under the pool mode)",
+            remedy="Launch with --cuda-graph-backend-prefill=disabled.",
+        )
 
 
 def validate_breakable_boot(offload_fraction: float, layer_id: Any = None) -> None:
@@ -571,6 +612,8 @@ __all__ = [
     "MODES",
     "MODE_BREAKABLE",
     "MODE_CAPTURABLE",
+    "MODE_POOL",
+    "validate_pool_boot",
     "MODE_EAGER",
     "NO_SERVER_ARGS",
     "REFUTATION",

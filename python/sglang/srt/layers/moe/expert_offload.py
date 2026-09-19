@@ -2767,6 +2767,14 @@ class MoEExpertOffloadCache:
         # written by every fetch on every route so a sticky resolve can trust
         # it; cleared whenever the buffers are physically rearranged.
         self._scratch_holds: Dict[int, int] = {}
+        # Device-planned expert pool (vLLM #56177 port, 19.09.): tables, step
+        # buffers and the UVA views of the spill pool; built by install_pool().
+        self._pool_ready = False
+        self._pool_tables = None
+        self._pool_buffers = None
+        self._pool_srcs = None
+        self._pool_dsts = None
+        self._pool_view_holders = []
         from sglang.srt.environ import envs as _envs
 
         self.lookahead_sticky = int(_envs.SGLANG_MOE_EXPERT_LOOKAHEAD.get()) > 0
@@ -3396,6 +3404,112 @@ class MoEExpertOffloadCache:
             path,
         )
 
+    # ---- device-planned expert pool (vLLM PR #56177 port, 19.09.) -------------
+    def install_pool(self):  # pragma: no cover - requires CUDA
+        """Build the per-layer pool tables over the EXISTING [R+C] arena: rows
+        [0, R) are the fixed residents (never victims, no host copy needed),
+        [R, R+C-S) the device-LRU region, the last S rows staging. The host
+        source is the pinned spill pool through its UVA device view, addressed
+        by the static ``host_row`` table. Idempotent."""
+        import logging
+        import os
+
+        from sglang.srt.layers.moe.expert_pool_device import (
+            PLAN_WIDTH,
+            allocate_pool_tables,
+            allocate_step_buffers,
+        )
+
+        if self._pool_ready:
+            return
+        if not self._installed:
+            raise RuntimeError("install_pool() requires install() first")
+        if self._hot_enabled and not self._hot_frozen:
+            raise RuntimeError(
+                "pool mode: live hot-set calibration (SGLANG_MOE_HOT_RESIDENCY=1) "
+                "would rearrange the bank after the decode graphs captured it; "
+                "freeze from SGLANG_MOE_HOTSET_FILE or set HOT_RESIDENCY=0"
+            )
+        if self._cold_tier is not None:
+            raise RuntimeError("pool mode has no shared cold tier (#394) path")
+        R, C, E = self.resident_count, self.scratch, self.num_local_experts
+        rows = self.planner.buffer_size
+        if rows != R + C:
+            raise RuntimeError(
+                f"pool mode requires buffer_size == R+C ({rows} != {R}+{C})"
+            )
+        staging = int(os.environ.get("SGLANG_MOE_POOL_STAGING", "12") or 12)
+        staging = max(1, min(staging, C - 1, PLAN_WIDTH))
+        attrs = [a for a in self._pinned if a in self._resident]
+        device = self._resident[attrs[0]].device
+        pool_index = self._spill_pool_index
+        resident_ids = self.planner.resident_ids
+        host_row = []
+        for e in range(E):
+            resident = (e < R) if resident_ids is None else (e in resident_ids)
+            if resident:
+                host_row.append(-1)
+            else:
+                host_row.append(int(pool_index[e]) if pool_index is not None else e - R)
+        hot_slot_of = (
+            dict(self.planner.resident_slot)
+            if self.planner.resident_slot is not None
+            else {e: e for e in range(R)}
+        )
+        self._pool_tables = allocate_pool_tables(
+            device, E, rows, R, staging, hot_slot_of, host_row
+        )
+        self._pool_buffers = allocate_step_buffers(device, E, PLAN_WIDTH)
+        self._pool_srcs = [device_view_of_pinned(self._pinned[a]) for a in attrs]
+        self._pool_dsts = [self._resident[a] for a in attrs]
+        self._pool_view_holders = [self._pinned[a] for a in attrs]
+        self._pool_ready = True
+        logging.getLogger(__name__).info(
+            "MoE expert pool on layer %s: residents %d, LRU rows %d, staging %d, "
+            "spill rows %d, tensors %d",
+            getattr(self.layer, "layer_id", None), R, C - staging, staging,
+            sum(1 for h in host_row if h >= 0), len(attrs),
+        )
+
+    def prepare_pool(self, topk_ids):
+        """The captured decode step: plan on the device, copy only the misses
+        (device count), return the physical rows the apply reads. Pure device
+        ops with fixed addresses -- captured once, replayed every step."""
+        import torch
+
+        from sglang.srt.layers.moe.expert_pool_device import copy_rows, step
+
+        if not self._pool_ready:
+            self.install_pool()
+        bs, k = topk_ids.shape
+        flat = topk_ids.reshape(-1)
+        if flat.dtype != torch.int32:
+            flat = flat.to(torch.int32)
+        step(self._pool_tables, flat, self._pool_buffers)
+        copy_rows(
+            self._pool_srcs,
+            self._pool_dsts,
+            self._pool_buffers.gather_src,
+            self._pool_buffers.gather_dst,
+            self._pool_buffers.gather_count,
+        )
+        routes = self._pool_buffers.routes[: bs * k].view(bs, k)
+        return routes if routes.dtype == topk_ids.dtype else routes.to(topk_ids.dtype)
+
+    def begin_eager_pool(self):
+        """Before an eager (prefill / uncaptured) forward under the pool mode:
+        run_waves will rewrite scratch rows; record exactly those."""
+        self._scratch_holds.clear()
+
+    def sync_pool_from_host(self):
+        """After that eager forward: the device tables take the host's truth
+        for the LRU rows run_waves wrote; the rest of the LRU region is free."""
+        if not self._pool_ready:
+            return
+        from sglang.srt.layers.moe.expert_pool_device import sync_tables
+
+        sync_tables(self._pool_tables, dict(self._scratch_holds))
+
     def prepare_breakable(self, topk_ids, bridge, stage=None):
         """#462 breakable route: the EAGER pre-replay phase, in one call.
 
@@ -3945,6 +4059,13 @@ class MoEExpertOffloadCache:
             raise RuntimeError(
                 "hot-set freeze after install_capturable_buffers(); the freeze "
                 "must happen before the capturable buffers are built"
+            )
+        if self._pool_ready:
+            raise RuntimeError(
+                "hot-set freeze after install_pool(); the pool's tables and the "
+                "captured graphs address the frozen layout -- freeze from a "
+                "SGLANG_MOE_HOTSET_FILE at install, or run with "
+                "SGLANG_MOE_HOT_RESIDENCY=0 under the pool mode"
             )
         hot_set = set(hot)
         cold = [e for e in range(E) if e not in hot_set]  # ascending
