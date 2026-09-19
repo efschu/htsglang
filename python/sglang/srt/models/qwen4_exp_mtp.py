@@ -25,6 +25,50 @@ from sglang.srt.utils import add_prefix, is_npu
 logger = logging.getLogger(__name__)
 
 
+def _trace_mtp_input(model, forward_batch, input_ids, input_embeds, hidden, fused=False):
+    """SGLANG_SPEC_TRACE=N (fn4w 19.09.): the draft proposes like a context-free
+    bigram model, so log what it is FED -- per-row norms of the target hidden
+    (per hc slot), the embeddings and the fused input -- for the first N
+    draft forwards. Zero / constant / NaN rows name the broken handoff."""
+    import os
+
+    try:
+        n = int(os.environ.get("SGLANG_SPEC_TRACE", "0") or 0)
+    except ValueError:
+        n = 0
+    if n <= 0 or hidden is None:
+        return
+    if hidden.is_cuda and torch.cuda.is_current_stream_capturing():
+        return  # no host syncs inside a graph capture; eager forwards only
+    done = getattr(model, "_trace_mtp_done", 0)
+    if done >= 2 * n:
+        return
+    model._trace_mtp_done = done + 1
+    try:
+        h = hidden.float()
+        rows = min(int(h.shape[0]), 4)
+        hc = int(getattr(model, "hc_count", 1) or 1)
+        msg = [
+            f"MTP-INPUT mode={forward_batch.forward_mode.name} fused={fused} "
+            f"shape={tuple(hidden.shape)} dtype={hidden.dtype} "
+            f"absmean={h.abs().mean().item():.4g} zero_frac={(h == 0).float().mean().item():.3f} "
+            f"nan={int(torch.isnan(h).sum().item())}"
+        ]
+        if not fused and h.shape[-1] % hc == 0 and hc > 1:
+            per = h[:rows].view(rows, hc, -1).norm(dim=-1)
+            msg.append(f"row_hc_norms={[[round(x, 2) for x in r] for r in per.tolist()]}")
+        else:
+            msg.append(f"row_norms={[round(x, 2) for x in h[:rows].norm(dim=-1).tolist()]}")
+        if input_ids is not None:
+            msg.append(f"input_ids={input_ids[:8].tolist()}")
+        if input_embeds is not None:
+            e = input_embeds.float()
+            msg.append(f"embed_absmean={e.abs().mean().item():.4g} embed_row_norms={[round(x, 2) for x in e[:rows].norm(dim=-1).tolist()]}")
+        logger.info(" ".join(msg))
+    except Exception as e:  # noqa: BLE001
+        logger.warning("MTP-INPUT trace skipped: %s", e)
+
+
 class Qwen4ExpForCausalLMMTP(Qwen3_5ForCausalLMMTP):
     def __init__(
         self,
@@ -210,8 +254,10 @@ class Qwen4ExpForCausalLMMTP(Qwen3_5ForCausalLMMTP):
                 input_ids, forward_batch, input_embeds
             )
             hidden_states = forward_batch.spec_info.hidden_states
+            _trace_mtp_input(self, forward_batch, input_ids, input_embeds, hidden_states)
             if not forward_batch.forward_mode.is_idle():
                 hidden_states = self._mtp_input_fusion(input_embeds, hidden_states)
+                _trace_mtp_input(self, forward_batch, None, None, hidden_states, fused=True)
 
             with get_global_expert_distribution_recorder().disable_this_region():
                 model_output = self.model(
