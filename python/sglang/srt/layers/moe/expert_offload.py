@@ -4151,6 +4151,22 @@ class MoEExpertOffloadCache:
 
         self._observe_routing(ids_list)
 
+        # Task #45 (19.09.): expert-oracle dump, eager decode only, rank 0
+        try:
+            from sglang.srt.layers.moe.expert_oracle_dump import active as _oracle_on
+
+            if _oracle_on():
+                from sglang.srt.layers.moe.expert_oracle_dump import record_target
+
+                record_target(
+                    str(getattr(self.layer, "_sglang_prefix", "") or ""),
+                    getattr(self.layer, "layer_id", None),
+                    getattr(dispatch_output, "hidden_states", None),
+                    topk_ids,
+                )
+        except Exception as exc:  # noqa: BLE001 -- a dump never kills a forward
+            logger.debug("[expert-oracle] target record skipped: %s", exc)
+
         if self._wave_order == "expert":
             # #254: split over SPILL EXPERTS instead of tokens. The single-wave
             # case is bit-for-bit the token-major fast path below.

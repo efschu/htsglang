@@ -25,6 +25,17 @@ from sglang.srt.utils import add_prefix, is_npu
 logger = logging.getLogger(__name__)
 
 
+def _oracle_draft_recorder():
+    """Task #45: the draft-side half of the expert-oracle dump (rank 0, eager,
+    small forwards). None when SGLANG_EXPERT_ORACLE_DUMP is unset."""
+    try:
+        from sglang.srt.layers.moe.expert_oracle_dump import active, record_draft
+
+        return record_draft if active() else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def _trace_mtp_input(model, forward_batch, input_ids, input_embeds, hidden, fused=False):
     """SGLANG_SPEC_TRACE=N (fn4w 19.09.): the draft proposes like a context-free
     bigram model, so log what it is FED -- per-row norms of the target hidden
@@ -255,9 +266,14 @@ class Qwen4ExpForCausalLMMTP(Qwen3_5ForCausalLMMTP):
             )
             hidden_states = forward_batch.spec_info.hidden_states
             _trace_mtp_input(self, forward_batch, input_ids, input_embeds, hidden_states)
+            _oracle = _oracle_draft_recorder()
+            if _oracle is not None and not forward_batch.forward_mode.is_idle():
+                _oracle("in", hidden_states)
             if not forward_batch.forward_mode.is_idle():
                 hidden_states = self._mtp_input_fusion(input_embeds, hidden_states)
                 _trace_mtp_input(self, forward_batch, None, None, hidden_states, fused=True)
+                if _oracle is not None:
+                    _oracle("fused", hidden_states)
 
             with get_global_expert_distribution_recorder().disable_this_region():
                 model_output = self.model(
@@ -272,6 +288,8 @@ class Qwen4ExpForCausalLMMTP(Qwen3_5ForCausalLMMTP):
                 hidden_states, hc_hidden_states = model_output
             else:
                 hidden_states = model_output
+            if _oracle is not None:
+                _oracle("out", hidden_states)
 
         logits_output = self.logits_processor(
             input_ids, hidden_states, self.lm_head, forward_batch
