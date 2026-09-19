@@ -3414,6 +3414,61 @@ class MoEExpertOffloadCache:
             v = views[attr] = device_view_of_pinned(spill)
         return v
 
+    def _nan_guard_wave(self, combine_out, wave, needed, start) -> None:
+        """Task #49: with SGLANG_NAN_GUARD=1 name the wave (its expert set and
+        slice start) whose grouped GEMM produced non-finite rows."""
+        try:
+            from sglang.srt.layers.nan_guard import nan_guard_on
+            if not nan_guard_on():
+                return
+            import torch
+            hs = getattr(combine_out, "hidden_states", combine_out)
+            if hs is None or not torch.is_tensor(hs):
+                return
+            finite = torch.isfinite(hs)
+            if bool(finite.all().item()):
+                return
+            rows = torch.nonzero(~finite.reshape(hs.shape[0], -1).all(dim=1)).reshape(-1)
+            import logging
+            logging.getLogger(__name__).error(
+                "[nan-guard] wave %d slice@%d on layer %s: %d non-finite rows of %d; wave experts (local ids) %s",
+                int(wave), int(start), getattr(self.layer, "layer_id", "?"), int(rows.numel()), int(hs.shape[0]),
+                sorted(int(e) for e in needed)[:24],
+            )
+        except Exception as exc:  # noqa: BLE001
+            import logging
+            logging.getLogger(__name__).debug("[nan-guard] wave check skipped: %s", exc)
+
+    def _nan_guard_fetched(self, fetch_plan) -> None:
+        """Task #49 (19.09.): with SGLANG_NAN_GUARD=1, after the join, every
+        FLOAT resident tensor (the scales) of the slots this fetch filled is
+        checked; a non-finite scale row means the bytes that landed in the
+        slot are not the expert's (race, stale row, wrong offset)."""
+        try:
+            from sglang.srt.layers.nan_guard import nan_guard_on
+            if not nan_guard_on():
+                return
+            import torch
+            slots = [int(sl) for _e, sl in fetch_plan]
+            for attr, dst in self._resident.items():
+                if not dst.is_floating_point():
+                    continue
+                sub = dst[slots].float()
+                if bool(torch.isfinite(sub).all().item()):
+                    continue
+                bad = ~torch.isfinite(sub).reshape(len(slots), -1).any(dim=1)
+                bad_idx = torch.nonzero(bad).reshape(-1).tolist()
+                pairs = [fetch_plan[i] for i in bad_idx[:6]]
+                import logging
+                logging.getLogger(__name__).error(
+                    "[nan-guard] fetched slot(s) with non-finite %s on layer %s: %d of %d slots, "
+                    "(expert, slot) %s",
+                    attr, getattr(self.layer, "layer_id", "?"), len(bad_idx), len(slots), pairs,
+                )
+        except Exception as exc:  # noqa: BLE001
+            import logging
+            logging.getLogger(__name__).debug("[nan-guard] fetched check skipped: %s", exc)
+
     def _fetch(self, fetch_plan, join: bool = True):
         """Async H2D-copy each wave's SPILL experts into their scratch slots,
         then join the copy stream before compute reads them. ``fetch_plan`` is
@@ -3515,6 +3570,9 @@ class MoEExpertOffloadCache:
                 _copies()
             if join:
                 torch.cuda.current_stream().wait_stream(self._stream)
+        _g = getattr(self, "_nan_guard_fetched", None)  # desk stubs carry no guard
+        if _g is not None and join and fetch_plan:
+            _g(fetch_plan)
         self.planner.stats.h2d_bytes += moved
         self.planner.stats.remote_h2d_bytes += remote_moved
 
@@ -4473,6 +4531,9 @@ class MoEExpertOffloadCache:
                         topk_output=sub_topk,
                     )
                     combine_out = apply_fn(sub)
+                    _gw = getattr(self, "_nan_guard_wave", None)
+                    if _gw is not None:
+                        _gw(combine_out, w, needed, start)
                     part = combine_out.hidden_states
                     if stream_partials:
                         if out_acc is None:
