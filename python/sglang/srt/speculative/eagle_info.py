@@ -377,6 +377,12 @@ class EagleDraftExtendInput(SpecInput):
     # default 0: our draft-extend packs [draft-window rows] only). Read by the
     # QSA MTP index share to find the last accepted row (fn4n 19.09.).
     num_front_tokens: int = 0
+    # Flat per-req index of each request's last accepted window row
+    # (i * window + front + num_correct_drafts[i]) -- upstream field. None
+    # here: our worker gathers hidden states by its own select_index after
+    # the forward, and Qwen4ExpForCausalLMMTP._set_hc_logits_hidden_states
+    # only prunes when it is set (fn4p 19.09.: AttributeError without it).
+    select_index: Optional[torch.Tensor] = None
 
     # Per-req batch-state slices for the draft-extend forward:
     #   - input_ids:        accept tokens flat over surviving reqs
