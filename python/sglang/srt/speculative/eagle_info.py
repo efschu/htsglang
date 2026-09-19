@@ -373,6 +373,10 @@ class EagleDraftExtendInput(SpecInput):
     num_accept_tokens: torch.Tensor = None
     # CPU view, read by attention backends during the extend forward.
     num_accept_tokens_cpu: List[int] = None
+    # Rows packed in FRONT of each request's draft window (upstream field,
+    # default 0: our draft-extend packs [draft-window rows] only). Read by the
+    # QSA MTP index share to find the last accepted row (fn4n 19.09.).
+    num_front_tokens: int = 0
 
     # Per-req batch-state slices for the draft-extend forward:
     #   - input_ids:        accept tokens flat over surviving reqs
