@@ -7461,6 +7461,21 @@ class SchedulerWeightUpdaterManager:
                 logger.info(
                     "WEG2-DORMANT cleared: kv_cache resumed, admission seams admit"
                 )
+                # 19.09. (xsn380): the admission-wedge clocks are ABSOLUTE per
+                # rank and kept running through this rank's sleep -- the last
+                # first token was 26 s before the wake, a 100k arrival needed
+                # 3 s of store prefetch, and the 20-s alarm fired 3 s after the
+                # wake ("28 s since first-token progress"), the recovery turned
+                # the arrival into an intake stall and the front flipped away
+                # with the batch still queued. A request queued during the
+                # flip is not older than the wake: restart both clocks here.
+                try:
+                    scheduler.note_first_token_progress()
+                    scheduler.note_prefill_progress()
+                    logger.info("WEG2-WAKE wedge clocks restarted (first-token, prefill): "
+                                "queue age counts from this wake")
+                except Exception as _clk_exc:  # noqa: BLE001 -- stubs without the clocks
+                    logger.info("WEG2-WAKE wedge clocks not restarted: %r", _clk_exc)
                 scheduler._weg2_post_wake_pass_n = 0  # arm the post-wake pass timer
                 scheduler._weg2_post_wake_t = None
                 # weg2xsn288: a new phase -- no intake-stall hold and no
