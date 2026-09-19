@@ -2500,6 +2500,21 @@ class _PinnedDeviceViewHolder:
         }
 
 
+def _h2d_i64(arr, device):
+    """A small int64 vector on ``device`` WITHOUT a host-blocking copy: staged
+    through a pinned tensor from torch's caching host allocator (event-tracked
+    reuse) and copied non_blocking. On a non-CUDA device: the plain tensor."""
+    import numpy as np
+    import torch
+    n = int(len(arr))
+    if getattr(device, "type", str(device)) != "cuda" and str(device) != "cuda":
+        return torch.from_numpy(np.ascontiguousarray(arr, dtype=np.int64))
+    host = torch.empty((n,), dtype=torch.int64, pin_memory=True)
+    if n:
+        host.numpy()[:] = arr
+    return host.to(device, non_blocking=True)
+
+
 def _fetch_mode() -> str:
     """SGLANG_MOE_OFFLOAD_FETCH: 'gather' (default, Task #33) or 'memcpy'."""
     import os
@@ -3063,8 +3078,9 @@ class MoEExpertOffloadCache:
             slots = [int(sl) for _e, sl in fetch_plan]
             first = next(iter(self._resident.values()))
             dev = first.device
-            rows_t = torch.tensor(rows, dtype=torch.int64, device=dev)
-            slots_t = torch.tensor(slots, dtype=torch.int64, device=dev)
+            import numpy as np
+            rows_t = _h2d_i64(np.asarray(rows, dtype=np.int64), dev)
+            slots_t = _h2d_i64(np.asarray(slots, dtype=np.int64), dev)
             for attr in self._pinned:
                 spill = self._pinned.get(attr)
                 dst = self._resident[attr]
@@ -3144,15 +3160,14 @@ class MoEExpertOffloadCache:
         n = len(slot_of_needed)
         if n == 0:
             return lut
-        idx = torch.from_numpy(np.fromiter(slot_of_needed.keys(), np.int64, n))
-        val = torch.from_numpy(np.fromiter(slot_of_needed.values(), np.int64, n)).to(
-            dtype
-        )
-        lut.index_copy_(
-            0,
-            idx.to(device, non_blocking=True),
-            val.to(device, non_blocking=True),
-        )
+        # 19.09. (Task #33, fn3g profile): pageable -> device copies are host-
+        # blocking (`non_blocking` is honoured only for pinned memory), so the
+        # two vectors go through PINNED host tensors from the caching host
+        # allocator (its reuse is event-tracked, so a buffer freed here is not
+        # handed out again before the copy has read it). CPU desk path unchanged.
+        idx = _h2d_i64(np.fromiter(slot_of_needed.keys(), np.int64, n), device)
+        val = _h2d_i64(np.fromiter(slot_of_needed.values(), np.int64, n), device).to(dtype)
+        lut.index_copy_(0, idx, val)
         return lut
 
     @staticmethod
