@@ -76,6 +76,58 @@ def _qsa_rows_path_armed() -> bool:
     return os.environ.get("SGLANG_QSA_ROWS_PATH", "1") != "0"
 
 
+_QSA_DENSE_CHECK_LOGS = [0]
+
+
+def _qsa_dense_check_mode() -> str:
+    """fn5i 2026-09-19: SGLANG_QSA_DENSE_CHECK=1 compares every single-request,
+    prefix-free extend (target prefill AND the draft's extend after prefill)
+    against a dense causal reference over the same q/k/v and logs the
+    deviation; =subst additionally returns the reference (the draft extend
+    then runs on exact attention, so SPEC-TF tells whether the rest of the
+    draft forward is sound)."""
+    import os
+
+    value = os.environ.get("SGLANG_QSA_DENSE_CHECK", "").strip().lower()
+    if value in ("", "0", "off", "false"):
+        return ""
+    return "subst" if value == "subst" else "check"
+
+
+def _qsa_dense_reference(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, scaling: float
+) -> torch.Tensor:
+    """Dense causal GQA attention in fp32 over one prefix-free sequence.
+
+    ``q`` [n, hq, d], ``k``/``v`` [n, hkv, d]; kv head j serves q heads
+    ``j*g .. (j+1)*g-1`` with ``g = hq // hkv`` (the sparse kernels' grouping).
+    Returns [n, hq*d] in q's dtype."""
+    n, hq, d = q.shape
+    hkv = k.shape[1]
+    if hq % hkv:
+        raise ValueError(f"q heads {hq} not a multiple of kv heads {hkv}")
+    g = hq // hkv
+    qf = q.float().transpose(0, 1)
+    kf = k[:n].float().transpose(0, 1).repeat_interleave(g, 0)
+    vf = v[:n].float().transpose(0, 1).repeat_interleave(g, 0)
+    scores = torch.matmul(qf, kf.transpose(1, 2)) * float(scaling)
+    causal = torch.ones(n, n, dtype=torch.bool, device=q.device).tril()
+    scores = scores.masked_fill(~causal, float("-inf"))
+    probs = torch.softmax(scores, dim=-1)
+    out = torch.matmul(probs, vf)
+    return out.transpose(0, 1).reshape(n, hq * d).to(q.dtype)
+
+
+def _qsa_dense_check_eligible(forward_batch, rows: int, k: torch.Tensor) -> bool:
+    seq_lens = getattr(forward_batch, "seq_lens_cpu", None)
+    ext_lens = getattr(forward_batch, "extend_seq_lens_cpu", None)
+    if seq_lens is None or ext_lens is None or len(seq_lens) != 1 or len(ext_lens) != 1:
+        return False
+    if int(seq_lens[0]) != int(ext_lens[0]) or int(ext_lens[0]) != rows:
+        return False
+    return k.dim() == 3 and k.shape[0] >= rows and 1 < rows <= 2048
+
+
 def _speculative_rows_route(
     dcp_size: int, rows_armed: bool, q_is_cuda: bool, fa_available: bool
 ) -> bool:
@@ -1495,6 +1547,77 @@ class QwenSparseAttnBackend(AttentionBackend):
         return torch.where(valid, slots, torch.full_like(slots, -1)).to(torch.int32)
 
     def forward_extend(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer,
+        forward_batch,
+        save_kv_cache: bool = True,
+        topk_indices: Optional[torch.Tensor] = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        mode = _qsa_dense_check_mode()
+        if not mode or topk_indices is None:
+            return self._forward_extend_impl(
+                q, k, v, layer, forward_batch, save_kv_cache, topk_indices, **kwargs
+            )
+        rows = int(topk_indices.shape[0])
+        q3 = q.reshape(-1, layer.tp_q_head_num, layer.head_dim)
+        eligible = _qsa_dense_check_eligible(forward_batch, rows, k) and q3.shape[0] >= rows
+        ref = (
+            _qsa_dense_reference(q3[:rows], k, v, layer.scaling) if eligible else None
+        )
+        output = self._forward_extend_impl(
+            q, k, v, layer, forward_batch, save_kv_cache, topk_indices, **kwargs
+        )
+        if ref is None:
+            return output
+        self._qsa_dense_check_log(mode, layer, forward_batch, output, ref, rows)
+        if mode == "subst" and output.shape[0] >= rows:
+            output = output.clone()
+            output[:rows] = ref.reshape(rows, -1).to(output.dtype)
+        return output
+
+    def _qsa_dense_check_log(self, mode, layer, forward_batch, output, ref, rows):
+        if _QSA_DENSE_CHECK_LOGS[0] >= 240:
+            return
+        _QSA_DENSE_CHECK_LOGS[0] += 1
+        try:
+            a = output[:rows].float().reshape(rows, -1)
+            b = ref.float().reshape(rows, -1)
+            diff = (a - b).abs()
+            cos = F.cosine_similarity(a, b, dim=-1)
+            pool = self.token_to_kv_pool
+            loc = getattr(forward_batch, "out_cache_loc", None)
+            loc_min = int(loc.min()) if loc is not None and loc.numel() else -1
+            loc_max = int(loc.max()) if loc is not None and loc.numel() else -1
+            logger.warning(
+                "QSA-DENSE-CHECK mode=%s draft=%s layer=%d fmode=%s rows=%d hq=%d hkv=%d "
+                "max_abs=%.4g mean_abs=%.4g ref_mean_abs=%.4g cos_mean=%.4f cos_min=%.4f "
+                "cos_first8=%s pool_size=%s loc_min=%d loc_max=%d dcp=%d",
+                mode,
+                self.is_draft_worker,
+                int(layer.layer_id),
+                getattr(forward_batch.forward_mode, "name", str(forward_batch.forward_mode)),
+                rows,
+                int(layer.tp_q_head_num),
+                int(layer.tp_k_head_num),
+                float(diff.max()),
+                float(diff.mean()),
+                float(b.abs().mean()),
+                float(cos.mean()),
+                float(cos.min()),
+                [round(float(x), 3) for x in cos[:8].tolist()],
+                getattr(pool, "size", None),
+                loc_min,
+                loc_max,
+                int(self.dcp_size),
+            )
+        except Exception as exc:  # diagnostics never kill the forward
+            logger.warning("QSA-DENSE-CHECK skipped: %r", exc)
+
+    def _forward_extend_impl(
         self,
         q: torch.Tensor,
         k: torch.Tensor,
