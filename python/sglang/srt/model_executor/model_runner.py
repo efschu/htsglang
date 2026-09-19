@@ -4713,6 +4713,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if self.enable_elastic_ep:
             self.maybe_recover_ep_ranks()
 
+        # 19.09.: [vram-peak] once per kind -- the measured transient
+        try:
+            from sglang.srt.model_executor.vram_family_census import maybe_log_vram_peak
+
+            maybe_log_vram_peak(self, forward_batch)
+        except Exception as exc:  # noqa: BLE001 -- an instrument never kills a forward
+            logger.debug("[vram-peak] skipped: %s", exc)
+
         return output
 
     def _maybe_execute_deferred_mamba_cow_and_clear(
