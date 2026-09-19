@@ -3376,6 +3376,15 @@ class MoEExpertOffloadCache:
             return  # static [0,R) residency (F3)
         if self._hot_frozen:
             return
+        if not hotset_covers_layer(self.layer):
+            logging.getLogger(__name__).info(
+                "SGLANG_MOE_HOTSET_FILE not applied to draft layer %r "
+                "(layer_id %s): the file is keyed by the TARGET's layer ids; "
+                "static [0,R) residency here",
+                getattr(self.layer, "_sglang_prefix", ""),
+                getattr(self.layer, "layer_id", None),
+            )
+            return
         path = hotset_path_for_rank(path, getattr(self.layer, "moe_tp_rank", 0))
         data = _load_hotset_file(path)
         layer_id = getattr(self.layer, "layer_id", None)
@@ -4266,6 +4275,17 @@ class MoEExpertOffloadCache:
 # Per-process cache for SGLANG_MOE_HOTSET_FILE: every MoE layer freezes from
 # the same small JSON, so parse it once.
 _HOTSET_FILE_CACHE: Dict[str, dict] = {}
+
+
+def hotset_covers_layer(layer) -> bool:
+    """Whether SGLANG_MOE_HOTSET_FILE describes THIS layer. The file is keyed
+    by the target model's layer ids; an MTP/NEXTN draft layer (checkpoint
+    prefix ``mtp.…``) has layer_id 0 too and, once its experts are split
+    like the target's, the SAME local expert count -- the target's layer-0
+    hot set would silently be frozen onto it (fn4j 19.09.). Draft layers keep
+    the static plan."""
+    prefix = str(getattr(layer, "_sglang_prefix", "") or "")
+    return not (prefix.startswith("mtp") or ".mtp." in prefix)
 
 
 def hotset_path_for_rank(path: str, tp_rank: int) -> str:

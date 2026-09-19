@@ -337,6 +337,20 @@ def _warn_host_shard_unreachable_once() -> None:
     )
 
 
+def expert_shard_generic_eligible(quant_config, plan_active, moe_ep_size, opt_in):
+    """WP3a expert-index shard eligibility: any non-GGUF weight format under
+    an active uneven plan, pure TP, opted in. UNQUANTIZED (quant_config None)
+    is eligible too -- fn4j 19.09.: the Qwen3.8-Flash-Next MTP draft ships its
+    512 experts in bf16, and excluding None left every rank REPLICATING all
+    of them (3.9 GB per rank, no room for the KV pool) while the target's
+    experts were split 312/104/96."""
+    if not (bool(plan_active) and int(moe_ep_size) == 1 and bool(opt_in)):
+        return False
+    if quant_config is not None and quant_config.get_name() == "gguf":
+        return False  # GGUF has its own (always-on) expert shard
+    return True
+
+
 class FusedMoE(torch.nn.Module):
     """FusedMoE layer for MoE models.
 
@@ -454,12 +468,11 @@ class FusedMoE(torch.nn.Module):
         # it; GGUF keeps its trailing pad (index n_local).
         from sglang.srt.environ import envs as _envs
 
-        self._expert_shard_generic = bool(
-            quant_config is not None
-            and quant_config.get_name() != "gguf"
-            and _plan_active
-            and self.moe_ep_size == 1
-            and _envs.SGLANG_UNEVEN_MOE_EXPERT_SHARD.get()
+        self._expert_shard_generic = expert_shard_generic_eligible(
+            quant_config,
+            _plan_active,
+            self.moe_ep_size,
+            _envs.SGLANG_UNEVEN_MOE_EXPERT_SHARD.get(),
         )
         self._gguf_expert_shard = (
             quant_config is not None
@@ -593,6 +606,10 @@ class FusedMoE(torch.nn.Module):
         )
 
         self.quant_method: Optional[FusedMoEMethodBase] = None
+        # The checkpoint prefix of this layer ("mtp.layers.0.mlp.experts" on
+        # an MTP draft): the residency machinery tells a draft layer from the
+        # target's by it (expert_offload.hotset_covers_layer).
+        self._sglang_prefix = prefix
         server_args = get_server_args()
         kt_config = create_kt_config_from_server_args(server_args, layer_id)
         if kt_config is not None:

@@ -120,3 +120,16 @@ def test_hotset_path_template_names_the_ranks_own_file():
 
     assert hotset_path_for_rank("/x/hot_tp{rank}.json", 2) == "/x/hot_tp2.json"
     assert hotset_path_for_rank("/x/hot.json", 2) == "/x/hot.json"
+
+
+def test_hotset_file_never_covers_a_draft_layer():
+    # fn4j 19.09.: the draft's layer 0 shares key "0" and (after the expert
+    # split) the local expert count with the target's layer 0.
+    from types import SimpleNamespace
+
+    from sglang.srt.layers.moe.expert_offload import hotset_covers_layer
+
+    assert hotset_covers_layer(SimpleNamespace(_sglang_prefix="model.layers.0.mlp.experts"))
+    assert hotset_covers_layer(SimpleNamespace())
+    assert not hotset_covers_layer(SimpleNamespace(_sglang_prefix="mtp.layers.0.mlp.experts"))
+    assert not hotset_covers_layer(SimpleNamespace(_sglang_prefix="model.mtp.layers.0.mlp"))

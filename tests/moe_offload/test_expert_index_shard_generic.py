@@ -161,3 +161,26 @@ def test_source_start_is_zero_along_the_intermediate_under_the_expert_shard():
         _gguf_expert_shard=False, moe_tp_size=2, moe_tp_family="moe", moe_tp_units=1, use_presharded_weights=False
     )
     assert FusedMoE._moe_src_start(even, 80, 40, 1) == 40
+
+
+class _Q:
+    def __init__(self, name):
+        self._n = name
+
+    def get_name(self):
+        return self._n
+
+
+def test_unquantized_experts_are_eligible_for_the_generic_shard():
+    # fn4j 19.09.: the MTP draft's bf16 experts (quant_config None) must be
+    # split like the target's, not replicated on every rank.
+    from sglang.srt.layers.moe.fused_moe_triton.layer import (
+        expert_shard_generic_eligible,
+    )
+
+    assert expert_shard_generic_eligible(None, True, 1, True)
+    assert expert_shard_generic_eligible(_Q("compressed-tensors"), True, 1, True)
+    assert not expert_shard_generic_eligible(_Q("gguf"), True, 1, True)
+    assert not expert_shard_generic_eligible(None, False, 1, True)
+    assert not expert_shard_generic_eligible(None, True, 2, True)
+    assert not expert_shard_generic_eligible(None, True, 1, False)
