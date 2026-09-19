@@ -4953,18 +4953,23 @@ def _expert_store_rows_for(layer, plan):
 
     if not _es.store_enabled():
         return None
-    if not getattr(layer, "_expert_shard_generic", False):
-        return None
-    rng = getattr(layer, "_gguf_expert_range", None)
-    if rng is None:
-        return None
-    lo, _hi = rng
     num_global = int(getattr(layer, "num_experts", 0) or 0)
     if num_global <= 0:
         raise RuntimeError(
             "the shared expert store needs the layer's GLOBAL expert count "
             "(layer.num_experts) and found none"
         )
+    num_local = int(getattr(layer, "num_local_experts", 0) or 0)
+    if getattr(layer, "_expert_shard_generic", False):
+        rng = getattr(layer, "_gguf_expert_range", None)
+        if rng is None:
+            return None
+        lo, _hi = rng
+        pad = True  # local 0 is the zero pad expert
+    elif num_local == num_global:
+        lo, pad = 0, False  # unsharded (a PP stage): local id == global id
+    else:
+        return None  # an EP-style slice; no global row map defined here
     from sglang.srt.layers.moe.cold_tier_fetch import layer_key_for
 
     return (
@@ -4972,7 +4977,8 @@ def _expert_store_rows_for(layer, plan):
         layer_key_for(layer),
         int(lo),
         num_global,
-        _es.global_rows(plan.spill_ids, int(lo)),
+        _es.global_rows(plan.spill_ids, int(lo), pad),
+        pad,
     )
 
 
@@ -5058,11 +5064,11 @@ def presplit_expert_offload_after_repack(
             # included, so a reader from another rank group finds them.
             from sglang.srt.layers.moe import expert_store as _es
 
-            s_dir, s_key, s_lo, s_num, _s_index = store_rows
+            s_dir, s_key, s_lo, s_num, _s_index, s_pad = store_rows
             spill, _created = _es.open_store(
                 s_dir, s_key, attr, s_num, tuple(t.shape[1:]), t.dtype
             )
-            written = _es.write_rows(spill, t, range(1, int(E)), s_lo)
+            written = _es.write_rows(spill, t, range(0, int(E)), s_lo, s_pad)
             _es.mark_rows_written(
                 s_dir, s_key, attr, int(getattr(layer, "moe_tp_rank", 0) or 0),
                 written.values(),

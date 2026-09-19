@@ -74,22 +74,29 @@ def open_store(
     )
 
 
-def global_rows(local_ids: Iterable[int], lo: int) -> Dict[int, int]:
-    """Local id -> store row for a generic expert-dim shard: local 0 is the
-    zero pad expert (no row), local i >= 1 is global ``lo + i - 1``."""
+def global_rows(local_ids: Iterable[int], lo: int, pad: bool = True) -> Dict[int, int]:
+    """Local id -> store row. ``pad=True`` is the generic expert-dim shard:
+    local 0 is the zero pad expert (no row), local i >= 1 is global
+    ``lo + i - 1``. ``pad=False`` is an unsharded layer (a PP stage holding
+    every expert): local i is global ``lo + i``."""
     out: Dict[int, int] = {}
     for e in local_ids:
         e = int(e)
-        if e >= 1:
-            out[e] = int(lo) + e - 1
+        if pad:
+            if e >= 1:
+                out[e] = int(lo) + e - 1
+        else:
+            out[e] = int(lo) + e
     return out
 
 
-def write_rows(store: torch.Tensor, src: torch.Tensor, local_ids: Sequence[int], lo: int) -> Dict[int, int]:
-    """Copy ``src[local]`` into ``store[lo + local - 1]`` for every local id
-    >= 1 (``src`` is expert-major over the rank's LOCAL ids, on any device).
-    Returns the local -> row map that was written."""
-    rows = global_rows(local_ids, lo)
+def write_rows(
+    store: torch.Tensor, src: torch.Tensor, local_ids: Sequence[int], lo: int, pad: bool = True
+) -> Dict[int, int]:
+    """Copy ``src[local]`` into its store row (see :func:`global_rows`) for
+    every local id (``src`` is expert-major over the rank's LOCAL ids, on any
+    device). Returns the local -> row map that was written."""
+    rows = global_rows(local_ids, lo, pad)
     if not rows:
         return rows
     locals_ = list(rows.keys())

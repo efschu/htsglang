@@ -38,3 +38,7 @@ def test_store_is_off_without_the_env(monkeypatch):
     assert not es.store_enabled()
     monkeypatch.setenv(es.STORE_DIR_ENV, "/dev/shm/x")
     assert es.store_enabled() and es.store_dir() == "/dev/shm/x"
+
+
+def test_unsharded_layer_maps_local_to_global_identity():
+    assert es.global_rows([0, 1, 2], lo=0, pad=False) == {0: 0, 1: 1, 2: 2}
