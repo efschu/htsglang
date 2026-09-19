@@ -536,13 +536,15 @@ def _step_kernel():
                         staged += 1
             tl.debug_barrier()
         tl.store(promoted_count_ptr, promoted)
-        tl.store(staged_count_ptr, staged)
-        tl.store(gather_count_ptr, promoted + staged)
         if PREFETCH:
-            # The speculative pass has no compute to route and no miss to
-            # report: it leaves step_map/routes/misses_total to the real step.
+            # The speculative pass never stages and has no compute to route:
+            # it leaves step_map/routes/misses_total to the real step.
+            tl.store(staged_count_ptr, 0)
+            tl.store(gather_count_ptr, promoted)
             tl.store(pf_counts_ptr + 1, tl.load(pf_counts_ptr + 1) + promoted.to(tl.int64))
         else:
+            tl.store(staged_count_ptr, staged)
+            tl.store(gather_count_ptr, promoted + staged)
             tl.store(misses_total_ptr, tl.load(misses_total_ptr) + (promoted + staged).to(tl.int64))
             tl.debug_barrier()
             for i in range(0, staged):
