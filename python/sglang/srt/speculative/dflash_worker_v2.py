@@ -1510,7 +1510,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                     [round(float(x), 3) for x in draft_hidden[0].float().sum(-1).tolist()],
                     anchor_token_ids.flatten()[:4].tolist(), candidate_ids[0, :3, :4].tolist(),
                     float(scores.float().sum().item()),
-                    float(sel.predecessor_codebook.float().sum().item()), float(sel.successor_codebook.float().sum().item()),
+                    float(sel.predecessor_codebook.weight.float().sum().item()), float(sel.successor_codebook.weight.float().sum().item()),
                     float(sel.hidden_projection.weight.float().sum().item()),
                     (int(lm_head.shard_indices.org_vocab_start_index), int(lm_head.shard_indices.num_org_elements)) if hasattr(lm_head, "shard_indices") else None,
                 )

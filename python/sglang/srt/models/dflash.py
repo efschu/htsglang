@@ -23,7 +23,6 @@ from sglang.srt.layers.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
     QKVParallelLinear,
-    ReplicatedLinear,
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import (
@@ -32,6 +31,7 @@ from sglang.srt.layers.logits_processor import (
 )
 from sglang.srt.layers.radix_attention import AttentionType, RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
+from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.utils import apply_qk_norm
@@ -443,7 +443,12 @@ class DFlashGroupedConv(nn.Module):
     """
 
     def __init__(
-        self, hidden_size: int, block_size: int, taps: int, group_size: int
+        self,
+        hidden_size: int,
+        block_size: int,
+        taps: int,
+        group_size: int,
+        prefix: str = "",
     ) -> None:
         super().__init__()
         if hidden_size % group_size:
@@ -457,11 +462,43 @@ class DFlashGroupedConv(nn.Module):
         self.group_size = int(group_size)
         self.num_groups = hidden_size // self.group_size
         # [input/output, tap, channel], the layout training exports.
+        # Replicated on purpose: 2 * taps * hidden elements, ~41 kB per conv,
+        # against 13 MB for the projection below.
         base_kernel = torch.zeros(2, self.taps, hidden_size)
         base_kernel[:, 0] = 1.0
         self.base_kernel = nn.Parameter(base_kernel)
-        self.kernel_projection = nn.Linear(
-            hidden_size, 2 * self.taps * self.num_groups, bias=False
+        # SHARDED (task #37 stage 2), and ROW-parallel rather than column-
+        # parallel. Both split the same [2*taps*num_groups, hidden] weight by
+        # the same ratio; the difference is the collective that puts the
+        # coefficients back together.
+        #
+        # Column-parallel would give each rank a slice of the GROUP axis and
+        # need an all-gather over it. Under an uneven plan those slices have
+        # DIFFERENT widths per rank, and the fork's dim=-1 all_gather is
+        # equal-size-only (parallel_state.GroupCoordinator.all_gather builds
+        # output_size = input_size[0] * world_size); the variable-size
+        # all_gatherv is dim-0 and pynccl-only. That leaves padding to the
+        # widest rank plus per-rank narrow+cat surgery, ten times per forward.
+        #
+        # Row-parallel needs none of it: the input is the replicated hidden
+        # state, each rank contracts its own slice of it, and ONE all-reduce of
+        # the full [.., 2*taps*num_groups] coefficient tensor -- the same shape
+        # on every rank, which is what keeps the collective sequence
+        # rank-uniform -- reconstructs the exact projection. The convolution
+        # itself stays replicated: it folds the FULL hidden channels, and
+        # sharding it would move [.., hidden] instead of [.., 2*taps*groups].
+        #
+        # Units are 16-element groups of the CONTRACTION (hidden) axis, the
+        # same alignment rationale as DFlashMLP; the conv's own group_size
+        # never enters here, because this axis is contracted away.
+        _proj_units = hidden_size // math.gcd(hidden_size, 16)
+        self.kernel_projection = RowParallelLinear(
+            hidden_size,
+            2 * self.taps * self.num_groups,
+            bias=False,
+            input_is_parallel=False,
+            prefix=add_prefix("kernel_projection", prefix),
+            tp_units=_proj_units,
         )
 
     def _convolve(self, hidden_states, delta, side: int) -> torch.Tensor:
@@ -481,7 +518,10 @@ class DFlashGroupedConv(nn.Module):
         )
 
     def prepare(self, hidden_states: torch.Tensor):
-        coefficients = self.kernel_projection(hidden_states).reshape(
+        # RowParallelLinear returns (output, bias); bias is None (bias=False),
+        # and the output is already all-reduced back to the full group axis.
+        projected, _ = self.kernel_projection(hidden_states)
+        coefficients = projected.reshape(
             *hidden_states.shape[:-1], 2, self.taps, self.num_groups
         )
         return (
@@ -586,7 +626,7 @@ class DFlashDraftModel(nn.Module):
         self.block_size = draft_config.resolve_block_size(default=16)
         self.candidate_selector: Optional[nn.Module] = None
 
-        def grouped_conv():
+        def grouped_conv(conv_prefix: str):
             if not draft_config.conv_kernel_size:
                 return None
             return DFlashGroupedConv(
@@ -594,6 +634,7 @@ class DFlashDraftModel(nn.Module):
                 self.block_size,
                 draft_config.conv_kernel_size,
                 draft_config.conv_group_size,
+                prefix=add_prefix(conv_prefix, prefix),
             )
 
         self.layers = nn.ModuleList(
@@ -601,8 +642,8 @@ class DFlashDraftModel(nn.Module):
                 self.decoder_layer_cls(
                     config=config,
                     layer_id=i,
-                    attention_conv=grouped_conv(),
-                    mlp_conv=grouped_conv(),
+                    attention_conv=grouped_conv(f"layers.{i}.attention_conv"),
+                    mlp_conv=grouped_conv(f"layers.{i}.mlp_conv"),
                     quant_config=quant_config,
                 )
                 for i in range(num_layers)
@@ -626,7 +667,7 @@ class DFlashDraftModel(nn.Module):
         num_context_features = len(target_layer_ids)
 
         self.num_context_features = int(num_context_features)
-        # ReplicatedLinear rather than nn.Linear, so ``fc`` can take a PACKED
+        # A parallel linear rather than nn.Linear, so ``fc`` can take a PACKED
         # weight. It is by far the largest single tensor in the draft (for
         # Qwen3.6-27B: [25600, 5120], 131 M of the checkpoint's 1.73 G
         # parameters), and every quantised DFLASH artefact in the wild ships it
@@ -634,17 +675,34 @@ class DFlashDraftModel(nn.Module):
         # dense one, which made the whole checkpoint unloadable rather than
         # just this tensor.
         #
-        # REPLICATED and not column/row-parallel on purpose: ``fc`` consumes the
-        # concatenated target-layer features and produces the draft's hidden
-        # state, which every rank needs in full. It is also the shape that makes
-        # solo placement (draft weight-TP=1 on one host rank) the same code
-        # path as the split one.
-        self.fc = ReplicatedLinear(
-            self.num_context_features * hidden_size,
+        # ROW-parallel (task #37 stage 2), replacing the replicated form. The
+        # input is the concatenation of the K target-layer hidden states, and
+        # every rank holds it IN FULL -- the target's hidden states are
+        # replicated after its own TP all-reduce -- so ``input_is_parallel`` is
+        # False and the layer cuts the contraction axis itself, by the shard
+        # plan (RowParallelLinear.forward). The output all-reduce restores the
+        # full draft hidden state that every rank needs.
+        #
+        # Units are 16-element groups of the contraction axis, so any weight
+        # vector works and not only the ones whose sum divides K*hidden; no
+        # family, because this axis is the target's hidden dim K times over and
+        # has nothing to do with the "mlp" family's intermediate size.
+        #
+        # Under solo placement the draft is built with tp_size=1 (ModelRunner
+        # overrides the parallel context for the host AND the shadows), so this
+        # is a plain local matmul with no collective -- the same code path as
+        # the split one, which is what made the replicated form attractive
+        # before the bytes mattered.
+        _fc_in = self.num_context_features * hidden_size
+        _fc_units = _fc_in // math.gcd(_fc_in, 16)
+        self.fc = RowParallelLinear(
+            _fc_in,
             hidden_size,
             bias=False,
+            input_is_parallel=False,
             quant_config=quant_config,
             prefix=add_prefix("fc", prefix),
+            tp_units=_fc_units,
         )
         self.hidden_norm = RMSNorm(hidden_size, eps=rms_norm_eps)
 
@@ -675,9 +733,12 @@ class DFlashDraftModel(nn.Module):
 
     def project_target_hidden(self, target_hidden: torch.Tensor) -> torch.Tensor:
         """Project concatenated target-layer hidden states into draft hidden_size."""
-        # ``input_size`` rather than ``in_features``: ReplicatedLinear carries
-        # the logical shape under its own name, and it is the only one that
-        # survives quantisation (a packed weight has no ``in_features``).
+        # ``input_size`` rather than ``in_features``: the parallel linears
+        # carry the LOGICAL (unsharded) shape under that name, and it is the
+        # only one that survives quantisation (a packed weight has no
+        # ``in_features``) AND sharding (``weight.shape[1]`` is this rank's
+        # slice of the contraction axis, not the feature count the caller has
+        # to hand in).
         expected = int(self.fc.input_size)
         if target_hidden.ndim != 2 or int(target_hidden.shape[-1]) != expected:
             raise ValueError(
@@ -688,7 +749,8 @@ class DFlashDraftModel(nn.Module):
                 "This usually means the target model is capturing a different number of layer features than "
                 "the draft checkpoint/config expects."
             )
-        # ReplicatedLinear returns (output, bias); bias is None here (bias=False).
+        # RowParallelLinear returns (output, bias); bias is None (bias=False),
+        # and the output is already all-reduced across the TP group.
         projected, _ = self.fc(target_hidden)
         return self.hidden_norm(projected)
 
@@ -738,17 +800,29 @@ class DFlashDraftModel(nn.Module):
         params_dict = dict(self.named_parameters())
 
         def resolve_param_name(name: str) -> Optional[str]:
-            if name in params_dict:
-                return name
-            if name.startswith("model."):
-                stripped_name = name[len("model.") :]
-                if stripped_name in params_dict:
-                    return stripped_name
-            else:
-                prefixed_name = f"model.{name}"
-                if prefixed_name in params_dict:
-                    return prefixed_name
+            for candidate in _name_candidates(name):
+                if candidate in params_dict:
+                    return candidate
             return None
+
+        def _name_candidates(name: str) -> Iterable[str]:
+            forms = [name]
+            if name.startswith("model."):
+                forms.append(name[len("model.") :])
+            else:
+                forms.append(f"model.{name}")
+            for form in forms:
+                yield form
+                # The selector codebooks are MODULES now
+                # (VocabParallelEmbedding, task #37 stage 2), not bare
+                # nn.Parameters: the checkpoint's
+                # `candidate_selector.successor_codebook` is this model's
+                # `candidate_selector.successor_codebook.weight`. Scoped to the
+                # codebook names rather than "try `.weight` on anything", so a
+                # checkpoint tensor that merely shares a module's name cannot
+                # be silently absorbed by it.
+                if form.endswith("_codebook"):
+                    yield f"{form}.weight"
 
         loaded_params: set[str] = set()
 
@@ -776,16 +850,21 @@ class DFlashDraftModel(nn.Module):
                 # there is nothing to compare here; that case is caught on the
                 # first forward by project_target_hidden, which checks the same
                 # quantity against the same config field.
-                if resolved_name.endswith("fc.weight") and tuple(
-                    loaded_weight.shape
-                ) != tuple(param.shape):
-                    raise ValueError(
-                        "DFLASH fc.weight shape mismatch. This usually means the draft checkpoint's "
-                        "number of context features (K) does not match this config. "
-                        f"Expected fc.weight.shape={tuple(param.shape)} "
-                        f"(num_context_features={self.num_context_features}, hidden_size={int(self.config.hidden_size)}), "
-                        f"but got {tuple(loaded_weight.shape)} for weight '{name}'."
-                    )
+                #
+                # Compared against the LOGICAL shape, not ``param.shape``: fc
+                # is row-parallel since task #37 stage 2, so under TP>1 this
+                # rank's parameter holds only its slice of the contraction
+                # axis while the checkpoint tensor is always the full one.
+                if resolved_name.endswith("fc.weight"):
+                    logical = (int(self.fc.output_size), int(self.fc.input_size))
+                    if tuple(loaded_weight.shape) != logical:
+                        raise ValueError(
+                            "DFLASH fc.weight shape mismatch. This usually means the draft checkpoint's "
+                            "number of context features (K) does not match this config. "
+                            f"Expected fc.weight.shape={logical} "
+                            f"(num_context_features={self.num_context_features}, hidden_size={int(self.config.hidden_size)}), "
+                            f"but got {tuple(loaded_weight.shape)} for weight '{name}'."
+                        )
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
                 loaded_params.add(resolved_name)
@@ -914,23 +993,20 @@ class DFlashLagunaForCausalLM(DFlashDraftModel):
 @torch.compile(dynamic=True, backend=get_compiler_backend(), disable=_is_npu)
 def _score_edges(
     *,
-    predecessor_table: torch.Tensor,
-    successor_table: torch.Tensor,
-    candidate_ids: torch.Tensor,
+    keys: torch.Tensor,
+    predecessors: torch.Tensor,
     unary_logits: torch.Tensor,
     hidden: torch.Tensor,
-    anchor_token_ids: torch.Tensor,
-    top_k: int,
 ) -> torch.Tensor:
-    keys = successor_table[candidate_ids]
-    # Concatenate the ids and look them up once. Concatenating the looked-up rows
-    # instead moves a [b, slots, k, rank] float tensor where this moves one id per
-    # candidate, and it costs a second gather for the anchor.
-    predecessor_ids = torch.cat(
-        [anchor_token_ids[:, None, None].expand(-1, 1, top_k), candidate_ids[:, :-1]],
-        dim=1,
-    )
-    predecessors = predecessor_table[predecessor_ids]
+    """The pure arithmetic of the lattice, with the two codebook ROWS already
+    looked up by the caller.
+
+    The lookups used to happen in here. They moved out when the codebooks
+    became vocab-parallel (task #37 stage 2): a sharded lookup ends in an
+    all-reduce, and a collective inside a torch.compile region is a graph break
+    at best and a captured-but-wrong collective at worst. Everything that is
+    left is elementwise plus one einsum, which is what this region was
+    compiled for anyway."""
     return unary_logits[:, :, None] + torch.einsum(
         "blpr,blcr->blpc", predecessors * hidden[:, :, None], keys
     )
@@ -949,8 +1025,21 @@ def _follow_maps(maps, initial_indices, edges: int):
 class CandidateSelector(nn.Module):
     """Scores the K x K transitions between adjacent proposal slots, then walks them.
 
-    The [vocab, r] tables are replicated on every TP rank rather than sharded like
-    the LM head: candidate ids are gathered globally, so any rank can need any row.
+    The two [vocab, r] tables are VOCAB-PARALLEL (task #37 stage 2), exactly
+    like the LM head: each rank holds a contiguous band of rows, masks the ids
+    outside it to zero, and one all-reduce per table puts the gathered rows
+    back together. Candidate ids are global -- ``compute_candidates``
+    all-gathers the per-shard top-k and re-ranks, so every rank asks for the
+    same ids -- which is why a masked lookup plus a sum is exact here and not
+    merely close: the ranks that do not own a row contribute a zero row.
+
+    They used to be replicated ("any rank can need any row", which is true and
+    is what the mask is for). At 248320 x 256 bf16 that was 254 MB on EVERY
+    rank of the TP3 layout, the single largest replicated block in the draft.
+
+    Under ``--speculative-draft-placement solo`` the draft is built with
+    tp_size=1, so VocabParallelEmbedding holds the whole table, skips the mask
+    and runs no collective -- the shadows never call this module at all.
     """
 
     def __init__(
@@ -960,6 +1049,7 @@ class CandidateSelector(nn.Module):
         vocab_size: int,
         state_rank: int,
         top_k: int,
+        prefix: str = "",
     ) -> None:
         super().__init__()
         if _flashinfer_top_k is None:
@@ -970,11 +1060,22 @@ class CandidateSelector(nn.Module):
             )
         state_rank = int(state_rank)
         self.top_k = int(top_k)
-        self.predecessor_codebook = nn.Parameter(
-            torch.zeros(int(vocab_size), state_rank), requires_grad=False
+        self.vocab_size = int(vocab_size)
+        self.state_rank = state_rank
+        # No quant_config: these two tables ship dense in every DFLASH2
+        # artefact so far, and they were bare nn.Parameters before -- a
+        # quantised codebook would have been unloadable then too. The
+        # embedding-dim is the selector rank, not a hidden size, so the
+        # vocab-parallel layer is used purely for its ROW sharding.
+        self.predecessor_codebook = VocabParallelEmbedding(
+            self.vocab_size,
+            state_rank,
+            prefix=add_prefix("predecessor_codebook", prefix),
         )
-        self.successor_codebook = nn.Parameter(
-            torch.zeros(int(vocab_size), state_rank), requires_grad=False
+        self.successor_codebook = VocabParallelEmbedding(
+            self.vocab_size,
+            state_rank,
+            prefix=add_prefix("successor_codebook", prefix),
         )
         self.hidden_projection = nn.Linear(hidden_size, state_rank, bias=False)
 
@@ -990,20 +1091,38 @@ class CandidateSelector(nn.Module):
 
         pred is cand[b,e-1], and the verified anchor for slot 0.
         """
+        hidden = self.hidden_projection(hidden_states)
+        # Concatenate the ids and look them up once. Concatenating the looked-up
+        # rows instead moves a [b, slots, k, rank] float tensor where this moves
+        # one id per candidate, and it costs a second gather for the anchor.
+        predecessor_ids = torch.cat(
+            [
+                anchor_token_ids[:, None, None].expand(-1, 1, self.top_k),
+                candidate_ids[:, :-1],
+            ],
+            dim=1,
+        )
+        # OUTSIDE the compiled region below, on purpose: each of these is a
+        # masked lookup plus an all-reduce under TP>1 (no-ops at tp_size=1),
+        # and a collective does not belong in a compile graph. Both are issued
+        # by every rank, in this order, with the same shapes -- the collective
+        # sequence stays rank-uniform even though the shard widths differ.
+        keys = self.successor_codebook(candidate_ids)
+        predecessors = self.predecessor_codebook(predecessor_ids)
         # Everything but the batch is a model constant. Left symbolic, inductor
         # recovers indices with an integer division per element instead of folding.
-        hidden = self.hidden_projection(hidden_states)
-        for tensor in (candidate_ids, unary_logits, hidden):
+        for tensor in (unary_logits, hidden):
             torch._dynamo.mark_static(tensor, 1)
             torch._dynamo.mark_static(tensor, 2)
+        for tensor in (keys, predecessors):
+            torch._dynamo.mark_static(tensor, 1)
+            torch._dynamo.mark_static(tensor, 2)
+            torch._dynamo.mark_static(tensor, 3)
         return _score_edges(
-            predecessor_table=self.predecessor_codebook,
-            successor_table=self.successor_codebook,
-            candidate_ids=candidate_ids,
+            keys=keys,
+            predecessors=predecessors,
             unary_logits=unary_logits,
             hidden=hidden,
-            anchor_token_ids=anchor_token_ids,
-            top_k=self.top_k,
         )
 
     def sample_path(
@@ -1083,6 +1202,7 @@ class DFlash2DraftModel(DFlashDraftModel):
             vocab_size=int(config.vocab_size),
             state_rank=draft_config.selector_rank,
             top_k=draft_config.selector_top_k,
+            prefix=add_prefix("candidate_selector", prefix),
         )
         # The draft has no head of its own; the worker points this at the target's
         # before capture.

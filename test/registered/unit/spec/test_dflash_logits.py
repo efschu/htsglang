@@ -9,6 +9,7 @@ from sglang.srt.models.dflash import (
     DFlash2DraftModel,
     _grouped_conv,
 )
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.speculative.dflash_utils import parse_dflash_draft_config
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -44,7 +45,13 @@ def test_selector_greedy_row_walk_is_deterministic_in_a_mixed_batch():
     to 1.0, so a softmax q stays a real distribution and verify would
     rejection-sample a deterministic request against it. The row must also not
     depend on who else is in the batch."""
-    selector = CandidateSelector(hidden_size=4, vocab_size=16, state_rank=2, top_k=4)
+    # The codebooks are VocabParallelEmbedding modules since the stage-2 shard
+    # (task #37), so construction reads the parallel context; sample_path
+    # itself never touches them.
+    with get_parallel().override(tp_size=1, tp_rank=0):
+        selector = CandidateSelector(
+            hidden_size=4, vocab_size=16, state_rank=2, top_k=4
+        )
     torch.manual_seed(1)
     candidate_ids = torch.randint(0, 16, (2, 3, 4))
     scores = torch.randn(2, 3, 4, 4)
