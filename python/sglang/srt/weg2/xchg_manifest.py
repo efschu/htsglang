@@ -968,6 +968,7 @@ def join_manifests(
 
     tensors: List[JoinedTensor] = []
     unsourced: List[str] = []
+    solo_names: List[str] = []
     for nkey in names:
         region, name = nkey
         rows = []
@@ -978,16 +979,50 @@ def join_manifests(
                 if piece is not None:
                     break
             rows.append(piece)
-        if any(p is None for p in rows):
-            # A tensor only SOME TP ranks hold is not a cut this plan can name;
-            # it is reported rather than planned over the ranks that have it.
-            unsourced.append(name)
-            continue
         found = pp_by_name.get(nkey)
         if found is None:
             unsourced.append(name)
             continue
         stage, whole = found
+        if any(p is None for p in rows):
+            # A tensor only SOME TP ranks hold is not a cut this plan can
+            # name -- with ONE exception, read off the records (19.09.,
+            # xsn389): every rank that holds it holds it WHOLE (the PP
+            # side's own extents). That is the solo draft host of
+            # --speculative-draft-placement solo (the shadows publish no
+            # draft rows, `card_inventory` skips meta parameters): a ROWS
+            # cut whose widths are the whole on the holders and 0 on the
+            # others, so `_blocks_of` gives the others no block and the plan
+            # moves the tensor to (and from) the holders only. Any other
+            # partial hold is reported, never planned over the ranks that
+            # have it.
+            held = [p for p in rows if p is not None]
+            whole_on_holders = all(
+                int(p.rows_full) == int(whole.rows_full)
+                and int(p.cols_full) == int(whole.cols_full)
+                and int(p.itemsize) == int(whole.itemsize)
+                for p in held)
+            if not whole_on_holders:
+                unsourced.append(name)
+                continue
+            solo_names.append(name)
+            tensors.append(
+                JoinedTensor(
+                    param_name=name,
+                    tensor_class=whole.tensor_class,
+                    tag=str(held[0].tag or whole.tag),
+                    itemsize=int(whole.itemsize),
+                    rows_full=int(whole.rows_full),
+                    cols_full=int(whole.cols_full),
+                    shard_axis=wx.ROWS,
+                    pp_stage=int(stage),
+                    tp_widths=tuple(int(whole.rows_full) if p is not None else 0
+                                    for p in rows),
+                    pp_card=int(pp_card_by_rank.get(stage, stage)),
+                    pad_units=0,
+                )
+            )
+            continue
         if int(whole.itemsize) != int(rows[0].itemsize):
             raise wx.Weg2XchgPlanDisagree(
                 f"W68 Weg2XchgPlanDisagree: {name}: itemsize "
@@ -1036,6 +1071,15 @@ def join_manifests(
             )
         )
 
+    if solo_names:
+        import logging as _logging
+        _logging.getLogger(__name__).info(
+            "WEG2-XCHG-PLAN region=%s solo-held-names=%d first=%r -- held whole "
+            "by %s rank(s) %s only (solo draft host); the other ranks get no "
+            "block of them",
+            _my_region, len(solo_names), solo_names[0], tp_group,
+            sorted({r for t in tensors if t.param_name in set(solo_names)
+                    for r, w in enumerate(t.tp_widths) if int(w) > 0}))
     if unsourced:
         raise wx.Weg2XchgSourceMissing(
             f"W74 Weg2XchgSourceMissing: {len(unsourced)} of {len(names)} "

@@ -4419,6 +4419,8 @@ class SchedulerWeightUpdaterManager:
                     region = _xm.region_of_tag(_wx.GPU_MEMORY_TYPE_WEIGHTS_DRAFT)
                     try:
                         for name, param in model.named_parameters():
+                            if getattr(getattr(param, "device", None), "type", "") == "meta":
+                                continue  # xsn389: a solo-shadow meta draft holds no bytes
                             table.setdefault((region, str(name)), param)
                     except BaseException:  # noqa: BLE001
                         pass
@@ -4430,6 +4432,8 @@ class SchedulerWeightUpdaterManager:
                 region = _wx.GPU_MEMORY_TYPE_WEIGHTS
             try:
                 for name, param in model.named_parameters():
+                    if getattr(getattr(param, "device", None), "type", "") == "meta":
+                        continue  # xsn389: a meta parameter has no device address
                     table.setdefault((region, str(name)), param)
             except BaseException:  # noqa: BLE001
                 continue

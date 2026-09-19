@@ -1796,7 +1796,11 @@ def _blocks_of(geom: ParamGeom, layout: GroupLayout, is_dst: bool) -> List[List[
             )
         out, acc = [], 0
         for w in geom.dst_widths:
-            out.append([Block(block=0, global_start=acc, dev_row=0, size=int(w))])
+            # xsn389: width 0 = this rank holds NOTHING of the tensor (a solo
+            # draft shadow) -- an empty list, which `_emit` skips, never a
+            # zero-size block that would still ask the rank for an address.
+            out.append([Block(block=0, global_start=acc, dev_row=0, size=int(w))]
+                       if int(w) > 0 else [])
             acc += int(w)
         return out
     # THE FAMILY AXIS.  The real shard boundary is a function of (total,
@@ -1814,7 +1818,7 @@ def _blocks_of(geom: ParamGeom, layout: GroupLayout, is_dst: bool) -> List[List[
         geom.shard_total, ratios, layout.tp_size, geom.units, geom.groups
     )
     return [
-        [Block(block=0, global_start=start, dev_row=0, size=size)]
+        [Block(block=0, global_start=start, dev_row=0, size=size)] if int(size) > 0 else []
         for start, size in ranges
     ]
 

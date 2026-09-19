@@ -3083,6 +3083,15 @@ def card_inventory(
     walked = 0
     for name, param in model.named_parameters():
         walked += 1
+        if getattr(getattr(param, "device", None), "type", "") == "meta":
+            # 19.09. (xsn389): a META parameter holds no bytes on any card --
+            # the solo-draft SHADOWS (--speculative-draft-placement solo) build
+            # the draft on `meta` with the sharded shapes; publishing those
+            # made the join read (5120, 6400) rows against the host's whole
+            # (1600, 20480) and refuse W68. Absent from the manifest, the
+            # join plans the tensor on the ranks that hold it.
+            skipped.append((str(name), "meta-no-bytes"))
+            continue
         tag = str(tag_of(str(name), region_tag=region_tag))
         if not ms.is_weights_family_tag(tag):
             # Not a skip of a FAMILY piece: this parameter is outside the
