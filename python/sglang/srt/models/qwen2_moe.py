@@ -364,6 +364,19 @@ def link_moe_lookahead(layers, distance: Optional[int] = None) -> int:
     return links
 
 
+_BREAKABLE_MODE = None
+
+
+def _breakable_offload_mode() -> bool:
+    """True when the MoE offload runs the #462 breakable graph route
+    (SGLANG_MOE_OFFLOAD_GRAPH_MODE=breakable); read once per process."""
+    global _BREAKABLE_MODE
+    if _BREAKABLE_MODE is None:
+        import os
+        _BREAKABLE_MODE = str(os.environ.get("SGLANG_MOE_OFFLOAD_GRAPH_MODE", "")).strip().lower() == "breakable"
+    return _BREAKABLE_MODE
+
+
 class Qwen2MoeSparseMoeBlock(nn.Module):
     def __init__(
         self,
@@ -702,13 +715,26 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
     ) -> torch.Tensor:
         current_stream = torch.cuda.current_stream()
         self.alt_stream.wait_stream(current_stream)
-        shared_output = (
-            self._forward_shared_experts(
-                hidden_states.clone(), apply_gate=not use_fused_gate
+        # 19.09. (fn3k, #462 breakable route): the routed experts carry the
+        # eager MoE break (`eager_on_graph`), and a CUDA-graph segment can only
+        # end on the stream it began on -- the CAPTURE stream. So under the
+        # breakable offload mode the roles swap: shared experts overlap on the
+        # alt stream, the routed experts (and their break) stay on the current
+        # stream. Same overlap, same bytes; only the break's stream changes.
+        _routed_on_main = _breakable_offload_mode()
+        if _routed_on_main and self.shared_expert is not None:
+            with torch.cuda.stream(self.alt_stream):
+                shared_output = self._forward_shared_experts(
+                    hidden_states.clone(), apply_gate=not use_fused_gate
+                )
+        else:
+            shared_output = (
+                self._forward_shared_experts(
+                    hidden_states.clone(), apply_gate=not use_fused_gate
+                )
+                if self.shared_expert is not None
+                else None
             )
-            if self.shared_expert is not None
-            else None
-        )
 
         # ===== TO BE REFACTORED ====
         # Shared-add overlap (SGLANG_OPT_LORA_SHARED_ADD_OVERLAP): hand the add to the LoRA
@@ -726,8 +752,11 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 staged = True
         # ===== END TO BE REFACTORED ====
 
-        with torch.cuda.stream(self.alt_stream):
+        if _routed_on_main:
             router_output = self._forward_router_experts(hidden_states)
+        else:
+            with torch.cuda.stream(self.alt_stream):
+                router_output = self._forward_router_experts(hidden_states)
 
         current_stream.wait_stream(self.alt_stream)
 

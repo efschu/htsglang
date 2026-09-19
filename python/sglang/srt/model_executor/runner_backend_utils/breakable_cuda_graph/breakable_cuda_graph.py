@@ -434,17 +434,9 @@ class BreakableCUDAGraphCapture:
         else:
             graph = torch.cuda.CUDAGraph()
             self._current_graph_needs_instantiate = False
-        _cap = self._stream or _current_stream_var.get()
-        if _cap is not None and torch.cuda.current_stream() != _cap:
-            # keep every segment on the capture stream (see _end_current_segment)
-            with torch.cuda.stream(_cap):
-                graph.capture_begin(
-                    pool=self._pool, capture_error_mode=self._capture_error_mode
-                )
-        else:
-            graph.capture_begin(
-                pool=self._pool, capture_error_mode=self._capture_error_mode
-            )
+        graph.capture_begin(
+            pool=self._pool, capture_error_mode=self._capture_error_mode
+        )
         self._current_graph = graph
 
     def _end_current_segment(self) -> None:
@@ -473,15 +465,17 @@ class BreakableCUDAGraphCapture:
         # joined above, so the segment's work is complete on it.
         _cap = self._stream or _current_stream_var.get()
         if _cap is not None and torch.cuda.current_stream() != _cap:
+            # fn3k: ending the segment on the capture stream while the forward
+            # continued on another (un-forked) stream captured nothing of what
+            # followed -- 44 tok/s of '!!!!'. Named refusal instead.
             import traceback
-            logger.warning(
-                "BreakableCUDAGraph: segment end reached on stream %s, the capture began on %s "
-                "-- ending on the capture stream. Site:\n%s",
-                torch.cuda.current_stream(), _cap, "".join(traceback.format_stack(limit=12)))
-            with torch.cuda.stream(_cap):
-                graph.capture_end()
-        else:
-            graph.capture_end()
+            raise RuntimeError(
+                "BreakableCUDAGraph: a break point was reached on stream "
+                f"{torch.cuda.current_stream()} but the capture began on {_cap}; the "
+                "forward must issue the MoE break on the capture stream (see "
+                "qwen2_moe.forward_normal_dual_stream under the breakable mode). Site:\n"
+                + "".join(traceback.format_stack(limit=12)))
+        graph.capture_end()
         self.cuda_graph._append_segment(graph, self._current_graph_needs_instantiate)
         self._current_graph = None
         self._current_graph_needs_instantiate = False
