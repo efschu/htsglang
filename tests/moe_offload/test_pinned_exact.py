@@ -100,3 +100,32 @@ def test_presplit_and_spill_pool_use_exact_pins(monkeypatch):
     for fn in (eo.presplit_expert_offload_after_repack, eo.allocate_spill_pool):
         src = code_of(fn)
         assert "pin_memory()" not in src and "pinned_exact_empty(" in src, fn.__name__
+
+
+def test_a_dropped_pool_unregisters_itself(monkeypatch):
+    """fn6r (19.09.): pools are rebuilt per layer (hot set from file, presplit
+    doors); a superseded pool must give its bytes back when its LAST view is
+    dropped -- not stay page-locked in a registry (40 GiB on TP0 by layer 19)."""
+    import gc
+
+    calls = []
+    _fake_cuda(monkeypatch, calls)
+    t = eo.pinned_exact_empty((64, 1024), torch.uint8)
+    ptr = t.data_ptr()
+    view = t[3:9]
+    del t
+    gc.collect()
+    assert ("unregister", ptr) not in calls, "unregistered while a view was alive"
+    assert eo.pinned_exact_bytes() == 64 * 1024
+    view[0, 0] = 5
+    del view
+    gc.collect()
+    assert calls[-1] == ("unregister", ptr)
+    assert eo.pinned_exact_bytes() == 0
+    # explicit release first, finalizer later: exactly one unregister
+    t2 = eo.pinned_exact_empty((8, 8), torch.float32)
+    p2 = t2.data_ptr()
+    assert eo.pinned_exact_release(t2) is True
+    del t2
+    gc.collect()
+    assert calls.count(("unregister", p2)) == 1

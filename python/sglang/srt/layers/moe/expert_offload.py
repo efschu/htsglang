@@ -2571,8 +2571,44 @@ def refuse_capturable_cold_tier(num_experts: int) -> None:
 # ``Tensor.is_pinned()`` is true for it, H2D copies take the DMA path, and under
 # UVA its device pointer equals the host pointer -- exactly what
 # ``device_view_of_pinned`` needs for the captured spill gather.
-_PINNED_EXACT_REGISTRY: dict = {}
+_PINNED_EXACT_REGISTRY: dict = {}  # ptr -> nbytes of live registrations
 _CUDA_HOST_REGISTER_MAPPED = 0x02
+
+
+import mmap as _mmap
+
+
+class _PinnedMap(_mmap.mmap):
+    """The anonymous mapping behind one exact-size pool.
+
+    A plain ``mmap.mmap`` cannot be weakly referenced; this subclass can.
+    torch keeps it alive through the tensor's STORAGE (frombuffer holds its
+    buffer source), so a ``weakref.finalize`` on it fires exactly when the
+    LAST view of the pool is gone -- and unregisters the range before the
+    mapping is torn down. That lifetime is the whole point: a pool that is
+    rebuilt (hot set frozen from file, heat migration, a second presplit door)
+    must return its bytes when the old tensor is dropped -- fn6r (19.09.)
+    held every superseded pool in a registry and had 40 GiB page-locked on
+    TP0 by layer 19 of 48 (3.3 pools per layer instead of one)."""
+
+    def __new__(cls, nbytes: int):
+        return super().__new__(
+            cls, -1, nbytes, flags=_mmap.MAP_PRIVATE | _mmap.MAP_ANONYMOUS
+        )
+
+
+def _pinned_exact_unregister(ptr: int) -> bool:
+    """Unregister ``ptr`` if it is a live registration; idempotent."""
+    nbytes = _PINNED_EXACT_REGISTRY.pop(ptr, None)
+    if nbytes is None:
+        return False
+    import torch
+
+    try:
+        torch.cuda.cudart().cudaHostUnregister(ptr)
+    except Exception:  # pragma: no cover - CUDA already torn down
+        pass
+    return True
 
 
 def pinned_exact_empty(shape, dtype):
@@ -2588,8 +2624,6 @@ def pinned_exact_empty(shape, dtype):
     nbytes = n * torch.empty((), dtype=dtype).element_size()
     if nbytes == 0 or not torch.cuda.is_available():
         return torch.empty(shape, dtype=dtype, device="cpu")
-    import mmap
-
     # Give back what torch's host cache still holds from the weight load
     # before pinning new pages: the loader's pinned staging blocks sit in the
     # CachingHostAllocator's free lists after use, and the presplit pools used
@@ -2604,7 +2638,9 @@ def pinned_exact_empty(shape, dtype):
     except Exception:  # pragma: no cover - no CUDA context
         pass
     release_torch_host_cache()
-    mm = mmap.mmap(-1, nbytes, flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS)
+    import weakref
+
+    mm = _PinnedMap(nbytes)
     flat = torch.frombuffer(mm, dtype=torch.uint8)
     ptr = flat.data_ptr()
     err = torch.cuda.cudart().cudaHostRegister(ptr, nbytes, _CUDA_HOST_REGISTER_MAPPED)
@@ -2613,7 +2649,11 @@ def pinned_exact_empty(shape, dtype):
         raise RuntimeError(
             f"cudaHostRegister({nbytes} bytes) failed with cudaError {int(err)}"
         )
-    _PINNED_EXACT_REGISTRY[ptr] = (mm, nbytes)
+    _PINNED_EXACT_REGISTRY[ptr] = nbytes
+    # The storage holds ``mm``; when the last view of it dies, the finalizer
+    # unregisters the range BEFORE the mapping is torn down.
+    fin = weakref.finalize(mm, _pinned_exact_unregister, ptr)
+    fin.atexit = False
     _log_pinned_exact_milestone(nbytes)
     return flat.view(dtype).view(shape)
 
@@ -2661,15 +2701,7 @@ def _log_pinned_exact_milestone(nbytes: int) -> None:
 def pinned_exact_release(tensor):
     """Unregister and unmap a buffer from :func:`pinned_exact_empty` once no
     view of it is used any more (the caller's promise). No-op for others."""
-    import torch
-
-    entry = _PINNED_EXACT_REGISTRY.pop(tensor.data_ptr(), None)
-    if entry is None:
-        return False
-    mm, _nbytes = entry
-    torch.cuda.cudart().cudaHostUnregister(tensor.data_ptr())
-    mm.close()
-    return True
+    return _pinned_exact_unregister(tensor.data_ptr())
 
 
 def release_torch_host_cache() -> None:
@@ -2705,7 +2737,7 @@ def torch_host_cache_reserved_bytes() -> int:
 
 def pinned_exact_bytes():
     """Bytes currently page-locked through :func:`pinned_exact_empty`."""
-    return sum(n for _mm, n in _PINNED_EXACT_REGISTRY.values())
+    return sum(_PINNED_EXACT_REGISTRY.values())
 
 
 class _PinnedDeviceViewHolder:
