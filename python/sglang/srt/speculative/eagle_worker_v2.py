@@ -287,7 +287,13 @@ def _get_plan_stream(
 
 def _qsa_index_share_requested(hf_config) -> bool:
     """--json-model-override-args writes top-level hf_config attributes, while
-    checkpoint configs carry the flag on the nested text_config; read both."""
+    checkpoint configs carry the flag on the nested text_config; read both.
+    SGLANG_QSA_MTP_INDEX_SHARE=0 forces it off (A/B switch, fn4r 19.09.: the
+    Qwen4Exp config class defaults it to True, accept length 1.2 with it)."""
+    import os
+
+    if os.environ.get("SGLANG_QSA_MTP_INDEX_SHARE", "") == "0":
+        return False
     text_config = getattr(hf_config, "text_config", hf_config)
     return bool(
         getattr(

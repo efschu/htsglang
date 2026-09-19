@@ -263,3 +263,15 @@ def test_index_share_flag_reads_override_and_checkpoint_locations():
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
+
+
+def test_index_share_env_switch_forces_off(monkeypatch):
+    from types import SimpleNamespace
+
+    from sglang.srt.speculative.eagle_worker_v2 import _qsa_index_share_requested
+
+    cfg = SimpleNamespace(text_config=SimpleNamespace(index_share_for_mtp_iteration=True))
+    monkeypatch.delenv("SGLANG_QSA_MTP_INDEX_SHARE", raising=False)
+    assert _qsa_index_share_requested(cfg) is True
+    monkeypatch.setenv("SGLANG_QSA_MTP_INDEX_SHARE", "0")
+    assert _qsa_index_share_requested(cfg) is False
