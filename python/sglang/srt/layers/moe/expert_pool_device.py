@@ -20,7 +20,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 ROW_USE_NEVER = 0x7FFFFFFFFFFFFFFF
-PLAN_WIDTH = 32
+PLAN_WIDTH = 64
 COPY_PROGRAMS = 32
 COPY_WORDS = 4096  # int32 words per program iteration (16 KiB)
 
