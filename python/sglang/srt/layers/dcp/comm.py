@@ -26,6 +26,8 @@ PR #25090 vs #14194):
 import warnings
 from typing import Optional
 
+import logging
+
 import torch
 
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
@@ -225,7 +227,39 @@ def cp_local_head_bounds(cp_group: GroupCoordinator, head_counts: list) -> tuple
     return start, start + head_counts[rank]
 
 
+logger = logging.getLogger(__name__)
+
 _LSE_MERGE = {"dtype": None, "mode": None}
+
+
+def _ng(stage: str, t: torch.Tensor, cp_group, allow_neg_inf: bool = False) -> None:
+    """Task #49 (19.09.): SGLANG_NAN_GUARD=1 names the merge stage in which
+    the numbers die (fn7y: layer 15, all ranks, the same 2608 rows). -inf
+    is a legal LSE (a query without rows); anything else non-finite is not."""
+    try:
+        from sglang.srt.layers.nan_guard import nan_guard_on
+    except Exception:  # noqa: BLE001
+        return
+    if not nan_guard_on() or t is None or t.numel() == 0:
+        return
+    try:
+        if t.is_cuda and torch.cuda.is_current_stream_capturing():
+            return
+        tf = t.float()
+        bad = ~torch.isfinite(tf)
+        if allow_neg_inf:
+            bad &= ~(tf == float("-inf"))
+        n = int(bad.sum().item())
+        if n == 0:
+            return
+        rows = torch.nonzero(bad.reshape(bad.shape[0], -1).any(dim=1) if t.dim() > 1 else bad).reshape(-1)
+        logger.error(
+            "[nan-guard] merge stage %s rank %d: %d non-finite of %d, shape %s, first rows %s (n_rows %d)",
+            stage, int(getattr(cp_group, "rank_in_group", -1)), n, t.numel(), tuple(t.shape),
+            rows[:8].tolist(), int(rows.numel()),
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("[nan-guard] merge check skipped: %s", exc)
 
 
 def lse_merge_reduce_dtype() -> str:
@@ -279,7 +313,10 @@ def cp_lse_ag_out_a2a_mha_uneven(
     counts = [int(c) for c in head_counts]
     assert len(counts) == world and sum(counts) == cp_attn_out.shape[1]
     cp_attn_lse = cp_attn_lse.contiguous()
+    _ng("merge.local_out", cp_attn_out, cp_group)
+    _ng("merge.local_lse", cp_attn_lse, cp_group, allow_neg_inf=True)
     lses = _ag_lse(cp_attn_lse, cp_group)
+    _ng("merge.gathered_lse", lses, cp_group, allow_neg_inf=True)
     global_lse = torch.logsumexp(lses, dim=0)
     scale = torch.exp(cp_attn_lse - global_lse).unsqueeze(-1)
     scale = torch.nan_to_num(scale, nan=0.0, posinf=0.0, neginf=0.0)
@@ -294,7 +331,10 @@ def cp_lse_ag_out_a2a_mha_uneven(
     cp_group.all_to_all_single_v(
         recv, send, output_split_sizes=[mine] * world, input_split_sizes=counts
     )
+    _ng("merge.a2a_send", send, cp_group)
+    _ng("merge.a2a_recv", recv, cp_group)
     merged = recv.view(world, mine, tokens, dim).to(torch.float32).sum(dim=0)
+    _ng("merge.result", merged, cp_group)
     merged = merged.transpose(0, 1).contiguous()  # [tokens, H_local, D]
     if return_lse:
         start, stop = cp_local_head_bounds(cp_group, counts)
