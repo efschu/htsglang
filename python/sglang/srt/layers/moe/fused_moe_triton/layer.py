@@ -2485,6 +2485,44 @@ class FusedMoE(torch.nn.Module):
             dispatch_output, _apply, lookahead=self._take_lookahead()
         )
 
+    def pool_prefetch_local_ids(self, predicted_global_ids):
+        """Translate a router prediction (GLOBAL expert ids) into this rank's
+        LOCAL pool ids, with everything this rank does not own marked -1.
+
+        Same translation the real path applies in ``forward_local`` -- the
+        static ``_gguf_topk_remap`` table, plain indexing, CUDA-graph safe --
+        plus one step the real path must NOT take: the remap sends every
+        foreign expert to the all-zero PAD slot so its contribution is exactly
+        0, and prefetching the pad row would spend an LRU slot on a row that is
+        resident-by-construction and never read from host. The pad becomes -1,
+        which the pool step treats as padding and skips."""
+        import torch
+
+        if not getattr(self, "_gguf_expert_shard", False):
+            return predicted_global_ids
+        if not hasattr(self, "_gguf_topk_remap"):
+            self._build_expert_shard_topk_remap()
+        local = self._gguf_topk_remap[predicted_global_ids.long()]
+        lo, hi = self._gguf_expert_range
+        pad = 0 if getattr(self, "_expert_shard_generic", False) else (hi - lo)
+        return torch.where(
+            local == pad, torch.full_like(local, -1), local
+        )
+
+    def pool_prefetch(self, predicted_global_ids) -> bool:
+        """Issue the speculative prefetch for THIS layer's pool with the ids a
+        previous layer's forward predicted. Returns True when it was issued."""
+        from sglang.srt.layers.moe.expert_offload import pool_prefetch_enabled
+
+        cache = self._expert_offload
+        if (
+            cache is None
+            or not getattr(self, "_moe_offload_pool", False)
+            or not pool_prefetch_enabled()
+        ):
+            return False
+        return bool(cache.prefetch_pool(self.pool_prefetch_local_ids(predicted_global_ids)))
+
     def set_lookahead(self, next_layer, predicted_local_ids):
         """WP8: hand this forward the LATER layer's offload target and the
         expert ids its router predicted on the current stream (this rank's

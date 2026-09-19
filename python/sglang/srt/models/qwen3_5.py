@@ -1611,6 +1611,16 @@ class Qwen3_5ForCausalLM(nn.Module):
                 _envs.SGLANG_MOE_EXPERT_LOOKAHEAD.get(),
                 n_links,
             )
+        # SGLANG_MOE_POOL_PREFETCH=1: chain each MoE block to the NEXT one so
+        # it can prefetch that block's predicted expert rows while its own
+        # experts compute (0 links when the switch is off).
+        from sglang.srt.models.qwen2_moe import link_moe_pool_prefetch
+
+        n_pf = link_moe_pool_prefetch(self.layers)
+        if n_pf:
+            logger.info(
+                "[moe-pool-prefetch] %d MoE blocks linked (distance 1)", n_pf
+            )
 
         # #753: the mid-loop crossing wire. NoCrossingWire unless a layer set
         # is configured AND SGLANG_PP_CROSSING_WIRE is on, so the default path

@@ -364,6 +364,41 @@ def link_moe_lookahead(layers, distance: Optional[int] = None) -> int:
     return links
 
 
+def link_moe_pool_prefetch(layers) -> int:
+    """Speculative expert prefetch (SGLANG_MOE_POOL_PREFETCH=1): point every
+    MoE block at the NEXT MoE block, so it can run that block's router on its
+    own MoE input and prefetch the predicted rows while its own experts
+    compute. Distance is fixed at 1 -- the overlap window is exactly one
+    layer's expert GEMM, and a further block's router applied to this block's
+    state predicts measurably worse (Mixtral-Offloading's own finding).
+
+    Deliberately a SEPARATE chain from ``link_moe_lookahead``: WP8's lookahead
+    is consumed only by the eager wave path and carries its own distance knob;
+    this one exists only for the graph pool route. Returns the links made."""
+    from sglang.srt.layers.moe.expert_offload import pool_prefetch_enabled
+
+    if not pool_prefetch_enabled():
+        return 0
+    blocks = []
+    for layer in layers:
+        mlp = getattr(layer, "mlp", None)
+        ok = (
+            mlp is not None
+            and hasattr(mlp, "pool_prefetch_next")
+            and hasattr(mlp, "gate")
+            and hasattr(mlp, "experts")
+        )
+        blocks.append(mlp if ok else None)
+    links = 0
+    for i, blk in enumerate(blocks):
+        j = i + 1
+        if blk is None or j >= len(blocks) or blocks[j] is None:
+            continue
+        blk.pool_prefetch_next = blocks[j]
+        links += 1
+    return links
+
+
 _BREAKABLE_MODE = None
 
 
@@ -519,6 +554,61 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         # WP8 expert lookahead: the MoE block N steps ahead whose router this
         # block evaluates on its own stream (None = off; see link_moe_lookahead).
         self.lookahead_next: Optional["Qwen2MoeSparseMoeBlock"] = None
+        # Speculative expert prefetch for the device-planned pool: the NEXT
+        # MoE block, whose router this block evaluates on its own MoE input
+        # (None = off; see link_moe_pool_prefetch).
+        self.pool_prefetch_next: Optional["Qwen2MoeSparseMoeBlock"] = None
+        self._pool_prefetch_refused = False
+
+    def _pool_prefetch_next_block(self, hidden_states: torch.Tensor) -> None:
+        """Mixtral-Offloading's speculative expert loading, for the graph pool.
+
+        The residual stream changes slowly from layer to layer, so the NEXT MoE
+        block's router applied to THIS block's MoE input is a good predictor of
+        the experts that block will want. Run it here, at the top of this
+        block's forward, and hand the prediction to the next block's pool: the
+        rows it is missing are copied on a side stream while this block's own
+        experts compute, and the next block's real plan then finds them
+        resident (see expert_pool_device's module docstring).
+
+        Only the COPIES go to the side stream. The prediction itself stays on
+        the capture stream because it is a [tokens x hidden] @ [hidden x E]
+        GEMM plus one top-k -- a few MFLOP per layer against the ~350 MB per
+        round the copies move; forking it would buy nothing and cost a second
+        event pair.
+
+        Graph-capture only: outside capture the pool is not the active route
+        (an eager forward runs run_waves and republishes its occupancy
+        afterwards), so there is nothing to prefetch into.
+        """
+        nxt = self.pool_prefetch_next
+        if nxt is None or hidden_states.shape[0] == 0:
+            return
+        if not get_is_capture_mode():
+            return
+        cfg = nxt.topk.topk_config
+        if cfg.use_grouped_topk or cfg.correction_bias is not None:
+            # A prediction that used the wrong routing rule would still be
+            # SAFE (a wrong guess is only a wasted row), but it would be
+            # silently worse than it looks. Refuse loudly once instead.
+            if not self._pool_prefetch_refused:
+                self._pool_prefetch_refused = True
+                logger.warning(
+                    "[moe-pool-prefetch] layer %s: the next block routes with "
+                    "grouped top-k / a correction bias; the plain top-k "
+                    "predictor does not reproduce it, prefetch stays off here",
+                    self.layer_id,
+                )
+            return
+        k = int(cfg.top_k) - int(cfg.num_fused_shared_experts or 0)
+        if k <= 0:
+            return
+        pred_logits, _ = nxt.gate(hidden_states)
+        # top-k of the logits == top-k of softmax(logits): softmax is strictly
+        # monotone, so the RenormalizeNaive path selects exactly these ids. We
+        # need the ids only -- the weights are never used by a prefetch.
+        pred_ids = torch.topk(pred_logits, k, dim=-1).indices.to(torch.int32)
+        nxt.experts.pool_prefetch(pred_ids)
 
     def _predict_lookahead(self, hidden_states: torch.Tensor):
         """Run the LATER block's router on this block's MLP input and hand the
@@ -773,6 +863,12 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
     ) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
+
+        # Issue the NEXT block's speculative prefetch first: everything this
+        # block enqueues afterwards (gate, shared expert, expert GEMM) is the
+        # compute the copies hide behind.
+        if self.pool_prefetch_next is not None:
+            self._pool_prefetch_next_block(hidden_states)
 
         if get_moe_a2a_backend().is_deepep():
             return self._forward_deepep(hidden_states, forward_batch)

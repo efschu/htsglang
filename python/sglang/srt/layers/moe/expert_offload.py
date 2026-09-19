@@ -657,6 +657,39 @@ class ExpertResidencyPlanner:
         return slot_of_needed, fetch_plan, len(reused)
 
 
+_POOL_PREFETCH: Optional[bool] = None
+_POOL_PREFETCH_STREAM = None
+
+
+def pool_prefetch_enabled() -> bool:
+    """SGLANG_MOE_POOL_PREFETCH=1 arms the speculative expert prefetch of the
+    device-planned pool (default OFF -- with it unset every pool forward is
+    byte-identical to before). Read once per process."""
+    global _POOL_PREFETCH
+    if _POOL_PREFETCH is None:
+        import os
+
+        _POOL_PREFETCH = str(
+            os.environ.get("SGLANG_MOE_POOL_PREFETCH", "") or ""
+        ).strip().lower() in ("1", "true", "yes", "on")
+    return _POOL_PREFETCH
+
+
+def pool_prefetch_stream():
+    """ONE side stream per rank for every layer's speculative prefetch.
+
+    One stream, not one per layer: the prefetches of successive layers happen
+    at different points of the same forward and all contend for the same PCIe
+    link, so serialising them on a single stream is what we want anyway, and it
+    keeps the number of streams a decode graph forks to one."""
+    global _POOL_PREFETCH_STREAM
+    if _POOL_PREFETCH_STREAM is None:
+        import torch
+
+        _POOL_PREFETCH_STREAM = torch.cuda.Stream()
+    return _POOL_PREFETCH_STREAM
+
+
 def resident_slot_count(num_local_experts: int, fraction: float) -> int:
     """Resident-expert count to keep on GPU for a given fraction (<1)."""
     n = int(math.ceil(fraction * num_local_experts))
@@ -2813,6 +2846,13 @@ class MoEExpertOffloadCache:
         self._pool_srcs = None
         self._pool_dsts = None
         self._pool_view_holders = []
+        # Speculative expert prefetch (SGLANG_MOE_POOL_PREFETCH=1, default off):
+        # own step buffers, because the gather list the side stream copies from
+        # must survive while the real step writes the layer's normal buffers.
+        self._pool_pf_buffers = None
+        self._pool_pf_begin = None  # main -> side: x_L is ready
+        self._pool_pf_done = None  # side -> main: the predicted rows are in
+        self._pool_pf_armed = False
         from sglang.srt.environ import envs as _envs
 
         self.lookahead_sticky = int(_envs.SGLANG_MOE_EXPERT_LOOKAHEAD.get()) > 0
@@ -3527,12 +3567,19 @@ class MoEExpertOffloadCache:
         self._pool_srcs = [device_view_of_pinned(self._pinned[a]) for a in attrs]
         self._pool_dsts = [self._resident[a] for a in attrs]
         self._pool_view_holders = [self._pinned[a] for a in attrs]
+        if pool_prefetch_enabled():
+            import torch
+
+            self._pool_pf_buffers = allocate_step_buffers(device, E, PLAN_WIDTH)
+            self._pool_pf_begin = torch.cuda.Event()
+            self._pool_pf_done = torch.cuda.Event()
         self._pool_ready = True
         logging.getLogger(__name__).info(
             "MoE expert pool on layer %s: residents %d, LRU rows %d, staging %d, "
-            "spill rows %d, tensors %d",
+            "spill rows %d, tensors %d, prefetch %s",
             getattr(self.layer, "layer_id", None), R, C - staging, staging,
             sum(1 for h in host_row if h >= 0), len(attrs),
+            "on" if self._pool_pf_buffers is not None else "off",
         )
 
     def prepare_pool(self, topk_ids):
@@ -3549,6 +3596,12 @@ class MoEExpertOffloadCache:
         flat = topk_ids.reshape(-1)
         if flat.dtype != torch.int32:
             flat = flat.to(torch.int32)
+        if self._pool_pf_armed:
+            # The speculative rows for THIS layer were copied on the side
+            # stream while the previous layer computed. One wait, captured into
+            # the graph, and the real plan below sees them as ordinary hits.
+            self._pool_pf_armed = False
+            torch.cuda.current_stream().wait_event(self._pool_pf_done)
         step(self._pool_tables, flat, self._pool_buffers)
         copy_rows(
             self._pool_srcs,
@@ -3559,6 +3612,54 @@ class MoEExpertOffloadCache:
         )
         routes = self._pool_buffers.routes[: bs * k].view(bs, k)
         return routes if routes.dtype == topk_ids.dtype else routes.to(topk_ids.dtype)
+
+    def prefetch_pool(self, predicted_ids):
+        """Speculative pass for THIS layer, issued by the PREVIOUS layer while
+        its experts compute (SGLANG_MOE_POOL_PREFETCH=1).
+
+        ``predicted_ids`` are this layer's LOCAL expert ids as the caller's
+        block predicted them -- the next MoE block's router applied to the
+        current block's MoE input, remapped through the expert shard, padding
+        marked -1 (see ``FusedMoE.pool_prefetch``).
+
+        Everything runs on ONE side stream per rank, joined to the caller's
+        stream by two events so a CUDA graph captures the fork: the side stream
+        waits for ``begin`` (recorded on the main stream, which is therefore
+        also ordered behind this layer's PREVIOUS-round GEMM), plans and copies
+        the predicted rows, and records ``done``; ``prepare_pool`` waits for
+        ``done`` before this layer's real step. Nothing is allocated here that
+        is not already allocated: the plan writes the layer's own prefetch
+        buffers, the copy writes its own bank rows."""
+        import torch
+
+        from sglang.srt.layers.moe.expert_pool_device import copy_rows, step
+
+        if not self._pool_ready:
+            self.install_pool()
+        if self._pool_pf_buffers is None:
+            return False
+        flat = predicted_ids.reshape(-1)
+        if flat.dtype != torch.int32:
+            flat = flat.to(torch.int32)
+        width = self._pool_pf_buffers.gather_src.shape[0]
+        if flat.numel() > width:
+            flat = flat[:width]
+        side = pool_prefetch_stream()
+        main = torch.cuda.current_stream()
+        self._pool_pf_begin.record(main)
+        with torch.cuda.stream(side):
+            side.wait_event(self._pool_pf_begin)
+            step(self._pool_tables, flat, self._pool_pf_buffers, prefetch=True)
+            copy_rows(
+                self._pool_srcs,
+                self._pool_dsts,
+                self._pool_pf_buffers.gather_src,
+                self._pool_pf_buffers.gather_dst,
+                self._pool_pf_buffers.gather_count,
+            )
+            self._pool_pf_done.record(side)
+        self._pool_pf_armed = True
+        return True
 
     def begin_eager_pool(self):
         """Before an eager (prefill / uncaptured) forward under the pool mode:
@@ -3572,15 +3673,23 @@ class MoEExpertOffloadCache:
             return
         import logging
 
-        from sglang.srt.layers.moe.expert_pool_device import sync_tables, take_report
+        from sglang.srt.layers.moe.expert_pool_device import (
+            sync_tables,
+            take_prefetch_report,
+            take_report,
+        )
 
         forwards, misses = take_report(self._pool_tables)
+        predicted, fetched, pf_hits, pf_skipped = take_prefetch_report(self._pool_tables)
         lid = getattr(self.layer, "layer_id", None)
         if forwards and lid in (0, 23, 47):
             logging.getLogger(__name__).info(
                 "MoE expert pool layer %s: %d decode forwards since last sync, "
-                "%d misses (%.2f per forward, top-k %d)",
-                lid, forwards, misses, misses / forwards, getattr(self.layer, "top_k", -1),
+                "%d misses (%.2f per forward, top-k %d); prefetch predicted %d, "
+                "fetched %d, hits %d, wasted %d, skipped %d",
+                lid, forwards, misses, misses / forwards,
+                getattr(self.layer, "top_k", -1),
+                predicted, fetched, pf_hits, max(fetched - pf_hits, 0), pf_skipped,
             )
         sync_tables(self._pool_tables, dict(self._scratch_holds))
 
