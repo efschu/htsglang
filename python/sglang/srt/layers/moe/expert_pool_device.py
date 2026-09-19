@@ -101,6 +101,9 @@ class StepBuffers:
     staged_count: Any  # [1] int32
     promoted_count: Any  # [1] int32
     step_map: Any  # [E] int32
+    ids: Any  # [W] int32 the step's OWN copy of its ids (the prefetch reads it
+    # on the side stream; a caller temporary could be recycled by the capture
+    # stream before that read -- see MoEExpertOffloadCache.prefetch_pool)
 
 
 def allocate_pool_tables(
@@ -161,6 +164,7 @@ def allocate_step_buffers(device, num_experts: int, width: int = PLAN_WIDTH) -> 
         staged_expert=ints(width), staged_row=ints(width), staged_count=ints(1),
         promoted_count=ints(1),
         step_map=torch.full((num_experts,), -1, dtype=torch.int32, device=device),
+        ids=torch.full((width,), -1, dtype=torch.int32, device=device),
     )
 
 
@@ -495,7 +499,11 @@ def _step_kernel():
         for i in range(0, WIDTH):
             is_miss = tl.sum(tl.where(lane == i, (distinct & (~hit)).to(tl.int32), 0), 0)
             if is_miss > 0:
-                expert = tl.load(ids_ptr + i).to(tl.int64)
+                # From the registers, never a second load: the ids buffer is
+                # read exactly once (``raw`` above), so a writer racing this
+                # kernel can at worst mis-route, never index the tables with
+                # a value ``valid`` did not screen.
+                expert = tl.sum(tl.where(lane == i, safe, 0), 0)
                 victim_row = tl.full((), -1, tl.int64)
                 misses_so_far = tl.load(miss_count_ptr + expert)
                 if not PREFETCH:

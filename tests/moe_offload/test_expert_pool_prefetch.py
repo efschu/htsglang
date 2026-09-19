@@ -216,3 +216,90 @@ def test_the_real_step_is_unchanged_when_no_prefetch_ever_ran():
     assert b.routes[:3].tolist() == [2, 2, 3]
     assert t.pf_row.tolist() == [-1] * ROWS
     assert ep.take_prefetch_report(t) == (0, 0, 0, 0)
+
+
+def test_the_side_stream_reads_the_layers_own_ids_buffer(monkeypatch):
+    """fn6n (19.09.): the prefetch handed the caller's top-k temporary to the
+    side stream; under graph capture that block is recycled on the capture
+    stream, so the replay raced the step kernel's reads -> illegal address on
+    all three ranks. The step must read the layer's OWN ids buffer, filled on
+    the main stream before the fork, and only ever the lanes it was given."""
+    import torch
+
+    from sglang.srt.layers.moe import expert_offload as eo
+    from sglang.srt.layers.moe import expert_pool_device as ep
+
+    E, W = 12, 8
+    pf = ep.allocate_step_buffers("cpu", E, W)
+    seen = {}
+
+    class _Ev:
+        def record(self, _stream=None):
+            seen["recorded"] = seen.get("recorded", 0) + 1
+
+    class _Stream:
+        def wait_event(self, _ev):
+            seen["waited"] = True
+
+    class _Ctx:
+        def __init__(self, _s):
+            pass
+
+        def __enter__(self):
+            return None
+
+        def __exit__(self, *a):
+            return False
+
+    monkeypatch.setattr(eo, "pool_prefetch_stream", lambda: _Stream())
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: _Stream())
+    monkeypatch.setattr(torch.cuda, "stream", _Ctx)
+
+    def fake_step(tables, ids, buffers, prefetch=False):
+        seen["ids"] = ids
+        seen["prefetch"] = prefetch
+        seen["buffers"] = buffers
+
+    monkeypatch.setattr(ep, "step", fake_step)
+    monkeypatch.setattr(ep, "copy_rows", lambda *a, **k: seen.setdefault("copied", True))
+
+    class _Cache:
+        _pool_ready = True
+        _pool_tables = object()
+        _pool_pf_buffers = pf
+        _pool_pf_begin = _Ev()
+        _pool_pf_done = _Ev()
+        _pool_pf_armed = False
+        _pool_srcs = []
+        _pool_dsts = []
+
+    cache = _Cache()
+    predicted = torch.tensor([[3, 7, 11, -1, 9, 2]], dtype=torch.int64)
+    assert eo.MoEExpertOffloadCache.prefetch_pool(cache, predicted) is True
+    ids = seen["ids"]
+    assert seen["prefetch"] is True and seen["buffers"] is pf
+    assert ids.data_ptr() == pf.ids.data_ptr() and ids.dtype == torch.int32
+    assert ids.tolist() == [3, 7, 11, -1, 9, 2]
+    assert pf.ids.tolist() == [3, 7, 11, -1, 9, 2, -1, -1]
+    # the caller's temporary may be recycled after the fork -- the step's copy stays
+    predicted.fill_(0)
+    assert ids.tolist() == [3, 7, 11, -1, 9, 2]
+    assert cache._pool_pf_armed is True and seen["waited"] and seen["copied"]
+    # more lanes than the plan width: only the first W are taken
+    wide = torch.arange(W + 5, dtype=torch.int32)
+    eo.MoEExpertOffloadCache.prefetch_pool(cache, wide)
+    assert seen["ids"].tolist() == list(range(W))
+
+
+def test_the_kernel_takes_the_missing_expert_from_the_screened_lanes():
+    """The Triton step reads the ids buffer exactly once: the per-miss expert
+    comes from the screened ``safe`` lanes in registers, never from a second
+    ``tl.load`` that a racing writer could feed an unscreened value."""
+    import inspect
+
+    from sglang.srt.layers.moe import expert_pool_device as ep
+
+    src = inspect.getsource(ep._step_kernel)
+    assert "expert = tl.load(ids_ptr + i)" not in src
+    assert "expert = tl.sum(tl.where(lane == i, safe, 0), 0)" in src
+    assert src.count("tl.load(ids_ptr") == 1

@@ -3639,17 +3639,25 @@ class MoEExpertOffloadCache:
         if self._pool_pf_buffers is None:
             return False
         flat = predicted_ids.reshape(-1)
-        if flat.dtype != torch.int32:
-            flat = flat.to(torch.int32)
         width = self._pool_pf_buffers.gather_src.shape[0]
         if flat.numel() > width:
             flat = flat[:width]
+        # The side stream reads the ids from the layer's OWN buffer, filled on
+        # the main stream before the fork. ``predicted_ids`` is a temporary of
+        # the caller's forward (top-k output); under graph capture its block
+        # goes back to the private pool as soon as the caller drops it and a
+        # later allocation on the capture stream may reuse it -- concurrently
+        # with the side-stream step on replay. fn6n (19.09.): three ranks died
+        # with an illegal address on the first replay after two clean warmup
+        # forwards, the signature of exactly that race.
+        ids = self._pool_pf_buffers.ids[: flat.numel()]
+        ids.copy_(flat)
         side = pool_prefetch_stream()
         main = torch.cuda.current_stream()
         self._pool_pf_begin.record(main)
         with torch.cuda.stream(side):
             side.wait_event(self._pool_pf_begin)
-            step(self._pool_tables, flat, self._pool_pf_buffers, prefetch=True)
+            step(self._pool_tables, ids, self._pool_pf_buffers, prefetch=True)
             copy_rows(
                 self._pool_srcs,
                 self._pool_dsts,
