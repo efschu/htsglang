@@ -3927,11 +3927,13 @@ class MoEExpertOffloadCache:
         import logging
 
         from sglang.srt.layers.moe.expert_pool_device import (
+            check_pool_error,
             sync_tables,
             take_prefetch_report,
             take_report,
         )
 
+        check_pool_error(self._pool_tables, f"layer {getattr(self.layer, 'layer_id', '?')} sync")
         forwards, misses = take_report(self._pool_tables)
         predicted, fetched, pf_hits, pf_skipped = take_prefetch_report(self._pool_tables)
         lid = getattr(self.layer, "layer_id", None)

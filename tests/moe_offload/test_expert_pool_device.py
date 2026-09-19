@@ -33,8 +33,9 @@ def test_misses_take_free_rows_first_and_routes_point_at_them():
     assert t.row_key.tolist() == [0, 1, 2, 3, -1, -1, -1]
     pairs, _ = ep.step_reference(t, _ids(0, -1, 3), b)  # a resident hit, padding, an LRU hit
     assert pairs == [] and b.routes[:3].tolist() == [0, -1, 3]
+    # the lane bound is LRU + staging = 5 (Task #40): four lanes pass, six are refused
     with pytest.raises(ValueError):
-        ep.step_reference(t, _ids(2, 3, 4, 5), b)  # more lanes than staging rows
+        ep.step_reference(t, _ids(2, 3, 4, 5, 6, 7), b)  # more lanes than the bound
 
 
 def test_lru_evicts_the_least_recently_used_row_and_residents_never_move():

@@ -107,10 +107,13 @@ def test_the_prefetch_leaves_clock_forwards_misses_and_routes_alone():
 
 def test_the_prefetch_refuses_more_lanes_than_the_plan_allows():
     t, b, pf = _pool(rows=6, staging=2)
+    # rows 6 = 2 residents + 2 LRU + 2 staging: the bound is lru + staging = 4
+    # lanes (Task #40); three lanes are fine now, five are refused
+    ep.step_reference(t, _ids(2, 3, 4), b)
     with pytest.raises(ValueError):
-        ep.step_reference(t, _ids(2, 3, 4), b)  # real step: more lanes than staging
+        ep.step_reference(t, _ids(2, 3, 4, 5, 6), b)  # real step: more lanes than the bound
     with pytest.raises(ValueError):
-        ep.step_reference(t, _ids(2, 3, 4), pf, prefetch=True)  # and the prefetch too
+        ep.step_reference(t, _ids(2, 3, 4, 5, 6), pf, prefetch=True)  # and the prefetch too
 
 
 def test_an_eager_pass_clears_the_prefetch_marks():

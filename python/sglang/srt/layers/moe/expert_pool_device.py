@@ -200,6 +200,18 @@ def sync_tables(tables: PoolTables, lru_holds: Dict[int, int]) -> None:
     tables.pf_row[lo:].fill_(-1)
 
 
+def check_pool_error(tables: PoolTables, where: str = "") -> None:
+    """Raise if a step set the sticky device error: an id outside [0, E) or a
+    miss that found neither an LRU victim nor a staging row -- either means a
+    routed expert did not reach the row it was computed from."""
+    if int(tables.error[0]) != 0:
+        raise RuntimeError(
+            f"MoE expert pool: sticky device error set{(' at ' + where) if where else ''} "
+            "(an id outside [0, E) or a miss with neither an LRU victim nor a "
+            "staging row); the routed output cannot be trusted"
+        )
+
+
 def take_report(tables: PoolTables) -> Tuple[int, int]:
     """(forwards, misses) since the last report; both reset. One host read."""
     f, m = int(tables.forwards[0]), int(tables.misses_total[0])
@@ -251,8 +263,14 @@ def step_reference(
     staging_rows = tables.staging_rows.tolist()
     gate = bool(int(tables.gate[0]))
     raw = [int(v) for v in ids.reshape(-1).tolist()]
-    if len(raw) > buffers.gather_src.shape[0] or len(raw) > len(staging_rows):
-        raise ValueError("Step ids exceed the plan width or the staging rows")
+    if len(raw) > buffers.gather_src.shape[0]:
+        raise ValueError("Step ids exceed the plan width")
+    if len(raw) > (tables.pool_rows - tables.lru_start) + len(staging_rows):
+        # Overflow-impossible bound (Task #40): a miss takes an LRU victim
+        # (rows not used this step) or a staging row; hits protect at most
+        # `len(raw)` LRU rows, so victims + staging >= lru + staging - hits
+        # >= misses whenever len(raw) <= lru + staging.
+        raise ValueError("Step ids exceed the LRU rows plus the staging rows")
     error = bool(int(tables.error[0]))
     selected: List[int] = []
     for v in raw:
@@ -315,6 +333,12 @@ def step_reference(
                 # No evictable row: drop the prediction. The real step will
                 # take this expert as an ordinary miss and stage it.
                 pf_counts[3] += 1
+                continue
+            if len(staged) >= len(staging_rows):
+                # Cannot happen under the bound above (protect_recent=0); with
+                # protect_recent it can, and the sticky error says so instead
+                # of routing the expert to a row it never reached.
+                error = True
                 continue
             staged.append((e, staging_rows[len(staged)]))
             continue
@@ -383,8 +407,11 @@ def step(tables: PoolTables, ids, buffers: StepBuffers, prefetch: bool = False) 
     if not flat.is_contiguous():
         flat = flat.contiguous()
     width = buffers.gather_src.shape[0]
-    if flat.numel() > width or flat.numel() > tables.staging_rows.shape[0]:
-        raise ValueError("Step ids exceed the plan width or the staging rows")
+    n_staging = int(tables.staging_rows.shape[0])
+    if flat.numel() > width:
+        raise ValueError("Step ids exceed the plan width")
+    if flat.numel() > (tables.pool_rows - tables.lru_start) + n_staging:
+        raise ValueError("Step ids exceed the LRU rows plus the staging rows")
     _step_kernel()[(1,)](
         flat, flat.numel(),
         tables.hot_phys, tables.host_row, tables.row_key, tables.row_use,
@@ -395,7 +422,7 @@ def step(tables: PoolTables, ids, buffers: StepBuffers, prefetch: bool = False) 
         buffers.gather_src, buffers.gather_dst, buffers.gather_count,
         buffers.routes, buffers.staged_expert, buffers.staged_row,
         buffers.staged_count, buffers.promoted_count, buffers.step_map,
-        tables.num_experts, tables.pool_rows, tables.lru_start,
+        tables.num_experts, tables.pool_rows, tables.lru_start, n_staging,
         WIDTH=width, BLOCK_R=_next_power_of_two(tables.pool_rows),
         MAP_BLOCK=1024, PREFETCH=bool(prefetch), num_warps=8,
     )
@@ -423,7 +450,7 @@ def _step_kernel():
         pf_row_ptr, pf_counts_ptr,
         gather_src_ptr, gather_dst_ptr, gather_count_ptr, routes_ptr,
         staged_expert_ptr, staged_row_ptr, staged_count_ptr, promoted_count_ptr,
-        step_map_ptr, num_experts, pool_rows, lru_start,
+        step_map_ptr, num_experts, pool_rows, lru_start, n_staging,
         WIDTH: tl.constexpr, BLOCK_R: tl.constexpr, MAP_BLOCK: tl.constexpr,
         PREFETCH: tl.constexpr,
     ):
@@ -539,9 +566,15 @@ def _step_kernel():
                         # no evictable row: drop it, the real step will stage it
                         tl.store(pf_counts_ptr + 3, tl.load(pf_counts_ptr + 3) + 1)
                     else:
-                        tl.store(staged_expert_ptr + staged, expert.to(tl.int32))
-                        tl.store(staged_row_ptr + staged, tl.load(staging_ptr + staged))
-                        staged += 1
+                        if staged < n_staging:
+                            tl.store(staged_expert_ptr + staged, expert.to(tl.int32))
+                            tl.store(staged_row_ptr + staged, tl.load(staging_ptr + staged))
+                            staged += 1
+                        else:
+                            # no victim and no staging row left: never write
+                            # past the staging table; the sticky error is
+                            # read at the next host rendezvous
+                            tl.store(error_ptr, 1)
             tl.debug_barrier()
         tl.store(promoted_count_ptr, promoted)
         if PREFETCH:
@@ -641,4 +674,5 @@ __all__ = [
     "allocate_pool_tables", "allocate_step_buffers", "copy_rows",
     "copy_rows_reference", "step", "step_reference", "sync_tables", "take_report",
     "take_prefetch_report",
+    "check_pool_error",
 ]
