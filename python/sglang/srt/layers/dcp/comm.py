@@ -225,6 +225,83 @@ def cp_local_head_bounds(cp_group: GroupCoordinator, head_counts: list) -> tuple
     return start, start + head_counts[rank]
 
 
+_LSE_MERGE = {"dtype": None, "mode": None}
+
+
+def lse_merge_reduce_dtype() -> str:
+    """SGLANG_DCP_LSE_MERGE_DTYPE: 'fp32' (default) or 'bf16' for the reduction
+    of the scaled attention partials in the uneven LSE merge."""
+    if _LSE_MERGE["dtype"] is None:
+        import os
+
+        v = str(os.environ.get("SGLANG_DCP_LSE_MERGE_DTYPE", "fp32")).strip().lower()
+        _LSE_MERGE["dtype"] = "bf16" if v in ("bf16", "bfloat16", "half") else "fp32"
+    return _LSE_MERGE["dtype"]
+
+
+def lse_merge_mode() -> str:
+    """SGLANG_DCP_LSE_MERGE: 'ar' (default; all-reduce of the full head range,
+    then slice) or 'a2a' (reduce-scatter built from one all_to_all_single of
+    per-rank head blocks plus a local sum -- each rank ships only the heads the
+    others own)."""
+    if _LSE_MERGE["mode"] is None:
+        import os
+
+        v = str(os.environ.get("SGLANG_DCP_LSE_MERGE", "ar")).strip().lower()
+        _LSE_MERGE["mode"] = "a2a" if v in ("a2a", "rs", "reduce_scatter") else "ar"
+    return _LSE_MERGE["mode"]
+
+
+def cp_lse_ag_out_a2a_mha_uneven(
+    cp_attn_out: torch.Tensor,
+    cp_attn_lse: torch.Tensor,
+    cp_group: GroupCoordinator,
+    head_counts: list,
+    return_lse: bool = False,
+):
+    """Uneven-DCP MHA combine as a REDUCE-SCATTER: the same LSE math as
+    ``cp_lse_ag_out_ar_mha_uneven``, but instead of all-reducing the whole
+    [tokens, H_total, D] and slicing, every rank sends rank ``s`` only the
+    scaled partial of ``s``'s heads (one uneven ``all_to_all_single_v`` --
+    bar1 serves unequal blocks natively, no padding) and sums the blocks it
+    receives. Bytes per rank: (W-1)/W x full instead of the ring's
+    2(W-1)/W x full -- half the wire -- and half of that again with
+    SGLANG_DCP_LSE_MERGE_DTYPE=bf16.
+
+    cp_attn_out: [ tokens, H_total, D ]; cp_attn_lse: [ tokens, H_total ].
+    Returns this rank's [ tokens, H_local, D ] in fp32 (and its global lse).
+    """
+    if weightless_kv_active():
+        guard_dcp_step("lse_merge_a2a", cp_group)
+    if cp_group.world_size == 1:
+        return (cp_attn_out, cp_attn_lse) if return_lse else cp_attn_out
+    world = cp_group.world_size
+    counts = [int(c) for c in head_counts]
+    assert len(counts) == world and sum(counts) == cp_attn_out.shape[1]
+    cp_attn_lse = cp_attn_lse.contiguous()
+    lses = _ag_lse(cp_attn_lse, cp_group)
+    global_lse = torch.logsumexp(lses, dim=0)
+    scale = torch.exp(cp_attn_lse - global_lse).unsqueeze(-1)
+    scale = torch.nan_to_num(scale, nan=0.0, posinf=0.0, neginf=0.0)
+    out = torch.nan_to_num(cp_attn_out, nan=0.0, posinf=0.0, neginf=0.0) * scale
+    wire_dtype = cp_attn_out.dtype if lse_merge_reduce_dtype() == "bf16" else torch.float32
+    tokens, _h, dim = out.shape
+    rank = cp_group.rank_in_group
+    mine = counts[rank]
+    # head-major so that axis 0 (the only axis the a2a splits) is the head axis
+    send = out.transpose(0, 1).contiguous().to(wire_dtype)  # [H_total, tokens, D]
+    recv = torch.empty((world * mine, tokens, dim), dtype=wire_dtype, device=out.device)
+    cp_group.all_to_all_single_v(
+        recv, send, output_split_sizes=[mine] * world, input_split_sizes=counts
+    )
+    merged = recv.view(world, mine, tokens, dim).to(torch.float32).sum(dim=0)
+    merged = merged.transpose(0, 1).contiguous()  # [tokens, H_local, D]
+    if return_lse:
+        start, stop = cp_local_head_bounds(cp_group, counts)
+        return merged, global_lse[:, start:stop].contiguous()
+    return merged
+
+
 def cp_lse_ag_out_ar_mha_uneven(
     cp_attn_out: torch.Tensor,
     cp_attn_lse: torch.Tensor,
@@ -253,7 +330,14 @@ def cp_lse_ag_out_ar_mha_uneven(
     scale = torch.nan_to_num(scale, nan=0.0, posinf=0.0, neginf=0.0)
 
     out = torch.nan_to_num(cp_attn_out, nan=0.0, posinf=0.0, neginf=0.0) * scale
-    out = cp_group.all_reduce(out)
+    # fn7g (19.09.): this all-reduce is 12 x 100 MB fp32 per 8k prefill chunk
+    # (0.67 s of 7.66 s) and reduce_scatterv is not served by barlink. With
+    # SGLANG_DCP_LSE_MERGE_DTYPE=bf16 the scaled partials are reduced in the
+    # query dtype (half the bytes); the scale itself stays fp32.
+    if lse_merge_reduce_dtype() == "bf16" and out.dtype == torch.float32:
+        out = cp_group.all_reduce(out.to(cp_attn_out.dtype)).to(torch.float32)
+    else:
+        out = cp_group.all_reduce(out)
 
     start, stop = cp_local_head_bounds(cp_group, head_counts)
     out = out[:, start:stop, :].contiguous()

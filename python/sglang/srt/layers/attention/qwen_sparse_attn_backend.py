@@ -540,7 +540,9 @@ class QwenSparseAttnBackend(AttentionBackend):
             return out
         from sglang.srt.layers.dcp.comm import (
             cp_all_gather_heads_uneven,
+            cp_lse_ag_out_a2a_mha_uneven,
             cp_lse_ag_out_ar_mha_uneven,
+            lse_merge_mode,
         )
         from sglang.srt.runtime_context import get_parallel
 
@@ -561,7 +563,8 @@ class QwenSparseAttnBackend(AttentionBackend):
         # The merge scales in fp32 and hands back fp32 (fn1x 2026-09-16: every
         # rank died in o_proj with 'float != BFloat16'); the layer's output
         # projection expects the query dtype.
-        return cp_lse_ag_out_ar_mha_uneven(out, lse, group, counts).to(q.dtype)
+        merge = cp_lse_ag_out_a2a_mha_uneven if lse_merge_mode() == "a2a" else cp_lse_ag_out_ar_mha_uneven
+        return merge(out, lse, group, counts).to(q.dtype)
 
     @staticmethod
     def _is_speculative_paged_mode(forward_mode) -> bool:
