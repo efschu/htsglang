@@ -1427,15 +1427,22 @@ class Qwen4ExpLayerExtensionMixin:
             rms_norm_eps=config.rms_norm_eps,
             hc_per_branch_norm=True,
         )
+        # Task #46 (19.09.): the mixers may stay INT8 (SGLANG_HC_MIXER_INT8);
+        # the prefix is the checkpoint name, which the CT config lists verbatim.
+        hc_prefix = prefix.replace(".linear_attn", "").replace(".self_attn", "")
         self.attn_hyper_connection = GatedResidual(
             hc_config,
             use_mix=True,
             use_combine=True,
+            quant_config=quant_config,
+            prefix=f"{hc_prefix}.attn_hyper_connection" if hc_prefix else "attn_hyper_connection",
         )
         self.mlp_hyper_connection = GatedResidual(
             hc_config,
             use_mix=True,
             use_combine=True,
+            quant_config=quant_config,
+            prefix=f"{hc_prefix}.mlp_hyper_connection" if hc_prefix else "mlp_hyper_connection",
         )
 
     def _prepare_qwen4_exp_attn(
@@ -1966,6 +1973,18 @@ def load_packed_hc_linear(
     if suffix is None:
         return False
     module_name = name[: -len(suffix)]
+    if module_name + ".weight_packed" in params_dict:
+        # Task #46: the mixer is a quantized ReplicatedLinear -- its own
+        # params take the packed tensors as they are, nothing is widened.
+        param = params_dict.get(name)
+        if param is None:
+            return True  # weight_shape is implied by the module
+        loader = getattr(param, "weight_loader", None)
+        if loader is None:
+            param.data.copy_(loaded_weight.to(param.dtype))
+        else:
+            loader(param, loaded_weight)
+        return True
     if suffix == ".weight_shape":
         return True
     param_name = module_name + ".weight"

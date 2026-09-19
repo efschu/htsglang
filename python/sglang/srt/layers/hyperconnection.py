@@ -8,6 +8,33 @@ import torch.nn.functional as F
 from sglang.srt.layers.hc_mix_triton import fused_hc_mix, fused_hc_mix_supported
 
 
+def hc_mixer_int8_on(quant_config) -> bool:
+    """SGLANG_HC_MIXER_INT8 (Task #46, 19.09.): keep the hyper-connection
+    mixers (input_mix_weight_down/up, INT8 g64 in Minachist's export) as
+    quantized ReplicatedLinear layers instead of widening them to BF16
+    nn.Linear at load -- 1.19 GiB per rank measured ([vram-census] fn7l),
+    about half of it comes back. '1' = every rank, 'tp0' = TP rank 0 only
+    (the 5090, where every freed GiB becomes LRU rows), unset/'0' = off.
+    Needs a quant config whose targets name the mixers verbatim."""
+    import os
+
+    if quant_config is None:
+        return False
+    v = str(os.environ.get("SGLANG_HC_MIXER_INT8", "0")).strip().lower()
+    if v in ("", "0", "off", "false"):
+        return False
+    if v.startswith("tp"):
+        try:
+            from sglang.srt.distributed import get_tensor_model_parallel_rank
+
+            return int(get_tensor_model_parallel_rank()) in {
+                int(x) for x in v[2:].split(",") if x
+            }
+        except Exception:  # noqa: BLE001
+            return False
+    return True
+
+
 class HyperConnectionConfig(msgspec.Struct, frozen=True):
     hc_count: int = 4
     hidden_size: int = 64
@@ -119,8 +146,11 @@ class GatedResidual(HyperConnectionBase):
         use_mix: bool = True,
         use_combine: bool = True,
         role: Optional[str] = None,
+        quant_config=None,
+        prefix: str = "",
     ):
         super().__init__(config, use_mix, use_combine, role)
+        self._mix_quantized = False
 
         norm_dim = (
             self.config.hidden_size * self.hc_count
@@ -134,7 +164,29 @@ class GatedResidual(HyperConnectionBase):
             norm_dim, eps=self.config.rms_norm_eps, group_size=norm_group_size
         )
 
-        if use_mix:
+        if use_mix and hc_mixer_int8_on(quant_config):
+            from sglang.srt.layers.linear import ReplicatedLinear
+
+            self.input_mix_weight_down = ReplicatedLinear(
+                self.hidden_size * self.hc_count,
+                self.config.hc_lowrank,
+                bias=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.input_mix_weight_down" if prefix else "input_mix_weight_down",
+                params_dtype=config.params_dtype,
+            )
+            self.input_mix_weight_up = ReplicatedLinear(
+                self.config.hc_lowrank,
+                self.hc_count * self.hidden_size,
+                bias=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.input_mix_weight_up" if prefix else "input_mix_weight_up",
+                params_dtype=config.params_dtype,
+            )
+            self._mix_quantized = True
+            self._jit_mix_ok = False
+            self._mix_up_weight_padded = None
+        elif use_mix:
             self.input_mix_weight_down = nn.Linear(
                 self.hidden_size * self.hc_count,
                 self.config.hc_lowrank,
@@ -149,6 +201,7 @@ class GatedResidual(HyperConnectionBase):
                 device=torch.cuda.current_device(),
                 dtype=config.params_dtype,
             )
+        if use_mix and not self._mix_quantized:
             lowrank = self.config.hc_lowrank
             self._jit_mix_ok = (
                 torch.cuda.is_available()
@@ -233,6 +286,16 @@ class GatedResidual(HyperConnectionBase):
             hyper_input_normed = self.hc_norm(
                 hyper_input.unflatten(-1, (self.hc_count, self.hidden_size))
             ).flatten(-2)
+        if self._mix_quantized:
+            # Task #46: the quantized mixers answer through their own
+            # (Marlin W8A16) apply; the math is _mix_compute's, unfused.
+            hc, hs = self.hc_count, self.hidden_size
+            down, _ = self.input_mix_weight_down(hyper_input_normed)
+            w = F.silu(down / hc)
+            up, _ = self.input_mix_weight_up(w)
+            w = torch.sigmoid(up).unflatten(-1, (hc, hs))
+            mixed_input = (w * hyper_input_normed.unflatten(-1, (hc, hs))).mean(dim=-2)
+            return mixed_input.to(self.params_dtype), (hyper_input, hyper_input_normed)
         if (
             self._jit_mix_ok
             and hyper_input_normed.is_cuda
