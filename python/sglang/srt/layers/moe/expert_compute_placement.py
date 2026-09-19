@@ -163,6 +163,11 @@ __all__ = [
     "resident_fraction_held_at_base_plan",
     "resolve_moe_compute_placement_flag",
     "solve_link_proportional_expert_vector",
+    "solve_time_equalised_expert_vector",
+    "miss_exponent_from_measurement",
+    "TimePlacement",
+    "COMPUTE_PLACEMENT_TIME",
+    "TIME_MISS_ROWS_ENV",
     "vram_neutral_resident_fraction",
 ]
 
@@ -181,10 +186,29 @@ COMPUTE_PLACEMENT_LINK = "link"
 #: the operator's back.
 COMPUTE_PLACEMENT_LINK_CALIBRATED = "link-calibrated"
 
+#: TIME-equalised placement for the device-LRU expert pool (Task #48, 19.09.).
+#: ``link`` holds the resident FRACTION of the base plan fixed and lets the cold
+#: mass follow the links -- the first-order model in which every non-resident
+#: expert is fetched on every activation. The pool route does not behave like
+#: that: each rank holds a fixed number of HOT ROWS per layer (resident slots
+#: plus LRU rows, both sized by VRAM, not by the shard), and the miss count is
+#: strongly non-linear in the shard width (fn7p, base plan 312/104/96 with
+#: 138/67/71 hot rows: 2988 / 461 / 180 miss rows, i.e. 9.6 : 4.4 : 1.9
+#: misses per owned expert). ``time`` keeps the hot rows where they are and
+#: solves the shard widths so that every rank's streaming time
+#: ``misses_r * row_bytes / link_r`` is the same -- the split by time instead
+#: of by VRAM.
+COMPUTE_PLACEMENT_TIME = "time"
+
+#: Measured miss rows per rank at the base plan (comma vector), used to
+#: calibrate the miss exponent of ``time``. Unset -> first-order exponent 1.
+TIME_MISS_ROWS_ENV = "SGLANG_MOE_TIME_MISS_ROWS"
+
 #: Every symbolic value the flag accepts, for the parser and the validators.
 COMPUTE_PLACEMENT_SYMBOLS = (
     COMPUTE_PLACEMENT_LINK,
     COMPUTE_PLACEMENT_LINK_CALIBRATED,
+    COMPUTE_PLACEMENT_TIME,
 )
 
 #: How a worker learns WHICH policy produced the explicit vector it was handed.
@@ -557,6 +581,210 @@ def solve_link_proportional_expert_vector(
     )
 
 
+@dataclass(frozen=True)
+class TimePlacement:
+    """The time-equalised vector plus the model it was solved under."""
+
+    weights: Tuple[int, ...]
+    hot_rows: Tuple[int, ...]
+    link_shares: Tuple[float, ...]
+    miss_exponent: float
+    #: modelled miss rows per rank at the solved vector, in units where the
+    #: sum over ranks of ``owned`` is ``num_experts`` (relative, not absolute)
+    predicted_misses: Tuple[float, ...]
+    #: the same at the base plan the solve started from
+    base_weights: Tuple[int, ...] = ()
+    base_misses: Tuple[float, ...] = ()
+    link_source: str = "?"
+    link_provenance: str = "?"
+
+    def predicted_time_shares(self) -> Tuple[float, ...]:
+        times = [
+            (m / l if l > 0 else float("inf"))
+            for m, l in zip(self.predicted_misses, self.link_shares)
+        ]
+        total = sum(times)
+        if not total or total == float("inf"):
+            return tuple(0.0 for _ in times)
+        return tuple(t / total for t in times)
+
+    def base_time_shares(self) -> Tuple[float, ...]:
+        times = [
+            (m / l if l > 0 else float("inf"))
+            for m, l in zip(self.base_misses, self.link_shares)
+        ]
+        total = sum(times)
+        if not total or total == float("inf"):
+            return tuple(0.0 for _ in times)
+        return tuple(t / total for t in times)
+
+    def clock_speedup(self) -> float:
+        """Base plan's slowest streaming time over the solved plan's slowest
+        (same units on both sides); > 1 means the round's transfer clock got
+        shorter."""
+        if not self.base_misses:
+            return 1.0
+        base = max(m / l for m, l in zip(self.base_misses, self.link_shares) if l > 0)
+        new = max(m / l for m, l in zip(self.predicted_misses, self.link_shares) if l > 0)
+        return base / new if new > 0 else float("inf")
+
+    def describe(self) -> str:
+        vec = ",".join(str(w) for w in self.weights)
+        base = ",".join(str(w) for w in self.base_weights) if self.base_weights else "?"
+        hot = ",".join(str(h) for h in self.hot_rows)
+        shares = ", ".join(f"rank{i}={t:.4f}" for i, t in enumerate(self.predicted_time_shares()))
+        return (
+            f"--rank-moe-ratio {vec} [time-equalised from base {base}; hot rows "
+            f"{hot} held fixed; miss exponent {self.miss_exponent:.2f}; link "
+            f"source={self.link_source} provenance={self.link_provenance}; "
+            f"predicted streaming-time shares {shares}; clock speedup "
+            f"{self.clock_speedup():.2f}x]"
+        )
+
+
+def _modelled_misses(owned: float, hot: float, gamma: float) -> float:
+    """Miss rows per unit of routed traffic for a rank owning ``owned`` experts
+    with ``hot`` of them held on the device: activations are proportional to
+    ``owned`` (uniform routing across the group), and the miss rate of the
+    recency pool is ``(1 - hot/owned) ** gamma`` -- gamma 1 is the first-order
+    "cold experts are always fetched", gamma > 1 is what a skewed routing
+    distribution under an LRU measures (fn7p: ~2.3)."""
+    if owned <= 0:
+        return 0.0
+    cold = max(0.0, 1.0 - float(hot) / float(owned))
+    return float(owned) * (cold ** gamma)
+
+
+def miss_exponent_from_measurement(
+    base_owned: Sequence[int],
+    hot_rows: Sequence[int],
+    miss_rows: Sequence[float],
+) -> float:
+    """Fit gamma in ``misses_r / owned_r = c * (1 - hot_r/owned_r) ** gamma``
+    by least squares in log space (one intercept, one slope). Ranks whose hot
+    rows cover the whole shard, or that recorded no misses, carry no
+    information and are skipped; fewer than two usable ranks -> 1.0."""
+    xs: List[float] = []
+    ys: List[float] = []
+    for o, h, m in zip(base_owned, hot_rows, miss_rows):
+        o = float(o)
+        if o <= 0 or m <= 0:
+            continue
+        cold = 1.0 - float(h) / o
+        if cold <= 0:
+            continue
+        xs.append(math.log(cold))
+        ys.append(math.log(float(m) / o))
+    if len(xs) < 2:
+        return 1.0
+    n = len(xs)
+    mx = sum(xs) / n
+    my = sum(ys) / n
+    sxx = sum((x - mx) ** 2 for x in xs)
+    if sxx <= 0:
+        return 1.0
+    sxy = sum((x - mx) * (y - my) for x, y in zip(xs, ys))
+    gamma = sxy / sxx
+    if not (gamma > 0) or gamma != gamma:
+        return 1.0
+    return float(gamma)
+
+
+def solve_time_equalised_expert_vector(
+    num_experts: int,
+    hot_rows: Sequence[int],
+    link_weights: Sequence[float],
+    miss_exponent: float = 1.0,
+    base_weights: Optional[Sequence[int]] = None,
+    link_source: str = "?",
+    link_provenance: str = "?",
+) -> TimePlacement:
+    """Shard widths (expert counts per rank, summing to ``num_experts``) that
+    equalise ``misses_r / link_r`` across the group with the hot rows held
+    fixed. Pure: no environment, no torch.
+
+    ``misses_r(o) = o * (1 - hot_r/o) ** gamma`` is monotone in ``o``, so the
+    common streaming time ``T`` is found by bisection: for a trial ``T`` every
+    rank's width is the largest ``o`` with ``misses_r(o)/link_r <= T``; the
+    widths sum to more than ``num_experts`` for a ``T`` that is too large and
+    to less for one too small. The real-valued widths are then rounded to
+    integers by largest remainder, which keeps the sum exact.
+    """
+    n = len(hot_rows)
+    if n == 0:
+        raise ValueError("hot_rows is empty; there is no group to place")
+    if len(link_weights) != n:
+        raise ValueError(
+            f"vector lengths disagree: hot_rows has {n} entries, link_weights "
+            f"{len(link_weights)}; both index the same TP group"
+        )
+    E = int(num_experts)
+    if E < n:
+        raise ValueError(f"num_experts {E} is smaller than the group size {n}")
+    gamma = float(miss_exponent)
+    if not (gamma > 0) or gamma != gamma or gamma == float("inf"):
+        raise ValueError(f"miss exponent {miss_exponent!r} must be a finite positive number")
+    hot = [max(0, int(h)) for h in hot_rows]
+    link = _normalize(link_weights, "link weights")
+    if sum(hot) >= E:
+        raise NoComputeLever(
+            f"the hot rows {hot} already cover all {E} experts; every shard is "
+            "fully resident and there is no streaming time to equalise"
+        )
+
+    def width_for(T: float, r: int) -> float:
+        lo, hi = float(hot[r]), float(E)
+        if _modelled_misses(hi, hot[r], gamma) / link[r] <= T:
+            return hi
+        for _ in range(60):
+            mid = 0.5 * (lo + hi)
+            if _modelled_misses(mid, hot[r], gamma) / link[r] <= T:
+                lo = mid
+            else:
+                hi = mid
+        return lo
+
+    t_lo, t_hi = 0.0, max(_modelled_misses(E, h, gamma) / l for h, l in zip(hot, link))
+    for _ in range(80):
+        t_mid = 0.5 * (t_lo + t_hi)
+        total = sum(width_for(t_mid, r) for r in range(n))
+        if total >= E:
+            t_hi = t_mid
+        else:
+            t_lo = t_mid
+    widths = [width_for(t_hi, r) for r in range(n)]
+    shares = [w / sum(widths) for w in widths]
+    ints = list(_largest_remainder(shares, E))
+    # a rank must own at least one expert, and no rank may own fewer experts
+    # than it has hot rows -- moving experts away from a rank below its hot
+    # capacity buys nothing and wastes the rows
+    for r in range(n):
+        floor_r = max(1, min(hot[r], E - (n - 1)))
+        if ints[r] < floor_r:
+            deficit = floor_r - ints[r]
+            ints[r] = floor_r
+            donor = max(range(n), key=lambda i: ints[i] - hot[i])
+            ints[donor] -= deficit
+    if sum(ints) != E or any(i <= 0 for i in ints):
+        raise NoComputeLever(f"time solve produced an unusable vector {ints} for {E} experts")
+    predicted = tuple(_modelled_misses(o, h, gamma) for o, h in zip(ints, hot))
+    base = tuple(int(b) for b in base_weights) if base_weights else ()
+    base_m = (
+        tuple(_modelled_misses(o, h, gamma) for o, h in zip(base, hot)) if base else ()
+    )
+    return TimePlacement(
+        weights=tuple(ints),
+        hot_rows=tuple(hot),
+        link_shares=tuple(link),
+        miss_exponent=gamma,
+        predicted_misses=predicted,
+        base_weights=base,
+        base_misses=base_m,
+        link_source=link_source,
+        link_provenance=link_provenance,
+    )
+
+
 def compute_policy_label() -> str:
     """What produced the installed vector, for the #390 dump. Never raises."""
     return os.environ.get(COMPUTE_POLICY_ENV, "").strip() or "base-plan"
@@ -833,6 +1061,10 @@ def _traffic_coefficients_for_symbol(
     told which flag spends it, and an operator who left one exported from the
     previous arm does not silently run the falsified solve.
     """
+    if symbol == COMPUTE_PLACEMENT_TIME:
+        # the time solve has its own calibration (TIME_MISS_ROWS_ENV) and
+        # never reads the cold-traffic coefficients
+        return None
     env_coefficients = _traffic_coefficients_from_env(world)
     if symbol == COMPUTE_PLACEMENT_LINK:
         if env_coefficients is not None:
@@ -876,6 +1108,82 @@ def _traffic_coefficients_for_symbol(
         COMPUTE_PLACEMENT_LINK,
     )
     return env_coefficients
+
+
+def _hot_rows_per_rank(server_args, world: int, base_plan, fractions, num_experts: int):
+    """This boot's HOT ROWS per layer and rank: the resident slots the fraction
+    buys on the base-plan shard plus the pool's LRU rows (scratch slots minus
+    staging). Both are VRAM-sized and stay where they are under ``time``."""
+    from sglang.srt.distributed.utils import partition_units
+    from sglang.srt.layers.moe.expert_offload import (
+        resident_slot_count,
+        scratch_slots_from_env,
+    )
+
+    owned = [int(v) for v in partition_units(int(num_experts), list(base_plan))]
+    staging = int(os.environ.get("SGLANG_MOE_POOL_STAGING", "12") or 12)
+    scratch_env = os.environ.get("SGLANG_MOE_SCRATCH_SLOTS", "")
+    hot: List[int] = []
+    for r in range(world):
+        resident = resident_slot_count(owned[r], float(fractions[r]))
+        scratch = scratch_slots_from_env(scratch_env, (r, world))
+        if scratch is None:
+            scratch = max(8, resident // 4)
+        hot.append(resident + max(0, int(scratch) - staging))
+    return owned, hot
+
+
+def _resolve_time_placement(server_args, world: int, base_plan, fractions, ratio):
+    num_experts = int(
+        getattr(server_args.get_model_config().hf_text_config, "num_experts", 0) or 0
+    )
+    if num_experts <= 0:
+        raise NoComputeLever(
+            f"--rank-moe-ratio {COMPUTE_PLACEMENT_TIME} needs the model's expert "
+            "count (hf_text_config.num_experts) and found none"
+        )
+    owned, hot = _hot_rows_per_rank(server_args, world, base_plan, fractions, num_experts)
+    gamma = 1.0
+    miss_text = os.environ.get(TIME_MISS_ROWS_ENV, "").strip()
+    if miss_text:
+        try:
+            misses = [float(v) for v in miss_text.split(",")]
+        except ValueError as exc:
+            raise NoComputeLever(f"{TIME_MISS_ROWS_ENV}={miss_text!r} is not a comma vector") from exc
+        if len(misses) != world:
+            raise NoComputeLever(
+                f"{TIME_MISS_ROWS_ENV} has {len(misses)} entries but the TP group has {world}"
+            )
+        gamma = miss_exponent_from_measurement(owned, hot, misses)
+    placement = solve_time_equalised_expert_vector(
+        num_experts,
+        hot,
+        ratio.weights,
+        miss_exponent=gamma,
+        base_weights=owned,
+        link_source=ratio.source,
+        link_provenance=ratio.provenance,
+    )
+    server_args.override(
+        "moe compute placement (time-equalised, Task #48)",
+        rank_moe_ratio=list(placement.weights),
+    )
+    os.environ[COMPUTE_POLICY_ENV] = "time-equalised"
+    # the runtime holds each rank's resident rows at the base plan through
+    # resident_fraction_held_at_base_plan, exactly as under ``link``
+    os.environ[COMPUTE_BASE_PLAN_ENV] = ",".join(str(int(b)) for b in base_plan)
+    logger.info(
+        "--rank-moe-ratio %s -> %s. Base plan experts %s -> %s; modelled miss rows "
+        "base %s -> solved %s (relative units); base streaming-time shares %s.",
+        COMPUTE_PLACEMENT_TIME,
+        placement.describe(),
+        owned,
+        list(placement.weights),
+        [round(m, 1) for m in placement.base_misses],
+        [round(m, 1) for m in placement.predicted_misses],
+        [round(t, 4) for t in placement.base_time_shares()],
+    )
+    return placement
 
 
 def resolve_moe_compute_placement_flag(server_args) -> Optional[ComputePlacement]:
@@ -988,6 +1296,8 @@ def resolve_moe_compute_placement_flag(server_args) -> Optional[ComputePlacement
         )
 
     fractions = _resident_fraction_vector(server_args, world)
+    if symbol == COMPUTE_PLACEMENT_TIME:
+        return _resolve_time_placement(server_args, world, base_plan, fractions, ratio)
     placement = solve_link_proportional_expert_vector(
         base_plan,
         fractions,

@@ -499,9 +499,11 @@ _COMPUTE_PLACEMENT_LINK = "link"
 #: SGLANG_MOE_COLD_TRAFFIC_COEFFICIENTS silently produced the calibrated solve,
 #: and that solve is the one the window falsified.
 _COMPUTE_PLACEMENT_LINK_CALIBRATED = "link-calibrated"
+_COMPUTE_PLACEMENT_TIME = "time"
 _COMPUTE_PLACEMENT_SYMBOLS = (
     _COMPUTE_PLACEMENT_LINK,
     _COMPUTE_PLACEMENT_LINK_CALIBRATED,
+    _COMPUTE_PLACEMENT_TIME,
 )
 
 
