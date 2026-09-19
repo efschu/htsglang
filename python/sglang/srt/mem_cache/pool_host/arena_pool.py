@@ -395,11 +395,16 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
                 return  # every layer came with the page load at layer 0
             if layer_id == 0:
                 slots = rows
+                _tm0 = time.perf_counter()
                 if self.row_slot is not None:
                     rl = rows.tolist()
                     slots = torch.tensor([self.row_slot.get(int(r), -1) for r in rl], dtype=rows.dtype, device=rows.device)
+                self._last_load_map_ms = (time.perf_counter() - _tm0) * 1000.0
                 if slots.numel() and bool((slots >= 0).all()):
-                    self.pin_slots(slots)
+                    _tp0 = time.perf_counter()
+                    _newly = self.pin_slots(slots)
+                    self._last_load_pin_ms = (time.perf_counter() - _tp0) * 1000.0
+                    self._last_load_pinned_n = int(_newly or 0)
                     self._arena_load_guard(device_pool, slots, device_indices, 0, nrows=int(rows.numel()), nmiss=0)
                     self._load_pages_all_layers(device_pool, slots, device_indices)
                     self._page_loaded_key = key
@@ -470,9 +475,16 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
         _timing = _arena_page_load_timing()
         _t0 = time.perf_counter() if _timing else 0.0
         _gather_ms = 0.0
+        # 19.09. (Task #3, xsn394): under the timing env every block records
+        # three events (before gather, after gather, after the per-layer
+        # scatter) so the device time splits into GATHER (host->stage over
+        # PCIe) and SCATTER (stage->pools), next to the CPU launch time.
+        _ev = [] if (_timing and dev.type == "cuda") else None
         for bi, start in enumerate(range(0, n, B)):
             b = min(B, n - start)
             k = bi % 2
+            if _ev is not None:
+                _e0 = torch.cuda.Event(enable_timing=True); _e0.record()
             if mode == "kernel":
                 try:
                     from sglang.jit_kernel.hicache import transfer_hicache_one_layer_mla
@@ -494,6 +506,8 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
                 _gather_ms += (time.perf_counter() - _g0) * 1000.0
                 dev_stage[:b].copy_(host_stage[:b], non_blocking=True)
                 self._page_events[k].record()
+            if _ev is not None:
+                _e1 = torch.cuda.Event(enable_timing=True); _e1.record()
             dst = _dst_all[start:start + b] if _async_idx else device_indices[start:start + b].to(device=dev, dtype=torch.int64)
             for l in range(L):
                 ko, vo = self._k_offs_b[l], self._v_offs_b[l]
@@ -501,6 +515,10 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
                     0, dst, dev_stage[:b, ko:ko + cell].reshape(-1).view(self.dtype).view(b, H, D))
                 device_pool.v_buffer[l].index_copy_(
                     0, dst, dev_stage[:b, vo:vo + cell].reshape(-1).view(self.dtype).view(b, H, D))
+            if _ev is not None:
+                _e2 = torch.cuda.Event(enable_timing=True); _e2.record()
+                _ev.append((_e0, _e1, _e2))
+        _cpu_ms = (time.perf_counter() - _t0) * 1000.0 if _timing else 0.0
         global _PAGE_LOAD_N
         _PAGE_LOAD_N += 1
         n_log = _PAGE_LOAD_N
@@ -508,7 +526,13 @@ class ArenaMHAHostPool(MHATokenToKVPoolHost):
         if _timing and dev.type == "cuda":
             torch.cuda.current_stream(dev).synchronize()
             _ms = (time.perf_counter() - _t0) * 1000.0
-            _wall = f" wall_ms={_ms:.0f} GB/s={(n * pb) / max(_ms, 1e-3) / 1e6:.2f} gather_ms={_gather_ms:.0f}"
+            _gd = sum(e0.elapsed_time(e1) for e0, e1, _e2 in _ev) if _ev else 0.0
+            _sd = sum(e1.elapsed_time(e2) for _e0, e1, e2 in _ev) if _ev else 0.0
+            _wall = (f" wall_ms={_ms:.0f} GB/s={(n * pb) / max(_ms, 1e-3) / 1e6:.2f} cpu_launch_ms={_cpu_ms:.0f}"
+                     f" dev_gather_ms={_gd:.0f} dev_scatter_ms={_sd:.0f}"
+                     f" gather_GB/s={(n * pb) / max(_gd, 1e-3) / 1e6:.2f} cpu_gather_ms={_gather_ms:.0f}"
+                     f" map_ms={getattr(self, '_last_load_map_ms', 0.0):.0f} pin_ms={getattr(self, '_last_load_pin_ms', 0.0):.0f}"
+                     f" pinned_new={getattr(self, '_last_load_pinned_n', 0)}")
         if n_log <= 8 or n_log % 64 == 0 or _timing:
             logger.info("WEG2-ARENA-PAGE-LOAD n=%d rows=%d pages=%d block=%d bytes=%d mode=%s%s (whole pages, layers split on device)",
                         n_log, n, n, B, n * pb, mode, _wall)
