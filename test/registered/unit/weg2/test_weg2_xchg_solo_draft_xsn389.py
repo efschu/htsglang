@@ -100,3 +100,62 @@ def test_a_zero_width_is_no_block_not_a_zero_size_block():
     assert [len(b) for b in blocks] == [1, 0, 0] and blocks[0][0].size == 1600
     src = wx._blocks_of(geom, layout, is_dst=False)
     assert [len(b) for b in src] == [1, 0, 0]
+
+
+# ---------------------------------------------------------------------------
+# xsn390: the draft REGION's own leg -- the shadows have no piece of it
+# ---------------------------------------------------------------------------
+DTAG = wx.GPU_MEMORY_TYPE_WEIGHTS_DRAFT
+
+
+def _region_manifests():
+    """P: stages 0..2 hold the main weights (whole, one per stage); the LAST
+    stage also holds the draft whole. D: every rank a main cut; only rank 0
+    (the solo host) holds the draft, whole."""
+    out = []
+    for r in range(3):
+        pieces = [_piece(f"model.layers.{r}.mlp.down_proj.weight", 2048, 1200)]
+        if r == 2:
+            pieces.append(_piece(DRAFT, 1600, 20480, tag=DTAG))
+        out.append(xm.RankManifest(group="P", rank=r, card=r, region_tag=TAG, boot_token="b1",
+                                   tp_rank=0, pp_rank=r, pieces=tuple(pieces)))
+    for r in range(3):
+        pieces = [_piece(f"model.layers.{i}.mlp.down_proj.weight", 2048, 400) for i in range(3)]
+        if r == 0:
+            pieces.append(_piece(DRAFT, 1600, 20480, tag=DTAG))
+        out.append(xm.RankManifest(group="D", rank=r, card=r, region_tag=TAG, boot_token="b1",
+                                   tp_rank=r, pp_rank=0, pieces=tuple(pieces)))
+    return out
+
+
+@pytest.mark.parametrize("hook,group,rank_side", [("source", "D", "src_rank"),
+                                                   ("wake", "D", "dst_rank")])
+def test_the_draft_regions_leg_plans_the_solo_host_with_the_shadows_as_empty_rows(hook, group, rank_side):
+    lines = []
+    plan, why = xm.leg_plan_from_join(hook=hook, group=group, rank=0,
+                                      manifests=_region_manifests(),
+                                      region_tag=DTAG, log=lines.append)
+    assert plan is not None, why
+    descs = [d for d in plan.descs if d.param_name == DRAFT]
+    assert descs and {int(getattr(d, rank_side)) for d in descs} == {0}
+    assert sum(int(d.nbytes) for d in descs) == 1600 * 20480
+    assert any("tp_ranks_without_pieces=[1, 2]" in l for l in lines)
+
+
+def test_a_shadow_gets_no_draft_leg_and_is_told_so_not_a_crash():
+    plan, why = xm.leg_plan_from_join(hook="source", group="D", rank=1,
+                                      manifests=_region_manifests(),
+                                      region_tag=DTAG, log=lambda *_: None)
+    assert plan is None and "no-descriptors-for-rank" in why
+
+
+def test_a_region_nobody_in_tp_holds_is_still_refused():
+    mans = [m for m in _region_manifests()]
+    # strip the draft from D rank 0 too: the region has no TP holder at all
+    d0 = mans[3]
+    mans[3] = xm.RankManifest(group="D", rank=0, card=0, region_tag=TAG, boot_token="b1",
+                              tp_rank=0, pp_rank=0,
+                              pieces=tuple(p for p in d0.pieces if p.tag != DTAG))
+    plan, why = xm.leg_plan_from_join(hook="source", group="D", rank=0, manifests=mans,
+                                      region_tag=DTAG, log=lambda *_: None)
+    assert plan is None and why

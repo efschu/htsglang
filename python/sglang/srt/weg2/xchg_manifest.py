@@ -1500,7 +1500,22 @@ def leg_plan_from_join(
             region_tag=man.region_tag, boot_token=man.boot_token,
             tp_rank=man.tp_rank, pp_rank=man.pp_rank,
             pieces=tuple(keep_p)))
-    manifests = [m for m in narrowed if m.pieces]
+    # 19.09. (xsn390): a rank of the TP group with NOTHING of this region
+    # keeps its (empty) row as long as a sibling rank has pieces -- the
+    # solo draft host of --speculative-draft-placement solo holds the whole
+    # draft region, the shadows hold none of it. Dropping the empty rows
+    # planned group D at tp_size=1 ("the PP form on BOTH sides", W68) and
+    # skipped the draft leg; kept, the join reads the tensor as held whole
+    # by rank 0 (ROWS (whole, 0, 0)) and the plan moves it there only.
+    _tp_has = any(m.pieces for m in narrowed if m.group == tp_group)
+    manifests = [m for m in narrowed
+                 if m.pieces or (m.group == tp_group and _tp_has)]
+    _empty_tp = sorted(m.rank for m in manifests
+                       if m.group == tp_group and not m.pieces)
+    if _empty_tp and log is not None:
+        log(f"WEG2-XCHG-PLAN region={my_region} tp_ranks_without_pieces="
+            f"{_empty_tp} kept as empty rows -- the region is held by the "
+            f"other {tp_group} rank(s) only (solo draft host)")
     if not manifests:
         return None, refusal(
             "no-tensors-in-region",

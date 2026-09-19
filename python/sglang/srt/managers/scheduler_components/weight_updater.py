@@ -1963,6 +1963,14 @@ class SchedulerWeightUpdaterManager:
         if str(tag) == GPU_MEMORY_TYPE_WEIGHTS_DRAFT:
             if self.draft_worker is None:
                 return None
+            _drafter = _weg2_drafter_of(self)
+            if getattr(_drafter, "is_draft_solo_shadow", False):
+                # 19.09. (xsn390): a solo-draft SHADOW holds no draft bytes
+                # by construction (a meta draft, the saver has no allocation
+                # under this tag), so an empty plan for it is the whole
+                # truth, not a gap -- the host restores its own draft
+                # through the exchange's draft leg.
+                return None
             if cdescs_present:
                 return None  # the real join covers this tag on this leg
             # NUTZER-ORDER 2026-09-14 (A2, xsn32, W4 Weg2WakeRefused at
