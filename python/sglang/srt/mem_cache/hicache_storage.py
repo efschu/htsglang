@@ -2993,10 +2993,31 @@ class HiCacheFile(HiCacheStorage):
                 _l3bulk[name] = present
                 return present
 
+            _rbulk: dict = {}
+            def _bulk_readable(name: str, states, l3):
+                """xsn381 (py-spy PP0, prefetch thread 320/1066 samples): every
+                page the arena did not hold COMPLETE but the L3 index listed
+                still went through _readable_stems([k]) one page at a time
+                (an arena lookup, a width derivation, a stat -- per page).
+                ONE batched call per pool for all such pages; the answer is a
+                set the per-page rule reads."""
+                if name in _rbulk:
+                    return _rbulk[name]
+                try:
+                    idx = [i for i in range(kv_pages)
+                           if not (states is not None and i < len(states) and states[i] == 2)
+                           and not (l3 is not None and i < len(l3) and not l3[i])]
+                    stems = [self._get_component_key(keys[i], name) for i in idx]
+                    present = set(self._readable_stems(stems)) if stems else set()
+                except Exception:  # noqa: BLE001 - fall back to the per-page path
+                    present = None
+                _rbulk[name] = present
+                return present
             def has_component(page_idx: int, name: str) -> bool:
                 states = _bulk_states(name)
                 if states is not None and page_idx < len(states) and states[page_idx] == 2:
                     return True
+                l3 = None
                 if states is not None and page_idx < len(states):
                     l3 = _bulk_l3(name)
                     if l3 is not None and page_idx < len(l3) and not l3[page_idx]:
@@ -3004,7 +3025,8 @@ class HiCacheFile(HiCacheStorage):
                 k = self._get_component_key(keys[page_idx], name)
                 v = _memo.get(k)
                 if v is None:
-                    v = bool(self._readable_stems([k]))
+                    rb = _bulk_readable(name, states, l3)
+                    v = (k in rb) if rb is not None else bool(self._readable_stems([k]))
                     _memo[k] = v
                 return v
         else:
