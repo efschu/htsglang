@@ -2515,6 +2515,41 @@ def _h2d_i64(arr, device):
     return host.to(device, non_blocking=True)
 
 
+_WAVE_T = {"on": None, "ev": [], "fetch_ms": 0.0, "apply_ms": 0.0, "layers": 0, "spill": 0,
+           "tokens": 0, "forwards0": 0}
+
+
+def _wave_timing_on() -> bool:
+    if _WAVE_T["on"] is None:
+        import os
+        _WAVE_T["on"] = str(os.environ.get("SGLANG_MOE_OFFLOAD_TIMING", "0")).strip() not in ("", "0")
+    return bool(_WAVE_T["on"])
+
+
+def _wave_timing_note(layer_id, e0, e1, e2, n_spill, n_tokens):
+    """Collect one layer's (fetch, apply) event pair; every 16 forwards of
+    layer 0 synchronize ONCE, sum the elapsed times and log the split."""
+    import logging
+    import torch
+    t = _WAVE_T
+    t["ev"].append((e0, e1, e2))
+    t["spill"] += int(n_spill)
+    if layer_id in (0, None):
+        t["forwards0"] += 1
+        t["tokens"] += int(n_tokens)
+    if layer_id in (0, None) and t["forwards0"] % 16 == 0:
+        torch.cuda.synchronize()
+        f = sum(a.elapsed_time(b) for a, b, _c in t["ev"])
+        g = sum(b.elapsed_time(c) for _a, b, c in t["ev"])
+        n = len(t["ev"])
+        logging.getLogger(__name__).info(
+            "MOE-OFFLOAD-TIMING forwards=%d layers=%d tokens=%d fetch_ms=%.1f apply_ms=%.1f "
+            "per_forward: fetch_ms=%.2f apply_ms=%.2f spill_experts=%.1f (CUDA events: fetch = "
+            "host->scratch incl. the join, apply = the grouped GEMM over the wave)",
+            t["forwards0"], n, t["tokens"], f, g, f / 16.0, g / 16.0, t["spill"] / 16.0)
+        t["ev"].clear(); t["spill"] = 0; t["tokens"] = 0
+
+
 def _fetch_mode() -> str:
     """SGLANG_MOE_OFFLOAD_FETCH: 'gather' (default, Task #33) or 'memcpy'."""
     import os
@@ -3714,7 +3749,13 @@ class MoEExpertOffloadCache:
             )
         else:
             slot_of_needed, fetch_plan = self.planner.resolve(needed)
+        _tm = _wave_timing_on() and topk_ids.is_cuda
+        if _tm:
+            import torch
+            _e0 = torch.cuda.Event(enable_timing=True); _e0.record()
         self._fetch(fetch_plan)
+        if _tm:
+            _e1 = torch.cuda.Event(enable_timing=True); _e1.record()
         if prefetch is not None:
             prefetch()
         lut = self._build_lut(slot_of_needed, topk_ids.dtype, topk_ids.device)
@@ -3722,7 +3763,12 @@ class MoEExpertOffloadCache:
         sub = dispatch_output._replace(
             topk_output=topk_output._replace(topk_ids=remapped)
         )
-        return apply_fn(sub)
+        out = apply_fn(sub)
+        if _tm:
+            _e2 = torch.cuda.Event(enable_timing=True); _e2.record()
+            _wave_timing_note(getattr(self.layer, "layer_id", None), _e0, _e1, _e2,
+                              len(fetch_plan), int(topk_ids.shape[0]))
+        return out
 
     def _run_waves_expert_major(
         self, dispatch_output, apply_fn, ids_list, resident_used, spill_waves
