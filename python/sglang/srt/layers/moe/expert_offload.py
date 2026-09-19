@@ -2811,6 +2811,23 @@ def _wave_timing_note(layer_id, e0, e1, e2, n_spill, n_tokens):
 
 _WAVE_TP = {"ev": [], "layers": 0, "waves": 0, "spill": 0, "tokens": 0, "forwards": 0}
 _WAVE_SLICE = {"pairs": None}
+_PARTIALS_MODE = {"mode": None}
+
+
+def partials_mode() -> str:
+    """SGLANG_MOE_OFFLOAD_PARTIALS: 'table' (default) keeps the [T*K, H]
+    partials table and combines once at the end (byte-identical to the
+    token-major path); 'stream' accumulates every slice straight into a
+    [T, H] fp32 output (index_add_), which drops the T*K*H table -- 1.7 GB at
+    a 32768-token chunk with top-k 10 -- at the price of fp32 summation order
+    instead of the combine kernel's. Prefill chunks beyond 16k need it on TP0
+    (fn6v 19.09.: OOM before the first wave)."""
+    if _PARTIALS_MODE["mode"] is None:
+        import os
+
+        v = str(os.environ.get("SGLANG_MOE_OFFLOAD_PARTIALS", "table")).strip().lower()
+        _PARTIALS_MODE["mode"] = "stream" if v == "stream" else "table"
+    return _PARTIALS_MODE["mode"]
 
 
 def wave_token_slice_pairs() -> int:
@@ -4388,6 +4405,8 @@ class MoEExpertOffloadCache:
         _tm = _wave_timing_on()
         _tm_ev = []
         slice_pairs = wave_token_slice_pairs()
+        stream_partials = partials_mode() == "stream"
+        out_acc = None  # [T, H] fp32 when streaming
         try:
             cfg.routed_scaling_factor = 1.0
             for w, needed in enumerate([resident_used] + spill_waves):
@@ -4439,6 +4458,13 @@ class MoEExpertOffloadCache:
                     )
                     combine_out = apply_fn(sub)
                     part = combine_out.hidden_states
+                    if stream_partials:
+                        if out_acc is None:
+                            out_acc = torch.zeros(
+                                (T, part.shape[-1]), dtype=torch.float32, device=device
+                            )
+                        out_acc.index_add_(0, rows, part.to(torch.float32))
+                        continue
                     if partials is None:
                         partials = torch.zeros(
                             (T * K, part.shape[-1]), dtype=part.dtype, device=device
@@ -4450,10 +4476,15 @@ class MoEExpertOffloadCache:
         finally:
             cfg.routed_scaling_factor = saved_rsf
 
-        out_full = torch.empty(
-            (T, partials.shape[-1]), dtype=partials.dtype, device=device
-        )
-        combine_topk_partials(partials.view(T, K, -1), out_full, saved_rsf)
+        if stream_partials:
+            # the combine kernel's job (sum over K, times the routed scaling
+            # factor) was done incrementally; only the scale and dtype remain
+            out_full = (out_acc * saved_rsf).to(combine_out.hidden_states.dtype)
+        else:
+            out_full = torch.empty(
+                (T, partials.shape[-1]), dtype=partials.dtype, device=device
+            )
+            combine_topk_partials(partials.view(T, K, -1), out_full, saved_rsf)
         self._log_wave_h2d("expert", len(spill_waves) + 1, h2d_before)
         if _tm and _tm_ev:
             _wave_timing_note_prefill(

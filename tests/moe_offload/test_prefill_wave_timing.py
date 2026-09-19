@@ -73,3 +73,27 @@ def test_wave_token_slice_is_env_gated_and_bounded(monkeypatch):
     assert "for start in range(0, int(idx_np.size), step):" in src
     # the wave is fetched ONCE, outside the slice loop
     assert src.index("self._fetch(fetch_plan)") < src.index("for start in range(0, int(idx_np.size), step):")
+
+
+def test_partials_mode_is_env_gated_and_defaults_to_the_table(monkeypatch):
+    """SGLANG_MOE_OFFLOAD_PARTIALS=stream drops the [T*K, H] partials table
+    (1.7 GB at a 32k chunk, fn6v OOM) for an fp32 [T, H] accumulator; the
+    default keeps the byte-identical combine."""
+    import ast
+    import inspect
+    import textwrap
+
+    from sglang.srt.layers.moe import expert_offload as eo
+
+    for raw, want in (("", "table"), ("table", "table"), ("stream", "stream"), ("STREAM", "stream"), ("x", "table")):
+        eo._PARTIALS_MODE["mode"] = None
+        if raw == "":
+            monkeypatch.delenv("SGLANG_MOE_OFFLOAD_PARTIALS", raising=False)
+        else:
+            monkeypatch.setenv("SGLANG_MOE_OFFLOAD_PARTIALS", raw)
+        assert eo.partials_mode() == want, raw
+    eo._PARTIALS_MODE["mode"] = None
+    src = textwrap.dedent(inspect.getsource(eo.MoEExpertOffloadCache._run_waves_expert_major))
+    ast.parse(src)
+    assert "out_acc.index_add_(0, rows, part.to(torch.float32))" in src
+    assert "combine_topk_partials(partials.view(T, K, -1), out_full, saved_rsf)" in src
