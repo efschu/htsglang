@@ -7845,3 +7845,17 @@ class ModelRunnerKVCacheMixin:
             f"Memory pool end. "
             f"avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
         )
+        # 19.09.: the balance sheet after offload + pools, measured off the tensors
+        try:
+            from sglang.srt.model_executor.vram_family_census import (
+                log_vram_family_census,
+            )
+
+            log_vram_family_census(
+                self.model,
+                f"pp{self.pp_rank}tp{self.tp_rank}"
+                + ("-draft" if getattr(self, "is_draft_worker", False) else ""),
+                "after pools",
+            )
+        except Exception as exc:  # noqa: BLE001 -- a census never kills a boot
+            logger.debug("[vram-census] skipped: %s", exc)

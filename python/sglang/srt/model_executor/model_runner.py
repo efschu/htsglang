@@ -2769,6 +2769,21 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             f"mem usage={self.weight_load_mem_usage:.2f} GB."
         )
 
+        # 19.09.: VRAM bytes by tensor family, measured off the tensors
+        try:
+            from sglang.srt.model_executor.vram_family_census import (
+                log_vram_family_census,
+            )
+
+            log_vram_family_census(
+                self.model,
+                f"pp{self.pp_rank}tp{self.tp_rank}"
+                + ("-draft" if self.is_draft_worker else ""),
+                "after load",
+            )
+        except Exception as exc:  # noqa: BLE001 -- a census never kills a boot
+            logger.debug("[vram-census] skipped: %s", exc)
+
         # #644: end-of-load host-anon discriminator. Off unless
         # SGLANG_644_DISCRIMINATOR is set; the answer it produces (references
         # genuinely persist vs glibc arenas holding freed pages) cannot be read
