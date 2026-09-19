@@ -2106,6 +2106,13 @@ class SchedulerWeightUpdaterManager:
         """
         if self.draft_worker is None:
             return False
+        if getattr(_weg2_drafter_of(self), "is_draft_solo_shadow", False):
+            # 19.09. (xsn391): a solo-draft SHADOW holds no draft bytes at
+            # all (meta draft) -- nothing to refill, and the refill's own
+            # quantization gate (W4 on compressed-tensors) must not fire for
+            # bytes that never existed; the host restores its draft through
+            # the exchange's draft leg.
+            return False
         try:
             from sglang.srt.weg2.weight_exchange import weights_cpu_backup_armed
 

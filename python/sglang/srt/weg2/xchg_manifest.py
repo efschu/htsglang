@@ -1510,8 +1510,9 @@ def leg_plan_from_join(
     _tp_has = any(m.pieces for m in narrowed if m.group == tp_group)
     manifests = [m for m in narrowed
                  if m.pieces or (m.group == tp_group and _tp_has)]
-    _empty_tp = sorted(m.rank for m in manifests
-                       if m.group == tp_group and not m.pieces)
+    _tp_with = {m.rank for m in manifests if m.group == tp_group and m.pieces}
+    _empty_tp = sorted({m.rank for m in manifests
+                        if m.group == tp_group and not m.pieces} - _tp_with)
     if _empty_tp and log is not None:
         log(f"WEG2-XCHG-PLAN region={my_region} tp_ranks_without_pieces="
             f"{_empty_tp} kept as empty rows -- the region is held by the "
