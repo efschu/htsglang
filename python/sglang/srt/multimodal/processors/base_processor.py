@@ -1544,6 +1544,34 @@ class BaseMultimodalProcessor(ABC):
             ):
                 item.set_pad_value()
 
+        # Task #58: THE TRANSIENT VISION STAGE RUNS HERE, or not at all.
+        #
+        # This is the last point in the processor process where the pixels
+        # exist and the items have not yet been wrapped for transport. Under
+        # `--weg2-vision transient` the model on every rank is built WITHOUT a
+        # tower (`language_model_only` -> `qwen3_vl.py:1286`), so if these
+        # items leave with `feature` and no `precomputed_embeddings`, they
+        # reach `_require_visual` (`qwen3_vl.py:1421`) and the request fails --
+        # or worse, on a path that does not check, returns wrong text.
+        #
+        # The call is a NO-OP unless a service was installed
+        # (`vision_stage_service.install`), so every boot that does not use the
+        # transient form is byte-for-byte what it was. It never raises: a stage
+        # failure comes back as an outcome and is logged with its W-code; the
+        # items then still carry `feature`, and the normal refusal downstream
+        # is what the caller sees -- one failure, named once, not two.
+        #
+        # Upstream fills this same field in this same process
+        # (`moss_vl.py:587`), which is why the seam is here and not in the
+        # scheduler: the transport below already handles a filled
+        # `precomputed_embeddings`.
+        try:
+            from sglang.srt.weg2 import vision_stage_service as _vss
+
+            _vss.maybe_run(all_collected_items)
+        except Exception as _exc:  # noqa: BLE001 -- never break the text path
+            logger.warning("vision stage seam skipped: %s", _exc)
+
         """
         solution for cuda-ipc memory-leak:
         1. memory-pool:  each time get a slice from memory-pool and use it as transport-data (with async lock guard)

@@ -198,6 +198,7 @@ def run_vision_stage(
     encoder_flops: int = 0,
     achieved_tflops: Optional[float] = None,
     clock: Callable[[], float] = time.perf_counter,
+    check_deadline: Optional[Callable[[str], None]] = None,
 ) -> VisionStageResult:
     """Run the tower once, on one card, and leave the card as it was found.
 
@@ -210,7 +211,17 @@ def run_vision_stage(
     before it is known that everything will fit.  The displacement is third
     and the load fourth, because a load that fails with nothing displaced is a
     cheaper failure than one with a band already in host RAM.
+
+    ``check_deadline(leg)`` is called BEFORE each leg and NEVER before the
+    teardown.  Raising from it aborts the stage at a leg BOUNDARY, which is
+    the only place an abort is safe: the teardown still runs and unwinds
+    whatever is standing.  There is deliberately no way to interrupt a leg in
+    progress -- a band paused and never resumed is a hole in the weights, and
+    that is worse than any slow request.
     """
+    def _gate(leg: str) -> None:
+        if check_deadline is not None:
+            check_deadline(leg)
     cfg = encoder_config or VisionEncoderConfig()
     width = int(expected_width if expected_width is not None else cfg.embed_width)
 
@@ -218,6 +229,7 @@ def run_vision_stage(
         raise VisionStageFlipInFlight("armed")
 
     # --- plan -------------------------------------------------------------
+    _gate("plan")
     t0 = clock()
     cards = list(hooks.census())
     plan = plan_vision_stage(
@@ -235,6 +247,7 @@ def run_vision_stage(
     handle = None
     try:
         # --- displace ------------------------------------------------------
+        _gate("displace")
         t0 = clock()
         for blk in plan.evicted:
             try:
@@ -252,6 +265,7 @@ def run_vision_stage(
         measured["displace"] = clock() - t0
 
         # --- load ----------------------------------------------------------
+        _gate("load")
         t0 = clock()
         try:
             handle = hooks.load_tower(plan.card)
@@ -271,6 +285,7 @@ def run_vision_stage(
         measured["load"] = clock() - t0
 
         # --- encode --------------------------------------------------------
+        _gate("encode")
         t0 = clock()
         try:
             embeddings = hooks.encode(handle, items)
@@ -283,6 +298,7 @@ def run_vision_stage(
         measured["encode"] = clock() - t0
 
         # --- hand on -------------------------------------------------------
+        _gate("attach")
         t0 = clock()
         rows = attach_precomputed_embeddings(
             items, embeddings, expected_width=width

@@ -175,31 +175,45 @@ def test_every_non_route_verdict_has_a_W_CODE_in_the_handler():
     import inspect
 
     src = inspect.getsource(fr.Front.handle_generate)
-    non_route = {
-        fr.VERDICT_REFUSE_IMAGE, fr.VERDICT_REFUSE_VIDEO,
-        fr.VERDICT_REFUSE_MODE, fr.VERDICT_STAGE,
+    refusals = {
+        fr.VERDICT_REFUSE_IMAGE, fr.VERDICT_REFUSE_VIDEO, fr.VERDICT_REFUSE_MODE,
     }
-    assert non_route == set(fr.__dict__[n] for n in dir(fr)
-                            if n.startswith("VERDICT_")) - {fr.VERDICT_ROUTE}
-    for v in non_route:
+    # the verdict set is exactly the refusals plus route plus stage, and the
+    # last two are NOT refusals -- so the dict must cover the refusals and
+    # nothing else can reach it
+    assert set(fr.__dict__[n] for n in dir(fr) if n.startswith("VERDICT_")) == (
+        refusals | {fr.VERDICT_ROUTE, fr.VERDICT_STAGE}
+    )
+    for v in refusals:
         assert f"VERDICT_{v.upper().replace('-', '_')}:" in src
     assert "W101 Weg2VisionRefused" in src
     assert "W103 Weg2VideoRefused" in src
     assert "W104 Weg2VisionModeUnknown" in src
-    assert "W102 Weg2VisionStage" in src
 
 
-def test_the_transient_mode_refuses_LOUDLY_until_the_group_side_is_wired():
-    """Slice 6 gap, named rather than faked.  `transient` must not ROUTE an
-    image before the group runs the stage -- that would reach
-    `_require_visual` on a tower-less rank, which is wrong text, not an
-    error."""
+def test_the_transient_mode_now_ROUTES_instead_of_refusing():
+    """SUPERSEDES `test_the_transient_mode_refuses_LOUDLY_until_the_group_side_
+    is_wired`, which pinned the round-2 state: `transient` answered 501 with
+    "the group-side runtime is not wired yet".
+
+    It is wired now (`weg2/vision_stage_service.py`, called from
+    `base_processor.process_and_combine_mm_data`), so the verdict STAGE falls
+    through to routing and W102 is an INFO line on the way to P, not a
+    refusal. The old assertion is kept here as its negation so the two states
+    can never both be true, and so a reader of the history sees the change
+    rather than a test that quietly vanished.
+    """
     import inspect
 
     src = inspect.getsource(fr.Front.handle_generate)
-    assert "not wired yet" in src
-    assert "status=501" in src
-    assert "_require_visual" in src
+    assert "not wired yet" not in src
+    assert "W102 Weg2VisionStage" in src
+    assert "routing to P" in src
+    # STAGE is no longer in the REFUSAL dict -- it does still appear later,
+    # in the force-to-P branch, which is the opposite of a refusal
+    dict_block = src[src.index("_code = {"): src.index("}[_verdict]")]
+    assert "VERDICT_STAGE" not in dict_block
+    assert 'route = "long"' in src
 
 
 def test_the_front_carries_the_mode_it_was_told():
