@@ -892,11 +892,43 @@ def get_jit_cuda_arch() -> ArchInfo:
     return arch
 
 
+_PDL_SM12_ENV = "SGLANG_PDL_ON_SM12"
+_PDL_SM12_LOGGED = {"done": False}
+
+
+def pdl_on_sm12_opted_in(env=None) -> bool:
+    """#49 (20.09.): programmatic dependent launch on consumer Blackwell
+    (capability 12.x) is OFF unless SGLANG_PDL_ON_SM12=1. fn8c12 showed the
+    Triton fused-gate router -- launched with launch_pdl=True AND carrying its
+    gdc_wait -- turning finite logits into whole-token NaN weights on the RTX
+    5090 only, while the same kernel isolated from any predecessor is clean:
+    the griddepcontrol barrier does not order the read on sm_120 (the same
+    class CUTLASS documents for compute_120 builds). The 3080s (sm_86) never
+    launch with PDL and never saw it. Opt-in keeps the A/B spellable."""
+    import os
+
+    src = os.environ if env is None else env
+    return str(src.get(_PDL_SM12_ENV, "")).strip().lower() in ("1", "true", "yes", "on")
+
+
 @cache_once_per_arch
 def is_arch_support_pdl() -> bool:
     if is_hip_runtime() or is_musa_runtime():
         return False
-    return get_jit_cuda_arch().major >= 9
+    arch = get_jit_cuda_arch()
+    if arch.major >= 12 and not pdl_on_sm12_opted_in():
+        if not _PDL_SM12_LOGGED["done"]:
+            _PDL_SM12_LOGGED["done"] = True
+            import logging
+
+            logging.getLogger(__name__).info(
+                "[nan-49] PDL disabled on capability %d.%d (consumer Blackwell): "
+                "griddepcontrol did not order the fused-gate router's read of the "
+                "gate logits on sm_120 (fn8c12); set %s=1 to opt back in",
+                arch.major, arch.minor, _PDL_SM12_ENV,
+            )
+        return False
+    return arch.major >= 9
 
 
 def _find_package_root(package: str) -> Optional[pathlib.Path]:
