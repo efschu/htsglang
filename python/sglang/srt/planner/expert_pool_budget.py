@@ -1,151 +1,94 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tasks #14/#48 -- the expert pool's LRU rows come from the BUDGET, not the hand.
 
-WHY THIS EXISTS
----------------
-Boot fn8aj (2026-09-20) sized the KV pool per rank out of what was left after
-the weights::
+WHAT THIS PRICES, AND WHAT IT LEARNED NOT TO
+--------------------------------------------
+Four configuration boots on 2026-09-20, each one a subtraction:
 
-    KV pool sizing: available_bytes=5074821120 (4.726 GiB), cell_size=14143,
-    page_size=64 -> max_total_num_tokens=358784        (rank 0, one line per rank)
-
-and then capped it by hand with ``--max-total-tokens 270000``.  But the DCP
-token vector was ``[11, 11, 10]``, so what a rank has to hold for a
-262144-token context is ``ceil(262144/32) * ratio_r`` = 90112 / 90112 / 81920
-tokens -- 1.19 GiB at ``cell_size`` 14143, not the 3.56 GiB each rank got.
-
-The expert residency on the other side was a pure HAND PIN:
-``--rank-moe-resident-fraction 0.004,0.37,0.44`` froze R from the hot-set file
-and ``SGLANG_MOE_SCRATCH_SLOTS=145,36,36`` set C by taste.  Two configuration
-boots then failed, and BOTH failures are this module's acceptance tests:
-
-* **fn8ak** (``175,60,60``) died before ``/health`` with
-  ``RuntimeError: pool mode requires buffer_size == R+C (97 != 43+60)``.
-  Rank 2 OWNS 97 experts and ``buffer_size`` is ``min(R + C, E_local)``
+* **fn8ak** (``SGLANG_MOE_SCRATCH_SLOTS=175,60,60``) died before ``/health``:
+  ``pool mode requires buffer_size == R+C (97 != 43+60)``.  Rank 2 OWNS 97
+  experts and ``buffer_size`` is ``min(R + C, E_local)``
   (``expert_offload.py:504``, checked at ``:3895-3898``): rows above the owned
   count are not a bigger pool, they are a contradiction.
-* **fn8ak2** (``175,60,54``) booted -- KV pools 1.215/2.031/2.293 GiB -- and
-  then rank 0 (the 5090) went OOM inside the FIRST 8192-token prefill chunk:
-  ``MoE offload gather fetch failed (OutOfMemoryError ... 254 MiB free ...
-  30.88 GiB in use)``.  The 30 extra rows on that rank had eaten the memory
-  the prefill needed.
+* **fn8ak2** (``175,60,54``) booted and then rank 0 went OOM inside the first
+  8192-token prefill chunk (``254 MiB free ... 30.88 GiB in use``).
+* **fn8ak3** (``145,60,54`` -- the 5090 untouched, the 3080s +24/+18 rows) died
+  in the needle prefill on rank 2: ``73.5 MiB free, 19.36 GiB in use; 18.60 GiB
+  allocated by PyTorch, 1.79 GiB in private pools (CUDA Graphs)`` with
+  ``expandable_segments:True`` already on.  Not fragmentation: at the real
+  prefill peak the 3080 is full.
+* **fn8am** carried ``--max-total-tokens 90816`` and refused the needle at
+  90810 -- see "THE FLAG IS THE WORLD CAP" below.
 
-WHICH TRANSIENT INSTRUMENT (the correction that decides this term)
-------------------------------------------------------------------
-The ``[vram-peak]`` line offers three readings of "how much does this rank
-need beyond its steady state", and they disagree by 4x.  fn8aj rank 0::
+THERE IS NO KV CREDIT TO HARVEST (the correction that gutted this term)
+-----------------------------------------------------------------------
+An earlier version of this module read the ``KV pool sizing`` line --
+``available_bytes=4.73 GiB -> max_total_num_tokens=358784`` -- and the
+``local capacity 269995`` of the ``Uneven-DCP token sizing`` line as the pool a
+rank had ALLOCATED, and concluded that shrinking it to the DCP need would free
+~2.37 GiB per rank.  **Both numbers are CAPACITY, not allocation.**  Under the
+weighted owner rule the pool is already compacted to
+``dcp_compact_pool_rows(C, S, ratio_r) = (C // S + 1) * ratio_r``
+(``layers/dcp/owner.py:155``), and the boot says so itself::
 
-    [vram-peak] extend (8192 rows): allocator peak since pools 24.77 GiB,
-    allocated now 23.09, reserved 29.82, card free 0.55 of 31.34 GiB
-    -> transient headroom used = peak - allocated 1.69 GiB
+    fn8aj: KV Cache is allocated ... #tokens: 90123   (ratio 11, C = 262151)
+           KV Cache is allocated ... #tokens: 81930   (ratio 10)
+    fn8am: KV Cache is allocated ... #tokens: 31229   (ratio 11, C = 90816)
+           KV Cache is allocated ... #tokens: 28390   (ratio 10)
 
-* ``peak - allocated`` = 1.69 GiB (2.47 at decode).  This is what the line
-  itself names, and it **UNDERBOOKS**: it counts only the allocator's live
-  high-water, not the cached-but-unreturned blocks the next allocation has to
-  find contiguously.  fn8ak2 was planned on it and died.
-* ``reserved - allocated`` = 6.73 GiB.  The allocator's cache high-water.  It
-  **OVERBOOKS**: on fn8aj it exceeds rank 0's whole reachable budget, so a
-  term using it refuses a configuration that demonstrably ran -- and it also
-  forbids the +24/+18 rows the 3080s demonstrably took in fn8ak3.
-* ``card free`` = 0.55 GiB.  **This is the base this module uses.**  It is the
-  residual after the transient, the allocator cache, the fragmentation, the
-  CUDA context and any foreign process -- i.e. it already contains every term
-  the other two readings argue about, measured rather than modelled.
+``(262151 // 32 + 1) * 11 = 90123`` exactly.  fn8aj's pool was ALREADY the
+1.19 GiB its DCP share needs, so the credit was zero and the 2.37 GiB never
+existed -- measured independently: fn8am with the cap had 5.0-5.4 GiB free per
+3080 after the pools, the same as without it.  This module now reads the
+ALLOCATION line and charges ``(rows_now - rows_needed) * cell``, which is zero
+whenever C already matches the context and NEGATIVE when the pool has to grow.
 
-AND THE SAMPLE ITSELF IS NOT A MAXIMUM (fn8ak3, the third death)
------------------------------------------------------------------
-``maybe_log_vram_peak`` LATCHED: ``st["extend"]`` was set by the first extend
-of >= 2048 rows, which under chunked prefill is the first chunk of the first
-request.  The transient a deep prefill draws is not constant across chunks --
-the attention workspace and the partials grow with the cached context a chunk
-attends over -- so the worst chunk of a 259k needle comes minutes after the
-latch and was never sampled.  Measured: fn8aj printed ``allocated now 13.29``
-for rank 2; fn8ak3 (145,60,54 -- that rank +18 rows) died in the needle prefill
-with ``18.60 GiB allocated by PyTorch, 1.79 GiB in private pools (CUDA Graphs),
-73.5 MiB free``, and ``expandable_segments:True`` was already set, so it is not
-fragmentation: at the real peak the 3080 is simply full.  The ~3.5 GiB that
-look idle on a 3080 ARE the prefill transient at CHUNK 8192; they are free only
-in decode.
+THE FLAG IS THE WORLD CAP, BY DESIGN
+------------------------------------
+``--max-total-tokens`` is C, the GLOBAL context budget; the per-rank pool is
+compacted from it.  fn8am set it to one rank's physical row count (90816) and
+so cut the context every request may have -- ``Input length (259415 tokens)
+exceeds the maximum allowed length (90810 tokens)``.  That is the flag working
+as designed on a wrong input, not a defect: :meth:`Plan.env` emits
+``MAX_TOTAL_TOKENS`` as the WORLD pool and nothing else.
 
-``vram_family_census.py`` now re-emits on every new allocator high-water, so
-the next boot MEASURES that number.  Until a log carries it, this module
-REFUSES to size a pool (``strict=True``) rather than read the latched sample as
-a maximum -- ``strict=False`` gives the upper bound, labelled as one.
+WHICH TRANSIENT (three readings, 4x apart, and only one binds)
+---------------------------------------------------------------
+* ``peak - allocated`` -- what the ``[vram-peak]`` line itself calls the
+  transient: 1.92 GiB on fn8am's 3080s.  **Underbooks by 2.3x.**  It counts the
+  allocator's live high-water only.
+* ``peak_allocated_deep - allocated_at_rest`` (minus the rows the measuring
+  boot carried beyond this census) -- **what this module uses**.  fn8ak3 rank 2:
+  ``18.60 - 12.06 - 18 rows x 116 MiB = ~4.4 GiB``.
+* ``card_free_at_rest - card_free_at_worst`` -- 5.37 - 0.08 = **5.29 GiB** on
+  fn8am rank 1.  Larger again, because the allocator RESERVES more than it
+  holds live and never returns it to the driver.  Reported beside the figure
+  used, with the delta named, because it is the stricter bound and the one the
+  OOM actually hit.
 
-So the headroom a rank has for more rows is::
+So::
 
-    transient_r(chunk) = graph_private_r + (peak_alloc_r - alloc_r - graph_private_r)
-                         * chunk / chunk_measured
-    free_r(chunk)      = card_free_r - (peak_alloc_r - peak_r) + transient_r(measured)
-                         - transient_r(chunk)
-    headroom_r         = free_r(chunk) + (kv_bytes_now_r - kv_bytes_need_r)
-    rows_r             = floor(headroom_r / row_bytes_r)
-    C_r                = min(C_now_r + rows_r, E_local_r - R_r)
+    transient_r     = peak_alloc_deep_r - alloc_at_rest_r - extra_rows_r * row_bytes_r
+    kv_credit_r     = (rows_now_r - rows_needed_r) * cell_size        # 0, or negative
+    headroom_r      = card_free_after_pools_r + kv_credit_r - transient_r - floor
+    rows_r          = floor(headroom_r / row_bytes_r)
+    C_r             = min(C_now_r + rows_r, E_local_r - R_r)
 
-The KV term is a CREDIT, because shrinking the pool to its DCP need gives those
-bytes back to the card before anything else runs.  The CUDA-graph private pools
-are chunk-INDEPENDENT, so halving CHUNK halves only the other half of the
-transient -- and that is a real lever: on fn8ak3's rank 2 it is the difference
-between a refusal at 8192 and ~12 rows at 4096, at a TTFT cost this module does
-not price.  :func:`dry_run` therefore prints both.
-
-RETRODICTIONS, all from fn8aj's census, before anything new is booted:
-fn8ak is refused by the pool identity on rank 2; fn8ak2 is refused by 5 rows on
-rank 0 (0.57 GiB -- the OOM it hit reported 254 MiB free); and fn8ak3, which
-the LATCHED reading accepts, is refused once rank 2's measured peak is in the
-census.  The last one is the standing argument for ``strict=True``.
-
-AND THE CAP IS A GLOBAL BUDGET, NOT A POOL SIZE (fn8am, the fourth boot)
-------------------------------------------------------------------------
-fn8am carried ``--max-total-tokens 90816`` -- rank 0's physical pool need --
-and refused the needle: ``Input length (259415 tokens) exceeds the maximum
-allowed length (90810 tokens)``.  The pools were right (``KV Cache is
-allocated ... #tokens: 31229`` on the ratio-11 ranks, ``28390`` on the
-ratio-10 one); the ceiling was not.  ``_apply_token_constraints`` applies the
-flag TWICE -- first to ``P_r``, this rank's physical capacity, then to
-``C = min_r(P_r // ratio_r) * S``, the global context budget that
-``max_req_input_len`` is built from.  ``SGLANG_KV_POOL_CAP_TOKENS`` now caps
-only ``P_r``; :meth:`Plan.env` emits it per rank and leaves
-``--max-total-tokens`` as the WORLD number.  Each rank is charged its own
-share ``C * ratio_r / S``, never the global one.
-
-THE SIZING CHAIN THIS INVERTS (file:line @ 546dd2bd36)
-------------------------------------------------------
-1. ``model_runner_kv_cache_mixin.py:864-870`` -- the rank BUDGET is the
-   absolute ``--rank-gpu-memory-mib``; the first post is the MEASURED
-   ``weights + runtime state`` delta.  The expert arena (``R + C`` rows over
-   all MoE layers) is inside that post, which is why a row is paid for in KV
-   tokens and in nothing else.
-2. ``model_runner_kv_cache_mixin.py:872-874`` -- corridor holdback (0 here).
-3. ``model_runner_kv_cache_mixin.py:875-892`` -- the #48 C prefill transient,
-   ``SGLANG_KV_BUDGET_PREFILL_TRANSIENT_MIB``, default 0 = nothing booked.
-   In fn8aj it was UNSET, so the transient was funded by whatever the sizer
-   happened to leave -- which is the defect, not a policy.
-4. ``model_runner_kv_cache_mixin.py:905+`` -- mamba / speculative posts, then
-   ``rest``, then a per-rank reserve, then ``available_bytes``.
-5. ``pool_configurator.py:549-586`` -- ``available_bytes // cell_size``, then
-   ``// page_size * page_size``, then the ``KV pool sizing`` line.
-6. ``model_runner_kv_cache_mixin.py:5266-5305`` -- ``--max-total-tokens`` and
-   the hybrid cap bind; the per-rank unit is ``local // ratio_r``, the world
-   takes the MIN unit, ``EFFECTIVE`` is that unit times the ratio sum.
-7. ``expert_offload.py:700-715`` / ``:3866`` / ``:3895`` --
-   ``SGLANG_MOE_SCRATCH_SLOTS`` (scalar or per-rank vector) is C; the arena is
-   ``[0,R)`` residents, ``[R, R+C-S)`` device LRU, last S staging.
+``row_bytes`` is read from ``[vram-census] experts / (R+C)``, never from a
+nominal per-expert size times a layer count: fn8aj/fn8am, three ranks with
+three different arenas, give 115.98 / 116.05 / 116.01 MiB -- a 0.06 % spread.
 
 USER LAWS THIS OBEYS
 --------------------
-* Reserves NEVER ("nicht ein Byte"): :data:`DEFAULT_FLOOR_BYTES` is 0 and the
-  only non-zero floor is one a caller passes in with a named reason.
-* Transients are BOOKED EXPLICITLY: :meth:`Plan.env` emits
-  ``SGLANG_KV_BUDGET_PREFILL_TRANSIENT_MIB`` as the residual that keeps the
-  sizer's hands off the bytes the rows and the prefill need -- the sizer then
-  produces exactly the DCP need instead of "whatever is left".
-* "KEIN BINDENDER RANG": ranks are priced independently; no rank's row count
-  is copied to another.
+* Reserves NEVER ("nicht ein Byte"): :data:`DEFAULT_FLOOR_BYTES` is 0.
+* "KEIN BINDENDER RANG": ranks are priced independently.
 * Under uneven DCP the pool is quoted as the WORLD total
   (:attr:`Plan.kv_tokens_world`), never as one rank's share.
 * Refusal by name: an infeasible rank raises :class:`ExpertPoolBudgetRefused`
-  naming the rank, every post and the shortfall.  Nothing is clamped silently.
+  naming the rank, every post and the shortfall.  A census without a measured
+  DEEP prefill peak is refused outright (``strict=True``) -- the shallow
+  high-water sample is a lower bound, and three boots died on reading one as a
+  maximum.
 """
 
 from __future__ import annotations
@@ -163,9 +106,10 @@ __all__ = [
     "GIB",
     "MIB",
     "DEFAULT_FLOOR_BYTES",
-    "kv_tokens_for_rank",
+    "kv_rows_for_rank",
     "row_bytes_from_census",
     "plan_expert_pool",
+    "survey_ranks",
     "verify_scratch_vector",
     "parse_boot_log",
     "dry_run",
@@ -215,24 +159,20 @@ class RankCensus:
 
     ``available_bytes`` / ``cell_size`` / ``page_size``
         ``KV pool sizing: available_bytes=%d ... cell_size=%d, page_size=%d``
-        (``pool_configurator.py:577``).
-    ``kv_tokens_now``
-        ``Uneven-DCP token sizing: rank %d local capacity %d tokens``
-        (``model_runner_kv_cache_mixin.py:5291``) -- the pool this rank
-        actually built, AFTER every cap.
+        (``pool_configurator.py:577``).  CAPACITY, not allocation.
+    ``kv_rows_now``
+        ``KV Cache is allocated. ... #tokens: %d`` -- the main pool's
+        ALLOCATION.  This is the one that says what the pool costs.
     ``dcp_ratio``
-        this rank's entry of that line's ratio vector.
-    ``card_free_gib`` / ``card_total_gib``
-        ``[vram-peak] ... card free %s of %s GiB``, taken at the rank's WORST
-        observed load state (minimum free).  This is the headroom instrument.
-    ``reserved_gib`` / ``allocated_gib`` / ``peak_gib``
-        the other three columns of that same worst line, kept only so the
-        report can show why the two cheaper readings of "the transient"
-        (``peak - allocated``, ``reserved - allocated``) are not used.
+        this rank's entry of the ``Uneven-DCP token sizing`` ratio vector.
+    ``card_free_after_pools_gib`` / ``alloc_at_rest_gib``
+        the ``[vram-peak] high-water (1 rows)`` line: the at-rest state once
+        every pool exists.
+    ``card_free_worst_gib`` / ``card_total_gib``
+        the minimum ``card free`` over all this rank's ``[vram-peak]`` lines.
     ``expert_tensor_gib``
-        ``[vram-census] ... model tensors on device ... {experts %s, ...}`` of
-        the MAIN model (never the ``-draft`` census -- the draft's experts are
-        not rows of this arena).
+        ``[vram-census] ... {experts %s, ...}`` of the MAIN model (never the
+        ``-draft`` census -- those experts are not rows of this arena).
     ``residents`` / ``lru_rows`` / ``staging`` / ``spill_rows``
         ``MoE expert pool on layer 0: residents %d, LRU rows %d, staging %d,
         spill rows %d``.
@@ -243,30 +183,36 @@ class RankCensus:
     available_bytes: int
     cell_size: int
     page_size: int
-    kv_tokens_now: int
-    card_free_gib: float
+    #: PHYSICAL rows this rank's main KV pool holds, from
+    #: ``KV Cache is allocated ... #tokens: %d`` -- the ALLOCATION, never the
+    #: ``KV pool sizing`` capacity or the ``local capacity`` reconstruction.
+    #: Equals ``dcp_compact_pool_rows(C, S, ratio_r)`` (owner.py:155).
+    kv_rows_now: int
+    #: card free at rest, once every pool exists: the ``[vram-peak]
+    #: high-water (1 rows)`` line. This is the budget rows and the transient
+    #: come out of.
+    card_free_after_pools_gib: float
+    #: torch allocated at that same at-rest moment.
+    alloc_at_rest_gib: float
+    #: the WORST card free this rank was ever observed at (minimum over its
+    #: ``[vram-peak]`` lines). Reported as the stricter cross-check.
+    card_free_worst_gib: float
     card_total_gib: float
-    reserved_gib: float
-    allocated_gib: float
-    peak_gib: float
     expert_tensor_gib: float
     residents: int
     lru_rows: int
     staging: int
     spill_rows: int
-    #: 20.09. (fn8ak3): the TRUE ``torch.cuda.max_memory_allocated()`` at the
-    #: DEEPEST prefill chunk, GiB.  ``peak_gib`` above is NOT that number --
-    #: ``maybe_log_vram_peak`` latched on the first extend of >= 2048 rows, so
-    #: on a 259k needle it reported the first chunk of the first request.
-    #: Measured gap on fn8aj/fn8ak3 rank 2: 14.98 reported against 18.60 real.
-    #: ``None`` means the log could not measure it, and a strict plan REFUSES
-    #: rather than treating the latched sample as a maximum.
+    #: ``torch.cuda.max_memory_allocated()`` at the DEEPEST prefill chunk, GiB.
+    #: ``None`` -> a strict plan REFUSES: the shallow high-water sample is a
+    #: lower bound on the draw and fn8ak3 died on reading one as a maximum.
     prefill_peak_allocated_gib: Optional[float] = None
-    #: CUDA-graph private pools, GiB.  Chunk-INDEPENDENT, so it does not scale
-    #: when the prefill chunk is halved (fn8ak3 rank 2: 1.79 GiB of the 19.36
-    #: in use).
+    #: rows the boot that measured that peak carried BEYOND this census's C.
+    #: Subtracted so the transient is the transient and not somebody's arena.
+    peak_boot_extra_rows: int = 0
+    #: CUDA-graph private pools, GiB -- chunk-INDEPENDENT (fn8ak3: 1.79).
     graph_private_gib: float = 0.0
-    #: the prefill chunk size ``prefill_peak_allocated_gib`` was measured at.
+    #: the prefill chunk ``prefill_peak_allocated_gib`` was measured at.
     prefill_chunk_tokens: int = 0
 
     @property
@@ -288,20 +234,19 @@ class RankCensus:
 
     @property
     def kv_bytes_now(self) -> int:
-        return int(self.kv_tokens_now) * int(self.cell_size)
+        """Bytes the pool ACTUALLY holds: compacted rows x cell."""
+        return int(self.kv_rows_now) * int(self.cell_size)
 
     @property
-    def allocator_cache_gib(self) -> float:
-        """``reserved - allocated``: cached blocks the allocator holds and does
-        not return to the driver.  Reported, never subtracted -- it is already
-        inside ``card_free``."""
-        return float(self.reserved_gib) - float(self.allocated_gib)
-
-    @property
-    def peak_minus_allocated_gib(self) -> float:
-        """What the ``[vram-peak]`` line calls the transient.  Reported as the
-        instrument that UNDERBOOKS (fn8ak2 was planned on it)."""
-        return float(self.peak_gib) - float(self.allocated_gib)
+    def transient_card_gib(self) -> float:
+        """The stricter transient reading: how far the CARD's free column fell
+        between the at-rest sample and the worst one.  Larger than the
+        allocated-delta reading because the allocator reserves more than it
+        holds live and returns none of it to the driver (fn8am rank 1: 5.37 ->
+        0.08 GiB while allocated moved 11.85 -> 12.06)."""
+        return max(
+            0.0, float(self.card_free_after_pools_gib) - float(self.card_free_worst_gib)
+        )
 
     def __post_init__(self):
         if self.cell_size <= 0:
@@ -314,8 +259,15 @@ class RankCensus:
             raise ValueError(f"rank{self.rank}: page_size={self.page_size} must be > 0")
         if self.dcp_ratio <= 0:
             raise ValueError(f"rank{self.rank}: dcp_ratio={self.dcp_ratio} must be > 0")
-        if self.card_free_gib < 0.0:
-            raise ValueError(f"rank{self.rank}: card_free_gib must be >= 0")
+        if self.card_free_after_pools_gib < 0.0:
+            raise ValueError(f"rank{self.rank}: card_free_after_pools_gib must be >= 0")
+        if self.kv_rows_now <= 0:
+            raise ValueError(
+                f"rank{self.rank}: kv_rows_now={self.kv_rows_now}. This is the "
+                "ALLOCATION ('KV Cache is allocated ... #tokens'), not the "
+                "'KV pool sizing' capacity -- a census without it cannot say "
+                "whether the pool has to grow or shrink."
+            )
         if self.buffer_rows > self.owned_experts:
             raise ValueError(
                 f"rank{self.rank}: census is self-inconsistent -- buffer R+C="
@@ -369,7 +321,6 @@ class Plan:
     dcp_ratios: Tuple[int, ...]
     unit_tokens: int
     max_total_tokens: int
-    pool_cap_tokens: Tuple[int, ...] = ()
     notes: Tuple[str, ...] = field(default=())
 
     @property
@@ -383,16 +334,10 @@ class Plan:
         """The vector that REPLACES the hand pins.
 
         * ``SGLANG_MOE_SCRATCH_SLOTS`` -- C per rank, budget-derived.
-        * ``SGLANG_KV_POOL_CAP_TOKENS`` -- the per-rank PHYSICAL pool cap,
-          ``unit * ratio_r``.  This is the knob that shrinks the pool.
-        * ``MAX_TOTAL_TOKENS`` -- the GLOBAL context ceiling
-          (``--max-total-tokens``), i.e. the world pool, NOT a rank's share.
-          fn8am proved these are two quantities and not one: a
-          ``--max-total-tokens 90816`` meant as a per-rank pool size also
-          clamped the global budget, and a 259415-token needle was refused at
-          90810 (``scheduler.py:5051`` -> ``managers/utils.py:202``).  Setting
-          it to the world pool keeps the length check honest while the cap
-          above does the shrinking.
+        * ``MAX_TOTAL_TOKENS`` -- ``--max-total-tokens``, which IS C, the
+          GLOBAL context budget; the per-rank pool is compacted from it by the
+          runtime.  Never a rank's share: fn8am set it to one rank's physical
+          row count and refused a 259415-token needle at 90810.
         * ``SGLANG_KV_BUDGET_PREFILL_TRANSIENT_MIB`` -- the residual post that
           books, in the sizer's own ledger, the bytes the new rows and the
           prefill transient will take.  Without it the sizer re-derives
@@ -402,7 +347,6 @@ class Plan:
         """
         return {
             "SGLANG_MOE_SCRATCH_SLOTS": ",".join(str(r.scratch) for r in self.ranks),
-            "SGLANG_KV_POOL_CAP_TOKENS": ",".join(str(t) for t in self.pool_cap_tokens),
             "MAX_TOTAL_TOKENS": str(self.max_total_tokens),
             "SGLANG_KV_BUDGET_PREFILL_TRANSIENT_MIB": ",".join(
                 str(r.transient_book_mib) for r in self.ranks
@@ -429,36 +373,33 @@ class Plan:
 # ---------------------------------------------------------------------------
 
 
-def kv_tokens_for_rank(
+def kv_rows_for_rank(
     *,
     ctx_tokens: int,
     spec_tokens: int,
     dcp_ratios: Sequence[int],
     rank: int,
-    page_size: int,
 ) -> Tuple[int, int]:
-    """KV tokens rank ``rank`` must hold -- FROM THE DCP UNIT, not from the rest.
+    """PHYSICAL rows rank ``rank`` must hold for a world context.  ``(C, rows)``.
 
-    Returns ``(unit, local_tokens)``.
+    This is the runtime's own compaction rule, not a model of it
+    (``layers/dcp/owner.py:155``)::
 
-    The runtime's relation (``model_runner_kv_cache_mixin.py:5291``) is
-    ``unit = local_capacity // ratio_r``, and the world pool is the MIN unit
-    times ``sum(ratios)``.  Inverted for a REQUIRED world pool ``ctx + spec``::
+        C    = ctx + spec                      # the GLOBAL context budget
+        rows = (C // S + 1) * ratio_r          # S = sum(ratios)
 
-        unit    = ceil((ctx + spec) / sum(ratios))
-        local_r = page_up(unit * ratio_r)
+    The ``+1`` is a CEIL to a whole owner block and is not cosmetic: allocator
+    slot ids reach ``C`` itself, and a slot in a trailing partial block
+    compacts one block past a floored sizing.  Flooring it cost an async
+    illegal memory access once already; this module will not re-derive it.
 
-    Both roundings are the opposite of the sizer's, deliberately:
+    Verified against two boots: ``(262151 // 32 + 1) * 11 = 90123`` and
+    ``(90816 // 32 + 1) * 11 = 31229``, both exactly the ``KV Cache is
+    allocated ... #tokens`` line.
 
-    * ``ceil`` on the unit -- the sizer floors, so a unit taken with ``//``
-      gives a world pool up to one ratio-sum short of the context.
-    * ``page_up`` on the local count -- ``pool_configurator.py:534`` rounds the
-      pool DOWN to a whole page, so a need that is not page-aligned is not met
-      by a pool sized exactly to it.
-
-    The speculative rows are a WORLD term, not a per-rank addend: draft and
-    verify tokens land in the same DCP-sharded pool as everything else, so
-    charging them per rank would charge them ``len(ratios)`` times.
+    The speculative rows are a WORLD term: draft and verify tokens land in the
+    same sharded pool, so charging them per rank charges them ``len(ratios)``
+    times.
     """
     ratios = [int(x) for x in dcp_ratios]
     if not ratios or any(x <= 0 for x in ratios):
@@ -468,10 +409,8 @@ def kv_tokens_for_rank(
     world = int(ctx_tokens) + int(spec_tokens)
     if world <= 0:
         raise ValueError(f"ctx_tokens + spec_tokens must be > 0, got {world}")
-    unit = -(-world // sum(ratios))  # ceil
-    page = int(page_size)
-    local = -(-(unit * ratios[int(rank)]) // page) * page  # page_up
-    return unit, int(local)
+    S = sum(ratios)
+    return world, (world // S + 1) * ratios[int(rank)]
 
 
 def row_bytes_from_census(expert_tensor_gib: float, buffer_rows: int) -> float:
@@ -506,33 +445,24 @@ def rank_headroom_bytes(
     c: RankCensus,
     *,
     kv_credit_bytes: float,
+    row_bytes: float,
     prefill_chunk_tokens: Optional[int] = None,
     floor_bytes: int = DEFAULT_FLOOR_BYTES,
     strict: bool = True,
 ) -> Tuple[float, float, Optional[str]]:
     """Bytes rank ``c`` has free for new pool rows.  ``(headroom, transient, note)``.
 
-    THREE CORRECTIONS, one per dead boot, all of them subtractions:
+    ``headroom = card_free_after_pools + kv_credit - transient(chunk) - floor``
 
-    1. ``card free`` is the residual after the transient, the allocator cache,
-       the fragmentation and the CUDA context -- so it is the headroom
-       instrument, not ``peak - allocated`` (fn8ak2 was planned on that and
-       died) and not ``reserved - allocated`` (which forbids boots that ran).
-    2. But the ``card free`` the log prints was sampled at the moment
-       ``maybe_log_vram_peak`` latched, which under chunked prefill is the
-       FIRST chunk, not the deepest one.  The true peak is bigger by
-       ``prefill_peak_allocated - peak_gib``, and the free column at that
-       moment is smaller by the same amount.  Without a measured true peak a
-       strict plan REFUSES -- the latched sample is a lower bound on the draw,
-       and calling it a maximum is what killed fn8ak3.
-    3. The transient is not one number per rank, it is a function of the
-       prefill chunk.  ``graph_private_gib`` (CUDA-graph private pools) does
-       not scale; the rest -- wave buffers, partials, the attention workspace
-       that grows with the cached context a chunk attends over -- does, near
-       enough to linearly to be worth pricing.  Halving CHUNK is therefore a
-       real lever on the row count, and the dry run prints both.
+    The transient is ``peak_alloc_deep - alloc_at_rest``, minus the rows the
+    measuring boot carried beyond this census (otherwise somebody else's arena
+    is charged as a transient).  Only the non-graph part scales with the chunk:
+    the CUDA-graph private pools are captured once.
+
+    The cross-check :attr:`RankCensus.transient_card_gib` is computed too and a
+    NOTE fires when it is larger -- it is the stricter bound and the one the
+    fn8ak3 OOM hit, because the allocator reserves more than it holds live.
     """
-    instrument = float(c.peak_gib) - float(c.allocated_gib)
     note: Optional[str] = None
     if c.prefill_peak_allocated_gib is None:
         if strict:
@@ -540,31 +470,29 @@ def rank_headroom_bytes(
                 c.rank,
                 0.0,
                 [
-                    ("card free at the LATCHED sample", float(c.card_free_gib) * GIB),
-                    ("transient the latched sample saw", instrument * GIB),
+                    (
+                        "card free after pools",
+                        float(c.card_free_after_pools_gib) * GIB,
+                    ),
+                    ("transient at the DEEPEST chunk", float("nan")),
                 ],
                 0.0,
             )
         note = (
-            f"rank{c.rank}: no measured prefill peak -- the latched "
-            f"[vram-peak] sample ({instrument:.2f} GiB drawn) is a LOWER bound "
-            "on the real draw, so the row count below is an UPPER BOUND and not "
-            "a budget. Boot the high-water instrument first"
+            f"rank{c.rank}: no measured DEEP prefill peak -- only the shallow "
+            f"high-water sample ({c.transient_card_gib:.2f} GiB of card free lost) "
+            "is known, and that is a LOWER bound on the draw. The row count is an "
+            "UPPER BOUND, not a budget"
         )
-        true_transient = instrument
+        true_transient = c.transient_card_gib
     else:
-        true_transient = float(c.prefill_peak_allocated_gib) - float(c.allocated_gib)
-    # The free column was read while only `instrument` was drawn.
-    free_gib = float(c.card_free_gib) - (true_transient - instrument)
-    target = true_transient
-    if prefill_chunk_tokens is not None and (
-        int(c.prefill_chunk_tokens) <= 0 or c.prefill_peak_allocated_gib is None
-    ):
-        note = (note + "; " if note else f"rank{c.rank}: ") + (
-            f"chunk {prefill_chunk_tokens} NOT priced -- this census carries no "
-            "measured peak at a known chunk size, so the number below is the same "
-            "at every chunk"
+        true_transient = max(
+            0.0,
+            float(c.prefill_peak_allocated_gib)
+            - float(c.alloc_at_rest_gib)
+            - float(c.peak_boot_extra_rows) * row_bytes / GIB,
         )
+    target = true_transient
     if (
         prefill_chunk_tokens is not None
         and int(c.prefill_chunk_tokens) > 0
@@ -574,8 +502,23 @@ def rank_headroom_bytes(
         target = float(c.graph_private_gib) + scalable * (
             float(prefill_chunk_tokens) / float(c.prefill_chunk_tokens)
         )
-        free_gib += true_transient - target
-    headroom = free_gib * GIB + float(kv_credit_bytes) - float(floor_bytes)
+    headroom = (
+        float(c.card_free_after_pools_gib) * GIB
+        + float(kv_credit_bytes)
+        - target * GIB
+        - float(floor_bytes)
+    )
+    if c.transient_card_gib > target:
+        extra = (
+            f"rank{c.rank}: the CARD-side transient reading is "
+            f"{c.transient_card_gib:.2f} GiB against the {target:.2f} GiB priced "
+            f"here -- {(c.transient_card_gib - target) * GIB / MIB:.0f} MiB of "
+            "allocator reservation that never returns to the driver. The stricter "
+            "reading allows "
+            f"{max(0, int((headroom - (c.transient_card_gib - target) * GIB) // row_bytes))} "
+            "row(s)"
+        )
+        note = (note + "; " + extra) if note else extra
     return headroom, target, note
 
 
@@ -614,44 +557,38 @@ def plan_expert_pool(
             f"{[c.page_size for c in ranks]} -- refusing to pick one"
         )
 
-    unit = 0
+    world = 0
     needs: List[int] = []
     for c in ranks:
-        unit, local = kv_tokens_for_rank(
+        world, rows = kv_rows_for_rank(
             ctx_tokens=ctx_tokens,
             spec_tokens=spec_tokens,
             dcp_ratios=ratios,
             rank=c.rank,
-            page_size=page,
         )
-        needs.append(local)
-    world = int(unit) * sum(ratios)
+        needs.append(rows)
+    unit = world // sum(ratios)
     cap = int(max_total_tokens) if max_total_tokens is not None else world
     notes: List[str] = []
     if cap < world:
         notes.append(
-            f"--max-total-tokens {cap} is below the world pool {world}: it clamps "
-            f"the GLOBAL context budget, so requests longer than ~{cap} tokens are "
-            "refused however big the per-rank pools are (fn8am)"
+            f"--max-total-tokens {cap} is below the world context {world}: the flag "
+            "IS C, so requests longer than that are refused however big the pools "
+            "are (fn8am refused a 259415-token needle at 90810)"
         )
 
     plans: List[RankPlan] = []
     for c, need in zip(ranks, needs):
-        # Each rank physically stores ``C * ratio_r / S`` tokens -- its OWN
-        # share, never the cap.  fn8am is why this is not ``cap``: the flag is
-        # a GLOBAL budget under weighted uneven DCP, and charging every rank
-        # the global number over-charged rank 2 by a row and, worse, suggested
-        # the flag was a pool size.
-        kv_tokens = int(need)
-        kv_bytes = kv_tokens * int(c.cell_size)
-        # CREDIT, not a post: shrinking the pool to the DCP need hands those
-        # bytes back to the card before anything else runs.
-        credit = float(c.kv_bytes_now - kv_bytes)
-        card_free = float(c.card_free_gib) * GIB
         row_bytes = row_bytes_from_census(c.expert_tensor_gib, c.buffer_rows)
+        kv_bytes = int(need) * int(c.cell_size)
+        # CREDIT, and it is usually ZERO: the pool is already compacted to
+        # C x ratio_r / S. It is NEGATIVE when C has to grow to serve the
+        # context -- then restoring the pool costs rows, it does not fund them.
+        credit = float(c.kv_bytes_now - kv_bytes)
         headroom, transient_gib, note = rank_headroom_bytes(
             c,
             kv_credit_bytes=credit,
+            row_bytes=row_bytes,
             prefill_chunk_tokens=prefill_chunk_tokens,
             floor_bytes=floor_bytes,
             strict=strict,
@@ -663,12 +600,12 @@ def plan_expert_pool(
                 c.rank,
                 headroom,
                 [
-                    ("card free at worst observed state", card_free),
                     (
-                        "prefill transient (measured, at this chunk)",
-                        -transient_gib * GIB,
+                        "card free after pools",
+                        float(c.card_free_after_pools_gib) * GIB,
                     ),
-                    ("KV pool credit (now - DCP need)", credit),
+                    ("KV pool credit (allocated now - DCP need)", credit),
+                    ("prefill transient at this chunk", -transient_gib * GIB),
                     ("floor", -float(floor_bytes)),
                 ],
                 -headroom,
@@ -680,24 +617,18 @@ def plan_expert_pool(
             surplus = 0
             taken = rows
         else:
-            # The fn8ak finding: R + C above E_local is not a bigger pool, it is
-            # the RuntimeError at expert_offload.py:3898.  The excess belongs to
-            # the OWNERSHIP vector (--rank-moe-ratio), not to this arena.
             bound_by = "ownership (buffer_size == R+C <= E_local)"
             surplus = rows - ownable
             taken = ownable
         scratch = c.scratch + taken
-        # What the sizer must NOT hand back to KV next boot: everything between
-        # this rank's available_bytes and the KV need, minus what the new rows
-        # already take out of the same budget post.
         book = (float(c.available_bytes) - kv_bytes - taken * row_bytes) / MIB
         plans.append(
             RankPlan(
                 rank=c.rank,
-                kv_tokens=kv_tokens,
+                kv_tokens=int(need),
                 kv_bytes=kv_bytes,
                 kv_credit_bytes=credit,
-                card_free_bytes=card_free,
+                card_free_bytes=float(c.card_free_after_pools_gib) * GIB,
                 headroom_bytes=headroom,
                 row_bytes=row_bytes,
                 rows_affordable=taken,
@@ -728,9 +659,71 @@ def plan_expert_pool(
         dcp_ratios=ratios,
         unit_tokens=int(unit),
         max_total_tokens=int(cap),
-        pool_cap_tokens=tuple(int(n) for n in needs),
         notes=tuple(notes),
     )
+
+
+def survey_ranks(
+    census: Sequence[RankCensus],
+    *,
+    ctx_tokens: int,
+    spec_tokens: int = 0,
+    floor_bytes: int = DEFAULT_FLOOR_BYTES,
+    prefill_chunk_tokens: Optional[int] = None,
+    strict: bool = True,
+) -> Tuple[str, ...]:
+    """One line per rank, refusals INCLUDED instead of raising on the first.
+
+    :func:`plan_expert_pool` refuses by name and stops, which is right for a
+    caller that wants a vector.  A reader wants to see every rank -- especially
+    when one refuses, because "rank 0 is short by 0.6 GiB" says nothing about
+    whether the 3080s have room.  Same arithmetic, no exception.
+    """
+    ranks = sorted(census, key=lambda c: c.rank)
+    ratios = tuple(c.dcp_ratio for c in ranks)
+    out: List[str] = []
+    for c in ranks:
+        _, need = kv_rows_for_rank(
+            ctx_tokens=ctx_tokens,
+            spec_tokens=spec_tokens,
+            dcp_ratios=ratios,
+            rank=c.rank,
+        )
+        row_bytes = row_bytes_from_census(c.expert_tensor_gib, c.buffer_rows)
+        credit = float(c.kv_bytes_now - need * int(c.cell_size))
+        try:
+            headroom, transient, note = rank_headroom_bytes(
+                c,
+                kv_credit_bytes=credit,
+                row_bytes=row_bytes,
+                prefill_chunk_tokens=prefill_chunk_tokens,
+                floor_bytes=floor_bytes,
+                strict=strict,
+            )
+        except ExpertPoolBudgetRefused as exc:
+            out.append(f"rank{c.rank}: REFUSED -- {exc}")
+            continue
+        ownable = c.owned_experts - c.residents - c.scratch
+        rows = int(math.floor(headroom / row_bytes)) if headroom >= 0 else 0
+        taken = min(rows, ownable)
+        verdict = (
+            f"+{taken} row(s) -> C {c.scratch + taken}"
+            if headroom >= 0
+            else f"SHORT by {-headroom / MIB:.0f} MiB -- no rows, and "
+            f"{int(-headroom // row_bytes) + 1} of the current {c.scratch} would "
+            "have to go back"
+        )
+        out.append(
+            f"rank{c.rank}: pool {c.kv_rows_now} -> {need} rows "
+            f"(credit {credit / GIB:+.3f} GiB) | free at rest "
+            f"{c.card_free_after_pools_gib:.2f} | transient {transient:.2f} "
+            f"(card reading {c.transient_card_gib:.2f}) | row "
+            f"{row_bytes / MIB:.1f} MiB | headroom {headroom / GIB:+.3f} GiB | "
+            f"{verdict}"
+        )
+        if note:
+            out.append(f"    NOTE {note}")
+    return tuple(out)
 
 
 def verify_scratch_vector(
@@ -751,29 +744,42 @@ def verify_scratch_vector(
     it names the ownership contradiction rank 2 died on, and fed fn8ak2's
     ``175,60,54`` it names the rows rank 0 was over budget by.
     """
-    plan = plan_expert_pool(
-        census,
-        ctx_tokens=ctx_tokens,
-        spec_tokens=spec_tokens,
-        floor_bytes=floor_bytes,
-        max_total_tokens=max_total_tokens,
-        prefill_chunk_tokens=prefill_chunk_tokens,
-        strict=strict,
-    )
+    ranks = sorted(census, key=lambda x: x.rank)
     proposed = [int(x) for x in scratch]
-    if len(proposed) != len(plan.ranks):
+    if len(proposed) != len(ranks):
         raise ValueError(
-            f"scratch vector has {len(proposed)} entries for "
-            f"{len(plan.ranks)} ranks"
+            f"scratch vector has {len(proposed)} entries for {len(ranks)} ranks"
         )
-    out: List[str] = []
-    for c, p, want in zip(sorted(census, key=lambda x: x.rank), plan.ranks, proposed):
+    # The pool identity needs NO budget, so it is checked first and separately:
+    # a rank the budget cannot price still has a verdict on whether its C is
+    # even representable (fn8ak died on exactly this, before any memory ran
+    # out).
+    identity: List[str] = []
+    for c, want in zip(ranks, proposed):
         if c.residents + want > c.owned_experts:
-            out.append(
+            identity.append(
                 f"rank{c.rank}: C={want} breaks the pool identity -- "
                 f"'pool mode requires buffer_size == R+C "
                 f"({c.owned_experts} != {c.residents}+{want})'"
             )
+    try:
+        plan = plan_expert_pool(
+            census,
+            ctx_tokens=ctx_tokens,
+            spec_tokens=spec_tokens,
+            floor_bytes=floor_bytes,
+            max_total_tokens=max_total_tokens,
+            prefill_chunk_tokens=prefill_chunk_tokens,
+            strict=strict,
+        )
+    except ExpertPoolBudgetRefused as exc:
+        return tuple(identity) + (
+            f"rank{exc.rank}: the budget cannot be priced, so the remaining "
+            f"ranks are unchecked -- {exc}",
+        )
+    out: List[str] = list(identity)
+    for c, p, want in zip(ranks, plan.ranks, proposed):
+        if c.residents + want > c.owned_experts:
             continue
         over = (want - c.scratch) - p.rows_affordable
         if over > 0:
@@ -805,21 +811,23 @@ _RE_POOL = re.compile(
     r"MoE expert pool on layer 0: residents (\d+), LRU rows (\d+), "
     r"staging (\d+), spill rows (\d+)"
 )
-_RE_DCP = re.compile(
-    r"Uneven-DCP token sizing: rank (\d+) local capacity (\d+) tokens / ratio "
-    r"(\d+)\b.*?vector \[([\d, ]+)\]"
-)
+_RE_DCP = re.compile(r"Uneven-DCP token sizing: rank \d+ .*?vector \[([\d, ]+)\]")
+#: The ALLOCATION, not the capacity. A boot allocates several pools (draft/MTP,
+#: QSA index, the main one); the MAIN one is the one with the largest K size,
+#: never the one with the largest token count -- on fn8am the 90816-token pool
+#: is the 1-layer draft pool at 0.02 GB while the main pool is 31229 tokens at
+#: 0.18 GB.
+_RE_ALLOC = re.compile(r"KV Cache is allocated\..*?#tokens: (\d+), K size: ([\d.]+) GB")
 
 _REQUIRED = (
     "available_bytes",
     "cell_size",
     "page_size",
-    "kv_tokens_now",
-    "card_free_gib",
+    "kv_rows_now",
+    "card_free_after_pools_gib",
+    "alloc_at_rest_gib",
+    "card_free_worst_gib",
     "card_total_gib",
-    "reserved_gib",
-    "allocated_gib",
-    "peak_gib",
     "expert_tensor_gib",
     "residents",
     "lru_rows",
@@ -835,9 +843,13 @@ def parse_boot_log(text: str) -> Tuple[RankCensus, ...]:
     the log does not state.  Two choices are load-bearing and both are the
     conservative one:
 
-    * the ``[vram-peak]`` line kept per rank is the one with the MINIMUM
-      ``card free`` -- the worst load state, which is the one a deployment
-      serves;
+    * the AT-REST sample is the ``[vram-peak] high-water (1 rows)`` line --
+      every pool exists and no traffic has drawn anything yet -- while
+      ``card_free_worst`` is the MINIMUM over every ``[vram-peak]`` line, the
+      worst load state the deployment actually served;
+    * the pool row count comes from the ``KV Cache is allocated`` line with the
+      LARGEST K size, so a small draft pool with a big token count cannot be
+      mistaken for the main one;
     * ``-draft`` census lines are skipped, because the draft model's experts
       are not rows of this arena.
     """
@@ -862,12 +874,14 @@ def parse_boot_log(text: str) -> Tuple[RankCensus, ...]:
         if m and rank is not None:
             s = slot(rank)
             free = float(m.group(4))
-            if free <= s.get("card_free_gib", float("inf")):
-                s["peak_gib"] = float(m.group(1))
-                s["allocated_gib"] = float(m.group(2))
-                s["reserved_gib"] = float(m.group(3))
-                s["card_free_gib"] = free
-                s["card_total_gib"] = float(m.group(5))
+            s["card_total_gib"] = float(m.group(5))
+            if free < s.get("card_free_worst_gib", float("inf")):
+                s["card_free_worst_gib"] = free
+            # the AT-REST sample is the '(1 rows)' one: every pool exists and
+            # no traffic has drawn anything yet.
+            if " (1 rows)" in line:
+                s["card_free_after_pools_gib"] = free
+                s["alloc_at_rest_gib"] = float(m.group(2))
             continue
         m = _RE_CENSUS.search(line)
         if m and "-draft" not in line:
@@ -881,12 +895,17 @@ def parse_boot_log(text: str) -> Tuple[RankCensus, ...]:
             s["staging"] = float(m.group(3))
             s["spill_rows"] = float(m.group(4))
             continue
+        m = _RE_ALLOC.search(line)
+        if m and rank is not None:
+            s = slot(rank)
+            k_gb = float(m.group(2))
+            if k_gb > s.get("_k_gb", -1.0):
+                s["_k_gb"] = k_gb
+                s["kv_rows_now"] = float(m.group(1))
+            continue
         m = _RE_DCP.search(line)
-        if m:
-            s = slot(int(m.group(1)))
-            s["kv_tokens_now"] = float(m.group(2))
-            if not ratios:
-                ratios = tuple(int(x) for x in m.group(4).split(","))
+        if m and not ratios:
+            ratios = tuple(int(x) for x in m.group(1).split(","))
 
     if not ratios:
         raise ValueError(
@@ -910,12 +929,11 @@ def parse_boot_log(text: str) -> Tuple[RankCensus, ...]:
                 available_bytes=int(s["available_bytes"]),
                 cell_size=int(s["cell_size"]),
                 page_size=int(s["page_size"]),
-                kv_tokens_now=int(s["kv_tokens_now"]),
-                card_free_gib=s["card_free_gib"],
+                kv_rows_now=int(s["kv_rows_now"]),
+                card_free_after_pools_gib=s["card_free_after_pools_gib"],
+                alloc_at_rest_gib=s["alloc_at_rest_gib"],
+                card_free_worst_gib=s["card_free_worst_gib"],
                 card_total_gib=s["card_total_gib"],
-                reserved_gib=s["reserved_gib"],
-                allocated_gib=s["allocated_gib"],
-                peak_gib=s["peak_gib"],
                 expert_tensor_gib=s["expert_tensor_gib"],
                 residents=int(s["residents"]),
                 lru_rows=int(s["lru_rows"]),
@@ -968,7 +986,17 @@ def dry_run(
             )
             out.append(f"{head}\n{plan.report()}")
         except ExpertPoolBudgetRefused as exc:
-            out.append(f"{head}\nREFUSED: {exc}")
+            survey = "\n".join(
+                survey_ranks(
+                    census,
+                    ctx_tokens=ctx_tokens,
+                    spec_tokens=spec_tokens,
+                    floor_bytes=floor_bytes,
+                    prefill_chunk_tokens=chunk,
+                    strict=strict,
+                )
+            )
+            out.append(f"{head}\nREFUSED: {exc}\n{survey}")
     return "\n\n".join(out)
 
 

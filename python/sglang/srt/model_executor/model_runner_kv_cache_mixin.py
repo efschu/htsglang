@@ -235,9 +235,9 @@ def _is_draft_kv_only_producer(runner) -> bool:
     if got is not None:
         return bool(got)
     server_args = getattr(runner, "server_args", None)
-    return bool(getattr(server_args, "speculative_draft_kv_only", False)) and not bool(
-        getattr(runner, "is_draft_worker", False)
-    )
+    return bool(
+        getattr(server_args, "speculative_draft_kv_only", False)
+    ) and not bool(getattr(runner, "is_draft_worker", False))
 
 
 def _note_mamba_component(runner, name: str, gb: float) -> None:
@@ -364,53 +364,6 @@ _is_hip = is_hip()
 
 
 PREFILL_TRANSIENT_ENV = "SGLANG_KV_BUDGET_PREFILL_TRANSIENT_MIB"
-
-KV_POOL_CAP_ENV = "SGLANG_KV_POOL_CAP_TOKENS"
-
-
-def kv_pool_cap_tokens_for_rank(text: str, rank: int) -> Optional[int]:
-    """Task #14/#48 (20.09.): a cap on THIS RANK'S PHYSICAL KV pool, tokens.
-
-    Scalar (every rank) or a comma vector (one entry per rank). Empty -> None,
-    and sizing is byte-identical to before.
-
-    WHY THIS IS NOT ``--max-total-tokens``. That flag is applied twice in
-    :meth:`_apply_token_constraints`: once to ``P_r`` (this rank's physical
-    capacity) and once, thirty lines later, to the GLOBAL context budget
-    ``C = min_r(P_r // ratio_r) * S``.  The second clamp is what
-    ``max_req_input_len`` is built from, so using the flag to size a pool also
-    cuts the context every request is allowed -- fn8am refused a 259415-token
-    needle at 90810 because its pool cap was read as a context ceiling.
-
-    REFUSAL BY NAME rather than a silent fallback: an unparsable value, a
-    non-positive one, or a vector whose length does not match the rank vector
-    raises.  A pool cap that silently does nothing is how a boot spends a GPU
-    window measuring the configuration it thought it had replaced.
-    """
-    t = (text or "").strip()
-    if not t:
-        return None
-    parts = [x.strip() for x in t.split(",")]
-    try:
-        values = [int(x) for x in parts]
-    except ValueError as exc:
-        raise ValueError(
-            f"{KV_POOL_CAP_ENV}={text!r} is not an integer or a comma vector of "
-            "integers (tokens)"
-        ) from exc
-    if any(v <= 0 for v in values):
-        raise ValueError(
-            f"{KV_POOL_CAP_ENV}={text!r} must be positive: a pool of 0 tokens is "
-            "not a smaller pool, it is a boot that cannot serve"
-        )
-    if len(values) == 1:
-        return values[0]
-    if not 0 <= int(rank) < len(values):
-        raise ValueError(
-            f"{KV_POOL_CAP_ENV} vector has {len(values)} entries ({text}) but this "
-            f"rank's index is {rank}; give one entry per rank or a single value"
-        )
-    return values[int(rank)]
 
 
 def prefill_transient_mib_for_rank(text: str, rank: int) -> float:
@@ -2710,9 +2663,9 @@ class ModelRunnerKVCacheMixin:
         # kv_lora_rank + scale storage (kv_lora_rank // quant_block_size * 4 bytes) + rope dimension storage
         # Note: rope dimension is stored in original dtype (bf16), not quantized to fp8
         if kv_cache_dtype == torch.float8_e4m3fn:
-            assert (
-                kv_lora_rank % quant_block_size == 0
-            ), f"kv_lora_rank {kv_lora_rank} must be multiple of quant_block_size {quant_block_size}"
+            assert kv_lora_rank % quant_block_size == 0, (
+                f"kv_lora_rank {kv_lora_rank} must be multiple of quant_block_size {quant_block_size}"
+            )
 
             return (
                 kv_lora_rank
@@ -2736,9 +2689,9 @@ class ModelRunnerKVCacheMixin:
                 else:
                     additional_ratio = MAMBA_CACHE_V2_ADDITIONAL_RATIO_OVERLAP
             else:
-                assert (
-                    not self.server_args.enable_mamba_extra_buffer_lazy()
-                ), "Lazy extra buffer requires overlap schedule (--disable-overlap-schedule is incompatible)"
+                assert not self.server_args.enable_mamba_extra_buffer_lazy(), (
+                    "Lazy extra buffer requires overlap schedule (--disable-overlap-schedule is incompatible)"
+                )
                 additional_ratio = MAMBA_CACHE_V2_ADDITIONAL_RATIO_NO_OVERLAP
 
         ratio = MAMBA_CACHE_SIZE_MAX_RUNNING_REQUESTS_RATIO + additional_ratio
@@ -2882,7 +2835,9 @@ class ModelRunnerKVCacheMixin:
                 reserve_mib = int(DEFAULT_USER_RESERVE_MIB)
             else:
                 scalar = getattr(self.server_args, "user_reserve_mib_scalar", None)
-                reserve_mib = int(scalar()) if callable(scalar) else int(configured)
+                reserve_mib = (
+                    int(scalar()) if callable(scalar) else int(configured)
+                )
             if reserve_mib <= 0:
                 return rest_memory, None
             reserve_gb = reserve_mib / 1024.0
@@ -3015,9 +2970,9 @@ class ModelRunnerKVCacheMixin:
 
         config = self.mambaish_config
         assert config is not None
-        assert (
-            not self.use_mla_backend
-        ), "unified memory pool does not support MLA-hybrid-Mamba yet"
+        assert not self.use_mla_backend, (
+            "unified memory pool does not support MLA-hybrid-Mamba yet"
+        )
         # The full sub-pool is page-aware (via `MultiEndedAllocator(page_size=...)`);
         # the mamba sub-pool stays page=1.
         assert self.page_size >= 1, f"page_size must be >= 1, got {self.page_size}"
@@ -3102,9 +3057,9 @@ class ModelRunnerKVCacheMixin:
         # Both sub-pools are page-aware; the SWA composite runs alloc_extend_kernel
         # once in virtual space and binds the new pages on both sub-allocators.
         assert self.page_size >= 1, f"page_size must be >= 1, got {self.page_size}"
-        assert (
-            not self.use_mla_backend
-        ), "unified memory pool does not support MLA-SWA hybrid yet"
+        assert not self.use_mla_backend, (
+            "unified memory pool does not support MLA-SWA hybrid yet"
+        )
         # Mirror the non-shared path's extra_max_context_len computation.
         extra_max_context_len = 4
         if self.server_args.speculative_num_draft_tokens is not None:
@@ -4602,7 +4557,9 @@ class ModelRunnerKVCacheMixin:
                         qsa_index_head_dim=_qsa_profile.head_dim,
                         qsa_compress_ratio=_qsa_profile.compress_ratio,
                         qsa_token_topk=_qsa_profile.budget,
-                        num_request_slots=self.req_to_token_pool.req_to_token.shape[0],
+                        num_request_slots=self.req_to_token_pool.req_to_token.shape[
+                            0
+                        ],
                         # WP3: the compressed cache mirrors the GLOBAL slot
                         # space of req_to_token, not this rank's DCP slice.
                         qsa_slot_space=int(self.max_total_num_tokens),
@@ -4686,9 +4643,9 @@ class ModelRunnerKVCacheMixin:
                     self._kv_sess_attach_host_pool()
             else:
                 if is_float4_e2m1fn_x2(self.kv_cache_dtype):
-                    assert (
-                        not enable_page_major
-                    ), "page-major KV layout is not supported with fp4 KV cache"
+                    assert not enable_page_major, (
+                        "page-major KV layout is not supported with fp4 KV cache"
+                    )
                     self.token_to_kv_pool = MHATokenToKVPoolFP4(
                         self._dcp_token_sharded_pool_rows(self.max_total_num_tokens),
                         page_size=self.page_size,
@@ -5166,42 +5123,6 @@ class ModelRunnerKVCacheMixin:
                     f"{token_capacity}. Use the profiled value instead."
                 )
             token_capacity = min(token_capacity, user_limit)
-
-        # Task #14/#48 (20.09., fn8am): the PER-RANK POOL CAP, separate from
-        # --max-total-tokens.
-        #
-        # `token_capacity` is P_r here -- THIS RANK'S PHYSICAL token capacity.
-        # Thirty lines down, the weighted uneven-DCP block turns it into the
-        # GLOBAL context budget C = min_r(P_r // ratio_r) * S and clamps THAT
-        # by the same `user_limit` again. One scalar, two incompatible
-        # quantities, and the second clamp is the one the length check reads
-        # (scheduler.py:5051 -> managers/utils.py:202 `max_req_input_len`).
-        #
-        # Measured, fn8am: `--max-total-tokens 90816` was chosen as a per-rank
-        # pool size. It clamped P_r (intended) and then clamped C to 90816 as
-        # well, so a 259415-token needle was REFUSED with "Input length
-        # (259415 tokens) exceeds the maximum allowed length (90810 tokens)" on
-        # a group whose projected capacity was 264192. The pool was correct;
-        # the ceiling was not.
-        #
-        # This env caps ONLY P_r. --max-total-tokens keeps both of its meanings
-        # byte-identically, so no existing recipe moves. Shrinking P_r lowers C
-        # through the unit relation on purpose -- that is the point: capping
-        # P_r at `unit * ratio_r` is how a boot asks for exactly the context it
-        # wants and no more pool than that context needs.
-        pool_cap = kv_pool_cap_tokens_for_rank(
-            os.environ.get(KV_POOL_CAP_ENV, ""), self._rank_vector_index()
-        )
-        if pool_cap is not None:
-            logger.info(
-                "%s=%d caps this rank's PHYSICAL pool (profiled %d); "
-                "--max-total-tokens (%s) still owns the GLOBAL context ceiling",
-                KV_POOL_CAP_ENV,
-                pool_cap,
-                int(token_capacity),
-                user_limit,
-            )
-            token_capacity = min(token_capacity, pool_cap)
 
         # Multi-group runtime (#274): a dual-group lane runner sizes RANK-LOCAL
         # by contract. Its scoped server_args view makes both sync predicates
@@ -7944,9 +7865,9 @@ class ModelRunnerKVCacheMixin:
             # caller-supplied pool config it is supposed to RESOLVE, and
             # every rank died here with "Draft worker requires
             # memory_pool_config" (measured, boot 15, 2026-08-08).
-            assert (
-                self.memory_pool_config is not None
-            ), "Draft worker requires memory_pool_config"
+            assert self.memory_pool_config is not None, (
+                "Draft worker requires memory_pool_config"
+            )
         else:
             self.memory_pool_config = self._resolve_memory_pool_config(
                 pre_model_load_memory
