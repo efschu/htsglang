@@ -180,6 +180,22 @@ def maybe_log_vram_peak(runner, forward_batch, cuda=torch.cuda) -> Optional[str]
         alloc = cuda.memory_allocated() / 2**30
         reserved = cuda.memory_reserved() / 2**30
         free, total = cuda.mem_get_info()
+        # 20.09. (fn8am rank 1): 18.94 reserved against 12.06 allocated and
+        # 0.08 GiB free on the card, with expandable_segments:True on. Three
+        # columns cannot say what those ~6.9 GiB are, and the two candidates
+        # need different fixes -- CUDA-graph private pools are a capture-size
+        # decision, fragmentation is an allocator one. `inactive_split_bytes`
+        # is exactly "reserved, inside a split block, not usable for the next
+        # request", i.e. the fragmentation term; `num_alloc_retries` counts the
+        # times the allocator had to flush and retry, which is the symptom that
+        # precedes the OOM. Both are read-only counters.
+        frag = retries = -1.0
+        try:
+            stats = cuda.memory_stats()
+            frag = float(stats.get("inactive_split_bytes.all.current", 0)) / 2**30
+            retries = float(stats.get("num_alloc_retries", 0))
+        except Exception:  # noqa: BLE001 -- an instrument never kills a forward
+            pass
         n = (
             int(getattr(forward_batch, "input_ids").shape[0])
             if getattr(forward_batch, "input_ids", None) is not None
@@ -187,7 +203,9 @@ def maybe_log_vram_peak(runner, forward_batch, cuda=torch.cuda) -> Optional[str]
         )
         logger.info(
             "[vram-peak] %s (%s rows): allocator peak since pools %.2f GiB, allocated now %.2f, "
-            "reserved %.2f, card free %.2f of %.2f GiB -> transient headroom used = peak - allocated %.2f GiB",
+            "reserved %.2f, card free %.2f of %.2f GiB -> transient headroom used = peak - allocated %.2f GiB"
+            " | cache = reserved - allocated %.2f GiB, of which fragmentation "
+            "(inactive split) %.2f GiB, alloc retries %.0f",
             kind,
             n,
             peak,
@@ -196,6 +214,9 @@ def maybe_log_vram_peak(runner, forward_batch, cuda=torch.cuda) -> Optional[str]
             free / 2**30,
             total / 2**30,
             peak - alloc,
+            reserved - alloc,
+            frag,
+            retries,
         )
     except Exception as exc:  # noqa: BLE001
         logger.debug("[vram-peak] skipped: %s", exc)
