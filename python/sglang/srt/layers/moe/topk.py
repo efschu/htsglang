@@ -34,6 +34,11 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
+from sglang.srt.layers.moe.router_nan_probe import (
+    guarded_denominator,
+    renorm_guard_on,
+    renorm_rows_that_would_nan,
+)
 from sglang.srt.runtime_context import get_parallel
 
 try:
@@ -674,7 +679,23 @@ def fused_topk_torch_native(
         topk_weights, topk_ids = torch.topk(topk_weights, topk, dim=-1)
 
     if renormalize:
-        topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+        # Task #49 (fn8c8b): an all-zero row of selected scores makes this
+        # 0/0 = NaN for EVERY one of the token's K weights at once, which is
+        # precisely the contiguous per-token block the probe saw arrive at
+        # GEMM2 through mul_topk_weights. The guard is OPT-IN -- on by default
+        # it would mask the defect instead of repairing it.
+        _den = topk_weights.sum(dim=-1, keepdim=True)
+        if renorm_guard_on():
+            _fired = renorm_rows_that_would_nan(_den)
+            if _fired:
+                logger.error(
+                    "[nan-probe-rw] RENORM GUARD fired on %d of %d rows in "
+                    "fused_topk_torch_native -- these rows would have become "
+                    "0/0 = NaN across all K weights",
+                    _fired, int(_den.shape[0]),
+                )
+            _den = guarded_denominator(_den)
+        topk_weights = topk_weights / _den
     return topk_weights, topk_ids
 
 
@@ -948,6 +969,16 @@ def grouped_topk_gpu(
             if num_fused_shared_experts == 0
             else topk_weights[:, :-1].sum(dim=-1, keepdim=True)
         )
+        if renorm_guard_on():
+            _fired = renorm_rows_that_would_nan(topk_weights_sum)
+            if _fired:
+                logger.error(
+                    "[nan-probe-rw] RENORM GUARD fired on %d of %d rows in "
+                    "biased_grouped_topk_impl -- these rows would have become "
+                    "0/0 = NaN across all K weights",
+                    _fired, int(topk_weights_sum.shape[0]),
+                )
+            topk_weights_sum = guarded_denominator(topk_weights_sum)
         topk_weights = topk_weights / topk_weights_sum
         if apply_routed_scaling_factor_on_output:
             topk_weights *= routed_scaling_factor

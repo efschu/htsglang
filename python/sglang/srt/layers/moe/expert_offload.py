@@ -4565,6 +4565,8 @@ class MoEExpertOffloadCache:
 
         flat_ids = topk_ids.reshape(-1)
         flat_weights = topk_weights.reshape(-1, 1).contiguous()
+        # Task #49 (fn8c8b): ROUTER-W resolved into gate / renorm / gather.
+        _router_probe(router_logits, topk_weights, flat_weights, T, K)
         partials = None
         combine_out = None
 
@@ -5244,3 +5246,84 @@ def presplit_expert_offload_after_repack(
             _ct.CDLL("libc.so.6").malloc_trim(0)
         except Exception:
             pass
+
+
+# --- Task #49 (2026-09-20, after fn8c8b): the router-level probe ------------
+#
+# fn8c8b put the NaN in topk_weights, on the way into GEMM2's
+# mul_topk_weights. This splits that one verdict into three, so the next boot
+# does not have to guess which half of the router did it:
+#
+#   GATE-LOGITS   -- router_logits already non-finite: the gate GEMM (or the
+#                    model) made it and softmax/sigmoid only carried it.
+#   TOPK-WEIGHTS  -- logits finite, weights not: the selection and its
+#                    renormalisation made it. The 0/0 case.
+#   GATHERED      -- both finite, only the wave-slice gather dirty. Reading the
+#                    gather, that should be impossible (index_select over
+#                    flatnonzero indices); if it ever fires, the index is wrong
+#                    and this is the finding.
+#
+# Budgeted and capture-gated through the same helpers as the level-2 stage
+# walk, so it can never repeat the fn8c5 mistake of syncing inside a graph
+# capture.
+_ROUTER_PROBE_LOGGED = {"n": 0}
+_ROUTER_PROBE_BUDGET = 24
+
+
+def _router_probe(router_logits, topk_weights, flat_weights, T, K) -> None:
+    # This module imports logging per function rather than at module scope;
+    # every other logging site here does the same, so this one follows suit.
+    import logging
+
+    import torch
+
+    logger = logging.getLogger(__name__)
+    try:
+        from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import (
+            _bad_rows,
+            _capture_active,
+            _first,
+            _n,
+            marlin_stage_probe_on,
+        )
+        from sglang.srt.layers.moe.router_nan_probe import classify_router_origin
+
+        if not marlin_stage_probe_on() or _capture_active():
+            return
+        if _ROUTER_PROBE_LOGGED["n"] >= _ROUTER_PROBE_BUDGET:
+            return
+
+        levels = {}
+        lg = None
+        if isinstance(router_logits, torch.Tensor) and router_logits.dim() >= 2:
+            lg = _bad_rows(router_logits)
+            levels["GATE-LOGITS"] = _n(lg)
+        tw = _bad_rows(topk_weights.reshape(T, -1))
+        levels["TOPK-WEIGHTS"] = _n(tw)
+        gw = _bad_rows(flat_weights)
+        levels["GATHERED"] = _n(gw)
+
+        if all(v == 0 for v in levels.values()):
+            return
+        _ROUTER_PROBE_LOGGED["n"] += 1
+        origin = classify_router_origin(levels)
+        # A per-token failure hits ALL K of that token's weights; a per-pair one
+        # does not. The ratio is the discriminator between "the renorm divided
+        # this token by zero" and "one weight went bad on its own".
+        bad_pairs = levels["GATHERED"]
+        bad_tokens = levels["TOPK-WEIGHTS"]
+        logger.error(
+            "[nan-probe-rw] ROUTER-ORIGIN %s: T=%d K=%d bad_logit_rows=%s "
+            "bad_weight_tokens=%d bad_flat_pairs=%d pairs_per_bad_token=%.2f "
+            "first_bad_logits=%s first_bad_tokens=%s "
+            "-- pairs_per_bad_token == K means every weight of those tokens is "
+            "gone at once, which is the signature of the unguarded "
+            "topk_weights / topk_weights.sum() (0/0); a value below K means "
+            "individual weights failed and the renorm is NOT the cause",
+            origin, int(T), int(K),
+            levels.get("GATE-LOGITS", "unmeasured"), bad_tokens, bad_pairs,
+            (bad_pairs / bad_tokens) if bad_tokens else float("nan"),
+            _first(lg), _first(tw),
+        )
+    except Exception as exc:  # noqa: BLE001 -- an instrument never kills a layer
+        logger.debug("[nan-probe-rw] router probe skipped: %s", exc)
