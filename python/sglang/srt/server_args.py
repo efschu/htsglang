@@ -8625,7 +8625,14 @@ class ServerArgs:
         # token OWNERSHIP under weighted uneven DCP -- one page would span two
         # owner ranks. QSA needs page_size >= 32 (qsa_kv_pool: page_size //
         # ratio >= 8), so the refusal is keyed on the owner mode, not on 1.
-        if self.page_size != 1 and self.uneven_weighted_dcp_enabled():
+        # ... and ownership only exists with tp_size > 1: a PP3 group with
+        # tp_size 1 per stage carries the env pair out of habit (arm_fnw) while
+        # its dcp_size collapses to 1 -- fnFL1b refused itself on that habit.
+        if (
+            self.page_size != 1
+            and self.uneven_weighted_dcp_enabled()
+            and int(getattr(self, "tp_size", 1) or 1) > 1
+        ):
             raise ValueError(
                 "--hicache-canonical-kv-page requires --page-size 1 under "
                 f"weighted uneven DCP, got {self.page_size}. A multi-token "

@@ -18,11 +18,12 @@ from sglang.srt.server_args import ServerArgs
 CELL_PER_TOKEN = 1088  # Next Flash: 1088 B per token per attention layer (design 2.1)
 
 
-def _args(page_size, weighted):
+def _args(page_size, weighted, tp_size=3):
     return types.SimpleNamespace(
         hicache_canonical_kv_page=True,
         hicache_storage_backend="file",
         page_size=page_size,
+        tp_size=tp_size,
         uneven_weighted_dcp_enabled=lambda: weighted,
     )
 
@@ -30,6 +31,8 @@ def _args(page_size, weighted):
 def test_page_64_is_admitted_when_no_weighted_dcp_owns_tokens():
     ServerArgs._handle_hicache_canonical_kv_page(_args(64, weighted=False))
     ServerArgs._handle_hicache_canonical_kv_page(_args(1, weighted=True))
+    # PP3 with tp_size 1 per stage carries the env pair out of habit: no owners
+    ServerArgs._handle_hicache_canonical_kv_page(_args(64, weighted=True, tp_size=1))
 
 
 def test_page_64_is_still_refused_under_weighted_uneven_dcp():
