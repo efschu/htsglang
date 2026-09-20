@@ -1483,7 +1483,13 @@ class Qwen4ExpLayerExtensionMixin:
             # Strip the block-type segment like the dense mlp (PLE is attn's sibling);
             # else the quant prefix misses the ckpt skip-list -> NaN.
             ple_prefix = prefix.replace(".linear_attn", "").replace(".self_attn", "")
-            self.ple = Qwen4ExpPLELayer(
+            # FORM A (F3, construction half): a worker holds experts and
+            # nothing else, so the PLE is never built there -- which is what
+            # actually keeps its parameters off the card. Inert on a classic
+            # boot (skip_on_worker returns None when no role plan is
+            # installed), so the default path constructs exactly as before.
+            _ple_ph = skip_on_worker("ple", ple_prefix)
+            self.ple = _ple_ph if _ple_ph is not None else Qwen4ExpPLELayer(
                 config,
                 quant_config=quant_config,
                 prefix=f"{ple_prefix}.ple" if ple_prefix else "ple",
@@ -1502,14 +1508,22 @@ class Qwen4ExpLayerExtensionMixin:
         # Task #46 (19.09.): the mixers may stay INT8 (SGLANG_HC_MIXER_INT8);
         # the prefix is the checkpoint name, which the CT config lists verbatim.
         hc_prefix = prefix.replace(".linear_attn", "").replace(".self_attn", "")
-        self.attn_hyper_connection = GatedResidual(
+        # FORM A (F3): the two hyper-connection mixers are the largest
+        # single post a worker carries for nothing -- they are NOT sharded
+        # (layers/hyperconnection.py builds plain nn.Linear), so every rank
+        # holds them in full: 0.63 GiB per rank in INT8, 1.19 in BF16
+        # (measured, boot fn8ah). Skipping their construction is where that
+        # VRAM actually comes back.
+        _attn_hc_ph = skip_on_worker("hyper_connection", f"{hc_prefix}.attn")
+        self.attn_hyper_connection = _attn_hc_ph if _attn_hc_ph is not None else GatedResidual(
             hc_config,
             use_mix=True,
             use_combine=True,
             quant_config=quant_config,
             prefix=f"{hc_prefix}.attn_hyper_connection" if hc_prefix else "attn_hyper_connection",
         )
-        self.mlp_hyper_connection = GatedResidual(
+        _mlp_hc_ph = skip_on_worker("hyper_connection", f"{hc_prefix}.mlp")
+        self.mlp_hyper_connection = _mlp_hc_ph if _mlp_hc_ph is not None else GatedResidual(
             hc_config,
             use_mix=True,
             use_combine=True,
@@ -2024,6 +2038,7 @@ _LAYER_ID_RE = re.compile(r"\.layers\.(\d+)\.")
 # Form A (F3): the loader veto in weight_name_needed. Imported at module
 # level rather than inside the method because it runs once per checkpoint
 # tensor -- 225.300 of them for this model.
+from sglang.srt.form_a_construction import skip_on_worker  # noqa: E402
 from sglang.srt.rank_role import (  # noqa: E402
     this_rank_is_form_a_worker,
     worker_keeps_parameter,

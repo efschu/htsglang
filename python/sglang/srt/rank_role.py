@@ -51,6 +51,8 @@ __all__ = [
     "guard_collective_subgroup",
     "guard_graph_mode",
     "guard_zero_width_linear",
+    "guard_zero_width_linear_shard",
+    "FormAZeroWidthLinear",
     "worker_keeps_parameter",
     "guard_dcp_merge",
     "UNWIRED_ORDER",
@@ -64,6 +66,17 @@ ROLES = (HOST, WORKER)
 
 class RankRoleError(ValueError):
     """The role vector is not a Form A role vector."""
+
+
+class FormAZeroWidthLinear(RankRoleError):
+    """A parallel Linear was constructed with a shard width of zero.
+
+    Its OWN class, and deliberately not a FormASeamNotWired: the refusal IS
+    the feature here, not a placeholder for missing work. Tying it to the
+    seam's wired flag would have made the backstop evaporate the moment the
+    seam was marked built -- which is exactly what happened on the first
+    attempt and is the reason this class exists.
+    """
 
 
 class FormASeamNotWired(NotImplementedError):
@@ -85,6 +98,14 @@ class Seam:
     where: str
     wired: bool
     note: str = ""
+    #: (path under python/sglang/srt, line, a substring that must be AT or
+    #: within a few lines of it). This is what makes the registry
+    #: self-checking: `where` is prose a reader trusts, `anchors` is the same
+    #: claim in a form a test can falsify. Measured need for it: in slice 5
+    #: the F4 entry still cited utils.py:1430 and :1180, both of which had
+    #: become other code -- a seam list whose file:line have drifted is worse
+    #: than no seam list, because it is believed.
+    anchors: Tuple[Tuple[str, int, str], ...] = ()
 
     def refuse(self, context: str = "") -> "FormASeamNotWired":
         tail = f" Context: {context}" if context else ""
@@ -105,6 +126,10 @@ SEAMS: Dict[str, Seam] = {
             wired=True,
             note="Slice 2: admitted only together with an explicit "
             "--rank-role vector, so an accidental zero still raises.",
+            anchors=(
+                ("server_args.py", 11990, "--rank-tp-ratio entries must be"),
+                ("server_args.py", 11962, "--rank-role requires an explicit"),
+            ),
         ),
         Seam(
             "F2",
@@ -115,24 +140,40 @@ SEAMS: Dict[str, Seam] = {
             wired=True,
             note="Slice 1 opened the arithmetic, slice 2 threaded it through "
             "the plan; the kv-group alignment composes.",
+            anchors=(
+                ("distributed/utils.py", 1348,
+                 "def _partition_units_with_empty_ranks"),
+                ("distributed/utils.py", 124, "def set_tp_partition_ratios"),
+            ),
         ),
         Seam(
             "F3",
             "a worker rank that never LOADS the dense weights (not merely "
             "idles through them)",
-            "models/qwen4_exp.py:2147-2158 weight_name_needed (the LOAD "
-            "veto -- BUILT), against the module construction in "
-            "qwen4_exp.py:1486-1518 / 1838 / 1895 and qwen3_5.py:797-830, "
-            "1090-1168 (NOT built)",
+            "models/qwen4_exp.py:2179 weight_name_needed (LOAD veto, "
+            "BUILT), :1491 and :1517/:1525 (CONSTRUCTION skip for ple and "
+            "both hyper_connections, BUILT), against qwen3_5.py:797-830 and "
+            "1090-1168 (self_attn / linear_attn / o_proj, NOT built)",
             wired=False,
-            note="HALF BUILT. The loader veto is in: a worker never READS a "
-            "dense tensor (measured against the real weight map -- 221.184 "
-            "of 225.300 names kept, 4.116 dropped, no shared expert, no "
-            "draft, no vision). What is NOT built is skipping the module "
-            "CONSTRUCTION, so create_weights still allocates the dense "
-            "tensors and the 2 x 1.84 GiB is saved in checkpoint I/O but "
-            "NOT yet in VRAM. The census on a worker must show 'experts' "
-            "alone before this flips to wired.",
+            note="TWO OF THREE BUILT. (1) The loader veto: a worker never "
+            "READS a dense tensor (checked against the real weight map -- "
+            "221.184 of 225.300 names kept, no shared expert, no draft, no "
+            "vision). (2) The CONSTRUCTION skip at the posts that cost most "
+            "-- the two hyper-connection mixers (not sharded at all, so "
+            "every rank held them in full: 0.63 GiB per rank in INT8) and "
+            "the PLE -- via form_a_construction.skip_on_worker, which puts "
+            "a parameter-free HostOnlyModule in their place. (3) NOT built: "
+            "the same skip for self_attn / linear_attn / o_proj / "
+            "embed_tokens / lm_head, which live in qwen3_5.py's decoder "
+            "layer. Until those land the worker census still shows more "
+            "than 'experts', which is the acceptance criterion "
+            "(form_a_construction.expected_census_categories).",
+            anchors=(
+                ("models/qwen4_exp.py", 2179, "this_rank_is_form_a_worker()"),
+                ("models/qwen4_exp.py", 1491, 'skip_on_worker("ple"'),
+                ("models/qwen4_exp.py", 1517,
+                 'skip_on_worker("hyper_connection"'),
+            ),
         ),
         Seam(
             "F4",
@@ -153,6 +194,10 @@ SEAMS: Dict[str, Seam] = {
             "same answer it already gives a shadow rank at :152-153). The "
             "pool ALLOCATION needs nothing: cell_size == 0 already has the "
             "_KVLESS_STAGE_TOKENS path at :256 / :553-557.",
+            anchors=(
+                ("distributed/utils.py", 1478, "def cp_token_context_budget"),
+                ("model_executor/pool_configurator.py", 173, "FORM A (F4)"),
+            ),
         ),
         Seam(
             "F5",
@@ -163,6 +208,10 @@ SEAMS: Dict[str, Seam] = {
             note="Under Form A the merge should not run at all (the host "
             "holds every head); the refusal exists so that a configuration "
             "that still reaches it says so instead of asserting.",
+            anchors=(
+                ("layers/dcp/comm.py", 197, "assert counts[rank] == local_heads"),
+                ("layers/dcp/comm.py", 222, "def cp_local_head_bounds"),
+            ),
         ),
         Seam(
             "F6",
@@ -173,6 +222,9 @@ SEAMS: Dict[str, Seam] = {
             note="Form A's decode path needs no subgroup as long as the MoE "
             "exchange spans all ranks; it becomes necessary when the dense "
             "layers want a collective the workers must not join.",
+            anchors=(
+                ("distributed/parallel_state.py", 618, "class GroupCoordinator"),
+            ),
         ),
         Seam(
             "F7",
@@ -183,6 +235,11 @@ SEAMS: Dict[str, Seam] = {
             note="Slice 3. barlink's facade still has no reduce; the "
             "exchange builds one from put and NAMES the all_reduce fallback "
             "rather than degrading silently.",
+            anchors=(
+                ("distributed/device_communicators/barlink_bar1.py", 3270,
+                 "def put"),
+                ("layers/moe/host_moe_exchange.py", 14, "host-centric"),
+            ),
         ),
         Seam(
             "F8",
@@ -194,6 +251,9 @@ SEAMS: Dict[str, Seam] = {
             wired=True,
             note="Slice 1 built the solve; the predictor's minimum-token "
             "rule still has to learn about worker ranks.",
+            anchors=(
+                ("uneven_perf.py", 196, "_SOLO_HOST_WORKSPACE_MIB"),
+            ),
         ),
         Seam(
             "F9",
@@ -205,6 +265,11 @@ SEAMS: Dict[str, Seam] = {
             note="Deferrable: the first Form A probe boot can run decode "
             "EAGER. That costs throughput but measures the per-layer chain, "
             "which is what the probe is for.",
+            anchors=(
+                ("layers/moe/offload_capture_gate.py", 236, "def env_graph_mode"),
+                ("layers/moe/offload_capture_gate.py", 249,
+                 "def resolve_offload_graph_mode"),
+            ),
         ),
         # ---- found by the slice-2 seam survey, not in the original nine ----
         Seam(
@@ -222,6 +287,11 @@ SEAMS: Dict[str, Seam] = {
             "Form A worker (0 / total * units = 0.0 < 1.0 always) and the "
             "refusal would have rejected every Form A vector as 'axis "
             "switched off'.",
+            anchors=(
+                ("weg2/launcher.py", 7226, "def _saturated"),
+                ("weg2/launcher.py", 7229,
+                 "Form A worker: not on this axis, not saturated"),
+            ),
         ),
         Seam(
             "F11",
@@ -229,15 +299,25 @@ SEAMS: Dict[str, Seam] = {
             "layers/linear.py:2069-2092 (row-parallel "
             "input_size_per_partition can be a true 0 on the element path), "
             ":670-699 (column-parallel output_partition_sizes=[0]), "
-            "distributed/utils.py:1790 assert_activation_aligned_shards "
+            "distributed/utils.py:1806 assert_activation_aligned_shards "
             "(0 % 8 == 0, so the only activation guard passes a zero "
-            "silently)",
-            wired=False,
-            note="THE DANGEROUS ONE. F.linear with K=0 does not raise, it "
-            "returns zeros, and the all-reduce adds them -- a wrong result "
-            "that is only visible at the output. Under Form A a worker must "
-            "not CONSTRUCT these layers at all (that is F3); this seam is "
-            "the backstop for the case where one slips through.",
+            "silently); backstop guard_zero_width_linear_shard at "
+            "layers/linear.py",
+            wired=True,
+            note="THE DANGEROUS ONE, now closed by refusal rather than by "
+            "prevention: both construction sites call "
+            "guard_zero_width_linear_shard, which raises FormAZeroWidthLinear "
+            "-- its OWN class, not a seam-not-wired, because the refusal is "
+            "the feature and would otherwise evaporate the moment this seam "
+            "was marked built. Inert on a classic boot (no role plan "
+            "installed). Prevention is still F3's construction half; this "
+            "only guarantees that a layer which slips through is LOUD.",
+            anchors=(
+                ("layers/linear.py", 2093, "guard_zero_width_linear_shard"),
+                ("layers/linear.py", 677, "guard_zero_width_linear_shard"),
+                ("distributed/utils.py", 1806,
+                 "def assert_activation_aligned_shards"),
+            ),
         ),
     )
 }
@@ -245,7 +325,7 @@ SEAMS: Dict[str, Seam] = {
 #: The seams that must be wired before a Form A boot can be believed, in the
 #: order the survey found them knocking. Kept as data so a report can print
 #: the remaining work without re-deriving it.
-UNWIRED_ORDER: Tuple[str, ...] = ("F3", "F11", "F5", "F9", "F6")
+UNWIRED_ORDER: Tuple[str, ...] = ("F3", "F5", "F9", "F6")
 
 
 def require_wired(seam_id: str, context: str = "") -> None:
@@ -533,12 +613,30 @@ def guard_zero_width_linear(
     """
     if width > 0:
         return
-    require_wired(
-        "F11",
-        f"rank {rank} would build the parallel layer {name!r} with shard "
-        f"width 0. Under Form A a worker must not construct it at all "
-        f"(F3); a zero-width layer that runs is a silent wrong answer.",
+    raise FormAZeroWidthLinear(
+        f"rank {rank} ({plan.role_of(rank)}) built the parallel layer "
+        f"{name!r} with shard width 0. F.linear with K=0 does not raise -- "
+        f"it returns zeros, and the all-reduce adds them, so the only "
+        f"symptom would be a wrong output many layers later. Under Form A a "
+        f"worker must not CONSTRUCT this layer at all (seam F3, the "
+        f"construction half); this refusal is the backstop for one that "
+        f"slipped through."
     )
+
+
+def guard_zero_width_linear_shard(name: str, width: int) -> None:
+    """F11 at a construction site that has no plan object to hand.
+
+    The shape every hot call site needs: no arguments beyond what it already
+    has, and a fast exit on the classic path. `this_rank_is_form_a_worker()`
+    is False whenever no role plan is installed, so on every boot that is not
+    Form A this costs one attribute read and returns.
+    """
+    if width > 0 or not this_rank_is_form_a_worker():
+        return
+    plan = _INSTALLED_PLAN
+    assert plan is not None  # implied by this_rank_is_form_a_worker()
+    guard_zero_width_linear(plan, _INSTALLED_RANK, name, width)
 
 
 def guard_dcp_merge(plan: RankRolePlan, rank: int) -> None:

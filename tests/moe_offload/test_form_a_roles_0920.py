@@ -204,8 +204,8 @@ def test_an_explicit_dcp_flag_is_refused_not_overridden():
 # ==========================================================================
 # 4. The seam registry -- named refusals for what is not built
 # ==========================================================================
-WIRED = ("F1", "F2", "F4", "F7", "F8", "F10")
-UNWIRED = ("F3", "F5", "F6", "F9", "F11")
+WIRED = ("F1", "F2", "F4", "F7", "F8", "F10", "F11")
+UNWIRED = ("F3", "F5", "F6", "F9")
 
 
 def test_every_seam_has_an_identity_a_place_and_a_verdict():
@@ -240,7 +240,8 @@ def test_the_remaining_work_is_ordered_and_complete():
     assert UNWIRED_ORDER[0] == "F3"
     # F4 and F10 left the list in slice 5; if one comes back the order must
     # come back with it, not silently shrink.
-    assert "F4" not in UNWIRED_ORDER and "F10" not in UNWIRED_ORDER
+    for gone in ("F4", "F10", "F11"):
+        assert gone not in UNWIRED_ORDER
 
 
 def test_the_two_seams_the_survey_added_carry_their_evidence():
@@ -249,7 +250,7 @@ def test_the_two_seams_the_survey_added_carry_their_evidence():
     assert "launcher.py:7203" in SEAMS["F10"].where
     assert "cannot happen" in SEAMS["F10"].where
     assert "linear.py:2069" in SEAMS["F11"].where
-    assert "1790" in SEAMS["F11"].where  # the 0 % 8 == 0 activation guard
+    assert "1806" in SEAMS["F11"].where  # the 0 % 8 == 0 activation guard
 
 
 def test_unknown_seam_is_refused():
@@ -289,12 +290,19 @@ def test_a_zero_width_linear_is_only_guarded_when_it_is_actually_zero():
     """F11's backstop. A positive width is the normal case and must cost
     nothing; a zero width must refuse, because F.linear with K=0 returns
     zeros without raising and the all-reduce adds them."""
-    from sglang.srt.rank_role import guard_zero_width_linear
+    from sglang.srt.rank_role import (
+        FormAZeroWidthLinear,
+        guard_zero_width_linear,
+    )
 
     guard_zero_width_linear(FORM_A, 0, "o_proj", 2560)
     guard_zero_width_linear(FORM_A, 1, "o_proj", 2560)
-    with pytest.raises(FormASeamNotWired, match="F11"):
+    # Its OWN class, not a seam-not-wired: the refusal IS the feature, and
+    # tying it to the seam flag made it evaporate the moment F11 was marked
+    # built. That happened once; this assertion is why it cannot again.
+    with pytest.raises(FormAZeroWidthLinear, match="shard width 0"):
         guard_zero_width_linear(FORM_A, 1, "o_proj", 0)
+    assert not issubclass(FormAZeroWidthLinear, FormASeamNotWired)
 
 
 def test_subgroup_and_dcp_merge_guards_name_their_seams():
