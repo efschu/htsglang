@@ -638,7 +638,9 @@ class DefaultModelLoader(BaseModelLoader):
             # checkpoint; prefetching every shard for it pulled 144 GB into the
             # page cache of a 118 GB host and the boot had to be shot. The
             # target runner already warmed what the draft reads.
-            if weight_loader_prefetch and getattr(model_config, "is_draft_model", False):
+            if weight_loader_prefetch and getattr(
+                getattr(self, "_loading_model_config", None), "is_draft_model", False
+            ):
                 logger.info(
                     "weight loader: checkpoint prefetch skipped for the DRAFT "
                     "runner (its block is a fraction of the checkpoint; the "
