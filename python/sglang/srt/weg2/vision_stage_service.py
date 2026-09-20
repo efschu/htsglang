@@ -595,6 +595,7 @@ class VisionStageService:
                 achieved_tflops=self.achieved_tflops,
                 clock=self.clock,
                 check_deadline=self._deadline(started),
+                rid=rid,
             )
         except BaseException as exc:  # noqa: BLE001 -- every seam becomes an outcome
             code, fatal = code_for(exc)
@@ -623,12 +624,10 @@ class VisionStageService:
                 seconds=self.clock() - started,
                 fatal=fatal,
             )
-        # THE ACCEPTANCE LINE (design §6 row e).  It was BUILT and never
-        # emitted: `log_line()` was only stuffed into the outcome's `detail`,
-        # and `base_processor` discarded the outcome -- so the one line the
-        # metal test greps for could not appear in any log, success or not.
-        # The stage's first measured encoder time lives here.
-        logger.info("%s rid=%s", result.log_line(), rid or "<unset>")
+        # The acceptance line (design §6 row e) is emitted by the runtime, ONCE
+        # -- not here.  A second copy would double every grep count the metal
+        # test takes off it, and a doubled acceptance line is worse than a
+        # missing one: it reads as two stages having run.
         return VisionStageOutcome(
             ok=True,
             code=W_STAGE_OK,

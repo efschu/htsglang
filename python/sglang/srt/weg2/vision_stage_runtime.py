@@ -199,6 +199,7 @@ def run_vision_stage(
     achieved_tflops: Optional[float] = None,
     clock: Callable[[], float] = time.perf_counter,
     check_deadline: Optional[Callable[[str], None]] = None,
+    rid: str = "",
 ) -> VisionStageResult:
     """Run the tower once, on one card, and leave the card as it was found.
 
@@ -347,5 +348,10 @@ def run_vision_stage(
         displaced=tuple(b.name for b in displaced),
         measured=measured,
     )
-    logger.info("%s", result.log_line())
+    # THE ACCEPTANCE LINE (design section 6, row e) -- emitted EXACTLY ONCE, here.
+    # `rid` is carried only so this line can be tied to the request that
+    # produced it; xsn405 had refusal lines with an empty rid and nothing to
+    # join them on.  Printed as <unset> rather than as an empty field, so a
+    # missing rid is visible instead of looking like a formatting artefact.
+    logger.info("%s rid=%s", result.log_line(), rid or "<unset>")
     return result

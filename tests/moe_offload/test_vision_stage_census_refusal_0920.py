@@ -308,6 +308,27 @@ class TestTheSuccessLineReachesTheLog:
             assert field in caplog.text, field
         assert "rid=req-ok" in caplog.text
 
+    def test_it_is_emitted_exactly_once(self, caplog):
+        """A doubled acceptance line is worse than a missing one.
+
+        Correction to this file's own first draft: ``log_line()`` WAS already
+        emitted, by ``vision_stage_runtime.py:350``.  Adding a second emitter
+        in the service doubled it, and a metal test that counts ``W102
+        Weg2VisionStage card=`` would then have read two stages where one ran.
+        The rid was threaded into the runtime's line instead.
+        """
+        svc = _service(_snapshot(free_gib=(8.0, 0.6, 2.0)))
+        with caplog.at_level(logging.INFO):
+            svc.encode_items([_Item()], rid="req-once")
+        assert caplog.text.count("W102 Weg2VisionStage card=") == 1
+
+    def test_a_missing_rid_is_visible_rather_than_an_empty_field(self, caplog):
+        vss.set_request_rid("")
+        svc = _service(_snapshot(free_gib=(8.0, 0.6, 2.0)))
+        with caplog.at_level(logging.INFO):
+            svc.encode_items([_Item()])
+        assert "rid=<unset>" in caplog.text
+
 
 # ===========================================================================
 # 5. THE BOOT KILLER: a refusal must END the request at the seam.
