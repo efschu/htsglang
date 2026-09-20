@@ -1095,6 +1095,12 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         return output
 
     def reduce(self, output: torch.Tensor) -> torch.Tensor:
+        # FORM A (F12): the dense side is not split across ranks -- this
+        # rank owns all of it -- so there is no partial sum to reduce and
+        # no second participant to reduce with. Issuing the collective
+        # would block on ranks that never arrive.
+        if form_a_dense_is_unsharded():
+            return output
         if self.tp_size > 1 and not get_attn_tp_context().input_scattered:
             if self.use_attn_tp_group:
                 return attn_tp_all_reduce(output)
@@ -1570,7 +1576,9 @@ class Qwen4ExpLayerExtensionMixin:
         residual: Optional[torch.Tensor],
         forward_batch: ForwardBatch,
     ):
-        if not forward_batch.forward_mode.is_idle():
+        # FORM A (F12): see LinearBase.reduce -- unsharded dense means no
+        # attn-TP partial to all-reduce.
+        if not forward_batch.forward_mode.is_idle() and not form_a_dense_is_unsharded():
             hidden_states = attn_tp_all_reduce(hidden_states)
         hidden_states = self.attn_hyper_connection.combine(hidden_states, residual)
         hidden_states, residual = self.mlp_hyper_connection.mix(hidden_states)
@@ -1634,7 +1642,9 @@ class Qwen4ExpLayerExtensionMixin:
                 )
             else:
                 dp_scatter(hidden_states, global_hidden_states, forward_batch)
-        elif use_attn_tp_a2a_scatter:
+        elif use_attn_tp_a2a_scatter and not form_a_dense_is_unsharded():
+            # FORM A (F12): nothing to gather -- this rank produced every
+            # q packet itself.
             assert attn_tp_chunks is not None
             gathered = [torch.empty_like(t) for t in attn_tp_chunks]
             attn_tp_all_gather(gathered, hidden_states.contiguous())
@@ -2040,6 +2050,7 @@ _LAYER_ID_RE = re.compile(r"\.layers\.(\d+)\.")
 # tensor -- 225.300 of them for this model.
 from sglang.srt.form_a_construction import skip_on_worker  # noqa: E402
 from sglang.srt.rank_role import (  # noqa: E402
+    form_a_dense_is_unsharded,
     this_rank_is_form_a_worker,
     worker_keeps_parameter,
 )

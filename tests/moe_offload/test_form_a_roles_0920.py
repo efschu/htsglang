@@ -204,8 +204,8 @@ def test_an_explicit_dcp_flag_is_refused_not_overridden():
 # ==========================================================================
 # 4. The seam registry -- named refusals for what is not built
 # ==========================================================================
-WIRED = ("F1", "F2", "F4", "F7", "F8", "F10", "F11")
-UNWIRED = ("F3", "F5", "F6", "F9", "F12")
+WIRED = ("F1", "F2", "F4", "F7", "F8", "F10", "F11", "F12")
+UNWIRED = ("F3", "F5", "F6", "F9")
 
 
 def test_every_seam_has_an_identity_a_place_and_a_verdict():
@@ -236,13 +236,11 @@ def test_the_remaining_work_is_ordered_and_complete():
 
     assert set(UNWIRED_ORDER) == set(UNWIRED)
     assert len(UNWIRED_ORDER) == len(set(UNWIRED_ORDER))
-    # F12 FIRST, ahead of F3: the symmetry probe showed that shipping the
-    # worker's construction skip without silencing the host's own dense
-    # collectives is a deadlock, not a half-built feature. Order is not
-    # cosmetic here -- it is the difference between a refusal and a wedged
-    # rig.
-    assert UNWIRED_ORDER[0] == "F12"
-    assert UNWIRED_ORDER.index("F12") < UNWIRED_ORDER.index("F3")
+    # F12 was ordered ahead of F3 and is now built, so F3 leads again. The
+    # ordering rule it encoded still holds and is asserted at its new home:
+    # F3's construction skip must not ship while F12 is open.
+    assert UNWIRED_ORDER[0] == "F3"
+    assert "F12" not in UNWIRED_ORDER
     # F4 and F10 left the list in slice 5; if one comes back the order must
     # come back with it, not silently shrink.
     for gone in ("F4", "F10", "F11"):

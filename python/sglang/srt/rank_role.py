@@ -52,6 +52,7 @@ __all__ = [
     "guard_graph_mode",
     "guard_zero_width_linear",
     "guard_zero_width_linear_shard",
+    "form_a_dense_is_unsharded",
     "FormAZeroWidthLinear",
     "worker_keeps_parameter",
     "guard_dcp_merge",
@@ -150,7 +151,7 @@ SEAMS: Dict[str, Seam] = {
             "F3",
             "a worker rank that never LOADS the dense weights (not merely "
             "idles through them)",
-            "models/qwen4_exp.py:2179 weight_name_needed (LOAD veto, "
+            "models/qwen4_exp.py:2190 weight_name_needed (LOAD veto, "
             "BUILT), :1491 and :1517/:1525 (CONSTRUCTION skip for ple and "
             "both hyper_connections, BUILT), against qwen3_5.py:797-830 and "
             "1090-1168 (self_attn / linear_attn / o_proj, NOT built)",
@@ -169,9 +170,9 @@ SEAMS: Dict[str, Seam] = {
             "than 'experts', which is the acceptance criterion "
             "(form_a_construction.expected_census_categories).",
             anchors=(
-                ("models/qwen4_exp.py", 2179, "this_rank_is_form_a_worker()"),
-                ("models/qwen4_exp.py", 1491, 'skip_on_worker("ple"'),
-                ("models/qwen4_exp.py", 1517,
+                ("models/qwen4_exp.py", 2190, "this_rank_is_form_a_worker()"),
+                ("models/qwen4_exp.py", 1497, 'skip_on_worker("ple"'),
+                ("models/qwen4_exp.py", 1523,
                  'skip_on_worker("hyper_connection"'),
             ),
         ),
@@ -279,8 +280,12 @@ SEAMS: Dict[str, Seam] = {
             "models/qwen4_exp.py:1100-1101 (o_proj all-reduce), :1574 "
             "(attn_tp_all_reduce), :1640 (attn_tp_all_gather); verdict from "
             "form_a_symmetry.py probe_form_a_boot",
-            wired=False,
-            note="THE ONE THE SLICE PLAN DID NOT HAVE, and the reason slice "
+            wired=True,
+            note="BUILT. Three sites now return early under a Form A plan: "
+            "LinearBase.reduce (o_proj), the attn_tp_all_reduce in the "
+            "layer postprocess, and the attn_tp_all_gather in the q scatter "
+            "-- form_a_dense_is_unsharded(). THE ONE THE SLICE PLAN DID NOT "
+            "HAVE, and the reason slice "
             "6a must not ship alone. Those collectives exist only because "
             "the dense side is SHARDED; under Form A rank 0 owns every head, "
             "so they have no second participant. Silencing the worker's "
@@ -290,8 +295,7 @@ SEAMS: Dict[str, Seam] = {
             "no log line, until the deadman fires. Measured by the probe: "
             "worker_skips_dense alone diverges at collective #0.",
             anchors=(
-                ("models/qwen4_exp.py", 1100,
-                 "tensor_model_parallel_all_reduce"),
+                ("models/qwen4_exp.py", 1102, "form_a_dense_is_unsharded"),
                 ("form_a_symmetry.py", 1, "do the ranks still AGREE"),
             ),
         ),
@@ -349,7 +353,7 @@ SEAMS: Dict[str, Seam] = {
 #: The seams that must be wired before a Form A boot can be believed, in the
 #: order the survey found them knocking. Kept as data so a report can print
 #: the remaining work without re-deriving it.
-UNWIRED_ORDER: Tuple[str, ...] = ("F12", "F3", "F5", "F9", "F6")
+UNWIRED_ORDER: Tuple[str, ...] = ("F3", "F5", "F9", "F6")
 
 
 def require_wired(seam_id: str, context: str = "") -> None:
@@ -646,6 +650,24 @@ def guard_zero_width_linear(
         f"construction half); this refusal is the backstop for one that "
         f"slipped through."
     )
+
+
+def form_a_dense_is_unsharded() -> bool:
+    """F12: under Form A the dense side lives on ONE rank, so the per-layer
+    dense collectives have no second participant.
+
+    The q all-gather and the o_proj all-reduce exist only because the dense
+    dimension is SPLIT across ranks. With `--rank-role host,worker,worker`
+    and `--rank-tp-ratio 1,0,0` the host owns every head and every dense
+    weight; there is nothing to gather from anyone and nothing to sum with
+    anyone. Issuing them anyway means the host blocks on ranks that are not
+    coming -- a hang, not an error, which is why this predicate exists and
+    why the boot gate (form_a_boot_gate) checks that all ranks agree about
+    it before the first forward.
+
+    False on every classic boot, so the default path is untouched.
+    """
+    return _INSTALLED_PLAN is not None
 
 
 def guard_zero_width_linear_shard(name: str, width: int) -> None:
