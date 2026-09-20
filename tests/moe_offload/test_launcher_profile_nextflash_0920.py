@@ -65,3 +65,20 @@ def test_group_env_extra_is_applied_last_and_parsed_strictly(tmp_path):
     env = lc.build_env(str(tmp_path), "venv", "0,1,2", str(tmp_path), False, "t", group="P",
                        profile=lc.PROFILE_NEXTFLASH, group_env_extra={"SGLANG_MOE_SCRATCH_SLOTS": "32"}, **kw)
     assert env["SGLANG_MOE_SCRATCH_SLOTS"] == "32"
+
+
+def test_resident_arm_sleeps_only_kv(monkeypatch):
+    """fnFL2 v7 (20.09.): the launcher's post-READY sleep(P) must not name a
+    weights tag on a resident boot (server W4 refuses -> W29 rank disagree)."""
+    import types
+
+    from sglang.srt.weg2 import launcher as L
+
+    fam = ["weights_0", "weights_1", "weights"]
+    assert L.flip_weights_tags(types.SimpleNamespace(flip_weights="resident"), fam) == []
+    assert L.flip_weights_tags(types.SimpleNamespace(flip_weights="family"), fam) == fam
+    assert L.flip_weights_tags(types.SimpleNamespace(), fam) == fam
+    sent = []
+    monkeypatch.setattr(L, "http", lambda m, url, body, timeout: sent.append(body) or (200, "{}"))
+    L.sleep_group(30031, lambda *a, **k: None, "P", L.flip_weights_tags(types.SimpleNamespace(flip_weights="resident"), fam))
+    assert sent == [{"tags": ["kv_cache"]}]

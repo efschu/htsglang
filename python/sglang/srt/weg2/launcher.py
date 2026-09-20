@@ -6235,6 +6235,18 @@ def arm_deadman(log: Log, boot_log: str, port: int, pattern: str, probe_s: int, 
     return pid
 
 
+def flip_weights_tags(ns, family: List[str]) -> List[str]:
+    """The weights tags the launcher sleeps/resumes: the family, or NOTHING
+    under ``--flip-weights resident`` (fnFL2 v7, 20.09.: the post-READY
+    sleep(P) named weights_0..7 + weights, the server's W4 guard refused a
+    weights tag on a resident boot, three ranks disagreed -> W29 crash).
+    The front derives its own empty list from ``--weights-resident``; this
+    is the launcher half of the same rule."""
+    if getattr(ns, "flip_weights", "family") == "resident":
+        return []
+    return list(family)
+
+
 def sleep_group(port: int, log: Log, name: str, weights_tags: List[str]) -> float:
     tags = ["kv_cache"] + list(weights_tags)
     t0 = time.time()
@@ -11003,7 +11015,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         chunk_tag_cards,
         weights_family_tags,
     )
-    weights_tags = weights_family_tags(chunk_count)
+    weights_tags = flip_weights_tags(ns, weights_family_tags(chunk_count))
     log(f"WEG2-WEIGHT-CHUNKS N={chunk_count} tags (layers per chunk {chunk_layers} of {n_layers}; family {weights_tags}); "
         "flip (C9, gathered legs) = src.pause(kv) -> ONE src.release(family) and ONE dst.resume(family) "
         "in flight together -> dst.resume(kv); the host holds ONE image per card (H(c) = max_g image_g(c)) "
