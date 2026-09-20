@@ -1289,6 +1289,50 @@ def _partition_units_raw(units: int, weights: Sequence[int]) -> list:
     return sizes
 
 
+def _partition_units_with_empty_ranks(
+    units: int, weights: Sequence[int], groups: Optional[int]
+) -> list:
+    """Largest-remainder split that lets a rank with weight 0 own NOTHING.
+
+    The classic split (`_partition_units_raw`) reserves a minimum of one unit
+    per rank and asserts it, so "this rank has no attention head at all" is
+    structurally inexpressible there. Form A (the attention-host layout: one
+    card runs every dense part, the other cards are pure expert workers) is
+    exactly that shape, which is why this is a SEPARATE function behind an
+    explicit `allow_zero` rather than a relaxed assertion in the hot path --
+    an accidental zero in the classic path stays an error.
+
+    Zero-weight ranks are removed, the classic split runs over the rest (so
+    the rounding, the tie-break and the per-rank minimum are byte-identical
+    for the ranks that do own units), and the zeros are put back.
+    """
+    if groups:
+        # Refusal by name: the kv-group alignment (#116) partitions the ranks
+        # into contiguous NON-EMPTY segments (_balanced_group_lengths), so an
+        # empty rank has no defined segment. Opening that is its own slice.
+        raise ValueError(
+            "partition_units(allow_zero=True) with kv-head-group alignment "
+            f"(groups={groups}) is not built: the group split assigns every "
+            "rank to a non-empty q-packet segment, which a zero-width rank "
+            "has none of. Pass groups=None for an expert-only rank, or split "
+            "the q dimension before the group constraint."
+        )
+    if any(w < 0 for w in weights):
+        raise ValueError(f"partition_units: negative weight in {list(weights)}.")
+    kept = [r for r, w in enumerate(weights) if w > 0]
+    if not kept:
+        raise ValueError(
+            "partition_units(allow_zero=True): the weight vector is all "
+            f"zeros ({list(weights)}) -- no rank would own any of the "
+            f"{units} units."
+        )
+    sub = _partition_units_raw(units, [weights[k] for k in kept])
+    sizes = [0] * len(weights)
+    for i, r in enumerate(kept):
+        sizes[r] = sub[i]
+    return sizes
+
+
 def _balanced_group_lengths(weights: Sequence[int], groups: int, max_len: int) -> list:
     """Partition the `len(weights)` ranks (in order) into `groups`
     contiguous non-empty segments, each of length in [1, max_len],
@@ -1464,7 +1508,10 @@ def cp_token_speed_vector(
 
 
 def partition_units(
-    units: int, weights: Sequence[int], groups: Optional[int] = None
+    units: int,
+    weights: Sequence[int],
+    groups: Optional[int] = None,
+    allow_zero: bool = False,
 ) -> list:
     """Split `units` indivisible units over ranks proportionally to
     `weights` (largest-remainder rounding, every rank gets >= 1 unit).
@@ -1477,7 +1524,15 @@ def partition_units(
     the REPLICATED-KV geometry), the split is constrained so no rank's q
     packets straddle a kv-head-group boundary. It is a NO-OP whenever the raw
     split is already aligned, so all non-q dimensions (which pass groups=None)
-    and already-aligned q splits stay byte-identical."""
+    and already-aligned q splits stay byte-identical.
+
+    `allow_zero` (Form A) drops the per-rank minimum of one unit for ranks
+    whose weight is 0: they own nothing and the remaining ranks split the
+    units among themselves, byte-identically to a call that never mentioned
+    the empty ranks. OFF by default, because in every existing caller a zero
+    weight is a bug, not a layout."""
+    if allow_zero:
+        return _partition_units_with_empty_ranks(units, weights, groups)
     if groups:
         return _partition_units_kv_aligned(units, weights, groups)
     return _partition_units_raw(units, weights)
@@ -1488,6 +1543,7 @@ def partition_sizes(
     weights: Sequence[int],
     units: Optional[int] = None,
     groups: Optional[int] = None,
+    allow_zero: bool = False,
 ) -> list:
     """Per-rank sizes of a sharded dimension of `total` elements under the
     weight vector `weights`.
@@ -1500,7 +1556,10 @@ def partition_sizes(
 
     Without `units`, per-rank sizes must be exact: `total` must be
     divisible by sum(weights); otherwise this raises, naming the offending
-    dimension size.
+    dimension size. A zero weight already yields size 0 on that path (it is
+    plain proportional arithmetic); `allow_zero` is what extends the same
+    meaning to the UNIT path, where the classic split reserves one unit per
+    rank. See `partition_units`.
     """
     if units is not None:
         if total % units != 0:
@@ -1509,13 +1568,22 @@ def partition_sizes(
                 f"unit count {units}."
             )
         scale = total // units
-        return [s * scale for s in partition_units(units, weights, groups)]
+        return [
+            s * scale
+            for s in partition_units(units, weights, groups, allow_zero=allow_zero)
+        ]
     if groups:
         raise ValueError(
             "partition_sizes: groups (kv-boundary alignment) requires a "
             "unit count (the q-head packet count); got units=None."
         )
     denom = sum(weights)
+    if denom <= 0:
+        # Refusal by name instead of the ZeroDivisionError two lines down.
+        raise ValueError(
+            f"partition_sizes: weight vector {list(weights)} sums to "
+            f"{denom}; no rank could own any of the {total} elements."
+        )
     if total % denom != 0:
         raise ValueError(
             f"Cannot partition dimension of size {total} with weight "
