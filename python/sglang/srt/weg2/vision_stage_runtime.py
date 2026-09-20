@@ -140,6 +140,11 @@ class StageHooks:
     pause_tag: Callable[[str], None]
     resume_tag: Callable[[str], None]
     flip_armed: Callable[[], bool] = lambda: False
+    #: xsn411: THIS PROCESS's device bytes on an NVML card (None = unreadable).
+    #: The card-wide census after the release is confounded by the co-resident
+    #: ranks (a P prefill on the same card moves it by GiB); the process figure
+    #: is the residue the teardown actually owns.
+    own_bytes: Optional[Callable[[int], Optional[int]]] = None
 
 
 @dataclass
@@ -183,6 +188,20 @@ def _flip_is_armed(hook: Callable[[], bool]) -> bool:
             exc,
         )
         return True
+
+
+def _own_bytes(hooks: StageHooks, card: int) -> Optional[int]:
+    """This process's device bytes on ``card`` through the optional hook; None
+    when the hook is absent or fails (unmeasured is reported, never faked)."""
+    fn = getattr(hooks, "own_bytes", None)
+    if fn is None:
+        return None
+    try:
+        v = fn(int(card))
+        return None if v is None else int(v)
+    except Exception as exc:  # noqa: BLE001
+        logger.info("vision stage: per-process NVML reading unreadable (%s: %s)", type(exc).__name__, exc)
+        return None
 
 
 def run_vision_stage(
@@ -267,6 +286,7 @@ def run_vision_stage(
 
         # --- load ----------------------------------------------------------
         _gate("load")
+        own_before = _own_bytes(hooks, plan.card)
         t0 = clock()
         try:
             handle = hooks.load_tower(plan.card)
@@ -341,7 +361,8 @@ def run_vision_stage(
             except Exception as exc:  # noqa: BLE001
                 stranded.append(blk.name)
                 causes.append(f"{blk.name}: {exc}")
-        residue_mib = None
+        residue_mib = None  # card-wide: free_idle_before vs the census after
+        residue_proc_mib = None  # this process only (NVML per pid), xsn411
         if released and release_error is None and not stranded:
             # THE PROOF THAT THE TOWER LEFT: the same idle census the plan was
             # sized from, read again. A residue near the tower's size means the
@@ -352,14 +373,24 @@ def run_vision_stage(
                     residue_mib = (int(plan.free_before_bytes) - after[plan.card]) / (1 << 20)
             except Exception as exc:  # noqa: BLE001 -- unmeasured, never unmentioned
                 logger.info("vision stage: teardown census unreadable (%s: %s)", type(exc).__name__, exc)
+            own_after = _own_bytes(hooks, plan.card)
+            if own_before is not None and own_after is not None:
+                residue_proc_mib = (int(own_after) - int(own_before)) / (1 << 20)
         measured["teardown"] = clock() - t0
-        if residue_mib is not None:
+        if residue_mib is not None or residue_proc_mib is not None:
             tower_mib = tower.weight_bytes / (1 << 20)
+            # the process figure is the verdict when it exists (xsn411: the card
+            # figure read 309 MiB while sibling ranks were prefilling on card0)
+            verdict_mib = residue_proc_mib if residue_proc_mib is not None else residue_mib
             logger.info(
-                "W102 Weg2VisionStage teardown card=%d residue=%.0f MiB (free_idle_before %.3f GiB "
-                "vs census after release; tower %.0f MiB) rid=%s",
-                plan.card, residue_mib, plan.free_before_bytes / (1 << 30), tower_mib, rid or "<unset>",
+                "W102 Weg2VisionStage teardown card=%d residue=%.0f MiB (%s; card-wide %s MiB = "
+                "free_idle_before %.3f GiB vs census after release; tower %.0f MiB) rid=%s",
+                plan.card, verdict_mib,
+                "this process, NVML per pid" if residue_proc_mib is not None else "card-wide only, per-pid unreadable",
+                ("%.0f" % residue_mib) if residue_mib is not None else "n/a",
+                plan.free_before_bytes / (1 << 30), tower_mib, rid or "<unset>",
             )
+            residue_mib = verdict_mib
             if residue_mib > max(256.0, 0.5 * tower_mib):
                 release_error = RuntimeError(
                     f"card{plan.card}: {residue_mib:.0f} MiB of the card's idle air did not "

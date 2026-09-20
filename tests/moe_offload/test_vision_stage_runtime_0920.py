@@ -436,3 +436,40 @@ def test_a_residue_after_the_release_is_named_and_escalated():
     # a small residue (allocator noise below max(256 MiB, half the tower)) passes
     res = run(R([card(2, 4.0)], after_gib=4.0 - 0.1))
     assert res.rows is not None
+
+
+def test_the_per_process_reading_is_the_verdict_when_it_exists():
+    """xsn411: the card-wide census read 309 MiB while sibling ranks prefilled
+    on card0; the per-pid NVML figure is the residue the teardown owns."""
+    class R(Rig):
+        def __init__(self, cards, own):
+            super().__init__(cards)
+            self._own = list(own)
+            self.own_calls = 0
+
+        def census(self):
+            self.calls.append("census")
+            if "release" in self.calls:  # card-wide reading confounded by a sibling
+                return [card(2, 4.0 - 2.0)]
+            return self._cards
+
+        def own_bytes(self, card_idx):
+            self.own_calls += 1
+            return self._own.pop(0)
+
+        @property
+        def hooks(self):
+            h = super().hooks
+            return vsr.StageHooks(**{**h.__dict__, "own_bytes": self.own_bytes})
+
+    # process residue 40 MiB although the card lost 2 GiB to a sibling: passes
+    rig = R([card(2, 4.0)], own=[100 << 20, 140 << 20])
+    res = run(rig, rid="t")
+    assert res.rows is not None and rig.own_calls == 2
+    # process residue of the tower's size: escalated even if the card looks fine
+    class R2(R):
+        def census(self):
+            self.calls.append("census")
+            return self._cards
+    with pytest.raises(vsr.VisionStageTeardownIncomplete):
+        run(R2([card(2, 4.0)], own=[100 << 20, (100 << 20) + int(0.9 * GIB)]), rid="t")
