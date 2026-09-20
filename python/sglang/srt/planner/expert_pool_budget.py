@@ -95,6 +95,20 @@ rank 0 (0.57 GiB -- the OOM it hit reported 254 MiB free); and fn8ak3, which
 the LATCHED reading accepts, is refused once rank 2's measured peak is in the
 census.  The last one is the standing argument for ``strict=True``.
 
+AND THE CAP IS A GLOBAL BUDGET, NOT A POOL SIZE (fn8am, the fourth boot)
+------------------------------------------------------------------------
+fn8am carried ``--max-total-tokens 90816`` -- rank 0's physical pool need --
+and refused the needle: ``Input length (259415 tokens) exceeds the maximum
+allowed length (90810 tokens)``.  The pools were right (``KV Cache is
+allocated ... #tokens: 31229`` on the ratio-11 ranks, ``28390`` on the
+ratio-10 one); the ceiling was not.  ``_apply_token_constraints`` applies the
+flag TWICE -- first to ``P_r``, this rank's physical capacity, then to
+``C = min_r(P_r // ratio_r) * S``, the global context budget that
+``max_req_input_len`` is built from.  ``SGLANG_KV_POOL_CAP_TOKENS`` now caps
+only ``P_r``; :meth:`Plan.env` emits it per rank and leaves
+``--max-total-tokens`` as the WORLD number.  Each rank is charged its own
+share ``C * ratio_r / S``, never the global one.
+
 THE SIZING CHAIN THIS INVERTS (file:line @ 546dd2bd36)
 ------------------------------------------------------
 1. ``model_runner_kv_cache_mixin.py:864-870`` -- the rank BUDGET is the
@@ -355,6 +369,7 @@ class Plan:
     dcp_ratios: Tuple[int, ...]
     unit_tokens: int
     max_total_tokens: int
+    pool_cap_tokens: Tuple[int, ...] = ()
     notes: Tuple[str, ...] = field(default=())
 
     @property
@@ -368,8 +383,16 @@ class Plan:
         """The vector that REPLACES the hand pins.
 
         * ``SGLANG_MOE_SCRATCH_SLOTS`` -- C per rank, budget-derived.
-        * ``MAX_TOTAL_TOKENS`` -- the scalar ``--max-total-tokens`` that stops
-          the pool at the DCP need instead of at the rest.
+        * ``SGLANG_KV_POOL_CAP_TOKENS`` -- the per-rank PHYSICAL pool cap,
+          ``unit * ratio_r``.  This is the knob that shrinks the pool.
+        * ``MAX_TOTAL_TOKENS`` -- the GLOBAL context ceiling
+          (``--max-total-tokens``), i.e. the world pool, NOT a rank's share.
+          fn8am proved these are two quantities and not one: a
+          ``--max-total-tokens 90816`` meant as a per-rank pool size also
+          clamped the global budget, and a 259415-token needle was refused at
+          90810 (``scheduler.py:5051`` -> ``managers/utils.py:202``).  Setting
+          it to the world pool keeps the length check honest while the cap
+          above does the shrinking.
         * ``SGLANG_KV_BUDGET_PREFILL_TRANSIENT_MIB`` -- the residual post that
           books, in the sizer's own ledger, the bytes the new rows and the
           prefill transient will take.  Without it the sizer re-derives
@@ -379,6 +402,7 @@ class Plan:
         """
         return {
             "SGLANG_MOE_SCRATCH_SLOTS": ",".join(str(r.scratch) for r in self.ranks),
+            "SGLANG_KV_POOL_CAP_TOKENS": ",".join(str(t) for t in self.pool_cap_tokens),
             "MAX_TOTAL_TOKENS": str(self.max_total_tokens),
             "SGLANG_KV_BUDGET_PREFILL_TRANSIENT_MIB": ",".join(
                 str(r.transient_book_mib) for r in self.ranks
@@ -390,7 +414,8 @@ class Plan:
             f"context {self.ctx_tokens} + spec {self.spec_tokens} over DCP vector "
             f"{list(self.dcp_ratios)} -> unit {self.unit_tokens}; WORLD pool "
             f"{self.kv_tokens_world} tokens (the per-rank figures below are SHARES "
-            f"of it, never the pool)"
+            f"of it, never the pool; --max-total-tokens is the WORLD number -- "
+            f"giving it a rank's share refuses long requests, fn8am)"
         )
         body = "\n".join(r.line() for r in self.ranks)
         env = "\n".join(f"  {k}={v}" for k, v in self.env().items())
@@ -600,22 +625,24 @@ def plan_expert_pool(
             page_size=page,
         )
         needs.append(local)
-    cap = int(max_total_tokens) if max_total_tokens is not None else max(needs)
+    world = int(unit) * sum(ratios)
+    cap = int(max_total_tokens) if max_total_tokens is not None else world
     notes: List[str] = []
+    if cap < world:
+        notes.append(
+            f"--max-total-tokens {cap} is below the world pool {world}: it clamps "
+            f"the GLOBAL context budget, so requests longer than ~{cap} tokens are "
+            "refused however big the per-rank pools are (fn8am)"
+        )
 
     plans: List[RankPlan] = []
     for c, need in zip(ranks, needs):
-        # The rank allocates ``min(its own pool ceiling, cap)`` and the ceiling
-        # is not known before the boot -- so the CAP is charged, never the
-        # (possibly smaller) need.
-        kv_tokens = (int(cap) // page) * page
-        if need > kv_tokens:
-            notes.append(
-                f"rank{c.rank} needs {need} tokens for its DCP share but the cap "
-                f"allows {kv_tokens}: the world unit binds at "
-                f"{kv_tokens // c.dcp_ratio} and the served context drops to "
-                f"{(kv_tokens // c.dcp_ratio) * sum(ratios)}"
-            )
+        # Each rank physically stores ``C * ratio_r / S`` tokens -- its OWN
+        # share, never the cap.  fn8am is why this is not ``cap``: the flag is
+        # a GLOBAL budget under weighted uneven DCP, and charging every rank
+        # the global number over-charged rank 2 by a row and, worse, suggested
+        # the flag was a pool size.
+        kv_tokens = int(need)
         kv_bytes = kv_tokens * int(c.cell_size)
         # CREDIT, not a post: shrinking the pool to the DCP need hands those
         # bytes back to the card before anything else runs.
@@ -701,6 +728,7 @@ def plan_expert_pool(
         dcp_ratios=ratios,
         unit_tokens=int(unit),
         max_total_tokens=int(cap),
+        pool_cap_tokens=tuple(int(n) for n in needs),
         notes=tuple(notes),
     )
 

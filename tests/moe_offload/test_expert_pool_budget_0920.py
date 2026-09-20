@@ -185,11 +185,15 @@ def test_the_upper_bound_plan_is_available_but_says_so(census):
     assert plan.unit_tokens == 8192
     # user law: under uneven DCP quote the WORLD pool.
     assert plan.kv_tokens_world == 262144
-    assert plan.max_total_tokens == 90112  # was 270000, by hand
-    assert [p.kv_gib for p in plan.ranks] == pytest.approx([1.187] * 3, abs=0.002)
-    # every rank gives ~2.37 GiB back to its card.
+    # --max-total-tokens is the WORLD number (fn8am), the pool cap is per rank.
+    assert plan.max_total_tokens == 262144
+    assert plan.pool_cap_tokens == (90112, 90112, 81920)
+    # each rank holds its OWN share C * ratio_r / S, never the global number.
+    assert [p.kv_gib for p in plan.ranks] == pytest.approx(
+        [1.187, 1.187, 1.079], abs=0.002
+    )
     assert [p.kv_credit_bytes / GIB for p in plan.ranks] == pytest.approx(
-        [2.369] * 3, abs=0.002
+        [2.369, 2.369, 2.477], abs=0.002
     )
     assert [p.rows_affordable for p in plan.ranks] == [25, 28, 18]
     assert [p.scratch for p in plan.ranks] == [170, 64, 54]
@@ -223,8 +227,8 @@ def test_rank2_is_ownership_capped_and_the_surplus_is_named_for_the_ratio(census
     plan = epb.plan_expert_pool(census, ctx_tokens=CTX, strict=False)
     r2 = plan.ranks[2]
     assert r2.bound_by.startswith("ownership")
-    # 29 rows affordable, 18 of them ownable (97 - 43 - 36).
-    assert r2.rows_affordable == 18 and r2.ownership_surplus_rows == 11
+    # 30 rows affordable, 18 of them ownable (97 - 43 - 36).
+    assert r2.rows_affordable == 18 and r2.ownership_surplus_rows == 12
     assert r2.buffer_rows == 97 == r2.owned_experts
     assert any("--rank-moe-ratio" in n for n in plan.notes)
 
@@ -233,7 +237,10 @@ def test_env_replaces_both_hand_pins_and_books_the_transient(census):
     plan = epb.plan_expert_pool(census, ctx_tokens=CTX, strict=False)
     env = plan.env()
     assert env["SGLANG_MOE_SCRATCH_SLOTS"] == "170,64,54"
-    assert env["MAX_TOTAL_TOKENS"] == "90112"
+    # the knob that shrinks the pool is per rank ...
+    assert env["SGLANG_KV_POOL_CAP_TOKENS"] == "90112,90112,81920"
+    # ... and --max-total-tokens stays the GLOBAL context ceiling (fn8am).
+    assert env["MAX_TOTAL_TOKENS"] == "262144"
     # User law: transients are BOOKED, explicitly, per rank. The value is the
     # residual that keeps the sizer from handing the rows' bytes back to KV.
     booked = [int(x) for x in env["SGLANG_KV_BUDGET_PREFILL_TRANSIENT_MIB"].split(",")]
