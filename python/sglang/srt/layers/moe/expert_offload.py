@@ -3113,6 +3113,12 @@ class MoEExpertOffloadCache:
         # written by every fetch on every route so a sticky resolve can trust
         # it; cleared whenever the buffers are physically rearranged.
         self._scratch_holds: Dict[int, int] = {}
+        # Task #49 (20.09.): with SGLANG_NAN_GUARD=1 every forward records the
+        # routing and the per-wave slot assignment here, so that when the MoE
+        # output goes non-finite the '[nan-disc2]' group can say WHICH expert
+        # the bad rows share and WHICH slot it was reading. None when the guard
+        # is off -- then nothing is recorded and nothing is paid.
+        self._nan_trace: Optional[Dict[str, "object"]] = None
         # Device-planned expert pool (vLLM #56177 port, 19.09.): tables, step
         # buffers and the UVA views of the spill pool; built by install_pool().
         self._pool_ready = False
@@ -3436,6 +3442,45 @@ class MoEExpertOffloadCache:
         if v is None or v.data_ptr() != spill.data_ptr():
             v = views[attr] = device_view_of_pinned(spill)
         return v
+
+    def _nan_trace_begin(self, ids_list) -> None:
+        """Task #49: open this forward's routing trace for '[nan-disc2]'. Costs
+        one dict and one list reference; nothing is copied, and with the guard
+        off the attribute is set to None and every recorder below is a no-op."""
+        try:
+            from sglang.srt.layers.nan_guard import nan_guard_on
+
+            if not nan_guard_on():
+                self._nan_trace = None
+                return
+            self._nan_trace = {
+                "ids_list": ids_list,
+                "waves": [],
+                "partials": partials_mode(),
+            }
+        except Exception:  # noqa: BLE001 -- an instrument never kills a forward
+            self._nan_trace = None
+
+    def _nan_trace_wave(self, wave, needed, slot_of_needed) -> None:
+        """Record one wave's expert set and its expert -> slot assignment, plus
+        what the scratch holds said at that moment. This is the half that
+        cannot be reconstructed after the fact: later waves overwrite the
+        scratch slots, so 'which slot did THIS wave read' is only knowable
+        here."""
+        tr = getattr(self, "_nan_trace", None)
+        if not isinstance(tr, dict):
+            return
+        try:
+            tr["waves"].append(
+                {
+                    "wave": int(wave),
+                    "needed": [int(e) for e in needed],
+                    "slot_of_needed": {int(k): int(v) for k, v in slot_of_needed.items()},
+                    "holds": dict(self._scratch_holds),
+                }
+            )
+        except Exception:  # noqa: BLE001
+            pass
 
     def _nan_guard_wave(self, combine_out, wave, needed, start) -> None:
         """Task #49: with SGLANG_NAN_GUARD=1 name the wave (its expert set and
@@ -4255,6 +4300,7 @@ class MoEExpertOffloadCache:
             prefetch = self._issue_lookahead(lookahead, pred_list)
 
         self._observe_routing(ids_list)
+        self._nan_trace_begin(ids_list)
 
         # Task #45 (19.09.): expert-oracle dump, eager decode only, rank 0
         try:
@@ -4309,11 +4355,12 @@ class MoEExpertOffloadCache:
         out_full = torch.empty_like(hidden)
         combine_out = None
 
-        for rows in waves:
+        for _w, rows in enumerate(waves):
             rows_t = torch.tensor(rows, device=topk_ids.device, dtype=torch.long)
             needed = sorted({e for r in rows for e in ids_list[r] if e >= 0})
             slot_of_needed, fetch_plan = self.planner.resolve(needed)
             self._fetch(fetch_plan)
+            self._nan_trace_wave(_w, needed, slot_of_needed)
             lut = self._build_lut(slot_of_needed, topk_ids.dtype, topk_ids.device)
 
             tid_w = self._remap(topk_ids.index_select(0, rows_t), lut)
@@ -4444,6 +4491,7 @@ class MoEExpertOffloadCache:
             import torch
             _e0 = torch.cuda.Event(enable_timing=True); _e0.record()
         self._fetch(fetch_plan)
+        self._nan_trace_wave(0, needed, slot_of_needed)
         if _tm:
             _e1 = torch.cuda.Event(enable_timing=True); _e1.record()
         if prefetch is not None:
@@ -4538,6 +4586,7 @@ class MoEExpertOffloadCache:
                 if _tm:
                     _e0 = torch.cuda.Event(enable_timing=True); _e0.record()
                 self._fetch(fetch_plan)
+                self._nan_trace_wave(w, needed, slot_of_needed)
                 if _tm:
                     _e1 = torch.cuda.Event(enable_timing=True); _e1.record()
                 lut = self._build_lut(slot_of_needed, topk_ids.dtype, device)

@@ -81,6 +81,37 @@ def _nan_discriminate(layer, mlp_in, mlp_out, forward_batch) -> None:
                 lid, int(in_rows_t.numel()), in_rows_t[:8].tolist(),
             )
             return
+
+        # Task #49 (20.09.): the second discriminator. 'TRANSIENT' is where the
+        # three-way verdict below stops; this group says WHICH of the five
+        # candidate classes produced it. Everything that has to be read BEFORE
+        # the recompute (the recompute re-resolves and RE-FETCHES the slot) is
+        # collected here; the group is emitted as one record afterwards, so the
+        # before/after fingerprints sit side by side instead of in two lines a
+        # boot log would separate. First hit of the process only.
+        disc2 = None
+        try:
+            from sglang.srt.layers.moe import nan_disc2
+
+            if nan_disc2.disc2_on() and nan_disc2.arm_once():
+                experts_mod, cache = nan_disc2.find_cache(layer)
+                if cache is not None:
+                    n_rows = int(mlp_out.shape[0])
+                    bad_set = set(out_rows_t.tolist())
+                    good = [r for r in range(n_rows) if r not in bad_set][:512]
+                    snap = nan_disc2.snapshot(
+                        experts_mod, cache, out_rows_t.tolist(), good
+                    )
+                    if snap is not None:
+                        disc2 = (experts_mod, cache, snap)
+                else:
+                    log.error(
+                        "[nan-disc2] layer %s: no expert-offload cache on the MoE block "
+                        "-- nothing to fingerprint", lid,
+                    )
+        except Exception as exc:  # noqa: BLE001
+            log.error("[nan-disc2] pre-recompute collection failed: %r", exc)
+
         again = layer.mlp(mlp_in.clone(), forward_batch)
         again_bad = ~torch.isfinite(again)
         again_rows_t = torch.nonzero(again_bad.reshape(again.shape[0], -1).any(dim=1)).reshape(-1)
@@ -96,6 +127,17 @@ def _nan_discriminate(layer, mlp_in, mlp_out, forward_batch) -> None:
             lid, int(out_rows_t.numel()), out_rows_t[:8].tolist(),
             int(again_rows_t.numel()), again_rows_t[:8].tolist(), verdict,
         )
+        if disc2 is not None:
+            try:
+                from sglang.srt.layers.moe import nan_disc2
+
+                experts_mod, cache, snap = disc2
+                snap = nan_disc2.finish(
+                    experts_mod, cache, snap, int(again_rows_t.numel())
+                )
+                log.error("%s", nan_disc2.render(lid, snap))
+            except Exception as exc:  # noqa: BLE001
+                log.error("[nan-disc2] post-recompute report failed: %r", exc)
         seen = 0
         for obj in vars(getattr(layer.mlp, "experts", layer.mlp)).values():
             resident = getattr(obj, "_resident", None)
