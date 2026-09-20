@@ -2211,6 +2211,36 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
         # If the current hidden mode is no longer aligned with the required hidden mode, we need to set it to what is required and re-capture
         if self.capture_hidden_mode != required_capture_hidden_mode:
+            # FORM A (F9): a MID-SERVING recapture is a WEDGE in either
+            # direction, so it crashes by name instead. Capture issues the
+            # per-layer collectives once per ladder rung; a rank that
+            # recaptures while its peers serve blocks in the carrier
+            # all-reduce with nobody in it, and a rank that does NOT
+            # recapture while a peer does blocks in the round. The trigger
+            # is rank-uniform by construction (spec_algorithm and the
+            # batch's capture_hidden_mode are the same on every rank), so
+            # reaching this line under a role plan means the ranks already
+            # disagree about something -- exactly the case the user law
+            # answers with CRASH/STOP rather than a hang.
+            #
+            # The worker's recorded body has no hidden-state output at all
+            # (no lm_head, no logits), so there is nothing a recapture could
+            # fix for it; on the host the mode is decided by the speculative
+            # config before the first round and never moves. Neither is a
+            # feature being taken away.
+            if rank_role.installed_role_plan() is not None:
+                from sglang.srt.form_a_boot_gate import FormARanksDisagree
+
+                raise FormARanksDisagree(
+                    "Form A: a decode-graph RECAPTURE was demanded mid-serving "
+                    f"on rank {getattr(self.model_runner, 'tp_rank', '?')} "
+                    f"(captured {self.capture_hidden_mode}, batch requires "
+                    f"{required_capture_hidden_mode}). Capture re-issues the "
+                    "per-layer collectives, so doing it while the other ranks "
+                    "serve wedges the group. The trigger is rank-uniform, so "
+                    "this means the ranks disagree about the batch -- stopping "
+                    "here instead of hanging, per the CRASH/STOP rule."
+                )
             self.capture_hidden_mode = required_capture_hidden_mode
             self.backend.cleanup()
             self.capture()

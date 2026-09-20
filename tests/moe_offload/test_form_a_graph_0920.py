@@ -346,6 +346,54 @@ def test_the_worker_attention_backend_answers_the_graph_path_bookkeeping():
     )
 
 
+def test_a_mid_serving_recapture_crashes_instead_of_wedging_the_group():
+    """Capture re-issues the per-layer collectives. A rank that recaptures
+    while its peers serve blocks in a carrier all-reduce nobody joins; a
+    rank that does not while a peer does blocks in the round. The trigger is
+    rank-uniform, so reaching it at all means the ranks already disagree --
+    CRASH/STOP, never hang."""
+    from sglang.srt.form_a_boot_gate import FormARanksDisagree
+    from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
+        DecodeCudaGraphRunner,
+    )
+    from sglang.srt.rank_role import set_form_a_role_plan
+
+    src = inspect.getsource(DecodeCudaGraphRunner.recapture_if_needed)
+    # The refusal must sit BEFORE the mutation + capture, not after it.
+    assert src.index("FormARanksDisagree") < src.index("self.backend.cleanup()")
+    assert src.index("installed_role_plan") < src.index("self.capture()")
+
+    holder = DecodeCudaGraphRunner.__new__(DecodeCudaGraphRunner)
+    holder.model_runner = type("MR", (), {"tp_rank": 1})()
+    holder.enable_return_hidden_states = False
+    holder.capture_hidden_mode = 2  # captured FULL
+    holder.ragged_verify_mode = False
+    batch = type(
+        "FB", (), {"capture_hidden_mode": 0, "spec_info": None}
+    )()
+
+    def _run():
+        holder.recapture_if_needed(batch)
+
+    # No plan installed: the classic behaviour, which for this stub means it
+    # walks on into the real recapture (and dies on the stub's missing
+    # backend) -- what matters is that it does NOT raise the Form A refusal.
+    with pytest.raises(Exception) as classic:
+        _run()
+    assert not isinstance(classic.value, FormARanksDisagree)
+    # The classic path MUTATES the mode before it dies on the stub, so the
+    # trigger has to be re-armed -- a second call would otherwise find the
+    # modes already equal and prove nothing.
+    holder.capture_hidden_mode = 2
+
+    try:
+        set_form_a_role_plan(FORM_A, 1)
+        with pytest.raises(FormARanksDisagree, match="RECAPTURE"):
+            _run()
+    finally:
+        set_form_a_role_plan(None, 0)
+
+
 def test_the_zero_addend_reasoning_is_recorded_where_the_capture_lives():
     """Not decoration. `receive_moe_input`'s torch.zeros is a RECORDED fill
     kernel under capture, which is the only reason a replay re-zeroes the
