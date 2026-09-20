@@ -249,11 +249,19 @@ def make_ple_checkpoint_prefetcher(
     SGLANG_QWEN4_PLE_FILE_PREFETCH switch governs both."""
     if not envs.SGLANG_QWEN4_PLE_FILE_PREFETCH.get():
         return None
-    prefetcher = PleCheckpointPrefetcher(table)
+    # 20.09. (fn8ad, Task #54): the decode round's own gather (48 rows) was
+    # below the threshold, so every decode round paid its cold page faults
+    # inside the kernel -- 8.6 ms of a 34.5 ms round on every rank. The
+    # threshold is an env now (SGLANG_QWEN4_PLE_PREFETCH_MIN_ROWS, default
+    # unchanged) so a boot can warm decode-sized gathers too.
+    min_rows = int(
+        os.environ.get("SGLANG_QWEN4_PLE_PREFETCH_MIN_ROWS", str(PLE_FILE_PREFETCH_MIN_ROWS))
+    )
+    prefetcher = PleCheckpointPrefetcher(table, min_rows=min_rows)
     logger.info(
         "PLE table: checkpoint page warm-up on for gathers of >= %d rows "
         "(row = %d B, %d files, %d threads)",
-        PLE_FILE_PREFETCH_MIN_ROWS,
+        min_rows,
         table.row_bytes,
         len(prefetcher._fds),
         prefetcher._workers,
