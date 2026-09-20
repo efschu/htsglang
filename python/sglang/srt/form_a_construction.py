@@ -182,3 +182,85 @@ def skip_on_worker(kind: str, prefix: str = ""):
     if worker_builds(kind):
         return None
     return HostOnlyModule(kind, prefix)
+
+
+class FormAWorkerAttentionUsed(RankRoleError):
+    """A Form A worker was asked to compute attention. Its own class: the
+    refusal IS the feature (the worker has no attention layers, no heads,
+    no KV) and must not evaporate into a generic NotImplementedError."""
+
+
+class FormAWorkerAttnBackend:
+    """The attention backend of a Form A WORKER rank (fnFA7 20.09.).
+
+    The runner and the spec worker expect an ``attn_backend`` object on
+    every rank -- per-forward metadata init, the verify-buffer query, the
+    ``max_context_len`` read, the per-mode backend-name stamps. A real
+    backend cannot be built here: the worker's uneven-TP head share is 0
+    (flashinfer's ``should_use_tensor_core`` divided by it). This object
+    answers the bookkeeping calls as no-ops and refuses, by name, every
+    call that would actually attend: a worker enters the model at the MoE
+    input of each layer and leaves at the MoE combine (form_a_worker_forward),
+    so a reached attention call is a routing bug, not a missing feature.
+    """
+
+    prefill_attention_backend_str = None
+    decode_attention_backend_str = None
+    supports_ragged_verify_graph = False
+
+    def __init__(self, model_runner):
+        self.model_runner = model_runner
+        self.max_context_len = int(model_runner.model_config.context_len)
+        self.forward_metadata = None
+
+    # -- bookkeeping the host-driven loop touches on every rank: no-ops --
+    def init_forward_metadata(self, forward_batch):
+        return None
+
+    def init_forward_metadata_out_graph(self, forward_batch, in_capture=False):
+        return None
+
+    def init_forward_metadata_in_graph(self, forward_batch):
+        return None
+
+    def init_cuda_graph_state(self, max_bs, max_num_tokens):
+        return None
+
+    def get_cuda_graph_seq_len_fill_value(self):
+        return 1
+
+    def on_after_cuda_graph_warmup(self):
+        return None
+
+    def get_verify_buffers_to_fill_after_draft(self):
+        return [None, None]
+
+    def update_verify_buffers_to_fill_after_draft(self, *args, **kwargs):
+        return None
+
+    def support_triton(self):
+        return False
+
+    def get_indexer_metadata(self, *args, **kwargs):
+        return None
+
+    # -- anything that attends is a routing bug on a worker --
+    def _refuse(self, what: str):
+        raise FormAWorkerAttentionUsed(
+            f"a Form A WORKER rank reached attention ({what}). A worker holds "
+            "experts and a router and nothing else; its forward is the MoE "
+            "route of form_a_worker_forward. An attention call here means a "
+            "dense forward was routed to a worker."
+        )
+
+    def forward(self, *args, **kwargs):
+        self._refuse("forward")
+
+    def forward_decode(self, *args, **kwargs):
+        self._refuse("forward_decode")
+
+    def forward_extend(self, *args, **kwargs):
+        self._refuse("forward_extend")
+
+    def forward_mixed(self, *args, **kwargs):
+        self._refuse("forward_mixed")

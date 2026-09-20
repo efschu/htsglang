@@ -3851,7 +3851,16 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
     def init_attention_backend(self):
         """Init attention kernel backend."""
-        if self.server_args.enable_pdmux:
+        if getattr(self, "is_form_a_worker", False):
+            # FORM A (fnFA7 20.09.): a worker has no attention layers and a
+            # head share of 0 -- a real backend cannot even be constructed
+            # (flashinfer's should_use_tensor_core divides by the kv-head
+            # count). The worker backend answers the per-forward
+            # bookkeeping as no-ops and refuses any real attention by name.
+            from sglang.srt.form_a_construction import FormAWorkerAttnBackend
+
+            self.attn_backend = FormAWorkerAttnBackend(self)
+        elif self.server_args.enable_pdmux:
             self.attn_backend = self._get_attention_backend(init_new_workspace=True)
             self.decode_attn_backend_group = []
             for _ in range(self.server_args.sm_group_num):
