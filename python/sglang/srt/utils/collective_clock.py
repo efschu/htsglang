@@ -56,9 +56,13 @@ So the events move INTO the graph. Three CUDA facts carry this, and each is
 a documented guarantee rather than an observation of one driver:
 
 1. ``cudaEventRecord`` issued on a stream that is CAPTURING does not record
-   a timestamp; it becomes an **event-record node** of the graph under
-   construction. The node is part of the graph body and is therefore
-   re-executed on **every replay**, like any other node.
+   a timestamp; WITH ``cudaEventRecordExternal`` (torch: ``Event(external=
+   True)``) it becomes an **event-record node** of the graph under
+   construction, re-executed on **every replay** like any other node.
+   WITHOUT the flag (the state of this module until 20.09., fn8t) the
+   record is folded into a cross-stream dependency and the graph carries
+   NO node: the events were never re-stamped by a replay and every round
+   read ``not-ready``.
 2. ``cudaEventElapsedTime(pre, post)`` over two such nodes is valid once the
    replay that executed them has **completed**. Completion is established
    here the way it already is for a round: ``Event.query()``, never a
@@ -259,7 +263,13 @@ class TorchCudaBackend(ClockBackend):
     """The real device. The default, and the only one serving ever uses."""
 
     def event(self):
-        return torch.cuda.Event(enable_timing=True)
+        # external=True (20.09., fn8t): a record on a CAPTURING stream makes
+        # an event-record NODE only with cudaEventRecordExternal; without
+        # the flag it is folded into a cross-stream dependency and the graph
+        # carries no node at all -- the binder found 0 of 246 pair events
+        # as nodes, and every replay read 'not-ready' forever (the events
+        # were never re-stamped). Outside a capture the flag changes nothing.
+        return torch.cuda.Event(enable_timing=True, external=True)
 
     def is_capturing(self) -> bool:
         return torch.cuda.is_current_stream_capturing()

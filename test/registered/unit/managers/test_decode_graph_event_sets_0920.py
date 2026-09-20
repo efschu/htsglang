@@ -226,3 +226,28 @@ class EventSetsTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ExternalEventTest(unittest.TestCase):
+    def test_torch_backend_creates_external_timing_events(self):
+        """fn8t 20.09.: without external=True a captured record is a
+        cross-stream dependency, not an event-record node -- the graph then
+        carries nothing the reader could read."""
+        import torch
+
+        from sglang.srt.utils.collective_clock import TorchCudaBackend
+
+        seen = {}
+
+        class FakeEvent:
+            def __init__(self, **kw):
+                seen.update(kw)
+
+        orig = torch.cuda.Event
+        torch.cuda.Event = FakeEvent
+        try:
+            TorchCudaBackend().event()
+        finally:
+            torch.cuda.Event = orig
+        self.assertTrue(seen.get("enable_timing"))
+        self.assertTrue(seen.get("external"), seen)
