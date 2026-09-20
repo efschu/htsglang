@@ -2220,6 +2220,29 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         return ret_topk_p, ret_topk_index, ret_hidden_states
 
 
+def adaptive_target_attn_backend(target_model_runner):
+    """The target attention backend of ONE adaptive runtime state.
+
+    fnFA24 (20.09.): on a Form A EXPERT WORKER the static path never builds a
+    real backend -- the rank has a kv-head share of 0 and flashinfer's
+    should_use_tensor_core divides by it (model_runner.init_attention_backend,
+    fnFA7) -- but this builder called _get_attention_backend directly and TP1/TP2
+    died at boot with ZeroDivisionError. A worker state gets its own
+    FormAWorkerAttnBackend instance (a fresh object per state, so the
+    M16/#50 isolation check sees no backend shared between states); every
+    other rank builds a private-workspace backend as before.
+    """
+    if getattr(target_model_runner, "is_form_a_worker", False):
+        from sglang.srt.form_a_construction import FormAWorkerAttnBackend
+
+        return FormAWorkerAttnBackend(target_model_runner)
+    backup_init = target_model_runner.init_new_workspace
+    try:
+        return target_model_runner._get_attention_backend(init_new_workspace=True)
+    finally:
+        target_model_runner.init_new_workspace = backup_init
+
+
 class EAGLEWorkerV2(BaseSpecWorker):
     def __init__(
         self,
@@ -3024,13 +3047,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
             # Build target attention backend and CUDA graph runner
             target_model_runner = self._target_worker.model_runner
-            backup_init = target_model_runner.init_new_workspace
-            try:
-                target_attn_backend = target_model_runner._get_attention_backend(
-                    init_new_workspace=True
-                )
-            finally:
-                target_model_runner.init_new_workspace = backup_init
+            target_attn_backend = adaptive_target_attn_backend(target_model_runner)
 
             target_graph_runner = None
             if not check_cuda_graph_backend(Phase.DECODE, Backend.DISABLED):
