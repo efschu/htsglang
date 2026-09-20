@@ -101,6 +101,26 @@ W_FLIP = "W108 Weg2VisionFlipInFlight"
 W_TIMEOUT = "W109 Weg2VisionTimeout"
 #: NOT a refusal.  The boot is compromised; the front takes the group out.
 W_TEARDOWN = "W110 Weg2VisionTeardownIncomplete"
+#: BOOT TIME.  ``--weg2-vision transient`` was asked for and the service could
+#: not be built -- the named precondition is in the message.  See
+#: :mod:`sglang.srt.weg2.vision_stage_boot`.
+W_ARM_REFUSED = "W111 Weg2VisionArmRefused"
+#: REQUEST TIME.  An image arrived in a group that is running ``transient`` and
+#: has NO service armed.  This is the one shape the whole arming path exists to
+#: prevent: without it the seam is a silent no-op, the items leave with
+#: ``feature`` and no rows, and the failure surfaces three hops later as
+#: ``_require_visual`` -- or, on a path that does not check, as wrong text.
+W_NOT_ARMED = "W112 Weg2VisionNotArmed"
+
+#: The launcher's arming variable, and the group that runs the stage.  They
+#: live in THIS module rather than in ``vision_stage_boot`` because this is the
+#: light module every multimodal boot already imports: a caller that has to
+#: decide whether a failed import of the heavy one matters can read the key
+#: without importing it, and one key cannot be spelled two ways.
+VISION_ENV = "SGLANG_WEG2_VISION"
+VISION_GROUP_ENV = "SGLANG_WEG2_GROUP"
+VISION_GROUP = "P"
+VISION_TRANSIENT = "transient"
 
 #: Default deadline for one stage, seconds.  Derived, not chosen: the modelled
 #: worst leg on this box is the BUFFERED read of the tower (0.858 GiB at
@@ -113,6 +133,37 @@ DEFAULT_STAGE_DEADLINE_S = 6.0
 #: The legs, in the order ``run_vision_stage`` runs them.  The deadline is
 #: checked BEFORE each one.
 LEGS = ("plan", "displace", "load", "encode", "attach", "teardown")
+
+
+class VisionStageNotArmed(RuntimeError):
+    """An image reached a ``transient`` group with no service installed.
+
+    NOT a :class:`VisionStageRefused`: a refusal is a verdict the stage
+    reached, and no stage ran here at all.  It is raised out of
+    :func:`maybe_run` -- the ONE thing in this module that raises -- because
+    the alternative is the silent shape: ``maybe_run`` returning ``None``
+    looks exactly like "text request, nothing to do", and a boot that asked
+    for ``transient`` and armed nothing would then serve image requests by
+    handing the prefill items with no rows.
+
+    The message carries the BOOT-TIME reason (W111) when there was one, so
+    the operator reading the first failed request sees the precondition that
+    was missing at arming and does not have to go back through the log.
+    """
+
+    def __init__(self, reason: str, items: int):
+        self.reason = str(reason)
+        self.items = int(items)
+        super().__init__(
+            f"{W_NOT_ARMED}: {self.items} image item(s) reached the group's "
+            "multimodal processor, this boot runs --weg2-vision transient, and "
+            "NO vision stage service is installed in this process, so the tower "
+            "would never run. Reason recorded at arming: "
+            f"{self.reason or '<none recorded: install() was never called>'}. "
+            "Refusing this request by name rather than passing items with no "
+            "precomputed embeddings downstream, where a rank without a tower "
+            "either raises _require_visual or returns plausible wrong text."
+        )
 
 
 class VisionStageTimeout(VisionStageRefused):
@@ -399,15 +450,62 @@ def _no_eviction_resume(name: str) -> None:  # pragma: no cover - same reason
 # ---------------------------------------------------------------------------
 
 _SERVICE: Optional[VisionStageService] = None
+#: Set INSTEAD of a service when this boot asked for ``transient`` and the
+#: arming refused.  Two states are NOT one: ``None`` here means "no transient
+#: boot, nothing expected" (``off``/``resident``, or a plain upstream engine),
+#: and a non-empty string means "transient was asked for and is NOT armed".
+#: Collapsing them is exactly how a broken arming becomes a silent no-op.
+_ARM_REFUSAL: str = ""
 
 
 def install(service: Optional[VisionStageService]) -> None:
-    """Arm (or disarm, with ``None``) the transient stage for this process."""
-    global _SERVICE
+    """Arm (or disarm, with ``None``) the transient stage for this process.
+
+    Installing a service CLEARS any recorded arming refusal: the two are
+    mutually exclusive states of one process, and a stale reason beside a
+    live service would print a refusal for a stage that ran.
+    """
+    global _SERVICE, _ARM_REFUSAL
     _SERVICE = service
+    if service is not None:
+        _ARM_REFUSAL = ""
     logger.info(
         "vision stage service %s", "ARMED" if service is not None else "disarmed"
     )
+
+
+def install_refusal(reason: str) -> None:
+    """Record that ``transient`` was asked for and could NOT be armed.
+
+    The counterpart to :func:`install`, and the reason :func:`maybe_run` can
+    tell "nothing to do" from "this boot is broken for images".  Logged at
+    ERROR with the W-code at the moment it happens, so the boot log says it
+    once at arming -- and said again, with this reason quoted, on the first
+    image request.
+    """
+    global _SERVICE, _ARM_REFUSAL
+    _SERVICE = None
+    _ARM_REFUSAL = str(reason)
+    logger.error(
+        "%s -- the transient vision stage is NOT armed in this process: %s. "
+        "Image requests to this group will be refused by name (%s); text "
+        "requests are unaffected.",
+        W_ARM_REFUSED,
+        _ARM_REFUSAL,
+        W_NOT_ARMED,
+    )
+
+
+def arm_refusal() -> str:
+    """The recorded arming refusal, or ``""`` when none was recorded."""
+    return _ARM_REFUSAL
+
+
+def reset_for_test() -> None:
+    """Drop both states.  Only tests call this; a boot arms once."""
+    global _SERVICE, _ARM_REFUSAL
+    _SERVICE = None
+    _ARM_REFUSAL = ""
 
 
 def installed() -> Optional[VisionStageService]:
@@ -417,13 +515,20 @@ def installed() -> Optional[VisionStageService]:
 def maybe_run(items: Sequence[Any], *, rid: str = "") -> Optional[VisionStageOutcome]:
     """Run the stage for these items if a service is armed and they need it.
 
-    Returns ``None`` when there was nothing to do -- no service, no items, or
-    items that already carry embeddings (a re-entry, or an encoder-disagg
-    boot that filled them upstream).  Never raises: a stage failure is an
-    outcome, and the caller decides.
+    Returns ``None`` when there was nothing to do -- no service and no
+    transient boot, no items, or items that already carry embeddings (a
+    re-entry, or an encoder-disagg boot that filled them upstream).
+
+    Raises exactly one thing, and only one: :class:`VisionStageNotArmed`, when
+    there ARE items to stage and this boot asked for ``transient`` without
+    arming.  Every other failure is a :class:`VisionStageOutcome` with a
+    W-code, because a stage that reached a verdict has a verdict to report.
+
+    THE ORDER HERE IS THE TEXT-PATH GUARANTEE: the "nothing to stage" exits
+    come FIRST, so a text-only request takes exactly the same two ``getattr``
+    scans it took before this path existed and can never reach the refusal.
     """
-    service = _SERVICE
-    if service is None or not items:
+    if not items:
         return None
     pending = [
         it
@@ -432,5 +537,10 @@ def maybe_run(items: Sequence[Any], *, rid: str = "") -> Optional[VisionStageOut
         and getattr(it, "feature", None) is not None
     ]
     if not pending:
+        return None
+    service = _SERVICE
+    if service is None:
+        if _ARM_REFUSAL:
+            raise VisionStageNotArmed(_ARM_REFUSAL, len(pending))
         return None
     return service.encode_items(pending, rid=rid)

@@ -75,6 +75,9 @@ from sglang.srt.weg2 import (
     DEFAULT_PP_ORDERED_CUT,
 )
 from sglang.srt.weg2 import admin_key as admin_key_mod
+# Task #58: the arming variable's name comes from the module that READS it, so
+# the publisher and the reader cannot drift into two spellings of one key.
+from sglang.srt.weg2.vision_stage_boot import VISION_ENV as VISION_STAGE_ENV
 from sglang.srt.weg2 import (
     checkpoint_census,
     corridor_budget,
@@ -4501,6 +4504,11 @@ def _env_knobs(ns) -> Dict[str, object]:
         "lane_coverage_dir": lane_coverage_dump_dir(ns),
         "lane_coverage_token": lane_coverage_boot_token(ns),
         "weg2_boot_token": weg2_boot_token(ns),
+        # Task #58: the vision form, so `build_env` can publish the arming
+        # variable for P. Gathered HERE with the other six for the reason this
+        # function exists: three call sites build an environment and a value
+        # spelled out at each of them is a value that drifts.
+        "vision": str(getattr(ns, "weg2_vision", VISION_OFF)),
     }
 
 
@@ -4622,8 +4630,31 @@ def build_env(tree: str, venv: str, cvd: str, store_dir: str, debug_hold: bool, 
               # `weg2_boot_token`'s own docstring for why this one is safe to
               # publish UNCONDITIONALLY where that one may not be.
               weg2_boot_token: str = "",
+              # Task #58: which vision form this boot runs. Published as
+              # SGLANG_WEG2_VISION for the P group ONLY (see below).
+              vision: str = VISION_OFF,
               xchg_env: Optional[Dict[str, str]] = None) -> Dict[str, str]:
     env = dict(os.environ)
+    # Task #58: THE ARMING SIGNAL for the transient vision stage, and the ONE
+    # thing that turns `vision_stage_service`'s seam from a no-op into a stage.
+    # Read by `weg2/vision_stage_boot.vision_mode`, which the P group's
+    # tokenizer process calls once.
+    #
+    # SAME DISCIPLINE AS SGLANG_WEG2_GROUP AND THE RING FAMILY (R19): launcher
+    # OUTPUT, published only when this call names the transient form AND the P
+    # group, POPPED otherwise -- a value inherited from the operator's shell
+    # must never arm a stage nobody asked for, and a D rank that armed one
+    # would spawn a CUDA-context probe and load a tower on a group that has no
+    # use for either.
+    #
+    # P ONLY, and that is the design's decision, not a shortcut: the transient
+    # stage exists because the P layout has no tower and needs the rows before
+    # its prefill (DESIGN_VISION_TRANSIENT_0920 §6). The front forces image
+    # requests to the long/P route for the same reason.
+    if vision == VISION_TRANSIENT and group == "P":
+        env[VISION_STAGE_ENV] = VISION_TRANSIENT
+    else:
+        env.pop(VISION_STAGE_ENV, None)
     # #1348: the exchange lane's unexecuted-line instrument. SAME DISCIPLINE
     # as SGLANG_WEG2_GROUP and the host-ring family below (R19): this is
     # LAUNCHER OUTPUT, published only when `--xchg-coverage-diff` named a

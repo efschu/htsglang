@@ -1565,12 +1565,23 @@ class BaseMultimodalProcessor(ABC):
         # (`moss_vl.py:587`), which is why the seam is here and not in the
         # scheduler: the transport below already handles a filled
         # `precomputed_embeddings`.
+        #
+        # ONE exception is deliberately NOT swallowed: `VisionStageNotArmed`.
+        # That one says this boot asked for `transient` and armed nothing, and
+        # swallowing it is the exact silent shape described above -- the image
+        # would go on as if the stage had run. It is raised only when there
+        # ARE items to stage, so the text path cannot reach it.
         try:
             from sglang.srt.weg2 import vision_stage_service as _vss
-
-            _vss.maybe_run(all_collected_items)
         except Exception as _exc:  # noqa: BLE001 -- never break the text path
-            logger.warning("vision stage seam skipped: %s", _exc)
+            logger.warning("vision stage seam unavailable: %s", _exc)
+        else:
+            try:
+                _vss.maybe_run(all_collected_items)
+            except _vss.VisionStageNotArmed:
+                raise
+            except Exception as _exc:  # noqa: BLE001 -- never break the text path
+                logger.warning("vision stage seam skipped: %s", _exc)
 
         """
         solution for cuda-ipc memory-leak:
