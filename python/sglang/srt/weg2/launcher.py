@@ -2585,7 +2585,43 @@ def store_read_cost_line(plan: StoreDiskPlan, cap_tokens: int) -> str:
 #: and the front refuses them by name, so the bytes bought nothing.
 VISION_OFF = "off"
 VISION_RESIDENT = "resident"
-VISION_CHOICES = (VISION_OFF, VISION_RESIDENT)
+#: Task #58 (user order 2026-09-20): the tower is in NO layout resident. An
+#: image request loads it onto one card before the P prefill really starts,
+#: runs it, and takes it down again.
+#:
+#: THE ARGV IS NOT `--no-enable-multimodal` FOR THIS ONE, and that is the
+#: whole difference. `off` passes that flag, which also switches off the
+#: TOKENIZER's image path (`model_config.py:573 is_multimodal`), so no
+#: `mm_items` are ever built and there is nothing for a stage to encode.
+#: `transient` instead sets the hf-config override `language_model_only`,
+#: which `vision_tower_forced_off` (`models/qwen3_vl.py:1230`) also honours:
+#: the tokenizer keeps processing images, `self.visual` stays None
+#: (`:1286`), `skip_vision_weight` (`:1243`) drops the checkpoint's tower
+#: tensors, and `weight_name_needed` now stops them being READ at all.
+#: Measured in fn8ag2 (docstring `qwen3_vl.py:1216-1220`).
+VISION_TRANSIENT = "transient"
+VISION_CHOICES = (VISION_OFF, VISION_RESIDENT, VISION_TRANSIENT)
+
+#: `--json-model-override-args` payload for the transient form. One constant
+#: so the launcher and the tests cannot drift.
+VISION_TRANSIENT_OVERRIDE = '{"language_model_only": true}'
+
+
+def vision_model_flags(vision: str):
+    """The model-side argv this vision form needs. PURE -- enumerable at a
+    desk, which is where the three forms are pinned against each other."""
+    if vision == VISION_OFF:
+        return ["--no-enable-multimodal"]
+    if vision == VISION_TRANSIENT:
+        return ["--json-model-override-args", VISION_TRANSIENT_OVERRIDE]
+    if vision == VISION_RESIDENT:
+        return []
+    raise ValueError(
+        f"unknown --weg2-vision {vision!r}; expected one of "
+        f"{list(VISION_CHOICES)}. Refusing rather than defaulting: a boot "
+        "whose tower state nobody stated is a boot that can return plausible "
+        "wrong text for an image request."
+    )
 
 
 def common_flags(
@@ -2663,7 +2699,7 @@ def common_flags(
         # is the #1362 fossil class. `--no-enable-multimodal` became spellable
         # in this same commit; before it, `False` existed in the tri-state and
         # in the config branch and no caller could say it.
-    ] + (["--no-enable-multimodal"] if vision == VISION_OFF else []) + [
+    ] + vision_model_flags(vision) + [
         # #1362 FOSSIL 4: this was the LITERAL "Qwen3.8-27B" on every boot,
         # including the 4B-FP8 transition vehicle -- the served name is what the
         # front, the load drivers and every probe address, so a wrong one makes
@@ -12358,6 +12394,11 @@ def front_argv_for(py: str, store_dir: str, p_pid: int, d_pid: int, dc_expect_d:
         "--port", str(PORT_FRONT), "--host", front_host, "--awake", "D", "--tag", ns.tag,
         "--store-dir", store_dir,
         "--prefill-sid", str(p_pid), "--decode-sid", str(d_pid),
+        # Task #58: the front decides image requests (route / stage / refuse)
+        # and it cannot infer the mode from the groups it talks to -- their
+        # tower state is in THEIR argv, not in any response the front sees.
+        # Told once, here, so --dry-run prints it too.
+        "--vision", str(getattr(ns, "weg2_vision", VISION_OFF)),
         "--dc-reserve", ",".join(f"{c.uuid}={dc_expect_d.get(c.uuid, 0)}" for c in cards),
         "--fairness-w-s", str(ns.fairness_w_s),
         "--weight-chunks", str(chunk_count),

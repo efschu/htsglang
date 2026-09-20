@@ -445,6 +445,110 @@ def _image_parts(payload) -> int:
     return n
 
 
+def _video_parts(payload) -> int:
+    """Task #58: how many VIDEO parts this request carries. 0 for text-only.
+
+    THIS EXISTED AS A HOLE, not as a decision. `_image_parts` above counts
+    only the three IMAGE type names, so a video part scored 0 and the request
+    routed as text -- straight past W101 and into `_require_visual`
+    (`models/qwen3_vl.py:1421`) on a rank whose tower was never built. The
+    refusal that was supposed to be structural was, for videos, absent.
+
+    Kept as its OWN counter rather than folded into `_image_parts`, because
+    the two do not get the same verdict: the transient vision stage is built,
+    priced and tested for still images. A video's cost is `ceil(frames/2)`
+    temporal patches through the same quadratic encoder
+    (`VisionEncoderConfig.patch_rows`), which no census on this rig has ever
+    measured. So video refuses BY NAME in every mode, including `transient`,
+    until something prices it -- an honest 501 rather than a stage that
+    discovers the frame count on the card.
+    """
+    n = 0
+    try:
+        for m in (payload or {}).get("messages") or []:
+            c = m.get("content") if isinstance(m, dict) else None
+            if not isinstance(c, list):
+                continue
+            for part in c:
+                if not isinstance(part, dict):
+                    continue
+                t = str(part.get("type") or "")
+                if t in ("video_url", "video", "input_video"):
+                    n += 1
+    except Exception:  # noqa: BLE001 - a malformed body is not a video
+        return 0
+    return n
+
+
+#: Task #58: the front's half of `--weg2-vision` (launcher: VISION_CHOICES).
+VISION_MODE_OFF = "off"
+VISION_MODE_RESIDENT = "resident"
+VISION_MODE_TRANSIENT = "transient"
+VISION_MODES = (VISION_MODE_OFF, VISION_MODE_RESIDENT, VISION_MODE_TRANSIENT)
+
+#: verdicts of :func:`vision_verdict`
+VERDICT_ROUTE = "route"
+VERDICT_STAGE = "stage"
+VERDICT_REFUSE_IMAGE = "refuse-image"
+VERDICT_REFUSE_VIDEO = "refuse-video"
+VERDICT_REFUSE_MODE = "refuse-mode"
+
+
+def vision_verdict(image_parts: int, video_parts: int, mode: str):
+    """PURE: what happens to a request, given its parts and the boot's mode.
+
+    Split out of `handle_generate` so the decision can be enumerated at a
+    desk instead of inferred from a running front. Returns
+    ``(verdict, why)``; the caller turns a verdict into a route, a stage or a
+    501, and the ``why`` is what the log line and the response body carry.
+
+    The table, and each row is a decision and not a default:
+
+    * **video, any mode** -> refuse. See `_video_parts`: unpriced.
+    * **image + off** -> refuse (W101). The tower is not built on either
+      group; routing would run an uninitialised tower and return plausible
+      WRONG text, which is the one failure shape that must never be silent.
+    * **image + resident** -> route. Both groups carry the tower.
+    * **image + transient** -> stage. The tower is loaded for this request,
+      run, and taken down again (user order 2026-09-20).
+    * **no parts** -> route, in every mode. Text is never touched by this.
+    * **unknown mode** -> refuse, by name. A mode nobody recognises must not
+      silently fall through to `route`, because `route` is the one verdict
+      that can return wrong text.
+    """
+    if mode not in VISION_MODES:
+        return VERDICT_REFUSE_MODE, (
+            f"unknown vision mode {mode!r} (expected one of {list(VISION_MODES)}); "
+            "refusing rather than routing, because routing an image at a boot "
+            "whose tower state is unknown returns plausible wrong text"
+        )
+    if video_parts:
+        return VERDICT_REFUSE_VIDEO, (
+            f"{video_parts} video part(s): the vision stage is priced and "
+            "tested for still images only. A clip's encoder cost is quadratic "
+            "in the patch rows and its frame count is unmeasured on this rig, "
+            "so it is refused by name rather than discovered on the card"
+        )
+    if not image_parts:
+        return VERDICT_ROUTE, ""
+    if mode == VISION_MODE_RESIDENT:
+        return VERDICT_ROUTE, ""
+    if mode == VISION_MODE_TRANSIENT:
+        return VERDICT_STAGE, (
+            f"{image_parts} image part(s): loading the vision tower for this "
+            "request, running it, and taking it down again"
+        )
+    return VERDICT_REFUSE_IMAGE, (
+        f"this boot is TEXT-ONLY (--weg2-vision off) and carries no vision "
+        f"tower, so the {image_parts} image part(s) in this request cannot be "
+        "served. Routing them would run an uninitialised tower and return "
+        "plausible WRONG text rather than an error. Boot with --weg2-vision "
+        "transient to load the tower for the request and take it down again, "
+        "or --weg2-vision resident to keep it on both groups (879 MiB per P "
+        "card, 2.63 GiB across the host ring, measured on weg2xsn27)."
+    )
+
+
 def request_text(payload: dict) -> str:
     """The prompt as ONE string, for the span estimate and the ledger.
 
@@ -1655,7 +1759,8 @@ class Front:
                  src_chunk_cards: Optional[Dict[str, Dict[str, List[int]]]] = None,
                  measured_record: str = "", commit: str = "",
                  ledger_arm: Optional[Dict[str, float]] = None,
-                 admin_key_file: str = ""):
+                 admin_key_file: str = "",
+                 vision: str = VISION_MODE_OFF):
         # #1275: the key arrives as a PATH, never as an argv value. The groups
         # have no choice (`server_args` offers only `--admin-api-key`, so their
         # key is world-readable in /proc/<pid>/cmdline), but the front does, and
@@ -1663,6 +1768,12 @@ class Front:
         # second exposure bought with nothing. None here == the groups are
         # unkeyed == send no header, which is the pre-#1275 behaviour byte for
         # byte.
+        # Task #58: which vision form this boot runs -- the front's half of
+        # the launcher's --weg2-vision. NOT defaulted silently to `off` when
+        # the value is unrecognised: `vision_verdict` refuses an unknown mode
+        # by name, because the one verdict a wrong mode must never reach is
+        # `route`.
+        self.vision = str(vision or VISION_MODE_OFF)
         self.admin_key_file = admin_key_file or ""
         self.admin_key = admin_key_mod.read(admin_key_file) if admin_key_file else None
         self.groups = {"P": Group("P", prefill.rstrip("/"), prefill_sid), "D": Group("D", decode.rstrip("/"), decode_sid)}
@@ -2592,17 +2703,23 @@ class Front:
         if self.state == "STOP":
             return web.json_response({"error": f"WEG2 STOP {self.stop}"}, status=503)
         payload = await request.json()
-        # #1356 IMAGES ARE REFUSED BY NAME, not routed to a group that cannot
-        # serve them. Both groups boot text-only (`--weg2-vision off`), so the
-        # tower is not loaded and an image part would reach a model with no
-        # vision weights. Upstream's own words for that case are "image inputs
-        # would run an uninitialized vision tower" (model_config.py, the GGUF
-        # branch) -- i.e. the failure is WRONG OUTPUT, not an exception, which
-        # is the one shape that must never be reached silently. 501 and not
-        # 400: the request is well-formed and this deployment does not
-        # implement it; a 400 would tell the caller its input was wrong.
+        # #1356 IMAGES ARE NEVER ROUTED TO A GROUP THAT CANNOT SERVE THEM.
+        # Upstream's own words for that case are "image inputs would run an
+        # uninitialized vision tower" (model_config.py, the GGUF branch) --
+        # i.e. the failure is WRONG OUTPUT, not an exception, which is the one
+        # shape that must never be reached silently. Every refusal below is
+        # 501 and not 400: the request is well-formed and this deployment does
+        # not implement it; a 400 would tell the caller its input was wrong.
+        #
+        # Task #58: WHICH of route/stage/refuse applies is no longer inline.
+        # It was `if _image_parts(payload):` plus one refusal, written when
+        # `off` was the only form -- and the VIDEO hole underneath it was
+        # invisible precisely because nothing counted videos. The table now
+        # lives in `vision_verdict`, where it can be enumerated at a desk.
         _img = _image_parts(payload)
-        if _img:
+        _vid = _video_parts(payload)
+        _verdict, _why = vision_verdict(_img, _vid, self.vision)
+        if _verdict != VERDICT_ROUTE:
             # #1356 THE REFUSAL IS LOGGED, NOT ONLY RETURNED. Without this line
             # W101 existed solely in the caller's response body: `grep W101
             # front.log` read 0 even when it had fired cleanly, so nobody
@@ -2617,21 +2734,46 @@ class Front:
             # client sees is not a marker, because the record is what the next
             # reader has. All other W-codes in this file are visible; W101 was
             # the exception.
+            _code = {
+                VERDICT_REFUSE_IMAGE: "W101 Weg2VisionRefused",
+                VERDICT_REFUSE_VIDEO: "W103 Weg2VideoRefused",
+                VERDICT_REFUSE_MODE: "W104 Weg2VisionModeUnknown",
+                VERDICT_STAGE: "W102 Weg2VisionStage",
+            }[_verdict]
+            _rid_peek = f"weg2-{self.epoch}-{self._rid + 1}"
+            if _verdict == VERDICT_STAGE:
+                # The stage itself lives in the GROUP, not here: it needs the
+                # card census, the memory-saver tags and the checkpoint, none
+                # of which the front process has. The front's job is the
+                # TRIGGER and the routing; the group's tokenizer runs
+                # `weg2.vision_stage_runtime.run_vision_stage` and attaches
+                # `precomputed_embeddings` before the prefill.
+                #
+                # Slice 6 gap, named rather than faked: until that wiring
+                # lands in the group, `transient` must not ROUTE an image --
+                # it would reach `_require_visual` on a tower-less rank. So it
+                # refuses here too, with its own code, and the refusal says
+                # exactly what is missing instead of pretending the mode is
+                # unsupported.
+                logger.warning(
+                    "%s rid=%s image_parts=%d -- transient stage requested; the "
+                    "group-side runtime is not wired yet, refusing with 501",
+                    _code, _rid_peek, int(_img))
+                return web.json_response(
+                    {"error": f"{_code}: {_why}. The stage term, the loader and "
+                              f"the teardown are built and tested "
+                              f"(planner/vision_stage*.py, "
+                              f"weg2/vision_stage_runtime.py); what is missing "
+                              f"is the GROUP-side call that runs it and attaches "
+                              f"precomputed_embeddings before the prefill. "
+                              f"Routing now would reach _require_visual on a "
+                              f"rank with no tower."},
+                    status=501)
             logger.warning(
-                "W101 Weg2VisionRefused rid=%s image_parts=%d -- TEXT-ONLY boot "
-                "(--weg2-vision off), request refused with 501 and NOT routed",
-                f"weg2-{self.epoch}-{self._rid + 1}", int(_img))
-            return web.json_response(
-                {"error": f"W101 Weg2VisionRefused: this boot is TEXT-ONLY "
-                          f"(--weg2-vision off) and carries no vision tower, so "
-                          f"the {_img} image part(s) in this request cannot be "
-                          f"served. Routing them would run an uninitialised "
-                          f"tower and return plausible WRONG text rather than "
-                          f"an error. Boot with --weg2-vision resident to load "
-                          f"the tower on both groups (879 MiB per P card, "
-                          f"2.63 GiB across the host ring, measured on "
-                          f"weg2xsn27)."},
-                status=501)
+                "%s rid=%s image_parts=%d video_parts=%d mode=%s -- request "
+                "refused with 501 and NOT routed",
+                _code, _rid_peek, int(_img), int(_vid), self.vision)
+            return web.json_response({"error": f"{_code}: {_why}"}, status=501)
         self._rid += 1
         rid = f"weg2-{self.epoch}-{self._rid}"
         text = request_text(payload)
@@ -5405,6 +5547,17 @@ def main():
                          "`cgroup anon - sum(RssAnon)` is not subtractable and "
                          "printed foreign=-30.91 GiB on weg2sb5b. 0 = unset, and "
                          "then no split is printed rather than an invented one.")
+    ap.add_argument(
+        # Task #58: the front's half of the launcher's --weg2-vision. NO
+        # `choices=` here on purpose: an unknown value must reach
+        # `vision_verdict`, which refuses it by name (W104). argparse would
+        # kill the front process instead, and a front that will not start is a
+        # worse failure than one that refuses image requests.
+        "--vision", default=VISION_MODE_OFF,
+        help="#58: `off` (default) refuses image requests by name (W101); "
+             "`resident` routes them to groups that carry the tower; "
+             "`transient` loads the tower for the request and takes it down "
+             "again. Videos refuse (W103) in every mode -- unpriced.")
     ap.add_argument("--ledger-arm", default="",
                     help="#1233 fix 8: JSON {s_gb, m_mib, store_gib} -- the arm the ledger chose, needed to "
                          "derive the RUN-MOMENT residual from the front's own cgroup reading")
@@ -5425,7 +5578,8 @@ def main():
                   src_chunk_cards=json.loads(args.src_chunk_cards) if args.src_chunk_cards else {},
                   measured_record=args.measured_record, commit=args.commit,
                   ledger_arm=json.loads(args.ledger_arm) if args.ledger_arm else {},
-                  admin_key_file=args.admin_key_file)
+                  admin_key_file=args.admin_key_file,
+                  vision=args.vision)
     # #1269 fix 3: the pre-boot anon baseline the watermark's currency is split
     # against. Kept from weg2/idle-anon-0908.
     if args.anon_preboot_bytes > 0:

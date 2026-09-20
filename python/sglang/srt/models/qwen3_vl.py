@@ -1418,6 +1418,36 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         pattern = MultiModalityDataPaddingPatternMultimodalTokens()
         return pattern.pad_input_tokens(input_ids, mm_inputs)
 
+    def weight_name_needed(self, name: str):
+        """Loader veto BEFORE a checkpoint tensor is READ.
+
+        The loader looks this method up by name (``model_loader/loader.py:763``)
+        and hands it to the readers as ``should_load``
+        (``:697``/``:707`` -> ``weight_utils.pread_safetensors_file:1325``).
+        ``True`` = read, ``False`` = skip entirely, ``"meta"`` = a meta tensor
+        of the right shape.
+
+        MEASURED WASTE THIS ENDS (Task #58, 2026-09-20): this class and
+        ``Qwen3_5ForConditionalGeneration`` defined NO such method, so a
+        text-only rank read the checkpoint's tower -- 333 tensors,
+        921_460_192 bytes = 0.858 GiB on the serving checkpoint -- off disk
+        and then dropped it by NAME afterwards in ``load_weights``
+        (``skip_vision_weight``, :func:`skip_vision_weight` above). Six ranks
+        per Weg-2 boot: ~5.1 GiB of reads that nothing ever used. The
+        precedent for the veto is ``qwen4_exp.py:2180``, which already does
+        exactly this for its own tower.
+
+        NARROW ON PURPOSE. It vetoes the tower and nothing else, and only when
+        there is no tower to load into -- so for every boot that builds one
+        the answer is ``True`` for every name and the load path is byte-for-byte
+        what it was. ``skip_vision_weight`` stays where it is: it is the same
+        test one layer later, and it must keep working for a loader that does
+        not consult this method at all.
+        """
+        if skip_vision_weight(name, self.visual):
+            return False
+        return True
+
     def _require_visual(self, what: str) -> None:
         if self.visual is None:
             raise RuntimeError(
