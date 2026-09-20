@@ -14,6 +14,36 @@ except ImportError as e:
 logger = logging.getLogger(__name__)
 
 
+@contextmanager
+def _abort_poll_excluded():
+    """Hold the barlink watchdog off the device for one pause/resume (#1489).
+
+    A TMS pause unmaps a tag's physical handles and KEEPS its virtual
+    reservation, so for the length of the call any device pointer this
+    process holds can look live and not be backed. The barlink abort-word
+    watchdog runs on its own thread and reads exactly such a pointer every
+    10 ms; on boot weg2xsn406 a `/weg2/flip` arriving while D was awake put
+    the two in the same microsecond, the resume then refused on a device OOM
+    (`WEG2-TMS-RESUME REFUSED tag=kv_cache rc=2`), and the poll's `copy_`
+    came back as `RuntimeError: unknown parameter type` followed by a
+    segfault.
+
+    This is the SAME exclusion CUDA-graph capture already takes
+    (``parallel_state.graph_capture``), applied at the one chokepoint every
+    tag pause and resume in this process goes through, so no caller has to
+    remember it. It degrades to a no-op -- never to a raise -- when the gate
+    module is not importable: a guard that can break bring-up is worse than
+    the gap it closes.
+    """
+    try:
+        from sglang.srt.distributed.device_communicators import barlink_abort_gate
+    except Exception:  # noqa: BLE001 -- see the docstring
+        yield
+        return
+    with barlink_abort_gate.pause_polling():
+        yield
+
+
 def _weg2_ring_symbol(name: str):
     """Look one of the Weg-2 C entrypoints up in the ALREADY-LOADED preload hook.
 
@@ -135,10 +165,12 @@ class _TorchMemorySaverAdapterReal(TorchMemorySaverAdapter):
         return _memory_saver.disable()
 
     def pause(self, tag: str):
-        return _memory_saver.pause(tag=tag)
+        with _abort_poll_excluded():
+            return _memory_saver.pause(tag=tag)
 
     def resume(self, tag: str):
-        return _memory_saver.resume(tag=tag)
+        with _abort_poll_excluded():
+            return _memory_saver.resume(tag=tag)
 
     def tag_bytes(self, tag: str):
         """C8/C7: the saver's OWN byte sum for ``tag``, or None.
