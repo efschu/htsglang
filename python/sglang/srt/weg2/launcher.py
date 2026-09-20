@@ -2609,6 +2609,17 @@ VISION_CHOICES = (VISION_OFF, VISION_RESIDENT, VISION_TRANSIENT)
 #: so the launcher and the tests cannot drift.
 VISION_TRANSIENT_OVERRIDE = '{"language_model_only": true}'
 
+#: Task #47 Scheibe 6a (20.09.): the checkpoint PROFILE the two groups are built
+#: for. ``qwen27b`` is every boot before this flag existed (byte-identical argv
+#: and env). ``nextflash`` = Qwen3.8 Next Flash: P = PP3 (tp 1 per stage), D =
+#: Form A (host,worker,worker), whose rank_role collapses DCP to 1 and REFUSES an
+#: inherited SGLANG_UNEVEN_DCP=1 -- so the uneven-DCP facts (EARLY_READ_FACTS,
+#: env AND flag half) are owned per group here (flip_nextflash_groups
+#: GROUP_ENV_VALUES: P 1/1, D 0/0) and the flag half is dropped on both.
+PROFILE_QWEN27B = "qwen27b"
+PROFILE_NEXTFLASH = "nextflash"
+PROFILES = (PROFILE_QWEN27B, PROFILE_NEXTFLASH)
+
 
 def vision_model_flags(vision: str):
     """The model-side argv this vision form needs. PURE -- enumerable at a
@@ -2645,6 +2656,7 @@ def common_flags(
     # See argv_p for the failure this produced on the normal start path.
     *,
     vision: str = VISION_OFF,
+    profile: str = PROFILE_QWEN27B,
     # #1386 [Minimalform HiCache switch]: OFF (default) is byte-identical to
     # every argv this function built before the flag existed. ON drops the
     # WHOLE hicache block below rather than passing a smaller size through it
@@ -2753,7 +2765,7 @@ def common_flags(
         "--barlink", "--barlink-transport", "bar1",
         "--barlink-bar1-cap-cycles", str(barlink_cap_cycles),
         "--collective-census-interval", str(census_interval),
-    ] + early_read_flags(group) + [
+    ] + (early_read_flags(group) if profile == PROFILE_QWEN27B else []) + [
         # THE DOUBLY-STATED FACTS COME FROM ONE TABLE (#1235). --mamba-ssm-dtype
         # is here for both groups and the two uneven-DCP flags for group D; the
         # matching environment keys are written by build_env from the SAME
@@ -2828,6 +2840,7 @@ def argv_p(
     admin_api_key: Optional[str] = None,
     p_max_total_tokens: Optional[int] = None,
     vision: str = VISION_OFF,
+    profile: str = PROFILE_QWEN27B,
     # #1386: forwarded to `common_flags` unchanged; see that function.
     hicache_disabled: bool = False,
     # #1369: forwarded to `common_flags` unchanged; see that function.
@@ -2902,6 +2915,7 @@ def argv_p(
         # and the transient stage refused to arm (W111). The P group is the
         # ONLY place the vision form reaches the model argv; D stays text-only.
         vision=vision,
+        profile=profile,
         weights_cpu_backup=weights_cpu_backup,
     ) + [
         # C1/K1: P's own bs. Concurrency for the front's leg-1 fan-out AND
@@ -3034,12 +3048,14 @@ def argv_d(
     # #1369: APPENDED LAST for the same reason as `hicache_disabled` two
     # lines up -- `argv_d` has no `*` marker.
     weights_cpu_backup: bool = True,
+    profile: str = PROFILE_QWEN27B,
 ) -> List[str]:
     return [py, "-m", "sglang.launch_server"] + common_flags(
         model, s_gb, m_mib, store_cfg, max_kv_per_request, d_write_policy, "D",
         random_seed, barlink_cap_cycles, census_interval,
         hicache_disabled=hicache_disabled,
         weights_cpu_backup=weights_cpu_backup,
+        profile=profile,
     ) + (
         ["--disable-overlap-schedule"] if disable_overlap else []
     ) + (
@@ -4509,6 +4525,7 @@ def _env_knobs(ns) -> Dict[str, object]:
         "lane_coverage_dir": lane_coverage_dump_dir(ns),
         "lane_coverage_token": lane_coverage_boot_token(ns),
         "weg2_boot_token": weg2_boot_token(ns),
+        "profile": getattr(ns, "profile", PROFILE_QWEN27B),
         # Task #58: the vision form, so `build_env` can publish the arming
         # variable for P. Gathered HERE with the other six for the reason this
         # function exists: three call sites build an environment and a value
@@ -4638,6 +4655,7 @@ def build_env(tree: str, venv: str, cvd: str, store_dir: str, debug_hold: bool, 
               # Task #58: which vision form this boot runs. Published as
               # SGLANG_WEG2_VISION for the P group ONLY (see below).
               vision: str = VISION_OFF,
+              profile: str = PROFILE_QWEN27B,
               xchg_env: Optional[Dict[str, str]] = None) -> Dict[str, str]:
     env = dict(os.environ)
     # Task #58: THE ARMING SIGNAL for the transient vision stage, and the ONE
@@ -4873,6 +4891,13 @@ def build_env(tree: str, venv: str, cvd: str, store_dir: str, debug_hold: bool, 
     # same three facts and this loop is the one that survives.)
     for fact in EARLY_READ_FACTS:
         env[fact.env_key] = fact.env_value
+    if profile == PROFILE_NEXTFLASH and group:
+        # Scheibe 6a: the uneven-DCP axis is GROUP-OWNED on Next Flash (seam D):
+        # P (PP3, tp 1) keeps 1/1 (inert), D (Form A) gets 0/0 -- an inherited 1
+        # lands in RankRoleError (rank_role.py resolve_dcp_under_host_kv).
+        from sglang.srt.flip_nextflash_groups import GROUP_ENV_VALUES
+
+        env.update(GROUP_ENV_VALUES[group])
     env["SGLANG_BARLINK_BUILD_WINDOW_CAP_S"] = str(barlink_build_window_cap_s)
     if str(transport) == "nccl":
         # #1234 C6: half-configuring a transport the group does not run is
@@ -9523,6 +9548,9 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--tag", required=True)
     ap.add_argument("--venv", default=VENV_DEFAULT)
     ap.add_argument("--model", default=MODEL_DEFAULT)
+    ap.add_argument("--profile", choices=list(PROFILES), default=PROFILE_QWEN27B,
+                    help="Task #47 Scheibe 6a: checkpoint profile of the two groups; "
+                         "nextflash = P PP3 + D Form A, uneven-DCP env per group, no DCP flag half.")
     # #1360: THE NAMED DEVIATION, flag only. The user's standing rule of
     # 2026-09-12 makes the reap mark soft -- crossing it is allowed WITH a
     # reason and a runtime latch, never silently -- and until now the launcher
@@ -11258,6 +11286,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         census_interval=ns.collective_census_interval,
         draft_kv_on_p=draft_kv_on_p,
         vision=ns.weg2_vision,
+        profile=ns.profile,
         p_max_total_tokens=int(cut.pool_tokens),
         hicache_disabled=hicache_disabled,
         # #1369: form-key must reflect the ring's real presence/absence --
@@ -11845,6 +11874,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         census_interval=ns.collective_census_interval,
         draft_kv_on_p=draft_kv_on_p,
         vision=ns.weg2_vision,
+        profile=ns.profile,
         admin_api_key=admin_api_key,
         p_max_total_tokens=int(cut.pool_tokens),
         hicache_disabled=hicache_disabled,
@@ -11929,7 +11959,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         log(d_ratio.op_line)
         log(d_tokvec.line)
         env_d = build_env(tree, ns.venv, cvd, store_dir, False, ns.tag, chunk_layers, chunk_count, tms_so, ns.transport, ring_plan, group="D", xchg_env=xchg_env, **_env_knobs(ns))
-        spec_d = GroupSpec("D", PORT_D, transport_argv(argv_d(py, ns.model, budgets_d, s_gb_d, arm.m_mib, store_cfg, shlex.split(ns.extra_d), d_bs, max_kv_per_request, x_tokens, ns.num_continuous_decode_steps, ns.d_disable_overlap_schedule, d_ratio.flags, d_tokvec.flags, ns.random_seed, ns.barlink_bar1_cap_cycles, ns.collective_census_interval, ns.d_disable_cuda_graph, admin_api_key=admin_api_key, hicache_disabled=hicache_disabled, weights_cpu_backup=weights_cpu_backup_armed), ns.transport), state.logs["D"], env_d)
+        spec_d = GroupSpec("D", PORT_D, transport_argv(argv_d(py, ns.model, budgets_d, s_gb_d, arm.m_mib, store_cfg, shlex.split(ns.extra_d), d_bs, max_kv_per_request, x_tokens, ns.num_continuous_decode_steps, ns.d_disable_overlap_schedule, d_ratio.flags, d_tokvec.flags, ns.random_seed, ns.barlink_bar1_cap_cycles, ns.collective_census_interval, ns.d_disable_cuda_graph, admin_api_key=admin_api_key, hicache_disabled=hicache_disabled, weights_cpu_backup=weights_cpu_backup_armed, profile=ns.profile), ns.transport), state.logs["D"], env_d)
         launch_group(spec_d, tree, log, dry)
         log("front argv (dry): " + " ".join(shlex.quote(a) for a in front_argv_for(
             py, store_dir, 0, 0, dc_expect_d, cards, ns, chunk_count, 0, p_bs, d_bs, x_tokens,
@@ -12028,7 +12058,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     log(d_ratio.op_line)
     log(d_tokvec.line)
     env_d = build_env(tree, ns.venv, cvd, store_dir, ns.debug_hold in ("D", "both"), ns.tag, chunk_layers, chunk_count, tms_so, ns.transport, ring_plan, group="D", xchg_env=xchg_env, **_env_knobs(ns))
-    spec_d = GroupSpec("D", PORT_D, transport_argv(argv_d(py, ns.model, budgets_d, s_gb_d, arm.m_mib, store_cfg, shlex.split(ns.extra_d), d_bs, max_kv_per_request, x_tokens, ns.num_continuous_decode_steps, ns.d_disable_overlap_schedule, d_ratio.flags, d_tokvec.flags, ns.random_seed, ns.barlink_bar1_cap_cycles, ns.collective_census_interval, ns.d_disable_cuda_graph, admin_api_key=admin_api_key, hicache_disabled=hicache_disabled, weights_cpu_backup=weights_cpu_backup_armed), ns.transport), state.logs["D"], env_d)
+    spec_d = GroupSpec("D", PORT_D, transport_argv(argv_d(py, ns.model, budgets_d, s_gb_d, arm.m_mib, store_cfg, shlex.split(ns.extra_d), d_bs, max_kv_per_request, x_tokens, ns.num_continuous_decode_steps, ns.d_disable_overlap_schedule, d_ratio.flags, d_tokvec.flags, ns.random_seed, ns.barlink_bar1_cap_cycles, ns.collective_census_interval, ns.d_disable_cuda_graph, admin_api_key=admin_api_key, hicache_disabled=hicache_disabled, weights_cpu_backup=weights_cpu_backup_armed, profile=ns.profile), ns.transport), state.logs["D"], env_d)
     state.argv["D"] = " ".join(shlex.quote(a) for a in spec_d.argv)
     launch_group(spec_d, tree, log, dry)
     state.pids["D"] = spec_d.pid
