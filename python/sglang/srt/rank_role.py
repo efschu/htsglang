@@ -631,6 +631,21 @@ def this_rank_is_form_a_worker() -> bool:
     )
 
 
+def this_rank_is_form_a_host() -> bool:
+    """True only on the Form A host rank (a plan is installed and this rank
+    is not a worker). False on a classic boot."""
+    return _INSTALLED_PLAN is not None and not _INSTALLED_PLAN.is_worker(
+        _INSTALLED_RANK
+    )
+
+
+def form_a_token_src_rank() -> Optional[int]:
+    """The rank whose sampled tokens every other rank adopts under Form A
+    (the host: it alone has lm_head + hidden states), or None on a classic
+    boot."""
+    return None if _INSTALLED_PLAN is None else int(_INSTALLED_PLAN.host_rank)
+
+
 def guard_dense_weights(plan: RankRolePlan, rank: int) -> None:
     """Called where a rank is about to LOAD dense weights (F3).
 

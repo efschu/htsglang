@@ -609,14 +609,23 @@ class TpModelWorker(BaseTpWorker):
                 # Skip sampling; spec_v2 worker fires its own publish post-verify.
                 return batch_result
 
-            if getattr(self.model_runner, "is_weightless_worker", False):
+            # FORM A (fnFA10 20.09.): a worker rank produced no logits either
+            # (its forward is the MoE route only) -- same shape as the
+            # weightless worker, same channel, the host is the sender.
+            _fa_worker = getattr(self.model_runner, "is_form_a_worker", False)
+            if getattr(self.model_runner, "is_weightless_worker", False) or _fa_worker:
+                from sglang.srt.rank_role import form_a_token_src_rank
+
+                _src = (
+                    form_a_token_src_rank()
+                    if _fa_worker
+                    else self.server_args.weightless_kv_head_rank
+                )
                 head_ids = broadcast_pyobj(
                     [],
                     self.tp_size * self.pp_rank + self.tp_rank,
                     self.world_group.cpu_group,
-                    src=self.world_group.ranks[
-                        self.server_args.weightless_kv_head_rank
-                    ],
+                    src=self.world_group.ranks[_src],
                 )
                 batch_result.next_token_ids = torch.tensor(
                     head_ids,
@@ -630,7 +639,11 @@ class TpModelWorker(BaseTpWorker):
                 and not self.enable_spec
                 and forward_batch.sampling_info.grammars is not None
             ):
-                if getattr(self.model_runner, "is_weightless_head", False):
+                from sglang.srt.rank_role import this_rank_is_form_a_host
+
+                if getattr(self.model_runner, "is_weightless_head", False) or (
+                    this_rank_is_form_a_host()
+                ):
                     # The weightless workers block on the head's token
                     # broadcast right after their stripped forward; a delayed
                     # (grammar) sample would leave them waiting on a send that
@@ -681,14 +694,26 @@ class TpModelWorker(BaseTpWorker):
             # token-dependent finish (EOS/stop) desyncs the lockstep loop into
             # a permanent DCP hang. One tiny gloo broadcast per generation
             # batch; per-layer NCCL collective count untouched.
-            if getattr(self.model_runner, "is_weightless_head", False):
+            from sglang.srt.rank_role import (
+                form_a_token_src_rank,
+                this_rank_is_form_a_host,
+            )
+
+            if getattr(self.model_runner, "is_weightless_head", False) or (
+                this_rank_is_form_a_host()
+            ):
+                # FORM A: the host is the only rank with logits; the workers
+                # block on this broadcast (see the is_form_a_worker branch).
+                _src = (
+                    form_a_token_src_rank()
+                    if this_rank_is_form_a_host()
+                    else self.server_args.weightless_kv_head_rank
+                )
                 broadcast_pyobj(
                     batch_result.next_token_ids.tolist(),
                     self.tp_size * self.pp_rank + self.tp_rank,
                     self.world_group.cpu_group,
-                    src=self.world_group.ranks[
-                        self.server_args.weightless_kv_head_rank
-                    ],
+                    src=self.world_group.ranks[_src],
                 )
 
             return batch_result

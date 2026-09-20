@@ -3253,9 +3253,12 @@ class EAGLEWorkerV2(BaseSpecWorker):
         # replicated inputs and runs identically on both sides, which is what
         # keeps the scheduler state (seq_lens, kv_committed_len, finish state) in
         # lockstep. The predicate is a boot-time role, hence rank-uniform.
+        # FORM A (fnFA10 20.09.): a Form A worker is the same shape -- no
+        # logits from the MoE-only forward, the host (rank 0) owns the
+        # accept decision and publishes it on the same broadcast.
         _wl_worker = getattr(
             self.target_worker.model_runner, "is_weightless_worker", False
-        )
+        ) or getattr(self.target_worker.model_runner, "is_form_a_worker", False)
         if not _wl_worker:
             maybe_detect_nan(
                 logits_output.next_token_logits, "verify: target model logits"
