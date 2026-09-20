@@ -142,15 +142,15 @@ SEAMS: Dict[str, Seam] = {
         Seam(
             "F1",
             "a zero entry in the dense ratio vector, admitted by the flag layer",
-            "server_args.py:12031 (--rank-tp-ratio entries must be positive), "
-            ":12003 (--rank-role requires an explicit vector), "
+            "server_args.py:12038 (--rank-tp-ratio entries must be positive), "
+            ":12010 (--rank-role requires an explicit vector), "
             "distributed/utils.py:_normalize_partition_plan",
             wired=True,
             note="Slice 2: admitted only together with an explicit "
             "--rank-role vector, so an accidental zero still raises.",
             anchors=(
-                ("server_args.py", 12031, "--rank-tp-ratio entries must be"),
-                ("server_args.py", 12003, "--rank-role requires an explicit"),
+                ("server_args.py", 12038, "--rank-tp-ratio entries must be"),
+                ("server_args.py", 12010, "--rank-role requires an explicit"),
             ),
         ),
         Seam(
