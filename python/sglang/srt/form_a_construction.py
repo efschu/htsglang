@@ -46,8 +46,17 @@ __all__ = [
 ]
 
 
-class FormAHostOnlyModuleUsed(RuntimeError):
-    """A worker rank's forward reached a module only the host builds."""
+class FormAHostOnlyModuleUsed(RuntimeError, AttributeError):
+    """A worker rank's forward reached a module only the host builds.
+
+    fnFA3 (20.09.): also an AttributeError, so that INTROSPECTION with a
+    default -- ``getattr(module, "quant_method", None)`` in the loader's
+    post-load pass (model_loader/loader.py load_weights_and_postprocess),
+    ``hasattr`` in weight-processing sweeps -- sees "no such attribute" and
+    moves on, exactly as it would for any module without that attribute.
+    Direct use (forward(), a bare attribute read) still raises with the
+    Form A message.
+    """
 
 
 #: Everything the attention host owns alone. These names are the module
