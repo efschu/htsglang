@@ -281,6 +281,22 @@ def eager_on_graph(enable: bool):
     return decorator
 
 
+_SYNC_BREAKS: bool | None = None
+
+
+def _sync_breaks() -> bool:
+    """Diagnosis switch (19.09., fn3m): SGLANG_BCG_SYNC_BREAKS=1 drains the
+    device after every eager break function of a replay. It rules a
+    stream-ordering race between the break's work and the next segment in or
+    out at the metal; it is never a production setting. Read once."""
+    global _SYNC_BREAKS
+    if _SYNC_BREAKS is None:
+        import os
+
+        _SYNC_BREAKS = str(os.environ.get("SGLANG_BCG_SYNC_BREAKS", "0")).strip() not in ("", "0")
+    return _SYNC_BREAKS
+
+
 class BreakableCUDAGraph:
     """Container holding one torch.cuda.CUDAGraph per segment plus an
     eager break function between consecutive segments."""
@@ -307,11 +323,14 @@ class BreakableCUDAGraph:
             # per-segment host work, and the ordinal is what turns a graph
             # name into a place to read. Five stores, no device access.
             if clock is None:
+                sync = _sync_breaks()
                 for i, seg in enumerate(self._segments):
                     barlink_abort_gate.note_replay("breakable/seg", None, i)
                     seg.replay()
                     if i < len(self._break_fns):
                         self._break_fns[i]()
+                        if sync:
+                            torch.cuda.synchronize()
             else:
                 self._replay_measured(clock)
         finally:
@@ -458,6 +477,23 @@ class BreakableCUDAGraphCapture:
                 "reaching here means the capture is being closed from inside "
                 "that window."
             )
+        # 19.09. (fn3f, Task #33): torch refuses `capture_end` on a stream other
+        # than the one `capture_begin` ran on. If a forward left another stream
+        # current at a break point, name the site once (the stack) and end the
+        # segment on the capture's own stream -- the forked side streams were
+        # joined above, so the segment's work is complete on it.
+        _cap = self._stream or _current_stream_var.get()
+        if _cap is not None and torch.cuda.current_stream() != _cap:
+            # fn3k: ending the segment on the capture stream while the forward
+            # continued on another (un-forked) stream captured nothing of what
+            # followed -- 44 tok/s of '!!!!'. Named refusal instead.
+            import traceback
+            raise RuntimeError(
+                "BreakableCUDAGraph: a break point was reached on stream "
+                f"{torch.cuda.current_stream()} but the capture began on {_cap}; the "
+                "forward must issue the MoE break on the capture stream (see "
+                "qwen2_moe.forward_normal_dual_stream under the breakable mode). Site:\n"
+                + "".join(traceback.format_stack(limit=12)))
         graph.capture_end()
         self.cuda_graph._append_segment(graph, self._current_graph_needs_instantiate)
         self._current_graph = None

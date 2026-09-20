@@ -335,6 +335,100 @@ def _shared_expert_uneven_misaligned(
     return False
 
 
+def link_moe_lookahead(layers, distance: Optional[int] = None) -> int:
+    """WP8: point every MoE block at the MoE block ``distance`` layers ahead
+    (``SGLANG_MOE_EXPERT_LOOKAHEAD``; 0 = off). Only blocks that carry a
+    FusedMoE ``experts`` and a ``gate`` take part; a PP-missing or dense layer
+    breaks the chain at that point. Returns the number of links made."""
+    if distance is None:
+        distance = int(envs.SGLANG_MOE_EXPERT_LOOKAHEAD.get())
+    if distance <= 0:
+        return 0
+    blocks = []
+    for layer in layers:
+        mlp = getattr(layer, "mlp", None)
+        ok = (
+            mlp is not None
+            and hasattr(mlp, "lookahead_next")
+            and hasattr(mlp, "gate")
+            and hasattr(mlp, "experts")
+        )
+        blocks.append(mlp if ok else None)
+    links = 0
+    for i, blk in enumerate(blocks):
+        j = i + distance
+        if blk is None or j >= len(blocks) or blocks[j] is None:
+            continue
+        blk.lookahead_next = blocks[j]
+        links += 1
+    return links
+
+
+def link_moe_pool_prefetch(layers) -> int:
+    """Speculative expert prefetch (SGLANG_MOE_POOL_PREFETCH=1): point every
+    MoE block at the NEXT MoE block, so it can run that block's router on its
+    own MoE input and prefetch the predicted rows while its own experts
+    compute. Distance is fixed at 1 -- the overlap window is exactly one
+    layer's expert GEMM, and a further block's router applied to this block's
+    state predicts measurably worse (Mixtral-Offloading's own finding).
+
+    Deliberately a SEPARATE chain from ``link_moe_lookahead``: WP8's lookahead
+    is consumed only by the eager wave path and carries its own distance knob;
+    this one exists only for the graph pool route. Returns the links made."""
+    from sglang.srt.layers.moe.expert_offload import pool_prefetch_enabled
+
+    if not pool_prefetch_enabled():
+        return 0
+    blocks = []
+    for layer in layers:
+        mlp = getattr(layer, "mlp", None)
+        ok = (
+            mlp is not None
+            and hasattr(mlp, "pool_prefetch_next")
+            and hasattr(mlp, "gate")
+            and hasattr(mlp, "experts")
+        )
+        blocks.append(mlp if ok else None)
+    links = 0
+    for i, blk in enumerate(blocks):
+        j = i + 1
+        if blk is None or j >= len(blocks) or blocks[j] is None:
+            continue
+        blk.pool_prefetch_next = blocks[j]
+        links += 1
+    return links
+
+
+_BREAKABLE_MODE = None
+
+
+def _breakable_offload_mode() -> bool:
+    """True when the MoE offload runs the #462 breakable graph route
+    (SGLANG_MOE_OFFLOAD_GRAPH_MODE=breakable); read once per process."""
+    global _BREAKABLE_MODE
+    if _BREAKABLE_MODE is None:
+        import os
+        _BREAKABLE_MODE = str(os.environ.get("SGLANG_MOE_OFFLOAD_GRAPH_MODE", "")).strip().lower() == "breakable"
+    return _BREAKABLE_MODE
+
+
+_POOL_PREFETCH_TOPK = {"m": None}
+
+
+def pool_prefetch_topk(k: int) -> int:
+    """How many of the next router's top-k predictions the pool prefetch
+    fetches per token: min(k, SGLANG_MOE_POOL_PREFETCH_TOPK), default k."""
+    if _POOL_PREFETCH_TOPK["m"] is None:
+        import os
+
+        try:
+            _POOL_PREFETCH_TOPK["m"] = int(os.environ.get("SGLANG_MOE_POOL_PREFETCH_TOPK", "0") or 0)
+        except ValueError:
+            _POOL_PREFETCH_TOPK["m"] = 0
+    m = _POOL_PREFETCH_TOPK["m"]
+    return int(k) if m <= 0 else max(1, min(int(k), m))
+
+
 class Qwen2MoeSparseMoeBlock(nn.Module):
     def __init__(
         self,
@@ -474,6 +568,90 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             )
             self.top_k = config.num_experts_per_tok
         self.is_nextn = is_nextn
+        # WP8 expert lookahead: the MoE block N steps ahead whose router this
+        # block evaluates on its own stream (None = off; see link_moe_lookahead).
+        self.lookahead_next: Optional["Qwen2MoeSparseMoeBlock"] = None
+        # Speculative expert prefetch for the device-planned pool: the NEXT
+        # MoE block, whose router this block evaluates on its own MoE input
+        # (None = off; see link_moe_pool_prefetch).
+        self.pool_prefetch_next: Optional["Qwen2MoeSparseMoeBlock"] = None
+        self._pool_prefetch_refused = False
+
+    def _pool_prefetch_next_block(self, hidden_states: torch.Tensor) -> None:
+        """Mixtral-Offloading's speculative expert loading, for the graph pool.
+
+        The residual stream changes slowly from layer to layer, so the NEXT MoE
+        block's router applied to THIS block's MoE input is a good predictor of
+        the experts that block will want. Run it here, at the top of this
+        block's forward, and hand the prediction to the next block's pool: the
+        rows it is missing are copied on a side stream while this block's own
+        experts compute, and the next block's real plan then finds them
+        resident (see expert_pool_device's module docstring).
+
+        Only the COPIES go to the side stream. The prediction itself stays on
+        the capture stream because it is a [tokens x hidden] @ [hidden x E]
+        GEMM plus one top-k -- a few MFLOP per layer against the ~350 MB per
+        round the copies move; forking it would buy nothing and cost a second
+        event pair.
+
+        Graph-capture only: outside capture the pool is not the active route
+        (an eager forward runs run_waves and republishes its occupancy
+        afterwards), so there is nothing to prefetch into.
+        """
+        nxt = self.pool_prefetch_next
+        if nxt is None or hidden_states.shape[0] == 0:
+            return
+        if not get_is_capture_mode():
+            return
+        cfg = nxt.topk.topk_config
+        if cfg.use_grouped_topk or cfg.correction_bias is not None:
+            # A prediction that used the wrong routing rule would still be
+            # SAFE (a wrong guess is only a wasted row), but it would be
+            # silently worse than it looks. Refuse loudly once instead.
+            if not self._pool_prefetch_refused:
+                self._pool_prefetch_refused = True
+                logger.warning(
+                    "[moe-pool-prefetch] layer %s: the next block routes with "
+                    "grouped top-k / a correction bias; the plain top-k "
+                    "predictor does not reproduce it, prefetch stays off here",
+                    self.layer_id,
+                )
+            return
+        k = int(cfg.top_k) - int(cfg.num_fused_shared_experts or 0)
+        if k <= 0:
+            return
+        # Task #45 (fn7m dump, 19.09.): fetching all k predictions costs 1.49x
+        # the bytes at 50 % precision on the fetched rows; the m most probable
+        # per token (SGLANG_MOE_POOL_PREFETCH_TOPK, default k) reach 72 % at
+        # m=3 / 65 % at m=5 for 1.06x / 1.13x bytes -- above the 59 % break-even.
+        k = pool_prefetch_topk(k)
+        pred_logits, _ = nxt.gate(hidden_states)
+        # top-k of the logits == top-k of softmax(logits): softmax is strictly
+        # monotone, so the RenormalizeNaive path selects exactly these ids. We
+        # need the ids only -- the weights are never used by a prefetch.
+        pred_ids = torch.topk(pred_logits, k, dim=-1).indices.to(torch.int32)
+        nxt.experts.pool_prefetch(pred_ids)
+
+    def _predict_lookahead(self, hidden_states: torch.Tensor):
+        """Run the LATER block's router on this block's MLP input and hand the
+        predicted expert ids (this rank's local ids) to this block's experts,
+        which prefetch them into the later block's scratch while this block's
+        GEMM runs. Eager only: under graph capture the prediction would need
+        a host rendezvous the captured segment cannot pay."""
+        nxt = self.lookahead_next
+        if nxt is None or get_is_capture_mode():
+            return
+        pred_logits, _ = nxt.gate(hidden_states)
+        pred = nxt.topk(hidden_states, pred_logits)
+        if not TopKOutputChecker.format_is_standard(pred):
+            return
+        pred_ids = pred.topk_ids
+        target = nxt.experts
+        if getattr(target, "_gguf_expert_shard", False):
+            if not hasattr(target, "_gguf_topk_remap"):
+                target._build_expert_shard_topk_remap()
+            pred_ids = target._gguf_topk_remap[pred_ids.long()]
+        self.experts.set_lookahead(target, pred_ids)
 
     def get_moe_weights(self):
         return [
@@ -638,6 +816,8 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             topk_output
         ):
             topk_output = self._append_shared_to_topk_output(topk_output, hidden_states)
+        if self.lookahead_next is not None:
+            self._predict_lookahead(hidden_states)
         return self.experts(hidden_states, topk_output)
 
     def forward_normal_dual_stream(
@@ -647,13 +827,26 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
     ) -> torch.Tensor:
         current_stream = torch.cuda.current_stream()
         self.alt_stream.wait_stream(current_stream)
-        shared_output = (
-            self._forward_shared_experts(
-                hidden_states.clone(), apply_gate=not use_fused_gate
+        # 19.09. (fn3k, #462 breakable route): the routed experts carry the
+        # eager MoE break (`eager_on_graph`), and a CUDA-graph segment can only
+        # end on the stream it began on -- the CAPTURE stream. So under the
+        # breakable offload mode the roles swap: shared experts overlap on the
+        # alt stream, the routed experts (and their break) stay on the current
+        # stream. Same overlap, same bytes; only the break's stream changes.
+        _routed_on_main = _breakable_offload_mode()
+        if _routed_on_main and self.shared_expert is not None:
+            with torch.cuda.stream(self.alt_stream):
+                shared_output = self._forward_shared_experts(
+                    hidden_states.clone(), apply_gate=not use_fused_gate
+                )
+        else:
+            shared_output = (
+                self._forward_shared_experts(
+                    hidden_states.clone(), apply_gate=not use_fused_gate
+                )
+                if self.shared_expert is not None
+                else None
             )
-            if self.shared_expert is not None
-            else None
-        )
 
         # ===== TO BE REFACTORED ====
         # Shared-add overlap (SGLANG_OPT_LORA_SHARED_ADD_OVERLAP): hand the add to the LoRA
@@ -671,8 +864,11 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 staged = True
         # ===== END TO BE REFACTORED ====
 
-        with torch.cuda.stream(self.alt_stream):
+        if _routed_on_main:
             router_output = self._forward_router_experts(hidden_states)
+        else:
+            with torch.cuda.stream(self.alt_stream):
+                router_output = self._forward_router_experts(hidden_states)
 
         current_stream.wait_stream(self.alt_stream)
 
@@ -689,6 +885,12 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
     ) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
+
+        # Issue the NEXT block's speculative prefetch first: everything this
+        # block enqueues afterwards (gate, shared expert, expert GEMM) is the
+        # compute the copies hide behind.
+        if self.pool_prefetch_next is not None:
+            self._pool_prefetch_next_block(hidden_states)
 
         if get_moe_a2a_backend().is_deepep():
             return self._forward_deepep(hidden_states, forward_batch)

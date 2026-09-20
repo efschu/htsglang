@@ -57,6 +57,15 @@ if _use_aiter:
 logger = logging.getLogger(__name__)
 
 
+def _moe_offload_active() -> bool:
+    """Is MoE expert offload on anywhere in the group? (group-wide on purpose,
+    see awq_moe._moe_offload_active; imported lazily to keep this module's
+    import graph unchanged)."""
+    from sglang.srt.layers.moe.resident_fraction import offload_active
+
+    return offload_active()
+
+
 class GPTQMarlinState(Enum):
     REPACK = enum.auto()
     READY = enum.auto()
@@ -113,12 +122,32 @@ class CompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
         extra_weight_attrs.update(
             {"is_transposed": True, "quant_method": self.strategy}
         )
+
+        # WP2 (Qwen3.8-Flash-Next, compressed-tensors AWQ/GPTQ INT4): the
+        # load-time half of the per-expert MoE offload, the same construction
+        # awq_moe.create_weights / gptq_moe.create_weights use. With a
+        # resident-expert fraction < 1.0 every expert-major tensor (packed
+        # weights, group scales, asymmetric zero points) is built on the host,
+        # so the full [E, ...] stack never sits on the card at once; the
+        # marlin repack still runs on GPU under the loader's
+        # device_loading_context, and presplit_expert_offload_after_repack
+        # then keeps only the [R+C] resident slots there (see
+        # process_weights_after_loading). fraction >= 1.0 -> _moe_dev is None
+        # -> byte-identical stock path.
+        _moe_dev = (
+            "cpu"
+            if not getattr(layer, "_moe_offload_excluded", False)
+            and _moe_offload_active()
+            else None
+        )
+
         w13_weight = torch.nn.Parameter(
             torch.empty(
                 num_experts,
                 hidden_size // self.packed_factor,
                 2 * intermediate_size_per_partition,
                 dtype=torch.int32,
+                device=_moe_dev,
             ),
             requires_grad=False,
         )
@@ -131,6 +160,7 @@ class CompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
                 intermediate_size_per_partition // self.packed_factor,
                 hidden_size,
                 dtype=torch.int32,
+                device=_moe_dev,
             ),
             requires_grad=False,
         )
@@ -165,6 +195,7 @@ class CompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
                 num_groups_w13,
                 2 * intermediate_size_per_partition,
                 dtype=params_dtype,
+                device=_moe_dev,
             ),
             requires_grad=False,
         )
@@ -172,7 +203,13 @@ class CompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
         set_weight_attrs(w13_scale, extra_weight_attrs)
 
         w2_scale = torch.nn.Parameter(
-            torch.ones(num_experts, num_groups_w2, hidden_size, dtype=params_dtype),
+            torch.ones(
+                num_experts,
+                num_groups_w2,
+                hidden_size,
+                dtype=params_dtype,
+                device=_moe_dev,
+            ),
             requires_grad=False,
         )
         layer.register_parameter("w2_weight_scale", w2_scale)
@@ -199,6 +236,7 @@ class CompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
                     num_groups_w13,
                     2 * intermediate_size_per_partition // self.packed_factor,
                     dtype=torch.int32,
+                    device=_moe_dev,
                 ),
                 requires_grad=False,
             )
@@ -211,6 +249,7 @@ class CompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
                     num_groups_w2,
                     hidden_size // self.packed_factor,
                     dtype=torch.int32,
+                    device=_moe_dev,
                 ),
                 requires_grad=False,
             )
@@ -280,11 +319,47 @@ class CompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
             layer._original_shapes["w13_weight_zero_point"] = w13_qzeros.shape
             layer._original_shapes["w2_weight_zero_point"] = tuple(w2_qzeros.shape)
 
+        # WP1: arm the per-layer early presplit (FusedMoE._ct_stream_note).
+        # Only with the host allocation above AND a CUDA ambient device: the
+        # repack needs a card, and without the offload there is nothing to
+        # bound. Expected shard counts: w13-type params get gate and up
+        # (two shards per expert), w2-type params one.
+        if _moe_dev == "cpu":
+            import threading
+
+            ambient = torch.empty(0).device
+            if ambient.type == "cuda":
+                # under the generic expert shard only the OWNED experts arrive
+                # (the pad expert never does)
+                owned = int(getattr(layer, "_expert_shard_owned", num_experts))
+                expected = {
+                    "w13_weight_packed": 2 * owned,
+                    "w2_weight_packed": owned,
+                    "w13_weight_scale": 2 * owned,
+                    "w2_weight_scale": owned,
+                }
+                if not self.sym:
+                    expected["w13_weight_zero_point"] = 2 * owned
+                    expected["w2_weight_zero_point"] = owned
+                layer._ct_stream_presplit = {
+                    "expected": expected,
+                    "names": {id(getattr(layer, n)): n for n in expected},
+                    "seen": {},
+                    "lock": threading.Lock(),
+                    "done": False,
+                    "device": ambient,
+                }
+
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
 
         # Skip if the layer is already converted to Marlin format to prevent double-packing.
         if getattr(layer, "is_marlin_converted", False):
             return
+
+        # WP3a generic expert shard: the pad expert contributes zero (scales 0)
+        zero_pad = getattr(layer, "zero_expert_shard_pad", None)
+        if callable(zero_pad):
+            zero_pad()
 
         if not hasattr(layer, "_original_shapes"):
             layer._original_shapes = {}
@@ -403,6 +478,17 @@ class CompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
 
         layer.workspace = marlin_make_workspace(layer.w13_weight_packed.device, 4)
         layer.is_marlin_converted = True
+
+        # WP2: after the marlin repack, split into the fixed-resident GPU
+        # buffer + pinned-host spill so the full [E] expert stack never gets
+        # pinned back to host (load-time RAM cap). No-op unless
+        # SGLANG_MOE_RESIDENT_EXPERT_FRACTION < 1.0. No ``cold_shard=`` here
+        # (#421 F8), like every other repack door.
+        from sglang.srt.layers.moe.expert_offload import (
+            presplit_expert_offload_after_repack,
+        )
+
+        presplit_expert_offload_after_repack(layer)
 
     def restore_weights_before_loading(self, layer: torch.nn.Module):
         """Forcibly resize parameters back to their original shapes (e.g., GPTQ format) before loading weights."""

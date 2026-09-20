@@ -863,3 +863,18 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
         return self.forward_cuda(*args, **kwargs)
 
     forward_native = forward_cpu
+
+
+def precompile_splitk_tactics() -> bool:
+    """#37500 port: upstream's BF16 split-K GEMM tactics (GB300/B300 tuned)
+    are not carried on this line; qwen4_exp asks once at load and gets
+    'nothing to precompile'."""
+    return False
+
+
+def bf16_gemm_dispatch(
+    x: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor]
+) -> torch.Tensor:
+    """#37500 port: upstream routes BF16 GEMMs through cuBLAS/CuTe/split-K
+    tactics here; this line has none of those, so it is a plain linear."""
+    return torch.nn.functional.linear(x, weight, bias)

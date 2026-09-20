@@ -685,6 +685,56 @@ class TestModelOptMixedPrecisionConfig(CustomTestCase):
             "FP8",
         )
 
+    def test_mixed_precision_resolves_vl_language_model_keys(self):
+        # nvidia/Qwen3.8-Flash-Next-NVFP4 keys the text stack as
+        # `model.language_model.*` while Qwen4-Exp modules are `model.*`.
+        quant_config = ModelOptMixedPrecisionConfig.from_config(
+            {
+                "quant_algo": "MIXED_PRECISION",
+                "quantized_layers": {
+                    "model.language_model.layers.3.mlp.experts": {
+                        "quant_algo": "NVFP4",
+                        "group_size": 16,
+                    },
+                    "model.language_model.layers.1.ple.ple_embedding.ngram_embedding": {
+                        "quant_algo": "FP8"
+                    },
+                    "mtp.layers.0.mlp.experts": {
+                        "quant_algo": "FP8_BLOCK_SCALES",
+                        "group_size": 128,
+                    },
+                },
+            }
+        )
+
+        self.assertEqual(quant_config.exclude_modules, [])
+        moe = FusedMoE.__new__(FusedMoE)
+        self.assertIsInstance(
+            quant_config.get_quant_method(moe, "mtp.layers.0.mlp.experts"),
+            Fp8MoEMethod,
+        )
+        self.assertEqual(
+            quant_config.get_quant_method(
+                moe, "mtp.layers.0.mlp.experts"
+            ).quant_config.weight_block_size,
+            [128, 128],
+        )
+        self.assertEqual(
+            quant_config.resolve_quant_algo("model.layers.3.mlp.experts"), "NVFP4"
+        )
+        self.assertEqual(
+            quant_config.resolve_quant_algo(
+                "model.layers.1.ple.ple_embedding.ngram_embedding"
+            ),
+            "FP8",
+        )
+        self.assertIsNone(
+            quant_config.resolve_quant_algo("model.layers.1.ple.key_proj")
+        )
+        self.assertIsNone(
+            quant_config.resolve_quant_algo("model.layers.3.mlp.shared_expert")
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

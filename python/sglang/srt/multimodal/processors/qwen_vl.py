@@ -28,6 +28,7 @@ from sglang.srt.models.qwen3_5_mtp import Qwen3_5ForCausalLMMTP
 from sglang.srt.models.qwen3_omni_moe import Qwen3OmniMoeForConditionalGeneration
 from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
 from sglang.srt.models.qwen3_vl_moe import Qwen3VLMoeForConditionalGeneration
+from sglang.srt.models.qwen4_exp import Qwen4ExpForConditionalGeneration
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor as SGLangBaseProcessor,
 )
@@ -275,10 +276,29 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
         Qwen3_5ForCausalLMMTP,
         InternS2PreviewForConditionalGeneration,
         Qwen3OmniMoeForConditionalGeneration,
+        Qwen4ExpForConditionalGeneration,
     ]
 
     def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
         self.model_type = hf_config.model_type
+        if self.model_type in (
+            "qwen2_vl",
+            "qwen2_5_vl",
+            "qwen3_vl",
+            "qwen3_vl_moe",
+            "qwen3_5",
+            "qwen3_5_moe",
+            "qwen4_exp",
+            "intern_s2_preview",
+            "interns2_mobius",
+        ):
+            # Two workers overlap CPU preprocessing without over-fragmenting
+            # burst arrivals into smaller GPU prefill batches. Higher counts can
+            # improve short-output TTFT, but regress long-output throughput on
+            # Blackwell when requests reach the scheduler too far apart.
+            self.auto_mm_processor_worker_num = 2
+            self.auto_mm_io_worker_num = 16
+            self.supports_mm_processor_concurrency = True
         if hf_config.model_type == "qwen3_omni_moe":
             hf_config = hf_config.thinker_config
 
@@ -479,6 +499,7 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
             "qwen3_vl_moe",
             "qwen3_5",
             "qwen3_5_moe",
+            "qwen4_exp",
             "intern_s2_preview",
         ):
             return None
@@ -614,6 +635,7 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
                 "qwen3_vl_moe",
                 "qwen3_5",
                 "qwen3_5_moe",
+                "qwen4_exp",
                 "intern_s2_preview",
             ]
             and video_timestamps is not None
@@ -715,6 +737,7 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
             "qwen3_vl_moe",
             "qwen3_5",
             "qwen3_5_moe",
+            "qwen4_exp",
             "intern_s2_preview",
         ):
             mm_items, input_ids, ret = self.process_and_combine_mm_data(

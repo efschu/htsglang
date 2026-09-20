@@ -436,7 +436,31 @@ class Envs:
     #        keeping access relatively ordered.
     SGLANG_SORT_WEIGHT_FILES = EnvInt(0)
     SGLANG_DISABLED_MODEL_ARCHS = EnvTuple(tuple())
+    # Shard the Qwen4-Exp PLE n-gram embedding within each attention-TP group
+    # instead of gathering DP tokens for a global-TP lookup.
+    SGLANG_USE_ATTN_TP_NGRAM = EnvBool(False)
+    # Bitwise-exact, shape-guarded Qwen4 PLE decode fusion. Unsupported inputs
+    # and phases fall back to the original implementation.
+    SGLANG_ENABLE_QWEN4_PLE_FUSION = EnvBool(True)
+    # --ple-offload-backend file: where the sparse, file-backed PLE table lives
+    # (deterministic name, reused across restarts), whether prefill-sized
+    # gathers hint the page cache first, and an escape hatch for the device
+    # attribute check (pageable host memory reachable through host page tables).
+    SGLANG_QWEN4_PLE_FILE_DIR = EnvStr(lambda: _default_cache_subdir("ple"))
+    SGLANG_QWEN4_PLE_FILE_PREFETCH = EnvBool(True)
+    SGLANG_QWEN4_PLE_FILE_SKIP_DEVICE_CHECK = EnvBool(False)
+    # Faulting rows in maps whole page-cache folios, so the mapping creeps
+    # towards full residency (~45 KB/token) and eats the free memory that
+    # sizes the KV pool. Cap its resident set; 0 disables the trim.
+    SGLANG_QWEN4_PLE_FILE_RSS_BUDGET_GB = EnvFloat(8.0)
+    SGLANG_QWEN4_PLE_FILE_RSS_INTERVAL_S = EnvFloat(30.0)
     SGLANG_PREFETCH_BLOCK_SIZE_MB = EnvInt(16)
+    # Weight loader: read safetensors tensors with pread() instead of mmap
+    # page faults (ZFS: ~0.5 GB/s per rank through mmap, ~3 GB/s through
+    # read(); fn1v/fn1w 2026-09-16), and let the model veto tensors before
+    # they are read (weight_name_needed: PLE shards the checkpoint backend
+    # only maps, experts and layers other ranks own).
+    SGLANG_WEIGHT_LOADER_PREAD = EnvBool(False)
     SGLANG_GEMMA_OUT_OF_PLACE_POSITION_MUTATION = EnvBool(False)
 
     # HTTP server
@@ -892,6 +916,14 @@ class Envs:
     # family, MOE = fused expert-weight family.
     SGLANG_UNEVEN_MLP_VECTOR = EnvStr(None)
     SGLANG_UNEVEN_MOE_VECTOR = EnvStr(None)
+    # WP3a: shard MoE experts by INDEX (whole experts per rank, pad expert at
+    # local 0) under an uneven plan for non-GGUF quant paths too.
+    SGLANG_UNEVEN_MOE_EXPERT_SHARD = EnvBool(False)
+    # WP8 expert lookahead (slotstream +11 % decode): a MoE block runs the
+    # router of the block N steps AHEAD on its own stream and that block's
+    # offload cache prefetches the predicted spill experts while the current
+    # block computes. 0 = off (default, byte-identical path); 1 or 2 = distance.
+    SGLANG_MOE_EXPERT_LOOKAHEAD = EnvInt(0)
     # Ratio-weighted vocab sharding vector ("a,b,c", one positive integer
     # per rank) for VocabParallelEmbedding/ParallelLMHead; overrides
     # --rank-vocab-ratio when both are set. Unlike MLP/MOE this family
@@ -1916,6 +1948,25 @@ class Envs:
     # over undefined resume content. Costs ~capture-pool-size of host RAM per
     # state and a PCIe round-trip per swap.
     SGLANG_ADAPTIVE_CAPTURE_CPU_BACKUP = EnvBool(False)
+    # Per-round adaptive draft chain length (topk=1 chains only), on top of
+    # --speculative-adaptive. Where --speculative-adaptive picks the chain
+    # length from the EMA of *observed* accept lengths every update_interval
+    # batches, this picks it every round from the draft model's own top-1
+    # confidence: survival = cumprod of the per-step top-1 probability, and
+    # k* = argmax (1 + sum survival) / cost(k). Deliberately NOT named
+    # SGLANG_SPEC_ADAPTIVE: that word is already taken by the server arg for
+    # the EMA policy, and two different mechanisms under one name is how a
+    # later reader picks the wrong one. Requires --speculative-adaptive, which
+    # owns the per-candidate runtime states (CUDA graphs) this switches between.
+    SGLANG_SPEC_ADAPTIVE_CHAIN = EnvBool(False)
+    # Never draft fewer than this many steps, even at zero confidence.
+    SGLANG_SPEC_ADAPTIVE_CHAIN_MIN_STEPS = EnvInt(1)
+    # Cost prior, "draft:<ms>,verify:<ms>" (e.g. "draft:2.5,verify:26"). Seeds
+    # cost(k) = verify + k * draft until enough rounds at that k have been
+    # measured; a malformed entry falls back to the built-in default.
+    SGLANG_SPEC_ADAPTIVE_CHAIN_COST_MS = EnvStr("")
+    # Log a "[spec-adaptive]" histogram of chosen k every N rounds. 0 = never.
+    SGLANG_SPEC_ADAPTIVE_CHAIN_LOG_EVERY = EnvInt(0)
     # Kill-switch for the draft-extend cuda graph. Draft extend then always runs
     # eager. Escape hatch for setups where the capture's memory pool costs more
     # than the graph saves (e.g. DeepEP MoE workspace captured at full dispatch

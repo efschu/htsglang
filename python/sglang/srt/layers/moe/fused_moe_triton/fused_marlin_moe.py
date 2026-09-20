@@ -1,3 +1,5 @@
+import logging
+import os
 from typing import Optional
 
 import torch
@@ -6,7 +8,63 @@ import torch.nn.functional as F
 from sglang.srt.utils import is_cuda
 from sglang.srt.utils.custom_op import register_custom_op
 
+logger = logging.getLogger(__name__)
+
 _is_cuda = is_cuda()
+
+# --- Task #49 (20.09.): the Marlin lock-workspace discriminator -------------
+#
+# Every caller of this function hands in a workspace that was allocated ONCE
+# and is then reused by every call: the wNa16 MoE scheme allocates
+# ``layer.workspace`` in process_weights_after_loading
+# (compressed_tensors_wNa16_moe.py: ``marlin_make_workspace(device, 4)``), the
+# MoE runner keeps a process-global ``MARLIN_MOE_WORKSPACE``. Marlin uses it as
+# its inter-threadblock lock buffer and is expected to leave it zeroed; if a
+# launch ever does not, the NEXT launch starts with locks already taken and its
+# parallel-k reduction can read a partial tile. Under expert-major prefill one
+# layer issues many launches back to back over the same buffer, which is the
+# shape that would make such a leak visible only sporadically.
+#
+# SGLANG_MOE_MARLIN_PRIVATE_WORKSPACE=1 drops the supplied buffer and allocates
+# a freshly ZEROED one per call (the same size the None-branch below computes),
+# so the second needle boot can decide the question by A/B instead of argument.
+# It costs one small zeroed int allocation per MoE GEMM; it is a probe, not a
+# fix. Scope it per rank the way the launcher scopes every other per-rank env.
+_PRIVATE_WS = {"on": None}
+_WS_LOGGED = {"done": False}
+
+
+def marlin_private_workspace_on() -> bool:
+    if _PRIVATE_WS["on"] is None:
+        _PRIVATE_WS["on"] = str(
+            os.environ.get("SGLANG_MOE_MARLIN_PRIVATE_WORKSPACE", "0")
+        ).strip().lower() in ("1", "true", "on")
+    return bool(_PRIVATE_WS["on"])
+
+
+def _log_workspace_provenance(workspace) -> None:
+    """Once per process, name whether this path uses a SHARED workspace at all.
+
+    That is the 'prüfen und belegen' half of the switch: a probe that turns off
+    a mechanism the path never used would be a null result misread as an
+    exoneration, so the log states the mechanism's presence before the A/B."""
+    if _WS_LOGGED["done"]:
+        return
+    _WS_LOGGED["done"] = True
+    try:
+        logger.error(
+            "[nan-disc2] marlin MoE workspace: supplied=%s numel=%s ptr=%s nonzero=%s "
+            "private=%s -- a supplied buffer is the SHARED lock workspace (allocated "
+            "once at load, reused by every call/wave/slice); private=on replaces it "
+            "with a freshly zeroed one per call",
+            workspace is not None,
+            int(workspace.numel()) if workspace is not None else None,
+            hex(workspace.data_ptr()) if workspace is not None else None,
+            int((workspace != 0).sum().item()) if workspace is not None else None,
+            marlin_private_workspace_on(),
+        )
+    except Exception as exc:  # noqa: BLE001 -- an instrument never kills a GEMM
+        logger.debug("[nan-disc2] workspace provenance log skipped: %s", exc)
 
 if _is_cuda:
     from sgl_kernel import moe_sum_reduce
@@ -187,6 +245,11 @@ def fused_marlin_moe(
     sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
         topk_ids, block_size_m, global_num_experts
     )
+
+    _log_workspace_provenance(workspace)
+    if marlin_private_workspace_on():
+        # Task #49 probe: forget the shared lock buffer, take a private one.
+        workspace = None
 
     if workspace is None:
         max_workspace_size = (max(2 * N, K) // 64) * (

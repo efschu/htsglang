@@ -575,6 +575,9 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
         "MistralLarge3ForCausalLM",
         "PixtralForConditionalGeneration",
         "HYV3ForCausalLM",
+        "HYV4ForCausalLM",
+        # Qwen4-Exp ships its NEXTN draft layer inside the target checkpoint.
+        "Qwen4ExpForConditionalGeneration",
     ]:
         if server_args.speculative_draft_model_path is None:
             server_args.speculative_draft_model_path = server_args.model_path

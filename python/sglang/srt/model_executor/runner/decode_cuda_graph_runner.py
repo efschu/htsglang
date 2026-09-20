@@ -726,6 +726,23 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             self._clock_runner_tag = tag
         return (tag, shape_key)
 
+    def _bind_clock_graph(self, shape_key) -> None:
+        """Task #52: after the capture (outside it), hand the captured
+        CUDAGraph to the collective clock so its event-record nodes get K
+        event sets and a replay no longer overwrites the round the
+        scheduler thread has not read yet. No-op for backends without
+        ``graph_object`` and for graphs the clock captured no pairs in."""
+        getter = getattr(self.backend, "graph_object", None)
+        if getter is None:
+            return
+        graph = getter(shape_key)
+        if graph is None:
+            return
+        try:
+            collective_clock().bind_graph(self._clock_graph_key(shape_key), graph)
+        except Exception:  # the instrument must never take the boot down
+            logger.warning("collective clock: bind_graph failed", exc_info=True)
+
     def _clock_capture_phase(self):
         """#1241b. The family PREFIX this capture's collectives must carry.
 
@@ -1924,6 +1941,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                         dummies=None,
                         post_warmup_hook=post_warmup_hook,
                     )
+                self._bind_clock_graph(shape_key)
 
     def _capture_one_shape_weightless(
         self,
@@ -2031,6 +2049,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     dummies=None,
                     post_warmup_hook=None,
                 )
+            self._bind_clock_graph(shape_key)
 
     def recapture_if_needed(self, forward_batch: ForwardBatch):
 

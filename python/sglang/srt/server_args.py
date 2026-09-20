@@ -235,6 +235,7 @@ SPECULATIVE_DRAFT_MODEL_QUANTIZATION_CHOICES = QUANTIZATION_CHOICES
 ATTENTION_BACKEND_CHOICES = [
     # Common
     "triton",
+    "qsa",  # #37500: Qwen sparse attention (Qwen3.8-Flash-Next)
     "torch_native",
     "flex_attention",
     "dsa",
@@ -498,9 +499,11 @@ _COMPUTE_PLACEMENT_LINK = "link"
 #: SGLANG_MOE_COLD_TRAFFIC_COEFFICIENTS silently produced the calibrated solve,
 #: and that solve is the one the window falsified.
 _COMPUTE_PLACEMENT_LINK_CALIBRATED = "link-calibrated"
+_COMPUTE_PLACEMENT_TIME = "time"
 _COMPUTE_PLACEMENT_SYMBOLS = (
     _COMPUTE_PLACEMENT_LINK,
     _COMPUTE_PLACEMENT_LINK_CALIBRATED,
+    _COMPUTE_PLACEMENT_TIME,
 )
 
 
@@ -4702,6 +4705,33 @@ class ServerArgs:
     # Offloading
     # -------------------------------------------------------------------------
     cpu_offload_gb: A[int, "How many GBs of RAM to reserve for CPU offloading."] = 0
+    ple_offload_embedding: A[
+        Optional[bool],
+        Arg(
+            help="#37500: offload the Qwen4-Exp PLE n-gram embedding table (51B rows) to "
+            "CPU pinned memory (or a file-backed table, see --ple-offload-backend). "
+            "Default: enabled for bf16 Qwen4-Exp on CUDA; --no-ple-offload-embedding disables.",
+            action=argparse.BooleanOptionalAction,
+            resolvable=True,
+        ),
+    ] = None
+    ple_offload_backend: A[
+        str,
+        Arg(
+            help="#39126: host storage for the offloaded Qwen4 PLE n-gram table. "
+            "'pinned' (default) uses CPU pinned memory. 'file' maps a sparse file under "
+            "--ple-offload-dir and lets the gather kernel read it directly (upstream: "
+            "unified-memory devices only, cudaDevAttrPageableMemoryAccessUsesHostPageTables). "
+            "'checkpoint' (this line) copies nothing: the checkpoint's own safetensors files are "
+            "mapped read-only and gathered through HMM (needs cudaDevAttrPageableMemoryAccess).",
+            choices=["pinned", "file", "checkpoint"],
+        ),
+    ] = "pinned"
+    ple_offload_dir: A[
+        Optional[str],
+        "#39126: directory for the file-backed PLE table when --ple-offload-backend is 'file'. "
+        "Defaults to $SGLANG_CACHE_DIR/ple/<model path>; the file is sparse and reused across restarts.",
+    ] = None
     offload_group_size: A[int, "Number of layers per group in offloading."] = -1
     offload_num_in_group: A[
         int,
@@ -15069,6 +15099,7 @@ class ServerArgs:
             "Qwen3_5MoeForConditionalGeneration",
             "InternS2PreviewForConditionalGeneration",
             "Qwen3_5ForConditionalGeneration",
+            "Qwen4ExpForConditionalGeneration",
         ]:
             # The quantization/moe_runner_backend resolution moved to the
             # override registry (arg_groups/overrides.py:
@@ -18060,6 +18091,7 @@ class ServerArgs:
             "Qwen3VLMoeForConditionalGeneration",
             "Qwen3_5ForConditionalGeneration",
             "Qwen3_5MoeForConditionalGeneration",
+            "Qwen4ExpForConditionalGeneration",
             "InternS2PreviewForConditionalGeneration",
             "Qwen3OmniMoeForConditionalGeneration",
             "Qwen2AudioForConditionalGeneration",

@@ -363,6 +363,28 @@ _is_npu = is_npu()
 _is_hip = is_hip()
 
 
+PREFILL_TRANSIENT_ENV = "SGLANG_KV_BUDGET_PREFILL_TRANSIENT_MIB"
+
+
+def prefill_transient_mib_for_rank(text: str, rank: int) -> float:
+    """Task #48 C: the measured prefill activation transient to book for
+    ``rank``, MiB. ``text`` is a scalar (every rank) or a comma vector (one
+    entry per rank); empty or unparsable -> 0.0 (nothing booked, sizing
+    byte-identical). A vector shorter than ``rank`` books 0 for that rank."""
+    t = (text or "").strip()
+    if not t:
+        return 0.0
+    parts = [x.strip() for x in t.split(",")]
+    try:
+        if len(parts) == 1:
+            return max(0.0, float(parts[0]))
+        if 0 <= int(rank) < len(parts):
+            return max(0.0, float(parts[int(rank)]))
+    except ValueError:
+        return 0.0
+    return 0.0
+
+
 class ModelRunnerKVCacheMixin:
     # === #119: expert-offload VRAM -> KV pool ==============================
     # The expert offload (#77/#123) parks cold experts in a pinned host pool and
@@ -850,6 +872,24 @@ class ModelRunnerKVCacheMixin:
             rest_memory, _reserve_post = self._gapped_corridor_holdback(rest_memory)
             if _reserve_post is not None:
                 budget_posts.append(_reserve_post)
+            # Task #48 C (19./20.09.): the prefill activation transient is a
+            # MEASURED post ([vram-peak]: 1.69 GiB per rank at 8192-token
+            # chunks on Next Flash), booked here explicitly. Without it the
+            # sizer left ~1.9 GiB of slack that the transient plus allocator
+            # fragmentation ate: fn8h died at 187 MiB free wanting 200, fn8i at
+            # 481 wanting 520. On the uneven-DCP path the ledger's activation
+            # reserve never runs (see ServerArgs.activation_reserve_mb), so
+            # this is the only place the number can enter. Env vector, one
+            # entry per rank, default 0 = byte-identical sizing.
+            _transient_gb = (
+                prefill_transient_mib_for_rank(
+                    os.environ.get(PREFILL_TRANSIENT_ENV, ""), self._rank_vector_index()
+                )
+                / 1024.0
+            )
+            if _transient_gb > 0.0:
+                rest_memory -= _transient_gb
+                budget_posts.append(("prefill transient (measured)", _transient_gb))
             # #260: the budget is ABSOLUTE, so a co-resident process must
             # never shrink it -- but it does bound what this rank can
             # physically allocate. That bound gets its own check and its own
@@ -1073,18 +1113,27 @@ class ModelRunnerKVCacheMixin:
             # here rather than as an unexplained smaller KV pool.
             from sglang.srt.layers.moe.expert_offload import (
                 expert_offload_release_totals,
+                pinned_exact_bytes,
+                torch_host_cache_reserved_bytes,
             )
 
             released = expert_offload_release_totals()
+            # The page-locked figure is what the host allocator really holds
+            # (exact-size registrations, see pinned_exact_empty); before that
+            # helper, torch's CachingHostAllocator rounded every pool up to a
+            # power of two and the two numbers could differ by ~18 GiB per rank.
             logger.info(
                 "[offload-kv-regain] rank %d: expert offload released %.2f GiB "
                 "of weight VRAM across %d MoE layer(s) (%.2f GiB moved to the "
-                "pinned host pool); that VRAM is part of the %.2f GiB KV budget "
+                "pinned host pool, %.2f GiB page-locked exactly, torch host "
+                "cache %.2f GiB); that VRAM is part of the %.2f GiB KV budget "
                 "profiled here.",
                 self.tp_rank,
                 released.device_bytes / (1 << 30),
                 released.layers,
                 released.host_bytes / (1 << 30),
+                pinned_exact_bytes() / (1 << 30),
+                torch_host_cache_reserved_bytes() / (1 << 30),
                 rest_memory,
             )
 
@@ -3832,7 +3881,24 @@ class ModelRunnerKVCacheMixin:
                         pre_alloc_size=pre_alloc_size,
                     )
             elif config := self.mambaish_config:
+                # #37500 port: Qwen4-Exp PLE side states (short conv + n-gram
+                # window) ride on the mamba slots of THIS stage's layers.
+                from sglang.srt.configs.qwen4_exp import Qwen4ExpTextConfig
+
+                _ple_kwargs = {}
+                if isinstance(config, Qwen4ExpTextConfig):
+                    _ple_kwargs = dict(
+                        short_conv_layer_ids=[
+                            i
+                            for i in config.short_conv_layer_ids
+                            if self.start_layer <= i < self.end_layer
+                        ],
+                        short_conv_state_shape=config.short_conv_state_shape,
+                        ngram_context_len=config.ngram_context_len,
+                        ngram_eos_token_id=int(config.eos_token_id),
+                    )
                 self.req_to_token_pool = HybridReqToTokenPool(
+                    **_ple_kwargs,
                     size=max_num_reqs,
                     mamba_size=self.server_args.max_mamba_cache_size,
                     mamba_spec_state_size=max_num_reqs,
@@ -4493,7 +4559,33 @@ class ModelRunnerKVCacheMixin:
                     stage_owned_layer_ids,
                 )
 
-                self.token_to_kv_pool = HybridLinearKVPool(
+                # #37500 port: Qwen4-Exp compressed QSA carries its index-K
+                # and compressed K/V beside the full KV of the same slots.
+                from sglang.srt.layers.attention.qsa.config import parse_qsa_profile
+
+                # Since upstream #38960 only the compressed QSA variant exists.
+                _qsa_profile = parse_qsa_profile(self.model_config.hf_config)
+                if _qsa_profile is None:
+                    _kv_pool_class = HybridLinearKVPool
+                    extra_args["use_mla"] = self.use_mla_backend
+                else:
+                    from sglang.srt.mem_cache.qsa_kv_pool import QSATokenToKVPool
+
+                    _kv_pool_class = QSATokenToKVPool
+                    extra_args.update(
+                        qsa_index_kv_heads=_qsa_profile.kv_heads,
+                        qsa_index_head_dim=_qsa_profile.head_dim,
+                        qsa_compress_ratio=_qsa_profile.compress_ratio,
+                        qsa_token_topk=_qsa_profile.budget,
+                        num_request_slots=self.req_to_token_pool.req_to_token.shape[
+                            0
+                        ],
+                        # WP3: the compressed cache mirrors the GLOBAL slot
+                        # space of req_to_token, not this rank's DCP slice.
+                        qsa_slot_space=int(self.max_total_num_tokens),
+                    )
+
+                self.token_to_kv_pool = _kv_pool_class(
                     page_size=self.page_size,
                     size=_b1_size,
                     dtype=self.kv_cache_dtype,
@@ -4526,7 +4618,6 @@ class ModelRunnerKVCacheMixin:
                     enable_kv_cache_copy=(
                         self.server_args.speculative_algorithm is not None
                     ),
-                    use_mla=self.use_mla_backend,
                     start_layer=self.start_layer,
                     full_kv_pool_class=mha_pool_class,
                     post_capture_active=(
@@ -7814,3 +7905,17 @@ class ModelRunnerKVCacheMixin:
             f"Memory pool end. "
             f"avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"
         )
+        # 19.09.: the balance sheet after offload + pools, measured off the tensors
+        try:
+            from sglang.srt.model_executor.vram_family_census import (
+                log_vram_family_census,
+            )
+
+            log_vram_family_census(
+                self.model,
+                f"pp{self.pp_rank}tp{self.tp_rank}"
+                + ("-draft" if getattr(self, "is_draft_worker", False) else ""),
+                "after pools",
+            )
+        except Exception as exc:  # noqa: BLE001 -- a census never kills a boot
+            logger.debug("[vram-census] skipped: %s", exc)

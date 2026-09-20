@@ -602,8 +602,31 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     (n * k * effective_num_layers * 2 * kv_size) // scale_block_size
                 )
 
+        cell_size += self._compute_qsa_cell_size(
+            hf_config=model_config.hf_config, num_layers=num_layers
+        )
         return cell_size
 
+    @staticmethod
+    def _compute_qsa_cell_size(*, hf_config, num_layers: int) -> int:
+        from sglang.srt.layers.attention.qsa.config import (
+            parse_qsa_profile,
+        )
+        from sglang.srt.mem_cache.qsa_kv_pool import (
+            QSATokenToKVPool,
+        )
+
+        if num_layers == 0:
+            return 0
+        qsa_profile = parse_qsa_profile(hf_config)
+        if qsa_profile is None:
+            return 0
+        return QSATokenToKVPool.qsa_bytes_per_token(
+            kv_heads=qsa_profile.kv_heads,
+            head_dim=qsa_profile.head_dim,
+            compress_ratio=qsa_profile.compress_ratio,
+            num_layers=num_layers,
+        )
 
     def calculate_pool_sizes(
         self, available_bytes: int, page_size: int

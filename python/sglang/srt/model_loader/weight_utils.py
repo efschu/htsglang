@@ -813,6 +813,27 @@ def _prefetch_checkpoint_file(file_path: str) -> None:
             pass
 
 
+def prefetch_share_of_rank(
+    local_rank: int, local_size: int, rank_in_group: int, world_size: int
+) -> tuple:
+    """(index, count) of this rank's share of the checkpoint files to warm.
+
+    Under --rank-gpu-id every rank is its own process with CUDA_VISIBLE_DEVICES
+    narrowed to one card, so ``local_rank`` is 0 and ``local_size`` 1 on every
+    rank of the node -- fn1w boot 2026-09-16: all three TP ranks logged
+    "Rank 0: prefetching 13/38" and warmed the SAME third of the files. When
+    the local view collapses to one rank while the world has more, the
+    world rank is the share index (single-node rig; on a multi-node world
+    this merely spreads the warm-up thinner per node, never wrongly)."""
+    if world_size > 1 and (local_size <= 1 or int(local_size) == int(world_size)):
+        # Single node (or a collapsed local view): the world rank is the
+        # share index. fn1x 2026-09-16: local_size was 3 but local_rank 0 on
+        # every rank, so the earlier "local_size <= 1" test did not fire and
+        # all three still warmed the same third.
+        return int(rank_in_group), int(world_size)
+    return int(local_rank), int(local_size)
+
+
 def _prefetch_all_checkpoints(
     sorted_files: List[str],
     num_threads: int = 4,
@@ -843,8 +864,12 @@ def _prefetch_all_checkpoints(
     # across nodes, but page cache is not shared across nodes.
     if torch.distributed.is_initialized():
         world_group = get_world_group()
-        local_rank = world_group.local_rank
-        local_world_size = world_group.local_size or world_group.world_size
+        local_rank, local_world_size = prefetch_share_of_rank(
+            world_group.local_rank,
+            world_group.local_size or world_group.world_size,
+            getattr(world_group, "rank_in_group", world_group.local_rank),
+            world_group.world_size,
+        )
     else:
         local_rank = 0
         local_world_size = 1
@@ -1072,6 +1097,8 @@ def safetensors_weights_iterator(
     prefetch: bool = False,
     prefetch_num_threads: int = 4,
     drop_cache_after_load: bool = False,
+    should_load=None,
+    pread: bool = False,
 ) -> Generator[Tuple[str, torch.Tensor], None, None]:
     """Iterate over the weights in the model safetensor files."""
     enable_tqdm = (
@@ -1090,6 +1117,12 @@ def safetensors_weights_iterator(
         bar_format=BAR_FORMAT,
         position=tqdm._get_free_pos(),
     ):
+        if pread:
+            result = pread_safetensors_file(st_file, should_load)
+            for name in sorted(result.keys()):
+                yield name, result[name]
+            del result
+            continue
         if disable_mmap:
             if direct_io:
                 # #738: bypass the page cache instead of trying to evict it
@@ -1112,6 +1145,8 @@ def safetensors_weights_iterator(
             extents: List[Tuple[int, int]] = []
             with safetensors.safe_open(st_file, framework="pt", device="cpu") as f:
                 for name in f.keys():
+                    if should_load is not None and not should_load(name):
+                        continue
                     tensor = f.get_tensor(name)
                     if drop_cache_after_load:
                         extents.append(
@@ -1237,6 +1272,81 @@ def multi_thread_safetensors_weights_iterator(
             del state_dict
 
 
+_SAFETENSORS_DTYPES = {
+    "BF16": torch.bfloat16,
+    "F16": torch.float16,
+    "F32": torch.float32,
+    "F64": torch.float64,
+    "I8": torch.int8,
+    "U8": torch.uint8,
+    "I16": torch.int16,
+    "U16": torch.uint16,
+    "I32": torch.int32,
+    "U32": torch.uint32,
+    "I64": torch.int64,
+    "U64": torch.uint64,
+    "BOOL": torch.bool,
+    "F8_E4M3": torch.float8_e4m3fn,
+    "F8_E5M2": torch.float8_e5m2,
+}
+
+_PREAD_CHUNK = 256 << 20
+
+
+def read_safetensors_header(st_file: str):
+    """(header dict without __metadata__, byte offset of the data block)."""
+    with open(st_file, "rb") as f:
+        (n,) = struct.unpack("<Q", f.read(8))
+        header = json.loads(f.read(n))
+    header.pop("__metadata__", None)
+    return header, 8 + n
+
+
+def pread_safetensors_file(st_file: str, should_load=None) -> dict:
+    """Read a safetensors file's tensors with pread() into fresh CPU tensors,
+    in file order, one tensor at a time -- no mmap, no whole-file buffer.
+
+    ``should_load(name)`` may answer True (read), False (skip entirely) or
+    "meta" (yield a meta tensor of the right shape/dtype without reading a
+    byte -- for tensors the model only needs to see by name, e.g. the PLE
+    shards the checkpoint backend maps itself).
+
+    Why not mmap: on this rig's ZFS a page-faulted mmap read runs at ~0.5
+    GB/s per rank while read() runs at ~3 GB/s (measured 2026-09-16), and
+    mmap materialised every tensor of every file, including 95 GB of PLE
+    shards no rank copies and the experts other ranks own.
+    """
+    header, base = read_safetensors_header(st_file)
+    order = sorted(header.items(), key=lambda kv: kv[1]["data_offsets"][0])
+    result = {}
+    fd = os.open(st_file, os.O_RDONLY)
+    try:
+        for name, info in order:
+            verdict = True if should_load is None else should_load(name)
+            if not verdict:
+                continue
+            dtype = _SAFETENSORS_DTYPES[info["dtype"]]
+            shape = tuple(int(x) for x in info["shape"])
+            if verdict == "meta":
+                result[name] = torch.empty(shape, dtype=dtype, device="meta")
+                continue
+            off0, off1 = info["data_offsets"]
+            nbytes = int(off1) - int(off0)
+            buf = torch.empty(nbytes, dtype=torch.uint8)
+            if nbytes:
+                view = memoryview(buf.numpy())
+                pos = 0
+                while pos < nbytes:
+                    n = os.preadv(fd, [view[pos : pos + _PREAD_CHUNK]], base + off0 + pos)
+                    if n <= 0:
+                        raise IOError(f"short read in {st_file} at {base + off0 + pos}")
+                    pos += n
+            result[name] = buf.view(dtype).reshape(shape) if nbytes else torch.empty(shape, dtype=dtype)
+    finally:
+        os.close(fd)
+    return result
+
+
 def buffered_multi_thread_safetensors_weights_iterator(
     hf_weights_files: List[str],
     max_workers: int,
@@ -1245,12 +1355,18 @@ def buffered_multi_thread_safetensors_weights_iterator(
     prefetch: bool = False,
     prefetch_num_threads: int = 4,
     drop_cache_after_load: bool = False,
+    should_load=None,
+    pread: bool = False,
 ) -> Generator[Tuple[str, torch.Tensor], None, None]:
     """Multi-threaded safetensor loader with bounded memory via a sliding window.
 
     At most (max_workers + 1) shard files are in-flight at any time:
     max_workers loading concurrently + 1 prefetched and ready to yield.
     Peak CPU RAM ≈ (max_workers + 2) × shard_file_size.
+
+    ``should_load`` / ``pread``: see ``pread_safetensors_file``. The name
+    filter also applies to the mmap path (a vetoed tensor is never
+    materialised); "meta" verdicts are honoured there too.
     """
     if prefetch and not disable_mmap:
         _prefetch_all_checkpoints(
@@ -1261,12 +1377,29 @@ def buffered_multi_thread_safetensors_weights_iterator(
     )
 
     def _load_file(st_file: str):
+        if pread:
+            return pread_safetensors_file(st_file, should_load)
         if disable_mmap:
             with open(st_file, "rb") as f:
                 result = safetensors.torch.load(f.read())
+            if should_load is not None:
+                result = {k: v for k, v in result.items() if should_load(k)}
         else:
             with safetensors.safe_open(st_file, framework="pt", device="cpu") as f:
-                result = {k: f.get_tensor(k) for k in f.keys()}
+                result = {}
+                for k in f.keys():
+                    verdict = True if should_load is None else should_load(k)
+                    if not verdict:
+                        continue
+                    if verdict == "meta":
+                        sl = f.get_slice(k)
+                        result[k] = torch.empty(
+                            tuple(sl.get_shape()),
+                            dtype=_SAFETENSORS_DTYPES[sl.get_dtype()],
+                            device="meta",
+                        )
+                        continue
+                    result[k] = f.get_tensor(k)
         return result
 
     # Sliding window: max_workers loading + 1 prefetched.
@@ -2217,6 +2350,34 @@ def _warn_draft_load_unchecked(
     )
 
 
+_MARLIN_G_IDX_PARAM_SUFFIXES = (
+    "w13_weight_g_idx",
+    "w2_weight_g_idx",
+    "w13_g_idx_sort_indices",
+    "w2_g_idx_sort_indices",
+)
+
+
+def load_time_derived_param_names(model: torch.nn.Module) -> set:
+    """Parameters a quant scheme creates and fills at load time WITHOUT a
+    checkpoint tensor behind them, so their absence from ``loaded_params`` is
+    not an unloaded weight. Today: the Marlin WNA16 MoE ``g_idx`` /
+    ``g_idx_sort_indices`` placeholders on a layer whose scheme has NO
+    activation ordering (fn4l 19.09.: the INT4 g32 NEXTN draft of
+    Qwen3.8-Flash-Next was refused for exactly these four zero tensors). With
+    actorder set the checkpoint DOES carry ``weight_g_idx`` and a missing one
+    stays a finding."""
+    names = set()
+    for prefix, module in model.named_modules():
+        scheme = getattr(module, "scheme", None)
+        if scheme is None or getattr(scheme, "actorder", None):
+            continue
+        for suffix in _MARLIN_G_IDX_PARAM_SUFFIXES:
+            if hasattr(module, suffix):
+                names.add(f"{prefix}.{suffix}" if prefix else suffix)
+    return names
+
+
 def raise_on_unloaded_draft_parameters(
     model: torch.nn.Module,
     loaded_params: Optional[Iterable[str]],
@@ -2272,10 +2433,12 @@ def raise_on_unloaded_draft_parameters(
         )
         return
 
+    derived = load_time_derived_param_names(model)
     missing = sorted(
         name
         for name in dict(model.named_parameters())
         if name not in loaded
+        and name not in derived
         and not any(
             fragment in name for fragment in _TARGET_PROVIDED_DRAFT_PARAM_FRAGMENTS
         )

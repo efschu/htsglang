@@ -355,7 +355,8 @@ class GraphEventNodeTest(unittest.TestCase):
         self.h.ready_now()
         self.h.log.end_round()
         un = parse_unsplit_line("[2026-09-09 00:00:00 TP1] " + self.lines()[0])
-        self.assertEqual(un["reason"], "graph-replay-nodes-unread")
+        # 20.09.: the refusal names the graph and node behind the prefix
+        self.assertTrue(un["reason"].startswith("graph-replay-nodes-unread"), un["reason"])
         self.assertEqual(self.h.state.synchronize_calls, 0)
         self.assertEqual(self.h.clock.graph_node_counts[4], 1)
 
@@ -504,7 +505,8 @@ class ConcurrentReplayTest(unittest.TestCase):
 
         un = parse_unsplit_line("[2026-09-09 00:00:00 TP1] " + self.lines()[0])
         self.assertIsNotNone(un, self.lines()[0])
-        self.assertEqual(un["reason"], "graph-replay-nodes-unread")
+        # 20.09.: the refusal names the graph and node behind the prefix
+        self.assertTrue(un["reason"].startswith("graph-replay-nodes-unread"), un["reason"])
         self.assertEqual(self.h.clock.graph_node_counts[4], 1)
         self.assertEqual(self.h.state.synchronize_calls, 0)
 

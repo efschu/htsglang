@@ -60,6 +60,7 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     nvfp4_unpackable_reason,
 )
 from sglang.srt.layers.quantization.compressed_tensors.utils import (
+    FALLBACK_FUSED_SHARDS,
     find_matched_target,
     is_activation_quantization_format,
     should_ignore_layer,
@@ -337,6 +338,33 @@ class CompressedTensorsConfig(QuantizationConfig):
                 _model_path = None
             if not vocab_is_quantized(getattr(self, "config", None) or {}, prefix, _model_path):
                 return UnquantizedEmbeddingMethod()
+            # pack-quantized group vocab (AutoRound / llm-compressor writes
+            # weight_packed + group weight_scale, e.g. Minachist's INT8 g128
+            # embed_tokens and lm_head): the head is a GEMM and takes the
+            # Marlin linear scheme; the table is gathered and dequantized per
+            # row. Anything else stays on the per-row int8 method (#727).
+            from sglang.srt.layers.quantization.compressed_tensors.ct_embedding import (
+                CompressedTensorsPackedEmbeddingMethod,
+            )
+            from sglang.srt.layers.quantization.compressed_tensors.schemes import (
+                CompressedTensorsWNA16,
+            )
+            from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
+
+            scheme = None
+            try:
+                scheme = self.get_linear_scheme(layer=layer, layer_name=prefix)
+            except Exception:
+                scheme = None
+            if isinstance(scheme, CompressedTensorsWNA16):
+                if isinstance(layer, ParallelLMHead):
+                    layer.scheme = scheme
+                    return CompressedTensorsLinearMethod(self)
+                return CompressedTensorsPackedEmbeddingMethod(
+                    num_bits=scheme.src_num_bits,
+                    group_size=scheme.group_size,
+                    symmetric=scheme.symmetric,
+                )
             return CompressedTensorsEmbeddingMethod()
 
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
@@ -769,9 +797,11 @@ class CompressedTensorsConfig(QuantizationConfig):
 
         # Detect If Mixed Precision
         if self._is_wNa16_group_channel(weight_quant, input_quant):
-            if (
-                self.quant_format == CompressionFormat.pack_quantized.value
-                and weight_quant.num_bits in WNA16_SUPPORTED_BITS
+            if self.quant_format == CompressionFormat.pack_quantized.value and (
+                weight_quant.num_bits in WNA16_SUPPORTED_BITS
+                # symmetric 6-bit groups are widened to the 8-bit kernel at
+                # load (CompressedTensorsWNA16, Minachist INT4/INT6 mixed)
+                or (weight_quant.num_bits == 6 and weight_quant.symmetric)
             ):
                 return CompressedTensorsWNA16(
                     num_bits=weight_quant.num_bits,
@@ -1089,6 +1119,32 @@ class CompressedTensorsConfig(QuantizationConfig):
         )
         return CompressedTensorsW4A4Fp4Dequant()
 
+    def _explicit_target_scheme(self, layer_name: str | None):
+        """The scheme of a layer whose NAME (or, for a fused module, every
+        shard name) is listed verbatim as a target; None when it is not."""
+        if not self.target_scheme_map or not layer_name:
+            return None
+        hit = self.target_scheme_map.get(layer_name)
+        if hit is not None:
+            return hit
+        proj_name = layer_name.split(".")[-1]
+        fused_mapping = self.packed_modules_mapping
+        if proj_name not in fused_mapping and proj_name in FALLBACK_FUSED_SHARDS:
+            fused_mapping = FALLBACK_FUSED_SHARDS
+        if proj_name not in fused_mapping:
+            return None
+        stem = layer_name[: -len(proj_name)]
+        shards = [stem + shard for shard in fused_mapping[proj_name]]
+        schemes = [self.target_scheme_map.get(shard) for shard in shards]
+        if any(scheme is None for scheme in schemes):
+            return None
+        if any(scheme != schemes[0] for scheme in schemes[1:]):
+            raise ValueError(
+                f"Found different quantization schemes for {shards} in "
+                f"{layer_name}. SGLang requires all to use the same scheme."
+            )
+        return schemes[0]
+
     def get_scheme_dict(
         self, layer: torch.nn.Module, layer_name: str | None = None
     ) -> dict[str, QuantizationArgs | str | None] | None:
@@ -1102,6 +1158,20 @@ class CompressedTensorsConfig(QuantizationConfig):
                 "format": str | None
             } | None
         """
+        # An EXPLICIT target name wins over the ignore list. The ignore match
+        # is a substring match (a bare "mtp" entry must still cover the whole
+        # draft), which also makes a parent entry such as
+        # "model.language_model.layers.0.linear_attn" (Minachist's AutoRound
+        # export lists the GDN module itself as ignored) swallow its quantized
+        # children "...linear_attn.in_proj_qkv" / "in_proj_z" -- children the
+        # same config names as targets with their 6-bit scheme. The fused
+        # module "in_proj_qkvz" resolves the same way through its shards.
+        # compressed-tensors' own matcher resolves such names to the target;
+        # so do we.
+        explicit = self._explicit_target_scheme(layer_name)
+        if explicit is not None:
+            return explicit
+
         if should_ignore_layer(
             layer_name, ignore=self.ignore, fused_mapping=self.packed_modules_mapping
         ):

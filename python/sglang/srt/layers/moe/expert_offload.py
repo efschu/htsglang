@@ -252,6 +252,14 @@ class ResidencyStats:
     # is an arm that silently ran the baseline.
     remote_fetches: int = 0
     remote_h2d_bytes: int = 0
+    # WP8 expert lookahead: spill experts prefetched on a prediction, how many
+    # of a forward's real spill experts were already in a scratch slot when it
+    # resolved (no H2D), how many were not, and predictions that could not be
+    # used (no cache yet, wave overflow, a captured route).
+    lookahead_prefetched: int = 0
+    lookahead_hits: int = 0
+    lookahead_misses: int = 0
+    lookahead_dropped: int = 0
 
     @property
     def hit_rate(self) -> float:
@@ -585,6 +593,102 @@ class ExpertResidencyPlanner:
             fetch_plan.append((e, slot))
         return slot_of_needed, fetch_plan
 
+    def resolve_sticky(
+        self, needed: Sequence[int], holds: Dict[int, int]
+    ) -> Tuple[Dict[int, int], List[Tuple[int, int]], int]:
+        """WP8 lookahead variant of :meth:`resolve`: a spill expert that a
+        scratch slot ALREADY HOLDS (``holds``: slot -> expert, maintained by
+        every fetch) keeps that slot and is not fetched again; the remaining
+        spill experts take the free scratch slots in sorted order. Returns
+        (slot_of_needed, fetch_plan, reused). Residency accounting is the same
+        as resolve(); the reused experts count as lookahead hits, not misses.
+
+        The layout is no longer a pure function of ``needed`` -- which slot an
+        expert sits in only decides where the grouped GEMM reads its weights,
+        never what it computes -- and that is why this is a separate method
+        behind the lookahead switch: resolve() keeps its history-independent
+        layout for every launch that did not ask for the lookahead."""
+        self.stats.forwards += 1
+        self.stats.waves += 1
+        needed_unique = sorted(set(int(e) for e in needed if e >= 0))
+        if self.fully_resident:
+            self.stats.hits += len(needed_unique)
+            return {e: e for e in needed_unique}, [], 0
+        resident, spill = self.split_needed(needed_unique)
+        if self.resident_ids is None:
+            slot_of_needed: Dict[int, int] = {e: e for e in resident}
+        else:
+            slot_of_needed = {e: self.resident_slot[e] for e in resident}
+        if self.delegated_ids is not None:
+            foreign = [e for e in spill if e in self.delegated_ids]
+            if foreign and not self.delegated_reachable:
+                # Same refusal as resolve(); stated once there.
+                return self.resolve(needed)
+            if foreign:
+                self.stats.remote_fetches += len(
+                    [e for e in foreign if e not in holds.values()]
+                )
+        if len(spill) > self.scratch:
+            raise RuntimeError(
+                f"resolve_sticky() got {len(spill)} spill experts but only "
+                f"{self.scratch} scratch slots exist; caller must wave-split "
+                f"with plan_token_waves() first."
+            )
+        held_slot_of = {e: slot for slot, e in holds.items()}
+        reused = [e for e in spill if e in held_slot_of]
+        missing = [e for e in spill if e not in held_slot_of]
+        taken = {held_slot_of[e] for e in reused}
+        free = [
+            slot
+            for slot in range(self.resident_count, self.resident_count + self.scratch)
+            if slot not in taken
+        ]
+        fetch_plan: List[Tuple[int, int]] = []
+        for e in reused:
+            slot_of_needed[e] = held_slot_of[e]
+        for e, slot in zip(missing, free):
+            slot_of_needed[e] = slot
+            fetch_plan.append((e, slot))
+        self.stats.hits += len(resident)
+        self.stats.misses += len(missing)
+        self.stats.fetches += len(missing)
+        self.stats.lookahead_hits += len(reused)
+        self.stats.lookahead_misses += len(missing)
+        return slot_of_needed, fetch_plan, len(reused)
+
+
+_POOL_PREFETCH: Optional[bool] = None
+_POOL_PREFETCH_STREAM = None
+
+
+def pool_prefetch_enabled() -> bool:
+    """SGLANG_MOE_POOL_PREFETCH=1 arms the speculative expert prefetch of the
+    device-planned pool (default OFF -- with it unset every pool forward is
+    byte-identical to before). Read once per process."""
+    global _POOL_PREFETCH
+    if _POOL_PREFETCH is None:
+        import os
+
+        _POOL_PREFETCH = str(
+            os.environ.get("SGLANG_MOE_POOL_PREFETCH", "") or ""
+        ).strip().lower() in ("1", "true", "yes", "on")
+    return _POOL_PREFETCH
+
+
+def pool_prefetch_stream():
+    """ONE side stream per rank for every layer's speculative prefetch.
+
+    One stream, not one per layer: the prefetches of successive layers happen
+    at different points of the same forward and all contend for the same PCIe
+    link, so serialising them on a single stream is what we want anyway, and it
+    keeps the number of streams a decode graph forks to one."""
+    global _POOL_PREFETCH_STREAM
+    if _POOL_PREFETCH_STREAM is None:
+        import torch
+
+        _POOL_PREFETCH_STREAM = torch.cuda.Stream()
+    return _POOL_PREFETCH_STREAM
+
 
 def resident_slot_count(num_local_experts: int, fraction: float) -> int:
     """Resident-expert count to keep on GPU for a given fraction (<1)."""
@@ -604,12 +708,50 @@ def scratch_slot_count(resident_count: int) -> int:
     import os
 
     env = os.environ.get("SGLANG_MOE_SCRATCH_SLOTS", "")
-    if env.strip():
-        try:
-            return max(1, int(env))
-        except ValueError:
-            pass
+    picked = scratch_slots_from_env(env, _scratch_env_rank_and_size())
+    if picked is not None:
+        return picked
     return max(8, resident_count // 4)
+
+
+def _scratch_env_rank_and_size():
+    try:
+        from sglang.srt.runtime_context import get_parallel
+
+        parallel = get_parallel()
+        return int(parallel.moe_tp_rank), int(parallel.moe_tp_size)
+    except Exception:
+        return None
+
+
+def scratch_slots_from_env(env: str, rank_and_size) -> Optional[int]:
+    """SGLANG_MOE_SCRATCH_SLOTS as one value for every rank, or a per-rank
+    comma vector (fn5t/fn5u 19.09.: the LRU rows = C - staging are the recency
+    lever of the pool, and only the 5090's link is the round's critical path,
+    so the ranks need different C). A vector must have exactly tp_size
+    entries; anything unparsable falls back to the default."""
+    text = (env or "").strip()
+    if not text:
+        return None
+    if "," in text:
+        try:
+            values = [max(1, int(v)) for v in text.split(",")]
+        except ValueError:
+            return None
+        if rank_and_size is None:
+            return None
+        rank, size = rank_and_size
+        if len(values) != size:
+            raise ValueError(
+                f"SGLANG_MOE_SCRATCH_SLOTS vector has {len(values)} entries "
+                f"({text}) but the MoE tensor parallelism is {size}; give one "
+                "entry per rank or a single value."
+            )
+        return values[rank]
+    try:
+        return max(1, int(text))
+    except ValueError:
+        return None
 
 
 # ===========================================================================
@@ -1418,10 +1560,9 @@ def allocate_spill_pool(spill_ids, row_shape, dtype, cold_tier=None, param_attr=
         return cold_tier.allocate_spill_pool(param_attr, ids, shape, dtype)
     if not ids:
         return None
-    pool = torch.empty((len(ids),) + shape, dtype=dtype, device="cpu")
-    if torch.cuda.is_available():
-        pool = pool.pin_memory()
-    return pool
+    # Page-locked at its exact size (see pinned_exact_empty): plain pageable
+    # memory without a CUDA context, exactly as pin_memory() would be there.
+    return pinned_exact_empty((len(ids),) + shape, dtype)
 
 
 # ===========================================================================
@@ -2410,6 +2551,195 @@ def refuse_capturable_cold_tier(num_experts: int) -> None:
     )
 
 
+# ---------------------------------------------------------------------------
+# Exact-size page-locked host buffers (host-RAM peak of the load-time presplit)
+# ---------------------------------------------------------------------------
+#
+# ``torch.empty(...).pin_memory()`` goes through ATen's CachingHostAllocator,
+# which rounds EVERY request up to the next power of two before it calls
+# cudaHostAlloc (ATen/core/CachingHostAllocator.h:302, ``PowerOf2Ceil``, torch
+# 2.11.0). The presplit allocates one pinned spill pool per layer per expert
+# tensor, so a spill pool that lands 1 % above 256 MiB is page-locked as
+# 512 MiB -- 48 layers x 3 tensors of that is ~18 GiB of host RAM nobody uses
+# (measured 19.09.: MoE vector 32/16/16 lifted the boot from 71 to 89-92 GiB and
+# tripped the 88 GiB RAM guard; 39/13/12 only fit because 311 rows x 1.6384 MB
+# happens to sit 0.5 % below 512 MiB).
+#
+# The buffers below are page-locked at their exact byte size: an anonymous
+# ``mmap`` (page aligned by construction) registered with ``cudaHostRegister``.
+# cudaPointerGetAttributes reports such a range as host memory, so
+# ``Tensor.is_pinned()`` is true for it, H2D copies take the DMA path, and under
+# UVA its device pointer equals the host pointer -- exactly what
+# ``device_view_of_pinned`` needs for the captured spill gather.
+_PINNED_EXACT_REGISTRY: dict = {}  # ptr -> nbytes of live registrations
+_CUDA_HOST_REGISTER_MAPPED = 0x02
+
+
+import mmap as _mmap
+
+
+class _PinnedMap(_mmap.mmap):
+    """The anonymous mapping behind one exact-size pool.
+
+    A plain ``mmap.mmap`` cannot be weakly referenced; this subclass can.
+    torch keeps it alive through the tensor's STORAGE (frombuffer holds its
+    buffer source), so a ``weakref.finalize`` on it fires exactly when the
+    LAST view of the pool is gone -- and unregisters the range before the
+    mapping is torn down. That lifetime is the whole point: a pool that is
+    rebuilt (hot set frozen from file, heat migration, a second presplit door)
+    must return its bytes when the old tensor is dropped -- fn6r (19.09.)
+    held every superseded pool in a registry and had 40 GiB page-locked on
+    TP0 by layer 19 of 48 (3.3 pools per layer instead of one)."""
+
+    def __new__(cls, nbytes: int):
+        return super().__new__(
+            cls, -1, nbytes, flags=_mmap.MAP_PRIVATE | _mmap.MAP_ANONYMOUS
+        )
+
+
+def _pinned_exact_unregister(ptr: int) -> bool:
+    """Unregister ``ptr`` if it is a live registration; idempotent."""
+    nbytes = _PINNED_EXACT_REGISTRY.pop(ptr, None)
+    if nbytes is None:
+        return False
+    import torch
+
+    try:
+        torch.cuda.cudart().cudaHostUnregister(ptr)
+    except Exception:  # pragma: no cover - CUDA already torn down
+        pass
+    return True
+
+
+def pinned_exact_empty(shape, dtype):
+    """Uninitialised host tensor of ``shape``/``dtype``, page-locked at its
+    exact byte size (see the module comment). Without a CUDA context (desk
+    tests) it is a plain pageable tensor, like ``pin_memory()`` there."""
+    import torch
+
+    shape = tuple(int(d) for d in shape)
+    n = 1
+    for d in shape:
+        n *= d
+    nbytes = n * torch.empty((), dtype=dtype).element_size()
+    if nbytes == 0 or not torch.cuda.is_available():
+        return torch.empty(shape, dtype=dtype, device="cpu")
+    # Give back what torch's host cache still holds from the weight load
+    # before pinning new pages: the loader's pinned staging blocks sit in the
+    # CachingHostAllocator's free lists after use, and the presplit pools used
+    # to RECYCLE them (same power-of-two sizes). Exact pools cannot, so without
+    # this the cache stays resident on top of them -- fn6p (19.09.) peaked at
+    # 100 GiB host RAM and was OOM-killed at layer 19 of the presplit.
+    # empty_cache only frees blocks whose recorded events have completed, and
+    # nothing but an allocate() call polls those events any more once the
+    # pools stop going through the cache -- so complete them here first.
+    try:
+        torch.cuda.synchronize()
+    except Exception:  # pragma: no cover - no CUDA context
+        pass
+    release_torch_host_cache()
+    import weakref
+
+    mm = _PinnedMap(nbytes)
+    flat = torch.frombuffer(mm, dtype=torch.uint8)
+    ptr = flat.data_ptr()
+    err = torch.cuda.cudart().cudaHostRegister(ptr, nbytes, _CUDA_HOST_REGISTER_MAPPED)
+    if int(err) != 0:
+        mm.close()
+        raise RuntimeError(
+            f"cudaHostRegister({nbytes} bytes) failed with cudaError {int(err)}"
+        )
+    _PINNED_EXACT_REGISTRY[ptr] = nbytes
+    # The storage holds ``mm``; when the last view of it dies, the finalizer
+    # unregisters the range BEFORE the mapping is torn down.
+    fin = weakref.finalize(mm, _pinned_exact_unregister, ptr)
+    fin.atexit = False
+    _log_pinned_exact_milestone(nbytes)
+    return flat.view(dtype).view(shape)
+
+
+_PINNED_EXACT_MILESTONE_GIB = 4
+_pinned_exact_next_milestone = [_PINNED_EXACT_MILESTONE_GIB << 30]
+
+
+def _cgroup_anon_shmem_gib():
+    """(anon, shmem) GiB charged to this process's cgroup (-1, -1 = unknown)."""
+    try:
+        with open("/proc/self/cgroup") as f:
+            path = f.read().strip().split(":", 2)[-1]
+        vals = {}
+        with open(f"/sys/fs/cgroup{path}/memory.stat") as f:
+            for line in f:
+                k, v = line.split()
+                if k in ("anon", "shmem"):
+                    vals[k] = int(v) / (1 << 30)
+        return vals.get("anon", -1.0), vals.get("shmem", -1.0)
+    except Exception:
+        return -1.0, -1.0
+
+
+def _log_pinned_exact_milestone(nbytes: int) -> None:
+    """One line per 4 GiB of exact pools: where the host RAM really sits
+    (fn6p/fn6q 19.09.: TP0 was OOM-killed mid-presplit with nothing in the
+    log saying which allocator held the bytes)."""
+    total = pinned_exact_bytes()
+    if total < _pinned_exact_next_milestone[0]:
+        return
+    while total >= _pinned_exact_next_milestone[0]:
+        _pinned_exact_next_milestone[0] += _PINNED_EXACT_MILESTONE_GIB << 30
+    import logging
+
+    anon, shmem = _cgroup_anon_shmem_gib()
+    logging.getLogger(__name__).info(
+        "[pinned-exact] %.1f GiB page-locked exactly (last +%.0f MiB); torch host "
+        "allocator %.1f GiB; cgroup anon %.1f GiB shmem %.1f GiB",
+        total / (1 << 30), nbytes / (1 << 20),
+        torch_host_cache_reserved_bytes() / (1 << 30), anon, shmem,
+    )
+
+
+def pinned_exact_release(tensor):
+    """Unregister and unmap a buffer from :func:`pinned_exact_empty` once no
+    view of it is used any more (the caller's promise). No-op for others."""
+    return _pinned_exact_unregister(tensor.data_ptr())
+
+
+def release_torch_host_cache() -> None:
+    """Free the CachingHostAllocator's cached (unused) pinned blocks."""
+    import torch
+
+    fn = getattr(torch._C, "_host_emptyCache", None)
+    if fn is not None:
+        fn()
+
+
+def torch_host_cache_reserved_bytes() -> int:
+    """Bytes torch's CachingHostAllocator currently holds (-1 = unknown).
+
+    torch 2.11 exposes the raw stats as nested dicts (``allocated_bytes``
+    counts live blocks plus the ones whose deferred free has not been processed
+    yet; ``reserved_bytes`` is present on builds that track it)."""
+    import torch
+
+    fn = getattr(torch._C, "_cuda_hostMemoryStats", None)
+    if fn is None:
+        return -1
+    try:
+        stats = fn()
+    except Exception:  # pragma: no cover - no CUDA context
+        return -1
+    for key in ("reserved_bytes", "allocated_bytes"):
+        entry = stats.get(key) if hasattr(stats, "get") else None
+        if isinstance(entry, dict) and "current" in entry:
+            return int(entry["current"])
+    return -1
+
+
+def pinned_exact_bytes():
+    """Bytes currently page-locked through :func:`pinned_exact_empty`."""
+    return sum(_PINNED_EXACT_REGISTRY.values())
+
+
 class _PinnedDeviceViewHolder:
     """Minimal ``__cuda_array_interface__`` producer used to alias PINNED host
     memory as a CUDA tensor (UVA zero-copy). Under CUDA UVA every page-locked
@@ -2427,6 +2757,150 @@ class _PinnedDeviceViewHolder:
             "version": 3,
             "strides": None,
         }
+
+
+def _h2d_i64(arr, device):
+    """A small int64 vector on ``device`` WITHOUT a host-blocking copy: staged
+    through a pinned tensor from torch's caching host allocator (event-tracked
+    reuse) and copied non_blocking. On a non-CUDA device: the plain tensor."""
+    import numpy as np
+    import torch
+    n = int(len(arr))
+    if getattr(device, "type", str(device)) != "cuda" and str(device) != "cuda":
+        return torch.from_numpy(np.ascontiguousarray(arr, dtype=np.int64))
+    host = torch.empty((n,), dtype=torch.int64, pin_memory=True)
+    if n:
+        host.numpy()[:] = arr
+    return host.to(device, non_blocking=True)
+
+
+_WAVE_T = {"on": None, "ev": [], "fetch_ms": 0.0, "apply_ms": 0.0, "layers": 0, "spill": 0,
+           "tokens": 0, "forwards0": 0}
+
+
+def _wave_timing_on() -> bool:
+    if _WAVE_T["on"] is None:
+        import os
+        _WAVE_T["on"] = str(os.environ.get("SGLANG_MOE_OFFLOAD_TIMING", "0")).strip() not in ("", "0")
+    return bool(_WAVE_T["on"])
+
+
+def _wave_timing_note(layer_id, e0, e1, e2, n_spill, n_tokens):
+    """Collect one layer's (fetch, apply) event pair; every 16 forwards of
+    layer 0 synchronize ONCE, sum the elapsed times and log the split."""
+    import logging
+    import torch
+    t = _WAVE_T
+    t["ev"].append((e0, e1, e2))
+    t["spill"] += int(n_spill)
+    if layer_id in (0, None):
+        t["forwards0"] += 1
+        t["tokens"] += int(n_tokens)
+    if layer_id in (0, None) and t["forwards0"] % 16 == 0:
+        torch.cuda.synchronize()
+        f = sum(a.elapsed_time(b) for a, b, _c in t["ev"])
+        g = sum(b.elapsed_time(c) for _a, b, c in t["ev"])
+        n = len(t["ev"])
+        logging.getLogger(__name__).info(
+            "MOE-OFFLOAD-TIMING forwards=%d layers=%d tokens=%d fetch_ms=%.1f apply_ms=%.1f "
+            "per_forward: fetch_ms=%.2f apply_ms=%.2f spill_experts=%.1f (CUDA events: fetch = "
+            "host->scratch incl. the join, apply = the grouped GEMM over the wave)",
+            t["forwards0"], n, t["tokens"], f, g, f / 16.0, g / 16.0, t["spill"] / 16.0)
+        t["ev"].clear(); t["spill"] = 0; t["tokens"] = 0
+
+
+_WAVE_TP = {"ev": [], "layers": 0, "waves": 0, "spill": 0, "tokens": 0, "forwards": 0}
+_WAVE_SLICE = {"pairs": None}
+_PARTIALS_MODE = {"mode": None}
+
+
+def partials_mode() -> str:
+    """SGLANG_MOE_OFFLOAD_PARTIALS: 'table' (default) keeps the [T*K, H]
+    partials table and combines once at the end (byte-identical to the
+    token-major path); 'stream' accumulates every slice straight into a
+    [T, H] fp32 output (index_add_), which drops the T*K*H table -- 1.7 GB at
+    a 32768-token chunk with top-k 10 -- at the price of fp32 summation order
+    instead of the combine kernel's. Prefill chunks beyond 16k need it on TP0
+    (fn6v 19.09.: OOM before the first wave)."""
+    if _PARTIALS_MODE["mode"] is None:
+        import os
+
+        v = str(os.environ.get("SGLANG_MOE_OFFLOAD_PARTIALS", "table")).strip().lower()
+        _PARTIALS_MODE["mode"] = "stream" if v == "stream" else "table"
+    return _PARTIALS_MODE["mode"]
+
+
+def wave_token_slice_pairs() -> int:
+    """SGLANG_MOE_OFFLOAD_WAVE_SLICE: (token, expert) pairs one grouped GEMM of
+    an expert-major wave may take at once; 0 = whole wave (the old behaviour).
+
+    Why: the expert stream is paid ONCE per chunk (fn6u 19.09.: 18.7 GiB on
+    TP0 per forward, 8.1 s of fetch against 0.8 s of GEMM over the needle's
+    forwards), so a 4x larger prefill chunk buys 4x fewer host->device bytes
+    per token -- but the grouped GEMM's workspace (Marlin) grows with the
+    tokens of the wave, and a 16384-token chunk already OOMed a 3080 (fn6m,
+    514 MiB short). Slicing the wave's tokens keeps that workspace at the
+    slice's size while the wave's experts stay resident in scratch for all
+    slices. Default 81920 pairs = 8192 tokens x top-k 10 = the shape that fits."""
+    if _WAVE_SLICE["pairs"] is None:
+        import os
+
+        raw = str(os.environ.get("SGLANG_MOE_OFFLOAD_WAVE_SLICE", "81920")).strip()
+        try:
+            _WAVE_SLICE["pairs"] = max(0, int(raw))
+        except ValueError:
+            _WAVE_SLICE["pairs"] = 81920
+    return int(_WAVE_SLICE["pairs"])
+
+
+def _wave_timing_note_prefill(layer_id, wave_events, n_spill, n_tokens):
+    """Expert-major prefill: collect one layer's per-wave (fetch, apply) event
+    triples; when the NEXT forward starts (layer 0 again) synchronize once, sum
+    and log the forward's split. That is the decomposition the 'Prefill rank
+    batch ... compute' figure hides: how much of a chunk's compute is the
+    expert stream (host -> scratch over PCIe) and how much the grouped GEMM."""
+    import logging
+    import torch
+
+    t = _WAVE_TP
+    if layer_id in (0, None) and t["ev"]:
+        torch.cuda.synchronize()
+        f = sum(a.elapsed_time(b) for a, b, _c in t["ev"])
+        g = sum(b.elapsed_time(c) for _a, b, c in t["ev"])
+        t["forwards"] += 1
+        logging.getLogger(__name__).info(
+            "MOE-OFFLOAD-TIMING-PREFILL forward=%d tokens=%d layers=%d waves=%d "
+            "spill_experts=%d fetch_ms=%.1f apply_ms=%.1f (CUDA events per wave: "
+            "fetch = host->scratch incl. the join, apply = grouped GEMM of the wave)",
+            t["forwards"], t["tokens"], t["layers"], t["waves"], t["spill"], f, g,
+        )
+        t["ev"].clear(); t["layers"] = t["waves"] = t["spill"] = t["tokens"] = 0
+    t["ev"].extend(wave_events)
+    t["layers"] += 1
+    t["waves"] += len(wave_events)
+    t["spill"] += int(n_spill)
+    if layer_id in (0, None):
+        t["tokens"] = int(n_tokens)
+
+
+_FETCH_SYNC = {"on": None}
+
+
+def fetch_sync_on() -> bool:
+    """SGLANG_MOE_OFFLOAD_FETCH_SYNC=1: host-synchronize after every joined
+    fetch (Task #49 probe switch, default off; costs prefill throughput)."""
+    if _FETCH_SYNC["on"] is None:
+        import os
+
+        _FETCH_SYNC["on"] = str(os.environ.get("SGLANG_MOE_OFFLOAD_FETCH_SYNC", "0")).strip().lower() in ("1", "true", "on")
+    return _FETCH_SYNC["on"]
+
+
+def _fetch_mode() -> str:
+    """SGLANG_MOE_OFFLOAD_FETCH: 'gather' (default, Task #33) or 'memcpy'."""
+    import os
+    v = str(os.environ.get("SGLANG_MOE_OFFLOAD_FETCH", "gather")).strip().lower()
+    return "memcpy" if v == "memcpy" else "gather"
 
 
 def device_view_of_pinned(pinned):  # pragma: no cover - requires CUDA
@@ -2601,6 +3075,17 @@ class MoEExpertOffloadCache:
         # absent for a given quant method are skipped by the shape check below.
         "w13_qzeros",
         "w2_qzeros",
+        # compressed-tensors WNA16 Marlin path (WP2, Qwen3.8-Flash-Next AWQ/GPTQ
+        # INT4 as llm-compressor writes it): the same post-repack marlin tensors
+        # under compressed-tensors' names. Scales reuse "w13_weight_scale" /
+        # "w2_weight_scale" above; the zero points exist only for asymmetric
+        # checkpoints and are read per expert by the marlin apply. The NVFP4
+        # schemes that also name "w13_weight_packed" stay refused by class name
+        # (_OFFLOAD_UNSUPPORTED_QUANT_METHOD_NAMES) before any staging.
+        "w13_weight_packed",
+        "w2_weight_packed",
+        "w13_weight_zero_point",
+        "w2_weight_zero_point",
     )
 
     def __init__(self, layer, fraction: float):
@@ -2624,6 +3109,34 @@ class MoEExpertOffloadCache:
         self._resident: Dict[str, "object"] = {}  # attr -> GPU buffer [R+C,...]
         self._stream = None
         self._installed = False
+        # WP8 lookahead: what each scratch slot currently holds (slot -> expert),
+        # written by every fetch on every route so a sticky resolve can trust
+        # it; cleared whenever the buffers are physically rearranged.
+        self._scratch_holds: Dict[int, int] = {}
+        # Task #49 (20.09.): with SGLANG_NAN_GUARD=1 every forward records the
+        # routing and the per-wave slot assignment here, so that when the MoE
+        # output goes non-finite the '[nan-disc2]' group can say WHICH expert
+        # the bad rows share and WHICH slot it was reading. None when the guard
+        # is off -- then nothing is recorded and nothing is paid.
+        self._nan_trace: Optional[Dict[str, "object"]] = None
+        # Device-planned expert pool (vLLM #56177 port, 19.09.): tables, step
+        # buffers and the UVA views of the spill pool; built by install_pool().
+        self._pool_ready = False
+        self._pool_tables = None
+        self._pool_buffers = None
+        self._pool_srcs = None
+        self._pool_dsts = None
+        self._pool_view_holders = []
+        # Speculative expert prefetch (SGLANG_MOE_POOL_PREFETCH=1, default off):
+        # own step buffers, because the gather list the side stream copies from
+        # must survive while the real step writes the layer's normal buffers.
+        self._pool_pf_buffers = None
+        self._pool_pf_begin = None  # main -> side: x_L is ready
+        self._pool_pf_done = None  # side -> main: the predicted rows are in
+        self._pool_pf_armed = False
+        from sglang.srt.environ import envs as _envs
+
+        self.lookahead_sticky = int(_envs.SGLANG_MOE_EXPERT_LOOKAHEAD.get()) > 0
 
         # --- Stage-1 hot-expert residency ----------------------------------
         # When enabled, per-expert routing counts are accumulated over the first
@@ -2683,6 +3196,16 @@ class MoEExpertOffloadCache:
             self.planner.resident_ids = frozenset(int(e) for e in resident_ids)
             self.planner.resident_slot = {int(e): i for i, e in enumerate(resident_ids)}
             self._spill_pool_index = {int(e): j for j, e in enumerate(spill_ids)}
+            self._hot_frozen = True
+        store_index = getattr(layer, "_moe_offload_store_index", None)
+        if store_index:
+            # Task #47 step 1: spill rows are GLOBAL ids in the shared store.
+            # A static [0,R) layout gets its resident maps spelled out so the
+            # freeze invariant (both maps or neither) holds.
+            if self.planner.resident_slot is None:
+                self.planner.resident_ids = frozenset(range(self.resident_count))
+                self.planner.resident_slot = {e: e for e in range(self.resident_count)}
+            self._spill_pool_index = {int(e): int(r) for e, r in store_index.items()}
             self._hot_frozen = True
 
         # #394: cold experts a peer's host tier owns. Adopted as a planner
@@ -2865,10 +3388,10 @@ class MoEExpertOffloadCache:
             self._resident[attr] = buf
             # Pinned host spill pool = experts [R:E].
             spill_src = full[R:].contiguous()
-            if spill_src.is_cpu:
-                spill = spill_src if spill_src.is_pinned() else spill_src.pin_memory()
+            if spill_src.is_cpu and spill_src.is_pinned():
+                spill = spill_src
             else:
-                spill = torch.empty_like(spill_src, device="cpu").pin_memory()
+                spill = pinned_exact_empty(spill_src.shape, spill_src.dtype)
                 spill.copy_(spill_src)
             self._pinned[attr] = spill
             setattr(
@@ -2910,11 +3433,123 @@ class MoEExpertOffloadCache:
         self._installed = True
 
     # --- fetch / remap helpers (GPU window) --------------------------------
-    def _fetch(self, fetch_plan):
+    def _uva_pool_view(self, attr, spill):
+        """The cached UVA device view of one pinned spill pool (Task #33)."""
+        views = getattr(self, "_uva_views", None)
+        if views is None:
+            views = self._uva_views = {}
+        v = views.get(attr)
+        if v is None or v.data_ptr() != spill.data_ptr():
+            v = views[attr] = device_view_of_pinned(spill)
+        return v
+
+    def _nan_trace_begin(self, ids_list) -> None:
+        """Task #49: open this forward's routing trace for '[nan-disc2]'. Costs
+        one dict and one list reference; nothing is copied, and with the guard
+        off the attribute is set to None and every recorder below is a no-op."""
+        try:
+            from sglang.srt.layers.nan_guard import nan_guard_on
+
+            if not nan_guard_on():
+                self._nan_trace = None
+                return
+            self._nan_trace = {
+                "ids_list": ids_list,
+                "waves": [],
+                "partials": partials_mode(),
+            }
+        except Exception:  # noqa: BLE001 -- an instrument never kills a forward
+            self._nan_trace = None
+
+    def _nan_trace_wave(self, wave, needed, slot_of_needed) -> None:
+        """Record one wave's expert set and its expert -> slot assignment, plus
+        what the scratch holds said at that moment. This is the half that
+        cannot be reconstructed after the fact: later waves overwrite the
+        scratch slots, so 'which slot did THIS wave read' is only knowable
+        here."""
+        tr = getattr(self, "_nan_trace", None)
+        if not isinstance(tr, dict):
+            return
+        try:
+            tr["waves"].append(
+                {
+                    "wave": int(wave),
+                    "needed": [int(e) for e in needed],
+                    "slot_of_needed": {int(k): int(v) for k, v in slot_of_needed.items()},
+                    "holds": dict(self._scratch_holds),
+                }
+            )
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _nan_guard_wave(self, combine_out, wave, needed, start) -> None:
+        """Task #49: with SGLANG_NAN_GUARD=1 name the wave (its expert set and
+        slice start) whose grouped GEMM produced non-finite rows."""
+        try:
+            from sglang.srt.layers.nan_guard import nan_guard_on
+            if not nan_guard_on():
+                return
+            import os
+            if os.environ.get("SGLANG_NAN_GUARD_WAVE", "1").strip() in ("0", "off"):
+                return  # the per-slice .item() completes each GEMM before the next fetch -- hides a race
+            import torch
+            hs = getattr(combine_out, "hidden_states", combine_out)
+            if hs is None or not torch.is_tensor(hs):
+                return
+            finite = torch.isfinite(hs)
+            if bool(finite.all().item()):
+                return
+            rows = torch.nonzero(~finite.reshape(hs.shape[0], -1).all(dim=1)).reshape(-1)
+            import logging
+            logging.getLogger(__name__).error(
+                "[nan-guard] wave %d slice@%d on layer %s: %d non-finite rows of %d; wave experts (local ids) %s",
+                int(wave), int(start), getattr(self.layer, "layer_id", "?"), int(rows.numel()), int(hs.shape[0]),
+                sorted(int(e) for e in needed)[:24],
+            )
+        except Exception as exc:  # noqa: BLE001
+            import logging
+            logging.getLogger(__name__).debug("[nan-guard] wave check skipped: %s", exc)
+
+    def _nan_guard_fetched(self, fetch_plan) -> None:
+        """Task #49 (19.09.): with SGLANG_NAN_GUARD=1, after the join, every
+        FLOAT resident tensor (the scales) of the slots this fetch filled is
+        checked; a non-finite scale row means the bytes that landed in the
+        slot are not the expert's (race, stale row, wrong offset)."""
+        try:
+            from sglang.srt.layers.nan_guard import nan_guard_on
+            if not nan_guard_on():
+                return
+            import os
+            if os.environ.get("SGLANG_NAN_GUARD_FETCH", "1").strip() in ("0", "off"):
+                return  # the per-fetch check joins copy and compute -- a race hides behind it
+            import torch
+            slots = [int(sl) for _e, sl in fetch_plan]
+            for attr, dst in self._resident.items():
+                if not dst.is_floating_point():
+                    continue
+                sub = dst[slots].float()
+                if bool(torch.isfinite(sub).all().item()):
+                    continue
+                bad = ~torch.isfinite(sub).reshape(len(slots), -1).any(dim=1)
+                bad_idx = torch.nonzero(bad).reshape(-1).tolist()
+                pairs = [fetch_plan[i] for i in bad_idx[:6]]
+                import logging
+                logging.getLogger(__name__).error(
+                    "[nan-guard] fetched slot(s) with non-finite %s on layer %s: %d of %d slots, "
+                    "(expert, slot) %s",
+                    attr, getattr(self.layer, "layer_id", "?"), len(bad_idx), len(slots), pairs,
+                )
+        except Exception as exc:  # noqa: BLE001
+            import logging
+            logging.getLogger(__name__).debug("[nan-guard] fetched check skipped: %s", exc)
+
+    def _fetch(self, fetch_plan, join: bool = True):
         """Async H2D-copy each wave's SPILL experts into their scratch slots,
         then join the copy stream before compute reads them. ``fetch_plan`` is
         (spill_expert_id, scratch_slot); the spill pool is indexed by
-        (expert_id - resident_count).
+        (expert_id - resident_count). ``join=False`` (WP8 lookahead prefetch)
+        leaves the copies in flight on the copy stream; the next fetch of this
+        cache -- which always joins -- is what makes them visible to compute.
 
         #394 slice 2: an expert in ``self._remote_ids`` is not in this rank's
         pool at all -- its row is a zero-copy view of a PEER's shared segment,
@@ -2925,6 +3560,8 @@ class MoEExpertOffloadCache:
 
         if not fetch_plan:
             return
+        for expert_id, slot in fetch_plan:
+            self._scratch_holds[slot] = expert_id
         R = self.resident_count
         pool_index = self._spill_pool_index  # None => static layout (id - R)
         remote = self._cold_tier
@@ -2939,8 +3576,42 @@ class MoEExpertOffloadCache:
         # enough for the copies to win the race (expert-major waves do; the
         # short token-major waves happened not to). The join below covers the
         # other direction (compute must not read before the copy lands).
+        def _copies_gather():
+            # 19.09. (Task #33, fn3e profile): the eager fetch as ONE gather
+            # over the UVA device view of the pinned pool plus ONE scatter into
+            # the scratch slots, per tensor per layer -- instead of one
+            # cudaMemcpyAsync per expert per tensor (~10 x attrs launches a
+            # layer, ~1300 a token; the Python thread was busy 91 % of the
+            # decode wall). Same bytes over the same link (only the misses);
+            # only the launch count changes. Static layout or pool_index alike.
+            nonlocal moved
+            rows = [int(pool_index[e]) if pool_index is not None else int(e) - R
+                    for e, _s in fetch_plan]
+            slots = [int(sl) for _e, sl in fetch_plan]
+            first = next(iter(self._resident.values()))
+            dev = first.device
+            import numpy as np
+            rows_t = _h2d_i64(np.asarray(rows, dtype=np.int64), dev)
+            slots_t = _h2d_i64(np.asarray(slots, dtype=np.int64), dev)
+            for attr in self._pinned:
+                spill = self._pinned.get(attr)
+                dst = self._resident[attr]
+                pool_dev = self._uva_pool_view(attr, spill)
+                dst.index_copy_(0, slots_t, torch.index_select(pool_dev, 0, rows_t))
+                moved += dst[0].numel() * dst.element_size() * len(rows)
+
         def _copies():
             nonlocal moved, remote_moved
+            if remote is None and self._stream is not None and _fetch_mode() == "gather" and fetch_plan:
+                try:
+                    return _copies_gather()
+                except Exception as exc:  # noqa: BLE001 -- one named fallback, then memcpy
+                    import logging
+                    import os
+                    logging.getLogger(__name__).warning(
+                        "MoE offload gather fetch failed (%s: %s); memcpy fetch from now on",
+                        type(exc).__name__, exc)
+                    os.environ["SGLANG_MOE_OFFLOAD_FETCH"] = "memcpy"
             # With no shared tier the iteration set is exactly what it always
             # was. With one, a rank can own ZERO local cold rows for a tensor
             # (a lopsided ratio is legal), so the attr set has to come from the
@@ -2971,7 +3642,17 @@ class MoEExpertOffloadCache:
             self._stream.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(self._stream):
                 _copies()
-            torch.cuda.current_stream().wait_stream(self._stream)
+            if join:
+                torch.cuda.current_stream().wait_stream(self._stream)
+            if fetch_sync_on():
+                # Task #49 probe (fn8ah 20.09.): a device-side wait is the
+                # design; a host-side synchronize here is the DISCRIMINATOR --
+                # if the 259k needle stops going NaN with it, the first
+                # compute read a slot whose copy had not landed.
+                torch.cuda.synchronize()
+        _g = getattr(self, "_nan_guard_fetched", None)  # desk stubs carry no guard
+        if _g is not None and join and fetch_plan:
+            _g(fetch_plan)
         self.planner.stats.h2d_bytes += moved
         self.planner.stats.remote_h2d_bytes += remote_moved
 
@@ -3000,15 +3681,14 @@ class MoEExpertOffloadCache:
         n = len(slot_of_needed)
         if n == 0:
             return lut
-        idx = torch.from_numpy(np.fromiter(slot_of_needed.keys(), np.int64, n))
-        val = torch.from_numpy(np.fromiter(slot_of_needed.values(), np.int64, n)).to(
-            dtype
-        )
-        lut.index_copy_(
-            0,
-            idx.to(device, non_blocking=True),
-            val.to(device, non_blocking=True),
-        )
+        # 19.09. (Task #33, fn3g profile): pageable -> device copies are host-
+        # blocking (`non_blocking` is honoured only for pinned memory), so the
+        # two vectors go through PINNED host tensors from the caching host
+        # allocator (its reuse is event-tracked, so a buffer freed here is not
+        # handed out again before the copy has read it). CPU desk path unchanged.
+        idx = _h2d_i64(np.fromiter(slot_of_needed.keys(), np.int64, n), device)
+        val = _h2d_i64(np.fromiter(slot_of_needed.values(), np.int64, n), device).to(dtype)
+        lut.index_copy_(0, idx, val)
         return lut
 
     @staticmethod
@@ -3174,6 +3854,16 @@ class MoEExpertOffloadCache:
             return  # static [0,R) residency (F3)
         if self._hot_frozen:
             return
+        if not hotset_covers_layer(self.layer):
+            logging.getLogger(__name__).info(
+                "SGLANG_MOE_HOTSET_FILE not applied to draft layer %r "
+                "(layer_id %s): the file is keyed by the TARGET's layer ids; "
+                "static [0,R) residency here",
+                getattr(self.layer, "_sglang_prefix", ""),
+                getattr(self.layer, "layer_id", None),
+            )
+            return
+        path = hotset_path_for_rank(path, getattr(self.layer, "moe_tp_rank", 0))
         data = _load_hotset_file(path)
         layer_id = getattr(self.layer, "layer_id", None)
         key = str(layer_id)
@@ -3184,6 +3874,18 @@ class MoEExpertOffloadCache:
             )
         R, E = self.resident_count, self.num_local_experts
         ids = [int(e) for e in data[key]]
+        if len(ids) != E:
+            # fn4h 19.09.: the file describes another expert space (a rank's
+            # expert-split target layer: 313/105/97 ids) while THIS layer holds
+            # a different set (the MTP draft's replicated 512). Not this
+            # layer's file -> static [0,R) residency, said once.
+            logging.getLogger(__name__).warning(
+                "SGLANG_MOE_HOTSET_FILE %s layer %s lists %d experts but this "
+                "layer holds %d (a different expert space); keeping the static "
+                "[0,R) residency here",
+                path, key, len(ids), E,
+            )
+            return
         if any(e < 0 or e >= E for e in ids):
             raise RuntimeError(
                 f"SGLANG_MOE_HOTSET_FILE layer {key}: expert id out of [0,{E})"
@@ -3201,6 +3903,217 @@ class MoEExpertOffloadCache:
             R,
             path,
         )
+
+    # ---- device-planned expert pool (vLLM PR #56177 port, 19.09.) -------------
+    def install_pool(self):  # pragma: no cover - requires CUDA
+        """Build the per-layer pool tables over the EXISTING [R+C] arena: rows
+        [0, R) are the fixed residents (never victims, no host copy needed),
+        [R, R+C-S) the device-LRU region, the last S rows staging. The host
+        source is the pinned spill pool through its UVA device view, addressed
+        by the static ``host_row`` table. Idempotent."""
+        import logging
+        import os
+
+        from sglang.srt.layers.moe.expert_pool_device import (
+            PLAN_WIDTH,
+            allocate_pool_tables,
+            allocate_step_buffers,
+        )
+
+        if self._pool_ready:
+            return
+        if not self._installed:
+            raise RuntimeError("install_pool() requires install() first")
+        # The frozen hot set (SGLANG_MOE_HOTSET_FILE) is installed BEFORE the
+        # tables snapshot the layout: the residents [0, R) then are the file's
+        # hottest R experts, not expert ids 0..R-1.
+        self.freeze_from_source()
+        if self._hot_enabled and not self._hot_frozen:
+            raise RuntimeError(
+                "pool mode: live hot-set calibration (SGLANG_MOE_HOT_RESIDENCY=1) "
+                "would rearrange the bank after the decode graphs captured it; "
+                "freeze from SGLANG_MOE_HOTSET_FILE or set HOT_RESIDENCY=0"
+            )
+        if self._cold_tier is not None:
+            raise RuntimeError("pool mode has no shared cold tier (#394) path")
+        R, C, E = self.resident_count, self.scratch, self.num_local_experts
+        rows = self.planner.buffer_size
+        if rows != R + C:
+            raise RuntimeError(
+                f"pool mode requires buffer_size == R+C ({rows} != {R}+{C})"
+            )
+        staging = int(os.environ.get("SGLANG_MOE_POOL_STAGING", "12") or 12)
+        staging = max(1, min(staging, C - 1, PLAN_WIDTH))
+        attrs = [a for a in self._pinned if a in self._resident]
+        device = self._resident[attrs[0]].device
+        pool_index = self._spill_pool_index
+        resident_ids = self.planner.resident_ids
+        host_row = []
+        for e in range(E):
+            resident = (e < R) if resident_ids is None else (e in resident_ids)
+            if resident:
+                host_row.append(-1)
+            else:
+                host_row.append(int(pool_index[e]) if pool_index is not None else e - R)
+        hot_slot_of = (
+            dict(self.planner.resident_slot)
+            if self.planner.resident_slot is not None
+            else {e: e for e in range(R)}
+        )
+        self._pool_tables = allocate_pool_tables(
+            device, E, rows, R, staging, hot_slot_of, host_row
+        )
+        self._pool_buffers = allocate_step_buffers(device, E, PLAN_WIDTH)
+        self._pool_srcs = [device_view_of_pinned(self._pinned[a]) for a in attrs]
+        self._pool_dsts = [self._resident[a] for a in attrs]
+        self._pool_view_holders = [self._pinned[a] for a in attrs]
+        if pool_prefetch_enabled():
+            import torch
+
+            self._pool_pf_buffers = allocate_step_buffers(device, E, PLAN_WIDTH)
+            self._pool_pf_begin = torch.cuda.Event()
+            self._pool_pf_done = torch.cuda.Event()
+        self._pool_ready = True
+        logging.getLogger(__name__).info(
+            "MoE expert pool on layer %s: residents %d, LRU rows %d, staging %d, "
+            "spill rows %d, tensors %d, prefetch %s",
+            getattr(self.layer, "layer_id", None), R, C - staging, staging,
+            sum(1 for h in host_row if h >= 0), len(attrs),
+            "on" if self._pool_pf_buffers is not None else "off",
+        )
+
+    def prepare_pool(self, topk_ids):
+        """The captured decode step: plan on the device, copy only the misses
+        (device count), return the physical rows the apply reads. Pure device
+        ops with fixed addresses -- captured once, replayed every step."""
+        import torch
+
+        from sglang.srt.layers.moe.expert_pool_device import copy_rows, step
+
+        if not self._pool_ready:
+            self.install_pool()
+        bs, k = topk_ids.shape
+        flat = topk_ids.reshape(-1)
+        if flat.dtype != torch.int32:
+            flat = flat.to(torch.int32)
+        if self._pool_pf_armed:
+            # The speculative rows for THIS layer were copied on the side
+            # stream while the previous layer computed. One wait, captured into
+            # the graph, and the real plan below sees them as ordinary hits.
+            self._pool_pf_armed = False
+            torch.cuda.current_stream().wait_event(self._pool_pf_done)
+        # 20.09. (fn8u, Task #52): the pool step and the row fetch are timed
+        # as their own clock families, so a decode round's split names the
+        # host->device expert traffic apart from compute and collectives.
+        # Outside a capture/round the span costs one attribute read.
+        from contextlib import nullcontext
+
+        from sglang.srt.utils.collective_clock import collective_clock
+
+        clock = collective_clock()
+        armed = clock.armed
+        with clock.span("pool.step") if armed else nullcontext():
+            step(self._pool_tables, flat, self._pool_buffers)
+        with clock.span("pool.fetch") if armed else nullcontext():
+            copy_rows(
+                self._pool_srcs,
+                self._pool_dsts,
+                self._pool_buffers.gather_src,
+                self._pool_buffers.gather_dst,
+                self._pool_buffers.gather_count,
+            )
+        routes = self._pool_buffers.routes[: bs * k].view(bs, k)
+        return routes if routes.dtype == topk_ids.dtype else routes.to(topk_ids.dtype)
+
+    def prefetch_pool(self, predicted_ids):
+        """Speculative pass for THIS layer, issued by the PREVIOUS layer while
+        its experts compute (SGLANG_MOE_POOL_PREFETCH=1).
+
+        ``predicted_ids`` are this layer's LOCAL expert ids as the caller's
+        block predicted them -- the next MoE block's router applied to the
+        current block's MoE input, remapped through the expert shard, padding
+        marked -1 (see ``FusedMoE.pool_prefetch``).
+
+        Everything runs on ONE side stream per rank, joined to the caller's
+        stream by two events so a CUDA graph captures the fork: the side stream
+        waits for ``begin`` (recorded on the main stream, which is therefore
+        also ordered behind this layer's PREVIOUS-round GEMM), plans and copies
+        the predicted rows, and records ``done``; ``prepare_pool`` waits for
+        ``done`` before this layer's real step. Nothing is allocated here that
+        is not already allocated: the plan writes the layer's own prefetch
+        buffers, the copy writes its own bank rows."""
+        import torch
+
+        from sglang.srt.layers.moe.expert_pool_device import copy_rows, step
+
+        if not self._pool_ready:
+            self.install_pool()
+        if self._pool_pf_buffers is None:
+            return False
+        flat = predicted_ids.reshape(-1)
+        width = self._pool_pf_buffers.gather_src.shape[0]
+        if flat.numel() > width:
+            flat = flat[:width]
+        # The side stream reads the ids from the layer's OWN buffer, filled on
+        # the main stream before the fork. ``predicted_ids`` is a temporary of
+        # the caller's forward (top-k output); under graph capture its block
+        # goes back to the private pool as soon as the caller drops it and a
+        # later allocation on the capture stream may reuse it -- concurrently
+        # with the side-stream step on replay. fn6n (19.09.): three ranks died
+        # with an illegal address on the first replay after two clean warmup
+        # forwards, the signature of exactly that race.
+        ids = self._pool_pf_buffers.ids[: flat.numel()]
+        ids.copy_(flat)
+        side = pool_prefetch_stream()
+        main = torch.cuda.current_stream()
+        self._pool_pf_begin.record(main)
+        with torch.cuda.stream(side):
+            side.wait_event(self._pool_pf_begin)
+            step(self._pool_tables, ids, self._pool_pf_buffers, prefetch=True)
+            copy_rows(
+                self._pool_srcs,
+                self._pool_dsts,
+                self._pool_pf_buffers.gather_src,
+                self._pool_pf_buffers.gather_dst,
+                self._pool_pf_buffers.gather_count,
+            )
+            self._pool_pf_done.record(side)
+        self._pool_pf_armed = True
+        return True
+
+    def begin_eager_pool(self):
+        """Before an eager (prefill / uncaptured) forward under the pool mode:
+        run_waves will rewrite scratch rows; record exactly those."""
+        self._scratch_holds.clear()
+
+    def sync_pool_from_host(self):
+        """After that eager forward: the device tables take the host's truth
+        for the LRU rows run_waves wrote; the rest of the LRU region is free."""
+        if not self._pool_ready:
+            return
+        import logging
+
+        from sglang.srt.layers.moe.expert_pool_device import (
+            check_pool_error,
+            sync_tables,
+            take_prefetch_report,
+            take_report,
+        )
+
+        check_pool_error(self._pool_tables, f"layer {getattr(self.layer, 'layer_id', '?')} sync")
+        forwards, misses = take_report(self._pool_tables)
+        predicted, fetched, pf_hits, pf_skipped = take_prefetch_report(self._pool_tables)
+        lid = getattr(self.layer, "layer_id", None)
+        if forwards and lid in (0, 23, 47):
+            logging.getLogger(__name__).info(
+                "MoE expert pool layer %s: %d decode forwards since last sync, "
+                "%d misses (%.2f per forward, top-k %d); prefetch predicted %d, "
+                "fetched %d, hits %d, wasted %d, skipped %d",
+                lid, forwards, misses, misses / forwards,
+                getattr(self.layer, "top_k", -1),
+                predicted, fetched, pf_hits, max(fetched - pf_hits, 0), pf_skipped,
+            )
+        sync_tables(self._pool_tables, dict(self._scratch_holds))
 
     def prepare_breakable(self, topk_ids, bridge, stage=None):
         """#462 breakable route: the EAGER pre-replay phase, in one call.
@@ -3341,9 +4254,16 @@ class MoEExpertOffloadCache:
             if self._heat.due():
                 self._migrate_heat()
 
-    def run_waves(self, dispatch_output, apply_fn):
+    def run_waves(self, dispatch_output, apply_fn, lookahead=None):
         """Run the grouped-GEMM for one forward, wave-splitting when the forward
         needs more unique experts than there are resident slots.
+
+        ``lookahead`` (WP8): ``(next_cache, predicted_ids)`` -- the offload
+        cache of a LATER layer and the expert ids its router predicted on this
+        layer's stream (already this rank's local ids). The prediction rides
+        the same D2H rendezvous as this forward's routing (one ``tolist`` for
+        both) and, when this forward is a single wave, ``next_cache.prefetch``
+        is issued right after this layer's own fetch.
 
         ``apply_fn(sub_dispatch_output) -> CombineInput`` runs the unmodified
         MoE math (``quant_method.apply``) over the resident buffer. We call it
@@ -3358,11 +4278,45 @@ class MoEExpertOffloadCache:
         topk_ids = topk_output.topk_ids
 
         if self.planner.fully_resident:
+            if lookahead is not None:
+                self._issue_lookahead(lookahead, None)
             return apply_fn(dispatch_output)
 
-        ids_list = topk_ids.tolist()  # [T][k]  (device->host sync; eager only)
+        prefetch = None
+        if lookahead is None:
+            ids_list = topk_ids.tolist()  # [T][k]  (device->host sync; eager only)
+        else:
+            # One rendezvous for both: this forward's routing and the later
+            # layer's prediction cross together.
+            next_cache, pred = lookahead
+            n_own = topk_ids.numel()
+            both = torch.cat(
+                [topk_ids.reshape(-1), pred.reshape(-1).to(topk_ids.dtype)]
+            ).tolist()
+            own = both[:n_own]
+            k = topk_ids.shape[-1]
+            ids_list = [own[i : i + k] for i in range(0, n_own, k)]
+            pred_list = both[n_own:]
+            prefetch = self._issue_lookahead(lookahead, pred_list)
 
         self._observe_routing(ids_list)
+        self._nan_trace_begin(ids_list)
+
+        # Task #45 (19.09.): expert-oracle dump, eager decode only, rank 0
+        try:
+            from sglang.srt.layers.moe.expert_oracle_dump import active as _oracle_on
+
+            if _oracle_on():
+                from sglang.srt.layers.moe.expert_oracle_dump import record_target
+
+                record_target(
+                    str(getattr(self.layer, "_sglang_prefix", "") or ""),
+                    getattr(self.layer, "layer_id", None),
+                    getattr(dispatch_output, "hidden_states", None),
+                    topk_ids,
+                )
+        except Exception as exc:  # noqa: BLE001 -- a dump never kills a forward
+            logger.debug("[expert-oracle] target record skipped: %s", exc)
 
         if self._wave_order == "expert":
             # #254: split over SPILL EXPERTS instead of tokens. The single-wave
@@ -3372,10 +4326,12 @@ class MoEExpertOffloadCache:
             )
             if len(spill_waves) > 1:
                 self.planner.stats.overflow_forwards += 1
+                if prefetch is not None:
+                    self.planner.stats.lookahead_dropped += 1
                 return self._run_waves_expert_major(
                     dispatch_output, apply_fn, ids_list, resident_used, spill_waves
                 )
-            return self._run_single_wave(dispatch_output, apply_fn, ids_list)
+            return self._run_single_wave(dispatch_output, apply_fn, ids_list, prefetch)
 
         waves = plan_token_waves(
             ids_list, self.resident_count, self.scratch, self.planner.resident_ids
@@ -3384,10 +4340,12 @@ class MoEExpertOffloadCache:
         # Fast path: the whole forward fits in one wave (typical decode). Remap
         # the full batch and run a single apply -- no token slicing overhead.
         if len(waves) == 1:
-            return self._run_single_wave(dispatch_output, apply_fn, ids_list)
+            return self._run_single_wave(dispatch_output, apply_fn, ids_list, prefetch)
 
         # Multi-wave (prefill overflow): process disjoint token subsets.
         self.planner.stats.overflow_forwards += 1
+        if prefetch is not None:
+            self.planner.stats.lookahead_dropped += 1
         h2d_before = self.planner.stats.h2d_bytes
         hidden = dispatch_output.hidden_states
         scale = dispatch_output.hidden_states_scale
@@ -3397,11 +4355,12 @@ class MoEExpertOffloadCache:
         out_full = torch.empty_like(hidden)
         combine_out = None
 
-        for rows in waves:
+        for _w, rows in enumerate(waves):
             rows_t = torch.tensor(rows, device=topk_ids.device, dtype=torch.long)
             needed = sorted({e for r in rows for e in ids_list[r] if e >= 0})
             slot_of_needed, fetch_plan = self.planner.resolve(needed)
             self._fetch(fetch_plan)
+            self._nan_trace_wave(_w, needed, slot_of_needed)
             lut = self._build_lut(slot_of_needed, topk_ids.dtype, topk_ids.device)
 
             tid_w = self._remap(topk_ids.index_select(0, rows_t), lut)
@@ -3437,6 +4396,22 @@ class MoEExpertOffloadCache:
         self._log_wave_h2d("token", len(waves), h2d_before)
         return combine_out._replace(hidden_states=out_full)
 
+    def _issue_lookahead(self, lookahead, pred_list):
+        """Build the prefetch thunk for ``lookahead`` (see run_waves). With
+        ``pred_list`` None the prediction was not carried across the
+        rendezvous (fully resident layer) and is dropped by name."""
+        next_cache, pred = lookahead
+        if pred_list is None:
+            pred_list = pred.reshape(-1).tolist()
+        if next_cache is None or not getattr(next_cache, "_installed", False):
+            self.planner.stats.lookahead_dropped += 1
+            return None
+
+        def _thunk():
+            next_cache.prefetch(pred_list)
+
+        return _thunk
+
     def _log_wave_h2d(self, order, waves, before):  # pragma: no cover - CUDA
         """One line per multi-wave forward with the PCIe volume it cost, so the
         token- vs expert-major difference is readable off the log instead of
@@ -3464,21 +4439,74 @@ class MoEExpertOffloadCache:
             gib,
         )
 
-    def _run_single_wave(self, dispatch_output, apply_fn, ids_list):
+    def prefetch(self, predicted):
+        """WP8 lookahead: bring the PREDICTED spill experts of this layer into
+        free scratch slots on the copy stream, without joining compute. Called
+        by an EARLIER layer's forward while that layer's GEMM runs, so the
+        H2D overlaps compute instead of sitting on the critical path. A
+        prediction that does not fit the scratch region is truncated to it
+        (the first sorted experts, as resolve() would place them); an expert
+        already held keeps its slot. Returns the number of experts issued."""
+        if not self._installed or self.planner.fully_resident:
+            return 0
+        needed_unique = sorted(set(int(e) for e in predicted if e >= 0))
+        spill = self.planner.split_needed(needed_unique)[1]
+        if self.planner.delegated_ids is not None and not self.planner.delegated_reachable:
+            spill = [e for e in spill if e not in self.planner.delegated_ids]
+        spill = spill[: self.scratch]
+        held_slot_of = {e: slot for slot, e in self._scratch_holds.items()}
+        missing = [e for e in spill if e not in held_slot_of]
+        if not missing:
+            return 0
+        keep = {held_slot_of[e] for e in spill if e in held_slot_of}
+        free = [
+            slot
+            for slot in range(self.resident_count, self.resident_count + self.scratch)
+            if slot not in keep
+        ]
+        plan = list(zip(missing, free))
+        self._fetch(plan, join=False)
+        self.planner.stats.lookahead_prefetched += len(plan)
+        return len(plan)
+
+    def _run_single_wave(self, dispatch_output, apply_fn, ids_list, prefetch=None):
         """One apply over the full batch: every routed expert fits the buffer at
         once (typical decode, and any prefill whose spill set fits the scratch).
-        Shared by both wave orders -- with a single wave they are the same path."""
+        Shared by both wave orders -- with a single wave they are the same path.
+
+        ``prefetch`` (WP8 lookahead): a thunk issuing the NEXT layer's
+        predicted spill fetch, run right after this layer's own fetch so the
+        copies overlap this layer's GEMM."""
         topk_output = dispatch_output.topk_output
         topk_ids = topk_output.topk_ids
         needed = sorted({e for row in ids_list for e in row if e >= 0})
-        slot_of_needed, fetch_plan = self.planner.resolve(needed)
+        if self.lookahead_sticky:
+            slot_of_needed, fetch_plan, _ = self.planner.resolve_sticky(
+                needed, self._scratch_holds
+            )
+        else:
+            slot_of_needed, fetch_plan = self.planner.resolve(needed)
+        _tm = _wave_timing_on() and topk_ids.is_cuda
+        if _tm:
+            import torch
+            _e0 = torch.cuda.Event(enable_timing=True); _e0.record()
         self._fetch(fetch_plan)
+        self._nan_trace_wave(0, needed, slot_of_needed)
+        if _tm:
+            _e1 = torch.cuda.Event(enable_timing=True); _e1.record()
+        if prefetch is not None:
+            prefetch()
         lut = self._build_lut(slot_of_needed, topk_ids.dtype, topk_ids.device)
         remapped = self._remap(topk_ids, lut)
         sub = dispatch_output._replace(
             topk_output=topk_output._replace(topk_ids=remapped)
         )
-        return apply_fn(sub)
+        out = apply_fn(sub)
+        if _tm:
+            _e2 = torch.cuda.Event(enable_timing=True); _e2.record()
+            _wave_timing_note(getattr(self.layer, "layer_id", None), _e0, _e1, _e2,
+                              len(fetch_plan), int(topk_ids.shape[0]))
+        return out
 
     def _run_waves_expert_major(
         self, dispatch_output, apply_fn, ids_list, resident_used, spill_waves
@@ -3543,6 +4571,11 @@ class MoEExpertOffloadCache:
         h2d_before = self.planner.stats.h2d_bytes
         cfg = self.layer.moe_runner_config
         saved_rsf = cfg.routed_scaling_factor
+        _tm = _wave_timing_on()
+        _tm_ev = []
+        slice_pairs = wave_token_slice_pairs()
+        stream_partials = partials_mode() == "stream"
+        out_acc = None  # [T, H] fp32 when streaming
         try:
             cfg.routed_scaling_factor = 1.0
             for w, needed in enumerate([resident_used] + spill_waves):
@@ -3550,50 +4583,87 @@ class MoEExpertOffloadCache:
                 if idx_np.size == 0:
                     continue
                 slot_of_needed, fetch_plan = self.planner.resolve(needed)
+                if _tm:
+                    _e0 = torch.cuda.Event(enable_timing=True); _e0.record()
                 self._fetch(fetch_plan)
+                self._nan_trace_wave(w, needed, slot_of_needed)
+                if _tm:
+                    _e1 = torch.cuda.Event(enable_timing=True); _e1.record()
                 lut = self._build_lut(slot_of_needed, topk_ids.dtype, device)
 
-                idx = torch.from_numpy(idx_np).to(device, non_blocking=True)
-                rows = torch.div(idx, K, rounding_mode="floor")
-                tid_w = lut[flat_ids.index_select(0, idx)].unsqueeze(1)
-                tw_w = flat_weights.index_select(0, idx)
-                hs_w = hidden.index_select(0, rows).contiguous()
-                sc_w = (
-                    scale.index_select(0, rows)
-                    if isinstance(scale, torch.Tensor) and scale.shape[0] == T
-                    else scale
-                )
-                rl_w = (
-                    router_logits.index_select(0, rows)
-                    if isinstance(router_logits, torch.Tensor)
-                    and router_logits.dim() >= 1
-                    and router_logits.shape[0] == T
-                    else router_logits
-                )
-
-                sub_topk = topk_output._replace(
-                    topk_weights=tw_w, topk_ids=tid_w, router_logits=rl_w
-                )
-                sub = dispatch_output._replace(
-                    hidden_states=hs_w,
-                    hidden_states_scale=sc_w,
-                    topk_output=sub_topk,
-                )
-                combine_out = apply_fn(sub)
-                part = combine_out.hidden_states
-                if partials is None:
-                    partials = torch.zeros(
-                        (T * K, part.shape[-1]), dtype=part.dtype, device=device
+                # The wave's experts are resident in scratch now; the grouped
+                # GEMM over its (token, expert) pairs runs in slices so its
+                # workspace is bounded by the slice, not by the chunk (see
+                # wave_token_slice_pairs). Byte-identical: every pair is
+                # computed exactly once and lands in its own partials row.
+                step = slice_pairs if slice_pairs > 0 else int(idx_np.size)
+                for start in range(0, int(idx_np.size), step):
+                    idx = torch.from_numpy(idx_np[start : start + step]).to(
+                        device, non_blocking=True
                     )
-                partials.index_copy_(0, idx, part.to(partials.dtype))
+                    rows = torch.div(idx, K, rounding_mode="floor")
+                    tid_w = lut[flat_ids.index_select(0, idx)].unsqueeze(1)
+                    tw_w = flat_weights.index_select(0, idx)
+                    hs_w = hidden.index_select(0, rows).contiguous()
+                    sc_w = (
+                        scale.index_select(0, rows)
+                        if isinstance(scale, torch.Tensor) and scale.shape[0] == T
+                        else scale
+                    )
+                    rl_w = (
+                        router_logits.index_select(0, rows)
+                        if isinstance(router_logits, torch.Tensor)
+                        and router_logits.dim() >= 1
+                        and router_logits.shape[0] == T
+                        else router_logits
+                    )
+
+                    sub_topk = topk_output._replace(
+                        topk_weights=tw_w, topk_ids=tid_w, router_logits=rl_w
+                    )
+                    sub = dispatch_output._replace(
+                        hidden_states=hs_w,
+                        hidden_states_scale=sc_w,
+                        topk_output=sub_topk,
+                    )
+                    combine_out = apply_fn(sub)
+                    _gw = getattr(self, "_nan_guard_wave", None)
+                    if _gw is not None:
+                        _gw(combine_out, w, needed, start)
+                    part = combine_out.hidden_states
+                    if stream_partials:
+                        if out_acc is None:
+                            out_acc = torch.zeros(
+                                (T, part.shape[-1]), dtype=torch.float32, device=device
+                            )
+                        out_acc.index_add_(0, rows, part.to(torch.float32))
+                        continue
+                    if partials is None:
+                        partials = torch.zeros(
+                            (T * K, part.shape[-1]), dtype=part.dtype, device=device
+                        )
+                    partials.index_copy_(0, idx, part.to(partials.dtype))
+                if _tm:
+                    _e2 = torch.cuda.Event(enable_timing=True); _e2.record()
+                    _tm_ev.append((_e0, _e1, _e2))
         finally:
             cfg.routed_scaling_factor = saved_rsf
 
-        out_full = torch.empty(
-            (T, partials.shape[-1]), dtype=partials.dtype, device=device
-        )
-        combine_topk_partials(partials.view(T, K, -1), out_full, saved_rsf)
+        if stream_partials:
+            # the combine kernel's job (sum over K, times the routed scaling
+            # factor) was done incrementally; only the scale and dtype remain
+            out_full = (out_acc * saved_rsf).to(combine_out.hidden_states.dtype)
+        else:
+            out_full = torch.empty(
+                (T, partials.shape[-1]), dtype=partials.dtype, device=device
+            )
+            combine_topk_partials(partials.view(T, K, -1), out_full, saved_rsf)
         self._log_wave_h2d("expert", len(spill_waves) + 1, h2d_before)
+        if _tm and _tm_ev:
+            _wave_timing_note_prefill(
+                getattr(self.layer, "layer_id", None), _tm_ev,
+                sum(len(g) for g in spill_waves), int(T),
+            )
         return combine_out._replace(hidden_states=out_full)
 
     # --- Stage-1 hot-set freeze (GPU window) -------------------------------
@@ -3640,12 +4710,18 @@ class MoEExpertOffloadCache:
         )
 
     def _apply_hotset_freeze(self, hot):  # pragma: no cover - requires CUDA
+        if getattr(self.layer, "_moe_offload_store_index", None):
+            raise RuntimeError(
+                "hot-set freeze rearranges the private spill pool; the shared "
+                "expert store (rows = global ids) has no such pool to rearrange"
+            )
         """Physically install ``hot`` (sorted list of R expert ids) as the
         frozen resident set: in-place buffer rearrange + planner/cache map
         install + freeze. Shared by live calibration (_freeze_hotset) and the
         §5 file-driven freeze_from_source."""
         import torch
 
+        self._scratch_holds.clear()  # WP8: the slots are about to be rewritten
         R = self.resident_count
         E = self.num_local_experts
         if self._capturable_ready:
@@ -3654,6 +4730,13 @@ class MoEExpertOffloadCache:
             raise RuntimeError(
                 "hot-set freeze after install_capturable_buffers(); the freeze "
                 "must happen before the capturable buffers are built"
+            )
+        if self._pool_ready:
+            raise RuntimeError(
+                "hot-set freeze after install_pool(); the pool's tables and the "
+                "captured graphs address the frozen layout -- freeze from a "
+                "SGLANG_MOE_HOTSET_FILE at install, or run with "
+                "SGLANG_MOE_HOT_RESIDENCY=0 under the pool mode"
             )
         hot_set = set(hot)
         cold = [e for e in range(E) if e not in hot_set]  # ascending
@@ -3679,9 +4762,7 @@ class MoEExpertOffloadCache:
                 return resident_host[e] if e < R else old_spill[e - R]
 
             # New spill pool (cold experts), pinned for async H2D fetches later.
-            new_spill = torch.empty(
-                (E - R,) + tail, dtype=old_spill.dtype, device="cpu"
-            ).pin_memory()
+            new_spill = pinned_exact_empty((E - R,) + tail, old_spill.dtype)
             for j, e in enumerate(cold):
                 new_spill[j].copy_(_src(e))  # host<-host (snapshot or old_spill)
 
@@ -3771,6 +4852,7 @@ class MoEExpertOffloadCache:
         ``SGLANG_MOE_HEAT_PERIOD`` forwards, so a full sync is the cheap,
         obviously correct choice over an event dance.
         """
+        self._scratch_holds.clear()  # WP8: scratch is the exchange buffer below
         import torch
 
         if self._capturable_ready:
@@ -3826,6 +4908,24 @@ class MoEExpertOffloadCache:
 # Per-process cache for SGLANG_MOE_HOTSET_FILE: every MoE layer freezes from
 # the same small JSON, so parse it once.
 _HOTSET_FILE_CACHE: Dict[str, dict] = {}
+
+
+def hotset_covers_layer(layer) -> bool:
+    """Whether SGLANG_MOE_HOTSET_FILE describes THIS layer. The file is keyed
+    by the target model's layer ids; an MTP/NEXTN draft layer (checkpoint
+    prefix ``mtp.…``) has layer_id 0 too and, once its experts are split
+    like the target's, the SAME local expert count -- the target's layer-0
+    hot set would silently be frozen onto it (fn4j 19.09.). Draft layers keep
+    the static plan."""
+    prefix = str(getattr(layer, "_sglang_prefix", "") or "")
+    return not (prefix.startswith("mtp") or ".mtp." in prefix)
+
+
+def hotset_path_for_rank(path: str, tp_rank: int) -> str:
+    """One SGLANG_MOE_HOTSET_FILE for a TP group whose ranks own DISJOINT
+    expert sets (the expert-dim shard): ``{rank}`` in the path names this
+    rank's own file (local expert ids). A path without the token is shared."""
+    return str(path).replace("{rank}", str(int(tp_rank)))
 
 
 def _load_hotset_file(path: str) -> dict:
@@ -3926,6 +5026,42 @@ def refuse_cold_shard_at_repack_door(layer) -> None:
     )
 
 
+def _expert_store_rows_for(layer, plan):
+    """``(dir, layer_key, lo, num_global, local->row)`` when the shared expert
+    store is on and this layer is a generic expert-dim shard; else ``None``."""
+    from sglang.srt.layers.moe import expert_store as _es
+
+    if not _es.store_enabled():
+        return None
+    num_global = int(getattr(layer, "num_experts", 0) or 0)
+    if num_global <= 0:
+        raise RuntimeError(
+            "the shared expert store needs the layer's GLOBAL expert count "
+            "(layer.num_experts) and found none"
+        )
+    num_local = int(getattr(layer, "num_local_experts", 0) or 0)
+    if getattr(layer, "_expert_shard_generic", False):
+        rng = getattr(layer, "_gguf_expert_range", None)
+        if rng is None:
+            return None
+        lo, _hi = rng
+        pad = True  # local 0 is the zero pad expert
+    elif num_local == num_global:
+        lo, pad = 0, False  # unsharded (a PP stage): local id == global id
+    else:
+        return None  # an EP-style slice; no global row map defined here
+    from sglang.srt.layers.moe.cold_tier_fetch import layer_key_for
+
+    return (
+        _es.store_dir(),
+        layer_key_for(layer),
+        int(lo),
+        num_global,
+        _es.global_rows(plan.spill_ids, int(lo), pad),
+        pad,
+    )
+
+
 def presplit_expert_offload_after_repack(
     layer, cold_shard: Optional[ColdShardContext] = None
 ) -> None:  # pragma: no cover - CUDA
@@ -3981,6 +5117,9 @@ def presplit_expert_offload_after_repack(
     R = plan.resident_count
     buf_slots = plan.buffer_slots
     static = plan.is_static_layout
+    store_rows = _expert_store_rows_for(layer, plan)
+    if store_rows is not None:
+        layer._moe_offload_store_index = dict(store_rows[4])
 
     presplit = {}
     freed_device = 0
@@ -3999,12 +5138,32 @@ def presplit_expert_offload_after_repack(
         # Spill -> pinned host; the GPU [E] stack is then freed. The static
         # plan is two contiguous slices, exactly as before; a #394 plan gathers
         # the rows the plan names (whole experts on dim 0 either way).
-        spill = torch.empty(
-            (len(plan.spill_ids),) + tuple(t.shape[1:]), dtype=t.dtype, device="cpu"
-        ).pin_memory()
+        if store_rows is not None:
+            # Task #47 step 1: the spill pool IS the shared store (rows =
+            # global ids); this rank writes every row it loaded, residents
+            # included, so a reader from another rank group finds them.
+            from sglang.srt.layers.moe import expert_store as _es
+
+            s_dir, s_key, s_lo, s_num, _s_index, s_pad = store_rows
+            spill, _created = _es.open_store(
+                s_dir, s_key, attr, s_num, tuple(t.shape[1:]), t.dtype
+            )
+            # Only the COLD rows go to the host (flip design 20.09.: a row a
+            # card holds in some layout is taken from that card over BAR1, the
+            # host store keeps what no card holds). fn8m measured the store
+            # with residents at 58 GiB shmem / 77 GiB cgroup after load, 89 at
+            # the load peak, against the 88 GiB mark; residents are the 12 GiB.
+            written = _es.write_rows(spill, t, list(plan.spill_ids), s_lo, s_pad)
+            _es.mark_rows_written(
+                s_dir, s_key, attr, int(getattr(layer, "moe_tp_rank", 0) or 0),
+                written.values(),
+            )
+        else:
+            spill = pinned_exact_empty((len(plan.spill_ids),) + tuple(t.shape[1:]), t.dtype)
         if static:
             buf[:R].copy_(t[:R])
-            spill.copy_(t[R:])
+            if store_rows is None:
+                spill.copy_(t[R:])
         else:
             buf[:R].copy_(
                 t.index_select(
@@ -4014,7 +5173,7 @@ def presplit_expert_offload_after_repack(
                     ),
                 )
             )
-            if plan.spill_ids:
+            if plan.spill_ids and store_rows is None:
                 spill.copy_(
                     t.index_select(
                         0,
@@ -4024,18 +5183,30 @@ def presplit_expert_offload_after_repack(
                     )
                 )
         presplit[attr] = (buf, spill)
+        if store_rows is not None:
+            torch.cuda.empty_cache()  # give the sizer the device bytes back (fn8m)
         # #119: tally the VRAM this tensor stops holding, so the KV-pool sizing
         # step can report (and assert on) the reclaim it is about to inherit.
         row_bytes = (t.numel() // t.shape[0]) * t.element_size()
         freed_device += expert_offload_released_device_bytes(
             int(E), buf_slots, row_bytes
         )
-        freed_host += spill.numel() * spill.element_size()
-        # Replace the param with a 0-row placeholder so device_loading_context
-        # copies nothing back to host (the full [E] GPU tensor is dropped here).
+        if store_rows is not None:
+            freed_host += len(plan.spill_ids) * row_bytes  # own rows of the shared file
+        else:
+            freed_host += spill.numel() * spill.element_size()
+        # Replace the param's DATA with a 0-row placeholder so
+        # device_loading_context copies nothing back to host (the full [E]
+        # GPU tensor is dropped here). In place, on the SAME Parameter object:
+        # measured on Qwen3.8-Flash-Next (fn1l, 16.09.2026) a fresh Parameter
+        # left the old one -- with its repacked [E] stack -- alive under
+        # ``model.layers.N.mlp.experts.w13_weight_packed`` in the loader's
+        # params_dict snapshot for the rest of load_weights: +0.81 GiB per
+        # layer on the card, OOM at 71 % of the checkpoint. Swapping .data
+        # frees the stack for every holder of the object.
         empty = torch.empty((0,) + tuple(t.shape[1:]), dtype=t.dtype, device=t.device)
         if isinstance(p, torch.nn.Parameter):
-            setattr(layer, attr, torch.nn.Parameter(empty, requires_grad=False))
+            p.data = empty
         else:
             setattr(layer, attr, empty)
 

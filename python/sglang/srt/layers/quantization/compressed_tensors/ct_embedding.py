@@ -162,6 +162,35 @@ def vocab_is_quantized(
     return True
 
 
+def vocab_named_in_targets(quant_config: Dict[str, Any], layer_name: str) -> bool:
+    """Does a config group NAME this vocab layer -- verbatim or by a ``re:``
+    target? A class-name target (``Linear``) never covers an embedding: HF's
+    ``embed_tokens`` is an ``nn.Embedding``, so an llm-compressor export with
+    ``targets: [Linear]`` (cyankiwi) carries a dense embedding even though
+    its ignore list, which only lists Linears, does not mention it. An
+    AutoRound export that packs the vocab names it (Minachist:
+    ``re:.*embed_tokens``). This is the positive evidence a model class
+    needs before it hands the vocab a quant_config at all; the ignore-list
+    scan in ``vocab_is_quantized`` stays the per-row int8 rule (#727)."""
+    groups = quant_config.get("config_groups") or {}
+    for group in groups.values():
+        for target in (group or {}).get("targets") or []:
+            if not isinstance(target, str):
+                continue
+            if target.startswith("re:"):
+                try:
+                    if re.fullmatch(target[3:], layer_name) or re.search(
+                        target[3:], layer_name
+                    ):
+                        return True
+                except re.error:
+                    if target[3:] == layer_name:
+                        return True
+            elif target == layer_name:
+                return True
+    return False
+
+
 class CompressedTensorsEmbeddingMethod(QuantizeMethodBase):
     """Symmetric per-row int8 vocab, dequantized on gather.
 
@@ -240,3 +269,92 @@ class CompressedTensorsEmbeddingMethod(QuantizeMethodBase):
         )
         out = torch.nn.functional.linear(x, weight, bias)
         return out
+
+
+class CompressedTensorsPackedEmbeddingMethod(QuantizeMethodBase):
+    """``pack-quantized`` group-int vocab (e.g. INT8 g128 as AutoRound writes
+    Qwen3.8-Flash-Next's ``embed_tokens``), dequantized on gather.
+
+    Parameter layout mirrors the checkpoint: ``weight_packed`` int32
+    ``[rows, dim*bits/32]`` (little-endian, values stored unsigned with offset
+    2**(bits-1)), ``weight_scale`` ``[rows, dim/group]``, ``weight_shape``.
+    Only whole rows are gathered and unpacked, so the cost stays per token.
+    """
+
+    def __init__(
+        self, num_bits: int, group_size: int, symmetric: bool = True, params_dtype=None
+    ):
+        if not symmetric:
+            raise NotImplementedError("packed vocab: only symmetric groups are supported")
+        if 32 % num_bits:
+            raise NotImplementedError(f"packed vocab: {num_bits}-bit dense packing unsupported")
+        self.num_bits = int(num_bits)
+        self.pack_factor = 32 // self.num_bits
+        self.group_size = int(group_size)
+        self.params_dtype = params_dtype or torch.get_default_dtype()
+
+    def create_weights(
+        self,
+        layer: torch.nn.Module,
+        input_size_per_partition: int,
+        output_partition_sizes: List[int],
+        input_size: int,
+        output_size: int,
+        params_dtype: Optional[torch.dtype] = None,
+        weight_loader=None,
+        **extra,
+    ) -> None:
+        rows = int(sum(output_partition_sizes))
+        dim = int(input_size_per_partition)
+        if params_dtype is not None:
+            self.params_dtype = params_dtype
+        if dim % self.pack_factor or dim % self.group_size:
+            raise ValueError(
+                f"packed vocab: dim {dim} must be a multiple of the pack factor "
+                f"{self.pack_factor} and the group size {self.group_size}"
+            )
+        weight = torch.nn.Parameter(
+            torch.empty(rows, dim // self.pack_factor, dtype=torch.int32),
+            requires_grad=False,
+        )
+        scale = torch.nn.Parameter(
+            torch.empty(rows, dim // self.group_size, dtype=torch.float16),
+            requires_grad=False,
+        )
+        shape = torch.nn.Parameter(torch.empty(2, dtype=torch.int64), requires_grad=False)
+        # rows are dim 0 for the vocab loader (see the per-row method, #763);
+        # the packed axis is the hidden dim, never sharded by the vocab loader.
+        set_weight_attrs(
+            weight,
+            {"input_dim": 1, "output_dim": 0, "packed_dim": 1, "packed_factor": self.pack_factor},
+        )
+        set_weight_attrs(scale, {"input_dim": 1, "output_dim": 0})
+        layer.register_parameter("weight_packed", weight)
+        layer.register_parameter("weight_scale", scale)
+        layer.register_parameter("weight_shape", shape)
+        for param in (weight, scale, shape):
+            if weight_loader is not None:
+                setattr(param, "weight_loader", weight_loader)
+            if extra:
+                set_weight_attrs(param, extra)
+
+    def _dequant_rows(self, packed: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+        n = packed.shape[0]
+        w = packed.to(torch.int64) & 0xFFFFFFFF
+        shifts = torch.arange(self.pack_factor, device=packed.device, dtype=torch.int64)
+        mask = (1 << self.num_bits) - 1
+        raw = (w.unsqueeze(-1) >> (shifts * self.num_bits)) & mask  # [n, words, pf]
+        q = raw.reshape(n, -1) - (1 << (self.num_bits - 1))
+        q = q.view(n, -1, self.group_size).to(self.params_dtype)
+        return (q * scale.to(self.params_dtype).unsqueeze(-1)).reshape(n, -1)
+
+    def embedding(self, layer: torch.nn.Module, x: torch.Tensor) -> torch.Tensor:
+        packed = layer.weight_packed[x]
+        scale = layer.weight_scale[x]
+        return self._dequant_rows(packed, scale)
+
+    def apply(self, layer: torch.nn.Module, x: torch.Tensor, bias=None):
+        """Dense fallback (the head goes through the Marlin linear scheme
+        instead; this dequantizes the whole vocab and is for tests only)."""
+        weight = self._dequant_rows(layer.weight_packed, layer.weight_scale)
+        return torch.nn.functional.linear(x, weight, bias)

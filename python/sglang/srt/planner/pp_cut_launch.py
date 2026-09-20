@@ -1020,7 +1020,7 @@ def solve_launch_cut(
     # weights plus the arming floor still fit rank0's own budget. A cut above
     # it is arithmetic that ignores the card.
     spendable0 = float(pool_model.free_mib[0]) - float(pool_model.arming_floor_mib[0])
-    max_rank0 = int(spendable0 // float(pool_model.weight_mib_per_layer))
+    max_rank0 = int(spendable0 // float(pool_model.layer_mib(0)))
     max_rank0 = max(1, min(int(total_layers) - (n_stages - 1), max_rank0))
 
     # BOTH AXES, JOINTLY AND ONLY IN THEIR REALIZABLE COMBINATIONS. The

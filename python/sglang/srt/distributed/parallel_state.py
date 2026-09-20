@@ -568,6 +568,53 @@ def should_build_custom_allreduce(
     return use_custom_allreduce and world_size > 1 and not barlink_active
 
 
+_NAN_GUARD_WIRE = {"on": None, "in_bad": 0, "out_bad": 0, "calls": 0}
+
+
+def _nan_guard_wire_on() -> bool:
+    if _NAN_GUARD_WIRE["on"] is None:
+        import os
+
+        _NAN_GUARD_WIRE["on"] = os.environ.get("SGLANG_NAN_GUARD", "0").strip() not in ("", "0")
+    return bool(_NAN_GUARD_WIRE["on"])
+
+
+def _nan_guard_all_reduce(group, input_):
+    """Task #49 (19.09., fn8e run 3): the first NaN rows of layer 11 sat in the
+    MoE INPUT on every rank identically while the LSE merge before it was
+    finite -- between them lies the o_proj all-reduce (8192 x 2560 bf16 =
+    42 MB, several bar1 rounds). Finite in, non-finite out on any rank is a
+    transport fault, named here with shape, bytes and the first rows."""
+    try:
+        if torch.cuda.is_current_stream_capturing():
+            return group.barlink_comm.all_reduce(input_)
+    except Exception:  # noqa: BLE001
+        pass
+    pre_ok = bool(torch.isfinite(input_).all().item())
+    out = group.barlink_comm.all_reduce(input_)
+    _NAN_GUARD_WIRE["calls"] += 1
+    if not pre_ok:
+        _NAN_GUARD_WIRE["in_bad"] += 1
+        if _NAN_GUARD_WIRE["in_bad"] <= 3:
+            logger.error(
+                "[nan-guard] all_reduce input already non-finite on rank %d: shape %s (call %d)",
+                group.rank_in_group, tuple(input_.shape), _NAN_GUARD_WIRE["calls"],
+            )
+        return out
+    post_ok = bool(torch.isfinite(out).all().item())
+    if not post_ok:
+        _NAN_GUARD_WIRE["out_bad"] += 1
+        bad = ~torch.isfinite(out)
+        rows = torch.nonzero(bad.reshape(bad.shape[0], -1).any(dim=1) if out.dim() > 1 else bad).reshape(-1)
+        logger.error(
+            "[nan-guard] all_reduce TRANSPORT FAULT on rank %d: finite in, %d non-finite out of %d, "
+            "shape %s dtype %s bytes %d, first rows %s (n_rows %d), call %d",
+            group.rank_in_group, int(bad.sum().item()), out.numel(), tuple(out.shape), out.dtype,
+            out.numel() * out.element_size(), rows[:8].tolist(), int(rows.numel()), _NAN_GUARD_WIRE["calls"],
+        )
+    return out
+
+
 class GroupCoordinator:
     """
     PyTorch ProcessGroup wrapper for a group of processes.
@@ -1469,6 +1516,8 @@ class GroupCoordinator:
         # through them would split the host-staging schedule across graph
         # segments. Out-of-place, matching the outplace contract.
         if self.barlink_comm is not None:
+            if _nan_guard_wire_on() and input_.is_cuda:
+                return _nan_guard_all_reduce(self, input_)
             return self.barlink_comm.all_reduce(input_)
 
         if self.hpu_communicator is not None and not self.hpu_communicator.disabled:

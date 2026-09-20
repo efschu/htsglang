@@ -1224,6 +1224,18 @@ class AdaptiveGraphMemoryManager:
         free, _ = torch.cuda.mem_get_info()
         return max(0, int(needed) - (int(free) + outgoing))
 
+    def note_resident_activation(self, steps) -> None:
+        """Resident mode has no swap, so ``ensure_active`` returns before the
+        rank-sync check. The controller calls this on every activation
+        instead, so a rank-divergent choice (the per-round chain policy
+        decides locally on each rank) fails loudly under
+        SGLANG_ADAPTIVE_ALIAS_VERIFY_RANK_SYNC=1 instead of deadlocking in
+        the next collective with different graphs on different ranks."""
+        if self.offload_enabled:
+            return
+        self._swap_ordinal += 1
+        self._maybe_verify_rank_sync(steps)
+
     def _maybe_verify_rank_sync(self, steps) -> None:
         from sglang.srt.environ import envs
 

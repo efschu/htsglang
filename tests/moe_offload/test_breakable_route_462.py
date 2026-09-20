@@ -528,37 +528,34 @@ def test_the_eager_path_pays_more_host_blocking_than_the_breakable_one():
     assert HOST_SYNCS_PER_LAYER_PER_STEP == 1
 
 
-def test_the_eager_lut_build_really_does_issue_the_two_extra_transfers(monkeypatch):
-    """Positive control for the crossing count above.
+def test_the_eager_lut_build_stages_its_two_vectors_through_pinned_memory(monkeypatch):
+    """19.09. (Task #33, fn3g profile): the eager ``_build_lut`` used to ship
+    two PAGEABLE numpy-backed vectors with ``non_blocking=True`` -- a flag torch
+    honours only for pinned memory, so both copies blocked the host. They now go
+    through ``_h2d_i64``: a pinned tensor from the caching host allocator and a
+    genuinely non-blocking copy. On the CPU desk no transfer happens at all (the
+    vectors are already where they are read); with a card the two copies are
+    issued from PINNED sources."""
+    import numpy as np
+    from sglang.srt.layers.moe import expert_offload as eo
 
-    ``_build_lut`` ships TWO numpy-backed host tensors to the device with
-    ``non_blocking=True``. Those two are the crossings the breakable route
-    removes, and the flag is the point: ``non_blocking`` is honoured only for
-    PINNED memory, and ``torch.from_numpy`` gives pageable memory, so on a real
-    device both copies block the host despite asking not to.
-
-    The transfer count -- not the source/destination devices -- is what this
-    asserts, because the hermetic fixture has no device to copy to. If the eager
-    path ever stops issuing them, the documented 3-vs-2 delta is stale and this
-    goes red.
-    """
     cache = _cache()
     transfers = []
     original = torch.Tensor.to
 
     def probe(self, *a, **kw):
         if kw.get("non_blocking") is True:
-            transfers.append(tuple(str(x) for x in a))
+            transfers.append(bool(self.is_pinned()) if torch.cuda.is_available() else None)
         return original(self, *a, **kw)
 
     monkeypatch.setattr(torch.Tensor, "to", probe)
     slot_of_needed, _ = cache.planner.resolve([0, 9, 3])
-    cache._build_lut(slot_of_needed, torch.int64, torch.device("cpu"))
-
-    assert len(transfers) == (
-        EAGER_HOST_BLOCKING_CROSSINGS_PER_LAYER_PER_STEP
-        - HOST_SYNCS_PER_LAYER_PER_STEP
-    ) == 2, f"expected two non_blocking transfers, saw {transfers}"
+    lut = cache._build_lut(slot_of_needed, torch.int64, torch.device("cpu"))
+    assert lut.shape[0] == cache.num_local_experts
+    assert transfers == [], f"the CPU desk path issues no transfer, saw {transfers}"
+    if torch.cuda.is_available():
+        out = eo._h2d_i64(np.arange(3, dtype=np.int64), torch.device("cuda"))
+        assert out.is_cuda and transfers == [True], f"expected one pinned non_blocking copy, saw {transfers}"
 
 
 def test_the_staged_publish_is_blocking(monkeypatch):

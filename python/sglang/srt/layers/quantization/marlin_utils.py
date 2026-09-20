@@ -366,16 +366,18 @@ def marlin_moe_permute_scales(
     size_n: int,
     group_size: int,
 ):
+    # Batched over experts (16.09.2026, Flash-Next load profile): the
+    # permutation is a column permutation applied row by row, so the [E, k, n]
+    # stack is one [E*k, n] matrix to it. The per-expert loop was 313 calls
+    # per tensor per layer on the 5090 rank. Row-identical to the loop.
     num_experts = s.shape[0]
-    output = torch.empty(
-        (num_experts, s.shape[1], s.shape[2]),
-        device=s.device,
-        dtype=s.dtype,
-    )
-
-    for e in range(num_experts):
-        output[e] = marlin_permute_scales(s[e], size_k, size_n, group_size)
-    return output
+    if num_experts == 0:
+        return torch.empty_like(s)
+    flat = s.reshape(num_experts * s.shape[1], s.shape[2])
+    # `group_size < size_k` selects the grouped permutation exactly as the
+    # per-expert call would (size_k is the per-expert extent).
+    out = marlin_permute_scales(flat, size_k, size_n, group_size)
+    return out.reshape(num_experts, s.shape[1], s.shape[2]).contiguous()
 
 
 def marlin_zero_points(
@@ -428,15 +430,71 @@ def awq_to_marlin_zero_points(
 def moe_awq_to_marlin_zero_points(
     q_zp_packed: torch.Tensor, size_k: int, size_n: int, num_bits: int
 ):
+    # Batched over experts (16.09.2026, Flash-Next load profile): unpack,
+    # de-interleave, marlin permute and repack are all row-wise, so the
+    # [E, k, n/pf] stack is handed through as one [E*k, n/pf] matrix with
+    # size_k = E*k. py-spy on the 5090 rank showed the per-expert numpy loop
+    # (unpack_cols) in 3 of 10 load samples. Row-identical to the loop.
     num_experts = q_zp_packed.shape[0]
-    output = torch.empty(
-        (num_experts, q_zp_packed.shape[1], q_zp_packed.shape[2]),
-        device=q_zp_packed.device,
-        dtype=q_zp_packed.dtype,
-    )
-    for e in range(num_experts):
-        output[e] = awq_to_marlin_zero_points(q_zp_packed[e], size_k, size_n, num_bits)
-    return output
+    if num_experts == 0:
+        return torch.empty_like(q_zp_packed)
+    k = q_zp_packed.shape[1]
+    flat = q_zp_packed.reshape(num_experts * k, q_zp_packed.shape[2])
+    out = awq_to_marlin_zero_points_torch(flat, num_experts * size_k, size_n, num_bits)
+    return out.reshape(num_experts, k, q_zp_packed.shape[2]).contiguous()
+
+
+def _unpack_cols_torch(packed: torch.Tensor, num_bits: int, size_k: int, size_n: int):
+    """Torch twin of quantization.utils.unpack_cols (numpy): int32 [k, n/pf]
+    -> int32 [k, n], value j of column c*pf+i is bits [i*b, (i+1)*b) of word
+    (r, c). Runs on the tensor's own device."""
+    pack_factor = 32 // num_bits
+    assert packed.shape == (size_k, size_n // pack_factor)
+    mask = (1 << num_bits) - 1
+    res = torch.empty((size_k, size_n), dtype=torch.int32, device=packed.device)
+    for i in range(pack_factor):
+        # arithmetic shift on int32; the mask discards the sign fill.
+        res[:, i::pack_factor] = (packed >> (num_bits * i)) & mask
+    return res
+
+
+def _pack_cols_torch(q: torch.Tensor, num_bits: int, size_k: int, size_n: int):
+    """Torch twin of quantization.utils.pack_cols (numpy)."""
+    pack_factor = 32 // num_bits
+    assert q.shape == (size_k, size_n) and size_n % pack_factor == 0
+    res = torch.zeros((size_k, size_n // pack_factor), dtype=torch.int32, device=q.device)
+    for i in range(pack_factor):
+        res = res | (q[:, i::pack_factor].to(torch.int32) << (num_bits * i))
+    return res
+
+
+def awq_to_marlin_zero_points_torch(
+    q_zp_packed: torch.Tensor, size_k: int, size_n: int, num_bits: int
+) -> torch.Tensor:
+    """awq_to_marlin_zero_points with torch ops end to end, on CUDA when one is
+    available (the MoE stack of a Flash-Next rank is 313 x 80 x 160 int32 per
+    tensor per layer; the numpy path still showed in 5 of 14 load samples
+    after batching). Bit-identical to the numpy path (test pins it)."""
+    work_device = q_zp_packed.device
+    if work_device.type == "cpu" and torch.cuda.is_available():
+        work_device = torch.device("cuda")
+    x = q_zp_packed.to(work_device)
+    q_zp = _unpack_cols_torch(x, num_bits, size_k, size_n)
+    if num_bits == 4:
+        undo = torch.tensor(numpy.argsort(numpy.array([0, 2, 4, 6, 1, 3, 5, 7])), device=work_device)
+        inter = torch.tensor([0, 2, 4, 6, 1, 3, 5, 7], device=work_device)
+    elif num_bits == 8:
+        undo = torch.tensor(numpy.argsort(numpy.array([0, 2, 1, 3])), device=work_device)
+        inter = torch.tensor([0, 2, 1, 3], device=work_device)
+    else:
+        raise Exception("num_bits must be 4 or 8, got {}".format(num_bits))
+    q_zp = q_zp.reshape((-1, undo.numel()))[:, undo].reshape((-1, size_n)).contiguous()
+    scale_perm, _ = get_scale_perms()
+    perm = torch.tensor(scale_perm, device=work_device)
+    zp = q_zp.reshape((-1, perm.numel()))[:, perm]
+    zp = zp.reshape((-1, inter.numel()))[:, inter].reshape((-1, size_n)).contiguous()
+    out = _pack_cols_torch(zp, num_bits, size_k, size_n)
+    return out.to(q_zp_packed.device)
 
 
 def maybe_warn_marlin_atomic_add(device, dtype):

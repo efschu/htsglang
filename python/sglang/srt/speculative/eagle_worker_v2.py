@@ -18,6 +18,13 @@ from sglang.srt.hardware_backend.npu.graph_runner.npu_graph_runner import NPUGra
 from sglang.srt.kv_canary.runner.canary_manager import context_tuple
 from sglang.srt.layers.attention.dsa.utils import dsa_use_prefill_cp
 from sglang.srt.layers.attention.flashinfer_backend import FlashInferAttnBackend
+from sglang.srt.layers.attention.index_topk_share import IndexTopKShareState
+from sglang.srt.layers.attention.qsa.config import parse_qsa_profile
+from sglang.srt.layers.attention.qwen_sparse_attn_backend import (
+    QSAMTPSharedSparseIndices,
+    QwenSparseAttnBackend,
+    QwenSparseMultiStepDraftBackend,
+)
 from sglang.srt.layers.attention.tokenspeed_mla_backend import TokenspeedMLABackend
 from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
 from sglang.srt.layers.attention.trtllm_mha_backend import TRTLLMHAAttnBackend
@@ -48,9 +55,16 @@ from sglang.srt.model_executor.runner import (
     DecodeCudaGraphRunner,
     get_batch_sizes_to_capture,
 )
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_parallel, get_spec
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative import accept_position_probe
+from sglang.srt.speculative.adaptive_chain import (
+    AdaptiveChainPolicy,
+    ChainCostModel,
+    RoundCostProbe,
+    SurvivalProbe,
+    parse_cost_ms,
+)
 from sglang.srt.speculative.adaptive_runtime_state import (
     AdaptiveController,
     SpecRuntimeState,
@@ -278,6 +292,70 @@ def _get_plan_stream(
         return None, contextlib.nullcontext()
 
 
+def _spec_trace_rounds() -> int:
+    """SGLANG_SPEC_TRACE=N: log the first N verify rounds -- draft ids, the
+    target's per-row picks, accept length and the draft-extend top-5 -- to
+    tell 'plausible but wrong' from 'noise' (fn4r-fn4u 19.09.: accept 1.2)."""
+    import os
+
+    try:
+        return int(os.environ.get("SGLANG_SPEC_TRACE", "0") or 0)
+    except ValueError:
+        return 0
+
+
+def _log_spec_trace(worker, verify_input, predict, accept_lens, accept_index) -> None:
+    try:
+        num_draft = int(worker.speculative_num_draft_tokens)
+        draft = verify_input.draft_token.view(-1, num_draft).tolist()
+        if predict.numel() == len(draft) * num_draft:
+            target = predict.view(-1, num_draft).tolist()
+        else:
+            target = [predict.tolist()] * len(draft)
+        acc = accept_lens.tolist()
+        top5 = getattr(worker, "_spec_trace_top5", None)
+        top5 = top5.tolist() if top5 is not None else None
+        for i in range(min(len(draft), 4)):
+            logger.info(
+                "SPEC-TRACE round=%d req=%d draft=%s target=%s accept=%s top5_prev=%s",
+                worker._spec_trace_done, i, draft[i], target[i],
+                acc[i] if i < len(acc) else None,
+                top5[i] if top5 is not None and i < len(top5) else None,
+            )
+    except Exception as e:  # noqa: BLE001 - a trace must never kill the loop
+        logger.warning("SPEC-TRACE skipped: %s", e)
+
+
+def _qsa_index_share_requested(hf_config) -> bool:
+    """--json-model-override-args writes top-level hf_config attributes, while
+    checkpoint configs carry the flag on the nested text_config; read both.
+    SGLANG_QSA_MTP_INDEX_SHARE=0 forces it off (A/B switch, fn4r 19.09.: the
+    Qwen4Exp config class defaults it to True, accept length 1.2 with it)."""
+    import os
+
+    if os.environ.get("SGLANG_QSA_MTP_INDEX_SHARE", "") == "0":
+        return False
+    text_config = getattr(hf_config, "text_config", hf_config)
+    return bool(
+        getattr(
+            text_config,
+            "index_share_for_mtp_iteration",
+            getattr(hf_config, "index_share_for_mtp_iteration", False),
+        )
+    )
+
+
+def target_shares_vocab_modules(target_lm_head, embed_module) -> bool:
+    """Whether the draft must share the target's vocab MODULES instead of
+    their ``.weight`` tensors: a GGUF quantized-resident lm_head (packed
+    ``qweight``), or -- fn4i 19.09., Next Flash -- an embedding kept on the
+    host (Qwen4ExpPinnedHostEmbedding under --ple-offload-embedding) that has
+    no ``.weight`` tensor to hand over either."""
+    if target_lm_head is not None and not hasattr(target_lm_head, "weight") and hasattr(target_lm_head, "qweight"):
+        return True
+    return embed_module is not None and not hasattr(embed_module, "weight")
+
+
 class EagleDraftWorker(EagleDraftWorkerBase):
     def __init__(
         self,
@@ -349,6 +427,10 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         self._topk1_parents_prealloc = None
         self._topk1_score_indices_prealloc = None
         self._rebuild_topk1_chain_buffers()
+
+        # Per-round adaptive chain length (SGLANG_SPEC_ADAPTIVE_CHAIN).
+        self.survival_probe: Optional[SurvivalProbe] = None
+        self._init_adaptive_chain_probe()
 
         # Load draft model weights only.
         if server_args.enable_dp_attention and self.speculative_algorithm.is_eagle3():
@@ -572,17 +654,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             f"got {self.speculative_num_draft_tokens} and {self.speculative_num_steps}"
         )
         num_steps = self.speculative_num_steps
-        sa = self.server_args
-        decode_max_bs = (
-            sa.cuda_graph_config.decode.max_bs
-            if sa.cuda_graph_config is not None
-            else None
-        )
-        max_bs = max(
-            decode_max_bs or 0,
-            sa.max_running_requests or 0,
-            1,
-        )
+        max_bs = self._max_chain_bs()
         # A single-step chain has no parent entries (slow path drops the last
         # step). repeat (not expand): the kernel reads these as contiguous.
         parent_width = num_steps if num_steps > 1 else 0
@@ -592,6 +664,67 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         self._topk1_score_indices_prealloc = torch.arange(
             num_steps, dtype=torch.long, device=self.device
         ).repeat(max_bs, 1)
+
+    def _max_chain_bs(self) -> int:
+        """Largest batch size any chain-shaped buffer must cover."""
+        sa = self.server_args
+        decode_max_bs = (
+            sa.cuda_graph_config.decode.max_bs
+            if sa.cuda_graph_config is not None
+            else None
+        )
+        return max(decode_max_bs or 0, sa.max_running_requests or 0, 1)
+
+    def _init_adaptive_chain_probe(self) -> None:
+        """Allocate the survival buffer once, sized for the longest candidate.
+
+        Sized from the *union* of the adaptive candidate steps rather than from
+        the current ``speculative_num_steps``: the buffer is captured into every
+        draft CUDA graph and must never be reallocated afterwards, so it has to
+        be wide enough for the longest chain the controller can ever activate.
+
+        Requires ``--speculative-adaptive`` — that flag owns the per-candidate
+        runtime states (one captured draft/verify graph set per chain length)
+        that the per-round policy switches between. Without it there is exactly
+        one captured chain length and nothing to choose from.
+        """
+        if not envs.SGLANG_SPEC_ADAPTIVE_CHAIN.get():
+            return
+        if self.topk != 1:
+            logger.warning(
+                "SGLANG_SPEC_ADAPTIVE_CHAIN ignored: it models a topk=1 chain, "
+                f"but speculative_eagle_topk={self.topk}."
+            )
+            return
+        if not self.server_args.speculative_adaptive:
+            logger.warning(
+                "SGLANG_SPEC_ADAPTIVE_CHAIN ignored: it needs --speculative-adaptive, "
+                "which builds the per-chain-length runtime states it selects between."
+            )
+            return
+
+        from sglang.srt.speculative.adaptive_spec_params import (
+            resolve_candidate_steps_from_config,
+        )
+
+        candidates = resolve_candidate_steps_from_config(
+            cfg_path=self.server_args.speculative_adaptive_config
+        )
+        k_max = max([*candidates, self.speculative_num_steps])
+        if k_max <= 1:
+            logger.warning(
+                f"SGLANG_SPEC_ADAPTIVE_CHAIN ignored: candidate steps {candidates} "
+                "leave no chain length to choose between."
+            )
+            return
+
+        self.survival_probe = SurvivalProbe(
+            max_bs=self._max_chain_bs(), k_max=k_max, device=self.device
+        )
+        logger.info(
+            f"[spec-adaptive] survival probe armed: k_max={k_max}, "
+            f"candidates={candidates}, max_bs={self.survival_probe.max_bs}"
+        )
 
     def init_token_map(self):
         # Load hot token ids
@@ -625,11 +758,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         # path (M21: before KV profiling; set_embed_and_head_modules calls
         # empty_cache so the profiler sees the released draft dupes).
         # Non-GGUF targets always have `.weight` and never take this branch.
-        if (
-            target_lm_head is not None
-            and not hasattr(target_lm_head, "weight")
-            and hasattr(target_lm_head, "qweight")
-        ):
+        _embed_module = getattr(getattr(target_model, "model", None), "embed_tokens", None)
+        if target_shares_vocab_modules(target_lm_head, _embed_module):
             draft_model = self.draft_runner.model
             if (
                 self.speculative_algorithm.is_eagle3()
@@ -637,8 +767,9 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 or not hasattr(draft_model, "set_embed_and_head_modules")
             ):
                 raise NotImplementedError(
-                    "GGUF quantized-resident lm_head requires a NEXTN/EAGLE "
-                    "draft supporting module-level sharing "
+                    "a target vocab module without a .weight tensor (GGUF "
+                    "quantized-resident lm_head, or a host-resident embedding) "
+                    "requires a NEXTN/EAGLE draft supporting module-level sharing "
                     "(set_embed_and_head_modules) and no hot-token vocab. "
                     "Set SGLANG_GGUF_DENSE_VOCAB=1 to restore the dense "
                     "lm_head path."
@@ -978,6 +1109,10 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 self.draft_runner,
                 self.topk,
                 self.speculative_num_steps,
+                seed_dsa_topk_from_draft_extend=self.seed_dsa_topk_from_draft_extend,
+                qsa_profile=parse_qsa_profile(
+                    self.draft_runner.model_config.hf_config
+                ),
             )
 
             # Initialize decode attention backend
@@ -991,7 +1126,57 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         self.draft_runner.draft_attn_backend = self.draft_attn_backend
         if self.draft_extend_attn_backend is not None:
             self.draft_runner.attn_backend = self.draft_extend_attn_backend
+        self._configure_qsa_mtp_index_share()
         self.tree_mask_mode = default_tree_mask_mode()
+
+    def _configure_qsa_mtp_index_share(self) -> None:
+        """Reuse the draft-extend QSA selection across the MTP decode steps;
+        chain speculation only: with topk > 1 decode rows are not request-major."""
+        from sglang.srt.layers.attention.qsa.qsa_indexer import QSAIndexer
+
+        hf_config = self.draft_runner.model_config.hf_config
+        if (
+            not _qsa_index_share_requested(hf_config)
+            or self.topk != 1
+            or self.speculative_num_steps <= 1
+            or not isinstance(self.draft_attn_backend, QwenSparseMultiStepDraftBackend)
+            or not isinstance(self.draft_extend_attn_backend, QwenSparseAttnBackend)
+        ):
+            return
+        if get_spec().speculative_adaptive:
+            # Adaptive speculation switches SpecRuntimeState between the draft-extend
+            # capture and the decode lookup; per-state index buffers would not match.
+            logger.warning(
+                "index_share_for_mtp_iteration is disabled under adaptive "
+                "speculative decoding"
+            )
+            return
+        layer_ids = sorted(
+            {
+                module.layer_id
+                for module in self.draft_runner.model.modules()
+                if isinstance(module, QSAIndexer)
+            }
+        )
+        if not layer_ids:
+            return
+        pool = self.draft_runner.token_to_kv_pool
+        # The expansion emits token_topk + ratio - 1 columns (top-k blocks
+        # plus the uncompressed tail of the capture position).
+        expanded_width = pool.qsa_token_topk + pool.qsa_compress_ratio - 1
+        state = QSAMTPSharedSparseIndices(
+            layer_ids=layer_ids,
+            num_requests=self.draft_runner.req_to_token_pool.req_to_token.shape[0],
+            token_topk=expanded_width,
+            tail_width=get_spec().speculative_num_steps + 1,
+            device=self.draft_runner.device,
+        )
+        for backend in (self.draft_attn_backend, self.draft_extend_attn_backend):
+            backend.set_mtp_shared_sparse_indices(state)
+        logger.info(
+            "QSA MTP index sharing enabled: draft decode steps reuse the "
+            f"draft-extend selection for layers {layer_ids}"
+        )
 
     def _capture_cuda_graphs(self):
         """Capture the draft worker's own cuda graphs (decode + draft-extend)."""
@@ -1073,6 +1258,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             TRTLLMHAAttnBackend,
             TokenspeedMLABackend,
             FlashInferAttnBackend,
+            QwenSparseAttnBackend,
         ]
         if _is_cuda or _is_musa:
             # DSA is CUDA-only; import lazily so non-CUDA builds don't pull in
@@ -1187,6 +1373,13 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             # the entire cross-rank traffic of the draft phase. The shadows
             # are blocked in _draft_solo_shadow on the matching broadcast.
             self._solo_send_draft_tokens(draft_tokens, batch.seq_lens.shape[0])
+
+        if self.survival_probe is not None:
+            # Non-blocking D2H; the value is picked up at the START of a later
+            # round (see EAGLEWorkerV2.activate_step_by_batch), never waited on.
+            self.survival_probe.start_readout(
+                forward_batch.batch_size, self.speculative_num_steps
+            )
 
         return self._finish_draft_tree(
             batch, draft_input, parent_list, top_scores_index, draft_tokens, draft_probs
@@ -1376,9 +1569,32 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 )
                 draft_probs_list.append(probs)
             elif self.topk == 1 and not _is_hip:
-                topk_index = torch.argmax(
-                    logits_output.next_token_logits, dim=-1, keepdim=True
-                )
+                if self.survival_probe is not None:
+                    # max() gives the same index argmax() does plus the logit,
+                    # so the confidence costs one extra logsumexp reduction and
+                    # no second pass over the logits. Graph-safe: the result
+                    # lands in the pre-allocated survival buffer, which is never
+                    # reallocated (see _init_adaptive_chain_probe).
+                    top1_logit, topk_index = logits_output.next_token_logits.max(
+                        dim=-1, keepdim=True
+                    )
+                    step_p = torch.exp(
+                        top1_logit.float()
+                        - torch.logsumexp(
+                            logits_output.next_token_logits.float(),
+                            dim=-1,
+                            keepdim=True,
+                        )
+                    )
+                    # Loop step i produces draft token i+2; token 1 came from
+                    # draft-extend and occupies column 0.
+                    self.survival_probe.write_step(
+                        i + 1, step_p, forward_batch.batch_size
+                    )
+                else:
+                    topk_index = torch.argmax(
+                        logits_output.next_token_logits, dim=-1, keepdim=True
+                    )
                 topk_p = torch.ones_like(topk_index, dtype=torch.float32)
             else:
                 probs = renorm_draft_probs(
@@ -1485,6 +1701,17 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
         # Draft-extend spec_info for the extend forward; carries only
         # hidden_states + shape info.
+        # SPEC_TRACE teacher forcing (fn4z 19.09.): logits for EVERY prompt
+        # row of a single-request extend, so the draft's argmax at row i can
+        # be scored against the true token i+2 before any verify machinery.
+        _tf_rows = 0
+        if (
+            _spec_trace_rounds() > 0
+            and not batch.forward_mode.is_idle()
+            and len(batch.extend_lens) == 1
+            and 2 < int(batch.extend_lens[0]) <= 2048
+        ):
+            _tf_rows = int(batch.extend_lens[0])
         batch.spec_info = EagleDraftExtendInput(
             hidden_states=target_hidden_states,
             # draft mode is same with decode mode, only 1 token per req
@@ -1503,6 +1730,18 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         batch.capture_hidden_mode = capture_hidden_mode
         forward_batch = ForwardBatch.init_new(batch, self.draft_runner)
         forward_batch.return_logprob = False
+        if _tf_rows:
+            # Input logprobs over every prompt row: the LogitsProcessor's own
+            # extend_return_logprob path (top-5 ids per row + logprob of the
+            # true next token); next_token_logits stays the last row.
+            truth = torch.cat(
+                [forward_batch.input_ids[1:_tf_rows], forward_batch.input_ids[-1:]]
+            ).long()
+            forward_batch.return_logprob = True
+            forward_batch.top_logprobs_nums = [5]
+            forward_batch.token_ids_logprobs = [None]
+            forward_batch.extend_logprob_start_lens_cpu = [0]
+            forward_batch.extend_input_logprob_token_ids_gpu = truth
         if mm_input_embeds is not None:
             forward_batch.mm_input_embeds = mm_input_embeds
 
@@ -1541,6 +1780,25 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             # forward above; everything below seeds a draft round this group
             # never runs. Return before any pick/broadcast.
             return None
+        if _tf_rows:
+            try:
+                idx = logits_output.input_top_logprobs_idx
+                idx = idx[0] if isinstance(idx, list) and len(idx) == 1 else idx
+                truth = forward_batch.input_ids[1:_tf_rows].tolist()
+                n = min(len(truth), len(idx))
+                top1 = sum(1 for r in range(n) if idx[r] and idx[r][0] == truth[r])
+                top5 = sum(1 for r in range(n) if idx[r] and truth[r] in idx[r][:5])
+                lp = logits_output.input_token_logprobs
+                lp_mean = float(lp[:n].float().mean().item()) if lp is not None else float("nan")
+                logger.info(
+                    "SPEC-TF draft-extend after prefill: rows=%d top1_agree=%.3f "
+                    "top5_agree=%.3f mean_logprob_truth=%.3f first12_top1=%s first12_truth=%s",
+                    n, top1 / max(n, 1), top5 / max(n, 1), lp_mean,
+                    [idx[r][0] if idx[r] else -1 for r in range(min(n, 12))], truth[:12],
+                )
+            except Exception as e:  # noqa: BLE001
+                logger.warning("SPEC-TF skipped: %s", e)
+            forward_batch.return_logprob = False
         maybe_detect_nan(logits_output.next_token_logits, "draft_extend_for_prefill")
         maybe_detect_inf(logits_output.next_token_logits, "draft_extend_for_prefill")
 
@@ -1730,9 +1988,28 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         elif self.topk == 1 and not _is_hip:
             # Gated to CUDA: see #26358 — ROCm's argmax tie-break corrupts
             # MTP draft selection on FP8 logits.
-            ret_topk_index = torch.argmax(
-                draft_logits_output.next_token_logits, dim=-1, keepdim=True
-            )
+            if self.survival_probe is not None:
+                # This samples the FIRST draft token of the next round, so its
+                # confidence is survival column 0. Runs outside the draft graph
+                # ("owned by the worker for both graph and eager paths" above),
+                # hence no graph constraint here — but it writes the same
+                # buffer the draft graph later reads column 0 from.
+                top1_logit, ret_topk_index = draft_logits_output.next_token_logits.max(
+                    dim=-1, keepdim=True
+                )
+                step_p = torch.exp(
+                    top1_logit.float()
+                    - torch.logsumexp(
+                        draft_logits_output.next_token_logits.float(),
+                        dim=-1,
+                        keepdim=True,
+                    )
+                )
+                self.survival_probe.write_step(0, step_p, step_p.shape[0])
+            else:
+                ret_topk_index = torch.argmax(
+                    draft_logits_output.next_token_logits, dim=-1, keepdim=True
+                )
             ret_topk_p = torch.ones_like(ret_topk_index, dtype=torch.float32)
             ret_draft_probs = None
         else:
@@ -1760,6 +2037,10 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             solo_single_rank=self._spec_solo_active,
             fuse=True,
         )
+        if _spec_trace_rounds() > 0:
+            self._spec_trace_top5 = torch.topk(
+                draft_logits_output.next_token_logits.float(), 5, dim=-1
+            ).indices
         ret_hidden_states = draft_logits_output.hidden_states
 
         # Construct the return values
@@ -1966,6 +2247,10 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 config_path=server_args.speculative_adaptive_config,
                 algorithm=server_args.speculative_algorithm,
             )
+        # Per-round chain-length policy; armed in init_cuda_graphs once the
+        # controller knows which chain lengths actually got a runtime state.
+        self.chain_policy: Optional[AdaptiveChainPolicy] = None
+        self.round_cost_probe: Optional[RoundCostProbe] = None
 
         # Some dummy tensors
         self.num_new_pages_per_topk = torch.empty(
@@ -2043,6 +2328,47 @@ class EAGLEWorkerV2(BaseSpecWorker):
                         else self.server_args.cuda_graph_bs_decode
                     ),
                 )
+            self._arm_chain_policy()
+
+    def _arm_chain_policy(self) -> None:
+        """Build the per-round policy over the chain lengths that got built.
+
+        Runs after ``init_states`` on purpose: the policy may only return a
+        chain length whose runtime state (draft + verify CUDA graphs) exists,
+        and that set is only known once the controller has built them.
+        """
+        if (
+            self._draft_worker.survival_probe is None
+            or self.adaptive_controller is None
+        ):
+            return
+        built = [s for s in self.adaptive_controller.built_steps if s >= 1]
+        if len(built) < 2:
+            logger.warning(
+                f"[spec-adaptive] chain policy not armed: runtime states {built} "
+                "leave nothing to choose between."
+            )
+            self._draft_worker.survival_probe = None
+            return
+
+        draft_ms, verify_ms = parse_cost_ms(
+            envs.SGLANG_SPEC_ADAPTIVE_CHAIN_COST_MS.get()
+        )
+        k_max = max(built)
+        self.chain_policy = AdaptiveChainPolicy(
+            k_max=k_max,
+            k_min=envs.SGLANG_SPEC_ADAPTIVE_CHAIN_MIN_STEPS.get(),
+            cost_model=ChainCostModel(
+                k_max=k_max, draft_ms=draft_ms, verify_ms=verify_ms
+            ),
+            log_every=envs.SGLANG_SPEC_ADAPTIVE_CHAIN_LOG_EVERY.get(),
+            candidates=built,
+        )
+        self.round_cost_probe = RoundCostProbe(device=self.device)
+        logger.info(
+            f"[spec-adaptive] chain policy armed: candidates={self.chain_policy.candidates}, "
+            f"k_min={self.chain_policy.k_min}, cost prior draft={draft_ms}ms verify={verify_ms}ms"
+        )
 
     @property
     def target_worker(self):
@@ -2206,6 +2532,9 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 return batch_output
         else:
             self.activate_step_by_batch(batch.seq_lens.shape[0])
+            if self.round_cost_probe is not None:
+                # Tag the measurement with the chain length just activated.
+                self.round_cost_probe.begin(self.speculative_num_steps)
 
             if batch.spec_info is None:
                 capture_mode = (
@@ -2307,6 +2636,8 @@ class EAGLEWorkerV2(BaseSpecWorker):
             # the cutover, or before the verify) would let an exception
             # between the two leave a request marked as bootstrapped while
             # its draft input is still the seed's zeros.
+            if self.round_cost_probe is not None:
+                self.round_cost_probe.end()
             return batch_output
 
     def _forward_spill_tick_spec(self, batch: ScheduleBatch, on_publish=None):
@@ -2544,8 +2875,37 @@ class EAGLEWorkerV2(BaseSpecWorker):
             )
 
     def activate_step_by_batch(self, batch_size: int) -> None:
-        if self.adaptive_controller is not None:
-            self.adaptive_controller.activate_step_by_batch(batch_size)
+        if self.adaptive_controller is None:
+            return
+        if self.chain_policy is not None and self._apply_chain_policy():
+            # The per-round survival policy owns the chain length while it is
+            # armed; running the batch-size EMA on top would have the two
+            # fight over the same runtime state within one round.
+            return
+        self.adaptive_controller.activate_step_by_batch(batch_size)
+
+    def _apply_chain_policy(self) -> bool:
+        """Pick this round's chain length from the last round's survival curve.
+
+        Returns True when the policy was consulted (whether or not the state
+        actually changed). False means no fresh curve had landed yet, so the
+        caller should fall back to the existing batch-size policy.
+        """
+        probe = self._draft_worker.survival_probe
+        if probe is None:
+            return False
+        if self.round_cost_probe is not None:
+            # Fold in whatever round timings have completed since last round.
+            self.round_cost_probe.drain(self.chain_policy.record_duration)
+        curve = probe.poll()
+        if curve is None:
+            # D2H not finished (or no draft ran). Never block on it: keeping
+            # the current chain length for one more round is strictly cheaper
+            # than a sync, and the next round will have the curve.
+            return False
+        self.chain_policy.record_survival(curve)
+        self.adaptive_controller.activate_steps(self.chain_policy.choose())
+        return True
 
     # -- Adaptive speculative decoding protocol --
 
@@ -2910,6 +3270,11 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 "accept_index@post_sample", accept_index, -1, predict.numel()
             )
         new_seq_lens = batch.seq_lens + accept_lens
+        if _spec_trace_rounds() > 0:
+            done = getattr(self, "_spec_trace_done", 0)
+            if done < _spec_trace_rounds():
+                self._spec_trace_done = done + 1
+                _log_spec_trace(self, verify_input, predict, accept_lens, accept_index)
         # Round 7b posten 0: the serving group's PER-POSITION acceptance, so it
         # can be put next to the lane's. Off unless the probe env is set, and
         # the D2H it costs is the reason -- a diagnostic must not price the

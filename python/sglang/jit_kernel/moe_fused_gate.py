@@ -136,9 +136,6 @@ def _router_triton_kernel(
         tl.float32
     )  # [BLOCK_N]
 
-    if USE_PDL:
-        tl.extra.cuda.gdc_wait()
-
     row_ptr = scores_ptr + offs_m[:, None] * stride_sm + offs_n[None, :] * stride_sn
     mask2d = mask_m[:, None] & mask_n[None, :]
     scores = tl.load(row_ptr, mask=mask2d, other=0.0).to(

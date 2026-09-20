@@ -4,6 +4,7 @@
 
 import logging
 import math
+import logging
 import threading
 from enum import Enum
 from functools import cached_property
@@ -104,6 +105,7 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 #: twice per layer, so the fast path never touches it and there is nothing to
 #: gain from a per-layer lock -- while a per-layer lock would itself need to be
 #: created by a check-then-build.
+logger = logging.getLogger(__name__)
 _GGUF_STREAM_LATCH_LOCK = threading.Lock()
 
 
@@ -335,6 +337,43 @@ def _warn_host_shard_unreachable_once() -> None:
     )
 
 
+def _expert_offload_fraction_for_layer(excluded: bool, resolve) -> float:
+    """The resident fraction this FusedMoE layer is sized with.
+
+    An offload-EXCLUDED layer (the NEXTN draft under
+    SGLANG_MOE_OFFLOAD_EXCLUDE_DRAFT=1) is fully resident and never consults
+    the per-rank vector: fn5j 19.09. -- under --speculative-draft-placement
+    solo the draft is built inside a tp_size=1 parallel override, and the
+    3-entry vector of the TP=3 target then fails the length check before the
+    exclusion ever applied."""
+    if excluded:
+        return 1.0
+    return resolve()
+
+
+def _offload_excludes_draft_layer(prefix: str) -> bool:
+    import os
+
+    if os.environ.get("SGLANG_MOE_OFFLOAD_EXCLUDE_DRAFT", "") != "1":
+        return False
+    prefix = str(prefix or "")
+    return prefix.startswith("mtp") or ".mtp." in prefix
+
+
+def expert_shard_generic_eligible(quant_config, plan_active, moe_ep_size, opt_in):
+    """WP3a expert-index shard eligibility: any non-GGUF weight format under
+    an active uneven plan, pure TP, opted in. UNQUANTIZED (quant_config None)
+    is eligible too -- fn4j 19.09.: the Qwen3.8-Flash-Next MTP draft ships its
+    512 experts in bf16, and excluding None left every rank REPLICATING all
+    of them (3.9 GB per rank, no room for the KV pool) while the target's
+    experts were split 312/104/96."""
+    if not (bool(plan_active) and int(moe_ep_size) == 1 and bool(opt_in)):
+        return False
+    if quant_config is not None and quant_config.get_name() == "gguf":
+        return False  # GGUF has its own (always-on) expert shard
+    return True
+
+
 class FusedMoE(torch.nn.Module):
     """FusedMoE layer for MoE models.
 
@@ -441,11 +480,28 @@ class FusedMoE(torch.nn.Module):
         # padding expert (see forward_impl remap + materialize), and the
         # existing reduce_results all-reduce combines the disjoint expert
         # contributions. Even TP and no-plan paths are untouched.
+        _plan_active = tp_plan_active(self.moe_tp_size, self.moe_tp_family)
+        # WP3a (Qwen3.8-Flash-Next, this line): the same expert-index shard
+        # for every other quant path (compressed-tensors/AWQ/GPTQ Marlin,
+        # fp8), opt-in via SGLANG_UNEVEN_MOE_EXPERT_SHARD=1. Whole experts
+        # per rank keep every Marlin tile intact where the intermediate cut
+        # (640 -> 384/128/128) would not, and give the per-rank offload its
+        # own expert set (residents by VRAM, cold traffic by link). Pad expert
+        # at LOCAL INDEX 0 so the static residency plan [0, R) always holds
+        # it; GGUF keeps its trailing pad (index n_local).
+        from sglang.srt.environ import envs as _envs
+
+        self._expert_shard_generic = expert_shard_generic_eligible(
+            quant_config,
+            _plan_active,
+            self.moe_ep_size,
+            _envs.SGLANG_UNEVEN_MOE_EXPERT_SHARD.get(),
+        )
         self._gguf_expert_shard = (
             quant_config is not None
             and quant_config.get_name() == "gguf"
-            and tp_plan_active(self.moe_tp_size, self.moe_tp_family)
-        )
+            and _plan_active
+        ) or self._expert_shard_generic
         if self._gguf_expert_shard:
             lo = tp_partition_offset(
                 self.num_experts,
@@ -468,10 +524,23 @@ class FusedMoE(torch.nn.Module):
             # otherwise partition the quant-block units (e.g. 512/256 = 2)
             # over the ranks and raise for 2 units < 3 ranks).
             self.moe_tp_units = self.num_experts
+            if self._expert_shard_generic:
+                if self._has_fused_shared:
+                    raise ValueError(
+                        "SGLANG_UNEVEN_MOE_EXPERT_SHARD does not support fused "
+                        "shared experts"
+                    )
+                # local layout: [pad(0), owned experts lo..hi-1 at 1..n_local]
+                self._expert_shard_pad_index = 0
+                self._expert_shard_owned = n_local
+                self._num_local_routed = n_local + 1
+                self.num_local_experts = n_local + 1
+                self._moe_offload_pinned_experts = [0]
             logging.getLogger(__name__).info(
-                "GGUF MoE uneven TP: expert-dim sharding active — rank %d "
+                "%s MoE uneven TP: expert-dim sharding active — rank %d "
                 "owns experts [%d, %d) of %d (full intermediate %d per "
                 "expert).",
+                "generic" if self._expert_shard_generic else "GGUF",
                 self.moe_tp_rank,
                 lo,
                 lo + n_local,
@@ -560,6 +629,13 @@ class FusedMoE(torch.nn.Module):
         )
 
         self.quant_method: Optional[FusedMoEMethodBase] = None
+        # The checkpoint prefix of this layer ("mtp.layers.0.mlp.experts" on
+        # an MTP draft): the residency machinery tells a draft layer from the
+        # target's by it (expert_offload.hotset_covers_layer).
+        self._sglang_prefix = prefix
+        # Decided BEFORE create_weights: the quant scheme reads it to keep the
+        # draft's expert stack on the card instead of the host presplit.
+        self._moe_offload_excluded = _offload_excludes_draft_layer(prefix)
         server_args = get_server_args()
         kt_config = create_kt_config_from_server_args(server_args, layer_id)
         if kt_config is not None:
@@ -626,21 +702,33 @@ class FusedMoE(torch.nn.Module):
         # latch point for the fraction every VRAM figure on this layer derives
         # from, which is why the #439 base-plan correction is applied here and
         # nowhere else.
-        self._expert_offload_fraction = resident_fraction_held_at_base_plan(
-            resident_fraction_for_rank(),
-            num_experts=self.num_experts,
-            num_local_experts=self.num_local_experts,
-            moe_tp_size=self.moe_tp_size,
-            moe_tp_rank=self.moe_tp_rank,
-            expert_sharded=self._gguf_expert_shard,
-            intermediate_size=intermediate_size,
-            intermediate_units=self.moe_tp_units,
+        self._expert_offload_fraction = _expert_offload_fraction_for_layer(
+            self._moe_offload_excluded,
+            lambda: resident_fraction_held_at_base_plan(
+                resident_fraction_for_rank(),
+                num_experts=self.num_experts,
+                num_local_experts=self.num_local_experts,
+                moe_tp_size=self.moe_tp_size,
+                moe_tp_rank=self.moe_tp_rank,
+                expert_sharded=self._gguf_expert_shard,
+                intermediate_size=intermediate_size,
+                intermediate_units=self.moe_tp_units,
+            ),
         )
         self._moe_offload_trace_path = envs.SGLANG_MOE_OFFLOAD_TRACE.get()
         self._moe_offload_enabled = self._expert_offload_fraction < 1.0 or bool(
             self._moe_offload_trace_path
         )
+        if self._moe_offload_enabled and self._moe_offload_excluded:
+            # SGLANG_MOE_OFFLOAD_EXCLUDE_DRAFT=1 (fn4x 19.09.): the NEXTN draft's
+            # experts stay fully resident (INT4 g32: 0.3-0.9 GB per rank) -- the
+            # A/B that tells the draft's offload path from the rest of its forward.
+            self._expert_offload_fraction = 1.0
+            self._moe_offload_enabled = False
         self._expert_offload = None  # MoEExpertOffloadCache, lazily installed
+        # WP8 lookahead: (next FusedMoE, predicted local ids) set by the MoE
+        # block right before this forward; consumed by exactly one forward.
+        self._lookahead_pending = None
         self._expert_offload_install_failed = False
         self._moe_offload_trace_step = 0
         # CUDA-graph guard -> MODE SWITCH (Stage-3). The eager offload path
@@ -666,8 +754,10 @@ class FusedMoE(torch.nn.Module):
         from sglang.srt.layers.moe.offload_capture_gate import (
             MODE_BREAKABLE,
             MODE_CAPTURABLE,
+            MODE_POOL,
             resolve_offload_graph_mode,
             validate_breakable_boot,
+            validate_pool_boot,
         )
 
         self._moe_offload_mode = resolve_offload_graph_mode(
@@ -677,6 +767,9 @@ class FusedMoE(torch.nn.Module):
         )
         self._moe_offload_graph_mode = self._moe_offload_mode == MODE_CAPTURABLE
         self._moe_offload_breakable = self._moe_offload_mode == MODE_BREAKABLE
+        self._moe_offload_pool = self._moe_offload_mode == MODE_POOL
+        if self._moe_offload_pool:
+            validate_pool_boot(self._expert_offload_fraction, self.layer_id)
         # Per-layer bridge-buffer registry for the breakable route; built on the
         # first captured forward, never on the default path.
         self._moe_offload_arena = None
@@ -687,7 +780,11 @@ class FusedMoE(torch.nn.Module):
                 _disable_cg = bool(get_server_args().disable_cuda_graph)
             except Exception:
                 _disable_cg = True  # server args not wired (unit/test context)
-            _graph_ok = self._moe_offload_graph_mode or self._moe_offload_breakable
+            _graph_ok = (
+                self._moe_offload_graph_mode
+                or self._moe_offload_breakable
+                or self._moe_offload_pool
+            )
             if not _disable_cg and not _graph_ok:
                 raise RuntimeError(
                     "MoE expert-offload / routing-trace "
@@ -937,6 +1034,16 @@ class FusedMoE(torch.nn.Module):
         back to the base plan); works for weight AND block-scale grids because
         moe_tp_units divides both -- that branch was already source-derived.
         """
+        if getattr(self, "_gguf_expert_shard", False):
+            # Expert-index shard (GGUF #82 / generic WP3a): a rank holds WHOLE
+            # experts, so along the intermediate dim every rank's shard starts
+            # at 0 and spans the full width; which experts it holds is decided
+            # by _map_global_expert_id_to_local_expert_id, not here. The plan
+            # partition below is over experts (moe_tp_units == num_experts) and
+            # must never be asked about an intermediate extent -- fn1n boot,
+            # 2026-09-16: "Dimension of size 80 is not a multiple of its unit
+            # count 512" out of _load_w2 on the packed 4-bit intermediate.
+            return 0
         if not tp_plan_active(self.moe_tp_size, self.moe_tp_family):
             tp_size = self.moe_tp_size
             # getattr: the attribute is always set on a real FusedMoE, but this
@@ -1150,6 +1257,11 @@ class FusedMoE(torch.nn.Module):
             expert_data.copy_(loaded_weight)
 
     def _map_global_expert_id_to_local_expert_id(self, expert_id: int) -> int:
+        if getattr(self, "_expert_shard_generic", False):
+            lo, hi = self._gguf_expert_range
+            if lo <= expert_id < hi:
+                return expert_id - lo + 1  # index 0 is the zero pad expert
+            return -1
         start_idx = self.moe_ep_rank * self._num_local_routed
         end_idx = start_idx + self._num_local_routed
         if start_idx <= expert_id < end_idx:
@@ -1198,6 +1310,7 @@ class FusedMoE(torch.nn.Module):
                 shard_id=shard_id,
                 expert_id=expert_id,
             )
+            self._ct_stream_note(param)
             return
 
         require_global_experts = getattr(param, "_sglang_require_global_experts", False)
@@ -1263,6 +1376,123 @@ class FusedMoE(torch.nn.Module):
             shard_id=shard_id,
             expert_id=expert_id,
         )
+        self._ct_stream_note(param)
+
+    # -- WP1 (Qwen3.8-Flash-Next): per-layer early presplit for the
+    # compressed-tensors WNA16 offload path ------------------------------
+    #
+    # The safetensors loader delivers EVERY layer's expert shards before the
+    # loader's own process_weights_after_loading pass runs, so with the host
+    # create_weights of CompressedTensorsWNA16MoE the full expert stack of
+    # the checkpoint (Qwen3.8-Flash-Next: 70 GB of INT4 experts) is resident
+    # in host RAM at once, and the pinned spill pool comes ON TOP of it --
+    # the #256 shape one level up. The GGUF path bounds this with per-expert
+    # streaming (#391c); the marlin repack works on stacked [E, ...] tensors,
+    # so this path bounds it per LAYER instead: the scheme arms a shard
+    # counter at create_weights, and the moment the last expected shard of
+    # this layer has landed, the repack + presplit run right here, from the
+    # loader thread, under the same device_loading_context the loader would
+    # use later. The layer's host copy is dropped (0-row placeholder + pinned
+    # spill), so the host peak is the spill pool plus the layers still in
+    # flight, not the whole checkpoint. The loader's later pass sees
+    # ``is_marlin_converted`` and is a no-op.
+
+    def _ct_stream_note(self, param) -> None:
+        state = getattr(self, "_ct_stream_presplit", None)
+        if state is None or state["done"]:
+            return
+        name = state["names"].get(id(param))
+        if name is None:
+            return
+        fire = False
+        with state["lock"]:
+            if state["done"]:
+                return
+            state["seen"][name] = state["seen"].get(name, 0) + 1
+            if all(
+                state["seen"].get(n, 0) >= want for n, want in state["expected"].items()
+            ):
+                state["done"] = True
+                fire = True
+        if fire:
+            self._ct_stream_presplit_now(state)
+
+    def _ct_stream_presplit_now(self, state) -> None:
+        import time
+
+        from sglang.srt.layers.moe.expert_offload import (
+            expert_offload_release_totals,
+        )
+        from sglang.srt.model_loader.loader import device_loading_context
+
+        import os as _os
+
+        _snap = _os.environ.get("SGLANG_CT_PRESPLIT_MEMSNAP", "")
+        if _snap and not getattr(FusedMoE, "_ct_memsnap_armed", False):
+            FusedMoE._ct_memsnap_armed = True
+            torch.cuda.memory._record_memory_history(max_entries=200000)
+        before = expert_offload_release_totals()
+        t0 = time.perf_counter()
+        with device_loading_context(self, state["device"]):
+            self.quant_method.process_weights_after_loading(self)
+        # The repack's [E] transients are freed but stay reserved in the
+        # caching allocator; hand them back so the next layer's copy-in and
+        # the KV pool are sized against real free memory, not the cache.
+        torch.cuda.empty_cache()
+        after = expert_offload_release_totals()
+        presplit = getattr(self, "_moe_offload_presplit", None) or {}
+        buf_bytes = sum(b.numel() * b.element_size() for b, _ in presplit.values())
+        rows = {a: tuple(b.shape) for a, (b, _) in presplit.items()}
+        logger.info(
+            "[ct-stream-presplit] layer %s: repack + presplit at load "
+            "(%.2f GiB of weight VRAM released, %.2f GiB to the pinned host "
+            "pool, %.1f s) | resident buffers %.2f GiB %s | torch allocated "
+            "%.2f GiB reserved %.2f GiB",
+            getattr(self, "layer_id", "?"),
+            (after.device_bytes - before.device_bytes) / 2**30,
+            (after.host_bytes - before.host_bytes) / 2**30,
+            time.perf_counter() - t0,
+            buf_bytes / 2**30,
+            rows,
+            torch.cuda.memory_allocated() / 2**30,
+            torch.cuda.memory_reserved() / 2**30,
+        )
+        if _snap and int(getattr(self, "layer_id", -1)) in (2, 6):
+            # OOM hunt (fn1g-fn1k): +1.17 GiB per presplit layer on the card
+            # while the resident buffers are 0.36 GiB. List the largest live
+            # CUDA tensors of the process with the attribute names that hold
+            # them; the allocator snapshot had no frames for them.
+            import gc as _gc
+
+            _gc.collect()
+            rows = []
+            seen = set()
+            for obj in _gc.get_objects():
+                try:
+                    if not torch.is_tensor(obj) or not obj.is_cuda:
+                        continue
+                    nb = obj.numel() * obj.element_size()
+                    if nb < 32 * 2**20 or (obj.data_ptr(), nb) in seen:
+                        continue
+                    seen.add((obj.data_ptr(), nb))
+                    names = []
+                    for r in _gc.get_referrers(obj):
+                        if isinstance(r, dict):
+                            names += [str(k) for k, v in r.items() if v is obj][:2]
+                        elif isinstance(r, torch.nn.Parameter):
+                            names.append("Parameter")
+                    rows.append((nb, tuple(obj.shape), str(obj.dtype), names[:4]))
+                except Exception:
+                    continue
+            rows.sort(reverse=True)
+            logger.info(
+                "[ct-stream-presplit] layer %s live CUDA tensors >32 MiB: %d, "
+                "sum %.2f GiB; top: %s",
+                getattr(self, "layer_id", "?"),
+                len(rows),
+                sum(r[0] for r in rows) / 2**30,
+                "; ".join(f"{nb/2**20:.0f}MiB{shape}{dt}{names}" for nb, shape, dt, names in rows[:14]),
+            )
 
     def _load_gguf_weight(
         self,
@@ -1714,6 +1944,15 @@ class FusedMoE(torch.nn.Module):
 
             clear_mxfp8_shuffle_index_cache()
 
+        # Line fix (Qwen3.8-Flash-Next AWQ, asymmetric compressed-tensors MoE):
+        # upstream left the zero points untransposed ("zero" not in name).
+        # llm-compressor stores them flipped like the packed weights --
+        # measured on the cyankiwi checkpoint: down_proj.weight_zero_point
+        # [320, 20] = [out/pack, groups], gate/up [80, 80] -- while
+        # create_weights lays the param out as [E, groups, out/pack] and
+        # moe_awq_to_marlin_zero_points reads it that way. Untransposed, w2
+        # died on the shape ("320 vs 20") and w13 (square) would have loaded
+        # silently wrong. So the zero points take the same transpose.
         loaded_weight = (
             loaded_weight.t().contiguous()
             if (
@@ -1724,7 +1963,6 @@ class FusedMoE(torch.nn.Module):
                     "CompressedTensorsWNA16TritonMoE",
                 ]
             )
-            and "zero" not in weight_name
             else loaded_weight
         )
 
@@ -2080,12 +2318,14 @@ class FusedMoE(torch.nn.Module):
         assert self.quant_method is not None
 
         if getattr(self, "_gguf_expert_shard", False):
-            # Uneven-TP GGUF MoE (expert-dim sharding): translate the
-            # GLOBAL topk expert ids to this rank's LOCAL ids; foreign
-            # experts map to the trailing all-zero padding expert, so their
+            # Uneven-TP expert-dim sharding (GGUF #82 / generic WP3a):
+            # translate the GLOBAL topk expert ids to this rank's LOCAL ids;
+            # foreign experts map to the all-zero padding expert, so their
             # local contribution is exactly 0 and the TP all-reduce sums
             # the true per-owner contributions. Routing (replicated router
             # + identical softmax/topk) is byte-identical on every rank.
+            if not hasattr(self, "_gguf_topk_remap"):
+                self._build_expert_shard_topk_remap()
             assert TopKOutputChecker.format_is_standard(topk_output)
             topk_output = topk_output._replace(
                 topk_ids=self._gguf_topk_remap[topk_output.topk_ids.long()]
@@ -2165,6 +2405,8 @@ class FusedMoE(torch.nn.Module):
             return _apply(dispatch_output)
 
         topk_ids = topk_output.topk_ids
+        if self._expert_offload is None or self._expert_offload_fraction >= 1.0:
+            self._lookahead_pending = None  # nothing to prefetch into yet / ever
 
         from sglang.srt.model_executor.runner_utils.capture_mode import (
             get_is_capture_mode,
@@ -2203,6 +2445,7 @@ class FusedMoE(torch.nn.Module):
         # requires --cuda-graph-backend-prefill=disabled), so prefill forwards
         # fall through to run_waves and keep their wave splitting.
         if self._moe_offload_breakable and get_is_capture_mode():
+            self._drop_lookahead()
             return self._run_moe_core_offload_breakable(
                 dispatch_output, topk_output, topk_ids, _apply
             )
@@ -2212,14 +2455,95 @@ class FusedMoE(torch.nn.Module):
         # gather + a SINGLE-wave apply. Everything else (prefill, eager decode,
         # buckets beyond the captured sizes) keeps run_waves.
         if self._moe_offload_graph_mode and get_is_capture_mode():
+            self._drop_lookahead()
             return self._run_moe_core_offload_capturable(
                 dispatch_output, topk_output, topk_ids, _apply
             )
 
+        # 19.09. device-planned pool (vLLM #56177 port): under the full decode
+        # graph the step plans, copies the misses and remaps on the device;
+        # an eager forward (prefill, uncaptured shapes) keeps run_waves and
+        # republishes its scratch occupancy to the device tables afterwards.
+        if getattr(self, "_moe_offload_pool", False):
+            cache = self._expert_offload
+            if get_is_capture_mode():
+                self._drop_lookahead()
+                remapped = cache.prepare_pool(topk_ids)
+                sub = dispatch_output._replace(
+                    topk_output=topk_output._replace(topk_ids=remapped)
+                )
+                return _apply(sub)
+            cache.begin_eager_pool()
+            out = cache.run_waves(dispatch_output, _apply, lookahead=None)
+            cache.sync_pool_from_host()
+            return out
+
         # run_waves handles both the single-wave decode fast path (one apply over
         # the full batch) and the multi-wave prefill-overflow path (disjoint
         # token subsets, each fully computed once -> byte-identical accumulation).
-        return self._expert_offload.run_waves(dispatch_output, _apply)
+        return self._expert_offload.run_waves(
+            dispatch_output, _apply, lookahead=self._take_lookahead()
+        )
+
+    def pool_prefetch_local_ids(self, predicted_global_ids):
+        """Translate a router prediction (GLOBAL expert ids) into this rank's
+        LOCAL pool ids, with everything this rank does not own marked -1.
+
+        Same translation the real path applies in ``forward_local`` -- the
+        static ``_gguf_topk_remap`` table, plain indexing, CUDA-graph safe --
+        plus one step the real path must NOT take: the remap sends every
+        foreign expert to the all-zero PAD slot so its contribution is exactly
+        0, and prefetching the pad row would spend an LRU slot on a row that is
+        resident-by-construction and never read from host. The pad becomes -1,
+        which the pool step treats as padding and skips."""
+        import torch
+
+        if not getattr(self, "_gguf_expert_shard", False):
+            return predicted_global_ids
+        if not hasattr(self, "_gguf_topk_remap"):
+            self._build_expert_shard_topk_remap()
+        local = self._gguf_topk_remap[predicted_global_ids.long()]
+        lo, hi = self._gguf_expert_range
+        pad = 0 if getattr(self, "_expert_shard_generic", False) else (hi - lo)
+        return torch.where(
+            local == pad, torch.full_like(local, -1), local
+        )
+
+    def pool_prefetch(self, predicted_global_ids) -> bool:
+        """Issue the speculative prefetch for THIS layer's pool with the ids a
+        previous layer's forward predicted. Returns True when it was issued."""
+        from sglang.srt.layers.moe.expert_offload import pool_prefetch_enabled
+
+        cache = self._expert_offload
+        if (
+            cache is None
+            or not getattr(self, "_moe_offload_pool", False)
+            or not pool_prefetch_enabled()
+        ):
+            return False
+        return bool(cache.prefetch_pool(self.pool_prefetch_local_ids(predicted_global_ids)))
+
+    def set_lookahead(self, next_layer, predicted_local_ids):
+        """WP8: hand this forward the LATER layer's offload target and the
+        expert ids its router predicted on the current stream (this rank's
+        local ids). Consumed by the next run_moe_core; a route that cannot use
+        it drops it and counts the drop."""
+        self._lookahead_pending = (next_layer, predicted_local_ids)
+
+    def _take_lookahead(self):
+        pending = self._lookahead_pending
+        if pending is None:
+            return None
+        self._lookahead_pending = None
+        next_layer, pred = pending
+        return (getattr(next_layer, "_expert_offload", None), pred)
+
+    def _drop_lookahead(self):
+        if self._lookahead_pending is not None:
+            self._lookahead_pending = None
+            cache = self._expert_offload
+            if cache is not None:
+                cache.planner.stats.lookahead_dropped += 1
 
     def _run_moe_core_offload_breakable(
         self, dispatch_output, topk_output, topk_ids, apply_fn
@@ -2822,26 +3146,51 @@ class FusedMoE(torch.nn.Module):
         if getattr(self, "_gguf_expert_shard", False) and not hasattr(
             self, "_gguf_topk_remap"
         ):
-            # Global -> local expert id translation for forward_impl:
-            # owned experts map to their local slot (global order), all
-            # foreign experts map to the zero padding expert (index
-            # n_local). Lives on the weights' device; plain indexing, so
-            # CUDA-graph safe.
-            lo, hi = self._gguf_expert_range
-            n_local = hi - lo
-            device = next(
-                (
-                    p.device
-                    for p in self.parameters()
-                    if not isinstance(p, UninitializedParameter)
-                ),
-                torch.device("cuda"),
-            )
+            self._build_expert_shard_topk_remap()
+
+    def _build_expert_shard_topk_remap(self) -> None:
+        """Global -> local expert id translation for forward_local.
+
+        Owned experts map to their local slot, every foreign expert to the
+        zero padding expert: index n_local (trailing, GGUF #82) or index 0
+        (leading, generic shard), so its contribution is exactly 0 and the TP
+        all-reduce sums the true per-owner contributions. Lives on the
+        weights' device; plain indexing, so CUDA-graph safe.
+        """
+        lo, hi = self._gguf_expert_range
+        n_local = hi - lo
+        device = next(
+            (
+                p.device
+                for p in self.parameters()
+                if not isinstance(p, UninitializedParameter)
+            ),
+            torch.device("cuda"),
+        )
+        if getattr(self, "_expert_shard_generic", False):
+            remap = torch.zeros((self.num_experts,), dtype=torch.int32, device=device)
+            remap[lo:hi] = torch.arange(1, n_local + 1, dtype=torch.int32, device=device)
+        else:
             remap = torch.full(
                 (self.num_experts,), n_local, dtype=torch.int32, device=device
             )
             remap[lo:hi] = torch.arange(n_local, dtype=torch.int32, device=device)
-            self._gguf_topk_remap = remap
+        self._gguf_topk_remap = remap
+
+    def zero_expert_shard_pad(self) -> None:
+        """Generic expert shard: make the pad expert (local index 0) contribute
+        exactly 0 -- zero every expert-major parameter's row 0 (group scales at
+        0 make the dequantized weight 0 whatever the packed payload). Called by
+        the quant scheme BEFORE its repack; idempotent."""
+        pad = getattr(self, "_expert_shard_pad_index", None)
+        if pad is None or getattr(self, "_expert_shard_pad_zeroed", False):
+            return
+        n = int(self.num_local_experts)
+        for name, p in self.named_parameters():
+            t = p.data
+            if t.dim() >= 1 and t.shape[0] == n and t.numel():
+                t[pad].zero_()
+        self._expert_shard_pad_zeroed = True
 
 
 @register_custom_op(out_shape="hidden_states")

@@ -824,6 +824,81 @@ def prepare_mamba_track_for_verify(batch: ScheduleBatch) -> None:
     batch.mamba_track_seqlens = None
 
 
+def mamba_track_grid(tree_page: int) -> int:
+    """#37500 port of runtime_context.mamba_track_grid: the granularity a
+    decode-donated mamba checkpoint must land on -- the tree page, the mamba
+    cache chunk and the requested track interval, all at once."""
+    import math
+
+    from sglang.srt.runtime_context import get_server_args
+
+    sa = get_server_args()
+    grid = math.lcm(int(tree_page), int(sa.mamba_cache_chunk_size))
+    return math.lcm(grid, int(getattr(sa, "mamba_track_interval", 1) or 1))
+
+
+def _verify_commit_step_indices(
+    *,
+    batch: ScheduleBatch,
+    accept_index: torch.Tensor,
+    accept_lens: torch.Tensor,
+    draft_token_num: int,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """Step indices for a post-verify state commit: per req, the tree step of
+    the last accepted node (reduces to accept_lens - 1 for topk == 1), and the
+    mamba-track interval-crossing step (-1 = no crossing; None when tracking
+    is off)."""
+    bs = accept_lens.shape[0]
+    if accept_index.is_cuda:
+        from sglang.srt.layers.attention.mamba.mamba_state_scatter_triton import (
+            fused_commit_track_indices,
+        )
+
+        track_grid = (
+            mamba_track_grid(batch.tree_cache.page_size)
+            if batch.mamba_track_indices is not None
+            else 0
+        )
+        return fused_commit_track_indices(
+            accept_index,
+            accept_lens,
+            batch.seq_lens if track_grid > 0 else None,
+            draft_token_num,
+            track_grid,
+        )
+    accept_indices_offset = torch.arange(
+        0,
+        bs * draft_token_num,
+        step=draft_token_num,
+        dtype=accept_lens.dtype,
+        device=accept_lens.device,
+    )
+    req_idx = torch.arange(bs, dtype=torch.int64, device=accept_lens.device)
+    last_correct_step_indices = (
+        accept_index[req_idx, (accept_lens - 1).to(torch.int64)] - accept_indices_offset
+    )
+    if batch.mamba_track_indices is None:
+        return last_correct_step_indices, None
+    seq_lens_pre_verify = batch.seq_lens
+    seq_lens_post_verify = batch.seq_lens + accept_lens
+    mamba_track_interval = mamba_track_grid(batch.tree_cache.page_size)
+    to_track_mask = (
+        seq_lens_pre_verify // mamba_track_interval
+        != seq_lens_post_verify // mamba_track_interval
+    )
+    tracking_point = seq_lens_post_verify // mamba_track_interval * mamba_track_interval
+    to_track_ith = torch.clamp(tracking_point - seq_lens_pre_verify - 1, min=0).to(
+        torch.int64
+    )
+    candidate_track_steps = accept_index[req_idx, to_track_ith] - accept_indices_offset
+    mamba_steps_to_track = torch.where(
+        to_track_mask,
+        candidate_track_steps,
+        torch.full_like(candidate_track_steps, -1),
+    )
+    return last_correct_step_indices, mamba_steps_to_track
+
+
 def commit_mamba_states_after_verify(
     target_worker: TpModelWorker,
     batch: ScheduleBatch,

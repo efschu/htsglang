@@ -5,6 +5,9 @@
 import logging
 from typing import Callable, Optional
 
+import math
+from fractions import Fraction
+
 import torch
 from compressed_tensors.quantization import ActivationOrdering
 
@@ -60,6 +63,84 @@ WNA16_ZP_SUPPORTED_TYPES_MAP = {4: scalar_types.uint4, 8: scalar_types.uint8}
 WNA16_SUPPORTED_BITS = list(WNA16_SUPPORTED_TYPES_MAP.keys())
 
 
+def dequantize_pack_quantized_weight(
+    packed: torch.Tensor, scale: torch.Tensor, shape: torch.Size
+) -> torch.Tensor:
+    """Dense float weight of a compressed-tensors ``pack-quantized`` linear
+    (symmetric, group strategy, ``packed_dim=1``): ``packed`` is int32
+    ``[out, in/pack_factor]``, ``scale`` is ``[out, in/group]``. Used for the
+    handful of layers this line keeps as plain ``nn.Linear`` (the
+    hyper-connection mixers, a few MB each) -- their bits are read from the
+    checkpoint as they are and widened to the module dtype at load time."""
+    from compressed_tensors.compressors.pack_quantized.helpers import unpack_from_int32
+
+    out_features, in_features = int(shape[0]), int(shape[1])
+    if packed.dtype != torch.int32 or packed.dim() != 2 or packed.shape[0] != out_features:
+        raise ValueError(
+            f"pack-quantized weight: packed {tuple(packed.shape)} {packed.dtype} "
+            f"does not fit a [{out_features}, {in_features}] weight"
+        )
+    if in_features % packed.shape[1] != 0 or 32 % (in_features // packed.shape[1]) != 0:
+        raise ValueError(
+            f"pack-quantized weight: {in_features} inputs in {packed.shape[1]} "
+            "int32 columns is no whole pack factor"
+        )
+    num_bits = 32 // (in_features // packed.shape[1])
+    if scale.dim() != 2 or scale.shape[0] != out_features or in_features % scale.shape[1] != 0:
+        raise ValueError(
+            f"pack-quantized weight: scale {tuple(scale.shape)} does not fit "
+            f"[{out_features}, {in_features}]"
+        )
+    group = in_features // scale.shape[1]
+    q = unpack_from_int32(packed, num_bits, torch.Size((out_features, in_features)))
+    dense = q.view(out_features, scale.shape[1], group).to(torch.float32) * scale.to(
+        torch.float32
+    ).unsqueeze(-1)
+    return dense.view(out_features, in_features)
+
+
+def unpack_dense_subbyte(packed: torch.Tensor, bits: int, n_elems: int) -> torch.Tensor:
+    """Unpack a dense little-endian bitstream of ``bits``-wide unsigned values
+    (compressed-tensors ``pack-quantized`` for 32 % bits != 0) into int32.
+
+    ``packed`` is [rows, ceil(n_elems*bits/32)] int32; element e occupies bits
+    [e*bits, e*bits+bits) of the row's bitstream, so a value may straddle two
+    words. Returns [rows, n_elems] int32 in [0, 2**bits).
+    """
+    rows, words = packed.shape
+    w = packed.to(torch.int64) & 0xFFFFFFFF
+    e = torch.arange(n_elems, device=packed.device, dtype=torch.int64)
+    bit0 = e * bits
+    word = bit0 // 32
+    shift = bit0 % 32
+    mask = (1 << bits) - 1
+    lo = (w[:, word] >> shift) & mask
+    # bits that spill into the next word (shift + bits > 32)
+    spill = shift + bits - 32
+    has_spill = spill > 0
+    nxt = torch.clamp(word + 1, max=words - 1)
+    hi = (w[:, nxt] << (bits - spill.clamp(min=0))) & mask
+    hi = torch.where(has_spill.unsqueeze(0), hi, torch.zeros_like(hi))
+    return ((lo | hi) & mask).to(torch.int32)
+
+
+def widen_dense_packed_to_8bit(
+    packed: torch.Tensor, src_bits: int, in_features: int
+) -> torch.Tensor:
+    """Lossless widening of a dense ``src_bits`` packing to the 8-bit
+    compressed-tensors packing (4 values per int32, little-endian, unsigned
+    with offset 128): q_signed = raw - 2**(src_bits-1); stored8 = q_signed + 128.
+    The group scales are unchanged (value = q_signed * scale)."""
+    rows = packed.shape[0]
+    raw = unpack_dense_subbyte(packed, src_bits, in_features)
+    q8 = raw - (1 << (src_bits - 1)) + 128  # in [96, 159] for 6 bit
+    assert in_features % 4 == 0
+    q8 = q8.view(rows, in_features // 4, 4).to(torch.int64)
+    shifts = torch.arange(4, device=packed.device, dtype=torch.int64) * 8
+    out = (q8 << shifts).sum(dim=2)
+    return out.to(torch.int32)
+
+
 class CompressedTensorsWNA16(CompressedTensorsLinearScheme):
     _kernel_backends_being_used: set[str] = set()
 
@@ -70,7 +151,24 @@ class CompressedTensorsWNA16(CompressedTensorsLinearScheme):
                  symmetric: Optional[bool] = True,
                  actorder: Optional[ActivationOrdering] = None):
 
-        self.pack_factor = 32 // num_bits
+        # Line extension (Qwen3.8-Flash-Next, Minachist INT4/INT6 mixed): a
+        # symmetric 6-bit group checkpoint is loaded in its dense
+        # compressed-tensors packing (32/6 values per int32, little-endian
+        # bitstream; measured on the checkpoint: [10240, 480] for 2560
+        # inputs) and WIDENED to 8 bit at process_weights_after_loading --
+        # lossless (q in [-32, 31] keeps its scale) -- so the existing 8-bit
+        # Marlin (uint8b128) path computes it. User order 16.09.2026: no
+        # checkpoint rewrite, compute on the int8-capable kernels.
+        self.src_num_bits = num_bits
+        if num_bits == 6:
+            if not symmetric:
+                raise ValueError("6-bit compressed-tensors: only symmetric is supported")
+            num_bits = 8
+        self.pack_factor = (
+            Fraction(32, self.src_num_bits)
+            if 32 % self.src_num_bits
+            else 32 // self.src_num_bits
+        )
         self.strategy = strategy
         self.symmetric = symmetric
         self.group_size = -1 if group_size is None else group_size
@@ -128,6 +226,9 @@ class CompressedTensorsWNA16(CompressedTensorsLinearScheme):
             assert input_size_per_partition % group_size == 0
             scales_and_zp_size = input_size_per_partition // group_size
 
+        # dense packing: ceil(in * bits / 32) int32 words per row (== in //
+        # pack_factor for 4/8 bit, where 32 % bits == 0)
+        packed_input_dim = math.ceil(input_size_per_partition * self.src_num_bits / 32)
         weight = PackedvLLMParameter(input_dim=1,
                                      output_dim=0,
                                      weight_loader=weight_loader,
@@ -135,8 +236,7 @@ class CompressedTensorsWNA16(CompressedTensorsLinearScheme):
                                      packed_dim=1,
                                      data=torch.empty(
                                          output_size_per_partition,
-                                         input_size_per_partition //
-                                         self.pack_factor,
+                                         packed_input_dim,
                                          dtype=torch.int32,
                                      ))
 
@@ -243,6 +343,17 @@ class CompressedTensorsWNA16(CompressedTensorsLinearScheme):
                 replace_parameter(
                     layer, name, torch.nn.Parameter(new_param.data, requires_grad=False)
                 )
+
+        if self.src_num_bits != c.weight_type.size_bits:
+            # widen the dense sub-byte packing to the kernel's 8-bit packing
+            wp = getattr(layer, self.w_q_name)
+            wp.data = widen_dense_packed_to_8bit(
+                wp.data,
+                src_bits=self.src_num_bits,
+                in_features=c.partition_weight_shape[0],
+            )
+            if hasattr(wp, "_packed_factor"):
+                wp._packed_factor = 4
 
         def transform_w_q(x):
             assert isinstance(x, BasevLLMParameter)

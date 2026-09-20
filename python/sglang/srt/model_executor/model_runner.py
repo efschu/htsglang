@@ -1123,6 +1123,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             extra={"draft_worker": bool(self.is_draft_worker)},
         )
         self._attach_layer_fingerprint()
+        from sglang.srt.model_executor.graph_eager_check import maybe_attach as _gec_attach
+
+        self._graph_eager_check = _gec_attach(self)
         self._prepare_moe_topk()
 
         # Must run before backend/graph init so no draft graph records a
@@ -2348,6 +2351,56 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 self.tp_rank,
             )
 
+        # #37500 port (load_model_utils hunk): the PLE n-gram table offload
+        # flag is read by the model off its text config; only Qwen4-Exp has
+        # such a table, and generic layer offload would stage the pinned
+        # table back to the device.
+        if not self.is_draft_worker:
+            _archs = self.model_config.hf_config.architectures or []
+            _is_qwen4_exp = "Qwen4ExpForConditionalGeneration" in _archs
+            _ple = getattr(self.server_args, "ple_offload_embedding", None)
+            if _ple and not _is_qwen4_exp:
+                raise ValueError(
+                    "--ple-offload-embedding only supports "
+                    "Qwen4ExpForConditionalGeneration"
+                )
+            if _ple and (
+                int(getattr(self.server_args, "cpu_offload_gb", 0) or 0) > 0
+                or int(getattr(self.server_args, "offload_group_size", -1) or -1) > 0
+            ):
+                raise ValueError(
+                    "--ple-offload-embedding cannot be combined with "
+                    "--cpu-offload-gb or --offload-group-size: generic layer "
+                    "offload would stage the pinned PLE embedding back to the device."
+                )
+            _ple_backend = getattr(self.server_args, "ple_offload_backend", "pinned")
+            if _ple_backend == "file" and _ple is False:
+                raise ValueError(
+                    "--ple-offload-backend file requires --ple-offload-embedding: "
+                    "the file-backed table is the offloaded table."
+                )
+            if _is_qwen4_exp:
+                _tc = self.model_config.hf_text_config
+                _tc.ple_offload_embedding = bool(_ple)
+                _tc.ple_offload_backend = _ple_backend
+                _ple_dir = getattr(self.server_args, "ple_offload_dir", None)
+                if _ple_backend == "file":
+                    from sglang.srt.models.qwen4_exp_ple_table import (
+                        check_file_backend_supported,
+                        default_ple_table_dir,
+                    )
+
+                    _ple_dir = _ple_dir or default_ple_table_dir(
+                        self.server_args.model_path
+                    )
+                    if _ple and self.device == "cuda":
+                        check_file_backend_supported(
+                            torch.cuda.current_device()
+                            if torch.cuda.is_available()
+                            else 0
+                        )
+                _tc.ple_offload_dir = _ple_dir
+
         # This can reduce thread conflicts and speed up weight loading.
         if self.device != "cpu":
             torch.set_num_threads(1)
@@ -2715,6 +2768,21 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             f"avail mem={after_avail_memory:.2f} GB, "
             f"mem usage={self.weight_load_mem_usage:.2f} GB."
         )
+
+        # 19.09.: VRAM bytes by tensor family, measured off the tensors
+        try:
+            from sglang.srt.model_executor.vram_family_census import (
+                log_vram_family_census,
+            )
+
+            log_vram_family_census(
+                self.model,
+                f"pp{self.pp_rank}tp{self.tp_rank}"
+                + ("-draft" if self.is_draft_worker else ""),
+                "after load",
+            )
+        except Exception as exc:  # noqa: BLE001 -- a census never kills a boot
+            logger.debug("[vram-census] skipped: %s", exc)
 
         # #644: end-of-load host-anon discriminator. Off unless
         # SGLANG_644_DISCRIMINATOR is set; the answer it produces (references
@@ -4645,6 +4713,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if self.enable_elastic_ep:
             self.maybe_recover_ep_ranks()
 
+        # 19.09.: [vram-peak] once per kind -- the measured transient
+        try:
+            from sglang.srt.model_executor.vram_family_census import maybe_log_vram_peak
+
+            maybe_log_vram_peak(self, forward_batch)
+        except Exception as exc:  # noqa: BLE001 -- an instrument never kills a forward
+            logger.debug("[vram-peak] skipped: %s", exc)
+
         return output
 
     def _maybe_execute_deferred_mamba_cow_and_clear(
@@ -5004,6 +5080,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
             # Replay cuda graph if applicable
             if can_run_graph:
+                _gec = getattr(self, "_graph_eager_check", None)
+                if _gec is not None:
+                    _gec.before_graph(forward_batch)
                 # #1241. The bracket sits AROUND the replay, on the same
                 # stream, so the round's device time is measured even though
                 # the collectives inside the replay are unobservable. That
@@ -5020,6 +5099,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                         forward_batch,
                         pp_proxy_tensors=pp_proxy_tensors,
                     )
+                _gec = getattr(self, "_graph_eager_check", None)
+                if _gec is not None:
+                    _gec.after_graph(forward_batch, ret)
                 return ModelRunnerOutput(logits_output=ret, can_run_graph=can_run_graph)
 
             # DP / MLP-sync padding + attn-tp normalization. Only the decode

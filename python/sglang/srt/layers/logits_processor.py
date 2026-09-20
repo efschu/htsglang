@@ -92,6 +92,18 @@ def should_apply_lm_head_quant_method(lm_head, quant_method) -> bool:
         and callable(getattr(quant_method, "apply", None))
     ):
         return True
+    # compressed-tensors pack-quantized lm_head (Marlin linear scheme on a
+    # ParallelLMHead): the parameter is ``weight_packed``, there is no
+    # ``.weight``; the method's apply computes the logits from the packed
+    # bytes. Checked before the generic ``.weight`` gate for the same reason
+    # the GGUF branch above is.
+    if (
+        quant_method is not None
+        and hasattr(lm_head, "weight_packed")
+        and not hasattr(lm_head, "weight")
+        and callable(getattr(quant_method, "apply", None))
+    ):
+        return True
     if (
         quant_method is None
         or not hasattr(lm_head, "weight")

@@ -297,6 +297,9 @@ def _gguf_layer(num_owned=E, expert_shard=False, declared_w2_type=None):
         _GGUF_SHARD_TO_ATTR = FusedMoE._GGUF_SHARD_TO_ATTR
         _drain_gguf_stream_stagers = FusedMoE._drain_gguf_stream_stagers
         _gguf_cold_shard_context = FusedMoE._gguf_cold_shard_context
+        # WP3a: materialize builds the topk remap through this method now.
+        _build_expert_shard_topk_remap = FusedMoE._build_expert_shard_topk_remap
+        zero_expert_shard_pad = FusedMoE.zero_expert_shard_pad
 
     layer = _StubGGUFMoELayer()
     layer.layer_id = 7

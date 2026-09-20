@@ -855,6 +855,161 @@ __global__ void bar1_mesh_kernel(Bar1Args A)
 }
 
 // ---------------------------------------------------------------------------
+// TOPOLOGY 'oneshot' -- small payloads only (Task #53, 20.09.).
+//
+// The decode round of Qwen3.8 Next Flash issues 98 all_reduces of 24 KB each;
+// measured in the graph-replayed round (collective clock, fn8v) the mesh
+// costs 88 us apiece = 8.6 ms of a 34.5 ms round. For such a payload the
+// mesh's reduce-scatter + allgather is two barriers for chunks of 427 float4
+// -- the barriers, not the bytes, are the price. This kernel does what the
+// probe's 'symmetric' variant did: every rank sends its WHOLE contribution
+// to every peer, ONE barrier, then reduces locally over own + R-1 received.
+// Bytes on the wire: (R-1)*nbytes per rank instead of 2*(R-1)*nbytes/R -- for
+// R=3 that is 2x the mesh's traffic, irrelevant at 24 KB, which is why the
+// Python side caps this algorithm at SGLANG_BARLINK_BAR1_ONESHOT_MAX.
+//
+// SLOTS: the mesh's RS slot of each peer (chunk_max bytes) carries the full
+// payload; the wrapper refuses nbytes > chunk_max. The AG slots and the
+// phase-1 flags stay unused. The #622 entry acknowledgment is kept
+// unchanged: the RS slot is overwritten on the next call, and the peer must
+// have read it -- same hazard, same fix, same ack bank.
+// ---------------------------------------------------------------------------
+template<typename T, int LA, int FLUSH, int GRID>
+__global__ void bar1_oneshot_kernel(Bar1Args A)
+{
+    const int tid = (GRID == K_GRID)
+                        ? (int)(blockIdx.x * blockDim.x + threadIdx.x)
+                        : (int)threadIdx.x;
+    const int nth = (GRID == K_GRID)
+                        ? (int)(gridDim.x * blockDim.x)
+                        : (int)blockDim.x;
+    const bool isFirst = (tid == 0);
+    const int  n4 = A.n4, R = A.R, r = A.rank;
+    const u64  round = *(const volatile u64 *)A.roundDev + 1ull;
+    __shared__ int abortS;
+    if (GRID == K_1BLK) {
+        if (threadIdx.x == 0) abortS = 0;
+        __syncthreads();
+    } else if (isFirst) {
+        *(volatile unsigned int *)A.abortDev = 0u;
+        __threadfence();
+    }
+    __shared__ uint4       *sSendRS[BARLINK_BAR1_MAX_RANKS];
+    __shared__ const uint4 *sRecvRS[BARLINK_BAR1_MAX_RANKS];
+    __shared__ u64         *sFlagTo [BARLINK_BAR1_MAX_RANKS];
+    __shared__ const u64   *sFlagFrom[BARLINK_BAR1_MAX_RANKS];
+    __shared__ u64         *sAckTo  [BARLINK_BAR1_MAX_RANKS];
+    __shared__ const u64   *sAckFrom[BARLINK_BAR1_MAX_RANKS];
+    if (threadIdx.x == 0) {
+        for (int z = 0; z < R; ++z) {
+            sSendRS[z] = A.nzSendRS[z];
+            sRecvRS[z] = A.nzRecvRS[z];
+            sFlagTo [z] = A.nzFlagTo [0][z];
+            sFlagFrom[z] = A.nzFlagFrom[0][z];
+            sAckTo[z]   = A.ackTo[z];
+            sAckFrom[z] = A.ackFrom[z];
+        }
+    }
+    __syncthreads();
+    // --- 0. #622 entry acknowledgment (identical to the mesh) --------------
+    if (isFirst) {
+        const u64 prev = *(const volatile u64 *)A.lastRoundDev;
+        bool ab = false;
+        long long t0 = clock64();
+        unsigned int probeCounter = 0u;
+        while (prev != 0ull) {
+            bool allAcked = true;
+            for (int s = 0; s < R; ++s) {
+                if (s == r) continue;
+                const bool acked = readFlag<LA>(sAckFrom[s]) >= prev;
+                if (!acked) { allAcked = false; break; }
+            }
+            if (allAcked) break;
+            if ((u64)(clock64() - t0) > A.capCycles) { ab = true; break; }
+            if (A.abortHost != nullptr && ((++probeCounter & BARLINK_BAR1_HOST_MASK) == 0u)
+                && *(const volatile unsigned int *)A.abortHost != 0u) { ab = true; break; }
+        }
+        if (ab) {
+            if (GRID == K_1BLK) abortS = 1;
+            else { *(volatile unsigned int *)A.abortDev = 1u; __threadfence(); }
+        }
+    }
+    barrier<GRID>();
+    {
+        const int aborted = (GRID == K_1BLK)
+                                ? abortS
+                                : (int)*(volatile unsigned int *)A.abortDev;
+        if (aborted) {
+            if (isFirst) {
+                *A.ctlStatus = 2u;
+                writeRound(A, round);
+            }
+            return;
+        }
+    }
+    // --- 1. the WHOLE contribution to every peer's RS slot -----------------
+    for (int z = 0; z < R; ++z) {
+        if (z == r) continue;
+        sendPhase(A.in, sSendRS[z], n4, tid, nth);
+    }
+    __threadfence_system();
+    barrier<GRID>();
+    if (isFirst) {
+        for (int z = 0; z < R; ++z) {
+            if (z == r) continue;
+            if (FLUSH) readFlush(sSendRS[z], n4);
+            writeU64(sFlagTo[z], round);
+        }
+        __threadfence_system();
+        bool ab = false;
+        long long t0 = clock64();
+        unsigned int probeCounter = 0u;
+        for (;;) {
+            bool allArrived = true;
+            for (int s = 0; s < R; ++s) {
+                if (s == r) continue;
+                if (readFlag<LA>(sFlagFrom[s]) != round) { allArrived = false; break; }
+            }
+            if (allArrived) break;
+            if ((u64)(clock64() - t0) > A.capCycles) { ab = true; break; }
+            if (A.abortHost != nullptr && ((++probeCounter & BARLINK_BAR1_HOST_MASK) == 0u)
+                && *(const volatile unsigned int *)A.abortHost != 0u) { ab = true; break; }
+        }
+        if (ab) {
+            if (GRID == K_1BLK) abortS = 1;
+            else { *(volatile unsigned int *)A.abortDev = 1u; __threadfence(); }
+        }
+    }
+    barrier<GRID>();
+    {
+        const int aborted = (GRID == K_1BLK)
+                                ? abortS
+                                : (int)*(volatile unsigned int *)A.abortDev;
+        if (aborted) {
+            if (isFirst) {
+                *A.ctlStatus = 1u;
+                writeRound(A, round);
+            }
+            return;
+        }
+    }
+    __threadfence_system();
+    // --- 2. reduce locally over own + all received (full payloads) ---------
+    reduceNPhase<T>(A.in, A.out, sRecvRS, R, r, n4, tid, nth);
+    barrier<GRID>();
+    if (isFirst) {
+        // #622 ack, same order as the mesh: peers' lines, fence, watermark,
+        // round.
+        for (int z = 0; z < R; ++z) {
+            if (z == r) continue;
+            writeU64(sAckTo[z], round);
+        }
+        __threadfence_system();
+        *(volatile u64 *)A.lastRoundDev = round;
+        writeRound(A, round);
+    }
+}
+// ---------------------------------------------------------------------------
 // TOPOLOGY 'ring' -- ring reduce-scatter + ring allgather, 2*(R-1) barriers.
 // Always sends to (r+1)%R, always receives from (r-1+R)%R.
 // Unchanged from ar3_ring_kernel, only RANGE_N -> A.R and without the check.
@@ -1396,8 +1551,9 @@ static void start(int algo, int kernel_variant, int la, int read_flush, Bar1Args
         }                                                                      \
     } while (0)
 
-    if (algo == 0) BARLINK_BAR1_SELECT(bar1_mesh_kernel);
-    else           BARLINK_BAR1_SELECT(bar1_ring_kernel);
+    if (algo == 0)      BARLINK_BAR1_SELECT(bar1_mesh_kernel);
+    else if (algo == 2) BARLINK_BAR1_SELECT(bar1_oneshot_kernel);
+    else                BARLINK_BAR1_SELECT(bar1_ring_kernel);
 #undef BARLINK_BAR1_SELECT
 #undef BARLINK_BAR1_LAUNCH
 }
@@ -1425,7 +1581,8 @@ void bar1_all_reduce(at::Tensor inp, at::Tensor out,
     TORCH_CHECK(R >= 2 && R <= BARLINK_BAR1_MAX_RANKS,
                 "barlink-bar1: world ", R, " outside 2..", BARLINK_BAR1_MAX_RANKS);
     TORCH_CHECK(r >= 0 && r < R, "barlink-bar1: rank out of range");
-    TORCH_CHECK(algo == 0 || algo == 1, "barlink-bar1: algo 0=mesh 1=ring");
+    TORCH_CHECK(algo == 0 || algo == 1 || algo == 2,
+                "barlink-bar1: algo 0=mesh 1=ring 2=oneshot");
     TORCH_CHECK(inp.is_contiguous() && out.is_contiguous(),
                 "barlink-bar1: only contiguous tensors");
     TORCH_CHECK(inp.numel() == out.numel() && inp.scalar_type() == out.scalar_type(),
@@ -1494,7 +1651,13 @@ void bar1_all_reduce(at::Tensor inp, at::Tensor out,
 #define FSLOT(BASE, STEP, SENDER) \
     ((BASE) + (size_t)((STEP) * R + (SENDER)) * 256u)
 
-    if (algo == 0) {
+    if (algo == 2) {
+        // oneshot: the WHOLE payload goes into one RS slot per peer.
+        TORCH_CHECK((int64_t)nbytes <= chunk_max,
+                    "barlink-bar1: oneshot payload ", nbytes,
+                    " exceeds the slot (chunk_max ", chunk_max, ")");
+    }
+    if (algo == 0 || algo == 2) {
         for (int z = 0; z < R; ++z) {
             if (z == r) continue;
             // My position in the ascending peer list of receiver z.

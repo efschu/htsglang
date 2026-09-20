@@ -401,11 +401,14 @@ class DecodeRoundLog:
             wait_ms += r.wait_ms
             for name, stat in (r.families or {}).items():
                 slot = family_acc.get(name)
+                mn = float(getattr(stat, "min_ms", 0.0) or 0.0)
                 if slot is None:
-                    family_acc[name] = [stat.total_ms, float(stat.count)]
+                    family_acc[name] = [stat.total_ms, float(stat.count), mn]
                 else:
                     slot[0] += stat.total_ms
                     slot[1] += stat.count
+                    if mn > 0.0 and (slot[2] <= 0.0 or mn < slot[2]):
+                        slot[2] = mn
 
         line = (
             "Decode rank batch, rank: %d, #round: %d, t: %.3f, bs: %d, "
@@ -424,9 +427,23 @@ class DecodeRoundLog:
             line += " (compute %.1f, wait %.1f)"
             args += [max(round_ms - wait_ms, 0.0), wait_ms]
             if family_acc:
+                # 20.09. (fn8aa): the per-family MINIMUM names the protocol
+                # floor of one collective; mean minus floor is skew. Appended
+                # as its own token so the existing 'name total/countx' reader
+                # (rank_phase_summary) keeps matching.
                 parts = ", ".join(
-                    "%s %.1f/%dx" % (name, total_ms, int(count))
-                    for name, (total_ms, count) in sorted(
+                    "%s %.1f/%dx%s"
+                    % (
+                        name,
+                        acc3[0],
+                        int(acc3[1]),
+                        (
+                            (" min%.3f" % acc3[2])
+                            if len(acc3) > 2 and acc3[2] > 0 and acc3[1] > 1
+                            else ""
+                        ),
+                    )
+                    for name, acc3 in sorted(
                         family_acc.items(), key=lambda kv: -kv[1][0]
                     )
                 )

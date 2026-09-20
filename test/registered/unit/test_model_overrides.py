@@ -78,6 +78,7 @@ class TestModelOverridableWhitelist(CustomTestCase):
                     "speculative_moe_a2a_backend",
                     "disable_shared_experts_fusion",
                     "kv_cache_dtype",
+                    "ple_offload_embedding",
                     "dsa_prefill_backend",
                     "dsa_decode_backend",
                     "prefill_attention_backend",
@@ -326,6 +327,78 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         # publish still materializes the whitelisted leaf with the pristine
         # value: readers only ever read flags.
         self.assertEqual(self._publish(sa).dtype, "auto")
+
+    def test_qwen4_rejects_pd_and_unified_memory(self):
+        qwen4 = ("Qwen4ExpForConditionalGeneration", "qwen4_exp")
+        for kwargs, message in (
+            ({"disaggregation_mode": "prefill"}, "PD disaggregation"),
+            ({"disaggregation_mode": "decode"}, "PD disaggregation"),
+            ({"enable_unified_memory": True}, "enable-unified-memory"),
+        ):
+            with self.subTest(**kwargs):
+                with self.assertRaisesRegex(ValueError, message):
+                    self._construct(*qwen4, **kwargs)
+
+    def test_qwen4_exp_default_construction_declares_ple_offload(self):
+        """A Qwen4-Exp ServerArgs WITHOUT --ple-offload-embedding must build:
+        the override declares ``ple_offload_embedding`` (bf16 on CUDA -> True),
+        so the field has to be resolvable or validate_declarations refuses
+        the whole construction ("not model-overridable"). Every smoke so far
+        passed the flag explicitly and never hit this; a bare launch did."""
+        # disable_radix_cache: the Mamba radix validation below the override
+        # asserts a CUDA host (FLA extra_buffer) and is not under test here.
+        sa = self._construct(
+            "Qwen4ExpForConditionalGeneration", "qwen4_exp", disable_radix_cache=True
+        )
+        declared = {f for _s, d in sa._resolved_overrides for f in d}
+        self.assertIn("ple_offload_embedding", declared)
+        # The value itself is host/dtype dependent (bf16 on CUDA -> True); what
+        # is under test is that the declaration survives the publish gate.
+        self.assertIsInstance(self._publish(sa).ple_offload_embedding, bool)
+
+    def test_qwen4_exp_overrides_ported(self):
+        """#37500/#39126 port: the Qwen4-Exp override lives in overrides.py on
+        this line (no model_overrides package). bf16 on CUDA turns the PLE
+        host offload on, compressed QSA pins page_size to 64, and a dense
+        moe_dense_tp_size == 1 is lifted for the MoE checkpoint."""
+        import torch
+
+        from sglang.srt.arg_groups.overrides import _qwen4_exp_overrides
+        from sglang.srt.configs.qwen4_exp import Qwen4ExpConfig
+
+        # The indexer fields of the real checkpoint (config.json 16.09.):
+        # 4 index heads x 128, 1 KV head, budget 2048, compress ratio 4.
+        hf_config = Qwen4ExpConfig(
+            text_config=dict(
+                indexer_n_heads=4,
+                indexer_head_dim=128,
+                indexer_kv_heads=1,
+                indexer_budget=2048,
+                indexer_compress_ratio=4,
+            )
+        )
+        view = SimpleNamespace(
+            ple_offload_embedding=None,
+            attention_backend="triton",
+            moe_dense_tp_size=1,
+            get_model_config=lambda: SimpleNamespace(dtype=torch.bfloat16),
+        )
+        with (
+            patch.object(overrides_module, "is_cuda", return_value=True),
+            patch.object(overrides_module, "is_sm100_supported", return_value=False),
+        ):
+            got = _qwen4_exp_overrides(view, hf_config)
+        self.assertTrue(got["ple_offload_embedding"])
+        self.assertEqual(got["page_size"], 64)
+        self.assertIsNone(got["moe_dense_tp_size"])
+        # fp16 target: the pinned table stays in the checkpoint's dtype path
+        view.get_model_config = lambda: SimpleNamespace(dtype=torch.float16)
+        with (
+            patch.object(overrides_module, "is_cuda", return_value=True),
+            patch.object(overrides_module, "is_sm100_supported", return_value=False),
+        ):
+            self.assertFalse(_qwen4_exp_overrides(view, hf_config)["ple_offload_embedding"])
+
 
     def test_minimax_m2_enables_tf32_matmul(self):
         sa = self._construct("MiniMaxM2ForCausalLM", "llama")

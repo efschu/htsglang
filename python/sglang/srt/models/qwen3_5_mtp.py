@@ -51,6 +51,80 @@ logger = logging.getLogger(__name__)
 MTP_FC_LAYER_NAME = "mtp.fc"
 
 
+_QUANT_TENSOR_SUFFIXES = (".weight_packed", ".weight_scale", ".weight_scale_inv")
+
+
+def mtp_index_is_dense(model_path) -> Optional[bool]:
+    """Does the checkpoint's safetensors index carry NO quantized tensor under
+    ``mtp.``? True = the draft ships dense (bf16), False = it carries packed
+    weights or scales, None = no index to read (single-file checkpoints, GGUF).
+
+    The compressed-tensors config cannot answer this on its own: an
+    AutoRound export (Minachist Qwen3.8-Flash-Next) lists neither an
+    ``mtp.*`` target nor an ``mtp.*`` ignore entry while shipping the whole
+    MTP module in bf16, so building the draft under the config would refuse
+    every ``mtp.`` layer with 'Unable to find matching target'. The index
+    says what was actually written."""
+    import json
+    import os
+
+    if not model_path or not os.path.isdir(str(model_path)):
+        return None
+    index_path = os.path.join(str(model_path), "model.safetensors.index.json")
+    if not os.path.isfile(index_path):
+        return None
+    try:
+        with open(index_path) as f:
+            weight_map = json.load(f).get("weight_map") or {}
+    except (OSError, ValueError):
+        return None
+    mtp_keys = [k for k in weight_map if k.startswith("mtp.")]
+    if not mtp_keys:
+        return None
+    return not any(k.endswith(_QUANT_TENSOR_SUFFIXES) for k in mtp_keys)
+
+
+def _mtp_quant_config(quant_config):
+    """The quantization the MTP module itself is built with (#37500 port:
+    shared with qwen4_exp_mtp so the loader's fusion gate sees the same
+    normalization the constructor applies).
+
+    The MTP module often ships unquantized even though the target checkpoint
+    is quantized.
+    """
+    # The MTP model is unquantized in the nvfp4 / modelopt-mixed checkpoints.
+    if quant_config and quant_config.get_name() in (
+        "modelopt_fp4",
+        "modelopt_mixed",
+    ):
+        return None
+    if is_npu() and get_server_args().speculative_draft_model_quantization is None:
+        return None
+    # Quark-quantized Qwen3.5 MXFP4 checkpoints ship the MTP module in bf16;
+    # every `mtp.*` layer appears under the quantization exclude list. Detect
+    # that and skip quantization here so linear/MoE weight loaders allocate
+    # bf16 shapes (see sgl-project/sglang#23113).
+    if quant_config and quant_config.get_name() == "quark":
+        exclude_layers = getattr(quant_config, "exclude_layers", [])
+        if any(
+            isinstance(layer, str) and layer.startswith("mtp.")
+            for layer in exclude_layers
+        ):
+            return None
+    # compressed-tensors: the safetensors index is the authority on whether
+    # the draft was written quantized (Qwen3.8-27B-INT8: mtp.*.weight_scale
+    # present -> stays quantized) or dense (Minachist / cyankiwi
+    # Qwen3.8-Flash-Next: no packed tensor under mtp. -> bf16 draft).
+    if quant_config and quant_config.get_name() == "compressed-tensors":
+        if mtp_index_is_dense(getattr(get_server_args(), "model_path", None)):
+            logger.info(
+                "[mtp] checkpoint index carries no quantized tensor under 'mtp.'; "
+                "building the MTP draft unquantized"
+            )
+            return None
+    return quant_config
+
+
 def build_mtp_fc(hidden_size: int, quant_config, prefix: str):
     """Build the MTP head's `2*hidden -> hidden` fusion projection.
 
@@ -241,26 +315,7 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
         # Deep-copy so MTP mutations below don't leak into the target's config.
         config = copy.deepcopy(config)
 
-        # The MTP model is unquantized in the nvfp4 checkpoint.
-        if quant_config and quant_config.get_name() in (
-            "modelopt_fp4",
-            "modelopt_mixed",
-        ):
-            quant_config = None
-        if is_npu() and get_server_args().speculative_draft_model_quantization is None:
-            quant_config = None
-
-        # Quark-quantized Qwen3.5 MXFP4 checkpoints ship the MTP module in
-        # bf16; every `mtp.*` layer appears under the quantization exclude
-        # list. Detect that and skip quantization here so linear/MoE weight
-        # loaders allocate bf16 shapes (see sgl-project/sglang#23113).
-        if quant_config and quant_config.get_name() == "quark":
-            exclude_layers = getattr(quant_config, "exclude_layers", [])
-            if any(
-                isinstance(layer, str) and layer.startswith("mtp.")
-                for layer in exclude_layers
-            ):
-                quant_config = None
+        quant_config = _mtp_quant_config(quant_config)
 
         self.config = config
         self.tp_size = get_parallel().tp_size
