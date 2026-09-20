@@ -1795,6 +1795,60 @@ def _nvml_free() -> List[CardFree]:
     ]
 
 
+#: #1493: how far the sleeping group's CURRENT device residency may exceed the
+#: dormant image it recorded at its own sleep before a manual flip is refused.
+#: Not a reserve and not a safety factor -- it is measurement slack: NVML
+#: per-process readings on a shared card move by tens of MiB between samples.
+MANUAL_FLIP_RESIDENCY_SLACK_MIB = 256
+
+
+def manual_flip_residency_refusal(*, awake: Optional[str], sleeper: Optional[str],
+                                  sleeper_used_mib=None, sleeper_dormant_mib=None,
+                                  slack_mib: int = MANUAL_FLIP_RESIDENCY_SLACK_MIB):
+    """Name why a manual flip must not be attempted right now, or None.
+
+    BOOT weg2xsn406 (2026-09-20 16:49:25Z) is the case. A `POST /weg2/flip`
+    arrived while D was awake. The handler flips D->P and then straight back
+    P->D -- and that RETURN wake is the one that has to fund D's whole
+    kv_cache tag again. P had just prefilled on the same cards, its transient
+    residency was still on them, and the return wake hit
+
+        [core.cpp] WEG2-TMS-RESUME REFUSED tag=kv_cache rc=2 (out of memory)
+
+    i.e. the flip destroyed a serving group to find out something that was
+    measurable BEFORE it started. The automatic flip never reaches this state
+    because it does not turn around inside one request.
+
+    THE TEST IS ONE-SIDED AND USES ONLY WHAT THE FRONT ALREADY READS: the
+    sleeping group's CURRENT NVML per-process bytes against the dormant image
+    THAT SAME GROUP recorded at its own sleep. A sleeper that is holding more
+    than its dormant image has not finished releasing -- those bytes are the
+    transient residency, and they are exactly what the return wake will not
+    find. Either figure absent => None: an absence is never a refusal
+    (NULL-NUR-BEI-ERREICHTEM-EMITTER).
+
+    Returns the refusal text (a W115 line) or None.
+    """
+    if str(awake or "") != "D":
+        return None
+    if sleeper_used_mib is None or sleeper_dormant_mib is None:
+        return None
+    over = int(sleeper_used_mib) - int(sleeper_dormant_mib)
+    if over <= int(slack_mib):
+        return None
+    return (
+        f"W115 Weg2ManualFlipRefused: group {sleeper or '?'} still holds "
+        f"{int(sleeper_used_mib)} MiB against a dormant image of "
+        f"{int(sleeper_dormant_mib)} MiB -- {over} MiB of transient residency "
+        f"above a {int(slack_mib)} MiB measurement slack. A manual flip turns "
+        f"around inside one request (D->P->D), so those bytes are missing from "
+        f"the RETURN wake, not from the flip out; on boot weg2xsn406 that wake "
+        f"refused its kv_cache resume on a device OOM and the group died. "
+        f"D stays awake and serving: refusing a flip costs a flip, attempting "
+        f"it cost a group."
+    )
+
+
 def _nvml_process_mib(pids: set) -> Dict[str, int]:
     try:
         out = subprocess.run(
@@ -5665,12 +5719,47 @@ class Front:
     async def handle_manual_flip(self, request: web.Request) -> web.Response:
         if self.state != "serving":
             return web.json_response({"error": self.state}, status=503)
+        # #1493: a manual flip from D turns around inside one request, so the
+        # return wake pays for whatever the sleeper has not released yet.
+        # Measured BEFORE the flip out, because after it there is no group
+        # left to refuse on behalf of.
+        why = self._manual_flip_refusal()
+        if why is not None:
+            logger.error("%s", why)
+            return web.json_response({"error": "manual-flip-refused", "why": why,
+                                      "code": "W115"}, status=409)
         src, dst = self.awake, ("P" if self.awake == "D" else "D")
         self.admit_d = False
         await self.flip(src, dst)
         if self.awake == "P" and self.state == "serving":
             await self.flip("P", "D")
         return web.json_response(self.state_dict())
+
+    def _manual_flip_refusal(self) -> Optional[str]:
+        """#1493: the two readings behind :func:`manual_flip_residency_refusal`.
+
+        Fail-soft by construction: any reading that cannot be taken makes this
+        None, so the endpoint behaves exactly as before rather than refusing
+        on a blind guess.
+        """
+        try:
+            sleeper = "P" if self.awake == "D" else "D"
+            rec = (self.dormant_image or {}).get(sleeper) or {}
+            dormant = rec.get("vram_residue_mib")
+            used = None
+            pids = getattr(self, "group_pids", None)
+            if callable(pids):
+                pids = pids(sleeper)
+            if pids:
+                by_uuid = _nvml_process_mib(set(pids))
+                if by_uuid:
+                    used = max(int(v) for v in by_uuid.values())
+            return manual_flip_residency_refusal(
+                awake=self.awake, sleeper=sleeper,
+                sleeper_used_mib=used, sleeper_dormant_mib=dormant,
+            )
+        except Exception:  # noqa: BLE001 -- a guard may not break the endpoint
+            return None
 
 
 def main():

@@ -41,6 +41,7 @@ import ctypes
 import json
 import logging
 import mmap
+import contextlib
 import os
 import socket
 import struct
@@ -966,20 +967,71 @@ def _recv_marked(cred, kind: str, g: int, budget_s: float, d: str, seq, lane_key
                 pass
 
 
+@contextlib.contextmanager
+def lane_streams(ops, device: int, ring: int):
+    """The lane's ring of CUDA streams, CREATED AND DESTROYED (#1492).
+
+    THE LEAK THIS CLOSES, measured on boots weg2xsn406/408. Every other
+    ``create_stream`` in the Weg-2 transport has a matching ``destroy_stream``
+    (``weight_exchange_transport.py`` 3350/3366, 3377/3548, 3584/3588;
+    ``weight_exchange_bounce.py`` 1343-1344/1587-1588). This one did not: the
+    ring was built per TAG, per PHASE, per LANE, on EVERY flip, and never
+    torn down. A CUDA stream is a driver object -- it is not in torch's
+    caching allocator, so it shows up only in the `other
+    (context+driver+communicator+non-torch)` post of WEG2-DC-BREAKDOWN, which
+    is exactly the post that crept:
+
+      rank   WEG2-BAR1 mapped lines   x ring=4   nvml_proc creep   per stream
+      P PP0            140              560       +436 MiB         0.78 MiB
+      D TP1            110              440       +326 MiB         0.74 MiB
+      D TP2             90              360       +272 MiB         0.76 MiB
+
+    Three independent ranks agreeing inside 5 % on a per-stream cost is the
+    reason this is named a finding and not a candidate. The other three ranks
+    (P PP1 0.40, P PP2 0.29, D TP0 1.66 MiB) bracket it within a factor of
+    about two, which is what one expects when other posts share the line --
+    so the claim is "this is the dominant term", not "this is the only one".
+
+    Degrades exactly as before: a fake ops that cannot make a stream yields a
+    0 in the ring, and a destroy that raises is swallowed -- a teardown may
+    never turn a completed transfer into a failure, nor mask the real error.
+    """
+    streams = []
+    try:
+        for _ in range(int(ring)):
+            try:
+                streams.append(ops.create_stream(int(device)))
+            except Exception:  # noqa: BLE001 -- the desk fakes carry no stream
+                streams.append(0)
+        yield streams
+    finally:
+        destroy = getattr(ops, "destroy_stream", None)
+        for stream in streams:
+            if not stream or destroy is None:
+                continue
+            try:
+                destroy(stream)
+            except BaseException:  # noqa: BLE001 -- see the docstring
+                pass
+
+
 def _run_bar1_tag(descs, ops, lanes, lane_key, role, seq, phase, no_write, liveness,
                   budget_s, device, log, base, slot_bytes, ring, batches, tp) -> str:
+    with lane_streams(ops, device, ring) as streams:
+        return _run_bar1_tag_streamed(descs, ops, lanes, lane_key, role, seq, phase,
+                                      no_write, liveness, budget_s, device, log, base,
+                                      slot_bytes, ring, batches, tp, streams)
+
+
+def _run_bar1_tag_streamed(descs, ops, lanes, lane_key, role, seq, phase, no_write,
+                           liveness, budget_s, device, log, base, slot_bytes, ring,
+                           batches, tp, streams) -> str:
     d = lanes.flags(lane_key, role)
     chan = lanes.channel(lane_key, role)
     cred = SocketCredits(chan, liveness) if chan is not None else FileCredits(d, seq, liveness)
     via = "sock" if chan is not None else "file"
     total = sum(int(b.total_bytes) for b in batches)
     npieces = sum(len(b.pieces) for b in batches)
-    streams = []
-    for _ in range(int(ring)):
-        try:
-            streams.append(ops.create_stream(int(device)))
-        except Exception:  # noqa: BLE001 -- the desk fakes carry no stream
-            streams.append(0)
     _nw = no_write or ()
     t0 = time.perf_counter()
     t_wait = t_copy = 0.0
