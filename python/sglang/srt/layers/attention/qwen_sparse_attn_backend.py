@@ -536,6 +536,12 @@ class QwenSparseAttnBackend(AttentionBackend):
                 )
             else:
                 mode, kw = MODE_EVEN, dict(world=self.dcp_size, rank=self.dcp_rank)
+            if not getattr(self, "_rows_fused_logged", False):
+                self._rows_fused_logged = True
+                logger.info(
+                    "[qsa-rows] fused resolve+compaction armed (mode %d, dcp %d, K %d)",
+                    mode, self.dcp_size, int(topk_indices.shape[1]),
+                )
             return qsa_rows_resolve(
                 topk_indices,
                 metadata.token_to_batch_idx,

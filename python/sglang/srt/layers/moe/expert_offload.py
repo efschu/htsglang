@@ -2883,6 +2883,19 @@ def _wave_timing_note_prefill(layer_id, wave_events, n_spill, n_tokens):
         t["tokens"] = int(n_tokens)
 
 
+_FETCH_SYNC = {"on": None}
+
+
+def fetch_sync_on() -> bool:
+    """SGLANG_MOE_OFFLOAD_FETCH_SYNC=1: host-synchronize after every joined
+    fetch (Task #49 probe switch, default off; costs prefill throughput)."""
+    if _FETCH_SYNC["on"] is None:
+        import os
+
+        _FETCH_SYNC["on"] = str(os.environ.get("SGLANG_MOE_OFFLOAD_FETCH_SYNC", "0")).strip().lower() in ("1", "true", "on")
+    return _FETCH_SYNC["on"]
+
+
 def _fetch_mode() -> str:
     """SGLANG_MOE_OFFLOAD_FETCH: 'gather' (default, Task #33) or 'memcpy'."""
     import os
@@ -3586,6 +3599,12 @@ class MoEExpertOffloadCache:
                 _copies()
             if join:
                 torch.cuda.current_stream().wait_stream(self._stream)
+            if fetch_sync_on():
+                # Task #49 probe (fn8ah 20.09.): a device-side wait is the
+                # design; a host-side synchronize here is the DISCRIMINATOR --
+                # if the 259k needle stops going NaN with it, the first
+                # compute read a slot whose copy had not landed.
+                torch.cuda.synchronize()
         _g = getattr(self, "_nan_guard_fetched", None)  # desk stubs carry no guard
         if _g is not None and join and fetch_plan:
             _g(fetch_plan)
