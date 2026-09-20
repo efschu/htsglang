@@ -150,6 +150,20 @@ _REQUEST_STATE_WAIT_TIMEOUT = envs.SGLANG_REQUEST_STATE_WAIT_TIMEOUT.get()
 logger = logging.getLogger(__name__)
 
 
+def _weg2_set_vision_rid(rid) -> None:
+    """Publish this request's rid for the transient vision stage's log lines.
+
+    Guarded and silent: a log field must never be the reason a request fails,
+    and an upstream boot without the weg2 tree must not notice this exists.
+    """
+    try:
+        from sglang.srt.weg2.vision_stage_service import set_request_rid
+
+        set_request_rid(rid)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 @lru_cache(maxsize=1)
 def _ragged_verify_cap_accept() -> bool:
     # The mode env is fixed at server launch; cache to keep it off the
@@ -959,6 +973,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         )
 
         if should_run_mm_processor:
+            # Task #58: hand the rid to the transient vision stage, which runs
+            # four frames below this one inside the multimodal processor and
+            # has no other way to learn it. Without this the metal log read
+            # `W105 Weg2VisionNoRoom rid= --` and no refusal could be tied to
+            # the request that caused it. Task-local, never raises, and a
+            # no-op in any boot that does not run the stage.
+            _weg2_set_vision_rid(obj.rid)
             if obj.image_data is not None and not isinstance(obj.image_data, list):
                 obj.image_data = [obj.image_data]
             if obj.video_data is not None and not isinstance(obj.video_data, list):

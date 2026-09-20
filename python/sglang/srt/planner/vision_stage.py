@@ -118,6 +118,7 @@ class VisionStageNoRoom(VisionStageRefused):
         need_bytes: int,
         attempts: Sequence[Tuple[int, float, float, float]],
         evictions_allowed: bool,
+        census_note: str = "",
     ):
         self.need_bytes = int(need_bytes)
         #: (card, free_bytes, evictable_bytes, shortfall_bytes) per card
@@ -125,17 +126,44 @@ class VisionStageNoRoom(VisionStageRefused):
             (int(c), float(f), float(e), float(s)) for c, f, e, s in attempts
         )
         self.evictions_allowed = bool(evictions_allowed)
-        best = min((s for _, _, _, s in self.attempts), default=float("nan"))
-        per_card = "; ".join(
-            f"card{c}: free {f / GIB:.3f} GiB + evictable {e / GIB:.3f} GiB "
-            f"-> short {s / GIB:.3f} GiB"
-            for c, f, e, s in self.attempts
+        self.census_note = str(census_note)
+        # NO ``nan``, EVER.  Measured on metal (xsn405, 20.09. 16:18Z): with an
+        # empty ``attempts`` this read "no card can hold it (...): . Best card
+        # is short by nan GiB" -- an empty card list and a nan shortfall, from
+        # which NOBODY can tell "every card was full" from "the placement was
+        # handed no cards at all".  The second is what had actually happened
+        # (``census_from_nvml`` read ``total_mib`` off the wrong object and
+        # dropped every card), and the refusal text hid it.  A number that
+        # cannot be computed is NAMED as absent, never printed as ``nan``.
+        self.best_shortfall_bytes: Optional[float] = (
+            min((s for _, _, _, s in self.attempts), default=None)
         )
+        if self.attempts:
+            per_card = "; ".join(
+                f"card{c}: free_idle {f / GIB:.3f} GiB + evictable {e / GIB:.3f} "
+                f"GiB -> short {s / GIB:.3f} GiB"
+                for c, f, e, s in self.attempts
+            )
+            shortfall = (
+                f"Best card is short by "
+                f"{float(self.best_shortfall_bytes) / GIB:.3f} GiB."
+            )
+        else:
+            per_card = (
+                "NO CANDIDATE CARDS reached the placement -- the census handed "
+                "it an EMPTY list, so this is NOT a measurement that every card "
+                "is full; it is the absence of a measurement"
+            )
+            shortfall = (
+                "No shortfall can be stated: with no candidate there is no "
+                "card to be short."
+            )
+        note = f" {self.census_note}" if self.census_note else ""
         super().__init__(
             f"transient vision stage needs {self.need_bytes / GIB:.3f} GiB and no "
             f"card can hold it (evictions "
             f"{'allowed' if self.evictions_allowed else 'FORBIDDEN by the caller'}): "
-            f"{per_card}. Best card is short by {best / GIB:.3f} GiB. Nothing is "
+            f"{per_card}. {shortfall}{note} Nothing is "
             "clamped and no reserve is raided -- the image request is refused, or "
             "a block is made evictable, or the stage waits for the next D->P flip."
         )

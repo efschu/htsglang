@@ -1556,32 +1556,54 @@ class BaseMultimodalProcessor(ABC):
         #
         # The call is a NO-OP unless a service was installed
         # (`vision_stage_service.install`), so every boot that does not use the
-        # transient form is byte-for-byte what it was. It never raises: a stage
-        # failure comes back as an outcome and is logged with its W-code; the
-        # items then still carry `feature`, and the normal refusal downstream
-        # is what the caller sees -- one failure, named once, not two.
+        # transient form is byte-for-byte what it was.
+        #
+        # A REFUSED STAGE ENDS THE REQUEST HERE. The earlier form logged the
+        # W-code and let the request continue, on the premise that "the normal
+        # refusal downstream is what the caller sees -- one failure, named
+        # once, not two." METAL BOOT xsn405 (20.09. 16:18Z) disproved that
+        # premise: after `W105 Weg2VisionNoRoom` the same request went into the
+        # prefill, `mm_utils.py:669 _get_chunked_prefill_embedding` ->
+        # `:604 _get_chunked_embedding_by_item` reached a rank with no tower,
+        # and `_require_visual` (`qwen3_vl.py:1421`) raised inside the
+        # SCHEDULER THREAD on PP0, PP1 and PP2. That is not a refused request,
+        # it is a dead group (`W17 Weg2GroupDead` in the front). One image
+        # request took the whole P group down.
+        #
+        # So: a non-ok outcome raises `VisionStageRequestRefused` -- a
+        # `ValueError`, which every entrypoint route already turns into a clean
+        # error envelope, lifted to 501. Raising here is what guarantees the
+        # second half of the rule: the request dies before the tokenizer builds
+        # a `TokenizedGenerateReqInput`, so NOTHING carrying mm_items is ever
+        # sent to a scheduler.
+        #
+        # `assert_nothing_unstaged` is the second line, for the failures the
+        # first cannot see: `maybe_run` returns `None` both for "nothing to do"
+        # and for "no service, no recorded refusal", and in a transient boot the
+        # second of those is the same dead group by another road.
         #
         # Upstream fills this same field in this same process
         # (`moss_vl.py:587`), which is why the seam is here and not in the
         # scheduler: the transport below already handles a filled
         # `precomputed_embeddings`.
-        #
-        # ONE exception is deliberately NOT swallowed: `VisionStageNotArmed`.
-        # That one says this boot asked for `transient` and armed nothing, and
-        # swallowing it is the exact silent shape described above -- the image
-        # would go on as if the stage had run. It is raised only when there
-        # ARE items to stage, so the text path cannot reach it.
         try:
             from sglang.srt.weg2 import vision_stage_service as _vss
         except Exception as _exc:  # noqa: BLE001 -- never break the text path
             logger.warning("vision stage seam unavailable: %s", _exc)
         else:
+            # Refusals by name are re-raised; only an UNEXPECTED seam error is
+            # swallowed, and even then the unstaged check below still runs, so
+            # a swallowed error cannot become a silent pass-through.
             try:
-                _vss.maybe_run(all_collected_items)
-            except _vss.VisionStageNotArmed:
+                _outcome = _vss.maybe_run(all_collected_items)
+            except (_vss.VisionStageNotArmed, _vss.VisionStageRequestRefused):
                 raise
             except Exception as _exc:  # noqa: BLE001 -- never break the text path
                 logger.warning("vision stage seam skipped: %s", _exc)
+            else:
+                if _outcome is not None and not _outcome.ok:
+                    raise _vss.VisionStageRequestRefused(_outcome)
+            _vss.assert_nothing_unstaged(all_collected_items)
 
         """
         solution for cuda-ipc memory-leak:

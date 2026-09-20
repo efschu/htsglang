@@ -497,10 +497,14 @@ def test_the_processor_seam_does_NOT_swallow_the_not_armed_refusal():
 
     src = inspect.getsource(bp.BaseMultimodalProcessor.process_and_combine_mm_data)
     assert "_vss.maybe_run(all_collected_items)" in src
-    assert "except _vss.VisionStageNotArmed" in src
-    assert src.index("except _vss.VisionStageNotArmed") < src.index(
-        "vision stage seam skipped"
-    )
+    # The re-raise clause now names TWO classes -- `VisionStageRequestRefused`
+    # joined it when the xsn405 fix made a refused stage terminal at the seam
+    # (see test_vision_stage_census_refusal_0920) -- so this pins the CLAUSE,
+    # not one spelling of it, and still pins that it comes BEFORE the
+    # swallow-everything-else clause.
+    assert "_vss.VisionStageNotArmed" in src
+    reraise = src.index("_vss.VisionStageNotArmed, _vss.VisionStageRequestRefused")
+    assert reraise < src.index("vision stage seam skipped")
 
 
 def test_the_not_armed_class_is_not_a_refusal_subclass():
