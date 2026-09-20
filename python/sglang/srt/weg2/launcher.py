@@ -2897,6 +2897,11 @@ def argv_p(
         model, s_gb, m_mib, store_cfg, max_kv_per_request, write_policy, "P",
         random_seed, barlink_cap_cycles, census_interval,
         hicache_disabled=hicache_disabled,
+        # Task #58 xsn403: argv_p accepted `vision` but never handed it on, so
+        # P was launched with vision_model_flags(VISION_OFF) = --no-enable-multimodal
+        # and the transient stage refused to arm (W111). The P group is the
+        # ONLY place the vision form reaches the model argv; D stays text-only.
+        vision=vision,
         weights_cpu_backup=weights_cpu_backup,
     ) + [
         # C1/K1: P's own bs. Concurrency for the front's leg-1 fan-out AND
