@@ -66,6 +66,11 @@ from sglang.srt.layers.dcp.reshard_plan import KvReshardError
 from sglang.srt.managers import phase_flip_seam_census as seam_census
 from sglang.srt.managers import seam_coverage
 from sglang.srt.managers import tree_congruence
+from sglang.srt.managers.d_vector_menu_runtime import (
+    effective_token_vector,
+    flip_backlog_from_scheduler,
+    menu_of,
+)
 from sglang.srt.managers.io_struct import PhaseFlipDecision
 from sglang.srt.managers.kv_reshard import (
     _CHECKSUM_BYTES,
@@ -3382,15 +3387,27 @@ def build_production_flip_cutover(scheduler, reduce_fn=None) -> Callable[[str], 
         # through the parallel_state getters; see phase_flip_boot).
         _ps.set_phase_flip_tp_active(tp_phase)
 
-        # 2. Owner rule: the vector is boot-constant; refresh the bounds
-        # consumers so the TP backends read the (re)installed vector.
+        # 2. Owner rule: install the EFFECTIVE token vector and refresh the
+        # bounds consumers so the TP backends read it.
         # This is a TOKEN-space quantity, so it must be the token vector,
         # not the weight shard vector. They are equal unless
         # SGLANG_UNEVEN_TOKEN_VECTOR overrides the token side; reinstalling
         # the weight vector here would leave the owner rule splitting rows
         # under a different vector than the pools were SIZED under, which
         # is an out-of-bounds slot id, not a slow path.
-        set_cp_token_ratios(list(stacks.token_vector))
+        #
+        # THIS LINE USED TO SAY "the vector is boot-constant", and with no
+        # menu declared it still is, bit-for-bit: effective_token_vector
+        # returns stacks.token_vector unchanged. What made it movable is the
+        # D-vector menu (user order 2026-09-20, "ja nur am flip"), and the
+        # authority is unchanged -- PP0 chooses, the choice rides the existing
+        # PhaseFlipDecision, every rank below ADOPTS it, and a rank that
+        # cannot (undeclared name) or must not (different ceiling set) stops
+        # the group at adoption, i.e. BEFORE this install. By the time control
+        # reaches this line the vector has already been agreed; reading it
+        # here is a read, never a second decision.
+        _token_vector = effective_token_vector(scheduler, stacks.token_vector)
+        set_cp_token_ratios(list(_token_vector))
         refresh_all_owner_bounds()
 
         _mark("routing+owner")
@@ -5031,6 +5048,10 @@ class PhaseFlipRuntime:
         #: #631 J: read-only handle for the pool census. Set by the
         #: builder; absent in unit stubs, where the census is a no-op.
         self._census_scheduler = None
+        #: Last arming sample, with depths (see `_arming_backlog`). None until
+        #: a round has actually read one -- an absent sample and an empty
+        #: backlog are different facts and the menu treats them differently.
+        self._last_arming_backlog = None
         # #856: served-request latency by rounds-since-cutover. The cutover
         # side is wired here; the request side is an explicit open integration
         # -- request latency is assembled in `tokenizer_manager`, a DIFFERENT
@@ -6305,6 +6326,10 @@ class PhaseFlipRuntime:
             if dec.verdict == PhaseFlipDecision.ABORT:
                 return self._abandon_parked_flip(0)
             self._last_hold_reason = None
+            # The D-vector menu: PP0 adopts its OWN published choice, through
+            # the same call the followers use, so the decider cannot install a
+            # vector by a path that skips the declaration and graph checks.
+            self._adopt_menu_choice(dec)
             try:
                 return self._execute()
             finally:
@@ -6341,6 +6366,7 @@ class PhaseFlipRuntime:
             config_fp=self._fp,
             vector=self._vec,
             tree_digest=self._local_tree_digest(),
+            **self._menu_choice_fields(verdict),
         )
         self._decision_taken = False
         logger.warning(
@@ -6378,6 +6404,8 @@ class PhaseFlipRuntime:
             # because PP0 said so, never because of its own reading.
             return self._abandon_parked_flip(1 if self._ready_fn() else 0)
         self._last_hold_reason = None
+        # The D-vector menu: adopt what PP0 chose, before any byte moves.
+        self._adopt_menu_choice(dec)
         try:
             return self._execute()
         finally:
@@ -6414,6 +6442,110 @@ class PhaseFlipRuntime:
             f"means a premise is false -- the group stops HERE, before any "
             f"rank moves a byte under the wrong layout."
         )
+
+    # -- the D-vector menu (user order 2026-09-20) --------------------------
+    def _menu_choice_fields(self, verdict) -> dict:
+        """PP0's menu choice, as the three extra fields of the decision.
+
+        EMPTY IN EVERY CASE BUT ONE, and each exclusion is a rule rather than
+        a convenience:
+
+          * no menu declared -> the pre-order boot, byte-identical;
+          * an ABORT -> nothing will be installed, so choosing would only
+            advance the dwell counter for a flip that never happened;
+          * TP -> PP -> the vector describes the layout we are LEAVING. The
+            menu picks the D layout; re-picking it on the way out would
+            install a key the resident D-KV was not written under.
+
+        A failure to choose is NOT fatal here. The menu is an optimisation of
+        WHICH layout to flip into; a flip into the current one is always
+        available and correct, so an unreadable backlog holds the vector
+        rather than stopping a flip that was otherwise funded.
+        """
+        if verdict != PhaseFlipDecision.PROCEED or self._pending != PP_TO_TP:
+            return {}
+        menu = menu_of(self)
+        if menu is None:
+            return {}
+        try:
+            backlog = flip_backlog_from_scheduler(
+                getattr(self, "_census_scheduler", None)
+            )
+            if backlog is None:
+                logger.warning(
+                    "%s D-VECTOR MENU: backlog unreadable at the decision; "
+                    "holding %r rather than choosing on a guess.",
+                    LOG_PREFIX,
+                    menu.current,
+                )
+                chosen = menu.current_vector
+            else:
+                mverdict = menu.propose(
+                    backlog, resident_kv_tokens=int(backlog.held_tokens)
+                )
+                chosen = mverdict.chosen
+                logger.warning("%s %s", LOG_PREFIX, mverdict.describe())
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                "%s D-VECTOR MENU refused to choose (%s); holding %r. The "
+                "flip proceeds into the resident layout, which is always a "
+                "correct answer -- a menu that cannot price itself must not "
+                "also cancel a funded flip.",
+                LOG_PREFIX,
+                e,
+                menu.current,
+            )
+            chosen = menu.current_vector
+        return {
+            "d_vector_name": chosen.name,
+            "d_token_vector": chosen.token_ratio,
+            "menu_fp": menu.menu_fingerprint,
+        }
+
+    def _adopt_menu_choice(self, dec) -> None:
+        """Install PP0's choice on THIS rank, BEFORE any byte moves.
+
+        Called on both sides of the one-decider channel -- PP0 immediately
+        before it executes, every follower immediately after the identity
+        check -- so the move plan and the cutover both run under one vector.
+
+        THIS ONE DOES RAISE. Unlike the choosing half above, adoption is where
+        a divergence is detected, and a divergence here is the case the whole
+        family stops for: two ranks splitting one token space two ways is a
+        silent out-of-bounds slot id, not a degraded mode.
+        """
+        menu = menu_of(self)
+        name = getattr(dec, "d_vector_name", None)
+        if menu is None:
+            if name:
+                raise KvReshardError(
+                    f"{LOG_PREFIX} rank {self._rank} was told to install the "
+                    f"D-vector {name!r} but declared NO MENU at boot. One rank "
+                    f"with a ceiling set and one without is the same defect as "
+                    f"two different ceiling sets: the pools were sized "
+                    f"differently. The group STOPS."
+                )
+            return
+        if not name:
+            # A menu is declared but PP0 sent no choice: an abort, a TP->PP
+            # flip, or a PP0 that could not read its backlog. Holding is the
+            # correct reading, and the dwell counter must not advance for a
+            # choice that was never made.
+            return
+        try:
+            entry = menu.adopt(
+                name=name,
+                token_ratio=getattr(dec, "d_token_vector", ()),
+                menu_fp=getattr(dec, "menu_fp", ""),
+                told_by=f"PP0 (epoch {dec.epoch})",
+            )
+        except Exception as e:  # noqa: BLE001 - re-raised as the family error
+            raise KvReshardError(f"{LOG_PREFIX} {e}") from e
+        # The move plan is built from `self._vec`, so the vector must move
+        # HERE -- before `_execute`, not at the cutover. Installing at the
+        # cutover alone would pack and exchange rows under the old key and
+        # then switch the owner rule under them.
+        self._vec = tuple(int(x) for x in entry.token_ratio)
 
     def take_flip_decision(self):
         """Rank 0 only: hand the pending decision to the request stream.
@@ -10442,6 +10574,29 @@ class PhaseFlipRuntime:
         except Exception:  # pragma: no cover - pacing must not raise
             pass
 
+    def _arming_backlog(self):
+        """The arming sample, WITH DEPTHS. One read per round, two consumers.
+
+        This used to be a bare count, and the docstring below still records
+        why a count was right FOR A DAMPER: the damper only needs "is the load
+        still there". The D-vector menu (user order 2026-09-20) needs the
+        SHAPE -- one 200k-token request and two hundred 1k ones are the two
+        ends of the menu and are indistinguishable by count. The terms are the
+        scheduler's own (``scheduler.py``: ``len(waiting_queue)``,
+        ``sum(len(req.origin_input_ids))``, ``max(len(...))``, and
+        ``sum(req.seqlen)`` off the running batch), so the menu and the regime
+        observer cannot end up with two different backlogs for one round.
+
+        Sampled ONCE and parked, because the damper and the menu must not see
+        two different rounds: a damper that stands down on a load the menu
+        then cannot see would arm a flip for a backlog that no longer exists.
+
+        ``None`` when unreadable -- never a fabricated empty backlog.
+        """
+        backlog = flip_backlog_from_scheduler(getattr(self, "_census_scheduler", None))
+        self._last_arming_backlog = backlog
+        return backlog
+
     def _arming_condition_persists(self) -> bool:
         """Is there still work waiting that wants the other layout?
 
@@ -10452,13 +10607,18 @@ class PhaseFlipRuntime:
         gone away", which is the one distinction the abandon counter needs and
         never had.
 
+        THE COARSENESS IS STILL RIGHT HERE and is now deliberate rather than
+        incidental: the sample underneath carries depths (see
+        :meth:`_arming_backlog`), and this predicate throws them away on
+        purpose. A damper that started refusing on a DEPTH would be a second
+        opinion about the decision, which is exactly what the paragraph above
+        forbids. The depths exist for the menu, which chooses the layout, not
+        for the damper, which only asks whether there is a load at all.
+
         False on anything unreadable, which keeps the counter's old behaviour
         exactly: an unreadable queue must not be able to disable a damper.
         """
         try:
-            scheduler = getattr(self, "_census_scheduler", None)
-            if scheduler is None:
-                return False
             # QUEUED **OR RUNNING**, and the difference cost a whole boot.
             #
             # The first version of this asked only about the waiting queue,
@@ -10467,18 +10627,11 @@ class PhaseFlipRuntime:
             # #full token: 457724, #queue-req: 0" and the damper did NOT stand
             # down, because by its reading nothing was waiting. The load that
             # most wants the other layout is the load that is already in the
-            # machine.
-            for name in ("waiting_queue", "grammar_queue"):
-                q = getattr(scheduler, name, None)
-                if q and len(q) > 0:
-                    return True
-            running = getattr(scheduler, "running_batch", None)
-            reqs = getattr(running, "reqs", None) if running is not None else None
-            if reqs and len(reqs) > 0:
-                return True
-            cur = getattr(scheduler, "cur_batch", None)
-            cur_reqs = getattr(cur, "reqs", None) if cur is not None else None
-            return bool(cur_reqs and len(cur_reqs) > 0)
+            # machine. `_arming_backlog` counts both, in that same order.
+            backlog = self._arming_backlog()
+            if backlog is None:
+                return False
+            return int(backlog.queued_reqs) > 0
         except Exception:  # noqa: BLE001 - a damper must not raise
             return False
 

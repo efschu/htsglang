@@ -110,6 +110,37 @@ class DVectorMenuError(RuntimeError):
 #: land on the same lattice and cannot differ by rounding alone.
 TOKEN_GRAIN = 64
 
+#: The ONE measured CUDA-graph capture figure this fork has, in seconds per
+#: rank, and its provenance. #578: a number that decides a trade is measured
+#: or it is named unmeasured; it is never a default that looks like a
+#: measurement.
+#:
+#: Read out of ``boot_weg2_weg2sb4_e4f1b9fcc6_0908_162906.P.log`` with
+#: ``managers/d_vector_menu_runtime.graph_capture_seconds_from_boot_log``:
+#:
+#:     PP0 target decode 2.67 s   PP1 2.18 s   PP2 2.18 s
+#:
+#: THIS REPLACES AN 18.0 s PLACEHOLDER, and the correction matters in the
+#: direction that decides the feature. 18.0 s against BAR1 legs of 0.21-0.41 s
+#: made recapture ~98 % of a switch and put payback at ~11 800 decode rounds
+#: (~3 min of continuous decode). The measured 2.67 s is still the dominant
+#: term -- roughly 7-13x the legs, not the "two orders of magnitude" the first
+#: pass claimed -- but it moves payback to ~1 700 rounds, which is inside a
+#: realistic D phase rather than outside it.
+#:
+#: THE BOUND ON THIS NUMBER, stated because it is easy to over-read: that boot
+#: captured ONE set ("target decode") on a 3-rank PP layout. A boot that also
+#: captures draft/verify shapes pays more, and the honest figure for such a
+#: boot is the per-rank ``__total__`` from ITS OWN log, not this constant.
+#: ``RankCensus.graph_capture_s`` therefore still defaults to 0.0 = unmeasured;
+#: this constant is a reference point for a reader, never an implicit default.
+MEASURED_GRAPH_CAPTURE_S = {
+    "boot": "boot_weg2_weg2sb4_e4f1b9fcc6_0908_162906.P.log",
+    "captured_sets": ("target decode",),
+    "per_rank_s": {"PP0": 2.67, "PP1": 2.18, "PP2": 2.18},
+    "max_s": 2.67,
+}
+
 
 # ---------------------------------------------------------------------------
 # Inputs
@@ -593,8 +624,38 @@ class SwitchPrice:
         the token key changes. Zero under a full-reset flip that drops D-KV;
         non-zero under the "D-KV bleibt resident" direction, which is exactly
         why that direction makes a vector switch more expensive, not less.
-      * ``graph_capture_s``  -- a new weight vector changes per-rank head
-        counts, so every captured decode/verify/draft shape is invalid.
+      * ``graph_capture_s``  -- EITHER vector axis invalidates every captured
+        decode/verify/draft shape. The weight axis for the obvious reason
+        (per-rank head counts change). The TOKEN axis for a reason that was
+        measured out of the code on 2026-09-20 and is the opposite of what
+        this field originally assumed: the weighted owner rule's WRITE side
+        consumes ``cp_S``/``cp_lo``/``cp_hi``/``cp_ratio`` as PYTHON-INT
+        SCALAR OPERANDS (``layers/dcp/owner.py:429-436``
+        ``dcp_weighted_write_slots``), and its call sites lie INSIDE the
+        captured decode body (``flashinfer_backend.py:2594`` via
+        ``forward_decode:2443``; ``triton_backend.py:2392`` via ``:2967``;
+        ``qwen_sparse_attn_backend.py:457`` via ``:2008``; capture at
+        ``decode_cuda_graph_runner.py:1893`` ->
+        ``runner_backend/full_cuda_graph_backend.py:163-170``). A scalar read
+        during capture is baked by value, and ``ShapeKey``
+        (``model_executor/runner/shape_key.py:22-35``) carries no layout axis,
+        so a stale graph is silently REUSED rather than missed.
+
+        THE IN-TREE "no CUDA-graph recapture" CLAIM DOES NOT COVER THIS.
+        ``phase_flip_runtime.py:24-26`` says it of POOLS ("pre-sized for BOTH
+        layouts: no growth, no address change"); its fuller twin
+        ``kv_reshard.py:46-50`` names its only graph-facing ground -- "graph
+        METADATA is rebuilt host-side per replay from the refreshed backend
+        bounds" -- which is the READ path, and true. ``DESIGN_297``'s
+        ownership-transition matrix enumerates every reader of the vector and
+        has no row for the captured KV WRITE. The gap was latent because the
+        cutover reinstalled the SAME vector every time ("the vector is
+        boot-constant"); a menu is precisely what arms it.
+
+        So the price of a token-key switch is a recapture unless the
+        destination's graph set is already resident -- which is what makes
+        :func:`second_graph_set_trade` the load-bearing question of the whole
+        menu rather than an optimisation.
 
     Seconds are ``max_r(bytes_r / link_r)`` per leg, NOT the total over a mean
     rate: the legs run in parallel across pairs and the barrier waits for the
@@ -695,8 +756,16 @@ def switch_price(
     binding = w_times if weight_s >= kv_s else k_times
     taktgeber = max(range(n), key=lambda r: binding[r]) if n else 0
 
+    # EITHER AXIS OWES A RECAPTURE. This condition read
+    # ``src.weight_ratio != dst.weight_ratio`` until the write-side finding
+    # above; the token axis was assumed graph-neutral on the strength of an
+    # in-tree sentence that turns out to be about the read path. Charging only
+    # the weight axis priced the cheapest-looking menu switch -- token key
+    # only, same weights -- as free, which is exactly the switch a backlog-
+    # driven menu takes most often.
+    changed = src.weight_ratio != dst.weight_ratio or src.token_ratio != dst.token_ratio
     recapture = 0.0
-    if src.weight_ratio != dst.weight_ratio and not graph_set_resident:
+    if changed and not graph_set_resident:
         recapture = float(census.graph_capture_s)
 
     return SwitchPrice(
@@ -744,11 +813,18 @@ class SecondGraphSetTrade:
 def second_graph_set_trade(v: DVector, census: RankCensus) -> SecondGraphSetTrade:
     """Price holding a SECOND resident graph set under vector ``v``.
 
-    ``graph_capture_s`` is the dominant term of :func:`switch_price` -- on this
-    rig it is roughly two orders of magnitude above the BAR1 legs -- so whether
-    two sets can stay resident is the single biggest lever on whether a menu is
-    worth having at all. It is answered here by re-deriving the vector against a
-    census that carries the second set, which keeps ONE derivation path.
+    ``graph_capture_s`` is the dominant term of :func:`switch_price` -- on the
+    one boot where it is measured it is 2.18-2.67 s per rank against BAR1 legs
+    of 0.21-0.41 s (:data:`MEASURED_GRAPH_CAPTURE_S`), so roughly 7-13x, not
+    the "two orders of magnitude" an 18.0 s placeholder made it look like.
+
+    IT IS STILL THE WHOLE QUESTION, and for a reason the correction does not
+    touch: since the write-side finding of 2026-09-20 a token-key switch owes
+    a recapture too, so without a second resident set the menu has no cheap
+    move at all. Whether two sets can stay resident is therefore not an
+    optimisation of the menu -- it is the menu's precondition. Answered here
+    by re-deriving the vector against a census that carries the second set,
+    which keeps ONE derivation path.
     """
     graphs = census.graphs
     if not any(graphs):

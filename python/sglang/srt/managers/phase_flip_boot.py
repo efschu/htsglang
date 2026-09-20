@@ -47,6 +47,7 @@ from typing import Dict, List, Optional, Tuple
 import torch
 
 from sglang.srt.layers.dcp.reshard_plan import KvReshardError
+from sglang.srt.managers.d_vector_menu_runtime import declare_menu_from_env
 from sglang.srt.model_executor.rotation_executor import allocate_rotation_image
 from sglang.srt.model_executor.weights_arena import (
     ArenaLayout,
@@ -1429,6 +1430,40 @@ def build_flip_draft_worker(scheduler, tp_worker, tp_args, world_rank):
 #: lives on the thing being built cannot go stale relative to it.
 COLD_STACK_BUILT_ATTR = "_phase_flip_cold_stack_built"
 
+#: Which TOKEN VECTORS this worker has a captured graph set for.
+#:
+#: ``COLD_STACK_BUILT_ATTR`` above is a BOOLEAN, and until the D-vector menu
+#: that was exactly right: one stack, one vector, one set of shapes, and a
+#: second ``init_cuda_graphs()`` could only ever be the double-build the flag
+#: exists to catch ("built twice, which allocates a second set of workspaces
+#: and a second capture, silently").
+#:
+#: The menu makes a second set a LEGITIMATE, PRICED purchase rather than a
+#: bug -- ``planner/d_vector_menu.second_graph_set_trade`` costs it in
+#: GESAMTPOOL tokens against recapture seconds -- because the owner rule's
+#: write side bakes cp_S/cp_lo/cp_hi/cp_ratio into the captured body
+#: (``layers/dcp/owner.py:429-436``), so a token-key switch with no resident
+#: set for the destination is silently wrong output.
+#:
+#: So the IDENTITY of the latch moves from "anything" to "this vector", and
+#: the boolean keeps its exact old meaning for every existing caller: a
+#: worker with one set still reports built, and a second set is refused
+#: unless it is asked for BY VECTOR through :func:`build_graph_set_for_vector`.
+COLD_STACK_VECTORS_ATTR = "_phase_flip_cold_stack_vectors"
+
+
+def cold_stack_vectors(tp_worker) -> Tuple[Tuple[int, ...], ...]:
+    """Token vectors this worker has captured graph shapes for."""
+    return tuple(getattr(tp_worker, COLD_STACK_VECTORS_ATTR, ()) or ())
+
+
+def note_cold_stack_vector(tp_worker, token_vector) -> None:
+    """Record that a graph set exists for ``token_vector``. Idempotent."""
+    key = tuple(int(x) for x in token_vector)
+    have = cold_stack_vectors(tp_worker)
+    if key not in have:
+        setattr(tp_worker, COLD_STACK_VECTORS_ATTR, have + (key,))
+
 
 def build_cold_stack_posts(
     tp_worker, draft_worker, draft_carrier, *, where: str
@@ -1510,7 +1545,87 @@ def build_cold_stack_posts(
         )
 
     setattr(tp_worker, COLD_STACK_BUILT_ATTR, True)
-    logger.info("%s cold stack posts built at %s", LOG_PREFIX, where)
+    # The shapes just captured belong to whatever token key is installed RIGHT
+    # NOW -- read from the live global rather than passed in, so the record
+    # cannot drift from what the capture actually baked.
+    from sglang.srt.distributed.utils import get_cp_token_ratios
+
+    _installed = get_cp_token_ratios()
+    if _installed:
+        note_cold_stack_vector(tp_worker, _installed)
+    logger.info(
+        "%s cold stack posts built at %s; graph set now resident for token "
+        "vector(s) %s",
+        LOG_PREFIX,
+        where,
+        [list(v) for v in cold_stack_vectors(tp_worker)],
+    )
+    return True
+
+
+def build_graph_set_for_vector(
+    tp_worker, draft_worker, token_vector, *, where: str
+) -> bool:
+    """Capture a SECOND graph set, under a second declared token key.
+
+    THE ONE LEGITIMATE DOUBLE BUILD. ``build_cold_stack_posts`` refuses a
+    second call by design and that refusal is correct for the case it was
+    written for -- an accidental re-entry, which allocates a second set of
+    workspaces and a second capture silently. What it cannot express is a
+    second set that was ASKED FOR, priced, and is the only thing that makes a
+    D-vector menu switch installable at all.
+
+    So this is a separate, named entry point rather than a flag on the other
+    one: the accidental case still hits the latch, and the deliberate case has
+    to say which vector it is buying. A vector already captured is a no-op,
+    which keeps it safe to call per boot without a second latch of its own.
+
+    THE CALLER OWNS THE INSTALL. This function does not touch
+    ``set_cp_token_ratios``: the capture bakes whatever owner bounds are
+    installed when it runs, so the caller must install ``token_vector``,
+    refresh the bounds, call this, and reinstall the boot vector. Doing the
+    install here would hide the one ordering that matters inside a helper.
+
+    Returns True if it captured; False if the set was already resident.
+    """
+    from sglang.srt.distributed.utils import get_cp_token_ratios
+
+    key = tuple(int(x) for x in token_vector)
+    if key in cold_stack_vectors(tp_worker):
+        logger.info(
+            "%s graph set for token vector %s already resident; %s is a no-op",
+            LOG_PREFIX,
+            list(key),
+            where,
+        )
+        return False
+    installed = tuple(int(x) for x in (get_cp_token_ratios() or ()))
+    if installed != key:
+        raise PhaseFlipBootError(
+            f"{LOG_PREFIX} build_graph_set_for_vector({list(key)}) was called "
+            f"with token vector {list(installed)} installed. The capture bakes "
+            f"the owner bounds that are live at capture time "
+            f"(layers/dcp/owner.py:429-436 reads cp_S/cp_lo/cp_hi/cp_ratio as "
+            f"python scalars inside the captured decode body), so capturing "
+            f"under one key and recording it under another would produce "
+            f"exactly the silent read/write drift the second set exists to "
+            f"prevent. Install the key, refresh the owner bounds, then call "
+            f"this."
+        )
+    _guard_geometry_before_backend_build(tp_worker, where)
+    tp_worker.init_cuda_graphs()
+    if draft_worker is not None:
+        draft_worker.init_cuda_graphs()
+    note_cold_stack_vector(tp_worker, key)
+    logger.warning(
+        "%s SECOND GRAPH SET captured at %s for token vector %s. This is the "
+        "second_graph_set_trade, paid in VRAM that the KV pool therefore does "
+        "not get; resident sets are now %s.",
+        LOG_PREFIX,
+        where,
+        list(key),
+        [list(v) for v in cold_stack_vectors(tp_worker)],
+    )
     return True
 
 
@@ -1616,6 +1731,35 @@ def build_phase_flip_tp_stack(scheduler) -> PhaseFlipStacks:
     tok_vec = parse_flip_token_vector(server_args)
     n = len(vec)
     world_rank = get_world_group().rank_in_group
+
+    # THE D-VECTOR MENU'S CEILING SET (user order 2026-09-20), declared HERE
+    # and nowhere else. This function is the one place in the boot that owns
+    # the TP layout end to end -- it installs the token key, sizes the pools
+    # and captures the graphs -- so it is also the only place where "which
+    # token keys may this boot ever install" can be stated before any of the
+    # three is decided. A declaration made later would be a declaration made
+    # after the pools it constrains.
+    #
+    # Absent flag -> None, and every seam downstream is a no-op returning the
+    # boot-constant vector. A PRESENT but broken declaration raises and kills
+    # the boot, on purpose: a menu that silently failed to load would run the
+    # pre-order layout under a log line claiming a menu.
+    scheduler.d_vector_menu = declare_menu_from_env(rank=world_rank)
+    if scheduler.d_vector_menu is not None:
+        _menu = scheduler.d_vector_menu
+        logger.warning(
+            "%s D-VECTOR MENU declared: %s. The boot-installed token key is "
+            "%s; the menu may install any DECLARED entry whose graph set AND "
+            "arena layout are resident (installable: %s). Pools on this rank "
+            "must back the elementwise-max caps %s -- this function does NOT "
+            "resize them, so a cap above what the allocator actually took is "
+            "a refusal at adoption, not a silent reshape.",
+            LOG_PREFIX,
+            _menu.describe(),
+            list(tok_vec),
+            list(_menu.installable),
+            list(_menu.ceiling_kv_cap_rows),
+        )
     primary_runner = scheduler.tp_worker.model_runner
     device = primary_runner.device
 

@@ -1511,24 +1511,71 @@ class PhaseFlipDecision:
     disagreement, so it counts and never kills (see on_round).
     """
 
-    __slots__ = ("verdict", "epoch", "dir_id", "config_fp", "vector", "tree_digest")
+    __slots__ = (
+        "verdict",
+        "epoch",
+        "dir_id",
+        "config_fp",
+        "vector",
+        "tree_digest",
+        "d_vector_name",
+        "d_token_vector",
+        "menu_fp",
+    )
 
     PROCEED = "proceed"
     ABORT = "abort"
 
-    def __init__(self, *, verdict, epoch, dir_id, config_fp, vector, tree_digest):
+    def __init__(
+        self,
+        *,
+        verdict,
+        epoch,
+        dir_id,
+        config_fp,
+        vector,
+        tree_digest,
+        d_vector_name=None,
+        d_token_vector=(),
+        menu_fp="",
+    ):
         self.verdict = str(verdict)
         self.epoch = int(epoch)
         self.dir_id = int(dir_id)
         self.config_fp = int(config_fp)
         self.vector = tuple(int(v) for v in vector)
         self.tree_digest = int(tree_digest)
+        # THE D-VECTOR MENU (user order 2026-09-20), and why it is THREE new
+        # fields beside `vector` rather than a new meaning for `vector`.
+        #
+        # `vector` is a CHECKSUM: the PREVIOUS effective vector, which every
+        # follower verifies against its own and dies on a mismatch. It is the
+        # backstop that catches ranks drifting apart. Re-purposing it into
+        # "the vector I am about to install" would have deleted that backstop
+        # in the same commit that first gave the vector a reason to move.
+        #
+        # So the CHOICE travels separately:
+        #   * `menu_fp`        -- the declared ceiling set's fingerprint. A
+        #     follower holding a different one has a differently-sized pool;
+        #     that is CRASH/STOP, like every other identity field here.
+        #   * `d_vector_name`  -- which declared entry. A name the follower
+        #     never declared is a REFUSAL BY NAME, the shape
+        #     KvReshardRuntime.arm already uses for an undeclared target.
+        #   * `d_token_vector` -- the token key behind that name, carried so a
+        #     name that means two different splits cannot pass silently.
+        # All three default to "absent", so a boot with no menu builds and
+        # compares decisions exactly as before.
+        self.d_vector_name = None if d_vector_name is None else str(d_vector_name)
+        self.d_token_vector = tuple(int(v) for v in d_token_vector)
+        self.menu_fp = str(menu_fp)
 
     def __repr__(self) -> str:  # pragma: no cover - diagnostics only
         return (
             f"PhaseFlipDecision(verdict={self.verdict!r}, epoch={self.epoch}, "
             f"dir_id={self.dir_id}, config_fp={self.config_fp}, "
-            f"vector={self.vector}, tree_digest={self.tree_digest})"
+            f"vector={self.vector}, tree_digest={self.tree_digest}, "
+            f"d_vector_name={self.d_vector_name!r}, "
+            f"d_token_vector={self.d_token_vector}, menu_fp={self.menu_fp!r})"
         )
 
 
