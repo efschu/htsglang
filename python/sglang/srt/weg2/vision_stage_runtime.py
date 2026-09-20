@@ -309,9 +309,20 @@ def run_vision_stage(
         # --- teardown, on EVERY path -----------------------------------------
         t0 = clock()
         release_error = None
+        released = False
         if handle is not None:
+            # xsn410 (20.09.): the runtime's OWN reference must go first. The hook's
+            # `del handle` dropped only the callee's name while this frame kept the
+            # module alive, so its empty_cache() returned nothing: ~2.1 GiB (tower
+            # + encode workspace) stayed reserved in P's tokenizer process on card0
+            # and D's TP1 fell 1343 MiB short at the next wake (W114, flip stall).
+            # The hook now receives the SOLE reference in a one-slot box it must
+            # empty before it empties the cache; the census below is the proof.
+            box: List[Any] = [handle]
+            handle = None
+            released = True
             try:
-                hooks.release_tower(handle)
+                hooks.release_tower(box)
             except Exception as exc:  # noqa: BLE001
                 # Recorded, not raised here: a stranded band is worse than a
                 # stranded tower (wrong text against an OOM), so the restores
@@ -330,7 +341,32 @@ def run_vision_stage(
             except Exception as exc:  # noqa: BLE001
                 stranded.append(blk.name)
                 causes.append(f"{blk.name}: {exc}")
+        residue_mib = None
+        if released and release_error is None and not stranded:
+            # THE PROOF THAT THE TOWER LEFT: the same idle census the plan was
+            # sized from, read again. A residue near the tower's size means the
+            # hook emptied the cache with the module still alive somewhere.
+            try:
+                after = {int(c.card): int(c.free_bytes) for c in hooks.census()}
+                if plan.card in after:
+                    residue_mib = (int(plan.free_before_bytes) - after[plan.card]) / (1 << 20)
+            except Exception as exc:  # noqa: BLE001 -- unmeasured, never unmentioned
+                logger.info("vision stage: teardown census unreadable (%s: %s)", type(exc).__name__, exc)
         measured["teardown"] = clock() - t0
+        if residue_mib is not None:
+            tower_mib = tower.weight_bytes / (1 << 20)
+            logger.info(
+                "W102 Weg2VisionStage teardown card=%d residue=%.0f MiB (free_idle_before %.3f GiB "
+                "vs census after release; tower %.0f MiB) rid=%s",
+                plan.card, residue_mib, plan.free_before_bytes / (1 << 30), tower_mib, rid or "<unset>",
+            )
+            if residue_mib > max(256.0, 0.5 * tower_mib):
+                release_error = RuntimeError(
+                    f"card{plan.card}: {residue_mib:.0f} MiB of the card's idle air did not "
+                    f"come back after the release (tower {tower_mib:.0f} MiB) -- the tower or "
+                    "its workspace is still held; the co-resident group's next kv resume "
+                    "on this card would be refused (xsn410 W114)"
+                )
         if stranded:
             raise VisionStageTeardownIncomplete(
                 plan.card, stranded, "; ".join(causes)

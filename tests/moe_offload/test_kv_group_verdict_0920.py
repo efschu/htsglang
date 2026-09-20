@@ -68,10 +68,45 @@ def test_world_size_one_is_the_own_verdict(monkeypatch):
     assert r.memory_saver_adapter.paused == []
 
 
-def test_the_late_site_asks_the_group_before_marking_the_epoch_done():
+def test_the_verdict_sits_between_the_resume_and_the_clear_half():
+    """xsn410: after the clear half (xsn409's placement) the verdict deadlocked --
+    the resumed ranks ran the clear half's own collective
+    (_weg2_release_dormant_hold -> _weg2_group_min_flags) while the refused
+    rank waited in the verdict's all_gather. Now: every exit of the resume
+    half votes, and the clear half runs on no rank unless the group resumed."""
     import inspect
 
     src = inspect.getsource(CLS)
-    i_v = src.index("_weg2_kv_ok = self._weg2_kv_group_verdict(bool(_weg2_kv_ok), _kv_epoch)")
-    i_done = src.index("self._weg2_kv_epoch_done = _kv_epoch", i_v)
-    assert i_v < i_done
+    i_part = src.index("def _weg2_kv_resume_part():")
+    i_clear = src.index("def _weg2_kv_clear_part():", i_part)
+    part = src[i_part:i_clear]
+    # the two refusals vote False; the landed resume votes True before the epoch mark
+    assert part.count("return self._weg2_kv_group_verdict(False, _kv_epoch)") == 2
+    i_yes = part.index("if not self._weg2_kv_group_verdict(True, _kv_epoch):")
+    i_mark = part.index("self._weg2_kv_resumed_epoch = _kv_epoch")
+    i_resume = part.index("self.memory_saver_adapter.resume(GPU_MEMORY_TYPE_KV_CACHE)")
+    assert i_resume < i_yes < i_mark
+    # the late site no longer votes a second time
+    late = src[i_clear:]
+    assert "_weg2_kv_group_verdict(bool(_weg2_kv_ok)" not in late
+
+
+def test_the_plan_and_the_mid_site_are_group_uniform():
+    """The resume half now carries a collective, so the decisions that gate it
+    (early/late plan, mid-legs resume) must be the GROUP's, not one rank's."""
+    import inspect
+
+    src = inspect.getsource(CLS)
+    assert 'self._weg2_kv_group_all(_fundable, "WAKE-KV-FIRST fundable")' in src
+    assert "fundable=_fundable," in src
+    assert '_mid_ok = self._weg2_kv_group_all(bool(_mid_ok), "WAKE-KV-MID tag=%s" % (tag,))' in src
+
+
+def test_group_all_is_an_and_over_the_votes(monkeypatch):
+    ALL = CLS._weg2_kv_group_all
+    _wire(monkeypatch, [True, True, True])
+    assert ALL(_rank(), True, "x") is True
+    _wire(monkeypatch, [True, False, True])
+    assert ALL(_rank(), True, "x") is False
+    monkeypatch.setattr(wu.torch.distributed, "get_world_size", lambda group=None: 1, raising=False)
+    assert ALL(_rank(), True, "x") is True and ALL(_rank(), False, "x") is False
