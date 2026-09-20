@@ -761,10 +761,15 @@ class DefaultModelLoader(BaseModelLoader):
         # see weight_utils.pread_safetensors_file). Only the primary source:
         # a secondary source (draft) has its own model.
         self._weight_name_filter = getattr(model, "weight_name_needed", None)
+        # fn8r3 20.09.: the prefetch branch of _get_weights_iterator asks the
+        # config being loaded (is_draft_model); the generator has no config
+        # parameter, so it is parked here for the duration of the primary read.
+        self._loading_model_config = model_config
         try:
             yield from self._get_weights_iterator(primary_weights)
         finally:
             self._weight_name_filter = None
+            self._loading_model_config = None
 
         secondary_weights = cast(
             Iterable[DefaultModelLoader.Source], getattr(model, "secondary_weights", ())
