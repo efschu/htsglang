@@ -364,3 +364,24 @@ def test_the_idle_reading_is_a_different_instrument_from_the_peak_one():
     assert "free_idle" in inspect.getdoc(vfc.log_vram_idle) or "free_idle" in (
         inspect.getsource(vfc.log_vram_idle)
     )
+
+
+def test_argv_p_hands_the_vision_form_to_the_model_argv():
+    """xsn403 (20.09.): argv_p accepted ``vision`` and dropped it, so P was
+    launched text-only (``--no-enable-multimodal``) and the transient stage
+    refused to arm (W111). The P argv must carry the transient override and
+    NOT the multimodal switch-off; ``off`` keeps the old argv; D stays
+    text-only regardless."""
+    from sglang.srt.weg2 import launcher as lz
+
+    def p_argv(vision):
+        return lz.argv_p("py", "/models/Qwen3.8-27B-INT8-gdncov", [1, 1, 1], 4, 512,
+                         "store", [], vision=vision)
+
+    transient = p_argv("transient")
+    assert "--no-enable-multimodal" not in transient
+    i = transient.index("--json-model-override-args")
+    assert transient[i + 1] == lz.VISION_TRANSIENT_OVERRIDE
+    off = p_argv("off")
+    assert "--no-enable-multimodal" in off
+    assert "--json-model-override-args" not in off
