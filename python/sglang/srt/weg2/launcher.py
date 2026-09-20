@@ -75,6 +75,9 @@ from sglang.srt.weg2 import (
     DEFAULT_PP_ORDERED_CUT,
 )
 from sglang.srt.weg2 import admin_key as admin_key_mod
+# Task #58: the arming variable's name comes from the module that READS it, so
+# the publisher and the reader cannot drift into two spellings of one key.
+from sglang.srt.weg2.vision_stage_boot import VISION_ENV as VISION_STAGE_ENV
 from sglang.srt.weg2 import (
     checkpoint_census,
     corridor_budget,
@@ -2585,7 +2588,43 @@ def store_read_cost_line(plan: StoreDiskPlan, cap_tokens: int) -> str:
 #: and the front refuses them by name, so the bytes bought nothing.
 VISION_OFF = "off"
 VISION_RESIDENT = "resident"
-VISION_CHOICES = (VISION_OFF, VISION_RESIDENT)
+#: Task #58 (user order 2026-09-20): the tower is in NO layout resident. An
+#: image request loads it onto one card before the P prefill really starts,
+#: runs it, and takes it down again.
+#:
+#: THE ARGV IS NOT `--no-enable-multimodal` FOR THIS ONE, and that is the
+#: whole difference. `off` passes that flag, which also switches off the
+#: TOKENIZER's image path (`model_config.py:573 is_multimodal`), so no
+#: `mm_items` are ever built and there is nothing for a stage to encode.
+#: `transient` instead sets the hf-config override `language_model_only`,
+#: which `vision_tower_forced_off` (`models/qwen3_vl.py:1230`) also honours:
+#: the tokenizer keeps processing images, `self.visual` stays None
+#: (`:1286`), `skip_vision_weight` (`:1243`) drops the checkpoint's tower
+#: tensors, and `weight_name_needed` now stops them being READ at all.
+#: Measured in fn8ag2 (docstring `qwen3_vl.py:1216-1220`).
+VISION_TRANSIENT = "transient"
+VISION_CHOICES = (VISION_OFF, VISION_RESIDENT, VISION_TRANSIENT)
+
+#: `--json-model-override-args` payload for the transient form. One constant
+#: so the launcher and the tests cannot drift.
+VISION_TRANSIENT_OVERRIDE = '{"language_model_only": true}'
+
+
+def vision_model_flags(vision: str):
+    """The model-side argv this vision form needs. PURE -- enumerable at a
+    desk, which is where the three forms are pinned against each other."""
+    if vision == VISION_OFF:
+        return ["--no-enable-multimodal"]
+    if vision == VISION_TRANSIENT:
+        return ["--json-model-override-args", VISION_TRANSIENT_OVERRIDE]
+    if vision == VISION_RESIDENT:
+        return []
+    raise ValueError(
+        f"unknown --weg2-vision {vision!r}; expected one of "
+        f"{list(VISION_CHOICES)}. Refusing rather than defaulting: a boot "
+        "whose tower state nobody stated is a boot that can return plausible "
+        "wrong text for an image request."
+    )
 
 
 def common_flags(
@@ -2663,7 +2702,7 @@ def common_flags(
         # is the #1362 fossil class. `--no-enable-multimodal` became spellable
         # in this same commit; before it, `False` existed in the tri-state and
         # in the config branch and no caller could say it.
-    ] + (["--no-enable-multimodal"] if vision == VISION_OFF else []) + [
+    ] + vision_model_flags(vision) + [
         # #1362 FOSSIL 4: this was the LITERAL "Qwen3.8-27B" on every boot,
         # including the 4B-FP8 transition vehicle -- the served name is what the
         # front, the load drivers and every probe address, so a wrong one makes
@@ -4465,6 +4504,11 @@ def _env_knobs(ns) -> Dict[str, object]:
         "lane_coverage_dir": lane_coverage_dump_dir(ns),
         "lane_coverage_token": lane_coverage_boot_token(ns),
         "weg2_boot_token": weg2_boot_token(ns),
+        # Task #58: the vision form, so `build_env` can publish the arming
+        # variable for P. Gathered HERE with the other six for the reason this
+        # function exists: three call sites build an environment and a value
+        # spelled out at each of them is a value that drifts.
+        "vision": str(getattr(ns, "weg2_vision", VISION_OFF)),
     }
 
 
@@ -4586,8 +4630,31 @@ def build_env(tree: str, venv: str, cvd: str, store_dir: str, debug_hold: bool, 
               # `weg2_boot_token`'s own docstring for why this one is safe to
               # publish UNCONDITIONALLY where that one may not be.
               weg2_boot_token: str = "",
+              # Task #58: which vision form this boot runs. Published as
+              # SGLANG_WEG2_VISION for the P group ONLY (see below).
+              vision: str = VISION_OFF,
               xchg_env: Optional[Dict[str, str]] = None) -> Dict[str, str]:
     env = dict(os.environ)
+    # Task #58: THE ARMING SIGNAL for the transient vision stage, and the ONE
+    # thing that turns `vision_stage_service`'s seam from a no-op into a stage.
+    # Read by `weg2/vision_stage_boot.vision_mode`, which the P group's
+    # tokenizer process calls once.
+    #
+    # SAME DISCIPLINE AS SGLANG_WEG2_GROUP AND THE RING FAMILY (R19): launcher
+    # OUTPUT, published only when this call names the transient form AND the P
+    # group, POPPED otherwise -- a value inherited from the operator's shell
+    # must never arm a stage nobody asked for, and a D rank that armed one
+    # would spawn a CUDA-context probe and load a tower on a group that has no
+    # use for either.
+    #
+    # P ONLY, and that is the design's decision, not a shortcut: the transient
+    # stage exists because the P layout has no tower and needs the rows before
+    # its prefill (DESIGN_VISION_TRANSIENT_0920 §6). The front forces image
+    # requests to the long/P route for the same reason.
+    if vision == VISION_TRANSIENT and group == "P":
+        env[VISION_STAGE_ENV] = VISION_TRANSIENT
+    else:
+        env.pop(VISION_STAGE_ENV, None)
     # #1348: the exchange lane's unexecuted-line instrument. SAME DISCIPLINE
     # as SGLANG_WEG2_GROUP and the host-ring family below (R19): this is
     # LAUNCHER OUTPUT, published only when `--xchg-coverage-diff` named a
@@ -12369,6 +12436,11 @@ def front_argv_for(py: str, store_dir: str, p_pid: int, d_pid: int, dc_expect_d:
         "--port", str(PORT_FRONT), "--host", front_host, "--awake", "D", "--tag", ns.tag,
         "--store-dir", store_dir,
         "--prefill-sid", str(p_pid), "--decode-sid", str(d_pid),
+        # Task #58: the front decides image requests (route / stage / refuse)
+        # and it cannot infer the mode from the groups it talks to -- their
+        # tower state is in THEIR argv, not in any response the front sees.
+        # Told once, here, so --dry-run prints it too.
+        "--vision", str(getattr(ns, "weg2_vision", VISION_OFF)),
         "--dc-reserve", ",".join(f"{c.uuid}={dc_expect_d.get(c.uuid, 0)}" for c in cards),
         "--fairness-w-s", str(ns.fairness_w_s),
         "--weight-chunks", str(chunk_count),

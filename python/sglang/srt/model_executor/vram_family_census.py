@@ -96,7 +96,64 @@ def log_vram_family_census(
             torch.cuda.reset_peak_memory_stats()
         except Exception:  # noqa: BLE001
             pass
+        # #58: and THIS is the moment the idle reading is honest -- pools
+        # built, nothing forwarding yet. The vision stage is placed against
+        # this number, not against [vram-peak]'s.
+        log_vram_idle(runner, "after pools")
     return fam
+
+
+# --- [vram-idle]: the free air with NO forward in flight ---------------------
+#
+# Task #58. `[vram-peak]` answers "how much did this rank draw at its worst",
+# which is the right instrument for sizing a POOL that coexists with the
+# prefill. It is the WRONG instrument for the transient vision stage, which
+# runs before the P prefill really starts and is gone before it: sizing that
+# stage against a number with the prefill transient already subtracted
+# understates the card by the whole transient (1.69-2.47 GiB per rank on
+# fn8aj) and refuses placements that would have fit.
+#
+# `weg2/corridor_budget.py:143` already distinguishes `free_idle_mib` from
+# `free_load_mib` in its data model -- what was missing was an emitter that
+# prints the idle half. Until this line exists in a boot log, the vision
+# stage planner is fed fn8aj's quietest `[vram-peak] decode` sample as a
+# STAND-IN, and that stand-in is named as one in
+# `tests/moe_offload/test_vision_stage_planner_0920.py`.
+
+
+def log_vram_idle(runner, where: str, cuda=torch.cuda) -> Optional[float]:
+    """Print this rank's card free/total with no forward in flight.
+
+    Returns the free GiB, or ``None`` when the reading could not be taken --
+    and ``None`` is NOT logged as zero, because a card that could not be read
+    is not a full card.
+
+    ``where`` names the moment ("after pools", "idle", "before vision stage"),
+    so two lines from one boot are never confused for one instrument sampled
+    twice.
+    """
+    try:
+        free, total = cuda.mem_get_info()
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("[vram-idle] skipped: %s", exc)
+        return None
+    try:
+        alloc = cuda.memory_allocated() / 2**30
+        reserved = cuda.memory_reserved() / 2**30
+    except Exception:  # noqa: BLE001
+        alloc = reserved = float("nan")
+    free_gib = free / 2**30
+    logger.info(
+        "[vram-idle] %s: card free %.3f of %.3f GiB, allocated %.2f, reserved %.2f "
+        "-- NO forward in flight; this is free_idle, the input the transient "
+        "vision stage is placed against (#58)",
+        where,
+        free_gib,
+        total / 2**30,
+        alloc,
+        reserved,
+    )
+    return free_gib
 
 
 # --- [vram-peak]: the transient the planner has to leave room for -----------

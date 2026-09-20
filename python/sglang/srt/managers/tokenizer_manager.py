@@ -410,6 +410,55 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     tokenizer_backend=server_args.tokenizer_backend,
                 )
 
+        # Task #58: ARM THE TRANSIENT VISION STAGE, here and nowhere else.
+        #
+        # This is the process the design picked (DESIGN_VISION_TRANSIENT_0920
+        # slice 9): it holds the pixels, it can bind any card, and upstream
+        # itself fills `precomputed_embeddings` in it (`moss_vl.py:587`). The
+        # seam that CALLS the stage is in `base_processor`; without this call
+        # it is a permanent no-op, which is exactly what every boot before this
+        # one did with `--weg2-vision transient`.
+        #
+        # OUTSIDE the multimodal branch on purpose. Inside it, a transient boot
+        # whose model config came back NOT multimodal would arm nothing and say
+        # nothing -- the one silent shape this whole path exists to end. Out
+        # here, `arm_transient_vision` sees that case and refuses it by name
+        # (W111) like every other missing precondition.
+        #
+        # It never raises. An arming failure leaves the TEXT path exactly as it
+        # was and makes the IMAGE path loud: the first image request refuses by
+        # name (W112) quoting the boot-time reason.
+        #
+        # Under any other `--weg2-vision` value (and in any process that is not
+        # the P group's) it returns before touching a single piece of state.
+        #
+        # The import is guarded for the DEFAULT path's sake: an upstream boot
+        # must not die because a Weg-2 module failed to import. A transient boot
+        # must not silently survive one either -- the key is spelled literally
+        # HERE and only here, because the module that owns the constant is
+        # precisely the one that did not import, and `install_refusal` lives in
+        # it too; the W111 line in the log is what remains.
+        try:
+            from sglang.srt.weg2.vision_stage_boot import arm_transient_vision
+        except Exception as _exc:  # noqa: BLE001
+            if os.environ.get("SGLANG_WEG2_VISION", "").strip() == "transient":
+                logger.error(
+                    "W111 Weg2VisionArmRefused -- this boot asked for "
+                    "--weg2-vision transient and sglang.srt.weg2."
+                    "vision_stage_boot could not be imported: %s. The transient "
+                    "vision stage is NOT armed; image requests to this group "
+                    "cannot be served.",
+                    _exc,
+                )
+            else:
+                logger.debug("transient vision arming unavailable: %s", _exc)
+        else:
+            arm_transient_vision(
+                server_args,
+                self.model_config,
+                multimodal=bool(self.mm_processor is not None),
+            )
+
         # Initialize async dynamic batch tokenizer if enabled (common for both multimodal and non-multimodal)
         if (
             server_args.enable_dynamic_batch_tokenizer
