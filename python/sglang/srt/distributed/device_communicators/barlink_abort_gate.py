@@ -389,7 +389,8 @@ def clear_poison_record() -> None:
 
 
 def pause_polling() -> _PausePolling:
-    """Exclude the watchdog's device reads for the duration of a capture.
+    """Exclude the watchdog's device reads for the duration of a capture
+    OR of a torch-memory-saver pause/resume.
 
     Entered by ``parallel_state.graph_capture`` -- the ONE context manager
     that surrounds every CUDA-graph capture in this process, so there is one
@@ -397,6 +398,13 @@ def pause_polling() -> _PausePolling:
     ``barlink.graph_capture_running()`` cannot serve here: it asks whether the
     CALLING THREAD's current stream is capturing, and the watchdog is a
     different thread, where the honest answer is always False.
+
+    #1489 adds the SECOND entrant, and it is the same fact in a different
+    coat: ``torch_memory_saver_adapter``'s ``pause``/``resume``. A TMS pause
+    unmaps the physical handles behind a tag while KEEPING the virtual
+    reservation, so for the length of the call the watchdog can hold a device
+    pointer that still LOOKS live and is not backed. The exclusion is the
+    structural answer -- the transport-side pre-check below is only the belt.
     """
     return _PausePolling()
 
@@ -404,6 +412,54 @@ def pause_polling() -> _PausePolling:
 def polling_paused() -> bool:
     with _capture_lock:
         return _capture_depth > 0
+
+
+# --- #1489: the gate itself can be disarmed, not just one transport ---------
+# Boot weg2xsn406 (2026-09-20 16:49:25Z) is the specimen that #1330's
+# per-transport disarm does not cover. A manual `/weg2/flip` arrived while D
+# was awake; the wake's `resume_memory_occupation` hit
+#   [core.cpp] WEG2-TMS-RESUME REFUSED tag=kv_cache rc=2 (out of memory)
+#              ... every allocation of the tag is PAUSED again
+# and left the control word's backing unmapped. The watchdog pass then raised
+# `RuntimeError: unknown parameter type` on transport A, disarmed A -- and the
+# `for` loop CONTINUED to transport B in the same poisoned context, raised
+# again, and the process died with `Fatal Python error: Segmentation fault`
+# whose current thread was `poll_status_word` itself.
+#
+# The per-transport disarm is therefore necessary and NOT sufficient: one
+# unmapped mapping is a statement about the PROCESS's device memory, not about
+# one transport. The first poll failure of any shape stops the whole gate, by
+# name, once.
+_gate_lock = threading.Lock()
+_gate_disarmed: Optional[str] = None
+
+
+def disarm_gate(why: str) -> bool:
+    """Stop the watchdog's device polling for this process. Returns True once.
+
+    Losing the instrument is strictly better than losing the process, and the
+    abort word is sticky, so what a disarmed gate costs is the LAST KNOWN
+    verdict and nothing else -- no consumer's view can go backwards.
+    """
+    global _gate_disarmed
+    with _gate_lock:
+        if _gate_disarmed is not None:
+            return False
+        _gate_disarmed = str(why)
+    return True
+
+
+def gate_disarmed() -> Optional[str]:
+    """The reason the gate stopped polling, or None while it still polls."""
+    with _gate_lock:
+        return _gate_disarmed
+
+
+def rearm_gate() -> None:
+    """Test-only. A real process does not un-lose a mapping."""
+    global _gate_disarmed
+    with _gate_lock:
+        _gate_disarmed = None
 
 
 def poll_status_words() -> int:
@@ -423,6 +479,11 @@ def poll_status_words() -> int:
     if not abort_check_enabled():
         return 0
     if polling_paused():
+        return 0
+    if gate_disarmed() is not None:
+        # #1489: a previous pass already said, by name, that this process's
+        # device memory is not safe to read. Asking again every round is the
+        # amplifier, not the safety net.
         return 0
     tripped = 0
     for transport in registered():
@@ -469,6 +530,27 @@ def poll_status_words() -> int:
             _disarm = getattr(transport, "_abort_poll_disarm", None)
             if callable(_disarm):
                 _disarm("the status poll raised; see the traceback above")
+            # #1489: AND STOP THE WHOLE PASS. Disarming only the transport
+            # that raised left the loop free to walk into the NEXT one with
+            # the same unmapped backing -- boot weg2xsn406 logged exactly two
+            # tracebacks from two transports in one pass and then segfaulted
+            # inside `poll_status_word`. One unmapped mapping is a fact about
+            # this PROCESS's device memory, not about one transport.
+            if disarm_gate(f"{source} raised {type(exc).__name__}: {exc}"):
+                logger.error(
+                    "#1489 W113 BarlinkPollGateDisarmed source=%s exc=%s -- the "
+                    "watchdog's DEVICE polling is now OFF for this whole "
+                    "process, not just for the transport that raised. A poll "
+                    "that failed once fails every round, and on boot "
+                    "weg2xsn406 the second attempt of the same pass took the "
+                    "process down with a segfault instead of a raise. The "
+                    "abort word is sticky, so what is lost is the last "
+                    "verdict and nothing else; host-side peer probing is "
+                    "untouched. This is a NAMED refusal, not a silent skip.",
+                    source,
+                    exc,
+                )
+            break
     return tripped
 
 
@@ -875,6 +957,8 @@ __all__ = [
     "abort_check_enabled",
     "check_aborts",
     "check_after_graph_replay",
+    "disarm_gate",
+    "gate_disarmed",
     "check_every",
     "current_replay",
     "format_current_replay",
@@ -892,6 +976,7 @@ __all__ = [
     "poll_interval_s",
     "poll_status_words",
     "polling_paused",
+    "rearm_gate",
     "register",
     "registered",
     "replay_check_enabled",
