@@ -36,6 +36,7 @@ from sglang.jit_kernel.marlin_switches import (
     format_switch_log,
     no_k_split_on,
     parse_arch_override,
+    smem_optin_verdict,
     sms_override,
     switch_census,
 )
@@ -229,6 +230,22 @@ def test_arch_override_lands_in_the_jit_cache_key():
 # --- the log line -----------------------------------------------------------
 
 
+@pytest.mark.parametrize(
+    "value,want",
+    [
+        (101376, "ok"),
+        (None, "unknown"),
+        (0, "DRIVER-POISONED"),
+        (-1, "DRIVER-POISONED"),
+        # The value RTX 5090 owners report from early Blackwell drivers.
+        (4294967297, "DRIVER-POISONED"),
+        (49152, "unexpected"),
+    ],
+)
+def test_smem_optin_verdict_names_the_driver_report(value, want):
+    assert smem_optin_verdict(value) == want
+
+
 def test_census_and_log_line_name_every_switch():
     env = {
         ENV_NO_K_SPLIT: "1",
@@ -236,7 +253,7 @@ def test_census_and_log_line_name_every_switch():
         ENV_EPILOGUE_SYNC: "0",
         ENV_ARCH_OVERRIDE: "9.0",
     }
-    census = switch_census(170, env)
+    census = switch_census(170, env, smem_optin=101376)
     assert census == {
         "epilogue_sync": False,
         "no_k_split": True,
@@ -245,6 +262,8 @@ def test_census_and_log_line_name_every_switch():
         "sms_effective": 68,
         "arch_override": "9.0",
         "ptx_jit": True,
+        "smem_optin": 101376,
+        "smem_optin_verdict": "ok",
     }
     line = format_switch_log("12.0", census)
     assert line.startswith("[nan-49c] marlin switches:")
@@ -261,8 +280,9 @@ def test_census_and_log_line_name_every_switch():
 
 
 def test_log_line_on_a_default_boot_says_so():
-    line = format_switch_log("8.6", switch_census(68, {}))
+    line = format_switch_log("8.6", switch_census(68, {}, smem_optin=101376))
     assert "arch_override=None" in line
     assert "epilogue_sync=True" in line
     assert "no_k_split=False" in line
     assert "sms_hw=68 sms_effective=68" in line
+    assert "smem_optin=101376(ok)" in line

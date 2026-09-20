@@ -183,10 +183,45 @@ def arch_override_cuda_cflags(override: Optional[ArchOverride]) -> List[str]:
     return [f"-gencode=arch={override.virtual_arch},code={override.virtual_arch}"]
 
 
-def switch_census(hardware_sms: Optional[int] = None, env=None) -> dict:
+#: What `cudaDevAttrMaxSharedMemoryPerBlockOptin` must report on every
+#: architecture Marlin runs on here: 99 KiB on sm_86 (3080) AND on sm_120
+#: (5090). Consumer Blackwell did NOT shrink the opt-in budget.
+EXPECTED_SMEM_OPTIN = 101376
+
+
+def smem_optin_verdict(value: Optional[int]) -> str:
+    """Name a driver that mis-reports the opt-in shared-memory budget.
+
+    Reported on RTX 5090 with early Blackwell drivers: the attribute comes back
+    as 0x100000001 (4294967297) or 0 instead of 101376. That number is not
+    cosmetic here -- the Marlin host code reads the SAME attribute into an
+    ``int`` (truncating 0x100000001 to 1) and feeds it to `is_valid_config`,
+    which is the check vLLM PR #11493 added to keep the shared-memory buffers
+    from overlapping. A poisoned budget disables that check on ONE card while
+    the two 3080s keep a correct one, which is a structural explanation for
+    'sm_120 dirty, sm_86 clean' that needs no undiscovered hardware bug.
+
+    Printing it costs nothing and turns a lead into a measurement."""
+    if value is None:
+        return "unknown"
+    value = int(value)
+    if value == EXPECTED_SMEM_OPTIN:
+        return "ok"
+    if value <= 0 or value > (1 << 31) - 1:
+        return "DRIVER-POISONED"
+    return "unexpected"
+
+
+def switch_census(
+    hardware_sms: Optional[int] = None,
+    env=None,
+    smem_optin: Optional[int] = None,
+) -> dict:
     """Everything the one-shot log line needs, as plain data (testable)."""
     override = arch_override_from_env(env)
     return {
+        "smem_optin": None if smem_optin is None else int(smem_optin),
+        "smem_optin_verdict": smem_optin_verdict(smem_optin),
         "epilogue_sync": epilogue_sync_on(env),
         "no_k_split": no_k_split_on(env),
         "sms_requested": sms_override(env),
@@ -204,7 +239,7 @@ def format_switch_log(device_arch: str, census: dict) -> str:
     return (
         "[nan-49c] marlin switches: device_arch=%s arch_override=%s ptx_jit=%s "
         "epilogue_sync=%s no_k_split=%s sms_hw=%s sms_effective=%s "
-        "sms_requested=%s"
+        "sms_requested=%s smem_optin=%s(%s)"
         % (
             device_arch,
             census["arch_override"],
@@ -214,5 +249,7 @@ def format_switch_log(device_arch: str, census: dict) -> str:
             census["sms_hw"],
             census["sms_effective"],
             census["sms_requested"],
+            census["smem_optin"],
+            census["smem_optin_verdict"],
         )
     )

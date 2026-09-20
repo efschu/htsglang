@@ -44,9 +44,13 @@ def _log_marlin_switches(device) -> None:
         return
     _SWITCHES_LOGGED["done"] = True
     try:
-        sms = torch.cuda.get_device_properties(device).multi_processor_count
+        props = torch.cuda.get_device_properties(device)
+        sms = props.multi_processor_count
+        smem = getattr(props, "shared_memory_per_block_optin", None)
         arch = get_jit_cuda_arch().target_name
-        logger.error("%s", format_switch_log(arch, switch_census(sms)))
+        logger.error(
+            "%s", format_switch_log(arch, switch_census(sms, smem_optin=smem))
+        )
     except Exception as exc:  # noqa: BLE001 -- an instrument never kills a GEMM
         logger.debug("[nan-49c] marlin switch log skipped: %s", exc)
 
