@@ -4,6 +4,7 @@ SGLANG_ADAPTIVE_ALIAS_VERIFY_RANK_SYNC check after the swap; in resident
 mode it returned before the check, so a rank-divergent activation would
 have deadlocked in the next collective instead of failing loudly. The
 controller now calls note_resident_activation on every activation."""
+
 import unittest
 from unittest.mock import patch
 
@@ -23,7 +24,13 @@ class TestResidentRankSync(unittest.TestCase):
             mgr.note_resident_activation(3)
             mgr.note_resident_activation(1)
         self.assertEqual(calls, [3, 1])
-        self.assertEqual(mgr.swap_count, 2)
+        # Resident mode swaps nothing, so the counter that moves is the
+        # ACTIVATION counter. (It used to bump swap_count, which named a thing
+        # that had not happened; the rank-sync payload reads this counter and
+        # must stay rank-invariant, while swap counts legitimately differ per
+        # rank once residency is budget-driven.)
+        self.assertEqual(mgr.activation_count, 2)
+        self.assertEqual(mgr.swap_count, 0)
 
     def test_offload_mode_leaves_it_to_ensure_active(self):
         # Constructing an offload manager needs the preload hook; flip the
@@ -36,7 +43,7 @@ class TestResidentRankSync(unittest.TestCase):
         ):
             mgr.note_resident_activation(3)
         self.assertEqual(calls, [])
-        self.assertEqual(mgr.swap_count, 0)
+        self.assertEqual(mgr.activation_count, 0)
 
     def test_check_is_a_noop_without_the_env(self):
         # No torch.distributed init here: the check must return before any
@@ -47,7 +54,7 @@ class TestResidentRankSync(unittest.TestCase):
 
             os.environ.pop("SGLANG_ADAPTIVE_ALIAS_VERIFY_RANK_SYNC", None)
             mgr.note_resident_activation(2)
-        self.assertEqual(mgr.swap_count, 1)
+        self.assertEqual(mgr.activation_count, 1)
 
 
 if __name__ == "__main__":

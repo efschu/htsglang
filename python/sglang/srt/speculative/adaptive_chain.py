@@ -210,6 +210,115 @@ def choose_chain_length(
     return best_k
 
 
+def expected_tokens(survival: Sequence[float], k: int) -> float:
+    """Expected accepted tokens for a chain of length *k*: ``1 + sum(survival[:k])``.
+
+    The leading 1 is the bonus token a verify always emits, so the value is
+    >= 1.0 even for an empty curve.
+    """
+    if k <= 0:
+        return 1.0
+    return 1.0 + float(sum(_sanitize_survival(v) for v in list(survival)[:k]))
+
+
+def switch_is_profitable(
+    e_incumbent: float,
+    c_incumbent: float,
+    e_candidate: float,
+    c_candidate: float,
+    swap_ms: float,
+    dwell_rounds: int,
+) -> bool:
+    """Does moving to *candidate* pay for the state swap it costs?
+
+    The adaptive ladder keeps one runtime state mapped at a time, so changing
+    the chain length can cost a physical graph-memory swap (unmap the outgoing
+    state's pages, map the incoming one).  The per-round argmax in
+    :func:`choose_chain_length` is blind to that: it compares steady-state
+    throughputs and will happily pay a swap for a gain it holds for one round.
+
+    Measured on the Qwen3.8 Next Flash 32k form (boot fn8s4, 2026-09-20): 1270
+    swaps at a mean 33.46 ms each, against a ~38 ms decode round -- the policy
+    bought a real acceptance gain (3.39 vs 2.69 tokens) and still lost 10 %
+    throughput, because a swap costs most of a round and it swapped on 0.6 of
+    them.  That boot is the reason this gate exists.
+
+    The comparison is a throughput one, with the swap charged once and
+    amortised over the rounds the new state is actually held:
+
+        incumbent:  e_inc / c_inc                        tokens per ms
+        candidate:  dwell * e_new / (dwell * c_new + swap_ms)
+
+    Returns True only when the candidate's amortised rate strictly beats the
+    incumbent's.  ``swap_ms == 0`` (nothing to pay, e.g. the target state is
+    already resident) reduces it to the plain rate comparison, and a
+    non-positive dwell means "never hold it", which can never pay.
+    """
+    try:
+        e_inc = float(e_incumbent)
+        c_inc = float(c_incumbent)
+        e_new = float(e_candidate)
+        c_new = float(c_candidate)
+        swap = max(0.0, float(swap_ms))
+        dwell = int(dwell_rounds)
+    except (TypeError, ValueError):
+        return False
+    if dwell <= 0:
+        return False
+    for v in (e_inc, c_inc, e_new, c_new, swap):
+        if not math.isfinite(v):
+            return False
+    if c_inc <= 0.0 or c_new <= 0.0:
+        return False
+    denom = dwell * c_new + swap
+    if denom <= 0.0:
+        return False
+    return (dwell * e_new) / denom > (e_inc / c_inc)
+
+
+def break_even_rounds(
+    e_incumbent: float,
+    c_incumbent: float,
+    e_candidate: float,
+    c_candidate: float,
+    swap_ms: float,
+) -> float:
+    """Smallest dwell (in rounds) for which the switch pays, or ``inf``.
+
+    Solving :func:`switch_is_profitable` for ``dwell``:
+
+        dwell * e_new / (dwell * c_new + swap) > e_inc / c_inc
+        dwell * (e_new * c_inc - e_inc * c_new) > e_inc * swap
+
+    so the switch pays from ``e_inc * swap / (e_new * c_inc - e_inc * c_new)``
+    rounds on.  A non-positive denominator means the candidate is not faster in
+    steady state either: no dwell makes it profitable, hence ``inf``.
+
+    Diagnostic counterpart to the boolean gate -- it is what a log line should
+    print when a switch is suppressed, because it names the number the operator
+    would have to believe about the workload's stability to want the switch.
+    """
+    try:
+        e_inc = float(e_incumbent)
+        c_inc = float(c_incumbent)
+        e_new = float(e_candidate)
+        c_new = float(c_candidate)
+        swap = max(0.0, float(swap_ms))
+    except (TypeError, ValueError):
+        return math.inf
+    for v in (e_inc, c_inc, e_new, c_new, swap):
+        if not math.isfinite(v):
+            return math.inf
+    if c_inc <= 0.0 or c_new <= 0.0:
+        return math.inf
+    denom = e_new * c_inc - e_inc * c_new
+    if denom <= 0.0:
+        return math.inf
+    if swap <= 0.0:
+        return 0.0
+    return (e_inc * swap) / denom
+
+
 def parse_cost_ms(spec: str | None) -> tuple[float, float]:
     """Parse ``SGLANG_SPEC_ADAPTIVE_CHAIN_COST_MS`` (e.g. ``"draft:2.5,verify:26"``).
 
@@ -352,15 +461,43 @@ class AdaptiveChainPolicy:
         cost_model: ChainCostModel | None = None,
         log_every: int = 0,
         candidates: Sequence[int] | None = None,
+        min_dwell: int = 0,
+        swap_ms: float = 0.0,
+        swap_ms_for: Callable[[int], float] | None = None,
+        consensus: Callable[[int], int] | None = None,
     ):
         self.k_max = int(k_max)
         self.k_min = max(0, min(int(k_min), self.k_max))
         self.candidates = eligible_candidates(self.k_max, self.k_min, candidates)
         self.cost_model = cost_model or ChainCostModel(k_max=self.k_max)
         self.log_every = int(log_every)
+        #: Rounds a chain length must be held before another switch may be
+        #: considered at all. Floor under the break-even gate: it bounds the
+        #: *switch rate* even while the cost/survival estimates are still cold
+        #: (the gate needs a warm E and c to be meaningful, the dwell does not).
+        self.min_dwell = max(0, int(min_dwell))
+        #: Flat swap-cost prior in ms, used when *swap_ms_for* is absent.
+        self.swap_ms = max(0.0, float(swap_ms))
+        #: Optional per-target swap cost, ``swap_ms_for(k) -> ms``. The graph
+        #: memory manager supplies it so an already-resident target costs 0 and
+        #: only a genuine unmap/map is charged.
+        self.swap_ms_for = swap_ms_for
+        #: ``consensus(local_proposal) -> agreed`` -- makes the chain length
+        #: identical across TP ranks. Supplied by the worker as a broadcast
+        #: from rank 0 over the TP CPU group; None (the default) leaves the
+        #: local proposal in force, which is correct for world_size 1 and for
+        #: every off-GPU test.
+        self.consensus = consensus
         self._survival: list[float] = []
         self._histogram: Counter[int] = Counter()
         self._rounds = 0
+        self._current: int | None = None
+        self._dwell = 0
+        self._rounds_since_decision = 0
+        self._switches = 0
+        self._held_dwell = 0
+        self._held_breakeven = 0
+        self._consensus_overrides = 0
 
     def record_survival(self, survival: Sequence[float]) -> None:
         self._survival = normalize_survival(survival, self.k_max)
@@ -368,19 +505,149 @@ class AdaptiveChainPolicy:
     def record_duration(self, k: int, duration_ms: float) -> None:
         self.cost_model.observe(k, duration_ms)
 
+    def _swap_cost(self, k: int) -> float:
+        if self.swap_ms_for is None:
+            return self.swap_ms
+        try:
+            value = float(self.swap_ms_for(k))
+        except (TypeError, ValueError):
+            return self.swap_ms
+        if not math.isfinite(value) or value < 0.0:
+            return self.swap_ms
+        return value
+
+    def _gate(self, candidate: int) -> int:
+        """Hold the incumbent unless *candidate* earns the swap it costs.
+
+        Three outcomes, in order: same length (nothing to pay), still inside
+        the minimum dwell (refuse without asking), or a break-even test against
+        the measured swap cost. The incumbent is only replaced by the third.
+        """
+        current = self._current
+        if current is None:
+            self._current = candidate
+            self._dwell = 0
+            return candidate
+        if candidate == current:
+            self._dwell += 1
+            return current
+        if self._dwell < self.min_dwell:
+            self._dwell += 1
+            self._held_dwell += 1
+            return current
+        swap_ms = self._swap_cost(candidate)
+        profitable = switch_is_profitable(
+            e_incumbent=expected_tokens(self._survival, current),
+            c_incumbent=self.cost_model.cost(current),
+            e_candidate=expected_tokens(self._survival, candidate),
+            c_candidate=self.cost_model.cost(candidate),
+            swap_ms=swap_ms,
+            # A switch taken now is held for at least the dwell floor; with no
+            # floor configured, charge the swap against a single round, which
+            # is the pessimistic (and correct) reading of "may flip again next
+            # round".
+            dwell_rounds=max(1, self.min_dwell),
+        )
+        if not profitable:
+            self._dwell += 1
+            self._held_breakeven += 1
+            return current
+        self._current = candidate
+        self._dwell = 0
+        self._switches += 1
+        return candidate
+
     def choose(self) -> int:
-        k = choose_chain_length(
+        """The chain length for this round.  Call exactly once per round.
+
+        Two things make the answer the same on every TP rank, which it must be
+        -- a divergent ``k`` replays different CUDA graphs and deadlocks the
+        next collective (boot fn8s4, round 859).
+
+        First, the decision happens only on *decision rounds*, and which rounds
+        those are is a pure function of the round counter, which every rank
+        advances in lockstep (one call per scheduler batch).  In between, the
+        held length is re-affirmed without consulting any estimate at all.
+
+        Second, on a decision round the locally-proposed length is passed
+        through :attr:`consensus` before it is adopted.  That is the only
+        sound construction available here: the proposal is derived from a
+        cost EMA over CUDA-event timings and from whether a non-blocking D2H
+        copy has landed, and *both are rank-local by nature*.  Quantising the
+        survival curve (as :func:`normalize_survival` does) narrows the window
+        but cannot close it -- two ranks straddling a quantisation boundary
+        still split.  Agreeing on one rank's answer closes it by construction,
+        for the price of one small collective per decision round.
+        """
+        self._rounds += 1
+        if self._current is not None and self._rounds_since_decision < max(
+            1, self.min_dwell
+        ):
+            # Frozen: no estimate is read, so nothing rank-local can leak into
+            # the answer, and no collective is posted.
+            self._rounds_since_decision += 1
+            # The dwell clock runs during the freeze too. It must: _gate reads
+            # it to decide whether the held length has been kept long enough,
+            # and if only decision rounds advanced it, it could never reach
+            # min_dwell and the policy would hold its first choice forever.
+            self._dwell += 1
+            self._histogram[self._current] += 1
+            self._maybe_log()
+            return self._current
+
+        raw = choose_chain_length(
             self._survival,
             self.cost_model.cost,
             k_max=self.k_max,
             k_min=self.k_min,
             candidates=self.candidates,
         )
+        proposal = self._gate(raw)
+        k = self._agree(proposal)
+        if k != self._current:
+            # Consensus overrode this rank's gate outcome; adopt it wholesale
+            # so the residency bookkeeping and the dwell clock stay truthful.
+            self._current = k
+            self._dwell = 0
+        self._rounds_since_decision = 1
         self._histogram[k] += 1
-        self._rounds += 1
+        self._maybe_log()
+        return k
+
+    def _agree(self, proposal: int) -> int:
+        """Run *proposal* through the consensus hook, falling back to it."""
+        if self.consensus is None:
+            return proposal
+        try:
+            agreed = int(self.consensus(proposal))
+        except Exception:  # pragma: no cover - defensive
+            logger.warning(
+                "[spec-adaptive] chain-length consensus failed; keeping the "
+                "local proposal. Ranks may now disagree.",
+                exc_info=True,
+            )
+            return proposal
+        if agreed not in self.candidates:
+            logger.warning(
+                "[spec-adaptive] consensus returned k=%s which is not a built "
+                "candidate %s; keeping local proposal k=%s.",
+                agreed,
+                self.candidates,
+                proposal,
+            )
+            return proposal
+        if agreed != proposal:
+            self._consensus_overrides += 1
+        return agreed
+
+    def _maybe_log(self) -> None:
         if self.log_every > 0 and self._rounds % self.log_every == 0:
             self.log_histogram()
-        return k
+
+    @property
+    def current(self) -> int | None:
+        """The chain length currently held, or None before the first choose."""
+        return self._current
 
     def log_histogram(self) -> None:
         total = sum(self._histogram.values()) or 1
@@ -393,12 +660,30 @@ class AdaptiveChainPolicy:
         )
         surv = " ".join(f"{s:.3f}" for s in self._survival)
         logger.info(
-            "[spec-adaptive] rounds=%d %s | %s | survival=[%s]",
+            "[spec-adaptive] rounds=%d %s | %s | survival=[%s] | "
+            "switches=%d held(dwell=%d,breakeven=%d) dwell=%d/%d k=%s",
             self._rounds,
             hist,
             costs,
             surv,
+            self._switches,
+            self._held_dwell,
+            self._held_breakeven,
+            self._dwell,
+            self.min_dwell,
+            self._current,
         )
+
+    @property
+    def switch_stats(self) -> dict[str, int]:
+        """Switches taken and suppressed -- the numbers that say whether the
+        swap-amortisation gate is doing anything on this workload."""
+        return {
+            "switches": self._switches,
+            "held_dwell": self._held_dwell,
+            "held_breakeven": self._held_breakeven,
+            "rounds": self._rounds,
+        }
 
     @property
     def histogram(self) -> dict[int, int]:
