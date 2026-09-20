@@ -747,6 +747,13 @@ class FlashInferAttnBackend(AttentionBackend):
         # silently duplicate the whole cache per rank — refuse instead.
         # (The NEXTN/EAGLE draft worker is exempt by design: its 1-layer
         # full-context pool is intentionally replicated.)
+        # fnFA8 (20.09.): under Form A the host owns EVERY head (base plan
+        # 1,0,0) and the whole KV once -- nothing is duplicated across
+        # ranks, a worker never attends (it gets FormAWorkerAttnBackend),
+        # so no token-sharded pool is needed. Same waiver as the attention
+        # layer's (qwen3_5.py, fnFA2).
+        from sglang.srt.rank_role import form_a_dense_is_unsharded
+
         if (
             attn_kv_replicated(
                 get_parallel().attn_tp_size,
@@ -754,6 +761,7 @@ class FlashInferAttnBackend(AttentionBackend):
             )
             and not getattr(model_runner, "is_draft_worker", False)
             and not self.uneven_dcp
+            and not form_a_dense_is_unsharded()
         ):
             raise ValueError(
                 "TP > num_kv_heads requires the uneven-DCP token-sharded KV "
