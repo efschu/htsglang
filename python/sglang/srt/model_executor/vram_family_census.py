@@ -99,7 +99,10 @@ def log_vram_family_census(
         # #58: and THIS is the moment the idle reading is honest -- pools
         # built, nothing forwarding yet. The vision stage is placed against
         # this number, not against [vram-peak]'s.
-        log_vram_idle(runner, "after pools")
+        # xsn405: this read `runner`, a name this function never had; the NameError
+        # was swallowed by the caller's census guard (debug "skipped") AFTER the
+        # census line had printed, so [vram-idle] never appeared in any P log.
+        log_vram_idle(model, "after pools")
     return fam
 
 

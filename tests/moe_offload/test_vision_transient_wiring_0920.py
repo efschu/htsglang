@@ -349,9 +349,9 @@ def test_the_census_emits_it_at_the_one_honest_moment():
     import inspect
 
     src = inspect.getsource(vfc)
-    assert 'log_vram_idle(runner, "after pools")' in src
+    assert 'log_vram_idle(model, "after pools")' in src
     # exactly one CALL (the `def` line matches the same prefix, hence `("`)
-    assert src.count('log_vram_idle(runner, "') == 1
+    assert src.count('log_vram_idle(model, "') == 1
 
 
 def test_the_idle_reading_is_a_different_instrument_from_the_peak_one():
@@ -385,3 +385,23 @@ def test_argv_p_hands_the_vision_form_to_the_model_argv():
     off = p_argv("off")
     assert "--no-enable-multimodal" in off
     assert "--json-model-override-args" not in off
+
+
+def test_after_pools_census_reaches_the_idle_reading(monkeypatch):
+    """xsn405: ``log_vram_family_census(..., "after pools")`` referenced a
+    ``runner`` the function never had; the NameError was swallowed by the
+    caller's census guard after the census line had printed, so no P log
+    ever carried ``[vram-idle] after pools`` (acceptance (b), design §6)."""
+    import torch
+
+    from sglang.srt.model_executor import vram_family_census as vc
+
+    seen = []
+    monkeypatch.setattr(vc, "log_vram_idle", lambda runner, where, **kw: seen.append(where))
+    monkeypatch.setattr(vc.torch.cuda, "reset_peak_memory_stats", lambda: None, raising=False)
+    model = torch.nn.Linear(4, 4)
+    vc.log_vram_family_census(model, "pp0tp0", "after pools")
+    assert seen == ["after pools"]
+    seen.clear()
+    vc.log_vram_family_census(model, "pp0tp0", "after load")
+    assert seen == []
