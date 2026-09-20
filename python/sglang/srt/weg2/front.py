@@ -1749,6 +1749,7 @@ class Front:
     def __init__(self, prefill: str, decode: str, awake: str, tag: str, store_dir: str,
                  prefill_sid: int, decode_sid: int, dc_reserve: Dict[str, int], w_s: float,
                  weight_chunks: int = 0, carrier_max_tokens: int = 0,
+                 weights_resident: bool = False,
                  p_concurrency: int = DEFAULT_P_BS, d_bs: int = DEFAULT_D_BS,
                  tp_prefill_max_tokens: int = X_FALLBACK_TOKENS,
                  flip_min_work_tokens: Optional[int] = None,
@@ -1781,7 +1782,13 @@ class Front:
         # #1233 one-backup flip: the weights tag family both groups were built
         # with (launcher: SGLANG_WEG2_WEIGHT_CHUNKS), chunks first, base last.
         self.weight_chunks = int(weight_chunks)
-        self.weights_tags = weights_family_tags(self.weight_chunks)
+        # Task #47 Scheibe 6a (20.09.): Next Flash's FIRST flip form keeps BOTH
+        # layouts' weights resident (P PP3 stages and D Form A share the cards at
+        # reduced expert residency) and flips ONLY the kv_cache tag -- no weights
+        # family, no gathered legs, no host ring traffic. An empty family here
+        # is that decision, stated once; the flip driver reads it as such.
+        self.weights_resident = bool(weights_resident)
+        self.weights_tags = [] if self.weights_resident else weights_family_tags(self.weight_chunks)
         # #1233 boot weg2dk4: per group, which cards (NVML index) hold each
         # chunk tag's bytes -- derived by the launcher from that group's
         # parallelism, EMPTY for a group whose tags are uniform across cards
@@ -4503,10 +4510,13 @@ class Front:
         # access is now the ONE shape both readers use, so a further field on
         # `CardFree` cannot break either.
         free_mib = {c.nvml_index: c.free_mib for c in _nvml_free()}
-        pause_order, why = interleave_pause_order(
-            self.weights_tags, self.src_chunk_cards.get(src, {}), free_mib,
-            dst_cards=self.src_chunk_cards.get(dst, {}),
-        )
+        if self.weights_resident:
+            pause_order, why = [], "weights resident on both groups (--weights-resident): no family to order"
+        else:
+            pause_order, why = interleave_pause_order(
+                self.weights_tags, self.src_chunk_cards.get(src, {}), free_mib,
+                dst_cards=self.src_chunk_cards.get(dst, {}),
+            )
         logger.info(
             "WEG2-FLIP-ORDER epoch=%d src=%s driver_free=%s pause_order=%s resume_order=%s (%s) "
             "-- applied to the GATHERED sleep leg's tag list (C9), not to a per-tag RPC loop",
@@ -4525,42 +4535,51 @@ class Front:
         # a bare flip index made this boot inherit.
         flip_epoch = credit_epoch(self.boot_epoch, self.epoch)
         t_gather0 = time.perf_counter()
-        # C14 / FIX 1 round 1: the FLIP'S epoch rides on BOTH legs.  It is the
-        # only thing that dates the per-card VRAM credit counter, and this
-        # gather is precisely why one is needed -- there is no happens-before
-        # between S's begin_leg and W's first read, so without it W reads the
-        # previous flip's terminal state as this flip's funding.
-        # #1361 fix6 THE GATE AT THE START OF THE LEG, at the ONE call site
-        # that issues it. A pure function nobody calls is the state this seat
-        # has paid for four times this week; the smoke test drives THIS line.
-        #
-        # Both terms come from readings that already exist here: the cushion
-        # from `read_cgroup_pressure` -- the SAME call the rate latch is fed,
-        # so the gate and the latch can never disagree about the moment -- and
-        # the write size from the sidecar's own measurement of this group's
-        # last sleep. Either unreadable -> no verdict, and the leg proceeds
-        # exactly as before fix6.
-        self._sleep_leg_gate(S)
-        self._flip_stage = "gathered-legs"
-        (s_code, s_body, s_ms), (w_code, w_body, w_ms) = await asyncio.gather(
-            self.timed_rpc(S, "/release_memory_occupation",
-                           {"tags": pause_order, "epoch": flip_epoch}, RPC_TIMEOUT_S),
-            # weg2xsn84 (#1378): THE WAKE WALKS THE SAME ORDER AS THE SLEEP.
-            # Since #1374 the two legs are a per-tag LOCKSTEP over one lane
-            # buffer -- deposit(t) -> pause(t) -> credit(t) on S, resume(t)
-            # -> collect(t) on D -- so the i-th tag S deposits must be the
-            # i-th tag D collects. With P as the source the interleave put
-            # weights_4 first (tight card) while D resumed weights_0 first:
-            # D read PP0's 174-unit weights_4 deposit as weights_0's first
-            # 174 units (per-unit digests 'matched' -- the bytes were the
-            # deposit's bytes, just not weights_0's) and waited 120 s for
-            # unit 174 that no deposit of weights_4 has. On the TP source
-            # the interleave happened to return the natural order, which is
-            # why leg 0 never showed it. `family` (natural order) remains
-            # the permutation check's reference above.
-            self.timed_rpc(D, "/resume_memory_occupation",
-                           {"tags": pause_order, "epoch": flip_epoch}, RPC_TIMEOUT_S),
-        )
+        if self.weights_resident:
+            # Scheibe 6a: no weights family to move -- both layouts stay mapped.
+            s_code = w_code = 200
+            s_body = w_body = ""
+            s_ms = w_ms = 0.0
+            self._flip_stage = "gathered-legs"
+            logger.info("WEG2-FLIP-LEGS SKIPPED epoch=%d: weights resident on both groups "
+                        "(--weights-resident), only kv_cache flips", self.epoch)
+        else:
+            # C14 / FIX 1 round 1: the FLIP'S epoch rides on BOTH legs.  It is the
+            # only thing that dates the per-card VRAM credit counter, and this
+            # gather is precisely why one is needed -- there is no happens-before
+            # between S's begin_leg and W's first read, so without it W reads the
+            # previous flip's terminal state as this flip's funding.
+            # #1361 fix6 THE GATE AT THE START OF THE LEG, at the ONE call site
+            # that issues it. A pure function nobody calls is the state this seat
+            # has paid for four times this week; the smoke test drives THIS line.
+            #
+            # Both terms come from readings that already exist here: the cushion
+            # from `read_cgroup_pressure` -- the SAME call the rate latch is fed,
+            # so the gate and the latch can never disagree about the moment -- and
+            # the write size from the sidecar's own measurement of this group's
+            # last sleep. Either unreadable -> no verdict, and the leg proceeds
+            # exactly as before fix6.
+            self._sleep_leg_gate(S)
+            self._flip_stage = "gathered-legs"
+            (s_code, s_body, s_ms), (w_code, w_body, w_ms) = await asyncio.gather(
+                self.timed_rpc(S, "/release_memory_occupation",
+                               {"tags": pause_order, "epoch": flip_epoch}, RPC_TIMEOUT_S),
+                # weg2xsn84 (#1378): THE WAKE WALKS THE SAME ORDER AS THE SLEEP.
+                # Since #1374 the two legs are a per-tag LOCKSTEP over one lane
+                # buffer -- deposit(t) -> pause(t) -> credit(t) on S, resume(t)
+                # -> collect(t) on D -- so the i-th tag S deposits must be the
+                # i-th tag D collects. With P as the source the interleave put
+                # weights_4 first (tight card) while D resumed weights_0 first:
+                # D read PP0's 174-unit weights_4 deposit as weights_0's first
+                # 174 units (per-unit digests 'matched' -- the bytes were the
+                # deposit's bytes, just not weights_0's) and waited 120 s for
+                # unit 174 that no deposit of weights_4 has. On the TP source
+                # the interleave happened to return the natural order, which is
+                # why leg 0 never showed it. `family` (natural order) remains
+                # the permutation check's reference above.
+                self.timed_rpc(D, "/resume_memory_occupation",
+                               {"tags": pause_order, "epoch": flip_epoch}, RPC_TIMEOUT_S),
+            )
         legs_wall_ms = (time.perf_counter() - t_gather0) * 1000
         s_done, s_per_tag, s_crit = completed_tags(s_body)
         w_done, w_per_tag, w_crit = completed_tags(w_body)
@@ -5509,6 +5528,9 @@ def main():
     ap.add_argument("--drain-deadline-s", type=float, default=DRAIN_DEADLINE_DEFAULT_S,
                     help="C13/K10: seconds a group may still hold requests before a flip is refused "
                          "by name (W1 -> W2). Today's shipped value, promoted from a literal.")
+    ap.add_argument("--weights-resident", action="store_true",
+                    help="Task #47 Scheibe 6a: both groups keep their weights resident; the flip "
+                         "moves only kv_cache (no weights family, no gathered legs).")
     ap.add_argument("--weight-chunks", type=int, default=0, help="#1233: number of weights_<k> chunk tags both groups were built with (0 = single weights tag)")
     ap.add_argument("--carrier-max-tokens", type=int, default=0,
                     help="#1233 zero-remainder: longest prompt group D can read from the store. "
@@ -5573,6 +5595,7 @@ def main():
         dc[k] = int(v)
     front = Front(args.prefill, args.decode, args.awake, args.tag, args.store_dir, args.prefill_sid, args.decode_sid, dc, args.fairness_w_s,
                   weight_chunks=args.weight_chunks, carrier_max_tokens=args.carrier_max_tokens,
+                  weights_resident=args.weights_resident,
                   p_concurrency=args.p_concurrency, d_bs=args.d_bs,
                   tp_prefill_max_tokens=args.tp_prefill_max_tokens,
                   flip_min_work_tokens=args.flip_min_work_tokens,

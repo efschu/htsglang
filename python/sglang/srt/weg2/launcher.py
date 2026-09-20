@@ -9636,6 +9636,10 @@ def build_parser() -> argparse.ArgumentParser:
              "so the floor protects the box -- boot logs, the evidence tree, the model "
              "cache -- not the store. NOT the old 1 GiB, which was 1/6th of a 6 GiB "
              "tmpfs and latched the backend's write stop after 5 GiB.")
+    ap.add_argument("--flip-weights", choices=("family", "resident"), default="family",
+                    help="Task #47 Scheibe 6a: 'family' (default) moves the weights family across the flip "
+                         "(gathered legs, host ring / exchange); 'resident' keeps BOTH groups' weights mapped "
+                         "and flips only kv_cache (the front skips the legs: --weights-resident).")
     ap.add_argument("--weight-chunks", type=int, default=8,
                     help="#1233: number of weights_<k> layer-chunk tags per group (0 = the round-1 single tag / two-backup shape)")
     ap.add_argument("--ready-deadline-s", type=float, default=900.0)
@@ -12479,6 +12483,7 @@ def front_argv_for(py: str, store_dir: str, p_pid: int, d_pid: int, dc_expect_d:
         "--dc-reserve", ",".join(f"{c.uuid}={dc_expect_d.get(c.uuid, 0)}" for c in cards),
         "--fairness-w-s", str(ns.fairness_w_s),
         "--weight-chunks", str(chunk_count),
+    ] + (["--weights-resident"] if getattr(ns, "flip_weights", "family") == "resident" else []) + [
         "--carrier-max-tokens", str(carrier_max_tokens),
         "--p-concurrency", str(p_bs),
         "--d-bs", str(d_bs),
