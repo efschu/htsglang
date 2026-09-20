@@ -7431,8 +7431,56 @@ class SchedulerWeightUpdaterManager:
             # Python traceback. The RESUME half runs once per epoch.
             if _kv_epoch is not None and self._weg2_kv_resumed_epoch == _kv_epoch:
                 logger.info("WEG2-WAKE-KV-RESUME already ran in epoch=%s: resume half skipped", _kv_epoch)
-                return
-            self.memory_saver_adapter.resume(GPU_MEMORY_TYPE_KV_CACHE)
+                return True
+            # #1490: REFUSE A RESUME THE CARD CANNOT FUND, AND REFUSE TO
+            # BELIEVE ONE THAT DID NOT LAND. `_weg2_wake_kv_first_ok` above
+            # already computed this rank's fit and printed it --
+            #   WEG2-WAKE-KV-FIRST LATE free=5974 MiB floor=700 MiB need=6904 MiB
+            # -- and then used the answer ONLY to pick EARLY vs LATE. Boots
+            # weg2xsn406 and weg2xsn408 both resumed LATE into a card that
+            # arithmetic had just called short; the hook rolled the tag back,
+            # its void ABI reported nothing, and the pool work below zeroed
+            # unmapped memory. TP0 and TP1 of xsn408 died there with no Python
+            # traceback. The fit figure is re-read HERE because the legs run
+            # between the plan and this site and change it.
+            from sglang.srt.utils.torch_memory_saver_adapter import (
+                Weg2TmsResumeRefused,
+            )
+            from sglang.srt.weg2.wake_kv import kv_resume_fit_refusal
+
+            _kv_need = None
+            _kv_free = None
+            try:
+                _kv_need = int(self._weg2_tag_bytes(GPU_MEMORY_TYPE_KV_CACHE) or 0)
+                _kv_free = self._weg2_free_bytes()
+                _kv_floor = int(self._weg2_corridor_floor_bytes() or 0)
+            except Exception as _exc:  # noqa: BLE001 -- no probe, no refusal
+                logger.info("WEG2-WAKE-KV-FIT skipped (%s: %s)", type(_exc).__name__, _exc)
+                _kv_floor = 0
+            _unfit = kv_resume_fit_refusal(_kv_free, _kv_need, _kv_floor)
+            if _unfit is not None:
+                logger.error(
+                    "W114 Weg2KvResumeRefused epoch=%s: %s. The kv_cache tag "
+                    "stays PAUSED and this rank stays DORMANT -- the pool is "
+                    "NOT cleared, NOT zeroed and NOT marked resumed, because "
+                    "every one of those touches unmapped memory. That touch is "
+                    "what killed TP0 and TP1 of boot weg2xsn408 with no Python "
+                    "traceback at all. This is a NAMED refusal of the wake, "
+                    "not a silent skip: the group stays alive and asleep, and "
+                    "the front's W4 Weg2WakeRefused now states a fact instead "
+                    "of marking a grave.",
+                    _kv_epoch, _unfit,
+                )
+                return False
+            try:
+                self.memory_saver_adapter.resume(GPU_MEMORY_TYPE_KV_CACHE)
+            except Weg2TmsResumeRefused as _exc:
+                logger.error(
+                    "W114 Weg2KvResumeRefused epoch=%s: %s The pool is NOT "
+                    "cleared and NOT marked resumed; this rank stays DORMANT.",
+                    _kv_epoch, _exc,
+                )
+                return False
             self._weg2_kv_resumed_epoch = _kv_epoch
             _weg2_ph("kv_resume")
             scheduler = self.scheduler
@@ -7531,8 +7579,18 @@ class SchedulerWeightUpdaterManager:
                     if queue is not None:
                         queue.resume_memory_occupation()
         def _weg2_kv_block():
-            _weg2_kv_resume_part()
+            # #1490: the CLEAR half zeroes req_to_token, the mamba maps and the
+            # KV buffers. Every one of those writes into the kv_cache region,
+            # so it may run ONLY behind a resume that actually mapped it.
+            if _weg2_kv_resume_part() is False:
+                logger.error(
+                    "W114 Weg2KvResumeRefused: the clear half is SKIPPED "
+                    "because the resume did not land -- zeroing a paused pool "
+                    "is the fault, not the report of it."
+                )
+                return False
             _weg2_kv_clear_part()
+            return True
 
         _weg2_kv_done = False
         from sglang.srt.weg2.wake_kv import wake_kv_plan as _wk_plan
@@ -7551,8 +7609,12 @@ class SchedulerWeightUpdaterManager:
                     _kv_in, any(is_weights_family_tag(t) for t in tags), bool(self._weg2_kv_deferred))
         _weg2_kv_resumed_early = False
         if _plan == "early":
-            _weg2_kv_resume_part()   # loads may start; admission stays dormant until the legs
-            _weg2_kv_resumed_early = True
+            # #1490: a refused resume must not be recorded as an early one --
+            # the late site below reads this flag to decide whether the CLEAR
+            # half may run, and a False here is what sends it back through
+            # `_weg2_kv_block` (which retries, the legs having freed memory in
+            # between) instead of straight into the pool.
+            _weg2_kv_resumed_early = _weg2_kv_resume_part() is not False
             self._weg2_kv_deferred = False
             if not any(is_weights_family_tag(t) for t in tags):
                 # a kv-only call: the CLEAR half and the cuda_graph resume belong
@@ -7888,11 +7950,18 @@ class SchedulerWeightUpdaterManager:
                                         _floor_mid >> 20, _kv_need >> 20, len(_rest), _rest_need >> 20)
                             if _mid_ok:
                                 _t_mid = time.perf_counter()
-                                _weg2_kv_resume_part()
-                                _weg2_kv_resumed_early = True
-                                _n_pre = self._weg2_preload_hold()
-                                logger.info("WEG2-WAKE-KV-MID resumed after tag=%s preload=%d ms=%.0f",
-                                            tag, _n_pre, (time.perf_counter() - _t_mid) * 1000)
+                                # #1490: same rule mid-legs. A refusal here is
+                                # not an error -- the remaining legs still free
+                                # memory, so the late site gets the next try --
+                                # but it may never be recorded as a resume.
+                                if _weg2_kv_resume_part() is not False:
+                                    _weg2_kv_resumed_early = True
+                                    _n_pre = self._weg2_preload_hold()
+                                    logger.info("WEG2-WAKE-KV-MID resumed after tag=%s preload=%d ms=%.0f",
+                                                tag, _n_pre, (time.perf_counter() - _t_mid) * 1000)
+                                else:
+                                    logger.info("WEG2-WAKE-KV-MID refused after tag=%s: the late "
+                                                "site retries once the remaining legs have run", tag)
                         except Exception as _mid_exc:  # noqa: BLE001 -- the late site stays
                             logger.info("WEG2-WAKE-KV-MID skipped after tag=%s: %r", tag, _mid_exc)
                     from sglang.srt.managers.weg2_memory_saver import (
@@ -8164,10 +8233,16 @@ class SchedulerWeightUpdaterManager:
                 self._weg2_graph_deferred = False
             if _weg2_kv_resumed_early or (_kv_epoch is not None and self._weg2_kv_resumed_epoch == _kv_epoch):
                 _weg2_kv_clear_part()
+                _weg2_kv_ok = True
             else:
-                _weg2_kv_block()
-            self._weg2_kv_epoch_done = _kv_epoch
-            self._weg2_kv_deferred = False
+                _weg2_kv_ok = _weg2_kv_block() is not False
+            # #1490: the epoch is DONE only when the pool is actually back. A
+            # refused resume that marked the epoch done would make the next
+            # call answer "done: nothing to do" and leave the group dormant
+            # forever with no second chance and no further line in the log.
+            if _weg2_kv_ok:
+                self._weg2_kv_epoch_done = _kv_epoch
+                self._weg2_kv_deferred = False
 
         report: Dict[str, Any] = {}
         # #1295 MUST_FIX 2: THE STORE VERDICT RIDES THE FENCE THAT IS ALREADY

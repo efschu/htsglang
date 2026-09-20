@@ -44,6 +44,33 @@ def _abort_poll_excluded():
         yield
 
 
+class Weg2TmsResumeRefused(RuntimeError):
+    """#1490: a ``resume(tag)`` that did not happen, said so BY NAME.
+
+    Raised by the adapter, never by the hook -- the hook's resume ABI returns
+    void and cannot report. Callers must treat the tag as still PAUSED: do not
+    clear DORMANT, do not flush or zero the pool, do not mark the epoch
+    resumed. Every one of those touches unmapped memory.
+    """
+
+
+def _device_free_bytes():
+    """Driver-free bytes on the current device, or None (#1490).
+
+    None is the honest answer whenever torch cannot be asked (no CUDA, a
+    poisoned context, an import that is not available in this process); the
+    landing check stands aside on a None rather than inventing a refusal.
+    """
+    try:
+        import torch
+
+        if not torch.cuda.is_available():
+            return None
+        return int(torch.cuda.mem_get_info()[0])
+    except Exception:  # noqa: BLE001 -- a probe that raises is not a verdict
+        return None
+
+
 def _weg2_ring_symbol(name: str):
     """Look one of the Weg-2 C entrypoints up in the ALREADY-LOADED preload hook.
 
@@ -169,8 +196,61 @@ class _TorchMemorySaverAdapterReal(TorchMemorySaverAdapter):
             return _memory_saver.pause(tag=tag)
 
     def resume(self, tag: str):
+        """Resume ``tag`` AND VERIFY IT HAPPENED (#1490).
+
+        THE HOOK CANNOT TELL US. Its resume entry point is a C function
+        returning void, so when the mapping fails the whole tag is rolled back
+        and the only record is on stderr:
+
+            [core.cpp] WEG2-TMS-RESUME REFUSED tag=kv_cache rc=2 (out of memory)
+                       failed_alloc=30/41 ... -- every allocation of the tag is
+                       PAUSED again
+            [torch_memory_saver.cpp] tms_resume failed rc=2 tag=kv_cache
+                       (void ABI: exiting)
+
+        Python is handed a normal return. On boot weg2xsn408 (17:57:21Z) the
+        wake then zeroed the pools it believed it had just remapped: TP0 and
+        TP1 died with NO Python traceback at all, and TP2 -- whose card DID
+        fund its pool -- survived only to report the other two as gone. Boot
+        weg2xsn406 is the same failure 68 minutes earlier.
+
+        So the verification is a MEASUREMENT, not a return code: a resume that
+        maps a tag's bytes takes them out of device free memory, and a rolled
+        back one takes nothing. The probe is one-sided (see
+        ``wake_kv.resume_landed``) and degrades to silence -- never to a
+        raise -- whenever it cannot measure.
+
+        ``resume_stats``'s own docstring still carries the assumption this
+        replaces: "every CUDA_ERROR_CHECK / SIMPLE_CHECK in tms_csrc exits the
+        process, so a failed resume kills the rank instead of leaving a stale
+        record behind". The hook has since learned to roll back and return,
+        which is better behaviour and strictly worse news for a caller that
+        was relying on the crash.
+        """
+        from sglang.srt.weg2.wake_kv import resume_landed
+
+        need = None
+        try:
+            need = self.tag_bytes(tag)
+        except Exception:  # noqa: BLE001 -- an absent probe is not a refusal
+            need = None
+        before = _device_free_bytes()
         with _abort_poll_excluded():
-            return _memory_saver.resume(tag=tag)
+            out = _memory_saver.resume(tag=tag)
+        after = _device_free_bytes()
+        landed = resume_landed(before, after, need)
+        if landed is False:
+            raise Weg2TmsResumeRefused(
+                f"W114 Weg2TmsResumeRefused tag={tag}: the saver reported no "
+                f"error (its resume ABI returns void) but device free memory "
+                f"did not move -- before={int(before) >> 20} MiB "
+                f"after={int(after) >> 20} MiB delta={(int(before) - int(after)) >> 20} "
+                f"MiB against tag_bytes={int(need) >> 20} MiB. The tag is "
+                f"PAUSED, not resumed; every allocation in it is unmapped. "
+                f"Touching the pool now is what killed TP0 and TP1 of boot "
+                f"weg2xsn408 without a traceback."
+            )
+        return out
 
     def tag_bytes(self, tag: str):
         """C8/C7: the saver's OWN byte sum for ``tag``, or None.

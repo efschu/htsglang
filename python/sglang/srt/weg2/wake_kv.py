@@ -61,3 +61,79 @@ def kv_mid_ok(free_bytes, floor_bytes: int, kv_bytes: int, remaining_bytes: int,
     if free_bytes is None or int(kv_bytes) <= 0:
         return False
     return int(free_bytes) - int(floor_bytes) - int(margin_bytes) >= int(kv_bytes) + int(remaining_bytes)
+
+
+# --- #1490: the fit test the wake computed and then ignored ------------------
+# Boots weg2xsn406 (16:49:25Z) and weg2xsn408 (17:57:21Z), same shape twice.
+# `_weg2_wake_kv_first_ok` computes EXACTLY the physical-fit arithmetic --
+#
+#   WEG2-WAKE-KV-FIRST LATE free=5974 MiB floor=700 MiB need=6904 MiB
+#                           (... free - floor - margin < kv)
+#
+# -- and uses the answer ONLY to choose EARLY vs LATE ordering. It then
+# resumes LATE anyway, into a card the same arithmetic just said cannot fund
+# it, and the hook answers
+#
+#   [core.cpp] WEG2-TMS-RESUME REFUSED tag=kv_cache rc=2 (out of memory)
+#              ... every allocation of the tag is PAUSED again
+#   [torch_memory_saver.cpp] tms_resume failed rc=2 tag=kv_cache (void ABI: exiting)
+#
+# -- a VOID ABI, so Python is told nothing. The wake then zeroes the pools it
+# believes it just remapped. TP0 and TP1 of xsn408 died there with NO Python
+# traceback at all; TP2, whose card did fund the pool, lived and reported the
+# other two as gone.
+#
+# Both of these are one-sided and neither invents a reserve: the fit refusal
+# fires only on PHYSICAL impossibility (free < need -- the corridor floor is
+# reported, never subtracted, per "keine Korridor-Reserve, nie"), and the
+# landing check only ever says "this did not happen", never "this is unsafe".
+
+
+def kv_resume_fit_refusal(free_bytes, need_bytes, floor_bytes: int = 0) -> Optional[str]:
+    """Name the shortfall when the card cannot possibly map ``need_bytes``.
+
+    Returns None when the resume is physically possible, or when either figure
+    is unknown -- an absent probe is not a refusal. The floor appears in the
+    message for the reader and is NEVER subtracted from the budget: a reserve
+    may shape a plan, it may never be the reason a wake is refused.
+    """
+    if free_bytes is None or need_bytes is None:
+        return None
+    free = int(free_bytes)
+    need = int(need_bytes)
+    if need <= 0 or free < 0:
+        return None
+    if free >= need:
+        return None
+    return (
+        f"free={free >> 20} MiB < need={need >> 20} MiB "
+        f"(short by {(need - free) >> 20} MiB; corridor floor={int(floor_bytes) >> 20} "
+        "MiB is reported, not subtracted)"
+    )
+
+
+#: A resume that mapped less than this fraction of the tag's bytes did not
+#: happen. Deliberately loose: the question is "did ~13 GiB appear or ~0", and
+#: a concurrent allocation on another thread must never turn a landed resume
+#: into a refusal. One-sided by construction.
+RESUME_LANDED_FRACTION = 0.5
+
+#: Below this, the free-memory delta is noise and the check stands aside.
+RESUME_LANDED_MIN_BYTES = 64 << 20
+
+
+def resume_landed(free_before, free_after, need_bytes) -> Optional[bool]:
+    """Did a ``resume(tag)`` actually map the tag's bytes?
+
+    True  -- device free fell by at least half of what the tag claims.
+    False -- it did not; the hook rolled the whole tag back and could not say so.
+    None  -- not decidable here (no probe, or a tag too small to measure), which
+             is an ABSENCE and must be reported as one, never as a False.
+    """
+    if free_before is None or free_after is None or need_bytes is None:
+        return None
+    need = int(need_bytes)
+    if need < RESUME_LANDED_MIN_BYTES:
+        return None
+    delta = int(free_before) - int(free_after)
+    return delta >= int(need * RESUME_LANDED_FRACTION)
