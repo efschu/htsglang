@@ -136,6 +136,18 @@ def _router_triton_kernel(
         tl.float32
     )  # [BLOCK_N]
 
+    # #49 (20.09.): a kernel launched with launch_pdl=True may start while the
+    # kernel before it in the stream is still writing `scores` (the gate GEMM's
+    # output). The wait below is the ONLY thing that orders that read; b113aea441
+    # (upstream #39126, "PDL router fix" for DGX Spark) removed it and kept the
+    # PDL launch, and on every PDL-capable card (sm_90+, here the RTX 5090 --
+    # the sm_86 3080s launch without PDL and never saw it) the router then
+    # read unwritten logits now and then: whole-token NaN/garbage topk_weights
+    # in row blocks, transient, recompute-clean (fn8c8b/fn8c9b ORIGIN
+    # ENTERS-AT-ROUTER-W; fn8c10b with the Triton router off: 0 events).
+    if USE_PDL:
+        tl.extra.cuda.gdc_wait()
+
     row_ptr = scores_ptr + offs_m[:, None] * stride_sm + offs_n[None, :] * stride_sn
     mask2d = mask_m[:, None] & mask_n[None, :]
     scores = tl.load(row_ptr, mask=mask2d, other=0.0).to(
