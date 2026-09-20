@@ -2280,7 +2280,14 @@ class ModelRunnerKVCacheMixin:
             per_req = self._stage_local_mamba_cache_per_req(config)
         else:
             per_req = config.mamba2_cache_params.mamba_cache_per_req
-            assert per_req > 0
+            # FORM A (fnFA6 20.09.): a worker has no linear-attention heads
+            # (uneven plan share 0), so its per-request state is 0 bytes --
+            # the same shape as a PP stage without linear layers: the sizing
+            # branches emit PP_STAGE_NO_MAMBA_STATE_SLOTS and the world
+            # MIN-sync below carries the host's real bound.
+            from sglang.srt.rank_role import this_rank_is_form_a_worker
+
+            assert per_req > 0 or this_rank_is_form_a_worker()
 
         if server_args.max_mamba_cache_size is not None:
             # Use explicitly set max_mamba_cache_size

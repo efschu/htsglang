@@ -1364,6 +1364,24 @@ class ModelConfig:
 
         if not tp_plan_active(tensor_parallel_size):
             return None
+        # FORM A (F4, fnFA6 20.09.): a worker rank holds no attention -- no
+        # q heads, no kv heads, no KV. The replicated-KV geometry below
+        # (kv < tp) would hand it EVERY kv head and a full-context pool it
+        # never reads (3.45 GiB per 3080 at 270k tokens). Zero heads make
+        # the pool cell 0 bytes, which the configurator already turns into
+        # the KV-less token table (_KVLESS_STAGE_TOKENS).
+        from sglang.srt.rank_role import (
+            installed_role_plan,
+            this_rank_is_form_a_worker,
+        )
+
+        _plan = installed_role_plan()
+        if _plan is not None:
+            if rank is not None:
+                if _plan.is_worker(rank):
+                    return 0
+            elif this_rank_is_form_a_worker():
+                return 0
         if attn_kv_replicated(tensor_parallel_size, total_num_kv_heads):
             # TP > num_kv_heads (task #62): REPLICATED-KV geometry — every
             # rank holds ALL kv heads (q heads split in kv_total-sized
