@@ -4238,6 +4238,68 @@ def verify_flip_cutover(scheduler, tp_phase: bool) -> None:
             f"this check exists to catch -- refusing to run a round on it."
         )
 
+    # Seam C (Task #47 slice 5): every per-request state the now-active
+    # phase needs is CARRIED or PRICED. Deliberately AFTER the stale check
+    # and not merged into it: the two answer different questions, and a
+    # W115 hidden inside a `stale` list would read as one more stale
+    # snapshot instead of "this state belongs to nobody".
+    #
+    # Fed the runner's ACTUAL family inventory, never a hand list -- that is
+    # the whole mechanism by which an undeclared family (the QSA raw-key
+    # ring, a hyper-connection mixer buffer) falls out as a refusal instead
+    # of being silently absent. A state that is neither carried nor priced
+    # does not fail loudly on its own: the D side decodes from a recurrent
+    # state nobody owns, and an unwritten state reads as a valid one.
+    _verify_flip_state_carry(scheduler, tp_phase)
+
+
+def _next_flash_live_state_families(scheduler) -> Optional[List[str]]:
+    """The per-request state families this runner actually holds, or None.
+
+    None means "this runner does not publish an inventory", which is an
+    ABSENCE and is reported as one: the check stands aside rather than
+    inventing an empty list, because an empty list would pass the
+    completeness test for every declared family at once.
+    """
+    inventory = getattr(scheduler, "next_flash_state_families", None)
+    if inventory is None:
+        return None
+    try:
+        return [str(n) for n in inventory() if str(n)]
+    except TypeError:
+        try:
+            return [str(n) for n in inventory if str(n)]
+        except Exception:  # noqa: BLE001
+            return None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _verify_flip_state_carry(scheduler, tp_phase: bool) -> None:
+    """Raise W115 when a live per-request state is neither carried nor priced.
+
+    Only on the TP (decode) side: the flip's state question is "does the
+    DECODE layout have what it needs", and the PP side rebuilds its state
+    from the prefill it is about to run anyway.
+    """
+    if not tp_phase:
+        return
+    live = _next_flash_live_state_families(scheduler)
+    if live is None:
+        return
+    from sglang.srt.flip_state_carry import solve_flip_state_carry
+
+    carry = solve_flip_state_carry(live)
+    logger.info(
+        "%s SEAM-C state carry verified: %d family(ies), carried %.0f MiB/req, "
+        "rebuild %d tok/req (%.1f ms)",
+        LOG_PREFIX,
+        len(carry.families),
+        carry.carried_bytes / (1 << 20),
+        carry.rebuild_tokens,
+        carry.rebuild_seconds * 1000.0,
+    )
+
 
 def build_phase_flip_runtime(scheduler) -> PhaseFlipRuntime:
     """Factory mirroring build_kv_reshard_runtime (kv_reshard.py): wires

@@ -159,3 +159,69 @@ def test_the_report_names_every_family_and_its_disposition():
 def test_planning_the_declared_set_alone_works_at_the_desk():
     carry = solve_flip_state_carry(None)
     assert len(carry.families) == len(NEXT_FLASH_STATES)
+
+
+# --------------------------------------------------------------------------
+# Wired at the cutover (slice 5, part 2)
+# --------------------------------------------------------------------------
+class _Sched:
+    def __init__(self, families=None, raising=False):
+        self._f = families
+        self._raising = raising
+
+    def next_flash_state_families(self):
+        if self._raising:
+            raise RuntimeError("inventory unavailable")
+        return list(self._f)
+
+
+def test_the_cutover_verifies_the_state_carry_on_the_decode_side():
+    from sglang.srt.managers.phase_flip_runtime import _verify_flip_state_carry
+
+    _verify_flip_state_carry(_Sched(_LIVE), tp_phase=True)  # no raise
+
+
+def test_the_cutover_raises_W115_for_an_undeclared_live_family():
+    from sglang.srt.managers.phase_flip_runtime import _verify_flip_state_carry
+
+    sched = _Sched(_LIVE + ["hyper_connection_mixer_buffer"])
+    with pytest.raises(Weg2FlipDraftStateOrphaned) as exc:
+        _verify_flip_state_carry(sched, tp_phase=True)
+    assert "hyper_connection_mixer_buffer" in str(exc.value)
+
+
+def test_the_pp_side_is_not_checked_because_it_rebuilds_anyway():
+    from sglang.srt.managers.phase_flip_runtime import _verify_flip_state_carry
+
+    sched = _Sched(_LIVE + ["something_undeclared"])
+    _verify_flip_state_carry(sched, tp_phase=False)  # no raise
+
+
+def test_a_runner_without_an_inventory_stands_aside_rather_than_passing_empty():
+    """An empty list would pass the completeness test for every declared
+    family at once -- an ABSENCE must be reported as one."""
+    from sglang.srt.managers.phase_flip_runtime import (
+        _next_flash_live_state_families,
+        _verify_flip_state_carry,
+    )
+
+    class Bare:
+        pass
+
+    assert _next_flash_live_state_families(Bare()) is None
+    _verify_flip_state_carry(Bare(), tp_phase=True)  # no raise
+
+
+def test_a_raising_inventory_is_an_absence_not_a_crash():
+    from sglang.srt.managers.phase_flip_runtime import _next_flash_live_state_families
+
+    assert _next_flash_live_state_families(_Sched(raising=True)) is None
+
+
+def test_a_plain_sequence_inventory_also_works():
+    from sglang.srt.managers.phase_flip_runtime import _next_flash_live_state_families
+
+    class Seq:
+        next_flash_state_families = tuple(_LIVE)
+
+    assert _next_flash_live_state_families(Seq()) == _LIVE
