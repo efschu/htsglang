@@ -4964,6 +4964,50 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             worker_dispatch(layer, forward_batch)
         return ModelRunnerOutput(logits_output=None, can_run_graph=False)
 
+    def _run_form_a_boot_gate(self) -> None:
+        """'RAENGE NIE UNEINS' as a boot-path refusal (form_a_boot_gate).
+
+        Once, on the first forward, and never again: the collective
+        sequence is a property of the LAYOUT, not of a batch, so checking
+        it per layer would cost 48 all-gathers a round forever. The first
+        forward rather than __init__ because that is the earliest point
+        where every rank demonstrably has its process group AND its model,
+        which is what the declaration describes.
+
+        A disagreement raises here -- with a stack, a log line and three
+        live processes -- instead of parking every card in a different
+        collective until the deadman fires.
+        """
+        if getattr(self, "_form_a_gate_done", False):
+            return
+        self._form_a_gate_done = True
+        from sglang.srt.form_a_boot_gate import gate_form_a_boot
+        from sglang.srt.rank_role import installed_role_plan
+
+        plan = installed_role_plan()
+        if plan is None or self.is_draft_worker:
+            return
+        from sglang.srt.distributed import get_tp_group
+
+        group = get_tp_group()
+        gate_form_a_boot(
+            plan,
+            self.tp_rank,
+            group.all_gather_object,
+            worker_skips_dense=True,
+            host_dense_is_unsharded=True,
+            # Slice 3's host-centric exchange stays behind its switch; the
+            # first Form A boot runs the simple form, where the MoE keeps
+            # its plain post-experts all-reduce and the carrier moves the
+            # input.
+            host_uses_moe_exchange=False,
+        )
+        logger.info(
+            "Form A boot gate: rank %d agrees with every rank about the "
+            "per-layer collective sequence.",
+            self.tp_rank,
+        )
+
     def _form_a_moe_blocks(self):
         """The worker's MoE layer list, resolved once from the module tree.
 
@@ -5041,6 +5085,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         reinit_attn_backend: bool = False,
         split_forward_count: int = 1,
     ) -> ModelRunnerOutput:
+        # Form A: every rank declares the collectives it will issue and the
+        # host compares them, once, BEFORE the first forward. No-op on
+        # every classic boot (no role plan installed).
+        self._run_form_a_boot_gate()
         # Task #343 layer tap. Driven from here rather than from a forward
         # pre-hook on the model, because the model is entered as
         # ``model.forward(...)`` -- torch runs no hook on a direct .forward()

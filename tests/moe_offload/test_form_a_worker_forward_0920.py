@@ -382,3 +382,52 @@ def test_the_boot_gate_passes_when_every_rank_reads_the_same_carrier():
         None, 0, _gather, worker_skips_dense=False,
         host_dense_is_unsharded=False, host_uses_moe_exchange=False,
     )
+
+
+# ==========================================================================
+# 8. The gate and the stripped forward are WIRED, not merely written
+# ==========================================================================
+def test_the_boot_gate_and_the_worker_forward_have_real_call_sites():
+    """The desk-written-never-executed check. Both of these are useless as
+    modules nobody calls: a gate that is not on the boot path lets the rig
+    wedge exactly as if it did not exist, and a stripped forward that is
+    not dispatched means the worker runs the full model and raises on the
+    first placeholder. Asserted against the SOURCE of _forward_raw rather
+    than by running it, because running it needs three GPUs."""
+    import inspect
+
+    from sglang.srt.model_executor.model_runner import ModelRunner
+
+    src = inspect.getsource(ModelRunner._forward_raw)
+    assert "self._run_form_a_boot_gate()" in src
+    assert "self._forward_form_a_worker(forward_batch)" in src
+    assert "is_form_a_worker" in src
+    # and the gate itself declares the SIMPLE form: worker skips dense,
+    # host dense unsharded, MoE keeps its plain all-reduce
+    gate_src = inspect.getsource(ModelRunner._run_form_a_boot_gate)
+    assert "worker_skips_dense=True" in gate_src
+    assert "host_dense_is_unsharded=True" in gate_src
+    assert "host_uses_moe_exchange=False" in gate_src
+
+
+def test_the_host_publishes_the_moe_input_in_the_layer_forward():
+    """The carrier's host side has to sit at the MoE input itself, not at
+    the earlier dense all-reduce: between those two points the host runs
+    the hyper-connection combine and mix, which a worker does not have."""
+    import inspect
+
+    from sglang.srt.models import qwen4_exp
+
+    src = inspect.getsource(
+        qwen4_exp.Qwen4ExpLayerExtensionMixin._run_qwen4_exp_mlp
+    )
+    assert "publish_moe_input(hidden_states)" in src
+    assert "form_a_dense_is_unsharded()" in src
+    # ... immediately before the MoE block, with no hyper-connection in
+    # between: the host runs combine+mix between the dense all-reduce and
+    # the MoE input, and a worker has neither mixer, so a carrier placed at
+    # the earlier all-reduce would hand the worker the wrong rows.
+    before, after = src.split("publish_moe_input(hidden_states)", 1)
+    head, _ = after.split("self.mlp(hidden_states, forward_batch)", 1)
+    assert "hyper_connection" not in head
+    assert "self.mlp(hidden_states, forward_batch)" not in before
