@@ -5,6 +5,7 @@ offload) was explained three different ways from load/offload deltas, all
 wrong. This sums the CUDA-resident parameters and buffers of the model by
 family name so the next balance sheet comes from the tensors themselves.
 """
+
 from __future__ import annotations
 
 import logging
@@ -39,7 +40,9 @@ def family_of(name: str) -> str:
     return "other"
 
 
-def census(named: Iterable[Tuple[str, torch.Tensor]], cuda_only: bool = True) -> Dict[str, int]:
+def census(
+    named: Iterable[Tuple[str, torch.Tensor]], cuda_only: bool = True
+) -> Dict[str, int]:
     """Bytes per family over ``named`` (name, tensor) pairs; dedups storages
     so a tensor registered twice (tied weights, views) is counted once."""
     seen = set()
@@ -54,11 +57,15 @@ def census(named: Iterable[Tuple[str, torch.Tensor]], cuda_only: bool = True) ->
         if key in seen:
             continue
         seen.add(key)
-        out[family_of(name)] = out.get(family_of(name), 0) + t.numel() * t.element_size()
+        out[family_of(name)] = (
+            out.get(family_of(name), 0) + t.numel() * t.element_size()
+        )
     return out
 
 
-def log_vram_family_census(model: torch.nn.Module, tag: str, where: str) -> Dict[str, int]:
+def log_vram_family_census(
+    model: torch.nn.Module, tag: str, where: str
+) -> Dict[str, int]:
     named = list(model.named_parameters()) + list(model.named_buffers())
     fam = census(named)
     total = sum(fam.values())
@@ -74,7 +81,12 @@ def log_vram_family_census(model: torch.nn.Module, tag: str, where: str) -> Dict
         "[vram-census] %s %s: model tensors on device %.2f GiB = {%s}; "
         "torch allocated %.2f GiB, reserved %.2f GiB (the gap to allocated is "
         "non-model: workspaces, pool tables, KV, activations)",
-        tag, where, total / 2**30, parts, alloc, reserved,
+        tag,
+        where,
+        total / 2**30,
+        parts,
+        alloc,
+        reserved,
     )
     if where == "after pools":
         # from here on the allocator peak is the RUNTIME transient (prefill
@@ -92,10 +104,17 @@ PEAK_EXTEND_MIN_TOKENS = 2048
 PEAK_DECODE_AT = 64
 
 
+#: 20.09. (fn8ak3): a new high-water has to beat the last LOGGED one by this
+#: much before it is re-emitted, so a long prefill does not print a line per
+#: chunk.  Small enough that the number the planner reads is the real maximum
+#: to within one step of this size.
+PEAK_HIGHWATER_STEP_GIB = 0.25
+
+
 def _peak_state(runner):
     st = getattr(runner, "_vram_peak_state", None)
     if st is None:
-        st = {"extend": False, "decode": 0, "decode_done": False}
+        st = {"extend": False, "decode": 0, "decode_done": False, "logged": 0.0}
         try:
             runner._vram_peak_state = st
         except Exception:  # noqa: BLE001 -- slots classes
@@ -104,12 +123,26 @@ def _peak_state(runner):
 
 
 def maybe_log_vram_peak(runner, forward_batch, cuda=torch.cuda) -> Optional[str]:
-    """Once after the first big extend (>= PEAK_EXTEND_MIN_TOKENS rows) and
-    once at the PEAK_DECODE_AT-th decode forward: allocator peak since the
-    pools, allocated, reserved and the card's real free bytes. That peak
-    minus what was allocated before the forward is the transient the sizing
-    must subtract instead of the hand-tuned air (19.09.). Returns the kind
-    logged ('extend'/'decode') or None."""
+    """Once after the first big extend (>= PEAK_EXTEND_MIN_TOKENS rows), once
+    at the PEAK_DECODE_AT-th decode forward, and AGAIN on every new allocator
+    high-water: allocator peak since the pools, allocated, reserved and the
+    card's real free bytes. That peak minus what was allocated before the
+    forward is the transient the sizing must subtract instead of the hand-tuned
+    air (19.09.). Returns the kind logged ('extend'/'decode'/'high-water') or
+    None.
+
+    THE HIGH-WATER KIND EXISTS BECAUSE THE LATCH LIED (20.09., fn8ak3).
+    ``st["extend"]`` latched on the FIRST extend of >= 2048 rows, which under
+    chunked prefill is the first chunk of the first request.  The transient a
+    deep prefill draws is not constant across chunks: the attention workspace
+    and the partials scale with the CACHED context the chunk attends over, so
+    the worst chunk of a 259k needle is the last one, minutes after the latch.
+    Measured consequence: fn8aj printed ``allocated now 13.29`` for rank 2 and
+    a planner reading it as the peak sized 18 extra pool rows onto that card;
+    the real prefill peak was ``18.60 GiB allocated by PyTorch`` and the boot
+    died with 73.5 MiB free.  A once-per-kind instrument cannot report a
+    maximum -- it reports the first sample and calls it one.
+    """
     st = _peak_state(runner)
     mode = getattr(forward_batch, "forward_mode", None)
     kind = None
@@ -133,18 +166,36 @@ def maybe_log_vram_peak(runner, forward_batch, cuda=torch.cuda) -> Optional[str]
         if st["decode"] >= PEAK_DECODE_AT:
             st["decode_done"] = True
             kind = "decode"
-    if kind is None:
-        return None
     try:
         peak = cuda.max_memory_allocated() / 2**30
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("[vram-peak] skipped: %s", exc)
+        return None
+    if kind is None and peak >= st["logged"] + PEAK_HIGHWATER_STEP_GIB:
+        kind = "high-water"
+    if kind is None:
+        return None
+    st["logged"] = max(st["logged"], peak)
+    try:
         alloc = cuda.memory_allocated() / 2**30
         reserved = cuda.memory_reserved() / 2**30
         free, total = cuda.mem_get_info()
-        n = int(getattr(forward_batch, "input_ids").shape[0]) if getattr(forward_batch, "input_ids", None) is not None else -1
+        n = (
+            int(getattr(forward_batch, "input_ids").shape[0])
+            if getattr(forward_batch, "input_ids", None) is not None
+            else -1
+        )
         logger.info(
             "[vram-peak] %s (%s rows): allocator peak since pools %.2f GiB, allocated now %.2f, "
             "reserved %.2f, card free %.2f of %.2f GiB -> transient headroom used = peak - allocated %.2f GiB",
-            kind, n, peak, alloc, reserved, free / 2**30, total / 2**30, peak - alloc,
+            kind,
+            n,
+            peak,
+            alloc,
+            reserved,
+            free / 2**30,
+            total / 2**30,
+            peak - alloc,
         )
     except Exception as exc:  # noqa: BLE001
         logger.debug("[vram-peak] skipped: %s", exc)

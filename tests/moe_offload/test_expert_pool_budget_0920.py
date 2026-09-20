@@ -165,11 +165,23 @@ def test_page_rounding_goes_UP_because_the_sizer_rounds_down():
     assert local == 128
 
 
-# --- 4. the plan on the fn8aj fixture --------------------------------------
+# --- 4. the latched [vram-peak] sample is NOT a maximum ---------------------
+#
+# fn8aj's log carries no measured prefill peak: maybe_log_vram_peak latched on
+# the first extend of >= 2048 rows, which under chunked prefill is the first
+# chunk of the first request.  A strict plan therefore REFUSES to size the
+# pool from it -- which is the lesson fn8ak3 paid for.
 
 
-def test_plan_on_fn8aj_shrinks_the_KV_pool_to_its_DCP_share(census):
-    plan = epb.plan_expert_pool(census, ctx_tokens=CTX)
+def test_a_log_without_a_measured_prefill_peak_is_refused_by_default(census):
+    with pytest.raises(epb.ExpertPoolBudgetRefused) as exc:
+        epb.plan_expert_pool(census, ctx_tokens=CTX)
+    assert exc.value.rank == 0
+    assert "LATCHED sample" in str(exc.value)
+
+
+def test_the_upper_bound_plan_is_available_but_says_so(census):
+    plan = epb.plan_expert_pool(census, ctx_tokens=CTX, strict=False)
     assert plan.unit_tokens == 8192
     # user law: under uneven DCP quote the WORLD pool.
     assert plan.kv_tokens_world == 262144
@@ -177,15 +189,20 @@ def test_plan_on_fn8aj_shrinks_the_KV_pool_to_its_DCP_share(census):
     assert [p.kv_gib for p in plan.ranks] == pytest.approx([1.187] * 3, abs=0.002)
     # every rank gives ~2.37 GiB back to its card.
     assert [p.kv_credit_bytes / GIB for p in plan.ranks] == pytest.approx(
-        [2.369, 2.369, 2.369], abs=0.002
+        [2.369] * 3, abs=0.002
     )
-
-
-def test_plan_on_fn8aj_buys_rows_with_the_freed_bytes(census):
-    plan = epb.plan_expert_pool(census, ctx_tokens=CTX)
     assert [p.rows_affordable for p in plan.ranks] == [25, 28, 18]
     assert [p.scratch for p in plan.ranks] == [170, 64, 54]
-    # the pool-mode identity holds on every rank by construction.
+    # and every rank carries the warning that these are not budgets.
+    for rank in (0, 1, 2):
+        assert any(
+            n.startswith(f"rank{rank}: no measured prefill peak") for n in plan.notes
+        )
+    assert all("UPPER BOUND" in n for n in plan.notes if "no measured" in n)
+
+
+def test_the_pool_identity_holds_on_every_rank_by_construction(census):
+    plan = epb.plan_expert_pool(census, ctx_tokens=CTX, strict=False)
     for p in plan.ranks:
         assert p.buffer_rows <= p.owned_experts
         assert p.leftover_bytes >= 0.0
@@ -193,9 +210,9 @@ def test_plan_on_fn8aj_buys_rows_with_the_freed_bytes(census):
 
 def test_rank0_buys_fewest_rows_despite_the_largest_budget(census):
     """The 5090 has the biggest card and the biggest KV credit and still gets
-    the fewest rows -- because its card free at the worst state is 0.55 GiB
-    against the 3080s' 0.85/0.96.  That asymmetry is the whole finding."""
-    plan = epb.plan_expert_pool(census, ctx_tokens=CTX)
+    the fewest rows -- because its card free at the sampled state is 0.55 GiB
+    against the 3080s' 0.85/0.96."""
+    plan = epb.plan_expert_pool(census, ctx_tokens=CTX, strict=False)
     r0, r1, r2 = plan.ranks
     assert r0.card_free_bytes < r1.card_free_bytes < r2.card_free_bytes
     assert r0.rows_affordable < r1.rows_affordable
@@ -203,7 +220,7 @@ def test_rank0_buys_fewest_rows_despite_the_largest_budget(census):
 
 
 def test_rank2_is_ownership_capped_and_the_surplus_is_named_for_the_ratio(census):
-    plan = epb.plan_expert_pool(census, ctx_tokens=CTX)
+    plan = epb.plan_expert_pool(census, ctx_tokens=CTX, strict=False)
     r2 = plan.ranks[2]
     assert r2.bound_by.startswith("ownership")
     # 29 rows affordable, 18 of them ownable (97 - 43 - 36).
@@ -213,17 +230,15 @@ def test_rank2_is_ownership_capped_and_the_surplus_is_named_for_the_ratio(census
 
 
 def test_env_replaces_both_hand_pins_and_books_the_transient(census):
-    env = epb.plan_expert_pool(census, ctx_tokens=CTX).env()
+    plan = epb.plan_expert_pool(census, ctx_tokens=CTX, strict=False)
+    env = plan.env()
     assert env["SGLANG_MOE_SCRATCH_SLOTS"] == "170,64,54"
     assert env["MAX_TOTAL_TOKENS"] == "90112"
     # User law: transients are BOOKED, explicitly, per rank. The value is the
     # residual that keeps the sizer from handing the rows' bytes back to KV.
     booked = [int(x) for x in env["SGLANG_KV_BUDGET_PREFILL_TRANSIENT_MIB"].split(",")]
     assert len(booked) == 3 and all(b > 0 for b in booked)
-    for b, c, p in zip(
-        booked, census, epb.plan_expert_pool(census, ctx_tokens=CTX).ranks
-    ):
-        # available - KV need - the arena growth == what is booked.
+    for b, c, p in zip(booked, census, plan.ranks):
         assert b == pytest.approx(
             (c.available_bytes - p.kv_bytes - p.rows_affordable * p.row_bytes) / MIB,
             abs=1.0,
@@ -233,51 +248,174 @@ def test_env_replaces_both_hand_pins_and_books_the_transient(census):
 def test_no_reserve_is_added_anywhere(census):
     """User law 2026-09-19, verbatim: reserves NEVER, 'nicht ein Byte'."""
     assert epb.DEFAULT_FLOOR_BYTES == 0
-    plan = epb.plan_expert_pool(census, ctx_tokens=CTX)
+    plan = epb.plan_expert_pool(census, ctx_tokens=CTX, strict=False)
     for p in plan.ranks:
         assert p.headroom_bytes == pytest.approx(
             p.card_free_bytes + p.kv_credit_bytes, rel=1e-9
         )
         if p.bound_by == "budget":
-            # nothing is held back: the leftover is less than one more row.
             assert p.leftover_bytes < p.row_bytes
 
 
 def test_a_named_floor_is_possible_but_never_default(census):
-    tight = epb.plan_expert_pool(census, ctx_tokens=CTX, floor_bytes=int(1.0 * GIB))
-    loose = epb.plan_expert_pool(census, ctx_tokens=CTX)
+    tight = epb.plan_expert_pool(
+        census, ctx_tokens=CTX, floor_bytes=int(1.0 * GIB), strict=False
+    )
+    loose = epb.plan_expert_pool(census, ctx_tokens=CTX, strict=False)
     assert tight.ranks[0].rows_affordable < loose.ranks[0].rows_affordable
 
 
-# --- 5. the three configuration boots, retrodicted -------------------------
+# --- 5. the MEASURED prefill peak, and the chunk lever ---------------------
+#
+# fn8ak3 booted 145,60,54 -- the 5090 untouched, the 3080s +24/+18 rows -- and
+# rank 2 went OOM in the needle prefill:
+#
+#   Tried to allocate 160 MiB, 73.5 MiB free, 19.36 GiB in use;
+#   18.60 GiB allocated by PyTorch, 1.79 GiB in private pools (CUDA Graphs),
+#   372 MiB reserved-unallocated
+#
+# with PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True already set, so this is
+# not fragmentation: at the real prefill peak the 3080 is simply full.  The
+# 18.60 GiB is the number [vram-peak] should have printed and printed 14.98
+# for.  Only rank 2's peak was measured, so only rank 2 is priced here.
+
+MEASURED_PEAK_GIB = 18.60  # fn8ak3 rank 2, OOM line
+GRAPH_PRIVATE_GIB = 1.79  # same line: CUDA-graph private pools, chunk-independent
+FN8AK3_CHUNK = 8192
+
+
+@pytest.fixture
+def rank2_measured(census):
+    return replace(
+        census[2],
+        prefill_peak_allocated_gib=MEASURED_PEAK_GIB,
+        graph_private_gib=GRAPH_PRIVATE_GIB,
+        prefill_chunk_tokens=FN8AK3_CHUNK,
+    )
+
+
+def _credit(c):
+    return float(c.kv_bytes_now - 90112 * c.cell_size)
+
+
+def test_the_measured_peak_is_3_6_GiB_above_what_the_latched_line_reported(
+    rank2_measured,
+):
+    c = rank2_measured
+    latched = c.peak_gib - c.allocated_gib  # 14.98 - 13.29
+    real = c.prefill_peak_allocated_gib - c.allocated_gib  # 18.60 - 13.29
+    assert latched == pytest.approx(1.69, abs=0.01)
+    assert real == pytest.approx(5.31, abs=0.01)
+    assert real - latched == pytest.approx(3.62, abs=0.02)
+
+
+def test_at_chunk_8192_the_3080_has_no_headroom_at_all(rank2_measured):
+    """The ~3.5 GiB that look idle on a 3080 ARE the prefill transient at
+    CHUNK 8192.  They are free only in decode."""
+    headroom, transient, note = epb.rank_headroom_bytes(
+        rank2_measured,
+        kv_credit_bytes=_credit(rank2_measured),
+        prefill_chunk_tokens=8192,
+    )
+    assert note is None  # measured, so no upper-bound warning
+    assert transient == pytest.approx(5.31, abs=0.01)
+    # even after handing back 2.37 GiB of KV over-provision the rank is short.
+    assert headroom < 0
+    assert headroom / GIB == pytest.approx(-0.29, abs=0.03)
+
+
+def test_halving_the_chunk_is_the_lever_that_actually_frees_rows(rank2_measured):
+    at8192, t8192, _ = epb.rank_headroom_bytes(
+        rank2_measured,
+        kv_credit_bytes=_credit(rank2_measured),
+        prefill_chunk_tokens=8192,
+    )
+    at4096, t4096, _ = epb.rank_headroom_bytes(
+        rank2_measured,
+        kv_credit_bytes=_credit(rank2_measured),
+        prefill_chunk_tokens=4096,
+    )
+    # only the non-graph half scales: 1.79 fixed + (5.31 - 1.79)/2.
+    assert t4096 == pytest.approx(GRAPH_PRIVATE_GIB + (t8192 - GRAPH_PRIVATE_GIB) / 2)
+    assert t4096 == pytest.approx(3.55, abs=0.02)
+    assert at8192 < 0 < at4096
+    row = epb.row_bytes_from_census(
+        rank2_measured.expert_tensor_gib, rank2_measured.buffer_rows
+    )
+    assert int(at4096 // row) == 12
+
+
+def test_the_graph_private_pool_does_not_scale_with_the_chunk(rank2_measured):
+    """1.79 GiB of CUDA-graph private pools are captured once and are the same
+    at every chunk size, so a term that scaled the WHOLE transient would
+    promise rows that halving CHUNK cannot deliver."""
+    _, t, _ = epb.rank_headroom_bytes(
+        rank2_measured, kv_credit_bytes=0.0, prefill_chunk_tokens=1
+    )
+    assert t > GRAPH_PRIVATE_GIB
+    assert t == pytest.approx(GRAPH_PRIVATE_GIB, abs=0.01)
+
+
+def test_a_measured_rank_needs_no_upper_bound_warning(rank2_measured):
+    _, _, note = epb.rank_headroom_bytes(rank2_measured, kv_credit_bytes=0.0)
+    assert note is None
+
+
+# --- 6. the three configuration boots, retrodicted -------------------------
 
 
 def test_the_term_retrodicts_all_three_configuration_boots(census):
+    """From fn8aj's census alone, on the (optimistic) upper-bound reading."""
     # fn8ak 175,60,60 -- rank 2 died on the pool identity, rank 0 was over.
-    bad = epb.verify_scratch_vector(census, (175, 60, 60), ctx_tokens=CTX)
+    bad = epb.verify_scratch_vector(census, (175, 60, 60), ctx_tokens=CTX, strict=False)
     assert len(bad) == 2
     assert "buffer_size == R+C (97 != 43+60)" in bad[1]
     assert bad[0].startswith("rank0:")
 
     # fn8ak2 175,60,54 -- booted, then rank 0 OOMed in the first prefill chunk.
-    bad2 = epb.verify_scratch_vector(census, (175, 60, 54), ctx_tokens=CTX)
+    bad2 = epb.verify_scratch_vector(
+        census, (175, 60, 54), ctx_tokens=CTX, strict=False
+    )
     assert len(bad2) == 1 and bad2[0].startswith("rank0:")
     assert "5 row(s)" in bad2[0]
 
-    # fn8ak3 145,60,54 -- the 5090 left alone. Accepted.
-    assert epb.verify_scratch_vector(census, (145, 60, 54), ctx_tokens=CTX) == ()
+    # fn8ak3 145,60,54 -- accepted on the upper bound, and metal refuted it.
+    # That is exactly why strict=True is the default: the upper bound is not a
+    # budget, and this line is the standing reminder.
+    assert (
+        epb.verify_scratch_vector(census, (145, 60, 54), ctx_tokens=CTX, strict=False)
+        == ()
+    )
+
+
+def test_the_measured_peak_would_have_refused_fn8ak3(rank2_measured):
+    """The same rank 2, priced on the MEASURED peak instead of the latched
+    sample, has negative headroom -- so its +18 rows are refused before the
+    boot rather than discovered by an OOM."""
+    headroom, _, _ = epb.rank_headroom_bytes(
+        rank2_measured,
+        kv_credit_bytes=_credit(rank2_measured),
+        prefill_chunk_tokens=8192,
+    )
+    assert headroom < 0
 
 
 def test_verify_rejects_a_vector_of_the_wrong_length(census):
     with pytest.raises(ValueError, match="2 entries for 3 ranks"):
-        epb.verify_scratch_vector(census, (145, 36), ctx_tokens=CTX)
+        epb.verify_scratch_vector(census, (145, 36), ctx_tokens=CTX, strict=False)
 
 
-# --- 6. refusal by name -----------------------------------------------------
+# --- 7. refusal by name -----------------------------------------------------
 
 
 def test_refusal_names_the_rank_and_the_shortfall(census):
-    starved = list(census)
+    # give every rank a measured peak so the refusal below is the BUDGET one,
+    # not the "no measured peak" one.
+    starved = [
+        replace(c, prefill_peak_allocated_gib=c.peak_gib, prefill_chunk_tokens=8192)
+        for c in census
+    ]
+    # rank 1 keeps a pool it cannot shrink and has nothing free on the card.
     starved[1] = replace(starved[1], card_free_gib=0.0, kv_tokens_now=1024)
     with pytest.raises(epb.ExpertPoolBudgetRefused) as exc:
         epb.plan_expert_pool(tuple(starved), ctx_tokens=CTX)
@@ -290,7 +428,7 @@ def test_refusal_names_the_rank_and_the_shortfall(census):
 
 def test_refusal_rather_than_a_silent_clamp_on_an_impossible_context(census):
     with pytest.raises(epb.ExpertPoolBudgetRefused) as exc:
-        epb.plan_expert_pool(census, ctx_tokens=4_000_000)
+        epb.plan_expert_pool(census, ctx_tokens=4_000_000, strict=False)
     assert exc.value.rank == 0
 
 
@@ -320,19 +458,26 @@ def test_ranks_never_uneins_on_the_page_size(census):
     mixed = list(census)
     mixed[1] = replace(mixed[1], page_size=32)
     with pytest.raises(ValueError, match="RAENGE NIE UNEINS"):
-        epb.plan_expert_pool(tuple(mixed), ctx_tokens=CTX)
+        epb.plan_expert_pool(tuple(mixed), ctx_tokens=CTX, strict=False)
 
 
-# --- 7. the dry run ---------------------------------------------------------
+# --- 8. the dry run ---------------------------------------------------------
 
 
-def test_dry_run_prints_the_per_rank_numbers_for_a_census():
-    out = epb.dry_run(FN8AJ_LOG, ctx_tokens=CTX)
+def test_dry_run_prices_both_chunk_sizes():
+    out = epb.dry_run(FN8AJ_LOG, ctx_tokens=CTX, strict=False)
+    assert "=== prefill chunk 8192" in out and "=== prefill chunk 4096" in out
     assert "WORLD pool 262144 tokens" in out
     assert "SGLANG_MOE_SCRATCH_SLOTS=170,64,54" in out
     for rank in (0, 1, 2):
         assert f"rank{rank}:" in out
     assert "--rank-moe-ratio" in out
+
+
+def test_dry_run_refuses_a_log_whose_peak_instrument_latched():
+    out = epb.dry_run(FN8AJ_LOG, ctx_tokens=CTX)
+    assert out.count("REFUSED") == len(epb.DRY_RUN_CHUNKS)
+    assert "LATCHED sample" in out
 
 
 def test_dry_run_works_on_a_grep_of_the_five_line_shapes():
@@ -344,6 +489,6 @@ def test_dry_run_works_on_a_grep_of_the_five_line_shapes():
         "MoE expert pool",
     )
     grepped = "\n".join(l for l in FN8AJ_LOG.splitlines() if any(k in l for k in keep))
-    assert epb.dry_run(grepped, ctx_tokens=CTX) == epb.dry_run(
-        FN8AJ_LOG, ctx_tokens=CTX
+    assert epb.dry_run(grepped, ctx_tokens=CTX, strict=False) == epb.dry_run(
+        FN8AJ_LOG, ctx_tokens=CTX, strict=False
     )

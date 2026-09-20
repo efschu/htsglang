@@ -47,27 +47,53 @@ need beyond its steady state", and they disagree by 4x.  fn8aj rank 0::
   **OVERBOOKS**: on fn8aj it exceeds rank 0's whole reachable budget, so a
   term using it refuses a configuration that demonstrably ran -- and it also
   forbids the +24/+18 rows the 3080s demonstrably took in fn8ak3.
-* ``card free`` = 0.55 GiB.  **This is the one this module uses.**  It is the
+* ``card free`` = 0.55 GiB.  **This is the base this module uses.**  It is the
   residual after the transient, the allocator cache, the fragmentation, the
   CUDA context and any foreign process -- i.e. it already contains every term
-  the other two readings argue about, measured rather than modelled.  A new
-  pool row comes out of exactly this number and nothing else.
+  the other two readings argue about, measured rather than modelled.
+
+AND THE SAMPLE ITSELF IS NOT A MAXIMUM (fn8ak3, the third death)
+-----------------------------------------------------------------
+``maybe_log_vram_peak`` LATCHED: ``st["extend"]`` was set by the first extend
+of >= 2048 rows, which under chunked prefill is the first chunk of the first
+request.  The transient a deep prefill draws is not constant across chunks --
+the attention workspace and the partials grow with the cached context a chunk
+attends over -- so the worst chunk of a 259k needle comes minutes after the
+latch and was never sampled.  Measured: fn8aj printed ``allocated now 13.29``
+for rank 2; fn8ak3 (145,60,54 -- that rank +18 rows) died in the needle prefill
+with ``18.60 GiB allocated by PyTorch, 1.79 GiB in private pools (CUDA Graphs),
+73.5 MiB free``, and ``expandable_segments:True`` was already set, so it is not
+fragmentation: at the real peak the 3080 is simply full.  The ~3.5 GiB that
+look idle on a 3080 ARE the prefill transient at CHUNK 8192; they are free only
+in decode.
+
+``vram_family_census.py`` now re-emits on every new allocator high-water, so
+the next boot MEASURES that number.  Until a log carries it, this module
+REFUSES to size a pool (``strict=True``) rather than read the latched sample as
+a maximum -- ``strict=False`` gives the upper bound, labelled as one.
 
 So the headroom a rank has for more rows is::
 
-    headroom_r = card_free_min_r + (kv_bytes_now_r - kv_bytes_need_r)
-    rows_r     = floor(headroom_r / row_bytes_r)
-    C_r        = min(C_now_r + rows_r, E_local_r - R_r)
+    transient_r(chunk) = graph_private_r + (peak_alloc_r - alloc_r - graph_private_r)
+                         * chunk / chunk_measured
+    free_r(chunk)      = card_free_r - (peak_alloc_r - peak_r) + transient_r(measured)
+                         - transient_r(chunk)
+    headroom_r         = free_r(chunk) + (kv_bytes_now_r - kv_bytes_need_r)
+    rows_r             = floor(headroom_r / row_bytes_r)
+    C_r                = min(C_now_r + rows_r, E_local_r - R_r)
 
-``card_free_min`` is the MINIMUM over the rank's ``[vram-peak]`` lines, not the
-first one: the worst load state is the one the deployment serves (the lesson
-``planner/transient_census.py`` records for the cut gate).  The KV term is a
-CREDIT, because shrinking the pool to its DCP need gives those bytes back to
-the card before anything else runs.
+The KV term is a CREDIT, because shrinking the pool to its DCP need gives those
+bytes back to the card before anything else runs.  The CUDA-graph private pools
+are chunk-INDEPENDENT, so halving CHUNK halves only the other half of the
+transient -- and that is a real lever: on fn8ak3's rank 2 it is the difference
+between a refusal at 8192 and ~12 rows at 4096, at a TTFT cost this module does
+not price.  :func:`dry_run` therefore prints both.
 
-RETRODICTION, on the fixture, before anything new is booted: fn8aj rank 0 has
-``0.55 + 2.37 = 2.92 GiB`` of headroom = 25 rows.  fn8ak2 took 30.  The five
-rows it was over is 0.57 GiB -- and the OOM it hit reported 254 MiB free.
+RETRODICTIONS, all from fn8aj's census, before anything new is booted:
+fn8ak is refused by the pool identity on rank 2; fn8ak2 is refused by 5 rows on
+rank 0 (0.57 GiB -- the OOM it hit reported 254 MiB free); and fn8ak3, which
+the LATCHED reading accepts, is refused once rank 2's measured peak is in the
+census.  The last one is the standing argument for ``strict=True``.
 
 THE SIZING CHAIN THIS INVERTS (file:line @ 546dd2bd36)
 ------------------------------------------------------
@@ -214,6 +240,20 @@ class RankCensus:
     lru_rows: int
     staging: int
     spill_rows: int
+    #: 20.09. (fn8ak3): the TRUE ``torch.cuda.max_memory_allocated()`` at the
+    #: DEEPEST prefill chunk, GiB.  ``peak_gib`` above is NOT that number --
+    #: ``maybe_log_vram_peak`` latched on the first extend of >= 2048 rows, so
+    #: on a 259k needle it reported the first chunk of the first request.
+    #: Measured gap on fn8aj/fn8ak3 rank 2: 14.98 reported against 18.60 real.
+    #: ``None`` means the log could not measure it, and a strict plan REFUSES
+    #: rather than treating the latched sample as a maximum.
+    prefill_peak_allocated_gib: Optional[float] = None
+    #: CUDA-graph private pools, GiB.  Chunk-INDEPENDENT, so it does not scale
+    #: when the prefill chunk is halved (fn8ak3 rank 2: 1.79 GiB of the 19.36
+    #: in use).
+    graph_private_gib: float = 0.0
+    #: the prefill chunk size ``prefill_peak_allocated_gib`` was measured at.
+    prefill_chunk_tokens: int = 0
 
     @property
     def scratch(self) -> int:
@@ -437,6 +477,83 @@ def row_bytes_from_census(expert_tensor_gib: float, buffer_rows: int) -> float:
     return float(expert_tensor_gib) * GIB / rows
 
 
+def rank_headroom_bytes(
+    c: RankCensus,
+    *,
+    kv_credit_bytes: float,
+    prefill_chunk_tokens: Optional[int] = None,
+    floor_bytes: int = DEFAULT_FLOOR_BYTES,
+    strict: bool = True,
+) -> Tuple[float, float, Optional[str]]:
+    """Bytes rank ``c`` has free for new pool rows.  ``(headroom, transient, note)``.
+
+    THREE CORRECTIONS, one per dead boot, all of them subtractions:
+
+    1. ``card free`` is the residual after the transient, the allocator cache,
+       the fragmentation and the CUDA context -- so it is the headroom
+       instrument, not ``peak - allocated`` (fn8ak2 was planned on that and
+       died) and not ``reserved - allocated`` (which forbids boots that ran).
+    2. But the ``card free`` the log prints was sampled at the moment
+       ``maybe_log_vram_peak`` latched, which under chunked prefill is the
+       FIRST chunk, not the deepest one.  The true peak is bigger by
+       ``prefill_peak_allocated - peak_gib``, and the free column at that
+       moment is smaller by the same amount.  Without a measured true peak a
+       strict plan REFUSES -- the latched sample is a lower bound on the draw,
+       and calling it a maximum is what killed fn8ak3.
+    3. The transient is not one number per rank, it is a function of the
+       prefill chunk.  ``graph_private_gib`` (CUDA-graph private pools) does
+       not scale; the rest -- wave buffers, partials, the attention workspace
+       that grows with the cached context a chunk attends over -- does, near
+       enough to linearly to be worth pricing.  Halving CHUNK is therefore a
+       real lever on the row count, and the dry run prints both.
+    """
+    instrument = float(c.peak_gib) - float(c.allocated_gib)
+    note: Optional[str] = None
+    if c.prefill_peak_allocated_gib is None:
+        if strict:
+            raise ExpertPoolBudgetRefused(
+                c.rank,
+                0.0,
+                [
+                    ("card free at the LATCHED sample", float(c.card_free_gib) * GIB),
+                    ("transient the latched sample saw", instrument * GIB),
+                ],
+                0.0,
+            )
+        note = (
+            f"rank{c.rank}: no measured prefill peak -- the latched "
+            f"[vram-peak] sample ({instrument:.2f} GiB drawn) is a LOWER bound "
+            "on the real draw, so the row count below is an UPPER BOUND and not "
+            "a budget. Boot the high-water instrument first"
+        )
+        true_transient = instrument
+    else:
+        true_transient = float(c.prefill_peak_allocated_gib) - float(c.allocated_gib)
+    # The free column was read while only `instrument` was drawn.
+    free_gib = float(c.card_free_gib) - (true_transient - instrument)
+    target = true_transient
+    if prefill_chunk_tokens is not None and (
+        int(c.prefill_chunk_tokens) <= 0 or c.prefill_peak_allocated_gib is None
+    ):
+        note = (note + "; " if note else f"rank{c.rank}: ") + (
+            f"chunk {prefill_chunk_tokens} NOT priced -- this census carries no "
+            "measured peak at a known chunk size, so the number below is the same "
+            "at every chunk"
+        )
+    if (
+        prefill_chunk_tokens is not None
+        and int(c.prefill_chunk_tokens) > 0
+        and c.prefill_peak_allocated_gib is not None
+    ):
+        scalable = max(0.0, true_transient - float(c.graph_private_gib))
+        target = float(c.graph_private_gib) + scalable * (
+            float(prefill_chunk_tokens) / float(c.prefill_chunk_tokens)
+        )
+        free_gib += true_transient - target
+    headroom = free_gib * GIB + float(kv_credit_bytes) - float(floor_bytes)
+    return headroom, target, note
+
+
 def plan_expert_pool(
     census: Sequence[RankCensus],
     *,
@@ -444,6 +561,8 @@ def plan_expert_pool(
     spec_tokens: int = 0,
     floor_bytes: int = DEFAULT_FLOOR_BYTES,
     max_total_tokens: Optional[int] = None,
+    prefill_chunk_tokens: Optional[int] = None,
+    strict: bool = True,
 ) -> Plan:
     """The planner term.  See the module docstring for the chain it inverts.
 
@@ -503,14 +622,30 @@ def plan_expert_pool(
         credit = float(c.kv_bytes_now - kv_bytes)
         card_free = float(c.card_free_gib) * GIB
         row_bytes = row_bytes_from_census(c.expert_tensor_gib, c.buffer_rows)
-        posts = [
-            ("card free at worst observed state", card_free),
-            ("KV pool credit (now - DCP need)", credit),
-            ("floor", -float(floor_bytes)),
-        ]
-        headroom = card_free + credit - float(floor_bytes)
+        headroom, transient_gib, note = rank_headroom_bytes(
+            c,
+            kv_credit_bytes=credit,
+            prefill_chunk_tokens=prefill_chunk_tokens,
+            floor_bytes=floor_bytes,
+            strict=strict,
+        )
+        if note:
+            notes.append(note)
         if headroom < 0.0:
-            raise ExpertPoolBudgetRefused(c.rank, headroom, posts, -headroom)
+            raise ExpertPoolBudgetRefused(
+                c.rank,
+                headroom,
+                [
+                    ("card free at worst observed state", card_free),
+                    (
+                        "prefill transient (measured, at this chunk)",
+                        -transient_gib * GIB,
+                    ),
+                    ("KV pool credit (now - DCP need)", credit),
+                    ("floor", -float(floor_bytes)),
+                ],
+                -headroom,
+            )
         rows = int(math.floor(headroom / row_bytes))
         ownable = c.owned_experts - c.residents - c.scratch
         if rows <= ownable:
@@ -578,6 +713,8 @@ def verify_scratch_vector(
     spec_tokens: int = 0,
     floor_bytes: int = DEFAULT_FLOOR_BYTES,
     max_total_tokens: Optional[int] = None,
+    prefill_chunk_tokens: Optional[int] = None,
+    strict: bool = True,
 ) -> Tuple[str, ...]:
     """Check a PROPOSED ``SGLANG_MOE_SCRATCH_SLOTS`` vector against the census.
 
@@ -592,6 +729,8 @@ def verify_scratch_vector(
         spec_tokens=spec_tokens,
         floor_bytes=floor_bytes,
         max_total_tokens=max_total_tokens,
+        prefill_chunk_tokens=prefill_chunk_tokens,
+        strict=strict,
     )
     proposed = [int(x) for x in scratch]
     if len(proposed) != len(plan.ranks):
@@ -759,26 +898,50 @@ def parse_boot_log(text: str) -> Tuple[RankCensus, ...]:
     return tuple(out)
 
 
+#: The prefill chunk sizes the dry run prices side by side.  Halving CHUNK
+#: halves the chunk-scaling half of the transient, and on fn8ak3's rank 2 that
+#: is the difference between a refusal and ~12 rows -- at a TTFT cost this
+#: module does not price.
+DRY_RUN_CHUNKS = (8192, 4096)
+
+
 def dry_run(
     text: str,
     *,
     ctx_tokens: int = 262144,
     spec_tokens: int = 0,
     floor_bytes: int = DEFAULT_FLOOR_BYTES,
+    chunks: Sequence[int] = DRY_RUN_CHUNKS,
+    strict: bool = True,
 ) -> str:
-    """Parse a boot log and print the numbers the NEXT boot should carry.
+    """Parse a boot log and print the numbers the NEXT boot should carry, once
+    per prefill chunk size in ``chunks``.
 
     Input is exactly the ``[vram-census]``, ``[vram-peak]``, ``KV pool
     sizing``, ``Uneven-DCP token sizing`` and ``MoE expert pool`` lines of a
     log -- the whole file works, so does a grep of those five shapes.
+
+    A section is printed for every chunk, including the ones that REFUSE: a
+    chunk size the rig cannot afford is an answer, and hiding it would leave
+    the reader with only the affordable half of the trade.
     """
-    plan = plan_expert_pool(
-        parse_boot_log(text),
-        ctx_tokens=ctx_tokens,
-        spec_tokens=spec_tokens,
-        floor_bytes=floor_bytes,
-    )
-    return plan.report()
+    census = parse_boot_log(text)
+    out: List[str] = []
+    for chunk in chunks:
+        head = f"=== prefill chunk {chunk} " + "=" * 40
+        try:
+            plan = plan_expert_pool(
+                census,
+                ctx_tokens=ctx_tokens,
+                spec_tokens=spec_tokens,
+                floor_bytes=floor_bytes,
+                prefill_chunk_tokens=chunk,
+                strict=strict,
+            )
+            out.append(f"{head}\n{plan.report()}")
+        except ExpertPoolBudgetRefused as exc:
+            out.append(f"{head}\nREFUSED: {exc}")
+    return "\n\n".join(out)
 
 
 def _main(argv: Optional[Sequence[str]] = None) -> int:  # pragma: no cover - CLI
@@ -794,6 +957,20 @@ def _main(argv: Optional[Sequence[str]] = None) -> int:  # pragma: no cover - CL
         default=None,
         help="check a proposed SGLANG_MOE_SCRATCH_SLOTS vector instead of deriving one",
     )
+    ap.add_argument(
+        "--chunks",
+        default=",".join(str(c) for c in DRY_RUN_CHUNKS),
+        help="prefill chunk sizes to price side by side",
+    )
+    ap.add_argument(
+        "--no-strict",
+        action="store_true",
+        help=(
+            "price on the LATCHED [vram-peak] sample when the log has no measured "
+            "prefill peak. The result is an upper bound, not a budget -- three "
+            "boots died on exactly that reading"
+        ),
+    )
     args = ap.parse_args(argv)
     text = (
         sys.stdin.read()
@@ -807,12 +984,22 @@ def _main(argv: Optional[Sequence[str]] = None) -> int:  # pragma: no cover - CL
                 [int(x) for x in args.verify.split(",")],
                 ctx_tokens=args.ctx_tokens,
                 spec_tokens=args.spec_tokens,
+                prefill_chunk_tokens=int(args.chunks.split(",")[0]),
+                strict=not args.no_strict,
             )
             for line in bad:
                 print(f"REFUSED {line}")
             print("VECTOR OK" if not bad else f"{len(bad)} rank(s) refused")
             return 1 if bad else 0
-        print(dry_run(text, ctx_tokens=args.ctx_tokens, spec_tokens=args.spec_tokens))
+        print(
+            dry_run(
+                text,
+                ctx_tokens=args.ctx_tokens,
+                spec_tokens=args.spec_tokens,
+                chunks=[int(c) for c in args.chunks.split(",")],
+                strict=not args.no_strict,
+            )
+        )
     except (ExpertPoolBudgetRefused, ValueError) as exc:
         print(f"REFUSED: {exc}", file=sys.stderr)
         return 1
