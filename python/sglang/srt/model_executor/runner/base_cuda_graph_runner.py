@@ -92,7 +92,15 @@ def get_batch_sizes_to_capture(
     # device group may not be usable for a plain integer reduce here. Every rank
     # reaches this line exactly once during runner init, so the reduce itself is
     # rank-uniform -- the property the rest of this comment is about.
-    if get_parallel().tp_size > 1:
+    # DRAFT-SOLO (fnFA16 20.09.): the solo host is the ONLY rank that builds
+    # draft graph runners -- the shadows return before this point
+    # (eagle_worker_v2.init_cuda_graphs) and never enter a draft-runner
+    # collective. A group reduce here therefore has no second participant:
+    # fnFA16 hung the host in this all_reduce for 120 s until the workers'
+    # sampler-warmup barrier timed out. The solo draft's ladder is bounded by
+    # its own pool alone, which is exactly what the local value already is.
+    _solo_draft = bool(getattr(model_runner, "is_draft_solo_host", False))
+    if get_parallel().tp_size > 1 and not _solo_draft:
         import torch
         import torch.distributed as dist
 
