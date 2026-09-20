@@ -3859,6 +3859,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             # bookkeeping as no-ops and refuses any real attention by name.
             from sglang.srt.form_a_construction import FormAWorkerAttnBackend
 
+            # The per-mode name stamps are normally resolved inside
+            # _get_attention_backend, which a worker never calls (fnFA9).
+            self.prefill_attention_backend_str = "form_a_worker"
+            self.decode_attention_backend_str = "form_a_worker"
             self.attn_backend = FormAWorkerAttnBackend(self)
         elif self.server_args.enable_pdmux:
             self.attn_backend = self._get_attention_backend(init_new_workspace=True)
