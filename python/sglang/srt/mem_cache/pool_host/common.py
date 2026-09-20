@@ -95,10 +95,23 @@ def alloc_with_host_register(
     Allocate tensor and register host memory with cudaHostRegister.
     CudaHostRegister only applies when pin_memory=True.
     """
+    if _empty_dims(dims):
+        # Form A expert worker (fnFL2 v13, 20.09.): 0 layers / 0 kv-heads on
+        # this rank -> a 0-byte pool. mmap(0) is EINVAL and cudaHostRegister
+        # of 0 bytes is invalid; the shape is kept so every reader indexes
+        # the same rank-uniform slot count.
+        return torch.empty(dims, dtype=dtype, device=device)
     buffer = allocator.allocate(dims, dtype=dtype, device=device)
     if pin_memory:
         _cuda_host_register(buffer)
     return buffer
+
+
+def _empty_dims(dims) -> bool:
+    n = 1
+    for d in dims:
+        n *= int(d)
+    return n == 0
 
 
 def alloc_with_pin_memory(

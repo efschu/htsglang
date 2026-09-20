@@ -28,3 +28,22 @@ def test_mamba_anchor_pool_uses_the_same_rule():
     assert "fixed_host_pool_slots(int(anchor_host_mib) * (1024**2), self.size_per_token)" in src
     assert "fixed_host_pool_tokens(host_size, self.size_per_token), host_size" in src
     assert "// self.size_per_token" not in src
+
+
+def test_zero_byte_host_pool_skips_mmap_and_host_register(monkeypatch):
+    import torch
+
+    from sglang.srt.mem_cache.pool_host import common as c
+
+    calls = []
+    monkeypatch.setattr(c, "_cuda_host_register", lambda buf: calls.append("register"))
+
+    class Alloc:
+        def allocate(self, dims, dtype, device):
+            calls.append("mmap")
+            return torch.empty(dims, dtype=dtype)
+
+    buf = c.alloc_with_host_register((2, 0, 4096, 0, 128), torch.uint8, "cpu", True, Alloc())
+    assert buf.numel() == 0 and tuple(buf.shape) == (2, 0, 4096, 0, 128) and calls == []
+    buf = c.alloc_with_host_register((2, 1, 8, 1, 4), torch.uint8, "cpu", True, Alloc())
+    assert buf.numel() == 64 and calls == ["mmap", "register"]
