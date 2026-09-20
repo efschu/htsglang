@@ -253,7 +253,7 @@ import os
 import time
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Mapping, Optional, Sequence
 
 import torch
 
@@ -273,6 +273,13 @@ MIN_TAGGED_BYTES = 2 * 1024 * 1024
 # cu_mem 2 MiB granularity and mem_get_info jitter; NOT a tuning knob for
 # transient budgets -- those are the registered safety/tag posts).
 _RESUME_RECLAIM_HEADROOM_BYTES = 32 * (1 << 20)
+
+#: Swap-cost prior in ms, used before this rank has measured one of its own.
+#: Measured on boot fn8s4 (Qwen3.8 Next Flash 32k form, 2026-09-20): 1270
+#: swaps, mean 33.46 ms -- 38.9 ms for a resume (map ~494 MiB + zero it),
+#: 27.8 ms for a bare unmap. Against a ~38 ms decode round, one swap costs
+#: very nearly one whole round.
+_SWAP_MS_PRIOR = 33.5
 
 _MODES = ("auto", "resident", "offload", "offload-scratch")
 
@@ -396,6 +403,60 @@ def resolve_adaptive_graph_memory_mode(server_args: "ServerArgs") -> str:
 # ----------------------------------------------------------------------
 # Reserve demand of the ladder itself (#313)
 # ----------------------------------------------------------------------
+
+
+def plan_residency(
+    target: Optional[str],
+    resident: Sequence[str],
+    sizes: Mapping[str, int],
+    budget_bytes: int,
+) -> list[str]:
+    """Tags to unmap so *target* can be mapped, keeping the rest resident.
+
+    The swap path used to pause the outgoing state unconditionally before
+    resuming the incoming one.  That is only *necessary* when the incoming
+    state needs the outgoing one's pages; charging it on every activation made
+    the common case -- alternating between two states that both fit -- cost two
+    unmap/map cycles per alternation for no memory benefit at all.
+
+    Measured on boot fn8s4 (Qwen3.8 Next Flash, 32k form, 2026-09-20): of 1270
+    swaps, 630 had ``target=<baseline>``, i.e. they unmapped a tagged state to
+    make room for the *untagged* baseline -- which needs no room whatsoever.
+    Those 630 cost 17.5 s (mean 27.8 ms) and freed memory nobody asked for; the
+    631 swaps back then paid another 24.5 s to map exactly what had just been
+    unmapped.  All three states together are 1478 MiB and the tightest rank had
+    3535 MiB free with everything paused.
+
+    So residency is a budget question, not a one-at-a-time invariant:
+
+    * ``target=None`` (the untagged baseline) evicts nothing -- it is always
+      mapped and consumes no tagged budget.
+    * A target already resident evicts nothing.
+    * Otherwise evict, in the caller's order (least-recently-used first), only
+      until the target fits.
+
+    *budget_bytes* is the measured envelope from ``finalize_boot``: device-free
+    with every state paused, minus the serving-transient margin.  It is not a
+    new reserve -- the boot check already proves that much memory is free and
+    that a mapped state may occupy it; this only declines to hand it back.
+
+    Returns the tags to unmap, in eviction order.  Never evicts *target*.
+    """
+    resident_list = [t for t in resident if t != target]
+    if target is None:
+        return []
+    need = int(sizes.get(target, 0))
+    if need <= 0:
+        return []
+    budget = int(budget_bytes)
+    used = sum(int(sizes.get(t, 0)) for t in resident_list)
+    evict: list[str] = []
+    for tag in resident_list:
+        if used + need <= budget:
+            break
+        evict.append(tag)
+        used -= int(sizes.get(tag, 0))
+    return evict
 
 
 @dataclass(frozen=True)
@@ -678,7 +739,22 @@ class AdaptiveGraphMemoryManager:
         self._pre_build_segments: Optional[dict[int, int]] = None
         self._finalized = False
         self._swap_ordinal = 0
+        #: Counts EVERY activation, swap or not. The rank-sync payload uses
+        #: this, never _swap_ordinal: with budget-driven residency the swap
+        #: count legitimately differs per rank (the ranks have different
+        #: amounts of free memory -- 3535/4001/5720 MiB on the fn8s4 rig), so
+        #: comparing swap counts would report divergence where there is none.
+        self._activation_ordinal = 0
+        #: Tags currently mapped, least-recently-activated first.
+        self._resident: list[str] = []
+        #: Bytes of mapped tagged state this rank may hold at once. Measured in
+        #: finalize_boot; 0 until then, which reproduces the strict
+        #: one-state-at-a-time behaviour during the build phase.
+        self._resident_budget_bytes = 0
         self.last_swap_ms: Optional[float] = None
+        #: Duration of the last activation that actually did driver work.
+        #: Distinct from last_swap_ms, which is 0.0 after a free activation.
+        self._last_real_swap_ms: Optional[float] = None
         self._tp_cpu_group = tp_cpu_group
         self._adapter = None
         if self.offload_enabled:
@@ -991,6 +1067,31 @@ class AdaptiveGraphMemoryManager:
                 "--speculative-adaptive-graph-memory resident."
                 + self._reserve_suggestion(shortfall_mib)
             )
+        # Residency budget: the memory this check just PROVED is free and
+        # usable by a mapped state, less the serving-transient margin it
+        # reserved for eager forwards. Holding more than one state inside this
+        # envelope adds no risk the check did not already accept -- the
+        # guarantee is "free_bytes >= <mapped states> + margin", and it is
+        # satisfied for any subset of states whose sum fits here. This is not a
+        # new reserve: nothing is set aside, memory already measured free is
+        # simply not handed back and re-taken every round.
+        self._resident_budget_bytes = max(0, free_bytes - margin_bytes)
+        self._resident = []
+        fits_all = sum(sizes.values()) <= self._resident_budget_bytes
+        logger.info(
+            "Adaptive graph memory: residency budget %.1f MiB (free %.1f - "
+            "margin %.1f); all %d state(s) sum to %.1f MiB -> %s",
+            self._resident_budget_bytes / (1 << 20),
+            free_bytes / (1 << 20),
+            margin_bytes / (1 << 20),
+            len(sizes),
+            sum(sizes.values()) / (1 << 20),
+            (
+                "every state stays mapped, swaps only on eviction pressure"
+                if fits_all
+                else "least-recently-used states are evicted on demand"
+            ),
+        )
         self._finalized = True
         # Map the initial state (a registered baseline has no tag and needs
         # no resume; a BUILT initial state does).
@@ -1074,6 +1175,18 @@ class AdaptiveGraphMemoryManager:
         """
         if not self.offload_enabled:
             return
+        # Unconditionally FIRST, before any branch that depends on this rank's
+        # residency: the guard is itself a collective (all_gather_object), so
+        # reaching it on only some ranks does not detect divergence, it *is* a
+        # divergence. Boot fn8s4 deadlocked exactly there -- TP0 entered
+        # _maybe_verify_rank_sync from the swap path at round 859 while TP1/TP2
+        # had finished the round and were already in the next request
+        # broadcast. Hoisting it above the branching makes every rank post the
+        # same collective on the same activation, so a divergent `steps` now
+        # raises the intended error instead of hanging.
+        self._activation_ordinal += 1
+        self._maybe_verify_rank_sync(steps)
+
         tag = self.tag_for_steps(steps)
         rec = self._states.get(tag)
         target = (
@@ -1081,41 +1194,104 @@ class AdaptiveGraphMemoryManager:
             if (rec is not None and (rec.tensors or tag in self._capture_pools))
             else None
         )
-        if target == self._resumed_tag:
+        if target is None:
+            # The untagged baseline occupies no tagged pages, so nothing has
+            # to be unmapped for it. Pausing the outgoing state here (as this
+            # path used to) freed memory for a state that needs none: 630 of
+            # fn8s4's 1270 swaps, 17.5 s, pure loss.
+            self._resumed_tag = None
+            # This activation did no driver work. Say so: cross_algo_worker
+            # reads last_swap_ms straight after ensure_active to charge the
+            # switch, and a stale value from an earlier real swap would bill a
+            # free activation ~33 ms.
+            self.last_swap_ms = 0.0
+            return
+        if target in self._resident:
+            # Already mapped: activation is a pointer swap, no driver work and
+            # no re-zeroing. Not re-zeroing is not a relaxation -- a state that
+            # was never unmapped keeps its pages, which is precisely what
+            # 'resident' mode does on every activation. The zero_ below exists
+            # only because pause/resume hands back FRESH physical pages.
+            self._resumed_tag = target
+            self._touch_resident(target)
+            self.last_swap_ms = 0.0
             return
 
+        evict = plan_residency(
+            target=target,
+            resident=list(self._resident),
+            sizes={
+                t: r.footprint_bytes
+                for t, r in self._states.items()
+                if r.tensors or t in self._capture_pools
+            },
+            budget_bytes=self._resident_budget_bytes,
+        )
+
         tic = time.perf_counter()
-        # Quiescence: attr-rebinding never required this, but unmapping the
-        # outgoing state's pages under in-flight kernels (e.g. the previous
-        # step's draft_extend still queued) would be use-after-unmap.
+        # Quiescence: attr-rebinding never required this, but unmapping a
+        # state's pages under in-flight kernels (e.g. the previous step's
+        # draft_extend still queued) would be use-after-unmap.
         torch.cuda.synchronize()
-        if self._resumed_tag is not None:
-            # Pause BEFORE resume: releases the outgoing pages so the
-            # incoming state maps into memory the boot check accounted for.
-            self._adapter.pause(self._resumed_tag)
-            self._paused.add(self._resumed_tag)
-            self._resumed_tag = None
-        if target is not None:
-            self._reclaim_driver_free_for_resume(rec)
-            self._adapter.resume(target)
-            self._paused.discard(target)
-            self._resumed_tag = target
-            # Re-init: restore the boot-state content contract (zeroed
-            # workspaces per #50; zeroed index/mask buffers == fresh-boot
-            # pre-first-replay state). Plan data is host-side and re-planned
-            # per forward; nothing else is stateful. See module docstring.
-            for t in rec.tensors:
-                t.zero_()
+        for victim in evict:
+            self._adapter.pause(victim)
+            self._paused.add(victim)
+            self._resident.remove(victim)
+            if self._resumed_tag == victim:
+                self._resumed_tag = None
+        self._reclaim_driver_free_for_resume(rec)
+        self._adapter.resume(target)
+        self._paused.discard(target)
+        self._resident.append(target)
+        self._resumed_tag = target
+        # Re-init: restore the boot-state content contract (zeroed
+        # workspaces per #50; zeroed index/mask buffers == fresh-boot
+        # pre-first-replay state). Plan data is host-side and re-planned
+        # per forward; nothing else is stateful. See module docstring.
+        for t in rec.tensors:
+            t.zero_()
         torch.cuda.synchronize()
         self.last_swap_ms = (time.perf_counter() - tic) * 1e3
+        self._last_real_swap_ms = self.last_swap_ms
         self._swap_ordinal += 1
         logger.info(
-            "Adaptive graph memory swap #%d: mapped=%s (%.2f ms)",
+            "Adaptive graph memory swap #%d: mapped=%s evicted=%s "
+            "resident=%s (%.2f ms)",
             self._swap_ordinal,
-            target or "<baseline>",
+            target,
+            evict or "[]",
+            list(self._resident),
             self.last_swap_ms,
         )
-        self._maybe_verify_rank_sync(steps)
+
+    def _touch_resident(self, tag: str) -> None:
+        """Move *tag* to the most-recently-used end of the residency list."""
+        try:
+            self._resident.remove(tag)
+        except ValueError:
+            pass
+        self._resident.append(tag)
+
+    def swap_ms_for(self, steps) -> float:
+        """Estimated swap cost of activating *steps* right now, in ms.
+
+        0.0 when the activation needs no driver work (the untagged baseline,
+        or an already-resident tag) -- which, with budget-driven residency, is
+        the common case. Feeds the chain policy's break-even gate so it only
+        charges a switch that will actually be paid for.
+        """
+        if not self.offload_enabled:
+            return 0.0
+        tag = self.tag_for_steps(steps)
+        rec = self._states.get(tag)
+        if rec is None or not (rec.tensors or tag in self._capture_pools):
+            return 0.0
+        if tag in self._resident:
+            return 0.0
+        # last_swap_ms is 0.0 after a no-op activation, which says nothing
+        # about what a REAL swap to this tag would cost -- fall back to the
+        # measured prior rather than reporting a genuine swap as free.
+        return float(self._last_real_swap_ms or _SWAP_MS_PRIOR)
 
     def _reclaim_driver_free_for_resume(self, rec: "_StateRecord") -> None:
         """Guarantee DRIVER-visible free memory for resume's cu_mem_create.
@@ -1194,16 +1370,25 @@ class AdaptiveGraphMemoryManager:
         rec = self._states.get(tag)
         if rec is None or not (rec.tensors or tag in self._capture_pools):
             return 0
-        if tag == self._resumed_tag:
+        if tag in self._resident:
             return 0
         needed = rec.footprint_bytes
-        # The outgoing tag is paused (physically released) before the
-        # resume, so its footprint counts as available.
-        outgoing = 0
-        if self._resumed_tag is not None:
-            out_rec = self._states.get(self._resumed_tag)
-            if out_rec is not None:
-                outgoing = int(out_rec.footprint_bytes)
+        # Whatever residency planning would evict is paused (physically
+        # released) before the resume, so those footprints count as available.
+        sizes = {
+            t: r.footprint_bytes
+            for t, r in self._states.items()
+            if r.tensors or t in self._capture_pools
+        }
+        outgoing = sum(
+            int(sizes.get(t, 0))
+            for t in plan_residency(
+                target=tag,
+                resident=list(self._resident),
+                sizes=sizes,
+                budget_bytes=self._resident_budget_bytes,
+            )
+        )
         free, _ = torch.cuda.mem_get_info()
         if free + outgoing >= needed:
             return 0
@@ -1212,15 +1397,19 @@ class AdaptiveGraphMemoryManager:
         return max(0, int(needed) - (int(free) + outgoing))
 
     def note_resident_activation(self, steps) -> None:
-        """Resident mode has no swap, so ``ensure_active`` returns before the
-        rank-sync check. The controller calls this on every activation
-        instead, so a rank-divergent choice (the per-round chain policy
-        decides locally on each rank) fails loudly under
+        """Resident mode returns from ``ensure_active`` before the rank-sync
+        check. The controller calls this on every activation instead, so a
+        rank-divergent choice (the per-round chain policy decides locally on
+        each rank) fails loudly under
         SGLANG_ADAPTIVE_ALIAS_VERIFY_RANK_SYNC=1 instead of deadlocking in
-        the next collective with different graphs on different ranks."""
+        the next collective with different graphs on different ranks.
+
+        Offload mode runs the same check at the top of ``ensure_active``,
+        where every rank reaches it on every activation regardless of what its
+        own residency happens to be."""
         if self.offload_enabled:
             return
-        self._swap_ordinal += 1
+        self._activation_ordinal += 1
         self._maybe_verify_rank_sync(steps)
 
     def _maybe_verify_rank_sync(self, steps) -> None:
@@ -1237,7 +1426,7 @@ class AdaptiveGraphMemoryManager:
                 from sglang.srt.distributed import get_tp_group
 
                 self._tp_cpu_group = get_tp_group().cpu_group
-            payload = (self._swap_ordinal, steps)
+            payload = (self._activation_ordinal, steps)
             gathered: list = [None] * dist.get_world_size(self._tp_cpu_group)
             dist.all_gather_object(gathered, payload, group=self._tp_cpu_group)
             if any(g != payload for g in gathered):
@@ -1268,7 +1457,20 @@ class AdaptiveGraphMemoryManager:
 
     @property
     def swap_count(self) -> int:
+        """Activations that actually did driver work (unmap and/or map)."""
         return self._swap_ordinal
+
+    @property
+    def activation_count(self) -> int:
+        """Activations, swapped or not. Resident mode never swaps, so this is
+        the only counter that moves there; in offload mode the gap between the
+        two is exactly what budget-driven residency saved."""
+        return self._activation_ordinal
+
+    @property
+    def resident_tags(self) -> list[str]:
+        """Currently mapped tags, least-recently-activated first."""
+        return list(self._resident)
 
 
 # ----------------------------------------------------------------------

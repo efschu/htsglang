@@ -1959,6 +1959,13 @@ class Envs:
     SGLANG_SPEC_ADAPTIVE_CHAIN_COST_MS = EnvStr("")
     # Log a "[spec-adaptive]" histogram of chosen k every N rounds. 0 = never.
     SGLANG_SPEC_ADAPTIVE_CHAIN_LOG_EVERY = EnvInt(0)
+    # Rounds a chain length is held before the policy may reconsider it. Two
+    # jobs: it amortises the graph-memory swap a switch can cost (measured
+    # fn8s4 2026-09-20: mean 33.5 ms against a ~38 ms round, break-even ~5
+    # rounds), and it confines the decision -- and the one broadcast that makes
+    # it rank-identical -- to every Nth round. 0 disables both (decide every
+    # round); the default is set from the measured break-even with headroom.
+    SGLANG_SPEC_ADAPTIVE_CHAIN_MIN_DWELL = EnvInt(8)
     # Kill-switch for the draft-extend cuda graph. Draft extend then always runs
     # eager. Escape hatch for setups where the capture's memory pool costs more
     # than the graph saves (e.g. DeepEP MoE workspace captured at full dispatch

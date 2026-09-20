@@ -2372,6 +2372,12 @@ class EAGLEWorkerV2(BaseSpecWorker):
             envs.SGLANG_SPEC_ADAPTIVE_CHAIN_COST_MS.get()
         )
         k_max = max(built)
+        # Swap cost of a switch, asked of the graph-memory manager per target
+        # so an already-resident state is correctly charged 0 ms.
+        from sglang.srt.speculative.adaptive_graph_memory import get_active_manager
+
+        manager = get_active_manager()
+        swap_ms_for = manager.swap_ms_for if manager is not None else None
         self.chain_policy = AdaptiveChainPolicy(
             k_max=k_max,
             k_min=envs.SGLANG_SPEC_ADAPTIVE_CHAIN_MIN_STEPS.get(),
@@ -2380,11 +2386,16 @@ class EAGLEWorkerV2(BaseSpecWorker):
             ),
             log_every=envs.SGLANG_SPEC_ADAPTIVE_CHAIN_LOG_EVERY.get(),
             candidates=built,
+            min_dwell=envs.SGLANG_SPEC_ADAPTIVE_CHAIN_MIN_DWELL.get(),
+            swap_ms_for=swap_ms_for,
+            consensus=self._agree_chain_length,
         )
         self.round_cost_probe = RoundCostProbe(device=self.device)
         logger.info(
             f"[spec-adaptive] chain policy armed: candidates={self.chain_policy.candidates}, "
-            f"k_min={self.chain_policy.k_min}, cost prior draft={draft_ms}ms verify={verify_ms}ms"
+            f"k_min={self.chain_policy.k_min}, cost prior draft={draft_ms}ms verify={verify_ms}ms, "
+            f"min_dwell={self.chain_policy.min_dwell} rounds, "
+            f"swap_cost={'per-target from graph memory' if swap_ms_for else 'none'}"
         )
 
     @property
@@ -2904,9 +2915,16 @@ class EAGLEWorkerV2(BaseSpecWorker):
     def _apply_chain_policy(self) -> bool:
         """Pick this round's chain length from the last round's survival curve.
 
-        Returns True when the policy was consulted (whether or not the state
-        actually changed). False means no fresh curve had landed yet, so the
-        caller should fall back to the existing batch-size policy.
+        Returns True whenever the policy is armed -- i.e. an armed policy owns
+        the chain length for every round, and the batch-size EMA never runs
+        alongside it. False means only that there is no survival probe at all
+        (the policy was never armed), which is a boot-time property and
+        therefore the same on every rank.
+
+        It deliberately does NOT return False when the survival readout has
+        not landed: that is a rank-local race, and making it decide which
+        policy owns k is what let two ranks pick different chain lengths in
+        the same round (see the comment below).
         """
         probe = self._draft_worker.survival_probe
         if probe is None:
@@ -2915,14 +2933,54 @@ class EAGLEWorkerV2(BaseSpecWorker):
             # Fold in whatever round timings have completed since last round.
             self.round_cost_probe.drain(self.chain_policy.record_duration)
         curve = probe.poll()
-        if curve is None:
-            # D2H not finished (or no draft ran). Never block on it: keeping
-            # the current chain length for one more round is strictly cheaper
-            # than a sync, and the next round will have the curve.
-            return False
-        self.chain_policy.record_survival(curve)
+        if curve is not None:
+            self.chain_policy.record_survival(curve)
+        # choose() runs EVERY round, curve or not. Returning early here (as
+        # this did while the curve was missing) handed the round back to the
+        # batch-size EMA -- on THIS rank only, because whether the D2H copy
+        # has landed is a rank-local race (SurvivalProbe.poll is a
+        # non-blocking cudaEventQuery). Two policies owning the chain length
+        # on different ranks in the same round pick different k, replay
+        # different CUDA graphs, and deadlock the next collective: the fn8s4
+        # hang (2026-09-20, round 859 -- TP0 alone entered the activation path
+        # while TP1/TP2 had already finished the round). Calling choose()
+        # unconditionally also keeps the policy's round counter rank-invariant,
+        # which is what makes its decision rounds land on every rank together.
+        # With no fresh curve the policy simply re-scores the last one.
         self.adaptive_controller.activate_steps(self.chain_policy.choose())
         return True
+
+    def _agree_chain_length(self, proposal: int) -> int:
+        """Broadcast rank 0's chain length to the TP group.
+
+        The proposal is derived from rank-local quantities (a cost EMA over
+        this rank's CUDA-event timings, and whether this rank's survival copy
+        had landed), so it cannot be relied on to match across ranks. One
+        broadcast per decision round -- with the default dwell, well under one
+        per ten rounds -- buys structural agreement instead.
+        """
+        try:
+            import torch.distributed as dist
+
+            from sglang.srt.distributed import get_tp_group
+
+            if not dist.is_initialized():
+                return proposal
+            group = get_tp_group().cpu_group
+            if dist.get_world_size(group) == 1:
+                return proposal
+            box = [int(proposal)]
+            dist.broadcast_object_list(
+                box, src=dist.get_global_rank(group, 0), group=group
+            )
+            return int(box[0])
+        except Exception:
+            logger.warning(
+                "[spec-adaptive] chain-length broadcast failed; keeping the "
+                "local proposal.",
+                exc_info=True,
+            )
+            return proposal
 
     # -- Adaptive speculative decoding protocol --
 

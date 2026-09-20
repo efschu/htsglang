@@ -247,7 +247,22 @@ class TestActivateStepByBatch(unittest.TestCase):
         self.assertEqual(ctrl.by_steps, [1])
         self.assertEqual(ctrl.by_batch, [])
 
-    def test_falls_back_to_ema_when_readout_has_not_landed(self):
+    def test_armed_policy_owns_k_even_without_a_fresh_readout(self):
+        """No curve yet must NOT hand the round back to the batch-size EMA.
+
+        It used to (the assertion here was ``by_batch == [2]``), and that is
+        the fn8s4 deadlock: whether the survival copy has landed is a
+        rank-local cudaEventQuery, so on the same round one rank would run the
+        chain policy and another the batch-size EMA, pick different chain
+        lengths, replay different CUDA graphs and hang the next collective
+        (2026-09-20, round 859 -- TP0 alone was still in the activation path
+        while TP1/TP2 had finished the round).
+
+        Once armed, the policy owns the chain length unconditionally. It also
+        has to be *consulted* every round, so that its round counter -- which
+        decides which rounds are decision rounds -- advances identically on
+        every rank.
+        """
         ctrl = _FakeController()
         probe = SurvivalProbe(max_bs=1, k_max=3, device="cpu")  # no start_readout
         policy = AdaptiveChainPolicy(k_max=3, candidates=[1, 3])
@@ -255,8 +270,10 @@ class TestActivateStepByBatch(unittest.TestCase):
 
         w.activate_step_by_batch(2)
 
-        self.assertEqual(ctrl.by_steps, [])
-        self.assertEqual(ctrl.by_batch, [2])
+        self.assertEqual(ctrl.by_batch, [])
+        self.assertEqual(len(ctrl.by_steps), 1)
+        self.assertIn(ctrl.by_steps[0], policy.candidates)
+        self.assertEqual(policy.switch_stats["rounds"], 1)
 
     def test_policy_without_probe_falls_back(self):
         ctrl = _FakeController()

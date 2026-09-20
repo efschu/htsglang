@@ -26,8 +26,8 @@ from sglang.srt.speculative.adaptive_runtime_state import (
     SpecRuntimeState,
 )
 from sglang.srt.speculative.adaptive_spec_params import (
-    AdaptiveStepSlot,
     HIGH_ACCEPT_ADAPTIVE_CONFIG,
+    AdaptiveStepSlot,
     resolve_candidate_steps_from_config,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -131,7 +131,14 @@ def _offload_init(self, mode="offload"):
     self._pre_build_segments = None
     self._finalized = False
     self._swap_ordinal = 0
+    self._activation_ordinal = 0
+    self._resident = []
+    # Budget 0 == the pre-residency behaviour: every activation of a tagged
+    # state evicts whatever is mapped. Tests that exercise budget-driven
+    # residency raise it explicitly.
+    self._resident_budget_bytes = 0
     self.last_swap_ms = None
+    self._last_real_swap_ms = None
     self._tp_cpu_group = None
     self._server_args = None
     self._adapter = FakeAdapter()
@@ -260,9 +267,7 @@ class TestManagerOffload(unittest.TestCase):
                 agm.note_state_tensor(small)
                 big_nbytes = agm.MIN_TAGGED_BYTES
                 with agm.tagged_state_alloc(nbytes=big_nbytes):
-                    big = torch.full(
-                        (big_nbytes // 4,), 5, dtype=torch.int32
-                    )
+                    big = torch.full((big_nbytes // 4,), 5, dtype=torch.int32)
                 agm.note_state_tensor(big)
         rec = mgr._states["adaptive_state_k3"]
         self.assertEqual(len(rec.tensors), 1)
@@ -305,18 +310,54 @@ class TestManagerOffload(unittest.TestCase):
 
             mgr._adapter.calls.clear()
             mgr.ensure_active(1)
+            # Both states fit the residency budget measured at finalize_boot,
+            # so k2 is NOT unmapped to make room for k1.
+            self.assertEqual(mgr._adapter.calls, [("resume", "adaptive_state_k1")])
+            self.assertTrue(torch.all(tensors[1] == 0))
+            self.assertIsNotNone(mgr.last_swap_ms)
+
+            # Back to an untagged baseline: it occupies no tagged pages, so
+            # nothing has to be unmapped for it. Pausing here (which this path
+            # used to do unconditionally) freed memory for a state that needs
+            # none -- 630 of boot fn8s4's 1270 swaps, 17.5 s of pure loss.
+            mgr._adapter.calls.clear()
+            mgr.ensure_active(3)
+            self.assertEqual(mgr._adapter.calls, [])
+            self.assertEqual(mgr.swap_count, 2)
+
+            # ...and coming back off the baseline is free too: the state was
+            # never unmapped. This is the fn8s4 alternation (baseline <-> k1,
+            # 1261 of its swaps) reduced to zero driver work.
+            mgr._adapter.calls.clear()
+            mgr.ensure_active(1)
+            self.assertEqual(mgr._adapter.calls, [])
+            self.assertEqual(mgr.swap_count, 2)
+            # 4 explicit activations plus the one finalize_boot itself does.
+            self.assertEqual(mgr.activation_count, 5)
+
+    def test_tight_budget_evicts_least_recently_used(self):
+        """With a budget too small for both states, residency falls back to
+        one-at-a-time -- the pre-residency behaviour, now reached only when
+        the memory genuinely is not there."""
+        mgr = _offload_manager()
+        self._build_two_states(mgr)
+        with _mock_cuda():
+            mgr.finalize_boot(initial_steps=3)
+            # Room for exactly one of the two states.
+            sizes = {t: r.footprint_bytes for t, r in mgr._states.items()}
+            mgr._resident_budget_bytes = max(sizes.values())
+            mgr._adapter.calls.clear()
+
+            mgr.ensure_active(2)
+            self.assertEqual(mgr.resident_tags, ["adaptive_state_k2"])
+            mgr._adapter.calls.clear()
+
+            mgr.ensure_active(1)
             self.assertEqual(
                 mgr._adapter.calls,
                 [("pause", "adaptive_state_k2"), ("resume", "adaptive_state_k1")],
             )
-            self.assertTrue(torch.all(tensors[1] == 0))
-            self.assertIsNotNone(mgr.last_swap_ms)
-
-            # Back to an untagged baseline: outgoing state paused, no resume.
-            mgr._adapter.calls.clear()
-            mgr.ensure_active(3)
-            self.assertEqual(mgr._adapter.calls, [("pause", "adaptive_state_k1")])
-            self.assertEqual(mgr.swap_count, 3)
+            self.assertEqual(mgr.resident_tags, ["adaptive_state_k1"])
 
     def test_resume_reclaims_allocator_cache_when_driver_free_is_short(self):
         # Regression for the 2026-07-22 tp3 crash: serving transients
@@ -441,9 +482,7 @@ class _FakeWrapper:
 
     def __init__(self, nbytes=8 << 20):
         self._float_workspace_buffer = torch.zeros(16, dtype=torch.uint8)
-        self._int_workspace_buffer = torch.full(
-            (nbytes,), 7, dtype=torch.uint8
-        )
+        self._int_workspace_buffer = torch.full((nbytes,), 7, dtype=torch.uint8)
         self.resets = []
 
     def reset_workspace_buffer(self, float_ws, int_ws):
@@ -475,9 +514,7 @@ def _mock_capture_graph():
 class TestStage2ModeResolution(unittest.TestCase):
     def test_explicit_offload_scratch(self):
         with mock.patch.dict(os.environ, {"PYTORCH_CUDA_ALLOC_CONF": ""}):
-            args = _server_args(
-                speculative_adaptive_graph_memory="offload-scratch"
-            )
+            args = _server_args(speculative_adaptive_graph_memory="offload-scratch")
             self.assertEqual(
                 resolve_adaptive_graph_memory_mode(args), "offload-scratch"
             )
@@ -573,9 +610,7 @@ class TestStage2CapturePools(unittest.TestCase):
                 [("graph", graph, pool, "s")],
             )
             # The capture body ran inside the tag's region_config.
-            self.assertIn(
-                ("region_config", "adaptive_state_k2"), mgr._adapter.calls
-            )
+            self.assertIn(("region_config", "adaptive_state_k2"), mgr._adapter.calls)
 
     def test_capture_graph_defers_to_default_ctx_outside_builds(self):
         mgr = _offload_manager()
@@ -619,20 +654,15 @@ class TestStage2CapturePools(unittest.TestCase):
                 ):
                     pass
             mgr.pause_after_build(2)
-            self.assertIn(
-                ("pause", "adaptive_state_k2"), mgr._adapter.calls
-            )
+            self.assertIn(("pause", "adaptive_state_k2"), mgr._adapter.calls)
             mgr.finalize_boot(initial_steps=3)
             mgr._adapter.calls.clear()
             mgr.ensure_active(2)
-            self.assertEqual(
-                mgr._adapter.calls, [("resume", "adaptive_state_k2")]
-            )
+            self.assertEqual(mgr._adapter.calls, [("resume", "adaptive_state_k2")])
             mgr._adapter.calls.clear()
             mgr.ensure_active(3)
-            self.assertEqual(
-                mgr._adapter.calls, [("pause", "adaptive_state_k2")]
-            )
+            # Untagged baseline: nothing to unmap for it (see plan_residency).
+            self.assertEqual(mgr._adapter.calls, [])
 
     def test_paused_bytes_measured_and_drives_reserve_check(self):
         mgr = _offload_manager()
@@ -752,9 +782,7 @@ class TestStage2IntWorkspaceTagging(unittest.TestCase):
         # Free covers the mapped state but NOT state + serving margin
         # (default 512 MiB): must fail fast at boot, not OOM at runtime.
         with _mock_cuda(free_bytes=200 << 20):
-            with self.assertRaisesRegex(
-                RuntimeError, "serving transient margin"
-            ):
+            with self.assertRaisesRegex(RuntimeError, "serving transient margin"):
                 mgr.finalize_boot(initial_steps=3)
         # With margin honored it finalizes.
         with _mock_cuda(free_bytes=(100 + 512 + 1) << 20):
@@ -905,9 +933,7 @@ class TestControllerIntegration(unittest.TestCase):
         worker, controller = self._controller("resident")
         with _mock_cuda():
             controller.init_states(cuda_graph_bs=None)
-        with mock.patch.dict(
-            os.environ, {"SGLANG_ADAPTIVE_FORCE_SWAP_INTERVAL": "2"}
-        ):
+        with mock.patch.dict(os.environ, {"SGLANG_ADAPTIVE_FORCE_SWAP_INTERVAL": "2"}):
             for _ in range(8):
                 controller.on_verify_complete([3, 3], batch_size=1)
         # candidates [1,2,3]; start 3 -> 1 -> 2 -> 3 -> 1 (every 2nd call)
