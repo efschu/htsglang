@@ -1482,10 +1482,25 @@ def cp_token_context_budget(vector: Sequence[int], capacities: Sequence[int]) ->
     every rank can fund is min_r(capacities[r] // vector[r]) and the global
     budget is that unit times sum(vector). Maximised when the vector is
     proportional to the capacities -- which is exactly what --rank-kv-ratio
-    capacity installs."""
+    capacity installs.
+
+    Form A (F4): a rank with vector[r] == 0 owns no context tokens at all --
+    the attention host holds the whole KV -- so it FUNDS no unit and must be
+    left out of the min() rather than dividing by zero. It is excluded, not
+    asserted against: a zero here used to be impossible and is now a layout.
+    An ALL-zero vector is still a refusal, because then nobody holds the KV.
+    """
     n = len(vector)
-    assert len(capacities) == n and all(v > 0 for v in vector)
-    return min(capacities[r] // vector[r] for r in range(n)) * sum(vector)
+    assert len(capacities) == n
+    funding = [r for r in range(n) if vector[r] > 0]
+    if not funding:
+        raise ValueError(
+            f"cp_token_context_budget: token vector {list(vector)} gives "
+            "every rank zero context tokens -- no rank would hold the KV "
+            "cache. Under Form A exactly one rank (the attention host) "
+            "holds all of it, so its entry must be positive."
+        )
+    return min(capacities[r] // vector[r] for r in funding) * sum(vector)
 
 
 def cp_token_speed_vector(

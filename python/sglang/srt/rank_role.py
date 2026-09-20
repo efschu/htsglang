@@ -30,6 +30,7 @@ that is wired loses its guard; a seam that is not keeps it until it is.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -50,6 +51,7 @@ __all__ = [
     "guard_collective_subgroup",
     "guard_graph_mode",
     "guard_zero_width_linear",
+    "worker_keeps_parameter",
     "guard_dcp_merge",
     "UNWIRED_ORDER",
     "resolve_dcp_under_host_kv",
@@ -118,26 +120,39 @@ SEAMS: Dict[str, Seam] = {
             "F3",
             "a worker rank that never LOADS the dense weights (not merely "
             "idles through them)",
-            "models/qwen4_exp.py load_weights / _build_embed_tokens",
+            "models/qwen4_exp.py:2147-2158 weight_name_needed (the LOAD "
+            "veto -- BUILT), against the module construction in "
+            "qwen4_exp.py:1486-1518 / 1838 / 1895 and qwen3_5.py:797-830, "
+            "1090-1168 (NOT built)",
             wired=False,
-            note="Needs a load-time filter keyed on the role, and the "
-            "census must then show 'experts' alone on a worker. This is the "
-            "slice with the largest VRAM gain (2 x 1.84 GiB).",
+            note="HALF BUILT. The loader veto is in: a worker never READS a "
+            "dense tensor (measured against the real weight map -- 221.184 "
+            "of 225.300 names kept, 4.116 dropped, no shared expert, no "
+            "draft, no vision). What is NOT built is skipping the module "
+            "CONSTRUCTION, so create_weights still allocates the dense "
+            "tensors and the 2 x 1.84 GiB is saved in checkpoint I/O but "
+            "NOT yet in VRAM. The census on a worker must show 'experts' "
+            "alone before this flips to wired.",
         ),
         Seam(
             "F4",
             "KV only on the host: a worker builds no KV pool and owns no "
             "context tokens",
-            "distributed/utils.py:1430-1431 cp_token_context_budget "
-            "(assert all(v > 0), then capacities[r] // vector[r]), "
-            ":1180 the token-vector validation, "
-            "model_executor/pool_configurator.py:167 (if ratio_r > 0: skips "
-            "the draft-KV cell correction SILENTLY)",
-            wired=False,
-            note="resolve_dcp_under_host_kv() below resolves the POLICY "
-            "(dcp off, replication off); the pool-construction half is open. "
-            "The pool_configurator line is the dangerous one -- it does not "
-            "refuse, it mis-scales.",
+            "distributed/utils.py:1487 cp_token_context_budget "
+            "(assert all(v > 0 ...)), :1488 (capacities[r] // vector[r]), "
+            ":1554 (the search already skips v <= 0), "
+            "model_executor/pool_configurator.py:170-180 (the ratio_r == 0 "
+            "branch)",
+            wired=True,
+            note="Three halves, all built: the POLICY "
+            "(resolve_dcp_under_host_kv -- dcp off, replication off), the "
+            "ARITHMETIC (cp_token_context_budget excludes a rank that funds "
+            "no unit instead of dividing by zero, and still refuses an "
+            "all-zero vector), and the MIS-SCALE (pool_configurator returned "
+            "1.0 silently for a rank with no pool; it now returns 0.0, the "
+            "same answer it already gives a shadow rank at :152-153). The "
+            "pool ALLOCATION needs nothing: cell_size == 0 already has the "
+            "_KVLESS_STAGE_TOKENS path at :256 / :553-557.",
         ),
         Seam(
             "F5",
@@ -198,12 +213,15 @@ SEAMS: Dict[str, Seam] = {
             "that a zero-head rank CANNOT happen",
             "weg2/launcher.py:7203-7207 (\"A rank owning zero heads cannot "
             "happen; asserting against zero heads would be a guard that can "
-            "never fire\"), refusal at :7217-7285",
-            wired=False,
-            note="Form A makes that assumption false. Until the refusal "
-            "learns about worker ranks it will reject every Form A vector as "
-            "'axis switched off' -- a guard that was correct becoming a "
-            "blocker is exactly the class that eats a GPU window.",
+            "never fire\"), predicate _saturated at :7226-7232",
+            wired=True,
+            note="Form A made that written assumption false, so both the "
+            "prose and the predicate were corrected: a weight of 0 is not a "
+            "saturated axis, it is a rank that was never on the axis, and "
+            "_saturated now skips it. Left as it was it fired for EVERY "
+            "Form A worker (0 / total * units = 0.0 < 1.0 always) and the "
+            "refusal would have rejected every Form A vector as 'axis "
+            "switched off'.",
         ),
         Seam(
             "F11",
@@ -227,7 +245,7 @@ SEAMS: Dict[str, Seam] = {
 #: The seams that must be wired before a Form A boot can be believed, in the
 #: order the survey found them knocking. Kept as data so a report can print
 #: the remaining work without re-deriving it.
-UNWIRED_ORDER: Tuple[str, ...] = ("F3", "F11", "F4", "F10", "F5", "F9", "F6")
+UNWIRED_ORDER: Tuple[str, ...] = ("F3", "F11", "F5", "F9", "F6")
 
 
 def require_wired(seam_id: str, context: str = "") -> None:
@@ -354,6 +372,100 @@ class RankRolePlan:
 # ---------------------------------------------------------------------------
 # Guards -- called from the places that would otherwise fail late and mutely
 # ---------------------------------------------------------------------------
+#: The ONE substring that distinguishes a routed expert from everything else
+#: in this checkpoint's parameter names. Measured against the real weight map
+#: of Qwen3.8-Flash-Next-INT4-Mixed-AutoRound-Minachist (225.300 entries):
+#: 221.184 of them are ``model.language_model.layers.<n>.mlp.experts.<e>.*``.
+#: The near-misses this must NOT match are real and adjacent --
+#: ``mlp.shared_expert.*`` (dense, runs for every token) and
+#: ``mlp.shared_expert_gate`` -- which is why the marker carries its dots.
+_ROUTED_EXPERT_MARKER = ".mlp.experts."
+
+#: The draft's experts live under this prefix. Under Form A the MTP draft is
+#: UNSHARDED on the host, so a worker keeps none of them even though their
+#: names carry the expert marker. This is the one case where "is it an
+#: expert" and "does a worker want it" disagree.
+_DRAFT_PREFIX = "mtp."
+
+
+#: The SHARED expert is dense -- it runs for every token -- so it belongs to
+#: the host. Its parameters are easy to mistake for routed ones twice over:
+#: by name (``mlp.shared_expert``, ``mlp.shared_expert_gate``), and because
+#: the fused-shared-expert path REWRITES ``mlp.shared_expert.`` into
+#: ``mlp.experts.<num_routed>.`` (models/qwen3_5.py:2448-2452), after which
+#: the name is indistinguishable from a routed expert's. That is what
+#: `num_routed_experts` is for below.
+_SHARED_EXPERT_MARKERS = (".mlp.shared_expert.", ".mlp.shared_expert_gate")
+
+_EXPERT_ID_RE = re.compile(r"\.experts\.(\d+)\.")
+
+
+def worker_keeps_parameter(
+    name: str, num_routed_experts: Optional[int] = None
+) -> bool:
+    """Does a Form A WORKER need this checkpoint parameter? (F3)
+
+    A worker holds the ROUTED experts of the language model and nothing
+    else: no attention, no GDN, no hyper-connection mixer, no embeddings,
+    no lm_head, no PLE, no norms, no router, no SHARED expert, no vision
+    tower -- and no draft, because the draft is unsharded on the host.
+
+    Stated as a predicate over NAMES rather than over modules because that
+    is where the load path can veto a tensor without constructing anything
+    first (models/qwen4_exp.py:2138 `weight_name_needed`), and because a
+    name predicate is checkable against the real weight map.
+
+    `num_routed_experts`, when known, rejects the FUSED shared expert: it
+    arrives as ``mlp.experts.<num_routed>.*`` and is otherwise
+    indistinguishable from a routed expert. Without it that one module
+    would land on a worker, which is wrong but silent -- it would compute
+    for every token on a rank that only ever sees broadcast rows.
+    """
+    if name.startswith(_DRAFT_PREFIX) or ".mtp." in name:
+        return False
+    if any(marker in name for marker in _SHARED_EXPERT_MARKERS):
+        return False
+    if _ROUTED_EXPERT_MARKER not in name:
+        return False
+    if num_routed_experts is not None:
+        hit = _EXPERT_ID_RE.search(name)
+        if hit is not None and int(hit.group(1)) >= num_routed_experts:
+            return False
+    return True
+
+
+# ---------------------------------------------------------------------------
+# The INSTALLED role plan for this worker process.
+#
+# Symmetric with distributed.utils.set_tp_partition_ratios: the scheduler
+# process installs it once before any model code runs, and everything
+# downstream asks here instead of threading a server_args through the model.
+# ---------------------------------------------------------------------------
+_INSTALLED_PLAN: Optional["RankRolePlan"] = None
+_INSTALLED_RANK: int = 0
+
+
+def set_form_a_role_plan(plan: Optional["RankRolePlan"], rank: int = 0) -> None:
+    """Install this process's Form A role plan (or None for a classic boot)."""
+    global _INSTALLED_PLAN, _INSTALLED_RANK
+    if plan is not None:
+        plan.role_of(rank)  # refuses a rank outside the vector, here and now
+    _INSTALLED_PLAN = plan
+    _INSTALLED_RANK = int(rank)
+
+
+def installed_role_plan() -> Optional["RankRolePlan"]:
+    return _INSTALLED_PLAN
+
+
+def this_rank_is_form_a_worker() -> bool:
+    """True only on a Form A worker rank. False on a classic boot, so every
+    caller's default path is untouched by construction."""
+    return _INSTALLED_PLAN is not None and _INSTALLED_PLAN.is_worker(
+        _INSTALLED_RANK
+    )
+
+
 def guard_dense_weights(plan: RankRolePlan, rank: int) -> None:
     """Called where a rank is about to LOAD dense weights (F3)."""
     if plan.is_worker(rank):

@@ -7200,11 +7200,20 @@ def d_operating_point_rows(
 
     # -- W62: a position that would turn an uneven axis OFF -------------------
     #
-    # THE OBVIOUS CHECK IS UNREACHABLE AND IS NOT THE ONE MADE HERE. A rank
-    # owning zero heads cannot happen: `partition_units` guarantees every rank
-    # >= 1 unit by construction (distributed/utils.py, "largest-remainder
-    # rounding, every rank gets >= 1 unit"). Asserting against zero heads would
-    # be a guard that can never fire -- written, never executed.
+    # THE OBVIOUS CHECK WAS UNREACHABLE AND IS STILL NOT THE ONE MADE HERE --
+    # but the reason has CHANGED, and the old wording is now false. It used to
+    # read: "a rank owning zero heads cannot happen: `partition_units`
+    # guarantees every rank >= 1 unit by construction". Form A (the
+    # attention-host layout, --rank-role host,worker,worker) makes zero heads
+    # a deliberate LAYOUT: partition_units(allow_zero=True) hands a worker
+    # rank nothing at all, on purpose, because it holds only experts.
+    #
+    # So the zero case is now reachable and is EXCLUDED rather than asserted
+    # against: a weight of 0 is not a saturated axis, it is a rank that was
+    # never on the axis. Without this exclusion _saturated fires for every
+    # Form A worker (0 / total * units = 0.0 < 1.0 always) and the refusal
+    # below would reject every Form A vector as "axis switched off" -- a
+    # guard that was correct becoming a boot blocker.
     #
     # The reachable failure is SATURATION. When a rank's proportional share of
     # a family's units falls below one unit, the partitioner floors it to 1 and
@@ -7217,6 +7226,8 @@ def d_operating_point_rows(
     def _saturated(weights: Sequence[int], units: int) -> Optional[int]:
         total = sum(int(w) for w in weights)
         for r, w in enumerate(weights):
+            if int(w) == 0:
+                continue  # Form A worker: not on this axis, not saturated
             if total > 0 and float(w) / total * float(units) < 1.0:
                 return r
         return None

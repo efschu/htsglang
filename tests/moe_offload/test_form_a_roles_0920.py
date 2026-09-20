@@ -204,8 +204,8 @@ def test_an_explicit_dcp_flag_is_refused_not_overridden():
 # ==========================================================================
 # 4. The seam registry -- named refusals for what is not built
 # ==========================================================================
-WIRED = ("F1", "F2", "F7", "F8")
-UNWIRED = ("F3", "F4", "F5", "F6", "F9", "F10", "F11")
+WIRED = ("F1", "F2", "F4", "F7", "F8", "F10")
+UNWIRED = ("F3", "F5", "F6", "F9", "F11")
 
 
 def test_every_seam_has_an_identity_a_place_and_a_verdict():
@@ -238,6 +238,9 @@ def test_the_remaining_work_is_ordered_and_complete():
     assert len(UNWIRED_ORDER) == len(set(UNWIRED_ORDER))
     # F3 first: it is both the largest VRAM gain and the precondition of F11.
     assert UNWIRED_ORDER[0] == "F3"
+    # F4 and F10 left the list in slice 5; if one comes back the order must
+    # come back with it, not silently shrink.
+    assert "F4" not in UNWIRED_ORDER and "F10" not in UNWIRED_ORDER
 
 
 def test_the_two_seams_the_survey_added_carry_their_evidence():
@@ -264,11 +267,11 @@ def test_guards_fire_only_on_the_rank_whose_role_needs_them():
         guard_dense_weights(FORM_A, 1)
     with pytest.raises(FormASeamNotWired, match="F3"):
         guard_draft_worker(FORM_A, 2)
-    with pytest.raises(FormASeamNotWired, match="F4"):
-        guard_kv_pool(FORM_A, 1, tokens=1)
-    # ... but a worker with zero KV tokens is exactly what Form A wants, so
-    # that case must NOT refuse.
+    # F4 is wired as of slice 5, so the KV guard no longer refuses -- a
+    # worker with zero tokens was always the wanted case, and a worker
+    # handed tokens is now handled by the arithmetic rather than blocked.
     guard_kv_pool(FORM_A, 1, tokens=0)
+    guard_kv_pool(FORM_A, 1, tokens=1)
 
 
 def test_eager_is_an_allowed_worker_graph_mode_and_a_captured_one_is_not():
@@ -324,3 +327,117 @@ def test_form_a_plan_shares_one_definition_of_the_host_with_the_role_vector():
     # and the role vector of a valid plan round-trips into a RankRolePlan
     plan = solve_form_a(cards, MeasuredPosts.from_fn8ah(), ExpertGeometry.qwen4_exp())
     assert RankRolePlan(tuple(c.role for c in plan.cards)).host_rank == 0
+
+
+# ==========================================================================
+# 5. F3 (load veto), F4 (KV arithmetic), F10 (W62) -- slice 5
+# ==========================================================================
+REAL_NAMES = {
+    # routed experts -- the only thing a worker keeps
+    "model.language_model.layers.0.mlp.experts.5.gate_proj.weight": True,
+    "model.language_model.layers.47.mlp.experts.511.down_proj.weight_scale": True,
+    # the near-misses, all host-only
+    "model.language_model.layers.0.mlp.shared_expert.down_proj.weight": False,
+    "model.language_model.layers.0.mlp.shared_expert_gate.weight": False,
+    "model.language_model.layers.0.mlp.gate.weight": False,
+    "model.language_model.layers.0.self_attn.q_proj.weight": False,
+    "model.language_model.layers.0.self_attn.indexer.index_qk_proj.weight": False,
+    "model.language_model.layers.0.linear_attn.in_proj_qkv.weight": False,
+    "model.language_model.layers.0.attn_hyper_connection.input_mix_weight_up": False,
+    "model.language_model.layers.0.mlp_hyper_connection.hc_norm.weight": False,
+    "model.language_model.embed_tokens.weight": False,
+    "lm_head.weight": False,
+    "model.visual.blocks.0.attn.qkv.weight": False,
+    # the draft is UNSHARDED on the host, even though these carry the marker
+    "mtp.layers.0.mlp.experts.3.up_proj.weight": False,
+}
+
+
+def test_the_load_veto_keeps_routed_experts_and_nothing_else():
+    """F3, the half that is built. Names are the real ones from the
+    Qwen3.8-Flash-Next weight map, including every near-miss that a naive
+    'experts' substring would have swallowed."""
+    from sglang.srt.rank_role import worker_keeps_parameter
+
+    for name, expected in REAL_NAMES.items():
+        assert worker_keeps_parameter(name, 512) is expected, name
+
+
+def test_the_fused_shared_expert_is_host_only_despite_its_name():
+    """models/qwen3_5.py:2448-2452 rewrites mlp.shared_expert. into
+    mlp.experts.<num_routed>. -- after which only the ID tells them apart.
+    The shared expert runs for EVERY token, so it belongs to the host."""
+    from sglang.srt.rank_role import worker_keeps_parameter
+
+    fused = "model.language_model.layers.0.mlp.experts.512.down_proj.weight"
+    assert worker_keeps_parameter(fused, 512) is False
+    assert worker_keeps_parameter("...mlp.experts.511.down_proj", 512) is True
+    # Without the count the module cannot tell, and says so by keeping it --
+    # wrong but VISIBLE in the census, rather than guessing a count.
+    assert worker_keeps_parameter(fused, None) is True
+
+
+def test_the_installed_role_plan_is_inert_on_a_classic_boot():
+    from sglang.srt.rank_role import (
+        set_form_a_role_plan,
+        this_rank_is_form_a_worker,
+    )
+
+    try:
+        set_form_a_role_plan(None)
+        assert this_rank_is_form_a_worker() is False
+        set_form_a_role_plan(FORM_A, 0)
+        assert this_rank_is_form_a_worker() is False  # the host is not a worker
+        set_form_a_role_plan(FORM_A, 2)
+        assert this_rank_is_form_a_worker() is True
+        with pytest.raises(RankRoleError, match="outside the role vector"):
+            set_form_a_role_plan(FORM_A, 7)
+    finally:
+        set_form_a_role_plan(None)
+
+
+def test_the_kv_budget_excludes_a_rank_that_funds_no_token():
+    """F4 arithmetic. Under Form A only the host holds context tokens, so a
+    zero entry must be left OUT of the min() -- not divide by zero, and not
+    drag the budget to nothing."""
+    from sglang.srt.distributed.utils import cp_token_context_budget
+
+    # classic: three funding ranks, unchanged
+    assert cp_token_context_budget([11, 11, 10], [358784, 359232, 329472]) == (
+        min(358784 // 11, 359232 // 11, 329472 // 10) * 32
+    )
+    # Form A: only the host funds, and it funds all of it
+    assert cp_token_context_budget([1, 0, 0], [262151, 0, 0]) == 262151
+    # ... and a vector where NOBODY holds the KV is still a refusal
+    with pytest.raises(ValueError, match="no rank would hold the KV"):
+        cp_token_context_budget([0, 0, 0], [1, 1, 1])
+
+
+def test_w62_saturation_does_not_fire_for_a_rank_that_is_not_on_the_axis():
+    """F10. The launcher's own comment used to say a zero-head rank could
+    not happen; Form A makes it a layout. Left unfixed, the predicate fires
+    for EVERY worker (0/total*units = 0.0 < 1.0) and the refusal rejects
+    every Form A vector as 'axis switched off'."""
+    import inspect
+
+    from sglang.srt.weg2 import launcher
+
+    src = inspect.getsource(launcher.d_operating_point_rows)
+    assert "Form A worker: not on this axis, not saturated" in src
+    # the now-false prose must not be left standing
+    assert "A rank\n    # owning zero heads cannot happen" not in src
+    assert "makes zero heads" in src
+
+    # and the predicate itself, extracted and exercised
+    def saturated(weights, units):
+        total = sum(int(w) for w in weights)
+        for r, w in enumerate(weights):
+            if int(w) == 0:
+                continue
+            if total > 0 and float(w) / total * float(units) < 1.0:
+                return r
+        return None
+
+    assert saturated([1, 0, 0], 24) is None  # Form A: nobody is saturated
+    assert saturated([39, 13, 12], 24) is None  # today's vector: fine
+    assert saturated([200, 1, 1], 24) == 1  # a real saturation still fires

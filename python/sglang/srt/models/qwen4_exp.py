@@ -2021,6 +2021,14 @@ class Qwen4ExpVLModel(Qwen4ExpModel):
 
 _LAYER_ID_RE = re.compile(r"\.layers\.(\d+)\.")
 
+# Form A (F3): the loader veto in weight_name_needed. Imported at module
+# level rather than inside the method because it runs once per checkpoint
+# tensor -- 225.300 of them for this model.
+from sglang.srt.rank_role import (  # noqa: E402
+    this_rank_is_form_a_worker,
+    worker_keeps_parameter,
+)
+
 
 def weight_layer_is_owned(name: str, start_layer: int, end_layer: int) -> bool:
     """WP5 (pipeline parallelism): does this stage own the decoder layer a
@@ -2146,6 +2154,17 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
             return False  # load_weights drops these on the floor anyway
         if "visual" in name and self.language_model_only:
             return False
+        # FORM A (F3): a worker rank holds the ROUTED experts and nothing
+        # else -- no attention, no GDN, no mixer, no embeddings, no lm_head,
+        # no PLE, no router, no shared expert. Vetoing by NAME here rather
+        # than skipping later in load_weights is the whole point: the tensor
+        # is never read, so the 1.84 GiB of dense weights per worker never
+        # touch the card. Inert on a classic boot -- no role plan installed
+        # means this is False for every rank.
+        if this_rank_is_form_a_worker() and not worker_keeps_parameter(
+            name, self._num_routed_experts_for_form_a()
+        ):
+            return False
         local = name.replace("model.language_model.", "model.")
         lm = self.model
         start = int(getattr(lm, "start_layer", 0))
@@ -2164,6 +2183,19 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 lo, hi = rng
                 return lo <= int(m.group(1)) < hi
         return True
+
+    def _num_routed_experts_for_form_a(self):
+        """`config.num_experts`, or None when it cannot be read.
+
+        Used only to tell a ROUTED expert from the FUSED shared expert,
+        which arrives under the same ``mlp.experts.<id>.`` name with
+        id == num_experts (models/qwen3_5.py:2448-2452). None means "do not
+        try", which keeps the fused shared expert on a worker -- wrong, but
+        visible in the census, whereas guessing a count would be wrong and
+        invisible.
+        """
+        n = getattr(self.config, "num_experts", None)
+        return int(n) if isinstance(n, int) and n > 0 else None
 
     def _ple_ngram_embedding(self):
         for layer in getattr(self.model, "layers", ()):

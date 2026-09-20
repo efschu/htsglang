@@ -17874,9 +17874,22 @@ def configure_scheduler_process(
         if isinstance(server_args.rank_tp_ratio, list)
         else None
     )
+    # allow_zero is a property of the PLAN, not of a call site: under Form A
+    # (--rank-role host,worker,worker) the worker ranks own no dense shard of
+    # ANY dimension, and every layer in this process must split by that same
+    # rule. Installed here with the vector so no layer can disagree with it.
     set_tp_partition_ratios(
-        base_plan, families=uneven_family_plans(server_args) or None
+        base_plan,
+        families=uneven_family_plans(server_args) or None,
+        allow_zero=server_args.form_a_active(),
     )
+
+    # ... and the role plan alongside it, for the same reason: the loader
+    # veto (F3) runs once per checkpoint tensor and must not thread a
+    # server_args through the model to learn whether this rank is a worker.
+    from sglang.srt.rank_role import set_form_a_role_plan
+
+    set_form_a_role_plan(server_args.form_a_role_plan(), tp_rank)
 
     # Uneven DCP (M1): install the token-axis split vector so the KV pool
     # pinning and the weighted owner rule agree across ranks. None keeps the
