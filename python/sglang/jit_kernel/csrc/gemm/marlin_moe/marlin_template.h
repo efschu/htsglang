@@ -322,7 +322,11 @@ __global__ void Marlin(
     bool has_bias,
     bool use_atomic_add,   // whether to use atomic add to reduce
     bool use_fp32_reduce,  // whether to use fp32 global reduce
-    int max_shared_mem) {
+    int max_shared_mem,
+    bool no_k_split,     // Task #49: round the per-threadblock stripe up to whole
+                         // k-columns, so slice_count is always 1 (see below)
+    bool epilogue_sync) {  // Task #49: block-wide barrier before the epilogue
+                           // reuses sh_b as sh_red (see the site below)
   // Each threadblock processes one "stripe" of the B matrix with (roughly) the
   // same size, which might involve multiple column "slices" (of width 16 *
   // `thread_n_blocks`). Stripes are defined as shown in the 3x3 matrix 5 SM
@@ -398,6 +402,23 @@ __global__ void Marlin(
       // in the middle of group.
       iters = (group_blocks / thread_k_blocks) * div_ceil(iters, (group_blocks / thread_k_blocks));
     }
+  }
+
+  // Task #49 (2026-09-20), SGLANG_MARLIN_NO_K_SPLIT=1 -- the single-slice lever.
+  //
+  // `iters` is the number of 16x16 k-tiles one threadblock walks before it
+  // moves to the next n-column. When it is NOT a whole multiple of `k_tiles`,
+  // a column is split across several threadblocks (`slice_count > 1`) and its
+  // partial sums have to meet again through `locks[locks_off]` -- either via
+  // the fp32/fp16 global reduce or via the atomicAdd branch. Rounding `iters`
+  // up to a multiple of `k_tiles` makes `slice_row` identically 0 and
+  // `init_slice` then always computes `slice_count == 1`: every column is
+  // finished by ONE threadblock, no cross-block partial ever exists, and both
+  // reduce branches become unreachable. The total work is unchanged; only the
+  // load-balancing granularity coarsens to whole columns, so this is a
+  // measurable-cost probe and a candidate fix, not a correctness change.
+  if (no_k_split) {
+    iters = k_tiles * div_ceil(iters, k_tiles);
   }
 
   int slice_row = (iters * blockIdx.x) % k_tiles;
@@ -1754,6 +1775,48 @@ __global__ void Marlin(
     // the loop seemed to noticeably worse performance after compilation.
     if (slice_iters == 0) {
       cp_async_wait<0>();
+      // Task #49 (2026-09-20) -- THE EPILOGUE BARRIER, default ON.
+      //
+      // `sh_red` and `sh_b` are the SAME shared memory -- both are `sh_new`,
+      // see the aliasing above. The epilogue REUSES the B-pipeline staging
+      // buffer as the reduction buffer, and nothing separates the last reader
+      // of `sh_b` from the first writer of `sh_red`:
+      //
+      //   * the last BLOCK-WIDE barrier before this point is the
+      //     `__syncthreads()` inside `wait_for_stage()`, issued at
+      //     `k == b_sh_wr_iters - 2` of the final k-iteration. After it every
+      //     warp still runs `fetch_to_registers(...)`, which READS `sh_b`, and
+      //     two more `matmul(k)` calls, entirely unsynchronised;
+      //   * `cp_async_wait<0>()` on the line above does not close that: it is a
+      //     PER-THREAD wait. `cp.async.wait_group 0` retires only the groups the
+      //     EXECUTING thread committed and says nothing about sibling warps.
+      //
+      // So a warp that reaches the epilogue first starts writing reduction
+      // partials into `sh_red` while a lagging warp is still reading the same
+      // bytes as `sh_b` (and, for stages the predicate did not switch off, may
+      // still have `cp.async` traffic landing there). The lagging warp then
+      // multiplies against whatever the first warp just wrote -- arbitrary
+      // bit patterns read as bf16 -- and its accumulator leaves the mma as
+      // Inf/NaN. That is the #49 fingerprint exactly: transient, recompute-
+      // clean, in CONTIGUOUS ROW BLOCKS (one warp owns one 16-row m-fragment),
+      // and present on BOTH reduce branches, because this happens before
+      // either branch is chosen.
+      //
+      // The barrier also covers the `red_off == 0` case, where
+      // `thread_block_reduce()` is a no-op and `write_result()` is itself the
+      // first writer of `sh_red`.
+      //
+      // The correct pattern is the one this same function already uses ~20
+      // lines below for `sh_s`: `cp_async_wait<0>(); __syncthreads();`. The
+      // barrier is uniform across the block (`epilogue_sync` is a kernel
+      // argument, identical for every thread), so it is never divergent, and
+      // it costs one block-wide barrier per finished slice.
+      //
+      // SGLANG_MARLIN_EPILOGUE_SYNC=0 removes it again, so one boot can show
+      // the fault with the barrier off and its absence with the barrier on.
+      if (epilogue_sync) {
+        __syncthreads();
+      }
       bool last = slice_idx == slice_count - 1;
       // For per-column scales, we only fetch them here in the final step before
       // write-out

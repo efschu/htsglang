@@ -4,31 +4,97 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sglang.jit_kernel.utils import cache_once_per_arch, load_jit, make_cpp_args
+import logging
+
+from sglang.jit_kernel.marlin_switches import (
+    arch_override_cuda_cflags,
+    arch_override_from_env,
+    format_switch_log,
+    switch_census,
+)
+from sglang.jit_kernel.utils import (
+    cache_once_per_arch,
+    get_jit_cuda_arch,
+    load_jit,
+    make_cpp_args,
+    override_jit_cuda_arch,
+)
 from sglang.kernel_api_logging import debug_kernel_api
 
 if TYPE_CHECKING:
     from sgl_kernel.scalar_type import ScalarType
     from tvm_ffi.module import Module
 
+logger = logging.getLogger(__name__)
+
 # Constants matching device::marlin_moe:: in marlin.cuh
 _MAX_THREAD_N = 256
+
+_SWITCHES_LOGGED = {"done": False}
+
+
+def _log_marlin_switches(device) -> None:
+    """Task #49: ONE line per rank naming every Marlin switch this boot ran with.
+
+    Without it a clean A/B arm cannot be told from an arm whose environment
+    never reached the worker -- the same null-result trap the #49 workspace and
+    reduce-branch logs already close. Emitted at error level on purpose: it must
+    survive the serving log level, and it is one line per process."""
+    if _SWITCHES_LOGGED["done"]:
+        return
+    _SWITCHES_LOGGED["done"] = True
+    try:
+        props = torch.cuda.get_device_properties(device)
+        sms = props.multi_processor_count
+        smem = getattr(props, "shared_memory_per_block_optin", None)
+        arch = get_jit_cuda_arch().target_name
+        logger.error(
+            "%s", format_switch_log(arch, switch_census(sms, smem_optin=smem))
+        )
+    except Exception as exc:  # noqa: BLE001 -- an instrument never kills a GEMM
+        logger.debug("[nan-49c] marlin switch log skipped: %s", exc)
 
 
 @cache_once_per_arch
 def _jit_moe_wna16_marlin_module(dtype: torch.dtype) -> Module:
     args = make_cpp_args(dtype)
-    return load_jit(
-        "moe_wna16_marlin",
-        *args,
-        cuda_files=["gemm/marlin_moe/moe_wna16_marlin.cuh"],
-        cuda_wrappers=[
-            (
-                "moe_wna16_marlin_gemm",
-                f"moe_wna16_marlin_gemm<{args}>",
-            )
-        ],
-    )
+    override = arch_override_from_env()
+
+    def _build():
+        return load_jit(
+            "moe_wna16_marlin",
+            *args,
+            cuda_files=["gemm/marlin_moe/moe_wna16_marlin.cuh"],
+            cuda_wrappers=[
+                (
+                    "moe_wna16_marlin_gemm",
+                    f"moe_wna16_marlin_gemm<{args}>",
+                )
+            ],
+            extra_cuda_cflags=arch_override_cuda_cflags(override),
+        )
+
+    if override is None:
+        return _build()
+
+    # Task #49: build this ONE module for a different virtual architecture and
+    # let the driver JIT the embedded PTX for the real device.
+    #
+    # `override_jit_cuda_arch` changes three things at once, and all three are
+    # required together: the `-DSGL_CUDA_ARCH` macro the kernel headers
+    # static_assert `__CUDA_ARCH__` against, the `TVM_FFI_CUDA_ARCH_LIST` from
+    # which tvm-ffi derives its `-gencode`, and the `arch` that goes into both
+    # the JIT build hash and the build directory NAME. The last one is what
+    # makes the cache key disjoint from the native build: an overridden module
+    # lands in `..._arch_9.0__...`, the native one in `..._arch_12.0__...`, and
+    # `_compat_ok` re-checks the recorded provenance before reusing either, so
+    # the two can never be mistaken for one another.
+    #
+    # Scope: this module only. Every other JIT kernel in the process keeps
+    # building for the real device, which is what keeps the A/B pointed at
+    # Marlin instead of at the whole runtime.
+    with override_jit_cuda_arch(override.major, override.minor, override.suffix):
+        return _build()
 
 
 def _or_empty(
@@ -134,6 +200,7 @@ def moe_wna16_marlin_gemm(
     b_bias_t = _or_empty(b_bias_or_none, device, a.dtype)
     global_scale_t = _or_empty(global_scale_or_none, device, a.dtype)
 
+    _log_marlin_switches(device)
     module = _jit_moe_wna16_marlin_module(a.dtype)
     module.moe_wna16_marlin_gemm(
         a,
