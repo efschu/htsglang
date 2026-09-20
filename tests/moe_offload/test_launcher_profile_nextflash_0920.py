@@ -52,3 +52,16 @@ def test_the_knobs_carry_the_profile_and_the_cli_offers_it():
 
     src = inspect.getsource(lc)
     assert 'ap.add_argument("--profile", choices=list(PROFILES), default=PROFILE_QWEN27B' in src
+
+
+def test_group_env_extra_is_applied_last_and_parsed_strictly(tmp_path):
+    import pytest as _pt
+
+    assert lc.parse_group_env("") == {}
+    assert lc.parse_group_env("A=1; SGLANG_MOE_SCRATCH_SLOTS=74,48,48") == {"A": "1", "SGLANG_MOE_SCRATCH_SLOTS": "74,48,48"}
+    with _pt.raises(ValueError):
+        lc.parse_group_env("NOEQUALS")
+    kw = dict(chunk_layers=0, chunk_count=0, tms_so="", transport="bar1", ring=None)
+    env = lc.build_env(str(tmp_path), "venv", "0,1,2", str(tmp_path), False, "t", group="P",
+                       profile=lc.PROFILE_NEXTFLASH, group_env_extra={"SGLANG_MOE_SCRATCH_SLOTS": "32"}, **kw)
+    assert env["SGLANG_MOE_SCRATCH_SLOTS"] == "32"

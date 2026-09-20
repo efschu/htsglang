@@ -4635,6 +4635,19 @@ def lane_coverage_dump_dir(ns) -> str:
     )
 
 
+def parse_group_env(spec: str) -> Dict[str, str]:
+    """'KEY=VAL;KEY=VAL' -> dict; empty -> {}. Entries are ';'-separated because
+    the values themselves are comma vectors (SGLANG_MOE_SCRATCH_SLOTS=74,48,48).
+    A malformed entry is refused by name rather than dropped (#781 class)."""
+    out: Dict[str, str] = {}
+    for item in [x for x in str(spec or "").split(";") if x.strip()]:
+        if "=" not in item:
+            raise ValueError(f"--env-p/--env-d entry {item!r} is not KEY=VAL")
+        k, v = item.split("=", 1)
+        out[k.strip()] = v.strip()
+    return out
+
+
 def build_env(tree: str, venv: str, cvd: str, store_dir: str, debug_hold: bool, tag: str,
               chunk_layers: int = 0, chunk_count: int = 0, tms_so: str = "",
               transport: str = "bar1", ring: Optional["HostRingPlan"] = None,
@@ -4658,6 +4671,7 @@ def build_env(tree: str, venv: str, cvd: str, store_dir: str, debug_hold: bool, 
               vision: str = VISION_OFF,
               profile: str = PROFILE_QWEN27B,
               flip_weights: str = "family",
+              group_env_extra: Optional[Dict[str, str]] = None,
               xchg_env: Optional[Dict[str, str]] = None) -> Dict[str, str]:
     env = dict(os.environ)
     # Task #58: THE ARMING SIGNAL for the transient vision stage, and the ONE
@@ -4904,6 +4918,12 @@ def build_env(tree: str, venv: str, cvd: str, store_dir: str, debug_hold: bool, 
         from sglang.srt.managers.weg2_memory_saver import WEIGHTS_RESIDENT_ENV
 
         env[WEIGHTS_RESIDENT_ENV] = "1"
+    if group_env_extra:
+        # --env-p / --env-d (Scheibe 6a): per-group variables the two layouts
+        # spell differently (e.g. SGLANG_MOE_SCRATCH_SLOTS: one value per TP
+        # rank -- P's stages run tp 1, D's Form A runs tp 3). Applied LAST so
+        # an operator value is what the group runs, and printed by the caller.
+        env.update({str(k): str(v) for k, v in group_env_extra.items()})
     env["SGLANG_BARLINK_BUILD_WINDOW_CAP_S"] = str(barlink_build_window_cap_s)
     if str(transport) == "nccl":
         # #1234 C6: half-configuring a transport the group does not run is
@@ -9650,6 +9670,8 @@ def build_parser() -> argparse.ArgumentParser:
                     help="#1233: number of weights_<k> layer-chunk tags per group (0 = the round-1 single tag / two-backup shape)")
     ap.add_argument("--ready-deadline-s", type=float, default=900.0)
     ap.add_argument("--extra-p", default="", help="extra flags for group P (shell-split)")
+    ap.add_argument("--env-p", default="", help="Scheibe 6a: per-group env for P, 'KEY=VAL;KEY=VAL' (values may hold commas; applied last in build_env)")
+    ap.add_argument("--env-d", default="", help="Scheibe 6a: per-group env for D, 'KEY=VAL;KEY=VAL' (values may hold commas; applied last in build_env)")
     ap.add_argument("--extra-d", default="", help="extra flags for group D (shell-split)")
     ap.add_argument("--fairness-w-s", type=float, default=45.0,
                     help="A1-1: the only sanctioned pre-emption; 0 disables it. Passed to the front.")
@@ -11693,7 +11715,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # TRAIN FIX 5 moved the dc-reserve / budgets_p / cut solve ahead of the
     # ring (block 1b- above); only ``env_p`` stays here, because it is the
     # one thing in this step that genuinely needs the armed ring.
-    env_p = build_env(tree, ns.venv, cvd, store_dir, ns.debug_hold in ("P", "both"), ns.tag, chunk_layers, chunk_count, tms_so, ns.transport, ring_plan, group="P", xchg_env=xchg_env, **_env_knobs(ns))
+    env_p = build_env(tree, ns.venv, cvd, store_dir, ns.debug_hold in ("P", "both"), ns.tag, chunk_layers, chunk_count, tms_so, ns.transport, ring_plan, group="P", xchg_env=xchg_env, group_env_extra=parse_group_env(getattr(ns, "env_p", "")), **_env_knobs(ns))
     # #1269 PUBLICATION: build_env's own comment says the decision is
     # "published explicitly so the boot log names the decision" -- but it only
     # SET the variables and logged nothing, so no boot log ever carried them.
@@ -11974,7 +11996,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         log(d_ratio.line)
         log(d_ratio.op_line)
         log(d_tokvec.line)
-        env_d = build_env(tree, ns.venv, cvd, store_dir, False, ns.tag, chunk_layers, chunk_count, tms_so, ns.transport, ring_plan, group="D", xchg_env=xchg_env, **_env_knobs(ns))
+        env_d = build_env(tree, ns.venv, cvd, store_dir, False, ns.tag, chunk_layers, chunk_count, tms_so, ns.transport, ring_plan, group="D", xchg_env=xchg_env, group_env_extra=parse_group_env(getattr(ns, "env_d", "")), **_env_knobs(ns))
         spec_d = GroupSpec("D", PORT_D, transport_argv(argv_d(py, ns.model, budgets_d, s_gb_d, arm.m_mib, store_cfg, shlex.split(ns.extra_d), d_bs, max_kv_per_request, x_tokens, ns.num_continuous_decode_steps, ns.d_disable_overlap_schedule, d_ratio.flags, d_tokvec.flags, ns.random_seed, ns.barlink_bar1_cap_cycles, ns.collective_census_interval, ns.d_disable_cuda_graph, admin_api_key=admin_api_key, hicache_disabled=hicache_disabled, weights_cpu_backup=weights_cpu_backup_armed, profile=ns.profile), ns.transport), state.logs["D"], env_d)
         launch_group(spec_d, tree, log, dry)
         log("front argv (dry): " + " ".join(shlex.quote(a) for a in front_argv_for(
@@ -12073,7 +12095,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     log(d_ratio.line)
     log(d_ratio.op_line)
     log(d_tokvec.line)
-    env_d = build_env(tree, ns.venv, cvd, store_dir, ns.debug_hold in ("D", "both"), ns.tag, chunk_layers, chunk_count, tms_so, ns.transport, ring_plan, group="D", xchg_env=xchg_env, **_env_knobs(ns))
+    env_d = build_env(tree, ns.venv, cvd, store_dir, ns.debug_hold in ("D", "both"), ns.tag, chunk_layers, chunk_count, tms_so, ns.transport, ring_plan, group="D", xchg_env=xchg_env, group_env_extra=parse_group_env(getattr(ns, "env_d", "")), **_env_knobs(ns))
     spec_d = GroupSpec("D", PORT_D, transport_argv(argv_d(py, ns.model, budgets_d, s_gb_d, arm.m_mib, store_cfg, shlex.split(ns.extra_d), d_bs, max_kv_per_request, x_tokens, ns.num_continuous_decode_steps, ns.d_disable_overlap_schedule, d_ratio.flags, d_tokvec.flags, ns.random_seed, ns.barlink_bar1_cap_cycles, ns.collective_census_interval, ns.d_disable_cuda_graph, admin_api_key=admin_api_key, hicache_disabled=hicache_disabled, weights_cpu_backup=weights_cpu_backup_armed, profile=ns.profile), ns.transport), state.logs["D"], env_d)
     state.argv["D"] = " ".join(shlex.quote(a) for a in spec_d.argv)
     launch_group(spec_d, tree, log, dry)
