@@ -332,9 +332,7 @@ def resolve_adaptive_graph_memory_mode(server_args: "ServerArgs") -> str:
                 f"usable: {reason}. Use 'resident' (all states stay "
                 "materialized in VRAM) or fix the prerequisite."
             )
-        logger.info(
-            "Adaptive graph memory: auto-resolving to 'resident' (%s).", reason
-        )
+        logger.info("Adaptive graph memory: auto-resolving to 'resident' (%s).", reason)
         return "resident"
 
     if server_args.device not in (None, "cuda"):
@@ -754,9 +752,7 @@ class AdaptiveGraphMemoryManager:
             pre = self._pre_build_segments or {}
             self._pre_build_segments = None
             rec.segment_ranges = [
-                (addr, addr + size)
-                for addr, size in post.items()
-                if addr not in pre
+                (addr, addr + size) for addr, size in post.items() if addr not in pre
             ]
         logger.info(
             "Adaptive graph memory: built %s, tagged %.1f MiB in %d buffers",
@@ -932,9 +928,7 @@ class AdaptiveGraphMemoryManager:
 
         # Pause anything still mapped (defensive; builds already pause).
         for tag, rec in self._states.items():
-            if tag not in self._paused and (
-                rec.tensors or tag in self._capture_pools
-            ):
+            if tag not in self._paused and (rec.tensors or tag in self._capture_pools):
                 torch.cuda.synchronize()
                 self._adapter.pause(tag)
                 self._paused.add(tag)
@@ -1034,11 +1028,7 @@ class AdaptiveGraphMemoryManager:
         placement."""
         live = _snapshot_segment_addrs()
         live_ranges = {
-            tag: [
-                (lo, hi)
-                for lo, hi in rec.segment_ranges
-                if live.get(lo) == hi - lo
-            ]
+            tag: [(lo, hi) for lo, hi in rec.segment_ranges if live.get(lo) == hi - lo]
             for tag, rec in self._states.items()
         }
         for tag, rec in self._states.items():
@@ -1088,10 +1078,7 @@ class AdaptiveGraphMemoryManager:
         rec = self._states.get(tag)
         target = (
             tag
-            if (
-                rec is not None
-                and (rec.tensors or tag in self._capture_pools)
-            )
+            if (rec is not None and (rec.tensors or tag in self._capture_pools))
             else None
         )
         if target == self._resumed_tag:
@@ -1334,18 +1321,14 @@ def note_state_tensor(t: Optional[torch.Tensor], kind: str = "scratch") -> None:
 def in_offload_build() -> bool:
     """True while an offload-mode adaptive state build scope is active."""
     mgr = _ACTIVE_MANAGER
-    return (
-        mgr is not None and mgr.offload_enabled and mgr._build_tag is not None
-    )
+    return mgr is not None and mgr.offload_enabled and mgr._build_tag is not None
 
 
 def in_capture_offload_build() -> bool:
     """True while a STAGE-2 (capture-pool) adaptive build scope is active
     (gates the Stage-2-only wrap sites, e.g. int-workspace retagging)."""
     mgr = _ACTIVE_MANAGER
-    return (
-        mgr is not None and mgr.capture_offload and mgr._build_tag is not None
-    )
+    return mgr is not None and mgr.capture_offload and mgr._build_tag is not None
 
 
 def capture_pool_override():

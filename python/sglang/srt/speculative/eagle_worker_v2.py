@@ -318,7 +318,10 @@ def _log_spec_trace(worker, verify_input, predict, accept_lens, accept_index) ->
         for i in range(min(len(draft), 4)):
             logger.info(
                 "SPEC-TRACE round=%d req=%d draft=%s target=%s accept=%s top5_prev=%s",
-                worker._spec_trace_done, i, draft[i], target[i],
+                worker._spec_trace_done,
+                i,
+                draft[i],
+                target[i],
                 acc[i] if i < len(acc) else None,
                 top5[i] if top5 is not None and i < len(top5) else None,
             )
@@ -351,7 +354,11 @@ def target_shares_vocab_modules(target_lm_head, embed_module) -> bool:
     ``qweight``), or -- fn4i 19.09., Next Flash -- an embedding kept on the
     host (Qwen4ExpPinnedHostEmbedding under --ple-offload-embedding) that has
     no ``.weight`` tensor to hand over either."""
-    if target_lm_head is not None and not hasattr(target_lm_head, "weight") and hasattr(target_lm_head, "qweight"):
+    if (
+        target_lm_head is not None
+        and not hasattr(target_lm_head, "weight")
+        and hasattr(target_lm_head, "qweight")
+    ):
         return True
     return embed_module is not None and not hasattr(embed_module, "weight")
 
@@ -382,7 +389,9 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         # on that stage is a PPMissingLayer, so the early embed/head share
         # below is skipped and `draft_kv_producer` loads the embedding
         # resident (placement A) and shares lm_head itself.
-        self.draft_kv_only = bool(getattr(server_args, "speculative_draft_kv_only", False))
+        self.draft_kv_only = bool(
+            getattr(server_args, "speculative_draft_kv_only", False)
+        )
         self.attn_cp_rank = attn_cp_rank
         self.moe_dp_rank = moe_dp_rank
 
@@ -758,7 +767,9 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         # path (M21: before KV profiling; set_embed_and_head_modules calls
         # empty_cache so the profiler sees the released draft dupes).
         # Non-GGUF targets always have `.weight` and never take this branch.
-        _embed_module = getattr(getattr(target_model, "model", None), "embed_tokens", None)
+        _embed_module = getattr(
+            getattr(target_model, "model", None), "embed_tokens", None
+        )
         if target_shares_vocab_modules(target_lm_head, _embed_module):
             draft_model = self.draft_runner.model
             if (
@@ -1110,9 +1121,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 self.topk,
                 self.speculative_num_steps,
                 seed_dsa_topk_from_draft_extend=self.seed_dsa_topk_from_draft_extend,
-                qsa_profile=parse_qsa_profile(
-                    self.draft_runner.model_config.hf_config
-                ),
+                qsa_profile=parse_qsa_profile(self.draft_runner.model_config.hf_config),
             )
 
             # Initialize decode attention backend
@@ -1789,12 +1798,20 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 top1 = sum(1 for r in range(n) if idx[r] and idx[r][0] == truth[r])
                 top5 = sum(1 for r in range(n) if idx[r] and truth[r] in idx[r][:5])
                 lp = logits_output.input_token_logprobs
-                lp_mean = float(lp[:n].float().mean().item()) if lp is not None else float("nan")
+                lp_mean = (
+                    float(lp[:n].float().mean().item())
+                    if lp is not None
+                    else float("nan")
+                )
                 logger.info(
                     "SPEC-TF draft-extend after prefill: rows=%d top1_agree=%.3f "
                     "top5_agree=%.3f mean_logprob_truth=%.3f first12_top1=%s first12_truth=%s",
-                    n, top1 / max(n, 1), top5 / max(n, 1), lp_mean,
-                    [idx[r][0] if idx[r] else -1 for r in range(min(n, 12))], truth[:12],
+                    n,
+                    top1 / max(n, 1),
+                    top5 / max(n, 1),
+                    lp_mean,
+                    [idx[r][0] if idx[r] else -1 for r in range(min(n, 12))],
+                    truth[:12],
                 )
             except Exception as e:  # noqa: BLE001
                 logger.warning("SPEC-TF skipped: %s", e)
