@@ -126,14 +126,16 @@ def test_sms_override_applies_downward_only():
 
 def test_cuda_source_reads_exactly_these_env_names():
     src = CUH.read_text()
-    for name in (ENV_EPILOGUE_SYNC, ENV_NO_K_SPLIT, ENV_SMS_OVERRIDE):
+    for name in (ENV_EPILOGUE_SYNC, ENV_SMS_OVERRIDE):
         assert f'std::getenv("{name}")' in src, name
+    # NO_K_SPLIT goes through the shared gate parser, not a bare getenv.
+    assert f'marlin_parse_gate("{ENV_NO_K_SPLIT}")' in src
 
 
 def test_cuda_truthiness_sets_match_the_python_ones():
     src = CUH.read_text()
-    # no_k_split: raw[0] == '1' || 't' || 'T' || 'y' || 'Y'
-    block = src.split("marlin_moe_no_k_split()")[1].split("}")[0]
+    # no_k_split truthiness now lives in marlin_parse_gate, same character set
+    block = src.split("inline MarlinGate marlin_parse_gate")[1].split("\n}\n")[0]
     assert set(re.findall(r"raw\[0\] == '(.)'", block)) == {"1", "t", "T", "y", "Y"}
     # epilogue_sync: NOT ('0','f','F','n','N'), default true
     block = src.split("marlin_moe_epilogue_sync()")[1].split("}")[0]
@@ -257,6 +259,7 @@ def test_census_and_log_line_name_every_switch():
     assert census == {
         "arch_override_applied": True,
         "arch_override_reason": "applies",
+        "no_k_split_requested": True,
         "epilogue_sync": False,
         "no_k_split": True,
         "sms_requested": 68,
@@ -368,3 +371,111 @@ def test_ptx_flag_is_what_the_fn8c4_build_actually_used():
     assert arch_override_cuda_cflags(parse_arch_override("9.0")) == [
         "-gencode=arch=compute_90,code=compute_90"
     ]
+
+
+# --- fn8c6/fn8c7: does NO_K_SPLIT actually reach slice_count == 1? ----------
+
+from sglang.jit_kernel.marlin_switches import marlin_slice_census
+
+#: The fn8c6 shapes. Qwen3.8-Flash-Next: hidden 2560, moe_intermediate 640,
+#: block_size_m 64 -> thread_m_blocks 4 -> large_batch_thread_configs[0] =
+#: {thread_k 64, thread_n 256}. k_tiles = K/16/4, n_tiles = N/16/16.
+GEMM1_TILES = (40, 5)   # gate_up: K=2560, N=2*640=1280
+GEMM2_TILES = (10, 10)  # down:    K=640,  N=2560
+
+
+@pytest.mark.parametrize("tiles", [GEMM1_TILES, GEMM2_TILES])
+@pytest.mark.parametrize("blocks", [170, 68])
+@pytest.mark.parametrize("M", [32850, 28909, 20161])
+def test_no_k_split_reaches_slice_count_one(tiles, blocks, M):
+    """The claim fn8c7 rests on, as an assertion instead of a hope."""
+    k_tiles, n_tiles = tiles
+    parallel = -(-M // 64) + 8
+    off = marlin_slice_census(k_tiles, n_tiles, parallel, blocks)
+    on = marlin_slice_census(k_tiles, n_tiles, parallel, blocks, no_k_split=True)
+    assert off["max_slice_count"] == 2, "without the switch, columns DO split"
+    assert on["max_slice_count"] == 1
+    assert on["slices_with_split"] == 0
+    assert on["iters"] % k_tiles == 0, "whole k-columns is the mechanism"
+
+
+def test_the_k_split_is_not_what_makes_gemm2_special():
+    """Both GEMMs split, in the same order of magnitude -- so a mechanism that
+    is equally present in the GEMM that stays CLEAN cannot on its own explain
+    the one that does not. Pinned so the next reader does not re-derive it."""
+    parallel = -(-32850 // 64) + 8
+    g1 = marlin_slice_census(*GEMM1_TILES, parallel, 170)
+    g2 = marlin_slice_census(*GEMM2_TILES, parallel, 170)
+    assert g1["slices_with_split"] > 0 and g2["slices_with_split"] > 0
+    ratio = g1["slices_with_split"] / g2["slices_with_split"]
+    assert 0.5 < ratio < 2.0, (g1, g2)
+
+
+def test_the_5090_is_exposed_to_more_split_slices_than_the_3080():
+    """The real asymmetry the arm is worth a boot for: 170 SMs against 68."""
+    parallel = -(-32850 // 64) + 8
+    on5090 = marlin_slice_census(*GEMM2_TILES, parallel, 170)
+    on3080 = marlin_slice_census(*GEMM2_TILES, parallel, 68)
+    assert on5090["slices_with_split"] > 2 * on3080["slices_with_split"]
+
+
+def test_slice_census_rejects_nonsense():
+    with pytest.raises(ValueError):
+        marlin_slice_census(0, 10, 100, 170)
+
+
+# --- fn8c7: NO_K_SPLIT must be a per-RANK decision too ----------------------
+
+
+def test_bare_no_k_split_still_applies_everywhere():
+    """Backward compatible: fn8c7's spelling keeps fn8c7's meaning."""
+    from sglang.jit_kernel.marlin_switches import no_k_split_on
+
+    assert no_k_split_on({ENV_NO_K_SPLIT: "1"}, (12, 0)) is True
+    assert no_k_split_on({ENV_NO_K_SPLIT: "1"}, (8, 6)) is True
+
+
+def test_gated_no_k_split_touches_only_the_named_capability():
+    """fn8c7 died because the sm_86 ranks took the coarser grid too. They run
+    this form with ~1 % of card headroom (card free 0.17-0.37 GiB of 19.58 in
+    BOTH fn8c6 and fn8c7), so moving their kernel timing is enough to tip
+    self_attention into CUDA OOM."""
+    from sglang.jit_kernel.marlin_switches import no_k_split_on
+
+    env = {ENV_NO_K_SPLIT: "1@12.0"}
+    assert no_k_split_on(env, (12, 0)) is True
+    assert no_k_split_on(env, (8, 6)) is False
+    assert no_k_split_on(env, None) is False, "unknown card -> do not touch it"
+
+
+@pytest.mark.parametrize("gate", ["1@120", "1@12.0"])
+def test_both_gate_spellings_parse(gate):
+    from sglang.jit_kernel.marlin_switches import parse_gate
+
+    assert parse_gate(gate) == (True, (12, 0))
+
+
+@pytest.mark.parametrize("raw", ["1@twelve", "1@", "1@x.y"])
+def test_a_malformed_gate_disables_rather_than_widens(raw):
+    """The dangerous failure is 'gate unparsable -> apply everywhere'."""
+    from sglang.jit_kernel.marlin_switches import no_k_split_on
+
+    assert no_k_split_on({ENV_NO_K_SPLIT: raw}, (12, 0)) is False
+
+
+def test_census_separates_requested_from_applied_for_no_k_split():
+    env = {ENV_NO_K_SPLIT: "1@12.0"}
+    on3080 = switch_census(68, env, smem_optin=101376, device_cap=(8, 6))
+    assert on3080["no_k_split"] is False
+    assert on3080["no_k_split_requested"] is True
+    assert "no_k_split=False(req=True)" in format_switch_log("8.6", on3080)
+
+
+def test_cuda_source_parses_the_same_gate():
+    src = CUH.read_text()
+    assert "marlin_parse_gate" in src
+    assert "cudaDevAttrComputeCapabilityMajor" in src
+    assert "marlin_moe_no_k_split(dev)" in src
+    # A gate it cannot parse must disable, not widen.
+    block = src.split("inline MarlinGate marlin_parse_gate")[1].split("\n}\n")[0]
+    assert "g.enabled = false;" in block

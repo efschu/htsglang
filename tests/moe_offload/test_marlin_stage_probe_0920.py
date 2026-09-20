@@ -74,16 +74,16 @@ def test_level_1_still_means_exactly_what_it_meant(monkeypatch):
 def test_origin_names_the_first_bad_stage():
     assert (
         classify_nonfinite_origin(
-            {"INPUT-A": 0, "GEMM1": 0, "ACT": 0, "GEMM2": 7}
+            {"INPUT-A": 0, "ROUTER-W": 0, "GEMM1": 0, "ACT": 0, "GEMM2": 7}
         )
         == "ENTERS-AT-GEMM2"
     )
     assert (
-        classify_nonfinite_origin({"INPUT-A": 0, "GEMM1": 4, "ACT": 4, "GEMM2": 4})
+        classify_nonfinite_origin({"INPUT-A": 0, "ROUTER-W": 0, "GEMM1": 4, "ACT": 4, "GEMM2": 4})
         == "ENTERS-AT-GEMM1"
     )
     assert (
-        classify_nonfinite_origin({"INPUT-A": 3, "GEMM1": 3, "ACT": 3, "GEMM2": 3})
+        classify_nonfinite_origin({"INPUT-A": 3, "ROUTER-W": 0, "GEMM1": 3, "ACT": 3, "GEMM2": 3})
         == "ENTERS-AT-INPUT-A"
     )
 
@@ -98,7 +98,8 @@ def test_an_unmeasured_stage_is_not_a_clean_stage():
     # The #49 trap in one assertion: a scan that threw must never be reported
     # as evidence of absence.
     assert (
-        classify_nonfinite_origin({"INPUT-A": 0, "GEMM1": 0}) == "UNMEASURED-AT-ACT"
+        classify_nonfinite_origin({"INPUT-A": 0, "ROUTER-W": 0, "GEMM1": 0})
+        == "UNMEASURED-AT-ACT"
     )
     assert classify_nonfinite_origin({}) == "UNMEASURED-AT-INPUT-A"
     assert (
@@ -205,7 +206,8 @@ def test_report_names_the_kernel_when_the_input_was_clean(caplog):
     clean = torch.zeros(8, dtype=torch.bool)
     bad = torch.zeros(8, dtype=torch.bool)
     bad[5] = True
-    masks = {"INPUT-A": clean, "GEMM1": bad, "ACT": bad, "GEMM2": bad}
+    masks = {"INPUT-A": clean, "ROUTER-W": clean, "GEMM1": bad, "ACT": bad,
+             "GEMM2": bad}
     with caplog.at_level("ERROR"):
         fmm._stage_probe_report(masks, True, 8, 1, 64)
     assert "ORIGIN ENTERS-AT-GEMM1" in caplog.text
@@ -305,7 +307,8 @@ def test_report_touches_no_mask_under_capture(capturing, caplog):
 def test_report_still_works_outside_capture(not_capturing, caplog):
     bad = torch.zeros(4, dtype=torch.bool)
     bad[1] = True
-    masks = {"INPUT-A": torch.zeros(4, dtype=torch.bool), "GEMM1": bad,
+    masks = {"INPUT-A": torch.zeros(4, dtype=torch.bool),
+             "ROUTER-W": torch.zeros(4, dtype=torch.bool), "GEMM1": bad,
              "ACT": bad, "GEMM2": bad}
     with caplog.at_level("ERROR"):
         fmm._stage_probe_report(masks, True, 4, 1, 64)
@@ -338,3 +341,25 @@ def test_level_1_is_unaffected_by_the_capture_gate(monkeypatch, capturing):
     monkeypatch.setenv("SGLANG_MOE_MARLIN_C_SENTINEL", "1")
     assert marlin_c_sentinel_on() is True
     assert fmm.marlin_stage_probe_active() is False
+
+
+def test_router_weights_are_the_gemm2_only_input(caplog, not_capturing):
+    """The fn8c6 pattern WITHOUT a kernel defect: A, GEMM1 and ACT clean, a NaN
+    in topk_weights, GEMM2 non-finite -- because mul_topk_weights is set on the
+    down projection and nowhere else."""
+    clean = torch.zeros(8, dtype=torch.bool)
+    rw = torch.zeros(8, dtype=torch.bool)
+    rw[3] = True
+    out = torch.zeros(8, dtype=torch.bool)
+    out[3] = True
+    masks = {"INPUT-A": clean, "ROUTER-W": rw, "GEMM1": clean, "ACT": clean,
+             "GEMM2": out}
+    assert classify_nonfinite_origin({k: int(v.sum()) for k, v in masks.items()}) == (
+        "ENTERS-AT-ROUTER-W"
+    )
+    with caplog.at_level("ERROR"):
+        fmm._stage_probe_report(masks, True, 8, 1, 64)
+    assert "ORIGIN ENTERS-AT-ROUTER-W" in caplog.text
+    # and GEMM2 must read as TRANSPORT, not PRODUCED-HERE: the union of the two
+    # call inputs already carried that row.
+    assert "'GEMM2': 'TRANSPORT'" in caplog.text

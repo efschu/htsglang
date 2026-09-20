@@ -67,9 +67,44 @@ def epilogue_sync_on(env=None) -> bool:
     return not _c_falsy_first_char(env.get(ENV_EPILOGUE_SYNC))
 
 
-def no_k_split_on(env=None) -> bool:
+def parse_gate(raw):
+    """Mirror of `marlin_parse_gate` in the .cuh: (enabled, only_on|None).
+
+    Accepts a bare truthy value, or `1@12.0` / `1@120`. A MALFORMED gate
+    disables the switch rather than applying it everywhere -- fn8c7 is what
+    "everywhere" cost: the two sm_86 ranks took the coarser grid too and TP1
+    died with CUDA OOM in self_attention 20 s into the boot."""
+    if not raw:
+        return False, None
+    enabled = _c_truthy_first_char(raw)
+    if "@" not in raw:
+        return enabled, None
+    gate = raw.split("@", 1)[1].strip()
+    m = re.match(r"^(\d{1,2})\.(\d)$", gate)
+    if m:
+        return enabled, (int(m.group(1)), int(m.group(2)))
+    m = re.match(r"^(\d{2,3})$", gate)
+    if m and int(m.group(1)) >= 10:
+        n = int(m.group(1))
+        return enabled, (n // 10, n % 10)
+    return False, None
+
+
+def no_k_split_on(env=None, device_cap=None) -> bool:
+    """Does THIS process's card take the no-k-split grid?
+
+    ``device_cap`` is (major, minor). Unknown capability with a gate present
+    means NO -- a switch that cannot tell whose card it is on does not change
+    that card's behaviour."""
     env = os.environ if env is None else env
-    return _c_truthy_first_char(env.get(ENV_NO_K_SPLIT))
+    enabled, only_on = parse_gate(env.get(ENV_NO_K_SPLIT))
+    if not enabled:
+        return False
+    if only_on is None:
+        return True
+    if device_cap is None:
+        return False
+    return tuple(device_cap) == tuple(only_on)
 
 
 def sms_override(env=None) -> int:
@@ -299,7 +334,8 @@ def switch_census(
         "smem_optin": None if smem_optin is None else int(smem_optin),
         "smem_optin_verdict": smem_optin_verdict(smem_optin),
         "epilogue_sync": epilogue_sync_on(env),
-        "no_k_split": no_k_split_on(env),
+        "no_k_split": no_k_split_on(env, device_cap),
+        "no_k_split_requested": bool(parse_gate(env.get(ENV_NO_K_SPLIT))[0]),
         "sms_requested": sms_override(env),
         "sms_hw": None if hardware_sms is None else int(hardware_sms),
         "sms_effective": (
@@ -314,7 +350,7 @@ def format_switch_log(device_arch: str, census: dict) -> str:
     """The named log line, one per rank. Grep marker: ``[nan-49c] marlin``."""
     return (
         "[nan-49c] marlin switches: device_arch=%s arch_override=%s ptx_jit=%s "
-        "epilogue_sync=%s no_k_split=%s sms_hw=%s sms_effective=%s "
+        "epilogue_sync=%s no_k_split=%s(req=%s) sms_hw=%s sms_effective=%s "
         "sms_requested=%s smem_optin=%s(%s) arch_override_applied=%s(%s)"
         % (
             device_arch,
@@ -322,6 +358,7 @@ def format_switch_log(device_arch: str, census: dict) -> str:
             census["ptx_jit"],
             census["epilogue_sync"],
             census["no_k_split"],
+            census["no_k_split_requested"],
             census["sms_hw"],
             census["sms_effective"],
             census["sms_requested"],
@@ -331,3 +368,92 @@ def format_switch_log(device_arch: str, census: dict) -> str:
             census["arch_override_reason"],
         )
     )
+
+
+# --- Task #49 after fn8c6: the k-split census, computed at the desk ---------
+#
+# fn8c7 was about to be booted with SGLANG_MARLIN_NO_K_SPLIT=1 on the strength
+# of "GEMM2 is the one that splits". This function exists so that claim is a
+# NUMBER instead of a hope: it is a line-by-line mirror of `init_slice()` in
+# marlin_moe/marlin_template.h, so the same arithmetic that decides
+# `slice_count` inside the kernel can be run on a laptop.
+#
+# What it says for the fn8c6 shapes (Qwen3.8-Flash-Next: hidden 2560,
+# moe_intermediate 640, block_size_m 64 -> thread_m_blocks 4 -> the FIRST
+# large-batch config {thread_k 64, thread_n 256, 256 threads}):
+#
+#   GEMM1 gate_up  K=2560 N=1280  k_tiles=40 n_tiles=5
+#   GEMM2 down     K=640  N=2560  k_tiles=10 n_tiles=10
+#
+#   M=32850  5090 (170 blocks): GEMM1 iters=615 split_slices=296
+#                               GEMM2 iters=308 split_slices=272
+#            3080 ( 68 blocks): GEMM1 iters=1536 split_slices=108
+#                               GEMM2 iters=768  split_slices=108
+#
+# TWO conclusions, and the second one is the useful one:
+#
+#  (a) NO_K_SPLIT does what it claims: max_slice_count drops to 1 and
+#      split_slices to 0 for BOTH gemms, on both cards, for every M measured.
+#      fn8c7 is a valid arm.
+#  (b) but the k-split is NOT what distinguishes GEMM2 from GEMM1. Both split,
+#      in the same order of magnitude (296 vs 272 on the 5090). A mechanism
+#      present in equal measure in a GEMM that stays clean cannot be the
+#      explanation for the one that does not. It remains a real 5090-vs-3080
+#      asymmetry (2.5x more split slices, because 170 SMs instead of 68), so
+#      the arm is still worth one boot -- but it is no longer the leading
+#      hypothesis.
+
+
+def marlin_slice_census(k_tiles, n_tiles, parallel, blocks, no_k_split=False):
+    """Mirror of `init_slice()`: how many threadblocks co-operate per column.
+
+    ``parallel`` is the number of VALID moe blocks, ``blocks`` is gridDim.x
+    (= SM count x blocks_per_sm). Returns iters, the largest slice_count seen,
+    how many slices had slice_count > 1, and the full histogram.
+
+    Not a prediction of runtime behaviour -- purely the index arithmetic. It
+    does not model the shared-memory validity check that picks the thread
+    config, so the caller supplies k_tiles/n_tiles already derived."""
+    k_tiles, n_tiles = int(k_tiles), int(n_tiles)
+    parallel, blocks = int(parallel), int(blocks)
+    if min(k_tiles, n_tiles, parallel, blocks) <= 0:
+        raise ValueError("marlin_slice_census: all four arguments must be > 0")
+
+    def div_ceil(a, b):
+        return -(-a // b)
+
+    iters = div_ceil(k_tiles * n_tiles * parallel, blocks)
+    if no_k_split:
+        iters = k_tiles * div_ceil(iters, k_tiles)
+
+    hist = {}
+    max_sc = 1
+    split = 0
+    for bx in range(blocks):
+        slice_row = (iters * bx) % k_tiles
+        scp = (iters * bx) // k_tiles
+        while True:
+            si = iters * (bx + 1) - (k_tiles * scp + slice_row)
+            if si < 0 or scp >= n_tiles * parallel:
+                break
+            if slice_row + si > k_tiles:
+                si = k_tiles - slice_row
+            sc = 1
+            col_first = iters * div_ceil(k_tiles * scp, iters)
+            if col_first <= k_tiles * (scp + 1):
+                col_off = col_first - k_tiles * scp
+                sc = div_ceil(k_tiles - col_off, iters)
+                if col_off > 0:
+                    sc += 1
+            hist[sc] = hist.get(sc, 0) + 1
+            max_sc = max(max_sc, sc)
+            if sc > 1:
+                split += 1
+            slice_row = 0
+            scp += 1
+    return {
+        "iters": iters,
+        "max_slice_count": max_sc,
+        "slices_with_split": split,
+        "hist": hist,
+    }

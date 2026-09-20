@@ -25,7 +25,9 @@
 
 #include <sgl_kernel/scalar_type.hpp>
 
+#include <cstdio>
 #include <cstdlib>
+#include <cstring>
 
 #include "kernel.h"
 #include "marlin_template.h"
@@ -51,13 +53,65 @@ namespace device::marlin_moe {
 // Reading the environment here rather than in Python keeps the value on the
 // same side as the launch that consumes it; the Python wrapper logs the same
 // two names once per rank so a boot log can never show a switch it did not use.
-inline bool marlin_moe_no_k_split() {
-  static const bool value = [] {
-    const char* raw = std::getenv("SGLANG_MARLIN_NO_K_SPLIT");
-    if (raw == nullptr || raw[0] == '\0') return false;
-    return raw[0] == '1' || raw[0] == 't' || raw[0] == 'T' || raw[0] == 'y' || raw[0] == 'Y';
-  }();
-  return value;
+// SGLANG_MARLIN_NO_K_SPLIT -- accepts a bare truthy value, or a CAPABILITY
+// GATE spelled `1@12.0`.
+//
+// fn8c7 (2026-09-20) is why the gate exists. The switch was read from the
+// environment, which the launcher scopes per BOOT and not per RANK, so all
+// three ranks took the coarser grid. Only the 5090 has the defect; the two
+// 3080s run this form with `card free` between 0.17 and 0.37 GiB of 19.58 --
+// about one percent of headroom -- and fn8c7's TP1 died 20 s in with
+// `CUDA error: out of memory` in self_attention. The allocator numbers are
+// IDENTICAL to fn8c6's (peak 15.12 GiB, allocated 12.94, transient headroom
+// 2.18 on both), so the switch did not raise the demand; it changed the kernel
+// timing, and a form with one percent of margin does not survive having its
+// overlap window moved. Nothing here allocates per `iters` anyway: the lock
+// workspace is sized `sms * 4`, `c_tmp` from `sms * 4 * moe_block_size *
+// max_thread_n`, and `blocks` from `sms * blocks_per_sm` -- none of the three
+// sees the rounding.
+//
+// So: apply the switch on the card that has the defect, leave the others
+// bit-identical to the previous boot. Same shape as the arch-override gate.
+struct MarlinGate {
+  bool enabled;
+  int major;  // -1 = no capability gate
+  int minor;
+};
+
+inline MarlinGate marlin_parse_gate(const char* name) {
+  const char* raw = std::getenv(name);
+  MarlinGate g{false, -1, -1};
+  if (raw == nullptr || raw[0] == '\0') return g;
+  g.enabled = raw[0] == '1' || raw[0] == 't' || raw[0] == 'T' || raw[0] == 'y' || raw[0] == 'Y';
+  const char* at = std::strchr(raw, '@');
+  if (at != nullptr && at[1] != '\0') {
+    // "12.0" or "120"; a malformed gate DISABLES the switch rather than
+    // silently applying it everywhere -- fn8c7 is what "everywhere" costs.
+    int a = 0, b = -1;
+    if (std::sscanf(at + 1, "%d.%d", &a, &b) == 2) {
+      g.major = a;
+      g.minor = b;
+    } else if (std::sscanf(at + 1, "%d", &a) == 1 && a >= 10) {
+      g.major = a / 10;
+      g.minor = a % 10;
+    } else {
+      g.enabled = false;
+    }
+  }
+  return g;
+}
+
+inline bool marlin_moe_no_k_split(int dev) {
+  static const MarlinGate gate = marlin_parse_gate("SGLANG_MARLIN_NO_K_SPLIT");
+  if (!gate.enabled) return false;
+  if (gate.major < 0) return true;
+  int major = -1, minor = -1;
+  if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) != cudaSuccess ||
+      cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev) != cudaSuccess) {
+    // Cannot tell whose card this is -> do not change its behaviour.
+    return false;
+  }
+  return major == gate.major && minor == gate.minor;
 }
 
 // SGLANG_MARLIN_EPILOGUE_SYNC -- default ON (the fix). '0' removes the barrier
@@ -868,7 +922,7 @@ void marlin_mm(
       sorted_token_ids_ptr, expert_ids_ptr, num_tokens_past_padded_ptr,
       topk_weights_ptr, top_k, mul_topk_weights, is_ep, num_groups, prob_m,
       prob_n, prob_k, locks, has_bias, use_atomic_add, use_fp32_reduce, max_shared_mem,
-      marlin_moe_no_k_split(), marlin_moe_epilogue_sync());
+      marlin_moe_no_k_split(dev), marlin_moe_epilogue_sync());
   // clang-format on
 }
 

@@ -154,7 +154,33 @@ _STAGE_LOG_BUDGET = 24
 
 #: The four stages of one call, in dataflow order. Named here so the classifier
 #: and the report cannot disagree about the order.
-STAGE_ORDER = ("INPUT-A", "GEMM1", "ACT", "GEMM2")
+#: Task #49, after fn8c6. The walk gained a stage between ACT and GEMM2, and
+#: the reason is the whole finding of that boot.
+#:
+#: fn8c6 put the origin on GEMM2 and NOWHERE else: bad_A=0, bad_gemm1=0,
+#: bad_act=0, bad_gemm2=396 with transport GEMM2:PRODUCED-HERE, on the three
+#: eager wave-slice calls of TP0. So the question became: what does GEMM2
+#: consume that GEMM1 does not?
+#:
+#: Reading the two call sites, there are exactly three differences, and only
+#: one of them is DATA:
+#:   * ``size_k`` -- intermediate (640) instead of hidden (2560);
+#:   * ``top_k=1`` instead of ``topk``;
+#:   * ``mul_topk_weights=True`` instead of False.
+#:
+#: The third one is the only one that feeds a new TENSOR into the kernel.
+#: With it set, ``write_result`` does
+#: ``res = __hmul2(res, sh_block_topk_weights[row])`` per half2 -- and
+#: ``__hmul2`` of a finite product with a non-finite weight is non-finite. A
+#: NaN in ``topk_weights`` therefore lands in GEMM2's output while GEMM1,
+#: ACT and A stay provably clean: EXACTLY the fn8c6 pattern, with no kernel
+#: defect required.
+#:
+#: ``weights_scales_finite`` did not cover this: it checks the QUANTIZATION
+#: scales (w1_scale/w2_scale), never the ROUTER weights. That gap is why
+#: fn8c6 could report "finite weights and scales" next to a GEMM2 that
+#: produced NaN.
+STAGE_ORDER = ("INPUT-A", "ROUTER-W", "GEMM1", "ACT", "GEMM2")
 
 
 def _read_probe_level() -> int:
@@ -424,13 +450,21 @@ def _stage_probe_report(stages, weights_finite, M, topk, block_size_m) -> None:
             return
         _STAGE_LOGGED["n"] += 1
 
+        # Either call INPUT can be the source, so the transport comparison is
+        # against their union: a GEMM2 row whose router weight was already bad
+        # is transported, not produced, even though A itself was clean.
         in_mask = stages.get("INPUT-A")
+        rw_mask = stages.get("ROUTER-W")
+        if in_mask is not None and rw_mask is not None:
+            in_mask = in_mask | rw_mask
+        elif in_mask is None:
+            in_mask = rw_mask
         # Per-stage transport verdict against the CALL INPUT, which is the one
         # comparison that separates 'this kernel made it' from 'this kernel was
         # handed it'. Row identity holds: every stage here is indexed by the
         # same M token rows as hidden_states.
         transport = {}
-        for name in STAGE_ORDER[1:]:
+        for name in ("GEMM1", "ACT", "GEMM2"):
             m = stages.get(name)
             if m is None or in_mask is None:
                 transport[name] = "unmeasured"
@@ -440,18 +474,23 @@ def _stage_probe_report(stages, weights_finite, M, topk, block_size_m) -> None:
 
         logger.error(
             "[nan-probe-in] ORIGIN %s: M=%d topk=%d block_size_m=%d "
-            "bad_A=%d bad_gemm1=%d bad_act=%d bad_gemm2=%d "
+            "bad_A=%d bad_routerw=%d bad_gemm1=%d bad_act=%d bad_gemm2=%d "
             "transport=%s weights_scales_finite=%s "
-            "first_bad_A=%s first_bad_gemm1=%s first_bad_gemm2=%s "
-            "-- ENTERS-AT-INPUT-A means this GEMM was HANDED the NaN and the "
-            "Marlin kernel is exonerated for this call; ENTERS-AT-GEMM1/GEMM2 "
-            "with transport=PRODUCED-HERE means the kernel made it",
+            "first_bad_A=%s first_bad_routerw=%s first_bad_gemm1=%s "
+            "first_bad_gemm2=%s "
+            "-- ENTERS-AT-INPUT-A means this GEMM was HANDED the NaN; "
+            "ENTERS-AT-ROUTER-W means topk_weights carries it and GEMM2 only "
+            "multiplies it in (mul_topk_weights is GEMM2-only, so GEMM1 stays "
+            "clean -- the fn8c6 pattern WITHOUT a kernel defect); "
+            "ENTERS-AT-GEMM1/GEMM2 with transport=PRODUCED-HERE means the "
+            "kernel made it",
             origin, int(M), int(topk), int(block_size_m),
-            counts.get("INPUT-A", -1), counts.get("GEMM1", -1),
+            counts.get("INPUT-A", -1), counts.get("ROUTER-W", -1),
+            counts.get("GEMM1", -1),
             counts.get("ACT", -1), counts.get("GEMM2", -1),
             transport, weights_finite,
-            _first(stages.get("INPUT-A")), _first(stages.get("GEMM1")),
-            _first(stages.get("GEMM2")),
+            _first(stages.get("INPUT-A")), _first(stages.get("ROUTER-W")),
+            _first(stages.get("GEMM1")), _first(stages.get("GEMM2")),
         )
     except Exception as exc:  # noqa: BLE001 -- an instrument never kills a GEMM
         logger.debug("[nan-probe-in] stage report skipped: %s", exc)
@@ -731,6 +770,9 @@ def fused_marlin_moe(
     if _stage_on:
         try:
             _stage_masks["INPUT-A"] = _bad_rows(hidden_states)
+            # The ONE tensor GEMM2 consumes and GEMM1 does not. Folded to the M
+            # token rows so it lines up with every other stage of this report.
+            _stage_masks["ROUTER-W"] = _bad_rows(topk_weights.reshape(M, -1))
         except Exception as exc:  # noqa: BLE001
             logger.debug("[nan-probe-in] input scan skipped: %s", exc)
 
