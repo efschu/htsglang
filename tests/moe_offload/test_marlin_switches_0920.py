@@ -253,8 +253,10 @@ def test_census_and_log_line_name_every_switch():
         ENV_EPILOGUE_SYNC: "0",
         ENV_ARCH_OVERRIDE: "9.0",
     }
-    census = switch_census(170, env, smem_optin=101376)
+    census = switch_census(170, env, smem_optin=101376, device_cap=(12, 0))
     assert census == {
+        "arch_override_applied": True,
+        "arch_override_reason": "applies",
         "epilogue_sync": False,
         "no_k_split": True,
         "sms_requested": 68,
@@ -280,9 +282,89 @@ def test_census_and_log_line_name_every_switch():
 
 
 def test_log_line_on_a_default_boot_says_so():
-    line = format_switch_log("8.6", switch_census(68, {}, smem_optin=101376))
+    line = format_switch_log(
+        "8.6", switch_census(68, {}, smem_optin=101376, device_cap=(8, 6))
+    )
     assert "arch_override=None" in line
     assert "epilogue_sync=True" in line
     assert "no_k_split=False" in line
     assert "sms_hw=68 sms_effective=68" in line
     assert "smem_optin=101376(ok)" in line
+
+
+# --- fn8c4: the override must be a per-RANK decision, not a per-BOOT env ----
+
+
+def test_override_is_refused_on_a_device_older_than_its_ptx():
+    """fn8c4 died exactly here: both sm_86 ranks built compute_90 and hit
+    'no kernel image is available for execution on the device' at the first
+    Marlin launch. PTX is forward-compatible only."""
+    from sglang.jit_kernel.marlin_switches import arch_override_applies
+
+    ov = parse_arch_override("9.0")
+    assert arch_override_applies(ov, 12, 0) == (True, "applies")
+    ok, reason = arch_override_applies(ov, 8, 6)
+    assert ok is False and reason == "device-8.6-older-than-ptx-9.0"
+
+
+def test_override_is_refused_when_the_capability_is_unknown():
+    from sglang.jit_kernel.marlin_switches import arch_override_applies
+
+    assert arch_override_applies(parse_arch_override("9.0"), None, None) == (
+        False,
+        "device-capability-unknown",
+    )
+
+
+def test_no_override_is_never_applied():
+    from sglang.jit_kernel.marlin_switches import arch_override_applies
+
+    assert arch_override_applies(None, 12, 0) == (False, "unset")
+
+
+def test_explicit_gate_restricts_to_one_capability():
+    from sglang.jit_kernel.marlin_switches import arch_override_applies
+
+    ov = parse_arch_override("9.0@12.0")
+    assert ov.only_on == (12, 0)
+    assert arch_override_applies(ov, 12, 0) == (True, "applies")
+    assert arch_override_applies(ov, 8, 6) == (False, "gated-to-12.0")
+    # The gate wins even where the physical rule would allow it.
+    assert arch_override_applies(ov, 10, 0) == (False, "gated-to-12.0")
+
+
+def test_gate_junk_raises():
+    with pytest.raises(ValueError):
+        parse_arch_override("9.0@twelve")
+
+
+def test_gate_combines_with_the_ptx_suffix():
+    ov = parse_arch_override("9.0@12.0+noptx")
+    assert (ov.major, ov.minor, ov.ptx, ov.only_on) == (9, 0, False, (12, 0))
+
+
+def test_census_reports_applied_separately_from_requested():
+    """After fn8c4 'requested' and 'applied' are not allowed to be one field:
+    the boot log showed arch_override=9.0 ptx_jit=True on BOTH 3080 ranks,
+    which read like a working arm right up to the crash."""
+    env = {ENV_ARCH_OVERRIDE: "9.0"}
+    on5090 = switch_census(170, env, smem_optin=101376, device_cap=(12, 0))
+    on3080 = switch_census(68, env, smem_optin=101376, device_cap=(8, 6))
+    assert on5090["arch_override"] == on3080["arch_override"] == "9.0"
+    assert on5090["arch_override_applied"] is True
+    assert on3080["arch_override_applied"] is False
+    assert on3080["ptx_jit"] is False
+    assert "older-than-ptx" in on3080["arch_override_reason"]
+    line = format_switch_log("8.6", on3080)
+    assert "arch_override_applied=False(device-8.6-older-than-ptx-9.0)" in line
+
+
+def test_ptx_flag_is_what_the_fn8c4_build_actually_used():
+    """The flag pair verified by hand against the real cache entry
+    /root/.cache/tvm-ffi/...__cuda_arch_9.0__.../build.ninja after fn8c4:
+    -gencode=arch=compute_90,code=sm_90 (from TVM_FFI_CUDA_ARCH_LIST) plus the
+    one this module adds. cuobjdump -lptx on that .so listed a sm_90 PTX
+    section, so the fatbin was NOT the failure -- the 3080 ranks were."""
+    assert arch_override_cuda_cflags(parse_arch_override("9.0")) == [
+        "-gencode=arch=compute_90,code=compute_90"
+    ]

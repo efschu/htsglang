@@ -96,6 +96,9 @@ class ArchOverride(NamedTuple):
     minor: int
     suffix: str
     ptx: bool
+    #: ``None`` = no explicit gate; otherwise (major, minor) of the ONE device
+    #: capability this override may be applied on.
+    only_on: Optional[tuple] = None
 
     @property
     def target_name(self) -> str:
@@ -105,6 +108,51 @@ class ArchOverride(NamedTuple):
     @property
     def virtual_arch(self) -> str:
         return f"compute_{self.major}{self.minor}{self.suffix}"
+
+
+def arch_override_applies(
+    override: Optional[ArchOverride],
+    device_major: Optional[int],
+    device_minor: Optional[int],
+):
+    """May this override be applied to THIS process's device? (bool, reason).
+
+    fn8c4 (2026-09-20) is why this function exists. The switch was read from the
+    environment, which the launcher scopes per BOOT and not per RANK, so all
+    three ranks built the Marlin module for compute_90. On TP0 (sm_120) that is
+    exactly the intended A/B. On TP1/TP2 (sm_86) it is impossible: PTX is
+    forward-compatible ONLY, so a compute_90 PTX image cannot be JITted for a
+    capability below 9.0 and there is no sm_86 cubin in the fatbin either. Both
+    3080 ranks died at the first Marlin launch with "no kernel image is
+    available for execution on the device" (moe_wna16_marlin.cuh:864) and the
+    boot never reached /health -- a dead boot, not a measurement.
+
+    Two guards, and the first one is a law rather than a configuration:
+
+      * a device strictly OLDER than the override's virtual architecture can
+        never run its PTX. Refuse there, always, and say so in the log.
+      * an optional explicit gate, spelled ``9.0@12.0``, restricts the override
+        to exactly one capability. Use it when an A/B must touch one card even
+        though several could technically run the image.
+
+    ``device_major``/``device_minor`` of None means the capability could not be
+    resolved; the override is then NOT applied, because guessing here is how
+    fn8c4 lost its boot."""
+    if override is None:
+        return False, "unset"
+    if device_major is None or device_minor is None:
+        return False, "device-capability-unknown"
+    dev = (int(device_major), int(device_minor))
+    if override.only_on is not None and dev != tuple(override.only_on):
+        return False, "gated-to-%d.%d" % tuple(override.only_on)
+    if dev < (override.major, override.minor):
+        # The fn8c4 killer, named rather than re-discovered.
+        return False, "device-%d.%d-older-than-ptx-%s" % (
+            dev[0],
+            dev[1],
+            override.target_name,
+        )
+    return True, "applies"
 
 
 # The only suffixes nvcc knows are 'a' (arch-specific, sm_90a/sm_100a/sm_120a)
@@ -148,6 +196,20 @@ def parse_arch_override(raw: Optional[str]) -> Optional[ArchOverride]:
     elif low.endswith("+ptx"):
         ptx, body = True, raw[: -len("+ptx")]
 
+    # '9.0@12.0' -- build for compute_90, but ONLY on a device that reports
+    # capability 12.0. See `arch_override_applies` for why this exists.
+    only_on = None
+    if "@" in body:
+        body, gate = body.split("@", 1)
+        gm = _ARCH_RE.match(gate.strip().lower())
+        if gm is None:
+            raise ValueError(
+                f"{ENV_ARCH_OVERRIDE}={raw!r}: the part after '@' must be a CUDA "
+                "capability such as '12.0' -- it names the ONE device this "
+                "override may be applied on."
+            )
+        only_on = (int(gm.group(1)), int(gm.group(2)))
+
     m = _ARCH_RE.match(body.strip().lower())
     if m is None:
         raise ValueError(
@@ -161,7 +223,9 @@ def parse_arch_override(raw: Optional[str]) -> Optional[ArchOverride]:
             f"{ENV_ARCH_OVERRIDE}={raw!r}: Marlin needs sm_80 or newer; the "
             "pre-Ampere stub compiles to an empty kernel."
         )
-    return ArchOverride(major=major, minor=minor, suffix=suffix, ptx=ptx)
+    return ArchOverride(
+        major=major, minor=minor, suffix=suffix, ptx=ptx, only_on=only_on
+    )
 
 
 def arch_override_from_env(env=None) -> Optional[ArchOverride]:
@@ -216,10 +280,22 @@ def switch_census(
     hardware_sms: Optional[int] = None,
     env=None,
     smem_optin: Optional[int] = None,
+    device_cap: Optional[tuple] = None,
 ) -> dict:
-    """Everything the one-shot log line needs, as plain data (testable)."""
+    """Everything the one-shot log line needs, as plain data (testable).
+
+    ``device_cap`` is this process's REAL (major, minor). Without it the arch
+    override can only be reported as requested, never as applied -- and after
+    fn8c4 those two are not allowed to be the same field."""
     override = arch_override_from_env(env)
+    applied, reason = arch_override_applies(
+        override,
+        None if device_cap is None else device_cap[0],
+        None if device_cap is None else device_cap[1],
+    )
     return {
+        "arch_override_applied": applied,
+        "arch_override_reason": reason,
         "smem_optin": None if smem_optin is None else int(smem_optin),
         "smem_optin_verdict": smem_optin_verdict(smem_optin),
         "epilogue_sync": epilogue_sync_on(env),
@@ -230,7 +306,7 @@ def switch_census(
             None if hardware_sms is None else effective_sms(hardware_sms, env)
         ),
         "arch_override": None if override is None else override.target_name,
-        "ptx_jit": bool(override is not None and override.ptx),
+        "ptx_jit": bool(applied and override is not None and override.ptx),
     }
 
 
@@ -239,7 +315,7 @@ def format_switch_log(device_arch: str, census: dict) -> str:
     return (
         "[nan-49c] marlin switches: device_arch=%s arch_override=%s ptx_jit=%s "
         "epilogue_sync=%s no_k_split=%s sms_hw=%s sms_effective=%s "
-        "sms_requested=%s smem_optin=%s(%s)"
+        "sms_requested=%s smem_optin=%s(%s) arch_override_applied=%s(%s)"
         % (
             device_arch,
             census["arch_override"],
@@ -251,5 +327,7 @@ def format_switch_log(device_arch: str, census: dict) -> str:
             census["sms_requested"],
             census["smem_optin"],
             census["smem_optin_verdict"],
+            census["arch_override_applied"],
+            census["arch_override_reason"],
         )
     )

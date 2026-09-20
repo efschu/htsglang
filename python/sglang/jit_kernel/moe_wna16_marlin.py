@@ -5,8 +5,10 @@ from typing import TYPE_CHECKING, Optional
 import torch
 
 import logging
+import os
 
 from sglang.jit_kernel.marlin_switches import (
+    arch_override_applies,
     arch_override_cuda_cflags,
     arch_override_from_env,
     format_switch_log,
@@ -47,9 +49,13 @@ def _log_marlin_switches(device) -> None:
         props = torch.cuda.get_device_properties(device)
         sms = props.multi_processor_count
         smem = getattr(props, "shared_memory_per_block_optin", None)
+        cap = (props.major, props.minor)
         arch = get_jit_cuda_arch().target_name
         logger.error(
-            "%s", format_switch_log(arch, switch_census(sms, smem_optin=smem))
+            "%s",
+            format_switch_log(
+                arch, switch_census(sms, smem_optin=smem, device_cap=cap)
+            ),
         )
     except Exception as exc:  # noqa: BLE001 -- an instrument never kills a GEMM
         logger.debug("[nan-49c] marlin switch log skipped: %s", exc)
@@ -59,6 +65,22 @@ def _log_marlin_switches(device) -> None:
 def _jit_moe_wna16_marlin_module(dtype: torch.dtype) -> Module:
     args = make_cpp_args(dtype)
     override = arch_override_from_env()
+
+    # fn8c4 (2026-09-20) died here: the env is scoped per BOOT, not per RANK, so
+    # both sm_86 ranks also built the module for compute_90 and hit "no kernel
+    # image is available for execution on the device" at the first launch. The
+    # decision is a property of THIS process's card, never of the environment
+    # alone -- so resolve the real capability and let arch_override_applies say
+    # yes or no, with a reason that lands in the per-rank log line.
+    dev_arch = get_jit_cuda_arch()
+    applies, reason = arch_override_applies(override, dev_arch.major, dev_arch.minor)
+    if override is not None and not applies:
+        logger.error(
+            "[nan-49c] marlin arch override NOT applied on this rank: "
+            "requested=%s device=%s reason=%s -- building natively instead",
+            override.target_name, dev_arch.target_name, reason,
+        )
+        override = None
 
     def _build():
         return load_jit(
@@ -94,7 +116,43 @@ def _jit_moe_wna16_marlin_module(dtype: torch.dtype) -> Module:
     # building for the real device, which is what keeps the A/B pointed at
     # Marlin instead of at the whole runtime.
     with override_jit_cuda_arch(override.major, override.minor, override.suffix):
-        return _build()
+        module = _build()
+    _log_override_artefact(override, args)
+    return module
+
+
+def _log_override_artefact(override, args=None) -> None:
+    """Prove the module this rank LOADED actually carries PTX the driver can JIT.
+
+    The coordinator's question after fn8c4 -- 'is a cubin or a fatbin with PTX
+    built and loaded?' -- had to be answered by hand with cuobjdump against the
+    cache directory. Answered once, it stays answered only if the boot answers
+    it itself, so the check is an instrument now. Best effort: a missing
+    cuobjdump reports 'unknown', never a false 'yes'."""
+    import glob
+    import subprocess
+
+    try:
+        cache = os.environ.get("TVM_FFI_CACHE_DIR", "~/.cache/tvm-ffi")
+        hits = glob.glob(os.path.join(os.path.expanduser(cache), "*arch_%s__*" % override.target_name, "*.so"))
+        so = max(hits, key=os.path.getmtime) if hits else None
+        ptx = "unknown"
+        if so:
+            try:
+                out = subprocess.run(
+                    ["cuobjdump", "-lptx", so], capture_output=True, timeout=30
+                ).stdout.decode("utf-8", "replace")
+                ptx = [l.split(":")[-1].strip() for l in out.splitlines() if "PTX file" in l] or "NONE"
+            except Exception:  # noqa: BLE001 -- cuobjdump may not be on PATH
+                ptx = "unknown"
+        logger.error(
+            "[nan-49c] marlin arch override APPLIED: target=%s so=%s ptx_sections=%s "
+            "-- 'NONE' means the fatbin has no PTX and the driver cannot JIT it; "
+            "that is the fn8c4 death mode and the arm is invalid",
+            override.target_name, so, ptx,
+        )
+    except Exception as exc:  # noqa: BLE001 -- an instrument never kills a build
+        logger.debug("[nan-49c] arch override artefact log skipped: %s", exc)
 
 
 def _or_empty(
