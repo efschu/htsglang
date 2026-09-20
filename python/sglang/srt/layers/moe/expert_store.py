@@ -101,10 +101,18 @@ def write_rows(
         return rows
     locals_ = list(rows.keys())
     dst = torch.as_tensor([rows[e] for e in locals_], dtype=torch.long)
-    src_idx = torch.as_tensor(locals_, dtype=torch.long, device=src.device)
-    picked = src.index_select(0, src_idx)
-    if picked.device.type != "cpu":
-        picked = picked.to("cpu")
+    # NO device-side gather: fn8m (20.09.) showed the index_select copies of
+    # every layer's expert tensors staying RESERVED in the caching allocator
+    # (+1.9 GiB on the x4 3080), which the KV sizer then read as used and
+    # the first 8k chunk OOMed on. Move the rows through the host instead.
+    if locals_ == list(range(len(locals_))) and len(locals_) == int(src.shape[0]):
+        picked = src.to("cpu")  # every local row, in order: one D2H, no device alloc
+    elif src.device.type == "cpu":
+        picked = src[torch.as_tensor(locals_, dtype=torch.long)]
+    else:
+        picked = torch.empty((len(locals_),) + tuple(src.shape[1:]), dtype=src.dtype)
+        for j, e in enumerate(locals_):
+            picked[j].copy_(src[e])
     store.index_copy_(0, dst, picked.to(store.dtype))
     return rows
 

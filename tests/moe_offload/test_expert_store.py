@@ -42,3 +42,11 @@ def test_store_is_off_without_the_env(monkeypatch):
 
 def test_unsharded_layer_maps_local_to_global_identity():
     assert es.global_rows([0, 1, 2], lo=0, pad=False) == {0: 0, 1: 1, 2: 2}
+
+
+def test_write_rows_partial_ids_take_the_per_row_path(tmp_path):
+    src = torch.arange(5 * 4, dtype=torch.float32).reshape(5, 4)
+    s, _ = es.open_store(str(tmp_path), "L0", "w2", 10, (4,), torch.float32, register=False)
+    rows = es.write_rows(s, src, [1, 3], lo=6)
+    assert rows == {1: 6, 3: 8}
+    assert torch.equal(s[6], src[1]) and torch.equal(s[8], src[3]) and float(s[7].abs().sum()) == 0.0
