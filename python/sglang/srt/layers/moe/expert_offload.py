@@ -3938,14 +3938,26 @@ class MoEExpertOffloadCache:
             # the graph, and the real plan below sees them as ordinary hits.
             self._pool_pf_armed = False
             torch.cuda.current_stream().wait_event(self._pool_pf_done)
-        step(self._pool_tables, flat, self._pool_buffers)
-        copy_rows(
-            self._pool_srcs,
-            self._pool_dsts,
-            self._pool_buffers.gather_src,
-            self._pool_buffers.gather_dst,
-            self._pool_buffers.gather_count,
-        )
+        # 20.09. (fn8u, Task #52): the pool step and the row fetch are timed
+        # as their own clock families, so a decode round's split names the
+        # host->device expert traffic apart from compute and collectives.
+        # Outside a capture/round the span costs one attribute read.
+        from contextlib import nullcontext
+
+        from sglang.srt.utils.collective_clock import collective_clock
+
+        clock = collective_clock()
+        armed = clock.armed
+        with clock.span("pool.step") if armed else nullcontext():
+            step(self._pool_tables, flat, self._pool_buffers)
+        with clock.span("pool.fetch") if armed else nullcontext():
+            copy_rows(
+                self._pool_srcs,
+                self._pool_dsts,
+                self._pool_buffers.gather_src,
+                self._pool_buffers.gather_dst,
+                self._pool_buffers.gather_count,
+            )
         routes = self._pool_buffers.routes[: bs * k].view(bs, k)
         return routes if routes.dtype == topk_ids.dtype else routes.to(topk_ids.dtype)
 
