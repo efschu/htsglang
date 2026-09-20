@@ -195,6 +195,66 @@ def marlin_stage_probe_on() -> bool:
     return marlin_probe_level() >= 2
 
 
+_CAPTURE_LOGGED = {"done": False}
+
+
+def _capture_active() -> bool:
+    """Is this thread currently recording into a CUDA graph?
+
+    Wrapped, and a failure to answer counts as YES. Under capture the only safe
+    answer is 'do not measure': a probe that cannot tell must not gamble with
+    the boot."""
+    try:
+        if not _is_cuda or not torch.cuda.is_available():
+            return False
+        return bool(torch.cuda.is_current_stream_capturing())
+    except Exception:  # noqa: BLE001
+        return True
+
+
+def marlin_stage_probe_active() -> bool:
+    """The level-2 probe, gated on CUDA-graph capture. fn8c5 is why.
+
+    Every number the stage walk produces needs a DEVICE-TO-HOST SYNC --
+    `_n()` is `.item()`, `_first()` is `.tolist()`, `_weights_scales_finite()`
+    is `.item()`. None of those may run while a CUDA graph is being recorded.
+    fn8c5 (2026-09-20) proved it the expensive way: all three ranks died in
+    `decode_cuda_graph_runner.capture_one_shape` ->
+    `full_cuda_graph_backend.capture_one` -> `graphs.py capture_end` with
+    `cudaErrorStreamCaptureInvalidated` ("operation failed due to a previous
+    error during capture", first at log line 1427), the boot never reached
+    /health, and the probe emitted ZERO ORIGIN lines -- a dead boot instead of
+    a measurement.
+
+    Level 1 never had this defect because `_c_probe_report` opens with exactly
+    this check; the level-2 path simply did not inherit it.
+
+    Losing the captured decode path costs nothing here: all three originating
+    calls of fn8c2 are eager prefill (EXTEND / wave-slice, `topk=1` on TP0),
+    and a captured decode replay is the same recorded kernel sequence every
+    time -- there is nothing for a per-call probe to discover in it.
+
+    Logged once per process so a boot can never mistake 'measured and clean'
+    for 'never measured'."""
+    if not marlin_stage_probe_on():
+        return False
+    if not _capture_active():
+        return True
+    if not _CAPTURE_LOGGED["done"]:
+        _CAPTURE_LOGGED["done"] = True
+        try:
+            logger.error(
+                "[nan-probe-in] UNMEASURED-UNDER-CAPTURE: the stage walk is a "
+                "no-op while a CUDA graph is recording (every stage count needs "
+                "a device-to-host sync, which invalidates the capture -- fn8c5). "
+                "Absence of ORIGIN lines for captured decode is NOT evidence of "
+                "a clean decode; the probe covers the eager prefill only."
+            )
+        except Exception:  # noqa: BLE001
+            pass
+    return False
+
+
 # The #49 boots reset `_C_SENTINEL["on"]` to re-read the switch; keep the two
 # memos independent so neither can shadow the other (see `_read_probe_level`).
 
@@ -349,6 +409,12 @@ def _stage_probe_report(stages, weights_finite, M, topk, block_size_m) -> None:
     :data:`_STAGE_LOG_BUDGET` findings of the process -- the residual poisoning
     repeats the same finding hundreds of times and the first few carry all of
     it."""
+    # Defence in depth behind `marlin_stage_probe_active()`: this function is
+    # where every device-to-host sync actually happens, so it refuses to touch
+    # a mask at all while a graph is recording -- even if a future caller
+    # forgets the gate. fn8c5 cost a boot to this.
+    if _capture_active():
+        return
     try:
         counts = {k: _n(v) for k, v in stages.items()}
         origin = classify_nonfinite_origin(counts)
@@ -658,7 +724,11 @@ def fused_marlin_moe(
     # Task #49 level 2: the call's INPUT, measured BEFORE the first GEMM runs.
     # This is the single number the fn8ar/fn8c2 verdict could not produce.
     _stage_masks = {}
-    if marlin_stage_probe_on():
+    # Decided ONCE per call: a half-measured call would report
+    # UNMEASURED-AT-<stage> for a stage that was simply skipped later, which is
+    # noise dressed as a finding. Under capture this is False for every site.
+    _stage_on = marlin_stage_probe_active()
+    if _stage_on:
         try:
             _stage_masks["INPUT-A"] = _bad_rows(hidden_states)
         except Exception as exc:  # noqa: BLE001
@@ -720,7 +790,7 @@ def fused_marlin_moe(
         is_zp_float=False,
     )
 
-    if marlin_stage_probe_on():
+    if _stage_on:
         try:
             # GEMM1 writes [M*topk, gemm1_n]; fold back to the M token rows so
             # every stage of this report is indexed the same way.
@@ -760,7 +830,7 @@ def fused_marlin_moe(
     else:
         raise ValueError(f"Unsupported activation: {activation=}, with {is_gated=}")
 
-    if marlin_stage_probe_on():
+    if _stage_on:
         try:
             _act = _bad_rows(intermediate_cache2.view(-1, intermediate_cache2.shape[-1]))
             _stage_masks["ACT"] = _act.reshape(M, topk).any(dim=1)
@@ -812,7 +882,7 @@ def fused_marlin_moe(
             output,
             routed_scaling_factor,
         )
-        if marlin_stage_probe_on():
+        if _stage_on:
             try:
                 _g2 = _bad_rows(intermediate_cache3.reshape(-1, K))
                 _stage_masks["GEMM2"] = _g2.reshape(M, topk).any(dim=1)
