@@ -271,6 +271,8 @@ def _refuse_stray_host_index(pool, index, op: str) -> None:
 
 from sglang.srt.mem_cache.pool_host import HostKVCache
 from sglang.srt.mem_cache.pool_host.base import (
+    fixed_host_pool_slots,
+    fixed_host_pool_tokens,
     _WRITE_BACK_STAGING_PAGE_CHUNK,
     HICACHE_HOST_MEMORY_RESERVE_BYTES,
     sync_fixed_hicache_size,
@@ -439,13 +441,13 @@ class MambaPoolHost(HostKVCache):
             # count (each rank still allocates its own per-rank-sized buffer
             # for it). The local count travels on the provenance line as
             # synced_from_local= so the binding rank is legible in the log.
-            _local_slots = int(anchor_host_mib) * (1024**2) // self.size_per_token
+            _local_slots = fixed_host_pool_slots(int(anchor_host_mib) * (1024**2), self.size_per_token)
             self.size = sync_fixed_hicache_size(_local_slots, int(anchor_host_mib))
             _synced_suffix = f" synced_from_local={_local_slots}"
         elif host_size > 0:
             _size_source = f"--hicache-size={host_size}"
             self.size = sync_fixed_hicache_size(
-                int(host_size * 1e9 // self.size_per_token), host_size
+                fixed_host_pool_tokens(host_size, self.size_per_token), host_size
             )
         else:
             # The multiple, not the product, is the policy: it stays correct if

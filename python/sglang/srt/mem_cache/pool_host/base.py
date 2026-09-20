@@ -97,6 +97,34 @@ def sync_fixed_hicache_size(size: int, host_size: int) -> int:
     return synced_size
 
 
+#: A rank with 0 bytes/token (a Form A expert worker: no attention layer,
+#: fnFL2 v12 20.09.) offers this many tokens to the min-reduce so the group
+#: settles on the attention host's capacity; its own buffer is 0 bytes.
+NO_KV_RANK_TOKENS = 1 << 40
+
+
+def fixed_host_pool_tokens(host_size: float, size_per_token: int) -> int:
+    """Tokens a fixed ``--hicache-size`` budget (GB) buys on THIS rank.
+
+    ``size_per_token == 0`` is a rank that holds no KV at all (Form A expert
+    worker); ``//`` by zero killed TP1/TP2 at the HiCache host pool (fnFL2
+    v12). Such a rank must still join ``sync_fixed_hicache_size`` (one slot
+    count per lockstep group), so it bids NO_KV_RANK_TOKENS and allocates
+    ``size * 0`` bytes.
+    """
+    if size_per_token <= 0:
+        return NO_KV_RANK_TOKENS
+    return int(host_size * 1e9 // size_per_token)
+
+
+def fixed_host_pool_slots(budget_bytes: int, size_per_slot: int) -> int:
+    """Slots a fixed byte budget buys on this rank (mamba anchor pool,
+    --hicache-mamba-host-mib); a rank without GDN state bids the sentinel."""
+    if size_per_slot <= 0:
+        return NO_KV_RANK_TOKENS
+    return int(budget_bytes) // int(size_per_slot)
+
+
 def synchronized(func):
     @wraps(func)
     def wrapper(self, *args, **kwargs):
@@ -141,7 +169,7 @@ class HostKVCache(abc.ABC):
         self.size_per_token = self.get_size_per_token()
         if host_size > 0:
             self.size = sync_fixed_hicache_size(
-                int(host_size * 1e9 // self.size_per_token), host_size
+                fixed_host_pool_tokens(host_size, self.size_per_token), host_size
             )
         else:
             self.size = int(device_pool.size * host_to_device_ratio)
