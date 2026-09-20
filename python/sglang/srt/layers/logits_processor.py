@@ -373,6 +373,17 @@ class LogitsProcessor(nn.Module):
         self.logit_scale = logit_scale
         self.use_attn_tp_group = get_server_args().enable_dp_lm_head
         self.use_fp32_lm_head = get_server_args().enable_fp32_lm_head
+        # FORM A (F13): the logits all-gather is the vocab-sharding twin of
+        # the per-layer dense collectives F12 silences. Under
+        # `--rank-role host,worker,worker` the lm_head is built unsharded on
+        # the host (models/qwen3_vl.py) and does not exist at all on the
+        # workers, so there are no shards to gather and the workers never
+        # reach this module -- issuing the gather anyway is the same hang
+        # F12 describes, one op later. False on every classic boot.
+        from sglang.srt.rank_role import form_a_dense_is_unsharded
+
+        if form_a_dense_is_unsharded():
+            skip_all_gather = True
         if self.use_attn_tp_group:
             self.attn_tp_size = get_parallel().attn_tp_size
             self.do_tensor_parallel_all_gather = (

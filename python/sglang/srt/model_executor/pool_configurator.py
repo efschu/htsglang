@@ -169,6 +169,14 @@ def solo_draft_kv_cell_factor(mr: ModelRunner) -> float:
             ratio_r = int(ratios[dcp_rank])
             if ratio_r > 0:
                 factor *= cp_token_split_factor(dcp_size) / ratio_r
+            else:
+                # FORM A (F4): this rank owns no context tokens -- the
+                # attention host holds the whole KV. There is no token-axis
+                # correction to make because there is no pool here to
+                # correct. Falling through with factor unchanged (what this
+                # branch did before it existed) would scale a draft-KV cell
+                # for a pool that does not exist, and say nothing.
+                return 0.0
     elif dcp_size > 1:
         factor *= float(dcp_size)
     # (b) head-axis share: the solo draft keeps all kv heads. When the target

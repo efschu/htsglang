@@ -794,7 +794,18 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
             if quant_config and quant_config.get_name() == "modelopt_fp4"
             else quant_config
         )
-        self.linear_attn = Qwen3_5GatedDeltaNet(
+        # FORM A (F3, construction half -- slice 6a): a worker rank holds
+        # experts and its router and nothing else. The GDN block is the
+        # single biggest dense post per layer after the mixer, and building
+        # it on a worker does two bad things at once: it allocates the
+        # tensors the loader veto already refused to fill, and its shard
+        # width is 0 there, which is what the F11 backstop fires on. Inert
+        # on a classic boot (no role plan installed -> skip_on_worker is
+        # None), so the default path constructs exactly as before.
+        from sglang.srt.form_a_construction import skip_on_worker
+
+        _la_ph = skip_on_worker("linear_attn", prefix)
+        self.linear_attn = _la_ph if _la_ph is not None else Qwen3_5GatedDeltaNet(
             config, layer_id, linear_attn_quant_config, alt_stream, prefix
         )
 
@@ -1087,7 +1098,17 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             else quant_config
         )
 
-        self.qkv_proj = QKVParallelLinear(
+        # FORM A (F3, construction half -- slice 6a): qkv_proj / o_proj /
+        # attn are the attention host's alone. On a worker each of them
+        # would be built with shard width 0 (the F11 backstop), and `attn`
+        # additionally registers a layer with the KV pool a worker does not
+        # have (F4). All three are skipped together, because a half-built
+        # attention block is worse than none: it would pass construction
+        # and fail at the first forward with a shape.
+        from sglang.srt.form_a_construction import skip_on_worker
+
+        _qkv_ph = skip_on_worker("self_attn", add_prefix("qkv_proj", prefix))
+        self.qkv_proj = _qkv_ph if _qkv_ph is not None else QKVParallelLinear(
             config.hidden_size,
             self.head_dim,
             self.total_num_heads * (1 + self.attn_output_gate),
@@ -1106,7 +1127,8 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             q_shard_groups=self._attn_q_groups,
         )
 
-        self.o_proj = RowParallelLinear(
+        _o_ph = skip_on_worker("o_proj", add_prefix("o_proj", prefix))
+        self.o_proj = _o_ph if _o_ph is not None else RowParallelLinear(
             self.total_num_heads * self.head_dim,
             config.hidden_size,
             bias=False,
@@ -1125,7 +1147,8 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             tp_q_groups=self._attn_q_groups,
         )
 
-        self.attn = RadixAttention(
+        _attn_ph = skip_on_worker("self_attn", f"{prefix}.attn")
+        self.attn = _attn_ph if _attn_ph is not None else RadixAttention(
             self.num_heads,
             self.head_dim,
             self.scaling,

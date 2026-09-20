@@ -482,6 +482,18 @@ def _parse_rank_moe_resident_fraction(value: str) -> List[float]:
     return [float(part.strip()) for part in value.split(",") if part.strip()]
 
 
+def _parse_rank_role(value: str) -> List[str]:
+    """Parse --rank-role: one of 'host'/'worker' per rank (Form A).
+
+    Delegates to `rank_role.parse_rank_roles` so the flag and the runtime
+    share ONE definition of what a role is -- a second spelling here is how
+    the two come to disagree about which rank computes attention.
+    """
+    from sglang.srt.rank_role import parse_rank_roles
+
+    return list(parse_rank_roles(value))
+
+
 def _parse_rank_vocab_ratio(value: str) -> Union[str, List[int]]:
     """Parse --rank-vocab-ratio: 'auto' or a comma-separated integer list."""
     if value.strip() == "auto":
@@ -2582,6 +2594,31 @@ class ServerArgs:
             "Pure tensor parallelism only: combining it with --pp-size > 1 "
             "is rejected, not silently applied.",
             type_parser=_parse_rank_tp_ratio,
+        ),
+    ] = None
+    rank_role: A[
+        Optional[List[str]],
+        Arg(
+            help="FORM A (attention-host layout): comma-separated roles, one "
+            "per rank, each 'host' or 'worker'. Exactly one rank may be the "
+            "host. Example for one 5090 plus two 3080s: "
+            "--rank-role host,worker,worker. "
+            "The HOST runs every dense part of the model (attention and the "
+            "QSA indexer, GDN/linear attention, o_proj, the hyper-connection "
+            "mixer, norms, embeddings, PLE, lm_head), holds the whole KV "
+            "cache for the full context, the GDN recurrent states, the "
+            "speculative draft and the CUDA graphs, plus its own share of "
+            "the MoE experts. A WORKER holds its own experts and NOTHING "
+            "else: it computes them for the rows the host broadcasts and "
+            "sends the partial sums back. "
+            "This flag is what makes a ZERO in --rank-tp-ratio legible as a "
+            "LAYOUT rather than an arithmetic accident: a zero is admitted "
+            "only for a rank this flag names a worker, and every worker must "
+            "have one. Without --rank-role, --rank-tp-ratio entries must "
+            "still be positive, unchanged. "
+            "Requires an explicit --rank-tp-ratio; pure single-node tensor "
+            "parallelism only.",
+            type_parser=_parse_rank_role,
         ),
     ] = None
     rank_auto_reserve_mib: A[
@@ -10872,6 +10909,81 @@ class ServerArgs:
                 )
             logger.info("%s", demand.ledger(card))
 
+    def form_a_role_plan(self):
+        """The Form A role plan (`rank_role.RankRolePlan`), or None.
+
+        The ONE accessor: everything downstream that needs to know which
+        rank is the attention host asks here rather than re-reading the raw
+        flag, so "is this a Form A boot" has a single answer.
+        """
+        if not self.rank_role:
+            return None
+        from sglang.srt.rank_role import RankRolePlan
+
+        return RankRolePlan(tuple(self.rank_role))
+
+    def form_a_active(self) -> bool:
+        """True when this boot is the attention-host layout."""
+        return bool(self.rank_role)
+
+    def _validate_rank_role_plan(self) -> None:
+        """--rank-role x --rank-tp-ratio: the two must say the same thing.
+
+        Called only when --rank-role is set. The zero-admission above has
+        already happened, so this is where a vector that is arithmetically
+        legal but says the wrong thing gets caught -- a worker carrying a
+        dense share would load dense weights onto a card Form A budgeted for
+        experts alone, and the first sign of it is an OOM on a 3080.
+        """
+        from sglang.srt.rank_role import RankRoleError, RankRolePlan
+
+        try:
+            plan = RankRolePlan(tuple(self.rank_role))
+        except RankRoleError as e:
+            raise ValueError(f"--rank-role: {e}") from e
+        if len(self.rank_role) != self.tp_size:
+            raise ValueError(
+                f"--rank-role has {len(self.rank_role)} entries but "
+                f"--tp-size is {self.tp_size}; one role per rank."
+            )
+        try:
+            plan.check_dense_ratio(self.rank_tp_ratio)
+        except RankRoleError as e:
+            raise ValueError(str(e)) from e
+        # FORM A x the DRAFT. Same load-bearing condition, and for the same
+        # reason, as --weightless-kv-fastlane's (see
+        # _handle_weightless_kv_fastlane): 'split' placement runs a SHARDED
+        # draft forward on every rank, with its own per-layer collectives
+        # and -- for an MTP draft -- its own MoE combine. A Form A worker
+        # holds no draft weights at all (the loader veto rejects every
+        # `mtp.*` name), so its draft phase would have to be invented, and
+        # the host would block in a second model's collectives exactly the
+        # way seam F12 describes for the first.
+        #
+        # Note the standing rule this sits against (memory
+        # `draft-zuordnung-27b-dflash2-nextflash-mtp`, user order 19.09.):
+        # every draft is SHARDED, and solo is "nur ein explizites Opt-in
+        # fuer A/B, nie Default, nie Vorschlag". This is that explicit
+        # opt-in and nothing wider: it is required only when --rank-role is
+        # set, i.e. only in the layout whose entire premise is that the
+        # dense side -- draft included -- lives on one card.
+        if (
+            getattr(self, "speculative_algorithm", None) is not None
+            and getattr(self, "speculative_draft_placement", "split") != "solo"
+        ):
+            raise ValueError(
+                "--rank-role (Form A) requires --speculative-draft-placement "
+                "solo when speculative decoding is on (got "
+                f"'{getattr(self, 'speculative_draft_placement', 'split')}'). "
+                "Under Form A the draft is UNSHARDED on rank "
+                f"{plan.host_rank}: the worker ranks hold no draft weights, "
+                "no draft KV pool and no draft backends, so they cannot join "
+                "a split draft forward, and the host would hang in the "
+                "draft's own per-layer collectives. Solo drafts entirely on "
+                "the host rank and broadcasts the chain token ids once per "
+                "round."
+            )
+
     def _validate_pp_stage_gpu_groups(self) -> List[List[int]]:
         """--rank-gpu-id under a pipeline: one disjoint GPU group per stage.
 
@@ -11620,12 +11732,32 @@ class ServerArgs:
 
         ratio_was_perf = self.rank_tp_ratio == "auto-performance"
         ratio_was_auto = self.rank_tp_ratio == "auto" or ratio_was_perf
+        # Form A x a SYMBOLIC ratio, refused BEFORE 'auto' is resolved. After
+        # resolution the disagreement would still be caught below, but by
+        # accident and with the wrong reason ("rank 1 has a dense share")
+        # instead of the real one: 'auto' maximises the KV pool across ALL
+        # ranks, which is the opposite of a layout where two ranks hold none.
+        if self.rank_role and ratio_was_auto:
+            raise ValueError(
+                f"--rank-tp-ratio {self.rank_tp_ratio!r} is a symbolic "
+                "sizing mode, but --rank-role (Form A) needs the resolved "
+                "vector: 'auto' maximises the KV pool across ALL ranks, "
+                "which is the opposite of a layout where only the "
+                "attention host holds KV at all. Pass the vector "
+                "explicitly, e.g. "
+                + ",".join("1" if r == "host" else "0" for r in self.rank_role)
+                + "."
+            )
         self._check_perf_flags(ratio_was_perf)
 
         if (
             self.rank_gpu_id is None
             and self.rank_gpu_memory_mib is None
             and self.rank_tp_ratio is None
+            # --rank-role alone must NOT take this exit: it is a Form A boot
+            # missing its partition, and the refusal for that sits below.
+            # Without this clause the flag would be silently inert.
+            and not self.rank_role
         ):
             if str(self.rank_auto_reserve_mib) != str(
                 ServerArgs.AUTO_RANK_MEMORY_RESERVE_MIB
@@ -11856,6 +11988,21 @@ class ServerArgs:
         # self.rank_gpu_id; everything that does stays after the early return.
         # ---------------------------------------------------------------
 
+        # Form A roles need an EXPLICIT partition, and a resolved one.
+        if self.rank_role:
+            if self.rank_tp_ratio is None:
+                raise ValueError(
+                    "--rank-role requires an explicit --rank-tp-ratio: the "
+                    "roles say WHO holds the dense side, the ratio says how "
+                    "much, and Form A needs both. For "
+                    f"--rank-role {','.join(self.rank_role)} the matching "
+                    "vector is "
+                    + ",".join(
+                        "1" if r == "host" else "0" for r in self.rank_role
+                    )
+                    + "."
+                )
+
         # Uneven-TP ratio checks.
         if self.rank_tp_ratio is not None:
             if len(self.rank_tp_ratio) != self.tp_size:
@@ -11863,12 +12010,30 @@ class ServerArgs:
                     f"--rank-tp-ratio length ({len(self.rank_tp_ratio)}) "
                     f"must equal --tp-size ({self.tp_size})."
                 )
-            if any(not isinstance(r, int) or r <= 0 for r in self.rank_tp_ratio):
+            # A ZERO is admitted only when --rank-role names that rank a
+            # Form A worker. Without the role flag the classic rule stands
+            # unchanged: in every caller older than Form A a zero is an
+            # arithmetic accident, and admitting it globally would turn a
+            # typo into a silently wrong shard plan.
+            floor = 0 if self.rank_role else 1
+            if any(
+                not isinstance(r, int) or r < floor for r in self.rank_tp_ratio
+            ):
                 raise ValueError(
-                    "--rank-tp-ratio entries must be positive integers, "
-                    f"got {self.rank_tp_ratio}."
+                    "--rank-tp-ratio entries must be "
+                    + ("non-negative" if self.rank_role else "positive")
+                    + f" integers, got {self.rank_tp_ratio}."
+                    + (
+                        ""
+                        if self.rank_role
+                        else " A zero is only legible as a layout together "
+                        "with --rank-role (Form A); on its own it is an "
+                        "arithmetic accident."
+                    )
                 )
-            if len(set(self.rank_tp_ratio)) == 1:
+            if self.rank_role:
+                self._validate_rank_role_plan()
+            elif len(set(self.rank_tp_ratio)) == 1:
                 raise ValueError(
                     "--rank-tp-ratio with identical entries is the even "
                     "split — omit the flag instead."

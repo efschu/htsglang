@@ -38,6 +38,7 @@ from sglang.srt.distributed.utils import (
     tp_partition_sizes,
     tp_plan_active,
 )
+from sglang.srt.rank_role import guard_zero_width_linear_shard
 from sglang.srt.layers.dp_attention import (
     is_allocation_symmetric,
 )
@@ -669,6 +670,13 @@ class ColumnParallelLinear(LinearBase):
         else:
             self.output_size_per_partition = tp_partition_size(
                 self.output_size, tp_size, tp_rank, self.tp_units, self.tp_family
+            )
+            # FORM A (F11), column-parallel half: see the row-parallel note.
+            # A zero output width builds a layer that produces nothing and
+            # says nothing about it.
+            guard_zero_width_linear_shard(
+                f"{getattr(self, 'prefix', '') or type(self).__name__}.output",
+                self.output_size_per_partition,
             )
             self.output_partition_sizes = [self.output_size_per_partition]
             # If QKV or MergedColumn, use output size of each partition.
@@ -2073,6 +2081,18 @@ class RowParallelLinear(LinearBase):
             self.tp_units,
             self.tp_family,
             self.tp_q_groups,
+        )
+        # FORM A (F11): a shard width of 0 is legal arithmetic and a silent
+        # wrong answer. F.linear with K=0 does not raise -- it returns zeros
+        # -- and the row-parallel all-reduce adds them, so the only symptom
+        # is a wrong output many layers later. The one activation guard
+        # (distributed/utils.py:1806) passes it too, because 0 % 8 == 0.
+        # Under Form A a worker must not CONSTRUCT this layer at all (F3);
+        # this is the backstop for one that slipped through. Inert on every
+        # classic boot: no role plan installed means the guard returns.
+        guard_zero_width_linear_shard(
+            f"{getattr(self, 'prefix', '') or type(self).__name__}.input",
+            self.input_size_per_partition,
         )
         assert self.quant_method is not None
         self.use_presharded_weights = use_presharded_weights
