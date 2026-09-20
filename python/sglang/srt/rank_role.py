@@ -174,7 +174,7 @@ SEAMS: Dict[str, Seam] = {
             "which slice 6a widened from ('experts',) to "
             "('experts', 'moe_gate') with its reason attached.",
             anchors=(
-                ("models/qwen4_exp.py", 2273, "this_rank_is_form_a_worker()"),
+                ("models/qwen4_exp.py", 2280, "this_rank_is_form_a_worker()"),
                 ("models/qwen4_exp.py", 1539, 'skip_on_worker("ple"'),
                 ("models/qwen4_exp.py", 1565,
                  'skip_on_worker("hyper_connection"'),

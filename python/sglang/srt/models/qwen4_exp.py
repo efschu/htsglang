@@ -1669,7 +1669,12 @@ class Qwen4ExpLayerExtensionMixin:
         # which makes it a broadcast without a new transport.
         # form_a_worker_forward's docstring carries the count correction
         # this implies (96 collectives per round, not 48).
-        if form_a_dense_is_unsharded():
+        # fnFA11 (20.09.): NOT for the solo MTP draft. The draft is the
+        # host's alone (--speculative-draft-placement solo) with every expert
+        # resident there (SGLANG_MOE_OFFLOAD_EXCLUDE_DRAFT); the workers run
+        # no draft forward at all, so a carrier collective here has no
+        # second participant -- fnFA11 died in exactly that all-reduce.
+        if form_a_dense_is_unsharded() and not getattr(self, "is_nextn", False):
             hidden_states = publish_moe_input(hidden_states)
 
         mlp_in = hidden_states if _nan_guard_on() else None
@@ -1729,6 +1734,7 @@ class Qwen4ExpLinearDecoderLayer(
         is_nextn: bool = False,
     ) -> None:
         super().__init__(config, layer_id, quant_config, prefix, alt_stream, is_nextn)
+        self.is_nextn = bool(is_nextn)
         self._init_qwen4_exp_layer_extensions(config, layer_id, quant_config, prefix)
 
     def forward(
@@ -1770,6 +1776,7 @@ class Qwen4ExpAttentionDecoderLayer(
     ) -> None:
         config.attn_output_gate = True
         super().__init__(config, layer_id, quant_config, prefix, alt_stream, is_nextn)
+        self.is_nextn = bool(is_nextn)
         from sglang.srt.layers.attention.qsa.config import is_qwen_qsa
         from sglang.srt.layers.attention.qsa.glue import build_qsa_indexer
 
