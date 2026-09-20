@@ -1056,6 +1056,11 @@ def window_requirement(algorithm: str, nbytes: int, world: int) -> int:
     # ``pipe_chunk_bytes``, not on the payload.
     if algorithm in ("mesh", "mesh_pipe", "ring", "hierarchical"):
         return 2 * (world - 1) * share
+    if algorithm == "oneshot":
+        # Task #53: R-1 RS slots, each holding the WHOLE payload (the AG
+        # slots exist but stay unused). Never above the mesh's requirement
+        # for nbytes <= chunk_max, which is the only range it is chosen in.
+        return (world - 1) * nbytes
     if algorithm == "star":
         return 2 * (world - 1) * nbytes
     raise ValueError(f"unknown algorithm {algorithm!r}")
@@ -2143,6 +2148,13 @@ class BarlinkBar1Transport:
             os.environ.get("SGLANG_BARLINK_BAR1_RING_THRESHOLD", str(1 << 20))
         )
         self.min_bytes = int(os.environ.get("SGLANG_BARLINK_BAR1_MIN_BYTES", "4096"))
+        # Task #53 (20.09.): payloads up to this size run the ONE-barrier
+        # 'oneshot' kernel (whole contribution to every peer, local reduce)
+        # instead of the two-barrier mesh. Measured motive: 98 all_reduces of
+        # 24 KB per decode round at 88 us each. 0 disables. Rank-uniform.
+        self.oneshot_max = int(
+            os.environ.get("SGLANG_BARLINK_BAR1_ONESHOT_MAX", str(64 << 10))
+        )
         self.max_bytes = 0
         # all_to_all occupies a third slot set in the same region and thus
         # costs a third of the largest all_reduce payload (see `geometry`).
@@ -3128,6 +3140,17 @@ class BarlinkBar1Transport:
             # reach this point via handles() in the first place.
         else:
             a = "ring" if nbytes >= self.ring_from else "mesh"
+        # Task #53: small payloads take the one-barrier kernel. Above the
+        # plan and the threshold on purpose -- the planner's cost models know
+        # mesh and ring, and at these sizes the barriers, not the bytes, are
+        # the price (the plan could only have said 'mesh' here anyway).
+        oneshot_max = int(getattr(self, "oneshot_max", 0) or 0)
+        if (
+            a == "mesh"
+            and 0 < nbytes <= oneshot_max
+            and nbytes <= int(self._geo.get("chunk_max", 0))
+        ):
+            return "oneshot"
         if (self.pipe_on and a == "mesh" and nbytes >= self.pipe_from
                 and self._pipe_k(nbytes) is not None):
             return "mesh_pipe"
@@ -3445,7 +3468,7 @@ class BarlinkBar1Transport:
         # For a single round, this is byte-for-byte the old question.
         for _, length in rounds:
             algo = self.algorithm_for(length)
-            if algo not in ("mesh", "mesh_pipe", "ring"):
+            if algo not in ("mesh", "mesh_pipe", "ring", "oneshot"):
                 # 'star' and 'hierarchical' are not ported here. No silent
                 # fallback to 'mesh'.
                 return False
@@ -3868,7 +3891,7 @@ class BarlinkBar1Transport:
                     )
                 for _, length in rounds:
                     algo = self.algorithm_for(length)
-                    if algo not in ("mesh", "mesh_pipe", "ring"):
+                    if algo not in ("mesh", "mesh_pipe", "ring", "oneshot"):
                         # NOT oversize: a bigger window does not port an
                         # algorithm, so "widen the window" would be wrong
                         # advice and stopping the group would be wrong policy.
@@ -4030,7 +4053,7 @@ class BarlinkBar1Transport:
         self._note_launch("all_reduce", nbytes, kernel_variant)
         self._ext.bar1_all_reduce(
             inp, out, int(self.rank), int(self.world),
-            0 if algo == "mesh" else 1,
+            {"mesh": 0, "ring": 1, "oneshot": 2}[algo],
             peer_payload, peer_flag,
             int(self._own[0]), int(self._own_flag[0]),
             int(self._geo["chunk_max"]), int(self._geo["off_mesh"]),
