@@ -105,15 +105,16 @@ def write_rows(
     # every layer's expert tensors staying RESERVED in the caching allocator
     # (+1.9 GiB on the x4 3080), which the KV sizer then read as used and
     # the first 8k chunk OOMed on. Move the rows through the host instead.
-    if locals_ == list(range(len(locals_))) and len(locals_) == int(src.shape[0]):
-        picked = src.to("cpu")  # every local row, in order: one D2H, no device alloc
-    elif src.device.type == "cpu":
-        picked = src[torch.as_tensor(locals_, dtype=torch.long)]
-    else:
-        picked = torch.empty((len(locals_),) + tuple(src.shape[1:]), dtype=src.dtype)
-        for j, e in enumerate(locals_):
-            picked[j].copy_(src[e])
-    store.index_copy_(0, dst, picked.to(store.dtype))
+    if src.device.type == "cpu":
+        store.index_copy_(0, dst, src[torch.as_tensor(locals_, dtype=torch.long)].to(store.dtype))
+        return rows
+    # fn8m4 (20.09.): a host intermediate (src.to("cpu")) per tensor left the
+    # load's anon footprint at 60 GiB while the store filled (shmem 26 GiB)
+    # -> 90 GiB against the 88 mark. Copy each row straight from the device
+    # into the registered store mapping (D2H DMA), no host buffer at all.
+    assert src.dtype == store.dtype, (src.dtype, store.dtype)
+    for e in locals_:
+        store[rows[e]].copy_(src[e], non_blocking=False)
     return rows
 
 
