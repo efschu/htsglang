@@ -61,14 +61,22 @@ HOST_ONLY_KINDS: Tuple[str, ...] = (
     "lm_head",
     "ple",
     "norm",
-    "moe_gate",  # the router: the host picks the experts and sends the ids
     "shared_expert",  # dense, runs for every token
     "draft",  # the MTP draft is unsharded on the host
     "vision",
 )
 
-#: What a worker builds. Exactly one thing.
-WORKER_KINDS: Tuple[str, ...] = ("experts",)
+#: What a worker builds.
+#:
+#: `moe_gate` MOVED HERE in slice 6a (it was host-only in slice 6, on the
+#: assumption that the host would send the expert ids). The worker forward
+#: settled that question the other way: the router is a replicated
+#: [hidden, num_experts] matmul the worker already carries today (0.12 GiB
+#: over 48 layers, boot fn8ah), while transporting topk_ids/topk_weights
+#: would be a SECOND payload per layer, wider with k and with the batch, in
+#: GLOBAL expert ids every rank would have to filter into its own shard
+#: anyway. Cheaper to re-derive than to ship -- see form_a_worker_forward.
+WORKER_KINDS: Tuple[str, ...] = ("experts", "moe_gate")
 
 MODULE_KINDS: Tuple[str, ...] = WORKER_KINDS + HOST_ONLY_KINDS
 
@@ -95,14 +103,22 @@ def expected_census_categories(role: str) -> Tuple[str, ...]:
 
     This is the ACCEPTANCE CRITERION of slice 4a, written where a test can
     read it: after the construction skip, a worker's census line must carry
-    'experts' and nothing else. Today it also carries hyper_connection,
-    linear_attn, embed_tokens, lm_head, moe_gate, shared_expert and ple --
-    measured on boot fn8ah, 1.84 GiB per worker.
+    'experts' and its ROUTER and nothing else. Today it also carries
+    hyper_connection, linear_attn, embed_tokens, lm_head, shared_expert and
+    ple -- measured on boot fn8ah, 1.84 GiB per worker.
+
+    The criterion grew from one category to two in slice 6a, and that is a
+    WIDENING, so it is worth saying why it does not hollow the criterion
+    out: the eight-category fn8ah worker line still fails it (the companion
+    test pins exactly that), and the one category added is the one the
+    worker forward proved it needs -- the router, because the worker has to
+    pick its own experts on the broadcast MoE input. Anything else on a
+    worker's census line is still dense weight that should not be there.
     """
     if role == "worker":
-        return ("experts",)
+        return WORKER_KINDS
     if role == "host":
-        return ("experts",) + HOST_ONLY_KINDS
+        return WORKER_KINDS + HOST_ONLY_KINDS
     raise RankRoleError(f"unknown role {role!r}")
 
 

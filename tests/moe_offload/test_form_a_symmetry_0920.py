@@ -31,13 +31,19 @@ from sglang.srt.rank_role import RankRolePlan
 FORM_A = RankRolePlan(("host", "worker", "worker"))
 
 
-def _probe(wsd, hme, hdu, layers=48):
+def _probe(wsd, hme, hdu, layers=48, carrier="all_reduce_zero"):
+    """`carrier` defaults to the built one: without it a worker that skips
+    the dense path has no MoE input at all, which the probe now refuses
+    separately from the symmetry verdict (FormAWorkerWithoutMoeInput). Pass
+    carrier=None to ask the old question -- "would they hang?" -- about a
+    configuration that could not compute anyway."""
     return probe_form_a_boot(
         FORM_A,
         num_layers=layers,
         worker_skips_dense=wsd,
         host_uses_moe_exchange=hme,
         host_dense_is_unsharded=hdu,
+        moe_input_carrier=carrier,
     )
 
 
@@ -85,7 +91,7 @@ def test_slice_6a_alone_would_hang_the_rig():
     feature, it is a deadlock: the host blocks on participants that have
     already left the forward."""
     with pytest.raises(CollectiveMismatch) as e:
-        _probe(True, False, False)
+        _probe(True, False, False, carrier=None)
     msg = str(e.value)
     assert "collective #0 differs" in msg
     assert "ranks [0]" in msg and "[1, 2]" in msg
@@ -100,6 +106,25 @@ def test_the_moe_exchange_alone_does_not_rescue_it():
         _probe(True, True, False)
 
 
+def test_symmetry_is_not_sufficiency_the_simple_form_needs_a_carrier():
+    """The blind spot of the first version of this probe, and the reason
+    the switch matrix's '48 collectives' line was wrong.
+
+    A collective-sequence model says nothing about DATA. With the worker's
+    dense path silent AND the host's dense collectives silent, all three
+    ranks issue exactly one op per layer and agree perfectly -- and the
+    worker computes its experts on rows nobody ever sent it. Harmless to
+    model on a classic boot (every rank derives the MoE input itself);
+    fatal under Form A, where the value lives on one card."""
+    from sglang.srt.form_a_symmetry import FormAWorkerWithoutMoeInput
+
+    with pytest.raises(FormAWorkerWithoutMoeInput) as e:
+        _probe(True, False, True, carrier=None)
+    assert "48 COLLECTIVES" in str(e.value)
+    # ... and the exchange's broadcast IS a carrier, so that form needs none
+    _probe(True, True, True, carrier=None)
+
+
 def test_the_missing_switch_is_the_hosts_own_dense_collectives():
     """The third switch, which the slice plan did not have. The host's
     per-layer dense collectives exist only because the dense side is
@@ -112,24 +137,33 @@ def test_the_missing_switch_is_the_hosts_own_dense_collectives():
 # ==========================================================================
 # 3. The consequence for the plan: the MoE exchange is not a prerequisite
 # ==========================================================================
-def test_the_simple_form_a_is_symmetric_and_cheaper_in_collective_COUNT():
-    """Worker skips dense + host unsharded, MoE keeping its plain
-    all-reduce: 48 collectives per round against today's 108, with no MoE
-    exchange needed at all.
+def test_both_form_a_shapes_cost_96_collectives_not_48_and_108():
+    """THE COUNT CORRECTION of slice 6a's worker forward.
 
-    And the number that reorders the slice plan: the broadcast/reduce
-    exchange is TWO collectives per layer where the all-reduce is one, so
-    full Form A issues 96 -- twice the count of the simple form. Whether it
-    is cheaper depends on cost per op, not on count, and under Form A there
-    is no skew either way because the workers wait on the host. So the
-    exchange is an OPTIMISATION TO MEASURE, not a prerequisite."""
+    The previous version of this test read 48 for the simple form, because
+    the model had no op for the MoE INPUT. With the carrier counted the
+    simple form is 96 per round (carrier + combine per layer) -- the SAME
+    count as the full broadcast/reduce exchange, against 108 today.
+
+    What survives the correction unchanged is the ARGUMENT: the gain of
+    Form A was never the collective count (DESIGN §2.3 -- "der Gewinn von
+    Form A ist nicht weniger Transport, sondern das Verschwinden der
+    Schiefe"), and the exchange remains an optimisation to measure rather
+    than a prerequisite. What does not survive is the number, and a
+    slice plan that still quoted 48 would be comparing two layouts on a
+    figure one of them never had."""
     simple = _probe(True, False, True)
     full = _probe(True, True, True)
     today = _probe(False, False, False)
-    assert len(simple[0].ops) == 48
+    assert len(simple[0].ops) == 96
     assert len(full[0].ops) == 96
     assert len(today[0].ops) == 108
-    assert len(simple[0].ops) < len(full[0].ops) < len(today[0].ops)
+    assert len(simple[0].ops) < len(today[0].ops)
+    # the two Form A shapes differ in WHAT they move, not in how many ops:
+    # the simple form's carrier is an all-reduce of zeros, the full form's
+    # is a real broadcast, and its combine is a directed reduce.
+    assert {op.kind for op in simple[0].ops} == {"all_reduce"}
+    assert {op.kind for op in full[0].ops} == {"broadcast", "reduce"}
 
 
 # ==========================================================================

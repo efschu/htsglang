@@ -10950,6 +10950,39 @@ class ServerArgs:
             plan.check_dense_ratio(self.rank_tp_ratio)
         except RankRoleError as e:
             raise ValueError(str(e)) from e
+        # FORM A x the DRAFT. Same load-bearing condition, and for the same
+        # reason, as --weightless-kv-fastlane's (see
+        # _handle_weightless_kv_fastlane): 'split' placement runs a SHARDED
+        # draft forward on every rank, with its own per-layer collectives
+        # and -- for an MTP draft -- its own MoE combine. A Form A worker
+        # holds no draft weights at all (the loader veto rejects every
+        # `mtp.*` name), so its draft phase would have to be invented, and
+        # the host would block in a second model's collectives exactly the
+        # way seam F12 describes for the first.
+        #
+        # Note the standing rule this sits against (memory
+        # `draft-zuordnung-27b-dflash2-nextflash-mtp`, user order 19.09.):
+        # every draft is SHARDED, and solo is "nur ein explizites Opt-in
+        # fuer A/B, nie Default, nie Vorschlag". This is that explicit
+        # opt-in and nothing wider: it is required only when --rank-role is
+        # set, i.e. only in the layout whose entire premise is that the
+        # dense side -- draft included -- lives on one card.
+        if (
+            getattr(self, "speculative_algorithm", None) is not None
+            and getattr(self, "speculative_draft_placement", "split") != "solo"
+        ):
+            raise ValueError(
+                "--rank-role (Form A) requires --speculative-draft-placement "
+                "solo when speculative decoding is on (got "
+                f"'{getattr(self, 'speculative_draft_placement', 'split')}'). "
+                "Under Form A the draft is UNSHARDED on rank "
+                f"{plan.host_rank}: the worker ranks hold no draft weights, "
+                "no draft KV pool and no draft backends, so they cannot join "
+                "a split draft forward, and the host would hang in the "
+                "draft's own per-layer collectives. Solo drafts entirely on "
+                "the host rank and broadcasts the chain token ids once per "
+                "round."
+            )
 
     def _validate_pp_stage_gpu_groups(self) -> List[List[int]]:
         """--rank-gpu-id under a pipeline: one disjoint GPU group per stage.

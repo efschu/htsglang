@@ -526,9 +526,20 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             get_parallel().tp_size,
             config.shared_expert_intermediate_size,
         )
+        # FORM A (F3, construction half -- slice 6a): the SHARED expert is
+        # dense, it runs for every token, and it is sharded like any other
+        # MLP -- so on a worker its shard width is 0 and the F11 backstop
+        # fires. `None` is already a supported state here (the else branch
+        # below), and `_forward_shared_experts` already tests for it, so the
+        # host keeps contributing the shared output into the same
+        # post-experts all-reduce and the sum stays exact.
+        from sglang.srt.rank_role import this_rank_is_form_a_worker
+
+        _form_a_worker = this_rank_is_form_a_worker()
         if (
             config.shared_expert_intermediate_size > 0
             and not self.enable_shared_expert_fusion
+            and not _form_a_worker
         ):
             self.shared_expert = Qwen2MoeMLP(
                 hidden_size=config.hidden_size,

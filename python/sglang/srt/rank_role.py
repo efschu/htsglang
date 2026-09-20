@@ -54,6 +54,7 @@ __all__ = [
     "guard_zero_width_linear_shard",
     "form_a_dense_is_unsharded",
     "FormAZeroWidthLinear",
+    "FormAWorkerBuildsDraft",
     "worker_keeps_parameter",
     "guard_dcp_merge",
     "UNWIRED_ORDER",
@@ -122,14 +123,15 @@ SEAMS: Dict[str, Seam] = {
         Seam(
             "F1",
             "a zero entry in the dense ratio vector, admitted by the flag layer",
-            "server_args.py:11866 (--rank-tp-ratio entries must be positive), "
+            "server_args.py:12023 (--rank-tp-ratio entries must be positive), "
+            ":11995 (--rank-role requires an explicit vector), "
             "distributed/utils.py:_normalize_partition_plan",
             wired=True,
             note="Slice 2: admitted only together with an explicit "
             "--rank-role vector, so an accidental zero still raises.",
             anchors=(
-                ("server_args.py", 11990, "--rank-tp-ratio entries must be"),
-                ("server_args.py", 11962, "--rank-role requires an explicit"),
+                ("server_args.py", 12023, "--rank-tp-ratio entries must be"),
+                ("server_args.py", 11995, "--rank-role requires an explicit"),
             ),
         ),
         Seam(
@@ -151,29 +153,64 @@ SEAMS: Dict[str, Seam] = {
             "F3",
             "a worker rank that never LOADS the dense weights (not merely "
             "idles through them)",
-            "models/qwen4_exp.py:2190 weight_name_needed (LOAD veto, "
-            "BUILT), :1491 and :1517/:1525 (CONSTRUCTION skip for ple and "
-            "both hyper_connections, BUILT), against qwen3_5.py:797-830 and "
-            "1090-1168 (self_attn / linear_attn / o_proj, NOT built)",
-            wired=False,
-            note="TWO OF THREE BUILT. (1) The loader veto: a worker never "
-            "READS a dense tensor (checked against the real weight map -- "
-            "221.184 of 225.300 names kept, no shared expert, no draft, no "
-            "vision). (2) The CONSTRUCTION skip at the posts that cost most "
-            "-- the two hyper-connection mixers (not sharded at all, so "
-            "every rank held them in full: 0.63 GiB per rank in INT8) and "
-            "the PLE -- via form_a_construction.skip_on_worker, which puts "
-            "a parameter-free HostOnlyModule in their place. (3) NOT built: "
-            "the same skip for self_attn / linear_attn / o_proj / "
-            "embed_tokens / lm_head, which live in qwen3_5.py's decoder "
-            "layer. Until those land the worker census still shows more "
-            "than 'experts', which is the acceptance criterion "
-            "(form_a_construction.expected_census_categories).",
+            "models/qwen4_exp.py weight_name_needed (LOAD veto), :1497 / "
+            ":1523 / :1531 (ple, both hyper_connections), qwen3_5.py "
+            "(linear_attn, qkv_proj, o_proj, attn), qwen2_moe.py "
+            "(shared_expert), qwen3_vl.py (lm_head)",
+            wired=True,
+            note="BUILT, all three parts. (1) The loader veto: a worker "
+            "never READS a dense tensor (checked against the real weight "
+            "map -- 221.184 of 225.300 names kept, no shared expert, no "
+            "draft, no vision; the ROUTER was added to the kept set in "
+            "slice 6a, see _ROUTER_MARKER). (2) The CONSTRUCTION skip at "
+            "the posts that cost most -- the two per-layer hyper-connection "
+            "mixers and the model-level one (not sharded at all, so every "
+            "rank held them in full: 0.63 GiB per rank in INT8) and the "
+            "PLE. (3) The rest of the construction skip: linear_attn, "
+            "qkv_proj, o_proj and the RadixAttention layer in qwen3_5.py, "
+            "the QSA indexer in qwen4_exp.py, the SHARED expert in "
+            "qwen2_moe.py, embed_tokens and lm_head. Acceptance is "
+            "form_a_construction.expected_census_categories('worker'), "
+            "which slice 6a widened from ('experts',) to "
+            "('experts', 'moe_gate') with its reason attached.",
             anchors=(
-                ("models/qwen4_exp.py", 2190, "this_rank_is_form_a_worker()"),
+                ("models/qwen4_exp.py", 2231, "this_rank_is_form_a_worker()"),
                 ("models/qwen4_exp.py", 1497, 'skip_on_worker("ple"'),
                 ("models/qwen4_exp.py", 1523,
                  'skip_on_worker("hyper_connection"'),
+                ("models/qwen3_5.py", 807, 'skip_on_worker("linear_attn"'),
+                ("models/qwen3_5.py", 1110, 'skip_on_worker("self_attn"'),
+            ),
+        ),
+        Seam(
+            "F13",
+            "the MODEL-LEVEL vocab collectives must fall with the vocab "
+            "sharding, exactly as F12's per-layer ones fall with the dense "
+            "sharding",
+            "layers/vocab_parallel_embedding.py:730-732 (the embedding "
+            "all-reduce), layers/logits_processor.py (the logits "
+            "all-gather), models/qwen3_vl.py:1358-1368 (the host's lm_head "
+            "built unsharded), against distributed/utils.py:1734 "
+            "tp_vocab_ratios "
+            "(\"vocab always even\" -- the vocab family deliberately does "
+            "NOT inherit the base ratio vector)",
+            wired=True,
+            note="FOUND BY THE WORKER FORWARD, not by the seam survey. F12 "
+            "silenced the collectives INSIDE a decoder layer; these two sit "
+            "outside it, once per forward, and the survey missed them "
+            "because they are not per-layer. They would have hung the boot "
+            "in exactly the same way and one op earlier: tp_vocab_ratios "
+            "keeps the vocab EVEN under a plain uneven-TP plan, so without "
+            "this the host would hold one third of the rows and all-reduce "
+            "the embedding with two ranks that hold none. Built as the same "
+            "answer F12 gives: the sharding goes (enable_tp=False on the "
+            "host's VocabParallelEmbedding / ParallelLMHead, so tp_size=1 "
+            "there -- full vocab, no mask, no collective) and the gather "
+            "goes with it (skip_all_gather in LogitsProcessor).",
+            anchors=(
+                ("models/qwen3_vl.py", 1367, "form_a_dense_is_unsharded"),
+                ("layers/logits_processor.py", 385, "form_a_dense_is_unsharded"),
+                ("distributed/utils.py", 1734, "def tp_vocab_ratios"),
             ),
         ),
         Seam(
@@ -353,7 +390,7 @@ SEAMS: Dict[str, Seam] = {
 #: The seams that must be wired before a Form A boot can be believed, in the
 #: order the survey found them knocking. Kept as data so a report can print
 #: the remaining work without re-deriving it.
-UNWIRED_ORDER: Tuple[str, ...] = ("F3", "F5", "F9", "F6")
+UNWIRED_ORDER: Tuple[str, ...] = ("F5", "F9", "F6")
 
 
 def require_wired(seam_id: str, context: str = "") -> None:
@@ -507,16 +544,34 @@ _SHARED_EXPERT_MARKERS = (".mlp.shared_expert.", ".mlp.shared_expert_gate")
 
 _EXPERT_ID_RE = re.compile(r"\.experts\.(\d+)\.")
 
+#: The ROUTER. Slice 6a moved it onto the worker: a worker picks its own
+#: experts out of the broadcast MoE input rather than being told which ones
+#: to run, because the router is a replicated [hidden, num_experts] matmul
+#: (0.12 GiB over 48 layers, boot fn8ah) and the alternative -- shipping
+#: topk_ids/topk_weights per layer -- is a wider payload in GLOBAL expert
+#: ids that each rank would have to re-filter anyway. Reasoning in
+#: form_a_worker_forward's module docstring.
+#:
+#: The dots matter here exactly as they do for the expert marker: the near
+#: miss is ``mlp.shared_expert_gate``, which is dense and host-only, and
+#: which `_SHARED_EXPERT_MARKERS` rejects first.
+_ROUTER_MARKER = ".mlp.gate."
+
 
 def worker_keeps_parameter(
     name: str, num_routed_experts: Optional[int] = None
 ) -> bool:
     """Does a Form A WORKER need this checkpoint parameter? (F3)
 
-    A worker holds the ROUTED experts of the language model and nothing
-    else: no attention, no GDN, no hyper-connection mixer, no embeddings,
-    no lm_head, no PLE, no norms, no router, no SHARED expert, no vision
+    A worker holds the ROUTED experts of the language model AND ITS ROUTER,
+    and nothing else: no attention, no GDN, no hyper-connection mixer, no
+    embeddings, no lm_head, no PLE, no norms, no SHARED expert, no vision
     tower -- and no draft, because the draft is unsharded on the host.
+
+    The router (``mlp.gate``) was on the veto list until slice 6a and is
+    now kept: the worker runs it on the broadcast MoE input to pick its own
+    experts. See ``_ROUTER_MARKER`` above for why that is cheaper than
+    shipping the host's choice.
 
     Stated as a predicate over NAMES rather than over modules because that
     is where the load path can veto a tensor without constructing anything
@@ -533,6 +588,8 @@ def worker_keeps_parameter(
         return False
     if any(marker in name for marker in _SHARED_EXPERT_MARKERS):
         return False
+    if _ROUTER_MARKER in name:
+        return True
     if _ROUTED_EXPERT_MARKER not in name:
         return False
     if num_routed_experts is not None:
@@ -575,12 +632,29 @@ def this_rank_is_form_a_worker() -> bool:
 
 
 def guard_dense_weights(plan: RankRolePlan, rank: int) -> None:
-    """Called where a rank is about to LOAD dense weights (F3)."""
-    if plan.is_worker(rank):
-        require_wired(
-            "F3",
-            f"rank {rank} is a Form A worker and must not load dense "
-            "weights, but the load path has no role filter yet.",
+    """Called where a rank is about to LOAD dense weights (F3).
+
+    F3 is wired, so this is no longer "the filter does not exist yet". What
+    it checks now is that the filter is actually IN FORCE on this rank: the
+    loader veto and the construction skip both ask
+    `this_rank_is_form_a_worker()`, which reads the INSTALLED plan, not the
+    plan object passed around. A rank that is a worker by the plan but has
+    no plan installed in its own process would load and build everything,
+    silently, and only announce itself as an OOM on a 3080.
+    """
+    if plan.is_worker(rank) and not (
+        _INSTALLED_PLAN is not None
+        and _INSTALLED_PLAN.is_worker(_INSTALLED_RANK)
+        and _INSTALLED_RANK == rank
+    ):
+        raise RankRoleError(
+            f"rank {rank} is a Form A worker in the plan {plan.roles}, but "
+            f"this process has role plan {_INSTALLED_PLAN} installed for "
+            f"rank {_INSTALLED_RANK}. Every F3 site (the loader veto in "
+            "weight_name_needed, the construction skip in "
+            "form_a_construction.skip_on_worker) reads the INSTALLED plan, "
+            "so without it this rank would load and build the whole dense "
+            "side and report it as an OOM, not as a misconfiguration."
         )
 
 
@@ -594,13 +668,39 @@ def guard_kv_pool(plan: RankRolePlan, rank: int, tokens: int) -> None:
         )
 
 
+class FormAWorkerBuildsDraft(RankRoleError):
+    """A Form A worker was about to build the MTP draft. Its own class, not
+    a seam-not-wired: the refusal IS the feature and must not evaporate
+    when a seam is marked built."""
+
+
 def guard_draft_worker(plan: RankRolePlan, rank: int) -> None:
-    """Called where a rank builds the MTP draft model (F3, draft half)."""
+    """Called where a rank builds the MTP draft model.
+
+    Under Form A the draft is the HOST's alone (+0.84 GiB there, the price
+    of un-sharding it -- DESIGN_FORM_A_0920 §3.1), and the mechanism for
+    that already exists and is not ours:
+    ``--speculative-draft-placement solo`` builds the draft on the meta
+    device on every other rank and skips their draft forward entirely.
+    Without it the host runs a SHARDED draft whose per-layer collectives
+    the workers would have to join with draft weights they do not hold --
+    a second hang, in a second model, of exactly the F12 shape.
+
+    Note the standing rule this sits against (memory
+    `draft-zuordnung-27b-dflash2-nextflash-mtp`): every draft is SHARDED,
+    solo is "nur ein explizites Opt-in fuer A/B, nie Default". Form A is
+    that explicit opt-in -- its whole layout is "the dense side lives on
+    one card" and the draft is part of the dense side -- so the flag has to
+    be named in the boot line, deliberately, not inherited.
+    """
     if plan.is_worker(rank):
-        require_wired(
-            "F3",
+        raise FormAWorkerBuildsDraft(
             f"rank {rank} is a Form A worker and must not build the MTP "
-            "draft; the draft is unsharded on the host.",
+            "draft: under Form A the draft is unsharded on rank "
+            f"{plan.host_rank}. Pass --speculative-draft-placement solo "
+            "(with --speculative-draft-gpu pointing at the host's device) "
+            "so the other ranks build it on the meta device and skip the "
+            "draft forward."
         )
 
 

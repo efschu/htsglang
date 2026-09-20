@@ -46,12 +46,18 @@ def declare_layer_collectives(
     worker_skips_dense: bool,
     host_dense_is_unsharded: bool,
     host_uses_moe_exchange: bool,
+    moe_input_carrier: Optional[str] = None,
 ) -> List[CollectiveOp]:
     """What THIS rank will issue for one decoder layer.
 
     Built from the same `trace_layer` the desk probe uses, so the boot gate
     and the desk verdict cannot drift apart -- two spellings of "which
     collectives" is how a gate comes to pass while the boot hangs.
+
+    `moe_input_carrier` is declared, not assumed: it is read per process
+    from the environment (form_a_worker_forward.moe_input_carrier), so a
+    rank that read a different spelling issues a different op here and the
+    gate stops the boot instead of letting it wedge on op #1 of layer 0.
     """
     from sglang.srt.form_a_symmetry import trace_layer
 
@@ -63,6 +69,7 @@ def declare_layer_collectives(
         worker_skips_dense=worker_skips_dense,
         host_uses_moe_exchange=host_uses_moe_exchange,
         host_dense_is_unsharded=host_dense_is_unsharded,
+        moe_input_carrier=moe_input_carrier,
     )
     return trace.ops
 
@@ -125,15 +132,25 @@ def gate_form_a_boot(
     host_dense_is_unsharded: bool,
     host_uses_moe_exchange: bool,
     attention_every: int = 4,
+    moe_input_carrier: Optional[str] = None,
 ) -> None:
     """The whole gate: both layer shapes, checked once, before forward one.
 
     A no-op when `plan` is None -- on a classic boot every rank runs the
     same code and the property holds by construction, so the gate must cost
     nothing there.
+
+    `moe_input_carrier=None` means "ask this process" -- the gate then reads
+    the same environment variable the forward reads, which is the only way
+    the declaration can catch a rank whose env differs. Pass it explicitly
+    only from a test.
     """
     if plan is None:
         return
+    if moe_input_carrier is None and worker_skips_dense:
+        from sglang.srt.form_a_worker_forward import moe_input_carrier as _carrier
+
+        moe_input_carrier = _carrier()
     for is_attn in (False, True):
         ops = declare_layer_collectives(
             plan,
@@ -142,5 +159,6 @@ def gate_form_a_boot(
             worker_skips_dense=worker_skips_dense,
             host_dense_is_unsharded=host_dense_is_unsharded,
             host_uses_moe_exchange=host_uses_moe_exchange,
+            moe_input_carrier=moe_input_carrier,
         )
         assert_ranks_agree(plan, rank, ops, gather)

@@ -121,3 +121,47 @@ def test_the_flag_parser_and_the_runtime_share_one_definition():
     assert _parse_rank_role("host, worker ,WORKER") == FORM_A
     with pytest.raises(Exception, match="must be one of"):
         _parse_rank_role("host,driver,worker")
+
+
+# ==========================================================================
+# Form A x the DRAFT (slice 6a): the boot line's one new speculative flag
+# ==========================================================================
+def test_form_a_requires_the_solo_draft_and_says_why():
+    """The refusal that keeps a SECOND model from hanging the rig.
+
+    'split' placement runs a sharded draft forward on every rank, with its
+    own per-layer collectives and -- for an MTP draft -- its own MoE
+    combine. A Form A worker holds no draft weights at all (the loader veto
+    rejects every `mtp.*` name), so the host would block in the draft's
+    collectives exactly the way seam F12 describes for the target model.
+    Same load-bearing condition as --weightless-kv-fastlane's, one lane
+    over."""
+    with pytest.raises(ValueError, match="draft-placement solo"):
+        _args(
+            rank_role=FORM_A,
+            rank_tp_ratio=[1, 0, 0],
+            speculative_algorithm="NEXTN",
+            speculative_draft_placement="split",
+        )._handle_uneven_tp()
+
+
+def test_form_a_with_the_solo_draft_is_accepted():
+    sa = _args(
+        rank_role=FORM_A,
+        rank_tp_ratio=[1, 0, 0],
+        speculative_algorithm="NEXTN",
+        speculative_draft_placement="solo",
+    )
+    sa._handle_uneven_tp()
+    assert sa.form_a_active() is True
+
+
+def test_form_a_without_speculation_needs_no_placement_flag():
+    """The refusal is scoped to speculative boots. A Form A boot with no
+    draft at all must not be told to configure one."""
+    _args(
+        rank_role=FORM_A,
+        rank_tp_ratio=[1, 0, 0],
+        speculative_algorithm=None,
+        speculative_draft_placement="split",
+    )._handle_uneven_tp()

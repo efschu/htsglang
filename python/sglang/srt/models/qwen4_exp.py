@@ -1618,6 +1618,18 @@ class Qwen4ExpLayerExtensionMixin:
             attn_tp_chunks = list(hidden_states.tensor_split(attn_tp_size))
             hidden_states = attn_tp_chunks[get_parallel().attn_tp_rank].contiguous()
 
+        # FORM A (slice 6a): this is where the host hands the MoE input to
+        # the ranks that have no dense chain to compute it with. On a
+        # classic boot every rank produced the identical value itself (the
+        # dense path ends in an all-reduce), so no carrier is needed and
+        # this call is skipped entirely. Under Form A the value exists on
+        # ONE card and the workers contribute zeros to the same collective,
+        # which makes it a broadcast without a new transport.
+        # form_a_worker_forward's docstring carries the count correction
+        # this implies (96 collectives per round, not 48).
+        if form_a_dense_is_unsharded():
+            hidden_states = publish_moe_input(hidden_states)
+
         mlp_in = hidden_states if _nan_guard_on() else None
         hidden_states = self.mlp(hidden_states, forward_batch)
 
@@ -1720,7 +1732,13 @@ class Qwen4ExpAttentionDecoderLayer(
         from sglang.srt.layers.attention.qsa.glue import build_qsa_indexer
 
         self.is_qsa = is_qwen_qsa(config)
-        if self.is_qsa:
+        # FORM A (F3): the QSA indexer is part of the attention host's
+        # attention -- it selects the sparse rows for it. A worker runs no
+        # attention at all, so it builds none.
+        _idx_ph = skip_on_worker("self_attn", f"{prefix}.indexer")
+        if self.is_qsa and _idx_ph is not None:
+            self.indexer = _idx_ph
+        elif self.is_qsa:
             self.indexer = build_qsa_indexer(
                 config=config,
                 layer_id=layer_id,
@@ -1876,6 +1894,12 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
             # embeds (the meta probe built a full embedding on every stage).
             return PPMissingLayer()
         name = add_prefix("embed_tokens", prefix)
+        # FORM A (F3 / F13): the vocabulary is the host's. A worker never
+        # embeds anything -- it enters the model at the MoE input of layer 0
+        # and leaves at the last MoE combine.
+        _emb_ph = skip_on_worker("embed_tokens", name)
+        if _emb_ph is not None:
+            return _emb_ph
         raw = getattr(quant_config, "config", None)
         vocab_quant = (
             quant_config
@@ -1889,6 +1913,15 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
             quant_config=vocab_quant,
             prefix=name,
             use_attn_tp_group=is_dp_attention_enabled(),
+            # FORM A (F13): the vocab family deliberately does NOT inherit
+            # the base ratio vector (distributed/utils.py:1734
+            # tp_vocab_ratios, "vocab always even"), so under a Form A plan
+            # the host would still hold one third of the rows and
+            # all-reduce the embedding with two ranks that hold none. The
+            # sharding has to fall the same way the dense sharding does
+            # (F12): enable_tp=False gives tp_size=1 here -- full vocab, no
+            # mask, no collective.
+            enable_tp=not form_a_dense_is_unsharded(),
         )
 
     def __init__(
@@ -1916,7 +1949,14 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
             rms_norm_eps=config.rms_norm_eps,
             hc_per_branch_norm=True,
         )
-        self.hyper_connection_mixer = GatedResidual(hc_config, use_combine=False)
+        # FORM A (F3): the model-level mixer, like the two per-layer ones,
+        # is not sharded at all -- every rank held it in full. A worker
+        # enters the model at a MoE input and never touches it.
+        _mix_ph = skip_on_worker("hyper_connection", "hyper_connection_mixer")
+        self.hyper_connection_mixer = (
+            _mix_ph if _mix_ph is not None
+            else GatedResidual(hc_config, use_combine=False)
+        )
         # WP5 (PP=3 prefill): the PLE batch (n-gram hashing, prefetch, commit)
         # is only built on the stage that owns a PLE layer.
         self._stage_has_ple = self.has_ple and any(
@@ -2049,6 +2089,7 @@ _LAYER_ID_RE = re.compile(r"\.layers\.(\d+)\.")
 # level rather than inside the method because it runs once per checkpoint
 # tensor -- 225.300 of them for this model.
 from sglang.srt.form_a_construction import skip_on_worker  # noqa: E402
+from sglang.srt.form_a_worker_forward import publish_moe_input  # noqa: E402
 from sglang.srt.rank_role import (  # noqa: E402
     form_a_dense_is_unsharded,
     this_rank_is_form_a_worker,

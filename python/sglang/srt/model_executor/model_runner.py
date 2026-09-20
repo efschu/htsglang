@@ -568,6 +568,27 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 "weights, TP=1 + attention dispatch).",
                 self.tp_rank,
             )
+        # FORM A (slice 6a): the same shape of asymmetry, one axis over.
+        # The weightless lane splits the KV off the weights; Form A splits
+        # the DENSE side off the experts. Both end in a rank that must not
+        # run the model's own forward, and both express that here rather
+        # than by branching inside the model: `_forward_raw` routes a Form A
+        # worker into `_forward_form_a_worker`, which runs only the MoE
+        # blocks. A draft runner is excluded for the same reason it is
+        # excluded above -- under Form A the draft is the host's alone
+        # (--speculative-draft-placement solo), so a worker has no draft
+        # runner to strip.
+        from sglang.srt.rank_role import this_rank_is_form_a_worker
+
+        self.is_form_a_worker = (
+            this_rank_is_form_a_worker() and not is_draft_worker
+        )
+        if self.is_form_a_worker:
+            logger.info(
+                "Form A: rank %d is an EXPERT WORKER (routed experts + "
+                "router only; no dense weights, no KV, no draft).",
+                self.tp_rank,
+            )
         # Draft-solo placement (--speculative-draft-placement solo): computed
         # here for the same reason as the weightless flags above (single init
         # path, consumed by load_model). No-ops on the default 'split' path
@@ -4943,6 +4964,76 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             worker_dispatch(layer, forward_batch)
         return ModelRunnerOutput(logits_output=None, can_run_graph=False)
 
+    def _form_a_moe_blocks(self):
+        """The worker's MoE layer list, resolved once from the module tree.
+
+        Once, and from the TREE -- not from a layer count in the config:
+        the host's collective sequence IS the order of `model.layers`, so a
+        worker that re-derived the list from anywhere else could drift by a
+        layer and hang with nothing in the log to say so.
+        """
+        cached = getattr(self, "_form_a_moe_blocks_cache", None)
+        if cached is None:
+            from sglang.srt.form_a_worker_forward import form_a_moe_blocks
+
+            inner = getattr(self.model, "model", self.model)
+            cached = form_a_moe_blocks(inner)
+            self._form_a_moe_blocks_cache = cached
+            logger.info(
+                "Form A worker: %d routed-MoE blocks (layers %s..%s)",
+                len(cached),
+                cached[0][0],
+                cached[-1][0],
+            )
+        return cached
+
+    def _forward_form_a_worker(
+        self, forward_batch: ForwardBatch
+    ) -> ModelRunnerOutput:
+        """Stripped MoE-only forward for a Form A expert worker.
+
+        Runs NO dense module -- it has none. Per routed-MoE layer it joins
+        the MoE-input carrier (the host's value; this rank contributes
+        zeros), runs its own router over it, computes its own experts and
+        joins the post-experts all-reduce that sums the partial sums back
+        together. Two collectives per layer, in the same order the host
+        issues them, which is what the boot gate pinned before the first
+        forward.
+
+        Returns a sentinel output: no logits, because no lm_head. Sampling
+        on a worker is skipped the same way it is for a weightless worker.
+        """
+        from sglang.srt.form_a_worker_forward import run_form_a_worker_layers
+
+        self._prepare_eager_forward_batch(forward_batch)
+        if forward_batch.forward_mode.is_idle():
+            # The host's MoE block short-circuits a zero-row forward before
+            # its own all-reduce, so it issues nothing for an idle batch and
+            # neither may this rank. Same rule, same branch, rank-uniform
+            # input -- see _forward_weightless_worker's idle note.
+            return ModelRunnerOutput(logits_output=None, can_run_graph=False)
+        input_ids = getattr(forward_batch, "input_ids", None)
+        if input_ids is None:
+            raise RuntimeError(
+                "Form A worker forward: the batch carries no input_ids, so "
+                "the row count of the MoE-input carrier cannot be derived. "
+                "The count must be RANK-UNIFORM -- guessing one here is how "
+                "two ranks end up all-reducing different shapes."
+            )
+        num_tokens = int(input_ids.shape[0])
+        if num_tokens == 0:
+            return ModelRunnerOutput(logits_output=None, can_run_graph=False)
+        run_form_a_worker_layers(
+            self._form_a_moe_blocks(),
+            num_tokens=num_tokens,
+            hidden_size=int(self.model_config.hidden_size),
+            dtype=self.dtype,
+            device=input_ids.device,
+            forward_batch=forward_batch,
+            host_rank=0,
+        )
+        return ModelRunnerOutput(logits_output=None, can_run_graph=False)
+
     def _forward_raw(
         self,
         forward_batch: ForwardBatch,
@@ -5058,6 +5149,16 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     return ModelRunnerOutput(logits_output=None, can_run_graph=True)
                 with self._decode_round_segment("decode", graphed=False):
                     return self._forward_weightless_worker(forward_batch)
+
+            if getattr(self, "is_form_a_worker", False):
+                # FORM A: no dense weights on this rank, so there is no
+                # model forward to run -- only the per-layer MoE route. No
+                # graph branch here on purpose: the first Form A boot runs
+                # decode EAGER (seam F9, deliberately last), and a captured
+                # worker graph that recorded the carrier would have to agree
+                # with a host graph that does not exist yet.
+                with self._decode_round_segment("decode", graphed=False):
+                    return self._forward_form_a_worker(forward_batch)
 
             mode_check = (
                 forward_batch.forward_mode.is_cpu_graph

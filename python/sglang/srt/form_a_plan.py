@@ -141,6 +141,13 @@ class MeasuredPosts:
     corridor_gib: float
     # worker-only: the double-buffered MoE row exchange
     dispatch_buffer_gib: float
+    #: The ROUTER, which slice 6a moved onto the worker: it picks its own
+    #: experts out of the broadcast MoE input rather than being told which
+    #: to run. Replicated [hidden, num_experts] over 48 layers, measured as
+    #: `moe_gate 0.12` on every rank of fn8ah -- so this is not a new post,
+    #: it is one the earlier plan wrongly booked away from the workers.
+    #: ~1 residence row per worker per layer (0.12 / 0.1148).
+    worker_router_gib: float = 0.12
     source: str = "unset"
 
     @property
@@ -359,7 +366,14 @@ def solve_form_a(
     }
     host_fixed = sum(host_breakdown.values())
     worker_fixed = (
-        posts.worker_runtime_gib + posts.corridor_gib + posts.dispatch_buffer_gib
+        posts.worker_runtime_gib
+        + posts.corridor_gib
+        + posts.dispatch_buffer_gib
+        # slice 6a: a worker keeps its ROUTER (see MeasuredPosts.
+        # worker_router_gib). Booking it here rather than leaving it out is
+        # what keeps the residence ceiling honest -- it costs ~1 row per
+        # worker per layer, which is small and is not zero.
+        + posts.worker_router_gib
     )
 
     fixed: List[float] = []
@@ -375,7 +389,8 @@ def solve_form_a(
                 else (
                     f"runtime {posts.worker_runtime_gib:.2f}, "
                     f"corridor {posts.corridor_gib:.2f}, "
-                    f"dispatch buffer {posts.dispatch_buffer_gib:.2f}"
+                    f"dispatch buffer {posts.dispatch_buffer_gib:.2f}, "
+                    f"router {posts.worker_router_gib:.2f}"
                 )
             )
             exc = FormAHostOverBudget if c.role == "host" else FormAWorkerOverBudget

@@ -1346,12 +1346,25 @@ class Qwen3VLForConditionalGeneration(nn.Module):
 
                         if gguf_dense_vocab():
                             lm_head_quant_config = None
-                    self.lm_head = ParallelLMHead(
+                    # FORM A (F3 / F13): the lm_head is the host's, for the
+                    # same two reasons as embed_tokens -- a worker never
+                    # produces a logit, and the vocab family does not
+                    # inherit the Form A base vector, so left even-split the
+                    # host would all-gather logit shards from ranks that
+                    # hold none. Both branches are inert on a classic boot.
+                    from sglang.srt.form_a_construction import skip_on_worker
+                    from sglang.srt.rank_role import form_a_dense_is_unsharded
+
+                    _lm_ph = skip_on_worker(
+                        "lm_head", add_prefix("lm_head", prefix)
+                    )
+                    self.lm_head = _lm_ph if _lm_ph is not None else ParallelLMHead(
                         self.config.vocab_size,
                         self.config.hidden_size,
                         quant_config=lm_head_quant_config,
                         use_attn_tp_group=get_server_args().enable_dp_lm_head,
                         prefix=add_prefix("lm_head", prefix),
+                        enable_tp=not form_a_dense_is_unsharded(),
                     )
             else:
                 self.lm_head = PPMissingLayer()

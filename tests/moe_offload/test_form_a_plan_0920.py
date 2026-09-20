@@ -64,10 +64,20 @@ def test_host_pays_for_every_dense_post_and_the_worker_for_none_of_them():
     host_fixed, w1_fixed, w2_fixed = plan.fixed_gib
 
     assert w1_fixed == pytest.approx(w2_fixed)
-    # A worker carries runtime + corridor + row buffer, and nothing else.
+    # A worker carries runtime + corridor + row buffer + its ROUTER, and
+    # nothing else. The router joined the list in slice 6a, when the worker
+    # forward settled that a worker picks its own experts out of the
+    # broadcast MoE input rather than being handed global topk ids. It is
+    # not a new post -- fn8ah measured `moe_gate 0.12` on every rank -- it
+    # is one the earlier plan wrongly booked away from the workers, worth
+    # about one residence row per worker per layer.
     assert w1_fixed == pytest.approx(
-        posts.worker_runtime_gib + posts.corridor_gib + posts.dispatch_buffer_gib
+        posts.worker_runtime_gib
+        + posts.corridor_gib
+        + posts.dispatch_buffer_gib
+        + posts.worker_router_gib
     )
+    assert posts.worker_router_gib == pytest.approx(0.12)
     # The host carries all seven posts, itemised.
     assert set(plan.host_breakdown) == {
         "dense",

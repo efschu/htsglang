@@ -204,15 +204,17 @@ def test_an_explicit_dcp_flag_is_refused_not_overridden():
 # ==========================================================================
 # 4. The seam registry -- named refusals for what is not built
 # ==========================================================================
-WIRED = ("F1", "F2", "F4", "F7", "F8", "F10", "F11", "F12")
-UNWIRED = ("F3", "F5", "F6", "F9")
+WIRED = ("F1", "F2", "F3", "F4", "F7", "F8", "F10", "F11", "F12", "F13")
+UNWIRED = ("F5", "F6", "F9")
 
 
 def test_every_seam_has_an_identity_a_place_and_a_verdict():
-    """Eleven, not the nine the design note started with: the slice-2 survey
-    of the call sites found two more, and a seam that is known but unlisted
-    is worse than one that was never looked for."""
-    assert set(SEAMS) == {f"F{i}" for i in range(1, 13)}
+    """THIRTEEN, not the nine the design note started with: the slice-2
+    survey found F10/F11, the slice-6a symmetry probe found F12, and the
+    slice-6a WORKER FORWARD found F13 (the model-level vocab collectives --
+    the survey missed them because they are not per-layer). A seam that is
+    known but unlisted is worse than one that was never looked for."""
+    assert set(SEAMS) == {f"F{i}" for i in range(1, 14)}
     for sid, seam in SEAMS.items():
         assert seam.id == sid
         assert ":" in seam.where or ".py" in seam.where, sid
@@ -236,14 +238,14 @@ def test_the_remaining_work_is_ordered_and_complete():
 
     assert set(UNWIRED_ORDER) == set(UNWIRED)
     assert len(UNWIRED_ORDER) == len(set(UNWIRED_ORDER))
-    # F12 was ordered ahead of F3 and is now built, so F3 leads again. The
-    # ordering rule it encoded still holds and is asserted at its new home:
-    # F3's construction skip must not ship while F12 is open.
-    assert UNWIRED_ORDER[0] == "F3"
-    assert "F12" not in UNWIRED_ORDER
-    # F4 and F10 left the list in slice 5; if one comes back the order must
-    # come back with it, not silently shrink.
-    for gone in ("F4", "F10", "F11"):
+    # F5 leads now: with F3 and F12 built, what is left before a believed
+    # boot is the DCP merge (which Form A should never reach), the per-role
+    # graph mode (deliberately last -- the first boot is eager) and the
+    # subgroup (not needed while every collective spans all ranks).
+    assert UNWIRED_ORDER[0] == "F5"
+    # Seams that left the list must stay off it; if one comes back the
+    # order has to come back with it, not silently shrink.
+    for gone in ("F3", "F4", "F10", "F11", "F12", "F13"):
         assert gone not in UNWIRED_ORDER
 
 
@@ -262,15 +264,33 @@ def test_unknown_seam_is_refused():
 
 
 def test_guards_fire_only_on_the_rank_whose_role_needs_them():
+    from sglang.srt.rank_role import (
+        FormAWorkerBuildsDraft,
+        set_form_a_role_plan,
+    )
+
     # The host is never guarded by the worker guards.
     guard_dense_weights(FORM_A, 0)
     guard_draft_worker(FORM_A, 0)
     guard_kv_pool(FORM_A, 0, tokens=262151)
-    # A worker is.
-    with pytest.raises(FormASeamNotWired, match="F3"):
+    # F3 is wired as of slice 6a, so guard_dense_weights stopped meaning
+    # "the filter does not exist" and now means "the filter is in force on
+    # THIS rank": every F3 site reads the INSTALLED plan, so a worker
+    # process without one would load and build everything and only announce
+    # itself as an OOM on a 3080.
+    with pytest.raises(RankRoleError, match="role plan"):
         guard_dense_weights(FORM_A, 1)
-    with pytest.raises(FormASeamNotWired, match="F3"):
+    try:
+        set_form_a_role_plan(FORM_A, 1)
+        guard_dense_weights(FORM_A, 1)
+    finally:
+        set_form_a_role_plan(None)
+    # The draft guard keeps its refusal and gets its OWN class, for the same
+    # reason F11's does: the refusal is the feature. Under Form A the draft
+    # is the host's alone, and the mechanism for that is an existing flag.
+    with pytest.raises(FormAWorkerBuildsDraft, match="draft-placement solo"):
         guard_draft_worker(FORM_A, 2)
+    assert not issubclass(FormAWorkerBuildsDraft, FormASeamNotWired)
     # F4 is wired as of slice 5, so the KV guard no longer refuses -- a
     # worker with zero tokens was always the wanted case, and a worker
     # handed tokens is now handled by the arithmetic rather than blocked.
@@ -344,13 +364,17 @@ def test_form_a_plan_shares_one_definition_of_the_host_with_the_role_vector():
 # 5. F3 (load veto), F4 (KV arithmetic), F10 (W62) -- slice 5
 # ==========================================================================
 REAL_NAMES = {
-    # routed experts -- the only thing a worker keeps
+    # routed experts, and the ROUTER that picks them -- what a worker keeps
     "model.language_model.layers.0.mlp.experts.5.gate_proj.weight": True,
     "model.language_model.layers.47.mlp.experts.511.down_proj.weight_scale": True,
+    # the router moved onto the worker in slice 6a: it runs over the
+    # broadcast MoE input, which is cheaper than shipping global topk ids
+    "model.language_model.layers.0.mlp.gate.weight": True,
     # the near-misses, all host-only
     "model.language_model.layers.0.mlp.shared_expert.down_proj.weight": False,
+    # ... and THIS is the one the router marker must not swallow: it is
+    # dense, host-only, and its name contains 'gate'
     "model.language_model.layers.0.mlp.shared_expert_gate.weight": False,
-    "model.language_model.layers.0.mlp.gate.weight": False,
     "model.language_model.layers.0.self_attn.q_proj.weight": False,
     "model.language_model.layers.0.self_attn.indexer.index_qk_proj.weight": False,
     "model.language_model.layers.0.linear_attn.in_proj_qkv.weight": False,

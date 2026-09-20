@@ -40,8 +40,10 @@ from sglang.srt.rank_role import HOST, RankRolePlan, WORKER
 __all__ = [
     "CollectiveMismatch",
     "CollectiveOp",
+    "FormAWorkerWithoutMoeInput",
     "RankTrace",
     "trace_layer",
+    "trace_forward_edges",
     "check_symmetry",
     "probe_form_a_boot",
 ]
@@ -49,6 +51,20 @@ __all__ = [
 
 class CollectiveMismatch(RuntimeError):
     """Two ranks would enter different collectives -- i.e. they would hang."""
+
+
+class FormAWorkerWithoutMoeInput(RuntimeError):
+    """A worker would compute experts on a value nobody handed it.
+
+    The blind spot of the first version of this model, and worth naming
+    rather than fixing quietly: a collective-sequence model is silent about
+    DATA. It checked that three ranks enter the same ops in the same order
+    and said nothing about whether the rows they enter with exist. On a
+    classic boot that gap is harmless -- every rank computes the MoE input
+    itself, because the dense path ends in an all-reduce. Under Form A the
+    value lives on one card, and the configuration the model called "the
+    simple Form A, 48 collectives" had no op that moves it.
+    """
 
 
 @dataclass(frozen=True)
@@ -81,11 +97,20 @@ def trace_layer(
     worker_skips_dense: bool,
     host_uses_moe_exchange: bool,
     host_dense_is_unsharded: bool,
+    moe_input_carrier: Optional[str] = None,
 ) -> None:
     """Model ONE decoder layer's collectives for one rank.
 
-    THREE switches, and that count is itself the finding of this file. The
-    slice plan had two:
+    FOUR switches now. The fourth, `moe_input_carrier`, is the slice-6a
+    worker-forward finding: see `FormAWorkerWithoutMoeInput`. It is one op
+    per MoE layer, issued by EVERY rank (the host publishes, the workers
+    contribute zeros or receive), and it sits immediately before the MoE.
+    `None` means no carrier -- correct today, and a data gap under Form A
+    unless the host-centric exchange provides one, which its broadcast
+    does.
+
+    The first three, and that count was the finding of the previous round.
+    The slice plan had two:
 
       `worker_skips_dense`      -- slice 6a: the worker stops executing the
                                    dense path.
@@ -122,12 +147,64 @@ def trace_layer(
         else:
             trace.issue("all_reduce", f"layer{layer_id}.linear_attn", "hidden")
 
+    # The MoE INPUT carrier. Every rank is here: the host publishes its
+    # value, a worker contributes zeros (an all-reduce whose other addends
+    # are zero IS a broadcast) or receives one.
+    #
+    # It exists only because SOME rank cannot compute the input itself, so
+    # it is conditioned on `worker_skips_dense` and not on the carrier
+    # setting alone: on a classic boot every rank's own dense path ends in
+    # an all-reduce and produces the identical value, so a carrier there
+    # would be a 49th collective for a value everyone already has.
+    # Skipped when the host-centric exchange broadcasts the input below --
+    # two carriers would be two collectives for one value.
+    if (
+        moe_input_carrier is not None
+        and worker_skips_dense
+        and not host_uses_moe_exchange
+    ):
+        kind = "broadcast" if moe_input_carrier == "broadcast" else "all_reduce"
+        trace.issue(kind, f"layer{layer_id}.moe_in", "hidden")
+
     # The MoE side. Every rank owns experts, so every rank is here.
     if host_uses_moe_exchange:
         trace.issue("broadcast", f"layer{layer_id}.moe_in", "rows")
         trace.issue("reduce", f"layer{layer_id}.moe_out", "rows")
     else:
         trace.issue("all_reduce", f"layer{layer_id}.moe_combine", "hidden")
+
+
+def trace_forward_edges(
+    trace: RankTrace,
+    *,
+    worker_skips_dense: bool,
+    vocab_is_host_only: bool,
+) -> None:
+    """The two collectives that sit OUTSIDE the layer loop -- seam F13.
+
+    Kept in its own function, and out of the per-layer count, because that
+    is what it is: once per forward, not once per layer. The seam survey
+    missed these for exactly that reason -- it was looking at a decoder
+    layer -- and they hang the boot one op EARLIER than F12's would.
+
+      embed_tokens : VocabParallelEmbedding all-reduces the masked lookup
+                     across the vocab shards (layers/
+                     vocab_parallel_embedding.py:730-732).
+      lm_head      : LogitsProcessor all-gathers the logit shards.
+
+    `vocab_is_host_only` is the built answer (F13): the host's vocab layers
+    are constructed with enable_tp=False, so there is one shard, no mask
+    and no collective, and a worker builds neither module. With it False --
+    which is what `tp_vocab_ratios` gives you by default, since the vocab
+    family deliberately does NOT inherit the base ratio vector -- the host
+    issues both and a worker that skips the dense path issues neither.
+    """
+    if vocab_is_host_only:
+        return
+    if trace.role == WORKER and worker_skips_dense:
+        return
+    trace.issue("all_reduce", "embed_tokens", "hidden")
+    trace.issue("all_gather", "lm_head", "logits")
 
 
 def check_symmetry(traces: Sequence[RankTrace]) -> None:
@@ -177,15 +254,32 @@ def probe_form_a_boot(
     worker_skips_dense: bool,
     host_uses_moe_exchange: bool,
     host_dense_is_unsharded: bool = False,
+    moe_input_carrier: Optional[str] = None,
+    vocab_is_host_only: bool = True,
 ) -> List[RankTrace]:
-    """The whole-boot probe: N layers, three fake ranks, one verdict.
+    """The whole-boot probe: N layers, three fake ranks, two verdicts.
 
-    Returns the traces when the configuration is symmetric; raises
-    `CollectiveMismatch` naming the first divergence when it is not.
+    Returns the traces when the configuration is symmetric AND every rank
+    has the rows it computes on; raises `CollectiveMismatch` naming the
+    first divergence, or `FormAWorkerWithoutMoeInput` when a worker would
+    run its experts on a value no op ever moved to it.
+
+    The HANG verdict comes first and the data verdict second, deliberately:
+    a configuration that hangs costs a GPU window and leaves no log line,
+    while one that is merely missing its input fails loudly at the first
+    shape. Both are checked -- a configuration can be perfectly symmetric
+    and still wrong, which is exactly what the first version of this probe
+    waved through.
     """
     traces = [
         RankTrace(rank=r, role=plan.role_of(r)) for r in range(plan.tp_size)
     ]
+    for t in traces:
+        trace_forward_edges(
+            t,
+            worker_skips_dense=worker_skips_dense,
+            vocab_is_host_only=vocab_is_host_only,
+        )
     for layer_id in range(num_layers):
         is_attn = (layer_id + 1) % attention_every == 0
         for t in traces:
@@ -196,6 +290,19 @@ def probe_form_a_boot(
                 worker_skips_dense=worker_skips_dense,
                 host_uses_moe_exchange=host_uses_moe_exchange,
                 host_dense_is_unsharded=host_dense_is_unsharded,
+                moe_input_carrier=moe_input_carrier,
             )
     check_symmetry(traces)
+    if worker_skips_dense and not host_uses_moe_exchange and moe_input_carrier is None:
+        raise FormAWorkerWithoutMoeInput(
+            "the ranks AGREE about the collectives and it is still not a "
+            "runnable layout: a worker skips the dense path, so it does not "
+            "compute the MoE input; the host-centric exchange is off, so "
+            "nothing broadcasts it; and no moe_input_carrier is set, so no "
+            "op moves it either. THIS IS THE CONFIGURATION THE SWITCH "
+            "MATRIX PRICED AT 48 COLLECTIVES -- symmetry is not "
+            "sufficiency. Set moe_input_carrier='all_reduce_zero' (the host "
+            "publishes, the workers add zeros -- see form_a_worker_forward, "
+            "96 collectives per round) or turn the exchange on."
+        )
     return traces

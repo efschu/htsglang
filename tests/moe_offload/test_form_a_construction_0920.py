@@ -47,16 +47,29 @@ def _no_plan_leaks():
 # ==========================================================================
 # 1. The decision
 # ==========================================================================
-def test_a_worker_builds_exactly_one_kind_of_module():
-    assert WORKER_KINDS == ("experts",)
+def test_a_worker_builds_its_experts_and_the_router_that_picks_them():
+    """TWO kinds since slice 6a, not one, and the second one is a decision
+    rather than a leftover: the worker runs its own router over the
+    broadcast MoE input instead of being told which experts to run. The
+    alternative is a per-layer payload of GLOBAL topk ids that every rank
+    would re-filter into its own shard anyway; the router is a replicated
+    [hidden, num_experts] matmul, 0.12 GiB over 48 layers (fn8ah), which a
+    worker already carries today."""
+    assert WORKER_KINDS == ("experts", "moe_gate")
     assert worker_builds("experts") is True
+    assert worker_builds("moe_gate") is True
     for kind in HOST_ONLY_KINDS:
         assert worker_builds(kind) is False, kind
+    # and the two lists do not overlap -- a kind in both would make
+    # worker_builds's answer depend on iteration order
+    assert not set(WORKER_KINDS) & set(HOST_ONLY_KINDS)
 
 
 def test_the_host_only_list_names_every_post_the_census_measured():
     """fn8ah's census categories, each one accounted for. A post that is in
-    the census but not in this list is a post nobody decided about."""
+    the census but not in one of the two lists is a post nobody decided
+    about -- `moe_gate` moved from the host list to the worker list in
+    slice 6a, so the union is what has to cover the census."""
     measured = {
         "hyper_connection",
         "linear_attn",
@@ -67,8 +80,9 @@ def test_the_host_only_list_names_every_post_the_census_measured():
         "ple",
         "norm",
     }
-    assert measured <= set(HOST_ONLY_KINDS)
-    # ... and the two that are not census keys but are real modules
+    assert measured <= set(MODULE_KINDS)
+    assert measured - {"moe_gate"} <= set(HOST_ONLY_KINDS)
+    # ... and the ones that are not census keys but are real modules
     assert {"self_attn", "o_proj", "draft", "vision"} <= set(HOST_ONLY_KINDS)
 
 
@@ -85,8 +99,8 @@ def test_an_unknown_kind_is_refused_rather_than_defaulted():
 # ==========================================================================
 # 2. The acceptance criterion, as code
 # ==========================================================================
-def test_a_worker_census_may_show_experts_and_nothing_else():
-    assert expected_census_categories("worker") == ("experts",)
+def test_a_worker_census_may_show_experts_its_router_and_nothing_else():
+    assert expected_census_categories("worker") == ("experts", "moe_gate")
     host = expected_census_categories("host")
     assert "experts" in host and "hyper_connection" in host
     assert len(host) == len(MODULE_KINDS)
@@ -97,7 +111,12 @@ def test_a_worker_census_may_show_experts_and_nothing_else():
 def test_the_census_contract_would_fail_on_todays_boot():
     """The pin that makes the criterion meaningful: fn8ah's worker line
     carried seven categories beyond 'experts'. If this ever passes, the
-    criterion has been weakened rather than met."""
+    criterion has been weakened rather than met.
+
+    Slice 6a WIDENED the criterion (moe_gate moved onto the worker), and
+    this pin is what keeps that widening honest: six of fn8ah's eight
+    categories are still dense weight that must not be on a worker, so the
+    real census line still fails."""
     fn8ah_worker = {
         "experts",
         "hyper_connection",
@@ -108,7 +127,9 @@ def test_the_census_contract_would_fail_on_todays_boot():
         "shared_expert",
         "ple",
     }
-    assert not fn8ah_worker <= set(expected_census_categories("worker"))
+    allowed = set(expected_census_categories("worker"))
+    assert not fn8ah_worker <= allowed
+    assert len(fn8ah_worker - allowed) == 6
 
 
 # ==========================================================================
