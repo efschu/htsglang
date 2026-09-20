@@ -407,6 +407,19 @@ class FamilyStat:
     #: as many small transfers or as one long stall, and only the second is
     #: a latency problem -- the sum alone cannot tell those apart.
     max_ms: float
+    #: Shortest single span (20.09., fn8aa): the protocol FLOOR of one
+    #: collective is what the minimum shows; everything above it in the
+    #: mean is waiting for a slower rank (skew). 0.0 = not recorded.
+    min_ms: float = 0.0
+
+
+def _min_ms(a: float, b: float) -> float:
+    """Minimum of two family minima where 0.0 means 'not recorded'."""
+    if a <= 0.0:
+        return b
+    if b <= 0.0:
+        return a
+    return a if a < b else b
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1298,14 +1311,16 @@ class CollectiveClock:
                 return None
             cell = acc.get(family)
             if cell is None:
-                acc[family] = [ms, 1.0, ms]
+                acc[family] = [ms, 1.0, ms, ms]
             else:
                 cell[0] += ms
                 cell[1] += 1.0
                 if ms > cell[2]:
                     cell[2] = ms
+                if ms < cell[3]:
+                    cell[3] = ms
         return {
-            name: FamilyStat(total_ms=v[0], count=int(v[1]), max_ms=v[2])
+            name: FamilyStat(total_ms=v[0], count=int(v[1]), max_ms=v[2], min_ms=v[3])
             for name, v in acc.items()
         }
 
@@ -1335,19 +1350,24 @@ class CollectiveClock:
             total_ms += ms
             slot_acc = acc.get(family)
             if slot_acc is None:
-                acc[family] = [ms, 1.0, ms]
+                acc[family] = [ms, 1.0, ms, ms]
             else:
                 slot_acc[0] += ms
                 slot_acc[1] += 1.0
                 if ms > slot_acc[2]:
                     slot_acc[2] = ms
+                if len(slot_acc) > 3 and ms < slot_acc[3]:
+                    slot_acc[3] = ms
             self._pool.append(start)
             self._pool.append(end)
         slot.pairs.clear()
         return HarvestResult(
             total_s=total_ms / 1000.0,
             families={
-                name: FamilyStat(total_ms=v[0], count=int(v[1]), max_ms=v[2])
+                name: FamilyStat(
+                    total_ms=v[0], count=int(v[1]), max_ms=v[2],
+                    min_ms=(v[3] if len(v) > 3 else 0.0),
+                )
                 for name, v in acc.items()
             },
         )
@@ -1484,6 +1504,7 @@ class CollectiveClock:
                             total_ms=have.total_ms + stat.total_ms,
                             count=have.count + stat.count,
                             max_ms=max(have.max_ms, stat.max_ms),
+                            min_ms=_min_ms(have.min_ms, stat.min_ms),
                         )
                     )
             if refused is not None:
@@ -1524,6 +1545,7 @@ class CollectiveClock:
                         total_ms=have.total_ms + stat.total_ms,
                         count=have.count + stat.count,
                         max_ms=max(have.max_ms, stat.max_ms),
+                        min_ms=_min_ms(have.min_ms, stat.min_ms),
                     )
                 )
             wait_ms = sum(st.total_ms for st in families.values())
