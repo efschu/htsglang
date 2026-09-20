@@ -3228,6 +3228,49 @@ class SchedulerWeightUpdaterManager:
             return weights_only
         return {str(t): int(v) for t, v in census.items()}, WEG2_TAG_POPULATION_ALL
 
+    def _weg2_kv_group_verdict(self, mine: bool, kv_epoch) -> bool:
+        """xsn409 (20.09.): the kv_cache resume verdict of a wake is the WHOLE TP
+        group's. Every rank contributes ok/refused over the gloo cpu group; if any
+        rank refused (W114 Weg2KvResumeRefused), a rank that already resumed and
+        cleared its pool pauses it again, sets the dormant flag back and forgets
+        the resumed epoch, so all ranks answer the front's post-legs kv call from
+        the same dormant image. A split group (awake ranks beside a dormant one)
+        hangs in the scheduler loop's next collective -- xsn409: three silent
+        ranks, the front's second kv RPC never dispatched. World 1: own verdict."""
+        group = getattr(self, "tp_cpu_group", None)
+        try:
+            world = int(torch.distributed.get_world_size(group=group)) if group is not None else 1
+        except Exception:  # noqa: BLE001 -- no process group: single rank
+            world = 1
+        if world <= 1:
+            return bool(mine)
+        gathered: List[Optional[bool]] = [None] * world
+        torch.distributed.all_gather_object(gathered, bool(mine), group=group)
+        refused = [i for i, v in enumerate(gathered) if v is not True]
+        if not refused:
+            return True
+        logger.error(
+            "W114 Weg2KvResumeRefused GROUP epoch=%s: rank(s) %s refused the kv_cache "
+            "resume, this rank had %s -- every rank steps back to the dormant image "
+            "(kv_cache paused, dormant set, epoch not done) so the post-legs kv call "
+            "resumes the group together instead of splitting it",
+            kv_epoch, refused, "resumed" if mine else "refused too",
+        )
+        if mine:
+            try:
+                self.memory_saver_adapter.pause(GPU_MEMORY_TYPE_KV_CACHE)
+            except Exception as exc:  # noqa: BLE001 -- named, never a silent split
+                logger.error("W114 group step-back: pause(kv_cache) raised %s: %s", type(exc).__name__, exc)
+            scheduler = getattr(self, "scheduler", None)
+            if scheduler is not None:
+                try:
+                    scheduler.weg2_dormant = True
+                except Exception:  # noqa: BLE001
+                    pass
+            self._weg2_kv_resumed_epoch = None
+        self._weg2_kv_deferred = True
+        return False
+
     def _weg2_wake_kv_first_ok(self, tags) -> bool:
         """Wake-Parallel (user 18.09.): may the kv_cache pool be resumed BEFORE
         the weight legs? Only when the card can fund it right now: free -
@@ -8275,6 +8318,11 @@ class SchedulerWeightUpdaterManager:
             # refused resume that marked the epoch done would make the next
             # call answer "done: nothing to do" and leave the group dormant
             # forever with no second chance and no further line in the log.
+            # xsn409 (20.09.): a per-rank kv verdict split the TP group -- two ranks
+            # resumed and cleared, one refused (W114) and stayed DORMANT; the next
+            # collective of the scheduler loop then hung all three. The verdict is the
+            # GROUP's: any refused rank makes every rank step back to the dormant image.
+            _weg2_kv_ok = self._weg2_kv_group_verdict(bool(_weg2_kv_ok), _kv_epoch)
             if _weg2_kv_ok:
                 self._weg2_kv_epoch_done = _kv_epoch
                 self._weg2_kv_deferred = False
