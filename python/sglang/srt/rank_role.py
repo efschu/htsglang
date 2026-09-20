@@ -179,7 +179,7 @@ SEAMS: Dict[str, Seam] = {
                 ("models/qwen4_exp.py", 1565,
                  'skip_on_worker("hyper_connection"'),
                 ("models/qwen3_5.py", 807, 'skip_on_worker("linear_attn"'),
-                ("models/qwen3_5.py", 1110, 'skip_on_worker("self_attn"'),
+                ("models/qwen3_5.py", 1120, 'skip_on_worker("self_attn"'),
             ),
         ),
         Seam(
