@@ -1234,10 +1234,14 @@ class HiCacheController:
                     "The #706 canonical KV page currently supports only the "
                     f"'file' backend, got '{storage_backend}'."
                 )
-            if self.page_size != 1:
+            # fnFL1b (20.09.): page_size > 1 is the same K/V-major form with
+            # page_size tokens per slot; only weighted uneven-DCP ownership
+            # (one page spanning two owner ranks) rules it out -- and that case
+            # is already refused above. Qwen4Exp/QSA needs page_size >= 32.
+            if self.page_size != 1 and self.storage_config.dcp_owner_mode:
                 raise NotImplementedError(
-                    "The #706 canonical KV page requires page_size == 1, got "
-                    f"{self.page_size}."
+                    "The #706 canonical KV page requires page_size == 1 under "
+                    f"weighted uneven DCP (dcp_owner_mode), got {self.page_size}."
                 )
         # for MLA models, only one rank needs to backup the KV cache
         self.backup_skip = (

@@ -8618,12 +8618,20 @@ class ServerArgs:
                 "disk tier is where the format has to live anyway for "
                 "context to survive a reboot."
             )
-        if self.page_size != 1:
+        # Next Flash (fnFL1b, 20.09.): a multi-token canonical page is the SAME
+        # K/V-major form with page_size tokens per slot (the host pool's flat
+        # page, pool_host/mha.py get_data_page; build_page_window reads the
+        # cell off that page), so the only thing a page_size > 1 breaks is
+        # token OWNERSHIP under weighted uneven DCP -- one page would span two
+        # owner ranks. QSA needs page_size >= 32 (qsa_kv_pool: page_size //
+        # ratio >= 8), so the refusal is keyed on the owner mode, not on 1.
+        if self.page_size != 1 and self.uneven_weighted_dcp_enabled():
             raise ValueError(
-                "--hicache-canonical-kv-page requires --page-size 1, "
-                f"got {self.page_size}. A canonical page is ONE token's "
-                "attention layers; a multi-token page would span token "
-                "owners, the same limit weighted uneven-DCP already sets."
+                "--hicache-canonical-kv-page requires --page-size 1 under "
+                f"weighted uneven DCP, got {self.page_size}. A multi-token "
+                "page would span token owners (the same limit dcp_owner_mode "
+                "sets); with dcp_size 1 on the writing group any page size "
+                "is one owner's and the whole-page format holds."
             )
 
     def _handle_regime_controller(self):
