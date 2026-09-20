@@ -150,6 +150,11 @@ def tp_partition_allows_zero() -> bool:
     return _TP_PARTITION_ALLOW_ZERO
 
 
+# Families that carry EXPERT weights: a Form A worker (base width zero) owns
+# these and nothing else, so the base plan's zero does not bind them.
+EXPERT_FAMILIES = frozenset({"moe"})
+
+
 def _normalize_partition_plan(
     ratios: Optional[Sequence[int]],
     families: Optional[dict] = None,
@@ -191,7 +196,11 @@ def _normalize_partition_plan(
             # width zero -- that rank has no dense weights at all, and a
             # family vector that disagrees is how one dimension quietly
             # lands on an expert worker.
-            if allow_zero and base is not None:
+            if allow_zero and base is not None and name not in EXPERT_FAMILIES:
+                # fnFA1 (20.09.): the EXPERT family is exactly what a Form A
+                # worker owns -- a zero dense width with a positive expert
+                # share is the layout, not a stray dimension. Only DENSE
+                # families are bound by the base plan's zero.
                 stray = [
                     r for r, (b, w) in enumerate(zip(base, vec)) if b == 0 and w > 0
                 ]

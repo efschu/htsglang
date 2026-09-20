@@ -144,7 +144,7 @@ SEAMS: Dict[str, Seam] = {
             note="Slice 1 opened the arithmetic, slice 2 threaded it through "
             "the plan; the kv-group alignment composes.",
             anchors=(
-                ("distributed/utils.py", 1348,
+                ("distributed/utils.py", 1357,
                  "def _partition_units_with_empty_ranks"),
                 ("distributed/utils.py", 124, "def set_tp_partition_ratios"),
             ),
@@ -174,9 +174,9 @@ SEAMS: Dict[str, Seam] = {
             "which slice 6a widened from ('experts',) to "
             "('experts', 'moe_gate') with its reason attached.",
             anchors=(
-                ("models/qwen4_exp.py", 2231, "this_rank_is_form_a_worker()"),
-                ("models/qwen4_exp.py", 1497, 'skip_on_worker("ple"'),
-                ("models/qwen4_exp.py", 1523,
+                ("models/qwen4_exp.py", 2273, "this_rank_is_form_a_worker()"),
+                ("models/qwen4_exp.py", 1539, 'skip_on_worker("ple"'),
+                ("models/qwen4_exp.py", 1565,
                  'skip_on_worker("hyper_connection"'),
                 ("models/qwen3_5.py", 807, 'skip_on_worker("linear_attn"'),
                 ("models/qwen3_5.py", 1110, 'skip_on_worker("self_attn"'),
@@ -210,7 +210,7 @@ SEAMS: Dict[str, Seam] = {
             anchors=(
                 ("models/qwen3_vl.py", 1367, "form_a_dense_is_unsharded"),
                 ("layers/logits_processor.py", 385, "form_a_dense_is_unsharded"),
-                ("distributed/utils.py", 1734, "def tp_vocab_ratios"),
+                ("distributed/utils.py", 1743, "def tp_vocab_ratios"),
             ),
         ),
         Seam(
@@ -233,7 +233,7 @@ SEAMS: Dict[str, Seam] = {
             "pool ALLOCATION needs nothing: cell_size == 0 already has the "
             "_KVLESS_STAGE_TOKENS path at :256 / :553-557.",
             anchors=(
-                ("distributed/utils.py", 1478, "def cp_token_context_budget"),
+                ("distributed/utils.py", 1487, "def cp_token_context_budget"),
                 ("model_executor/pool_configurator.py", 173, "FORM A (F4)"),
             ),
         ),
@@ -332,8 +332,8 @@ SEAMS: Dict[str, Seam] = {
             "no log line, until the deadman fires. Measured by the probe: "
             "worker_skips_dense alone diverges at collective #0.",
             anchors=(
-                ("models/qwen4_exp.py", 1102, "form_a_dense_is_unsharded"),
-                ("form_a_symmetry.py", 1, "do the ranks still AGREE"),
+                ("models/qwen4_exp.py", 1144, "form_a_dense_is_unsharded"),
+                ("form_a_symmetry.py", 2, "do the ranks still AGREE"),
             ),
         ),
         # ---- found by the slice-2 seam survey, not in the original nine ----
@@ -354,7 +354,7 @@ SEAMS: Dict[str, Seam] = {
             "switched off'.",
             anchors=(
                 ("weg2/launcher.py", 7226, "def _saturated"),
-                ("weg2/launcher.py", 7229,
+                ("weg2/launcher.py", 7230,
                  "Form A worker: not on this axis, not saturated"),
             ),
         ),
@@ -380,7 +380,7 @@ SEAMS: Dict[str, Seam] = {
             anchors=(
                 ("layers/linear.py", 2093, "guard_zero_width_linear_shard"),
                 ("layers/linear.py", 677, "guard_zero_width_linear_shard"),
-                ("distributed/utils.py", 1806,
+                ("distributed/utils.py", 1815,
                  "def assert_activation_aligned_shards"),
             ),
         ),

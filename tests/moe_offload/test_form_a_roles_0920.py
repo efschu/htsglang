@@ -165,6 +165,11 @@ def test_a_family_may_not_overrule_a_zero_of_the_base_plan():
     # base zero still governs every dense dimension.
     with pytest.raises(ValueError, match="gave width zero"):
         set_tp_partition_ratios([1, 0, 0], {"mlp": [10, 1, 1]}, True)
+    # fnFA1 (20.09.): the expert family IS the worker's share -- the boot
+    # form MOE_RATIO=183,149,180 under TP_RATIO=1,0,0 must install, not refuse.
+    set_tp_partition_ratios([1, 0, 0], {"moe": [183, 149, 180]}, True)
+    assert get_tp_partition_ratios("moe") == [183, 149, 180]
+    assert tp_partition_sizes(2560, 3) == [2560, 0, 0]
     # the same family vector is fine when the base plan has no zeros.
     set_tp_partition_ratios([39, 13, 12], {"mlp": [10, 1, 1]}, False)
     assert get_tp_partition_ratios("mlp") == [10, 1, 1]
