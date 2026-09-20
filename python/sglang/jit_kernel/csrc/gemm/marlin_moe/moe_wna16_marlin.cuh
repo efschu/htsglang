@@ -25,10 +25,62 @@
 
 #include <sgl_kernel/scalar_type.hpp>
 
+#include <cstdlib>
+
 #include "kernel.h"
 #include "marlin_template.h"
 
 namespace device::marlin_moe {
+
+// --- Task #49 (2026-09-20): the two grid-shape levers ------------------------
+//
+// Both are read ONCE per process (function-local static) and both default to
+// "off", so an unset environment reproduces the pre-#49 launch bit for bit.
+//
+//   SGLANG_MARLIN_NO_K_SPLIT=1   -- forbid the parallel-k split entirely; the
+//       kernel rounds its stripe up to whole k-columns so slice_count == 1 and
+//       neither the lock-based global reduce nor the atomicAdd accumulate can
+//       be reached. See the comment at the rounding site in marlin_template.h.
+//
+//   SGLANG_MARLIN_SMS_OVERRIDE=<n>  -- pretend the device has <n> SMs when
+//       sizing the grid. gridDim.x is the ONLY term by which the number of
+//       co-operating threadblocks per column differs between the 5090 (170 SMs)
+//       and the 3080s (68 SMs); this makes that difference a free variable
+//       instead of a hardware constant. Values <= 0 are ignored.
+//
+// Reading the environment here rather than in Python keeps the value on the
+// same side as the launch that consumes it; the Python wrapper logs the same
+// two names once per rank so a boot log can never show a switch it did not use.
+inline bool marlin_moe_no_k_split() {
+  static const bool value = [] {
+    const char* raw = std::getenv("SGLANG_MARLIN_NO_K_SPLIT");
+    if (raw == nullptr || raw[0] == '\0') return false;
+    return raw[0] == '1' || raw[0] == 't' || raw[0] == 'T' || raw[0] == 'y' || raw[0] == 'Y';
+  }();
+  return value;
+}
+
+// SGLANG_MARLIN_EPILOGUE_SYNC -- default ON (the fix). '0' removes the barrier
+// again and restores the pre-#49 behaviour, which is what makes the A/B a
+// one-boot decision instead of an argument.
+inline bool marlin_moe_epilogue_sync() {
+  static const bool value = [] {
+    const char* raw = std::getenv("SGLANG_MARLIN_EPILOGUE_SYNC");
+    if (raw == nullptr || raw[0] == '\0') return true;
+    return !(raw[0] == '0' || raw[0] == 'f' || raw[0] == 'F' || raw[0] == 'n' || raw[0] == 'N');
+  }();
+  return value;
+}
+
+inline int marlin_moe_sms_override() {
+  static const int value = [] {
+    const char* raw = std::getenv("SGLANG_MARLIN_SMS_OVERRIDE");
+    if (raw == nullptr || raw[0] == '\0') return 0;
+    int n = std::atoi(raw);
+    return n > 0 ? n : 0;
+  }();
+  return value;
+}
 
 __global__ void MarlinDefault(MARLIN_KERNEL_PARAMS){};
 
@@ -815,7 +867,8 @@ void marlin_mm(
       A_ptr, B_ptr, C_ptr, C_tmp_ptr, bias_ptr, s_ptr, s2_ptr, zp_ptr, g_idx_ptr,
       sorted_token_ids_ptr, expert_ids_ptr, num_tokens_past_padded_ptr,
       topk_weights_ptr, top_k, mul_topk_weights, is_ep, num_groups, prob_m,
-      prob_n, prob_k, locks, has_bias, use_atomic_add, use_fp32_reduce, max_shared_mem);
+      prob_n, prob_k, locks, has_bias, use_atomic_add, use_fp32_reduce, max_shared_mem,
+      marlin_moe_no_k_split(), marlin_moe_epilogue_sync());
   // clang-format on
 }
 
@@ -915,6 +968,15 @@ void moe_wna16_marlin_gemm(
   int dev = dl_device.device_id;
   cudaStream_t stream = LaunchKernel::resolve_device(dl_device);
   RuntimeDeviceCheck(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev));
+  // Task #49: an explicit grid width wins over the hardware SM count. Applied
+  // HERE, before min_workspace_size is derived from `sms`, so the lock-buffer
+  // bound below stays consistent with the grid that is actually launched.
+  // Only DOWNWARD: the shared lock workspace was sized `hardware_sms * 4` at
+  // load time, so a grid wider than the hardware would fail the workspace check
+  // below rather than run. A narrower grid is always safe.
+  if (int sms_override = device::marlin_moe::marlin_moe_sms_override(); sms_override > 0 && sms_override < sms) {
+    sms = sms_override;
+  }
 
   // Verify c (allocation done in Python)
   device.verify(c.device());
