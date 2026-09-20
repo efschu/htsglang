@@ -460,6 +460,17 @@ class Sampler(nn.Module):
         # same-arch ranks (the farm's odd rank was not arch-predicted).
         # Opt-out: SGLANG_SYNC_SAMPLED_TOKENS=0 restores the upstream
         # opt-in/grammar-only MIN-allreduce below.
+        # FORM A (fnFA12-14, 20.09.): the host is the ONLY sampling rank --
+        # the workers run the MoE route, produce no logits and never reach
+        # the sampler; they take the host's tokens off the lockstep gloo
+        # channel (tp_worker, is_form_a_worker). A rank-0 broadcast here has
+        # no receiver: under NCCL it wedged the host's stream (both workers
+        # then blocked in cuModuleLoadData, the host in the next round's
+        # request broadcast), under Bar1 it aborted the host's spin kernel.
+        from sglang.srt.rank_role import this_rank_is_form_a_host
+
+        if this_rank_is_form_a_host():
+            return
         if (
             SGLANG_SYNC_SAMPLED_TOKENS
             and self._tp_sync_coordinator is not None
