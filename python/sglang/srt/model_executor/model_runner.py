@@ -2360,6 +2360,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
     def load_model(self):
         tic_total = time.perf_counter()
+        if os.environ.get("SGLANG_LOAD_MEMSNAP_DIR"):
+            # frames for the [vram-census] segment report / snapshot after load
+            try:
+                torch.cuda.memory._record_memory_history(max_entries=400000)
+            except Exception as exc:  # noqa: BLE001
+                logger.info("[vram-census] memory history not armed: %s", exc)
         before_avail_memory = get_available_gpu_memory(self.device, self.gpu_id)
         logger.info(
             f"Load weight begin. avail mem={get_available_gpu_memory(self.device, self.gpu_id):.2f} GB"

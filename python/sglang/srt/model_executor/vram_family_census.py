@@ -63,6 +63,71 @@ def census(
     return out
 
 
+def _frame_str(frames) -> str:
+    """First non-torch-internal frame of a snapshot block, ``file:line name``."""
+    for f in frames or ():
+        fn = str(f.get("filename", ""))
+        if "/torch/" in fn or fn.startswith("<"):
+            continue
+        return f"{fn.rsplit('/sglang/', 1)[-1]}:{f.get('line')} {f.get('name')}"
+    return "?"
+
+
+def allocator_segment_report(min_inactive_mib: int = 64, top: int = 12) -> str:
+    """Segments of the caching allocator whose INACTIVE part is >= min_inactive_mib:
+    the reserved-but-unusable VRAM. fnFL2 v4/v5 (20.09.): PP1 13.05 GiB reserved
+    against 5.97 allocated, so the KV sizing (which charges the whole reserve
+    because empty_cache cannot return a segment holding one live block) refused.
+    Frames appear only when ``torch.cuda.memory._record_memory_history`` was
+    armed (SGLANG_LOAD_MEMSNAP_DIR arms it at load begin)."""
+    try:
+        snap = torch.cuda.memory._snapshot()
+    except Exception as exc:  # noqa: BLE001
+        return f"segment report unavailable: {exc}"
+    rows = []
+    pinned = 0
+    for seg in snap.get("segments", ()):
+        total = int(seg.get("total_size", 0))
+        active = int(seg.get("active_size", 0))
+        inactive = total - active
+        if inactive < min_inactive_mib * 2**20 or active <= 0:
+            continue
+        pinned += inactive
+        holders = []
+        for b in seg.get("blocks", ()):
+            if str(b.get("state", "")).startswith("active"):
+                holders.append((int(b.get("size", 0)), _frame_str(b.get("frames"))))
+        holders.sort(reverse=True)
+        rows.append((inactive, total, active, holders[:2]))
+    rows.sort(reverse=True)
+    parts = []
+    for inactive, total, active, holders in rows[:top]:
+        h = "; ".join(f"{sz / 2**20:.0f}MiB@{fr}" for sz, fr in holders) or "-"
+        parts.append(f"seg {total / 2**20:.0f}MiB active {active / 2**20:.0f} held by {h}")
+    return (
+        f"{len(rows)} segment(s) pin {pinned / 2**30:.2f} GiB of inactive reserve: "
+        + " | ".join(parts)
+    )
+
+
+def dump_load_memsnap(tag: str) -> None:
+    """SGLANG_LOAD_MEMSNAP_DIR=<dir>: write the allocator snapshot (with the
+    history armed at load begin) as <dir>/load_<tag>_<pid>.pickle for
+    mcp__debugtools__memsnapshot_analyze."""
+    import os
+
+    d = os.environ.get("SGLANG_LOAD_MEMSNAP_DIR", "")
+    if not d:
+        return
+    try:
+        os.makedirs(d, exist_ok=True)
+        path = os.path.join(d, f"load_{tag}_{os.getpid()}.pickle")
+        torch.cuda.memory._dump_snapshot(path)
+        logger.info("[vram-census] %s allocator snapshot -> %s", tag, path)
+    except Exception as exc:  # noqa: BLE001
+        logger.info("[vram-census] %s allocator snapshot failed: %s", tag, exc)
+
+
 def log_vram_family_census(
     model: torch.nn.Module, tag: str, where: str
 ) -> Dict[str, int]:
@@ -88,6 +153,10 @@ def log_vram_family_census(
         alloc,
         reserved,
     )
+    if reserved - alloc >= 1.0 and where == "after load":
+        # the reserve the KV sizing is about to charge: name what pins it
+        logger.info("[vram-census] %s %s: %s", tag, where, allocator_segment_report())
+        dump_load_memsnap(tag)
     if where == "after pools":
         # from here on the allocator peak is the RUNTIME transient (prefill
         # chunk, graphs, decode), not the load-time peak of the un-offloaded
