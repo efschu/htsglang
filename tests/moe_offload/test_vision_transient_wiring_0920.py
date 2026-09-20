@@ -349,9 +349,9 @@ def test_the_census_emits_it_at_the_one_honest_moment():
     import inspect
 
     src = inspect.getsource(vfc)
-    assert 'log_vram_idle(runner, "after pools")' in src
+    assert 'log_vram_idle(model, "after pools")' in src
     # exactly one CALL (the `def` line matches the same prefix, hence `("`)
-    assert src.count('log_vram_idle(runner, "') == 1
+    assert src.count('log_vram_idle(model, "') == 1
 
 
 def test_the_idle_reading_is_a_different_instrument_from_the_peak_one():
@@ -364,3 +364,44 @@ def test_the_idle_reading_is_a_different_instrument_from_the_peak_one():
     assert "free_idle" in inspect.getdoc(vfc.log_vram_idle) or "free_idle" in (
         inspect.getsource(vfc.log_vram_idle)
     )
+
+
+def test_argv_p_hands_the_vision_form_to_the_model_argv():
+    """xsn403 (20.09.): argv_p accepted ``vision`` and dropped it, so P was
+    launched text-only (``--no-enable-multimodal``) and the transient stage
+    refused to arm (W111). The P argv must carry the transient override and
+    NOT the multimodal switch-off; ``off`` keeps the old argv; D stays
+    text-only regardless."""
+    from sglang.srt.weg2 import launcher as lz
+
+    def p_argv(vision):
+        return lz.argv_p("py", "/models/Qwen3.8-27B-INT8-gdncov", [1, 1, 1], 4, 512,
+                         "store", [], vision=vision)
+
+    transient = p_argv("transient")
+    assert "--no-enable-multimodal" not in transient
+    i = transient.index("--json-model-override-args")
+    assert transient[i + 1] == lz.VISION_TRANSIENT_OVERRIDE
+    off = p_argv("off")
+    assert "--no-enable-multimodal" in off
+    assert "--json-model-override-args" not in off
+
+
+def test_after_pools_census_reaches_the_idle_reading(monkeypatch):
+    """xsn405: ``log_vram_family_census(..., "after pools")`` referenced a
+    ``runner`` the function never had; the NameError was swallowed by the
+    caller's census guard after the census line had printed, so no P log
+    ever carried ``[vram-idle] after pools`` (acceptance (b), design §6)."""
+    import torch
+
+    from sglang.srt.model_executor import vram_family_census as vc
+
+    seen = []
+    monkeypatch.setattr(vc, "log_vram_idle", lambda runner, where, **kw: seen.append(where))
+    monkeypatch.setattr(vc.torch.cuda, "reset_peak_memory_stats", lambda: None, raising=False)
+    model = torch.nn.Linear(4, 4)
+    vc.log_vram_family_census(model, "pp0tp0", "after pools")
+    assert seen == ["after pools"]
+    seen.clear()
+    vc.log_vram_family_census(model, "pp0tp0", "after load")
+    assert seen == []
