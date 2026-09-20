@@ -363,6 +363,28 @@ _is_npu = is_npu()
 _is_hip = is_hip()
 
 
+PREFILL_TRANSIENT_ENV = "SGLANG_KV_BUDGET_PREFILL_TRANSIENT_MIB"
+
+
+def prefill_transient_mib_for_rank(text: str, rank: int) -> float:
+    """Task #48 C: the measured prefill activation transient to book for
+    ``rank``, MiB. ``text`` is a scalar (every rank) or a comma vector (one
+    entry per rank); empty or unparsable -> 0.0 (nothing booked, sizing
+    byte-identical). A vector shorter than ``rank`` books 0 for that rank."""
+    t = (text or "").strip()
+    if not t:
+        return 0.0
+    parts = [x.strip() for x in t.split(",")]
+    try:
+        if len(parts) == 1:
+            return max(0.0, float(parts[0]))
+        if 0 <= int(rank) < len(parts):
+            return max(0.0, float(parts[int(rank)]))
+    except ValueError:
+        return 0.0
+    return 0.0
+
+
 class ModelRunnerKVCacheMixin:
     # === #119: expert-offload VRAM -> KV pool ==============================
     # The expert offload (#77/#123) parks cold experts in a pinned host pool and
@@ -850,6 +872,24 @@ class ModelRunnerKVCacheMixin:
             rest_memory, _reserve_post = self._gapped_corridor_holdback(rest_memory)
             if _reserve_post is not None:
                 budget_posts.append(_reserve_post)
+            # Task #48 C (19./20.09.): the prefill activation transient is a
+            # MEASURED post ([vram-peak]: 1.69 GiB per rank at 8192-token
+            # chunks on Next Flash), booked here explicitly. Without it the
+            # sizer left ~1.9 GiB of slack that the transient plus allocator
+            # fragmentation ate: fn8h died at 187 MiB free wanting 200, fn8i at
+            # 481 wanting 520. On the uneven-DCP path the ledger's activation
+            # reserve never runs (see ServerArgs.activation_reserve_mb), so
+            # this is the only place the number can enter. Env vector, one
+            # entry per rank, default 0 = byte-identical sizing.
+            _transient_gb = (
+                prefill_transient_mib_for_rank(
+                    os.environ.get(PREFILL_TRANSIENT_ENV, ""), self._rank_vector_index()
+                )
+                / 1024.0
+            )
+            if _transient_gb > 0.0:
+                rest_memory -= _transient_gb
+                budget_posts.append(("prefill transient (measured)", _transient_gb))
             # #260: the budget is ABSOLUTE, so a co-resident process must
             # never shrink it -- but it does bound what this rank can
             # physically allocate. That bound gets its own check and its own
