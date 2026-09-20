@@ -227,3 +227,114 @@ def test_report_survives_a_broken_mask(caplog):
     with caplog.at_level("ERROR"):
         fmm._stage_probe_report({"INPUT-A": "not a tensor"}, True, 8, 1, 64)
     assert "[nan-probe-in] ORIGIN" not in caplog.text
+
+
+# --- fn8c5: the probe must be a NO-OP while a CUDA graph is recording -------
+
+
+class _SyncTrap:
+    """Any attribute access is a host sync as far as this test is concerned.
+
+    The level-2 stage walk reaches the device through exactly three verbs --
+    `.sum().item()`, `.tolist()` and `&` -- so a mask that explodes on ANY
+    attribute access proves 'not touched' rather than 'touched harmlessly'."""
+
+    def __init__(self):
+        self.touched = []
+
+    def __getattr__(self, name):
+        self.touched.append(name)
+        raise AssertionError(f"host sync under capture: mask.{name}")
+
+    def __and__(self, other):
+        raise AssertionError("host sync under capture: mask & mask")
+
+
+@pytest.fixture
+def capturing(monkeypatch):
+    monkeypatch.setattr(fmm, "_is_cuda", True)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    fmm._CAPTURE_LOGGED["done"] = False
+    yield
+    fmm._CAPTURE_LOGGED["done"] = False
+
+
+@pytest.fixture
+def not_capturing(monkeypatch):
+    monkeypatch.setattr(fmm, "_is_cuda", True)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    fmm._CAPTURE_LOGGED["done"] = False
+    yield
+    fmm._CAPTURE_LOGGED["done"] = False
+
+
+def test_stage_probe_is_off_under_capture(monkeypatch, capturing):
+    """fn8c5 died here: every stage count is a device-to-host sync and all three
+    ranks hit cudaErrorStreamCaptureInvalidated in capture_one_shape."""
+    monkeypatch.setenv("SGLANG_MOE_MARLIN_C_SENTINEL", "2")
+    assert marlin_stage_probe_on() is True, "the switch is still on ..."
+    assert fmm.marlin_stage_probe_active() is False, "... but the probe is not"
+
+
+def test_stage_probe_is_on_outside_capture(monkeypatch, not_capturing):
+    monkeypatch.setenv("SGLANG_MOE_MARLIN_C_SENTINEL", "2")
+    assert fmm.marlin_stage_probe_active() is True
+
+
+def test_the_capture_skip_is_logged_exactly_once(monkeypatch, capturing, caplog):
+    monkeypatch.setenv("SGLANG_MOE_MARLIN_C_SENTINEL", "2")
+    with caplog.at_level("ERROR"):
+        for _ in range(5):
+            assert fmm.marlin_stage_probe_active() is False
+    # Once, because a captured decode replays constantly; and at all, because
+    # "no ORIGIN lines" must never be readable as "decode was clean".
+    assert caplog.text.count("UNMEASURED-UNDER-CAPTURE") == 1
+
+
+def test_report_touches_no_mask_under_capture(capturing, caplog):
+    traps = {k: _SyncTrap() for k in STAGE_ORDER}
+    with caplog.at_level("ERROR"):
+        fmm._stage_probe_report(traps, True, 8, 1, 64)
+    for k, t in traps.items():
+        assert t.touched == [], f"{k}: {t.touched}"
+    assert "[nan-probe-in] ORIGIN" not in caplog.text
+
+
+def test_report_still_works_outside_capture(not_capturing, caplog):
+    bad = torch.zeros(4, dtype=torch.bool)
+    bad[1] = True
+    masks = {"INPUT-A": torch.zeros(4, dtype=torch.bool), "GEMM1": bad,
+             "ACT": bad, "GEMM2": bad}
+    with caplog.at_level("ERROR"):
+        fmm._stage_probe_report(masks, True, 4, 1, 64)
+    assert "ORIGIN ENTERS-AT-GEMM1" in caplog.text
+
+
+def test_capture_detection_fails_closed(monkeypatch):
+    """If we cannot tell whether a graph is recording, the answer is YES.
+
+    A probe that cannot tell must not gamble with the boot -- the cost of a
+    wrong 'no' was fn8c5, the cost of a wrong 'yes' is one missing log line."""
+    monkeypatch.setattr(fmm, "_is_cuda", True)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+
+    def boom():
+        raise RuntimeError("no context")
+
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", boom)
+    assert fmm._capture_active() is True
+
+
+def test_capture_is_false_without_cuda(monkeypatch):
+    monkeypatch.setattr(fmm, "_is_cuda", False)
+    assert fmm._capture_active() is False
+
+
+def test_level_1_is_unaffected_by_the_capture_gate(monkeypatch, capturing):
+    """fn8ar/fn8c2 ran level 1 through capture without trouble; that must stay
+    exactly true, or their logs stop being comparable to the next boot's."""
+    monkeypatch.setenv("SGLANG_MOE_MARLIN_C_SENTINEL", "1")
+    assert marlin_c_sentinel_on() is True
+    assert fmm.marlin_stage_probe_active() is False
