@@ -904,6 +904,12 @@ class CollectiveClock:
             return None, f"graph-replay-nodes-overwritten-by-{lag}"
         fams = self._read_graph_nodes(nodes, count_unready=count)
         if fams is None:
+            lu = getattr(self, "_last_unread", None)
+            if lu:
+                return None, (
+                    f"graph-replay-nodes-unread[{lu[1]}:{lu[0]} node {lu[3]}/{lu[4]} "
+                    f"{lu[2]} {lu[5]}]"
+                )
             return None, "graph-replay-nodes-unread"
         lag = self._executed_past(nodes, generation)
         if lag:
@@ -960,11 +966,17 @@ class CollectiveClock:
           of this key was launched while this loop ran.
         """
         acc: Dict[str, List[float]] = {}
-        for pre, post, family in nodes.pairs:
+        for idx, (pre, post, family) in enumerate(nodes.pairs):
             try:
                 if not post.query():
                     if count_unready:
                         self._graph_unready_reads += 1
+                    # 20.09. fn8n/fn8k: every Next Flash round read 'unread'
+                    # with and without overlap -- name WHICH graph and node.
+                    self._last_unread = (
+                        str(getattr(nodes, "key", "?")), str(getattr(nodes, "phase", "")),
+                        str(family), int(idx), len(nodes.pairs), "incomplete",
+                    )
                     return None
                 ms = pre.elapsed_time(post)
             except RuntimeError:
@@ -972,6 +984,10 @@ class CollectiveClock:
                 # mid-read. Same outcome as an incomplete node, same counter.
                 if count_unready:
                     self._graph_unready_reads += 1
+                self._last_unread = (
+                    str(getattr(nodes, "key", "?")), str(getattr(nodes, "phase", "")),
+                    str(family), int(idx), len(nodes.pairs), "not-ready",
+                )
                 return None
             cell = acc.get(family)
             if cell is None:
