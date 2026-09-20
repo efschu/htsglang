@@ -41,3 +41,16 @@ def test_primary_read_sees_the_loading_config(monkeypatch):
     # cleared after the primary read: a later secondary/draft read must not
     # inherit the target's config
     assert ldr._loading_model_config is None
+
+
+def test_the_prefetch_branch_never_names_a_bare_model_config():
+    """fnFL1a (20.09.): _get_weights_iterator read `model_config`, a name the
+    function never binds -- NameError on the PP3 load path. The loading
+    config lives on self._loading_model_config (5bce92590e)."""
+    import inspect
+
+    from sglang.srt.model_loader import loader as ld
+
+    src = inspect.getsource(ld.DefaultModelLoader._get_weights_iterator)
+    assert 'getattr(model_config, "is_draft_model"' not in src
+    assert '_loading_model_config' in src
