@@ -1240,12 +1240,39 @@ class SchedulerWeightUpdaterManager:
                 reserved, allocated = int(module.memory_reserved()), int(module.memory_allocated())
             except Exception:  # noqa: BLE001
                 reserved, allocated = None, None
+            # #1491: the CARD terms, so the line can say whether the bytes
+            # that went missing since the last wake are this process's at all.
+            _card_total = None
+            _card_free = None
+            try:
+                uuid_key = self._weg2_card_uuid()
+                if uuid_key is not None:
+                    from sglang.srt.registry import nvml as _nvml_registry
+
+                    _info = _nvml_registry.memory_info_for_uuid(uuid_key)
+                    _card_total = int(_info.total_bytes)
+                    _card_free = int(_info.free_bytes)
+            except Exception:  # noqa: BLE001 -- an absent reading is n/a, not 0
+                _card_total = _card_free = None
             rec = dc_breakdown(
                 nvml_proc_bytes=self._weg2_nvml_self_bytes(),
                 torch_reserved=reserved, torch_allocated=allocated,
                 tag_bytes=tag_bytes, offload_tags=getattr(self, "offload_tags", None),
+                card_total_bytes=_card_total, card_free_bytes=_card_free,
             )
             logger.info("%s", format_dc_breakdown(rec, stage=stage))
+            # #1491: and the WAKE-TO-WAKE delta, which is the question boots
+            # weg2xsn406/408 could not answer -- 8387 MiB free at D TP1's
+            # first wake, 5974 at its second, and no line anywhere saying
+            # which post took the difference.
+            _creep_key = stage.split()[0]
+            if _creep_key.startswith("wake"):
+                from sglang.srt.managers.weg2_memory_saver import (  # noqa: PLC0415
+                    dc_creep, format_dc_creep, remember_dc,
+                )
+
+                _prev = remember_dc(_creep_key, rec)
+                logger.info("%s", format_dc_creep(dc_creep(_prev, rec), stage=stage))
             # #1452: with SGLANG_WEG2_DC_SNAPSHOT=1 the allocator's snapshot of
             # the UNTAGGED remainder (794 / 772 MiB per card at weg2xsn207)
             # goes to the evidence dir once all tags are paused -- the census
@@ -7447,6 +7474,14 @@ class SchedulerWeightUpdaterManager:
                 Weg2TmsResumeRefused,
             )
             from sglang.srt.weg2.wake_kv import kv_resume_fit_refusal
+
+            # #1491: the census BEFORE the resume, on every wake. This is the
+            # reading that did not exist: `stage=release` runs at the SLEEP,
+            # so a creep that happens between a sleep and the next wake -- the
+            # co-resident group's prefill, on the same card -- was never in
+            # any log. Emitted before the fit check so that a refused wake is
+            # explained by the line above it, not only named by the line below.
+            self._weg2_log_dc_breakdown("wake-pre-kv epoch=%s" % (_kv_epoch,))
 
             _kv_need = None
             _kv_free = None

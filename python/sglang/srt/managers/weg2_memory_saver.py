@@ -3167,6 +3167,8 @@ def dc_breakdown(
     torch_allocated: Optional[int],
     tag_bytes: Dict[str, int],
     offload_tags: Any,
+    card_total_bytes: Optional[int] = None,
+    card_free_bytes: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Pure: the attribution record from the three readings.  MiB, rounded."""
     paused = {str(t) for t in (offload_tags or ())}
@@ -3196,7 +3198,112 @@ def dc_breakdown(
         "resident_tags_mib": {t: mib(b) for t, b in sorted(res_tags.items())},
         "paused_tags_mib": {t: mib(b) for t, b in sorted(pau_tags.items())},
         "other_mib": mib(other),
+        # --- #1491: the CARD, not just this process -----------------------
+        # The three readings above answer "what does MY pid hold". Boots
+        # weg2xsn406 and weg2xsn408 asked a question they cannot answer: D's
+        # TP1 found 8387 MiB free at its first wake and 5974 MiB at its
+        # second, and this rank's own dormant residue grew by only 232 MiB in
+        # between (untagged_live 224 -> 437, nvml_proc 1598 -> 1830). The
+        # missing ~2.2 GiB is on the card and belongs to SOMEONE ELSE -- the
+        # co-resident P group, which prefills on the same card between D's
+        # wakes. No instrument read that, so it was never attributed, and the
+        # wake walked into an OOM it could have named.
+        #
+        # `card_other_procs` is that term: total - free - mine. It is a
+        # RESIDUAL, so it also absorbs any driver accounting this process
+        # cannot see -- named as a residual rather than claimed as the
+        # sibling's, because the honest bound is "not mine".
+        "card_total_mib": mib(card_total_bytes),
+        "card_free_mib": mib(card_free_bytes),
+        "card_other_procs_mib": (
+            None
+            if (card_total_bytes is None or card_free_bytes is None
+                or nvml_proc_bytes is None)
+            else mib(max(0, int(card_total_bytes) - int(card_free_bytes)
+                         - int(nvml_proc_bytes)))
+        ),
     }
+
+
+#: The posts a wake-to-wake comparison walks, biggest mover first. `card_free`
+#: leads because it is the quantity the wake actually fails on; the rest say
+#: WHO took it.
+DC_CREEP_POSTS = (
+    "card_free_mib",
+    "card_other_procs_mib",
+    "nvml_proc_mib",
+    "torch_untagged_mib",
+    "other_mib",
+    "tms_resident_mib",
+    "tms_paused_mib",
+    "torch_reserved_mib",
+)
+
+#: Per-process store of the previous record per key (rank+stage). Process-local
+#: by construction: a creep is a statement about ONE rank's own history.
+_dc_previous: Dict[str, Dict[str, Any]] = {}
+
+
+def remember_dc(key: str, rec: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Store ``rec`` under ``key`` and return what was there before."""
+    prev = _dc_previous.get(str(key))
+    if rec is not None:
+        _dc_previous[str(key)] = dict(rec)
+    return prev
+
+
+def forget_dc(key: Optional[str] = None) -> None:
+    """Test-only. Drop one key's history, or all of it."""
+    if key is None:
+        _dc_previous.clear()
+    else:
+        _dc_previous.pop(str(key), None)
+
+
+def dc_creep(prev: Optional[Dict[str, Any]],
+             cur: Optional[Dict[str, Any]]) -> Optional[Dict[str, int]]:
+    """Per-post MiB delta ``cur - prev``, or None when there is nothing to say.
+
+    A post missing from EITHER record is left out entirely rather than read as
+    a zero: a reading that could not be taken is an absence
+    (NULL-NUR-BEI-ERREICHTEM-EMITTER), and a zero delta built from two
+    absences is the exact shape that made this creep invisible for two boots.
+    """
+    if not prev or not cur:
+        return None
+    out: Dict[str, int] = {}
+    for post in DC_CREEP_POSTS:
+        a, b = prev.get(post), cur.get(post)
+        if a is None or b is None:
+            continue
+        out[post] = int(b) - int(a)
+    return out or None
+
+
+def format_dc_creep(delta: Optional[Dict[str, int]], *, stage: str,
+                    since: str = "the previous wake") -> str:
+    """The one creep line (``WEG2-VRAM-CREEP``). Names the biggest TAKER.
+
+    "Biggest taker" is the post that GREW most, except for ``card_free_mib``,
+    where growth is good news -- it is reported as the headline number and
+    never nominated as a culprit.
+    """
+    if not delta:
+        return (f"WEG2-VRAM-CREEP stage={stage} n/a -- no comparable record from "
+                f"{since} on this rank (first wake, or a reading that could not "
+                f"be taken; an absence, not a zero)")
+    takers = {k: v for k, v in delta.items() if k != "card_free_mib"}
+    worst = max(takers.items(), key=lambda kv: kv[1]) if takers else None
+    free = delta.get("card_free_mib")
+    head = "n/a" if free is None else f"{free:+d} MiB"
+    body = " ".join(f"{k[:-4] if k.endswith('_mib') else k}={v:+d}"
+                    for k, v in delta.items())
+    tail = ("no post grew" if worst is None or worst[1] <= 0
+            else f"BIGGEST TAKER {worst[0][:-4]} {worst[1]:+d} MiB")
+    return (f"WEG2-VRAM-CREEP stage={stage} card_free {head} since {since}; "
+            f"{body}; {tail} (every figure is MiB, delta of THIS rank's own "
+            f"readings; card_other_procs is a RESIDUAL total-free-mine, so it "
+            f"names bytes that are NOT this process's, never whose they are)")
 
 
 def format_dc_breakdown(rec: Dict[str, Any], *, stage: str) -> str:
@@ -3208,7 +3315,9 @@ def format_dc_breakdown(rec: Dict[str, Any], *, stage: str) -> str:
         f"+ torch_untagged {n('torch_untagged_mib')} (workspaces, static buffers, allocator cache) "
         f"+ other {n('other_mib')} (context+driver+communicator+non-torch); "
         f"tms_paused {n('tms_paused_mib')} {rec.get('paused_tags_mib') or {}} is unmapped and NOT in nvml_proc; "
-        f"raw torch_reserved {n('torch_reserved_mib')} allocated {n('torch_allocated_mib')} "
+        f"raw torch_reserved {n('torch_reserved_mib')} allocated {n('torch_allocated_mib')}; "
+        f"card free {n('card_free_mib')} of {n('card_total_mib')} MiB total, "
+        f"other processes hold {n('card_other_procs_mib')} MiB (residual total-free-mine) "
         f"(instrument: NVML per-process bytes for this pid = the front's WEG2-DC quantity; "
         f"torch_untagged = reserved - resident - paused, because torch keeps the saver's regions "
         f"reserved even when unmapped; tms = saver tag sums split by offload_tags)"
