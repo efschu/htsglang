@@ -2760,6 +2760,27 @@ def weights_region(adapter: Any, tag: str, *, enable_cpu_backup: bool) -> Iterat
             "of its own -- see weight_chunk_scope."
         )
     with weights_region_tag(tag):
+        if weights_resident_armed():
+            # Scheibe 6a / fnFL2 v4-v6 (20.09.): the weights never sleep on
+            # this arm, so they need no saver pool -- and a saver pool is a
+            # PRIVATE torch.cuda.MemPool whose freed blocks torch.cuda.
+            # empty_cache() never returns while the pool object lives
+            # (metal probe pool_probe.py: 1.8 GiB freed inside a MemPool stays
+            # reserved through empty_cache; only use_count 0 releases it).
+            # The load-time transients (presplit full [E] stacks, marlin
+            # repack) therefore pinned 7.1 GiB on PP1 (13.05 reserved vs
+            # 5.97 allocated) and the KV sizing, which charges the card's
+            # occupancy, refused. Outside the pool the transients go back to
+            # the driver at the sizing's empty_cache. The tag is still
+            # published: the census, weight_chunk_scope (a no-op without a
+            # TMS region) and the release refusal read the name, not the pool.
+            logger.info(
+                "WEG2-WEIGHTS-RESIDENT: %s loads OUTSIDE the memory-saver pool "
+                "(no pause on this arm; load transients return to the driver)",
+                tag,
+            )
+            yield tag
+            return
         with adapter.region(tag, enable_cpu_backup=enable_cpu_backup):
             # #1378 xsn66: the base tag's own pool, INSIDE the region so its
             # segments are cudaMalloc'ed under this tag. A layer band nested

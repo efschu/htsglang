@@ -67,7 +67,9 @@ def _frame_str(frames) -> str:
     """First non-torch-internal frame of a snapshot block, ``file:line name``."""
     for f in frames or ():
         fn = str(f.get("filename", ""))
-        if "/torch/" in fn or fn.startswith("<"):
+        # C++ unwind frames ("??", libtorch) and torch's own Python carry no
+        # address of ours -- the first sglang/user .py frame does
+        if not fn.endswith(".py") or "/torch/" in fn or fn.startswith("<"):
             continue
         return f"{fn.rsplit('/sglang/', 1)[-1]}:{f.get('line')} {f.get('name')}"
     return "?"

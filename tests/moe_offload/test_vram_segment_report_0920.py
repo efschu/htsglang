@@ -55,6 +55,7 @@ def test_report_survives_a_missing_snapshot(monkeypatch):
 
 def test_frame_str_skips_torch_internals():
     assert vc._frame_str([{"filename": "<string>", "line": 1, "name": "a"}]) == "?"
+    assert vc._frame_str([{"filename": "??", "line": 0, "name": "torch::unwind::unwind()"}, {"filename": "/r/python/sglang/x.py", "line": 3, "name": "f"}]) == "x.py:3 f"
     assert vc._frame_str(None) == "?"
 
 
