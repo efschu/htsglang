@@ -2259,6 +2259,12 @@ class ModelRunnerKVCacheMixin:
         r = self.server_args.mamba_full_memory_ratio
         mamba_share_gb = max(usable_gb, 0.0) * r / (1.0 + r)
         per_slot_bytes = per_req * (1.0 + D / max(ratio, 1))
+        if per_slot_bytes <= 0:
+            # Form A worker (fnFL2 v11, 20.09.): no GDN/mamba state lives on
+            # this rank, so a slot costs nothing and there is nothing to fit
+            # -- the ceiling holds (the old `//` raised ZeroDivisionError the
+            # moment the worker's weights overran its budget).
+            return wanted
         fitted = int(mamba_share_gb * (1 << 30) // per_slot_bytes)
         fitted = max(0, min(fitted, wanted))
         if fitted >= wanted:
