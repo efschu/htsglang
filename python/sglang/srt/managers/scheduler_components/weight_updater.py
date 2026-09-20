@@ -5947,6 +5947,19 @@ class SchedulerWeightUpdaterManager:
         # ordered first on the sleep and last on the wake, which is exactly
         # upstream's pause/resume order for cuda_graph.
         tags = self._weg2_with_graph_tag(tags, weg2_memory_saver_on)
+        # Task #47 Scheibe 6a: under --flip-weights resident the weights family
+        # is never paused. A release naming one is a wrong front, not a sleep --
+        # refused by name before any tag is touched.
+        from sglang.srt.managers.weg2_memory_saver import weights_resident_armed as _wra
+
+        if _wra():
+            _foreign = [t for t in tags if is_weights_family_tag(t)]
+            if _foreign:
+                raise Weg2WakeRefused(
+                    "W4 Weg2WakeRefused: this boot keeps the weights RESIDENT "
+                    f"(SGLANG_WEG2_WEIGHTS_RESIDENT=1) but the release named {_foreign}; "
+                    "only kv_cache/cuda_graph may sleep here -- nothing paused"
+                )
 
         # #1233 one-backup flip: the weights are a FAMILY of tags (the base
         # GPU_MEMORY_TYPE_WEIGHTS plus weights_<k> per layer chunk, see

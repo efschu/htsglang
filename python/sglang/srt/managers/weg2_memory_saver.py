@@ -332,6 +332,19 @@ def checkpoint_quantization(model_config: Any, server_args: Any) -> Optional[str
     return None
 
 
+#: Task #47 Scheibe 6a (20.09.): the launcher's ``--flip-weights resident`` form.
+#: Both groups keep their weights MAPPED for the whole boot and only kv_cache
+#: (+ cuda_graph) flips, so no wake ever refills a weights tag -- the
+#: backup-OFF lock's premise ("the wake reloads the weights from disk") does
+#: not apply, and a release that names a weights-family tag is a defect, not a
+#: sleep. Set by weg2/launcher.build_env, read here and in the release handler.
+WEIGHTS_RESIDENT_ENV = "SGLANG_WEG2_WEIGHTS_RESIDENT"
+
+
+def weights_resident_armed() -> bool:
+    return os.environ.get(WEIGHTS_RESIDENT_ENV, "0").strip() == "1"
+
+
 def assert_backup_off_wake_refill_is_defined(
     *, quantization: Optional[str], context: str,
     exchange_owns_wake_refill: bool = False,
@@ -383,6 +396,12 @@ def assert_backup_off_wake_refill_is_defined(
     bytes and no reload runs at all), or serve an unquantized checkpoint.
     """
     if exchange_owns_wake_refill:
+        return
+    if weights_resident_armed():
+        # Scheibe 6a: the weights never sleep on this arm, so there is no
+        # wake refill to define; the release handler refuses a weights tag.
+        logger.info("WEG2-WEIGHTS-RESIDENT: backup-OFF wake lock not applicable "
+                    "(%s) -- the weights family never sleeps on this boot", context)
         return
     if not quantization:
         return

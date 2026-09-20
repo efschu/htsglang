@@ -4526,6 +4526,7 @@ def _env_knobs(ns) -> Dict[str, object]:
         "lane_coverage_token": lane_coverage_boot_token(ns),
         "weg2_boot_token": weg2_boot_token(ns),
         "profile": getattr(ns, "profile", PROFILE_QWEN27B),
+        "flip_weights": getattr(ns, "flip_weights", "family"),
         # Task #58: the vision form, so `build_env` can publish the arming
         # variable for P. Gathered HERE with the other six for the reason this
         # function exists: three call sites build an environment and a value
@@ -4656,6 +4657,7 @@ def build_env(tree: str, venv: str, cvd: str, store_dir: str, debug_hold: bool, 
               # SGLANG_WEG2_VISION for the P group ONLY (see below).
               vision: str = VISION_OFF,
               profile: str = PROFILE_QWEN27B,
+              flip_weights: str = "family",
               xchg_env: Optional[Dict[str, str]] = None) -> Dict[str, str]:
     env = dict(os.environ)
     # Task #58: THE ARMING SIGNAL for the transient vision stage, and the ONE
@@ -4898,6 +4900,10 @@ def build_env(tree: str, venv: str, cvd: str, store_dir: str, debug_hold: bool, 
         from sglang.srt.flip_nextflash_groups import GROUP_ENV_VALUES
 
         env.update(GROUP_ENV_VALUES[group])
+    if flip_weights == "resident":
+        from sglang.srt.managers.weg2_memory_saver import WEIGHTS_RESIDENT_ENV
+
+        env[WEIGHTS_RESIDENT_ENV] = "1"
     env["SGLANG_BARLINK_BUILD_WINDOW_CAP_S"] = str(barlink_build_window_cap_s)
     if str(transport) == "nccl":
         # #1234 C6: half-configuring a transport the group does not run is
@@ -10778,6 +10784,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     else:
         weights_cpu_backup_armed = weight_exchange.weights_cpu_backup_armed(
             explicit=ns.weg2_weights_cpu_backup)
+    if getattr(ns, "flip_weights", "family") == "resident":
+        # Task #47 Scheibe 6a: the weights never sleep -> no host ring, no cpu
+        # backup, no exchange; the ring planner takes the ABSENT-BY-DESIGN path.
+        weights_cpu_backup_armed = False
+        print("WEG2-LAUNCH --flip-weights resident: weights of BOTH groups stay mapped, "
+              "only kv_cache flips; host ring / cpu backup ABSENT-BY-DESIGN", flush=True)
     # #1348: both coverage instruments armed at once is a burnt window, and
     # the cheapest place to say so is here -- before anything is started.
     refuse_double_coverage_arm(os.environ, xchg_coverage_diff=getattr(
