@@ -89,6 +89,7 @@ from typing import (
     List,
     Mapping,
     Optional,
+    Sequence,
     Tuple,
 )
 
@@ -132,7 +133,20 @@ __all__ = [
     "prefill_seconds",
     "require_switchable",
     "run_move_ops",
+    "run_move_ops_guarded",
+    "require_breakable_route",
+    "require_union_fits",
+    "placement_switch_seconds",
+    "slowest_hop_seconds",
+    "union_kv_costs",
+    "union_layout",
     "vram_freed_bytes",
+    "MoverNotCapturable",
+    "RANK_INDEXED_VECTORS",
+    "StagePermutation",
+    "StagePermutationIncomplete",
+    "UnionKvCost",
+    "UnionKvTooCostly",
 ]
 
 
@@ -812,6 +826,9 @@ class SwitchVerdict:
     margin_s: float
     breakeven_tokens: Optional[int]
     why: str
+    #: The union's token price per stage, when it was priced. Reported rather
+    #: than folded into a second: tokens and seconds are different units.
+    union_costs: Tuple["UnionKvCost", ...] = ()
 
     @property
     def switches(self) -> bool:
@@ -831,7 +848,9 @@ class SwitchVerdict:
             f"prefill_s={self.chosen.prefill_s:.3f} flip_s={self.chosen.flip_s:.3f} "
             f"moved_mib={self.chosen.moved_bytes / 1048576:.0f} "
             f"freed_mib={self.chosen.vram_freed_bytes / 1048576:.0f} "
-            f"breakeven_tokens={be} why={self.why}"
+            f"breakeven_tokens={be} "
+            f"union_tok_lost={max((c.tokens_lost for c in self.union_costs), default=0)} "
+            f"why={self.why}"
         )
 
 
@@ -843,17 +862,31 @@ def _price(
     end_on: PLayout,
     pending_tokens: int,
     calib: SwitchCalibration,
+    recapture_s: float = 0.0,
 ) -> Plan:
-    """Price one course: switch to ``run_on``, prefill there, end on ``end_on``."""
+    """Price one course: switch to ``run_on``, prefill there, end on ``end_on``.
+
+    ``recapture_s`` is the CUDA-graph re-record the switch forces, charged to
+    each LEG that actually moves the boundary. It is a real cost on the
+    critical path, not an aside: the captured prefill graphs bake the executed
+    layer set, so a boundary that moves leaves every graph to be re-recorded or
+    discarded (``runner/graph_recapture.py``). Zero by default so a caller who
+    has not measured it gets the old arithmetic rather than a guessed term.
+    """
     switch_plan = plan_layer_moves(current, run_on, calib.layer_bytes)
     back_plan = plan_layer_moves(run_on, end_on, calib.layer_bytes)
     freed = vram_freed_bytes(current, end_on, 0, calib.geom, calib.layer_bytes)
+    recap = float(recapture_s)
+    moves_out = current.counts != run_on.counts
+    moves_back = run_on.counts != end_on.counts
     return Plan(
         action=action,
         end_layout=end_on.name,
-        switch_s=move_seconds(switch_plan, calib.rates),
+        switch_s=move_seconds(switch_plan, calib.rates) + (recap if moves_out else 0.0),
         prefill_s=prefill_seconds(run_on, pending_tokens, calib),
-        back_switch_s=move_seconds(back_plan, calib.rates),
+        back_switch_s=(
+            move_seconds(back_plan, calib.rates) + (recap if moves_back else 0.0)
+        ),
         flip_s=calib.flip_of(end_on),
         moved_bytes=switch_plan.total_bytes + back_plan.total_bytes,
         vram_freed_bytes=freed,
@@ -920,6 +953,9 @@ def decide(
     lean: PLayout,
     pending_tokens: int,
     calib: SwitchCalibration,
+    union_costs: Optional[Sequence["UnionKvCost"]] = None,
+    required_context_tokens: Optional[int] = None,
+    recapture_s: float = 0.0,
 ) -> SwitchVerdict:
     """PP0's verdict: which of the four courses finishes soonest.
 
@@ -954,6 +990,15 @@ def decide(
     _require_same_shape(current, lean)
     pending = max(0, int(pending_tokens))
 
+    # The union's KV price, checked BEFORE any course is priced. Offering a
+    # layout pair whose union cannot hold the promised context and then picking
+    # the quickest course through it would be answering the wrong question
+    # quickly: the pools cover the union for the whole life of the boot, so a
+    # union that is too wide is a property of the PAIR and is settled here,
+    # once, not re-litigated per verdict.
+    if union_costs is not None and required_context_tokens is not None:
+        require_union_fits(union_costs, int(required_context_tokens))
+
     stay = _price(
         ACTION_STAY,
         current=current,
@@ -961,6 +1006,7 @@ def decide(
         end_on=current,
         pending_tokens=pending,
         calib=calib,
+        recapture_s=recapture_s,
     )
     plans: List[Plan] = [stay]
     if fast.counts != current.counts:
@@ -972,6 +1018,7 @@ def decide(
                 end_on=fast,
                 pending_tokens=pending,
                 calib=calib,
+                recapture_s=recapture_s,
             )
         )
     if lean.counts != current.counts:
@@ -983,6 +1030,7 @@ def decide(
                 end_on=lean,
                 pending_tokens=pending,
                 calib=calib,
+                recapture_s=recapture_s,
             )
         )
     if fast.counts != lean.counts:
@@ -994,6 +1042,7 @@ def decide(
                 end_on=lean,
                 pending_tokens=pending,
                 calib=calib,
+                recapture_s=recapture_s,
             )
         )
 
@@ -1041,6 +1090,7 @@ def decide(
         margin_s=margin,
         breakeven_tokens=min(live) if live else None,
         why=why,
+        union_costs=tuple(union_costs or ()),
     )
 
 
@@ -1306,3 +1356,410 @@ def run_move_ops(ops: Iterable[MoveOp], device_ops, stream: int) -> int:
         device_ops.memcpy_async(int(op.dst), int(op.src), int(op.nbytes), int(stream))
         moved += int(op.nbytes)
     return moved
+
+
+# ---------------------------------------------------------------------------
+# The union's KV price (blocker 3).
+#
+# A layer this rank may be handed by a later switch needs KV rows on the card
+# BEFORE the switch, not after it: the pools are built once, over the UNION of
+# the layouts, because rebuilding one at a new start_layer would move the
+# `layer_id - start_layer` indexing base under every row already cached
+# (layout_boundary.pool_coverage_observer). That is not free. The pool's token
+# capacity is `kv_budget_bytes // cell_size` and the cell scales with the layer
+# count (pool_configurator.py:408, :555), so holding U layers instead of N
+# costs tokens on every card -- and a switch whose prefill gain is paid for
+# with context the user asked for is not a gain.
+# ---------------------------------------------------------------------------
+
+
+class UnionKvTooCostly(PLayoutSwitchError):
+    """The union's pool would hold fewer tokens than the run requires."""
+
+
+@dataclasses.dataclass(frozen=True)
+class UnionKvCost:
+    """Pool tokens a card loses by holding the union instead of one layout.
+
+    Deliberately NOT expressed in seconds. Tokens and seconds are different
+    units and the honest conversion needs a measured recompute rate for evicted
+    prefix; inventing one here would put a fabricated term in ``decide`` beside
+    the measured ones, which is exactly the mixed-unit class ``derive_x_star``
+    refuses by name. So this is a CONSTRAINT and a reported number: the union
+    either leaves each card enough tokens for the context the run promises, or
+    the pair of layouts is refused and the switch is not offered at all.
+    """
+
+    stage: int
+    #: KV bytes this card gives the pool, after weights and reserve.
+    kv_budget_bytes: int
+    #: Bytes one token costs in ONE layer's KV (per_token_bytes / layer_count).
+    bytes_per_token_per_layer: int
+    #: Layers this stage runs under the layout being priced.
+    layout_layers: int
+    #: Layers the union makes it hold rows for.
+    union_layers: int
+
+    def __post_init__(self) -> None:
+        for name in ("kv_budget_bytes", "bytes_per_token_per_layer"):
+            if int(getattr(self, name)) <= 0:
+                raise UnionKvTooCostly(
+                    f"{name}={getattr(self, name)} on stage {self.stage}: a "
+                    "card with no KV budget and a token that costs no bytes "
+                    "are both numbers that were never measured, and the token "
+                    "counts below would be arithmetic on a guess."
+                )
+        if int(self.union_layers) < int(self.layout_layers):
+            raise UnionKvTooCostly(
+                f"stage {self.stage}: the union holds {self.union_layers} "
+                f"layers but the layout runs {self.layout_layers}. The union is "
+                "the span of every layout this rank may occupy, so it can never "
+                "be the smaller of the two -- this is a union computed from the "
+                "wrong set of layouts."
+            )
+
+    @property
+    def tokens_with_layout(self) -> int:
+        """Pool tokens if the pool were built for this layout alone."""
+        return int(self.kv_budget_bytes) // (
+            int(self.bytes_per_token_per_layer) * int(self.layout_layers)
+        )
+
+    @property
+    def tokens_with_union(self) -> int:
+        """Pool tokens actually available, the pool being built over the union."""
+        return int(self.kv_budget_bytes) // (
+            int(self.bytes_per_token_per_layer) * int(self.union_layers)
+        )
+
+    @property
+    def tokens_lost(self) -> int:
+        return self.tokens_with_layout - self.tokens_with_union
+
+    def as_line(self) -> str:
+        return (
+            f"[p-layout-union] stage {self.stage}: union {self.union_layers} "
+            f"layers vs layout {self.layout_layers} -> pool "
+            f"{self.tokens_with_union} tok (would be {self.tokens_with_layout}), "
+            f"costs {self.tokens_lost} tok"
+        )
+
+
+def union_layout(*layouts: PLayout) -> Tuple[Tuple[int, int], ...]:
+    """Per stage, the union span every rank must build weights and pools over.
+
+    The span, not the set: :class:`PLayout` is contiguous by construction (the
+    gapped form was refused on boot weg2gp1), so the union of a stage's ranges
+    across the layouts is an interval and a rank holds every layer in it.
+    """
+    if not layouts:
+        raise PLayoutSwitchError("union_layout needs at least one layout.")
+    first = layouts[0]
+    for other in layouts[1:]:
+        _require_same_shape(first, other)
+    spans: List[Tuple[int, int]] = []
+    for stage in range(first.n_stages):
+        los, his = [], []
+        for lay in layouts:
+            a, b = lay.range_of(stage)
+            los.append(a)
+            his.append(b)
+        spans.append((min(los), max(his)))
+    return tuple(spans)
+
+
+def union_kv_costs(
+    *layouts: PLayout,
+    priced_layout: PLayout,
+    kv_budget_bytes: Mapping[int, int],
+    bytes_per_token_per_layer: Mapping[int, int],
+) -> Tuple[UnionKvCost, ...]:
+    """The union's token price on every stage, for ``priced_layout``."""
+    spans = union_layout(*layouts)
+    out: List[UnionKvCost] = []
+    for stage, (lo, hi) in enumerate(spans):
+        a, b = priced_layout.range_of(stage)
+        try:
+            budget = kv_budget_bytes[stage]
+            per_layer = bytes_per_token_per_layer[stage]
+        except KeyError:
+            raise UnionKvTooCostly(
+                f"stage {stage} has no measured KV budget / per-layer token "
+                f"cost; priced stages are {sorted(set(kv_budget_bytes))}. The "
+                "cards differ by more than 50 % in VRAM on this rig, so one "
+                "number standing in for another card's is not an "
+                "approximation -- it is the wrong card."
+            ) from None
+        out.append(
+            UnionKvCost(
+                stage=stage,
+                kv_budget_bytes=int(budget),
+                bytes_per_token_per_layer=int(per_layer),
+                layout_layers=b - a,
+                union_layers=hi - lo,
+            )
+        )
+    return tuple(out)
+
+
+def require_union_fits(
+    costs: Sequence[UnionKvCost], required_tokens: int
+) -> Tuple[UnionKvCost, ...]:
+    """Refuse the layout PAIR when the union cannot hold the promised context.
+
+    ``required_tokens`` is the context the run promises -- 262144 under the
+    standing order that Next Flash is always computed at 262k. A pool that
+    cannot hold it has not made the prefill faster; it has made the run
+    smaller, and the switch would be bought with the user's context.
+    """
+    need = int(required_tokens)
+    short = [c for c in costs if c.tokens_with_union < need]
+    if short:
+        lines = "; ".join(
+            f"stage {c.stage}: {c.tokens_with_union} tok over its "
+            f"{c.union_layers}-layer union (needs {need}, loses {c.tokens_lost} "
+            f"to the union)"
+            for c in short
+        )
+        raise UnionKvTooCostly(
+            f"W123: the union of these layouts does not leave room for "
+            f"{need} tokens on every card -- {lines}. The pools must cover the "
+            "union (a layer a later switch activates has no rows otherwise, and "
+            "rebuilding at a new start moves the indexing base under every "
+            "cached row), so this is a property of the layout PAIR, not of "
+            "either layout. Offer a pair whose union is narrower, or lower the "
+            "promised context deliberately."
+        )
+    return tuple(costs)
+
+
+# ---------------------------------------------------------------------------
+# The mover's route (blocker 4).
+# ---------------------------------------------------------------------------
+
+
+class MoverNotCapturable(PLayoutSwitchError):
+    """The mover was asked to run inside a CUDA-graph capture."""
+
+
+def require_breakable_route(
+    *, capturing: bool, route: str, n_ops: int = 0, capture_safety=None
+) -> str:
+    """The mover runs eager/breakable only. Refused by NAME under capture.
+
+    ``barlink_bar1_p2p.capture_safety()`` already states the asymmetry that
+    forces this (``barlink_bar1_p2p.py:181``): ``put()`` is a ``memcpy_async``
+    on the caller's stream and records into a graph, but the RECV half has to
+    be waited on and BAR1 exposes no device-side wait -- its three kernels are
+    all collectives, and a host-side flag spin inside a capture raises
+    ``cudaErrorStreamCaptureUnsupported``.
+
+    The failure that matters is not the raise. It is the HALF that does record:
+    a capture containing the deposits but not the collects replays as a mover
+    that ships bytes into peer windows and never lands them, every replay, in
+    silence. So the refusal is placed BEFORE the first op is issued and names
+    the route, rather than being left to CUDA to discover midway.
+    """
+    safety = (capture_safety or _bar1_capture_safety)()
+    if not capturing:
+        return str(route)
+    raise MoverNotCapturable(
+        f"W124: the P-layout mover was asked to issue {n_ops} op(s) on route "
+        f"{route!r} INSIDE a CUDA-graph capture. BAR1 recv is not capturable: "
+        f"{safety.get('reason')}. The deposit half WOULD record, so a captured "
+        "mover is not a capture failure at every replay -- it is a mover that "
+        "deposits into peer windows and never collects, silently, on the fast "
+        "path. Run the switch on the eager/breakable route at a chunk boundary "
+        "(require_switchable), which is where it belongs anyway: the ring must "
+        "be drained for the switch to be safe at all."
+    )
+
+
+def _bar1_capture_safety():
+    from sglang.srt.distributed.device_communicators.barlink_bar1_p2p import (
+        capture_safety,
+    )
+
+    return capture_safety()
+
+
+def run_move_ops_guarded(
+    ops: Iterable[MoveOp],
+    device_ops,
+    stream: int,
+    *,
+    capturing: bool,
+    route: str = "breakable",
+    capture_safety=None,
+) -> int:
+    """:func:`run_move_ops` behind :func:`require_breakable_route`."""
+    ops = tuple(ops)
+    require_breakable_route(
+        capturing=capturing,
+        route=route,
+        n_ops=len(ops),
+        capture_safety=capture_safety,
+    )
+    return run_move_ops(ops, device_ops, stream)
+
+
+# ---------------------------------------------------------------------------
+# Who the 5090's PP neighbour is.
+#
+# The standing shape on this rig is --rank-gpu-id 0,1,2, i.e. stage 0 = 5090
+# (cuda:0), stage 1 = the 3080 on the x4 link, stage 2 = the 3080 on x8
+# (planner/device_map.py:36-38, planner/flags.py:2615-2625). That puts the SLOW
+# card in the MIDDLE, where it is a neighbour on both hops, and every layer the
+# switch moves between stage 0 and stage 1 crosses at 6.56 GB/s instead of
+# 13.15 (PLAN_BAR1_LANES_0918).
+#
+# The PP stage ORDER itself is not free: a stage number is welded to a rank
+# number (server_args.py:10700 `world_rank = pp_rank * tp_size + tp_rank`) and
+# the PP group is built from a strided range (parallel_state.py:3945-3962), so
+# no rank list puts rank 2 at stage 1. The send/recv layer WOULD follow a
+# permuted list -- neighbours are positional, `self.ranks[(rank_in_group ± 1)
+# % world_size]` (parallel_state.py:1319-1350) -- but nothing constructs one.
+#
+# The equivalent move IS free, and it is the supported one: permute the CARDS
+# across the stages with --rank-gpu-id (server_args.py:10583-10605). `0,2,1`
+# makes the 5090's neighbour the x8 3080 and exiles the x4 card to the end of
+# the pipeline, where it has one hop instead of two.
+#
+# The hazard is not the permutation. It is permuting it HALFWAY: at least five
+# vectors are indexed by rank and were hand-calibrated for 0,1,2, and each one
+# left behind silently gives one card another card's budget. So the permutation
+# is applied to all of them at once, by one object, or it is refused.
+# ---------------------------------------------------------------------------
+
+
+class StagePermutationIncomplete(PLayoutSwitchError):
+    """A card permutation applied to some rank-indexed vectors but not all."""
+
+
+#: Every rank-indexed vector that must move with the cards. Named here so the
+#: list is a datum a test can assert against, not a habit spread over a
+#: briefing. Sources: planner/flags.py:2615-2625 (tokvec, reserve),
+#: weg2/launcher.py:2884 (--rank-gpu-memory-mib), server_args.py:17254-17290
+#: (--pp-stage-ratio), p_layout_switch.LinkRates (ordered stage pairs).
+RANK_INDEXED_VECTORS = (
+    "rank_gpu_id",
+    "rank_gpu_memory_mib",
+    "pp_stage_ratio",
+    "kv_tokvec",
+    "vram_reserve_mib",
+)
+
+
+@dataclasses.dataclass(frozen=True)
+class StagePermutation:
+    """Move the cards across the stages, and everything keyed to a card with them.
+
+    ``cards[stage]`` is the physical cuda index that stage runs on. The default
+    ``(0, 1, 2)`` is the shipped placement; ``(0, 2, 1)`` is the one that makes
+    the 5090's neighbour the x8 3080.
+    """
+
+    cards: Tuple[int, ...]
+
+    def __post_init__(self) -> None:
+        cards = tuple(int(c) for c in self.cards)
+        object.__setattr__(self, "cards", cards)
+        if sorted(cards) != list(range(len(cards))):
+            raise StagePermutationIncomplete(
+                f"cards={list(cards)} is not a permutation of "
+                f"{list(range(len(cards)))}. Two stages on one card is refused "
+                "upstream by name (server_args.py:10893-10900), and a missing "
+                "card is a stage with no GPU."
+            )
+
+    @property
+    def is_identity(self) -> bool:
+        return self.cards == tuple(range(len(self.cards)))
+
+    def permute(self, vector: Sequence) -> Tuple:
+        """Reorder a rank-indexed vector onto the new stage order."""
+        vec = tuple(vector)
+        if len(vec) != len(self.cards):
+            raise StagePermutationIncomplete(
+                f"vector of length {len(vec)} cannot be permuted onto "
+                f"{len(self.cards)} stages: {list(vec)}. A rank-indexed vector "
+                "that is short is not a shorter vector -- it is a vector for a "
+                "different world."
+            )
+        return tuple(vec[c] for c in self.cards)
+
+    def apply(self, vectors: Mapping[str, Sequence]) -> Dict[str, Tuple]:
+        """Permute every rank-indexed vector, or refuse.
+
+        The refusal is the point. ``planner/flags.py:2619`` says in so many
+        words "rank 0 IS the 5090", and the KV token vector (33,13,18) and the
+        reserve vector (3000,2200,2200) were measured against that sentence. A
+        permutation that moves the cards but leaves those two behind hands the
+        5090's KV share to a 3080 and does it QUIETLY -- the boot comes up, the
+        pool is simply the wrong size on two cards. Naming the missing vector
+        is cheaper than finding that at the corridor.
+        """
+        missing = [n for n in RANK_INDEXED_VECTORS if n not in vectors]
+        if missing and not self.is_identity:
+            raise StagePermutationIncomplete(
+                f"cards {list(self.cards)} permutes the stages, but "
+                f"{missing} were not handed over to be permuted with them. "
+                "These vectors are indexed by RANK and were calibrated for the "
+                "shipped 0,1,2 placement, so leaving one behind gives one card "
+                "another card's budget without any error: the boot comes up and "
+                "the pool is the wrong size. Pass every vector in "
+                "RANK_INDEXED_VECTORS, or keep the identity permutation."
+            )
+        return {name: self.permute(vec) for name, vec in vectors.items()}
+
+    def neighbour_pairs(self) -> Tuple[Tuple[int, int], ...]:
+        """The PP hops, as ordered stage pairs, under this placement."""
+        return tuple((i, i + 1) for i in range(len(self.cards) - 1))
+
+    def as_flag(self) -> str:
+        """The ``--rank-gpu-id`` value this placement is."""
+        return ",".join(str(c) for c in self.cards)
+
+
+def slowest_hop_seconds(
+    perm: StagePermutation, rates: LinkRates, nbytes: int
+) -> Tuple[Tuple[int, int], float]:
+    """The worst PP hop under ``perm``, and what ``nbytes`` costs on it.
+
+    A property of the LINKS, not of a switch, and the difference caught a wrong
+    conclusion while this was being written. Swapping the cards to ``0,2,1``
+    does NOT halve this number: it makes the 5090's hop fast (7.13 -> 14.25
+    GB/s) but leaves a 3080-to-3080 hop at 6.58 GB/s, which then becomes the
+    worst one. The switch still roughly halves -- but only because the busiest
+    hop CARRIES most of the bytes, not because the slowest link got faster.
+
+    So use :func:`placement_switch_seconds` to decide a placement. This
+    function answers "how bad is the worst link", which is a different and
+    smaller question.
+    """
+    worst: Optional[Tuple[Tuple[int, int], float]] = None
+    for a, b in perm.neighbour_pairs():
+        for src, dst in ((a, b), (b, a)):
+            secs = rates.seconds(src, dst, int(nbytes))
+            if worst is None or secs > worst[1]:
+                worst = ((src, dst), secs)
+    if worst is None:
+        raise PLayoutSwitchError("a single-stage placement has no PP hop to price.")
+    return worst
+
+
+def placement_switch_seconds(
+    frm: PLayout, to: PLayout, layer_bytes: LayerBytes, rates: LinkRates
+) -> float:
+    """What the ``frm -> to`` switch actually costs under one card placement.
+
+    The honest comparison between placements, because it prices the BYTES EACH
+    HOP CARRIES rather than a notional payload on every hop. A 39->32 cut moves
+    seven layers from stage 0 to stage 1 and three from stage 1 to stage 2, so
+    the 5090's hop dominates and a placement that speeds it up speeds up the
+    switch -- even though the pipeline's slowest LINK is unchanged.
+
+    ``rates`` must be the table for the placement being priced: :class:`LinkRates`
+    is keyed by ordered STAGE pair, and permuting the cards re-keys it.
+    """
+    return move_seconds(plan_layer_moves(frm, to, layer_bytes), rates)

@@ -837,18 +837,54 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         #     set no flag at all and read False, silently losing both.
         # #352's store bound stays correct regardless: it is graph-stable (KV VA
         # row count) and deliberately NOT gated on capture mode.
+        with self._capture_session(warmup=True):
+            self._capture_one_stream()
+
+    @contextlib.contextmanager
+    def _capture_session(self, warmup: bool):
+        """The context stack every capture must run inside.
+
+        Extracted so a RE-capture enters the identical stack rather than a
+        hand-rolled approximation of it. The four properties above
+        (model_capture_mode, freeze_gc, graph_capture, the backend's own
+        capture_session) are not optional decoration: two of them change what
+        gets RECORDED into the graph, so a recapture that skipped one would
+        produce a graph that differs from the boot graph in ways no shape key
+        can express.
+
+        ``warmup`` is False for a recapture: :meth:`warmup` is run-once across
+        the decode and prefill runners (BaseRunner.warmup) and the kernels are
+        already autotuned by the time a boundary moves.
+        """
         capture_ctx = (
             model_capture_mode()
             if self._uses_raw_cuda_graph_capture()
             else contextlib.nullcontext()
         )
         with capture_ctx:
-            self.warmup()
+            if warmup:
+                self.warmup()
             with freeze_gc(self.model_runner.server_args.enable_cudagraph_gc):
                 with graph_capture() as graph_capture_context:
                     self.stream = graph_capture_context.stream
                     with self.backend.capture_session(self.stream):
-                        self._capture_one_stream()
+                        yield
+
+    def recapture_shapes(self, sizes) -> tuple[int, ...]:
+        """Re-record the graphs for ``sizes`` under the range in force NOW.
+
+        The executed layer set is baked at capture time, so after a boundary
+        flip a replay of an old graph runs the OLD range while the model
+        reports the new one. This is the repair half; the refusal half is
+        :func:`sglang.srt.model_executor.layout_boundary.cuda_graph_observer`.
+        """
+        ordered = tuple(int(s) for s in sizes)
+        if not ordered:
+            return ()
+        with self._capture_session(warmup=False):
+            for size in ordered:
+                self.capture_one_shape(size)
+        return ordered
 
     def _capture_one_stream(self) -> None:
         avail_mem = get_available_gpu_memory(

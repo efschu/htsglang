@@ -48,6 +48,7 @@ flip, whose two layouts are disjoint tensor sets with no useful union.
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import itertools
 from collections.abc import Callable, Mapping, MutableMapping, Sequence
@@ -487,3 +488,258 @@ def pool_coverage_observer(
             )
 
     return _observe
+
+
+# ---------------------------------------------------------------------------
+# The ModelRunner's own copy of the range (#704 slice 1a-iii).
+#
+# The actuator above moves ``model._start_layer``/``_end_layer``, which the
+# decoder forward re-reads on every pass. The ModelRunner does NOT re-read it:
+# it SNAPSHOTS the range at init and derives three further things from the
+# snapshot, all of which then stop following the boundary.
+# ---------------------------------------------------------------------------
+
+
+class ModelRunnerRangeMirror:
+    """Pull ``ModelRunner``'s derived layer state along with the boundary.
+
+    Three pieces of ModelRunner state are computed ONCE at init from the
+    model's range and never recomputed (``model_runner.py:1185-1206``,
+    ``:1729-1745``):
+
+    * ``runner.start_layer`` / ``runner.end_layer`` -- a snapshot, taken with
+      ``getattr(self.model, "start_layer", 0)``. Read by roughly twenty KV-pool
+      construction sites (``model_runner_kv_cache_mixin.py:2997-4181``) and by
+      the attention backends;
+    * ``runner.num_effective_layers`` -- the pool's ``layer_num=`` argument
+      (``model_runner_kv_cache_mixin.py:4013`` and eight more);
+    * ``model_config.swa_attention_layer_ids`` / ``full_attention_layer_ids``
+      -- narrowed to the range by ``adjust_hybrid_swa_layers_for_pp``.
+
+    A flip that moves only the model's backing fields leaves all three at their
+    boot values, and every one of them fails QUIETLY rather than loudly: the
+    model would execute the new range while the KV pool still filters, sizes
+    and indexes for the old one.
+
+    **The narrowing is destructive, so this mirror snapshots first.**
+    ``adjust_hybrid_swa_layers_for_pp`` assigns the filtered list back over the
+    attribute it filtered. Calling it a second time therefore intersects with
+    an ALREADY-NARROWED list: widening the range back out can never recover a
+    layer id that an earlier narrowing dropped, and the loss is silent -- a
+    full-attention layer that has quietly become SWA produces plausible output,
+    not an error. This mirror keeps the pristine lists from construction time
+    and re-derives every rung from those, never from the current value.
+
+    **Construction must happen at the UNION range**, and that is checked rather
+    than assumed: the pristine lists are only pristine if nothing has narrowed
+    them below the union, and the union is exactly the span the pools are built
+    over (:func:`pool_coverage_observer`). Every rung is a sub-range of the
+    union, so re-deriving any rung from the union-wide lists is complete.
+    """
+
+    def __init__(self, runner, union_range: tuple[int, int]):
+        self.runner = runner
+        self._union = (int(union_range[0]), int(union_range[1]))
+        got = (int(getattr(runner, "start_layer")), int(getattr(runner, "end_layer")))
+        if got != self._union:
+            raise LayoutBoundaryError(
+                f"ModelRunnerRangeMirror must be built while the runner still "
+                f"holds the UNION range {self._union}, but it holds {got}. The "
+                "hybrid-SWA layer id lists are narrowed IN PLACE against "
+                "whatever range is in force at init "
+                "(model_runner.py:1729-1745), so a mirror built after the "
+                "runner narrowed to one rung would snapshot that rung's lists "
+                "as if they were the full ones, and every later widening would "
+                "silently keep serving the narrow set. Build the pools and the "
+                "mirror inside union_layer_window()."
+            )
+        config = runner.model_config
+        # The pristine lists. Copied, not referenced: the attribute they came
+        # from is the one that gets overwritten on every re-derivation.
+        self._pristine_full = self._snapshot(config, "full_attention_layer_ids")
+        self._pristine_swa = self._snapshot(config, "swa_attention_layer_ids")
+
+    @staticmethod
+    def _snapshot(config, name: str):
+        if not hasattr(config, name):
+            return None
+        value = getattr(config, name)
+        return None if value is None else list(value)
+
+    @property
+    def pristine_layer_ids(self) -> dict[str, list[int] | None]:
+        """What the re-derivation reads. Exposed so a test can prove it is the
+        UNION's lists and not some rung's."""
+        return {
+            "full_attention_layer_ids": (
+                None if self._pristine_full is None else list(self._pristine_full)
+            ),
+            "swa_attention_layer_ids": (
+                None if self._pristine_swa is None else list(self._pristine_swa)
+            ),
+        }
+
+    def apply(self, new_range: tuple[int, int]) -> dict[str, object]:
+        """Set the range and re-derive everything that hangs off it."""
+        lo, hi = int(new_range[0]), int(new_range[1])
+        if lo < self._union[0] or hi > self._union[1]:
+            raise LayoutBoundaryError(
+                f"range [{lo},{hi}) leaves the union {self._union} the mirror "
+                "was built for; the pristine layer id lists only cover the "
+                "union, so the re-derivation would be short of layers it "
+                "cannot know are missing."
+            )
+        runner = self.runner
+        # COMPUTE, then commit. `_effective_layers` can refuse (the layer-set
+        # env), and an assignment before that refusal would leave the runner
+        # holding a NEW range beside the OLD effective count -- a half-applied
+        # update, which is the exact failure the actuator's rollback exists to
+        # prevent and which a rollback of the MODEL alone would not undo.
+        effective = self._effective_layers(lo, hi)
+        runner.start_layer = lo
+        runner.end_layer = hi
+        runner.num_effective_layers = effective
+        self._rederive_hybrid_swa(lo, hi)
+        return {
+            "start_layer": lo,
+            "end_layer": hi,
+            "num_effective_layers": runner.num_effective_layers,
+            "full_attention_layer_ids": self._snapshot(
+                runner.model_config, "full_attention_layer_ids"
+            ),
+            "swa_attention_layer_ids": self._snapshot(
+                runner.model_config, "swa_attention_layer_ids"
+            ),
+        }
+
+    def _effective_layers(self, lo: int, hi: int) -> int:
+        """Reproduce ``model_runner.py:1200-1212`` for the new range.
+
+        The ``SGLANG_PP_LAYER_SET`` branch is a REFUSAL rather than a
+        recomputation: that env names one fixed layer set per stage, so a stage
+        whose range moved is no longer the stage the env describes. Recomputing
+        ``len(owned)`` there would return the env's count for a range that no
+        longer matches it -- a pool sized for a set the model does not execute.
+        """
+        runner = self.runner
+        from sglang.srt.distributed.utils import get_pp_layer_set
+
+        model_num_layers = self._model_num_layers()
+        owned = get_pp_layer_set(model_num_layers, runner.pp_rank, runner.pp_size)
+        if owned is not None:
+            if tuple(sorted(owned)) != tuple(range(lo, hi)):
+                raise LayoutBoundaryError(
+                    f"SGLANG_PP_LAYER_SET pins stage {runner.pp_rank} to layers "
+                    f"{sorted(owned)}, but the boundary moved this rank to "
+                    f"[{lo},{hi}). The env is the authority on which layers this "
+                    "stage owns and it is process-wide and not re-read per "
+                    "flip, so the two cannot both be true. Move the boundary "
+                    "with the layer-set env unset, or teach the layer-set path "
+                    "a rung of its own."
+                )
+            effective = len(owned)
+        else:
+            effective = hi - lo
+        loop_num = int(getattr(runner.model_config.hf_config, "loop_num", 1) or 1)
+        if loop_num > 1:
+            effective *= loop_num
+        return effective
+
+    def _model_num_layers(self) -> int:
+        config = self.runner.model_config
+        arch = config.hf_config.architectures[0]
+        if arch in ("MiMoV2MTP", "Step3p5MTP"):
+            return 1
+        return max(
+            int(config.num_hidden_layers),
+            int(getattr(config, "num_attention_layers", 0) or 0),
+        )
+
+    def _rederive_hybrid_swa(self, lo: int, hi: int) -> None:
+        """Re-run the init narrowing from the PRISTINE lists.
+
+        The ``hi + 1`` bound is not a typo and not an improvement waiting to be
+        made here: ``adjust_hybrid_swa_layers_for_pp`` uses
+        ``range(self.start_layer, self.end_layer + 1)`` (``model_runner.py:1734``,
+        ``:1740``) while every other consumer treats ``end_layer`` as exclusive.
+        Whatever that inclusive bound is worth, the mirror must reproduce it
+        exactly: a mirror that quietly "fixed" it would make the first flip
+        change the layer id lists for a reason that has nothing to do with the
+        boundary, and the boundary would get the blame.
+        """
+        runner = self.runner
+        if not getattr(runner, "is_hybrid_swa", False):
+            return
+        if getattr(runner.model_config, "is_deepseek_v4_arch", False):
+            return
+        window = range(lo, hi + 1)
+        config = runner.model_config
+        if self._pristine_full is not None:
+            config.full_attention_layer_ids = [
+                i for i in self._pristine_full if i in window
+            ]
+        if self._pristine_swa is not None:
+            config.swa_attention_layer_ids = [
+                i for i in self._pristine_swa if i in window
+            ]
+
+
+def model_runner_observer(mirror: ModelRunnerRangeMirror):
+    """Observer form of :class:`ModelRunnerRangeMirror`, for ``add_observer``.
+
+    Registered like the other two, so a flip that cannot update the runner
+    rolls the range back instead of leaving the model and its runner
+    disagreeing about which layers this rank owns.
+    """
+
+    def _observe(report: BoundaryFlipReport) -> None:
+        mirror.apply(report.to_range)
+
+    return _observe
+
+
+@contextlib.contextmanager
+def union_layer_window(runner, union_range: tuple[int, int], num_effective: int = 0):
+    """Hold ``runner`` at the UNION range while the KV pools are built.
+
+    The pools must cover the union for the reason the weights must
+    (:func:`pool_coverage_observer`): a layer activated by a later flip needs
+    KV rows, and rebuilding a pool at a new start would move the
+    ``layer_id - start_layer`` indexing base under every row already cached.
+
+    Doing that by editing the pool constructors would mean editing them all.
+    They do not each decide the range -- they all read the SAME three
+    ModelRunner attributes (``model_runner_kv_cache_mixin.py:2997-4208``,
+    ``pool_configurator.py:320-336, :890``), roughly twenty sites, plus the
+    attention backends. So the range is widened at the one place they read it
+    from, for the duration of the build, and every reader follows without
+    knowing it did. That is the same reason this is a window and not a
+    permanent widening: ``num_effective_layers`` is the pool's ``layer_num=``
+    and the pools should be wide, but the same attributes also feed what the
+    model EXECUTES, and running the union would run layers this rung does not
+    own.
+
+    ``num_effective`` defaults to the union span; pass it explicitly only for a
+    model whose effective count is not the span (``loop_num``).
+    """
+    lo, hi = int(union_range[0]), int(union_range[1])
+    if hi <= lo:
+        raise LayoutBoundaryError(
+            f"union range [{lo},{hi}) is empty; a rank that owns no layer has "
+            "no pool to build and no boundary to move."
+        )
+    saved = (
+        getattr(runner, "start_layer", None),
+        getattr(runner, "end_layer", None),
+        getattr(runner, "num_effective_layers", None),
+    )
+    runner.start_layer = lo
+    runner.end_layer = hi
+    runner.num_effective_layers = int(num_effective) if num_effective else (hi - lo)
+    try:
+        yield (lo, hi)
+    finally:
+        # Restored even on failure: a half-built pool beside a runner still
+        # claiming the union would size the NEXT build off a range that no
+        # structure agrees with.
+        runner.start_layer, runner.end_layer, runner.num_effective_layers = saved

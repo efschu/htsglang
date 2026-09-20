@@ -76,8 +76,7 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
         )
         self._capture_stream: Optional[torch.cuda.Stream] = None
         self._memory_saver_adapter: Optional[Any] = TorchMemorySaverAdapter.create(
-            enable=enable_memory_saver
-            and envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get()
+            enable=enable_memory_saver and envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get()
         )
 
     @contextmanager
@@ -205,6 +204,18 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
         # unless a #394 shared cold tier is live.
         offload_capture_gate.check_after_graph_replay()
         return self._outputs[shape_key]
+
+    def discard_shape(self, shape_key) -> bool:
+        """Drop the graph recorded for ``shape_key``; return whether one went.
+
+        A captured graph bakes the executed layer range, so after a boundary
+        flip every graph is either re-recorded or must STOP BEING REPLAYABLE.
+        Dropping it makes ``can_run`` answer False for that shape, which sends
+        it down the eager path -- slower, and correct. Leaving it is the one
+        outcome that is neither.
+        """
+        self._outputs.pop(shape_key, None)
+        return self._graphs.pop(shape_key, None) is not None
 
     def cleanup(self) -> None:
         self._graphs.clear()
