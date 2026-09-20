@@ -2404,12 +2404,17 @@ class EAGLEWorkerV2(BaseSpecWorker):
             min_dwell=envs.SGLANG_SPEC_ADAPTIVE_CHAIN_MIN_DWELL.get(),
             swap_ms_for=swap_ms_for,
             consensus=self._agree_chain_length,
+            switch_margin=(
+                envs.SGLANG_SPEC_ADAPTIVE_CHAIN_SWITCH_MARGIN_PCT.get() / 100.0
+            ),
         )
         self.round_cost_probe = RoundCostProbe(device=self.device)
         logger.info(
             f"[spec-adaptive] chain policy armed: candidates={self.chain_policy.candidates}, "
-            f"k_min={self.chain_policy.k_min}, cost prior draft={draft_ms}ms verify={verify_ms}ms, "
+            f"k_min={self.chain_policy.k_min}, cost prior draft={draft_ms}ms verify={verify_ms}ms "
+            f"(cold start only -- unmeasured k are fitted from measured rounds), "
             f"min_dwell={self.chain_policy.min_dwell} rounds, "
+            f"switch_margin={100.0 * self.chain_policy.switch_margin:.0f}%, "
             f"swap_cost={'per-target from graph memory' if swap_ms_for else 'none'}"
         )
 

@@ -39,9 +39,25 @@ class TestNormalizeSurvival(unittest.TestCase):
         # A survival curve is a cumulative product; a rise is noise.
         self.assertEqual(normalize_survival([0.8, 0.9, 0.5], 3), [0.8, 0.8, 0.5])
 
-    def test_short_vector_is_flat_extended(self):
-        # Optimistic on purpose: prevents lock-in at k_min (see module docstring).
-        self.assertEqual(normalize_survival([0.7], 3), [0.7, 0.7, 0.7])
+    def test_short_vector_continues_its_decay(self):
+        # A single entry IS one per-step probability, so it is also the ratio.
+        self.assertEqual(normalize_survival([0.7], 3), [0.7, 0.49, 0.343])
+
+    def test_short_vector_ratio_comes_from_the_last_step(self):
+        # 0.343 / 0.472 = 0.727 -- the boot ab27a curve, continued.
+        self.assertEqual(
+            normalize_survival([0.472, 0.343], 5),
+            [0.472, 0.343, 0.2493, 0.1812, 0.1317],
+        )
+
+    def test_flat_extension_is_still_reachable(self):
+        self.assertEqual(normalize_survival([0.7], 3, extend="flat"), [0.7, 0.7, 0.7])
+
+    def test_confident_curve_keeps_a_high_tail(self):
+        # The k_min lock-in the flat pad was defending against does not come
+        # back: a ratio near 1.0 extends to a tail near 1.0.
+        curve = normalize_survival([0.99], 4)
+        self.assertGreater(curve[-1], 0.95)
 
     def test_empty_vector_becomes_zeros(self):
         self.assertEqual(normalize_survival([], 3), [0.0, 0.0, 0.0])
@@ -307,8 +323,26 @@ class TestChainCostModel(unittest.TestCase):
 
 
 class TestAdaptiveChainPolicy(unittest.TestCase):
-    def test_first_choice_without_survival_is_k_max(self):
+    def test_first_choices_time_the_untimed_candidates(self):
+        # Cold start is now a warm-up sweep, not a jump to k_max: with no
+        # round cost measured for any candidate, the policy runs each of them
+        # once rather than optimising against the prior's shape (see
+        # AdaptiveChainPolicy._warmup_target and the ab27a regression in
+        # test_adaptive_chain_throughput.py).
         p = AdaptiveChainPolicy(k_max=3)
+        self.assertTrue(p.warming_up)
+        self.assertEqual(p.choose(), 1)
+
+    def test_empty_survival_after_warmup_falls_back_to_k_max(self):
+        # The old cold-start rule still holds once there is nothing left to
+        # measure: no survival information means the configured length.
+        p = AdaptiveChainPolicy(
+            k_max=3,
+            cost_model=ChainCostModel(k_max=3, min_samples=1, ema_alpha=1.0),
+        )
+        for k in (1, 2, 3):
+            p.record_duration(k, 20.0 + k)
+        self.assertFalse(p.warming_up)
         self.assertEqual(p.choose(), 3)
 
     def test_survival_drives_the_choice(self):
@@ -320,7 +354,13 @@ class TestAdaptiveChainPolicy(unittest.TestCase):
         self.assertEqual(p.choose(), 1)
 
     def test_histogram_counts_choices(self):
-        p = AdaptiveChainPolicy(k_max=2)
+        p = AdaptiveChainPolicy(
+            k_max=2,
+            cost_model=ChainCostModel(k_max=2, min_samples=1, ema_alpha=1.0),
+        )
+        for k in (1, 2):
+            p.record_duration(k, 20.0 + k)
+        p.record_survival([1.0, 1.0])
         p.choose()
         p.record_survival([0.0, 0.0])
         p.choose()
@@ -352,14 +392,22 @@ class TestAdaptiveChainPolicy(unittest.TestCase):
         self.assertEqual(sum(p.histogram.values()), 5)
 
     def test_recovers_upward_after_a_short_chain(self):
-        """Flat extension must let the policy climb back out of k_min."""
+        """Tail extension must let the policy climb back out of k_min."""
         p = AdaptiveChainPolicy(
             k_max=3, cost_model=ChainCostModel(k_max=3, draft_ms=2.5, verify_ms=26.0)
         )
+        # Warm the cost model first so the warm-up sweep is not what drives
+        # the choice; this test is about the survival curve.
+        for k in (1, 2, 3):
+            for _ in range(p.cost_model.min_samples):
+                p.cost_model.observe(k, 26.0 + 2.5 * k)
+        self.assertFalse(p.warming_up)
         p.record_survival([0.0])
         self.assertEqual(p.choose(), 1)
         # Next round the draft is confident again; only one step was run, so
-        # only one survival entry exists.
+        # only one survival entry exists. Geometric continuation of a 0.99
+        # ratio still reaches k_max -- the lock-in the flat pad guarded
+        # against does not come back.
         p.record_survival([0.99])
         self.assertEqual(p.choose(), 3)
 

@@ -1966,6 +1966,24 @@ class Envs:
     # it rank-identical -- to every Nth round. 0 disables both (decide every
     # round); the default is set from the measured break-even with headroom.
     SGLANG_SPEC_ADAPTIVE_CHAIN_MIN_DWELL = EnvInt(8)
+    # Hysteresis: relative throughput improvement a candidate chain length must
+    # show before the incumbent is given up, in percent. The break-even gate
+    # alone stops paying for swaps; it does NOT stop two near-equal lengths
+    # trading places on estimate noise, and with every candidate state resident
+    # (plan_residency) the swap term is honestly 0.0 so the gate degenerates
+    # into a bare ">". 0 disables the margin (pre-2026-09-20 behaviour).
+    #
+    # MUST STAY WELL UNDER THE EFFECT SIZE, and 2 % is not a round number
+    # picked for looking modest. Measured on the 27B A/B of 2026-09-20: the
+    # whole spread between the best and the worst chain length was 4.5 %
+    # (k=3 at 0.0673 vs k=5 at 0.0644 tok/ms). A 5 % margin -- which reads as
+    # conservative -- is larger than that spread, so it suppresses the k=5 ->
+    # k=3 correction this regulator exists to make and silently reproduces the
+    # bug it was added next to. Caught by the closed-loop test in
+    # test_adaptive_chain_throughput.py, not by review. Raising this is
+    # therefore a decision about which real gains to give up, not a safety
+    # tightening; re-measure the spread before touching it.
+    SGLANG_SPEC_ADAPTIVE_CHAIN_SWITCH_MARGIN_PCT = EnvFloat(2.0)
     # Kill-switch for the draft-extend cuda graph. Draft extend then always runs
     # eager. Escape hatch for setups where the capture's memory pool costs more
     # than the graph saves (e.g. DeepEP MoE workspace captured at full dispatch
