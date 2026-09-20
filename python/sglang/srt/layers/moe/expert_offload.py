@@ -5098,6 +5098,8 @@ def presplit_expert_offload_after_repack(
                     )
                 )
         presplit[attr] = (buf, spill)
+        if store_rows is not None:
+            torch.cuda.empty_cache()  # give the sizer the device bytes back (fn8m)
         # #119: tally the VRAM this tensor stops holding, so the KV-pool sizing
         # step can report (and assert on) the reclaim it is about to inherit.
         row_bytes = (t.numel() // t.shape[0]) * t.element_size()
