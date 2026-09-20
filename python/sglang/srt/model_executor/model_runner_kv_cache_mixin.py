@@ -710,6 +710,24 @@ class ModelRunnerKVCacheMixin:
             f"--rank-gpu-memory-mib), or stop that process."
         )
 
+    def _flip_host_ledger_layout(self) -> str:
+        """Which side of the Next-Flash P/D flip is this process?
+
+        Named from the two flags that actually DEFINE the two layouts, not
+        from a tag the operator could forget to pass: Form A is the layout
+        with an explicit ``--rank-role`` vector (host + workers), PP3 is the
+        layout with ``--pp-size > 1``. A process that is neither is labelled
+        ``solo`` rather than guessed into one of the two -- a single-layout
+        boot has a ledger too, and mislabelling it would make its line look
+        like half of a flip.
+        """
+        sa = self.server_args
+        if getattr(sa, "rank_role", None):
+            return "D"
+        if int(getattr(sa, "pp_size", 1) or 1) > 1:
+            return "P"
+        return "solo"
+
     @staticmethod
     def budget_exhausted_message(
         tp_rank: int,
@@ -1136,6 +1154,29 @@ class ModelRunnerKVCacheMixin:
                 torch_host_cache_reserved_bytes() / (1 << 30),
                 rest_memory,
             )
+
+            # Task #47 slice 2: the OTHER half of the host mark. The line
+            # above states the page-locked pool; it says nothing about the
+            # anonymous runtime footprint, and the flip design had to
+            # ESTIMATE that half (~27.5 GiB per three-process group, from
+            # cgroup_current minus pinned -- risk R1). This emits both,
+            # decomposed and per process, so the six lines of a flip boot
+            # aggregate into one W114 verdict instead of six hand-added
+            # numbers. It never raises and never decides: one rank cannot see
+            # the other five (flip_host_ledger.emit_host_ledger_line).
+            try:
+                from sglang.srt.flip_host_ledger import emit_host_ledger_line
+                from sglang.srt.layers.moe.cold_tier_fetch import cold_tier_enabled
+
+                emit_host_ledger_line(
+                    logger,
+                    layout=self._flip_host_ledger_layout(),
+                    rank=self.tp_rank,
+                    pinned_bytes=pinned_exact_bytes(),
+                    shared=cold_tier_enabled(),
+                )
+            except Exception:  # noqa: BLE001 -- an instrument never kills a boot
+                pass
 
         # Component-balance checkpoint "post-weights" (weights + CUDA context
         # are resident; pools/graphs are not): exact allocator numbers for
