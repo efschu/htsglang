@@ -156,6 +156,29 @@ FORM_A_ALLOCATIONS: Tuple[FormAAllocation, ...] = (
         ),
     ),
     FormAAllocation(
+        name="expert_scratch_slots",
+        roles=frozenset((ROLE_WORKER,)),
+        tag=GPU_MEMORY_TYPE_WEIGHTS,
+        why=(
+            "launch_fnFA19.sh SCRATCH_SLOTS=74,36,36 -> "
+            "SGLANG_MOE_SCRATCH_SLOTS. Device staging slots for the spilled "
+            "experts: they live and die with the expert weights, so they wear "
+            "the weights tag rather than a fourth one. Not 'the pool' -- the "
+            "spilled rows themselves are host-side (see below)"
+        ),
+    ),
+    FormAAllocation(
+        name="expert_lru_pool_rows",
+        roles=frozenset((ROLE_WORKER,)),
+        tag=GPU_MEMORY_TYPE_WEIGHTS,
+        why=(
+            "the device-resident LRU rows of the expert pool "
+            "(SGLANG_MOE_POOL_STAGING, Memory FLASH-NEXT-POOL-ROUTE). DEVICE "
+            "rows only -- the page-locked host store behind them is seam B and "
+            "wears no device tag"
+        ),
+    ),
+    FormAAllocation(
         name="role_graphs",
         roles=frozenset((ROLE_HOST, ROLE_WORKER)),
         tag=GPU_MEMORY_TYPE_CUDA_GRAPH,
