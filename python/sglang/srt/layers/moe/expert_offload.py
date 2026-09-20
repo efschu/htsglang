@@ -4353,6 +4353,7 @@ class MoEExpertOffloadCache:
         router_logits = getattr(topk_output, "router_logits", None)
         T = hidden.shape[0]
         out_full = torch.empty_like(hidden)
+        _router_probe(router_logits, topk_weights, None, int(T), int(topk_weights.shape[1]))
         combine_out = None
 
         for _w, rows in enumerate(waves):
@@ -4479,6 +4480,17 @@ class MoEExpertOffloadCache:
         copies overlap this layer's GEMM."""
         topk_output = dispatch_output.topk_output
         topk_ids = topk_output.topk_ids
+        # fn8c9b: the layer-0 ROUTER-W event (M=8192 topk=10) ran through this
+        # path and the three-level router probe never saw it -- it was wired into
+        # the expert-major wave path only. Every path that hands topk_weights to
+        # the MoE kernel probes them, or the probe's silence is coverage, not health.
+        _router_probe(
+            getattr(topk_output, "router_logits", None),
+            topk_output.topk_weights,
+            None,
+            int(topk_ids.shape[0]),
+            int(topk_ids.shape[1]),
+        )
         needed = sorted({e for row in ids_list for e in row if e >= 0})
         if self.lookahead_sticky:
             slot_of_needed, fetch_plan, _ = self.planner.resolve_sticky(
@@ -5300,6 +5312,8 @@ def _router_probe(router_logits, topk_weights, flat_weights, T, K) -> None:
             levels["GATE-LOGITS"] = _n(lg)
         tw = _bad_rows(topk_weights.reshape(T, -1))
         levels["TOPK-WEIGHTS"] = _n(tw)
+        if flat_weights is None:
+            flat_weights = topk_weights.reshape(-1, 1)
         gw = _bad_rows(flat_weights)
         levels["GATHERED"] = _n(gw)
 

@@ -268,6 +268,37 @@ def _reject_uneven_tp_unaware_attention(model_name: str, tp_size: int) -> None:
     )
 
 
+
+_GATE_FP32_ENV = "SGLANG_MOE_GATE_FP32"
+
+
+def moe_gate_fp32_on(env=None) -> bool:
+    """#49 discriminator (20.09.): compute the router logits with an fp32 GEMM
+    (weights and activations upcast) instead of the bf16 gate. The ROUTER-W
+    verdict (fn8c8b/fn8c9b) says the NaN enters the MoE through topk_weights on
+    the 5090 only, while the 3080s compute the same router on the same hidden
+    states and stay finite. Two kernels sit between finite hidden states and
+    the router weights: the bf16 gate GEMM and the Triton fused gate. This
+    switch removes the first from the picture; SGLANG_OPT_USE_JIT_KERNEL_FUSED_TOPK=0
+    removes the second. Opt-in, off by default: it changes the routing math
+    (fp32 logits) and the boot must say so in its own line."""
+    import os
+
+    src = os.environ if env is None else env
+    return str(src.get(_GATE_FP32_ENV, "")).strip().lower() in ("1", "true", "yes", "on")
+
+
+def moe_router_logits(gate, hidden_states: torch.Tensor) -> torch.Tensor:
+    """The router logits for one MoE block: the module's gate, or -- under
+    SGLANG_MOE_GATE_FP32 -- an fp32 F.linear over the same weight."""
+    if moe_gate_fp32_on():
+        weight = getattr(gate, "weight", None)
+        if isinstance(weight, torch.Tensor):
+            return torch.nn.functional.linear(hidden_states.float(), weight.float())
+    logits, _ = gate(hidden_states)
+    return logits
+
+
 class Qwen3MoeSparseMoeBlock(nn.Module):
     def __init__(
         self,
@@ -358,7 +389,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         hidden_states = hidden_states.view(-1, hidden_dim)
 
         # router_logits: (num_tokens, n_experts)
-        router_logits, _ = self.gate(hidden_states)
+        router_logits = moe_router_logits(self.gate, hidden_states)
         topk_output = self.topk(hidden_states, router_logits)
         final_hidden_states = self.experts(hidden_states, topk_output)
 
