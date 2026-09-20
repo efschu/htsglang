@@ -407,4 +407,6 @@ class AdaptiveController:
         # outgoing built state's) BEFORE the worker's pointer swap. No-op in
         # resident mode / when the target is already mapped.
         self.graph_memory.ensure_active(speculative_num_steps)
+        # Resident mode: same rank-sync guard as the offload swap path.
+        self.graph_memory.note_resident_activation(speculative_num_steps)
         self.worker.apply_runtime_state(state)
