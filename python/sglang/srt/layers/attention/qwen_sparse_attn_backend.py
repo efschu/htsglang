@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 from copy import copy
 from functools import lru_cache
 from typing import Dict, Optional, Tuple
@@ -64,6 +65,18 @@ def _resolve_trtllm_sparse_decode():
 
 
 _QSA_ROWS_COMPACT = {"on": None}
+
+
+_QSA_ROWS_FUSED = {"on": None}
+
+
+def _qsa_rows_fused_on() -> bool:
+    """SGLANG_QSA_ROWS_FUSED (default 1): graph-path rows resolve + owner
+    compaction in one Triton launch (qsa/rows_resolve.py); 0 = the torch
+    chain + compact_owned_rows (the fn8ab form)."""
+    if _QSA_ROWS_FUSED["on"] is None:
+        _QSA_ROWS_FUSED["on"] = os.environ.get("SGLANG_QSA_ROWS_FUSED", "1").strip().lower() not in ("0", "false", "off", "")
+    return _QSA_ROWS_FUSED["on"]
 
 
 def _qsa_rows_compact_on() -> bool:
@@ -496,6 +509,44 @@ class QwenSparseAttnBackend(AttentionBackend):
             slots = self._logical_to_physical(topk_indices, metadata)
         return self._local_rows(slots)
 
+    def _rows_and_counts(self, topk_indices: torch.Tensor, metadata):
+        """(rows, counts-or-None): the graph path resolves and compacts in ONE
+        Triton launch (qsa/rows_resolve.py, Task #53 Sitz 5) when
+        SGLANG_QSA_ROWS_FUSED is on (default); every other path keeps the
+        torch chain and lets _attend_rows compact."""
+        if (
+            _qsa_rows_fused_on()
+            and getattr(metadata, "is_cuda_graph", False)
+            and topk_indices.is_cuda
+            and self.req_to_token is not None
+            and metadata.row_req_pool_indices is not None
+        ):
+            from sglang.srt.layers.attention.qsa.rows_resolve import (
+                MODE_EVEN,
+                MODE_NONE,
+                MODE_WEIGHTED,
+                qsa_rows_resolve,
+            )
+
+            if self.dcp_size <= 1:
+                mode, kw = MODE_NONE, {}
+            elif self.uneven_dcp_weighted:
+                mode, kw = MODE_WEIGHTED, dict(
+                    cp_S=self.cp_S, cp_lo=self.cp_lo, cp_hi=self.cp_hi, cp_ratio=self.cp_ratio
+                )
+            else:
+                mode, kw = MODE_EVEN, dict(world=self.dcp_size, rank=self.dcp_rank)
+            return qsa_rows_resolve(
+                topk_indices,
+                metadata.token_to_batch_idx,
+                metadata.sequence_lengths,
+                metadata.row_req_pool_indices,
+                self.req_to_token,
+                mode=mode,
+                **kw,
+            )
+        return self._topk_rows(topk_indices, metadata), None
+
     def _logical_to_physical_graph(
         self, logical_indices: torch.Tensor, metadata
     ) -> torch.Tensor:
@@ -528,7 +579,9 @@ class QwenSparseAttnBackend(AttentionBackend):
         slots = req_to_token[req_rows[:, None], safe]
         return torch.where(valid, slots, torch.full_like(slots, -1)).to(torch.int32)
 
-    def _attend_rows(self, q: torch.Tensor, layer, rows: torch.Tensor) -> torch.Tensor:
+    def _attend_rows(
+        self, q: torch.Tensor, layer, rows: torch.Tensor, row_counts=None
+    ) -> torch.Tensor:
         """Sparse attention over ``rows`` for this rank's q heads; under DCP the
         group's heads are gathered, the owned partial computed, and the
         partials LSE-merged back to this rank's heads."""
@@ -536,7 +589,9 @@ class QwenSparseAttnBackend(AttentionBackend):
         k_pool = pool.get_key_buffer(layer.layer_id)
         v_pool = pool.get_value_buffer(layer.layer_id)
         if self.dcp_size <= 1:
-            out, _ = sparse_attn_rows_triton(q.contiguous(), k_pool, v_pool, rows, layer.scaling)
+            out, _ = sparse_attn_rows_triton(
+                q.contiguous(), k_pool, v_pool, rows, layer.scaling, row_counts=row_counts
+            )
             return out
         from sglang.srt.layers.dcp.comm import (
             cp_all_gather_heads_uneven,
@@ -549,12 +604,13 @@ class QwenSparseAttnBackend(AttentionBackend):
         group = get_parallel().dcp_group
         counts = self._dcp_group_q_head_counts(q.shape[1])
         q_all = cp_all_gather_heads_uneven(q.contiguous(), group, counts)
-        if _qsa_rows_compact_on():
+        if row_counts is None and _qsa_rows_compact_on():
             # Task #42: loop only over the rows this rank owns (see
             # sparse_attn.compact_owned_rows); the foreign lanes are -1 here.
             from sglang.srt.layers.attention.qsa.sparse_attn import compact_owned_rows
 
             rows, row_counts = compact_owned_rows(rows)
+        if row_counts is not None:
             out, lse = sparse_attn_rows_triton(
                 q_all, k_pool, v_pool, rows, layer.scaling, row_counts=row_counts
             )
@@ -1831,8 +1887,8 @@ class QwenSparseAttnBackend(AttentionBackend):
             # subset on the gathered heads and LSE-merge (see _attend_rows).
             # fn5e: also the non-DCP branch -- see _qsa_rows_path_armed.
             metadata = self._resolve_metadata(forward_batch)
-            rows = self._topk_rows(topk_indices, metadata)
-            output = self._attend_rows(q, layer, rows)
+            rows, counts = self._rows_and_counts(topk_indices, metadata)
+            output = self._attend_rows(q, layer, rows, counts)
             return self._pad_extend_output(output, num_output_rows)
 
         # The validated chunk-prefill kernel consumes tightly packed full-context
@@ -2024,8 +2080,8 @@ class QwenSparseAttnBackend(AttentionBackend):
         if self.dcp_size <= 1 and _qsa_rows_path_armed() and q.is_cuda:
             # fn5e: rows kernel on every rank (see _qsa_rows_path_armed)
             metadata = self._resolve_metadata(forward_batch)
-            rows = self._topk_rows(topk_indices, metadata)
-            return self._attend_rows(q, layer, rows).reshape(q.shape[0], -1)
+            rows, counts = self._rows_and_counts(topk_indices, metadata)
+            return self._attend_rows(q, layer, rows, counts).reshape(q.shape[0], -1)
         return self._forward_paged_attention(q, layer, forward_batch, topk_indices)
 
     def _forward_paged_attention(
@@ -2060,8 +2116,8 @@ class QwenSparseAttnBackend(AttentionBackend):
             # backend runs dcp_size 1 and the packed varlen fallback is FA4
             # cute, whose MLIR refuses sm86 ('Operation creation failed',
             # pack_gqa) in the target-verify / draft-extend capture.
-            rows = self._topk_rows(topk_indices, metadata)
-            output = self._attend_rows(q, layer, rows)
+            rows, counts = self._rows_and_counts(topk_indices, metadata)
+            output = self._attend_rows(q, layer, rows, counts)
             return output.reshape(q.shape[0], -1)
         if trtllm_decode is not None:
             return self._forward_trtllm_sparse(

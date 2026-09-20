@@ -1210,8 +1210,14 @@ class Qwen3LLMModel(Qwen3Model):
         return hidden_states, aux_hidden_states
 
 
-def vision_tower_forced_off() -> bool:
-    """#1356 slice 2: is the tower FORCED off by ``--no-enable-multimodal``?
+def vision_tower_forced_off(config=None) -> bool:
+    """#1356 slice 2: is the tower FORCED off by ``--no-enable-multimodal``
+    -- or, Task #46 (fn8ag2 20.09.), by the hf-config override
+    ``language_model_only`` (--json-model-override-args)? MEASURED fn8ag2: the
+    override was set, the tower weights were never read (pread filter), and
+    the census still listed ``visual`` 0.55/0.20/0.20 GiB per rank -- an
+    EMPTY tower was built because only the multimodal flag reached this
+    predicate. Text-only means no tower, whichever switch says so.
 
     Only the explicit ``False`` of the tri-state counts. ``None`` (auto) and
     ``True`` build the tower as every boot before this did. MEASURED on
@@ -1221,6 +1227,8 @@ def vision_tower_forced_off() -> bool:
     reached the tokenizer's image path and never the model constructor. The
     flag was SET and did not ACT; this predicate is where it acts.
     """
+    if config is not None and bool(getattr(config, "language_model_only", False)):
+        return True
     try:
         return getattr(get_server_args(), "enable_multimodal", None) is False
     except Exception:  # noqa: BLE001 -- no server args (desk, unit tests)
@@ -1267,7 +1275,7 @@ class Qwen3VLForConditionalGeneration(nn.Module):
 
         self.use_data_parallel = get_server_args().mm_enable_dp_encoder
 
-        if vision_tower_forced_off():
+        if vision_tower_forced_off(config):
             # #1356 slice 2 -- TEXT-ONLY MEANS NO TOWER, not a tower nobody
             # calls. `self.visual` is None: no parameters, so the weight
             # exchange manifest, the memory saver's `weights` region and the
@@ -1277,7 +1285,8 @@ class Qwen3VLForConditionalGeneration(nn.Module):
             # None; the Weg-2 front already refuses them by name.
             self.visual = None
             logger.info(
-                "Qwen3-VL vision tower NOT BUILT: --no-enable-multimodal "
+                "Qwen3-VL vision tower NOT BUILT: --no-enable-multimodal or "
+                "language_model_only "
                 "(#1356 slice 2); visual.* checkpoint tensors will be skipped"
             )
         else:
