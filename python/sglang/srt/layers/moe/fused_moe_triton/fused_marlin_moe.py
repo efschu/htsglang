@@ -66,6 +66,176 @@ def _log_workspace_provenance(workspace) -> None:
     except Exception as exc:  # noqa: BLE001 -- an instrument never kills a GEMM
         logger.debug("[nan-disc2] workspace provenance log skipped: %s", exc)
 
+
+# --- Task #49 (20.09.): the C-buffer discriminator, '[nan-probe-c]' ---------
+#
+# What the fn8ap/fn8aq needle boots established, and what is left after it:
+#
+#   * the NaN originates on rank 0 ONLY (fn8ap call 1129, fn8aq call 525; the
+#     other two ranks log 'finite in' at that call and only see it after the
+#     combine all-reduce). Rank 0 is the RTX 5090 -- the boot's own ledger line
+#     names GPU 0 as the 5090, and the shared lock workspace is 680 = 170 SMs
+#     x 4 there against 272 = 68 x 4 on the two 3080s.
+#   * fn8aq's per-wave guard puts 8684 of 32073 non-finite rows in WAVE 0 --
+#     the resident-only wave, whose ``resolve()`` returns an EMPTY fetch plan,
+#     so not one byte crosses PCIe in it. A fetch/slot race cannot produce
+#     that, and the partials table is written AFTER the guard reads the wave's
+#     output, so it cannot either. The fault is inside ONE fused_marlin_moe
+#     call, on one card.
+#
+# The only thing this call does differently on that one card is
+# ``use_atomic_add`` (see the rule below): bf16 + compute capability >= 9 is
+# true on sm120 and false on sm86, and with it true AND a k-split slice the
+# kernel accumulates into C with atomicAdd after zeroing C from inside the
+# kernel and hand-shaking through the lock buffer -- on top of a C that came
+# from ``torch.empty``. Two candidate faults remain, and they need different
+# repairs:
+#
+#   (U) UNWRITTEN -- rows of ``intermediate_cache3`` that no thread block ever
+#       stores to, read by moe_sum_reduce as allocator garbage. Repair: zero
+#       the cache.
+#   (W) WRITTEN-NONFINITE -- the rows ARE written and the value is wrong, i.e.
+#       the accumulate/lock protocol. Repair: do not take that path.
+#
+# SGLANG_MOE_MARLIN_C_SENTINEL=1 separates them in ONE boot: the shared
+# cache13 arena is pre-filled with a finite sentinel instead of being left
+# uninitialised, and whenever the GEMM's own output has non-finite rows the
+# probe counts how many of those rows are still ENTIRELY sentinel (= never
+# written) and logs the verdict. SGLANG_MOE_MARLIN_ATOMIC_ADD=0/1 then forces
+# the branch the verdict names; 0 is the deterministic lock-based reduce the
+# two 3080s already run without a fault, so it is a candidate FIX, not only a
+# probe.
+_C_SENTINEL = {"on": None}
+_ATOMIC_ADD = {"mode": None}
+_ATOMIC_LOGGED = {"done": False}
+
+# -2**-14: exact in bf16 AND fp16 (fp16's smallest normal), so the fill
+# survives the dtype round-trip bit-for-bit and an equality test is exact. A
+# real activation hitting it in every one of K columns of a row is not a
+# failure mode this probe has to price.
+C_SENTINEL_VALUE = -6.103515625e-05
+
+
+def marlin_c_sentinel_on() -> bool:
+    """SGLANG_MOE_MARLIN_C_SENTINEL=1: pre-fill the Marlin MoE intermediate
+    arena with :data:`C_SENTINEL_VALUE` and, on a non-finite GEMM output, name
+    how many bad rows were never written at all (Task #49 probe, default off).
+    """
+    if _C_SENTINEL["on"] is None:
+        _C_SENTINEL["on"] = str(
+            os.environ.get("SGLANG_MOE_MARLIN_C_SENTINEL", "0")
+        ).strip().lower() in ("1", "true", "on")
+    return bool(_C_SENTINEL["on"])
+
+
+def marlin_atomic_add_override():
+    """SGLANG_MOE_MARLIN_ATOMIC_ADD -- unset (default) keeps the hardware rule;
+    '0' forces the deterministic lock-based global reduce; '1' forces the
+    atomic accumulate. Returns None / False / True."""
+    if _ATOMIC_ADD["mode"] is None:
+        raw = str(os.environ.get("SGLANG_MOE_MARLIN_ATOMIC_ADD", "")).strip().lower()
+        if raw in ("0", "false", "off"):
+            _ATOMIC_ADD["mode"] = False
+        elif raw in ("1", "true", "on"):
+            _ATOMIC_ADD["mode"] = True
+        else:
+            _ATOMIC_ADD["mode"] = "auto"
+    mode = _ATOMIC_ADD["mode"]
+    return None if mode == "auto" else bool(mode)
+
+
+def resolve_atomic_add(hardware_rule: bool):
+    """Apply the override to the hardware rule and return (value, source).
+
+    Pure; the desk tests drive it without CUDA. ``source`` is 'hardware' or
+    'env', so the one-shot log below can never claim a branch the run did not
+    take."""
+    override = marlin_atomic_add_override()
+    if override is None:
+        return bool(hardware_rule), "hardware"
+    return bool(override), "env"
+
+
+def classify_c_probe(bad_rows: int, untouched_bad_rows: int) -> str:
+    """Verdict of the C-buffer probe for ONE GEMM output.
+
+    ``bad_rows``            -- output rows with a non-finite element.
+    ``untouched_bad_rows``  -- of those, the rows whose whole cache3 row is
+                               still the sentinel, i.e. no thread block ever
+                               stored to them.
+
+    Pure, so the verdict logic is proven without a GPU."""
+    bad_rows = int(bad_rows)
+    untouched_bad_rows = int(untouched_bad_rows)
+    if bad_rows < 0 or untouched_bad_rows < 0 or untouched_bad_rows > bad_rows:
+        raise ValueError(
+            f"classify_c_probe: untouched_bad_rows={untouched_bad_rows} must lie "
+            f"in [0, bad_rows={bad_rows}]"
+        )
+    if bad_rows == 0:
+        return "CLEAN"
+    if untouched_bad_rows == bad_rows:
+        return "U-UNWRITTEN"
+    if untouched_bad_rows == 0:
+        return "W-WRITTEN-NONFINITE"
+    return "MIXED"
+
+
+def _log_atomic_add_choice(use_atomic_add: bool, source: str, device) -> None:
+    """Once per process: which reduce branch this rank's Marlin MoE takes, and
+    whether the hardware rule or the env decided it. Without this line a boot
+    that shows no hit cannot tell 'the probe worked' from 'this rank never took
+    the branch anyway' -- the same null-result trap the workspace log closes."""
+    if _ATOMIC_LOGGED["done"]:
+        return
+    _ATOMIC_LOGGED["done"] = True
+    try:
+        cap = torch.cuda.get_device_capability(device) if _is_cuda else None
+        logger.error(
+            "[nan-probe-c] marlin MoE reduce branch: use_atomic_add=%s source=%s "
+            "capability=%s sentinel=%s -- atomic accumulate needs C zeroed from "
+            "inside the kernel and a lock hand-shake; the lock-based global "
+            "reduce (use_atomic_add=0) does neither",
+            bool(use_atomic_add), source, cap, marlin_c_sentinel_on(),
+        )
+    except Exception as exc:  # noqa: BLE001 -- an instrument never kills a GEMM
+        logger.debug("[nan-probe-c] reduce-branch log skipped: %s", exc)
+
+
+def _c_probe_report(out, cache3_rows, M, topk, block_size_m, use_atomic_add) -> None:
+    """After the second GEMM: if the output carries non-finite rows, say how
+    many of them were NEVER WRITTEN (still sentinel) and name the class.
+
+    Only runs with the sentinel on, and only reads the device when the output
+    is already bad -- one ``isfinite`` over [M, K] per apply is the probe's
+    standing cost, the row scan is paid on a hit."""
+    try:
+        if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+            return
+        finite_rows = torch.isfinite(out).reshape(out.shape[0], -1).all(dim=1)
+        bad_mask = ~finite_rows
+        n_bad = int(bad_mask.sum().item())
+        if n_bad == 0:
+            return
+        untouched = (cache3_rows == C_SENTINEL_VALUE).all(dim=1).reshape(M, topk)
+        untouched_any = untouched.any(dim=1)
+        n_untouched_bad = int((bad_mask & untouched_any).sum().item())
+        verdict = classify_c_probe(n_bad, n_untouched_bad)
+        logger.error(
+            "[nan-probe-c] VERDICT %s: M=%d topk=%d block_size_m=%d "
+            "use_atomic_add=%s bad_rows=%d untouched_bad_rows=%d "
+            "untouched_rows_total=%d first_bad=%s -- U means moe_sum_reduce read "
+            "rows no thread block ever stored to (repair: zero the cache); W "
+            "means the rows were written and the value is wrong (repair: "
+            "SGLANG_MOE_MARLIN_ATOMIC_ADD=0)",
+            verdict, int(M), int(topk), int(block_size_m), bool(use_atomic_add),
+            n_bad, n_untouched_bad, int(untouched.sum().item()),
+            torch.nonzero(bad_mask).reshape(-1)[:8].tolist(),
+        )
+    except Exception as exc:  # noqa: BLE001 -- an instrument never kills a GEMM
+        logger.debug("[nan-probe-c] report skipped: %s", exc)
+
+
 if _is_cuda:
     from sgl_kernel import moe_sum_reduce
 
@@ -279,6 +449,12 @@ def fused_marlin_moe(
         device=hidden_states.device,
         dtype=hidden_states.dtype,
     )
+    if marlin_c_sentinel_on():
+        # Task #49 probe: the arena is normally handed out uninitialised, so a
+        # row no thread block stores to is read back as allocator garbage and
+        # is indistinguishable from a row that WAS written wrong. A finite
+        # sentinel makes the two separable (see _c_probe_report).
+        intermediate_cache13.fill_(C_SENTINEL_VALUE)
     intermediate_cache1 = intermediate_cache13[: M * topk_ids.shape[1] * gemm1_n]
     intermediate_cache1 = intermediate_cache1.view(-1, gemm1_n)
     intermediate_cache3 = intermediate_cache13[: M * topk_ids.shape[1] * K]
@@ -292,6 +468,13 @@ def fused_marlin_moe(
         hidden_states.dtype == torch.half
         or (_is_cuda and torch.cuda.get_device_capability(hidden_states.device)[0] >= 9)
     ) and (not is_mxfp4_marlin)
+    # Task #49: this is the ONLY term in this call that differs between the
+    # rank that produces the NaN (rank 0 = the 5090, capability 12) and the two
+    # that never do (the 3080s, capability 8.6). The override lets one boot run
+    # the 3080s' deterministic branch on the 5090 as well.
+    if not is_mxfp4_marlin:
+        use_atomic_add, _aa_source = resolve_atomic_add(use_atomic_add)
+        _log_atomic_add_choice(use_atomic_add, _aa_source, hidden_states.device)
 
     intermediate_cache1 = moe_wna16_marlin_gemm(
         hidden_states,
@@ -398,4 +581,13 @@ def fused_marlin_moe(
             output,
             routed_scaling_factor,
         )
+        if marlin_c_sentinel_on():
+            _c_probe_report(
+                output,
+                intermediate_cache3.reshape(-1, K),
+                M,
+                topk,
+                block_size_m,
+                use_atomic_add,
+            )
         return output
