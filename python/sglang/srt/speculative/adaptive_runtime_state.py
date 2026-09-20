@@ -115,6 +115,30 @@ class AdaptiveController:
         if target != self.worker.speculative_num_steps:
             self._activate(target)
 
+    @property
+    def built_steps(self) -> list[int]:
+        """Chain lengths that actually have a runtime state, sorted ascending.
+
+        ``candidate_steps`` is what the config asked for; this is what
+        ``init_states`` managed to build. A per-round policy must choose from
+        this list, since ``_activate`` raises on anything else.
+        """
+        return sorted(self._states)
+
+    def activate_steps(self, speculative_num_steps: int) -> bool:
+        """Switch to *speculative_num_steps*; no-op if already there.
+
+        Returns True when a switch happened. Unlike ``activate_step_by_batch``
+        this takes the step count directly, for callers that decide by some
+        other signal than the batch-size-routed EMA.
+        """
+        if speculative_num_steps == self.worker.speculative_num_steps:
+            return False
+        if speculative_num_steps not in self._states:
+            return False
+        self._activate(speculative_num_steps)
+        return True
+
     def on_verify_complete(
         self, num_correct_drafts_per_req: list[int], batch_size: int
     ) -> None:

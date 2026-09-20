@@ -725,6 +725,25 @@ class Envs:
     # Saves the per-step draft forward, but the draft KV goes stale: an upshift
     # back to steps>0 starts from a cold draft state (low accept until it recovers).
     SGLANG_SPEC_SKIP_ZERO_STEP_DRAFT_EXTEND = EnvBool(False)
+    # Per-round adaptive draft chain length (topk=1 chains only), on top of
+    # --speculative-adaptive. Where --speculative-adaptive picks the chain
+    # length from the EMA of *observed* accept lengths every update_interval
+    # batches, this picks it every round from the draft model's own top-1
+    # confidence: survival = cumprod of the per-step top-1 probability, and
+    # k* = argmax (1 + sum survival) / cost(k). Deliberately NOT named
+    # SGLANG_SPEC_ADAPTIVE: that word is already taken by the server arg for
+    # the EMA policy, and two different mechanisms under one name is how a
+    # later reader picks the wrong one. Requires --speculative-adaptive, which
+    # owns the per-candidate runtime states (CUDA graphs) this switches between.
+    SGLANG_SPEC_ADAPTIVE_CHAIN = EnvBool(False)
+    # Never draft fewer than this many steps, even at zero confidence.
+    SGLANG_SPEC_ADAPTIVE_CHAIN_MIN_STEPS = EnvInt(1)
+    # Cost prior, "draft:<ms>,verify:<ms>" (e.g. "draft:2.5,verify:26"). Seeds
+    # cost(k) = verify + k * draft until enough rounds at that k have been
+    # measured; a malformed entry falls back to the built-in default.
+    SGLANG_SPEC_ADAPTIVE_CHAIN_COST_MS = EnvStr("")
+    # Log a "[spec-adaptive]" histogram of chosen k every N rounds. 0 = never.
+    SGLANG_SPEC_ADAPTIVE_CHAIN_LOG_EVERY = EnvInt(0)
     # Kill-switch for the draft-extend cuda graph. Draft extend then always runs
     # eager. Escape hatch for setups where the capture's memory pool costs more
     # than the graph saves (e.g. DeepEP MoE workspace captured at full dispatch

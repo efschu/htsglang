@@ -211,14 +211,16 @@ def _use_cached_default_models(model_repo: str):
     return ""
 
 
+# `or "0"`, not just the get() default: a hermetic CPU run sets
+# CUDA_VISIBLE_DEVICES="" (the documented way to hide every GPU), and for a
+# variable that is *set but empty* get() returns "" rather than the default,
+# so indexing [0] raised IndexError at import time and took down collection of
+# every test module that imports this one.
+_VISIBLE_DEVICES_FOR_PORT = os.environ.get("CUDA_VISIBLE_DEVICES", "0") or "0"
 if is_in_ci():
-    DEFAULT_PORT_FOR_SRT_TEST_RUNNER = (
-        10000 + int(os.environ.get("CUDA_VISIBLE_DEVICES", "0")[0]) * 2000
-    )
+    DEFAULT_PORT_FOR_SRT_TEST_RUNNER = 10000 + int(_VISIBLE_DEVICES_FOR_PORT[0]) * 2000
 else:
-    DEFAULT_PORT_FOR_SRT_TEST_RUNNER = (
-        20000 + int(os.environ.get("CUDA_VISIBLE_DEVICES", "0")[0]) * 1000
-    )
+    DEFAULT_PORT_FOR_SRT_TEST_RUNNER = 20000 + int(_VISIBLE_DEVICES_FOR_PORT[0]) * 1000
 DEFAULT_URL_FOR_TEST = f"http://127.0.0.1:{DEFAULT_PORT_FOR_SRT_TEST_RUNNER + 1000}"
 
 if is_in_amd_ci():

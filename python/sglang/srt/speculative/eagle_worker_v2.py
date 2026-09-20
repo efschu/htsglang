@@ -49,6 +49,13 @@ from sglang.srt.model_executor.runner import (
 )
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.speculative.adaptive_chain import (
+    AdaptiveChainPolicy,
+    ChainCostModel,
+    RoundCostProbe,
+    SurvivalProbe,
+    parse_cost_ms,
+)
 from sglang.srt.speculative.adaptive_runtime_state import (
     AdaptiveController,
     SpecRuntimeState,
@@ -173,6 +180,10 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         self._topk1_score_indices_prealloc = None
         self._rebuild_topk1_chain_buffers()
 
+        # Per-round adaptive chain length (SGLANG_SPEC_ADAPTIVE_CHAIN).
+        self.survival_probe: Optional[SurvivalProbe] = None
+        self._init_adaptive_chain_probe()
+
         # Load draft model weights only.
         if server_args.enable_dp_attention and self.speculative_algorithm.is_eagle3():
             ctx = draft_tp_context(get_parallel().attn_tp_group)
@@ -292,17 +303,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             f"got {self.speculative_num_draft_tokens} and {self.speculative_num_steps}"
         )
         num_steps = self.speculative_num_steps
-        sa = self.server_args
-        decode_max_bs = (
-            sa.cuda_graph_config.decode.max_bs
-            if sa.cuda_graph_config is not None
-            else None
-        )
-        max_bs = max(
-            decode_max_bs or 0,
-            sa.max_running_requests or 0,
-            1,
-        )
+        max_bs = self._max_chain_bs()
         # A single-step chain has no parent entries (slow path drops the last
         # step). repeat (not expand): the kernel reads these as contiguous.
         parent_width = num_steps if num_steps > 1 else 0
@@ -312,6 +313,67 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         self._topk1_score_indices_prealloc = torch.arange(
             num_steps, dtype=torch.long, device=self.device
         ).repeat(max_bs, 1)
+
+    def _max_chain_bs(self) -> int:
+        """Largest batch size any chain-shaped buffer must cover."""
+        sa = self.server_args
+        decode_max_bs = (
+            sa.cuda_graph_config.decode.max_bs
+            if sa.cuda_graph_config is not None
+            else None
+        )
+        return max(decode_max_bs or 0, sa.max_running_requests or 0, 1)
+
+    def _init_adaptive_chain_probe(self) -> None:
+        """Allocate the survival buffer once, sized for the longest candidate.
+
+        Sized from the *union* of the adaptive candidate steps rather than from
+        the current ``speculative_num_steps``: the buffer is captured into every
+        draft CUDA graph and must never be reallocated afterwards, so it has to
+        be wide enough for the longest chain the controller can ever activate.
+
+        Requires ``--speculative-adaptive`` — that flag owns the per-candidate
+        runtime states (one captured draft/verify graph set per chain length)
+        that the per-round policy switches between. Without it there is exactly
+        one captured chain length and nothing to choose from.
+        """
+        if not envs.SGLANG_SPEC_ADAPTIVE_CHAIN.get():
+            return
+        if self.topk != 1:
+            logger.warning(
+                "SGLANG_SPEC_ADAPTIVE_CHAIN ignored: it models a topk=1 chain, "
+                f"but speculative_eagle_topk={self.topk}."
+            )
+            return
+        if not self.server_args.speculative_adaptive:
+            logger.warning(
+                "SGLANG_SPEC_ADAPTIVE_CHAIN ignored: it needs --speculative-adaptive, "
+                "which builds the per-chain-length runtime states it selects between."
+            )
+            return
+
+        from sglang.srt.speculative.adaptive_spec_params import (
+            resolve_candidate_steps_from_config,
+        )
+
+        candidates = resolve_candidate_steps_from_config(
+            cfg_path=self.server_args.speculative_adaptive_config
+        )
+        k_max = max([*candidates, self.speculative_num_steps])
+        if k_max <= 1:
+            logger.warning(
+                f"SGLANG_SPEC_ADAPTIVE_CHAIN ignored: candidate steps {candidates} "
+                "leave no chain length to choose between."
+            )
+            return
+
+        self.survival_probe = SurvivalProbe(
+            max_bs=self._max_chain_bs(), k_max=k_max, device=self.device
+        )
+        logger.info(
+            f"[spec-adaptive] survival probe armed: k_max={k_max}, "
+            f"candidates={candidates}, max_bs={self.survival_probe.max_bs}"
+        )
 
     def init_token_map(self):
         # Load hot token ids
@@ -567,6 +629,13 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 self.device,
             )
 
+        if self.survival_probe is not None:
+            # Non-blocking D2H; the value is picked up at the START of a later
+            # round (see EAGLEWorkerV2.activate_step_by_batch), never waited on.
+            self.survival_probe.start_readout(
+                forward_batch.batch_size, self.speculative_num_steps
+            )
+
         # Build tree mask
         # Directly write to cuda graph buffers for verify attn
         tree_mask_buf, position_buf = (
@@ -714,9 +783,32 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 )
                 draft_probs_list.append(probs)
             elif self.topk == 1 and not _is_hip:
-                topk_index = torch.argmax(
-                    logits_output.next_token_logits, dim=-1, keepdim=True
-                )
+                if self.survival_probe is not None:
+                    # max() gives the same index argmax() does plus the logit,
+                    # so the confidence costs one extra logsumexp reduction and
+                    # no second pass over the logits. Graph-safe: the result
+                    # lands in the pre-allocated survival buffer, which is never
+                    # reallocated (see _init_adaptive_chain_probe).
+                    top1_logit, topk_index = logits_output.next_token_logits.max(
+                        dim=-1, keepdim=True
+                    )
+                    step_p = torch.exp(
+                        top1_logit.float()
+                        - torch.logsumexp(
+                            logits_output.next_token_logits.float(),
+                            dim=-1,
+                            keepdim=True,
+                        )
+                    )
+                    # Loop step i produces draft token i+2; token 1 came from
+                    # draft-extend and occupies column 0.
+                    self.survival_probe.write_step(
+                        i + 1, step_p, forward_batch.batch_size
+                    )
+                else:
+                    topk_index = torch.argmax(
+                        logits_output.next_token_logits, dim=-1, keepdim=True
+                    )
                 topk_p = torch.ones_like(topk_index, dtype=torch.float32)
             else:
                 probs = renorm_draft_probs(
@@ -1016,9 +1108,28 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         elif self.topk == 1 and not _is_hip:
             # Gated to CUDA: see #26358 — ROCm's argmax tie-break corrupts
             # MTP draft selection on FP8 logits.
-            ret_topk_index = torch.argmax(
-                draft_logits_output.next_token_logits, dim=-1, keepdim=True
-            )
+            if self.survival_probe is not None:
+                # This samples the FIRST draft token of the next round, so its
+                # confidence is survival column 0. Runs outside the draft graph
+                # ("owned by the worker for both graph and eager paths" above),
+                # hence no graph constraint here — but it writes the same
+                # buffer the draft graph later reads column 0 from.
+                top1_logit, ret_topk_index = draft_logits_output.next_token_logits.max(
+                    dim=-1, keepdim=True
+                )
+                step_p = torch.exp(
+                    top1_logit.float()
+                    - torch.logsumexp(
+                        draft_logits_output.next_token_logits.float(),
+                        dim=-1,
+                        keepdim=True,
+                    )
+                )
+                self.survival_probe.write_step(0, step_p, step_p.shape[0])
+            else:
+                ret_topk_index = torch.argmax(
+                    draft_logits_output.next_token_logits, dim=-1, keepdim=True
+                )
             ret_topk_p = torch.ones_like(ret_topk_index, dtype=torch.float32)
             ret_draft_probs = None
         else:
@@ -1100,6 +1211,10 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 self,
                 config_path=server_args.speculative_adaptive_config,
             )
+        # Per-round chain-length policy; armed in init_cuda_graphs once the
+        # controller knows which chain lengths actually got a runtime state.
+        self.chain_policy: Optional[AdaptiveChainPolicy] = None
+        self.round_cost_probe: Optional[RoundCostProbe] = None
 
         # Some dummy tensors
         self.num_new_pages_per_topk = torch.empty(
@@ -1171,6 +1286,47 @@ class EAGLEWorkerV2(BaseSpecWorker):
                         else self.server_args.cuda_graph_bs_decode
                     ),
                 )
+            self._arm_chain_policy()
+
+    def _arm_chain_policy(self) -> None:
+        """Build the per-round policy over the chain lengths that got built.
+
+        Runs after ``init_states`` on purpose: the policy may only return a
+        chain length whose runtime state (draft + verify CUDA graphs) exists,
+        and that set is only known once the controller has built them.
+        """
+        if (
+            self._draft_worker.survival_probe is None
+            or self.adaptive_controller is None
+        ):
+            return
+        built = [s for s in self.adaptive_controller.built_steps if s >= 1]
+        if len(built) < 2:
+            logger.warning(
+                f"[spec-adaptive] chain policy not armed: runtime states {built} "
+                "leave nothing to choose between."
+            )
+            self._draft_worker.survival_probe = None
+            return
+
+        draft_ms, verify_ms = parse_cost_ms(
+            envs.SGLANG_SPEC_ADAPTIVE_CHAIN_COST_MS.get()
+        )
+        k_max = max(built)
+        self.chain_policy = AdaptiveChainPolicy(
+            k_max=k_max,
+            k_min=envs.SGLANG_SPEC_ADAPTIVE_CHAIN_MIN_STEPS.get(),
+            cost_model=ChainCostModel(
+                k_max=k_max, draft_ms=draft_ms, verify_ms=verify_ms
+            ),
+            log_every=envs.SGLANG_SPEC_ADAPTIVE_CHAIN_LOG_EVERY.get(),
+            candidates=built,
+        )
+        self.round_cost_probe = RoundCostProbe(device=self.device)
+        logger.info(
+            f"[spec-adaptive] chain policy armed: candidates={self.chain_policy.candidates}, "
+            f"k_min={self.chain_policy.k_min}, cost prior draft={draft_ms}ms verify={verify_ms}ms"
+        )
 
     @property
     def target_worker(self):
@@ -1222,6 +1378,9 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 return batch_output
         else:
             self.activate_step_by_batch(batch.seq_lens.shape[0])
+            if self.round_cost_probe is not None:
+                # Tag the measurement with the chain length just activated.
+                self.round_cost_probe.begin(self.speculative_num_steps)
 
             if batch.spec_info is None:
                 capture_mode = (
@@ -1276,6 +1435,8 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 ):
                     self.draft_worker._draft_extend_for_decode(batch, batch_output)
 
+            if self.round_cost_probe is not None:
+                self.round_cost_probe.end()
             return batch_output
 
     def _build_trivial_verify_input(self, batch: ScheduleBatch) -> EagleVerifyInput:
@@ -1374,8 +1535,37 @@ class EAGLEWorkerV2(BaseSpecWorker):
             )
 
     def activate_step_by_batch(self, batch_size: int) -> None:
-        if self.adaptive_controller is not None:
-            self.adaptive_controller.activate_step_by_batch(batch_size)
+        if self.adaptive_controller is None:
+            return
+        if self.chain_policy is not None and self._apply_chain_policy():
+            # The per-round survival policy owns the chain length while it is
+            # armed; running the batch-size EMA on top would have the two
+            # fight over the same runtime state within one round.
+            return
+        self.adaptive_controller.activate_step_by_batch(batch_size)
+
+    def _apply_chain_policy(self) -> bool:
+        """Pick this round's chain length from the last round's survival curve.
+
+        Returns True when the policy was consulted (whether or not the state
+        actually changed). False means no fresh curve had landed yet, so the
+        caller should fall back to the existing batch-size policy.
+        """
+        probe = self._draft_worker.survival_probe
+        if probe is None:
+            return False
+        if self.round_cost_probe is not None:
+            # Fold in whatever round timings have completed since last round.
+            self.round_cost_probe.drain(self.chain_policy.record_duration)
+        curve = probe.poll()
+        if curve is None:
+            # D2H not finished (or no draft ran). Never block on it: keeping
+            # the current chain length for one more round is strictly cheaper
+            # than a sync, and the next round will have the curve.
+            return False
+        self.chain_policy.record_survival(curve)
+        self.adaptive_controller.activate_steps(self.chain_policy.choose())
+        return True
 
     # -- Adaptive speculative decoding protocol --
 
