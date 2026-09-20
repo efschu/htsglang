@@ -989,7 +989,17 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 # token-sharded pool (owner rule) — fail fast without it.
                 # The NEXTN draft is exempt by design: its single-layer
                 # full-context pool is intentionally replicated (non-DCP).
-                if not is_nextn and get_parallel().attn_dcp_size != self.attn_tp_size:
+                # fnFA2 (20.09.): under Form A the host owns EVERY head
+                # (base plan 1,0,0) -- the kv heads are not replicated
+                # across ranks but held once, so no token-sharded pool is
+                # needed; a worker never attends at all (skip_on_worker).
+                from sglang.srt.rank_role import form_a_dense_is_unsharded
+
+                if (
+                    not is_nextn
+                    and not form_a_dense_is_unsharded()
+                    and get_parallel().attn_dcp_size != self.attn_tp_size
+                ):
                     raise ValueError(
                         f"TP > num_kv_heads: layer {layer_id} has "
                         f"{self.total_num_kv_heads} kv heads for "
