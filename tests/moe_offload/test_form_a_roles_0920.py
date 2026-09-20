@@ -209,8 +209,8 @@ def test_an_explicit_dcp_flag_is_refused_not_overridden():
 # ==========================================================================
 # 4. The seam registry -- named refusals for what is not built
 # ==========================================================================
-WIRED = ("F1", "F2", "F3", "F4", "F7", "F8", "F10", "F11", "F12", "F13")
-UNWIRED = ("F5", "F6", "F9")
+WIRED = ("F1", "F2", "F3", "F4", "F7", "F8", "F9", "F10", "F11", "F12", "F13")
+UNWIRED = ("F5", "F6")
 
 
 def test_every_seam_has_an_identity_a_place_and_a_verdict():
@@ -243,14 +243,15 @@ def test_the_remaining_work_is_ordered_and_complete():
 
     assert set(UNWIRED_ORDER) == set(UNWIRED)
     assert len(UNWIRED_ORDER) == len(set(UNWIRED_ORDER))
-    # F5 leads now: with F3 and F12 built, what is left before a believed
-    # boot is the DCP merge (which Form A should never reach), the per-role
-    # graph mode (deliberately last -- the first boot is eager) and the
-    # subgroup (not needed while every collective spans all ranks).
+    # F5 leads now: with F3, F9 and F12 built, what is left before a
+    # believed boot is the DCP merge (which Form A should never reach) and
+    # the subgroup (not needed while every collective spans all ranks).
+    # F9 left the list on 20.09.: fnFA15's 233 ms per round against the
+    # classic form's 35 ms WITH graphs is what ended its deferrability.
     assert UNWIRED_ORDER[0] == "F5"
     # Seams that left the list must stay off it; if one comes back the
     # order has to come back with it, not silently shrink.
-    for gone in ("F3", "F4", "F10", "F11", "F12", "F13"):
+    for gone in ("F3", "F4", "F9", "F10", "F11", "F12", "F13"):
         assert gone not in UNWIRED_ORDER
 
 
@@ -303,15 +304,24 @@ def test_guards_fire_only_on_the_rank_whose_role_needs_them():
     guard_kv_pool(FORM_A, 1, tokens=1)
 
 
-def test_eager_is_an_allowed_worker_graph_mode_and_a_captured_one_is_not():
-    """R6/F9 is deferrable precisely because the first probe boot may run
-    decode eager; what must refuse is a CAPTURED dense graph on a rank that
-    holds no dense weights."""
+def test_eager_is_an_allowed_worker_graph_mode_and_a_dense_capture_is_not():
+    """F9 is WIRED as of 20.09., and the refusal did not go with it -- it
+    changed subject. Eager stays allowed (that is what fnFA15 ran); what is
+    refused, now permanently and with its own class, is recording the DENSE
+    body on a rank that holds no dense weights. The per-role graph itself
+    has its own file, test_form_a_graph_0920.py."""
+    from sglang.srt.rank_role import (
+        GRAPH_BODY_MOE_ROUTE,
+        FormAWorkerDenseGraph,
+    )
+
     guard_graph_mode(FORM_A, 1, "eager")
     guard_graph_mode(FORM_A, 1, "disabled")
     guard_graph_mode(FORM_A, 0, "full")
-    with pytest.raises(FormASeamNotWired, match="F9"):
+    guard_graph_mode(FORM_A, 1, "full", body=GRAPH_BODY_MOE_ROUTE)
+    with pytest.raises(FormAWorkerDenseGraph, match="expert worker"):
         guard_graph_mode(FORM_A, 1, "full")
+    assert not issubclass(FormAWorkerDenseGraph, FormASeamNotWired)
 
 
 def test_a_zero_width_linear_is_only_guarded_when_it_is_actually_zero():

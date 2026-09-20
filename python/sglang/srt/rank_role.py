@@ -50,6 +50,10 @@ __all__ = [
     "guard_dense_weights",
     "guard_collective_subgroup",
     "guard_graph_mode",
+    "FormAWorkerDenseGraph",
+    "GRAPH_BODY_MOE_ROUTE",
+    "GRAPH_BODY_MODEL_FORWARD",
+    "GRAPH_BODIES",
     "guard_zero_width_linear",
     "guard_zero_width_linear_shard",
     "form_a_dense_is_unsharded",
@@ -78,6 +82,21 @@ class FormAZeroWidthLinear(RankRoleError):
     seam's wired flag would have made the backstop evaporate the moment the
     seam was marked built -- which is exactly what happened on the first
     attempt and is the reason this class exists.
+    """
+
+
+class FormAWorkerDenseGraph(RankRoleError):
+    """A Form A worker was about to CAPTURE a dense graph.
+
+    Its OWN class, and deliberately not a FormASeamNotWired -- the same
+    reasoning as FormAZeroWidthLinear: with F9 wired the worker DOES
+    capture a graph, so a refusal tied to the seam's wired flag would have
+    evaporated in the very commit that built the seam. What stays refused
+    forever is the WRONG BODY: recording `model.forward` on a rank whose
+    dense modules are HostOnlyModule placeholders records a graph that
+    either raises at capture or -- worse, if a placeholder ever grows a
+    silent fallback -- replays zeros every round with nothing to show for
+    it.
     """
 
 
@@ -297,16 +316,26 @@ SEAMS: Dict[str, Seam] = {
             "F9",
             "CUDA-graph mode chosen per role (host captures the dense "
             "families, a worker captures only its expert route)",
-            "layers/moe/offload_capture_gate.py:236/249 (process-wide env "
-            "decision)",
-            wired=False,
-            note="Deferrable: the first Form A probe boot can run decode "
-            "EAGER. That costs throughput but measures the per-layer chain, "
-            "which is what the probe is for.",
+            "model_executor/runner/decode_cuda_graph_runner.py "
+            "(capture_one_shape picks the recorded BODY per role; the "
+            "worker's body is form_a_worker_forward.py "
+            "run_form_a_worker_layers, the same one its eager forward "
+            "runs); the MoE offload's own mode stays process-wide in "
+            "layers/moe/offload_capture_gate.py:236/249 and is correct "
+            "there -- both roles run the same FusedMoE pool route",
+            wired=True,
+            note="Wired 20.09. after fnFA15 ran end-to-end EAGER at 233 ms "
+            "per round against 35 ms for the classic form with graphs. The "
+            "graph decision is no longer process-wide in the part that "
+            "matters: the host records model.forward, a worker records only "
+            "form_a_worker_forward.run_form_a_worker_layers -- the SAME "
+            "function its eager forward runs, so the two bodies cannot drift "
+            "into different collective sequences.",
             anchors=(
-                ("layers/moe/offload_capture_gate.py", 236, "def env_graph_mode"),
-                ("layers/moe/offload_capture_gate.py", 249,
-                 "def resolve_offload_graph_mode"),
+                ("model_executor/runner/decode_cuda_graph_runner.py", 1989,
+                 "def _capture_one_shape_form_a"),
+                ("form_a_worker_forward.py", 247,
+                 "def run_form_a_worker_layers"),
             ),
         ),
         # ---- found by the slice-6a symmetry probe (form_a_symmetry.py) ----
@@ -390,7 +419,7 @@ SEAMS: Dict[str, Seam] = {
 #: The seams that must be wired before a Form A boot can be believed, in the
 #: order the survey found them knocking. Kept as data so a report can print
 #: the remaining work without re-deriving it.
-UNWIRED_ORDER: Tuple[str, ...] = ("F5", "F9", "F6")
+UNWIRED_ORDER: Tuple[str, ...] = ("F5", "F6")
 
 
 def require_wired(seam_id: str, context: str = "") -> None:
@@ -728,19 +757,74 @@ def guard_collective_subgroup(plan: RankRolePlan, name: str) -> None:
     )
 
 
-def guard_graph_mode(plan: RankRolePlan, rank: int, mode: str) -> None:
-    """Called where a rank picks its CUDA-graph mode (F9).
+#: The two bodies a decode graph can record under Form A. A CLOSED
+#: vocabulary on purpose (same rule as form_a_construction.worker_builds):
+#: a caller that invents a third spelling is refused rather than defaulted,
+#: because the default that reads best ("it's probably fine") is exactly the
+#: one that records a dense forward on a rank with no dense weights.
+GRAPH_BODY_MOE_ROUTE = "form_a_moe_route"
+GRAPH_BODY_MODEL_FORWARD = "model_forward"
+GRAPH_BODIES: Tuple[str, ...] = (GRAPH_BODY_MOE_ROUTE, GRAPH_BODY_MODEL_FORWARD)
 
-    Eager is explicitly allowed and is the first probe boot's form -- what
-    is refused is a CAPTURED dense graph on a rank that holds no dense
-    weights, because that captures nothing and hides it.
+
+def guard_graph_mode(
+    plan: RankRolePlan,
+    rank: int,
+    mode: str,
+    *,
+    body: Optional[str] = None,
+) -> None:
+    """Called where a rank picks its CUDA-graph mode AND its body (F9).
+
+    Two things are checked here, and the second is the one that survives the
+    seam being wired:
+
+    * ``mode`` -- eager/disabled stays explicitly allowed. That is the form
+      fnFA15 ran (and it measured 233 ms per round against 35 ms for the
+      classic form WITH graphs, which is why F9 stopped being deferrable).
+    * ``body`` -- WHAT the graph records. A worker holds no dense weights,
+      so recording ``model.forward`` on it is refused by name, forever; the
+      only body it may record is its own MoE route. The host is the mirror
+      image: it records the model forward and must NOT record the stripped
+      worker route, which would skip its whole dense chain and still emit
+      the right NUMBER of collectives -- a wrong answer that no hang and no
+      shape error would reveal.
+
+    ``body=None`` means "this call site only decides the mode" and keeps the
+    old, mode-only contract for callers that have not picked a body yet.
     """
-    if plan.is_worker(rank) and mode not in ("eager", "disabled", None):
-        require_wired(
-            "F9",
-            f"rank {rank} is a Form A worker but was given graph mode "
-            f"{mode!r}; the graph decision is still process-wide.",
+    if body is not None and body not in GRAPH_BODIES:
+        raise RankRoleError(
+            f"{body!r} is not a Form A graph body; known: {list(GRAPH_BODIES)}. "
+            "Refusing rather than defaulting: this argument decides whether a "
+            "rank records its dense forward or the stripped expert route, and "
+            "a typo that silently picked either one is a wrong answer, not a "
+            "crash."
         )
+    is_worker = plan.is_worker(rank)
+    if not is_worker:
+        if body == GRAPH_BODY_MOE_ROUTE:
+            raise FormAWorkerDenseGraph(
+                f"rank {rank} is the Form A HOST but was about to capture the "
+                f"worker's MoE route ({body!r}). The host owns the whole dense "
+                "chain; recording the stripped route would skip it and still "
+                "issue the same 96 collectives per round, so every rank would "
+                "stay in lockstep and the output would simply be wrong."
+            )
+        return
+    if mode in ("eager", "disabled", None):
+        return
+    if body == GRAPH_BODY_MOE_ROUTE:
+        return
+    raise FormAWorkerDenseGraph(
+        f"rank {rank} is a Form A expert worker and was given graph mode "
+        f"{mode!r} with body {body!r}. A worker's dense modules are "
+        "HostOnlyModule placeholders (form_a_construction.skip_on_worker), so "
+        "a captured model.forward records nothing it could replay. The body a "
+        f"worker may record is {GRAPH_BODY_MOE_ROUTE!r} -- "
+        "form_a_worker_forward.run_form_a_worker_layers, the same function "
+        "its eager forward runs."
+    )
 
 
 def guard_zero_width_linear(

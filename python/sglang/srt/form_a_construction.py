@@ -207,6 +207,14 @@ class FormAWorkerAttnBackend:
     prefill_attention_backend_str = None
     decode_attention_backend_str = None
     supports_ragged_verify_graph = False
+    #: F9. Read by DecodeCudaGraphRunner.execute on a TARGET_VERIFY replay to
+    #: decide WHEN the WAR read-done event is recorded. False is not a
+    #: placeholder: a worker's captured graph re-reads no req_to_token at all
+    #: (it never attends), so there is no post-replay re-read to wait for.
+    #: Declared rather than left to an AttributeError, because the read is
+    #: guarded by a short-circuit today and a future spec family would reach
+    #: it -- and "the attribute happened to be unreachable" is not a design.
+    use_captured_forward_metadata_for_breakable_cuda_graph = False
 
     def __init__(self, model_runner):
         self.model_runner = model_runner

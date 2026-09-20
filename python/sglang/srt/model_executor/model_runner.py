@@ -583,6 +583,18 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.is_form_a_worker = (
             this_rank_is_form_a_worker() and not is_draft_worker
         )
+        # RANK-UNIFORM (F9): true on the host AND on every worker whenever a
+        # role plan is installed. The two flags answer different questions
+        # and must not be confused -- `is_form_a_worker` is "does THIS rank
+        # run the stripped route", this one is "is the GROUP running Form A",
+        # which is what a phase-level capture decision has to be keyed on: a
+        # phase captured on one role and not the other is the #631 class of
+        # wedge, not a tuning choice. A draft runner is excluded from the
+        # worker flag but NOT from this one: the solo shadow still lives in a
+        # Form A group.
+        from sglang.srt.rank_role import installed_role_plan
+
+        self.form_a_role_plan_installed = installed_role_plan() is not None
         if self.is_form_a_worker:
             logger.info(
                 "Form A: rank %d is an EXPERT WORKER (routed experts + "
@@ -4093,6 +4105,20 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 self.prefill_cuda_graph_runner = self.eager_runner
             return
 
+        # FORM A (F9): DECODE/VERIFY is captured per role; PREFILL/EXTEND is
+        # not. Same reason as the weightless lane one branch up, plus one of
+        # its own: an extend batch's row count is the CHUNK, which varies per
+        # request, and the worker derives the width of its MoE-input carrier
+        # from exactly that row count -- a captured extend would bake one
+        # chunk width and the carrier would then all-reduce a shape the host
+        # is not sending. Rank-uniform by construction: the HOST takes the
+        # same exit (the role plan is installed on every rank), so neither
+        # side captures a phase the other runs eager.
+        if getattr(self, "form_a_role_plan_installed", False):
+            if not self.is_draft_worker:
+                self.prefill_cuda_graph_runner = self.eager_runner
+            return
+
         if check_cuda_graph_backend(Phase.PREFILL, Backend.DISABLED):
             logger.info(
                 "Disable prefill CUDA graph because cuda_graph_config "
@@ -5060,8 +5086,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         Returns a sentinel output: no logits, because no lm_head. Sampling
         on a worker is skipped the same way it is for a weightless worker.
         """
-        from sglang.srt.form_a_worker_forward import run_form_a_worker_layers
-
         self._prepare_eager_forward_batch(forward_batch)
         if forward_batch.forward_mode.is_idle():
             # The host's MoE block short-circuits a zero-row forward before
@@ -5080,16 +5104,45 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         num_tokens = int(input_ids.shape[0])
         if num_tokens == 0:
             return ModelRunnerOutput(logits_output=None, can_run_graph=False)
-        run_form_a_worker_layers(
+        self.run_form_a_worker_route(forward_batch, num_tokens)
+        return ModelRunnerOutput(logits_output=None, can_run_graph=False)
+
+    def run_form_a_worker_route(self, forward_batch: ForwardBatch, num_tokens: int):
+        """THE Form A worker body -- ONE spelling, eager and captured (F9).
+
+        The decode-graph runner's Form A capture records THIS call, not a
+        copy of it. That is the whole point of the method existing: the
+        captured body and the eager body are the same function with the same
+        arguments, so they cannot drift into different per-layer collective
+        sequences. Two spellings of "which collectives" is how a boot gate
+        comes to pass while the boot hangs (form_a_boot_gate's docstring);
+        the same trap one level down is two spellings of the forward.
+
+        `host_rank` comes from the INSTALLED plan rather than the literal 0
+        the first draft used: the plan already names the host
+        (`form_a_token_src_rank`), and a hardcoded 0 would be a second
+        source of truth for the same fact.
+        """
+        from sglang.srt.form_a_worker_forward import run_form_a_worker_layers
+        from sglang.srt.rank_role import form_a_token_src_rank
+
+        host_rank = form_a_token_src_rank()
+        if host_rank is None:
+            raise RuntimeError(
+                "Form A worker route reached with no role plan installed in "
+                "this process. The route is a Form A path by construction; "
+                "without the plan this rank cannot even name the host it "
+                "would receive the MoE input from."
+            )
+        return run_form_a_worker_layers(
             self._form_a_moe_blocks(),
-            num_tokens=num_tokens,
+            num_tokens=int(num_tokens),
             hidden_size=int(self.model_config.hidden_size),
             dtype=self.dtype,
-            device=input_ids.device,
+            device=forward_batch.input_ids.device,
             forward_batch=forward_batch,
-            host_rank=0,
+            host_rank=int(host_rank),
         )
-        return ModelRunnerOutput(logits_output=None, can_run_graph=False)
 
     def _forward_raw(
         self,
@@ -5212,12 +5265,66 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     return self._forward_weightless_worker(forward_batch)
 
             if getattr(self, "is_form_a_worker", False):
-                # FORM A: no dense weights on this rank, so there is no
-                # model forward to run -- only the per-layer MoE route. No
-                # graph branch here on purpose: the first Form A boot runs
-                # decode EAGER (seam F9, deliberately last), and a captured
-                # worker graph that recorded the carrier would have to agree
-                # with a host graph that does not exist yet.
+                # FORM A: no dense weights on this rank, so there is no model
+                # forward to run -- only the per-layer MoE route.
+                #
+                # F9 (wired 20.09.): the worker REPLAYS its own captured
+                # route when the batch is graph-eligible, mirroring the
+                # weightless-worker branch above. The host replays its dense
+                # graph in the same round; both graphs recorded the same 96
+                # collectives per round in the same order, so the two replays
+                # pair up exactly as the two eager forwards did. When the
+                # batch is not eligible (a bucket miss, a bs the ladder does
+                # not carry) BOTH sides fall back to eager for the same
+                # reason at the same point -- `can_run_graph` reads
+                # rank-uniform inputs (batch_size, forward_mode, token count).
+                mode_check = (
+                    forward_batch.forward_mode.is_cpu_graph
+                    if self.device == "cpu"
+                    else forward_batch.forward_mode.is_cuda_graph
+                )
+                form_a_can_run_graph = bool(
+                    mode_check()
+                    and self.decode_cuda_graph_runner
+                    and self.decode_cuda_graph_runner.can_run_graph(forward_batch)
+                )
+                if form_a_can_run_graph:
+                    if not getattr(self, "_form_a_graph_replay_logged", False):
+                        self._form_a_graph_replay_logged = True
+                        # ONCE per rank, and it earns its line: the ONE
+                        # property this lane cannot prove at the desk is that
+                        # the host and the workers ADMIT the same rounds to
+                        # the graph. They read the same predicate over
+                        # rank-uniform inputs, so they should -- but if they
+                        # ever diverge the symptom is a carrier all-reduce of
+                        # the PADDED bucket width against the RAW row count,
+                        # which is a size mismatch, not a hang, and this line
+                        # is what makes the two sides comparable in the log.
+                        logger.info(
+                            "Form A worker: FIRST GRAPH REPLAY on rank %d "
+                            "(mode=%s raw_bs=%d rows=%d). The host must show "
+                            "its own first replay for the same round.",
+                            self.tp_rank,
+                            forward_batch.forward_mode.name,
+                            int(forward_batch.batch_size),
+                            (
+                                int(forward_batch.input_ids.shape[0])
+                                if getattr(forward_batch, "input_ids", None)
+                                is not None
+                                else -1
+                            ),
+                        )
+                    with self._decode_round_segment(
+                        "target_verify"
+                        if forward_batch.forward_mode.is_target_verify()
+                        else "decode",
+                        graphed=True,
+                    ):
+                        self.decode_cuda_graph_runner.execute(
+                            forward_batch,
+                            pp_proxy_tensors=pp_proxy_tensors,
+                        )
+                    return ModelRunnerOutput(logits_output=None, can_run_graph=True)
                 with self._decode_round_segment("decode", graphed=False):
                     return self._forward_form_a_worker(forward_batch)
 

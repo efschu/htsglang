@@ -65,6 +65,10 @@ from sglang.srt.model_executor.forward_batch_info import (
     enable_num_token_non_padded,
 )
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
+# Imported as a MODULE, not by name: the F9 guard and its two body constants
+# are one decision that must be read from one place, and a `from ... import
+# guard_graph_mode` here would let a future edit shadow it locally.
+from sglang.srt import rank_role
 from sglang.srt.model_executor.runner.base_cuda_graph_runner import (
     BaseCudaGraphRunner,
     freeze_gc,
@@ -1829,6 +1833,16 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         if self.model_runner.is_weightless_worker:
             return self._capture_one_shape_weightless(size, stream_idx, variant_label)
 
+        # FORM A WORKER (F9): same shape of asymmetry, one axis over. The
+        # worker holds experts and a router and nothing else, so what it
+        # records is its MoE route, not model.forward. The guard below is the
+        # decision point seam F9 names -- it is called for BOTH roles, so a
+        # host that ever reached the worker body is refused here too.
+        if getattr(self.model_runner, "is_form_a_worker", False):
+            self._guard_form_a_capture_body(rank_role.GRAPH_BODY_MOE_ROUTE)
+            return self._capture_one_shape_form_a(size, stream_idx, variant_label)
+        self._guard_form_a_capture_body(rank_role.GRAPH_BODY_MODEL_FORWARD)
+
         num_tokens = size * self.num_tokens_per_bs
         bs = self._ragged_capture_slots(num_tokens) if self.ragged_verify_mode else size
 
@@ -1942,6 +1956,123 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                         post_warmup_hook=post_warmup_hook,
                     )
                 self._bind_clock_graph(shape_key)
+
+    def _graph_mode_name(self) -> str:
+        """What to CALL this runner's mode when a refusal has to name it.
+
+        The runner exists, so a graph is about to be recorded; the string is
+        the resolved decode backend rather than a bare "on" so the refusal
+        text says which knob produced it.
+        """
+        cfg = getattr(self.model_runner.server_args, "cuda_graph_config", None)
+        decode = getattr(cfg, "decode", None)
+        return str(getattr(decode, "backend", "full") or "full")
+
+    def _guard_form_a_capture_body(self, body: str) -> None:
+        """Seam F9's decision point: WHICH body does this rank record?
+
+        A no-op on every classic boot (no role plan installed), which is why
+        it sits here rather than behind an `if` at the call site: the guard
+        itself is the cheap part, and a guard that is only reached when
+        someone remembered to reach it is the #363 class.
+        """
+        plan = rank_role.installed_role_plan()
+        if plan is None:
+            return
+        rank_role.guard_graph_mode(
+            plan,
+            int(getattr(self.model_runner, "tp_rank", 0)),
+            self._graph_mode_name(),
+            body=body,
+        )
+
+    def _capture_one_shape_form_a(
+        self,
+        size: int,
+        stream_idx: Optional[int] = None,
+        variant_label: Optional[str] = None,
+    ):
+        """FORM A WORKER decode/verify-graph capture (seam F9).
+
+        Symmetric counterpart of the host's capture_one_shape, and the exact
+        analogue of ``_capture_one_shape_weightless`` one axis over: instead
+        of recording model.forward (impossible -- the worker's dense modules
+        are HostOnlyModule placeholders), record the stripped per-MoE-layer
+        route, i.e. ``ModelRunner.run_form_a_worker_route`` -- THE SAME
+        method the eager worker forward calls, not a copy of its body. The
+        recorded graph therefore issues the identical sequence the boot gate
+        pinned: per routed-MoE layer one MoE-INPUT CARRIER (all-reduce of a
+        zero addend by default) and one post-experts COMBINE all-reduce, 96
+        collectives over 48 layers, in the order the host issues them.
+
+        **Why the zero addend survives capture, which is the one thing a
+        reader should not have to take on trust.** ``receive_moe_input``
+        allocates its receive buffer with ``torch.zeros``. Under capture that
+        is an allocation from the graph's private pool plus a RECORDED fill
+        kernel, so every replay re-zeroes the buffer before the all-reduce.
+        A "cheaper" preallocated buffer hoisted out of the body would be
+        WRONG here in a way nothing would report: after replay one it holds
+        the host's hidden states, so replay two would add them to the host's
+        new value and every rank would agree on a corrupted MoE input.
+
+        Attention metadata is prepped out of the graph and is a no-op on this
+        rank (``FormAWorkerAttnBackend``); there are no logits, no sampling
+        and no capture-tail hooks, for the same reason the weightless worker
+        has none. The sentinel output is None: ``execute`` maps a None replay
+        output to a logits-free ModelRunnerOutput.
+        """
+        num_tokens = size * self.num_tokens_per_bs
+        bs = size
+        model_runner = self.model_runner
+
+        forward_batch, attn_backend, _pp_proxy_tensors = self.capture_prepare(
+            bs, stream_idx=stream_idx, num_tokens=num_tokens
+        )
+        # Resolve the layer list BEFORE the capture region: it walks the
+        # module tree and logs, neither of which belongs inside a recorded
+        # pass, and a first-call resolution failure must be a boot error with
+        # a stack rather than a capture abort.
+        model_runner._form_a_moe_blocks()
+
+        with forward_context(ForwardContext(attn_backend=attn_backend)):
+            attn_backend.init_forward_metadata_out_graph(forward_batch, in_capture=True)
+
+            def run_once():
+                attn_backend.init_forward_metadata_in_graph(forward_batch)
+                forward_batch.dp_local_start_pos = forward_batch.dp_local_num_tokens = (
+                    None
+                )
+                set_dp_buffer_len(
+                    forward_batch.global_dp_buffer_len,
+                    num_tokens,
+                    forward_batch.dp_padding_mode.is_max_len(),
+                    forward_batch.global_num_tokens_cpu,
+                )
+                set_is_extend_in_batch(False)
+                model_runner.run_form_a_worker_route(forward_batch, num_tokens)
+                return None
+
+            shape_key = self._make_graph_key(
+                self._capture_graph_size(bs=bs, num_tokens=num_tokens),
+                stream_idx,
+                variant_label,
+            )
+            # Same bracketing as the weightless worker's capture, for the
+            # same reason (#1241b): this rank replays under the round
+            # instrument, so its graph needs the clock's event nodes -- a
+            # three-rank round comparison missing one rank is worse than no
+            # comparison, because nothing in the log says which rank is gone.
+            with collective_clock().capture_scope(
+                self._clock_graph_key(shape_key),
+                phase=self._clock_capture_phase(),
+            ):
+                self.backend.capture_one(
+                    shape_key,
+                    run_once,
+                    dummies=None,
+                    post_warmup_hook=None,
+                )
+            self._bind_clock_graph(shape_key)
 
     def _capture_one_shape_weightless(
         self,

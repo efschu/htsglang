@@ -42,6 +42,28 @@ def should_run_flashinfer_autotune(
     if mr.server_args.disable_flashinfer_autotune:
         return False
 
+    # FORM A (F9): autotune drives a DUMMY MODEL FORWARD. On the host that
+    # forward issues the 96 per-round collectives; the workers are not in a
+    # forward at that moment, so the host would block in the carrier's
+    # all-reduce with no peer -- the fnFA12 shape, one phase earlier. The
+    # refusal is RANK-UNIFORM on purpose (every rank has the plan installed,
+    # so every rank returns False here): excluding only the worker would
+    # leave exactly the one-sided forward that hangs. On this rig the
+    # predicate below is False anyway (the MoE backend is the offload/pool
+    # route, not flashinfer_*), so this is a guard against a config change,
+    # not a fix for a boot that failed -- named here rather than left to be
+    # rediscovered as a hang.
+    from sglang.srt.rank_role import installed_role_plan
+
+    if installed_role_plan() is not None:
+        logger.info(
+            "Form A: flashinfer autotune SKIPPED on every rank. Its dummy "
+            "forward is a full model forward, which under Form A issues the "
+            "per-layer MoE-input carrier -- a collective the workers do not "
+            "join outside a real round."
+        )
+        return False
+
     # CuteDSL v1 (cutedsl runner + deepep a2a) bypasses MoeRunner and must not
     # be autotuned -- its _dummy_run would dispatch more tokens per rank than
     # SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK, tripping a DeepEP assert.
