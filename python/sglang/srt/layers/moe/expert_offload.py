@@ -5068,7 +5068,12 @@ def presplit_expert_offload_after_repack(
             spill, _created = _es.open_store(
                 s_dir, s_key, attr, s_num, tuple(t.shape[1:]), t.dtype
             )
-            written = _es.write_rows(spill, t, range(0, int(E)), s_lo, s_pad)
+            # Only the COLD rows go to the host (flip design 20.09.: a row a
+            # card holds in some layout is taken from that card over BAR1, the
+            # host store keeps what no card holds). fn8m measured the store
+            # with residents at 58 GiB shmem / 77 GiB cgroup after load, 89 at
+            # the load peak, against the 88 GiB mark; residents are the 12 GiB.
+            written = _es.write_rows(spill, t, list(plan.spill_ids), s_lo, s_pad)
             _es.mark_rows_written(
                 s_dir, s_key, attr, int(getattr(layer, "moe_tp_rank", 0) or 0),
                 written.values(),
