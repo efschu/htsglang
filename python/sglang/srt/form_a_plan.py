@@ -333,14 +333,15 @@ def solve_form_a(
             f"Form A needs at least one host and one worker, got {len(cards)} "
             "card(s)."
         )
-    hosts = [c for c in cards if c.role == "host"]
-    if len(hosts) != 1:
-        raise FormAGeometryInvalid(
-            "Form A has exactly ONE attention host; got "
-            f"{[c.rank for c in hosts]!r} of {[c.rank for c in cards]!r}. "
-            "Two hosts would need the dense side sharded again, which is "
-            "the layout Form A replaces."
-        )
+    # ONE definition of "exactly one host", shared with the role vector and
+    # its flag (rank_role.RankRolePlan) rather than restated here -- two
+    # copies of a rule are two rules the moment one of them is edited.
+    from sglang.srt.rank_role import RankRoleError, RankRolePlan
+
+    try:
+        RankRolePlan(tuple(c.role for c in cards))
+    except RankRoleError as e:
+        raise FormAGeometryInvalid(str(e)) from e
     if geometry.num_experts <= 0 or geometry.num_layers <= 0:
         raise FormAGeometryInvalid(
             f"empty MoE geometry: {geometry.num_experts} experts, "

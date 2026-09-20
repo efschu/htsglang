@@ -113,9 +113,18 @@ _TP_PARTITION_OVERLAY: contextvars.ContextVar = contextvars.ContextVar(
 )
 
 
+#: Does the INSTALLED plan contain ranks of width zero (Form A: the expert
+#: workers own no dense shard at all)? A property of the PLAN, not of the
+#: call site: every layer that splits a dense dimension must agree about it,
+#: and a per-call flag is exactly how two layers come to disagree. Off means
+#: the classic rule -- a zero is a bug, and every rank gets at least one unit.
+_TP_PARTITION_ALLOW_ZERO: bool = False
+
+
 def set_tp_partition_ratios(
     ratios: Optional[Sequence[int]],
     families: Optional[dict] = None,
+    allow_zero: bool = False,
 ) -> None:
     """Install the uneven-TP ratio vector for this process (or None).
 
@@ -123,16 +132,28 @@ def set_tp_partition_ratios(
     weight vectors, overriding the base vector for layers constructed
     with a matching tp_family. Families are only valid together with a
     base vector and must have the same length; empty/None entries are
-    ignored. Every call replaces the complete plan (base + families)."""
-    global _TP_PARTITION_RATIOS, _TP_PARTITION_FAMILIES
+    ignored. Every call replaces the complete plan (base + families).
+
+    `allow_zero` (Form A) admits ranks of width zero into the plan -- the
+    expert workers, which own no dense shard of anything. It is installed
+    WITH the plan so that every dense dimension in the process splits by the
+    same rule; see `tp_partition_sizes`."""
+    global _TP_PARTITION_RATIOS, _TP_PARTITION_FAMILIES, _TP_PARTITION_ALLOW_ZERO
     _TP_PARTITION_RATIOS, _TP_PARTITION_FAMILIES = _normalize_partition_plan(
-        ratios, families
+        ratios, families, allow_zero
     )
+    _TP_PARTITION_ALLOW_ZERO = bool(allow_zero)
+
+
+def tp_partition_allows_zero() -> bool:
+    """True when the installed plan admits zero-width ranks (Form A)."""
+    return _TP_PARTITION_ALLOW_ZERO
 
 
 def _normalize_partition_plan(
     ratios: Optional[Sequence[int]],
     families: Optional[dict] = None,
+    allow_zero: bool = False,
 ) -> tuple:
     """Validate and normalize a (base, families) shard plan; shared by the
     process-wide setter and the context-local scope."""
@@ -154,11 +175,34 @@ def _normalize_partition_plan(
                     f"but the base plan has {len(base)} "
                     f"({vec} vs {base})."
                 )
-            if any(not isinstance(w, int) or w <= 0 for w in vec):
+            floor = 0 if allow_zero else 1
+            if any(not isinstance(w, int) or w < floor for w in vec):
                 raise ValueError(
-                    f"Family shard plan {name!r} entries must be positive "
-                    f"integers, got {vec}."
+                    f"Family shard plan {name!r} entries must be "
+                    + ("non-negative" if allow_zero else "positive")
+                    + f" integers, got {vec}."
                 )
+            if allow_zero and not any(w > 0 for w in vec):
+                raise ValueError(
+                    f"Family shard plan {name!r} is all zeros ({vec}): no "
+                    "rank would own any of this family's weights."
+                )
+            # A family may not hand a shard to a rank the BASE plan gave
+            # width zero -- that rank has no dense weights at all, and a
+            # family vector that disagrees is how one dimension quietly
+            # lands on an expert worker.
+            if allow_zero and base is not None:
+                stray = [
+                    r for r, (b, w) in enumerate(zip(base, vec)) if b == 0 and w > 0
+                ]
+                if stray:
+                    raise ValueError(
+                        f"Family shard plan {name!r} gives rank(s) {stray} a "
+                        f"share ({vec}) that the base plan {base} gave width "
+                        "zero. Under Form A a zero in the base plan means "
+                        "'this rank holds no dense weights'; a family cannot "
+                        "overrule that for one dimension."
+                    )
             fams[name] = vec
     return base, fams
 
@@ -185,6 +229,7 @@ def get_tp_partition_ratios(family: Optional[str] = None) -> Optional[list]:
 def scoped_tp_partition_ratios(
     ratios: Optional[Sequence[int]],
     families: Optional[dict] = None,
+    allow_zero: bool = False,
 ):
     """Install a shard plan for the duration of a block, then restore.
 
@@ -207,11 +252,22 @@ def scoped_tp_partition_ratios(
     (install, restore); across threads it is the difference between correct
     and silently wrong -- a lane loading its complement under a 2-entry vector
     must not make the serving group's concurrent forward read that vector.
+
+    `allow_zero` is scoped with the plan for the same reason it is installed
+    with it (see `set_tp_partition_ratios`): the scope's vector and the
+    zero-admission rule are one plan, and a lane that splits by a different
+    rule than the vector it installed is the #274 failure in a new dress.
     """
-    token = _TP_PARTITION_OVERLAY.set(_normalize_partition_plan(ratios, families))
+    global _TP_PARTITION_ALLOW_ZERO
+    token = _TP_PARTITION_OVERLAY.set(
+        _normalize_partition_plan(ratios, families, allow_zero)
+    )
+    previous_allow_zero = _TP_PARTITION_ALLOW_ZERO
+    _TP_PARTITION_ALLOW_ZERO = bool(allow_zero)
     try:
         yield
     finally:
+        _TP_PARTITION_ALLOW_ZERO = previous_allow_zero
         _TP_PARTITION_OVERLAY.reset(token)
 
 
@@ -1305,18 +1361,15 @@ def _partition_units_with_empty_ranks(
     Zero-weight ranks are removed, the classic split runs over the rest (so
     the rounding, the tie-break and the per-rank minimum are byte-identical
     for the ranks that do own units), and the zeros are put back.
+
+    The kv-group alignment (#116) COMPOSES rather than being refused: an
+    empty rank straddles no kv-head-group boundary, so dropping it before
+    the alignment and putting the zero back afterwards preserves the
+    invariant exactly -- the ranks that do own q packets are aligned among
+    themselves. (Form A slice 2; slice 1 refused this case by name instead,
+    which would have made the layout unbootable at the first attention
+    layer.)
     """
-    if groups:
-        # Refusal by name: the kv-group alignment (#116) partitions the ranks
-        # into contiguous NON-EMPTY segments (_balanced_group_lengths), so an
-        # empty rank has no defined segment. Opening that is its own slice.
-        raise ValueError(
-            "partition_units(allow_zero=True) with kv-head-group alignment "
-            f"(groups={groups}) is not built: the group split assigns every "
-            "rank to a non-empty q-packet segment, which a zero-width rank "
-            "has none of. Pass groups=None for an expert-only rank, or split "
-            "the q dimension before the group constraint."
-        )
     if any(w < 0 for w in weights):
         raise ValueError(f"partition_units: negative weight in {list(weights)}.")
     kept = [r for r, w in enumerate(weights) if w > 0]
@@ -1326,7 +1379,11 @@ def _partition_units_with_empty_ranks(
             f"zeros ({list(weights)}) -- no rank would own any of the "
             f"{units} units."
         )
-    sub = _partition_units_raw(units, [weights[k] for k in kept])
+    sub_weights = [weights[k] for k in kept]
+    if groups:
+        sub = _partition_units_kv_aligned(units, sub_weights, groups)
+    else:
+        sub = _partition_units_raw(units, sub_weights)
     sizes = [0] * len(weights)
     for i, r in enumerate(kept):
         sizes[r] = sub[i]
@@ -1618,12 +1675,21 @@ def tp_partition_sizes(
     plan (e.g. "mlp") and falls back to the base vector when that family
     has no own vector installed. `groups` (task #116, Q dimension only)
     constrains the split to kv-head-group boundaries; None keeps the plain
-    proportional split (byte-identical)."""
+    proportional split (byte-identical).
+
+    Zero-width ranks (Form A: the expert workers hold no dense shard of any
+    dimension) are admitted only when the INSTALLED plan says so --
+    `tp_partition_allows_zero()`, set with the vector in
+    `set_tp_partition_ratios`. Reading it here rather than taking it as an
+    argument is the point: every dense dimension in the process then splits
+    by the same rule, and no call site can disagree with the plan."""
     ratios = get_tp_partition_ratios(family)
     if not ratios or len(ratios) != tp_size:
         ensure_divisibility(total, tp_size)
         return [total // tp_size] * tp_size
-    return partition_sizes(total, ratios, units, groups)
+    return partition_sizes(
+        total, ratios, units, groups, allow_zero=tp_partition_allows_zero()
+    )
 
 
 def tp_partition_size(

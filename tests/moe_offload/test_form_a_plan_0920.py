@@ -289,9 +289,26 @@ def test_allow_zero_reaches_through_partition_sizes():
     assert partition_sizes(6144, [1, 0, 0], units=24) == [5632, 256, 256]
 
 
-def test_allow_zero_refuses_the_kv_group_alignment_by_name():
-    with pytest.raises(ValueError, match="kv-head-group alignment"):
-        partition_units(24, [1, 0, 0], groups=2, allow_zero=True)
+def test_allow_zero_composes_with_the_kv_group_alignment():
+    """Slice 1 refused this combination by name; slice 2 makes it compose,
+    because refusing it would have made Form A unbootable at the FIRST
+    attention layer -- the q split passes groups=num_key_value_heads.
+
+    An empty rank straddles no kv-head-group boundary, so the aligned split
+    over the ranks that DO own packets, with the zeros put back, is the same
+    answer the alignment would have given had the empty rank never existed.
+    """
+    # Form A proper: one host, every packet, alignment trivially satisfied.
+    assert partition_units(24, [1, 0, 0], groups=2, allow_zero=True) == [24, 0, 0]
+    # A four-rank plan with one worker reproduces today's aligned 12/6/6
+    # over the three ranks that are left.
+    assert partition_units(24, [39, 13, 12, 0], groups=2, allow_zero=True) == [
+        12,
+        6,
+        6,
+        0,
+    ]
+    assert partition_units(24, [39, 13, 12], groups=2) == [12, 6, 6]
 
 
 def test_allow_zero_refuses_an_all_zero_vector_by_name():
