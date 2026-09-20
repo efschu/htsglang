@@ -205,14 +205,14 @@ def test_an_explicit_dcp_flag_is_refused_not_overridden():
 # 4. The seam registry -- named refusals for what is not built
 # ==========================================================================
 WIRED = ("F1", "F2", "F4", "F7", "F8", "F10", "F11")
-UNWIRED = ("F3", "F5", "F6", "F9")
+UNWIRED = ("F3", "F5", "F6", "F9", "F12")
 
 
 def test_every_seam_has_an_identity_a_place_and_a_verdict():
     """Eleven, not the nine the design note started with: the slice-2 survey
     of the call sites found two more, and a seam that is known but unlisted
     is worse than one that was never looked for."""
-    assert set(SEAMS) == {f"F{i}" for i in range(1, 12)}
+    assert set(SEAMS) == {f"F{i}" for i in range(1, 13)}
     for sid, seam in SEAMS.items():
         assert seam.id == sid
         assert ":" in seam.where or ".py" in seam.where, sid
@@ -236,8 +236,13 @@ def test_the_remaining_work_is_ordered_and_complete():
 
     assert set(UNWIRED_ORDER) == set(UNWIRED)
     assert len(UNWIRED_ORDER) == len(set(UNWIRED_ORDER))
-    # F3 first: it is both the largest VRAM gain and the precondition of F11.
-    assert UNWIRED_ORDER[0] == "F3"
+    # F12 FIRST, ahead of F3: the symmetry probe showed that shipping the
+    # worker's construction skip without silencing the host's own dense
+    # collectives is a deadlock, not a half-built feature. Order is not
+    # cosmetic here -- it is the difference between a refusal and a wedged
+    # rig.
+    assert UNWIRED_ORDER[0] == "F12"
+    assert UNWIRED_ORDER.index("F12") < UNWIRED_ORDER.index("F3")
     # F4 and F10 left the list in slice 5; if one comes back the order must
     # come back with it, not silently shrink.
     for gone in ("F4", "F10", "F11"):

@@ -271,6 +271,30 @@ SEAMS: Dict[str, Seam] = {
                  "def resolve_offload_graph_mode"),
             ),
         ),
+        # ---- found by the slice-6a symmetry probe (form_a_symmetry.py) ----
+        Seam(
+            "F12",
+            "the HOST's own per-layer dense collectives must disappear with "
+            "the sharding",
+            "models/qwen4_exp.py:1100-1101 (o_proj all-reduce), :1574 "
+            "(attn_tp_all_reduce), :1640 (attn_tp_all_gather); verdict from "
+            "form_a_symmetry.py probe_form_a_boot",
+            wired=False,
+            note="THE ONE THE SLICE PLAN DID NOT HAVE, and the reason slice "
+            "6a must not ship alone. Those collectives exist only because "
+            "the dense side is SHARDED; under Form A rank 0 owns every head, "
+            "so they have no second participant. Silencing the worker's "
+            "dense path while the host still issues them is not a "
+            "half-built feature, it is a DEADLOCK -- the host blocks on "
+            "ranks that already left the forward, on all three cards, with "
+            "no log line, until the deadman fires. Measured by the probe: "
+            "worker_skips_dense alone diverges at collective #0.",
+            anchors=(
+                ("models/qwen4_exp.py", 1100,
+                 "tensor_model_parallel_all_reduce"),
+                ("form_a_symmetry.py", 1, "do the ranks still AGREE"),
+            ),
+        ),
         # ---- found by the slice-2 seam survey, not in the original nine ----
         Seam(
             "F10",
@@ -325,7 +349,7 @@ SEAMS: Dict[str, Seam] = {
 #: The seams that must be wired before a Form A boot can be believed, in the
 #: order the survey found them knocking. Kept as data so a report can print
 #: the remaining work without re-deriving it.
-UNWIRED_ORDER: Tuple[str, ...] = ("F3", "F5", "F9", "F6")
+UNWIRED_ORDER: Tuple[str, ...] = ("F12", "F3", "F5", "F9", "F6")
 
 
 def require_wired(seam_id: str, context: str = "") -> None:
