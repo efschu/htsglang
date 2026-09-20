@@ -126,7 +126,14 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
             reason="full cuda-graph capture warmup",
         )
 
-        graph = torch.cuda.CUDAGraph()
+        # Task #52: keep the cudaGraph_t so the collective clock can address
+        # the event-record nodes of the exec graph (event-set swap per
+        # replay). Older torch has no keep_graph; the clock then stays
+        # unbound and reads as before.
+        try:
+            graph = torch.cuda.CUDAGraph(keep_graph=True)
+        except TypeError:
+            graph = torch.cuda.CUDAGraph()
 
         graph_ctx: Callable[..., AbstractContextManager]
         if (
@@ -165,6 +172,10 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
 
     def can_run(self, forward_batch: ForwardBatch, shape_key: ShapeKey) -> bool:
         return shape_key in self._graphs
+
+    def graph_object(self, shape_key: ShapeKey):
+        """The torch CUDAGraph captured for ``shape_key`` (Task #52 binder)."""
+        return self._graphs.get(shape_key)
 
     @contextmanager
     def replay_session(self):

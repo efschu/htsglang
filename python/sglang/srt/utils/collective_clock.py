@@ -176,10 +176,14 @@ reader of another form's log knows why the nodes are in it.
 from __future__ import annotations
 
 import dataclasses
+import logging
+import time
 from contextlib import contextmanager
 from typing import Dict, List, Optional, Tuple
 
 import torch
+
+logger = logging.getLogger(__name__)
 
 __all__ = [
     "ClockBackend",
@@ -231,6 +235,12 @@ class ClockBackend:
     def is_capturing(self) -> bool:  # pragma: no cover
         raise NotImplementedError
 
+    def graph_binder(self):
+        """The cudart seam for Task #52 (event-set swapping on a captured
+        graph), or None when the backend cannot bind graphs -- then the
+        reader keeps the #1302 ring semantics unchanged."""
+        return None
+
     def materialize(self, event) -> None:
         """Force the DEVICE-side event object into existence, now (#1241b).
 
@@ -253,6 +263,128 @@ class TorchCudaBackend(ClockBackend):
 
     def is_capturing(self) -> bool:
         return torch.cuda.is_current_stream_capturing()
+
+    _binder = None
+    _binder_tried = False
+
+    def graph_binder(self):
+        if not TorchCudaBackend._binder_tried:
+            TorchCudaBackend._binder_tried = True
+            try:
+                TorchCudaBackend._binder = CudartGraphBinder()
+            except Exception as e:  # pragma: no cover - depends on the box
+                logger.warning(
+                    "collective clock: cudart graph binder unavailable (%s); "
+                    "graph event sets stay off",
+                    e,
+                )
+        return TorchCudaBackend._binder
+
+
+class CudartGraphBinder:
+    """Task #52: the four cudart calls the event-set swap needs, via ctypes.
+
+    * ``event_record_nodes(raw_graph)``: every node of type
+      ``cudaGraphNodeTypeEventRecord`` (0x07) with the ``cudaEvent_t`` it
+      records -- how a captured pair is matched to its node;
+    * ``set_event(exec, node, event)``: ``cudaGraphExecEventRecordNodeSetEvent``
+      -- a host-side exec update, no re-instantiation, no allocation;
+    * ``event_handle(torch_event)``: the ``cudaEvent_t`` behind a
+      ``torch.cuda.Event`` (materialized ones only).
+    """
+
+    EVENT_RECORD = 7
+
+    def __init__(self) -> None:
+        import ctypes
+        import ctypes.util
+
+        self._ct = ctypes
+        lib = None
+        cands = []
+        try:
+            import nvidia.cuda_runtime  # type: ignore
+
+            import os as _os
+
+            d = _os.path.join(_os.path.dirname(nvidia.cuda_runtime.__file__), "lib")
+            cands += [
+                _os.path.join(d, f) for f in sorted(_os.listdir(d)) if "libcudart" in f
+            ]
+        except Exception:
+            pass
+        cands += [ctypes.util.find_library("cudart") or "", "libcudart.so.12", "libcudart.so"]
+        err = None
+        for c in cands:
+            if not c:
+                continue
+            try:
+                lib = ctypes.CDLL(c)
+                break
+            except OSError as e:
+                err = e
+        if lib is None:
+            raise RuntimeError(f"libcudart not loadable: {err}")
+        self._lib = lib
+        vp, sz = ctypes.c_void_p, ctypes.c_size_t
+        lib.cudaGraphGetNodes.argtypes = [vp, ctypes.POINTER(vp), ctypes.POINTER(sz)]
+        lib.cudaGraphNodeGetType.argtypes = [vp, ctypes.POINTER(ctypes.c_int)]
+        lib.cudaGraphEventRecordNodeGetEvent.argtypes = [vp, ctypes.POINTER(vp)]
+        lib.cudaGraphExecEventRecordNodeSetEvent.argtypes = [vp, vp, vp]
+        for fn in (
+            lib.cudaGraphGetNodes,
+            lib.cudaGraphNodeGetType,
+            lib.cudaGraphEventRecordNodeGetEvent,
+            lib.cudaGraphExecEventRecordNodeSetEvent,
+        ):
+            fn.restype = ctypes.c_int
+
+    def _check(self, rc: int, what: str) -> None:
+        if rc != 0:
+            raise RuntimeError(f"{what} failed: cudaError {rc}")
+
+    def event_record_nodes(self, raw_graph: int) -> List[Tuple[int, int]]:
+        ct = self._ct
+        n = ct.c_size_t(0)
+        self._check(self._lib.cudaGraphGetNodes(raw_graph, None, ct.byref(n)), "cudaGraphGetNodes")
+        arr = (ct.c_void_p * max(1, n.value))()
+        self._check(self._lib.cudaGraphGetNodes(raw_graph, arr, ct.byref(n)), "cudaGraphGetNodes")
+        out = []
+        t = ct.c_int(0)
+        ev = ct.c_void_p(0)
+        for i in range(n.value):
+            node = arr[i]
+            self._check(self._lib.cudaGraphNodeGetType(node, ct.byref(t)), "cudaGraphNodeGetType")
+            if t.value != self.EVENT_RECORD:
+                continue
+            self._check(
+                self._lib.cudaGraphEventRecordNodeGetEvent(node, ct.byref(ev)),
+                "cudaGraphEventRecordNodeGetEvent",
+            )
+            out.append((int(node or 0), int(ev.value or 0)))
+        return out
+
+    def set_event(self, exec_handle: int, node: int, event_handle: int) -> None:
+        self._check(
+            self._lib.cudaGraphExecEventRecordNodeSetEvent(exec_handle, node, event_handle),
+            "cudaGraphExecEventRecordNodeSetEvent",
+        )
+
+    @staticmethod
+    def event_handle(event) -> int:
+        return int(event.cuda_event)
+
+    @staticmethod
+    def graph_handles(cuda_graph) -> Tuple[int, int]:
+        """``(cudaGraph_t, cudaGraphExec_t)`` of a torch CUDAGraph captured
+        with ``keep_graph=True``; instantiates when the exec is lazy."""
+        raw = int(cuda_graph.raw_cuda_graph())
+        try:
+            ex = int(cuda_graph.raw_cuda_graph_exec())
+        except RuntimeError:
+            cuda_graph.instantiate()
+            ex = int(cuda_graph.raw_cuda_graph_exec())
+        return raw, ex
 
 
 @dataclasses.dataclass(frozen=True)
@@ -324,6 +456,44 @@ class GraphNodes:
     #: entries carry, never from their position, so trimming cannot make a
     #: large lag read as a small one.
     fences: List[Tuple[int, object]] = dataclasses.field(default_factory=list)
+    #: 20.09. (Task #52). EVENT SETS: ``event_sets[0]`` is ``pairs`` (the
+    #: events the capture recorded as nodes); sets 1..K-1 are spare pairs
+    #: of the same shape. Before replay G the exec graph's event-record
+    #: nodes are pointed at set ``G % K`` (cudaGraphExecEventRecordNode-
+    #: SetEvent, host-side, no re-instantiate), so replay G+1 stamps a
+    #: DIFFERENT set and generation G stays readable until replay G+K.
+    #: Empty until ``bind_graph`` succeeded; then the reader is exactly as
+    #: far behind as before, but the nodes are no longer gone by then --
+    #: fn8r5 (20.09.) read ``overwritten-by-1`` on every one of ~300
+    #: rounds, which is the run-ahead of the overlap scheduler, not a bug.
+    event_sets: List[List[Tuple[object, object]]] = dataclasses.field(
+        default_factory=list
+    )
+    #: ``(pre_node, post_node)`` handles of the ORIGINAL graph, one per
+    #: pair, in pair order (the exec-update API addresses nodes by the
+    #: source graph's handles).
+    node_handles: List[Tuple[int, int]] = dataclasses.field(default_factory=list)
+    exec_handle: int = 0
+    #: Which set replay ``generation`` stamped; trimmed to K entries.
+    set_of_generation: Dict[int, int] = dataclasses.field(default_factory=dict)
+    active_set: int = 0
+
+    @property
+    def bound(self) -> bool:
+        return len(self.event_sets) > 1
+
+    def pairs_for(self, generation: int) -> List[Tuple[object, object, str]]:
+        """The (pre, post, family) triples replay ``generation`` stamped."""
+        if not self.bound:
+            return self.pairs
+        s = self.set_of_generation.get(generation)
+        if s is None or s == 0:
+            return self.pairs
+        return [
+            (pre, post, fam)
+            for (pre, post), (_, _, fam) in zip(self.event_sets[s], self.pairs)
+        ]
+
     #: #1302. ``(generation, families)`` readings, oldest first. A reading is
     #: taken at the last instant it is valid -- the flush that finds a round
     #: not yet readable -- and kept here so the round can be emitted from it
@@ -485,6 +655,14 @@ class CollectiveClock:
         #: non-zero value means the instrument allocated inside the span it
         #: was measuring.
         self._fence_late_created: int = 0
+        #: Task #52. Graphs whose event-record nodes were bound to K sets,
+        #: and the host time the per-replay swap has cost so far (it runs on
+        #: the forward thread, inside the span being measured, so it is
+        #: printed rather than assumed negligible).
+        self._graphs_bound: int = 0
+        self._graph_bind_refusals: int = 0
+        self._swap_calls: int = 0
+        self._swap_s: float = 0.0
 
     # -- arming ---------------------------------------------------------
 
@@ -730,7 +908,11 @@ class CollectiveClock:
         # simply not pre-created in that case and the replay path
         # late-creates them, counted and printed.
         if not self._backend.is_capturing():
-            for _ in range(self._graph_ring):
+            # ring + 1: the ring holds ``_graph_ring`` fences and the trim
+            # that hands one back runs AFTER the pop for the new replay, so
+            # replay ring+1 found the pool empty (20.09., caught by
+            # test_swap_allocates_nothing_and_is_counted).
+            for _ in range(self._graph_ring + 1):
                 ev = self._backend.event()
                 self._backend.materialize(ev)
                 self._fence_pool.append(ev)
@@ -743,6 +925,101 @@ class CollectiveClock:
         self._graphs[key] = capture
         if len(capture.pairs) > self._capture_pair_hint:
             self._capture_pair_hint = len(capture.pairs)
+
+    def bind_graph(self, key, cuda_graph, sets: Optional[int] = None) -> bool:
+        """Task #52. Give the captured graph under ``key`` K event sets.
+
+        Called by the runner AFTER ``capture_one`` (outside any capture):
+        matches every captured pair to its event-record node of the graph,
+        creates K-1 spare pairs (materialized here, on the cold path), and
+        points the exec graph at set 0. Returns True when bound. Any failure
+        leaves the graph UNBOUND and counted -- the reader then behaves
+        exactly as before (#1302 ring, lag named per replay).
+
+        K defaults to the reading ring depth: a reading is taken at the
+        latest during the flush that finds the round unreadable, and with K
+        sets that flush may be K-1 replays late instead of none.
+        """
+        nodes = self._graphs.get(key)
+        if nodes is None or not nodes.pairs or nodes.bound:
+            return False
+        k = int(self._graph_ring if sets is None else sets)
+        if k < 2:
+            return False
+        binder = self._backend.graph_binder()
+        if binder is None:
+            self._graph_bind_refusals += 1
+            return False
+        try:
+            raw, ex = binder.graph_handles(cuda_graph)
+            by_event: Dict[int, Tuple[int, int]] = {}
+            for idx, (pre, post, _fam) in enumerate(nodes.pairs):
+                by_event[binder.event_handle(pre)] = (idx, 0)
+                by_event[binder.event_handle(post)] = (idx, 1)
+            handles: List[List[int]] = [[0, 0] for _ in nodes.pairs]
+            found = 0
+            for node, evh in binder.event_record_nodes(raw):
+                hit = by_event.get(evh)
+                if hit is None:
+                    continue
+                handles[hit[0]][hit[1]] = node
+                found += 1
+            if found != 2 * len(nodes.pairs):
+                raise RuntimeError(
+                    f"{found} of {2 * len(nodes.pairs)} pair events found as "
+                    "event-record nodes of the graph"
+                )
+            sets: List[List[Tuple[object, object]]] = [
+                [(pre, post) for pre, post, _ in nodes.pairs]
+            ]
+            for _ in range(k - 1):
+                cur = []
+                for _ in nodes.pairs:
+                    a = self._backend.event()
+                    b = self._backend.event()
+                    self._backend.materialize(a)
+                    self._backend.materialize(b)
+                    cur.append((a, b))
+                sets.append(cur)
+        except Exception as e:
+            self._graph_bind_refusals += 1
+            logger.warning(
+                "collective clock: graph %s NOT bound to event sets (%s); "
+                "its rounds keep the ring semantics",
+                key,
+                e,
+            )
+            return False
+        nodes.event_sets = sets
+        nodes.node_handles = [(h[0], h[1]) for h in handles]
+        nodes.exec_handle = ex
+        nodes.active_set = 0
+        self._graphs_bound += 1
+        logger.info(
+            "collective clock: graph %s bound: %d pairs x %d event sets "
+            "(replay G stamps set G %% %d; generation G readable until replay G+%d)",
+            key,
+            len(nodes.pairs),
+            k,
+            k,
+            k,
+        )
+        return True
+
+    def _swap_event_set(self, nodes: GraphNodes, target: int) -> None:
+        """Point the exec graph's event-record nodes at set ``target``.
+        Host-side exec updates only; 2 calls per pair, timed and counted."""
+        binder = self._backend.graph_binder()
+        if binder is None or target == nodes.active_set:
+            return
+        tic = time.perf_counter()
+        ev_set = nodes.event_sets[target]
+        for (npre, npost), (pre, post) in zip(nodes.node_handles, ev_set):
+            binder.set_event(nodes.exec_handle, npre, binder.event_handle(pre))
+            binder.set_event(nodes.exec_handle, npost, binder.event_handle(post))
+        nodes.active_set = target
+        self._swap_calls += 1
+        self._swap_s += time.perf_counter() - tic
 
     def captured_graph(self, key) -> Optional[GraphNodes]:
         """The nodes recorded for ``key``, or None if that graph carries none.
@@ -774,6 +1051,16 @@ class CollectiveClock:
         if nodes is None:
             return
         nodes.generation += 1
+        if nodes.bound:
+            # Task #52: this replay stamps set G % K, so the previous K-1
+            # generations' timestamps survive it. The swap precedes the
+            # fence and the launch; an exec update is host-side.
+            k = len(nodes.event_sets)
+            target = nodes.generation % k
+            self._swap_event_set(nodes, target)
+            nodes.set_of_generation[nodes.generation] = target
+            for g in [g for g in nodes.set_of_generation if g <= nodes.generation - k]:
+                del nodes.set_of_generation[g]
         # #1302. THE FENCE, and it is recorded HERE rather than after the
         # launch on purpose. The stream order is
         # ``... replay G | fence G+1 | replay G+1 ...``, so a COMPLETE fence
@@ -862,9 +1149,15 @@ class CollectiveClock:
         their position, so a trimmed ring reports a lag of 40 as 40 and
         never as the ring depth.
         """
+        # Task #52: with K event sets, generation G's timestamps are only
+        # re-executed by replay G+K -- a complete fence closer than that
+        # proves nothing about G's set.
+        stride = len(nodes.event_sets) if nodes.bound else 1
         for gen, fence in reversed(nodes.fences):
             if gen <= generation:
                 break
+            if gen - generation < stride:
+                continue
             if fence.query():
                 return gen - generation
         return 0
@@ -902,7 +1195,7 @@ class CollectiveClock:
             if count:
                 self._graph_stale_reads += 1
             return None, f"graph-replay-nodes-overwritten-by-{lag}"
-        fams = self._read_graph_nodes(nodes, count_unready=count)
+        fams = self._read_graph_nodes(nodes, count_unready=count, generation=generation)
         if fams is None:
             lu = getattr(self, "_last_unread", None)
             if lu:
@@ -940,7 +1233,10 @@ class CollectiveClock:
             self._graph_reading(nodes, generation, count=False)
 
     def _read_graph_nodes(
-        self, nodes: GraphNodes, count_unready: bool = True
+        self,
+        nodes: GraphNodes,
+        count_unready: bool = True,
+        generation: Optional[int] = None,
     ) -> Optional[Dict[str, FamilyStat]]:
         """Per-family stats of the LAST completed replay, or None.
 
@@ -966,7 +1262,8 @@ class CollectiveClock:
           of this key was launched while this loop ran.
         """
         acc: Dict[str, List[float]] = {}
-        for idx, (pre, post, family) in enumerate(nodes.pairs):
+        pairs = nodes.pairs if generation is None else nodes.pairs_for(generation)
+        for idx, (pre, post, family) in enumerate(pairs):
             try:
                 if not post.query():
                     if count_unready:
