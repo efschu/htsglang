@@ -298,16 +298,61 @@ def tower_state_dict(shard: str, *, meta: bool = False) -> Dict[str, Any]:
     return sd
 
 
+#: Substring renames the tower module needs on top of the prefix strip, taken
+#: 1:1 from ``Qwen3VLForConditionalGeneration.hf_to_sglang_mapper``
+#: (``models/qwen3_vl.py:1252-1254``) and from that class's own loader
+#: (``:1649``: ``name.replace(r"attn.qkv.", r"attn.qkv_proj.")``).
+#:
+#: THE DEFECT THIS EXISTS TO END (metal boot xsn406, 20.09. 16:49Z): the stage
+#: stripped the prefix and stopped there, so ``blocks.N.attn.qkv.weight`` was
+#: handed to a module whose parameter is ``blocks.N.attn.qkv_proj.weight``
+#: (``VisionAttention`` with ``use_qkv_parallel=True``, ``qwen3_vl.py:205``).
+#: 27 blocks x (weight + bias) = **54 unfilled parameters**, and the stage
+#: refused with ``W106 Weg2VisionLoadFailed``. The checkpoint name is right and
+#: the module name is right; only the MAP between them was missing.
+#:
+#: The DOTTED form is deliberate. Upstream's ``orig_to_new_substr`` entry is
+#: the undotted ``"attn.qkv" -> "attn.qkv_proj"``, which is safe there because
+#: ``WeightsMapper`` runs once over raw checkpoint names. Applied as a bare
+#: substring a second time it would turn ``attn.qkv_proj.weight`` into
+#: ``attn.qkv_proj_proj.weight``. The dotted form is IDEMPOTENT, so this
+#: mapper can be applied to an already-mapped dict without corrupting it --
+#: and it is exactly the spelling qwen3_vl's own loader uses.
+#: ``test_vision_tower_name_mapping_0920`` pins it against BOTH upstream forms,
+#: so a rename upstream fails at the desk instead of on metal.
+TOWER_SUBSTR_RENAMES: Tuple[Tuple[str, str], ...] = (
+    ("attn.qkv.", "attn.qkv_proj."),
+)
+
+
+def map_tower_param_name(name: str) -> str:
+    """One checkpoint tensor name -> the standalone tower's parameter name.
+
+    Pure, idempotent, and the single place the rename table is applied, so a
+    caller cannot map half the names.
+    """
+    for old, new in TOWER_SUBSTR_RENAMES:
+        if new in name:
+            continue  # already mapped; the rename is idempotent by design
+        name = name.replace(old, new)
+    return name
+
+
 def strip_checkpoint_prefix(
     state_dict: Dict[str, Any], prefix: str = "model.visual."
 ) -> Dict[str, Any]:
     """Map checkpoint names onto the tower module's own parameter names.
 
-    The checkpoint calls them ``model.visual.blocks.0.attn.qkv.weight``; the
-    standalone tower module calls the same parameter ``blocks.0.attn.qkv.weight``.
-    ``Qwen3VLForConditionalGeneration.hf_to_sglang_mapper`` does this inside
-    the full model (``qwen3_vl.py:1258``: ``"model.visual." -> "visual."``); a
-    stage that builds the tower ALONE needs the prefix gone entirely.
+    Two steps, and the second one is the xsn406 fix:
+
+    1. The PREFIX goes. The checkpoint calls it
+       ``model.visual.blocks.0.attn.qkv.weight``;
+       ``Qwen3VLForConditionalGeneration.hf_to_sglang_mapper`` rewrites that to
+       ``visual....`` inside the full model (``qwen3_vl.py:1258``), but a stage
+       that builds the tower ALONE needs the prefix gone entirely.
+    2. The SUBSTRING RENAMES of :data:`TOWER_SUBSTR_RENAMES` apply --
+       ``attn.qkv.`` -> ``attn.qkv_proj.``. Skipping this was what left 54
+       parameters unfilled on xsn406.
 
     Refuses on a name that does not carry the prefix rather than passing it
     through, because a silently unmapped key lands in ``missing_keys`` and a
@@ -316,15 +361,16 @@ def strip_checkpoint_prefix(
     out: Dict[str, Any] = {}
     for k, v in state_dict.items():
         if k.startswith(prefix):
-            out[k[len(prefix) :]] = v
+            bare = k[len(prefix) :]
         elif k.startswith("visual."):
-            out[k[len("visual.") :]] = v
+            bare = k[len("visual.") :]
         else:
             raise VisionStageLoadRefused(
                 f"tower tensor {k!r} carries neither {prefix!r} nor 'visual.'; "
                 "refusing to pass an unmapped name to the module, where it "
                 "would end up in missing_keys and the block would stay empty"
             )
+        out[map_tower_param_name(bare)] = v
     return out
 
 
