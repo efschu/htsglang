@@ -952,6 +952,21 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         logits/embeddings for a fraction of the vocabulary only.
         """
         from sglang.srt.distributed import get_tp_group
+        from sglang.srt.rank_role import form_a_dense_is_unsharded
+
+        if form_a_dense_is_unsharded():
+            # FORM A (F13, fnFA5 20.09.): the vocabulary is the host's alone
+            # and already FULL (embed_tokens/lm_head built with tp_size=1),
+            # the workers hold a HostOnlyModule in its place. There is no
+            # shard to assemble and no rank to gather from: the host takes
+            # the split path (which also shares the MODULES when the
+            # target's vocab is packed -- Minachist's INT8 embedding has no
+            # `.weight`), the workers do nothing (they never run the
+            # draft). Symmetric by construction: neither side issues a
+            # collective.
+            if self._spec_solo_is_host:
+                self.init_lm_head()
+            return
 
         target_model = self.target_worker.model_runner.model
         target_lm_head = getattr(target_model, "lm_head", None)
