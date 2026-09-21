@@ -69,6 +69,27 @@ _OWNED: Dict[str, Tuple[UnionVmmArena, UnionRendezvousServer, list]] = {}
 _ATTACHED: Dict[str, UnionVmmArena] = {}
 
 
+def _shareable(named) -> Dict[str, torch.Tensor]:
+    """The tensors an image may hold: real storage, at least one byte.
+
+    EMPTY tensors are excluded, and that is a correctness rule rather than an
+    optimisation. Marlin's ``*_g_idx_sort_indices`` are zero-element and every
+    one of them reports the SAME storage pointer, so the arena's aliasing
+    inference folds ``model.layers.40.mlp.experts.w13_g_idx_sort_indices`` and
+    ``lm_head.g_idx_sort_indices`` into one slot and then refuses because the
+    views differ (fnFL2 v30: group P died before READY on exactly that). They
+    carry no bytes, so there is nothing for an image to share.
+
+    META tensors are excluded for the same kind of reason: a Form A worker
+    holds the draft model as meta, and meta has no bytes either.
+    """
+    return {
+        n: t
+        for n, t in named.items()
+        if not t.is_meta and t.numel() > 0 and t.untyped_storage().data_ptr() != 0
+    }
+
+
 def _free_bytes(device) -> int:
     try:
         free, _total = torch.cuda.mem_get_info(device)
@@ -95,7 +116,7 @@ def own_image(
     """
     from sglang.srt.managers.phase_flip_boot import checkpoint_param_dict
 
-    named = {n: t for n, t in checkpoint_param_dict(model).items() if not t.is_meta}
+    named = _shareable(checkpoint_param_dict(model))
     layout = plan_arena_layout(dict(named))
     before = _free_bytes(device)
     # BEFORE the pack. Once a parameter is rebound to an arena view its
@@ -145,7 +166,7 @@ def bind_image(
     """
     from sglang.srt.managers.phase_flip_boot import checkpoint_param_dict
 
-    named = {n: t for n, t in checkpoint_param_dict(model).items() if not t.is_meta}
+    named = _shareable(checkpoint_param_dict(model))
     try:
         text, fds = fetch_union(socket_path(union_dir, card), timeout_s=timeout_s)
     except UnionShareError:

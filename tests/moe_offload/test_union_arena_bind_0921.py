@@ -112,3 +112,17 @@ def test_a_missing_owner_is_fatal_for_the_main_image_and_not_for_the_draft():
     hook = inspect.getsource(ub.maybe_union_image)
     assert 'timeout_s=600.0 if role == "main" else 20.0' in hook
     assert 'required=(role == "main")' in hook
+
+
+def test_empty_tensors_are_kept_out_of_the_image():
+    """Marlin's zero-element ``*_g_idx_sort_indices`` all report the SAME
+    storage pointer; the arena folds them into one slot and refuses because
+    the views differ. fnFL2 v30 died before READY on exactly that."""
+    named = {
+        "real": torch.randn(4, 4),
+        "lm_head.g_idx_sort_indices": torch.empty(0, dtype=torch.int32),
+        "layers.40.experts.w13_g_idx_sort_indices": torch.empty(0, dtype=torch.int32),
+        "ghost": torch.empty(8, device="meta"),
+    }
+    kept = ub._shareable(named)
+    assert list(kept) == ["real"]
