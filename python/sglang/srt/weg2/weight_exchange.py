@@ -4036,6 +4036,22 @@ NO_PLAN_REASON = (
 )
 
 
+def _tensor_is_meta(tensor) -> bool:
+    """Is this a META tensor -- a shape with no bytes behind it?
+
+    CONSERVATIVE: only an unambiguous ``device.type == "meta"`` answers True.
+    Anything this cannot read (no ``device``, an exotic wrapper) answers False
+    and stays in the manifest, because the error direction matters: dropping a
+    tensor a rank really holds would narrow the exchange silently, while
+    keeping one it does not hold is caught downstream by the join.
+    """
+    dev = getattr(tensor, "device", None)
+    try:
+        return str(getattr(dev, "type", "")) == "meta"
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _write_placement_manifest(model, *, rank: int, region_tag: str,
                               log: Callable[[str], None],
                               tp_rank: Optional[int] = None,
@@ -4060,7 +4076,31 @@ def _write_placement_manifest(model, *, rank: int, region_tag: str,
             return
         inventory, _skipped, _walked, reason = sh.card_inventory(
             rank=int(rank), model=model, region_tag=str(region_tag))
+        # #76 (fnFL2w2, 21.09.): EIN META-SCHATTEN HAELT NICHTS, ALSO
+        # PUBLIZIERT ER NICHTS. Unter Form A bauen die Experten-Worker einen
+        # meta-Drafter ("rank 1 is a draft SHADOW ... no draft weights/KV/
+        # graphs"), und der Census bestaetigt es: weights_draft mib=0.0. Das
+        # Manifest schrieb ihn trotzdem als Halter von 2,54 GiB -- und weil
+        # ein meta-Tensor `process_weights_after_loading` nie durchlaeuft,
+        # trug der Schatten die UNREPACKTE Form (163840x1280) gegen die
+        # Marlin-Form des Hosts (81920x2560). Der Join las zwei Halter, die
+        # einander widersprechen, und fiel mit W68 auf
+        # model.layers.0.mlp.experts.w13_weight_packed -- der Flip starb am
+        # ersten Wake. Ein Manifest listet, was ein Rang HAELT; die Frage
+        # stellt sich hier an den Tensor, nicht an die Rolle, damit derselbe
+        # Schnitt fuer jeden Schatten gilt (DFlash2, 27B, spaetere Formen).
+        _held = [(g, t) for (g, t) in inventory if not _tensor_is_meta(t)]
+        _shadow_n = len(inventory) - len(_held)
+        if _shadow_n:
+            log(
+                f"{xm.JOIN_LINE_PREFIX}-WRITE group={group} rank={rank} "
+                f"region_tag={region_tag} shadow_pieces={_shadow_n} of "
+                f"{len(inventory)} dropped -- meta tensors hold no bytes and "
+                f"are not published as holders (#76)"
+            )
+        inventory = _held
         if not inventory:
+            reason = reason or ("all-meta-shadow" if _shadow_n else "")
             log(
                 f"{xm.JOIN_LINE_PREFIX}-WRITE group={group} rank={rank} "
                 f"pieces=0 reason={reason or 'empty-inventory'} -- no manifest "

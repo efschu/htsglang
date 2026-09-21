@@ -943,6 +943,25 @@ def join_manifests(
     tp_by_rank: Dict[int, List[RankManifest]] = {}
     for man in tp:
         tp_by_rank.setdefault(int(man.rank), []).append(man)
+    # #76 (fnFL2w2, 21.09.): WER EINE REGION NICHT FUEHRT, IST KEIN FEHLENDER
+    # HALTER. Unter Form A haelt nur der Attention-Host den MTP-Drafter; die
+    # Experten-Worker bauen einen meta-Schatten und publizieren ihn seit
+    # `_tensor_is_meta` nicht mehr. Ohne diese Unterscheidung kippte genau
+    # dieser Fix W68 in W74: die Schleife unten haette fuer jeden der 34
+    # Draft-Tensoren zwei None-Zeilen gesehen und ALLE als unsourced gemeldet.
+    # Der Diskriminator ist die REGION, nicht die Anzahl: fuehrt ein Rang die
+    # Region und fehlt ihm nur DIESER Tensor, bleibt es eine Verweigerung --
+    # das ist der Zwist, den dieser Join benennen soll.
+    tp_region_ranks: Dict[str, List[int]] = {}
+    for man in tp:
+        for pc in man.pieces:
+            reg = region_of_tag(pc.tag)
+            lst = tp_region_ranks.setdefault(reg, [])
+            if int(man.rank) not in lst:
+                lst.append(int(man.rank))
+    for _reg in tp_region_ranks:
+        tp_region_ranks[_reg].sort()
+    _all_tp_ranks = sorted(tp_by_rank)
     names: List[Tuple[str, str]] = []
     seen = set()
     for man in tp:
@@ -985,17 +1004,19 @@ def join_manifests(
     unsourced: List[str] = []
     for nkey in names:
         region, name = nkey
+        holders = tp_region_ranks.get(region) or _all_tp_ranks
         rows = []
-        for rank in sorted(tp_by_rank):
+        held_ranks: List[int] = []
+        for rank in holders:
             piece = None
             for man in tp_by_rank[rank]:
                 piece = man.by_region_name.get(nkey)
                 if piece is not None:
                     break
-            rows.append(piece)
-        if any(p is None for p in rows):
-            # A tensor only SOME TP ranks hold is not a cut this plan can name;
-            # it is reported rather than planned over the ranks that have it.
+            if piece is not None:
+                rows.append(piece)
+                held_ranks.append(rank)
+        if not rows:
             unsourced.append(name)
             continue
         found = pp_by_name.get(nkey)
@@ -1003,6 +1024,30 @@ def join_manifests(
             unsourced.append(name)
             continue
         stage, whole = found
+        if len(held_ranks) != len(_all_tp_ranks):
+            # #76 (fnFL2w2, 21.09.): EINE TEILMENGE IST NUR OHNE SCHNITTKANTE
+            # HARMLOS. Bisher galt hier "a tensor only SOME TP ranks hold is
+            # not a cut this plan can name" ohne Ausnahme -- unter Form A ist
+            # das aber das LAYOUT, nicht der Defekt: der Attention-Host haelt
+            # alle Dense-Gewichte allein, die Experten-Worker tragen an ihrer
+            # Stelle HostOnlyModule-Platzhalter. Gemessen an fnFL2w2 sind das
+            # 1603 von 1853 Tensoren, also praktisch der ganze Flip.
+            #
+            # Die Gefahr, vor der die alte Klausel schuetzte, bleibt bestehen
+            # und bleibt verweigert: fehlt einem Rang sein Stueck eines
+            # ECHTEN SCHNITTS (weil sein Manifest nicht geschrieben wurde),
+            # verschiebt ein Plan ueber die uebrigen Raenge jede Shard-Grenze
+            # und verliert still ein Drittel der Bytes. Der Diskriminator ist
+            # deshalb nicht die ANZAHL der Halter, sondern ob zwischen ihnen
+            # ueberhaupt eine Grenze liegt: halten alle Halter die Form der
+            # PP-Seite GANZ, gibt es keine Kante, die verrutschen koennte --
+            # ein Nicht-Halter bekommt dann schlicht keine Kopie, was genau
+            # der Wahrheit auf seiner Karte entspricht.
+            _whole_shape = (int(whole.rows_full), int(whole.cols_full))
+            if any((int(p.rows_full), int(p.cols_full)) != _whole_shape
+                   for p in rows):
+                unsourced.append(name)
+                continue
         if int(whole.itemsize) != int(rows[0].itemsize):
             raise wx.Weg2XchgPlanDisagree(
                 f"W68 Weg2XchgPlanDisagree: {name}: itemsize "
@@ -1012,6 +1057,14 @@ def join_manifests(
                 f"name both."
             )
         axis, rows_full, cols_full, widths, pad = _axis_of(name, whole, rows)
+        # #76: der Breitenvektor bleibt in RANGORDNUNG ueber die GANZE Gruppe.
+        # Ein Rang, der die Region nicht fuehrt, haelt null Zeilen -- das ist
+        # sein Eintrag, nicht sein Fehlen. So sagt `dst_widths` weiter fuer
+        # jeden Rang etwas aus, statt einen kurzen Vektor zu liefern, den
+        # `_blocks_of` gegen die falschen Raenge legen wuerde.
+        if widths and len(held_ranks) != len(_all_tp_ranks):
+            _by_rank = dict(zip(held_ranks, widths))
+            widths = tuple(int(_by_rank.get(r, 0)) for r in _all_tp_ranks)
         # #1384: the SAME pure function _axis_of already ran once to decide
         # MIXED_FUSED at all -- called again here for its full per-component
         # breakdown rather than threading a 6th return value through
