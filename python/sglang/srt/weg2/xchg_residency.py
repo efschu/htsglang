@@ -442,13 +442,29 @@ def check_partition(census: XchgCensus) -> List[str]:
             "twice and taken twice, so every peak below it is fiction"
         )
     for uuid, card in sorted(census.cards.items()):
+        # A wave tag absent from BOTH groups on one card is that card not
+        # carrying the component at all -- a SOLO-placed drafter
+        # (``--speculative-draft-placement solo``) lives on one board, and the
+        # other two boards hold no bytes of it in either phase.  Nothing is
+        # under-priced there: neither group frees it, neither takes it, and
+        # ``solve`` sums zero for both sides.  What IS a defect is the
+        # ASYMMETRIC gap -- one group carries the tag and the other does not --
+        # because then the exchange frees bytes it never takes back (or takes
+        # bytes nobody freed) and the peak is a number about a schedule the
+        # cards cannot run.
         for group in GROUPS:
-            missing = sorted(set(flat) - set(card.tags[group]))
+            other = [g for g in GROUPS if g != group]
+            missing = sorted(
+                t
+                for t in set(flat) - set(card.tags[group])
+                if any(t in card.tags[g] for g in other)
+            )
             if missing:
                 bad.append(
                     f"card {uuid} group {group}: the census has no bytes for wave "
-                    f"tags {missing} -- an absent tag is not a zero-byte tag, and "
-                    "reading it as one under-prices the peak"
+                    f"tags {missing}, which the other group DOES carry on this "
+                    "card -- an absent tag is not a zero-byte tag, and reading "
+                    "it as one under-prices the peak"
                 )
     return bad
 

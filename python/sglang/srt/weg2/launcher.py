@@ -601,6 +601,37 @@ P_DRAFT_KV_FLAGS: Tuple[str, ...] = (
     "--speculative-num-draft-tokens", str(SPEC_NUM_DRAFT_TOKENS),
     "--speculative-draft-kv-only",
 )
+def p_draft_kv_flags(extra_d: Sequence[str]) -> Tuple[str, ...]:
+    """P's four speculative flags, READ OFF GROUP D's OWN ARGV.
+
+    They hash into the drafter identity (W5/W10), so a constant here is only
+    correct while every arm runs the constant's depth.  fnFL2 v38 is the boot
+    that broke it: group D runs the Next-Flash MTP at ``--speculative-num-steps
+    3 --speculative-num-draft-tokens 4`` out of ``--extra-d``, the constants
+    say 2/3, and P would have registered a DIFFERENT drafter than the one D
+    asks the carrier for -- the weg2zr2 shape (194,088 failed draft fetches),
+    except silent, because W10 grades the identity AFTER both groups are up.
+
+    So the producer's depth is D's depth by construction: whatever
+    ``--extra-d`` names wins, and the module constants are the fallback for an
+    arm that names nothing.  ``--speculative-draft-kv-only`` is P's alone and
+    is never taken from D.
+    """
+    want = {
+        "--speculative-algorithm": SPEC_ALGORITHM,
+        "--speculative-num-steps": str(SPEC_NUM_STEPS),
+        "--speculative-eagle-topk": str(SPEC_EAGLE_TOPK),
+        "--speculative-num-draft-tokens": str(SPEC_NUM_DRAFT_TOKENS),
+    }
+    for i, tok in enumerate(extra_d):
+        if tok in want and i + 1 < len(extra_d):
+            want[tok] = extra_d[i + 1]
+    out: List[str] = []
+    for flag, value in want.items():
+        out += [flag, value]
+    return tuple(out) + ("--speculative-draft-kv-only",)
+
+
 #: The standing user order of 2026-09-07 is draft KV ACROSS THE FLIP, so the
 #: producer is the default.  ``off`` is the serving-base / A-B form and is
 #: never silent -- see :func:`draft_kv_off_line`.
@@ -2845,6 +2876,10 @@ def argv_p(
     hicache_disabled: bool = False,
     # #1369: forwarded to `common_flags` unchanged; see that function.
     weights_cpu_backup: bool = True,
+    # #1264 follow-up (fnFL2 v39): the producer's four speculative flags, read
+    # off group D's argv by :func:`p_draft_kv_flags`.  Default = the module
+    # constants, which is what every pre-Next-Flash arm shipped.
+    spec_flags: Optional[Sequence[str]] = None,
 ) -> List[str]:
     # THE COUNT FLAGS ARE THE CONTIGUOUS FORM, AND ONLY THAT (#1240 FOLLOW FIX
     # 1). --pp-stage-ratio/--pp-attn-stage-ratio are per-stage COUNTS that
@@ -2957,7 +2992,8 @@ def argv_p(
     # Group D is NOT touched by this switch: D keeps its own NEXTN head in
     # both forms (argv_d, below), because `off` removes the PRODUCER, not
     # speculative decode.
-    ] + (list(P_DRAFT_KV_FLAGS) if draft_kv_on_p else []) + (
+    ] + (list(P_DRAFT_KV_FLAGS if spec_flags is None else spec_flags)
+         if draft_kv_on_p else []) + (
         # #1305 item 2: the cap is the SHIPPED cut's priced pool, handed in by
         # the caller that holds PCutFacts; never a constant here.  Head-scoped
         # (see P_DRAFT_KV_FLAGS); absent when no cut was solved (the sentinel
@@ -11353,6 +11389,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         barlink_cap_cycles=ns.barlink_bar1_cap_cycles,
         census_interval=ns.collective_census_interval,
         draft_kv_on_p=draft_kv_on_p,
+        spec_flags=p_draft_kv_flags(shlex.split(ns.extra_d)),
         vision=ns.weg2_vision,
         profile=ns.profile,
         p_max_total_tokens=int(cut.pool_tokens),
@@ -11941,6 +11978,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         barlink_cap_cycles=ns.barlink_bar1_cap_cycles,
         census_interval=ns.collective_census_interval,
         draft_kv_on_p=draft_kv_on_p,
+        spec_flags=p_draft_kv_flags(shlex.split(ns.extra_d)),
         vision=ns.weg2_vision,
         profile=ns.profile,
         admin_api_key=admin_api_key,
