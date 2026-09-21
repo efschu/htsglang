@@ -122,6 +122,28 @@ DRAIN_DEADLINE_DEFAULT_S = 120.0
 #: launcher recomputes from this boot's own lines and tells the front (C2).
 X_FALLBACK_TOKENS = 22000
 QUIESCE_DEADLINE_S = 90.0
+
+#: fnFL2 v22: how long the quiesce waits for /health_generate proxies the
+#: front forwarded before the flip began (a 1-token generate, ~1 s warm; the
+#: cold-JIT first probe took 2 min on D -- that one the bound lets run out
+#: and the flush loop names the rest).
+HEALTH_DRAIN_BOUND_S = 30.0
+
+
+async def health_probes_drained(inflight, name: str, bound_s: float, *, sleep=None):
+    """Wait until ``inflight[name] == 0`` or ``bound_s`` elapses.
+
+    Returns None when nothing was in flight, else (seconds waited, count seen
+    at entry). ``sleep`` is the awaitable sleep (asyncio.sleep by default)."""
+    n0 = int(inflight.get(name, 0) or 0)
+    if n0 <= 0:
+        return None
+    _sleep = sleep or asyncio.sleep
+    t0 = time.time()
+    while inflight.get(name, 0) > 0 and time.time() - t0 < bound_s:
+        await _sleep(0.05)
+    return (time.time() - t0, n0)
+
 #: Spec C4/R-15/O9: the admitter resolves ONE future and then waits for that
 #: request's coroutine to actually POST to D before resolving the next.  A
 #: disconnected client never posts, so the wait carries a deadline and a
@@ -1883,6 +1905,10 @@ class Front:
         self.drain_refusals_in_a_row = 0
         self.identity_checked = False
         self.dc_measured_d: Dict[str, int] = {}
+        #: fnFL2 v22 (21.09.): /health_generate proxies in flight per group.
+        #: A probe forwarded a moment before `WEG2-FLIP begin` is a running
+        #: request the group's own flush cannot see yet; the quiesce waits for it.
+        self._health_inflight: Dict[str, int] = {"P": 0, "D": 0}
         self.t0 = time.time()
         self._rid = 0
         # ---- WEG2_SCHEDULING_SPEC_0907 slice A, laws 1/2/4/5 ----------------
@@ -2618,12 +2644,15 @@ class Front:
         if self.state != "serving":
             return web.json_response({"state": self.state, "stop": str(self.stop) if self.stop else None}, status=503)
         g = self.groups[self.awake]
+        self._health_inflight[g.name] = self._health_inflight.get(g.name, 0) + 1
         try:
             async with self.session.get(f"{g.url}/health_generate", timeout=ClientTimeout(total=60)) as r:
                 body = await r.read()
                 return web.Response(body=body, status=r.status, content_type=r.content_type)
         except Exception as e:  # noqa: BLE001
             return web.json_response({"error": f"{type(e).__name__}: {e}", "group": g.name}, status=503)
+        finally:
+            self._health_inflight[g.name] = max(0, self._health_inflight.get(g.name, 0) - 1)
 
     async def handle_state(self, request: web.Request) -> web.Response:
         return web.json_response(self.state_dict())
@@ -4136,6 +4165,18 @@ class Front:
         instead of an assert-death on a follower."""
         t0 = time.time()
         last = ""
+        # fnFL2 v22 (21.09.): a /health_generate the front forwarded just
+        # before `WEG2-FLIP begin` was still running on D when the release
+        # arrived (flush said idle 100 ms earlier) -> "release_memory_
+        # occupation should be called only when server is idle" -> W29 on
+        # every rank. Probes arriving now are refused (state != serving);
+        # the ones already in flight are waited for here.
+        waited = await health_probes_drained(self._health_inflight, g.name, HEALTH_DRAIN_BOUND_S)
+        if waited is not None:
+            logger.info(
+                "WEG2-FLIP quiesce group=%s waited %.2f s for %s in-flight /health_generate "
+                "proxy(ies) before the flush (fnFL2 v22)", g.name, waited[0], waited[1]
+            )
         while time.time() - t0 < QUIESCE_DEADLINE_S:
             code, body = await self.rpc(g, "/flush_cache", None, 60)
             if code == 200:

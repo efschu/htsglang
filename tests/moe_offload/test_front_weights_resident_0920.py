@@ -81,3 +81,38 @@ def test_w19_dormant_residue_is_not_graded_on_the_resident_arm():
     assert dormant_residue_over(dc, reserve, weights_resident=True) == {}
     assert dormant_residue_over(dc, reserve, weights_resident=False) == {"gpu-a": (11534, 1986)}
     assert dormant_residue_over(dc, {}, weights_resident=False) == {}
+
+
+def test_quiesce_waits_for_inflight_health_probes():
+    """fnFL2 v22 (21.09.): a /health_generate forwarded just before the flip
+    was still running on D at the release -> assert not idle -> W29."""
+    import asyncio
+
+    from sglang.srt.weg2 import front as fr
+
+    inflight = {"D": 0, "P": 0}
+    assert asyncio.run(fr.health_probes_drained(inflight, "D", 1.0)) is None
+
+    inflight = {"D": 2, "P": 0}
+    ticks = []
+
+    async def fake_sleep(dt):
+        ticks.append(dt)
+        if len(ticks) == 3:
+            inflight["D"] = 0
+
+    waited, seen = asyncio.run(fr.health_probes_drained(inflight, "D", 5.0, sleep=fake_sleep))
+    assert seen == 2 and len(ticks) == 3 and waited < 1.0
+
+    inflight = {"D": 1}
+
+    async def never(dt):
+        pass
+
+    waited, seen = asyncio.run(fr.health_probes_drained(inflight, "D", 0.05, sleep=never))
+    assert seen == 1 and waited >= 0.05
+    import inspect
+
+    src = inspect.getsource(fr.Front.handle_health_generate)
+    assert "self._health_inflight[g.name] = self._health_inflight.get(g.name, 0) + 1" in src
+    assert "await health_probes_drained(self._health_inflight, g.name, HEALTH_DRAIN_BOUND_S)" in inspect.getsource(fr.Front.quiesce)
