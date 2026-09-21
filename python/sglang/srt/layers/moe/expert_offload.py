@@ -5203,6 +5203,24 @@ def _rank_moe_ratio_vector(layer):
                 return [int(x) for x in src]
             except (TypeError, ValueError):
                 continue
+    # #90: Gruppe P laeuft tp1/pp3 und bekommt deshalb KEIN --rank-moe-ratio
+    # (der Server verweigert die Flag ohne --rank-tp-ratio, server_args.py).
+    # Ohne Vektor faellt der Slot-Pool-Block in `_expert_store_rows_for` still
+    # durch -- ausgerechnet bei der Gruppe, die den Store FUELLT. Gemessen
+    # fnFL2w16: die Store-Datei blieb bei 512 Slots (800,0 MiB) fuer JEDE
+    # Residenz-Fraction, weil dieser Zweig nie lief.
+    #
+    # Bei EINEM Rang ist der Vektor trivial und braucht keine Absprache: der
+    # Rang haelt alle Experten des Layers. Das ist keine Annahme, sondern die
+    # Definition von tp_size==1 -- und `slot_rows` rechnet damit dieselbe
+    # Packung wie fuer jede andere Geometrie.
+    _tp = getattr(getattr(_ps, "_TP", None), "world_size", None)
+    if _tp in (None, 1):
+        _e = getattr(layer, "num_experts", None) or getattr(
+            layer, "num_local_experts", None
+        )
+        if _e:
+            return [int(_e)]
     return None
 
 
