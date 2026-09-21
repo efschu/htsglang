@@ -491,7 +491,21 @@ MODEL_DEFAULT = "/spinning/llm_stuff/club-3090/models-cache/Qwen3.8-27B-INT8-gdn
 #:     target lm_head excluded) and the NVML delta rides beside it as its own
 #:     named term `nvml_delta_mib`.
 #: The next boot's L2 `resident_mib` replaces 1618.2 here, with its tag.
-P_DRAFT_RESIDENT_BUDGET_MIB = 405.2 + 1213.0
+#:
+#: fnFL2v71 (21.09.) is that next boot, and it REFUSED against the old pair:
+#: measured resident_mib=2202.6 vs budget 1618.2+256. The build changed under
+#: two fixes of the same day, both of which this budget has to follow:
+#:   embed 405.2 -> 615.7 MiB  the vocab is now loaded PACKED, under the
+#:                             TARGET's quantization (d84f1394fe). The old
+#:                             number priced a table the producer refused to
+#:                             load at all -- it is not a saving that was lost.
+#:   mtp  1213.0 -> 1522.7 MiB the mtp layers now follow the DRAFT checkpoint
+#:                             (a905902f47), which is INT4 g32, not the bf16
+#:                             stump the target's index implied.
+#: Sum 2138.4 MiB; the measured 2202.6 sits 64.2 MiB above it, inside the 256
+#: tolerance -- the gate keeps its grip, it is only no longer aimed at a build
+#: that no longer exists.
+P_DRAFT_RESIDENT_BUDGET_MIB = 615.7 + 1522.7
 P_DRAFT_RESIDENT_TOL_MIB = 256.0
 P_CORRIDOR_TOP_MIB = 1229.0
 
