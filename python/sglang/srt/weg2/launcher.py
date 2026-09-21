@@ -7007,6 +7007,57 @@ def _axis_renormalisation(
     )
 
 
+def _infeasible_breakdown(pcm, mlp, attn_units, budgets, cap) -> str:
+    """The per-rank arithmetic behind a W64 feasible=False, as one clause.
+
+    A refusal that names only its verdict makes the reader re-derive the
+    reason by hand -- three boots of this flip paid that price, because
+    "does not leave a positive KV pool on at least one rank" does not say
+    WHICH rank, nor by how much, nor which term ate the budget.  Every number
+    here comes from the same model that produced the verdict (no second
+    accounting): the weight shards and the mamba pool from ``pcm``, the
+    predicted per-rank tokens straight off ``cap["p"]``, and the two flat
+    reserves from ``uneven_perf``'s own constants -- so the four terms add up
+    to the budget the gate used and the shortfall is readable without a
+    second run.
+    """
+    try:
+        from sglang.srt.uneven_perf import (
+            _PREDICT_MAMBA_ACT_RESERVE_MIB,
+            _PREDICT_MIN_RANK_TOKENS,
+            _PREDICT_OVERHEAD_MIB,
+        )
+
+        MI = float(2 ** 20)
+        attn = list(attn_units) if attn_units else None
+        wb = pcm.per_rank_weight_bytes(list(mlp), attn)
+        mb = pcm.mamba_pool_bytes_for(attn)
+        cell = float(pcm.kv_cell_bytes)
+        overhead = float(_PREDICT_OVERHEAD_MIB + _PREDICT_MAMBA_ACT_RESERVE_MIB)
+        ptok = list(cap.get("p") or [])
+        rows = []
+        for r in range(len(budgets)):
+            free = float(budgets[r]) - wb[r] / MI - mb[r] / MI - overhead
+            rows.append(
+                "r%d budget=%d - weights=%.0f - mamba=%.0f - reserves=%.0f "
+                "=> free=%.0f MiB / kv_cell=%.0f B = %d tokens%s"
+                % (
+                    r, int(budgets[r]), wb[r] / MI, mb[r] / MI, overhead, free,
+                    cell, int(ptok[r]) if r < len(ptok) else -1,
+                    "  <-- BELOW the minimum" if (
+                        r < len(ptok) and ptok[r] < _PREDICT_MIN_RANK_TOKENS
+                    ) else "",
+                )
+            )
+        return (
+            "  THE ARITHMETIC (same model, no second accounting; a rank needs "
+            ">= %d tokens): %s"
+            % (_PREDICT_MIN_RANK_TOKENS, "; ".join(rows))
+        )
+    except Exception as exc:  # pragma: no cover - diagnostic only
+        return "  (per-rank breakdown unavailable: %s)" % exc
+
+
 def d_operating_point_rows(
     cards: Sequence[Card],
     budgets: Sequence[int],
@@ -7384,6 +7435,7 @@ def d_operating_point_rows(
                 "model's own verdict, not a margin chosen here: no safety "
                 "factor is applied on top of it."
                 % (position, list(int(w) for w in weights), list(budgets))
+                + _infeasible_breakdown(pcm, mlp, attn_units, budgets, cap)
             )
         return (
             DOperatingPointRow(
