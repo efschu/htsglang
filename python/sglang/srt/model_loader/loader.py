@@ -699,6 +699,7 @@ class DefaultModelLoader(BaseModelLoader):
                     direct_io=weight_loader_direct_io,
                     should_load=getattr(self, "_weight_name_filter", None),
                     pread=envs.SGLANG_WEIGHT_LOADER_PREAD.get(),
+                    post_load=getattr(self, "_weight_post_load", None),
                 )
             else:
                 weights_iterator = safetensors_weights_iterator(
@@ -764,6 +765,12 @@ class DefaultModelLoader(BaseModelLoader):
         # see weight_utils.pread_safetensors_file). Only the primary source:
         # a secondary source (draft) has its own model.
         self._weight_name_filter = getattr(model, "weight_name_needed", None)
+        # #66: the same seam one step further -- a transform the model
+        # wants applied IN THE LOADER THREAD, where the eight file
+        # workers otherwise sit idle with a full buffer while the
+        # consumer transposes. Absent on a model that declares none,
+        # so every other model stays byte-identical.
+        self._weight_post_load = getattr(model, "weight_post_load", None)
         # fn8r3 20.09.: the prefetch branch of _get_weights_iterator asks the
         # config being loaded (is_draft_model); the generator has no config
         # parameter, so it is parked here for the duration of the primary read.
@@ -772,6 +779,7 @@ class DefaultModelLoader(BaseModelLoader):
             yield from self._get_weights_iterator(primary_weights)
         finally:
             self._weight_name_filter = None
+            self._weight_post_load = None
             self._loading_model_config = None
 
         secondary_weights = cast(

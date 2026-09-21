@@ -1,5 +1,6 @@
 """Inference-only Qwen4-Exp (text + VL) on the Qwen3.5 backbone."""
 
+import os
 import re
 import math
 import contextlib
@@ -2235,6 +2236,44 @@ def load_packed_hc_linear(
     return True
 
 
+def _transpose_in_worker() -> bool:
+    """ONE switch, read by BOTH sides of the seam (#66).
+
+    `Qwen4ExpForConditionalGeneration.weight_post_load` transposes the expert
+    shards in the loader thread iff this is on; `_weight_loader_impl` skips
+    its own transpose iff this is on. Read fresh each call -- the load happens
+    once per process and a cached verdict would only hide a mis-set env.
+    """
+    return os.environ.get("SGLANG_LOAD_TRANSPOSE_IN_WORKER") == "1"
+
+
+#: The checkpoint tensors the compressed-tensors WNA16 MoE path transposes:
+#: the packed weights and everything that shares their [out, in/pack]
+#: orientation. Names come from the checkpoint, before any mapping.
+_CT_EXPERT_SUFFIXES = (
+    "weight_packed",
+    "weight_scale",
+    "weight_zero_point",
+)
+
+
+def _is_ct_wna16_expert_shard(name: str, model) -> bool:
+    """Is this checkpoint tensor one the WNA16 MoE path would transpose?
+
+    Deliberately narrow: an expert tensor of a compressed-tensors checkpoint.
+    A name this returns False for keeps the consumer's own transpose, so a
+    miss costs speed and never correctness -- the asymmetry a switch like this
+    must have.
+    """
+    if ".experts." not in name:
+        return False
+    if not name.endswith(_CT_EXPERT_SUFFIXES):
+        return False
+    qc = getattr(model, "quant_config", None)
+    method = type(qc).__name__ if qc is not None else ""
+    return "CompressedTensors" in method
+
+
 class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
     packed_modules_mapping = Qwen3_5ForCausalLM.packed_modules_mapping
     hf_to_sglang_mapper = None
@@ -2286,6 +2325,41 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
         return output
 
     _EXPERT_ID_RE = re.compile(r"\.experts\.(\d+)\.")
+
+    def weight_post_load(self, name: str, tensor):
+        """Transform applied IN THE LOADER THREAD, before load_weights sees
+        the tensor (#66).
+
+        WHAT AND WHY. The compressed-tensors WNA16 MoE path transposes every
+        expert shard -- fused_moe_triton/layer.py, `loaded_weight.t()
+        .contiguous()` -- because the checkpoint stores [out, in/pack] while
+        create_weights lays the parameter out as [E, in/pack, out]. The
+        transpose is NECESSARY (checked against the two layouts) and it is
+        expensive in the WRONG PLACE: measured on fnFL2v84/v85 it is 43-50 %
+        of the whole load, serial, on the consumer thread, while the eight
+        file workers sit in threading.wait with a full buffer and the NVMe
+        reports 40-60 % read load at queue depth 0,64.
+
+        Doing it HERE costs the same microseconds on a thread that had
+        nothing to do, and takes them off the critical path.
+
+        ONE SWITCH, READ IN BOTH PLACES. The consumer skips its own transpose
+        under the same env, so the work happens exactly once. A per-tensor
+        marker was the alternative and is refused: a marker that gets lost on
+        the way (a narrow, a clone, a dict round-trip) transposes twice and
+        loads SILENTLY WRONG, which is the one failure this code must not
+        have. A global switch can be read by both sides and checked by a
+        test.
+
+        Off by default; SGLANG_LOAD_TRANSPOSE_IN_WORKER=1 turns it on.
+        """
+        if not _transpose_in_worker():
+            return tensor
+        if not _is_ct_wna16_expert_shard(name, self):
+            return tensor
+        if getattr(tensor, "dim", None) is None or tensor.dim() != 2:
+            return tensor
+        return tensor.t().contiguous()
 
     def weight_name_needed(self, name: str):
         """Loader veto BEFORE a checkpoint tensor is read (weight_utils

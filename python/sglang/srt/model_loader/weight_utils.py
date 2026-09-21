@@ -1357,6 +1357,7 @@ def buffered_multi_thread_safetensors_weights_iterator(
     drop_cache_after_load: bool = False,
     should_load=None,
     pread: bool = False,
+    post_load=None,
 ) -> Generator[Tuple[str, torch.Tensor], None, None]:
     """Multi-threaded safetensor loader with bounded memory via a sliding window.
 
@@ -1367,6 +1368,20 @@ def buffered_multi_thread_safetensors_weights_iterator(
     ``should_load`` / ``pread``: see ``pread_safetensors_file``. The name
     filter also applies to the mmap path (a vetoed tensor is never
     materialised); "meta" verdicts are honoured there too.
+    
+    ``post_load(name, tensor) -> tensor`` runs IN THE WORKER, on the thread
+    that read the file, before the consumer ever sees the tensor (#66).
+    That is the whole point of the seam: measured on fnFL2v84/v85, the
+    consumer spends 43-50 % of the load inside ONE per-shard transpose
+    while these workers sit in ``threading.wait`` with a full buffer and the
+    NVMe reports 40-60 % read load at queue depth 0,64. Work moved here
+    leaves the critical path entirely, which is strictly more than the
+    1,55-1,96x a thread pool buys on that same operation (measured
+    2026-09-21 -- it is bandwidth-bound, not compute-bound).
+
+    An exception from ``post_load`` is NOT swallowed: a half-transformed
+    weight set loads silently wrong, and that is the one outcome worse
+    than a slow boot.
     """
     if prefetch and not disable_mmap:
         _prefetch_all_checkpoints(
@@ -1400,6 +1415,11 @@ def buffered_multi_thread_safetensors_weights_iterator(
                         )
                         continue
                     result[k] = f.get_tensor(k)
+        if post_load is not None:
+            # In the worker, on the thread that read the file. Not
+            # guarded: an exception here must surface, because a
+            # half-transformed weight set loads silently wrong.
+            result = {k: post_load(k, v) for k, v in result.items()}
         return result
 
     # Sliding window: max_workers loading + 1 prefetched.

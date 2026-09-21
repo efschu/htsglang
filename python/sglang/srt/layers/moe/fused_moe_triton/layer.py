@@ -374,6 +374,18 @@ def expert_shard_generic_eligible(quant_config, plan_active, moe_ep_size, opt_in
     return True
 
 
+def _transpose_done_in_worker() -> bool:
+    """Did the loader thread already transpose the expert shards? (#66)
+
+    The same env the model's ``weight_post_load`` reads -- one switch, two
+    readers, so the work happens exactly once. Off by default, which makes
+    this path byte-identical to before.
+    """
+    import os as _os
+
+    return _os.environ.get("SGLANG_LOAD_TRANSPOSE_IN_WORKER") == "1"
+
+
 class FusedMoE(torch.nn.Module):
     """FusedMoE layer for MoE models.
 
@@ -1969,17 +1981,24 @@ class FusedMoE(torch.nn.Module):
         # moe_awq_to_marlin_zero_points reads it that way. Untransposed, w2
         # died on the shape ("320 vs 20") and w13 (square) would have loaded
         # silently wrong. So the zero points take the same transpose.
+        # #66: THE OTHER HALF OF THE SWITCH. This transpose is 43-50 % of the
+        # whole load (measured fnFL2v84/v85, all three ranks), serial, on this
+        # thread, while the loader's eight file workers sit idle. When
+        # SGLANG_LOAD_TRANSPOSE_IN_WORKER=1 the model's `weight_post_load` has
+        # already done it in one of those workers, so doing it again here
+        # would transpose TWICE and load silently wrong. Both sides read the
+        # same switch, which is exactly why it is a switch and not a
+        # per-tensor marker: a marker can get lost between the two, a switch
+        # cannot.
+        _needs_ct_transpose = method.__class__.__name__ in [
+            "CompressedTensorsWNA16MarlinMoE",
+            "CompressedTensorsWNA16MoE",
+            "CompressedTensorsWNA16TritonMoE",
+        ]
+        if _needs_ct_transpose and _transpose_done_in_worker():
+            _needs_ct_transpose = False
         loaded_weight = (
-            loaded_weight.t().contiguous()
-            if (
-                method.__class__.__name__
-                in [
-                    "CompressedTensorsWNA16MarlinMoE",
-                    "CompressedTensorsWNA16MoE",
-                    "CompressedTensorsWNA16TritonMoE",
-                ]
-            )
-            else loaded_weight
+            loaded_weight.t().contiguous() if _needs_ct_transpose else loaded_weight
         )
 
         if shard_id not in ("w1", "w2", "w3"):
