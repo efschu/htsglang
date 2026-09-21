@@ -1760,6 +1760,36 @@ def _blocks_of(geom: ParamGeom, layout: GroupLayout, is_dst: bool) -> List[List[
         )
     if geom.shard_axis == REPLICATED:
         total = geom.content_units
+        # #83 (fnFL2w3/w7/w8, 21.09.): REPLIZIERT HEISST NICHT "JEDER HAELT
+        # IHN". Dieser Zweig stand VOR dem `dst_widths`-Zweig und gab jedem
+        # Rang einen vollen Block zurueck -- fuer jeden Rang also ein
+        # `d_rank` und damit eine Lane c0 UND c1 UND c2. Unter Form A haelt
+        # den Tensor aber nur der Attention-Host; die beiden Worker-Karten
+        # haben auf ihrer Diagonalen nichts abzulegen, und P wartete drei
+        # Boots lang auf zwei Lanes, die niemand je bedient hat (w3 STALL
+        # 129,2 s, w7 125,2 s, w8 W29 am Wake).
+        #
+        # DAS IST AUCH DER GRUND, WARUM #80 (418e685ce4) WIRKUNGSLOS BLIEB.
+        # Der Fix dort setzt die Null-Breiten korrekt ins Manifest -- aber
+        # diese Funktion kam bei REPLICATED nie bis zu der Zeile, die sie
+        # liest. Ein richtiger Wert, der nie gelesen wird, sieht im Test
+        # genauso aus wie ein Fix.
+        #
+        # Die Breiten hier NICHT als Praefixsumme lesen: bei REPLICATED
+        # traegt jeder HALTER die volle Form (deshalb size=total, nicht
+        # size=w). Die Breite sagt nur, OB er sie traegt.
+        if is_dst and geom.dst_widths is not None:
+            if len(geom.dst_widths) != layout.n_ranks:
+                raise Weg2XchgPlanDisagree(
+                    f"W68 Weg2XchgPlanDisagree: {geom.name}: "
+                    f"{len(geom.dst_widths)} seeded widths for "
+                    f"{layout.n_ranks} ranks."
+                )
+            return [
+                ([Block(block=0, global_start=0, dev_row=0, size=total)]
+                 if int(w) > 0 else [])
+                for w in geom.dst_widths
+            ]
         return [
             [Block(block=0, global_start=0, dev_row=0, size=total)]
             for _ in range(layout.n_ranks)
