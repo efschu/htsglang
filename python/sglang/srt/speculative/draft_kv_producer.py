@@ -90,8 +90,12 @@ class DraftKvProducer:
         # torch auf der Karte waechst, und was der Default-Allokator cached.
         self._outside_before_mib = _outside_torch_mib()
         self._default_inactive_before_mib = _default_pool_inactive_mib()
+        # #66: der dritte Zustand neben "frei" und "gecached" -- lebend.
+        self._alloc_before_mib = _live_allocated_mib()
         self.resident_mib = -1.0
         self.nvml_delta_mib = -1.0
+        self.card_free_mib = -1.0
+        self.other_live_mib = -1.0
         self.head_released_mib = 0.0
         # #1259 (b): True when the head's own [vocab, hidden] output table was
         # never BUILT (the deferral below) rather than built-and-deleted. The
@@ -340,6 +344,12 @@ class DraftKvProducer:
         after = _cuda_free_mib()
         if after >= 0 and self._free_before_mib >= 0:
             self.nvml_delta_mib = self._free_before_mib - after
+        # #66: WAS DIE KARTE NACH DEM BUILD NOCH FREI HAT -- kein
+        # Buchungsposten, sondern der MASSSTAB fuer den unerklaerten Rest.
+        # W11b existiert, um ein OOM zu verhindern; ob eine unerklaerte
+        # Differenz gefaehrlich ist, entscheidet allein diese Zahl, und keiner
+        # der vier Terme trug sie bisher.
+        self.card_free_mib = after
         # Beide NACH empty_cache: ein Rest im Default-Pool ist dann ein
         # Befund, kein Buchungsposten.
         _out_after = _outside_torch_mib()
@@ -362,6 +372,19 @@ class DraftKvProducer:
         self.resident_mib = _live_weight_mib(
             draft_model, shared=(now_head if (head is not None and now_head is head) else None)
         )
+        # #66: LEBENDE NICHT-MODELL-BYTES. Was der Build an Allokator-Bytes
+        # zugelegt hat, minus dem, was davon Modell ist -- also der
+        # Attention-Workspace des Draft-Runners und was sonst ausser den
+        # Gewichten lebt. Nur positiv gemeldet: ein negativer Wert hiesse, der
+        # Modell-Term uebersteigt den Allokator-Zuwachs, und das waere ein
+        # Befund ueber die Messung, kein Buchungsposten.
+        _alloc_after = _live_allocated_mib()
+        if _alloc_after >= 0 and self._alloc_before_mib >= 0 and self.resident_mib >= 0:
+            self.other_live_mib = max(
+                0.0, (_alloc_after - self._alloc_before_mib) - self.resident_mib
+            )
+        else:
+            self.other_live_mib = -1.0
         return mib
 
     # -- the per-chunk primitive ---------------------------------------------
@@ -573,6 +596,37 @@ def _default_pool_inactive_mib() -> float:
         r = float(torch.cuda.memory_reserved())
         a = float(torch.cuda.memory_allocated())
         return (r - a) / float(2**20)
+    except Exception:  # noqa: BLE001
+        return -1.0
+
+
+def _live_allocated_mib() -> float:
+    """LEBENDE Allokator-Bytes dieses Prozesses in MiB, private MemPools des
+    Memory-Savers eingeschlossen; -1 ohne CUDA.
+
+    #66: der Term, der W11b vier Boots lang gefehlt hat. Die Bilanz kannte nur
+    Modell-Tensoren (``resident_mib`` = parameters + buffers) und CACHE
+    (``reserved - allocated``). Zwischen beiden liegt eine dritte Klasse, die
+    keiner der Terme sehen KANN: lebende Tensoren, die dem Modell nicht
+    gehoeren. Der Draft-Build baut keinen nackten ``nn.Module``, sondern einen
+    ganzen ModelRunner, und der legt seinen Attention-Backend-Workspace an
+    (jedes Backend tut das -- ``flashinfer_backend.py:1125``,
+    ``trtllm_mha_backend.py:127``, ``aiter_backend.py:271``, der
+    FlashInfer-Default 512 MiB ueber ``SGLANG_FLASHINFER_WORKSPACE_SIZE``),
+    dazu Sampler- und Rotary-Puffer. Diese Bytes sind ALLOCATED, also weder im
+    Cache-Term (``reserved - allocated`` zieht sie ab) noch im Modell-Term
+    (kein Parameter, kein Buffer) -- und exakt dieser Groessenordnung war die
+    unerklaerte Differenz (533,7 MiB, fnFL2v86/v89/v90/v91).
+
+    KEIN ``empty_cache`` davor: hier wird gezaehlt, was LEBT, und ein
+    Cache-Leeren aendert daran nichts, waehrend es die Messung nur gegen die
+    anderen Terme verschoebe.
+    """
+    if not torch.cuda.is_available():
+        return -1.0
+    try:
+        torch.cuda.synchronize()
+        return float(torch.cuda.memory_allocated()) / float(2**20)
     except Exception:  # noqa: BLE001
         return -1.0
 

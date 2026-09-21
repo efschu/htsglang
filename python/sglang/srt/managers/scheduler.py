@@ -1640,6 +1640,7 @@ class Scheduler(
             "resident_mib=%.1f head_released_mib=%.1f head_deferred=%s "
             "nvml_delta_mib=%.1f tag_pool_inactive_mib=%.1f "
             "outside_torch_mib=%.1f default_pool_inactive_mib=%.1f "
+            "card_free_mib=%.1f other_live_mib=%.1f "
             "embed_dtype=%s build_s=%.1f",
             self.draft_kv_producer.stage,
             self.draft_kv_producer.stages,
@@ -1690,6 +1691,16 @@ class Scheduler(
             # AUSSERHALB (CUDA-Kontext, cuBLAS-Workspaces, JIT-Kernel)?
             getattr(self.draft_kv_producer, "outside_torch_mib", -1.0),
             getattr(self.draft_kv_producer, "default_pool_inactive_mib", -1.0),
+            # #66: NICHT Teil der Bilanz -- der Massstab, an dem W11b misst,
+            # ob ein unerklaerter Rest die Karte bedroht oder nur den KV-Pool
+            # schmaelert (den das Sizing danach ohnehin aus mem_get_info
+            # ableitet, also mit diesen Bytes bereits rechnet).
+            getattr(self.draft_kv_producer, "card_free_mib", -1.0),
+            # #66: der fehlende Posten der W11b-Bilanz -- lebende Bytes, die
+            # nicht dem Modell gehoeren (Attention-Workspace des Draft-Runners
+            # voran). Weder Cache noch Gewicht, und deshalb von keinem der
+            # vier bisherigen Terme sichtbar.
+            getattr(self.draft_kv_producer, "other_live_mib", -1.0),
             self.draft_kv_producer.embed_dtype,
             self.draft_kv_producer.build_s,
         )

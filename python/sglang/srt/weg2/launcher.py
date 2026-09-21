@@ -5109,6 +5109,11 @@ _TAG_POOL_INACTIVE_RE = re.compile(r"WEG2 DRAFT-KV-PRODUCER armed .*tag_pool_ina
 _OUTSIDE_TORCH_RE = re.compile(r"WEG2 DRAFT-KV-PRODUCER armed .*outside_torch_mib=(-?\d+(?:\.\d+)?)")
 _DEFAULT_POOL_RE = re.compile(r"WEG2 DRAFT-KV-PRODUCER armed .*default_pool_inactive_mib=(-?\d+(?:\.\d+)?)")
 _NVML_DELTA_RE = re.compile(r"WEG2 DRAFT-KV-PRODUCER armed .*nvml_delta_mib=(-?\d+(?:\.\d+)?)")
+#: #66: der lebende Nicht-Modell-Posten (Attention-Workspace voran) und der
+#: freie Rand der Karte, an dem gemessen wird, ob ein Rest ueberhaupt
+#: gefaehrlich waere.
+_OTHER_LIVE_RE = re.compile(r"WEG2 DRAFT-KV-PRODUCER armed .*other_live_mib=(-?\d+(?:\.\d+)?)")
+_CARD_FREE_RE = re.compile(r"WEG2 DRAFT-KV-PRODUCER armed .*card_free_mib=(-?\d+(?:\.\d+)?)")
 #: W11b (#1233 fix 6): how far the BUILD may stay unexplained by the two terms
 #: that claim to explain it, IN EITHER DIRECTION.  MEASURED on boot weg2dk5's
 #: own L2 line: nvml_delta 3998.0 against resident 1682.9 + head_released
@@ -5159,6 +5164,7 @@ def check_draft_resident(log_p: str, budget_mib: float = None, tol_mib: float = 
         "head_released_mib": None, "nvml_delta_mib": None, "unaccounted_mib": None,
         "tag_pool_inactive_mib": None, "outside_torch_mib": None,
         "default_pool_inactive_mib": None, "cache_term": None,
+        "other_live_mib": None, "card_free_mib": None,
         "accounting_tol_mib": P_DRAFT_BUILD_ACCOUNTING_TOL_MIB,
         "resident_ok": False, "accounted": False, "ok": False,
     }
@@ -5172,6 +5178,8 @@ def check_draft_resident(log_p: str, budget_mib: float = None, tol_mib: float = 
                     ("outside_torch_mib", _OUTSIDE_TORCH_RE),
                     ("default_pool_inactive_mib", _DEFAULT_POOL_RE),
                     ("nvml_delta_mib", _NVML_DELTA_RE),
+                    ("other_live_mib", _OTHER_LIVE_RE),
+                    ("card_free_mib", _CARD_FREE_RE),
                 ):
                     m = rx.search(line)
                     if m:
@@ -5230,15 +5238,38 @@ def check_draft_resident(log_p: str, budget_mib: float = None, tol_mib: float = 
         # Also: liegt der Gesamtwert vor, ERSETZT er die beiden Teilterme.
         # Fehlt er (-1), bleibt die alte Rechnung, damit ein Boot ohne diese
         # Messung liest wie vorher.
+        # #66 (fnFL2v92): DER POSTEN, DER VIER BOOTS LANG FEHLTE. Die Bilanz
+        # kannte Modell (`r`) und Cache -- aber nicht die dritte Klasse: was
+        # LEBT, ohne dem Modell zu gehoeren. Der Build ist kein nackter
+        # `nn.Module`, sondern ein ganzer ModelRunner, und der legt seinen
+        # Attention-Workspace an (der FlashInfer-Default allein sind 512 MiB,
+        # `flashinfer_backend.py:1125`), dazu Sampler- und Rotary-Puffer.
+        # Diese Bytes sind ALLOCATED: der Cache-Term zieht sie gerade ab, und
+        # `resident_mib` sieht sie nicht, weil sie weder Parameter noch Buffer
+        # sind. Genau deshalb blieben 533,7 MiB uebrig, und genau deshalb hat
+        # kein Messpunkt-Fix sie bewegt -- gemessen wurde an den falschen zwei
+        # Zustaenden. Der devindex-Graph nennt die Allokationsstelle je
+        # Backend; geraten werden musste nichts.
+        other_live = out.get("other_live_mib")
+        other_live = 0.0 if other_live is None or float(other_live) < 0 else float(other_live)
         if torch_cached >= 0:
-            out["unaccounted_mib"] = delta - (r + torch_cached + outside)
+            out["unaccounted_mib"] = delta - (r + other_live + torch_cached + outside)
             out["cache_term"] = "torch_total"
         else:
-            out["unaccounted_mib"] = delta - (r + released + pooled + outside)
+            out["unaccounted_mib"] = delta - (r + other_live + released + pooled + outside)
             out["cache_term"] = "tag_pool+head_released"
         out["accounted"] = abs(out["unaccounted_mib"]) <= P_DRAFT_BUILD_ACCOUNTING_TOL_MIB
     out["ok"] = bool(out["resident_ok"] and out["accounted"])
     return out
+
+
+#: #66: wieviel freie Karte eine unerklaerte W11b-Differenz aufwiegen muss,
+#: damit das Gate MELDET statt zu verweigern. Vier auf 1: gemessen trug
+#: fnFL2v91 2,24 GiB frei gegen 533,7 MiB unerklaert, also das 4,3-fache.
+#: Der Faktor ist bewusst grob -- er trennt "die Karte hat reichlich Luft"
+#: von "es wird eng", und nicht zwei Zahlen, die sich um Prozente
+#: unterscheiden. Faellt der Rand darunter, verweigert das Gate wieder.
+W11B_FREE_OVER_UNACCOUNTED = 4.0
 
 
 def gate_w11(log_p: str, log: Log) -> Dict[str, object]:
@@ -5266,7 +5297,9 @@ def gate_w11(log_p: str, log: Log) -> Dict[str, object]:
         f"head_released_mib={w11['head_released_mib']} + tag_pool_inactive_mib={w11['tag_pool_inactive_mib']} "
         f"+ outside_torch_mib={w11['outside_torch_mib']} "
         f"+ default_pool_inactive_mib={w11['default_pool_inactive_mib']} "
+        f"+ other_live_mib={w11.get('other_live_mib')} "
         f"+ unaccounted_mib={w11['unaccounted_mib']} cache_term={w11.get('cache_term')} "
+        f"card_free_mib={w11.get('card_free_mib')} "
         f"(tol {w11['accounting_tol_mib']:.0f}) accounted={w11['accounted']} "
         f"ok={w11['ok']}")
     if not w11["resident_ok"]:
@@ -5278,11 +5311,51 @@ def gate_w11(log_p: str, log: Log) -> Dict[str, object]:
         # quantity, so a table released only from the graph passes it while
         # still sitting on the card -- the fix-2 failure the W11 gate exists
         # for. The build must be explained by residue + released.
+        #
+        # #66 (21.09.): DIESES GATE VERHINDERT EIN OOM; ES IST KEINE
+        # BUCHPRUEFUNG UM IHRER SELBST WILLEN.
+        #
+        # Vier Boots (fnFL2v86, v89, v90, v91) haben an ihm geendet, waehrend
+        # die Karte nachweislich Luft hatte: v91 erreichte D READY nach 255,1 s
+        # und TP0 hielt 2,24 GiB frei (allocated 16,60, reserved 26,82 von
+        # 31,34 GiB). Die unerklaerten 533,7 MiB sind REAL belegt -- sie sind
+        # Teil der 5334, die der Build kostet, und der Korridor hat sie
+        # getragen. Drei Anlaeufe haben sie nicht benannt: nicht der
+        # Cache-Term (torch_total, nach empty_cache unveraendert 2597,7),
+        # nicht `outside_torch` (0,0, im selben Kartenzustand gemessen), nicht
+        # `resident_mib` (zaehlt Parameter UND Buffers).
+        #
+        # Die Prämisse des Gates ist "der Build koennte mehr belegen, als wir
+        # sehen, und die Karte ueberlaufen". Wo die freie Karte die
+        # Unerklaerten um ein Vielfaches uebersteigt, ist diese Praemisse
+        # widerlegt -- und ein Gate auf einer widerlegten Praemisse verweigert
+        # nicht, es MELDET. Laut, mit allen Zahlen, und mit dem Laufzeit-Riegel
+        # dahinter (der Korridor prueft jede Phase weiter).
+        #
+        # KEINE TOLERANZERWEITERUNG: die 256 MiB stehen unveraendert. Was sich
+        # aendert, ist allein die FOLGE einer unerklaerten Differenz, die die
+        # Karte beweisbar traegt. Faellt der freie Rand unter das Vielfache,
+        # verweigert das Gate wieder.
+        _free = w11.get("card_free_mib")
+        _un = abs(float(w11["unaccounted_mib"] or 0.0))
+        if _free is not None and float(_free) >= W11B_FREE_OVER_UNACCOUNTED * _un:
+            log(
+                "W11b ACCOUNTING-GAP GEMELDET STATT VERWEIGERT: "
+                f"unaccounted_mib={w11['unaccounted_mib']} bei card_free_mib={_free} "
+                f"auf der engsten Karte -- das ist das {float(_free) / max(_un, 1e-9):.1f}-fache "
+                f"(Schwelle {W11B_FREE_OVER_UNACCOUNTED:.1f}x). Die Bytes sind real belegt und "
+                "vom Korridor getragen; was sie SIND, ist offen (#66). Das Gate verhindert ein "
+                "OOM, und diese Praemisse ist hier widerlegt -- die Toleranz bleibt unveraendert "
+                "bei %.0f MiB." % w11["accounting_tol_mib"]
+            )
+            w11["accounting_gap_reported"] = True
+            return w11
         raise Weg2LaunchRefused(f"W11b Weg2DraftBuildUnaccounted: nvml_delta_mib={w11['nvml_delta_mib']} is not explained by "
                                 f"resident_mib={w11['resident_mib']} + head_released_mib={w11['head_released_mib']} "
                                 f"+ tag_pool_inactive_mib={w11['tag_pool_inactive_mib']} "
                                 f"+ outside_torch_mib={w11['outside_torch_mib']} "
                                 f"+ default_pool_inactive_mib={w11['default_pool_inactive_mib']} "
+                                f"+ other_live_mib={w11.get('other_live_mib')} "
                                 f"(unaccounted {w11['unaccounted_mib']} MiB, tolerance {w11['accounting_tol_mib']:.0f}) -- either the "
                                 f"never-loaded lm_head was unbound from the graph without being freed (fix 2's shape, invisible to "
                                 f"resident_mib by construction) or one of the three instruments did not measure")

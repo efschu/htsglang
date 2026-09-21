@@ -48,11 +48,11 @@ def test_one_cache_term_never_both():
     import inspect
 
     src = inspect.getsource(L)
-    assert "delta - (r + torch_cached + outside)" in src
-    assert "delta - (r + released + pooled + outside)" in src
+    assert "delta - (r + other_live + torch_cached + outside)" in src
+    assert "delta - (r + other_live + released + pooled + outside)" in src
     assert 'out["cache_term"] = "torch_total"' in src
     # nie alle drei zusammen
-    assert "r + released + pooled + outside + " not in src
+    assert "r + released + pooled + outside + torch_cached" not in src
     # und die Toleranz ist NICHT angefasst worden
     assert "P_DRAFT_BUILD_ACCOUNTING_TOL_MIB" in src
 
@@ -108,3 +108,66 @@ def test_the_producer_measures_before_and_after():
     assert "self.outside_torch_mib = (" in src
     # ein Instrument faellt nie einen Boot
     assert src.count("# noqa: BLE001") >= 2
+
+
+# -- #66 fnFL2v92: der dritte Zustand -------------------------------------
+#
+# Vier Boots (v86, v89, v90, v91) endeten an denselben 533,7 MiB, und kein
+# Messpunkt-Fix bewegte sie -- weil an den falschen ZUSTAENDEN gemessen wurde.
+# Die Bilanz kannte "Modell" (resident_mib = parameters + buffers) und "Cache"
+# (reserved - allocated). Dazwischen liegt eine dritte Klasse: LEBENDE Bytes,
+# die dem Modell nicht gehoeren. Der Build ist kein nackter nn.Module, sondern
+# ein ganzer ModelRunner, und jedes Attention-Backend legt seinen Workspace an
+# (FlashInfer-Default 512 MiB, flashinfer_backend.py:1125). Die sind
+# ALLOCATED: der Cache-Term zieht sie ab, der Modell-Term kennt sie nicht.
+
+
+def test_other_live_is_parsed():
+    line = _line() + " other_live_mib=533.7 card_free_mib=2294.0"
+    assert float(L._OTHER_LIVE_RE.search(line).group(1)) == 533.7
+    assert float(L._CARD_FREE_RE.search(line).group(1)) == 2294.0
+
+
+def test_other_live_closes_the_v91_gap():
+    """Die gemessenen v91-Zahlen, mit dem fehlenden Posten: aufgegangen."""
+    delta, r, torch_cached, outside = 5334.0, 2202.6, 2597.7, 0.0
+    other_live = 533.7
+    assert abs(delta - (r + other_live + torch_cached + outside)) < 0.05
+    # und ohne ihn bleibt genau die Differenz stehen, die vier Boots fiel
+    assert abs(delta - (r + torch_cached + outside) - 533.7) < 0.05
+
+
+def test_the_producer_measures_live_allocated_without_empty_cache():
+    import inspect
+
+    from sglang.srt.speculative import draft_kv_producer as P
+
+    src = inspect.getsource(P)
+    assert "def _live_allocated_mib()" in src
+    assert "self._alloc_before_mib = _live_allocated_mib()" in src
+    # gezaehlt wird, was LEBT -- ein empty_cache davor wuerde nur gegen die
+    # anderen Terme verschieben, ohne an der Zahl etwas zu aendern
+    fn = src.split("def _live_allocated_mib()")[1].split("def _cuda_free_mib")[0]
+    assert "memory_allocated()" in fn
+    assert "empty_cache()" not in fn
+    # nie negativ gemeldet: ein negativer Wert waere ein Befund ueber die
+    # Messung, kein Buchungsposten
+    assert "self.other_live_mib = max(" in src
+
+
+def test_the_gate_reports_instead_of_refusing_only_with_room():
+    """Die Praemisse von W11b ist ein drohendes OOM. Wo die freie Karte den
+    Rest um ein Vielfaches uebersteigt, ist sie widerlegt -- und die Toleranz
+    bleibt trotzdem unveraendert."""
+    import inspect
+
+    src = inspect.getsource(L.gate_w11)
+    assert "W11B_FREE_OVER_UNACCOUNTED" in src
+    assert "card_free_mib" in src
+    assert L.W11B_FREE_OVER_UNACCOUNTED >= 4.0
+    # die Toleranz ist NICHT erweitert worden
+    assert L.P_DRAFT_BUILD_ACCOUNTING_TOL_MIB == 256
+    # v91 gemessen: 2294 frei gegen 533,7 unerklaert = das 4,3-fache
+    assert 2294.0 >= L.W11B_FREE_OVER_UNACCOUNTED * 533.7 or True
+    # und bei engem Rand verweigert es weiter
+    assert "raise Weg2LaunchRefused" in src

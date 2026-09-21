@@ -63,5 +63,8 @@ def test_w11b_counts_the_tag_pool_cache_as_a_named_term():
     assert "return -1.0" in body
 
     lau = inspect.getsource(launcher.check_draft_resident)
-    assert "r + released + pooled" in lau
+    # #66 fnFL2v92: der Posten `other_live` steht seither VOR den beiden
+    # (lebende Nicht-Modell-Bytes, Attention-Workspace voran); der
+    # Cache-Term selbst ist unveraendert.
+    assert "r + other_live + released + pooled" in lau
     assert "float(pooled) < 0 else float(pooled)" in lau
