@@ -7231,6 +7231,82 @@ def d_moe_residency(env_d: str, tp_size: int):
     )
 
 
+#: Prefix of the one line that says where group D's capacity model got its
+#: numbers.  It rides in the refusal list because that is what
+#: ``d_operating_point_line`` prints, but it is PROVENANCE, never a refusal:
+#: ``d_tp_ratio_decision`` filters it out of the fatal set explicitly, so a
+#: note whose text happens to contain an objective name can never kill a
+#: launch the way a real W61/W63 does.
+ANCHOR_NOTE_PREFIX = "W65 Weg2MeasuredAnchor: "
+
+
+def _d_measured_anchor(
+    cards: Sequence[Card],
+    budgets: Sequence[int],
+    model: str,
+    maxkv_weights: Sequence[int],
+    user_reserve_by_card: Optional[Dict[str, int]],
+    injected: Optional[object],
+    evidence_dirs: Sequence[str],
+) -> Tuple[Optional[object], str]:
+    """Group D's measured anchor, or a NAMED reason there is none.
+
+    Returns ``(anchor_or_None, note)``; the note always goes to the log, so a
+    boot that plans unanchored says so in one line instead of looking
+    identical to a boot that planned on a measurement.
+
+    Two inputs are the caller's own configuration and are never invented
+    here.  ``ranks_on_gpu`` is counted off the rank->card map this launcher is
+    building (two ranks on one uuid = 2).  ``required_free_bytes`` is the
+    ``--user-reserve-mib`` this boot ships; without it the anchor is REFUSED
+    rather than anchored against an assumed zero reserve, because a zero that
+    was never configured reads exactly like one that was.
+    """
+    if injected is not None:
+        return injected, ANCHOR_NOTE_PREFIX + getattr(
+            injected, "provenance", "injected anchor"
+        )
+    if user_reserve_by_card is None:
+        return None, (
+            ANCHOR_NOTE_PREFIX
+            + "no anchor: --user-reserve-mib was not handed to the operating"
+            " point pass, so the reserve the runtime subtracts is unknown."
+            " The heuristic path stands; it is not anchored against an"
+            " assumed zero."
+        )
+    try:
+        from sglang.srt.planner.measured_anchor import (
+            MeasuredAnchorRefused,
+            read_measured_anchor,
+        )
+
+        uuids = [getattr(c, "uuid", None) for c in cards]
+        on_gpu = [uuids.count(u) if u is not None else 1 for u in uuids]
+        reserve_b = [
+            int(user_reserve_by_card.get(u, 0)) << 20 for u in uuids
+        ]
+        anchor = read_measured_anchor(
+            # Group D is pp=1, tp=len(budgets), so the census tag's TP
+            # ordinal is this group's rank. Derived from the geometry this
+            # function is called with, not wired in: a group whose ranks are
+            # pipeline stages would name "pp" here.
+            group="D",
+            tp_size=len(budgets),
+            rank_axis="tp",
+            ranks_on_gpu=on_gpu,
+            required_free_bytes=reserve_b,
+            mlp_vector=list(maxkv_weights),
+            budgets_mib=list(budgets),
+            model_path=model,
+            evidence_dirs=tuple(evidence_dirs),
+        )
+    except Exception as exc:  # noqa: BLE001 - an anchor never kills a launch
+        return None, ANCHOR_NOTE_PREFIX + (
+            "no anchor, heuristic path stands: %s" % exc
+        )
+    return anchor, ANCHOR_NOTE_PREFIX + anchor.provenance
+
+
 def d_operating_point_rows(
     cards: Sequence[Card],
     budgets: Sequence[int],
@@ -7239,6 +7315,10 @@ def d_operating_point_rows(
     facts: Sequence[EarlyReadFact] = EARLY_READ_FACTS,
     moe_resident_fraction: Optional[Sequence[float]] = None,
     moe_scratch_slots: Optional[Sequence[int]] = None,
+    user_reserve_by_card: Optional[Dict[str, int]] = None,
+    measured_anchor: Optional[object] = None,
+    anchor_evidence_dirs: Sequence[str] = (EVIDENCE_DIR,),
+    provenance_out: Optional[List[str]] = None,
 ) -> Tuple[List[DOperatingPointRow], List[str]]:
     """Price the three D weight vectors side by side. Returns (rows, refusals).
 
@@ -7261,8 +7341,30 @@ def d_operating_point_rows(
     pcm = None
     plan = None
     try:
+        from sglang.srt.planner.measured_anchor import (
+            anchor_has_uniform_kv_cell,
+        )
         from sglang.srt.uneven_perf import PerfCostModel
 
+        # BEFORE the checkpoint is read: where the capacity numbers come from
+        # is a fact about this boot's evidence, not about whether the model
+        # config happens to parse, so the provenance line must survive a W61.
+        anchor, anchor_note = _d_measured_anchor(
+            cards,
+            budgets,
+            model,
+            maxkv_weights,
+            user_reserve_by_card,
+            measured_anchor,
+            anchor_evidence_dirs,
+        )
+        # The note is PROVENANCE, not a refusal, and it deliberately does not
+        # ride in ``refusals``: that list is a contract -- its exact contents
+        # decide which positions are fatal (``d_tp_ratio_decision``) and six
+        # existing cases assert on it. A caller that wants the line passes a
+        # sink; one that does not is byte-identical to before.
+        if provenance_out is not None:
+            provenance_out.append(anchor_note)
         plan = d_plan_inputs(model, len(budgets), d_bs)
         pcm = PerfCostModel(
             plan,
@@ -7270,6 +7372,10 @@ def d_operating_point_rows(
             list(budgets),
             moe_resident_fraction=moe_resident_fraction,
             moe_scratch_slots=moe_scratch_slots,
+            measured=(list(anchor.components) if anchor is not None else None),
+            measured_mlp_vector=(
+                list(anchor.mlp_vector) if anchor is not None else None
+            ),
         )
     except Exception as exc:  # pragma: no cover - geometry is diagnostic
         refusals.append(
@@ -7620,11 +7726,32 @@ def d_operating_point_rows(
             # Without an anchor the RUNTIME's own derivation stands, which is
             # what carried 262144 tokens on this form (fnFL2v72). The gate
             # still sees the offload; only the vector waits for #48.
+            # #48 MEASURED 2026-09-21, and the reason this guard grew a second
+            # clause instead of opening: anchoring the model (see
+            # planner/measured_anchor.py) makes `measured is not None` TRUE on
+            # this form, and the vector it then derives is still wrong here.
+            # Against fnFL2v72's own posts the anchored model answers
+            # token_vector [19,21,24] and a funded context of 1016030 tokens,
+            # i.e. it spreads KV across ranks 1 and 2 -- which own NO attention
+            # heads under `--rank-tp-ratio 1,0,0` and sized their pools at a
+            # 768-byte placeholder cell against rank 0's 14143. Their
+            # `available_bytes` is therefore not "bytes fundable for group KV",
+            # and re-priced at the group cell it reads as ~340k phantom tokens
+            # per rank. Shipping that is the fnFL2v84/v85 failure in a new
+            # costume.
+            #
+            # So the readback additionally requires that every rank sized its
+            # pool at the SAME cell -- the one condition under which an
+            # anchored per-rank budget means the same thing on every rank. On
+            # a uniform-cell form it opens by itself; on this one the runtime's
+            # own derivation keeps carrying the vector, which is what ran
+            # 262144 tokens on fnFL2v72.
             if (
                 position == "maxkv"
                 and axis == "token"
                 and cap.get("token_vector")
                 and getattr(pcm, "measured", None) is not None
+                and anchor_has_uniform_kv_cell(getattr(pcm, "measured", None))
             ):
                 token_units = tuple(int(v) for v in cap["token_vector"])
         except Exception:
@@ -7875,6 +8002,7 @@ def d_tp_ratio_decision(
     model: str,
     d_bs: int,
     env_d: str = "",
+    user_reserve_by_card: Optional[Dict[str, int]] = None,
 ) -> DTpRatioDecision:
     """Choose group D's weight objective and PRICE the choice on one line.
 
@@ -7937,11 +8065,18 @@ def d_tp_ratio_decision(
     # the point of the line is that the trade is visible per boot. Refusals
     # only KILL the launch when the refused position is the one being shipped.
     _moe_frac, _moe_scratch = d_moe_residency(env_d, len(budgets))
+    _anchor_notes: List[str] = []
     op_rows, op_refusals = d_operating_point_rows(
         cards, budgets, model, d_bs,
         moe_resident_fraction=_moe_frac, moe_scratch_slots=_moe_scratch,
+        user_reserve_by_card=user_reserve_by_card,
+        provenance_out=_anchor_notes,
     )
     op_line = d_operating_point_line(op_rows, op_refusals, objective)
+    # Where group D's capacity numbers came from, on every boot -- an
+    # unanchored boot must not look identical to an anchored one.
+    for _note in _anchor_notes:
+        op_line = op_line + "\n  " + _note
     if objective in D_OPERATING_POINTS:
         mine = [
             r
@@ -12375,6 +12510,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         d_ratio = d_tp_ratio_decision(
             ns.d_tp_objective, ns.d_rank_perf_tune, cards, budgets_d, ns.model,
             d_bs, getattr(ns, "env_d", "") or "",
+            user_reserve_by_card=user_reserve_by_card,
         )
         log(d_ratio.line)
         log(d_ratio.op_line)
@@ -12475,6 +12611,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     d_ratio = d_tp_ratio_decision(
         ns.d_tp_objective, ns.d_rank_perf_tune, cards, budgets_d, ns.model,
         d_bs, getattr(ns, "env_d", "") or "",
+        user_reserve_by_card=user_reserve_by_card,
     )
     log(d_ratio.line)
     log(d_ratio.op_line)
