@@ -1192,6 +1192,15 @@ class FusedMoE(torch.nn.Module):
             return False
 
         key = (expert_id, shard_id)
+        # #68: DIE EINE STELLE, DIE DEN TENSOR FESTHAELT statt ihn zu
+        # kopieren. Seit die CT-WNA16-Transposition ihr `.contiguous()`
+        # weglaesst (eine Kopie statt zwei, siehe `_weight_loader_impl`), kann
+        # `loaded_weight` hier strided ankommen -- und was in diese beiden
+        # Dicts wandert, wird spaeter quantisiert und als GEWICHT gehalten,
+        # nicht bloss durch ein `copy_` gereicht. Also hier materialisieren,
+        # wo es um genau diese Tensoren geht, statt auf dem ganzen Pfad.
+        if not loaded_weight.is_contiguous():
+            loaded_weight = loaded_weight.contiguous()
         if is_weight:
             fp8_weight = loaded_weight
             fp8_scale = self._pending_fp8_shared_scales.pop(key, None)
@@ -1997,9 +2006,40 @@ class FusedMoE(torch.nn.Module):
         ]
         if _needs_ct_transpose and _transpose_done_in_worker():
             _needs_ct_transpose = False
-        loaded_weight = (
-            loaded_weight.t().contiguous() if _needs_ct_transpose else loaded_weight
-        )
+        # #68: `.t()` OHNE `.contiguous()` -- EINE KOPIE STATT ZWEI.
+        #
+        # `.t()` allein kostet nichts (nur Strides). Teuer war das
+        # `.contiguous()`: es materialisiert eine volle umsortierte Kopie,
+        # bevor der Code unten den Tensor ein zweites Mal kopiert -- jeder
+        # Endpunkt dieses Pfades ist ein `copy_` bzw. ein
+        # `param_data[expert_id] = ...` (dasselbe), und ein `copy_` sortiert
+        # strided Quellen selbst um. Die Umsortierung passiert also weiterhin
+        # genau einmal, nur fusioniert in die Kopie, die ohnehin faellt.
+        #
+        # GEMESSEN (21.09., int32, die vier Shard-Formen des Checkpoints):
+        #   [2560, 80]  269,2 -> 120,2 us   2,24x
+        #   [640, 320]  189,6 ->  96,1 us   1,97x
+        #   [320, 20]     8,5 ->   6,4 us   1,33x
+        #   [80, 80]      7,6 ->   5,7 us   1,33x
+        # Ziel-Bytes byteweise identisch (torch.equal gegen die alte Form).
+        # Diese Zeile war 43 % der Ladezeit auf allen drei Raengen
+        # (fnFL2v84/v85, 222720 Shards, ~50 s je Rang).
+        #
+        # WARUM NICHT IM WORKER: das war der andere Weg (#66, 1b907bf00a) und
+        # er ist gebaut, gemessen und VERRIEGELT -- `post_load` laeuft je
+        # Datei seriell in EINEM der acht Worker und nahm der
+        # Sliding-Window-Pipeline den Vorlauf: PP2 36,7 -> 47,5 s, PP1 50,3 ->
+        # 57,0 s. Langsamer, nicht schneller. Diese Aenderung hier braucht
+        # keinen Schalter und keinen zweiten Leser: sie macht dieselbe Arbeit
+        # an derselben Stelle, nur einmal statt zweimal.
+        #
+        # SICHER, WEIL JEDER KONSUMENT KOPIERT: `narrow` ist stride-neutral,
+        # und auf dem ganzen Weg (Zeilen 900-1290) steht kein `view`,
+        # `reshape`, `data_ptr` oder `from_blob`, das Kontiguitaet
+        # voraussetzt. Die EINE Stelle, die den Tensor festhaelt statt ihn zu
+        # kopieren, ist der fp8-shared-Pfad -- der materialisiert jetzt selbst
+        # (siehe `_maybe_load_fp8_shared_expert_as_fp4`).
+        loaded_weight = loaded_weight.t() if _needs_ct_transpose else loaded_weight
 
         if shard_id not in ("w1", "w2", "w3"):
             raise ValueError(f"shard_id must be ['w1','w2','w3'] but got {shard_id}.")
