@@ -116,7 +116,24 @@ def _mtp_quant_config(quant_config):
     # present -> stays quantized) or dense (Minachist / cyankiwi
     # Qwen3.8-Flash-Next: no packed tensor under mtp. -> bf16 draft).
     if quant_config and quant_config.get_name() == "compressed-tensors":
-        if mtp_index_is_dense(getattr(get_server_args(), "model_path", None)):
+        # THE DRAFT CHECKPOINT DECIDES, not the target's (#66, 21.09.). With
+        # --speculative-draft-model-path the mtp weights come from THAT
+        # checkpoint, and the two can disagree in both directions -- measured
+        # on this rig:
+        #
+        #   Minachist (target): 1565 'mtp.' keys, ALL plain .weight (a bf16
+        #                       stump), vocab PACKED
+        #   albucino (draft):   4637 'mtp.' keys, 1536 each of weight_packed/
+        #                       _scale/_shape (INT4 g32), vocab DENSE
+        #
+        # Reading the target's index called the INT4 draft "dense" and built
+        # the whole MTP module in bf16 -- the draft head measured 5.21 GB on
+        # TP0 in fnFL2v65. The vocab is the other way round and is handled
+        # separately, where it belongs: its rows come from the target half
+        # under placement A (qwen4_exp_mtp.py, embed_quant_config).
+        _sa = get_server_args()
+        _draft_path = getattr(_sa, "speculative_draft_model_path", None)
+        if mtp_index_is_dense(_draft_path or getattr(_sa, "model_path", None)):
             logger.info(
                 "[mtp] checkpoint index carries no quantized tensor under 'mtp.'; "
                 "building the MTP draft unquantized"
