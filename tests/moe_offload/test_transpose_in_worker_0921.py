@@ -106,7 +106,13 @@ def test_the_consumer_reads_the_switch_at_the_right_place():
 
     src = inspect.getsource(fml.FusedMoE._weight_loader_impl)
     assert "_needs_ct_transpose and _transpose_done_in_worker()" in src
-    assert "loaded_weight.t().contiguous() if _needs_ct_transpose else loaded_weight" in src
+    # #68 (21.09.): der Verbraucher materialisiert nicht mehr -- `.t()` ohne
+    # `.contiguous()`, weil jeder Endpunkt dieses Pfades ohnehin kopiert und
+    # ein `copy_` strided Quellen selbst umsortiert (EINE Kopie statt zwei,
+    # 2,24x auf dem grossen Shard). Am SCHALTER aendert das nichts: liest er
+    # sich als "im Worker erledigt", laesst der Verbraucher die Transposition
+    # weiterhin ganz aus.
+    assert "loaded_weight.t() if _needs_ct_transpose else loaded_weight" in src
 
 
 def test_the_lock_comes_before_any_shape_logic(monkeypatch):
