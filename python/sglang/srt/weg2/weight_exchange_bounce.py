@@ -1733,6 +1733,25 @@ def pcie_copy_lock(pcie_uuid, pcie_direction):
                               label="collect band")
 
 
+#: #81 (fnFL2w3/w5/w7, 21.09.): DAS LANE-BUDGET MUSS VOR DEM FRONT-BOUND
+#: GREIFEN, sonst kann es nie zuerst greifen.
+#:
+#: Beide Zahlen standen auf 120,0 -- diese hier und
+#: `front.DRAIN_DEADLINE_DEFAULT_S` -- aus zwei verschiedenen Specs, ohne
+#: voneinander zu wissen. Bei Gleichstand meldet die Front ihren STALL, waehrend
+#: der Lane-Wait noch laeuft: gemessen "WEG2-FLIP STALL epoch=0 elapsed=125,2 s
+#: bound=120,0 s" in w7 und 129,2 s in w3. Der Boot stirbt dann am Stall statt
+#: an der benannten Lane-Verweigerung, die den Tensor und die Lane nennt --
+#: dreimal hintereinander war der Stall die erste Meldung und die
+#: Lane-Verweigerung nur im Traceback zu finden.
+#:
+#: 0,75 x 120 = 90 s laesst der Lane 25 % Vorlauf. Das ist kein Toleranzband
+#: fuer langsame Deposits: gemessen deponiert die Quelle einen Chunk-Tag in
+#: 643-1412 ms, also zwei Groessenordnungen darunter. Wer 90 s wartet, wartet
+#: auf etwas, das nicht kommt, und soll das SAGEN.
+SEQ_LANE_BUDGET_S = 90.0
+
+
 class CrossSlotRendezvous:
     """The empty/full handshake for ONE directed card pair, or the diagonal.
 
@@ -1775,7 +1794,8 @@ class CrossSlotRendezvous:
     """
 
     def __init__(self, sems, slots, *, pair: Optional[int] = None,
-                 card: Optional[int] = None, budget_s: float = 120.0):
+                 card: Optional[int] = None,
+                 budget_s: float = SEQ_LANE_BUDGET_S):
         if (pair is None) == (card is None):
             raise ValueError(
                 "exactly one of pair= (cross) or card= (diagonal) -- the two "
@@ -2563,7 +2583,7 @@ def run_sequential_units(descs, ops, boot_nonce: str, *,
                          #: off); True/False forces it (desk witnesses).
                          unit_digest=None,
                          liveness=None,
-                         budget_s: float = 120.0,
+                         budget_s: float = SEQ_LANE_BUDGET_S,
                          #: #1378 xsn44: the shared buffer as a bytearray.
                          #: When provided, the transport uses it directly
                          #: (bytearray slices for the copies) -- no mmap,
