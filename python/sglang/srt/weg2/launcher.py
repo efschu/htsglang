@@ -6186,6 +6186,23 @@ def choose_host_ledger(
     return arm, reap_headroom_gib, _baseline_lines + _bounce_lines + lines, cg
 
 
+#: The worker's own #706 line (cache_controller._generate_storage_config):
+#: a Form A expert worker holds no attention layer, builds no page window
+#: and rides the null storage tier -- for W7/W10 it stands in for BOTH the
+#: KV-page and the GDN-blob marker of that rank (fnFL2 v18, 21.09.: D READY
+#: with 1 host + 2 workers was refused "kv x1 blob x1, need 3 each").
+FORM_A_WORKER_CANONICAL_MARKER = "this rank is a Form A expert worker (no attention layer) -- no page window"
+
+
+def canonical_marker_counts(path: str) -> tuple:
+    """(kv, blob, workers): the #706 KV-page and GDN-blob markers of a group
+    log, each worker line counted once into both."""
+    n_kv = count_marker(path, "#706 canonical KV page active")
+    n_blob = count_marker(path, "canonical GDN blob active")
+    n_worker = count_marker(path, FORM_A_WORKER_CANONICAL_MARKER)
+    return n_kv + n_worker, n_blob + n_worker, n_worker
+
+
 def count_marker(path: str, marker: str) -> int:
     n = 0
     try:
@@ -12123,9 +12140,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "never builds either (enable_hierarchical_cache is False) -- no "
             "canonical-page/GDN-blob emitter to grade, same as group P above.")
     else:
-        n_kv = count_marker(spec_d.log, "#706 canonical KV page active")
-        n_blob = count_marker(spec_d.log, "canonical GDN blob active")
-        log(f"W7/W10 launcher half, group D log: '#706 canonical KV page active' x{n_kv}, 'canonical GDN blob active' x{n_blob}")
+        n_kv, n_blob, n_worker = canonical_marker_counts(spec_d.log)
+        log(f"W7/W10 launcher half, group D log: '#706 canonical KV page active' x{n_kv}, 'canonical GDN blob active' x{n_blob}"
+            + (f" (of which {n_worker} Form A expert worker(s): no attention layer, no page window, null storage tier -- fnFL2 v18)" if n_worker else ""))
         if n_kv < 3 or n_blob < 3:
             raise Weg2LaunchRefused(f"W7/W10 (launcher half): D logged kv x{n_kv} blob x{n_blob}, need 3 each")
     # #1233 zero-remainder (1j finding 6): W9 LAUNCH-TIME KEY-SCHEME GATE. The

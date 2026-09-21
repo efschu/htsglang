@@ -382,8 +382,8 @@ SEAMS: Dict[str, Seam] = {
             "refusal would have rejected every Form A vector as 'axis "
             "switched off'.",
             anchors=(
-                ("weg2/launcher.py", 7362, "def _saturated"),
-                ("weg2/launcher.py", 7366,
+                ("weg2/launcher.py", 7379, "def _saturated"),
+                ("weg2/launcher.py", 7383,
                  "Form A worker: not on this axis, not saturated"),
             ),
         ),

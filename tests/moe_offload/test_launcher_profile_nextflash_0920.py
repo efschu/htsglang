@@ -82,3 +82,26 @@ def test_resident_arm_sleeps_only_kv(monkeypatch):
     monkeypatch.setattr(L, "http", lambda m, url, body, timeout: sent.append(body) or (200, "{}"))
     L.sleep_group(30031, lambda *a, **k: None, "P", L.flip_weights_tags(types.SimpleNamespace(flip_weights="resident"), fam))
     assert sent == [{"tags": ["kv_cache"]}]
+
+
+def test_w7_w10_counts_form_a_workers(tmp_path):
+    """fnFL2 v18 (21.09.): D READY with one attention host and two expert
+    workers logged kv x1 blob x1; the workers' own #706 line stands in."""
+    from sglang.srt.weg2 import launcher as L
+
+    log = tmp_path / "D.log"
+    log.write_text(
+        "[TP0] #706 canonical KV page active: slots [0, 12) of 12\n"
+        "[TP0] #706 canonical GDN blob active: layers [0, 36) of 36\n"
+        "[TP1] #706 canonical KV page: this rank is a Form A expert worker (no attention layer) -- no page window, null storage tier\n"
+        "[TP2] #706 canonical KV page: this rank is a Form A expert worker (no attention layer) -- no page window, null storage tier\n"
+    )
+    assert L.canonical_marker_counts(str(log)) == (3, 3, 2)
+    log.write_text("[PP0] #706 canonical KV page active\n[PP0] canonical GDN blob active\n")
+    assert L.canonical_marker_counts(str(log)) == (1, 1, 0)
+    # the marker text is the controller's own line, byte for byte
+    from sglang.srt.managers import cache_controller as cc
+    import inspect
+
+    src = inspect.getsource(cc.HiCacheController._generate_storage_config)
+    assert "this rank is a Form A expert worker " in src and "(no attention layer) -- no page window" in src
