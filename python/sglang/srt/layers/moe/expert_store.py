@@ -54,6 +54,7 @@ __all__ = [
     "slots_for",
     "global_rows",
     "slot_rows",
+    "slot_base_for_rank",
     "write_rows",
     "mark_rows_written",
     "rows_written",
@@ -153,6 +154,45 @@ def global_rows(local_ids: Iterable[int], lo: int, pad: bool = True) -> Dict[int
         else:
             out[e] = int(lo) + e
     return out
+
+
+def slot_base_for_rank(ratios: Sequence[int],
+                       fractions: Sequence[float],
+                       rank: int) -> int:
+    """Der erste Slot, der DIESEM Rang gehoert (#72).
+
+    Der Store ist ueber Raenge UND Gruppen geteilt, also muessen zwei Raenge
+    fuer dieselbe globale Id denselben Platz errechnen -- ohne miteinander zu
+    reden. Die beiden Vektoren, die das erlauben, stehen ohnehin auf jeder
+    Kommandozeile: ``--rank-moe-ratio`` (wieviele Experten je Rang, GEMESSEN
+    60,226,226 auf diesem Rig) und ``--rank-moe-resident-fraction`` alias
+    ``SGLANG_MOE_RESIDENT_EXPERT_FRACTION``, ein EnvFloatVector, also schon
+    heute ein Wert JE RANG.
+
+    Kalt je Rang ist ``bereich - round(bereich * fraction)``; der Offset ist
+    die Summe der Kalten DAVOR. Damit ist der Slot-Raum genau so gross wie
+    das, was nie auf einer Karte liegt -- die Nutzer-Order vom 21.09.
+
+    KONSERVATIV: fehlt ein Eintrag oder ist er unlesbar, gilt fraction 0.0
+    fuer diesen Rang, also die volle Bereichsgroesse als kalt. Zu viel Platz
+    kostet Host-RAM; zu wenig kollidiert, und Kollision ist Datenverlust.
+    """
+    base = 0
+    for r in range(int(rank)):
+        try:
+            span = int(ratios[r])
+        except (IndexError, TypeError, ValueError):
+            continue
+        if span <= 0:
+            continue
+        try:
+            f = float(fractions[r])
+        except (IndexError, TypeError, ValueError):
+            f = 0.0
+        if not (0.0 <= f <= 1.0):
+            f = 0.0
+        base += span - int(round(span * f))
+    return int(base)
 
 
 def slot_rows(local_ids: Iterable[int], lo: int, pad: bool = True,

@@ -153,3 +153,38 @@ def test_the_pad_convention_survives():
     got = es.slot_rows([0, 1, 2], lo=0, pad=True,
                        resident_ids=set(), num_experts=4)
     assert 0 not in got and got == {1: 0, 2: 1}
+
+
+def test_slot_base_matches_the_rigs_own_vectors():
+    """Die Rechnung mit den Zahlen dieses Rigs: --rank-moe-ratio 60,226,226
+    (gemessen in fnFL2w7s Kommandozeile) bei 59 % Residenz."""
+    R, F = [60, 226, 226], [0.59, 0.59, 0.59]
+    assert es.slot_base_for_rank(R, F, 0) == 0
+    assert es.slot_base_for_rank(R, F, 1) == 25      # 60 - round(60*0.59)
+    assert es.slot_base_for_rank(R, F, 2) == 25 + 93
+    total = sum(s - round(s * f) for s, f in zip(R, F))
+    assert total == 211 and round(100 * total / sum(R)) == 41
+
+
+def test_the_bases_never_overlap():
+    """Der Kern: zwei Raenge duerfen sich nie einen Platz teilen. Die Basis
+    des naechsten Rangs muss hinter allen Plaetzen der vorigen liegen."""
+    R, F = [60, 226, 226], [0.59, 0.30, 0.90]
+    for r in range(len(R) - 1):
+        cold_r = R[r] - round(R[r] * F[r])
+        assert (es.slot_base_for_rank(R, F, r) + cold_r
+                == es.slot_base_for_rank(R, F, r + 1))
+
+
+def test_a_missing_fraction_reserves_the_whole_span():
+    """KONSERVATIV: fehlt der Eintrag, gilt fraction 0 -- voller Bereich als
+    kalt. Zu viel Platz kostet Host-RAM; zu wenig kollidiert, und Kollision
+    ist Datenverlust."""
+    assert es.slot_base_for_rank([60, 226, 226], [], 2) == 286
+    assert es.slot_base_for_rank([60, 226, 226], [1.0, "quatsch"], 2) == 226
+
+
+def test_full_residency_needs_no_slots_at_all():
+    """Liegt alles auf den Karten, braucht der Store keinen Platz -- die
+    Nutzer-Order in ihrem Grenzfall."""
+    assert es.slot_base_for_rank([60, 226, 226], [1.0, 1.0, 1.0], 2) == 0
