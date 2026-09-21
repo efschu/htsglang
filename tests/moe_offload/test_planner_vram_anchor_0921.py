@@ -294,6 +294,55 @@ def test_a_missing_evidence_dir_is_a_note_not_a_crash():
     assert note.startswith(launcher.ANCHOR_NOTE_PREFIX)
 
 
+def test_an_incomplete_newest_log_does_not_shadow_an_older_complete_one(tmp_path):
+    """Measured: the newest group-D log of this form (fnFL2v92) states 0 of
+    15 posts because it died before the weights loaded, while v89 two boots
+    earlier states all of them.  Refusing outright at the newest candidate
+    throws away a good measurement because a later attempt crashed.
+    """
+    from sglang.srt.planner.measured_anchor import read_measured_anchor
+
+    argv = (
+        "argv: --rank-gpu-memory-mib 29560,18512,18488 "
+        "model_path='/ckpt/form-a'\n"
+    )
+    newest = tmp_path / "boot_weg2_vNEW_dead_0921_150000.D.log"
+    newest.write_text(argv + "[2026-09-21 15:00:00 TP0] crashed before load\n")
+    older = tmp_path / "boot_weg2_vOLD_good_0921_140000.D.log"
+    older.write_text(argv + EXCERPT)
+    os.utime(older, (1_000_000, 1_000_000))
+    os.utime(newest, (2_000_000, 2_000_000))
+
+    anchor = read_measured_anchor(
+        group="D", tp_size=3, rank_axis="tp", ranks_on_gpu=[1, 1, 1],
+        required_free_bytes=[0, 0, 0], mlp_vector=[1, 1, 1],
+        budgets_mib=[29560, 18512, 18488], model_path="/ckpt/form-a",
+        evidence_dirs=(str(tmp_path),),
+    )
+    assert anchor.boot_tag == "vOLD"
+    assert "vOLD" in anchor.provenance
+
+
+def test_a_log_of_another_form_is_rejected_by_name(tmp_path):
+    from sglang.srt.planner.measured_anchor import (
+        MeasuredAnchorRefused,
+        read_measured_anchor,
+    )
+
+    other = tmp_path / "boot_weg2_vX_0921_140000.D.log"
+    other.write_text(
+        "argv: --rank-gpu-memory-mib 1,2,3 model_path='/ckpt/other'\n" + EXCERPT
+    )
+    with pytest.raises(MeasuredAnchorRefused) as exc:
+        read_measured_anchor(
+            group="D", tp_size=3, rank_axis="tp", ranks_on_gpu=[1, 1, 1],
+            required_free_bytes=[0, 0, 0], mlp_vector=[1, 1, 1],
+            budgets_mib=[29560, 18512, 18488], model_path="/ckpt/form-a",
+            evidence_dirs=(str(tmp_path),),
+        )
+    assert "different model" in str(exc.value)
+
+
 def test_provenance_never_enters_the_refusal_contract():
     """``refusals`` decides what is FATAL; provenance must not ride in it."""
     from sglang.srt.weg2 import launcher

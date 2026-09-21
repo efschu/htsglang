@@ -429,13 +429,26 @@ def read_measured_anchor(
             )
             continue
         posts = parse_boot_log_posts(text, rank_axis=rank_axis)
-        components = build_components(
-            posts,
-            tp_size=tp_size,
-            ranks_on_gpu=ranks_on_gpu,
-            required_free_bytes=required_free_bytes,
-            source=os.path.basename(path),
-        )
+        try:
+            components = build_components(
+                posts,
+                tp_size=tp_size,
+                ranks_on_gpu=ranks_on_gpu,
+                required_free_bytes=required_free_bytes,
+                source=os.path.basename(path),
+            )
+        except MeasuredAnchorRefused as exc:
+            # An INCOMPLETE newest log must not shadow an older complete one.
+            # Measured 2026-09-21: the newest group-D log of this form,
+            # fnFL2v92, states 0 of 15 posts -- it died before the weights
+            # were loaded -- while v89 two boots earlier states all of them.
+            # Refusing outright there would have thrown away a good
+            # measurement because a later attempt crashed early. The form
+            # checks above still gate every candidate, and the provenance
+            # names which log won and how old it is, so falling through is
+            # not "keep looking until something fits".
+            rejected.append("%s: %s" % (os.path.basename(path), exc))
+            continue
         age = (now if now is not None else time.time()) - os.path.getmtime(path)
         tag = _boot_tag(path)
         prov = (
