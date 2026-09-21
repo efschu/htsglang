@@ -2730,7 +2730,18 @@ def release_active_tag_pools(reason: str = "") -> int:
     device_index = torch.cuda.current_device()
     n = 0
     for tag, pool in list(_TAG_MEM_POOLS.items()):
+        # THE ACTIVE POOL MUST NOT BE RELEASED (fnFL2 v50, the first cut of
+        # this function): ``_cuda_releasePool`` asserts ``use_count == 0``
+        # internally and PP2 died on
+        # ``it->second->use_count == 0 INTERNAL ASSERT FAILED``
+        # (CUDACachingAllocator.cpp:3473) the moment it reached the pool of
+        # the layer being loaded.  ``MemPool.use_count()`` is the question
+        # the allocator itself asks, so ask it here rather than track which
+        # scope is open: the CURRENT layer's transient is simply released one
+        # layer later, when its own scope has closed.
         try:
+            if int(pool.use_count()) != 0:
+                continue
             _cuda_releasePool(device_index, pool.id)
             n += 1
         except Exception as exc:  # noqa: BLE001

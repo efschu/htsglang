@@ -33,8 +33,8 @@ class ReleaseActiveTagPools(unittest.TestCase):
             self.assertEqual(MS.release_active_tag_pools(), 0)
 
     def test_every_pool_is_released_and_the_cache_emptied_after(self):
-        MS._TAG_MEM_POOLS["weights_0"] = mock.Mock(id=(0, 1))
-        MS._TAG_MEM_POOLS["weights_1"] = mock.Mock(id=(0, 2))
+        MS._TAG_MEM_POOLS["weights_0"] = mock.Mock(id=(0, 1), use_count=lambda: 0)
+        MS._TAG_MEM_POOLS["weights_1"] = mock.Mock(id=(0, 2), use_count=lambda: 0)
         calls = []
         with mock.patch("torch.cuda.is_available", return_value=True), \
              mock.patch("torch.cuda.current_device", return_value=0), \
@@ -48,8 +48,8 @@ class ReleaseActiveTagPools(unittest.TestCase):
         self.assertEqual({c[2] for c in calls if c[0] == "release"}, {(0, 1), (0, 2)})
 
     def test_one_failing_pool_is_named_and_does_not_stop_the_others(self):
-        MS._TAG_MEM_POOLS["bad"] = mock.Mock(id=(0, 1))
-        MS._TAG_MEM_POOLS["good"] = mock.Mock(id=(0, 2))
+        MS._TAG_MEM_POOLS["bad"] = mock.Mock(id=(0, 1), use_count=lambda: 0)
+        MS._TAG_MEM_POOLS["good"] = mock.Mock(id=(0, 2), use_count=lambda: 0)
 
         def _rp(d, i):
             if i == (0, 1):
@@ -81,3 +81,32 @@ class ThePresplitPathCallsIt(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TheActivePoolIsSkipped(unittest.TestCase):
+    """fnFL2 v50: the first cut released every pool and PP2 died on
+    ``it->second->use_count == 0 INTERNAL ASSERT FAILED``
+    (CUDACachingAllocator.cpp:3473) at the pool of the layer being loaded.
+    ``MemPool.use_count()`` is the allocator's own question; the current
+    layer's transient is released one layer later instead."""
+
+    def setUp(self):
+        self._saved = dict(MS._TAG_MEM_POOLS)
+        MS._TAG_MEM_POOLS.clear()
+
+    def tearDown(self):
+        MS._TAG_MEM_POOLS.clear()
+        MS._TAG_MEM_POOLS.update(self._saved)
+
+    def test_a_pool_in_use_is_left_alone(self):
+        MS._TAG_MEM_POOLS["idle"] = mock.Mock(id=(0, 1), use_count=lambda: 0)
+        MS._TAG_MEM_POOLS["active"] = mock.Mock(id=(0, 2), use_count=lambda: 1)
+        released = []
+        with mock.patch("torch.cuda.is_available", return_value=True), \
+             mock.patch("torch.cuda.current_device", return_value=0), \
+             mock.patch("torch.cuda.memory._cuda_releasePool",
+                        side_effect=lambda d, i: released.append(i)), \
+             mock.patch("torch.cuda.empty_cache"):
+            n = MS.release_active_tag_pools()
+        self.assertEqual(n, 1)
+        self.assertEqual(released, [(0, 1)])
