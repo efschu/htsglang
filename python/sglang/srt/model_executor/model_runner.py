@@ -2834,6 +2834,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 self.model,
                 rank=self.tp_rank if self.pp_size == 1 else self.pp_rank,
                 device=self.gpu_id,
+                role="draft" if self.is_draft_worker else "main",
             )
         except Exception as exc:  # noqa: BLE001 -- a census never kills a boot
             logger.info("WEG2-UNION census skipped: %s", exc)

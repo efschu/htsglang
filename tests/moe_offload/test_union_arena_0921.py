@@ -196,8 +196,9 @@ def test_the_census_separates_shareable_from_colliding(tmp_path):
     assert census.shareable_bytes == 64 * 8 * 4
     assert census.colliding == ("attn.o",)
     assert census.colliding_bytes == 8 * 8 * 4
-    assert census.incompatible == ()
+    assert census.incompatible == () and census.incompatible_bytes == 0
     assert census.saved_bytes == census.shareable_bytes
+    assert dict(census.private_bytes)["P"] == 4 * 4  # p.only
     own = dict(census.own_bytes)
     assert census.union_bytes == own["P"] + own["D"] - census.shareable_bytes
     line = census.line()
@@ -211,6 +212,9 @@ def test_a_shape_difference_is_incompatible_not_colliding(tmp_path):
     _side(tmp_path, ua.PHASE_D, d_named, card="GPU-shape")
     census = ua.join_sides(str(tmp_path), "GPU-shape")
     assert census.incompatible == ("w",) and census.shareable == ()
+    assert census.incompatible_bytes == 4 * 5 * 4  # the larger of the two
+    name, nbytes, p_shape, d_shape = census.top_incompatible[0]
+    assert name == "w" and p_shape == "float32(4, 4)" and d_shape == "float32(4, 5)"
 
 
 def test_a_missing_side_is_a_named_refusal(tmp_path):
@@ -234,6 +238,35 @@ def test_a_side_without_checksums_is_never_read_as_identical(tmp_path):
         )
     census = ua.join_sides(str(tmp_path), "GPU-nosum")
     assert census.shareable == () and census.incompatible == ("w",)
+
+
+def test_a_draft_worker_does_not_overwrite_the_main_model_side(tmp_path):
+    """fnFL2 v29: the draft worker is a second rank of the same phase on the
+    same card; keyed without the role it overwrote the main model's side and
+    the census compared P's model against D's DRAFT."""
+    main = {"w": torch.randn(4, 4)}
+    draft = {"d": torch.randn(2, 2)}
+    ua.publish_side(str(tmp_path), tag="t", card="GPU-role", phase=ua.PHASE_D,
+                    rank=0, named=main, role="main")
+    ua.publish_side(str(tmp_path), tag="t", card="GPU-role", phase=ua.PHASE_D,
+                    rank=0, named=draft, role="draft")
+    ua.publish_side(str(tmp_path), tag="t", card="GPU-role", phase=ua.PHASE_P,
+                    rank=0, named=main, role="main")
+    census = ua.join_sides(str(tmp_path), "GPU-role", role="main")
+    assert census.shareable == ("w",)
+
+
+def test_meta_tensors_are_skipped_not_checksummed(tmp_path):
+    """A Form A worker holds the draft model as meta; uint8_checksum raises
+    on meta, and the census must survive that rather than skip the boot."""
+    named = {"real": torch.randn(4), "ghost": torch.empty(8, device="meta")}
+    path = ua.publish_side(str(tmp_path), tag="t", card="GPU-meta",
+                           phase=ua.PHASE_P, rank=0, named=named)
+    import json as _json
+
+    side = _json.load(open(path))
+    assert side["skipped_meta"] == 1
+    assert [t["name"] for t in side["tensors"]] == ["real"]
 
 
 def test_the_census_hook_is_off_without_its_env(monkeypatch):

@@ -439,8 +439,16 @@ def _covered(manifest: UnionManifest, name: str) -> bool:
 UNION_DIR_ENV = "SGLANG_WEG2_UNION_DIR"
 
 
-def side_path(union_dir: str, card: str, phase: str) -> str:
-    return os.path.join(union_dir, f"side-{card[-12:]}-{phase}.json")
+def side_path(union_dir: str, card: str, phase: str, role: str = "main") -> str:
+    """One side file per (card, phase, ROLE).
+
+    ROLE is not decoration: the draft worker (MTP) is a second rank of the
+    SAME phase on the SAME card, and keying without it made the draft's side
+    overwrite the main model's -- boot fnFL2 v29 logged a census of P's main
+    model against D's DRAFT (own D=3.86 GiB, shareable 0.00) and it looked
+    like a finding instead of a collision of file names.
+    """
+    return os.path.join(union_dir, f"side-{card[-12:]}-{phase}-{role}.json")
 
 
 def publish_side(
@@ -452,9 +460,19 @@ def publish_side(
     rank: int,
     named: Mapping[str, torch.Tensor],
     with_checksums: bool = True,
+    role: str = "main",
 ) -> str:
-    """Write this rank's half of the join. Returns the path written."""
+    """Write this rank's half of the join. Returns the path written.
+
+    META tensors are skipped rather than checksummed: a Form A worker holds
+    the draft model as meta (it has no draft), and ``uint8_checksum`` on meta
+    raises. They are reported in the side's ``skipped_meta`` count so an empty
+    side is never read as "this rank holds nothing".
+    """
     os.makedirs(union_dir, exist_ok=True)
+    real = {n: t for n, t in named.items() if not t.is_meta}
+    skipped_meta = len(named) - len(real)
+    named = real
     sums = checksums_for(named) if with_checksums else {}
     body = {
         "version": MANIFEST_VERSION,
@@ -463,6 +481,8 @@ def publish_side(
         "phase": phase,
         "rank": int(rank),
         "pid": os.getpid(),
+        "role": role,
+        "skipped_meta": skipped_meta,
         "tensors": [
             {
                 "name": name,
@@ -475,7 +495,7 @@ def publish_side(
             for name, t in sorted(named.items())
         ],
     }
-    path = side_path(union_dir, card, phase)
+    path = side_path(union_dir, card, phase, role)
     tmp = f"{path}.{os.getpid()}.tmp"
     with open(tmp, "w") as fh:
         json.dump(body, fh)
@@ -495,9 +515,13 @@ class UnionCensus:
     colliding_bytes: int
     #: same name, different shape/stride/dtype
     incompatible: Tuple[str, ...]
+    incompatible_bytes: int
     private: Tuple[Tuple[str, int], ...]  # (phase, count)
+    private_bytes: Tuple[Tuple[str, int], ...]  # (phase, bytes)
     own_bytes: Tuple[Tuple[str, int], ...]  # (phase, bytes)
     union_bytes: int
+    #: the largest tensors that could NOT be shared, with both sides' shapes
+    top_incompatible: Tuple[Tuple[str, int, str, str], ...] = ()
 
     @property
     def saved_bytes(self) -> int:
@@ -505,14 +529,18 @@ class UnionCensus:
 
     def line(self) -> str:
         own = " ".join(f"{p}={b / 2**30:.2f}" for p, b in self.own_bytes)
-        priv = " ".join(f"{p}={n}" for p, n in self.private)
+        pb = dict(self.private_bytes)
+        priv = " ".join(
+            f"{p}={n}/{pb.get(p, 0) / 2**30:.2f}GiB" for p, n in self.private
+        )
         return (
             f"WEG2-UNION CENSUS card={self.card[-12:]} own_gib[{own}] "
             f"union={self.union_bytes / 2**30:.2f} GiB "
             f"SHAREABLE={self.shareable_bytes / 2**30:.2f} GiB "
             f"({len(self.shareable)} tensors) "
             f"collide={len(self.colliding)}/{self.colliding_bytes / 2**30:.2f} GiB "
-            f"incompatible={len(self.incompatible)} private[{priv}] "
+            f"incompatible={len(self.incompatible)}/{self.incompatible_bytes / 2**30:.2f} GiB "
+            f"private[{priv}] "
             f"-- SHAREABLE is what the union arena removes from this card; "
             f"collide is same-name-same-shape-DIFFERENT-BYTES (expert-index "
             f"sharding), which no arena may ever fold together"
@@ -527,11 +555,11 @@ def _load_side(path: str) -> dict:
     return raw
 
 
-def join_sides(union_dir: str, card: str) -> UnionCensus:
-    """Join the two phases' side files for one card into a census."""
+def join_sides(union_dir: str, card: str, role: str = "main") -> UnionCensus:
+    """Join the two phases' side files for one card and role into a census."""
     sides = {}
     for phase in (PHASE_P, PHASE_D):
-        path = side_path(union_dir, card, phase)
+        path = side_path(union_dir, card, phase, role)
         if not os.path.exists(path):
             raise UnionShareError(f"phase {phase} has not published {path} yet")
         sides[phase] = _load_side(path)
@@ -540,7 +568,8 @@ def join_sides(union_dir: str, card: str) -> UnionCensus:
     }
     p_t, d_t = by_phase[PHASE_P], by_phase[PHASE_D]
     shareable, colliding, incompatible = [], [], []
-    shareable_bytes = colliding_bytes = 0
+    shareable_bytes = colliding_bytes = incompatible_bytes = 0
+    incompat_detail: list = []
     for name in sorted(set(p_t) & set(d_t)):
         a, b = p_t[name], d_t[name]
         if (a["shape"], a["stride"], a["dtype"], a["nbytes"]) != (
@@ -550,10 +579,21 @@ def join_sides(union_dir: str, card: str) -> UnionCensus:
             b["nbytes"],
         ):
             incompatible.append(name)
+            incompatible_bytes += max(int(a["nbytes"]), int(b["nbytes"]))
+            incompat_detail.append(
+                (
+                    name,
+                    max(int(a["nbytes"]), int(b["nbytes"])),
+                    f"{a['dtype']}{tuple(a['shape'])}",
+                    f"{b['dtype']}{tuple(b['shape'])}",
+                )
+            )
             continue
         if a["checksum"] is None or b["checksum"] is None:
             # No checksum means no proof; it is NOT evidence of sameness.
             incompatible.append(name)
+            incompatible_bytes += int(a["nbytes"])
+            incompat_detail.append((name, int(a["nbytes"]), "no-checksum", "no-checksum"))
             continue
         if a["checksum"] != b["checksum"]:
             colliding.append(name)
@@ -573,8 +613,21 @@ def join_sides(union_dir: str, card: str) -> UnionCensus:
         colliding=tuple(colliding),
         colliding_bytes=colliding_bytes,
         incompatible=tuple(incompatible),
+        incompatible_bytes=incompatible_bytes,
+        top_incompatible=tuple(sorted(incompat_detail, key=lambda r: -r[1])[:6]),
         private=tuple(
             (phase, len(set(tensors) - set(p_t if phase == PHASE_D else d_t)))
+            for phase, tensors in by_phase.items()
+        ),
+        private_bytes=tuple(
+            (
+                phase,
+                sum(
+                    int(t["nbytes"])
+                    for n, t in tensors.items()
+                    if n not in (p_t if phase == PHASE_D else d_t)
+                ),
+            )
             for phase, tensors in by_phase.items()
         ),
         own_bytes=tuple((phase, b) for phase, b in own.items()),
@@ -582,7 +635,9 @@ def join_sides(union_dir: str, card: str) -> UnionCensus:
     )
 
 
-def maybe_union_census(model, *, rank: int, device) -> Optional[UnionCensus]:
+def maybe_union_census(
+    model, *, rank: int, device, role: str = "main"
+) -> Optional[UnionCensus]:
     """Publish this rank's side and, if the other phase is already there, log
     the join. A no-op unless ``SGLANG_WEG2_UNION_DIR`` names a directory.
 
@@ -608,9 +663,10 @@ def maybe_union_census(model, *, rank: int, device) -> Optional[UnionCensus]:
         phase=phase,
         rank=int(rank),
         named=named,
+        role=role,
     )
     other = PHASE_D if phase == PHASE_P else PHASE_P
-    if not os.path.exists(side_path(union_dir, card, other)):
+    if not os.path.exists(side_path(union_dir, card, other, role)):
         logger.info(
             "WEG2-UNION side published for phase %s on card %s (%d tensors, "
             "%.2f GiB); phase %s has not published this card yet, so the join "
@@ -622,8 +678,17 @@ def maybe_union_census(model, *, rank: int, device) -> Optional[UnionCensus]:
             other,
         )
         return None
-    census = join_sides(union_dir, card)
+    census = join_sides(union_dir, card, role=role)
     logger.info("%s", census.line())
+    if census.top_incompatible:
+        logger.info(
+            "WEG2-UNION biggest NOT shareable on card %s: %s",
+            card[-12:],
+            "; ".join(
+                f"{n} {b / 2**20:.0f} MiB P{pa} vs D{da}"
+                for n, b, pa, da in census.top_incompatible
+            ),
+        )
     if census.colliding:
         logger.info(
             "WEG2-UNION collide sample (same name, same shape, DIFFERENT "
