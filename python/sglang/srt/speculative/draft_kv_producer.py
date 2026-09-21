@@ -299,6 +299,13 @@ class DraftKvProducer:
             # `own_head is not embed` covers tie_word_embeddings: there the
             # head IS the resident embedding this method just loaded, and
             # gutting it would hand the producer token soup.
+            # MEASURED fnFL2v74: the pool term must be read BEFORE this
+            # release. _drop_parameters frees the never-loaded lm_head into
+            # the SAME private pool, so a reading taken afterwards counts
+            # those 1212.5 MiB twice -- W11b's residual went from +1918.9
+            # (term missing) to -678.8 (term double-counting). Both are a
+            # refusal, and rightly so.
+            self._pool_inactive_after_mib = _tag_pool_inactive_mib()
             self.head_released_mib = _drop_parameters(own_head)
             del own_head
         torch.cuda.empty_cache()
@@ -315,7 +322,11 @@ class DraftKvProducer:
         # residual strongly negative, and the gate refuses BOTH directions
         # ("an explanation that does not add up is not an explanation").
         # What belongs here is the DELTA this build added to that cache.
-        after_pool = _tag_pool_inactive_mib()
+        # taken before the head release above; "now" only when nothing was
+        # released (tie_word_embeddings drops no second table).
+        after_pool = getattr(self, "_pool_inactive_after_mib", -1.0)
+        if after_pool < 0:
+            after_pool = _tag_pool_inactive_mib()
         if after_pool >= 0 and self._pool_inactive_before_mib >= 0:
             self.tag_pool_inactive_mib = after_pool - self._pool_inactive_before_mib
         else:
