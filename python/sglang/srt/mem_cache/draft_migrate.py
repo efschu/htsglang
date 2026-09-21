@@ -281,7 +281,14 @@ def _partition(total: int, ratios: Sequence[int], units: int) -> List[int]:
     imported so the migration cannot drift from what the ranks expect."""
     from sglang.srt.distributed.utils import partition_sizes
 
-    return partition_sizes(total, list(ratios), units)
+    # Form A (fnFL2 v17, 21.09.): a ZERO ratio is a worker that owns no
+    # heads -- the unit path's "one unit per rank" floor would hand it 1 of
+    # 16 units and cut the host's window to 7/8 of its own pool page
+    # (51480576 of 58834944 bytes, "no head-shard candidate cuts a mamba
+    # window"). Zero ratios are only legal under the runtime's allow_zero
+    # plan, so a zero here IS that plan.
+    ratios = [int(r) for r in ratios]
+    return partition_sizes(total, ratios, units, allow_zero=any(r == 0 for r in ratios))
 
 
 def _prefix_offsets(sizes: Sequence[int]) -> List[int]:
