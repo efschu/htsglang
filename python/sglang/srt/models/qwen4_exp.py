@@ -1995,17 +1995,17 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
         is_nextn: bool = False,
         embed_quant_config: Optional[QuantizationConfig] = None,
     ) -> None:
-        # #66 (fnFL2v66): the MTP build nulls its quant_config whenever the
-        # checkpoint's `mtp.` tensors are dense (_mtp_quant_config) -- right
-        # for the mtp layers, WRONG for embed_tokens, whose rows come from
-        # the TARGET half of the same checkpoint. Minachist packs the vocab
-        # (AutoRound group_3 `re:.*embed_tokens`), so a nulled config builds
-        # a bf16 table that no `weight_packed` fits into: the draft-KV
-        # producer's resident load then refuses by name ("the built table and
-        # the checkpoint disagree on the vocab quantization"). Handing the
-        # UNMODIFIED config through for the vocab alone lets
-        # _build_embed_tokens apply its own rule (quantize iff the config
-        # NAMES the vocab), which is already correct for both exports.
+        # #66 (fnFL2v67): a caller may override the config the VOCAB is built
+        # under. The draft-KV producer needs that: under placement A the
+        # vocab rows come from the TARGET checkpoint, and target and draft
+        # disagree in opposite directions -- Minachist packs the vocab
+        # (AutoRound group_3 `re:.*embed_tokens`) while the albucino MTP
+        # checkpoint lists it under `ignore`. Building the draft's table from
+        # the DRAFT's config therefore produced a bf16 table that no
+        # `weight_packed` fits into. The producer sets this from the target
+        # model before it loads (draft_kv_producer.load_resident_embedding);
+        # the MTP constructor does NOT -- its own config is the draft's and
+        # would be exactly the wrong one.
         # Set BEFORE super().__init__, which is what calls the builder.
         self._embed_quant_config = embed_quant_config
         super().__init__(config, quant_config, prefix, is_nextn)

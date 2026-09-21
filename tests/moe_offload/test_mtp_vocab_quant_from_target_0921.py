@@ -19,13 +19,29 @@ import types
 from sglang.srt.models import qwen4_exp, qwen4_exp_mtp
 
 
-def test_the_mtp_hands_the_unmodified_config_through_for_the_vocab():
+def test_the_mtp_constructor_does_NOT_set_it():
+    """Its own config is the DRAFT's -- exactly the wrong one for the vocab.
+
+    The first attempt (ca09d2babf) handed that config through and changed
+    nothing: albucino lists embed_tokens under `ignore`, so the table still
+    came out bf16. The setter has to be the producer, which knows the target.
+    """
     src = inspect.getsource(qwen4_exp_mtp.Qwen4ExpForCausalLMMTP.__init__)
-    # captured BEFORE the nulling, passed to the model build
-    assert src.index("embed_quant_config = quant_config") < src.index(
-        "quant_config = _mtp_quant_config(quant_config)"
+    assert "embed_quant_config" not in src
+
+
+def test_the_producer_rebuilds_the_vocab_under_the_target_config():
+    from sglang.srt.speculative import draft_kv_producer as dkp
+
+    src = inspect.getsource(dkp.DraftKvProducer.load_resident_embedding)
+    assert "target_model.quant_config" in src or 'getattr(target_model, "quant_config"' in src
+    assert "inner._embed_quant_config = target_quant" in src
+    # and the rebuild happens BEFORE the parameters are read
+    assert src.index("inner.embed_tokens = embed") < src.index(
+        "params = dict(embed.named_parameters())"
     )
-    assert "embed_quant_config=embed_quant_config," in src
+    # a target config we cannot honour is refused, never silently ignored
+    assert "refusing to load" in src
 
 
 def test_the_builder_prefers_the_vocab_config_and_keeps_the_old_rule():

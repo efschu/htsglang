@@ -194,6 +194,41 @@ class DraftKvProducer:
         # the built parameters is refused by name -- int8 codes cast into a
         # bf16 table without their scale, or a scale with no parameter to
         # land in, would both load "successfully" as token soup.
+        # #66 (fnFL2v67): the rows below come from the TARGET checkpoint, so
+        # the table has to be built under the TARGET's quantization -- not
+        # the draft's. Measured on this rig, the two disagree in opposite
+        # directions: Minachist packs the vocab (AutoRound group_3
+        # `re:.*embed_tokens`), the albucino MTP checkpoint lists it under
+        # `ignore`. Built from the draft's config the table came out bf16 and
+        # every `weight_packed` row below had nowhere to go. Sharing the
+        # target's module (the way lm_head is shared) is NOT available here:
+        # this is the last pp stage and only the first one builds an
+        # embedding at all, which is why placement A loads a resident copy.
+        target_model = self.draft_worker.target_worker.model_runner.model
+        target_quant = getattr(target_model, "quant_config", None)
+        inner = getattr(draft_model, "model", None)
+        rebuild = getattr(inner, "_build_embed_tokens", None)
+        inner_config = getattr(inner, "config", None)
+        if target_quant is not None and rebuild is not None and inner_config is not None:
+            inner._embed_quant_config = target_quant
+            embed = rebuild(inner_config, target_quant, prefix="mtp")
+            inner.embed_tokens = embed
+            logger.info(
+                "WEG2 DRAFT-KV-PRODUCER vocab rebuilt under the TARGET's "
+                "quantization (%s): params now %s",
+                type(target_quant).__name__,
+                sorted(n for n, _ in embed.named_parameters()),
+            )
+        elif target_quant is not None:
+            # Loud, not silent: a table built from the wrong config loads
+            # int codes without their scale as token soup.
+            raise RuntimeError(
+                "draft-KV producer: cannot rebuild the vocab under the "
+                f"target's quantization (builder={rebuild is not None}, "
+                f"config={inner_config is not None}) -- refusing to load "
+                "target rows into a table built from the draft's config."
+            )
+
         params = dict(embed.named_parameters())
         wanted = {f"embed_tokens.{n}" for n in params}
         loaded = set()
