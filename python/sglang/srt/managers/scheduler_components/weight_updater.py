@@ -374,6 +374,34 @@ def _merge_checksum_payloads(target: Dict, draft: Dict) -> Dict:
 WEG2_LEG_LEDGER_MAX = 8
 
 
+
+def _any_scheduler_process_alive() -> bool:
+    """Lebt ueberhaupt noch ein Scheduler ausser mir? (#79)
+
+    FAIL-OPEN wie der Aufrufer: kann diese Funktion nichts lesen, antwortet
+    sie True -- weiterwarten im Budget. Sie liest /proc direkt statt pgrep zu
+    starten, weil sie im Collect-Pfad je Einheit laufen kann.
+    """
+    import os as _os
+
+    me = _os.getpid()
+    try:
+        for entry in _os.listdir("/proc"):
+            if not entry.isdigit():
+                continue
+            pid = int(entry)
+            if pid == me:
+                continue
+            try:
+                with open(f"/proc/{pid}/comm") as fh:
+                    if "sglang" in fh.read():
+                        return True
+            except OSError:
+                continue
+    except OSError:
+        return True
+    return False
+
 class Weg2LegLedger:
     """Per-rank record of COMPLETED epoch-scoped flip legs (#1285)."""
 
@@ -3737,7 +3765,28 @@ class SchedulerWeightUpdaterManager:
             procs = pynvml.nvmlDeviceGetComputeRunningProcesses_v3(handle)
             me = os.getpid()
             others = {int(pr.pid) for pr in procs} - {me}
-            return bool(others)
+            if others:
+                return True
+            # #79 (fnFL2w5, 21.09.): EIN SCHLAFENDER RANG IST KEIN TOTER RANG.
+            # NVML listet nur Prozesse, die auf der Karte ALLOKIERT haben. Die
+            # schlafende Gruppe gibt beim Sleep genau das frei -- sie faellt
+            # aus dieser Liste, ohne zu sterben. Der Collect las das als Tod:
+            #
+            #   W68: 3 lane(s) refused: c0/weights_1: PeerGone at unit 0
+            #   'model.layers.3.attn_hyper_connection.block_inject_weight...'
+            #
+            # und riss ueber W29 (resume_memory_occupation) alle sechs Raenge
+            # mit, obwohl bis zur selben Sekunde 6/6 Scheduler liefen. Und der
+            # Flip legt die Quelle IMMER schlafen (WEG2-FLIP begin sleep=D
+            # wake=P), also trifft es jeden Flip, nicht einen Sonderfall.
+            #
+            # Eine leere NVML-Liste ist damit KEIN Todesbeweis mehr. Sie wird
+            # erst einer, wenn auch kein Scheduler-Prozess mehr lebt -- dann
+            # ist wirklich niemand mehr da, der deponieren koennte. Bis dahin
+            # gilt weiter das Budget als harte Schranke (die urspruengliche
+            # Anforderung (b) aus #1378 xsn36/37), und der Irrtum faellt auf
+            # die sichere Seite: warten statt einen lebenden Peer erschiessen.
+            return _any_scheduler_process_alive()
         except BaseException:  # noqa: BLE001 -- fail-open, budget is the bound
             return True
 
