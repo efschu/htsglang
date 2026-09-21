@@ -730,6 +730,46 @@ def _axis_of(name: str, whole: ManifestPiece,
     if same_rows and _padded(w_cols, cols):
         return wx.COLS, w_rows, sum(cols), tuple(cols), sum(cols) - w_cols
 
+    # THE ZERO PAD EXPERT (#74, fnFL2w1).  The expert-dim shard carries ONE
+    # extra local row per rank, and it is not a skew -- it is this tree's own
+    # convention, written down in `expert_store.global_rows`:
+    #
+    #     ``pad=True`` is the generic expert-dim shard: local 0 is the zero
+    #     pad expert (no row), local i >= 1 is global ``lo + i - 1``.
+    #     ``pad=False`` is an unsharded layer (a PP stage holding every
+    #     expert): local i is global ``lo + i``.
+    #
+    # So the two groups describe the SAME tensor correctly and differently:
+    # group P runs the layer unsharded (pad=False) and holds the whole expert
+    # count; group D shards the expert dim (pad=True) and every rank holds its
+    # slice PLUS the zero row at local 0. Measured fnFL2w1 on
+    # `model.layers.0.mlp.experts.w13_weight_shape`: P (512, 2) against
+    # [(61, 2), (227, 2), (227, 2)] -- 61+227+227 = 515 = 512 + 3 ranks, at a
+    # cut of 60,226,226 (`--rank-moe-ratio`). The join refused, the wake
+    # refused behind it, and the whole flip died at the first wake.
+    #
+    # A PREDICATE, NOT A BAND -- the same discipline `_padded` above states
+    # for the vocab pad: EXACTLY one surplus row per rank, nothing else
+    # passes. A two-row surplus on one rank is still a genuine disagreement
+    # and still refuses. Two further conditions keep it from over-reaching:
+    #
+    #   * only on an EXPERT tensor (``.experts.`` in the name) -- the pad
+    #     convention is the expert shard's, and nothing else in the tree
+    #     carries it;
+    #   * every rank must hold at least 2 rows (one real expert + the pad),
+    #     because a rank of width 1 would be all pad and no payload, which is
+    #     not a cut this can vouch for.
+    def _expert_pad_cut(nm: str, total_full: int, widths: Sequence[int]) -> bool:
+        if ".experts." not in str(nm):
+            return False
+        if len(widths) < 2 or any(int(w) < 2 for w in widths):
+            return False
+        return sum(int(w) for w in widths) - len(widths) == int(total_full)
+
+    if same_cols and _expert_pad_cut(name, w_rows, rows):
+        # declared pad = one row per rank, which is exactly the surplus
+        return wx.ROWS, sum(rows), w_cols, tuple(rows), len(rows)
+
     # THE MIXED-FUSED FALLBACK (#1384).  Only reached once all five outer
     # tests above have already failed, so every geometry that used to
     # classify (kv >= tp: Q and KV split TOGETHER, no replication skew, the
