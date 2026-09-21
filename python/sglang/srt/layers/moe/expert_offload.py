@@ -3123,10 +3123,20 @@ class MoEExpertOffloadCache:
         self.scratch = scratch_slot_count(
             self.resident_count, self.num_local_experts
         )
+        # #93: WER RESIDENT IST, STEHT IM HOTSET -- der Planner darf nicht
+        # weiter `resident == [0, R) at slot==id` annehmen (Zeile ~524).
+        # Seit #92 sind die Residenten die Hotset-Ids (bei w22 u.a. 320..369),
+        # und ein residenter Experte mit Id 370 landete im 32-zeiligen
+        # Scratch: "IndexError: index 370 is out of bounds for dimension 0
+        # with size 32". Der Planner hat den Zweig fuer genau diesen Fall
+        # ("Hot residency: resident == frozen id set at its assigned slot"),
+        # er bekam die Menge nur nie.
+        _hot_lokal = _hotset_local_ids(layer, self.num_local_experts)
         self.planner = ExpertResidencyPlanner(
             num_local_experts=self.num_local_experts,
             resident_count=self.resident_count,
             scratch=self.scratch,
+            resident_ids=frozenset(_hot_lokal) if _hot_lokal else None,
         )
         self._pinned: Dict[str, "object"] = {}  # attr -> pinned spill [E-R,...]
         self._resident: Dict[str, "object"] = {}  # attr -> GPU buffer [R+C,...]
