@@ -2868,8 +2868,65 @@ def tag_pool_scope(tag: str) -> Iterator[Any]:
             )
         yield None
         return
-    with stack:
-        yield pool
+    global _ACTIVE_TAG_POOL
+    _prev_active = _ACTIVE_TAG_POOL
+    _ACTIVE_TAG_POOL = pool
+    try:
+        with stack:
+            yield pool
+    finally:
+        _ACTIVE_TAG_POOL = _prev_active
+
+
+#: The pool ``tag_pool_scope`` currently routes to, so a nested step can step
+#: OUT of it for the duration of a transient (:func:`outside_tag_pool`).  A
+#: module global rather than a parameter because the step that needs it -- the
+#: sub-byte unpack inside ``process_weights_after_loading`` -- is several
+#: frames below the scope, in a quantization scheme this tree does not own.
+_ACTIVE_TAG_POOL: Any = None
+
+
+@contextmanager
+def outside_tag_pool(reason: str = "") -> Iterator[bool]:
+    """Route allocations inside to the DEFAULT pool, then come back.
+
+    A private ``MemPool`` NEVER hands a cached block back to the driver while
+    it lives: ``emptyCache`` releases ``graph_pools_freeable`` only, and a tag
+    pool is cached per tag for the whole boot.  So every transient born inside
+    one leaves a segment there forever.
+
+    MEASURED (fnFL2v62 allocator snapshot, PP0): the eleven chunk pools held
+    22.0 GiB reserved for 2.6 GiB of live weights -- 82 of 302 segments were
+    COMPLETELY EMPTY (18.1 GiB), and the alloc history named the source: the
+    INT4 unpack allocated 161 GiB cumulative and the widening 43 GiB inside
+    those pools, in 2147 short-lived tensors of changing size, against 2.0 GiB
+    of marlin repack output that is what actually has to stay.
+
+    Yields True when it really stepped out.  Everything allocated inside is in
+    the DEFAULT pool, in segments that carry no tag, so a caller MUST copy
+    anything that has to survive back in before leaving the block -- else the
+    exchange would pause a segment holding another tag's bytes (#1378 xsn66).
+    """
+    import torch
+
+    pool = _ACTIVE_TAG_POOL
+    if pool is None:
+        yield False
+        return
+    try:
+        from torch.cuda.memory import (
+            _cuda_beginAllocateCurrentThreadToPool,
+            _cuda_endAllocateToPool,
+        )
+    except Exception:  # noqa: BLE001 -- a torch without private pools
+        yield False
+        return
+    device_index = torch.cuda.current_device()
+    _cuda_endAllocateToPool(device_index, pool.id)
+    try:
+        yield True
+    finally:
+        _cuda_beginAllocateCurrentThreadToPool(device_index, pool.id)
 
 
 @contextmanager

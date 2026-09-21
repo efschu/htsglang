@@ -128,9 +128,36 @@ def widen_dense_packed_to_8bit(
     packed: torch.Tensor, src_bits: int, in_features: int
 ) -> torch.Tensor:
     """Lossless widening of a dense ``src_bits`` packing to the 8-bit
-    compressed-tensors packing (4 values per int32, little-endian, unsigned
-    with offset 128): q_signed = raw - 2**(src_bits-1); stored8 = q_signed + 128.
-    The group scales are unchanged (value = q_signed * scale)."""
+    compressed-tensors packing -- see :func:`_widen_dense_packed_to_8bit`.
+
+    The widening itself runs OUTSIDE the weg2 tag pool and only its result
+    comes back in.  #1378 / fnFL2v62: a private ``MemPool`` never returns a
+    cached block while it lives, so the unpack's short-lived tensors (161 GiB
+    cumulative across the load, in ever-changing sizes) left the eleven chunk
+    pools of PP0 holding 22.0 GiB for 2.6 GiB of live weights.  Outside, the
+    same tensors land in the default pool, which the KV sizing's empty_cache
+    really reaches.  The RESULT is a permanent parameter, so it is allocated
+    again inside the pool and copied -- one device-to-device copy of the
+    output (~2 ms per GiB) instead of a segment kept for the whole boot.
+    """
+    from sglang.srt.managers.weg2_memory_saver import outside_tag_pool
+
+    with outside_tag_pool(reason="ct-widen-subbyte") as stepped_out:
+        out = _widen_dense_packed_to_8bit(packed, src_bits, in_features)
+        if not stepped_out:
+            return out
+    # back inside the tag pool: give the survivor a segment that carries the tag
+    fresh = torch.empty_like(out)
+    fresh.copy_(out)
+    return fresh
+
+
+def _widen_dense_packed_to_8bit(
+    packed: torch.Tensor, src_bits: int, in_features: int
+) -> torch.Tensor:
+    """q_signed = raw - 2**(src_bits-1); stored8 = q_signed + 128 (4 values per
+    int32, little-endian, unsigned with offset 128).  The group scales are
+    unchanged (value = q_signed * scale)."""
     rows = packed.shape[0]
     raw = unpack_dense_subbyte(packed, src_bits, in_features)
     q8 = raw - (1 << (src_bits - 1)) + 128  # in [96, 159] for 6 bit
