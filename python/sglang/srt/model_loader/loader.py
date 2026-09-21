@@ -18,6 +18,7 @@ import os
 import re
 import socket
 import tempfile
+import sys
 import threading
 import time
 from abc import ABC, abstractmethod
@@ -879,6 +880,16 @@ class DefaultModelLoader(BaseModelLoader):
 
         target_device = torch.device(device_config.device)
         quant_config = _get_quantization_config(model_config, self.load_config)
+        # #66: der Ladeprofiler laeuft MIT dem Laden, nicht danach -- wer von
+        # aussen sampelt, kommt zu spaet (107 s fuer 222720 Experten-Keys).
+        # Aus per Default; ein defekter Sampler darf das Laden nie verhindern.
+        _prof, _prof_t0 = None, time.perf_counter()
+        if os.environ.get("SGLANG_LOAD_PROFILE") == "1":
+            try:
+                _prof = _LoadSampler()
+                _prof.start()
+            except Exception:  # pragma: no cover - diagnostic only
+                _prof = None
         with set_default_torch_dtype(model_config.dtype):
             with target_device:
                 model = _initialize_model(
@@ -895,6 +906,13 @@ class DefaultModelLoader(BaseModelLoader):
             )
 
         self.counter_after_loading_weights = time.perf_counter()
+        if _prof is not None:
+            try:
+                _prof.report(
+                    logger, self.counter_after_loading_weights - _prof_t0
+                )
+            except Exception:  # pragma: no cover - diagnostic only
+                pass
         return model.eval()
 
     @staticmethod
@@ -971,6 +989,60 @@ class DefaultModelLoader(BaseModelLoader):
                 with weight_chunk_scope(layer_id_from_module_name(name)):
                     with device_loading_context(module, target_device):
                         quant_method.process_weights_after_loading(module)
+
+
+class _LoadSampler:
+    """WO die Ladezeit liegt, waehrend sie verstreicht (#66, 21.09.).
+
+    Gemessen an fnFL2v75: 86 % CPU idle, 0,5 % iowait, EIN Thread auf 102 %.
+    Also weder die NVMe noch die Maschine, sondern eine serielle Schleife --
+    py-spy fand sie in ``_load_w2`` (fused_moe_triton/layer.py:1142). Aber
+    eine Stichprobe ist keine Verteilung, und der Ladevorgang war vorbei,
+    bevor mehr zu holen war: 222720 Experten-Keys gehen in 107 s durch, wer
+    von aussen sampelt, kommt zu spaet.
+
+    Deshalb laeuft der Sampler MIT: ein Thread, 20 Hz, nur solange das Laden
+    dauert, und er zaehlt die Frames des Ladethreads. Ausgabe sind die
+    haeufigsten Aufenthaltsorte -- die Grundlage, um zu entscheiden, was
+    parallelisiert wird, statt es zu raten.
+
+    Aus per Default; ``SGLANG_LOAD_PROFILE=1`` schaltet ihn ein.
+    """
+
+    def __init__(self, hz: float = 20.0):
+        self._stop = threading.Event()
+        self._interval = 1.0 / max(1.0, hz)
+        self._target = threading.get_ident()
+        self._counts: Dict[str, int] = {}
+        self._n = 0
+        self._t = None
+
+    def _run(self):
+        while not self._stop.is_set():
+            frame = sys._current_frames().get(self._target)
+            if frame is not None:
+                site = f"{os.path.basename(frame.f_code.co_filename)}:{frame.f_lineno} {frame.f_code.co_name}"
+                self._counts[site] = self._counts.get(site, 0) + 1
+                self._n += 1
+            self._stop.wait(self._interval)
+
+    def start(self):
+        self._t = threading.Thread(target=self._run, name="load-sampler", daemon=True)
+        self._t.start()
+
+    def report(self, logger_, elapsed_s: float, top: int = 8):
+        self._stop.set()
+        if self._t is not None:
+            self._t.join(timeout=1.0)
+        if not self._n:
+            return
+        rows = sorted(self._counts.items(), key=lambda kv: -kv[1])[:top]
+        logger_.info(
+            "WEG2 LOAD-PROFILE %d samples over %.1f s -- %s",
+            self._n,
+            elapsed_s,
+            "; ".join(f"{s} {100.0*c/self._n:.1f}%" for s, c in rows),
+        )
 
 
 class LayeredModelLoader(DefaultModelLoader):
