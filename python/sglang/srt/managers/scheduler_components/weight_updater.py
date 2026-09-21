@@ -1232,17 +1232,60 @@ class SchedulerWeightUpdaterManager:
         from sglang.srt.weg2 import xchg_bounce as xb
 
         terms = xb.read_published_terms()
+        # #73 (fnFL2v97): ZWEI PRAEDIKATE FUER EINE FRAGE -- und nur eines
+        # davon stimmte.
+        #
+        # Der Launcher publiziert die Bounce-Terme unter
+        # `xchg_bounce_arm_pins_host(weight_source, oncard_mode)`: BEIDE Arme
+        # entscheiden, denn `--weg2-xchg-oncard ipc` exportiert eine
+        # VRAM-Bounce, die mit ihrem eigenen Leg stirbt -- "no bounce FILE
+        # exists and no host byte is pinned" (launcher.py, Docstring). Er
+        # publiziert dort also ZU RECHT nichts.
+        #
+        # Diese Pruefung fragte nur nach der QUELLE und verweigerte jeden
+        # exchange-Wake ohne Terme -- auch den, bei dem es per Konstruktion
+        # keine Host-Bounce-Geometrie zu publizieren GIBT. fnFL2v97 erreichte
+        # beide Gruppen READY, den ersten Flip und starb hier: W4 auf allen
+        # drei P-Raengen, danach W29 (rank disagree) und ein
+        # `cudaErrorInvalidValue` aus `MemPool::~MemPool()` unter
+        # `_PyModule_Clear` -- der Shutdown-Folgeschaden, den man leicht fuer
+        # die Wurzel haelt.
+        #
+        # Die Leg ist fuer `terms=None` GEBAUT, nicht bloss tolerant dagegen:
+        # `_weg2_xchg_bounce_leg` fuehrt `terms=None` in der Signatur und
+        # prueft `if terms is not None` an jeder Stelle, die davon liest.
+        #
+        # EXPLIZIT 'ipc', nie "fehlt": eine fehlende Variable heisst
+        # "unbekannter Arm", und der bleibt eine Verweigerung. Nur der Arm,
+        # der sich als ipc AUSWEIST, hat nachweislich keinen Host-Bounce.
         if terms is None:
-            raise Weg2WakeRefused(
-                "W4 Weg2WakeRefused: --weg2-weight-source exchange owns this "
-                f"wake's weight bytes, but {xb.ENV_BOUNCE_TERMS} was not "
-                "published, so the bounce geometry the injection needs was "
-                "never priced by the launcher. Refusing rather than sizing a "
-                "pinned host buffer locally: the resume has already remapped "
-                "the weight pages and their content is undefined, so serving "
-                "is not an option either. Launch through the weg2 launcher, "
-                "which publishes the term it charged on the ARM line."
+            from sglang.srt.weg2 import (
+                weight_exchange_transport as _wt,
             )
+
+            _oncard = (os.environ.get(_wt.ENV_ONCARD_MODE, "") or "").strip()
+            if _oncard == _wt.ONCARD_MODE_IPC:
+                logger.info(
+                    "WEG2-XCHG-BOUNCE TERMS ABSENT BY ARM oncard=%s -- this arm "
+                    "pins no host byte, so the launcher priced no bounce "
+                    "geometry and there is none to read. The leg assembles "
+                    "from the exported VRAM bounce; `terms` stays None, which "
+                    "it is built for (#73).", _oncard)
+            else:
+                raise Weg2WakeRefused(
+                    "W4 Weg2WakeRefused: --weg2-weight-source exchange owns "
+                    f"this wake's weight bytes, but {xb.ENV_BOUNCE_TERMS} was "
+                    "not published, so the bounce geometry the injection "
+                    "needs was never priced by the launcher. Refusing rather "
+                    "than sizing a pinned host buffer locally: the resume has "
+                    "already remapped the weight pages and their content is "
+                    "undefined, so serving is not an option either. Launch "
+                    "through the weg2 launcher, which publishes the term it "
+                    f"charged on the ARM line. (Arm here: oncard="
+                    f"{_oncard!r} -- only an explicit "
+                    f"{_wt.ONCARD_MODE_IPC!r} pins no host byte and may go "
+                    "without terms, #73.)"
+                )
         return self._weg2_xchg_inject_from_peer(terms=terms, tag=tag, **kw)
 
     def _weg2_xchg_deposit_before_sleep(self, *, flip_index: int = -1,
@@ -1791,7 +1834,11 @@ class SchedulerWeightUpdaterManager:
         from sglang.srt.weg2 import weight_exchange as wx
         from sglang.srt.weg2 import weight_exchange_region as xr
 
-        priced = f"({terms.total_bytes} B, {terms.expression()})"
+        # #73: `terms` ist auf dem ipc-Arm None (kein Host-Bounce, also nichts
+        # zu bepreisen) -- die Zeile sagt das, statt an einem Attribut zu
+        # sterben, das es dort per Konstruktion nicht gibt.
+        priced = ("(no host bounce priced: oncard=ipc)" if terms is None
+                  else f"({terms.total_bytes} B, {terms.expression()})")
 
         # -- the identity sweep, in the order the legs consume it ------------
         boot_nonce = (os.environ.get(xr.ENV_REGION_BOOT, "") or "").strip()
