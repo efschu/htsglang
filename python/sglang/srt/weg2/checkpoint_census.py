@@ -209,7 +209,8 @@ def _tensor_bytes(meta: object) -> int:
 
 
 def layer_census_from_headers(model_dir: str, *,
-                              exclude_prefixes: Sequence[str] = ()) -> LayerCensus:
+                              exclude_prefixes: Sequence[str] = (),
+                              exclude_segments: Sequence[str] = ()) -> LayerCensus:
     """Bytes per layer, group-wide, from every shard's header. Never a default."""
     root = str(model_dir)
     try:
@@ -248,6 +249,23 @@ def layer_census_from_headers(model_dir: str, *,
             # keeps every existing caller -- including the widest-layer claim
             # the #1332 guard grades -- byte-identical.
             if exclude_prefixes and str(name).startswith(tuple(exclude_prefixes)):
+                continue
+            # #78 (21.09., Nutzer): EIN TEIL DES CHECKPOINTS WIRD NIE GELADEN.
+            # Die Per-Layer-Embeddings liegen unter `...layers.<k>.ple.<...>`
+            # und werden zur LAUFZEIT per mmap gelesen (#54: der PLE-Gather
+            # kostet 8,6 ms je Runde aus mmap-Shards) -- sie erreichen weder
+            # VRAM noch den Host-Store, also traegt sie auch kein Flip.
+            # GEMESSEN am Shipped-Checkpoint Qwen3.8-Flash-Next-INT4-Mixed:
+            #   gesamt                    163,20 GiB
+            #   davon PLE                  95,40 GiB  (58 %)
+            #   groesstes 3-Layer-Band mit PLE  99,21 GiB
+            #   groesstes 3-Layer-Band ohne PLE  3,81 GiB
+            # Der Bounce-Term dimensionierte also um FAKTOR 26 zu gross.
+            # ANDERS ALS `exclude_prefixes`: `ple` ist kein Baum-Praefix,
+            # sondern ein SEGMENT mitten im Namen -- derselbe Layer traegt
+            # geladene und nie geladene Tensoren nebeneinander.
+            if exclude_segments and any(str(seg) in str(name)
+                                        for seg in exclude_segments):
                 continue
             m = LAYER_RE.search(str(name))
             if m is None:
@@ -312,6 +330,11 @@ def widest_line(census: LayerCensus) -> str:
 #: than pattern-matched, so a new tree has to be added deliberately.
 MTP_TREE_PREFIXES = ("mtp.",)
 
+#: #78: die Per-Layer-Embedding-Tensoren, die NUR per mmap gelesen werden.
+#: Als SEGMENT geschrieben (mit fuehrendem und folgendem Punkt), damit ein
+#: Modul, das zufaellig `ple` im Namen traegt, nicht mitgenommen wird.
+PLE_SEGMENTS = (".ple.",)
+
 
 def max_tag_bytes_from_census(model_dir: str, chunk_layers: int) -> int:
     """#1374 OPTION 1: the LARGEST WEIGHT TAG this boot will pause, exactly.
@@ -358,7 +381,8 @@ def max_tag_bytes_from_census(model_dir: str, chunk_layers: int) -> int:
     # the language model's layer indices -- see `exclude_prefixes` above for the
     # measurement. Enumerated and subtracted by NAME, never by a factor.
     census = layer_census_from_headers(model_dir,
-                                      exclude_prefixes=MTP_TREE_PREFIXES)
+                                      exclude_prefixes=MTP_TREE_PREFIXES,
+                                      exclude_segments=PLE_SEGMENTS)
     per_layer = [int(b) for _idx, b in census.layer_bytes]
     if not per_layer:
         raise Weg2XchgWidestLayerUnreadable(
