@@ -439,7 +439,17 @@ def widest_layer_terms(model_dir: str, *, pairs: int, depth: int,
     """
     from sglang.srt.weg2 import xchg_bounce as xb
 
-    census = layer_census_from_headers(model_dir)
+    # #78 (fnFL2w7, 21.09.): DERSELBE AUSSCHLUSS WIE NEBENAN, und dass er hier
+    # gefehlt hat, stand eine Zeile spaeter im Boot-Log:
+    #   max_tag_mib=3900 (gefixt)  neben
+    #   widest_layer_bytes=103797370776 (ungefixt)
+    # Zwei Leser desselben Checkpoints, einer mit und einer ohne PLE -- also
+    # zwei Antworten auf eine Frage. Die PLE werden per mmap gelesen und nie
+    # geladen (#54), der MTP-Kopf hat seinen eigenen Tag; beides gehoert aus
+    # dem Term, aus dem der Bounce sizet.
+    census = layer_census_from_headers(model_dir,
+                                       exclude_prefixes=MTP_TREE_PREFIXES,
+                                       exclude_segments=PLE_SEGMENTS)
     idx, nbytes, _classes = widest_layer(census)
     kw = {} if not slot_bytes else {"slot_bytes": int(slot_bytes)}
     terms = xb.bounce_terms(
