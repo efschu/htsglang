@@ -39,6 +39,9 @@ __all__ = [
     "write_rows",
     "mark_rows_written",
     "rows_written",
+    "written_rows_cached",
+    "forget_written_rows",
+    "store_has_row",
 ]
 
 
@@ -118,6 +121,57 @@ def write_rows(
     return rows
 
 
+#: #75: der LESER des Sentinels, den es bisher nicht gab.
+#:
+#: `mark_rows_written` publiziert seit dem ersten Tag, welche Zeilen ein Rang
+#: geschrieben hat -- und `rows_written` hatte NULL AUFRUFER (devindex, 21.09.).
+#: Die Folge, gemessen an fnFL2w1: Gruppe D liest den ganzen Checkpoint ein
+#: zweites Mal (237 s, ~14 GiB Page-Cache, der die Container-Decke bricht),
+#: obwohl P dieselben Bytes im geteilten tmpfs liegen hat.
+#:
+#: Ein Cache je (dir, layer_key, attr): die Sentinels sind Dateien, und der
+#: Ladepfad fragt je Experte einmal -- 512 stat()+json.load() je Tensor waere
+#: die Ersparnis wieder aufgefressen. Der Cache lebt fuer die Dauer des Ladens
+#: und wird von `forget_written_rows` verworfen, wenn jemand schreibt.
+_ROWS_CACHE: Dict[Tuple[str, str, str, int], Dict[int, int]] = {}
+
+
+def written_rows_cached(directory: str, layer_key: str, attr: str,
+                        world: int) -> Dict[int, int]:
+    """``rows_written`` mit Cache je (dir, layer_key, attr, world)."""
+    key = (str(directory), str(layer_key), str(attr), int(world))
+    hit = _ROWS_CACHE.get(key)
+    if hit is None:
+        hit = rows_written(directory, layer_key, attr, world)
+        _ROWS_CACHE[key] = hit
+    return hit
+
+
+def forget_written_rows() -> None:
+    """Den Cache verwerfen -- nach jedem Schreiben, damit ein Leser nie eine
+    Sentinel-Lage von vor dem Schreiben sieht."""
+    _ROWS_CACHE.clear()
+
+
+def store_has_row(layer_key: str, attr: str, global_row: int,
+                  world: int) -> bool:
+    """Liegt diese GLOBALE Zeile schon im geteilten Store?
+
+    KONSERVATIV PER KONSTRUKTION: jede Unsicherheit -- Store aus, Verzeichnis
+    unlesbar, Sentinel fehlt, Zeile nicht darin -- antwortet False, also
+    "lies sie vom Checkpoint". Ein Irrtum in diese Richtung kostet Ladezeit;
+    der Irrtum in die andere Richtung laedt ein Modell mit einer Luecke und
+    rechnet still falsch.
+    """
+    if not store_enabled():
+        return False
+    try:
+        rows = written_rows_cached(store_dir(), layer_key, attr, int(world))
+    except Exception:  # noqa: BLE001 -- ein unlesbarer Sentinel ist ein Lader,
+        return False   # kein Absturz: der Checkpoint ist immer noch da.
+    return int(global_row) in rows
+
+
 def _sentinel(directory: str, layer_key: str, attr: str, rank: int) -> str:
     return store_path(directory, layer_key, attr) + f".r{int(rank)}.written.json"
 
@@ -129,6 +183,9 @@ def mark_rows_written(directory: str, layer_key: str, attr: str, rank: int, rows
     with open(tmp, "w") as fh:
         json.dump({"rank": int(rank), "rows": sorted(int(r) for r in rows)}, fh)
     os.replace(tmp, path)
+    # #75: der Cache des Lesers darf eine gerade publizierte Zeile nicht
+    # verpassen -- er wird hier verworfen, nicht per Zeitstempel geraten.
+    forget_written_rows()
     return path
 
 
