@@ -141,3 +141,22 @@ def test_the_offload_opens_the_gate_but_leaves_p_and_the_vector_alone():
     assert "feasible = all(x >= _PREDICT_MIN_RANK_TOKENS for x in gate_p)" in src
     # und ohne Offload ist gate_p buchstaeblich p
     assert "gate_p = p" in src
+
+
+def test_the_shipped_vector_is_only_read_back_from_an_anchored_model():
+    """#62 Folgefix: fnFL2v84 UND v85 starben daran, dass das reparierte
+    `feasible` erstmals einen Vektor durchreichte, den das unverankerte Modell
+    gerechnet hatte -- KV-Zelle der 5090 von 0,5 auf 5,7 KB je Token, Pool von
+    262144 auf 195008 Token, Karte voll beim Graph-Capture."""
+    import inspect
+
+    from sglang.srt.weg2 import launcher
+
+    src = inspect.getsource(launcher.d_operating_point_rows)
+    assert 'getattr(pcm, "measured", None) is not None' in src
+    # und der Rueckleser haengt WIRKLICH an dieser Bedingung
+    i = src.index('token_units = tuple(int(v) for v in cap["token_vector"])')
+    guard = src[:i]
+    assert guard.rindex('getattr(pcm, "measured", None) is not None') > guard.rindex(
+        'position == "maxkv"'
+    )

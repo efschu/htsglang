@@ -7465,7 +7465,35 @@ def d_operating_point_rows(
                 feasible = bool(cap["feasible"])
             if cap.get("ctx") is not None:
                 funded_ctx = int(cap["ctx"])
-            if position == "maxkv" and axis == "token" and cap.get("token_vector"):
+            # #62 FOLLOW-UP: READ THE VECTOR BACK ONLY FROM AN ANCHORED
+            # MODEL.
+            #
+            # This line takes the capacity model's own token vector and ships
+            # it. That is right when the model's absolute bytes are anchored
+            # to a measurement (`measured is not None`, where
+            # `measured_weight_bias` removes the family model's absolute
+            # error) and wrong when they are not -- and until #62 it never
+            # fired on this form at all, because the unanchored model declared
+            # every vector infeasible and `predict_capacity` returns
+            # `token_vector=None` in that branch.
+            #
+            # So fixing `feasible` (which WAS wrong: the routed experts live
+            # in the host store) had a second, unasked-for effect: it started
+            # feeding a vector computed from weights that read ~2x the
+            # measured census. Boots fnFL2v84 and v85 both died of it -- the
+            # 5090's KV cell grew from 0,5 to 5,7 KB per token, the pool fell
+            # from 262144 to 195008-196224 tokens, and the card ran out during
+            # graph capture.
+            #
+            # Without an anchor the RUNTIME's own derivation stands, which is
+            # what carried 262144 tokens on this form (fnFL2v72). The gate
+            # still sees the offload; only the vector waits for #48.
+            if (
+                position == "maxkv"
+                and axis == "token"
+                and cap.get("token_vector")
+                and getattr(pcm, "measured", None) is not None
+            ):
                 token_units = tuple(int(v) for v in cap["token_vector"])
         except Exception:
             pool = None
