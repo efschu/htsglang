@@ -2688,7 +2688,16 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 log_tag_pool_occupancy,
             )
 
-            log_tag_pool_occupancy(weights_tag, when="after-load")
+            # ALL tag pools, not just the base one (fnFL2v60): the 5090 holds
+            # 28.05 GB against 6.49 GiB of model tensors -- 21.6 GiB of
+            # ballast that does NOT move with the booking (its resident
+            # experts were down to 3.63 GiB at FR 0.04 and the figure did not
+            # budge).  The base tag alone cannot account for that, so every
+            # pool has to name its own occupancy before anyone builds a fix.
+            from sglang.srt.managers.weg2_memory_saver import _TAG_MEM_POOLS
+
+            for _t in sorted(_TAG_MEM_POOLS):
+                log_tag_pool_occupancy(_t, when="after-load")
         except Exception as _occ_exc:  # noqa: BLE001
             logger.warning(
                 "WEG2-TAG-POOL occupancy probe failed (%s)", _occ_exc

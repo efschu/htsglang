@@ -74,9 +74,13 @@ class TheRunnerProbesAfterLoading(unittest.TestCase):
         from sglang.srt.model_executor import model_runner as MR
 
         src = inspect.getsource(MR)
-        self.assertIn('log_tag_pool_occupancy(weights_tag, when="after-load")', src)
+        # fnFL2v60: EVERY pool, not just the base one -- the 5090 holds
+        # 28.05 GB against 6.49 GiB of model tensors and the base tag alone
+        # cannot account for 21.6 GiB.
+        self.assertIn('log_tag_pool_occupancy(_t, when="after-load")', src)
+        self.assertIn("for _t in sorted(_TAG_MEM_POOLS)", src)
         self.assertLess(
-            src.index("log_tag_pool_occupancy(weights_tag"),
+            src.index("log_tag_pool_occupancy(_t"),
             src.index("from sglang.srt.weg2.weight_exchange import arm_coverage_at_load"),
         )
 
