@@ -1254,9 +1254,24 @@ class HiCacheController:
         from sglang.srt.mem_cache.storage import StorageBackendFactory
 
         try:
-            self.storage_backend = StorageBackendFactory.create_backend(
-                storage_backend, self.storage_config, self.mem_pool_host
-            )
+            from sglang.srt.rank_role import this_rank_is_form_a_worker
+
+            if this_rank_is_form_a_worker():
+                # fnFL2 v16 (21.09.): no attention layer, no bytes in the
+                # canonical page -- the worker claims every page and moves
+                # nothing, so the tp-group MIN reduces settle on the host.
+                from sglang.srt.mem_cache.hicache_storage import FormAWorkerNullStorage
+
+                self.storage_backend = FormAWorkerNullStorage(self.storage_config)
+                logger.info(
+                    "#706 storage tier on a Form A expert worker: null backend "
+                    "(claims every page, reads and writes nothing; the attention "
+                    "host decides the group's prefetch)"
+                )
+            else:
+                self.storage_backend = StorageBackendFactory.create_backend(
+                    storage_backend, self.storage_config, self.mem_pool_host
+                )
             self.storage_backend.register_mem_pool_host(self.mem_pool_host)
 
             self.enable_storage = True
@@ -1435,7 +1450,17 @@ class HiCacheController:
         # the host pool's own start_layer is 0 on every PP stage.
         canonical_kv_page = None
         canonical_mamba_blob = None
-        if server_args is not None and getattr(
+        from sglang.srt.rank_role import this_rank_is_form_a_worker
+
+        if this_rank_is_form_a_worker():
+            # fnFL2 v16 (21.09.): the canonical page store refuses a rank
+            # without attention layers a window; the worker rides the null
+            # storage backend instead (attach_storage_backend).
+            logger.info(
+                "#706 canonical KV page: this rank is a Form A expert worker "
+                "(no attention layer) -- no page window, null storage tier"
+            )
+        elif server_args is not None and getattr(
             server_args, "hicache_canonical_kv_page", False
         ):
             from sglang.srt.mem_cache.canonical_page_store import (

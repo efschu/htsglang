@@ -3089,3 +3089,86 @@ class HiCacheFile(HiCacheStorage):
         except Exception as e:
             logger.error(f"Failed to clear HiCacheFile storage: {e}")
             return False
+
+
+
+class FormAWorkerNullStorage(HiCacheStorage):
+    """The storage tier of a Form A EXPERT WORKER (fnFL2 v16, 21.09.).
+
+    A worker holds no attention layer, so its KV host pool is 0 bytes/token
+    and the canonical page store refuses it a window ("a rank with no bytes
+    ... must not take part in the protocol"). It still runs the SAME HiCache
+    control path as the attention host: the prefetch progress is MIN-reduced
+    over the whole tp group (hiradix_cache._all_reduce_attn_groups falls
+    back to tp_group when the attention groups are trivial), so a worker
+    without a storage tier would hang the host in that collective, and a
+    worker answering "miss" would drag every group decision to zero and
+    starve the P->D KV carrier. This backend therefore claims every page
+    (the MIN is decided by the host, which holds the bytes), moves nothing,
+    and writes nothing -- the store's completeness markers come from the
+    ranks that own bytes.
+    """
+
+    def __init__(self, storage_config=None):
+        self.storage_config = storage_config
+        self.mem_pool_host = None
+        self.registered_pools = {}
+        self.canonical_kv_page = None
+        self.canonical_mamba_blob = None
+        self.canonical_draft_page = None
+
+    # --- v1 ---------------------------------------------------------
+    def get(self, key, target_location=None, target_sizes=None):
+        return target_location
+
+    def batch_get(self, keys, target_locations=None, target_sizes=None):
+        if target_locations is not None:
+            return list(target_locations)
+        return [b""] * len(keys)
+
+    def set(self, key, value=None, target_location=None, target_sizes=None) -> bool:
+        return True
+
+    def batch_set(self, keys, values=None, target_locations=None, target_sizes=None) -> bool:
+        return True
+
+    def exists(self, key: str) -> bool:
+        return True
+
+    def batch_exists(self, keys, extra_info=None) -> int:
+        return len(keys)
+
+    # --- v2 ---------------------------------------------------------
+    def batch_exists_v2(self, keys, pool_transfers=None, extra_info=None):
+        return PoolTransferResult(
+            kv_hit_pages=len(keys),
+            extra_pool_hit_pages={
+                str(t.name): len(t.keys or []) for t in (pool_transfers or [])
+            },
+            keys_asked=len(keys),
+        )
+
+    def batch_get_v2(self, transfers, extra_info=None):
+        return {str(t.name): [True] * len(t.keys or []) for t in transfers}
+
+    def batch_set_v2(self, transfers, extra_info=None):
+        return {str(t.name): [True] * len(t.keys or []) for t in transfers}
+
+    # --- housekeeping ------------------------------------------------
+    def register_mem_pool_host(self, mem_pool_host):
+        self.mem_pool_host = mem_pool_host
+
+    def register_mem_host_pool_v2(self, host_pool, host_pool_name):
+        self.registered_pools[host_pool_name] = host_pool
+
+    def get_stats(self):
+        return None
+
+    def clear(self) -> None:
+        return None
+
+    def close(self) -> None:
+        return None
+
+    def check_disk_space(self, force: bool = False) -> bool:
+        return True
