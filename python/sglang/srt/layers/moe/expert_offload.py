@@ -5214,7 +5214,7 @@ def _expert_store_rows_for(layer, plan):
         # gemeinsame Geometrie vor.
         # #91/3: die globalen Ids, die das gemeinsame Hotset resident haelt.
         # Sie sind die Autoritaet ueber die kalte Menge -- nicht die Fraction.
-        _ratios = _fracs = None
+        _ratios = _fracs = _hot_ids = None
         _hot_ids = _hotset_global_ids(layer, num_global, int(lo), pad)
         _shared = _es.shared_geometry()
         if _shared is not None:
@@ -5296,6 +5296,9 @@ def _expert_store_rows_for(layer, plan):
     # Drei Boots (w22/w24/w26) sind an einer Slot-Zahl gestorben, und jedes
     # Mal musste ich sie aus dem Absturz zurueckrechnen. Nur Layer 0 je Rang,
     # also sechs Zeilen je Boot.
+    _hot_ids = locals().get("_hot_ids")
+    _ratios = locals().get("_ratios")
+    _fracs = locals().get("_fracs")
     if int(getattr(layer, "layer_id", -1) or 0) == 0:
         import logging as _lg
         _lg.getLogger(__name__).info(
