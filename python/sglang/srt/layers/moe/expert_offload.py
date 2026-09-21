@@ -5223,7 +5223,35 @@ def _expert_store_rows_for(layer, plan):
             _ratios = _rank_moe_ratio_vector(layer)
             _fracs = (_rank_resident_fraction_vector(layer, len(_ratios))
                       if _ratios else None)
-        if _ratios and _fracs:
+        # #97 (fnFL2w27, die #96-Zeile sagt es woertlich):
+        #     ratios=None fracs=None global_res=188 -> SLOTS=None
+        # Die GLOBALE Menge war da und wurde nie benutzt, weil sie HINTER
+        # `if _ratios and _fracs:` lag -- der Bedingung, die sie selbst
+        # ueberfluessig macht. Elfte Instanz von
+        # [[riegel-hinter-dem-was-er-sichert]] an einem Tag, und den Riegel
+        # habe ich mit #95 eigenhaendig davorgesetzt.
+        #
+        # Steht die globale Menge, genuegt sie allein: die Plaetzezahl ist
+        # `num_global - |global_res|`, und die Zuordnung ist die Position
+        # der eigenen kalten Id in der aufsteigenden kalten Liste. Beides
+        # braucht weder --rank-moe-ratio noch die Fraction-Vektoren, die
+        # Gruppe D unter Form A gar nicht auf diesem Weg fuehrt.
+        _global_only = _es.shared_resident_ids()
+        if _global_only is not None:
+            _kalt = [e for e in range(num_global) if e not in _global_only]
+            _pos = {g: i for i, g in enumerate(_kalt)}
+            _fehlend = [g for g in _index.values() if g not in _pos]
+            if _fehlend:
+                raise RuntimeError(
+                    f"#97: {len(_fehlend)} eigene kalte Experten stehen in der "
+                    f"GLOBALEN Residenzmenge und haetten keinen Store-Platz "
+                    f"(erste: {_fehlend[:4]}, mein Bereich ab lo={lo}). Die "
+                    f"Menge und die tatsaechliche Residenz muessen dieselbe "
+                    f"meinen -- pruefe die Bereichsgrenzen des Hotsets."
+                )
+            _index = {k: _pos[g] for k, g in _index.items()}
+            _slots = len(_kalt)
+        elif _ratios and _fracs:
             _rank = int(getattr(layer, "moe_tp_rank", 0) or 0)
             _base = _es.slot_base_for_rank(_ratios, _fracs, _rank)
             # DREI GROESSEN, DREI GETRENNTE RECHNUNGEN -- und die mittlere ist

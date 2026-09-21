@@ -64,9 +64,20 @@ def _slots(layer, res):
     return None if r is None else r[3]
 
 
-def test_ohne_moe_ratio_trotzdem_324(_welt):
-    """DER FALL, DER w26 TOETETE: kein Vektor -> frueher 512."""
-    lay = _Layer(1, 183, 137)          # KEIN moe_ratio
+def test_ohne_moe_ratio_trotzdem_324(_welt, monkeypatch):
+    """DER FALL, DEN w27 GEMESSEN HAT -- die #96-Zeile woertlich:
+
+        ratios=None fracs=None global_res=188 | SLOTS=None
+
+    Mein erster Test hier war gruen OHNE Fix, weil `_rank_moe_ratio_vector`
+    ohne aktives TP in den tp1-Fallback `[num_experts]` laeuft und damit
+    `_ratios` doch setzt. Am Metall ist `_TP.world_size == 3`, der Fallback
+    greift nicht, `moe_ratio` fehlt auf dem Layer -> None.
+    Der Fallback wird hier ABGESCHALTET, damit der Test den Boot abbildet.
+    """
+    import sglang.srt.layers.moe.expert_offload as _eo
+    monkeypatch.setattr(_eo, "_rank_moe_ratio_vector", lambda layer: None)
+    lay = _Layer(1, 192, 137)          # lo=192, wie w27 es gedruckt hat
     assert _slots(lay, _welt) == 324
 
 
