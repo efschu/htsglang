@@ -525,8 +525,6 @@ def _outside_torch_mib() -> float:
     try:
         import torch
 
-        from sglang.srt.utils import get_device_id  # noqa: F401 -- may be absent
-
         free_b, total_b = torch.cuda.mem_get_info()
         used_mib = float(total_b - free_b) / float(2**20)
         reserved_mib = float(torch.cuda.memory_reserved()) / float(2**20)
@@ -536,12 +534,18 @@ def _outside_torch_mib() -> float:
 
 
 def _default_pool_inactive_mib() -> float:
-    """MiB torch's DEFAULT allocator holds cached (reserved - allocated).
+    """MiB TORCH holds cached in TOTAL (reserved - allocated), tagged pools
+    INCLUDED.
 
-    The private-tag-pool term above sees only the tagged pools. A build that
-    allocates outside them leaves its cache here, where ``empty_cache`` DOES
-    reach -- so a non-zero delta here after an empty_cache is itself a
-    finding, not just an accounting entry.
+    MEASURED fnFL2v89: this reads 2597.7 while the tag-pool term reads 1385.2
+    and the released head 1212.5 -- and 1385.2 + 1212.5 = 2597.7 exactly.
+    ``torch.cuda.memory_reserved()`` counts the private MemPools too, so this
+    is the SUM of the other two, not a third thing. Adding all three counted
+    the same bytes twice and drove W11b to -2064.0, the mirror image of the
+    +533.7 it started with; the gate refuses both directions, and rightly so.
+
+    So the caller uses this INSTEAD of the two, never beside them. The name
+    says "default" for history; what it measures is the whole allocator.
     """
     try:
         import torch

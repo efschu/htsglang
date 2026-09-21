@@ -5158,7 +5158,7 @@ def check_draft_resident(log_p: str, budget_mib: float = None, tol_mib: float = 
         "resident_mib": None, "budget_mib": budget, "tol_mib": tol, "over_mib": None,
         "head_released_mib": None, "nvml_delta_mib": None, "unaccounted_mib": None,
         "tag_pool_inactive_mib": None, "outside_torch_mib": None,
-        "default_pool_inactive_mib": None,
+        "default_pool_inactive_mib": None, "cache_term": None,
         "accounting_tol_mib": P_DRAFT_BUILD_ACCOUNTING_TOL_MIB,
         "resident_ok": False, "accounted": False, "ok": False,
     }
@@ -5214,14 +5214,28 @@ def check_draft_resident(log_p: str, budget_mib: float = None, tol_mib: float = 
         # Ein negativer Wert heisst "nicht messbar" und wird zu 0, nie geraten.
         outside = out.get("outside_torch_mib")
         outside = 0.0 if outside is None or float(outside) < 0 else float(outside)
-        default_cached = out.get("default_pool_inactive_mib")
-        default_cached = (
-            0.0 if default_cached is None or float(default_cached) < 0
-            else float(default_cached)
+        torch_cached = out.get("default_pool_inactive_mib")
+        torch_cached = (
+            -1.0 if torch_cached is None else float(torch_cached)
         )
-        out["unaccounted_mib"] = delta - (
-            r + released + pooled + outside + default_cached
-        )
+        # WELCHER CACHE-TERM GILT -- EINER, NIE BEIDE (fnFL2v89).
+        #
+        # `torch.cuda.memory_reserved()` zaehlt die privaten MemPools MIT.
+        # Gemessen: torch_cached=2597,7 gegen pooled=1385,2 und released=1212,5,
+        # und 1385,2 + 1212,5 = 2597,7 auf die Nachkommastelle. Alle drei zu
+        # addieren zaehlt dieselben Bytes zweimal und trieb W11b auf -2064,0 --
+        # das Spiegelbild der +533,7, mit denen es anfing. Das Gate verweigert
+        # beide Richtungen, und zu Recht.
+        #
+        # Also: liegt der Gesamtwert vor, ERSETZT er die beiden Teilterme.
+        # Fehlt er (-1), bleibt die alte Rechnung, damit ein Boot ohne diese
+        # Messung liest wie vorher.
+        if torch_cached >= 0:
+            out["unaccounted_mib"] = delta - (r + torch_cached + outside)
+            out["cache_term"] = "torch_total"
+        else:
+            out["unaccounted_mib"] = delta - (r + released + pooled + outside)
+            out["cache_term"] = "tag_pool+head_released"
         out["accounted"] = abs(out["unaccounted_mib"]) <= P_DRAFT_BUILD_ACCOUNTING_TOL_MIB
     out["ok"] = bool(out["resident_ok"] and out["accounted"])
     return out
@@ -5252,7 +5266,7 @@ def gate_w11(log_p: str, log: Log) -> Dict[str, object]:
         f"head_released_mib={w11['head_released_mib']} + tag_pool_inactive_mib={w11['tag_pool_inactive_mib']} "
         f"+ outside_torch_mib={w11['outside_torch_mib']} "
         f"+ default_pool_inactive_mib={w11['default_pool_inactive_mib']} "
-        f"+ unaccounted_mib={w11['unaccounted_mib']} "
+        f"+ unaccounted_mib={w11['unaccounted_mib']} cache_term={w11.get('cache_term')} "
         f"(tol {w11['accounting_tol_mib']:.0f}) accounted={w11['accounted']} "
         f"ok={w11['ok']}")
     if not w11["resident_ok"]:
