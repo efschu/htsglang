@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import json
 import os
-from typing import Dict, Iterable, Sequence, Tuple
+from typing import Dict, Iterable, Optional, Sequence, Tuple
 
 import torch
 
@@ -29,12 +29,29 @@ from sglang.srt.layers.moe.shared_pinned import shared_pinned_empty
 
 STORE_DIR_ENV = "SGLANG_MOE_EXPERT_STORE_DIR"
 
+#: #72 (Nutzer-Order 21.09.): WIEVIELE PLAETZE der Store haelt -- als Anteil
+#: der Expertenzahl, oder leer fuer "alle" (das bisherige Verhalten).
+#:
+#: "auf den karten liegt IMMER ein teil des modells, der rest liegt im
+#: systemram. aber waehrend decode oder prefill muss niemals alles im
+#: systemram liegen."
+#:
+#: Es kommt auf die ANZAHL an, nicht auf die Identitaet: liegen zu jedem
+#: Zeitpunkt R von N Experten auf den Karten, braucht der Store nie mehr als
+#: N-R Plaetze -- auch wenn dauernd andere Experten darin stehen. Gemessen an
+#: fnFL2w5/w7 haelt er heute alle 512: 59 GiB auf Platte, 61,10 GiB shmem,
+#: der groesste nicht-reclaimable Posten gegen die ~93-GiB-Decke, an der w4
+#: mit oom_kill starb.
+SLOT_FRACTION_ENV = "SGLANG_MOE_EXPERT_STORE_SLOT_FRACTION"
+
 __all__ = [
     "STORE_DIR_ENV",
     "store_dir",
     "store_enabled",
     "store_path",
     "open_store",
+    "slot_fraction",
+    "slots_for",
     "global_rows",
     "write_rows",
     "mark_rows_written",
@@ -53,6 +70,40 @@ def store_enabled() -> bool:
     return bool(store_dir())
 
 
+def slot_fraction() -> float:
+    """Anteil der Experten, fuer die der Store Plaetze haelt (0 < f <= 1).
+
+    KONSERVATIV: alles, was nicht als Zahl in (0, 1] lesbar ist -- leer,
+    Unsinn, 0, negativ, > 1 -- ergibt 1.0, also das bisherige Verhalten mit
+    einem Platz je Experte. Ein Irrtum in diese Richtung kostet Host-RAM; der
+    Irrtum in die andere Richtung liesse einen Experten ohne Platz zurueck.
+    """
+    raw = os.environ.get(SLOT_FRACTION_ENV, "").strip()
+    if not raw:
+        return 1.0
+    try:
+        f = float(raw)
+    except ValueError:
+        return 1.0
+    if not (0.0 < f <= 1.0):
+        return 1.0
+    return f
+
+
+def slots_for(num_experts: int, fraction: float | None = None) -> int:
+    """Wieviele PLAETZE fuer ``num_experts`` Experten -- mindestens einer.
+
+    AUFGERUNDET: lieber ein Platz zuviel als ein Experte ohne Platz.
+    """
+    f = slot_fraction() if fraction is None else float(fraction)
+    n = int(num_experts)
+    if n <= 0:
+        return 0
+    import math
+
+    return max(1, min(n, int(math.ceil(n * f))))
+
+
 def store_path(directory: str, layer_key: str, attr: str) -> str:
     safe = str(layer_key).replace("/", "_").replace(".", "_")
     return os.path.join(directory, f"{safe}-{attr}.bin")
@@ -66,14 +117,24 @@ def open_store(
     row_shape: Sequence[int],
     dtype: torch.dtype,
     register=None,
+    num_slots: Optional[int] = None,
 ) -> Tuple[torch.Tensor, bool]:
-    """The ``(num_experts, *row_shape)`` tensor backed by the store file.
+    """The ``(slots, *row_shape)`` tensor backed by the store file.
     Returns (tensor, created): the first opener creates the file (zero pages),
-    every later one maps the same bytes."""
+    every later one maps the same bytes.
+
+    #72: ``slots`` ist per Default ``num_experts`` -- byte-identisch zu
+    frueher. Steht ``SLOT_FRACTION_ENV`` (oder ``num_slots``), haelt der
+    Store WENIGER Plaetze als es Experten gibt, weil ein Teil der Experten
+    immer auf den Karten liegt und dort nie aus dem Host gelesen wird. Die
+    Zuordnung Experte -> Platz ist dann nicht mehr die Identitaet; sie gehoert
+    dem Aufrufer, der die Verdraengung kennt.
+    """
     os.makedirs(directory, exist_ok=True)
     path = store_path(directory, layer_key, attr)
+    slots = int(num_slots) if num_slots is not None else slots_for(int(num_experts))
     return shared_pinned_empty(
-        path, (int(num_experts),) + tuple(int(d) for d in row_shape), dtype, register
+        path, (int(slots),) + tuple(int(d) for d in row_shape), dtype, register
     )
 
 
