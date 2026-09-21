@@ -2823,6 +2823,21 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         except Exception as exc:  # noqa: BLE001 -- a census never kills a boot
             logger.debug("[vram-census] skipped: %s", exc)
 
+        # 21.09. (union arena slice 3a): how many of THIS card's weight bytes
+        # are the same in both phase groups? Publishes this rank's side and
+        # logs the join once both are there. Measures only; nothing is shared
+        # until the bind lands. Off unless SGLANG_WEG2_UNION_DIR is set.
+        try:
+            from sglang.srt.weg2.union_arena import maybe_union_census
+
+            maybe_union_census(
+                self.model,
+                rank=self.tp_rank if self.pp_size == 1 else self.pp_rank,
+                device=self.gpu_id,
+            )
+        except Exception as exc:  # noqa: BLE001 -- a census never kills a boot
+            logger.info("WEG2-UNION census skipped: %s", exc)
+
         # #644: end-of-load host-anon discriminator. Off unless
         # SGLANG_644_DISCRIMINATOR is set; the answer it produces (references
         # genuinely persist vs glibc arenas holding freed pages) cannot be read

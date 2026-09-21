@@ -55,6 +55,8 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import logging
+import os
 from typing import Dict, Mapping, Optional, Sequence, Tuple
 
 import torch
@@ -71,6 +73,8 @@ from sglang.srt.model_executor.weights_arena_union import (
     UnionArenaPlan,
     plan_union_arena,
 )
+
+logger = logging.getLogger(__name__)
 
 MANIFEST_VERSION = 1
 
@@ -418,3 +422,212 @@ def _covered(manifest: UnionManifest, name: str) -> bool:
     except UnionShareError:
         return False
     return True
+
+
+# --------------------------------------------------------------------------
+# The CENSUS (slice 3a). Before the loader is touched, one boot must answer
+# the only question that decides whether the surgery is worth it: how many
+# bytes on each card are genuinely the same in both phases?
+#
+# Each rank writes its own side of the join after its weights land; the side
+# that writes second logs the result. Metadata alone cannot answer it (the
+# expert-index shards agree on shape and disagree on content), so the side
+# file carries a checksum per tensor -- an exact device-side integer sum,
+# chunked, a few seconds over a 10 GiB parameter set.
+# --------------------------------------------------------------------------
+
+UNION_DIR_ENV = "SGLANG_WEG2_UNION_DIR"
+
+
+def side_path(union_dir: str, card: str, phase: str) -> str:
+    return os.path.join(union_dir, f"side-{card[-12:]}-{phase}.json")
+
+
+def publish_side(
+    union_dir: str,
+    *,
+    tag: str,
+    card: str,
+    phase: str,
+    rank: int,
+    named: Mapping[str, torch.Tensor],
+    with_checksums: bool = True,
+) -> str:
+    """Write this rank's half of the join. Returns the path written."""
+    os.makedirs(union_dir, exist_ok=True)
+    sums = checksums_for(named) if with_checksums else {}
+    body = {
+        "version": MANIFEST_VERSION,
+        "tag": tag,
+        "card": card,
+        "phase": phase,
+        "rank": int(rank),
+        "pid": os.getpid(),
+        "tensors": [
+            {
+                "name": name,
+                "shape": list(t.shape),
+                "stride": list(t.stride()),
+                "dtype": _dtype_name(t.dtype),
+                "nbytes": int(t.numel() * t.element_size()),
+                "checksum": int(sums[name]) if name in sums else None,
+            }
+            for name, t in sorted(named.items())
+        ],
+    }
+    path = side_path(union_dir, card, phase)
+    tmp = f"{path}.{os.getpid()}.tmp"
+    with open(tmp, "w") as fh:
+        json.dump(body, fh)
+    os.replace(tmp, path)  # a reader never sees a half-written side
+    return path
+
+
+@dataclasses.dataclass(frozen=True)
+class UnionCensus:
+    """What the two phases hold on ONE card, and what may be shared."""
+
+    card: str
+    shareable: Tuple[str, ...]
+    shareable_bytes: int
+    #: same name, same shape/dtype, DIFFERENT bytes -- never shareable
+    colliding: Tuple[str, ...]
+    colliding_bytes: int
+    #: same name, different shape/stride/dtype
+    incompatible: Tuple[str, ...]
+    private: Tuple[Tuple[str, int], ...]  # (phase, count)
+    own_bytes: Tuple[Tuple[str, int], ...]  # (phase, bytes)
+    union_bytes: int
+
+    @property
+    def saved_bytes(self) -> int:
+        return self.shareable_bytes
+
+    def line(self) -> str:
+        own = " ".join(f"{p}={b / 2**30:.2f}" for p, b in self.own_bytes)
+        priv = " ".join(f"{p}={n}" for p, n in self.private)
+        return (
+            f"WEG2-UNION CENSUS card={self.card[-12:]} own_gib[{own}] "
+            f"union={self.union_bytes / 2**30:.2f} GiB "
+            f"SHAREABLE={self.shareable_bytes / 2**30:.2f} GiB "
+            f"({len(self.shareable)} tensors) "
+            f"collide={len(self.colliding)}/{self.colliding_bytes / 2**30:.2f} GiB "
+            f"incompatible={len(self.incompatible)} private[{priv}] "
+            f"-- SHAREABLE is what the union arena removes from this card; "
+            f"collide is same-name-same-shape-DIFFERENT-BYTES (expert-index "
+            f"sharding), which no arena may ever fold together"
+        )
+
+
+def _load_side(path: str) -> dict:
+    with open(path) as fh:
+        raw = json.load(fh)
+    if int(raw.get("version", -1)) != MANIFEST_VERSION:
+        raise UnionShareError(f"side file {path} has version {raw.get('version')}")
+    return raw
+
+
+def join_sides(union_dir: str, card: str) -> UnionCensus:
+    """Join the two phases' side files for one card into a census."""
+    sides = {}
+    for phase in (PHASE_P, PHASE_D):
+        path = side_path(union_dir, card, phase)
+        if not os.path.exists(path):
+            raise UnionShareError(f"phase {phase} has not published {path} yet")
+        sides[phase] = _load_side(path)
+    by_phase = {
+        phase: {t["name"]: t for t in raw["tensors"]} for phase, raw in sides.items()
+    }
+    p_t, d_t = by_phase[PHASE_P], by_phase[PHASE_D]
+    shareable, colliding, incompatible = [], [], []
+    shareable_bytes = colliding_bytes = 0
+    for name in sorted(set(p_t) & set(d_t)):
+        a, b = p_t[name], d_t[name]
+        if (a["shape"], a["stride"], a["dtype"], a["nbytes"]) != (
+            b["shape"],
+            b["stride"],
+            b["dtype"],
+            b["nbytes"],
+        ):
+            incompatible.append(name)
+            continue
+        if a["checksum"] is None or b["checksum"] is None:
+            # No checksum means no proof; it is NOT evidence of sameness.
+            incompatible.append(name)
+            continue
+        if a["checksum"] != b["checksum"]:
+            colliding.append(name)
+            colliding_bytes += int(a["nbytes"])
+            continue
+        shareable.append(name)
+        shareable_bytes += int(a["nbytes"])
+    own = {
+        phase: sum(int(t["nbytes"]) for t in tensors.values())
+        for phase, tensors in by_phase.items()
+    }
+    union_bytes = own[PHASE_P] + own[PHASE_D] - shareable_bytes
+    return UnionCensus(
+        card=card,
+        shareable=tuple(shareable),
+        shareable_bytes=shareable_bytes,
+        colliding=tuple(colliding),
+        colliding_bytes=colliding_bytes,
+        incompatible=tuple(incompatible),
+        private=tuple(
+            (phase, len(set(tensors) - set(p_t if phase == PHASE_D else d_t)))
+            for phase, tensors in by_phase.items()
+        ),
+        own_bytes=tuple((phase, b) for phase, b in own.items()),
+        union_bytes=union_bytes,
+    )
+
+
+def maybe_union_census(model, *, rank: int, device) -> Optional[UnionCensus]:
+    """Publish this rank's side and, if the other phase is already there, log
+    the join. A no-op unless ``SGLANG_WEG2_UNION_DIR`` names a directory.
+
+    Called right after the weights land (``ModelRunner.load_model``), beside
+    the ``[vram-census]``, and wrapped by the caller so it can never kill a
+    boot: this measures, it does not decide anything yet.
+    """
+    union_dir = os.environ.get(UNION_DIR_ENV, "").strip()
+    if not union_dir:
+        return None
+    from sglang.srt.managers.phase_flip_boot import checkpoint_param_dict
+    from sglang.srt.managers.weg2_memory_saver import weg2_group_name
+
+    phase = weg2_group_name()
+    if phase not in (PHASE_P, PHASE_D):
+        return None
+    card = str(torch.cuda.get_device_properties(device).uuid)
+    named = checkpoint_param_dict(model)
+    publish_side(
+        union_dir,
+        tag=os.environ.get("SGLANG_WEG2_TAG", "weg2"),
+        card=card,
+        phase=phase,
+        rank=int(rank),
+        named=named,
+    )
+    other = PHASE_D if phase == PHASE_P else PHASE_P
+    if not os.path.exists(side_path(union_dir, card, other)):
+        logger.info(
+            "WEG2-UNION side published for phase %s on card %s (%d tensors, "
+            "%.2f GiB); phase %s has not published this card yet, so the join "
+            "is left to whichever side writes second",
+            phase,
+            card[-12:],
+            len(named),
+            sum(t.numel() * t.element_size() for t in named.values()) / 2**30,
+            other,
+        )
+        return None
+    census = join_sides(union_dir, card)
+    logger.info("%s", census.line())
+    if census.colliding:
+        logger.info(
+            "WEG2-UNION collide sample (same name, same shape, DIFFERENT "
+            "bytes): %s",
+            ", ".join(census.colliding[:5]),
+        )
+    return census

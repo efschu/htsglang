@@ -161,3 +161,81 @@ def test_byte_view_refuses_a_partial_view():
     base = torch.randn(64)
     with pytest.raises(ua.UnionShareError):
         ua.byte_view(base[8:16])
+
+
+# ---------------------------------------------------------------- the census
+
+
+def _side(tmp_path, phase, tensors, sums=None, card="GPU-aaaabbbbcccc"):
+    import torch as _t
+
+    return ua.publish_side(
+        str(tmp_path),
+        tag="fnFL2",
+        card=card,
+        phase=phase,
+        rank=0,
+        named=tensors,
+        with_checksums=sums is None,
+    )
+
+
+def test_the_census_separates_shareable_from_colliding(tmp_path):
+    torch.manual_seed(5)
+    same = torch.randn(64, 8)
+    p_named = {"attn.qkv": same, "attn.o": torch.randn(8, 8), "p.only": torch.randn(4)}
+    d_named = {
+        "attn.qkv": same.clone(),  # SAME bytes -> shareable
+        "attn.o": torch.randn(8, 8),  # same shape, other bytes -> collide
+        "d.only": torch.randn(9),
+    }
+    _side(tmp_path, ua.PHASE_P, p_named)
+    _side(tmp_path, ua.PHASE_D, d_named)
+    census = ua.join_sides(str(tmp_path), "GPU-aaaabbbbcccc")
+    assert census.shareable == ("attn.qkv",)
+    assert census.shareable_bytes == 64 * 8 * 4
+    assert census.colliding == ("attn.o",)
+    assert census.colliding_bytes == 8 * 8 * 4
+    assert census.incompatible == ()
+    assert census.saved_bytes == census.shareable_bytes
+    own = dict(census.own_bytes)
+    assert census.union_bytes == own["P"] + own["D"] - census.shareable_bytes
+    line = census.line()
+    assert "SHAREABLE=" in line and "collide=1" in line
+
+
+def test_a_shape_difference_is_incompatible_not_colliding(tmp_path):
+    p_named = {"w": torch.randn(4, 4)}
+    d_named = {"w": torch.randn(4, 5)}
+    _side(tmp_path, ua.PHASE_P, p_named, card="GPU-shape")
+    _side(tmp_path, ua.PHASE_D, d_named, card="GPU-shape")
+    census = ua.join_sides(str(tmp_path), "GPU-shape")
+    assert census.incompatible == ("w",) and census.shareable == ()
+
+
+def test_a_missing_side_is_a_named_refusal(tmp_path):
+    _side(tmp_path, ua.PHASE_P, {"w": torch.randn(2)}, card="GPU-lonely")
+    with pytest.raises(ua.UnionShareError, match="has not published"):
+        ua.join_sides(str(tmp_path), "GPU-lonely")
+
+
+def test_a_side_without_checksums_is_never_read_as_identical(tmp_path):
+    """No proof is not evidence of sameness."""
+    same = torch.randn(8, 8)
+    for phase in (ua.PHASE_P, ua.PHASE_D):
+        ua.publish_side(
+            str(tmp_path),
+            tag="t",
+            card="GPU-nosum",
+            phase=phase,
+            rank=0,
+            named={"w": same},
+            with_checksums=False,
+        )
+    census = ua.join_sides(str(tmp_path), "GPU-nosum")
+    assert census.shareable == () and census.incompatible == ("w",)
+
+
+def test_the_census_hook_is_off_without_its_env(monkeypatch):
+    monkeypatch.delenv(ua.UNION_DIR_ENV, raising=False)
+    assert ua.maybe_union_census(object(), rank=0, device=0) is None
