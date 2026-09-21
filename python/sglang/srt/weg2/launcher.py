@@ -7274,12 +7274,20 @@ def _d_measured_anchor(
             " The heuristic path stands; it is not anchored against an"
             " assumed zero."
         )
+    # Imported in its own step: naming MeasuredAnchorRefused in an `except`
+    # whose `try` also performs the import turns an ImportError into a
+    # NameError and loses the real reason.
     try:
         from sglang.srt.planner.measured_anchor import (
             MeasuredAnchorRefused,
             read_measured_anchor,
         )
-
+    except Exception as exc:  # noqa: BLE001 - an anchor never kills a launch
+        return None, ANCHOR_NOTE_PREFIX + (
+            "anchor module unavailable (%s: %s); heuristic path stands"
+            % (type(exc).__name__, exc)
+        )
+    try:
         uuids = [getattr(c, "uuid", None) for c in cards]
         on_gpu = [uuids.count(u) if u is not None else 1 for u in uuids]
         reserve_b = [
@@ -7300,9 +7308,18 @@ def _d_measured_anchor(
             model_path=model,
             evidence_dirs=tuple(evidence_dirs),
         )
-    except Exception as exc:  # noqa: BLE001 - an anchor never kills a launch
+    except MeasuredAnchorRefused as exc:
+        # The EXPECTED absence: no log of this form, or one that does not
+        # state every post. It names itself, so it is passed through verbatim.
         return None, ANCHOR_NOTE_PREFIX + (
             "no anchor, heuristic path stands: %s" % exc
+        )
+    except Exception as exc:  # noqa: BLE001 - an anchor never kills a launch
+        # The UNEXPECTED one (unreadable tree, import failure). Kept separate
+        # so a bug here cannot read as "nothing was measured yet".
+        return None, ANCHOR_NOTE_PREFIX + (
+            "anchor lookup FAILED (%s: %s); heuristic path stands"
+            % (type(exc).__name__, exc)
         )
     return anchor, ANCHOR_NOTE_PREFIX + anchor.provenance
 
