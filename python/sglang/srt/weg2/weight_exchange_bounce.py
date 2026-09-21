@@ -2050,6 +2050,25 @@ def pair_of(src_rank: int, dst_rank: int) -> Optional[int]:
     return xr.CROSS_PAIRS.index(key) if key in xr.CROSS_PAIRS else None
 
 
+def _rank_of(desc: object, field: str) -> int:
+    """``desc.src_rank`` / ``desc.dst_rank`` ohne Ersatzwert (#82).
+
+    Ein Deskriptor ohne diese Felder ist kein Deskriptor, den dieser Pfad
+    einordnen kann -- und ein geratener Rang schickt seine Bytes auf eine
+    Lane, an der kein Partner steht.
+    """
+    v = getattr(desc, field, None)
+    if v is None:
+        name = getattr(desc, "name", None) or getattr(desc, "tag", "?")
+        raise ValueError(
+            f"W82 Weg2DescRankMissing: {field} is required to place "
+            f"{name!r} on a lane; guessing it puts the bytes on a lane no "
+            f"peer serves (fnFL2w8: P collected on c1/c2/p3 while D "
+            f"deposited on c0)"
+        )
+    return int(v)
+
+
 def group_descs_by_pair(descs: Sequence[object]):
     """``{pair_index_or_None: [descs]}`` in first-appearance order.
 
@@ -2061,7 +2080,16 @@ def group_descs_by_pair(descs: Sequence[object]):
         if getattr(d, "kind", None) == wx.ZEROFILL:
             key = None
         else:
-            key = pair_of(getattr(d, "src_rank", -1), getattr(d, "dst_rank", -1))
+            # #82 (21.09.): KEINE DEFAULTS AUF DIESER ZEILE. `src_rank` und
+            # `dst_rank` sind Pflichtfelder des Deskriptors
+            # (weight_exchange.py:999), also kann `-1` hier nie der
+            # Normalfall sein -- wohl aber der stille Ausgang, wenn jemand
+            # spaeter einen anderen Deskriptor durchreicht: `pair_of(-1,-1)`
+            # ist ein Paar wie jedes andere und landet in der Diagonalen,
+            # wo der Aufrufer dann MEINE Karte nimmt. Drei Boots (w3/w7/w8)
+            # sind an einer Diagonal-Lane gestorben, die niemand bedient;
+            # dieser Default ist genau die Form, in der so etwas entsteht.
+            key = pair_of(_rank_of(d, "src_rank"), _rank_of(d, "dst_rank"))
         out.setdefault(key, []).append(d)
     return out
 
@@ -2688,8 +2716,19 @@ def run_sequential_units(descs, ops, boot_nonce: str, *,
     # lane's OWN byte sum (operator order 2026-09-15), so this is the number a
     # reader needs to price /dev/shm against -- and the one that made
     # weg2xsn55's "3 batches" refusal readable only from a traceback.
+    # #82 (21.09.): DER ERSTE TENSOR UND SEIN RANGPAAR AUF DIE ZEILE.
+    # Beim Vergleich der beiden Seiten von fnFL2w8 liess sich aus dem Log
+    # ablesen, WELCHE Lanes jede Seite bediente (D: 6, P: 9) -- aber nicht,
+    # WARUM eine Lane entstand. Die Antwort steckt im Rangpaar des ersten
+    # Deskriptors, und genau die musste ich aus Manifesten rekonstruieren,
+    # die der Teardown danach geraeumt hatte.
+    _d0 = descs[0] if descs else None
+    _who = (f" first={getattr(_d0, 'name', '?')!r}"
+            f" src_rank={getattr(_d0, 'src_rank', '?')}"
+            f" dst_rank={getattr(_d0, 'dst_rank', '?')}") if _d0 is not None else ""
     log(f"WEG2-SEQ lane={lane_key} phase={phase} handshake={resolved_full} "
-        f"descs={len(descs)} slot={_SEQ_SLOT} slot_bytes={int(slot_bytes)}")
+        f"descs={len(descs)} slot={_SEQ_SLOT} slot_bytes={int(slot_bytes)}"
+        f"{_who}")
 
     # THE PIECES, DERIVED IDENTICALLY ON BOTH SIDES.  ``batch_descs`` is the
     # one producer of the slot layout the lane form already used: deterministic

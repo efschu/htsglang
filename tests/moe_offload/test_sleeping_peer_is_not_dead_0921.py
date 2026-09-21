@@ -57,4 +57,4 @@ def test_the_budget_is_still_the_hard_bound():
     from sglang.srt.weg2 import weight_exchange_bounce as wxb
 
     sig = inspect.signature(wxb.run_sequential_units)
-    assert sig.parameters["budget_s"].default == 120.0
+    assert sig.parameters["budget_s"].default == 90.0  # #81: 30 s Vorlauf vor dem Front-Bound 120 s

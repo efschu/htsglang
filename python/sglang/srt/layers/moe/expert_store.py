@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import json
 import os
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Dict, Iterable, Optional, Sequence, Tuple
 
 import torch
 
@@ -61,9 +61,6 @@ __all__ = [
     "written_rows_cached",
     "forget_written_rows",
     "store_has_row",
-    "punch_rows",
-    "unmark_rows_written",
-    "StorePinnedForDevice",
 ]
 
 
@@ -240,139 +237,6 @@ def slot_rows(local_ids: Iterable[int], lo: int, pad: bool = True,
             continue
         out[local] = int(slot)
     return out
-
-
-# ===========================================================================
-# #72 RINGPUFFER, STUFE 1: EINE ZEILE WIEDER HERGEBEN
-#
-# Nutzer 21.09.: "die anderen liegen im vram, es ist quasi ein ringpuffer" --
-# und am 20.09.: "kalte experten (nicht alle, nur so viele wie noetig) aus dem
-# systemram werfen und spaeter von der platte wieder nachladen".
-#
-# Der Store ist damit ein CACHE UEBER DEM CHECKPOINT, keine Pflichtkopie. Was
-# dafuer fehlte, ist die Rueckgabe: `write_rows` fuellt, nichts leert.
-#
-# DIE FALLE, DIE DIESE STELLE TEUER MACHT, und der Grund fuer die Verweigerung
-# unten: `shared_pinned_empty` registriert die GANZE Datei mit
-# `cudaHostRegister(ptr, nbytes, MAPPED)` (shared_pinned.py:91). Die GPU
-# adressiert diese physischen Seiten direkt. FALLOC_FL_PUNCH_HOLE gibt sie
-# dem Kernel zurueck -- unter einer laufenden Device-Kopie ist das kein
-# Speichergewinn, sondern ein 'illegal memory access' oder, schlimmer, stille
-# Korruption. Und `cudaHostUnregister` loest IMMER die ganze Region, nie eine
-# Zeile: eine zeilenweise Eviction auf einer am Stueck registrierten Datei
-# gibt es nicht.
-#
-# Deshalb verweigert `punch_rows` auf einer registrierten Region, statt es zu
-# versuchen. Der Ring braucht einen Store, dessen Slots EINZELN registriert
-# sind (Stufe 2) -- diese Stufe liefert die Rueckgabe und benennt die
-# Bedingung, unter der sie sicher ist.
-# ===========================================================================
-
-_FALLOC_FL_KEEP_SIZE = 0x01
-_FALLOC_FL_PUNCH_HOLE = 0x02
-
-
-class StorePinnedForDevice(RuntimeError):
-    """Diese Store-Datei ist als Ganzes fuer die GPU registriert."""
-
-
-def _fallocate_punch(fd: int, offset: int, length: int) -> None:
-    import ctypes
-    import ctypes.util
-
-    libc = ctypes.CDLL(ctypes.util.find_library("c") or "libc.so.6",
-                       use_errno=True)
-    libc.fallocate.argtypes = [ctypes.c_int, ctypes.c_int,
-                               ctypes.c_long, ctypes.c_long]
-    rc = libc.fallocate(int(fd),
-                        _FALLOC_FL_PUNCH_HOLE | _FALLOC_FL_KEEP_SIZE,
-                        int(offset), int(length))
-    if rc != 0:
-        err = ctypes.get_errno()
-        raise OSError(err, f"fallocate(PUNCH_HOLE, {offset}, {length}) failed: "
-                           f"{os.strerror(err)}")
-
-
-def punch_rows(directory: str, layer_key: str, attr: str, rows: Iterable[int],
-               row_bytes: int, *, rank: Optional[int] = None,
-               registered: bool = False) -> int:
-    """Gibt die Seiten dieser Store-Zeilen frei. Gibt die Bytes zurueck.
-
-    ZWEI SCHRITTE, UND DIE REIHENFOLGE IST DIE SICHERE: erst den Sentinel
-    zuruecknehmen (ab jetzt sagt `store_has_row` "nicht da", ein Leser geht
-    zum Checkpoint), DANN lochen. Andersherum gaebe es ein Fenster, in dem
-    der Sentinel eine Zeile verspricht, die schon Nullen ist -- und Nullen
-    sind das eine Ergebnis, das kein Leser als Fehler erkennt.
-
-    ``registered=True`` heisst: der Aufrufer weiss, dass die Region fuer die
-    GPU registriert ist. Dann wird REFUSED statt gelocht (siehe Block oben).
-    """
-    if registered:
-        raise StorePinnedForDevice(
-            f"refusing to punch {store_path(directory, layer_key, attr)}: the "
-            f"file is cudaHostRegister'd as ONE region, so freeing a row's "
-            f"pages pulls them out from under a mapping the device still "
-            f"addresses, and cudaHostUnregister cannot release a single row. "
-            f"Register the store per slot before evicting from it."
-        )
-    rows = sorted({int(r) for r in rows})
-    if not rows or int(row_bytes) <= 0:
-        return 0
-    path = store_path(directory, layer_key, attr)
-    if not os.path.exists(path):
-        return 0
-    if rank is not None:
-        unmark_rows_written(directory, layer_key, attr, int(rank), rows)
-    freed = 0
-    fd = os.open(path, os.O_RDWR)
-    try:
-        size = os.fstat(fd).st_size
-        # Zusammenhaengende Zeilen in EINEN Aufruf: 210 Einzelloecher auf
-        # einer tmpfs-Datei sind 210 Baum-Operationen fuer dieselbe Menge
-        # Seiten.
-        start = prev = rows[0]
-        for r in rows[1:] + [None]:
-            if r == prev + 1:
-                prev = r
-                continue
-            off = start * int(row_bytes)
-            ln = (prev - start + 1) * int(row_bytes)
-            if off < size:
-                ln = min(ln, size - off)
-                _fallocate_punch(fd, off, ln)
-                freed += ln
-            if r is None:
-                break
-            start = prev = r
-    finally:
-        os.close(fd)
-    return freed
-
-
-def unmark_rows_written(directory: str, layer_key: str, attr: str, rank: int,
-                        rows: Iterable[int]) -> str:
-    """Nimmt Zeilen aus dem Sentinel dieses Rangs zurueck (#72).
-
-    Das Gegenstueck zu `mark_rows_written`, mit demselben atomaren Rename:
-    ein halb geschriebener Sentinel waere eine Zeile, die niemand mehr hat und
-    trotzdem jemand verspricht.
-    """
-    path = _sentinel(directory, layer_key, attr, int(rank))
-    have: List[int] = []
-    if os.path.exists(path):
-        try:
-            with open(path) as fh:
-                have = [int(r) for r in json.load(fh).get("rows", [])]
-        except (ValueError, OSError):
-            have = []
-    drop = {int(r) for r in rows}
-    keep = sorted(r for r in have if r not in drop)
-    tmp = path + ".tmp"
-    with open(tmp, "w") as fh:
-        json.dump({"rank": int(rank), "rows": keep}, fh)
-    os.replace(tmp, path)
-    forget_written_rows()
-    return path
 
 
 def write_rows(
