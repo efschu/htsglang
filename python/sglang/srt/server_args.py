@@ -8505,9 +8505,14 @@ class ServerArgs:
         ):
             if getattr(self, name, None) is None:
                 refuse(
-                    f"needs --{name.replace('_', '-')} (the decode group's value, byte-for-byte): "
-                    "the drafter identity is hashed from the full speculative flag set and "
-                    "the producer must compute the decode group's identity"
+                    f"needs --{name.replace('_', '-')}: the producer builds a "
+                    "real drafter and cannot do so without its full flag set. "
+                    "The VALUES no longer have to match the decode group's: "
+                    "since 2026-09-21 the chain geometry is out of "
+                    "drafter_identity_hash (it decides how many tokens a round "
+                    "proposes, never what a stored row means -- and "
+                    "--speculative-adaptive changes it per round), so P may "
+                    "run the shortest chain that still writes the rows"
                 )
         if getattr(self, "speculative_draft_placement", "split") == "solo":
             refuse("does not support --speculative-draft-placement solo")

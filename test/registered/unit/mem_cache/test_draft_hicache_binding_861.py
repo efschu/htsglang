@@ -350,8 +350,8 @@ def test_drafter_identity_covers_algorithm_and_layout():
     base = drafter_identity_hash(FakeServerArgs())
     for field, value in (
         ("speculative_algorithm", "EAGLE"),
-        ("speculative_num_steps", 5),
-        ("speculative_eagle_topk", 4),
+        ("speculative_draft_model_path", "/other/drafter"),
+        ("speculative_draft_model_revision", "rev2"),
         # draft_kv_layout decides the draft pool's ROW SPACE and per-row byte
         # length. DESIGN_631b records that it must NOT enter the target key
         # (it is a parallelism decision, not a weights one) -- which is exactly
@@ -361,6 +361,28 @@ def test_drafter_identity_covers_algorithm_and_layout():
         sa = FakeServerArgs()
         setattr(sa, field, value)
         assert drafter_identity_hash(sa) != base, field
+
+
+def test_the_chain_geometry_is_NOT_part_of_the_identity():
+    """User question 2026-09-21: "wie geht das dann bei adaptive draft length?
+    da aendert sich die tiefe doch auch?"
+
+    It does, and that is the point.  A stored draft KV row is one token's rows
+    through the drafter's own layers; the chain fields decide how many tokens a
+    round PROPOSES and how many slots it pre-allocates, never what a row means.
+    With them in the hash, ``--speculative-adaptive`` was one badly-timed
+    registration away from minting a second identity for byte-identical pages
+    and losing every page written before it, silently.
+    """
+    base = drafter_identity_hash(FakeServerArgs())
+    for field, value in (
+        ("speculative_num_steps", 5),
+        ("speculative_eagle_topk", 4),
+        ("speculative_num_draft_tokens", 6),
+    ):
+        sa = FakeServerArgs()
+        setattr(sa, field, value)
+        assert drafter_identity_hash(sa) == base, field
 
 
 def test_can_fail_pin4_identical_drafters_share_a_key():

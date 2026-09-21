@@ -135,13 +135,35 @@ def drafter_identity_hash(server_args) -> str:
     # #1233: speculative_draft_kv_only is deliberately not hashed: it decides
     # whether the drafter PROPOSES, not what a draft KV byte MEANS; P and D
     # must compute the same identity by construction (W5).
+    #
+    # NEITHER IS THE CHAIN GEOMETRY, and dropping it is a correction, not a
+    # relaxation (user question 2026-09-21: "wie geht das dann bei adaptive
+    # draft length? da aendert sich die tiefe doch auch?").  He is right on
+    # both halves:
+    #
+    # * PHYSICALLY: a stored draft KV row is one token's rows through the
+    #   drafter's own layers.  ``speculative_num_steps`` /
+    #   ``speculative_eagle_topk`` / ``speculative_num_draft_tokens`` decide
+    #   how many tokens a decode round PROPOSES and how many slots it
+    #   pre-allocates (``common.get_alloc_len_per_decode``) -- never the byte
+    #   layout or the meaning of a row.  This function's own first sentence is
+    #   the test they fail.
+    # * OPERATIONALLY: ``--speculative-adaptive`` changes the chain length per
+    #   round.  It only ever writes ``server_args`` inside
+    #   ``_override_worker_state``, which restores in its ``finally``, so the
+    #   identity computed at REGISTRATION happened to stay stable -- a timing
+    #   accident, not a guarantee.  A registration that lands inside a capture
+    #   override (a cutover during a re-capture) would have minted a different
+    #   identity for byte-identical pages, and every page written before it
+    #   would have gone missing with no error anywhere.
+    #
+    # What stays is what actually decides a row's meaning: the algorithm, the
+    # drafter checkpoint and its revision, and ``draft_kv_layout`` (the draft
+    # pool's row space and per-row byte length).
     parts = [
         str(getattr(server_args, "speculative_algorithm", "") or ""),
         str(getattr(server_args, "speculative_draft_model_path", "") or ""),
         str(getattr(server_args, "speculative_draft_model_revision", "") or ""),
-        str(getattr(server_args, "speculative_num_steps", "") or ""),
-        str(getattr(server_args, "speculative_eagle_topk", "") or ""),
-        str(getattr(server_args, "speculative_num_draft_tokens", "") or ""),
         str(getattr(server_args, "draft_kv_layout", "replicated") or "replicated"),
     ]
     return hashlib.sha256("|".join(parts).encode()).hexdigest()[:16]

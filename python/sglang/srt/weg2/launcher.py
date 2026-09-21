@@ -604,18 +604,23 @@ P_DRAFT_KV_FLAGS: Tuple[str, ...] = (
 def p_draft_kv_flags(extra_d: Sequence[str]) -> Tuple[str, ...]:
     """P's four speculative flags, READ OFF GROUP D's OWN ARGV.
 
-    They hash into the drafter identity (W5/W10), so a constant here is only
-    correct while every arm runs the constant's depth.  fnFL2 v38 is the boot
-    that broke it: group D runs the Next-Flash MTP at ``--speculative-num-steps
-    3 --speculative-num-draft-tokens 4`` out of ``--extra-d``, the constants
-    say 2/3, and P would have registered a DIFFERENT drafter than the one D
-    asks the carrier for -- the weg2zr2 shape (194,088 failed draft fetches),
-    except silent, because W10 grades the identity AFTER both groups are up.
+    W10 grades P's and D's drafter lines against each other, so a constant
+    here is only correct while every arm runs the constant's depth.  fnFL2 v38
+    is the boot that broke it: group D runs the Next-Flash MTP at
+    ``--speculative-num-steps 3 --speculative-num-draft-tokens 4`` out of
+    ``--extra-d`` while the constants say 2/3.
 
-    So the producer's depth is D's depth by construction: whatever
-    ``--extra-d`` names wins, and the module constants are the fallback for an
-    arm that names nothing.  ``--speculative-draft-kv-only`` is P's alone and
-    is never taken from D.
+    NOTE (2026-09-21) that the CORRECTNESS argument this originally carried --
+    "the four flags hash into the drafter identity, so a mismatch makes D ask
+    the carrier under an identity P never wrote" -- no longer holds, and it
+    was the wrong argument to begin with: the chain geometry left
+    ``drafter_identity_hash`` because it decides how many tokens a round
+    PROPOSES, never what a stored row means, and because
+    ``--speculative-adaptive`` changes it per round.  Taking D's depth is now
+    a matter of keeping ONE number in the boot record instead of two; P is
+    free to run a shorter chain, and the producer never proposes anyway.
+
+    ``--speculative-draft-kv-only`` is P's alone and is never taken from D.
     """
     want = {
         "--speculative-algorithm": SPEC_ALGORITHM,

@@ -4,8 +4,13 @@
 ``--speculative-draft-kv-only`` decides whether the drafter PROPOSES, not
 what a draft KV byte MEANS, so it is deliberately absent from the identity
 hash: group P (producer) and group D (proposer) compute the same identity by
-construction (W5). The refused silencer ``--speculative-num-steps 0`` hashes
-``""`` and yields a different identity -- that is the reason it is refused.
+construction (W5).
+
+Since 2026-09-21 the CHAIN GEOMETRY is absent for the same reason (user
+question on adaptive draft length): ``speculative_num_steps`` /
+``speculative_eagle_topk`` / ``speculative_num_draft_tokens`` decide how many
+tokens a round proposes, never what a stored row means, and
+``--speculative-adaptive`` changes them per round.
 """
 
 import types
@@ -33,16 +38,22 @@ def _args(**kw):
 
 class TestDrafterIdentity(CustomTestCase):
     def test_t12_identity_ignores_the_producer_flag_and_pins_the_live_value(self):
-        self.assertEqual(drafter_identity_hash(_args()), "a30db4b7c362c786")
+        self.assertEqual(drafter_identity_hash(_args()), "b53f8c336da51155")
         self.assertEqual(
             drafter_identity_hash(_args(speculative_draft_kv_only=True)),
             drafter_identity_hash(_args(speculative_draft_kv_only=False)),
         )
         self.assertNotEqual(
-            drafter_identity_hash(_args(draft_kv_layout="dcp")), "a30db4b7c362c786"
+            drafter_identity_hash(_args(draft_kv_layout="dcp")), "b53f8c336da51155"
         )
-        self.assertNotEqual(
-            drafter_identity_hash(_args(speculative_num_steps=0)), "a30db4b7c362c786"
+        # The chain geometry no longer moves the identity: an adaptive
+        # controller that switches k mid-run must keep reading the pages it
+        # already wrote.
+        self.assertEqual(
+            drafter_identity_hash(_args(speculative_num_steps=5)), "b53f8c336da51155"
+        )
+        self.assertEqual(
+            drafter_identity_hash(_args(speculative_num_draft_tokens=6)), "b53f8c336da51155"
         )
 
 
