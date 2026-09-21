@@ -5090,6 +5090,34 @@ def _warn_slot_pool_off(rank: int, cold: int, span: int) -> None:
     )
 
 
+def _hotset_global_ids(layer, num_global, lo, pad):
+    """Die GLOBALEN Experten-Ids, die das Hotset resident haelt -- oder None.
+
+    #91/3. Das Hotset ist je Rang in LOKALEN Ids geschrieben
+    (`hotset_path_for_rank`); der Store rechnet global. Ohne Datei, ohne
+    Abdeckung dieses Layers oder bei unlesbarem Inhalt: None, dann bleibt
+    alles wie bisher. Kein Raten -- eine falsche Residenzmenge waere eine
+    falsche Slot-Zuordnung, und die ist Datenverlust.
+    """
+    from sglang.srt.environ import envs
+
+    pfad = envs.SGLANG_MOE_HOTSET_FILE.get()
+    if not pfad or not hotset_covers_layer(layer):
+        return None
+    try:
+        daten = _load_hotset_file(hotset_path_for_rank(
+            pfad, getattr(layer, "moe_tp_rank", 0)))
+        roh = daten.get(str(getattr(layer, "layer_id", "")))
+        if not roh:
+            return None
+        lokal = [int(x) for x in roh]
+    except Exception:
+        return None
+    # lokal -> global, dieselbe Regel wie `global_rows`
+    ids = {int(lo) + e - 1 if pad else int(lo) + e for e in lokal if not pad or e >= 1}
+    return {g for g in ids if 0 <= g < int(num_global)} or None
+
+
 def _expert_store_rows_for(layer, plan):
     """``(dir, layer_key, lo, num_global, local->row)`` when the shared expert
     store is on and this layer is a generic expert-dim shard; else ``None``."""
@@ -5147,6 +5175,9 @@ def _expert_store_rows_for(layer, plan):
         # Das ist Datenverlust, nicht Speicherverlust; deshalb gibt der
         # Launcher, der als einziger beide Konfigurationen kennt, eine
         # gemeinsame Geometrie vor.
+        # #91/3: die globalen Ids, die das gemeinsame Hotset resident haelt.
+        # Sie sind die Autoritaet ueber die kalte Menge -- nicht die Fraction.
+        _hot_ids = _hotset_global_ids(layer, num_global, int(lo), pad)
         _shared = _es.shared_geometry()
         if _shared is not None:
             _ratios, _fracs = _shared
@@ -5183,7 +5214,27 @@ def _expert_store_rows_for(layer, plan):
                                     resident_ids=_not_mine,
                                     num_experts=num_global)
             _span = _es.slot_base_for_rank(_ratios, _fracs, _rank + 1) - _base
-            if _packed and len(_packed) <= _span:
+            if _hot_ids is not None:
+                # #91/3: STEHT EIN GEMEINSAMES HOTSET, IST DIE KALTE MENGE IN
+                # BEIDEN GRUPPEN DIESELBE -- dann folgt die Zuordnung direkt
+                # aus ihr und braucht die Ratio-Rechnung nicht mehr. Die ist
+                # hier sogar FALSCH: sie unterstellt, die ersten R Ids eines
+                # Bereichs seien resident, das Hotset waehlt aber andere.
+                # fnFL2w19 starb genau daran (IndexError: index 451 is out of
+                # bounds for dimension 0 with size 451, expert_store.py:310).
+                _kalt = [e for e in range(num_global) if e not in _hot_ids]
+                _pos = {g: i for i, g in enumerate(_kalt)}
+                _fehlend = [g for g in _index.values() if g not in _pos]
+                if _fehlend:
+                    raise RuntimeError(
+                        f"#91: {len(_fehlend)} kalte Experten stehen im Hotset "
+                        f"und haetten keinen Store-Platz (erste: {_fehlend[:4]}). "
+                        f"Das Hotset und die tatsaechliche Residenz muessen "
+                        f"dieselbe Menge meinen."
+                    )
+                _index = {k: _pos[g] for k, g in _index.items()}
+                _slots = len(_kalt)
+            elif _packed and len(_packed) <= _span:
                 _index = {k: _base + v for k, v in _packed.items()}
                 _slots = _es.slot_base_for_rank(_ratios, _fracs, len(_ratios))
             elif _packed:
